@@ -7,10 +7,13 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod bitstream;
 pub mod convert;
 pub mod error;
 pub mod filetype;
+pub mod formats;
 pub mod jsondiff;
+pub mod parser;
 pub mod reader;
 pub mod serialize;
 pub mod tagtable;

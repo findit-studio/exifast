@@ -461,6 +461,318 @@ pub fn module_for_type(file_type: &str) -> ModuleName {
     }
 }
 
+/// `%mimeType` (ExifTool.pm:616-847). 230 entries, verbatim (key ⇒ MIME
+/// string). The hash is keyed by file TYPE (not extension); a TYPE absent
+/// here yields `None`, exactly Perl `$mimeType{$fileType}` being `undef`
+/// (which `SetFileType` turns into `'application/unknown'`,
+/// ExifTool.pm:9704). Every value in the Perl source is a plain string
+/// literal — there is no Perl-expression value — so this is a faithful
+/// 1:1 transliteration. Some Perl keys are quoted/contain spaces
+/// (`'3FR'`, `'7Z'`, `'Canon 1D RAW'`, `'DVR-MS'`) — ported as-is.
+#[must_use]
+pub(crate) fn mime_type_lookup(file_type: &str) -> Option<&'static str> {
+    Some(match file_type {
+        "3FR" => "image/x-hasselblad-3fr",                  // ExifTool.pm:617
+        "7Z" => "application/x-7z-compressed",               // ExifTool.pm:618
+        "AA" => "audio/audible",                             // ExifTool.pm:619
+        "AAC" => "audio/aac",                                // ExifTool.pm:620
+        "AAE" => "application/vnd.apple.photos",             // ExifTool.pm:621
+        "AI" => "application/vnd.adobe.illustrator",         // ExifTool.pm:622
+        "AIFF" => "audio/x-aiff",                            // ExifTool.pm:623
+        "ALIAS" => "application/x-macos",                    // ExifTool.pm:624
+        "APE" => "audio/x-monkeys-audio",                    // ExifTool.pm:625
+        "APNG" => "image/apng",                              // ExifTool.pm:626
+        "ASF" => "video/x-ms-asf",                           // ExifTool.pm:627
+        "ARW" => "image/x-sony-arw",                         // ExifTool.pm:628
+        "BMP" => "image/bmp",                                // ExifTool.pm:629
+        "BPG" => "image/bpg",                                // ExifTool.pm:630
+        "BTF" => "image/x-tiff-big",                         // ExifTool.pm:631
+        "BZ2" => "application/bzip2",                         // ExifTool.pm:632
+        "C2PA" => "application/c2pa",                         // ExifTool.pm:633
+        "Canon 1D RAW" => "image/x-raw",                     // ExifTool.pm:634
+        "CHM" => "application/x-chm",                         // ExifTool.pm:635
+        "COS" => "application/octet-stream",                  // ExifTool.pm:636
+        "CR2" => "image/x-canon-cr2",                         // ExifTool.pm:637
+        "CR3" => "image/x-canon-cr3",                         // ExifTool.pm:638
+        "CRM" => "video/x-canon-crm",                         // ExifTool.pm:639
+        "CRW" => "image/x-canon-crw",                         // ExifTool.pm:640
+        "CSV" => "text/csv",                                  // ExifTool.pm:641
+        "CUR" => "image/x-cursor",                            // ExifTool.pm:642
+        "CZI" => "image/x-zeiss-czi",                         // ExifTool.pm:643
+        "DCP" => "application/octet-stream",                  // ExifTool.pm:644
+        "DCR" => "image/x-kodak-dcr",                         // ExifTool.pm:645
+        "DCX" => "image/dcx",                                 // ExifTool.pm:646
+        "DEX" => "application/octet-stream",                  // ExifTool.pm:647
+        "DFONT" => "application/x-dfont",                     // ExifTool.pm:648
+        "DICOM" => "application/dicom",                       // ExifTool.pm:649
+        "DIVX" => "video/divx",                               // ExifTool.pm:650
+        "DJVU" => "image/vnd.djvu",                           // ExifTool.pm:651
+        "DNG" => "image/x-adobe-dng",                         // ExifTool.pm:652
+        "DOC" => "application/msword",                        // ExifTool.pm:653
+        "DOCM" => "application/vnd.ms-word.document.macroEnabled.12", // ExifTool.pm:654
+        "DOCX" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // ExifTool.pm:655
+        "DOT" => "application/msword",                        // ExifTool.pm:656
+        "DOTM" => "application/vnd.ms-word.template.macroEnabledTemplate", // ExifTool.pm:657
+        "DOTX" => "application/vnd.openxmlformats-officedocument.wordprocessingml.template", // ExifTool.pm:658
+        "DPX" => "image/x-dpx",                               // ExifTool.pm:659
+        "DR4" => "application/octet-stream",                  // ExifTool.pm:660
+        "DS2" => "audio/x-ds2",                               // ExifTool.pm:661
+        "DSF" => "audio/x-dsf",                               // ExifTool.pm:662
+        "DSS" => "audio/x-dss",                               // ExifTool.pm:663
+        "DV" => "video/x-dv",                                 // ExifTool.pm:664
+        "DVR-MS" => "video/x-ms-dvr",                         // ExifTool.pm:665
+        "DWF" => "model/vnd.dwf",                             // ExifTool.pm:666
+        "DWG" => "image/vnd.dwg",                             // ExifTool.pm:667
+        "DXF" => "application/dxf",                           // ExifTool.pm:668
+        "EIP" => "application/x-captureone",                  // ExifTool.pm:669
+        "EPS" => "application/postscript",                    // ExifTool.pm:670
+        "ERF" => "image/x-epson-erf",                         // ExifTool.pm:671
+        "EXE" => "application/octet-stream",                  // ExifTool.pm:672
+        "EXR" => "image/x-exr",                               // ExifTool.pm:673
+        "EXV" => "image/x-exv",                               // ExifTool.pm:674
+        "FFF" => "image/x-hasselblad-fff",                    // ExifTool.pm:675
+        "FIT" => "application/fit",                           // ExifTool.pm:676
+        "FITS" => "image/fits",                               // ExifTool.pm:677
+        "FLA" => "application/vnd.adobe.fla",                 // ExifTool.pm:678
+        "FLAC" => "audio/flac",                               // ExifTool.pm:679
+        "FLIF" => "image/flif",                               // ExifTool.pm:680
+        "FLIR" => "image/x-flir-fff",                         // ExifTool.pm:681
+        "FLV" => "video/x-flv",                               // ExifTool.pm:682
+        "Font" => "application/x-font-type1",                 // ExifTool.pm:683
+        "FPF" => "image/x-flir-fpf",                          // ExifTool.pm:684
+        "FPX" => "image/vnd.fpx",                             // ExifTool.pm:685
+        "GIF" => "image/gif",                                 // ExifTool.pm:686
+        "GPR" => "image/x-gopro-gpr",                         // ExifTool.pm:687
+        "GZIP" => "application/x-gzip",                        // ExifTool.pm:688
+        "HDP" => "image/vnd.ms-photo",                        // ExifTool.pm:689
+        "HDR" => "image/vnd.radiance",                        // ExifTool.pm:690
+        "HTML" => "text/html",                                // ExifTool.pm:691
+        "ICC" => "application/vnd.iccprofile",                // ExifTool.pm:692
+        "ICO" => "image/x-icon",                              // ExifTool.pm:693
+        "ICS" => "text/calendar",                             // ExifTool.pm:694
+        "IDML" => "application/vnd.adobe.indesign-idml-package", // ExifTool.pm:695
+        "IIQ" => "image/x-raw",                               // ExifTool.pm:696
+        "IND" => "application/x-indesign",                    // ExifTool.pm:697
+        "INX" => "application/x-indesign-interchange",        // ExifTool.pm:698
+        "ISO" => "application/x-iso9660-image",               // ExifTool.pm:699
+        "ITC" => "application/itunes",                        // ExifTool.pm:700
+        "J2C" => "image/x-j2c",                               // ExifTool.pm:701
+        "JNG" => "image/jng",                                 // ExifTool.pm:702
+        "JP2" => "image/jp2",                                 // ExifTool.pm:703
+        "JPEG" => "image/jpeg",                               // ExifTool.pm:704
+        "JPH" => "image/jph",                                 // ExifTool.pm:705
+        "JPM" => "image/jpm",                                 // ExifTool.pm:706
+        "JPS" => "image/x-jps",                               // ExifTool.pm:707
+        "JPX" => "image/jpx",                                 // ExifTool.pm:708
+        "JSON" => "application/json",                          // ExifTool.pm:709
+        "JUMBF" => "application/octet-stream",                 // ExifTool.pm:710
+        "JXL" => "image/jxl",                                 // ExifTool.pm:711
+        "JXR" => "image/jxr",                                 // ExifTool.pm:712
+        "K25" => "image/x-kodak-k25",                          // ExifTool.pm:713
+        "KDC" => "image/x-kodak-kdc",                          // ExifTool.pm:714
+        "KEY" => "application/x-iwork-keynote-sffkey",         // ExifTool.pm:715
+        "LFP" => "image/x-lytro-lfp",                          // ExifTool.pm:716
+        "LIF" => "image/x-lif",                                // ExifTool.pm:717
+        "LNK" => "application/octet-stream",                   // ExifTool.pm:718
+        "LRI" => "image/x-light-lri",                          // ExifTool.pm:719
+        "M2T" => "video/mpeg",                                 // ExifTool.pm:720
+        "M2TS" => "video/m2ts",                                // ExifTool.pm:721
+        "MAX" => "application/x-3ds",                           // ExifTool.pm:722
+        "MEF" => "image/x-mamiya-mef",                          // ExifTool.pm:723
+        "MIE" => "application/x-mie",                            // ExifTool.pm:724
+        "MIFF" => "application/x-magick-image",                  // ExifTool.pm:725
+        "MKA" => "audio/x-matroska",                             // ExifTool.pm:726
+        "MKS" => "application/x-matroska",                       // ExifTool.pm:727
+        "MKV" => "video/x-matroska",                             // ExifTool.pm:728
+        "MNG" => "video/mng",                                    // ExifTool.pm:729
+        "MOBI" => "application/x-mobipocket-ebook",              // ExifTool.pm:730
+        "MOI" => "application/octet-stream",                     // ExifTool.pm:731
+        "MOS" => "image/x-raw",                                  // ExifTool.pm:732
+        "MOV" => "video/quicktime",                              // ExifTool.pm:733
+        "MP3" => "audio/mpeg",                                   // ExifTool.pm:734
+        "MP4" => "video/mp4",                                    // ExifTool.pm:735
+        "MPC" => "audio/x-musepack",                             // ExifTool.pm:736
+        "MPEG" => "video/mpeg",                                  // ExifTool.pm:737
+        "MRC" => "image/x-mrc",                                  // ExifTool.pm:738
+        "MRW" => "image/x-minolta-mrw",                          // ExifTool.pm:739
+        "MXF" => "application/mxf",                               // ExifTool.pm:740
+        "NEF" => "image/x-nikon-nef",                            // ExifTool.pm:741
+        "NKSC" => "application/x-nikon-nxstudio",                // ExifTool.pm:742
+        "NRW" => "image/x-nikon-nrw",                            // ExifTool.pm:743
+        "NUMBERS" => "application/x-iwork-numbers-sffnumbers",   // ExifTool.pm:744
+        "ODB" => "application/vnd.oasis.opendocument.database",  // ExifTool.pm:745
+        "ODC" => "application/vnd.oasis.opendocument.chart",     // ExifTool.pm:746
+        "ODF" => "application/vnd.oasis.opendocument.formula",   // ExifTool.pm:747
+        "ODG" => "application/vnd.oasis.opendocument.graphics",  // ExifTool.pm:748
+        "ODI" => "application/vnd.oasis.opendocument.image",     // ExifTool.pm:749
+        "ODP" => "application/vnd.oasis.opendocument.presentation", // ExifTool.pm:750
+        "ODS" => "application/vnd.oasis.opendocument.spreadsheet", // ExifTool.pm:751
+        "ODT" => "application/vnd.oasis.opendocument.text",      // ExifTool.pm:752
+        "OGG" => "audio/ogg",                                    // ExifTool.pm:753
+        "OGV" => "video/ogg",                                    // ExifTool.pm:754
+        "ONP" => "application/on1",                               // ExifTool.pm:755
+        "ORF" => "image/x-olympus-orf",                          // ExifTool.pm:756
+        "OTF" => "application/font-otf",                          // ExifTool.pm:757
+        "PAGES" => "application/x-iwork-pages-sffpages",         // ExifTool.pm:758
+        "PBM" => "image/x-portable-bitmap",                      // ExifTool.pm:759
+        "PCAP" => "application/vnd.tcpdump.pcap",                // ExifTool.pm:760
+        "PCD" => "image/x-photo-cd",                             // ExifTool.pm:761
+        "PCX" => "image/pcx",                                     // ExifTool.pm:762
+        "PDB" => "application/vnd.palm",                          // ExifTool.pm:763
+        "PDF" => "application/pdf",                               // ExifTool.pm:764
+        "PEF" => "image/x-pentax-pef",                           // ExifTool.pm:765
+        "PFA" => "application/x-font-type1",                      // ExifTool.pm:766
+        "PGF" => "image/pgf",                                     // ExifTool.pm:767
+        "PGM" => "image/x-portable-graymap",                     // ExifTool.pm:768
+        "PHP" => "application/x-httpd-php",                       // ExifTool.pm:769
+        "PICT" => "image/pict",                                   // ExifTool.pm:770
+        "PLIST" => "application/xml",                              // ExifTool.pm:771
+        "PMP" => "image/x-sony-pmp",                              // ExifTool.pm:772
+        "PNG" => "image/png",                                     // ExifTool.pm:773
+        "POT" => "application/vnd.ms-powerpoint",                 // ExifTool.pm:774
+        "POTM" => "application/vnd.ms-powerpoint.template.macroEnabled.12", // ExifTool.pm:775
+        "POTX" => "application/vnd.openxmlformats-officedocument.presentationml.template", // ExifTool.pm:776
+        "PPAM" => "application/vnd.ms-powerpoint.addin.macroEnabled.12", // ExifTool.pm:777
+        "PPAX" => "application/vnd.openxmlformats-officedocument.presentationml.addin", // ExifTool.pm:778
+        "PPM" => "image/x-portable-pixmap",                       // ExifTool.pm:779
+        "PPS" => "application/vnd.ms-powerpoint",                 // ExifTool.pm:780
+        "PPSM" => "application/vnd.ms-powerpoint.slideshow.macroEnabled.12", // ExifTool.pm:781
+        "PPSX" => "application/vnd.openxmlformats-officedocument.presentationml.slideshow", // ExifTool.pm:782
+        "PPT" => "application/vnd.ms-powerpoint",                 // ExifTool.pm:783
+        "PPTM" => "application/vnd.ms-powerpoint.presentation.macroEnabled.12", // ExifTool.pm:784
+        "PPTX" => "application/vnd.openxmlformats-officedocument.presentationml.presentation", // ExifTool.pm:785
+        "PS" => "application/postscript",                         // ExifTool.pm:786
+        "PSD" => "application/vnd.adobe.photoshop",               // ExifTool.pm:787
+        "PSP" => "image/x-paintshoppro",                          // ExifTool.pm:788
+        "QTIF" => "image/x-quicktime",                            // ExifTool.pm:789
+        "R3D" => "video/x-red-r3d",                               // ExifTool.pm:790
+        "RA" => "audio/x-pn-realaudio",                           // ExifTool.pm:791
+        "RAF" => "image/x-fujifilm-raf",                          // ExifTool.pm:792
+        "RAM" => "audio/x-pn-realaudio",                          // ExifTool.pm:793
+        "RAR" => "application/x-rar-compressed",                  // ExifTool.pm:794
+        "RAW" => "image/x-raw",                                   // ExifTool.pm:795
+        "RM" => "application/vnd.rn-realmedia",                   // ExifTool.pm:796
+        "RMVB" => "application/vnd.rn-realmedia-vbr",             // ExifTool.pm:797
+        "RPM" => "audio/x-pn-realaudio-plugin",                   // ExifTool.pm:798
+        "RSRC" => "application/ResEdit",                          // ExifTool.pm:799
+        "RTF" => "text/rtf",                                      // ExifTool.pm:800
+        "RV" => "video/vnd.rn-realvideo",                         // ExifTool.pm:801
+        "RW2" => "image/x-panasonic-rw2",                         // ExifTool.pm:802
+        "RWL" => "image/x-leica-rwl",                             // ExifTool.pm:803
+        "RWZ" => "image/x-rawzor",                                // ExifTool.pm:804
+        "SEQ" => "image/x-flir-seq",                              // ExifTool.pm:805
+        "SKETCH" => "application/sketch",                         // ExifTool.pm:806
+        "SR2" => "image/x-sony-sr2",                              // ExifTool.pm:807
+        "SRF" => "image/x-sony-srf",                              // ExifTool.pm:808
+        "SRW" => "image/x-samsung-srw",                           // ExifTool.pm:809
+        "SVG" => "image/svg+xml",                                 // ExifTool.pm:810
+        "SWF" => "application/x-shockwave-flash",                 // ExifTool.pm:811
+        "TAR" => "application/x-tar",                              // ExifTool.pm:812
+        "THMX" => "application/vnd.ms-officetheme",               // ExifTool.pm:813
+        "TIFF" => "image/tiff",                                   // ExifTool.pm:814
+        "TNEF" => "application/vnd.ms-tnef",                      // ExifTool.pm:815
+        "Torrent" => "application/x-bittorrent",                  // ExifTool.pm:816
+        "TTC" => "application/font-ttf",                          // ExifTool.pm:817
+        "TTF" => "application/font-ttf",                          // ExifTool.pm:818
+        "TXT" => "text/plain",                                    // ExifTool.pm:819
+        "VCard" => "text/vcard",                                  // ExifTool.pm:820
+        "VRD" => "application/octet-stream",                      // ExifTool.pm:821
+        "VSD" => "application/x-visio",                            // ExifTool.pm:822
+        "VSDX" => "application/vnd.ms-visio.drawing",             // ExifTool.pm:823
+        "WDP" => "image/vnd.ms-photo",                            // ExifTool.pm:824
+        "WEBM" => "video/webm",                                   // ExifTool.pm:825
+        "WMA" => "audio/x-ms-wma",                                // ExifTool.pm:826
+        "WMF" => "application/x-wmf",                              // ExifTool.pm:827
+        "WMV" => "video/x-ms-wmv",                                // ExifTool.pm:828
+        "WPG" => "image/x-wpg",                                   // ExifTool.pm:829
+        "WTV" => "video/x-ms-wtv",                                // ExifTool.pm:830
+        "WV" => "audio/x-wavpack",                                // ExifTool.pm:831
+        "X3F" => "image/x-sigma-x3f",                             // ExifTool.pm:832
+        "XCF" => "image/x-xcf",                                   // ExifTool.pm:833
+        "XISF" => "image/x-xisf",                                 // ExifTool.pm:834
+        "XLA" => "application/vnd.ms-excel",                      // ExifTool.pm:835
+        "XLAM" => "application/vnd.ms-excel.addin.macroEnabled.12", // ExifTool.pm:836
+        "XLS" => "application/vnd.ms-excel",                      // ExifTool.pm:837
+        "XLSB" => "application/vnd.ms-excel.sheet.binary.macroEnabled.12", // ExifTool.pm:838
+        "XLSM" => "application/vnd.ms-excel.sheet.macroEnabled.12", // ExifTool.pm:839
+        "XLSX" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // ExifTool.pm:840
+        "XLT" => "application/vnd.ms-excel",                      // ExifTool.pm:841
+        "XLTM" => "application/vnd.ms-excel.template.macroEnabled.12", // ExifTool.pm:842
+        "XLTX" => "application/vnd.openxmlformats-officedocument.spreadsheetml.template", // ExifTool.pm:843
+        "XML" => "application/xml",                                // ExifTool.pm:844
+        "XMP" => "application/rdf+xml",                            // ExifTool.pm:845
+        "ZIP" => "application/zip",                                // ExifTool.pm:846
+        _ => return None,
+    })
+}
+
+/// `%fileTypeExt` (ExifTool.pm:590-600), verbatim. The typical extension
+/// for a file TYPE *when it differs from the type name* — exactly 9 keys.
+/// "case is not significant" (ExifTool.pm:589 comment): the values are the
+/// lowercase Perl literals; `SetFileType` uppercases (`uc $normExt`) then
+/// PrintConv `lc` (ExifTool.pm:1433), so case is round-tripped faithfully.
+/// A TYPE absent here yields `None` ⇒ Perl `$normExt = $fileType`
+/// (ExifTool.pm:9698,9720).
+#[must_use]
+pub(crate) fn file_type_ext_lookup(file_type: &str) -> Option<&'static str> {
+    Some(match file_type {
+        "Canon 1D RAW" => "tif", // ExifTool.pm:591
+        "DICOM" => "dcm",        // ExifTool.pm:592
+        "FLIR" => "fff",         // ExifTool.pm:593
+        "GZIP" => "gz",          // ExifTool.pm:594
+        "JPEG" => "jpg",         // ExifTool.pm:595
+        "M2TS" => "mts",         // ExifTool.pm:596
+        "MPEG" => "mpg",         // ExifTool.pm:597
+        "TIFF" => "tif",         // ExifTool.pm:598
+        "VCard" => "vcf",        // ExifTool.pm:599
+        _ => return None,
+    })
+}
+
+/// Faithful `@fileTypeLookup{$key}` *root-type-as-string* accessor for the
+/// `SetFileType` sub-type-by-ext block (ExifTool.pm:9686-9692).
+///
+/// In Perl, a `%fileTypeLookup` value is either a string alias
+/// (`AIF => 'AIFF'`), a single-type arrayref (`['TYPE','desc']`), or a
+/// multi-type arrayref whose first element is itself an arrayref
+/// (`[['ZIP','FPX'],'desc']`). The block tests:
+/// ```text
+///   my ($f,$e) = @fileTypeLookup{$fileType,$ext};
+///   if (ref $f eq 'ARRAY' and ref $e eq 'ARRAY' and $$f[0] eq $$e[0]) { ...
+/// ```
+/// `ref $X eq 'ARRAY'` is true for single AND multi rows (both arrayrefs)
+/// but false for a string alias. `$$X[0]` is then string-compared: for a
+/// single row it is the TYPE string; for a multi row it is an *arrayref*,
+/// which `eq` (string comparison) can never equal another row's first
+/// element across keys (and never equals a single row's string). So the
+/// `$$f[0] eq $$e[0]` test succeeds *only* when BOTH rows are single-type.
+///
+/// This returns `Some(types[0])` for a [`Lookup::Single`] (Perl: `$$X[0]`
+/// is the TYPE string), and `None` for [`Lookup::Multi`] (Perl: `$$X[0]`
+/// is an arrayref — never string-equal) or [`Lookup::Alias`]/absent key
+/// (Perl: `ref` test fails). Direct hash access — NO alias resolution
+/// (Perl `@fileTypeLookup{...}` is a plain slice).
+#[must_use]
+pub(crate) fn file_type_lookup_root(key: &str) -> Option<&'static str> {
+    match file_type_lookup(key)? {
+        Lookup::Single(types, _) => Some(types[0]),
+        // Multi: Perl `$$X[0]` is an arrayref ⇒ never string-`eq` ⇒ as if
+        // there is no comparable root. Alias: Perl `ref` test fails.
+        Lookup::Multi(..) | Lookup::Alias(_) => None,
+    }
+}
+
+/// `defined $fileTypeLookup{$key}` (the `not $fileTypeLookup{$$f[0]}` test,
+/// ExifTool.pm:9690): does the key exist in `%fileTypeLookup` at all
+/// (any value shape: alias, single, or multi)? Direct hash access, no
+/// alias resolution. Perl `not $hash{$k}` is true when the key is absent
+/// (undef) — every present `%fileTypeLookup` value is a truthy arrayref or
+/// non-empty string, so "defined" == "truthy" here, exactly.
+#[must_use]
+pub(crate) fn file_type_lookup_defined(key: &str) -> bool {
+    file_type_lookup(key).is_some()
+}
+
 /// `@fileTypes` master scan order (ExifTool.pm:197-204), verbatim. The
 /// content-gated selection loop (`ExtractInfo`) appends every entry not in
 /// the `GetFileType` candidate list (in this order) so all types are tested;

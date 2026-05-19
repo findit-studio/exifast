@@ -250,6 +250,15 @@ impl Tag {
   pub fn value(&self) -> &TagValue {
     &self.value
   }
+
+  /// Replace this tag's value in place — the per-tag analogue of ExifTool
+  /// overwriting `$$self{VALUE}{$tag}` (`ExifTool.pm:9717,9722,9724`).
+  /// Crate-internal: the only faithful caller is [`Metadata::set_tag_value`]
+  /// (the `OverrideFileType` path); regular extraction still appends via
+  /// [`Metadata::push`].
+  pub(crate) fn set_value(&mut self, value: TagValue) {
+    self.value = value;
+  }
 }
 
 /// The full result of reading a file.
@@ -258,16 +267,19 @@ pub struct Metadata {
   source_file: SmolStr,
   tags: Vec<Tag>,
   warnings: Vec<SmolStr>,
+  errors: Vec<SmolStr>,
 }
 
 impl Metadata {
-  /// Construct a `Metadata` for the given source file path (tags and warnings empty).
+  /// Construct a `Metadata` for the given source file path (tags, warnings
+  /// and errors empty).
   #[must_use]
   pub fn new(source_file: impl Into<SmolStr>) -> Self {
     Self {
       source_file: source_file.into(),
       tags: Vec::new(),
       warnings: Vec::new(),
+      errors: Vec::new(),
     }
   }
 
@@ -289,6 +301,18 @@ impl Metadata {
     &self.warnings
   }
 
+  /// Errors (ExifTool emits these as its generated `Error` tag). Mirrors
+  /// [`warnings`](Self::warnings): `Error` is defined in `Image::ExifTool::
+  /// Extra` (`ExifTool.pm:1288-1296`) with `Groups => \%allGroupsExifTool`
+  /// (group1 `ExifTool`, `ExifTool.pm:1225`) — exactly like `Warning`
+  /// (`ExifTool.pm:1297`). `sub Error` (`ExifTool.pm:5648`) is the plain
+  /// `$self->FoundTag('Error', $str)`, so the serializer emits the first as
+  /// `ExifTool:Error` under `-j -G1`.
+  #[must_use]
+  pub fn errors(&self) -> &[SmolStr] {
+    &self.errors
+  }
+
   /// Append a tag in extraction order.
   pub fn push(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
     self.tags.push(Tag::new(group, name, value));
@@ -300,6 +324,55 @@ impl Metadata {
   /// `ExifTool:Warning` under `-j -G1` (`ExifTool.pm:1225`).
   pub fn push_warning(&mut self, warning: impl Into<SmolStr>) {
     self.warnings.push(warning.into());
+  }
+
+  /// Record an error, in occurrence order — the faithful analogue of
+  /// `sub Error` (`ExifTool.pm:5648` `$self->FoundTag('Error', $str)`; the
+  /// plain read path has no `DemoteErrors`/`IgnoreMinorErrors`, so it is
+  /// exactly `FoundTag`, like `Warn`). ExifTool surfaces these as its
+  /// generated `Error` tag (`ExifTool.pm:1288-1296`); the serializer emits
+  /// the first as `ExifTool:Error` under `-j -G1` (`ExifTool.pm:1225`).
+  /// Mirrors [`push_warning`](Self::push_warning) exactly.
+  pub fn push_error(&mut self, error: impl Into<SmolStr>) {
+    self.errors.push(error.into());
+  }
+
+  /// Is `File:FileType` (family-1 `File`) already on this metadata? Faithful
+  /// to ExifTool's per-file `$$self{FileType}` marker: every `SetFileType`
+  /// call pushes `File:FileType` as its first FoundTag (`ExifTool.pm:9702`),
+  /// AND `$$self{FileType} = $fileType` engages first-call-wins
+  /// (`ExifTool.pm:9701`). Since `$self` outlives the per-`Process<Type>`
+  /// invocation, this marker is FILE-scoped, not candidate-scoped — a second
+  /// candidate's `SetFileType` is faithfully a no-op (`ExifTool.pm:9681`
+  /// `unless ($$self{FileType} and not $$self{DOC_NUM})`).
+  #[must_use]
+  pub fn has_file_type(&self) -> bool {
+    self
+      .tags
+      .iter()
+      .any(|t| t.group().family1() == "File" && t.name() == "FileType")
+  }
+
+  /// Replace the value of the existing tag identified by `group` (family-0
+  /// AND family-1) + `name`, in place — the faithful analogue of ExifTool
+  /// overwriting `$$self{VALUE}{$tag}` (`ExifTool.pm:9717,9722,9724`).
+  /// Returns `true` if such a tag existed and was replaced; `false` (no-op)
+  /// if absent (mirrors `OverrideFileType`'s `if defined
+  /// $$self{VALUE}{FileType}` guard, `ExifTool.pm:9715`). Append-style
+  /// [`push`](Self::push) would be non-faithful here: the serializer's
+  /// `%noDups` first-wins would keep the pre-override value.
+  pub fn set_tag_value(&mut self, group: &Group, name: &str, value: TagValue) -> bool {
+    match self
+      .tags
+      .iter_mut()
+      .find(|t| t.group() == group && t.name() == name)
+    {
+      Some(tag) => {
+        tag.set_value(value);
+        true
+      }
+      None => false,
+    }
   }
 }
 
@@ -323,5 +396,69 @@ mod tests {
     let names: Vec<&str> = m.tags().iter().map(Tag::name).collect();
     assert_eq!(names, ["FileType", "SampleRate"]);
     assert_eq!(m.tags()[1].group().family1(), "AAC");
+  }
+
+  #[test]
+  fn set_tag_value_replaces_existing_in_place() {
+    // Faithful `$$self{VALUE}{FileType}=x` overwrite (ExifTool.pm:9717):
+    // an existing tag's value is replaced in place — NOT appended.
+    let mut m = Metadata::new("x");
+    m.push(
+      Group::new("File", "File"),
+      "FileType",
+      TagValue::Str("M4A".into()),
+    );
+    m.push(Group::new("AAC", "AAC"), "SampleRate", TagValue::I64(44100));
+    let before = m.tags().len();
+    let replaced = m.set_tag_value(
+      &Group::new("File", "File"),
+      "FileType",
+      TagValue::Str("AAC".into()),
+    );
+    assert!(replaced); // existed ⇒ true
+    assert_eq!(m.tags().len(), before); // no new tag appended
+    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
+    assert_eq!(ft.value(), &TagValue::Str("AAC".into())); // value changed
+                                                          // exactly one FileType tag — the value was overwritten, not duplicated.
+    assert_eq!(
+      m.tags().iter().filter(|t| t.name() == "FileType").count(),
+      1
+    );
+  }
+
+  #[test]
+  fn set_tag_value_absent_is_noop() {
+    // Mirrors `OverrideFileType`'s `if defined $$self{VALUE}{FileType}`
+    // guard (ExifTool.pm:9715): absent ⇒ false, nothing changes.
+    let mut m = Metadata::new("x");
+    m.push(Group::new("AAC", "AAC"), "SampleRate", TagValue::I64(44100));
+    let before = m.tags().len();
+    let replaced = m.set_tag_value(
+      &Group::new("File", "File"),
+      "FileType",
+      TagValue::Str("AAC".into()),
+    );
+    assert!(!replaced); // absent ⇒ false
+    assert_eq!(m.tags().len(), before); // len unchanged
+  }
+
+  #[test]
+  fn set_tag_value_requires_both_group_families() {
+    // ExifTool's `%VALUE` is keyed by tag within a group identity; our
+    // `Group` carries family-0 AND family-1 and both must match (a tag with
+    // the right name but a different group is NOT the target).
+    let mut m = Metadata::new("x");
+    m.push(
+      Group::new("AAC", "AAC"),
+      "FileType",
+      TagValue::Str("nope".into()),
+    );
+    let replaced = m.set_tag_value(
+      &Group::new("File", "File"),
+      "FileType",
+      TagValue::Str("AAC".into()),
+    );
+    assert!(!replaced);
+    assert_eq!(m.tags()[0].value(), &TagValue::Str("nope".into()));
   }
 }
