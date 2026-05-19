@@ -16,3 +16,10 @@
 
 /target
 Cargo.lock
+
+# Stray default output of `rustc <file>.rs` (scratch compiles)
+/rust_out
+rust_out
+
+# Internal planning docs (specs/plans) — kept local, not published
+/docs/
