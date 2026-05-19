@@ -1,11 +1,20 @@
-//! A template for creating Rust open-source repo on GitHub
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, allow(unused_attributes))]
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+//! `exifast`: a faithful Rust port of ExifTool's metadata reader.
+//!
+//! Stage 1 scope: video/audio formats, read-only. Per-format port status
+//! is tracked in `FORMATS.md` at the repository root.
 #![deny(missing_docs)]
+#![forbid(unsafe_code)]
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
-extern crate alloc as std;
+pub mod convert;
+pub mod error;
+pub mod filetype;
+pub mod jsondiff;
+pub mod reader;
+pub mod serialize;
+pub mod tagtable;
+pub mod value;
 
-#[cfg(feature = "std")]
-extern crate std;
+pub use error::{Error, OutOfBounds, Result, UnexpectedEof};
+pub use value::{Group, Metadata, Rational, Tag, TagValue};

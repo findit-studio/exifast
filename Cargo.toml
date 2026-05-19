@@ -1,28 +1,31 @@
 [package]
-name = "template-rs"
+name = "exifast"
 version = "0.0.0"
 edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
-license = "MIT OR Apache-2.0"
-rust-version = "1.73"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
+repository = "https://github.com/Findit-AI/exifast"
+homepage = "https://github.com/Findit-AI/exifast"
+documentation = "https://docs.rs/exifast"
+description = "A 1:1 Rust port of ExifTool's metadata reader (video/audio, Stage 1)"
+license = "GPL-3.0-or-later"
+rust-version = "1.74"
 
 [features]
-default = ["std"]
-alloc = []
-std = []
+default = []
 
 [dependencies]
+derive_more = { version = "2", features = ["is_variant", "unwrap", "try_unwrap"] }
+serde = { version = "1", features = ["derive"] }
+smol_str = "0.3"
+# `raw_value` exposes `serde_json::value::RawValue`, used by `jsondiff` to
+# compare scalar lexemes byte-for-byte (strings escape-exact, numbers
+# token-exact). This subsumes the old `arbitrary_precision` number path, and
+# `preserve_order` is no longer needed because `serialize` builds the JSON
+# string directly (no `serde_json` round-trip).
+serde_json = { version = "1", features = ["raw_value"] }
 
 [dev-dependencies]
-criterion = "0.8"
+# `serde_json` is a normal dependency (above) and is already visible to
+# unit and integration tests, so it is intentionally NOT duplicated here.
 tempfile = "3"
 
 [profile.bench]
@@ -42,7 +45,3 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }

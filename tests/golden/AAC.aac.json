@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "AAC.aac",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AAC",
+  "File:FileTypeExtension": "aac",
+  "File:MIMEType": "audio/aac",
+  "AAC:ProfileType": "Low Complexity",
+  "AAC:SampleRate": 44100,
+  "AAC:Channels": 2,
+  "AAC:Encoder": "Lavc57.107.100"
+}]
