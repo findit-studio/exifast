@@ -1,8 +1,10 @@
 //! Runs a raw value through a `TagDef`'s ValueConv then PrintConv, producing
 //! the value that appears in `-j` output (PrintConv on) — ExifTool's pipeline.
 
-use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv};
-use crate::value::{format_g, TagValue};
+use crate::{
+  tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
+  value::{format_g, TagValue},
+};
 use smol_str::SmolStr;
 
 /// The conversion stage, faithful to ExifTool's `$convType` (`ExifTool.pm`
@@ -13,13 +15,10 @@ use smol_str::SmolStr;
 /// the stage discriminator ExifTool already threads as `$convType`.)
 #[derive(Clone, Copy, derive_more::IsVariant)]
 enum ConvType {
-  /// ExifTool `$convType eq 'ValueConv'`. Faithfully part of the
-  /// discriminator (a hash conv applied as ValueConv must take the generic
-  /// `Unknown ($val)` branch, not the PrintHex hex form,
-  /// `ExifTool.pm:3618`). Stage-1 ValueConvs are all `Func`, never a hash,
-  /// so the public pipeline never constructs this arm yet; the conv-type
-  /// gate is exercised by `printhex_hex_form_not_applied_in_value_conv_stage`.
-  #[allow(dead_code)]
+  /// ExifTool `$convType eq 'ValueConv'` — now also constructed for hash ValueConvs (AAC SampleRate).
+  /// Faithfully part of the discriminator (a hash conv applied as ValueConv
+  /// must take the generic `Unknown ($val)` branch, not the PrintHex hex
+  /// form, `ExifTool.pm:3618`).
   ValueConv,
   /// ExifTool `$convType eq 'PrintConv'`.
   PrintConv,
@@ -29,9 +28,22 @@ enum ConvType {
 /// `-n` switch: when `false`, the post-ValueConv value is returned (the `-n`
 /// golden), matching spec §4's two snapshots.
 pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue {
+  // ExifTool.pm:3578-3582 — the conversion loop iterates list elements for
+  // the active stage, applying the current conv per scalar `$val`. Recurse
+  // once at the top so BOTH ValueConv and PrintConv run element-wise; nested
+  // lists terminate because each recursion drops one level of nesting.
+  if let TagValue::List(items) = raw {
+    return TagValue::List(
+      items
+        .iter()
+        .map(|it| apply(def, it, print_conv_enabled))
+        .collect(),
+    );
+  }
   let valued = match def.value_conv() {
     ValueConv::None => raw.clone(),
     ValueConv::Func(f) => f(raw),
+    ValueConv::Hash(h) => apply_hash_conv(def, &h, raw, ConvType::ValueConv),
   };
   if !print_conv_enabled {
     return valued;
@@ -43,7 +55,9 @@ pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue
 /// list value (`ExifTool.pm:3578-3582` seeds `$val = $$vals[0]` then loops
 /// `for(;;)` advancing through `@$value`, applying `$conv` each pass), so for
 /// a [`TagValue::List`] we recurse element-wise and rebuild the list — for
-/// every `PrintConv` variant, not just the hash.
+/// every `PrintConv` variant, not just the hash. `apply` now pre-recurses on
+/// `List` at the top, so this arm is defense-in-depth: it only fires if a
+/// caller invokes `apply_print_conv` directly on a list (vanishingly rare).
 fn apply_print_conv(
   def: &TagDef,
   conv: PrintConv,
@@ -184,11 +198,29 @@ fn is_int(s: &str) -> bool {
 /// `$val & (1 << $i)` where `$val` is a string in numeric context.
 ///
 /// Perl string→number coercion: takes the longest leading prefix matching
-/// `[+-]? ( \d+ \.? \d* | \. \d+ ) ( [eE] [+-]? \d+ )?`, evaluates as
-/// `f64`, then truncates toward zero (`int()`) for the integer value used in
-/// bitwise `&`. No leading prefix ⇒ 0; no hex parsing of `"0x…"` strings
-/// (Perl: `"0x05"+0 == 0`). Negatives fold via `as u64` (two's-complement
-/// low 64 bits), identical to Perl `$val & (1<<$i)` for negative values.
+/// `[+-]? ( \d+ \.? \d* | \. \d+ ) ( [eE] [+-]? \d+ )?`. The matched prefix
+/// is then classified:
+///
+/// - **Pure integer** (sign + digits, no `.` and no `[eE]` consumed): mapped
+///   to the exact 64-bit value Perl's bitwise `&` uses. On 64-bit Perl an
+///   integer-valued scalar `0..2^64-1` is a UV (unsigned 64-bit) and `&`
+///   forces operands to UV, so `0..=u64::MAX` map verbatim (bit 63 and any
+///   `|n| > 2^53` survive — no f64 rounding). Negative integers are
+///   two's-complement 64-bit (Perl `-1 & X == 0xFFFF…FFFF & X`). Magnitudes
+///   that exceed the 64-bit window (real BITMASK tables never carry these)
+///   saturate: `> u64::MAX ⇒ u64::MAX`, `< i64::MIN ⇒ i64::MIN`.
+/// - **Float/exponent** (a `.` or `[eE]` was consumed): Perl keeps an NV
+///   (double) operand for `&`, but `&` then converts it with the SAME
+///   64-bit rule as the integer path — non-negative NV → UV (truncated
+///   toward zero, exact in `[0, 2^64)`, saturating to `u64::MAX` at/above
+///   `2^64`); negative NV → IV then UV reinterpret (two's-complement,
+///   saturating at `i64::MIN`). f64's rounding is faithful because Perl's
+///   NV is the same IEEE double (e.g. `"18446744073709551615.0"` rounds to
+///   `2^64` in both).
+///
+/// No leading prefix ⇒ 0; no hex parsing of `"0x…"` strings
+/// (Perl: `"0x05"+0 == 0`). Negative semantics are covered per-path above
+/// (integer and float alike: two's-complement 64-bit).
 fn perl_numeric_coerce(word: &str) -> u64 {
   // Parse the longest leading numeric prefix matching Perl's rules.
   // We handle sign, then integer digits, optional dot+fraction, optional exponent.
@@ -200,6 +232,9 @@ fn perl_numeric_coerce(word: &str) -> u64 {
   }
   // Must have at least one digit (or a dot followed by a digit).
   let start_after_sign = i;
+  // Pure integer until we actually consume a `.` (with a fraction context)
+  // or an exponent — then Perl carries an NV (double) into `&`.
+  let mut is_integer = true;
   // Integer digits.
   while i < bytes.len() && bytes[i].is_ascii_digit() {
     i += 1;
@@ -215,6 +250,8 @@ fn perl_numeric_coerce(word: &str) -> u64 {
     if i == dot_pos + 1 && start_after_sign == dot_pos {
       return 0;
     }
+    // A `.` is part of the prefix ⇒ Perl float (NV) ⇒ f64 path.
+    is_integer = false;
   }
   // Optional exponent.
   if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
@@ -230,6 +267,9 @@ fn perl_numeric_coerce(word: &str) -> u64 {
     // No digits after [eE] => do not consume exponent.
     if i == exp_digits_start {
       i = exp_pos;
+    } else {
+      // A consumed exponent ⇒ Perl float (NV) ⇒ f64 path.
+      is_integer = false;
     }
   }
   // No numeric prefix found (only a sign, or nothing at all) ⇒ 0.
@@ -237,26 +277,46 @@ fn perl_numeric_coerce(word: &str) -> u64 {
     return 0;
   }
   let prefix = &word[..i];
-  // Parse as f64, then truncate toward zero to i64 (Perl `int()`), then
-  // reinterpret as u64 (two's-complement) for bitwise operations.
+  if is_integer {
+    // Pure integer prefix: exact 64-bit (Perl UV/IV) — `$val & (1<<$i)`
+    // forces a UV, so non-negative integers up to u64::MAX map verbatim
+    // (bit 63 / >2^53 survive), negatives fold two's-complement.
+    return match prefix.parse::<i128>() {
+      Ok(v) if (0..=(u64::MAX as i128)).contains(&v) => v as u64,
+      Ok(v) if ((i64::MIN as i128)..0).contains(&v) => (v as i64) as u64,
+      // |v| beyond the 64-bit window (real BITMASK tables never reach
+      // here): saturate, preserving the historical clamp intent.
+      Ok(v) if v > u64::MAX as i128 => u64::MAX,
+      Ok(_) => i64::MIN as u64,
+      // Prefix overflows i128 itself: saturate by sign (never panic).
+      Err(_) => {
+        if prefix.as_bytes().first() == Some(&b'-') {
+          i64::MIN as u64
+        } else {
+          u64::MAX
+        }
+      }
+    };
+  }
+  // Float/exponent prefix: Perl carries an NV (incl. ±Inf/NaN) into
+  // bitwise `&` → UV (non-negative) / IV→UV two's-complement (negative).
+  // Rust's saturating `f64 as u64`/`as i64` reproduce Perl `(UV)nv`
+  // exactly (oracle: "1e309"⇒all 64, "-1e309"⇒bit 63, "1e308"⇒all 64,
+  // "-1e308"⇒bit 63). Same 64-bit rule as the integer path above
+  // (DecodeBits ExifTool.pm:6374-6396).
   match prefix.parse::<f64>() {
-    Ok(f) if f.is_finite() => {
-      // Truncate toward zero: Perl's numeric context for `&`.
-      let truncated = f.trunc();
-      // Map to i64 range, then cast to u64 for two's-complement bitwise.
-      // Values outside i64 range: clamp to i64::MIN/MAX before cast —
-      // Perl uses its native integer width; ExifTool only passes values
-      // fitting in 64 bits through real BITMASK tables.
-      let as_i64 = if truncated >= i64::MAX as f64 {
-        i64::MAX
-      } else if truncated <= i64::MIN as f64 {
+    Ok(f) if f.is_nan() => 0, // (UV)NaN ⇒ 0 (also unreachable here)
+    Ok(f) if f < 0.0 => {
+      let t = f.trunc();
+      let as_i64 = if t <= i64::MIN as f64 {
         i64::MIN
       } else {
-        truncated as i64
+        t as i64
       };
       as_i64 as u64
     }
-    _ => 0,
+    Ok(f) => f.trunc() as u64,
+    Err(_) => 0,
   }
 }
 
@@ -283,9 +343,12 @@ fn perl_numeric_coerce(word: &str) -> u64 {
 /// `split ' ', $vals` is Perl's special whitespace split: leading whitespace
 /// trimmed, fields separated by runs of whitespace (`str::split_whitespace`).
 /// Each word is taken in Perl numeric context for `$val & (1 << $i)` via
-/// [`perl_numeric_coerce`]: leading numeric prefix evaluated as f64, truncated
-/// toward zero to i64, then reinterpreted as u64 for two's-complement bitwise
-/// operations. No leading numeric prefix ⇒ 0; no hex parsing of `"0x…"`.
+/// [`perl_numeric_coerce`]: an integer leading prefix uses exact 64-bit
+/// (Perl UV/IV) semantics — `&` forces a UV, so bit 63 and any `|n| > 2^53`
+/// survive; a float/exponent prefix goes through f64 (truncated toward
+/// zero) and is mapped with the SAME 64-bit rule (non-negative → UV,
+/// negative → two's-complement). No leading numeric prefix ⇒ 0; no hex
+/// parsing of `"0x…"`.
 /// `1 << $i` over `$i` up to `$bits-1`: ExifTool only ever passes
 /// `BitsPerWord` ≤ 64 here, so a `u64` accumulator is exact for every real
 /// table; shifts of ≥ 64 are treated as 0 (Perl's bit beyond the value is
@@ -351,7 +414,8 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
     TagValue::Rational(r) => Some(r.exiftool_val_str()),
     // No faithful Perl hash key for raw bytes ⇒ miss.
     TagValue::Bytes(_) => None,
-    // Lists are handled element-wise by `apply_print_conv` before this.
+    // Lists are stripped element-wise by `apply` before any hash-conv path
+    // (and `apply_print_conv`'s list-arm defends the same on direct calls).
     TagValue::List(_) => None,
   }
 }
@@ -440,8 +504,7 @@ mod tests {
     let v = apply(&CHANNELS, &TagValue::I64(2), true);
     assert_eq!(v, TagValue::I64(2));
 
-    use crate::serialize::to_exiftool_json;
-    use crate::{Group, Metadata};
+    use crate::{serialize::to_exiftool_json, Group, Metadata};
     let mut m = Metadata::new("a.aac");
     m.push(Group::new("Audio", "AAC"), "Channels", v);
     let json = to_exiftool_json(&m);
@@ -1120,6 +1183,24 @@ mod tests {
   }
 
   #[test]
+  fn hash_value_conv_maps_then_printconv_passthrough() {
+    // Faithful to AAC.pm:18-26,46 — %convSampleRate as a ValueConv hash.
+    static SR: TagDef = TagDef::new(
+      "SampleRate",
+      "AAC",
+      ValueConv::Hash(PrintConvHash::direct(&[
+        ("4", PrintValue::I64(44100)),
+        ("11", PrintValue::I64(8000)),
+      ])),
+      PrintConv::None,
+    );
+    // -n (print_conv off): ValueConv still applies → 44100 (number).
+    assert_eq!(apply(&SR, &TagValue::I64(4), false), TagValue::I64(44100));
+    // print_conv on: ValueConv 4→44100 then PrintConv::None passthrough.
+    assert_eq!(apply(&SR, &TagValue::I64(4), true), TagValue::I64(44100));
+  }
+
+  #[test]
   fn bitmask_decodebits_applied_element_wise_over_lists() {
     // PrintConv runs over every list element (ExifTool.pm:3578-3582) for
     // the hash conv too — including the BITMASK path.
@@ -1134,6 +1215,190 @@ mod tests {
         TagValue::Str("No presentation".into()), // direct key 0
         TagValue::Str("Main track".into()),      // BITMASK bit0
         TagValue::Str("[1]".into()),             // BITMASK miss bit1
+      ])
+    );
+  }
+
+  // ── ISSUE C: exact 64-bit (Perl UV/IV) coercion for integer prefixes ──────
+  // Fixed in D10 r13c: `perl_numeric_coerce` classifies the matched leading
+  // prefix. A pure-integer prefix (sign + digits, no `.`/exponent consumed)
+  // parses via i128 and maps to the exact 64-bit UV/IV Perl's bitwise `&`
+  // uses — so bit 63 and any |n| > 2^53 survive. Only float/exponent
+  // prefixes still go through f64 (ExifTool.pm:6374-6396 `$val & (1<<$i)`:
+  // Perl forces a UV; an NV operand stays a double). Oracle: bundled Perl
+  //   perl -I/Users/user/Develop/findit-studio/exiftool/lib -MImage::ExifTool \
+  //        -e 'print Image::ExifTool::DecodeBits($ARGV[0],undef,$ARGV[1]||32)'
+
+  #[test]
+  fn decode_bits_bitsperword64_high_bit_exact() {
+    // Perl: "9223372036854775808" (2^63) is a UV; $val & (1<<63) != 0
+    // ⇒ ONLY bit 63. f64 coercion would have lost it (clamped to i64::MAX).
+    // BitsPerWord=64 (bits arg = 64). One-entry lookup mapping bit 63.
+    assert_eq!(
+      decode_bits("9223372036854775808", Some(&[(63, "Bit63")]), 64),
+      "Bit63"
+    );
+    // No lookup ⇒ raw bit number "63".
+    assert_eq!(decode_bits("9223372036854775808", None, 64), "63");
+  }
+
+  #[test]
+  fn decode_bits_integer_above_2pow53_is_exact() {
+    // 2^53 + 1 = 9007199254740993: f64 rounds to 2^53 (bit 0 lost).
+    // Faithful Perl UV keeps bit 0 set.  bits=64, map bit 0.
+    assert_eq!(
+      decode_bits("9007199254740993", Some(&[(0, "B0"), (53, "B53")]), 64),
+      "B0, B53"
+    );
+  }
+
+  #[test]
+  fn decode_bits_u64_max_all_low_bits_set() {
+    // 18446744073709551615 = u64::MAX (Perl UV): bits 0..=63 all set.
+    // Spot-check a few via a 64-wide call with no lookup. No-lookup
+    // separator is ',' (no space) — `join($lookup ? ', ' : ',', …)`,
+    // ExifTool.pm:6396; oracle: DecodeBits("18446744073709551615",
+    // undef, 64) => "0,1,2,3,…,63".
+    let out = decode_bits("18446744073709551615", None, 64);
+    assert!(out.starts_with("0,1,2,"));
+    assert!(out.ends_with(",63"));
+  }
+
+  #[test]
+  fn perl_numeric_coerce_integer_path_no_regression_small() {
+    // |n| <= 2^53: integer path must equal the historical f64 result.
+    assert_eq!(perl_numeric_coerce("0"), 0);
+    assert_eq!(perl_numeric_coerce("30"), 30);
+    assert_eq!(perl_numeric_coerce("-1"), u64::MAX); // two's-complement, unchanged
+    assert_eq!(perl_numeric_coerce("+12abc"), 12); // leading prefix only
+  }
+
+  #[test]
+  fn perl_numeric_coerce_float_path_unchanged() {
+    // Float/exponent prefixes still go through f64 trunc-toward-zero.
+    assert_eq!(perl_numeric_coerce("2.9"), 2);
+    assert_eq!(perl_numeric_coerce("1e3"), 1000);
+    assert_eq!(perl_numeric_coerce("-2.9"), (-2i64) as u64);
+  }
+
+  // ── PART A: float-path NV→UV unification (fixes residual 64-bit
+  // corruption). Oracle: bundled Perl `Image::ExifTool::DecodeBits` via
+  //   perl -I/Users/user/Develop/findit-studio/exiftool/lib -MImage::ExifTool \
+  //        -e 'print Image::ExifTool::DecodeBits($ARGV[0],undef,64)' -- '<val>'
+  // (outputs reproduced inline; re-verified 2026-05-19).
+
+  #[test]
+  fn decode_bits_float_path_high_uv_bits_exact() {
+    // Perl NV→UV: "9223372036854775808.0" (2^63) ⇒ only bit 63.
+    assert_eq!(
+      decode_bits("9223372036854775808.0", Some(&[(63, "B63")]), 64),
+      "B63"
+    );
+    assert_eq!(decode_bits("9223372036854775808.0", None, 64), "63");
+    // "1e19" = 10000000000000000000 = 0x8AC7230489E80000.
+    assert_eq!(
+      decode_bits("1e19", None, 64),
+      "19,21,22,23,24,27,31,34,40,41,45,48,49,50,54,55,57,59,63"
+    );
+    // "18446744073709551615.0" rounds (NV and f64 alike) to 2^64 ⇒
+    // Perl (UV) ⇒ all 64 bits.
+    let all = (0..64).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    assert_eq!(decode_bits("18446744073709551615.0", None, 64), all);
+  }
+
+  #[test]
+  fn decode_bits_float_path_no_regression() {
+    // Negative + small non-negative floats already matched Perl — unchanged.
+    // "-2.9" ⇒ -2 ⇒ 0xFFFF…FFFE ⇒ bits 1..63 (bit 0 unset).
+    let one_to_63 = (1..64).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    assert_eq!(decode_bits("-2.9", None, 64), one_to_63);
+    assert_eq!(decode_bits("2.9", None, 64), "1"); // 2 ⇒ bit 1
+    assert_eq!(decode_bits("1e3", None, 64), "3,5,6,7,8,9"); // 1000
+    assert_eq!(perl_numeric_coerce("2.9"), 2);
+    assert_eq!(perl_numeric_coerce("-2.9"), (-2i64) as u64);
+  }
+
+  #[test]
+  fn decode_bits_non_finite_exponent_overflow_faithful() {
+    // Perl (UV)+Inf = u64::MAX ⇒ all 64 bits; (UV)-Inf = i64::MIN as u64
+    // ⇒ bit 63 only. Oracle-verified vs bundled ExifTool DecodeBits.
+    let all = (0..64).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    assert_eq!(decode_bits("1e309", None, 64), all); // +inf
+    assert_eq!(decode_bits("9e999", None, 64), all); // +inf
+    assert_eq!(decode_bits("1e400", None, 64), all); // +inf
+    assert_eq!(decode_bits("-1e309", None, 64), "63"); // -inf
+    assert_eq!(decode_bits("-9e999", None, 64), "63"); // -inf
+  }
+
+  #[test]
+  fn decode_bits_finite_huge_unchanged_regression() {
+    // Already faithful before the fix — pin so the change is zero-regression.
+    // "1e308": finite, (UV) saturates u64::MAX. "-1e308": saturates i64::MIN.
+    let all = (0..64).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    assert_eq!(decode_bits("1e308", None, 64), all);
+    assert_eq!(decode_bits("-1e308", None, 64), "63");
+    // Pre-existing small/float vectors must still hold.
+    assert_eq!(decode_bits("2.9", None, 64), "1");
+    assert_eq!(decode_bits("1e3", None, 64), "3,5,6,7,8,9");
+  }
+
+  // ExifTool.pm:3578-3582 — the conversion loop iterates list elements for
+  // the ACTIVE stage (ValueConv as well as PrintConv). `apply` must recurse
+  // element-wise so a scalar ValueConv::Func / ValueConv::Hash never sees
+  // a `TagValue::List` as its raw scalar input.
+
+  fn plus_one(v: &TagValue) -> TagValue {
+    match v {
+      TagValue::I64(n) => TagValue::I64(n + 1),
+      x => x.clone(),
+    }
+  }
+
+  static VC_FUNC_NO_PC: TagDef =
+    TagDef::new("VCFunc", "X", ValueConv::Func(plus_one), PrintConv::None);
+
+  #[test]
+  fn apply_value_conv_func_is_element_wise_over_list() {
+    // -n mode (PrintConv off): scalar ValueConv must be applied to each
+    // element of a `List`, not to the list as a whole. Pre-fix the scalar
+    // `plus_one` would see `TagValue::List(...)` (its `_` arm clones) and
+    // return the list unchanged — a silent shape bug.
+    let list = TagValue::List(vec![TagValue::I64(1), TagValue::I64(2), TagValue::I64(3)]);
+    let out = apply(&VC_FUNC_NO_PC, &list, false);
+    assert_eq!(
+      out,
+      TagValue::List(vec![TagValue::I64(2), TagValue::I64(3), TagValue::I64(4)])
+    );
+  }
+
+  static VC_HASH_THEN_PC_HASH: TagDef = TagDef::new(
+    "VCThenPC",
+    "X",
+    ValueConv::Hash(PrintConvHash::direct(&[
+      ("1", PrintValue::I64(10)),
+      ("2", PrintValue::I64(20)),
+      ("3", PrintValue::I64(30)),
+    ])),
+    PrintConv::Hash(PrintConvHash::direct(&[
+      ("10", PrintValue::Str("A")),
+      ("20", PrintValue::Str("B")),
+      ("30", PrintValue::Str("C")),
+    ])),
+  );
+
+  #[test]
+  fn apply_value_conv_hash_then_print_conv_is_element_wise_over_list() {
+    // Both stages per element: ValueConv::Hash maps 1→10/2→20/3→30, then
+    // PrintConv::Hash maps 10→"A"/20→"B"/30→"C". Mirrors ExifTool's
+    // GetValue+ConvertValue running once per scalar element of `@$value`.
+    let list = TagValue::List(vec![TagValue::I64(1), TagValue::I64(2), TagValue::I64(3)]);
+    let out = apply(&VC_HASH_THEN_PC_HASH, &list, true);
+    assert_eq!(
+      out,
+      TagValue::List(vec![
+        TagValue::Str("A".into()),
+        TagValue::Str("B".into()),
+        TagValue::Str("C".into()),
       ])
     );
   }

@@ -297,6 +297,27 @@ pub fn to_exiftool_json(m: &Metadata) -> String {
       push_json_string(&mut out, first);
     }
   }
+  // ExifTool's generated `Error` tag: defined in `Image::ExifTool::Extra`
+  // (`ExifTool.pm:1288-1296`) with `Groups => \%allGroupsExifTool`
+  // (`ExifTool.pm:1225`) — group1 `ExifTool`, exactly like `Warning`
+  // (`ExifTool.pm:1297`). `sub Error` (`ExifTool.pm:5648`) is the plain
+  // `$self->FoundTag('Error', $str)` on the read path (no DemoteErrors /
+  // IgnoreMinorErrors options here). With `-G1` the JSON token is
+  // `$group:$tagName` (`exiftool:2948`) ⇒ exactly `"ExifTool:Error"`. It
+  // joins the SAME `%noDups` set (`exiftool:2951`) INDEPENDENTLY of the
+  // Warning token (distinct tokens), first-wins; default `-j -G1` shows
+  // only the FIRST error (the ` (N)` copy-suffix dups are dropped,
+  // `exiftool:2744`; `-a`/Duplicates not modelled — see fn doc), so we
+  // emit `m.errors()[0]` via the SAME EscapeJSON string path as Warning.
+  if let Some(first) = m.errors().first() {
+    let tok = "ExifTool:Error".to_string();
+    if seen.insert(tok.clone()) {
+      out.push_str(",\n  ");
+      push_json_string(&mut out, &tok);
+      out.push_str(": ");
+      push_json_string(&mut out, first);
+    }
+  }
   out.push_str("\n}");
   out.push_str("]\n");
   out

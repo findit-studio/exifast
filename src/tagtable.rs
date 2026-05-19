@@ -13,6 +13,10 @@ pub enum ValueConv {
   None,
   /// Pure transformation of the raw value.
   Func(fn(&TagValue) -> TagValue),
+  /// A Perl *hash* `ValueConv` (`ref $conv eq 'HASH'` applied with
+  /// `$convType eq 'ValueConv'`, ExifTool.pm conv loop). Same faithful
+  /// model as a hash `PrintConv` (`AAC.pm:46` `ValueConv => \%convSampleRate`).
+  Hash(PrintConvHash),
 }
 
 /// A single value in an ExifTool hash `PrintConv` (the right-hand side of a
@@ -113,6 +117,19 @@ impl PrintConvHash {
 }
 
 /// A print-stage conversion (ExifTool `PrintConv`).
+///
+/// ExifTool also supports `PrintConv => [arrayref of per-element convs]`
+/// (ExifTool.pm:3540-3555 `if (ref $conv eq 'ARRAY')` advances `$conv =
+/// $$convList[$num]` per value-array element); e.g. `QuickTime.pm:2626-
+/// 2631 TrackProperty` and `RIFF.pm:977-983 Statistics`. That variant is
+/// **faithfully deferred** to the FIRST Phase-2 consumer that needs it
+/// (QuickTime or RIFF, in a follow-up PR): adding `PrintConv::Array(&[
+/// PrintConv])` + the matching `apply` per-element-advance arm is a
+/// non-breaking additive extension whose Relist/RawJoin/shorter-list
+/// semantics must be derived from real Perl + oracle golden — same
+/// incremental-derivation discipline as D11 / `BitOrder::Ii` / unknown-
+/// header. None of AAC, FLAC StreamInfo, or any current pathfinder tag
+/// table needs it.
 #[derive(Clone, Copy, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
@@ -141,6 +158,11 @@ pub struct TagDef {
   print_conv: PrintConv,
   print_hex: bool,
   bits_per_word: Option<u8>,
+  /// ExifTool `$$tagInfo{Format}` (FLAC.pm:179-181).
+  /// `None` ⇒ no Format key — the tag is extracted as an unsigned integer
+  /// from the bit stream. `Some("undef")` ⇒ the value is the raw byte string
+  /// (passed to ValueConv as `TagValue::Bytes`).
+  format: Option<&'static str>,
 }
 
 impl TagDef {
@@ -163,6 +185,7 @@ impl TagDef {
       print_conv,
       print_hex: false,
       bits_per_word: None,
+      format: None,
     }
   }
 
@@ -181,6 +204,26 @@ impl TagDef {
   #[must_use]
   pub const fn with_bits_per_word(mut self, bits_per_word: u8) -> Self {
     self.bits_per_word = Some(bits_per_word);
+    self
+  }
+
+  /// Set `$$tagInfo{Format}` (FLAC.pm:181). When present, `ProcessBitStream`
+  /// skips the unsigned-integer accumulation and passes raw bytes from the
+  /// stream to `HandleTag` / `ValueConv` instead (`FLAC.pm:179-181`).
+  /// `"undef"` means the value is the raw byte string (`TagValue::Bytes`),
+  /// which a `ValueConv::Func` can then convert (e.g. FLAC MD5:
+  /// `unpack("H*",$val)` → lowercase hex string).
+  ///
+  /// NOTE: the engine currently treats *any* present `Format` identically —
+  /// the field's `Start..Start+Size` bytes are emitted as [`TagValue::Bytes`]
+  /// regardless of the string (pair it with a `ValueConv` to convert, e.g.
+  /// FLAC `MD5Signature` uses `Format="undef"` + a hex `ValueConv`).
+  /// Structured ExifTool formats (`int16u`, `int32u`, `string`, …) are NOT
+  /// yet interpreted — deferred per the Phase-2 forward items; a format that
+  /// needs one adds it then, validated against that format's golden.
+  #[must_use]
+  pub const fn with_format(mut self, format: &'static str) -> Self {
+    self.format = Some(format);
     self
   }
 
@@ -220,6 +263,14 @@ impl TagDef {
   #[must_use]
   pub const fn bits_per_word(&self) -> Option<u8> {
     self.bits_per_word
+  }
+
+  /// `$$tagInfo{Format}` (FLAC.pm:179-181); `None` ⇒ the Perl tagInfo has no
+  /// `Format` key — bit-field extracted as unsigned integer. `Some("undef")`
+  /// ⇒ raw byte string passed to `ValueConv` as [`crate::value::TagValue::Bytes`].
+  #[must_use]
+  pub const fn format(&self) -> Option<&'static str> {
+    self.format
   }
 }
 
@@ -440,5 +491,26 @@ mod tests {
     static U: TagDef = TagDef::new("U", "X", ValueConv::None, PrintConv::None);
     assert!(!U.print_hex());
     assert_eq!(U.bits_per_word(), None);
+  }
+
+  #[test]
+  fn tagdef_format_builder_and_getter() {
+    // `new()` leaves format as None (Perl tagInfo without a Format key).
+    static NO_FMT: TagDef = TagDef::new("NoFormat", "FLAC", ValueConv::None, PrintConv::None);
+    assert_eq!(NO_FMT.format(), None);
+
+    // `with_format("undef")` models `Format => 'undef'` (FLAC.pm:181):
+    // raw byte string passed through to ValueConv as TagValue::Bytes.
+    static WITH_UNDEF: TagDef =
+      TagDef::new("MD5Signature", "FLAC", ValueConv::None, PrintConv::None).with_format("undef");
+    assert_eq!(WITH_UNDEF.format(), Some("undef"));
+
+    // Round-trip: the getter returns exactly what the builder was given.
+    // Any non-empty string is accepted; the engine emits TagValue::Bytes for
+    // ALL Some(_) values — "binary", "int16u", "string", etc. are not
+    // individually dispatched (all treated identically as the raw-bytes path).
+    static CUSTOM: TagDef =
+      TagDef::new("SomeTag", "FLAC", ValueConv::None, PrintConv::None).with_format("binary");
+    assert_eq!(CUSTOM.format(), Some("binary"));
   }
 }

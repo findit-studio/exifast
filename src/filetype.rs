@@ -158,6 +158,17 @@ fn get_file_extension(name: &str) -> Option<SmolStr> {
   })
 }
 
+/// `$$self{FILE_EXT}` (ExifTool.pm:2966 `$$self{FILE_EXT} =
+/// GetFileExtension($realname)`): the uppercased, `TIF`→`TIFF`-normalized
+/// file extension, or `None` for a dotless name. This is exactly the value
+/// `SetFileType`/`OverrideFileType` read as `$ext` (ExifTool.pm:9683) — the
+/// shared seam must derive `$ext` identically to the detection path, so it
+/// reuses the same private [`get_file_extension`] (no second normalizer).
+#[must_use]
+pub fn file_ext_for_name(name: &str) -> Option<SmolStr> {
+  get_file_extension(name)
+}
+
 /// Resolve string aliases transitively: `while value is a string: value =
 /// lookup[value]`. Returns the terminal non-alias entry, or `None` if the
 /// chain is broken (unrecognized).
