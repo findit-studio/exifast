@@ -270,7 +270,18 @@ pub enum AnyParser {
   /// MOI (Phase E pilot — camcorder MOD info sidecar).
   #[cfg(feature = "moi")]
   Moi(crate::formats::moi::ProcessMoi),
-  // Phase F1 adds: Aac, Dv, Audible, Red.
+  /// AAC (Phase F1 — ADTS audio).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::ProcessAac),
+  /// DV (Phase F1 — DV video stream).
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::ProcessDv),
+  /// Audible (AA) (Phase F1 — DRM'd audiobook).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::ProcessAa),
+  /// Red R3D (Phase F1 — Redcode video).
+  #[cfg(feature = "red")]
+  R3D(crate::formats::red::ProcessR3D),
   // Phase F2 adds: Id3.
   // Phase F3 adds: Ape, Dsf, Aiff, Flac.
   // Phase F4 adds: Ogg, MpegAudio.
@@ -293,6 +304,21 @@ pub enum AnyMeta<'a> {
   /// MOI (Phase E pilot).
   #[cfg(feature = "moi")]
   Moi(crate::formats::moi::MoiMeta<'a>),
+  /// AAC (Phase F1).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::AacMeta<'a>),
+  /// DV (Phase F1). Carries the [`crate::formats::dv::DvParseOutcome`]
+  /// because DV has TWO accept paths (unrecognized-profile warn vs.
+  /// full data); the closed-enum carry must distinguish them so the
+  /// sink can warn on the former without emitting DV:* tags.
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::DvParseOutcome<'a>),
+  /// Audible (AA) (Phase F1).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::AaMeta<'a>),
+  /// Red R3D (Phase F1).
+  #[cfg(feature = "red")]
+  R3d(crate::formats::red::R3dMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
@@ -306,6 +332,22 @@ impl MetaSinker for AnyMeta<'_> {
       }
       #[cfg(feature = "moi")]
       AnyMeta::Moi(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(o) => match o {
+        // DV.pm:188 — Warn + return 1 without DV:* tags. The bridge
+        // emits the warning at the legacy `OldFormatParser::process`
+        // entry; the sink path emits no tags for this variant.
+        crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
+          out.write_warning("Unrecognized DV profile")
+        }
+        crate::formats::dv::DvParseOutcome::Meta(m) => m.sink(print_conv, out),
+      },
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(m) => m.sink(print_conv, out),
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(m) => m.sink(print_conv, out),
     }
   }
 }
