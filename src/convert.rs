@@ -389,8 +389,19 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
 /// keys are strings), and which the JSON serializer prints. Numbers use the
 /// crate's single shared `%g`/rational formatter ([`crate::value::format_g`]
 /// / [`Rational::exiftool_val_str`]) so a hash key matches the serialized
-/// `$val` text exactly. `Bytes` has no faithful Perl scalar key ⇒ `None`
-/// (caller treats it as a miss).
+/// `$val` text exactly. `Bytes` is keyed via [`fix_utf8`] (`XMP::FixUTF8`,
+/// XMP.pm:2943-2974) — the same byte-walker `EscapeJSON` runs on every
+/// string before serialization at exiftool:3822, so the hash-key lookup
+/// matches the JSON-printed `$val` text byte-for-byte. ASCII is identity
+/// (so AIFF `CompressionType` `"NONE"`/`"sowt"`/… hit the Perl hash
+/// entries exactly); high bytes that do NOT form a valid UTF-8 sequence
+/// are replaced with `?` (Perl default `$bad`). Codex R3 fix: an earlier
+/// **byte-identical Latin-1** keying diverged from Perl for
+/// `CompressionType b"\x80ABC"` (Perl ⇒ `"?ABC"`; Latin-1 ⇒ `"\u{0080}ABC"`).
+/// This `Bytes` arm subsumes the prior `None` (which made every
+/// `Bytes`-backed string[N] PrintConv hash lookup miss — flagged by Codex
+/// R1 on the AIFF `CompressionType` path once string/pstring formats
+/// started emitting `TagValue::Bytes` faithfully).
 fn exiftool_val_string(v: &TagValue) -> Option<String> {
   match v {
     // Perl stringifies an integer as its decimal text (`"$n"`).
@@ -412,8 +423,19 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
     // `num/denom` rounded via the shared formatter (or `inf`/`undef`):
     // exactly what the serializer prints, so the key matches `$val`.
     TagValue::Rational(r) => Some(r.exiftool_val_str()),
-    // No faithful Perl hash key for raw bytes ⇒ miss.
-    TagValue::Bytes(_) => None,
+    // Byte strings: Perl-faithful FixUTF8 mapping (XMP.pm:2943-2974,
+    // called by `EscapeJSON` at exiftool:3822). Valid UTF-8 sequences in
+    // the byte buffer are preserved as their decoded chars; bytes that
+    // do NOT form a valid UTF-8 sequence are replaced by `?`. ASCII is
+    // identity (so AIFF `CompressionType` "NONE"/"sowt"/… still hits the
+    // Perl hash entries exactly). For high bytes: a MacRoman-decoded
+    // tag's ValueConv emits a `TagValue::Str` BEFORE this lookup runs
+    // (the `Bytes → Str` MacRoman conversion happens in
+    // `decode_macroman`), so `Bytes` arrives at this lookup ONLY for
+    // tags WITHOUT a ValueConv (e.g. AIFF `CompressionType`). Codex R3:
+    // a previous Latin-1 1:1 mapping diverged from Perl for
+    // CompressionType `\x80ABC` (Perl: "?ABC"; Latin-1: "\u{0080}ABC").
+    TagValue::Bytes(b) => Some(fix_utf8(b)),
     // Lists are stripped element-wise by `apply` before any hash-conv path
     // (and `apply_print_conv`'s list-arm defends the same on direct calls).
     TagValue::List(_) => None,

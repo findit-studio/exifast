@@ -8,7 +8,7 @@
 //! `serde_json` round-trip) keeps it byte-exact with ExifTool and infallible —
 //! there is no error path, so `Bytes`/`Rational` can never fail the document.
 
-use crate::value::{format_g, Metadata, Rational, TagValue};
+use crate::value::{format_g, perl_nonfinite_str, Metadata, Rational, TagValue};
 use std::collections::HashSet;
 
 /// ExifTool's `%jsonChar` short escapes (`exiftool` line 250):
@@ -160,8 +160,22 @@ fn push_value(out: &mut String, v: &TagValue) {
       if n.is_finite() {
         push_numeric_gated(out, &format_g(*n, 15));
       } else {
-        // ExifTool never emits a non-finite bare token; quote it.
-        push_json_string(out, &n.to_string());
+        // ExifTool never emits a non-finite bare token; quote it. Codex R8
+        // fix: use Perl's titlecase `Inf`/`-Inf`/`NaN` form (verified
+        // 2026-05-20 via `perl -e 'print 1e308*1e308'`), NOT Rust's
+        // lowercase `inf`/`-inf` from `f64::to_string`. `perl_nonfinite_str`
+        // covers every non-finite f64 (NaN/+Inf/-Inf — IEEE-754 has no other
+        // non-finite category), so the `None` arm is unreachable while the
+        // outer `is_finite` gate holds. Fall back to Rust's default
+        // stringification rather than emit a hard-to-debug empty string if
+        // a future refactor ever routes a finite value into this branch
+        // (would surface as visibly lowercase `inf`/`-inf` in the JSON,
+        // failing the conformance gate loudly instead of silently emitting
+        // `""`).
+        match perl_nonfinite_str(*n) {
+          Some(s) => push_json_string(out, s),
+          None => push_json_string(out, &n.to_string()),
+        }
       }
     }
     TagValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),

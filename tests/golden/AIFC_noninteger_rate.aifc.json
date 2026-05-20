@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "AIFC_noninteger_rate.aifc",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFC",
+  "File:FileTypeExtension": "aifc",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:FormatVersionTime": "1990:05:23 14:40:00",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 44057,
+  "AIFF:SampleSize": 16,
+  "AIFF:SampleRate": 44056.94,
+  "AIFF:CompressionType": "None",
+  "AIFF:CompressorName": "",
+  "AIFF:Name": "AIFC non-integer SampleRate",
+  "Composite:Duration": "1.00 s"
+}]

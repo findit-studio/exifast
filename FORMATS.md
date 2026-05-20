@@ -21,7 +21,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 0 | **Engine** (reader/filetype/tagtable/value/convert/serialize) | *(new Rust)* | — | 1 | — | n/a | ✅ | — | — |
 | 1 | **AAC** | AAC.pm | 177 | 2 | Engine | `AAC.aac` | ✅ | clean | — |
 | 2 | **ID3** *(infra; also completes **MP3**)* | ID3.pm | 1775 | 2 | Engine | `MP3.mp3` | ⬜ | — | — |
-| 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif` | ⬜ | — | — |
+| 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif`, `AIFC.aifc`, `AIFF_short.aif`, `AIFF_huge.aif` | ✅ | clean | — |
 | 4 | **MPC** | MPC.pm | 156 | 2 | Engine, ID3/APE tags | `APE.mpc` | ⬜ | — | — |
 | 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape` | ⬜ | — | — |
 | 6 | **WavPack** (WV/WVP) | WavPack.pm | 144 | 2 | Engine, ID3/APE tags | `WavPack.wv` + adversarial | ✅ | clean | — |

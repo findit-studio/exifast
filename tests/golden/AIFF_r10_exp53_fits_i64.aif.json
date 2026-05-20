@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "AIFF_r10_exp53_fits_i64.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "aiff",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 1000,
+  "AIFF:SampleSize": 16,
+  "AIFF:SampleRate": 9.00719925474099e+15,
+  "Composite:Duration": "0.00 s"
+}]

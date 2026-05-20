@@ -158,6 +158,34 @@ fn strip_g_trailing_zeros(s: &str) -> String {
   s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// Perl-style stringification of a non-finite `f64` (Codex R8 fix).
+///
+/// Rust's `f64::to_string` emits lowercase `inf`/`-inf` and `NaN`; Perl's
+/// default NV stringification on the same scalars emits titlecase `Inf`/
+/// `-Inf` and `NaN`. ExifTool's `EscapeJSON` quotes any non-numeric-shape
+/// scalar, so the casing surfaces unchanged in JSON output (a malformed
+/// AIFF SampleRate that decodes to infinity would print as quoted
+/// `"Inf"` in bundled Perl, `"inf"` in pre-fix Rust). This helper
+/// produces Perl's casing so both the serializer's non-finite branch
+/// and `convert_duration`'s `unless IsFloat` fallback agree.
+///
+/// Returns `None` for finite inputs (callers route those to `format_g`
+/// or `to_string`); `Some(text)` for the three non-finite categories.
+#[must_use]
+pub fn perl_nonfinite_str(val: f64) -> Option<&'static str> {
+  if val.is_nan() {
+    Some("NaN")
+  } else if val.is_infinite() {
+    if val.is_sign_negative() {
+      Some("-Inf")
+    } else {
+      Some("Inf")
+    }
+  } else {
+    None
+  }
+}
+
 /// A metadata value. The variants cover what Stage-1 video/audio tags need;
 /// `Bytes`/`Rational` JSON encoding is wired in the first format plan (AAC).
 #[derive(
@@ -313,9 +341,39 @@ impl Metadata {
     &self.errors
   }
 
-  /// Append a tag in extraction order.
+  /// Append a tag in extraction order, OR overwrite an existing same-key
+  /// tag's value in place (faithful to Perl `FoundTag`, ExifTool.pm:9437-
+  /// 9519). When a tag with the SAME `group` (both family-0 AND family-1)
+  /// AND SAME `name` already exists, FoundTag's "higher-or-equal priority"
+  /// branch (line 9554-9573) moves the OLD entry to a `"$tag ($n)"` slot
+  /// and stores the NEW value under the canonical name. Net effect after
+  /// the JSON serializer suppresses the `\(\d+\)` copy-keys: the LATEST
+  /// `push` call's value wins.
+  ///
+  /// Faithful implementation here: replace-in-place (no copy-key tracking
+  /// — those keys are NEVER serialized under default `-j -G1` because the
+  /// `next if $tag =~ /^(.*?) ?\(/ and defined $$info{$1}` gate at
+  /// exiftool:2744 unconditionally drops them, and exifast doesn't yet
+  /// support `-a` / `Duplicates`-mode output where they'd surface).
+  ///
+  /// Codex R11 fix: the prior unconditional `self.tags.push(...)` left
+  /// the first-occurrence wins via the serializer's `%noDups` (which
+  /// matches Perl's @foundTags iteration), but it kept the FIRST value
+  /// instead of the LAST — diverging from Perl for any format that emits
+  /// duplicate chunks (e.g. AIFF NAME, AUTH, ANNO, APPL chunks). Oracle
+  /// verified 2026-05-20 on a synthesized two-NAME-chunk AIFF: bundled
+  /// `perl exiftool` emits `"AIFF:Name": "<second value>"`, NOT the first.
   pub fn push(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
-    self.tags.push(Tag::new(group, name, value));
+    let name = name.into();
+    if let Some(tag) = self
+      .tags
+      .iter_mut()
+      .find(|t| t.group() == &group && t.name() == name.as_str())
+    {
+      tag.set_value(value);
+    } else {
+      self.tags.push(Tag::new(group, name, value));
+    }
   }
 
   /// Record a non-fatal warning, in occurrence order. ExifTool accumulates
@@ -396,6 +454,55 @@ mod tests {
     let names: Vec<&str> = m.tags().iter().map(Tag::name).collect();
     assert_eq!(names, ["FileType", "SampleRate"]);
     assert_eq!(m.tags()[1].group().family1(), "AAC");
+  }
+
+  #[test]
+  fn push_duplicate_group_and_name_overwrites_last_wins() {
+    // Codex R11 regression: faithful Perl `FoundTag` (`ExifTool.pm:9437-
+    // 9519`) — when a tag with the SAME group AND name is FoundTag'd a
+    // second time, the OLD value is moved to a `"Name (1)"` copy-slot
+    // and the NEW value is stored under the canonical name; the JSON
+    // serializer suppresses the copy-key, so the LATEST `push` wins.
+    // Pinned here as a unit-level invariant; the conformance fixture
+    // `AIFF_dup_name.aif` pins the JSON-output side.
+    let mut m = Metadata::new("dup.aif");
+    let aiff = Group::new("AIFF", "AIFF");
+    m.push(aiff.clone(), "Name", TagValue::Str("First Name".into()));
+    m.push(aiff.clone(), "Name", TagValue::Str("Second Name".into()));
+    // No new tag appended — overwritten in place.
+    assert_eq!(m.tags().len(), 1);
+    assert_eq!(m.tags()[0].name(), "Name");
+    assert_eq!(
+      m.tags()[0].value(),
+      &TagValue::Str("Second Name".into()),
+      "LAST `push` value must win for duplicate group+name"
+    );
+  }
+
+  #[test]
+  fn push_different_group_or_name_appends_distinct_tags() {
+    // The replace-in-place semantics are gated on EXACT group + name
+    // match. A different family-1 OR a different name appends a NEW
+    // tag (both are distinct JSON keys under `-G1`).
+    let mut m = Metadata::new("x.dat");
+    m.push(
+      Group::new("File", "File"),
+      "FileType",
+      TagValue::Str("AAC".into()),
+    );
+    // Same name, different group ⇒ distinct tag.
+    m.push(
+      Group::new("File", "System"),
+      "FileType",
+      TagValue::Str("OTHER".into()),
+    );
+    // Same group, different name ⇒ distinct tag.
+    m.push(
+      Group::new("File", "File"),
+      "MIMEType",
+      TagValue::Str("audio/aac".into()),
+    );
+    assert_eq!(m.tags().len(), 3);
   }
 
   #[test]
