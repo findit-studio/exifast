@@ -2,7 +2,7 @@
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (AAC.pm:29) → `crate::bitstream`.
 
 use crate::{
-  bitstream::{process_bit_stream, BitOrder},
+  bitstream::{BitOrder, process_bit_stream},
   parser::{FormatParser, ParseContext},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, TagValue},
@@ -189,7 +189,7 @@ impl FormatParser for ProcessAac {
             if pos + cnt <= frame.len() {
               // if ($pos + $cnt <= length($buff))  (AAC.pm:129)
               let dat = &frame[pos..pos + cnt]; // my $dat = substr($buff,$pos,$cnt)  (AAC.pm:130)
-                                                // $dat =~ s/^\0+// ; $dat =~ s/\0+$//  (AAC.pm:131-132)
+              // $dat =~ s/^\0+// ; $dat =~ s/\0+$//  (AAC.pm:131-132)
               let s = dat.iter().position(|&b| b != 0).unwrap_or(dat.len());
               let e = dat.iter().rposition(|&b| b != 0).map_or(s, |i| i + 1);
               // e >= s by construction (map_or(s,…) | rposition+1 > s)

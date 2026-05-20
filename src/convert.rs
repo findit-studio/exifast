@@ -33,7 +33,7 @@
 
 use crate::{
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
-  value::{format_g, TagValue},
+  value::{TagValue, format_g},
 };
 use smol_str::SmolStr;
 
@@ -514,6 +514,13 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
 /// but-bounded behavior — real ExifTool COVERART payloads are clean base64,
 /// so this fallback is mostly defensive and never panics). Output is the
 /// decoded raw bytes.
+///
+/// `#[allow(dead_code)]`: only the `ogg` format uses this helper today; under
+/// feature-pruned builds without OGG the dead-code lint fires. The helper
+/// stays in `convert.rs` (not in `formats/ogg.rs`) because it's logically
+/// a `ConvertBase64` helper akin to ExifTool's `MIME::Base64::decode` and
+/// will be reused by future XMP/EXIF ports.
+#[allow(dead_code)]
 pub(crate) fn base64_decode(s: &str) -> Vec<u8> {
   // Map an ASCII byte to its 6-bit value, or `None` for ignored/invalid.
   fn val(b: u8) -> Option<u8> {
@@ -1166,6 +1173,7 @@ mod tests {
   // emits the JSON number `2`, never the string `"2"`. Pin that shape:
   // the Map hit must yield a numeric `TagValue`, and serializing it must
   // produce a bare JSON number.
+  #[cfg(feature = "json")]
   #[test]
   fn numeric_map_value_yields_number_not_string() {
     static CHANNELS: TagDef = TagDef::new(
@@ -1182,7 +1190,7 @@ mod tests {
     let v = apply(&CHANNELS, &TagValue::I64(2), true);
     assert_eq!(v, TagValue::I64(2));
 
-    use crate::{serialize::to_exiftool_json, Group, Metadata};
+    use crate::{Group, Metadata, serialize::to_exiftool_json};
     let mut m = Metadata::new("a.aac");
     m.push(Group::new("Audio", "AAC"), "Channels", v);
     let json = to_exiftool_json(&m);
@@ -2652,7 +2660,7 @@ mod tests {
     assert_eq!(pipeline(0xFFFE), "???"); // noncharacter ⇒ 3 `?`s
     assert_eq!(pipeline(0x10FFFF), "\u{10ffff}"); // max valid kept
     assert_eq!(pipeline(0x110000), "????"); // > U+10FFFF ⇒ 4 `?`s
-                                            // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
+    // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
     assert_eq!(pipeline(0x1_0000_0000), "???????"); // 7 `?`s (above-u32 7-byte)
     assert_eq!(pipeline(0xF_FFFF_FFFF), "???????"); // 7 `?`s (top of 7-byte range)
     assert_eq!(pipeline(0x10_0000_0000), "?????????????"); // 13 `?`s (13-byte form)

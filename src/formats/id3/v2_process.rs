@@ -23,7 +23,7 @@
 //! - Unhandled: faithful Warn "Don't know how to handle $id frame".
 
 use crate::{
-  convert::{apply_ctx, ConvContext},
+  convert::{ConvContext, apply_ctx},
   formats::id3::decode::{decode_string, decode_string_joined, unsync_safe},
   tagtable::{TagDef, TagId, TagTable},
   value::{Group, Metadata, TagValue},
@@ -1552,8 +1552,8 @@ mod tests {
     // 4-byte length itself + 2 more bytes (the ext-flags-and-padding).
     let mut ext = Vec::new();
     ext.extend_from_slice(&[0, 0, 0, 6]); // length=6 (NOT sync-safe in v2.3;
-                                          // UnSyncSafe leaves small values
-                                          // unchanged)
+    // UnSyncSafe leaves small values
+    // unchanged)
     ext.extend_from_slice(&[0, 0]); // 2 ext bytes
     let payload: Vec<u8> = ext.into_iter().chain(title_frame).collect();
     let size = payload.len() as u32;
@@ -1571,7 +1571,7 @@ mod tests {
     // Here we just exercise the wrapper indirectly by replicating the
     // bundled behavior: strip `len` bytes from h_buff, then process.
     let mut h_buff: Vec<u8> = data[10..].to_vec(); // skip ID3v2 header
-                                                   // Read ext length (first 4 bytes of h_buff).
+    // Read ext length (first 4 bytes of h_buff).
     let ext_len_raw = u32::from_be_bytes([h_buff[0], h_buff[1], h_buff[2], h_buff[3]]);
     // UnSyncSafe leaves <=0x7F unchanged.
     let ext_len = ext_len_raw as usize;
@@ -1636,10 +1636,11 @@ mod tests {
       .expect("MCDI must be emitted as raw bytes");
     assert_eq!(mcdi.value(), &TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
     // No Warn for known-binary frames.
-    assert!(m
-      .warnings()
-      .iter()
-      .all(|w| !w.contains("Don't know how to handle")));
+    assert!(
+      m.warnings()
+        .iter()
+        .all(|w| !w.contains("Don't know how to handle"))
+    );
   }
 
   #[test]
@@ -1665,16 +1666,18 @@ mod tests {
       &ConvContext::default(),
     );
     // No GEOB-* tags, no GeneralEncapsulatedObject.
-    assert!(m
-      .tags()
-      .iter()
-      .all(|t| !t.name().starts_with("GEOB") && t.name() != "GeneralEncapsulatedObject"));
+    assert!(
+      m.tags()
+        .iter()
+        .all(|t| !t.name().starts_with("GEOB") && t.name() != "GeneralEncapsulatedObject")
+    );
     // No "Don't know how to handle" Warn — bundled silently dispatches
     // SubDirectory frames; our skip must be silent too.
-    assert!(m
-      .warnings()
-      .iter()
-      .all(|w| !w.contains("Don't know how to handle")));
+    assert!(
+      m.warnings()
+        .iter()
+        .all(|w| !w.contains("Don't know how to handle"))
+    );
   }
 
   #[test]
@@ -1706,10 +1709,11 @@ mod tests {
     // dateTimeConv: XMP → EXIF date.
     assert_eq!(t.value(), &TagValue::Str("2024:05:19".into()));
     // Bundled minor Warn fires.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version")));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version"))
+    );
   }
 
   #[test]
@@ -1743,10 +1747,11 @@ mod tests {
       "Picture" | "PictureMIMEType" | "PictureType" | "PictureDescription"
     )));
     // Faithful Warn.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.contains("Invalid APIC frame")));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.contains("Invalid APIC frame"))
+    );
   }
 
   #[test]

@@ -7,7 +7,7 @@
 //! (the parent `%Image::ExifTool::ID3::Main` table's group, ID3.pm:78).
 
 use crate::{
-  convert::{apply_ctx, ConvContext},
+  convert::{ConvContext, apply_ctx},
   formats::id3::text::convert_id3v1_text,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue},

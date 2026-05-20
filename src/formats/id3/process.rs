@@ -21,7 +21,7 @@
 use crate::{
   formats::id3::{
     decode::unsync_safe,
-    v1::{process_id3v1, ID3V1_MAIN},
+    v1::{ID3V1_MAIN, process_id3v1},
     v2_2::ID3V2_2_MAIN,
     v2_3::ID3V2_3_MAIN,
     v2_4::ID3V2_4_MAIN,
@@ -641,7 +641,7 @@ mod tests {
   fn process_mp3_id3v1_only() {
     // Construct a file: 1024 padding bytes + 128-byte ID3v1 TAG block.
     let mut data: Vec<u8> = vec![0; 256]; // some prefix that's NOT ID3
-                                          // Build TAG block.
+    // Build TAG block.
     let mut tag = Vec::with_capacity(128);
     tag.extend_from_slice(b"TAG");
     let pad = |s: &str, n: usize| {
@@ -732,10 +732,11 @@ mod tests {
     data.extend_from_slice(&[0xff, 0x00, 0xff, 0x00]); // body (shrinks to 0xff 0xff)
     let m = run(&data, "x.mp3");
     // Must not panic. Faithful Warn fires.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Bad ID3 extended header"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Bad ID3 extended header")
+    );
   }
 
   #[test]
@@ -781,10 +782,11 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&[0u8, 0, 0, 0]);
     let m = run(&data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Unsupported ID3 version: 2.5.0"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Unsupported ID3 version: 2.5.0")
+    );
   }
 
   #[test]
@@ -798,10 +800,11 @@ mod tests {
     data.extend_from_slice(&[0u8, 0, 0, 100]); // sync-safe 100
     data.extend_from_slice(&[0u8; 3]);
     let m = run(&data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Truncated ID3 data"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Truncated ID3 data")
+    );
   }
 
   #[test]
@@ -809,10 +812,11 @@ mod tests {
     // ID3 magic + only 2 of 7 header bytes.
     let data = b"ID3\x02\x00";
     let m = run(data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Short ID3 header"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Short ID3 header")
+    );
   }
 
   #[test]

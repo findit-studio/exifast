@@ -172,8 +172,8 @@ fn perl_nv_str(n: f64) -> String {
   // 2^63 (signed: n < 2^63; unsigned: 2^63 <= n < 2^64).
   let two63 = (1u128 << 63) as f64; // exactly 9223372036854775808.0
   let two64 = (1u128 << 64) as f64; // exactly 18446744073709551616.0
-                                    // Signed-integer carve-out: integer-valued f64 in [i64::MIN, 2^63),
-                                    // EXCLUDING 2^63 because `n as i64` would saturate to i64::MAX = 2^63-1.
+  // Signed-integer carve-out: integer-valued f64 in [i64::MIN, 2^63),
+  // EXCLUDING 2^63 because `n as i64` would saturate to i64::MAX = 2^63-1.
   if n == n.trunc() && n >= i64::MIN as f64 && n < two63 {
     let iv = n as i64;
     return iv.to_string();
@@ -208,11 +208,7 @@ fn as_perl_float(v: &TagValue) -> Option<f64> {
     TagValue::F64(x) => {
       // Non-finite ⇒ stringifies to Inf/-Inf/NaN ⇒ IsFloat regex fails ⇒
       // gate miss. Finite ⇒ pass through.
-      if x.is_finite() {
-        Some(*x)
-      } else {
-        None
-      }
+      if x.is_finite() { Some(*x) } else { None }
     }
     TagValue::Str(s) => {
       if is_perl_float(s) {
@@ -870,11 +866,7 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
   }
   // Parse the matched numeric prefix as positive, then apply the sign.
   let mag = s[num_start..i].parse::<f64>().unwrap_or(0.0);
-  if neg {
-    -mag
-  } else {
-    mag
-  }
+  if neg { -mag } else { mag }
 }
 
 // APE.pm:29
@@ -1968,8 +1960,8 @@ mod tests {
     data[12..16].copy_from_slice(&48000u32.to_le_bytes()); // SampleRate (idx 4)
     data[24..28].copy_from_slice(&500u32.to_le_bytes()); // TotalFrames (idx 10)
     data[28..32].copy_from_slice(&65536u32.to_le_bytes()); // FinalFrameBlocks (idx 12)
-                                                           // Fill the rest with non-zero junk that would corrupt header reads
-                                                           // if we mistakenly copied the WHOLE file and indexed past 28 bytes.
+    // Fill the rest with non-zero junk that would corrupt header reads
+    // if we mistakenly copied the WHOLE file and indexed past 28 bytes.
     for byte in data.iter_mut().skip(32) {
       *byte = 0xCC;
     }
@@ -2245,7 +2237,7 @@ mod tests {
     let mut data = vec![0u8; 64];
     data[..4].copy_from_slice(b"MAC ");
     data[4..6].copy_from_slice(&5000u16.to_le_bytes()); // NewHeader path
-                                                        // Footer at data[32..64] — APETAGEX with size_raw = 5.
+    // Footer at data[32..64] — APETAGEX with size_raw = 5.
     data[32..40].copy_from_slice(b"APETAGEX");
     data[32 + 12..32 + 16].copy_from_slice(&5u32.to_le_bytes());
     data[32 + 16..32 + 20].copy_from_slice(&0u32.to_le_bytes());
@@ -2491,7 +2483,7 @@ mod tests {
     data.extend_from_slice(&2u32.to_le_bytes()); // count
     data.extend_from_slice(&0u32.to_le_bytes()); // flags
     data.extend_from_slice(&[0u8; 8]); // reserved
-                                       // Run the trailer-only planner.
+    // Run the trailer-only planner.
     let plan = plan_ape_trailer_only(&data, true, 0).expect("trailer-only plan returns Some");
     // header_job is None (the prior parser owns the File:*/header tags).
     assert!(matches!(plan.header_job, HeaderJob::None));

@@ -570,8 +570,8 @@ pub fn detection_candidates(name: &str, head: &[u8]) -> DetectionCandidates {
     // (Perl reaches this branch only when $recognizedExt is false — it is
     // the `else` of the `elsif ($recognizedExt)`.)
     let skip = end - marker_len; // Perl: pos($buff) - length($1)
-                                 // L3038 applies to this terminal $type too: a JPEG terminal's Parent
-                                 // is "JPEG"; a TIFF terminal's Parent is $tiffType.
+    // L3038 applies to this terminal $type too: a JPEG terminal's Parent
+    // is "JPEG"; a TIFF terminal's Parent is $tiffType.
     out.push(DetectionCandidate {
       file_type: ty,
       header_skip: skip,

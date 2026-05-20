@@ -6,7 +6,7 @@
 use crate::{
   parser::{FormatParser, ParseContext},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
-  value::{format_g, Group, TagValue},
+  value::{Group, TagValue, format_g},
 };
 
 /// One row of `@dvProfiles` (DV.pm:21-113). All fields are derived
@@ -478,8 +478,8 @@ fn extract_vaux_meta(
     // DV.pm:207 `for ($j=0; $j<15; ++$j)`.
     for j in 0..15usize {
       let p = vaux_pos + j * 5 + 3; // DV.pm:208
-                                    // Guard against running past the buffer: every Get8u must be in
-                                    // range (`p+0` through `p+4` for the 4-byte date/time fields).
+      // Guard against running past the buffer: every Get8u must be in
+      // range (`p+0` through `p+4` for the 4-byte date/time fields).
       if p + 4 >= buff.len() {
         break;
       }
@@ -955,7 +955,7 @@ mod tests {
     // forces an `a-f` letter in the hex sprintf — DV.pm:220-221 rejects.
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
-                                                           // VAUX block 1 at offset 80 — block_type & 0xf0 == 0x50.
+    // VAUX block 1 at offset 80 — block_type & 0xf0 == 0x50.
     data[80] = 0x50;
     // Pack 0 (j=0): p = 80 + 0*5 + 3 = 83. pack_type = 0x62 (date).
     data[83] = 0x62;

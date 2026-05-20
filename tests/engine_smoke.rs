@@ -2,11 +2,11 @@
 //! through the conversion runtime, serialize, and confirm our own jsondiff
 //! treats the output as equivalent to itself. No format parser involved.
 use exifast::{
+  Group, Metadata, TagValue,
   convert::apply,
   jsondiff::json_equivalent,
   serialize::to_exiftool_json,
   tagtable::{PrintConv, TagDef, ValueConv},
-  Group, Metadata, TagValue,
 };
 
 static FILETYPE: TagDef = TagDef::new("FileType", "System", ValueConv::None, PrintConv::None);

@@ -31,7 +31,7 @@
 //! `exifast-phase2-forward-items` memory entry.
 
 use crate::{
-  convert::{apply, read_value, ByteOrder},
+  convert::{ByteOrder, apply, read_value},
   parser::{FormatParser, ParseContext},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{Group, TagValue},

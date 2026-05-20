@@ -41,7 +41,7 @@
 //!   keeps that faithful for any future divergence.
 
 use crate::{
-  bitstream::{process_bit_stream_cond, BitOrder, FrameState},
+  bitstream::{BitOrder, FrameState, process_bit_stream_cond},
   parser::{FormatParser, ParseContext},
   tagtable::{PrintConv, PrintConvHash, PrintValue, RawConv, TagDef, ValueConv},
   value::TagValue,
@@ -784,11 +784,7 @@ fn parse_xing_lame(
   let len = buff.len();
   // MPEG.pm:504 side-info offset.
   let side = if v == 3 {
-    if m == 3 {
-      17
-    } else {
-      32
-    }
+    if m == 3 { 17 } else { 32 }
   } else if m == 3 {
     9
   } else {
@@ -1110,11 +1106,7 @@ pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
   // compares against the uppercased `$$self{FILE_EXT}` (ExifTool.pm:2966
   // `GetFileExtension` returns it uppercased), so a case-insensitive
   // match on the Rust side (which already uppercases) is faithful.
-  if ext_is_mp3 {
-    8192
-  } else {
-    256
-  }
+  if ext_is_mp3 { 8192 } else { 256 }
 }
 
 impl ProcessMp3 {
@@ -1571,8 +1563,8 @@ mod tests {
     d.extend_from_slice(&200_000u32.to_be_bytes()); // VBRBytes
     d.extend(std::iter::repeat(0).take(100)); // TOC (skipped)
     d.extend_from_slice(&78u32.to_be_bytes()); // VBRScale (LameVBRQuality=2, LameQuality=2)
-                                               // LAME block starts here. Pre-fill 348 bytes so the LAME-flag length
-                                               // gate (MPEG.pm:537 `last if $pos + 348 > $len`) passes.
+    // LAME block starts here. Pre-fill 348 bytes so the LAME-flag length
+    // gate (MPEG.pm:537 `last if $pos + 348 > $len`) passes.
     let start = d.len();
     d.extend(std::iter::repeat(0).take(348));
     // Stamp the LAME fields by absolute offset into `d`.
@@ -1684,8 +1676,8 @@ mod tests {
     d.extend(std::iter::repeat(0).take(32));
     d.extend_from_slice(b"Xing");
     d.extend_from_slice(&0x01u32.to_be_bytes()); // flag VBRFrames only
-                                                 // Truncate: do NOT append the 4-byte VBRFrames; MPEG.pm:516 `last if
-                                                 // $pos + 4 > $len`.
+    // Truncate: do NOT append the 4-byte VBRFrames; MPEG.pm:516 `last if
+    // $pos + 4 > $len`.
     let mut m = Metadata::new("x.mp3");
     let mut c = ctx_over(&mut m, &d, "MP3");
     assert!(ProcessMp3.process(&mut c));

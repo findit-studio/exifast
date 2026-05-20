@@ -1164,7 +1164,7 @@ mod tests {
     // Length < 2.
     assert_eq!(make_tag_name(""), "Tag");
     assert_eq!(make_tag_name("a"), "TagA"); // ucfirst then Tag-prefix
-                                            // Leading hyphen.
+    // Leading hyphen.
     assert_eq!(make_tag_name("-foo"), "Tag-foo");
     // Normal name: ucfirst only.
     assert_eq!(make_tag_name("product_id"), "Product_id");
@@ -1281,7 +1281,7 @@ mod tests {
     assert_eq!(unescape_html("&mdash;"), "—");
     assert_eq!(unescape_html("&eacute;"), "é");
     assert_eq!(unescape_html("&Alpha;"), "Α"); // 913, distinct from "alpha"
-                                               // Numeric (decimal): `&#169;` = `©`.
+    // Numeric (decimal): `&#169;` = `©`.
     assert_eq!(unescape_html("&#169;"), "©");
     // Numeric (hex): lowercase `#x` only, per XMP.pm:2924.
     assert_eq!(unescape_html("&#xA9;"), "©");
