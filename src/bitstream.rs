@@ -16,7 +16,14 @@ use crate::{
 pub enum BitOrder {
   /// Big-endian ('MM'): FLAC/AAC.
   Mm,
-  /// Little-endian ('II').
+  /// Little-endian ('II'). First real consumer: MPC (MPC.pm:98
+  /// `SetByteOrder('II')`); verified byte-exact via
+  /// `tests/conformance.rs::mpc_conformance` against the bundled Perl
+  /// oracle on `MPC.mpc` — the SV7 happy path exercises every
+  /// `MPC_BIT_KEYS` extraction in `Ii` order (TotalFrames, SampleRate,
+  /// Quality, EncoderVersion, …). This retires the "BitOrder::Ii
+  /// faithful-but-unexercised" forward item in
+  /// `[[exifast-phase2-forward-items]]`.
   Ii,
 }
 

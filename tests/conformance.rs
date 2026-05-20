@@ -92,6 +92,31 @@ fn raw_unsupported_error_conformance() {
   check("RAW.raw", "RAW.raw.n.json", false);
 }
 
+#[test]
+fn mpc_conformance() {
+  // Pure SV7 MPC happy path (32-byte MP+ header, no ID3 leading / APE
+  // trailer / ID3v1 — those are deferred to PRs #6 (ID3), the APE PR).
+  // Synthesized from APE.mpc[263..295], the embedded MP+ frame in
+  // exiftool/t/images/APE.mpc; oracle = bundled `perl exiftool` output.
+  // MPC.pm:97-106 (SV7 ProcessDirectory) + MPC.pm:98 SetByteOrder('II')
+  // (first end-to-end exerciser of bitstream::BitOrder::Ii).
+  check("MPC.mpc", "MPC.mpc.json", true);
+  check("MPC.mpc", "MPC.mpc.n.json", false);
+}
+
+#[test]
+fn mpc_sv8_warn_conformance() {
+  // MPC.pm:107-109 Warn path: a valid MP+ magic with version != 0x07 still
+  // calls SetFileType (MPC.pm:94, before the version dispatch) then emits
+  // `ExifTool:Warning = 'Audio info currently not extracted from this
+  // version MPC file'`. Goldens captured from bundled `perl exiftool`.
+  // Adversarial — pins that the version-dispatch branch is taken AFTER
+  // SetFileType (the inverted ordering would emit just the Warning with no
+  // File:* tags, which would diverge from bundled ExifTool byte-exact).
+  check("sv8.mpc", "sv8.mpc.json", true);
+  check("sv8.mpc", "sv8.mpc.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
