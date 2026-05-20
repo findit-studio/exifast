@@ -28,7 +28,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 7 | **DSF** | DSF.pm | 138 | 2 | Engine, ID3 | ⚠️ ffmpeg-gen `DSF.dsf` | ⬜ | — | — |
 | 8 | **FLAC** | FLAC.pm | 321 | 2 | Engine, ID3, Vorbis | `FLAC.flac` | ✅ | clean | — |
 | 9 | **Ogg + Vorbis** (OGG/OGV/OPUS) | Ogg.pm + Vorbis.pm | 496 | 2 | Engine, FLAC (ogg-flac) | `Vorbis.ogg`, `Opus.opus`, `FLAC.ogg` | ⬜ | — | — |
-| 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ⬜ | — | — |
+| 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ✅ | clean | — |
 | 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ⬜ | — | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |

@@ -123,8 +123,16 @@ impl<'a> ParseContext<'a> {
   }
 
   /// The file bytes the parser reads (`$raf` content).
+  ///
+  /// Returns `&'a [u8]` (the original construction-time borrow), NOT
+  /// `&[u8]` tied to `&self`. That lets a parser hold a slice borrowed
+  /// from this method across calls to `&mut ctx` mutators
+  /// (`ctx.metadata()`, `ctx.set_file_type(...)`) without a borrow-
+  /// checker conflict — the slice's lifetime is independent of the
+  /// `&self` receiver. Avoids the formats-side `.to_vec()` workaround
+  /// (per Copilot PR #12 review #3271619078).
   #[must_use]
-  pub fn data(&self) -> &[u8] {
+  pub fn data(&self) -> &'a [u8] {
     self.data
   }
 

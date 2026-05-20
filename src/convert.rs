@@ -565,6 +565,108 @@ pub fn fix_utf8(bytes: &[u8]) -> String {
   String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+/// Emit one codepoint as Perl's `pack('C0U', $n)` would (variable-length
+/// UTF-8 encoding WITHOUT validity checks — surrogates and out-of-range
+/// values get the same algorithmic encoding, deliberately producing
+/// byte sequences that [`fix_utf8`] will later flag as bad).
+///
+/// XMP.pm:2933 (`UnescapeChar`) is the only call site this port targets —
+/// see [[exifast-phase2-forward-items]] FixUTF8 entry for the broader
+/// engine-level concern.
+///
+/// Perl's `pack('C0U', n)` follows the original UTF-8 spec (RFC 2279,
+/// allowing up to 6 bytes) and then Perl's own RFC-2279-extended forms
+/// (7-byte lead `0xFE`, 13-byte lead `0xFF`) for codepoints up to
+/// `0x7FFF_FFFF_FFFF_FFFF` (i64::MAX, Perl's hard `pack` limit; values
+/// above that die inside Perl — we treat them as "leave entity literal"
+/// in [`resolve_html_entity_codepoint`]).
+///
+/// Bytes generated for `n >= 0x110000` are deliberately invalid UTF-8 —
+/// [`fix_utf8`] will turn each into one `?` downstream.
+pub fn pack_c0u(n: u64, out: &mut Vec<u8>) {
+  if n < 0x80 {
+    out.push(n as u8);
+  } else if n < 0x800 {
+    out.push(0xC0 | ((n >> 6) & 0x1F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x10000 {
+    out.push(0xE0 | ((n >> 12) & 0x0F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x20_0000 {
+    out.push(0xF0 | ((n >> 18) & 0x07) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x400_0000 {
+    out.push(0xF8 | ((n >> 24) & 0x03) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x8000_0000 {
+    // 6-byte form (Perl `pack('C0U')` for `0x0400_0000..=0x7FFF_FFFF`).
+    // FixUTF8 lead-byte gate is `< 0xF8`, so 0xFC/0xFD are NEVER accepted —
+    // each byte becomes `?` downstream. Empirical: `n=0x7fffffff` ⇒ 6
+    // bytes `fd bf bf bf bf bf` ⇒ FixUTF8 ⇒ "??????" (6 `?`s).
+    out.push(0xFC | ((n >> 30) & 0x01) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x10_0000_0000 {
+    // 7-byte form (Perl `pack('C0U')` for `0x8000_0000..=0xF_FFFF_FFFF`,
+    // i.e. 31..36 payload bits). Lead byte is always `0xFE`. Empirical
+    // bundled-Perl reference (R5 investigation):
+    //   n=0x80000000   ⇒ fe 82 80 80 80 80 80
+    //   n=0xFFFFFFFF   ⇒ fe 83 bf bf bf bf bf
+    //   n=0x100000000  ⇒ fe 84 80 80 80 80 80
+    //   n=0xFFFFFFFFF  ⇒ fe bf bf bf bf bf bf
+    // Each invalid byte becomes one `?` via FixUTF8 (7 `?`s). Byte 1
+    // carries six payload bits (`(n >> 30) & 0x3F`), not two — fixed
+    // from the earlier u32-only `& 0x03` cap so 32..36-bit values
+    // round-trip byte-exact against Perl.
+    out.push(0xFE);
+    out.push(0x80 | ((n >> 30) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else {
+    // 13-byte form (Perl `pack('C0U')` for
+    // `0x10_0000_0000..=0x7FFF_FFFF_FFFF_FFFF`, i.e. 37..63 payload bits).
+    // Lead byte is `0xFF`; 12 continuation bytes follow, each carrying
+    // 6 bits of payload starting from the most significant 6-bit group.
+    // Empirical (R5):
+    //   n=0x1000000000        ⇒ ff 80 80 80 80 80 81 80 80 80 80 80 80
+    //   n=0x7FFFFFFFFFFFFFFF  ⇒ ff 80 87 bf bf bf bf bf bf bf bf bf bf
+    // Lead `0xFF` is `>= 0xF8`, so FixUTF8 rejects it and every
+    // continuation byte (orphans) — output is 13 `?` chars.
+    //
+    // The first two continuation bytes (i=1,2) cover bit positions
+    // 66..71 and 60..65 respectively. A `u64` can only set bits 0..63,
+    // so those slots are always `0x80`. We hard-code that to avoid an
+    // illegal shift (`n >> 66` is undefined behavior for u64); the
+    // remaining ten payload bytes use shifts in `[0, 60]` which are
+    // safe.
+    out.push(0xFF);
+    out.push(0x80); // bits 71..66 — always zero for u64-bounded n
+    out.push(0x80 | ((n >> 60) & 0x3F) as u8); // bits 65..60
+    out.push(0x80 | ((n >> 54) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 48) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 42) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 36) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 30) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  }
+}
+
 /// Faithful transliteration of `Image::ExifTool::ReadValue($dataPt, $offset,
 /// $format, $count, $size, $ratPt)` (`ExifTool.pm:6275-6321`), restricted to
 /// the format set `Image::ExifTool::Red` uses (Red.pm:22-33 `%redFormat` plus
@@ -2103,5 +2205,130 @@ mod tests {
     assert_eq!(read_value(&buf, 0, "double", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "binary", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "garbage", 1, ByteOrder::Mm), None);
+  }
+
+  // ---------- Audible-port FixUTF8 / pack_c0u tests --------------------------
+  // Empirical reference column ("Perl" below) generated by running
+  //   perl -I.../exiftool/lib -e 'use Image::ExifTool::XMP;
+  //     my $s = ...; Image::ExifTool::XMP::FixUTF8(\$s); print $s;'
+  // against the bundled ExifTool oracle (Audible PR #12 R4 investigation).
+
+  #[test]
+  fn fix_utf8_rejects_overlong_3byte_and_surrogates() {
+    // Overlong 3-byte: 0xE0 + cont < 0xA0 (e.g. e0 80 80 encodes U+0000).
+    // Perl rejects (XMP.pm:2958).
+    assert_eq!(fix_utf8(b"\xe0\x80\x80"), "???");
+    // Surrogate U+D800 = ed a0 80 — Perl rejects (XMP.pm:2959).
+    assert_eq!(fix_utf8(b"X\xed\xa0\x80Y"), "X???Y");
+    // Surrogate U+DFFF = ed bf bf — rejected.
+    assert_eq!(fix_utf8(b"\xed\xbf\xbf"), "???");
+    // Adjacent BMP noncharacter U+FDD0..U+FDEF — NOT rejected (FixUTF8
+    // only catches U+FFFE/U+FFFF in the noncharacter range; faithful).
+    assert_eq!(fix_utf8(b"\xef\xb7\x90"), "\u{fdd0}");
+  }
+
+  #[test]
+  fn fix_utf8_rejects_overlong_4byte_and_above_u10ffff() {
+    // Overlong 4-byte: 0xF0 + cont < 0x90 (encodes < U+10000). Rejected
+    // (XMP.pm:2963).
+    assert_eq!(fix_utf8(b"\xf0\x80\x80\x80"), "????");
+    // > U+10FFFF: 0xF4 + cont > 0x8F. Rejected (XMP.pm:2964).
+    assert_eq!(fix_utf8(b"\xf4\x90\x80\x80"), "????");
+    // $ch > 0xF4 (0xF5..=0xF7) — always rejected.
+    assert_eq!(fix_utf8(b"\xf5\x80\x80\x80"), "????");
+    // Boundary: U+10FFFF = f4 8f bf bf — KEPT.
+    assert_eq!(fix_utf8(b"\xf4\x8f\xbf\xbf"), "\u{10ffff}");
+  }
+
+  #[test]
+  fn fix_utf8_truncated_continuation_each_byte_replaced() {
+    // 0xC2 (2-byte lead) but no continuation: one `?`.
+    assert_eq!(fix_utf8(b"\xc2"), "?");
+    // 0xE0 + 0xA0 but missing third byte: each invalid byte ⇒ `?`.
+    // Perl: scans byte by byte after the failed match.
+    assert_eq!(fix_utf8(b"\xe0\xa0"), "??");
+    // Multi-byte lead followed by ASCII (continuation pattern fails).
+    assert_eq!(fix_utf8(b"\xe2A"), "?A");
+  }
+
+  #[test]
+  fn pack_c0u_perl_pack_c0u_byte_exact() {
+    // Empirical reference (Perl `pack('C0U', $n)`):
+    //   n=0x7f                -> [7f]                       (1 byte)
+    //   n=0x80                -> [c2 80]                    (2 bytes)
+    //   n=0xa0                -> [c2 a0]
+    //   n=0xff                -> [c3 bf]
+    //   n=0xd800              -> [ed a0 80]                 (surrogate, 3 bytes invalid)
+    //   n=0xfffe              -> [ef bf be]                 (noncharacter)
+    //   n=0xffff              -> [ef bf bf]
+    //   n=0x10000             -> [f0 90 80 80]              (4 bytes)
+    //   n=0x10ffff            -> [f4 8f bf bf]              (max valid)
+    //   n=0x110000            -> [f4 90 80 80]              (above max, FixUTF8 will reject)
+    //   n=0x7fffffff          -> [fd bf bf bf bf bf]        (6 bytes)
+    //   n=0x80000000          -> [fe 82 80 80 80 80 80]     (7 bytes)
+    //   n=0xffffffff          -> [fe 83 bf bf bf bf bf]
+    //   n=0x100000000         -> [fe 84 80 80 80 80 80]     (R5: 7-byte form extends past u32)
+    //   n=0xfffffffff         -> [fe bf bf bf bf bf bf]     (R5: top of 7-byte range)
+    //   n=0x1000000000        -> [ff 80 80 80 80 80 81 80 80 80 80 80 80] (R5: 13-byte form begins)
+    //   n=0x7fffffffffffffff  -> [ff 80 87 bf bf bf bf bf bf bf bf bf bf] (Perl pack max)
+    let mut out = Vec::new();
+    let cases: &[(u64, &[u8])] = &[
+      (0x7F, &[0x7F]),
+      (0x80, &[0xC2, 0x80]),
+      (0xA0, &[0xC2, 0xA0]),
+      (0xFF, &[0xC3, 0xBF]),
+      (0xD800, &[0xED, 0xA0, 0x80]),
+      (0xFFFE, &[0xEF, 0xBF, 0xBE]),
+      (0xFFFF, &[0xEF, 0xBF, 0xBF]),
+      (0x10000, &[0xF0, 0x90, 0x80, 0x80]),
+      (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),
+      (0x110000, &[0xF4, 0x90, 0x80, 0x80]),
+      (0x7FFFFFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      (0x80000000, &[0xFE, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80]),
+      (0xFFFFFFFF, &[0xFE, 0x83, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      // R5 additions — empirically verified vs bundled Perl `pack('C0U', $n)`.
+      (0x1_0000_0000, &[0xFE, 0x84, 0x80, 0x80, 0x80, 0x80, 0x80]),
+      (0xF_FFFF_FFFF, &[0xFE, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      (
+        0x10_0000_0000,
+        &[
+          0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        ],
+      ),
+      (
+        0x7FFF_FFFF_FFFF_FFFF,
+        &[
+          0xFF, 0x80, 0x87, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF,
+        ],
+      ),
+    ];
+    for (n, expected) in cases {
+      out.clear();
+      pack_c0u(*n, &mut out);
+      assert_eq!(&out[..], *expected, "pack_c0u(0x{n:x}) mismatch");
+    }
+  }
+
+  #[test]
+  fn fix_utf8_after_pack_c0u_matches_perl_pipeline() {
+    // End-to-end: simulate UnescapeChar(numeric entity) → pack_c0u → FixUTF8,
+    // i.e. the byte path Audible.pm:243-261 takes for `&#xN;` entities.
+    // Empirically verified vs bundled Perl ExifTool (R4 + R5 investigation).
+    let pipeline = |n: u64| -> String {
+      let mut buf = Vec::new();
+      pack_c0u(n, &mut buf);
+      fix_utf8(&buf)
+    };
+    assert_eq!(pipeline(0x7F), "\u{7f}"); // DEL is valid ASCII
+    assert_eq!(pipeline(0x80), "\u{80}"); // Latin-1 PAD via valid 2-byte
+    assert_eq!(pipeline(0xD800), "???"); // surrogate ⇒ 3 `?`s
+    assert_eq!(pipeline(0xFFFE), "???"); // noncharacter ⇒ 3 `?`s
+    assert_eq!(pipeline(0x10FFFF), "\u{10ffff}"); // max valid kept
+    assert_eq!(pipeline(0x110000), "????"); // > U+10FFFF ⇒ 4 `?`s
+                                            // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
+    assert_eq!(pipeline(0x1_0000_0000), "???????"); // 7 `?`s (above-u32 7-byte)
+    assert_eq!(pipeline(0xF_FFFF_FFFF), "???????"); // 7 `?`s (top of 7-byte range)
+    assert_eq!(pipeline(0x10_0000_0000), "?????????????"); // 13 `?`s (13-byte form)
+    assert_eq!(pipeline(0x7FFF_FFFF_FFFF_FFFF), "?????????????"); // 13 `?`s (Perl max)
   }
 }

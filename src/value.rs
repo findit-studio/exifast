@@ -436,6 +436,20 @@ impl Metadata {
       None => false,
     }
   }
+
+  /// Existence query for `(group, name)`. The companion to
+  /// [`set_tag_value`](Self::set_tag_value) used by format-specific
+  /// duplicate-handling paths (e.g. the Audible AA dictionary loop,
+  /// which mirrors Perl `FoundTag` last-wins via "if exists ⇒ replace
+  /// in place, else ⇒ push"). Keeps callers allocation-free on the
+  /// common no-duplicate path.
+  #[must_use]
+  pub fn has_tag(&self, group: &Group, name: &str) -> bool {
+    self
+      .tags
+      .iter()
+      .any(|t| t.group() == group && t.name() == name)
+  }
 }
 
 #[cfg(test)]

@@ -56,6 +56,230 @@ fn wavpack_adversarial_conformance() {
 }
 
 #[test]
+fn audible_aa_conformance() {
+  // FORMATS.md row 10. Bundled fixture
+  // `exiftool/t/images/Audible.aa`; goldens captured from `LC_ALL=C
+  // TZ=UTC perl exiftool -j -G1 -struct -api QuickTimeUTC=1 ...`. Both
+  // snapshots asserted (the PrintConv vs `-n` diff is only on
+  // `File:FileTypeExtension` here: `aa` vs `AA`).
+  check("Audible.aa", "Audible.aa.json", true);
+  check("Audible.aa", "Audible.aa.n.json", false);
+}
+
+#[test]
+fn audible_chapters_aa_conformance() {
+  // Adversarial synthesized fixture: minimal valid AA exercising the
+  // type-6 ChapterCount path (Audible.pm:221-225, absent from the
+  // bundled Audible.aa fixture) AND `UnescapeHTML` (Audible.pm:261)
+  // via a dictionary value `"A &amp; B"` ⇒ `"A & B"`. Goldens captured
+  // from bundled `perl exiftool` exactly as for Audible.aa.
+  check("Audible_chapters.aa", "Audible_chapters.aa.json", true);
+  check("Audible_chapters.aa", "Audible_chapters.aa.n.json", false);
+}
+
+#[test]
+fn audible_eof_aa_conformance() {
+  // Adversarial: TOC has a type-6 entry whose offset is past EOF (the
+  // 0xFFFFFFFF sentinel). The faithful Perl behavior (Audible.pm:222
+  // inline `next if length < 4 or $raf->Read($buff, 4) != 4`) is to
+  // silently skip the chunk — no Warn — and CONTINUE the TOC walk so
+  // the subsequent valid type-2 dictionary still emits its tags. Pins
+  // Codex R1 finding #1's fix: there is NO "Chunk 6 seek error" warning
+  // for an in-memory/file backing where Seek succeeds but Read fails.
+  check("Audible_eof.aa", "Audible_eof.aa.json", true);
+  check("Audible_eof.aa", "Audible_eof.aa.n.json", false);
+}
+
+#[test]
+fn audible_warn_aa_conformance() {
+  // Adversarial: malformed AA whose first chunk-2 dictionary has
+  // `num > 0x200` ⇒ Audible.pm:240 `Warn('Bad dictionary count'),
+  // next`, and a second chunk-6 still emits a valid ChapterCount.
+  // Bundled golden has `ExifTool:Warning` PLUS `Audible:ChapterCount`,
+  // proving the loop continues past the Warn (Codex R1 finding #3).
+  // The warning's position within the JSON object is not significant
+  // under jsondiff's order-insensitive comparison (per the
+  // [[exifast-phase2-forward-items]] "Warning JSON ordering" entry —
+  // non-blocking until a format requires position-faithful warning
+  // ordering at the byte level; tracked for the engine-level fix when
+  // the gap becomes visible at the byte-exact bar).
+  check("Audible_warn.aa", "Audible_warn.aa.json", true);
+  check("Audible_warn.aa", "Audible_warn.aa.n.json", false);
+}
+
+#[test]
+fn audible_badutf_aa_conformance() {
+  // Adversarial: chunk-2 dictionary value contains a raw 0xFF byte
+  // (`A\xffB`). Bundled Perl ExifTool's pipeline:
+  //   bytes "A\xffB" → UnescapeHTML (no-op, no `&`) →
+  //   Decode($_, 'UTF8') (no-op, from==to==UTF8) →
+  //   HandleTag(Author, "A\xffB") →
+  //   JSON serialize → FixUTF8 (replaces 0xff with '?') →
+  //   "A?B"
+  // Pins Codex R4 finding's fix: invalid input bytes flow through to
+  // FixUTF8 (now applied at the parser boundary in this AA port, until
+  // the engine grows a serializer-tier FixUTF8 — tracked in
+  // [[exifast-phase2-forward-items]] "engine-wide FixUTF8 at JSON
+  // serialization"). Rust's `String::from_utf8_lossy` (U+FFFD =
+  // EF BF BD) would diverge — this confirms the byte-oriented
+  // `fix_utf8(&unescape_html_bytes(...))` pipeline matches bundled
+  // ExifTool exactly.
+  check("Audible_badutf.aa", "Audible_badutf.aa.json", true);
+  check("Audible_badutf.aa", "Audible_badutf.aa.n.json", false);
+}
+
+#[test]
+fn audible_surrogate_aa_conformance() {
+  // Adversarial: chunk-2 dictionary value `"X&#xD800;Y"`. Bundled Perl:
+  //   bytes "X&#xD800;Y" → UnescapeHTML →
+  //     pack('C0U', 0xD800) → "X\xed\xa0\x80Y" (invalid 3-byte surrogate
+  //     encoding) →
+  //   Decode($_, 'UTF8') (no-op) →
+  //   HandleTag → JSON serialize → FixUTF8 (each of \xed \xa0 \x80
+  //   replaced with '?') →
+  //   "X???Y"
+  // Pins Codex R4 finding's fix for the surrogate / out-of-range numeric
+  // entity sub-case. Rust `char::from_u32(0xD800)` returns None (would
+  // leave the entity literal as `&#xD800;`); the byte-oriented port
+  // emits Perl's invalid 3-byte sequence via `pack_c0u`, which `fix_utf8`
+  // then replaces with three `?`.
+  check("Audible_surrogate.aa", "Audible_surrogate.aa.json", true);
+  check("Audible_surrogate.aa", "Audible_surrogate.aa.n.json", false);
+}
+
+#[test]
+fn audible_dup_aa_conformance() {
+  // R5: two `author` entries in chunk-2 dictionary. Bundled Perl
+  // `FoundTag` (ExifTool.pm:9504-9577) promotes the first entry to
+  // `Author (1)` and writes the second at base `Author`; the `%noDups`
+  // JSON serializer (exiftool:2744-2752) drops `(1)` so the final
+  // output is `Audible:Author = "SECOND"`. Pin: replace-in-place
+  // (`push_dict_last_wins`) keeps the first slot's position but
+  // updates its value, exactly matching bundled output byte-for-byte.
+  check("Audible_dup.aa", "Audible_dup.aa.json", true);
+  check("Audible_dup.aa", "Audible_dup.aa.n.json", false);
+}
+
+#[test]
+fn audible_bigent_aa_conformance() {
+  // R5: chunk-2 dictionary value `"&#x100000000;"` — a numeric entity
+  // whose body exceeds u32. Bundled Perl: `hex("100000000")` →
+  // `0x100000000` → `pack('C0U', 0x100000000)` →
+  // 7-byte invalid UTF-8 (`fe 84 80 80 80 80 80`) → `FixUTF8` ⇒ 7 `?`.
+  // The previous u32-only `resolve_html_entity_codepoint` left the
+  // entity literal; the new u64 path mirrors Perl byte-for-byte.
+  check("Audible_bigent.aa", "Audible_bigent.aa.json", true);
+  check("Audible_bigent.aa", "Audible_bigent.aa.n.json", false);
+}
+
+#[test]
+fn audible_dupchap_aa_conformance() {
+  // R6: two type-6 ChapterCount chunks in TOC (counts 1, then 2).
+  // Bundled Perl `FoundTag` last-wins (ExifTool.pm:9504-9577) +
+  // `%noDups` serializer filter ⇒ `Audible:ChapterCount` = 2. The
+  // previous chunk-tag path used plain `push` instead of the AA dict's
+  // last-wins helper, leaving Rust to emit ChapterCount = 1 (first
+  // wins via `%noDups`). Routing every AA `HandleTag` equivalent
+  // through `push_dict_last_wins` covers chunk-6 and chunk-11 the
+  // same way as the dict path.
+  check("Audible_dupchap.aa", "Audible_dupchap.aa.json", true);
+  check("Audible_dupchap.aa", "Audible_dupchap.aa.n.json", false);
+}
+
+#[test]
+fn audible_under_aa_conformance() {
+  // R6: dict tag `__foo` exercises Perl `AddTagToTable` (ExifTool.pm:
+  // 9217-9266) final name normalization: after MakeTagName +
+  // `s/_(.)/\U$1/g` produces `_foo`, AddTagToTable's `length($name) <
+  // 2 or $name !~ /^[A-Z]/i` rule prepends `Tag` because `_foo`'s
+  // first char is not a letter. Bundled Perl emits `Audible:Tag_foo`;
+  // the Rust port previously stopped after `s/_(.)/\U$1/g` and
+  // emitted `Audible:_foo`.
+  check("Audible_under.aa", "Audible_under.aa.json", true);
+  check("Audible_under.aa", "Audible_under.aa.n.json", false);
+}
+
+#[test]
+fn audible_dictcover_aa_conformance() {
+  // R6: dictionary tag `_cover_art` (Audible.pm:43-47, `Binary => 1`)
+  // takes the static-table branch but its raw value is binary — the
+  // engine's universal `TagValue::Bytes` serializer emits
+  // `(Binary data N bytes, use -b option to extract)`. The previous
+  // dict-path treatment converted every static value to `TagValue::
+  // Str(fix_utf8(unescape_html_bytes(...)))`, which dropped the
+  // binary semantics and (worse) reshaped the byte length via
+  // fix_utf8's invalid-byte replacement. Bundled Perl emits
+  // `(Binary data 5 bytes, ...)` for the 5-byte value `"ABCDE"`.
+  check("Audible_dictcover.aa", "Audible_dictcover.aa.json", true);
+  check("Audible_dictcover.aa", "Audible_dictcover.aa.n.json", false);
+}
+
+#[test]
+fn audible_reserved_aa_conformance() {
+  // R7: dict tags `GROUPS` and `FORMAT` are in Perl `%specialTags`
+  // (ExifTool.pm:1229-1236, table-internal hash keys). When the dict
+  // loop hits one, Perl's `unless ($$tagTablePtr{$tag})` branch sees
+  // a defined hashref (the table's actual GROUPS) and SKIPS
+  // AddTagToTable; HandleTag then calls GetTagInfo which warns and
+  // returns empty for special tags, so FoundTag is NEVER reached and
+  // the tag is dropped. Bundled Perl emits ONLY `Audible:Title`; the
+  // previous Rust port emitted `Audible:GROUPS` and `Audible:FORMAT`
+  // too via the dynamic-name fallthrough.
+  check("Audible_reserved.aa", "Audible_reserved.aa.json", true);
+  check("Audible_reserved.aa", "Audible_reserved.aa.n.json", false);
+}
+
+#[test]
+fn audible_ftype_aa_conformance() {
+  // R7: dict entries `file_type` and `FileType` both resolve to
+  // dynamic name `FileType` (after MakeTagName + `s/_(.)/\U$1/g` +
+  // AddTagToTable). The engine's `SetFileType` (Audible.pm:207)
+  // already pushed `File:FileType=AA` with `Priority => 2`
+  // (ExifTool.pm:1437); Perl FoundTag (ExifTool.pm:9533-9574) sees
+  // PRIORITY{FileType}=2 vs the AA push's default $priority=1, takes
+  // the else branch (`$tag = $nextTag`) and stores the FIRST AA push
+  // at `FileType (1)`, the SECOND at `FileType (2)`. The JSON noDups
+  // dedup (exiftool:2951) keys by `<family1>:<name>` and picks the
+  // first occurrence, so bundled Perl emits
+  // `Audible:FileType = "FIRST"`. The R5 last-wins helper would have
+  // emitted `SECOND`; R7 fix: when the AA dynamic-tag name collides
+  // with an engine-pre-pushed bare name in a different group, treat
+  // AA duplicates as FIRST-wins (mirroring Perl's no-promotion arm).
+  check("Audible_ftype.aa", "Audible_ftype.aa.json", true);
+  check("Audible_ftype.aa", "Audible_ftype.aa.n.json", false);
+}
+
+#[test]
+fn audible_ftypeext_aa_conformance() {
+  // R8 negative case: dict entries `file_type_extension=FIRST` and
+  // `FileTypeExtension=SECOND` both resolve to dynamic name
+  // `FileTypeExtension`. Unlike `FileType` (Priority 2), bundled
+  // Perl's `File:FileTypeExtension` uses the DEFAULT Priority 1
+  // (ExifTool.pm:1444+ has no `Priority =>` line), so FoundTag's
+  // promote arm fires symmetrically and emits the LAST value:
+  // `Audible:FileTypeExtension = "SECOND"`. The R7 fix was over-
+  // broad (treated every cross-group same-name collision as first-
+  // wins); R8 narrows the helper to the single Priority-2 name
+  // `FileType`, restoring last-wins for the symmetric case.
+  check("Audible_ftypeext.aa", "Audible_ftypeext.aa.json", true);
+  check("Audible_ftypeext.aa", "Audible_ftypeext.aa.n.json", false);
+}
+
+#[test]
+fn audible_etver_aa_conformance() {
+  // R8 negative case: dict entries `exif_tool_version=FIRST` and
+  // `ExifToolVersion=SECOND` both resolve to dynamic name
+  // `ExifToolVersion`. The engine pre-emits
+  // `ExifTool:ExifToolVersion` with default Priority 1 (no `Priority
+  // =>` line, ExifTool.pm:1451+), so FoundTag's promote arm fires
+  // and bundled Perl emits `Audible:ExifToolVersion = "SECOND"`.
+  // Confirms the narrowed R8 check: cross-group `ExifToolVersion`
+  // does NOT trigger first-wins.
+  check("Audible_etver.aa", "Audible_etver.aa.json", true);
+  check("Audible_etver.aa", "Audible_etver.aa.n.json", false);
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);
