@@ -162,6 +162,21 @@ impl<'a> ParseContext<'a> {
     self.meta
   }
 
+  /// Split-borrow accessor: returns `(&[u8], &mut Metadata)` simultaneously
+  /// so a parser can slice into [`Self::data`] and call into a metadata-
+  /// pushing sub-parser (e.g. `process_vorbis_comments`, `process_flac_picture`,
+  /// `bitstream::process_bit_stream`) WITHOUT cloning the slice into a `Vec`.
+  ///
+  /// Required because [`Self::data`] reborrows `&self` while
+  /// [`Self::metadata`] reborrows `&mut self` — calling both in sequence
+  /// forces the caller to `.to_vec()` the slice. The split borrow is sound
+  /// because `data` and `meta` are disjoint fields (the `&[u8]` does NOT
+  /// alias `&mut Metadata`).
+  #[must_use]
+  pub fn data_and_metadata(&mut self) -> (&[u8], &mut Metadata) {
+    (self.data, self.meta)
+  }
+
   /// Faithful `SetFileType` (ExifTool.pm:9677-9706), read path. Pushes
   /// `File:FileType`, `File:FileTypeExtension` (`uc $normExt`; PrintConv
   /// `lc`), `File:MIMEType` (`$mimeType || 'application/unknown'`). Called

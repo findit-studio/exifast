@@ -163,6 +163,14 @@ pub struct TagDef {
   /// from the bit stream. `Some("undef")` ⇒ the value is the raw byte string
   /// (passed to ValueConv as `TagValue::Bytes`).
   format: Option<&'static str>,
+  /// ExifTool `$$tagInfo{List}` (e.g. `Vorbis.pm:85` `ARTIST => { ..., List
+  /// => 1 }`). `true` ⇒ repeated `FoundTag` calls for this tag accumulate
+  /// the new value onto the same key (`ExifTool.pm:9605-9606` sets
+  /// `$$self{LIST_TAGS}{$tagInfo} = $tag`; the next FoundTag with the same
+  /// `$tagInfo` appends via `push @{$$valueHash{$tag}}, $value`,
+  /// `ExifTool.pm:9520`). `false` ⇒ no list accumulation; first-wins via
+  /// the serializer's `%noDups` (`exiftool:2950-2951`) applies as before.
+  list: bool,
 }
 
 impl TagDef {
@@ -186,6 +194,7 @@ impl TagDef {
       print_hex: false,
       bits_per_word: None,
       format: None,
+      list: false,
     }
   }
 
@@ -224,6 +233,26 @@ impl TagDef {
   #[must_use]
   pub const fn with_format(mut self, format: &'static str) -> Self {
     self.format = Some(format);
+    self
+  }
+
+  /// Set `$$tagInfo{List}` (e.g. `Vorbis.pm:85` `ARTIST => { ..., List =>
+  /// 1 }`). The flag is a TAG-LEVEL declaration that a tag accumulates
+  /// repeats into a `TagValue::List`, mirroring ExifTool's
+  /// `LIST_TAGS{$tagInfo}` accumulation (`ExifTool.pm:9605-9606,9520`).
+  ///
+  /// Note: this flag is informational on the `TagDef`. The opt-in actually
+  /// lives at the CALL SITE — callers who observe `list() == true` MUST
+  /// use [`crate::value::Metadata::push_listable`] (which coalesces a
+  /// repeat into `TagValue::List`); plain [`crate::value::Metadata::push`]
+  /// still just appends another tag entry regardless of the flag, and the
+  /// serializer's `%noDups` first-wins suppression
+  /// (`exiftool:2950-2951`) then silently drops every later occurrence.
+  /// The flag-vs-call split keeps the seam tiny: every existing `push`
+  /// site is untouched, only Vorbis/ID3-style accumulators opt in.
+  #[must_use]
+  pub const fn with_list(mut self, list: bool) -> Self {
+    self.list = list;
     self
   }
 
@@ -271,6 +300,13 @@ impl TagDef {
   #[must_use]
   pub const fn format(&self) -> Option<&'static str> {
     self.format
+  }
+
+  /// `$$tagInfo{List}` (e.g. `Vorbis.pm:85` ARTIST `List => 1`). See
+  /// [`with_list`](Self::with_list) for the accumulation semantics.
+  #[must_use]
+  pub const fn list(&self) -> bool {
+    self.list
   }
 }
 
@@ -491,6 +527,28 @@ mod tests {
     static U: TagDef = TagDef::new("U", "X", ValueConv::None, PrintConv::None);
     assert!(!U.print_hex());
     assert_eq!(U.bits_per_word(), None);
+  }
+
+  #[test]
+  fn tagdef_list_builder_and_getter() {
+    // Vorbis.pm:85 `ARTIST => { ..., List => 1 }` — the new List attribute
+    // (R1-F2). `new()` leaves it false (Perl tagInfo without a List key).
+    static NO_LIST: TagDef = TagDef::new("Artist", "Vorbis", ValueConv::None, PrintConv::None);
+    assert!(!NO_LIST.list(), "default List flag is false");
+
+    static IS_LIST: TagDef =
+      TagDef::new("Artist", "Vorbis", ValueConv::None, PrintConv::None).with_list(true);
+    assert!(IS_LIST.list(), "with_list(true) flips the List flag on");
+
+    // The flag is independent of other builder attrs; chain ordering doesn't
+    // matter (`with_list` returns Self by value).
+    static ALL: TagDef = TagDef::new("Tag", "X", ValueConv::None, PrintConv::None)
+      .with_list(true)
+      .with_format("undef")
+      .with_print_hex(true);
+    assert!(ALL.list());
+    assert_eq!(ALL.format(), Some("undef"));
+    assert!(ALL.print_hex());
   }
 
   #[test]

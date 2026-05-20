@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "bad_flac.flac",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Format error in FLAC file",
+  "File:FileType": "FLAC",
+  "File:FileTypeExtension": "flac",
+  "File:MIMEType": "audio/flac"
+}]

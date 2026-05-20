@@ -259,6 +259,14 @@ impl Tag {
   pub(crate) fn set_value(&mut self, value: TagValue) {
     self.value = value;
   }
+
+  /// Mutable access to the tag's value — only used by
+  /// [`Metadata::push_listable`] to `mem::replace` the existing value out
+  /// (avoiding an O(n) clone of the inner `Vec` per appended repeat).
+  /// Crate-internal: regular write paths still go through [`Self::set_value`].
+  pub(crate) fn value_mut(&mut self) -> &mut TagValue {
+    &mut self.value
+  }
 }
 
 /// The full result of reading a file.
@@ -315,6 +323,60 @@ impl Metadata {
 
   /// Append a tag in extraction order.
   pub fn push(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
+    self.tags.push(Tag::new(group, name, value));
+  }
+
+  /// Push `value` under `(group, name)`, faithfully accumulating a repeat as
+  /// ExifTool's `FoundTag` does for a `List => 1` tagInfo
+  /// (`ExifTool.pm:9505-9520`):
+  ///
+  /// - First occurrence: identical to [`Self::push`] — appends a new
+  ///   [`Tag`] with the given scalar value.
+  /// - Same-`(group, name)` repeat: the existing tag's value is widened to
+  ///   `TagValue::List([...])` and the new value is appended (Perl
+  ///   `push @{$$valueHash{$tag}}, $value` after promoting a scalar
+  ///   `$$valueHash{$tag}` via `[ $$valueHash{$tag} ]`,
+  ///   `ExifTool.pm:9514-9518`). NO new tag entry is created — exactly
+  ///   `return $tag` at `ExifTool.pm:9520`.
+  /// - If the existing tag's value is *already* a `TagValue::List`,
+  ///   `value` is appended to it (the recursive accumulation case for
+  ///   3+ repeats).
+  ///
+  /// Callers should reach this entry point only when the source `TagDef`
+  /// has `list() == true`; for plain (non-List) tags use [`Self::push`]
+  /// (the serializer's `%noDups` first-wins then applies as before, so
+  /// repeats are silently dropped — `exiftool:2950-2951`). The flag-vs-call
+  /// split keeps the seam tiny: only Vorbis/ID3-like accumulators that
+  /// faithfully need `List` semantics opt in; every existing push site is
+  /// untouched.
+  pub fn push_listable(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
+    let name: SmolStr = name.into();
+    // Find an existing same-(group, name) tag (faithful to FoundTag's
+    // `$$valueHash{$tag}` lookup at ExifTool.pm:9505 `defined
+    // $$valueHash{$tag}`). Group equality is family-0 AND family-1 — same
+    // identity used by `set_tag_value` and the serializer's `%noDups` token.
+    if let Some(tag) = self
+      .tags
+      .iter_mut()
+      .find(|t| t.group() == &group && t.name() == name.as_str())
+    {
+      // ExifTool.pm:9514-9518 promote-and-push: a scalar becomes a 1-elem
+      // list, then `push` appends. We model that with one `TagValue::List`
+      // step containing both the old scalar and the new value. `mem::replace`
+      // moves the existing `Vec` out (no clone) so 3+ repeats are amortized
+      // O(1) per append, not O(n²).
+      let placeholder = TagValue::List(Vec::new());
+      let new_val = match std::mem::replace(tag.value_mut(), placeholder) {
+        TagValue::List(mut items) => {
+          items.push(value);
+          TagValue::List(items)
+        }
+        scalar => TagValue::List(vec![scalar, value]),
+      };
+      tag.set_value(new_val);
+      return;
+    }
+    // First occurrence: identical to push().
     self.tags.push(Tag::new(group, name, value));
   }
 
@@ -396,6 +458,77 @@ mod tests {
     let names: Vec<&str> = m.tags().iter().map(Tag::name).collect();
     assert_eq!(names, ["FileType", "SampleRate"]);
     assert_eq!(m.tags()[1].group().family1(), "AAC");
+  }
+
+  #[test]
+  fn push_listable_coalesces_repeats_into_list() {
+    // R1-F2 regression pin. ExifTool's FoundTag accumulates `List => 1`
+    // tagInfos via `$$self{LIST_TAGS}{$tagInfo} = $tag` (ExifTool.pm:9606)
+    // and `push @{$$valueHash{$tag}}, $value` (ExifTool.pm:9520). Two
+    // `push_listable` calls under the same `(group, name)` → one tag, with
+    // value `List([scalar1, scalar2])` (NOT two separate tags).
+    let mut m = Metadata::new("x");
+    let g = Group::new("Vorbis", "Vorbis");
+    m.push_listable(g.clone(), "Artist", TagValue::Str("Alice".into()));
+    m.push_listable(g.clone(), "Artist", TagValue::Str("Bob".into()));
+    assert_eq!(m.tags().len(), 1, "two pushes coalesce to one tag");
+    assert_eq!(m.tags()[0].name(), "Artist");
+    assert_eq!(
+      m.tags()[0].value(),
+      &TagValue::List(vec![
+        TagValue::Str("Alice".into()),
+        TagValue::Str("Bob".into()),
+      ])
+    );
+
+    // Third push extends the list (ExifTool.pm:9518 `push @{...}`).
+    m.push_listable(g.clone(), "Artist", TagValue::Str("Carol".into()));
+    assert_eq!(m.tags().len(), 1);
+    assert_eq!(
+      m.tags()[0].value(),
+      &TagValue::List(vec![
+        TagValue::Str("Alice".into()),
+        TagValue::Str("Bob".into()),
+        TagValue::Str("Carol".into()),
+      ])
+    );
+
+    // First-call for a fresh (group, name) is identical to push(): a new
+    // scalar tag — NOT a 1-element list.
+    m.push_listable(g.clone(), "Performer", TagValue::Str("X".into()));
+    let p = m.tags().iter().find(|t| t.name() == "Performer").unwrap();
+    assert_eq!(p.value(), &TagValue::Str("X".into())); // scalar, not List
+
+    // Different group (family-1) ⇒ NOT the same tag identity (ExifTool's
+    // `$$valueHash{$tag}` keyed implicitly by group too).
+    m.push_listable(
+      Group::new("Vorbis", "Other"),
+      "Artist",
+      TagValue::Str("Z".into()),
+    );
+    let artists: Vec<_> = m.tags().iter().filter(|t| t.name() == "Artist").collect();
+    assert_eq!(artists.len(), 2, "different family1 ⇒ separate tag");
+  }
+
+  #[test]
+  fn push_listable_preserves_order_of_unrelated_tags() {
+    // The accumulation site is the EXISTING tag; later unrelated pushes
+    // append after the accumulated tag in extraction order.
+    let mut m = Metadata::new("x");
+    let g = Group::new("Vorbis", "Vorbis");
+    m.push_listable(g.clone(), "Artist", TagValue::Str("Alice".into()));
+    m.push(g.clone(), "Title", TagValue::Str("T".into())); // plain push
+    m.push_listable(g.clone(), "Artist", TagValue::Str("Bob".into()));
+    let names: Vec<_> = m.tags().iter().map(Tag::name).collect();
+    // Order: Artist (coalesced), Title. NO second Artist tag.
+    assert_eq!(names, vec!["Artist", "Title"]);
+    assert_eq!(
+      m.tags()[0].value(),
+      &TagValue::List(vec![
+        TagValue::Str("Alice".into()),
+        TagValue::Str("Bob".into()),
+      ])
+    );
   }
 
   #[test]
