@@ -24,6 +24,8 @@ pub mod dv;
 pub mod flac;
 #[cfg(feature = "id3")]
 pub mod id3;
+#[cfg(feature = "moi")]
+pub mod moi;
 #[cfg(feature = "mpc")]
 pub mod mpc;
 // MPEG audio frame parser is the internal `mpeg-audio` feature (gates
@@ -84,6 +86,8 @@ pub fn parser_for(file_type: &str) -> Option<&'static dyn FormatParser> {
     // per-format gates), so `id3` is in scope whenever this arm compiles.
     #[cfg(feature = "mp3")]
     "MP3" => Some(&id3::ProcessMp3),
+    #[cfg(feature = "moi")]
+    "MOI" => Some(&moi::ProcessMoi), // ExifTool %moduleName{MOI}=undef ⇒ 'MOI' (MOI.pm)
     #[cfg(feature = "mpc")]
     "MPC" => Some(&mpc::ProcessMpc), // ExifTool %moduleName{MPC}=undef ⇒ 'MPC'
     // ExifTool %moduleName{OGG}='Ogg' (handles OGG, OGV, OPUS via container
@@ -104,11 +108,11 @@ mod tests {
 
   #[test]
   fn registry_resolves_ported_formats() {
-    // AA, AAC, AIFF, APE, DSF, DV, FLAC, MP3 (ID3), MPC, OGG, R3D, and WV
-    // are the ported formats; their arms must resolve when their Cargo
-    // features are enabled. Unported types (and the empty string) must
-    // still cleanly report "no parser" so the consumer falls through to
-    // the next detection candidate (faithful to Perl: a Process<Type>
+    // AA, AAC, AIFF, APE, DSF, DV, FLAC, MOI, MP3 (ID3), MPC, OGG, R3D,
+    // and WV are the ported formats; their arms must resolve when their
+    // Cargo features are enabled. Unported types (and the empty string)
+    // must still cleanly report "no parser" so the consumer falls through
+    // to the next detection candidate (faithful to Perl: a Process<Type>
     // not loaded is `next` in the candidate loop, ExifTool.pm:3060-3077).
     // Each assertion is feature-gated to match the corresponding `match`
     // arm in [`parser_for`].
@@ -126,6 +130,8 @@ mod tests {
     assert!(parser_for("DV").is_some());
     #[cfg(feature = "flac")]
     assert!(parser_for("FLAC").is_some());
+    #[cfg(feature = "moi")]
+    assert!(parser_for("MOI").is_some());
     #[cfg(feature = "mp3")]
     assert!(parser_for("MP3").is_some());
     #[cfg(feature = "mpc")]

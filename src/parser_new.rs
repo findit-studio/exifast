@@ -28,9 +28,11 @@
 use core::fmt;
 use core::marker::PhantomData;
 
-mod parser_sealed {
+pub(crate) mod parser_sealed {
   /// Sealed marker for the new [`super::FormatParser`] trait. Downstream
-  /// crates cannot implement the trait because they cannot name this type.
+  /// crates cannot implement the trait because they cannot name this
+  /// type (the `parser_sealed` module is `pub(crate)`, accessible only
+  /// to in-crate format modules that implement [`super::FormatParser`]).
   pub trait Sealed {}
 }
 
@@ -131,10 +133,27 @@ pub trait TagWriter {
 ///
 /// Errors propagate from the writer (the Meta itself has no error states —
 /// fallibility belongs to the destination).
+///
+/// **Phase E discovery — `print_conv` parameter.** Spec §6.3 originally
+/// shaped this as `sink<W>(&self, out: &mut W)` with no mode flag. The MOI
+/// pilot (Phase E) surfaced that byte-exact reproduction of the bundled
+/// `perl exiftool -j` / `-n` JSON pair requires the Meta to know whether
+/// PrintConv strings (e.g. `ConvertDuration("8.16 s")`) or post-ValueConv
+/// raw values (e.g. `8.16` as `f64`) should be emitted. This mirrors
+/// ExifTool's `$$self{OPTIONS}{PrintConv}` flag (ExifTool.pm:5710): the
+/// PrintConv toggle is a global engine option, not a writer/sink choice.
+///
+/// Library callers consuming typed accessors on the Meta directly never
+/// touch this trait; only the CLI JSON path (`MetaSinker` → `TagWriter`)
+/// needs the toggle.
 pub trait MetaSinker {
   /// Emit this Meta's tags into `out`. Emission order should mirror the
   /// bundled-Perl iteration order of the format's tag table.
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error>;
+  ///
+  /// `print_conv = true` emits PrintConv strings (faithful to
+  /// `perl exiftool -j`); `print_conv = false` emits post-ValueConv raw
+  /// scalars (faithful to `perl exiftool -j -n`).
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error>;
 }
 
 /// Cross-format shared state. Threaded through chained parsers
@@ -248,7 +267,9 @@ impl SharedFlags {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum AnyParser {
-  // Phase E adds: Moi(crate::formats::moi::ProcessMoi),
+  /// MOI (Phase E pilot — camcorder MOD info sidecar).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::ProcessMoi),
   // Phase F1 adds: Aac, Dv, Audible, Red.
   // Phase F2 adds: Id3.
   // Phase F3 adds: Ape, Dsf, Aiff, Flac.
@@ -258,28 +279,33 @@ pub enum AnyParser {
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
 ///
-/// The `_Phantom` variant exists so the enum compiles before any format
-/// has migrated to the new trait. It is removed in Phase G (last) once
-/// every format has a real arm.
+/// The `_Phantom` variant exists so the enum compiles even when no format
+/// feature is enabled (e.g. `--no-default-features` builds). It is
+/// removed in Phase G (last) once every format has a real arm AND the
+/// public-API contract pins at least one format always being present.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
-  /// Placeholder so the enum compiles before any format arm exists.
-  /// Removed in Phase G after every format has migrated.
+  /// Placeholder so the enum compiles when no format feature is enabled.
+  /// Removed in Phase G.
   #[doc(hidden)]
   _Phantom(PhantomData<&'a ()>),
-  // Phase E adds: Moi(crate::formats::moi::MoiMeta<'a>),
+  /// MOI (Phase E pilot).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::MoiMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     match self {
       AnyMeta::_Phantom(_) => {
         // Phantom variant emits no tags; exists only as a type-system
-        // placeholder until Phase E adds the first real format arm.
-        let _ = out;
+        // placeholder for the no-format-feature build.
+        let _ = (out, print_conv);
         Ok(())
-      } // Phase E adds: AnyMeta::Moi(m) => m.sink(out),
+      }
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(m) => m.sink(print_conv, out),
     }
   }
 }
@@ -346,9 +372,15 @@ mod tests {
   }
 
   impl MetaSinker for DummyMeta<'_> {
-    fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+    fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
       out.write_str("Dummy", "Name", self.name)?;
-      out.write_u64("Dummy", "Size", self.size)?;
+      if print_conv {
+        // Faithful to the PrintConv toggle: emit a formatted text view
+        // when print_conv is on; the raw numeric otherwise.
+        out.write_fmt("Dummy", "Size", |w| write!(w, "{} bytes", self.size))?;
+      } else {
+        out.write_u64("Dummy", "Size", self.size)?;
+      }
       Ok(())
     }
   }
@@ -359,12 +391,20 @@ mod tests {
       name: "moi-fake",
       size: 1234,
     };
+    // -j (PrintConv on) — formatted bytes-string.
     let mut w = MapTagWriter::new();
-    meta.sink(&mut w).unwrap();
+    meta.sink(true, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Name").map(MapValue::as_str),
       Some("moi-fake".to_string())
     );
+    assert_eq!(
+      w.get("Dummy", "Size").map(MapValue::as_str),
+      Some("1234 bytes".to_string())
+    );
+    // -n (PrintConv off) — raw u64.
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Size").map(MapValue::as_str),
       Some("1234".to_string())
@@ -416,7 +456,7 @@ mod tests {
     let mut sink = InfallibleSink;
     // The `unwrap()` on an `Infallible` result is what the doc claims is
     // collapsed at type-check; here we just ensure the dataflow compiles.
-    let result: Result<(), Infallible> = meta.sink(&mut sink);
+    let result: Result<(), Infallible> = meta.sink(true, &mut sink);
     let () = result.unwrap();
   }
 
@@ -449,7 +489,10 @@ mod tests {
   fn any_meta_phantom_sinks_nothing() {
     let any: AnyMeta<'_> = AnyMeta::_Phantom(PhantomData);
     let mut w = MapTagWriter::new();
-    any.sink(&mut w).unwrap();
+    any.sink(true, &mut w).unwrap();
+    assert_eq!(w.len(), 0);
+    let mut w = MapTagWriter::new();
+    any.sink(false, &mut w).unwrap();
     assert_eq!(w.len(), 0);
   }
 }

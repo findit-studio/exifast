@@ -5,12 +5,18 @@
 //! collector, validation harness) brings its own [`crate::parser_new::TagWriter`]
 //! impl.
 //!
-//! Phase D ships exactly one reference implementor — [`MapTagWriter`] — to
+//! Phase D shipped exactly one reference implementor — [`MapTagWriter`] — to
 //! exercise the trait shape and prove the dataflow Meta → TagWriter compiles
-//! end-to-end. The JSON [`TagWriter`] implementor lands in Phase G alongside
-//! the public API.
+//! end-to-end. Phase E adds [`MetadataTagWriter`] — the migration bridge
+//! adapter that translates a typed `Meta` emission back into the push-style
+//! [`crate::value::Metadata`] sink used by the legacy
+//! [`crate::parser::OldFormatParser`] dispatch. This bridge is what lets
+//! the CLI JSON output remain byte-exact while individual formats migrate
+//! one PR at a time across Phases E–F. Retired in Phase G when the JSON
+//! emitter consumes [`AnyMeta`](crate::parser_new::AnyMeta) directly.
 
 use crate::parser_new::TagWriter;
+use crate::value::{Group, Metadata, TagValue};
 use core::convert::Infallible;
 use core::fmt;
 use core::fmt::Write as _;
@@ -214,6 +220,154 @@ impl TagWriter for MapTagWriter {
 }
 
 // ===========================================================================
+// `MetadataTagWriter` — Phase E–F migration bridge
+// ===========================================================================
+
+/// Bridge [`TagWriter`] that emits into the push-style [`Metadata`] sink.
+///
+/// This is the **Phase E–F migration bridge**: the legacy
+/// [`crate::parser::OldFormatParser`] dispatch (`parser_for(file_type) ->
+/// &dyn OldFormatParser`) reads `&mut Metadata` and pushes string-keyed
+/// tags into it; the new typed-Meta API ([`crate::parser_new::MetaSinker`])
+/// emits typed scalars into a [`TagWriter`]. As each format migrates from
+/// the old to the new design, its `OldFormatParser` impl uses this adapter
+/// to translate the new `Meta`'s `MetaSinker::sink` call back into pushes
+/// on the existing `Metadata`. The CLI JSON serializer (which still reads
+/// `Metadata`) stays byte-exact end-to-end during the per-format crawl.
+///
+/// **Retired in Phase G** once the JSON emitter consumes
+/// [`AnyMeta`](crate::parser_new::AnyMeta) directly via a JSON-native
+/// `TagWriter`; the old `OldFormatParser` dispatch is removed at the same
+/// time.
+///
+/// **Group mapping** (the `group` argument of every `write_*` call):
+///
+/// - The string is taken as **both** family-0 AND family-1 of the pushed
+///   tag's [`Group`]. Spec §6.2 (TagWriter) leaves the dual-family encoding
+///   open; for the formats migrating through Phases E–F the two families
+///   are identical (e.g. MOI emits under family-0/-1 = "MOI"; ID3 emits
+///   under family-1 = "ID3v2_3"/"ID3v2_4" etc. with family-0 also matching;
+///   File:* is pushed by `ctx.set_file_type` outside this writer's path).
+///   Formats that need a family-0 ≠ family-1 split will encode the family-1
+///   directly in their `group` argument (since family-1 is what `-G1`
+///   emits and the serializer's `%noDups` key is keyed by family-1).
+/// - The MOI pilot exercises the `family-0 == family-1` case end-to-end.
+///   Future formats will revisit this if they observe a divergent need;
+///   the bridge is internal to the migration.
+///
+/// **Listable tags** — [`Metadata::push_listable`]: the bridge does NOT
+/// expose a listable variant in the current Phase E. List-emitting formats
+/// (OGG Vorbis comments, ID3 multi-frame, etc.) are Phase F4–F5 migrations
+/// and will be handled there; MOI emits only scalars.
+///
+/// D8 convention: no public fields; constructor takes the `&mut Metadata`.
+pub struct MetadataTagWriter<'meta> {
+  meta: &'meta mut Metadata,
+}
+
+impl<'meta> MetadataTagWriter<'meta> {
+  /// Construct an adapter that pushes into `meta` for every `write_*` call.
+  pub fn new(meta: &'meta mut Metadata) -> Self {
+    Self { meta }
+  }
+
+  /// Build a [`Group`] from the writer-side single-string `group` argument.
+  /// Family-0 and family-1 are both `group` (see the type-level docs on
+  /// `MetadataTagWriter` for the group-mapping rationale).
+  fn group(group: &str) -> Group {
+    Group::new(group, group)
+  }
+}
+
+impl TagWriter for MetadataTagWriter<'_> {
+  /// Bridge writes never fail — every `write_*` call is a `Metadata::push`
+  /// (or a `push_warning`/`push_error`), all of which are infallible. Using
+  /// [`Infallible`] lets a typed `Meta`'s `?`-propagating `MetaSinker::sink`
+  /// chain compile-eliminate the error branch.
+  type Error = Infallible;
+
+  fn write_str(&mut self, group: &str, name: &str, value: &str) -> Result<(), Infallible> {
+    self.meta.push(
+      Self::group(group),
+      name.to_string(),
+      TagValue::Str(value.into()),
+    );
+    Ok(())
+  }
+
+  fn write_u64(&mut self, group: &str, name: &str, value: u64) -> Result<(), Infallible> {
+    // The push-style `Metadata` stores integers as `TagValue::I64`. Most
+    // typed-Meta `u64` emissions fit cleanly (`as i64`) — sizes/durations
+    // are well below 2^63. We saturate to `i64::MAX` defensively; in the
+    // Phase E MOI pilot the values are u32-derived, never overflowing.
+    let n = i64::try_from(value).unwrap_or(i64::MAX);
+    self
+      .meta
+      .push(Self::group(group), name.to_string(), TagValue::I64(n));
+    Ok(())
+  }
+
+  fn write_i64(&mut self, group: &str, name: &str, value: i64) -> Result<(), Infallible> {
+    self
+      .meta
+      .push(Self::group(group), name.to_string(), TagValue::I64(value));
+    Ok(())
+  }
+
+  fn write_f64(&mut self, group: &str, name: &str, value: f64) -> Result<(), Infallible> {
+    self
+      .meta
+      .push(Self::group(group), name.to_string(), TagValue::F64(value));
+    Ok(())
+  }
+
+  fn write_bytes(&mut self, group: &str, name: &str, value: &[u8]) -> Result<(), Infallible> {
+    self.meta.push(
+      Self::group(group),
+      name.to_string(),
+      TagValue::Bytes(value.to_vec()),
+    );
+    Ok(())
+  }
+
+  fn write_fmt(
+    &mut self,
+    group: &str,
+    name: &str,
+    f: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+  ) -> Result<(), Infallible> {
+    // `write_fmt` is the no-alloc workhorse on the TagWriter side; the
+    // bridge must materialize the formatted text because `Metadata` stores
+    // strings as owned `TagValue::Str`. The single allocation happens
+    // here — the caller (`MetaSinker::sink`) sees only a streaming-format
+    // interface.
+    let mut s = String::new();
+    f(&mut s).expect("MetadataTagWriter::write_fmt: in-memory String write cannot fail");
+    self.meta.push(
+      Self::group(group),
+      name.to_string(),
+      TagValue::Str(s.into()),
+    );
+    Ok(())
+  }
+
+  fn write_warning(&mut self, text: &str) -> Result<(), Infallible> {
+    // Faithful: `Metadata::push_warning` mirrors ExifTool's `$self->Warn`
+    // accumulator (the serializer surfaces the first as `ExifTool:Warning`
+    // under `-j -G1`, ExifTool.pm:1297).
+    self.meta.push_warning(text.to_string());
+    Ok(())
+  }
+
+  fn write_error(&mut self, text: &str) -> Result<(), Infallible> {
+    // Faithful: `Metadata::push_error` mirrors `$self->Error`
+    // (ExifTool.pm:5648), surfaced as `ExifTool:Error`.
+    self.meta.push_error(text.to_string());
+    Ok(())
+  }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -301,5 +455,129 @@ mod tests {
     // BTreeMap orders by key: ("A","Name1") < ("B","Name2").
     assert_eq!(collected[0].0, "A");
     assert_eq!(collected[1].0, "B");
+  }
+
+  // -------------------------------------------------------------------------
+  // MetadataTagWriter tests
+  // -------------------------------------------------------------------------
+
+  /// Helper: locate a pushed tag by `(family1, name)` (`-G1` token).
+  fn find<'a>(meta: &'a Metadata, group: &str, name: &str) -> Option<&'a TagValue> {
+    meta
+      .tags()
+      .iter()
+      .find(|t| t.group().family1() == group && t.name() == name)
+      .map(|t| t.value())
+  }
+
+  #[test]
+  fn metadata_writer_pushes_str_through_to_metadata() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_str("MOI", "MOIVersion", "V6").unwrap();
+    }
+    assert_eq!(
+      find(&meta, "MOI", "MOIVersion"),
+      Some(&TagValue::Str("V6".into()))
+    );
+  }
+
+  #[test]
+  fn metadata_writer_pushes_u64_as_i64() {
+    // The push-style Metadata stores integers as I64; the bridge maps u64
+    // ⇒ I64 with saturation. For values ≤ i64::MAX this is exact.
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_u64("MOI", "VideoBitrate", 8_500_000).unwrap();
+    }
+    assert_eq!(
+      find(&meta, "MOI", "VideoBitrate"),
+      Some(&TagValue::I64(8_500_000))
+    );
+  }
+
+  #[test]
+  fn metadata_writer_u64_saturates_on_overflow() {
+    // u64 values above i64::MAX saturate to i64::MAX. Not reachable from
+    // any real-world MOI extraction; defensive coverage of the cast path.
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_u64("MOI", "Huge", u64::MAX).unwrap();
+    }
+    assert_eq!(find(&meta, "MOI", "Huge"), Some(&TagValue::I64(i64::MAX)));
+  }
+
+  #[test]
+  fn metadata_writer_pushes_f64() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_f64("MOI", "Duration", 8.16).unwrap();
+    }
+    assert_eq!(find(&meta, "MOI", "Duration"), Some(&TagValue::F64(8.16)));
+  }
+
+  #[test]
+  fn metadata_writer_pushes_bytes() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_bytes("MOI", "Cover", &[1, 2, 3]).unwrap();
+    }
+    assert_eq!(
+      find(&meta, "MOI", "Cover"),
+      Some(&TagValue::Bytes(vec![1, 2, 3]))
+    );
+  }
+
+  #[test]
+  fn metadata_writer_write_fmt_materializes_string() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_fmt("MOI", "DateTimeOriginal", |f| {
+        write!(
+          f,
+          "{:04}:{:02}:{:02} {:02}:{:02}:{:06.3}",
+          2011, 5, 15, 17, 58, 48.0
+        )
+      })
+      .unwrap();
+    }
+    assert_eq!(
+      find(&meta, "MOI", "DateTimeOriginal"),
+      Some(&TagValue::Str("2011:05:15 17:58:48.000".into()))
+    );
+  }
+
+  #[test]
+  fn metadata_writer_routes_warnings_and_errors() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_warning("minor — malformed tag").unwrap();
+      w.write_error("fatal — header rejected").unwrap();
+    }
+    assert_eq!(meta.warnings(), &["minor — malformed tag".to_string()]);
+    assert_eq!(meta.errors(), &["fatal — header rejected".to_string()]);
+  }
+
+  #[test]
+  fn metadata_writer_uses_group_as_both_family0_and_family1() {
+    let mut meta = Metadata::new("x.moi");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_str("MOI", "T", "v").unwrap();
+    }
+    let tag = meta
+      .tags()
+      .iter()
+      .find(|t| t.name() == "T")
+      .expect("pushed tag missing");
+    assert_eq!(tag.group().family0(), "MOI");
+    assert_eq!(tag.group().family1(), "MOI");
   }
 }
