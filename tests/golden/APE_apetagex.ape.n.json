@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "APE_apetagex.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:Title": "Test Title",
+  "APE:MyCustomTag": "custom value"
+}]

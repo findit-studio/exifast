@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "APE_huge_composite.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:SampleRate": 1,
+  "APE:TotalFrames": "1000000000000000",
+  "APE:BlocksPerFrame": "1000000000000000",
+  "APE:FinalFrameBlocks": 0,
+  "Composite:Duration": 9.99999999999999e+29
+}]

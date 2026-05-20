@@ -1,7 +1,7 @@
 //! The per-format tag-table abstraction. Each ported ExifTool module supplies
 //! its own static `TagTable`; the shared `convert` runtime interprets these.
 
-use crate::value::TagValue;
+use crate::{convert::ConvContext, value::TagValue};
 
 /// A value-stage conversion (ExifTool `ValueConv`). `Func` is a faithful Rust
 /// transliteration of the Perl expression.
@@ -11,8 +11,16 @@ use crate::value::TagValue;
 pub enum ValueConv {
   /// No value conversion.
   None,
-  /// Pure transformation of the raw value.
+  /// Pure transformation of the raw value (no `$self` use).
   Func(fn(&TagValue) -> TagValue),
+  /// Context-dependent transformation: Perl code refs that dereference
+  /// `$self` (e.g. `$self->Options('CharsetID3')`, `$self->Decode(...)`,
+  /// `$$self{TimeScale}`) — the D11 conversion-context API (spec §11.2).
+  /// First consumer: ID3v1::Title's `ConvertID3v1Text` (ID3.pm:897-901).
+  ///
+  /// Strictly additive sibling of [`ValueConv::Func`]: existing tag defs
+  /// using `Func` continue to compile and run unchanged.
+  FuncCtx(fn(&TagValue, &ConvContext) -> TagValue),
   /// A Perl *hash* `ValueConv` (`ref $conv eq 'HASH'` applied with
   /// `$convType eq 'ValueConv'`, ExifTool.pm conv loop). Same faithful
   /// model as a hash `PrintConv` (`AAC.pm:46` `ValueConv => \%convSampleRate`).
@@ -116,6 +124,38 @@ impl PrintConvHash {
   }
 }
 
+/// A *raw-value* conversion (ExifTool `RawConv`, `ExifTool.pm:3477-3501`).
+/// Runs BEFORE [`ValueConv`] and [`PrintConv`] on the freshly-extracted raw
+/// value. Faithful Perl: a RawConv may return the same value (Perl idiom
+/// "side-effect only") or transform it — both are observable to downstream
+/// conv steps, which see the RawConv's return.
+///
+/// Only the variants needed by ported formats appear here. `MPEG.pm` uses
+/// the `SetFrameState` shape exclusively (`'$self->{MPEG_Vers} = $val'` and
+/// friends, MPEG.pm:27/36/202) — a side-effect that writes the raw integer
+/// into a per-frame state slot and returns `$val` unchanged. The
+/// [`crate::bitstream`] cond entry point applies this BEFORE the
+/// integer value is fed into [`ValueConv`], so subsequent tags' Condition
+/// arms (which read the same state) see the updated value. New variants
+/// (e.g. a transforming `Func(fn(&TagValue) -> TagValue)`) are additive —
+/// add when a faithful port first needs one and pin via the oracle golden.
+#[derive(
+  Clone, Copy, Debug, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+pub enum RawConv {
+  /// No RawConv (Perl tagInfo without a `RawConv` key — the common case).
+  None,
+  /// Faithful port of `RawConv => '$self->{X} = $val'`: write the raw
+  /// integer (from the bit-field accumulator) into the per-frame state
+  /// slot named `X`, return `$val` unchanged. The slot is read by sibling
+  /// tags' Condition arms (MPEG.pm:47-224). The `&'static str` is the
+  /// faithful Perl key (`"MPEG_Vers"`, `"MPEG_Layer"`, `"MPEG_Mode"` for
+  /// MPEG.pm).
+  SetFrameState(&'static str),
+}
+
 /// A print-stage conversion (ExifTool `PrintConv`).
 ///
 /// ExifTool also supports `PrintConv => [arrayref of per-element convs]`
@@ -146,8 +186,13 @@ pub enum PrintConv {
   /// `CompressionType`: `NONE`, `sowt`, `ULAW`, …). The value may be a
   /// string or a number, mirroring ExifTool exactly.
   Hash(PrintConvHash),
-  /// Arbitrary transliterated conversion to a display value.
+  /// Arbitrary transliterated conversion to a display value (no `$self` use).
   Func(fn(&TagValue) -> TagValue),
+  /// Context-dependent PrintConv — the D11 sibling of `Func`. Used by
+  /// Perl code refs that call `$self->ConvertDateTime`, `$self->Decode`,
+  /// or any `$$self{…}` deref. Strictly additive sibling of
+  /// [`PrintConv::Func`]: existing tag defs continue unchanged.
+  FuncCtx(fn(&TagValue, &ConvContext) -> TagValue),
 }
 
 /// Definition of one tag within a table.
@@ -171,6 +216,11 @@ pub struct TagDef {
   /// `ExifTool.pm:9520`). `false` ⇒ no list accumulation; first-wins via
   /// the serializer's `%noDups` (`exiftool:2950-2951`) applies as before.
   list: bool,
+  /// ExifTool `$$tagInfo{RawConv}` (ExifTool.pm:3477-3501). Default
+  /// [`RawConv::None`] = Perl tagInfo without a `RawConv` key. Faithful to
+  /// MPEG.pm:27/36/202 which use `'$self->{X} = $val'` (side-effect, return
+  /// `$val` unchanged) — see [`RawConv::SetFrameState`].
+  raw_conv: RawConv,
 }
 
 impl TagDef {
@@ -195,6 +245,7 @@ impl TagDef {
       bits_per_word: None,
       format: None,
       list: false,
+      raw_conv: RawConv::None,
     }
   }
 
@@ -256,6 +307,17 @@ impl TagDef {
     self
   }
 
+  /// Set `$$tagInfo{RawConv}` (ExifTool.pm:3477-3501). The Phase-2 cond
+  /// bit-stream entry point (`crate::bitstream::process_bit_stream_cond`)
+  /// applies this BEFORE `ValueConv`/`PrintConv`, so per-frame state
+  /// written here is observable to sibling tags' Condition arms — faithful
+  /// to MPEG.pm:27/36/202 + 47/71/95/.../224.
+  #[must_use]
+  pub const fn with_raw_conv(mut self, raw_conv: RawConv) -> Self {
+    self.raw_conv = raw_conv;
+    self
+  }
+
   /// Tag name as ExifTool reports it.
   #[must_use]
   pub const fn name(&self) -> &'static str {
@@ -307,6 +369,13 @@ impl TagDef {
   #[must_use]
   pub const fn list(&self) -> bool {
     self.list
+  }
+
+  /// `$$tagInfo{RawConv}` (ExifTool.pm:3477-3501); [`RawConv::None`] when
+  /// the Perl tagInfo omits the key.
+  #[must_use]
+  pub const fn raw_conv(&self) -> RawConv {
+    self.raw_conv
   }
 }
 
@@ -549,6 +618,23 @@ mod tests {
     assert!(ALL.list());
     assert_eq!(ALL.format(), Some("undef"));
     assert!(ALL.print_hex());
+  }
+
+  #[test]
+  fn tagdef_raw_conv_builder_and_getter() {
+    // Default — Perl tagInfo without a RawConv key.
+    static NO_RC: TagDef = TagDef::new("NoRc", "MPEG", ValueConv::None, PrintConv::None);
+    assert!(NO_RC.raw_conv().is_none());
+
+    // SetFrameState — MPEG.pm:27 RawConv=>'$self->{MPEG_Vers}=$val'.
+    static SET_VERS: TagDef =
+      TagDef::new("MPEGAudioVersion", "MPEG", ValueConv::None, PrintConv::None)
+        .with_raw_conv(RawConv::SetFrameState("MPEG_Vers"));
+    assert!(SET_VERS.raw_conv().is_set_frame_state());
+    assert_eq!(
+      *SET_VERS.raw_conv().unwrap_set_frame_state_ref(),
+      "MPEG_Vers"
+    );
   }
 
   #[test]

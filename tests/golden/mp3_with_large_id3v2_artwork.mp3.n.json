@@ -1,0 +1,23 @@
+[{
+  "SourceFile": "mp3_with_large_id3v2_artwork.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 9271,
+  "MPEG:MPEGAudioVersion": 3,
+  "MPEG:AudioLayer": 1,
+  "MPEG:AudioBitrate": 128000,
+  "MPEG:SampleRate": 0,
+  "MPEG:ChannelMode": 1,
+  "MPEG:MSStereo": 0,
+  "MPEG:IntensityStereo": 0,
+  "MPEG:CopyrightFlag": 1,
+  "MPEG:OriginalMedia": 1,
+  "MPEG:Emphasis": 0,
+  "ID3v2_3:PictureMIMEType": "image/jpeg",
+  "ID3v2_3:PictureType": 3,
+  "ID3v2_3:PictureDescription": "",
+  "ID3v2_3:Picture": "(Binary data 9222 bytes, use -b option to extract)",
+  "ID3v2_3:Title": "Test"
+}]

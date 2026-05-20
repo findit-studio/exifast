@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "dsf_with_id3v2_trailer.dsf",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DSF",
+  "File:FileTypeExtension": "DSF",
+  "File:MIMEType": "audio/x-dsf",
+  "File:FormatVersion": 1,
+  "File:FormatID": 0,
+  "File:ChannelType": 2,
+  "File:ChannelCount": 2,
+  "File:SampleRate": 2822400,
+  "File:BitsPerSample": 1,
+  "File:SampleCount": 100,
+  "File:BlockSize": 4096,
+  "File:ID3Size": 29,
+  "ID3v2_3:Title": "DsfTitle"
+}]

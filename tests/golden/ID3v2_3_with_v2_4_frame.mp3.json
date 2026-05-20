@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "ID3v2_3_with_v2_4_frame.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[minor] Frame 'TMOO' is not valid for this ID3 version",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "mp3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 26,
+  "ID3v2_4:Mood": "Happy"
+}]

@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "AIFF_first_nv_exp.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "aiff",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 1000,
+  "AIFF:SampleSize": 16,
+  "AIFF:SampleRate": 8.30767497365572e+34,
+  "Composite:Duration": "0.00 s"
+}]

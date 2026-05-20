@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "ape_id3v24_footer_then_mac.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "ape",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "File:ID3Size": 34,
+  "MAC:APEVersion": 3.97,
+  "MAC:CompressionLevel": 2000,
+  "MAC:Channels": 2,
+  "MAC:SampleRate": 44100,
+  "MAC:TotalFrames": 100,
+  "MAC:FinalFrameBlocks": 0,
+  "APE:Artist": "V24FooterTester",
+  "ID3v2_4:Title": "TestV24Footer"
+}]

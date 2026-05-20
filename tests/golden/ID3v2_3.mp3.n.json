@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "ID3v2_3.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 122,
+  "ID3v2_3:Title": "Hello",
+  "ID3v2_3:Artist": "Phil",
+  "ID3v2_3:Album": "Album23",
+  "ID3v2_3:Genre": "Rock",
+  "ID3v2_3:Comment": "Hi",
+  "ID3v2_3:PictureMIMEType": "image/jpeg",
+  "ID3v2_3:PictureType": 0,
+  "ID3v2_3:PictureDescription": "img",
+  "ID3v2_3:Picture": "(Binary data 4 bytes, use -b option to extract)"
+}]

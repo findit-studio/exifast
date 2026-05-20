@@ -1,0 +1,21 @@
+[{
+  "SourceFile": "ape_with_enhancedtag_and_id3v1.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "File:ID3Size": 128,
+  "MAC:APEVersion": 3.97,
+  "MAC:CompressionLevel": 2000,
+  "MAC:Channels": 2,
+  "MAC:SampleRate": 44100,
+  "MAC:TotalFrames": 100,
+  "MAC:FinalFrameBlocks": 0,
+  "APE:Artist": "ApeEnhancedTAGArtist",
+  "ID3v1:Title": "StdTitleX",
+  "ID3v1:Artist": "StdArtistX",
+  "ID3v1:Album": "StdAlbumX",
+  "ID3v1:Year": 2024,
+  "ID3v1:Comment": "StdCommentX",
+  "ID3v1:Genre": 7
+}]

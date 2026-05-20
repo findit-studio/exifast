@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "synthetic_opus_minimal.opus",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OPUS",
+  "File:FileTypeExtension": "OPUS",
+  "File:MIMEType": "audio/ogg",
+  "Vorbis:Vendor": "libopus 1.5 synth",
+  "Vorbis:Title": "Synth Tone",
+  "Vorbis:Artist": "exifast tests"
+}]

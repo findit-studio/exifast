@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "ID3v2_2.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 111,
+  "ID3v2_2:Title": "ExifTool Test",
+  "ID3v2_2:Artist": "Phil Harvey",
+  "ID3v2_2:Genre": "Rock",
+  "ID3v2_2:Composer": "A Composer",
+  "ID3v2_2:Comment": "Hello",
+  "ID3v2_2:PictureFormat": "JPG",
+  "ID3v2_2:PictureType": 3,
+  "ID3v2_2:PictureDescription": "shot",
+  "ID3v2_2:Picture": "(Binary data 3 bytes, use -b option to extract)"
+}]

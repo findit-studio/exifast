@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "DV.dv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DV",
+  "File:FileTypeExtension": "dv",
+  "File:MIMEType": "video/x-dv",
+  "DV:DateTimeOriginal": "2010:02:16 21:36:28",
+  "DV:ImageWidth": 720,
+  "DV:ImageHeight": 576,
+  "DV:Duration": "0.00 s",
+  "DV:TotalBitrate": "28.8 Mbps",
+  "DV:VideoFormat": "IEC 61834 - 625/50 (PAL)",
+  "DV:VideoScanType": "Interlaced",
+  "DV:FrameRate": 25,
+  "DV:AspectRatio": "16:9",
+  "DV:Colorimetry": "4:2:0",
+  "DV:AudioChannels": 4,
+  "DV:AudioSampleRate": 32000,
+  "DV:AudioBitsPerSample": 12
+}]

@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "ape_id3_prefixed.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "File:ID3Size": 30,
+  "MAC:APEVersion": 3.97,
+  "MAC:CompressionLevel": 0,
+  "MAC:Channels": 0,
+  "MAC:SampleRate": 0,
+  "MAC:TotalFrames": 0,
+  "MAC:FinalFrameBlocks": 0,
+  "APE:Artist": "Tester",
+  "ID3v2_3:Title": "TestTitle"
+}]

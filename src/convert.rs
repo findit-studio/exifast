@@ -1,11 +1,96 @@
 //! Runs a raw value through a `TagDef`'s ValueConv then PrintConv, producing
 //! the value that appears in `-j` output (PrintConv on) — ExifTool's pipeline.
+//!
+//! # D11 conversion-context API (spec §11.2)
+//!
+//! ExifTool ValueConv/PrintConv code refs frequently dereference `$self`
+//! (the per-file `Image::ExifTool` instance) for reader state/options —
+//! e.g. `ConvertID3v1Text` (ID3.pm:897-901) reads
+//! `$self->Options('CharsetID3')`. The D11 API exposes that state via
+//! [`ConvContext`]: a small struct carrying ONLY the option/state fields
+//! some real ported tag actually consumes.
+//!
+//! **Derivation rule (frozen in this PR — ID3 pathfinder, FORMATS.md row 2).**
+//! Fields are added ADDITIVELY when a real ported tag's faithful conversion
+//! needs them — NEVER speculatively. The initial field set is derived from
+//! the FIRST context-dependent ValueConv in our port: ID3v1::Title
+//! (ID3.pm:339-343 → :897-901 `ConvertID3v1Text`) reads
+//! `$self->Options('CharsetID3')` (default `"Latin"`, ExifTool.pm:1118).
+//! Future format ports CONSUME this shape (no re-design); they may add
+//! fields, but every addition must cite the first real consumer.
+//!
+//! **Plumbing.** Two parallel APIs:
+//! - [`apply`] — the legacy entry point (default `ConvContext`); existing
+//!   `ValueConv::Func` / `PrintConv::Func` callers continue to work
+//!   unchanged (AAC, FLAC StreamInfo, etc.).
+//! - [`apply_ctx`] — the context-threaded entry point; routes to
+//!   [`ValueConv::FuncCtx`] / [`PrintConv::FuncCtx`] when present.
+//!
+//! Both variants accept any [`ValueConv`]/[`PrintConv`] enum value; the
+//! `FuncCtx` variants are simply the additive extension. `apply` is a thin
+//! wrapper that builds a default context and delegates to `apply_ctx` —
+//! no behavior change for AAC and friends.
 
 use crate::{
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
   value::{format_g, TagValue},
 };
 use smol_str::SmolStr;
+
+/// Faithful model of the subset of `$$self{OPTIONS}` / `$self`-derived state
+/// that ported ValueConv/PrintConv code refs actually consume. Per D11
+/// derivation rule (spec §11.2): fields are added additively for each new
+/// real consumer; do NOT speculate. The currently-carried fields:
+///
+/// - **`charset_id3`** — ExifTool `$$self{OPTIONS}{CharsetID3}` (default
+///   `"Latin"`, ExifTool.pm:1118). First consumer: ID3v1::Title
+///   (ID3.pm:339-343 calls :897-901 `ConvertID3v1Text` which does
+///   `$et->Decode($val, $et->Options('CharsetID3'))`).
+///
+/// D8 (no public fields): all fields are private; access via accessors;
+/// `const fn new` enables `static` use. Extension contract: add a field +
+/// a `const fn with_<field>` builder + a `<field>()` accessor + an
+/// in-code citation of the FIRST real-tag consumer.
+#[derive(Clone, Copy)]
+pub struct ConvContext {
+  /// ExifTool `$$self{OPTIONS}{CharsetID3}`: drives `ConvertID3v1Text`
+  /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
+  charset_id3: &'static str,
+}
+
+impl ConvContext {
+  /// Construct a `ConvContext` from explicit field values. Required for
+  /// `static` use (e.g. test fixtures); production callers usually want
+  /// [`ConvContext::default`].
+  #[must_use]
+  pub const fn new(charset_id3: &'static str) -> Self {
+    Self { charset_id3 }
+  }
+
+  /// `$$self{OPTIONS}{CharsetID3}` — drives `ConvertID3v1Text`
+  /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
+  #[must_use]
+  pub const fn charset_id3(&self) -> &'static str {
+    self.charset_id3
+  }
+
+  /// Builder: override `charset_id3` (D8 `with_*` shape). The read path
+  /// does not yet expose `CharsetID3` as a user-controllable option, so
+  /// production callers stay on the default; this builder exists for
+  /// tests + the documented extension contract.
+  #[must_use]
+  pub const fn with_charset_id3(mut self, value: &'static str) -> Self {
+    self.charset_id3 = value;
+    self
+  }
+}
+
+impl Default for ConvContext {
+  /// `CharsetID3 => 'Latin'` (ExifTool.pm:1118): bundled ExifTool's default.
+  fn default() -> Self {
+    Self::new("Latin")
+  }
+}
 
 /// The conversion stage, faithful to ExifTool's `$convType` (`ExifTool.pm`
 /// `GetValue`/`ConvertValue`). The `PrintHex → 'Unknown (0x%x)'` sub-case is
@@ -24,10 +109,33 @@ enum ConvType {
   PrintConv,
 }
 
-/// Apply ValueConv then PrintConv. `print_conv_enabled` mirrors ExifTool's
-/// `-n` switch: when `false`, the post-ValueConv value is returned (the `-n`
-/// golden), matching spec §4's two snapshots.
+/// Hot-path default — `apply` runs per tag, so the default `ConvContext`
+/// is lifted to a `static` and passed by `&` instead of constructed (and
+/// then immediately borrowed) on every call.
+static DEFAULT_CONV_CONTEXT: ConvContext = ConvContext::new("Latin");
+
+/// Apply ValueConv then PrintConv with the **default** [`ConvContext`].
+/// `print_conv_enabled` mirrors ExifTool's `-n` switch: when `false`, the
+/// post-ValueConv value is returned (the `-n` golden), matching spec §4's
+/// two snapshots.
+///
+/// Thin wrapper over [`apply_ctx`]: zero behavioral difference for tags
+/// that use only `ValueConv::None`/`Func`/`Hash` + `PrintConv::None`/`Func`/
+/// `Hash` (AAC, FLAC StreamInfo). The `FuncCtx` variants observe whatever
+/// `ConvContext` is in scope; `apply` provides the default.
 pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue {
+  apply_ctx(def, raw, print_conv_enabled, &DEFAULT_CONV_CONTEXT)
+}
+
+/// Apply ValueConv then PrintConv, threading a [`ConvContext`] for any
+/// `FuncCtx` variants. See module-level docs for the D11 derivation rule.
+/// Element-wise over lists (ExifTool.pm:3578-3582), identical to [`apply`].
+pub fn apply_ctx(
+  def: &TagDef,
+  raw: &TagValue,
+  print_conv_enabled: bool,
+  ctx: &ConvContext,
+) -> TagValue {
   // ExifTool.pm:3578-3582 — the conversion loop iterates list elements for
   // the active stage, applying the current conv per scalar `$val`. Recurse
   // once at the top so BOTH ValueConv and PrintConv run element-wise; nested
@@ -36,19 +144,20 @@ pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue
     return TagValue::List(
       items
         .iter()
-        .map(|it| apply(def, it, print_conv_enabled))
+        .map(|it| apply_ctx(def, it, print_conv_enabled, ctx))
         .collect(),
     );
   }
   let valued = match def.value_conv() {
     ValueConv::None => raw.clone(),
     ValueConv::Func(f) => f(raw),
+    ValueConv::FuncCtx(f) => f(raw, ctx),
     ValueConv::Hash(h) => apply_hash_conv(def, &h, raw, ConvType::ValueConv),
   };
   if !print_conv_enabled {
     return valued;
   }
-  apply_print_conv(def, def.print_conv(), &valued, ConvType::PrintConv)
+  apply_print_conv(def, def.print_conv(), &valued, ConvType::PrintConv, ctx)
 }
 
 /// The PrintConv stage. ExifTool runs the conversion over every element of a
@@ -63,18 +172,20 @@ fn apply_print_conv(
   conv: PrintConv,
   valued: &TagValue,
   conv_type: ConvType,
+  ctx: &ConvContext,
 ) -> TagValue {
   if let TagValue::List(items) = valued {
     return TagValue::List(
       items
         .iter()
-        .map(|it| apply_print_conv(def, conv, it, conv_type))
+        .map(|it| apply_print_conv(def, conv, it, conv_type, ctx))
         .collect(),
     );
   }
   match conv {
     PrintConv::None => valued.clone(),
     PrintConv::Func(f) => f(valued),
+    PrintConv::FuncCtx(f) => f(valued, ctx),
     PrintConv::Hash(h) => apply_hash_conv(def, &h, valued, conv_type),
   }
 }
@@ -385,12 +496,96 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
   bit_list.join(if lookup.is_some() { ", " } else { "," })
 }
 
-/// The stringified scalar ExifTool would key `$$conv{$val}` by (Perl hash
-/// keys are strings), and which the JSON serializer prints. Numbers use the
+// `convert_bitrate` (faithful `sub ConvertBitrate($)` from
+// `ExifTool.pm:6891-6902`) is DEFERRED to the dedicated Vorbis/Theora codec
+// PRs (R1 F2 — see `src/formats/ogg.rs` top-of-module comment). The Ogg
+// pathfinder PR tightened its scope back to "container + Vorbis-comment
+// block" and the `convert_bitrate` engine helper has no in-scope consumer
+// here. When `Vorbis.pm` / `Theora.pm` codec-identification-table PRs land,
+// they will re-land this helper alongside its consumers (Vorbis.pm:55,61,67
+// + Theora.pm:88).
+
+/// Faithful transliteration of `Image::ExifTool::XMP::DecodeBase64` (an
+/// RFC 4648 decode used by `Vorbis.pm:101-104` for `COVERART` and
+/// `Vorbis.pm:122-134` for `METADATA_BLOCK_PICTURE`). The standard alphabet
+/// `A-Za-z0-9+/`, with `=` padding; ignores whitespace; on the first
+/// invalid input byte the function returns the *partial* decode collected
+/// up to that point (mirroring Perl's `MIME::Base64::decode` permissive-
+/// but-bounded behavior — real ExifTool COVERART payloads are clean base64,
+/// so this fallback is mostly defensive and never panics). Output is the
+/// decoded raw bytes.
+pub(crate) fn base64_decode(s: &str) -> Vec<u8> {
+  // Map an ASCII byte to its 6-bit value, or `None` for ignored/invalid.
+  fn val(b: u8) -> Option<u8> {
+    match b {
+      b'A'..=b'Z' => Some(b - b'A'),
+      b'a'..=b'z' => Some(b - b'a' + 26),
+      b'0'..=b'9' => Some(b - b'0' + 52),
+      b'+' => Some(62),
+      b'/' => Some(63),
+      _ => None,
+    }
+  }
+  let mut out: Vec<u8> = Vec::with_capacity(s.len() * 3 / 4);
+  let mut buf: u32 = 0;
+  let mut have: u32 = 0; // number of valid 6-bit chunks accumulated (0..=4)
+  for &b in s.as_bytes() {
+    if b == b'=' {
+      // Padding — stops decoding (the trailing 1/2 byte was emitted as the
+      // chunks accumulated; padding is purely positional).
+      break;
+    }
+    if b.is_ascii_whitespace() {
+      continue;
+    }
+    let Some(v) = val(b) else {
+      // Invalid byte ⇒ abort (mirror Perl's permissive-but-bounded decode:
+      // anything outside the alphabet + padding + whitespace → no further
+      // bytes, return what we have so far). Real ExifTool COVERART payloads
+      // are clean base64, so this branch only fires on a truly malformed
+      // input; returning the partial decode (Vec accumulated so far) keeps
+      // the parser panic-free.
+      return out;
+    };
+    buf = (buf << 6) | u32::from(v);
+    have += 1;
+    if have == 4 {
+      out.push((buf >> 16) as u8);
+      out.push((buf >> 8) as u8);
+      out.push(buf as u8);
+      buf = 0;
+      have = 0;
+    }
+  }
+  // Emit any leftover bytes (when input length % 4 ∈ {2, 3}). Perl's
+  // `MIME::Base64::decode` does the same: a final partial group of 2 valid
+  // base64 chars decodes to 1 byte, 3 chars to 2 bytes.
+  match have {
+    2 => out.push((buf >> 4) as u8),
+    3 => {
+      out.push((buf >> 10) as u8);
+      out.push((buf >> 2) as u8);
+    }
+    _ => {}
+  }
+  out
+}
+
 /// crate's single shared `%g`/rational formatter ([`crate::value::format_g`]
 /// / [`Rational::exiftool_val_str`]) so a hash key matches the serialized
-/// `$val` text exactly. `Bytes` has no faithful Perl scalar key ⇒ `None`
-/// (caller treats it as a miss).
+/// `$val` text exactly. `Bytes` is keyed via [`fix_utf8`] (`XMP::FixUTF8`,
+/// XMP.pm:2943-2974) — the same byte-walker `EscapeJSON` runs on every
+/// string before serialization at exiftool:3822, so the hash-key lookup
+/// matches the JSON-printed `$val` text byte-for-byte. ASCII is identity
+/// (so AIFF `CompressionType` `"NONE"`/`"sowt"`/… hit the Perl hash
+/// entries exactly); high bytes that do NOT form a valid UTF-8 sequence
+/// are replaced with `?` (Perl default `$bad`). Codex R3 fix: an earlier
+/// **byte-identical Latin-1** keying diverged from Perl for
+/// `CompressionType b"\x80ABC"` (Perl ⇒ `"?ABC"`; Latin-1 ⇒ `"\u{0080}ABC"`).
+/// This `Bytes` arm subsumes the prior `None` (which made every
+/// `Bytes`-backed string[N] PrintConv hash lookup miss — flagged by Codex
+/// R1 on the AIFF `CompressionType` path once string/pstring formats
+/// started emitting `TagValue::Bytes` faithfully).
 fn exiftool_val_string(v: &TagValue) -> Option<String> {
   match v {
     // Perl stringifies an integer as its decimal text (`"$n"`).
@@ -412,8 +607,19 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
     // `num/denom` rounded via the shared formatter (or `inf`/`undef`):
     // exactly what the serializer prints, so the key matches `$val`.
     TagValue::Rational(r) => Some(r.exiftool_val_str()),
-    // No faithful Perl hash key for raw bytes ⇒ miss.
-    TagValue::Bytes(_) => None,
+    // Byte strings: Perl-faithful FixUTF8 mapping (XMP.pm:2943-2974,
+    // called by `EscapeJSON` at exiftool:3822). Valid UTF-8 sequences in
+    // the byte buffer are preserved as their decoded chars; bytes that
+    // do NOT form a valid UTF-8 sequence are replaced by `?`. ASCII is
+    // identity (so AIFF `CompressionType` "NONE"/"sowt"/… still hits the
+    // Perl hash entries exactly). For high bytes: a MacRoman-decoded
+    // tag's ValueConv emits a `TagValue::Str` BEFORE this lookup runs
+    // (the `Bytes → Str` MacRoman conversion happens in
+    // `decode_macroman`), so `Bytes` arrives at this lookup ONLY for
+    // tags WITHOUT a ValueConv (e.g. AIFF `CompressionType`). Codex R3:
+    // a previous Latin-1 1:1 mapping diverged from Perl for
+    // CompressionType `\x80ABC` (Perl: "?ABC"; Latin-1: "\u{0080}ABC").
+    TagValue::Bytes(b) => Some(fix_utf8(b)),
     // Lists are stripped element-wise by `apply` before any hash-conv path
     // (and `apply_print_conv`'s list-arm defends the same on direct calls).
     TagValue::List(_) => None,
@@ -563,6 +769,108 @@ pub fn fix_utf8(bytes: &[u8]) -> String {
   // `String::from_utf8` (no unsafe) — falling back to lossy *just* in
   // case (panic-free contract, `#![forbid(unsafe_code)]`).
   String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Emit one codepoint as Perl's `pack('C0U', $n)` would (variable-length
+/// UTF-8 encoding WITHOUT validity checks — surrogates and out-of-range
+/// values get the same algorithmic encoding, deliberately producing
+/// byte sequences that [`fix_utf8`] will later flag as bad).
+///
+/// XMP.pm:2933 (`UnescapeChar`) is the only call site this port targets —
+/// see [[exifast-phase2-forward-items]] FixUTF8 entry for the broader
+/// engine-level concern.
+///
+/// Perl's `pack('C0U', n)` follows the original UTF-8 spec (RFC 2279,
+/// allowing up to 6 bytes) and then Perl's own RFC-2279-extended forms
+/// (7-byte lead `0xFE`, 13-byte lead `0xFF`) for codepoints up to
+/// `0x7FFF_FFFF_FFFF_FFFF` (i64::MAX, Perl's hard `pack` limit; values
+/// above that die inside Perl — we treat them as "leave entity literal"
+/// in [`resolve_html_entity_codepoint`]).
+///
+/// Bytes generated for `n >= 0x110000` are deliberately invalid UTF-8 —
+/// [`fix_utf8`] will turn each into one `?` downstream.
+pub fn pack_c0u(n: u64, out: &mut Vec<u8>) {
+  if n < 0x80 {
+    out.push(n as u8);
+  } else if n < 0x800 {
+    out.push(0xC0 | ((n >> 6) & 0x1F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x10000 {
+    out.push(0xE0 | ((n >> 12) & 0x0F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x20_0000 {
+    out.push(0xF0 | ((n >> 18) & 0x07) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x400_0000 {
+    out.push(0xF8 | ((n >> 24) & 0x03) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x8000_0000 {
+    // 6-byte form (Perl `pack('C0U')` for `0x0400_0000..=0x7FFF_FFFF`).
+    // FixUTF8 lead-byte gate is `< 0xF8`, so 0xFC/0xFD are NEVER accepted —
+    // each byte becomes `?` downstream. Empirical: `n=0x7fffffff` ⇒ 6
+    // bytes `fd bf bf bf bf bf` ⇒ FixUTF8 ⇒ "??????" (6 `?`s).
+    out.push(0xFC | ((n >> 30) & 0x01) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else if n < 0x10_0000_0000 {
+    // 7-byte form (Perl `pack('C0U')` for `0x8000_0000..=0xF_FFFF_FFFF`,
+    // i.e. 31..36 payload bits). Lead byte is always `0xFE`. Empirical
+    // bundled-Perl reference (R5 investigation):
+    //   n=0x80000000   ⇒ fe 82 80 80 80 80 80
+    //   n=0xFFFFFFFF   ⇒ fe 83 bf bf bf bf bf
+    //   n=0x100000000  ⇒ fe 84 80 80 80 80 80
+    //   n=0xFFFFFFFFF  ⇒ fe bf bf bf bf bf bf
+    // Each invalid byte becomes one `?` via FixUTF8 (7 `?`s). Byte 1
+    // carries six payload bits (`(n >> 30) & 0x3F`), not two — fixed
+    // from the earlier u32-only `& 0x03` cap so 32..36-bit values
+    // round-trip byte-exact against Perl.
+    out.push(0xFE);
+    out.push(0x80 | ((n >> 30) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  } else {
+    // 13-byte form (Perl `pack('C0U')` for
+    // `0x10_0000_0000..=0x7FFF_FFFF_FFFF_FFFF`, i.e. 37..63 payload bits).
+    // Lead byte is `0xFF`; 12 continuation bytes follow, each carrying
+    // 6 bits of payload starting from the most significant 6-bit group.
+    // Empirical (R5):
+    //   n=0x1000000000        ⇒ ff 80 80 80 80 80 81 80 80 80 80 80 80
+    //   n=0x7FFFFFFFFFFFFFFF  ⇒ ff 80 87 bf bf bf bf bf bf bf bf bf bf
+    // Lead `0xFF` is `>= 0xF8`, so FixUTF8 rejects it and every
+    // continuation byte (orphans) — output is 13 `?` chars.
+    //
+    // The first two continuation bytes (i=1,2) cover bit positions
+    // 66..71 and 60..65 respectively. A `u64` can only set bits 0..63,
+    // so those slots are always `0x80`. We hard-code that to avoid an
+    // illegal shift (`n >> 66` is undefined behavior for u64); the
+    // remaining ten payload bytes use shifts in `[0, 60]` which are
+    // safe.
+    out.push(0xFF);
+    out.push(0x80); // bits 71..66 — always zero for u64-bounded n
+    out.push(0x80 | ((n >> 60) & 0x3F) as u8); // bits 65..60
+    out.push(0x80 | ((n >> 54) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 48) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 42) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 36) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 30) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 24) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 18) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 12) & 0x3F) as u8);
+    out.push(0x80 | ((n >> 6) & 0x3F) as u8);
+    out.push(0x80 | (n & 0x3F) as u8);
+  }
 }
 
 /// Faithful transliteration of `Image::ExifTool::ReadValue($dataPt, $offset,
@@ -1793,6 +2101,66 @@ mod tests {
     );
   }
 
+  // ---- D11 conversion-context API (spec §11.2) ----
+
+  #[test]
+  fn conv_context_default_is_latin() {
+    // Default `CharsetID3 => 'Latin'` (ExifTool.pm:1118).
+    let ctx = ConvContext::default();
+    assert_eq!(ctx.charset_id3(), "Latin");
+  }
+
+  #[test]
+  fn conv_context_with_charset_id3_override() {
+    // `with_charset_id3` is the D8 builder shape — `const fn` so it
+    // composes into a `static` if a port ever needs it.
+    let ctx = ConvContext::default().with_charset_id3("UTF8");
+    assert_eq!(ctx.charset_id3(), "UTF8");
+  }
+
+  /// First-consumer-shaped: an ID3v1::Title-style ValueConv that reads
+  /// `ctx.charset_id3()` and returns a value derived from it. Proves the
+  /// `FuncCtx` plumbing routes the context through `apply_ctx` correctly.
+  fn fake_id3v1_text_conv(raw: &TagValue, ctx: &ConvContext) -> TagValue {
+    let bytes = match raw {
+      TagValue::Str(s) => s.as_bytes(),
+      _ => return raw.clone(),
+    };
+    // Stand-in: emit the charset tag so the test sees which ctx was used.
+    let s = format!("[{}]{}", ctx.charset_id3(), String::from_utf8_lossy(bytes));
+    TagValue::Str(s.into())
+  }
+
+  static D11_VC_FUNCCTX: TagDef = TagDef::new(
+    "Title",
+    "ID3v1",
+    ValueConv::FuncCtx(fake_id3v1_text_conv),
+    PrintConv::None,
+  );
+
+  #[test]
+  fn apply_ctx_routes_value_conv_funcctx() {
+    // Default ctx (Latin), then an override; both reach the FuncCtx fn.
+    assert_eq!(
+      apply_ctx(
+        &D11_VC_FUNCCTX,
+        &TagValue::Str("hi".into()),
+        true,
+        &ConvContext::default()
+      ),
+      TagValue::Str("[Latin]hi".into())
+    );
+    assert_eq!(
+      apply_ctx(
+        &D11_VC_FUNCCTX,
+        &TagValue::Str("hi".into()),
+        true,
+        &ConvContext::new("UTF8")
+      ),
+      TagValue::Str("[UTF8]hi".into())
+    );
+  }
+
   #[test]
   fn read_value_int8s_signed() {
     // `Get8s` (ExifTool.pm:6068) ⇒ `0xff` reads as `-1`.
@@ -2103,5 +2471,191 @@ mod tests {
     assert_eq!(read_value(&buf, 0, "double", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "binary", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "garbage", 1, ByteOrder::Mm), None);
+  }
+
+  #[test]
+  fn apply_thin_wraps_apply_ctx_with_default() {
+    // `apply` must be a behavior-identical thin wrapper for default ctx —
+    // any FuncCtx invoked via `apply` sees the Latin default.
+    assert_eq!(
+      apply(&D11_VC_FUNCCTX, &TagValue::Str("hi".into()), true),
+      TagValue::Str("[Latin]hi".into())
+    );
+  }
+
+  fn fake_printctx(v: &TagValue, ctx: &ConvContext) -> TagValue {
+    match v {
+      TagValue::Str(s) => TagValue::Str(format!("{}::{}", ctx.charset_id3(), s).into()),
+      x => x.clone(),
+    }
+  }
+  static D11_PC_FUNCCTX: TagDef = TagDef::new(
+    "T",
+    "ID3v1",
+    ValueConv::None,
+    PrintConv::FuncCtx(fake_printctx),
+  );
+
+  #[test]
+  fn apply_ctx_routes_print_conv_funcctx() {
+    assert_eq!(
+      apply_ctx(
+        &D11_PC_FUNCCTX,
+        &TagValue::Str("x".into()),
+        true,
+        &ConvContext::new("ZZ")
+      ),
+      TagValue::Str("ZZ::x".into())
+    );
+    // -n mode (PrintConv off): the FuncCtx must NOT run; raw passes through.
+    assert_eq!(
+      apply_ctx(
+        &D11_PC_FUNCCTX,
+        &TagValue::Str("x".into()),
+        false,
+        &ConvContext::new("ZZ")
+      ),
+      TagValue::Str("x".into())
+    );
+  }
+
+  #[test]
+  fn apply_ctx_funcctx_is_element_wise_over_list() {
+    // ExifTool.pm:3578-3582 — every element runs through the conv. The list
+    // arm recursion in `apply_ctx` must thread `ctx` through every element.
+    let list = TagValue::List(vec![TagValue::Str("a".into()), TagValue::Str("b".into())]);
+    let out = apply_ctx(&D11_VC_FUNCCTX, &list, true, &ConvContext::new("Latin"));
+    assert_eq!(
+      out,
+      TagValue::List(vec![
+        TagValue::Str("[Latin]a".into()),
+        TagValue::Str("[Latin]b".into()),
+      ])
+    );
+  }
+
+  // ---------- Audible-port FixUTF8 / pack_c0u tests --------------------------
+  // Empirical reference column ("Perl" below) generated by running
+  //   perl -I.../exiftool/lib -e 'use Image::ExifTool::XMP;
+  //     my $s = ...; Image::ExifTool::XMP::FixUTF8(\$s); print $s;'
+  // against the bundled ExifTool oracle (Audible PR #12 R4 investigation).
+
+  #[test]
+  fn fix_utf8_rejects_overlong_3byte_and_surrogates() {
+    // Overlong 3-byte: 0xE0 + cont < 0xA0 (e.g. e0 80 80 encodes U+0000).
+    // Perl rejects (XMP.pm:2958).
+    assert_eq!(fix_utf8(b"\xe0\x80\x80"), "???");
+    // Surrogate U+D800 = ed a0 80 — Perl rejects (XMP.pm:2959).
+    assert_eq!(fix_utf8(b"X\xed\xa0\x80Y"), "X???Y");
+    // Surrogate U+DFFF = ed bf bf — rejected.
+    assert_eq!(fix_utf8(b"\xed\xbf\xbf"), "???");
+    // Adjacent BMP noncharacter U+FDD0..U+FDEF — NOT rejected (FixUTF8
+    // only catches U+FFFE/U+FFFF in the noncharacter range; faithful).
+    assert_eq!(fix_utf8(b"\xef\xb7\x90"), "\u{fdd0}");
+  }
+
+  #[test]
+  fn fix_utf8_rejects_overlong_4byte_and_above_u10ffff() {
+    // Overlong 4-byte: 0xF0 + cont < 0x90 (encodes < U+10000). Rejected
+    // (XMP.pm:2963).
+    assert_eq!(fix_utf8(b"\xf0\x80\x80\x80"), "????");
+    // > U+10FFFF: 0xF4 + cont > 0x8F. Rejected (XMP.pm:2964).
+    assert_eq!(fix_utf8(b"\xf4\x90\x80\x80"), "????");
+    // $ch > 0xF4 (0xF5..=0xF7) — always rejected.
+    assert_eq!(fix_utf8(b"\xf5\x80\x80\x80"), "????");
+    // Boundary: U+10FFFF = f4 8f bf bf — KEPT.
+    assert_eq!(fix_utf8(b"\xf4\x8f\xbf\xbf"), "\u{10ffff}");
+  }
+
+  #[test]
+  fn fix_utf8_truncated_continuation_each_byte_replaced() {
+    // 0xC2 (2-byte lead) but no continuation: one `?`.
+    assert_eq!(fix_utf8(b"\xc2"), "?");
+    // 0xE0 + 0xA0 but missing third byte: each invalid byte ⇒ `?`.
+    // Perl: scans byte by byte after the failed match.
+    assert_eq!(fix_utf8(b"\xe0\xa0"), "??");
+    // Multi-byte lead followed by ASCII (continuation pattern fails).
+    assert_eq!(fix_utf8(b"\xe2A"), "?A");
+  }
+
+  #[test]
+  fn pack_c0u_perl_pack_c0u_byte_exact() {
+    // Empirical reference (Perl `pack('C0U', $n)`):
+    //   n=0x7f                -> [7f]                       (1 byte)
+    //   n=0x80                -> [c2 80]                    (2 bytes)
+    //   n=0xa0                -> [c2 a0]
+    //   n=0xff                -> [c3 bf]
+    //   n=0xd800              -> [ed a0 80]                 (surrogate, 3 bytes invalid)
+    //   n=0xfffe              -> [ef bf be]                 (noncharacter)
+    //   n=0xffff              -> [ef bf bf]
+    //   n=0x10000             -> [f0 90 80 80]              (4 bytes)
+    //   n=0x10ffff            -> [f4 8f bf bf]              (max valid)
+    //   n=0x110000            -> [f4 90 80 80]              (above max, FixUTF8 will reject)
+    //   n=0x7fffffff          -> [fd bf bf bf bf bf]        (6 bytes)
+    //   n=0x80000000          -> [fe 82 80 80 80 80 80]     (7 bytes)
+    //   n=0xffffffff          -> [fe 83 bf bf bf bf bf]
+    //   n=0x100000000         -> [fe 84 80 80 80 80 80]     (R5: 7-byte form extends past u32)
+    //   n=0xfffffffff         -> [fe bf bf bf bf bf bf]     (R5: top of 7-byte range)
+    //   n=0x1000000000        -> [ff 80 80 80 80 80 81 80 80 80 80 80 80] (R5: 13-byte form begins)
+    //   n=0x7fffffffffffffff  -> [ff 80 87 bf bf bf bf bf bf bf bf bf bf] (Perl pack max)
+    let mut out = Vec::new();
+    let cases: &[(u64, &[u8])] = &[
+      (0x7F, &[0x7F]),
+      (0x80, &[0xC2, 0x80]),
+      (0xA0, &[0xC2, 0xA0]),
+      (0xFF, &[0xC3, 0xBF]),
+      (0xD800, &[0xED, 0xA0, 0x80]),
+      (0xFFFE, &[0xEF, 0xBF, 0xBE]),
+      (0xFFFF, &[0xEF, 0xBF, 0xBF]),
+      (0x10000, &[0xF0, 0x90, 0x80, 0x80]),
+      (0x10FFFF, &[0xF4, 0x8F, 0xBF, 0xBF]),
+      (0x110000, &[0xF4, 0x90, 0x80, 0x80]),
+      (0x7FFFFFFF, &[0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      (0x80000000, &[0xFE, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80]),
+      (0xFFFFFFFF, &[0xFE, 0x83, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      // R5 additions — empirically verified vs bundled Perl `pack('C0U', $n)`.
+      (0x1_0000_0000, &[0xFE, 0x84, 0x80, 0x80, 0x80, 0x80, 0x80]),
+      (0xF_FFFF_FFFF, &[0xFE, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]),
+      (
+        0x10_0000_0000,
+        &[
+          0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        ],
+      ),
+      (
+        0x7FFF_FFFF_FFFF_FFFF,
+        &[
+          0xFF, 0x80, 0x87, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF,
+        ],
+      ),
+    ];
+    for (n, expected) in cases {
+      out.clear();
+      pack_c0u(*n, &mut out);
+      assert_eq!(&out[..], *expected, "pack_c0u(0x{n:x}) mismatch");
+    }
+  }
+
+  #[test]
+  fn fix_utf8_after_pack_c0u_matches_perl_pipeline() {
+    // End-to-end: simulate UnescapeChar(numeric entity) → pack_c0u → FixUTF8,
+    // i.e. the byte path Audible.pm:243-261 takes for `&#xN;` entities.
+    // Empirically verified vs bundled Perl ExifTool (R4 + R5 investigation).
+    let pipeline = |n: u64| -> String {
+      let mut buf = Vec::new();
+      pack_c0u(n, &mut buf);
+      fix_utf8(&buf)
+    };
+    assert_eq!(pipeline(0x7F), "\u{7f}"); // DEL is valid ASCII
+    assert_eq!(pipeline(0x80), "\u{80}"); // Latin-1 PAD via valid 2-byte
+    assert_eq!(pipeline(0xD800), "???"); // surrogate ⇒ 3 `?`s
+    assert_eq!(pipeline(0xFFFE), "???"); // noncharacter ⇒ 3 `?`s
+    assert_eq!(pipeline(0x10FFFF), "\u{10ffff}"); // max valid kept
+    assert_eq!(pipeline(0x110000), "????"); // > U+10FFFF ⇒ 4 `?`s
+                                            // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
+    assert_eq!(pipeline(0x1_0000_0000), "???????"); // 7 `?`s (above-u32 7-byte)
+    assert_eq!(pipeline(0xF_FFFF_FFFF), "???????"); // 7 `?`s (top of 7-byte range)
+    assert_eq!(pipeline(0x10_0000_0000), "?????????????"); // 13 `?`s (13-byte form)
+    assert_eq!(pipeline(0x7FFF_FFFF_FFFF_FFFF), "?????????????"); // 13 `?`s (Perl max)
   }
 }

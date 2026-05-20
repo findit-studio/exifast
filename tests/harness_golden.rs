@@ -9,8 +9,10 @@
 //! tracked `tests/golden/` files.
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+  path::{Path, PathBuf},
+  process::Command,
+};
 
 /// The bundled ExifTool script (`$EXIFTOOL` override, else the sibling
 /// checkout), or `None` when it is not present → skip, not fail.

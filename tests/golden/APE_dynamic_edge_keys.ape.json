@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "APE_dynamic_edge_keys.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "ape",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:Tag1abc": "v1",
+  "APE:Tag_abc": "v2",
+  "APE:TagA": "v3",
+  "APE:Tag": "v4"
+}]

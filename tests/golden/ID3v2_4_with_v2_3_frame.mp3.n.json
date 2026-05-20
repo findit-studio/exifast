@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "ID3v2_4_with_v2_3_frame.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[minor] Frame 'TSIZ' is not valid for this ID3 version",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 26,
+  "ID3v2_3:Size": 12345
+}]

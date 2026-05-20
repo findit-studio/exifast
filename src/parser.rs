@@ -122,9 +122,15 @@ impl<'a> ParseContext<'a> {
     }
   }
 
-  /// The file bytes the parser reads (`$raf` content).
+  /// The file bytes the parser reads (`$raf` content). Returns the
+  /// `&'a [u8]` tied to the original file lifetime rather than to `&self`,
+  /// so a parser may interleave data reads with mutable-`ctx` calls (e.g.
+  /// `ctx.metadata().push_warning(...)` inside an Ogg page-walk loop,
+  /// or `ctx.set_file_type(...)` inside an ID3 detection) without an
+  /// immutable-vs-mutable borrow conflict (avoiding redundant
+  /// `data.to_vec()` clones — per Copilot PR #12 review #3271619078).
   #[must_use]
-  pub fn data(&self) -> &[u8] {
+  pub fn data(&self) -> &'a [u8] {
     self.data
   }
 
@@ -138,6 +144,16 @@ impl<'a> ParseContext<'a> {
   #[must_use]
   pub fn parent_type(&self) -> &str {
     self.parent_type
+  }
+
+  /// ExifTool's `$$self{FILE_TYPE}` (ExifTool.pm:3036/9682): the detected
+  /// candidate file type carried by this context. Read by format parsers
+  /// that branch on the type (e.g. MPEG.pm:485 `$mp3` flag — the audio
+  /// scan tightens validation to Layer III when the caller has narrowed
+  /// to `MP3`).
+  #[must_use]
+  pub fn file_type(&self) -> &str {
+    self.file_type
   }
 
   /// ExifTool's `$$self{FILE_EXT}` (ExifTool.pm:2966): the uppercased,
@@ -164,8 +180,9 @@ impl<'a> ParseContext<'a> {
 
   /// Split-borrow accessor: returns `(&[u8], &mut Metadata)` simultaneously
   /// so a parser can slice into [`Self::data`] and call into a metadata-
-  /// pushing sub-parser (e.g. `process_vorbis_comments`, `process_flac_picture`,
-  /// `bitstream::process_bit_stream`) WITHOUT cloning the slice into a `Vec`.
+  /// pushing sub-parser (e.g. `parse_xing_lame`, `process_vorbis_comments`,
+  /// `process_flac_picture`, `bitstream::process_bit_stream`) WITHOUT
+  /// cloning the slice into a `Vec`.
   ///
   /// Required because [`Self::data`] reborrows `&self` while
   /// [`Self::metadata`] reborrows `&mut self` — calling both in sequence
@@ -175,6 +192,23 @@ impl<'a> ParseContext<'a> {
   #[must_use]
   pub fn data_and_metadata(&mut self) -> (&[u8], &mut Metadata) {
     (self.data, self.meta)
+  }
+
+  /// Run `f` with a mutable reference to the underlying metadata sink,
+  /// keeping that `&mut Metadata` borrow strictly scoped to the closure.
+  ///
+  /// This helper does not — and cannot — end or release any caller-held
+  /// `ctx.data()` borrow; Rust's borrow checker still rejects calling
+  /// `metadata_then` while an immutable borrow of `ctx` (e.g. via
+  /// `ctx.data()`) is live. The benefit is purely structural: by taking
+  /// a closure, the mutable `Metadata` borrow is confined to the closure
+  /// body and never escapes as a named binding that would conflict with
+  /// a subsequent `ctx.data()` call. Callers holding a `ctx.data()`
+  /// borrow must drop it (or copy/clone the slice they need) before
+  /// calling this helper. D8/D9 compliant (no field exposure; takes a
+  /// closure, returns its result by value).
+  pub fn metadata_then<R, F: FnOnce(&mut Metadata) -> R>(&mut self, f: F) -> R {
+    f(self.meta)
   }
 
   /// Faithful `SetFileType` (ExifTool.pm:9677-9706), read path. Pushes

@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "ID3v2_4.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 50,
+  "ID3v2_4:Title": "Hi v2.4",
+  "ID3v2_4:Artist": "Artist v2.4"
+}]

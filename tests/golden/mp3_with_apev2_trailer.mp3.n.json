@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "mp3_with_apev2_trailer.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 28,
+  "MPEG:MPEGAudioVersion": 3,
+  "MPEG:AudioLayer": 1,
+  "MPEG:AudioBitrate": 128000,
+  "MPEG:SampleRate": 0,
+  "MPEG:ChannelMode": 0,
+  "MPEG:MSStereo": 0,
+  "MPEG:IntensityStereo": 0,
+  "MPEG:CopyrightFlag": 0,
+  "MPEG:OriginalMedia": 0,
+  "MPEG:Emphasis": 0,
+  "APE:Artist": "ApeTester",
+  "ID3v2_3:Title": "TestMp3"
+}]
