@@ -31,6 +31,9 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ⬜ | — | — |
 | 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ⬜ | — | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
+| 12a | **MOI** (camcorder MOD info sidecar — JVC/Canon/Panasonic) | MOI.pm | 159 | 2 | Engine | ⚠️ ffmpeg-gen / synthetic `MOI.moi` | ⬜ | — | — |
+| 12b | **PLIST** *(infra; carries MODD)* | PLIST.pm | 548 | 2 | Engine | via MODD | ⬜ | — | — |
+| 12c | **MODD** (Sony Picture Motion metadata sidecar; XML rides on PLIST) | PLIST.pm tag `MODD` | — | 2 | Engine, PLIST (#12b) | synthetic `Sony.modd` | ⬜ | — | — |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |
 | 14 | **GPS** *(infra)* | GPS.pm | 641 | 3 | Engine, Exif | via containers | ⬜ | — | — |
 | 15 | **XMP** *(infra)* | XMP.pm + XMP2.pl | 6693 | 3 | Engine | via containers | ⬜ | — | — |
@@ -44,7 +47,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 23 | **Matroska** (MKV/MKA/MKS/WEBM) | Matroska.pm | 1289 | 3 | Engine | `Matroska.mkv` | ⬜ | — | — |
 | 24 | **MXF** | MXF.pm | 3031 | 3 | Engine | `MXF.mxf` | ⬜ | — | — |
 | 25 | **QuickTime core** (MOV/MP4/M4A/M4V/3GP/3G2) | QuickTime.pm | 10771 | 4 | Engine, Exif, GPS, XMP | `QuickTime.mov`, `QuickTime.m4a` | ⬜ | — | — |
-| 26 | **QuickTime variants** (360/F4V/GLV/LRV/INSV/MQV/AAX/DVB) | QuickTime.pm *(same .pm, brand-specific)* | — | 4 | #25 | per-variant ⚠️ may need ffmpeg | ⬜ | — | — |
+| 26 | **QuickTime variants** (360/F4V/F4A/F4B/F4P/GLV/LRV/LRF/INSV/MQV/AAX/DVB/QT/CRM⁺) | QuickTime.pm *(same .pm, brand-specific)* | — | 4 | #25 | per-variant ⚠️ may need ffmpeg | ⬜ | — | — |
 | 27 | **QuickTimeStream** (timed GPS/telemetry) | QuickTimeStream.pl | 3840 | 4 | #25, GPS | ⚠️ needs telemetry sample | ⬜ | — | — |
 | 28 | **DSS / DS2** | Olympus.pm *(DSS subset)* | ~4462 | 4 *(last)* | Engine | `Olympus.dss` | ⬜ | — | — |
 
@@ -56,10 +59,12 @@ metadata; they are explicitly **not** Stage 1. MakerNotes are likewise Stage 2
 
 | File types | Rides on | Status |
 |---|---|:--:|
-| HEIC / HEIF / AVIF / QTIF / CR3 / CRM | QuickTime.pm | ⏸️ |
+| HEIC / HEIF / AVIF / QTIF / CR3 | QuickTime.pm | ⏸️ |
 | WEBP | RIFF.pm | ⏸️ |
 | SWF | Flash.pm | ⏸️ |
 | MakerNotes (Canon/Nikon/Sony/Apple/…) | shared, embedded | ⏸️ |
+
+⁺ **CRM (Canon RAW Movie)**: was deferred Stage 2 as an image/RAW companion to CR3, but it carries a video MOOV box and treats well as a QuickTime variant when MakerNotes are skipped. Re-flagged to Row 26 (video-relevant track only); RAW image payload remains Stage 2.
 
 ## How to use this tracker
 
