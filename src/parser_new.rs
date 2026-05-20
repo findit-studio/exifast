@@ -288,7 +288,18 @@ pub enum AnyParser {
   /// MP3 wrapper parser (Phase F2 — ID3 + audio-frame chain).
   #[cfg(feature = "mp3")]
   Mp3(crate::formats::id3::ProcessMp3),
-  // Phase F3 adds: Ape, Dsf, Aiff, Flac.
+  /// AIFF (Phase F3 — Audio Interchange File Format / AIFC / DjVu).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::ProcessAiff),
+  /// APE (Phase F3 — Monkey's Audio, chains ID3v1/v2).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ProcessApe),
+  /// DSF (Phase F3 — DSD Stream File, chains ID3v2 trailer).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::ProcessDsf),
+  /// FLAC (Phase F3 — Free Lossless Audio Codec).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::ProcessFlac),
   // Phase F4 adds: Ogg, MpegAudio.
   // Phase F5 adds: Mpc, WavPack.
 }
@@ -336,6 +347,18 @@ pub enum AnyMeta<'a> {
   /// `docs/tracking.md` F2 ID3 integration notes).
   #[cfg(feature = "mp3")]
   Mp3(crate::formats::id3::Mp3Meta<'a>),
+  /// AIFF (Phase F3).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::AiffMeta<'a>),
+  /// APE (Phase F3).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ApeMeta<'a>),
+  /// DSF (Phase F3).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::DsfMeta<'a>),
+  /// FLAC (Phase F3).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::FlacMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
@@ -369,6 +392,14 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Id3(m) => m.sink(print_conv, out),
       #[cfg(feature = "mp3")]
       AnyMeta::Mp3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(m) => m.sink(print_conv, out),
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(m) => m.sink(print_conv, out),
     }
   }
 }

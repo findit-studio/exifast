@@ -15,15 +15,17 @@
 //! one PR at a time across Phases E–F. Retired in Phase G when the JSON
 //! emitter consumes [`AnyMeta`](crate::parser_new::AnyMeta) directly.
 
-use crate::parser_new::TagWriter;
-use crate::value::{Group, Metadata, TagValue};
-use core::convert::Infallible;
-use core::fmt;
-use core::fmt::Write as _;
+use crate::{
+  parser_new::TagWriter,
+  value::{Group, Metadata, TagValue},
+};
+use core::{convert::Infallible, fmt, fmt::Write as _};
 
-use std::collections::BTreeMap;
-use std::string::{String, ToString};
-use std::vec::Vec;
+use std::{
+  collections::BTreeMap,
+  string::{String, ToString},
+  vec::Vec,
+};
 
 /// Owned `(Group, Name)` key — used by [`MapTagWriter`] to index emitted
 /// tags. Kept as `(String, String)` rather than `(&'static str, &'static
@@ -263,19 +265,49 @@ impl TagWriter for MapTagWriter {
 /// D8 convention: no public fields; constructor takes the `&mut Metadata`.
 pub struct MetadataTagWriter<'meta> {
   meta: &'meta mut Metadata,
+  /// Optional family-0 override (per spec §6.2 group-mapping rationale).
+  /// When `Some(f0)`, every `write_*` call pushes a tag with
+  /// `family-0 = f0` and `family-1 = group` (the writer-side argument).
+  /// When `None` (default), `family-0 = family-1 = group` — the original
+  /// MOI/AAC/DV pattern.
+  ///
+  /// **Use case (Phase F3 / APE):** APE has TWO emission group-1 values
+  /// (`"APE"` for the main-tag stream, `"MAC"` for the binary-data
+  /// header), and a SINGLE family-0 (`"APE"` — APE.pm has no explicit
+  /// `GROUPS{0}` so all tags default to family-0 = package name `APE`).
+  /// The composite lookup at APE.pm:84-87 keys on family-0 = `"APE:"`
+  /// so MAC tags MUST land at family-0 = `"APE"` to be discovered.
+  family0_override: Option<&'static str>,
 }
 
 impl<'meta> MetadataTagWriter<'meta> {
   /// Construct an adapter that pushes into `meta` for every `write_*` call.
   pub fn new(meta: &'meta mut Metadata) -> Self {
-    Self { meta }
+    Self {
+      meta,
+      family0_override: None,
+    }
+  }
+
+  /// Construct an adapter that overrides family-0 for every push. The
+  /// writer-side `group` argument becomes family-1 only; family-0 is
+  /// pinned to `family0`. See the type-level docs for the use case (APE
+  /// MAC vs APE main-tag split).
+  pub fn with_family0(meta: &'meta mut Metadata, family0: &'static str) -> Self {
+    Self {
+      meta,
+      family0_override: Some(family0),
+    }
   }
 
   /// Build a [`Group`] from the writer-side single-string `group` argument.
-  /// Family-0 and family-1 are both `group` (see the type-level docs on
-  /// `MetadataTagWriter` for the group-mapping rationale).
-  fn group(group: &str) -> Group {
-    Group::new(group, group)
+  /// When `family0_override` is `Some(f0)`, family-0 = `f0` and
+  /// family-1 = `group`; otherwise family-0 = family-1 = `group`.
+  fn group(&self, group: &str) -> Group {
+    match self.family0_override {
+      Some(f0) => Group::new(f0, group),
+      None => Group::new(group, group),
+    }
   }
 }
 
@@ -288,7 +320,7 @@ impl TagWriter for MetadataTagWriter<'_> {
 
   fn write_str(&mut self, group: &str, name: &str, value: &str) -> Result<(), Infallible> {
     self.meta.push(
-      Self::group(group),
+      self.group(group),
       name.to_string(),
       TagValue::Str(value.into()),
     );
@@ -303,27 +335,27 @@ impl TagWriter for MetadataTagWriter<'_> {
     let n = i64::try_from(value).unwrap_or(i64::MAX);
     self
       .meta
-      .push(Self::group(group), name.to_string(), TagValue::I64(n));
+      .push(self.group(group), name.to_string(), TagValue::I64(n));
     Ok(())
   }
 
   fn write_i64(&mut self, group: &str, name: &str, value: i64) -> Result<(), Infallible> {
     self
       .meta
-      .push(Self::group(group), name.to_string(), TagValue::I64(value));
+      .push(self.group(group), name.to_string(), TagValue::I64(value));
     Ok(())
   }
 
   fn write_f64(&mut self, group: &str, name: &str, value: f64) -> Result<(), Infallible> {
     self
       .meta
-      .push(Self::group(group), name.to_string(), TagValue::F64(value));
+      .push(self.group(group), name.to_string(), TagValue::F64(value));
     Ok(())
   }
 
   fn write_bytes(&mut self, group: &str, name: &str, value: &[u8]) -> Result<(), Infallible> {
     self.meta.push(
-      Self::group(group),
+      self.group(group),
       name.to_string(),
       TagValue::Bytes(value.to_vec()),
     );
@@ -343,11 +375,9 @@ impl TagWriter for MetadataTagWriter<'_> {
     // interface.
     let mut s = String::new();
     f(&mut s).expect("MetadataTagWriter::write_fmt: in-memory String write cannot fail");
-    self.meta.push(
-      Self::group(group),
-      name.to_string(),
-      TagValue::Str(s.into()),
-    );
+    self
+      .meta
+      .push(self.group(group), name.to_string(), TagValue::Str(s.into()));
     Ok(())
   }
 
