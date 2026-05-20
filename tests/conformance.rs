@@ -117,6 +117,95 @@ fn mpc_sv8_warn_conformance() {
   check("sv8.mpc", "sv8.mpc.n.json", false);
 }
 
+#[test]
+fn red_r3d_conformance() {
+  // FORMATS.md row 12: Image::ExifTool::Red. Bundled fixture
+  // `tests/fixtures/Red.r3d` is the real `t/images/Red.r3d` (1160 bytes,
+  // RED2 + ~50 directory entries). Goldens are bundled `perl exiftool`
+  // output stripped of the 5 `Composite:*` lines (composite synthesis is
+  // engine-level, NOT in Red.pm — see Red::ProcessR3D module docs).
+  check("Red.r3d", "Red.r3d.json", true);
+  check("Red.r3d", "Red.r3d.n.json", false);
+}
+
+#[test]
+fn red_bad_magic_error_conformance() {
+  // 8 bytes, magic gate `\0\0..RED(1|2)` fails. `.r3d` is a known type but
+  // no parser accepted ⇒ post-loop 'File format error' (ExifTool.pm:3093).
+  check("red_bad_magic.r3d", "red_bad_magic.r3d.json", true);
+  check("red_bad_magic.r3d", "red_bad_magic.r3d.n.json", false);
+}
+
+#[test]
+fn red_short_size_error_conformance() {
+  // 8 bytes, magic OK, `$size = 4 < 8` ⇒ ProcessR3D returns 0 (Red.pm:228).
+  // No parser accepted ⇒ 'File format error'.
+  check("red_short.r3d", "red_short.r3d.json", true);
+  check("red_short.r3d", "red_short.r3d.n.json", false);
+}
+
+#[test]
+fn red_truncated_header_conformance() {
+  // 8 bytes, magic OK, `$size = 0x40 > 8` but the `Read($size-8)` of the
+  // remaining header bytes fails ⇒ SetFileType triplet is emitted then
+  // `$et->Warn("Truncated R3D file")` (Red.pm:236). Bundled output:
+  // ExifToolVersion, Warning, File:{FileType, FileTypeExtension, MIMEType}.
+  check(
+    "red_truncated_header.r3d",
+    "red_truncated_header.r3d.json",
+    true,
+  );
+  check(
+    "red_truncated_header.r3d",
+    "red_truncated_header.r3d.n.json",
+    false,
+  );
+}
+
+#[test]
+fn red2_framerate_div_by_zero_conformance() {
+  // Codex round-3 F1 regression: RED2 `int16u[3]` at offset 0x56 is
+  // `(0, 0, 24000)` — the first word (`$a[0]`) is zero. Perl ValueConv
+  // `($a[1]*0x10000 + $a[2])/$a[0]` dies with `Illegal division by zero`
+  // inside `GetValue`'s eval (ExifTool.pm:3652-3655); the resulting
+  // `$value = undef` drops the `Red:FrameRate` tag from output. Bundled
+  // `perl exiftool -j -G` on this fixture emits RedcodeVersion / ImageWidth
+  // / ImageHeight (extracted before FrameRate) but no `Red:FrameRate` —
+  // empirically verified.
+  check(
+    "red2_framerate_div_by_zero.r3d",
+    "red2_framerate_div_by_zero.r3d.json",
+    true,
+  );
+  check(
+    "red2_framerate_div_by_zero.r3d",
+    "red2_framerate_div_by_zero.r3d.n.json",
+    false,
+  );
+}
+
+#[test]
+fn red2_short_first_block_conformance() {
+  // Codex round-2 F2 regression: RED2 declared `$size = 0x40` (< 0x44),
+  // file has trailing bytes past the declared first block. Pre-fix this
+  // port would read `rdi/rda/rdx` from offsets 0x40..0x42 of the FULL
+  // file (outside `$buff`), compute a nonsense directory position, and
+  // enter fallback scanning. Faithful Perl (Red.pm:251-252) bounds `$buff`
+  // to `$size` first, then checks `length($buff) < 0x44` and warns
+  // "Truncated R3D file" — RedcodeVersion still flows from the prior
+  // RED2 subtable extraction (Red.pm:175-206 read at offset 0x07).
+  check(
+    "red2_short_first_block.r3d",
+    "red2_short_first_block.r3d.json",
+    true,
+  );
+  check(
+    "red2_short_first_block.r3d",
+    "red2_short_first_block.r3d.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).
