@@ -56,6 +56,35 @@ fn wavpack_adversarial_conformance() {
 }
 
 #[test]
+fn dv_conformance() {
+  // FORMATS.md row 11. `tests/fixtures/DV.dv` is the bundled
+  // `lib/Image/ExifTool/t/images/DV.dv` (4400 bytes, PAL 25Mbps 4:2:0,
+  // 16:9 aspect, interlaced, 32 kHz audio). Goldens are bundled `perl
+  // exiftool -j -G1 -struct` output with `System:*` and `Composite:*`
+  // stripped uniformly (matching every other format conformance — the
+  // composite-tag system is engine infrastructure outside DV.pm's
+  // scope, deferred per `[[exifast-phase2-forward-items]]`).
+  check("DV.dv", "DV.dv.json", true);
+  check("DV.dv", "DV.dv.n.json", false);
+}
+
+#[test]
+fn dv_unknown_profile_conformance() {
+  // Adversarial: 480-byte synthetic with the primary `\x1f\x07\0\x3f`
+  // magic and `stype=0x1f` at offset 451 — never present in
+  // `@dvProfiles`, so DV.pm:188 hits the `Warn("Unrecognized DV
+  // profile")` branch. Faithful bundled-Perl output: `ExifTool:Warning`
+  // tag + `File:*` triplet only, no `DV:*` tags. Goldens captured with
+  // `-x Composite:all`.
+  check("dv_unknown_profile.dv", "dv_unknown_profile.dv.json", true);
+  check(
+    "dv_unknown_profile.dv",
+    "dv_unknown_profile.dv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);

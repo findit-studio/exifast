@@ -29,7 +29,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 8 | **FLAC** | FLAC.pm | 321 | 2 | Engine, ID3, Vorbis | `FLAC.flac` | ⬜ | — | — |
 | 9 | **Ogg + Vorbis** (OGG/OGV/OPUS) | Ogg.pm + Vorbis.pm | 496 | 2 | Engine, FLAC (ogg-flac) | `Vorbis.ogg`, `Opus.opus`, `FLAC.ogg` | ⬜ | — | — |
 | 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ⬜ | — | — |
-| 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ⬜ | — | — |
+| 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ✅ | clean | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |
 | 14 | **GPS** *(infra)* | GPS.pm | 641 | 3 | Engine, Exif | via containers | ⬜ | — | — |
