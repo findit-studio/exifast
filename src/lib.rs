@@ -39,10 +39,19 @@ pub mod formats;
 #[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
+// Phase D — new lib-first `FormatParser` trait scaffold, lands alongside the
+// legacy `parser::FormatParser` (re-exported there as `OldFormatParser`). Per
+// the spec at `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`:
+// `parser_new` holds the new `FormatParser` / `MetaSinker` / `TagWriter` /
+// `SharedFlags` traits + `AnyParser` / `AnyMeta` enum dispatch skeletons; `sink`
+// holds the reference `TagWriter` implementor used by Phase D unit tests.
+// Format arms are added in Phase E (MOI) and Phase F (everything else).
+pub mod parser_new;
 pub mod processbinarydata;
 pub mod reader;
 #[cfg(feature = "json")]
 pub mod serialize;
+pub mod sink;
 pub mod tagtable;
 pub mod value;
 

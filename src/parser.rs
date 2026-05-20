@@ -403,6 +403,12 @@ pub trait FormatParser: Sync {
   fn process(&self, ctx: &mut ParseContext<'_>) -> bool;
 }
 
+/// Phase D shim: the existing push-style [`FormatParser`] is being
+/// migrated to the new typed-Meta [`crate::parser_new::FormatParser`] in
+/// Phases E–F. During migration this alias documents the legacy trait
+/// without renaming, so existing impl sites continue to work verbatim.
+pub use FormatParser as OldFormatParser;
+
 /// Faithful `ConvertFileSize` (ExifTool.pm:6840-6860), default-units branch
 /// only. The `ByteUnit eq 'Binary'` arm (ExifTool.pm:6843-6850) is gated on
 /// the `ByteUnit` option, which the read path here does not expose (YAGNI;
