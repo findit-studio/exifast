@@ -4,6 +4,7 @@
 
 pub mod aac;
 pub mod mpc;
+pub mod red;
 
 use crate::parser::FormatParser;
 
@@ -15,6 +16,7 @@ pub fn parser_for(file_type: &str) -> Option<&'static dyn FormatParser> {
   match file_type {
     "AAC" => Some(&aac::ProcessAac), // ExifTool %moduleName{AAC}='AAC'
     "MPC" => Some(&mpc::ProcessMpc), // ExifTool %moduleName{MPC}=undef ⇒ 'MPC'
+    "R3D" => Some(&red::ProcessR3D), // ExifTool %moduleName{R3D}='Red'
     _ => None,
   }
 }
@@ -25,12 +27,13 @@ mod tests {
 
   #[test]
   fn registry_resolves_ported_formats() {
-    // AAC and MPC are the ported formats; their arms must resolve.
+    // AAC, MPC, and R3D are the ported formats; their arms must resolve.
     // Unported types (and the empty string) must still cleanly report
     // "no parser" so the consumer falls through to the next detection
     // candidate.
     assert!(parser_for("AAC").is_some());
     assert!(parser_for("MPC").is_some());
+    assert!(parser_for("R3D").is_some());
     assert!(parser_for("MP3").is_none());
     assert!(parser_for("").is_none());
   }

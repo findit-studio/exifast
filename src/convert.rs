@@ -420,6 +420,376 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
   }
 }
 
+/// Byte order for [`read_value`], faithful to ExifTool's `SetByteOrder('MM'|'II')`
+/// (`ExifTool.pm:9669-9722`, the `Get<N>(u|s)` family + `RoundUp` pair).
+///
+/// ExifTool keeps the current byte order as global state (`$currentByteOrder`),
+/// but exifast threads it as an explicit argument so every read is local and
+/// the engine stays panic-/global-state-free.
+#[derive(Clone, Copy, derive_more::IsVariant)]
+pub enum ByteOrder {
+  /// `MM` — big-endian (Motorola). ExifTool's default for TIFF/EXIF and
+  /// `Image::ExifTool::Red::ProcessR3D` (Red.pm:231 `SetByteOrder('MM')`).
+  Mm,
+  /// `II` — little-endian (Intel).
+  Ii,
+}
+
+/// Faithful transliteration of `Image::ExifTool::XMP::FixUTF8(\$str)`
+/// (`XMP.pm:2943-2975`): replaces each byte sequence that is NOT a valid
+/// UTF-8 codepoint with the literal ASCII `?` (Perl default `$bad`).
+/// The bundled `exiftool` script invokes this in its JSON emitter at
+/// `exiftool:3822` (`Image::ExifTool::XMP::FixUTF8(\$str) unless $altEnc`).
+///
+/// **Why a custom impl, not `String::from_utf8_lossy`:** `from_utf8_lossy`
+/// substitutes the Unicode REPLACEMENT CHARACTER U+FFFD (3-byte UTF-8
+/// `\xEF\xBF\xBD`), not the single ASCII byte `0x3F`. ExifTool's golden
+/// JSON for any format whose raw bytes include a malformed UTF-8 byte
+/// (e.g. an R3D `OriginalFileName` containing `A\xFF.R3D`) will emit
+/// `A?.R3D`; `from_utf8_lossy` produces `A\u{FFFD}.R3D`, a 5-character
+/// byte-mismatch at the conformance `jsondiff` gate. (Codex round-9 F1:
+/// flagged precisely for the Red string-extraction path.)
+///
+/// **Faithful semantics from XMP.pm:2949-2972:**
+/// 1. Scan byte-by-byte for high-bit bytes (`0x80..=0xFF`).
+/// 2. If the byte is in `0xC2..0xF8`, it could be a valid UTF-8 leader
+///    (1, 2, or 3 continuation bytes expected). Validate the continuation
+///    bytes match `[0x80..=0xBF]{n}` for the expected length.
+/// 3. For each leader/continuation length, apply the additional
+///    overlong/surrogate/non-character checks (the `unless ... == 0x80` /
+///    `... == 0xa0` / `... == 0xbf` chain at XMP.pm:2958-2964).
+/// 4. Any byte that fails the chain is replaced with `?`.
+///
+/// **Re-use:** designed to be the engine-tier seam for every future
+/// format whose Perl path passes raw bytes through to JSON serialization
+/// (Phase-2 forward item #51 — engine-wide `FixUTF8` at JSON serialization).
+/// The current consumer is `read_value`'s `string` arm; later formats
+/// (Audible AA already has its own copy; we will dedupe when the
+/// dependency-tree allows) can invoke this same helper at their parser
+/// boundary instead of duplicating the byte-walker.
+#[must_use]
+pub fn fix_utf8(bytes: &[u8]) -> String {
+  // **Codex round-10 F1:** no `std::str::from_utf8` fast path — Rust's
+  // strict UTF-8 validator and ExifTool's `IsUTF8`/`FixUTF8` agree on
+  // overlongs and surrogates, BUT Rust ACCEPTS the BMP "non-characters"
+  // U+FFFE (`EF BF BE`) and U+FFFF (`EF BF BF`), while ExifTool's
+  // `FixUTF8` explicitly REJECTS them (XMP.pm:2960-2961:
+  // `ord($1) == 0xbf and (ord(substr $1, 1) & 0xfe) == 0xbe`). A
+  // fast-path early-exit would silently preserve these non-characters
+  // where Perl writes `?`.
+  //
+  // Bundled-Perl oracle for the divergent cases:
+  //   perl -Ilib -MImage::ExifTool::XMP -e 'my $s="A\xEF\xBF\xBEB";
+  //         Image::ExifTool::XMP::FixUTF8(\$s); print "$s\n"' ⇒ "A???B"
+  //   (same for `\xEF\xBF\xBF`); U+FFFD (`EF BF BD`) and U+FFEC
+  //   (`EF BF AC`) pass through unchanged.
+  //
+  // Always go through the byte-walker below — its valid-sequence
+  // copy-as-slice path is fast enough for any realistic metadata
+  // payload (single linear scan, no allocation churn on the happy
+  // path).
+  //
+  // Faithful byte-by-byte transliteration of XMP.pm:2948-2972.
+  let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    let ch = bytes[i];
+    if ch < 0x80 {
+      out.push(ch);
+      i += 1;
+      continue;
+    }
+    // High-bit byte: validate as a UTF-8 leader. XMP.pm:2953 — leaders
+    // are in `0xC2..=0xF7` (`< 0xf8`).
+    if (0xC2..0xF8).contains(&ch) {
+      // Expected continuation count (`$n` at XMP.pm:2954):
+      // 0xC2..=0xDF ⇒ 1 continuation
+      // 0xE0..=0xEF ⇒ 2 continuations
+      // 0xF0..=0xF7 ⇒ 3 continuations
+      let n: usize = if ch < 0xE0 {
+        1
+      } else if ch < 0xF0 {
+        2
+      } else {
+        3
+      };
+      // Slurp `n` continuation bytes (`/\G([\x80-\xbf]{n})/g` at
+      // XMP.pm:2955): they must all be in 0x80..=0xBF.
+      if i + 1 + n <= bytes.len()
+        && bytes[i + 1..i + 1 + n]
+          .iter()
+          .all(|&c| (0x80..=0xBF).contains(&c))
+      {
+        // Apply the overlong/surrogate/non-character chain.
+        let cont1 = bytes[i + 1];
+        let ok = if n == 1 {
+          // 0xC2..=0xDF leader with one continuation is unconditionally
+          // valid (XMP.pm:2956 `next if $n == 1`).
+          true
+        } else if n == 2 {
+          // XMP.pm:2958-2961: reject overlongs (`0xe0` + cont1 < 0xA0),
+          // surrogates (`0xed` + cont1 >= 0xA0), and the specific
+          // non-character `0xef 0xbf 0xbe/0xbf` family.
+          let is_overlong = ch == 0xE0 && (cont1 & 0xE0) == 0x80;
+          let is_surrogate = ch == 0xED && (cont1 & 0xE0) == 0xA0;
+          let is_non_char_efbf =
+            ch == 0xEF && cont1 == 0xBF && i + 2 < bytes.len() && (bytes[i + 2] & 0xFE) == 0xBE;
+          !(is_overlong || is_surrogate || is_non_char_efbf)
+        } else {
+          // n == 3, XMP.pm:2962-2964: reject overlongs (`0xf0` with cont1
+          // < 0x90), out-of-range (`0xf4` with cont1 > 0x8f, or any
+          // leader > 0xf4).
+          let is_overlong_4byte = ch == 0xF0 && (cont1 & 0xF0) == 0x80;
+          let is_out_of_range = (ch == 0xF4 && cont1 > 0x8F) || ch > 0xF4;
+          !(is_overlong_4byte || is_out_of_range)
+        };
+        if ok {
+          // Copy the leader + its `n` continuations verbatim.
+          out.extend_from_slice(&bytes[i..i + 1 + n]);
+          i += 1 + n;
+          continue;
+        }
+      }
+    }
+    // Either not a valid leader, or the continuation chain failed.
+    // Replace the *single bad byte* with `?` (XMP.pm:2970
+    // `substr($$strPt, $pos-1, 1) = $bad`) and advance.
+    out.push(b'?');
+    i += 1;
+  }
+  // The result is now byte-for-byte valid UTF-8 (`?` is ASCII and every
+  // accepted multi-byte sequence was already validated above), so the
+  // `from_utf8` call cannot fail; use unchecked construction via
+  // `String::from_utf8` (no unsafe) — falling back to lossy *just* in
+  // case (panic-free contract, `#![forbid(unsafe_code)]`).
+  String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Faithful transliteration of `Image::ExifTool::ReadValue($dataPt, $offset,
+/// $format, $count, $size, $ratPt)` (`ExifTool.pm:6275-6321`), restricted to
+/// the format set `Image::ExifTool::Red` uses (Red.pm:22-33 `%redFormat` plus
+/// the rational32u + string fields in RED1/RED2):
+///
+/// - integer types: `int8u`, `int8s`, `int16u`, `int32u`, `int32s`
+///   (`ExifTool.pm:6068-6077` `Get8u`/`Get8s`/`Get16u`/`Get32u`/`Get32s`)
+/// - `float` (`ExifTool.pm:6074` `GetFloat` ⇒ `unpack 'f'`, IEEE single)
+/// - `rational32u` (`ExifTool.pm:6089-6095` `GetRational32u` ⇒
+///   `Rational::rational32(num, denom)`; the zero-denominator `inf`/`undef`
+///   semantics are carried by [`Rational::exiftool_val_str`])
+/// - `string` (truncated at first NUL, `ExifTool.pm:6300`)
+/// - `undef` (raw byte slice — `ExifTool.pm:6298`)
+///
+/// Returns the **value** ExifTool would pass to `HandleTag`: a scalar for
+/// `count == 1` and a *space-joined* `TagValue::Str` for `count > 1`
+/// (Perl `wantarray ? @vals : join(' ', @vals)`, `ExifTool.pm:6318-6320`).
+/// For `string`/`undef` the byte slice itself is a single scalar; for the
+/// fixed-width numeric formats with `size == count * len` >1 element each
+/// element is read individually and the textual results joined with `' '`.
+///
+/// **Short buffers:** faithful to `ExifTool.pm:6290-6292` — when
+/// `len * count > $size` (with `$size = length($$dataPt) - $offset`), `count`
+/// is shortened to `int($size / len)` and the read continues; `None` is
+/// returned only when the shortened count is `< 1`. So a `RED2` `int16u[3]`
+/// against a 4-byte tail yields a 2-element `"a b"` value, not a dropped tag.
+///
+/// `byte_order` mirrors ExifTool's global `$currentByteOrder` but threaded
+/// as an explicit argument (the engine is global-state-free). Red.pm uses
+/// only `ByteOrder::Mm`; the `Ii` arm is faithful but unexercised here and
+/// must be unit-tested at the first little-endian consumer (same discipline
+/// as `bitstream::BitOrder::Ii`, see the Phase-2 forward items).
+///
+/// **Coverage:** intentionally sized to Red.pm's needs (per the
+/// incremental-derivation discipline). Other ExifTool formats — `int16s`,
+/// `int64u`/`int64s`, `rational32s`, `rational64u`/`rational64s`,
+/// `fixed16(s|u)`/`fixed32(s|u)`, `double`, `extended`, `binary`,
+/// `unicode`/`utf8`/`ue7`, `ifd`/`ifd64` — are deferred to the first format
+/// that genuinely needs each one. Adding an arm is faithfully-additive: the
+/// caller picks the format string, this function dispatches.
+#[must_use]
+pub fn read_value(
+  data: &[u8],
+  offset: usize,
+  format: &str,
+  count: usize,
+  byte_order: ByteOrder,
+) -> Option<TagValue> {
+  // ExifTool.pm:6279 `my $len = $formatSize{$format}` — the per-element width.
+  let elem_size = format_size(format)?;
+  // ExifTool.pm:6284 `$size = length($$dataPt) - $offset unless defined $size`
+  // — Perl defaults `$size` to "all of the buffer past `$offset`". Mirror that
+  // here (Red.pm always omits `$size` at the ReadValue call sites).
+  let size = data.len().checked_sub(offset)?;
+  // ExifTool.pm:6290-6292 — when `$len * $count > $size`, shorten `$count` to
+  // `int($size / $len)`; if the shortened count is < 1, return undef. This is
+  // the faithful ReadValue semantic for short/truncated inputs (Codex round-1
+  // F2: a RED2 file with header-declared `$size` short by one or two bytes at
+  // offset 0x56 yields `int16u[3]` partial values `"1001 0"` or `"1001"` in
+  // Perl, not a dropped tag).
+  let total = elem_size.checked_mul(count)?;
+  let count = if total > size {
+    let shortened = size / elem_size;
+    if shortened == 0 {
+      return None;
+    }
+    shortened
+  } else {
+    count
+  };
+  // After shortening, `elem_size * count <= size` is guaranteed by `int`.
+  let end = offset
+    .checked_add(elem_size.checked_mul(count)?)
+    .filter(|&e| e <= data.len())?;
+  match format {
+    // ExifTool.pm:6298-6300 — string is a single scalar of `count * len`
+    // bytes (`length len` == 1), TRUNCATED at the first NUL.
+    "string" => {
+      let bytes = &data[offset..end];
+      let trunc_end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+      // **Codex round-9 F1:** `from_utf8_lossy` substitutes U+FFFD
+      // (3-byte `\xEF\xBF\xBD`) for malformed bytes, but bundled
+      // `exiftool` runs `Image::ExifTool::XMP::FixUTF8(\$str)` at JSON
+      // serialization (`exiftool:3822`), which substitutes the single
+      // ASCII byte `?` per `XMP.pm:2949-2972`. Route through
+      // [`fix_utf8`] to mirror that behaviour byte-exact (e.g. an R3D
+      // `OriginalFileName` of `A\xff.R3D` emits `A?.R3D`, matching
+      // ExifTool, not `A�.R3D`). Phase-2 forward-item #51 seam: the
+      // engine-tier helper lives in this module for re-use by any
+      // future format whose Perl path passes raw bytes to `HandleTag`.
+      Some(TagValue::Str(fix_utf8(&bytes[..trunc_end]).into()))
+    }
+    // ExifTool.pm:6298 (`%readValueProc` has no `undef` entry) — raw bytes.
+    "undef" => Some(TagValue::Bytes(data[offset..end].to_vec())),
+    // Fixed-width numerics: read element by element, join multi-element
+    // results with `' '` (Perl `join(' ', @vals)`, ExifTool.pm:6319).
+    _ => {
+      if count == 0 {
+        // ExifTool.pm:6286 `return '' if defined $count or $size < $len`:
+        // a literal `0` count yields the empty string — faithful but the
+        // `HandleTag` callers in Red.pm always derive `count = size/len ≥ 1`.
+        return Some(TagValue::Str(SmolStr::new("")));
+      }
+      // count == 1 ⇒ return a typed scalar; count > 1 ⇒ join textual forms.
+      if count == 1 {
+        return read_one(data, offset, format, byte_order);
+      }
+      let mut parts: Vec<String> = Vec::with_capacity(count);
+      for i in 0..count {
+        let v = read_one(data, offset + i * elem_size, format, byte_order)?;
+        parts.push(scalar_text(&v));
+      }
+      Some(TagValue::Str(parts.join(" ").into()))
+    }
+  }
+}
+
+/// ExifTool `%formatSize` (`ExifTool.pm:6199-6231`), Red.pm subset.
+fn format_size(format: &str) -> Option<usize> {
+  Some(match format {
+    "int8u" | "int8s" | "string" | "undef" => 1, // ExifTool.pm:6200-6201,6224,6226
+    "int16u" => 2,                               // ExifTool.pm:6203
+    "int32u" | "int32s" | "rational32u" | "float" => 4, // ExifTool.pm:6205-6211,6219
+    _ => return None,
+  })
+}
+
+/// Read a SINGLE element of `format` at `offset`. `count > 1` callers in
+/// [`read_value`] invoke this per index and join textual forms.
+fn read_one(data: &[u8], offset: usize, format: &str, byte_order: ByteOrder) -> Option<TagValue> {
+  match format {
+    // ExifTool.pm:6068-6069 `Get8u`/`Get8s` — no byte-order dependence.
+    "int8u" => Some(TagValue::I64(i64::from(data[offset]))),
+    "int8s" => Some(TagValue::I64(i64::from(data[offset] as i8))),
+    "int16u" => {
+      // ExifTool.pm:6071 `Get16u` ⇒ unpack `S`/`v` depending on byte order.
+      let b: [u8; 2] = [data[offset], data[offset + 1]];
+      Some(TagValue::I64(i64::from(match byte_order {
+        ByteOrder::Mm => u16::from_be_bytes(b),
+        ByteOrder::Ii => u16::from_le_bytes(b),
+      })))
+    }
+    "int32u" => {
+      // ExifTool.pm:6073 `Get32u`.
+      let b: [u8; 4] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+      ];
+      Some(TagValue::I64(i64::from(match byte_order {
+        ByteOrder::Mm => u32::from_be_bytes(b),
+        ByteOrder::Ii => u32::from_le_bytes(b),
+      })))
+    }
+    "int32s" => {
+      // ExifTool.pm:6072 `Get32s` (signed).
+      let b: [u8; 4] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+      ];
+      Some(TagValue::I64(i64::from(match byte_order {
+        ByteOrder::Mm => i32::from_be_bytes(b),
+        ByteOrder::Ii => i32::from_le_bytes(b),
+      })))
+    }
+    "float" => {
+      // ExifTool.pm:6074 `GetFloat` ⇒ unpack `f` (IEEE-754 single precision).
+      let b: [u8; 4] = [
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+      ];
+      Some(TagValue::F64(f64::from(match byte_order {
+        ByteOrder::Mm => f32::from_be_bytes(b),
+        ByteOrder::Ii => f32::from_le_bytes(b),
+      })))
+    }
+    "rational32u" => {
+      // ExifTool.pm:6089-6095 `GetRational32u`: numerator = Get16u, denominator
+      // = Get16u (offset+2), wrapped in `Rational::rational32` (7-sig
+      // RoundFloat). Zero-denominator handling lives in `Rational::
+      // exiftool_val_str` so a hash key matches what the serializer prints.
+      let n_b: [u8; 2] = [data[offset], data[offset + 1]];
+      let d_b: [u8; 2] = [data[offset + 2], data[offset + 3]];
+      let (num, den) = match byte_order {
+        ByteOrder::Mm => (u16::from_be_bytes(n_b), u16::from_be_bytes(d_b)),
+        ByteOrder::Ii => (u16::from_le_bytes(n_b), u16::from_le_bytes(d_b)),
+      };
+      Some(TagValue::Rational(crate::value::Rational::rational32(
+        i64::from(num),
+        i64::from(den),
+      )))
+    }
+    _ => None,
+  }
+}
+
+/// Stringified form of a [`read_one`] scalar for the multi-element
+/// `join(' ', @vals)` (`ExifTool.pm:6319`). Matches Perl scalar
+/// stringification (the same text `%g`/integer form `ReadValue` would
+/// pass to `HandleTag`).
+fn scalar_text(v: &TagValue) -> String {
+  match v {
+    TagValue::I64(n) => n.to_string(),
+    // Perl stringifies a float via `%g`-ish (default `$DIG = 15`). The
+    // serializer uses `format_g(_, 15)` for floats; same here so the joined
+    // text matches what ExifTool's joined `@vals` would print.
+    TagValue::F64(n) => {
+      if n.is_finite() {
+        format_g(*n, 15)
+      } else {
+        n.to_string()
+      }
+    }
+    TagValue::Rational(r) => r.exiftool_val_str(),
+    TagValue::Str(s) => s.to_string(),
+    TagValue::Bool(b) => b.to_string(),
+    TagValue::Bytes(_) | TagValue::List(_) => String::new(),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1401,5 +1771,337 @@ mod tests {
         TagValue::Str("C".into()),
       ])
     );
+  }
+
+  // ── read_value: faithful `ReadValue` (ExifTool.pm:6275-6321) over the
+  // Red.pm format-coverage subset.
+
+  #[test]
+  fn read_value_int8u_scalar_and_array() {
+    // count == 1 ⇒ typed `I64` scalar (`Get8u`, ExifTool.pm:6069).
+    let buf = [0x05u8, 0x00, 0xff, 0x10];
+    assert_eq!(
+      read_value(&buf, 0, "int8u", 1, ByteOrder::Mm),
+      Some(TagValue::I64(5))
+    );
+    // count > 1 ⇒ Perl `join(' ', @vals)` (ExifTool.pm:6319) — a single
+    // space-joined `TagValue::Str`, NOT a `List`. Faithful to Red.pm tags
+    // like CropArea (int16u[4]) which appear as "0 0 5120 2560".
+    assert_eq!(
+      read_value(&buf, 0, "int8u", 4, ByteOrder::Mm),
+      Some(TagValue::Str("5 0 255 16".into()))
+    );
+  }
+
+  #[test]
+  fn read_value_int8s_signed() {
+    // `Get8s` (ExifTool.pm:6068) ⇒ `0xff` reads as `-1`.
+    let buf = [0xffu8, 0x7f, 0x80];
+    assert_eq!(
+      read_value(&buf, 0, "int8s", 1, ByteOrder::Mm),
+      Some(TagValue::I64(-1))
+    );
+    assert_eq!(
+      read_value(&buf, 1, "int8s", 1, ByteOrder::Mm),
+      Some(TagValue::I64(127))
+    );
+    assert_eq!(
+      read_value(&buf, 2, "int8s", 1, ByteOrder::Mm),
+      Some(TagValue::I64(-128))
+    );
+  }
+
+  #[test]
+  fn read_value_int16u_be_le() {
+    // `Get16u`/`SetByteOrder` (ExifTool.pm:6071,6149-6190) ⇒ MM=big, II=little.
+    let buf = [0x14u8, 0x00];
+    assert_eq!(
+      read_value(&buf, 0, "int16u", 1, ByteOrder::Mm),
+      Some(TagValue::I64(0x1400))
+    );
+    assert_eq!(
+      read_value(&buf, 0, "int16u", 1, ByteOrder::Ii),
+      Some(TagValue::I64(0x0014))
+    );
+  }
+
+  #[test]
+  fn read_value_int32u_int32s() {
+    // 0x12345678 BE ⇒ 305419896u32 ; 0xfffffffe BE as int32s ⇒ -2.
+    let buf = [0x12u8, 0x34, 0x56, 0x78, 0xff, 0xff, 0xff, 0xfe];
+    assert_eq!(
+      read_value(&buf, 0, "int32u", 1, ByteOrder::Mm),
+      Some(TagValue::I64(0x12345678))
+    );
+    assert_eq!(
+      read_value(&buf, 4, "int32s", 1, ByteOrder::Mm),
+      Some(TagValue::I64(-2))
+    );
+  }
+
+  #[test]
+  fn read_value_string_truncates_at_nul() {
+    // ExifTool.pm:6300 `$vals[0] =~ s/\0.*//s if $format eq 'string'`.
+    let buf = b"hello\0extra";
+    assert_eq!(
+      read_value(buf, 0, "string", buf.len(), ByteOrder::Mm),
+      Some(TagValue::Str("hello".into()))
+    );
+    // No NUL ⇒ keep full slice.
+    let buf2 = b"abc";
+    assert_eq!(
+      read_value(buf2, 0, "string", 3, ByteOrder::Mm),
+      Some(TagValue::Str("abc".into()))
+    );
+  }
+
+  #[test]
+  fn fix_utf8_passes_valid_strings_through_verbatim() {
+    // Pure ASCII.
+    assert_eq!(fix_utf8(b"hello"), "hello");
+    // Valid multi-byte UTF-8 (é = \xC3\xA9, 日本 = \xE6\x97\xA5\xE6\x9C\xAC,
+    // 🦀 = \xF0\x9F\xA6\x80).
+    assert_eq!(fix_utf8("héllo".as_bytes()), "héllo");
+    assert_eq!(fix_utf8("日本".as_bytes()), "日本");
+    assert_eq!(fix_utf8("🦀".as_bytes()), "🦀");
+    // Mixed.
+    assert_eq!(fix_utf8("a日b🦀c".as_bytes()), "a日b🦀c");
+    // Empty.
+    assert_eq!(fix_utf8(b""), "");
+  }
+
+  #[test]
+  fn fix_utf8_replaces_invalid_bytes_with_question_mark() {
+    // **Codex round-9 F1 oracle:** `Image::ExifTool::XMP::FixUTF8` runs
+    // at JSON serialize-time and replaces each invalid UTF-8 byte with
+    // the literal ASCII byte `?` (XMP.pm:2949-2972 default `$bad='?'`).
+    //
+    //   perl -e 'use Image::ExifTool::XMP;
+    //            my $s = "A\xff.R3D";
+    //            Image::ExifTool::XMP::FixUTF8(\$s);
+    //            print "$s\n"'   ⇒ "A?.R3D"
+    let mut buf = b"A\xff.R3D".to_vec();
+    let r = fix_utf8(&buf);
+    assert_eq!(r, "A?.R3D");
+    // Lone continuation byte (0x80-0xBF without a leader) — invalid.
+    buf = b"A\x80B".to_vec();
+    assert_eq!(fix_utf8(&buf), "A?B");
+    // Overlong 2-byte sequence: 0xC0 0x80 (would encode NUL).
+    // `0xC0` is < 0xC2 ⇒ not a valid leader ⇒ replaced with `?`,
+    // then `0x80` is a lone continuation ⇒ also replaced.
+    buf = b"A\xC0\x80B".to_vec();
+    assert_eq!(fix_utf8(&buf), "A??B");
+    // 4-byte sequence beyond U+10FFFF: 0xF5 0x80 0x80 0x80.
+    // Leader 0xF5 is > 0xF4 ⇒ out-of-range ⇒ replaced with `?`, then
+    // three lone continuations each replaced.
+    buf = b"A\xF5\x80\x80\x80B".to_vec();
+    assert_eq!(fix_utf8(&buf), "A????B");
+    // Truncated 3-byte sequence: leader 0xE6 (Japanese leader) +
+    // single continuation, missing the second continuation.
+    buf = b"A\xE6\x97B".to_vec();
+    // Both bytes (leader + one continuation) are invalid as standalone
+    // sequence: leader needs 2 continuations, only 1 follows.
+    // XMP.pm's regex `[\x80-\xbf]{2}` would fail ⇒ leader replaced with
+    // `?`, then `0x97` is a lone continuation ⇒ also replaced.
+    assert_eq!(fix_utf8(&buf), "A??B");
+  }
+
+  #[test]
+  fn fix_utf8_rejects_bmp_non_characters_u_fffe_and_u_ffff() {
+    // **Codex round-10 F1:** Rust's `std::str::from_utf8` ACCEPTS U+FFFE
+    // and U+FFFF (they are valid in the Unicode codespace but flagged
+    // as "non-characters" by Unicode). ExifTool's `FixUTF8` REJECTS
+    // them via the explicit chain at XMP.pm:2960-2961
+    // (`ord($1) == 0xbf and (ord(substr $1, 1) & 0xfe) == 0xbe`).
+    // The fix_utf8 fast path was removed so the byte-walker can apply
+    // these rules.
+    //
+    // Bundled-Perl oracle:
+    //   "A\xEF\xBF\xBEB" (U+FFFE) ⇒ "A???B" (3 bytes each ⇒ `?`)
+    //   "A\xEF\xBF\xBFB" (U+FFFF) ⇒ "A???B"
+    //   "A\xEF\xBF\xBDB" (U+FFFD replacement char) ⇒ unchanged (BD ≠ BE/BF)
+    //   "A\xEF\xBF\xACB" (U+FFEC random kanji punctuation) ⇒ unchanged
+    assert_eq!(fix_utf8(b"A\xEF\xBF\xBEB"), "A???B");
+    assert_eq!(fix_utf8(b"A\xEF\xBF\xBFB"), "A???B");
+    // The replacement character U+FFFD is NOT a non-character and
+    // passes through verbatim.
+    let fffd_bytes = b"A\xEF\xBF\xBDB";
+    assert_eq!(fix_utf8(fffd_bytes).as_bytes(), fffd_bytes);
+    // U+FFEC (random valid BMP char) — passes through.
+    let ffec_bytes = b"A\xEF\xBF\xACB";
+    assert_eq!(fix_utf8(ffec_bytes).as_bytes(), ffec_bytes);
+  }
+
+  #[test]
+  fn read_value_string_non_character_emits_fixutf8_question_mark() {
+    // Codex round-10 F1: integration through `read_value` — a Red
+    // `string` payload containing U+FFFE/U+FFFF must emit the
+    // ExifTool-matching `?` substitution, not preserve the
+    // non-character.
+    let buf = b"A\xEF\xBF\xBEB";
+    assert_eq!(
+      read_value(buf, 0, "string", buf.len(), ByteOrder::Mm),
+      Some(TagValue::Str("A???B".into()))
+    );
+    let buf2 = b"A\xEF\xBF\xBFB";
+    assert_eq!(
+      read_value(buf2, 0, "string", buf2.len(), ByteOrder::Mm),
+      Some(TagValue::Str("A???B".into()))
+    );
+  }
+
+  #[test]
+  fn read_value_string_invalid_utf8_emits_fixutf8_question_mark() {
+    // Codex round-9 F1: `read_value` routes through `fix_utf8` so a
+    // bad-byte payload produces ExifTool-matching `A?.R3D`, not the
+    // `from_utf8_lossy` `A\u{FFFD}.R3D`.
+    let buf = b"A\xff.R3D";
+    assert_eq!(
+      read_value(buf, 0, "string", buf.len(), ByteOrder::Mm),
+      Some(TagValue::Str("A?.R3D".into()))
+    );
+    // Truncate at NUL still applies before FixUTF8.
+    let buf2 = b"A\xff\0extra";
+    assert_eq!(
+      read_value(buf2, 0, "string", buf2.len(), ByteOrder::Mm),
+      Some(TagValue::Str("A?".into()))
+    );
+  }
+
+  #[test]
+  fn read_value_undef_returns_raw_bytes() {
+    // ExifTool.pm:6298 (no `undef` entry in `%readValueProc` ⇒ raw substr).
+    let buf = [0x00u8, 0xff, 0x10];
+    assert_eq!(
+      read_value(&buf, 0, "undef", 3, ByteOrder::Mm),
+      Some(TagValue::Bytes(vec![0x00, 0xff, 0x10]))
+    );
+  }
+
+  #[test]
+  fn read_value_float_be_le() {
+    // 1.0 (IEEE-754 single) = 0x3F800000.
+    let be = [0x3fu8, 0x80, 0x00, 0x00];
+    assert_eq!(
+      read_value(&be, 0, "float", 1, ByteOrder::Mm),
+      Some(TagValue::F64(1.0))
+    );
+    let le = [0x00u8, 0x00, 0x80, 0x3f];
+    assert_eq!(
+      read_value(&le, 0, "float", 1, ByteOrder::Ii),
+      Some(TagValue::F64(1.0))
+    );
+  }
+
+  #[test]
+  fn read_value_float_array_joins_with_space() {
+    // Two BE float32s: 0.25 (0x3e800000) and 0.5 (0x3f000000) ⇒ "0.25 0.5".
+    let buf = [0x3eu8, 0x80, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00];
+    assert_eq!(
+      read_value(&buf, 0, "float", 2, ByteOrder::Mm),
+      Some(TagValue::Str("0.25 0.5".into()))
+    );
+  }
+
+  #[test]
+  fn read_value_rational32u_be() {
+    // num=1, denom=3 (BE int16u pairs) ⇒ `Rational::rational32(1,3)`,
+    // which `exiftool_val_str` renders as `0.3333333` (%.7g, ExifTool.pm:6087).
+    let buf = [0x00u8, 0x01, 0x00, 0x03];
+    let v = read_value(&buf, 0, "rational32u", 1, ByteOrder::Mm).expect("rational32u should parse");
+    match v {
+      TagValue::Rational(r) => {
+        assert_eq!(r.numerator(), 1);
+        assert_eq!(r.denominator(), 3);
+        assert_eq!(r.sig(), 7);
+        assert_eq!(r.exiftool_val_str(), "0.3333333");
+      }
+      other => panic!("expected Rational, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn read_value_rational32u_zero_denom_inf_undef() {
+    // ExifTool.pm:6094 `$ratDenom = Get16u(...) or return $ratNumer ? 'inf'
+    // : 'undef'` — `Rational::exiftool_val_str` is the SHARED source of
+    // truth: `inf` for numerator ≠ 0, `undef` for numerator == 0.
+    let inf = [0x00u8, 0x05, 0x00, 0x00]; // num=5, denom=0
+    let v_inf = read_value(&inf, 0, "rational32u", 1, ByteOrder::Mm).unwrap();
+    assert_eq!(v_inf.unwrap_rational().exiftool_val_str(), "inf");
+    let undef = [0x00u8, 0x00, 0x00, 0x00]; // num=0, denom=0
+    let v_undef = read_value(&undef, 0, "rational32u", 1, ByteOrder::Mm).unwrap();
+    assert_eq!(v_undef.unwrap_rational().exiftool_val_str(), "undef");
+  }
+
+  #[test]
+  fn read_value_out_of_bounds_returns_none() {
+    // ExifTool.pm:6290-6292 — when `$len * $count > $size`, count is shortened
+    // to `int($size / $len)`; if the shortened count is < 1, return undef.
+    // A 2-byte buffer asked for a single int32u shortens to count=0 ⇒ None.
+    let buf = [0x01u8, 0x02];
+    assert_eq!(read_value(&buf, 0, "int32u", 1, ByteOrder::Mm), None);
+    // Offset past end ⇒ size underflows ⇒ None (no panic, faithful to
+    // ExifTool.pm:6284 `length($$dataPt) - $offset`).
+    assert_eq!(read_value(&buf, 99, "int8u", 1, ByteOrder::Mm), None);
+  }
+
+  #[test]
+  fn read_value_shortens_count_when_buffer_truncates_array() {
+    // Codex round-1 F2 (Red.pm RED2 FrameRate `int16u[3]` at 0x56): a header
+    // that ends with only 4 bytes at the field offset should yield a 2-element
+    // scalar "1001 0", and with only 2 bytes a single scalar "1001"; not
+    // dropped. Cross-checked against bundled Perl:
+    //   perl -MImage::ExifTool=:DataAccess -e '
+    //     my $b = pack("nn", 1001, 0);
+    //     print Image::ExifTool::ReadValue(\$b, 0, "int16u", 3, length($b))'
+    //   => "1001 0"
+    //   perl -MImage::ExifTool=:DataAccess -e '
+    //     my $b = pack("n", 1001);
+    //     print Image::ExifTool::ReadValue(\$b, 0, "int16u", 3, length($b))'
+    //   => "1001"
+    let four_bytes = [0x03u8, 0xe9, 0x00, 0x00]; // 1001, 0
+    let v = read_value(&four_bytes, 0, "int16u", 3, ByteOrder::Mm)
+      .expect("shortened to count=2, must emit");
+    assert_eq!(v, TagValue::Str("1001 0".into()));
+    let two_bytes = [0x03u8, 0xe9]; // 1001
+    let v2 = read_value(&two_bytes, 0, "int16u", 3, ByteOrder::Mm)
+      .expect("shortened to count=1, must emit");
+    // count==1 ⇒ typed scalar (mirroring Perl's `wantarray ? @vals : @vals==1
+    // ? $vals[0] : join ' ', @vals`, ExifTool.pm:6318-6320).
+    assert_eq!(v2, TagValue::I64(1001));
+    // 1 byte for int16u[3] ⇒ shortened to 0 elements ⇒ undef (None).
+    let one_byte = [0xaau8];
+    assert_eq!(read_value(&one_byte, 0, "int16u", 3, ByteOrder::Mm), None);
+  }
+
+  #[test]
+  fn read_value_string_clamps_count_to_available_bytes() {
+    // ExifTool.pm:6298 `substr($$dataPt, $offset, $count * $len)`: with the
+    // count-shortening rule, asking for a 32-char string against a 10-byte
+    // buffer yields the 10 bytes (truncated at NUL if present). Bundled Perl:
+    //   perl -MImage::ExifTool=:DataAccess -e '
+    //     my $b = "HELLO\0BYE"; print Image::ExifTool::ReadValue(
+    //       \$b, 0, "string", 32, length($b))' => "HELLO"
+    let buf = b"HELLO\0BYE";
+    let v =
+      read_value(buf, 0, "string", 32, ByteOrder::Mm).expect("string clamped to buffer, must emit");
+    assert_eq!(v, TagValue::Str("HELLO".into()));
+    // No NUL ⇒ entire (shortened) slice is the value.
+    let raw = b"ABCD";
+    let v2 = read_value(raw, 0, "string", 16, ByteOrder::Mm).expect("string clamped, must emit");
+    assert_eq!(v2, TagValue::Str("ABCD".into()));
+  }
+
+  #[test]
+  fn read_value_unknown_format_returns_none() {
+    // ExifTool warns "Unknown format" (ExifTool.pm:6281) then proceeds with
+    // $len=1. We return None instead — the caller (Red.pm:282 unknown
+    // format-code path) emits its own Warning and aborts the directory walk,
+    // so the engine never reaches a fake $len=1 read. Same incremental-
+    // derivation discipline: future formats add their own arms as needed.
+    let buf = [0u8; 16];
+    assert_eq!(read_value(&buf, 0, "double", 1, ByteOrder::Mm), None);
+    assert_eq!(read_value(&buf, 0, "binary", 1, ByteOrder::Mm), None);
+    assert_eq!(read_value(&buf, 0, "garbage", 1, ByteOrder::Mm), None);
   }
 }
