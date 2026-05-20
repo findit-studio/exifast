@@ -25,6 +25,37 @@ fn aac_conformance() {
 }
 
 #[test]
+fn wavpack_conformance() {
+  // FORMATS.md row 6. Native `wvpk....` 32-byte header (no RIFF wrapper,
+  // no ID3, no APE) ⇒ ProcessWV runs the WavPack::Main ProcessBinaryData
+  // step (5 masked sub-tags) and the post-PBD `ProcessRIFF`/`ProcessAPE`
+  // calls (WavPack.pm:97-102) emit nothing — see the orchestrator-scoped
+  // deferral note in `src/formats/wavpack.rs`. Goldens captured from
+  // bundled `perl exiftool`.
+  check("WavPack.wv", "WavPack.wv.json", true);
+  check("WavPack.wv", "WavPack.wv.n.json", false);
+}
+
+#[test]
+fn wavpack_adversarial_conformance() {
+  // Flags = 0xFFFFFFFF: every mask saturates ⇒ exercises the off-end of
+  // every PrintConv hash (SampleRate index 15 = 'Custom' is the only
+  // non-numeric entry; BytesPerSample raw=3 ⇒ +1 = 4 = the largest
+  // ValueConv output). Pins that the byte-order (MM) and the mask /
+  // shift derivation stay faithful even with every bit set.
+  check(
+    "WavPack_adversarial.wv",
+    "WavPack_adversarial.wv.json",
+    true,
+  );
+  check(
+    "WavPack_adversarial.wv",
+    "WavPack_adversarial.wv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);

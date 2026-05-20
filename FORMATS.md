@@ -24,7 +24,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif` | ⬜ | — | — |
 | 4 | **MPC** | MPC.pm | 156 | 2 | Engine, ID3/APE tags | `APE.mpc` | ⬜ | — | — |
 | 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape` | ⬜ | — | — |
-| 6 | **WavPack** (WV/WVP) | WavPack.pm | 144 | 2 | Engine, ID3/APE tags | ⚠️ ffmpeg-gen `WavPack.wv` | ⬜ | — | — |
+| 6 | **WavPack** (WV/WVP) | WavPack.pm | 144 | 2 | Engine, ID3/APE tags | `WavPack.wv` + adversarial | ✅ | clean | — |
 | 7 | **DSF** | DSF.pm | 138 | 2 | Engine, ID3 | ⚠️ ffmpeg-gen `DSF.dsf` | ⬜ | — | — |
 | 8 | **FLAC** | FLAC.pm | 321 | 2 | Engine, ID3, Vorbis | `FLAC.flac` | ⬜ | — | — |
 | 9 | **Ogg + Vorbis** (OGG/OGV/OPUS) | Ogg.pm + Vorbis.pm | 496 | 2 | Engine, FLAC (ogg-flac) | `Vorbis.ogg`, `Opus.opus`, `FLAC.ogg` | ⬜ | — | — |
