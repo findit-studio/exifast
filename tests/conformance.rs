@@ -193,6 +193,104 @@ fn red_truncated_header_conformance() {
   );
 }
 
+// FORMATS.md row 2 — ID3 pathfinder + MP3 completion. Each fixture is a
+// synthetic ID3v2.x or ID3v1 file (no MPEG audio frame body — MPEG.pm is
+// row 17, out-of-PR-scope; APE.pm row 5 likewise). The bundled-Perl
+// oracle JSON is captured by hand from `perl exiftool -j -G1 -struct …`.
+
+#[test]
+fn id3v2_2_conformance() {
+  // Synthetic ID3v2.2 file: TT2/TP1/TCO/TCM/COM/PIC frames; no Composite
+  // triggers (no Year). Exercises ProcessID3 + ProcessID3v2 (6-byte
+  // frame header path) + PIC sub-attribute emission (PIC-1/-2/-3 +
+  // binary Picture).
+  check("ID3v2_2.mp3", "ID3v2_2.mp3.json", true);
+  check("ID3v2_2.mp3", "ID3v2_2.mp3.n.json", false);
+}
+
+#[test]
+fn id3v1_conformance() {
+  // 128-byte ID3v1 TAG trailer + 256 leading null bytes. Year set to
+  // `\0\0\0\0` ⇒ ID3v1:Year="" ⇒ Composite:DateTimeOriginal NOT emitted
+  // (Perl ValueConv `return undef unless $val[1]`, ID3.pm:853). Exercises
+  // ProcessID3 ID3v1 trailer detection + ProcessID3v1 (binary table).
+  check("ID3v1.mp3", "ID3v1.mp3.json", true);
+  check("ID3v1.mp3", "ID3v1.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_3_conformance() {
+  // Synthetic ID3v2.3 file: TIT2/TPE1/TALB/TCON/COMM/APIC frames. v2.3
+  // uses 10-byte frame headers (a4 N n) and standard int32 sizes.
+  check("ID3v2_3.mp3", "ID3v2_3.mp3.json", true);
+  check("ID3v2_3.mp3", "ID3v2_3.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_4_conformance() {
+  // Synthetic ID3v2.4 file: TIT2/TPE1 with sync-safe sizes. Exercises
+  // ProcessID3v2 v2.4 sync-safe length detection (the no-iTunes-bug
+  // path where sync-safe size IS valid).
+  check("ID3v2_4.mp3", "ID3v2_4.mp3.json", true);
+  check("ID3v2_4.mp3", "ID3v2_4.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_3_extended_header_conformance() {
+  // R4-F1 regression — pins the FAITHFUL bundled-Perl behavior:
+  //   ID3.pm:1481 `$hBuff = substr($hBuff, $len)` strips EXACTLY $len
+  //   bytes from the buffer, where $len is the writer's ext-header
+  //   length-field value. Canonical real-world ID3v2.3 writers store
+  //   $len = total_ext_header_size INCLUDING the 4-byte length field
+  //   (verified against bundled `perl exiftool` on this fixture).
+  //   Naively "fixing" the strip to `$len + 4` would diverge from
+  //   bundled — Codex review R4 misread the ID3 spec on this point.
+  //
+  // The fixture is a v2.3 file with ext-header value=10 (full ext
+  // size) + TIT2 frame. Bundled emits ID3v2_3:Title="ExtHdr".
+  check("ID3v2_3_exthdr.mp3", "ID3v2_3_exthdr.mp3.json", true);
+  check("ID3v2_3_exthdr.mp3", "ID3v2_3_exthdr.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_corrupt_with_valid_id3v1_trailer_conformance() {
+  // R3-F1 regression: a file with a corrupt ID3v2 header (here `ID3v5`,
+  // unsupported) BUT a valid ID3v1 trailer at the end. Bundled ID3.pm
+  // `last`s out of the v2 header loop (ID3.pm:1454-1465) AND CONTINUES
+  // to the ID3v1 trailer scan at ID3.pm:1510-1517 — the trailer tags
+  // must still be emitted. Previously my port early-returned on the
+  // v5 Warn and dropped all ID3v1 tags. Pinned by this conformance:
+  // `Warning="Unsupported ID3 version: 2.5.0"` + full ID3v1:* tag set.
+  check("ID3v2_v5_with_v1.mp3", "ID3v2_v5_with_v1.mp3.json", true);
+  check("ID3v2_v5_with_v1.mp3", "ID3v2_v5_with_v1.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_4_big_frame_conformance() {
+  // R2 regression — v2.4 single frame with sync-safe size > 127 followed
+  // by EOF (no terminator). Bundled `ProcessID3v2` (ID3.pm:1143-1152)
+  // emits `[minor] Missing ID3 terminating frame` Warn AND extracts the
+  // 200-byte title. Previously my port defaulted to RAW int32 in the
+  // sync-safe-above-127 branch and dropped the frame. Pinned by this
+  // conformance fixture: 200 'A's + the bundled Warn.
+  check("ID3v2_4_big.mp3", "ID3v2_4_big.mp3.json", true);
+  check("ID3v2_4_big.mp3", "ID3v2_4_big.mp3.n.json", false);
+}
+
+#[test]
+fn id3v5_unsupported_conformance() {
+  // ID3 magic + version 5.0 ⇒ ExifTool emits Warn "Unsupported ID3
+  // version: 2.5.0" (ID3.pm:1460). $rtnVal=1 was set at ID3.pm:1453
+  // BEFORE the version check, so SetFileType('MP3') + ID3Size=0 still
+  // run in the post-loop rtnVal-truthy block (ID3.pm:1580-1611).
+  check("ID3v5_unsupported.mp3", "ID3v5_unsupported.mp3.json", true);
+  check(
+    "ID3v5_unsupported.mp3",
+    "ID3v5_unsupported.mp3.n.json",
+    false,
+  );
+}
+
 #[test]
 fn red2_framerate_div_by_zero_conformance() {
   // Codex round-3 F1 regression: RED2 `int16u[3]` at offset 0x56 is
@@ -216,6 +314,49 @@ fn red2_framerate_div_by_zero_conformance() {
 }
 
 #[test]
+fn id3v2_short_header_conformance() {
+  // ID3 magic + only 2 bytes total (5 bytes of header). ID3.pm:1454
+  // `$raf->Read($hBuff,7)==7 or $et->Warn('Short ID3 header'), last`.
+  // Same rtnVal-was-already-1 pattern: File:* + ID3Size=0 still emitted.
+  check("ID3v2_short.mp3", "ID3v2_short.mp3.json", true);
+  check("ID3v2_short.mp3", "ID3v2_short.mp3.n.json", false);
+}
+
+#[test]
+fn id3v2_truncated_data_conformance() {
+  // ID3 magic + declared size 100 but only 3 body bytes. ID3.pm:1464
+  // Warn "Truncated ID3 data".
+  check("ID3v2_truncated.mp3", "ID3v2_truncated.mp3.json", true);
+  check("ID3v2_truncated.mp3", "ID3v2_truncated.mp3.n.json", false);
+}
+
+#[test]
+fn no_ext_layer2_mpeg_conformance() {
+  // R8-F1 regression. A dotless file whose contents start with the valid
+  // MPEG Layer-II frame sync `ff fd 90 4c`. Bundled `ProcessMP3`
+  // (ID3.pm:1684-1728) invokes `ParseMPEGAudio` with `$mp3 = 1` because
+  // `$ext ne 'MUS'` (ID3.pm:1715-1717); the Layer-III gate at
+  // MPEG.pm:485 then rejects this sync (`0x040000 != 0x020000`).
+  // Without the .mp3 extension MPEG.pm:488 `return 0 unless $ext eq
+  // 'MP3'` bails immediately, so the candidate loop continues and the
+  // post-loop emits `Unknown file type`. Previously my port used the
+  // same `ext_is_mp3` boolean for both the 8192-byte scan window AND
+  // the Layer-III gate — for a non-MP3-ext dispatch path it skipped
+  // the Layer-III check and would have accepted this Layer-II header.
+  // Pinned: `Error="Unknown file type"`, no `File:*` tags.
+  check(
+    "no_ext_layer2_mpeg.bin",
+    "no_ext_layer2_mpeg.bin.json",
+    true,
+  );
+  check(
+    "no_ext_layer2_mpeg.bin",
+    "no_ext_layer2_mpeg.bin.n.json",
+    false,
+  );
+}
+
+#[test]
 fn red2_short_first_block_conformance() {
   // Codex round-2 F2 regression: RED2 declared `$size = 0x40` (< 0x44),
   // file has trailing bytes past the declared first block. Pre-fix this
@@ -233,6 +374,113 @@ fn red2_short_first_block_conformance() {
   check(
     "red2_short_first_block.r3d",
     "red2_short_first_block.r3d.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_3_with_v2_4_frame_conformance() {
+  // R8-F2 regression (v2.3 → v2.4 fallback). A v2.3 file containing
+  // a v2.4-only frame (`TMOO` = Mood). Bundled ID3.pm:833-836
+  // `%otherTable` maps v2.3 ↔ v2.4; ID3.pm:1166-1172: when the per-
+  // frame `GetTagInfo` misses in the current-version table, the alt
+  // table is consulted, and on a hit a minor `Warn("Frame '${id}' is
+  // not valid for this ID3 version", 1)` is emitted + the tag IS still
+  // extracted under the alt table's `TagDef` (whose `group1()` is
+  // `ID3v2_4`). TMOO chosen because it is NOT a Composite source
+  // (Composite tag derivation is out-of-PR-scope, row 17 +); pins
+  // the fallback emission without depending on out-of-scope Composite
+  // machinery. Pinned: `Warning="[minor] Frame 'TMOO' is not valid
+  // for this ID3 version"` + `ID3v2_4:Mood="Happy"`.
+  check(
+    "ID3v2_3_with_v2_4_frame.mp3",
+    "ID3v2_3_with_v2_4_frame.mp3.json",
+    true,
+  );
+  check(
+    "ID3v2_3_with_v2_4_frame.mp3",
+    "ID3v2_3_with_v2_4_frame.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_4_with_v2_3_frame_conformance() {
+  // R8-F2 regression (v2.4 → v2.3 fallback). A v2.4 file containing
+  // a v2.3-only frame (`TSIZ` = Size). Symmetric to the above; bundled
+  // emits the same minor Warn but the tag goes under `ID3v2_3:Size`
+  // (the alt table's group1). TSIZ chosen because it is NOT a
+  // Composite source (Year/Date/Time WOULD trigger
+  // Composite:DateTimeOriginal). Pinned: `Warning="[minor] Frame
+  // 'TSIZ' is not valid for this ID3 version"` + `ID3v2_3:Size=12345`.
+  check(
+    "ID3v2_4_with_v2_3_frame.mp3",
+    "ID3v2_4_with_v2_3_frame.mp3.json",
+    true,
+  );
+  check(
+    "ID3v2_4_with_v2_3_frame.mp3",
+    "ID3v2_4_with_v2_3_frame.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_3_invalid_apic_conformance() {
+  // R8-F3 regression (APIC Latin). A v2.3 file with a malformed APIC
+  // frame: MIME + 0 + picType + description WITHOUT the description's
+  // trailing `\0` terminator. Bundled ID3.pm:1321 regex
+  // `.(.*?)\0(.)(.*?)\0` does NOT match (final `\0` absent), ID3.pm:
+  // 1324 `... or $et->Warn("Invalid $id frame"), next` fires.
+  // Previously my port treated the entire remaining buffer as the
+  // description and emitted empty image bytes; now the picture frame
+  // is skipped entirely. Pinned: `Warning="Invalid APIC frame"` + NO
+  // `APIC*` tags.
+  check(
+    "ID3v2_3_invalid_APIC.mp3",
+    "ID3v2_3_invalid_APIC.mp3.json",
+    true,
+  );
+  check(
+    "ID3v2_3_invalid_APIC.mp3",
+    "ID3v2_3_invalid_APIC.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_3_invalid_apic_utf16_conformance() {
+  // R8-F3 regression (APIC UTF-16). The UTF-16 branch of the bundled
+  // regex (ID3.pm:1319 `.(.*?)\0(.)((?:..)*?)\0\0`) requires a word-
+  // aligned `\0\0` description terminator; fixture omits it ⇒ same
+  // `Invalid APIC frame` Warn + skip semantics.
+  check(
+    "ID3v2_3_invalid_APIC_utf16.mp3",
+    "ID3v2_3_invalid_APIC_utf16.mp3.json",
+    true,
+  );
+  check(
+    "ID3v2_3_invalid_APIC_utf16.mp3",
+    "ID3v2_3_invalid_APIC_utf16.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_2_invalid_pic_conformance() {
+  // R8-F3 regression (PIC v2.2). The 3-byte image-format + 1-byte
+  // picType + description-without-`\0`. Bundled ID3.pm:1321 PIC regex
+  // `.(...)(.)(.*?)\0` requires the trailing `\0`; absent ⇒
+  // `Warn("Invalid PIC frame")` + frame skipped. Pinned to confirm
+  // the v2.2 path uses the `Invalid PIC frame` wording (NOT APIC).
+  check(
+    "ID3v2_2_invalid_PIC.mp3",
+    "ID3v2_2_invalid_PIC.mp3.json",
+    true,
+  );
+  check(
+    "ID3v2_2_invalid_PIC.mp3",
+    "ID3v2_2_invalid_PIC.mp3.n.json",
     false,
   );
 }

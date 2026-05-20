@@ -1,11 +1,96 @@
 //! Runs a raw value through a `TagDef`'s ValueConv then PrintConv, producing
 //! the value that appears in `-j` output (PrintConv on) — ExifTool's pipeline.
+//!
+//! # D11 conversion-context API (spec §11.2)
+//!
+//! ExifTool ValueConv/PrintConv code refs frequently dereference `$self`
+//! (the per-file `Image::ExifTool` instance) for reader state/options —
+//! e.g. `ConvertID3v1Text` (ID3.pm:897-901) reads
+//! `$self->Options('CharsetID3')`. The D11 API exposes that state via
+//! [`ConvContext`]: a small struct carrying ONLY the option/state fields
+//! some real ported tag actually consumes.
+//!
+//! **Derivation rule (frozen in this PR — ID3 pathfinder, FORMATS.md row 2).**
+//! Fields are added ADDITIVELY when a real ported tag's faithful conversion
+//! needs them — NEVER speculatively. The initial field set is derived from
+//! the FIRST context-dependent ValueConv in our port: ID3v1::Title
+//! (ID3.pm:339-343 → :897-901 `ConvertID3v1Text`) reads
+//! `$self->Options('CharsetID3')` (default `"Latin"`, ExifTool.pm:1118).
+//! Future format ports CONSUME this shape (no re-design); they may add
+//! fields, but every addition must cite the first real consumer.
+//!
+//! **Plumbing.** Two parallel APIs:
+//! - [`apply`] — the legacy entry point (default `ConvContext`); existing
+//!   `ValueConv::Func` / `PrintConv::Func` callers continue to work
+//!   unchanged (AAC, FLAC StreamInfo, etc.).
+//! - [`apply_ctx`] — the context-threaded entry point; routes to
+//!   [`ValueConv::FuncCtx`] / [`PrintConv::FuncCtx`] when present.
+//!
+//! Both variants accept any [`ValueConv`]/[`PrintConv`] enum value; the
+//! `FuncCtx` variants are simply the additive extension. `apply` is a thin
+//! wrapper that builds a default context and delegates to `apply_ctx` —
+//! no behavior change for AAC and friends.
 
 use crate::{
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
   value::{format_g, TagValue},
 };
 use smol_str::SmolStr;
+
+/// Faithful model of the subset of `$$self{OPTIONS}` / `$self`-derived state
+/// that ported ValueConv/PrintConv code refs actually consume. Per D11
+/// derivation rule (spec §11.2): fields are added additively for each new
+/// real consumer; do NOT speculate. The currently-carried fields:
+///
+/// - **`charset_id3`** — ExifTool `$$self{OPTIONS}{CharsetID3}` (default
+///   `"Latin"`, ExifTool.pm:1118). First consumer: ID3v1::Title
+///   (ID3.pm:339-343 calls :897-901 `ConvertID3v1Text` which does
+///   `$et->Decode($val, $et->Options('CharsetID3'))`).
+///
+/// D8 (no public fields): all fields are private; access via accessors;
+/// `const fn new` enables `static` use. Extension contract: add a field +
+/// a `const fn with_<field>` builder + a `<field>()` accessor + an
+/// in-code citation of the FIRST real-tag consumer.
+#[derive(Clone, Copy)]
+pub struct ConvContext {
+  /// ExifTool `$$self{OPTIONS}{CharsetID3}`: drives `ConvertID3v1Text`
+  /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
+  charset_id3: &'static str,
+}
+
+impl ConvContext {
+  /// Construct a `ConvContext` from explicit field values. Required for
+  /// `static` use (e.g. test fixtures); production callers usually want
+  /// [`ConvContext::default`].
+  #[must_use]
+  pub const fn new(charset_id3: &'static str) -> Self {
+    Self { charset_id3 }
+  }
+
+  /// `$$self{OPTIONS}{CharsetID3}` — drives `ConvertID3v1Text`
+  /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
+  #[must_use]
+  pub const fn charset_id3(&self) -> &'static str {
+    self.charset_id3
+  }
+
+  /// Builder: override `charset_id3` (D8 `with_*` shape). The read path
+  /// does not yet expose `CharsetID3` as a user-controllable option, so
+  /// production callers stay on the default; this builder exists for
+  /// tests + the documented extension contract.
+  #[must_use]
+  pub const fn with_charset_id3(mut self, value: &'static str) -> Self {
+    self.charset_id3 = value;
+    self
+  }
+}
+
+impl Default for ConvContext {
+  /// `CharsetID3 => 'Latin'` (ExifTool.pm:1118): bundled ExifTool's default.
+  fn default() -> Self {
+    Self::new("Latin")
+  }
+}
 
 /// The conversion stage, faithful to ExifTool's `$convType` (`ExifTool.pm`
 /// `GetValue`/`ConvertValue`). The `PrintHex → 'Unknown (0x%x)'` sub-case is
@@ -24,10 +109,33 @@ enum ConvType {
   PrintConv,
 }
 
-/// Apply ValueConv then PrintConv. `print_conv_enabled` mirrors ExifTool's
-/// `-n` switch: when `false`, the post-ValueConv value is returned (the `-n`
-/// golden), matching spec §4's two snapshots.
+/// Hot-path default — `apply` runs per tag, so the default `ConvContext`
+/// is lifted to a `static` and passed by `&` instead of constructed (and
+/// then immediately borrowed) on every call.
+static DEFAULT_CONV_CONTEXT: ConvContext = ConvContext::new("Latin");
+
+/// Apply ValueConv then PrintConv with the **default** [`ConvContext`].
+/// `print_conv_enabled` mirrors ExifTool's `-n` switch: when `false`, the
+/// post-ValueConv value is returned (the `-n` golden), matching spec §4's
+/// two snapshots.
+///
+/// Thin wrapper over [`apply_ctx`]: zero behavioral difference for tags
+/// that use only `ValueConv::None`/`Func`/`Hash` + `PrintConv::None`/`Func`/
+/// `Hash` (AAC, FLAC StreamInfo). The `FuncCtx` variants observe whatever
+/// `ConvContext` is in scope; `apply` provides the default.
 pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue {
+  apply_ctx(def, raw, print_conv_enabled, &DEFAULT_CONV_CONTEXT)
+}
+
+/// Apply ValueConv then PrintConv, threading a [`ConvContext`] for any
+/// `FuncCtx` variants. See module-level docs for the D11 derivation rule.
+/// Element-wise over lists (ExifTool.pm:3578-3582), identical to [`apply`].
+pub fn apply_ctx(
+  def: &TagDef,
+  raw: &TagValue,
+  print_conv_enabled: bool,
+  ctx: &ConvContext,
+) -> TagValue {
   // ExifTool.pm:3578-3582 — the conversion loop iterates list elements for
   // the active stage, applying the current conv per scalar `$val`. Recurse
   // once at the top so BOTH ValueConv and PrintConv run element-wise; nested
@@ -36,19 +144,20 @@ pub fn apply(def: &TagDef, raw: &TagValue, print_conv_enabled: bool) -> TagValue
     return TagValue::List(
       items
         .iter()
-        .map(|it| apply(def, it, print_conv_enabled))
+        .map(|it| apply_ctx(def, it, print_conv_enabled, ctx))
         .collect(),
     );
   }
   let valued = match def.value_conv() {
     ValueConv::None => raw.clone(),
     ValueConv::Func(f) => f(raw),
+    ValueConv::FuncCtx(f) => f(raw, ctx),
     ValueConv::Hash(h) => apply_hash_conv(def, &h, raw, ConvType::ValueConv),
   };
   if !print_conv_enabled {
     return valued;
   }
-  apply_print_conv(def, def.print_conv(), &valued, ConvType::PrintConv)
+  apply_print_conv(def, def.print_conv(), &valued, ConvType::PrintConv, ctx)
 }
 
 /// The PrintConv stage. ExifTool runs the conversion over every element of a
@@ -63,18 +172,20 @@ fn apply_print_conv(
   conv: PrintConv,
   valued: &TagValue,
   conv_type: ConvType,
+  ctx: &ConvContext,
 ) -> TagValue {
   if let TagValue::List(items) = valued {
     return TagValue::List(
       items
         .iter()
-        .map(|it| apply_print_conv(def, conv, it, conv_type))
+        .map(|it| apply_print_conv(def, conv, it, conv_type, ctx))
         .collect(),
     );
   }
   match conv {
     PrintConv::None => valued.clone(),
     PrintConv::Func(f) => f(valued),
+    PrintConv::FuncCtx(f) => f(valued, ctx),
     PrintConv::Hash(h) => apply_hash_conv(def, &h, valued, conv_type),
   }
 }
@@ -1793,6 +1904,66 @@ mod tests {
     );
   }
 
+  // ---- D11 conversion-context API (spec §11.2) ----
+
+  #[test]
+  fn conv_context_default_is_latin() {
+    // Default `CharsetID3 => 'Latin'` (ExifTool.pm:1118).
+    let ctx = ConvContext::default();
+    assert_eq!(ctx.charset_id3(), "Latin");
+  }
+
+  #[test]
+  fn conv_context_with_charset_id3_override() {
+    // `with_charset_id3` is the D8 builder shape — `const fn` so it
+    // composes into a `static` if a port ever needs it.
+    let ctx = ConvContext::default().with_charset_id3("UTF8");
+    assert_eq!(ctx.charset_id3(), "UTF8");
+  }
+
+  /// First-consumer-shaped: an ID3v1::Title-style ValueConv that reads
+  /// `ctx.charset_id3()` and returns a value derived from it. Proves the
+  /// `FuncCtx` plumbing routes the context through `apply_ctx` correctly.
+  fn fake_id3v1_text_conv(raw: &TagValue, ctx: &ConvContext) -> TagValue {
+    let bytes = match raw {
+      TagValue::Str(s) => s.as_bytes(),
+      _ => return raw.clone(),
+    };
+    // Stand-in: emit the charset tag so the test sees which ctx was used.
+    let s = format!("[{}]{}", ctx.charset_id3(), String::from_utf8_lossy(bytes));
+    TagValue::Str(s.into())
+  }
+
+  static D11_VC_FUNCCTX: TagDef = TagDef::new(
+    "Title",
+    "ID3v1",
+    ValueConv::FuncCtx(fake_id3v1_text_conv),
+    PrintConv::None,
+  );
+
+  #[test]
+  fn apply_ctx_routes_value_conv_funcctx() {
+    // Default ctx (Latin), then an override; both reach the FuncCtx fn.
+    assert_eq!(
+      apply_ctx(
+        &D11_VC_FUNCCTX,
+        &TagValue::Str("hi".into()),
+        true,
+        &ConvContext::default()
+      ),
+      TagValue::Str("[Latin]hi".into())
+    );
+    assert_eq!(
+      apply_ctx(
+        &D11_VC_FUNCCTX,
+        &TagValue::Str("hi".into()),
+        true,
+        &ConvContext::new("UTF8")
+      ),
+      TagValue::Str("[UTF8]hi".into())
+    );
+  }
+
   #[test]
   fn read_value_int8s_signed() {
     // `Get8s` (ExifTool.pm:6068) ⇒ `0xff` reads as `-1`.
@@ -2103,5 +2274,66 @@ mod tests {
     assert_eq!(read_value(&buf, 0, "double", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "binary", 1, ByteOrder::Mm), None);
     assert_eq!(read_value(&buf, 0, "garbage", 1, ByteOrder::Mm), None);
+  }
+
+  #[test]
+  fn apply_thin_wraps_apply_ctx_with_default() {
+    // `apply` must be a behavior-identical thin wrapper for default ctx —
+    // any FuncCtx invoked via `apply` sees the Latin default.
+    assert_eq!(
+      apply(&D11_VC_FUNCCTX, &TagValue::Str("hi".into()), true),
+      TagValue::Str("[Latin]hi".into())
+    );
+  }
+
+  fn fake_printctx(v: &TagValue, ctx: &ConvContext) -> TagValue {
+    match v {
+      TagValue::Str(s) => TagValue::Str(format!("{}::{}", ctx.charset_id3(), s).into()),
+      x => x.clone(),
+    }
+  }
+  static D11_PC_FUNCCTX: TagDef = TagDef::new(
+    "T",
+    "ID3v1",
+    ValueConv::None,
+    PrintConv::FuncCtx(fake_printctx),
+  );
+
+  #[test]
+  fn apply_ctx_routes_print_conv_funcctx() {
+    assert_eq!(
+      apply_ctx(
+        &D11_PC_FUNCCTX,
+        &TagValue::Str("x".into()),
+        true,
+        &ConvContext::new("ZZ")
+      ),
+      TagValue::Str("ZZ::x".into())
+    );
+    // -n mode (PrintConv off): the FuncCtx must NOT run; raw passes through.
+    assert_eq!(
+      apply_ctx(
+        &D11_PC_FUNCCTX,
+        &TagValue::Str("x".into()),
+        false,
+        &ConvContext::new("ZZ")
+      ),
+      TagValue::Str("x".into())
+    );
+  }
+
+  #[test]
+  fn apply_ctx_funcctx_is_element_wise_over_list() {
+    // ExifTool.pm:3578-3582 — every element runs through the conv. The list
+    // arm recursion in `apply_ctx` must thread `ctx` through every element.
+    let list = TagValue::List(vec![TagValue::Str("a".into()), TagValue::Str("b".into())]);
+    let out = apply_ctx(&D11_VC_FUNCCTX, &list, true, &ConvContext::new("Latin"));
+    assert_eq!(
+      out,
+      TagValue::List(vec![
+        TagValue::Str("[Latin]a".into()),
+        TagValue::Str("[Latin]b".into()),
+      ])
+    );
   }
 }

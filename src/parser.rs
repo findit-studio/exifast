@@ -122,9 +122,12 @@ impl<'a> ParseContext<'a> {
     }
   }
 
-  /// The file bytes the parser reads (`$raf` content).
+  /// The file bytes the parser reads (`$raf` content). Returns a slice tied
+  /// to the context's lifetime `'a`, NOT `&self`, so callers may hold the
+  /// slice across `&mut self` calls such as [`Self::metadata`] /
+  /// [`Self::set_file_type`] (avoiding redundant `data.to_vec()` clones).
   #[must_use]
-  pub fn data(&self) -> &[u8] {
+  pub fn data(&self) -> &'a [u8] {
     self.data
   }
 

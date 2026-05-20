@@ -1,7 +1,7 @@
 //! The per-format tag-table abstraction. Each ported ExifTool module supplies
 //! its own static `TagTable`; the shared `convert` runtime interprets these.
 
-use crate::value::TagValue;
+use crate::{convert::ConvContext, value::TagValue};
 
 /// A value-stage conversion (ExifTool `ValueConv`). `Func` is a faithful Rust
 /// transliteration of the Perl expression.
@@ -11,8 +11,16 @@ use crate::value::TagValue;
 pub enum ValueConv {
   /// No value conversion.
   None,
-  /// Pure transformation of the raw value.
+  /// Pure transformation of the raw value (no `$self` use).
   Func(fn(&TagValue) -> TagValue),
+  /// Context-dependent transformation: Perl code refs that dereference
+  /// `$self` (e.g. `$self->Options('CharsetID3')`, `$self->Decode(...)`,
+  /// `$$self{TimeScale}`) — the D11 conversion-context API (spec §11.2).
+  /// First consumer: ID3v1::Title's `ConvertID3v1Text` (ID3.pm:897-901).
+  ///
+  /// Strictly additive sibling of [`ValueConv::Func`]: existing tag defs
+  /// using `Func` continue to compile and run unchanged.
+  FuncCtx(fn(&TagValue, &ConvContext) -> TagValue),
   /// A Perl *hash* `ValueConv` (`ref $conv eq 'HASH'` applied with
   /// `$convType eq 'ValueConv'`, ExifTool.pm conv loop). Same faithful
   /// model as a hash `PrintConv` (`AAC.pm:46` `ValueConv => \%convSampleRate`).
@@ -146,8 +154,13 @@ pub enum PrintConv {
   /// `CompressionType`: `NONE`, `sowt`, `ULAW`, …). The value may be a
   /// string or a number, mirroring ExifTool exactly.
   Hash(PrintConvHash),
-  /// Arbitrary transliterated conversion to a display value.
+  /// Arbitrary transliterated conversion to a display value (no `$self` use).
   Func(fn(&TagValue) -> TagValue),
+  /// Context-dependent PrintConv — the D11 sibling of `Func`. Used by
+  /// Perl code refs that call `$self->ConvertDateTime`, `$self->Decode`,
+  /// or any `$$self{…}` deref. Strictly additive sibling of
+  /// [`PrintConv::Func`]: existing tag defs continue unchanged.
+  FuncCtx(fn(&TagValue, &ConvContext) -> TagValue),
 }
 
 /// Definition of one tag within a table.
