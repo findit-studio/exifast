@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "AIFF_dup_name.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "AIFF",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 22050,
+  "AIFF:SampleSize": 16,
+  "AIFF:SampleRate": 22050,
+  "AIFF:Name": "Second Name",
+  "Composite:Duration": 1
+}]

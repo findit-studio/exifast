@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "ID3v2_2_invalid_PIC.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Invalid PIC frame",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "mp3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 27
+}]

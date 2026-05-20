@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "AIFC_pre1970.aifc",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFC",
+  "File:FileTypeExtension": "aifc",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:FormatVersionTime": "1904:01:01 00:00:00",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 11554,
+  "AIFF:SampleSize": 8,
+  "AIFF:SampleRate": 0,
+  "AIFF:CompressionType": "None",
+  "AIFF:CompressorName": "",
+  "AIFF:Name": "AIFC pre-1970 FormatVersionTime"
+}]

@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "AIFF_duration_float.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "aiff",
+  "File:MIMEType": "audio/x-aiff",
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 44101,
+  "AIFF:SampleSize": 8,
+  "AIFF:SampleRate": 22050.5,
+  "Composite:Duration": "2.00 s"
+}]

@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "synthetic_vorbis_specialkeys.ogg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OGG",
+  "File:FileTypeExtension": "ogg",
+  "File:MIMEType": "audio/ogg",
+  "Vorbis:Vendor": "test vendor",
+  "Vorbis:Namespace_": "ns_value",
+  "Vorbis:Avoid_": "a_val",
+  "Vorbis:IsOffset_": "i_val",
+  "Vorbis:LangInfo_": "l_val",
+  "Vorbis:TagPrefix_": "t_val",
+  "Vorbis:Preferred_": "p_val",
+  "Vorbis:Notes_": "n_val",
+  "Vorbis:TrackA_b": "track_ab",
+  "Vorbis:A_bC_dE": "multi",
+  "Vorbis:KeyA_longName": "k1",
+  "Vorbis:FooBarX_y": "k2"
+}]

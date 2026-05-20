@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "MUS_layer2.mus",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "mp3",
+  "File:MIMEType": "audio/mpeg",
+  "MPEG:MPEGAudioVersion": 1,
+  "MPEG:AudioLayer": 2,
+  "MPEG:AudioBitrate": "160 kbps",
+  "MPEG:SampleRate": 44100,
+  "MPEG:ChannelMode": "Joint Stereo",
+  "MPEG:ModeExtension": "Bands 4-31",
+  "MPEG:CopyrightFlag": true,
+  "MPEG:OriginalMedia": true,
+  "MPEG:Emphasis": "None"
+}]

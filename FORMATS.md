@@ -20,16 +20,17 @@ marked `ffmpeg-gen` (we generate per spec D6).
 |--:|---|---|--:|:--:|---|---|:--:|:--:|---|
 | 0 | **Engine** (reader/filetype/tagtable/value/convert/serialize) | *(new Rust)* | — | 1 | — | n/a | ✅ | — | — |
 | 1 | **AAC** | AAC.pm | 177 | 2 | Engine | `AAC.aac` | ✅ | clean | — |
-| 2 | **ID3** *(infra; also completes **MP3**)* | ID3.pm | 1775 | 2 | Engine | `MP3.mp3` | ⬜ | — | — |
-| 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif` | ⬜ | — | — |
+| 2 | **ID3** *(infra; also completes **MP3**)* | ID3.pm | 1775 | 2 | Engine | `ID3v2_2.mp3`, `ID3v1.mp3`, `ID3v2_3.mp3`, `ID3v2_4.mp3` (+ adversarial) | ✅ | clean | — |
+| 2a | **MPEG audio frame** *(MP3 subset; ID3 not required)* | MPEG.pm (audio) | 735 | 2 | Engine | `MP3.mp3` (ID3-free) | ✅ | clean | — |
+| 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif`, `AIFC.aifc`, `AIFF_short.aif`, `AIFF_huge.aif` | ✅ | clean | — |
 | 4 | **MPC** | MPC.pm | 156 | 2 | Engine, ID3/APE tags | `APE.mpc` | ⬜ | — | — |
-| 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape` | ⬜ | — | — |
+| 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape`, `APE_old.ape` | ✅ | clean | — |
 | 6 | **WavPack** (WV/WVP) | WavPack.pm | 144 | 2 | Engine, ID3/APE tags | `WavPack.wv` + adversarial | ✅ | clean | — |
-| 7 | **DSF** | DSF.pm | 138 | 2 | Engine, ID3 | ⚠️ ffmpeg-gen `DSF.dsf` | ⬜ | — | — |
+| 7 | **DSF** | DSF.pm | 138 | 2 | Engine, ID3 | ⚠️ ffmpeg-gen `DSF.dsf` | ✅ | clean | — |
 | 8 | **FLAC** | FLAC.pm | 321 | 2 | Engine, ID3, Vorbis | `FLAC.flac` | ✅ | clean | — |
-| 9 | **Ogg + Vorbis** (OGG/OGV/OPUS) | Ogg.pm + Vorbis.pm | 496 | 2 | Engine, FLAC (ogg-flac) | `Vorbis.ogg`, `Opus.opus`, `FLAC.ogg` | ⬜ | — | — |
-| 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ⬜ | — | — |
-| 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ⬜ | — | — |
+| 9 | **Ogg + Vorbis** (OGG/OGV/OPUS) | Ogg.pm + Vorbis.pm | 496 | 2 | Engine, FLAC (ogg-flac) | `Vorbis.ogg`, `synthetic_opus_minimal.opus`, `bad.ogg` | ✅ | clean | — |
+| 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ✅ | clean | — |
+| 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ✅ | clean | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |
 | 14 | **GPS** *(infra)* | GPS.pm | 641 | 3 | Engine, Exif | via containers | ⬜ | — | — |

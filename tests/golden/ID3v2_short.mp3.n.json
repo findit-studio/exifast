@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "ID3v2_short.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Short ID3 header",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 0
+}]

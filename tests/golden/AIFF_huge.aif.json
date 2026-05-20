@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "AIFF_huge.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Skipping large Common chunk (> 100 MB)",
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "aiff",
+  "File:MIMEType": "audio/x-aiff"
+}]

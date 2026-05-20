@@ -8,12 +8,15 @@
 #![forbid(unsafe_code)]
 
 pub mod bitstream;
+pub mod charset;
 pub mod convert;
+pub mod datetime;
 pub mod error;
 pub mod filetype;
 pub mod formats;
 pub mod jsondiff;
 pub mod parser;
+pub mod processbinarydata;
 pub mod reader;
 pub mod serialize;
 pub mod tagtable;

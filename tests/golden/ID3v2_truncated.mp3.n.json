@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "ID3v2_truncated.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Truncated ID3 data",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "MP3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 0
+}]

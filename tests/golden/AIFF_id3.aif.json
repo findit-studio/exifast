@@ -1,0 +1,14 @@
+[{
+  "SourceFile": "AIFF_id3.aif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AIFF",
+  "File:FileTypeExtension": "aiff",
+  "File:MIMEType": "audio/x-aiff",
+  "File:ID3Size": 31,
+  "AIFF:NumChannels": 1,
+  "AIFF:NumSampleFrames": 22050,
+  "AIFF:SampleSize": 16,
+  "AIFF:SampleRate": 22050,
+  "ID3v2_3:Title": "Test Title",
+  "Composite:Duration": "1.00 s"
+}]

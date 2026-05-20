@@ -1,0 +1,22 @@
+[{
+  "SourceFile": "ape_with_id3v1_trailer.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "File:ID3Size": 128,
+  "MAC:APEVersion": 3.97,
+  "MAC:CompressionLevel": 2000,
+  "MAC:Channels": 2,
+  "MAC:SampleRate": 44100,
+  "MAC:TotalFrames": 100,
+  "MAC:FinalFrameBlocks": 0,
+  "APE:Artist": "ApeId3v1Artist",
+  "APE:Title": "ApeId3v1Title",
+  "ID3v1:Title": "Id3v1AfterApe",
+  "ID3v1:Artist": "OldArtist",
+  "ID3v1:Album": "OldAlbum",
+  "ID3v1:Year": 1999,
+  "ID3v1:Comment": "ID3v1Cmt",
+  "ID3v1:Genre": 8
+}]

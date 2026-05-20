@@ -1,0 +1,72 @@
+//! Faithful port of `%Image::ExifTool::ID3::v2_3` (ID3.pm:673-690) —
+//! v2.3-only frames plus the `%id3v2_common` inclusion. 10-byte frame
+//! header (`a4Nn`); length is a normal big-endian 32-bit integer.
+
+use crate::{
+  formats::id3::v2_common::common_v2_3,
+  tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
+};
+
+// v2.3-only frames (ID3.pm:681-690).
+static IPLS: TagDef = TagDef::new(
+  "InvolvedPeople",
+  "ID3v2_3",
+  ValueConv::None,
+  PrintConv::None,
+);
+static TDAT: TagDef = TagDef::new("Date", "ID3v2_3", ValueConv::None, PrintConv::None);
+static TIME: TagDef = TagDef::new("Time", "ID3v2_3", ValueConv::None, PrintConv::None);
+static TORY: TagDef = TagDef::new(
+  "OriginalReleaseYear",
+  "ID3v2_3",
+  ValueConv::None,
+  PrintConv::None,
+);
+static TRDA: TagDef = TagDef::new(
+  "RecordingDates",
+  "ID3v2_3",
+  ValueConv::None,
+  PrintConv::None,
+);
+static TSIZ: TagDef = TagDef::new("Size", "ID3v2_3", ValueConv::None, PrintConv::None);
+static TYER: TagDef = TagDef::new("Year", "ID3v2_3", ValueConv::None, PrintConv::None);
+
+fn v2_3_get(id: TagId) -> Option<&'static TagDef> {
+  // common table first (faithful Perl `%id3v2_common` is included before the
+  // v2.3-only entries in `%v2_3`, but those keys are unique so order is
+  // immaterial for correctness — only for tidy lookup).
+  if let Some(def) = common_v2_3(id) {
+    return Some(def);
+  }
+  match id {
+    TagId::Str("IPLS") => Some(&IPLS),
+    TagId::Str("TDAT") => Some(&TDAT),
+    TagId::Str("TIME") => Some(&TIME),
+    TagId::Str("TORY") => Some(&TORY),
+    TagId::Str("TRDA") => Some(&TRDA),
+    TagId::Str("TSIZ") => Some(&TSIZ),
+    TagId::Str("TYER") => Some(&TYER),
+    _ => None,
+  }
+}
+
+/// `%Image::ExifTool::ID3::v2_3` (ID3.pm:673).
+pub static ID3V2_3_MAIN: TagTable = TagTable::new("ID3", v2_3_get);
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn v2_3_specific_and_common_resolve() {
+    let g = ID3V2_3_MAIN.get();
+    // Common.
+    assert_eq!(g(TagId::Str("TIT2")).unwrap().name(), "Title");
+    assert_eq!(g(TagId::Str("TIT2")).unwrap().group1(), "ID3v2_3");
+    // v2.3-only.
+    assert_eq!(g(TagId::Str("TYER")).unwrap().name(), "Year");
+    assert_eq!(g(TagId::Str("TYER")).unwrap().group1(), "ID3v2_3");
+    assert_eq!(g(TagId::Str("IPLS")).unwrap().name(), "InvolvedPeople");
+    assert!(g(TagId::Str("TDRC")).is_none()); // v2.4-only
+  }
+}

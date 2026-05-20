@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "DSF.dsf",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DSF",
+  "File:FileTypeExtension": "DSF",
+  "File:MIMEType": "audio/x-dsf",
+  "File:FormatVersion": 1,
+  "File:FormatID": 0,
+  "File:ChannelType": 2,
+  "File:ChannelCount": 2,
+  "File:SampleRate": 2822400,
+  "File:BitsPerSample": 1,
+  "File:SampleCount": 2822400,
+  "File:BlockSize": 4096
+}]

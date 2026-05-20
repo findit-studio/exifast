@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "ogg_vorbis_trailing_garbage.ogg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OGG",
+  "File:FileTypeExtension": "ogg",
+  "File:MIMEType": "audio/ogg",
+  "Vorbis:Vendor": "test"
+}]
