@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "DSF.dsf",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DSF",
+  "File:FileTypeExtension": "dsf",
+  "File:MIMEType": "audio/x-dsf",
+  "File:FormatVersion": 1,
+  "File:FormatID": "DSD Raw",
+  "File:ChannelType": "Stereo (Left, Right)",
+  "File:ChannelCount": 2,
+  "File:SampleRate": 2822400,
+  "File:BitsPerSample": 1,
+  "File:SampleCount": 2822400,
+  "File:BlockSize": 4096
+}]

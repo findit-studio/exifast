@@ -56,6 +56,25 @@ fn wavpack_adversarial_conformance() {
 }
 
 #[test]
+fn dsf_conformance() {
+  // FORMATS.md row 7. Faithful DSF.pm port (1:1 of ExifTool 13.58
+  // lib/Image/ExifTool/DSF.pm:55-99). The fixture is a synthesized minimal
+  // valid DSF (no bundled `t/images/DSF.dsf`); see plan §3.1 for layout.
+  check("DSF.dsf", "DSF.dsf.json", true);
+  check("DSF.dsf", "DSF.dsf.n.json", false);
+}
+
+#[test]
+fn dsf_short_fmt_warning_conformance() {
+  // Pins DSF.pm:71-72 Warn + `return 1`: a DSF whose `fmtLen` violates the
+  // `>12 && <1000` guard (here `fmtLen=8`) still emits File:* via
+  // `SetFileType` (DSF.pm:64 runs BEFORE the guard, DSF.pm:67) plus the
+  // ExifTool:Warning, and NO fmt-chunk payload tags.
+  check("DSF_short.dsf", "DSF_short.dsf.json", true);
+  check("DSF_short.dsf", "DSF_short.dsf.n.json", false);
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);
