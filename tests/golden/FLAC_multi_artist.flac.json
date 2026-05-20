@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "FLAC_multi_artist.flac",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLAC",
+  "File:FileTypeExtension": "flac",
+  "File:MIMEType": "audio/flac",
+  "FLAC:BlockSizeMin": 4608,
+  "FLAC:BlockSizeMax": 4608,
+  "FLAC:FrameSizeMin": 16777215,
+  "FLAC:FrameSizeMax": 0,
+  "FLAC:SampleRate": 8000,
+  "FLAC:Channels": 2,
+  "FLAC:BitsPerSample": 8,
+  "FLAC:TotalSamples": 0,
+  "FLAC:MD5Signature": "d41d8cd98f00b204e9800998ecf8427e",
+  "Vorbis:Vendor": "exifast-test",
+  "Vorbis:Artist": ["Alice","Bob"],
+  "Vorbis:Title": "Multi"
+}]
