@@ -282,10 +282,15 @@ pub enum AnyParser {
   /// Red R3D (Phase F1 — Redcode video).
   #[cfg(feature = "red")]
   R3D(crate::formats::red::ProcessR3D),
-  // Phase F2 adds: Id3.
+  /// ID3 directory parser (Phase F2 — ID3v1 + ID3v2 unified).
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::ProcessId3),
+  /// MP3 wrapper parser (Phase F2 — ID3 + audio-frame chain).
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::ProcessMp3),
   // Phase F3 adds: Ape, Dsf, Aiff, Flac.
   // Phase F4 adds: Ogg, MpegAudio.
-  // Phase F5 adds: Mp3, Mpc, WavPack.
+  // Phase F5 adds: Mpc, WavPack.
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -319,6 +324,18 @@ pub enum AnyMeta<'a> {
   /// Red R3D (Phase F1).
   #[cfg(feature = "red")]
   R3d(crate::formats::red::R3dMeta<'a>),
+  /// ID3 directory metadata (Phase F2). The [`crate::formats::id3::ProcessId3`]
+  /// `FormatParser` impl produces `Id3Meta<'static>` (Phase E
+  /// `into_static` pragma); this arm carries the `<'a>` projection so the
+  /// closed enum compiles at any caller lifetime.
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::Id3Meta<'a>),
+  /// MP3 wrapper metadata (Phase F2). Wraps [`crate::formats::id3::Id3Meta`]
+  /// plus borrowed MPEG-audio / APE-trailer passthrough slices; the typed
+  /// MPEG-audio / APE arms land in Phase F3/F4 (per
+  /// `docs/tracking.md` F2 ID3 integration notes).
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::Mp3Meta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
@@ -348,6 +365,10 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Aa(m) => m.sink(print_conv, out),
       #[cfg(feature = "red")]
       AnyMeta::R3d(m) => m.sink(print_conv, out),
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(m) => m.sink(print_conv, out),
     }
   }
 }
