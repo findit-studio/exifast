@@ -56,6 +56,100 @@ fn wavpack_adversarial_conformance() {
 }
 
 #[test]
+fn mp3_conformance() {
+  // ID3-free MPEG-1 Layer III audio frame at 128 kbps / 44.1 kHz / Joint
+  // Stereo (a single 417-byte frame: 4-byte header 0xfffb904c + 413 zero
+  // bytes of audio payload). The bundled `perl exiftool -j -G1 -struct`
+  // emits an additional `"Composite:Duration": "0.03 s (approx)"` (and
+  // `0.0260625` under `-n`); both goldens here EXCLUDE that key because
+  // composite tags are not yet ported (`%MPEG::Composite`, MPEG.pm:385-
+  // 432 — a forward item tracked in the module header). The capture
+  // suppresses it via `--Composite:Duration`.
+  check("MP3.mp3", "MP3.mp3.json", true);
+  check("MP3.mp3", "MP3.mp3.n.json", false);
+}
+
+#[test]
+fn vbr_xing_lame_mp3_conformance() {
+  // Synthesized 504-byte VBR Xing+LAME MP3. Pins the MPEG.pm:501-578 tail:
+  // `%MPEG::Xing` (VBRFrames=1000, VBRBytes=200_000, VBRScale=78, Encoder=
+  // "LAME3.99r", LameVBRQuality=2, LameQuality=2) and `%MPEG::Lame`
+  // (LameMethod=4→"VBR (new/mtrh)", LameLowPassFilter=160→"16 kHz",
+  // LameBitrate=128→"128 kbps", LameStereoMode=3→"Joint Stereo"). The
+  // bundled `perl exiftool -j -G1 -struct` also emits `Composite:
+  // AudioBitrate` (61.2 kbps under -j, 61250 under -n); both goldens
+  // EXCLUDE that key (Composite tags are not yet ported — `%MPEG::
+  // Composite` forward item) just as `mp3_conformance` excludes
+  // `Composite:Duration`. The capture suppresses it via
+  // `--Composite:AudioBitrate`.
+  check("VBR.mp3", "VBR.mp3.json", true);
+  check("VBR.mp3", "VBR.mp3.n.json", false);
+}
+
+#[test]
+fn vbr_no_vbrscale_mp3_conformance() {
+  // F2 (Codex R2): Xing+LAME MP3 with flags = 0x13 — VBRFrames | VBRBytes |
+  // LAME, deliberately OMITTING the VBRScale flag bit (0x08). MPEG.pm:510
+  // declares `my $vbrScale;` (undef); MPEG.pm:528-533 only assigns it when
+  // `$flags & 0x08`. The LAME-quality calculation at MPEG.pm:563-565 then
+  // evaluates `undef <= 100` in numeric context — Perl promotes undef to 0
+  // with a runtime warning, so the calc runs unconditionally on the encoder
+  // version: `int((100 - 0) / 10) = 10` (LameVBRQuality) and `(100 - 0) %
+  // 10 = 0` (LameQuality). Bundled `perl exiftool -j -G1 -struct` confirms:
+  // `LameVBRQuality=10, LameQuality=0` (with three "Use of uninitialized
+  // value $vbrScale ..." warnings to STDERR). Pins the undef-as-zero
+  // semantics — without the `vbr_scale.unwrap_or(0)` fallback in
+  // `parse_xing_lame`'s LAME-quality arm (MPEG.pm:563-565), exifast omits
+  // both LAME quality tags and this assertion fails.
+  check("VBR_no_vbrscale.mp3", "VBR_no_vbrscale.mp3.json", true);
+  check("VBR_no_vbrscale.mp3", "VBR_no_vbrscale.mp3.n.json", false);
+}
+
+#[test]
+fn mus_layer2_conformance() {
+  // Codex R3: 5-byte MUS fixture (`\xff\xfd\x90\x4c\x00`) = MPEG-1 Layer II
+  // sync at 160 kbps / 44.1 kHz / Joint Stereo. Bundled `ID3::ProcessMP3`
+  // dispatches `.mus` files through `ParseMPEGAudio($et, \$buff, $mp3)`
+  // with `$mp3 = ($ext eq 'MUS') ? 0 : 1` (ID3.pm:1715-1717), so the
+  // Layer-III-only check at MPEG.pm:485 is BYPASSED for `.mus` ⇒ Layer II
+  // is accepted. Bundled `perl exiftool -j -G1 -struct
+  // --System:all --Composite:all` emits `MPEG:AudioLayer=2`. exifast's
+  // `ProcessMp3::process` must thread the caller `$mp3` flag through (NOT
+  // recompute it from `ctx.file_type()=="MP3"`); without that, the Layer
+  // III gate falsely rejects this fixture. Pins ID3.pm:1715-1717 +
+  // MPEG.pm:485 caller-flag semantics.
+  check("MUS_layer2.mus", "MUS_layer2.mus.json", true);
+  check("MUS_layer2.mus", "MUS_layer2.mus.n.json", false);
+}
+
+#[test]
+fn junk_past_8k_mp3_conformance() {
+  // F1 (Codex R1): 8200 bytes of pseudo-random non-`\xff` filler followed
+  // by a valid Layer III header at offset 8200. Bundled ExifTool's
+  // `ID3::ProcessMP3` (ID3.pm:1704) reads only the first 8192 bytes; the
+  // header at offset 8200 is outside the scan window, so the audio-frame
+  // sync scan finds nothing ⇒ `ParseMPEGAudio` returns 0 ⇒ post-loop
+  // `File format error` (ExifTool.pm:3093). exifast's bounded-scan
+  // wrapper (`ProcessMp3::process` → ID3.pm:1684-1729) must match.
+  // Without the bound, the unbounded scan would latch onto the sync byte
+  // at offset 8200 and falsely accept ⇒ this test would fail.
+  check("JunkPast8k.mp3", "JunkPast8k.mp3.json", true);
+  check("JunkPast8k.mp3", "JunkPast8k.mp3.n.json", false);
+}
+
+#[test]
+fn malformed_mp3_error_conformance() {
+  // `.mp3` extension + 144 bytes that all fail the audio-frame header
+  // validation (either sync-bit reject or bad bitrate). `MP3` is a known
+  // type ⇒ post-loop ExifTool:Error finalizes as `File format error`
+  // (ExifTool.pm:3093). Pins that `parse_mpeg_audio` returns false on
+  // pure garbage AND that no File:* tags slip through (no SetFileType
+  // was called).
+  check("bad.mp3", "bad.mp3.json", true);
+  check("bad.mp3", "bad.mp3.n.json", false);
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);

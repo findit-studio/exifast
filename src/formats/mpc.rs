@@ -1,8 +1,10 @@
 //! Faithful port of `Image::ExifTool::MPC` (lib/Image/ExifTool/MPC.pm).
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → `crate::bitstream`.
 
-use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv};
-use crate::value::TagValue;
+use crate::{
+  tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
+  value::TagValue,
+};
 
 // MPC.pm:28 — TotalFrames (Bit032-063 = 32-bit integer): no PrintConv.
 static TOTAL_FRAMES: TagDef = TagDef::new("TotalFrames", "MPC", ValueConv::None, PrintConv::None);
@@ -288,8 +290,10 @@ impl crate::parser::FormatParser for ProcessMpc {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::parser::{FormatParser, ParseContext};
-  use crate::value::Metadata;
+  use crate::{
+    parser::{FormatParser, ParseContext},
+    value::Metadata,
+  };
 
   #[test]
   fn table_and_keys_are_faithful() {

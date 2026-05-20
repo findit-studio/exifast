@@ -140,6 +140,16 @@ impl<'a> ParseContext<'a> {
     self.parent_type
   }
 
+  /// ExifTool's `$$self{FILE_TYPE}` (ExifTool.pm:3036/9682): the detected
+  /// candidate file type carried by this context. Read by format parsers
+  /// that branch on the type (e.g. MPEG.pm:485 `$mp3` flag — the audio
+  /// scan tightens validation to Layer III when the caller has narrowed
+  /// to `MP3`).
+  #[must_use]
+  pub fn file_type(&self) -> &str {
+    self.file_type
+  }
+
   /// ExifTool's `$$self{FILE_EXT}` (ExifTool.pm:2966): the uppercased,
   /// `TIF`→`TIFF` file extension (or `None` for a dotless name). Read as
   /// `$ext` by `SetFileType` (ExifTool.pm:9683).
@@ -160,6 +170,21 @@ impl<'a> ParseContext<'a> {
   #[must_use]
   pub fn metadata(&mut self) -> &mut Metadata {
     self.meta
+  }
+
+  /// Split-borrow accessor: returns `(&[u8], &mut Metadata)` simultaneously
+  /// so a parser can slice into [`Self::data`] and call into a metadata-
+  /// pushing sub-parser (e.g. `parse_xing_lame`, `process_vorbis_comments`,
+  /// `bitstream::process_bit_stream`) WITHOUT cloning the slice into a `Vec`.
+  ///
+  /// Required because [`Self::data`] reborrows `&self` while
+  /// [`Self::metadata`] reborrows `&mut self` — calling both in sequence
+  /// forces the caller to `.to_vec()` the slice. The split borrow is sound
+  /// because `data` and `meta` are disjoint fields (the `&[u8]` does NOT
+  /// alias `&mut Metadata`).
+  #[must_use]
+  pub fn data_and_metadata(&mut self) -> (&[u8], &mut Metadata) {
+    (self.data, self.meta)
   }
 
   /// Faithful `SetFileType` (ExifTool.pm:9677-9706), read path. Pushes

@@ -20,9 +20,11 @@
 //!   FLAC.pm:59-82  (%Image::ExifTool::FLAC::StreamInfo)
 //!   FLAC.pm:239-280 (ProcessFLAC — magic + metadata-block-header structure)
 
-use exifast::bitstream::{process_bit_stream, BitOrder};
-use exifast::tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv};
-use exifast::value::{Metadata, TagValue};
+use exifast::{
+  bitstream::{process_bit_stream, BitOrder},
+  tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
+  value::{Metadata, TagValue},
+};
 
 // ---------------------------------------------------------------------------
 // Faithful %FLAC::StreamInfo table (FLAC.pm:59-82)

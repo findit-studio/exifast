@@ -6,9 +6,79 @@
 
 use crate::{
   convert::apply,
-  tagtable::{TagId, TagTable},
+  tagtable::{RawConv, TagDef, TagId, TagTable},
   value::{format_g, Group, Metadata, TagValue},
 };
+
+/// Per-frame scalar state populated by [`RawConv::SetFrameState`] writes and
+/// read by sibling tags' Condition arms (MPEG.pm:27/36/202 + 47/71/.../224).
+/// Only `&'static str` slot names are valid (the faithful Perl keys, e.g.
+/// `"MPEG_Vers"`); a small set of dedicated `Option<i64>` fields is
+/// sufficient — MPEG.pm uses 3 slots, and any future format will be
+/// additive (add a new field below + extend the `get`/`set` `match` arms
+/// without changing the public API). All slots default to `None` ("never
+/// set" = Perl `undef`, which is treated as a Condition mismatch by the
+/// chooser).
+///
+/// Slots are flat and additive on purpose: no allocation, no hashing, no
+/// growth beyond the dedicated field set — `process_bit_stream_cond` only
+/// ever touches the field a tag's `RawConv::SetFrameState(slot)` names, so
+/// an MPEG-only file never touches a hypothetical Ogg slot.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameState {
+  // Add a slot here when a faithful port first needs it.
+  // MPEG.pm:27   RawConv => '$self->{MPEG_Vers} = $val'
+  mpeg_vers: Option<i64>,
+  // MPEG.pm:36   RawConv => '$self->{MPEG_Layer} = $val'
+  mpeg_layer: Option<i64>,
+  // MPEG.pm:202  RawConv => '$self->{MPEG_Mode} = $val'
+  mpeg_mode: Option<i64>,
+}
+
+impl FrameState {
+  /// Construct a freshly-empty state — every slot `None` ("never set", i.e.
+  /// Perl `$$self{X}` being `undef`).
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      mpeg_vers: None,
+      mpeg_layer: None,
+      mpeg_mode: None,
+    }
+  }
+
+  /// Read slot `slot`. Returns `None` if the slot has never been written
+  /// (Perl `$$self{X}` being `undef`) OR if `slot` is not a known name (a
+  /// faithful port should NEVER hit the latter — it indicates a typo in a
+  /// `RawConv::SetFrameState(slot)` or a Condition closure).
+  #[must_use]
+  pub const fn get(&self, slot: &str) -> Option<i64> {
+    match slot.as_bytes() {
+      b"MPEG_Vers" => self.mpeg_vers,
+      b"MPEG_Layer" => self.mpeg_layer,
+      b"MPEG_Mode" => self.mpeg_mode,
+      _ => None,
+    }
+  }
+
+  /// Write slot `slot` with the raw integer value (Perl
+  /// `$$self{X} = $val`). Unknown slots are ignored (no-op) — a faithful
+  /// port should never hit that branch; it indicates a typo in a
+  /// `RawConv::SetFrameState(slot)`.
+  fn set(&mut self, slot: &str, val: i64) {
+    match slot.as_bytes() {
+      b"MPEG_Vers" => self.mpeg_vers = Some(val),
+      b"MPEG_Layer" => self.mpeg_layer = Some(val),
+      b"MPEG_Mode" => self.mpeg_mode = Some(val),
+      _ => {
+        // Debug-only signal so typos in `RawConv::SetFrameState(slot)`
+        // surface during tests. Release behavior unchanged (silent
+        // no-op, matching Perl's silent failure on a malformed key).
+        debug_assert!(false, "FrameState::set: unknown slot {slot:?}");
+      }
+    }
+  }
+}
 
 /// Byte order of the bit stream (FLAC.pm `GetByteOrder()`; ExifTool global
 /// default is 'MM' / big-endian — AAC never calls `SetByteOrder`).
@@ -47,24 +117,21 @@ fn parse_bits(key: &str) -> Option<(usize, usize)> {
   Some((b1, b2))
 }
 
-/// Faithful port of `FLAC::ProcessBitStream` (FLAC.pm:158-233).
-/// When a tag has no `Format` key, its bits are accumulated into an unsigned
-/// integer (FLAC.pm:179-222). When `Format` IS set (e.g. `Format => 'undef'`),
-/// the raw `Size = i2 - i1 + 1` bytes at `Start = i1` are emitted as
-/// `TagValue::Bytes` and the integer path is skipped (FLAC.pm:179-181, 224-229).
-/// `bit_keys` is the module's statically-known, sorted list of `Bit<a>-<b>`
-/// keys (ExifTool does `sort keys %$tagTablePtr`; Rust statics are not
-/// enumerable, so the format module supplies the equivalent sorted slice).
+/// Faithful port of the per-key extraction step in
+/// `FLAC::ProcessBitStream` (FLAC.pm:158-233). Returns:
 ///
-/// `bit_keys` MUST be in ascending bit-offset order (ExifTool's `sort keys`
-/// works because all known tables use zero-padded 3-digit offsets, e.g.
-/// `Bit016-017`). The `i2 >= dirLen` early-exit (FLAC.pm:177) assumes this;
-/// out-of-order keys would silently skip valid later fields. Any key with a
-/// descending range (`b1 > b2`) is a table-author error and is skipped
-/// (no tag emitted) rather than spinning in the shift-down loop; this covers
-/// both cross-byte keys (i1 > i2) and same-byte keys (i1 == i2, where the
-/// mask computes to 0 and the shift-down `while last_mask & 0x01 == 0`
-/// would loop forever).
+/// - `Some(Ok(val))` — the field at bits `b1..=b2` was extracted (UV→NV
+///   faithful, see below).
+/// - `Some(Err(()))` — the key is malformed (descending `b1 > b2`); the
+///   caller should skip it without emitting.
+/// - `None` — the field would read past `dir_len` (FLAC.pm:177 `last`);
+///   the caller MUST break out of its iteration loop.
+///
+/// When `def.format()` is `Some(_)` (FLAC.pm:179-181 `Format` key set), the
+/// raw `Size = i2 - i1 + 1` bytes at `Start = i1` are returned as
+/// `TagValue::Bytes` and the integer-accumulation path is skipped. When
+/// `def.format()` is `None`, the bits are accumulated into an unsigned
+/// integer per FLAC.pm:182-222.
 ///
 /// **No-`Format` integer accumulation — faithful Perl scalar (UV→NV)
 /// semantics:** Perl's `$val = $val * 256 + N` stays an exact UV
@@ -77,6 +144,7 @@ fn parse_bits(key: &str) -> Option<(usize, usize)> {
 /// f64 /2.0 (always exact for finite values). No `>16-byte` guard:
 /// Perl loses precision past 53 bits silently — we do the same in NV
 /// mode (acceptable because Perl does too). After the shift-down:
+///
 /// - u64 mode, val ≤ `i64::MAX` ⇒ `TagValue::I64` (unchanged for all
 ///   currently-ported fields: AAC ≤ 2 bytes, FLAC `TotalSamples` 36-bit).
 /// - u64 mode, val > `i64::MAX` ⇒ `TagValue::Str(exact_decimal)` — the
@@ -85,6 +153,147 @@ fn parse_bits(key: &str) -> Option<(usize, usize)> {
 /// - NV (f64) mode ⇒ `TagValue::Str(format_g(val, 15))` — Perl's default
 ///   `%.15g` NV stringification (e.g. `"4.72236648286965e+21"` for
 ///   9-byte all-0xFF, byte-exact vs the bundled Perl oracle).
+#[allow(clippy::result_unit_err)]
+fn extract_field(
+  data: &[u8],
+  b1: usize,
+  b2: usize,
+  order: BitOrder,
+  def: &TagDef,
+) -> Option<Result<TagValue, ()>> {
+  let dir_len = data.len();
+  let (i1, i2) = (b1 / 8, b2 / 8); // FLAC.pm:175
+  let (f1, f2) = (b1 % 8, b2 % 8); // FLAC.pm:176
+  if i2 >= dir_len {
+    return None; // FLAC.pm:177 `last if $i2 >= $dirLen` — break in caller
+  }
+  // A descending range (b1 > b2) is a malformed key — skip (no tag).
+  if b1 > b2 {
+    return Some(Err(()));
+  }
+  let v = if def.format().is_some() {
+    // TEMPLATE: copy this arm for any tag with Format set (e.g. FLAC StreamInfo MD5Signature).
+    // Format IS set: `$val` stays undef; HandleTag reads raw bytes.
+    // FLAC.pm:224-229: `Start => $dirStart + $i1`, `Size => $i2 - $i1 + 1`
+    // (dirStart=0, Start=i1, inclusive end=i2). The `i2 >= dir_len` break
+    // above guarantees i2 < data.len() and the `b1 > b2` continue above
+    // guarantees i1 <= i2, so this inclusive slice is always in-bounds.
+    TagValue::Bytes(data[i1..=i2].to_vec())
+  } else {
+    // Format NOT set: unsigned-integer accumulation (FLAC.pm:182-222).
+    // Faithful Perl scalar: `$val` starts as UV (here: u64) and
+    // auto-promotes to NV (here: f64) when the next `*256 + byte` would
+    // overflow u64. Once NV, every subsequent operation stays NV
+    // (Perl scalars don't downgrade). No `>16-byte` guard — Perl's NV
+    // simply loses precision past ~15 significant digits; we mirror it.
+    enum Acc {
+      // u64 mode (Perl UV). The exact integer value.
+      U(u64),
+      // f64 mode (Perl NV). Auto-promoted after a u64 overflow.
+      F(f64),
+    }
+    // Multiply-and-add `acc * 256 + add` with UV→NV promotion on
+    // overflow. `add` is at most 255 (it is `mask & byte`).
+    fn mul256_add(acc: Acc, add: u8) -> Acc {
+      match acc {
+        Acc::U(v) => match v.checked_mul(256).and_then(|x| x.checked_add(add as u64)) {
+          Some(n) => Acc::U(n),
+          // Perl `$val = $val * 256 + N` auto-promotes to NV the moment
+          // u64 cannot hold the result. From this byte on, accumulate
+          // in f64 (matching Perl's NV path).
+          None => Acc::F(v as f64 * 256.0 + add as f64),
+        },
+        Acc::F(v) => Acc::F(v * 256.0 + add as f64),
+      }
+    }
+    let mut acc = Acc::U(0);
+    let mut last_mask: u32 = 0;
+    let byte = |i: usize| data[i] as u32; // Get8u($dataPt,$i+$dirStart), dirStart=0
+    match order {
+      BitOrder::Mm => {
+        // FLAC.pm:185-199: `if ($byteOrder eq 'MM')` — loop ascending i1..=i2
+        // (comment says "loop from high byte to low byte"; bit-0 is the MSB so
+        // i1 carries the most-significant byte of the extracted field).
+        for i in i1..=i2 {
+          let mut mask: u32 = 0xff;
+          if i == i1 && f1 != 0 {
+            // mask off high bits in first word (0 is high bit) (FLAC.pm:190-191)
+            for b in (8 - f1)..=7 {
+              mask ^= 1 << b;
+            }
+          }
+          if i == i2 && f2 < 7 {
+            // mask off low bits in last word (7 is low bit) (FLAC.pm:194-195)
+            for b in 0..=(6 - f2) {
+              mask ^= 1 << b;
+            }
+          }
+          let add = (mask & byte(i)) as u8; // FLAC.pm:197 (mask & Get8u)
+          acc = mul256_add(acc, add);
+          last_mask = mask;
+        }
+      }
+      BitOrder::Ii => {
+        // FLAC.pm:200-217: `else` — loop descending i2..=i1 (little-endian
+        // bit streams; comment: "FLAC is big-endian, but support little-endian
+        // bit streams so this routine can be used by other modules").
+        for i in (i1..=i2).rev() {
+          let mut mask: u32 = 0xff;
+          if i == i1 && f1 != 0 {
+            // mask off low bits in first word (0 is low bit) (FLAC.pm:207-208)
+            for b in 0..f1 {
+              mask ^= 1 << b;
+            }
+          }
+          if i == i2 && f2 < 7 {
+            // mask off high bits in last word (7 is high bit) (FLAC.pm:211-212)
+            for b in (f2 + 1)..=7 {
+              mask ^= 1 << b;
+            }
+          }
+          let add = (mask & byte(i)) as u8; // FLAC.pm:214 (mask & Get8u)
+          acc = mul256_add(acc, add);
+          last_mask = mask;
+        }
+      }
+    }
+    // FLAC.pm:219-222 shift word down until low bit is in position 0.
+    // Perl `$val /= 2` is integer-exact on a UV with a 0 low bit (the
+    // last-byte mask AND clears that bit, so `val` is divisible) and
+    // exact-exponent-decrement on an NV. We match: u64 `/= 2` (integer
+    // division; exact because the low bit is 0 by construction) and
+    // f64 `/= 2.0` (exact for finite values: just decrements the
+    // exponent).
+    while last_mask & 0x01 == 0 {
+      acc = match acc {
+        Acc::U(v) => Acc::U(v / 2),
+        Acc::F(v) => Acc::F(v / 2.0),
+      };
+      last_mask >>= 1;
+    }
+    match acc {
+      // u64 mode ≤ i64::MAX ⇒ TagValue::I64 (unchanged for all ported
+      // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit).
+      Acc::U(v) if v <= i64::MAX as u64 => TagValue::I64(v as i64),
+      // u64 mode > i64::MAX ⇒ exact decimal string (Perl UV stringifies
+      // as exact integer); the serializer's number gate quotes ≥16-digit
+      // bare integers, exactly as ExifTool -j emits a big unsigned int.
+      Acc::U(v) => TagValue::Str(v.to_string().into()),
+      // NV (f64) mode ⇒ Perl's default `%.15g` NV stringification (e.g.
+      // 9-byte all-0xFF ⇒ "4.72236648286965e+21", byte-exact oracle).
+      Acc::F(v) => TagValue::Str(format_g(v, 15).into()),
+    }
+  };
+  Some(Ok(v))
+}
+
+/// Faithful port of `FLAC::ProcessBitStream` (FLAC.pm:158-233) — the
+/// **unconditional** entry point (no Condition arms, no RawConv side
+/// effects). Used by AAC, FLAC StreamInfo, etc. (formats whose tag table
+/// is a flat string-keyed hash with at most one def per key).
+///
+/// For tag tables with Condition arms or RawConv side-effects (e.g. MPEG
+/// audio), use [`process_bit_stream_cond`] instead.
 pub fn process_bit_stream(
   data: &[u8],
   order: BitOrder,
@@ -93,158 +302,104 @@ pub fn process_bit_stream(
   into: &mut Metadata,
   print_conv_enabled: bool,
 ) {
-  let dir_len = data.len(); // DirStart=0, DirLen=length($$dataPt) (FLAC.pm:163-164)
   for key in bit_keys {
     let Some((b1, b2)) = parse_bits(key) else {
       continue; // FLAC.pm:173
     };
-    let (i1, i2) = (b1 / 8, b2 / 8); // FLAC.pm:175
-    let (f1, f2) = (b1 % 8, b2 % 8); // FLAC.pm:176
-    if i2 >= dir_len {
-      break; // FLAC.pm:177 `last if $i2 >= $dirLen`
-    }
-    // A descending range (b1 > b2, incl. the same-byte case i1==i2 where the
-    // mask would compute to 0 and the shift-down loop would spin forever) is
-    // a malformed table key — skip it (no tag), completing the no-hang guard
-    // for ALL descending keys, not just cross-byte (i1 > i2).
-    if b1 > b2 {
-      continue;
-    }
-    // Resolve the tag definition before branching (Perl checks
+    // Resolve the tag definition before extraction (Perl checks
     // `$$tagTablePtr{$tag}{Format}` — the def must exist first).
-    // If the key is not in the table, skip it (no tag emitted).
     let get = table.get();
     let Some(def) = get(TagId::Str(key)) else {
       continue;
     };
-    // FLAC.pm:179-181: "if Format is unspecified, convert the specified number
-    // of bits to an unsigned integer, otherwise allow HandleTag to convert
-    // whole bytes the normal way (via undefined $val)".
-    let raw = if def.format().is_some() {
-      // TEMPLATE: copy this arm for any tag with Format set (e.g. FLAC StreamInfo MD5Signature).
-      // Format IS set: `$val` stays undef; HandleTag reads raw bytes.
-      // FLAC.pm:224-229: `Start => $dirStart + $i1`, `Size => $i2 - $i1 + 1`
-      // (dirStart=0, Start=i1, inclusive end=i2). The `i2 >= dir_len` break
-      // above guarantees i2 < data.len() and the `b1 > b2` continue above
-      // guarantees i1 <= i2, so this inclusive slice is always in-bounds.
-      TagValue::Bytes(data[i1..=i2].to_vec())
-    } else {
-      // Format NOT set: unsigned-integer accumulation (FLAC.pm:182-222).
-      // Faithful Perl scalar: `$val` starts as UV (here: u64) and
-      // auto-promotes to NV (here: f64) when the next `*256 + byte` would
-      // overflow u64. Once NV, every subsequent operation stays NV
-      // (Perl scalars don't downgrade). No `>16-byte` guard — Perl's NV
-      // simply loses precision past ~15 significant digits; we mirror it.
-      enum Acc {
-        // u64 mode (Perl UV). The exact integer value.
-        U(u64),
-        // f64 mode (Perl NV). Auto-promoted after a u64 overflow.
-        F(f64),
-      }
-      // Multiply-and-add `acc * 256 + add` with UV→NV promotion on
-      // overflow. `add` is at most 255 (it is `mask & byte`).
-      fn mul256_add(acc: Acc, add: u8) -> Acc {
-        match acc {
-          Acc::U(v) => match v.checked_mul(256).and_then(|x| x.checked_add(add as u64)) {
-            Some(n) => Acc::U(n),
-            // Perl `$val = $val * 256 + N` auto-promotes to NV the moment
-            // u64 cannot hold the result. From this byte on, accumulate
-            // in f64 (matching Perl's NV path).
-            None => Acc::F(v as f64 * 256.0 + add as f64),
-          },
-          Acc::F(v) => Acc::F(v * 256.0 + add as f64),
-        }
-      }
-      let mut acc = Acc::U(0);
-      let mut last_mask: u32 = 0;
-      let byte = |i: usize| data[i] as u32; // Get8u($dataPt,$i+$dirStart), dirStart=0
-      match order {
-        BitOrder::Mm => {
-          // FLAC.pm:185-199: `if ($byteOrder eq 'MM')` — loop ascending i1..=i2
-          // (comment says "loop from high byte to low byte"; bit-0 is the MSB so
-          // i1 carries the most-significant byte of the extracted field).
-          for i in i1..=i2 {
-            let mut mask: u32 = 0xff;
-            if i == i1 && f1 != 0 {
-              // mask off high bits in first word (0 is high bit) (FLAC.pm:190-191)
-              for b in (8 - f1)..=7 {
-                mask ^= 1 << b;
-              }
-            }
-            if i == i2 && f2 < 7 {
-              // mask off low bits in last word (7 is low bit) (FLAC.pm:194-195)
-              for b in 0..=(6 - f2) {
-                mask ^= 1 << b;
-              }
-            }
-            let add = (mask & byte(i)) as u8; // FLAC.pm:197 (mask & Get8u)
-            acc = mul256_add(acc, add);
-            last_mask = mask;
-          }
-        }
-        BitOrder::Ii => {
-          // FLAC.pm:200-217: `else` — loop descending i2..=i1 (little-endian
-          // bit streams; comment: "FLAC is big-endian, but support little-endian
-          // bit streams so this routine can be used by other modules").
-          for i in (i1..=i2).rev() {
-            let mut mask: u32 = 0xff;
-            if i == i1 && f1 != 0 {
-              // mask off low bits in first word (0 is low bit) (FLAC.pm:207-208)
-              for b in 0..f1 {
-                mask ^= 1 << b;
-              }
-            }
-            if i == i2 && f2 < 7 {
-              // mask off high bits in last word (7 is high bit) (FLAC.pm:211-212)
-              for b in (f2 + 1)..=7 {
-                mask ^= 1 << b;
-              }
-            }
-            let add = (mask & byte(i)) as u8; // FLAC.pm:214 (mask & Get8u)
-            acc = mul256_add(acc, add);
-            last_mask = mask;
-          }
-        }
-      }
-      // FLAC.pm:219-222 shift word down until low bit is in position 0.
-      // Perl `$val /= 2` is integer-exact on a UV with a 0 low bit (the
-      // last-byte mask AND clears that bit, so `val` is divisible) and
-      // exact-exponent-decrement on an NV. We match: u64 `/= 2` (integer
-      // division; exact because the low bit is 0 by construction) and
-      // f64 `/= 2.0` (exact for finite values: just decrements the
-      // exponent).
-      while last_mask & 0x01 == 0 {
-        acc = match acc {
-          Acc::U(v) => Acc::U(v / 2),
-          Acc::F(v) => Acc::F(v / 2.0),
-        };
-        last_mask >>= 1;
-      }
-      match acc {
-        // u64 mode ≤ i64::MAX ⇒ TagValue::I64 (unchanged for all ported
-        // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit).
-        Acc::U(v) if v <= i64::MAX as u64 => TagValue::I64(v as i64),
-        // u64 mode > i64::MAX ⇒ exact decimal string (Perl UV stringifies
-        // as exact integer); the serializer's number gate quotes ≥16-digit
-        // bare integers, exactly as ExifTool -j emits a big unsigned int.
-        Acc::U(v) => TagValue::Str(v.to_string().into()),
-        // NV (f64) mode ⇒ Perl's default `%.15g` NV stringification (e.g.
-        // 9-byte all-0xFF ⇒ "4.72236648286965e+21", byte-exact oracle).
-        Acc::F(v) => TagValue::Str(format_g(v, 15).into()),
-      }
+    let raw = match extract_field(data, b1, b2, order, def) {
+      None => break, // FLAC.pm:177 `last if $i2 >= $dirLen`
+      Some(Err(())) => continue,
+      Some(Ok(v)) => v,
     };
     // HandleTag (FLAC.pm:224-229): ValueConv then PrintConv via the engine.
-    // Same tail for both the Format and no-Format paths.
     let out = apply(def, &raw, print_conv_enabled);
     into.push(Group::new(table.group0(), def.group1()), def.name(), out);
+  }
+}
+
+/// Conditional-arm + RawConv variant of [`process_bit_stream`] (faithful to
+/// MPEG.pm:441-457 `ProcessFrameHeader` driving the `%MPEG::Audio` tag
+/// table). Differences from [`process_bit_stream`]:
+///
+/// - `choose` selects the matching variant per key, given the current
+///   [`FrameState`]: Perl's `sub HandleTag` consults the array of arms in
+///   order and picks the first whose `Condition` matches the current
+///   `$self`. The closure mirrors that — return the first variant whose
+///   `Condition` evaluates true, or `None` if no arm matches (faithful:
+///   ExifTool emits no tag for that key when every arm rejects).
+/// - After the raw value is extracted, the def's
+///   [`RawConv::SetFrameState`] (if any) writes the **raw integer** into
+///   the [`FrameState`] BEFORE `ValueConv`/`PrintConv` (ExifTool.pm:3477-
+///   3501). Sibling tags' Condition arms (later in `bit_keys`) read the
+///   updated state.
+///
+/// `RawConv::None` ⇒ no state mutation (the common case for tags without a
+/// Perl `RawConv` key).
+#[allow(clippy::too_many_arguments)]
+pub fn process_bit_stream_cond(
+  data: &[u8],
+  order: BitOrder,
+  bit_keys: &[&'static str],
+  group0: &'static str,
+  choose: impl Fn(&str, &FrameState) -> Option<&'static TagDef>,
+  state: &mut FrameState,
+  into: &mut Metadata,
+  print_conv_enabled: bool,
+) {
+  for key in bit_keys {
+    let Some((b1, b2)) = parse_bits(key) else {
+      continue; // FLAC.pm:173
+    };
+    // Variant selection: pick the first Condition-matching arm. If no arm
+    // matches, emit nothing (faithful: HandleTag exits silently when
+    // every Condition fails — ExifTool.pm:8983-8989).
+    let Some(def) = choose(key, state) else {
+      continue;
+    };
+    let raw = match extract_field(data, b1, b2, order, def) {
+      None => break, // FLAC.pm:177 `last if $i2 >= $dirLen`
+      Some(Err(())) => continue,
+      Some(Ok(v)) => v,
+    };
+    // RawConv FIRST (ExifTool.pm:3477-3501): side-effect runs BEFORE the
+    // value is fed to ValueConv/PrintConv. Faithful to MPEG.pm:27/36/202
+    // `$self->{X} = $val` — writes the raw integer (the value the
+    // accumulator just produced, BEFORE any conversion).
+    if let RawConv::SetFrameState(slot) = def.raw_conv() {
+      // Only integer raw values can populate `MPEG_Vers`/`Layer`/`Mode`
+      // (the only slots ported). Non-integer raw (e.g. a `Format=undef`
+      // bytes value) under a `SetFrameState` would be a faithful-port
+      // bug — neither MPEG.pm nor any other ported file has this shape.
+      // Mirror Perl's silent "store whatever Perl stringifies the value
+      // to" by storing nothing (the slot stays None) — Condition arms
+      // reading that slot see `undef` and reject, which is the faithful
+      // Perl behavior for `$$self{X}=<non-integer>` under `==`/`!=`
+      // comparisons (Perl warns + uses 0; ExifTool callers always store
+      // integers in this slot in practice).
+      if let TagValue::I64(n) = raw {
+        state.set(slot, n);
+      }
+    }
+    // HandleTag (FLAC.pm:224-229): ValueConv then PrintConv via the engine.
+    let out = apply(def, &raw, print_conv_enabled);
+    into.push(Group::new(group0, def.group1()), def.name(), out);
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv};
-  use crate::{serialize::to_exiftool_json, value::Group};
+  use crate::{
+    serialize::to_exiftool_json,
+    tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
+    value::Group,
+  };
 
   // Faithful AAC::Main subset for the synthetic header
   // [0xFF,0xF1,0x50,0x80,0x00,0x00,0x00]:
@@ -690,5 +845,187 @@ mod tests {
       json_over.contains("\"Test:Field\": \"9223372036854775808\""),
       "i64::MAX+1 (19 digits) must be quoted by the number gate: {json_over}"
     );
+  }
+
+  // ── process_bit_stream_cond + FrameState (MPEG.pm faithful) ──
+
+  #[test]
+  fn frame_state_defaults_none_then_set_get() {
+    let mut s = FrameState::new();
+    assert_eq!(s.get("MPEG_Vers"), None);
+    assert_eq!(s.get("MPEG_Layer"), None);
+    assert_eq!(s.get("MPEG_Mode"), None);
+    s.set("MPEG_Vers", 3);
+    s.set("MPEG_Layer", 1);
+    assert_eq!(s.get("MPEG_Vers"), Some(3));
+    assert_eq!(s.get("MPEG_Layer"), Some(1));
+    assert_eq!(s.get("MPEG_Mode"), None);
+    // Unknown slot on `get` is silently None (Perl `undef` for an unknown
+    // `$$self{X}` — the engine reads slots via Conditions like
+    // `s.get("Bit20-21")`, which can be a legitimate not-yet-known key
+    // when reading FrameState before the corresponding RawConv has fired).
+    assert_eq!(s.get("MPEG_Bogus"), None);
+  }
+
+  #[test]
+  #[should_panic(expected = "FrameState::set: unknown slot")]
+  #[cfg(debug_assertions)]
+  fn frame_state_set_unknown_slot_debug_asserts() {
+    // Typos in `RawConv::SetFrameState("MPEG_Bog")` would silently drop
+    // the state write and fall through to a Condition-mismatch missing-
+    // tag downstream — extremely hard to detect. The debug-only assert
+    // here turns such a typo into an immediate test failure. Release
+    // behavior is the original silent no-op (faithful to Perl's silent
+    // failure on a malformed hash-store).
+    let mut s = FrameState::new();
+    s.set("MPEG_Bogus", 99);
+  }
+
+  #[test]
+  fn cond_raw_conv_writes_state_before_next_key_sees_it() {
+    // Faithful to MPEG.pm:27 (Bit11-12 RawConv writes MPEG_Vers) +
+    // MPEG.pm:169 (Bit20-21 Condition reads MPEG_Vers). Two-key fixture
+    // drives this end-to-end: extracting Bit11-12 must populate state
+    // BEFORE Bit20-21's chooser closure runs.
+    static VERS: TagDef = TagDef::new("MPEGAudioVersion", "MPEG", ValueConv::None, PrintConv::None)
+      .with_raw_conv(RawConv::SetFrameState("MPEG_Vers"));
+    static SR_V1: TagDef = TagDef::new(
+      "SampleRate",
+      "MPEG",
+      ValueConv::None,
+      PrintConv::Hash(PrintConvHash::direct(&[("0", PrintValue::I64(44100))])),
+    );
+    static SR_V2: TagDef = TagDef::new(
+      "SampleRate",
+      "MPEG",
+      ValueConv::None,
+      PrintConv::Hash(PrintConvHash::direct(&[("0", PrintValue::I64(22050))])),
+    );
+    fn choose(key: &str, s: &FrameState) -> Option<&'static TagDef> {
+      match key {
+        "Bit11-12" => Some(&VERS),
+        // Pick v1 vs v2 by current MPEG_Vers (Perl `$self->{MPEG_Vers}==3` arm).
+        "Bit20-21" => match s.get("MPEG_Vers") {
+          Some(3) => Some(&SR_V1),
+          Some(2) => Some(&SR_V2),
+          _ => None,
+        },
+        _ => None,
+      }
+    }
+    // Canonical MP3 header 0xfffb_904c has Bit11-12=3 (MPEG-1) and
+    // Bit20-21=0 (raw SampleRate index). The cond entry point must
+    // (a) extract Bit11-12 first, (b) run its RawConv to write
+    // MPEG_Vers=3 into state, (c) then call `choose` on Bit20-21 with
+    // MPEG_Vers visible — selecting SR_V1, whose PrintConv 0→44100.
+    let data = [0xffu8, 0xfb, 0x90, 0x4c];
+    let mut state = FrameState::new();
+    let mut m = Metadata::new("x.mp3");
+    process_bit_stream_cond(
+      &data,
+      BitOrder::Mm,
+      &["Bit11-12", "Bit20-21"],
+      "MPEG",
+      choose,
+      &mut state,
+      &mut m,
+      true,
+    );
+    // Raw extraction set MPEG_Vers=3, then SR chose SR_V1.
+    assert_eq!(state.get("MPEG_Vers"), Some(3));
+    let tags: Vec<_> = m
+      .tags()
+      .iter()
+      .map(|t| (t.name(), t.value().clone()))
+      .collect();
+    assert_eq!(
+      tags,
+      vec![
+        ("MPEGAudioVersion", TagValue::I64(3)),
+        ("SampleRate", TagValue::I64(44100)),
+      ]
+    );
+  }
+
+  #[test]
+  fn cond_no_matching_arm_emits_no_tag() {
+    // Faithful: when every Condition rejects, HandleTag emits nothing for
+    // that key (it just falls through). MPEG.pm:166-197 has SampleRate
+    // arms for Vers∈{0,2,3}; Vers=1 would be the "reserved" case and
+    // emit nothing.
+    static SR: TagDef = TagDef::new(
+      "SampleRate",
+      "MPEG",
+      ValueConv::None,
+      PrintConv::Hash(PrintConvHash::direct(&[("0", PrintValue::I64(44100))])),
+    );
+    fn choose(key: &str, s: &FrameState) -> Option<&'static TagDef> {
+      // Only emit if MPEG_Vers is exactly 3 — here we never write it, so the
+      // closure must reject (return None) and no tag must be emitted.
+      if key == "Bit20-21" && s.get("MPEG_Vers") == Some(3) {
+        Some(&SR)
+      } else {
+        None
+      }
+    }
+    let mut state = FrameState::new();
+    let mut m = Metadata::new("x.mp3");
+    let data = [0xffu8, 0xfb, 0x90, 0x4c];
+    process_bit_stream_cond(
+      &data,
+      BitOrder::Mm,
+      &["Bit20-21"],
+      "MPEG",
+      choose,
+      &mut state,
+      &mut m,
+      true,
+    );
+    assert!(m.tags().is_empty(), "no matching arm => no tag");
+  }
+
+  #[test]
+  fn cond_raw_conv_uses_raw_integer_not_value_conv_result() {
+    // ExifTool.pm:3477-3501: RawConv runs BEFORE ValueConv/PrintConv on the
+    // RAW value. Pin this by giving the def a ValueConv that would change
+    // the integer (so if we mistakenly stored the *value-converted* value,
+    // the test fails).
+    static VL: TagDef = TagDef::new(
+      "MPEGLayer",
+      "MPEG",
+      // ValueConv that would alias raw 1 -> 99 (if RawConv read post-VC).
+      ValueConv::Hash(PrintConvHash::direct(&[("1", PrintValue::I64(99))])),
+      PrintConv::None,
+    )
+    .with_raw_conv(RawConv::SetFrameState("MPEG_Layer"));
+    fn choose(key: &str, _s: &FrameState) -> Option<&'static TagDef> {
+      if key == "Bit13-14" {
+        Some(&VL)
+      } else {
+        None
+      }
+    }
+    // Layout: byte 1 bits 5-6 = layer (0xfb >> 1 & 0b11 = 0b01 = 1).
+    let data = [0xffu8, 0xfb, 0x90, 0x4c];
+    let mut state = FrameState::new();
+    let mut m = Metadata::new("x.mp3");
+    process_bit_stream_cond(
+      &data,
+      BitOrder::Mm,
+      &["Bit13-14"],
+      "MPEG",
+      choose,
+      &mut state,
+      &mut m,
+      true,
+    );
+    // State must reflect the RAW integer (1), NOT the value-converted 99.
+    assert_eq!(
+      state.get("MPEG_Layer"),
+      Some(1),
+      "RawConv must capture the raw integer, not the value-converted result"
+    );
+    // Emitted tag IS value-converted (99) — the tag pipeline is unaffected.
+    assert_eq!(m.tags()[0].value(), &TagValue::I64(99));
   }
 }
