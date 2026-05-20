@@ -393,6 +393,27 @@ fn flac_duration_conformance() {
   check("FLAC_duration.flac", "FLAC_duration.flac.n.json", false);
 }
 
+#[test]
+fn moi_conformance() {
+  // FORMATS.md row 12a: Image::ExifTool::MOI. Bundled fixture
+  // `tests/fixtures/MOI.moi` is the real `t/images/MOI.moi` (320 bytes,
+  // V6 sidecar with DateTime / Duration / AspectRatio / AudioCodec /
+  // AudioBitrate / VideoBitrate). Goldens captured from bundled
+  // `perl exiftool` (`-j -G1 -struct` and `-n`).
+  //
+  // Exercises:
+  //   - V6 magic + embedded BE u32 filesize gate (MOI.pm:110-114)
+  //   - SetByteOrder('MM') for int16u/int32u walks (MOI.pm:116)
+  //   - DateTimeOriginal `undef[8]` + sprintf('%06.3f',…) format
+  //   - Duration `int32u/1000` + ConvertDuration sub-30s path
+  //   - AspectRatio nibble decode (lo<2 + hi=5 ⇒ "4:3 PAL")
+  //   - AudioCodec PrintHex + direct hash hit (0xC1 ⇒ AC3)
+  //   - AudioBitrate `*16000+48000` + ConvertBitrate (kbps)
+  //   - VideoBitrate hash ValueConv + ConvertBitrate (Mbps)
+  check("MOI.moi", "MOI.moi.json", true);
+  check("MOI.moi", "MOI.moi.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

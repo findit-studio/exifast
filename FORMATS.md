@@ -31,6 +31,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ⬜ | — | — |
 | 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ⬜ | — | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
+| 12a | **MOI** (camcorder MOD info) | MOI.pm | 159 | 2 | Engine | `MOI.moi` | ✅ | clean | — |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |
 | 14 | **GPS** *(infra)* | GPS.pm | 641 | 3 | Engine, Exif | via containers | ⬜ | — | — |
 | 15 | **XMP** *(infra)* | XMP.pm + XMP2.pl | 6693 | 3 | Engine | via containers | ⬜ | — | — |
