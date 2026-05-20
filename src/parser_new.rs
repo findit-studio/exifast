@@ -300,7 +300,12 @@ pub enum AnyParser {
   /// FLAC (Phase F3 — Free Lossless Audio Codec).
   #[cfg(feature = "flac")]
   Flac(crate::formats::flac::ProcessFlac),
-  // Phase F4 adds: Ogg, MpegAudio.
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::ProcessOgg),
+  /// MPEG audio (Phase F4 — MP3 / MP2 / MUS frame parser + Xing/LAME tail).
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::ProcessMpegAudio),
   // Phase F5 adds: Mpc, WavPack.
 }
 
@@ -359,6 +364,17 @@ pub enum AnyMeta<'a> {
   /// FLAC (Phase F3).
   #[cfg(feature = "flac")]
   Flac(crate::formats::flac::FlacMeta<'a>),
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
+  /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces
+  /// `OggMeta<'static>` (Phase E `into_static` pragma); this arm carries
+  /// the `<'a>` projection so the closed enum compiles at any caller
+  /// lifetime.
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::OggMeta<'a>),
+  /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
+  /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
@@ -400,6 +416,10 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Dsf(m) => m.sink(print_conv, out),
       #[cfg(feature = "flac")]
       AnyMeta::Flac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(m) => m.sink(print_conv, out),
     }
   }
 }
