@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "MPC.mpc",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MPC",
+  "File:FileTypeExtension": "MPC",
+  "File:MIMEType": "audio/x-musepack",
+  "MPC:TotalFrames": 102,
+  "MPC:SampleRate": 0,
+  "MPC:Quality": 10,
+  "MPC:MaxBand": 28,
+  "MPC:ReplayGainTrackPeak": 0,
+  "MPC:ReplayGainTrackGain": 0,
+  "MPC:ReplayGainAlbumPeak": 0,
+  "MPC:ReplayGainAlbumGain": 0,
+  "MPC:FastSeek": 0,
+  "MPC:Gapless": 1,
+  "MPC:EncoderVersion": 115
+}]
