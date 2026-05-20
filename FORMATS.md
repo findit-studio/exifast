@@ -23,7 +23,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 2 | **ID3** *(infra; also completes **MP3**)* | ID3.pm | 1775 | 2 | Engine | `MP3.mp3` | ⬜ | — | — |
 | 3 | **AIFF** (AIFF/AIF/AIFC) | AIFF.pm | 316 | 2 | Engine, ID3 | `AIFF.aif` | ⬜ | — | — |
 | 4 | **MPC** | MPC.pm | 156 | 2 | Engine, ID3/APE tags | `APE.mpc` | ⬜ | — | — |
-| 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape` | ⬜ | — | — |
+| 5 | **APE** | APE.pm | 287 | 2 | Engine, ID3 | `APE.ape`, `APE_old.ape` | ✅ | clean | — |
 | 6 | **WavPack** (WV/WVP) | WavPack.pm | 144 | 2 | Engine, ID3/APE tags | `WavPack.wv` + adversarial | ✅ | clean | — |
 | 7 | **DSF** | DSF.pm | 138 | 2 | Engine, ID3 | ⚠️ ffmpeg-gen `DSF.dsf` | ⬜ | — | — |
 | 8 | **FLAC** | FLAC.pm | 321 | 2 | Engine, ID3, Vorbis | `FLAC.flac` | ✅ | clean | — |

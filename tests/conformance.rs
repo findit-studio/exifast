@@ -104,6 +104,225 @@ fn aac_reserved_profile_error_conformance() {
 }
 
 #[test]
+fn ape_conformance() {
+  // Real fixture from exiftool/t/images/APE.ape: NewHeader (version 3990)
+  // + APETAGEX v2 footer with 14 tags including Cover Art (front).
+  check("APE.ape", "APE.ape.json", true);
+  check("APE.ape", "APE.ape.n.json", false);
+}
+
+#[test]
+fn ape_old_header_conformance() {
+  // Adversarial synthesized fixture: OldHeader (version <= 3970) with no
+  // APETAGEX trailer. Exercises the APE.pm:149-151 OldHeader branch +
+  // APE.pm:170 `return 1` (no-trailer) path.
+  check("APE_old.ape", "APE_old.ape.json", true);
+  check("APE_old.ape", "APE_old.ape.n.json", false);
+}
+
+#[test]
+fn ape_apetagex_only_conformance() {
+  // Adversarial synthesized fixture (Codex r5 finding): starts directly
+  // with APETAGEX (no MAC header). Exercises the APE.pm:142-144
+  // header_at_start path with the Composite Duration Require failing
+  // cleanly (no MAC ingredients ⇒ no Composite tag). Also covers the
+  // dynamic MakeTag path ('My Custom Tag' → 'MyCustomTag') alongside a
+  // static-dictionary tag ('Title' → 'Title').
+  check("APE_apetagex.ape", "APE_apetagex.ape.json", true);
+  check("APE_apetagex.ape", "APE_apetagex.ape.n.json", false);
+}
+
+#[test]
+fn ape_wire_composite_ingredients_conformance() {
+  // Adversarial wire-format fixture (Codex r8 follow-up). Carries four
+  // APE tag-stream entries whose KEYS spell the four Composite Duration
+  // ingredient names exactly: 'SampleRate', 'TotalFrames',
+  // 'BlocksPerFrame', 'FinalFrameBlocks'. Bundled ExifTool 13.58
+  // confirms NO `Composite:Duration` is emitted — because APE.pm:105
+  // `MakeTag` runs `ucfirst lc` on the wire key first, producing
+  // `Samplerate` (lowercase 'r'), `Totalframes` (lowercase 'f'), etc.
+  // The Composite Require key `APE:SampleRate` (capital 'R') does NOT
+  // match `Samplerate`, so no Composite tag fires. Pins this faithful
+  // case-mangling behavior: a future regression that preserved camelCase
+  // in MakeTag would WRONGLY emit a Composite here.
+  check(
+    "APE_wire_composite_ingredients.ape",
+    "APE_wire_composite_ingredients.ape.json",
+    true,
+  );
+  check(
+    "APE_wire_composite_ingredients.ape",
+    "APE_wire_composite_ingredients.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_spaced_composite_conformance() {
+  // Adversarial wire-format fixture (Codex r9 finding): four APE tag
+  // entries whose KEYS contain SPACES — `Sample Rate`, `Total Frames`,
+  // `Blocks Per Frame`, `Final Frame Blocks`. APE.pm:107 `MakeTag`
+  // applies `s/[^\w-]+(.?)/\U$1/sg` AFTER `ucfirst lc`: `Sample Rate` →
+  // ucfirst lc `Sample rate` → s/// at the space (non-word, then
+  // uppercase the next char) → `SampleRate`. The Composite Require key
+  // `APE:SampleRate` MATCHES, so Composite:Duration IS emitted
+  // (`14.71 s`). Pins the family-0 + Str-coercion composite lookup
+  // path end-to-end.
+  check(
+    "APE_spaced_composite.ape",
+    "APE_spaced_composite.ape.json",
+    true,
+  );
+  check(
+    "APE_spaced_composite.ape",
+    "APE_spaced_composite.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_dup_override_conformance() {
+  // Adversarial wire-format fixture (Codex r9 finding): MAC NewHeader
+  // emits `SampleRate=44100`, then the APETAGEX footer emits a
+  // `Sample Rate=48000` (which MakeTag normalises to `SampleRate`). Both
+  // tags appear as `MAC:SampleRate` and `APE:SampleRate`; the Composite
+  // Duration MUST use the LATEST value (48000, the wire-format override),
+  // matching ExifTool's HandleTag/DUPL_TAG semantics (the bare-name key
+  // is given to the most recent FoundTag call). Faithful Duration =
+  // ((10-1)*73728+42662)/48000 = 14.71 s (NOT 16.01 s from 44100). Pins
+  // the `iter().rev().find` last-wins behaviour in the composite lookup.
+  check("APE_dup_override.ape", "APE_dup_override.ape.json", true);
+  check("APE_dup_override.ape", "APE_dup_override.ape.n.json", false);
+}
+
+#[test]
+fn ape_nonfinite_composite_conformance() {
+  // Adversarial wire-format fixture (Codex r9 finding): one ingredient
+  // (`Total Frames`) has value `"Inf"` (a string Perl coerces to IEEE
+  // infinity). The composite arithmetic `(Inf-1)*73728+42662 = Inf;
+  // /48000 = Inf`. ExifTool emits `APE:TotalFrames: "Inf"` (string,
+  // because Inf fails IsFloat) and `Composite:Duration: "Inf"`. Pins:
+  // (a) perl_numeric_coerce_f64 recognises "Inf"; (b) the composite
+  // arithmetic in f64 propagates non-finite cleanly; (c) the composite
+  // emit promotes non-finite f64 to Perl-cased `TagValue::Str("Inf")`
+  // — Rust's f64::to_string() would emit lowercase `inf` and
+  // byte-diverge.
+  check(
+    "APE_nonfinite_composite.ape",
+    "APE_nonfinite_composite.ape.json",
+    true,
+  );
+  check(
+    "APE_nonfinite_composite.ape",
+    "APE_nonfinite_composite.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_huge_composite_conformance() {
+  // Adversarial wire-format fixture (Codex r10 finding): four APE tag
+  // entries where the Composite Duration arithmetic produces a value
+  // beyond `i64::MAX` seconds (`1e15 * 1e15 / 1` ≈ 1e30 s). The previous
+  // Rust port cast `(time / 3600.0) as i64` — saturating to `i64::MAX`
+  // and emitting a corrupt h:m:s. Bundled Perl ExifTool 13.58 emits the
+  // hours count via Perl's NV stringification (`%.15g`) which yields
+  // `1.15740740740741e+25 days 0:00:00`. Pins the f64-throughout
+  // ConvertDuration days-carve-out and the perl_nv_str helper.
+  check(
+    "APE_huge_composite.ape",
+    "APE_huge_composite.ape.json",
+    true,
+  );
+  check(
+    "APE_huge_composite.ape",
+    "APE_huge_composite.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_repeated_keys_conformance() {
+  // Adversarial wire-format fixture (Codex r13 follow-up): same APE
+  // wire key emitted TWICE. Two `Title` entries (`First Title`,
+  // `Second Title`) and two `Sample Rate` entries (`44100`, `48000`).
+  // ExifTool HandleTag/FoundTag DUPL_TAG semantics give the bare key
+  // to the LAST FoundTag call (renaming earlier ones to `Name (1)`,
+  // `Name (2)`, …); default `-G1 -j` JSON suppresses the renamed
+  // duplicates. Bundled Perl 13.58 emits ONLY the second value for
+  // each key: `APE:Title="Second Title"`, `APE:SampleRate=48000`.
+  check("APE_repeated.ape", "APE_repeated.ape.json", true);
+  check("APE_repeated.ape", "APE_repeated.ape.n.json", false);
+}
+
+#[test]
+fn ape_dynamic_edge_keys_conformance() {
+  // Adversarial wire-format fixture (Codex r13 finding): four edge
+  // dynamic APE tag keys exercising AddTagToTable (ExifTool.pm:9243-9255)
+  // name normalization post-processing that MakeTag invokes:
+  //   `1abc` → `Tag1abc` (prepend "Tag" because doesn't start with letter)
+  //   `_abc` → `Tag_abc` (prepend "Tag" because doesn't start with letter)
+  //   `a`    → `TagA` (prepend "Tag" because length<2; ucfirst → A)
+  //   `\xe9` → `Tag` (non-ASCII byte stripped by tr/-_a-zA-Z0-9//dc ⇒
+  //                   empty ⇒ length<2 ⇒ prepend "Tag")
+  // Verified against bundled Perl 13.58. Pins make_tag's
+  // AddTagToTable-equivalent post-processing.
+  check(
+    "APE_dynamic_edge_keys.ape",
+    "APE_dynamic_edge_keys.ape.json",
+    true,
+  );
+  check(
+    "APE_dynamic_edge_keys.ape",
+    "APE_dynamic_edge_keys.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_two63_boundary_composite_conformance() {
+  // Adversarial wire-format fixture (Codex r12 finding): `Sample Rate=1`,
+  // `Total Frames=9223372036854775808` (= 2^63), `Blocks Per Frame=86400`,
+  // `Final Frame Blocks=0`. Composite arithmetic:
+  //   `(2^63 - 1) * 86400 / 1 ≈ 7.97e23` seconds → days = `2^63` exactly.
+  // This pins the exact f64 boundary `i64::MAX as f64 == 2^63` (because
+  // i64::MAX = 2^63-1 isn't representable in f64; the cast rounds UP).
+  // Earlier `perl_nv_str` treated `n as i64` on `n=2^63` and saturated
+  // to `i64::MAX = 2^63-1`, losing one. Bundled Perl 13.58 uses its UV
+  // path and emits `"9223372036854775808 days 0:00:00"`. The fix splits
+  // signed/unsigned carve-outs at the exact f64 power-of-two boundary.
+  check(
+    "APE_two63_boundary.ape",
+    "APE_two63_boundary.ape.json",
+    true,
+  );
+  check(
+    "APE_two63_boundary.ape",
+    "APE_two63_boundary.ape.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ape_u64_days_composite_conformance() {
+  // Adversarial wire-format fixture (Codex r11 finding): four APE tag
+  // entries chosen so the Composite Duration arithmetic produces a days
+  // count strictly above `i64::MAX` (≈ 9.22e18) but at-or-below
+  // `u64::MAX` (≈ 1.84e19). Perl preserves DECIMAL stringification in
+  // that range via its UV (u64) integer path. Earlier `perl_nv_str` only
+  // handled the signed `i64` range and emitted scientific notation
+  // here, byte-diverging from bundled Perl. Empirically against bundled
+  // Perl 13.58: composite duration `8.64e+23` seconds (≈ 1e19 days)
+  // stringifies as `"10000000000000002048 days -32768:00:00"` — note
+  // the `-32768` negative-hours residue is itself a faithful Perl quirk
+  // caused by f64 precision loss in `$h -= $d * 24` and `%02d` integer
+  // formatting (verified against bundled Perl). Pins the u64-range
+  // integer carve-out in `perl_nv_str`.
+  check("APE_u64_days.ape", "APE_u64_days.ape.json", true);
+  check("APE_u64_days.ape", "APE_u64_days.ape.n.json", false);
+}
+
+#[test]
 fn all_zero_file_error_conformance() {
   // 32 `\0` ⇒ buff ≥ 16 and all-same ⇒ the all-same-byte insight;
   // whole file is `\0` ⇒ 'Entire file is binary zeros'

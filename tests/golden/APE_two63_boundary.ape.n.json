@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "APE_two63_boundary.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:SampleRate": 1,
+  "APE:TotalFrames": "9223372036854775808",
+  "APE:BlocksPerFrame": 86400,
+  "APE:FinalFrameBlocks": 0,
+  "Composite:Duration": 7.96899343984253e+23
+}]

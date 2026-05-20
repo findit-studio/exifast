@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "APE_dup_override.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "MAC:CompressionLevel": 0,
+  "MAC:BlocksPerFrame": 73728,
+  "MAC:FinalFrameBlocks": 42662,
+  "MAC:TotalFrames": 10,
+  "MAC:BitsPerSample": 0,
+  "MAC:Channels": 0,
+  "MAC:SampleRate": 44100,
+  "APE:SampleRate": 48000,
+  "Composite:Duration": 14.7127916666667
+}]

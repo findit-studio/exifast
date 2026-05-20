@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "APE_old.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "ape",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "MAC:APEVersion": 3.97,
+  "MAC:CompressionLevel": 2000,
+  "MAC:Channels": 2,
+  "MAC:SampleRate": 22050,
+  "MAC:TotalFrames": 100,
+  "MAC:FinalFrameBlocks": 73728
+}]

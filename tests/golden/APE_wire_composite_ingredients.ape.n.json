@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "APE_wire_composite_ingredients.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:Samplerate": 44100,
+  "APE:Totalframes": 10,
+  "APE:Blocksperframe": 73728,
+  "APE:Finalframeblocks": 42662
+}]

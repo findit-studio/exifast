@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "APE_nonfinite_composite.ape",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "ape",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "APE:SampleRate": 48000,
+  "APE:TotalFrames": "Inf",
+  "APE:BlocksPerFrame": 73728,
+  "APE:FinalFrameBlocks": 42662,
+  "Composite:Duration": "Inf"
+}]

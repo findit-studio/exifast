@@ -177,6 +177,23 @@ impl<'a> ParseContext<'a> {
     (self.data, self.meta)
   }
 
+  /// Run `f` with a mutable reference to the underlying metadata sink,
+  /// keeping that `&mut Metadata` borrow strictly scoped to the closure.
+  ///
+  /// This helper does not — and cannot — end or release any caller-held
+  /// `ctx.data()` borrow; Rust's borrow checker still rejects calling
+  /// `metadata_then` while an immutable borrow of `ctx` (e.g. via
+  /// `ctx.data()`) is live. The benefit is purely structural: by taking
+  /// a closure, the mutable `Metadata` borrow is confined to the closure
+  /// body and never escapes as a named binding that would conflict with
+  /// a subsequent `ctx.data()` call. Callers holding a `ctx.data()`
+  /// borrow must drop it (or copy/clone the slice they need) before
+  /// calling this helper. D8/D9 compliant (no field exposure; takes a
+  /// closure, returns its result by value).
+  pub fn metadata_then<R, F: FnOnce(&mut Metadata) -> R>(&mut self, f: F) -> R {
+    f(self.meta)
+  }
+
   /// Faithful `SetFileType` (ExifTool.pm:9677-9706), read path. Pushes
   /// `File:FileType`, `File:FileTypeExtension` (`uc $normExt`; PrintConv
   /// `lc`), `File:MIMEType` (`$mimeType || 'application/unknown'`). Called
