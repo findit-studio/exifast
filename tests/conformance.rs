@@ -56,6 +56,167 @@ fn wavpack_adversarial_conformance() {
 }
 
 #[test]
+fn ogg_conformance() {
+  // FORMATS.md row 9 (Ogg + Vorbis-comments): a real Ogg-Vorbis fixture
+  // from the bundled-ExifTool corpus. The committed golden is bundled
+  // `perl exiftool -j -G1 -struct ... -x Composite:all -x
+  // Vorbis:{VorbisVersion,AudioChannels,SampleRate,NominalBitrate,
+  // MaximumBitrate,MinimumBitrate}`: `Composite:Duration` is deferred (no
+  // Composite engine yet) and the Vorbis identification-binary fields
+  // are deferred (R1 F2 scope tightening — see `src/formats/ogg.rs`
+  // module docs). Every emitted tag is byte-exact with bundled Perl,
+  // both with PrintConv on (default) and `-n`.
+  check("Vorbis.ogg", "Vorbis.ogg.json", true);
+  check("Vorbis.ogg", "Vorbis.ogg.n.json", false);
+}
+
+#[test]
+fn malformed_ogg_error_conformance() {
+  // Adversarial: a 16-byte file starting with `OggS` magic but truncated
+  // before the page-header is even 27 bytes long. `.ogg` is a known
+  // type ⇒ `ProcessOGG` runs, returns 0 (no valid page completed) ⇒
+  // `'File format error'` (ExifTool.pm:3093). Pins that the OGG parser
+  // does not "accept" without finalising a stream — symmetric with the
+  // AAC `bad.aac` / `aac_profile3.aac` adversarial pattern.
+  check("bad.ogg", "bad.ogg.json", true);
+  check("bad.ogg", "bad.ogg.n.json", false);
+}
+
+#[test]
+fn ogg_truncated_error_conformance() {
+  // R1 regression pin: a 27-byte file with valid `OggS` magic but exactly
+  // ONE byte short of the page-header minimum read. Bundled `Ogg.pm:94`
+  // requires `$raf->Read($buff, 28) == 28` — at 27 bytes the read returns
+  // 27, the `== 28` fails, the loop never enters, `$success` stays 0 ⇒
+  // post-loop `'File format error'` (ExifTool.pm:3093). Pins that
+  // `ProcessOgg` does NOT call `SetFileType` on a 27-byte OggS prefix
+  // (the Codex round-1 F1 finding).
+  check("ogg_truncated.ogg", "ogg_truncated.ogg.json", true);
+  check("ogg_truncated.ogg", "ogg_truncated.ogg.n.json", false);
+}
+
+#[test]
+fn ogg_vorbis_trailing_garbage_conformance() {
+  // R2 regression pin (Codex round-2 [medium] disposition: finding rejected
+  // as misframed — see commit message + `src/formats/ogg.rs::process_vorbis_comments`).
+  //
+  // Fixture: a complete two-page Ogg-Vorbis file whose comment packet is
+  // `\x03vorbis` + vendor("test") + count=0 + `\x01\x02\x03` (3 trailing
+  // garbage bytes) + framing-bit. Reaches `process_vorbis_comments` with
+  // exactly that block.
+  //
+  // The Codex round-2 finding claimed bundled ExifTool emits
+  // `ExifTool:Warning => 'Format error in Vorbis comments'` on this input.
+  // EMPIRICAL EVIDENCE (this committed golden, captured from bundled
+  // `perl exiftool`): NO `ExifTool:Warning` is emitted — only `Vorbis:Vendor`.
+  //
+  // The reason (Vorbis.pm:157-210): `ProcessComments` reads the vendor in
+  // the FIRST loop iteration (line 175 else-branch), sets `$num =
+  // (pos+4 < end) ? Get32u(at count) : 0` (line 184; reads as 0 in the
+  // trailing case since the count field contents are `\0\0\0\0`), then
+  // unconditionally hits `$num-- or return 1` (line 205) at the end of the
+  // iteration. With `$num == 0`, `$num--` returns the original 0 (falsy),
+  // so `return 1` fires IMMEDIATELY — BEFORE the next iteration can run
+  // `last if pos+4 > end` (line 168) that would otherwise fall through to
+  // the warning at line 208. Perl therefore returns success without ever
+  // reaching the warning line, and any bytes after the comment count
+  // (whether 0, 3, or more) are silently ignored.
+  //
+  // This conformance test pins that exifast's `process_vorbis_comments`
+  // matches the silent-accept behaviour. Adding a `pos != end` check
+  // here (as the rejected finding proposed) would emit a warning on an
+  // input Perl accepts cleanly — UNFAITHFUL by D5 and would break this
+  // golden. The negative pin is the regression guard.
+  check(
+    "ogg_vorbis_trailing_garbage.ogg",
+    "ogg_vorbis_trailing_garbage.ogg.json",
+    true,
+  );
+  check(
+    "ogg_vorbis_trailing_garbage.ogg",
+    "ogg_vorbis_trailing_garbage.ogg.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ogg_vorbis_specialkeys_conformance() {
+  // R3 regression pin (Codex round-3 [medium] dispositions F1+F2).
+  //
+  // F1: `%specialTags` (ExifTool.pm:1228-1236) had been partially ported
+  // as a 16-key stub including 3 keys NOT in Perl (`PARENT`, `DID_TAG_ID`,
+  // `ID3`) and missing 15 that ARE in Perl (incl. `NAMESPACE`, `AVOID`,
+  // `IS_OFFSET`, `LANG_INFO`, `TAG_PREFIX`, `PREFERRED`, `SHORT_NAME`,
+  // `TABLE_DESC`, `IS_SUBDIR`, `EXTRACT_UNKNOWN`, `PRINT_CONV`,
+  // `SRC_TABLE`, `SET_GROUP1`, `PERMANENT`, `INIT_TABLE`). For each
+  // comment KEY in that set, `Vorbis.pm:180` appends `_` to the
+  // synthesised tag name (so `NAMESPACE=x` ⇒ `Vorbis:Namespace_`).
+  // Fixed by porting the full 28-key hash; this fixture pins seven of
+  // them (`NAMESPACE`, `AVOID`, `IS_OFFSET`, `LANG_INFO`, `TAG_PREFIX`,
+  // `PREFERRED`, `NOTES`) byte-exact against the bundled golden.
+  //
+  // F2: `underscore_camelcase` (port of Perl `s/([a-z0-9])_([a-z])/$1\U$2/g`,
+  // Vorbis.pm:193) had walked positions in the ORIGINAL input string and
+  // tested `bytes[i-1]` for lowercase against pre-replacement state, so
+  // multi-underscore chains like `TRACK_A_B` (after ucfirst+lc =>
+  // `Track_a_b`) produced `TrackAB` instead of Perl's `TrackA_b`.
+  // Perl `s///g` advances `pos()` past the END of each replacement and
+  // continues from there in the mutated string — so after `a_b` becomes
+  // `aB`, the next character checked is the now-uppercase `B`, which
+  // does NOT satisfy `[a-z0-9]` and the trailing `_b` is preserved.
+  // Fixed by switching to cursor-over-MUTATED-output semantics; this
+  // fixture pins `TRACK_A_B => TrackA_b`, `A_B_C_D_E => A_bC_dE`,
+  // `KEY_A_LONG_NAME => KeyA_longName`, `FOO_BAR_X_Y => FooBarX_y`
+  // byte-exact against the bundled golden.
+  //
+  // Fixture layout (323 bytes, synthetic Ogg-Vorbis, CRC-valid):
+  //   - BOS page (header_type=0x02, seq=0): `\x01vorbis` identification
+  //     packet (vendor`=` placeholder; channels=2, sample_rate=44100,
+  //     nominal_bitrate=128000, blocksize0/1=0xB8, framing=1).
+  //   - Page (header_type=0x00, seq=1): `\x03vorbis` comment packet
+  //     with vendor="test vendor" + 11 KEY=VALUE comments + framing=1.
+  // Composite:Duration and the Vorbis identification-binary fields
+  // (VorbisVersion/AudioChannels/SampleRate/NominalBitrate/...) are
+  // deferred (R1 F2 scope tightening) so the golden excludes them via
+  // `-x Composite:all -x Vorbis:{VorbisVersion,AudioChannels,...}`.
+  check(
+    "synthetic_vorbis_specialkeys.ogg",
+    "synthetic_vorbis_specialkeys.ogg.json",
+    true,
+  );
+  check(
+    "synthetic_vorbis_specialkeys.ogg",
+    "synthetic_vorbis_specialkeys.ogg.n.json",
+    false,
+  );
+}
+
+#[test]
+fn ogg_opus_synthetic_conformance() {
+  // A synthetic minimal Ogg-Opus stream (BOS page wrapping `OpusHead` +
+  // EOS page wrapping `OpusTags` with vendor + 2 KEY=VALUE comments —
+  // built in `examples/gen_synthetic_opus.rs`). Avoids the real
+  // `Opus.opus` corpus fixture's `METADATA_BLOCK_PICTURE` which
+  // SubDirectory-hops into `FLAC::Picture` (DEFERRED — see Picture
+  // forward-items entry). Exercises `OverrideFileType('OPUS')`
+  // (Ogg.pm:50) firing on the `OpusHead` packet, AND the `OpusTags`
+  // Vorbis-comments delegation (Opus.pm:32) — the `Opus::Header`
+  // binary table (Opus.pm:36-51) is deferred (R1 F2 scope tightening),
+  // so `Opus:OpusVersion`/`AudioChannels`/`SampleRate`/`OutputGain` are
+  // excluded from the golden via `-x`.
+  check(
+    "synthetic_opus_minimal.opus",
+    "synthetic_opus_minimal.opus.json",
+    true,
+  );
+  check(
+    "synthetic_opus_minimal.opus",
+    "synthetic_opus_minimal.opus.n.json",
+    false,
+  );
+}
+
+#[test]
 fn unsupported_bz2_conformance() {
   check("Unsupported.bz2", "Unsupported.bz2.json", true);
   check("Unsupported.bz2", "Unsupported.bz2.n.json", false);

@@ -122,9 +122,13 @@ impl<'a> ParseContext<'a> {
     }
   }
 
-  /// The file bytes the parser reads (`$raf` content).
+  /// The file bytes the parser reads (`$raf` content). Returns the
+  /// `&'a [u8]` tied to the original file lifetime rather than to `&self`,
+  /// so a parser may interleave data reads with mutable-`ctx` calls (e.g.
+  /// `ctx.metadata().push_warning(...)` inside an Ogg page-walk loop)
+  /// without an immutable-vs-mutable borrow conflict.
   #[must_use]
-  pub fn data(&self) -> &[u8] {
+  pub fn data(&self) -> &'a [u8] {
     self.data
   }
 

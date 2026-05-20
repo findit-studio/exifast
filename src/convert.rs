@@ -385,8 +385,81 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
   bit_list.join(if lookup.is_some() { ", " } else { "," })
 }
 
-/// The stringified scalar ExifTool would key `$$conv{$val}` by (Perl hash
-/// keys are strings), and which the JSON serializer prints. Numbers use the
+// `convert_bitrate` (faithful `sub ConvertBitrate($)` from
+// `ExifTool.pm:6891-6902`) is DEFERRED to the dedicated Vorbis/Theora codec
+// PRs (R1 F2 — see `src/formats/ogg.rs` top-of-module comment). The Ogg
+// pathfinder PR tightened its scope back to "container + Vorbis-comment
+// block" and the `convert_bitrate` engine helper has no in-scope consumer
+// here. When `Vorbis.pm` / `Theora.pm` codec-identification-table PRs land,
+// they will re-land this helper alongside its consumers (Vorbis.pm:55,61,67
+// + Theora.pm:88).
+
+/// Faithful transliteration of `Image::ExifTool::XMP::DecodeBase64` (an
+/// RFC 4648 decode used by `Vorbis.pm:101-104` for `COVERART` and
+/// `Vorbis.pm:122-134` for `METADATA_BLOCK_PICTURE`). The standard alphabet
+/// `A-Za-z0-9+/`, with `=` padding; ignores whitespace; on the first
+/// invalid input byte the function returns the *partial* decode collected
+/// up to that point (mirroring Perl's `MIME::Base64::decode` permissive-
+/// but-bounded behavior — real ExifTool COVERART payloads are clean base64,
+/// so this fallback is mostly defensive and never panics). Output is the
+/// decoded raw bytes.
+pub(crate) fn base64_decode(s: &str) -> Vec<u8> {
+  // Map an ASCII byte to its 6-bit value, or `None` for ignored/invalid.
+  fn val(b: u8) -> Option<u8> {
+    match b {
+      b'A'..=b'Z' => Some(b - b'A'),
+      b'a'..=b'z' => Some(b - b'a' + 26),
+      b'0'..=b'9' => Some(b - b'0' + 52),
+      b'+' => Some(62),
+      b'/' => Some(63),
+      _ => None,
+    }
+  }
+  let mut out: Vec<u8> = Vec::with_capacity(s.len() * 3 / 4);
+  let mut buf: u32 = 0;
+  let mut have: u32 = 0; // number of valid 6-bit chunks accumulated (0..=4)
+  for &b in s.as_bytes() {
+    if b == b'=' {
+      // Padding — stops decoding (the trailing 1/2 byte was emitted as the
+      // chunks accumulated; padding is purely positional).
+      break;
+    }
+    if b.is_ascii_whitespace() {
+      continue;
+    }
+    let Some(v) = val(b) else {
+      // Invalid byte ⇒ abort (mirror Perl's permissive-but-bounded decode:
+      // anything outside the alphabet + padding + whitespace → no further
+      // bytes, return what we have so far). Real ExifTool COVERART payloads
+      // are clean base64, so this branch only fires on a truly malformed
+      // input; returning the partial decode (Vec accumulated so far) keeps
+      // the parser panic-free.
+      return out;
+    };
+    buf = (buf << 6) | u32::from(v);
+    have += 1;
+    if have == 4 {
+      out.push((buf >> 16) as u8);
+      out.push((buf >> 8) as u8);
+      out.push(buf as u8);
+      buf = 0;
+      have = 0;
+    }
+  }
+  // Emit any leftover bytes (when input length % 4 ∈ {2, 3}). Perl's
+  // `MIME::Base64::decode` does the same: a final partial group of 2 valid
+  // base64 chars decodes to 1 byte, 3 chars to 2 bytes.
+  match have {
+    2 => out.push((buf >> 4) as u8),
+    3 => {
+      out.push((buf >> 10) as u8);
+      out.push((buf >> 2) as u8);
+    }
+    _ => {}
+  }
+  out
+}
+
 /// crate's single shared `%g`/rational formatter ([`crate::value::format_g`]
 /// / [`Rational::exiftool_val_str`]) so a hash key matches the serialized
 /// `$val` text exactly. `Bytes` has no faithful Perl scalar key ⇒ `None`

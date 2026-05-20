@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "Vorbis.ogg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OGG",
+  "File:FileTypeExtension": "ogg",
+  "File:MIMEType": "audio/ogg",
+  "Vorbis:Vendor": "AO; aoTuV b4b [20051117] (based on Xiph.Org's libVorbis)",
+  "Vorbis:CoverArtMIMEType": "image/jpeg",
+  "Vorbis:CoverArt": "(Binary data 1351 bytes, use -b option to extract)",
+  "Vorbis:MediajukeboxToolName": "Media Center",
+  "Vorbis:MediajukeboxToolVersion": "11.1.197",
+  "Vorbis:Genre": "Funk",
+  "Vorbis:MediajukeboxDate": 38718,
+  "Vorbis:Date": 2006,
+  "Vorbis:Title": "A 4s sample for testing embedded cover art",
+  "Vorbis:TrackNumber": 1,
+  "Vorbis:Comment": "a nice comment",
+  "Vorbis:Artist": "Who Knows",
+  "Vorbis:Album": "The Test Album"
+}]
