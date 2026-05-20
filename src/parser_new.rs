@@ -25,8 +25,7 @@
 //! / Phase F (everything else). Both are `#[non_exhaustive]` so new format
 //! arms are additive.
 
-use core::fmt;
-use core::marker::PhantomData;
+use core::{fmt, marker::PhantomData};
 
 pub(crate) mod parser_sealed {
   /// Sealed marker for the new [`super::FormatParser`] trait. Downstream
@@ -306,7 +305,12 @@ pub enum AnyParser {
   /// MPEG audio (Phase F4 — MP3 / MP2 / MUS frame parser + Xing/LAME tail).
   #[cfg(feature = "mpeg-audio")]
   MpegAudio(crate::formats::mpeg::ProcessMpegAudio),
-  // Phase F5 adds: Mpc, WavPack.
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio, chains ID3 + APE).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::ProcessMpc),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio, chains ID3 + APE).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::ProcessWv),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -375,6 +379,12 @@ pub enum AnyMeta<'a> {
   /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
   #[cfg(feature = "mpeg-audio")]
   MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::MpcMeta<'a>),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::WvMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
@@ -420,6 +430,10 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Ogg(m) => m.sink(print_conv, out),
       #[cfg(feature = "mpeg-audio")]
       AnyMeta::MpegAudio(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(m) => m.sink(print_conv, out),
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(m) => m.sink(print_conv, out),
     }
   }
 }
