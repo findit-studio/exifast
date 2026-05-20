@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "WavPack_adversarial.wv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WV",
+  "File:FileTypeExtension": "WV",
+  "File:MIMEType": "audio/x-wavpack",
+  "File:BytesPerSample": 4,
+  "File:AudioType": 1,
+  "File:Compression": 1,
+  "File:DataFormat": 1,
+  "File:SampleRate": 15
+}]

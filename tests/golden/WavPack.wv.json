@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "WavPack.wv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WV",
+  "File:FileTypeExtension": "wv",
+  "File:MIMEType": "audio/x-wavpack",
+  "File:BytesPerSample": 1,
+  "File:AudioType": "Mono",
+  "File:Compression": "Lossless",
+  "File:DataFormat": "Integer",
+  "File:SampleRate": 48000
+}]
