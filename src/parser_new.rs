@@ -367,10 +367,14 @@ pub enum AnyParser {
 ///
 /// `#[non_exhaustive]` ensures consumers cannot exhaustively match on the
 /// enum across crate-feature combinations — new format arms are additive
-/// within the crate, but no caller can rely on a fixed set. (Phase D
-/// originally added a `_Phantom(PhantomData<&'a ()>)` variant as a
-/// no-format-feature placeholder; Phase G retired it now that all 13
-/// formats have a real arm.)
+/// within the crate, but no caller can rely on a fixed set.
+///
+/// The lifetime `'a` is anchored by the real format arms (which all carry
+/// `XxxMeta<'a>`). When NO format feature is enabled, every arm is
+/// `cfg`'d out and `'a` would be unused (a hard `E0392` error), so the
+/// [`AnyMeta::_Phantom`] variant — present ONLY in a no-format build —
+/// anchors `'a`. Under the `all-formats` default the phantom is `cfg`'d
+/// OUT (Codex CF3).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
@@ -431,16 +435,41 @@ pub enum AnyMeta<'a> {
   /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
   #[cfg(feature = "wavpack")]
   Wv(crate::formats::wavpack::WvMeta<'a>),
+  /// Lifetime anchor for a no-format build (Codex CF3). When at least one
+  /// format feature is enabled this variant is `cfg`'d OUT (the real arms
+  /// anchor `'a`); it exists only so a `--features std` build with no
+  /// format gate still type-checks `AnyMeta<'a>` instead of failing with
+  /// `E0392` (unused lifetime parameter). It is uninhabitable from safe
+  /// code (`PhantomData` payload, `#[doc(hidden)]`).
+  #[cfg(not(any(
+    feature = "moi",
+    feature = "aac",
+    feature = "dv",
+    feature = "audible",
+    feature = "red",
+    feature = "id3",
+    feature = "mp3",
+    feature = "aiff",
+    feature = "ape",
+    feature = "dsf",
+    feature = "flac",
+    feature = "ogg",
+    feature = "mpeg-audio",
+    feature = "mpc",
+    feature = "wavpack",
+  )))]
+  #[doc(hidden)]
+  _Phantom(core::marker::PhantomData<&'a ()>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
-    // Note: `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)`
-    // gates means a match without `_` is only exhaustive when at least one
-    // format feature is on. The `all-formats` default and the `any(...)`
-    // gating on this `impl` block ensure that's always the case for any
-    // build that has an `AnyMeta` value to sink (a no-format build has no
-    // variants and the enum cannot be constructed).
+    // `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)` gates
+    // means a `_`-less match is exhaustive when ≥1 format feature is on
+    // (the real arms), and when NO format feature is on (only the
+    // `_Phantom` arm, Codex CF3). The `all-formats` default takes the
+    // former path; the phantom arm below keeps the no-format build
+    // type-checking.
     match self {
       #[cfg(feature = "moi")]
       AnyMeta::Moi(m) => m.sink(print_conv, out),
@@ -480,6 +509,30 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Mpc(m) => m.sink(print_conv, out),
       #[cfg(feature = "wavpack")]
       AnyMeta::Wv(m) => m.sink(print_conv, out),
+      // No-format build: the only variant is the uninhabitable phantom
+      // (Codex CF3). `PhantomData` carries no data, so there is nothing to
+      // sink; the arm exists purely for exhaustiveness.
+      #[cfg(not(any(
+        feature = "moi",
+        feature = "aac",
+        feature = "dv",
+        feature = "audible",
+        feature = "red",
+        feature = "id3",
+        feature = "mp3",
+        feature = "aiff",
+        feature = "ape",
+        feature = "dsf",
+        feature = "flac",
+        feature = "ogg",
+        feature = "mpeg-audio",
+        feature = "mpc",
+        feature = "wavpack",
+      )))]
+      AnyMeta::_Phantom(_) => {
+        let _ = (print_conv, out);
+        Ok(())
+      }
     }
   }
 }
@@ -696,6 +749,27 @@ impl AnyParser {
     shared: &mut SharedFlags,
     ext: Option<&'a str>,
   ) -> Result<Option<AnyMeta<'a>>, AnyError> {
+    // No-format build (Codex CF3): `AnyParser` has no variants, so the
+    // `match` below is empty and the parameters are unused. Discard them
+    // to keep the no-format tier warning-clean.
+    #[cfg(not(any(
+      feature = "moi",
+      feature = "aac",
+      feature = "dv",
+      feature = "audible",
+      feature = "red",
+      feature = "id3",
+      feature = "mp3",
+      feature = "aiff",
+      feature = "ape",
+      feature = "dsf",
+      feature = "flac",
+      feature = "ogg",
+      feature = "mpeg-audio",
+      feature = "mpc",
+      feature = "wavpack",
+    )))]
+    let _ = (bytes, shared, ext);
     match self {
       #[cfg(feature = "moi")]
       AnyParser::Moi(p) => {
