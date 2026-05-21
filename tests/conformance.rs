@@ -131,6 +131,66 @@ fn matroska_cluster_skip_conformance() {
 }
 
 #[test]
+fn matroska_negative_subsecond_date_conformance() {
+  // PR #31 R2 finding companion fixture — pre-2001 DateUTC (signed
+  // nanoseconds < 0) exercises BOTH (a) the EBML 8-byte signed-decode
+  // f64-promotion loss (`Matroska.pm:1184-1191` — Perl's `$val * 256 +
+  // $byte` accumulator promotes IV→NV at ~2^64 magnitude, so the
+  // post-subtract `$val` is OFF FROM THE EXACT INTEGER by ~256), and
+  // (b) the fractional-second `$frac < 0 → frac += 1, $itime -= 1`
+  // correction branch in `ExifTool.pm:6782`.
+  //
+  // Synthetic fixture: raw_ns = -1_500_000_000 (1.5 s before Matroska
+  // epoch). Bundled-Perl emits "2000:12:31 23:59:58.499999762Z" — the
+  // `.499999762` (not `.5`) is Perl's deliberate decode loss; our
+  // `convert_matroska_date` replays it via `(raw_ns as u64) as f64 -
+  // 2^64` for byte-exact match.
+  check(
+    "Matroska_negative_subsecond_date.mkv",
+    "Matroska_negative_subsecond_date.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_negative_subsecond_date.mkv",
+    "Matroska_negative_subsecond_date.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_subsecond_date_conformance() {
+  // PR #31 R2 finding — `Value::Date` rendering used `as i64` casting on
+  // `secs_unix` (f64), silently dropping the subsecond component that
+  // Perl's `ConvertUnixTime($t, undef, -9) . 'Z'` preserves
+  // (ExifTool.pm:6773-6800 fractional branch + `dec=-9` trim). The
+  // bundled Matroska.mkv fixture's DateTimeOriginal carries integer
+  // nanoseconds (`2010:02:03 21:17:48Z` — no fractional), so the
+  // original conformance didn't catch the loss.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[TimecodeScale,
+  // MuxingApp, WritingApp, DateUTC = 286_658_268_123_456_789]] →
+  // post-Matroska-offset `$t = 1264965468.123456789` → bundled-Perl
+  // emits `"2010:01:31 19:17:48.123456717Z"` (the `.717` instead of
+  // `.789` is the inherent f64 precision loss of Perl's `$val / 1e9`,
+  // which our `convert_matroska_date` faithfully transliterates).
+  //
+  // Goldens captured with `EXIFTOOL=...exiftool tools/gen_golden.sh
+  // Matroska_subsecond_date.mkv` — UNTRIMMED; the synthetic body is so
+  // minimal there are no System:* / Composite:* tags emitted by Perl
+  // for this fixture (gen_golden.sh strips fs-dependent System fields).
+  check(
+    "Matroska_subsecond_date.mkv",
+    "Matroska_subsecond_date.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_subsecond_date.mkv",
+    "Matroska_subsecond_date.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_attachment_conformance() {
   // PR #31 R1 finding F5 — Binary elements (Matroska.pm:552
   // `AttachedFileData`, 695 `TagBinary`). Synthetic fixture:

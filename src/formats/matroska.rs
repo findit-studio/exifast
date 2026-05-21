@@ -2992,11 +2992,12 @@ fn emit_one(
     }
     Value::Date(raw_ns) => {
       // Matroska.pm:1193-1198 — `$t = $val / 1e9; $t += (((2001-1970)*365+8)
-      // *24*3600); $val = ConvertUnixTime($t, undef, -9) . 'Z'`.
-      let secs_2001 = (*raw_ns as f64) / 1e9;
-      let secs_unix = secs_2001 + EPOCH_OFFSET_2001_TO_1970_SECS as f64;
-      let mut s = convert_unix_time(secs_unix as i64);
-      s.push('Z');
+      // *24*3600); $val = ConvertUnixTime($t, undef, -9) . 'Z'`. The dec=-9
+      // argument enables fractional-second formatting (9 decimal places) with
+      // trailing-zero trimming. See `convert_matroska_date` below for the
+      // faithful transliteration of `ConvertUnixTime`'s fractional branch
+      // (ExifTool.pm:6773-6800).
+      let s = convert_matroska_date(*raw_ns);
       out.write_str(group, name, &s)?;
     }
     Value::UidHex(hex) => {
@@ -3093,6 +3094,151 @@ fn emit_one(
 /// (`(2001 - 1970) * 365 + 8` leap days × 86400 = `978307200`).
 /// Matroska.pm:1196 `(((2001-1970)*365+8)*24*3600)`.
 const EPOCH_OFFSET_2001_TO_1970_SECS: i64 = ((2001 - 1970) * 365 + 8) * 24 * 3600;
+
+/// Faithful transliteration of `Matroska.pm:1193-1198` +
+/// `ExifTool.pm:6773-6800 ConvertUnixTime($t, undef, -9) . 'Z'`. Input:
+/// signed nanoseconds since the Matroska epoch (`2001-01-01T00:00:00Z`).
+///
+/// Algorithm (line-by-line vs Perl source):
+///
+/// ```text
+/// Matroska.pm:1194  my $t = $val / 1e9;                     # secs (Matroska epoch)
+/// Matroska.pm:1196  $t += (((2001-1970)*365+8)*24*3600);    # → Unix epoch
+/// Matroska.pm:1197  ConvertUnixTime($t, undef, -9) . 'Z'    # with dec=-9 (trim)
+///
+/// ExifTool.pm:6776   return '0000:00:00 00:00:00' if $time == 0
+/// ExifTool.pm:6779   $dec < 0 and $dec = -$dec, $trim = 1    # dec=-9 → 9 + trim
+/// ExifTool.pm:6780   my $itime = int($time)                  # truncate toward zero
+/// ExifTool.pm:6781   my $frac = $time - $itime
+/// ExifTool.pm:6782   $frac < 0 and $frac += 1, $itime -= 1
+/// ExifTool.pm:6783   $dec = sprintf('%.*f', $dec, $frac)     # "0.123456789" / "1.000000000"
+/// ExifTool.pm:6785   $dec =~ s/^(\d)// and $1 eq '1' and $itime += 1
+/// ExifTool.pm:6786   $dec =~ s/\.?0+$//                      # strip trailing zeros
+/// ExifTool.pm:6788   @tm = gmtime($itime); $tz = ''          # $toLocal == undef
+/// ExifTool.pm:6797   sprintf "%4d:%.2d:%.2d %.2d:%.2d:%.2d$dec%s"
+/// ```
+///
+/// The Perl `$val / 1e9` math is f64-lossy by design (Perl's NV is also
+/// f64); transliterating it line-for-line preserves byte-equivalence with
+/// the Perl oracle even where the format would mathematically support more
+/// precision. The zero-input shortcut fires on the POST-offset `$t`, i.e.
+/// when `raw_ns == -978_307_200_000_000_000` (the Unix epoch expressed in
+/// Matroska-relative nanoseconds), NOT when `raw_ns == 0` (which is the
+/// Matroska epoch `2001:01:01 00:00:00Z`).
+fn convert_matroska_date(raw_ns: i64) -> String {
+  // Matroska.pm:1184-1191 — `$val` is the post-decode signed integer.
+  // For an EBML signed/date element, bundled Perl accumulates each byte
+  // into `$val = $val * 256 + $byte` (lines 1186-1188); IF the high bit
+  // was set (line 1191), `$val -= $over` where `$over = 256^len`. The
+  // accumulator is a Perl SCALAR which promotes from IV → NV (f64) the
+  // moment the magnitude exceeds IV range (~`2^63`). For an 8-byte
+  // DateUTC with the high bit set, the pre-subtract magnitude reaches
+  // `~2^64`, so the result LOSES precision via f64 rounding — and the
+  // canonical EBML 8-byte DateUTC layout is what every real Matroska
+  // writer emits.
+  //
+  // To match Perl byte-for-byte we replay the same f64 promotion path
+  // for negative raw_ns: `raw_ns as u64` recovers the original unsigned
+  // accumulator value (2^64 + raw_ns since raw_ns < 0), `as f64` applies
+  // the same IEEE round-to-nearest as Perl's NV promotion, then the
+  // `- 2^64` subtraction (also in f64) recovers Perl's lossy negative.
+  // For non-negative raw_ns (high bit clear), Perl never enters the
+  // subtract branch and `raw_ns as f64` produces the same value as
+  // Perl's accumulator (`x.x.y.z as f64` is identical regardless of how
+  // you build x.x.y.z, since IEEE rounding is deterministic).
+  //
+  // Assumes 8-byte input — the canonical EBML DateUTC width (Matroska
+  // spec; every real-world writer emits 8 bytes for `Format => 'date'`).
+  // A non-8-byte DateUTC (extremely rare; the EBML grammar permits 1-8
+  // bytes for any signed integer) would compute Perl's `$over = 256^len`
+  // with a SMALLER value, so the correction here would diverge. If a
+  // fixture ever surfaces this case, plumb the byte length through from
+  // `decode_signed` and parameterize the correction. Until then the
+  // 8-byte assumption is byte-faithful for every real Matroska file.
+  let raw_f64 = if raw_ns < 0 {
+    // `$over = 256^8 = 2^64` (exact in f64 — it's a power of two within
+    // the representable range). `(raw_ns as u64) as f64` recovers Perl's
+    // pre-subtract NV; the subtraction in f64 mirrors line 1191.
+    const POW_2_64: f64 = 18_446_744_073_709_551_616.0; // 2^64 exact in f64
+    (raw_ns as u64) as f64 - POW_2_64
+  } else {
+    raw_ns as f64
+  };
+
+  // Matroska.pm:1194-1196 — f64 division + addition, deliberately lossy
+  // to match Perl's NV arithmetic byte-for-byte.
+  let secs_2001 = raw_f64 / 1e9;
+  let time = secs_2001 + EPOCH_OFFSET_2001_TO_1970_SECS as f64;
+
+  // ExifTool.pm:6776 — special-case input zero. This fires when `time`
+  // (post-Matroska-offset Unix seconds) is exactly 0.0, i.e. the Unix
+  // epoch expressed as a Matroska date. Matroska then appends 'Z'.
+  if time == 0.0 {
+    return "0000:00:00 00:00:00Z".to_string();
+  }
+
+  // ExifTool.pm:6779 — dec=-9 → dec=9, trim=1.
+  // ExifTool.pm:6780-6782 — split into truncate-toward-zero integer seconds
+  // plus non-negative fractional. Perl's `int()` on a float truncates
+  // toward zero; Rust's `f64::trunc()` does the same. The `frac < 0`
+  // correction keeps frac in `[0.0, 1.0)` (matching Perl's algorithm).
+  let mut itime = time.trunc() as i64;
+  let mut frac = time - time.trunc();
+  if frac < 0.0 {
+    frac += 1.0;
+    itime -= 1;
+  }
+
+  // ExifTool.pm:6783 — `sprintf('%.9f', $frac)` → "0.123456789" /
+  // "1.000000000" (the `%.9f` printf format always emits a single leading
+  // digit before the decimal for `frac` in `[0.0, 1.0]`, but rounding can
+  // promote frac to 1.000000000 at the %.9f boundary, which the next line
+  // detects and folds into itime).
+  let mut dec_str = format!("{frac:.9}");
+
+  // ExifTool.pm:6785 — `s/^(\d)//` strips one leading digit; if it was '1'
+  // (i.e. frac rounded UP to 1.000000000 at %.9f), increment itime.
+  // The first byte of `dec_str` is always an ASCII '0' or '1' (the integer
+  // part of a [0.0, 1.0] %.9f format never overflows into multi-digit), so
+  // we can peel it off via byte slicing — safe because the format string
+  // guarantees this shape.
+  debug_assert!(dec_str.starts_with('0') || dec_str.starts_with('1'));
+  let leading_was_one = dec_str.starts_with('1');
+  dec_str.remove(0);
+  if leading_was_one {
+    itime += 1;
+  }
+
+  // ExifTool.pm:6786 — `$dec =~ s/\.?0+$//` strips trailing zeros and a
+  // trailing '.' if present. Applied unconditionally because `trim = 1`
+  // (Matroska always passes negative dec).
+  while dec_str.ends_with('0') {
+    dec_str.pop();
+  }
+  if dec_str.ends_with('.') {
+    dec_str.pop();
+  }
+
+  // ExifTool.pm:6788-6789 — `gmtime($itime); $tz = ''` (toLocal == undef).
+  // ExifTool.pm:6797 — `sprintf("%4d:%.2d:%.2d %.2d:%.2d:%.2d$dec%s", ...)`.
+  // Matroska.pm:1197 — append 'Z'. We share `gmtime` via the public
+  // `convert_unix_time` helper for `itime != 0`; for the post-correction
+  // itime == 0 path we bypass its special-case shortcut (Perl's shortcut
+  // is on the ORIGINAL `$time`, not `$itime`, and at this point
+  // `$time != 0`).
+  let mut s = if itime == 0 {
+    // gmtime(0) ⇒ 1970:01:01 00:00:00 (the Unix epoch components). We
+    // can't call `convert_unix_time(0)` because that returns the
+    // `"0000:00:00 00:00:00"` shortcut, but Perl's shortcut here was
+    // already bypassed (input `$time != 0`).
+    "1970:01:01 00:00:00".to_string()
+  } else {
+    convert_unix_time(itime)
+  };
+  s.push_str(&dec_str);
+  s.push('Z');
+  s
+}
 
 /// Perl-style "compact" float-to-string for a finite f64. When the value
 /// is exactly an integer (e.g. `1.0`, `25.0`, `24.0`), Perl's default
@@ -3264,6 +3410,94 @@ mod tests {
   fn epoch_offset_constant_matches_perl() {
     // (((2001-1970)*365+8)*24*3600) = 978307200
     assert_eq!(EPOCH_OFFSET_2001_TO_1970_SECS, 978_307_200);
+  }
+
+  // -- convert_matroska_date ----------------------------------------------
+  // Bundled-Perl oracle (LC_ALL=C TZ=UTC) on
+  // `Image::ExifTool::ConvertUnixTime($val/1e9 + 978_307_200, undef, -9)
+  // . 'Z'` for each `raw_ns` below. Confirms our faithful transliteration
+  // of the fractional branch (`ExifTool.pm:6773-6800`) matches Perl's NV
+  // arithmetic byte-for-byte.
+
+  #[test]
+  fn convert_matroska_date_matroska_epoch_is_2001_jan_01() {
+    // raw_ns = 0 ⇒ Matroska epoch ⇒ 2001:01:01 00:00:00Z (NOT the
+    // ExifTool.pm:6776 shortcut — that triggers when post-offset $t == 0).
+    assert_eq!(convert_matroska_date(0), "2001:01:01 00:00:00Z");
+  }
+
+  #[test]
+  fn convert_matroska_date_unix_epoch_hits_zero_shortcut() {
+    // raw_ns = -978_307_200_000_000_000 ⇒ post-offset $t == 0 ⇒
+    // ExifTool.pm:6776 shortcut fires; Matroska appends 'Z'.
+    let unix_epoch_ns = -(EPOCH_OFFSET_2001_TO_1970_SECS * 1_000_000_000);
+    assert_eq!(convert_matroska_date(unix_epoch_ns), "0000:00:00 00:00:00Z");
+  }
+
+  #[test]
+  fn convert_matroska_date_integer_seconds_have_no_fractional() {
+    // Bundled Matroska.mkv carries DateTimeOriginal that maps to
+    // "2010:02:03 21:17:48Z" (no fractional). Synthetic exact whole-second
+    // example: raw_ns ≡ (1264965468 - 978307200) * 1e9 = 286658268000000000.
+    // Bundled-Perl on $t=1264965468.0 yields "2010:01:31 19:17:48" (no
+    // fractional after trim).
+    let raw_ns = 286_658_268_i64 * 1_000_000_000;
+    assert_eq!(convert_matroska_date(raw_ns), "2010:01:31 19:17:48Z");
+  }
+
+  #[test]
+  fn convert_matroska_date_half_second_renders_dot_five() {
+    // raw_ns = (1264965468 - 978307200) * 1e9 + 500_000_000 ⇒ $t = .5
+    // ⇒ Bundled-Perl: "2010:01:31 19:17:48.5". Verifies trailing-zero
+    // trim collapses ".500000000" → ".5".
+    let raw_ns = 286_658_268_i64 * 1_000_000_000 + 500_000_000;
+    assert_eq!(convert_matroska_date(raw_ns), "2010:01:31 19:17:48.5Z");
+  }
+
+  #[test]
+  fn convert_matroska_date_high_precision_subseconds_lossy_to_f64() {
+    // raw_ns = (1264965468 - 978307200) * 1e9 + 123456789 ⇒ Bundled-Perl
+    // on $t=1264965468.123456789 yields ".123456717" (f64 precision loss
+    // by design — Perl's NV / 1e9 has the same loss).
+    let raw_ns = 286_658_268_i64 * 1_000_000_000 + 123_456_789;
+    assert_eq!(
+      convert_matroska_date(raw_ns),
+      "2010:01:31 19:17:48.123456717Z"
+    );
+  }
+
+  #[test]
+  fn convert_matroska_date_negative_raw_ns_pre_2001() {
+    // raw_ns = -1_500_000_000 ⇒ Perl's 8-byte signed-decode loop
+    // accumulates 0xFFFFFFFFA697D100 → NV-promotes to f64
+    // (1.84467440722095514e+19), then `- 2^64` in f64 yields -1500000256
+    // (off by 256 from the exact -1.5e9, due to f64 rounding at the
+    // ~2^64 magnitude). `$t = -1500000256/1e9 + 978307200 ≈
+    // 978307198.499999744` ⇒ Bundled-Perl emits "2000:12:31
+    // 23:59:58.499999762Z" — byte-exact via our u64-as-f64-minus-2^64
+    // replay. Exercises (a) the negative-i64 → f64 lossy-cast path and
+    // (b) the `$frac < 0 → frac += 1; itime -= 1` branch via the
+    // POSITIVE fractional component that results from a non-integral
+    // post-offset $t.
+    let raw_ns = -1_500_000_000_i64;
+    assert_eq!(
+      convert_matroska_date(raw_ns),
+      "2000:12:31 23:59:58.499999762Z"
+    );
+  }
+
+  #[test]
+  fn convert_matroska_date_round_up_carries_into_seconds() {
+    // raw_ns chosen so $t = ...9999999995 rounds UP to .000000000 at
+    // %.9f boundary and the increment-itime branch fires. Bundled-Perl
+    // on 1264965468.9999999995 = "2010:01:31 19:17:49" (whole second
+    // after round-up + trim of trailing zeros).
+    // (1264965468 - 978307200) * 1e9 + 999999999 = 286658268999999999
+    let raw_ns = 286_658_268_999_999_999_i64;
+    // f64 imprecision near .9999999995 promotes to next second.
+    // Verify against the bundled-Perl direct oracle (line for 1264965468
+    // .9999999995 captured 2026-05-22).
+    assert_eq!(convert_matroska_date(raw_ns), "2010:01:31 19:17:49Z");
   }
 
   #[test]

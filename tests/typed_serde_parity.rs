@@ -188,12 +188,19 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // adversarial fixtures exercising SimpleTag/StdTag mapping,
   // unknown-size Segment, default Cluster-stop, and binary-placeholder
   // emission (see `tests/conformance.rs::matroska_*_conformance`).
+  // 131 → 133 after PR #31 Round-2 finding (DateUTC subsecond loss):
+  // added `Matroska_subsecond_date.mkv` (positive raw_ns with non-zero
+  // nanosecond remainder) and `Matroska_negative_subsecond_date.mkv`
+  // (pre-2001 raw_ns < 0 exercising both the EBML 8-byte signed-decode
+  // f64 promotion loss and the $frac < 0 correction branch). Both
+  // verify the new `convert_matroska_date` faithful transliteration of
+  // `Matroska.pm:1184-1198` + `ExifTool.pm:6773-6800` fractional branch.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    131,
-    "expected exactly the 131 active conformance fixtures, found {}: {:?}",
+    133,
+    "expected exactly the 133 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
