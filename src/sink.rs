@@ -395,6 +395,27 @@ impl TagWriter for MetadataTagWriter<'_> {
     self.meta.push_error(text.to_string());
     Ok(())
   }
+
+  /// Override the default `write_str_list` to route through
+  /// [`Metadata::push_listable`], preserving the first-occurrence-position
+  /// list-coalesce semantics that the CLI JSON serializer expects
+  /// (faithful to ExifTool.pm:9505-9520 `FoundTag` promote-and-push).
+  ///
+  /// This unblocks the OGG/FLAC bridges from calling `push_listable`
+  /// directly inside their `OldFormatParser::process` impls — the typed
+  /// [`MetaSinker::sink`](crate::parser_new::MetaSinker) path can now emit
+  /// list values via `write_str_list` and the bridge translates them
+  /// faithfully. Added in Phase G (per F3-FLAC / F4-OGG integration notes).
+  fn write_str_list(&mut self, group: &str, name: &str, values: &[&str]) -> Result<(), Infallible> {
+    for v in values {
+      self.meta.push_listable(
+        self.group(group),
+        name.to_string(),
+        TagValue::Str((*v).into()),
+      );
+    }
+    Ok(())
+  }
 }
 
 // ===========================================================================
@@ -609,5 +630,45 @@ mod tests {
       .expect("pushed tag missing");
     assert_eq!(tag.group().family0(), "MOI");
     assert_eq!(tag.group().family1(), "MOI");
+  }
+
+  /// `write_str_list` routes through `Metadata::push_listable` on the
+  /// bridge sink, coalescing repeats into a single first-occurrence-position
+  /// `TagValue::List`. Faithful to ExifTool's `FoundTag` list-coalesce
+  /// (ExifTool.pm:9505-9520).
+  #[test]
+  fn metadata_writer_write_str_list_coalesces_via_push_listable() {
+    let mut meta = Metadata::new("x.ogg");
+    {
+      let mut w = MetadataTagWriter::new(&mut meta);
+      w.write_str_list("Vorbis", "Artist", &["Alice", "Bob", "Carol"])
+        .unwrap();
+    }
+    let tag = meta
+      .tags()
+      .iter()
+      .find(|t| t.name() == "Artist")
+      .expect("Artist tag missing");
+    // Single tag with a 3-element list, not 3 separate scalar pushes.
+    match tag.value() {
+      crate::value::TagValue::List(items) => {
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], crate::value::TagValue::Str(s) if s == "Alice"));
+        assert!(matches!(&items[1], crate::value::TagValue::Str(s) if s == "Bob"));
+        assert!(matches!(&items[2], crate::value::TagValue::Str(s) if s == "Carol"));
+      }
+      other => panic!("expected TagValue::List, got {other:?}"),
+    }
+  }
+
+  /// `write_str_list` on the default `MapTagWriter` falls through to the
+  /// trait's default impl (per-element `write_str`). The BTreeMap's
+  /// last-write-wins means only the final element is observable; this is
+  /// the documented behavior for non-list-aware sinks.
+  #[test]
+  fn map_tag_writer_write_str_list_uses_default_impl_last_write_wins() {
+    let mut w = MapTagWriter::new();
+    w.write_str_list("G", "N", &["a", "b", "c"]).unwrap();
+    assert_eq!(w.get("G", "N").map(MapValue::as_str), Some("c".to_string()));
   }
 }

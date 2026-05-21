@@ -73,6 +73,6 @@ pub mod v2_common;
 pub mod v2_process;
 
 pub use process::{
-  Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, Mp3Error, Mp3Meta,
-  ProcessId3, ProcessMp3,
+  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, Mp3Context,
+  Mp3Error, Mp3Meta, ProcessId3, ProcessMp3, parse_id3_borrowed,
 };
