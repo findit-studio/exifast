@@ -328,10 +328,15 @@ pub fn parse_id3<'a>(
 
 /// Parse an MP3 file (ID3 wrapper + MPEG audio chain + APE trailer)
 /// directly through the typed [`ProcessMp3`] parser, faithful to bundled
-/// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728). The returned
-/// [`Mp3Meta`] borrows from `bytes` and carries the ID3, MPEG-audio, and
-/// APE-trailer sub-Metas; it is `Some` for a valid MPEG-only MP3 (Codex
-/// BF1/CF1).
+/// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728). Only `bytes`
+/// flows into the returned [`Mp3Meta<'a>`] (which carries the ID3,
+/// MPEG-audio, and APE-trailer sub-Metas); it is `Some` for a valid
+/// MPEG-only MP3 (Codex BF1/CF1).
+///
+/// `ext` borrows on an **independent** lifetime — it is consumed only to
+/// derive the MPEG scan window + Layer-II/MUS gate and is never stored, so
+/// a transient `ext` string may be dropped while the returned meta lives on
+/// (Codex C-R2-2).
 ///
 /// The ID3 sub-Meta is staged in `-j` (PrintConv) mode; sink the result
 /// with `sink(true, ...)`.
@@ -342,11 +347,11 @@ pub fn parse_id3<'a>(
 #[cfg(feature = "mp3")]
 pub fn parse_mp3<'a>(
   bytes: &'a [u8],
-  ext: Option<&'a str>,
+  ext: Option<&str>,
 ) -> core::result::Result<Option<Mp3Meta<'a>>, Mp3Error> {
-  // `parse_mp3_borrowed` decouples the transient `shared` borrow from the
-  // returned `Mp3Meta<'a>` (which borrows from `bytes`), so a local
-  // `SharedFlags` is valid here.
+  // `parse_mp3_borrowed` decouples the transient `shared` AND `ext` borrows
+  // from the returned `Mp3Meta<'a>` (which borrows only from `bytes`), so a
+  // local `SharedFlags` and a transient `ext` are both valid here.
   let mut shared = SharedFlags::new();
   formats::id3::parse_mp3_borrowed(bytes, ext, &mut shared)
 }
@@ -366,8 +371,10 @@ pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, Ai
 /// [`ProcessApe`] parser.
 ///
 /// `shared` carries cross-format state (`DoneID3` / `DoneAPE` flags) and
-/// borrows independently of `bytes` — the returned [`ApeMeta`] owns its
-/// data (`'a` phantom).
+/// borrows **independently** of `bytes` — only the byte-buffer lifetime
+/// `'a` flows into the returned [`ApeMeta`] (which owns its data; `'a` is
+/// phantom). The transient `shared` may therefore be dropped or reused
+/// while the returned meta lives on (Codex C-R2-2).
 ///
 /// # Errors
 ///
@@ -375,10 +382,13 @@ pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, Ai
 #[cfg(feature = "ape")]
 pub fn parse_ape<'a>(
   bytes: &'a [u8],
-  shared: &'a mut SharedFlags,
+  shared: &mut SharedFlags,
 ) -> core::result::Result<Option<ApeMeta<'a>>, ApeError> {
-  use parser_new::FormatParser;
-  ProcessApe.parse(ApeContext::new(bytes, shared))
+  // Use the decoupled `parse_full_owned` (returns `ApeMeta<'static>`,
+  // covariant to `'a`) rather than `ProcessApe.parse(ApeContext::new(...))`,
+  // whose GAT `Context<'a> = ApeContext<'a>` ties `shared` to the Meta's
+  // lifetime even though `ApeMeta` never borrows from it (Codex C-R2-2).
+  Ok(formats::ape::parse_full_owned(bytes, shared))
 }
 
 /// Parse a DSF (DSD Stream File) buffer directly. See
@@ -563,5 +573,46 @@ mod tests {
     {
       let _ = parse_mpeg_audio(bytes, true, "MP3");
     }
+  }
+
+  /// **Codex C-R2-2.** `parse_mp3`'s returned `Mp3Meta<'a>` is tied ONLY to
+  /// the byte buffer — a transient `ext` string can be dropped while the
+  /// meta lives on. This compiles only if `ext` is on an independent
+  /// (non-`'a`) lifetime. (The buffer is non-MP3 so the parse returns
+  /// `None`; the point is the borrow shape, exercised at compile time.)
+  #[test]
+  #[cfg(feature = "mp3")]
+  fn parse_mp3_meta_outlives_transient_ext() {
+    let bytes: Vec<u8> = vec![0xff, 0xfb, 0x90, 0x00];
+    let meta = {
+      // `ext` is a short-lived String dropped at the end of this block.
+      let ext: String = String::from("MP3");
+      let m = parse_mp3(&bytes, Some(ext.as_str())).expect("ok");
+      // `ext` drops here; `m` must remain valid (borrows only `bytes`).
+      m
+    };
+    // Use the meta after `ext` is gone — proves the decoupling.
+    let _ = meta.is_some();
+  }
+
+  /// **Codex C-R2-2.** `parse_ape`'s returned `ApeMeta<'a>` does not borrow
+  /// from `shared` — the `SharedFlags` can be dropped (or reused for another
+  /// parse) while the meta lives on. Compiles only if `shared` is on an
+  /// independent lifetime.
+  #[test]
+  #[cfg(feature = "ape")]
+  fn parse_ape_meta_outlives_transient_shared() {
+    let bytes: Vec<u8> = vec![0u8; 64];
+    let meta = {
+      let mut shared = SharedFlags::new();
+      let m = parse_ape(&bytes, &mut shared).expect("ok");
+      // `shared` drops here; `m` must remain valid (ApeMeta is owned).
+      m
+    };
+    let _ = meta.is_some();
+    // `shared` can also be reused for a second parse without aliasing the
+    // first meta — exercise that path too.
+    let mut shared2 = SharedFlags::new();
+    let _ = parse_ape(&bytes, &mut shared2).expect("ok");
   }
 }

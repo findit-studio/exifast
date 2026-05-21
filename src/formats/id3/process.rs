@@ -854,10 +854,13 @@ impl FormatParser for ProcessMp3 {
 /// `print_conv` is fixed to `true` (`-j`) for the typed entry: the ID3
 /// sub-Meta is mode-locked (Codex BF2), and MPEG/APE sub-Metas apply
 /// PrintConv at sink time. Sink the result with `sink(true, ...)`.
+// `ext` borrows on an INDEPENDENT lifetime — `Mp3Meta` (and its MPEG
+// sub-Meta) never store it; only `data` flows into the returned Meta's `'a`
+// (Codex C-R2-2).
 #[cfg(feature = "mp3")]
 fn parse_mp3_typed<'a>(
   data: &'a [u8],
-  ext: Option<&'a str>,
+  ext: Option<&str>,
   shared: &mut SharedFlags,
 ) -> Result<Option<Mp3Meta<'a>>, Id3Error> {
   // -- 1. ID3 (ID3.pm:1691-1693) ------------------------------------------
@@ -929,11 +932,11 @@ fn parse_mp3_typed<'a>(
 }
 
 /// Lib-first direct entry for the MP3 wrapper with **decoupled `shared`
-/// lifetime** — `data` borrows for `'a` (and so does the returned
-/// [`Mp3Meta`]), while `shared` is a transient borrow that does not pin
-/// the returned Meta. This is the entry the public
-/// [`parse_mp3`](crate::parse_mp3) uses with a freshly-constructed
-/// [`SharedFlags`].
+/// and `ext` lifetimes** — only `data` borrows for `'a` (and so does the
+/// returned [`Mp3Meta`]), while `shared` and `ext` are transient borrows on
+/// independent lifetimes that do NOT pin the returned Meta (Codex C-R2-2).
+/// This is the entry the public [`parse_mp3`](crate::parse_mp3) uses with a
+/// freshly-constructed [`SharedFlags`].
 ///
 /// The ID3 sub-Meta is staged in `-j` PrintConv mode (sink with
 /// `sink(true, ...)`); MPEG / APE sub-Metas apply PrintConv at sink time.
@@ -944,7 +947,7 @@ fn parse_mp3_typed<'a>(
 #[cfg(feature = "mp3")]
 pub fn parse_mp3_borrowed<'a>(
   data: &'a [u8],
-  ext: Option<&'a str>,
+  ext: Option<&str>,
   shared: &mut SharedFlags,
 ) -> Result<Option<Mp3Meta<'a>>, Mp3Error> {
   parse_mp3_typed(data, ext, shared).map_err(Mp3Error::Id3)
