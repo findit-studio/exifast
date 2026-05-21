@@ -770,11 +770,19 @@ impl AnyParser {
   /// (uninhabited `XxxError` enums), so the `Err` branch is unreachable
   /// in practice; the structure is in place for future I/O-fallible
   /// parsers.
+  ///
+  /// `ext` borrows on an INDEPENDENT (elided) lifetime — distinct from
+  /// `bytes`. Only `bytes` drives the returned `AnyMeta<'a>`; no dispatch arm
+  /// stores `ext` into the Meta (the MP3 / MPEG-audio arms thread it into
+  /// helpers that consume it for the layer-II / `.MUS` gate but never retain
+  /// it). So a caller may pass a transient `ext` string, drop it, and keep
+  /// the returned Meta (Codex C-R3-1; C-R2-2 fixed the direct `parse_<fmt>`
+  /// accessors but missed this closed-dispatch path).
   pub fn parse_any<'a>(
     self,
     bytes: &'a [u8],
     shared: &mut SharedFlags,
-    ext: Option<&'a str>,
+    ext: Option<&str>,
   ) -> Result<Option<AnyMeta<'a>>, AnyError> {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` below is empty and the parameters are unused. Discard them
@@ -1201,6 +1209,34 @@ mod tests {
     // acceptance rules for a 16-byte buffer; this test just verifies the
     // dispatch doesn't panic and produces an `Ok(_)` result.
     assert!(result.is_ok());
+  }
+
+  /// Codex C-R3-1: `parse_any` decouples the transient `ext` borrow from the
+  /// returned `AnyMeta<'a>` (only `bytes` flows into the Meta). The MP3 arm
+  /// threads `ext` into `parse_mp3_borrowed` for the layer-II / `.MUS` gate
+  /// but never stores it, so a short-lived `ext` string may be dropped while
+  /// the returned Meta lives on. This compiles ONLY if `ext` is on an
+  /// independent lifetime; it is the closed-dispatch analogue of
+  /// `lib::parse_mp3_meta_outlives_transient_ext` (which covered the direct
+  /// accessor under C-R2-2). The byte buffer is a minimal MPEG-audio sync
+  /// frame so the MP3 arm produces `Some`.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn parse_any_meta_outlives_transient_ext() {
+    let bytes: Vec<u8> = vec![0xff, 0xfb, 0x90, 0x00];
+    let parser = any_parser_for("MP3").expect("MP3 feature enabled");
+    let mut shared = SharedFlags::new();
+    let meta = {
+      // `ext` is a short-lived String dropped at the end of this block.
+      let ext: String = String::from("MP3");
+      let m = parser
+        .parse_any(&bytes, &mut shared, Some(ext.as_str()))
+        .expect("ok");
+      // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
+      m
+    };
+    // Use the meta after `ext` is gone — proves the decoupling.
+    let _ = meta.is_some();
   }
 
   /// `AnyError` formats nicely via `Display`. Most format errors are
