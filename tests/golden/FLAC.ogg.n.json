@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "FLAC.ogg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OGG",
+  "File:FileTypeExtension": "OGG",
+  "File:MIMEType": "audio/ogg",
+  "FLAC:BlockSizeMin": 4608,
+  "FLAC:BlockSizeMax": 4608,
+  "FLAC:FrameSizeMin": 0,
+  "FLAC:FrameSizeMax": 0,
+  "FLAC:SampleRate": 8000,
+  "FLAC:Channels": 2,
+  "FLAC:BitsPerSample": 8,
+  "FLAC:TotalSamples": 0,
+  "FLAC:MD5Signature": "00000000000000000000000000000000",
+  "Vorbis:Vendor": "reference libFLAC 1.1.2 20050205"
+}]

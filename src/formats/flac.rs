@@ -180,8 +180,13 @@ pub const FLAC_STREAMINFO_BIT_KEYS: &[&str] = &[
 /// outside the 0..=20 table (faithful: `Unknown (N)` is NOT in the table;
 /// for an unknown code ExifTool's default `PrintConv` falls back to the
 /// numeric value as a string).
+///
+/// `pub(crate)` so OGG's `METADATA_BLOCK_PICTURE` SubDirectory hop
+/// (R3 F2 — Vorbis.pm:122-134) can resolve the same PrintConv on the
+/// decoded payload (the on-wire structure is identical to FLAC's type-6
+/// block).
 #[must_use]
-const fn picture_type_name(code: u32) -> Option<&'static str> {
+pub(crate) const fn picture_type_name(code: u32) -> Option<&'static str> {
   match code {
     0 => Some("Other"),
     1 => Some("32x32 PNG Icon"),
@@ -1195,7 +1200,11 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
 /// MIME length-word) are truncated — for any later truncation the
 /// declared length is clamped to the remaining bytes (ExifTool::ReadValue
 /// clamp at ExifTool.pm:6290-6298) and partial data is preserved.
-fn parse_flac_picture(payload: &[u8]) -> Option<Picture<'_>> {
+///
+/// `pub(crate)` so the OGG/Vorbis `METADATA_BLOCK_PICTURE` SubDirectory
+/// hop (R3 F2 — Vorbis.pm:122-134) can reuse it on the base64-decoded
+/// payload (same on-wire structure as FLAC's METADATA_BLOCK type 6).
+pub(crate) fn parse_flac_picture(payload: &[u8]) -> Option<Picture<'_>> {
   let mut pos = 0usize;
   // -- index 0: PictureType (int32u BE) -----------------------------------
   if payload.len() < pos + 4 {

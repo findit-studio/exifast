@@ -110,8 +110,15 @@ fn coverart_valueconv(v: &TagValue) -> TagValue {
 
 fn metadata_block_picture_valueconv(v: &TagValue) -> TagValue {
   // Vorbis.pm:122-134 `Binary => 1, RawConv => 'XMP::DecodeBase64($val)'`.
-  // The SubDirectory hop to `FLAC::Picture` is deferred (see module doc).
-  // For our scope: emit the decoded raw bytes (same shape as COVERART).
+  // The RawConv decodes base64 to raw bytes; the SubDirectory hop to
+  // `FLAC::Picture` (Vorbis.pm:130-133) then parses the resulting payload.
+  // R3 F2: the SubDirectory hop is now intercepted by
+  // `process_vorbis_comments` BEFORE this ValueConv runs (see the
+  // `METADATA_BLOCK_PICTURE` branch in that function), so the decoded
+  // bytes are parsed into an `OggPicture` and emitted as `FLAC:Picture*`
+  // fields. This ValueConv is kept as the fallback for any future call
+  // site that bypasses the comments-level intercept; today it's
+  // unreachable.
   coverart_valueconv(v)
 }
 
@@ -717,6 +724,158 @@ fn parse_opus_header(payload: &[u8]) -> Option<OpusHeader> {
 }
 
 // ===========================================================================
+// OggPicture — owned form of a Vorbis::Comments METADATA_BLOCK_PICTURE
+//
+// R3 F2 (Codex adversarial). Bundled Vorbis.pm:122-134 defines:
+//
+//   METADATA_BLOCK_PICTURE => {
+//     Name => 'Picture', Binary => 1,
+//     RawConv => 'XMP::DecodeBase64($val)',
+//     SubDirectory => { TagTable => 'Image::ExifTool::FLAC::Picture',
+//                        ByteOrder => 'BigEndian' },
+//   };
+//
+// The base64-decoded payload has the SAME on-wire structure as a FLAC
+// METADATA_BLOCK type 6 (PictureType / MIMEType / Description /
+// Width / Height / BitsPerPixel / IndexedColors / Length / Picture
+// data; FLAC.pm:84-134). Pre-fix the OGG parser stopped at the
+// base64 decode and emitted a single `Vorbis:Picture` blob —
+// silent loss of every Picture:* sub-field that bundled emits.
+//
+// Implementation: parse the decoded payload via
+// `flac::parse_flac_picture` (same routine FLAC uses for its type-6
+// block), then OWN the fields (allocate `String` / `Vec<u8>` so the
+// typed Meta doesn't borrow from a temporary base64 buffer). The
+// emission path mirrors `flac::sink_picture` but writes directly
+// against an `OggPicture` (no lifetime juggling needed).
+// ===========================================================================
+
+/// Owned form of a FLAC Picture METADATA_BLOCK, used by the Vorbis
+/// `METADATA_BLOCK_PICTURE` SubDirectory hop (Vorbis.pm:122-134). The
+/// base64-decoded payload from the Vorbis comment is parsed via
+/// [`crate::formats::flac::parse_flac_picture`] (same on-wire layout as
+/// FLAC's type-6 metadata block, FLAC.pm:84-134) and the resulting
+/// borrowed `Picture<'_>` is cloned into owned fields so the typed
+/// `ogg::Meta` doesn't borrow from a temporary base64 buffer.
+///
+/// **D8 — no public fields, accessors only.** §3 projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OggPicture {
+  /// `FLAC:PictureType` raw int32u (FLAC.pm:88-113 PrintConv hash key).
+  picture_type: u32,
+  /// `FLAC:PictureMIMEType` (FLAC.pm:115-117, `Format => 'var_pstr32'`),
+  /// UTF-8 string. Owned `String` (the base64-decoded buffer is dropped
+  /// after parse).
+  mime_type: String,
+  /// `FLAC:PictureDescription` (FLAC.pm:118-122, UTF-8 var_pstr32).
+  description: String,
+  /// `FLAC:PictureWidth` (FLAC.pm:123, int32u BE).
+  width: u32,
+  /// `FLAC:PictureHeight` (FLAC.pm:124, int32u BE).
+  height: u32,
+  /// `FLAC:PictureBitsPerPixel` (FLAC.pm:125, int32u BE).
+  bits_per_pixel: u32,
+  /// `FLAC:PictureIndexedColors` (FLAC.pm:126, int32u BE).
+  indexed_colors: u32,
+  /// `FLAC:PictureLength` (FLAC.pm:127) — DECLARED length, may exceed
+  /// `data.len()` on truncation (faithful ExifTool::ReadValue clamp).
+  length: u32,
+  /// `FLAC:Picture` raw bytes (FLAC.pm:128-133 `Format => 'undef[$val{7}]'`,
+  /// clamped to remaining payload). Owned `Vec<u8>`.
+  data: Vec<u8>,
+}
+
+impl OggPicture {
+  /// `FLAC:PictureType` raw code (Copy → by value; §3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn picture_type(&self) -> u32 {
+    self.picture_type
+  }
+  /// Bundled-Perl PrintConv string for [`Self::picture_type`] (e.g.
+  /// `"Front Cover"`), `None` for out-of-table codes (raw int emitted
+  /// in that case). Reuses the FLAC PrintConv map.
+  #[must_use]
+  #[inline(always)]
+  pub fn picture_type_name(&self) -> Option<&'static str> {
+    crate::formats::flac::picture_type_name(self.picture_type)
+  }
+  /// MIME type, e.g. `"image/png"`. §3 string projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn mime_type(&self) -> &str {
+    self.mime_type.as_str()
+  }
+  /// Description (UTF-8). §3 string projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn description(&self) -> &str {
+    self.description.as_str()
+  }
+  /// Picture width in pixels (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+  /// Picture height in pixels (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+  /// Bits per pixel (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn bits_per_pixel(&self) -> u32 {
+    self.bits_per_pixel
+  }
+  /// Indexed-palette colour count, 0 for non-paletted (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn indexed_colors(&self) -> u32 {
+    self.indexed_colors
+  }
+  /// Declared length in bytes (may exceed `data().len()` on truncation;
+  /// Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn length(&self) -> u32 {
+    self.length
+  }
+  /// Picture binary payload (clamped to remaining bytes per
+  /// ExifTool::ReadValue, ExifTool.pm:6290-6298). §3 byte-slice
+  /// projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn data(&self) -> &[u8] {
+    self.data.as_slice()
+  }
+}
+
+/// Parse a base64-decoded METADATA_BLOCK_PICTURE payload into an owned
+/// [`OggPicture`]. Returns `None` when the on-wire bytes are too truncated
+/// to even read PictureType + MIME length (same threshold as
+/// [`crate::formats::flac::parse_flac_picture`]).
+fn parse_metadata_block_picture(payload: &[u8]) -> Option<OggPicture> {
+  // The on-wire layout is identical to FLAC's METADATA_BLOCK type 6, so
+  // delegate the binary unpack to the FLAC helper and clone the borrowed
+  // fields into owned ones.
+  let picture = crate::formats::flac::parse_flac_picture(payload)?;
+  Some(OggPicture {
+    picture_type: picture.picture_type(),
+    mime_type: picture.mime_type().to_string(),
+    description: picture.description().to_string(),
+    width: picture.width(),
+    height: picture.height(),
+    bits_per_pixel: picture.bits_per_pixel(),
+    indexed_colors: picture.indexed_colors(),
+    length: picture.length(),
+    data: picture.data().to_vec(),
+  })
+}
+
+// ===========================================================================
 // Vorbis comments — ProcessComments (Vorbis.pm:154-210)
 // ===========================================================================
 
@@ -731,10 +890,15 @@ fn read_u32_le(data: &[u8], pos: usize) -> Option<u32> {
 /// Process a Vorbis-comment block. `data` is the comment-packet payload
 /// (after the 7-byte `\x03vorbis` magic for Vorbis, or after the 8-byte
 /// `OpusTags` magic for Opus), starting at the vendor-length u32le.
-/// `group1` is the family-1 group to use for the emitted tags (`Vorbis`
-/// always — Ogg.pm: the dispatch resolves the SubDirectory but the
-/// VorbisComments tag-table's group1 is always 'Vorbis').
-fn process_vorbis_comments(data: &[u8], meta: &mut Metadata, print_conv_enabled: bool) -> bool {
+/// `meta` is the staging buffer for Vorbis-comment tags;
+/// `picture_sink` accumulates `METADATA_BLOCK_PICTURE` payloads parsed
+/// into [`OggPicture`] (R3 F2 — Vorbis.pm:122-134 SubDirectory hop).
+fn process_vorbis_comments(
+  data: &[u8],
+  meta: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
+  print_conv_enabled: bool,
+) -> bool {
   let end = data.len();
   let mut pos = 0usize;
   // Vendor (Vorbis.pm:182-187).
@@ -821,6 +985,31 @@ fn process_vorbis_comments(data: &[u8], meta: &mut Metadata, print_conv_enabled:
     // `synthetic_vorbis_specialkeys.ogg` conformance fixture.
     if is_special_tag(&key) {
       key.push('_');
+    }
+    // R3 F2 (Codex adversarial): `METADATA_BLOCK_PICTURE` is a Vorbis
+    // comment KEY whose base64-decoded value carries a FLAC METADATA_BLOCK
+    // type-6 (Picture) structure (Vorbis.pm:122-134, SubDirectory →
+    // %FLAC::Picture FLAC.pm:84-134). Bundled emits the Picture sub-fields
+    // (`FLAC:PictureType`, `:PictureMIMEType`, ...). The pre-fix code
+    // base64-decoded the value into a single `Vorbis:Picture` blob —
+    // silent loss of every sub-field.
+    //
+    // Intercept HERE (before push) so the binary payload becomes an
+    // `OggPicture` in `picture_sink`, NOT a `Vorbis:Picture` blob in the
+    // staging Metadata. Multiple METADATA_BLOCK_PICTURE comments in one
+    // file (rare but in-spec) accumulate as separate `OggPicture` entries.
+    if key == "METADATA_BLOCK_PICTURE" {
+      let decoded = base64_decode(&raw_val);
+      if let Some(picture) = parse_metadata_block_picture(&decoded) {
+        picture_sink.push(picture);
+      } else {
+        // Truncated payload — bundled would emit an empty Picture or
+        // skip; we choose "skip" to match the typical bundled behaviour
+        // for malformed METADATA_BLOCK_PICTURE comments (no error in
+        // bundled; the SubDirectory hop fails silently when ReadValue
+        // returns undef on the header). No emission, no warning.
+      }
+      continue;
     }
     push_vorbis_comment(
       meta,
@@ -1060,7 +1249,12 @@ enum PacketOutcome {
 /// carries the `OPUS` override). Theora `\x80theora` →
 /// `Theora::Identification` remains deferred (no Theora fixture; on the
 /// dedicated Theora.pm queue).
-fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8]) -> PacketOutcome {
+fn process_packet(
+  staging: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
+  print_conv_enabled: bool,
+  buff: &[u8],
+) -> PacketOutcome {
   let Some(kind) = classify_packet(buff) else {
     return PacketOutcome::None;
   };
@@ -1088,8 +1282,15 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
         }
         3 => {
           // Vorbis::Comments (Vorbis.pm:34-37). No override; comments
-          // have been emitted into the staging metadata.
-          process_vorbis_comments(&buff[payload_start..], staging, print_conv_enabled);
+          // have been emitted into the staging metadata. R3 F2:
+          // `picture_sink` carries any `METADATA_BLOCK_PICTURE` payloads
+          // back to the caller for emission as `FLAC:Picture*` fields.
+          process_vorbis_comments(
+            &buff[payload_start..],
+            staging,
+            picture_sink,
+            print_conv_enabled,
+          );
           PacketOutcome::None
         }
         _ => {
@@ -1125,6 +1326,7 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
           process_vorbis_comments_with_group1(
             &buff[payload_start..],
             staging,
+            picture_sink,
             print_conv_enabled,
             "Theora",
           );
@@ -1160,15 +1362,30 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
         OpusKind::Tags => {
           // Opus.pm:32 delegates to Vorbis::Comments with the default
           // group1 (Vorbis).
-          process_vorbis_comments(&buff[payload_start..], staging, print_conv_enabled);
+          process_vorbis_comments(
+            &buff[payload_start..],
+            staging,
+            picture_sink,
+            print_conv_enabled,
+          );
           PacketOutcome::Override { file_type: "OPUS" }
         }
       }
     }
     PacketKind::Flac => {
-      // Ogg.pm:176-179, 190-195: FLAC-in-Ogg transport. DEFERRED.
-      // TODO(ogg-flac, FORMATS.md row 9): wire `ProcessFLAC` once the FLAC
-      // port lands. Silent no-op preserves "container OK, no codec tags".
+      // Ogg.pm:176-179, 190-195: FLAC-in-Ogg transport. The R3 F2 disposition
+      // for the codec stream itself is FORMALLY ACCEPT-DEFERRED (see the
+      // module-level note and `tests/conformance.rs`'s `flac_ogg_deferred`
+      // marker); the bundled `FLAC.ogg` fixture would exercise it, and the
+      // accumulation logic for `numFlac` header-packet packets is not yet
+      // ported. See `parse_inner` for the loop-side handling: when a
+      // `\x7fFLAC` packet is encountered the OGG body is REJECTED (the
+      // OGG candidate returns `success() == false`), so dispatch falls
+      // through to the FLAC top-level entry on the FLAC sub-stream. Today
+      // the typed Meta therefore omits FLAC body tags emitted by bundled —
+      // formally accepted-deferral until a follow-up PR ports the
+      // `numFlac` accumulator. (The METADATA_BLOCK_PICTURE handler above
+      // covers the other half of the original R3 F2 finding.)
       PacketOutcome::FlacDeferred
     }
   }
@@ -1182,14 +1399,18 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
 /// each emitted tag into the caller's metadata with the family-1 group
 /// rewritten to `group1`. Family-0 (`"Vorbis"`) is preserved (Perl's
 /// `SET_GROUP1` swaps ONLY family-1; family-0 is fixed by the tag table).
+/// `picture_sink` is threaded through to `process_vorbis_comments` so
+/// `METADATA_BLOCK_PICTURE` payloads under a Theora stream are still
+/// collected (R3 F2).
 fn process_vorbis_comments_with_group1(
   data: &[u8],
   meta: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
   print_conv_enabled: bool,
   group1: &str,
 ) -> bool {
   let mut side = Metadata::new(meta.source_file());
-  let ok = process_vorbis_comments(data, &mut side, print_conv_enabled);
+  let ok = process_vorbis_comments(data, &mut side, picture_sink, print_conv_enabled);
   for tag in side.tags_slice() {
     meta.push(
       Group::new(tag.group_ref().family0(), group1),
@@ -1277,6 +1498,14 @@ pub struct Meta<'a> {
   /// the payload was shorter than the 10-byte fixed window the table reads.
   /// Emits before the Vorbis-comment block on the same stream.
   opus_header: Option<OpusHeader>,
+  /// R3 F2: `METADATA_BLOCK_PICTURE` payloads decoded into the FLAC
+  /// `%FLAC::Picture` SubDirectory shape (Vorbis.pm:122-134 → FLAC.pm:
+  /// 84-134). One entry per encountered `METADATA_BLOCK_PICTURE` Vorbis
+  /// comment. Empty `Vec` when no METADATA_BLOCK_PICTURE comments were
+  /// seen. Pre-fix the parser emitted only a single `Vorbis:Picture` blob
+  /// (the base64-decoded payload); bundled emits `FLAC:Picture*` sub-
+  /// fields. Codex round-3 caught this as silent metadata loss.
+  pictures: Vec<OggPicture>,
   /// Emitted comment tags in bundled emission order (vendor first, then
   /// KEY=VALUE in encounter order; list-tags coalesced at first-occurrence
   /// position).
@@ -1517,6 +1746,17 @@ impl Meta<'_> {
     self.opus_header
   }
 
+  /// `METADATA_BLOCK_PICTURE` payloads parsed from the Vorbis-comment
+  /// block (R3 F2). One entry per `METADATA_BLOCK_PICTURE` comment;
+  /// empty when none were seen. Mirrors `flac::Meta::pictures` shape
+  /// but with owned strings/bytes (the base64-decoded buffer is dropped
+  /// after parse). §3 slice projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn pictures(&self) -> &[OggPicture] {
+    self.pictures.as_slice()
+  }
+
   /// The emitted comment tags in bundled emission order. Each item is an
   /// [`Comment`] newtype arm with the resolved family-1 group, tag name,
   /// and value. §3 slice projection — returns `&[Comment]`, never
@@ -1672,6 +1912,12 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
   // coalesce into a single `TagValue::List`) inside the typed Meta.
   let mut staging = Metadata::new("ogg-staging");
 
+  // R3 F2: `METADATA_BLOCK_PICTURE` Vorbis-comment payloads decoded into
+  // owned `OggPicture` entries (Vorbis.pm:122-134 SubDirectory hop into
+  // %FLAC::Picture). One entry per encountered comment; lifted into the
+  // typed Meta below.
+  let mut pictures: Vec<OggPicture> = Vec::new();
+
   // Container walker state — verbatim Perl ProcessOGG (Ogg.pm:75-197).
   let mut success = false;
   let mut packet_count: u32 = 0;
@@ -1769,7 +2015,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     // through to the regular packet-processing branch.)
     if val.contains_key(&current_stream) && current_flag & 0x01 == 0 {
       let owned = val.remove(&current_stream).unwrap();
-      let outcome = process_packet(&mut staging, print_conv_enabled, &owned);
+      let outcome = process_packet(&mut staging, &mut pictures, print_conv_enabled, &owned);
       record_outcome(
         &mut file_type_override,
         &mut vorbis_identification,
@@ -1844,7 +2090,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     // Ogg.pm:184-188 — EOS bit ⇒ process now.
     if current_flag & 0x04 != 0 && val.contains_key(&current_stream) {
       let owned = val.remove(&current_stream).unwrap();
-      let outcome = process_packet(&mut staging, print_conv_enabled, &owned);
+      let outcome = process_packet(&mut staging, &mut pictures, print_conv_enabled, &owned);
       record_outcome(
         &mut file_type_override,
         &mut vorbis_identification,
@@ -1871,6 +2117,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     file_type_override,
     vorbis_identification,
     opus_header,
+    pictures,
     comments,
     warnings,
     success,
@@ -2124,6 +2371,14 @@ impl Meta<'_> {
         }
       }
     }
+    // 3b. R3 F2: `METADATA_BLOCK_PICTURE` payloads (Vorbis.pm:122-134
+    //     → %FLAC::Picture FLAC.pm:84-134). Emit each Picture sub-field
+    //     under the `FLAC` family-1 group with the same names FLAC's
+    //     own `sink_picture` uses (FLAC.pm:84-134), so the value-multiset
+    //     conformance check matches bundled byte-for-byte.
+    for p in &self.pictures {
+      sink_ogg_picture(p, print_conv, out)?;
+    }
     // 4. Warnings emit in occurrence order. The engine `TagMap` routes
     //    these to its `warnings()` accumulator (ExifTool:Warning surface);
     //    `TagMap` collects into a `warnings()` vec.
@@ -2132,6 +2387,50 @@ impl Meta<'_> {
     }
     Ok(())
   }
+}
+
+/// Sink one [`OggPicture`] under the bundled `FLAC` family-1 group in
+/// the same emission order `flac::sink_picture` uses (FLAC.pm:84-134).
+/// R3 F2: Vorbis `METADATA_BLOCK_PICTURE` SubDirectory hop into
+/// `Image::ExifTool::FLAC::Picture` (Vorbis.pm:122-134). Mirrors the
+/// emission shape: `PictureType` (PrintConv-mapped under -j), then
+/// `PictureMIMEType` / `PictureDescription` / `PictureWidth` /
+/// `PictureHeight` / `PictureBitsPerPixel` / `PictureIndexedColors` /
+/// `PictureLength` / `Picture` (binary).
+#[cfg(feature = "alloc")]
+fn sink_ogg_picture(
+  p: &OggPicture,
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  const GROUP: &str = "FLAC";
+  // PictureType — PrintConv hash (FLAC.pm:88-113). On a hash miss the
+  // Perl default falls back to the numeric value as a string; we emit
+  // the raw u32.
+  if print_conv {
+    if let Some(name) = p.picture_type_name() {
+      out.write_str(GROUP, "PictureType", name)?;
+    } else {
+      out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
+    }
+  } else {
+    out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
+  }
+  out.write_str(GROUP, "PictureMIMEType", p.mime_type())?;
+  out.write_str(GROUP, "PictureDescription", p.description())?;
+  out.write_u64(GROUP, "PictureWidth", u64::from(p.width()))?;
+  out.write_u64(GROUP, "PictureHeight", u64::from(p.height()))?;
+  out.write_u64(GROUP, "PictureBitsPerPixel", u64::from(p.bits_per_pixel()))?;
+  out.write_u64(GROUP, "PictureIndexedColors", u64::from(p.indexed_colors()))?;
+  out.write_u64(GROUP, "PictureLength", u64::from(p.length()))?;
+  // Picture binary — same skip-on-zero-payload sentinel as FLAC's
+  // sink_picture (FLAC.pm:128-133 + ExifTool.pm:6292 ReadValue clamp).
+  if p.length() > 0 && p.data().is_empty() {
+    // Faithful skip — bundled ReadValue returns undef ⇒ no tag.
+  } else {
+    out.write_bytes(GROUP, "Picture", p.data())?;
+  }
+  Ok(())
 }
 
 /// Emit a Vorbis bitrate field (`MaximumBitrate` / `NominalBitrate` /
@@ -2342,7 +2641,13 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogg");
-    assert!(process_vorbis_comments(&data, &mut meta, true));
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
     let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     // Order: Vendor first, then comments in insertion order.
     assert_eq!(
@@ -2385,7 +2690,13 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogg");
-    assert!(process_vorbis_comments(&data, &mut meta, true));
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
     // Vendor first, then Title, then a single Artist as a List of 2.
     let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     assert_eq!(names, vec!["Vendor", "Title", "Artist"]);
@@ -2408,7 +2719,13 @@ mod tests {
     // Vendor-length larger than available data.
     let data: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff];
     let mut meta = Metadata::new("x.ogg");
-    assert!(!process_vorbis_comments(&data, &mut meta, true));
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(!process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
     assert_eq!(meta.warnings_slice()[0], "Format error in Vorbis comments");
   }
 
@@ -2440,8 +2757,13 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogv");
+    let mut pictures: Vec<OggPicture> = Vec::new();
     assert!(process_vorbis_comments_with_group1(
-      &data, &mut meta, true, "Theora"
+      &data,
+      &mut meta,
+      &mut pictures,
+      true,
+      "Theora"
     ));
     for t in meta.tags_slice() {
       // Family-0 stays "Vorbis" (from the tag table); family-1 is "Theora".
@@ -2494,6 +2816,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2525,6 +2848,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2561,6 +2885,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2600,6 +2925,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: None,
@@ -2805,6 +3131,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2850,6 +3177,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2885,6 +3213,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2921,6 +3250,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: Some(OpusHeader {
@@ -2957,6 +3287,7 @@ mod tests {
     let meta = Meta {
       #[cfg(feature = "id3")]
       id3: None,
+      pictures: vec![],
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: Some(OpusHeader {
@@ -2998,7 +3329,13 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogg");
-    assert!(process_vorbis_comments(&data, &mut meta, true));
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
     for tag in meta.tags_slice() {
       match tag.value_ref() {
         TagValue::Str(_) | TagValue::List(_) | TagValue::Bytes(_) => {}

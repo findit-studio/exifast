@@ -419,13 +419,83 @@ fn ogg_id3_prefixed_conformance() {
 }
 
 #[test]
+fn ogg_metadata_block_picture_conformance() {
+  // R3 F2 regression pin (Codex round-3 [high] disposition).
+  //
+  // Fixture: the bundled `Opus.opus` corpus file (exiftool/t/images/Opus.opus)
+  // — a real Ogg-Opus stream carrying a `METADATA_BLOCK_PICTURE` Vorbis
+  // comment (a base64-encoded payload with the FLAC METADATA_BLOCK type-6
+  // on-wire structure: PictureType=3 "Front Cover", MIME=image/png,
+  // Description="cover pic", 16x16 1bpp, 85 bytes of PNG data).
+  //
+  // Vorbis.pm:122-134 defines the `METADATA_BLOCK_PICTURE` SubDirectory
+  // hop: the base64 RawConv decodes the value, then ProcessDirectory
+  // dispatches it through `%Image::ExifTool::FLAC::Picture` (FLAC.pm:84-
+  // 134). Bundled emits each Picture sub-field (`FLAC:PictureType`,
+  // `:PictureMIMEType`, `:PictureDescription`, `:PictureWidth`,
+  // `:PictureHeight`, `:PictureBitsPerPixel`, `:PictureIndexedColors`,
+  // `:PictureLength`, `:Picture`).
+  //
+  // Pre-fix exifast's `metadata_block_picture_valueconv` only base64-
+  // decoded the value into a single `Vorbis:Picture` Bytes blob, losing
+  // every sub-field. Silent metadata loss caught by Codex round 3.
+  //
+  // Fix: a comments-level intercept in `process_vorbis_comments` decodes
+  // the base64 then parses the result via `flac::parse_flac_picture`
+  // (made `pub(crate)`); the parsed `Picture` is cloned into an owned
+  // `OggPicture` accumulated on `ogg::Meta::pictures`. The typed
+  // `serialize_tags` sink emits each Picture under the `FLAC` family-1
+  // group with the same shape FLAC's `sink_picture` uses.
+  check("Opus.opus", "Opus.opus.json", true);
+  check("Opus.opus", "Opus.opus.n.json", false);
+}
+
+#[test]
+#[ignore = "Ogg-FLAC transport (Ogg.pm:176-179, 190-195): \\x7fFLAC packet → \
+  ProcessFLAC on substr(buff,9). FORMALLY ACCEPT-DEFERRED — see docs/tracking.md \
+  (R3 F2 fallback). The METADATA_BLOCK_PICTURE half of R3 F2 IS fixed (see \
+  ogg_metadata_block_picture_conformance)."]
+fn ogg_flac_transport_deferred() {
+  // R3 F2 FALLBACK (formally accept-deferred per task spec). Bundled
+  // `FLAC.ogg` extracts `FLAC:BlockSizeMin/Max`, `FLAC:FrameSizeMin/Max`,
+  // `FLAC:SampleRate`, `FLAC:Channels`, `FLAC:BitsPerSample`,
+  // `FLAC:TotalSamples`, `FLAC:MD5Signature`, `Vorbis:Vendor`.
+  //
+  // exifast's current OGG parser emits only the orchestration triplet
+  // (`File:FileType`, `:FileTypeExtension`, `:MIMEType`) for this
+  // fixture; the `\x7fFLAC` packet hits `PacketKind::Flac` which is
+  // a silent no-op (`process_packet` returns `PacketOutcome::FlacDeferred`).
+  //
+  // Implementation cost: porting the bundled `numFlac` accumulator
+  // (Ogg.pm:123-126, 176-179, 190-195) — track the FLAC header packet
+  // count, accumulate packets across pages, and after all are read run
+  // `ProcessFLAC` on the assembled `substr(buff, 9)` buffer (which
+  // begins with `fLaC` magic — see hex dump of FLAC.ogg). Then nest a
+  // `flac::Meta` into `ogg::Meta`, which forces a self-referential
+  // shape (the flac::Meta borrows from the buffer that's owned by the
+  // ogg::Meta).
+  //
+  // Per-user contract: this is FORMALLY ACCEPT-DEFERRED, NOT silent.
+  // `#[ignore]` keeps the test off the default run but committed; the
+  // golden is committed for the eventual port; `docs/tracking.md`
+  // records the residual; this comment + the
+  // `PacketKind::Flac => PacketOutcome::FlacDeferred` arm in
+  // `src/formats/ogg.rs::process_packet` document it in code too.
+  //
+  // Run manually to verify the gap closes when the port lands:
+  //   `cargo test --ignored ogg_flac_transport_deferred`
+  check("FLAC.ogg", "FLAC.ogg.json", true);
+  check("FLAC.ogg", "FLAC.ogg.n.json", false);
+}
+
+#[test]
 fn ogg_opus_synthetic_conformance() {
   // A synthetic minimal Ogg-Opus stream (BOS page wrapping `OpusHead` +
   // EOS page wrapping `OpusTags` with vendor + 2 KEY=VALUE comments —
   // built in `examples/gen_synthetic_opus.rs`). Avoids the real
-  // `Opus.opus` corpus fixture's `METADATA_BLOCK_PICTURE` which
-  // SubDirectory-hops into `FLAC::Picture` (DEFERRED — see Picture
-  // forward-items entry). Exercises `OverrideFileType('OPUS')`
+  // `Opus.opus` corpus fixture's `METADATA_BLOCK_PICTURE` (now COVERED
+  // by `ogg_metadata_block_picture_conformance` — R3 F2 fix).
+  // Exercises `OverrideFileType('OPUS')`
   // (Ogg.pm:50) firing on the `OpusHead` packet, the `OpusTags`
   // Vorbis-comments delegation (Opus.pm:32), AND the `Opus::Header`
   // binary table (Opus.pm:36-51, R2 F-OGG-TRIM port) emitting
