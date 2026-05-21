@@ -1456,11 +1456,15 @@ pub(crate) fn parse_full_owned(data: &[u8], shared: &mut SharedFlags) -> Option<
 ///    ID3.pm:1590), with the footer scan walking PAST the v1 trailer via the
 ///    now-set `DoneID3` (APE.pm:169).
 ///
-/// Returns `Some(ApeMeta)` with `id3` nested when ID3 was found AND/OR the
-/// MAC/APE body parsed; `None` only when NEITHER the body nor ID3 produced a
-/// result (faithful APE.pm:138 `return 0`). The intra-APE composite is
-/// computed from the header + wire main tags (cross-format ID3 ingredients do
-/// not contribute to APE's Composite).
+/// Returns `Some(ApeMeta)` (with `id3` nested) ONLY when the MAC/APE body
+/// parsed (`plan_ape` succeeded); `None` when the body magic missed (Perl
+/// `return 0`) so the `parse_any` candidate loop tries the next type — even if
+/// an ID3 prefix WAS found. This body-magic gate is what keeps APE from
+/// wrongly claiming an ID3-prefixed MP3 in the per-candidate dispatch (the
+/// engine avoids the same trap by resolving the file type before dispatch).
+/// Every real APE-typed fixture carries a body, so this never drops a genuine
+/// APE. The intra-APE composite is computed from the header + wire main tags
+/// (cross-format ID3 ingredients do not contribute to APE's Composite).
 ///
 /// `#[cfg(feature = "id3")]`: the `ape` feature pulls `id3`, so this is the
 /// production path for the standalone `APE` file-type entry. Lifetime
@@ -1488,28 +1492,21 @@ pub(crate) fn parse_full_chained<'a>(
   let ape_slice = data.get(hdr_end..).unwrap_or(&[]);
   // APE.pm:169 footer shift: `$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1`.
   let done_id3 = shared.done_id3().unwrap_or(0);
-  let plan = plan_ape(ape_slice, /* print_conv */ false, done_id3);
-
-  match plan {
-    Some(plan) => {
-      let mut meta = meta_from_plan(plan);
-      meta.id3 = id3;
-      Some(meta)
-    }
-    // APE.pm:137-138 — short or wrong magic. When ID3 was found, the bundled
-    // `ProcessID3 ... and return 1` semantics treat the file as ID3-bearing:
-    // surface an ApeMeta carrying ONLY the ID3 sub-Meta (no MAC/main). When
-    // ID3 was NOT found, return `None` (Perl `return 0`) so the candidate
-    // loop tries the next type.
-    None => id3.map(|id3_meta| ApeMeta {
-      header: None,
-      main_tags: Vec::new(),
-      warn_bad_trailer: false,
-      composite_duration: None,
-      id3: Some(id3_meta),
-      _phantom: core::marker::PhantomData,
-    }),
-  }
+  // APE.pm:137-138 — short or wrong `MAC `/`APETAGEX` magic ⇒ `plan_ape`
+  // returns `None`. Return `None` here too (Perl `return 0`) so the
+  // `parse_any` candidate loop tries the NEXT type. This is critical for the
+  // closed-dispatch path: APE's `%magicNumber` includes `ID3`, so an
+  // ID3-prefixed MP3 (`ID3v2_with_mpeg_audio.mp3`) reaches the APE arm; if
+  // APE returned `Some` merely because the ID3 prefix parsed, it would wrongly
+  // claim the file and starve the MP3 candidate (the engine avoids this by
+  // resolving the file type to "MP3" and never dispatching APE for it — but
+  // `parse_any` is per-candidate, so the body-magic gate must do the rejection
+  // here). Every real APE-typed fixture carries a `MAC `/`APETAGEX` body, so
+  // `plan_ape` succeeds for them; the nested ID3 is attached below.
+  let plan = plan_ape(ape_slice, /* print_conv */ false, done_id3)?;
+  let mut meta = meta_from_plan(plan);
+  meta.id3 = id3;
+  Some(meta)
 }
 
 /// Lift a Phase-1 [`ApePlan`] into a typed [`ApeMeta`]. Translates the

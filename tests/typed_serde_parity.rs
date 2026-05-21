@@ -1,0 +1,212 @@
+//! STAGE-1 PARITY CHECKPOINT for the sink-layer removal.
+//!
+//! Proves that the **typed serde path** — `detect → parse (typed AnyMeta) →
+//! serde-render` via [`exifast::Rendered`] — reproduces, for EVERY active
+//! conformance fixture in BOTH `-j` (PrintConv) and `-n` (numeric) modes,
+//! EXACTLY what the current writer path
+//! ([`exifast::parser::extract_info`], the `JsonTagWriter` collector) produces
+//! AND the committed bundled-ExifTool golden. This is the hard checkpoint the
+//! sink-layer deletion (Stage 2) rides on: once the typed serde document is
+//! value-equivalent to the writer document for all 121, the writer is
+//! redundant on the output path.
+//!
+//! ## What the typed serde document is
+//!
+//! The end-state `extract_info` will: detect the file type, run the parse
+//! (yielding a complete typed `AnyMeta` incl. chains), emit the orchestration
+//! tags (`ExifTool:ExifToolVersion`, `SourceFile`, the `File:*` triplet), and
+//! serde-render the whole thing. At Stage 1 the writer still exists, so this
+//! harness assembles the SAME document by:
+//!
+//!   1. Lifting the orchestration tags (`ExifTool:*` + `File:*`) and the
+//!      warnings/errors (incl. the post-loop finalization `Error`) off the
+//!      authoritative engine document ([`extract_info`], itself §4-conformant)
+//!      — these are the engine's responsibility, OUTSIDE the per-format typed
+//!      Meta, in BOTH the current and end-state designs.
+//!   2. Serde-rendering the typed `AnyMeta` for the FORMAT tags via
+//!      `serde_json::to_value(&Rendered::new(&meta, print_conv))` — the actual
+//!      Stage-2 output mechanism (NOT the `MetaSinker::sink`-into-writer path
+//!      that `json_writer_parity.rs` exercises).
+//!   3. Merging into the single `[{ … }]` document with `%noDups` first-wins
+//!      (orchestration keys are inserted first, so they win over any
+//!      coincident typed key — though typed Metas never emit `File:*`).
+//!
+//! ## Excluded fixture
+//!
+//! `AIFF_id3.aif` is NOT one of the 121 active conformance fixtures: the AIFF
+//! `ID3 ` SubDirectory dispatch (AIFF.pm:202) is a deliberate Phase-2 forward
+//! item that the ENGINE path also does not implement (the `ID3 ` chunk is
+//! recognized then silently skipped — see the `#[ignore]`-d
+//! `aiff_id3_chunk_subdirectory_dispatch_deferred_conformance` test). The
+//! typed path matches the engine path there (both lack ID3); both diverge only
+//! from the golden. It is therefore excluded from this 121-fixture checkpoint,
+//! exactly as it is excluded from `conformance.rs`.
+//!
+//! Gated on `feature = "json"`: imports the `json`-gated `jsondiff` +
+//! `serde_json` rendering of `Rendered`.
+#![cfg(feature = "json")]
+
+use exifast::filetype::detection_candidates;
+use exifast::jsondiff::json_equivalent;
+use exifast::parser::extract_info;
+use exifast::parser_new::{Rendered, SharedFlags, any_parser_for};
+
+/// The one fixture excluded from the 121 active conformance set — the AIFF
+/// ID3-chunk SubDirectory forward item (deferred in BOTH the engine and typed
+/// paths; see module docs).
+const NOT_IN_121: &[&str] = &["AIFF_id3.aif"];
+
+/// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
+/// `tests/golden/<f>.n.json`, MINUS the [`NOT_IN_121`] forward item — i.e. the
+/// 121 active conformance fixtures.
+fn active_fixtures() -> Vec<String> {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let mut out = Vec::new();
+  for entry in std::fs::read_dir(format!("{root}/tests/fixtures")).expect("read fixtures dir") {
+    let entry = entry.expect("dir entry");
+    if !entry.file_type().expect("file type").is_file() {
+      continue;
+    }
+    let name = entry.file_name().to_string_lossy().into_owned();
+    if NOT_IN_121.contains(&name.as_str()) {
+      continue;
+    }
+    let j = format!("{root}/tests/golden/{name}.json");
+    let n = format!("{root}/tests/golden/{name}.n.json");
+    if std::path::Path::new(&j).is_file() && std::path::Path::new(&n).is_file() {
+      out.push(name);
+    }
+  }
+  out.sort();
+  out
+}
+
+/// Resolve the typed parser the SAME way `extract_info` does — walk the
+/// detection candidates in `ExtractInfo` loop order; the first whose
+/// `any_parser_for` is `Some` AND whose `parse_any` returns `Ok(Some(meta))`
+/// wins. Returns `None` when no typed parser accepts (rejected/finalization-
+/// only fixtures — e.g. `bad.ogg`, where the golden's tags come from
+/// finalization, not a Meta). Mirrors `parse_bytes`' candidate loop.
+fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>> {
+  let ext = exifast::filetype::file_ext_for_name(fixture);
+  let ext_ref = ext.as_deref();
+  let mut shared = SharedFlags::new();
+  for cand in detection_candidates(fixture, data) {
+    let ft = cand.file_type();
+    let Some(parser) = any_parser_for(ft) else {
+      continue;
+    };
+    match parser.parse_any(data, &mut shared, ext_ref) {
+      Ok(Some(meta)) => return Some(meta),
+      Ok(None) => shared = SharedFlags::new(),
+      Err(_) => shared = SharedFlags::new(),
+    }
+  }
+  None
+}
+
+/// Build the typed SERDE document for `fixture` in the given mode: lift the
+/// orchestration tags + warnings/errors off the engine writer, serde-render
+/// the typed `AnyMeta` for the format tags, and merge into the `[{ … }]`
+/// document with `%noDups` first-wins. Returns the JSON string.
+fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
+  use serde_json::{Map, Value};
+
+  let mut obj: Map<String, Value> = Map::new();
+  obj.insert("SourceFile".into(), Value::String(fixture.to_string()));
+
+  // (1) Orchestration tags (`ExifTool:*` + `File:*`) + warnings/errors lifted
+  // off the authoritative engine writer. These are the engine's
+  // responsibility OUTSIDE the typed Meta in BOTH designs. We lift them as
+  // rendered JSON values by round-tripping the engine's own document and
+  // copying only the orchestration/diagnostic keys — this keeps their exact
+  // rendered form (e.g. `ExifTool:ExifToolVersion` as the bare number 13.58).
+  let engine_doc = extract_info(fixture, data, print_on);
+  let engine_parsed: Value = serde_json::from_str(&engine_doc).expect("engine doc is valid JSON");
+  let engine_obj = engine_parsed[0]
+    .as_object()
+    .expect("engine doc is a single-object array");
+  for (key, value) in engine_obj {
+    if key == "SourceFile" {
+      continue; // already inserted first
+    }
+    let is_orchestration = key.starts_with("ExifTool:")
+      || key.starts_with("File:")
+      || key == "ExifTool:Warning"
+      || key == "ExifTool:Error";
+    if is_orchestration && !obj.contains_key(key) {
+      obj.insert(key.clone(), value.clone());
+    }
+  }
+
+  // (2) Format tags via the typed SERDE path — `serde_json::to_value` over the
+  // `Rendered` wrapper (the actual Stage-2 output mechanism).
+  if let Some(meta) = typed_parse(fixture, data) {
+    let rendered = serde_json::to_value(Rendered::new(&meta, print_on))
+      .expect("Rendered serialization is infallible");
+    if let Value::Object(format_map) = rendered {
+      for (key, value) in format_map {
+        // `%noDups` first-wins: orchestration keys (inserted above) win.
+        obj.entry(key).or_insert(value);
+      }
+    }
+  }
+
+  Value::Array(vec![Value::Object(obj)]).to_string()
+}
+
+#[test]
+fn typed_serde_path_equals_writer_path_and_golden_all_121() {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let fixtures = active_fixtures();
+  assert_eq!(
+    fixtures.len(),
+    121,
+    "expected exactly the 121 active conformance fixtures, found {}: {:?}",
+    fixtures.len(),
+    fixtures
+  );
+
+  let mut failures: Vec<String> = Vec::new();
+
+  for fixture in &fixtures {
+    let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+      .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
+    let golden_j = std::fs::read_to_string(format!("{root}/tests/golden/{fixture}.json"))
+      .unwrap_or_else(|e| panic!("read golden {fixture}.json: {e}"));
+    let golden_n = std::fs::read_to_string(format!("{root}/tests/golden/{fixture}.n.json"))
+      .unwrap_or_else(|e| panic!("read golden {fixture}.n.json: {e}"));
+
+    for (mode, print_on, golden) in [("j", true, &golden_j), ("n", false, &golden_n)] {
+      let typed = typed_serde_document(fixture, &data, print_on);
+      let writer = extract_info(fixture, &data, print_on);
+
+      // typed serde == writer path.
+      if let Err(e) = json_equivalent(&typed, &writer) {
+        failures.push(format!(
+          "[{mode}] {fixture}: typed-serde != writer-path: {}\n  typed:  {typed}\n  writer: {writer}",
+          e.message()
+        ));
+      }
+      // typed serde == golden.
+      if let Err(e) = json_equivalent(&typed, golden) {
+        failures.push(format!(
+          "[{mode}] {fixture}: typed-serde != golden: {}\n  typed:  {typed}\n  golden: {golden}",
+          e.message()
+        ));
+      }
+    }
+  }
+
+  assert!(
+    failures.is_empty(),
+    "STAGE-1 PARITY CHECKPOINT failed for {} case(s):\n{}",
+    failures.len(),
+    failures.join("\n")
+  );
+
+  eprintln!(
+    "=== STAGE-1 PARITY CHECKPOINT: typed-serde == writer == golden for all {} fixtures, both -j and -n ===",
+    fixtures.len()
+  );
+}
