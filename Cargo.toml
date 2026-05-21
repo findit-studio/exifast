@@ -81,7 +81,12 @@ dsf        = ["id3"]
 dv         = []
 flac       = ["id3"]
 id3        = []
-mp3        = ["id3", "mpeg-audio"]
+# `mp3` chains ID3 (header), MPEG-audio (frame scan), AND APE: bundled
+# `ID3::ProcessMP3` (ID3.pm:1722-1727) runs `APE::ProcessAPE` as the final
+# trailer fallback, so the typed MP3 parser unconditionally calls
+# `ape::ProcessApe`. Without the `ape` edge a `--features std,mp3` build
+# (no `ape`) fails to compile.
+mp3        = ["id3", "mpeg-audio", "ape"]
 mpc        = ["id3", "ape"]
 # `moi` is reserved here even though the actual `src/formats/moi.rs` code lives
 # on the `moi-port` branch and hasn't merged to `main` yet. The format-gating
