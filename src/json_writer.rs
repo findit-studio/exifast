@@ -36,11 +36,17 @@
 //!    identity replace-in-place as [`crate::value::Metadata::push`] (faithful
 //!    `FoundTag`, `ExifTool.pm:9437-9519`): the LATEST scalar `write_*` for a
 //!    key wins, in the FIRST occurrence's position.
-//! 4. **`%noDups` first-wins + framing + Warning/Error placement.** Same as
-//!    [`crate::serialize::to_exiftool_json`]: `[{`, `SourceFile` first, then
-//!    `"<family1>:<name>"` tokens with `%noDups` first-wins
-//!    (`exiftool:2950-2951`), then the generated `ExifTool:Warning` /
-//!    `ExifTool:Error` tags (`ExifTool.pm:1225,1288-1297`), then `\n}]\n`.
+//! 4. **Framing + Group1 sort + `%noDups` first-wins + Warning/Error.** Both
+//!    [`finish`](JsonTagWriter::finish) and
+//!    [`crate::serialize::to_exiftool_json`] now delegate to the SAME
+//!    [`crate::json_scalar::render_g1_json_document`]: `[{`, `SourceFile`
+//!    first, then the entries SORTED by Group1
+//!    (`exiftool:1853-1854`/`ExifTool.pm:3362-3386` — group-clustered, groups
+//!    in first-seen order, occurrence order within a group), with `%noDups`
+//!    first-wins on the sorted walk (`exiftool:2950-2951`). The generated
+//!    `ExifTool:Warning` / `ExifTool:Error` tags (`ExifTool.pm:1225,
+//!    1288-1297`) are `ExifTool`-group FoundTags that cluster right after
+//!    `ExifTool:ExifToolVersion` (rank 1). Then `\n}]\n` (Codex B-R4-1).
 //!
 //! ## Group mapping
 //!
@@ -60,18 +66,11 @@
 //! faithfully renders whatever scalars the Meta emits, so the same writer
 //! serves both `-j` and `-n` (`exiftool` PrintConv toggle, `ExifTool.pm:5710`).
 
-use crate::json_scalar::{push_json_string, push_value};
 use crate::parser_new::TagWriter;
 use crate::value::{Group, Tag, TagValue};
 use core::{convert::Infallible, fmt};
 use smol_str::SmolStr;
-// `BTreeSet` (not `HashSet`) for the `%noDups` seen-token set: this module
-// is `#[cfg(feature = "alloc")]`-gated, and in a no_std + alloc build the
-// crate aliases `alloc as std` (lib.rs) — but `alloc::collections` has NO
-// `HashSet` (it needs a std hasher), so `std::collections::HashSet` would
-// fail to compile outside std (Codex A-R4-3). `BTreeSet` lives in `alloc`
-// and is a drop-in for the insert-returns-bool dedup.
-use std::{collections::BTreeSet, string::String, vec::Vec};
+use std::{string::String, vec::Vec};
 
 /// A [`TagWriter`] that emits bundled-`exiftool -j -G1` JSON directly from a
 /// typed `Meta`'s emission stream — see the module docs for the byte-exact
@@ -374,60 +373,19 @@ impl JsonTagWriter {
     // `{\n  "SourceFile": …` (exiftool 2678) then `,\n  "tok": v` per tag
     // (exiftool 2953-2954, $ind = '  '); close `\n}` (exiftool 3090);
     // `$fileTrailer = "]\n"` (exiftool 1650).
-    let mut out = String::new();
-    out.push('[');
-    out.push('{');
-    out.push_str("\n  \"SourceFile\": ");
-    push_json_string(&mut out, &self.source_file);
-    // ExifTool `%noDups` (exiftool:2950-2951 `next if $noDups{$tok};
-    // $noDups{$tok} = 1;`): first occurrence of a "<family1>:<name>" token
-    // wins; later same-token records are skipped entirely (no key, no value).
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for rec in &self.records {
-      // exiftool:2947 `my $tok = $allGroup ? "$group:$tagName" : $tagName;`
-      // (`-G1` => $allGroup true => "<family1>:<name>").
-      let tok = std::format!("{}:{}", rec.group().family1(), rec.name());
-      // exiftool:2950 `next if $noDups{$tok};` — first wins, drop the rest.
-      if !seen.insert(tok.clone()) {
-        continue;
-      }
-      out.push_str(",\n  ");
-      push_json_string(&mut out, &tok);
-      out.push_str(": ");
-      push_value(&mut out, rec.value());
-    }
-    // ExifTool's generated `Warning` tag: group1 = `ExifTool`
-    // (`ExifTool.pm:1225,1297`) ⇒ `-G1` token `"ExifTool:Warning"`
-    // (`exiftool:2948`). Joins the SAME `%noDups` set (`exiftool:2951`,
-    // first-wins). Default `-j -G1` emits only the FIRST warning (the
-    // ` (N)` copy-suffix dups are dropped, `exiftool:2744`; `-a`/Duplicates
-    // not modelled — same deferral as `to_exiftool_json`).
-    if let Some(first) = self.warnings.first() {
-      let tok = String::from("ExifTool:Warning");
-      if seen.insert(tok.clone()) {
-        out.push_str(",\n  ");
-        push_json_string(&mut out, &tok);
-        out.push_str(": ");
-        push_json_string(&mut out, first);
-      }
-    }
-    // ExifTool's generated `Error` tag: group1 `ExifTool`
-    // (`ExifTool.pm:1225,1288-1296`) ⇒ `-G1` token `"ExifTool:Error"`. Joins
-    // the SAME `%noDups` set INDEPENDENTLY of the Warning token (distinct
-    // tokens), first-wins; only the FIRST error is emitted under `-j -G1`
-    // (same deferral as `to_exiftool_json`).
-    if let Some(first) = self.errors.first() {
-      let tok = String::from("ExifTool:Error");
-      if seen.insert(tok.clone()) {
-        out.push_str(",\n  ");
-        push_json_string(&mut out, &tok);
-        out.push_str(": ");
-        push_json_string(&mut out, first);
-      }
-    }
-    out.push_str("\n}");
-    out.push_str("]\n");
-    out
+    // Delegate to the shared `exiftool -j -G1` document renderer (the SINGLE
+    // source of truth shared with `crate::serialize::to_exiftool_json`), so
+    // the framing, the Group1 stable-clustering sort (`exiftool:1853-1854` +
+    // `ExifTool.pm:3362-3386`), the generated Warning/Error placement, and
+    // the `%noDups` first-wins are byte-identical across both output paths
+    // (Codex B-R4-1). The records carry the Group1 + file order; the warning
+    // and error vecs supply the generated `ExifTool:*` tags.
+    crate::json_scalar::render_g1_json_document(
+      &self.source_file,
+      &self.records,
+      &self.warnings,
+      &self.errors,
+    )
   }
 }
 

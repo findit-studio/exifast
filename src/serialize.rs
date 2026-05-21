@@ -8,14 +8,7 @@
 //! `serde_json` round-trip) keeps it byte-exact with ExifTool and infallible —
 //! there is no error path, so `Bytes`/`Rational` can never fail the document.
 
-use crate::json_scalar::{push_json_string, push_value};
 use crate::value::Metadata;
-// `BTreeSet` (not `HashSet`) for the `%noDups` seen-token set: this module is
-// `#[cfg(feature = "json")]`-gated and `json` implies `alloc` but not `std`,
-// so in a no_std + alloc + json build the crate aliases `alloc as std`
-// (lib.rs) and `alloc::collections` has NO `HashSet` (Codex A-R4-3).
-// `BTreeSet` lives in `alloc` and is a drop-in for the dedup set.
-use std::collections::BTreeSet;
 
 // The byte-exact ExifTool scalar encoders (`EscapeJSON` number gate, string
 // escaping, the binary placeholder, the rational repr, and `FormatJSON` array
@@ -56,73 +49,17 @@ use std::collections::BTreeSet;
 /// emitted, deferring those nuances.
 #[must_use]
 pub fn to_exiftool_json(m: &Metadata) -> String {
-  // ExifTool framing: `$fileHeader = '['` (exiftool 1649); per file
-  // `{\n  "SourceFile": …` (exiftool 2678) then `,\n  "tok": v` per tag
-  // (exiftool 2953-2954, $ind = '  '); close `\n}` (exiftool 3090);
-  // `$fileTrailer = "]\n"` (exiftool 1650).
-  let mut out = String::new();
-  out.push('[');
-  out.push('{');
-  out.push_str("\n  \"SourceFile\": ");
-  push_json_string(&mut out, m.source_file());
-  // ExifTool `%noDups` (exiftool:2950-2951 `next if $noDups{$tok};
-  // $noDups{$tok} = 1;`): first occurrence of a "<family1>:<name>" token
-  // wins; later same-token tags are skipped entirely (no key, no value).
-  let mut seen: BTreeSet<String> = BTreeSet::new();
-  for t in m.tags() {
-    // exiftool:2947 `my $tok = $allGroup ? "$group:$tagName" : $tagName;`
-    // (`-G1` => $allGroup true => "<family1>:<name>").
-    let tok = format!("{}:{}", t.group().family1(), t.name());
-    // exiftool:2950 `next if $noDups{$tok};` — first wins, drop the rest.
-    if !seen.insert(tok.clone()) {
-      continue;
-    }
-    out.push_str(",\n  ");
-    push_json_string(&mut out, &tok);
-    out.push_str(": ");
-    push_value(&mut out, t.value());
-  }
-  // ExifTool's generated `Warning` tag: group1 = `ExifTool`
-  // (`ExifTool.pm:1225,1297`) ⇒ `-G1` token `"ExifTool:Warning"`
-  // (`exiftool:2948`). Joins the SAME `%noDups` set (`exiftool:2951`,
-  // first-wins): a pre-existing `ExifTool:Warning` token suppresses this,
-  // and only ONE is ever emitted. Default `-j -G1` shows just the FIRST
-  // warning (the ` (N)` copy-suffix duplicates are dropped,
-  // `exiftool:2744`; `-a`/Duplicates is not modelled — see fn doc), so we
-  // emit `m.warnings()[0]` via the SAME escaped string path.
-  if let Some(first) = m.warnings().first() {
-    let tok = "ExifTool:Warning".to_string();
-    if seen.insert(tok.clone()) {
-      out.push_str(",\n  ");
-      push_json_string(&mut out, &tok);
-      out.push_str(": ");
-      push_json_string(&mut out, first);
-    }
-  }
-  // ExifTool's generated `Error` tag: defined in `Image::ExifTool::Extra`
-  // (`ExifTool.pm:1288-1296`) with `Groups => \%allGroupsExifTool`
-  // (`ExifTool.pm:1225`) — group1 `ExifTool`, exactly like `Warning`
-  // (`ExifTool.pm:1297`). `sub Error` (`ExifTool.pm:5648`) is the plain
-  // `$self->FoundTag('Error', $str)` on the read path (no DemoteErrors /
-  // IgnoreMinorErrors options here). With `-G1` the JSON token is
-  // `$group:$tagName` (`exiftool:2948`) ⇒ exactly `"ExifTool:Error"`. It
-  // joins the SAME `%noDups` set (`exiftool:2951`) INDEPENDENTLY of the
-  // Warning token (distinct tokens), first-wins; default `-j -G1` shows
-  // only the FIRST error (the ` (N)` copy-suffix dups are dropped,
-  // `exiftool:2744`; `-a`/Duplicates not modelled — see fn doc), so we
-  // emit `m.errors()[0]` via the SAME EscapeJSON string path as Warning.
-  if let Some(first) = m.errors().first() {
-    let tok = "ExifTool:Error".to_string();
-    if seen.insert(tok.clone()) {
-      out.push_str(",\n  ");
-      push_json_string(&mut out, &tok);
-      out.push_str(": ");
-      push_json_string(&mut out, first);
-    }
-  }
-  out.push_str("\n}");
-  out.push_str("]\n");
-  out
+  // Delegate to the shared `exiftool -j -G1` document renderer in
+  // [`crate::json_scalar`] — the SINGLE source of truth shared with
+  // [`crate::json_writer::JsonTagWriter::finish`], guaranteeing the two
+  // output paths are byte-identical. It owns the framing (`exiftool:1649,
+  // 2678,2953-2954,3090,1650`), the Group1 stable-clustering sort
+  // (`exiftool:1853-1854`, `ExifTool.pm:3362-3386` — `-G#` ⇒ `Sort =>
+  // Group1`, applied before the print loop), the generated `ExifTool:Warning`
+  // / `ExifTool:Error` tags (`ExifTool.pm:1225,1288-1297`; only the FIRST of
+  // each, `exiftool:2744`), and the `%noDups` first-wins
+  // (`exiftool:2950-2951`) on the sorted walk.
+  crate::json_scalar::render_g1_json_document(m.source_file(), m.tags(), m.warnings(), m.errors())
 }
 
 #[cfg(test)]

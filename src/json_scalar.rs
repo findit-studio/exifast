@@ -12,7 +12,16 @@
 //! round-trip) keeps it byte-exact with ExifTool and infallible — there is no
 //! error path, so `Bytes`/`Rational` can never fail the document.
 
-use crate::value::{Rational, TagValue, format_g, perl_nonfinite_str};
+use crate::value::{Rational, Tag, TagValue, format_g, perl_nonfinite_str};
+use smol_str::SmolStr;
+// `BTreeSet` (not `HashSet`) for the `%noDups` seen-token set in
+// `render_g1_json_document`: this module is `#[cfg(feature = "alloc")]`-gated,
+// and in a no_std + alloc build the crate aliases `alloc as std` (lib.rs) —
+// but `alloc::collections` has NO `HashSet` (it needs a std hasher), so
+// `std::collections::HashSet` would fail to compile outside std (Codex
+// A-R4-3). `BTreeSet` lives in `alloc` and is a drop-in for the
+// insert-returns-bool dedup.
+use std::{collections::BTreeSet, string::String, vec::Vec};
 
 /// ExifTool's `%jsonChar` short escapes (`exiftool` line 250):
 /// `"` → `\"`, `\` → `\\`, TAB → `\t`, LF → `\n`, CR → `\r`.
@@ -244,4 +253,115 @@ pub fn push_numeric_gated(out: &mut String, s: &str) {
   } else {
     push_json_string(out, s);
   }
+}
+
+/// Render the byte-exact `exiftool -j -G1` JSON document from the SourceFile
+/// path, the found tags (in extraction / FoundTag order), and the generated
+/// `Warning` / `Error` strings. This is the SINGLE source of truth shared by
+/// [`crate::serialize::to_exiftool_json`] (the `Metadata` push-bag oracle) and
+/// [`crate::json_writer::JsonTagWriter::finish`] (the direct value sink), so
+/// the two output paths are guaranteed byte-identical.
+///
+/// It reproduces, citing the bundled rules:
+///
+/// 1. **Framing** — `[`/`{` (`exiftool:1649,2678`), `SourceFile` first,
+///    `,\n  "tok": v` per tag (`exiftool:2953-2954`, `$ind = '  '`), `\n}` +
+///    `]\n` (`exiftool:3090,1650`).
+/// 2. **Group1 sort** — `-G#` sets `Sort => "Group1"` (`exiftool:1853-1854`),
+///    applied by `GetTagList` (`ExifTool.pm:3362-3386`) BEFORE the print loop:
+///    walk in file order, rank each Group1 by first appearance, then sort by
+///    `(group rank, file order)` — group-clustered, groups in first-seen
+///    order, occurrence order within a group.
+/// 3. **Generated `ExifTool:Warning` / `ExifTool:Error`** — real `ExifTool`-
+///    group FoundTags (`ExifTool.pm:1225,1288-1297`). The caller pushes
+///    `ExifTool:ExifToolVersion` FIRST, so the `ExifTool` group is rank 1 and
+///    Warning/Error cluster right after `ExifToolVersion` (their file-order
+///    indices follow the records ⇒ Version → Warning → Error within the
+///    cluster). Default `-j -G1` emits only the FIRST of each
+///    (`exiftool:2744`; `-a`/Duplicates deferred).
+/// 4. **`%noDups` first-wins** — `next if $noDups{$tok}` (`exiftool:2950-2951`)
+///    on the already-SORTED walk: the first occurrence of a `"<family1>:<name>"`
+///    token wins, later same-token entries are dropped entirely.
+#[must_use]
+pub fn render_g1_json_document<S: AsRef<str>>(
+  source_file: &str,
+  tags: &[Tag],
+  warnings: &[S],
+  errors: &[S],
+) -> String {
+  struct Entry {
+    group1: SmolStr,
+    file_order: usize,
+    token: String,
+    value: String,
+  }
+  // ─── 1. Assemble every output entry in FILE (occurrence) order ──────────
+  let mut entries: Vec<Entry> = Vec::with_capacity(tags.len() + 2);
+  for (i, t) in tags.iter().enumerate() {
+    let mut value = String::new();
+    push_value(&mut value, t.value());
+    entries.push(Entry {
+      group1: t.group().family1().into(),
+      file_order: i,
+      // exiftool:2947 `$tok = "$group:$tagName"` under `-G1`.
+      token: std::format!("{}:{}", t.group().family1(), t.name()),
+      value,
+    });
+  }
+  if let Some(first) = warnings.first() {
+    let mut value = String::new();
+    push_json_string(&mut value, first.as_ref());
+    entries.push(Entry {
+      group1: SmolStr::new_static("ExifTool"),
+      file_order: tags.len(),
+      token: String::from("ExifTool:Warning"),
+      value,
+    });
+  }
+  if let Some(first) = errors.first() {
+    let mut value = String::new();
+    push_json_string(&mut value, first.as_ref());
+    entries.push(Entry {
+      group1: SmolStr::new_static("ExifTool"),
+      file_order: tags.len() + 1,
+      token: String::from("ExifTool:Error"),
+      value,
+    });
+  }
+
+  // ─── 2. Group1 stable-clustering sort (ExifTool.pm:3362-3386) ───────────
+  let mut group_rank: Vec<SmolStr> = Vec::new();
+  let mut rank_of = |g: &SmolStr| -> usize {
+    if let Some(r) = group_rank.iter().position(|name| name == g) {
+      r
+    } else {
+      group_rank.push(g.clone());
+      group_rank.len() - 1
+    }
+  };
+  let ranks: Vec<usize> = entries.iter().map(|e| rank_of(&e.group1)).collect();
+  let mut idx: Vec<usize> = (0..entries.len()).collect();
+  // Stable sort by (group rank, file order); the key pair is total.
+  idx.sort_by_key(|&i| (ranks[i], entries[i].file_order));
+
+  // ─── 3. Framing + print loop with `%noDups` first-wins on SORTED order ──
+  let mut out = String::new();
+  out.push('[');
+  out.push('{');
+  out.push_str("\n  \"SourceFile\": ");
+  push_json_string(&mut out, source_file);
+  let mut seen: BTreeSet<&str> = BTreeSet::new();
+  for &i in &idx {
+    let e = &entries[i];
+    if !seen.insert(e.token.as_str()) {
+      continue; // exiftool:2950 first-wins.
+    }
+    out.push_str(",\n  ");
+    push_json_string(&mut out, &e.token);
+    out.push_str(": ");
+    out.push_str(&e.value);
+  }
+  out.push_str("\n}");
+  out.push_str("]\n");
+  out
 }
