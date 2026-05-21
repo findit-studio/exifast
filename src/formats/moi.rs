@@ -117,57 +117,66 @@ impl<'a> MoiMeta<'a> {
   /// MOIVersion — 2-byte ASCII tag prefix (e.g. `"V6"`). Borrowed from
   /// the input slice.
   #[must_use]
-  pub fn version(&self) -> &'a str {
+  #[inline(always)]
+  pub const fn version(&self) -> &'a str {
     self.version
   }
 
   /// DateTimeOriginal as a [`jiff::civil::DateTime`]; `None` if the
   /// embedded bytes encoded out-of-range components.
   #[must_use]
-  pub fn datetime_original(&self) -> Option<DateTime> {
+  #[inline(always)]
+  pub const fn datetime_original(&self) -> Option<DateTime> {
     self.datetime_original
   }
 
   /// Recording duration. Millisecond-precise (constructed from the raw
   /// int32u via [`Duration::from_millis`]).
   #[must_use]
-  pub fn duration(&self) -> Option<Duration> {
+  #[inline(always)]
+  pub const fn duration(&self) -> Option<Duration> {
     self.duration
   }
 
   /// AspectRatio (nibble-decoded). Returns `None` if the offset was
   /// missing from the buffer.
   #[must_use]
-  pub fn aspect_ratio(&self) -> Option<AspectRatio> {
+  #[inline(always)]
+  pub const fn aspect_ratio(&self) -> Option<AspectRatio> {
     self.aspect_ratio
   }
 
   /// AudioCodec raw int16u. Use [`audio_codec_name`](Self::audio_codec_name)
   /// for the PrintConv-style name.
   #[must_use]
-  pub fn audio_codec(&self) -> Option<u16> {
+  #[inline(always)]
+  pub const fn audio_codec(&self) -> Option<u16> {
     self.audio_codec
   }
 
   /// AudioCodec name from the MOI.pm:75-79 PrintConv hash. `None` if no
   /// codec was extracted; `Some(&str)` for a known codec; the "Unknown
   /// (0x%x)" fallback is NOT returned here (it lives in the PrintConv
-  /// emit path).
+  /// emit path). (`Option::and_then` is not `const`, so this getter is
+  /// non-const.)
   #[must_use]
+  #[inline(always)]
   pub fn audio_codec_name(&self) -> Option<&'static str> {
     self.audio_codec.and_then(audio_codec_lookup)
   }
 
   /// AudioBitrate in bits-per-second (post-ValueConv `*16000+48000`).
   #[must_use]
-  pub fn audio_bitrate(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn audio_bitrate(&self) -> Option<u32> {
     self.audio_bitrate
   }
 
   /// VideoBitrate — `Known(bps)` on a hash hit; `Unknown(raw_u16)` for
   /// an off-table code.
   #[must_use]
-  pub fn video_bitrate(&self) -> Option<VideoBitrate> {
+  #[inline(always)]
+  pub const fn video_bitrate(&self) -> Option<VideoBitrate> {
     self.video_bitrate
   }
 }
@@ -183,7 +192,17 @@ impl<'a> MoiMeta<'a> {
 /// the cross-product of those two axes; [`Self::print_conv`] yields the
 /// joined ExifTool form (e.g. `"4:3 PAL"`).
 ///
-/// D8 convention: newtype-style enum (no fields on variants).
+/// D8 convention: unit-only enum (no fields on any variant).
+///
+/// §2: closed/total decode of one `int8u` (every `(lo, hi)` nibble pair
+/// maps to exactly one variant via [`Self::from_byte`]), so it is **not**
+/// `#[non_exhaustive]` (there is no upstream vocabulary to grow — the
+/// `Unknown*` variants already absorb every off-table nibble) and carries
+/// no `Other(_)` escape. Variant predicates are hand-written (below) with
+/// clean names rather than `derive_more::IsVariant`, whose snake-casing
+/// across the `R4x3` digit boundaries would read as `is_r_4x_3` (§2
+/// digit-boundary gotcha); the variant names stay byte-faithful. `Display`
+/// routes through the single [`Self::print_conv`] source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AspectRatio {
   /// lo<2 ⇒ "4:3" (no system suffix; hi=0..3 or 6..15)
@@ -240,8 +259,10 @@ impl AspectRatio {
     }
   }
 
-  /// The MOI.pm:52-69 PrintConv string.
+  /// The MOI.pm:52-69 PrintConv string. Single source of truth for the
+  /// human-readable form, also driving [`core::fmt::Display`].
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> &'static str {
     match self {
       AspectRatio::R4x3 => "4:3",
@@ -255,6 +276,63 @@ impl AspectRatio {
       AspectRatio::UnknownPal => "Unknown PAL",
     }
   }
+
+  /// `true` for the `4:3` frame-shape family (any TV-system suffix).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_4x3(self) -> bool {
+    matches!(
+      self,
+      AspectRatio::R4x3 | AspectRatio::R4x3Ntsc | AspectRatio::R4x3Pal
+    )
+  }
+
+  /// `true` for the `16:9` frame-shape family (any TV-system suffix).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_16x9(self) -> bool {
+    matches!(
+      self,
+      AspectRatio::R16x9 | AspectRatio::R16x9Ntsc | AspectRatio::R16x9Pal
+    )
+  }
+
+  /// `true` for the `Unknown` frame-shape family (off-table low nibble).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_unknown_shape(self) -> bool {
+    matches!(
+      self,
+      AspectRatio::Unknown | AspectRatio::UnknownNtsc | AspectRatio::UnknownPal
+    )
+  }
+
+  /// `true` when the high nibble decoded to the NTSC TV system (`hi == 4`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_ntsc(self) -> bool {
+    matches!(
+      self,
+      AspectRatio::R4x3Ntsc | AspectRatio::R16x9Ntsc | AspectRatio::UnknownNtsc
+    )
+  }
+
+  /// `true` when the high nibble decoded to the PAL TV system (`hi == 5`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_pal(self) -> bool {
+    matches!(
+      self,
+      AspectRatio::R4x3Pal | AspectRatio::R16x9Pal | AspectRatio::UnknownPal
+    )
+  }
+}
+
+impl core::fmt::Display for AspectRatio {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.print_conv())
+  }
 }
 
 /// VideoBitrate ValueConv result (MOI.pm:92-95). A hash hit produces a
@@ -262,9 +340,31 @@ impl AspectRatio {
 /// the PrintConv emit path can render the `Unknown (0x%x)` PrintHex
 /// fallback.
 ///
-/// D8 newtype-style: variants are flat data carriers, no public field
-/// accessors needed beyond the type's own match arms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// D8 newtype-style: every variant is a single-field newtype data carrier.
+///
+/// §2: data-carrying enum — `derive_more` supplies the `is_known`/
+/// `is_unknown` predicates and `unwrap_*`/`try_unwrap_*` accessors
+/// (`ref`/`ref_mut`) so callers don't hand-match. The `Unknown(u16)` arm is
+/// the lossless coded escape: it preserves the raw on-disk `int16u` so the
+/// off-table code round-trips through to the PrintHex (`Unknown (0x%x)`)
+/// emit path. No `Display` is provided: a `VideoBitrate` has no single
+/// canonical string — the `Known` arm renders via `ConvertBitrate` while
+/// the `Unknown` arm renders via PrintHex — so its formatting lives in the
+/// `serialize_tags` emit path, not a misleading one-shot `as_str`.
+/// Not `#[non_exhaustive]`: these two arms (hash hit vs. lossless raw
+/// carrier) already cover every possible ValueConv outcome.
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum VideoBitrate {
   /// MOI.pm:93/94 hash hit ⇒ known bps (e.g. 8_500_000 / 5_500_000).
   Known(u32),
@@ -283,6 +383,7 @@ pub enum VideoBitrate {
 /// so the library accessor [`MoiMeta::audio_codec_name`] and the sink
 /// path share the same source of truth.
 #[must_use]
+#[inline(always)]
 const fn audio_codec_lookup(code: u16) -> Option<&'static str> {
   match code {
     0x00c1 => Some("AC3"),  // MOI.pm:77
@@ -754,19 +855,15 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
 ///
-/// `Display` is hand-derived (no variants today; `Debug` is enough).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
+/// feature tier — `thiserror` v2 with `default-features = false` emits
+/// `core::error::Error`, so `MoiError` is a real `Error` even on no-std).
+/// `#[non_exhaustive]` lets the first real variant land without a breaking
+/// change. The derive expands `Display` to an empty `match *self {}`, so no
+/// `#[error(…)]` attribute is needed while the enum has no variants.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MoiError {}
-
-impl core::fmt::Display for MoiError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    // Unreachable: no variants exist.
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for MoiError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -780,6 +877,14 @@ impl std::error::Error for MoiError {}
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;
+
+  #[test]
+  fn moi_error_is_core_error() {
+    // §5: thiserror v2 (default-features=false) makes the empty error enum
+    // a real `core::error::Error` in every feature tier.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<MoiError>();
+  }
 
   // ---------- ValueConv helpers ------------------------------------------
 
@@ -850,6 +955,47 @@ mod tests {
     assert_eq!(AspectRatio::from_byte(0x02).print_conv(), "Unknown");
     assert_eq!(AspectRatio::from_byte(0x42).print_conv(), "Unknown NTSC");
     assert_eq!(AspectRatio::from_byte(0x52).print_conv(), "Unknown PAL");
+  }
+
+  #[test]
+  fn aspect_ratio_predicates_and_display() {
+    // §2 hand-written predicates: shape family is mutually exclusive.
+    let pal43 = AspectRatio::from_byte(0x51); // R4x3Pal
+    assert!(pal43.is_4x3());
+    assert!(!pal43.is_16x9());
+    assert!(!pal43.is_unknown_shape());
+    assert!(pal43.is_pal());
+    assert!(!pal43.is_ntsc());
+
+    let ntsc169 = AspectRatio::from_byte(0x44); // R16x9Ntsc
+    assert!(ntsc169.is_16x9());
+    assert!(ntsc169.is_ntsc());
+    assert!(!ntsc169.is_pal());
+
+    let unk = AspectRatio::from_byte(0x02); // Unknown (no system)
+    assert!(unk.is_unknown_shape());
+    assert!(!unk.is_ntsc());
+    assert!(!unk.is_pal());
+
+    // §2 Display routes through the single `print_conv` source of truth.
+    assert_eq!(pal43.to_string(), "4:3 PAL");
+    assert_eq!(pal43.to_string(), pal43.print_conv());
+    assert_eq!(AspectRatio::R16x9Ntsc.to_string(), "16:9 NTSC");
+  }
+
+  #[test]
+  fn video_bitrate_variant_accessors() {
+    // §2 derive_more predicates + unwrap/try_unwrap.
+    let known = VideoBitrate::Known(8_500_000);
+    let unknown = VideoBitrate::Unknown(0xbeef);
+    assert!(known.is_known());
+    assert!(!known.is_unknown());
+    assert!(unknown.is_unknown());
+    assert_eq!(known.unwrap_known(), 8_500_000);
+    assert_eq!(unknown.unwrap_unknown(), 0xbeef);
+    assert_eq!(known.try_unwrap_unknown().ok(), None);
+    assert_eq!(unknown.try_unwrap_known().ok(), None);
+    assert_eq!(*known.unwrap_known_ref(), 8_500_000);
   }
 
   #[test]

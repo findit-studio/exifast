@@ -139,13 +139,15 @@ pub struct AacMeta<'a> {
 impl<'a> AacMeta<'a> {
   /// ProfileType raw value (0..=2).
   #[must_use]
-  pub fn profile_type(&self) -> u8 {
+  #[inline(always)]
+  pub const fn profile_type(&self) -> u8 {
     self.profile_type
   }
 
   /// ProfileType PrintConv name (`%AAC::Main{ProfileType}`).
   #[must_use]
-  pub fn profile_type_name(&self) -> &'static str {
+  #[inline(always)]
+  pub const fn profile_type_name(&self) -> &'static str {
     match self.profile_type {
       0 => "Main",
       1 => "Low Complexity",
@@ -156,19 +158,22 @@ impl<'a> AacMeta<'a> {
 
   /// SampleRate in Hz (e.g. 44100). Post-ValueConv (`%convSampleRate`).
   #[must_use]
-  pub fn sample_rate(&self) -> u32 {
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> u32 {
     self.sample_rate
   }
 
   /// Channels raw value (0..=7).
   #[must_use]
-  pub fn channels(&self) -> u8 {
+  #[inline(always)]
+  pub const fn channels(&self) -> u8 {
     self.channels
   }
 
   /// Encoder string borrowed from the input buffer, if present.
   #[must_use]
-  pub fn encoder(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn encoder(&self) -> Option<&'a str> {
     self.encoder
   }
 }
@@ -412,17 +417,16 @@ impl AacMeta<'_> {
 /// Rust-level fatal modes for AAC parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
+/// feature tier — `thiserror` v2 with `default-features = false` emits
+/// `core::error::Error`, so `AacError` is a real `Error` even on no-std).
+/// `#[non_exhaustive]` lets the first real variant land without a breaking
+/// change. The derive expands `Display` to an empty `match *self {}`, so no
+/// `#[error(…)]` attribute is needed while the enum has no variants.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AacError {}
-
-impl core::fmt::Display for AacError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for AacError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -435,6 +439,14 @@ impl std::error::Error for AacError {}
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn aac_error_is_core_error() {
+    // §5: thiserror v2 (default-features=false) makes the empty error enum
+    // a real `core::error::Error` in every feature tier.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<AacError>();
+  }
 
   #[test]
   fn table_and_keys_are_faithful() {

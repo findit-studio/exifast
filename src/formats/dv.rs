@@ -47,6 +47,7 @@ impl DvProfile {
   /// ImageHeight, ImageWidth)` rendering (FrameRate splits into 2 fields),
   /// and a builder would obscure the line-by-line faithful-1:1 mapping.
   #[must_use]
+  #[inline(always)]
   #[allow(clippy::too_many_arguments)]
   const fn new(
     dsf: u8,
@@ -74,41 +75,50 @@ impl DvProfile {
 
   /// DV.pm `DSF` field.
   #[must_use]
+  #[inline(always)]
   const fn dsf(&self) -> u8 {
     self.dsf
   }
   /// DV.pm `VideoSType` field (`0x0` / `0x4` / `0x14` / `0x18` / `0x1`).
   #[must_use]
+  #[inline(always)]
   const fn video_stype(&self) -> u8 {
     self.video_stype
   }
   /// DV.pm `FrameSize` field (bytes per video frame).
   #[must_use]
+  #[inline(always)]
   const fn frame_size(&self) -> u32 {
     self.frame_size
   }
   /// DV.pm `VideoFormat` field (the descriptive string).
   #[must_use]
+  #[inline(always)]
   const fn video_format(&self) -> &'static str {
     self.video_format
   }
   /// DV.pm `Colorimetry` field.
   #[must_use]
+  #[inline(always)]
   const fn colorimetry(&self) -> &'static str {
     self.colorimetry
   }
-  /// `FrameRate` as a Rust `f64` (`num/den`).
+  /// `FrameRate` as a Rust `f64` (`num/den`). (`f64::from` is not a
+  /// `const` trait call, so this getter is non-const.)
   #[must_use]
+  #[inline(always)]
   fn frame_rate_f64(&self) -> f64 {
     f64::from(self.frame_rate_num) / f64::from(self.frame_rate_den)
   }
   /// DV.pm `ImageHeight` field.
   #[must_use]
+  #[inline(always)]
   const fn image_height(&self) -> u32 {
     self.image_height
   }
   /// DV.pm `ImageWidth` field.
   #[must_use]
+  #[inline(always)]
   const fn image_width(&self) -> u32 {
     self.image_width
   }
@@ -551,6 +561,12 @@ fn extract_vaux_meta(
 /// Computed result of the bytewise parse (`compute`). Distinguishes the
 /// Perl reject paths from the two accept paths so each is independently
 /// testable; the live driver matches and runs the `&mut ctx` finalize.
+///
+/// §2: private intermediate enum (never crosses the crate boundary, so no
+/// `Display`/lossless-escape surface) — `derive_more::IsVariant` supplies
+/// the variant predicates. All variants are unit or single-field newtype
+/// (`Found`), satisfying the unit-or-newtype-only rule.
+#[derive(derive_more::IsVariant)]
 enum Parsed<'a> {
   /// DV.pm:158 `or return 0` — `$raf->Read` empty.
   RejectEmpty,
@@ -623,71 +639,85 @@ pub struct DvMeta<'a> {
 
 impl<'a> DvMeta<'a> {
   /// `DateTimeOriginal` as a fixed-format `"YYYY:MM:DD hh:mm:ss"` string
-  /// (DV.pm:239). `None` if the VAUX scan failed.
+  /// (DV.pm:239). `None` if the VAUX scan failed. (`Option::as_deref` is
+  /// not `const`, so this getter is non-const.)
   #[must_use]
+  #[inline(always)]
   pub fn date_time_original(&self) -> Option<&str> {
     self.date_time_original.as_deref()
   }
   /// `ImageWidth` in pixels (DV.pm `@dvProfiles{ImageWidth}`).
   #[must_use]
-  pub fn image_width(&self) -> u32 {
+  #[inline(always)]
+  pub const fn image_width(&self) -> u32 {
     self.image_width
   }
   /// `ImageHeight` in pixels.
   #[must_use]
-  pub fn image_height(&self) -> u32 {
+  #[inline(always)]
+  pub const fn image_height(&self) -> u32 {
     self.image_height
   }
   /// `Duration` in seconds (file-size / byte-rate, DV.pm:196).
   #[must_use]
-  pub fn duration_secs(&self) -> f64 {
+  #[inline(always)]
+  pub const fn duration_secs(&self) -> f64 {
     self.duration
   }
   /// `TotalBitrate` in bits-per-second (DV.pm:194).
   #[must_use]
-  pub fn total_bitrate_bps(&self) -> f64 {
+  #[inline(always)]
+  pub const fn total_bitrate_bps(&self) -> f64 {
     self.total_bitrate
   }
   /// `VideoFormat` (e.g. `"IEC 61834 - 625/50 (PAL)"`).
   #[must_use]
-  pub fn video_format(&self) -> &'a str {
+  #[inline(always)]
+  pub const fn video_format(&self) -> &'a str {
     self.video_format
   }
   /// `VideoScanType` — `"Interlaced"` / `"Progressive"`. `None` if no
   /// VAUX `0x61` pack.
   #[must_use]
-  pub fn video_scan_type(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn video_scan_type(&self) -> Option<&'a str> {
     self.video_scan_type
   }
   /// `FrameRate` raw value in Hz (post-ValueConv `num/den`,
   /// pre-PrintConv rounding).
   #[must_use]
-  pub fn frame_rate(&self) -> f64 {
+  #[inline(always)]
+  pub const fn frame_rate(&self) -> f64 {
     self.frame_rate
   }
   /// `AspectRatio` — `"16:9"` / `"4:3"`. `None` if no VAUX `0x61` pack.
   #[must_use]
-  pub fn aspect_ratio(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn aspect_ratio(&self) -> Option<&'a str> {
     self.aspect_ratio
   }
   /// `Colorimetry` (e.g. `"4:2:0"`).
   #[must_use]
-  pub fn colorimetry(&self) -> &'a str {
+  #[inline(always)]
+  pub const fn colorimetry(&self) -> &'a str {
     self.colorimetry
   }
   /// `AudioChannels` count. `None` if no audio pack.
   #[must_use]
-  pub fn audio_channels(&self) -> Option<i64> {
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> Option<i64> {
     self.audio_channels
   }
   /// `AudioSampleRate` in Hz. `None` if no audio pack.
   #[must_use]
-  pub fn audio_sample_rate(&self) -> Option<i64> {
+  #[inline(always)]
+  pub const fn audio_sample_rate(&self) -> Option<i64> {
     self.audio_sample_rate
   }
   /// `AudioBitsPerSample` in bits (12 or 16). `None` if no audio pack.
   #[must_use]
-  pub fn audio_bits_per_sample(&self) -> Option<i64> {
+  #[inline(always)]
+  pub const fn audio_bits_per_sample(&self) -> Option<i64> {
     self.audio_bits_per_sample
   }
 }
@@ -827,7 +857,17 @@ impl parser_sealed::Sealed for ProcessDv {}
 /// `Warn` + return-true vs. tag-emission + return-true respectively.
 ///
 /// The `Parsed::Reject*` arms map to `Ok(None)` (Perl `return 0`).
-#[derive(Debug, Clone)]
+///
+/// §2: data-carrying enum — `derive_more` supplies `is_*` predicates and
+/// `unwrap_*`/`try_unwrap_*` accessors (`ref`/`ref_mut`) so callers don't
+/// hand-match; `Display` is routed through the single [`Self::as_str`]
+/// label. Closed semantic vocabulary (the two terminal outcomes of a DV
+/// parse), so no open `Other(_)` / coded `Unknown(n)` escape applies; still
+/// `#[non_exhaustive]` so a future outcome variant is non-breaking.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum DvParseOutcome<'a> {
   /// DV.pm:188 — recognized DIF header but no profile match. Bundled
   /// Perl emits `Warning => "Unrecognized DV profile"` and returns 1
@@ -835,6 +875,25 @@ pub enum DvParseOutcome<'a> {
   UnrecognizedProfile,
   /// DV.pm:267-270 — full success; emit tags in @dvTags order.
   Meta(DvMeta<'a>),
+}
+
+impl DvParseOutcome<'_> {
+  /// Stable label for each outcome (single source of truth for `Display`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      DvParseOutcome::UnrecognizedProfile => "UnrecognizedProfile",
+      DvParseOutcome::Meta(_) => "Meta",
+    }
+  }
+}
+
+impl core::fmt::Display for DvParseOutcome<'_> {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
 }
 
 impl FormatParser for ProcessDv {
@@ -987,17 +1046,16 @@ impl DvMeta<'_> {
 /// Rust-level fatal modes for DV parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
+/// feature tier — `thiserror` v2 with `default-features = false` emits
+/// `core::error::Error`, so `DvError` is a real `Error` even on no-std).
+/// `#[non_exhaustive]` lets the first real variant land without a breaking
+/// change. The derive expands `Display` to an empty `match *self {}`, so no
+/// `#[error(…)]` attribute is needed while the enum has no variants.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DvError {}
-
-impl core::fmt::Display for DvError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for DvError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1006,6 +1064,14 @@ impl std::error::Error for DvError {}
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn dv_error_is_core_error() {
+    // §5: thiserror v2 (default-features=false) makes the empty error enum
+    // a real `core::error::Error` in every feature tier.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<DvError>();
+  }
 
   #[test]
   fn profiles_and_tag_order_are_faithful() {
@@ -1294,6 +1360,38 @@ mod tests {
   #[test]
   fn parse_borrowed_rejects_empty() {
     assert!(parse_borrowed(&[]).unwrap().is_none());
+  }
+
+  #[test]
+  fn dv_parse_outcome_variant_accessors_and_display() {
+    // §2 derive_more predicates + unwrap/try_unwrap + Display-via-as_str.
+    let unrecognized: DvParseOutcome<'static> = DvParseOutcome::UnrecognizedProfile;
+    assert!(unrecognized.is_unrecognized_profile());
+    assert!(!unrecognized.is_meta());
+    assert_eq!(unrecognized.as_str(), "UnrecognizedProfile");
+    assert_eq!(unrecognized.to_string(), "UnrecognizedProfile");
+    assert!(unrecognized.try_unwrap_meta().is_err());
+
+    let meta = DvMeta {
+      date_time_original: None,
+      image_width: 720,
+      image_height: 576,
+      duration: 1.0,
+      total_bitrate: 1.0,
+      video_format: "x",
+      video_scan_type: None,
+      frame_rate: 25.0,
+      aspect_ratio: None,
+      colorimetry: "4:2:0",
+      audio_channels: None,
+      audio_sample_rate: None,
+      audio_bits_per_sample: None,
+    };
+    let outcome = DvParseOutcome::Meta(meta);
+    assert!(outcome.is_meta());
+    assert_eq!(outcome.as_str(), "Meta");
+    assert_eq!(outcome.to_string(), "Meta");
+    assert_eq!(outcome.unwrap_meta().image_width(), 720);
   }
 
   #[test]
