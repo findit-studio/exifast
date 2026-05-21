@@ -842,7 +842,10 @@ pub enum DvParseOutcome<'a> {
 
 impl FormatParser for ProcessDv {
   /// Spec §8: leaf format with no shared state; reads a single byte slice.
-  type Meta = DvParseOutcome<'static>;
+  /// GAT: the Meta is parameterized by `'a`, though every string field
+  /// actually originates from the `'static` [`DV_PROFILES`] table (Codex
+  /// AF2).
+  type Meta<'a> = DvParseOutcome<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; DV parsing has no I/O modes).
@@ -852,7 +855,9 @@ impl FormatParser for ProcessDv {
   /// if the buffer is not a valid DV file (short read, no DIF header,
   /// fewer than 6 blocks). Returns `Err` only for Rust-level fatal
   /// modes; the current port has none.
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, DvError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, DvError> {
+    // `parse_outcome` yields a `DvParseOutcome<'static>`; covariance widens
+    // it to the caller's `'a`.
     Ok(parse_outcome(data))
   }
 }
@@ -880,16 +885,13 @@ fn parse_outcome(data: &[u8]) -> Option<DvParseOutcome<'static>> {
   }
 }
 
-// ===========================================================================
-// `DvMeta::into_static`
-// ===========================================================================
-
 // NOTE: DV's typed parser always produces `DvMeta<'static>` because every
-// `&'a str` field originates from the `'static` [`DV_PROFILES`] table; no
-// `into_static` shim is necessary (unlike MOI / AAC which carry
-// borrow-from-input strings). The `<'a>` parameter is kept on the struct
-// for shape parity with the rest of the Phase F1 leaves and to leave room
-// for future bytes-borrowed accessors (e.g. a raw DIF-block view).
+// `&'a str` field originates from the `'static` [`DV_PROFILES`] table; the
+// `FormatParser::Meta` GAT (`type Meta<'a> = DvParseOutcome<'a>`) widens
+// it to the caller's `'a` by covariance (Codex AF2). The `<'a>` parameter
+// is kept on the struct for shape parity with the rest of the Phase F1
+// leaves and to leave room for future bytes-borrowed accessors (e.g. a
+// raw DIF-block view).
 
 // ===========================================================================
 // `MetaSinker` — typed Meta → TagWriter

@@ -795,13 +795,14 @@ pub struct ProcessR3D;
 impl parser_sealed::Sealed for ProcessR3D {}
 
 impl FormatParser for ProcessR3D {
-  type Meta = R3dMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = R3dMeta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   type Error = R3dError;
 
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, R3dError> {
-    Ok(parse_inner(data).map(R3dMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, R3dError> {
+    Ok(parse_inner(data))
   }
 }
 
@@ -1323,92 +1324,6 @@ fn dispatch_directory_tag<'a>(
 
     _ => {
       // Unknown tag — faithfully drop.
-    }
-  }
-}
-
-// ===========================================================================
-// `R3dMeta::into_static`
-// ===========================================================================
-
-impl R3dMeta<'_> {
-  /// Promote a borrow-from-input [`R3dMeta`] into an owned `R3dMeta<'static>`
-  /// (Phase E `into_static` pragma).
-  fn into_static(self) -> R3dMeta<'static> {
-    fn leak(s: &str) -> &'static str {
-      std::boxed::Box::leak(s.to_string().into_boxed_str())
-    }
-    fn leak_opt(s: Option<&str>) -> Option<&'static str> {
-      s.map(leak)
-    }
-    fn leak_value(v: R3dValue<'_>) -> R3dValue<'static> {
-      match v {
-        R3dValue::I64(n) => R3dValue::I64(n),
-        R3dValue::F64(n) => R3dValue::F64(n),
-        R3dValue::Str(R3dStrCow::Borrowed(s)) => R3dValue::Str(R3dStrCow::Borrowed(leak(s))),
-        R3dValue::Str(R3dStrCow::Owned(s)) => R3dValue::Str(R3dStrCow::Owned(s)),
-        R3dValue::Bytes(b) => R3dValue::Bytes(b),
-        R3dValue::Rational(r) => R3dValue::Rational(r),
-      }
-    }
-    fn leak_value_opt(v: Option<R3dValue<'_>>) -> Option<R3dValue<'static>> {
-      v.map(leak_value)
-    }
-    fn leak_reel(v: R3dStrOrInt<'_>) -> R3dStrOrInt<'static> {
-      match v {
-        R3dStrOrInt::Str(s) => R3dStrOrInt::Str(leak(s)),
-        R3dStrOrInt::I64(n) => R3dStrOrInt::I64(n),
-      }
-    }
-
-    R3dMeta::<'static> {
-      redcode_version: self.redcode_version,
-      image_width: self.image_width,
-      image_height: self.image_height,
-      frame_rate: self.frame_rate,
-      red1_original_file_name: leak_opt(self.red1_original_file_name),
-      start_edge_code: leak_opt(self.start_edge_code),
-      start_timecode: leak_opt(self.start_timecode),
-      other_date_1: self.other_date_1,
-      other_date_2: self.other_date_2,
-      other_date_3: self.other_date_3,
-      date_time_original: self.date_time_original,
-      serial_number: leak_opt(self.serial_number),
-      camera_type: leak_opt(self.camera_type),
-      reel_number: self.reel_number.map(leak_reel),
-      take: leak_opt(self.take),
-      date_created: self.date_created,
-      time_created: self.time_created,
-      firmware_version: leak_opt(self.firmware_version),
-      reel_timecode: leak_opt(self.reel_timecode),
-      storage_type: leak_opt(self.storage_type),
-      storage_format_date: self.storage_format_date,
-      storage_format_time: self.storage_format_time,
-      storage_serial_number: leak_opt(self.storage_serial_number),
-      storage_model: leak_opt(self.storage_model),
-      aspect_ratio: leak_opt(self.aspect_ratio),
-      revision: leak_opt(self.revision),
-      original_file_name: leak_opt(self.original_file_name),
-      lens_make: leak_opt(self.lens_make),
-      lens_number: leak_opt(self.lens_number),
-      lens_model: leak_opt(self.lens_model),
-      model: leak_opt(self.model),
-      camera_operator: leak_opt(self.camera_operator),
-      video_format: leak_opt(self.video_format),
-      filter: leak_opt(self.filter),
-      brain: leak_opt(self.brain),
-      sensor: leak_opt(self.sensor),
-      quality: leak_opt(self.quality),
-      color_temperature: leak_value_opt(self.color_temperature),
-      rgb_curves: leak_value_opt(self.rgb_curves),
-      original_frame_rate: leak_value_opt(self.original_frame_rate),
-      crop_area: leak_value_opt(self.crop_area),
-      iso: leak_value_opt(self.iso),
-      f_number: self.f_number,
-      focal_length: leak_value_opt(self.focal_length),
-      focus_distance: self.focus_distance,
-      warnings: self.warnings,
-      directory_tag_order: self.directory_tag_order,
     }
   }
 }

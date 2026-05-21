@@ -720,9 +720,9 @@ impl parser_sealed::Sealed for ProcessAa {}
 
 impl FormatParser for ProcessAa {
   /// AA's only borrowed lifetime is the cover-art chunk-11 path (`&'a
-  /// [u8]`). The trait shape forces `'static` via [`AaMeta::into_static`]
-  /// (Phase E `into_static` pragma, per `docs/tracking.md`).
-  type Meta = AaMeta<'static>;
+  /// [u8]`). GAT: the Meta borrows from the input `'a` directly (Codex
+  /// AF2).
+  type Meta<'a> = AaMeta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]` (no shared cross-format
   /// state — AA does not chain to ID3/APE etc.).
   type Context<'a> = &'a [u8];
@@ -735,8 +735,8 @@ impl FormatParser for ProcessAa {
   /// buffer is not a valid AA (short read, wrong magic, or embedded
   /// filesize mismatch — Audible.pm:201-205). Returns `Err` only for
   /// Rust-level fatal modes; the current port has none.
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, AudibleError> {
-    Ok(parse_inner(data).map(AaMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AudibleError> {
+    Ok(parse_inner(data))
   }
 }
 
@@ -753,9 +753,9 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<AaMeta<'_>>, AudibleError> {
 }
 
 /// Inner parser — produces a borrow-from-input [`AaMeta`] (chunk-11 cover
-/// art borrows). The trait's `Meta = AaMeta<'static>` shape forces an
-/// [`AaMeta::into_static`] upgrade for the closed
-/// [`crate::parser_new::AnyMeta`] enum (Phase E `into_static` pragma).
+/// art borrows). The [`FormatParser::Meta`] GAT (`type Meta<'a> =
+/// AaMeta<'a>`) returns this borrowed form directly into the closed
+/// [`crate::parser_new::AnyMeta`] enum — no `'static` upgrade (Codex AF2).
 ///
 /// Faithful to `ProcessAA` (Audible.pm:194-273):
 /// 1. 16-byte magic + filesize gate (Audible.pm:201-205) — return `None`
@@ -1231,45 +1231,6 @@ fn handle_dynamic_entry<'a>(
 /// (`meta.tags().iter().any(...)`) is unnecessary in the typed path.
 fn collides_with_priority2_engine_tag(name: &str) -> bool {
   name == "FileType"
-}
-
-// ===========================================================================
-// `AaMeta::into_static`
-// ===========================================================================
-
-impl AaMeta<'_> {
-  /// Promote a borrow-from-input [`AaMeta`] into an owned `AaMeta<'static>`.
-  /// Used by the [`FormatParser`] impl to publish into the closed
-  /// [`crate::parser_new::AnyMeta`] enum (Phase E `into_static` pragma,
-  /// per `docs/tracking.md` 2026-05-21 entry).
-  ///
-  /// AA's only borrowed field is `AaValue::Bytes(Cow::Borrowed(...))` for
-  /// chunk-11 cover art; materializing into `Cow::Owned(Vec)` is the
-  /// faithful upgrade. Cover-art payloads are typically a few hundred KB;
-  /// this is a one-time clone per file. Phase G will retire this by
-  /// threading `AaMeta<'a>` through `AnyMeta<'a>` end-to-end.
-  fn into_static(self) -> AaMeta<'static> {
-    let entries: std::vec::Vec<AaEntry<'static>> = self
-      .entries
-      .into_iter()
-      .map(|e| AaEntry {
-        name: e.name,
-        value: match e.value {
-          AaValue::Str(s) => AaValue::Str(s),
-          AaValue::I64(n) => AaValue::I64(n),
-          // Materialize any borrowed bytes into an owned Cow. The
-          // `into_owned()` is a no-op for `Cow::Owned` and a single
-          // memcpy for `Cow::Borrowed`.
-          AaValue::Bytes(b) => AaValue::Bytes(std::borrow::Cow::Owned(b.into_owned())),
-        },
-      })
-      .collect();
-    AaMeta {
-      entries,
-      warnings: self.warnings,
-      errors: self.errors,
-    }
-  }
 }
 
 // ===========================================================================

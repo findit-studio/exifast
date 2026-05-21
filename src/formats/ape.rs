@@ -1299,25 +1299,6 @@ impl ApeMeta<'_> {
   }
 }
 
-impl ApeMeta<'_> {
-  /// Promote a borrow-from-input [`ApeMeta`] into an owned
-  /// `ApeMeta<'static>`. APE's typed parser already produces owned data
-  /// (`String` names, `TagValue` is by-value), so this is a no-op
-  /// reinterpretation of the lifetime parameter — but we keep the shape
-  /// parity with AAC/MOI for the closed [`crate::parser_new::AnyMeta`]
-  /// enum. Phase G retires the `into_static` shim by threading `'a`
-  /// through `AnyMeta<'a>` end-to-end.
-  fn into_static(self) -> ApeMeta<'static> {
-    ApeMeta {
-      header: self.header,
-      main_tags: self.main_tags,
-      warn_bad_trailer: self.warn_bad_trailer,
-      composite_duration: self.composite_duration,
-      _phantom: core::marker::PhantomData,
-    }
-  }
-}
-
 // =============================================================================
 // `ApeError` — Rust-level fatal modes (currently none)
 // =============================================================================
@@ -1337,10 +1318,11 @@ impl core::fmt::Display for ApeError {
 impl std::error::Error for ApeError {}
 
 impl FormatParser for ProcessApe {
-  /// Always `ApeMeta<'static>` — APE's typed Meta already owns its
-  /// resolved tag-name strings and `TagValue` payloads, so the
-  /// `into_static` shim is a no-op reinterpretation.
-  type Meta = ApeMeta<'static>;
+  /// GAT: `ApeMeta<'a>`. APE's typed Meta already owns its resolved
+  /// tag-name strings and `TagValue` payloads, so `'a` is phantom; the
+  /// `'static`-producing planner widens to the caller's `'a` by covariance
+  /// (Codex AF2).
+  type Meta<'a> = ApeMeta<'a>;
   /// Chained format (spec §6.4): `&'a [u8]` + `&'a mut SharedFlags` for
   /// the `done_id3`/`done_ape` cross-recursion plumbing.
   type Context<'a> = ApeContext<'a>;
@@ -1357,8 +1339,8 @@ impl FormatParser for ProcessApe {
   /// `$$et{DoneAPE} = 1` runs unconditionally on entry, BEFORE any
   /// magic check. This sets `shared.set_done_ape(true)` to gate the
   /// MP3 → APE-trailer fallback at ID3.pm:1723-1726.
-  fn parse(&self, ctx: ApeContext<'_>) -> Result<Option<ApeMeta<'static>>, ApeError> {
-    Ok(parse_borrowed(ctx).map(ApeMeta::into_static))
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
+    Ok(parse_borrowed(ctx))
   }
 }
 
@@ -1405,7 +1387,42 @@ fn parse_borrowed(mut ctx: ApeContext<'_>) -> Option<ApeMeta<'static>> {
   } else {
     plan_ape(ctx.data, print_conv_planner_mode, done_id3)
   }?;
-  Some(meta_from_plan(plan).into_static())
+  Some(meta_from_plan(plan))
+}
+
+/// Chained-parser trailer-only typed entry with **decoupled lifetimes** —
+/// `data` and `shared` borrow independently, and the returned
+/// [`ApeMeta`] is owned (`'static`). Used by the typed MP3 / MPC / WavPack
+/// wrappers (ID3.pm:1722-1727 `APE::ProcessAPE` trailer fallback) where
+/// `shared` is a transient borrow that must not extend into the returned
+/// Meta's lifetime (Codex BF1/CF1 + AF2).
+///
+/// Faithful to the private `parse_borrowed` trailer-only path: sets
+/// `done_ape` (APE.pm:131) and threads `shared.done_id3()` for the
+/// APE.pm:169 footer shift.
+pub(crate) fn parse_trailer_only_owned(
+  data: &[u8],
+  shared: &mut SharedFlags,
+) -> Option<ApeMeta<'static>> {
+  // APE.pm:131 `$$et{DoneAPE} = 1` (unconditional, before any magic check).
+  shared.set_done_ape(true);
+  let done_id3 = shared.done_id3().unwrap_or(0);
+  let plan = plan_apetagex_trailer_only(data, /* print_conv */ false, done_id3);
+  Some(meta_from_plan(plan))
+}
+
+/// Full APE parse (header + trailer) with **decoupled lifetimes** — `data`
+/// and `shared` borrow independently and the returned [`ApeMeta`] is owned
+/// (`'static`). Used by the closed [`crate::parser_new::AnyParser`]
+/// dispatch (Codex AF2) so the transient `shared` does not pin the
+/// returned `AnyMeta<'a>` lifetime. Faithful to the private `parse_borrowed`
+/// full path (APE.pm:121-172): sets `done_ape` and threads
+/// `shared.done_id3()` for the APE.pm:169 footer shift.
+pub(crate) fn parse_full_owned(data: &[u8], shared: &mut SharedFlags) -> Option<ApeMeta<'static>> {
+  shared.set_done_ape(true);
+  let done_id3 = shared.done_id3().unwrap_or(0);
+  let plan = plan_ape(data, /* print_conv */ false, done_id3)?;
+  Some(meta_from_plan(plan))
 }
 
 /// Lift a Phase-1 [`ApePlan`] into a typed [`ApeMeta`]. Translates the
@@ -4270,18 +4287,16 @@ mod tests {
   }
 
   #[test]
-  fn typed_meta_into_static_is_a_no_op_lifetime_reinterpretation() {
-    // ApeMeta carries owned data (String names, by-value TagValues), so
-    // `into_static` is a phantom-only reinterpretation. Confirm the
-    // round-trip preserves data.
+  fn typed_meta_borrowed_round_trip_preserves_data() {
+    // ApeMeta carries owned data (String names, by-value TagValues), so the
+    // GAT `Meta<'a>` is phantom over `'a`. Confirm the typed parse preserves
+    // data through the trait entry.
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta =
       <ProcessApe as FormatParser>::parse(&ProcessApe, ApeContext::new(&data, &mut shared))
         .expect("ok")
         .expect("parsed");
-    // The FormatParser trait already returns ApeMeta<'static>; the test
-    // is shape-parity with the AAC/MOI patterns.
     assert_eq!(meta.artist(), Some("Tester"));
   }
 

@@ -432,7 +432,8 @@ impl parser_sealed::Sealed for ProcessMoi {}
 
 impl FormatParser for ProcessMoi {
   /// Spec §8: leaf format with no shared state; reads a single byte slice.
-  type Meta = MoiMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = MoiMeta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; MOI parsing has no I/O modes).
@@ -444,17 +445,16 @@ impl FormatParser for ProcessMoi {
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, MoiError> {
-    parse_inner(data).map(|opt| opt.map(MoiMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MoiError> {
+    parse_inner(data)
   }
 }
 
-/// Lifetime-flexible inner parser. The trait's `Context<'a>` GAT shape
-/// requires `Meta` to be `'static` (we cannot name `Self::Meta<'a>` in the
-/// current spec §6.1 GAT formulation), so the trait method materializes
-/// the borrow-of-input strings into owned [`&'static str`] via
-/// [`MoiMeta::into_static`]. The lib-first direct call ([`parse_borrowed`])
-/// exposes the borrow-from-input form for zero-alloc callers.
+/// Inner parser producing a borrow-from-input [`MoiMeta`]. With the
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = MoiMeta<'a>`), the trait
+/// method returns this borrowed form directly — no `'static` upgrade. Both
+/// the trait `parse` and the lib-first direct call ([`parse_borrowed`])
+/// share this body (Codex AF2).
 fn parse_inner(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
   // MOI.pm:110 — `$raf->Read($buff,256) == 256 and $buff =~ /^V6/ or
   // return 0`. The 256-byte read AND the `V6` prefix are BOTH required.
@@ -493,11 +493,10 @@ fn parse_inner(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
   }))
 }
 
-/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
-/// [`MoiMeta`] that borrows from the input buffer — zero allocation. Use
-/// this when calling from typed Rust callers; the `FormatParser` trait
-/// signature uses `'static` for compatibility with the closed `AnyMeta`
-/// enum, which forces an `into_static` upgrade.
+/// Lib-first direct entry. Identical to [`FormatParser::parse`] now that
+/// the [`FormatParser::Meta`] GAT threads the input borrow lifetime
+/// through — returns a [`MoiMeta`] borrowing from the input buffer (zero
+/// allocation; Codex AF2).
 ///
 /// # Errors
 ///
@@ -745,49 +744,6 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
     _ => 0x05, // unset; fixture is 0x51 so default to 5 (PAL) for R4x3 ⇒ matches
   };
   (hi << 4) | lo
-}
-
-// ===========================================================================
-// `MoiMeta::into_static` — owned promotion for the `AnyMeta` enum
-// ===========================================================================
-
-impl MoiMeta<'_> {
-  /// Promote a borrow-from-input [`MoiMeta`] into an owned
-  /// `MoiMeta<'static>`. Used by the [`FormatParser`] impl to publish into
-  /// [`AnyMeta`](crate::parser_new::AnyMeta) — the closed `AnyMeta` enum
-  /// (spec §7) cannot carry a per-format lifetime parameter that's
-  /// different from `AnyMeta`'s own `'a`, and the simplest reconciliation
-  /// is to materialize the only borrowed field (`version: &'a str`) into
-  /// an owned static via a global interned subset.
-  ///
-  /// **Phase E pragma.** MOI's `MOIVersion` is always one of a few short
-  /// ASCII tokens (`"V6"` and forward-compat siblings); for the byte-exact
-  /// pilot we hard-code the `"V6"` case and fall back to the leaked-static
-  /// path for any other value. Phase G will revisit `AnyMeta`'s lifetime
-  /// model — the spec §7 sketch elides the per-format `<'a>` carry and
-  /// this `into_static` is the Phase E reconciliation. The leak path is
-  /// reachable only on a non-`"V6"` MOI version string, which no
-  /// camcorder-emitted file produces today.
-  fn into_static(self) -> MoiMeta<'static> {
-    let version: &'static str = match self.version {
-      "V6" => "V6",
-      // Forward-compat fallback: a future MOI generation may use a
-      // different magic-suffix string. Leaking the per-parse-allocated
-      // version is O(1) per file and unobservable in practice (MOI files
-      // are unique-version "V6" today). Phase G will retire this by
-      // threading `MoiMeta<'a>` through `AnyMeta<'a>` end-to-end.
-      other => std::boxed::Box::leak(other.to_string().into_boxed_str()),
-    };
-    MoiMeta {
-      version,
-      datetime_original: self.datetime_original,
-      duration: self.duration,
-      aspect_ratio: self.aspect_ratio,
-      audio_codec: self.audio_codec,
-      audio_bitrate: self.audio_bitrate,
-      video_bitrate: self.video_bitrate,
-    }
-  }
 }
 
 // ===========================================================================

@@ -494,11 +494,8 @@ pub struct ProcessWv;
 impl parser_sealed::Sealed for ProcessWv {}
 
 impl FormatParser for ProcessWv {
-  /// Typed metadata output. The `'static` shape is required by the closed
-  /// [`crate::parser_new::AnyMeta`] enum (Phase E `into_static` pragma);
-  /// [`parse_borrowed`] exposes the borrow-from-input form for zero-alloc
-  /// callers.
-  type Meta = WvMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = WvMeta<'a>;
   /// Spec §6.4 — chained-format context is a struct wrapping `&[u8]` +
   /// `&mut SharedFlags`.
   type Context<'a> = WvContext<'a>;
@@ -511,15 +508,15 @@ impl FormatParser for ProcessWv {
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, WvError> {
-    Ok(parse_inner(ctx.data).map(WvMeta::into_static))
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, WvError> {
+    Ok(parse_inner(ctx.data))
   }
 }
 
-/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
-/// [`WvMeta`] that borrows from the input buffer — zero allocation. The
-/// `FormatParser` trait signature uses `'static` for compatibility with
-/// the closed `AnyMeta` enum, which forces an `into_static` upgrade.
+/// Lib-first direct entry. Same as [`FormatParser::parse`] now that the
+/// [`FormatParser::Meta`] GAT threads the input borrow lifetime through —
+/// returns a [`WvMeta`] borrowing from the input buffer (zero allocation,
+/// including the chained ID3/APE trailer scan range; Codex AF2).
 ///
 /// # Errors
 ///
@@ -529,9 +526,10 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<WvMeta<'_>>, WvError> {
   Ok(parse_inner(data))
 }
 
-/// Inner parser — produces a borrow-from-input [`WvMeta`]. The trait's
-/// `Meta = WvMeta<'static>` shape forces a [`WvMeta::into_static`]
-/// upgrade for the closed [`crate::parser_new::AnyMeta`] enum.
+/// Inner parser — produces a borrow-from-input [`WvMeta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = WvMeta<'a>`) returns this
+/// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
+/// enum, keeping the live trailer-scan slice (Codex AF2).
 fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
   // WavPack.pm:87 `return 0 unless $raf->Read($buff, 32) == 32`.
   if data.len() < 32 {
@@ -613,42 +611,6 @@ fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
     sample_rate_raw_index: sr_raw,
     id3_apetrailer_scan: Some(data),
   })
-}
-
-// ===========================================================================
-// `WvMeta::into_static` — owned promotion for the `AnyMeta` enum
-// ===========================================================================
-
-impl WvMeta<'_> {
-  /// Promote a borrow-from-input [`WvMeta`] into an owned `WvMeta<'static>`.
-  /// Used by the [`FormatParser`] impl to publish into
-  /// [`AnyMeta`](crate::parser_new::AnyMeta) — the closed `AnyMeta` enum
-  /// (spec §7) cannot carry a per-format lifetime parameter that's
-  /// different from `AnyMeta`'s own `'a`, and the simplest reconciliation
-  /// is to clear the only borrowed field (`id3_apetrailer_scan: Option<&'a
-  /// [u8]>`) and rebuild as `'static`.
-  ///
-  /// **Phase F5 pragma.** The chained-trailer scan range is meaningful
-  /// only when a lib-first ID3 / APE typed parser consumes it; today's
-  /// `AnyMeta` consumer is the JSON sinker which emits the 5 header
-  /// tags and delegates the chained scan to the legacy bridge. Dropping
-  /// the borrow to `None` here is observably equivalent to leaving it
-  /// set: no caller of `AnyMeta::Wv(meta).sink(...)` reads the range
-  /// (the sink path doesn't drive trailers). Phase G will retire this
-  /// by threading `WvMeta<'a>` through `AnyMeta<'a>` end-to-end.
-  fn into_static(self) -> WvMeta<'static> {
-    WvMeta {
-      bytes_per_sample: self.bytes_per_sample,
-      audio_type: self.audio_type,
-      compression: self.compression,
-      data_format: self.data_format,
-      sample_rate: self.sample_rate,
-      sample_rate_raw_index: self.sample_rate_raw_index,
-      // Drop the borrow on input; the JSON sink does not read this
-      // field. See the doc comment above for the Phase G remediation.
-      id3_apetrailer_scan: None,
-    }
-  }
 }
 
 // ===========================================================================
@@ -1010,22 +972,22 @@ mod tests {
   // -------------------------------------------------------------------------
 
   #[test]
-  fn format_parser_trait_returns_meta_static() {
+  fn format_parser_trait_returns_borrowed_meta() {
     let data = header_with_flags(0x0480_008d);
     let mut shared = SharedFlags::new();
     let ctx = WvContext::new(&data, &mut shared);
     let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
       .expect("ok")
       .expect("parsed");
-    // Same field extraction as parse_borrowed; the only difference is
-    // the borrow on `id3_ape_scan_range` collapses to `None` after
-    // `into_static`.
+    // Identical extraction to `parse_borrowed`: the GAT path now threads
+    // the input borrow through, so the chained-trailer scan range survives
+    // (previously dropped by the removed `into_static`; Codex AF2).
     assert_eq!(meta.bytes_per_sample(), 1);
     assert_eq!(meta.audio_type(), AudioType::Mono);
     assert_eq!(meta.sample_rate(), SampleRate::Hz(48000));
     assert_eq!(meta.sample_rate_raw_index(), 10);
-    // `into_static` drops the borrow — see WvMeta::into_static doc.
-    assert!(meta.id3_ape_scan_range().is_none());
+    // The borrowed scan range is preserved on the trait path now.
+    assert!(meta.id3_ape_scan_range().is_some());
   }
 
   #[test]

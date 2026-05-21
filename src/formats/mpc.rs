@@ -557,10 +557,8 @@ pub struct ProcessMpc;
 impl parser_sealed::Sealed for ProcessMpc {}
 
 impl FormatParser for ProcessMpc {
-  /// Typed Meta. The `<'static>` shape is the [`crate::parser_new::AnyMeta`]-
-  /// compatible form; the lib-first direct entry [`parse_borrowed`] keeps
-  /// the borrow-from-input lifetime.
-  type Meta = MpcMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = MpcMeta<'a>;
   /// Chained-format Context: `data + SharedFlags`. See [`MpcContext`].
   type Context<'a> = MpcContext<'a>;
   /// Rust-level fatal error (currently none — every bad input is `Ok(None)`).
@@ -574,8 +572,8 @@ impl FormatParser for ProcessMpc {
   /// chained ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are
   /// deferred to the legacy [`OldFormatParser`] bridge (the parallel F2/F3
   /// agents own typed `Id3Meta` / `ApeMeta`).
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, MpcError> {
-    parse_inner(ctx.data()).map(|opt| opt.map(MpcMeta::into_static))
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpcError> {
+    parse_inner(ctx.data())
   }
 }
 
@@ -591,12 +589,11 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`MpcMeta`]. The trait's
-/// `Meta = MpcMeta<'static>` shape forces an [`MpcMeta::into_static`]
-/// upgrade for the closed [`crate::parser_new::AnyMeta`] enum (Phase E
-/// `into_static` pragma per `docs/tracking.md` 2026-05-21 entry); the
-/// placeholders [`MpcMeta::id3_prefix`] / [`MpcMeta::ape_trailer`] are
-/// always `None` in F5, so the upgrade is a trivial reborrow.
+/// Inner parser — produces a borrow-from-input [`MpcMeta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = MpcMeta<'a>`) returns
+/// this borrowed form directly into the closed
+/// [`crate::parser_new::AnyMeta`] enum (Codex AF2). The `id3_prefix` /
+/// `ape_trailer` placeholders are always `None` in F5.
 fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
   // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
   if data.len() < 32 {
@@ -692,40 +689,6 @@ fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
     }
   }
   h
-}
-
-// ===========================================================================
-// `MpcMeta::into_static`
-// ===========================================================================
-
-impl MpcMeta<'_> {
-  /// Promote a borrow-from-input [`MpcMeta`] into an owned
-  /// `MpcMeta<'static>`. Phase E `into_static` pragma: the trait
-  /// [`FormatParser::Meta`] is `MpcMeta<'static>` for [`crate::parser_new::
-  /// AnyMeta`] compatibility, but the lib-first direct path keeps the
-  /// borrow-from-input lifetime via [`parse_borrowed`].
-  ///
-  /// In F5 the `id3_prefix` / `ape_trailer` placeholders are ALWAYS `None`
-  /// (the typed parser does not pre-scan ID3/APE; the legacy bridge runs
-  /// those via [`OldFormatParser`]). The `into_static` upgrade is therefore
-  /// a trivial reborrow with no `Box::leak` (unlike MOI / AAC). When the
-  /// F5-integration pass starts threading typed `Id3Meta` / `ApeMeta` into
-  /// `MpcMeta`, this `into_static` will need to materialize the byte
-  /// slices — that's a Phase G concern (see spec §7's `<'a>` GAT note).
-  fn into_static(self) -> MpcMeta<'static> {
-    MpcMeta {
-      version: self.version,
-      sv7_header: self.sv7_header,
-      warn_unsupported_version: self.warn_unsupported_version,
-      // F5: placeholders are always `None`, so the lifetime upgrade is a
-      // direct `None: Option<&'static [u8]>` rebrand. When the F5-
-      // integration pass starts populating these from the typed
-      // `Id3Meta` / `ApeMeta`, the upgrade will need `Box::leak` or a
-      // full `'a` GAT thread-through (Phase G).
-      id3_prefix: None,
-      ape_trailer: None,
-    }
-  }
 }
 
 // ===========================================================================

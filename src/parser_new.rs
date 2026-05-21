@@ -64,10 +64,20 @@ pub(crate) mod parser_sealed {
 ///    [`AnyMeta`], and [`AnyMeta`]'s [`MetaSinker`] impl.
 pub trait FormatParser: parser_sealed::Sealed {
   /// The typed metadata structure this parser produces on a successful
-  /// parse. Should typically borrow from the input bytes (`Meta<'a>`),
-  /// holding `&'a str` / primitive integers / `core::time::Duration` /
-  /// `jiff::civil::DateTime` for no-alloc compatibility.
-  type Meta;
+  /// parse, as a **generic associated type** parameterized by the input
+  /// borrow lifetime `'a`. Meta types borrow from the input bytes
+  /// (`Meta<'a> = XxxMeta<'a>`), holding `&'a str` / primitive integers /
+  /// `core::time::Duration` / `jiff::civil::DateTime` for no-alloc
+  /// compatibility.
+  ///
+  /// The GAT threads the input lifetime through [`Self::parse`] so the
+  /// returned Meta borrows directly from the `Context<'a>` it was parsed
+  /// from — no `'static` upgrade, no `Box::leak`. Library callers consuming
+  /// `parse_bytes` get a zero-allocation `AnyMeta<'a>` tied to their input
+  /// buffer (Codex AF2).
+  type Meta<'a>
+  where
+    Self: 'a;
   /// Per-format input view. Leaf formats (MOI, AAC, DV, Audible) use
   /// `&'a [u8]`; chained formats (ID3, APE, MP3, …) use a struct
   /// wrapping `&'a [u8]` + `&'a mut SharedFlags`.
@@ -79,9 +89,10 @@ pub trait FormatParser: parser_sealed::Sealed {
   /// [`TagWriter::write_error`]).
   type Error;
 
-  /// Run the parser on a per-format `Context`. See trait docs for return
-  /// value semantics.
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, Self::Error>;
+  /// Run the parser on a per-format `Context`. The returned `Meta<'a>`
+  /// borrows from the same `'a` as the input `Context`. See trait docs for
+  /// return value semantics.
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error>;
 }
 
 /// Receivers of tag emissions. Implemented by JSON writers, in-memory
@@ -382,15 +393,14 @@ pub enum AnyMeta<'a> {
   #[cfg(feature = "red")]
   R3d(crate::formats::red::R3dMeta<'a>),
   /// ID3 directory metadata (Phase F2). The [`crate::formats::id3::ProcessId3`]
-  /// `FormatParser` impl produces `Id3Meta<'static>` (Phase E
-  /// `into_static` pragma); this arm carries the `<'a>` projection so the
-  /// closed enum compiles at any caller lifetime.
+  /// `FormatParser` impl produces a borrowed `Id3Meta<'a>` via the
+  /// [`FormatParser::Meta`] GAT (Codex AF2; `'a` is phantom there since
+  /// `Id3Meta` owns its strings).
   #[cfg(feature = "id3")]
   Id3(crate::formats::id3::Id3Meta<'a>),
   /// MP3 wrapper metadata (Phase F2). Wraps [`crate::formats::id3::Id3Meta`]
-  /// plus borrowed MPEG-audio / APE-trailer passthrough slices; the typed
-  /// MPEG-audio / APE arms land in Phase F3/F4 (per
-  /// `docs/tracking.md` F2 ID3 integration notes).
+  /// plus the typed MPEG-audio + APE-trailer sub-Metas (Codex BF1/CF1);
+  /// the MPEG-audio sub-Meta borrows its `encoder` field from the input.
   #[cfg(feature = "mp3")]
   Mp3(crate::formats::id3::Mp3Meta<'a>),
   /// AIFF (Phase F3).
@@ -406,10 +416,9 @@ pub enum AnyMeta<'a> {
   #[cfg(feature = "flac")]
   Flac(crate::formats::flac::FlacMeta<'a>),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
-  /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces
-  /// `OggMeta<'static>` (Phase E `into_static` pragma); this arm carries
-  /// the `<'a>` projection so the closed enum compiles at any caller
-  /// lifetime.
+  /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces a
+  /// borrowed `OggMeta<'a>` via the [`FormatParser::Meta`] GAT (Codex
+  /// AF2; `'a` is phantom there since `OggMeta` owns its data).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::OggMeta<'a>),
   /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
@@ -723,18 +732,24 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::R3d))
           .map_err(Into::into)
       }
+      // Chained formats dispatch via their **decoupled** `*_borrowed` /
+      // `*_owned` entries: `shared` borrows independently of `bytes`, so the
+      // returned `AnyMeta<'a>` borrows only from `bytes` and `shared` (a
+      // transient scratch bag) does not pin the result lifetime. Going
+      // through the per-format `Context<'a>` here would tie `shared` to `'a`
+      // via the GAT and break the `parse_bytes` candidate loop (Codex AF2).
       #[cfg(feature = "id3")]
       AnyParser::Id3(p) => {
-        let _ = ext;
-        let ctx = crate::formats::id3::Id3Context::new(bytes, shared);
-        p.parse(ctx)
+        let _ = (p, ext);
+        // ID3 typed Meta is mode-locked; the closed dispatch stages `-j`.
+        crate::formats::id3::parse_id3_borrowed(bytes, Some(shared), /* print_conv */ true)
           .map(|o| o.map(AnyMeta::Id3))
           .map_err(Into::into)
       }
       #[cfg(feature = "mp3")]
       AnyParser::Mp3(p) => {
-        let ctx = crate::formats::id3::Mp3Context::new(bytes, shared, ext);
-        p.parse(ctx)
+        let _ = p;
+        crate::formats::id3::parse_mp3_borrowed(bytes, ext, shared)
           .map(|o| o.map(AnyMeta::Mp3))
           .map_err(Into::into)
       }
@@ -747,25 +762,22 @@ impl AnyParser {
       }
       #[cfg(feature = "ape")]
       AnyParser::Ape(p) => {
-        let _ = ext;
-        let ctx = crate::formats::ape::ApeContext::new(bytes, shared);
-        p.parse(ctx)
-          .map(|o| o.map(AnyMeta::Ape))
-          .map_err(Into::into)
+        let _ = (p, ext);
+        Ok(crate::formats::ape::parse_full_owned(bytes, shared).map(AnyMeta::Ape))
       }
       #[cfg(feature = "dsf")]
       AnyParser::Dsf(p) => {
-        let _ = ext;
-        let ctx = crate::formats::dsf::DsfContext::new(bytes, shared);
-        p.parse(ctx)
+        let _ = (p, ext, &mut *shared);
+        // DSF's typed parse uses only `data`; the ID3v2 trailer scan range
+        // is exposed on the Meta for the caller to dispatch.
+        crate::formats::dsf::parse_borrowed(bytes)
           .map(|o| o.map(AnyMeta::Dsf))
           .map_err(Into::into)
       }
       #[cfg(feature = "flac")]
       AnyParser::Flac(p) => {
-        let _ = ext;
-        let ctx = crate::formats::flac::FlacContext::new(bytes, shared);
-        p.parse(ctx)
+        let _ = (p, ext);
+        crate::formats::flac::parse_borrowed(bytes, shared)
           .map(|o| o.map(AnyMeta::Flac))
           .map_err(Into::into)
       }
@@ -786,26 +798,26 @@ impl AnyParser {
         // the same closed-set machinery. The `mp3` flag and the extension
         // are derived from `ext` exactly as `ID3::ProcessMP3` does
         // (ID3.pm:1715-1717: `$ext eq 'MUS' ? 0 : 1`).
+        let _ = (p, &mut *shared);
         let ext = ext.unwrap_or("");
         let mp3 = !ext.eq_ignore_ascii_case("MUS");
-        let ctx = crate::formats::mpeg::MpegAudioContext::new(bytes, ext, mp3, shared);
-        p.parse(ctx)
+        crate::formats::mpeg::parse_borrowed(bytes, mp3, ext)
           .map(|o| o.map(AnyMeta::MpegAudio))
           .map_err(Into::into)
       }
       #[cfg(feature = "mpc")]
       AnyParser::Mpc(p) => {
-        let _ = ext;
-        let ctx = crate::formats::mpc::MpcContext::new(bytes, shared);
-        p.parse(ctx)
+        let _ = (p, ext, &mut *shared);
+        crate::formats::mpc::parse_borrowed(bytes)
           .map(|o| o.map(AnyMeta::Mpc))
           .map_err(Into::into)
       }
       #[cfg(feature = "wavpack")]
       AnyParser::Wv(p) => {
-        let _ = ext;
-        let ctx = crate::formats::wavpack::WvContext::new(bytes, shared);
-        p.parse(ctx).map(|o| o.map(AnyMeta::Wv)).map_err(Into::into)
+        let _ = (p, ext, &mut *shared);
+        crate::formats::wavpack::parse_borrowed(bytes)
+          .map(|o| o.map(AnyMeta::Wv))
+          .map_err(Into::into)
       }
     }
   }

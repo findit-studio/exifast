@@ -36,8 +36,8 @@
 //! When the caller knows the format up front, the per-format
 //! `parse_<fmt>` accessors return the typed `XxxMeta<'a>` directly with
 //! no enum hop. The lifetime of the returned Meta is tied to the input
-//! buffer (zero-alloc by default; see the per-format `into_static`
-//! methods to break the borrow):
+//! buffer (zero-alloc by default; to store a Meta beyond the input
+//! buffer's lifetime, clone the borrowed fields the caller needs):
 //!
 //! ```no_run
 //! # #[cfg(feature = "flac")] {
@@ -178,10 +178,9 @@ pub use formats::wavpack::{ProcessWv, WvContext, WvError, WvMeta};
 ///   `XxxError` enums), so the `Err` branch is unreachable in practice.
 ///
 /// The returned [`AnyMeta`] borrows from the input `bytes` for zero
-/// allocation on the happy path. To break the borrow (e.g. to store the
-/// Meta beyond the lifetime of `bytes`), use the per-format
-/// `XxxMeta::into_static()` helpers via the appropriate
-/// [`AnyMeta`] arm.
+/// allocation on the happy path. To store a Meta beyond the lifetime of
+/// `bytes`, clone the borrowed fields the caller needs out of the
+/// appropriate [`AnyMeta`] arm.
 ///
 /// # Filename-less detection
 ///
@@ -308,6 +307,11 @@ pub fn parse_r3d(bytes: &[u8]) -> core::result::Result<Option<R3dMeta<'_>>, R3dE
 /// `$$et{DoneID3}` flag, etc.); pass a fresh
 /// [`SharedFlags::new()`] when calling stand-alone.
 ///
+/// `print_conv = true` stages the tags in `-j` PrintConv mode (e.g. ID3v1
+/// Genre `"Hip-Hop"`); `false` stages in `-n` post-ValueConv raw mode
+/// (e.g. Genre `7`). The returned Meta must be sinked in the same mode
+/// (see the [`MetaSinker`] impl for `Id3Meta`).
+///
 /// # Errors
 ///
 /// Returns the per-format [`Id3Error`] (currently uninhabited).
@@ -315,16 +319,20 @@ pub fn parse_r3d(bytes: &[u8]) -> core::result::Result<Option<R3dMeta<'_>>, R3dE
 pub fn parse_id3<'a>(
   bytes: &'a [u8],
   shared: Option<&mut SharedFlags>,
+  print_conv: bool,
 ) -> core::result::Result<Option<Id3Meta<'a>>, Id3Error> {
-  formats::id3::parse_id3_borrowed(bytes, shared)
+  formats::id3::parse_id3_borrowed(bytes, shared, print_conv)
 }
 
-/// Parse an MP3 file (ID3 wrapper + MPEG audio chain) directly through the
-/// typed [`ProcessMp3`] parser. The returned [`Mp3Meta`] is the
-/// `'static`-lifetime form (the typed FormatParser publishes `Meta<'static>`
-/// for the closed `AnyMeta` enum). For deeper access (the raw MPEG-audio
-/// bytes etc.), use the [`ProcessMp3::parse`] entry directly with a
-/// constructed [`Mp3Context`].
+/// Parse an MP3 file (ID3 wrapper + MPEG audio chain + APE trailer)
+/// directly through the typed [`ProcessMp3`] parser, faithful to bundled
+/// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728). The returned
+/// [`Mp3Meta`] borrows from `bytes` and carries the ID3, MPEG-audio, and
+/// APE-trailer sub-Metas; it is `Some` for a valid MPEG-only MP3 (Codex
+/// BF1/CF1).
+///
+/// The ID3 sub-Meta is staged in `-j` (PrintConv) mode; sink the result
+/// with `sink(true, ...)`.
 ///
 /// # Errors
 ///
@@ -333,10 +341,12 @@ pub fn parse_id3<'a>(
 pub fn parse_mp3<'a>(
   bytes: &'a [u8],
   ext: Option<&'a str>,
-) -> core::result::Result<Option<Mp3Meta<'static>>, Mp3Error> {
-  use parser_new::FormatParser;
+) -> core::result::Result<Option<Mp3Meta<'a>>, Mp3Error> {
+  // `parse_mp3_borrowed` decouples the transient `shared` borrow from the
+  // returned `Mp3Meta<'a>` (which borrows from `bytes`), so a local
+  // `SharedFlags` is valid here.
   let mut shared = SharedFlags::new();
-  ProcessMp3.parse(Mp3Context::new(bytes, &mut shared, ext))
+  formats::id3::parse_mp3_borrowed(bytes, ext, &mut shared)
 }
 
 /// Parse an AIFF (or AIFC) buffer directly. See
@@ -350,10 +360,12 @@ pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, Ai
   formats::aiff::parse_borrowed(bytes)
 }
 
-/// Parse an APE (Monkey's Audio) buffer directly. See
-/// [`formats::ape::parse_borrowed`].
+/// Parse an APE (Monkey's Audio) buffer directly through the typed
+/// [`ProcessApe`] parser.
 ///
-/// `shared` carries cross-format state (`DoneID3` / `DoneAPE` flags).
+/// `shared` carries cross-format state (`DoneID3` / `DoneAPE` flags) and
+/// borrows independently of `bytes` — the returned [`ApeMeta`] owns its
+/// data (`'a` phantom).
 ///
 /// # Errors
 ///
@@ -362,7 +374,7 @@ pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, Ai
 pub fn parse_ape<'a>(
   bytes: &'a [u8],
   shared: &'a mut SharedFlags,
-) -> core::result::Result<Option<ApeMeta<'static>>, ApeError> {
+) -> core::result::Result<Option<ApeMeta<'a>>, ApeError> {
   use parser_new::FormatParser;
   ProcessApe.parse(ApeContext::new(bytes, shared))
 }
@@ -388,7 +400,7 @@ pub fn parse_dsf(bytes: &[u8]) -> core::result::Result<Option<DsfMeta<'_>>, DsfE
 #[cfg(feature = "flac")]
 pub fn parse_flac<'a>(
   bytes: &'a [u8],
-  shared: &'a mut SharedFlags,
+  shared: &mut SharedFlags,
 ) -> core::result::Result<Option<FlacMeta<'a>>, FlacError> {
   formats::flac::parse_borrowed(bytes, shared)
 }
@@ -529,7 +541,7 @@ mod tests {
     let _ = parse_wavpack(bytes);
     #[cfg(feature = "id3")]
     {
-      let _ = parse_id3(bytes, None);
+      let _ = parse_id3(bytes, None, true);
     }
     #[cfg(feature = "mp3")]
     {

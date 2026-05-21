@@ -920,8 +920,8 @@ pub struct OggMeta<'a> {
   /// position).
   comments: Vec<OggComment>,
   /// `$et->Warn(...)` accumulator (Ogg.pm:97 + 158, Vorbis.pm:208) in
-  /// occurrence order.
-  warnings: Vec<&'static str>,
+  /// occurrence order. Owned (`SmolStr`) — no `Box::leak` (Codex AF2).
+  warnings: Vec<SmolStr>,
   /// `$success` — at least one valid 28-byte page accepted. Drives the
   /// bridge's `SetFileType` call AND the false-return (post-loop
   /// `File format error`) decision.
@@ -946,7 +946,9 @@ pub enum OggComment {
   /// (TITLE/ALBUM/GENRE/...).
   Scalar {
     /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
-    group1: &'static str,
+    /// Owned (`SmolStr`) so the typed Meta needs no `Box::leak` for the
+    /// rare non-`Vorbis`/`Theora` group (Codex AF2).
+    group1: SmolStr,
     /// Resolved tag name (`Vorbis.pm:80-121` rename hint, or
     /// `vorbis_comment_compute_name` for unknown keys).
     name: SmolStr,
@@ -959,9 +961,9 @@ pub enum OggComment {
   /// append (faithful `FoundTag` — ExifTool.pm:9505-9520).
   List {
     /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
-    group1: &'static str,
+    group1: SmolStr,
     /// Resolved tag name ("Artist" / "Performer" / "Contact").
-    name: &'static str,
+    name: SmolStr,
     /// Coalesced UTF-8 string values, in encounter order.
     values: Vec<SmolStr>,
   },
@@ -971,9 +973,9 @@ pub enum OggComment {
   /// deferred (Vorbis.pm:122-134) — only the raw-bytes form is emitted.
   Binary {
     /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
-    group1: &'static str,
+    group1: SmolStr,
     /// "CoverArt" or "Picture".
-    name: &'static str,
+    name: SmolStr,
     /// Base64-decoded raw bytes.
     bytes: Vec<u8>,
   },
@@ -1002,7 +1004,7 @@ impl OggMeta<'_> {
   /// file"` (Ogg.pm:158), or `"Format error in Vorbis comments"`
   /// (Vorbis.pm:208).
   #[must_use]
-  pub fn warnings(&self) -> &[&'static str] {
+  pub fn warnings(&self) -> &[SmolStr] {
     &self.warnings
   }
 
@@ -1029,7 +1031,8 @@ pub struct ProcessOgg;
 impl parser_sealed::Sealed for ProcessOgg {}
 
 impl FormatParser for ProcessOgg {
-  type Meta = OggMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` directly (Codex AF2).
+  type Meta<'a> = OggMeta<'a>;
   type Context<'a> = &'a [u8];
   type Error = OggError;
 
@@ -1043,8 +1046,8 @@ impl FormatParser for ProcessOgg {
   /// reason is that OGG accumulates warnings during the walk that the
   /// bundled output preserves even when the page-acceptance test never
   /// passes (e.g. mid-stream `Lost synchronization`).
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, OggError> {
-    parse_inner(data, /* print_conv_enabled */ true).map(|opt| opt.map(OggMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, OggError> {
+    parse_inner(data, /* print_conv_enabled */ true)
   }
 }
 
@@ -1069,8 +1072,9 @@ pub fn parse_borrowed(
 
 /// Inner parser — produces a borrow-from-input [`OggMeta`] (technically
 /// `OggMeta<'_>` with a phantom `'_` today; see [`OggMeta`] struct doc
-/// re: zero-alloc revisit). The trait method `into_static`s the result
-/// to satisfy `AnyMeta`'s `'static` slot (Phase F1 pattern).
+/// re: zero-alloc revisit). The [`FormatParser::Meta`] GAT (`type
+/// Meta<'a> = OggMeta<'a>`) returns this borrowed form directly into the
+/// closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
 fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'_>>, OggError> {
   // Stage the legacy push-style emissions into a side `Metadata` so the
   // bundled-faithful list-coalesce + name-synthesis paths stay byte-exact
@@ -1250,13 +1254,13 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'
   }
   // Ogg.pm:196 `return $success`.
 
-  // Lift staging metadata into typed OggMeta. Warnings carry their static
-  // string identity (we re-route via `staged_warning_to_static`); comments
-  // go through `tag_to_comment` per element.
-  let warnings: Vec<&'static str> = staging
+  // Lift staging metadata into typed OggMeta. Warnings are cloned into
+  // owned `SmolStr` (no `Box::leak`); comments go through `tag_to_comment`
+  // per element.
+  let warnings: Vec<SmolStr> = staging
     .warnings()
     .iter()
-    .map(|w| staged_warning_to_static(w.as_str()))
+    .map(|w| staged_warning_to_owned(w.as_str()))
     .collect();
   let comments: Vec<OggComment> = staging.tags().iter().map(tag_to_comment).collect();
   Ok(Some(OggMeta {
@@ -1284,21 +1288,13 @@ fn update_override(state: &mut Option<&'static str>, outcome: &PacketOutcome) {
   }
 }
 
-/// Re-route a staged warning string to its bundled-Perl static identity.
+/// Clone a staged warning string into the typed Meta's owned warning list.
 /// The three strings OGG can emit (Ogg.pm:97, :158, Vorbis.pm:208) are all
-/// `&'static str` literals in bundled-Perl; we round-trip through SmolStr
-/// in the staging Metadata, but the typed Meta carries `&'static str`.
-fn staged_warning_to_static(w: &str) -> &'static str {
-  match w {
-    "Lost synchronization" => "Lost synchronization",
-    "Missing page(s) in Ogg file" => "Missing page(s) in Ogg file",
-    "Format error in Vorbis comments" => "Format error in Vorbis comments",
-    // Defensive: an unrecognised warning shouldn't occur from this module's
-    // own emission paths, but if a future engine-level addition slips one
-    // through we leak it via `Box::leak` to preserve byte-exact emission
-    // without unsafe transmutation.
-    other => std::boxed::Box::leak(other.to_string().into_boxed_str()),
-  }
+/// `&'static str` literals in bundled-Perl; the typed Meta now carries them
+/// as owned [`SmolStr`] (no `Box::leak`; Codex AF2). The short, fixed
+/// literals are all SmolStr-inline (≤ 23 bytes), so this is allocation-free.
+fn staged_warning_to_owned(w: &str) -> SmolStr {
+  SmolStr::from(w)
 }
 
 /// Transpose a staged `Tag` (one row of the side `Metadata`) into a typed
@@ -1311,27 +1307,13 @@ fn staged_warning_to_static(w: &str) -> &'static str {
 fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
   // Family-1 group is bundled's `-G1` token. For OGG it's either "Vorbis"
   // (Vorbis::Comments / Opus comments) or "Theora" (Theora::Comments).
-  // We compare to the two known constants and fall back to a leaked
-  // static for any future expansion (defensive parity with
-  // `staged_warning_to_static`).
-  let group1: &'static str = match tag.group().family1() {
-    "Vorbis" => "Vorbis",
-    "Theora" => "Theora",
-    other => std::boxed::Box::leak(other.to_string().into_boxed_str()),
-  };
+  // Stored owned (`SmolStr`) so an unforeseen group needs no `Box::leak`
+  // (Codex AF2).
+  let group1 = SmolStr::from(tag.group().family1());
   let name = SmolStr::from(tag.name());
   match tag.value() {
     TagValue::List(items) => {
-      // List tags in OGG today: Artist / Performer / Contact. All three
-      // have static names; we route to the &'static-str arm by exact
-      // match with a `Box::leak` defensive fallback for parity with
-      // group1 routing.
-      let name_static: &'static str = match tag.name() {
-        "Artist" => "Artist",
-        "Performer" => "Performer",
-        "Contact" => "Contact",
-        other => std::boxed::Box::leak(other.to_string().into_boxed_str()),
-      };
+      // List tags in OGG today: Artist / Performer / Contact.
       let values: Vec<SmolStr> = items
         .iter()
         .map(|v| match v {
@@ -1344,23 +1326,15 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
         .collect();
       OggComment::List {
         group1,
-        name: name_static,
+        name,
         values,
       }
     }
-    TagValue::Bytes(bytes) => {
-      // OGG's only Bytes producers are CoverArt and Picture (base64-decoded).
-      let name_static: &'static str = match tag.name() {
-        "CoverArt" => "CoverArt",
-        "Picture" => "Picture",
-        other => std::boxed::Box::leak(other.to_string().into_boxed_str()),
-      };
-      OggComment::Binary {
-        group1,
-        name: name_static,
-        bytes: bytes.clone(),
-      }
-    }
+    TagValue::Bytes(bytes) => OggComment::Binary {
+      group1,
+      name,
+      bytes: bytes.clone(),
+    },
     TagValue::Str(s) => OggComment::Scalar {
       group1,
       name,
@@ -1375,32 +1349,6 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
       name,
       value: SmolStr::from(format!("{other:?}")),
     },
-  }
-}
-
-// ===========================================================================
-// `OggMeta::into_static`
-// ===========================================================================
-
-impl OggMeta<'_> {
-  /// Promote a borrow-from-input [`OggMeta`] into an owned `OggMeta<'static>`.
-  /// Used by the [`FormatParser`] impl to publish into the closed
-  /// [`crate::parser_new::AnyMeta`] enum.
-  ///
-  /// Today the OGG typed Meta carries owned [`SmolStr`] / [`Vec<u8>`] +
-  /// the lifetime is phantom (struct-level docs), so this fn is a pure
-  /// lifetime cast — the runtime data is unchanged. The shape matches
-  /// AAC / MOI / DV's `into_static` so the parser_new AnyMeta arm
-  /// integration (deferred to a parallel PR per the task's MUST-NOT-TOUCH
-  /// constraint) stays uniform.
-  fn into_static(self) -> OggMeta<'static> {
-    OggMeta {
-      file_type_override: self.file_type_override,
-      comments: self.comments,
-      warnings: self.warnings,
-      success: self.success,
-      _marker: core::marker::PhantomData,
-    }
   }
 }
 
@@ -1571,8 +1519,8 @@ impl OldFormatParser for ProcessOgg {
             value,
           } => {
             meta_sink.push(
-              Group::new("Vorbis", *group1),
-              SmolStr::from(name.as_str()),
+              Group::new("Vorbis", group1.as_str()),
+              name.as_str(),
               TagValue::Str(value.clone()),
             );
           }
@@ -1586,8 +1534,8 @@ impl OldFormatParser for ProcessOgg {
             // 9505-9520). The legacy `push_listable` does exactly this.
             for v in values {
               meta_sink.push_listable(
-                Group::new("Vorbis", *group1),
-                *name,
+                Group::new("Vorbis", group1.as_str()),
+                name.as_str(),
                 TagValue::Str(v.clone()),
               );
             }
@@ -1598,15 +1546,15 @@ impl OldFormatParser for ProcessOgg {
             bytes,
           } => {
             meta_sink.push(
-              Group::new("Vorbis", *group1),
-              *name,
+              Group::new("Vorbis", group1.as_str()),
+              name.as_str(),
               TagValue::Bytes(bytes.clone()),
             );
           }
         }
       }
       for w in &meta.warnings {
-        meta_sink.push_warning(*w);
+        meta_sink.push_warning(w.as_str());
       }
     }
     // NOTE: this migration does NOT route through `MetadataTagWriter`
@@ -1950,12 +1898,12 @@ mod tests {
       file_type_override: None,
       comments: vec![
         OggComment::Scalar {
-          group1: "Vorbis",
+          group1: SmolStr::from("Vorbis"),
           name: SmolStr::from("Vendor"),
           value: SmolStr::from("test vendor"),
         },
         OggComment::Scalar {
-          group1: "Vorbis",
+          group1: SmolStr::from("Vorbis"),
           name: SmolStr::from("Title"),
           value: SmolStr::from("Song"),
         },
@@ -1983,7 +1931,10 @@ mod tests {
     let meta = OggMeta {
       file_type_override: None,
       comments: vec![],
-      warnings: vec!["Lost synchronization", "Missing page(s) in Ogg file"],
+      warnings: vec![
+        SmolStr::from("Lost synchronization"),
+        SmolStr::from("Missing page(s) in Ogg file"),
+      ],
       success: false,
       _marker: core::marker::PhantomData,
     };
@@ -1999,36 +1950,34 @@ mod tests {
   }
 
   #[test]
-  fn format_parser_trait_returns_meta_static() {
-    // The trait's `Meta = OggMeta<'static>` shape forces `into_static`.
-    // Drive the trait API with empty bytes and confirm the shape.
-    let meta: OggMeta<'static> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
+  fn format_parser_trait_returns_borrowed_meta() {
+    // GAT path: `Meta<'a> = OggMeta<'a>` (phantom `'a`). Drive the trait
+    // API with empty bytes and confirm the shape.
+    let meta: OggMeta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
       .expect("ok")
       .expect("meta");
     assert!(!meta.success());
   }
 
   #[test]
-  fn into_static_preserves_data() {
-    // `into_static` is a pure lifetime cast today (typed Meta carries
-    // owned SmolStr/Vec<u8>). Verify the round-trip preserves every
-    // field by-value.
+  fn typed_meta_owns_its_data() {
+    // The typed Meta carries owned SmolStr/Vec<u8> (the `'a` lifetime is
+    // phantom). Verify field accessors round-trip.
     let meta = OggMeta {
       file_type_override: Some("OPUS"),
       comments: vec![OggComment::Scalar {
-        group1: "Vorbis",
+        group1: SmolStr::from("Vorbis"),
         name: SmolStr::from("Vendor"),
         value: SmolStr::from("v"),
       }],
-      warnings: vec!["Lost synchronization"],
+      warnings: vec![SmolStr::from("Lost synchronization")],
       success: true,
       _marker: core::marker::PhantomData,
     };
-    let s = meta.into_static();
-    assert_eq!(s.file_type_override(), Some("OPUS"));
-    assert!(s.success());
-    assert_eq!(s.warnings(), &["Lost synchronization"]);
-    assert_eq!(s.comments().len(), 1);
+    assert_eq!(meta.file_type_override(), Some("OPUS"));
+    assert!(meta.success());
+    assert_eq!(meta.warnings(), &[SmolStr::from("Lost synchronization")]);
+    assert_eq!(meta.comments().len(), 1);
   }
 
   #[test]

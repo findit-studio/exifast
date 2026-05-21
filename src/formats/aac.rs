@@ -187,12 +187,12 @@ pub struct ProcessAac;
 impl parser_sealed::Sealed for ProcessAac {}
 
 impl FormatParser for ProcessAac {
-  type Meta = AacMeta<'static>;
+  type Meta<'a> = AacMeta<'a>;
   type Context<'a> = &'a [u8];
   type Error = AacError;
 
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, AacError> {
-    parse_inner(data).map(|opt| opt.map(AacMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AacError> {
+    parse_inner(data)
   }
 }
 
@@ -207,9 +207,10 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`AacMeta`]. The trait's
-/// `Meta = AacMeta<'static>` shape forces an [`AacMeta::into_static`]
-/// upgrade for the closed [`crate::parser_new::AnyMeta`] enum.
+/// Inner parser — produces a borrow-from-input [`AacMeta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = AacMeta<'a>`) returns this
+/// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
+/// enum — no `'static` upgrade (Codex AF2).
 fn parse_inner(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
   // AAC.pm:99-105 header validation. A reject here returns `Ok(None)` —
   // Perl `return 0` BEFORE `$et->SetFileType()` (AAC.pm:107).
@@ -354,34 +355,6 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
   let abs_start = frame_start + frame_offset;
   let abs_end = abs_start + trimmed.len();
   core::str::from_utf8(&data[abs_start..abs_end]).ok()
-}
-
-// ===========================================================================
-// `AacMeta::into_static`
-// ===========================================================================
-
-impl AacMeta<'_> {
-  /// Promote a borrow-from-input [`AacMeta`] into an owned `AacMeta<'static>`.
-  /// Used by the [`FormatParser`] impl to publish into the closed
-  /// [`crate::parser_new::AnyMeta`] enum (Phase E `into_static` pragma,
-  /// per `docs/tracking.md` 2026-05-21 entry).
-  ///
-  /// Materializes the optional `encoder` borrow into a leaked `&'static str`.
-  /// Encoder strings are short (typically `"Lavc57.107.100"`-style; ≤ 32
-  /// bytes) and exactly one per AAC file; leaking is O(1) per parse and
-  /// unobservable in practice. Phase G will retire this by threading
-  /// `AacMeta<'a>` through `AnyMeta<'a>` end-to-end.
-  fn into_static(self) -> AacMeta<'static> {
-    let encoder: Option<&'static str> = self
-      .encoder
-      .map(|s| -> &'static str { std::boxed::Box::leak(s.to_string().into_boxed_str()) });
-    AacMeta {
-      profile_type: self.profile_type,
-      sample_rate: self.sample_rate,
-      channels: self.channels,
-      encoder,
-    }
-  }
 }
 
 // ===========================================================================

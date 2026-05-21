@@ -386,7 +386,7 @@ impl Emphasis {
 
 /// LameMethod (MPEG.pm:344-357). Raw byte AND-masked with 0x0f; PrintConv
 /// hash maps 1..9. Note codes 5 and 3 both render `"VBR (old/rh)"`; we
-/// preserve the raw so `into_static` round-trips.
+/// preserve the raw byte so `-n` mode emits the exact on-disk value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LameMethod {
   /// raw=1 → "CBR".
@@ -1264,12 +1264,14 @@ pub struct ProcessMpegAudio;
 impl parser_sealed::Sealed for ProcessMpegAudio {}
 
 impl FormatParser for ProcessMpegAudio {
-  type Meta = MpegAudioMeta<'static>;
+  /// GAT: the Meta borrows its `encoder` field from the input `'a` (Codex
+  /// AF2).
+  type Meta<'a> = MpegAudioMeta<'a>;
   type Context<'a> = MpegAudioContext<'a>;
   type Error = MpegAudioError;
 
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, MpegAudioError> {
-    parse_inner(ctx.data, ctx.mp3, ctx.ext).map(|opt| opt.map(MpegAudioMeta::into_static))
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpegAudioError> {
+    parse_inner(ctx.data, ctx.mp3, ctx.ext)
   }
 }
 
@@ -1288,10 +1290,10 @@ pub fn parse_borrowed<'a>(
   parse_inner(data, mp3, ext)
 }
 
-/// Inner parser — produces a borrow-from-input [`MpegAudioMeta`]. The
-/// trait's `Meta = MpegAudioMeta<'static>` shape forces an
-/// [`MpegAudioMeta::into_static`] upgrade for the closed
-/// [`crate::parser_new::AnyMeta`] enum.
+/// Inner parser — produces a borrow-from-input [`MpegAudioMeta`] (the
+/// `encoder` field borrows from `data`). The [`FormatParser::Meta`] GAT
+/// (`type Meta<'a> = MpegAudioMeta<'a>`) returns this borrowed form
+/// directly into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
 fn parse_inner<'a>(
   data: &'a [u8],
   mp3: bool,
@@ -1318,54 +1320,6 @@ fn parse_inner<'a>(
   // (no fatal modes).
   parse_xing_lame_into(data, pos_after_header, &mut meta);
   Ok(Some(meta))
-}
-
-// ===========================================================================
-// `MpegAudioMeta::into_static`
-// ===========================================================================
-
-impl MpegAudioMeta<'_> {
-  /// Promote a borrow-from-input [`MpegAudioMeta`] into an owned
-  /// `MpegAudioMeta<'static>`. Used by the [`FormatParser`] impl to publish
-  /// into the closed [`crate::parser_new::AnyMeta`] enum (Phase E
-  /// `into_static` pragma, per `docs/tracking.md` 2026-05-21 entry).
-  ///
-  /// The only borrowing field is `encoder: Option<Cow<'a, str>>`. For
-  /// `Cow::Borrowed` we materialize an owned [`std::boxed::Box::leak`]'d
-  /// `&'static str`; for `Cow::Owned` the contents already live independently
-  /// (we leak its boxed slice to align the lifetime). Encoder strings are
-  /// short (≤ 20 bytes) and unique per file, so leaking is O(1) per parse
-  /// and unobservable in practice. Phase G will retire this by threading
-  /// `MpegAudioMeta<'a>` through `AnyMeta<'a>` end-to-end.
-  fn into_static(self) -> MpegAudioMeta<'static> {
-    let encoder: Option<Cow<'static, str>> = self.encoder.map(|c| {
-      let s: &'static str = std::boxed::Box::leak(c.into_owned().into_boxed_str());
-      Cow::Borrowed(s)
-    });
-    MpegAudioMeta {
-      mpeg_audio_version: self.mpeg_audio_version,
-      audio_layer: self.audio_layer,
-      audio_bitrate: self.audio_bitrate,
-      sample_rate_raw: self.sample_rate_raw,
-      channel_mode: self.channel_mode,
-      ms_stereo: self.ms_stereo,
-      mode_extension: self.mode_extension,
-      intensity_stereo: self.intensity_stereo,
-      copyright_flag: self.copyright_flag,
-      original_media: self.original_media,
-      emphasis: self.emphasis,
-      vbr_frames: self.vbr_frames,
-      vbr_bytes: self.vbr_bytes,
-      vbr_scale: self.vbr_scale,
-      encoder,
-      lame_vbr_quality: self.lame_vbr_quality,
-      lame_quality: self.lame_quality,
-      lame_method: self.lame_method,
-      lame_low_pass_filter: self.lame_low_pass_filter,
-      lame_bitrate: self.lame_bitrate,
-      lame_stereo_mode: self.lame_stereo_mode,
-    }
-  }
 }
 
 // ===========================================================================

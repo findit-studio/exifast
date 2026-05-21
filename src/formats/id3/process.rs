@@ -385,6 +385,12 @@ pub struct Id3Meta<'a> {
   /// `ID3v2_*:*` frame + every `ID3v1:*` v1 field — the same set the
   /// legacy serializer pushed into a `Metadata`.
   staged_tags: Vec<StagedTag>,
+  /// The `print_conv` mode the staged tag values were extracted in
+  /// (`true` = `-j` PrintConv strings; `false` = `-n` post-ValueConv
+  /// raw). [`MetaSinker::sink`] honors its `print_conv` argument by
+  /// matching against this; a mismatch is a caller contract violation
+  /// (parse and sink in the same mode). Codex BF2.
+  staged_print_conv: bool,
   /// All warnings the engine emitted while parsing this ID3 directory.
   warnings: Vec<SmolStr>,
   /// All errors the engine emitted (rare; faithful to ExifTool's
@@ -597,91 +603,35 @@ impl<'a> Id3Meta<'a> {
   }
 }
 
-/// MPEG audio frame body — borrowed passthrough for Phase F2. The MPEG
-/// audio frame parser ([`crate::formats::mpeg`]) is a separate format
-/// port (F4). For F2 we expose the raw slice; library callers can
-/// dispatch to MPEG-aware parsers themselves, and the
-/// [`crate::parser_new::MetaSinker`] path delegates to the legacy
-/// `crate::formats::mpeg::ProcessMp3` for byte-exact CLI JSON output.
-///
-/// Lifetimes: `'a` borrows from the input MP3 buffer (zero alloc).
-#[derive(Debug, Clone, Copy)]
-pub struct Mp3MpegAudioRaw<'a> {
-  /// Offset into the input MP3 buffer where the MPEG audio body starts
-  /// (post-ID3v2 header). Bundled `$hdrEnd` (ID3.pm:1504).
-  start_offset: usize,
-  /// Borrowed slice into the input MP3 buffer; the MPEG audio frame
-  /// dispatch reads from `[start_offset..]` (or all of `data` when
-  /// no ID3v2 prefix is present, with `start_offset = 0`).
-  data: &'a [u8],
-}
-
-impl<'a> Mp3MpegAudioRaw<'a> {
-  /// Offset into the input buffer where the MPEG audio body starts.
-  #[must_use]
-  pub fn start_offset(&self) -> usize {
-    self.start_offset
-  }
-
-  /// Borrowed input slice; the audio body is `&data[start_offset..]`.
-  #[must_use]
-  pub fn data(&self) -> &'a [u8] {
-    self.data
-  }
-}
-
-/// APE trailer raw bytes — borrowed passthrough for Phase F2. APE is a
-/// separate format port (F3); its typed Meta lands in that PR. Until
-/// then, the typed [`Mp3Meta`] exposes this placeholder marker and the
-/// sink delegates the trailer extraction to the legacy
-/// [`crate::formats::ape::ProcessApe::process_trailer_only`] entry.
-#[derive(Debug, Clone, Copy)]
-pub struct Mp3ApeTrailerRaw<'a> {
-  /// Borrowed slice into the input MP3 buffer — the APE trailer scan
-  /// works backward from `data.len()` (faithful to APE.pm's
-  /// `Seek(-$footPos, 2)` pattern). The presence of an APE trailer is
-  /// not pre-detected here; the sink invokes
-  /// `ProcessApe::process_trailer_only` which performs the scan.
-  data: &'a [u8],
-}
-
-impl<'a> Mp3ApeTrailerRaw<'a> {
-  /// Borrowed input slice. APE trailer scan walks from the end.
-  #[must_use]
-  pub fn data(&self) -> &'a [u8] {
-    self.data
-  }
-}
-
 /// Typed MP3 wrapper metadata — the lib-first output of [`ProcessMp3`].
 ///
 /// Combines the optional ID3 sub-Meta (when an ID3v1/v2 was detected)
-/// with raw passthrough slices for the MPEG audio body and the APE
-/// trailer (typed Metas land in F3/F4). The [`MetaSinker`] impl
-/// delegates the byte-exact emission of MPEG / APE through the legacy
-/// engine paths so all 60+ existing MP3 conformance fixtures stay byte-
-/// equivalent during Phase F.
+/// with the typed MPEG-audio sub-Meta (frame header + Xing/LAME tail) and
+/// the typed APE-trailer sub-Meta, mirroring bundled
+/// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728). The
+/// [`MetaSinker`] impl emits ID3 → MPEG → APE in that order so the typed
+/// path matches the legacy bridge byte-for-byte (Codex BF1/CF1).
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `Mp3Meta` carries `'a` (input borrow); today only the
-/// MPEG / APE raw passthroughs borrow from the input. The ID3 sub-Meta
-/// owns its strings (Phase G zero-alloc opt-in).
+/// **Lifetimes.** `Mp3Meta` carries `'a` (input borrow); the MPEG-audio
+/// sub-Meta borrows its `encoder` field from the input. The ID3 + APE
+/// sub-Metas own their strings (`'a` phantom there).
 #[derive(Debug, Clone)]
 pub struct Mp3Meta<'a> {
   /// Optional ID3 sub-Meta — present iff ID3v1 or ID3v2 was detected.
   /// `None` for pure MPEG audio with no ID3 prefix or trailer.
   id3: Option<Id3Meta<'a>>,
-  /// Borrowed raw MPEG audio passthrough — the F4 MPEG-audio Meta
-  /// lands separately; this slice is what `crate::formats::mpeg`
-  /// consumes via the legacy `process_with_start_offset` entry.
-  mpeg: Mp3MpegAudioRaw<'a>,
-  /// Borrowed raw APE trailer passthrough — the F3 APE Meta lands
-  /// separately; this slice is what `crate::formats::ape` consumes via
-  /// the legacy `process_trailer_only` entry.
-  ape_trailer: Mp3ApeTrailerRaw<'a>,
-  /// `true` iff `ProcessID3` accepted (Perl `$rtnVal` from ProcessID3 +
-  /// ParseMPEGAudio combined).
+  /// Optional typed MPEG-audio sub-Meta — present when an MPEG audio frame
+  /// sync was found in the scan window (ID3.pm:1696-1719
+  /// `ParseMPEGAudio`). Borrows its `encoder` field from the input.
+  mpeg: Option<crate::formats::mpeg::MpegAudioMeta<'a>>,
+  /// Optional typed APE-trailer sub-Meta — present when the APE-trailer
+  /// fallback (ID3.pm:1722-1727 `APE::ProcessAPE`) found an APETAGEX
+  /// footer. `'a` is phantom (APE Meta owns its data).
+  ape: Option<crate::formats::ape::ApeMeta<'a>>,
+  /// `true` iff `ProcessID3` OR `ParseMPEGAudio` accepted (Perl `$rtnVal`
+  /// at the end of `ProcessMP3`).
   found: bool,
 }
 
@@ -692,16 +642,16 @@ impl<'a> Mp3Meta<'a> {
     self.id3.as_ref()
   }
 
-  /// Raw MPEG audio body passthrough.
+  /// Optional typed MPEG-audio sub-Meta (frame header + Xing/LAME tail).
   #[must_use]
-  pub fn mpeg(&self) -> Mp3MpegAudioRaw<'a> {
-    self.mpeg
+  pub fn mpeg(&self) -> Option<&crate::formats::mpeg::MpegAudioMeta<'a>> {
+    self.mpeg.as_ref()
   }
 
-  /// Raw APE trailer passthrough.
+  /// Optional typed APE-trailer sub-Meta.
   #[must_use]
-  pub fn ape_trailer(&self) -> Mp3ApeTrailerRaw<'a> {
-    self.ape_trailer
+  pub fn ape(&self) -> Option<&crate::formats::ape::ApeMeta<'a>> {
+    self.ape.as_ref()
   }
 
   /// `true` iff ProcessID3 + ParseMPEGAudio accepted the file as MP3
@@ -766,7 +716,9 @@ impl<'a> Id3Context<'a> {
 }
 
 impl FormatParser for ProcessId3 {
-  type Meta = Id3Meta<'static>;
+  /// GAT: the Meta is parameterized by `'a` (Id3Meta owns its strings via
+  /// `SmolStr`, so `'a` is phantom; Codex AF2).
+  type Meta<'a> = Id3Meta<'a>;
   type Context<'a> = Id3Context<'a>;
   type Error = Id3Error;
 
@@ -774,8 +726,12 @@ impl FormatParser for ProcessId3 {
   /// `Ok(Some(meta))` when an ID3v1 OR ID3v2 was detected, `Ok(None)`
   /// otherwise. The cross-format `DoneID3` flag is set on the
   /// [`SharedFlags`] (faithful to ID3.pm:1527).
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, Self::Error> {
-    parse_id3_inner(ctx.data, Some(ctx.shared)).map(|opt| opt.map(Id3Meta::into_static))
+  ///
+  /// Stages in `-j` PrintConv mode (the closed-dispatch convention; the
+  /// Meta is mode-locked, Codex BF2 — sink with `sink(true, ...)`). For
+  /// `-n` access use [`parse_id3_borrowed`] with `print_conv = false`.
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
+    parse_id3_inner(ctx.data, Some(ctx.shared), /* print_conv */ true).map(|(meta, _hdr_end)| meta)
   }
 }
 
@@ -827,60 +783,123 @@ impl<'a> Mp3Context<'a> {
 }
 
 impl FormatParser for ProcessMp3 {
-  type Meta = Mp3Meta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (the chained MPEG-audio
+  /// sub-Meta borrows its `encoder` field; Codex AF2).
+  type Meta<'a> = Mp3Meta<'a>;
   type Context<'a> = Mp3Context<'a>;
   type Error = Mp3Error;
 
   /// Parse a candidate MP3 file. Returns `Ok(Some(meta))` if ID3 OR
   /// MPEG audio sync was detected, `Ok(None)` otherwise. Faithful to
-  /// ID3.pm:1684-1728 (`ProcessMP3` flow).
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, Self::Error> {
-    // The Phase F2 typed `FormatParser::parse` is the path used by the
-    // closed `AnyParser` enum dispatch (orchestrator-side); it returns
-    // a `Mp3Meta<'static>` which materializes the borrowed MPEG/APE
-    // slices via `Mp3Meta::into_static` (Phase E pragma, see
-    // `docs/tracking.md` 2026-05-21 entry on `AnyMeta` lifetime).
-    //
-    // Because the legacy MP3 wrapper (`OldFormatParser::process`)
-    // depends on the engine's `ParseContext` for the file-type
-    // promotion + MPEG/APE chained dispatch (those still consume
-    // `Metadata` push-style during Phase F2), the byte-exact CLI JSON
-    // path remains [`OldFormatParser::process`] below. The typed entry
-    // here parses ID3 + records the MPEG/APE passthroughs but does
-    // NOT run the legacy chained dispatch — library callers consuming
-    // the typed `Mp3Meta` directly use the `mpeg()` / `ape_trailer()`
-    // borrowed slices to dispatch to those format ports themselves
-    // (or wait for the F4/F3 typed Meta dispatch).
-    let _ = ctx.shared; // (kept for symmetry; ID3 mutates it below)
-    let id3 = parse_id3_inner(ctx.data, None)
-      .map_err(|e| Mp3Error::Id3(e))?
-      .map(Id3Meta::into_static);
-    let id3_found = id3.is_some();
-    // The MPEG body starts past the ID3v2 header when ID3v2 was found;
-    // else at offset 0. We don't re-derive `hdr_end` here for the
-    // typed entry — the legacy path threads it through ParseContext.
-    let mpeg = Mp3MpegAudioRaw {
-      start_offset: 0,
-      // SAFETY-free: `data` lifetime is the input borrow; we extend
-      // via the static promotion below.
-      data: &[],
-    };
-    let ape_trailer = Mp3ApeTrailerRaw { data: &[] };
-    // Empty / `false` placeholder slices — the typed F2 entry only
-    // materializes the ID3 sub-Meta; the MPEG/APE typed Metas land in
-    // F4/F3.
-    let _ = ctx.ext;
-    let found = id3_found;
-    if !found {
-      return Ok(None);
-    }
-    Ok(Some(Mp3Meta {
-      id3,
-      mpeg,
-      ape_trailer,
-      found,
-    }))
+  /// bundled `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728): runs
+  /// ID3 detection, then (when ID3 did not already accept) scans MPEG
+  /// audio from `hdr_end` within the `$scanLen` window, then runs the
+  /// APE-trailer fallback when a valid A/V file was found and APE has not
+  /// already run. The typed sub-Metas are populated so the [`MetaSinker`]
+  /// emits ID3 + MPEG + APE tags without the legacy bridge (Codex
+  /// BF1/CF1).
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
+    parse_mp3_typed(ctx.data, ctx.ext, ctx.shared).map_err(Mp3Error::Id3)
   }
+}
+
+/// Faithful typed port of bundled `Image::ExifTool::ID3::ProcessMP3`
+/// (ID3.pm:1684-1728), producing a fully-populated [`Mp3Meta`] (ID3 +
+/// MPEG-audio + APE-trailer sub-Metas). Codex BF1/CF1: the prior typed
+/// entry staged only ID3 and returned `Ok(None)` for raw-MPEG MP3.
+///
+/// Flow (ID3.pm:1691-1727):
+/// 1. `unless ($$et{DoneID3}) { ProcessID3 }` — parse the leading/trailing
+///    ID3 (ID3.pm:1691-1693). Yields the typed `Id3Meta` and `hdr_end`
+///    (bundled `$hdrEnd`, the post-ID3v2-header file position).
+/// 2. Scan MPEG audio from `hdr_end` within the `$scanLen` window
+///    (ID3.pm:1696-1719). Faithful to the bridge's
+///    `process_with_start_offset`: `$scanLen = ext eq 'MP3' ? 8192 : 256`
+///    and `$mp3 = ext eq 'MUS' ? 0 : 1`. The MPEG scan runs regardless of
+///    ID3 acceptance — bundled emits MPEG tags for ID3v2+audio files via
+///    the ProcessID3 → audio-format-loop → recursive-ProcessMP3 dance
+///    (the recursive call hits the `unless ($rtnVal)` branch because
+///    `DoneID3` is set). Modeling it as an unconditional post-ID3 scan
+///    produces the same tag set.
+/// 3. `if ($rtnVal and not $$et{DoneAPE})` — run the APE-trailer fallback
+///    (ID3.pm:1722-1727 `APE::ProcessAPE`). In an MP3 there is no leading
+///    APE magic, so this is the trailer-only footer scan (APE.pm:165+),
+///    threaded with `done_id3` for the APE.pm:169 footer shift.
+///
+/// `print_conv` is fixed to `true` (`-j`) for the typed entry: the ID3
+/// sub-Meta is mode-locked (Codex BF2), and MPEG/APE sub-Metas apply
+/// PrintConv at sink time. Sink the result with `sink(true, ...)`.
+fn parse_mp3_typed<'a>(
+  data: &'a [u8],
+  ext: Option<&'a str>,
+  shared: &mut SharedFlags,
+) -> Result<Option<Mp3Meta<'a>>, Id3Error> {
+  // -- 1. ID3 (ID3.pm:1691-1693) ------------------------------------------
+  // Stage in `-j` mode (the typed MP3 entry's fixed mode).
+  let (id3, hdr_end) = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
+
+  // -- 2. MPEG audio scan from hdr_end (ID3.pm:1696-1719) ------------------
+  // Faithful scan-window + Layer-III/MUS gate, mirroring the bridge's
+  // `process_with_start_offset`.
+  let ext_is_mp3 = ext.is_some_and(|e| e.eq_ignore_ascii_case("MP3"));
+  let scan_len = crate::formats::mpeg::id3_process_mp3_scan_len(ext_is_mp3);
+  let mp3_flag = !ext.is_some_and(|e| e.eq_ignore_ascii_case("MUS"));
+  let ext_str = ext.unwrap_or("");
+  let post_id3 = data.get(hdr_end..).unwrap_or(&[]);
+  let bounded = &post_id3[..scan_len.min(post_id3.len())];
+  // `MpegAudioError` is uninhabited; the `Ok(None)` path covers "no sync".
+  let mpeg = crate::formats::mpeg::parse_borrowed(bounded, mp3_flag, ext_str)
+    .ok()
+    .flatten();
+
+  // -- rtnVal (ID3.pm:1722 `if ($rtnVal ...)`) ----------------------------
+  let rtn_val = id3.is_some() || mpeg.is_some();
+  if !rtn_val {
+    // Perl returns 0 ⇒ no File:* promotion; the engine emits the
+    // file-format error. The typed entry returns `Ok(None)`.
+    return Ok(None);
+  }
+
+  // -- 3. APE trailer fallback (ID3.pm:1722-1727) -------------------------
+  // `if ($rtnVal and not $$et{DoneAPE})`. An MP3 has no leading APE magic,
+  // so this is the trailer-only footer scan (faithful to bundled
+  // `ProcessAPE` falling through to the APETAGEX footer at APE.pm:165+).
+  // `parse_trailer_only_owned` decouples the `shared` borrow from the
+  // returned (owned, `'static`) Meta so the transient `shared` does not
+  // pin the `Mp3Meta<'a>` lifetime; the owned Meta coerces to `'a`.
+  let ape: Option<crate::formats::ape::ApeMeta<'a>> = if shared.done_ape() {
+    None
+  } else {
+    crate::formats::ape::parse_trailer_only_owned(data, shared)
+  };
+
+  Ok(Some(Mp3Meta {
+    id3,
+    mpeg,
+    ape,
+    found: rtn_val,
+  }))
+}
+
+/// Lib-first direct entry for the MP3 wrapper with **decoupled `shared`
+/// lifetime** — `data` borrows for `'a` (and so does the returned
+/// [`Mp3Meta`]), while `shared` is a transient borrow that does not pin
+/// the returned Meta. This is the entry the public
+/// [`parse_mp3`](crate::parse_mp3) uses with a freshly-constructed
+/// [`SharedFlags`].
+///
+/// The ID3 sub-Meta is staged in `-j` PrintConv mode (sink with
+/// `sink(true, ...)`); MPEG / APE sub-Metas apply PrintConv at sink time.
+///
+/// # Errors
+///
+/// Returns the per-format [`Mp3Error`].
+pub fn parse_mp3_borrowed<'a>(
+  data: &'a [u8],
+  ext: Option<&'a str>,
+  shared: &mut SharedFlags,
+) -> Result<Option<Mp3Meta<'a>>, Mp3Error> {
+  parse_mp3_typed(data, ext, shared).map_err(Mp3Error::Id3)
 }
 
 /// Rust-level fatal modes for ID3 parsing. Currently empty — every bad
@@ -930,15 +949,19 @@ impl std::error::Error for Mp3Error {}
 fn parse_id3_inner<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
-) -> Result<Option<Id3Meta<'a>>, Id3Error> {
+  print_conv: bool,
+) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
   // Run the legacy engine into a staging Metadata. The staging Metadata
   // is a transient scratch buffer; we lift its tags into the typed Meta
-  // afterwards.
+  // afterwards. The staging `print_conv_enabled` is threaded from the
+  // caller so the staged tag values reflect the requested `-j` / `-n`
+  // mode (Codex BF2 — ID3v1 Genre %genre PrintConv ID3.pm:371-375; TLEN
+  // ValueConv/PrintConv split ID3.pm:592-595).
   let mut staging = Metadata::new("staging.id3");
-  let mut staging_ctx = ParseContext::new(data, "ID3", 0, "ID3", None, true, &mut staging);
-  let (found, _hdr_end) = process_id3_inner_legacy(data, &mut staging_ctx, false);
+  let mut staging_ctx = ParseContext::new(data, "ID3", 0, "ID3", None, print_conv, &mut staging);
+  let (found, hdr_end) = process_id3_inner_legacy(data, &mut staging_ctx, false);
   if !found {
-    return Ok(None);
+    return Ok((None, hdr_end));
   }
   // Propagate done_id3 (the trailer size that APE.pm:169 reads). The
   // legacy `process_id3_inner_legacy` stored this on `staging.done_id3`;
@@ -982,15 +1005,19 @@ fn parse_id3_inner<'a>(
   }
   let warnings: Vec<SmolStr> = staging.warnings().to_vec();
   let errors: Vec<SmolStr> = staging.errors().to_vec();
-  Ok(Some(Id3Meta {
-    v2_version,
-    id3v1,
-    id3_size,
-    staged_tags,
-    warnings,
-    errors,
-    _phantom: core::marker::PhantomData,
-  }))
+  Ok((
+    Some(Id3Meta {
+      v2_version,
+      id3v1,
+      id3_size,
+      staged_tags,
+      staged_print_conv: print_conv,
+      warnings,
+      errors,
+      _phantom: core::marker::PhantomData,
+    }),
+    hdr_end,
+  ))
 }
 
 /// Lift a single ID3v1-group tag into the typed [`Id3v1Meta`] subframe.
@@ -1042,97 +1069,33 @@ fn id3v1_genre_byte_for_name(name: &str) -> Option<(u8, &'static str)> {
 }
 
 // ===========================================================================
-// `into_static` — owned-promotion for the closed `AnyMeta` enum
-// ===========================================================================
-
-impl Id3Meta<'_> {
-  /// Promote a borrow-from-input [`Id3Meta`] into an owned
-  /// `Id3Meta<'static>`. Used by the [`FormatParser`] impl on
-  /// [`ProcessId3`] to publish into [`crate::parser_new::AnyMeta`].
-  ///
-  /// All strings are already owned via `SmolStr` in this Phase F2
-  /// design — `into_static` is a no-op rename of the lifetime (the
-  /// `_phantom: PhantomData<&'a ()>` is the only variance). Phase G
-  /// re-shapes `AnyMeta<'a>` to carry the borrow lifetime directly,
-  /// which retires this helper.
-  pub(crate) fn into_static(self) -> Id3Meta<'static> {
-    Id3Meta {
-      v2_version: self.v2_version,
-      id3v1: self.id3v1.map(Id3v1Meta::into_static),
-      id3_size: self.id3_size,
-      staged_tags: self.staged_tags,
-      warnings: self.warnings,
-      errors: self.errors,
-      _phantom: core::marker::PhantomData,
-    }
-  }
-}
-
-impl Id3v1Meta<'_> {
-  /// Promote to `Id3v1Meta<'static>` (no-op rename; all data is owned).
-  fn into_static(self) -> Id3v1Meta<'static> {
-    Id3v1Meta {
-      title: self.title,
-      artist: self.artist,
-      album: self.album,
-      year: self.year,
-      comment: self.comment,
-      track: self.track,
-      genre: self.genre,
-      genre_name: self.genre_name,
-      _phantom: core::marker::PhantomData,
-    }
-  }
-}
-
-impl Mp3Meta<'_> {
-  /// Promote a borrow-from-input [`Mp3Meta`] into an owned
-  /// `Mp3Meta<'static>`. The MPEG / APE raw passthroughs lose their
-  /// borrow (they become empty static slices); library callers needing
-  /// the borrowed payload use the direct [`parse_borrowed`] entry.
-  ///
-  /// Currently consumed only by the [`FormatParser::parse`] impl
-  /// (called via the orchestrator's `AnyParser::Mp3` arm — which will
-  /// land separately in the orchestrator integration, hence the
-  /// `dead_code` allow until that arm is wired up).
-  #[allow(dead_code)]
-  pub(crate) fn into_static(self) -> Mp3Meta<'static> {
-    Mp3Meta {
-      id3: self.id3.map(Id3Meta::into_static),
-      mpeg: Mp3MpegAudioRaw {
-        start_offset: self.mpeg.start_offset,
-        data: &[],
-      },
-      ape_trailer: Mp3ApeTrailerRaw { data: &[] },
-      found: self.found,
-    }
-  }
-}
-
-// ===========================================================================
 // `MetaSinker` — replay staged tags into a TagWriter
 // ===========================================================================
 
 impl MetaSinker for Id3Meta<'_> {
   /// Emit every staged ID3 tag in the order the legacy engine produced
   /// them. Faithful to ID3.pm: File:ID3Size first, then ID3v2 frames in
-  /// tag-table order, then ID3v1 fields in `%v1` order. The
-  /// `print_conv` flag is consulted on each tag — for PrintConv-toggled
-  /// fields the staged value already carries the post-conversion form
-  /// (the engine ran with `print_conv_enabled = print_conv` at
-  /// extraction time).
+  /// tag-table order, then ID3v1 fields in `%v1` order.
   ///
-  /// **Caveat:** Because the stage-and-replay path runs the legacy
-  /// engine with a single `print_conv` mode at parse time, the sink's
-  /// `print_conv` argument must match the value the parser was invoked
-  /// with. The legacy [`OldFormatParser`] bridge re-parses with the
-  /// correct `print_conv` so the byte-exact CLI JSON output is
-  /// preserved. Library callers using [`FormatParser::parse`] directly
-  /// MUST be aware that the Meta is captured at one PrintConv mode.
-  /// Phase G re-shapes this so the typed Meta carries POST-VALUECONV
-  /// raw scalars and applies PrintConv at sink time, matching the
-  /// pilot pattern.
-  fn sink<W: TagWriter>(&self, _print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  /// **`print_conv` contract (Codex BF2).** The stage-and-replay path
+  /// runs the legacy engine once at a fixed `print_conv` mode (recorded
+  /// in [`Id3Meta::staged_print_conv`]); PrintConv-toggled fields (ID3v1
+  /// Genre %genre ID3.pm:371-375; TLEN ValueConv/PrintConv split
+  /// ID3.pm:592-595) therefore carry the mode-appropriate value. `sink`'s
+  /// `print_conv` argument MUST match the parse-time mode — parse in `-n`
+  /// (`print_conv = false`) to sink `-n` raw scalars, parse in `-j` to
+  /// sink PrintConv strings. A mismatch is a `debug_assert` failure
+  /// (caught in tests; in release it emits the staged mode's values). The
+  /// public typed entries [`parse_id3`](crate::parse_id3) /
+  /// [`parse_mp3`](crate::parse_mp3) parse in `-j`; the lib-first
+  /// [`parse_id3_borrowed`] takes an explicit `print_conv` for `-n`.
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    debug_assert_eq!(
+      print_conv, self.staged_print_conv,
+      "Id3Meta::sink(print_conv={print_conv}) must match the mode the Meta was \
+       parsed in (staged_print_conv={}); parse in the desired mode (Codex BF2)",
+      self.staged_print_conv,
+    );
     for tag in &self.staged_tags {
       // Use the family-1 string as the writer's `group` argument; the
       // legacy `MetadataTagWriter` bridge mirrors family-1 to BOTH
@@ -1178,19 +1141,26 @@ impl MetaSinker for Id3Meta<'_> {
 }
 
 impl MetaSinker for Mp3Meta<'_> {
-  /// Emit MP3 tags: first the ID3 sub-Meta (when present), then a
-  /// delegation marker for MPEG / APE which are still produced by the
-  /// legacy engine in this Phase F2. The byte-exact CLI JSON path goes
-  /// through [`OldFormatParser::process`] which threads the legacy
-  /// MPEG/APE engine into the same `Metadata` push sink — the typed
-  /// `MetaSinker::sink` here only emits the ID3 tags (sufficient for
-  /// the typed-API library callers; the JSON path uses the bridge).
+  /// Emit MP3 tags in bundled `ProcessMP3` order (ID3.pm:1684-1728):
+  /// 1. ID3 sub-Meta (header frames + v1 trailer fields), when present;
+  /// 2. MPEG-audio sub-Meta (frame header + Xing/LAME tail), when an
+  ///    audio frame sync was found;
+  /// 3. APE-trailer sub-Meta, when an APETAGEX footer was found.
+  ///
+  /// This typed sink now emits the SAME tag set the legacy
+  /// [`OldFormatParser::process`] bridge does, so library callers
+  /// consuming `Mp3Meta` via `MetaSinker` get the complete picture
+  /// (Codex BF1/CF1).
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     if let Some(id3) = &self.id3 {
       id3.sink(print_conv, out)?;
     }
-    // MPEG + APE typed sink is F4/F3 work; for F2 the JSON path uses
-    // the OldFormatParser bridge below.
+    if let Some(mpeg) = &self.mpeg {
+      mpeg.sink(print_conv, out)?;
+    }
+    if let Some(ape) = &self.ape {
+      ape.sink(print_conv, out)?;
+    }
     Ok(())
   }
 }
@@ -1547,12 +1517,14 @@ fn reverse_unsync_inplace(v: &[u8]) -> Vec<u8> {
 // Public lib-first direct entries — borrow-from-input typed Meta
 // ===========================================================================
 
-/// Lib-first direct entry. Same as [`FormatParser::parse`] on
-/// [`ProcessId3`] but returns an [`Id3Meta`] that borrows from the input
-/// buffer (Phase G zero-alloc reservation). For now this matches
-/// [`FormatParser::parse`] in behavior since `Id3Meta` owns all strings
-/// via `SmolStr`; the borrow lifetime is reserved for future zero-alloc
-/// optimization.
+/// Lib-first direct entry. Returns an [`Id3Meta`] that borrows from the
+/// input buffer (Phase G zero-alloc reservation; `Id3Meta` owns all
+/// strings via `SmolStr` today, so the borrow lifetime is phantom).
+///
+/// `print_conv = true` stages the tags in `-j` PrintConv mode (e.g. ID3v1
+/// Genre `"Hip-Hop"`); `print_conv = false` stages in `-n` post-ValueConv
+/// raw mode (e.g. Genre `7`). The returned Meta must be sinked in the same
+/// mode (see [`MetaSinker`] for [`Id3Meta`]; Codex BF2).
 ///
 /// # Errors
 ///
@@ -1561,8 +1533,9 @@ fn reverse_unsync_inplace(v: &[u8]) -> Vec<u8> {
 pub fn parse_id3_borrowed<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
+  print_conv: bool,
 ) -> Result<Option<Id3Meta<'a>>, Id3Error> {
-  parse_id3_inner(data, shared)
+  parse_id3_inner(data, shared, print_conv).map(|(meta, _hdr_end)| meta)
 }
 
 // ===========================================================================
@@ -1875,7 +1848,9 @@ mod tests {
   fn parse_id3_borrowed_returns_some_for_id3v1_trailer() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None).expect("ok").expect("found");
+    let meta = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
     assert_eq!(meta.id3_size(), 128);
     assert_eq!(meta.title(), Some("Hello"));
     assert_eq!(meta.artist(), Some("Phil"));
@@ -1889,7 +1864,9 @@ mod tests {
   fn parse_id3_borrowed_id3v1_subframe_populated() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None).expect("ok").expect("found");
+    let meta = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
     let v1 = meta.id3v1().expect("v1 present");
     assert_eq!(v1.title(), Some("Hello"));
     assert_eq!(v1.artist(), Some("Phil"));
@@ -1902,7 +1879,7 @@ mod tests {
   #[test]
   fn parse_id3_borrowed_returns_none_when_no_id3() {
     let data = vec![0u8; 64];
-    assert!(parse_id3_borrowed(&data, None).expect("ok").is_none());
+    assert!(parse_id3_borrowed(&data, None, true).expect("ok").is_none());
   }
 
   #[test]
@@ -1926,7 +1903,9 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&(title_frame.len() as u32).to_be_bytes());
     data.extend_from_slice(&title_frame);
-    let meta = parse_id3_borrowed(&data, None).expect("ok").expect("found");
+    let meta = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
     assert_eq!(meta.v2_version(), Some(Id3v2Version::V2_2));
     assert_eq!(meta.title(), Some("Hello"));
     // The ID3v2.2 frame iterator should contain Title.
@@ -1939,7 +1918,7 @@ mod tests {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
     let mut shared = SharedFlags::new();
-    let _ = parse_id3_borrowed(&data, Some(&mut shared)).expect("ok");
+    let _ = parse_id3_borrowed(&data, Some(&mut shared), true).expect("ok");
     assert_eq!(shared.done_id3(), Some(128));
   }
 
@@ -1974,7 +1953,9 @@ mod tests {
   fn id3_meta_sinker_replays_into_writer() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None).expect("ok").expect("found");
+    let meta = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
     let mut w = crate::sink::MapTagWriter::new();
     meta.sink(true, &mut w).unwrap();
     assert_eq!(
@@ -2017,7 +1998,9 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&size.to_be_bytes());
     data.extend_from_slice(&body);
-    let meta = parse_id3_borrowed(&data, None).expect("ok").expect("found");
+    let meta = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
     let pic = meta.picture().expect("picture present");
     assert_eq!(pic.mime(), "image/jpeg");
     assert_eq!(pic.picture_type(), 3);

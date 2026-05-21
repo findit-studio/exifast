@@ -802,7 +802,8 @@ impl FormatParser for ProcessAiff {
   /// if AIFF gets an ID3 chunk, the bundled would set DoneID3 — since
   /// ID3 chunk dispatch is deferred per [[exifast-phase2-forward-items]],
   /// AIFF does not touch DoneID3.
-  type Meta = AiffMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = AiffMeta<'a>;
   /// Leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; AIFF parsing has no I/O modes —
@@ -812,8 +813,8 @@ impl FormatParser for ProcessAiff {
   /// Parse an AIFF/AIFC/DJVU file's bytes into a typed [`AiffMeta`], or
   /// `None` if the buffer is not a recognized FORM container (AIFF.pm:191
   /// short read, :209 magic mismatch, :199 AT&TFORM tail mismatch).
-  fn parse(&self, data: Self::Context<'_>) -> Result<Option<Self::Meta>, AiffError> {
-    parse_inner(data).map(|opt| opt.map(AiffMeta::into_static))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AiffError> {
+    parse_inner(data)
   }
 }
 
@@ -1279,31 +1280,6 @@ fn tag_str_to_static(s: &str) -> &'static str {
     "ID3 " => "ID3 ",
     "APPL" => "APPL",
     _ => "",
-  }
-}
-
-// ===========================================================================
-// `AiffMeta::into_static`
-// ===========================================================================
-
-impl AiffMeta<'_> {
-  /// Promote a borrow-from-input [`AiffMeta`] into an owned
-  /// `AiffMeta<'static>`. Used by the [`FormatParser`] impl to publish
-  /// into the closed [`crate::parser_new::AnyMeta`] enum (Phase E
-  /// `into_static` pragma, per `docs/tracking.md` 2026-05-21 entry).
-  ///
-  /// Currently every field is already owned (the chunk loop produces
-  /// owned strings via MacRoman decode + `to_string()`), so `into_static`
-  /// is a no-op `PhantomData` rewire. Phase G will retire the wrapper
-  /// when `AnyMeta` carries `<'a>` through.
-  fn into_static(self) -> AiffMeta<'static> {
-    AiffMeta {
-      magic: self.magic,
-      djvm_multi_page: self.djvm_multi_page,
-      events: self.events,
-      composite_duration: self.composite_duration,
-      _lifetime: core::marker::PhantomData,
-    }
   }
 }
 

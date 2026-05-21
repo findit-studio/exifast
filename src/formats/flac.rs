@@ -706,11 +706,11 @@ impl<'a> FlacContext<'a> {
 }
 
 impl FormatParser for ProcessFlac {
-  /// Spec §6.1: typed `FlacMeta<'static>` so it can publish into the closed
-  /// [`AnyMeta`](crate::parser_new::AnyMeta) enum without a per-arm
-  /// lifetime parameter. The borrow-from-input variant lives in
-  /// [`parse_borrowed`].
-  type Meta = FlacMeta<'static>;
+  /// GAT: the Meta borrows from the input `'a` directly (including borrowed
+  /// Vorbis-comment strings and the picture payload), publishing into the
+  /// closed [`AnyMeta`](crate::parser_new::AnyMeta) enum with no `'static`
+  /// upgrade (Codex AF2).
+  type Meta<'a> = FlacMeta<'a>;
   /// Spec §6.1: chained-format context with shared flags.
   type Context<'a> = FlacContext<'a>;
   /// Rust-level fatal error type (no variants today; reserved for future
@@ -722,8 +722,8 @@ impl FormatParser for ProcessFlac {
   ///   `return 1`).
   /// - `Ok(None)` — magic rejected (FLAC.pm:254 `or return 0`).
   /// - `Err(_)` — unreachable today.
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, FlacError> {
-    parse_inner(ctx.data, ctx.shared).map(|opt| opt.map(FlacMeta::into_static))
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, FlacError> {
+    parse_inner(ctx.data, ctx.shared)
   }
 }
 
@@ -731,13 +731,18 @@ impl FormatParser for ProcessFlac {
 /// [`FlacMeta`] that borrows from the input buffer — zero allocation on
 /// the happy-path UTF-8.
 ///
+/// `shared` borrows independently of `data` (decoupled lifetimes): the
+/// returned `FlacMeta<'a>` borrows only from `data`, so the closed
+/// [`crate::parser_new::AnyParser`] dispatch can pass a transient
+/// `shared` without pinning the returned `AnyMeta<'a>` (Codex AF2).
+///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
 pub fn parse_borrowed<'a>(
   data: &'a [u8],
-  shared: &'a mut crate::parser_new::SharedFlags,
+  shared: &mut crate::parser_new::SharedFlags,
 ) -> Result<Option<FlacMeta<'a>>, FlacError> {
   parse_inner(data, shared)
 }
@@ -1304,86 +1309,6 @@ fn decode_base64(s: &str) -> Vec<u8> {
     out.push((quartet[1] << 4) | (quartet[2] >> 2));
   }
   out
-}
-
-// ===========================================================================
-// `FlacMeta::into_static`
-// ===========================================================================
-
-impl FlacMeta<'_> {
-  /// Promote a borrow-from-input [`FlacMeta`] into an owned `FlacMeta<'static>`.
-  /// Used by the [`FormatParser`] impl to publish into the closed
-  /// [`AnyMeta`](crate::parser_new::AnyMeta) enum (Phase E `into_static`
-  /// pragma — see `docs/tracking.md` 2026-05-21 entry).
-  ///
-  /// Materializes every `Cow::Borrowed` into a `Cow::Owned(String)` and
-  /// every `&'a [u8]` (Picture data) into a `Vec<u8>` rehosted as a
-  /// `&'static [u8]` via [`Box::leak`]. Picture binary data is large but
-  /// the file is unique per parse; the leak is O(file) per parse and
-  /// retired in Phase G when `AnyMeta<'a>` threads the lifetime through.
-  fn into_static(self) -> FlacMeta<'static> {
-    let vorbis: Vec<VorbisItem<'static>> =
-      self.vorbis.into_iter().map(vorbis_into_static).collect();
-    let pictures: Vec<FlacPicture<'static>> = self
-      .pictures
-      .into_iter()
-      .map(flac_picture_into_static)
-      .collect();
-    FlacMeta {
-      stream_info: self.stream_info,
-      vorbis,
-      pictures,
-      format_error: self.format_error,
-    }
-  }
-}
-
-fn vorbis_into_static(item: VorbisItem<'_>) -> VorbisItem<'static> {
-  match item {
-    VorbisItem::Vendor(v) => VorbisItem::Vendor(cow_to_owned(v)),
-    VorbisItem::Named {
-      name,
-      value,
-      listable,
-    } => VorbisItem::Named {
-      name,
-      value: cow_to_owned(value),
-      listable,
-    },
-    VorbisItem::Auto { name, value } => VorbisItem::Auto {
-      name,
-      value: cow_to_owned(value),
-    },
-    VorbisItem::CoverArt(b) => VorbisItem::CoverArt(b),
-    VorbisItem::PictureRecursionWarning(v) => VorbisItem::PictureRecursionWarning(cow_to_owned(v)),
-  }
-}
-
-fn cow_to_owned(c: Cow<'_, str>) -> Cow<'static, str> {
-  Cow::Owned(c.into_owned())
-}
-
-fn flac_picture_into_static(p: FlacPicture<'_>) -> FlacPicture<'static> {
-  // Picture data must outlive the input; leak it into a 'static slice.
-  // O(file) per parse; bounded by Picture.length (clamped to remaining
-  // payload). Phase G retires this when `AnyMeta<'a>` threads lifetimes
-  // through.
-  let data: &'static [u8] = if p.data.is_empty() {
-    &[]
-  } else {
-    std::boxed::Box::leak(p.data.to_vec().into_boxed_slice())
-  };
-  FlacPicture {
-    picture_type: p.picture_type,
-    mime_type: cow_to_owned(p.mime_type),
-    description: cow_to_owned(p.description),
-    width: p.width,
-    height: p.height,
-    bits_per_pixel: p.bits_per_pixel,
-    indexed_colors: p.indexed_colors,
-    length: p.length,
-    data,
-  }
 }
 
 // ===========================================================================

@@ -370,30 +370,28 @@ pub struct ProcessDsf;
 impl parser_sealed::Sealed for ProcessDsf {}
 
 impl FormatParser for ProcessDsf {
-  /// Spec §6.1: `'static` Meta on the trait — the `parse` method
-  /// materializes a `'static` slice copy (or rejects the trailer) for
-  /// the `AnyMeta` closed-set publish path. Library-direct callers
-  /// (`parse_borrowed`) get the true zero-alloc `DsfMeta<'a>`.
-  type Meta = DsfMeta<'static>;
+  /// GAT: the Meta borrows the optional ID3v2 trailer from the input `'a`
+  /// directly — zero allocation for the `AnyMeta` closed-set publish path
+  /// (Codex AF2).
+  type Meta<'a> = DsfMeta<'a>;
   /// Spec §6.1: chained format Context wraps `&'a [u8]` + `&'a mut
   /// SharedFlags`.
   type Context<'a> = DsfContext<'a>;
   /// Rust-level fatal error (none today; DSF parsing has no I/O modes).
   type Error = DsfError;
 
-  /// Parse a DSF file's bytes into a typed [`DsfMeta`]. See [`Self`]'s
-  /// trait-doc for the `'static` lifetime promotion semantics.
-  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, DsfError> {
-    parse_inner(ctx.data).map(|opt| opt.map(DsfMeta::into_static))
+  /// Parse a DSF file's bytes into a typed [`DsfMeta`] borrowing from
+  /// `ctx.data` (`'a`).
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, DsfError> {
+    parse_inner(ctx.data)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
 /// [`DsfMeta`] that borrows the optional ID3v2 trailer from the input
-/// buffer — zero allocation. Use this when calling from typed Rust
-/// callers; the `FormatParser` trait signature uses `'static` for
-/// compatibility with the closed `AnyMeta` enum, which forces an
-/// `into_static` upgrade.
+/// buffer — zero allocation. Identical to the [`FormatParser::parse`]
+/// path now that the [`FormatParser::Meta`] GAT threads the borrow
+/// lifetime through (Codex AF2).
 ///
 /// # Errors
 ///
@@ -403,9 +401,10 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`DsfMeta`]. The trait's
-/// `Meta = DsfMeta<'static>` shape forces a [`DsfMeta::into_static`]
-/// upgrade for the closed [`crate::parser_new::AnyMeta`] enum.
+/// Inner parser — produces a borrow-from-input [`DsfMeta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = DsfMeta<'a>`) returns
+/// this borrowed form (including the live ID3v2 trailer slice) directly
+/// into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
 ///
 /// Returns:
 /// - `Ok(None)` — header magic missed (`return 0` BEFORE
@@ -766,45 +765,6 @@ impl MetaSinker for DsfMeta<'_> {
       }
     }
     Ok(())
-  }
-}
-
-// ===========================================================================
-// `DsfMeta::into_static` — owned promotion for the `AnyMeta` enum
-// ===========================================================================
-
-impl DsfMeta<'_> {
-  /// Promote a borrow-from-input [`DsfMeta`] into an owned
-  /// `DsfMeta<'static>`. Used by the [`FormatParser`] impl to publish
-  /// into [`crate::parser_new::AnyMeta`] (Phase E `into_static`
-  /// pragma — see the `docs/tracking.md` 2026-05-21 entry on
-  /// `AnyMeta<'a>` lifetime reconciliation).
-  ///
-  /// **Promotion strategy.** The only borrow-from-input field is the
-  /// ID3v2 trailer slice (`id3_trailer: Option<&'a [u8]>`). Materializing
-  /// it into a `'static` slice requires either a per-parse `Box::leak`
-  /// (unbounded in size — DSF trailers cap at < 20 MB per DSF.pm:88
-  /// guard) OR dropping the trailer on the typed `AnyMeta` path.
-  ///
-  /// We drop the trailer here: the typed lib-first `parse_borrowed`
-  /// path returns the live borrow, and the legacy CLI JSON bridge
-  /// dispatches the trailer through `process_id3_v2_slice` BEFORE
-  /// calling `into_static` (no observable loss for the byte-exact
-  /// conformance contract). Phase G will retire this by threading
-  /// `DsfMeta<'a>` through `AnyMeta<'a>` end-to-end.
-  ///
-  /// The fmt-chunk fields are owned primitives; `fmt_warning` is a
-  /// `&'static str` literal — both round-trip identically without any
-  /// allocation.
-  pub fn into_static(self) -> DsfMeta<'static> {
-    DsfMeta {
-      fmt: self.fmt,
-      fmt_warning: self.fmt_warning,
-      // Drop the borrowed slice on the static-promotion path — the
-      // legacy bridge consumes the borrow BEFORE this call, so no
-      // observable behavior changes for CLI JSON.
-      id3_trailer: None,
-    }
   }
 }
 
@@ -1546,15 +1506,15 @@ mod tests {
   // --- FormatParser trait round-trip --------------------------------------
 
   #[test]
-  fn format_parser_trait_returns_meta_static() {
+  fn format_parser_trait_returns_borrowed_meta() {
     let bytes = happy_path_dsf();
     let mut shared = SharedFlags::new();
     let ctx = DsfContext::new(&bytes, &mut shared);
     let meta = <ProcessDsf as FormatParser>::parse(&ProcessDsf, ctx)
       .expect("ok")
       .expect("parsed");
-    // The static-promotion path drops the id3 trailer borrow (see
-    // `DsfMeta::into_static` doc).
+    // GAT path borrows from the input; this fixture has metaPos=0 (no ID3
+    // trailer), so the trailer slice is absent here.
     assert!(meta.id3_trailer().is_none());
     // fmt fields survive intact.
     let fmt = meta.fmt().expect("populated");
