@@ -25,12 +25,13 @@
 //! / Phase F (everything else). Both are `#[non_exhaustive]` so new format
 //! arms are additive.
 
-use core::fmt;
-use core::marker::PhantomData;
+use core::{fmt, marker::PhantomData};
 
-mod parser_sealed {
+pub(crate) mod parser_sealed {
   /// Sealed marker for the new [`super::FormatParser`] trait. Downstream
-  /// crates cannot implement the trait because they cannot name this type.
+  /// crates cannot implement the trait because they cannot name this
+  /// type (the `parser_sealed` module is `pub(crate)`, accessible only
+  /// to in-crate format modules that implement [`super::FormatParser`]).
   pub trait Sealed {}
 }
 
@@ -131,10 +132,27 @@ pub trait TagWriter {
 ///
 /// Errors propagate from the writer (the Meta itself has no error states —
 /// fallibility belongs to the destination).
+///
+/// **Phase E discovery — `print_conv` parameter.** Spec §6.3 originally
+/// shaped this as `sink<W>(&self, out: &mut W)` with no mode flag. The MOI
+/// pilot (Phase E) surfaced that byte-exact reproduction of the bundled
+/// `perl exiftool -j` / `-n` JSON pair requires the Meta to know whether
+/// PrintConv strings (e.g. `ConvertDuration("8.16 s")`) or post-ValueConv
+/// raw values (e.g. `8.16` as `f64`) should be emitted. This mirrors
+/// ExifTool's `$$self{OPTIONS}{PrintConv}` flag (ExifTool.pm:5710): the
+/// PrintConv toggle is a global engine option, not a writer/sink choice.
+///
+/// Library callers consuming typed accessors on the Meta directly never
+/// touch this trait; only the CLI JSON path (`MetaSinker` → `TagWriter`)
+/// needs the toggle.
 pub trait MetaSinker {
   /// Emit this Meta's tags into `out`. Emission order should mirror the
   /// bundled-Perl iteration order of the format's tag table.
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error>;
+  ///
+  /// `print_conv = true` emits PrintConv strings (faithful to
+  /// `perl exiftool -j`); `print_conv = false` emits post-ValueConv raw
+  /// scalars (faithful to `perl exiftool -j -n`).
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error>;
 }
 
 /// Cross-format shared state. Threaded through chained parsers
@@ -248,38 +266,174 @@ impl SharedFlags {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum AnyParser {
-  // Phase E adds: Moi(crate::formats::moi::ProcessMoi),
-  // Phase F1 adds: Aac, Dv, Audible, Red.
-  // Phase F2 adds: Id3.
-  // Phase F3 adds: Ape, Dsf, Aiff, Flac.
-  // Phase F4 adds: Ogg, MpegAudio.
-  // Phase F5 adds: Mp3, Mpc, WavPack.
+  /// MOI (Phase E pilot — camcorder MOD info sidecar).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::ProcessMoi),
+  /// AAC (Phase F1 — ADTS audio).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::ProcessAac),
+  /// DV (Phase F1 — DV video stream).
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::ProcessDv),
+  /// Audible (AA) (Phase F1 — DRM'd audiobook).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::ProcessAa),
+  /// Red R3D (Phase F1 — Redcode video).
+  #[cfg(feature = "red")]
+  R3D(crate::formats::red::ProcessR3D),
+  /// ID3 directory parser (Phase F2 — ID3v1 + ID3v2 unified).
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::ProcessId3),
+  /// MP3 wrapper parser (Phase F2 — ID3 + audio-frame chain).
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::ProcessMp3),
+  /// AIFF (Phase F3 — Audio Interchange File Format / AIFC / DjVu).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::ProcessAiff),
+  /// APE (Phase F3 — Monkey's Audio, chains ID3v1/v2).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ProcessApe),
+  /// DSF (Phase F3 — DSD Stream File, chains ID3v2 trailer).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::ProcessDsf),
+  /// FLAC (Phase F3 — Free Lossless Audio Codec).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::ProcessFlac),
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::ProcessOgg),
+  /// MPEG audio (Phase F4 — MP3 / MP2 / MUS frame parser + Xing/LAME tail).
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::ProcessMpegAudio),
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio, chains ID3 + APE).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::ProcessMpc),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio, chains ID3 + APE).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::ProcessWv),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
 ///
-/// The `_Phantom` variant exists so the enum compiles before any format
-/// has migrated to the new trait. It is removed in Phase G (last) once
-/// every format has a real arm.
+/// The `_Phantom` variant exists so the enum compiles even when no format
+/// feature is enabled (e.g. `--no-default-features` builds). It is
+/// removed in Phase G (last) once every format has a real arm AND the
+/// public-API contract pins at least one format always being present.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
-  /// Placeholder so the enum compiles before any format arm exists.
-  /// Removed in Phase G after every format has migrated.
+  /// Placeholder so the enum compiles when no format feature is enabled.
+  /// Removed in Phase G.
   #[doc(hidden)]
   _Phantom(PhantomData<&'a ()>),
-  // Phase E adds: Moi(crate::formats::moi::MoiMeta<'a>),
+  /// MOI (Phase E pilot).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::MoiMeta<'a>),
+  /// AAC (Phase F1).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::AacMeta<'a>),
+  /// DV (Phase F1). Carries the [`crate::formats::dv::DvParseOutcome`]
+  /// because DV has TWO accept paths (unrecognized-profile warn vs.
+  /// full data); the closed-enum carry must distinguish them so the
+  /// sink can warn on the former without emitting DV:* tags.
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::DvParseOutcome<'a>),
+  /// Audible (AA) (Phase F1).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::AaMeta<'a>),
+  /// Red R3D (Phase F1).
+  #[cfg(feature = "red")]
+  R3d(crate::formats::red::R3dMeta<'a>),
+  /// ID3 directory metadata (Phase F2). The [`crate::formats::id3::ProcessId3`]
+  /// `FormatParser` impl produces `Id3Meta<'static>` (Phase E
+  /// `into_static` pragma); this arm carries the `<'a>` projection so the
+  /// closed enum compiles at any caller lifetime.
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::Id3Meta<'a>),
+  /// MP3 wrapper metadata (Phase F2). Wraps [`crate::formats::id3::Id3Meta`]
+  /// plus borrowed MPEG-audio / APE-trailer passthrough slices; the typed
+  /// MPEG-audio / APE arms land in Phase F3/F4 (per
+  /// `docs/tracking.md` F2 ID3 integration notes).
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::Mp3Meta<'a>),
+  /// AIFF (Phase F3).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::AiffMeta<'a>),
+  /// APE (Phase F3).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ApeMeta<'a>),
+  /// DSF (Phase F3).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::DsfMeta<'a>),
+  /// FLAC (Phase F3).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::FlacMeta<'a>),
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
+  /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces
+  /// `OggMeta<'static>` (Phase E `into_static` pragma); this arm carries
+  /// the `<'a>` projection so the closed enum compiles at any caller
+  /// lifetime.
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::OggMeta<'a>),
+  /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
+  /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::MpcMeta<'a>),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::WvMeta<'a>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     match self {
       AnyMeta::_Phantom(_) => {
         // Phantom variant emits no tags; exists only as a type-system
-        // placeholder until Phase E adds the first real format arm.
-        let _ = out;
+        // placeholder for the no-format-feature build.
+        let _ = (out, print_conv);
         Ok(())
-      } // Phase E adds: AnyMeta::Moi(m) => m.sink(out),
+      }
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(o) => match o {
+        // DV.pm:188 — Warn + return 1 without DV:* tags. The bridge
+        // emits the warning at the legacy `OldFormatParser::process`
+        // entry; the sink path emits no tags for this variant.
+        crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
+          out.write_warning("Unrecognized DV profile")
+        }
+        crate::formats::dv::DvParseOutcome::Meta(m) => m.sink(print_conv, out),
+      },
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(m) => m.sink(print_conv, out),
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(m) => m.sink(print_conv, out),
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(m) => m.sink(print_conv, out),
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(m) => m.sink(print_conv, out),
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(m) => m.sink(print_conv, out),
     }
   }
 }
@@ -346,9 +500,15 @@ mod tests {
   }
 
   impl MetaSinker for DummyMeta<'_> {
-    fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+    fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
       out.write_str("Dummy", "Name", self.name)?;
-      out.write_u64("Dummy", "Size", self.size)?;
+      if print_conv {
+        // Faithful to the PrintConv toggle: emit a formatted text view
+        // when print_conv is on; the raw numeric otherwise.
+        out.write_fmt("Dummy", "Size", |w| write!(w, "{} bytes", self.size))?;
+      } else {
+        out.write_u64("Dummy", "Size", self.size)?;
+      }
       Ok(())
     }
   }
@@ -359,12 +519,20 @@ mod tests {
       name: "moi-fake",
       size: 1234,
     };
+    // -j (PrintConv on) — formatted bytes-string.
     let mut w = MapTagWriter::new();
-    meta.sink(&mut w).unwrap();
+    meta.sink(true, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Name").map(MapValue::as_str),
       Some("moi-fake".to_string())
     );
+    assert_eq!(
+      w.get("Dummy", "Size").map(MapValue::as_str),
+      Some("1234 bytes".to_string())
+    );
+    // -n (PrintConv off) — raw u64.
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Size").map(MapValue::as_str),
       Some("1234".to_string())
@@ -416,7 +584,7 @@ mod tests {
     let mut sink = InfallibleSink;
     // The `unwrap()` on an `Infallible` result is what the doc claims is
     // collapsed at type-check; here we just ensure the dataflow compiles.
-    let result: Result<(), Infallible> = meta.sink(&mut sink);
+    let result: Result<(), Infallible> = meta.sink(true, &mut sink);
     let () = result.unwrap();
   }
 
@@ -449,7 +617,10 @@ mod tests {
   fn any_meta_phantom_sinks_nothing() {
     let any: AnyMeta<'_> = AnyMeta::_Phantom(PhantomData);
     let mut w = MapTagWriter::new();
-    any.sink(&mut w).unwrap();
+    any.sink(true, &mut w).unwrap();
+    assert_eq!(w.len(), 0);
+    let mut w = MapTagWriter::new();
+    any.sink(false, &mut w).unwrap();
     assert_eq!(w.len(), 0);
   }
 }

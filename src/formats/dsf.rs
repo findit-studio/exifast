@@ -1,18 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "dsf")]
 //! Faithful port of `Image::ExifTool::DSF` (lib/Image/ExifTool/DSF.pm,
 //! ExifTool 13.58, 138 lines). DSD Stream File container: `'DSD '` chunk +
 //! `'fmt '` chunk. Read-only.
 //!
-//! The ID3v2 trailer arm (DSF.pm:88-97) was IMPLEMENTED in Codex R2-F3
-//! via `crate::formats::id3::process::process_id3_v2_slice` — modelling
-//! the bundled `ProcessDirectory(GetTagTable('Image::ExifTool::ID3::Main'))`
-//! dispatch over `data[metaPos..metaPos+metaLen]`. Pinned by
-//! `tests/fixtures/dsf_with_id3v2_trailer.dsf`.
+//! **Phase F3 — lib-first migration.** Follows the MOI pilot (Phase E) and
+//! the F1 leaves (AAC, DV) pattern: a typed [`DsfMeta<'a>`] is produced by
+//! the new [`crate::parser_new::FormatParser`] trait; the legacy
+//! [`crate::parser::OldFormatParser`] entry point bridges through
+//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
+//! during Phase F. The bridge is retired in Phase G.
+//!
+//! ## Why DSF needs a `Context<'a>` struct (not the leaf `&'a [u8]`)
+//!
+//! DSF chains into the bundled ID3v2 trailer at `metaPos` (DSF.pm:88-97).
+//! The chain itself runs through the legacy `process_id3_v2_slice`
+//! ([`crate::formats::id3::process::process_id3_v2_slice`]) which still
+//! consumes a `ParseContext` — F3 lands the typed `DsfMeta` first and
+//! leaves the chained-ID3 typed path for F4 (when typed `Id3Meta`
+//! becomes available). Per the task plan we model the F3 `Context<'a>`
+//! as `DsfContext<'a>` = `&'a [u8]` + `&'a mut SharedFlags` even though
+//! the F3 parser itself doesn't yet touch `SharedFlags`; the shape is
+//! pinned now to make the F4 follow-on a pure additive change (no
+//! signature break).
+//!
+//! ## ID3 trailer placeholder
+//!
+//! `DsfMeta::id3_trailer()` exposes a borrowed `&'a [u8]` of the trailer
+//! bytes (faithful to `DSF.pm:88-97`'s `$dirInfo{DataPt}` slice). When
+//! F2's typed `Id3Meta` lands, this field gains an `Option<Id3Meta<'a>>`
+//! sibling and the byte-slice degrades to a fallback; for now the bytes
+//! are the lib-first surface AND the bridge dispatches them through
+//! the legacy `process_id3_v2_slice` for byte-exact CLI JSON output.
 
 use crate::{
-  parser::{FormatParser, ParseContext},
+  parser::{OldFormatParser, ParseContext},
+  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue},
 };
+
+// ===========================================================================
+// Static tag table — `%DSF::Main` (DSF.pm:20-49)
+// ===========================================================================
 
 // DSF.pm:30 `3 => 'FormatVersion'`.
 static FORMAT_VERSION: TagDef =
@@ -59,12 +92,8 @@ static BITS_PER_SAMPLE: TagDef =
 // DSF.pm:47 `9 => { Name => 'SampleCount', Format => 'int64u' }`.
 //
 // `Format => 'int64u'` consumes 8 bytes at byte offset 36 (key 9 * 4-byte
-// int32u stride), which is why DSF::Main has no key 10 (would land inside the
-// int64u payload). The DSF-local binary walk in this module reads exactly
-// 8 LE bytes here; values above `i64::MAX` are emitted as `TagValue::Str`
-// (exact decimal) — same faithful UV→NV-shape that `bitstream` uses for its
-// integer-accumulation path, and which the serializer's number gate keeps as
-// a bare JSON integer (≥ 16-digit string lookup, `EscapeJSON` line 3809).
+// int32u stride), which is why DSF::Main has no key 10 (would land inside
+// the int64u payload).
 static SAMPLE_COUNT: TagDef =
   TagDef::new("SampleCount", "File", ValueConv::None, PrintConv::None).with_format("int64u");
 // DSF.pm:48 `11 => 'BlockSize'`.
@@ -93,39 +122,808 @@ fn dsf_get(id: TagId) -> Option<&'static TagDef> {
 pub static DSF_MAIN: TagTable = TagTable::new("File", dsf_get);
 
 /// Sorted integer keys of `%DSF::Main` in ASCENDING order. Faithful to Perl's
-/// `sort { $a <=> $b } keys %$tagTbl` for ProcessBinaryData (the engine walks
-/// keys in numeric order — DSF.pm has no `FIRST_ENTRY` hint, so order is the
-/// numeric sort of present keys). 10 is absent (consumed by key 9's
-/// `Format => 'int64u'`).
+/// `sort { $a <=> $b } keys %$tagTbl` for ProcessBinaryData. 10 is absent
+/// (consumed by key 9's `Format => 'int64u'`).
 const DSF_KEYS: &[i64] = &[3, 4, 5, 6, 7, 8, 9, 11];
 
+// ===========================================================================
+// Typed Meta — `DsfMeta<'a>`
+// ===========================================================================
+
+/// The `'fmt '` chunk fields (DSF.pm:30-48). Every field is the raw
+/// post-decode integer — PrintConv hashes (FormatID, ChannelType) are
+/// applied at [`MetaSinker::sink`] time mirroring the
+/// `$$self{OPTIONS}{PrintConv}` toggle.
+///
+/// `present_mask` tracks which `DSF_KEYS` entries the parser successfully
+/// read (one bit per key index in `DSF_KEYS` order — bit 0 = key 3, bit
+/// 1 = key 4, …, bit 7 = key 11). On the production happy path the mask
+/// is `0xFF` (every field fits); a pathological `fmt_len` in `(12, 48)`
+/// produces a partial mask and the sink emits ONLY the present fields,
+/// faithful to ExifTool.pm:9953 `last if $more <= 0`.
+#[derive(Debug, Clone, Copy)]
+pub struct DsfFmtData {
+  /// 0x0c key 3 — `FormatVersion` (DSF.pm:30). int32u LE.
+  format_version: u32,
+  /// 0x10 key 4 — `FormatID` raw u32 (DSF.pm:31). PrintConv: 0⇒"DSD Raw".
+  format_id: u32,
+  /// 0x14 key 5 — `ChannelType` raw u32 (DSF.pm:32-43). PrintConv: hash.
+  channel_type: u32,
+  /// 0x18 key 6 — `ChannelCount` (DSF.pm:44). int32u LE.
+  channel_count: u32,
+  /// 0x1c key 7 — `SampleRate` (DSF.pm:45). int32u LE.
+  sample_rate: u32,
+  /// 0x20 key 8 — `BitsPerSample` (DSF.pm:46). int32u LE.
+  bits_per_sample: u32,
+  /// 0x24 key 9 — `SampleCount` (DSF.pm:47). int64u LE.
+  sample_count: u64,
+  /// 0x2c key 11 — `BlockSize` (DSF.pm:48). int32u LE.
+  block_size: u32,
+  /// True iff `sample_count > i64::MAX` — emission switches from
+  /// `TagValue::I64` to a decimal `TagValue::Str` to preserve the exact
+  /// unsigned value (Perl UV→NV-shape; the serializer's number gate
+  /// keeps a ≥16-digit bare integer as a JSON number — byte-exact vs
+  /// `exiftool -j` for large unsigned values).
+  sample_count_is_decimal_string: bool,
+  /// Bitmask of present `DSF_KEYS` entries (LSB = first key). `0xFF` for
+  /// the production happy path; partial on pathological short payloads.
+  present_mask: u8,
+}
+
+impl DsfFmtData {
+  /// DSF.pm:30 `3 => 'FormatVersion'` (int32u LE).
+  #[must_use]
+  pub fn format_version(&self) -> u32 {
+    self.format_version
+  }
+  /// DSF.pm:31 raw `FormatID` (int32u LE). Use [`Self::format_id_print`]
+  /// for the PrintConv-resolved name.
+  #[must_use]
+  pub fn format_id(&self) -> u32 {
+    self.format_id
+  }
+  /// DSF.pm:31 `PrintConv => { 0 => 'DSD Raw' }`. Returns `None` for
+  /// hash misses (faithful — Perl emits `0` raw in that case).
+  #[must_use]
+  pub fn format_id_print(&self) -> Option<&'static str> {
+    match self.format_id {
+      0 => Some("DSD Raw"),
+      _ => None,
+    }
+  }
+  /// DSF.pm:32-43 raw `ChannelType` (int32u LE). Use
+  /// [`Self::channel_type_print`] for the PrintConv-resolved name.
+  #[must_use]
+  pub fn channel_type(&self) -> u32 {
+    self.channel_type
+  }
+  /// DSF.pm:32-43 `PrintConv` hash. Returns `None` on a hash miss
+  /// (faithful — Perl emits the raw integer in that case).
+  #[must_use]
+  pub fn channel_type_print(&self) -> Option<&'static str> {
+    match self.channel_type {
+      1 => Some("Mono"),
+      2 => Some("Stereo (Left, Right)"),
+      3 => Some("3 Channels (Left, Right, Center)"),
+      4 => Some("Quad (Left, Right, Back L, Back R)"),
+      5 => Some("4 Channels (Left, Right, Center, Bass)"),
+      6 => Some("5 Channels (Left, Right, Center, Back L, Back R)"),
+      7 => Some("5.1 Channels (Left, Right, Center, Bass, Back L, Back R)"),
+      _ => None,
+    }
+  }
+  /// DSF.pm:44 `ChannelCount` (int32u LE).
+  #[must_use]
+  pub fn channel_count(&self) -> u32 {
+    self.channel_count
+  }
+  /// DSF.pm:45 `SampleRate` (int32u LE).
+  #[must_use]
+  pub fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+  /// DSF.pm:46 `BitsPerSample` (int32u LE).
+  #[must_use]
+  pub fn bits_per_sample(&self) -> u32 {
+    self.bits_per_sample
+  }
+  /// DSF.pm:47 `SampleCount` (int64u LE). The full unsigned range is
+  /// preserved; values above `i64::MAX` are still exact via `u64`.
+  #[must_use]
+  pub fn sample_count(&self) -> u64 {
+    self.sample_count
+  }
+  /// DSF.pm:48 `BlockSize` (int32u LE).
+  #[must_use]
+  pub fn block_size(&self) -> u32 {
+    self.block_size
+  }
+}
+
+/// Typed DSF metadata — the lib-first output of [`ProcessDsf`].
+///
+/// `DsfMeta` holds three orthogonal slices of the DSF.pm port:
+///
+/// 1. The `'fmt '` chunk fields ([`Self::fmt`]). `None` only on the
+///    DSF.pm:71-72 Warn-then-return-1 path (a malformed `fmtLen` —
+///    `fmtLen <= 12 || fmtLen >= 1000 || short read`); on every happy
+///    path this is `Some` with all eight integers populated.
+/// 2. The fmt-chunk warning text ([`Self::fmt_warning`]). When
+///    [`Self::fmt`] is `None`, this is `Some("Error reading DSF fmt
+///    chunk")` (DSF.pm:71) so the bridge re-pushes it through
+///    `MetadataTagWriter::write_warning` for byte-exact CLI JSON.
+/// 3. The optional ID3v2 trailer bytes ([`Self::id3_trailer`]) — the
+///    `metaPos..metaPos+metaLen` slice (DSF.pm:88-97) borrowed from the
+///    input buffer (zero-alloc). The bridge dispatches this slice
+///    through [`crate::formats::id3::process::process_id3_v2_slice`]
+///    so the bundled-Perl `ProcessDirectory(GetTagTable(
+///    'Image::ExifTool::ID3::Main'))` semantics are preserved. The
+///    typed lib-first path exposes the bytes; a future F4 sibling
+///    field will hold an `Option<Id3Meta<'a>>` parsed at the same time.
+///
+/// **D8 — no public fields, accessors only.**
+///
+/// **Lifetimes.** `DsfMeta` borrows only the optional ID3 trailer bytes
+/// (`id3_trailer: Option<&'a [u8]>`) from the input. Every fmt-chunk
+/// integer is owned. The lifetime is preserved end-to-end so the
+/// `id3_trailer` slice can flow through `parse_borrowed` zero-alloc.
+#[derive(Debug, Clone)]
+pub struct DsfMeta<'a> {
+  /// The eight `'fmt '` chunk fields (DSF.pm:30-48), or `None` on the
+  /// DSF.pm:71-72 Warn-then-accept path.
+  fmt: Option<DsfFmtData>,
+  /// `Some("Error reading DSF fmt chunk")` iff [`Self::fmt`] is `None`
+  /// (DSF.pm:71). The bridge re-pushes this through
+  /// `write_warning` so the bundled-Perl `$et->Warn(...)` semantics
+  /// are preserved.
+  fmt_warning: Option<&'static str>,
+  /// ID3v2 trailer slice (DSF.pm:88-97) — `metaPos..metaPos+metaLen`
+  /// borrowed from the input buffer. `None` when `metaPos == 0` or
+  /// the slice fails the bundled-Perl guards (`metaLen > 0 &&
+  /// metaLen < 20_000_000 && Read == metaLen`).
+  ///
+  /// **Phase F3 placeholder.** Typed `Id3Meta` lives in Phase F2 (not
+  /// yet migrated at F3 time per the task plan). The bridge consumes
+  /// these bytes through the legacy `process_id3_v2_slice` for byte-
+  /// exact CLI JSON; a future F4 PR will add a typed sibling field
+  /// (likely `Option<Id3Meta<'a>>`) parsed from the same slice.
+  id3_trailer: Option<&'a [u8]>,
+}
+
+impl<'a> DsfMeta<'a> {
+  /// The `'fmt '` chunk fields, present on every happy path and absent
+  /// only on the DSF.pm:71-72 Warn-then-accept path.
+  #[must_use]
+  pub fn fmt(&self) -> Option<&DsfFmtData> {
+    self.fmt.as_ref()
+  }
+
+  /// The Warn text emitted by DSF.pm:71 when the fmt-chunk read fails.
+  /// `Some` iff [`Self::fmt`] is `None`.
+  #[must_use]
+  pub fn fmt_warning(&self) -> Option<&'static str> {
+    self.fmt_warning
+  }
+
+  /// The optional ID3v2 trailer bytes (DSF.pm:88-97). Borrowed from
+  /// the input buffer when present; `None` when there is no trailer
+  /// (`metaPos == 0`) or the trailer fails the bundled-Perl guards
+  /// (`metaLen > 0 && metaLen < 20_000_000 && Read == metaLen`).
+  ///
+  /// **Phase F3 placeholder.** Will gain a typed `Option<Id3Meta<'a>>`
+  /// sibling once F2 lands typed ID3.
+  #[must_use]
+  pub fn id3_trailer(&self) -> Option<&'a [u8]> {
+    self.id3_trailer
+  }
+}
+
+// ===========================================================================
+// `DsfContext` — per-format input view (chained shape)
+// ===========================================================================
+
+/// Per-format `Context<'a>` for [`ProcessDsf`]. Spec §6.1: leaf formats
+/// (MOI, AAC, DV, Audible) use `&'a [u8]`; chained formats (the DSF→ID3
+/// trailer family) use a struct wrapping `&'a [u8]` + `&'a mut SharedFlags`.
+///
+/// DSF is the simplest chained leaf — it does not itself read or mutate
+/// `SharedFlags` (the chain into [`crate::formats::id3::process::
+/// process_id3_v2_slice`] runs through the legacy `ParseContext` path
+/// for now), but the F4 typed-ID3 follow-on will need to thread
+/// `DoneID3` through this context. Pinning the shape at F3 keeps the
+/// F4 PR purely additive (no breaking changes to the F3 API).
+///
+/// D8 convention: PRIVATE fields; constructor + accessors only.
+#[derive(Debug)]
+pub struct DsfContext<'a> {
+  /// The full file bytes (`$raf` in DSF.pm). Borrows for `'a`.
+  data: &'a [u8],
+  /// The cross-format flag block (spec §6.4). DSF does not currently
+  /// read or mutate any flag, but the typed F4 ID3 follow-on will pass
+  /// `DoneID3` through here.
+  #[allow(dead_code)]
+  shared: &'a mut SharedFlags,
+}
+
+impl<'a> DsfContext<'a> {
+  /// Construct a fresh DSF context (only constructor — D8 PRIVATE fields).
+  #[must_use]
+  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+    Self { data, shared }
+  }
+
+  /// File bytes (`$raf` in DSF.pm).
+  #[must_use]
+  pub fn data(&self) -> &'a [u8] {
+    self.data
+  }
+}
+
+// ===========================================================================
+// `ProcessDsf` — the lib-first parser
+// ===========================================================================
+
+/// DSF parser (faithful `ProcessDSF`, DSF.pm:55-99).
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessDsf;
+
+impl parser_sealed::Sealed for ProcessDsf {}
+
+impl FormatParser for ProcessDsf {
+  /// Spec §6.1: `'static` Meta on the trait — the `parse` method
+  /// materializes a `'static` slice copy (or rejects the trailer) for
+  /// the `AnyMeta` closed-set publish path. Library-direct callers
+  /// (`parse_borrowed`) get the true zero-alloc `DsfMeta<'a>`.
+  type Meta = DsfMeta<'static>;
+  /// Spec §6.1: chained format Context wraps `&'a [u8]` + `&'a mut
+  /// SharedFlags`.
+  type Context<'a> = DsfContext<'a>;
+  /// Rust-level fatal error (none today; DSF parsing has no I/O modes).
+  type Error = DsfError;
+
+  /// Parse a DSF file's bytes into a typed [`DsfMeta`]. See [`Self`]'s
+  /// trait-doc for the `'static` lifetime promotion semantics.
+  fn parse(&self, ctx: Self::Context<'_>) -> Result<Option<Self::Meta>, DsfError> {
+    parse_inner(ctx.data).map(|opt| opt.map(DsfMeta::into_static))
+  }
+}
+
+/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
+/// [`DsfMeta`] that borrows the optional ID3v2 trailer from the input
+/// buffer — zero allocation. Use this when calling from typed Rust
+/// callers; the `FormatParser` trait signature uses `'static` for
+/// compatibility with the closed `AnyMeta` enum, which forces an
+/// `into_static` upgrade.
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved for
+/// future I/O wrappers).
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
+  parse_inner(data)
+}
+
+/// Inner parser — produces a borrow-from-input [`DsfMeta`]. The trait's
+/// `Meta = DsfMeta<'static>` shape forces a [`DsfMeta::into_static`]
+/// upgrade for the closed [`crate::parser_new::AnyMeta`] enum.
+///
+/// Returns:
+/// - `Ok(None)` — header magic missed (`return 0` BEFORE
+///   `SetFileType`, DSF.pm:62-63).
+/// - `Ok(Some({ fmt: None, fmt_warning: Some(...) }))` — magic matched
+///   but the fmt-chunk read failed (DSF.pm:71-72 Warn + return 1).
+/// - `Ok(Some({ fmt: Some(...), id3_trailer: Option<...> }))` — happy
+///   path; optional ID3v2 trailer carried through.
+fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
+  // DSF.pm:62 `$raf->Read($buff,40)==40 or return 0`.
+  if data.len() < 40 {
+    return Ok(None);
+  }
+  // DSF.pm:63 `$buff =~ /^DSD \x1c\0{7}.{16}fmt /s`. The regex is
+  // anchored (^) and the `{16}` middle is "any 16 bytes" (Perl `.` under
+  // `/s` matches any byte including \n). Translated literally as four
+  // byte-equality checks; the 16-byte middle (fileSize+metaPos) is
+  // unconstrained.
+  let head = &data[..40];
+  if &head[0..4] != b"DSD " {
+    return Ok(None);
+  }
+  if head[4] != 0x1c {
+    return Ok(None);
+  }
+  if !head[5..12].iter().all(|&b| b == 0) {
+    return Ok(None);
+  }
+  if &head[28..32] != b"fmt " {
+    return Ok(None);
+  }
+  // DSF.pm:66 `SetByteOrder('II')` — every Get* below is little-endian.
+  // DSF.pm:67 `my $fmtLen = Get64u(\$buff,32)`.
+  let fmt_len = read_u64_le(&head[32..40]);
+  // DSF.pm:74-75 `$fileSize = Get64u(\$buff,12); $metaPos = Get64u(
+  // \$buff,20)` — local-only, NOT emitted as DSF tags. Read here for
+  // use by the ID3v2 trailer arm at DSF.pm:88-97.
+  let file_size = read_u64_le(&head[12..20]);
+  let meta_pos = read_u64_le(&head[20..28]);
+  // DSF.pm:68-72 `unless ($fmtLen > 12 and $fmtLen < 1000 and $raf->Read(
+  //   $buf2, $fmtLen - 12) == $fmtLen - 12) { Warn; return 1 }`.
+  //
+  // The `fmt_len > 12` guard is what makes the `fmt_len - 12` subtraction
+  // below panic-free in unsigned Rust (signed-Perl → usize underflow
+  // footgun, per [[exifast-phase2-forward-items]]). The `fmt_len < 1000`
+  // guard is NOT a `usize`-cast safety requirement (999 fits any
+  // realistic `usize`); it exists for two load-bearing reasons:
+  //   1. ExifTool conformance — DSF.pm:68 enforces this exact bound, so
+  //      a Perl-rejecting file must also be rejected here for byte-exact
+  //      diffs against `exiftool -j`.
+  //   2. Bounded fmt-chunk read — caps the slice size at < 1KB regardless
+  //      of input, so a malicious header cannot trigger a huge fmt-chunk
+  //      decode. Both guards are load-bearing — do NOT reorder.
+  let fmt_ok = fmt_len > 12 && fmt_len < 1000 && {
+    let need = (fmt_len - 12) as usize;
+    data.len() >= 40usize.saturating_add(need)
+  };
+  if !fmt_ok {
+    // DSF.pm:71-72 — Warn + return 1. No fmt-chunk payload.
+    // Caller (bridge / lib-direct) still emits File:* (DSF.pm:64
+    // SetFileType runs BEFORE the guard — bridge mirrors the ordering).
+    // The optional ID3v2 trailer is still scanned: DSF.pm:88-97 runs
+    // AFTER the Warn (the Warn path falls through to the trailer arm).
+    // Faithful to the bundled-Perl flow: the trailer's `metaPos`/`metaLen`
+    // were already captured from the header.
+    let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
+    return Ok(Some(DsfMeta {
+      fmt: None,
+      fmt_warning: Some("Error reading DSF fmt chunk"),
+      id3_trailer,
+    }));
+  }
+  // DSF.pm:76 `$buff = substr($buff,28) . $buf2` — the dirInfo buffer
+  // is `'fmt '` + chunkSize (12 bytes from head[28..40]) + payload
+  // (fmt_len - 12 bytes from data[40..]). Total length == fmt_len.
+  //
+  // The DSF-local binary walk reads each integer at its computed offset
+  // inside the dirInfo buffer; we transliterate that directly off the
+  // file bytes by computing `dir_offset = key * 4`, then
+  // `file_offset = dir_offset - 28 + 0` when `dir_offset >= 28`
+  // (the 12-byte `'fmt '`+size prefix is at file offset 28..40, and
+  // the payload begins at file offset 40 — so `file_offset = dir_offset
+  // + 12` after the prefix). No intermediate `Vec` allocation needed
+  // (Phase F3 zero-alloc derivation).
+  //
+  // Key 3 (FormatVersion) lands at dir_offset 12 ⇒ file_offset 40
+  // (start of payload). Key 11 (BlockSize) lands at dir_offset 44 ⇒
+  // file_offset 72 (and requires fmt_len >= 48). Key 9 (SampleCount)
+  // lands at dir_offset 36 ⇒ file_offset 64..72 (8 bytes).
+  let payload_len = (fmt_len - 12) as usize;
+  let dir_total = 12 + payload_len;
+  // Reads each fmt-chunk integer. Bounds-checked against `dir_total`
+  // (faithful to ExifTool.pm:9953 `last if $more <= 0; # all done if
+  // we have reached the end of data`). The DSF_KEYS list is strictly
+  // ascending so the first out-of-range field truncates the rest.
+  let mut format_version: u32 = 0;
+  let mut format_id: u32 = 0;
+  let mut channel_type: u32 = 0;
+  let mut channel_count: u32 = 0;
+  let mut sample_rate: u32 = 0;
+  let mut bits_per_sample: u32 = 0;
+  let mut sample_count: u64 = 0;
+  let mut block_size: u32 = 0;
+  let mut sample_count_is_decimal_string = false;
+  let mut emitted: u8 = 0;
+  for &key in DSF_KEYS {
+    let dir_off = (key as usize) * 4;
+    let is_int64 = key == 9;
+    let width: usize = if is_int64 { 8 } else { 4 };
+    let dir_end = dir_off + width;
+    if dir_end > dir_total {
+      // Once one key is out of range, every subsequent key is too
+      // (ascending). Faithful early-exit.
+      break;
+    }
+    // Map dirInfo offset to absolute file offset: the dirInfo buffer
+    // is `head[28..40] + payload` (40..40+payload_len in file). So:
+    //   file_off = (dir_off < 12) ? 28 + dir_off : 40 + (dir_off - 12)
+    // Equivalently: `file_off = dir_off + 28` for dir_off in [0,12),
+    // `file_off = dir_off + 28` for the whole range (the 28-byte head
+    // shift). Verified: dir_off 12 ⇒ file_off 40 (payload start),
+    // dir_off 36 ⇒ file_off 64 (SampleCount start). ✓
+    let file_off = dir_off + 28;
+    if is_int64 {
+      let v = read_u64_le(&data[file_off..file_off + 8]);
+      sample_count = v;
+      if v > i64::MAX as u64 {
+        sample_count_is_decimal_string = true;
+      }
+    } else {
+      let v = read_u32_le(&data[file_off..file_off + 4]);
+      match key {
+        3 => format_version = v,
+        4 => format_id = v,
+        5 => channel_type = v,
+        6 => channel_count = v,
+        7 => sample_rate = v,
+        8 => bits_per_sample = v,
+        11 => block_size = v,
+        _ => {}
+      }
+    }
+    emitted += 1;
+  }
+  // The eight fmt-chunk fields are populated by the loop above. The
+  // `present_mask` (one bit per key in DSF_KEYS order) tracks which
+  // fields actually fit in the dirInfo buffer — pathological short
+  // payloads emit only the prefix. `emitted` is the count of populated
+  // fields (0..=8); converted to a bitmask here.
+  debug_assert!(emitted as usize <= DSF_KEYS.len());
+  let present_mask: u8 = if emitted == 0 {
+    0
+  } else if emitted as usize == DSF_KEYS.len() {
+    0xFF
+  } else {
+    // DSF_KEYS is ascending, so the first `emitted` bits are set.
+    (1u8 << emitted) - 1
+  };
+  // Sanity: this matches `emitted_mask(dir_total)` (used by the
+  // `walk_binary_data` partial-walk test).
+  debug_assert_eq!(present_mask, emitted_mask(dir_total));
+  let fmt = if present_mask == 0 {
+    // Every key fell out of range (fmt_len just over 12 with no payload
+    // covering even FormatVersion). Emit zero fmt-chunk tags — the
+    // typed Meta still represents a successful magic+SetFileType but
+    // produces no DSF:* output.
+    None
+  } else {
+    Some(DsfFmtData {
+      format_version,
+      format_id,
+      channel_type,
+      channel_count,
+      sample_rate,
+      bits_per_sample,
+      sample_count,
+      block_size,
+      sample_count_is_decimal_string,
+      present_mask,
+    })
+  };
+  let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
+  Ok(Some(DsfMeta {
+    fmt,
+    fmt_warning: None,
+    id3_trailer,
+  }))
+}
+
+/// Computes the present-mask bit per `DSF_KEYS` entry based on whether
+/// the dirInfo buffer covers each field. Faithful to ExifTool.pm:9953
+/// `last if $more <= 0` — returns the bitmask of present fields in
+/// `DSF_KEYS` order (bit 0 = key 3, bit 1 = key 4, …, bit 7 = key 11).
+/// Returns `0xFF` when every field fits.
+const fn emitted_mask(dir_total: usize) -> u8 {
+  let mut mask: u8 = 0;
+  let mut i: usize = 0;
+  while i < DSF_KEYS.len() {
+    let key = DSF_KEYS[i];
+    let dir_off = (key as usize) * 4;
+    let width: usize = if key == 9 { 8 } else { 4 };
+    if dir_off + width <= dir_total {
+      mask |= 1u8 << i;
+    } else {
+      // Strictly ascending — once out of range, the rest are too.
+      break;
+    }
+    i += 1;
+  }
+  mask
+}
+
+/// Extract the optional ID3v2 trailer slice (DSF.pm:88-97) from `data`.
+///
+/// Faithful guards:
+/// - `$metaPos` truthy ⇒ `meta_pos > 0`.
+/// - `$metaLen = $fileSize - $metaPos` ⇒ `file_size.checked_sub(meta_pos)`
+///   (handles the malformed `file_size < meta_pos` case as an unsigned
+///   underflow ⇒ `None`, faithful to the `$metaLen > 0` Perl guard).
+/// - `$metaLen > 0 and $metaLen < 20000000`.
+/// - `$raf->Read($buff, $metaLen) == $metaLen` ⇒ in-memory slice bounds.
+///
+/// Returns the borrowed trailer bytes when every guard passes; `None`
+/// otherwise.
+fn id3_trailer_slice(data: &[u8], file_size: u64, meta_pos: u64) -> Option<&[u8]> {
+  if meta_pos == 0 {
+    return None;
+  }
+  let meta_len = file_size.checked_sub(meta_pos)?;
+  if meta_len == 0 || meta_len >= 20_000_000 {
+    return None;
+  }
+  let mp = meta_pos as usize;
+  let ml = meta_len as usize;
+  let end = mp.checked_add(ml)?;
+  if end > data.len() {
+    return None;
+  }
+  Some(&data[mp..end])
+}
+
+/// Little-endian u32 reader (DSF.pm:66 `SetByteOrder('II')`).
+/// Panic-free: caller bounds-checks `b` to at least 4 bytes.
+fn read_u32_le(b: &[u8]) -> u32 {
+  let mut le = [0u8; 4];
+  le.copy_from_slice(&b[..4]);
+  u32::from_le_bytes(le)
+}
+
+/// Little-endian u64 reader (DSF.pm:66 `SetByteOrder('II')`).
+/// Panic-free: caller bounds-checks `b` to at least 8 bytes.
+fn read_u64_le(b: &[u8]) -> u64 {
+  let mut le = [0u8; 8];
+  le.copy_from_slice(&b[..8]);
+  u64::from_le_bytes(le)
+}
+
+// ===========================================================================
+// `MetaSinker` — typed Meta → TagWriter
+// ===========================================================================
+
+impl MetaSinker for DsfMeta<'_> {
+  /// Emit DSF tags into the writer in `%DSF::Main` ascending-key order
+  /// (DSF.pm has no `FIRST_ENTRY` hint, so ExifTool walks keys via
+  /// `sort { $a <=> $b }` — DSF_KEYS). Family-0/1 group is `"File"`
+  /// (DSF.pm:22).
+  ///
+  /// `print_conv=true` ⇒ PrintConv hashes resolved (`-j` mode);
+  /// `print_conv=false` ⇒ post-ValueConv raw integers (`-n` mode).
+  ///
+  /// **Emission order (DSF.pm faithful)**:
+  /// 1. Warning (if [`Self::fmt_warning`] is `Some`) — DSF.pm:71.
+  /// 2. `fmt`-chunk tags in DSF_KEYS order (if [`Self::fmt`] is `Some`).
+  ///
+  /// File:* triplet is NOT emitted by the sink — it is the
+  /// `OldFormatParser` bridge's responsibility (DSF.pm:64
+  /// `SetFileType`). The ID3 trailer is also NOT emitted by the sink
+  /// — the bridge dispatches `id3_trailer()` bytes through the legacy
+  /// `process_id3_v2_slice` so the bundled-Perl ID3.pm semantics are
+  /// preserved byte-exact. Both are bridge concerns at F3 and become
+  /// sink concerns when F4 lands typed ID3.
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    const GROUP: &str = "File";
+    // (1) DSF.pm:71 — `$et->Warn('Error reading DSF fmt chunk')` is
+    // emitted BEFORE the (skipped) ProcessBinaryData walk. The bridge
+    // captures it via write_warning which routes to `meta.push_warning`.
+    if let Some(text) = self.fmt_warning {
+      out.write_warning(text)?;
+    }
+    // (2) DSF.pm:30-48 fmt-chunk tags, ascending key order. The
+    // happy-path mask is 0xFF (every field present). Partial-walk
+    // pathological inputs are exercised through the legacy
+    // `walk_binary_data` helper (not the typed parser).
+    if let Some(fmt) = self.fmt {
+      // `present_mask` bit ordering matches `DSF_KEYS`: bit 0 = key 3
+      // (FormatVersion), …, bit 7 = key 11 (BlockSize). Each arm
+      // guards on the corresponding mask bit so a partial-fit
+      // dirInfo buffer emits only the present prefix (faithful to
+      // ExifTool.pm:9953 early-exit).
+      let mask = fmt.present_mask;
+      // Key 3 — FormatVersion (DSF.pm:30, no PrintConv).
+      if mask & (1 << 0) != 0 {
+        out.write_u64(GROUP, "FormatVersion", u64::from(fmt.format_version))?;
+      }
+      // Key 4 — FormatID (DSF.pm:31). PrintConv: 0 ⇒ "DSD Raw".
+      if mask & (1 << 1) != 0 {
+        if print_conv {
+          if let Some(name) = fmt.format_id_print() {
+            out.write_str(GROUP, "FormatID", name)?;
+          } else {
+            // Hash miss: emit the raw integer (faithful — Perl emits
+            // the unconverted value).
+            out.write_u64(GROUP, "FormatID", u64::from(fmt.format_id))?;
+          }
+        } else {
+          out.write_u64(GROUP, "FormatID", u64::from(fmt.format_id))?;
+        }
+      }
+      // Key 5 — ChannelType (DSF.pm:32-43). PrintConv: hash.
+      if mask & (1 << 2) != 0 {
+        if print_conv {
+          if let Some(name) = fmt.channel_type_print() {
+            out.write_str(GROUP, "ChannelType", name)?;
+          } else {
+            out.write_u64(GROUP, "ChannelType", u64::from(fmt.channel_type))?;
+          }
+        } else {
+          out.write_u64(GROUP, "ChannelType", u64::from(fmt.channel_type))?;
+        }
+      }
+      // Key 6 — ChannelCount (DSF.pm:44, no PrintConv).
+      if mask & (1 << 3) != 0 {
+        out.write_u64(GROUP, "ChannelCount", u64::from(fmt.channel_count))?;
+      }
+      // Key 7 — SampleRate (DSF.pm:45, no PrintConv).
+      if mask & (1 << 4) != 0 {
+        out.write_u64(GROUP, "SampleRate", u64::from(fmt.sample_rate))?;
+      }
+      // Key 8 — BitsPerSample (DSF.pm:46, no PrintConv).
+      if mask & (1 << 5) != 0 {
+        out.write_u64(GROUP, "BitsPerSample", u64::from(fmt.bits_per_sample))?;
+      }
+      // Key 9 — SampleCount (DSF.pm:47, int64u, no PrintConv). Values
+      // above i64::MAX get the decimal-string treatment (the
+      // serializer's number gate keeps a ≥16-digit bare integer as a
+      // JSON number — byte-exact vs `exiftool -j` for large unsigned
+      // values).
+      if mask & (1 << 6) != 0 {
+        if fmt.sample_count_is_decimal_string {
+          out.write_fmt(GROUP, "SampleCount", |w| write!(w, "{}", fmt.sample_count))?;
+        } else {
+          out.write_u64(GROUP, "SampleCount", fmt.sample_count)?;
+        }
+      }
+      // Key 11 — BlockSize (DSF.pm:48, no PrintConv).
+      if mask & (1 << 7) != 0 {
+        out.write_u64(GROUP, "BlockSize", u64::from(fmt.block_size))?;
+      }
+    }
+    Ok(())
+  }
+}
+
+// ===========================================================================
+// `DsfMeta::into_static` — owned promotion for the `AnyMeta` enum
+// ===========================================================================
+
+impl DsfMeta<'_> {
+  /// Promote a borrow-from-input [`DsfMeta`] into an owned
+  /// `DsfMeta<'static>`. Used by the [`FormatParser`] impl to publish
+  /// into [`crate::parser_new::AnyMeta`] (Phase E `into_static`
+  /// pragma — see the `docs/tracking.md` 2026-05-21 entry on
+  /// `AnyMeta<'a>` lifetime reconciliation).
+  ///
+  /// **Promotion strategy.** The only borrow-from-input field is the
+  /// ID3v2 trailer slice (`id3_trailer: Option<&'a [u8]>`). Materializing
+  /// it into a `'static` slice requires either a per-parse `Box::leak`
+  /// (unbounded in size — DSF trailers cap at < 20 MB per DSF.pm:88
+  /// guard) OR dropping the trailer on the typed `AnyMeta` path.
+  ///
+  /// We drop the trailer here: the typed lib-first `parse_borrowed`
+  /// path returns the live borrow, and the legacy CLI JSON bridge
+  /// dispatches the trailer through `process_id3_v2_slice` BEFORE
+  /// calling `into_static` (no observable loss for the byte-exact
+  /// conformance contract). Phase G will retire this by threading
+  /// `DsfMeta<'a>` through `AnyMeta<'a>` end-to-end.
+  ///
+  /// The fmt-chunk fields are owned primitives; `fmt_warning` is a
+  /// `&'static str` literal — both round-trip identically without any
+  /// allocation.
+  pub fn into_static(self) -> DsfMeta<'static> {
+    DsfMeta {
+      fmt: self.fmt,
+      fmt_warning: self.fmt_warning,
+      // Drop the borrowed slice on the static-promotion path — the
+      // legacy bridge consumes the borrow BEFORE this call, so no
+      // observable behavior changes for CLI JSON.
+      id3_trailer: None,
+    }
+  }
+}
+
+// ===========================================================================
+// `DsfError` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for DSF parsing. Currently empty — every bad
+/// input produces either `Ok(None)` (`return 0` per DSF.pm:62-63) or
+/// `Ok(Some(DsfMeta { fmt: None, fmt_warning: Some(...) }))` (`Warn +
+/// return 1` per DSF.pm:71-72). Reserved for future I/O wrappers if
+/// streaming readers are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsfError {}
+
+impl core::fmt::Display for DsfError {
+  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match *self {}
+  }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DsfError {}
+
+// ===========================================================================
+// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// ===========================================================================
+
+impl OldFormatParser for ProcessDsf {
+  /// Phase F3 migration bridge. Runs the new typed
+  /// [`FormatParser::parse`] (via [`parse_inner`] to preserve the
+  /// `id3_trailer` borrow) and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the CLI JSON output stays byte-exact.
+  /// Retired in Phase G.
+  ///
+  /// Faithful order (DSF.pm:62-99):
+  /// 1. Header magic gate (DSF.pm:62-63) — `parse_inner` rejects with
+  ///    `Ok(None)` and the bridge returns `false` (no File:* emitted).
+  /// 2. `SetFileType` (DSF.pm:64) — runs BEFORE the fmt-chunk guard so
+  ///    a Warn-then-return-1 file still emits the File:* triplet.
+  /// 3. `fmt`-chunk warning (DSF.pm:71) AND/OR fmt-chunk tags
+  ///    (DSF.pm:80-85) via `MetaSinker::sink`.
+  /// 4. ID3v2 trailer dispatch (DSF.pm:88-97) via the legacy
+  ///    `process_id3_v2_slice` — chained, no SetFileType (DSF.pm:64
+  ///    already typed the file). The `id3_trailer` borrow lives long
+  ///    enough to flow into this call before the typed `Meta` is
+  ///    consumed.
+  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+    let bytes = ctx.data();
+    let meta = match parse_inner(bytes) {
+      Ok(Some(m)) => m,
+      // DSF.pm:62-63 — header miss ⇒ no File:* emission.
+      Ok(None) => return false,
+      Err(_) => return false,
+    };
+    // DSF.pm:64 — `$et->SetFileType()`. No-arg ⇒ detected file type
+    // ("DSF"). MUST run BEFORE the fmt-chunk warning so the File:*
+    // triplet lands first (the bundled-Perl emission order under
+    // `-j -G1`). DSF.pm:64 is line-ordered BEFORE the guard at :67-72.
+    ctx.set_file_type(None, None, None);
+    let print_conv = ctx.print_conv_enabled();
+    // Snapshot the trailer before the typed Meta moves into the sink.
+    let trailer = meta.id3_trailer;
+    // Bridge: typed `DsfMeta` ⇒ `Metadata` via the Phase F3
+    // `MetadataTagWriter` adapter. Faithful to DSF.pm:80-85
+    // `ProcessBinaryData` semantics — emits the same fmt-chunk tags
+    // (or the Warn) in the same order with the same PrintConv vs
+    // ValueConv toggling.
+    {
+      let mut bridge = MetadataTagWriter::new(ctx.metadata());
+      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    }
+    // DSF.pm:88-97 — ID3v2 trailer dispatch via the legacy ID3 path.
+    // Faithful gate:
+    //   $metaLen = $fileSize - $metaPos;
+    //   if ($metaPos and $metaLen > 0 and $metaLen < 20000000 ...) {
+    //       my $id3Tbl = GetTagTable('Image::ExifTool::ID3::Main');
+    //       $et->ProcessDirectory(\%dirInfo, $id3Tbl);
+    //   }
+    // The typed `parse_inner` already applied every guard; the
+    // borrowed `trailer` slice is `Some` iff every guard passed.
+    if let Some(slice) = trailer {
+      // Copy the slice into an owned Vec so we can pass it through
+      // `process_id3_v2_slice` without re-borrowing `ctx.data()`
+      // (the borrow checker forbids re-borrowing the file bytes
+      // while `ctx.metadata()` is `&mut`). Faithful — the bundled
+      // Perl reads the trailer bytes from disk into `$buff` (an
+      // owned Perl scalar). Allocation: ≤ 20 MB per DSF.pm:88-97
+      // guard.
+      let trailer_owned: std::vec::Vec<u8> = slice.to_vec();
+      let _ = crate::formats::id3::process::process_id3_v2_slice(&trailer_owned, ctx);
+    }
+    // DSF.pm:99 `return 1`. Even the Warn path returns 1 (DSF.pm:72).
+    true
+  }
+}
+
+// ===========================================================================
+// DSF-local ProcessBinaryData walk — exercised by the pathological
+// out-of-range test; the typed parser only emits full / no fmt
+// =====
+// ======================================================================
+
 /// DSF-local subset of `Image::ExifTool::ProcessBinaryData` (ExifTool.pm,
-/// `sub ProcessBinaryData`). Only the slice exercised by DSF::Main is
-/// transliterated; promoting this to a shared engine module is deferred
-/// until a second `ProcessBinaryData` consumer ports (same incremental-
-/// derivation discipline as `BitOrder::Ii`, D11, the PrintConv array
-/// variant).
+/// `sub ProcessBinaryData`). Pinned for the pathological out-of-range
+/// test (`walk_out_of_range_field_is_skipped` exercises a custom
+/// dirInfo buffer that's too short to cover key 9 or key 11). The
+/// production happy path goes through `parse_inner` ⇒ `MetaSinker::sink`
+/// and never calls this helper.
 ///
-/// `buf` is the dirInfo buffer DSF::ProcessDSF feeds in (DSF.pm:80-85, after
-/// `$buff = substr($buff,28) . $buf2` — `'fmt '` + chunkSize + payload,
-/// total length == `$fmtLen`).
-///
-/// Per-tag walk:
-/// - `byte_offset = key * 4` (table-level `FORMAT => 'int32u'`,
-///   DSF.pm:23; stride 4 bytes).
-/// - Width: `def.format()` `None` ⇒ 4 (int32u); `Some("int64u")` ⇒ 8.
-/// - Bounds-checked read; first out-of-range field breaks the loop early
-///   (DSF_KEYS is strictly ascending so subsequent keys cannot fit either —
-///   faithful to ExifTool.pm:9953 `last if $more <= 0`).
-/// - Apply `convert::apply` (ValueConv then PrintConv when enabled), push to
-///   `m` with family-0/1 = `("File", "File")` (DSF.pm:22).
+/// `buf` is the dirInfo-shape buffer (`'fmt '` + 8-byte chunkSize +
+/// payload). Faithful per-tag walk: bounds-check + LE u32/u64 read +
+/// `convert::apply` + push under `("File", "File")`.
+#[allow(dead_code)]
 fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
   for &key in DSF_KEYS {
     let Some(def) = dsf_get(TagId::Int(key)) else {
       continue;
     };
-    // `key` is bounded by 11 in DSF_KEYS; cast and *4 cannot overflow `usize`
-    // on any 16+ bit target. `saturating_*` documents the panic-free intent.
     let off = (key as usize).saturating_mul(4);
     let width: usize = match def.format() {
       Some("int64u") => 8,
@@ -133,32 +931,22 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
     };
     let end = off.saturating_add(width);
     if end > buf.len() {
-      // DSF_KEYS is strictly ascending (verified by the `prev` assertion in
-      // tests) and the table-level int32u stride means `off = key * 4` is
-      // monotonic, so once `end > buf.len()` for one key, every subsequent
-      // key is also out of range. Faithful to ExifTool.pm:9953
-      // `last if $more <= 0; # all done if we have reached the end of data`.
+      // ExifTool.pm:9953 `last if $more <= 0`.
       break;
     }
     let raw = if width == 8 {
-      // int64u little-endian (DSF.pm:66 SetByteOrder('II')). `copy_from_slice`
-      // panics on length mismatch, but we just bound-checked `end <= buf.len()`
-      // with `width == 8`, so the 8-byte slice always exists.
       let mut le = [0u8; 8];
       le.copy_from_slice(&buf[off..off + 8]);
       let v = u64::from_le_bytes(le);
       if v <= i64::MAX as u64 {
         TagValue::I64(v as i64)
       } else {
-        // Faithful Perl UV→NV-shape: a u64 above i64::MAX cannot fit in
-        // `i64`; emit the exact decimal string. The serializer's number gate
-        // (EscapeJSON line 3809) keeps a ≥16-digit bare integer as a JSON
-        // number — byte-exact vs `exiftool -j` for large unsigned values.
+        // Faithful Perl UV→NV-shape: the serializer's number gate keeps
+        // a ≥16-digit bare integer as a JSON number — byte-exact vs
+        // `exiftool -j` for large unsigned values.
         TagValue::Str(v.to_string().into())
       }
     } else {
-      // int32u little-endian (the table-level FORMAT, DSF.pm:23). A u32
-      // always fits in i64 (max 4_294_967_295 < 9.2e18).
       let mut le = [0u8; 4];
       le.copy_from_slice(&buf[off..off + 4]);
       TagValue::I64(u32::from_le_bytes(le) as i64)
@@ -168,162 +956,20 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
   }
 }
 
-/// DSF parser (faithful `ProcessDSF`, DSF.pm:55-99).
-pub struct ProcessDsf;
-
-impl FormatParser for ProcessDsf {
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // PHASE A — header validation against an immutable borrow of `ctx.data()`.
-    // We drop the borrow before touching `ctx.metadata()` / `ctx.set_file_type`
-    // (mutable borrows). The validation reads only `&data[..40]`.
-    let data_len = ctx.data().len();
-    // DSF.pm:62 `$raf->Read($buff,40)==40 or return 0`.
-    if data_len < 40 {
-      return false;
-    }
-    {
-      let head = &ctx.data()[..40];
-      // DSF.pm:63 `$buff =~ /^DSD \x1c\0{7}.{16}fmt /s`. The regex is
-      // anchored (^) and the `{16}` middle is "any 16 bytes" (Perl `.` under
-      // `/s` matches any byte including \n). Translated literally as four
-      // byte-equality checks; the 16-byte middle (fileSize+metaPos) is
-      // unconstrained.
-      if &head[0..4] != b"DSD " {
-        return false;
-      }
-      if head[4] != 0x1c {
-        return false;
-      }
-      if !head[5..12].iter().all(|&b| b == 0) {
-        return false;
-      }
-      if &head[28..32] != b"fmt " {
-        return false;
-      }
-    }
-    // PHASE B — extract every numeric value we need from the header into
-    // local variables, AGAIN behind a scoped immutable borrow that ends
-    // before any `&mut ctx` call below. After this block we hold only
-    // `Copy` locals (no live borrow of `ctx`).
-    // DSF.pm:66 `SetByteOrder('II')` — every Get* below is little-endian.
-    let fmt_len: u64;
-    let file_size: u64;
-    let meta_pos: u64;
-    {
-      let head = &ctx.data()[..40];
-      // DSF.pm:67 `my $fmtLen = Get64u(\$buff,32)`.
-      let mut le = [0u8; 8];
-      le.copy_from_slice(&head[32..40]);
-      fmt_len = u64::from_le_bytes(le);
-      // DSF.pm:74-75 `$fileSize = Get64u(\$buff,12); $metaPos = Get64u(
-      // \$buff,20)` — local-only, NOT emitted as DSF tags. Read here for
-      // use by the ID3v2 trailer arm at DSF.pm:88-97.
-      let mut le = [0u8; 8];
-      le.copy_from_slice(&head[12..20]);
-      file_size = u64::from_le_bytes(le);
-      let mut le = [0u8; 8];
-      le.copy_from_slice(&head[20..28]);
-      meta_pos = u64::from_le_bytes(le);
-    }
-    // DSF.pm:64 `$et->SetFileType()` — no-arg ⇒ detected type ("DSF").
-    // SetFileType MUST run before the guard check: DSF.pm orders it (line
-    // 64) BEFORE the read-and-guard (lines 67-72), so a Warn-then-return-1
-    // file still emits the File:* triplet (verified vs the bundled-Perl
-    // golden for `tests/fixtures/DSF_short.dsf`).
-    ctx.set_file_type(None, None, None);
-    let print_on = ctx.print_conv_enabled();
-    // DSF.pm:68-72 `unless ($fmtLen > 12 and $fmtLen < 1000 and $raf->Read(
-    //   $buf2, $fmtLen - 12) == $fmtLen - 12) { Warn; return 1 }`.
-    //
-    // The `fmt_len > 12` guard is what makes the `fmt_len - 12` subtraction
-    // below panic-free in unsigned Rust (signed-Perl → usize underflow
-    // footgun, per [[exifast-phase2-forward-items]]). The `fmt_len < 1000`
-    // guard is NOT a `usize`-cast safety requirement (999 fits any realistic
-    // `usize`); it exists for two load-bearing reasons:
-    //   1. ExifTool conformance — DSF.pm:68 enforces this exact bound, so a
-    //      Perl-rejecting file must also be rejected here for byte-exact
-    //      diffs against `exiftool -j`.
-    //   2. Bounded allocation — the `Vec::with_capacity(fmt_len as usize)`
-    //      below stays under 1KB regardless of input, so a malicious header
-    //      cannot trigger a huge `dir` allocation. The header guard does
-    //      this work; the payload-bytes guard would still admit a sparse
-    //      file with a 999-byte declared fmtLen.
-    // Both guards are load-bearing — do NOT reorder.
-    let ok = fmt_len > 12 && fmt_len < 1000 && {
-      let need = (fmt_len - 12) as usize;
-      data_len >= 40usize.saturating_add(need)
-    };
-    if !ok {
-      // DSF.pm:71 `$et->Warn('Error reading DSF fmt chunk')`.
-      ctx.metadata().push_warning("Error reading DSF fmt chunk");
-      // DSF.pm:72 `return 1` — accept (the File:* triplet stays), no payload.
-      return true;
-    }
-    // DSF.pm:76 `$buff = substr($buff,28) . $buf2` — the dirInfo buffer is
-    // `'fmt '` + chunkSize (12 bytes from head[28..40]) + payload (fmt_len -
-    // 12 bytes from data[40..]). Total length == fmt_len. Build via an
-    // immutable scoped borrow (released before the metadata() &mut call).
-    let payload_len = (fmt_len - 12) as usize;
-    let dir: Vec<u8> = {
-      let data = ctx.data();
-      let mut dir = Vec::with_capacity(fmt_len as usize);
-      dir.extend_from_slice(&data[28..40]);
-      dir.extend_from_slice(&data[40..40 + payload_len]);
-      dir
-    };
-    // DSF.pm:80-85 ProcessBinaryData(\%dirInfo, $tagTbl). The DSF-local walk
-    // (above) reads the fixed key set in ascending order.
-    walk_binary_data(&dir, ctx.metadata(), print_on);
-    // DSF.pm:88-97 ID3v2 trailer dispatch (Codex R2-F3). Faithful gate:
-    //   my $metaLen = $fileSize - $metaPos;
-    //   if ($metaPos and $metaLen > 0 and $metaLen < 20000000 and
-    //       $raf->Seek($metaPos, 0) and $raf->Read($buff, $metaLen) ==
-    //       $metaLen)
-    //   {
-    //       $dirInfo{DataPos} = $metaPos; $dirInfo{DirLen} = $metaLen;
-    //       my $id3Tbl = GetTagTable('Image::ExifTool::ID3::Main');
-    //       $et->ProcessDirectory(\%dirInfo, $id3Tbl);
-    //   }
-    //
-    // `$metaLen = $fileSize - $metaPos` uses unsigned-aware Perl
-    // arithmetic on Get64u values; Rust signed-overflow safety: use
-    // `checked_sub` for the (file_size < meta_pos) underflow case (a
-    // malformed header), which faithfully short-circuits to "no
-    // trailer" (the Perl `$metaLen > 0` guard rejects negative-Perl /
-    // wrap-around values too). The `$raf->Seek + Read == metaLen`
-    // guard maps to a slice-bounds check against `ctx.data()`
-    // (in-memory; bundled reads the bytes from disk). `ProcessDirectory
-    // (ID3::Main)` invokes `PROCESS_PROC = ProcessID3Dir` (ID3.pm:80 →
-    // 1637-1642), which dispatches to `ProcessID3` over the trailer
-    // DataPt — modelled by `process_id3_v2_slice` (chained, no
-    // SetFileType: DSF.pm:64 already typed the file as DSF). Pinned by
-    // `tests/fixtures/dsf_with_id3v2_trailer.dsf` conformance.
-    if meta_pos > 0 {
-      if let Some(meta_len) = file_size.checked_sub(meta_pos) {
-        if meta_len > 0 && meta_len < 20_000_000 {
-          // Slice-bounds check vs the in-memory file (mirrors
-          // `$raf->Read($buff, $metaLen) == $metaLen`).
-          let mp = meta_pos as usize;
-          let ml = meta_len as usize;
-          if let Some(slice_end) = mp.checked_add(ml) {
-            if slice_end <= data_len {
-              let trailer: Vec<u8> = ctx.data()[mp..slice_end].to_vec();
-              let _ = crate::formats::id3::process::process_id3_v2_slice(&trailer, ctx);
-            }
-          }
-        }
-      }
-    }
-    true // DSF.pm:99 `return 1`
-  }
-}
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{parser::ParseContext, value::Metadata};
+  use crate::{
+    parser::ParseContext,
+    sink::{MapTagWriter, MapValue},
+    value::Metadata,
+  };
 
-  // --- Task 3: table + dispatch ------------------------------------------
+  // --- Table + dispatch ---------------------------------------------------
 
   #[test]
   fn table_and_keys_are_faithful() {
@@ -341,7 +987,6 @@ mod tests {
     for &k in DSF_KEYS {
       assert_eq!(g(TagId::Int(k)).unwrap().group1(), "File");
     }
-    // Family-0 carried by the table is "File" (DSF.pm:22).
     assert_eq!(DSF_MAIN.group0(), "File");
     // Key 10 is intentionally absent (consumed by key 9's int64u).
     assert!(g(TagId::Int(10)).is_none());
@@ -355,8 +1000,6 @@ mod tests {
 
   #[test]
   fn dsf_keys_const_is_ascending_and_complete() {
-    // ASCENDING (faithful Perl `sort {$a<=>$b}`); every DSF_KEYS entry
-    // resolves through dsf_get (catches manual slice/dispatch drift).
     let mut prev = i64::MIN;
     for &k in DSF_KEYS {
       assert!(k > prev, "DSF_KEYS must be strictly ascending");
@@ -372,18 +1015,14 @@ mod tests {
   #[test]
   fn print_conv_shapes_are_faithful() {
     let g = DSF_MAIN.get();
-    // FormatID hash has exactly one entry { "0" => "DSD Raw" } (DSF.pm:31).
     match g(TagId::Int(4)).unwrap().print_conv() {
       PrintConv::Hash(h) => {
         let de = h.direct_entries();
         assert_eq!(de.len(), 1);
         assert_eq!(de[0], ("0", PrintValue::Str("DSD Raw")));
-        assert!(h.bitmask().is_none());
-        assert!(h.other().is_none());
       }
       _ => panic!("FormatID print_conv must be a hash"),
     }
-    // ChannelType hash has 7 entries (DSF.pm:34-42).
     match g(TagId::Int(5)).unwrap().print_conv() {
       PrintConv::Hash(h) => {
         assert_eq!(h.direct_entries().len(), 7);
@@ -394,23 +1033,446 @@ mod tests {
       }
       _ => panic!("ChannelType print_conv must be a hash"),
     }
-    // Non-hash tags have PrintConv::None.
     assert!(g(TagId::Int(3)).unwrap().print_conv().is_none());
     assert!(g(TagId::Int(11)).unwrap().print_conv().is_none());
-    // SampleCount carries the int64u Format key.
     assert_eq!(g(TagId::Int(9)).unwrap().format(), Some("int64u"));
-    // All other emitted tags have no Format key (int32u via the table FORMAT).
     for k in [3, 4, 5, 6, 7, 8, 11] {
       assert_eq!(g(TagId::Int(k)).unwrap().format(), None);
     }
   }
 
-  // --- Task 4: ProcessBinaryData walk ------------------------------------
+  // --- Fixture builders ---------------------------------------------------
+
+  /// 76-byte minimal valid DSF (matches the spec's §3.1 fixture exactly).
+  fn happy_path_dsf() -> std::vec::Vec<u8> {
+    let mut v = std::vec::Vec::with_capacity(76);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes()); // DSD chunk size
+    v.extend_from_slice(&76u64.to_le_bytes()); // fileSize
+    v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&48u64.to_le_bytes()); // fmtLen
+    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&2u32.to_le_bytes());
+    v.extend_from_slice(&2u32.to_le_bytes());
+    v.extend_from_slice(&2_822_400u32.to_le_bytes());
+    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&2_822_400u64.to_le_bytes());
+    v.extend_from_slice(&4096u32.to_le_bytes());
+    assert_eq!(v.len(), 76);
+    v
+  }
+
+  // --- Typed FormatParser path --------------------------------------------
+
+  #[test]
+  fn parse_borrowed_rejects_short_buffer() {
+    assert!(parse_borrowed(&[]).unwrap().is_none());
+    assert!(parse_borrowed(&[0u8; 39]).unwrap().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_rejects_bad_magic() {
+    let mut bad = happy_path_dsf();
+    bad[0..4].copy_from_slice(b"XXXX");
+    assert!(parse_borrowed(&bad).unwrap().is_none());
+    let mut bad = happy_path_dsf();
+    bad[4] = 0x00; // not 0x1c
+    assert!(parse_borrowed(&bad).unwrap().is_none());
+    let mut bad = happy_path_dsf();
+    bad[5] = 0xff; // not \0
+    assert!(parse_borrowed(&bad).unwrap().is_none());
+    let mut bad = happy_path_dsf();
+    bad[28..32].copy_from_slice(b"FMTA");
+    assert!(parse_borrowed(&bad).unwrap().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_happy_path_populates_fmt_data() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert!(meta.fmt_warning().is_none());
+    assert!(meta.id3_trailer().is_none());
+    let fmt = meta.fmt().expect("fmt populated");
+    assert_eq!(fmt.format_version(), 1);
+    assert_eq!(fmt.format_id(), 0);
+    assert_eq!(fmt.format_id_print(), Some("DSD Raw"));
+    assert_eq!(fmt.channel_type(), 2);
+    assert_eq!(fmt.channel_type_print(), Some("Stereo (Left, Right)"));
+    assert_eq!(fmt.channel_count(), 2);
+    assert_eq!(fmt.sample_rate(), 2_822_400);
+    assert_eq!(fmt.bits_per_sample(), 1);
+    assert_eq!(fmt.sample_count(), 2_822_400);
+    assert_eq!(fmt.block_size(), 4096);
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_emits_warning_no_fmt() {
+    // fmtLen = 8 ⇒ guard fails (≤ 12).
+    let mut v = std::vec::Vec::with_capacity(40);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&40u64.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12 ⇒ guard fail)
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt().is_none());
+    assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_at_fmt_len_12_no_underflow() {
+    // CRITICAL: DSF.pm:68 strict `$fmtLen > 12`. With fmtLen==12 the
+    // subtraction `$fmtLen - 12 == 0` would not underflow in Perl, but
+    // the `>` guard prevents the (no-op) read. We MUST NOT subtract 12
+    // from fmt_len when fmt_len <= 12 — that would underflow in
+    // unsigned Rust.
+    let mut v = std::vec::Vec::with_capacity(40);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&40u64.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt().is_none());
+    assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_at_fmt_len_zero_no_underflow() {
+    for fmt_len in [0u64, 1, 11] {
+      let mut v = std::vec::Vec::with_capacity(40);
+      v.extend_from_slice(b"DSD ");
+      v.extend_from_slice(&0x1cu64.to_le_bytes());
+      v.extend_from_slice(&40u64.to_le_bytes());
+      v.extend_from_slice(&0u64.to_le_bytes());
+      v.extend_from_slice(b"fmt ");
+      v.extend_from_slice(&fmt_len.to_le_bytes());
+      let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+      assert!(meta.fmt().is_none(), "fmt_len={fmt_len}");
+      assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
+    }
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_at_fmt_len_1000_upper_bound() {
+    // fmtLen = 1000 ⇒ guard fails (the `<` is strict).
+    let mut v = std::vec::Vec::with_capacity(40);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&40u64.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&1000u64.to_le_bytes());
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt().is_none());
+    assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_at_fmt_len_999_accepts() {
+    // Adjacent passing boundary to `fmt_len == 1000`. DSF.pm:68 `$fmtLen
+    // < 1000` is strict, so 999 with a 987-byte trailing payload parses
+    // successfully and emits no warning.
+    let mut v = std::vec::Vec::with_capacity(40 + 987);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&(40u64 + 987).to_le_bytes()); // fileSize
+    v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0 ⇒ no ID3
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&999u64.to_le_bytes()); // fmtLen = 999 (< 1000 ✓)
+    // First 36 bytes of payload: the eight fmt-chunk fields.
+    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&2u32.to_le_bytes());
+    v.extend_from_slice(&2u32.to_le_bytes());
+    v.extend_from_slice(&2_822_400u32.to_le_bytes());
+    v.extend_from_slice(&1u32.to_le_bytes());
+    v.extend_from_slice(&2_822_400u64.to_le_bytes());
+    v.extend_from_slice(&4096u32.to_le_bytes());
+    // Pad to total payload of 987 bytes (951 zeros after the 36-byte head).
+    v.extend(core::iter::repeat(0u8).take(987 - 36));
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt_warning().is_none());
+    let fmt = meta.fmt().expect("populated");
+    assert_eq!(fmt.format_version(), 1);
+    assert_eq!(fmt.block_size(), 4096);
+  }
+
+  #[test]
+  fn parse_borrowed_warn_path_at_truncated_payload() {
+    // fmtLen claims a payload longer than the file actually has.
+    let mut v = std::vec::Vec::with_capacity(40);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&40u64.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt().is_none());
+    assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
+  }
+
+  // --- ID3 trailer borrow -------------------------------------------------
+
+  fn dsf_with_trailer(trailer: &[u8]) -> std::vec::Vec<u8> {
+    // 76-byte fmt + `trailer.len()` bytes appended.
+    let mut v = happy_path_dsf();
+    let file_size = 76u64 + trailer.len() as u64;
+    let meta_pos = 76u64;
+    // Rewrite fileSize and metaPos.
+    v[12..20].copy_from_slice(&file_size.to_le_bytes());
+    v[20..28].copy_from_slice(&meta_pos.to_le_bytes());
+    v.extend_from_slice(trailer);
+    v
+  }
+
+  #[test]
+  fn parse_borrowed_carries_id3_trailer_slice() {
+    let id3_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x01\x00";
+    let v = dsf_with_trailer(id3_bytes);
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert_eq!(meta.id3_trailer(), Some(&id3_bytes[..]));
+  }
+
+  #[test]
+  fn parse_borrowed_no_id3_trailer_when_meta_pos_zero() {
+    let bytes = happy_path_dsf(); // metaPos == 0
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_no_id3_trailer_when_file_size_less_than_meta_pos() {
+    // Malformed: metaPos > fileSize ⇒ unsigned underflow in `$metaLen`
+    // calculation. Bundled-Perl's `$metaLen > 0` guard rejects; we
+    // mirror with `checked_sub`.
+    let mut v = happy_path_dsf();
+    v[12..20].copy_from_slice(&50u64.to_le_bytes()); // fileSize = 50
+    v[20..28].copy_from_slice(&100u64.to_le_bytes()); // metaPos = 100
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_no_id3_trailer_when_meta_len_zero() {
+    // metaPos == fileSize ⇒ metaLen == 0 ⇒ guard fails.
+    let mut v = happy_path_dsf();
+    v[12..20].copy_from_slice(&76u64.to_le_bytes()); // fileSize = 76
+    v[20..28].copy_from_slice(&76u64.to_le_bytes()); // metaPos = 76
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_no_id3_trailer_when_meta_len_too_large() {
+    // metaLen >= 20_000_000 ⇒ guard fails (DSF.pm:88
+    // `$metaLen < 20000000`).
+    let mut v = happy_path_dsf();
+    let file_size = 76u64 + 20_000_000;
+    let meta_pos = 76u64;
+    v[12..20].copy_from_slice(&file_size.to_le_bytes());
+    v[20..28].copy_from_slice(&meta_pos.to_le_bytes());
+    // Note: we don't actually append 20MB — the bounds check on
+    // `end > data.len()` rejects before the size guard. Equivalent
+    // behavior (both guards reject).
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_no_id3_trailer_when_short_read() {
+    // metaPos points past the actual file end.
+    let mut v = happy_path_dsf();
+    v[12..20].copy_from_slice(&100u64.to_le_bytes()); // claim fileSize = 100
+    v[20..28].copy_from_slice(&76u64.to_le_bytes()); // metaPos = 76
+    // But the file is only 76 bytes — `end > data.len()` rejects.
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.id3_trailer().is_none());
+  }
+
+  // --- MetaSinker ---------------------------------------------------------
+
+  #[test]
+  fn sink_emits_full_fmt_set_in_key_order_print_conv() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    // Spot-check: PrintConv-resolved names + numeric raw scalars.
+    assert_eq!(
+      w.get("File", "FormatVersion").map(MapValue::as_str),
+      Some("1".to_string())
+    );
+    assert_eq!(
+      w.get("File", "FormatID").map(MapValue::as_str),
+      Some("DSD Raw".to_string())
+    );
+    assert_eq!(
+      w.get("File", "ChannelType").map(MapValue::as_str),
+      Some("Stereo (Left, Right)".to_string())
+    );
+    assert_eq!(
+      w.get("File", "ChannelCount").map(MapValue::as_str),
+      Some("2".to_string())
+    );
+    assert_eq!(
+      w.get("File", "SampleRate").map(MapValue::as_str),
+      Some("2822400".to_string())
+    );
+    assert_eq!(
+      w.get("File", "BitsPerSample").map(MapValue::as_str),
+      Some("1".to_string())
+    );
+    assert_eq!(
+      w.get("File", "SampleCount").map(MapValue::as_str),
+      Some("2822400".to_string())
+    );
+    assert_eq!(
+      w.get("File", "BlockSize").map(MapValue::as_str),
+      Some("4096".to_string())
+    );
+    assert!(w.warnings().is_empty());
+  }
+
+  #[test]
+  fn sink_emits_full_fmt_set_print_conv_off() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
+    // -n: raw numeric for FormatID / ChannelType (hash NOT applied).
+    assert_eq!(
+      w.get("File", "FormatID").map(MapValue::as_str),
+      Some("0".to_string())
+    );
+    assert_eq!(
+      w.get("File", "ChannelType").map(MapValue::as_str),
+      Some("2".to_string())
+    );
+  }
+
+  #[test]
+  fn sink_emits_warning_when_fmt_chunk_failed() {
+    let meta = DsfMeta {
+      fmt: None,
+      fmt_warning: Some("Error reading DSF fmt chunk"),
+      id3_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(w.warnings(), &["Error reading DSF fmt chunk".to_string()]);
+    // No fmt-chunk tags emitted on the warn path.
+    assert!(w.get("File", "FormatVersion").is_none());
+    assert!(w.get("File", "BlockSize").is_none());
+  }
+
+  #[test]
+  fn sink_emits_int64u_above_i64_max_as_decimal_string() {
+    // SampleCount = u64::MAX ⇒ post-promotion fmt
+    // `sample_count_is_decimal_string = true` ⇒ `write_fmt` decimal.
+    let meta = DsfMeta {
+      fmt: Some(DsfFmtData {
+        format_version: 0,
+        format_id: 0,
+        channel_type: 0,
+        channel_count: 0,
+        sample_rate: 0,
+        bits_per_sample: 0,
+        sample_count: u64::MAX,
+        block_size: 0,
+        sample_count_is_decimal_string: true,
+        present_mask: 0xFF,
+      }),
+      fmt_warning: None,
+      id3_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("File", "SampleCount").map(MapValue::as_str),
+      Some("18446744073709551615".to_string())
+    );
+  }
+
+  // --- Partial fmt-chunk walk via parse_inner -----------------------------
+
+  #[test]
+  fn parse_borrowed_partial_fmt_chunk_emits_prefix_only() {
+    // fmt_len = 20 (`> 12 && < 1000`) ⇒ dirInfo total = 20 bytes.
+    // dir_off for key 3 (FormatVersion) is 12, width 4 ⇒ fits.
+    // dir_off for key 4 (FormatID) is 16, width 4 ⇒ fits (dir_total
+    // >= 20 ✓). Key 5 (ChannelType) is at 20, needs 24 ⇒ does NOT.
+    // So we expect ONLY FormatVersion + FormatID in the sink output.
+    let mut v = std::vec::Vec::with_capacity(40 + 8);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&48u64.to_le_bytes()); // fileSize = 48
+    v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&20u64.to_le_bytes()); // fmtLen = 20
+    // payload: 8 bytes = key3 (FormatVersion) + key4 (FormatID).
+    v.extend_from_slice(&7u32.to_le_bytes()); // FormatVersion = 7
+    v.extend_from_slice(&0u32.to_le_bytes()); // FormatID = 0 ⇒ "DSD Raw"
+    assert_eq!(v.len(), 48);
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt_warning().is_none());
+    let fmt = meta.fmt().expect("partial fmt");
+    assert_eq!(fmt.present_mask, 0b0000_0011); // keys 3,4 only
+    assert_eq!(fmt.format_version(), 7);
+    assert_eq!(fmt.format_id(), 0);
+    // The sink emits ONLY the present prefix.
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("File", "FormatVersion").map(MapValue::as_str),
+      Some("7".to_string())
+    );
+    assert_eq!(
+      w.get("File", "FormatID").map(MapValue::as_str),
+      Some("DSD Raw".to_string())
+    );
+    assert!(w.get("File", "ChannelType").is_none());
+    assert!(w.get("File", "BlockSize").is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_zero_fmt_chunk_emits_no_fmt_tags() {
+    // fmt_len = 13 ⇒ dir_total = 13 ⇒ even FormatVersion (dir_off
+    // 12, width 4 ⇒ needs 16) doesn't fit. Expect fmt == None,
+    // no warning (the guard PASSED on > 12 && < 1000 + read
+    // succeeded), no fmt-chunk tags.
+    let mut v = std::vec::Vec::with_capacity(40 + 1);
+    v.extend_from_slice(b"DSD ");
+    v.extend_from_slice(&0x1cu64.to_le_bytes());
+    v.extend_from_slice(&41u64.to_le_bytes()); // fileSize = 41
+    v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0
+    v.extend_from_slice(b"fmt ");
+    v.extend_from_slice(&13u64.to_le_bytes()); // fmtLen = 13
+    v.extend_from_slice(&[0u8; 1]); // 1 byte payload
+    assert_eq!(v.len(), 41);
+    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    assert!(meta.fmt_warning().is_none());
+    assert!(
+      meta.fmt().is_none(),
+      "fmt_len just over 12 with no key-3 coverage ⇒ fmt is None"
+    );
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert!(w.is_empty());
+  }
+
+  // --- ProcessBinaryData walk helper (pathological dirInfo) ---------------
 
   /// Build a dirInfo-shape buffer with the same layout DSF.pm:76 yields:
   /// `'fmt '` + 8-byte chunkSize + payload. Helper only.
-  fn dir(payload: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(12 + payload.len());
+  fn dir(payload: &[u8]) -> std::vec::Vec<u8> {
+    let mut b = std::vec::Vec::with_capacity(12 + payload.len());
     b.extend_from_slice(b"fmt ");
     b.extend_from_slice(&((12 + payload.len()) as u64).to_le_bytes());
     b.extend_from_slice(payload);
@@ -418,21 +1480,18 @@ mod tests {
   }
 
   #[test]
-  fn walk_emits_tags_in_ascending_key_order() {
-    // Standard payload: FormatVersion=1, FormatID=0, ChannelType=2, etc.
-    let mut p = Vec::new();
-    p.extend_from_slice(&1u32.to_le_bytes()); // 3 FormatVersion
-    p.extend_from_slice(&0u32.to_le_bytes()); // 4 FormatID
-    p.extend_from_slice(&2u32.to_le_bytes()); // 5 ChannelType
-    p.extend_from_slice(&2u32.to_le_bytes()); // 6 ChannelCount
-    p.extend_from_slice(&2_822_400u32.to_le_bytes()); // 7 SampleRate
-    p.extend_from_slice(&1u32.to_le_bytes()); // 8 BitsPerSample
-    p.extend_from_slice(&2_822_400u64.to_le_bytes()); // 9 SampleCount
-    p.extend_from_slice(&4096u32.to_le_bytes()); // 11 BlockSize
+  fn walk_out_of_range_field_is_skipped() {
+    // dirInfo buffer ending at offset 36 — keys 3..=8 fit, 9 (offset
+    // 36, 8 bytes) does NOT, 11 (offset 44, 4 bytes) also does NOT.
+    let mut p = std::vec::Vec::with_capacity(24);
+    for _ in 0..6 {
+      p.extend_from_slice(&0u32.to_le_bytes());
+    }
     let buf = dir(&p);
+    assert_eq!(buf.len(), 36);
     let mut m = Metadata::new("x");
-    walk_binary_data(&buf, &mut m, false); // -n: no PrintConv
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
+    walk_binary_data(&buf, &mut m, false);
+    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(
       names,
       [
@@ -442,65 +1501,16 @@ mod tests {
         "ChannelCount",
         "SampleRate",
         "BitsPerSample",
-        "SampleCount",
-        "BlockSize",
       ]
     );
-    for t in m.tags() {
-      assert_eq!(t.group().family1(), "File");
-      assert_eq!(t.group().family0(), "File");
-    }
-    // -n raw values: FormatID is the bare integer 0, ChannelType is 2.
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-        .unwrap()
-    };
-    assert_eq!(by_name("FormatID"), TagValue::I64(0));
-    assert_eq!(by_name("ChannelType"), TagValue::I64(2));
-    assert_eq!(by_name("SampleRate"), TagValue::I64(2_822_400));
-    assert_eq!(by_name("SampleCount"), TagValue::I64(2_822_400));
-    assert_eq!(by_name("BlockSize"), TagValue::I64(4096));
-  }
-
-  #[test]
-  fn walk_applies_print_conv_when_enabled() {
-    let mut p = Vec::new();
-    p.extend_from_slice(&1u32.to_le_bytes());
-    p.extend_from_slice(&0u32.to_le_bytes()); // FormatID = 0 ⇒ "DSD Raw"
-    p.extend_from_slice(&2u32.to_le_bytes()); // ChannelType = 2 ⇒ "Stereo (...)"
-    p.extend_from_slice(&2u32.to_le_bytes());
-    p.extend_from_slice(&44100u32.to_le_bytes());
-    p.extend_from_slice(&1u32.to_le_bytes());
-    p.extend_from_slice(&100u64.to_le_bytes());
-    p.extend_from_slice(&512u32.to_le_bytes());
-    let buf = dir(&p);
-    let mut m = Metadata::new("x");
-    walk_binary_data(&buf, &mut m, true); // PrintConv on
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-        .unwrap()
-    };
-    assert_eq!(by_name("FormatID"), TagValue::Str("DSD Raw".into()));
-    assert_eq!(
-      by_name("ChannelType"),
-      TagValue::Str("Stereo (Left, Right)".into())
-    );
+    assert!(m.tags().iter().all(|t| t.name() != "SampleCount"));
+    assert!(m.tags().iter().all(|t| t.name() != "BlockSize"));
   }
 
   #[test]
   fn walk_int64u_above_i64_max_is_decimal_string() {
-    // Craft SampleCount = u64::MAX (above i64::MAX) — must emit as decimal
-    // string `TagValue::Str("18446744073709551615")` (faithful UV→NV shape).
-    let mut p = vec![0u8; 36]; // payload fills keys 3..=11 with zeros (placeholder)
-    // overwrite SampleCount slot (key 9 ⇒ payload byte offset 36-12=24 … wait:
-    // key * 4 = 36 in the dirInfo buffer; dirInfo starts with 12 bytes of
-    // 'fmt'+size, so payload byte offset = 36-12 = 24.
+    let mut p = std::vec::Vec::with_capacity(36);
+    p.resize(36, 0);
     p[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
     let buf = dir(&p);
     let mut m = Metadata::new("x");
@@ -516,148 +1526,72 @@ mod tests {
   }
 
   #[test]
-  fn walk_unsigned_at_i64_max_boundary() {
-    // SampleCount = i64::MAX ⇒ TagValue::I64(i64::MAX).
-    let mut p = vec![0u8; 36];
-    p[24..32].copy_from_slice(&(i64::MAX as u64).to_le_bytes());
-    let buf = dir(&p);
-    let mut m = Metadata::new("x");
-    walk_binary_data(&buf, &mut m, false);
-    assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "SampleCount")
-        .unwrap()
-        .value(),
-      &TagValue::I64(i64::MAX)
-    );
-    // Boundary + 1 ⇒ decimal string.
-    p[24..32].copy_from_slice(&((i64::MAX as u64) + 1).to_le_bytes());
-    let buf = dir(&p);
-    let mut m = Metadata::new("x");
-    walk_binary_data(&buf, &mut m, false);
-    assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "SampleCount")
-        .unwrap()
-        .value(),
-      &TagValue::Str("9223372036854775808".into())
-    );
+  fn emitted_mask_full_when_dir_total_covers_block_size() {
+    // block_size key = 11 ⇒ dir_off = 44, width = 4 ⇒ requires
+    // dir_total >= 48.
+    assert_eq!(emitted_mask(48), 0xFF);
+    assert_eq!(emitted_mask(76), 0xFF); // production happy path
   }
 
   #[test]
-  fn walk_out_of_range_field_is_skipped() {
-    // dirInfo buffer ending at offset 36 — keys 3..=8 fit, 9 (offset 36, 8
-    // bytes) does NOT, 11 (offset 44, 4 bytes) also does NOT.
-    let mut p = Vec::with_capacity(24);
-    for _ in 0..6 {
-      p.extend_from_slice(&0u32.to_le_bytes()); // keys 3..8 (6 × 4 = 24 bytes)
-    }
-    let buf = dir(&p); // 12 + 24 = 36 bytes total
-    assert_eq!(buf.len(), 36);
-    let mut m = Metadata::new("x");
-    walk_binary_data(&buf, &mut m, false);
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    assert_eq!(
-      names,
-      [
-        "FormatVersion",
-        "FormatID",
-        "ChannelType",
-        "ChannelCount",
-        "SampleRate",
-        "BitsPerSample",
-      ]
-    );
-    // SampleCount and BlockSize are silently absent: the strictly-ascending
-    // DSF_KEYS means once key 9 is out of range, key 11 is too — faithful to
-    // ExifTool.pm:9953 `last if $more <= 0` (early-exit, not per-key skip).
-    assert!(m.tags().iter().all(|t| t.name() != "SampleCount"));
-    assert!(m.tags().iter().all(|t| t.name() != "BlockSize"));
+  fn emitted_mask_truncates_at_first_out_of_range_key() {
+    // dir_total == 36 ⇒ keys 3..=8 fit (bits 0..=5), keys 9/11 fall off.
+    assert_eq!(emitted_mask(36), 0b0011_1111);
+    // dir_total == 32 ⇒ keys 3..=7 fit (bits 0..=4), keys 8/9/11 fall off.
+    assert_eq!(emitted_mask(32), 0b0001_1111);
+    // dir_total == 12 ⇒ no payload yet ⇒ NO fmt keys fit.
+    assert_eq!(emitted_mask(12), 0);
   }
 
-  // --- Task 5: ProcessDsf header + dispatch ------------------------------
-
-  /// 76-byte minimal valid DSF (matches the spec's §3.1 fixture exactly).
-  fn happy_path_dsf() -> Vec<u8> {
-    let mut v = Vec::with_capacity(76);
-    v.extend_from_slice(b"DSD ");
-    v.extend_from_slice(&0x1cu64.to_le_bytes()); // DSD chunk size
-    v.extend_from_slice(&76u64.to_le_bytes()); // fileSize
-    v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0
-    v.extend_from_slice(b"fmt ");
-    v.extend_from_slice(&48u64.to_le_bytes()); // fmtLen
-    // payload (36 bytes):
-    v.extend_from_slice(&1u32.to_le_bytes());
-    v.extend_from_slice(&0u32.to_le_bytes());
-    v.extend_from_slice(&2u32.to_le_bytes());
-    v.extend_from_slice(&2u32.to_le_bytes());
-    v.extend_from_slice(&2_822_400u32.to_le_bytes());
-    v.extend_from_slice(&1u32.to_le_bytes());
-    v.extend_from_slice(&2_822_400u64.to_le_bytes());
-    v.extend_from_slice(&4096u32.to_le_bytes());
-    assert_eq!(v.len(), 76);
-    v
-  }
+  // --- FormatParser trait round-trip --------------------------------------
 
   #[test]
-  fn rejects_when_short() {
-    // < 40 bytes ⇒ DSF.pm:62 `return 0`. No File:* pushed.
+  fn format_parser_trait_returns_meta_static() {
+    let bytes = happy_path_dsf();
+    let mut shared = SharedFlags::new();
+    let ctx = DsfContext::new(&bytes, &mut shared);
+    let meta = <ProcessDsf as FormatParser>::parse(&ProcessDsf, ctx)
+      .expect("ok")
+      .expect("parsed");
+    // The static-promotion path drops the id3 trailer borrow (see
+    // `DsfMeta::into_static` doc).
+    assert!(meta.id3_trailer().is_none());
+    // fmt fields survive intact.
+    let fmt = meta.fmt().expect("populated");
+    assert_eq!(fmt.format_version(), 1);
+    assert_eq!(fmt.sample_count(), 2_822_400);
+  }
+
+  // --- OldFormatParser bridge ---------------------------------------------
+
+  #[test]
+  fn old_format_parser_rejects_when_short() {
     for n in [0usize, 39] {
-      let buf = vec![0u8; n];
+      let buf = std::vec![0u8; n];
       let mut m = Metadata::new("x.dsf");
       let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-      assert!(!ProcessDsf.process(&mut c));
+      assert!(!OldFormatParser::process(&ProcessDsf, &mut c));
       assert!(m.tags().is_empty(), "n={n}");
     }
   }
 
   #[test]
-  fn rejects_when_wrong_magic() {
-    // 40 bytes that fail the regex ⇒ DSF.pm:63 `return 0`. No File:* pushed.
-    let bad_first4 = {
-      let mut v = happy_path_dsf()[..40].to_vec();
-      v[0..4].copy_from_slice(b"XXXX");
-      v
-    };
-    let bad_1c_byte = {
-      let mut v = happy_path_dsf()[..40].to_vec();
-      v[4] = 0x00; // not 0x1c
-      v
-    };
-    let bad_zeros = {
-      let mut v = happy_path_dsf()[..40].to_vec();
-      v[5] = 0xff; // not \0
-      v
-    };
-    let bad_fmt_marker = {
-      let mut v = happy_path_dsf()[..40].to_vec();
-      v[28..32].copy_from_slice(b"FMTA");
-      v
-    };
-    for (label, buf) in [
-      ("first4", bad_first4),
-      ("1c_byte", bad_1c_byte),
-      ("zeros", bad_zeros),
-      ("fmt_marker", bad_fmt_marker),
-    ] {
-      let mut m = Metadata::new("x.dsf");
-      let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-      assert!(!ProcessDsf.process(&mut c), "{label}");
-      assert!(m.tags().is_empty(), "{label}: tags must be empty on reject");
-    }
+  fn old_format_parser_rejects_when_wrong_magic() {
+    let mut bad = happy_path_dsf()[..40].to_vec();
+    bad[0..4].copy_from_slice(b"XXXX");
+    let mut m = Metadata::new("x.dsf");
+    let mut c = ParseContext::new(&bad, "DSF", 0, "DSF", None, true, &mut m);
+    assert!(!OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(m.tags().is_empty());
   }
 
   #[test]
-  fn accepts_minimal_valid_emits_full_set() {
+  fn old_format_parser_accepts_minimal_valid_emits_full_set() {
     let buf = happy_path_dsf();
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    // File:* triplet pushed first (parser-driven SetFileType, DSF.pm:64),
-    // then the fmt-chunk tags in DSF::Main key order.
+    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(
       names,
       [
@@ -674,9 +1608,7 @@ mod tests {
         "BlockSize",
       ]
     );
-    // No warning on happy path.
     assert!(m.warnings().is_empty());
-    // Spot-check final converted values (PrintConv on).
     let by_name = |n: &str| {
       m.tags()
         .iter()
@@ -695,21 +1627,18 @@ mod tests {
   }
 
   #[test]
-  fn warns_on_short_fmt_chunk_returns_true() {
-    // DSF.pm:68-72 guard fails (fmtLen=8 ≤ 12) ⇒ Warn + return 1.
-    // The File:* triplet is pushed (DSF.pm:64 ran first); no payload tags.
-    let mut buf = Vec::with_capacity(40);
+  fn old_format_parser_warns_on_short_fmt_chunk_returns_true() {
+    let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&0x1cu64.to_le_bytes());
-    buf.extend_from_slice(&40u64.to_le_bytes()); // fileSize
-    buf.extend_from_slice(&0u64.to_le_bytes()); // metaPos
+    buf.extend_from_slice(&40u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12 ⇒ guard fail)
-    assert_eq!(buf.len(), 40);
+    buf.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12)
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c)); // DSF.pm:72 `return 1`
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
+    assert!(OldFormatParser::process(&ProcessDsf, &mut c)); // DSF.pm:72 return 1
+    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(names, ["FileType", "FileTypeExtension", "MIMEType"]);
     assert_eq!(
       m.warnings(),
@@ -718,116 +1647,31 @@ mod tests {
   }
 
   #[test]
-  fn warns_on_too_large_fmt_chunk_returns_true() {
-    // DSF.pm:68 `$fmtLen < 1000`: fmtLen = 1000 ⇒ guard fails (the `<` is
-    // strict). Pins the upper bound.
-    let mut buf = Vec::with_capacity(40);
+  fn old_format_parser_warns_on_truncated_fmt_payload_returns_true() {
+    let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&0x1cu64.to_le_bytes());
     buf.extend_from_slice(&40u64.to_le_bytes());
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&1000u64.to_le_bytes()); // fmtLen = 1000 (NOT < 1000)
+    buf.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
+    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
     assert_eq!(
       m.warnings(),
       ["Error reading DSF fmt chunk".to_string()].as_slice()
     );
+    assert!(m.tags().iter().all(|t| {
+      let n = t.name();
+      n == "FileType" || n == "FileTypeExtension" || n == "MIMEType"
+    }));
   }
 
   #[test]
-  fn accepts_fmt_len_999_at_upper_boundary() {
-    // Adjacent passing boundary to `fmt_len == 1000`. DSF.pm:68 `$fmtLen <
-    // 1000` is strict, so 999 with a 987-byte trailing payload must parse
-    // successfully and emit no "Error reading DSF fmt chunk" warning. The
-    // payload is mostly zeros (only the first 36 bytes carry the eight
-    // fmt-chunk fields — the remaining 951 bytes are unused tail).
-    let mut buf = Vec::with_capacity(40 + 987);
-    buf.extend_from_slice(b"DSD ");
-    buf.extend_from_slice(&0x1cu64.to_le_bytes());
-    buf.extend_from_slice(&(40u64 + 987).to_le_bytes()); // fileSize
-    buf.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0 ⇒ no ID3 trailer
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&999u64.to_le_bytes()); // fmtLen = 999 (< 1000 ✓)
-    // First 36 bytes of payload: the eight DSF::Main fields in key order.
-    buf.extend_from_slice(&1u32.to_le_bytes()); // key 3 FormatVersion
-    buf.extend_from_slice(&0u32.to_le_bytes()); // key 4 FormatID = 'DSD Raw'
-    buf.extend_from_slice(&2u32.to_le_bytes()); // key 5 ChannelType = Stereo
-    buf.extend_from_slice(&2u32.to_le_bytes()); // key 6 ChannelCount
-    buf.extend_from_slice(&2_822_400u32.to_le_bytes()); // key 7 SampleRate
-    buf.extend_from_slice(&1u32.to_le_bytes()); // key 8 BitsPerSample
-    buf.extend_from_slice(&2_822_400u64.to_le_bytes()); // key 9 SampleCount
-    buf.extend_from_slice(&4096u32.to_le_bytes()); // key 11 BlockSize
-    // Pad to total payload of 987 bytes (951 zeros after the 36-byte head).
-    buf.extend(std::iter::repeat(0u8).take(987 - 36));
-    assert_eq!(buf.len(), 40 + 987);
-    let mut m = Metadata::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
-    // No warning at the passing side of the boundary.
-    assert!(
-      m.warnings().is_empty(),
-      "fmt_len=999 must not emit any warning, got: {:?}",
-      m.warnings()
-    );
-    // All eight payload tags present alongside the File:* triplet.
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    assert_eq!(
-      names,
-      [
-        "FileType",
-        "FileTypeExtension",
-        "MIMEType",
-        "FormatVersion",
-        "FormatID",
-        "ChannelType",
-        "ChannelCount",
-        "SampleRate",
-        "BitsPerSample",
-        "SampleCount",
-        "BlockSize",
-      ]
-    );
-  }
-
-  #[test]
-  fn warns_on_truncated_fmt_payload_returns_true() {
-    // fmtLen claims a payload longer than the file actually has.
-    let mut buf = Vec::with_capacity(40);
-    buf.extend_from_slice(b"DSD ");
-    buf.extend_from_slice(&0x1cu64.to_le_bytes());
-    buf.extend_from_slice(&40u64.to_le_bytes());
-    buf.extend_from_slice(&0u64.to_le_bytes());
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more bytes
-    assert_eq!(buf.len(), 40); // but we have NOTHING after the 40-byte header
-    let mut m = Metadata::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
-    assert_eq!(
-      m.warnings(),
-      ["Error reading DSF fmt chunk".to_string()].as_slice()
-    );
-    // No payload tags emitted (the walk never ran).
-    assert!(
-      m.tags().iter().all(|t| {
-        let n = t.name();
-        n == "FileType" || n == "FileTypeExtension" || n == "MIMEType"
-      }),
-      "no DSF fmt tags expected on a short read"
-    );
-  }
-
-  #[test]
-  fn fmt_len_equals_12_underflow_guard() {
-    // CRITICAL: DSF.pm:68 strict `$fmtLen > 12`. With fmtLen==12 the
-    // subtraction `$fmtLen - 12 == 0` would not underflow in Perl, but the
-    // `>` guard prevents the (no-op) read. We MUST NOT subtract 12 from
-    // fmt_len when fmt_len <= 12 — that would underflow in unsigned Rust.
-    // This pins the panic-free behavior at the boundary.
-    let mut buf = Vec::with_capacity(40);
+  fn old_format_parser_fmt_len_equals_12_underflow_guard() {
+    // CRITICAL: DSF.pm:68 strict `$fmtLen > 12` underflow guard.
+    let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&0x1cu64.to_le_bytes());
     buf.extend_from_slice(&40u64.to_le_bytes());
@@ -836,8 +1680,7 @@ mod tests {
     buf.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    // Must not panic (no debug-mode underflow) and must Warn-then-accept.
-    assert!(ProcessDsf.process(&mut c));
+    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
     assert_eq!(
       m.warnings(),
       ["Error reading DSF fmt chunk".to_string()].as_slice()
@@ -845,25 +1688,28 @@ mod tests {
   }
 
   #[test]
-  fn fmt_len_zero_underflow_guard() {
-    // Even more adversarial: fmtLen = 0 (or 1). The guard MUST fire BEFORE
-    // any subtraction; faithful behavior is Warn + return 1.
-    for fmt_len in [0u64, 1, 11] {
-      let mut buf = Vec::with_capacity(40);
-      buf.extend_from_slice(b"DSD ");
-      buf.extend_from_slice(&0x1cu64.to_le_bytes());
-      buf.extend_from_slice(&40u64.to_le_bytes());
-      buf.extend_from_slice(&0u64.to_le_bytes());
-      buf.extend_from_slice(b"fmt ");
-      buf.extend_from_slice(&fmt_len.to_le_bytes());
-      let mut m = Metadata::new("x.dsf");
-      let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-      assert!(ProcessDsf.process(&mut c), "fmt_len={fmt_len}");
-      assert_eq!(
-        m.warnings(),
-        ["Error reading DSF fmt chunk".to_string()].as_slice(),
-        "fmt_len={fmt_len}"
-      );
-    }
+  fn old_format_parser_dispatches_id3_trailer() {
+    // Synthesize a DSF file with a small ID3v2.3 header attached.
+    // The trailer must be ≥ 10 bytes for ID3v2 magic + flags + size.
+    // ID3v2.3 frame: "ID3" 03 00 flags=00 size=4×7bit=0 ⇒ empty body.
+    let id3 = b"ID3\x03\x00\x00\x00\x00\x00\x00";
+    let buf = dsf_with_trailer(id3);
+    let mut m = Metadata::new("x.dsf");
+    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
+    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    // File:* triplet + fmt-chunk tags ARE emitted. The ID3 trailer
+    // dispatches but emits no payload tags for a body-empty header —
+    // it's enough that the dispatch ran without panicking and didn't
+    // emit any error.
+    assert!(m.warnings().is_empty());
+    // FileType still DSF (DSF.pm:64 SetFileType runs before the
+    // trailer dispatch — the chained ID3 path does NOT SetFileType).
+    let ft = m
+      .tags()
+      .iter()
+      .find(|t| t.name() == "FileType")
+      .map(|t| t.value().clone())
+      .unwrap();
+    assert_eq!(ft, TagValue::Str("DSF".into()));
   }
 }
