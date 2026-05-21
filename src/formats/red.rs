@@ -1075,6 +1075,10 @@ fn dispatch_directory_tag<'a>(
   let to_value = |v: TagValue| -> R3dValue<'a> {
     match v {
       TagValue::I64(n) => R3dValue::I64(n),
+      // RED tags never emit a u64 today (read_value yields I64/Rational/Str);
+      // keep the lossy-on-overflow `as i64` only as an exhaustiveness arm —
+      // the JSON output path never routes a R3D tag through it.
+      TagValue::U64(n) => R3dValue::I64(n as i64),
       TagValue::F64(n) => R3dValue::F64(n),
       TagValue::Str(s) => R3dValue::Str(R3dStrCow::Owned(s.to_string())),
       TagValue::Bytes(b) => R3dValue::Bytes(b),

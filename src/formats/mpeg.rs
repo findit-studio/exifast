@@ -2053,10 +2053,13 @@ mod tests {
       .map(|t| (t.name(), t.value().clone()))
       .collect();
     assert!(names_vals.contains(&("FileType", TagValue::Str("MP3".into()))));
-    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::I64(1))));
-    assert!(names_vals.contains(&("AudioLayer", TagValue::I64(3))));
+    // Integer tags emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1: the
+    // writer preserves the exact unsigned value; small values render bare,
+    // byte-identical to the old I64 mapping).
+    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::U64(1))));
+    assert!(names_vals.contains(&("AudioLayer", TagValue::U64(3))));
     assert!(names_vals.contains(&("AudioBitrate", TagValue::Str("128 kbps".into()))));
-    assert!(names_vals.contains(&("SampleRate", TagValue::I64(44100))));
+    assert!(names_vals.contains(&("SampleRate", TagValue::U64(44100))));
     assert!(names_vals.contains(&("ChannelMode", TagValue::Str("Joint Stereo".into()))));
     assert!(names_vals.contains(&("MSStereo", TagValue::Str("Off".into()))));
     assert!(names_vals.contains(&("IntensityStereo", TagValue::Str("Off".into()))));
@@ -2079,16 +2082,17 @@ mod tests {
       .iter()
       .map(|t| (t.name(), t.value().clone()))
       .collect();
-    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::I64(3))));
-    assert!(names_vals.contains(&("AudioLayer", TagValue::I64(1))));
-    assert!(names_vals.contains(&("AudioBitrate", TagValue::I64(128000))));
-    assert!(names_vals.contains(&("SampleRate", TagValue::I64(0))));
-    assert!(names_vals.contains(&("ChannelMode", TagValue::I64(1))));
-    assert!(names_vals.contains(&("MSStereo", TagValue::I64(0))));
-    assert!(names_vals.contains(&("IntensityStereo", TagValue::I64(0))));
-    assert!(names_vals.contains(&("CopyrightFlag", TagValue::I64(1))));
-    assert!(names_vals.contains(&("OriginalMedia", TagValue::I64(1))));
-    assert!(names_vals.contains(&("Emphasis", TagValue::I64(0))));
+    // -n raw integers emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1).
+    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::U64(3))));
+    assert!(names_vals.contains(&("AudioLayer", TagValue::U64(1))));
+    assert!(names_vals.contains(&("AudioBitrate", TagValue::U64(128000))));
+    assert!(names_vals.contains(&("SampleRate", TagValue::U64(0))));
+    assert!(names_vals.contains(&("ChannelMode", TagValue::U64(1))));
+    assert!(names_vals.contains(&("MSStereo", TagValue::U64(0))));
+    assert!(names_vals.contains(&("IntensityStereo", TagValue::U64(0))));
+    assert!(names_vals.contains(&("CopyrightFlag", TagValue::U64(1))));
+    assert!(names_vals.contains(&("OriginalMedia", TagValue::U64(1))));
+    assert!(names_vals.contains(&("Emphasis", TagValue::U64(0))));
   }
 
   #[test]
@@ -2111,12 +2115,14 @@ mod tests {
       .iter()
       .map(|t| (t.name(), t.value().clone()))
       .collect();
-    assert!(names_vals.contains(&("VBRFrames", TagValue::I64(1000))));
-    assert!(names_vals.contains(&("VBRBytes", TagValue::I64(200_000))));
-    assert!(names_vals.contains(&("VBRScale", TagValue::I64(78))));
+    // VBR/Lame integer tags emit via `write_u64` ⇒ `TagValue::U64` (Codex
+    // A-R4-1); the string-PrintConv tags below stay `Str`.
+    assert!(names_vals.contains(&("VBRFrames", TagValue::U64(1000))));
+    assert!(names_vals.contains(&("VBRBytes", TagValue::U64(200_000))));
+    assert!(names_vals.contains(&("VBRScale", TagValue::U64(78))));
     assert!(names_vals.contains(&("Encoder", TagValue::Str("LAME3.99r".into()))));
-    assert!(names_vals.contains(&("LameVBRQuality", TagValue::I64(2))));
-    assert!(names_vals.contains(&("LameQuality", TagValue::I64(2))));
+    assert!(names_vals.contains(&("LameVBRQuality", TagValue::U64(2))));
+    assert!(names_vals.contains(&("LameQuality", TagValue::U64(2))));
     assert!(names_vals.contains(&("LameMethod", TagValue::Str("VBR (new/mtrh)".into()))));
     assert!(names_vals.contains(&("LameLowPassFilter", TagValue::Str("16 kHz".into()))));
     assert!(names_vals.contains(&("LameBitrate", TagValue::Str("128 kbps".into()))));

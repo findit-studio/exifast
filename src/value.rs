@@ -196,6 +196,14 @@ pub fn perl_nonfinite_str(val: f64) -> Option<&'static str> {
 pub enum TagValue {
   /// Signed integer.
   I64(i64),
+  /// Unsigned 64-bit integer. Distinct from [`TagValue::I64`] so a value
+  /// above `i64::MAX` (e.g. an APE u64 day-count or a large file size) is
+  /// preserved EXACTLY rather than saturating to `i64::MAX`. Perl is
+  /// untyped — it stringifies any integer and runs the one `EscapeJSON`
+  /// number gate (`exiftool:3809`), so this variant renders its full decimal
+  /// text through that gate, byte-identical to bundled (a >15-digit value is
+  /// quoted, matching `i64::MAX`/`i64::MIN`, but with the TRUE value).
+  U64(u64),
   /// Floating point.
   F64(f64),
   /// UTF-8 text.

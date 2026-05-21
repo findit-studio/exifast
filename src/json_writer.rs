@@ -26,8 +26,8 @@
 //!    number gate at `exiftool:3809`, string escaping at `exiftool:3816-3830`,
 //!    the binary placeholder, the rational repr, and the `FormatJSON` ARRAY
 //!    framing at `exiftool:3843-3855`). One source of truth ⇒ no drift.
-//! 2. **`write_*` → `TagValue` mapping.** `write_u64` → `I64` (saturating to
-//!    `i64::MAX`, matching the push-style `Metadata`'s `I64` storage),
+//! 2. **`write_*` → `TagValue` mapping.** `write_u64` → `U64` (the EXACT
+//!    unsigned value, Codex A-R4-1 — no longer saturating to `i64::MAX`),
 //!    `write_i64` → `I64`, `write_f64` → `F64`, `write_str`/`write_fmt` →
 //!    `Str`, `write_bytes` → `Bytes`. `write_str_list` coalesces via the
 //!    [`crate::value::Metadata::push_listable`] promote-and-push rule
@@ -438,13 +438,15 @@ impl TagWriter for JsonTagWriter {
   }
 
   fn write_u64(&mut self, group: &str, name: &str, value: u64) -> Result<(), Infallible> {
-    // The push-style `Metadata` stores integers as `TagValue::I64`; the
-    // bridge saturates `u64` → `i64::MAX` (sink.rs). Mirror that exactly so a
-    // >`i64::MAX` value renders identically (it then quotes via the number
-    // gate just like the bridge path would).
-    let n = i64::try_from(value).unwrap_or(i64::MAX);
+    // Store the u64 EXACTLY as `TagValue::U64` (Codex A-R4-1). The prior
+    // `i64::try_from(value).unwrap_or(i64::MAX)` silently corrupted any value
+    // above `i64::MAX` (e.g. an APE u64 day-count, a large file size) into
+    // `9223372036854775807`. Perl is untyped: it stringifies the integer and
+    // runs the one `EscapeJSON` number gate (`exiftool:3809`), so the full
+    // decimal — quoted because it exceeds 15 digits, exactly as `i64::MAX`
+    // would be — renders byte-identical to bundled but with the TRUE value.
     let g = self.group(group);
-    self.push(g, name, TagValue::I64(n));
+    self.push(g, name, TagValue::U64(value));
     Ok(())
   }
 
@@ -577,13 +579,37 @@ mod tests {
   }
 
   #[test]
-  fn write_u64_saturates_like_bridge() {
+  fn write_u64_preserves_exact_value_above_i64_max() {
+    // Codex A-R4-1 regression: a u64 ABOVE i64::MAX must round-trip its FULL
+    // value, NOT saturate to i64::MAX (`9223372036854775807`). The exact
+    // decimal is quoted (it exceeds the EscapeJSON 15-digit number gate,
+    // `exiftool:3809`), exactly as bundled `perl exiftool` quotes it —
+    // verified against the bundled Perl regex (u64::MAX = 20 digits,
+    // 10000000000000000000 = 20 digits, 9223372036854775808 = 19 digits, all
+    // QUOTED). The writer and the serialize oracle agree (both store U64).
     assert_matches_serialize("a.aac", |m, w| {
-      // u64::MAX → i64::MAX (saturating), then quoted by the number gate
-      // (19 digits > 15). Both paths agree.
-      m.push(Group::new("X", "X"), "Huge", TagValue::I64(i64::MAX));
-      w.write_u64("X", "Huge", u64::MAX).unwrap();
+      for (name, v) in [
+        ("Max", u64::MAX),
+        ("AboveI64Max", (i64::MAX as u64) + 1),
+        ("Round", 10_000_000_000_000_000_000_u64),
+      ] {
+        m.push(Group::new("X", "X"), name, TagValue::U64(v));
+        w.write_u64("X", name, v).unwrap();
+      }
     });
+    // Direct assertion on the rendered token: the FULL exact value appears,
+    // and it is QUOTED (the >15-digit gate), NOT the truncated i64::MAX.
+    let mut w = JsonTagWriter::new("a.aac");
+    w.write_u64("X", "Max", u64::MAX).unwrap();
+    let out = w.finish();
+    assert!(
+      out.contains("\"X:Max\": \"18446744073709551615\""),
+      "u64::MAX must render as its full quoted decimal, got: {out}"
+    );
+    assert!(
+      !out.contains("9223372036854775807"),
+      "u64::MAX must NOT saturate to i64::MAX, got: {out}"
+    );
   }
 
   #[test]

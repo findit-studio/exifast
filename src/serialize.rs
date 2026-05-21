@@ -526,6 +526,39 @@ mod tests {
   }
 
   #[test]
+  fn u64_above_i64_max_renders_exact_through_the_gate() {
+    // Codex A-R4-1: `TagValue::U64` above i64::MAX must render its EXACT
+    // decimal (quoted, >15 digits), NOT saturate to i64::MAX. Perl is
+    // untyped — it stringifies the integer and runs the one EscapeJSON gate
+    // (exiftool:3809), so a 19-20 digit value is quoted, byte-identical to
+    // bundled but with the TRUE value.
+    let mut m = Metadata::new("a.jpg");
+    m.push(Group::new("X", "X"), "Max", TagValue::U64(u64::MAX));
+    m.push(
+      Group::new("X", "X"),
+      "Above",
+      TagValue::U64((i64::MAX as u64) + 1),
+    );
+    // A small u64 still passes the gate BARE, exactly like the I64 path.
+    m.push(Group::new("X", "X"), "Small", TagValue::U64(42));
+    let s = to_exiftool_json(&m);
+    assert!(
+      s.contains("\"X:Max\": \"18446744073709551615\","),
+      "u64::MAX exact + quoted: {s}"
+    );
+    assert!(
+      s.contains("\"X:Above\": \"9223372036854775808\","),
+      "i64::MAX+1 exact + quoted (NOT saturated): {s}"
+    );
+    assert!(s.contains("\"X:Small\": 42"), "small u64 bare: {s}");
+    // The saturated i64::MAX token must NEVER appear for these inputs.
+    assert!(
+      !s.contains("9223372036854775807"),
+      "must not saturate to i64::MAX: {s}"
+    );
+  }
+
+  #[test]
   fn f64_and_rational_route_through_the_same_gate() {
     // ExifTool runs the ONE gate on the string form of EVERY scalar.
     // `format_g(_,15)` in fixed notation can exceed the regex's

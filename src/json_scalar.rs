@@ -155,6 +155,12 @@ pub fn push_value(out: &mut String, v: &TagValue) {
     // integer (`i64::MIN`/`MAX`, any 16+-digit value) is QUOTED, not bare.
     // Verified against the bundled Perl regex (see tests).
     TagValue::I64(n) => push_numeric_gated(out, &n.to_string()),
+    // Same gate for an unsigned 64-bit integer: Perl stringifies (`"$n"`)
+    // and runs the line-3809 number gate, so a u64 above `i64::MAX` (19-20
+    // digits) is QUOTED — but with its EXACT decimal value, not the
+    // saturated `i64::MAX`. Verified against the bundled Perl regex: u64::MAX
+    // `18446744073709551615` → quoted exact (see tests).
+    TagValue::U64(n) => push_numeric_gated(out, &n.to_string()),
     // Same gate for floats: ExifTool stringifies (`%.15g`-ish) then runs
     // line 3809. `format_g(_, 15)` fixed-notation can exceed the regex's
     // `\d{1,16}` fraction cap (e.g. `sprintf("%.15g",10/2134)` =

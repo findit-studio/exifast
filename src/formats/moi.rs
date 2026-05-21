@@ -1160,10 +1160,11 @@ mod tests {
       Some(TagValue::Str("2011:05:15 17:58:48.000".into()))
     );
     assert_eq!(by_name("Duration"), Some(TagValue::F64(8.16)));
-    assert_eq!(by_name("AspectRatio"), Some(TagValue::I64(0x51)));
-    assert_eq!(by_name("AudioCodec"), Some(TagValue::I64(0x00c1)));
-    assert_eq!(by_name("AudioBitrate"), Some(TagValue::I64(224_000)));
-    assert_eq!(by_name("VideoBitrate"), Some(TagValue::I64(8_500_000)));
+    // -n raw integers emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1).
+    assert_eq!(by_name("AspectRatio"), Some(TagValue::U64(0x51)));
+    assert_eq!(by_name("AudioCodec"), Some(TagValue::U64(0x00c1)));
+    assert_eq!(by_name("AudioBitrate"), Some(TagValue::U64(224_000)));
+    assert_eq!(by_name("VideoBitrate"), Some(TagValue::U64(8_500_000)));
   }
 
   #[test]

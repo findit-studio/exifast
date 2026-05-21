@@ -273,7 +273,11 @@ fn extract_field(
     }
     match acc {
       // u64 mode ≤ i64::MAX ⇒ TagValue::I64 (unchanged for all ported
-      // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit).
+      // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit). Kept as I64 (not
+      // U64) so the SetFrameState slot (`if let TagValue::I64`, below) and
+      // the Condition `==`/`!=` integer comparisons still see these values
+      // — the no-format path's existing, tested contract (Codex A-R4-1 is
+      // scoped to `JsonTagWriter::write_u64`, not this UV accumulator).
       Acc::U(v) if v <= i64::MAX as u64 => TagValue::I64(v as i64),
       // u64 mode > i64::MAX ⇒ exact decimal string (Perl UV stringifies
       // as exact integer); the serializer's number gate quotes ≥16-digit

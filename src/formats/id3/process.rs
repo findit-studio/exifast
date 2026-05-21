@@ -1218,6 +1218,7 @@ impl MetaSinker for Id3Meta<'_> {
       match &tag.value {
         TagValue::Str(s) => out.write_str(group, name, s.as_str())?,
         TagValue::I64(n) => out.write_i64(group, name, *n)?,
+        TagValue::U64(n) => out.write_u64(group, name, *n)?,
         TagValue::F64(n) => out.write_f64(group, name, *n)?,
         TagValue::Bool(b) => out.write_u64(group, name, u64::from(*b))?,
         TagValue::Bytes(b) => out.write_bytes(group, name, b)?,

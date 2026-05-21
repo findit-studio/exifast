@@ -68,6 +68,7 @@ fn replay_value<W: TagWriter>(
   match v {
     TagValue::Str(s) => out.write_str(group, name, s.as_str()),
     TagValue::I64(n) => out.write_i64(group, name, *n),
+    TagValue::U64(n) => out.write_u64(group, name, *n),
     TagValue::F64(x) => out.write_f64(group, name, *x),
     TagValue::Bytes(b) => out.write_bytes(group, name, b.as_slice()),
     TagValue::Bool(b) => out.write_str(group, name, if *b { "true" } else { "false" }),

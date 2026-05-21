@@ -1096,14 +1096,15 @@ mod tests {
         .map(|t| t.value().clone())
     };
     assert_eq!(by_name("FileType"), Some(TagValue::Str("WV".into())));
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::I64(1)));
+    // `write_u64`-emitted integers ⇒ `TagValue::U64` (Codex A-R4-1).
+    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(1)));
     assert_eq!(by_name("AudioType"), Some(TagValue::Str("Mono".into())));
     assert_eq!(
       by_name("Compression"),
       Some(TagValue::Str("Lossless".into()))
     );
     assert_eq!(by_name("DataFormat"), Some(TagValue::Str("Integer".into())));
-    assert_eq!(by_name("SampleRate"), Some(TagValue::I64(48000)));
+    assert_eq!(by_name("SampleRate"), Some(TagValue::U64(48000)));
   }
 
   #[test]
@@ -1116,11 +1117,13 @@ mod tests {
         .find(|t| t.name() == n)
         .map(|t| t.value().clone())
     };
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::I64(1)));
-    assert_eq!(by_name("AudioType"), Some(TagValue::I64(1)));
-    assert_eq!(by_name("Compression"), Some(TagValue::I64(0)));
-    assert_eq!(by_name("DataFormat"), Some(TagValue::I64(0)));
-    assert_eq!(by_name("SampleRate"), Some(TagValue::I64(10)));
+    // -n raw integers all emit via `write_u64` ⇒ `TagValue::U64`
+    // (Codex A-R4-1).
+    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(1)));
+    assert_eq!(by_name("AudioType"), Some(TagValue::U64(1)));
+    assert_eq!(by_name("Compression"), Some(TagValue::U64(0)));
+    assert_eq!(by_name("DataFormat"), Some(TagValue::U64(0)));
+    assert_eq!(by_name("SampleRate"), Some(TagValue::U64(10)));
   }
 
   #[test]
@@ -1133,7 +1136,7 @@ mod tests {
         .find(|t| t.name() == n)
         .map(|t| t.value().clone())
     };
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::I64(4)));
+    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(4)));
     assert_eq!(by_name("AudioType"), Some(TagValue::Str("Mono".into())));
     assert_eq!(by_name("Compression"), Some(TagValue::Str("Hybrid".into())));
     assert_eq!(

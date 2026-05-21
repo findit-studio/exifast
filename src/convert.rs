@@ -597,6 +597,8 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
   match v {
     // Perl stringifies an integer as its decimal text (`"$n"`).
     TagValue::I64(n) => Some(n.to_string()),
+    // An unsigned 64-bit integer stringifies the same way (`"$n"`).
+    TagValue::U64(n) => Some(n.to_string()),
     // Same `%.15g`-ish text the serializer feeds through `EscapeJSON`
     // (non-finite never reaches a hash PrintConv; mirror Perl's `"$n"`).
     TagValue::F64(n) => Some(if n.is_finite() {
@@ -1088,6 +1090,7 @@ fn read_one(data: &[u8], offset: usize, format: &str, byte_order: ByteOrder) -> 
 fn scalar_text(v: &TagValue) -> String {
   match v {
     TagValue::I64(n) => n.to_string(),
+    TagValue::U64(n) => n.to_string(),
     // Perl stringifies a float via `%g`-ish (default `$DIG = 15`). The
     // serializer uses `format_g(_, 15)` for floats; same here so the joined
     // text matches what ExifTool's joined `@vals` would print.
