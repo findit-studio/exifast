@@ -872,7 +872,7 @@ fn parse_mp3_typed<'a>(
   // B-R2-2).
   let (id3, hdr_end) = if shared.done_id3().is_none() {
     // Stage in `-j` mode (the typed MP3 entry's fixed mode).
-    let result = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
+    let (id3, hdr_end) = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
     // ID3.pm:1435-1436: `ProcessID3` sets `$$et{DoneID3} = 1` BEFORE
     // scanning — truthy even when NO ID3 is found. `parse_id3_inner` only
     // propagates the trailer size on a hit; mirror the no-ID3 side effect so
@@ -881,11 +881,21 @@ fn parse_mp3_typed<'a>(
     if shared.done_id3().is_none() {
       shared.set_done_id3(0);
     }
-    result
+    // `parse_id3_inner` already recorded the post-ID3v2-header offset
+    // (bundled `$hdrEnd`) on `shared` for the DoneID3-skip path (Codex
+    // B-R3-1); no extra carry needed here.
+    (id3, hdr_end)
   } else {
     // DoneID3 already set ⇒ bundled `ProcessID3` returns 0 and the `unless`
-    // skips it. No ID3 sub-Meta; MPEG scanning starts at offset 0.
-    (None, 0)
+    // skips it (ID3.pm:1691-1693). No ID3 sub-Meta. The bundled flow only
+    // reaches this re-entry through the audio-format loop, which has already
+    // `Seek($hdrEnd, 0)` (ID3.pm:1590); scan MPEG from the carried `$hdrEnd`,
+    // NOT offset 0, so a large-ID3 file (MPEG frame after an ID3v2 body
+    // > 8192 bytes) still yields MPEG tags (Codex B-R3-1). When the prior
+    // pass never recorded a header end (e.g. `DoneID3` injected by a
+    // non-ID3-running caller), default to 0 — the legacy offset-0 behavior.
+    let hdr_end = shared.id3_hdr_end().unwrap_or(0);
+    (None, hdr_end)
   };
 
   // -- 2. MPEG audio scan from hdr_end (ID3.pm:1696-1719) ------------------
@@ -1041,6 +1051,24 @@ fn parse_id3_inner<'a>(
 
   // PrintConv (`-j`) pass — the accessor + `sink(true)` source.
   let (found, hdr_end, staged_tags, staging) = run_id3_pass(data, true);
+
+  // Record the post-ID3v2-header offset (bundled `$hdrEnd`) on the shared
+  // state for EVERY typed ID3 run — found or not. A later chained
+  // `ProcessMP3` re-entering with `DoneID3` already set scans MPEG from this
+  // offset (the audio-format loop's `$raf->Seek($hdrEnd, 0)`, ID3.pm:1590),
+  // not from 0, so a large-ID3 file still yields MPEG tags (Codex B-R3-1).
+  // Done before the no-ID3 early return so the offset is carried regardless
+  // of the return shape (FormatParser side-effects persist).
+  if let Some(sf) = shared {
+    sf.set_id3_hdr_end(hdr_end);
+    // Propagate done_id3 (the trailer size that APE.pm:169 reads). The
+    // legacy `process_id3_inner_legacy` stored this on `staging.done_id3`;
+    // mirror it onto the SharedFlags for the new chained-call path.
+    if let Some(trail_size) = staging.done_id3() {
+      sf.set_done_id3(trail_size);
+    }
+  }
+
   if !found {
     return Ok((None, hdr_end));
   }
@@ -1048,15 +1076,6 @@ fn parse_id3_inner<'a>(
   // PrintConv disabled (ID3v1 Genre %genre ID3.pm:371-375; TLEN
   // ValueConv/PrintConv split ID3.pm:592-595 differ between the two).
   let (_found_raw, _hdr_end_raw, staged_tags_raw, _staging_raw) = run_id3_pass(data, false);
-
-  // Propagate done_id3 (the trailer size that APE.pm:169 reads). The
-  // legacy `process_id3_inner_legacy` stored this on `staging.done_id3`;
-  // mirror it onto the SharedFlags for the new chained-call path.
-  if let Some(sf) = shared {
-    if let Some(trail_size) = staging.done_id3() {
-      sf.set_done_id3(trail_size);
-    }
-  }
   // Determine the ID3v2 version + size + ID3v1 sub-Meta from the PrintConv
   // staged tags (the accessor list).
   let mut v2_version: Option<Id3v2Version> = None;
@@ -1872,6 +1891,80 @@ mod tests {
     assert!(
       meta.mpeg().is_some(),
       "MPEG sub-Meta still populated (scan from offset 0)"
+    );
+  }
+
+  /// Codex B-R3-1: when a chained caller already ran typed ID3 over the FULL
+  /// buffer (setting `DoneID3` AND the carried `id3_hdr_end`), the typed MP3
+  /// skip path must scan MPEG from that `$hdrEnd`, NOT offset 0. For
+  /// `mp3_with_large_id3v2_artwork.mp3` the ID3v2 body is ~9261 bytes
+  /// (`$hdrEnd` ≈ 9271 > the 8192 MP3 scan window), so a from-0 scan sees
+  /// only ID3 bytes and emits NO MPEG tags; from `$hdrEnd` the MPEG frame
+  /// sync is found. Faithful to the audio-format loop's `$raf->Seek($hdrEnd,
+  /// 0)` (ID3.pm:1590) before the recursive `ProcessMP3`.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_parse_mp3_done_id3_skip_scans_from_carried_hdr_end() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mp3_with_large_id3v2_artwork.mp3"),
+    )
+    .expect("read mp3_with_large_id3v2_artwork.mp3 fixture");
+
+    // First, a chained caller runs typed ID3 over the FULL buffer. This sets
+    // both `DoneID3` and the carried `id3_hdr_end` (the post-ID3v2 offset).
+    let mut shared = SharedFlags::new();
+    let id3 = parse_id3_borrowed(&bytes, Some(&mut shared), /* print_conv */ true)
+      .expect("ok")
+      .expect("large-ID3 artwork file has an ID3v2 directory");
+    assert!(id3.v2_version().is_some(), "ID3v2 directory parsed");
+    assert!(shared.done_id3().is_some(), "DoneID3 set by typed ID3 pass");
+    let carried = shared
+      .id3_hdr_end()
+      .expect("typed ID3 pass records the post-ID3v2 hdr_end");
+    assert!(
+      carried > 8192,
+      "ID3v2 body extends past the 8192 MP3 scan window (hdr_end={carried})"
+    );
+
+    // Now the typed MP3 wrapper re-enters with DoneID3 + hdr_end preset (the
+    // bundled recursion-after-Seek path). It must scan from the carried
+    // hdr_end and STILL emit MPEG tags.
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("MPEG frame after the large ID3v2 body still accepts the file");
+    assert!(
+      meta.id3().is_none(),
+      "no duplicate ID3 sub-Meta when DoneID3 already set (Codex B-R2-2)"
+    );
+    assert!(
+      meta.mpeg().is_some(),
+      "MPEG sub-Meta populated by scanning from the carried hdr_end, not 0 (Codex B-R3-1)"
+    );
+  }
+
+  /// Codex B-R3-1 negative control: DoneID3 preset by a caller that did NOT
+  /// run typed ID3 (so `id3_hdr_end` is `None`) falls back to the legacy
+  /// offset-0 scan. `ID3v2_with_mpeg_audio.mp3` has its MPEG sync within the
+  /// first 8192 bytes, so the from-0 fallback still finds it — confirming the
+  /// `unwrap_or(0)` default preserves the prior behavior.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_parse_mp3_done_id3_without_carried_hdr_end_falls_back_to_zero() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ID3v2_with_mpeg_audio.mp3"),
+    )
+    .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    shared.set_done_id3(0); // injected; no typed ID3 pass ran.
+    assert_eq!(shared.id3_hdr_end(), None, "no carried hdr_end");
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("MPEG sync within first 8192 bytes still accepts via offset-0 fallback");
+    assert!(
+      meta.mpeg().is_some(),
+      "offset-0 fallback still finds the sync"
     );
   }
 

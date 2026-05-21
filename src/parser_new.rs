@@ -218,6 +218,15 @@ pub struct SharedFlags {
   /// and the typed chained dispatch agree on the not-run vs ran-no-trailer
   /// distinction (Codex AF1/BF3).
   done_id3: Option<usize>,
+  /// The post-ID3v2-header file position (bundled `$hdrEnd`) recorded when
+  /// the typed `ProcessID3` pass runs. The bundled audio-format loop seeks
+  /// to this offset (`$raf->Seek($hdrEnd, 0)`, ID3.pm:1590) before the
+  /// recursive `ProcessMP3`, so the DoneID3-skip path of `ProcessMP3` scans
+  /// MPEG from `$hdrEnd`, NOT from offset 0. Carry it here so a chained
+  /// typed caller that pre-ran ID3 over the FULL buffer still scans the
+  /// POST-ID3 region for an MPEG frame (Codex B-R3-1). `None` until a typed
+  /// ID3 pass has run.
+  id3_hdr_end: Option<usize>,
   /// `$$et{DoneAPE}` — set by APE after running, read by `ID3.pm:1723`
   /// to gate the wrapper APE-trailer fallback.
   done_ape: bool,
@@ -254,6 +263,24 @@ impl SharedFlags {
   /// guard treats `0` and `1` identically, so we normalize to `0`).
   pub fn set_done_id3(&mut self, trailer_size: usize) {
     self.done_id3 = Some(trailer_size);
+  }
+
+  /// The post-ID3v2-header file position (bundled `$hdrEnd`) recorded by the
+  /// typed `ProcessID3` pass. `None` until a typed ID3 pass has run. The
+  /// DoneID3-skip path of the typed `ProcessMP3` reads this to scan MPEG
+  /// from `$hdrEnd` instead of offset 0, faithful to the audio-format loop's
+  /// `$raf->Seek($hdrEnd, 0)` (ID3.pm:1590) before recursive `ProcessMP3`
+  /// (Codex B-R3-1).
+  #[must_use]
+  pub fn id3_hdr_end(&self) -> Option<usize> {
+    self.id3_hdr_end
+  }
+
+  /// Record the post-ID3v2-header file position (bundled `$hdrEnd`). Called
+  /// by the typed ID3 pass after it determines the header end so a later
+  /// chained `ProcessMP3` skip path can scan MPEG from there (Codex B-R3-1).
+  pub fn set_id3_hdr_end(&mut self, hdr_end: usize) {
+    self.id3_hdr_end = Some(hdr_end);
   }
 
   /// `$$et{DoneAPE}` — APE-trailer-already-handled flag, gates the
