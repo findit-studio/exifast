@@ -828,43 +828,12 @@ pub enum AnyError {
   Wv(#[from] crate::formats::wavpack::Error),
 }
 
-/// Compute the bundled `$hdrEnd` (ID3.pm:1457-1465,1504) for an `ID3`-prefixed
-/// buffer — the file offset PAST a leading ID3v2 header — or `None` when there
-/// is no valid ID3v2 prefix (no `ID3` magic, short/garbled header, or a
-/// truncated body). This is the SAME size computation the MP3 path performs
-/// (`id3::process::process_id3_inner_legacy` → `parse_v2_header`): the 28-bit
-/// synchsafe size at bytes [6..10], `hdr_end = 10 + size`, plus another 10
-/// bytes when the footer-present flag (byte 5 `& 0x10`) is set.
-///
-/// Kept feature-independent (the `ogg` feature does NOT pull in `id3`) and
-/// dependency-free so the [`AnyParser::parse_any`] OGG arm can seek past an
-/// ID3 prefix without the full ID3 parse (Codex C-R4-1). It is the read-only
-/// offset only — it emits no tags and never fails the document.
-#[cfg(feature = "ogg")]
-fn id3v2_prefix_end(data: &[u8]) -> Option<usize> {
-  // Need the 10-byte ID3v2 header: `ID3` magic + 2 version + 1 flags + 4 size.
-  if data.len() < 10 || !data.starts_with(b"ID3") {
-    return None;
-  }
-  let flags = data[5];
-  // 28-bit synchsafe size (ID3.pm:1452 `$size = UnSync(...)`): each of the 4
-  // size bytes must have its high bit clear; reject otherwise (matches
-  // `id3::decode::unsync_safe`'s `& 0x80808080` guard).
-  let raw = u32::from_be_bytes([data[6], data[7], data[8], data[9]]);
-  if raw & 0x8080_8080 != 0 {
-    return None;
-  }
-  let size = (raw & 0x0000_007f)
-    | ((raw & 0x0000_7f00) >> 1)
-    | ((raw & 0x007f_0000) >> 2)
-    | ((raw & 0x7f00_0000) >> 3);
-  let mut hdr_end = 10usize.saturating_add(size as usize);
-  // Footer present (ID3v2.4 `flags & 0x10`, ID3.pm:1462-1463) ⇒ +10 bytes.
-  if flags & 0x10 != 0 {
-    hdr_end = hdr_end.saturating_add(10);
-  }
-  Some(hdr_end)
-}
+// R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
+// previous dispatch arm computed an ID3v2-header offset, skipped past the
+// prefix, and reparsed the OGG body — but never emitted the ID3 directory
+// (silent metadata loss). The fix is `ogg::parse_full_chained`, which
+// invokes the typed `parse_id3_with_hdr_end` and nests an `Id3Meta` into
+// `ogg::Meta`, faithful to bundled Ogg.pm:79-83.
 
 // ===========================================================================
 // AnyParser::parse_any — the closed-dispatch entry point
@@ -1019,43 +988,28 @@ impl AnyParser {
       }
       #[cfg(feature = "ogg")]
       AnyParser::Ogg(p) => {
-        let _ = (shared, ext);
-        // The OGG typed parser returns `Some(ogg::Meta { success: false })`
-        // (carrying the "Not a valid OGG file" warning) for non-OGG /
-        // garbage input, faithful to the bundled `ProcessOGG` return. In
-        // this `parse_any` library path `Ok(Some(_))` terminates the
-        // candidate loop, so an ID3-prefixed MP3 — whose detection
-        // candidates may try OGG before MP3 — would be mis-reported as
-        // `AnyMeta::Ogg` with no MPEG tags. Map `success() == false` to
-        // `Ok(None)` so dispatch continues to the next candidate (Codex
-        // C-R2-1). The engine entry `ogg::ProcessOgg::process` likewise
-        // returns `false` on `!success` (and only then emits the OGG
-        // warning for a genuinely OGG-typed file).
-        let first = p.parse(bytes)?.filter(|m| m.success());
-        if let Some(m) = first {
+        let _ = (p, ext);
+        // R3 F1 (Codex adversarial): the OGG path now uses
+        // `parse_full_chained`, which runs `unless ($$et{DoneID3}) {
+        // ID3::ProcessID3 }` (Ogg.pm:79-83) BEFORE the container walk and
+        // nests the typed `Id3Meta` into `ogg::Meta::id3`. Pre-fix the
+        // dispatch stripped the ID3v2 prefix to reparse `bytes[hdr_end..]`
+        // but never emitted the ID3 directory — silent metadata loss caught
+        // by Codex round 3. The typed `serialize_tags` sink (ogg.rs)
+        // emits the ID3 sub-Meta's `File:ID3Size` + `ID3v2_*:*` frame
+        // tags, restoring value-equivalence with bundled.
+        //
+        // `success()` filtering still applies: an ID3-prefixed file whose
+        // post-ID3 body is NOT a valid OGG stream (e.g. an ID3-prefixed
+        // MP3) returns `success() == false` and the candidate loop
+        // continues to the next file-type (MP3 will then dispatch with
+        // the same `SharedFlags`'s `DoneID3` already set, mirroring
+        // bundled `unless ($$et{DoneID3})` recursion guard).
+        // (`ogg` requires `id3` in Cargo.toml.)
+        let chained =
+          crate::formats::ogg::parse_full_chained(bytes, shared)?.filter(|m| m.success());
+        if let Some(m) = chained {
           return Ok(Some(AnyMeta::Ogg(m)));
-        }
-        // Codex C-R4-1: ID3-PREFIXED Ogg. The `%magicNumber{OGG}` gate is
-        // `(OggS|ID3)` (filetype_data.rs / ExifTool.pm:1004), so an Ogg
-        // stream carrying a leading ID3v2 tag detects as OGG and reaches
-        // here — but `OggS` is NOT at offset 0, so the parse above failed.
-        // Bundled `ProcessOGG` (Ogg.pm:79-82) DOES support this: it runs
-        // `ProcessID3` first, whose audio-format loop seeks PAST the ID3
-        // header (`Seek($hdrEnd, 0)`, ID3.pm:1590) and re-dispatches OGG on
-        // the post-ID3 stream. Mirror that here for the `parse_any` library
-        // path: when the buffer starts with `ID3`, compute the post-ID3v2
-        // offset (the SAME `$hdrEnd` = 10 + synchsafe-size [+10 footer]
-        // computation the MP3 path uses, ID3.pm:1457-1465) and RETRY the
-        // Ogg parser on that slice before falling through to MP3. A valid
-        // post-ID3 Ogg ⇒ `AnyMeta::Ogg` (NOT the mis-routed MP3). The
-        // engine `extract_info` path already handles ID3-prefix chains via
-        // `process()`; this keeps the typed dispatch consistent.
-        if let Some(hdr_end) = id3v2_prefix_end(bytes) {
-          if let Some(slice) = bytes.get(hdr_end..) {
-            if let Some(m) = p.parse(slice)?.filter(|m| m.success()) {
-              return Ok(Some(AnyMeta::Ogg(m)));
-            }
-          }
         }
         Ok(None)
       }

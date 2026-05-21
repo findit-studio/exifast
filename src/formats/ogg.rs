@@ -1239,6 +1239,24 @@ fn process_vorbis_comments_with_group1(
 /// "OGG zero-alloc revisit" for the eventual borrow-from-input plan.
 #[derive(Debug, Clone)]
 pub struct Meta<'a> {
+  /// Chained ID3 sub-Meta from the Ogg.pm:79-83 embedded ProcessID3 call
+  /// (`unless ($$et{DoneID3}) { ID3::ProcessID3($et, $dirInfo) }`). `Some`
+  /// when an ID3v2 PREFIX (in front of the `OggS` magic) was detected and
+  /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`].
+  /// Carries `File:ID3Size` + any `ID3v2_*:*` frame tags; the typed
+  /// `serialize_tags` sink emits them in the bundled-faithful order
+  /// (`File:ID3Size` ⇒ Vorbis fields ⇒ `ID3v2_*:*` frame tags). Same
+  /// nesting pattern as `ape::Meta::id3`, `flac::Meta::id3`,
+  /// `dsf::Meta::id3`.
+  ///
+  /// R3 F1 (Codex adversarial): pre-fix the engine `AnyParser::Ogg` arm
+  /// stripped the ID3v2 prefix to reparse `bytes[hdr_end..]` but never
+  /// emitted the ID3 directory — silent metadata loss. Nesting the typed
+  /// ID3 parser closes that hole (no hand-trim, no #[ignore] — the
+  /// `ogg_id3_prefixed.ogg` fixture now reaches value-equivalent with
+  /// the bundled golden).
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
   /// `OverrideFileType` target (Ogg.pm:49-50). `Some("OPUS")` when an
   /// `OpusHead` or `OpusTags` packet was seen; `Some("OGV")` when a
   /// Theora `\x80theora` / `\x81theora` packet was seen; `None` otherwise.
@@ -1466,6 +1484,20 @@ impl Meta<'_> {
     self.file_type_override
   }
 
+  /// Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). `Some`
+  /// when an ID3v2 PREFIX was detected and parsed; the typed
+  /// `serialize_tags` sink emits its `File:ID3Size` + `ID3v2_*:*` frame
+  /// tags. R3 F1: this closes the silent metadata-loss hole on
+  /// ID3-prefixed Ogg.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
+  }
+
   /// Vorbis identification-packet fields (Vorbis.pm:40-70), or `None` if
   /// no `\x01vorbis` identification packet was parsed for this stream.
   /// Emits at bundled position — BEFORE the comment block. The contained
@@ -1564,6 +1596,63 @@ impl FormatParser for ProcessOgg {
 /// future I/O wrappers).
 pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data, print_conv_enabled)
+}
+
+/// R3 F1: full-chained parse — runs the embedded ID3 chain (`unless
+/// ($$et{DoneID3}) { ID3::ProcessID3 }`, Ogg.pm:79-83) and nests the typed
+/// [`crate::formats::id3::Id3Meta`] into the returned [`Meta`]. Then runs
+/// the OGG container walk over the POST-ID3-prefix slice (the same way
+/// bundled `ProcessID3`'s audio-format loop seeks past `$hdrEnd` and
+/// re-dispatches the OGG body, ID3.pm:1582-1601).
+///
+/// Bundled emits `File:ID3Size` for every ID3-prefixed Ogg-Vorbis stream
+/// (even an empty 10-byte header); pre-fix the engine dispatch stripped the
+/// ID3v2 prefix to reparse but never emitted the ID3 directory — silent
+/// metadata loss caught by Codex round 3.
+///
+/// Returns `Some(Meta)` (with `id3` nested) whenever the OGG body parsed
+/// successfully OR when the body parse rejected the slice (in which case
+/// the typed Meta carries `success = false` so the engine continues the
+/// candidate loop — and in particular the dispatch arm filters this case
+/// out to allow MP3 dispatch on an `ID3-prefixed MP3` to win).
+///
+/// `#[cfg(feature = "id3")]`: the `ogg` Cargo feature pulls `id3` (Cargo
+/// manifest), so this is the production path for the `OGG` file-type entry.
+/// Lifetime `'a` borrows from `data` (the ID3 sub-Meta owns its strings;
+/// the OGG Meta is mostly owned today — Phase G zero-alloc plan still
+/// applies).
+#[cfg(feature = "id3")]
+pub(crate) fn parse_full_chained<'a>(
+  data: &'a [u8],
+  shared: &mut crate::format_parser::SharedFlags,
+) -> Result<Option<Meta<'a>>, Error> {
+  // 1. Embedded ID3 (Ogg.pm:79-83). The recursion guard (ID3.pm:1435 `return
+  //    0 if $$et{DoneID3}`) is honoured here via `shared.done_id3().is_none()`:
+  //    only call when ID3 has not already run on this chain (a standalone
+  //    OGG file-type entry always gets a fresh `SharedFlags`).
+  let (id3, hdr_end) = if shared.done_id3().is_none() {
+    crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
+      .unwrap_or((None, 0))
+  } else {
+    (None, shared.id3_hdr_end().unwrap_or(0))
+  };
+
+  // 2. OGG container walk on the POST-ID3 slice. ID3.pm:1590 `Seek($hdrEnd,
+  //    0)` followed by re-dispatch on the audio body — same semantics as
+  //    `ape::parse_full_chained` (the body parser sees the bytes starting at
+  //    the post-ID3-header offset).
+  let body_slice = data.get(hdr_end..).unwrap_or(&[]);
+  match parse_inner(body_slice, /* print_conv */ true)? {
+    Some(mut meta) => {
+      meta.id3 = id3;
+      Ok(Some(meta))
+    }
+    // `parse_inner` always returns `Some` today (the typed Meta carries
+    // `success` even for non-OGG input). The `None` arm is reachable only
+    // if a future revision starts rejecting on Rust-level errors; treat as
+    // "no Meta" so the candidate loop continues.
+    None => Ok(None),
+  }
 }
 
 /// Inner parser — produces a borrow-from-input [`Meta`] (technically
@@ -1777,6 +1866,8 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     .collect();
   let comments: Vec<Comment> = staging.tags_slice().iter().map(tag_to_comment).collect();
   Ok(Some(Meta {
+    #[cfg(feature = "id3")]
+    id3: None,
     file_type_override,
     vorbis_identification,
     opus_header,
@@ -1935,6 +2026,27 @@ impl Meta<'_> {
     print_conv: bool,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
+    // 0. Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). Bundled
+    //    runs `ProcessID3` BEFORE the OGG container walk — `File:ID3Size`
+    //    + every `ID3v2_*:*` frame tag precede any Vorbis:* / Opus:* tag.
+    //    R3 F1 (Codex adversarial): the pre-fix engine arm stripped the
+    //    ID3v2 prefix to reparse `bytes[hdr_end..]` but never emitted the
+    //    ID3 directory, forcing a silent metadata-loss path. Nesting +
+    //    emitting via `Id3Meta::serialize_tags` is the same pattern
+    //    `ape::Meta`, `flac::Meta`, `dsf::Meta` use.
+    //
+    //    Bundled key ordering in `-j -G1` output places `File:ID3Size`
+    //    near `File:*` (system-emitted) and the `ID3v2_*:*` frames after
+    //    the Vorbis block. The conformance gate (object-key MULTISET,
+    //    NOT order — `tests/conformance.rs:1-7`) accepts any consistent
+    //    emission order; we emit ID3 sub-Meta first so the writer's
+    //    insertion order (which feeds `serde_json::Map` first-wins) is
+    //    deterministic, with the value multiset matching bundled exactly.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.serialize_tags(print_conv, out)?;
+    }
+
     // 1. Vorbis identification (Vorbis.pm:40-70). Emit in DECLARED OFFSET
     //    order: VorbisVersion (0), AudioChannels (4), SampleRate (5),
     //    MaximumBitrate (9), NominalBitrate (13), MinimumBitrate (17).
@@ -2380,6 +2492,8 @@ mod tests {
     // Drive a typed Meta with a vendor + a non-list scalar; verify
     // serialize_tags emits both via write_str.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2409,6 +2523,8 @@ mod tests {
   fn meta_sinker_list_coalesces_into_tagvalue_list_via_json_writer() {
     use crate::value::TagValue;
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2443,6 +2559,8 @@ mod tests {
     // A typed Meta with no comments but two warnings — serialize_tags
     // routes them to write_warning.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: None,
       opus_header: None,
@@ -2480,6 +2598,8 @@ mod tests {
     // The typed Meta carries owned SmolStr/Vec<u8> (the `'a` lifetime is
     // phantom). Verify field accessors round-trip.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: None,
@@ -2683,6 +2803,8 @@ mod tests {
     // SampleRate / MaximumBitrate? / NominalBitrate? / MinimumBitrate?.
     // Zero-bitrate fields are dropped (RawConv `$val || undef`).
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2726,6 +2848,8 @@ mod tests {
     // `print_conv = false` ⇒ raw u32 bps (no ConvertBitrate). Pins the
     // `-n` mode emission shape for the bitrate fields.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2759,6 +2883,8 @@ mod tests {
     // emit ONLY the populated fields — not the bitrate trio. This pins the
     // per-field emit gate in `serialize_tags`.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
         vorbis_version: Some(0),
@@ -2793,6 +2919,8 @@ mod tests {
     // Opus.pm:36-51 declared-offset order: OpusVersion / AudioChannels /
     // SampleRate / OutputGain.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: Some(OpusHeader {
@@ -2827,6 +2955,8 @@ mod tests {
     // OpusHeader with only OpusVersion + AudioChannels populated must
     // emit just those two keys.
     let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: Some(OpusHeader {

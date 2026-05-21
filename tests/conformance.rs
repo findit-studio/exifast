@@ -393,6 +393,32 @@ fn ogg_vorbis_specialkeys_conformance() {
 }
 
 #[test]
+fn ogg_id3_prefixed_conformance() {
+  // R3 F1 regression pin (Codex round-3 [high] disposition).
+  //
+  // Fixture: a real Ogg-Vorbis stream with a 34-byte ID3v2.3 PREFIX
+  // (10-byte header + a TIT2 frame containing "IDPrefixTitle") in front
+  // of the `OggS` page. Bundled `ProcessOGG` (Ogg.pm:79-83) runs
+  // `ID3::ProcessID3` BEFORE the OGG container walk; the audio-format
+  // loop (ID3.pm:1582-1601) then seeks past `$hdrEnd` and re-dispatches
+  // OGG on the post-ID3 body. Net emission: `File:ID3Size`, every Vorbis
+  // tag, plus the ID3v2 frame tags.
+  //
+  // Pre-fix the engine's `AnyParser::Ogg` arm stripped the ID3v2 prefix
+  // to reparse `bytes[hdr_end..]` but never emitted the ID3 directory —
+  // silent metadata loss (`File:ID3Size` + `ID3v2_3:Title` both dropped).
+  // R3 F1 fix: nest typed `Id3Meta` into `ogg::Meta::id3` via
+  // `ogg::parse_full_chained`, same pattern as APE/FLAC/DSF
+  // (`ape::parse_full_chained`, `flac::parse_inner`, etc.).
+  //
+  // Golden: bundled `perl exiftool -j -G1 -struct ... --Composite:Duration`
+  // (Composite engine is on the accepted-deferral list — see Vorbis.ogg).
+  // Every other emitted tag is value-equivalent to bundled in both modes.
+  check("ogg_id3_prefixed.ogg", "ogg_id3_prefixed.ogg.json", true);
+  check("ogg_id3_prefixed.ogg", "ogg_id3_prefixed.ogg.n.json", false);
+}
+
+#[test]
 fn ogg_opus_synthetic_conformance() {
   // A synthetic minimal Ogg-Opus stream (BOS page wrapping `OpusHead` +
   // EOS page wrapping `OpusTags` with vendor + 2 KEY=VALUE comments —
