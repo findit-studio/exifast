@@ -1379,7 +1379,14 @@ fn parse_borrowed(mut ctx: ApeContext<'_>) -> Option<ApeMeta<'static>> {
   // Phase-2 storage); pure lib-callers use `shared.done_id3()`. Prefer the
   // legacy mirror when present (the bridge knows the file-actual size); fall
   // back to `shared`.
-  let done_id3 = ctx.done_id3_legacy.unwrap_or_else(|| ctx.shared.done_id3());
+  // `done_id3` here is the `usize` shift amount for APE.pm:169
+  // (`$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1`). `SharedFlags::done_id3()`
+  // is now `Option<usize>` (None ⇒ not run); a not-run / ran-no-trailer state
+  // maps to a 0 shift, which the `> 1` guard in the planner already enforces.
+  let done_id3 = ctx
+    .done_id3_legacy
+    .or_else(|| ctx.shared.done_id3())
+    .unwrap_or(0);
   // The planner runs with `print_conv_enabled = false` so the static-def
   // `convert::apply` step yields the post-ValueConv RAW scalars (for
   // `MAIN_DURATION`: the f64 from `ape_duration_value_conv`'s signed-i32
@@ -4285,7 +4292,7 @@ mod tests {
     shared.set_done_id3(128);
     let mut ctx = ApeContext::new(&bytes, &mut shared);
     assert_eq!(ctx.data().len(), 4);
-    assert_eq!(ctx.shared().done_id3(), 128);
+    assert_eq!(ctx.shared().done_id3(), Some(128));
     ctx.shared_mut().set_done_ape(true);
     assert!(ctx.shared().done_ape());
   }

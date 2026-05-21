@@ -1046,10 +1046,10 @@ mod tests {
     let mut shared = SharedFlags::new();
     {
       let mut ctx = WvContext::new(&data, &mut shared);
-      assert_eq!(ctx.shared().done_id3(), 0);
+      assert_eq!(ctx.shared().done_id3(), None);
       ctx.shared_mut().set_done_id3(128);
     }
-    assert_eq!(shared.done_id3(), 128);
+    assert_eq!(shared.done_id3(), Some(128));
   }
 
   // -------------------------------------------------------------------------

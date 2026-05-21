@@ -1940,7 +1940,7 @@ mod tests {
     data.extend_from_slice(&build_id3v1_block());
     let mut shared = SharedFlags::new();
     let _ = parse_id3_borrowed(&data, Some(&mut shared)).expect("ok");
-    assert_eq!(shared.done_id3(), 128);
+    assert_eq!(shared.done_id3(), Some(128));
   }
 
   #[test]

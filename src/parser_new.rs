@@ -196,10 +196,17 @@ pub trait MetaSinker {
 /// D8 convention: no public fields; accessors only.
 #[derive(Debug, Default, Clone)]
 pub struct SharedFlags {
-  /// `$$et{DoneID3}` — set by ID3 to the size of the ID3v1 trailer
-  /// (128 + 227 if Enhanced TAG, etc.). Read by `APE.pm:169` for the
-  /// footer-position shift.
-  done_id3: usize,
+  /// `$$et{DoneID3}` — `None` until `ProcessID3` runs (`unless ($$et{DoneID3})`
+  /// recursion guard, ID3.pm:1435); `Some(n)` once run, with `n` the ID3v1
+  /// trailer size in bytes (128 + 227 if Enhanced TAG, etc.; `0` when ID3v2
+  /// was found but no v1 trailer — ID3.pm:1436 sets `1` as a truthy "ran"
+  /// marker, which the APE shift's `> 1` guard treats identically to `0`).
+  /// Read by `APE.pm:169` (`$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1`)
+  /// for the footer-position shift. Mirrors the legacy
+  /// [`crate::value::Metadata::done_id3`] `Option<usize>` shape so the bridge
+  /// and the typed chained dispatch agree on the not-run vs ran-no-trailer
+  /// distinction (Codex AF1/BF3).
+  done_id3: Option<usize>,
   /// `$$et{DoneAPE}` — set by APE after running, read by `ID3.pm:1723`
   /// to gate the wrapper APE-trailer fallback.
   done_ape: bool,
@@ -219,17 +226,23 @@ impl SharedFlags {
     Self::default()
   }
 
-  /// `$$et{DoneID3}` — bytes consumed by an ID3v1 trailer (128 + 227 if
-  /// Enhanced TAG, etc.). Zero means "not yet processed".
+  /// `$$et{DoneID3}` — `None` until `ProcessID3` runs; `Some(n)` once run,
+  /// with `n` the ID3v1-trailer size in bytes (`Some(0)` ⇒ ran but no v1
+  /// trailer). The `unless ($$et{DoneID3})` recursion guard (ID3.pm:1435,
+  /// APE.pm:124) maps to `is_none()`; the APE.pm:169 footer shift maps to
+  /// `done_id3().is_some_and(|n| n > 1)`. Mirrors
+  /// [`crate::value::Metadata::done_id3`] (Codex AF1/BF3).
   #[must_use]
-  pub fn done_id3(&self) -> usize {
+  pub fn done_id3(&self) -> Option<usize> {
     self.done_id3
   }
 
-  /// Set `$$et{DoneID3}`. Called by the ID3 parser after the v1 trailer
-  /// is consumed.
-  pub fn set_done_id3(&mut self, value: usize) {
-    self.done_id3 = value;
+  /// Set `$$et{DoneID3} = trailer_size`. Called by the ID3 parser after a
+  /// v1 trailer is consumed (pass `0` for the "ID3v2 found, no v1 trailer"
+  /// case — ID3.pm:1436 sets the truthy `1` marker; the APE `> 1` arithmetic
+  /// guard treats `0` and `1` identically, so we normalize to `0`).
+  pub fn set_done_id3(&mut self, trailer_size: usize) {
+    self.done_id3 = Some(trailer_size);
   }
 
   /// `$$et{DoneAPE}` — APE-trailer-already-handled flag, gates the
@@ -990,7 +1003,7 @@ mod tests {
   #[test]
   fn shared_flags_round_trip() {
     let mut sf = SharedFlags::new();
-    assert_eq!(sf.done_id3(), 0);
+    assert_eq!(sf.done_id3(), None);
     assert!(!sf.done_ape());
     assert!(sf.file_type_stack().is_empty());
     assert_eq!(sf.current_file_type(), None);
@@ -999,7 +1012,7 @@ mod tests {
     sf.set_done_ape(true);
     sf.push_file_type("MP3");
     sf.push_file_type("ID3");
-    assert_eq!(sf.done_id3(), 128);
+    assert_eq!(sf.done_id3(), Some(128));
     assert!(sf.done_ape());
     assert_eq!(sf.current_file_type(), Some("ID3"));
     assert_eq!(sf.file_type_stack(), &[Some("MP3"), Some("ID3")]);
