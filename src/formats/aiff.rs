@@ -349,7 +349,13 @@ pub static AIFF_COMMENT: TagTable = TagTable::new("AIFF", aiff_comment_get);
 /// `Djvu` carries the AT&TFORM body. AIFF.pm:206 appends `" (multi-page)"`
 /// to FileType when the tail is `DJVM` (see [`AiffMeta::djvu_multi_page`]).
 /// Body parsing under the DjVu arm is deferred per the module-level doc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §2: `#[non_exhaustive]` (the FORM-magic vocabulary may grow with future
+/// container variants), `is_*` predicates, and a `Display` routed through the
+/// single [`Self::as_file_type`] source of truth.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display)]
+#[display("{}", self.as_file_type())]
 pub enum AiffMagic {
   /// `FORM....AIFF` (AIFF.pm:209-210, `$1 == "AIFF"`).
   Aiff,
@@ -362,8 +368,9 @@ pub enum AiffMagic {
 impl AiffMagic {
   /// The `$1` capture form as a `&'static str` — the argument to
   /// `SetFileType` (`"AIFF"` / `"AIFC"`) or the AIFF.pm:202 explicit
-  /// `"DJVU"`.
+  /// `"DJVU"`. Single source of truth for [`core::fmt::Display`] (§2).
   #[must_use]
+  #[inline(always)]
   pub const fn as_file_type(self) -> &'static str {
     match self {
       AiffMagic::Aiff => "AIFF",
@@ -389,7 +396,16 @@ impl AiffMagic {
 ///   via [`crate::value::perl_nonfinite_str`].
 ///
 /// D8: newtype-style enum, no public fields.
-#[derive(Debug, Clone)]
+///
+/// §1/§2: a [`Self::Float`] f64 arm precludes `Eq`/`Hash` (NaN ≠ NaN) — the
+/// derive stops at `Debug, Clone`. §2 supplies `is_*` predicates and
+/// `unwrap`/`try_unwrap` accessors so callers never hand-match; all three
+/// variants are newtypes (no struct-style or multi-field tuple variants).
+/// `#[non_exhaustive]` reserves headroom for further Perl scalar shapes.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum AiffSampleRate {
   /// Perl IV path: exact integer in `i64::MIN..=i64::MAX`.
   Int(i64),
@@ -410,6 +426,7 @@ impl AiffSampleRate {
   /// Returns `None` only for the (impossible-in-practice) case where a
   /// `BigUInt` string fails to parse as f64 — we keep the path defensive.
   #[must_use]
+  #[inline]
   pub fn as_f64(&self) -> Option<f64> {
     match self {
       AiffSampleRate::Int(n) => Some(*n as f64),
@@ -430,7 +447,15 @@ impl AiffSampleRate {
 /// uses (XMP.pm:2943 FixUTF8 under EscapeJSON).
 ///
 /// D8 — newtype variants, no public fields.
-#[derive(Debug, Clone)]
+///
+/// §2: single newtype variant with an `is_*` predicate + `unwrap`/`try_unwrap`
+/// accessors; `#[non_exhaustive]` reserves room for a future decoded shape.
+/// The borrowed view ([`Self::raw_text`]) projects the inner `Vec<u8>` to a
+/// `&[u8]` slice (§3) — callers never see the owning `Vec`.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum AiffCompressionType {
   /// `RawText` is the trimmed 4-byte string-fixed value as stored on
   /// disk (after [`process_binary_data`]'s `strip_at_first_null`). The
@@ -442,6 +467,19 @@ pub enum AiffCompressionType {
   ///    (the bundled-Perl `-n` output for a missing hash key is the
   ///    raw text, e.g. `"NONE"` → `"None"` only under `-j`).
   RawText(Vec<u8>),
+}
+
+impl AiffCompressionType {
+  /// Borrowed view of the raw 4-byte string-fixed CompressionType value
+  /// (§3: `Vec<u8>` projected to `&[u8]`). The sink keys the PrintConv
+  /// hash on `fix_utf8(self.raw_text())`.
+  #[must_use]
+  #[inline(always)]
+  pub fn raw_text(&self) -> &[u8] {
+    match self {
+      AiffCompressionType::RawText(b) => b.as_slice(),
+    }
+  }
 }
 
 /// One `%AIFF::Comment` entry. AIFF.pm:155-178 walks `numComments` × (time
@@ -467,8 +505,10 @@ pub struct AiffComment {
 }
 
 impl AiffComment {
-  /// `CommentTime` as the formatted `"YYYY:MM:DD HH:MM:SS"` string.
+  /// `CommentTime` as the formatted `"YYYY:MM:DD HH:MM:SS"` string
+  /// (§3: `String` projected to `&str`).
   #[must_use]
+  #[inline(always)]
   pub fn comment_time(&self) -> &str {
     &self.comment_time
   }
@@ -476,12 +516,14 @@ impl AiffComment {
   /// `MarkerID` raw u16. `None` when the on-disk value was 0 (Perl
   /// `if $markerID` gate).
   #[must_use]
-  pub fn marker_id(&self) -> Option<u16> {
+  #[inline(always)]
+  pub const fn marker_id(&self) -> Option<u16> {
     self.marker_id
   }
 
-  /// `Comment` text, MacRoman-decoded.
+  /// `Comment` text, MacRoman-decoded (§3: `String` projected to `&str`).
   #[must_use]
+  #[inline(always)]
   pub fn comment(&self) -> &str {
     &self.comment
   }
@@ -512,33 +554,41 @@ pub struct AiffCommon {
 }
 
 impl AiffCommon {
-  /// NumChannels, raw int16u.
+  /// NumChannels, raw int16u (Copy → by value, bare name; §3).
   #[must_use]
-  pub fn num_channels(&self) -> u16 {
+  #[inline(always)]
+  pub const fn num_channels(&self) -> u16 {
     self.num_channels
   }
-  /// NumSampleFrames, raw int32u.
+  /// NumSampleFrames, raw int32u (Copy → by value).
   #[must_use]
-  pub fn num_sample_frames(&self) -> u32 {
+  #[inline(always)]
+  pub const fn num_sample_frames(&self) -> u32 {
     self.num_sample_frames
   }
-  /// SampleSize, raw int16u.
+  /// SampleSize, raw int16u (Copy → by value).
   #[must_use]
-  pub fn sample_size(&self) -> u16 {
+  #[inline(always)]
+  pub const fn sample_size(&self) -> u16 {
     self.sample_size
   }
-  /// SampleRate, 80-bit extended decoded.
+  /// SampleRate, 80-bit extended decoded (§3: non-`Copy` borrow ⇒ `_ref`).
   #[must_use]
-  pub fn sample_rate(&self) -> &AiffSampleRate {
+  #[inline(always)]
+  pub const fn sample_rate_ref(&self) -> &AiffSampleRate {
     &self.sample_rate
   }
-  /// `CompressionType` (AIFC). `None` for AIFF or short COMM.
+  /// `CompressionType` (AIFC). `None` for AIFF or short COMM (§3:
+  /// `Option<T>` non-`Copy` ⇒ `Option<&T>` with the `_ref` name).
   #[must_use]
-  pub fn compression_type(&self) -> Option<&AiffCompressionType> {
+  #[inline(always)]
+  pub const fn compression_type_ref(&self) -> Option<&AiffCompressionType> {
     self.compression_type.as_ref()
   }
-  /// `CompressorName` (AIFC, MacRoman-decoded pstring). `None` for AIFF.
+  /// `CompressorName` (AIFC, MacRoman-decoded pstring). `None` for AIFF
+  /// (§3: `Option<String>` projected to the `Option<&str>` view).
   #[must_use]
+  #[inline(always)]
   pub fn compressor_name(&self) -> Option<&str> {
     self.compressor_name.as_deref()
   }
@@ -604,7 +654,7 @@ enum AiffEvent {
 /// if let Some(aiff) = ProcessAiff.parse(&bytes)? {
 ///     if let Some(c) = aiff.common() {
 ///         println!("Channels: {}", c.num_channels());
-///         println!("Sample rate: {:?}", c.sample_rate());
+///         println!("Sample rate: {:?}", c.sample_rate_ref());
 ///     }
 ///     if let Some(d) = aiff.duration() {
 ///         println!("Duration: {} s", d.as_secs_f64());
@@ -637,16 +687,19 @@ pub struct AiffMeta<'a> {
 }
 
 impl AiffMeta<'_> {
-  /// AIFF / AIFC / DJVU magic from the FORM header (AIFF.pm:209-210).
+  /// AIFF / AIFC / DJVU magic from the FORM header (AIFF.pm:209-210)
+  /// (Copy → by value, bare name; §3).
   #[must_use]
-  pub fn magic(&self) -> AiffMagic {
+  #[inline(always)]
+  pub const fn magic(&self) -> AiffMagic {
     self.magic
   }
 
   /// True iff [`Self::magic`] == `Djvu` AND the 4-byte tail at
   /// bytes 12..16 was `DJVM` (AIFF.pm:206 multi-page).
   #[must_use]
-  pub fn djvu_multi_page(&self) -> bool {
+  #[inline(always)]
+  pub const fn djvu_multi_page(&self) -> bool {
     self.djvm_multi_page
   }
 
@@ -770,7 +823,8 @@ impl AiffMeta<'_> {
   /// this accessor exposes the raw f64 (for sink-time PrintConv +
   /// non-finite rendering).
   #[must_use]
-  pub fn composite_duration_secs(&self) -> Option<f64> {
+  #[inline(always)]
+  pub const fn composite_duration_secs(&self) -> Option<f64> {
     self.composite_duration
   }
 
@@ -1492,17 +1546,13 @@ fn sink_comment(
 /// Rust-level fatal modes for AIFF parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror`
+/// (v2, `default-features = false` ⇒ `core::error::Error` for no-std);
+/// `#[non_exhaustive]` lets future variants land without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AiffError {}
-
-impl core::fmt::Display for AiffError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for AiffError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1807,9 +1857,60 @@ mod tests {
     // (exp != 0 ⇒ Perl NV path even for integer-valued results). Codex
     // R10 documented this divergence; the SampleRate variant matches.
     assert!(
-      matches!(common.sample_rate(), AiffSampleRate::Float(x) if (*x - 22050.0).abs() < 1e-9)
+      matches!(common.sample_rate_ref(), AiffSampleRate::Float(x) if (*x - 22050.0).abs() < 1e-9)
     );
     let dur = meta.duration().expect("duration finite & positive");
     assert!((dur.as_secs_f64() - 4.0).abs() < 1e-9);
+  }
+
+  // ---------- §2/§3 convention surface -----------------------------------
+
+  #[test]
+  fn aiff_magic_predicates_and_display_route_through_as_file_type() {
+    // §2: is_* predicates (derive_more::IsVariant).
+    assert!(AiffMagic::Aiff.is_aiff());
+    assert!(AiffMagic::Aifc.is_aifc());
+    assert!(AiffMagic::Djvu.is_djvu());
+    assert!(!AiffMagic::Aiff.is_djvu());
+    // §2: Display is the single `as_file_type` source of truth.
+    for m in [AiffMagic::Aiff, AiffMagic::Aifc, AiffMagic::Djvu] {
+      assert_eq!(m.to_string(), m.as_file_type());
+    }
+    assert_eq!(AiffMagic::Aifc.to_string(), "AIFC");
+  }
+
+  #[test]
+  fn aiff_sample_rate_predicates_and_unwrap_accessors() {
+    let i = AiffSampleRate::Int(44_100);
+    assert!(i.is_int());
+    assert_eq!(*i.unwrap_int_ref(), 44_100);
+    let b = AiffSampleRate::BigUInt("18446744073709551615".into());
+    assert!(b.is_big_u_int());
+    assert!(b.try_unwrap_float_ref().is_err());
+    let f = AiffSampleRate::Float(48_000.5);
+    assert!(f.is_float());
+    assert!((f.try_unwrap_float_ref().copied().unwrap() - 48_000.5).abs() < 1e-9);
+    // Non-finite faithful behavior preserved through as_f64.
+    assert!(
+      AiffSampleRate::Float(f64::INFINITY)
+        .as_f64()
+        .unwrap()
+        .is_infinite()
+    );
+  }
+
+  #[test]
+  fn aiff_compression_type_raw_text_projects_to_slice() {
+    let c = AiffCompressionType::RawText(b"NONE".to_vec());
+    assert!(c.is_raw_text());
+    assert_eq!(c.raw_text(), b"NONE");
+    assert_eq!(c.unwrap_raw_text_ref().as_slice(), b"NONE");
+  }
+
+  #[test]
+  fn aiff_error_is_thiserror_uninhabited() {
+    // §5: empty enum derives core::error::Error via thiserror.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<AiffError>();
   }
 }

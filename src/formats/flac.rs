@@ -390,37 +390,111 @@ struct StreamInfo {
 /// (the Vorbis spec mandates UTF-8); pathological non-UTF-8 input falls
 /// back to `String::from_utf8_lossy` (owned) — faithful to Perl's
 /// `$et->Decode($val,'UTF8')` lossy behavior.
-#[derive(Debug, Clone)]
+///
+/// §2: every variant is unit or **newtype** — the multi-field `Named`/`Auto`
+/// payloads are extracted into the named structs [`VorbisNamed`] /
+/// [`VorbisAuto`] (private fields + accessors) so each variant hands back one
+/// coherent, independently-named payload. `#[non_exhaustive]` reserves room
+/// for future Vorbis dispositions; `is_*` + `unwrap`/`try_unwrap` accessors
+/// keep callers off hand-matching.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum VorbisItem<'a> {
   /// `vendor` (Vorbis.pm:181-187). Exactly one per block.
   Vendor(Cow<'a, str>),
-  /// A known Vorbis key. The `name` carries the bundled-Perl tag name
-  /// (`"Title"`, `"Artist"`, …). For list-tags (Artist/Performer/Contact),
-  /// each emission is one item; the sink/bridge coalesces same-name
-  /// repeats into a JSON array.
-  Named {
-    /// bundled-Perl tag name (e.g. `"Title"`).
-    name: &'static str,
-    /// raw UTF-8 value (post-Decode).
-    value: Cow<'a, str>,
-    /// Vorbis.pm `List => 1` flag (drives `push_listable` semantics at the
-    /// legacy-bridge sink).
-    listable: bool,
-  },
-  /// Unknown Vorbis key → auto-named (Vorbis.pm:188-196). `name` is owned
-  /// (synthesized via regex transform; cannot borrow from input).
-  Auto {
-    /// Auto-derived name.
-    name: String,
-    /// raw UTF-8 value.
-    value: Cow<'a, str>,
-  },
+  /// A known Vorbis key (payload [`VorbisNamed`]). For list-tags
+  /// (Artist/Performer/Contact), each emission is one item; the sink/bridge
+  /// coalesces same-name repeats into a JSON array.
+  Named(VorbisNamed<'a>),
+  /// Unknown Vorbis key → auto-named (Vorbis.pm:188-196), payload
+  /// [`VorbisAuto`]. The name is owned (synthesized via regex transform;
+  /// cannot borrow from input).
+  Auto(VorbisAuto<'a>),
   /// `COVERART` (Vorbis.pm:97-105) base64-decoded bytes.
   CoverArt(Vec<u8>),
   /// `METADATA_BLOCK_PICTURE` (Vorbis.pm:122-135) — faithful disposition is
-  /// a single Warning, no tag emission. `value` carries the raw base64
+  /// a single Warning, no tag emission. The payload carries the raw base64
   /// for debug visibility but is not emitted.
   PictureRecursionWarning(Cow<'a, str>),
+}
+
+/// Payload for [`VorbisItem::Named`] — a known Vorbis comment key
+/// (Vorbis.pm:80-121). §2 named-struct extraction: PRIVATE fields, accessors
+/// only.
+#[derive(Debug, Clone)]
+pub struct VorbisNamed<'a> {
+  /// bundled-Perl tag name (e.g. `"Title"`).
+  name: &'static str,
+  /// raw UTF-8 value (post-Decode).
+  value: Cow<'a, str>,
+  /// Vorbis.pm `List => 1` flag (drives `push_listable` semantics at the
+  /// legacy-bridge sink).
+  listable: bool,
+}
+
+impl<'a> VorbisNamed<'a> {
+  /// Construct a named Vorbis comment payload.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(name: &'static str, value: Cow<'a, str>, listable: bool) -> Self {
+    Self {
+      name,
+      value,
+      listable,
+    }
+  }
+  /// Bundled-Perl tag name (e.g. `"Title"`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+  /// Raw UTF-8 value, post-Decode (§3: `Cow` projected to `&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn value(&self) -> &str {
+    &self.value
+  }
+  /// Vorbis.pm `List => 1` flag.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_listable(&self) -> bool {
+    self.listable
+  }
+}
+
+/// Payload for [`VorbisItem::Auto`] — an unknown Vorbis key auto-named via the
+/// Vorbis.pm:188-196 regex transform. §2 named-struct extraction: PRIVATE
+/// fields, accessors only.
+#[derive(Debug, Clone)]
+pub struct VorbisAuto<'a> {
+  /// Auto-derived name (owned; synthesized, cannot borrow from input).
+  name: String,
+  /// raw UTF-8 value.
+  value: Cow<'a, str>,
+}
+
+impl<'a> VorbisAuto<'a> {
+  /// Construct an auto-named Vorbis comment payload.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(name: String, value: Cow<'a, str>) -> Self {
+    Self { name, value }
+  }
+  /// Auto-derived name (§3: `String` projected to `&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+  /// Raw UTF-8 value (§3: `Cow` projected to `&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn value(&self) -> &str {
+    &self.value
+  }
 }
 
 /// One FLAC Picture metadata block (block_type 6) — FLAC.pm:84-134.
@@ -448,55 +522,68 @@ pub struct FlacPicture<'a> {
 }
 
 impl FlacPicture<'_> {
-  /// Picture type code (FLAC.pm:88-113 raw int32u, ID3-spec Picture type).
+  /// Picture type code (FLAC.pm:88-113 raw int32u, ID3-spec Picture type)
+  /// (Copy → by value, bare name; §3).
   #[must_use]
-  pub fn picture_type(&self) -> u32 {
+  #[inline(always)]
+  pub const fn picture_type(&self) -> u32 {
     self.picture_type
   }
   /// Picture type PrintConv string (e.g. `"Front Cover"`); `None` for codes
   /// outside the bundled 0..=20 table (raw numeric used in that case).
   #[must_use]
-  pub fn picture_type_name(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn picture_type_name(&self) -> Option<&'static str> {
     picture_type_name(self.picture_type)
   }
-  /// MIME type (e.g. `"image/png"`).
+  /// MIME type, e.g. `"image/png"` (§3: `Cow` projected to `&str`).
   #[must_use]
+  #[inline(always)]
   pub fn mime_type(&self) -> &str {
     &self.mime_type
   }
-  /// Description (UTF-8).
+  /// Description, UTF-8 (§3: `Cow` projected to `&str`).
   #[must_use]
+  #[inline(always)]
   pub fn description(&self) -> &str {
     &self.description
   }
-  /// Picture width in pixels.
+  /// Picture width in pixels (Copy → by value).
   #[must_use]
-  pub fn width(&self) -> u32 {
+  #[inline(always)]
+  pub const fn width(&self) -> u32 {
     self.width
   }
-  /// Picture height in pixels.
+  /// Picture height in pixels (Copy → by value).
   #[must_use]
-  pub fn height(&self) -> u32 {
+  #[inline(always)]
+  pub const fn height(&self) -> u32 {
     self.height
   }
-  /// Bits per pixel.
+  /// Bits per pixel (Copy → by value).
   #[must_use]
-  pub fn bits_per_pixel(&self) -> u32 {
+  #[inline(always)]
+  pub const fn bits_per_pixel(&self) -> u32 {
     self.bits_per_pixel
   }
-  /// Indexed colors (0 for non-paletted).
+  /// Indexed colors (0 for non-paletted) (Copy → by value).
   #[must_use]
-  pub fn indexed_colors(&self) -> u32 {
+  #[inline(always)]
+  pub const fn indexed_colors(&self) -> u32 {
     self.indexed_colors
   }
-  /// Declared length in bytes (may exceed `data().len()` on truncation).
+  /// Declared length in bytes (may exceed `data().len()` on truncation)
+  /// (Copy → by value).
   #[must_use]
-  pub fn length(&self) -> u32 {
+  #[inline(always)]
+  pub const fn length(&self) -> u32 {
     self.length
   }
-  /// Raw picture bytes (borrowed from input; clamped to remaining payload).
+  /// Raw picture bytes (borrowed from input; clamped to remaining payload)
+  /// (§3: byte view `&[u8]`).
   #[must_use]
-  pub fn data(&self) -> &[u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &[u8] {
     self.data
   }
 }
@@ -526,51 +613,61 @@ pub struct FlacMeta<'a> {
 }
 
 impl<'a> FlacMeta<'a> {
-  /// FLAC.pm:63 BlockSizeMin (`Bit000-015`).
+  /// FLAC.pm:63 BlockSizeMin (`Bit000-015`) (Copy → by value; §3).
   #[must_use]
-  pub fn block_size_min(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn block_size_min(&self) -> Option<u32> {
     self.stream_info.block_size_min
   }
-  /// FLAC.pm:64 BlockSizeMax (`Bit016-031`).
+  /// FLAC.pm:64 BlockSizeMax (`Bit016-031`) (Copy → by value).
   #[must_use]
-  pub fn block_size_max(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn block_size_max(&self) -> Option<u32> {
     self.stream_info.block_size_max
   }
-  /// FLAC.pm:65 FrameSizeMin (`Bit032-055`).
+  /// FLAC.pm:65 FrameSizeMin (`Bit032-055`) (Copy → by value).
   #[must_use]
-  pub fn frame_size_min(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn frame_size_min(&self) -> Option<u32> {
     self.stream_info.frame_size_min
   }
-  /// FLAC.pm:66 FrameSizeMax (`Bit056-079`).
+  /// FLAC.pm:66 FrameSizeMax (`Bit056-079`) (Copy → by value).
   #[must_use]
-  pub fn frame_size_max(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn frame_size_max(&self) -> Option<u32> {
     self.stream_info.frame_size_max
   }
-  /// FLAC.pm:67 SampleRate Hz (`Bit080-099`).
+  /// FLAC.pm:67 SampleRate Hz (`Bit080-099`) (Copy → by value).
   #[must_use]
-  pub fn sample_rate(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> Option<u32> {
     self.stream_info.sample_rate
   }
-  /// FLAC.pm:68-71 Channels (post-ValueConv `$val + 1`).
+  /// FLAC.pm:68-71 Channels (post-ValueConv `$val + 1`) (Copy → by value).
   #[must_use]
-  pub fn channels(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn channels(&self) -> Option<u8> {
     self.stream_info.channels
   }
-  /// FLAC.pm:72-75 BitsPerSample (post-ValueConv `$val + 1`).
+  /// FLAC.pm:72-75 BitsPerSample (post-ValueConv `$val + 1`) (Copy → by value).
   #[must_use]
-  pub fn bits_per_sample(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn bits_per_sample(&self) -> Option<u8> {
     self.stream_info.bits_per_sample
   }
-  /// FLAC.pm:76 TotalSamples.
+  /// FLAC.pm:76 TotalSamples (Copy → by value).
   #[must_use]
-  pub fn total_samples(&self) -> Option<u64> {
+  #[inline(always)]
+  pub const fn total_samples(&self) -> Option<u64> {
     self.stream_info.total_samples
   }
   /// FLAC.pm:77-81 MD5Signature raw 16 bytes. Use [`md5_hex`](Self::md5_hex)
-  /// for the bundled-Perl `unpack("H*", ...)` rendering.
+  /// for the bundled-Perl `unpack("H*", ...)` rendering. (`[u8; 16]` is
+  /// `Copy` ⇒ returned by value, bare name; §3.)
   #[must_use]
-  pub fn md5_signature(&self) -> Option<&[u8; 16]> {
-    self.stream_info.md5_signature.as_ref()
+  #[inline(always)]
+  pub const fn md5_signature(&self) -> Option<[u8; 16]> {
+    self.stream_info.md5_signature
   }
   /// Bundled-Perl hex rendering of [`md5_signature`](Self::md5_signature)
   /// (32 lowercase hex characters). Allocates a [`String`] on every call;
@@ -584,15 +681,19 @@ impl<'a> FlacMeta<'a> {
       .map(|b| format_md5_hex(b))
   }
   /// Vorbis comment entries (Vorbis.pm:175-203), in extraction order
-  /// (the bundled-Perl loop order: vendor first, then each user comment).
+  /// (the bundled-Perl loop order: vendor first, then each user comment)
+  /// (§3: `Vec` projected to `&[T]`).
   #[must_use]
-  pub fn vorbis_items(&self) -> &[VorbisItem<'a>] {
-    &self.vorbis
+  #[inline(always)]
+  pub const fn vorbis_items(&self) -> &[VorbisItem<'a>] {
+    self.vorbis.as_slice()
   }
-  /// Picture frames (FLAC.pm:51-54). One entry per Picture block.
+  /// Picture frames (FLAC.pm:51-54). One entry per Picture block (§3: `Vec`
+  /// projected to `&[T]`).
   #[must_use]
-  pub fn pictures(&self) -> &[FlacPicture<'a>] {
-    &self.pictures
+  #[inline(always)]
+  pub const fn pictures(&self) -> &[FlacPicture<'a>] {
+    self.pictures.as_slice()
   }
   /// `Composite:Duration` — FLAC.pm:137-149 `($val[0] and $val[1]) ?
   /// $val[1] / $val[0] : undef`. Computed lazily from
@@ -621,7 +722,8 @@ impl<'a> FlacMeta<'a> {
   /// True iff FLAC.pm:263 set `$err = 1` during the block-chain walk (a
   /// truncated block read). Bundled emits the warning at FLAC.pm:278.
   #[must_use]
-  pub fn has_format_error(&self) -> bool {
+  #[inline(always)]
+  pub const fn has_format_error(&self) -> bool {
     self.format_error
   }
 }
@@ -655,20 +757,23 @@ pub struct FlacContext<'a> {
 impl<'a> FlacContext<'a> {
   /// Construct a FLAC parser context.
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut crate::parser_new::SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut crate::parser_new::SharedFlags) -> Self {
     Self { data, shared }
   }
 
-  /// File bytes accessor.
+  /// File bytes accessor (§3: byte view `&[u8]`).
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 
-  /// Shared flags (read-only access).
+  /// Shared flags (read-only access; §3: non-`Copy` borrow projection).
   #[must_use]
-  pub fn shared(&self) -> &crate::parser_new::SharedFlags {
-    &*self.shared
+  #[inline(always)]
+  pub const fn shared(&self) -> &crate::parser_new::SharedFlags {
+    self.shared
   }
 }
 
@@ -932,7 +1037,7 @@ fn parse_streaminfo(payload: &[u8]) -> StreamInfo {
 ///
 /// Returns nothing — items are appended to `out`. The function records a
 /// terminal "Format error in Vorbis comments" warning by pushing a
-/// synthetic `VorbisItem::Auto { name: "_FormatError", ... }` item — but
+/// synthetic `VorbisItem::Auto(VorbisAuto)` item — but
 /// since this internal item is invisible to the sink's filter we instead
 /// rely on the legacy-bridge wrapping the call and detecting truncation
 /// via the same exit conditions. To keep the typed API clean, this fn just
@@ -1024,16 +1129,16 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
       }
       _ => {
         if let Some(def) = lookup_vorbis_named(&tag_upper) {
-          out.push(VorbisItem::Named {
-            name: def.name(),
-            value: val,
-            listable: def.list(),
-          });
+          out.push(VorbisItem::Named(VorbisNamed::new(
+            def.name(),
+            val,
+            def.list(),
+          )));
         } else {
-          out.push(VorbisItem::Auto {
-            name: vorbis_derive_name(&tag_upper),
-            value: val,
-          });
+          out.push(VorbisItem::Auto(VorbisAuto::new(
+            vorbis_derive_name(&tag_upper),
+            val,
+          )));
         }
       }
     }
@@ -1374,15 +1479,9 @@ impl FlacMeta<'_> {
         VorbisItem::Vendor(s) => {
           out.write_str(VORBIS_GROUP, "Vendor", s)?;
         }
-        VorbisItem::Named {
-          name,
-          value,
-          listable,
-        } => {
-          if *listable {
-            // `name` binds as `&&'static str` (match ergonomics); `*name`
-            // is the `&str` key we coalesce on.
-            let key: &str = name;
+        VorbisItem::Named(named) => {
+          if named.is_listable() {
+            let key: &str = named.name();
             if emitted_listable.contains(&key) {
               // Already coalesced at first occurrence; skip the repeat.
               continue;
@@ -1392,22 +1491,18 @@ impl FlacMeta<'_> {
               .vorbis
               .iter()
               .filter_map(|it| match it {
-                VorbisItem::Named {
-                  name: n,
-                  value: v,
-                  listable: true,
-                } if *n == key => Some(&**v),
+                VorbisItem::Named(n) if n.is_listable() && n.name() == key => Some(n.value()),
                 _ => None,
               })
               .collect();
             out.write_str_list(VORBIS_GROUP, key, &refs)?;
             emitted_listable.push(key);
           } else {
-            out.write_str(VORBIS_GROUP, name, value)?;
+            out.write_str(VORBIS_GROUP, named.name(), named.value())?;
           }
         }
-        VorbisItem::Auto { name, value } => {
-          out.write_str(VORBIS_GROUP, name.as_str(), value)?;
+        VorbisItem::Auto(auto) => {
+          out.write_str(VORBIS_GROUP, auto.name(), auto.value())?;
         }
         VorbisItem::CoverArt(bytes) => {
           out.write_bytes(VORBIS_GROUP, "CoverArt", bytes)?;
@@ -1516,17 +1611,13 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
 /// Rust-level fatal modes for FLAC parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`) or a tagged warning
 /// (Perl `Warn`). Reserved for future I/O wrappers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror`
+/// (v2, `default-features = false` ⇒ `core::error::Error` for no-std);
+/// `#[non_exhaustive]` lets future variants land without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FlacError {}
-
-impl core::fmt::Display for FlacError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for FlacError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1619,10 +1710,10 @@ mod tests {
     assert!(process_vorbis_comments(&payload, &mut items));
     assert!(matches!(&items[0], VorbisItem::Vendor(c) if c == "vendor"));
     assert!(
-      matches!(&items[1], VorbisItem::Named { name, value, listable } if *name == "Title" && value == "Hi" && !listable)
+      matches!(&items[1], VorbisItem::Named(n) if n.name() == "Title" && n.value() == "Hi" && !n.is_listable())
     );
     assert!(
-      matches!(&items[2], VorbisItem::Named { name, value, .. } if *name == "Copyright" && value == "PH")
+      matches!(&items[2], VorbisItem::Named(n) if n.name() == "Copyright" && n.value() == "PH")
     );
   }
 
@@ -1634,7 +1725,7 @@ mod tests {
     let names: Vec<_> = items
       .iter()
       .filter_map(|i| match i {
-        VorbisItem::Named { name, listable, .. } => Some((*name, *listable)),
+        VorbisItem::Named(n) => Some((n.name(), n.is_listable())),
         _ => None,
       })
       .collect();
@@ -1649,7 +1740,7 @@ mod tests {
     let names: Vec<_> = items
       .iter()
       .filter_map(|i| match i {
-        VorbisItem::Auto { name, value } => Some((name.clone(), value.as_ref().to_string())),
+        VorbisItem::Auto(a) => Some((a.name().to_string(), a.value().to_string())),
         _ => None,
       })
       .collect();
@@ -1693,7 +1784,7 @@ mod tests {
     // derived name "Good" (Vorbis.pm:188-196 path).
     assert!(matches!(
       &items[1],
-      VorbisItem::Auto { name, .. } if name == "Good"
+      VorbisItem::Auto(a) if a.name() == "Good"
     ));
   }
 
@@ -1809,7 +1900,7 @@ mod tests {
     // Title comment present.
     assert!(meta.vorbis_items().iter().any(|i| matches!(
       i,
-      VorbisItem::Named { name, value, .. } if *name == "Title" && value == "ExifTool test"
+      VorbisItem::Named(n) if n.name() == "Title" && n.value() == "ExifTool test"
     )));
     // No pictures in this fixture.
     assert!(meta.pictures().is_empty());
@@ -2057,21 +2148,9 @@ mod tests {
     let meta = FlacMeta {
       stream_info: StreamInfo::default(),
       vorbis: vec![
-        VorbisItem::Named {
-          name: "Artist",
-          value: Cow::Borrowed("Alice"),
-          listable: true,
-        },
-        VorbisItem::Named {
-          name: "Title",
-          value: Cow::Borrowed("Song"),
-          listable: false,
-        },
-        VorbisItem::Named {
-          name: "Artist",
-          value: Cow::Borrowed("Bob"),
-          listable: true,
-        },
+        VorbisItem::Named(VorbisNamed::new("Artist", Cow::Borrowed("Alice"), true)),
+        VorbisItem::Named(VorbisNamed::new("Title", Cow::Borrowed("Song"), false)),
+        VorbisItem::Named(VorbisNamed::new("Artist", Cow::Borrowed("Bob"), true)),
       ],
       pictures: vec![],
       format_error: false,
@@ -2171,5 +2250,40 @@ mod tests {
       ])),
       TagValue::Str("d41d8cd98f00b204e9800998ecf8427e".into())
     );
+  }
+
+  // ---------- §2/§3 convention surface -----------------------------------
+
+  #[test]
+  fn vorbis_item_predicates_and_newtype_payload_accessors() {
+    // §2: every variant is unit/newtype with is_* predicates + unwrap.
+    let vendor = VorbisItem::Vendor(Cow::Borrowed("libFLAC"));
+    assert!(vendor.is_vendor());
+    assert_eq!(vendor.unwrap_vendor_ref(), "libFLAC");
+
+    let named = VorbisItem::Named(VorbisNamed::new("Artist", Cow::Borrowed("Alice"), true));
+    assert!(named.is_named());
+    let n = named.unwrap_named_ref();
+    assert_eq!(n.name(), "Artist");
+    assert_eq!(n.value(), "Alice");
+    assert!(n.is_listable());
+
+    let auto = VorbisItem::Auto(VorbisAuto::new("FooBar".to_string(), Cow::Borrowed("42")));
+    assert!(auto.is_auto());
+    let a = auto.unwrap_auto_ref();
+    assert_eq!(a.name(), "FooBar");
+    assert_eq!(a.value(), "42");
+
+    let cover = VorbisItem::CoverArt(vec![1, 2, 3]);
+    assert!(cover.is_cover_art());
+    assert!(named.try_unwrap_cover_art_ref().is_err());
+  }
+
+  #[test]
+  fn flac_error_is_thiserror_uninhabited() {
+    // §5: empty enum derives core::error::Error via thiserror — assert the
+    // trait bound holds without needing to construct a value.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<FlacError>();
   }
 }
