@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "Matroska_simpletag_duplicates.mkv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MKV",
+  "File:FileTypeExtension": "mkv",
+  "File:MIMEType": "video/x-matroska",
+  "Matroska:EBMLVersion": 1,
+  "Matroska:EBMLReadVersion": 1,
+  "Matroska:DocType": "matroska",
+  "Matroska:DocTypeVersion": 1,
+  "Matroska:DocTypeReadVersion": 1,
+  "Matroska:Title": "Last",
+  "Matroska:ReplacedArtist": "Original Artist",
+  "Info:MuxingApp": "test",
+  "Info:WritingApp": "synth",
+  "Track1:TrackNumber": 1,
+  "Track1:TrackUID": "01",
+  "Track1:TrackType": "Video"
+}]

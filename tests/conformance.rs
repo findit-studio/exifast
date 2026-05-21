@@ -302,6 +302,51 @@ fn matroska_track_targeted_tag_conformance() {
 }
 
 #[test]
+fn matroska_simpletag_duplicates_conformance() {
+  // PR #31 R5 finding — SimpleTag accumulator semantics. Matroska.pm:1224-
+  // 1226 is `if ($$tagInfo{NoSave} or $struct) { ... $$struct{$tagName} =
+  // $val if $struct; }` — i.e. plain Perl hash assignment, which is
+  // OVERWRITE semantics. Two divergences from the pre-R5 Rust port:
+  //   (1) The accumulator was first-wins on TagName/TagString/TagBinary —
+  //       Perl is last-wins (a second-occurrence `$$struct{TagString}` would
+  //       silently overwrite the first).
+  //   (2) Only TagBinary/TagName/TagString routed into the struct; other
+  //       leaves inside SimpleTag (e.g. `TagDefault` 0x484, `Format =>
+  //       'unsigned'`, Matroska.pm:690) fell through `Kind::Unsigned` →
+  //       `push_entry` → emitted as a TOP-LEVEL `Tags:TagDefault` tag.
+  //       Bundled NEVER emits such children (HandleStruct, Matroska.pm:
+  //       897-948, only reads TagName/TagString/TagBinary/TagLanguage — the
+  //       absorbed TagDefault is silently dropped at flush time per the
+  //       explicit "not currently handling TagDefault attribute" comment
+  //       at Matroska.pm:929).
+  //
+  // Synthetic fixture: a single Tag block with TWO SimpleTags:
+  //   #1: TagName="TITLE", TagString="First", TagString="Last",
+  //       TagDefault=1 → bundled emits `Matroska:Title: "Last"`.
+  //   #2: TagName="ARTIST", TagString="Original Artist",
+  //       TagName="REPLACED_ARTIST", TagDefault=0 → bundled emits
+  //       `Matroska:ReplacedArtist: "Original Artist"` (the LAST TagName
+  //       binds the canonical lookup key; `REPLACED_ARTIST` is NOT in
+  //       StdTag so `synthesize_tag_name` kicks in: lowercase →
+  //       `replaced_artist`, ucfirst → `Replaced_artist`, then `_a` → `A`
+  //       per `s/_([a-z])/\U$1/g` ⇒ `ReplacedArtist`).
+  //
+  // Neither golden contains `Matroska:TagDefault` (or any TagDefault
+  // emission anywhere) — the pre-R5 Rust would have emitted both as
+  // top-level tags.
+  check(
+    "Matroska_simpletag_duplicates.mkv",
+    "Matroska_simpletag_duplicates.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_simpletag_duplicates.mkv",
+    "Matroska_simpletag_duplicates.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_chapters_conformance() {
   // PR #31 R4 finding F1 — ChapterTimeStart (0x11) + ChapterTimeEnd (0x12)
   // were `Kind::Skip` (silent drop). Bundled extracts both as

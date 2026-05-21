@@ -205,12 +205,18 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // TagTrackUID → Track<N> group override (Matroska.pm:1207-1216
   // %trackNum map populated from TrackUID inside TrackEntry, looked up
   // at TagTrackUID time to switch SET_GROUP1 for the enclosing Tag).
+  // 138 → 139 after PR #31 R5 finding (Codex adversarial): added
+  // `Matroska_simpletag_duplicates.mkv` exercising last-wins overwrite
+  // semantics on SimpleTag children (Matroska.pm:1226 `$$struct{$tagName}
+  // = $val` is plain Perl hash assignment) AND TagDefault absorbed-not-
+  // emitted (Matroska.pm:1224-1226 routes ALL leaves into struct when
+  // active; Matroska.pm:929 explicitly drops TagDefault at flush).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    138,
-    "expected exactly the 138 active conformance fixtures, found {}: {:?}",
+    139,
+    "expected exactly the 139 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

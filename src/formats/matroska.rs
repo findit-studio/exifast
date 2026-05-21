@@ -2291,17 +2291,40 @@ struct Walker<'a> {
   track_type: Option<u64>,
   /// Currently-open SimpleTag struct accumulator (Matroska.pm:1115 `$struct
   /// = { } if $dirName eq 'SimpleTag'`). Set when a TOP-LEVEL SimpleTag is
-  /// entered; populated by TagName / TagString / TagBinary / TagLanguage /
-  /// TagDefault children (Matroska.pm:1224-1226 `$$struct{$tagName} = $val
-  /// if $struct`); flushed via the StdTag table by [`flush_simple_tag`] on
-  /// SimpleTag close (Matroska.pm:1043-1045 `HandleStruct($et, $struct)`).
+  /// entered; populated by EVERY leaf child via Matroska.pm:1224-1226
+  /// `if ($$tagInfo{NoSave} or $struct) { ... $$struct{$tagName} = $val if
+  /// $struct; }` — plain Perl hash assignment, hence:
+  ///
+  /// - **Universal absorption**: while the struct is active, ANY leaf-kind
+  ///   child (TagName, TagString, TagBinary, TagLanguage, TagDefault, …) is
+  ///   routed into the struct (or silently dropped when the struct does not
+  ///   model that slot) instead of being emitted as a top-level entry.
+  ///   Pre-R5 the absorb path was guarded by `def.name == "TagBinary" |
+  ///   "TagName" | "TagString"` — TagDefault (`Format => 'unsigned'`,
+  ///   Matroska.pm:690) fell through `Kind::Unsigned` and leaked as a
+  ///   spurious `Tags:TagDefault` top-level tag.
+  /// - **Last-wins overwrite**: a repeated child within one SimpleTag
+  ///   overwrites the prior slot — Perl hash assignment is overwrite, and
+  ///   HandleStruct (Matroska.pm:902-927) only reads the FINAL hash
+  ///   values. Pre-R5 the slots were first-wins.
+  ///
+  /// Flushed via the StdTag table by [`flush_simple_tag`] on SimpleTag close
+  /// (Matroska.pm:1043-1045 `HandleStruct($et, $struct)`).
+  ///
+  /// **Deferred at flush time**: TagLanguage (Matroska.pm:688) and
+  /// TagLanguageBCP47 (Matroska.pm:689) are absorbed into the struct (so they
+  /// no longer leak as top-level entries) BUT the language-suffixed key
+  /// emission (Matroska.pm:932-934 `GetLangInfo($tagInfo, $code)`) is a
+  /// visible Phase-2 deferral — see `docs/tracking.md`. Faithful absorb
+  /// today; lang-suffix later.
   ///
   /// NESTED SimpleTag support is deliberately DEFERRED in this pass — see
   /// the inline comment near `flush_simple_tag`. Real-world MKVs that use
   /// nested SimpleTags will see the inner-tag values absorbed into the
-  /// outer struct via first-occurrence semantics (TagName/TagString from
-  /// the first visited tag wins). 4-surface visible-deferral noted in
-  /// `docs/tracking.md`.
+  /// outer struct via last-wins overwrite (the inner SimpleTag re-binds
+  /// the outer's slots, so the inner's TagName/TagString wins instead of
+  /// being emitted as a `<Outer>/<Inner>` nested key). Visibility-deferral
+  /// noted in `docs/tracking.md`.
   simple_tag: Option<SimpleTagStruct<'a>>,
   /// Depth (`w.ends.len()` at SimpleTag push time) where the active
   /// SimpleTag was entered — used to scope which subsequent leaf elements
@@ -2323,16 +2346,26 @@ struct Walker<'a> {
 
 /// One in-flight SimpleTag struct (Matroska.pm `HandleStruct` inputs).
 ///
-/// Captures the canonical SimpleTag children:
-/// - `TagName` (Matroska.pm:687) — the looked-up key in StdTag table
+/// Captures the canonical SimpleTag children HandleStruct (Matroska.pm:
+/// 897-948) actually reads:
+/// - `TagName` (Matroska.pm:687) — the StdTag-lookup key
 /// - `TagString` (Matroska.pm:691) — the string value (preferred)
 /// - `TagBinary` (Matroska.pm:695) — the binary value (fallback when no
 ///   TagString)
 ///
-/// First-wins on each (matches Perl's `$$struct{TagName} = $val` re-
-/// assignment that the second occurrence would silently overwrite — we
-/// store only the first observation, which is the common case for
-/// well-formed MKV).
+/// Other SimpleTag children Perl absorbs but never reads (TagDefault,
+/// TagLanguage, TagOriginal, …) are silently dropped by the walker — the
+/// observable output is identical to Perl populating then ignoring those
+/// hash slots at HandleStruct time (Matroska.pm:929 explicitly notes
+/// "not currently handling TagDefault attribute"; Matroska.pm:928 reads
+/// TagLanguageBCP47/TagLanguage but the lang-suffix is a Phase-2 deferral
+/// — see [`Walker::simple_tag`]).
+///
+/// **Last-wins overwrite semantics** on each captured slot — Perl
+/// `$$struct{$tagName} = $val` is plain hash assignment (Matroska.pm:1226),
+/// so a second occurrence of `TagString` within the same SimpleTag
+/// overwrites the first. Pre-R5 we kept the first occurrence; that
+/// diverged from bundled for repeated-child SimpleTags.
 #[derive(Debug, Default)]
 struct SimpleTagStruct<'a> {
   /// `TagName` (Matroska.pm:687 `Name => 'TagName', Format => 'utf8'`).
@@ -2582,15 +2615,19 @@ fn walk(w: &mut Walker<'_>) {
         // the no-`-b` placeholder `(Binary data <N> bytes, use -b option
         // to extract)` in both `-j` and `-n` modes.
         let body = &data[w.pos..elem_end];
-        // If we're inside a SimpleTag struct AND this is the TagBinary
-        // child, route into the builder instead of emitting directly
-        // (Matroska.pm:1224-1226).
+        // Matroska.pm:1224-1226 — if a SimpleTag struct is active, route
+        // ALL leaf-kind children into the struct (or silently drop if no
+        // modeled slot) instead of emitting a top-level tag. Last-wins
+        // overwrite per `$$struct{$tagName} = $val` (plain hash assignment).
         if let Some(st) = w.simple_tag.as_mut() {
-          if def.name == "TagBinary" && st.tag_binary.is_none() {
+          if def.name == "TagBinary" {
             st.tag_binary = Some(Cow::Borrowed(body));
-            w.pos = elem_end;
-            continue;
           }
+          // else: absorbed-then-dropped (no struct slot models this leaf;
+          // HandleStruct at flush time would never read it either —
+          // Matroska.pm:902-927 only looks at TagName/TagString/TagBinary).
+          w.pos = elem_end;
+          continue;
         }
         push_entry(w, def.name, Value::Bytes(Cow::Borrowed(body)));
         w.pos = elem_end;
@@ -2602,6 +2639,12 @@ fn walk(w: &mut Walker<'_>) {
         // discarded.
         let raw = decode_unsigned(&data[w.pos..elem_end]);
         // ----- TrackType bookkeeping (Matroska.pm:267-282) ---------------
+        // Order: bookkeeping FIRST, absorb-or-emit decision SECOND. This
+        // mirrors Matroska.pm:1203-1217 (bookkeeping inside `if
+        // ($$tagInfo{Format})`) preceding line 1224's `if (...{NoSave} or
+        // $struct) { ... }` absorb branch. In well-formed MKV these
+        // bookkeeping triggers (TrackType/TrackNumber) never appear inside
+        // a SimpleTag, but the ordering is faithful regardless.
         if def.name == "TrackType" {
           w.track_type = Some(raw);
         }
@@ -2613,12 +2656,26 @@ fn walk(w: &mut Walker<'_>) {
           // Don't reset group_locked_at_depth — we're already inside a
           // TrackEntry that locked it.
         }
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag. TagDefault (0x484,
+        // Matroska.pm:690) is the concrete unsigned-kind child that pre-R5
+        // leaked here.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::U64(raw));
         w.pos = elem_end;
         continue;
       }
       Kind::Signed(_pc) => {
         let raw = decode_signed(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::I64(raw));
         w.pos = elem_end;
         continue;
@@ -2626,12 +2683,29 @@ fn walk(w: &mut Walker<'_>) {
       Kind::Float(_fc) => {
         let raw = decode_float(&data[w.pos..elem_end]);
         // FrameRate / SampleRate / etc.
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::F64(raw));
         w.pos = elem_end;
         continue;
       }
       Kind::AsciiString => {
         let s = decode_ascii(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag. TagLanguage (0x47a,
+        // Matroska.pm:688, `Format => 'string'`) is the concrete ascii-
+        // kind child. Pre-R5 it leaked as a top-level `Tags:TagLanguage`.
+        // The struct does not model a `tag_language` slot — the lang-
+        // suffix emission (Matroska.pm:932-934) is a Phase-2 deferral;
+        // we absorb-then-drop for now, see [`Walker::simple_tag`].
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::Str(s));
         w.pos = elem_end;
         continue;
@@ -2643,20 +2717,24 @@ fn walk(w: &mut Walker<'_>) {
         // children populate the struct instead of being emitted as
         // standalone tags. The struct's flush at SimpleTag-close (see
         // `flush_simple_tag`) emits the canonical StdTag-mapped key.
+        //
+        // **Last-wins**: the assignment is plain Perl hash overwrite
+        // (NOT first-wins). A repeated TagString within one SimpleTag
+        // replaces the prior slot; HandleStruct (Matroska.pm:926-927)
+        // reads only the FINAL value. Same for TagName — a repeated
+        // TagName re-binds the canonical StdTag-lookup key, which can
+        // change the synthesized name (see the duplicates fixture's
+        // `REPLACED_ARTIST` case).
         if let Some(st) = w.simple_tag.as_mut() {
           match def.name {
-            "TagName" if st.tag_name.is_none() => {
-              st.tag_name = Some(s);
-              w.pos = elem_end;
-              continue;
-            }
-            "TagString" if st.tag_string.is_none() => {
-              st.tag_string = Some(s);
-              w.pos = elem_end;
-              continue;
-            }
+            "TagName" => st.tag_name = Some(s),
+            "TagString" => st.tag_string = Some(s),
+            // Any other utf8 leaf inside SimpleTag is absorbed-then-dropped
+            // (no slot in the struct; HandleStruct would not read it).
             _ => {}
           }
+          w.pos = elem_end;
+          continue;
         }
         push_entry(w, def.name, Value::Str(s));
         w.pos = elem_end;
@@ -2664,6 +2742,12 @@ fn walk(w: &mut Walker<'_>) {
       }
       Kind::Date => {
         let raw = decode_signed(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::Date(raw));
         w.pos = elem_end;
         continue;
@@ -2687,6 +2771,10 @@ fn walk(w: &mut Walker<'_>) {
         // Chapter group would mean a spec-illegal placement (TrackUID
         // outside TrackEntry) and Perl's hash entry would never be
         // looked up anyway. We mirror the lenient Perl semantic.
+        //
+        // Bookkeeping runs BEFORE the absorb-or-emit decision, mirroring
+        // Matroska.pm:1203-1216 (inside `if $$tagInfo{Format}`) preceding
+        // line 1224 (absorb branch).
         if def.name == "TrackUID"
           && w.current_group.as_str() != DEFAULT_GROUP
           && w.group_locked_at_depth.is_some()
@@ -2719,13 +2807,32 @@ fn walk(w: &mut Walker<'_>) {
           }
         }
 
+        // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
+        // for ANY leaf child of an active SimpleTag. UID-class children
+        // (TagTrackUID, TagEditionUID, TagChapterUID, TagAttachmentUID)
+        // legally appear inside `Targets`, NOT inside `SimpleTag`, but
+        // an adversarial / malformed file could place one there; the
+        // absorb-then-drop is faithful Perl semantics.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
+
         push_entry(w, def.name, Value::UidHex(hex));
         w.pos = elem_end;
         continue;
       }
       Kind::TimecodeScale => {
         let raw = decode_unsigned(&data[w.pos..elem_end]);
+        // Bookkeeping FIRST (faithful to Perl `DataMember`/`RawConv`,
+        // Matroska.pm:160-166), absorb-or-emit SECOND.
         w.timecode_scale_ns = Some(raw);
+        // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
+        // an active SimpleTag. Spec-illegal placement, but faithful.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::TimecodeScaleRaw(raw));
         w.pos = elem_end;
         continue;
@@ -2736,18 +2843,36 @@ fn walk(w: &mut Walker<'_>) {
         // TimecodeScale}` (verified empirically with adversarial
         // fixtures — see `Value::DurationRawF64`).
         let raw = decode_float(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
+        // an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::DurationRawF64(raw));
         w.pos = elem_end;
         continue;
       }
       Kind::DefaultDuration => {
         let raw = decode_unsigned(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
+        // an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::DefaultDurationRaw(raw));
         w.pos = elem_end;
         continue;
       }
       Kind::VideoFrameRate => {
         let raw = decode_unsigned(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
+        // an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::VideoFrameRateRaw(raw));
         w.pos = elem_end;
         continue;
@@ -2758,6 +2883,12 @@ fn walk(w: &mut Walker<'_>) {
         // emit time. The `Chapter<n>` family-1 group is already in
         // `w.current_group` from the enclosing ChapterAtom enter.
         let raw = decode_unsigned(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
+        // an active SimpleTag.
+        if w.simple_tag.is_some() {
+          w.pos = elem_end;
+          continue;
+        }
         push_entry(w, def.name, Value::ChapterTimeRawNs(raw));
         w.pos = elem_end;
         continue;
@@ -3413,10 +3544,21 @@ fn write_perl_compact_num(out: &mut String, val: f64) {
 /// Conditional-id pre-dispatch — called from `walk()` BEFORE `tag_def`.
 /// Returns `Some(())` and pushes the right Entry when `id` is one of the
 /// three conditional IDs; the caller advances the cursor and continues.
+///
+/// Matroska.pm:1224-1226 — when a SimpleTag struct is active, ALL leaves
+/// (including these conditional-tag leaves) are absorbed-then-dropped
+/// instead of emitted. These IDs (VideoFrameRate, CodecID, CodecName)
+/// legally live inside TrackEntry, not SimpleTag, but the absorb guard
+/// is universal in Perl.
 fn maybe_handle_conditional<'a>(w: &mut Walker<'a>, id: i64, body: &'a [u8]) -> bool {
   let Some((name, kind)) = resolve_conditional_name(id, w.track_type) else {
     return false;
   };
+  // Absorb-into-struct (no top-level emit) when SimpleTag is active.
+  // Spec-illegal placement, but faithful to Matroska.pm:1224-1226.
+  if w.simple_tag.is_some() {
+    return true;
+  }
   match kind {
     ConditionalKind::VideoFrameRate => {
       let raw = decode_unsigned(body);
