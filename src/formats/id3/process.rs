@@ -856,8 +856,29 @@ fn parse_mp3_typed<'a>(
   shared: &mut SharedFlags,
 ) -> Result<Option<Mp3Meta<'a>>, Id3Error> {
   // -- 1. ID3 (ID3.pm:1691-1693) ------------------------------------------
-  // Stage in `-j` mode (the typed MP3 entry's fixed mode).
-  let (id3, hdr_end) = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
+  // `unless ($$et{DoneID3}) { $rtnVal = ProcessID3(...) }` (ID3.pm:1691-1693).
+  // When a prior parser in the chain (e.g. APE/DSF/FLAC) already ran
+  // `ProcessID3` and set `DoneID3`, the bundled `ProcessMP3` SKIPS the ID3
+  // pass and lets MPEG scanning (from offset 0) decide acceptance. Modeling
+  // it unconditionally would re-emit the ID3 sub-Meta a second time (Codex
+  // B-R2-2).
+  let (id3, hdr_end) = if shared.done_id3().is_none() {
+    // Stage in `-j` mode (the typed MP3 entry's fixed mode).
+    let result = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
+    // ID3.pm:1435-1436: `ProcessID3` sets `$$et{DoneID3} = 1` BEFORE
+    // scanning — truthy even when NO ID3 is found. `parse_id3_inner` only
+    // propagates the trailer size on a hit; mirror the no-ID3 side effect so
+    // a subsequent chained parser (or a recursive MP3 dispatch) observes
+    // `DoneID3` as set (`Some(0)` = no trailer).
+    if shared.done_id3().is_none() {
+      shared.set_done_id3(0);
+    }
+    result
+  } else {
+    // DoneID3 already set ⇒ bundled `ProcessID3` returns 0 and the `unless`
+    // skips it. No ID3 sub-Meta; MPEG scanning starts at offset 0.
+    (None, 0)
+  };
 
   // -- 2. MPEG audio scan from hdr_end (ID3.pm:1696-1719) ------------------
   // Faithful scan-window + Layer-III/MUS gate, mirroring the bridge's
@@ -1793,6 +1814,61 @@ mod tests {
       }
       other => panic!("expected AnyMeta::Mp3 (Codex C-R2-1), got {other:?}"),
     }
+  }
+
+  /// When `DoneID3` is already set on the shared flags (a prior chained
+  /// parser ran `ProcessID3`), the typed MP3 wrapper must SKIP the ID3 pass
+  /// (`unless ($$et{DoneID3})`, ID3.pm:1691-1693) and emit NO duplicate ID3
+  /// sub-Meta — MPEG scanning alone decides acceptance. Regression for Codex
+  /// B-R2-2: `parse_mp3_typed` previously called `parse_id3_inner`
+  /// unconditionally, re-emitting the ID3 frames a second time.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_parse_mp3_skips_id3_when_done_id3_already_set() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ID3v2_with_mpeg_audio.mp3"),
+    )
+    .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    // Simulate a prior parser having already processed ID3 (ID3.pm:1436).
+    shared.set_done_id3(0);
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("MPEG sync alone still accepts the file");
+    assert!(
+      meta.id3().is_none(),
+      "no duplicate ID3 sub-Meta when DoneID3 already set (Codex B-R2-2)"
+    );
+    assert!(
+      meta.mpeg().is_some(),
+      "MPEG sub-Meta still populated (scan from offset 0)"
+    );
+  }
+
+  /// `parse_id3_inner` mirrors `ProcessID3`'s `$$et{DoneID3} = 1` side
+  /// effect (ID3.pm:1435-1436): even when NO ID3 is found, the typed MP3
+  /// wrapper sets `DoneID3` to `Some(0)` (no-trailer marker) so a downstream
+  /// chained parser observes it (Codex B-R2-2). `MP3.mp3` is raw MPEG with
+  /// no ID3.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_parse_mp3_sets_done_id3_even_when_no_id3_found() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    assert_eq!(shared.done_id3(), None, "precondition: DoneID3 unset");
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("MPEG-only MP3 accepted");
+    assert!(meta.id3().is_none(), "MP3.mp3 has no ID3");
+    assert_eq!(
+      shared.done_id3(),
+      Some(0),
+      "DoneID3 set to Some(0) even with no ID3 (ID3.pm:1435-1436)"
+    );
   }
 
   #[cfg(feature = "mp3")]
