@@ -1759,6 +1759,42 @@ mod tests {
     );
   }
 
+  /// `parse_bytes(ID3v2_with_mpeg_audio.mp3)` dispatches to `AnyMeta::Mp3`
+  /// (NOT `AnyMeta::Ogg`) with BOTH the ID3 sub-Meta (Title="Test") and the
+  /// MPEG sub-Meta populated. Regression for Codex C-R2-1: the OGG typed
+  /// parser returns `Some(OggMeta { success: false })` for this ID3-prefixed
+  /// input, which — before the fix — terminated the closed-dispatch
+  /// candidate loop and mis-reported the file as `AnyMeta::Ogg`. The OGG arm
+  /// now maps `success() == false` to `Ok(None)` so dispatch falls through
+  /// to the MP3 candidate. Bundled `exiftool -j` reports FileType=MP3,
+  /// Title=Test, MPEGAudioVersion=1.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_parse_bytes_id3v2_plus_mpeg_dispatches_to_mp3_not_ogg() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ID3v2_with_mpeg_audio.mp3"),
+    )
+    .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
+    let meta = crate::parse_bytes(&bytes)
+      .expect("ok")
+      .expect("parse_bytes must accept ID3v2+MPEG MP3");
+    match meta {
+      crate::AnyMeta::Mp3(m) => {
+        assert_eq!(
+          m.id3().and_then(|id3| id3.title()),
+          Some("Test"),
+          "ID3 sub-Meta present with Title=Test"
+        );
+        assert!(
+          m.mpeg().is_some(),
+          "MPEG sub-Meta populated for ID3v2+audio MP3 via parse_bytes"
+        );
+      }
+      other => panic!("expected AnyMeta::Mp3 (Codex C-R2-1), got {other:?}"),
+    }
+  }
+
   #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_id3v1_only() {

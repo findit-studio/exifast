@@ -858,8 +858,18 @@ impl AnyParser {
       #[cfg(feature = "ogg")]
       AnyParser::Ogg(p) => {
         let _ = (shared, ext);
+        // The OGG typed parser returns `Some(OggMeta { success: false })`
+        // (carrying the "Not a valid OGG file" warning) for non-OGG /
+        // garbage input, faithful to the legacy `ProcessOGG` return. In
+        // *closed dispatch* `Ok(Some(_))` terminates the candidate loop, so
+        // an ID3-prefixed MP3 — whose detection candidates may try OGG
+        // before MP3 — would be mis-reported as `AnyMeta::Ogg` with no MPEG
+        // tags. Map `success() == false` to `Ok(None)` so dispatch continues
+        // to the next candidate (Codex C-R2-1). The legacy bridge
+        // (`OldFormatParser`) is unchanged and still emits the OGG warning
+        // for genuinely OGG-typed files.
         p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Ogg))
+          .map(|o| o.filter(|m| m.success()).map(AnyMeta::Ogg))
           .map_err(Into::into)
       }
       #[cfg(feature = "mpeg-audio")]
