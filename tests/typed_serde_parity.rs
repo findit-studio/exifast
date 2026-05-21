@@ -195,12 +195,17 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // f64 promotion loss and the $frac < 0 correction branch). Both
   // verify the new `convert_matroska_date` faithful transliteration of
   // `Matroska.pm:1184-1198` + `ExifTool.pm:6773-6800` fractional branch.
+  // 136 → 137 after PR #31 R4 finding F1 (Codex adversarial): added
+  // `Matroska_chapters.mkv` exercising ChapterTimeStart/ChapterTimeEnd
+  // (Matroska.pm:580-592 unsigned-ns → /1e9 → ConvertDuration), the
+  // ChapterDisplay (ID 0) traversal fix, and the `Chapter<n>` family-1
+  // group attribution (Matroska.pm:1117-1119 chapterNum counter).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    136,
-    "expected exactly the 136 active conformance fixtures, found {}: {:?}",
+    137,
+    "expected exactly the 137 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

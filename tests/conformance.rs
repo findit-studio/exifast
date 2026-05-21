@@ -267,6 +267,40 @@ fn matroska_duration_no_scale_conformance() {
 }
 
 #[test]
+fn matroska_chapters_conformance() {
+  // PR #31 R4 finding F1 — ChapterTimeStart (0x11) + ChapterTimeEnd (0x12)
+  // were `Kind::Skip` (silent drop). Bundled extracts both as
+  // `Format => 'unsigned'`, `ValueConv => '$val / 1e9'`,
+  // `PrintConv => 'ConvertDuration($val)'` (Matroska.pm:580-592). Group
+  // attribution: each ChapterAtom (Matroska.pm:1117-1118) bumps a 1-based
+  // counter and SET_GROUP1 → `Chapter<n>`, so a fixture with one
+  // ChapterAtom emits `Chapter1:ChapterTimeStart`, etc.
+  //
+  // Two ancillary fixes wrapped into this finding:
+  //   (a) The walker's ID-validity guard previously rejected ID 0
+  //       (`id_v.value() <= 0` ⇒ `< 0`, faithful to Matroska.pm:1068
+  //       `$tag >= 0`). ChapterDisplay's ID IS 0 (Matroska.pm:615), so
+  //       any chapter content (including ChapterString) was being
+  //       dropped.
+  //   (b) The new `Kind::ChapterTimeNs` carries raw u64 ns through to
+  //       output-time `ValueConv` + `ConvertDuration` (faithful to the
+  //       deferred-eval semantics the rest of the Matroska module uses).
+  //
+  // Synthetic fixture: EBMLHeader + Segment[Info(TimecodeScale=1ms,
+  // MuxingApp, WritingApp) + Chapters[EditionEntry[ChapterAtom[
+  // ChapterTimeStart=60s in ns, ChapterTimeEnd=120s in ns, ChapterDisplay
+  // [ChapterString="Intro"]]]]]. Bundled `-j` emits
+  // `Chapter1:ChapterTimeStart: "0:01:00"`, ChapterTimeEnd: "0:02:00",
+  // ChapterString: "Intro". Bundled `-n` emits the bare numeric seconds.
+  check("Matroska_chapters.mkv", "Matroska_chapters.mkv.json", true);
+  check(
+    "Matroska_chapters.mkv",
+    "Matroska_chapters.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_duration_zero_scale_conformance() {
   // PR #31 R3 finding — the ACTUAL pre-fix bug. ValueConv:
   // `$$self{TimecodeScale} ? $val * $$self{TimecodeScale} / 1e9 :

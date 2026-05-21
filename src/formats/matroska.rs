@@ -255,6 +255,12 @@ enum Kind {
   /// `ValueConv => '$val ? 1e9 / $val : 0'`, `PrintConv =>
   /// 'int($val * 1000 + 0.5) / 1000'`.
   VideoFrameRate,
+  /// `ChapterTimeStart` / `ChapterTimeEnd` (Matroska.pm:580-592) —
+  /// `Format => 'unsigned'`, `ValueConv => '$val / 1e9'`,
+  /// `PrintConv => 'ConvertDuration($val)'`. The raw u64 nanoseconds are
+  /// stored; output-time `serialize_tags` divides by 1e9 to seconds and
+  /// (in `-j` mode) runs `ConvertDuration` for the `H:MM:SS` rendering.
+  ChapterTimeNs,
 }
 
 /// PrintConv (the -j string) variations.
@@ -1184,14 +1190,22 @@ const TAG_TABLE: &[TagDef] = &[
     kind: Kind::Skip,
   },
   TagDef {
+    // Matroska.pm:580-586 — `Format => 'unsigned'`, `ValueConv => '$val /
+    // 1e9'`, `PrintConv => 'ConvertDuration($val)'`. Group `Chapter#` per
+    // `Groups => { 1 => 'Chapter#' }`; the family-1 switch is handled at
+    // the `ChapterAtom` SubDir enter (Matroska.pm:1117-1118).
     id: 0x11,
     name: "ChapterTimeStart",
-    kind: Kind::Skip,
+    kind: Kind::ChapterTimeNs,
   },
   TagDef {
+    // Matroska.pm:587-592 — same `unsigned` + `/1e9` + `ConvertDuration`
+    // semantics as ChapterTimeStart (note Matroska.pm:588 omits the
+    // `Groups => { 1 => 'Chapter#' }` for ChapterTimeEnd but the family-1
+    // group still comes from the surrounding ChapterAtom SET_GROUP1 push).
     id: 0x12,
     name: "ChapterTimeEnd",
-    kind: Kind::Skip,
+    kind: Kind::ChapterTimeNs,
   },
   TagDef {
     id: 0x18,
@@ -2105,6 +2119,12 @@ pub enum Value<'a> {
   /// when non-zero, else 0; PrintConv `int($val * 1000 + 0.5) / 1000`
   /// (Matroska.pm:294-301).
   VideoFrameRateRaw(u64),
+  /// `ChapterTimeStart` / `ChapterTimeEnd` (Matroska.pm:580-592) — raw u64
+  /// nanoseconds. ValueConv `$val / 1e9` (seconds, f64), PrintConv
+  /// `ConvertDuration($val)`. Both keys are emitted under the synthesized
+  /// family-1 group `Chapter<n>` set when the enclosing `ChapterAtom` was
+  /// entered (Matroska.pm:1117-1119).
+  ChapterTimeRawNs(u64),
   /// Binary blob — emitted as ExifTool's
   /// `(Binary data <N> bytes, use -b option to extract)` placeholder
   /// in both `-j` and `-n` modes (TagValue::Bytes serialization in
@@ -2400,7 +2420,11 @@ fn walk(w: &mut Walker<'_>) {
     let Some(id_v) = get_vint(data, w.pos) else {
       break;
     };
-    if id_v.is_unknown() || id_v.value() <= 0 {
+    // Matroska.pm:1068 `last unless defined $tag and $tag >= 0` — ID == 0 is
+    // VALID (used by ChapterDisplay, Matroska.pm:615-618), only the unknown-
+    // VINT sentinel (Perl `-1` / our `i64::MIN`) or a negative decode is a
+    // walk-terminator.
+    if id_v.is_unknown() || id_v.value() < 0 {
       break;
     }
     w.pos += id_v.consumed();
@@ -2668,6 +2692,16 @@ fn walk(w: &mut Walker<'_>) {
       Kind::VideoFrameRate => {
         let raw = decode_unsigned(&data[w.pos..elem_end]);
         push_entry(w, def.name, Value::VideoFrameRateRaw(raw));
+        w.pos = elem_end;
+        continue;
+      }
+      Kind::ChapterTimeNs => {
+        // Matroska.pm:580-592 — `Format => 'unsigned'`, store raw u64 ns and
+        // defer ValueConv (`$val / 1e9`) + PrintConv (`ConvertDuration`) to
+        // emit time. The `Chapter<n>` family-1 group is already in
+        // `w.current_group` from the enclosing ChapterAtom enter.
+        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        push_entry(w, def.name, Value::ChapterTimeRawNs(raw));
         w.pos = elem_end;
         continue;
       }
@@ -3118,6 +3152,21 @@ fn emit_one(
       // universal no-`-b` placeholder is rendered by `TagValue::Bytes`'s
       // Serialize impl (`value.rs`) — identical bytes for `-j` and `-n`.
       out.write_bytes(group, name, b.as_ref())?;
+    }
+    Value::ChapterTimeRawNs(raw_ns) => {
+      // Matroska.pm:580-592 — `ValueConv => '$val / 1e9'`,
+      // `PrintConv => 'ConvertDuration($val)'`. Both ChapterTimeStart and
+      // ChapterTimeEnd share these conv forms; `-j` emits the
+      // ConvertDuration string ("H:MM:SS" / "MM.MM s" form, see
+      // `datetime::convert_duration`), `-n` emits the bare post-ValueConv
+      // f64 seconds.
+      let vc = (*raw_ns as f64) / 1e9;
+      if print_conv {
+        let s = crate::datetime::convert_duration(vc);
+        out.write_str(group, name, &s)?;
+      } else {
+        out.write_f64(group, name, vc)?;
+      }
     }
   }
   Ok(())
