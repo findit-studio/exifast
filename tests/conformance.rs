@@ -2199,8 +2199,8 @@ fn mp3_with_apev2_and_id3v1_trailer_conformance() {
   // `EOF - 32 - 128 = 92`, APE:Artist is emitted, AND the ID3v1 trailer
   // tags fire from the standalone ProcessID3 invocation. Bundled also
   // emits Composite:Duration via DoneID3-aware scanning; that composite
-  // is engine-deferred (FLAC-id3-prefix hand-trim precedent) so the
-  // committed goldens omit it.
+  // is the documented ACCEPTED-DEFERRAL hand-trim (Composite engine,
+  // Phase 3+ — see docs/tracking.md) so the committed goldens omit it.
   check(
     "mp3_with_apev2_and_id3v1_trailer.mp3",
     "mp3_with_apev2_and_id3v1_trailer.mp3.json",
@@ -2232,8 +2232,9 @@ fn ape_with_id3v1_trailer_conformance() {
   // APE.pm:124-127) finds the ID3v1 trailer, sets DoneID3 = 128;
   // ProcessAPE's footer scan now uses `EOF - 32 - 128 = 88` and finds
   // the APETAGEX magic. Bundled also emits `Composite:DateTimeOriginal`
-  // (from the engine composite system) which is engine-deferred and
-  // hand-trimmed from the golden — same FLAC-id3-prefix precedent.
+  // (from the engine composite system) which is the documented
+  // ACCEPTED-DEFERRAL hand-trim (Composite engine, Phase 3+ — see
+  // docs/tracking.md) so the committed golden omits it.
   check(
     "ape_with_id3v1_trailer.ape",
     "ape_with_id3v1_trailer.ape.json",
