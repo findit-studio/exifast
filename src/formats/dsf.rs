@@ -498,9 +498,9 @@ mod tests {
     // Craft SampleCount = u64::MAX (above i64::MAX) — must emit as decimal
     // string `TagValue::Str("18446744073709551615")` (faithful UV→NV shape).
     let mut p = vec![0u8; 36]; // payload fills keys 3..=11 with zeros (placeholder)
-                               // overwrite SampleCount slot (key 9 ⇒ payload byte offset 36-12=24 … wait:
-                               // key * 4 = 36 in the dirInfo buffer; dirInfo starts with 12 bytes of
-                               // 'fmt'+size, so payload byte offset = 36-12 = 24.
+    // overwrite SampleCount slot (key 9 ⇒ payload byte offset 36-12=24 … wait:
+    // key * 4 = 36 in the dirInfo buffer; dirInfo starts with 12 bytes of
+    // 'fmt'+size, so payload byte offset = 36-12 = 24.
     p[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
     let buf = dir(&p);
     let mut m = Metadata::new("x");
@@ -588,7 +588,7 @@ mod tests {
     v.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0
     v.extend_from_slice(b"fmt ");
     v.extend_from_slice(&48u64.to_le_bytes()); // fmtLen
-                                               // payload (36 bytes):
+    // payload (36 bytes):
     v.extend_from_slice(&1u32.to_le_bytes());
     v.extend_from_slice(&0u32.to_le_bytes());
     v.extend_from_slice(&2u32.to_le_bytes());
@@ -751,7 +751,7 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes()); // metaPos = 0 ⇒ no ID3 trailer
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&999u64.to_le_bytes()); // fmtLen = 999 (< 1000 ✓)
-                                                  // First 36 bytes of payload: the eight DSF::Main fields in key order.
+    // First 36 bytes of payload: the eight DSF::Main fields in key order.
     buf.extend_from_slice(&1u32.to_le_bytes()); // key 3 FormatVersion
     buf.extend_from_slice(&0u32.to_le_bytes()); // key 4 FormatID = 'DSD Raw'
     buf.extend_from_slice(&2u32.to_le_bytes()); // key 5 ChannelType = Stereo
@@ -760,7 +760,7 @@ mod tests {
     buf.extend_from_slice(&1u32.to_le_bytes()); // key 8 BitsPerSample
     buf.extend_from_slice(&2_822_400u64.to_le_bytes()); // key 9 SampleCount
     buf.extend_from_slice(&4096u32.to_le_bytes()); // key 11 BlockSize
-                                                   // Pad to total payload of 987 bytes (951 zeros after the 36-byte head).
+    // Pad to total payload of 987 bytes (951 zeros after the 36-byte head).
     buf.extend(std::iter::repeat(0u8).take(987 - 36));
     assert_eq!(buf.len(), 40 + 987);
     let mut m = Metadata::new("x.dsf");

@@ -115,8 +115,8 @@ pub fn convert_duration(time: f64) -> String {
   let m_f = (rounded / 60.0).trunc();
   rounded -= m_f * 60.0;
   let s_f = rounded.trunc(); // `int($time)` of remaining
-                             // ExifTool.pm:6878-6882 `if ($h > 24) { my $d = int($h/24); $h -= $d*24;
-                             // $sign = "$sign$d days "; }`.
+  // ExifTool.pm:6878-6882 `if ($h > 24) { my $d = int($h/24); $h -= $d*24;
+  // $sign = "$sign$d days "; }`.
   let mut prefix = sign.to_string();
   let h_after_days = if h_f > 24.0 {
     let d_f = (h_f / 24.0).trunc();

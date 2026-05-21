@@ -21,7 +21,7 @@
 //!   FLAC.pm:239-280 (ProcessFLAC — magic + metadata-block-header structure)
 
 use exifast::{
-  bitstream::{process_bit_stream, BitOrder},
+  bitstream::{BitOrder, process_bit_stream},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };

@@ -7,7 +7,7 @@
 use crate::{
   convert::apply,
   tagtable::{RawConv, TagDef, TagId, TagTable},
-  value::{format_g, Group, Metadata, TagValue},
+  value::{Group, Metadata, TagValue, format_g},
 };
 
 /// Per-frame scalar state populated by [`RawConv::SetFrameState`] writes and
@@ -396,10 +396,13 @@ pub fn process_bit_stream_cond(
 mod tests {
   use super::*;
   use crate::{
-    serialize::to_exiftool_json,
     tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
     value::Group,
   };
+  // `serialize` is gated on `feature = "json"` (spec §4); tests below that
+  // use `to_exiftool_json` are correspondingly gated.
+  #[cfg(feature = "json")]
+  use crate::serialize::to_exiftool_json;
 
   // Faithful AAC::Main subset for the synthetic header
   // [0xFF,0xF1,0x50,0x80,0x00,0x00,0x00]:
@@ -671,6 +674,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_8_byte_all_ff_is_u64_max_exact_decimal() {
     // Oracle (bundled Perl, re-derived 2026-05-19):
@@ -703,6 +707,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_9_byte_all_ff_promotes_to_nv_format_g() {
     // Oracle (bundled Perl, re-derived 2026-05-19):
@@ -769,6 +774,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_small_value_is_i64_and_emitted_bare() {
     // Prove the common (≤ i64::MAX) path is byte-exact unchanged.
@@ -796,6 +802,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_8_byte_i64_max_split_boundary() {
     // Pins the u64-mode i64::MAX / i64::MAX+1 representation-split (D5).
@@ -999,11 +1006,7 @@ mod tests {
     )
     .with_raw_conv(RawConv::SetFrameState("MPEG_Layer"));
     fn choose(key: &str, _s: &FrameState) -> Option<&'static TagDef> {
-      if key == "Bit13-14" {
-        Some(&VL)
-      } else {
-        None
-      }
+      if key == "Bit13-14" { Some(&VL) } else { None }
     }
     // Layout: byte 1 bits 5-6 = layer (0xfb >> 1 & 0b11 = 0b01 = 1).
     let data = [0xffu8, 0xfb, 0x90, 0x4c];

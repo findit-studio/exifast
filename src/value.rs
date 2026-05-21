@@ -727,7 +727,7 @@ mod tests {
     assert_eq!(m.tags().len(), before); // no new tag appended
     let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
     assert_eq!(ft.value(), &TagValue::Str("AAC".into())); // value changed
-                                                          // exactly one FileType tag — the value was overwritten, not duplicated.
+    // exactly one FileType tag — the value was overwritten, not duplicated.
     assert_eq!(
       m.tags().iter().filter(|t| t.name() == "FileType").count(),
       1

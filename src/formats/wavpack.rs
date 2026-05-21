@@ -326,13 +326,13 @@ mod tests {
     h[4..8].copy_from_slice(&100u32.to_le_bytes()); // ckSize
     h[8] = 0x10; // version low
     h[9] = 0x04; // version high (0x0410)
-                 // [10] block_index_u8 = 0
-                 // [11] total_samples_u8 = 0
+    // [10] block_index_u8 = 0
+    // [11] total_samples_u8 = 0
     h[12..16].copy_from_slice(&1000u32.to_le_bytes()); // total_samples
-                                                       // [16..20] block_index = 0
+    // [16..20] block_index = 0
     h[20..24].copy_from_slice(&500u32.to_le_bytes()); // block_samples
     h[24..28].copy_from_slice(&flags_le.to_le_bytes()); // flags (LE on disk)
-                                                        // [28..32] crc = 0
+    // [28..32] crc = 0
     h
   }
 
@@ -353,10 +353,10 @@ mod tests {
     assert!(g(TagId::Str("Other")).is_none());
     assert!(g(TagId::Int(0)).is_none());
     assert_eq!(WAVPACK_MAIN.group0(), "File"); // WavPack.pm:23
-                                               // BitShift derivation: per ExifTool.pm:5905-5910 each shift = #
-                                               // trailing zero bits of the mask. Pinned to the exact integer values
-                                               // documented in the .pm so a mask-literal typo is caught even if the
-                                               // `bit_shift` helper is ever changed.
+    // BitShift derivation: per ExifTool.pm:5905-5910 each shift = #
+    // trailing zero bits of the mask. Pinned to the exact integer values
+    // documented in the .pm so a mask-literal typo is caught even if the
+    // `bit_shift` helper is ever changed.
     assert_eq!(BYTES_PER_SAMPLE_MASK, 0x0000_0003);
     assert_eq!(AUDIO_TYPE_MASK, 0x0000_0004);
     assert_eq!(COMPRESSION_MASK, 0x0000_0008);
