@@ -1817,8 +1817,24 @@ impl FormatParser for ProcessOgg {
   /// reason is that OGG accumulates warnings during the walk that the
   /// bundled output preserves even when the page-acceptance test never
   /// passes (e.g. mid-stream `Lost synchronization`).
+  ///
+  /// **R5 (Codex adversarial)** — routes through [`parse_full_chained`]
+  /// so the embedded ID3 chain (Ogg.pm:79-83) runs for ID3-prefixed Ogg
+  /// streams and nests an [`crate::formats::id3::Id3Meta`] into the
+  /// returned [`Meta`]. Pre-fix the trait impl called the body-only
+  /// [`parse_inner`], which requires `OggS` at byte 0 — so an
+  /// ID3v2-prefixed Ogg buffer returned `success = false` and the typed
+  /// `FormatParser` surface silently dropped both the detected ID3 tags
+  /// AND the OGG body. Only the crate-root `parse_ogg` was fixed in R4;
+  /// R5 propagates the chain down to ALL public surfaces.
+  ///
+  /// A fresh [`crate::format_parser::SharedFlags`] is constructed per
+  /// call (the trait's `&[u8]` Context has no chain state to thread).
   fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    parse_inner(data, /* print_conv_enabled */ true)
+    // `ogg = ["flac", "id3"]` per Cargo.toml ⇒ `parse_full_chained` is
+    // always present here.
+    let mut shared = crate::format_parser::SharedFlags::default();
+    parse_full_chained(data, &mut shared, /* print_conv */ true)
   }
 }
 
