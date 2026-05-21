@@ -1632,6 +1632,39 @@ pub(crate) fn parse_id3_with_hdr_end<'a>(
   parse_id3_inner(data, shared, print_conv)
 }
 
+/// Parse a stand-alone 128-byte ID3v1 `TAG` block into the typed
+/// [`Id3v1Meta`]. Used by callers that scan the ID3v1 trailer themselves
+/// (Real.pm:678-687 does so for RM files: `seek(-128, 2); read(128);
+/// /^TAG/; ProcessDirectory(ID3::v1)`). Returns `None` when the block is
+/// not exactly 128 bytes or does not begin with `b"TAG"`.
+///
+/// Driven through the existing [`crate::formats::id3::v1::process_id3v1`]
+/// `Metadata` sink path, then lifted into `Id3v1Meta` via the same
+/// `stuff_id3v1_field` helper the engine uses for the chained trailer
+/// (so the v1.1 Track sentinel, %genre PrintConv, and Latin-1 decoding
+/// all match bundled).
+#[must_use]
+pub fn parse_id3v1_from_block(data: &[u8]) -> Option<Id3v1Meta<'static>> {
+  if data.len() != 128 || !data.starts_with(b"TAG") {
+    return None;
+  }
+  let mut m = crate::value::Metadata::new("");
+  let ctx = crate::convert::ConvContext::default();
+  // print_conv=true so Genre stages as the PrintConv string; the
+  // `stuff_id3v1_field` path uses that string to back-resolve the byte.
+  crate::formats::id3::v1::process_id3v1(data, &mut m, true, &ctx);
+  let mut v1 = Id3v1Meta::default();
+  let mut has_any = false;
+  for tag in m.tags_slice() {
+    if tag.group_ref().family1() != "ID3v1" {
+      continue;
+    }
+    stuff_id3v1_field(&mut v1, tag.name(), tag.value_ref());
+    has_any = true;
+  }
+  if has_any { Some(v1) } else { None }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

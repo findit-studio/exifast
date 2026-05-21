@@ -59,6 +59,29 @@ fn file_type_ext(file_type: &str) -> Option<&'static str> {
   crate::filetype::file_type_ext_lookup(file_type)
 }
 
+/// Content-derived MIME override for an accepted typed Meta — the
+/// post-finalize `$$self{VALUE}{MIMEType} = $mime` step that some
+/// bundled-Perl parsers run AFTER `SetFileType` (Real.pm:653-657's
+/// single-stream override; ExifTool.pm calls this an "in-place MIME
+/// rewrite"). Returns `None` for Metas that have no such override.
+///
+/// Returning a fresh `String` (rather than borrowing from `meta`) lets
+/// the engine drop the `AnyMeta` reference before the `obj.insert` call;
+/// this keeps the function signature simple while paying one
+/// allocation per override fire (only one or two formats use this).
+#[cfg(feature = "json")]
+fn meta_mime_override(meta: &crate::format_parser::AnyMeta<'_>) -> Option<String> {
+  // Real (RM only): Real.pm:653-657 — overrides MIMEType to the lone
+  // non-`logical-fileinfo` stream's MimeType. Other Metas do not
+  // currently expose a MIME-override path.
+  #[cfg(feature = "real")]
+  if let crate::format_parser::AnyMeta::Real(m) = meta {
+    return m.mime_override().map(str::to_string);
+  }
+  let _ = meta;
+  None
+}
+
 /// The computed `File:*` triplet from a faithful `SetFileType` resolution —
 /// the `(FileType, FileTypeExtension-shown, MIMEType)` values. `FileType` and
 /// `MIMEType` are owned strings; `FileTypeExtension` is the post-`apply`
@@ -427,6 +450,20 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
         );
         insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
       }
+    }
+
+    // ----- MIME override (Real.pm:653-657 single-stream override) ----------
+    // After `SetFileType` resolves the engine table-derived `File:MIMEType`,
+    // certain typed Metas can supply a CONTENT-DERIVED MIME that overrides
+    // the table value (`$$self{VALUE}{MIMEType} = $mime`). Real.pm's RM
+    // path does this when exactly one stream has a non-`logical-fileinfo`
+    // MIME. The override must run BEFORE the format-tag emission below so
+    // `%noDups` first-wins doesn't lock the table value.
+    if let Some(mime) = meta_mime_override(&meta) {
+      // The base `insert` macro is `or_insert` (first-wins); we need to
+      // REPLACE the just-inserted `File:MIMEType` entry. Use direct
+      // `insert` to write over.
+      obj.insert("File:MIMEType".into(), Value::String(mime));
     }
 
     // ----- Format tags + diagnostics via the typed tag emission ----------

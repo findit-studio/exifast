@@ -471,6 +471,33 @@ fn dv_conformance() {
 }
 
 #[test]
+fn real_rm_conformance() {
+  // FORMATS.md row 19. `tests/fixtures/Real.rm` is the bundled
+  // `lib/Image/ExifTool/t/images/Real.rm` (1915 bytes). Exercises the
+  // RealMedia chunk walk (PROP / MDPR×2 / CONT), the RJMD footer
+  // metadata block, and the 128-byte ID3v1 trailer. The golden is bundled
+  // `perl exiftool -j -G1 -struct` output with `System:*` + `Composite:*`
+  // stripped uniformly (composite-tag synthesis is engine infrastructure
+  // outside Real.pm's scope — deferred per `[[exifast-phase2-forward-items]]`;
+  // bundled emits one Composite:DateTimeOriginal=2003 lifted from the
+  // ID3v1:Year frame).
+  check("Real.rm", "Real.rm.json", true);
+  check("Real.rm", "Real.rm.n.json", false);
+}
+
+#[test]
+fn real_ra_conformance() {
+  // FORMATS.md row 19. `tests/fixtures/Real.ra` is the bundled
+  // `lib/Image/ExifTool/t/images/Real.ra` (130 bytes, RealAudio V4).
+  // Exercises the `.ra\xfd` magic, the V4 codec table (AudioBytes /
+  // BytesPerMinute / AudioFrameSize / SampleRate / BitsPerSample /
+  // Channels / Title / Copyright; the file has no Artist or Comment).
+  // Goldens captured the same way as RM.
+  check("Real.ra", "Real.ra.json", true);
+  check("Real.ra", "Real.ra.n.json", false);
+}
+
+#[test]
 fn dv_unknown_profile_conformance() {
   // Adversarial: 480-byte synthetic with the primary `\x1f\x07\0\x3f`
   // magic and `stype=0x1f` at offset 451 — never present in

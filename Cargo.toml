@@ -62,7 +62,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 # Umbrella — enables every per-format gate.
 all-formats = [
   "aac", "aiff", "ape", "audible", "dsf", "dv", "flac",
-  "id3", "matroska", "mp3", "mpc", "moi", "ogg", "red", "wavpack",
+  "id3", "matroska", "mp3", "mpc", "moi", "ogg", "real", "red", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -111,6 +111,12 @@ moi        = []
 # `--features std,ogg` fails to compile (Codex R4 F1: silent feature-graph
 # breakage from the R3 picture-parse + ID3-nest fixes).
 ogg        = ["flac", "id3"]
+# `real` chains ID3 (Real.pm:678-687: ID3v1 trailer scan on RM files;
+# the typed parser reuses `formats::id3::parse_id3v1_from_block` to
+# decode the 128-byte TAG block via the same path the ID3 engine
+# uses). Without the `id3` edge a `--features std,real` build fails
+# to compile.
+real       = ["id3"]
 red        = []
 wavpack    = ["id3", "ape"]
 

@@ -1,0 +1,17 @@
+[
+  {
+    "SourceFile": "Real.ra",
+    "ExifTool:ExifToolVersion": 13.58,
+    "File:FileType": "RA",
+    "File:FileTypeExtension": "RA",
+    "File:MIMEType": "audio/x-pn-realaudio",
+    "Real-RA4:AudioBytes": 704352,
+    "Real-RA4:BytesPerMinute": 299743,
+    "Real-RA4:AudioFrameSize": 348,
+    "Real-RA4:SampleRate": 22050,
+    "Real-RA4:BitsPerSample": 16,
+    "Real-RA4:Channels": 1,
+    "Real-RA4:Title": "The Sewing Girls",
+    "Real-RA4:Copyright": "** institut f?r universelle zusammenh?nge"
+  }
+]
