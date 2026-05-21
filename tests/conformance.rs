@@ -2,7 +2,7 @@
 //! to the bundled-ExifTool golden for every ported fixture, for both the
 //! default (`-j -G1 -struct`) and `-n` snapshots. One case per ported
 //! format — add a `#[test]` per format as it lands (FORMATS.md order).
-use exifast::{jsondiff::json_equivalent, parser::extract_info, serialize::to_exiftool_json};
+use exifast::{jsondiff::json_equivalent, parser::extract_info};
 
 /// Assert exifast's output for `fixture` is equivalent to the committed
 /// bundled-ExifTool golden `golden` via `json_equivalent` (object key
@@ -14,7 +14,10 @@ fn check(fixture: &str, golden: &str, print_on: bool) {
     .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
   let want = std::fs::read_to_string(format!("{root}/tests/golden/{golden}"))
     .unwrap_or_else(|e| panic!("read golden {golden}: {e}"));
-  let got = to_exiftool_json(&extract_info(fixture, &data, print_on));
+  // `extract_info` now returns the byte-exact `exiftool -j -G1` JSON directly
+  // (via `JsonTagWriter::finish()`), replacing the retired
+  // `to_exiftool_json(&Metadata)` output path (task #124).
+  let got = extract_info(fixture, &data, print_on);
   json_equivalent(&got, &want).unwrap_or_else(|e| panic!("{fixture} vs {golden}: {}", e.message()));
 }
 
@@ -2241,6 +2244,27 @@ fn id3v24_footer_truncated_then_nothing_conformance() {
     "id3v24_footer_truncated_then_nothing.mp3.n.json",
     false,
   );
+}
+
+#[test]
+fn moi_conformance() {
+  // FORMATS.md row 12a: Image::ExifTool::MOI. Bundled fixture
+  // `tests/fixtures/MOI.moi` is the real `t/images/MOI.moi` (320 bytes,
+  // V6 sidecar with DateTime / Duration / AspectRatio / AudioCodec /
+  // AudioBitrate / VideoBitrate). Goldens captured from bundled
+  // `perl exiftool` (`-j -G1 -struct` and `-n`).
+  //
+  // Exercises:
+  //   - V6 magic + embedded BE u32 filesize gate (MOI.pm:110-114)
+  //   - SetByteOrder('MM') for int16u/int32u walks (MOI.pm:116)
+  //   - DateTimeOriginal `undef[8]` + sprintf('%06.3f',…) format
+  //   - Duration `int32u/1000` + ConvertDuration sub-30s path
+  //   - AspectRatio nibble decode (lo<2 + hi=5 ⇒ "4:3 PAL")
+  //   - AudioCodec PrintHex + direct hash hit (0xC1 ⇒ AC3)
+  //   - AudioBitrate `*16000+48000` + ConvertBitrate (kbps)
+  //   - VideoBitrate hash ValueConv + ConvertBitrate (Mbps)
+  check("MOI.moi", "MOI.moi.json", true);
+  check("MOI.moi", "MOI.moi.n.json", false);
 }
 
 // Add one `#[test]` per ported format here, in FORMATS.md order, each

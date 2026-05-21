@@ -5,19 +5,28 @@
 //! collector, validation harness) brings its own [`crate::parser_new::TagWriter`]
 //! impl.
 //!
-//! Phase D ships exactly one reference implementor — [`MapTagWriter`] — to
-//! exercise the trait shape and prove the dataflow Meta → TagWriter compiles
-//! end-to-end. The JSON [`TagWriter`] implementor lands in Phase G alongside
-//! the public API.
+//! [`MapTagWriter`] is the in-memory reference implementor (tests + generic
+//! library callers).
+//!
+//! **History (task #124).** This module once held a `Metadata`-bridge
+//! tag-writer adapter that translated a typed `Meta` emission into the
+//! push-style [`crate::value::Metadata`] sink the JSON serializer rendered.
+//! That bridge — and the `Metadata` push-bag on the OUTPUT path — were
+//! removed once the direct [`crate::json_writer::JsonTagWriter`] (which
+//! reproduces the same byte-exact `exiftool -j -G1` JSON) became the
+//! engine's `$$et` value sink. Each format's engine entry
+//! (`ProcessXxx::process`) now drives [`crate::parser_new::MetaSinker::sink`]
+//! straight into the `JsonTagWriter` carried by
+//! [`crate::parser::ParseContext`].
 
 use crate::parser_new::TagWriter;
-use core::convert::Infallible;
-use core::fmt;
-use core::fmt::Write as _;
+use core::{convert::Infallible, fmt, fmt::Write as _};
 
-use std::collections::BTreeMap;
-use std::string::{String, ToString};
-use std::vec::Vec;
+use std::{
+  collections::BTreeMap,
+  string::{String, ToString},
+  vec::Vec,
+};
 
 /// Owned `(Group, Name)` key — used by [`MapTagWriter`] to index emitted
 /// tags. Kept as `(String, String)` rather than `(&'static str, &'static
@@ -301,5 +310,16 @@ mod tests {
     // BTreeMap orders by key: ("A","Name1") < ("B","Name2").
     assert_eq!(collected[0].0, "A");
     assert_eq!(collected[1].0, "B");
+  }
+
+  /// `write_str_list` on the default `MapTagWriter` falls through to the
+  /// trait's default impl (per-element `write_str`). The BTreeMap's
+  /// last-write-wins means only the final element is observable; this is
+  /// the documented behavior for non-list-aware sinks.
+  #[test]
+  fn map_tag_writer_write_str_list_uses_default_impl_last_write_wins() {
+    let mut w = MapTagWriter::new();
+    w.write_str_list("G", "N", &["a", "b", "c"]).unwrap();
+    assert_eq!(w.get("G", "N").map(MapValue::as_str), Some("c".to_string()));
   }
 }

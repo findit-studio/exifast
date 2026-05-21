@@ -72,3 +72,45 @@ pub mod value;
 
 pub use error::{Error, OutOfBounds, Result, UnexpectedEof};
 pub use value::{Group, Metadata, Rational, Tag, TagValue};
+
+// Closed-set dispatch + sink scaffold re-exports (the public `AnyError`
+// wrapper + the `parse_bytes` / `parse_<fmt>` entry points land in Phase G).
+pub use parser_new::{AnyMeta, AnyParser, MetaSinker, SharedFlags, TagWriter};
+
+// Per-format public typed re-exports. Each module's `XxxMeta<'a>` + accessor
+// methods are the lib-first surface; the `ProcessXxx` unit-struct is the
+// parser handle (carried in `AnyParser`); `XxxError` is the fatal-error
+// variant.
+#[cfg(feature = "aac")]
+pub use formats::aac::{AacError, AacMeta, ProcessAac};
+#[cfg(feature = "aiff")]
+pub use formats::aiff::{AiffError, AiffMeta, ProcessAiff};
+#[cfg(feature = "ape")]
+pub use formats::ape::{ApeContext, ApeError, ApeMeta, ProcessApe};
+#[cfg(feature = "audible")]
+pub use formats::audible::{AaMeta, AudibleError, ProcessAa};
+#[cfg(feature = "dsf")]
+pub use formats::dsf::{DsfContext, DsfError, DsfMeta, ProcessDsf};
+#[cfg(feature = "dv")]
+pub use formats::dv::{DvError, DvMeta, DvParseOutcome, ProcessDv};
+#[cfg(feature = "flac")]
+pub use formats::flac::{FlacContext, FlacError, FlacMeta, ProcessFlac};
+#[cfg(feature = "id3")]
+pub use formats::id3::{
+  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
+};
+// MP3 wrapper (Codex A-R2-1) — `mp3` feature pulls `mpeg-audio` + `ape`.
+#[cfg(feature = "mp3")]
+pub use formats::id3::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3};
+#[cfg(feature = "moi")]
+pub use formats::moi::{MoiError, MoiMeta, ProcessMoi};
+#[cfg(feature = "mpc")]
+pub use formats::mpc::{MpcContext, MpcError, MpcMeta, ProcessMpc};
+#[cfg(feature = "mpeg-audio")]
+pub use formats::mpeg::{MpegAudioContext, MpegAudioError, MpegAudioMeta, ProcessMpegAudio};
+#[cfg(feature = "ogg")]
+pub use formats::ogg::{OggError, OggMeta, ProcessOgg};
+#[cfg(feature = "red")]
+pub use formats::red::{ProcessR3D, R3dError, R3dMeta};
+#[cfg(feature = "wavpack")]
+pub use formats::wavpack::{ProcessWv, WvContext, WvError, WvMeta};

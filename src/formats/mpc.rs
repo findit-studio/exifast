@@ -1,10 +1,76 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "mpc")]
 //! Faithful port of `Image::ExifTool::MPC` (lib/Image/ExifTool/MPC.pm).
-//! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → `crate::bitstream`.
+//! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → [`crate::bitstream`].
+//!
+//! A typed [`MpcMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
+//!
+//! ## Chained-format role
+//!
+//! Unlike the F1 leaves (AAC/DV — single-format, no chained sub-blocks),
+//! MPC is a chained format (MPC.pm:84-87, 111-113):
+//!
+//! 1. **Leading ID3** — `unless ($$et{DoneID3}) { ProcessID3 ... and return 1; }`
+//!    (MPC.pm:84-87). The bundled audio-loop (ID3.pm:1582-1601) recursively
+//!    re-enters ProcessMPC with `DoneID3` set when ID3 detects a prefix; our
+//!    flattened single-pass model runs ID3 first, then the MP+ header from
+//!    the post-ID3 offset (mirrors APE.pm:122-127 / [`crate::formats::ape`]'s
+//!    APE-style flatten).
+//! 2. **APE trailer** — `Image::ExifTool::APE::ProcessAPE(...)` (MPC.pm:111-113).
+//!    Always invoked after the MP+ header, even on the non-SV7 warning arm;
+//!    bundled returns 1 regardless (void context, MPC.pm:113-115).
+//!
+//! ID3 and APE are dispatched by the engine entry `process` via the chained
+//! helpers (`crate::formats::id3::process::process_id3_chained`,
+//! `crate::formats::ape::ProcessApe::process_trailer_only`) on the
+//! `ParseContext` value sink. The typed [`MpcMeta<'a>`] carries
+//! [`Option<&'a [u8]>`] byte placeholders for the ID3-prefix and APE-trailer
+//! slices so a future pass can compose them with the typed `Id3Meta`/`ApeMeta`.
+//!
+//! ## %MPC::Main table (MPC.pm:21-72)
+//!
+//! Bit fields walked by `process_bit_stream` (MPC.pm:22 `PROCESS_PROC =>
+//! \&Image::ExifTool::FLAC::ProcessBitStream`) on the 32-byte MP+ header
+//! with byte order `'II'` (MPC.pm:98).
+//!
+//! | Bit range  | Tag                  | PrintConv                    |
+//! |-----------|----------------------|------------------------------|
+//! | 032-063   | TotalFrames          | none                         |
+//! | 080-081   | SampleRate           | hash (0/1/2/3 ⇒ Hz numbers)  |
+//! | 084-087   | Quality              | hash (1..15, sparse strings) |
+//! | 088-093   | MaxBand              | none                         |
+//! | 096-111   | ReplayGainTrackPeak  | none                         |
+//! | 112-127   | ReplayGainTrackGain  | none                         |
+//! | 128-143   | ReplayGainAlbumPeak  | none                         |
+//! | 144-159   | ReplayGainAlbumGain  | none                         |
+//! | 179       | FastSeek             | hash (0/1 ⇒ No/Yes)          |
+//! | 191       | Gapless              | hash (0/1 ⇒ No/Yes)          |
+//! | 216-223   | EncoderVersion       | func (`$val =~ s/(\d)(\d)(\d)$/$1.$2.$3/`) |
 
 use crate::{
+  bitstream::{BitOrder, process_bit_stream},
+  parser::ParseContext,
+  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
-  value::TagValue,
+  value::{Metadata, TagValue},
 };
+
+// ===========================================================================
+// `%MPC::Main` tag table (MPC.pm:21-72)
+//
+// Retained so the [`process_bit_stream`] engine (and the engine entry
+// `process` below) can drive the same FLAC::ProcessBitStream PROCESS_PROC as
+// bundled Perl. The typed [`MpcMeta`] holds the raw bit-field scalars
+// (post-bit-stream, pre-PrintConv); PrintConv is applied at emit time by
+// [`MetaSinker::sink`] to mirror ExifTool's `$$self{OPTIONS}{PrintConv}`
+// toggle (ExifTool.pm:5710).
+// ===========================================================================
 
 // MPC.pm:28 — TotalFrames (Bit032-063 = 32-bit integer): no PrintConv.
 static TOTAL_FRAMES: TagDef = TagDef::new("TotalFrames", "MPC", ValueConv::None, PrintConv::None);
@@ -210,90 +276,706 @@ pub const MPC_BIT_KEYS: &[&str] = &[
   "Bit216-223", // EncoderVersion     (MPC.pm:68)
 ];
 
-/// MPC parser (faithful `ProcessMPC`, MPC.pm:79-116).
-pub struct ProcessMpc;
+// ===========================================================================
+// Typed Meta — `MpcMeta<'a>`
+// ===========================================================================
 
-impl crate::parser::FormatParser for ProcessMpc {
-  fn process(&self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
-    // MPC.pm:84-87 `unless ($$et{DoneID3}) { ProcessID3 ... and return 1 }`.
-    // Phase-2 DEFERRED to PR #6 (ID3): on a real MPC file that BEGINS with an
-    // ID3v2 magic (`ID3...`), ProcessID3 would consume the ID3v2 leading
-    // block, advance `$raf`, then dispatch the audio module from inside ID3
-    // (ID3.pm:1580-1601 `foreach $type (@audioFormats) { ... }`), and return
-    // 1 — at which point ProcessMPC returns 1 immediately. On a file WITHOUT
-    // ID3v2 leading bytes (the in-scope input set here), ProcessID3 reads 3
-    // bytes, finds no `^ID3` match (ID3.pm:1452), and returns 0 — at which
-    // point this `unless` block is a no-op. Inputs in this PR's scope are
-    // exactly the no-ID3 case: a pure SV7 MP+ file or a non-SV7 MP+ file.
-    //
-    // No `Warn` here is faithful: Perl's `ProcessID3` is silent in the
-    // no-ID3 case (it does NOT warn for "no ID3 found"; it simply returns 0).
-    // Re-derive the actual integration when the ID3 port lands.
+/// SV7 header bit-field scalars (MPC.pm:21-72), post-bit-stream extraction
+/// and pre-PrintConv. The bit-stream walker
+/// ([`process_bit_stream`]) emits these as `TagValue::I64`; the typed
+/// values here are the lifted primitives with the smallest faithful width
+/// (e.g. 32-bit `TotalFrames`, 16-bit `ReplayGain*`, 8-bit `EncoderVersion`).
+///
+/// PrintConv (`%SampleRate`, `%Quality`, `%FastSeek/Gapless`,
+/// [`encoder_version_print`]) is applied at emit time by [`MetaSinker::sink`]
+/// — `print_conv=true` ⇒ formatted strings or substituted numbers; `false` ⇒
+/// the raw scalars here as JSON numbers.
+///
+/// **D8 — no public fields, accessors only.** Construct only via the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MpcSv7Header {
+  /// Bit032-063 — `TotalFrames` raw u32 (MPC.pm:28).
+  total_frames: u32,
+  /// Bit080-081 — `SampleRate` raw index (0..=3, MPC.pm:29-37).
+  /// PrintConv hash maps 0⇒44100, 1⇒48000, 2⇒37800, 3⇒32000.
+  sample_rate_index: u8,
+  /// Bit084-087 — `Quality` raw index (1..=15, MPC.pm:38-54). The PrintConv
+  /// hash is sparse (no entries for 2/3/4); fall-through emits the generic
+  /// `Unknown (N)` form (ExifTool.pm:3622).
+  quality_index: u8,
+  /// Bit088-093 — `MaxBand` raw 6-bit integer (MPC.pm:55).
+  max_band: u8,
+  /// Bit096-111 — `ReplayGainTrackPeak` raw u16 (MPC.pm:56).
+  replay_gain_track_peak: u16,
+  /// Bit112-127 — `ReplayGainTrackGain` raw u16 (MPC.pm:57).
+  replay_gain_track_gain: u16,
+  /// Bit128-143 — `ReplayGainAlbumPeak` raw u16 (MPC.pm:58).
+  replay_gain_album_peak: u16,
+  /// Bit144-159 — `ReplayGainAlbumGain` raw u16 (MPC.pm:59).
+  replay_gain_album_gain: u16,
+  /// Bit179 — `FastSeek` raw 1-bit (MPC.pm:60-63).
+  fast_seek: u8,
+  /// Bit191 — `Gapless` raw 1-bit (MPC.pm:64-67).
+  gapless: u8,
+  /// Bit216-223 — `EncoderVersion` raw 8-bit (MPC.pm:68-71). PrintConv runs
+  /// `$val =~ s/(\d)(\d)(\d)$/$1.$2.$3/` — `115` ⇒ `"1.1.5"`.
+  encoder_version: u8,
+}
 
-    // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
-    // Copy the 32-byte header out of the borrowed `ctx.data()` so the upcoming
-    // `&mut ctx` (set_file_type + bit-stream call) does not conflict with
-    // `$buff`; `hdr` IS Perl `$buff`. Stack-allocated copy is panic-free.
-    let hdr: [u8; 32] = {
-      let data = ctx.data();
-      if data.len() < 32 {
-        return false; // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
-      }
-      let mut h = [0u8; 32];
-      h.copy_from_slice(&data[..32]);
-      h
-    };
-    if &hdr[..3] != b"MP+" {
-      return false; // magic mismatch ⇒ Perl regex no-match ⇒ return 0
+impl MpcSv7Header {
+  /// `TotalFrames` raw u32 (MPC.pm:28).
+  #[must_use]
+  pub const fn total_frames(&self) -> u32 {
+    self.total_frames
+  }
+  /// `SampleRate` raw index (0..=3, MPC.pm:29-37). Use
+  /// [`Self::sample_rate_hz`] for the PrintConv-mapped Hz number.
+  #[must_use]
+  pub const fn sample_rate_index(&self) -> u8 {
+    self.sample_rate_index
+  }
+  /// `SampleRate` in Hz from the MPC.pm:31-36 PrintConv hash. `None` if the
+  /// raw index is off-table (unreachable: bit field is 2-bit, all 4 values
+  /// are mapped).
+  #[must_use]
+  pub const fn sample_rate_hz(&self) -> Option<u32> {
+    match self.sample_rate_index {
+      0 => Some(44100), // MPC.pm:32
+      1 => Some(48000), // MPC.pm:33
+      2 => Some(37800), // MPC.pm:34
+      3 => Some(32000), // MPC.pm:35
+      _ => None,        // unreachable for a 2-bit index
     }
-    // MPC.pm:93 `my $vers = ord($1) & 0x0f` — low nibble of byte 3.
-    let vers = hdr[3] & 0x0f;
-    // MPC.pm:94 `$et->SetFileType()` — no-arg ⇒ detected file type ("MPC").
-    // Called AFTER magic passes, BEFORE the version dispatch, so the non-SV7
-    // branch still emits the File:* triplet alongside the Warning.
-    ctx.set_file_type(None, None, None);
-    let print_conv_enabled = ctx.print_conv_enabled();
-
-    // MPC.pm:97-106 — SV7 path: ProcessDirectory(MPC::Main) over the 32-byte
-    // header, byte order 'II' (MPC.pm:98). `Options('Verbose')` (MPC.pm:100)
-    // is faithfully deferred (no Verbose option on the read path).
-    if vers == 0x07 {
-      crate::bitstream::process_bit_stream(
-        &hdr,
-        crate::bitstream::BitOrder::Ii, // MPC.pm:98 SetByteOrder('II') — little-endian
-        MPC_BIT_KEYS,
-        &MPC_MAIN,
-        ctx.metadata(),
-        print_conv_enabled,
-      );
-    } else {
-      // MPC.pm:107-109 `$et->Warn('Audio info currently not extracted from
-      // this version MPC file')`. Verbatim string.
-      ctx
-        .metadata()
-        .push_warning("Audio info currently not extracted from this version MPC file");
+  }
+  /// `Quality` raw index (1..=15, MPC.pm:38-54).
+  #[must_use]
+  pub const fn quality_index(&self) -> u8 {
+    self.quality_index
+  }
+  /// `Quality` PrintConv string (MPC.pm:38-54). `None` on a hash miss
+  /// (raw 0, 2, 3, 4 — sparse keys); the legacy bridge then emits the
+  /// generic `Unknown (N)` fallback (ExifTool.pm:3622).
+  #[must_use]
+  pub const fn quality_name(&self) -> Option<&'static str> {
+    match self.quality_index {
+      1 => Some("Unstable/Experimental"),
+      5 => Some("0"),
+      6 => Some("1"),
+      7 => Some("2 (Telephone)"),
+      8 => Some("3 (Thumb)"),
+      9 => Some("4 (Radio)"),
+      10 => Some("5 (Standard)"),
+      11 => Some("6 (Xtreme)"),
+      12 => Some("7 (Insane)"),
+      13 => Some("8 (BrainDead)"),
+      14 => Some("9"),
+      15 => Some("10"),
+      _ => None,
     }
-
-    // MPC.pm:111-113 `require Image::ExifTool::APE; ProcessAPE($et, $dirInfo)`.
-    // Phase-2 DEFERRED to the APE port: on a file WITH an APE trailer,
-    // ProcessAPE seeks to the file end, reads the APE trailer, and pushes
-    // `APE:*` tags. On a file WITHOUT an APE trailer (the in-scope inputs
-    // here), ProcessAPE seeks to end-32 bytes, reads 32 bytes, finds no
-    // "APETAGEX" magic at the trailer position (APE.pm:128-133), and returns
-    // 0 with no warning. Re-derive the actual integration when the APE port
-    // lands; until then the no-APE case is byte-exact.
-
-    true // MPC.pm:115 `return 1`
+  }
+  /// `MaxBand` raw 6-bit (MPC.pm:55).
+  #[must_use]
+  pub const fn max_band(&self) -> u8 {
+    self.max_band
+  }
+  /// `ReplayGainTrackPeak` raw u16 (MPC.pm:56).
+  #[must_use]
+  pub const fn replay_gain_track_peak(&self) -> u16 {
+    self.replay_gain_track_peak
+  }
+  /// `ReplayGainTrackGain` raw u16 (MPC.pm:57).
+  #[must_use]
+  pub const fn replay_gain_track_gain(&self) -> u16 {
+    self.replay_gain_track_gain
+  }
+  /// `ReplayGainAlbumPeak` raw u16 (MPC.pm:58).
+  #[must_use]
+  pub const fn replay_gain_album_peak(&self) -> u16 {
+    self.replay_gain_album_peak
+  }
+  /// `ReplayGainAlbumGain` raw u16 (MPC.pm:59).
+  #[must_use]
+  pub const fn replay_gain_album_gain(&self) -> u16 {
+    self.replay_gain_album_gain
+  }
+  /// `FastSeek` raw 1-bit (MPC.pm:60-63). `true` ⇒ "Yes".
+  #[must_use]
+  pub const fn fast_seek(&self) -> bool {
+    self.fast_seek != 0
+  }
+  /// `Gapless` raw 1-bit (MPC.pm:64-67). `true` ⇒ "Yes".
+  #[must_use]
+  pub const fn gapless(&self) -> bool {
+    self.gapless != 0
+  }
+  /// `EncoderVersion` raw byte (MPC.pm:68-71). Use
+  /// [`Self::encoder_version_str`] for the dotted PrintConv form.
+  #[must_use]
+  pub const fn encoder_version(&self) -> u8 {
+    self.encoder_version
   }
 }
+
+/// Typed MPC metadata — the lib-first output of [`ProcessMpc`].
+///
+/// Holds the typed bit-field scalars from the SV7 header (when present) +
+/// the version-specific warning string (when the MP+ version is anything
+/// other than SV7, MPC.pm:107-109). PrintConv (hash + func) is applied at
+/// emit time by [`MetaSinker::sink`] to mirror ExifTool's
+/// `$$self{OPTIONS}{PrintConv}` toggle (ExifTool.pm:5710).
+///
+/// ## Chained sub-blocks
+///
+/// MPC dispatches both ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113). The typed
+/// [`MpcMeta`] captures their input byte slices as `Option<&'a [u8]>`
+/// placeholders so a future pass can compose them with the typed
+/// [`crate::formats::id3::Id3Meta`] / [`crate::formats::ape::ApeMeta`]; the
+/// engine entry `process` below dispatches both on the `ParseContext` value
+/// sink, so the serialized JSON is byte-exact with bundled `perl exiftool`.
+///
+/// **D8 — no public fields, accessors only.**
+///
+/// **Lifetimes.** `'a` is held for the ID3/APE byte placeholders that
+/// borrow from the input slice; the SV7 header is owned primitives.
+#[derive(Debug, Clone, Copy)]
+pub struct MpcMeta<'a> {
+  /// MP+ version low nibble (MPC.pm:93 `ord($1) & 0x0f`). The SV7 bit
+  /// walker only runs when `version == 0x07`; other versions trigger the
+  /// MPC.pm:107-109 warning arm.
+  version: u8,
+  /// SV7 header fields (MPC.pm:21-72). `Some` iff the MP+ version low
+  /// nibble is `0x07`; `None` for the non-SV7 warning arm
+  /// (MPC.pm:107-109).
+  sv7_header: Option<MpcSv7Header>,
+  /// Whether the non-SV7 warning (MPC.pm:108 `'Audio info currently not
+  /// extracted from this version MPC file'`) should be emitted.
+  warn_unsupported_version: bool,
+  /// **Phase F5 placeholder.** Byte slice of any ID3-prefix block seen
+  /// BEFORE the MP+ magic (MPC.pm:84-87). The legacy bridge dispatches it
+  /// through [`crate::formats::id3::process::process_id3_chained`]; the
+  /// typed `Id3Meta` from the parallel F2 agent will eventually consume
+  /// this slice (Phase F5-integration). Today: always `None` — F5 does NOT
+  /// pre-scan for ID3 (the bridge calls ID3 directly on `ctx.data()`).
+  id3_prefix: Option<&'a [u8]>,
+  /// **Phase F5 placeholder.** Byte slice of any APE trailer block seen
+  /// AFTER the MP+ header (MPC.pm:111-113). The legacy bridge dispatches
+  /// it through [`crate::formats::ape::ProcessApe::process_trailer_only`];
+  /// the typed `ApeMeta` from the parallel F3 agent will eventually
+  /// consume this slice. Today: always `None` for the same reason as
+  /// `id3_prefix`.
+  ape_trailer: Option<&'a [u8]>,
+}
+
+impl<'a> MpcMeta<'a> {
+  /// MP+ version low nibble (MPC.pm:93). `0x07` ⇒ SV7 path; anything else
+  /// ⇒ warning arm (MPC.pm:107-109).
+  #[must_use]
+  pub const fn version(&self) -> u8 {
+    self.version
+  }
+  /// SV7 header fields, present iff [`Self::version`] returned `0x07`.
+  #[must_use]
+  pub const fn sv7_header(&self) -> Option<&MpcSv7Header> {
+    self.sv7_header.as_ref()
+  }
+  /// `true` if the MPC.pm:108 warning (`'Audio info currently not extracted
+  /// from this version MPC file'`) should be emitted.
+  #[must_use]
+  pub const fn warn_unsupported_version(&self) -> bool {
+    self.warn_unsupported_version
+  }
+  /// **Phase F5 placeholder.** ID3-prefix bytes (always `None` today; see
+  /// the field-level doc).
+  #[must_use]
+  pub const fn id3_prefix(&self) -> Option<&'a [u8]> {
+    self.id3_prefix
+  }
+  /// **Phase F5 placeholder.** APE-trailer bytes (always `None` today; see
+  /// the field-level doc).
+  #[must_use]
+  pub const fn ape_trailer(&self) -> Option<&'a [u8]> {
+    self.ape_trailer
+  }
+}
+
+// ===========================================================================
+// `MpcContext<'a>` — per-format input view for chained dispatch
+// ===========================================================================
+
+/// Per-format input view for [`ProcessMpc`]. Wraps the input bytes and a
+/// mutable [`SharedFlags`] handle, faithful to spec §6.4: "Leaves (MOI,
+/// AAC, DV, Audible) take just `&'a [u8]`; chained formats (ID3 → APE,
+/// APE → ID3, MPC → ID3 + APE, …) wrap `&'a [u8]` + `&'a mut SharedFlags`."
+///
+/// MPC chains BOTH ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113), so it
+/// carries the SharedFlags. The Phase F5 typed [`ProcessMpc::parse`] does
+/// NOT itself dispatch to ID3/APE (those typed parsers land in the parallel
+/// F2/F3 agents and the F5-integration composes them); the field is in the
+/// surface for forward compatibility.
+///
+/// D8: PRIVATE fields, accessors only.
+#[derive(Debug)]
+pub struct MpcContext<'a> {
+  data: &'a [u8],
+  // Held for cross-format chained dispatch. F5's typed `parse` does not
+  // mutate the shared flags directly — they're threaded so a future
+  // F5-integration pass can chain into typed `Id3Meta` / `ApeMeta`.
+  #[allow(dead_code)]
+  shared: &'a mut SharedFlags,
+}
+
+impl<'a> MpcContext<'a> {
+  /// Construct a chained-MPC context with the input bytes and a mutable
+  /// [`SharedFlags`] handle.
+  #[must_use]
+  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+    Self { data, shared }
+  }
+  /// Borrow the input bytes.
+  #[must_use]
+  pub const fn data(&self) -> &'a [u8] {
+    self.data
+  }
+  /// Borrow the cross-format shared flags. Phase G integration will use
+  /// this to thread `done_id3` / `done_ape` updates from typed `Id3Meta` /
+  /// `ApeMeta` runs.
+  pub fn shared(&mut self) -> &mut SharedFlags {
+    self.shared
+  }
+}
+
+// ===========================================================================
+// `ProcessMpc` — the lib-first parser
+// ===========================================================================
+
+/// MPC parser (faithful `ProcessMPC`, MPC.pm:79-116).
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessMpc;
+
+impl parser_sealed::Sealed for ProcessMpc {}
+
+impl FormatParser for ProcessMpc {
+  /// GAT: the Meta borrows from the input `'a` (Codex AF2).
+  type Meta<'a> = MpcMeta<'a>;
+  /// Chained-format Context: `data + SharedFlags`. See [`MpcContext`].
+  type Context<'a> = MpcContext<'a>;
+  /// Rust-level fatal error (currently none — every bad input is `Ok(None)`).
+  type Error = MpcError;
+
+  /// Parse an MPC file's bytes into a typed [`MpcMeta`], or `None` if the
+  /// buffer is not a valid MP+ stream (short read or wrong magic; MPC.pm:92).
+  ///
+  /// Reads the 32-byte MP+ header, validates the magic (MPC.pm:92), and
+  /// extracts the SV7 bit-fields when `vers == 0x07`. The chained ID3
+  /// (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are driven by the
+  /// engine entry [`ProcessMpc::process`] (which owns the `ParseContext`
+  /// value sink), not by this header-only typed `parse`.
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpcError> {
+    parse_inner(ctx.data())
+  }
+}
+
+/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
+/// [`MpcMeta`] that borrows from the input buffer (for the F5 placeholder
+/// byte slices; the SV7 header is owned).
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved for
+/// future I/O wrappers).
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
+  parse_inner(data)
+}
+
+/// Inner parser — produces a borrow-from-input [`MpcMeta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = MpcMeta<'a>`) returns
+/// this borrowed form directly into the closed
+/// [`crate::parser_new::AnyMeta`] enum (Codex AF2). The `id3_prefix` /
+/// `ape_trailer` placeholders are always `None` in F5.
+fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
+  // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
+  if data.len() < 32 {
+    return Ok(None); // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
+  }
+  let hdr = &data[..32];
+  if &hdr[..3] != b"MP+" {
+    return Ok(None); // magic mismatch ⇒ Perl regex no-match ⇒ return 0
+  }
+  // MPC.pm:93 `my $vers = ord($1) & 0x0f` — low nibble of byte 3.
+  let version = hdr[3] & 0x0f;
+
+  // MPC.pm:97-106 — SV7 path: ProcessDirectory(MPC::Main) over the 32-byte
+  // header, byte order 'II' (MPC.pm:98). `Options('Verbose')` (MPC.pm:100)
+  // is faithfully deferred (no Verbose option on the read path).
+  let (sv7_header, warn_unsupported_version) = if version == 0x07 {
+    (Some(extract_sv7_header(hdr)), false)
+  } else {
+    // MPC.pm:107-109 `$et->Warn('Audio info currently not extracted from
+    // this version MPC file')`.
+    (None, true)
+  };
+
+  Ok(Some(MpcMeta {
+    version,
+    sv7_header,
+    warn_unsupported_version,
+    // F5 placeholders — see field docs on `MpcMeta`.
+    id3_prefix: None,
+    ape_trailer: None,
+  }))
+}
+
+/// Extract the SV7 bit-fields from the 32-byte MP+ header. Reuses
+/// [`process_bit_stream`] (the shared FLAC::ProcessBitStream engine) for
+/// byte-exact extraction faithful to MPC.pm:22, then lifts the emitted
+/// `TagValue::I64` scalars into typed primitives on [`MpcSv7Header`].
+///
+/// The bit-stream walker pushes into a side [`Metadata`] (`print_conv=false`
+/// so the staged values are post-ValueConv raw scalars — `ValueConv::None`
+/// for every MPC field, so these are the literal bit-extracted integers).
+/// [`MetaSinker::sink`] applies PrintConv at emit time.
+fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
+  // Staging Metadata captures the bit-stream walker's emissions. The walker
+  // always emits `TagValue::I64` for these ≤ 32-bit fields (see the AAC
+  // pilot — same pattern), so the lift is a direct `as` cast.
+  let mut staging = Metadata::new("mpc-staging");
+  process_bit_stream(
+    hdr,
+    BitOrder::Ii, // MPC.pm:98 SetByteOrder('II') — little-endian
+    MPC_BIT_KEYS,
+    &MPC_MAIN,
+    &mut staging,
+    /* print_conv_enabled */ false,
+  );
+
+  // Defaults are 0 for every field — the bit-stream walker hits every key
+  // for a well-formed 32-byte header; on a short buffer the walker breaks
+  // early via FLAC.pm:177 `last if $i2 >= $dirLen`. The 32-byte gate above
+  // ensures the full walk in production; the defaults guard against
+  // pathological inputs.
+  let mut h = MpcSv7Header {
+    total_frames: 0,
+    sample_rate_index: 0,
+    quality_index: 0,
+    max_band: 0,
+    replay_gain_track_peak: 0,
+    replay_gain_track_gain: 0,
+    replay_gain_album_peak: 0,
+    replay_gain_album_gain: 0,
+    fast_seek: 0,
+    gapless: 0,
+    encoder_version: 0,
+  };
+  for tag in staging.tags() {
+    let TagValue::I64(n) = tag.value() else {
+      continue; // unreachable for these fields under print_conv=false
+    };
+    let n = *n;
+    match tag.name() {
+      "TotalFrames" => h.total_frames = n as u32,
+      "SampleRate" => h.sample_rate_index = n as u8,
+      "Quality" => h.quality_index = n as u8,
+      "MaxBand" => h.max_band = n as u8,
+      "ReplayGainTrackPeak" => h.replay_gain_track_peak = n as u16,
+      "ReplayGainTrackGain" => h.replay_gain_track_gain = n as u16,
+      "ReplayGainAlbumPeak" => h.replay_gain_album_peak = n as u16,
+      "ReplayGainAlbumGain" => h.replay_gain_album_gain = n as u16,
+      "FastSeek" => h.fast_seek = n as u8,
+      "Gapless" => h.gapless = n as u8,
+      "EncoderVersion" => h.encoder_version = n as u8,
+      _ => {}
+    }
+  }
+  h
+}
+
+// ===========================================================================
+// `MetaSinker` — typed Meta → TagWriter
+// ===========================================================================
+
+impl MetaSinker for MpcMeta<'_> {
+  /// Emit MPC tags into the writer in `%MPC::Main` walk order (MPC.pm:21-72:
+  /// TotalFrames, SampleRate, Quality, MaxBand, ReplayGain×4, FastSeek,
+  /// Gapless, EncoderVersion) — faithful to the bundled-Perl bit-stream
+  /// iteration order.
+  ///
+  /// `print_conv=true` ⇒ PrintConv formatted values (`-j` mode):
+  /// - `SampleRate` ⇒ Hz number from the hash (e.g. `44100`)
+  /// - `Quality` ⇒ named string from the hash (e.g. `"5 (Standard)"`)
+  /// - `FastSeek` / `Gapless` ⇒ `"No"` / `"Yes"`
+  /// - `EncoderVersion` ⇒ dotted string (e.g. `"1.1.5"`)
+  ///
+  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode): every
+  /// field emits its raw integer (sample_rate_index, quality_index, etc.).
+  ///
+  /// **Non-SV7 arm.** When [`MpcMeta::sv7_header`] is `None`
+  /// (MPC.pm:107-109), no MPC:* tags are emitted; the warning is pushed by
+  /// the legacy bridge or directly by a lib caller via
+  /// [`TagWriter::write_warning`] at the end of this fn.
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    const GROUP: &str = "MPC";
+
+    if let Some(h) = self.sv7_header.as_ref() {
+      // MPC.pm:28 — TotalFrames: no conversions, identical under -j and -n.
+      out.write_u64(GROUP, "TotalFrames", u64::from(h.total_frames))?;
+
+      // MPC.pm:29-37 — SampleRate. -j: hash hit yields the Hz integer
+      // (PrintValue::I64). -n: raw index.
+      if print_conv {
+        // sample_rate_hz() is always Some for a 2-bit index (all 4
+        // values mapped); fall through to raw if ever None.
+        match h.sample_rate_hz() {
+          Some(hz) => out.write_u64(GROUP, "SampleRate", u64::from(hz))?,
+          None => out.write_u64(GROUP, "SampleRate", u64::from(h.sample_rate_index))?,
+        }
+      } else {
+        out.write_u64(GROUP, "SampleRate", u64::from(h.sample_rate_index))?;
+      }
+
+      // MPC.pm:38-54 — Quality. -j: hash hit yields a PrintValue::Str
+      // (e.g. "5 (Standard)" for index 10); miss falls back to "Unknown
+      // (N)" (ExifTool.pm:3622 — the generic PrintConv hash-miss path).
+      // -n: raw index.
+      if print_conv {
+        if let Some(name) = h.quality_name() {
+          out.write_str(GROUP, "Quality", name)?;
+        } else {
+          let idx = h.quality_index;
+          out.write_fmt(GROUP, "Quality", |w| write!(w, "Unknown ({idx})"))?;
+        }
+      } else {
+        out.write_u64(GROUP, "Quality", u64::from(h.quality_index))?;
+      }
+
+      // MPC.pm:55 — MaxBand: no conversions.
+      out.write_u64(GROUP, "MaxBand", u64::from(h.max_band))?;
+
+      // MPC.pm:56-59 — ReplayGain×4: no conversions.
+      out.write_u64(
+        GROUP,
+        "ReplayGainTrackPeak",
+        u64::from(h.replay_gain_track_peak),
+      )?;
+      out.write_u64(
+        GROUP,
+        "ReplayGainTrackGain",
+        u64::from(h.replay_gain_track_gain),
+      )?;
+      out.write_u64(
+        GROUP,
+        "ReplayGainAlbumPeak",
+        u64::from(h.replay_gain_album_peak),
+      )?;
+      out.write_u64(
+        GROUP,
+        "ReplayGainAlbumGain",
+        u64::from(h.replay_gain_album_gain),
+      )?;
+
+      // MPC.pm:60-63 — FastSeek. -j: 0⇒"No", 1⇒"Yes". -n: raw 0/1.
+      if print_conv {
+        out.write_str(
+          GROUP,
+          "FastSeek",
+          if h.fast_seek != 0 { "Yes" } else { "No" },
+        )?;
+      } else {
+        out.write_u64(GROUP, "FastSeek", u64::from(h.fast_seek))?;
+      }
+
+      // MPC.pm:64-67 — Gapless. Same shape as FastSeek.
+      if print_conv {
+        out.write_str(GROUP, "Gapless", if h.gapless != 0 { "Yes" } else { "No" })?;
+      } else {
+        out.write_u64(GROUP, "Gapless", u64::from(h.gapless))?;
+      }
+
+      // MPC.pm:68-71 — EncoderVersion. -j: dotted via the substitution
+      // function (115 ⇒ "1.1.5"). -n: raw byte (115). The match path is
+      // unconditional for valid 3-digit numbers: every u8 ≥ 100 takes the
+      // match path; u8 < 100 (1- or 2-digit) takes the no-match path and
+      // emits the raw integer faithfully.
+      if print_conv {
+        // Stringify the raw u8 and apply the Perl `s/(\d)(\d)(\d)$/$1.$2.$3/`
+        // substitution. For raw byte n:
+        //   n >= 100 ⇒ 3 trailing digits ⇒ match ⇒ "head.lhs.mid.tail"
+        //   n < 100  ⇒ no match ⇒ emit raw integer
+        // (This mirrors `encoder_version_print` above with the I64 input.)
+        let n = u32::from(h.encoder_version);
+        let s = n.to_string();
+        let bytes = s.as_bytes();
+        if bytes.len() >= 3 && bytes[bytes.len() - 3..].iter().all(u8::is_ascii_digit) {
+          out.write_fmt(GROUP, "EncoderVersion", |w| {
+            let (head, tail) = s.split_at(s.len() - 3);
+            let tb = tail.as_bytes();
+            w.write_str(head)?;
+            w.write_char(tb[0] as char)?;
+            w.write_char('.')?;
+            w.write_char(tb[1] as char)?;
+            w.write_char('.')?;
+            w.write_char(tb[2] as char)?;
+            Ok(())
+          })?;
+        } else {
+          // No-match path: emit the raw integer faithfully (Perl `s///`
+          // leaves $val unchanged, preserving I64 typing — the JSON
+          // writer emits a bare number, NOT a quoted string).
+          out.write_u64(GROUP, "EncoderVersion", u64::from(h.encoder_version))?;
+        }
+      } else {
+        out.write_u64(GROUP, "EncoderVersion", u64::from(h.encoder_version))?;
+      }
+    }
+
+    // MPC.pm:107-109 — non-SV7 warning. Emit AFTER the (empty) tag block;
+    // bundled `perl exiftool -j -G1` surfaces `ExifTool:Warning` as the
+    // first non-File: entry (the serializer emits the warning at the front
+    // of the JSON object). Both the engine [`JsonTagWriter`] and lib callers
+    // (MapTagWriter) route this through [`TagWriter::write_warning`].
+    if self.warn_unsupported_version {
+      out.write_warning("Audio info currently not extracted from this version MPC file")?;
+    }
+    Ok(())
+  }
+}
+
+// ===========================================================================
+// `MpcError` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for MPC parsing. Currently empty — every bad
+/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
+/// wrappers if streaming readers are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpcError {}
+
+impl core::fmt::Display for MpcError {
+  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match *self {}
+  }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for MpcError {}
+
+// ===========================================================================
+// Engine entry — typed parse + File:* + sink into `Metadata`
+// ===========================================================================
+
+impl ProcessMpc {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Faithful to `ProcessMPC`
+  /// (MPC.pm:79-116):
+  /// 1. **ID3 prefix dispatch** (MPC.pm:84-87) — `unless ($$et{DoneID3})
+  ///    { ProcessID3 ... and return 1; }`. Via the parallel F2 agent's
+  ///    [`crate::formats::id3::process::process_id3_chained`] entry. When
+  ///    ID3 finds a prefix, MPC continues at the post-ID3 offset (faithful
+  ///    APE-style flattened model — bundled's audio-loop recursion folds
+  ///    into a single pass). No-ID3 case is the in-scope MPC fixture set:
+  ///    `process_id3_chained` returns `found=false, hdr_end=0`.
+  /// 2. **MP+ magic gate + SV7/non-SV7 dispatch** (MPC.pm:92-109). On a
+  ///    short read or wrong magic ⇒ return 0 BEFORE SetFileType (faithful
+  ///    to the bundled `or return 0` at MPC.pm:92).
+  /// 3. **SetFileType** (MPC.pm:94) — no-arg, detected ("MPC"). Called
+  ///    AFTER magic passes, BEFORE the version dispatch (so the non-SV7
+  ///    warning arm still emits File:* alongside the Warning).
+  /// 4. **SV7 bit-stream walk** (MPC.pm:97-106) or **non-SV7 warning**
+  ///    (MPC.pm:107-109).
+  /// 5. **APE trailer** (MPC.pm:111-113) — `Image::ExifTool::APE::
+  ///    ProcessAPE(...)` via the parallel F3 agent's
+  ///    [`crate::formats::ape::ProcessApe::process_trailer_only`] entry
+  ///    (chained-from-typed-file path, APE.pm:165-237). Bundled is void-
+  ///    context; the result is discarded. APE.pm:131 `$$et{DoneAPE} = 1`
+  ///    happens inside, so subsequent chained parsers see DoneAPE set.
+  /// 6. **Return 1** (MPC.pm:115).
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+    // ----- (1) ID3 prefix dispatch (MPC.pm:84-87) --------------------------
+    // `unless ($$et{DoneID3}) { ProcessID3 ... and return 1; }`. Bundled's
+    // `and return 1` chains: a successful ProcessID3 makes MPC return 1
+    // immediately. The bundled audio-loop (ID3.pm:1582-1601) then recursively
+    // re-invokes ProcessMPC with DoneID3 set, which reads MP+ at $hdrEnd.
+    //
+    // Faithful flattened model (mirrors APE's APE.pm:122-127 chained
+    // ID3 dispatch in `src/formats/ape.rs`): run ID3 first, then continue
+    // MPC's own work at the post-ID3 offset. For the in-scope MPC fixtures
+    // (`MPC.mpc` / `sv8.mpc`) which have NO ID3 prefix, this returns
+    // `found=false, hdr_end=0` and is a no-op.
+    let id3 = if ctx.writer().done_id3().is_none() {
+      crate::formats::id3::process::process_id3_chained(ctx)
+    } else {
+      crate::formats::id3::process::Id3ChainedResult::default()
+    };
+    let id3_found = id3.found();
+    let hdr_end = id3.hdr_end_offset();
+
+    // ----- (2) MP+ magic gate (MPC.pm:92) ----------------------------------
+    // Slice past any ID3v2 header. When `hdr_end == 0` (no ID3 prefix —
+    // the in-scope fixture case), the slice IS `ctx.data()` from offset 0.
+    // Codex R4 F1 fix mirror (from APE): `hdr_end` may exceed `data.len()`
+    // for truncated v2.4-footer files — saturate-to-empty.
+    let body = ctx.data().get(hdr_end..).unwrap_or(&[]);
+    let meta = match parse_inner(body) {
+      Ok(Some(m)) => m,
+      // Bundled `or return 0` (MPC.pm:92): no magic, no SetFileType, no
+      // tags. Two faithful outcomes:
+      //   (a) ID3 was found above ⇒ bundled `and return 1` semantics:
+      //       return TRUE so the engine treats the file as ID3-only.
+      //   (b) ID3 was NOT found ⇒ return FALSE so the candidate loop
+      //       tries the next type.
+      Ok(None) | Err(_) => return id3_found,
+    };
+
+    // ----- (3) SetFileType (MPC.pm:94) -------------------------------------
+    // `$et->SetFileType()` no-arg ⇒ detected file type ("MPC"). Pushes
+    // File:FileType / File:FileTypeExtension / File:MIMEType under
+    // ("File", "File") BEFORE the MPC:* tags (the bundled iteration order
+    // under `-j -G1`).
+    ctx.set_file_type(None, None, None);
+
+    // ----- (4) SV7 walk OR non-SV7 warning (MPC.pm:97-109) -----------------
+    // Sink the typed `MpcMeta` directly into the engine `JsonTagWriter`
+    // (`ctx.writer()`). The MetaSinker emits the SV7 tags + the optional
+    // warning in faithful order via `TagWriter::write_*` / `write_warning`.
+    // `JsonTagWriter::Error` is `Infallible` ⇒ the call cannot fail.
+    let print_conv = ctx.print_conv_enabled();
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
+
+    // ----- (5) APE trailer (MPC.pm:111-113) --------------------------------
+    // `require Image::ExifTool::APE; ProcessAPE(...)`. Bundled is void
+    // context (`ProcessAPE($et, $dirInfo)` with no `and`/`or` chain), so
+    // the result is discarded — MPC's final return is always 1 (MPC.pm:115).
+    //
+    // Use the chained `process_trailer_only` (APE.pm:165-237 — the
+    // `unless ($header)` block) because MPC has already typed the file at
+    // step (3). APE.pm:131 `$$et{DoneAPE} = 1` happens INSIDE the trailer-
+    // only entry, regardless of whether a trailer is found.
+    //
+    // For the in-scope MPC fixtures (32-byte files, no APE trailer), the
+    // trailer scan finds no `APETAGEX` magic at the trailer position and
+    // emits no APE tags / no warning — byte-exact to the prior MPC.rs
+    // which simply omitted the APE dispatch entirely.
+    let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
+
+    // ----- (6) Return 1 (MPC.pm:115) ---------------------------------------
+    true
+  }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::{
-    parser::{FormatParser, ParseContext},
-    value::Metadata,
+    json_writer::JsonTagWriter,
+    parser::ParseContext,
+    parser_new::FormatParser,
+    sink::{MapTagWriter, MapValue},
   };
+
+  // ---------- Tag table + bit-keys faithfulness --------------------------
 
   #[test]
   fn table_and_keys_are_faithful() {
@@ -397,11 +1079,13 @@ mod tests {
     assert_eq!(out_short, TagValue::Str("ab".into()));
   }
 
+  // ---------- Reject paths (Perl `return 0`) -----------------------------
+
   #[test]
   fn rejects_non_mpc_magic() {
     // MPC.pm:92 `... $buff =~ /^MP\+(.)/s or return 0` — magic mismatch
     // returns 0 BEFORE SetFileType (MPC.pm:94), so nothing is pushed.
-    let mut m = Metadata::new("x.mpc");
+    let mut m = JsonTagWriter::new("x.mpc");
     let data = [0u8; 32];
     let mut c = ParseContext::new(&data, "MPC", 0, "MPC", None, true, &mut m);
     assert!(!ProcessMpc.process(&mut c));
@@ -412,10 +1096,302 @@ mod tests {
   fn rejects_short_read() {
     // MPC.pm:92 `$raf->Read($buff,32) == 32 ...` — < 32 bytes ⇒ return 0.
     // Faithful even for a buffer that starts with "MP+" but is too short.
-    let mut m = Metadata::new("x.mpc");
+    let mut m = JsonTagWriter::new("x.mpc");
     let data = b"MP+\x07\x00\x00\x00";
     let mut c = ParseContext::new(data, "MPC", 0, "MPC", None, true, &mut m);
     assert!(!ProcessMpc.process(&mut c));
     assert!(m.tags().is_empty());
+  }
+
+  // ---------- Lib-first typed Meta surface --------------------------------
+
+  #[test]
+  fn parse_borrowed_rejects_short_buffer() {
+    assert!(parse_borrowed(&[]).unwrap().is_none());
+    assert!(parse_borrowed(b"MP+\x07").unwrap().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_rejects_non_mpc_magic() {
+    let data = [0u8; 32];
+    assert!(parse_borrowed(&data).unwrap().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_extracts_sv7_fixture_fields() {
+    // Real MPC.mpc fixture is 32 bytes starting `MP+\x07...`. Oracle SV7
+    // header from bundled `perl exiftool`:
+    //   TotalFrames=102, SampleRate=44100 (idx=0), Quality="5 (Standard)"
+    //   (idx=10), MaxBand=28, ReplayGain*=0, FastSeek=No (0), Gapless=Yes
+    //   (1), EncoderVersion="1.1.5" (raw=115).
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MPC.mpc"),
+    )
+    .expect("read MPC.mpc fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert_eq!(meta.version(), 0x07);
+    let h = meta.sv7_header().expect("SV7 header present");
+    assert_eq!(h.total_frames(), 102);
+    assert_eq!(h.sample_rate_index(), 0);
+    assert_eq!(h.sample_rate_hz(), Some(44100));
+    assert_eq!(h.quality_index(), 10);
+    assert_eq!(h.quality_name(), Some("5 (Standard)"));
+    assert_eq!(h.max_band(), 28);
+    assert_eq!(h.replay_gain_track_peak(), 0);
+    assert_eq!(h.replay_gain_track_gain(), 0);
+    assert_eq!(h.replay_gain_album_peak(), 0);
+    assert_eq!(h.replay_gain_album_gain(), 0);
+    assert!(!h.fast_seek()); // 0 ⇒ No
+    assert!(h.gapless()); // 1 ⇒ Yes
+    assert_eq!(h.encoder_version(), 115);
+    assert!(!meta.warn_unsupported_version());
+    // F5 placeholders are always None.
+    assert!(meta.id3_prefix().is_none());
+    assert!(meta.ape_trailer().is_none());
+  }
+
+  #[test]
+  fn parse_borrowed_warns_on_non_sv7_version() {
+    // sv8.mpc fixture: `MP+\x08...` ⇒ version=8 ⇒ warning arm.
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sv8.mpc"),
+    )
+    .expect("read sv8.mpc fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert_eq!(meta.version(), 0x08);
+    assert!(meta.sv7_header().is_none());
+    assert!(meta.warn_unsupported_version());
+  }
+
+  #[test]
+  fn format_parser_trait_returns_meta_static() {
+    // Drive the trait via the chained-format Context.
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MPC.mpc"),
+    )
+    .expect("read MPC.mpc fixture");
+    let mut shared = SharedFlags::new();
+    let ctx = MpcContext::new(&bytes, &mut shared);
+    let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx)
+      .expect("ok")
+      .expect("parsed");
+    let h = meta.sv7_header().expect("SV7 header");
+    assert_eq!(h.total_frames(), 102);
+    assert_eq!(h.encoder_version(), 115);
+  }
+
+  // ---------- MetaSinker: -j (PrintConv on) ------------------------------
+
+  #[test]
+  fn meta_sinker_emits_sv7_print_conv_strings() {
+    // Build an SV7 MpcMeta with the MPC.mpc fixture values; sink -j.
+    let h = MpcSv7Header {
+      total_frames: 102,
+      sample_rate_index: 0,
+      quality_index: 10,
+      max_band: 28,
+      replay_gain_track_peak: 0,
+      replay_gain_track_gain: 0,
+      replay_gain_album_peak: 0,
+      replay_gain_album_gain: 0,
+      fast_seek: 0,
+      gapless: 1,
+      encoder_version: 115,
+    };
+    let meta = MpcMeta {
+      version: 0x07,
+      sv7_header: Some(h),
+      warn_unsupported_version: false,
+      id3_prefix: None,
+      ape_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("MPC", "TotalFrames").map(MapValue::as_str),
+      Some("102".to_string())
+    );
+    // SampleRate -j: PrintConv hash hit ⇒ 44100 (number)
+    assert_eq!(
+      w.get("MPC", "SampleRate").map(MapValue::as_str),
+      Some("44100".to_string())
+    );
+    // Quality -j: hash hit ⇒ "5 (Standard)"
+    assert_eq!(
+      w.get("MPC", "Quality").map(MapValue::as_str),
+      Some("5 (Standard)".to_string())
+    );
+    assert_eq!(
+      w.get("MPC", "MaxBand").map(MapValue::as_str),
+      Some("28".to_string())
+    );
+    assert_eq!(
+      w.get("MPC", "FastSeek").map(MapValue::as_str),
+      Some("No".to_string())
+    );
+    assert_eq!(
+      w.get("MPC", "Gapless").map(MapValue::as_str),
+      Some("Yes".to_string())
+    );
+    // EncoderVersion -j: 115 ⇒ "1.1.5"
+    assert_eq!(
+      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
+      Some("1.1.5".to_string())
+    );
+    // No warning when sv7_header is Some.
+    assert!(w.warnings().is_empty());
+  }
+
+  #[test]
+  fn meta_sinker_emits_sv7_print_conv_off_raw_scalars() {
+    let h = MpcSv7Header {
+      total_frames: 102,
+      sample_rate_index: 0,
+      quality_index: 10,
+      max_band: 28,
+      replay_gain_track_peak: 0,
+      replay_gain_track_gain: 0,
+      replay_gain_album_peak: 0,
+      replay_gain_album_gain: 0,
+      fast_seek: 0,
+      gapless: 1,
+      encoder_version: 115,
+    };
+    let meta = MpcMeta {
+      version: 0x07,
+      sv7_header: Some(h),
+      warn_unsupported_version: false,
+      id3_prefix: None,
+      ape_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
+    // SampleRate -n: raw idx = 0
+    assert_eq!(
+      w.get("MPC", "SampleRate").map(MapValue::as_str),
+      Some("0".to_string())
+    );
+    // Quality -n: raw idx = 10
+    assert_eq!(
+      w.get("MPC", "Quality").map(MapValue::as_str),
+      Some("10".to_string())
+    );
+    // FastSeek -n: 0
+    assert_eq!(
+      w.get("MPC", "FastSeek").map(MapValue::as_str),
+      Some("0".to_string())
+    );
+    // Gapless -n: 1
+    assert_eq!(
+      w.get("MPC", "Gapless").map(MapValue::as_str),
+      Some("1".to_string())
+    );
+    // EncoderVersion -n: raw 115
+    assert_eq!(
+      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
+      Some("115".to_string())
+    );
+  }
+
+  #[test]
+  fn meta_sinker_emits_warning_on_non_sv7() {
+    // sv8 path: sv7_header=None, warn_unsupported_version=true.
+    let meta = MpcMeta {
+      version: 0x08,
+      sv7_header: None,
+      warn_unsupported_version: true,
+      id3_prefix: None,
+      ape_trailer: None,
+    };
+    // -j
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    // No MPC:* tags emitted (sv7_header is None). `MapTagWriter::iter`
+    // only yields keyed (group, name, value) triples — warnings/errors
+    // live in their own accumulator (`MapTagWriter::warnings/errors`)
+    // and would not be returned here even if the sink had emitted them.
+    assert!(w.iter().all(|(g, _, _)| g != "MPC"));
+    // The warning is pushed through write_warning ⇒ MapTagWriter::warnings.
+    assert_eq!(
+      w.warnings(),
+      &["Audio info currently not extracted from this version MPC file"]
+    );
+    // -n: identical (no MPC:* tags, same warning).
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
+    assert_eq!(
+      w.warnings(),
+      &["Audio info currently not extracted from this version MPC file"]
+    );
+  }
+
+  #[test]
+  fn meta_sinker_emits_quality_unknown_fallback() {
+    // Quality raw=2 (sparse — MPC.pm:38-54 has no key for 2) ⇒ -j must
+    // emit "Unknown (2)" per ExifTool.pm:3622. -n: raw 2.
+    let h = MpcSv7Header {
+      total_frames: 0,
+      sample_rate_index: 0,
+      quality_index: 2,
+      max_band: 0,
+      replay_gain_track_peak: 0,
+      replay_gain_track_gain: 0,
+      replay_gain_album_peak: 0,
+      replay_gain_album_gain: 0,
+      fast_seek: 0,
+      gapless: 0,
+      encoder_version: 0,
+    };
+    let meta = MpcMeta {
+      version: 0x07,
+      sv7_header: Some(h),
+      warn_unsupported_version: false,
+      id3_prefix: None,
+      ape_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("MPC", "Quality").map(MapValue::as_str),
+      Some("Unknown (2)".to_string())
+    );
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
+    assert_eq!(
+      w.get("MPC", "Quality").map(MapValue::as_str),
+      Some("2".to_string())
+    );
+  }
+
+  #[test]
+  fn meta_sinker_encoder_version_lt_100_emits_raw() {
+    // No-match path: 2-digit value ⇒ Perl `s///` no-match ⇒ original
+    // I64 preserved. Both -j and -n emit the raw integer.
+    let h = MpcSv7Header {
+      total_frames: 0,
+      sample_rate_index: 0,
+      quality_index: 1,
+      max_band: 0,
+      replay_gain_track_peak: 0,
+      replay_gain_track_gain: 0,
+      replay_gain_album_peak: 0,
+      replay_gain_album_gain: 0,
+      fast_seek: 0,
+      gapless: 0,
+      encoder_version: 15, // 2-digit ⇒ no-match
+    };
+    let meta = MpcMeta {
+      version: 0x07,
+      sv7_header: Some(h),
+      warn_unsupported_version: false,
+      id3_prefix: None,
+      ape_trailer: None,
+    };
+    let mut w = MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
+      Some("15".to_string())
+    );
   }
 }

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
-//! New lib-first `FormatParser` trait scaffold. Lands alongside the existing
-//! [`crate::parser::OldFormatParser`] (aliased from the legacy
-//! [`crate::parser::FormatParser`]); each format migrates from old to new in
-//! Phases E–F per the design spec at
+//! Lib-first `FormatParser` trait + closed-set [`AnyParser`] / [`AnyMeta`]
+//! dispatch — the sole parser architecture. The engine entry
+//! [`crate::parser::extract_info`] routes through [`any_parser_for`] →
+//! `AnyParser::extract_into`. Design spec at
 //! `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`.
 //!
 //! The four central pieces, per spec §6:
@@ -26,11 +26,12 @@
 //! arms are additive.
 
 use core::fmt;
-use core::marker::PhantomData;
 
-mod parser_sealed {
+pub(crate) mod parser_sealed {
   /// Sealed marker for the new [`super::FormatParser`] trait. Downstream
-  /// crates cannot implement the trait because they cannot name this type.
+  /// crates cannot implement the trait because they cannot name this
+  /// type (the `parser_sealed` module is `pub(crate)`, accessible only
+  /// to in-crate format modules that implement [`super::FormatParser`]).
   pub trait Sealed {}
 }
 
@@ -141,7 +142,7 @@ pub trait TagWriter {
   ///
   /// The default implementation calls [`Self::write_str`] for each
   /// element in order. Writers that DO want list-aware semantics (e.g.
-  /// `MetadataTagWriter` → `Metadata::push_listable`) override this method
+  /// the engine [`crate::json_writer::JsonTagWriter`]) override this method
   /// to coalesce into a single first-occurrence-position list value.
   /// Stateless writers (`MapTagWriter`, future JSON-array sinks) keep the
   /// default and either see last-write-wins (map storage) or emit each
@@ -168,10 +169,27 @@ pub trait TagWriter {
 ///
 /// Errors propagate from the writer (the Meta itself has no error states —
 /// fallibility belongs to the destination).
+///
+/// **Phase E discovery — `print_conv` parameter.** Spec §6.3 originally
+/// shaped this as `sink<W>(&self, out: &mut W)` with no mode flag. The MOI
+/// pilot (Phase E) surfaced that byte-exact reproduction of the bundled
+/// `perl exiftool -j` / `-n` JSON pair requires the Meta to know whether
+/// PrintConv strings (e.g. `ConvertDuration("8.16 s")`) or post-ValueConv
+/// raw values (e.g. `8.16` as `f64`) should be emitted. This mirrors
+/// ExifTool's `$$self{OPTIONS}{PrintConv}` flag (ExifTool.pm:5710): the
+/// PrintConv toggle is a global engine option, not a writer/sink choice.
+///
+/// Library callers consuming typed accessors on the Meta directly never
+/// touch this trait; only the CLI JSON path (`MetaSinker` → `TagWriter`)
+/// needs the toggle.
 pub trait MetaSinker {
   /// Emit this Meta's tags into `out`. Emission order should mirror the
   /// bundled-Perl iteration order of the format's tag table.
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error>;
+  ///
+  /// `print_conv = true` emits PrintConv strings (faithful to
+  /// `perl exiftool -j`); `print_conv = false` emits post-ValueConv raw
+  /// scalars (faithful to `perl exiftool -j -n`).
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error>;
 }
 
 /// Cross-format shared state. Threaded through chained parsers
@@ -325,39 +343,347 @@ impl SharedFlags {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum AnyParser {
-  // Phase E adds: Moi(crate::formats::moi::ProcessMoi),
-  // Phase F1 adds: Aac, Dv, Audible, Red.
-  // Phase F2 adds: Id3.
-  // Phase F3 adds: Ape, Dsf, Aiff, Flac.
-  // Phase F4 adds: Ogg, MpegAudio.
-  // Phase F5 adds: Mp3, Mpc, WavPack.
+  /// MOI (Phase E pilot — camcorder MOD info sidecar).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::ProcessMoi),
+  /// AAC (Phase F1 — ADTS audio).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::ProcessAac),
+  /// DV (Phase F1 — DV video stream).
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::ProcessDv),
+  /// Audible (AA) (Phase F1 — DRM'd audiobook).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::ProcessAa),
+  /// Red R3D (Phase F1 — Redcode video).
+  #[cfg(feature = "red")]
+  R3D(crate::formats::red::ProcessR3D),
+  /// ID3 directory parser (Phase F2 — ID3v1 + ID3v2 unified).
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::ProcessId3),
+  /// MP3 wrapper parser (Phase F2 — ID3 + audio-frame chain).
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::ProcessMp3),
+  /// AIFF (Phase F3 — Audio Interchange File Format / AIFC / DjVu).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::ProcessAiff),
+  /// APE (Phase F3 — Monkey's Audio, chains ID3v1/v2).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ProcessApe),
+  /// DSF (Phase F3 — DSD Stream File, chains ID3v2 trailer).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::ProcessDsf),
+  /// FLAC (Phase F3 — Free Lossless Audio Codec).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::ProcessFlac),
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::ProcessOgg),
+  /// MPEG audio (Phase F4 — MP3 / MP2 / MUS frame parser + Xing/LAME tail).
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::ProcessMpegAudio),
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio, chains ID3 + APE).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::ProcessMpc),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio, chains ID3 + APE).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::ProcessWv),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
 ///
-/// The `_Phantom` variant exists so the enum compiles before any format
-/// has migrated to the new trait. It is removed in Phase G (last) once
-/// every format has a real arm.
+/// `#[non_exhaustive]` ensures consumers cannot exhaustively match on the
+/// enum across crate-feature combinations — new format arms are additive
+/// within the crate, but no caller can rely on a fixed set.
+///
+/// The lifetime `'a` is anchored by the real format arms (which all carry
+/// `XxxMeta<'a>`). When NO format feature is enabled, every arm is
+/// `cfg`'d out and `'a` would be unused (a hard `E0392` error), so the
+/// [`AnyMeta::_Phantom`] variant — present ONLY in a no-format build —
+/// anchors `'a`. Under the `all-formats` default the phantom is `cfg`'d
+/// OUT (Codex CF3).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
-  /// Placeholder so the enum compiles before any format arm exists.
-  /// Removed in Phase G after every format has migrated.
+  /// MOI (Phase E pilot).
+  #[cfg(feature = "moi")]
+  Moi(crate::formats::moi::MoiMeta<'a>),
+  /// AAC (Phase F1).
+  #[cfg(feature = "aac")]
+  Aac(crate::formats::aac::AacMeta<'a>),
+  /// DV (Phase F1). Carries the [`crate::formats::dv::DvParseOutcome`]
+  /// because DV has TWO accept paths (unrecognized-profile warn vs.
+  /// full data); the closed-enum carry must distinguish them so the
+  /// sink can warn on the former without emitting DV:* tags.
+  #[cfg(feature = "dv")]
+  Dv(crate::formats::dv::DvParseOutcome<'a>),
+  /// Audible (AA) (Phase F1).
+  #[cfg(feature = "audible")]
+  Aa(crate::formats::audible::AaMeta<'a>),
+  /// Red R3D (Phase F1).
+  #[cfg(feature = "red")]
+  R3d(crate::formats::red::R3dMeta<'a>),
+  /// ID3 directory metadata (Phase F2). The [`crate::formats::id3::ProcessId3`]
+  /// `FormatParser` impl produces a borrowed `Id3Meta<'a>` via the
+  /// [`FormatParser::Meta`] GAT (Codex AF2; `'a` is phantom there since
+  /// `Id3Meta` owns its strings).
+  #[cfg(feature = "id3")]
+  Id3(crate::formats::id3::Id3Meta<'a>),
+  /// MP3 wrapper metadata (Phase F2). Wraps [`crate::formats::id3::Id3Meta`]
+  /// plus the typed MPEG-audio + APE-trailer sub-Metas (Codex BF1/CF1);
+  /// the MPEG-audio sub-Meta borrows its `encoder` field from the input.
+  #[cfg(feature = "mp3")]
+  Mp3(crate::formats::id3::Mp3Meta<'a>),
+  /// AIFF (Phase F3).
+  #[cfg(feature = "aiff")]
+  Aiff(crate::formats::aiff::AiffMeta<'a>),
+  /// APE (Phase F3).
+  #[cfg(feature = "ape")]
+  Ape(crate::formats::ape::ApeMeta<'a>),
+  /// DSF (Phase F3).
+  #[cfg(feature = "dsf")]
+  Dsf(crate::formats::dsf::DsfMeta<'a>),
+  /// FLAC (Phase F3).
+  #[cfg(feature = "flac")]
+  Flac(crate::formats::flac::FlacMeta<'a>),
+  /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
+  /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces a
+  /// borrowed `OggMeta<'a>` via the [`FormatParser::Meta`] GAT (Codex
+  /// AF2; `'a` is phantom there since `OggMeta` owns its data).
+  #[cfg(feature = "ogg")]
+  Ogg(crate::formats::ogg::OggMeta<'a>),
+  /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
+  /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
+  #[cfg(feature = "mpeg-audio")]
+  MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
+  /// MPC (Phase F5 — Musepack SV7/SV8 audio).
+  #[cfg(feature = "mpc")]
+  Mpc(crate::formats::mpc::MpcMeta<'a>),
+  /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
+  #[cfg(feature = "wavpack")]
+  Wv(crate::formats::wavpack::WvMeta<'a>),
+  /// Lifetime anchor for a no-format build (Codex CF3). When at least one
+  /// format feature is enabled this variant is `cfg`'d OUT (the real arms
+  /// anchor `'a`); it exists only so a `--features std` build with no
+  /// format gate still type-checks `AnyMeta<'a>` instead of failing with
+  /// `E0392` (unused lifetime parameter). It is uninhabitable from safe
+  /// code (`PhantomData` payload, `#[doc(hidden)]`).
+  #[cfg(not(any(
+    feature = "moi",
+    feature = "aac",
+    feature = "dv",
+    feature = "audible",
+    feature = "red",
+    feature = "id3",
+    feature = "mp3",
+    feature = "aiff",
+    feature = "ape",
+    feature = "dsf",
+    feature = "flac",
+    feature = "ogg",
+    feature = "mpeg-audio",
+    feature = "mpc",
+    feature = "wavpack",
+  )))]
   #[doc(hidden)]
-  _Phantom(PhantomData<&'a ()>),
-  // Phase E adds: Moi(crate::formats::moi::MoiMeta<'a>),
+  _Phantom(core::marker::PhantomData<&'a ()>),
 }
 
 impl MetaSinker for AnyMeta<'_> {
-  fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    // `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)` gates
+    // means a `_`-less match is exhaustive when ≥1 format feature is on
+    // (the real arms), and when NO format feature is on (only the
+    // `_Phantom` arm, Codex CF3). The `all-formats` default takes the
+    // former path; the phantom arm below keeps the no-format build
+    // type-checking.
     match self {
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(o) => match o {
+        // DV.pm:188 — Warn + return 1 without DV:* tags. This `MetaSinker`
+        // path (library `parse_bytes`/`sink`) emits the warning and no
+        // tags. The engine entry `dv::ProcessDv::process` emits the same
+        // warning via `ctx.metadata().push_warning` after `SetFileType`.
+        crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
+          out.write_warning("Unrecognized DV profile")
+        }
+        crate::formats::dv::DvParseOutcome::Meta(m) => m.sink(print_conv, out),
+      },
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(m) => m.sink(print_conv, out),
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(m) => m.sink(print_conv, out),
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(m) => m.sink(print_conv, out),
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(m) => m.sink(print_conv, out),
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(m) => m.sink(print_conv, out),
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(m) => m.sink(print_conv, out),
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(m) => m.sink(print_conv, out),
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(m) => m.sink(print_conv, out),
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(m) => m.sink(print_conv, out),
+      // No-format build: the only variant is the uninhabitable phantom
+      // (Codex CF3). `PhantomData` carries no data, so there is nothing to
+      // sink; the arm exists purely for exhaustiveness.
+      #[cfg(not(any(
+        feature = "moi",
+        feature = "aac",
+        feature = "dv",
+        feature = "audible",
+        feature = "red",
+        feature = "id3",
+        feature = "mp3",
+        feature = "aiff",
+        feature = "ape",
+        feature = "dsf",
+        feature = "flac",
+        feature = "ogg",
+        feature = "mpeg-audio",
+        feature = "mpc",
+        feature = "wavpack",
+      )))]
       AnyMeta::_Phantom(_) => {
-        // Phantom variant emits no tags; exists only as a type-system
-        // placeholder until Phase E adds the first real format arm.
-        let _ = out;
+        let _ = (print_conv, out);
         Ok(())
-      } // Phase E adds: AnyMeta::Moi(m) => m.sink(out),
+      }
     }
+  }
+}
+
+impl AnyParser {
+  /// Engine dispatch for [`crate::parser::extract_info`]: run this format's
+  /// parser against the per-file value sink in `ctx`, emitting `File:*`
+  /// (via `ctx.set_file_type`/`override_file_type`) and every format tag
+  /// directly into `ctx.metadata()`.
+  ///
+  /// Returns `true` (Perl `return 1`) when the parser accepted the data —
+  /// finalizing this file type — and `false` (Perl `return 0`) so
+  /// `extract_info` tries the next detection candidate. **Side effects
+  /// already made on `ctx.metadata()` PERSIST regardless of the return
+  /// value** (faithful to ExifTool's `$self` model; e.g. MPEG.pm:675
+  /// `SetFileType` then :678 `or return 0` keeps `File:FileType=MPEG`).
+  ///
+  /// Each arm delegates to the format module's own `process` entry, which
+  /// owns the faithful ordering of `SetFileType` / `FoundTag` / `Warn` /
+  /// `Error` and any cross-format chain (ID3 → MPEG → APE trailer, etc.).
+  /// This is the single closed-set engine dispatch site (resolved via
+  /// [`any_parser_for`]).
+  pub(crate) fn extract_into(self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
+    // `ctx` is only consumed by the file-type *engine entry* arms below.
+    // `id3` and `mpeg-audio` are directory / internal parsers with no
+    // top-level engine entry (their arms return `false` without touching
+    // `ctx`), and a no-format build has no arms at all — so when none of the
+    // dispatching features is enabled, `ctx` is unused. Discard it then to
+    // stay warning-clean (Codex CF3 generalized).
+    #[cfg(not(any(
+      feature = "moi",
+      feature = "aac",
+      feature = "dv",
+      feature = "audible",
+      feature = "red",
+      feature = "mp3",
+      feature = "aiff",
+      feature = "ape",
+      feature = "dsf",
+      feature = "flac",
+      feature = "ogg",
+      feature = "mpc",
+      feature = "wavpack",
+    )))]
+    let _ = ctx;
+    match self {
+      #[cfg(feature = "moi")]
+      AnyParser::Moi(p) => p.process(ctx),
+      #[cfg(feature = "aac")]
+      AnyParser::Aac(p) => p.process(ctx),
+      #[cfg(feature = "dv")]
+      AnyParser::Dv(p) => p.process(ctx),
+      #[cfg(feature = "audible")]
+      AnyParser::Aa(p) => p.process(ctx),
+      #[cfg(feature = "red")]
+      AnyParser::R3D(p) => p.process(ctx),
+      // ID3 is a *directory* parser (PROCESS_PROC, ID3.pm:78), never a
+      // top-level file-type in `any_parser_for`; it has no engine entry.
+      // The arm is unreachable from `extract_info` but must be covered.
+      #[cfg(feature = "id3")]
+      AnyParser::Id3(_) => false,
+      #[cfg(feature = "mp3")]
+      AnyParser::Mp3(p) => p.process(ctx),
+      #[cfg(feature = "aiff")]
+      AnyParser::Aiff(p) => p.process(ctx),
+      #[cfg(feature = "ape")]
+      AnyParser::Ape(p) => p.process(ctx),
+      #[cfg(feature = "dsf")]
+      AnyParser::Dsf(p) => p.process(ctx),
+      #[cfg(feature = "flac")]
+      AnyParser::Flac(p) => p.process(ctx),
+      #[cfg(feature = "ogg")]
+      AnyParser::Ogg(p) => p.process(ctx),
+      // MPEG-audio is invoked internally by MP3 (ID3.pm:1716), never a
+      // top-level file-type in `any_parser_for`; it has no standalone
+      // engine entry. The arm is unreachable from `extract_info` but must
+      // be covered by the closed-set match.
+      #[cfg(feature = "mpeg-audio")]
+      AnyParser::MpegAudio(_) => false,
+      #[cfg(feature = "mpc")]
+      AnyParser::Mpc(p) => p.process(ctx),
+      #[cfg(feature = "wavpack")]
+      AnyParser::Wv(p) => p.process(ctx),
+    }
+  }
+}
+
+/// Map a finalized ExifTool file-type string to its [`AnyParser`] arm, or
+/// `None` if the format has no ported parser yet OR its Cargo feature is
+/// disabled. This is the runtime parser registry the engine entry
+/// [`crate::parser::extract_info`] dispatches through; it returns `None` for
+/// feature-pruned formats, faithful to ExifTool's "module not loaded ⇒
+/// `next` in candidate loop" (ExifTool.pm:3060-3077).
+#[must_use]
+pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
+  match file_type {
+    #[cfg(feature = "audible")]
+    "AA" => Some(AnyParser::Aa(crate::formats::audible::ProcessAa)),
+    #[cfg(feature = "aac")]
+    "AAC" => Some(AnyParser::Aac(crate::formats::aac::ProcessAac)),
+    #[cfg(feature = "aiff")]
+    "AIFF" => Some(AnyParser::Aiff(crate::formats::aiff::ProcessAiff)),
+    #[cfg(feature = "ape")]
+    "APE" => Some(AnyParser::Ape(crate::formats::ape::ProcessApe)),
+    #[cfg(feature = "dsf")]
+    "DSF" => Some(AnyParser::Dsf(crate::formats::dsf::ProcessDsf)),
+    #[cfg(feature = "dv")]
+    "DV" => Some(AnyParser::Dv(crate::formats::dv::ProcessDv)),
+    #[cfg(feature = "flac")]
+    "FLAC" => Some(AnyParser::Flac(crate::formats::flac::ProcessFlac)),
+    #[cfg(feature = "mp3")]
+    "MP3" => Some(AnyParser::Mp3(crate::formats::id3::ProcessMp3)),
+    #[cfg(feature = "moi")]
+    "MOI" => Some(AnyParser::Moi(crate::formats::moi::ProcessMoi)),
+    #[cfg(feature = "mpc")]
+    "MPC" => Some(AnyParser::Mpc(crate::formats::mpc::ProcessMpc)),
+    #[cfg(feature = "ogg")]
+    "OGG" => Some(AnyParser::Ogg(crate::formats::ogg::ProcessOgg)),
+    #[cfg(feature = "red")]
+    "R3D" => Some(AnyParser::R3D(crate::formats::red::ProcessR3D)),
+    #[cfg(feature = "wavpack")]
+    "WV" => Some(AnyParser::Wv(crate::formats::wavpack::ProcessWv)),
+    _ => None,
   }
 }
 
@@ -423,9 +749,15 @@ mod tests {
   }
 
   impl MetaSinker for DummyMeta<'_> {
-    fn sink<W: TagWriter>(&self, out: &mut W) -> Result<(), W::Error> {
+    fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
       out.write_str("Dummy", "Name", self.name)?;
-      out.write_u64("Dummy", "Size", self.size)?;
+      if print_conv {
+        // Faithful to the PrintConv toggle: emit a formatted text view
+        // when print_conv is on; the raw numeric otherwise.
+        out.write_fmt("Dummy", "Size", |w| write!(w, "{} bytes", self.size))?;
+      } else {
+        out.write_u64("Dummy", "Size", self.size)?;
+      }
       Ok(())
     }
   }
@@ -436,12 +768,20 @@ mod tests {
       name: "moi-fake",
       size: 1234,
     };
+    // -j (PrintConv on) — formatted bytes-string.
     let mut w = MapTagWriter::new();
-    meta.sink(&mut w).unwrap();
+    meta.sink(true, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Name").map(MapValue::as_str),
       Some("moi-fake".to_string())
     );
+    assert_eq!(
+      w.get("Dummy", "Size").map(MapValue::as_str),
+      Some("1234 bytes".to_string())
+    );
+    // -n (PrintConv off) — raw u64.
+    let mut w = MapTagWriter::new();
+    meta.sink(false, &mut w).unwrap();
     assert_eq!(
       w.get("Dummy", "Size").map(MapValue::as_str),
       Some("1234".to_string())
@@ -493,7 +833,7 @@ mod tests {
     let mut sink = InfallibleSink;
     // The `unwrap()` on an `Infallible` result is what the doc claims is
     // collapsed at type-check; here we just ensure the dataflow compiles.
-    let result: Result<(), Infallible> = meta.sink(&mut sink);
+    let result: Result<(), Infallible> = meta.sink(true, &mut sink);
     let () = result.unwrap();
   }
 
@@ -520,14 +860,40 @@ mod tests {
     assert!(sf.file_type_stack().is_empty());
   }
 
-  /// The `_Phantom` arm of [`AnyMeta`] sinks nothing. Verifies the
-  /// MetaSinker impl is reachable for the type-level placeholder.
+  /// `any_parser_for` resolves every ported format that has its feature
+  /// enabled, and returns `None` for unported / video-side / empty
+  /// file-type strings (the candidate-loop fall-through cases).
   #[test]
-  fn any_meta_phantom_sinks_nothing() {
-    let any: AnyMeta<'_> = AnyMeta::_Phantom(PhantomData);
-    let mut w = MapTagWriter::new();
-    any.sink(&mut w).unwrap();
-    assert_eq!(w.len(), 0);
+  fn any_parser_for_resolves_ported_formats() {
+    #[cfg(feature = "audible")]
+    assert!(any_parser_for("AA").is_some());
+    #[cfg(feature = "aac")]
+    assert!(any_parser_for("AAC").is_some());
+    #[cfg(feature = "aiff")]
+    assert!(any_parser_for("AIFF").is_some());
+    #[cfg(feature = "ape")]
+    assert!(any_parser_for("APE").is_some());
+    #[cfg(feature = "dsf")]
+    assert!(any_parser_for("DSF").is_some());
+    #[cfg(feature = "dv")]
+    assert!(any_parser_for("DV").is_some());
+    #[cfg(feature = "flac")]
+    assert!(any_parser_for("FLAC").is_some());
+    #[cfg(feature = "moi")]
+    assert!(any_parser_for("MOI").is_some());
+    #[cfg(feature = "mp3")]
+    assert!(any_parser_for("MP3").is_some());
+    #[cfg(feature = "mpc")]
+    assert!(any_parser_for("MPC").is_some());
+    #[cfg(feature = "ogg")]
+    assert!(any_parser_for("OGG").is_some());
+    #[cfg(feature = "red")]
+    assert!(any_parser_for("R3D").is_some());
+    #[cfg(feature = "wavpack")]
+    assert!(any_parser_for("WV").is_some());
+    assert!(any_parser_for("MPEG").is_none()); // video side deferred
+    assert!(any_parser_for("").is_none());
+    assert!(any_parser_for("AIFC").is_none()); // resolves to AIFF via lookup, not directly
   }
 }
 

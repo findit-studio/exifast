@@ -1,4 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "id3")]
 //! Faithful port of `Image::ExifTool::ID3` (lib/Image/ExifTool/ID3.pm).
+//!
+//! Implements ID3v1, ID3v2.2/2.3/2.4 plus the MP3 wrapper (`ProcessMP3` at
+//! ID3.pm:1684-1728) via the typed [`Id3Meta<'a>`] / [`Mp3Meta<'a>`]
+//! published through the [`crate::parser_new::FormatParser`] trait. The MP3
+//! engine entry ([`ProcessMp3::process`]) drives
+//! [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! byte-exact for all 60+ ID3/MP3 conformance fixtures.
 //!
 //! Per FORMATS.md row 2 (ID3 infra + MP3 completion) this module
 //! implements:
@@ -17,6 +29,12 @@
 //!   sample is captured.
 //! - Lyrics3 v1/v2 trailer (ID3.pm:1532-1576). Same: NO fixture in
 //!   scope; processing deferred.
+//! - The ID3.pm:1582-1601 audio-format loop (ID3-prefixed APE/MPC/FLAC/
+//!   OGG body in an .mp3 dispatch). Per Codex R6 finding tracked in
+//!   `docs/tracking.md` — keep the deferral; vanishingly rare in the
+//!   wild, Case A "ID3+no-MPEG+APE-trailer" is path-equivalent via the
+//!   `ProcessMp3` wrapper APE fallback (ID3.pm:1722-1727), Case B
+//!   "ID3+APE-body-in-.mp3" not exercised by any known fixture.
 //! - MPEG audio-frame parsing (`ParseMPEGAudio`, MPEG.pm:464-494) —
 //!   FORMATS.md row 17. ProcessMP3 ports ONLY the sync gate; MPEG:*
 //!   tag extraction defers to that PR.
@@ -37,7 +55,9 @@
 //! - [`v2_2`] / [`v2_3`] / [`v2_4`] — version-specific tag tables.
 //! - [`v2_process`] — `ProcessID3v2` (ID3.pm:1111-1423).
 //! - [`process`] — `ProcessID3` (ID3.pm:1431-1632) + `ProcessMp3`
-//!   (ID3.pm:1684-1728) + `FormatParser` impls.
+//!   (ID3.pm:1684-1728) + the typed [`Id3Meta`]/[`Mp3Meta`] types and
+//!   their [`crate::parser_new::FormatParser`] / [`crate::parser_new::MetaSinker`]
+//!   impls.
 
 pub mod decode;
 pub mod genre;
@@ -51,9 +71,13 @@ pub mod v2_4;
 pub mod v2_common;
 pub mod v2_process;
 
-// MP3 wrapper re-export (Codex A-R2-1) — gated behind `mp3`, which pulls
+pub use process::{
+  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
+  parse_id3_borrowed,
+};
+
+// MP3 wrapper re-exports (Codex A-R2-1) — gated behind `mp3`, which pulls
 // `mpeg-audio` + `ape`. The plain `id3` feature (pulled by flac/aiff/dsf/ape
-// for the ID3-prefix chain) does NOT compile `ProcessMp3` because its
-// `process` references `crate::formats::mpeg` + `crate::formats::ape`.
+// for the ID3-prefix chain) does NOT compile these.
 #[cfg(feature = "mp3")]
-pub use process::ProcessMp3;
+pub use process::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3, parse_mp3_borrowed};

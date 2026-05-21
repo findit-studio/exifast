@@ -17,9 +17,10 @@
 use crate::{
   convert::apply,
   filetype::detection_candidates,
-  formats::parser_for,
+  json_writer::JsonTagWriter,
+  parser_new::any_parser_for,
   tagtable::{PrintConv, TagDef, ValueConv},
-  value::{Group, Metadata, TagValue},
+  value::{Group, TagValue},
 };
 use smol_str::SmolStr;
 
@@ -84,14 +85,20 @@ pub struct ParseContext<'a> {
   ext: Option<SmolStr>,
   /// ExifTool `-n`: `false` ⇒ ValueConv-only (no PrintConv).
   print_conv_enabled: bool,
-  /// The `$et` value sink: the parser pushes its FoundTag/HandleTag tags here.
-  /// The first-call-wins gate (`$$self{FileType}`, ExifTool.pm:9681) is read
-  /// off this `Metadata` via [`Metadata::has_file_type`] — FILE-scoped, not
-  /// candidate-scoped (faithful to `$self` outliving any single
-  /// `Process<Type>` invocation: a candidate-loop iteration that constructs
-  /// a fresh `ParseContext` MUST still observe the marker any earlier
-  /// candidate's `SetFileType` set on `m`).
-  meta: &'a mut Metadata,
+  /// The `$et` value sink: the parser pushes its FoundTag/HandleTag tags here,
+  /// and the engine reads `JsonTagWriter::finish()` for the byte-exact JSON.
+  /// This REPLACES the retired `&mut Metadata` push-bag on the output path
+  /// (task #124): `JsonTagWriter` buffers records with the SAME FoundTag /
+  /// `%noDups` semantics and carries the engine's `$$et{DoneID3}`/`DoneAPE`
+  /// state plus the Composite read-back surface (`records()` / `has_tag` /
+  /// `has_file_type`). The first-call-wins gate (`$$self{FileType}`,
+  /// ExifTool.pm:9681) is read off the writer via
+  /// [`JsonTagWriter::has_file_type`] — FILE-scoped, not candidate-scoped
+  /// (faithful to `$self` outliving any single `Process<Type>` invocation: a
+  /// candidate-loop iteration that constructs a fresh `ParseContext` MUST
+  /// still observe the marker any earlier candidate's `SetFileType` set on the
+  /// shared writer).
+  writer: &'a mut JsonTagWriter,
 }
 
 impl<'a> ParseContext<'a> {
@@ -109,7 +116,7 @@ impl<'a> ParseContext<'a> {
     parent_type: &'a str,
     ext: Option<SmolStr>,
     print_conv_enabled: bool,
-    meta: &'a mut Metadata,
+    writer: &'a mut JsonTagWriter,
   ) -> Self {
     Self {
       data,
@@ -118,14 +125,14 @@ impl<'a> ParseContext<'a> {
       parent_type,
       ext,
       print_conv_enabled,
-      meta,
+      writer,
     }
   }
 
   /// The file bytes the parser reads (`$raf` content). Returns the
   /// `&'a [u8]` tied to the original file lifetime rather than to `&self`,
   /// so a parser may interleave data reads with mutable-`ctx` calls (e.g.
-  /// `ctx.metadata().push_warning(...)` inside an Ogg page-walk loop,
+  /// `ctx.writer().push_warning(...)` inside an Ogg page-walk loop,
   /// or `ctx.set_file_type(...)` inside an ID3 detection) without an
   /// immutable-vs-mutable borrow conflict (avoiding redundant
   /// `data.to_vec()` clones — per Copilot PR #12 review #3271619078).
@@ -171,44 +178,48 @@ impl<'a> ParseContext<'a> {
   }
 
   /// The `$et` value sink: the parser pushes its FoundTag/HandleTag tags
-  /// here (this is the `&mut Metadata` a `Process<Type>` fills, e.g. the
-  /// AAC bit-stream + Encoder tags).
+  /// here (this is the `&mut JsonTagWriter` a `Process<Type>` fills, e.g. the
+  /// AAC bit-stream + Encoder tags). Replaces the retired `metadata()`
+  /// accessor (`&mut Metadata`) on the output path; the writer exposes the
+  /// same `push` / `push_listable` / `push_warning` / `push_error` /
+  /// `set_tag_value` / `has_tag` / `has_file_type` / `done_id3` / `done_ape`
+  /// surface so format `process` entries migrate 1:1.
   #[must_use]
-  pub fn metadata(&mut self) -> &mut Metadata {
-    self.meta
+  pub fn writer(&mut self) -> &mut JsonTagWriter {
+    self.writer
   }
 
-  /// Split-borrow accessor: returns `(&[u8], &mut Metadata)` simultaneously
-  /// so a parser can slice into [`Self::data`] and call into a metadata-
-  /// pushing sub-parser (e.g. `parse_xing_lame`, `process_vorbis_comments`,
+  /// Split-borrow accessor: returns `(&[u8], &mut JsonTagWriter)`
+  /// simultaneously so a parser can slice into [`Self::data`] and call into a
+  /// tag-pushing sub-parser (e.g. `parse_xing_lame`, `process_vorbis_comments`,
   /// `process_flac_picture`, `bitstream::process_bit_stream`) WITHOUT
   /// cloning the slice into a `Vec`.
   ///
   /// Required because [`Self::data`] reborrows `&self` while
-  /// [`Self::metadata`] reborrows `&mut self` — calling both in sequence
+  /// [`Self::writer`] reborrows `&mut self` — calling both in sequence
   /// forces the caller to `.to_vec()` the slice. The split borrow is sound
-  /// because `data` and `meta` are disjoint fields (the `&[u8]` does NOT
-  /// alias `&mut Metadata`).
+  /// because `data` and `writer` are disjoint fields (the `&[u8]` does NOT
+  /// alias `&mut JsonTagWriter`).
   #[must_use]
-  pub fn data_and_metadata(&mut self) -> (&[u8], &mut Metadata) {
-    (self.data, self.meta)
+  pub fn data_and_writer(&mut self) -> (&[u8], &mut JsonTagWriter) {
+    (self.data, self.writer)
   }
 
-  /// Run `f` with a mutable reference to the underlying metadata sink,
-  /// keeping that `&mut Metadata` borrow strictly scoped to the closure.
+  /// Run `f` with a mutable reference to the underlying value sink, keeping
+  /// that `&mut JsonTagWriter` borrow strictly scoped to the closure.
   ///
   /// This helper does not — and cannot — end or release any caller-held
   /// `ctx.data()` borrow; Rust's borrow checker still rejects calling
-  /// `metadata_then` while an immutable borrow of `ctx` (e.g. via
+  /// `writer_then` while an immutable borrow of `ctx` (e.g. via
   /// `ctx.data()`) is live. The benefit is purely structural: by taking
-  /// a closure, the mutable `Metadata` borrow is confined to the closure
+  /// a closure, the mutable writer borrow is confined to the closure
   /// body and never escapes as a named binding that would conflict with
   /// a subsequent `ctx.data()` call. Callers holding a `ctx.data()`
   /// borrow must drop it (or copy/clone the slice they need) before
   /// calling this helper. D8/D9 compliant (no field exposure; takes a
   /// closure, returns its result by value).
-  pub fn metadata_then<R, F: FnOnce(&mut Metadata) -> R>(&mut self, f: F) -> R {
-    f(self.meta)
+  pub fn writer_then<R, F: FnOnce(&mut JsonTagWriter) -> R>(&mut self, f: F) -> R {
+    f(self.writer)
   }
 
   /// Faithful `SetFileType` (ExifTool.pm:9677-9706), read path. Pushes
@@ -234,7 +245,7 @@ impl<'a> ParseContext<'a> {
     // per-`ParseContext` bool (which would reset across candidates and
     // re-push duplicate File:FileType/FileTypeExtension/MIMEType when a
     // later candidate's parser also calls `SetFileType`).
-    if self.meta.has_file_type() {
+    if self.writer.has_file_type() {
       return;
     }
     // ExifTool.pm:9682 `my $baseType = $$self{FILE_TYPE}` — the detected
@@ -284,7 +295,7 @@ impl<'a> ParseContext<'a> {
     // $fileTypeExt{$fileType}; $normExt = $fileType unless defined }`.
     let norm_ext = norm_ext.or_else(|| file_type_ext(ft)).unwrap_or(ft);
     // ExifTool.pm:9702 FoundTag('FileType', $fileType).
-    self.meta.push(
+    self.writer.push(
       Group::new("File", "File"),
       "FileType",
       TagValue::Str(ft.into()),
@@ -297,10 +308,10 @@ impl<'a> ParseContext<'a> {
       self.print_conv_enabled,
     );
     self
-      .meta
+      .writer
       .push(Group::new("File", "File"), "FileTypeExtension", shown);
     // ExifTool.pm:9704 FoundTag('MIMEType', $mimeType || 'application/unknown').
-    self.meta.push(
+    self.writer.push(
       Group::new("File", "File"),
       "MIMEType",
       TagValue::Str(mime.unwrap_or("application/unknown").into()),
@@ -330,11 +341,10 @@ impl<'a> ParseContext<'a> {
     // ExifTool.pm:9715 guard: locate the existing File:FileType value; if
     // absent OR already == $fileType, do nothing.
     let current = self
-      .meta
-      .tags()
-      .iter()
-      .find(|t| t.group() == &file_grp && t.name() == "FileType")
-      .map(|t| t.value().clone());
+      .writer
+      .records()
+      .find(|(g, n, _)| *g == &file_grp && *n == "FileType")
+      .map(|(_, _, v)| v.clone());
     match current {
       Some(TagValue::Str(ref cur)) if cur.as_str() == file_type => return,
       Some(_) => {}
@@ -349,7 +359,7 @@ impl<'a> ParseContext<'a> {
     let mime = mime.or_else(|| mime_type(file_type));
     // ExifTool.pm:9717 `$$self{VALUE}{FileType} = $fileType` (in place).
     self
-      .meta
+      .writer
       .set_tag_value(&file_grp, "FileType", TagValue::Str(file_type.into()));
     // ExifTool.pm:9722 `$$self{VALUE}{FileTypeExtension} = uc $normExt`
     // (stored uc, then PrintConv `lc`, ExifTool.pm:1433).
@@ -359,55 +369,19 @@ impl<'a> ParseContext<'a> {
       self.print_conv_enabled,
     );
     self
-      .meta
+      .writer
       .set_tag_value(&file_grp, "FileTypeExtension", shown);
     // ExifTool.pm:9724 `$$self{VALUE}{MIMEType} = $mimeType if $mimeType`
     // — only overwrite MIMEType when a MIME type is known.
     if let Some(mime) = mime {
       self
-        .meta
+        .writer
         .set_tag_value(&file_grp, "MIMEType", TagValue::Str(mime.into()));
     }
     // ExifTool.pm:9725-9729 Verbose [override] VPrint block not modelled
     // (no Verbose option; consistent with existing deferrals).
   }
 }
-
-/// One ported format parser. `process` reads `ctx.data()` and may push tags
-/// / call `ctx.set_file_type(...)` / push warnings/errors via `ctx.metadata()`.
-/// Returning `true` (Perl `return 1`) finalizes this file type; returning
-/// `false` (Perl `return 0`) lets `extract_info` try the next detection
-/// candidate. **Side effects already made on `ctx.metadata()` PERSIST
-/// regardless of return value** — faithful to ExifTool's `$self` model.
-// `Sync` is required so `&'static dyn FormatParser` can be returned/shared.
-pub trait FormatParser: Sync {
-  /// Returns `true` if this parser accepted the data (Perl `return 1`).
-  /// Returns `false` (Perl `return 0`) so `extract_info` tries the next
-  /// candidate.
-  ///
-  /// IMPORTANT: `false` means only **"keep scanning"** — any side effects
-  /// already made on `ctx.metadata()` (tags, `set_file_type`, warnings,
-  /// errors) PERSIST. Each parser MUST mirror its Perl module's exact
-  /// ordering of `SetFileType`/`FoundTag`/`Warn`/`Error` calls and the
-  /// `return 0` line; e.g. `MPEG.pm:675 $et->SetFileType()` then `:678
-  /// $raf->Read(...) or return 0;` on a short read — bundled `perl
-  /// exiftool` emits the `File:FileType=MPEG` triplet plus the post-loop
-  /// `ExifTool:Error`, and exifast matches byte-exact because of this
-  /// contract.
-  ///
-  /// On accept, call `ctx.set_file_type(...)` BEFORE pushing any format
-  /// tags via `ctx.metadata()` — faithful to ExifTool, where
-  /// `$et->SetFileType` precedes `ProcessDirectory` (e.g. `AAC.pm:107`
-  /// before `:109`). Output tag order follows push order; `File:*` must
-  /// precede format-specific tags.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool;
-}
-
-/// Phase D shim: the existing push-style [`FormatParser`] is being
-/// migrated to the new typed-Meta [`crate::parser_new::FormatParser`] in
-/// Phases E–F. During migration this alias documents the legacy trait
-/// without renaming, so existing impl sites continue to work verbatim.
-pub use FormatParser as OldFormatParser;
 
 /// Faithful `ConvertFileSize` (ExifTool.pm:6840-6860), default-units branch
 /// only. The `ByteUnit eq 'Binary'` arm (ExifTool.pm:6843-6850) is gated on
@@ -523,13 +497,19 @@ fn finalization_error(name: &str, data: &[u8]) -> Option<String> {
   Some(err)
 }
 
-// Test-only parser-lookup override seam. `parser_for` (formats/mod.rs) is a
-// fixed `match` keyed on the real file-type string, and no real ported
+/// A parser engine entry: runs a `Process<Type>` against `ctx`, returning
+/// Perl `$result` (`true` ⇒ accept/finalize, `false` ⇒ try next candidate).
+/// Production dispatch resolves these via [`any_parser_for`]; the
+/// `#[cfg(test)]` seam below lets a test inject one for engine-loop tests.
+type EngineEntry = fn(&mut ParseContext<'_>) -> bool;
+
+// Test-only parser-lookup override seam. `any_parser_for` (parser_new.rs) is
+// a fixed `match` keyed on the real file-type string, and no real ported
 // format errors-while-accepting or set-file-type-then-rejects, so these
 // scenarios cannot be exercised end-to-end by any real input. This
-// thread-local lets a test register one OR MORE injected parsers (one per
-// file type); `lookup_parser` consults it FIRST, so `extract_info` runs its
-// genuine candidate→process(&mut m)→finalize block with that parser,
+// thread-local lets a test register one OR MORE injected engine entries (one
+// per file type); `lookup_parser` consults it FIRST, so `extract_info` runs
+// its genuine candidate→process(&mut m)→finalize block with that entry,
 // against the real outer `Metadata`. A `Vec` (not `Option`) because the
 // file-scoped first-call-wins-across-candidates test needs to inject TWO
 // distinct file types in one run (one for the early candidate, one for a
@@ -541,31 +521,47 @@ fn finalization_error(name: &str, data: &[u8]) -> Option<String> {
 #[cfg(test)]
 thread_local! {
   static INJECTED_PARSERS: std::cell::RefCell<
-    Vec<(&'static str, &'static dyn FormatParser)>,
+    Vec<(&'static str, EngineEntry)>,
   > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Parser lookup for [`extract_info`]. Production: exactly [`parser_for`].
-/// Under `#[cfg(test)]` the [`INJECTED_PARSERS`] table is consulted first —
-/// see the seam comment above for why and how. First matching entry wins,
-/// so a test can override a real ported file type if it needs to.
+/// Engine-entry lookup for [`extract_info`]. Production: the closed-set
+/// [`any_parser_for`] dispatch (`AnyParser::extract_into`). Under
+/// `#[cfg(test)]` the [`INJECTED_PARSERS`] table is consulted first — see the
+/// seam comment above for why and how. First matching entry wins, so a test
+/// can override a real ported file type if it needs to.
 #[cfg(test)]
-fn lookup_parser(file_type: &str) -> Option<&'static dyn FormatParser> {
+fn lookup_parser(file_type: &str) -> Option<EngineEntry> {
   let injected = INJECTED_PARSERS.with(|c| {
     c.borrow()
       .iter()
       .find(|(ft, _)| *ft == file_type)
       .map(|(_, p)| *p)
   });
-  if let Some(parser) = injected {
-    return Some(parser);
+  if let Some(entry) = injected {
+    return Some(entry);
   }
-  parser_for(file_type)
+  any_parser_for(file_type).map(|_| dispatch_typed as EngineEntry)
 }
 
 #[cfg(not(test))]
-fn lookup_parser(file_type: &str) -> Option<&'static dyn FormatParser> {
-  parser_for(file_type)
+fn lookup_parser(file_type: &str) -> Option<EngineEntry> {
+  any_parser_for(file_type).map(|_| dispatch_typed as EngineEntry)
+}
+
+/// Production engine entry: re-resolves the file type from `ctx` and routes
+/// through the closed [`crate::parser_new::AnyParser`] dispatch. (Indirecting
+/// through a `fn(&mut ParseContext) -> bool` keeps a uniform shape with the
+/// `#[cfg(test)]` injection seam, which cannot carry a captured `AnyParser`.)
+fn dispatch_typed(ctx: &mut ParseContext<'_>) -> bool {
+  // `ctx.file_type()` is the candidate type `extract_info` constructed this
+  // context with — the same key `lookup_parser` matched on.
+  match any_parser_for(ctx.file_type()) {
+    Some(parser) => parser.extract_into(ctx),
+    // Unreachable: `lookup_parser` only returns `Some(dispatch_typed)` when
+    // `any_parser_for` already matched. Fall through as a non-accept.
+    None => false,
+  }
 }
 
 /// The `ExtractInfo` finalization consumer (spec D10(5);
@@ -582,9 +578,27 @@ fn lookup_parser(file_type: &str) -> Option<&'static dyn FormatParser> {
 /// insight). [`finalization_error`] is the faithful port; `$self->Error`
 /// (ExifTool.pm:5648) ⇒ `m.push_error`.
 #[must_use]
-pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metadata {
-  let mut m = Metadata::new(name);
-  m.push(
+pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String {
+  // The engine `$$et` value sink IS the `JsonTagWriter` now (task #124): the
+  // candidate loop's `ParseContext`s push File:* + sink their typed Meta + read
+  // tags back through it, and the final byte-exact JSON comes from
+  // `JsonTagWriter::finish()`. This replaces the retired `Metadata` push-bag +
+  // `serialize::to_exiftool_json(Metadata)` output path.
+  extract_info_to_writer(name, data, print_conv_enabled).finish()
+}
+
+/// As [`extract_info`], but returns the populated [`JsonTagWriter`] BEFORE the
+/// terminal [`JsonTagWriter::finish`] step (the buffered records + warnings +
+/// errors, including the orchestration `ExifTool:ExifToolVersion` + the
+/// `File:*` triplet + the post-loop finalization `Error`). Useful for callers
+/// that need to inspect the engine's emitted tag stream rather than the
+/// rendered JSON — e.g. the typed-path parity harness, which lifts the
+/// orchestration tags off this writer and re-drives the TYPED `MetaSinker::sink`
+/// on top. `extract_info` itself is just this followed by `.finish()`.
+#[must_use]
+pub fn extract_info_to_writer(name: &str, data: &[u8], print_conv_enabled: bool) -> JsonTagWriter {
+  let mut writer = JsonTagWriter::new(name);
+  writer.push(
     Group::new("ExifTool", "ExifTool"),
     "ExifToolVersion",
     TagValue::Str(EXIFTOOL_VERSION.into()),
@@ -626,16 +640,17 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metada
           cand.parent_type(),
           file_ext.clone(),
           print_conv_enabled,
-          &mut m,
+          &mut writer,
         );
         ctx.set_file_type(None, None, None); // ExifTool.pm:3055 $self->SetFileType()
       }
-      m.push_warning("Unsupported file type"); // ExifTool.pm:3056 $self->Warn(...)
+      writer.push_warning("Unsupported file type"); // ExifTool.pm:3056 $self->Warn(...)
       finalized = true; // ExifTool.pm:3037 $$self{FILE_TYPE}=$type (defined)
       break; // ExifTool.pm:3057 last
     }
-    // `lookup_parser` ≡ `parser_for(ft)` in release (test seam compiled
-    // out; see above) — kept identical so tests exercise THIS block.
+    // `lookup_parser` ≡ `any_parser_for(ft)`-keyed dispatch in release (test
+    // seam compiled out; see above) — kept identical so tests exercise THIS
+    // block.
     let Some(parser) = lookup_parser(ft) else {
       continue;
     };
@@ -659,9 +674,9 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metada
         cand.parent_type(),
         file_ext.clone(),
         print_conv_enabled,
-        &mut m,
+        &mut writer,
       );
-      parser.process(&mut ctx)
+      parser(&mut ctx)
     };
     if accepted {
       // Finalization is keyed on the parser returning truthy
@@ -684,54 +699,56 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metada
   // is never set: the only condition is "nothing finalized".)
   if !finalized {
     if let Some(err) = finalization_error(name, data) {
-      m.push_error(err); // ExifTool.pm:3127 `$self->Error($err)` (:5648)
+      writer.push_error(err); // ExifTool.pm:3127 `$self->Error($err)` (:5648)
     }
   }
-  m
+  // Return the populated writer; `extract_info` calls `.finish()` for the
+  // byte-exact `exiftool -j -G1` JSON (faithful framing + `%noDups` first-wins
+  // + Warning/Error placement). Replaces the retired
+  // `serialize::to_exiftool_json(&m)` output path.
+  writer
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  fn names(m: &Metadata) -> Vec<(String, String, TagValue)> {
-    m.tags()
-      .iter()
-      .map(|t| {
-        (
-          t.group().family1().to_string(),
-          t.name().to_string(),
-          t.value().clone(),
-        )
-      })
+  /// Lift the writer's buffered records into `(family1, name, value)` triples
+  /// for order-significant assertions. Replaces the retired
+  /// `names(&Metadata)` (task #124): the engine sink is now a `JsonTagWriter`,
+  /// whose `records()` mirror the old `Metadata::tags()` in first-occurrence
+  /// order.
+  fn names(w: &JsonTagWriter) -> Vec<(String, String, TagValue)> {
+    w.records()
+      .map(|(group, name, value)| (group.family1().to_string(), name.to_string(), value.clone()))
       .collect()
   }
 
-  /// A throwaway `ParseContext` over a fresh `Metadata` for the
+  /// A throwaway `ParseContext` over a fresh `JsonTagWriter` for the
   /// `set_file_type`/`override_file_type` unit tests (the parser-driven
-  /// finalization in isolation). `$ext` is derived from the metadata's
-  /// file name via the real `GetFileExtension` (faithful to ExifTool.pm:
-  /// 2966) — e.g. `Metadata::new("x.aac")` ⇒ `$ext = "AAC"`,
-  /// `Metadata::new("x")` ⇒ `$ext = None`.
-  fn ctx_over<'a>(meta: &'a mut Metadata, ft: &'a str, print_on: bool) -> ParseContext<'a> {
-    let ext = crate::filetype::file_ext_for_name(meta.source_file());
-    ParseContext::new(&[], ft, 0, ft, ext, print_on, meta)
+  /// finalization in isolation). `$ext` is derived from the writer's
+  /// `source_file` via the real `GetFileExtension` (faithful to ExifTool.pm:
+  /// 2966) — e.g. `JsonTagWriter::new("x.aac")` ⇒ `$ext = "AAC"`,
+  /// `JsonTagWriter::new("x")` ⇒ `$ext = None`.
+  fn ctx_over<'a>(writer: &'a mut JsonTagWriter, ft: &'a str, print_on: bool) -> ParseContext<'a> {
+    let ext = crate::filetype::file_ext_for_name(writer.source_file());
+    ParseContext::new(&[], ft, 0, ft, ext, print_on, writer)
   }
 
   /// Like [`ctx_over`] but with an explicit `$ext` (`$$self{FILE_EXT}`),
   /// for the ExifTool.pm:9686-9692 sub-type-by-ext block tests.
   fn ctx_with_ext<'a>(
-    meta: &'a mut Metadata,
+    writer: &'a mut JsonTagWriter,
     ft: &'a str,
     ext: Option<&str>,
     print_on: bool,
   ) -> ParseContext<'a> {
-    ParseContext::new(&[], ft, 0, ft, ext.map(SmolStr::new), print_on, meta)
+    ParseContext::new(&[], ft, 0, ft, ext.map(SmolStr::new), print_on, writer)
   }
 
   #[test]
   fn set_file_type_pseudo_tags_print_on() {
-    let mut m = Metadata::new("x.aac");
+    let mut m = JsonTagWriter::new("x.aac");
     ctx_over(&mut m, "AAC", true).set_file_type(None, None, None);
     assert_eq!(
       names(&m),
@@ -757,30 +774,29 @@ mod tests {
 
   #[test]
   fn file_type_extension_is_raw_uppercase_under_n() {
-    let mut m = Metadata::new("x.aac");
+    let mut m = JsonTagWriter::new("x.aac");
     ctx_over(&mut m, "AAC", false).set_file_type(None, None, None);
     let ext = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FileTypeExtension")
+      .records()
+      .find(|(_, n, _)| *n == "FileTypeExtension")
       .unwrap();
-    assert_eq!(ext.value(), &TagValue::Str("AAC".into())); // -n: raw uc
+    assert_eq!(ext.2, &TagValue::Str("AAC".into())); // -n: raw uc
   }
 
   #[test]
   fn mime_fallback_is_application_unknown() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     // Detected type "XYZ" has no %mimeType / %fileTypeExt key.
     ctx_over(&mut m, "XYZ", true).set_file_type(None, None, None);
-    let mime = m.tags().iter().find(|t| t.name() == "MIMEType").unwrap();
-    assert_eq!(mime.value(), &TagValue::Str("application/unknown".into()));
+    let mime = m.records().find(|(_, n, _)| *n == "MIMEType").unwrap();
+    assert_eq!(mime.2, &TagValue::Str("application/unknown".into()));
   }
 
   #[test]
   fn set_file_type_first_call_wins() {
     // ExifTool.pm:9681 `unless ($$self{FileType} and not $$self{DOC_NUM})`:
     // a second SetFileType call for the main document is ignored.
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     {
       let mut c = ctx_over(&mut m, "AAC", true);
       c.set_file_type(None, None, None);
@@ -813,7 +829,7 @@ mod tests {
   fn override_file_type_replaces_in_place() {
     // Faithful OverrideFileType (ExifTool.pm:9712-9730): the three File:*
     // VALUES are overwritten in place — NOT duplicated.
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     {
       let mut c = ctx_over(&mut m, "AAC", true);
       c.set_file_type(None, None, None); // File:* = AAC / aac / audio/aac
@@ -840,37 +856,30 @@ mod tests {
       ]
     );
     // Exactly one of each File:* tag — values overwritten, not appended.
+    assert_eq!(m.records().filter(|(_, n, _)| *n == "FileType").count(), 1);
     assert_eq!(
-      m.tags().iter().filter(|t| t.name() == "FileType").count(),
-      1
-    );
-    assert_eq!(
-      m.tags()
-        .iter()
-        .filter(|t| t.name() == "FileTypeExtension")
+      m.records()
+        .filter(|(_, n, _)| *n == "FileTypeExtension")
         .count(),
       1
     );
-    assert_eq!(
-      m.tags().iter().filter(|t| t.name() == "MIMEType").count(),
-      1
-    );
+    assert_eq!(m.records().filter(|(_, n, _)| *n == "MIMEType").count(), 1);
   }
 
   #[test]
   fn override_file_type_noop_when_filetype_absent() {
     // ExifTool.pm:9715 `if defined $$self{VALUE}{FileType}` — with no prior
     // SetFileType there is nothing to override.
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     ctx_over(&mut m, "AAC", true).override_file_type("MP4", Some("video/mp4"), None);
-    assert!(m.tags().is_empty());
+    assert!(m.records().next().is_none());
   }
 
   #[test]
   fn override_file_type_noop_when_equal() {
     // ExifTool.pm:9715 `$fileType ne $$self{VALUE}{FileType}` — overriding
     // to the same type is a no-op (and must not duplicate File:*).
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     {
       let mut c = ctx_over(&mut m, "AAC", true);
       c.set_file_type(None, None, None);
@@ -903,18 +912,18 @@ mod tests {
     // ExifTool.pm:9724 `$$self{VALUE}{MIMEType} = $mimeType if $mimeType`
     // — when neither the argument nor %mimeType yields a MIME, the existing
     // MIMEType is left untouched (FileType/FileTypeExtension still change).
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     {
       let mut c = ctx_over(&mut m, "AAC", true);
       c.set_file_type(None, None, None); // MIMEType = audio/aac
       // "XYZ" has no %mimeType key and we pass mime=None.
       c.override_file_type("XYZ", None, None);
     }
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("XYZ".into()));
-    let mime = m.tags().iter().find(|t| t.name() == "MIMEType").unwrap();
+    let ft = m.records().find(|(_, n, _)| *n == "FileType").unwrap();
+    assert_eq!(ft.2, &TagValue::Str("XYZ".into()));
+    let mime = m.records().find(|(_, n, _)| *n == "MIMEType").unwrap();
     // unchanged — `if $mimeType` was false.
-    assert_eq!(mime.value(), &TagValue::Str("audio/aac".into()));
+    assert_eq!(mime.2, &TagValue::Str("audio/aac".into()));
   }
 
   /// `BZh91AY&SY` satisfies `%magicNumber{BZ2}` (ExifTool.pm:940); BZ2 is
@@ -925,30 +934,28 @@ mod tests {
     // %magicNumber{BZ2} = `BZh[1-9]\x31\x41\x59\x26\x53\x59` (ExifTool.pm:940);
     // prefix-only — trailing bytes are inert padding.
     let bz2_magic: &[u8] = b"BZh91AY\x26SY\x00\x00";
-    let m = extract_info("x.bz2", bz2_magic, true);
+    let m = extract_info_to_writer("x.bz2", bz2_magic, true);
     // Must have File:FileType == "BZ2" (SetFileType ran).
     let ft = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FileType")
+      .records()
+      .find(|(_, n, _)| *n == "FileType")
       .expect("File:FileType must be set");
-    assert_eq!(ft.value(), &TagValue::Str("BZ2".into()));
+    assert_eq!(ft.2, &TagValue::Str("BZ2".into()));
     // Must have ExifTool:Warning == "Unsupported file type".
     assert_eq!(
       m.warnings(),
-      &[smol_str::SmolStr::new("Unsupported file type")],
+      &[String::from("Unsupported file type")],
       "must have exactly the Warn string from ExifTool.pm:3056"
     );
     // Terminal stop: only ExifToolVersion + File:{FileType,FileTypeExtension,
     // MIMEType} — no format-specific tags beyond those four.
     let extra: Vec<_> = m
-      .tags()
-      .iter()
-      .filter(|t| {
-        !(t.name() == "ExifToolVersion"
-          || t.name() == "FileType"
-          || t.name() == "FileTypeExtension"
-          || t.name() == "MIMEType")
+      .records()
+      .filter(|(_, n, _)| {
+        !(*n == "ExifToolVersion"
+          || *n == "FileType"
+          || *n == "FileTypeExtension"
+          || *n == "MIMEType")
       })
       .collect();
     assert!(
@@ -964,7 +971,7 @@ mod tests {
     // `$self->Error('File is empty')` (ExifTool.pm:3086). Bundled
     // `perl exiftool -j -G1 -struct Empty.dat` ⇒ ExifTool:Error
     // "File is empty" (oracle-captured 2026-05-19).
-    let m = extract_info("Empty.dat", &[], true);
+    let m = extract_info_to_writer("Empty.dat", &[], true);
     assert_eq!(
       names(&m),
       vec![(
@@ -975,7 +982,7 @@ mod tests {
     );
     assert_eq!(
       m.errors(),
-      &[smol_str::SmolStr::new("File is empty")],
+      &[String::from("File is empty")],
       "ExifTool.pm:3086"
     );
     assert!(m.warnings().is_empty(), "no Warning on the empty path");
@@ -987,10 +994,10 @@ mod tests {
     // whole file is $ch ⇒ $num undef ⇒ 'Entire file is' + ' binary
     // zeros'. Bundled `perl exiftool` on a 32-\0 file ⇒ ExifTool:Error
     // "Entire file is binary zeros" (oracle-captured 2026-05-19).
-    let m = extract_info("allzero.dat", &[0u8; 32], true);
+    let m = extract_info_to_writer("allzero.dat", &[0u8; 32], true);
     assert_eq!(
       m.errors(),
-      &[smol_str::SmolStr::new("Entire file is binary zeros")],
+      &[String::from("Entire file is binary zeros")],
       "ExifTool.pm:3111,3115"
     );
     // The post-loop Error path emits no FileType (nothing finalized).
@@ -1009,10 +1016,10 @@ mod tests {
     // ExifTool.pm:3089-3095: buff < 16 (8 bytes) ⇒ the not-all-same arm;
     // `mystery.xyz` has no recognized type ⇒ 'Unknown file type'.
     // Bundled `perl exiftool` ⇒ ExifTool:Error "Unknown file type".
-    let m = extract_info("mystery.xyz", b"\x51\x7a\x2b\x6d\x09\x44\x1e\x77", true);
+    let m = extract_info_to_writer("mystery.xyz", b"\x51\x7a\x2b\x6d\x09\x44\x1e\x77", true);
     assert_eq!(
       m.errors(),
-      &[smol_str::SmolStr::new("Unknown file type")],
+      &[String::from("Unknown file type")],
       "ExifTool.pm:3095"
     );
   }
@@ -1024,10 +1031,10 @@ mod tests {
     // makes `ProcessAAC` reject (aac.rs:111, AAC.pm:103). `.aac` is a
     // known type ⇒ 'File format error' (ExifTool.pm:3093). Bundled
     // `perl exiftool bad.aac` ⇒ ExifTool:Error "File format error".
-    let m = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00\x00\x00\x00", true);
+    let m = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00\x00\x00\x00", true);
     assert_eq!(
       m.errors(),
-      &[smol_str::SmolStr::new("File format error")],
+      &[String::from("File format error")],
       "ExifTool.pm:3093 (.aac known, ProcessAAC rejected)"
     );
     // Reject ⇒ no File:* finalized; only version + the Error.
@@ -1192,13 +1199,12 @@ mod tests {
       ("M2TS", "mts", "video/m2ts"), // %fileTypeExt key ⇒ normExt=mts
       ("MPEG", "mpg", "video/mpeg"), // %fileTypeExt key ⇒ normExt=mpg
     ] {
-      let mut m = Metadata::new("x");
+      let mut m = JsonTagWriter::new("x");
       ctx_over(&mut m, ft, true).set_file_type(None, None, None);
       let pick = |n: &str| {
-        m.tags()
-          .iter()
-          .find(|t| t.name() == n)
-          .map(|t| t.value().clone())
+        m.records()
+          .find(|(_, n2, _)| *n2 == n)
+          .map(|(_, _, v)| v.clone())
       };
       assert_eq!(pick("FileType"), Some(TagValue::Str(ft.into())), "{ft}");
       assert_eq!(
@@ -1231,14 +1237,13 @@ mod tests {
       ("ARW", "ARW", "arw", "image/x-sony-arw"),  // ExifTool.pm:628
       ("3FR", "3FR", "3fr", "image/x-hasselblad-3fr"), // ExifTool.pm:617
     ] {
-      let mut m = Metadata::new("x");
+      let mut m = JsonTagWriter::new("x");
       // base/detected type = "TIFF"; $ext = the RAW extension.
       ctx_with_ext(&mut m, "TIFF", Some(ext), true).set_file_type(None, None, None);
       let pick = |n: &str| {
-        m.tags()
-          .iter()
-          .find(|t| t.name() == n)
-          .map(|t| t.value().clone())
+        m.records()
+          .find(|(_, n2, _)| *n2 == n)
+          .map(|(_, _, v)| v.clone())
       };
       assert_eq!(
         pick("FileType"),
@@ -1258,20 +1263,18 @@ mod tests {
     }
     // ext == fileType (TIFF/.tif) ⇒ NO promotion, plain TIFF (oracle:
     // II*\0 named .tif ⇒ TIFF / tif / image/tiff).
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     ctx_with_ext(&mut m, "TIFF", Some("TIFF"), true).set_file_type(None, None, None);
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value().clone()),
+      m.records()
+        .find(|(_, n, _)| *n == "FileType")
+        .map(|(_, _, v)| v.clone()),
       Some(TagValue::Str("TIFF".into()))
     );
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "MIMEType")
-        .map(|t| t.value().clone()),
+      m.records()
+        .find(|(_, n, _)| *n == "MIMEType")
+        .map(|(_, _, v)| v.clone()),
       Some(TagValue::Str("image/tiff".into()))
     );
   }
@@ -1282,26 +1285,24 @@ mod tests {
     // 'PNG' and JPEG's is 'JPEG' (Single rows, different roots) ⇒ NO
     // promotion: detected PNG with $ext=JPEG stays PNG (faithful: the
     // condition is false, so $fileType is untouched).
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     ctx_with_ext(&mut m, "PNG", Some("JPEG"), true).set_file_type(None, None, None);
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value().clone()),
+      m.records()
+        .find(|(_, n, _)| *n == "FileType")
+        .map(|(_, _, v)| v.clone()),
       Some(TagValue::Str("PNG".into())),
       "roots differ ⇒ no sub-type promotion"
     );
     // A multi-row extension can never promote: %fileTypeLookup{AI} is
     // [['PDF','PS'],..] so Perl `$$e[0]` is an arrayref (never string-
     // `eq`). Detected PDF + $ext=AI ⇒ stays PDF.
-    let mut m2 = Metadata::new("x");
+    let mut m2 = JsonTagWriter::new("x");
     ctx_with_ext(&mut m2, "PDF", Some("AI"), true).set_file_type(None, None, None);
     assert_eq!(
-      m2.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value().clone()),
+      m2.records()
+        .find(|(_, n, _)| *n == "FileType")
+        .map(|(_, _, v)| v.clone()),
       Some(TagValue::Str("PDF".into())),
       "multi-row ext ⇒ $$e[0] is arrayref ⇒ no promotion"
     );
@@ -1315,14 +1316,13 @@ mod tests {
     // that has NO %mimeType and no %fileTypeExt. The sub-type block does
     // not fire (no ext); $mimeType{XYZ} is None ⇒ fall back to
     // $mimeType{baseType=AAC} = "audio/aac".
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     // base type = "AAC"; explicit fileType arg "XYZ" (no %mimeType).
     ctx_over(&mut m, "AAC", true).set_file_type(Some("XYZ"), None, None);
-    let pick = |mm: &Metadata, n: &str| {
-      mm.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
+    let pick = |mm: &JsonTagWriter, n: &str| {
+      mm.records()
+        .find(|(_, n2, _)| *n2 == n)
+        .map(|(_, _, v)| v.clone())
     };
     assert_eq!(pick(&m, "FileType"), Some(TagValue::Str("XYZ".into())));
     assert_eq!(
@@ -1333,7 +1333,7 @@ mod tests {
     // The `$baseType eq 'TIFF'` exclusion: base = "TIFF", explicit
     // fileType "XYZ" (no %mimeType, no %fileTypeExt). Fallback is
     // SUPPRESSED ⇒ MIMEType stays application/unknown (NOT image/tiff).
-    let mut m2 = Metadata::new("x");
+    let mut m2 = JsonTagWriter::new("x");
     ctx_over(&mut m2, "TIFF", true).set_file_type(Some("XYZ"), None, None);
     assert_eq!(pick(&m2, "FileType"), Some(TagValue::Str("XYZ".into())));
     assert_eq!(
@@ -1344,7 +1344,7 @@ mod tests {
     // Sanity: with base "TIFF" and NO override (plain TIFF), $mimeType
     // {fileType=TIFF} is image/tiff directly (the exclusion only matters
     // when $mimeType{fileType} is undef).
-    let mut m3 = Metadata::new("x");
+    let mut m3 = JsonTagWriter::new("x");
     ctx_over(&mut m3, "TIFF", true).set_file_type(None, None, None);
     assert_eq!(
       pick(&m3, "MIMEType"),
@@ -1359,7 +1359,7 @@ mod tests {
     let data = std::fs::read(format!("{root}/tests/fixtures/AAC.aac")).expect("fixture");
     let want =
       std::fs::read_to_string(format!("{root}/tests/golden/AAC.aac.json")).expect("golden");
-    let got = crate::serialize::to_exiftool_json(&extract_info("AAC.aac", &data, true));
+    let got = extract_info("AAC.aac", &data, true);
     crate::jsondiff::json_equivalent(&got, &want)
       .unwrap_or_else(|e| panic!("AAC -j -G1 -struct conformance: {}", e.message()));
   }
@@ -1371,7 +1371,7 @@ mod tests {
     let data = std::fs::read(format!("{root}/tests/fixtures/AAC.aac")).expect("fixture");
     let want =
       std::fs::read_to_string(format!("{root}/tests/golden/AAC.aac.n.json")).expect("golden");
-    let got = crate::serialize::to_exiftool_json(&extract_info("AAC.aac", &data, false));
+    let got = extract_info("AAC.aac", &data, false);
     crate::jsondiff::json_equivalent(&got, &want)
       .unwrap_or_else(|e| panic!("AAC -n conformance: {}", e.message()));
   }
@@ -1381,36 +1381,34 @@ mod tests {
   //
   // ExifTool's `Process<Type>` may call `$et->Error('…')` (stored in
   // `$$self{VALUE}{Error}`) and still `return 1` — `Error` is emitted in
-  // `-j` regardless of the module returning success. `parser_for`
-  // (formats/mod.rs) is a fixed `match` keyed on the real file-type
+  // `-j` regardless of the module returning success. `any_parser_for`
+  // (parser_new.rs) is a fixed `match` keyed on the real file-type
   // string and no real ported format errors-while-accepting, so this test
   // uses the `#[cfg(test)]` [`INJECTED_PARSERS`] seam (consulted by
-  // [`lookup_parser`], which `extract_info` calls in place of
-  // `parser_for`): it registers an accepting-but-erroring parser for the
-  // *real* `AAC` file type, then calls the genuine `extract_info`. An
+  // [`lookup_parser`], which `extract_info` calls in place of the
+  // `any_parser_for` dispatch): it registers an accepting-but-erroring
+  // entry for the *real* `AAC` file type, then calls the genuine
+  // `extract_info`. An
   // `\xff\xf1` head passes the AAC `%magicNumber` gate (filetype_data.rs)
   // so `bad.aac` detects to `AAC`, the seam swaps in the injected parser,
   // and `extract_info` runs its real candidate→process(&mut m)→finalize
   // block against the outer Metadata directly (faithful to Perl
   // `&$func($self, \%dirInfo)`, ExifTool.pm:3066).
-  struct AcceptingButErroring;
-  impl FormatParser for AcceptingButErroring {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to every real accepting parser: `$et->SetFileType()`
-      // BEFORE pushing format tags (e.g. AAC.pm:107). All-`None` = the
-      // detected type (AAC.pm:107 no-arg style). Releases the &mut ctx
-      // borrow before `ctx.metadata()` re-borrows below.
-      ctx.set_file_type(None, None, None);
-      // Push via the real `&mut Metadata` seam parsers reach through
-      // `ctx.metadata()` (no public surface added for the test).
-      let m = ctx.metadata();
-      m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      m.push_warning("a non-fatal warning");
-      // ExifTool `$et->Error('File format error')` while still handling
-      // the file (sets $$self{VALUE}{Error}), then `return 1`.
-      m.push_error("File format error");
-      true // Perl `return 1`
-    }
+  fn accepting_but_erroring(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to every real accepting parser: `$et->SetFileType()`
+    // BEFORE pushing format tags (e.g. AAC.pm:107). All-`None` = the
+    // detected type (AAC.pm:107 no-arg style). Releases the &mut ctx
+    // borrow before `ctx.metadata()` re-borrows below.
+    ctx.set_file_type(None, None, None);
+    // Push via the real `&mut Metadata` seam parsers reach through
+    // `ctx.metadata()` (no public surface added for the test).
+    let m = ctx.writer();
+    m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    m.push_warning("a non-fatal warning");
+    // ExifTool `$et->Error('File format error')` while still handling
+    // the file (sets $$self{VALUE}{Error}), then `return 1`.
+    m.push_error("File format error");
+    true // Perl `return 1`
   }
 
   /// RAII guard so the `#[cfg(test)]` injection table is always cleared —
@@ -1429,42 +1427,40 @@ mod tests {
   /// (the file-scoped first-call-wins test uses TWO: an early file-type's
   /// parser AND a later file-type's parser — both from the same
   /// `detection_candidates` iterator on the same input).
-  fn inject(file_type: &'static str, parser: &'static dyn FormatParser) {
+  fn inject(file_type: &'static str, parser: EngineEntry) {
     INJECTED_PARSERS.with(|c| c.borrow_mut().push((file_type, parser)));
   }
-
-  static ACCEPTING_BUT_ERRORING: AcceptingButErroring = AcceptingButErroring;
 
   #[cfg(feature = "json")]
   #[test]
   fn accepted_parser_error_reaches_serialized_json() {
     // Register the injected parser for the REAL detected file type.
     let _guard = InjectionGuard;
-    inject("AAC", &ACCEPTING_BUT_ERRORING);
+    inject("AAC", accepting_but_erroring);
 
     // Drive the genuine `extract_info`: `\xff\xf1…` passes the AAC magic
     // gate ⇒ `bad.aac` detects to `AAC` ⇒ `lookup_parser("AAC")` returns
     // the injected parser ⇒ the REAL accepted-parser block runs against
     // the outer Metadata directly (no trial-merge).
-    let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
+    let meta = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
 
     // The accepting parser's ExifTool:Error reached the outer Metadata
     // via direct `&mut Metadata` push (faithful Perl `$self->Error`).
     assert_eq!(
       meta.errors(),
-      &[smol_str::SmolStr::new("File format error")],
+      &[String::from("File format error")],
       "accepting parser's ExifTool:Error must propagate through extract_info"
     );
     assert_eq!(
       meta.warnings(),
-      &[smol_str::SmolStr::new("a non-fatal warning")],
+      &[String::from("a non-fatal warning")],
       "accepting parser's warning must propagate through extract_info"
     );
     // And it survives serialization as the `ExifTool:Error` token,
     // alongside the parser-driven File:FileType (the parser called
     // SetFileType against the real outer Metadata), the pushed tag, and
     // the always-emitted version.
-    let json = crate::serialize::to_exiftool_json(&meta);
+    let json = meta.finish();
     assert!(
       json.contains("\"ExifTool:Error\": \"File format error\""),
       "serialized JSON must carry ExifTool:Error, got: {json}"
@@ -1491,24 +1487,19 @@ mod tests {
   // rejection exhausts the loop and the post-loop finalization Error
   // fires — yet `File:FileType=AAC` must remain (no rollback). This
   // FAILS the moment anyone re-introduces a trial-and-rollback model.
-  struct RejectingAfterSetFileType;
-  impl FormatParser for RejectingAfterSetFileType {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to MPEG.pm:675: `$et->SetFileType()` (no-arg ⇒ detected
-      // type) BEFORE reading/rejecting.
-      ctx.set_file_type(None, None, None);
-      // Push one tag for assertion clarity — also a side effect that
-      // must persist post-reject (faithful: `FoundTag` writes to
-      // `$$self{VALUE}` directly).
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      // MPEG.pm:678 style `or return 0` — reject AFTER SetFileType.
-      false
-    }
+  fn rejecting_after_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to MPEG.pm:675: `$et->SetFileType()` (no-arg ⇒ detected
+    // type) BEFORE reading/rejecting.
+    ctx.set_file_type(None, None, None);
+    // Push one tag for assertion clarity — also a side effect that
+    // must persist post-reject (faithful: `FoundTag` writes to
+    // `$$self{VALUE}` directly).
+    ctx
+      .writer()
+      .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    // MPEG.pm:678 style `or return 0` — reject AFTER SetFileType.
+    false
   }
-
-  static REJECTING_AFTER_SET_FILE_TYPE: RejectingAfterSetFileType = RejectingAfterSetFileType;
 
   #[cfg(feature = "json")]
   #[test]
@@ -1521,15 +1512,15 @@ mod tests {
     //   "File:FileType":"MPEG"
     // simultaneously. The same pattern is exercised here via the
     // injected-parser seam against the real AAC file type, since
-    // `parser_for` has no rejecting-after-SetFileType real parser yet.
+    // `any_parser_for` has no rejecting-after-SetFileType real parser yet.
     let _guard = InjectionGuard;
-    inject("AAC", &REJECTING_AFTER_SET_FILE_TYPE);
+    inject("AAC", rejecting_after_set_file_type);
 
     // `\xff\xf1…` passes the AAC magic gate ⇒ detects to AAC ⇒ the
     // injected parser runs ⇒ SetFileType pushes File:* THEN parser
     // returns false ⇒ post-loop finalization Error fires.
-    let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
-    let json = crate::serialize::to_exiftool_json(&meta);
+    let meta = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
+    let json = meta.finish();
 
     // The rejecting parser's SetFileType side effects PERSIST on the
     // outer Metadata (faithful Perl: no rollback).
@@ -1555,18 +1546,13 @@ mod tests {
   // `set_file_type` (no real parser does this, but ExifTool's accept is
   // keyed ONLY on the truthy Process return). Same `INJECTED_PARSERS`
   // seam as Part B.
-  struct AcceptingNoSetFileType;
-  impl FormatParser for AcceptingNoSetFileType {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // One tag, NO set_file_type, NO error — then `return 1`.
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      true // Perl `return 1`
-    }
+  fn accepting_no_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
+    // One tag, NO set_file_type, NO error — then `return 1`.
+    ctx
+      .writer()
+      .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    true // Perl `return 1`
   }
-
-  static ACCEPTING_NO_SET_FILE_TYPE: AcceptingNoSetFileType = AcceptingNoSetFileType;
 
   // Executable pin of the faithful finalization criterion: finalization
   // (and thus suppression of the post-loop Error) is keyed on the parser
@@ -1581,11 +1567,11 @@ mod tests {
     //     NO finalization ExifTool:Error and NO File:FileType (exifast's
     //     current faithful behavior; the regression guard vs the gate).
     let _guard = InjectionGuard;
-    inject("AAC", &ACCEPTING_NO_SET_FILE_TYPE);
+    inject("AAC", accepting_no_set_file_type);
     // `\xff\xf1…` passes the AAC magic gate ⇒ `bad.aac` detects to
     // `AAC` ⇒ the injected parser runs and accepts (returns true).
-    let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
-    let json = crate::serialize::to_exiftool_json(&meta);
+    let meta = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
+    let json = meta.finish();
     // The parser's tag is present (it accepted and pushed it).
     assert!(json.contains("\"AAC:Channels\": 2"), "got: {json}");
     // Accept ⇒ post-loop finalization Error SUPPRESSED: no
@@ -1646,32 +1632,24 @@ mod tests {
   // `fk2`) and accepts. Exactly one `File:FileType` (= `"AAC"`) must
   // remain on `m`, with the second parser's marker tag present and no
   // finalization Error (the second parser accepted).
-  struct AacSetThenReject;
-  impl FormatParser for AacSetThenReject {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to MPEG.pm:675 — `$et->SetFileType` BEFORE rejecting.
-      ctx.set_file_type(Some("AAC"), None, None);
-      false // MPEG.pm:678 style `or return 0`
-    }
+  fn aac_set_then_reject(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to MPEG.pm:675 — `$et->SetFileType` BEFORE rejecting.
+    ctx.set_file_type(Some("AAC"), None, None);
+    false // MPEG.pm:678 style `or return 0`
   }
-  static AAC_SET_THEN_REJECT: AacSetThenReject = AacSetThenReject;
 
-  struct WvOverwriteAndAccept;
-  impl FormatParser for WvOverwriteAndAccept {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Try to set a DIFFERENT File:* triplet — must be a no-op because
-      // candidate 1 already engaged first-call-wins on `m`. If exifast
-      // ever drops the file-scoped guard, this call leaks a duplicate
-      // File:FileType (= "FAKE2") into `m`, and the assertions below fire.
-      ctx.set_file_type(Some("FAKE2"), Some("application/fake"), Some("fk2"));
-      // Distinguishing marker so the test can confirm THIS parser ran.
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "WV"), "Marker", TagValue::I64(1));
-      true // Perl `return 1` — accept ⇒ no post-loop Error
-    }
+  fn wv_overwrite_and_accept(ctx: &mut ParseContext<'_>) -> bool {
+    // Try to set a DIFFERENT File:* triplet — must be a no-op because
+    // candidate 1 already engaged first-call-wins on `m`. If exifast
+    // ever drops the file-scoped guard, this call leaks a duplicate
+    // File:FileType (= "FAKE2") into `m`, and the assertions below fire.
+    ctx.set_file_type(Some("FAKE2"), Some("application/fake"), Some("fk2"));
+    // Distinguishing marker so the test can confirm THIS parser ran.
+    ctx
+      .writer()
+      .push(Group::new("Audio", "WV"), "Marker", TagValue::I64(1));
+    true // Perl `return 1` — accept ⇒ no post-loop Error
   }
-  static WV_OVERWRITE_AND_ACCEPT: WvOverwriteAndAccept = WvOverwriteAndAccept;
 
   #[cfg(feature = "json")]
   #[test]
@@ -1683,20 +1661,19 @@ mod tests {
     // (`AAC`) and a LATER (`WV`) candidate; the loop must invoke `AAC`'s
     // parser then `WV`'s — both against the SAME outer Metadata.
     let _guard = InjectionGuard;
-    inject("AAC", &AAC_SET_THEN_REJECT);
-    inject("WV", &WV_OVERWRITE_AND_ACCEPT);
+    inject("AAC", aac_set_then_reject);
+    inject("WV", wv_overwrite_and_accept);
 
-    let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
+    let meta = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
 
     // Candidate 2 ran (its marker is on `m`) and accepted ⇒ no post-loop
     // finalization Error (ExifTool.pm:3080 `not defined $type` is false).
     assert!(
       meta
-        .tags()
-        .iter()
-        .any(|t| t.name() == "Marker" && t.group().family1() == "WV"),
+        .records()
+        .any(|(g, n, _)| n == "Marker" && g.family1() == "WV"),
       "candidate 2's parser must have run and pushed its marker tag, got: {:?}",
-      meta.tags()
+      meta.records().collect::<Vec<_>>()
     );
     assert!(
       meta.errors().is_empty(),
@@ -1709,34 +1686,31 @@ mod tests {
     // MUST be a no-op (it would re-push a SECOND File:* triplet if the
     // guard were per-context, leaking `FAKE2`/`application/fake`/`fk2`).
     let file_types: Vec<_> = meta
-      .tags()
-      .iter()
-      .filter(|t| t.name() == "FileType" && t.group().family1() == "File")
-      .map(|t| t.value().clone())
+      .records()
+      .filter(|(g, n, _)| *n == "FileType" && g.family1() == "File")
+      .map(|(_, _, v)| v.clone())
       .collect();
     assert_eq!(
       file_types,
       vec![TagValue::Str("AAC".into())],
       "exactly one File:FileType (first-call-wins ⇒ \"AAC\", not \"FAKE2\")"
     );
-    let file_ext: Vec<_> = meta
-      .tags()
-      .iter()
-      .filter(|t| t.name() == "FileTypeExtension" && t.group().family1() == "File")
-      .collect();
-    assert_eq!(file_ext.len(), 1, "exactly one File:FileTypeExtension");
-    let mime: Vec<_> = meta
-      .tags()
-      .iter()
-      .filter(|t| t.name() == "MIMEType" && t.group().family1() == "File")
-      .collect();
-    assert_eq!(mime.len(), 1, "exactly one File:MIMEType");
+    let file_ext = meta
+      .records()
+      .filter(|(g, n, _)| *n == "FileTypeExtension" && g.family1() == "File")
+      .count();
+    assert_eq!(file_ext, 1, "exactly one File:FileTypeExtension");
+    let mime = meta
+      .records()
+      .filter(|(g, n, _)| *n == "MIMEType" && g.family1() == "File")
+      .count();
+    assert_eq!(mime, 1, "exactly one File:MIMEType");
 
     // And the same invariant must survive serialization (the `%noDups`
     // first-wins serializer would mask a leak from `Metadata::tags()`-
     // level checks if we only asserted on JSON, but we already asserted
     // on `meta.tags()` directly above; this is the belt-and-braces).
-    let json = crate::serialize::to_exiftool_json(&meta);
+    let json = meta.finish();
     assert!(
       json.contains("\"File:FileType\": \"AAC\""),
       "serialized File:FileType must be \"AAC\" (candidate 1's value), got: {json}"

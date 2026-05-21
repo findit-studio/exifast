@@ -32,7 +32,7 @@ marked `ffmpeg-gen` (we generate per spec D6).
 | 10 | **Audible** (AA) | Audible.pm | 317 | 2 | Engine | `Audible.aa` | ✅ | clean | — |
 | 11 | **DV** | DV.pm | 315 | 2 | Engine | `DV.dv` | ✅ | clean | — |
 | 12 | **Red** (R3D) | Red.pm | 335 | 2 | Engine | `Red.r3d` | ✅ | clean (Composite deferred) | docs/superpowers/plans/2026-05-20-red-port.md |
-| 12a | **MOI** (camcorder MOD info sidecar — JVC/Canon/Panasonic) | MOI.pm | 159 | 2 | Engine | ⚠️ ffmpeg-gen / synthetic `MOI.moi` | ⬜ | — | — |
+| 12a | **MOI** (camcorder MOD info sidecar — JVC/Canon/Panasonic) | MOI.pm | 159 | 2 | Engine | `MOI.moi` | ✅ | clean | — |
 | 12b | **PLIST** *(infra; carries MODD)* | PLIST.pm | 548 | 2 | Engine | via MODD | ⬜ | — | — |
 | 12c | **MODD** (Sony Picture Motion metadata sidecar; XML rides on PLIST) | PLIST.pm tag `MODD` | — | 2 | Engine, PLIST (#12b) | synthetic `Sony.modd` | ⬜ | — | — |
 | 13 | **Exif** *(infra)* | Exif.pm | 7324 | 3 | Engine | via containers | ⬜ | — | — |

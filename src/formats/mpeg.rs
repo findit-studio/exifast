@@ -1,668 +1,829 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "mpeg-audio")]
 //! Faithful port of `Image::ExifTool::MPEG` (lib/Image/ExifTool/MPEG.pm) —
-//! AUDIO side only. Ports:
+//! AUDIO side only.
+//!
+//! A typed [`MpegAudioMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait with a per-format
+//! [`MpegAudioContext`] (data + start_offset + ext + shared flags). MPEG
+//! audio is invoked internally by the MP3 file-type entry
+//! ([`crate::formats::id3::ProcessMp3`]) via
+//! [`ProcessMp3::process_with_start_offset`], which drives
+//! [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
+//!
+//! ## Ports
 //!
 //! - `%MPEG::Audio` (MPEG.pm:23-256) — the 11-tag bit-field table for the
 //!   4-byte MPEG audio frame header.
-//! - `ProcessFrameHeader` (MPEG.pm:441-457) — already subsumed by
-//!   [`crate::bitstream::process_bit_stream_cond`].
+//! - `ProcessFrameHeader` (MPEG.pm:441-457) — direct bit-extract from the
+//!   32-bit big-endian header word into typed [`MpegAudioMeta`] fields
+//!   (Phase F4 supersedes the [`crate::bitstream::process_bit_stream_cond`]
+//!   path for the typed Meta).
 //! - `ParseMPEGAudio` (MPEG.pm:464-581) — sync-scan, header-validate,
-//!   dispatch, AND the post-header Xing/Info/LAME tail.
+//!   extract, AND the post-header Xing/Info/LAME tail (MPEG.pm:501-578).
 //! - `%MPEG::Xing` (MPEG.pm:323-337) and `%MPEG::Lame` (MPEG.pm:339-382) —
 //!   the VBR/encoder sub-tables consumed by the post-header tail.
 //! - `ProcessMP3` audio scan-buffer bounding (ID3.pm:1684-1729) — the
-//!   wrapper at [`ProcessMp3::process`] bounds `data` to ID3.pm:1704's
-//!   `$scanLen` (8192 if `$$self{FILE_EXT} eq 'MP3'`, 256 otherwise)
-//!   BEFORE invoking [`parse_mpeg_audio`]. Required to match bundled
+//!   wrapper at `ProcessMp3::process_with_start_offset` bounds `data` to
+//!   ID3.pm:1704's `$scanLen` (8192 if `$$self{FILE_EXT} eq 'MP3'`, 256
+//!   otherwise) BEFORE invoking the typed parser. Required to match bundled
 //!   ExifTool's rejection of files where a valid sync byte appears beyond
-//!   the scan boundary; without it, MP3 (weak magic) accepts junk files
-//!   on a stray late `\xff` (Codex R1/F1).
+//!   the scan boundary; without it, MP3 (weak magic) would falsely accept
+//!   junk files on a stray late `\xff` (Codex R1/F1).
+//!
+//! ## Phase E discovery — `process_with_start_offset` API preservation
+//!
+//! The R5 fix introduced `ProcessMp3::process_with_start_offset` so the
+//! ID3 wrapper (`src/formats/id3/process.rs:117`) could mirror bundled's
+//! `Seek($hdrEnd, 0)` + `Read($buff, $scanLen)` pair (ID3.pm:1590 +
+//! ID3.pm:1705). The public method signature is **preserved exactly** so
+//! the ID3 wrapper code (`mpeg::ProcessMp3.process_with_start_offset(ctx,
+//! hdr_end)`) keeps working byte-for-byte. It internally drives the typed
+//! [`ProcessMpegAudio`] + [`MetaSinker`] path.
 //!
 //! ## Deferred (forward items, deliberately out of this PR's scope)
 //!
 //! - **MPEG video** (`%MPEG::Video`, `ProcessMPEG`, `ProcessMPEGVideo`,
 //!   `ParseMPEGAudioVideo`, MPEG.pm:258-321 + 583-681) — separate port.
-//! - **ID3 dispatch coordination** — the ID3 port is a parallel PR. In
-//!   bundled ExifTool, `MP3`-typed files route to `ID3::ProcessMP3`
-//!   (ExifTool.pm:893 `MP3 => 'ID3'`), which scans for `ID3` (v1/v2) tags
-//!   and then calls back into `ParseMPEGAudio`. While ID3 is unmerged,
-//!   THIS module registers as the `"MP3"` parser directly (its
-//!   [`ProcessMp3::process`] entry point applies the ID3.pm:1684-1729
-//!   `$scanLen` bound BEFORE delegating to [`parse_mpeg_audio`]); when
-//!   ID3 lands it can register a wrapping parser at `"MP3"` that performs
-//!   the same scan-buffer bound and delegates the audio side to
-//!   [`parse_mpeg_audio`] (re-exported `pub(crate)`).
 //! - **`%MPEG::Composite` (Duration/AudioBitrate)** (MPEG.pm:385-432) —
 //!   Composite tags subsystem not yet ported (cross-module Require/Desire).
 //! - **R8 set-then-reject** — MPEG.pm:496 `$et->SetFileType()` is called
 //!   BEFORE the post-header Xing/LAME tail; the tail can `last` on any
-//!   length / magic / flag check but never `return 0`, so the File:*
-//!   tags from SetFileType always persist. Today both code paths (sync
-//!   reject + Xing tail) return 1; the seam's persist-on-reject contract
-//!   keeps that faithful for any future divergence.
+//!   length / magic / flag check but never `return 0`, so the File:* tags
+//!   from SetFileType always persist. The engine entry preserves this: it
+//!   calls `ctx.set_file_type(None, None, None)` BEFORE sinking the typed
+//!   Meta, so File:* lands first and persists if any later code returns false.
+
+use std::{borrow::Cow, string::String};
 
 use crate::{
-  bitstream::{BitOrder, FrameState, process_bit_stream_cond},
-  parser::{FormatParser, ParseContext},
-  tagtable::{PrintConv, PrintConvHash, PrintValue, RawConv, TagDef, ValueConv},
-  value::TagValue,
+  parser::ParseContext,
+  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  value::format_g,
 };
 
-// ───────────────────────── ConvertBitrate ─────────────────────────
+// ===========================================================================
+// `convert_bitrate` / `convert_lame_lowpass`
+// ===========================================================================
 
-/// Faithful Rust port of `Image::ExifTool::ConvertBitrate` (ExifTool.pm:6891-
-/// 6902). The PrintConv for every `AudioBitrate` arm (MPEG.pm:67/91/115/139/
-/// 163). Returns the original value when it isn't numerical (Perl
-/// `IsFloat` false ⇒ `return $bitrate`).
+/// Format-into-writer port of `Image::ExifTool::ConvertBitrate`
+/// (ExifTool.pm:6891-6902). Writes the formatted bitrate string directly
+/// into a [`core::fmt::Write`] sink — no intermediate `String` allocation.
 ///
-/// Algorithm (Perl):
-///   `units = ('bps','kbps','Mbps','Gbps')`; while bitrate ≥ 1000 and more
-///   units remain: `bitrate /= 1000; shift units`. Format:
-///   `sprintf("%.3g %s", b, u)` if b < 100, else `sprintf("%.0f %s", b, u)`.
+/// Perl reference:
+/// ```perl
+/// my $bitrate = shift;
+/// IsFloat($bitrate) or return $bitrate;
+/// my @units = ('bps', 'kbps', 'Mbps', 'Gbps');
+/// for (;;) {
+///     my $units = shift @units;
+///     $bitrate >= 1000 and @units and $bitrate /= 1000, next;
+///     my $fmt = $bitrate < 100 ? '%.3g' : '%.0f';
+///     return sprintf("$fmt $units", $bitrate);
+/// }
+/// ```
 ///
-/// Inputs `0` ("free", from the `0 => 'free'` ValueConv-hash arm,
-/// MPEG.pm:51) bypass via `TagValue::Str("free")` ⇒ IsFloat false ⇒ string
-/// passthrough.
-fn convert_bitrate(val: &TagValue) -> TagValue {
-  // Perl `IsFloat($bitrate) or return $bitrate` (ExifTool.pm:6894) +
-  // `for(;;) { ... }` (ExifTool.pm:6896-6901). Faithful: any non-numeric
-  // input returns unchanged.
-  let b = match val {
-    TagValue::I64(n) => *n as f64,
-    TagValue::F64(n) if n.is_finite() => *n,
-    TagValue::Str(s) => match s.parse::<f64>() {
-      Ok(n) if n.is_finite() => n,
-      _ => return val.clone(), // IsFloat false ⇒ unchanged
-    },
-    _ => return val.clone(),
-  };
-  // Walk units: bps → kbps → Mbps → Gbps. After divide-by-1000 up to 3
-  // times we exit either by `bitrate < 1000` or by exhausting the unit
-  // list. Perl uses `shift @units` so `units` is removed-from-front; we
-  // mirror with an index.
-  let units = ["bps", "kbps", "Mbps", "Gbps"];
-  let mut b = b;
-  let mut i = 0usize;
-  // `bitrate >= 1000 and @units and bitrate /= 1000, next;` — the test is
-  // `i < units.len() - 1` because the next iteration must still have a unit
-  // available (i.e. units list non-empty AFTER the `shift`).
-  while b >= 1000.0 && i + 1 < units.len() {
-    b /= 1000.0;
-    i += 1;
+/// FORWARD-ITEM: Rust `{:.0}` rounds half-to-even; Perl `%.0f` on most
+/// platforms rounds half-away-from-zero. Currently load-bearing only for
+/// integer bitrates (every VC hash entry is a multiple of 1000, so /1000
+/// stays integer-valued; no halves are produced). If a VBR Composite:
+/// AudioBitrate (MPEG.pm:416-431) is later ported it can produce a half —
+/// switch this arm to a half-away-from-zero rounder then, pinned by an
+/// oracle golden.
+pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  bitrate: f64,
+) -> core::fmt::Result {
+  if !bitrate.is_finite() {
+    return write!(w, "{bitrate}");
   }
-  let unit = units[i];
-  // ExifTool.pm:6899: '%.3g' if bitrate < 100 else '%.0f'.
-  let s = if b < 100.0 {
-    // Perl `sprintf("%.3g", $b)` — 3 significant digits.
-    crate::value::format_g(b, 3)
+  const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
+  let mut b = bitrate;
+  for (i, &unit) in UNITS.iter().enumerate() {
+    let is_last = i + 1 == UNITS.len();
+    if b >= 1000.0 && !is_last {
+      b /= 1000.0;
+      continue;
+    }
+    return if b < 100.0 {
+      // `%.3g` — Perl `%g` strips trailing zeros. Share the engine helper.
+      let formatted = format_g(b, 3);
+      write!(w, "{formatted} {unit}")
+    } else {
+      write!(w, "{b:.0} {unit}")
+    };
+  }
+  unreachable!("write_convert_bitrate loop must exit on the last unit");
+}
+
+/// Format-into-writer port of MPEG.pm:361 `PrintConv => '($val / 1000) . "
+/// kHz"'`. ValueConv has already multiplied the raw byte by 100 (so the
+/// caller passes `byte * 100`); a value like `16000` yields `"16 kHz"`.
+/// Perl `.` is string concat; an integer-valued float prints as the
+/// integer (no trailing `.0`), so we explicitly skip the decimal when the
+/// quotient is integral.
+pub fn write_lame_lowpass<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  value: f64,
+) -> core::fmt::Result {
+  if !value.is_finite() {
+    return write!(w, "{value}");
+  }
+  let q = value / 1000.0;
+  if (q - q.round()).abs() < f64::EPSILON {
+    write!(w, "{} kHz", q.round() as i64)
   } else {
-    // Perl `sprintf("%.0f", $b)` — 0 decimal places (rounded).
-    // FORWARD: Rust `{:.0}` rounds half-to-even; Perl `%.0f` on most
-    // platforms rounds half-away-from-zero. Currently load-bearing only
-    // for integer bitrates (every entry in `VC_BR_*` is a multiple of
-    // 1000, so /1000 stays integer-valued and no halves are produced).
-    // If a VBR Composite:AudioBitrate (MPEG.pm:416-431) is later ported
-    // it can produce a half — switch this arm to a half-away-from-zero
-    // rounder then, pinned by an oracle golden.
-    format!("{:.0}", b)
-  };
-  TagValue::Str(format!("{s} {unit}").into())
-}
-
-// ───────────────────────── ValueConv hashes ─────────────────────────
-//
-// MPEG.pm AudioBitrate hashes 0..14 (per version+layer). Keyed by the
-// **stringified** raw integer (Perl `$$conv{$val}` indexes the hash with the
-// stringified scalar). `0 => 'free'` is a string sentinel; entries 1..14 are
-// bare numbers (`Integer Hz`).
-
-// MPEG.pm:50-66 — version 1, layer 1.
-const VC_BR_V1_L1: &[(&str, PrintValue)] = &[
-  ("0", PrintValue::Str("free")),
-  ("1", PrintValue::I64(32000)),
-  ("2", PrintValue::I64(64000)),
-  ("3", PrintValue::I64(96000)),
-  ("4", PrintValue::I64(128000)),
-  ("5", PrintValue::I64(160000)),
-  ("6", PrintValue::I64(192000)),
-  ("7", PrintValue::I64(224000)),
-  ("8", PrintValue::I64(256000)),
-  ("9", PrintValue::I64(288000)),
-  ("10", PrintValue::I64(320000)),
-  ("11", PrintValue::I64(352000)),
-  ("12", PrintValue::I64(384000)),
-  ("13", PrintValue::I64(416000)),
-  ("14", PrintValue::I64(448000)),
-];
-
-// MPEG.pm:74-90 — version 1, layer 2.
-const VC_BR_V1_L2: &[(&str, PrintValue)] = &[
-  ("0", PrintValue::Str("free")),
-  ("1", PrintValue::I64(32000)),
-  ("2", PrintValue::I64(48000)),
-  ("3", PrintValue::I64(56000)),
-  ("4", PrintValue::I64(64000)),
-  ("5", PrintValue::I64(80000)),
-  ("6", PrintValue::I64(96000)),
-  ("7", PrintValue::I64(112000)),
-  ("8", PrintValue::I64(128000)),
-  ("9", PrintValue::I64(160000)),
-  ("10", PrintValue::I64(192000)),
-  ("11", PrintValue::I64(224000)),
-  ("12", PrintValue::I64(256000)),
-  ("13", PrintValue::I64(320000)),
-  ("14", PrintValue::I64(384000)),
-];
-
-// MPEG.pm:98-114 — version 1, layer 3.
-const VC_BR_V1_L3: &[(&str, PrintValue)] = &[
-  ("0", PrintValue::Str("free")),
-  ("1", PrintValue::I64(32000)),
-  ("2", PrintValue::I64(40000)),
-  ("3", PrintValue::I64(48000)),
-  ("4", PrintValue::I64(56000)),
-  ("5", PrintValue::I64(64000)),
-  ("6", PrintValue::I64(80000)),
-  ("7", PrintValue::I64(96000)),
-  ("8", PrintValue::I64(112000)),
-  ("9", PrintValue::I64(128000)),
-  ("10", PrintValue::I64(160000)),
-  ("11", PrintValue::I64(192000)),
-  ("12", PrintValue::I64(224000)),
-  ("13", PrintValue::I64(256000)),
-  ("14", PrintValue::I64(320000)),
-];
-
-// MPEG.pm:122-138 — version 2 or 2.5, layer 1.
-const VC_BR_V2_L1: &[(&str, PrintValue)] = &[
-  ("0", PrintValue::Str("free")),
-  ("1", PrintValue::I64(32000)),
-  ("2", PrintValue::I64(48000)),
-  ("3", PrintValue::I64(56000)),
-  ("4", PrintValue::I64(64000)),
-  ("5", PrintValue::I64(80000)),
-  ("6", PrintValue::I64(96000)),
-  ("7", PrintValue::I64(112000)),
-  ("8", PrintValue::I64(128000)),
-  ("9", PrintValue::I64(144000)),
-  ("10", PrintValue::I64(160000)),
-  ("11", PrintValue::I64(176000)),
-  ("12", PrintValue::I64(192000)),
-  ("13", PrintValue::I64(224000)),
-  ("14", PrintValue::I64(256000)),
-];
-
-// MPEG.pm:146-162 — version 2 or 2.5, layer 2 or 3.
-const VC_BR_V2_L23: &[(&str, PrintValue)] = &[
-  ("0", PrintValue::Str("free")),
-  ("1", PrintValue::I64(8000)),
-  ("2", PrintValue::I64(16000)),
-  ("3", PrintValue::I64(24000)),
-  ("4", PrintValue::I64(32000)),
-  ("5", PrintValue::I64(40000)),
-  ("6", PrintValue::I64(48000)),
-  ("7", PrintValue::I64(56000)),
-  ("8", PrintValue::I64(64000)),
-  ("9", PrintValue::I64(80000)),
-  ("10", PrintValue::I64(96000)),
-  ("11", PrintValue::I64(112000)),
-  ("12", PrintValue::I64(128000)),
-  ("13", PrintValue::I64(144000)),
-  ("14", PrintValue::I64(160000)),
-];
-
-// ───────────────────────── Tag definitions ─────────────────────────
-
-// MPEG.pm:25-33  Bit11-12 MPEGAudioVersion.
-//   PrintConv 0 => 2.5, 2 => 2, 3 => 1.
-//   RawConv sets MPEG_Vers.
-static MPEG_AUDIO_VERSION: TagDef = TagDef::new(
-  "MPEGAudioVersion",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::F64(2.5)),
-    ("2", PrintValue::I64(2)),
-    ("3", PrintValue::I64(1)),
-  ])),
-)
-.with_raw_conv(RawConv::SetFrameState("MPEG_Vers"));
-
-// MPEG.pm:34-42  Bit13-14 AudioLayer.
-//   PrintConv 1 => 3, 2 => 2, 3 => 1.
-//   RawConv sets MPEG_Layer.
-static AUDIO_LAYER: TagDef = TagDef::new(
-  "AudioLayer",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("1", PrintValue::I64(3)),
-    ("2", PrintValue::I64(2)),
-    ("3", PrintValue::I64(1)),
-  ])),
-)
-.with_raw_conv(RawConv::SetFrameState("MPEG_Layer"));
-
-// MPEG.pm:44-68 — Bit16-19 AudioBitrate, version 1, layer 1.
-static AUDIO_BITRATE_V1_L1: TagDef = TagDef::new(
-  "AudioBitrate",
-  "MPEG",
-  ValueConv::Hash(PrintConvHash::direct(VC_BR_V1_L1)),
-  PrintConv::Func(convert_bitrate),
-);
-// MPEG.pm:69-92 — Bit16-19 AudioBitrate, version 1, layer 2.
-static AUDIO_BITRATE_V1_L2: TagDef = TagDef::new(
-  "AudioBitrate",
-  "MPEG",
-  ValueConv::Hash(PrintConvHash::direct(VC_BR_V1_L2)),
-  PrintConv::Func(convert_bitrate),
-);
-// MPEG.pm:93-116 — Bit16-19 AudioBitrate, version 1, layer 3.
-static AUDIO_BITRATE_V1_L3: TagDef = TagDef::new(
-  "AudioBitrate",
-  "MPEG",
-  ValueConv::Hash(PrintConvHash::direct(VC_BR_V1_L3)),
-  PrintConv::Func(convert_bitrate),
-);
-// MPEG.pm:117-140 — Bit16-19 AudioBitrate, version 2 or 2.5, layer 1.
-static AUDIO_BITRATE_V2_L1: TagDef = TagDef::new(
-  "AudioBitrate",
-  "MPEG",
-  ValueConv::Hash(PrintConvHash::direct(VC_BR_V2_L1)),
-  PrintConv::Func(convert_bitrate),
-);
-// MPEG.pm:141-164 — Bit16-19 AudioBitrate, version 2 or 2.5, layer 2 or 3.
-static AUDIO_BITRATE_V2_L23: TagDef = TagDef::new(
-  "AudioBitrate",
-  "MPEG",
-  ValueConv::Hash(PrintConvHash::direct(VC_BR_V2_L23)),
-  PrintConv::Func(convert_bitrate),
-);
-
-// MPEG.pm:166-176 — Bit20-21 SampleRate, version 1.
-//   PrintConv 0 => 44100, 1 => 48000, 2 => 32000. NO ValueConv (-n shows raw).
-static SAMPLE_RATE_V1: TagDef = TagDef::new(
-  "SampleRate",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::I64(44100)),
-    ("1", PrintValue::I64(48000)),
-    ("2", PrintValue::I64(32000)),
-  ])),
-);
-// MPEG.pm:177-186 — Bit20-21 SampleRate, version 2.
-static SAMPLE_RATE_V2: TagDef = TagDef::new(
-  "SampleRate",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::I64(22050)),
-    ("1", PrintValue::I64(24000)),
-    ("2", PrintValue::I64(16000)),
-  ])),
-);
-// MPEG.pm:187-196 — Bit20-21 SampleRate, version 2.5.
-static SAMPLE_RATE_V25: TagDef = TagDef::new(
-  "SampleRate",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::I64(11025)),
-    ("1", PrintValue::I64(12000)),
-    ("2", PrintValue::I64(8000)),
-  ])),
-);
-
-// MPEG.pm:200-209 — Bit24-25 ChannelMode. RawConv sets MPEG_Mode.
-static CHANNEL_MODE: TagDef = TagDef::new(
-  "ChannelMode",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("Stereo")),
-    ("1", PrintValue::Str("Joint Stereo")),
-    ("2", PrintValue::Str("Dual Channel")),
-    ("3", PrintValue::Str("Single Channel")),
-  ])),
-)
-.with_raw_conv(RawConv::SetFrameState("MPEG_Mode"));
-
-// MPEG.pm:210-215 — Bit26 MSStereo (Condition: layer 3).
-static MS_STEREO: TagDef = TagDef::new(
-  "MSStereo",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("Off")),
-    ("1", PrintValue::Str("On")),
-  ])),
-);
-// MPEG.pm:216-221 — Bit27 IntensityStereo (Condition: layer 3).
-static INTENSITY_STEREO: TagDef = TagDef::new(
-  "IntensityStereo",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("Off")),
-    ("1", PrintValue::Str("On")),
-  ])),
-);
-// MPEG.pm:222-232 — Bit26-27 ModeExtension (Condition: layer 1 or 2).
-static MODE_EXTENSION: TagDef = TagDef::new(
-  "ModeExtension",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("Bands 4-31")),
-    ("1", PrintValue::Str("Bands 8-31")),
-    ("2", PrintValue::Str("Bands 12-31")),
-    ("3", PrintValue::Str("Bands 16-31")),
-  ])),
-);
-
-// MPEG.pm:233-239 — Bit28 CopyrightFlag. JSON quirk: True/False strings
-// serialize as `true`/`false` JSON booleans (handled by serialize.rs).
-static COPYRIGHT_FLAG: TagDef = TagDef::new(
-  "CopyrightFlag",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("False")),
-    ("1", PrintValue::Str("True")),
-  ])),
-);
-// MPEG.pm:240-246 — Bit29 OriginalMedia.
-static ORIGINAL_MEDIA: TagDef = TagDef::new(
-  "OriginalMedia",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("False")),
-    ("1", PrintValue::Str("True")),
-  ])),
-);
-// MPEG.pm:247-255 — Bit30-31 Emphasis.
-static EMPHASIS: TagDef = TagDef::new(
-  "Emphasis",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("None")),
-    ("1", PrintValue::Str("50/15 ms")),
-    ("2", PrintValue::Str("reserved")),
-    ("3", PrintValue::Str("CCIT J.17")),
-  ])),
-);
-
-// ───────────────────────── %MPEG::Xing (MPEG.pm:323-337) ─────────────────────────
-//
-// `GROUPS => { 2 => 'Audio' }`, `VARS => { ID_FMT => 'none' }`, keys 1..7.
-// Keys 1-3 (VBRFrames/VBRBytes/VBRScale) and 5/6 (LameVBRQuality/LameQuality)
-// are 32-bit big-endian unsigned values handled by the Perl
-// `HandleTag($xingTable, K, $val)` calls at MPEG.pm:515/521/532/564/565.
-// Key 4 (Encoder) is the 9-byte LAME version *or* the 20-byte fallback
-// substring (MPEG.pm:563/575/553). Key 7 (LameHeader) is the SubDirectory
-// for `%MPEG::Lame` — ExifTool documents this for the tag-list output but
-// `HandleTag` is never invoked for it, so we model only the metadata
-// (Name + SubDirectory pointer) and route to LAME parsing directly.
-
-// MPEG.pm:327 `1 => { Name => 'VBRFrames' }` — bare integer.
-static XING_VBR_FRAMES: TagDef = TagDef::new("VBRFrames", "MPEG", ValueConv::None, PrintConv::None);
-// MPEG.pm:328 `2 => { Name => 'VBRBytes' }` — bare integer.
-static XING_VBR_BYTES: TagDef = TagDef::new("VBRBytes", "MPEG", ValueConv::None, PrintConv::None);
-// MPEG.pm:329 `3 => { Name => 'VBRScale' }` — bare integer.
-static XING_VBR_SCALE: TagDef = TagDef::new("VBRScale", "MPEG", ValueConv::None, PrintConv::None);
-// MPEG.pm:330 `4 => { Name => 'Encoder' }` — string (9-byte LAME version OR
-// 20-byte fallback OR identified non-LAME encoder, MPEG.pm:553/563/575).
-static XING_ENCODER: TagDef = TagDef::new("Encoder", "MPEG", ValueConv::None, PrintConv::None);
-// MPEG.pm:331 `5 => { Name => 'LameVBRQuality' }` — bare integer.
-static XING_LAME_VBR_QUALITY: TagDef =
-  TagDef::new("LameVBRQuality", "MPEG", ValueConv::None, PrintConv::None);
-// MPEG.pm:332 `6 => { Name => 'LameQuality' }` — bare integer.
-static XING_LAME_QUALITY: TagDef =
-  TagDef::new("LameQuality", "MPEG", ValueConv::None, PrintConv::None);
-
-// ───────────────────────── %MPEG::Lame (MPEG.pm:339-382) ─────────────────────────
-//
-// `PROCESS_PROC => \&Image::ExifTool::ProcessBinaryData`, `GROUPS => { 2 =>
-// 'Audio' }`. 4 tags keyed by BYTE OFFSET within the LAME header (counting
-// from the 9-byte version string). Each carries `Mask`+`BitShift`:
-// ExifTool.pm:5905-5910 derives `BitShift` from the lowest set bit of
-// `Mask`, then ExifTool.pm:10067-10068 applies `($val & $mask) >>
-// $bitShift` BEFORE ValueConv. We inline that computation in the parser
-// (the runtime `with_mask`/Format-`int8u` plumbing is a forward item).
-//
-// Tags:
-//   9   LameMethod         Mask 0x0f, hash PrintConv (8 entries).
-//   10  LameLowPassFilter  ValueConv `$val * 100`; PrintConv "$val/1000 + ' kHz'".
-//   20  LameBitrate        ValueConv `$val * 1000`; PrintConv ConvertBitrate.
-//   24  LameStereoMode     Mask 0x1c (BitShift 2), hash PrintConv (7 entries).
-
-/// Faithful port of MPEG.pm:361 PrintConv `'($val / 1000) . " kHz"'` —
-/// integer/float divide-by-1000 + literal " kHz" suffix. ValueConv has
-/// already multiplied the raw byte by 100, so `LameLowPassFilter = byte *
-/// 100`; passing a value like 16000 yields `16 kHz`. Perl `.` is string
-/// concat; the integer 16 stringifies as `"16"` (no trailing `.0`), so a
-/// value-`is_finite` integer formats without a decimal point.
-fn lame_lowpass_print(val: &TagValue) -> TagValue {
-  let n = match val {
-    TagValue::I64(n) => *n as f64,
-    TagValue::F64(n) if n.is_finite() => *n,
-    TagValue::Str(s) => match s.parse::<f64>() {
-      Ok(n) if n.is_finite() => n,
-      _ => return val.clone(),
-    },
-    _ => return val.clone(),
-  };
-  let q = n / 1000.0;
-  // Perl `($val/1000) . " kHz"` — `/` is float divide. Stringification:
-  // an integer-valued float prints as the integer (`16`), a fractional
-  // value prints with the minimum digits Perl uses (`%g`-like).
-  let s = if (q - q.round()).abs() < f64::EPSILON {
-    format!("{}", q.round() as i64)
-  } else {
-    crate::value::format_g(q, 15)
-  };
-  TagValue::Str(format!("{s} kHz").into())
-}
-
-// MPEG.pm:344-357 — LameMethod, Mask 0x0f (no shift).
-static LAME_METHOD: TagDef = TagDef::new(
-  "LameMethod",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("1", PrintValue::Str("CBR")),
-    ("2", PrintValue::Str("ABR")),
-    ("3", PrintValue::Str("VBR (old/rh)")),
-    ("4", PrintValue::Str("VBR (new/mtrh)")),
-    ("5", PrintValue::Str("VBR (old/rh)")),
-    ("6", PrintValue::Str("VBR")),
-    ("8", PrintValue::Str("CBR (2-pass)")),
-    ("9", PrintValue::Str("ABR (2-pass)")),
-  ])),
-);
-
-// MPEG.pm:358-362 — LameLowPassFilter, ValueConv `$val * 100`, PrintConv
-// `($val / 1000) . " kHz"`.
-fn lame_lowpass_value(val: &TagValue) -> TagValue {
-  match val {
-    TagValue::I64(n) => TagValue::I64(n.saturating_mul(100)),
-    TagValue::F64(n) if n.is_finite() => TagValue::F64(*n * 100.0),
-    other => other.clone(),
+    let s = format_g(q, 15);
+    write!(w, "{s} kHz")
   }
 }
-static LAME_LOWPASS_FILTER: TagDef = TagDef::new(
-  "LameLowPassFilter",
-  "MPEG",
-  ValueConv::Func(lame_lowpass_value),
-  PrintConv::Func(lame_lowpass_print),
-);
 
-// MPEG.pm:364-368 — LameBitrate, ValueConv `$val * 1000`, PrintConv
-// `ConvertBitrate($val)`.
-fn lame_bitrate_value(val: &TagValue) -> TagValue {
-  match val {
-    TagValue::I64(n) => TagValue::I64(n.saturating_mul(1000)),
-    TagValue::F64(n) if n.is_finite() => TagValue::F64(*n * 1000.0),
-    other => other.clone(),
+// ===========================================================================
+// Typed enums (D8 newtype-only)
+// ===========================================================================
+
+/// MPEG audio version (Bit11-12). Raw 2-bit field; bundled PrintConv hash
+/// (MPEG.pm:25-33) maps 0 → 2.5, 2 → 2, 3 → 1; raw 1 is the reserved
+/// version ID, which is rejected upstream by `check_header`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpegAudioVersion {
+  /// raw=0 → "2.5".
+  V2_5,
+  /// raw=2 → "2".
+  V2,
+  /// raw=3 → "1".
+  V1,
+}
+
+impl MpegAudioVersion {
+  /// Decode the raw 2-bit field. Returns `None` for raw=1 (reserved); the
+  /// header-validation gate ensures this is unreachable from `scan_for_header`.
+  #[must_use]
+  pub const fn from_raw(raw: u8) -> Option<Self> {
+    match raw {
+      0 => Some(Self::V2_5),
+      2 => Some(Self::V2),
+      3 => Some(Self::V1),
+      _ => None,
+    }
+  }
+  /// Raw 2-bit encoding (the on-disk value).
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::V2_5 => 0,
+      Self::V2 => 2,
+      Self::V1 => 3,
+    }
   }
 }
-static LAME_BITRATE: TagDef = TagDef::new(
-  "LameBitrate",
-  "MPEG",
-  ValueConv::Func(lame_bitrate_value),
-  PrintConv::Func(convert_bitrate),
-);
 
-// MPEG.pm:369-381 — LameStereoMode, Mask 0x1c (BitShift 2 from
-// ExifTool.pm:5907-5909).
-static LAME_STEREO_MODE: TagDef = TagDef::new(
-  "LameStereoMode",
-  "MPEG",
-  ValueConv::None,
-  PrintConv::Hash(PrintConvHash::direct(&[
-    ("0", PrintValue::Str("Mono")),
-    ("1", PrintValue::Str("Stereo")),
-    ("2", PrintValue::Str("Dual Channels")),
-    ("3", PrintValue::Str("Joint Stereo")),
-    ("4", PrintValue::Str("Forced Joint Stereo")),
-    ("6", PrintValue::Str("Auto")),
-    ("7", PrintValue::Str("Intensity Stereo")),
-  ])),
-);
+/// MPEG audio layer (Bit13-14). Raw 2-bit field; bundled PrintConv hash
+/// (MPEG.pm:34-42) maps 1 → 3, 2 → 2, 3 → 1; raw 0 is reserved, rejected
+/// upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioLayer {
+  /// raw=1 → "Layer III".
+  L3,
+  /// raw=2 → "Layer II".
+  L2,
+  /// raw=3 → "Layer I".
+  L1,
+}
 
-// ───────────────────────── Cond chooser + bit-key list ─────────────────────────
+impl AudioLayer {
+  /// Decode the raw 2-bit field. Returns `None` for raw=0 (reserved).
+  #[must_use]
+  pub const fn from_raw(raw: u8) -> Option<Self> {
+    match raw {
+      1 => Some(Self::L3),
+      2 => Some(Self::L2),
+      3 => Some(Self::L1),
+      _ => None,
+    }
+  }
+  /// Raw 2-bit encoding.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::L3 => 1,
+      Self::L2 => 2,
+      Self::L1 => 3,
+    }
+  }
+  /// Display layer number (1..3) for PrintConv emission.
+  #[must_use]
+  pub const fn display(self) -> u8 {
+    match self {
+      Self::L3 => 3,
+      Self::L2 => 2,
+      Self::L1 => 1,
+    }
+  }
+}
 
-/// Sorted `Bit<a>-<b>` keys of `%MPEG::Audio` in ASCENDING bit-offset order
-/// (the Perl `sort keys %$tagTablePtr` order for MPEG.pm:25-256). Note the
-/// `Bit26` < `Bit26-27` < `Bit27` lex ordering — the chooser uses Condition
-/// to pick which of `Bit26`/`Bit27`/`Bit26-27` is emitted per frame (they
-/// are mutually exclusive: `Bit26`+`Bit27` for layer 3, `Bit26-27` for
-/// layer 1/2).
-const MPEG_AUDIO_BIT_KEYS: &[&str] = &[
-  "Bit11-12", // MPEGAudioVersion (RawConv writes MPEG_Vers)
-  "Bit13-14", // AudioLayer       (RawConv writes MPEG_Layer)
-  "Bit16-19", // AudioBitrate     (5 Condition arms on MPEG_Vers/MPEG_Layer)
-  "Bit20-21", // SampleRate       (3 Condition arms on MPEG_Vers)
-  "Bit24-25", // ChannelMode      (RawConv writes MPEG_Mode)
-  "Bit26",    // MSStereo         (Condition MPEG_Layer == 1, i.e. layer 3)
-  "Bit26-27", // ModeExtension    (Condition MPEG_Layer > 1, i.e. layer 1 or 2)
-  "Bit27",    // IntensityStereo  (Condition MPEG_Layer == 1)
-  "Bit28",    // CopyrightFlag
-  "Bit29",    // OriginalMedia
-  "Bit30-31", // Emphasis
-];
+/// MPEG audio bitrate (Bit16-19). Each (version, layer) tuple has its own
+/// 15-entry value-conv table (MPEG.pm:44-164); raw=0 maps to the `"free"`
+/// sentinel string; raw=15 (`0b1111`) is reserved, rejected upstream.
+/// `Known(bps)` holds the post-ValueConv bitrate in bps; `Free` is the
+/// `0 => 'free'` sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioBitrate {
+  /// raw=0 → "free" sentinel; ConvertBitrate IsFloat-rejects, passthrough.
+  Free,
+  /// Post-ValueConv bitrate in bps from the per-(version, layer) hash.
+  Known(u32),
+}
 
-/// Faithful chooser for each `Bit<a>-<b>` key in `%MPEG::Audio`. Implements
-/// the multi-arm Perl table: returns the first arm whose `Condition`
-/// matches the current `FrameState`, or `None` if every arm rejects.
-fn choose_mpeg_audio(key: &str, s: &FrameState) -> Option<&'static TagDef> {
-  match key {
-    "Bit11-12" => Some(&MPEG_AUDIO_VERSION), // unconditional
-    "Bit13-14" => Some(&AUDIO_LAYER),        // unconditional
-    "Bit16-19" => {
-      // 5 arms (MPEG.pm:44-164). Perl evaluates `Condition` IN ORDER and
-      // takes the FIRST match. Reads MPEG_Vers, MPEG_Layer (set above).
-      let v = s.get("MPEG_Vers");
-      let l = s.get("MPEG_Layer");
-      // MPEG.pm:47 — '$self->{MPEG_Vers} == 3 and $self->{MPEG_Layer} == 3'.
-      if v == Some(3) && l == Some(3) {
-        Some(&AUDIO_BITRATE_V1_L1)
-      // MPEG.pm:71 — '$self->{MPEG_Vers} == 3 and $self->{MPEG_Layer} == 2'.
-      } else if v == Some(3) && l == Some(2) {
-        Some(&AUDIO_BITRATE_V1_L2)
-      // MPEG.pm:95 — '$self->{MPEG_Vers} == 3 and $self->{MPEG_Layer} == 1'.
-      } else if v == Some(3) && l == Some(1) {
-        Some(&AUDIO_BITRATE_V1_L3)
-      // MPEG.pm:119 — '$self->{MPEG_Vers} != 3 and $self->{MPEG_Layer} == 3'.
-      } else if v.is_some() && v != Some(3) && l == Some(3) {
-        Some(&AUDIO_BITRATE_V2_L1)
-      // MPEG.pm:143 — '$self->{MPEG_Vers} != 3 and $self->{MPEG_Layer}'
-      // ("layer 2 or 3" per the Notes; '$self->{MPEG_Layer}' is Perl
-      // truthy — i.e. non-zero, AND defined). Layer values 1,2 in raw
-      // bits = "layer 3" and "layer 2"; layer raw=0 is "reserved" (the
-      // sync-scan rejects). So `l != Some(0)` AND `l.is_some()`. Note
-      // that `l == Some(3)` already matched the v2_l1 arm above — Perl's
-      // first-match semantics prevent the wrong arm here.
-      } else if v.is_some() && v != Some(3) && l.is_some() && l != Some(0) {
-        Some(&AUDIO_BITRATE_V2_L23)
-      } else {
-        None // every arm rejects (e.g. MPEG_Vers undef) — no tag.
-      }
+/// Channel mode (Bit24-25). Raw 2-bit field; PrintConv (MPEG.pm:200-209)
+/// maps 0 → Stereo, 1 → Joint Stereo, 2 → Dual Channel, 3 → Single Channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelMode {
+  /// raw=0 → "Stereo".
+  Stereo,
+  /// raw=1 → "Joint Stereo".
+  JointStereo,
+  /// raw=2 → "Dual Channel".
+  DualChannel,
+  /// raw=3 → "Single Channel".
+  SingleChannel,
+}
+
+impl ChannelMode {
+  /// Decode the raw 2-bit field. The bit-stream walker always produces
+  /// a valid 0..3 value (the field is unconditional).
+  #[must_use]
+  pub const fn from_raw(raw: u8) -> Self {
+    match raw & 0x03 {
+      0 => Self::Stereo,
+      1 => Self::JointStereo,
+      2 => Self::DualChannel,
+      _ => Self::SingleChannel,
     }
-    "Bit20-21" => {
-      // 3 arms (MPEG.pm:166-196). All read MPEG_Vers.
-      match s.get("MPEG_Vers") {
-        Some(3) => Some(&SAMPLE_RATE_V1),
-        Some(2) => Some(&SAMPLE_RATE_V2),
-        Some(0) => Some(&SAMPLE_RATE_V25),
-        _ => None,
-      }
+  }
+  /// Raw 2-bit encoding.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::Stereo => 0,
+      Self::JointStereo => 1,
+      Self::DualChannel => 2,
+      Self::SingleChannel => 3,
     }
-    "Bit24-25" => Some(&CHANNEL_MODE), // unconditional
-    "Bit26" => {
-      // MPEG.pm:212 — Condition '$self->{MPEG_Layer} == 1' (layer raw=1
-      // is Layer III, per the AudioLayer PrintConv).
-      if s.get("MPEG_Layer") == Some(1) {
-        Some(&MS_STEREO)
-      } else {
-        None
-      }
+  }
+  /// PrintConv string (MPEG.pm:200-209).
+  #[must_use]
+  pub const fn print_conv(self) -> &'static str {
+    match self {
+      Self::Stereo => "Stereo",
+      Self::JointStereo => "Joint Stereo",
+      Self::DualChannel => "Dual Channel",
+      Self::SingleChannel => "Single Channel",
     }
-    "Bit27" => {
-      // MPEG.pm:218 — same condition.
-      if s.get("MPEG_Layer") == Some(1) {
-        Some(&INTENSITY_STEREO)
-      } else {
-        None
-      }
+  }
+}
+
+/// ModeExtension (Bit26-27, condition Layer I or II). Raw 2-bit; PrintConv
+/// (MPEG.pm:222-232) maps 0 → "Bands 4-31", 1 → "Bands 8-31", 2 → "Bands
+/// 12-31", 3 → "Bands 16-31".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeExtension {
+  /// raw=0 → "Bands 4-31".
+  Bands4to31,
+  /// raw=1 → "Bands 8-31".
+  Bands8to31,
+  /// raw=2 → "Bands 12-31".
+  Bands12to31,
+  /// raw=3 → "Bands 16-31".
+  Bands16to31,
+}
+
+impl ModeExtension {
+  /// Decode the raw 2-bit field.
+  #[must_use]
+  pub const fn from_raw(raw: u8) -> Self {
+    match raw & 0x03 {
+      0 => Self::Bands4to31,
+      1 => Self::Bands8to31,
+      2 => Self::Bands12to31,
+      _ => Self::Bands16to31,
     }
-    "Bit26-27" => {
-      // MPEG.pm:224 — Condition '$self->{MPEG_Layer} > 1' (layer raw=2/3,
-      // i.e. Layer II / Layer I).
-      match s.get("MPEG_Layer") {
-        Some(l) if l > 1 => Some(&MODE_EXTENSION),
-        _ => None,
-      }
+  }
+  /// Raw 2-bit encoding.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::Bands4to31 => 0,
+      Self::Bands8to31 => 1,
+      Self::Bands12to31 => 2,
+      Self::Bands16to31 => 3,
     }
-    "Bit28" => Some(&COPYRIGHT_FLAG), // unconditional
-    "Bit29" => Some(&ORIGINAL_MEDIA), // unconditional
-    "Bit30-31" => Some(&EMPHASIS),    // unconditional
+  }
+  /// PrintConv string (MPEG.pm:222-232).
+  #[must_use]
+  pub const fn print_conv(self) -> &'static str {
+    match self {
+      Self::Bands4to31 => "Bands 4-31",
+      Self::Bands8to31 => "Bands 8-31",
+      Self::Bands12to31 => "Bands 12-31",
+      Self::Bands16to31 => "Bands 16-31",
+    }
+  }
+}
+
+/// Emphasis (Bit30-31). Raw 2-bit; PrintConv (MPEG.pm:247-255) maps 0 →
+/// "None", 1 → "50/15 ms", 2 → "reserved", 3 → "CCIT J.17". Raw=2 is
+/// validated as the "reserved emphasis" reject by `check_header`
+/// (MPEG.pm:484), so a parsed [`MpegAudioMeta`] never carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emphasis {
+  /// raw=0 → "None".
+  None,
+  /// raw=1 → "50/15 ms".
+  FiftyFifteen,
+  /// raw=2 → "reserved" (rejected upstream).
+  Reserved,
+  /// raw=3 → "CCIT J.17".
+  CcitJ17,
+}
+
+impl Emphasis {
+  /// Decode the raw 2-bit field.
+  #[must_use]
+  pub const fn from_raw(raw: u8) -> Self {
+    match raw & 0x03 {
+      0 => Self::None,
+      1 => Self::FiftyFifteen,
+      2 => Self::Reserved,
+      _ => Self::CcitJ17,
+    }
+  }
+  /// Raw 2-bit encoding.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::None => 0,
+      Self::FiftyFifteen => 1,
+      Self::Reserved => 2,
+      Self::CcitJ17 => 3,
+    }
+  }
+  /// PrintConv string (MPEG.pm:247-255).
+  #[must_use]
+  pub const fn print_conv(self) -> &'static str {
+    match self {
+      Self::None => "None",
+      Self::FiftyFifteen => "50/15 ms",
+      Self::Reserved => "reserved",
+      Self::CcitJ17 => "CCIT J.17",
+    }
+  }
+}
+
+/// LameMethod (MPEG.pm:344-357). Raw byte AND-masked with 0x0f; PrintConv
+/// hash maps 1..9. Note codes 5 and 3 both render `"VBR (old/rh)"`; we
+/// preserve the raw byte so `-n` mode emits the exact on-disk value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LameMethod {
+  /// raw=1 → "CBR".
+  Cbr,
+  /// raw=2 → "ABR".
+  Abr,
+  /// raw=3 → "VBR (old/rh)" (also raw=5).
+  VbrOldRh,
+  /// raw=4 → "VBR (new/mtrh)".
+  VbrNewMtrh,
+  /// raw=5 → "VBR (old/rh)" (same display as raw=3).
+  VbrOldRhV5,
+  /// raw=6 → "VBR".
+  Vbr,
+  /// raw=8 → "CBR (2-pass)".
+  Cbr2Pass,
+  /// raw=9 → "ABR (2-pass)".
+  Abr2Pass,
+  /// Unknown/out-of-table raw byte (rendered as raw integer under -j,
+  /// since the PrintConv hash hash-misses and the value passes through).
+  Unknown(u8),
+}
+
+impl LameMethod {
+  /// Decode the raw post-mask 0x0f value.
+  #[must_use]
+  pub const fn from_raw(masked: u8) -> Self {
+    match masked & 0x0f {
+      1 => Self::Cbr,
+      2 => Self::Abr,
+      3 => Self::VbrOldRh,
+      4 => Self::VbrNewMtrh,
+      5 => Self::VbrOldRhV5,
+      6 => Self::Vbr,
+      8 => Self::Cbr2Pass,
+      9 => Self::Abr2Pass,
+      other => Self::Unknown(other),
+    }
+  }
+  /// Raw post-mask value.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::Cbr => 1,
+      Self::Abr => 2,
+      Self::VbrOldRh => 3,
+      Self::VbrNewMtrh => 4,
+      Self::VbrOldRhV5 => 5,
+      Self::Vbr => 6,
+      Self::Cbr2Pass => 8,
+      Self::Abr2Pass => 9,
+      Self::Unknown(b) => b,
+    }
+  }
+  /// PrintConv name; `None` for an unknown raw (the value passes through
+  /// as the raw integer in the bundled emit path).
+  #[must_use]
+  pub const fn print_conv(self) -> Option<&'static str> {
+    match self {
+      Self::Cbr => Some("CBR"),
+      Self::Abr => Some("ABR"),
+      Self::VbrOldRh | Self::VbrOldRhV5 => Some("VBR (old/rh)"),
+      Self::VbrNewMtrh => Some("VBR (new/mtrh)"),
+      Self::Vbr => Some("VBR"),
+      Self::Cbr2Pass => Some("CBR (2-pass)"),
+      Self::Abr2Pass => Some("ABR (2-pass)"),
+      Self::Unknown(_) => None,
+    }
+  }
+}
+
+/// LameStereoMode (MPEG.pm:369-381). Raw byte masked 0x1c then right-
+/// shifted by 2 (BitShift derived from `Mask`'s lowest set bit per
+/// ExifTool.pm:5907-5909). PrintConv hash maps 0..7; raw=5 is absent
+/// from the hash and emits as the raw integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LameStereoMode {
+  /// raw=0 → "Mono".
+  Mono,
+  /// raw=1 → "Stereo".
+  Stereo,
+  /// raw=2 → "Dual Channels".
+  DualChannels,
+  /// raw=3 → "Joint Stereo".
+  JointStereo,
+  /// raw=4 → "Forced Joint Stereo".
+  ForcedJointStereo,
+  /// raw=6 → "Auto".
+  Auto,
+  /// raw=7 → "Intensity Stereo".
+  IntensityStereo,
+  /// Unknown/out-of-table raw byte (raw=5 / >=8); falls through to raw
+  /// integer emission.
+  Unknown(u8),
+}
+
+impl LameStereoMode {
+  /// Decode the post-mask+shift (`(b & 0x1c) >> 2`) value.
+  #[must_use]
+  pub const fn from_raw(shifted: u8) -> Self {
+    match shifted {
+      0 => Self::Mono,
+      1 => Self::Stereo,
+      2 => Self::DualChannels,
+      3 => Self::JointStereo,
+      4 => Self::ForcedJointStereo,
+      6 => Self::Auto,
+      7 => Self::IntensityStereo,
+      other => Self::Unknown(other),
+    }
+  }
+  /// Raw post-mask+shift value.
+  #[must_use]
+  pub const fn raw(self) -> u8 {
+    match self {
+      Self::Mono => 0,
+      Self::Stereo => 1,
+      Self::DualChannels => 2,
+      Self::JointStereo => 3,
+      Self::ForcedJointStereo => 4,
+      Self::Auto => 6,
+      Self::IntensityStereo => 7,
+      Self::Unknown(b) => b,
+    }
+  }
+  /// PrintConv name; `None` for an unknown raw.
+  #[must_use]
+  pub const fn print_conv(self) -> Option<&'static str> {
+    match self {
+      Self::Mono => Some("Mono"),
+      Self::Stereo => Some("Stereo"),
+      Self::DualChannels => Some("Dual Channels"),
+      Self::JointStereo => Some("Joint Stereo"),
+      Self::ForcedJointStereo => Some("Forced Joint Stereo"),
+      Self::Auto => Some("Auto"),
+      Self::IntensityStereo => Some("Intensity Stereo"),
+      Self::Unknown(_) => None,
+    }
+  }
+}
+
+// ===========================================================================
+// Typed Meta — `MpegAudioMeta<'a>`
+// ===========================================================================
+
+/// Typed MPEG audio metadata — the lib-first output of [`ProcessMpegAudio`].
+///
+/// Holds the **post-ValueConv** raw scalars (PrintConv is applied at emit
+/// time by [`MetaSinker::sink`], mirroring ExifTool's
+/// `$$self{OPTIONS}{PrintConv}` toggle). The audio frame header fields
+/// (MPEG.pm:23-256) are mandatory; the Xing/Info VBR fields (MPEG.pm:323-
+/// 337) and the LAME sub-table (MPEG.pm:339-382) are `Option<…>` because
+/// they only appear in files carrying the post-header VBR/LAME annotation.
+///
+/// **D8 — no public fields, accessors only.**
+///
+/// **Lifetimes.** `MpegAudioMeta` borrows the LAME Encoder string from the
+/// input buffer when it's a direct slice (LAME3.90+ 9-byte version or the
+/// pre-3.90 20-byte fallback) — held as [`Cow::Borrowed`]. Synthesized
+/// strings (`"RCA mp3PRO"`, `"Thomson mp3PRO <suffix>"`, `"Gogo (<3.0)"`)
+/// use [`Cow::Owned`].
+#[derive(Debug, Clone)]
+pub struct MpegAudioMeta<'a> {
+  // ───────────────────── Audio frame header (MPEG.pm:23-256) ─────────────────────
+  /// Bit11-12 MPEGAudioVersion (MPEG.pm:25-33).
+  mpeg_audio_version: MpegAudioVersion,
+  /// Bit13-14 AudioLayer (MPEG.pm:34-42).
+  audio_layer: AudioLayer,
+  /// Bit16-19 AudioBitrate (MPEG.pm:44-164) — post-ValueConv from the
+  /// per-(version, layer) hash; `Free` for raw=0.
+  audio_bitrate: AudioBitrate,
+  /// Bit20-21 SampleRate (MPEG.pm:166-196). Raw 0..2; the per-version
+  /// PrintConv hash maps to Hz. `0` for unmapped (defensive — the check
+  /// rejects raw=3).
+  sample_rate_raw: u8,
+  /// Bit24-25 ChannelMode (MPEG.pm:200-209).
+  channel_mode: ChannelMode,
+  /// Bit26 MSStereo (MPEG.pm:210-215) — emitted only when AudioLayer ==
+  /// Layer III (raw=1). Raw 0 or 1.
+  ms_stereo: Option<bool>,
+  /// Bit26-27 ModeExtension (MPEG.pm:222-232) — emitted only when
+  /// AudioLayer is Layer I or II.
+  mode_extension: Option<ModeExtension>,
+  /// Bit27 IntensityStereo (MPEG.pm:216-221) — emitted only when
+  /// AudioLayer == Layer III. Raw 0 or 1.
+  intensity_stereo: Option<bool>,
+  /// Bit28 CopyrightFlag (MPEG.pm:233-239).
+  copyright_flag: bool,
+  /// Bit29 OriginalMedia (MPEG.pm:240-246).
+  original_media: bool,
+  /// Bit30-31 Emphasis (MPEG.pm:247-255).
+  emphasis: Emphasis,
+  // ───────────────────── Xing/Info VBR tail (MPEG.pm:501-578) ─────────────────────
+  /// Xing key 1 — VBRFrames (MPEG.pm:327). Absent when not VBR / flag
+  /// bit 0x01 unset / Info-frame / truncated.
+  vbr_frames: Option<u32>,
+  /// Xing key 2 — VBRBytes (MPEG.pm:328).
+  vbr_bytes: Option<u32>,
+  /// Xing key 3 — VBRScale (MPEG.pm:329).
+  vbr_scale: Option<u32>,
+  /// Xing key 4 — Encoder (MPEG.pm:330). Either a borrowed slice of the
+  /// LAME version string (LAME3.90+ 9 bytes OR pre-3.90 20-byte
+  /// fallback) or a synthesized owned `String` (RCA/THOMSON/MPGE).
+  encoder: Option<Cow<'a, str>>,
+  /// Xing key 5 — LameVBRQuality (MPEG.pm:331). `int((100-vbrScale)/10)`
+  /// when LAME ≥ 3.90 AND `vbrScale ∈ [0, 100]` (with absent vbr_scale
+  /// substituting 0 — bundled Perl's undef-promotes-to-0 semantics).
+  lame_vbr_quality: Option<u8>,
+  /// Xing key 6 — LameQuality (MPEG.pm:332). `(100-vbrScale) % 10`,
+  /// same gates as `lame_vbr_quality`.
+  lame_quality: Option<u8>,
+  // ───────────────────── LAME sub-table (MPEG.pm:339-382) ─────────────────────
+  /// MPEG::Lame offset 9 — LameMethod, mask 0x0f (no shift).
+  lame_method: Option<LameMethod>,
+  /// MPEG::Lame offset 10 — LameLowPassFilter, raw byte * 100.
+  /// Stored as the post-ValueConv u32 (byte × 100); the PrintConv
+  /// `($val / 1000) . " kHz"` is applied at sink time.
+  lame_low_pass_filter: Option<u32>,
+  /// MPEG::Lame offset 20 — LameBitrate, raw byte * 1000. Stored as
+  /// post-ValueConv u32 bps; PrintConv ConvertBitrate at sink time.
+  lame_bitrate: Option<u32>,
+  /// MPEG::Lame offset 24 — LameStereoMode, mask 0x1c shifted right 2.
+  lame_stereo_mode: Option<LameStereoMode>,
+}
+
+impl MpegAudioMeta<'_> {
+  // ── Audio frame header accessors ───────────────────────────────────────
+
+  /// MPEGAudioVersion (Bit11-12).
+  #[must_use]
+  pub fn mpeg_audio_version(&self) -> MpegAudioVersion {
+    self.mpeg_audio_version
+  }
+  /// AudioLayer (Bit13-14).
+  #[must_use]
+  pub fn audio_layer(&self) -> AudioLayer {
+    self.audio_layer
+  }
+  /// AudioBitrate (Bit16-19) — post-ValueConv `Free`/`Known(bps)`.
+  #[must_use]
+  pub fn audio_bitrate(&self) -> AudioBitrate {
+    self.audio_bitrate
+  }
+  /// Raw SampleRate index (Bit20-21).
+  #[must_use]
+  pub fn sample_rate_raw(&self) -> u8 {
+    self.sample_rate_raw
+  }
+  /// SampleRate in Hz from the per-version PrintConv hash; `None` if the
+  /// raw value falls outside the table (defensive — the validation gate
+  /// rejects raw=3).
+  #[must_use]
+  pub fn sample_rate_hz(&self) -> Option<u32> {
+    sample_rate_lookup(self.mpeg_audio_version, self.sample_rate_raw)
+  }
+  /// ChannelMode (Bit24-25).
+  #[must_use]
+  pub fn channel_mode(&self) -> ChannelMode {
+    self.channel_mode
+  }
+  /// MSStereo (Bit26) — emitted only for Layer III.
+  #[must_use]
+  pub fn ms_stereo(&self) -> Option<bool> {
+    self.ms_stereo
+  }
+  /// ModeExtension (Bit26-27) — emitted only for Layer I/II.
+  #[must_use]
+  pub fn mode_extension(&self) -> Option<ModeExtension> {
+    self.mode_extension
+  }
+  /// IntensityStereo (Bit27) — emitted only for Layer III.
+  #[must_use]
+  pub fn intensity_stereo(&self) -> Option<bool> {
+    self.intensity_stereo
+  }
+  /// CopyrightFlag (Bit28).
+  #[must_use]
+  pub fn copyright_flag(&self) -> bool {
+    self.copyright_flag
+  }
+  /// OriginalMedia (Bit29).
+  #[must_use]
+  pub fn original_media(&self) -> bool {
+    self.original_media
+  }
+  /// Emphasis (Bit30-31).
+  #[must_use]
+  pub fn emphasis(&self) -> Emphasis {
+    self.emphasis
+  }
+
+  // ── Xing tail accessors ────────────────────────────────────────────────
+
+  /// VBRFrames (Xing key 1).
+  #[must_use]
+  pub fn vbr_frames(&self) -> Option<u32> {
+    self.vbr_frames
+  }
+  /// VBRBytes (Xing key 2).
+  #[must_use]
+  pub fn vbr_bytes(&self) -> Option<u32> {
+    self.vbr_bytes
+  }
+  /// VBRScale (Xing key 3).
+  #[must_use]
+  pub fn vbr_scale(&self) -> Option<u32> {
+    self.vbr_scale
+  }
+  /// Encoder (Xing key 4) — `Cow<'a, str>` borrowed from input for LAME
+  /// version strings; owned for synthesized fallback names.
+  #[must_use]
+  pub fn encoder(&self) -> Option<&str> {
+    self.encoder.as_deref()
+  }
+  /// LameVBRQuality (Xing key 5).
+  #[must_use]
+  pub fn lame_vbr_quality(&self) -> Option<u8> {
+    self.lame_vbr_quality
+  }
+  /// LameQuality (Xing key 6).
+  #[must_use]
+  pub fn lame_quality(&self) -> Option<u8> {
+    self.lame_quality
+  }
+
+  // ── LAME sub-table accessors ───────────────────────────────────────────
+
+  /// LameMethod (offset 9, mask 0x0f).
+  #[must_use]
+  pub fn lame_method(&self) -> Option<LameMethod> {
+    self.lame_method
+  }
+  /// LameLowPassFilter (offset 10, ValueConv `* 100`).
+  #[must_use]
+  pub fn lame_low_pass_filter(&self) -> Option<u32> {
+    self.lame_low_pass_filter
+  }
+  /// LameBitrate (offset 20, ValueConv `* 1000`).
+  #[must_use]
+  pub fn lame_bitrate(&self) -> Option<u32> {
+    self.lame_bitrate
+  }
+  /// LameStereoMode (offset 24, mask 0x1c shifted right 2).
+  #[must_use]
+  pub fn lame_stereo_mode(&self) -> Option<LameStereoMode> {
+    self.lame_stereo_mode
+  }
+}
+
+// ===========================================================================
+// Lookup tables — ValueConv hashes (MPEG.pm:44-196)
+// ===========================================================================
+
+/// MPEG.pm:44-164 — AudioBitrate ValueConv hash chooser. Returns the bps
+/// for raw 1..14, `AudioBitrate::Free` for raw 0; raw 15 is rejected
+/// upstream by `check_header`.
+const fn audio_bitrate_lookup(
+  version: MpegAudioVersion,
+  layer: AudioLayer,
+  raw: u8,
+) -> AudioBitrate {
+  // raw==0 ⇒ Free; raw==15 cannot reach this function (header validation rejects).
+  if raw == 0 {
+    return AudioBitrate::Free;
+  }
+  // MPEG.pm:50-66 / :74-90 / :98-114 / :122-138 / :146-162 tables.
+  // Selected by (version, layer) — `V1` ↔ MPEG_Vers==3, `L1` ↔ MPEG_Layer==3
+  // per the raw encoding (PrintConv inverts to display).
+  let table: &[u32] = match (version, layer) {
+    // MPEG.pm:44-68 — version 1 (V1), layer 1 (L1 display ⇒ raw L1).
+    (MpegAudioVersion::V1, AudioLayer::L1) => &[
+      32_000, 64_000, 96_000, 128_000, 160_000, 192_000, 224_000, 256_000, 288_000, 320_000,
+      352_000, 384_000, 416_000, 448_000,
+    ],
+    // MPEG.pm:69-92 — version 1, layer 2.
+    (MpegAudioVersion::V1, AudioLayer::L2) => &[
+      32_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000, 224_000,
+      256_000, 320_000, 384_000,
+    ],
+    // MPEG.pm:93-116 — version 1, layer 3.
+    (MpegAudioVersion::V1, AudioLayer::L3) => &[
+      32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000,
+      224_000, 256_000, 320_000,
+    ],
+    // MPEG.pm:117-140 — version 2 or 2.5, layer 1.
+    (MpegAudioVersion::V2 | MpegAudioVersion::V2_5, AudioLayer::L1) => &[
+      32_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 144_000, 160_000, 176_000,
+      192_000, 224_000, 256_000,
+    ],
+    // MPEG.pm:141-164 — version 2 or 2.5, layer 2 or 3.
+    (MpegAudioVersion::V2 | MpegAudioVersion::V2_5, AudioLayer::L2 | AudioLayer::L3) => &[
+      8_000, 16_000, 24_000, 32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000,
+      128_000, 144_000, 160_000,
+    ],
+  };
+  // raw 1..14 indexes table[0..=13]. raw==15 rejected upstream — defensive
+  // saturate to last entry. (Hand-written `min` to keep this `const fn` —
+  // `usize::min` is not yet stable as a const-trait call.)
+  let base = (raw as usize).saturating_sub(1);
+  let last = table.len() - 1;
+  let idx = if base < last { base } else { last };
+  AudioBitrate::Known(table[idx])
+}
+
+/// MPEG.pm:166-196 — SampleRate PrintConv hash chooser. Raw 0..2 only;
+/// raw==3 (reserved) rejected upstream by `check_header`.
+const fn sample_rate_lookup(version: MpegAudioVersion, raw: u8) -> Option<u32> {
+  // MPEG.pm:166-176 / :177-186 / :187-196 tables (3 entries each).
+  let table: [u32; 3] = match version {
+    MpegAudioVersion::V1 => [44_100, 48_000, 32_000], // MPEG.pm:166-176
+    MpegAudioVersion::V2 => [22_050, 24_000, 16_000], // MPEG.pm:177-186
+    MpegAudioVersion::V2_5 => [11_025, 12_000, 8_000], // MPEG.pm:187-196
+  };
+  match raw {
+    0..=2 => Some(table[raw as usize]),
     _ => None,
   }
 }
 
-// ───────────────────────── ParseMPEGAudio ─────────────────────────
+// ===========================================================================
+// Header validation — MPEG.pm:474-490
+// ===========================================================================
 
-/// Reject-reason from header validation (MPEG.pm:474-490). On reject, the
-/// Perl loop advances `pos` and retries:
-/// - sync-bits failure ⇒ `pos -= 2` (MPEG.pm:475).
-/// - validation failure ⇒ give up unless `$ext eq 'MP3'`, in which case
-///   `pos -= 1` and continue (MPEG.pm:487-490).
+/// Reject-reason from header validation (MPEG.pm:474-490).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderCheck {
   /// All checks passed — emit.
   Ok,
-  /// Top-11-bit sync failed (the `\xff` was a false alarm). Faithful Perl
-  /// is `pos -= 2` from the post-match position (MPEG.pm:475); our
-  /// `scan_for_header` sets `p = next_pos - 2 = start + 2` (the same
-  /// two-byte backup), with a `start + 1` fallback as a forward-progress
-  /// guard if that backup would land at-or-before `start` (impossible at
-  /// the current `next_pos = start + 4`, but defensive against any future
-  /// arithmetic change).
+  /// Top-11-bit sync failed (the `\xff` was a false alarm).
   Sync,
-  /// One of the field validations (version=01/layer=00/bitrate=0000-or-
-  /// 1111/sample-rate=11/emphasis=10) failed. If `mp3` mode (caller is
-  /// `ProcessMP3` in ID3.pm OR our `MP3` file-type), advance one byte and
-  /// retry; else give up.
+  /// One of the field validations failed.
   Validation,
 }
 
 /// Header validation per MPEG.pm:474-490. `word` is the 32-bit big-endian
 /// audio-frame header. `mp3` is the MPEG.pm:485 `$mp3` flag: when set,
-/// REQUIRE Layer III as well as the basic field validations (without it,
-/// the sync-scan is more permissive — i.e. accepts any of layers I-III).
+/// REQUIRE Layer III as well as the basic field validations.
 fn check_header(word: u32, mp3: bool) -> HeaderCheck {
   // MPEG.pm:474 — top 11 bits all set.
   if (word & 0xffe0_0000) != 0xffe0_0000 {
@@ -683,106 +844,143 @@ fn check_header(word: u32, mp3: bool) -> HeaderCheck {
   HeaderCheck::Ok
 }
 
-/// Faithful port of `Image::ExifTool::MPEG::ParseMPEGAudio`
-/// (MPEG.pm:464-580). Sync-scans the buffer for a valid MPEG audio frame
-/// header, validates, emits the `%MPEG::Audio` tags via
-/// [`process_bit_stream_cond`], and then delegates to [`parse_xing_lame`]
-/// for the post-header Xing/Info/LAME VBR tail (MPEG.pm:501-578; R1-F2
-/// port). The tail's many `last` exits leave already-emitted File:* and
-/// audio-frame tags in place and `ParseMPEGAudio` still returns 1.
-///
-/// Returns true on accept (emitted ≥ 1 tag and `set_file_type` was
-/// called); false on reject.
-///
-/// `mp3` mirrors MPEG.pm:466 `$mp3` — set when the caller has already
-/// narrowed the file-type to MP3 (Layer III only). Plumbed by the caller
-/// (`ProcessMp3::process` faithful to ID3.pm:1715-1717 — `my $mp3 = ($ext
-/// eq 'MUS') ? 0 : 1; # MUS files are MP2`), NOT recomputed from `ctx`,
-/// because the bundled algorithm explicitly drops the Layer III gate for
-/// `.mus` files (which are MP2). Recomputing it from `ctx.file_type()`
-/// would force Layer III validation on a valid Layer II `.mus` payload
-/// dispatched through `ProcessMp3` (Codex R3 finding).
-pub(crate) fn parse_mpeg_audio(ctx: &mut ParseContext<'_>, mp3: bool) -> bool {
-  // MPEG.pm:468 `$$et{FILE_EXT}` + MPEG.pm:466 `$mp3` flag (the caller's).
-  // We do the header sync first (read-only on `data`) then drop the
-  // immutable borrow before the mutable `set_file_type`/`metadata` calls.
-  // The sync-scan result captures everything we need so `data` can be
-  // re-borrowed (via the original lifetime stored in `ctx`) below.
-  let (header_word, pos_after_header) = {
-    let ext = ctx.ext().unwrap_or("");
-    let Some(result) = scan_for_header(ctx.data(), mp3, ext) else {
-      return false; // MPEG.pm:472 `return 0`
-    };
-    result
-  };
-
-  // MPEG.pm:496 `$et->SetFileType()` — finalize file type BEFORE emitting
-  // bit-stream tags. R8 pattern: this is the load-bearing call that
-  // persists even if a downstream path later returns false (the Xing tail,
-  // when ported). The seam's persist-on-reject contract handles that.
-  ctx.set_file_type(None, None, None);
-
-  let print_conv_enabled = ctx.print_conv_enabled();
-  let mut state = FrameState::new();
-  // MPEG.pm:498-499 — `ProcessFrameHeader($et, $tagTablePtr, $word)`.
-  // The 4-byte big-endian header word is laid out exactly as
-  // process_bit_stream_cond expects (bit 0 = MSB of byte 0).
-  let header_bytes = header_word.to_be_bytes();
-  process_bit_stream_cond(
-    &header_bytes,
-    BitOrder::Mm,
-    MPEG_AUDIO_BIT_KEYS,
-    "MPEG",
-    choose_mpeg_audio,
-    &mut state,
-    ctx.metadata(),
-    print_conv_enabled,
-  );
-
-  // MPEG.pm:501-578 — Xing/Info/LAME VBR tail. Reads relative to
-  // `pos_after_header` (Perl `pos($$buffPt)` at MPEG.pm:492). Faithful:
-  // the tail's many `last` exits leave the File:* + audio-frame tags in
-  // place (`$et->SetFileType()` already ran above) and `ParseMPEGAudio`
-  // still `return 1`s at MPEG.pm:580. We never `return 0` from here.
-  //
-  // Borrow-discipline: `ctx.data()` reborrows `&ctx` and `ctx.metadata()`
-  // reborrows `&mut ctx`, so a naive sequenced call would conflict. The
-  // split-borrow accessor `data_and_metadata()` returns both simultaneously
-  // (the two fields are disjoint in `ParseContext`), so `parse_xing_lame`
-  // takes a borrowed `&[u8]` — no clone of the scan buffer.
-  let (data, meta) = ctx.data_and_metadata();
-  parse_xing_lame(data, pos_after_header, &state, meta, print_conv_enabled);
-
-  true // MPEG.pm:580 `return 1`
+/// MPEG.pm:470-494 sync-scan loop. Returns `Some((word, pos_after))` where
+/// `word` is the validated 4-byte big-endian header word and `pos_after`
+/// is the Perl `pos($$buffPt)` right after the matched 4 bytes (MPEG.pm:
+/// 492). Returns `None` when the buffer is exhausted (no valid header
+/// found). The Xing/Info/LAME tail (MPEG.pm:501-578) reads relative to
+/// `pos_after`.
+fn scan_for_header(data: &[u8], mp3: bool, ext: &str) -> Option<(u32, usize)> {
+  let mut p = 0usize;
+  loop {
+    // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Find next `\xff`.
+    let ff = data[p..].iter().position(|&b| b == 0xff)?;
+    let start = p + ff;
+    if start + 4 > data.len() {
+      return None;
+    }
+    let word = u32::from_be_bytes([
+      data[start],
+      data[start + 1],
+      data[start + 2],
+      data[start + 3],
+    ]);
+    let next_pos = start + 4;
+    match check_header(word, mp3) {
+      HeaderCheck::Ok => return Some((word, next_pos)),
+      HeaderCheck::Sync => {
+        // MPEG.pm:474-476 — `pos -= 2`.
+        p = next_pos.saturating_sub(2);
+        if p <= start {
+          p = start + 1;
+        }
+      }
+      HeaderCheck::Validation => {
+        // MPEG.pm:486-490 — give up unless $ext eq 'MP3'.
+        if !ext.eq_ignore_ascii_case("MP3") {
+          return None;
+        }
+        // MPEG.pm:489 — `pos -= 1`.
+        p = next_pos.saturating_sub(1);
+        if p <= start {
+          p = start + 1;
+        }
+      }
+    }
+  }
 }
 
-// ───────────────────────── parse_xing_lame ─────────────────────────
+// ===========================================================================
+// Bit-field extraction from the 32-bit header word (MPEG.pm:23-256)
+// ===========================================================================
 
-/// Faithful port of MPEG.pm:501-578 — the VBR Xing/Info + LAME header tail
-/// of `ParseMPEGAudio`. Runs AFTER the audio frame header has been
-/// extracted (and `SetFileType` called); reads relative to `pos`, the
-/// Perl `pos($$buffPt)` right after the 4-byte header match.
-///
-/// Side-info offset (MPEG.pm:503): `$v == 3 ? ($m == 3 ? 17 : 32) : ($m
-/// == 3 ?  9 : 17)` where `$v = $$self{MPEG_Vers}`, `$m = $$self{MPEG_Mode}`.
-/// `pos += that offset`, then look for `^(Xing|Info)` in the next 8 bytes
-/// (MPEG.pm:506-508). Any length / magic / state failure exits the tail
-/// silently (Perl `last`) — caller still returns 1.
-fn parse_xing_lame(
-  buff: &[u8],
-  mut pos: usize,
-  state: &FrameState,
-  into: &mut crate::value::Metadata,
-  print_conv_enabled: bool,
-) {
-  // MPEG.pm:501-502 — `($$et{MPEG_Vers}, $$et{MPEG_Mode})`. Both must be
-  // defined; either being None aborts the tail (Perl `while (defined $v
-  // and defined $m)`).
-  let (Some(v), Some(m)) = (state.get("MPEG_Vers"), state.get("MPEG_Mode")) else {
-    return;
-  };
+/// Extract the typed audio-frame fields from the validated header word.
+/// Faithful 1:1 of the `%MPEG::Audio` bit-key table: each tag's
+/// `Bit<a>-<b>` is bits `[a..=b]` counting from MSB=0 of the 4-byte BE
+/// header. `process_bit_stream_cond` reads the word as 32 BE bits, so
+/// `Bit11-12` is `(word >> (31 - 12)) & 0x3` = `(word >> 19) & 0x3`.
+fn extract_header_fields(word: u32) -> Option<MpegAudioMeta<'static>> {
+  // Bit11-12: bits [11..=12] of the 32-bit BE word = mask 0x0018_0000, shift 19.
+  let version_raw = ((word >> 19) & 0x03) as u8;
+  let version = MpegAudioVersion::from_raw(version_raw)?;
+  // Bit13-14: mask 0x0006_0000, shift 17.
+  let layer_raw = ((word >> 17) & 0x03) as u8;
+  let layer = AudioLayer::from_raw(layer_raw)?;
+  // Bit16-19: mask 0x0000_f000, shift 12.
+  let bitrate_raw = ((word >> 12) & 0x0f) as u8;
+  let audio_bitrate = audio_bitrate_lookup(version, layer, bitrate_raw);
+  // Bit20-21: mask 0x0000_0c00, shift 10.
+  let sample_rate_raw = ((word >> 10) & 0x03) as u8;
+  // Bit24-25: mask 0x0000_00c0, shift 6.
+  let channel_raw = ((word >> 6) & 0x03) as u8;
+  let channel_mode = ChannelMode::from_raw(channel_raw);
+  // Layer III (raw L3 == 1) ⇒ MSStereo (Bit26) + IntensityStereo (Bit27).
+  // Layer I/II (raw 2/3) ⇒ ModeExtension (Bit26-27).
+  let ms_stereo;
+  let intensity_stereo;
+  let mode_extension;
+  if matches!(layer, AudioLayer::L3) {
+    // Bit26: mask 0x0000_0020, shift 5.
+    ms_stereo = Some(((word >> 5) & 0x01) != 0);
+    // Bit27: mask 0x0000_0010, shift 4.
+    intensity_stereo = Some(((word >> 4) & 0x01) != 0);
+    mode_extension = None;
+  } else {
+    // Bit26-27: mask 0x0000_0030, shift 4.
+    let me_raw = ((word >> 4) & 0x03) as u8;
+    mode_extension = Some(ModeExtension::from_raw(me_raw));
+    ms_stereo = None;
+    intensity_stereo = None;
+  }
+  // Bit28: mask 0x0000_0008, shift 3.
+  let copyright_flag = ((word >> 3) & 0x01) != 0;
+  // Bit29: mask 0x0000_0004, shift 2.
+  let original_media = ((word >> 2) & 0x01) != 0;
+  // Bit30-31: mask 0x0000_0003, shift 0.
+  let emphasis_raw = (word & 0x03) as u8;
+  let emphasis = Emphasis::from_raw(emphasis_raw);
+  Some(MpegAudioMeta {
+    mpeg_audio_version: version,
+    audio_layer: layer,
+    audio_bitrate,
+    sample_rate_raw,
+    channel_mode,
+    ms_stereo,
+    mode_extension,
+    intensity_stereo,
+    copyright_flag,
+    original_media,
+    emphasis,
+    vbr_frames: None,
+    vbr_bytes: None,
+    vbr_scale: None,
+    encoder: None,
+    lame_vbr_quality: None,
+    lame_quality: None,
+    lame_method: None,
+    lame_low_pass_filter: None,
+    lame_bitrate: None,
+    lame_stereo_mode: None,
+  })
+}
+
+// ===========================================================================
+// Xing/Info VBR tail + LAME sub-table (MPEG.pm:501-578)
+// ===========================================================================
+
+/// MPEG.pm:501-578 — the VBR Xing/Info + LAME header tail of
+/// `ParseMPEGAudio`. Runs AFTER the audio frame header has been extracted;
+/// reads relative to `pos`, the Perl `pos($$buffPt)` right after the 4-
+/// byte header match. Mutates the typed `meta` in place; any length /
+/// magic / state failure silently exits (Perl `last`) — leaving partial
+/// progress.
+fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut MpegAudioMeta<'a>) {
+  // MPEG.pm:501-502 — `($$et{MPEG_Vers}, $$et{MPEG_Mode})` must be defined.
+  let v = meta.mpeg_audio_version.raw();
+  let m = meta.channel_mode.raw();
   let len = buff.len();
-  // MPEG.pm:504 side-info offset.
+  // MPEG.pm:504 side-info offset:
+  //   $v == 3 ? ($m == 3 ? 17 : 32) : ($m == 3 ? 9 : 17)
   let side = if v == 3 {
     if m == 3 { 17 } else { 32 }
   } else if m == 3 {
@@ -792,10 +990,10 @@ fn parse_xing_lame(
   };
   pos = match pos.checked_add(side) {
     Some(n) => n,
-    None => return, // overflow guard (Perl runs in unbounded ints)
+    None => return,
   };
   // MPEG.pm:505 `last if $pos + 8 > $len`.
-  if pos.checked_add(8).map_or(true, |end| end > len) {
+  if pos.checked_add(8).is_none_or(|end| end > len) {
     return;
   }
   // MPEG.pm:506 `my $buff = substr($$buffPt, $pos, 8)`.
@@ -806,86 +1004,60 @@ fn parse_xing_lame(
   if !magic_is_xing && !magic_is_info {
     return;
   }
-  // MPEG.pm:510 `my $flags = unpack('x4N', $buff)` — bytes 4..8 of the
-  // 8-byte block as big-endian u32.
+  // MPEG.pm:510 `my $flags = unpack('x4N', $buff)`.
   let flags = u32::from_be_bytes([head8[4], head8[5], head8[6], head8[7]]);
-  // MPEG.pm:511 `my $isVBR = ($buff !~ /^Info/)` — Info-frame is CBR.
+  // MPEG.pm:511 `my $isVBR = ($buff !~ /^Info/)`.
   let is_vbr = !magic_is_info;
   // MPEG.pm:512 `$pos += 8`.
   pos += 8;
 
-  // Helper: emit a Xing tag via the convert pipeline (faithful HandleTag).
-  let emit = |into: &mut crate::value::Metadata, def: &'static TagDef, raw: TagValue| {
-    let out = crate::convert::apply(def, &raw, print_conv_enabled);
-    into.push(
-      crate::value::Group::new("MPEG", def.group1()),
-      def.name(),
-      out,
-    );
-  };
-
   // MPEG.pm:513-517 — VBRFrames (key 1).
-  let mut vbr_scale: Option<i64> = None;
+  let mut vbr_scale_inner: Option<u32> = None;
   if flags & 0x01 != 0 {
-    if pos.checked_add(4).map_or(true, |end| end > len) {
+    if pos.checked_add(4).is_none_or(|end| end > len) {
       return;
     }
     if is_vbr {
-      let n = i64::from(u32::from_be_bytes([
-        buff[pos],
-        buff[pos + 1],
-        buff[pos + 2],
-        buff[pos + 3],
-      ]));
-      emit(into, &XING_VBR_FRAMES, TagValue::I64(n));
+      let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
+      meta.vbr_frames = Some(n);
     }
     pos += 4;
   }
   // MPEG.pm:518-522 — VBRBytes (key 2).
   if flags & 0x02 != 0 {
-    if pos.checked_add(4).map_or(true, |end| end > len) {
+    if pos.checked_add(4).is_none_or(|end| end > len) {
       return;
     }
     if is_vbr {
-      let n = i64::from(u32::from_be_bytes([
-        buff[pos],
-        buff[pos + 1],
-        buff[pos + 2],
-        buff[pos + 3],
-      ]));
-      emit(into, &XING_VBR_BYTES, TagValue::I64(n));
+      let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
+      meta.vbr_bytes = Some(n);
     }
     pos += 4;
   }
   // MPEG.pm:523-527 — TOC (skipped; 100 bytes, no tag).
   if flags & 0x04 != 0 {
-    if pos.checked_add(100).map_or(true, |end| end > len) {
+    if pos.checked_add(100).is_none_or(|end| end > len) {
       return;
     }
     pos += 100;
   }
-  // MPEG.pm:528-533 — VBRScale (key 3) AND captured for LameVBRQuality/
+  // MPEG.pm:528-533 — VBRScale (key 3) AND captured for LameVBRQuality /
   // LameQuality at MPEG.pm:564-565.
   if flags & 0x08 != 0 {
-    if pos.checked_add(4).map_or(true, |end| end > len) {
+    if pos.checked_add(4).is_none_or(|end| end > len) {
       return;
     }
-    let n = i64::from(u32::from_be_bytes([
-      buff[pos],
-      buff[pos + 1],
-      buff[pos + 2],
-      buff[pos + 3],
-    ]));
-    vbr_scale = Some(n);
+    let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
+    vbr_scale_inner = Some(n);
     if is_vbr {
-      emit(into, &XING_VBR_SCALE, TagValue::I64(n));
+      meta.vbr_scale = Some(n);
     }
     pos += 4;
   }
   // MPEG.pm:535-558 — LAME branch.
   if flags & 0x10 != 0 {
     // MPEG.pm:537 `last if $pos + 348 > $len`.
-    if pos.checked_add(348).map_or(true, |end| end > len) {
+    if pos.checked_add(348).is_none_or(|end| end > len) {
       return;
     }
   } else if pos.checked_add(4).is_some_and(|end| end <= len) {
@@ -893,8 +1065,10 @@ fn parse_xing_lame(
     let lib = &buff[pos..pos + 4];
     if lib != b"LAME" && lib != b"GOGO" {
       // MPEG.pm:541-555 — fallback string matches across the whole buffer.
-      let encoder_str: Option<String> = if find_subseq(buff, b"RCA mp3PRO Encoder").is_some() {
-        Some("RCA mp3PRO".to_string())
+      let encoder_str: Option<Cow<'a, str>> = if find_subseq(buff, b"RCA mp3PRO Encoder").is_some()
+      {
+        // MPEG.pm:544 `$lib = 'RCA mp3PRO'`.
+        Some(Cow::Owned(String::from("RCA mp3PRO")))
       } else if let Some(n) = find_subseq(buff, b"THOMSON mp3PRO Encoder") {
         // MPEG.pm:545 `$lib = 'Thomson mp3PRO'`; MPEG.pm:546 `$n += 22`;
         // MPEG.pm:547 `$lib .= ' ' . substr($$buffPt, $n, 6) if length(
@@ -903,16 +1077,21 @@ fn parse_xing_lame(
         let n2 = n + 22;
         if n2 <= len && len - n2 >= 6 {
           s.push(' ');
-          s.push_str(&String::from_utf8_lossy(&buff[n2..n2 + 6]));
+          // Use lossy UTF-8 conversion for the 6-byte suffix (defensive;
+          // real files emit ASCII version tags).
+          let suffix = &buff[n2..n2 + 6];
+          s.push_str(&std::string::String::from_utf8_lossy(suffix));
         }
-        Some(s)
+        Some(Cow::Owned(s))
       } else if find_subseq(buff, b"MPGE").is_some() {
-        Some("Gogo (<3.0)".to_string())
+        // MPEG.pm:549-550 `$lib = 'Gogo (<3.0)'`.
+        Some(Cow::Owned(String::from("Gogo (<3.0)")))
       } else {
+        // MPEG.pm:551 `last` — no recognized encoder.
         None
       };
       if let Some(s) = encoder_str {
-        emit(into, &XING_ENCODER, TagValue::Str(s.into()));
+        meta.encoder = Some(s);
       }
       // MPEG.pm:556 `last` — exit the tail regardless.
       return;
@@ -926,43 +1105,41 @@ fn parse_xing_lame(
     return; // MPEG.pm:560 `last if $lameLen < 9`.
   }
   let enc = &buff[pos..pos + 9];
-  // MPEG.pm:562 `if ($enc ge 'LAME3.90')` — Perl `ge` is bytewise ASCII
-  // comparison; faithful via `>=` on the byte slice.
+  // MPEG.pm:562 `if ($enc ge 'LAME3.90')` — Perl `ge` is bytewise ASCII.
   if enc >= b"LAME3.90" as &[u8] {
-    // MPEG.pm:563 emit Encoder as the 9-byte version string.
-    let enc_str = String::from_utf8_lossy(enc).into_owned();
-    emit(into, &XING_ENCODER, TagValue::Str(enc_str.into()));
+    // MPEG.pm:563 emit Encoder as the 9-byte version string. Borrow from
+    // input when the bytes are valid UTF-8 (every real LAME-3.90+ tag is
+    // printable ASCII). Defensive lossy fallback otherwise.
+    let enc_cow = match core::str::from_utf8(enc) {
+      Ok(s) => Cow::Borrowed(s),
+      Err(_) => Cow::Owned(std::string::String::from_utf8_lossy(enc).into_owned()),
+    };
+    meta.encoder = Some(enc_cow);
     // MPEG.pm:563-565 — LameVBRQuality / LameQuality fire whenever
-    // `$vbrScale <= 100`. `$vbrScale` is declared `my $vbrScale;` at
-    // MPEG.pm:510 and ONLY assigned at MPEG.pm:531 inside `if ($flags &
-    // 0x08)`; absent that flag bit, it stays undef. Perl's `<=` on undef
-    // runs in numeric context — undef promotes to 0 (with a runtime
-    // "Use of uninitialized value" warning), so the comparison succeeds
-    // and the calc emits `LameVBRQuality = int((100-0)/10) = 10` and
-    // `LameQuality = (100-0) % 10 = 0`. Bundled `perl exiftool` on the
-    // VBR_no_vbrscale.mp3 fixture confirms byte-exact. Faithful port:
-    // substitute 0 when `vbr_scale` is None.
-    let scale = vbr_scale.unwrap_or(0);
-    if (0..=100).contains(&scale) {
-      emit(
-        into,
-        &XING_LAME_VBR_QUALITY,
-        TagValue::I64((100 - scale) / 10),
-      );
-      emit(into, &XING_LAME_QUALITY, TagValue::I64((100 - scale) % 10));
+    // `$vbrScale <= 100`. Bundled Perl: when the Xing flags don't set the
+    // VBRScale bit (0x08), `$vbrScale` stays undef and Perl's `<=` numeric
+    // comparison treats undef as 0 (with a runtime warning). Faithful:
+    // substitute 0 when `vbr_scale_inner` is None.
+    let scale = vbr_scale_inner.unwrap_or(0);
+    if scale <= 100 {
+      meta.lame_vbr_quality = Some(((100 - scale) / 10) as u8);
+      meta.lame_quality = Some(((100 - scale) % 10) as u8);
     }
     // MPEG.pm:568-573 — ProcessDirectory %MPEG::Lame at DirStart=$pos
-    // over the rest of the buffer. Faithful inline:
-    process_lame_binary(buff, pos, into, print_conv_enabled);
+    // over the rest of the buffer.
+    parse_lame_into(buff, pos, meta);
   } else {
     // MPEG.pm:575 — non-LAME-≥3.90 fallback: emit Encoder as a 20-byte
     // substring (cropped to remaining bytes).
     let want = pos + 20;
     let end = want.min(len);
-    let enc_str = String::from_utf8_lossy(&buff[pos..end]).into_owned();
-    emit(into, &XING_ENCODER, TagValue::Str(enc_str.into()));
+    let slice = &buff[pos..end];
+    let enc_cow = match core::str::from_utf8(slice) {
+      Ok(s) => Cow::Borrowed(s),
+      Err(_) => Cow::Owned(std::string::String::from_utf8_lossy(slice).into_owned()),
+    };
+    meta.encoder = Some(enc_cow);
   }
-  // MPEG.pm:577 `last` — single-pass while.
 }
 
 /// Search for `needle` anywhere within `haystack`, returning the byte
@@ -978,20 +1155,9 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Faithful port of `ProcessBinaryData` applied to `%MPEG::Lame` at
 /// `DirStart=$pos` with the buffer running to its end (MPEG.pm:568-573).
-/// Inlined here because `ProcessBinaryData` is otherwise unported; the
-/// LAME table has 4 byte-indexed tags (offsets 9/10/20/24) with optional
-/// `Mask` (ExifTool.pm:10067-10068 applies `($val & $mask) >>
-/// $$tagInfo{BitShift}` BEFORE ValueConv, with `BitShift` derived from
-/// `Mask`'s lowest set bit at ExifTool.pm:5905-5910).
-fn process_lame_binary(
-  buff: &[u8],
-  pos: usize,
-  into: &mut crate::value::Metadata,
-  print_conv_enabled: bool,
-) {
-  // Helper: read byte at offset (relative to `pos`), apply mask+shift,
-  // run through ValueConv/PrintConv, emit.
-  let read_byte = |buff: &[u8], offset: usize| -> Option<u8> {
+/// Inlined here because `ProcessBinaryData` is otherwise unported.
+fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut MpegAudioMeta<'a>) {
+  let read_byte = |offset: usize| -> Option<u8> {
     let abs = pos.checked_add(offset)?;
     if abs < buff.len() {
       Some(buff[abs])
@@ -999,113 +1165,423 @@ fn process_lame_binary(
       None
     }
   };
-  let emit = |into: &mut crate::value::Metadata, def: &'static TagDef, raw_byte: u8| {
-    let raw = TagValue::I64(i64::from(raw_byte));
-    let out = crate::convert::apply(def, &raw, print_conv_enabled);
-    into.push(
-      crate::value::Group::new("MPEG", def.group1()),
-      def.name(),
-      out,
-    );
-  };
-  // Offset 9: LameMethod, Mask 0x0f (BitShift 0 — lowest set bit at 0).
-  if let Some(b) = read_byte(buff, 9) {
-    emit(into, &LAME_METHOD, b & 0x0f);
+  // Offset 9: LameMethod, Mask 0x0f.
+  if let Some(b) = read_byte(9) {
+    meta.lame_method = Some(LameMethod::from_raw(b & 0x0f));
   }
-  // Offset 10: LameLowPassFilter, no Mask (whole byte).
-  if let Some(b) = read_byte(buff, 10) {
-    emit(into, &LAME_LOWPASS_FILTER, b);
+  // Offset 10: LameLowPassFilter, ValueConv `$val * 100`.
+  if let Some(b) = read_byte(10) {
+    meta.lame_low_pass_filter = Some(u32::from(b) * 100);
   }
-  // Offset 20: LameBitrate, no Mask.
-  if let Some(b) = read_byte(buff, 20) {
-    emit(into, &LAME_BITRATE, b);
+  // Offset 20: LameBitrate, ValueConv `$val * 1000`.
+  if let Some(b) = read_byte(20) {
+    meta.lame_bitrate = Some(u32::from(b) * 1000);
   }
-  // Offset 24: LameStereoMode, Mask 0x1c (BitShift 2 — lowest set bit at 2,
-  // ExifTool.pm:5907-5909 derivation).
-  if let Some(b) = read_byte(buff, 24) {
-    emit(into, &LAME_STEREO_MODE, (b & 0x1c) >> 2);
+  // Offset 24: LameStereoMode, Mask 0x1c shifted right 2.
+  if let Some(b) = read_byte(24) {
+    meta.lame_stereo_mode = Some(LameStereoMode::from_raw((b & 0x1c) >> 2));
   }
 }
 
-/// MPEG.pm:470-494 sync-scan loop. Returns `Some((word, pos_after))` where
-/// `word` is the validated 4-byte big-endian header word and `pos_after`
-/// is the Perl `pos($$buffPt)` right after the matched 4 bytes (MPEG.pm:
-/// 492). Returns `None` when the buffer is exhausted (no valid header
-/// found). The Xing/Info/LAME tail (MPEG.pm:501-578) reads relative to
-/// `pos_after`.
-fn scan_for_header(data: &[u8], mp3: bool, ext: &str) -> Option<(u32, usize)> {
-  let mut p = 0usize;
-  loop {
-    // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Find next `\xff`; the
-    // 3 bytes after must also exist (else give up).
-    let ff = data[p..].iter().position(|&b| b == 0xff)?;
-    let start = p + ff;
-    if start + 4 > data.len() {
-      return None; // MPEG.pm:472 (no full 4-byte match possible)
-    }
-    let word = u32::from_be_bytes([
-      data[start],
-      data[start + 1],
-      data[start + 2],
-      data[start + 3],
-    ]);
-    let next_pos = start + 4; // Perl `pos` after matching 4 bytes
-    match check_header(word, mp3) {
-      HeaderCheck::Ok => return Some((word, next_pos)),
-      HeaderCheck::Sync => {
-        // MPEG.pm:474-476 — `pos -= 2` so the next find can latch onto a
-        // `\xff` that started inside our candidate. We were at `pos =
-        // next_pos`; backing up by 2 lands at `next_pos - 2 = start + 2`.
-        // Our forward scan should pick up from there.
-        p = next_pos.saturating_sub(2);
-        // Guard: ensure forward progress (p MUST advance past start, else
-        // we'd re-find the same `\xff` and loop forever).
-        if p <= start {
-          p = start + 1;
-        }
-      }
-      HeaderCheck::Validation => {
-        // MPEG.pm:486-490 — give up unless $ext eq 'MP3'.
-        if !ext.eq_ignore_ascii_case("MP3") {
-          return None;
-        }
-        // MPEG.pm:489 — `pos -= 1`. We were at `next_pos = start + 4`;
-        // `pos -= 1` ⇒ next find starts at `start + 3`, ensuring the
-        // current `\xff` (at `start`) is past.
-        p = next_pos.saturating_sub(1);
-        if p <= start {
-          p = start + 1;
-        }
-      }
-    }
-  }
-}
+// ===========================================================================
+// `MpegAudioContext` — per-format Context<'a> (spec §6.4)
+// ===========================================================================
 
-// ───────────────────────── FormatParser registration ─────────────────────────
-
-/// MP3 / MPEG audio-frame parser. Registered in `formats::parser_for` at
-/// the `"MP3"` file-type slot (until the ID3 parallel PR lands; see
-/// module-header note).
+/// Per-format input view threaded into [`ProcessMpegAudio::parse`].
 ///
-/// This entry point applies the ID3.pm:1684-1729 `ProcessMP3` scan-buffer
-/// bound BEFORE delegating to [`parse_mpeg_audio`]: ID3.pm:1704
-/// `my $scanLen = ($$et{FILE_EXT} and $$et{FILE_EXT} eq 'MP3') ? 8192 : 256;`
-/// — when invoked from a non-MP3-extension context (ID3.pm `ProcessMP3`
-/// recovers MP3 from a stray sync byte in the first 256 bytes) we must
-/// not silently accept a candidate sync past that boundary. Without this
-/// bound, MP3 (weak magic) would falsely accept any file containing a
-/// late `\xff` followed by 3 bytes that pass `check_header` — exactly
-/// the gap Codex R1/F1 flagged.
+/// Spec §6.4 — leaf-but-chained: this format takes an already-bounded byte
+/// slice (the caller's `ProcessMp3::process_with_start_offset` applies
+/// the ID3.pm:1704 `$scanLen` bound BEFORE delegating). The `mp3` flag is
+/// derived from the file extension by the caller per ID3.pm:1715-1717 (a
+/// `.mus` extension drops the Layer III gate); `ext` is preserved for the
+/// MPEG.pm:486-490 `give up unless $ext eq 'MP3'` retry on validation
+/// reject.
+///
+/// The `&'a mut SharedFlags` reborrow is held for API-shape parity with
+/// the spec §6.4 chained-format Context; the MPEG audio parser itself
+/// neither reads nor writes any shared flag (the cross-format flags
+/// `DoneID3` / `DoneAPE` are touched by the ID3/APE pair, not here).
+pub struct MpegAudioContext<'a> {
+  data: &'a [u8],
+  /// MPEG.pm:466 `$mp3` — REQUIRE Layer III when set. Set by the caller
+  /// from the file extension (ID3.pm:1715-1717: `$ext eq 'MUS' ? 0 : 1`).
+  mp3: bool,
+  /// Uppercased file extension (e.g. `"MP3"`, `"MUS"`). MPEG.pm:468 reads
+  /// `$$et{FILE_EXT}`; the sync-scan uses this for the
+  /// validation-reject-retry gate at MPEG.pm:488 (`return 0 unless $ext
+  /// eq 'MP3'`).
+  ext: &'a str,
+  /// Shared cross-format flags — held for API-shape parity (spec §6.4);
+  /// unused by this format's parser.
+  #[allow(dead_code)]
+  shared: &'a mut SharedFlags,
+}
+
+impl<'a> MpegAudioContext<'a> {
+  /// Construct a context from an already-bounded byte slice + the file
+  /// extension (uppercased; the empty string disables the
+  /// validation-reject retry) + the caller-derived `mp3` flag.
+  ///
+  /// The `data` slice MUST be pre-bounded by the caller to the
+  /// ID3.pm:1704 `$scanLen` window (8192 for `.mp3`, 256 otherwise) —
+  /// `ProcessMp3::process_with_start_offset` applies that bound.
+  pub fn new(data: &'a [u8], ext: &'a str, mp3: bool, shared: &'a mut SharedFlags) -> Self {
+    Self {
+      data,
+      mp3,
+      ext,
+      shared,
+    }
+  }
+
+  /// Borrow the input bytes.
+  #[must_use]
+  pub fn data(&self) -> &'a [u8] {
+    self.data
+  }
+  /// Borrow the file extension string.
+  #[must_use]
+  pub fn ext(&self) -> &'a str {
+    self.ext
+  }
+  /// The MPEG.pm:466 `$mp3` flag.
+  #[must_use]
+  pub fn mp3(&self) -> bool {
+    self.mp3
+  }
+}
+
+// ===========================================================================
+// `ProcessMpegAudio` — the lib-first parser
+// ===========================================================================
+
+/// MPEG audio frame parser — faithful port of
+/// `Image::ExifTool::MPEG::ParseMPEGAudio` (MPEG.pm:464-580). Reads a
+/// 4-byte sync header followed by the optional Xing/Info VBR + LAME tail.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessMpegAudio;
+
+impl parser_sealed::Sealed for ProcessMpegAudio {}
+
+impl FormatParser for ProcessMpegAudio {
+  /// GAT: the Meta borrows its `encoder` field from the input `'a` (Codex
+  /// AF2).
+  type Meta<'a> = MpegAudioMeta<'a>;
+  type Context<'a> = MpegAudioContext<'a>;
+  type Error = MpegAudioError;
+
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpegAudioError> {
+    parse_inner(ctx.data, ctx.mp3, ctx.ext)
+  }
+}
+
+/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
+/// [`MpegAudioMeta`] that borrows from the input buffer (Encoder field).
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved for
+/// future I/O wrappers).
+pub fn parse_borrowed<'a>(
+  data: &'a [u8],
+  mp3: bool,
+  ext: &str,
+) -> Result<Option<MpegAudioMeta<'a>>, MpegAudioError> {
+  parse_inner(data, mp3, ext)
+}
+
+/// Inner parser — produces a borrow-from-input [`MpegAudioMeta`] (the
+/// `encoder` field borrows from `data`). The [`FormatParser::Meta`] GAT
+/// (`type Meta<'a> = MpegAudioMeta<'a>`) returns this borrowed form
+/// directly into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
+fn parse_inner<'a>(
+  data: &'a [u8],
+  mp3: bool,
+  ext: &str,
+) -> Result<Option<MpegAudioMeta<'a>>, MpegAudioError> {
+  // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Returns `None` ⇒ Ok(None)
+  // (Perl `return 0` BEFORE `$et->SetFileType()` at MPEG.pm:496).
+  let (word, pos_after_header) = match scan_for_header(data, mp3, ext) {
+    Some(pair) => pair,
+    None => return Ok(None),
+  };
+  // MPEG.pm:498-499 — `ProcessFrameHeader($et, $tagTablePtr, $word)`. The
+  // validated header word is bit-extracted into typed fields.
+  let mut meta = match extract_header_fields(word) {
+    Some(m) => m,
+    // Defensive: `extract_header_fields` returns None only when the
+    // version/layer raw values are reserved. `check_header` already
+    // rejected those; treat as unreachable but defensive.
+    None => return Ok(None),
+  };
+  // MPEG.pm:501-578 — Xing/Info VBR + LAME tail. Reads relative to
+  // `pos_after_header`. The tail's `last` exits leave whatever was already
+  // emitted in `meta` in place; the call always returns to the caller
+  // (no fatal modes).
+  parse_xing_lame_into(data, pos_after_header, &mut meta);
+  Ok(Some(meta))
+}
+
+// ===========================================================================
+// `MetaSinker` — typed Meta → TagWriter
+// ===========================================================================
+
+impl MetaSinker for MpegAudioMeta<'_> {
+  /// Emit MPEG tags into the writer in `%MPEG::Audio` walk order
+  /// (Bit11-12 → … → Bit30-31) then `%MPEG::Xing` keys 1..6 then
+  /// `%MPEG::Lame` offsets 9/10/20/24 — faithful to MPEG.pm:23-256 +
+  /// 323-337 + 339-382 iteration order.
+  ///
+  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
+  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    const GROUP: &str = "MPEG";
+
+    // ─── Bit11-12 MPEGAudioVersion ────────────────────────────────────
+    // -j (PrintConv hash): 0 → 2.5 (f64), 2 → 2 (i64), 3 → 1 (i64).
+    // -n (raw): u8 of the on-disk 2-bit field.
+    if print_conv {
+      match self.mpeg_audio_version {
+        MpegAudioVersion::V2_5 => out.write_f64(GROUP, "MPEGAudioVersion", 2.5)?,
+        MpegAudioVersion::V2 => out.write_u64(GROUP, "MPEGAudioVersion", 2)?,
+        MpegAudioVersion::V1 => out.write_u64(GROUP, "MPEGAudioVersion", 1)?,
+      }
+    } else {
+      out.write_u64(
+        GROUP,
+        "MPEGAudioVersion",
+        u64::from(self.mpeg_audio_version.raw()),
+      )?;
+    }
+
+    // ─── Bit13-14 AudioLayer ──────────────────────────────────────────
+    // -j (PrintConv hash): 1 → 3, 2 → 2, 3 → 1.
+    // -n (raw): u8 1..3 on-disk.
+    if print_conv {
+      out.write_u64(GROUP, "AudioLayer", u64::from(self.audio_layer.display()))?;
+    } else {
+      out.write_u64(GROUP, "AudioLayer", u64::from(self.audio_layer.raw()))?;
+    }
+
+    // ─── Bit16-19 AudioBitrate ────────────────────────────────────────
+    // -j: ConvertBitrate string. -n: post-ValueConv u32 OR the "free"
+    // sentinel string passthrough.
+    match (self.audio_bitrate, print_conv) {
+      (AudioBitrate::Free, _) => {
+        // "free" sentinel under -j: ConvertBitrate IsFloat-rejects ⇒
+        // returns the string unchanged. Under -n: bare ValueConv
+        // value is the string "free". Same emission either way.
+        out.write_str(GROUP, "AudioBitrate", "free")?;
+      }
+      (AudioBitrate::Known(bps), true) => {
+        out.write_fmt(GROUP, "AudioBitrate", |w| {
+          write_convert_bitrate(w, f64::from(bps))
+        })?;
+      }
+      (AudioBitrate::Known(bps), false) => {
+        out.write_u64(GROUP, "AudioBitrate", u64::from(bps))?;
+      }
+    }
+
+    // ─── Bit20-21 SampleRate ──────────────────────────────────────────
+    // -j (PrintConv hash): Hz integer from per-version table.
+    // -n (raw): u8 0..2 on-disk (no ValueConv).
+    if print_conv {
+      // If the version/raw combo is out of table (defensive), bundled
+      // ExifTool falls back to "Unknown (raw)" via PrintConv default
+      // — but raw=3 is rejected by `check_header`, so this branch is
+      // unreachable from a successful parse. Emit raw as u64 as a
+      // defensive fallback.
+      if let Some(hz) = self.sample_rate_hz() {
+        out.write_u64(GROUP, "SampleRate", u64::from(hz))?;
+      } else {
+        out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw))?;
+      }
+    } else {
+      out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw))?;
+    }
+
+    // ─── Bit24-25 ChannelMode ─────────────────────────────────────────
+    // -j: PrintConv string. -n: raw u8.
+    if print_conv {
+      out.write_str(GROUP, "ChannelMode", self.channel_mode.print_conv())?;
+    } else {
+      out.write_u64(GROUP, "ChannelMode", u64::from(self.channel_mode.raw()))?;
+    }
+
+    // ─── Bit26 MSStereo (Layer III only) ──────────────────────────────
+    // -j: "Off" / "On". -n: 0 / 1.
+    if let Some(b) = self.ms_stereo {
+      if print_conv {
+        out.write_str(GROUP, "MSStereo", if b { "On" } else { "Off" })?;
+      } else {
+        out.write_u64(GROUP, "MSStereo", u64::from(b))?;
+      }
+    }
+
+    // ─── Bit26-27 ModeExtension (Layer I/II only) ─────────────────────
+    // NOTE: bundled `sort keys %$tagTablePtr` orders `Bit26` <
+    // `Bit26-27` < `Bit27` (lex). For Layer III the chooser emits
+    // MSStereo (Bit26) and IntensityStereo (Bit27) and skips Bit26-27;
+    // for Layer I/II it emits ModeExtension (Bit26-27) and skips
+    // Bit26 + Bit27. Either way the emission order is monotonic.
+    if let Some(me) = self.mode_extension {
+      if print_conv {
+        out.write_str(GROUP, "ModeExtension", me.print_conv())?;
+      } else {
+        out.write_u64(GROUP, "ModeExtension", u64::from(me.raw()))?;
+      }
+    }
+
+    // ─── Bit27 IntensityStereo (Layer III only) ───────────────────────
+    if let Some(b) = self.intensity_stereo {
+      if print_conv {
+        out.write_str(GROUP, "IntensityStereo", if b { "On" } else { "Off" })?;
+      } else {
+        out.write_u64(GROUP, "IntensityStereo", u64::from(b))?;
+      }
+    }
+
+    // ─── Bit28 CopyrightFlag ──────────────────────────────────────────
+    // -j: "True" / "False" — serialize.rs translates the Str("True")
+    // / Str("False") into JSON booleans `true` / `false` (bundled
+    // quirk handled engine-side). -n: 0 / 1.
+    if print_conv {
+      out.write_str(
+        GROUP,
+        "CopyrightFlag",
+        if self.copyright_flag { "True" } else { "False" },
+      )?;
+    } else {
+      out.write_u64(GROUP, "CopyrightFlag", u64::from(self.copyright_flag))?;
+    }
+
+    // ─── Bit29 OriginalMedia ──────────────────────────────────────────
+    if print_conv {
+      out.write_str(
+        GROUP,
+        "OriginalMedia",
+        if self.original_media { "True" } else { "False" },
+      )?;
+    } else {
+      out.write_u64(GROUP, "OriginalMedia", u64::from(self.original_media))?;
+    }
+
+    // ─── Bit30-31 Emphasis ────────────────────────────────────────────
+    // -j: PrintConv string. -n: raw u8.
+    if print_conv {
+      out.write_str(GROUP, "Emphasis", self.emphasis.print_conv())?;
+    } else {
+      out.write_u64(GROUP, "Emphasis", u64::from(self.emphasis.raw()))?;
+    }
+
+    // ─── Xing keys 1..6 (MPEG.pm:327-332) ─────────────────────────────
+    // VBRFrames / VBRBytes / VBRScale / Encoder / LameVBRQuality /
+    // LameQuality — bare integers and the Encoder ASCII string.
+    if let Some(n) = self.vbr_frames {
+      out.write_u64(GROUP, "VBRFrames", u64::from(n))?;
+    }
+    if let Some(n) = self.vbr_bytes {
+      out.write_u64(GROUP, "VBRBytes", u64::from(n))?;
+    }
+    if let Some(n) = self.vbr_scale {
+      out.write_u64(GROUP, "VBRScale", u64::from(n))?;
+    }
+    if let Some(s) = self.encoder.as_deref() {
+      out.write_str(GROUP, "Encoder", s)?;
+    }
+    if let Some(n) = self.lame_vbr_quality {
+      out.write_u64(GROUP, "LameVBRQuality", u64::from(n))?;
+    }
+    if let Some(n) = self.lame_quality {
+      out.write_u64(GROUP, "LameQuality", u64::from(n))?;
+    }
+
+    // ─── LAME sub-table offsets 9/10/20/24 (MPEG.pm:344-381) ──────────
+
+    if let Some(method) = self.lame_method {
+      if print_conv {
+        if let Some(name) = method.print_conv() {
+          out.write_str(GROUP, "LameMethod", name)?;
+        } else {
+          // PrintConv hash miss: bundled emits the raw integer
+          // (PrintConv hash with no default — Perl's $$conv{$val}
+          // returns undef ⇒ HandleTag returns the input unchanged).
+          out.write_u64(GROUP, "LameMethod", u64::from(method.raw()))?;
+        }
+      } else {
+        out.write_u64(GROUP, "LameMethod", u64::from(method.raw()))?;
+      }
+    }
+    if let Some(v) = self.lame_low_pass_filter {
+      if print_conv {
+        out.write_fmt(GROUP, "LameLowPassFilter", |w| {
+          write_lame_lowpass(w, f64::from(v))
+        })?;
+      } else {
+        out.write_u64(GROUP, "LameLowPassFilter", u64::from(v))?;
+      }
+    }
+    if let Some(v) = self.lame_bitrate {
+      if print_conv {
+        out.write_fmt(GROUP, "LameBitrate", |w| {
+          write_convert_bitrate(w, f64::from(v))
+        })?;
+      } else {
+        out.write_u64(GROUP, "LameBitrate", u64::from(v))?;
+      }
+    }
+    if let Some(stereo) = self.lame_stereo_mode {
+      if print_conv {
+        if let Some(name) = stereo.print_conv() {
+          out.write_str(GROUP, "LameStereoMode", name)?;
+        } else {
+          out.write_u64(GROUP, "LameStereoMode", u64::from(stereo.raw()))?;
+        }
+      } else {
+        out.write_u64(GROUP, "LameStereoMode", u64::from(stereo.raw()))?;
+      }
+    }
+
+    Ok(())
+  }
+}
+
+// ===========================================================================
+// `MpegAudioError` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for MPEG audio parsing. Currently empty — every
+/// bad input produces `Ok(None)` (Perl `return 0`). Reserved for future
+/// I/O wrappers if streaming readers are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpegAudioError {}
+
+impl core::fmt::Display for MpegAudioError {
+  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match *self {}
+  }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for MpegAudioError {}
+
+// ===========================================================================
+// `ProcessMp3` — raw MPEG-audio entry preserving R5 fix API
+// ===========================================================================
+
+/// MP3 / MPEG audio-frame parser handle. The `"MP3"` file-type slot in
+/// [`crate::parser_new::any_parser_for`] always routes to
+/// [`crate::formats::id3::ProcessMp3`] (the ID3 wrapper); this struct's
+/// [`ProcessMp3::process_with_start_offset`] is the load-bearing entry for
+/// that wrapper's chained MPEG-audio invocation — its public method
+/// signature is preserved verbatim from the R5 fix.
 pub struct ProcessMp3;
 
 /// ID3.pm:1704 — `$scanLen` selection. Constant-fold-friendly helper so
 /// the bound is documented at the call site AND in unit tests.
 #[must_use]
 pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
-  // ID3.pm:1704: 8192 if FILE_EXT eq 'MP3', else 256. The Perl `eq`
-  // compares against the uppercased `$$self{FILE_EXT}` (ExifTool.pm:2966
-  // `GetFileExtension` returns it uppercased), so a case-insensitive
-  // match on the Rust side (which already uppercases) is faithful.
   if ext_is_mp3 { 8192 } else { 256 }
 }
 
@@ -1117,210 +1593,465 @@ impl ProcessMp3 {
   /// returns: when an ID3v2 prefix was found, the audio loop seeks PAST the
   /// header (offset = bundled `$hdrEnd` = ID3.pm:1504) so that
   /// `ParseMPEGAudio` gets a FRESH $scanLen-byte window starting at the
-  /// post-ID3 file position. Without this offset plumbing, a file with a
-  /// large ID3v2 tag (e.g. embedded APIC artwork >8 KiB) would lose all
-  /// MPEG audio tags because the 8192-byte scan window from offset 0 never
-  /// reaches the post-ID3 audio frame.
+  /// post-ID3 file position.
   ///
-  /// `start_offset` is bundled `$hdrEnd` (ID3.pm:1504). `0` reproduces the
-  /// no-ID3 / raw-MP3 path of the trait `process` impl (byte-exact).
-  /// `start_offset > data.len()` saturates to an empty slice (mirrors
-  /// bundled's seek-past-EOF behavior — same pattern as `ape::ape_slice`
-  /// at ape.rs:1024).
+  /// **F4 invariant: signature preserved verbatim from R5 fix.** The F2
+  /// ID3 agent's wrapper calls
+  /// `crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end)`
+  /// expecting `bool` return. Internally this drives the typed
+  /// [`ProcessMpegAudio`] parser + `MetaSinker` sink — same algorithm,
+  /// new shape.
   pub(crate) fn process_with_start_offset(
     &self,
     ctx: &mut ParseContext<'_>,
     start_offset: usize,
   ) -> bool {
-    // ID3.pm:1684-1729 `sub ProcessMP3`: when not ID3-tagged (raw-MP3
-    // path = `start_offset == 0`), the recover path is
-    // `$raf->Read($buff, $scanLen)` + `ParseMPEGAudio($et, \$buff, $mp3)`.
-    // When ID3-tagged, bundled does `$raf->Seek($hdrEnd, 0)` first
-    // (ID3.pm:1590) — the SAME read+parse pair, just from a non-zero file
-    // position. The Perl `$buff` is a HARD slice — the bytes BEYOND
-    // `$scanLen` are simply absent from the parser's view, so a late sync
-    // byte cannot be latched. We emulate by bounding `data` to
-    // `[start_offset..start_offset+scan_len]` BEFORE invoking
-    // `parse_mpeg_audio`; `set_file_type`'s first-call-wins guard makes
-    // the bounded buffer behave identically for the SetFileType branch.
-    //
-    // Borrow discipline: snapshot every immutable scalar/string input
-    // from `ctx` FIRST (owned `SmolStr` / `Copy` locals); only then
-    // grab `(&data, &mut meta)` via the disjoint-field split-borrow
-    // accessor `data_and_metadata()`. The bounded slice is then a
-    // sub-slice of the original `data` — no `Vec<u8>` copy.
+    // ID3.pm:1684-1729 `sub ProcessMP3`: bound the buffer to `$scanLen`
+    // BEFORE invoking the typed parser. The Perl `$buff` is a HARD slice
+    // — the bytes BEYOND `$scanLen` are simply absent from the parser's
+    // view, so a late sync byte cannot be latched (Codex R1/F1).
     let ext_is_mp3 = ctx.ext().is_some_and(|e| e.eq_ignore_ascii_case("MP3"));
     let scan_len = id3_process_mp3_scan_len(ext_is_mp3);
-    // ID3.pm:1715-1717 `my $ext = $$et{FILE_EXT} || ''; my $mp3 = ($ext eq
-    // 'MUS') ? 0 : 1;  # MUS files are MP2 / ParseMPEGAudio($et, \$buff,
-    // $mp3)`. The caller's `$mp3` flag is computed from the file
-    // extension, NOT from the candidate file-type: bundled drops the
-    // Layer III gate when FILE_EXT is `MUS` (Layer II audio dressed in a
-    // `.mus` container). Without this caller-plumbed flag, a valid Layer
-    // II `.mus` dispatched through `ProcessMp3` would be rejected by
-    // MPEG.pm:485's `$mp3` Layer III check (Codex R3 finding). Case-
-    // insensitive on the Rust side because `file_ext_for_name` already
-    // uppercases (faithful to the Perl `eq 'MUS'` comparing against an
-    // uppercased FILE_EXT from `GetFileExtension`, ExifTool.pm:2966).
-    let mp3 = !ctx.ext().is_some_and(|e| e.eq_ignore_ascii_case("MUS"));
-    // Owned snapshots of the non-data, non-metadata inputs (these reborrow
-    // `&self`, so they must complete before the split-borrow below — but
-    // they're tiny: SmolStr inline for the common short strings).
+    // ID3.pm:1715-1717 `my $mp3 = ($ext eq 'MUS') ? 0 : 1`. The caller's
+    // `$mp3` flag is computed from the file extension: bundled drops
+    // the Layer III gate when FILE_EXT is `MUS` (Layer II audio dressed
+    // in a `.mus` container; Codex R3 finding).
+    let mp3_flag = !ctx.ext().is_some_and(|e| e.eq_ignore_ascii_case("MUS"));
+    let print_conv_enabled = ctx.print_conv_enabled();
+    // Pull all scalar/string inputs into owned snapshots BEFORE the
+    // mutable split-borrow on `data_and_metadata`. Faithful to the
+    // pre-F4 bridge's borrow discipline.
+    let ext_owned: smol_str::SmolStr = ctx
+      .ext()
+      .map_or(smol_str::SmolStr::new_inline(""), smol_str::SmolStr::new);
     let file_type_owned: smol_str::SmolStr = smol_str::SmolStr::new(ctx.file_type());
     let parent_type_owned: smol_str::SmolStr = smol_str::SmolStr::new(ctx.parent_type());
     let header_skip = ctx.header_skip();
-    let ext_owned: Option<smol_str::SmolStr> = ctx.ext().map(smol_str::SmolStr::new);
-    let print_conv_enabled = ctx.print_conv_enabled();
-    // Split borrow: `(&data, &mut meta)` via disjoint fields — avoids the
-    // prior `data.to_vec()` (up to 8 KiB per `ProcessMp3::process` call).
-    let (data, meta) = ctx.data_and_metadata();
-    // Slice from `start_offset` (bundled `$raf->Seek($hdrEnd, 0)` at
-    // ID3.pm:1590). `get(start_offset..).unwrap_or(&[])` saturates to
-    // empty when `start_offset > data.len()` (faithful to bundled's
-    // seek-past-EOF: the subsequent `$raf->Read` returns 0 bytes and
-    // ParseMPEGAudio's scan finds nothing). Same pattern as `ape.rs:1024`.
+    let ext_for_sub: Option<smol_str::SmolStr> = if ext_owned.is_empty() {
+      None
+    } else {
+      Some(ext_owned.clone())
+    };
+    // Split borrow: `(&data, &mut writer)` via disjoint fields — avoids any
+    // `Vec<u8>` copy of the scan buffer.
+    let (data, meta) = ctx.data_and_writer();
     let post_id3 = data.get(start_offset..).unwrap_or(&[]);
     let bounded_len = scan_len.min(post_id3.len());
     let bounded = &post_id3[..bounded_len];
+    // Run the typed parser. The lib-first API takes data+ext+mp3.
+    let typed_meta = match parse_inner(bounded, mp3_flag, &ext_owned) {
+      Ok(Some(m)) => m,
+      Ok(None) => return false,
+      Err(_) => return false,
+    };
+    // MPEG.pm:496 `$et->SetFileType()` — finalize file type BEFORE
+    // sinking the typed Meta. The first-call-wins guard in
+    // `ParseContext::set_file_type` ensures any prior caller (e.g.
+    // ID3.pm:1521 `$et->SetFileType("MP3")`) wins — bridge stays no-op
+    // in the wrapped case. For the raw-MP3 path (start_offset==0,
+    // hdr_end==0) this is the first call and the File:* tags emit.
+    //
+    // We need a fresh `ParseContext` to call `set_file_type` since the
+    // accessors above split-borrowed `ctx`. Build a sub-context over
+    // the bounded slice carrying the original ctx's file_type/ext/etc.
     let mut sub = ParseContext::new(
       bounded,
       &file_type_owned,
       header_skip,
       &parent_type_owned,
-      ext_owned,
+      ext_for_sub,
       print_conv_enabled,
       meta,
     );
-    parse_mpeg_audio(&mut sub, mp3)
+    sub.set_file_type(None, None, None);
+    // Sink the typed Meta DIRECTLY into the engine `JsonTagWriter` — File:* +
+    // MPEG:* in MPEG.pm iteration order. The sink writes group="MPEG" for
+    // every tag, matching the bundled `-G1` family-1 group. (No adapter
+    // bridge, no separate output push-bag.)
+    let _: Result<(), core::convert::Infallible> =
+      typed_meta.sink(print_conv_enabled, sub.writer());
+    // MPEG.pm:580 `return 1`.
+    true
   }
 }
 
-impl FormatParser for ProcessMp3 {
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Raw-MP3 dispatch path (no preceding ID3) — `$hdrEnd == 0`. Delegates
-    // to the offset-aware variant with `start_offset = 0` so the bounded
-    // slice IS `data[..scan_len]` byte-for-byte unchanged.
+#[cfg(test)]
+impl ProcessMp3 {
+  /// Raw-MPEG-audio entry (no preceding ID3) — the `start_offset == 0`
+  /// convenience over [`Self::process_with_start_offset`]. Faithful order
+  /// (MPEG.pm:464-581): sync scan ⇒ `SetFileType` ⇒ bit-extract ⇒
+  /// Xing/LAME tail, driving the typed parser through `MetaSinker` →
+  /// `JsonTagWriter`. Test-only: the production raw-MP3 dispatch goes
+  /// through `id3::ProcessMp3` (the `MP3` file-type entry), which calls
+  /// `process_with_start_offset` after the ID3 pass.
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+    // Raw-MP3 dispatch path (no preceding ID3) — `$hdrEnd == 0`.
+    // Delegates to the offset-aware variant; the bounded slice IS
+    // `data[..scan_len]` byte-for-byte unchanged.
     self.process_with_start_offset(ctx, 0)
   }
 }
 
-// ───────────────────────── tests ─────────────────────────
+// ===========================================================================
+// Tests
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::value::Metadata;
+  use crate::{
+    json_writer::JsonTagWriter,
+    sink::{MapTagWriter, MapValue},
+    value::TagValue,
+  };
 
-  fn ctx_over<'a>(meta: &'a mut Metadata, data: &'a [u8], ft: &'a str) -> ParseContext<'a> {
+  fn ctx_over<'a>(meta: &'a mut JsonTagWriter, data: &'a [u8], ft: &'a str) -> ParseContext<'a> {
     let ext = crate::filetype::file_ext_for_name(meta.source_file());
     ParseContext::new(data, ft, 0, ft, ext, true, meta)
   }
 
+  // ───────────────────────── check_header ─────────────────────────
+
   #[test]
   fn check_header_basic_acceptance() {
-    // Faithful MPEG-1 Layer III header for 128 kbps / 44.1 kHz / Joint Stereo:
-    //   0xfffb904c (synthesized above; oracle: `perl exiftool mp3test.mp3`).
+    // MPEG-1 Layer III, 128 kbps / 44.1 kHz / Joint Stereo: 0xfffb904c.
     assert_eq!(check_header(0xfffb_904c, false), HeaderCheck::Ok);
-    assert_eq!(check_header(0xfffb_904c, true), HeaderCheck::Ok); // mp3 mode also Ok (Layer III)
+    assert_eq!(check_header(0xfffb_904c, true), HeaderCheck::Ok);
   }
 
   #[test]
   fn check_header_rejects_each_invalid_field() {
-    // Each fixture flips ONE byte of the canonical 0xfffb_904c header to
-    // trigger exactly one MPEG.pm:479-484 reject. Comments cite the Perl
-    // mask under test; the chosen word changes only the offending bits
-    // from the base header.
-
-    // MPEG.pm:479 — reserved version (Bit11-12 = 0b01 → byte 1 = 0xeb).
+    // MPEG.pm:479 — reserved version (Bit11-12 = 0b01).
     assert_eq!(check_header(0xffeb_9040, false), HeaderCheck::Validation);
-    // MPEG.pm:480 — reserved layer (Bit13-14 = 0b00 → byte 1 = 0xf9).
+    // MPEG.pm:480 — reserved layer.
     assert_eq!(check_header(0xfff9_9040, false), HeaderCheck::Validation);
-    // MPEG.pm:481 — "free" bitrate (Bit16-19 = 0b0000 → byte 2 = 0x00).
+    // MPEG.pm:481 — "free" bitrate.
     assert_eq!(check_header(0xfffb_0040, false), HeaderCheck::Validation);
-    // MPEG.pm:482 — bad bitrate (Bit16-19 = 0b1111 → byte 2 = 0xf0).
+    // MPEG.pm:482 — bad bitrate.
     assert_eq!(check_header(0xfffb_f040, false), HeaderCheck::Validation);
-    // MPEG.pm:483 — reserved sample-rate (Bit20-21 = 0b11 → byte 2 = 0x9c).
+    // MPEG.pm:483 — reserved sample-rate.
     assert_eq!(check_header(0xfffb_9c40, false), HeaderCheck::Validation);
-    // MPEG.pm:484 — reserved emphasis (Bit30-31 = 0b10 → byte 3 = 0x42).
+    // MPEG.pm:484 — reserved emphasis.
     assert_eq!(check_header(0xfffb_9042, false), HeaderCheck::Validation);
   }
 
   #[test]
   fn check_header_sync_reject() {
-    // Sync bits not all 1 (e.g. top byte 0x7f). Reports Sync (NOT
-    // Validation) so the scan advances by a different amount.
     assert_eq!(check_header(0x7fff_904c, false), HeaderCheck::Sync);
   }
 
   #[test]
   fn check_header_mp3_mode_rejects_non_layer3() {
-    // MPEG.pm:485 mask 0x060000 is the Layer raw bits (Bit13-14 of the
-    // word = byte 1 mask 0x06); mp3-mode requires `($word & 0x060000) ==
-    // 0x020000`, i.e. Layer raw = 1 (display "Layer III" via MPEG.pm:38
-    // `1 => 3`). Construct a Layer-II variant of the canonical Layer-III
-    // header 0xfffb_904c by flipping byte-1 mask 0x06 (0xfb → 0xfd):
+    // Layer II under mp3-mode ⇒ Validation reject. (0xfffb→0xfffd toggles Bit13-14.)
     assert_eq!(check_header(0xfffd_904c, true), HeaderCheck::Validation);
-    // Same header is valid OUTSIDE mp3-mode (Layer II is accepted when
-    // `ParseMPEGAudio` is called from a non-MP3 context, e.g.
-    // ParseMPEGAudioVideo).
+    // Same header is Ok outside mp3-mode.
     assert_eq!(check_header(0xfffd_904c, false), HeaderCheck::Ok);
   }
 
+  // ───────────────────────── scan_for_header ─────────────────────────
+
   #[test]
   fn scan_finds_header_at_offset() {
-    // Build a fixture with 3 leading garbage bytes then the valid header.
-    let mut data = vec![0x00u8, 0x12, 0x34]; // garbage
+    let mut data = vec![0x00u8, 0x12, 0x34];
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    // Word found, `pos_after` is `start + 4` = 3 + 4 = 7.
     assert_eq!(scan_for_header(&data, false, "MP3"), Some((0xfffb_904c, 7)));
   }
 
   #[test]
   fn scan_skips_false_ff_then_finds_real_header() {
-    // A `\xff` followed by 0x12 (sync bits fail) must NOT abort the scan —
-    // we advance and find the real header later.
-    let mut data = vec![0xff, 0x12, 0x34, 0x56]; // false sync (sync-bit fail)
+    let mut data = vec![0xff, 0x12, 0x34, 0x56];
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
-    // Real header starts at offset 4 ⇒ `pos_after` = 8.
     assert_eq!(scan_for_header(&data, false, "MP3"), Some((0xfffb_904c, 8)));
   }
 
   #[test]
   fn scan_validation_reject_outside_mp3_ext_gives_up() {
-    // A `\xff` followed by validation-fail (free bitrate). Without `$ext eq
-    // MP3`, MPEG.pm:488 returns 0 immediately.
-    let data = [0xff, 0xfb, 0x00, 0x40]; // free bitrate (Validation reject)
-    assert!(scan_for_header(&data, false, "WAV").is_none()); // non-MP3 ext: give up
+    let data = [0xff, 0xfb, 0x00, 0x40];
+    assert!(scan_for_header(&data, false, "WAV").is_none());
   }
 
   #[test]
   fn scan_validation_reject_inside_mp3_ext_keeps_scanning() {
-    // With ext=MP3, validation rejects advance and retry. Append a real
-    // header after the bad bytes:
-    let mut data = vec![0xff, 0xfb, 0x00, 0x40]; // bad bitrate
+    let mut data = vec![0xff, 0xfb, 0x00, 0x40];
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
-    // Real header starts at offset 4 ⇒ `pos_after` = 8.
     assert_eq!(scan_for_header(&data, false, "MP3"), Some((0xfffb_904c, 8)));
   }
 
+  // ───────────────────────── typed Meta extraction ─────────────────────────
+
   #[test]
-  fn parse_emits_expected_tags_print_on() {
-    // Synthesized 4-byte header followed by 413 zero bytes (we don't reach
-    // the Xing tail).
+  fn extract_header_fields_decodes_v1_l3_128k_441_js() {
+    let m = extract_header_fields(0xfffb_904c).expect("typed extraction");
+    assert_eq!(m.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(m.audio_layer(), AudioLayer::L3);
+    assert_eq!(m.audio_bitrate(), AudioBitrate::Known(128_000));
+    assert_eq!(m.sample_rate_raw(), 0);
+    assert_eq!(m.sample_rate_hz(), Some(44_100));
+    assert_eq!(m.channel_mode(), ChannelMode::JointStereo);
+    assert_eq!(m.ms_stereo(), Some(false));
+    assert_eq!(m.intensity_stereo(), Some(false));
+    assert_eq!(m.mode_extension(), None); // Layer III ⇒ no mode extension
+    assert!(m.copyright_flag());
+    assert!(m.original_media());
+    assert_eq!(m.emphasis(), Emphasis::None);
+  }
+
+  #[test]
+  fn extract_header_fields_decodes_layer2_mode_extension() {
+    // Layer II header: 0xfffd904c — V1, L2 (raw=2), 160 kbps (raw=9 → V1L2[8]=160000),
+    // sample rate index 0 (44100), JS, ME raw=0 ("Bands 4-31").
+    let m = extract_header_fields(0xfffd_904c).expect("layer 2 extraction");
+    assert_eq!(m.audio_layer(), AudioLayer::L2);
+    assert_eq!(m.audio_bitrate(), AudioBitrate::Known(160_000));
+    assert_eq!(m.ms_stereo(), None);
+    assert_eq!(m.intensity_stereo(), None);
+    assert_eq!(m.mode_extension(), Some(ModeExtension::Bands4to31));
+  }
+
+  // ───────────────────────── parse_borrowed direct entry ─────────────────────────
+
+  #[test]
+  fn parse_borrowed_extracts_fixture_fields() {
+    // Bundled fixture MP3.mp3 — 4-byte canonical header at offset 0 +
+    // payload bytes; the Xing tail is absent (no Xing/Info magic).
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let meta = parse_borrowed(&bytes, true, "MP3")
+      .expect("ok")
+      .expect("parsed");
+    assert_eq!(meta.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(meta.audio_layer(), AudioLayer::L3);
+    assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
+    assert_eq!(meta.sample_rate_hz(), Some(44_100));
+    assert_eq!(meta.channel_mode(), ChannelMode::JointStereo);
+    assert_eq!(meta.encoder(), None); // no Xing/Info magic
+  }
+
+  #[test]
+  fn parse_borrowed_rejects_short_buffer() {
+    assert!(parse_borrowed(&[], true, "MP3").unwrap().is_none());
+    assert!(
+      parse_borrowed(&[0xff, 0xfb], true, "MP3")
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn parse_borrowed_rejects_bad_sync() {
+    let data = [0x00; 32];
+    assert!(parse_borrowed(&data, true, "MP3").unwrap().is_none());
+  }
+
+  // ───────────────────────── ConvertBitrate ─────────────────────────
+
+  fn fmt_bitrate(b: f64) -> std::string::String {
+    let mut s = std::string::String::new();
+    write_convert_bitrate(&mut s, b).unwrap();
+    s
+  }
+
+  #[test]
+  fn convert_bitrate_matches_perl_oracle() {
+    assert_eq!(fmt_bitrate(8_000.0), "8 kbps");
+    assert_eq!(fmt_bitrate(64_000.0), "64 kbps");
+    assert_eq!(fmt_bitrate(128_000.0), "128 kbps");
+    assert_eq!(fmt_bitrate(320_000.0), "320 kbps");
+    assert_eq!(fmt_bitrate(448_000.0), "448 kbps");
+    assert_eq!(fmt_bitrate(1_000_000.0), "1 Mbps");
+    assert_eq!(fmt_bitrate(2_500_000.0), "2.5 Mbps");
+    assert_eq!(fmt_bitrate(10_000_000_000.0), "10 Gbps");
+  }
+
+  // ───────────────────────── LameLowPass ─────────────────────────
+
+  fn fmt_lowpass(v: f64) -> std::string::String {
+    let mut s = std::string::String::new();
+    write_lame_lowpass(&mut s, v).unwrap();
+    s
+  }
+
+  #[test]
+  fn lame_lowpass_integer_and_fractional() {
+    assert_eq!(fmt_lowpass(16_000.0), "16 kHz");
+    assert_eq!(fmt_lowpass(16_500.0), "16.5 kHz");
+  }
+
+  // ───────────────────────── MetaSinker (MapTagWriter) ─────────────────────────
+
+  fn collect(buf: &[u8], print_conv: bool) -> MapTagWriter {
+    let mut w = MapTagWriter::new();
+    let meta = parse_borrowed(buf, true, "MP3")
+      .expect("ok")
+      .expect("parsed");
+    meta.sink(print_conv, &mut w).unwrap();
+    w
+  }
+
+  #[test]
+  fn meta_sinker_emits_expected_tags_print_on() {
+    // Synthesized canonical Layer III header + zero payload.
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let w = collect(&data, true);
+    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    assert_eq!(g("MPEGAudioVersion"), Some("1".into()));
+    assert_eq!(g("AudioLayer"), Some("3".into()));
+    assert_eq!(g("AudioBitrate"), Some("128 kbps".into()));
+    assert_eq!(g("SampleRate"), Some("44100".into()));
+    assert_eq!(g("ChannelMode"), Some("Joint Stereo".into()));
+    assert_eq!(g("MSStereo"), Some("Off".into()));
+    assert_eq!(g("IntensityStereo"), Some("Off".into()));
+    assert_eq!(g("CopyrightFlag"), Some("True".into()));
+    assert_eq!(g("OriginalMedia"), Some("True".into()));
+    assert_eq!(g("Emphasis"), Some("None".into()));
+    // No Xing tail.
+    assert_eq!(g("VBRFrames"), None);
+    assert_eq!(g("Encoder"), None);
+  }
+
+  #[test]
+  fn meta_sinker_emits_expected_tags_print_off() {
+    let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
+    data.extend(std::iter::repeat(0).take(413));
+    let w = collect(&data, false);
+    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    // -n: raw on-disk values + post-ValueConv numerics.
+    assert_eq!(g("MPEGAudioVersion"), Some("3".into())); // raw V1==3
+    assert_eq!(g("AudioLayer"), Some("1".into())); // raw L3==1
+    assert_eq!(g("AudioBitrate"), Some("128000".into())); // post-VC u32
+    assert_eq!(g("SampleRate"), Some("0".into())); // raw 0 (no VC in this tag)
+    assert_eq!(g("ChannelMode"), Some("1".into())); // raw JS==1
+    assert_eq!(g("MSStereo"), Some("0".into()));
+    assert_eq!(g("IntensityStereo"), Some("0".into()));
+    assert_eq!(g("CopyrightFlag"), Some("1".into()));
+    assert_eq!(g("OriginalMedia"), Some("1".into()));
+    assert_eq!(g("Emphasis"), Some("0".into()));
+  }
+
+  // ───────────────────────── Xing/LAME tail ─────────────────────────
+
+  /// Build a minimal VBR Xing+LAME MP3 in memory: header 0xfffb_904c
+  /// (MPEG-1 / Layer III / 128 kbps / 44.1 kHz / JointStereo) + 32-byte
+  /// side-info + "Xing"+flags+VBRFrames/Bytes+TOC+Scale + 348-byte LAME
+  /// block (`LAME3.99r\x04\xa0...0x80...0x0c...`).
+  fn build_vbr_xing_lame_fixture() -> std::vec::Vec<u8> {
+    let mut d = std::vec::Vec::with_capacity(504);
+    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
+    d.extend(std::iter::repeat(0).take(32));
+    d.extend_from_slice(b"Xing");
+    d.extend_from_slice(&0x1fu32.to_be_bytes()); // frames|bytes|toc|scale|lame
+    d.extend_from_slice(&1000u32.to_be_bytes());
+    d.extend_from_slice(&200_000u32.to_be_bytes());
+    d.extend(std::iter::repeat(0).take(100));
+    d.extend_from_slice(&78u32.to_be_bytes());
+    let start = d.len();
+    d.extend(std::iter::repeat(0).take(348));
+    let stamp = |buf: &mut std::vec::Vec<u8>, off: usize, b: u8| buf[start + off] = b;
+    for (i, b) in b"LAME3.99r".iter().enumerate() {
+      stamp(&mut d, i, *b);
+    }
+    stamp(&mut d, 9, 0x04); // LameMethod: mask 0x0f → 4 → "VBR (new/mtrh)"
+    stamp(&mut d, 10, 0xa0); // LameLowPassFilter: 0xa0=160 ×100 = 16000
+    stamp(&mut d, 20, 0x80); // LameBitrate: 0x80=128 ×1000 = 128000
+    stamp(&mut d, 24, 0x0c); // LameStereoMode: (0x0c & 0x1c)>>2 = 3 → "Joint Stereo"
+    d
+  }
+
+  #[test]
+  fn xing_lame_emits_typed_tags_print_on() {
+    let data = build_vbr_xing_lame_fixture();
+    let w = collect(&data, true);
+    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    assert_eq!(g("VBRFrames"), Some("1000".into()));
+    assert_eq!(g("VBRBytes"), Some("200000".into()));
+    assert_eq!(g("VBRScale"), Some("78".into()));
+    assert_eq!(g("Encoder"), Some("LAME3.99r".into()));
+    assert_eq!(g("LameVBRQuality"), Some("2".into()));
+    assert_eq!(g("LameQuality"), Some("2".into()));
+    assert_eq!(g("LameMethod"), Some("VBR (new/mtrh)".into()));
+    assert_eq!(g("LameLowPassFilter"), Some("16 kHz".into()));
+    assert_eq!(g("LameBitrate"), Some("128 kbps".into()));
+    assert_eq!(g("LameStereoMode"), Some("Joint Stereo".into()));
+  }
+
+  #[test]
+  fn xing_lame_emits_typed_tags_print_off() {
+    let data = build_vbr_xing_lame_fixture();
+    let w = collect(&data, false);
+    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    // VBRFrames, VBRBytes, VBRScale — no conversions.
+    assert_eq!(g("VBRFrames"), Some("1000".into()));
+    assert_eq!(g("Encoder"), Some("LAME3.99r".into()));
+    // LAME: raw values (no PrintConv applied) — post-ValueConv numerics.
+    assert_eq!(g("LameMethod"), Some("4".into()));
+    assert_eq!(g("LameLowPassFilter"), Some("16000".into()));
+    assert_eq!(g("LameBitrate"), Some("128000".into()));
+    assert_eq!(g("LameStereoMode"), Some("3".into()));
+  }
+
+  #[test]
+  fn info_frame_suppresses_vbr_tags() {
+    // MPEG.pm:511 `my $isVBR = ($buff !~ /^Info/)` — Info-frame magic
+    // suppresses VBRFrames/VBRBytes/VBRScale. LAME path can still run.
+    let mut d = build_vbr_xing_lame_fixture();
+    let xing_offset = 4 + 32;
+    d[xing_offset..xing_offset + 4].copy_from_slice(b"Info");
+    let w = collect(&d, true);
+    assert_eq!(w.get("MPEG", "VBRFrames"), None);
+    assert_eq!(w.get("MPEG", "VBRBytes"), None);
+    assert_eq!(w.get("MPEG", "VBRScale"), None);
+    // Encoder still emits from the LAME branch.
+    assert_eq!(
+      w.get("MPEG", "Encoder").map(MapValue::as_str),
+      Some("LAME3.99r".into())
+    );
+  }
+
+  #[test]
+  fn no_xing_magic_silent_skip() {
+    let mut d = std::vec::Vec::with_capacity(40);
+    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
+    d.extend(std::iter::repeat(0).take(36));
+    let w = collect(&d, true);
+    // Audio tags still emit.
+    assert!(w.get("MPEG", "AudioBitrate").is_some());
+    // No Xing tags.
+    assert_eq!(w.get("MPEG", "VBRFrames"), None);
+    assert_eq!(w.get("MPEG", "Encoder"), None);
+  }
+
+  #[test]
+  fn xing_truncated_at_each_length_gate() {
+    // Truncate before VBRFrames — MPEG.pm:516 `last`.
+    let mut d = std::vec::Vec::with_capacity(44);
+    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
+    d.extend(std::iter::repeat(0).take(32));
+    d.extend_from_slice(b"Xing");
+    d.extend_from_slice(&0x01u32.to_be_bytes()); // VBRFrames-only flag
+    // No VBRFrames data appended.
+    let w = collect(&d, true);
+    assert!(w.get("MPEG", "AudioBitrate").is_some());
+    assert_eq!(w.get("MPEG", "VBRFrames"), None);
+  }
+
+  // ───────────────────────── raw-MP3 engine entry ─────────────────────────
+
+  #[test]
+  fn bridge_parse_emits_expected_tags_print_on() {
+    let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
+    data.extend(std::iter::repeat(0).take(413));
+    let mut m = JsonTagWriter::new("x.mp3");
     let mut c = ctx_over(&mut m, &data, "MP3");
     assert!(ProcessMp3.process(&mut c));
-    let names_vals: Vec<_> = m
+    let names_vals: std::vec::Vec<_> = m
       .tags()
       .iter()
       .map(|t| (t.name(), t.value().clone()))
       .collect();
-    // The frame above decodes as: version=1, layer=3 (display), bitrate=128 kbps,
-    // sample-rate=44100, channel=Joint Stereo, ms-stereo=Off, intensity=Off,
-    // copyright=True, original=True, emphasis=None.
     assert!(names_vals.contains(&("FileType", TagValue::Str("MP3".into()))));
     assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::I64(1))));
     assert!(names_vals.contains(&("AudioLayer", TagValue::I64(3))));
@@ -1332,27 +2063,22 @@ mod tests {
     assert!(names_vals.contains(&("CopyrightFlag", TagValue::Str("True".into()))));
     assert!(names_vals.contains(&("OriginalMedia", TagValue::Str("True".into()))));
     assert!(names_vals.contains(&("Emphasis", TagValue::Str("None".into()))));
-    // ModeExtension MUST NOT be emitted (layer 3 ⇒ Bit26 & Bit27, not Bit26-27).
     assert!(!names_vals.iter().any(|(n, _)| *n == "ModeExtension"));
   }
 
   #[test]
-  fn parse_emits_expected_tags_print_off() {
-    // Same fixture, -n: raw integer values (no PrintConv). ValueConv still
-    // applies (e.g. AudioBitrate goes through the VC hash → 128000).
+  fn bridge_parse_emits_expected_tags_print_off() {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, false, &mut m);
     assert!(ProcessMp3.process(&mut c));
-    let names_vals: Vec<_> = m
+    let names_vals: std::vec::Vec<_> = m
       .tags()
       .iter()
       .map(|t| (t.name(), t.value().clone()))
       .collect();
-    // Raw values: ver=3, layer=1 (raw), bitrate VC = 128000, sr=0 (no VC!),
-    // ch=1, mss=0, intensity=0, copy=1, orig=1, emph=0.
     assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::I64(3))));
     assert!(names_vals.contains(&("AudioLayer", TagValue::I64(1))));
     assert!(names_vals.contains(&("AudioBitrate", TagValue::I64(128000))));
@@ -1366,134 +2092,73 @@ mod tests {
   }
 
   #[test]
-  fn reject_returns_false_with_no_filetype_tag() {
-    // Faithful MPEG.pm:472 `return 0` — buffer with no \xff sync byte. NO
-    // SetFileType call ⇒ no File:* tags.
+  fn bridge_reject_returns_false_with_no_filetype_tag() {
     let data = [0x00u8; 32];
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let mut c = ctx_over(&mut m, &data, "MP3");
     assert!(!ProcessMp3.process(&mut c));
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
   #[test]
-  fn convert_bitrate_faithful() {
-    // ExifTool.pm:6891-6902 — faithful port.
-    // Below 100 -> %.3g. We feed integers (post-ValueConv shape).
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(8000)),
-      TagValue::Str("8 kbps".into())
-    );
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(64000)),
-      TagValue::Str("64 kbps".into())
-    );
-    // 128000 -> 128 kbps (b=128 -> >= 100 -> %.0f).
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(128000)),
-      TagValue::Str("128 kbps".into())
-    );
-    // 320000 -> 320 kbps.
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(320000)),
-      TagValue::Str("320 kbps".into())
-    );
-    // 448000 -> 448 kbps.
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(448000)),
-      TagValue::Str("448 kbps".into())
-    );
-    // "free" sentinel ⇒ IsFloat false ⇒ unchanged.
-    assert_eq!(
-      convert_bitrate(&TagValue::Str("free".into())),
-      TagValue::Str("free".into())
-    );
-    // Bare integer "32" string -> IsFloat true -> "32 bps" (b<1000).
-    // Hmm actually only if it parses. Let's not test that case (no MPEG
-    // call-site produces a Str of digits — VC hash maps directly to I64).
+  fn bridge_parse_emits_xing_lame_tags() {
+    let data = build_vbr_xing_lame_fixture();
+    let mut m = JsonTagWriter::new("x.mp3");
+    let mut c = ctx_over(&mut m, &data, "MP3");
+    assert!(ProcessMp3.process(&mut c));
+    let names_vals: std::vec::Vec<_> = m
+      .tags()
+      .iter()
+      .map(|t| (t.name(), t.value().clone()))
+      .collect();
+    assert!(names_vals.contains(&("VBRFrames", TagValue::I64(1000))));
+    assert!(names_vals.contains(&("VBRBytes", TagValue::I64(200_000))));
+    assert!(names_vals.contains(&("VBRScale", TagValue::I64(78))));
+    assert!(names_vals.contains(&("Encoder", TagValue::Str("LAME3.99r".into()))));
+    assert!(names_vals.contains(&("LameVBRQuality", TagValue::I64(2))));
+    assert!(names_vals.contains(&("LameQuality", TagValue::I64(2))));
+    assert!(names_vals.contains(&("LameMethod", TagValue::Str("VBR (new/mtrh)".into()))));
+    assert!(names_vals.contains(&("LameLowPassFilter", TagValue::Str("16 kHz".into()))));
+    assert!(names_vals.contains(&("LameBitrate", TagValue::Str("128 kbps".into()))));
+    assert!(names_vals.contains(&("LameStereoMode", TagValue::Str("Joint Stereo".into()))));
   }
 
-  #[test]
-  fn convert_bitrate_higher_units() {
-    // 1,000,000 -> 1 Mbps (b=1000 -> /1000 -> 1; b<100 -> %.3g -> "1").
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(1_000_000)),
-      TagValue::Str("1 Mbps".into())
-    );
-    // 2_500_000 -> 2.5 Mbps (b=2500 → /1000 → 2.5; b<100 → %.3g → "2.5").
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(2_500_000)),
-      TagValue::Str("2.5 Mbps".into())
-    );
-    // 1e10 -> 10 Gbps (b=1e10 → /1000 thrice → 10; b<100 → %.3g → "10").
-    assert_eq!(
-      convert_bitrate(&TagValue::I64(10_000_000_000)),
-      TagValue::Str("10 Gbps".into())
-    );
-  }
-
-  // ─────────── F1: ID3.pm:1684-1729 ProcessMP3 bounded-scan ───────────
+  // ───────────────────────── ID3.pm:1684-1729 ProcessMP3 bounded-scan ─────────────────────────
 
   #[test]
   fn id3_process_mp3_scan_len_ext_branches() {
-    // ID3.pm:1704: 8192 if FILE_EXT eq 'MP3', else 256. Pin both arms so a
-    // refactor never silently loses the bound.
     assert_eq!(id3_process_mp3_scan_len(true), 8192);
     assert_eq!(id3_process_mp3_scan_len(false), 256);
   }
 
-  /// F1/RED-GREEN: a synthesized junk-`.mp3` whose first 8192 bytes contain
-  /// no valid MPEG audio sync, with a perfectly valid Layer III header at
-  /// offset 8200. Bundled ExifTool's `ProcessMP3` (ID3.pm:1704 `$scanLen
-  /// = 8192`) reads only the first 8192 bytes and rejects ⇒ `File format
-  /// error`. WITHOUT the bound, our unbounded `scan_for_header` would
-  /// latch onto the 0xff at offset 8200 and falsely accept — exactly the
-  /// gap Codex R1/F1 flagged.
-  ///
-  /// Composition: 8200 bytes of `((i*137+41) % 0xfe)` filler (no `0xff`
-  /// among the filler, no all-same-byte; mirrors the conformance fixture)
-  /// then the canonical Layer III header `0xfffb_904c` then 413 zero
-  /// payload bytes. With the F1 fix, `ProcessMp3::process` must:
-  /// 1) reject the bounded buffer ⇒ return false,
-  /// 2) emit NO File:* tags (SetFileType never called).
+  /// F1/RED-GREEN: junk-`.mp3` with valid sync at offset 8200 (past
+  /// $scanLen=8192) ⇒ reject.
   #[test]
   fn f1_bounded_scan_rejects_late_header_under_mp3_ext() {
-    let mut filler = Vec::with_capacity(8200);
+    let mut filler = std::vec::Vec::with_capacity(8200);
     for i in 1..=8200u32 {
       filler.push(((i * 137 + 41) % 0xfe) as u8);
     }
-    let mut data: Vec<u8> = filler;
-    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes()); // header at 8200
+    let mut data: std::vec::Vec<u8> = filler;
+    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
-    let rv = ProcessMp3.process(&mut c);
-    assert!(
-      !rv,
-      "ProcessMP3 must reject when valid sync byte is past $scanLen=8192 \
-       (ID3.pm:1704). Got accept ⇒ unbounded scan ⇒ Codex R1/F1 unfixed."
-    );
-    // SetFileType was never called → no File:* tags slipped through.
-    assert!(
-      m.tags().iter().all(|t| t.name() != "FileType"),
-      "Rejected MP3 must not have finalized File:FileType."
-    );
+    assert!(!ProcessMp3.process(&mut c));
+    assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
-  /// F1/GREEN-anchor: same shape but header at offset 8188 (so its 4 bytes
-  /// span 8188..8192, still fully within the 8192-byte scan buffer).
-  /// Bundled ExifTool accepts ⇒ exifast must too.
   #[test]
   fn f1_bounded_scan_accepts_header_at_8188() {
-    let mut filler = Vec::with_capacity(8188);
+    let mut filler = std::vec::Vec::with_capacity(8188);
     for i in 1..=8188u32 {
       filler.push(((i * 137 + 41) % 0xfe) as u8);
     }
-    let mut data: Vec<u8> = filler;
-    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes()); // header at 8188
+    let mut data: std::vec::Vec<u8> = filler;
+    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(ProcessMp3.process(&mut c));
@@ -1501,203 +2166,71 @@ mod tests {
     assert!(m.tags().iter().any(|t| t.name() == "AudioBitrate"));
   }
 
-  /// F1/non-MP3-ext-branch: same junk-prefix shape, header at offset 256,
-  /// extension `.dat` (any non-MP3) ⇒ scan_len = 256. The `0xff` byte at
-  /// offset 256 lives JUST PAST the scan boundary (offsets 0..255 only):
-  /// no sync can be found ⇒ reject. Without the bound a late `0xff`
-  /// would be found ⇒ false accept.
-  ///
-  /// Important: this exercises `ProcessMp3::process` DIRECTLY (skipping
-  /// the detection front-end which would never route a `.dat` to MP3 in
-  /// real disk flow; the scan_len=256 branch in `ProcessMp3` is exercised
-  /// when ID3::ProcessMP3 invokes us with a non-MP3 extension on a file
-  /// that DID match ID3 magic — that path will be wired up by the ID3
-  /// parallel PR, but the bound itself must be correct here).
   #[test]
   fn f1_bounded_scan_rejects_late_header_under_non_mp3_ext() {
-    let mut filler = Vec::with_capacity(256);
+    let mut filler = std::vec::Vec::with_capacity(256);
     for i in 1..=256u32 {
       filler.push(((i * 137 + 41) % 0xfe) as u8);
     }
-    let mut data: Vec<u8> = filler;
-    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes()); // header at 256
+    let mut data: std::vec::Vec<u8> = filler;
+    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.dat");
+    let mut m = JsonTagWriter::new("x.dat");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(!ProcessMp3.process(&mut c));
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
-  /// F1/non-MP3-ext-GREEN: header at offset 252 (so its 4 bytes span
-  /// 252..255, fully within scan_len=256). Must accept.
   #[test]
   fn f1_bounded_scan_accepts_header_at_252_under_non_mp3_ext() {
-    let mut filler = Vec::with_capacity(252);
+    let mut filler = std::vec::Vec::with_capacity(252);
     for i in 1..=252u32 {
       filler.push(((i * 137 + 41) % 0xfe) as u8);
     }
-    let mut data: Vec<u8> = filler;
-    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes()); // header at 252
+    let mut data: std::vec::Vec<u8> = filler;
+    data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.dat");
+    let mut m = JsonTagWriter::new("x.dat");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(ProcessMp3.process(&mut c));
     assert!(m.tags().iter().any(|t| t.name() == "FileType"));
   }
 
-  // ─────────── F2: %MPEG::Xing + %MPEG::Lame tail ───────────
+  // ───────────────────────── FormatParser trait surface ─────────────────────────
 
-  /// Build a minimal VBR Xing+LAME MP3 in memory: header 0xfffb_904c
-  /// (MPEG-1 / Layer III / 128 kbps / 44.1 kHz / JointStereo) + 32-byte
-  /// side-info + "Xing"+flags+VBRFrames/Bytes+TOC+Scale + 348-byte LAME
-  /// block (`LAME3.99r\x04\xa0...0x80...0x0c...`). Total: 504 bytes.
-  fn build_vbr_xing_lame_fixture() -> Vec<u8> {
-    let mut d = Vec::with_capacity(504);
-    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes()); // audio header
-    d.extend(std::iter::repeat(0).take(32)); // side info (joint stereo, v1 ⇒ 32)
-    d.extend_from_slice(b"Xing"); // magic
-    d.extend_from_slice(&0x1fu32.to_be_bytes()); // flags: frames|bytes|toc|scale|lame
-    d.extend_from_slice(&1000u32.to_be_bytes()); // VBRFrames
-    d.extend_from_slice(&200_000u32.to_be_bytes()); // VBRBytes
-    d.extend(std::iter::repeat(0).take(100)); // TOC (skipped)
-    d.extend_from_slice(&78u32.to_be_bytes()); // VBRScale (LameVBRQuality=2, LameQuality=2)
-    // LAME block starts here. Pre-fill 348 bytes so the LAME-flag length
-    // gate (MPEG.pm:537 `last if $pos + 348 > $len`) passes.
-    let start = d.len();
-    d.extend(std::iter::repeat(0).take(348));
-    // Stamp the LAME fields by absolute offset into `d`.
-    let stamp = |buf: &mut Vec<u8>, off: usize, b: u8| buf[start + off] = b;
-    // Offsets 0..8 inside the LAME block: "LAME3.99r" (9 bytes).
-    for (i, b) in b"LAME3.99r".iter().enumerate() {
-      stamp(&mut d, i, *b);
-    }
-    stamp(&mut d, 9, 0x04); // LameMethod: raw byte; mask 0x0f → 4 → "VBR (new/mtrh)"
-    stamp(&mut d, 10, 0xa0); // LameLowPassFilter: 0xa0=160 → ×100 = 16000 → "16 kHz"
-    stamp(&mut d, 20, 0x80); // LameBitrate: 0x80=128 → ×1000 = 128000 → "128 kbps"
-    stamp(&mut d, 24, 0x0c); // LameStereoMode: (0x0c & 0x1c)>>2 = 3 → "Joint Stereo"
-    d
+  #[test]
+  fn format_parser_trait_returns_meta_static() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    let ctx = MpegAudioContext::new(&bytes, "MP3", true, &mut shared);
+    let meta = <ProcessMpegAudio as FormatParser>::parse(&ProcessMpegAudio, ctx)
+      .expect("ok")
+      .expect("parsed");
+    assert_eq!(meta.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(meta.audio_layer(), AudioLayer::L3);
+    assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
   }
 
   #[test]
-  fn parse_emits_xing_lame_tags_print_on() {
-    let data = build_vbr_xing_lame_fixture();
-    let mut m = Metadata::new("x.mp3");
-    let mut c = ctx_over(&mut m, &data, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names_vals: Vec<_> = m
-      .tags()
-      .iter()
-      .map(|t| (t.name(), t.value().clone()))
-      .collect();
-    // Xing tags (MPEG.pm:327-332).
-    assert!(names_vals.contains(&("VBRFrames", TagValue::I64(1000))));
-    assert!(names_vals.contains(&("VBRBytes", TagValue::I64(200_000))));
-    assert!(names_vals.contains(&("VBRScale", TagValue::I64(78))));
-    assert!(names_vals.contains(&("Encoder", TagValue::Str("LAME3.99r".into()))));
-    assert!(names_vals.contains(&("LameVBRQuality", TagValue::I64(2))));
-    assert!(names_vals.contains(&("LameQuality", TagValue::I64(2))));
-    // Lame sub-table (MPEG.pm:344-381).
-    assert!(names_vals.contains(&("LameMethod", TagValue::Str("VBR (new/mtrh)".into()))));
-    assert!(names_vals.contains(&("LameLowPassFilter", TagValue::Str("16 kHz".into()))));
-    assert!(names_vals.contains(&("LameBitrate", TagValue::Str("128 kbps".into()))));
-    assert!(names_vals.contains(&("LameStereoMode", TagValue::Str("Joint Stereo".into()))));
-  }
-
-  #[test]
-  fn parse_emits_xing_lame_tags_print_off() {
-    // -n: raw values pass-through; ValueConvs still apply (×100, ×1000).
-    let data = build_vbr_xing_lame_fixture();
-    let mut m = Metadata::new("x.mp3");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, false, &mut m);
-    assert!(ProcessMp3.process(&mut c));
-    let names_vals: Vec<_> = m
-      .tags()
-      .iter()
-      .map(|t| (t.name(), t.value().clone()))
-      .collect();
-    // Unconverted raw integers / strings.
-    assert!(names_vals.contains(&("VBRFrames", TagValue::I64(1000))));
-    assert!(names_vals.contains(&("Encoder", TagValue::Str("LAME3.99r".into()))));
-    assert!(names_vals.contains(&("LameMethod", TagValue::I64(4))));
-    assert!(names_vals.contains(&("LameLowPassFilter", TagValue::I64(16_000))));
-    assert!(names_vals.contains(&("LameBitrate", TagValue::I64(128_000))));
-    assert!(names_vals.contains(&("LameStereoMode", TagValue::I64(3))));
-  }
-
-  #[test]
-  fn parse_info_frame_suppresses_vbr_tags() {
-    // MPEG.pm:511 `my $isVBR = ($buff !~ /^Info/)` — Info-frame magic does
-    // NOT emit VBRFrames/VBRBytes/VBRScale (the `if $isVBR` gates at
-    // MPEG.pm:515/521/532). LAME path can still run (Encoder emitted).
-    let mut d = build_vbr_xing_lame_fixture();
-    // Replace "Xing" with "Info".
-    let xing_offset = 4 + 32;
-    d[xing_offset..xing_offset + 4].copy_from_slice(b"Info");
-    let mut m = Metadata::new("x.mp3");
-    let mut c = ctx_over(&mut m, &d, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names: Vec<_> = m.tags().iter().map(|t| t.name()).collect();
-    assert!(!names.contains(&"VBRFrames"));
-    assert!(!names.contains(&"VBRBytes"));
-    assert!(!names.contains(&"VBRScale"));
-    // Encoder still emitted from the LAME block (MPEG.pm:563).
-    assert!(names.contains(&"Encoder"));
-  }
-
-  #[test]
-  fn parse_no_xing_magic_silent_skip() {
-    // Audio header + side-info bytes that do NOT start with Xing/Info ⇒
-    // MPEG.pm:508 `last`. Audio tags must still emit; no Xing tags.
-    let mut d = Vec::with_capacity(40);
-    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
-    d.extend(std::iter::repeat(0).take(36));
-    let mut m = Metadata::new("x.mp3");
-    let mut c = ctx_over(&mut m, &d, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names: Vec<_> = m.tags().iter().map(|t| t.name()).collect();
-    assert!(names.contains(&"AudioBitrate"));
-    assert!(!names.contains(&"VBRFrames"));
-    assert!(!names.contains(&"Encoder"));
-  }
-
-  #[test]
-  fn parse_xing_truncated_at_each_length_gate() {
-    // Each length gate in MPEG.pm:505/516/520/525/530/537 must silently
-    // exit. Build a buffer that PASSES the audio header + side-info but
-    // is truncated mid-VBR-tail; the audio tags emit, the Xing tags do
-    // not.
-    // Header + 32 side-info + "Xing" + flags (12 bytes used out of the
-    // first 13 of `head8`+flags), but truncate before VBRFrames.
-    let mut d = Vec::with_capacity(44);
-    d.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
-    d.extend(std::iter::repeat(0).take(32));
-    d.extend_from_slice(b"Xing");
-    d.extend_from_slice(&0x01u32.to_be_bytes()); // flag VBRFrames only
-    // Truncate: do NOT append the 4-byte VBRFrames; MPEG.pm:516 `last if
-    // $pos + 4 > $len`.
-    let mut m = Metadata::new("x.mp3");
-    let mut c = ctx_over(&mut m, &d, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names: Vec<_> = m.tags().iter().map(|t| t.name()).collect();
-    assert!(names.contains(&"AudioBitrate"));
-    assert!(!names.contains(&"VBRFrames"));
-  }
-
-  #[test]
-  fn lame_lowpass_print_integer_and_fractional() {
-    // 16_000 → "16 kHz" (16000/1000 = 16.0; integer-valued formats w/o
-    // decimal).
+  fn ms_stereo_layer3_on_off_emit() {
+    // Toggle Bit26 in a Layer III header — verify the typed Meta and
+    // the sink emission both reflect the bit.
+    // Bit26 = byte[3] mask 0x20. Base header 0xfffb_904c byte[3]=0x4c
+    // (bit 0x20 = 0). Set it: 0x6c.
+    let header = 0xfffb_906c_u32;
+    let m = extract_header_fields(header).unwrap();
+    assert_eq!(m.ms_stereo(), Some(true));
+    // Sink under -j.
+    let mut w = MapTagWriter::new();
+    m.sink(true, &mut w).unwrap();
     assert_eq!(
-      lame_lowpass_print(&TagValue::I64(16_000)),
-      TagValue::Str("16 kHz".into())
-    );
-    // 16_500 → "16.5 kHz" (fractional preserves the digits).
-    assert_eq!(
-      lame_lowpass_print(&TagValue::I64(16_500)),
-      TagValue::Str("16.5 kHz".into())
+      w.get("MPEG", "MSStereo").map(MapValue::as_str),
+      Some("On".into())
     );
   }
 }
