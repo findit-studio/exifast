@@ -217,22 +217,20 @@ enum NumVal {
 }
 
 impl NumVal {
-  /// Promote to `f64` for cross-representation comparison (an `Int` vs a
-  /// `Float`, etc.). Exact only within `f64`'s 53-bit mantissa — but two huge
-  /// integers are compared in the `(Int,Int)`/`(Uint,Uint)` arms FIRST, so the
-  /// lossy path is only reached when at least one side is genuinely fractional
-  /// or scientific (where ExifTool's own value is `f64`-derived anyway).
-  fn as_f64(self) -> f64 {
-    match self {
-      NumVal::Int(i) => i as f64,
-      NumVal::Uint(u) => u as f64,
-      NumVal::Float(f) => f,
-    }
-  }
-
   /// Value-equality across representations: same-kind integers compare
-  /// exactly; an `Int`/`Uint` pair compares exactly via `i128`↔`u128`; any
-  /// pairing involving a `Float` compares as `f64`.
+  /// exactly; an `Int`/`Uint` pair compares exactly via `i128`↔`u128`.
+  ///
+  /// An `Int`/`Float` (or `Uint`/`Float`) pair is the subtle case. The naive
+  /// `as_f64() == as_f64()` fallback silently collapses any two integers that
+  /// round to the same `f64` — e.g. `9007194254740993` and `…992.0` both become
+  /// the same `f64` above 2^53, so a real off-by-one mismatch reads EQUAL. So
+  /// when the float side is INTEGER-VALUED and exactly representable as the
+  /// integer type, we compare the integer values EXACTLY. Only a genuinely
+  /// fractional or out-of-integer-range float falls back to `f64` comparison
+  /// (where the float is the authoritative value anyway).
+  ///
+  /// `(Float, Float)` keeps `f64` comparison: both sides are `f64`-derived, so
+  /// this is formatting-insensitive (`0.0`==`0.00000000`, `3.4e+38`==`3.4e38`).
   fn value_eq(self, other: NumVal) -> bool {
     match (self, other) {
       (NumVal::Int(a), NumVal::Int(b)) => a == b,
@@ -242,9 +240,42 @@ impl NumVal {
       (NumVal::Int(i), NumVal::Uint(u)) | (NumVal::Uint(u), NumVal::Int(i)) => {
         u128::try_from(i).is_ok_and(|i| i == u)
       }
-      _ => self.as_f64() == other.as_f64(),
+      (NumVal::Int(i), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Int(i)) => {
+        match f_as_exact_i128(f) {
+          Some(fi) => i == fi,
+          None => i as f64 == f,
+        }
+      }
+      (NumVal::Uint(u), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Uint(u)) => {
+        match f_as_exact_u128(f) {
+          Some(fu) => u == fu,
+          None => u as f64 == f,
+        }
+      }
+      (NumVal::Float(a), NumVal::Float(b)) => a == b,
     }
   }
+}
+
+/// If `f` is integer-valued AND exactly representable as an `i128` (i.e. the
+/// round-trip `f as i128 as f64 == f` holds, which also rejects `f` outside
+/// `i128` range and any fractional `f`), return that exact `i128`. Otherwise
+/// `None` — the caller then treats `f` as a genuine float.
+fn f_as_exact_i128(f: f64) -> Option<i128> {
+  if f.fract() != 0.0 {
+    return None;
+  }
+  let i = f as i128;
+  (i as f64 == f).then_some(i)
+}
+
+/// `u128` analogue of [`f_as_exact_i128`]. Also rejects negative `f`.
+fn f_as_exact_u128(f: f64) -> Option<u128> {
+  if f.fract() != 0.0 || f < 0.0 {
+    return None;
+  }
+  let u = f as u128;
+  (u as f64 == f).then_some(u)
 }
 
 /// VALUE-equality of two scalar `RawValue`s (numbers, strings, `true`/`false`/
@@ -580,6 +611,77 @@ mod tests {
       .is_ok()
     );
     // Off by one ⇒ mismatch (precision preserved, NOT collapsed via f64).
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551614}]"#
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn int_vs_float_above_2pow53_compares_exact() {
+    // Codex F3: the OLD `as_f64() == as_f64()` cross-arm fallback collapsed an
+    // `Int` and a `Float` that round to the same `f64`. Above 2^53 that masks a
+    // real off-by-one: `9007199254740993` (odd, Int) and `9007199254740992.0`
+    // (the nearest even f64, Float) both become the same f64 ⇒ FALSE EQUAL.
+    // The exact-integer comparison must report these UNEQUAL.
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740993}]"#,
+        r#"[{"a":9007199254740992.0}]"#
+      )
+      .is_err(),
+      "9007199254740993 (Int) must NOT equal 9007199254740992.0 (Float)"
+    );
+    // But an Int that IS exactly the float's value stays EQUAL (2^53 is exactly
+    // representable, so `…992` Int == `…992.0` Float).
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740992}]"#,
+        r#"[{"a":9007199254740992.0}]"#
+      )
+      .is_ok(),
+      "9007199254740992 (Int) must equal 9007199254740992.0 (Float)"
+    );
+    // Order-independent (Float on the actual side).
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740992.0}]"#,
+        r#"[{"a":9007199254740993}]"#
+      )
+      .is_err()
+    );
+    // A genuinely fractional float vs a near integer still mismatches via the
+    // f64 fallback (the float is fractional ⇒ never integer-valued).
+    assert!(json_equivalent(r#"[{"a":3}]"#, r#"[{"a":3.5}]"#).is_err());
+    // Within-mantissa Int-vs-Float value equality is unaffected.
+    assert!(json_equivalent(r#"[{"a":42}]"#, r#"[{"a":42.0}]"#).is_ok());
+  }
+
+  #[test]
+  fn float_float_spelling_stays_value_equal_after_hardening() {
+    // The `(Float, Float)` arm keeps f64 comparison, so the value-style
+    // insensitivity Codex wanted preserved still holds AFTER the F3 fix:
+    // trailing zeros and exponent spelling of the same f64 stay EQUAL.
+    assert!(json_equivalent(r#"[{"a":0.0}]"#, r#"[{"a":0.00000000}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":3.4e+38}]"#, r#"[{"a":3.4e38}]"#).is_ok());
+  }
+
+  #[test]
+  fn huge_u64_vs_float_compares_exact() {
+    // Uint cross-arm: `18446744073709551615` (u64::MAX) vs its own value as a
+    // float spelling, and vs the f64-rounded neighbour `…614`.
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551615}]"#
+      )
+      .is_ok()
+    );
+    // u64::MAX rounds to 2^64 as f64; `18446744073709551614` is NOT that f64
+    // value, so a bare-vs-bare integer pair stays exact and UNEQUAL.
     assert!(
       json_equivalent(
         r#"[{"a":18446744073709551615}]"#,
