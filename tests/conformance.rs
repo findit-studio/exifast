@@ -267,6 +267,41 @@ fn matroska_duration_no_scale_conformance() {
 }
 
 #[test]
+fn matroska_track_targeted_tag_conformance() {
+  // PR #31 R4 finding F2 — Track-targeted SimpleTag misattribution
+  // (Matroska.pm:1207-1216). Bundled records every `TrackUID` inside a
+  // TrackEntry into `%trackNum{$val} = $$et{SET_GROUP1}` (raw bytes →
+  // Track<N>); when `TagTrackUID` is later read inside `Tags/Tag/
+  // Targets`, the matching raw bytes look up the mapped `Track<N>` and
+  // OVERRIDE SET_GROUP1 for the duration of the enclosing `Tag` master.
+  // SimpleTag children then emit under `Track<N>` instead of the
+  // default file-level group.
+  //
+  // Synthetic fixture: TrackEntry[TrackNumber=1, TrackUID=01020304,
+  // TrackType=Video] + Tags[Tag[Targets[TagTrackUID=01020304],
+  // SimpleTag[TagName="TITLE", TagString="Track Title"]]]. Bundled
+  // emits `Track1:TagTrackUID: "01020304"` AND `Track1:Title: "Track
+  // Title"` (NOT `Matroska:TagTrackUID` / `Matroska:Title`, which is
+  // what the pre-fix walker emitted).
+  //
+  // Lock-depth semantics: the `Tag` master's index in `Walker.ends` is
+  // used as the reset trigger, faithful to Perl's
+  // `$trackIndent = substr($$et{INDENT}, 0, -2)` one-level-up reset
+  // (Matroska.pm:1215). Multiple sibling Tags in the same Tags section
+  // can each re-set/reset independently.
+  check(
+    "Matroska_track_targeted_tag.mkv",
+    "Matroska_track_targeted_tag.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_track_targeted_tag.mkv",
+    "Matroska_track_targeted_tag.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_chapters_conformance() {
   // PR #31 R4 finding F1 — ChapterTimeStart (0x11) + ChapterTimeEnd (0x12)
   // were `Kind::Skip` (silent drop). Bundled extracts both as

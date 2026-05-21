@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "Matroska_track_targeted_tag.mkv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MKV",
+  "File:FileTypeExtension": "MKV",
+  "File:MIMEType": "video/x-matroska",
+  "Matroska:EBMLVersion": 1,
+  "Matroska:EBMLReadVersion": 1,
+  "Matroska:DocType": "matroska",
+  "Matroska:DocTypeVersion": 1,
+  "Matroska:DocTypeReadVersion": 1,
+  "Info:TimecodeScale": 0.001,
+  "Info:MuxingApp": "test",
+  "Info:WritingApp": "synth",
+  "Track1:TrackNumber": 1,
+  "Track1:TrackUID": "01020304",
+  "Track1:TrackType": 1,
+  "Track1:TagTrackUID": "01020304",
+  "Track1:Title": "Track Title"
+}]

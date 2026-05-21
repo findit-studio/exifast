@@ -2308,6 +2308,17 @@ struct Walker<'a> {
   /// populate the struct (everything at depth > this is part of the same
   /// struct). `None` when no SimpleTag is open.
   simple_tag_depth: Option<usize>,
+  /// `%trackNum` (Matroska.pm:992 `my %trackNum`): raw TrackUID bytes →
+  /// `Track<N>` group string. Populated at Matroska.pm:1207-1209 (when
+  /// TrackUID is read INSIDE a TrackEntry whose `SET_GROUP1` is the
+  /// `Track<N>` set by the prior TrackNumber). The key is the raw on-disk
+  /// bytes of the UID, NOT the lowercase-hex `UidHex` render — Perl's
+  /// hash uses the `Format => 'string'` decoded value (Matroska.pm:1170-
+  /// 1172), which for `%uidInfo` is the raw bytes (the `unpack("H*",$val)`
+  /// happens later, in ValueConv). Looked up at TagTrackUID time
+  /// (Matroska.pm:1210-1216) to override `SET_GROUP1` for the duration of
+  /// the surrounding `Tag` master.
+  track_uid_to_group: std::collections::HashMap<Vec<u8>, SmolStr>,
 }
 
 /// One in-flight SimpleTag struct (Matroska.pm `HandleStruct` inputs).
@@ -2362,6 +2373,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     track_type: None,
     simple_tag: None,
     simple_tag_depth: None,
+    track_uid_to_group: std::collections::HashMap::new(),
   };
   walk(&mut w);
   Ok(Some(Meta {
@@ -2662,6 +2674,51 @@ fn walk(w: &mut Walker<'_>) {
         // store the lowercase-hex synthesis directly into a SmolStr.
         let body = &data[w.pos..elem_end];
         let hex = hex_lower(body);
+
+        // Matroska.pm:1207-1209 — `TrackUID` inside a TrackEntry with
+        // SET_GROUP1 active records `(raw_bytes → Track<N>)` for later
+        // TagTrackUID lookup. Perl uses `$val` (the Format='string'
+        // raw-bytes scalar) as the hash key; we faithfully use the raw
+        // bytes (NOT the lowercase-hex render).
+        //
+        // The "SET_GROUP1 active" guard is `$$et{SET_GROUP1}` truthy in
+        // Perl — i.e. any of {Track<N>, Chapter<n>, Info}. For TrackUID
+        // specifically, only the Track<N> case is interesting; an Info or
+        // Chapter group would mean a spec-illegal placement (TrackUID
+        // outside TrackEntry) and Perl's hash entry would never be
+        // looked up anyway. We mirror the lenient Perl semantic.
+        if def.name == "TrackUID"
+          && w.current_group.as_str() != DEFAULT_GROUP
+          && w.group_locked_at_depth.is_some()
+        {
+          w.track_uid_to_group
+            .insert(body.to_vec(), w.current_group.clone());
+        } else if def.name == "TagTrackUID" {
+          // Matroska.pm:1210-1216 — `TagTrackUID` with a matching
+          // `$trackNum{$val}` overrides SET_GROUP1 for the duration of
+          // the enclosing Tag master. Perl sets `$trackIndent = substr(
+          // $$et{INDENT}, 0, -2)` — i.e. the reset triggers ONE level UP
+          // from the current INDENT (where current is the Targets
+          // container). Our lock-depth index corresponds to the Tag's
+          // position in `w.ends`: TagTrackUID is read inside Targets, so
+          // `ends.last()` is Targets and `ends[ends.len() - 2]` is Tag.
+          if let Some(target_group) = w.track_uid_to_group.get(body).cloned() {
+            w.current_group = target_group;
+            // Reset fires when the parent of Targets (which is Tag)
+            // closes — i.e. when `ends.len() == lock_depth + 1` after
+            // Targets is already popped. We need `lock_depth + 1 = Tag's
+            // index + 1 = (ends.len() - 2) + 1 = ends.len() - 1`. After
+            // the Targets-close pop, ends.len() decreases by 1, so the
+            // condition becomes `(ends.len() - 1) - 1 + 1 = ends.len() -
+            // 1` matches when Tag is the top-of-stack about to close.
+            // Concretely: lock_depth = ends.len() - 2 (Tag's stack index
+            // computed when we are INSIDE Targets).
+            if w.ends.len() >= 2 {
+              w.group_locked_at_depth = Some(w.ends.len() - 2);
+            }
+          }
+        }
+
         push_entry(w, def.name, Value::UidHex(hex));
         w.pos = elem_end;
         continue;

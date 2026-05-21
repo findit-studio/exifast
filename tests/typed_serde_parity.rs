@@ -200,12 +200,17 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // (Matroska.pm:580-592 unsigned-ns → /1e9 → ConvertDuration), the
   // ChapterDisplay (ID 0) traversal fix, and the `Chapter<n>` family-1
   // group attribution (Matroska.pm:1117-1119 chapterNum counter).
+  // 137 → 138 after PR #31 R4 finding F2 (Codex adversarial): added
+  // `Matroska_track_targeted_tag.mkv` exercising the
+  // TagTrackUID → Track<N> group override (Matroska.pm:1207-1216
+  // %trackNum map populated from TrackUID inside TrackEntry, looked up
+  // at TagTrackUID time to switch SET_GROUP1 for the enclosing Tag).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    137,
-    "expected exactly the 137 active conformance fixtures, found {}: {:?}",
+    138,
+    "expected exactly the 138 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
