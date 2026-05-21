@@ -5,7 +5,7 @@
 //! Faithful port of `Image::ExifTool::MPC` (lib/Image/ExifTool/MPC.pm).
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → [`crate::bitstream`].
 //!
-//! A typed [`MpcMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -29,9 +29,9 @@
 //! ID3 and APE are dispatched by the engine entry `process` via the chained
 //! helpers (`crate::formats::id3::process::process_id3_chained`,
 //! `crate::formats::ape::ProcessApe::process_trailer_only`) on the
-//! `ParseContext` value sink. The typed [`MpcMeta<'a>`] carries
+//! `ParseContext` value sink. The typed [`Meta<'a>`] carries
 //! [`Option<&'a [u8]>`] byte placeholders for the ID3-prefix and APE-trailer
-//! slices so a future pass can compose them with the typed `Id3Meta`/`ApeMeta`.
+//! slices so a future pass can compose them with the typed `Id3Meta`/`ape::Meta`.
 //!
 //! ## %MPC::Main table (MPC.pm:21-72)
 //!
@@ -65,7 +65,7 @@ use crate::{
 //
 // Retained so the [`process_bit_stream`] engine (and the engine entry
 // `process` below) can drive the same FLAC::ProcessBitStream PROCESS_PROC as
-// bundled Perl. The typed [`MpcMeta`] holds the raw bit-field scalars
+// bundled Perl. The typed [`Meta`] holds the raw bit-field scalars
 // (post-bit-stream, pre-PrintConv); PrintConv is applied at emit time by
 // `serialize_tags` to mirror ExifTool's `$$self{OPTIONS}{PrintConv}`
 // toggle (ExifTool.pm:5710).
@@ -276,7 +276,7 @@ pub const MPC_BIT_KEYS: &[&str] = &[
 ];
 
 // ===========================================================================
-// Typed Meta — `MpcMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// SV7 header bit-field scalars (MPC.pm:21-72), post-bit-stream extraction
@@ -292,7 +292,7 @@ pub const MPC_BIT_KEYS: &[&str] = &[
 ///
 /// **D8 — no public fields, accessors only.** Construct only via the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MpcSv7Header {
+pub struct Sv7Header {
   /// Bit032-063 — `TotalFrames` raw u32 (MPC.pm:28).
   total_frames: u32,
   /// Bit080-081 — `SampleRate` raw index (0..=3, MPC.pm:29-37).
@@ -321,7 +321,7 @@ pub struct MpcSv7Header {
   encoder_version: u8,
 }
 
-impl MpcSv7Header {
+impl Sv7Header {
   /// `TotalFrames` raw u32 (MPC.pm:28).
   #[must_use]
   #[inline(always)]
@@ -439,9 +439,9 @@ impl MpcSv7Header {
 /// ## Chained sub-blocks
 ///
 /// MPC dispatches both ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113). The typed
-/// [`MpcMeta`] captures their input byte slices as `Option<&'a [u8]>`
+/// [`Meta`] captures their input byte slices as `Option<&'a [u8]>`
 /// placeholders so a future pass can compose them with the typed
-/// [`crate::formats::id3::Id3Meta`] / [`crate::formats::ape::ApeMeta`]; the
+/// [`crate::formats::id3::Id3Meta`] / [`crate::formats::ape::Meta`]; the
 /// engine entry `process` below dispatches both on the `ParseContext` value
 /// sink, so the serialized JSON is byte-exact with bundled `perl exiftool`.
 ///
@@ -450,7 +450,7 @@ impl MpcSv7Header {
 /// **Lifetimes.** `'a` is held for the ID3/APE byte placeholders that
 /// borrow from the input slice; the SV7 header is owned primitives.
 #[derive(Debug, Clone, Copy)]
-pub struct MpcMeta<'a> {
+pub struct Meta<'a> {
   /// MP+ version low nibble (MPC.pm:93 `ord($1) & 0x0f`). The SV7 bit
   /// walker only runs when `version == 0x07`; other versions trigger the
   /// MPC.pm:107-109 warning arm.
@@ -458,7 +458,7 @@ pub struct MpcMeta<'a> {
   /// SV7 header fields (MPC.pm:21-72). `Some` iff the MP+ version low
   /// nibble is `0x07`; `None` for the non-SV7 warning arm
   /// (MPC.pm:107-109).
-  sv7_header: Option<MpcSv7Header>,
+  sv7_header: Option<Sv7Header>,
   /// Whether the non-SV7 warning (MPC.pm:108 `'Audio info currently not
   /// extracted from this version MPC file'`) should be emitted.
   warn_unsupported_version: bool,
@@ -472,13 +472,13 @@ pub struct MpcMeta<'a> {
   /// **Phase F5 placeholder.** Byte slice of any APE trailer block seen
   /// AFTER the MP+ header (MPC.pm:111-113). The legacy bridge dispatches
   /// it through [`crate::formats::ape::ProcessApe::process_trailer_only`];
-  /// the typed `ApeMeta` from the parallel F3 agent will eventually
+  /// the typed `ape::Meta` from the parallel F3 agent will eventually
   /// consume this slice. Today: always `None` for the same reason as
   /// `id3_prefix`.
   ape_trailer: Option<&'a [u8]>,
 }
 
-impl<'a> MpcMeta<'a> {
+impl<'a> Meta<'a> {
   /// MP+ version low nibble (MPC.pm:93). `0x07` ⇒ SV7 path; anything else
   /// ⇒ warning arm (MPC.pm:107-109).
   #[must_use]
@@ -489,7 +489,7 @@ impl<'a> MpcMeta<'a> {
   /// SV7 header fields, present iff [`Self::version`] returned `0x07`.
   #[must_use]
   #[inline(always)]
-  pub const fn sv7_header(&self) -> Option<&MpcSv7Header> {
+  pub const fn sv7_header(&self) -> Option<&Sv7Header> {
     self.sv7_header.as_ref()
   }
   /// `true` if the MPC.pm:108 warning (`'Audio info currently not extracted
@@ -516,7 +516,7 @@ impl<'a> MpcMeta<'a> {
 }
 
 // ===========================================================================
-// `MpcContext<'a>` — per-format input view for chained dispatch
+// `Context<'a>` — per-format input view for chained dispatch
 // ===========================================================================
 
 /// Per-format input view for [`ProcessMpc`]. Wraps the input bytes and a
@@ -532,16 +532,16 @@ impl<'a> MpcMeta<'a> {
 ///
 /// D8: PRIVATE fields, accessors only.
 #[derive(Debug)]
-pub struct MpcContext<'a> {
+pub struct Context<'a> {
   data: &'a [u8],
   // Held for cross-format chained dispatch. F5's typed `parse` does not
   // mutate the shared flags directly — they're threaded so a future
-  // F5-integration pass can chain into typed `Id3Meta` / `ApeMeta`.
+  // F5-integration pass can chain into typed `Id3Meta` / `ape::Meta`.
   #[allow(dead_code)]
   shared: &'a mut SharedFlags,
 }
 
-impl<'a> MpcContext<'a> {
+impl<'a> Context<'a> {
   /// Construct a chained-MPC context with the input bytes and a mutable
   /// [`SharedFlags`] handle.
   #[must_use]
@@ -557,7 +557,7 @@ impl<'a> MpcContext<'a> {
   }
   /// Borrow the cross-format shared flags. Phase G integration will use
   /// this to thread `done_id3` / `done_ape` updates from typed `Id3Meta` /
-  /// `ApeMeta` runs. (Named `shared` to mirror the established cross-format
+  /// `ape::Meta` runs. (Named `shared` to mirror the established cross-format
   /// `SharedFlags` accessor convention — `ape.rs`, `id3/process.rs`.)
   #[inline(always)]
   pub const fn shared(&mut self) -> &mut SharedFlags {
@@ -577,13 +577,13 @@ impl parser_sealed::Sealed for ProcessMpc {}
 
 impl FormatParser for ProcessMpc {
   /// GAT: the Meta borrows from the input `'a` (Codex AF2).
-  type Meta<'a> = MpcMeta<'a>;
-  /// Chained-format Context: `data + SharedFlags`. See [`MpcContext`].
-  type Context<'a> = MpcContext<'a>;
+  type Meta<'a> = Meta<'a>;
+  /// Chained-format Context: `data + SharedFlags`. See [`Context`].
+  type Context<'a> = Context<'a>;
   /// Rust-level fatal error (currently none — every bad input is `Ok(None)`).
-  type Error = MpcError;
+  type Error = Error;
 
-  /// Parse an MPC file's bytes into a typed [`MpcMeta`], or `None` if the
+  /// Parse an MPC file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid MP+ stream (short read or wrong magic; MPC.pm:92).
   ///
   /// Reads the 32-byte MP+ header, validates the magic (MPC.pm:92), and
@@ -591,29 +591,29 @@ impl FormatParser for ProcessMpc {
   /// (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are driven by the
   /// engine entry [`ProcessMpc::process`] (which owns the `ParseContext`
   /// value sink), not by this header-only typed `parse`.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpcError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(ctx.data())
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`MpcMeta`] that borrows from the input buffer (for the F5 placeholder
+/// [`Meta`] that borrows from the input buffer (for the F5 placeholder
 /// byte slices; the SV7 header is owned).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`MpcMeta`]. The
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = MpcMeta<'a>`) returns
+/// Inner parser — produces a borrow-from-input [`Meta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns
 /// this borrowed form directly into the closed
 /// [`crate::parser_new::AnyMeta`] enum (Codex AF2). The `id3_prefix` /
 /// `ape_trailer` placeholders are always `None` in F5.
-fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
+fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
   if data.len() < 32 {
     return Ok(None); // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
@@ -636,11 +636,11 @@ fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
     (None, true)
   };
 
-  Ok(Some(MpcMeta {
+  Ok(Some(Meta {
     version,
     sv7_header,
     warn_unsupported_version,
-    // F5 placeholders — see field docs on `MpcMeta`.
+    // F5 placeholders — see field docs on `Meta`.
     id3_prefix: None,
     ape_trailer: None,
   }))
@@ -649,13 +649,13 @@ fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
 /// Extract the SV7 bit-fields from the 32-byte MP+ header. Reuses
 /// [`process_bit_stream`] (the shared FLAC::ProcessBitStream engine) for
 /// byte-exact extraction faithful to MPC.pm:22, then lifts the emitted
-/// `TagValue::I64` scalars into typed primitives on [`MpcSv7Header`].
+/// `TagValue::I64` scalars into typed primitives on [`Sv7Header`].
 ///
 /// The bit-stream walker pushes into a side [`Metadata`] (`print_conv=false`
 /// so the staged values are post-ValueConv raw scalars — `ValueConv::None`
 /// for every MPC field, so these are the literal bit-extracted integers).
 /// `serialize_tags` applies PrintConv at emit time.
-fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
+fn extract_sv7_header(hdr: &[u8]) -> Sv7Header {
   // Staging Metadata captures the bit-stream walker's emissions. The walker
   // always emits `TagValue::I64` for these ≤ 32-bit fields (see the AAC
   // pilot — same pattern), so the lift is a direct `as` cast.
@@ -674,7 +674,7 @@ fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
   // early via FLAC.pm:177 `last if $i2 >= $dirLen`. The 32-byte gate above
   // ensures the full walk in production; the defaults guard against
   // pathological inputs.
-  let mut h = MpcSv7Header {
+  let mut h = Sv7Header {
     total_frames: 0,
     sample_rate_index: 0,
     quality_index: 0,
@@ -715,7 +715,7 @@ fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl MpcMeta<'_> {
+impl Meta<'_> {
   /// Emit MPC tags into the writer in `%MPC::Main` walk order (MPC.pm:21-72:
   /// TotalFrames, SampleRate, Quality, MaxBand, ReplayGain×4, FastSeek,
   /// Gapless, EncoderVersion) — faithful to the bundled-Perl bit-stream
@@ -730,7 +730,7 @@ impl MpcMeta<'_> {
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode): every
   /// field emits its raw integer (sample_rate_index, quality_index, etc.).
   ///
-  /// **Non-SV7 arm.** When [`MpcMeta::sv7_header`] is `None`
+  /// **Non-SV7 arm.** When [`Meta::sv7_header`] is `None`
   /// (MPC.pm:107-109), no MPC:* tags are emitted; the warning is pushed by
   /// the legacy bridge or directly by a lib caller via
   /// `TagMap::write_warning` at the end of this fn.
@@ -866,7 +866,7 @@ impl MpcMeta<'_> {
 }
 
 // ===========================================================================
-// `MpcError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for MPC parsing. Currently empty — every bad
@@ -879,7 +879,7 @@ impl MpcMeta<'_> {
 /// without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MpcError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1097,7 +1097,7 @@ mod tests {
     )
     .expect("read MPC.mpc fixture");
     let mut shared = SharedFlags::new();
-    let ctx = MpcContext::new(&bytes, &mut shared);
+    let ctx = Context::new(&bytes, &mut shared);
     let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx)
       .expect("ok")
       .expect("parsed");
@@ -1110,8 +1110,8 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_sv7_print_conv_strings() {
-    // Build an SV7 MpcMeta with the MPC.mpc fixture values; sink -j.
-    let h = MpcSv7Header {
+    // Build an SV7 Meta with the MPC.mpc fixture values; sink -j.
+    let h = Sv7Header {
       total_frames: 102,
       sample_rate_index: 0,
       quality_index: 10,
@@ -1124,7 +1124,7 @@ mod tests {
       gapless: 1,
       encoder_version: 115,
     };
-    let meta = MpcMeta {
+    let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
@@ -1155,7 +1155,7 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_sv7_print_conv_off_raw_scalars() {
-    let h = MpcSv7Header {
+    let h = Sv7Header {
       total_frames: 102,
       sample_rate_index: 0,
       quality_index: 10,
@@ -1168,7 +1168,7 @@ mod tests {
       gapless: 1,
       encoder_version: 115,
     };
-    let meta = MpcMeta {
+    let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
@@ -1192,7 +1192,7 @@ mod tests {
   #[test]
   fn meta_sinker_emits_warning_on_non_sv7() {
     // sv8 path: sv7_header=None, warn_unsupported_version=true.
-    let meta = MpcMeta {
+    let meta = Meta {
       version: 0x08,
       sv7_header: None,
       warn_unsupported_version: true,
@@ -1224,7 +1224,7 @@ mod tests {
   fn meta_sinker_emits_quality_unknown_fallback() {
     // Quality raw=2 (sparse — MPC.pm:38-54 has no key for 2) ⇒ -j must
     // emit "Unknown (2)" per ExifTool.pm:3622. -n: raw 2.
-    let h = MpcSv7Header {
+    let h = Sv7Header {
       total_frames: 0,
       sample_rate_index: 0,
       quality_index: 2,
@@ -1237,7 +1237,7 @@ mod tests {
       gapless: 0,
       encoder_version: 0,
     };
-    let meta = MpcMeta {
+    let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
@@ -1256,7 +1256,7 @@ mod tests {
   fn meta_sinker_encoder_version_lt_100_emits_raw() {
     // No-match path: 2-digit value ⇒ Perl `s///` no-match ⇒ original
     // I64 preserved. Both -j and -n emit the raw integer.
-    let h = MpcSv7Header {
+    let h = Sv7Header {
       total_frames: 0,
       sample_rate_index: 0,
       quality_index: 1,
@@ -1269,7 +1269,7 @@ mod tests {
       gapless: 0,
       encoder_version: 15, // 2-digit ⇒ no-match
     };
-    let meta = MpcMeta {
+    let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,

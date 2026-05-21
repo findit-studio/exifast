@@ -5,7 +5,7 @@
 //! Faithful port of `Image::ExifTool::WavPack` (lib/Image/ExifTool/WavPack.pm).
 //! WavPack.pm is 144 lines: one tag table + one `Process<Type>` sub.
 //!
-//! A typed [`WvMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` and the chained ID3/APE trailers so
@@ -46,7 +46,7 @@
 //! chain effectively runs RIFF → ID3 → APE.
 //!
 //! **Scope.** The typed parser ([`ProcessWv::parse`]) produces a
-//! [`WvMeta`] that ONLY carries the WavPack-header tags AND
+//! [`Meta`] that ONLY carries the WavPack-header tags AND
 //! borrow-from-input `Option<&'a [u8]>` placeholders denoting the byte
 //! ranges where ID3 / APE trailers may live (the whole input buffer,
 //! since both legacy formats scan the entire file). Actually parsing
@@ -104,7 +104,7 @@ const SAMPLE_RATE_SHIFT: u32 = bit_shift(SAMPLE_RATE_MASK); // 23
 /// WavPack.pm:55-72 `SampleRate` PrintConv hash — indices 0..=14 are
 /// known integer rates; index 15 is the string `"Custom"`. Looked up at
 /// emit time (PrintConv-on) and via the typed accessor
-/// [`WvMeta::sample_rate_hz`].
+/// [`Meta::sample_rate_hz`].
 ///
 /// Returns `None` only for indices ≥ 16 which are unreachable from a
 /// 4-bit mask (`0x07800000 >> 23 = 0..=15`). Kept as `None` for total
@@ -315,7 +315,7 @@ impl core::fmt::Display for DataFormat {
 ///
 /// §2: unit-or-newtype variants only — `Hz(u32)` (newtype) carries the
 /// post-PrintConv numeric rate, NOT the raw 4-bit index (the raw index is
-/// preserved separately on [`WvMeta::sample_rate_raw_index`] for `-n`
+/// preserved separately on [`Meta::sample_rate_raw_index`] for `-n`
 /// emission and provides the lossless on-disk round-trip). The
 /// externally-numbered 4-bit index is **total** over [0, 15] via
 /// [`sample_rate_lookup`], so this decoded form needs no `Unknown` escape.
@@ -358,7 +358,7 @@ impl core::fmt::Display for SampleRate {
 }
 
 // ===========================================================================
-// Typed Meta — `WvMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed WavPack metadata — the lib-first output of [`ProcessWv`].
@@ -383,11 +383,11 @@ impl core::fmt::Display for SampleRate {
 ///
 /// ```ignore
 /// use exifast::parser_new::{FormatParser, SharedFlags};
-/// use exifast::formats::wavpack::{ProcessWv, WvContext};
+/// use exifast::formats::wavpack::{ProcessWv, Context};
 ///
 /// let bytes = std::fs::read("file.wv")?;
 /// let mut shared = SharedFlags::new();
-/// let ctx = WvContext::new(&bytes, &mut shared);
+/// let ctx = Context::new(&bytes, &mut shared);
 /// if let Some(wv) = ProcessWv.parse(ctx)? {
 ///   println!("BytesPerSample: {}", wv.bytes_per_sample());
 ///   println!("AudioType: {}", wv.audio_type().print_conv());
@@ -400,7 +400,7 @@ impl core::fmt::Display for SampleRate {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone)]
-pub struct WvMeta<'a> {
+pub struct Meta<'a> {
   /// WavPack.pm:31-35 BytesPerSample — `Mask => 0x03; ValueConv => '$val + 1'`.
   /// Raw 2-bit field ∈ [0, 3] ⇒ post-ValueConv [1, 4] bytes per sample
   /// (1 = 8-bit, 2 = 16-bit, 3 = 24-bit, 4 = 32-bit). PrintConv is None,
@@ -436,7 +436,7 @@ pub struct WvMeta<'a> {
   id3_apetrailer_scan: Option<&'a [u8]>,
 }
 
-impl<'a> WvMeta<'a> {
+impl<'a> Meta<'a> {
   /// WavPack.pm:31-35 — `BytesPerSample` post-ValueConv (1..=4). Copy ⇒
   /// returned by value under the bare name (§3).
   #[must_use]
@@ -510,7 +510,7 @@ impl<'a> WvMeta<'a> {
 }
 
 // ===========================================================================
-// `WvContext<'a>` — per-format input view
+// `Context<'a>` — per-format input view
 // ===========================================================================
 
 /// Per-format input view for [`ProcessWv`]. Wraps the input bytes plus
@@ -528,7 +528,7 @@ impl<'a> WvMeta<'a> {
 /// `&mut SharedFlags` carry is the seam.
 ///
 /// D8: no public fields; constructor + accessors only.
-pub struct WvContext<'a> {
+pub struct Context<'a> {
   /// The full WavPack file bytes — typically the entire input buffer.
   data: &'a [u8],
   /// Mutable cross-format flags. Reserved for the typed ID3 / APE
@@ -538,7 +538,7 @@ pub struct WvContext<'a> {
   shared: &'a mut SharedFlags,
 }
 
-impl<'a> WvContext<'a> {
+impl<'a> Context<'a> {
   /// Build a context wrapping `data` and a borrowed `shared` flags
   /// table. The flags are not mutated by the lib-first parse today;
   /// see the type-level docs for the Phase F2 / F3 plan.
@@ -588,42 +588,42 @@ impl parser_sealed::Sealed for ProcessWv {}
 
 impl FormatParser for ProcessWv {
   /// GAT: the Meta borrows from the input `'a` (Codex AF2).
-  type Meta<'a> = WvMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §6.4 — chained-format context is a struct wrapping `&[u8]` +
   /// `&mut SharedFlags`.
-  type Context<'a> = WvContext<'a>;
+  type Context<'a> = Context<'a>;
   /// Rust-level fatal error (none today; WavPack parsing has no I/O modes).
-  type Error = WvError;
+  type Error = Error;
 
-  /// Parse a WavPack file's bytes into a typed [`WvMeta`], or `None` if
+  /// Parse a WavPack file's bytes into a typed [`Meta`], or `None` if
   /// the buffer is not a valid WavPack file (short read, bad magic, or
   /// version-byte mismatch — WavPack.pm:87-88).
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, WvError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     Ok(parse_inner(ctx.data))
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] now that the
 /// [`FormatParser::Meta`] GAT threads the input borrow lifetime through —
-/// returns a [`WvMeta`] borrowing from the input buffer (zero allocation,
+/// returns a [`Meta`] borrowing from the input buffer (zero allocation,
 /// including the chained ID3/APE trailer scan range; Codex AF2).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<WvMeta<'_>>, WvError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   Ok(parse_inner(data))
 }
 
-/// Inner parser — produces a borrow-from-input [`WvMeta`]. The
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = WvMeta<'a>`) returns this
+/// Inner parser — produces a borrow-from-input [`Meta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns this
 /// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
 /// enum, keeping the live trailer-scan slice (Codex AF2).
-fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // WavPack.pm:87 `return 0 unless $raf->Read($buff, 32) == 32`.
   if data.len() < 32 {
     return None;
@@ -695,7 +695,7 @@ fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
   // by `Seek(0, 0)`) for RIFF wrapper / ID3 / APE trailers. The typed
   // parse exposes the range; the legacy bridge invokes the chained
   // parsers.
-  Some(WvMeta {
+  Some(Meta {
     bytes_per_sample,
     audio_type,
     compression,
@@ -711,7 +711,7 @@ fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl WvMeta<'_> {
+impl Meta<'_> {
   /// Emit WavPack tags into the writer in ExifTool numeric sort order
   /// (WavPack.pm:31-73 → ExifTool.pm:9907 sorted-key walk): 6.1
   /// BytesPerSample, 6.2 AudioType, 6.3 Compression, 6.4 DataFormat, 6.5
@@ -772,7 +772,7 @@ impl WvMeta<'_> {
 }
 
 // ===========================================================================
-// `WvError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for WavPack parsing. Currently empty — every
@@ -785,7 +785,7 @@ impl WvMeta<'_> {
 /// without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum WvError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -998,14 +998,14 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // `FormatParser` trait + `WvContext`
+  // `FormatParser` trait + `Context`
   // -------------------------------------------------------------------------
 
   #[test]
   fn format_parser_trait_returns_borrowed_meta() {
     let data = header_with_flags(0x0480_008d);
     let mut shared = SharedFlags::new();
-    let ctx = WvContext::new(&data, &mut shared);
+    let ctx = Context::new(&data, &mut shared);
     let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
       .expect("ok")
       .expect("parsed");
@@ -1025,7 +1025,7 @@ mod tests {
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"WVPK");
     let mut shared = SharedFlags::new();
-    let ctx = WvContext::new(&data, &mut shared);
+    let ctx = Context::new(&data, &mut shared);
     let result = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx).unwrap();
     assert!(result.is_none());
   }
@@ -1037,7 +1037,7 @@ mod tests {
     let data = header_with_flags(0);
     let mut shared = SharedFlags::new();
     {
-      let mut ctx = WvContext::new(&data, &mut shared);
+      let mut ctx = Context::new(&data, &mut shared);
       assert_eq!(ctx.shared().done_id3(), None);
       ctx.shared_mut().set_done_id3(128);
     }
@@ -1051,7 +1051,7 @@ mod tests {
   fn collect(flags_le: u32, print_conv: bool) -> TagMap {
     let data = header_with_flags(flags_le);
     let mut shared = SharedFlags::new();
-    let ctx = WvContext::new(&data, &mut shared);
+    let ctx = Context::new(&data, &mut shared);
     let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
       .unwrap()
       .unwrap();

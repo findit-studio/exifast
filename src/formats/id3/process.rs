@@ -708,7 +708,7 @@ pub struct Mp3Meta<'a> {
   /// Optional typed APE-trailer sub-Meta — present when the APE-trailer
   /// fallback (ID3.pm:1722-1727 `APE::ProcessAPE`) found an APETAGEX
   /// footer. `'a` is phantom (APE Meta owns its data).
-  ape: Option<crate::formats::ape::ApeMeta<'a>>,
+  ape: Option<crate::formats::ape::Meta<'a>>,
   /// `true` iff `ProcessID3` OR `ParseMPEGAudio` accepted (Perl `$rtnVal`
   /// at the end of `ProcessMP3`).
   found: bool,
@@ -733,7 +733,7 @@ impl<'a> Mp3Meta<'a> {
   /// Optional typed APE-trailer sub-Meta.
   #[must_use]
   #[inline(always)]
-  pub const fn ape(&self) -> Option<&crate::formats::ape::ApeMeta<'a>> {
+  pub const fn ape(&self) -> Option<&crate::formats::ape::Meta<'a>> {
     self.ape.as_ref()
   }
 
@@ -993,7 +993,7 @@ fn parse_mp3_typed<'a>(
   // `parse_trailer_only_owned` decouples the `shared` borrow from the
   // returned (owned, `'static`) Meta so the transient `shared` does not
   // pin the `Mp3Meta<'a>` lifetime; the owned Meta coerces to `'a`.
-  let ape: Option<crate::formats::ape::ApeMeta<'a>> = if shared.done_ape() {
+  let ape: Option<crate::formats::ape::Meta<'a>> = if shared.done_ape() {
     None
   } else {
     crate::formats::ape::parse_trailer_only_owned(data, shared)
@@ -1786,7 +1786,7 @@ mod tests {
   /// `parse_bytes(ID3v2_with_mpeg_audio.mp3)` dispatches to `AnyMeta::Mp3`
   /// (NOT `AnyMeta::Ogg`) with BOTH the ID3 sub-Meta (Title="Test") and the
   /// MPEG sub-Meta populated. Regression for Codex C-R2-1: the OGG typed
-  /// parser returns `Some(OggMeta { success: false })` for this ID3-prefixed
+  /// parser returns `Some(ogg::Meta { success: false })` for this ID3-prefixed
   /// input, which — before the fix — terminated the closed-dispatch
   /// candidate loop and mis-reported the file as `AnyMeta::Ogg`. The OGG arm
   /// now maps `success() == false` to `Ok(None)` so dispatch falls through

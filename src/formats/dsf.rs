@@ -6,7 +6,7 @@
 //! ExifTool 13.58, 138 lines). DSD Stream File container: `'DSD '` chunk +
 //! `'fmt '` chunk. Read-only.
 //!
-//! A typed [`DsfMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` and the chained ID3v2 trailer so the
@@ -16,19 +16,19 @@
 //!
 //! DSF chains into the bundled ID3v2 trailer at `metaPos` (DSF.pm:88-97).
 //! The chain is now fully typed: [`parse_inner`] parses the trailer slice
-//! into a nested [`crate::formats::id3::Id3Meta`] ([`DsfMeta::id3_ref`]) via
+//! into a nested [`crate::formats::id3::Id3Meta`] ([`Meta::id3_ref`]) via
 //! [`crate::formats::id3::process::parse_id3_borrowed`], and the
 //! `serialize_tags` sink emits its `File:ID3Size` + `ID3v2_*:*` tags after
-//! the `'fmt '` chunk. The `DsfContext<'a>` = `&'a [u8]` + `&'a mut
+//! the `'fmt '` chunk. The `Context<'a>` = `&'a [u8]` + `&'a mut
 //! SharedFlags` shape is retained for parser-trait uniformity even though
 //! DSF itself does not read/mutate `SharedFlags` (the trailer is a
 //! self-contained ID3 "file"; the typed nesting passes `shared = None`).
 //!
 //! ## ID3 trailer
 //!
-//! [`DsfMeta::id3_trailer`] still exposes the borrowed `&'a [u8]` of the
+//! [`Meta::id3_trailer`] still exposes the borrowed `&'a [u8]` of the
 //! trailer bytes (faithful to `DSF.pm:88-97`'s `$dirInfo{DataPt}` slice)
-//! as a lib-first convenience; [`DsfMeta::id3_ref`] is the typed sub-Meta
+//! as a lib-first convenience; [`Meta::id3_ref`] is the typed sub-Meta
 //! parsed from those same bytes, which the sink emits.
 
 use crate::{
@@ -121,7 +121,7 @@ pub static DSF_MAIN: TagTable = TagTable::new("File", dsf_get);
 const DSF_KEYS: &[i64] = &[3, 4, 5, 6, 7, 8, 9, 11];
 
 // ===========================================================================
-// Typed Meta — `DsfMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// The `'fmt '` chunk fields (DSF.pm:30-48). Every field is the raw
@@ -136,7 +136,7 @@ const DSF_KEYS: &[i64] = &[3, 4, 5, 6, 7, 8, 9, 11];
 /// produces a partial mask and the sink emits ONLY the present fields,
 /// faithful to ExifTool.pm:9953 `last if $more <= 0`.
 #[derive(Debug, Clone, Copy)]
-pub struct DsfFmtData {
+pub struct FmtData {
   /// 0x0c key 3 — `FormatVersion` (DSF.pm:30). int32u LE.
   format_version: u32,
   /// 0x10 key 4 — `FormatID` raw u32 (DSF.pm:31). PrintConv: 0⇒"DSD Raw".
@@ -164,7 +164,7 @@ pub struct DsfFmtData {
   present_mask: u8,
 }
 
-impl DsfFmtData {
+impl FmtData {
   /// DSF.pm:30 `3 => 'FormatVersion'` (int32u LE).
   #[must_use]
   #[inline(always)]
@@ -246,7 +246,7 @@ impl DsfFmtData {
 
 /// Typed DSF metadata — the lib-first output of [`ProcessDsf`].
 ///
-/// `DsfMeta` holds three orthogonal slices of the DSF.pm port:
+/// `Meta` holds three orthogonal slices of the DSF.pm port:
 ///
 /// 1. The `'fmt '` chunk fields ([`Self::fmt`]). `None` only on the
 ///    DSF.pm:71-72 Warn-then-return-1 path (a malformed `fmtLen` —
@@ -267,15 +267,15 @@ impl DsfFmtData {
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `DsfMeta` borrows only the optional ID3 trailer bytes
+/// **Lifetimes.** `Meta` borrows only the optional ID3 trailer bytes
 /// (`id3_trailer: Option<&'a [u8]>`) from the input. Every fmt-chunk
 /// integer is owned. The lifetime is preserved end-to-end so the
 /// `id3_trailer` slice can flow through `parse_borrowed` zero-alloc.
 #[derive(Debug, Clone)]
-pub struct DsfMeta<'a> {
+pub struct Meta<'a> {
   /// The eight `'fmt '` chunk fields (DSF.pm:30-48), or `None` on the
   /// DSF.pm:71-72 Warn-then-accept path.
-  fmt: Option<DsfFmtData>,
+  fmt: Option<FmtData>,
   /// `Some("Error reading DSF fmt chunk")` iff [`Self::fmt`] is `None`
   /// (DSF.pm:71). The bridge re-pushes this through
   /// `write_warning` so the bundled-Perl `$et->Warn(...)` semantics
@@ -300,16 +300,16 @@ pub struct DsfMeta<'a> {
   id3: Option<crate::formats::id3::Id3Meta<'a>>,
 }
 
-impl<'a> DsfMeta<'a> {
+impl<'a> Meta<'a> {
   /// The `'fmt '` chunk fields, present on every happy path and absent
   /// only on the DSF.pm:71-72 Warn-then-accept path.
   ///
-  /// §3: [`DsfFmtData`] is `Copy`, so an `Option<T: Copy>` field is
-  /// returned **by value** (`-> Option<DsfFmtData>`, bare name), not as a
+  /// §3: [`FmtData`] is `Copy`, so an `Option<T: Copy>` field is
+  /// returned **by value** (`-> Option<FmtData>`, bare name), not as a
   /// borrow.
   #[must_use]
   #[inline(always)]
-  pub const fn fmt(&self) -> Option<DsfFmtData> {
+  pub const fn fmt(&self) -> Option<FmtData> {
     self.fmt
   }
 
@@ -349,7 +349,7 @@ impl<'a> DsfMeta<'a> {
 }
 
 // ===========================================================================
-// `DsfContext` — per-format input view (chained shape)
+// `Context` — per-format input view (chained shape)
 // ===========================================================================
 
 /// Per-format `Context<'a>` for [`ProcessDsf`]. Spec §6.1: leaf formats
@@ -365,7 +365,7 @@ impl<'a> DsfMeta<'a> {
 ///
 /// D8 convention: PRIVATE fields; constructor + accessors only.
 #[derive(Debug)]
-pub struct DsfContext<'a> {
+pub struct Context<'a> {
   /// The full file bytes (`$raf` in DSF.pm). Borrows for `'a`.
   data: &'a [u8],
   /// The cross-format flag block (spec §6.4). DSF does not currently
@@ -375,7 +375,7 @@ pub struct DsfContext<'a> {
   shared: &'a mut SharedFlags,
 }
 
-impl<'a> DsfContext<'a> {
+impl<'a> Context<'a> {
   /// Construct a fresh DSF context (only constructor — D8 PRIVATE fields).
   #[must_use]
   #[inline(always)]
@@ -407,22 +407,22 @@ impl FormatParser for ProcessDsf {
   /// GAT: the Meta borrows the optional ID3v2 trailer from the input `'a`
   /// directly — zero allocation for the `AnyMeta` closed-set publish path
   /// (Codex AF2).
-  type Meta<'a> = DsfMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §6.1: chained format Context wraps `&'a [u8]` + `&'a mut
   /// SharedFlags`.
-  type Context<'a> = DsfContext<'a>;
+  type Context<'a> = Context<'a>;
   /// Rust-level fatal error (none today; DSF parsing has no I/O modes).
-  type Error = DsfError;
+  type Error = Error;
 
-  /// Parse a DSF file's bytes into a typed [`DsfMeta`] borrowing from
+  /// Parse a DSF file's bytes into a typed [`Meta`] borrowing from
   /// `ctx.data` (`'a`).
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, DsfError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(ctx.data)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
-/// [`DsfMeta`] that borrows the optional ID3v2 trailer from the input
+/// [`Meta`] that borrows the optional ID3v2 trailer from the input
 /// buffer — zero allocation. Identical to the [`FormatParser::parse`]
 /// path now that the [`FormatParser::Meta`] GAT threads the borrow
 /// lifetime through (Codex AF2).
@@ -431,12 +431,12 @@ impl FormatParser for ProcessDsf {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`DsfMeta`]. The
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = DsfMeta<'a>`) returns
+/// Inner parser — produces a borrow-from-input [`Meta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns
 /// this borrowed form (including the live ID3v2 trailer slice) directly
 /// into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
 ///
@@ -447,7 +447,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
 ///   but the fmt-chunk read failed (DSF.pm:71-72 Warn + return 1).
 /// - `Ok(Some({ fmt: Some(...), id3_trailer: Option<...> }))` — happy
 ///   path; optional ID3v2 trailer carried through.
-fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
+fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // DSF.pm:62 `$raf->Read($buff,40)==40 or return 0`.
   if data.len() < 40 {
     return Ok(None);
@@ -505,7 +505,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
     // Faithful to the bundled-Perl flow: the trailer's `metaPos`/`metaLen`
     // were already captured from the header.
     let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
-    return Ok(Some(DsfMeta {
+    return Ok(Some(Meta {
       fmt: None,
       fmt_warning: Some("Error reading DSF fmt chunk"),
       id3_trailer,
@@ -609,7 +609,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
     // produces no DSF:* output.
     None
   } else {
-    Some(DsfFmtData {
+    Some(FmtData {
       format_version,
       format_id,
       channel_type,
@@ -623,7 +623,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
     })
   };
   let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
-  Ok(Some(DsfMeta {
+  Ok(Some(Meta {
     fmt,
     fmt_warning: None,
     id3_trailer,
@@ -720,7 +720,7 @@ fn read_u64_le(b: &[u8]) -> u64 {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl DsfMeta<'_> {
+impl Meta<'_> {
   /// Emit DSF tags into the writer in `%DSF::Main` ascending-key order
   /// (DSF.pm has no `FIRST_ENTRY` hint, so ExifTool walks keys via
   /// `sort { $a <=> $b }` — DSF_KEYS). Family-0/1 group is `"File"`
@@ -834,12 +834,12 @@ impl DsfMeta<'_> {
 }
 
 // ===========================================================================
-// `DsfError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for DSF parsing. Currently empty — every bad
 /// input produces either `Ok(None)` (`return 0` per DSF.pm:62-63) or
-/// `Ok(Some(DsfMeta { fmt: None, fmt_warning: Some(...) }))` (`Warn +
+/// `Ok(Some(Meta { fmt: None, fmt_warning: Some(...) }))` (`Warn +
 /// return 1` per DSF.pm:71-72). Reserved for future I/O wrappers if
 /// streaming readers are added.
 ///
@@ -851,7 +851,7 @@ impl DsfMeta<'_> {
 /// `#[error(...)]` arms and no variant predicates (nothing to predicate).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DsfError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1286,7 +1286,7 @@ mod tests {
 
   #[test]
   fn sink_emits_warning_when_fmt_chunk_failed() {
-    let meta = DsfMeta {
+    let meta = Meta {
       fmt: None,
       fmt_warning: Some("Error reading DSF fmt chunk"),
       id3_trailer: None,
@@ -1305,8 +1305,8 @@ mod tests {
   fn sink_emits_int64u_above_i64_max_as_decimal_string() {
     // SampleCount = u64::MAX ⇒ post-promotion fmt
     // `sample_count_is_decimal_string = true` ⇒ `write_fmt` decimal.
-    let meta = DsfMeta {
-      fmt: Some(DsfFmtData {
+    let meta = Meta {
+      fmt: Some(FmtData {
         format_version: 0,
         format_id: 0,
         channel_type: 0,
@@ -1474,7 +1474,7 @@ mod tests {
   fn format_parser_trait_returns_borrowed_meta() {
     let bytes = happy_path_dsf();
     let mut shared = SharedFlags::new();
-    let ctx = DsfContext::new(&bytes, &mut shared);
+    let ctx = Context::new(&bytes, &mut shared);
     let meta = <ProcessDsf as FormatParser>::parse(&ProcessDsf, ctx)
       .expect("ok")
       .expect("parsed");
@@ -1638,11 +1638,11 @@ mod tests {
 
   #[test]
   fn dsf_fmt_accessor_is_byvalue_copy() {
-    // §3: `DsfFmtData` is Copy ⇒ `DsfMeta::fmt()` returns `Option<T>` by
+    // §3: `FmtData` is Copy ⇒ `Meta::fmt()` returns `Option<T>` by
     // value (not `Option<&T>`), and the field getters are by-value too.
     let buf = happy_path_dsf();
     let meta = parse_borrowed(&buf).expect("ok").expect("some");
-    let fmt: Option<DsfFmtData> = meta.fmt();
+    let fmt: Option<FmtData> = meta.fmt();
     let fmt = fmt.expect("fmt present on happy path");
     assert_eq!(fmt.channel_count(), 2);
     assert_eq!(fmt.sample_rate(), 2_822_400);
@@ -1665,11 +1665,11 @@ mod tests {
 
   #[test]
   fn dsf_error_is_uninhabited_and_thiserror_derived() {
-    // §5: DsfError is uninhabited; this proves the thiserror-derived
+    // §5: Error is uninhabited; this proves the thiserror-derived
     // `Display`/`Error` impls exist (must compile).
     fn _assert_error<E: core::error::Error>() {}
-    _assert_error::<DsfError>();
-    let none: Option<DsfError> = None;
+    _assert_error::<Error>();
+    let none: Option<Error> = None;
     assert!(none.is_none());
   }
 }

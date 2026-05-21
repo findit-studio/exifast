@@ -4,7 +4,7 @@
 #![cfg(feature = "flac")]
 //! Faithful port of `Image::ExifTool::FLAC` (lib/Image/ExifTool/FLAC.pm).
 //!
-//! A typed [`FlacMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! emits StreamInfo/Picture/Composite via the typed `serialize_tags` path
 //! and the list-aware VorbisComment stream directly into `Metadata`, so the
@@ -47,7 +47,7 @@ use crate::value::TagValue;
 // ===========================================================================
 // Static %FLAC::StreamInfo + %FLAC::Picture + %Vorbis::Comments tables
 //
-// Kept ALONGSIDE the typed FlacMeta so the engine entry `process` (and
+// Kept ALONGSIDE the typed Meta so the engine entry `process` (and
 // downstream consumers such as `tests/flac_streaminfo.rs`) keep their
 // faithful tag-table identities (group strings, ValueConv functions, list
 // flags, etc.). The typed parser does NOT depend on these tables for
@@ -150,7 +150,7 @@ fn flac_streaminfo_get(id: TagId) -> Option<&'static TagDef> {
 
 /// Faithful `%Image::ExifTool::FLAC::StreamInfo` (FLAC.pm:59-82). Kept public
 /// for downstream tests and shared bit-stream callers (e.g.
-/// `tests/flac_streaminfo.rs`); the typed [`FlacMeta`] parser does not
+/// `tests/flac_streaminfo.rs`); the typed [`Meta`] parser does not
 /// consult it directly.
 pub static FLAC_STREAMINFO_TABLE: TagTable = TagTable::new("FLAC", flac_streaminfo_get);
 
@@ -345,7 +345,7 @@ fn lookup_vorbis_named(tag: &str) -> Option<&'static TagDef> {
 }
 
 // ===========================================================================
-// Typed Meta — `FlacMeta<'a>`, `VorbisItem<'a>`, `FlacPicture<'a>`
+// Typed Meta — `Meta<'a>`, `VorbisItem<'a>`, `Picture<'a>`
 // ===========================================================================
 
 /// Decoded StreamInfo block (FLAC.pm:59-82). All fields are post-ValueConv.
@@ -353,7 +353,7 @@ fn lookup_vorbis_named(tag: &str) -> Option<&'static TagDef> {
 /// payload (faithful: bundled `process_bit_stream` silently drops late
 /// fields once `i2 >= dirLen`).
 ///
-/// D8 convention: PRIVATE fields, accessors only on [`FlacMeta`].
+/// D8 convention: PRIVATE fields, accessors only on [`Meta`].
 #[derive(Debug, Clone, Default)]
 struct StreamInfo {
   block_size_min: Option<u32>,
@@ -502,7 +502,7 @@ impl<'a> VorbisAuto<'a> {
 /// truncated (faithful ExifTool::ReadValue clamp at ExifTool.pm:6290-6298;
 /// rare but real).
 #[derive(Debug, Clone)]
-pub struct FlacPicture<'a> {
+pub struct Picture<'a> {
   /// FLAC.pm:88-113 PrintConv key (raw int32u).
   picture_type: u32,
   /// FLAC.pm:115-117 `Format => 'var_pstr32'`. UTF-8 string borrowed from
@@ -521,7 +521,7 @@ pub struct FlacPicture<'a> {
   data: &'a [u8],
 }
 
-impl FlacPicture<'_> {
+impl Picture<'_> {
   /// Picture type code (FLAC.pm:88-113 raw int32u, ID3-spec Picture type)
   /// (Copy → by value, bare name; §3).
   #[must_use]
@@ -596,23 +596,23 @@ impl FlacPicture<'_> {
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `FlacMeta` borrows from the input bytes where possible:
+/// **Lifetimes.** `Meta` borrows from the input bytes where possible:
 /// Vorbis values and Picture mime/description/data slices are
 /// `Cow<'a, str>` / `&'a [u8]`. Synthesized strings (auto-derived Vorbis
 /// names, lossy UTF-8 fallbacks) are owned. The StreamInfo scalars and
 /// composite [`Duration`] are owned primitives.
 #[derive(Debug, Clone, Default)]
-pub struct FlacMeta<'a> {
+pub struct Meta<'a> {
   stream_info: StreamInfo,
   vorbis: Vec<VorbisItem<'a>>,
-  pictures: Vec<FlacPicture<'a>>,
+  pictures: Vec<Picture<'a>>,
   /// FLAC.pm:278 — `$err and Warn('Format error in FLAC file')`. Carried as
   /// a boolean so the sink can emit the canonical warning text without
   /// duplication.
   format_error: bool,
 }
 
-impl<'a> FlacMeta<'a> {
+impl<'a> Meta<'a> {
   /// FLAC.pm:63 BlockSizeMin (`Bit000-015`) (Copy → by value; §3).
   #[must_use]
   #[inline(always)]
@@ -692,7 +692,7 @@ impl<'a> FlacMeta<'a> {
   /// projected to `&[T]`).
   #[must_use]
   #[inline(always)]
-  pub const fn pictures(&self) -> &[FlacPicture<'a>] {
+  pub const fn pictures(&self) -> &[Picture<'a>] {
     self.pictures.as_slice()
   }
   /// `Composite:Duration` — FLAC.pm:137-149 `($val[0] and $val[1]) ?
@@ -747,14 +747,14 @@ impl parser_sealed::Sealed for ProcessFlac {}
 /// (faithful to ExifTool's `$self` model). Today this PR only **reads**
 /// `done_id3` from the shared state; the actual `set_done_id3` call lands
 /// when F2 ID3 migrates (then the bridge plumbing wires it up end-to-end).
-pub struct FlacContext<'a> {
+pub struct Context<'a> {
   /// File bytes — typically the whole file (FLAC parsing is offset-based).
   data: &'a [u8],
   /// Cross-format shared state.
   shared: &'a mut crate::parser_new::SharedFlags,
 }
 
-impl<'a> FlacContext<'a> {
+impl<'a> Context<'a> {
   /// Construct a FLAC parser context.
   #[must_use]
   #[inline(always)]
@@ -782,29 +782,29 @@ impl FormatParser for ProcessFlac {
   /// Vorbis-comment strings and the picture payload), publishing into the
   /// closed [`AnyMeta`](crate::parser_new::AnyMeta) enum with no `'static`
   /// upgrade (Codex AF2).
-  type Meta<'a> = FlacMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §6.1: chained-format context with shared flags.
-  type Context<'a> = FlacContext<'a>;
+  type Context<'a> = Context<'a>;
   /// Rust-level fatal error type (no variants today; reserved for future
   /// I/O wrappers).
-  type Error = FlacError;
+  type Error = Error;
 
   /// Run the typed parser. Returns:
   /// - `Ok(Some(meta))` — FLAC magic accepted; tags extracted (FLAC.pm:279
   ///   `return 1`).
   /// - `Ok(None)` — magic rejected (FLAC.pm:254 `or return 0`).
   /// - `Err(_)` — unreachable today.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, FlacError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(ctx.data, ctx.shared)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns a
-/// [`FlacMeta`] that borrows from the input buffer — zero allocation on
+/// [`Meta`] that borrows from the input buffer — zero allocation on
 /// the happy-path UTF-8.
 ///
 /// `shared` borrows independently of `data` (decoupled lifetimes): the
-/// returned `FlacMeta<'a>` borrows only from `data`, so the closed
+/// returned `Meta<'a>` borrows only from `data`, so the closed
 /// [`crate::parser_new::AnyParser`] dispatch can pass a transient
 /// `shared` without pinning the returned `AnyMeta<'a>` (Codex AF2).
 ///
@@ -815,15 +815,15 @@ impl FormatParser for ProcessFlac {
 pub fn parse_borrowed<'a>(
   data: &'a [u8],
   shared: &mut crate::parser_new::SharedFlags,
-) -> Result<Option<FlacMeta<'a>>, FlacError> {
+) -> Result<Option<Meta<'a>>, Error> {
   parse_inner(data, shared)
 }
 
-/// Inner parser — produces a borrow-from-input [`FlacMeta`].
+/// Inner parser — produces a borrow-from-input [`Meta`].
 fn parse_inner<'a>(
   data: &'a [u8],
   _shared: &mut crate::parser_new::SharedFlags,
-) -> Result<Option<FlacMeta<'a>>, FlacError> {
+) -> Result<Option<Meta<'a>>, Error> {
   // -- FLAC.pm:243-247 — ID3-prefix skip ----------------------------------
   //
   //    unless ($$et{DoneID3}) {
@@ -858,7 +858,7 @@ fn parse_inner<'a>(
 
   // -- FLAC.pm:256-280 — block chain walk ---------------------------------
   // SetByteOrder('MM') is implicit (every multi-byte read below uses BE).
-  let mut meta = FlacMeta::default();
+  let mut meta = Meta::default();
   let mut pos = offset + 4;
   loop {
     // FLAC.pm:260 — `$raf->Read($buff, 4) == 4 or last` (silent exit; no err).
@@ -1147,11 +1147,11 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
 }
 
 /// Decode a FLAC Picture block body (FLAC.pm:84-134) into a typed
-/// [`FlacPicture`]. Returns `None` if the header bytes (PictureType +
+/// [`Picture`]. Returns `None` if the header bytes (PictureType +
 /// MIME length-word) are truncated — for any later truncation the
 /// declared length is clamped to the remaining bytes (ExifTool::ReadValue
 /// clamp at ExifTool.pm:6290-6298) and partial data is preserved.
-fn parse_flac_picture(payload: &[u8]) -> Option<FlacPicture<'_>> {
+fn parse_flac_picture(payload: &[u8]) -> Option<Picture<'_>> {
   let mut pos = 0usize;
   // -- index 0: PictureType (int32u BE) -----------------------------------
   if payload.len() < pos + 4 {
@@ -1186,7 +1186,7 @@ fn parse_flac_picture(payload: &[u8]) -> Option<FlacPicture<'_>> {
   // (faithful: empty picture is still a tag, just zero bytes).
   let data = if actual == 0 && length > 0 {
     // No payload bytes left for a declared >0 length ⇒ no Picture tag.
-    return Some(FlacPicture {
+    return Some(Picture {
       picture_type,
       mime_type: mime,
       description,
@@ -1203,7 +1203,7 @@ fn parse_flac_picture(payload: &[u8]) -> Option<FlacPicture<'_>> {
   } else {
     &payload[pos..pos + actual]
   };
-  Some(FlacPicture {
+  Some(Picture {
     picture_type,
     mime_type: mime,
     description,
@@ -1388,7 +1388,7 @@ fn decode_base64(s: &str) -> Vec<u8> {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl FlacMeta<'_> {
+impl Meta<'_> {
   /// Emit FLAC tags into the writer in bundled `perl exiftool -j -G1` order:
   /// `FLAC:*` StreamInfo (FLAC.pm:59-82) → `Vorbis:*` comments (Vorbis.pm:
   /// 175-203, vendor first then user comments in extraction order) →
@@ -1533,12 +1533,12 @@ impl FlacMeta<'_> {
   }
 }
 
-/// Sink a single [`FlacPicture`] in faithful FLAC.pm:84-134 order. Drops
+/// Sink a single [`Picture`] in faithful FLAC.pm:84-134 order. Drops
 /// the Picture sub-field iff `length > 0 && data.is_empty()` (ExifTool::
 /// ReadValue clamp at ExifTool.pm:6292 `count < 1 and return undef`).
 #[cfg(feature = "alloc")]
 fn sink_picture(
-  p: &FlacPicture<'_>,
+  p: &Picture<'_>,
   print_conv: bool,
   out: &mut crate::tagmap::TagMap,
 ) -> Result<(), core::convert::Infallible> {
@@ -1605,7 +1605,7 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
 }
 
 // ===========================================================================
-// `FlacError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for FLAC parsing. Currently empty — every bad
@@ -1617,7 +1617,7 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
 /// `#[non_exhaustive]` lets future variants land without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum FlacError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1633,7 +1633,7 @@ pub enum FlacError {}
 // call. The split exists so the two FLAC warnings — "Format error in
 // Vorbis comments" (FLAC.pm via Vorbis::ProcessComments returning 0) and
 // "Format error in FLAC file" (FLAC.pm:278) — can be interleaved at their
-// faithful `-G1` emission positions, which the typed `FlacMeta` cannot
+// faithful `-G1` emission positions, which the typed `Meta` cannot
 // carry on its own. List coalescing (Vorbis ARTIST/PERFORMER/CONTACT,
 // Vorbis.pm:85,86,94) is identical on both paths: `bridge_emit_vorbis` and
 // `serialize_tags` both call `TagMap::write_str_list`. The standalone
@@ -2145,7 +2145,7 @@ mod tests {
   fn sink_list_coalesces_repeated_artist_via_json_writer() {
     // Two ARTIST entries (listable) plus a non-listable TITLE between
     // pins both ordering and the first-occurrence-position contract.
-    let meta = FlacMeta {
+    let meta = Meta {
       stream_info: StreamInfo::default(),
       vorbis: vec![
         VorbisItem::Named(VorbisNamed::new("Artist", Cow::Borrowed("Alice"), true)),
@@ -2284,6 +2284,6 @@ mod tests {
     // §5: empty enum derives core::error::Error via thiserror — assert the
     // trait bound holds without needing to construct a value.
     fn assert_error<E: core::error::Error>() {}
-    assert_error::<FlacError>();
+    assert_error::<Error>();
   }
 }

@@ -7,7 +7,7 @@
 //! (`%AIFF::Main`, `%AIFF::Common`, `%AIFF::FormatVers`, `%AIFF::Comment`),
 //! and the custom `ProcessComment` chunk decoder (AIFF.pm:155-178).
 //!
-//! A typed [`AiffMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -36,7 +36,7 @@
 //! ## Composite Duration — emitted inline per Codex R4
 //!
 //! `%AIFF::Composite Duration` (AIFF.pm:136-145) is computed by
-//! [`AiffMeta`] post-chunk-loop and emitted by the sink. RawConv is
+//! [`Meta`] post-chunk-loop and emitted by the sink. RawConv is
 //! `$val[1]/$val[0]` (NumSampleFrames / SampleRate); PrintConv via
 //! [`crate::datetime::convert_duration`]. The Composite runtime / D11
 //! conversion context aren't required for this single self-contained tag
@@ -338,7 +338,7 @@ fn aiff_comment_get(id: TagId) -> Option<&'static TagDef> {
 pub static AIFF_COMMENT: TagTable = TagTable::new("AIFF", aiff_comment_get);
 
 // =============================================================================
-// Typed Meta — `AiffMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // =============================================================================
 
 /// AIFF / AIFC magic from the FORM header. AIFF.pm:209-210 reads
@@ -347,7 +347,7 @@ pub static AIFF_COMMENT: TagTable = TagTable::new("AIFF", aiff_comment_get);
 /// is solely the FileType / FileTypeExtension / MIMEType triplet.
 ///
 /// `Djvu` carries the AT&TFORM body. AIFF.pm:206 appends `" (multi-page)"`
-/// to FileType when the tail is `DJVM` (see [`AiffMeta::djvu_multi_page`]).
+/// to FileType when the tail is `DJVM` (see [`Meta::djvu_multi_page`]).
 /// Body parsing under the DjVu arm is deferred per the module-level doc.
 ///
 /// §2: `#[non_exhaustive]` (the FORM-magic vocabulary may grow with future
@@ -356,7 +356,7 @@ pub static AIFF_COMMENT: TagTable = TagTable::new("AIFF", aiff_comment_get);
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display)]
 #[display("{}", self.as_file_type())]
-pub enum AiffMagic {
+pub enum Magic {
   /// `FORM....AIFF` (AIFF.pm:209-210, `$1 == "AIFF"`).
   Aiff,
   /// `FORM....AIFC` (AIFF.pm:209-210, `$1 == "AIFC"`).
@@ -365,7 +365,7 @@ pub enum AiffMagic {
   Djvu,
 }
 
-impl AiffMagic {
+impl Magic {
   /// The `$1` capture form as a `&'static str` — the argument to
   /// `SetFileType` (`"AIFF"` / `"AIFC"`) or the AIFF.pm:202 explicit
   /// `"DJVU"`. Single source of truth for [`core::fmt::Display`] (§2).
@@ -373,9 +373,9 @@ impl AiffMagic {
   #[inline(always)]
   pub const fn as_file_type(self) -> &'static str {
     match self {
-      AiffMagic::Aiff => "AIFF",
-      AiffMagic::Aifc => "AIFC",
-      AiffMagic::Djvu => "DJVU",
+      Magic::Aiff => "AIFF",
+      Magic::Aifc => "AIFC",
+      Magic::Djvu => "DJVU",
     }
   }
 }
@@ -406,7 +406,7 @@ impl AiffMagic {
 #[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
-pub enum AiffSampleRate {
+pub enum SampleRate {
   /// Perl IV path: exact integer in `i64::MIN..=i64::MAX`.
   Int(i64),
   /// Perl UV path: exact positive integer in `(i64::MAX, u64::MAX]`.
@@ -416,7 +416,7 @@ pub enum AiffSampleRate {
   Float(f64),
 }
 
-impl AiffSampleRate {
+impl SampleRate {
   /// Convert the sample rate to an `f64` for arithmetic (Composite Duration).
   /// Faithful to Perl `0 + $val` numeric coercion:
   /// - `Int` → `n as f64`
@@ -429,9 +429,9 @@ impl AiffSampleRate {
   #[inline]
   pub fn as_f64(&self) -> Option<f64> {
     match self {
-      AiffSampleRate::Int(n) => Some(*n as f64),
-      AiffSampleRate::BigUInt(s) => s.parse::<f64>().ok(),
-      AiffSampleRate::Float(x) => Some(*x),
+      SampleRate::Int(n) => Some(*n as f64),
+      SampleRate::BigUInt(s) => s.parse::<f64>().ok(),
+      SampleRate::Float(x) => Some(*x),
     }
   }
 }
@@ -456,7 +456,7 @@ impl AiffSampleRate {
 #[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
-pub enum AiffCompressionType {
+pub enum CompressionType {
   /// `RawText` is the trimmed 4-byte string-fixed value as stored on
   /// disk (after [`process_binary_data`]'s `strip_at_first_null`). The
   /// sink path translates this via:
@@ -469,7 +469,7 @@ pub enum AiffCompressionType {
   RawText(Vec<u8>),
 }
 
-impl AiffCompressionType {
+impl CompressionType {
   /// Borrowed view of the raw 4-byte string-fixed CompressionType value
   /// (§3: `Vec<u8>` projected to `&[u8]`). The sink keys the PrintConv
   /// hash on `fix_utf8(self.raw_text())`.
@@ -477,7 +477,7 @@ impl AiffCompressionType {
   #[inline(always)]
   pub fn raw_text(&self) -> &[u8] {
     match self {
-      AiffCompressionType::RawText(b) => b.as_slice(),
+      CompressionType::RawText(b) => b.as_slice(),
     }
   }
 }
@@ -494,7 +494,7 @@ impl AiffCompressionType {
 ///
 /// D8 — private fields, accessors only.
 #[derive(Debug, Clone)]
-pub struct AiffComment {
+pub struct Comment {
   /// AIFF.pm:169 — `CommentTime` post-ValueConv. ConvertUnixTime
   /// produces `"YYYY:MM:DD HH:MM:SS"` (24h GMT).
   comment_time: String,
@@ -504,7 +504,7 @@ pub struct AiffComment {
   comment: String,
 }
 
-impl AiffComment {
+impl Comment {
   /// `CommentTime` as the formatted `"YYYY:MM:DD HH:MM:SS"` string
   /// (§3: `String` projected to `&str`).
   #[must_use]
@@ -534,7 +534,7 @@ impl AiffComment {
 ///
 /// D8 — private fields, accessors only.
 #[derive(Debug, Clone)]
-pub struct AiffCommon {
+pub struct Common {
   /// AIFF.pm:88 — NumChannels, raw int16u.
   num_channels: u16,
   /// AIFF.pm:89 — NumSampleFrames, raw int32u.
@@ -542,18 +542,18 @@ pub struct AiffCommon {
   /// AIFF.pm:90 — SampleSize, raw int16u.
   sample_size: u16,
   /// AIFF.pm:91 — SampleRate, 80-bit extended decoded value.
-  sample_rate: AiffSampleRate,
+  sample_rate: SampleRate,
   /// AIFF.pm:92-111 — `CompressionType` (AIFC only). Raw 4-byte string;
   /// PrintConv hash applied at sink time. `None` for AIFF (no chunk
   /// content past offset 8) OR a truncated COMM chunk where bytes 18..22
   /// are unavailable.
-  compression_type: Option<AiffCompressionType>,
+  compression_type: Option<CompressionType>,
   /// AIFF.pm:112-116 — `CompressorName` (AIFC only). Post-`Decode(MacRoman)`
   /// pstring. `None` for AIFF OR for AIFC files lacking the pstring tail.
   compressor_name: Option<String>,
 }
 
-impl AiffCommon {
+impl Common {
   /// NumChannels, raw int16u (Copy → by value, bare name; §3).
   #[must_use]
   #[inline(always)]
@@ -575,14 +575,14 @@ impl AiffCommon {
   /// SampleRate, 80-bit extended decoded (§3: non-`Copy` borrow ⇒ `_ref`).
   #[must_use]
   #[inline(always)]
-  pub const fn sample_rate_ref(&self) -> &AiffSampleRate {
+  pub const fn sample_rate_ref(&self) -> &SampleRate {
     &self.sample_rate
   }
   /// `CompressionType` (AIFC). `None` for AIFF or short COMM (§3:
   /// `Option<T>` non-`Copy` ⇒ `Option<&T>` with the `_ref` name).
   #[must_use]
   #[inline(always)]
-  pub const fn compression_type_ref(&self) -> Option<&AiffCompressionType> {
+  pub const fn compression_type_ref(&self) -> Option<&CompressionType> {
     self.compression_type.as_ref()
   }
   /// `CompressorName` (AIFC, MacRoman-decoded pstring). `None` for AIFF
@@ -595,7 +595,7 @@ impl AiffCommon {
 }
 
 /// One chronological emission entry. The chunk loop produces these in the
-/// order encountered in the file; [`AiffMeta::events`] preserves that
+/// order encountered in the file; [`Meta::events`] preserves that
 /// order so `serialize_tags` emits byte-exact-to-Perl iteration.
 ///
 /// Each variant is the smallest typed shape sufficient to re-emit with
@@ -605,12 +605,12 @@ enum AiffEvent {
   /// `FVER` (FormatVersionTime). Post-ValueConv `ConvertUnixTime` string.
   FormatVersionTime(String),
   /// `COMM` (Common) — emits its 4-6 sub-fields. Carries the typed
-  /// [`AiffCommon`] for the sink to walk in `process_binary_data` order.
-  Common(AiffCommon),
+  /// [`Common`] for the sink to walk in `process_binary_data` order.
+  Common(Common),
   /// `COMT` (Comment) — one entry per `numComments`. The sink emits the
   /// per-comment tags in `(CommentTime, [MarkerID], Comment)` order
   /// (faithful to AIFF.pm:169-174).
-  Comment(AiffComment),
+  Comment(Comment),
   /// `NAME` — MacRoman-decoded text scalar. Last-write-wins via the push
   /// (see `Metadata::push` semantics + the `AIFF_dup_name` golden).
   Name(String),
@@ -638,7 +638,7 @@ enum AiffEvent {
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `AiffMeta` owns its strings (MacRoman decode produces
+/// **Lifetimes.** `Meta` owns its strings (MacRoman decode produces
 /// owned `String`; the on-disk byte slices are not borrowed past the
 /// parse). The `<'a>` lifetime parameter is held for shape parity with
 /// the rest of Phase F's typed Metas and to allow a future zero-alloc
@@ -663,9 +663,9 @@ enum AiffEvent {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone)]
-pub struct AiffMeta<'a> {
+pub struct Meta<'a> {
   /// AIFF / AIFC / DJVU magic.
-  magic: AiffMagic,
+  magic: Magic,
   /// True iff [`Self::magic`] is `Djvu` AND the on-disk tail at bytes
   /// 12..16 was `DJVM` (multi-page). AIFF.pm:206 appends ` (multi-page)`
   /// to FileType in that case.
@@ -686,12 +686,12 @@ pub struct AiffMeta<'a> {
   _lifetime: core::marker::PhantomData<&'a ()>,
 }
 
-impl AiffMeta<'_> {
+impl Meta<'_> {
   /// AIFF / AIFC / DJVU magic from the FORM header (AIFF.pm:209-210)
   /// (Copy → by value, bare name; §3).
   #[must_use]
   #[inline(always)]
-  pub const fn magic(&self) -> AiffMagic {
+  pub const fn magic(&self) -> Magic {
     self.magic
   }
 
@@ -707,7 +707,7 @@ impl AiffMeta<'_> {
   /// was found. When multiple COMM chunks appear (pathological), returns
   /// the LAST per Perl FoundTag last-write-wins.
   #[must_use]
-  pub fn common(&self) -> Option<&AiffCommon> {
+  pub fn common(&self) -> Option<&Common> {
     self.events.iter().rev().find_map(|e| {
       if let AiffEvent::Common(c) = e {
         Some(c)
@@ -719,7 +719,7 @@ impl AiffMeta<'_> {
 
   /// Per-`%AIFF::Comment` entries in chronological (in-file) order.
   /// Empty when no COMT chunk is present.
-  pub fn comments(&self) -> impl Iterator<Item = &AiffComment> {
+  pub fn comments(&self) -> impl Iterator<Item = &Comment> {
     self.events.iter().filter_map(|e| match e {
       AiffEvent::Comment(c) => Some(c),
       _ => None,
@@ -854,34 +854,34 @@ impl FormatParser for ProcessAiff {
   /// ID3 chunk dispatch is deferred per [[exifast-phase2-forward-items]],
   /// AIFF does not touch DoneID3.
   /// GAT: the Meta borrows from the input `'a` (Codex AF2).
-  type Meta<'a> = AiffMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; AIFF parsing has no I/O modes —
   /// every bad input is `Ok(None)` per Perl `return 0`).
-  type Error = AiffError;
+  type Error = Error;
 
-  /// Parse an AIFF/AIFC/DJVU file's bytes into a typed [`AiffMeta`], or
+  /// Parse an AIFF/AIFC/DJVU file's bytes into a typed [`Meta`], or
   /// `None` if the buffer is not a recognized FORM container (AIFF.pm:191
   /// short read, :209 magic mismatch, :199 AT&TFORM tail mismatch).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AiffError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(data)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`AiffMeta`] that may borrow from the input buffer (currently every
+/// [`Meta`] that may borrow from the input buffer (currently every
 /// string is owned, but the `<'a>` is reserved for future zero-alloc).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
-fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
+fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // AIFF.pm:191 `return 0 unless $raf->Read($buff, 12) == 12`.
   if data.len() < 12 {
     return Ok(None);
@@ -892,7 +892,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
   // file type is `'DJVU'` (AIFF.pm:202), with `' (multi-page)'`
   // appended when the tail was `DJVM` (AIFF.pm:206).
   let mut djvm_multi_page = false;
-  let magic: AiffMagic = if data.starts_with(b"AT&TFORM") {
+  let magic: Magic = if data.starts_with(b"AT&TFORM") {
     if data.len() < 16 {
       return Ok(None);
     }
@@ -901,15 +901,15 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
       b"DJVM" => djvm_multi_page = true,
       _ => return Ok(None),
     }
-    AiffMagic::Djvu
+    Magic::Djvu
   } else {
     // AIFF.pm:209 `return 0 unless $buff =~ /^FORM....(AIF(F|C))/s`.
     if &data[0..4] != b"FORM" {
       return Ok(None);
     }
     match &data[8..12] {
-      b"AIFF" => AiffMagic::Aiff,
-      b"AIFC" => AiffMagic::Aifc,
+      b"AIFF" => Magic::Aiff,
+      b"AIFC" => Magic::Aifc,
       _ => return Ok(None),
     }
   };
@@ -919,8 +919,8 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
   // run the chunk loop; we have no DjVu module ported, so the chunk
   // loop is skipped. This is identical to AIFF.pm's `fast3` mode
   // (AIFF.pm:203 `return 1 if $fast3`).
-  if magic == AiffMagic::Djvu {
-    return Ok(Some(AiffMeta {
+  if magic == Magic::Djvu {
+    return Ok(Some(Meta {
       magic,
       djvm_multi_page,
       events: Vec::new(),
@@ -997,9 +997,9 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
       }
       let body: &[u8] = &data[pos..pos + len];
       // Dispatch by chunk:
-      //   COMM  → process_binary_data(AIFF_COMMON, FORMAT=int16u)  → AiffCommon
+      //   COMM  → process_binary_data(AIFF_COMMON, FORMAT=int16u)  → Common
       //   FVER  → process_binary_data(AIFF_FORMAT_VERS, FORMAT=int32u) → str
-      //   COMT  → stage_comment (custom)                              → AiffComment×n
+      //   COMT  → stage_comment (custom)                              → Comment×n
       //   ID3   → deferred (skip body; recognized but no tags emitted)
       //   else  → scalar tag (NAME/AUTH/(c) /ANNO/APPL) — trim trailing
       //           NULs (AIFF.pm:249-251) and decode/copy per def.
@@ -1078,7 +1078,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
   //   `PrintConv => 'ConvertDuration($val)'`
   let composite_duration = compute_composite_duration(&events);
 
-  Ok(Some(AiffMeta {
+  Ok(Some(Meta {
     magic,
     djvm_multi_page,
     events,
@@ -1094,7 +1094,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<AiffMeta<'_>>, AiffError> {
 /// May return a NON-FINITE f64 (Inf / NaN) for adversarial SampleRate
 /// extended values; the sink emits those via [`perl_nonfinite_str`].
 fn compute_composite_duration(events: &[AiffEvent]) -> Option<f64> {
-  // Walk back through events to find the LAST AiffCommon (faithful to
+  // Walk back through events to find the LAST Common (faithful to
   // Perl `FoundTag` last-write-wins for the rare multi-COMM case).
   let common = events.iter().rev().find_map(|e| match e {
     AiffEvent::Common(c) => Some(c),
@@ -1158,7 +1158,7 @@ fn stage_comments(data: &[u8], events: &mut Vec<AiffEvent>) {
       // (Cross-checked: the AIFF.aif fixture exercises one full
       // comment; no fixture today triggers the overrun, so this
       // branch is defensive.)
-      events.push(AiffEvent::Comment(AiffComment {
+      events.push(AiffEvent::Comment(Comment {
         comment_time,
         marker_id: marker_id_opt,
         comment: String::new(),
@@ -1170,7 +1170,7 @@ fn stage_comments(data: &[u8], events: &mut Vec<AiffEvent>) {
     let raw_bytes = &data[pos..pos + size];
     // ValueConv = Decode(MacRoman).
     let comment = decode_macroman(raw_bytes);
-    events.push(AiffEvent::Comment(AiffComment {
+    events.push(AiffEvent::Comment(Comment {
       comment_time,
       marker_id: marker_id_opt,
       comment,
@@ -1184,12 +1184,12 @@ fn stage_comments(data: &[u8], events: &mut Vec<AiffEvent>) {
 /// `%AIFF::Common` (COMM chunk) processor. Walks the 6-key table via
 /// the existing [`process_binary_data`] (which is the shared engine
 /// path used by every Format=int16u table) into a staging Metadata,
-/// then lifts the tags into a typed [`AiffCommon`].
+/// then lifts the tags into a typed [`Common`].
 ///
 /// We call with `print_conv_enabled = false` so the staging values are
 /// POST-ValueConv but PRE-PrintConv: the sink path applies PrintConv
 /// based on the runtime flag.
-fn stage_common(body: &[u8]) -> Option<AiffCommon> {
+fn stage_common(body: &[u8]) -> Option<Common> {
   let mut staging = Metadata::new("aiff-common-staging");
   process_binary_data(
     body,
@@ -1203,8 +1203,8 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
   let mut num_channels: Option<u16> = None;
   let mut num_sample_frames: Option<u32> = None;
   let mut sample_size: Option<u16> = None;
-  let mut sample_rate: Option<AiffSampleRate> = None;
-  let mut compression_type: Option<AiffCompressionType> = None;
+  let mut sample_rate: Option<SampleRate> = None;
+  let mut compression_type: Option<CompressionType> = None;
   let mut compressor_name: Option<String> = None;
 
   for tag in staging.tags_slice() {
@@ -1226,10 +1226,10 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
       }
       "SampleRate" => {
         sample_rate = Some(match tag.value_ref() {
-          TagValue::I64(n) => AiffSampleRate::Int(*n),
-          TagValue::F64(x) => AiffSampleRate::Float(*x),
-          TagValue::Str(s) => AiffSampleRate::BigUInt(s.to_string()),
-          _ => AiffSampleRate::Int(0), // defensive: get_extended doesn't produce others
+          TagValue::I64(n) => SampleRate::Int(*n),
+          TagValue::F64(x) => SampleRate::Float(*x),
+          TagValue::Str(s) => SampleRate::BigUInt(s.to_string()),
+          _ => SampleRate::Int(0), // defensive: get_extended doesn't produce others
         });
       }
       "CompressionType" => {
@@ -1250,7 +1250,7 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
           TagValue::Bytes(b) => b.clone(),
           _ => Vec::new(),
         };
-        compression_type = Some(AiffCompressionType::RawText(raw));
+        compression_type = Some(CompressionType::RawText(raw));
       }
       "CompressorName" => {
         // Post-ValueConv `Decode(MacRoman)` ⇒ TagValue::Str.
@@ -1273,7 +1273,7 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
     return None;
   };
 
-  Some(AiffCommon {
+  Some(Common {
     num_channels,
     num_sample_frames,
     sample_size,
@@ -1339,7 +1339,7 @@ fn tag_str_to_static(s: &str) -> &'static str {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl AiffMeta<'_> {
+impl Meta<'_> {
   /// Emit AIFF tags into the writer in faithful chunk-order plus the
   /// post-loop Composite Duration. `print_conv = true` ⇒ PrintConv
   /// formatted strings (`-j` mode); `print_conv = false` ⇒ post-ValueConv
@@ -1356,7 +1356,7 @@ impl AiffMeta<'_> {
   ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "AIFF";
 
-    if self.magic == AiffMagic::Djvu {
+    if self.magic == Magic::Djvu {
       // DjVu body parsing is deferred (see module doc). Sink emits
       // nothing here; the File:FileType suffix is handled by the engine
       // entry `process` directly on `ctx.metadata()`.
@@ -1423,7 +1423,7 @@ impl AiffMeta<'_> {
 #[cfg(feature = "alloc")]
 fn sink_common(
   out: &mut crate::tagmap::TagMap,
-  c: &AiffCommon,
+  c: &Common,
   print_conv: bool,
 ) -> Result<(), core::convert::Infallible> {
   const GROUP: &str = "AIFF";
@@ -1441,7 +1441,7 @@ fn sink_common(
   sink_sample_rate(out, &c.sample_rate)?;
   // 9 CompressionType (string[4], AIFC only). PrintConv hash applied
   //   at sink time (or `-n` raw text).
-  if let Some(AiffCompressionType::RawText(raw)) = &c.compression_type {
+  if let Some(CompressionType::RawText(raw)) = &c.compression_type {
     let key = crate::convert::fix_utf8(raw);
     if print_conv {
       // PrintConv hash lookup. Miss ⇒ "Unknown (X)" where X is the
@@ -1485,7 +1485,7 @@ fn sink_common(
 #[cfg(feature = "alloc")]
 fn sink_compressor_name(
   out: &mut crate::tagmap::TagMap,
-  c: &AiffCommon,
+  c: &Common,
   _print_conv: bool,
 ) -> Result<(), core::convert::Infallible> {
   if let Some(name) = &c.compressor_name {
@@ -1497,7 +1497,7 @@ fn sink_compressor_name(
 #[cfg(feature = "alloc")]
 fn sink_sample_rate(
   out: &mut crate::tagmap::TagMap,
-  sr: &AiffSampleRate,
+  sr: &SampleRate,
 ) -> Result<(), core::convert::Infallible> {
   // Spec §8: extended → I64 (Perl IV), F64 (Perl NV), or Str("<decimal>")
   // (Perl UV path, > i64::MAX positive). The writer routes:
@@ -1507,9 +1507,9 @@ fn sink_sample_rate(
   //   - BigUInt(s) ⇒ Str token; serializer quotes > 15-digit text
   //     (write_str)
   match sr {
-    AiffSampleRate::Int(n) => out.write_i64("AIFF", "SampleRate", *n),
-    AiffSampleRate::BigUInt(s) => out.write_str("AIFF", "SampleRate", s),
-    AiffSampleRate::Float(x) => {
+    SampleRate::Int(n) => out.write_i64("AIFF", "SampleRate", *n),
+    SampleRate::BigUInt(s) => out.write_str("AIFF", "SampleRate", s),
+    SampleRate::Float(x) => {
       if let Some(non_finite) = perl_nonfinite_str(*x) {
         out.write_fmt("AIFF", "SampleRate", |w| w.write_str(non_finite))
       } else {
@@ -1522,7 +1522,7 @@ fn sink_sample_rate(
 #[cfg(feature = "alloc")]
 fn sink_comment(
   out: &mut crate::tagmap::TagMap,
-  c: &AiffComment,
+  c: &Comment,
 ) -> Result<(), core::convert::Infallible> {
   const GROUP: &str = "AIFF";
   // AIFF.pm:169 — CommentTime always emitted. PrintConv is identity
@@ -1540,7 +1540,7 @@ fn sink_comment(
 }
 
 // ===========================================================================
-// `AiffError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for AIFF parsing. Currently empty — every bad
@@ -1552,7 +1552,7 @@ fn sink_comment(
 /// `#[non_exhaustive]` lets future variants land without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AiffError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1797,12 +1797,7 @@ mod tests {
     data.extend_from_slice(b"abcd"); // text
     // Second comment header truncated: data ends after first.
     stage_comments(&data, &mut events);
-    assert_eq!(
-      events.len(),
-      1,
-      "one AiffComment per stage; got {:?}",
-      events
-    );
+    assert_eq!(events.len(), 1, "one Comment per stage; got {:?}", events);
     if let AiffEvent::Comment(c) = &events[0] {
       assert_eq!(c.marker_id(), None);
       assert_eq!(c.comment(), "abcd");
@@ -1847,7 +1842,7 @@ mod tests {
     data.extend_from_slice(&body);
 
     let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
-    assert_eq!(meta.magic(), AiffMagic::Aiff);
+    assert_eq!(meta.magic(), Magic::Aiff);
     assert_eq!(meta.name(), Some("Hello"));
     let common = meta.common().expect("COMM extracted");
     assert_eq!(common.num_channels(), 2);
@@ -1857,7 +1852,7 @@ mod tests {
     // (exp != 0 ⇒ Perl NV path even for integer-valued results). Codex
     // R10 documented this divergence; the SampleRate variant matches.
     assert!(
-      matches!(common.sample_rate_ref(), AiffSampleRate::Float(x) if (*x - 22050.0).abs() < 1e-9)
+      matches!(common.sample_rate_ref(), SampleRate::Float(x) if (*x - 22050.0).abs() < 1e-9)
     );
     let dur = meta.duration().expect("duration finite & positive");
     assert!((dur.as_secs_f64() - 4.0).abs() < 1e-9);
@@ -1868,31 +1863,31 @@ mod tests {
   #[test]
   fn aiff_magic_predicates_and_display_route_through_as_file_type() {
     // §2: is_* predicates (derive_more::IsVariant).
-    assert!(AiffMagic::Aiff.is_aiff());
-    assert!(AiffMagic::Aifc.is_aifc());
-    assert!(AiffMagic::Djvu.is_djvu());
-    assert!(!AiffMagic::Aiff.is_djvu());
+    assert!(Magic::Aiff.is_aiff());
+    assert!(Magic::Aifc.is_aifc());
+    assert!(Magic::Djvu.is_djvu());
+    assert!(!Magic::Aiff.is_djvu());
     // §2: Display is the single `as_file_type` source of truth.
-    for m in [AiffMagic::Aiff, AiffMagic::Aifc, AiffMagic::Djvu] {
+    for m in [Magic::Aiff, Magic::Aifc, Magic::Djvu] {
       assert_eq!(m.to_string(), m.as_file_type());
     }
-    assert_eq!(AiffMagic::Aifc.to_string(), "AIFC");
+    assert_eq!(Magic::Aifc.to_string(), "AIFC");
   }
 
   #[test]
   fn aiff_sample_rate_predicates_and_unwrap_accessors() {
-    let i = AiffSampleRate::Int(44_100);
+    let i = SampleRate::Int(44_100);
     assert!(i.is_int());
     assert_eq!(*i.unwrap_int_ref(), 44_100);
-    let b = AiffSampleRate::BigUInt("18446744073709551615".into());
+    let b = SampleRate::BigUInt("18446744073709551615".into());
     assert!(b.is_big_u_int());
     assert!(b.try_unwrap_float_ref().is_err());
-    let f = AiffSampleRate::Float(48_000.5);
+    let f = SampleRate::Float(48_000.5);
     assert!(f.is_float());
     assert!((f.try_unwrap_float_ref().copied().unwrap() - 48_000.5).abs() < 1e-9);
     // Non-finite faithful behavior preserved through as_f64.
     assert!(
-      AiffSampleRate::Float(f64::INFINITY)
+      SampleRate::Float(f64::INFINITY)
         .as_f64()
         .unwrap()
         .is_infinite()
@@ -1901,7 +1896,7 @@ mod tests {
 
   #[test]
   fn aiff_compression_type_raw_text_projects_to_slice() {
-    let c = AiffCompressionType::RawText(b"NONE".to_vec());
+    let c = CompressionType::RawText(b"NONE".to_vec());
     assert!(c.is_raw_text());
     assert_eq!(c.raw_text(), b"NONE");
     assert_eq!(c.unwrap_raw_text_ref().as_slice(), b"NONE");
@@ -1911,6 +1906,6 @@ mod tests {
   fn aiff_error_is_thiserror_uninhabited() {
     // §5: empty enum derives core::error::Error via thiserror.
     fn assert_error<E: core::error::Error>() {}
-    assert_error::<AiffError>();
+    assert_error::<Error>();
   }
 }

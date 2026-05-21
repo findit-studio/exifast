@@ -357,32 +357,32 @@ pub enum AnyMeta<'a> {
   Mp3(crate::formats::id3::Mp3Meta<'a>),
   /// AIFF (Phase F3).
   #[cfg(feature = "aiff")]
-  Aiff(crate::formats::aiff::AiffMeta<'a>),
+  Aiff(crate::formats::aiff::Meta<'a>),
   /// APE (Phase F3).
   #[cfg(feature = "ape")]
-  Ape(crate::formats::ape::ApeMeta<'a>),
+  Ape(crate::formats::ape::Meta<'a>),
   /// DSF (Phase F3).
   #[cfg(feature = "dsf")]
-  Dsf(crate::formats::dsf::DsfMeta<'a>),
+  Dsf(crate::formats::dsf::Meta<'a>),
   /// FLAC (Phase F3).
   #[cfg(feature = "flac")]
-  Flac(crate::formats::flac::FlacMeta<'a>),
+  Flac(crate::formats::flac::Meta<'a>),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
   /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces a
-  /// borrowed `OggMeta<'a>` via the [`FormatParser::Meta`] GAT (Codex
-  /// AF2; `'a` is phantom there since `OggMeta` owns its data).
+  /// borrowed `ogg::Meta<'a>` via the [`FormatParser::Meta`] GAT (Codex
+  /// AF2; `'a` is phantom there since `ogg::Meta` owns its data).
   #[cfg(feature = "ogg")]
-  Ogg(crate::formats::ogg::OggMeta<'a>),
+  Ogg(crate::formats::ogg::Meta<'a>),
   /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
   /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
   #[cfg(feature = "mpeg-audio")]
   MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
   /// MPC (Phase F5 — Musepack SV7/SV8 audio).
   #[cfg(feature = "mpc")]
-  Mpc(crate::formats::mpc::MpcMeta<'a>),
+  Mpc(crate::formats::mpc::Meta<'a>),
   /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
   #[cfg(feature = "wavpack")]
-  Wv(crate::formats::wavpack::WvMeta<'a>),
+  Wv(crate::formats::wavpack::Meta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -797,23 +797,23 @@ pub enum AnyError {
   /// AIFF fatal-error wrapper.
   #[cfg(feature = "aiff")]
   #[error("AIFF: {0}")]
-  Aiff(#[from] crate::formats::aiff::AiffError),
+  Aiff(#[from] crate::formats::aiff::Error),
   /// APE fatal-error wrapper.
   #[cfg(feature = "ape")]
   #[error("APE: {0}")]
-  Ape(#[from] crate::formats::ape::ApeError),
+  Ape(#[from] crate::formats::ape::Error),
   /// DSF fatal-error wrapper.
   #[cfg(feature = "dsf")]
   #[error("DSF: {0}")]
-  Dsf(#[from] crate::formats::dsf::DsfError),
+  Dsf(#[from] crate::formats::dsf::Error),
   /// FLAC fatal-error wrapper.
   #[cfg(feature = "flac")]
   #[error("FLAC: {0}")]
-  Flac(#[from] crate::formats::flac::FlacError),
+  Flac(#[from] crate::formats::flac::Error),
   /// Ogg fatal-error wrapper.
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
-  Ogg(#[from] crate::formats::ogg::OggError),
+  Ogg(#[from] crate::formats::ogg::Error),
   /// MPEG audio fatal-error wrapper.
   #[cfg(feature = "mpeg-audio")]
   #[error("MPEG-audio: {0}")]
@@ -821,11 +821,11 @@ pub enum AnyError {
   /// MPC fatal-error wrapper.
   #[cfg(feature = "mpc")]
   #[error("MPC: {0}")]
-  Mpc(#[from] crate::formats::mpc::MpcError),
+  Mpc(#[from] crate::formats::mpc::Error),
   /// WavPack fatal-error wrapper.
   #[cfg(feature = "wavpack")]
   #[error("WV: {0}")]
-  Wv(#[from] crate::formats::wavpack::WvError),
+  Wv(#[from] crate::formats::wavpack::Error),
 }
 
 /// Compute the bundled `$hdrEnd` (ID3.pm:1457-1465,1504) for an `ID3`-prefixed
@@ -996,7 +996,7 @@ impl AnyParser {
         let _ = (p, ext);
         // `parse_full_chained` runs the embedded ID3 chain (prefix v2 /
         // trailer v1, APE.pm:124-127) and nests the typed `Id3Meta` into the
-        // returned `ApeMeta`, so the typed `parse_any` path emits the complete
+        // returned `ape::Meta`, so the typed `parse_any` path emits the complete
         // `File:ID3Size` + `ID3v2_*`/`ID3v1` + `MAC:*` + `APE:*` tag set —
         // matching the engine `ProcessApe::process`. (`ape` pulls `id3`.)
         Ok(crate::formats::ape::parse_full_chained(bytes, shared).map(AnyMeta::Ape))
@@ -1020,7 +1020,7 @@ impl AnyParser {
       #[cfg(feature = "ogg")]
       AnyParser::Ogg(p) => {
         let _ = (shared, ext);
-        // The OGG typed parser returns `Some(OggMeta { success: false })`
+        // The OGG typed parser returns `Some(ogg::Meta { success: false })`
         // (carrying the "Not a valid OGG file" warning) for non-OGG /
         // garbage input, faithful to the bundled `ProcessOGG` return. In
         // this `parse_any` library path `Ok(Some(_))` terminates the

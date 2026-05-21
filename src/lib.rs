@@ -143,17 +143,17 @@ pub use parser_new::{
 #[cfg(feature = "aac")]
 pub use formats::aac::ProcessAac;
 #[cfg(feature = "aiff")]
-pub use formats::aiff::{AiffError, AiffMeta, ProcessAiff};
+pub use formats::aiff::ProcessAiff;
 #[cfg(feature = "ape")]
-pub use formats::ape::{ApeContext, ApeError, ApeMeta, ProcessApe};
+pub use formats::ape::ProcessApe;
 #[cfg(feature = "audible")]
 pub use formats::audible::ProcessAa;
 #[cfg(feature = "dsf")]
-pub use formats::dsf::{DsfContext, DsfError, DsfMeta, ProcessDsf};
+pub use formats::dsf::ProcessDsf;
 #[cfg(feature = "dv")]
 pub use formats::dv::ProcessDv;
 #[cfg(feature = "flac")]
-pub use formats::flac::{FlacContext, FlacError, FlacMeta, ProcessFlac};
+pub use formats::flac::ProcessFlac;
 #[cfg(feature = "id3")]
 pub use formats::id3::{
   Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
@@ -164,15 +164,15 @@ pub use formats::id3::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3};
 #[cfg(feature = "moi")]
 pub use formats::moi::ProcessMoi;
 #[cfg(feature = "mpc")]
-pub use formats::mpc::{MpcContext, MpcError, MpcMeta, ProcessMpc};
+pub use formats::mpc::ProcessMpc;
 #[cfg(feature = "mpeg-audio")]
 pub use formats::mpeg::{MpegAudioContext, MpegAudioError, MpegAudioMeta, ProcessMpegAudio};
 #[cfg(feature = "ogg")]
-pub use formats::ogg::{OggError, OggMeta, ProcessOgg};
+pub use formats::ogg::ProcessOgg;
 #[cfg(feature = "red")]
 pub use formats::red::ProcessR3D;
 #[cfg(feature = "wavpack")]
-pub use formats::wavpack::{ProcessWv, WvContext, WvError, WvMeta};
+pub use formats::wavpack::ProcessWv;
 
 // ===========================================================================
 // `parse_bytes` — universal dispatch entry
@@ -383,9 +383,11 @@ pub fn parse_mp3<'a>(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`AiffError`] (currently uninhabited).
+/// Returns the per-format [`formats::aiff::Error`] (currently uninhabited).
 #[cfg(feature = "aiff")]
-pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, AiffError> {
+pub fn parse_aiff(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::aiff::Meta<'_>>, formats::aiff::Error> {
   formats::aiff::parse_borrowed(bytes)
 }
 
@@ -394,22 +396,22 @@ pub fn parse_aiff(bytes: &[u8]) -> core::result::Result<Option<AiffMeta<'_>>, Ai
 ///
 /// `shared` carries cross-format state (`DoneID3` / `DoneAPE` flags) and
 /// borrows **independently** of `bytes` — only the byte-buffer lifetime
-/// `'a` flows into the returned [`ApeMeta`] (which owns its data; `'a` is
+/// `'a` flows into the returned [`formats::ape::Meta`] (which owns its data; `'a` is
 /// phantom). The transient `shared` may therefore be dropped or reused
 /// while the returned meta lives on (Codex C-R2-2).
 ///
 /// # Errors
 ///
-/// Returns the per-format [`ApeError`] (currently uninhabited).
+/// Returns the per-format [`formats::ape::Error`] (currently uninhabited).
 #[cfg(feature = "ape")]
 pub fn parse_ape<'a>(
   bytes: &'a [u8],
   shared: &mut SharedFlags,
-) -> core::result::Result<Option<ApeMeta<'a>>, ApeError> {
-  // Use the decoupled `parse_full_owned` (returns `ApeMeta<'static>`,
-  // covariant to `'a`) rather than `ProcessApe.parse(ApeContext::new(...))`,
-  // whose GAT `Context<'a> = ApeContext<'a>` ties `shared` to the Meta's
-  // lifetime even though `ApeMeta` never borrows from it (Codex C-R2-2).
+) -> core::result::Result<Option<formats::ape::Meta<'a>>, formats::ape::Error> {
+  // Use the decoupled `parse_full_owned` (returns `ape::Meta<'static>`,
+  // covariant to `'a`) rather than `ProcessApe.parse(ape::Context::new(...))`,
+  // whose GAT `Context<'a> = ape::Context<'a>` ties `shared` to the Meta's
+  // lifetime even though `ape::Meta` never borrows from it (Codex C-R2-2).
   Ok(formats::ape::parse_full_owned(bytes, shared))
 }
 
@@ -418,9 +420,11 @@ pub fn parse_ape<'a>(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`DsfError`] (currently uninhabited).
+/// Returns the per-format [`formats::dsf::Error`] (currently uninhabited).
 #[cfg(feature = "dsf")]
-pub fn parse_dsf(bytes: &[u8]) -> core::result::Result<Option<DsfMeta<'_>>, DsfError> {
+pub fn parse_dsf(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::dsf::Meta<'_>>, formats::dsf::Error> {
   formats::dsf::parse_borrowed(bytes)
 }
 
@@ -430,12 +434,12 @@ pub fn parse_dsf(bytes: &[u8]) -> core::result::Result<Option<DsfMeta<'_>>, DsfE
 ///
 /// # Errors
 ///
-/// Returns the per-format [`FlacError`] (currently uninhabited).
+/// Returns the per-format [`formats::flac::Error`] (currently uninhabited).
 #[cfg(feature = "flac")]
 pub fn parse_flac<'a>(
   bytes: &'a [u8],
   shared: &mut SharedFlags,
-) -> core::result::Result<Option<FlacMeta<'a>>, FlacError> {
+) -> core::result::Result<Option<formats::flac::Meta<'a>>, formats::flac::Error> {
   formats::flac::parse_borrowed(bytes, shared)
 }
 
@@ -447,12 +451,12 @@ pub fn parse_flac<'a>(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`OggError`] (currently uninhabited).
+/// Returns the per-format [`formats::ogg::Error`] (currently uninhabited).
 #[cfg(feature = "ogg")]
 pub fn parse_ogg(
   bytes: &[u8],
   print_conv_enabled: bool,
-) -> core::result::Result<Option<OggMeta<'_>>, OggError> {
+) -> core::result::Result<Option<formats::ogg::Meta<'_>>, formats::ogg::Error> {
   formats::ogg::parse_borrowed(bytes, print_conv_enabled)
 }
 
@@ -480,9 +484,11 @@ pub fn parse_mpeg_audio<'a>(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`MpcError`] (currently uninhabited).
+/// Returns the per-format [`formats::mpc::Error`] (currently uninhabited).
 #[cfg(feature = "mpc")]
-pub fn parse_mpc(bytes: &[u8]) -> core::result::Result<Option<MpcMeta<'_>>, MpcError> {
+pub fn parse_mpc(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::mpc::Meta<'_>>, formats::mpc::Error> {
   formats::mpc::parse_borrowed(bytes)
 }
 
@@ -491,9 +497,11 @@ pub fn parse_mpc(bytes: &[u8]) -> core::result::Result<Option<MpcMeta<'_>>, MpcE
 ///
 /// # Errors
 ///
-/// Returns the per-format [`WvError`] (currently uninhabited).
+/// Returns the per-format [`formats::wavpack::Error`] (currently uninhabited).
 #[cfg(feature = "wavpack")]
-pub fn parse_wavpack(bytes: &[u8]) -> core::result::Result<Option<WvMeta<'_>>, WvError> {
+pub fn parse_wavpack(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::wavpack::Meta<'_>>, formats::wavpack::Error> {
   formats::wavpack::parse_borrowed(bytes)
 }
 
@@ -663,7 +671,7 @@ mod tests {
     let _ = meta.is_some();
   }
 
-  /// **Codex C-R2-2.** `parse_ape`'s returned `ApeMeta<'a>` does not borrow
+  /// **Codex C-R2-2.** `parse_ape`'s returned `ape::Meta<'a>` does not borrow
   /// from `shared` — the `SharedFlags` can be dropped (or reused for another
   /// parse) while the meta lives on. Compiles only if `shared` is on an
   /// independent lifetime.
@@ -674,7 +682,7 @@ mod tests {
     let meta = {
       let mut shared = SharedFlags::new();
       let m = parse_ape(&bytes, &mut shared).expect("ok");
-      // `shared` drops here; `m` must remain valid (ApeMeta is owned).
+      // `shared` drops here; `m` must remain valid (ape::Meta is owned).
       m
     };
     let _ = meta.is_some();

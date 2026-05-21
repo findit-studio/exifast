@@ -13,7 +13,7 @@
 //! it has accumulated each stream's leading packets, then dispatches the
 //! packet to its codec's comments handler.
 //!
-//! A typed [`OggMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! re-emits through the `Metadata` push path (list-aware for Vorbis
 //! Artist/Performer/Contact) so the serialized JSON stays byte-exact with
@@ -702,7 +702,7 @@ enum OpusKind {
 
 /// Per-packet outcome captured during `walk_packet`. Used by [`parse_inner`]
 /// to lift the legacy push-style `process_vorbis_comments` emissions into the
-/// typed [`OggMeta`] shape without rewriting the parser internals.
+/// typed [`Meta`] shape without rewriting the parser internals.
 ///
 /// Comments-processed variants do NOT carry the family-1 group: the staging
 /// metadata already records the group on each emitted tag (the
@@ -872,7 +872,7 @@ fn process_vorbis_comments_with_group1(
 }
 
 // ===========================================================================
-// Typed Meta — `OggMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed OGG metadata — the lib-first output of [`ProcessOgg`].
@@ -905,7 +905,7 @@ fn process_vorbis_comments_with_group1(
 /// follow-ups). See `[[exifast-phase2-forward-items]]` →
 /// "OGG zero-alloc revisit" for the eventual borrow-from-input plan.
 #[derive(Debug, Clone)]
-pub struct OggMeta<'a> {
+pub struct Meta<'a> {
   /// `OverrideFileType` target (Ogg.pm:49-50). `Some("OPUS")` when an
   /// `OpusHead` or `OpusTags` packet was seen; `Some("OGV")` when a
   /// Theora `\x80theora` / `\x81theora` packet was seen; `None` otherwise.
@@ -915,7 +915,7 @@ pub struct OggMeta<'a> {
   /// Emitted comment tags in bundled emission order (vendor first, then
   /// KEY=VALUE in encounter order; list-tags coalesced at first-occurrence
   /// position).
-  comments: Vec<OggComment>,
+  comments: Vec<Comment>,
   /// `$et->Warn(...)` accumulator (Ogg.pm:97 + 158, Vorbis.pm:208) in
   /// occurrence order. Owned (`SmolStr`) — no `Box::leak` (Codex AF2).
   warnings: Vec<SmolStr>,
@@ -931,14 +931,14 @@ pub struct OggMeta<'a> {
   _marker: core::marker::PhantomData<&'a ()>,
 }
 
-/// Payload of [`OggComment::Scalar`] — a `Vorbis:<Name>` scalar string
+/// Payload of [`Comment::Scalar`] — a `Vorbis:<Name>` scalar string
 /// (the vast majority of named tags: TITLE/ALBUM/GENRE/...).
 ///
 /// §2: extracted from a former struct-style variant (`Scalar { group1,
 /// name, value }`) into a named struct with private fields + accessors so
 /// the variant is a clean newtype. §1: no public fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OggCommentScalar {
+pub struct CommentScalar {
   /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
   /// Owned (`SmolStr`) so the typed Meta needs no `Box::leak` for the
   /// rare non-`Vorbis`/`Theora` group (Codex AF2).
@@ -951,7 +951,7 @@ pub struct OggCommentScalar {
   value: SmolStr,
 }
 
-impl OggCommentScalar {
+impl CommentScalar {
   /// Construct a scalar comment payload.
   #[must_use]
   #[inline(always)]
@@ -986,14 +986,14 @@ impl OggCommentScalar {
   }
 }
 
-/// Payload of [`OggComment::List`] — a `Vorbis:Artist`-style coalesced
+/// Payload of [`Comment::List`] — a `Vorbis:Artist`-style coalesced
 /// list (Vorbis.pm:85,86,94 — ARTIST, PERFORMER, CONTACT). Emitted at
 /// FIRST-occurrence position; repeats append (faithful `FoundTag` —
 /// ExifTool.pm:9505-9520).
 ///
 /// §2: extracted from a former struct-style variant into a named struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OggCommentList {
+pub struct CommentList {
   /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
   group1: SmolStr,
   /// Resolved tag name ("Artist" / "Performer" / "Contact").
@@ -1002,7 +1002,7 @@ pub struct OggCommentList {
   values: Vec<SmolStr>,
 }
 
-impl OggCommentList {
+impl CommentList {
   /// Construct a list comment payload from coalesced values.
   #[must_use]
   #[inline(always)]
@@ -1034,7 +1034,7 @@ impl OggCommentList {
   }
 }
 
-/// Payload of [`OggComment::Binary`] — a `Vorbis:CoverArt` / `Vorbis:
+/// Payload of [`Comment::Binary`] — a `Vorbis:CoverArt` / `Vorbis:
 /// Picture` base64-decoded raw byte blob. Renders downstream as `(Binary
 /// data N bytes, use -b option to extract)`. The `Picture` SubDirectory
 /// hop to `FLAC::Picture` is deferred (Vorbis.pm:122-134) — only the
@@ -1042,7 +1042,7 @@ impl OggCommentList {
 ///
 /// §2: extracted from a former struct-style variant into a named struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OggCommentBinary {
+pub struct CommentBinary {
   /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
   group1: SmolStr,
   /// "CoverArt" or "Picture".
@@ -1051,7 +1051,7 @@ pub struct OggCommentBinary {
   bytes: Vec<u8>,
 }
 
-impl OggCommentBinary {
+impl CommentBinary {
   /// Construct a binary comment payload from decoded bytes.
   #[must_use]
   #[inline(always)]
@@ -1083,13 +1083,13 @@ impl OggCommentBinary {
   }
 }
 
-/// A single comment emission within an [`OggMeta`]. Mirrors the bundled
+/// A single comment emission within an [`Meta`]. Mirrors the bundled
 /// `HandleTag` family of pushes that `ProcessComments` emits per vendor
 /// + per `KEY=VALUE` pair (Vorbis.pm:181-205).
 ///
 /// §2: variants are **unit-or-newtype only** — each data-carrying arm wraps
-/// a single named struct ([`OggCommentScalar`] / [`OggCommentList`] /
-/// [`OggCommentBinary`]) whose fields are private with accessors, instead of
+/// a single named struct ([`CommentScalar`] / [`CommentList`] /
+/// [`CommentBinary`]) whose fields are private with accessors, instead of
 /// the former struct-style `{ … }` variants. `#[non_exhaustive]` guards
 /// future emission shapes; predicates (`is_*`) and unwrap accessors are
 /// derived (derive_more) so callers don't hand-match.
@@ -1099,17 +1099,17 @@ impl OggCommentBinary {
 )]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
-pub enum OggComment {
-  /// `Vorbis:<Name>` scalar string — see [`OggCommentScalar`].
-  Scalar(OggCommentScalar),
-  /// `Vorbis:Artist`-style coalesced list — see [`OggCommentList`].
-  List(OggCommentList),
+pub enum Comment {
+  /// `Vorbis:<Name>` scalar string — see [`CommentScalar`].
+  Scalar(CommentScalar),
+  /// `Vorbis:Artist`-style coalesced list — see [`CommentList`].
+  List(CommentList),
   /// `Vorbis:CoverArt` / `Vorbis:Picture` raw bytes — see
-  /// [`OggCommentBinary`].
-  Binary(OggCommentBinary),
+  /// [`CommentBinary`].
+  Binary(CommentBinary),
 }
 
-impl OggMeta<'_> {
+impl Meta<'_> {
   /// `OverrideFileType` target (`"OPUS"` or `"OGV"`), or `None` for plain
   /// Vorbis. Applied by the bridge after `SetFileType('OGG')` to mirror
   /// bundled Ogg.pm:49-50. `&'static str` payload is `Copy` ⇒ by value (§3).
@@ -1120,12 +1120,12 @@ impl OggMeta<'_> {
   }
 
   /// The emitted comment tags in bundled emission order. Each item is an
-  /// [`OggComment`] newtype arm with the resolved family-1 group, tag name,
-  /// and value. §3 slice projection — returns `&[OggComment]`, never
-  /// `&Vec<OggComment>`.
+  /// [`Comment`] newtype arm with the resolved family-1 group, tag name,
+  /// and value. §3 slice projection — returns `&[Comment]`, never
+  /// `&Vec<Comment>`.
   #[must_use]
   #[inline(always)]
-  pub fn comments(&self) -> &[OggComment] {
+  pub fn comments(&self) -> &[Comment] {
     self.comments.as_slice()
   }
 
@@ -1165,11 +1165,11 @@ impl parser_sealed::Sealed for ProcessOgg {}
 
 impl FormatParser for ProcessOgg {
   /// GAT: the Meta borrows from the input `'a` directly (Codex AF2).
-  type Meta<'a> = OggMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = OggError;
+  type Error = Error;
 
-  /// Parse an Ogg file's bytes into a typed [`OggMeta`].
+  /// Parse an Ogg file's bytes into a typed [`Meta`].
   ///
   /// `Ok(Some(meta))` is returned even when `meta.success() == false`
   /// (i.e. the bytes are not a valid Ogg stream): the typed Meta carries
@@ -1179,13 +1179,13 @@ impl FormatParser for ProcessOgg {
   /// reason is that OGG accumulates warnings during the walk that the
   /// bundled output preserves even when the page-acceptance test never
   /// passes (e.g. mid-stream `Lost synchronization`).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, OggError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(data, /* print_conv_enabled */ true)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but exposes
-/// the borrow-from-input form (`OggMeta<'_>`) and the `print_conv`
+/// the borrow-from-input form (`Meta<'_>`) and the `print_conv`
 /// toggle. `print_conv_enabled = true` matches bundled `perl exiftool -j`;
 /// `false` matches `-j -n`. The toggle gates `convert::apply`'s
 /// ValueConv / PrintConv chain on the few tags that have one
@@ -1196,23 +1196,20 @@ impl FormatParser for ProcessOgg {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(
-  data: &[u8],
-  print_conv_enabled: bool,
-) -> Result<Option<OggMeta<'_>>, OggError> {
+pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data, print_conv_enabled)
 }
 
-/// Inner parser — produces a borrow-from-input [`OggMeta`] (technically
-/// `OggMeta<'_>` with a phantom `'_` today; see [`OggMeta`] struct doc
+/// Inner parser — produces a borrow-from-input [`Meta`] (technically
+/// `Meta<'_>` with a phantom `'_` today; see [`Meta`] struct doc
 /// re: zero-alloc revisit). The [`FormatParser::Meta`] GAT (`type
-/// Meta<'a> = OggMeta<'a>`) returns this borrowed form directly into the
+/// Meta<'a> = Meta<'a>`) returns this borrowed form directly into the
 /// closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
-fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'_>>, OggError> {
+fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
   // Stage the legacy push-style emissions into a side `Metadata` so the
   // bundled-faithful list-coalesce + name-synthesis paths stay byte-exact
   // (faithful to Vorbis.pm:154-210 + ExifTool.pm:9505-9520). The side
-  // Metadata is then transposed into typed `OggMeta` fields below.
+  // Metadata is then transposed into typed `Meta` fields below.
   //
   // This pattern mirrors the AAC pilot (Phase F1) — the staging Metadata
   // is the simplest way to keep the established list-coalesce semantics
@@ -1269,7 +1266,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'
       if !success {
         // Ogg.pm:101-104 — first valid page: SetFileType + SetByteOrder.
         // (SetFileType is fired by the bridge, not here — the typed
-        // OggMeta records the success flag instead.)
+        // Meta records the success flag instead.)
         success = true;
       }
       // Ogg.pm:106 `$flag = Get8u(\$buff, 5)` — page-header byte 5.
@@ -1387,7 +1384,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'
   }
   // Ogg.pm:196 `return $success`.
 
-  // Lift staging metadata into typed OggMeta. Warnings are cloned into
+  // Lift staging metadata into typed Meta. Warnings are cloned into
   // owned `SmolStr` (no `Box::leak`); comments go through `tag_to_comment`
   // per element.
   let warnings: Vec<SmolStr> = staging
@@ -1395,8 +1392,8 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'
     .iter()
     .map(|w| staged_warning_to_owned(w.as_str()))
     .collect();
-  let comments: Vec<OggComment> = staging.tags_slice().iter().map(tag_to_comment).collect();
-  Ok(Some(OggMeta {
+  let comments: Vec<Comment> = staging.tags_slice().iter().map(tag_to_comment).collect();
+  Ok(Some(Meta {
     file_type_override,
     comments,
     warnings,
@@ -1431,13 +1428,13 @@ fn staged_warning_to_owned(w: &str) -> SmolStr {
 }
 
 /// Transpose a staged `Tag` (one row of the side `Metadata`) into a typed
-/// [`OggComment`]. Lossy on the [`TagValue`] enum because the typed
+/// [`Comment`]. Lossy on the [`TagValue`] enum because the typed
 /// Meta's contract is "what bundled would emit": `TagValue::Str` ⇒
-/// [`OggComment::Scalar`], `TagValue::List` ⇒ [`OggComment::List`],
-/// `TagValue::Bytes` ⇒ [`OggComment::Binary`]. Other `TagValue` variants
+/// [`Comment::Scalar`], `TagValue::List` ⇒ [`Comment::List`],
+/// `TagValue::Bytes` ⇒ [`Comment::Binary`]. Other `TagValue` variants
 /// are not produced by the legacy parser for OGG (no I64/F64/Rational
 /// paths in the Vorbis-comment block).
-fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
+fn tag_to_comment(tag: &crate::value::Tag) -> Comment {
   // Family-1 group is bundled's `-G1` token. For OGG it's either "Vorbis"
   // (Vorbis::Comments / Opus comments) or "Theora" (Theora::Comments).
   // Stored owned (`SmolStr`) so an unforeseen group needs no `Box::leak`
@@ -1457,17 +1454,15 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
           other => SmolStr::from(format!("{other:?}")),
         })
         .collect();
-      OggComment::List(OggCommentList::new(group1, name, values))
+      Comment::List(CommentList::new(group1, name, values))
     }
-    TagValue::Bytes(bytes) => {
-      OggComment::Binary(OggCommentBinary::new(group1, name, bytes.clone()))
-    }
-    TagValue::Str(s) => OggComment::Scalar(OggCommentScalar::new(group1, name, s.clone())),
+    TagValue::Bytes(bytes) => Comment::Binary(CommentBinary::new(group1, name, bytes.clone())),
+    TagValue::Str(s) => Comment::Scalar(CommentScalar::new(group1, name, s.clone())),
     // Other TagValue variants are unreachable from this module's emission
     // paths; render via Debug to preserve diagnostic fidelity without
     // panicking. Verified by the test
     // `parse_inner_only_emits_str_list_bytes_variants` below.
-    other => OggComment::Scalar(OggCommentScalar::new(
+    other => Comment::Scalar(CommentScalar::new(
       group1,
       name,
       SmolStr::from(format!("{other:?}")),
@@ -1476,11 +1471,11 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
 }
 
 // ===========================================================================
-// `OggError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for OGG parsing. Currently empty — every parse
-/// failure surfaces as `success == false` on the returned [`OggMeta`]
+/// failure surfaces as `success == false` on the returned [`Meta`]
 /// (Perl `return 0`) so the bridge can emit the engine-level `ExifTool:
 /// Error => "File format error"`. Reserved for future I/O wrappers if
 /// streaming readers are added.
@@ -1491,14 +1486,14 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
 /// without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum OggError {}
+pub enum Error {}
 
 // ===========================================================================
 // `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl OggMeta<'_> {
+impl Meta<'_> {
   /// Emit OGG tags into the writer in bundled emission order — vendor
   /// first, then comments in encounter order with list-tags coalesced at
   /// first occurrence (faithful FoundTag — ExifTool.pm:9505-9520),
@@ -1522,10 +1517,10 @@ impl OggMeta<'_> {
   ) -> Result<(), core::convert::Infallible> {
     for comment in &self.comments {
       match comment {
-        OggComment::Scalar(s) => {
+        Comment::Scalar(s) => {
           out.write_str(s.group1(), s.name(), s.value())?;
         }
-        OggComment::List(l) => {
+        Comment::List(l) => {
           // Vorbis List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:
           // 85/86/94) coalesce into a single `TagValue::List` at
           // first-occurrence position — faithful `FoundTag`
@@ -1535,7 +1530,7 @@ impl OggMeta<'_> {
           let refs: Vec<&str> = l.values_slice().iter().map(SmolStr::as_str).collect();
           out.write_str_list(l.group1(), l.name(), &refs)?;
         }
-        OggComment::Binary(b) => {
+        Comment::Binary(b) => {
           out.write_bytes(b.group1(), b.name(), b.bytes())?;
         }
       }
@@ -1882,11 +1877,11 @@ mod tests {
   fn meta_sinker_emits_vorbis_scalars() {
     // Drive a typed Meta with a vendor + a non-list scalar; verify
     // serialize_tags emits both via write_str.
-    let meta = OggMeta {
+    let meta = Meta {
       file_type_override: None,
       comments: vec![
-        OggComment::Scalar(OggCommentScalar::new("Vorbis", "Vendor", "test vendor")),
-        OggComment::Scalar(OggCommentScalar::new("Vorbis", "Title", "Song")),
+        Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "test vendor")),
+        Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
       ],
       warnings: vec![],
       success: true,
@@ -1909,12 +1904,12 @@ mod tests {
   #[test]
   fn meta_sinker_list_coalesces_into_tagvalue_list_via_json_writer() {
     use crate::value::TagValue;
-    let meta = OggMeta {
+    let meta = Meta {
       file_type_override: None,
       comments: vec![
         // A scalar BEFORE the list to pin first-occurrence position.
-        OggComment::Scalar(OggCommentScalar::new("Vorbis", "Title", "Song")),
-        OggComment::List(OggCommentList::new(
+        Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
+        Comment::List(CommentList::new(
           "Vorbis",
           "Artist",
           vec![SmolStr::from("Alice"), SmolStr::from("Bob")],
@@ -1941,7 +1936,7 @@ mod tests {
   fn meta_sinker_emits_warnings() {
     // A typed Meta with no comments but two warnings — serialize_tags
     // routes them to write_warning.
-    let meta = OggMeta {
+    let meta = Meta {
       file_type_override: None,
       comments: vec![],
       warnings: vec![
@@ -1964,9 +1959,9 @@ mod tests {
 
   #[test]
   fn format_parser_trait_returns_borrowed_meta() {
-    // GAT path: `Meta<'a> = OggMeta<'a>` (phantom `'a`). Drive the trait
+    // GAT path: `Meta<'a> = Meta<'a>` (phantom `'a`). Drive the trait
     // API with empty bytes and confirm the shape.
-    let meta: OggMeta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
+    let meta: Meta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
       .expect("ok")
       .expect("meta");
     assert!(!meta.success());
@@ -1976,11 +1971,9 @@ mod tests {
   fn typed_meta_owns_its_data() {
     // The typed Meta carries owned SmolStr/Vec<u8> (the `'a` lifetime is
     // phantom). Verify field accessors round-trip.
-    let meta = OggMeta {
+    let meta = Meta {
       file_type_override: Some("OPUS"),
-      comments: vec![OggComment::Scalar(OggCommentScalar::new(
-        "Vorbis", "Vendor", "v",
-      ))],
+      comments: vec![Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "v"))],
       warnings: vec![SmolStr::from("Lost synchronization")],
       success: true,
       _marker: core::marker::PhantomData,
