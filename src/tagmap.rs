@@ -201,17 +201,21 @@ impl TagMap {
   }
 
   /// The collected format-tag entries (`"<Group1>:<Name>"`, value) in
-  /// first-occurrence order (first-wins already applied).
-  pub(crate) fn entries(&self) -> &[(SmolStr, TagValue)] {
-    &self.entries
+  /// first-occurrence order (first-wins already applied). Slice view of the
+  /// backing `Vec` (§3: never expose `&Vec<T>`).
+  #[inline(always)]
+  pub(crate) const fn entries(&self) -> &[(SmolStr, TagValue)] {
+    self.entries.as_slice()
   }
 
   /// The FIRST recorded warning, if any (`ExifTool:Warning` under default `-j`).
+  #[inline(always)]
   pub(crate) fn first_warning(&self) -> Option<&str> {
     self.warnings.first().map(String::as_str)
   }
 
   /// The FIRST recorded error, if any (`ExifTool:Error`).
+  #[inline(always)]
   pub(crate) fn first_error(&self) -> Option<&str> {
     self.errors.first().map(String::as_str)
   }

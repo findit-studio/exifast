@@ -52,12 +52,15 @@ pub struct Mismatch(String);
 impl Mismatch {
   /// Construct a `Mismatch` from a message string.
   #[must_use]
+  #[inline(always)]
   pub fn new(message: impl Into<String>) -> Self {
     Self(message.into())
   }
 
-  /// The mismatch description message.
+  /// The mismatch description message (`&str` view of the owned `String`
+  /// field — never expose `&String`, §3).
   #[must_use]
+  #[inline(always)]
   pub fn message(&self) -> &str {
     &self.0
   }

@@ -24,7 +24,7 @@ use crate::{
 /// growth beyond the dedicated field set — `process_bit_stream_cond` only
 /// ever touches the field a tag's `RawConv::SetFrameState(slot)` names, so
 /// an MPEG-only file never touches a hypothetical Ogg slot.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrameState {
   // Add a slot here when a faithful port first needs it.
   // MPEG.pm:27   RawConv => '$self->{MPEG_Vers} = $val'
@@ -35,10 +35,20 @@ pub struct FrameState {
   mpeg_mode: Option<i64>,
 }
 
+impl Default for FrameState {
+  /// Delegates to [`FrameState::new`] (§1: one source of truth for "empty",
+  /// not a separate `#[derive(Default)]`).
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl FrameState {
   /// Construct a freshly-empty state — every slot `None` ("never set", i.e.
   /// Perl `$$self{X}` being `undef`).
   #[must_use]
+  #[inline(always)]
   pub const fn new() -> Self {
     Self {
       mpeg_vers: None,
@@ -52,6 +62,7 @@ impl FrameState {
   /// faithful port should NEVER hit the latter — it indicates a typo in a
   /// `RawConv::SetFrameState(slot)` or a Condition closure).
   #[must_use]
+  #[inline(always)]
   pub const fn get(&self, slot: &str) -> Option<i64> {
     match slot.as_bytes() {
       b"MPEG_Vers" => self.mpeg_vers,

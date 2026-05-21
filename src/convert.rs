@@ -63,6 +63,7 @@ impl ConvContext {
   /// `static` use (e.g. test fixtures); production callers usually want
   /// [`ConvContext::default`].
   #[must_use]
+  #[inline(always)]
   pub const fn new(charset_id3: &'static str) -> Self {
     Self { charset_id3 }
   }
@@ -70,6 +71,7 @@ impl ConvContext {
   /// `$$self{OPTIONS}{CharsetID3}` — drives `ConvertID3v1Text`
   /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
   #[must_use]
+  #[inline(always)]
   pub const fn charset_id3(&self) -> &'static str {
     self.charset_id3
   }
@@ -79,6 +81,7 @@ impl ConvContext {
   /// production callers stay on the default; this builder exists for
   /// tests + the documented extension contract.
   #[must_use]
+  #[inline(always)]
   pub const fn with_charset_id3(mut self, value: &'static str) -> Self {
     self.charset_id3 = value;
     self
