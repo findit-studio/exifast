@@ -1000,7 +1000,12 @@ impl AnyParser {
       #[cfg(feature = "ape")]
       AnyParser::Ape(p) => {
         let _ = (p, ext);
-        Ok(crate::formats::ape::parse_full_owned(bytes, shared).map(AnyMeta::Ape))
+        // `parse_full_chained` runs the embedded ID3 chain (prefix v2 /
+        // trailer v1, APE.pm:124-127) and nests the typed `Id3Meta` into the
+        // returned `ApeMeta`, so the typed `parse_any` path emits the complete
+        // `File:ID3Size` + `ID3v2_*`/`ID3v1` + `MAC:*` + `APE:*` tag set —
+        // matching the engine `ProcessApe::process`. (`ape` pulls `id3`.)
+        Ok(crate::formats::ape::parse_full_chained(bytes, shared).map(AnyMeta::Ape))
       }
       #[cfg(feature = "dsf")]
       AnyParser::Dsf(p) => {

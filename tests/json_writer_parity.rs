@@ -202,42 +202,29 @@ fn typed_path_matches_golden(
 }
 
 /// Fixtures whose **typed** parse path (`AnyParser::parse_any` →
-/// `MetaSinker::sink`) does NOT yet reproduce the bundled golden, because the
-/// CHAINED sub-format tags are surfaced only through the legacy
-/// `OldFormatParser::process` dispatch — NOT yet through the typed
-/// `AnyMeta`/`AnyParser` chaining. These are the gaps the parallel
-/// `OldFormatParser`-retirement pass on `lib/fix-all` is closing; the #124
-/// integration pass will flip them green here once `parse_any` chains:
+/// `MetaSinker::sink`) does NOT reproduce the bundled golden. After the
+/// sink-layer unification the only remaining entry is the one Phase-2 forward
+/// item where the **engine path ALSO diverges from the golden**:
 ///
-/// - `AIFF_id3.aif` — AIFF with an embedded ID3 chunk: `AiffMeta::sink` emits
-///   the AIFF tags but the typed path does not run the chained `ProcessID3`,
-///   so `ID3v1:*` is missing (legacy AIFF bridge runs it).
-/// - `ape_*` (4) — APE chained with ID3 (prefix / v1 trailer / v2.4 footer /
-///   enhanced-tag): the typed `AnyParser::Ape` arm
-///   (`ape::parse_full_owned`) does not surface the `MAC:*` binary header
-///   **and** the chained `ID3v1:*`/`ID3v2_*` tags together via `parse_any`
-///   the way the legacy bridge does.
-/// - `dsf_with_id3v2_trailer.dsf` — DSF chained with an ID3v2 trailer: the
-///   typed `AnyParser::Dsf` arm (`dsf::parse_borrowed`) exposes the trailer
-///   scan range on the Meta but does not itself run the chained `ProcessID3`,
-///   so `ID3v2_3:Title` is missing from the typed sink.
-/// - `APE_dup_override.ape` — the typed APE `Composite:Duration` computes a
-///   different value (16.01 s) than bundled (14.71 s): a typed-path Composite
-///   derivation difference (frame math / SampleRate source), independent of
-///   the writer.
+/// - `AIFF_id3.aif` — AIFF with an embedded `ID3 ` CHUNK (AIFF.pm:202 ID3
+///   SubDirectory dispatch). Neither the typed path NOR the engine
+///   `ProcessAiff::process` runs the chained `ProcessID3` over the chunk body
+///   (the `ID3 ` chunk is recognized then silently skipped — see the
+///   `id3_chunk_recognized_then_silently_skipped` unit test in
+///   `src/formats/aiff.rs`), so `File:ID3Size` + `ID3v2_3:Title` are missing
+///   in BOTH paths. This is the SAME deliberate divergence the
+///   `#[ignore]`-d `aiff_id3_chunk_subdirectory_dispatch_deferred_conformance`
+///   test in `conformance.rs` documents — `AIFF_id3.aif` is therefore NOT one
+///   of the 121 active conformance fixtures. The typed path here matches the
+///   engine path (both lack ID3); it diverges only from the GOLDEN, which pins
+///   the post-merge oracle for when the AIFF ID3-chunk dispatch lands.
 ///
-/// IMPORTANT: every one of these passes the **writer-only** parity below
-/// (122/122) — the `JsonTagWriter` renders the complete real tag stream
-/// byte-exactly. The gaps are purely in what the TYPED parse path emits, owned
-/// by the format/parser code the other agent is editing. Listed here (not
-/// silently skipped) per the task's "noted, not skipped" requirement.
-const KNOWN_TYPED_GAPS: &[&str] = &[
-  "AIFF_id3.aif",
-  "ape_id3_prefixed.ape",
-  "ape_id3v24_footer_then_mac.ape",
-  "ape_with_enhancedtag_and_id3v1.ape",
-  "ape_with_id3v1_trailer.ape",
-];
+/// All five formerly-listed chained gaps (the four `ape_*` ID3-prefix/trailer
+/// fixtures + `dsf_with_id3v2_trailer.dsf` + the `APE_dup_override.ape`
+/// composite) now pass typed parity: APE and DSF nest a typed `Id3Meta` and
+/// the APE intra-composite resolves last-wins, so the typed `parse_any` path
+/// emits the complete chained tag set.
+const KNOWN_TYPED_GAPS: &[&str] = &["AIFF_id3.aif"];
 
 #[test]
 fn json_writer_byte_exact_parity_all_fixtures() {

@@ -1643,6 +1643,27 @@ pub fn parse_id3_borrowed<'a>(
   parse_id3_inner(data, shared, print_conv).map(|(meta, _hdr_end)| meta)
 }
 
+/// As [`parse_id3_borrowed`], but ALSO returns the bundled `$hdrEnd`
+/// (ID3.pm:1504) — the file offset PAST a leading ID3v2 header. Chained
+/// callers that carry an ID3 PREFIX (e.g. APE: an ID3v2 tag in front of the
+/// `MAC `/`APETAGEX` body, ID3.pm:1582-1601 audio loop → recursive
+/// ProcessAPE on the post-ID3 slice) need the offset to slice the format
+/// body. `0` when there is no valid ID3v2 prefix (the body begins at offset
+/// 0). The `DoneID3` "ran" marker + trailer size are recorded on `shared`
+/// exactly as [`parse_id3_borrowed`] does (so APE.pm:169's footer shift sees
+/// the v1-trailer size).
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today).
+pub(crate) fn parse_id3_with_hdr_end<'a>(
+  data: &'a [u8],
+  shared: Option<&mut SharedFlags>,
+  print_conv: bool,
+) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
+  parse_id3_inner(data, shared, print_conv)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

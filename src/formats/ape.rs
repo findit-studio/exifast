@@ -1208,6 +1208,17 @@ pub struct ApeMeta<'a> {
   /// `Some(v)` ⇒ the intra-APE arithmetic produced a value (already
   /// PrintConv-converted at the planner's `print_conv` mode).
   composite_duration: Option<TagValue>,
+  /// Chained ID3 sub-Meta (APE.pm:124-127 embedded `ProcessID3`). `Some`
+  /// when an ID3v2 PREFIX (in front of the `MAC `/`APETAGEX` body) or an
+  /// ID3v1 TRAILER (at EOF) was detected and parsed via
+  /// [`crate::formats::id3::process::parse_id3_with_hdr_end`]. Carries
+  /// `File:ID3Size` + the `ID3v2_*:*` / `ID3v1:*` frame tags; the typed
+  /// [`MetaSinker`] sink emits them so the typed Meta is self-contained
+  /// (replaces the engine's separate `process_id3_chained` dispatch). The
+  /// MAC/main extraction runs over the POST-prefix slice and the footer
+  /// scan honours the v1-trailer shift (APE.pm:169) via `SharedFlags`.
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
   _phantom: core::marker::PhantomData<&'a ()>,
 }
 
@@ -1241,6 +1252,16 @@ impl ApeMeta<'_> {
   #[must_use]
   pub fn composite_duration(&self) -> Option<&TagValue> {
     self.composite_duration.as_ref()
+  }
+
+  /// Chained ID3 sub-Meta (APE.pm:124-127), `Some` when an ID3v2 prefix or
+  /// ID3v1 trailer was detected by [`parse_full_chained`]. The
+  /// [`MetaSinker`](crate::parser_new::MetaSinker) sink emits its
+  /// `File:ID3Size` + `ID3v2_*:*` / `ID3v1:*` tags.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  pub fn id3(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
   }
 
   // ---- Convenience lib-first accessors over `main_tags` ------------------
@@ -1422,6 +1443,75 @@ pub(crate) fn parse_full_owned(data: &[u8], shared: &mut SharedFlags) -> Option<
   Some(meta_from_plan(plan))
 }
 
+/// Full APE parse WITH the embedded ID3 chain (APE.pm:119-241 faithful) —
+/// the typed counterpart of the engine `ProcessApe::process`. Runs:
+///
+/// 1. **Embedded ID3** (APE.pm:124-127) over the FULL buffer when `DoneID3`
+///    is unset: an ID3v2 PREFIX or an ID3v1 TRAILER. This sets `DoneID3`
+///    (the v1-trailer size APE.pm:169 reads for the footer shift) and yields
+///    the post-ID3v2-header offset `hdr_end` (bundled `$hdrEnd`) plus a typed
+///    [`Id3Meta`].
+/// 2. **MAC/main extraction** (APE.pm:137-172) over the POST-prefix slice
+///    `data[hdr_end..]` (the bundled audio-loop `Seek($hdrEnd, 0)` at
+///    ID3.pm:1590), with the footer scan walking PAST the v1 trailer via the
+///    now-set `DoneID3` (APE.pm:169).
+///
+/// Returns `Some(ApeMeta)` with `id3` nested when ID3 was found AND/OR the
+/// MAC/APE body parsed; `None` only when NEITHER the body nor ID3 produced a
+/// result (faithful APE.pm:138 `return 0`). The intra-APE composite is
+/// computed from the header + wire main tags (cross-format ID3 ingredients do
+/// not contribute to APE's Composite).
+///
+/// `#[cfg(feature = "id3")]`: the `ape` feature pulls `id3`, so this is the
+/// production path for the standalone `APE` file-type entry. Lifetime
+/// `'a` borrows from `data` (the ID3 sub-Meta owns its strings; the MAC/main
+/// Meta is owned `'static`, widened by covariance).
+#[cfg(feature = "id3")]
+pub(crate) fn parse_full_chained<'a>(
+  data: &'a [u8],
+  shared: &mut SharedFlags,
+) -> Option<ApeMeta<'a>> {
+  // 1. Embedded ID3 (APE.pm:124-127). `unless ($$et{DoneID3})` recursion
+  // guard (ID3.pm:1435): only run when ID3 has not already run on this chain
+  // (a standalone APE file-type entry always gets a fresh `SharedFlags`). The
+  // pass sets `DoneID3` (trailer size for APE.pm:169) and returns `$hdrEnd`.
+  let (id3, hdr_end) = if shared.done_id3().is_none() {
+    crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
+      .unwrap_or((None, 0))
+  } else {
+    (None, shared.id3_hdr_end().unwrap_or(0))
+  };
+
+  // 2. MAC/main extraction over the post-ID3v2-header slice. APE.pm:131
+  // `$$et{DoneAPE} = 1` runs unconditionally before the magic check.
+  shared.set_done_ape(true);
+  let ape_slice = data.get(hdr_end..).unwrap_or(&[]);
+  // APE.pm:169 footer shift: `$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1`.
+  let done_id3 = shared.done_id3().unwrap_or(0);
+  let plan = plan_ape(ape_slice, /* print_conv */ false, done_id3);
+
+  match plan {
+    Some(plan) => {
+      let mut meta = meta_from_plan(plan);
+      meta.id3 = id3;
+      Some(meta)
+    }
+    // APE.pm:137-138 — short or wrong magic. When ID3 was found, the bundled
+    // `ProcessID3 ... and return 1` semantics treat the file as ID3-bearing:
+    // surface an ApeMeta carrying ONLY the ID3 sub-Meta (no MAC/main). When
+    // ID3 was NOT found, return `None` (Perl `return 0`) so the candidate
+    // loop tries the next type.
+    None => id3.map(|id3_meta| ApeMeta {
+      header: None,
+      main_tags: Vec::new(),
+      warn_bad_trailer: false,
+      composite_duration: None,
+      id3: Some(id3_meta),
+      _phantom: core::marker::PhantomData,
+    }),
+  }
+}
+
 /// Lift a Phase-1 [`ApePlan`] into a typed [`ApeMeta`]. Translates the
 /// `header_job` into [`ApeHeader::Old`] / [`ApeHeader::New`] (running
 /// the same binary-data extraction the legacy path would have via
@@ -1454,6 +1544,8 @@ fn meta_from_plan(plan: ApePlan) -> ApeMeta<'static> {
     main_tags,
     warn_bad_trailer: plan.warn_bad_trailer,
     composite_duration,
+    #[cfg(feature = "id3")]
+    id3: None,
     _phantom: core::marker::PhantomData,
   }
 }
@@ -1707,6 +1799,15 @@ impl MetaSinker for ApeMeta<'_> {
   /// is a global engine toggle (ExifTool.pm:5710 `OPTIONS{PrintConv}`),
   /// not a writer choice.
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+    // (0) Chained ID3 sub-Meta (APE.pm:124-127 embedded ProcessID3). Emitted
+    // FIRST — bundled runs `ProcessID3` before the MAC/APE body extraction, so
+    // `File:ID3Size` + the ID3 frames precede the MAC tags. (Object key order
+    // is value-semantically irrelevant, but matching the engine order keeps
+    // the streams identical.)
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.sink(print_conv, out)?;
+    }
     // (1) MAC binary-data header.
     if let Some(header) = &self.header {
       sink_header(header, print_conv, out)?;
