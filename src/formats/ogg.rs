@@ -432,66 +432,99 @@ fn underscore_camelcase(s: &str) -> String {
 /// Typed Vorbis-identification-packet payload (Vorbis.pm:40-70).
 ///
 /// Holds the six fields the bundled `Vorbis::Identification` ProcessBinaryData
-/// table extracts from the `\x01vorbis` packet's 23-byte fixed-offset
-/// payload. Bitrate fields are `Option<u32>` so the RawConv
-/// `'$val || undef'` (Vorbis.pm:55,61,67) maps cleanly to `None` for a
-/// zero-bitrate field — bundled drops the tag entirely when the raw value
-/// is 0, so emission iterates `if let Some(_)`.
+/// table extracts from the `\x01vorbis` packet's 23-byte fixed-offset payload.
+/// **Every field is `Option<...>`** because bundled `ProcessBinaryData`
+/// (ExifTool.pm:9866-10065) iterates the tag table per-FIELD: each declared
+/// offset is independently checked against `$entry >= $size` (line 9927)
+/// before extracting the value, so a short payload silently emits the
+/// *subset* of fields whose `offset + width <= payload.len()`. Bitrate fields
+/// also carry the RawConv `'$val || undef'` drop-zero behaviour
+/// (Vorbis.pm:55,61,67).
 ///
-/// §1: no public fields. §3: accessor returns the primitive (Copy) directly,
-/// not a reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Codex R3 F3: pre-fix the helper rejected the WHOLE table on a payload
+/// shorter than the largest declared offset (21 bytes), so a 9-byte payload
+/// emitted nothing even though bundled would emit VorbisVersion / AudioChannels
+/// / SampleRate. The fix is per-field offset-checked extraction with `Option`
+/// on every field, faithful to ProcessBinaryData's iterate-and-skip semantics.
+///
+/// §1: no public fields. §3: accessor returns `Option<primitive>` (the
+/// contained primitives are `Copy`) directly, not a reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VorbisIdentification {
-  /// `Vorbis:VorbisVersion` (offset 0, int32u). Vorbis.pm:43-46.
-  vorbis_version: u32,
+  /// `Vorbis:VorbisVersion` (offset 0, int32u). Vorbis.pm:43-46. `None` when
+  /// payload shorter than 4 bytes.
+  vorbis_version: Option<u32>,
   /// `Vorbis:AudioChannels` (offset 4, int8u). Vorbis.pm:47 — no explicit
-  /// Format ⇒ table's default `int8u`. Stored as u8 (faithful width).
-  audio_channels: u8,
-  /// `Vorbis:SampleRate` (offset 5, int32u). Vorbis.pm:48-51.
-  sample_rate: u32,
-  /// `Vorbis:MaximumBitrate` (offset 9, int32u). Vorbis.pm:52-57. RawConv
-  /// `'$val || undef'` ⇒ `None` when raw is 0 (bundled drops the tag).
+  /// Format ⇒ table's default `int8u`. `None` when payload shorter than 5
+  /// bytes. Stored as u8 (faithful width).
+  audio_channels: Option<u8>,
+  /// `Vorbis:SampleRate` (offset 5, int32u). Vorbis.pm:48-51. `None` when
+  /// payload shorter than 9 bytes.
+  sample_rate: Option<u32>,
+  /// `Vorbis:MaximumBitrate` (offset 9, int32u). Vorbis.pm:52-57. `None`
+  /// when payload shorter than 13 bytes OR when RawConv `'$val || undef'`
+  /// drops the zero value.
   maximum_bitrate: Option<u32>,
-  /// `Vorbis:NominalBitrate` (offset 13, int32u). Vorbis.pm:58-63.
+  /// `Vorbis:NominalBitrate` (offset 13, int32u). Vorbis.pm:58-63. `None`
+  /// when payload shorter than 17 bytes OR when RawConv drops a zero raw.
   nominal_bitrate: Option<u32>,
-  /// `Vorbis:MinimumBitrate` (offset 17, int32u). Vorbis.pm:64-69.
+  /// `Vorbis:MinimumBitrate` (offset 17, int32u). Vorbis.pm:64-69. `None`
+  /// when payload shorter than 21 bytes OR when RawConv drops a zero raw.
   minimum_bitrate: Option<u32>,
 }
 
 impl VorbisIdentification {
-  /// `Vorbis:VorbisVersion` raw value (Vorbis.pm:43-46, int32u).
+  /// True iff at least one field was successfully populated. The parse
+  /// helper [`parse_vorbis_identification`] returns this struct even on a
+  /// short payload; the caller uses [`Self::is_empty`] to distinguish a
+  /// fully-empty result (faithful: bundled ProcessBinaryData emits zero
+  /// tags when the payload doesn't reach offset 0+width).
   #[must_use]
   #[inline(always)]
-  pub const fn vorbis_version(&self) -> u32 {
+  pub const fn is_empty(&self) -> bool {
+    self.vorbis_version.is_none()
+      && self.audio_channels.is_none()
+      && self.sample_rate.is_none()
+      && self.maximum_bitrate.is_none()
+      && self.nominal_bitrate.is_none()
+      && self.minimum_bitrate.is_none()
+  }
+  /// `Vorbis:VorbisVersion` raw value (Vorbis.pm:43-46, int32u), `None`
+  /// when the payload was too short to cover offset 0..4 (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vorbis_version(&self) -> Option<u32> {
     self.vorbis_version
   }
-  /// `Vorbis:AudioChannels` raw value (Vorbis.pm:47, int8u).
+  /// `Vorbis:AudioChannels` raw value (Vorbis.pm:47, int8u), `None` when
+  /// the payload was too short to cover offset 4 (R3 F3 per-field).
   #[must_use]
   #[inline(always)]
-  pub const fn audio_channels(&self) -> u8 {
+  pub const fn audio_channels(&self) -> Option<u8> {
     self.audio_channels
   }
-  /// `Vorbis:SampleRate` raw value in Hz (Vorbis.pm:48-51, int32u).
+  /// `Vorbis:SampleRate` raw value in Hz (Vorbis.pm:48-51, int32u), `None`
+  /// when the payload was too short to cover offset 5..9 (R3 F3 per-field).
   #[must_use]
   #[inline(always)]
-  pub const fn sample_rate(&self) -> u32 {
+  pub const fn sample_rate(&self) -> Option<u32> {
     self.sample_rate
   }
-  /// `Vorbis:MaximumBitrate` raw bps, or `None` when bundled-RawConv would
-  /// drop the tag (raw == 0). Vorbis.pm:52-57.
+  /// `Vorbis:MaximumBitrate` raw bps, `None` when out-of-bounds OR
+  /// `bundled-RawConv` would drop the tag (raw == 0). Vorbis.pm:52-57.
   #[must_use]
   #[inline(always)]
   pub const fn maximum_bitrate(&self) -> Option<u32> {
     self.maximum_bitrate
   }
-  /// `Vorbis:NominalBitrate` raw bps, or `None` (raw == 0).
+  /// `Vorbis:NominalBitrate` raw bps, `None` when out-of-bounds OR raw == 0.
   /// Vorbis.pm:58-63.
   #[must_use]
   #[inline(always)]
   pub const fn nominal_bitrate(&self) -> Option<u32> {
     self.nominal_bitrate
   }
-  /// `Vorbis:MinimumBitrate` raw bps, or `None` (raw == 0).
+  /// `Vorbis:MinimumBitrate` raw bps, `None` when out-of-bounds OR raw == 0.
   /// Vorbis.pm:64-69.
   #[must_use]
   #[inline(always)]
@@ -501,32 +534,44 @@ impl VorbisIdentification {
 }
 
 /// Parse the Vorbis identification packet's payload (the bytes AFTER the
-/// `\x01vorbis` magic) into [`VorbisIdentification`]. Returns `None` if the
-/// payload is shorter than the 23-byte fixed window the
-/// `Vorbis::Identification` table reads (the last documented offset is 17,
-/// reading 4 bytes for `int32u` MinimumBitrate ⇒ offset 17..21; the table
-/// itself stops at 21 bytes total, but the Vorbis I spec packet trailer
-/// adds blocksize + framing for total 23 ⇒ we require at least 21).
+/// `\x01vorbis` magic) into [`VorbisIdentification`]. **Per-field**
+/// offset-checked extraction — faithful to bundled `ProcessBinaryData`
+/// (ExifTool.pm:9866-10065), which iterates the table and skips any field
+/// whose `entry+width` lies past the payload end (ExifTool.pm:9927 `next if
+/// $entry >= $size` and 9953 `last if $more <= 0`).
 ///
-/// Bundled `ProcessBinaryData` (ExifTool.pm `ProcessBinaryData`) reads only
-/// declared offsets; a short payload silently emits a subset of tags.
-/// Faithful behaviour: the bundled-Perl `ProcessBinaryData` `GetTagValue`
-/// returns `undef` for an out-of-bounds offset and `HandleTag` skips it.
-/// Our `None` mirrors that for a payload shorter than the largest declared
-/// offset+width (`17 + 4 = 21`).
+/// Codex R3 F3: pre-fix the helper required `payload.len() >= 21` (the
+/// largest declared offset+width); a 9-byte payload would emit NOTHING
+/// even though bundled would emit version/channels/sample-rate. Now each
+/// field is independently bounds-checked: `[0..4]` for VorbisVersion,
+/// `[4..5]` for AudioChannels, `[5..9]` for SampleRate, and `[9..13]`,
+/// `[13..17]`, `[17..21]` for the three bitrates.
+///
+/// Returns `None` ONLY when the payload is so short that NO field is
+/// populated (`payload.len() < 4`, so even VorbisVersion can't be read).
+/// On a short-but-non-empty payload, returns `Some(VorbisIdentification)`
+/// with the in-range fields populated and the out-of-range fields `None`.
 fn parse_vorbis_identification(payload: &[u8]) -> Option<VorbisIdentification> {
-  // Largest declared offset+width in %Vorbis::Identification: 17 + 4 = 21.
-  // Bundled would emit only the in-range subset; for the in-scope
-  // conformance fixtures every Vorbis packet payload is the full ~23-byte
-  // header, so this all-or-nothing rejection matches every observed input.
-  if payload.len() < 21 {
-    return None;
-  }
   // `SetByteOrder('II')` (Ogg.pm:101) — every multi-byte field is LE.
-  let vorbis_version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-  let audio_channels = payload[4];
-  let sample_rate = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+  //
+  // Per-field offset+width check (ExifTool.pm:9927 `next if $entry >=
+  // $size`): each field is emitted only if its full width fits in the
+  // payload. Bundled does NOT all-or-nothing; an 9-byte payload emits
+  // VorbisVersion / AudioChannels / SampleRate, then skips the three
+  // bitrate fields (offset 9 + 4 = 13 > 9, etc.).
+  let len = payload.len();
+  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` — the eager form
+  // would index into `payload[4]` etc. even when the bounds check fails
+  // (causing a panic before the result is discarded).
+  let vorbis_version =
+    (len >= 4).then(|| u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]));
+  let audio_channels = (len >= 5).then(|| payload[4]);
+  let sample_rate =
+    (len >= 9).then(|| u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]));
   let read_bitrate = |offset: usize| -> Option<u32> {
+    if len < offset + 4 {
+      return None;
+    }
     let raw = u32::from_le_bytes([
       payload[offset],
       payload[offset + 1],
@@ -536,92 +581,139 @@ fn parse_vorbis_identification(payload: &[u8]) -> Option<VorbisIdentification> {
     // RawConv `'$val || undef'` — drop zero. Vorbis.pm:55,61,67.
     (raw != 0).then_some(raw)
   };
-  Some(VorbisIdentification {
+  let id = VorbisIdentification {
     vorbis_version,
     audio_channels,
     sample_rate,
     maximum_bitrate: read_bitrate(9),
     nominal_bitrate: read_bitrate(13),
     minimum_bitrate: read_bitrate(17),
-  })
+  };
+  // `None` ONLY when payload was too short for even VorbisVersion — keeping
+  // the call-site `match` shape (the recorder still treats `None` as "no
+  // identification packet seen at all").
+  if id.is_empty() { None } else { Some(id) }
 }
 
 /// Typed Opus-header-packet payload (Opus.pm:36-51).
 ///
 /// Holds the four fields the bundled `Opus::Header` ProcessBinaryData table
 /// extracts from the `OpusHead` packet's 19-byte fixed-offset payload.
+/// **Every field is `Option<...>`** because bundled `ProcessBinaryData`
+/// (ExifTool.pm:9927) iterates the tag table per-FIELD and skips any field
+/// whose declared offset is out of bounds — a short payload silently emits
+/// only the in-range subset.
+///
 /// `output_gain` is the POST-ValueConv computed gain (Opus.pm:49
 /// `ValueConv => '10 ** ($val/5120)'`); the raw `int16u` is converted at
 /// parse time to match the bundled `$val` ValueConv chain.
 ///
-/// §1: no public fields. §3: accessor returns the primitive (Copy) directly.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Codex R3 F3: pre-fix the helper rejected the WHOLE table on payloads
+/// shorter than 10 bytes (the largest offset+width). Per-field offset
+/// checks are the fix; faithful to bundled.
+///
+/// §1: no public fields. §3: accessor returns `Option<primitive>` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct OpusHeader {
-  /// `Opus:OpusVersion` (offset 0, int8u). Opus.pm:39.
-  opus_version: u8,
-  /// `Opus:AudioChannels` (offset 1, int8u). Opus.pm:40.
-  audio_channels: u8,
-  /// `Opus:SampleRate` (offset 4, int32u). Opus.pm:42-45.
-  sample_rate: u32,
+  /// `Opus:OpusVersion` (offset 0, int8u). Opus.pm:39. `None` when payload
+  /// is empty.
+  opus_version: Option<u8>,
+  /// `Opus:AudioChannels` (offset 1, int8u). Opus.pm:40. `None` when
+  /// payload is shorter than 2 bytes.
+  audio_channels: Option<u8>,
+  /// `Opus:SampleRate` (offset 4, int32u). Opus.pm:42-45. `None` when
+  /// payload is shorter than 8 bytes.
+  sample_rate: Option<u32>,
   /// `Opus:OutputGain` post-ValueConv. Opus.pm:46-50 — raw int16u read at
-  /// offset 8, then `10 ** ($val/5120)`. Stored as `f64`.
-  output_gain: f64,
+  /// offset 8, then `10 ** ($val/5120)`. Stored as `f64`. `None` when
+  /// payload is shorter than 10 bytes.
+  output_gain: Option<f64>,
 }
 
 impl OpusHeader {
-  /// `Opus:OpusVersion` raw value (Opus.pm:39, int8u).
+  /// True iff at least one field was successfully populated.
   #[must_use]
   #[inline(always)]
-  pub const fn opus_version(&self) -> u8 {
+  pub const fn is_empty(&self) -> bool {
+    self.opus_version.is_none()
+      && self.audio_channels.is_none()
+      && self.sample_rate.is_none()
+      && self.output_gain.is_none()
+  }
+  /// `Opus:OpusVersion` raw value (Opus.pm:39, int8u). `None` when out of
+  /// bounds (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn opus_version(&self) -> Option<u8> {
     self.opus_version
   }
-  /// `Opus:AudioChannels` raw value (Opus.pm:40, int8u).
+  /// `Opus:AudioChannels` raw value (Opus.pm:40, int8u). `None` when out
+  /// of bounds (R3 F3 per-field).
   #[must_use]
   #[inline(always)]
-  pub const fn audio_channels(&self) -> u8 {
+  pub const fn audio_channels(&self) -> Option<u8> {
     self.audio_channels
   }
-  /// `Opus:SampleRate` raw value in Hz (Opus.pm:42-45, int32u).
+  /// `Opus:SampleRate` raw value in Hz (Opus.pm:42-45, int32u). `None`
+  /// when out of bounds (R3 F3 per-field).
   #[must_use]
   #[inline(always)]
-  pub const fn sample_rate(&self) -> u32 {
+  pub const fn sample_rate(&self) -> Option<u32> {
     self.sample_rate
   }
   /// `Opus:OutputGain` POST-ValueConv (Opus.pm:46-50: `10 ** ($val/5120)`).
+  /// `None` when out of bounds (R3 F3 per-field).
   #[must_use]
   #[inline(always)]
-  pub const fn output_gain(&self) -> f64 {
+  pub const fn output_gain(&self) -> Option<f64> {
     self.output_gain
   }
 }
 
 /// Parse the Opus header packet's payload (the bytes AFTER the `OpusHead`
-/// magic) into [`OpusHeader`]. Returns `None` if the payload is shorter
-/// than the 10-byte fixed window the `Opus::Header` table reads (largest
-/// declared offset+width: `8 + 2 = 10`).
+/// magic) into [`OpusHeader`]. **Per-field** offset-checked extraction —
+/// faithful to bundled `ProcessBinaryData` (ExifTool.pm:9927).
+///
+/// Codex R3 F3: pre-fix the helper required `payload.len() >= 10`. A short
+/// payload (e.g. 5 bytes) silently dropped EVERY field even though bundled
+/// would emit OpusVersion / AudioChannels / SampleRate when their declared
+/// offsets fit.
+///
+/// Returns `None` ONLY when the payload is empty (no field can be read).
+/// On a short payload, returns `Some(OpusHeader)` with the in-range fields
+/// populated.
 fn parse_opus_header(payload: &[u8]) -> Option<OpusHeader> {
-  if payload.len() < 10 {
-    return None;
-  }
   // Opus header fields are LE (RFC 7845 §5.1; ProcessBinaryData inherits
   // `II` from Ogg.pm:101).
-  let opus_version = payload[0];
-  let audio_channels = payload[1];
+  //
+  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` for the indexed
+  // arms — the eager form would index even when the bounds check fails.
+  let len = payload.len();
+  let opus_version = (len >= 1).then(|| payload[0]);
+  let audio_channels = (len >= 2).then(|| payload[1]);
   // Note: offset 2 is `PreSkip` (int16u), commented out in Opus.pm:41
   // — INTENTIONALLY not ported (commented in bundled ⇒ deliberately not
   // emitted).
-  let sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-  let raw_gain = u16::from_le_bytes([payload[8], payload[9]]);
-  // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
-  // table; the post-ValueConv value is what bundled emits in both `-j`
-  // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
-  let output_gain = 10.0_f64.powf(f64::from(raw_gain) / 5120.0);
-  Some(OpusHeader {
+  let sample_rate =
+    (len >= 8).then(|| u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]));
+  let output_gain = (len >= 10).then(|| {
+    let raw_gain = u16::from_le_bytes([payload[8], payload[9]]);
+    // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
+    // table; the post-ValueConv value is what bundled emits in both `-j`
+    // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
+    10.0_f64.powf(f64::from(raw_gain) / 5120.0)
+  });
+  let header = OpusHeader {
     opus_version,
     audio_channels,
     sample_rate,
     output_gain,
-  })
+  };
+  if header.is_empty() {
+    None
+  } else {
+    Some(header)
+  }
 }
 
 // ===========================================================================
@@ -1849,9 +1941,19 @@ impl Meta<'_> {
     //    Bundled `ProcessBinaryData` iterates the table in offset order,
     //    so the JSON emission order matches.
     if let Some(id) = self.vorbis_identification {
-      out.write_u64("Vorbis", "VorbisVersion", u64::from(id.vorbis_version()))?;
-      out.write_u64("Vorbis", "AudioChannels", u64::from(id.audio_channels()))?;
-      out.write_u64("Vorbis", "SampleRate", u64::from(id.sample_rate()))?;
+      // R3 F3 (per-field, faithful ProcessBinaryData): every field is
+      // optional — emit only when the parse populated it (i.e. the
+      // payload covered offset+width). Mirrors bundled's iterate-and-
+      // skip semantics (ExifTool.pm:9927).
+      if let Some(v) = id.vorbis_version() {
+        out.write_u64("Vorbis", "VorbisVersion", u64::from(v))?;
+      }
+      if let Some(v) = id.audio_channels() {
+        out.write_u64("Vorbis", "AudioChannels", u64::from(v))?;
+      }
+      if let Some(v) = id.sample_rate() {
+        out.write_u64("Vorbis", "SampleRate", u64::from(v))?;
+      }
       // Bitrate fields: RawConv `$val || undef` drops the zero case
       // (already filtered to `None` in `parse_vorbis_identification`);
       // PrintConv runs `ConvertBitrate` for `-j`, raw bps for `-j -n`.
@@ -1867,16 +1969,26 @@ impl Meta<'_> {
     }
     // 2. Opus header (Opus.pm:36-51). DECLARED OFFSET order: OpusVersion
     //    (0), AudioChannels (1), SampleRate (4), OutputGain (8).
+    //    R3 F3 (per-field): every field is `Option<...>`; emit only the
+    //    in-range subset.
     if let Some(h) = self.opus_header {
-      out.write_u64("Opus", "OpusVersion", u64::from(h.opus_version()))?;
-      out.write_u64("Opus", "AudioChannels", u64::from(h.audio_channels()))?;
-      out.write_u64("Opus", "SampleRate", u64::from(h.sample_rate()))?;
+      if let Some(v) = h.opus_version() {
+        out.write_u64("Opus", "OpusVersion", u64::from(v))?;
+      }
+      if let Some(v) = h.audio_channels() {
+        out.write_u64("Opus", "AudioChannels", u64::from(v))?;
+      }
+      if let Some(v) = h.sample_rate() {
+        out.write_u64("Opus", "SampleRate", u64::from(v))?;
+      }
       // OutputGain post-ValueConv (`10**(raw/5120)`). Bundled emits this
       // as a bare number — `1` when raw is 0 (the common in-spec case);
       // for non-zero raw the f64 result is emitted via the JSON-number
       // gate (the serializer already handles integer-valued f64 ⇒ no `.0`,
       // matching Perl's stringification of `1`).
-      out.write_f64("Opus", "OutputGain", h.output_gain())?;
+      if let Some(g) = h.output_gain() {
+        out.write_f64("Opus", "OutputGain", g)?;
+      }
     }
     // 3. Vorbis comments (vendor + KEY=VALUE) — encounter order with
     //    list-coalescing.
@@ -2403,9 +2515,9 @@ mod tests {
     payload[13..17].copy_from_slice(&128_000u32.to_le_bytes()); // NominalBitrate
     // MinimumBitrate = 0
     let id = parse_vorbis_identification(&payload).expect("21-byte payload accepted");
-    assert_eq!(id.vorbis_version(), 0);
-    assert_eq!(id.audio_channels(), 2);
-    assert_eq!(id.sample_rate(), 44100);
+    assert_eq!(id.vorbis_version(), Some(0));
+    assert_eq!(id.audio_channels(), Some(2));
+    assert_eq!(id.sample_rate(), Some(44100));
     assert_eq!(
       id.maximum_bitrate(),
       None,
@@ -2416,13 +2528,59 @@ mod tests {
   }
 
   #[test]
-  fn vorbis_identification_short_payload_rejected() {
-    // Bundled ProcessBinaryData treats a short payload (under 21 bytes,
-    // the largest declared offset+width) as a partial table that emits
-    // only the in-range subset. Our coarser policy is all-or-nothing
-    // rejection (the in-scope conformance fixtures all have >= 21 bytes),
-    // so a 20-byte payload returns None.
-    let payload = [0u8; 20];
+  fn vorbis_identification_empty_payload_rejected() {
+    // R3 F3: per-field semantics. An EMPTY payload yields `None` (the helper
+    // returns `None` only when not even VorbisVersion fits).
+    let payload = [0u8; 0];
+    assert!(parse_vorbis_identification(&payload).is_none());
+  }
+
+  #[test]
+  fn vorbis_identification_short_payload_per_field_emit() {
+    // R3 F3: per-FIELD offset-checked extraction. A 9-byte payload (covers
+    // offsets 0..4 VorbisVersion, 4 AudioChannels, 5..9 SampleRate, but
+    // NOT 9..13 MaximumBitrate / 13..17 NominalBitrate / 17..21
+    // MinimumBitrate) emits only the in-range subset. Bundled
+    // ProcessBinaryData (ExifTool.pm:9927 `next if $entry >= $size`)
+    // does exactly this — the pre-fix all-or-nothing reject violated
+    // faithfulness.
+    let mut payload = [0u8; 9];
+    payload[0..4].copy_from_slice(&0u32.to_le_bytes()); // VorbisVersion = 0
+    payload[4] = 2; // AudioChannels
+    payload[5..9].copy_from_slice(&44_100u32.to_le_bytes()); // SampleRate
+    let id = parse_vorbis_identification(&payload).expect("9 bytes ⇒ Some(partial)");
+    assert_eq!(id.vorbis_version(), Some(0));
+    assert_eq!(id.audio_channels(), Some(2));
+    assert_eq!(id.sample_rate(), Some(44_100));
+    assert_eq!(
+      id.maximum_bitrate(),
+      None,
+      "offset 9 out of bounds at len 9"
+    );
+    assert_eq!(id.nominal_bitrate(), None, "offset 13 out of bounds");
+    assert_eq!(id.minimum_bitrate(), None, "offset 17 out of bounds");
+  }
+
+  #[test]
+  fn vorbis_identification_just_first_field() {
+    // R3 F3: a 4-byte payload covers ONLY VorbisVersion; all other fields
+    // are out of bounds and emit `None`.
+    let payload = 42u32.to_le_bytes();
+    let id = parse_vorbis_identification(&payload).expect("4 bytes ⇒ Some(version-only)");
+    assert_eq!(id.vorbis_version(), Some(42));
+    assert_eq!(id.audio_channels(), None);
+    assert_eq!(id.sample_rate(), None);
+    assert_eq!(id.maximum_bitrate(), None);
+    assert_eq!(id.nominal_bitrate(), None);
+    assert_eq!(id.minimum_bitrate(), None);
+  }
+
+  #[test]
+  fn vorbis_identification_too_short_for_first_field() {
+    // R3 F3: a 3-byte payload doesn't even cover VorbisVersion (offset 0,
+    // width 4); the helper returns `None` so the caller treats this as
+    // "no identification packet seen".
+    let payload = [0u8; 3];
     assert!(parse_vorbis_identification(&payload).is_none());
   }
 
@@ -2436,8 +2594,8 @@ mod tests {
     payload[13..17].copy_from_slice(&192_000u32.to_le_bytes());
     payload[17..21].copy_from_slice(&64_000u32.to_le_bytes());
     let id = parse_vorbis_identification(&payload).unwrap();
-    assert_eq!(id.audio_channels(), 1);
-    assert_eq!(id.sample_rate(), 48_000);
+    assert_eq!(id.audio_channels(), Some(1));
+    assert_eq!(id.sample_rate(), Some(48_000));
     assert_eq!(id.maximum_bitrate(), Some(320_000));
     assert_eq!(id.nominal_bitrate(), Some(192_000));
     assert_eq!(id.minimum_bitrate(), Some(64_000));
@@ -2457,11 +2615,12 @@ mod tests {
     payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
     // OutputGain raw stays 0.
     let header = parse_opus_header(&payload).expect("10-byte payload accepted");
-    assert_eq!(header.opus_version(), 1);
-    assert_eq!(header.audio_channels(), 2);
-    assert_eq!(header.sample_rate(), 48_000);
+    assert_eq!(header.opus_version(), Some(1));
+    assert_eq!(header.audio_channels(), Some(2));
+    assert_eq!(header.sample_rate(), Some(48_000));
     // 10 ** (0 / 5120) = 10^0 = 1.0 exactly.
-    assert!((header.output_gain() - 1.0).abs() < 1e-12);
+    let gain = header.output_gain().expect("output_gain present");
+    assert!((gain - 1.0).abs() < 1e-12);
   }
 
   #[test]
@@ -2473,18 +2632,48 @@ mod tests {
     payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
     payload[8..10].copy_from_slice(&5120u16.to_le_bytes());
     let header = parse_opus_header(&payload).unwrap();
+    let gain = header.output_gain().expect("output_gain present");
     assert!(
-      (header.output_gain() - 10.0).abs() < 1e-10,
-      "10^(5120/5120) must be exactly 10.0, got {}",
-      header.output_gain()
+      (gain - 10.0).abs() < 1e-10,
+      "10^(5120/5120) must be exactly 10.0, got {gain}"
     );
   }
 
   #[test]
-  fn opus_header_short_payload_rejected() {
-    // Below the 10-byte minimum (offset 8 + width 2).
-    let payload = [0u8; 9];
+  fn opus_header_empty_payload_rejected() {
+    // R3 F3: an EMPTY payload yields None (not even OpusVersion fits).
+    let payload = [0u8; 0];
     assert!(parse_opus_header(&payload).is_none());
+  }
+
+  #[test]
+  fn opus_header_short_payload_per_field_emit() {
+    // R3 F3: per-field. A 5-byte payload covers OpusVersion (offset 0),
+    // AudioChannels (offset 1), but NOT SampleRate (offset 4..8) and
+    // NOT OutputGain (offset 8..10).
+    let mut payload = [0u8; 5];
+    payload[0] = 1;
+    payload[1] = 2;
+    let header = parse_opus_header(&payload).expect("partial Opus header populated");
+    assert_eq!(header.opus_version(), Some(1));
+    assert_eq!(header.audio_channels(), Some(2));
+    assert_eq!(
+      header.sample_rate(),
+      None,
+      "offset 4..8 out of bounds at len 5"
+    );
+    assert_eq!(header.output_gain(), None, "offset 8..10 out of bounds");
+  }
+
+  #[test]
+  fn opus_header_just_first_byte() {
+    // R3 F3: a 1-byte payload covers ONLY OpusVersion.
+    let payload = [3u8; 1];
+    let header = parse_opus_header(&payload).expect("partial");
+    assert_eq!(header.opus_version(), Some(3));
+    assert_eq!(header.audio_channels(), None);
+    assert_eq!(header.sample_rate(), None);
+    assert_eq!(header.output_gain(), None);
   }
 
   #[test]
@@ -2496,9 +2685,9 @@ mod tests {
     let meta = Meta {
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
-        vorbis_version: 0,
-        audio_channels: 2,
-        sample_rate: 44100,
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44100),
         maximum_bitrate: None,
         nominal_bitrate: Some(128_000),
         minimum_bitrate: None,
@@ -2539,9 +2728,9 @@ mod tests {
     let meta = Meta {
       file_type_override: None,
       vorbis_identification: Some(VorbisIdentification {
-        vorbis_version: 0,
-        audio_channels: 2,
-        sample_rate: 44100,
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44100),
         maximum_bitrate: None,
         nominal_bitrate: Some(128_000),
         minimum_bitrate: None,
@@ -2564,6 +2753,42 @@ mod tests {
   }
 
   #[test]
+  fn vorbis_identification_partial_payload_serialize_emits_subset() {
+    // R3 F3 regression pin: a partial VorbisIdentification (e.g. a 9-byte
+    // payload yields VorbisVersion / AudioChannels / SampleRate only) must
+    // emit ONLY the populated fields — not the bitrate trio. This pins the
+    // per-field emit gate in `serialize_tags`.
+    let meta = Meta {
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44_100),
+        maximum_bitrate: None,
+        nominal_bitrate: None,
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Vorbis:VorbisVersion",
+        "Vorbis:AudioChannels",
+        "Vorbis:SampleRate",
+      ],
+      "partial payload emits only populated fields (R3 F3)"
+    );
+  }
+
+  #[test]
   fn opus_header_serialize_emits_declared_order() {
     // Opus.pm:36-51 declared-offset order: OpusVersion / AudioChannels /
     // SampleRate / OutputGain.
@@ -2571,10 +2796,10 @@ mod tests {
       file_type_override: Some("OPUS"),
       vorbis_identification: None,
       opus_header: Some(OpusHeader {
-        opus_version: 1,
-        audio_channels: 2,
-        sample_rate: 48_000,
-        output_gain: 1.0,
+        opus_version: Some(1),
+        audio_channels: Some(2),
+        sample_rate: Some(48_000),
+        output_gain: Some(1.0),
       }),
       comments: vec![],
       warnings: vec![],
@@ -2593,6 +2818,35 @@ mod tests {
         "Opus:OutputGain",
       ],
       "declared-offset emission order"
+    );
+  }
+
+  #[test]
+  fn opus_header_partial_serialize_emits_subset() {
+    // R3 F3: serialize emits only the in-range subset. A partial
+    // OpusHeader with only OpusVersion + AudioChannels populated must
+    // emit just those two keys.
+    let meta = Meta {
+      file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: Some(OpusHeader {
+        opus_version: Some(1),
+        audio_channels: Some(2),
+        sample_rate: None,
+        output_gain: None,
+      }),
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec!["Opus:OpusVersion", "Opus:AudioChannels"],
+      "Opus partial emits only populated fields (R3 F3)"
     );
   }
 
