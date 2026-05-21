@@ -309,6 +309,9 @@ pub enum AnyParser {
   /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio, chains ID3 + APE).
   #[cfg(feature = "wavpack")]
   Wv(crate::formats::wavpack::ProcessWv),
+  /// Matroska (FORMATS.md row 23 — MKV/MKA/MKS/WebM EBML container).
+  #[cfg(feature = "matroska")]
+  Matroska(crate::formats::matroska::ProcessMatroska),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -383,6 +386,9 @@ pub enum AnyMeta<'a> {
   /// WavPack (Phase F5 — `.wv` / `.wvp` hybrid-lossless audio).
   #[cfg(feature = "wavpack")]
   Wv(crate::formats::wavpack::Meta<'a>),
+  /// Matroska (FORMATS.md row 23).
+  #[cfg(feature = "matroska")]
+  Matroska(crate::formats::matroska::Meta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -405,6 +411,7 @@ pub enum AnyMeta<'a> {
     feature = "mpeg-audio",
     feature = "mpc",
     feature = "wavpack",
+    feature = "matroska",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -468,6 +475,8 @@ impl AnyMeta<'_> {
       AnyMeta::Mpc(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "wavpack")]
       AnyMeta::Wv(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness.
@@ -487,6 +496,7 @@ impl AnyMeta<'_> {
         feature = "mpeg-audio",
         feature = "mpc",
         feature = "wavpack",
+        feature = "matroska",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = (print_conv, out);
@@ -625,6 +635,18 @@ impl AnyMeta<'_> {
       AnyMeta::Mpc(_) => FileTypeFinalize::Detected,
       #[cfg(feature = "wavpack")]
       AnyMeta::Wv(_) => FileTypeFinalize::Detected,
+      // Matroska: SetFileType is detected ("MKV"); a `DocType => "webm"`
+      // body invokes `OverrideFileType("WEBM")` (Matroska.pm:72) on the
+      // typed Meta. Other MKA/MKS overrides happen at end-of-walk based on
+      // track types (Matroska.pm:1240-1245) — Phase-2 forward item.
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(m) => {
+        if m.is_webm() {
+          FileTypeFinalize::DetectedThenOverride("WEBM")
+        } else {
+          FileTypeFinalize::Detected
+        }
+      }
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -641,6 +663,7 @@ impl AnyMeta<'_> {
         feature = "mpeg-audio",
         feature = "mpc",
         feature = "wavpack",
+        feature = "matroska",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -826,6 +849,10 @@ pub enum AnyError {
   #[cfg(feature = "wavpack")]
   #[error("WV: {0}")]
   Wv(#[from] crate::formats::wavpack::Error),
+  /// Matroska fatal-error wrapper.
+  #[cfg(feature = "matroska")]
+  #[error("Matroska: {0}")]
+  Matroska(#[from] crate::formats::matroska::Error),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -894,6 +921,7 @@ impl AnyParser {
       feature = "mpeg-audio",
       feature = "mpc",
       feature = "wavpack",
+      feature = "matroska",
     )))]
     let _ = (bytes, shared, ext);
     match self {
@@ -1051,6 +1079,13 @@ impl AnyParser {
         // (`wavpack` requires `id3` + `ape` in Cargo.toml.)
         Ok(crate::formats::wavpack::parse_full_chained(bytes, shared).map(AnyMeta::Wv))
       }
+      #[cfg(feature = "matroska")]
+      AnyParser::Matroska(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Matroska))
+          .map_err(Into::into)
+      }
     }
   }
 }
@@ -1078,6 +1113,10 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "DV" => Some(AnyParser::Dv(crate::formats::dv::ProcessDv)),
     #[cfg(feature = "flac")]
     "FLAC" => Some(AnyParser::Flac(crate::formats::flac::ProcessFlac)),
+    #[cfg(feature = "matroska")]
+    "MKV" => Some(AnyParser::Matroska(
+      crate::formats::matroska::ProcessMatroska,
+    )),
     #[cfg(feature = "mp3")]
     "MP3" => Some(AnyParser::Mp3(crate::formats::id3::ProcessMp3)),
     #[cfg(feature = "moi")]

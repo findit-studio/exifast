@@ -62,7 +62,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 # Umbrella — enables every per-format gate.
 all-formats = [
   "aac", "aiff", "ape", "audible", "dsf", "dv", "flac",
-  "id3", "mp3", "mpc", "moi", "ogg", "red", "wavpack",
+  "id3", "matroska", "mp3", "mpc", "moi", "ogg", "red", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -90,6 +90,9 @@ dsf        = ["id3"]
 dv         = []
 flac       = ["id3"]
 id3        = []
+# `matroska` — engine-only per FORMATS.md row 23. Leaf format (no
+# cross-format chains); ports the entire EBML walker + tag table.
+matroska   = []
 # `mp3` chains ID3 (header), MPEG-audio (frame scan), AND APE: bundled
 # `ID3::ProcessMP3` (ID3.pm:1722-1727) runs `APE::ProcessAPE` as the final
 # trailer fallback, so the typed MP3 parser unconditionally calls

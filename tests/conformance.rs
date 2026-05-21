@@ -50,6 +50,19 @@ fn aac_conformance() {
 }
 
 #[test]
+fn matroska_conformance() {
+  // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
+  // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio
+  // tracks with `DocType="matroska"`). Goldens are bundled
+  // `perl exiftool -j -G1:1 -api struct=1` output with `System:*` and
+  // `Composite:*` stripped uniformly (matching every other format
+  // conformance — composite-tag system is deferred per
+  // `[[exifast-phase2-forward-items]]`).
+  check("Matroska.mkv", "Matroska.mkv.json", true);
+  check("Matroska.mkv", "Matroska.mkv.n.json", false);
+}
+
+#[test]
 fn wavpack_conformance() {
   // FORMATS.md row 6. Native `wvpk....` 32-byte header (no RIFF wrapper,
   // no ID3, no APE) ⇒ ProcessWV runs the WavPack::Main ProcessBinaryData

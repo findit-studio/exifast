@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_126() {
+fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -179,12 +179,15 @@ fn typed_serde_path_equals_writer_path_and_golden_all_126() {
   // Vorbis-comment SubDirectory hop into `%FLAC::Picture` (FLAC.pm:84-
   // 134). The other R3 F2 fixture (`FLAC.ogg`, Ogg-FLAC transport) is
   // formally accept-deferred — see `NOT_ACTIVE`.
+  // 126 → 127 after FORMATS.md row 23 lib/matroska: added `Matroska.mkv`
+  // (bundled t/images fixture, 507 bytes) to exercise the EBML walker +
+  // tag-table dispatch ported in `src/formats/matroska.rs`.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    126,
-    "expected exactly the 126 active conformance fixtures, found {}: {:?}",
+    127,
+    "expected exactly the 127 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

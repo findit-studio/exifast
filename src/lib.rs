@@ -167,6 +167,8 @@ pub use formats::dv::ProcessDv;
 pub use formats::flac::ProcessFlac;
 #[cfg(feature = "id3")]
 pub use formats::id3::ProcessId3;
+#[cfg(feature = "matroska")]
+pub use formats::matroska::ProcessMatroska;
 // MP3 wrapper (Codex A-R2-1) — `mp3` feature pulls `mpeg-audio` + `ape`.
 #[cfg(feature = "mp3")]
 pub use formats::id3::ProcessMp3;
@@ -284,6 +286,20 @@ pub fn parse_moi(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::moi::Meta<'_>>, formats::moi::Error> {
   formats::moi::parse_borrowed(bytes)
+}
+
+/// Parse a Matroska/MKV/MKA/MKS/WebM buffer directly. See
+/// [`formats::matroska::parse_borrowed`].
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::matroska::Error`] (currently
+/// uninhabited).
+#[cfg(feature = "matroska")]
+pub fn parse_matroska(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::matroska::Meta<'_>>, formats::matroska::Error> {
+  formats::matroska::parse_borrowed(bytes)
 }
 
 /// Parse an AAC (ADTS) buffer directly. See [`formats::aac::parse_borrowed`].
@@ -652,6 +668,8 @@ mod tests {
     let bytes: &[u8] = b"";
     #[cfg(feature = "moi")]
     let _ = parse_moi(bytes);
+    #[cfg(feature = "matroska")]
+    let _ = parse_matroska(bytes);
     #[cfg(feature = "aac")]
     let _ = parse_aac(bytes);
     #[cfg(feature = "dv")]

@@ -23,6 +23,8 @@ pub mod dv;
 pub mod flac;
 #[cfg(feature = "id3")]
 pub mod id3;
+#[cfg(feature = "matroska")]
+pub mod matroska;
 #[cfg(feature = "moi")]
 pub mod moi;
 #[cfg(feature = "mpc")]
