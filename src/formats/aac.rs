@@ -5,7 +5,7 @@
 //! Faithful port of `Image::ExifTool::AAC` (lib/Image/ExifTool/AAC.pm).
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (AAC.pm:29) → [`crate::bitstream`].
 //!
-//! A typed [`AacMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
 //! [`ProcessAac::process`] drives the typed `serialize_tags` path
 //! into the engine `tagmap::TagMap` so the serialized
@@ -97,7 +97,7 @@ pub static AAC_MAIN: TagTable = TagTable::new("AAC", aac_get);
 pub const AAC_BIT_KEYS: &[&str] = &["Bit016-017", "Bit018-021", "Bit023-025"];
 
 // ===========================================================================
-// Typed Meta — `AacMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed AAC metadata — the lib-first output of [`ProcessAac`].
@@ -112,10 +112,10 @@ pub const AAC_BIT_KEYS: &[&str] = &["Bit016-017", "Bit018-021", "Bit023-025"];
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `AacMeta` borrows the Encoder string from the input
+/// **Lifetimes.** `Meta` borrows the Encoder string from the input
 /// buffer (`encoder: Option<&'a str>`); other fields are owned primitives.
 #[derive(Debug, Clone)]
-pub struct AacMeta<'a> {
+pub struct Meta<'a> {
   /// ProfileType (raw 2-bit field at bits 16-17). PrintConv at emit time:
   /// 0→"Main", 1→"Low Complexity", 2→"Scalable Sampling Rate"; 3 is
   /// rejected upstream by [`ProcessAac::parse`]. Always present after the
@@ -136,7 +136,7 @@ pub struct AacMeta<'a> {
   encoder: Option<&'a str>,
 }
 
-impl<'a> AacMeta<'a> {
+impl<'a> Meta<'a> {
   /// ProfileType raw value (0..=2).
   #[must_use]
   #[inline(always)]
@@ -189,31 +189,31 @@ pub struct ProcessAac;
 impl parser_sealed::Sealed for ProcessAac {}
 
 impl FormatParser for ProcessAac {
-  type Meta<'a> = AacMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = AacError;
+  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AacError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(data)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`AacMeta`] that borrows from the input buffer (Encoder field).
+/// [`Meta`] that borrows from the input buffer (Encoder field).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`AacMeta`]. The
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = AacMeta<'a>`) returns this
+/// Inner parser — produces a borrow-from-input [`Meta`]. The
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns this
 /// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
 /// enum — no `'static` upgrade (Codex AF2).
-fn parse_inner(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
+fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // AAC.pm:99-105 header validation. A reject here returns `Ok(None)` —
   // Perl `return 0` BEFORE `$et->SetFileType()` (AAC.pm:107).
   if data.len() < 7 {
@@ -247,7 +247,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
   // process_bit_stream into a side Metadata. The bit-stream walker is the
   // shared engine path used by AAC + FLAC StreamInfo + WavPack + MPC;
   // running it here is the simplest faithful path. We then transpose the
-  // emitted (name, TagValue) triples into typed scalars on AacMeta.
+  // emitted (name, TagValue) triples into typed scalars on Meta.
   let mut staging = Metadata::new("aac-staging");
   // print_conv_enabled=false: we want the post-ValueConv raw scalars —
   // PrintConv is applied at sink time per Meta's design.
@@ -291,7 +291,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
   // with an unconditional `last` (AAC.pm:136).
   let encoder: Option<&str> = encoder_from_filler(data, t0, t2, len);
 
-  Ok(Some(AacMeta {
+  Ok(Some(Meta {
     profile_type,
     sample_rate,
     channels,
@@ -364,7 +364,7 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl AacMeta<'_> {
+impl Meta<'_> {
   /// Emit AAC tags into the writer in `%AAC::Main` walk order (ProfileType,
   /// SampleRate, Channels, then Encoder) — faithful to AAC.pm:38-74 +
   /// bit-stream walker.
@@ -411,7 +411,7 @@ impl AacMeta<'_> {
 }
 
 // ===========================================================================
-// `AacError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for AAC parsing. Currently empty — every bad
@@ -420,13 +420,13 @@ impl AacMeta<'_> {
 ///
 /// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
 /// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `AacError` is a real `Error` even on no-std).
+/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
 /// `#[non_exhaustive]` lets the first real variant land without a breaking
 /// change. The derive expands `Display` to an empty `match *self {}`, so no
 /// `#[error(…)]` attribute is needed while the enum has no variants.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AacError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -445,7 +445,7 @@ mod tests {
     // §5: thiserror v2 (default-features=false) makes the empty error enum
     // a real `core::error::Error` in every feature tier.
     fn assert_error<E: core::error::Error>() {}
-    assert_error::<AacError>();
+    assert_error::<Error>();
   }
 
   #[test]
@@ -575,7 +575,7 @@ mod tests {
   #[test]
   fn meta_sinker_emits_typed_tags() {
     use crate::tagmap::TagMap;
-    let meta = AacMeta {
+    let meta = Meta {
       profile_type: 1,
       sample_rate: 44100,
       channels: 2,
@@ -603,7 +603,7 @@ mod tests {
   fn meta_sinker_emits_channels_special_cases() {
     use crate::tagmap::TagMap;
     // Channels=0 ⇒ "?"
-    let meta = AacMeta {
+    let meta = Meta {
       profile_type: 0,
       sample_rate: 44100,
       channels: 0,
@@ -613,7 +613,7 @@ mod tests {
     meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(w.get_str("AAC", "Channels"), Some("?".to_string()));
     // Channels=6 ⇒ "5+1"
-    let meta = AacMeta {
+    let meta = Meta {
       profile_type: 0,
       sample_rate: 44100,
       channels: 6,
@@ -623,7 +623,7 @@ mod tests {
     meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(w.get_str("AAC", "Channels"), Some("5+1".to_string()));
     // Channels=7 ⇒ "7+1"
-    let meta = AacMeta {
+    let meta = Meta {
       profile_type: 0,
       sample_rate: 44100,
       channels: 7,

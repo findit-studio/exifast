@@ -6,7 +6,7 @@
 //! AA-side only: `ProcessAA` + the `%Audible::Main` tag table.
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
-//! AAC/DV pattern: a typed [`AaMeta<'a>`] is produced by the new
+//! AAC/DV pattern: a typed [`Meta<'a>`] is produced by the new
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -544,15 +544,15 @@ static ENTITY_NUM: &[(&str, u32)] = &[
 ];
 
 // ===========================================================================
-// Typed Meta — `AaMeta<'a>` + `AaEntry<'a>` + `AaValue<'a>`
+// Typed Meta — `Meta<'a>` + `Entry<'a>` + `Value<'a>`
 // ===========================================================================
 
-/// One emitted tag in [`AaMeta::entries`]. Each entry carries the resolved
+/// One emitted tag in [`Meta::entries`]. Each entry carries the resolved
 /// `name` (post-`MakeTagName`/`AddTagToTable` normalization) and a typed
 /// value. The `group` is always family-0 = family-1 = `"Audible"` (the
 /// only group the AA path emits under).
 #[derive(Debug, Clone)]
-pub struct AaEntry<'a> {
+pub struct Entry<'a> {
   /// Tag name (e.g. `"Author"`, `"Title"`, `"Tag7eb298ac1328"`, `"ChapterCount"`,
   /// `"CoverArt"`). Already normalized via `MakeTagName` + `s/_(.)/\U$1/g` +
   /// `AddTagToTable` for the dynamic-name path; matches the static `TagDef::
@@ -561,20 +561,20 @@ pub struct AaEntry<'a> {
   /// Tag value. Strings are post-UnescapeHTML + post-fix_utf8 (synthesized);
   /// `I64` carries the chunk-6 ChapterCount; `Bytes` carries cover art
   /// (chunk-11 or dict `_cover_art` after UnescapeHTML).
-  value: AaValue<'a>,
+  value: Value<'a>,
 }
 
-impl<'a> AaEntry<'a> {
+impl<'a> Entry<'a> {
   /// Tag name (e.g. `"Author"`).
   #[must_use]
   #[inline(always)]
   pub fn name(&self) -> &str {
     self.name.as_str()
   }
-  /// Typed tag value (borrow of the non-`Copy` [`AaValue`]).
+  /// Typed tag value (borrow of the non-`Copy` [`Value`]).
   #[must_use]
   #[inline(always)]
-  pub const fn value_ref(&self) -> &AaValue<'a> {
+  pub const fn value_ref(&self) -> &Value<'a> {
     &self.value
   }
 }
@@ -591,7 +591,7 @@ impl<'a> AaEntry<'a> {
 /// breaking change for downstream matchers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum AaValue<'a> {
+pub enum Value<'a> {
   /// UTF-8 text post-UnescapeHTML + post-fix_utf8 (synthesized — does not
   /// borrow from input because the pipeline materially transforms bytes).
   /// Stored as [`SmolStr`] so small values (most AA dict tags) inline.
@@ -606,50 +606,50 @@ pub enum AaValue<'a> {
   Bytes(std::borrow::Cow<'a, [u8]>),
 }
 
-impl AaValue<'_> {
-  /// True iff this is an [`AaValue::Str`].
+impl Value<'_> {
+  /// True iff this is an [`Value::Str`].
   #[must_use]
   #[inline(always)]
   pub const fn is_str(&self) -> bool {
-    matches!(self, AaValue::Str(_))
+    matches!(self, Value::Str(_))
   }
-  /// True iff this is an [`AaValue::I64`].
+  /// True iff this is an [`Value::I64`].
   #[must_use]
   #[inline(always)]
   pub const fn is_i64(&self) -> bool {
-    matches!(self, AaValue::I64(_))
+    matches!(self, Value::I64(_))
   }
-  /// True iff this is an [`AaValue::Bytes`].
+  /// True iff this is an [`Value::Bytes`].
   #[must_use]
   #[inline(always)]
   pub const fn is_bytes(&self) -> bool {
-    matches!(self, AaValue::Bytes(_))
+    matches!(self, Value::Bytes(_))
   }
 
-  /// The string payload of an [`AaValue::Str`], else `None`.
+  /// The string payload of an [`Value::Str`], else `None`.
   #[must_use]
   #[inline(always)]
   pub fn try_unwrap_str(&self) -> Option<&str> {
     match self {
-      AaValue::Str(s) => Some(s.as_str()),
+      Value::Str(s) => Some(s.as_str()),
       _ => None,
     }
   }
-  /// The integer payload of an [`AaValue::I64`], else `None`.
+  /// The integer payload of an [`Value::I64`], else `None`.
   #[must_use]
   #[inline(always)]
   pub const fn try_unwrap_i64(&self) -> Option<i64> {
     match self {
-      AaValue::I64(n) => Some(*n),
+      Value::I64(n) => Some(*n),
       _ => None,
     }
   }
-  /// The byte payload of an [`AaValue::Bytes`], else `None`.
+  /// The byte payload of an [`Value::Bytes`], else `None`.
   #[must_use]
   #[inline(always)]
   pub fn try_unwrap_bytes(&self) -> Option<&[u8]> {
     match self {
-      AaValue::Bytes(b) => Some(b.as_ref()),
+      Value::Bytes(b) => Some(b.as_ref()),
       _ => None,
     }
   }
@@ -665,7 +665,7 @@ impl AaValue<'_> {
 /// `AddTagToTable`. Adding to that, two chunk types emit single
 /// well-known tags: chunk-6 ⇒ `ChapterCount` (Audible.pm:223), chunk-11 ⇒
 /// `CoverArt` (Audible.pm:234). The natural typed representation is an
-/// **ordered list of [`AaEntry`]** mirroring the bundled-Perl `FoundTag`
+/// **ordered list of [`Entry`]** mirroring the bundled-Perl `FoundTag`
 /// call sequence. Last-wins (Perl `FoundTag` promote-then-overwrite +
 /// `%noDups` first-token filter, ExifTool.pm:9504-9577, exiftool:2744-2752)
 /// is applied at construction in [`parse_inner`].
@@ -678,13 +678,13 @@ impl AaValue<'_> {
 /// **Lifetimes.** Most fields are synthesized (entity-decoded /
 /// UTF-8-repaired) and stored as [`SmolStr`] (alloc-backed). The cover-art
 /// chunk-11 path stays zero-copy by borrowing `&'a [u8]` from input via
-/// [`AaValue::Bytes`]`(Cow::Borrowed)`. The dict-`_cover_art` path
+/// [`Value::Bytes`]`(Cow::Borrowed)`. The dict-`_cover_art` path
 /// materializes an owned `Vec<u8>` (UnescapeHTML reshapes bytes).
 #[derive(Debug, Clone)]
-pub struct AaMeta<'a> {
+pub struct Meta<'a> {
   /// Ordered list of emitted tags (faithful to the Perl `FoundTag` call
   /// sequence in `ProcessAA` after last-wins resolution).
-  entries: std::vec::Vec<AaEntry<'a>>,
+  entries: std::vec::Vec<Entry<'a>>,
   /// Warnings accumulated during parse (faithful to `$et->Warn` —
   /// Audible.pm:210, 212, 227, 228, 238, 240, 246, 252). Mirrors
   /// [`crate::value::Metadata::warnings`].
@@ -695,12 +695,12 @@ pub struct AaMeta<'a> {
   errors: std::vec::Vec<SmolStr>,
 }
 
-impl<'a> AaMeta<'a> {
+impl<'a> Meta<'a> {
   /// All emitted tag entries in bundled-Perl `FoundTag` call order
   /// (post-last-wins resolution).
   #[must_use]
   #[inline(always)]
-  pub fn entries(&self) -> &[AaEntry<'a>] {
+  pub fn entries(&self) -> &[Entry<'a>] {
     &self.entries
   }
 
@@ -723,7 +723,7 @@ impl<'a> AaMeta<'a> {
   }
 
   /// `ChapterCount` extracted from chunk-6 (Audible.pm:223), if present.
-  /// Convenience accessor; the same value also appears as an [`AaEntry`]
+  /// Convenience accessor; the same value also appears as an [`Entry`]
   /// in [`Self::entries`] named `"ChapterCount"`.
   #[must_use]
   pub fn chapter_count(&self) -> Option<i64> {
@@ -731,7 +731,7 @@ impl<'a> AaMeta<'a> {
       .entries
       .iter()
       .find_map(|e| match (e.name.as_str(), &e.value) {
-        ("ChapterCount", AaValue::I64(n)) => Some(*n),
+        ("ChapterCount", Value::I64(n)) => Some(*n),
         _ => None,
       })
   }
@@ -746,7 +746,7 @@ impl<'a> AaMeta<'a> {
       .entries
       .iter()
       .find_map(|e| match (e.name.as_str(), &e.value) {
-        ("CoverArt", AaValue::Bytes(b)) => Some(b.as_ref()),
+        ("CoverArt", Value::Bytes(b)) => Some(b.as_ref()),
         _ => None,
       })
   }
@@ -776,39 +776,39 @@ impl FormatParser for ProcessAa {
   /// AA's only borrowed lifetime is the cover-art chunk-11 path (`&'a
   /// [u8]`). GAT: the Meta borrows from the input `'a` directly (Codex
   /// AF2).
-  type Meta<'a> = AaMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]` (no shared cross-format
   /// state — AA does not chain to ID3/APE etc.).
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; AA parsing has no I/O modes —
   /// every bad input either returns `Ok(None)` or accumulates warnings/
   /// errors into the typed Meta and returns `Ok(Some)`).
-  type Error = AudibleError;
+  type Error = Error;
 
-  /// Parse an AA file's bytes into a typed [`AaMeta`], or `None` if the
+  /// Parse an AA file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid AA (short read, wrong magic, or embedded
   /// filesize mismatch — Audible.pm:201-205). Returns `Err` only for
   /// Rust-level fatal modes; the current port has none.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AudibleError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     Ok(parse_inner(data))
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`AaMeta`] that borrows the cover-art chunk-11 payload directly from
+/// [`Meta`] that borrows the cover-art chunk-11 payload directly from
 /// the input buffer (zero-copy).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<AaMeta<'_>>, AudibleError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   Ok(parse_inner(data))
 }
 
-/// Inner parser — produces a borrow-from-input [`AaMeta`] (chunk-11 cover
+/// Inner parser — produces a borrow-from-input [`Meta`] (chunk-11 cover
 /// art borrows). The [`FormatParser::Meta`] GAT (`type Meta<'a> =
-/// AaMeta<'a>`) returns this borrowed form directly into the closed
+/// Meta<'a>`) returns this borrowed form directly into the closed
 /// [`crate::parser_new::AnyMeta`] enum — no `'static` upgrade (Codex AF2).
 ///
 /// Faithful to `ProcessAA` (Audible.pm:194-273):
@@ -820,7 +820,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<AaMeta<'_>>, AudibleError> {
 /// 3. `SetByteOrder('MM')` (Audible.pm:208) — every u32 read is BE.
 /// 4. TOC walk (Audible.pm:215-271) — dispatch chunk 6 (chapter count),
 ///    chunk 11 (cover art), chunk 2 (UTF-8 dictionary).
-fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // Audible.pm:201 — `$raf->Read($buff, 16) == 16 and $buff =~
   // /^.{4}\x57\x90\x75\x36/s`. Magic at bytes[4..8]; first 4 bytes are
   // unconstrained at this step.
@@ -847,7 +847,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
   // `$et->FoundTag` + `$et->Warn` calls become these in-memory pushes;
   // last-wins / first-wins resolution runs against this Vec, NOT against
   // engine state.
-  let mut entries: std::vec::Vec<AaEntry<'_>> = std::vec::Vec::new();
+  let mut entries: std::vec::Vec<Entry<'_>> = std::vec::Vec::new();
   let mut warnings: std::vec::Vec<SmolStr> = std::vec::Vec::new();
   let mut errors: std::vec::Vec<SmolStr> = std::vec::Vec::new();
 
@@ -865,7 +865,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
   // the last expression). Faithful: warn + return TRUE (accept).
   if toc_bytes > 0xc00 {
     warnings.push(SmolStr::new_static("Invalid TOC"));
-    return Some(AaMeta {
+    return Some(Meta {
       entries,
       warnings,
       errors,
@@ -879,7 +879,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
   let Some(toc_end) = toc_start.checked_add(toc_bytes) else {
     // Numerically impossible after the 0xc00 cap, but keep panic-free.
     warnings.push(SmolStr::new_static("Truncated TOC"));
-    return Some(AaMeta {
+    return Some(Meta {
       entries,
       warnings,
       errors,
@@ -887,7 +887,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
   };
   if toc_end > data_len {
     warnings.push(SmolStr::new_static("Truncated TOC"));
-    return Some(AaMeta {
+    return Some(Meta {
       entries,
       warnings,
       errors,
@@ -967,7 +967,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
       // (exiftool:2744-2752) then drops `(1)`, emitting only the
       // LATEST count. R6 fix: chunk-6 must go through the same
       // last-wins helper as the dict path.
-      handle_static_entry(&mut entries, "ChapterCount", AaValue::I64(i64::from(count)));
+      handle_static_entry(&mut entries, "ChapterCount", Value::I64(i64::from(count)));
       entry += 12;
       continue;
     }
@@ -1047,7 +1047,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
       handle_static_entry(
         &mut entries,
         "CoverArt",
-        AaValue::Bytes(std::borrow::Cow::Borrowed(cover_bytes)),
+        Value::Bytes(std::borrow::Cow::Borrowed(cover_bytes)),
       );
       entry += 12;
       continue;
@@ -1141,9 +1141,9 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
           // expansion would change that count, so the binary path
           // skips it.
           let value = if def.name() == "CoverArt" {
-            AaValue::Bytes(std::borrow::Cow::Owned(unescaped_bytes))
+            Value::Bytes(std::borrow::Cow::Owned(unescaped_bytes))
           } else {
-            AaValue::Str(SmolStr::from(fix_utf8(&unescaped_bytes)))
+            Value::Str(SmolStr::from(fix_utf8(&unescaped_bytes)))
           };
           // Last-wins: bundled Perl FoundTag promote-then-overwrite +
           // `%noDups` first-token filter ⇒ replace in-place at first
@@ -1170,7 +1170,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
           // 3. AddTagToTable     — ExifTool.pm:9243-9254 prefix gate
           let dynamic_name =
             add_tag_to_table_name_normalize(underscore_to_mixed_case(&make_tag_name(&tag)));
-          let value = AaValue::Str(SmolStr::from(fix_utf8(&unescaped_bytes)));
+          let value = Value::Str(SmolStr::from(fix_utf8(&unescaped_bytes)));
 
           // R7: dynamic-name collisions with engine pre-emitted
           // Priority-2 tags (only `FileType`) need first-wins. The
@@ -1187,7 +1187,7 @@ fn parse_inner(data: &[u8]) -> Option<AaMeta<'_>> {
     entry += 12;
   }
 
-  Some(AaMeta {
+  Some(Meta {
     entries,
     warnings,
     errors,
@@ -1226,15 +1226,11 @@ fn known_static_key(tag: &str) -> &'static str {
 ///
 /// Pinned to the AA path only — the engine-wide HandleTag promotion is a
 /// Phase-2 forward-item.
-fn handle_static_entry<'a>(
-  entries: &mut std::vec::Vec<AaEntry<'a>>,
-  name: &str,
-  value: AaValue<'a>,
-) {
+fn handle_static_entry<'a>(entries: &mut std::vec::Vec<Entry<'a>>, name: &str, value: Value<'a>) {
   if let Some(existing) = entries.iter_mut().find(|e| e.name == name) {
     existing.value = value;
   } else {
-    entries.push(AaEntry {
+    entries.push(Entry {
       name: SmolStr::from(name),
       value,
     });
@@ -1253,9 +1249,9 @@ fn handle_static_entry<'a>(
 /// (`FileType` is the only one; `FileTypeExtension`/`MIMEType`/
 /// `ExifToolVersion` use default Priority 1 and stay last-wins).
 fn handle_dynamic_entry<'a>(
-  entries: &mut std::vec::Vec<AaEntry<'a>>,
+  entries: &mut std::vec::Vec<Entry<'a>>,
   name: String,
-  value: AaValue<'a>,
+  value: Value<'a>,
 ) {
   if let Some(existing) = entries.iter_mut().find(|e| e.name == name.as_str()) {
     if collides_with_priority2_engine_tag(&name) {
@@ -1264,7 +1260,7 @@ fn handle_dynamic_entry<'a>(
     }
     existing.value = value;
   } else {
-    entries.push(AaEntry {
+    entries.push(Entry {
       name: SmolStr::from(name),
       value,
     });
@@ -1292,7 +1288,7 @@ fn collides_with_priority2_engine_tag(name: &str) -> bool {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl AaMeta<'_> {
+impl Meta<'_> {
   /// Emit AA tags into the writer in `ProcessAA` extraction order
   /// (Audible.pm:215-271): TOC-walk order of (chunk_type ∈ {2, 6, 11})
   /// emissions, post-last-wins/first-wins resolution.
@@ -1314,9 +1310,9 @@ impl AaMeta<'_> {
     // Tags first (TOC walk order, last-wins resolved at parse time).
     for entry in &self.entries {
       match &entry.value {
-        AaValue::Str(s) => out.write_str(GROUP, entry.name.as_str(), s.as_str())?,
-        AaValue::I64(n) => out.write_i64(GROUP, entry.name.as_str(), *n)?,
-        AaValue::Bytes(b) => out.write_bytes(GROUP, entry.name.as_str(), b.as_ref())?,
+        Value::Str(s) => out.write_str(GROUP, entry.name.as_str(), s.as_str())?,
+        Value::I64(n) => out.write_i64(GROUP, entry.name.as_str(), *n)?,
+        Value::Bytes(b) => out.write_bytes(GROUP, entry.name.as_str(), b.as_ref())?,
       }
     }
     // Warnings (Audible.pm `$et->Warn` accumulator). The CLI serializer
@@ -1335,12 +1331,12 @@ impl AaMeta<'_> {
 }
 
 // ===========================================================================
-// `AudibleError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for AA parsing. Currently empty — every bad
 /// input either produces `Ok(None)` (Perl `return 0`) or surfaces
-/// warnings/errors inside the typed [`AaMeta`] (Perl `$et->Warn` /
+/// warnings/errors inside the typed [`Meta`] (Perl `$et->Warn` /
 /// `$et->Error`). Reserved for future I/O wrappers if streaming readers
 /// are added.
 ///
@@ -1350,7 +1346,7 @@ impl AaMeta<'_> {
 /// [`crate::parser_new::AnyError`]'s `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum AudibleError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1878,7 +1874,7 @@ mod tests {
     let names: Vec<&str> = meta.entries().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["Author", "Title"]);
     match meta.entries()[0].value_ref() {
-      AaValue::Str(s) => assert_eq!(s.as_str(), "Alice"),
+      Value::Str(s) => assert_eq!(s.as_str(), "Alice"),
       other => panic!("expected Str, got {other:?}"),
     }
   }
@@ -1892,18 +1888,18 @@ mod tests {
 
   #[test]
   fn aa_value_predicates_and_unwrap_accessors() {
-    let s = AaValue::Str(SmolStr::from("hi"));
+    let s = Value::Str(SmolStr::from("hi"));
     assert!(s.is_str() && !s.is_i64() && !s.is_bytes());
     assert_eq!(s.try_unwrap_str(), Some("hi"));
     assert_eq!(s.try_unwrap_i64(), None);
     assert_eq!(s.try_unwrap_bytes(), None);
 
-    let n = AaValue::I64(7);
+    let n = Value::I64(7);
     assert!(n.is_i64() && !n.is_str() && !n.is_bytes());
     assert_eq!(n.try_unwrap_i64(), Some(7));
     assert_eq!(n.try_unwrap_str(), None);
 
-    let b = AaValue::Bytes(std::borrow::Cow::Borrowed(&[1u8, 2, 3]));
+    let b = Value::Bytes(std::borrow::Cow::Borrowed(&[1u8, 2, 3]));
     assert!(b.is_bytes() && !b.is_str() && !b.is_i64());
     assert_eq!(b.try_unwrap_bytes(), Some(&[1u8, 2, 3][..]));
     assert_eq!(b.try_unwrap_i64(), None);

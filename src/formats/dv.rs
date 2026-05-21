@@ -4,7 +4,7 @@
 //! (no explicit row, so Perl `$module = $type`); registered in
 //! [`crate::parser_new::any_parser_for`].
 //!
-//! A typed [`DvMeta<'a>`] is produced by the
+//! A typed [`Meta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -22,7 +22,7 @@ use crate::{
 /// on the exact same `f64` as `%.3g` of `30000/1001`.
 ///
 /// D8: PRIVATE fields, accessors only; `const fn new` for `static` use.
-struct DvProfile {
+struct Profile {
   dsf: u8,
   video_stype: u8,
   frame_size: u32,
@@ -37,12 +37,12 @@ struct DvProfile {
   image_width: u32,
 }
 
-impl DvProfile {
+impl Profile {
   /// Construct a profile row (DV.pm:21-113). The 9 named arguments mirror
   /// the 9 keys of a Perl `@dvProfiles` hash literal one-for-one; this is
   /// the only constructor (D8: PRIVATE fields, `const fn new` required for
   /// `static` use). `#[allow(clippy::too_many_arguments)]` is preferred
-  /// over a `DvProfileBuilder` here: the Perl table is a flat
+  /// over a `ProfileBuilder` here: the Perl table is a flat
   /// `(DSF, VideoSType, FrameSize, VideoFormat, Colorimetry, FrameRate,
   /// ImageHeight, ImageWidth)` rendering (FrameRate splits into 2 fields),
   /// and a builder would obscure the line-by-line faithful-1:1 mapping.
@@ -128,9 +128,9 @@ impl DvProfile {
 /// scans the table in order and stops at the FIRST `dsf`/`stype` match.
 /// `[2]` is the SMPTE-314M PAL 4:1:1 row that DV.pm:180 forces explicitly
 /// for the 576i50 25Mbps 4:1:1 special case.
-static DV_PROFILES: &[DvProfile] = &[
+static DV_PROFILES: &[Profile] = &[
   // [0] DV.pm:22-30 — IEC 61834 NTSC 525/60.
-  DvProfile::new(
+  Profile::new(
     0,
     0x0,
     120_000,
@@ -142,7 +142,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [1] DV.pm:31-39 — IEC 61834 PAL 625/50 4:2:0.
-  DvProfile::new(
+  Profile::new(
     1,
     0x0,
     144_000,
@@ -154,7 +154,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [2] DV.pm:40-48 — SMPTE-314M PAL 625/50 4:1:1 (DV.pm:180 special case).
-  DvProfile::new(
+  Profile::new(
     1,
     0x0,
     144_000,
@@ -166,7 +166,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [3] DV.pm:49-57 — DVCPRO50 NTSC.
-  DvProfile::new(
+  Profile::new(
     0,
     0x4,
     240_000,
@@ -178,7 +178,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [4] DV.pm:58-66 — DVCPRO50 PAL.
-  DvProfile::new(
+  Profile::new(
     1,
     0x4,
     288_000,
@@ -190,7 +190,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [5] DV.pm:67-75 — DVCPRO HD 1080i60 NTSC base.
-  DvProfile::new(
+  Profile::new(
     0,
     0x14,
     480_000,
@@ -202,7 +202,7 @@ static DV_PROFILES: &[DvProfile] = &[
     1280,
   ),
   // [6] DV.pm:76-84 — DVCPRO HD 1080i50 PAL base.
-  DvProfile::new(
+  Profile::new(
     1,
     0x14,
     576_000,
@@ -214,7 +214,7 @@ static DV_PROFILES: &[DvProfile] = &[
     1440,
   ),
   // [7] DV.pm:85-93 — DVCPRO HD 720p60 NTSC base.
-  DvProfile::new(
+  Profile::new(
     0,
     0x18,
     240_000,
@@ -226,7 +226,7 @@ static DV_PROFILES: &[DvProfile] = &[
     960,
   ),
   // [8] DV.pm:94-102 — DVCPRO HD 720p50 PAL base.
-  DvProfile::new(
+  Profile::new(
     1,
     0x18,
     288_000,
@@ -238,7 +238,7 @@ static DV_PROFILES: &[DvProfile] = &[
     960,
   ),
   // [9] DV.pm:103-112 — IEC 61883-5 PAL.
-  DvProfile::new(
+  Profile::new(
     1,
     0x1,
     144_000,
@@ -578,11 +578,11 @@ enum Parsed<'a> {
   /// `'a` only for shape parity with [`Parsed::Found`]; no borrow today.
   UnrecognizedProfile,
   /// DV.pm:267-270 — emit tags in @dvTags order.
-  Found(DvMeta<'a>),
+  Found(Meta<'a>),
 }
 
 // ===========================================================================
-// Typed Meta — `DvMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed DV metadata — the lib-first output of [`ProcessDv`].
@@ -602,20 +602,20 @@ enum Parsed<'a> {
 /// `'static` in practice. The `date_time_original` is the only owned
 /// allocation (`String` produced by the VAUX scan).
 #[derive(Debug, Clone)]
-pub struct DvMeta<'a> {
+pub struct Meta<'a> {
   /// `DateTimeOriginal` — VAUX-decoded date/time. `None` when the
   /// VAUX scan failed or rejected the hex-component decode
   /// (DV.pm:220-221).
   date_time_original: Option<String>,
-  /// `ImageWidth` from the matched [`DvProfile`].
+  /// `ImageWidth` from the matched [`Profile`].
   image_width: u32,
-  /// `ImageHeight` from the matched [`DvProfile`].
+  /// `ImageHeight` from the matched [`Profile`].
   image_height: u32,
   /// `Duration` in seconds = file-size / byte-rate (DV.pm:196).
   duration: f64,
   /// `TotalBitrate` in bps = 8 * frame-size * frame-rate (DV.pm:194).
   total_bitrate: f64,
-  /// `VideoFormat` from the matched [`DvProfile`].
+  /// `VideoFormat` from the matched [`Profile`].
   video_format: &'a str,
   /// `VideoScanType` — `Some("Interlaced")` / `Some("Progressive")` if the
   /// VAUX `0x61` pack was found; `None` otherwise (DV.pm:242).
@@ -625,7 +625,7 @@ pub struct DvMeta<'a> {
   /// `AspectRatio` — `"16:9"` / `"4:3"` from the VAUX `0x61` pack
   /// (DV.pm:241); `None` if not present.
   aspect_ratio: Option<&'a str>,
-  /// `Colorimetry` from the matched [`DvProfile`].
+  /// `Colorimetry` from the matched [`Profile`].
   colorimetry: &'a str,
   /// `AudioChannels` — DV.pm:258-262 (0/2/4/8). `None` if no audio pack.
   audio_channels: Option<i64>,
@@ -637,7 +637,7 @@ pub struct DvMeta<'a> {
   audio_bits_per_sample: Option<i64>,
 }
 
-impl<'a> DvMeta<'a> {
+impl<'a> Meta<'a> {
   /// `DateTimeOriginal` as a fixed-format `"YYYY:MM:DD hh:mm:ss"` string
   /// (DV.pm:239). `None` if the VAUX scan failed. (`Option::as_deref` is
   /// not `const`, so this getter is non-const.)
@@ -823,7 +823,7 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
     audio_bits_per_sample = Some(if quant != 0 { 12 } else { 16 }); // DV.pm:263
   }
 
-  Parsed::Found(DvMeta {
+  Parsed::Found(Meta {
     date_time_original,
     image_width: profile.image_width(),
     image_height: profile.image_height(),
@@ -868,28 +868,28 @@ impl parser_sealed::Sealed for ProcessDv {}
 #[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
-pub enum DvParseOutcome<'a> {
+pub enum ParseOutcome<'a> {
   /// DV.pm:188 — recognized DIF header but no profile match. Bundled
   /// Perl emits `Warning => "Unrecognized DV profile"` and returns 1
   /// without pushing any DV:* tags.
   UnrecognizedProfile,
   /// DV.pm:267-270 — full success; emit tags in @dvTags order.
-  Meta(DvMeta<'a>),
+  Meta(Meta<'a>),
 }
 
-impl DvParseOutcome<'_> {
+impl ParseOutcome<'_> {
   /// Stable label for each outcome (single source of truth for `Display`).
   #[must_use]
   #[inline(always)]
   pub const fn as_str(&self) -> &'static str {
     match self {
-      DvParseOutcome::UnrecognizedProfile => "UnrecognizedProfile",
-      DvParseOutcome::Meta(_) => "Meta",
+      ParseOutcome::UnrecognizedProfile => "UnrecognizedProfile",
+      ParseOutcome::Meta(_) => "Meta",
     }
   }
 }
 
-impl core::fmt::Display for DvParseOutcome<'_> {
+impl core::fmt::Display for ParseOutcome<'_> {
   #[inline]
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
@@ -901,25 +901,25 @@ impl FormatParser for ProcessDv {
   /// GAT: the Meta is parameterized by `'a`, though every string field
   /// actually originates from the `'static` [`DV_PROFILES`] table (Codex
   /// AF2).
-  type Meta<'a> = DvParseOutcome<'a>;
+  type Meta<'a> = ParseOutcome<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; DV parsing has no I/O modes).
-  type Error = DvError;
+  type Error = Error;
 
-  /// Parse a DV file's bytes into a typed [`DvParseOutcome`], or `None`
+  /// Parse a DV file's bytes into a typed [`ParseOutcome`], or `None`
   /// if the buffer is not a valid DV file (short read, no DIF header,
   /// fewer than 6 blocks). Returns `Err` only for Rust-level fatal
   /// modes; the current port has none.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, DvError> {
-    // `parse_outcome` yields a `DvParseOutcome<'static>`; covariance widens
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+    // `parse_outcome` yields a `ParseOutcome<'static>`; covariance widens
     // it to the caller's `'a`.
     Ok(parse_outcome(data))
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but produces
-/// a `DvParseOutcome` whose `Meta` arm carries borrows out of
+/// a `ParseOutcome` whose `Meta` arm carries borrows out of
 /// [`DV_PROFILES`] (i.e. `'static` in practice; the `&str` slices are
 /// const-table entries).
 ///
@@ -927,23 +927,23 @@ impl FormatParser for ProcessDv {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<DvParseOutcome<'static>>, DvError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<ParseOutcome<'static>>, Error> {
   Ok(parse_outcome(data))
 }
 
-fn parse_outcome(data: &[u8]) -> Option<DvParseOutcome<'static>> {
+fn parse_outcome(data: &[u8]) -> Option<ParseOutcome<'static>> {
   let total_len = data.len();
   let cap = total_len.min(12_000);
   match compute(&data[..cap], total_len) {
     Parsed::RejectEmpty | Parsed::RejectNoDif | Parsed::RejectShortDif => None,
-    Parsed::UnrecognizedProfile => Some(DvParseOutcome::UnrecognizedProfile),
-    Parsed::Found(meta) => Some(DvParseOutcome::Meta(meta)),
+    Parsed::UnrecognizedProfile => Some(ParseOutcome::UnrecognizedProfile),
+    Parsed::Found(meta) => Some(ParseOutcome::Meta(meta)),
   }
 }
 
-// NOTE: DV's typed parser always produces `DvMeta<'static>` because every
+// NOTE: DV's typed parser always produces `Meta<'static>` because every
 // `&'a str` field originates from the `'static` [`DV_PROFILES`] table; the
-// `FormatParser::Meta` GAT (`type Meta<'a> = DvParseOutcome<'a>`) widens
+// `FormatParser::Meta` GAT (`type Meta<'a> = ParseOutcome<'a>`) widens
 // it to the caller's `'a` by covariance (Codex AF2). The `<'a>` parameter
 // is kept on the struct for shape parity with the rest of the Phase F1
 // leaves and to leave room for future bytes-borrowed accessors (e.g. a
@@ -954,7 +954,7 @@ fn parse_outcome(data: &[u8]) -> Option<DvParseOutcome<'static>> {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl DvMeta<'_> {
+impl Meta<'_> {
   /// Emit DV tags into the writer in `@dvTags` order (DV.pm:116-121) —
   /// faithful to the bundled-Perl iteration.
   ///
@@ -1040,7 +1040,7 @@ impl DvMeta<'_> {
 }
 
 // ===========================================================================
-// `DvError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for DV parsing. Currently empty — every bad
@@ -1049,13 +1049,13 @@ impl DvMeta<'_> {
 ///
 /// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
 /// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `DvError` is a real `Error` even on no-std).
+/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
 /// `#[non_exhaustive]` lets the first real variant land without a breaking
 /// change. The derive expands `Display` to an empty `match *self {}`, so no
 /// `#[error(…)]` attribute is needed while the enum has no variants.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DvError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1070,7 +1070,7 @@ mod tests {
     // §5: thiserror v2 (default-features=false) makes the empty error enum
     // a real `core::error::Error` in every feature tier.
     fn assert_error<E: core::error::Error>() {}
-    assert_error::<DvError>();
+    assert_error::<Error>();
   }
 
   #[test]
@@ -1337,14 +1337,14 @@ mod tests {
     data[451] = 0x00; // stype = 0 ⇒ profile[1] (PAL)
     let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
     match outcome {
-      DvParseOutcome::Meta(m) => {
+      ParseOutcome::Meta(m) => {
         assert_eq!(m.image_width(), 720);
         assert_eq!(m.image_height(), 576);
         assert_eq!(m.video_format(), "IEC 61834 - 625/50 (PAL)");
         assert_eq!(m.colorimetry(), "4:2:0");
         assert!((m.frame_rate() - 25.0).abs() < 1e-12);
       }
-      DvParseOutcome::UnrecognizedProfile => panic!("expected Meta"),
+      ParseOutcome::UnrecognizedProfile => panic!("expected Meta"),
     }
   }
 
@@ -1354,7 +1354,7 @@ mod tests {
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x1f;
     let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
-    assert!(matches!(outcome, DvParseOutcome::UnrecognizedProfile));
+    assert!(matches!(outcome, ParseOutcome::UnrecognizedProfile));
   }
 
   #[test]
@@ -1365,14 +1365,14 @@ mod tests {
   #[test]
   fn dv_parse_outcome_variant_accessors_and_display() {
     // §2 derive_more predicates + unwrap/try_unwrap + Display-via-as_str.
-    let unrecognized: DvParseOutcome<'static> = DvParseOutcome::UnrecognizedProfile;
+    let unrecognized: ParseOutcome<'static> = ParseOutcome::UnrecognizedProfile;
     assert!(unrecognized.is_unrecognized_profile());
     assert!(!unrecognized.is_meta());
     assert_eq!(unrecognized.as_str(), "UnrecognizedProfile");
     assert_eq!(unrecognized.to_string(), "UnrecognizedProfile");
     assert!(unrecognized.try_unwrap_meta().is_err());
 
-    let meta = DvMeta {
+    let meta = Meta {
       date_time_original: None,
       image_width: 720,
       image_height: 576,
@@ -1387,7 +1387,7 @@ mod tests {
       audio_sample_rate: None,
       audio_bits_per_sample: None,
     };
-    let outcome = DvParseOutcome::Meta(meta);
+    let outcome = ParseOutcome::Meta(meta);
     assert!(outcome.is_meta());
     assert_eq!(outcome.as_str(), "Meta");
     assert_eq!(outcome.to_string(), "Meta");
@@ -1397,8 +1397,8 @@ mod tests {
   #[test]
   fn meta_sinker_emits_typed_tags() {
     use crate::tagmap::TagMap;
-    // Construct a DvMeta directly so we don't depend on a fixture.
-    let meta = DvMeta {
+    // Construct a Meta directly so we don't depend on a fixture.
+    let meta = Meta {
       date_time_original: Some("2024:01:15 12:30:45".to_string()),
       image_width: 720,
       image_height: 576,
@@ -1445,6 +1445,6 @@ mod tests {
     let outcome = <ProcessDv as FormatParser>::parse(&ProcessDv, &data)
       .expect("ok")
       .expect("parsed");
-    assert!(matches!(outcome, DvParseOutcome::Meta(_)));
+    assert!(matches!(outcome, ParseOutcome::Meta(_)));
   }
 }

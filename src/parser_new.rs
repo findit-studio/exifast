@@ -328,22 +328,22 @@ pub enum AnyParser {
 pub enum AnyMeta<'a> {
   /// MOI (Phase E pilot).
   #[cfg(feature = "moi")]
-  Moi(crate::formats::moi::MoiMeta<'a>),
+  Moi(crate::formats::moi::Meta<'a>),
   /// AAC (Phase F1).
   #[cfg(feature = "aac")]
-  Aac(crate::formats::aac::AacMeta<'a>),
-  /// DV (Phase F1). Carries the [`crate::formats::dv::DvParseOutcome`]
+  Aac(crate::formats::aac::Meta<'a>),
+  /// DV (Phase F1). Carries the [`crate::formats::dv::ParseOutcome`]
   /// because DV has TWO accept paths (unrecognized-profile warn vs.
   /// full data); the closed-enum carry must distinguish them so the
   /// sink can warn on the former without emitting DV:* tags.
   #[cfg(feature = "dv")]
-  Dv(crate::formats::dv::DvParseOutcome<'a>),
+  Dv(crate::formats::dv::ParseOutcome<'a>),
   /// Audible (AA) (Phase F1).
   #[cfg(feature = "audible")]
-  Aa(crate::formats::audible::AaMeta<'a>),
+  Aa(crate::formats::audible::Meta<'a>),
   /// Red R3D (Phase F1).
   #[cfg(feature = "red")]
-  R3d(crate::formats::red::R3dMeta<'a>),
+  R3d(crate::formats::red::Meta<'a>),
   /// ID3 directory metadata (Phase F2). The [`crate::formats::id3::ProcessId3`]
   /// `FormatParser` impl produces a borrowed `Id3Meta<'a>` via the
   /// [`FormatParser::Meta`] GAT (Codex AF2; `'a` is phantom there since
@@ -439,10 +439,10 @@ impl AnyMeta<'_> {
         // DV.pm:188 — Warn + return 1 without DV:* tags. The typed path emits
         // the warning and no tags (the document builder surfaces it as the
         // ExifTool:Warning).
-        crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
+        crate::formats::dv::ParseOutcome::UnrecognizedProfile => {
           out.write_warning("Unrecognized DV profile")
         }
-        crate::formats::dv::DvParseOutcome::Meta(m) => m.serialize_tags(print_conv, out),
+        crate::formats::dv::ParseOutcome::Meta(m) => m.serialize_tags(print_conv, out),
       },
       #[cfg(feature = "audible")]
       AnyMeta::Aa(m) => m.serialize_tags(print_conv, out),
@@ -740,7 +740,7 @@ const _: () = {
 /// `.map_err(Into::into)`.
 ///
 /// Most format errors today are uninhabited (no variants — see e.g.
-/// [`crate::formats::moi::MoiError`]); the `From` impls for those formats
+/// [`crate::formats::moi::Error`]); the `From` impls for those formats
 /// translate into unreachable matches that `rustc` constant-folds out at
 /// monomorphization. The structure exists so future I/O-fallible parsers
 /// can add fatal modes without changing the public `AnyError` shape.
@@ -769,23 +769,23 @@ pub enum AnyError {
   /// MOI fatal-error wrapper.
   #[cfg(feature = "moi")]
   #[error("MOI: {0}")]
-  Moi(#[from] crate::formats::moi::MoiError),
+  Moi(#[from] crate::formats::moi::Error),
   /// AAC fatal-error wrapper.
   #[cfg(feature = "aac")]
   #[error("AAC: {0}")]
-  Aac(#[from] crate::formats::aac::AacError),
+  Aac(#[from] crate::formats::aac::Error),
   /// DV fatal-error wrapper.
   #[cfg(feature = "dv")]
   #[error("DV: {0}")]
-  Dv(#[from] crate::formats::dv::DvError),
+  Dv(#[from] crate::formats::dv::Error),
   /// Audible (AA) fatal-error wrapper.
   #[cfg(feature = "audible")]
   #[error("AA: {0}")]
-  Aa(#[from] crate::formats::audible::AudibleError),
+  Aa(#[from] crate::formats::audible::Error),
   /// Red R3D fatal-error wrapper.
   #[cfg(feature = "red")]
   #[error("R3D: {0}")]
-  R3d(#[from] crate::formats::red::R3dError),
+  R3d(#[from] crate::formats::red::Error),
   /// ID3 fatal-error wrapper.
   #[cfg(feature = "id3")]
   #[error("ID3: {0}")]

@@ -141,17 +141,17 @@ pub use parser_new::{
 // parser handle (carried in `AnyParser`); `XxxError` is the fatal-error
 // variant (carried in `AnyError`).
 #[cfg(feature = "aac")]
-pub use formats::aac::{AacError, AacMeta, ProcessAac};
+pub use formats::aac::ProcessAac;
 #[cfg(feature = "aiff")]
 pub use formats::aiff::{AiffError, AiffMeta, ProcessAiff};
 #[cfg(feature = "ape")]
 pub use formats::ape::{ApeContext, ApeError, ApeMeta, ProcessApe};
 #[cfg(feature = "audible")]
-pub use formats::audible::{AaMeta, AudibleError, ProcessAa};
+pub use formats::audible::ProcessAa;
 #[cfg(feature = "dsf")]
 pub use formats::dsf::{DsfContext, DsfError, DsfMeta, ProcessDsf};
 #[cfg(feature = "dv")]
-pub use formats::dv::{DvError, DvMeta, DvParseOutcome, ProcessDv};
+pub use formats::dv::ProcessDv;
 #[cfg(feature = "flac")]
 pub use formats::flac::{FlacContext, FlacError, FlacMeta, ProcessFlac};
 #[cfg(feature = "id3")]
@@ -162,7 +162,7 @@ pub use formats::id3::{
 #[cfg(feature = "mp3")]
 pub use formats::id3::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3};
 #[cfg(feature = "moi")]
-pub use formats::moi::{MoiError, MoiMeta, ProcessMoi};
+pub use formats::moi::ProcessMoi;
 #[cfg(feature = "mpc")]
 pub use formats::mpc::{MpcContext, MpcError, MpcMeta, ProcessMpc};
 #[cfg(feature = "mpeg-audio")]
@@ -170,7 +170,7 @@ pub use formats::mpeg::{MpegAudioContext, MpegAudioError, MpegAudioMeta, Process
 #[cfg(feature = "ogg")]
 pub use formats::ogg::{OggError, OggMeta, ProcessOgg};
 #[cfg(feature = "red")]
-pub use formats::red::{ProcessR3D, R3dError, R3dMeta};
+pub use formats::red::ProcessR3D;
 #[cfg(feature = "wavpack")]
 pub use formats::wavpack::{ProcessWv, WvContext, WvError, WvMeta};
 
@@ -269,9 +269,11 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
 ///
 /// # Errors
 ///
-/// Returns the per-format [`MoiError`] (currently uninhabited).
+/// Returns the per-format [`formats::moi::Error`] (currently uninhabited).
 #[cfg(feature = "moi")]
-pub fn parse_moi(bytes: &[u8]) -> core::result::Result<Option<MoiMeta<'_>>, MoiError> {
+pub fn parse_moi(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::moi::Meta<'_>>, formats::moi::Error> {
   formats::moi::parse_borrowed(bytes)
 }
 
@@ -279,9 +281,11 @@ pub fn parse_moi(bytes: &[u8]) -> core::result::Result<Option<MoiMeta<'_>>, MoiE
 ///
 /// # Errors
 ///
-/// Returns the per-format [`AacError`] (currently uninhabited).
+/// Returns the per-format [`formats::aac::Error`] (currently uninhabited).
 #[cfg(feature = "aac")]
-pub fn parse_aac(bytes: &[u8]) -> core::result::Result<Option<AacMeta<'_>>, AacError> {
+pub fn parse_aac(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::aac::Meta<'_>>, formats::aac::Error> {
   formats::aac::parse_borrowed(bytes)
 }
 
@@ -289,9 +293,11 @@ pub fn parse_aac(bytes: &[u8]) -> core::result::Result<Option<AacMeta<'_>>, AacE
 ///
 /// # Errors
 ///
-/// Returns the per-format [`DvError`] (currently uninhabited).
+/// Returns the per-format [`formats::dv::Error`] (currently uninhabited).
 #[cfg(feature = "dv")]
-pub fn parse_dv(bytes: &[u8]) -> core::result::Result<Option<DvParseOutcome<'static>>, DvError> {
+pub fn parse_dv(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::dv::ParseOutcome<'static>>, formats::dv::Error> {
   formats::dv::parse_borrowed(bytes)
 }
 
@@ -299,9 +305,11 @@ pub fn parse_dv(bytes: &[u8]) -> core::result::Result<Option<DvParseOutcome<'sta
 ///
 /// # Errors
 ///
-/// Returns the per-format [`AudibleError`] (currently uninhabited).
+/// Returns the per-format [`formats::audible::Error`] (currently uninhabited).
 #[cfg(feature = "audible")]
-pub fn parse_audible(bytes: &[u8]) -> core::result::Result<Option<AaMeta<'_>>, AudibleError> {
+pub fn parse_audible(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::audible::Meta<'_>>, formats::audible::Error> {
   formats::audible::parse_borrowed(bytes)
 }
 
@@ -309,9 +317,11 @@ pub fn parse_audible(bytes: &[u8]) -> core::result::Result<Option<AaMeta<'_>>, A
 ///
 /// # Errors
 ///
-/// Returns the per-format [`R3dError`] (currently uninhabited).
+/// Returns the per-format [`formats::red::Error`] (currently uninhabited).
 #[cfg(feature = "red")]
-pub fn parse_r3d(bytes: &[u8]) -> core::result::Result<Option<R3dMeta<'_>>, R3dError> {
+pub fn parse_r3d(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::red::Meta<'_>>, formats::red::Error> {
   formats::red::parse_borrowed(bytes)
 }
 

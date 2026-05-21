@@ -6,7 +6,7 @@
 //! reads Redcode R3D version 1 + version 2 video files.
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
-//! AAC/DV pattern: a typed [`R3dMeta<'a>`] is produced by the new
+//! AAC/DV pattern: a typed [`Meta<'a>`] is produced by the new
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -379,7 +379,7 @@ fn format_size_of(fmt: &str) -> usize {
 }
 
 // ===========================================================================
-// Typed Meta — `R3dMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed R3D metadata — the lib-first output of [`ProcessR3D`].
@@ -395,7 +395,7 @@ fn format_size_of(fmt: &str) -> usize {
 /// does not register `Composite => ...`), and this port consciously
 /// FAITHFULLY DEFERS the Composite layer.
 #[derive(Debug, Clone, Default)]
-pub struct R3dMeta<'a> {
+pub struct Meta<'a> {
   /// `RedcodeVersion` from offset 0x07 — single ASCII digit byte.
   redcode_version: Option<u8>,
   /// `ImageWidth` from the RED1/RED2 header subtable.
@@ -442,15 +442,15 @@ pub struct R3dMeta<'a> {
   quality: Option<&'a str>,
 
   // Format-2 (float) tags.
-  color_temperature: Option<R3dValue<'a>>,
-  rgb_curves: Option<R3dValue<'a>>,
-  original_frame_rate: Option<R3dValue<'a>>,
+  color_temperature: Option<Value<'a>>,
+  rgb_curves: Option<Value<'a>>,
+  original_frame_rate: Option<Value<'a>>,
 
   // Format-4 (int16u) tags.
-  crop_area: Option<R3dValue<'a>>,
-  iso: Option<R3dValue<'a>>,
+  crop_area: Option<Value<'a>>,
+  iso: Option<Value<'a>>,
   f_number: Option<f64>,
-  focal_length: Option<R3dValue<'a>>,
+  focal_length: Option<Value<'a>>,
 
   // Format-6 (int32s) tags.
   focus_distance: Option<f64>,
@@ -469,7 +469,7 @@ pub struct R3dMeta<'a> {
 /// breaking change for downstream matchers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum R3dValue<'a> {
+pub enum Value<'a> {
   /// `int8u` / `int16u` / `int32u` count==1 typed scalar.
   I64(i64),
   /// `float` count==1 typed scalar.
@@ -482,80 +482,80 @@ pub enum R3dValue<'a> {
   Rational(Rational),
 }
 
-impl<'a> R3dValue<'a> {
-  /// True iff this is an [`R3dValue::I64`].
+impl<'a> Value<'a> {
+  /// True iff this is an [`Value::I64`].
   #[must_use]
   #[inline(always)]
   pub const fn is_i64(&self) -> bool {
-    matches!(self, R3dValue::I64(_))
+    matches!(self, Value::I64(_))
   }
-  /// True iff this is an [`R3dValue::F64`].
+  /// True iff this is an [`Value::F64`].
   #[must_use]
   #[inline(always)]
   pub const fn is_f64(&self) -> bool {
-    matches!(self, R3dValue::F64(_))
+    matches!(self, Value::F64(_))
   }
-  /// True iff this is an [`R3dValue::Str`].
+  /// True iff this is an [`Value::Str`].
   #[must_use]
   #[inline(always)]
   pub const fn is_str(&self) -> bool {
-    matches!(self, R3dValue::Str(_))
+    matches!(self, Value::Str(_))
   }
-  /// True iff this is an [`R3dValue::Bytes`].
+  /// True iff this is an [`Value::Bytes`].
   #[must_use]
   #[inline(always)]
   pub const fn is_bytes(&self) -> bool {
-    matches!(self, R3dValue::Bytes(_))
+    matches!(self, Value::Bytes(_))
   }
-  /// True iff this is an [`R3dValue::Rational`].
+  /// True iff this is an [`Value::Rational`].
   #[must_use]
   #[inline(always)]
   pub const fn is_rational(&self) -> bool {
-    matches!(self, R3dValue::Rational(_))
+    matches!(self, Value::Rational(_))
   }
 
-  /// The integer payload of an [`R3dValue::I64`], else `None`.
+  /// The integer payload of an [`Value::I64`], else `None`.
   #[must_use]
   #[inline(always)]
   pub const fn try_unwrap_i64(&self) -> Option<i64> {
     match self {
-      R3dValue::I64(n) => Some(*n),
+      Value::I64(n) => Some(*n),
       _ => None,
     }
   }
-  /// The float payload of an [`R3dValue::F64`], else `None`.
+  /// The float payload of an [`Value::F64`], else `None`.
   #[must_use]
   #[inline(always)]
   pub const fn try_unwrap_f64(&self) -> Option<f64> {
     match self {
-      R3dValue::F64(f) => Some(*f),
+      Value::F64(f) => Some(*f),
       _ => None,
     }
   }
-  /// The string payload of an [`R3dValue::Str`] (borrow), else `None`.
+  /// The string payload of an [`Value::Str`] (borrow), else `None`.
   #[must_use]
   #[inline(always)]
   pub const fn try_unwrap_str(&self) -> Option<&R3dStrCow<'a>> {
     match self {
-      R3dValue::Str(s) => Some(s),
+      Value::Str(s) => Some(s),
       _ => None,
     }
   }
-  /// The byte payload of an [`R3dValue::Bytes`], else `None`.
+  /// The byte payload of an [`Value::Bytes`], else `None`.
   #[must_use]
   #[inline(always)]
   pub fn try_unwrap_bytes(&self) -> Option<&[u8]> {
     match self {
-      R3dValue::Bytes(b) => Some(b.as_slice()),
+      Value::Bytes(b) => Some(b.as_slice()),
       _ => None,
     }
   }
-  /// The rational payload of an [`R3dValue::Rational`], else `None`.
+  /// The rational payload of an [`Value::Rational`], else `None`.
   #[must_use]
   #[inline(always)]
   pub const fn try_unwrap_rational(&self) -> Option<Rational> {
     match self {
-      R3dValue::Rational(r) => Some(*r),
+      Value::Rational(r) => Some(*r),
       _ => None,
     }
   }
@@ -726,7 +726,7 @@ impl DirectoryTag {
   }
 }
 
-impl<'a> R3dMeta<'a> {
+impl<'a> Meta<'a> {
   /// `RedcodeVersion` — ASCII digit byte (`b'1'` or `b'2'`).
   #[must_use]
   #[inline(always)]
@@ -959,34 +959,34 @@ impl<'a> R3dMeta<'a> {
   pub const fn quality(&self) -> Option<&'a str> {
     self.quality
   }
-  /// `ColorTemperature` (0x200d) — borrow of the non-`Copy` [`R3dValue`].
+  /// `ColorTemperature` (0x200d) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn color_temperature_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn color_temperature_ref(&self) -> Option<&Value<'a>> {
     self.color_temperature.as_ref()
   }
-  /// `RGBCurves` (0x204b) — borrow of the non-`Copy` [`R3dValue`].
+  /// `RGBCurves` (0x204b) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn rgb_curves_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn rgb_curves_ref(&self) -> Option<&Value<'a>> {
     self.rgb_curves.as_ref()
   }
-  /// `OriginalFrameRate` (0x2066) — borrow of the non-`Copy` [`R3dValue`].
+  /// `OriginalFrameRate` (0x2066) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn original_frame_rate_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn original_frame_rate_ref(&self) -> Option<&Value<'a>> {
     self.original_frame_rate.as_ref()
   }
-  /// `CropArea` (0x4037) — borrow of the non-`Copy` [`R3dValue`].
+  /// `CropArea` (0x4037) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn crop_area_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn crop_area_ref(&self) -> Option<&Value<'a>> {
     self.crop_area.as_ref()
   }
-  /// `ISO` (0x403b) — borrow of the non-`Copy` [`R3dValue`].
+  /// `ISO` (0x403b) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn iso_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn iso_ref(&self) -> Option<&Value<'a>> {
     self.iso.as_ref()
   }
   /// `FNumber` (0x406a) post-ValueConv.
@@ -995,10 +995,10 @@ impl<'a> R3dMeta<'a> {
   pub const fn f_number(&self) -> Option<f64> {
     self.f_number
   }
-  /// `FocalLength` (0x406b) — borrow of the non-`Copy` [`R3dValue`].
+  /// `FocalLength` (0x406b) — borrow of the non-`Copy` [`Value`].
   #[must_use]
   #[inline(always)]
-  pub const fn focal_length_ref(&self) -> Option<&R3dValue<'a>> {
+  pub const fn focal_length_ref(&self) -> Option<&Value<'a>> {
     self.focal_length.as_ref()
   }
   /// `FocusDistance` (0x606c) post-ValueConv.
@@ -1034,27 +1034,27 @@ impl parser_sealed::Sealed for ProcessR3D {}
 
 impl FormatParser for ProcessR3D {
   /// GAT: the Meta borrows from the input `'a` (Codex AF2).
-  type Meta<'a> = R3dMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
-  type Error = R3dError;
+  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, R3dError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     Ok(parse_inner(data))
   }
 }
 
-/// Lib-first direct entry. Returns an [`R3dMeta`] that borrows from the
+/// Lib-first direct entry. Returns an [`Meta`] that borrows from the
 /// input buffer (zero-alloc for `&'a str` fields).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<R3dMeta<'_>>, R3dError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   Ok(parse_inner(data))
 }
 
-fn parse_inner<'a>(data: &'a [u8]) -> Option<R3dMeta<'a>> {
+fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
   // Red.pm:225 magic.
   if data.len() < 8 {
     return None;
@@ -1077,7 +1077,7 @@ fn parse_inner<'a>(data: &'a [u8]) -> Option<R3dMeta<'a>> {
     return None;
   }
 
-  let mut meta = R3dMeta::default();
+  let mut meta = Meta::default();
 
   // Red.pm:236 — `$raf->Read($buf2, $size-8) == $size-8 or return
   // $et->Warn($errTrunc)`. Short-circuits Red.pm:240 HandleTag, so no
@@ -1181,7 +1181,7 @@ fn scan_for_red_directory(buf: &[u8]) -> Option<usize> {
 }
 
 /// RED1 header subtable read (Red.pm:154-172).
-fn extract_red1_header<'a>(meta: &mut R3dMeta<'a>, data: &'a [u8], size: usize) {
+fn extract_red1_header<'a>(meta: &mut Meta<'a>, data: &'a [u8], size: usize) {
   let cap = size.min(data.len());
   let buf = &data[..cap];
 
@@ -1205,7 +1205,7 @@ fn extract_red1_header<'a>(meta: &mut R3dMeta<'a>, data: &'a [u8], size: usize) 
 }
 
 /// RED2 header subtable read (Red.pm:175-206).
-fn extract_red2_header<'a>(meta: &mut R3dMeta<'a>, data: &'a [u8], size: usize) {
+fn extract_red2_header<'a>(meta: &mut Meta<'a>, data: &'a [u8], size: usize) {
   let cap = size.min(data.len());
   let buf = &data[..cap];
 
@@ -1245,7 +1245,7 @@ fn borrowed_string(data: &[u8], offset: usize, max_len: usize) -> Option<&str> {
 
 /// Red.pm:277-291 directory walk.
 fn walk_red_directory<'a>(
-  meta: &mut R3dMeta<'a>,
+  meta: &mut Meta<'a>,
   buff: &'a [u8],
   mut pos: usize,
   dir_end: usize,
@@ -1288,10 +1288,10 @@ fn walk_red_directory<'a>(
 }
 
 /// Route a directory entry's `read_value` result into the matching
-/// [`R3dMeta`] field. For string-typed fields we additionally pull a
+/// [`Meta`] field. For string-typed fields we additionally pull a
 /// borrowed slice from the input buffer (zero-alloc).
 fn dispatch_directory_tag<'a>(
-  meta: &mut R3dMeta<'a>,
+  meta: &mut Meta<'a>,
   tag: u16,
   v: TagValue,
   buff: &'a [u8],
@@ -1311,19 +1311,19 @@ fn dispatch_directory_tag<'a>(
     core::str::from_utf8(&slice[..trimmed]).ok()
   };
 
-  let to_value = |v: TagValue| -> R3dValue<'a> {
+  let to_value = |v: TagValue| -> Value<'a> {
     match v {
-      TagValue::I64(n) => R3dValue::I64(n),
+      TagValue::I64(n) => Value::I64(n),
       // RED tags never emit a u64 today (read_value yields I64/Rational/Str);
       // keep the lossy-on-overflow `as i64` only as an exhaustiveness arm —
       // the JSON output path never routes a R3D tag through it.
-      TagValue::U64(n) => R3dValue::I64(n as i64),
-      TagValue::F64(n) => R3dValue::F64(n),
-      TagValue::Str(s) => R3dValue::Str(R3dStrCow::Owned(s.to_string())),
-      TagValue::Bytes(b) => R3dValue::Bytes(b),
-      TagValue::Rational(r) => R3dValue::Rational(r),
-      TagValue::Bool(b) => R3dValue::I64(i64::from(b)),
-      TagValue::List(_) => R3dValue::Str(R3dStrCow::Owned(String::new())),
+      TagValue::U64(n) => Value::I64(n as i64),
+      TagValue::F64(n) => Value::F64(n),
+      TagValue::Str(s) => Value::Str(R3dStrCow::Owned(s.to_string())),
+      TagValue::Bytes(b) => Value::Bytes(b),
+      TagValue::Rational(r) => Value::Rational(r),
+      TagValue::Bool(b) => Value::I64(i64::from(b)),
+      TagValue::List(_) => Value::Str(R3dStrCow::Owned(String::new())),
     }
   };
 
@@ -1577,7 +1577,7 @@ fn dispatch_directory_tag<'a>(
 const GROUP: &str = "Red";
 
 #[cfg(feature = "alloc")]
-impl R3dMeta<'_> {
+impl Meta<'_> {
   /// Emit R3D tags into the writer in faithful Red.pm emission order:
   ///
   /// 1. RED1/RED2 header subtable fields (Red.pm:240 HandleTag).
@@ -1638,7 +1638,7 @@ impl R3dMeta<'_> {
   }
 }
 
-impl R3dMeta<'_> {
+impl Meta<'_> {
   /// Emit a single directory tag.
   fn sink_directory_tag(
     &self,
@@ -1828,11 +1828,11 @@ impl R3dMeta<'_> {
           // Red.pm:131-135 PrintConv `int($val*1000+0.5)/1000`.
           if print_conv {
             let raw: TagValue = match v {
-              R3dValue::I64(n) => TagValue::I64(*n),
-              R3dValue::F64(n) => TagValue::F64(*n),
-              R3dValue::Str(s) => TagValue::Str(s.as_str().into()),
-              R3dValue::Bytes(_) => TagValue::I64(0),
-              R3dValue::Rational(r) => TagValue::Rational(r.clone()),
+              Value::I64(n) => TagValue::I64(*n),
+              Value::F64(n) => TagValue::F64(*n),
+              Value::Str(s) => TagValue::Str(s.as_str().into()),
+              Value::Bytes(_) => TagValue::I64(0),
+              Value::Rational(r) => TagValue::Rational(r.clone()),
             };
             out.write_f64(GROUP, "OriginalFrameRate", round_to_3dp(&raw))?;
           } else {
@@ -1878,19 +1878,19 @@ impl R3dMeta<'_> {
   }
 }
 
-/// Emit a generic `R3dValue` (no per-tag PrintConv).
+/// Emit a generic `Value` (no per-tag PrintConv).
 #[cfg(feature = "alloc")]
 fn emit_r3d_value(
   out: &mut crate::tagmap::TagMap,
   name: &str,
-  v: &R3dValue<'_>,
+  v: &Value<'_>,
 ) -> Result<(), core::convert::Infallible> {
   match v {
-    R3dValue::I64(n) => out.write_i64(GROUP, name, *n),
-    R3dValue::F64(n) => out.write_f64(GROUP, name, *n),
-    R3dValue::Str(s) => out.write_str(GROUP, name, s.as_str()),
-    R3dValue::Bytes(b) => out.write_bytes(GROUP, name, b),
-    R3dValue::Rational(r) => {
+    Value::I64(n) => out.write_i64(GROUP, name, *n),
+    Value::F64(n) => out.write_f64(GROUP, name, *n),
+    Value::Str(s) => out.write_str(GROUP, name, s.as_str()),
+    Value::Bytes(b) => out.write_bytes(GROUP, name, b),
+    Value::Rational(r) => {
       let f = perl_arithmetic_to_f64(&r.exiftool_val_str());
       out.write_f64(GROUP, name, f)
     }
@@ -1898,7 +1898,7 @@ fn emit_r3d_value(
 }
 
 // ===========================================================================
-// `R3dError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for R3D parsing. Currently empty — every bad
@@ -1910,7 +1910,7 @@ fn emit_r3d_value(
 /// [`crate::parser_new::AnyError`]'s `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum R3dError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1958,21 +1958,21 @@ mod tests {
 
   #[test]
   fn r3d_value_predicates_and_unwrap_accessors() {
-    let i = R3dValue::I64(3);
+    let i = Value::I64(3);
     assert!(i.is_i64());
     assert_eq!(i.try_unwrap_i64(), Some(3));
     assert_eq!(i.try_unwrap_f64(), None);
 
-    let s = R3dValue::Str(R3dStrCow::Borrowed("xy"));
+    let s = Value::Str(R3dStrCow::Borrowed("xy"));
     assert!(s.is_str());
     assert_eq!(s.try_unwrap_str().map(R3dStrCow::as_str), Some("xy"));
     assert!(s.try_unwrap_bytes().is_none());
 
-    let b = R3dValue::Bytes(vec![9, 8]);
+    let b = Value::Bytes(vec![9, 8]);
     assert!(b.is_bytes());
     assert_eq!(b.try_unwrap_bytes(), Some(&[9u8, 8][..]));
 
-    let rat = R3dValue::Rational(Rational::rational32(10, 2));
+    let rat = Value::Rational(Rational::rational32(10, 2));
     assert!(rat.is_rational());
     assert_eq!(rat.try_unwrap_rational(), Some(Rational::rational32(10, 2)));
   }
@@ -2295,7 +2295,7 @@ mod tests {
 
   #[test]
   fn r3d_meta_default_is_empty() {
-    let m = R3dMeta::default();
+    let m = Meta::default();
     assert_eq!(m.redcode_version(), None);
     assert_eq!(m.image_width(), None);
     assert!(m.directory_tag_order().is_empty());

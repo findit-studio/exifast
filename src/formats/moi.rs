@@ -4,7 +4,7 @@
 #![cfg(feature = "moi")]
 //! Faithful port of `Image::ExifTool::MOI` (lib/Image/ExifTool/MOI.pm).
 //!
-//! The parser produces a typed [`MoiMeta<'a>`] holding `jiff::civil::DateTime`
+//! The parser produces a typed [`Meta<'a>`] holding `jiff::civil::DateTime`
 //! / `core::time::Duration` / primitive integers via the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
@@ -43,7 +43,7 @@ use jiff::civil::DateTime;
 use crate::parser_new::{FormatParser, parser_sealed};
 
 // ===========================================================================
-// Typed Meta — `MoiMeta<'a>`
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
 /// Typed MOI metadata — the lib-first output of [`ProcessMoi`].
@@ -57,7 +57,7 @@ use crate::parser_new::{FormatParser, parser_sealed};
 /// **D8 — no public fields, accessors only.** Construct only via
 /// [`ProcessMoi::parse`].
 ///
-/// **Lifetimes.** `MoiMeta` borrows from the input bytes via `version:
+/// **Lifetimes.** `Meta` borrows from the input bytes via `version:
 /// &'a str` (zero-alloc). The other fields are owned primitives (no
 /// allocation); only construction-on-stack is needed.
 ///
@@ -77,7 +77,7 @@ use crate::parser_new::{FormatParser, parser_sealed};
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone)]
-pub struct MoiMeta<'a> {
+pub struct Meta<'a> {
   /// 0x00 MOIVersion — `Format => 'string[2]'`. Always present after V6
   /// magic. Borrowed `&'a str` slice of the input (zero alloc).
   version: &'a str,
@@ -113,7 +113,7 @@ pub struct MoiMeta<'a> {
   video_bitrate: Option<VideoBitrate>,
 }
 
-impl<'a> MoiMeta<'a> {
+impl<'a> Meta<'a> {
   /// MOIVersion — 2-byte ASCII tag prefix (e.g. `"V6"`). Borrowed from
   /// the input slice.
   #[must_use]
@@ -380,7 +380,7 @@ pub enum VideoBitrate {
 ///
 /// Two entries today (`0x00c1 ⇒ AC3`, `0x4001 ⇒ MPEG`); a static slice
 /// + linear scan is faster than a HashMap for `n=2`. Kept as a free fn
-/// so the library accessor [`MoiMeta::audio_codec_name`] and the sink
+/// so the library accessor [`Meta::audio_codec_name`] and the sink
 /// path share the same source of truth.
 #[must_use]
 #[inline(always)]
@@ -529,29 +529,29 @@ impl parser_sealed::Sealed for ProcessMoi {}
 impl FormatParser for ProcessMoi {
   /// Spec §8: leaf format with no shared state; reads a single byte slice.
   /// GAT: the Meta borrows from the input `'a` (Codex AF2).
-  type Meta<'a> = MoiMeta<'a>;
+  type Meta<'a> = Meta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; MOI parsing has no I/O modes).
-  type Error = MoiError;
+  type Error = Error;
 
-  /// Parse a MOI file's bytes into a typed [`MoiMeta`], or `None` if the
+  /// Parse a MOI file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid MOI sidecar (short read, wrong magic, or
   /// embedded filesize mismatch — MOI.pm:110-114).
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MoiError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
     parse_inner(data)
   }
 }
 
-/// Inner parser producing a borrow-from-input [`MoiMeta`]. With the
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = MoiMeta<'a>`), the trait
+/// Inner parser producing a borrow-from-input [`Meta`]. With the
+/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`), the trait
 /// method returns this borrowed form directly — no `'static` upgrade. Both
 /// the trait `parse` and the lib-first direct call ([`parse_borrowed`])
 /// share this body (Codex AF2).
-fn parse_inner(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
+fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // MOI.pm:110 — `$raf->Read($buff,256) == 256 and $buff =~ /^V6/ or
   // return 0`. The 256-byte read AND the `V6` prefix are BOTH required.
   let total_len = data.len();
@@ -578,7 +578,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
   let audio_codec = Some(u16::from_be_bytes([head[0x84], head[0x85]]));
   let audio_bitrate = Some(audio_bitrate_value_conv(head[0x86]));
   let video_bitrate = Some(parse_video_bitrate(&head[0xda..0xdc]));
-  Ok(Some(MoiMeta {
+  Ok(Some(Meta {
     version,
     datetime_original,
     duration,
@@ -591,14 +591,14 @@ fn parse_inner(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
 
 /// Lib-first direct entry. Identical to [`FormatParser::parse`] now that
 /// the [`FormatParser::Meta`] GAT threads the input borrow lifetime
-/// through — returns a [`MoiMeta`] borrowing from the input buffer (zero
+/// through — returns a [`Meta`] borrowing from the input buffer (zero
 /// allocation; Codex AF2).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<MoiMeta<'_>>, MoiError> {
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
@@ -690,7 +690,7 @@ fn parse_video_bitrate(b: &[u8]) -> VideoBitrate {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl MoiMeta<'_> {
+impl Meta<'_> {
   /// Emit MOI tags into the writer in MOI.pm sorted-offset order (faithful
   /// to ExifTool.pm:9907 `sort { $a <=> $b }` keyed iteration). Family-1
   /// group is `"MOI"` (the Perl module-name suffix).
@@ -848,7 +848,7 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
 }
 
 // ===========================================================================
-// `MoiError` — Rust-level fatal modes (currently none)
+// `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for MOI parsing. Currently empty — every bad
@@ -857,13 +857,13 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
 ///
 /// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
 /// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `MoiError` is a real `Error` even on no-std).
+/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
 /// `#[non_exhaustive]` lets the first real variant land without a breaking
 /// change. The derive expands `Display` to an empty `match *self {}`, so no
 /// `#[error(…)]` attribute is needed while the enum has no variants.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MoiError {}
+pub enum Error {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -883,7 +883,7 @@ mod tests {
     // §5: thiserror v2 (default-features=false) makes the empty error enum
     // a real `core::error::Error` in every feature tier.
     fn assert_error<E: core::error::Error>() {}
-    assert_error::<MoiError>();
+    assert_error::<Error>();
   }
 
   // ---------- ValueConv helpers ------------------------------------------
@@ -1317,7 +1317,7 @@ mod tests {
   #[test]
   fn format_parser_trait_returns_meta_static() {
     // Cross-check that the closed-form `FormatParser::parse` (which
-    // returns `MoiMeta<'static>`) produces the same fields as the
+    // returns `Meta<'static>`) produces the same fields as the
     // borrow-from-input `parse_borrowed`.
     let buf = fixture_buffer();
     let meta = <ProcessMoi as FormatParser>::parse(&ProcessMoi, &buf)
