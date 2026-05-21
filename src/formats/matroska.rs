@@ -198,6 +198,30 @@ enum Kind {
   /// 209-210, 220, 237, 251) AND every `Unknown => 1` arm. Bundled
   /// ExifTool walks past these without emitting any tag.
   Skip,
+  /// Master container that stops the walker (faithful to bundled's
+  /// default Cluster handling — Matroska.pm:1096-1105). When the walker
+  /// encounters `Cluster` and `$processAll < 2` (default; no `-v`, no
+  /// `-U > 1`, no `-ee`), bundled tries the SeekHead Tags-jump and
+  /// otherwise `last`s the walk. We don't have SeekHead support yet so
+  /// our equivalent of "no Tags-jump available" is the `last` path:
+  /// stop walking entirely the first time we see a Cluster.
+  ///
+  /// This means Tags / Attachments / etc. that appear AFTER a Cluster
+  /// (without a SeekHead pointer that we could honor) WILL be missed —
+  /// faithful to bundled's default behaviour. Documented +
+  /// visibility-deferred SeekHead support is in `docs/tracking.md`.
+  ///
+  /// Why not advance-past-body? That's bundled's `-ee` mode, NOT the
+  /// default. Round-1 finding F3's plan suggested it, but bundled
+  /// default `-j -G1:1 -api struct=1` (our parity reference) takes the
+  /// `last` path — so we faithfully stop.
+  SkipBody,
+  /// Binary leaf — emit raw bytes as the ExifTool
+  /// `(Binary data <N> bytes, use -b option to extract)` placeholder.
+  /// Faithful to the `Format => 'binary'` / `Binary => 1` rows in
+  /// Matroska.pm (AttachedFileData line 552 `# Binary`, TagBinary line
+  /// 695 `# Binary`).
+  Binary,
   /// `Format => 'unsigned'` — BE big-int decoded into i64.
   Unsigned(PrintConv),
   /// `Format => 'signed'` — BE big-int with sign-extension.
@@ -478,10 +502,16 @@ const TAG_TABLE: &[TagDef] = &[
     kind: Kind::Utf8String,
   },
   // --- Cluster (Matroska.pm:186-251) -------------------------------------
+  // Cluster is the media-payload container. Bundled's DEFAULT behavior
+  // (Matroska.pm:1096-1105 — no `-v`, no `-U > 1`, no `-ee`) is to
+  // `last` the walker entirely the first time it sees a Cluster (no
+  // metadata in cluster bodies). We use `Kind::SkipBody`, which our
+  // walker maps to `break` — faithful to bundled default mode. See the
+  // `Kind::SkipBody` enum doc for the SeekHead-deferral rationale.
   TagDef {
     id: 0xf43b675,
     name: "Cluster",
-    kind: Kind::SubDir,
+    kind: Kind::SkipBody,
   },
   TagDef {
     id: 0x67,
@@ -1100,8 +1130,8 @@ const TAG_TABLE: &[TagDef] = &[
   TagDef {
     id: 0x65c,
     name: "AttachedFileData",
-    kind: Kind::Skip,
-  }, // Binary
+    kind: Kind::Binary,
+  }, // Binary (Matroska.pm:552; bundled emits as `(Binary data N bytes, use -b option to extract)` placeholder)
   TagDef {
     id: 0x6ae,
     name: "AttachedFileUID",
@@ -1338,14 +1368,663 @@ const TAG_TABLE: &[TagDef] = &[
   TagDef {
     id: 0x485,
     name: "TagBinary",
-    kind: Kind::Skip,
-  }, // Binary
+    kind: Kind::Binary,
+  }, // Binary (Matroska.pm:695; bundled emits as `(Binary data N bytes, use -b option to extract)` placeholder)
 ];
 
 /// Resolve `id` → `TagDef`. `None` for unknown ID (faithful to
 /// Matroska.pm:1127-1129 — "unknown tag, verbose log, skip past size bytes").
 fn tag_def(id: i64) -> Option<&'static TagDef> {
   TAG_TABLE.iter().find(|t| t.id == id)
+}
+
+// ===========================================================================
+// StdTag table — Matroska.pm:750-891 `%Image::ExifTool::Matroska::StdTag`
+// ===========================================================================
+
+/// One entry in the SimpleTag-key → canonical-tag-name table.
+///
+/// Faithful port of the static rows from `%Image::ExifTool::Matroska::StdTag`
+/// (Matroska.pm:750-891). The Perl Map maps SimpleTag `TagName` text →
+/// canonical tag identifier; rows like `DATE_RELEASED => { Name =>
+/// 'DateReleased', %dateInfo }` are encoded as `StdTagEntry { key:
+/// "DATE_RELEASED", name: "DateReleased", is_date: true }`.
+///
+/// Entries with `%dateInfo` ⇒ `is_date = true`: the SimpleTag's `TagString`
+/// is post-processed via `dateInfo.ValueConv` (Matroska.pm:29 — `s/^(\d{4})-
+/// (\d{2})-/$1:$2:/`) before emission.
+///
+/// Entries without `%dateInfo` ⇒ `is_date = false`: emitted as-is.
+///
+/// Note (deferred): the Perl table also has `IsList`-typed rows
+/// (`INSTRUMENTS`, `KEYWORDS`) that split on `,\s?`, and embedded
+/// SubDirectory rows (`spherical-video` → XMP). These are NOT exercised by
+/// the synthetic fixture and are documented + visibility-deferred.
+#[derive(Debug, Clone, Copy)]
+struct StdTagEntry {
+  /// The TagName text as it appears in the on-disk SimpleTag (e.g.
+  /// `"TITLE"`, `"DATE_RELEASED"`).
+  key: &'static str,
+  /// The canonical tag name to emit (e.g. `"Title"`, `"DateReleased"`).
+  name: &'static str,
+  /// Whether the value should pass through dateInfo's `ValueConv`
+  /// (`s/^(\d{4})-(\d{2})-/$1:$2:/` — replace the first two `-` with `:`).
+  is_date: bool,
+}
+
+/// `%Image::ExifTool::Matroska::StdTag` (Matroska.pm:750-891). Faithful
+/// port of the static rows. Lookup is linear (table is short by Matroska's
+/// standards; sub-100 ns even at this size).
+const STD_TAG_TABLE: &[StdTagEntry] = &[
+  // ----- Container/grouping (Matroska.pm:758-767) -----------------------
+  StdTagEntry {
+    key: "ORIGINAL",
+    name: "Original",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SAMPLE",
+    name: "Sample",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COUNTRY",
+    name: "Country",
+    is_date: false,
+  },
+  // ----- Numbering (Matroska.pm:761-763) --------------------------------
+  StdTagEntry {
+    key: "TOTAL_PARTS",
+    name: "TotalParts",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PART_NUMBER",
+    name: "PartNumber",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PART_OFFSET",
+    name: "PartOffset",
+    is_date: false,
+  },
+  // ----- Identification (Matroska.pm:764-767) ---------------------------
+  StdTagEntry {
+    key: "TITLE",
+    name: "Title",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SUBTITLE",
+    name: "Subtitle",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "URL",
+    name: "URL",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SORT_WITH",
+    name: "SortWith",
+    is_date: false,
+  },
+  // ----- Contact (Matroska.pm:773-776) ----------------------------------
+  StdTagEntry {
+    key: "EMAIL",
+    name: "Email",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ADDRESS",
+    name: "Address",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "FAX",
+    name: "FAX",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PHONE",
+    name: "Phone",
+    is_date: false,
+  },
+  // ----- People (Matroska.pm:777-808) -----------------------------------
+  StdTagEntry {
+    key: "ARTIST",
+    name: "Artist",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LEAD_PERFORMER",
+    name: "LeadPerformer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ACCOMPANIMENT",
+    name: "Accompaniment",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COMPOSER",
+    name: "Composer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ARRANGER",
+    name: "Arranger",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LYRICS",
+    name: "Lyrics",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LYRICIST",
+    name: "Lyricist",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "CONDUCTOR",
+    name: "Conductor",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "DIRECTOR",
+    name: "Director",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ASSISTANT_DIRECTOR",
+    name: "AssistantDirector",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "DIRECTOR_OF_PHOTOGRAPHY",
+    name: "DirectorOfPhotography",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SOUND_ENGINEER",
+    name: "SoundEngineer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ART_DIRECTOR",
+    name: "ArtDirector",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PRODUCTION_DESIGNER",
+    name: "ProductionDesigner",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "CHOREGRAPHER",
+    name: "Choregrapher",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COSTUME_DESIGNER",
+    name: "CostumeDesigner",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ACTOR",
+    name: "Actor",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "CHARACTER",
+    name: "Character",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "WRITTEN_BY",
+    name: "WrittenBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SCREENPLAY_BY",
+    name: "ScreenplayBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "EDITED_BY",
+    name: "EditedBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PRODUCER",
+    name: "Producer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COPRODUCER",
+    name: "Coproducer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "EXECUTIVE_PRODUCER",
+    name: "ExecutiveProducer",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "DISTRIBUTED_BY",
+    name: "DistributedBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "MASTERED_BY",
+    name: "MasteredBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ENCODED_BY",
+    name: "EncodedBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "MIXED_BY",
+    name: "MixedBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "REMIXED_BY",
+    name: "RemixedBy",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PRODUCTION_STUDIO",
+    name: "ProductionStudio",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "THANKS_TO",
+    name: "ThanksTo",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PUBLISHER",
+    name: "Publisher",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LABEL",
+    name: "Label",
+    is_date: false,
+  },
+  // ----- Categories (Matroska.pm:810-823) -------------------------------
+  StdTagEntry {
+    key: "GENRE",
+    name: "Genre",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "MOOD",
+    name: "Mood",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ORIGINAL_MEDIA_TYPE",
+    name: "OriginalMediaType",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "CONTENT_TYPE",
+    name: "ContentType",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SUBJECT",
+    name: "Subject",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "DESCRIPTION",
+    name: "Description",
+    is_date: false,
+  },
+  // KEYWORDS: deferred IsList split (Matroska.pm:816-820) — emitted as
+  // joined string for now.
+  StdTagEntry {
+    key: "KEYWORDS",
+    name: "Keywords",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SUMMARY",
+    name: "Summary",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "SYNOPSIS",
+    name: "Synopsis",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "INITIAL_KEY",
+    name: "InitialKey",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PERIOD",
+    name: "Period",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LAW_RATING",
+    name: "LawRating",
+    is_date: false,
+  },
+  // ----- Dates (Matroska.pm:826-832) -- is_date = true ------------------
+  StdTagEntry {
+    key: "DATE_RELEASED",
+    name: "DateReleased",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_RECORDED",
+    name: "DateTimeOriginal",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_ENCODED",
+    name: "DateEncoded",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_TAGGED",
+    name: "DateTagged",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_DIGITIZED",
+    name: "CreateDate",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_WRITTEN",
+    name: "DateWritten",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "DATE_PURCHASED",
+    name: "DatePurchased",
+    is_date: true,
+  },
+  // ----- Geo + composition (Matroska.pm:833-836) ------------------------
+  StdTagEntry {
+    key: "RECORDING_LOCATION",
+    name: "RecordingLocation",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COMPOSITION_LOCATION",
+    name: "CompositionLocation",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "COMPOSER_NATIONALITY",
+    name: "ComposerNationality",
+    is_date: false,
+  },
+  // ----- Comments + rating (Matroska.pm:836-840) ------------------------
+  StdTagEntry {
+    key: "COMMENT",
+    name: "Comment",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PLAY_COUNTER",
+    name: "PlayCounter",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "RATING",
+    name: "Rating",
+    is_date: false,
+  },
+  // ----- Encoder (Matroska.pm:839-844) ----------------------------------
+  StdTagEntry {
+    key: "ENCODER",
+    name: "Encoder",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ENCODER_SETTINGS",
+    name: "EncoderSettings",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "BPS",
+    name: "BPS",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "FPS",
+    name: "FPS",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "BPM",
+    name: "BPM",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "MEASURE",
+    name: "Measure",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "TUNING",
+    name: "Tuning",
+    is_date: false,
+  },
+  // ----- Replaygain (Matroska.pm:846-847) -------------------------------
+  StdTagEntry {
+    key: "REPLAYGAIN_GAIN",
+    name: "ReplaygainGain",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "REPLAYGAIN_PEAK",
+    name: "ReplaygainPeak",
+    is_date: false,
+  },
+  // ----- Identifiers (Matroska.pm:848-857) ------------------------------
+  StdTagEntry {
+    key: "ISRC",
+    name: "ISRC",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "MCDI",
+    name: "MCDI",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "ISBN",
+    name: "ISBN",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "BARCODE",
+    name: "Barcode",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "CATALOG_NUMBER",
+    name: "CatalogNumber",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LABEL_CODE",
+    name: "LabelCode",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LCCN",
+    name: "Lccn",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "IMDB",
+    name: "IMDB",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "TMDB",
+    name: "TMDB",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "TVDB",
+    name: "TVDB",
+    is_date: false,
+  },
+  // ----- Purchase (Matroska.pm:858-862) ---------------------------------
+  StdTagEntry {
+    key: "PURCHASE_ITEM",
+    name: "PurchaseItem",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PURCHASE_INFO",
+    name: "PurchaseInfo",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PURCHASE_OWNER",
+    name: "PurchaseOwner",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PURCHASE_PRICE",
+    name: "PurchasePrice",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PURCHASE_CURRENCY",
+    name: "PurchaseCurrency",
+    is_date: false,
+  },
+  // ----- Rights (Matroska.pm:863-866) -----------------------------------
+  StdTagEntry {
+    key: "COPYRIGHT",
+    name: "Copyright",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "PRODUCTION_COPYRIGHT",
+    name: "ProductionCopyright",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "LICENSE",
+    name: "License",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "TERMS_OF_USE",
+    name: "TermsOfUse",
+    is_date: false,
+  },
+  // ----- "Other tags seen" (Matroska.pm:885-890) ------------------------
+  StdTagEntry {
+    key: "_STATISTICS_WRITING_DATE_UTC",
+    name: "StatisticsWritingDateUTC",
+    is_date: true,
+  },
+  StdTagEntry {
+    key: "_STATISTICS_WRITING_APP",
+    name: "StatisticsWritingApp",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "_STATISTICS_TAGS",
+    name: "StatisticsTags",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "DURATION",
+    name: "Duration",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "NUMBER_OF_FRAMES",
+    name: "NumberOfFrames",
+    is_date: false,
+  },
+  StdTagEntry {
+    key: "NUMBER_OF_BYTES",
+    name: "NumberOfBytes",
+    is_date: false,
+  },
+];
+
+/// Resolve a SimpleTag's `TagName` to its canonical tag name. Returns
+/// `None` for unknown keys — the caller falls back to the bundled-Perl
+/// "synthesize a name" path (Matroska.pm:905-911).
+fn std_tag_lookup(key: &str) -> Option<StdTagEntry> {
+  STD_TAG_TABLE.iter().find(|e| e.key == key).copied()
+}
+
+/// Synthesize a canonical tag name from an off-table TagName key — faithful
+/// port of Matroska.pm:905-911:
+///
+/// ```perl
+/// my $name = ucfirst lc $tag;
+/// $name =~ tr/0-9a-zA-Z_//dc;       # drop non-alphanumeric_underscore
+/// $name =~ s/_([a-z])/\U$1/g;       # camelCase _x -> X
+/// $name = "Tag_$name" if length $name < 2;
+/// ```
+///
+/// Order of operations matters: lowercase ALL, capitalize first character,
+/// then trim non-alphanumeric_underscore, then process `_X` ⇒ `X` (camelCase).
+fn synthesize_tag_name(raw: &str) -> String {
+  // Step 1: lowercase
+  let lc: String = raw.chars().map(|c| c.to_ascii_lowercase()).collect();
+  // Step 2: capitalize first char (Perl `ucfirst`)
+  let mut chars = lc.chars();
+  let first = chars.next().map(|c| c.to_ascii_uppercase());
+  let rest: String = chars.collect();
+  let mut name = String::with_capacity(raw.len());
+  if let Some(f) = first {
+    name.push(f);
+  }
+  name.push_str(&rest);
+  // Step 3: drop non-alphanumeric_underscore (Perl `tr/0-9a-zA-Z_//dc`)
+  name.retain(|c| c.is_ascii_alphanumeric() || c == '_');
+  // Step 4: `_x` ⇒ `X` (camelCase — Perl `s/_([a-z])/\U$1/g`)
+  let mut out = String::with_capacity(name.len());
+  let mut chars = name.chars();
+  while let Some(c) = chars.next() {
+    if c == '_' {
+      if let Some(next) = chars.next() {
+        if next.is_ascii_lowercase() {
+          out.push(next.to_ascii_uppercase());
+        } else {
+          out.push('_');
+          out.push(next);
+        }
+      } else {
+        out.push('_');
+      }
+    } else {
+      out.push(c);
+    }
+  }
+  // Step 5: short-name guard (Matroska.pm:909)
+  if out.len() < 2 {
+    let mut prefixed = String::with_capacity(out.len() + 4);
+    prefixed.push_str("Tag_");
+    prefixed.push_str(&out);
+    out = prefixed;
+  }
+  out
 }
 
 // ===========================================================================
@@ -1411,14 +2090,28 @@ pub enum Value<'a> {
   /// when non-zero, else 0; PrintConv `int($val * 1000 + 0.5) / 1000`
   /// (Matroska.pm:294-301).
   VideoFrameRateRaw(u64),
+  /// Binary blob — emitted as ExifTool's
+  /// `(Binary data <N> bytes, use -b option to extract)` placeholder
+  /// in both `-j` and `-n` modes (TagValue::Bytes serialization in
+  /// `value.rs`). Faithful to Matroska.pm:552 (AttachedFileData) and
+  /// 695 (TagBinary) — `# Binary`.
+  Bytes(Cow<'a, [u8]>),
 }
 
 /// One emitted tag in [`Meta::entries`]: family-1 group, tag name, raw
 /// post-format value.
+///
+/// `name` is a [`SmolStr`] so SimpleTag synthesized names (Matroska.pm:
+/// 905-911) — which produce dynamically-computed canonical names for
+/// off-StdTag-table keys — can be carried alongside the static-string
+/// names from `TAG_TABLE` without a separate variant. SmolStr inlines
+/// strings up to 23 bytes, so every static `&'static str` from the
+/// Matroska tag tables stays heap-free; only the rare synthesized name
+/// allocates.
 #[derive(Debug, Clone)]
 pub struct Entry<'a> {
   group: SmolStr,
-  name: &'static str,
+  name: SmolStr,
   value: Value<'a>,
 }
 
@@ -1432,8 +2125,8 @@ impl<'a> Entry<'a> {
   /// Tag name (e.g. `"DocType"`, `"TimecodeScale"`, `"TrackNumber"`).
   #[must_use]
   #[inline(always)]
-  pub const fn name(&self) -> &'static str {
-    self.name
+  pub fn name(&self) -> &str {
+    self.name.as_str()
   }
   /// Decoded raw value (borrow of the non-`Copy` [`Value`]).
   #[must_use]
@@ -1561,6 +2254,47 @@ struct Walker<'a> {
   /// Matroska.pm:272 `RawConv` records it). `None` outside a TrackEntry,
   /// or before the TrackType element was read.
   track_type: Option<u64>,
+  /// Currently-open SimpleTag struct accumulator (Matroska.pm:1115 `$struct
+  /// = { } if $dirName eq 'SimpleTag'`). Set when a TOP-LEVEL SimpleTag is
+  /// entered; populated by TagName / TagString / TagBinary / TagLanguage /
+  /// TagDefault children (Matroska.pm:1224-1226 `$$struct{$tagName} = $val
+  /// if $struct`); flushed via the StdTag table by [`flush_simple_tag`] on
+  /// SimpleTag close (Matroska.pm:1043-1045 `HandleStruct($et, $struct)`).
+  ///
+  /// NESTED SimpleTag support is deliberately DEFERRED in this pass — see
+  /// the inline comment near `flush_simple_tag`. Real-world MKVs that use
+  /// nested SimpleTags will see the inner-tag values absorbed into the
+  /// outer struct via first-occurrence semantics (TagName/TagString from
+  /// the first visited tag wins). 4-surface visible-deferral noted in
+  /// `docs/tracking.md`.
+  simple_tag: Option<SimpleTagStruct<'a>>,
+  /// Depth (`w.ends.len()` at SimpleTag push time) where the active
+  /// SimpleTag was entered — used to scope which subsequent leaf elements
+  /// populate the struct (everything at depth > this is part of the same
+  /// struct). `None` when no SimpleTag is open.
+  simple_tag_depth: Option<usize>,
+}
+
+/// One in-flight SimpleTag struct (Matroska.pm `HandleStruct` inputs).
+///
+/// Captures the canonical SimpleTag children:
+/// - `TagName` (Matroska.pm:687) — the looked-up key in StdTag table
+/// - `TagString` (Matroska.pm:691) — the string value (preferred)
+/// - `TagBinary` (Matroska.pm:695) — the binary value (fallback when no
+///   TagString)
+///
+/// First-wins on each (matches Perl's `$$struct{TagName} = $val` re-
+/// assignment that the second occurrence would silently overwrite — we
+/// store only the first observation, which is the common case for
+/// well-formed MKV).
+#[derive(Debug, Default)]
+struct SimpleTagStruct<'a> {
+  /// `TagName` (Matroska.pm:687 `Name => 'TagName', Format => 'utf8'`).
+  tag_name: Option<Cow<'a, str>>,
+  /// `TagString` (Matroska.pm:691 `Name => 'TagString', Format => 'utf8'`).
+  tag_string: Option<Cow<'a, str>>,
+  /// `TagBinary` (Matroska.pm:695 `Name => 'TagBinary'`; binary blob).
+  tag_binary: Option<Cow<'a, [u8]>>,
 }
 
 const DEFAULT_GROUP: &str = "Matroska";
@@ -1591,6 +2325,8 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     group_locked_at_depth: None,
     chapter_num: 0,
     track_type: None,
+    simple_tag: None,
+    simple_tag_depth: None,
   };
   walk(&mut w);
   Ok(Some(Meta {
@@ -1608,10 +2344,16 @@ fn walk(w: &mut Walker<'_>) {
     // ---- Pop ended containers (Matroska.pm:1023-1057) -------------------
     while let Some(&(end, _)) = w.ends.last() {
       if w.pos >= end {
-        // Container ended; check whether we should restore the group.
+        // The locked depth records the INDEX at which the locking container
+        // was pushed — i.e. `w.ends.len() - 1` at push time. The locking
+        // container is the one whose end-marker we are about to cross when
+        // `w.ends.len() == d + 1`. Restore BEFORE pop so the next sibling
+        // observes the restored group (Matroska.pm:1050 `delete
+        // $$et{SET_GROUP1} if $trackIndent and $trackIndent eq $$et{INDENT}`
+        // — Perl resets exactly at the closing brace).
         if let Some(d) = w.group_locked_at_depth {
-          if w.ends.len() <= d {
-            // We exited the SubDir that locked the group ⇒ restore default.
+          if w.ends.len() == d + 1 {
+            // Exiting the SubDir that locked the group ⇒ restore default.
             w.current_group = SmolStr::new_static(DEFAULT_GROUP);
             w.group_locked_at_depth = None;
             // TrackType also resets when its TrackEntry closes
@@ -1619,6 +2361,18 @@ fn walk(w: &mut Walker<'_>) {
             // 1'` runs at TrackEntry entry, but conceptually it scopes per
             // TrackEntry).
             w.track_type = None;
+          }
+        }
+        // ---- SimpleTag close: flush via StdTag --------------------------
+        // Matroska.pm:1043-1045 `HandleStruct($et, $struct); undef $struct`
+        // fires when a TOP-LEVEL SimpleTag's end-marker is crossed. Nested
+        // SimpleTags (Matroska.pm:1037-1041) recurse — DEFERRED, see the
+        // `simple_tag` doc comment.
+        if let Some(d) = w.simple_tag_depth {
+          if w.ends.len() == d + 1 {
+            flush_simple_tag(w);
+            w.simple_tag = None;
+            w.simple_tag_depth = None;
           }
         }
         w.ends.pop();
@@ -1639,23 +2393,61 @@ fn walk(w: &mut Walker<'_>) {
       break;
     };
     w.pos += size_v.consumed();
-    if size_v.is_unknown() {
-      // Matroska.pm:1073 — `$size < 0` ⇒ `$unknownSize = 1, $size = 1e20`.
-      // Matroska.pm:1130 — `last if $unknownSize`. We can't continue
-      // meaningfully without a size; faithful stop.
-      break;
+    // Unknown-size pre-classification (Matroska.pm:1073 — `$size < 0` ⇒
+    // `$unknownSize = 1, $size = 1e20`). Faithful semantics differ for
+    // master vs leaf:
+    //   - master (SubDir / SkipBody): descend into the body until EOF or
+    //     parent's declared end (Matroska.pm:1073/1114 pushes
+    //     `[pos + 1e20, name, ...]` — the 1e20 sentinel is never reached
+    //     within a real buffer, so the body effectively extends to EOF
+    //     within Perl's read window).
+    //   - leaf: `last if $unknownSize` (Matroska.pm:1130) — no
+    //     decodable bound for the leaf body, so we faithfully STOP.
+    //   - Cluster (SkipBody): `last` (Matroska.pm:1105 default arm — no
+    //     way to advance past an unknown-size body without parsing the
+    //     children, which is exactly what SkipBody is avoiding).
+    let unknown_size = size_v.is_unknown();
+    let elem_end_declared: usize;
+    if unknown_size {
+      // Peek at the tag def to decide whether this is a master we can
+      // descend OR a leaf where we must stop. The conditional IDs
+      // (`0x3e383`, `0x06`, `0x58688`) are always leaves.
+      let id = id_v.value();
+      let is_conditional_leaf = matches!(id, 0x3e383 | 0x06 | 0x58688);
+      let kind = (!is_conditional_leaf)
+        .then(|| tag_def(id))
+        .flatten()
+        .map(|d| d.kind);
+      let is_master_subdir = matches!(kind, Some(Kind::SubDir));
+      if is_master_subdir {
+        // Set the effective end at parent's bound (if any) or EOF —
+        // faithful to Matroska.pm:1114 `[pos + $dataPos + $size, …]`
+        // where `$size = 1e20` ⇒ end always > buffer length.
+        elem_end_declared = w
+          .ends
+          .last()
+          .map(|&(e, _)| e)
+          .unwrap_or(data.len())
+          .min(data.len());
+      } else {
+        // Leaf, SkipBody (Cluster), or unknown ID with unknown size —
+        // faithful Perl `last if $unknownSize` (Matroska.pm:1130) OR
+        // `last` at Matroska.pm:1105 (Cluster default arm). We stop.
+        break;
+      }
+    } else {
+      let size = size_v.value() as usize;
+      // Declared end (Matroska.pm:1073-1085). For a SubDir whose declared end
+      // exceeds the buffer (Matroska files commonly declare a Segment size
+      // that overshoots the on-disk body — mkvmerge "unknown size", live
+      // streams), the bundled walker still enters and traverses every child
+      // until natural EOF. We clamp the SubDir end to `data.len()` so the
+      // walker keeps stepping. The match arms below handle SubDir vs leaf
+      // separately: SubDir uses the clamped end; leaves either fit the
+      // declared end (we use that as `elem_end`) or bail (Matroska.pm:
+      // 1130-1161 `last` after the failed streaming read).
+      elem_end_declared = w.pos.checked_add(size).unwrap_or(data.len());
     }
-    let size = size_v.value() as usize;
-    // Declared end (Matroska.pm:1073-1085). For a SubDir whose declared end
-    // exceeds the buffer (Matroska files commonly declare a Segment size
-    // that overshoots the on-disk body — mkvmerge "unknown size", live
-    // streams), the bundled walker still enters and traverses every child
-    // until natural EOF. We clamp the SubDir end to `data.len()` so the
-    // walker keeps stepping. The match arms below handle SubDir vs leaf
-    // separately: SubDir uses the clamped end; leaves either fit the
-    // declared end (we use that as `elem_end`) or bail (Matroska.pm:
-    // 1130-1161 `last` after the failed streaming read).
-    let elem_end_declared = w.pos.checked_add(size).unwrap_or(data.len());
     // The unified `elem_end` used by every leaf arm below — defaults to
     // declared but capped at data.len() so reads don't slice past EOF; if
     // the leaf would overflow the buffer we cap and let the decoder return
@@ -1706,6 +2498,13 @@ fn walk(w: &mut Walker<'_>) {
           // TrackEntry; the lock-depth is the TrackEntry's own depth.
           w.group_locked_at_depth = Some(w.ends.len() - 1);
           w.track_type = None;
+        } else if def.name == "SimpleTag" && w.simple_tag.is_none() {
+          // Matroska.pm:1115 — `$struct = { } if $dirName eq 'SimpleTag'`.
+          // Only TOP-LEVEL SimpleTag opens a struct (nested SimpleTags are
+          // recursed into the parent's struct via Matroska.pm:1037-1041 —
+          // DEFERRED, see `simple_tag` doc).
+          w.simple_tag = Some(SimpleTagStruct::default());
+          w.simple_tag_depth = Some(w.ends.len() - 1);
         }
         // Cursor stays at the start of the SubDir's children (we don't
         // advance by `size` — we descend into the body).
@@ -1713,6 +2512,36 @@ fn walk(w: &mut Walker<'_>) {
       }
       Kind::Skip => {
         // NoSave / Unknown → walk past.
+        w.pos = elem_end;
+        continue;
+      }
+      Kind::SkipBody => {
+        // Matroska.pm:1096-1105 (default Cluster handling): `last` the
+        // walk. Cluster is the only user of this kind. We don't (yet)
+        // honor SeekHead's Tags pointer to skip ahead to Tags after
+        // the Cluster, so the faithful default is to stop entirely —
+        // matches `perl exiftool -j -G1:1 -api struct=1` output (our
+        // parity reference). See the `Kind::SkipBody` doc above for
+        // the deferred-SeekHead note.
+        break;
+      }
+      Kind::Binary => {
+        // Matroska.pm:552 (AttachedFileData) + 695 (TagBinary) —
+        // `Format => 'binary'` / `Binary => 1`. ExifTool emits these as
+        // the no-`-b` placeholder `(Binary data <N> bytes, use -b option
+        // to extract)` in both `-j` and `-n` modes.
+        let body = &data[w.pos..elem_end];
+        // If we're inside a SimpleTag struct AND this is the TagBinary
+        // child, route into the builder instead of emitting directly
+        // (Matroska.pm:1224-1226).
+        if let Some(st) = w.simple_tag.as_mut() {
+          if def.name == "TagBinary" && st.tag_binary.is_none() {
+            st.tag_binary = Some(Cow::Borrowed(body));
+            w.pos = elem_end;
+            continue;
+          }
+        }
+        push_entry(w, def.name, Value::Bytes(Cow::Borrowed(body)));
         w.pos = elem_end;
         continue;
       }
@@ -1758,6 +2587,26 @@ fn walk(w: &mut Walker<'_>) {
       }
       Kind::Utf8String => {
         let s = decode_utf8(&data[w.pos..elem_end]);
+        // Matroska.pm:1224-1226 `$$struct{$tagName} = $val if $struct`:
+        // when an open SimpleTag struct is active, TagName / TagString
+        // children populate the struct instead of being emitted as
+        // standalone tags. The struct's flush at SimpleTag-close (see
+        // `flush_simple_tag`) emits the canonical StdTag-mapped key.
+        if let Some(st) = w.simple_tag.as_mut() {
+          match def.name {
+            "TagName" if st.tag_name.is_none() => {
+              st.tag_name = Some(s);
+              w.pos = elem_end;
+              continue;
+            }
+            "TagString" if st.tag_string.is_none() => {
+              st.tag_string = Some(s);
+              w.pos = elem_end;
+              continue;
+            }
+            _ => {}
+          }
+        }
         push_entry(w, def.name, Value::Str(s));
         w.pos = elem_end;
         continue;
@@ -1878,9 +2727,99 @@ fn push_entry<'a>(w: &mut Walker<'a>, name: &'static str, value: Value<'a>) {
   }
   w.entries.push(Entry {
     group: w.current_group.clone(),
+    name: SmolStr::new_static(name),
+    value,
+  });
+}
+
+/// Variant of [`push_entry`] for SimpleTag synthesized names (Matroska.pm:
+/// 905-911) — the `name` is a runtime [`SmolStr`] (inlined if short, heap
+/// otherwise) rather than a `&'static str` from `TAG_TABLE`.
+fn push_entry_named<'a>(w: &mut Walker<'a>, name: SmolStr, value: Value<'a>) {
+  w.entries.push(Entry {
+    group: w.current_group.clone(),
     name,
     value,
   });
+}
+
+/// Emit the buffered SimpleTag via [`STD_TAG_TABLE`] → canonical-or-
+/// synthesized tag name. Faithful port of `HandleStruct`
+/// (Matroska.pm:897-948) — the simplified single-tag path (we currently
+/// defer nested SimpleTag recursion + TagLanguage suffix, both noted in
+/// the `simple_tag` doc comment).
+///
+/// Emission rules:
+/// - If both `TagName` AND (`TagString` OR `TagBinary`) are present →
+///   emit `<StdTagName>` = value (Matroska.pm:926).
+/// - If `TagName` is in [`STD_TAG_TABLE`]:
+///   - For static rows (`name = &'static str`), uses the static name
+///     directly (cheap SmolStr inlining).
+///   - For date rows (`is_date = true`), the TagString is post-processed
+///     via `dateInfo.ValueConv` (Matroska.pm:29 — replace the first two
+///     `-` separators in a YYYY-MM-... string with `:`).
+/// - If `TagName` is NOT in the table → synthesize via
+///   [`synthesize_tag_name`] (Matroska.pm:905-911).
+/// - If `TagName` is absent → silently drop (faithful: bundled
+///   `$tag = $$struct{TagName}` followed by `$$tagTbl{$tag}` lookup is a
+///   no-op for an undef `$tag`).
+fn flush_simple_tag(w: &mut Walker<'_>) {
+  let Some(st) = w.simple_tag.as_ref() else {
+    return;
+  };
+  let Some(tag_name_text) = st.tag_name.as_ref() else {
+    return;
+  };
+  let key = tag_name_text.as_ref();
+  // Resolve canonical name + is_date flag.
+  let (canonical, is_date) = match std_tag_lookup(key) {
+    Some(e) => (SmolStr::new_static(e.name), e.is_date),
+    None => (SmolStr::new(&synthesize_tag_name(key)), false),
+  };
+  // Prefer TagString over TagBinary (Matroska.pm:927 `defined
+  // $$struct{TagString} ? $$struct{TagString} : \$$struct{TagBinary}`).
+  let value = if let Some(s) = st.tag_string.as_ref() {
+    // Apply dateInfo.ValueConv if marked is_date — `s/^(\d{4})-(\d{2})-
+    // /$1:$2:/`. Faithful to Matroska.pm:29.
+    if is_date {
+      Value::Str(Cow::Owned(date_separator_convert(s.as_ref())))
+    } else {
+      // Re-wrap as Owned to avoid borrowing from the SimpleTag struct's
+      // own Cow (which would tie Entry's lifetime to the struct's slot).
+      Value::Str(Cow::Owned(s.as_ref().to_owned()))
+    }
+  } else if let Some(b) = st.tag_binary.as_ref() {
+    Value::Bytes(Cow::Owned(b.as_ref().to_vec()))
+  } else {
+    // No value child (Matroska.pm:926 guard: neither TagString nor
+    // TagBinary defined) — bundled emits nothing.
+    return;
+  };
+  push_entry_named(w, canonical, value);
+}
+
+/// `dateInfo.ValueConv` (Matroska.pm:29) — `s/^(\d{4})-(\d{2})-/$1:$2:/`.
+/// Replace the first two `-` separators (the year-month and month-day
+/// boundaries) with `:` for a YYYY-MM-DDTHH:MM:SS-style input. Preserves
+/// timezone separators (e.g. `2010-12-31T00:00:00-05:00` ⇒
+/// `2010:12:31T00:00:00-05:00`).
+fn date_separator_convert(s: &str) -> String {
+  let bytes = s.as_bytes();
+  if bytes.len() >= 8 // YYYY-MM-D…
+    && bytes[..4].iter().all(|b| b.is_ascii_digit())
+    && bytes[4] == b'-'
+    && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+    && bytes[7] == b'-'
+  {
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..4]);
+    out.push(':');
+    out.push_str(&s[5..7]);
+    out.push(':');
+    out.push_str(&s[8..]);
+    return out;
+  }
+  s.to_owned()
 }
 
 // ===========================================================================
@@ -1994,8 +2933,10 @@ impl Meta<'_> {
 }
 
 /// Resolve `name` → `Kind` by re-looking it up in `TAG_TABLE`. Used by
-/// `emit_one` to know which PrintConv to apply.
-fn kind_for_name(name: &'static str) -> Option<Kind> {
+/// `emit_one` to know which PrintConv to apply. Accepts `&str` so it works
+/// for both static-table names AND SimpleTag synthesized names (which won't
+/// match — the caller falls back to `PrintConv::Identity`).
+fn kind_for_name(name: &str) -> Option<Kind> {
   TAG_TABLE
     .iter()
     .find_map(|t| (t.name == name).then(|| t.kind))
@@ -2137,6 +3078,12 @@ fn emit_one(
       } else {
         out.write_f64(group, name, vc)?;
       }
+    }
+    Value::Bytes(b) => {
+      // Matroska.pm:552 (AttachedFileData) + 695 (TagBinary). ExifTool's
+      // universal no-`-b` placeholder is rendered by `TagValue::Bytes`'s
+      // Serialize impl (`value.rs`) — identical bytes for `-j` and `-n`.
+      out.write_bytes(group, name, b.as_ref())?;
     }
   }
   Ok(())
@@ -2343,6 +3290,182 @@ mod tests {
     assert_eq!(meta.doc_type(), Some("matroska"));
     assert!(!meta.is_webm());
     assert_eq!(meta.timecode_scale_ns(), Some(1_000_000));
+  }
+
+  // -------------------------------------------------------------------
+  // Round-1 finding unit tests (F1, F2, F3, F4, F5)
+  // -------------------------------------------------------------------
+
+  #[test]
+  fn f4_group_restore_after_info_sibling_uses_default_group() {
+    // PR #31 R1 F4 — pre-fix the group-restore comparison fired only when
+    // the PARENT ended; siblings AFTER Info inherited the `Info:` group.
+    // Test: synthesize a fixture where the Tracks element appears AFTER
+    // Info inside the Segment. Pre-F4 the TrackEntry / TrackNumber
+    // emissions would carry an `Info:` group; post-F4 they carry the
+    // correct `Track1:` group.
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_unknown_segment.mkv"
+    ))
+    .expect("read F4 fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let mut tm = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // Info emitted under `Info:`
+    assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
+    assert_eq!(tm.get_str("Info", "MuxingApp"), Some("unkseg".into()));
+    // TrackEntry siblings AFTER Info must be under `Track1:`, NOT `Info:`.
+    assert_eq!(tm.get_str("Track1", "TrackNumber"), Some("1".into()));
+    assert_eq!(tm.get_str("Track1", "TrackType"), Some("Video".into()));
+    // Sanity: TrackNumber MUST NOT leak into `Info:` group.
+    assert_eq!(tm.get_str("Info", "TrackNumber"), None);
+  }
+
+  #[test]
+  fn f3_cluster_stops_walker_at_first_cluster() {
+    // PR #31 R1 F3 — bundled default Cluster handling (Matroska.pm:1105
+    // `last`). Our `Kind::SkipBody` → `break` matches: Tags AFTER Cluster
+    // are NOT emitted (faithful to bundled).
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_cluster_skip.mkv"
+    ))
+    .expect("read F3 fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let mut tm = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // Info BEFORE cluster: emitted
+    assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
+    assert_eq!(tm.get_str("Info", "MuxingApp"), Some("clu".into()));
+    // Cluster body should NOT be descended (TimeCode, SimpleBlock inside
+    // Cluster are NoSave anyway; verify we don't even attempt to emit)
+    // Tags AFTER cluster MUST NOT appear — bundled stops at first Cluster.
+    assert_eq!(tm.get_str("Matroska", "Title"), None);
+  }
+
+  #[test]
+  fn f5_binary_emits_placeholder_in_both_modes() {
+    // PR #31 R1 F5 — AttachedFileData emits the no-`-b` placeholder string
+    // in both `-j` and `-n` modes. `tm.get_str` hex-encodes Bytes for the
+    // raw-storage probe; the placeholder is rendered by
+    // `TagValue::Bytes::Serialize` (`src/value.rs:711-716`), which we
+    // verify via the JSON round-trip below.
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_attachment.mkv"
+    ))
+    .expect("read F5 fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    for print_conv in [true, false] {
+      let mut tm = crate::tagmap::TagMap::new();
+      meta.serialize_tags(print_conv, &mut tm).unwrap();
+      // The raw `TagValue::Bytes` storage stringifies as lower-hex via
+      // `tm.get_str` — a sanity check that the 32-byte attachment WAS
+      // captured (vs the pre-F5 silent drop).
+      let hex = tm
+        .get_str("Matroska", "AttachedFileData")
+        .expect("F5 captured");
+      assert_eq!(hex.len(), 32 * 2);
+      assert!(hex.starts_with("ffd8ffe0"), "JPEG magic preserved");
+      // String/utf8 attachments remain emitted as their normal Str value.
+      assert_eq!(
+        tm.get_str("Matroska", "AttachedFileName"),
+        Some("cover.jpg".into())
+      );
+    }
+  }
+
+  #[test]
+  fn f1_simpletag_maps_via_std_tag_table() {
+    // PR #31 R1 F1 — Tags → SimpleTag → StdTag-mapped tag emission.
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_simpletag.mkv"
+    ))
+    .expect("read F1 fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let mut tm = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // TITLE → Title, ARTIST → Artist (Matroska.pm:764, 777).
+    assert_eq!(tm.get_str("Matroska", "Title"), Some("Hello World".into()));
+    assert_eq!(tm.get_str("Matroska", "Artist"), Some("Test Artist".into()));
+    // DATE_RELEASED → DateReleased + dateInfo separator conversion
+    // (Matroska.pm:826 + 29): "2010-01-15" → "2010:01:15".
+    assert_eq!(
+      tm.get_str("Matroska", "DateReleased"),
+      Some("2010:01:15".into())
+    );
+    // Raw TagName/TagString must NOT be emitted alongside (they are
+    // absorbed into the SimpleTag struct and flushed via StdTag).
+    assert_eq!(tm.get_str("Matroska", "TagName"), None);
+    assert_eq!(tm.get_str("Matroska", "TagString"), None);
+  }
+
+  #[test]
+  fn f1_synthesize_tag_name_matroska_pm_rules() {
+    // Matroska.pm:905-911 — verbatim porting smoke test for the
+    // `ucfirst lc / strip / camelCase / Tag_<short>` rules.
+    // "FOO" → lc "foo" → ucfirst "Foo" → strip nothing → "Foo".
+    assert_eq!(synthesize_tag_name("FOO"), "Foo");
+    // "MY_CUSTOM_TAG" → "my_custom_tag" → "My_custom_tag" → camelCase
+    // _c → C, _t → T → "MyCustomTag".
+    assert_eq!(synthesize_tag_name("MY_CUSTOM_TAG"), "MyCustomTag");
+    // "tag-with-dashes" → lc no-op → "Tag-with-dashes" → strip `-` →
+    // "Tagwithdashes" (no `_x` => X conversion).
+    assert_eq!(synthesize_tag_name("tag-with-dashes"), "Tagwithdashes");
+    // Short name guard: "x" → "X" → length 1 → "Tag_X".
+    assert_eq!(synthesize_tag_name("x"), "Tag_X");
+    // Empty input → empty post-trim → "Tag_" prefix.
+    assert_eq!(synthesize_tag_name(""), "Tag_");
+  }
+
+  #[test]
+  fn f1_date_separator_convert_matches_perl_regex() {
+    // dateInfo.ValueConv (Matroska.pm:29) — `s/^(\d{4})-(\d{2})-/$1:$2:/`.
+    assert_eq!(date_separator_convert("2010-01-15"), "2010:01:15");
+    assert_eq!(
+      date_separator_convert("2010-01-15T00:00:00"),
+      "2010:01:15T00:00:00"
+    );
+    // Timezone separator is NOT converted (only the first two `-`).
+    assert_eq!(
+      date_separator_convert("2010-01-15T00:00:00-05:00"),
+      "2010:01:15T00:00:00-05:00"
+    );
+    // Non-date input: pass through unchanged.
+    assert_eq!(date_separator_convert("not a date"), "not a date");
+    // ISO with `:` already: pass through unchanged.
+    assert_eq!(date_separator_convert("2010:01:15"), "2010:01:15");
+  }
+
+  #[test]
+  fn f1_std_tag_lookup_finds_canonical_and_date_rows() {
+    let e = std_tag_lookup("TITLE").expect("TITLE present");
+    assert_eq!(e.name, "Title");
+    assert!(!e.is_date);
+    let e = std_tag_lookup("DATE_RELEASED").expect("DATE_RELEASED present");
+    assert_eq!(e.name, "DateReleased");
+    assert!(e.is_date);
+    assert!(std_tag_lookup("THIS_IS_NOT_A_REAL_KEY").is_none());
+  }
+
+  #[test]
+  fn f2_unknown_size_master_descends_to_eof() {
+    // PR #31 R1 F2 — Segment with unknown-size VINT must be descended.
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_unknown_segment.mkv"
+    ))
+    .expect("read F2 fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    // Pre-F2: walker breaks on the unknown-size VINT → Info/Tracks lost.
+    // Post-F2: Info+Tracks descended.
+    let mut tm = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
+    assert_eq!(tm.get_str("Info", "MuxingApp"), Some("unkseg".into()));
+    assert_eq!(tm.get_str("Track1", "TrackNumber"), Some("1".into()));
   }
 
   #[test]

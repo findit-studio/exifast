@@ -182,12 +182,18 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // 126 → 127 after FORMATS.md row 23 lib/matroska: added `Matroska.mkv`
   // (bundled t/images fixture, 507 bytes) to exercise the EBML walker +
   // tag-table dispatch ported in `src/formats/matroska.rs`.
+  // 127 → 131 after PR #31 Round-1 findings (F1, F2, F3, F5): added
+  // `Matroska_simpletag.mkv`, `Matroska_unknown_segment.mkv`,
+  // `Matroska_cluster_skip.mkv`, `Matroska_attachment.mkv` — synthetic
+  // adversarial fixtures exercising SimpleTag/StdTag mapping,
+  // unknown-size Segment, default Cluster-stop, and binary-placeholder
+  // emission (see `tests/conformance.rs::matroska_*_conformance`).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    127,
-    "expected exactly the 127 active conformance fixtures, found {}: {:?}",
+    131,
+    "expected exactly the 131 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

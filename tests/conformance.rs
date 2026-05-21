@@ -63,6 +63,97 @@ fn matroska_conformance() {
 }
 
 #[test]
+fn matroska_simpletag_conformance() {
+  // PR #31 R1 finding F1 — Tags → SimpleTag → TagName/TagString
+  // mapping via `Image::ExifTool::Matroska::StdTag` (Matroska.pm:750-
+  // 891). Synthetic fixture: EBMLHeader + Segment[Info + Tracks +
+  // Tags[Tag[SimpleTag(TITLE, "Hello World"), SimpleTag(ARTIST, "Test
+  // Artist"), SimpleTag(DATE_RELEASED, "2010-01-15")]]]. Exercises the
+  // StdTag canonical-name lookup (TITLE→Title, ARTIST→Artist,
+  // DATE_RELEASED→DateReleased + dateInfo separator conversion).
+  // Goldens captured with `perl exiftool -j -G1:1 -api struct=1
+  // -x System:all -x Composite:all`.
+  check(
+    "Matroska_simpletag.mkv",
+    "Matroska_simpletag.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_simpletag.mkv",
+    "Matroska_simpletag.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_unknown_segment_conformance() {
+  // PR #31 R1 finding F2 — unknown-size master element handling
+  // (Matroska.pm:1073-1085, 1114). Synthetic fixture: EBMLHeader +
+  // Segment(size = unknown-8-byte-VINT)[Info + Tracks]. Without F2
+  // the walker breaks on the unknown-size VINT after EBMLHeader and
+  // emits ONLY File:* + EBMLHeader children (losing Info + Tracks).
+  // With F2 the walker descends the unknown-size Segment using the
+  // parent's end (here EOF) as the effective bound, faithful to
+  // Matroska.pm:1073 `$size = 1e20` for unknown-size masters.
+  check(
+    "Matroska_unknown_segment.mkv",
+    "Matroska_unknown_segment.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_unknown_segment.mkv",
+    "Matroska_unknown_segment.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_cluster_skip_conformance() {
+  // PR #31 R1 finding F3 — Cluster default-skip (Matroska.pm:1096-
+  // 1105). Synthetic fixture: EBMLHeader + Segment[Info + Cluster
+  // (with Timecode + SimpleBlock body) + Tags]. Bundled DEFAULT
+  // behavior is to `last` the walker at the first Cluster (no
+  // `-v`/`-U > 1`/`-ee`), so Tags AFTER Cluster MUST NOT be emitted —
+  // matches our `Kind::SkipBody` → `break` semantics. Verifies we
+  // emit Info:* but neither walk into Cluster's body (SimpleBlock
+  // would emit nothing anyway since it's NoSave) nor pick up the
+  // Tags AFTER Cluster.
+  check(
+    "Matroska_cluster_skip.mkv",
+    "Matroska_cluster_skip.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_cluster_skip.mkv",
+    "Matroska_cluster_skip.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_attachment_conformance() {
+  // PR #31 R1 finding F5 — Binary elements (Matroska.pm:552
+  // `AttachedFileData`, 695 `TagBinary`). Synthetic fixture:
+  // EBMLHeader + Segment[Info + Tracks + Attachments[AttachedFile
+  // (Name=cover.jpg, MIME=image/jpeg, UID=deadbeef, Data=32B)]].
+  // Bundled emits AttachedFileData as
+  // `"(Binary data 32 bytes, use -b option to extract)"` (identical
+  // string for both `-j` and `-n` — TagValue::Bytes serialization in
+  // `src/value.rs:711-716`). With pre-F5 `Kind::Skip` the binary
+  // payload was silently dropped.
+  check(
+    "Matroska_attachment.mkv",
+    "Matroska_attachment.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_attachment.mkv",
+    "Matroska_attachment.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn wavpack_conformance() {
   // FORMATS.md row 6. Native `wvpk....` 32-byte header (no RIFF wrapper,
   // no ID3, no APE) ⇒ ProcessWV runs the WavPack::Main ProcessBinaryData
