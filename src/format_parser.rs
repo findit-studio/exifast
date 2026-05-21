@@ -1007,7 +1007,8 @@ impl AnyParser {
         // bundled `unless ($$et{DoneID3})` recursion guard).
         // (`ogg` requires `id3` in Cargo.toml.)
         let chained =
-          crate::formats::ogg::parse_full_chained(bytes, shared)?.filter(|m| m.success());
+          crate::formats::ogg::parse_full_chained(bytes, shared, /* print_conv */ true)?
+            .filter(|m| m.success());
         if let Some(m) = chained {
           return Ok(Some(AnyMeta::Ogg(m)));
         }

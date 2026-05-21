@@ -1830,12 +1830,27 @@ impl FormatParser for ProcessOgg {
 /// (COVERART base64 ValueConv is always applied; for known tags in OGG
 /// scope today PrintConv is `None` so the toggle is mostly cosmetic).
 ///
+/// **R4 F2 (Codex adversarial)** — routes through [`parse_full_chained`]
+/// so the embedded ID3 chain (Ogg.pm:79-83) runs for ID3-prefixed Ogg
+/// streams. Pre-fix this entry called the bare [`parse_inner`], which
+/// requires `OggS` at byte 0 — so an ID3v2-prefixed Ogg buffer returned
+/// `success = false` and the public API silently dropped both the
+/// detected ID3 tags AND the OGG body. The R3 fix went into the
+/// engine path (`AnyParser::Ogg`); the lib-direct API bypassed it.
+///
+/// A fresh [`crate::format_parser::SharedFlags`] is constructed per
+/// call (the public entry has no chain state to thread); the recursion
+/// guard inside `parse_full_chained` only matters for the engine
+/// path where ID3 may have already run on a prior format candidate.
+///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
 pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
-  parse_inner(data, print_conv_enabled)
+  // `ogg = ["id3", "flac"]` per Cargo.toml ⇒ `id3` is always present here.
+  let mut shared = crate::format_parser::SharedFlags::default();
+  parse_full_chained(data, &mut shared, print_conv_enabled)
 }
 
 /// R3 F1: full-chained parse — runs the embedded ID3 chain (`unless
@@ -1861,10 +1876,15 @@ pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Me
 /// Lifetime `'a` borrows from `data` (the ID3 sub-Meta owns its strings;
 /// the OGG Meta is mostly owned today — Phase G zero-alloc plan still
 /// applies).
+///
+/// `print_conv` is forwarded to the OGG body parse (Vorbis comment PrintConv
+/// toggle). The embedded ID3 chain is always staged in `print_conv: true`
+/// mode (the `parse_id3_with_hdr_end` contract).
 #[cfg(feature = "id3")]
 pub(crate) fn parse_full_chained<'a>(
   data: &'a [u8],
   shared: &mut crate::format_parser::SharedFlags,
+  print_conv: bool,
 ) -> Result<Option<Meta<'a>>, Error> {
   // 1. Embedded ID3 (Ogg.pm:79-83). The recursion guard (ID3.pm:1435 `return
   //    0 if $$et{DoneID3}`) is honoured here via `shared.done_id3().is_none()`:
@@ -1882,7 +1902,7 @@ pub(crate) fn parse_full_chained<'a>(
   //    `ape::parse_full_chained` (the body parser sees the bytes starting at
   //    the post-ID3-header offset).
   let body_slice = data.get(hdr_end..).unwrap_or(&[]);
-  match parse_inner(body_slice, /* print_conv */ true)? {
+  match parse_inner(body_slice, print_conv)? {
     Some(mut meta) => {
       meta.id3 = id3;
       Ok(Some(meta))

@@ -401,13 +401,22 @@ pub fn parse_aiff(
 }
 
 /// Parse an APE (Monkey's Audio) buffer directly through the typed
-/// [`ProcessApe`] parser.
+/// [`ProcessApe`] parser, including the embedded ID3 chain (APE.pm:124-127).
 ///
 /// `shared` carries cross-format state (`DoneID3` / `DoneAPE` flags) and
 /// borrows **independently** of `bytes` — only the byte-buffer lifetime
-/// `'a` flows into the returned [`formats::ape::Meta`] (which owns its data; `'a` is
-/// phantom). The transient `shared` may therefore be dropped or reused
-/// while the returned meta lives on (Codex C-R2-2).
+/// `'a` flows into the returned [`formats::ape::Meta`] (the MAC/main side
+/// is owned; the nested ID3 sub-Meta borrows from `bytes`). The transient
+/// `shared` may therefore be dropped or reused while the returned meta
+/// lives on (Codex C-R2-2).
+///
+/// **R4 F2 (Codex adversarial)** — routes through `parse_full_chained`
+/// rather than `parse_full_owned`, so an ID3v2-prefixed APE buffer or an
+/// ID3v1-trailered APE buffer surfaces the chained ID3 sub-Meta the way
+/// the engine `AnyParser::Ape` arm does. Pre-fix the lib-direct API
+/// (`parse_full_owned`) skipped the ID3 chain — silent metadata loss on
+/// `ape_id3_prefixed.ape` / `ape_with_id3v1_trailer.ape` / etc. through
+/// this path.
 ///
 /// # Errors
 ///
@@ -417,11 +426,10 @@ pub fn parse_ape<'a>(
   bytes: &'a [u8],
   shared: &mut SharedFlags,
 ) -> core::result::Result<Option<formats::ape::Meta<'a>>, formats::ape::Error> {
-  // Use the decoupled `parse_full_owned` (returns `ape::Meta<'static>`,
-  // covariant to `'a`) rather than `ProcessApe.parse(ape::Context::new(...))`,
-  // whose GAT `Context<'a> = ape::Context<'a>` ties `shared` to the Meta's
-  // lifetime even though `ape::Meta` never borrows from it (Codex C-R2-2).
-  Ok(formats::ape::parse_full_owned(bytes, shared))
+  // `ape = ["id3"]` per Cargo.toml ⇒ `parse_full_chained` is always present
+  // here. Returns `Option<Meta<'a>>` where `'a` is tied to `bytes` (the
+  // nested `Id3Meta` borrows from `bytes`); `shared` is transient.
+  Ok(formats::ape::parse_full_chained(bytes, shared))
 }
 
 /// Parse a DSF (DSD Stream File) buffer directly. See
@@ -488,8 +496,18 @@ pub fn parse_mpeg_audio<'a>(
   formats::mpeg::parse_borrowed(bytes, mp3, ext)
 }
 
-/// Parse an MPC (Musepack SV7) buffer directly. See
-/// [`formats::mpc::parse_borrowed`].
+/// Parse an MPC (Musepack SV7) buffer directly, including the embedded
+/// ID3 prefix (MPC.pm:84-87) and APE trailer (MPC.pm:111-113) chains.
+///
+/// **R4 F2 (Codex adversarial)** — routes through `parse_full_chained`
+/// rather than `parse_borrowed`. Pre-fix the lib-direct API called the
+/// bare body-only `parse_borrowed`, so an MPC with a leading ID3 or a
+/// trailing APE silently dropped those tags through the public path
+/// (the engine `AnyParser::Mpc` arm always used the chained entry).
+///
+/// A fresh [`SharedFlags`] is constructed per call (the public entry has
+/// no chain state to thread). The returned `Meta<'a>` is tied to `bytes`
+/// (the nested ID3 / APE sub-Metas borrow from `bytes`).
 ///
 /// # Errors
 ///
@@ -498,11 +516,24 @@ pub fn parse_mpeg_audio<'a>(
 pub fn parse_mpc(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::mpc::Meta<'_>>, formats::mpc::Error> {
-  formats::mpc::parse_borrowed(bytes)
+  // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
+  // present here.
+  let mut shared = SharedFlags::default();
+  Ok(formats::mpc::parse_full_chained(bytes, &mut shared))
 }
 
-/// Parse a WavPack `.wv` buffer directly. See
-/// [`formats::wavpack::parse_borrowed`].
+/// Parse a WavPack `.wv` buffer directly, including the embedded ID3
+/// + APE trailer chains (WavPack.pm:100-103).
+///
+/// **R4 F2 (Codex adversarial)** — routes through `parse_full_chained`
+/// rather than `parse_borrowed`. Pre-fix the lib-direct API called the
+/// bare body-only `parse_borrowed`, so a WavPack with an ID3v1 or APE
+/// trailer silently dropped those tags through the public path (the
+/// engine `AnyParser::Wv` arm always used the chained entry).
+///
+/// A fresh [`SharedFlags`] is constructed per call. The returned
+/// `Meta<'a>` is tied to `bytes` (the nested ID3 / APE sub-Metas borrow
+/// from `bytes`).
 ///
 /// # Errors
 ///
@@ -511,7 +542,10 @@ pub fn parse_mpc(
 pub fn parse_wavpack(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::wavpack::Meta<'_>>, formats::wavpack::Error> {
-  formats::wavpack::parse_borrowed(bytes)
+  // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is
+  // always present here.
+  let mut shared = SharedFlags::default();
+  Ok(formats::wavpack::parse_full_chained(bytes, &mut shared))
 }
 
 // ===========================================================================

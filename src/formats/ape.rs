@@ -1661,20 +1661,6 @@ pub(crate) fn parse_trailer_only_owned(
   Some(meta_from_plan(plan))
 }
 
-/// Full APE parse (header + trailer) with **decoupled lifetimes** — `data`
-/// and `shared` borrow independently and the returned [`Meta`] is owned
-/// (`'static`). Used by the closed [`crate::format_parser::AnyParser`]
-/// dispatch (Codex AF2) so the transient `shared` does not pin the
-/// returned `AnyMeta<'a>` lifetime. Faithful to the private `parse_borrowed`
-/// full path (APE.pm:121-172): sets `done_ape` and threads
-/// `shared.done_id3()` for the APE.pm:169 footer shift.
-pub(crate) fn parse_full_owned(data: &[u8], shared: &mut SharedFlags) -> Option<Meta<'static>> {
-  shared.set_done_ape(true);
-  let done_id3 = shared.done_id3().unwrap_or(0);
-  let plan = plan_ape(data, /* print_conv */ false, done_id3)?;
-  Some(meta_from_plan(plan))
-}
-
 /// Full APE parse WITH the embedded ID3 chain (APE.pm:119-241 faithful) —
 /// the typed counterpart of the engine `ProcessApe::process`. Runs:
 ///
