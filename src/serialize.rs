@@ -1,5 +1,16 @@
-//! Serialize a tag stream to the `exiftool -j -G1` JSON document via
-//! **standard `serde_json`**.
+//! Serialize a [`crate::value::Metadata`] tag stream to the `exiftool -j -G1`
+//! JSON document via **standard `serde_json`**.
+//!
+//! **Role after the sink-layer removal.** The PRODUCTION output path is now
+//! [`crate::parser::extract_info`] (detect → typed parse → serde-render of the
+//! typed `AnyMeta` via each Meta's `serialize_tags` into a
+//! [`crate::tagmap::TagMap`]). This module is the serializer for the
+//! [`crate::value::Metadata`] push-bag, which survives ONLY as INTERNAL STAGING
+//! (the bit-stream / ID3 / APE binary-data walks lift into typed Metas through
+//! it) — so [`render_document`] / [`to_exiftool_json`] here are the
+//! `Metadata`-staging serializer + the value-rendering TEST ORACLE (the
+//! `bitstream`/`convert` unit tests pin `TagValue` JSON shapes through them).
+//! They have no production output caller.
 //!
 //! We do NOT reproduce ExifTool's exact scalar tokens or its Group1 key order:
 //! the value-semantic [`crate::jsondiff`] comparator treats a different valid
