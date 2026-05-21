@@ -125,8 +125,15 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 //
 // The public top-level `parse_bytes` + per-format `parse_<fmt>` entry points
 // land here so callers don't need to traverse into `formats::<fmt>` for the
-// happy path. Re-exports of `XxxMeta` + `ProcessXxx` + `XxxError` from each
-// format module are kept feature-gated to match the per-format Cargo gates.
+// happy path. Per skill §6 (no module-name stutter), each format's typed
+// `Meta`/`Error`/`Context` types now use the bare names — so they CANNOT all
+// be re-exported at the crate root unaliased (`formats::moi::Meta` and
+// `formats::aac::Meta` would collide). The per-format typed surface is
+// therefore reached through the public [`formats`] module
+// (`exifast::formats::<fmt>::Meta`); only the parser-handle unit-structs
+// (`ProcessXxx`) are re-exported here (their names are unique). The universal
+// [`parse_bytes`] / [`AnyMeta`] / [`AnyError`] surface and every
+// `parse_<fmt>` fn stay at the crate root.
 
 /// The optional serde [`Serialize`](serde::Serialize) view of a typed
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
@@ -136,10 +143,14 @@ pub use parser_new::{
   AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags,
 };
 
-// Per-format public typed re-exports. Each module's `XxxMeta<'a>` + accessor
-// methods are the lib-first surface; the `ProcessXxx` unit-struct is the
-// parser handle (carried in `AnyParser`); `XxxError` is the fatal-error
-// variant (carried in `AnyError`).
+// Per-format parser-handle re-exports. The `ProcessXxx` unit-struct is the
+// parser handle (carried in `AnyParser`). The typed `Meta<'a>` (+ accessor
+// methods) and the fatal-error `Error` (carried in `AnyError`) are reached via
+// `exifast::formats::<fmt>::{Meta, Error}` — they are NOT re-exported at the
+// crate root because their bare §6 names would collide across formats.
+// (id3 keeps its `Id3*`/`Mp3*` axis prefixes and mpeg uses `Audio*`, but for a
+// uniform surface those per-format Meta/Error/Context types are also reached
+// only via the `formats` module, not the crate root.)
 #[cfg(feature = "aac")]
 pub use formats::aac::ProcessAac;
 #[cfg(feature = "aiff")]
@@ -155,18 +166,16 @@ pub use formats::dv::ProcessDv;
 #[cfg(feature = "flac")]
 pub use formats::flac::ProcessFlac;
 #[cfg(feature = "id3")]
-pub use formats::id3::{
-  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
-};
+pub use formats::id3::ProcessId3;
 // MP3 wrapper (Codex A-R2-1) — `mp3` feature pulls `mpeg-audio` + `ape`.
 #[cfg(feature = "mp3")]
-pub use formats::id3::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3};
+pub use formats::id3::ProcessMp3;
 #[cfg(feature = "moi")]
 pub use formats::moi::ProcessMoi;
 #[cfg(feature = "mpc")]
 pub use formats::mpc::ProcessMpc;
 #[cfg(feature = "mpeg-audio")]
-pub use formats::mpeg::{MpegAudioContext, MpegAudioError, MpegAudioMeta, ProcessMpegAudio};
+pub use formats::mpeg::ProcessMpegAudio;
 #[cfg(feature = "ogg")]
 pub use formats::ogg::ProcessOgg;
 #[cfg(feature = "red")]
@@ -338,20 +347,20 @@ pub fn parse_r3d(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`Id3Error`] (currently uninhabited).
+/// Returns the per-format [`formats::id3::Id3Error`] (currently uninhabited).
 #[cfg(feature = "id3")]
 pub fn parse_id3<'a>(
   bytes: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
-) -> core::result::Result<Option<Id3Meta<'a>>, Id3Error> {
+) -> core::result::Result<Option<formats::id3::Id3Meta<'a>>, formats::id3::Id3Error> {
   formats::id3::parse_id3_borrowed(bytes, shared, print_conv)
 }
 
 /// Parse an MP3 file (ID3 wrapper + MPEG audio chain + APE trailer)
 /// directly through the typed [`ProcessMp3`] parser, faithful to bundled
 /// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728). Only `bytes`
-/// flows into the returned [`Mp3Meta<'a>`] (which carries the ID3,
+/// flows into the returned [`formats::id3::Mp3Meta`] (which carries the ID3,
 /// MPEG-audio, and APE-trailer sub-Metas); it is `Some` for a valid
 /// MPEG-only MP3 (Codex BF1/CF1).
 ///
@@ -365,14 +374,14 @@ pub fn parse_id3<'a>(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`Mp3Error`].
+/// Returns the per-format [`formats::id3::Mp3Error`].
 #[cfg(feature = "mp3")]
 pub fn parse_mp3<'a>(
   bytes: &'a [u8],
   ext: Option<&str>,
-) -> core::result::Result<Option<Mp3Meta<'a>>, Mp3Error> {
+) -> core::result::Result<Option<formats::id3::Mp3Meta<'a>>, formats::id3::Mp3Error> {
   // `parse_mp3_borrowed` decouples the transient `shared` AND `ext` borrows
-  // from the returned `Mp3Meta<'a>` (which borrows only from `bytes`), so a
+  // from the returned `id3::Mp3Meta<'a>` (which borrows only from `bytes`), so a
   // local `SharedFlags` and a transient `ext` are both valid here.
   let mut shared = SharedFlags::new();
   formats::id3::parse_mp3_borrowed(bytes, ext, &mut shared)
@@ -469,13 +478,13 @@ pub fn parse_ogg(
 ///
 /// # Errors
 ///
-/// Returns the per-format [`MpegAudioError`] (currently uninhabited).
+/// Returns the per-format [`formats::mpeg::AudioError`] (currently uninhabited).
 #[cfg(feature = "mpeg-audio")]
 pub fn parse_mpeg_audio<'a>(
   bytes: &'a [u8],
   mp3: bool,
   ext: &str,
-) -> core::result::Result<Option<MpegAudioMeta<'a>>, MpegAudioError> {
+) -> core::result::Result<Option<formats::mpeg::AudioMeta<'a>>, formats::mpeg::AudioError> {
   formats::mpeg::parse_borrowed(bytes, mp3, ext)
 }
 
@@ -651,7 +660,7 @@ mod tests {
     }
   }
 
-  /// **Codex C-R2-2.** `parse_mp3`'s returned `Mp3Meta<'a>` is tied ONLY to
+  /// **Codex C-R2-2.** `parse_mp3`'s returned `id3::Mp3Meta<'a>` is tied ONLY to
   /// the byte buffer — a transient `ext` string can be dropped while the
   /// meta lives on. This compiles only if `ext` is on an independent
   /// (non-`'a`) lifetime. (The buffer is non-MP3 so the parse returns

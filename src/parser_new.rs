@@ -374,9 +374,9 @@ pub enum AnyMeta<'a> {
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::Meta<'a>),
   /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
-  /// `MpegAudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
+  /// `mpeg::AudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
   #[cfg(feature = "mpeg-audio")]
-  MpegAudio(crate::formats::mpeg::MpegAudioMeta<'a>),
+  MpegAudio(crate::formats::mpeg::AudioMeta<'a>),
   /// MPC (Phase F5 — Musepack SV7/SV8 audio).
   #[cfg(feature = "mpc")]
   Mpc(crate::formats::mpc::Meta<'a>),
@@ -817,7 +817,7 @@ pub enum AnyError {
   /// MPEG audio fatal-error wrapper.
   #[cfg(feature = "mpeg-audio")]
   #[error("MPEG-audio: {0}")]
-  MpegAudio(#[from] crate::formats::mpeg::MpegAudioError),
+  MpegAudio(#[from] crate::formats::mpeg::AudioError),
   /// MPC fatal-error wrapper.
   #[cfg(feature = "mpc")]
   #[error("MPC: {0}")]

@@ -5,9 +5,9 @@
 //! Faithful port of `Image::ExifTool::MPEG` (lib/Image/ExifTool/MPEG.pm) —
 //! AUDIO side only.
 //!
-//! A typed [`MpegAudioMeta<'a>`] is produced by the
+//! A typed [`AudioMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait with a per-format
-//! [`MpegAudioContext`] (data + start_offset + ext + shared flags). MPEG
+//! [`AudioContext`] (data + start_offset + ext + shared flags). MPEG
 //! audio is invoked internally by the MP3 file-type entry
 //! ([`crate::formats::id3::ProcessMp3`]) via
 //! [`ProcessMp3::process_with_start_offset`], which drives
@@ -20,7 +20,7 @@
 //! - `%MPEG::Audio` (MPEG.pm:23-256) — the 11-tag bit-field table for the
 //!   4-byte MPEG audio frame header.
 //! - `ProcessFrameHeader` (MPEG.pm:441-457) — direct bit-extract from the
-//!   32-bit big-endian header word into typed [`MpegAudioMeta`] fields
+//!   32-bit big-endian header word into typed [`AudioMeta`] fields
 //!   (Phase F4 supersedes the [`crate::bitstream::process_bit_stream_cond`]
 //!   path for the typed Meta).
 //! - `ParseMPEGAudio` (MPEG.pm:464-581) — sync-scan, header-validate,
@@ -149,7 +149,7 @@ pub fn write_lame_lowpass<W: core::fmt::Write + ?Sized>(
 /// (MPEG.pm:25-33) maps 0 → 2.5, 2 → 2, 3 → 1; raw 1 is the reserved
 /// version ID, which is rejected upstream by `check_header`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MpegAudioVersion {
+pub enum AudioVersion {
   /// raw=0 → "2.5".
   V2_5,
   /// raw=2 → "2".
@@ -158,7 +158,7 @@ pub enum MpegAudioVersion {
   V1,
 }
 
-impl MpegAudioVersion {
+impl AudioVersion {
   /// Decode the raw 2-bit field. Returns `None` for raw=1 (reserved); the
   /// header-validation gate ensures this is unreachable from `scan_for_header`.
   /// Lossless over the valid domain: `from_raw(v.raw()) == Some(v)` for every
@@ -215,7 +215,7 @@ impl MpegAudioVersion {
   }
 }
 
-impl core::fmt::Display for MpegAudioVersion {
+impl core::fmt::Display for AudioVersion {
   #[inline(always)]
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
@@ -530,7 +530,7 @@ impl core::fmt::Display for ModeExtension {
 /// Emphasis (Bit30-31). Raw 2-bit; PrintConv (MPEG.pm:247-255) maps 0 →
 /// "None", 1 → "50/15 ms", 2 → "reserved", 3 → "CCIT J.17". Raw=2 is
 /// validated as the "reserved emphasis" reject by `check_header`
-/// (MPEG.pm:484), so a parsed [`MpegAudioMeta`] never carries it.
+/// (MPEG.pm:484), so a parsed [`AudioMeta`] never carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Emphasis {
   /// raw=0 → "None".
@@ -948,7 +948,7 @@ impl core::fmt::Display for LameStereoMode {
 }
 
 // ===========================================================================
-// Typed Meta — `MpegAudioMeta<'a>`
+// Typed Meta — `AudioMeta<'a>`
 // ===========================================================================
 
 /// Typed MPEG audio metadata — the lib-first output of [`ProcessMpegAudio`].
@@ -962,16 +962,16 @@ impl core::fmt::Display for LameStereoMode {
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `MpegAudioMeta` borrows the LAME Encoder string from the
+/// **Lifetimes.** `AudioMeta` borrows the LAME Encoder string from the
 /// input buffer when it's a direct slice (LAME3.90+ 9-byte version or the
 /// pre-3.90 20-byte fallback) — held as [`Cow::Borrowed`]. Synthesized
 /// strings (`"RCA mp3PRO"`, `"Thomson mp3PRO <suffix>"`, `"Gogo (<3.0)"`)
 /// use [`Cow::Owned`].
 #[derive(Debug, Clone)]
-pub struct MpegAudioMeta<'a> {
+pub struct AudioMeta<'a> {
   // ───────────────────── Audio frame header (MPEG.pm:23-256) ─────────────────────
   /// Bit11-12 MPEGAudioVersion (MPEG.pm:25-33).
-  mpeg_audio_version: MpegAudioVersion,
+  mpeg_audio_version: AudioVersion,
   /// Bit13-14 AudioLayer (MPEG.pm:34-42).
   audio_layer: AudioLayer,
   /// Bit16-19 AudioBitrate (MPEG.pm:44-164) — post-ValueConv from the
@@ -1031,13 +1031,13 @@ pub struct MpegAudioMeta<'a> {
   lame_stereo_mode: Option<LameStereoMode>,
 }
 
-impl MpegAudioMeta<'_> {
+impl AudioMeta<'_> {
   // ── Audio frame header accessors ───────────────────────────────────────
 
   /// MPEGAudioVersion (Bit11-12).
   #[must_use]
   #[inline(always)]
-  pub const fn mpeg_audio_version(&self) -> MpegAudioVersion {
+  pub const fn mpeg_audio_version(&self) -> AudioVersion {
     self.mpeg_audio_version
   }
   /// AudioLayer (Bit13-14).
@@ -1185,11 +1185,7 @@ impl MpegAudioMeta<'_> {
 /// MPEG.pm:44-164 — AudioBitrate ValueConv hash chooser. Returns the bps
 /// for raw 1..14, `AudioBitrate::Free` for raw 0; raw 15 is rejected
 /// upstream by `check_header`.
-const fn audio_bitrate_lookup(
-  version: MpegAudioVersion,
-  layer: AudioLayer,
-  raw: u8,
-) -> AudioBitrate {
+const fn audio_bitrate_lookup(version: AudioVersion, layer: AudioLayer, raw: u8) -> AudioBitrate {
   // raw==0 ⇒ Free; raw==15 cannot reach this function (header validation rejects).
   if raw == 0 {
     return AudioBitrate::Free;
@@ -1199,27 +1195,27 @@ const fn audio_bitrate_lookup(
   // per the raw encoding (PrintConv inverts to display).
   let table: &[u32] = match (version, layer) {
     // MPEG.pm:44-68 — version 1 (V1), layer 1 (L1 display ⇒ raw L1).
-    (MpegAudioVersion::V1, AudioLayer::L1) => &[
+    (AudioVersion::V1, AudioLayer::L1) => &[
       32_000, 64_000, 96_000, 128_000, 160_000, 192_000, 224_000, 256_000, 288_000, 320_000,
       352_000, 384_000, 416_000, 448_000,
     ],
     // MPEG.pm:69-92 — version 1, layer 2.
-    (MpegAudioVersion::V1, AudioLayer::L2) => &[
+    (AudioVersion::V1, AudioLayer::L2) => &[
       32_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000, 224_000,
       256_000, 320_000, 384_000,
     ],
     // MPEG.pm:93-116 — version 1, layer 3.
-    (MpegAudioVersion::V1, AudioLayer::L3) => &[
+    (AudioVersion::V1, AudioLayer::L3) => &[
       32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000,
       224_000, 256_000, 320_000,
     ],
     // MPEG.pm:117-140 — version 2 or 2.5, layer 1.
-    (MpegAudioVersion::V2 | MpegAudioVersion::V2_5, AudioLayer::L1) => &[
+    (AudioVersion::V2 | AudioVersion::V2_5, AudioLayer::L1) => &[
       32_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 144_000, 160_000, 176_000,
       192_000, 224_000, 256_000,
     ],
     // MPEG.pm:141-164 — version 2 or 2.5, layer 2 or 3.
-    (MpegAudioVersion::V2 | MpegAudioVersion::V2_5, AudioLayer::L2 | AudioLayer::L3) => &[
+    (AudioVersion::V2 | AudioVersion::V2_5, AudioLayer::L2 | AudioLayer::L3) => &[
       8_000, 16_000, 24_000, 32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000,
       128_000, 144_000, 160_000,
     ],
@@ -1235,12 +1231,12 @@ const fn audio_bitrate_lookup(
 
 /// MPEG.pm:166-196 — SampleRate PrintConv hash chooser. Raw 0..2 only;
 /// raw==3 (reserved) rejected upstream by `check_header`.
-const fn sample_rate_lookup(version: MpegAudioVersion, raw: u8) -> Option<u32> {
+const fn sample_rate_lookup(version: AudioVersion, raw: u8) -> Option<u32> {
   // MPEG.pm:166-176 / :177-186 / :187-196 tables (3 entries each).
   let table: [u32; 3] = match version {
-    MpegAudioVersion::V1 => [44_100, 48_000, 32_000], // MPEG.pm:166-176
-    MpegAudioVersion::V2 => [22_050, 24_000, 16_000], // MPEG.pm:177-186
-    MpegAudioVersion::V2_5 => [11_025, 12_000, 8_000], // MPEG.pm:187-196
+    AudioVersion::V1 => [44_100, 48_000, 32_000], // MPEG.pm:166-176
+    AudioVersion::V2 => [22_050, 24_000, 16_000], // MPEG.pm:177-186
+    AudioVersion::V2_5 => [11_025, 12_000, 8_000], // MPEG.pm:187-196
   };
   match raw {
     0..=2 => Some(table[raw as usize]),
@@ -1341,10 +1337,10 @@ fn scan_for_header(data: &[u8], mp3: bool, ext: &str) -> Option<(u32, usize)> {
 /// `Bit<a>-<b>` is bits `[a..=b]` counting from MSB=0 of the 4-byte BE
 /// header. `process_bit_stream_cond` reads the word as 32 BE bits, so
 /// `Bit11-12` is `(word >> (31 - 12)) & 0x3` = `(word >> 19) & 0x3`.
-fn extract_header_fields(word: u32) -> Option<MpegAudioMeta<'static>> {
+fn extract_header_fields(word: u32) -> Option<AudioMeta<'static>> {
   // Bit11-12: bits [11..=12] of the 32-bit BE word = mask 0x0018_0000, shift 19.
   let version_raw = ((word >> 19) & 0x03) as u8;
-  let version = MpegAudioVersion::from_raw(version_raw)?;
+  let version = AudioVersion::from_raw(version_raw)?;
   // Bit13-14: mask 0x0006_0000, shift 17.
   let layer_raw = ((word >> 17) & 0x03) as u8;
   let layer = AudioLayer::from_raw(layer_raw)?;
@@ -1381,7 +1377,7 @@ fn extract_header_fields(word: u32) -> Option<MpegAudioMeta<'static>> {
   // Bit30-31: mask 0x0000_0003, shift 0.
   let emphasis_raw = (word & 0x03) as u8;
   let emphasis = Emphasis::from_raw(emphasis_raw);
-  Some(MpegAudioMeta {
+  Some(AudioMeta {
     mpeg_audio_version: version,
     audio_layer: layer,
     audio_bitrate,
@@ -1416,7 +1412,7 @@ fn extract_header_fields(word: u32) -> Option<MpegAudioMeta<'static>> {
 /// byte header match. Mutates the typed `meta` in place; any length /
 /// magic / state failure silently exits (Perl `last`) — leaving partial
 /// progress.
-fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut MpegAudioMeta<'a>) {
+fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta<'a>) {
   // MPEG.pm:501-502 — `($$et{MPEG_Vers}, $$et{MPEG_Mode})` must be defined.
   let v = meta.mpeg_audio_version.raw();
   let m = meta.channel_mode.raw();
@@ -1598,7 +1594,7 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Faithful port of `ProcessBinaryData` applied to `%MPEG::Lame` at
 /// `DirStart=$pos` with the buffer running to its end (MPEG.pm:568-573).
 /// Inlined here because `ProcessBinaryData` is otherwise unported.
-fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut MpegAudioMeta<'a>) {
+fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut AudioMeta<'a>) {
   let read_byte = |offset: usize| -> Option<u8> {
     let abs = pos.checked_add(offset)?;
     if abs < buff.len() {
@@ -1626,7 +1622,7 @@ fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut MpegAudioMeta<'a>)
 }
 
 // ===========================================================================
-// `MpegAudioContext` — per-format Context<'a> (spec §6.4)
+// `AudioContext` — per-format Context<'a> (spec §6.4)
 // ===========================================================================
 
 /// Per-format input view threaded into [`ProcessMpegAudio::parse`].
@@ -1643,7 +1639,7 @@ fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut MpegAudioMeta<'a>)
 /// the spec §6.4 chained-format Context; the MPEG audio parser itself
 /// neither reads nor writes any shared flag (the cross-format flags
 /// `DoneID3` / `DoneAPE` are touched by the ID3/APE pair, not here).
-pub struct MpegAudioContext<'a> {
+pub struct AudioContext<'a> {
   data: &'a [u8],
   /// MPEG.pm:466 `$mp3` — REQUIRE Layer III when set. Set by the caller
   /// from the file extension (ID3.pm:1715-1717: `$ext eq 'MUS' ? 0 : 1`).
@@ -1659,7 +1655,7 @@ pub struct MpegAudioContext<'a> {
   shared: &'a mut SharedFlags,
 }
 
-impl<'a> MpegAudioContext<'a> {
+impl<'a> AudioContext<'a> {
   /// Construct a context from an already-bounded byte slice + the file
   /// extension (uppercased; the empty string disables the
   /// validation-reject retry) + the caller-derived `mp3` flag.
@@ -1713,17 +1709,17 @@ impl parser_sealed::Sealed for ProcessMpegAudio {}
 impl FormatParser for ProcessMpegAudio {
   /// GAT: the Meta borrows its `encoder` field from the input `'a` (Codex
   /// AF2).
-  type Meta<'a> = MpegAudioMeta<'a>;
-  type Context<'a> = MpegAudioContext<'a>;
-  type Error = MpegAudioError;
+  type Meta<'a> = AudioMeta<'a>;
+  type Context<'a> = AudioContext<'a>;
+  type Error = AudioError;
 
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpegAudioError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AudioError> {
     parse_inner(ctx.data, ctx.mp3, ctx.ext)
   }
 }
 
 /// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`MpegAudioMeta`] that borrows from the input buffer (Encoder field).
+/// [`AudioMeta`] that borrows from the input buffer (Encoder field).
 ///
 /// # Errors
 ///
@@ -1733,19 +1729,19 @@ pub fn parse_borrowed<'a>(
   data: &'a [u8],
   mp3: bool,
   ext: &str,
-) -> Result<Option<MpegAudioMeta<'a>>, MpegAudioError> {
+) -> Result<Option<AudioMeta<'a>>, AudioError> {
   parse_inner(data, mp3, ext)
 }
 
-/// Inner parser — produces a borrow-from-input [`MpegAudioMeta`] (the
+/// Inner parser — produces a borrow-from-input [`AudioMeta`] (the
 /// `encoder` field borrows from `data`). The [`FormatParser::Meta`] GAT
-/// (`type Meta<'a> = MpegAudioMeta<'a>`) returns this borrowed form
+/// (`type Meta<'a> = AudioMeta<'a>`) returns this borrowed form
 /// directly into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
 fn parse_inner<'a>(
   data: &'a [u8],
   mp3: bool,
   ext: &str,
-) -> Result<Option<MpegAudioMeta<'a>>, MpegAudioError> {
+) -> Result<Option<AudioMeta<'a>>, AudioError> {
   // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Returns `None` ⇒ Ok(None)
   // (Perl `return 0` BEFORE `$et->SetFileType()` at MPEG.pm:496).
   let (word, pos_after_header) = match scan_for_header(data, mp3, ext) {
@@ -1774,7 +1770,7 @@ fn parse_inner<'a>(
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl MpegAudioMeta<'_> {
+impl AudioMeta<'_> {
   /// Emit MPEG tags into the writer in `%MPEG::Audio` walk order
   /// (Bit11-12 → … → Bit30-31) then `%MPEG::Xing` keys 1..6 then
   /// `%MPEG::Lame` offsets 9/10/20/24 — faithful to MPEG.pm:23-256 +
@@ -1794,9 +1790,9 @@ impl MpegAudioMeta<'_> {
     // -n (raw): u8 of the on-disk 2-bit field.
     if print_conv {
       match self.mpeg_audio_version {
-        MpegAudioVersion::V2_5 => out.write_f64(GROUP, "MPEGAudioVersion", 2.5)?,
-        MpegAudioVersion::V2 => out.write_u64(GROUP, "MPEGAudioVersion", 2)?,
-        MpegAudioVersion::V1 => out.write_u64(GROUP, "MPEGAudioVersion", 1)?,
+        AudioVersion::V2_5 => out.write_f64(GROUP, "MPEGAudioVersion", 2.5)?,
+        AudioVersion::V2 => out.write_u64(GROUP, "MPEGAudioVersion", 2)?,
+        AudioVersion::V1 => out.write_u64(GROUP, "MPEGAudioVersion", 1)?,
       }
     } else {
       out.write_u64(
@@ -2000,7 +1996,7 @@ impl MpegAudioMeta<'_> {
 }
 
 // ===========================================================================
-// `MpegAudioError` — Rust-level fatal modes (currently none)
+// `AudioError` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
 /// Rust-level fatal modes for MPEG audio parsing. Currently empty — every
@@ -2013,7 +2009,7 @@ impl MpegAudioMeta<'_> {
 /// change.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MpegAudioError {}
+pub enum AudioError {}
 
 // ===========================================================================
 // `ProcessMp3` — raw MPEG-audio entry preserving R5 fix API
@@ -2117,7 +2113,7 @@ mod tests {
   #[test]
   fn extract_header_fields_decodes_v1_l3_128k_441_js() {
     let m = extract_header_fields(0xfffb_904c).expect("typed extraction");
-    assert_eq!(m.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(m.mpeg_audio_version(), AudioVersion::V1);
     assert_eq!(m.audio_layer(), AudioLayer::L3);
     assert_eq!(m.audio_bitrate(), AudioBitrate::Known(128_000));
     assert_eq!(m.sample_rate_raw(), 0);
@@ -2156,7 +2152,7 @@ mod tests {
     let meta = parse_borrowed(&bytes, true, "MP3")
       .expect("ok")
       .expect("parsed");
-    assert_eq!(meta.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(meta.mpeg_audio_version(), AudioVersion::V1);
     assert_eq!(meta.audio_layer(), AudioLayer::L3);
     assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
     assert_eq!(meta.sample_rate_hz(), Some(44_100));
@@ -2550,11 +2546,11 @@ mod tests {
     )
     .expect("read MP3.mp3 fixture");
     let mut shared = SharedFlags::new();
-    let ctx = MpegAudioContext::new(&bytes, "MP3", true, &mut shared);
+    let ctx = AudioContext::new(&bytes, "MP3", true, &mut shared);
     let meta = <ProcessMpegAudio as FormatParser>::parse(&ProcessMpegAudio, ctx)
       .expect("ok")
       .expect("parsed");
-    assert_eq!(meta.mpeg_audio_version(), MpegAudioVersion::V1);
+    assert_eq!(meta.mpeg_audio_version(), AudioVersion::V1);
     assert_eq!(meta.audio_layer(), AudioLayer::L3);
     assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
   }
@@ -2580,12 +2576,8 @@ mod tests {
   fn enum_lossless_roundtrip_over_valid_domain() {
     // Version / Layer: Option-returning (reserved raw rejected) — round-trip
     // holds for every constructible variant.
-    for v in [
-      MpegAudioVersion::V2_5,
-      MpegAudioVersion::V2,
-      MpegAudioVersion::V1,
-    ] {
-      assert_eq!(MpegAudioVersion::from_raw(v.raw()), Some(v));
+    for v in [AudioVersion::V2_5, AudioVersion::V2, AudioVersion::V1] {
+      assert_eq!(AudioVersion::from_raw(v.raw()), Some(v));
     }
     for l in [AudioLayer::L3, AudioLayer::L2, AudioLayer::L1] {
       assert_eq!(AudioLayer::from_raw(l.raw()), Some(l));
@@ -2628,7 +2620,7 @@ mod tests {
   fn enum_display_routes_through_single_source() {
     // Version uses as_str; Layer Display is the descriptive name (distinct
     // from the numeric `display()` used in the byte-exact emission).
-    assert_eq!(MpegAudioVersion::V2_5.to_string(), "2.5");
+    assert_eq!(AudioVersion::V2_5.to_string(), "2.5");
     assert_eq!(AudioLayer::L3.to_string(), "Layer III");
     assert_eq!(AudioLayer::L3.display(), 3); // numeric form unchanged
     // print_conv-backed enums route Display through print_conv().
@@ -2655,9 +2647,9 @@ mod tests {
 
   #[test]
   fn version_layer_channel_predicates() {
-    assert!(MpegAudioVersion::V2_5.is_v2_5());
-    assert!(MpegAudioVersion::V2.is_v2());
-    assert!(MpegAudioVersion::V1.is_v1());
+    assert!(AudioVersion::V2_5.is_v2_5());
+    assert!(AudioVersion::V2.is_v2());
+    assert!(AudioVersion::V1.is_v1());
     assert!(AudioLayer::L1.is_l1() && AudioLayer::L2.is_l2() && AudioLayer::L3.is_l3());
     assert!(ChannelMode::Stereo.is_stereo());
     assert!(ChannelMode::SingleChannel.is_single_channel());

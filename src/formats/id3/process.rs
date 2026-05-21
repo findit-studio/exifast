@@ -704,7 +704,7 @@ pub struct Mp3Meta<'a> {
   /// Optional typed MPEG-audio sub-Meta — present when an MPEG audio frame
   /// sync was found in the scan window (ID3.pm:1696-1719
   /// `ParseMPEGAudio`). Borrows its `encoder` field from the input.
-  mpeg: Option<crate::formats::mpeg::MpegAudioMeta<'a>>,
+  mpeg: Option<crate::formats::mpeg::AudioMeta<'a>>,
   /// Optional typed APE-trailer sub-Meta — present when the APE-trailer
   /// fallback (ID3.pm:1722-1727 `APE::ProcessAPE`) found an APETAGEX
   /// footer. `'a` is phantom (APE Meta owns its data).
@@ -726,7 +726,7 @@ impl<'a> Mp3Meta<'a> {
   /// Optional typed MPEG-audio sub-Meta (frame header + Xing/LAME tail).
   #[must_use]
   #[inline(always)]
-  pub const fn mpeg(&self) -> Option<&crate::formats::mpeg::MpegAudioMeta<'a>> {
+  pub const fn mpeg(&self) -> Option<&crate::formats::mpeg::AudioMeta<'a>> {
     self.mpeg.as_ref()
   }
 
@@ -973,7 +973,7 @@ fn parse_mp3_typed<'a>(
   let ext_str = ext.unwrap_or("");
   let post_id3 = data.get(hdr_end..).unwrap_or(&[]);
   let bounded = &post_id3[..scan_len.min(post_id3.len())];
-  // `MpegAudioError` is uninhabited; the `Ok(None)` path covers "no sync".
+  // `mpeg::AudioError` is uninhabited; the `Ok(None)` path covers "no sync".
   let mpeg = crate::formats::mpeg::parse_borrowed(bounded, mp3_flag, ext_str)
     .ok()
     .flatten();
@@ -1707,7 +1707,7 @@ mod tests {
     let mpeg = meta.mpeg().expect("MPEG sub-Meta populated");
     assert_eq!(
       mpeg.mpeg_audio_version(),
-      crate::formats::mpeg::MpegAudioVersion::V1
+      crate::formats::mpeg::AudioVersion::V1
     );
     assert_eq!(mpeg.audio_layer(), crate::formats::mpeg::AudioLayer::L3);
     // Sink emits MPEG:* tags.
