@@ -2086,6 +2086,98 @@ mod tests {
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Codex BF2 — Id3Meta::sink must honor `print_conv` (-n support).
+  // The stage-and-replay used to hardcode `print_conv_enabled = true` and
+  // `Id3Meta::sink` ignored its `print_conv` arg, so `sink(false)` wrongly
+  // emitted PrintConv strings. Now the typed parse stages in the requested
+  // mode and the sink honors it. Compared against bundled `exiftool -j -n`.
+  // -------------------------------------------------------------------------
+
+  /// ID3v1 Genre %genre PrintConv (ID3.pm:371-375): `-j` emits "Hip-Hop",
+  /// `-n` emits the raw byte `7`. Bundled `exiftool -j -n` on an
+  /// ID3v1-genre-7 file emits `"ID3v1:Genre": 7`.
+  #[test]
+  fn id3_typed_sink_n_mode_emits_raw_genre_byte() {
+    let mut data: Vec<u8> = vec![0; 256];
+    data.extend_from_slice(&build_id3v1_block()); // genre byte = 7 (Hip-Hop)
+
+    // -j mode: parse + sink in PrintConv mode → "Hip-Hop".
+    let meta_j = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
+    let mut wj = crate::sink::MapTagWriter::new();
+    meta_j.sink(true, &mut wj).unwrap();
+    assert_eq!(
+      wj.get("ID3v1", "Genre").map(crate::sink::MapValue::as_str),
+      Some("Hip-Hop".into())
+    );
+
+    // -n mode: parse + sink in raw mode → "7" (the raw genre byte),
+    // matching bundled `exiftool -j -n`.
+    let meta_n = parse_id3_borrowed(&data, None, false)
+      .expect("ok")
+      .expect("found");
+    let mut wn = crate::sink::MapTagWriter::new();
+    meta_n.sink(false, &mut wn).unwrap();
+    assert_eq!(
+      wn.get("ID3v1", "Genre").map(crate::sink::MapValue::as_str),
+      Some("7".into()),
+      "-n must emit the raw genre byte, not the PrintConv string (Codex BF2)"
+    );
+  }
+
+  /// ID3v2 TLEN ValueConv/PrintConv split (ID3.pm:592-595): TLEN `"7000"`
+  /// ms → ValueConv `7` (s) → PrintConv `"7 s"`. Bundled `exiftool -j`
+  /// emits `"Length": "7 s"`; `-j -n` emits `"Length": 7`.
+  #[test]
+  fn id3_typed_sink_n_mode_emits_raw_tlen_seconds() {
+    // ID3v2.3 directory carrying a single TLEN = "7000" frame.
+    let mut frame: Vec<u8> = Vec::new();
+    frame.extend_from_slice(b"TLEN");
+    frame.extend_from_slice(&5u32.to_be_bytes()); // frame size
+    frame.extend_from_slice(&[0, 0]); // flags
+    frame.push(0); // text encoding = Latin-1
+    frame.extend_from_slice(b"7000");
+    let size = frame.len() as u32;
+    let ss = [
+      ((size >> 21) & 0x7f) as u8,
+      ((size >> 14) & 0x7f) as u8,
+      ((size >> 7) & 0x7f) as u8,
+      (size & 0x7f) as u8,
+    ];
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"ID3");
+    data.extend_from_slice(&[0x03, 0x00, 0x00]); // v2.3, no flags
+    data.extend_from_slice(&ss);
+    data.extend_from_slice(&frame);
+
+    // -j: "7 s" (PrintConv).
+    let meta_j = parse_id3_borrowed(&data, None, true)
+      .expect("ok")
+      .expect("found");
+    let mut wj = crate::sink::MapTagWriter::new();
+    meta_j.sink(true, &mut wj).unwrap();
+    assert_eq!(
+      wj.get("ID3v2_3", "Length")
+        .map(crate::sink::MapValue::as_str),
+      Some("7 s".into())
+    );
+
+    // -n: 7 (raw ValueConv seconds), matching bundled `exiftool -j -n`.
+    let meta_n = parse_id3_borrowed(&data, None, false)
+      .expect("ok")
+      .expect("found");
+    let mut wn = crate::sink::MapTagWriter::new();
+    meta_n.sink(false, &mut wn).unwrap();
+    assert_eq!(
+      wn.get("ID3v2_3", "Length")
+        .map(crate::sink::MapValue::as_str),
+      Some("7".into()),
+      "-n must emit raw ValueConv seconds, not the PrintConv \"7 s\" (Codex BF2)"
+    );
+  }
+
   #[test]
   fn id3_meta_picture_extracts_apic_payload() {
     // Build an ID3v2.3 ALBUM-only tag plus an APIC frame.
