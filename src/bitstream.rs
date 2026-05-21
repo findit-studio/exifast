@@ -399,14 +399,16 @@ pub fn process_bit_stream_cond(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
-    value::Group,
-  };
-  // `serialize` is gated on `feature = "json"` (spec §4); tests below that
-  // use `to_exiftool_json` are correspondingly gated.
+  use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv};
+  // `serialize` is gated on `feature = "json"` (spec §4); tests below that use
+  // `to_exiftool_json` are correspondingly gated — and `value::Group` is used
+  // ONLY by those json-gated tests (the `Metadata::push` + serialize cases),
+  // so it shares the gate to keep a `--features std,id3` test build warning-
+  // clean (Codex A-R4-2).
   #[cfg(feature = "json")]
   use crate::serialize::to_exiftool_json;
+  #[cfg(feature = "json")]
+  use crate::value::Group;
 
   // Faithful AAC::Main subset for the synthetic header
   // [0xFF,0xF1,0x50,0x80,0x00,0x00,0x00]:

@@ -1394,6 +1394,10 @@ mod tests {
   // and `extract_info` runs its real candidate→process(&mut m)→finalize
   // block against the outer Metadata directly (faithful to Perl
   // `&$func($self, \%dirInfo)`, ExifTool.pm:3066).
+  // Called ONLY by the `#[cfg(feature = "json")]` serialized-output tests
+  // below, so gate it too (Codex A-R4-2: keep a `--features std,id3` test
+  // build warning-clean — the injected-parser seam is json-output-only).
+  #[cfg(feature = "json")]
   fn accepting_but_erroring(ctx: &mut ParseContext<'_>) -> bool {
     // Faithful to every real accepting parser: `$et->SetFileType()`
     // BEFORE pushing format tags (e.g. AAC.pm:107). All-`None` = the
@@ -1415,7 +1419,13 @@ mod tests {
   /// even on assertion panic — keeping this thread's seam state clean for
   /// any subsequent test (thread-locals are per-thread, but a panic must
   /// not leak overrides either way).
+  ///
+  /// The whole injected-parser seam is exercised ONLY by `#[cfg(feature =
+  /// "json")]` serialized-output tests, so gate it on `json` to keep a
+  /// `--features std,id3` test build warning-clean (Codex A-R4-2).
+  #[cfg(feature = "json")]
   struct InjectionGuard;
+  #[cfg(feature = "json")]
   impl Drop for InjectionGuard {
     fn drop(&mut self) {
       INJECTED_PARSERS.with(|c| c.borrow_mut().clear());
@@ -1427,6 +1437,7 @@ mod tests {
   /// (the file-scoped first-call-wins test uses TWO: an early file-type's
   /// parser AND a later file-type's parser — both from the same
   /// `detection_candidates` iterator on the same input).
+  #[cfg(feature = "json")]
   fn inject(file_type: &'static str, parser: EngineEntry) {
     INJECTED_PARSERS.with(|c| c.borrow_mut().push((file_type, parser)));
   }
@@ -1487,6 +1498,7 @@ mod tests {
   // rejection exhausts the loop and the post-loop finalization Error
   // fires — yet `File:FileType=AAC` must remain (no rollback). This
   // FAILS the moment anyone re-introduces a trial-and-rollback model.
+  #[cfg(feature = "json")]
   fn rejecting_after_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
     // Faithful to MPEG.pm:675: `$et->SetFileType()` (no-arg ⇒ detected
     // type) BEFORE reading/rejecting.
@@ -1546,6 +1558,7 @@ mod tests {
   // `set_file_type` (no real parser does this, but ExifTool's accept is
   // keyed ONLY on the truthy Process return). Same `INJECTED_PARSERS`
   // seam as Part B.
+  #[cfg(feature = "json")]
   fn accepting_no_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
     // One tag, NO set_file_type, NO error — then `return 1`.
     ctx
@@ -1632,12 +1645,14 @@ mod tests {
   // `fk2`) and accepts. Exactly one `File:FileType` (= `"AAC"`) must
   // remain on `m`, with the second parser's marker tag present and no
   // finalization Error (the second parser accepted).
+  #[cfg(feature = "json")]
   fn aac_set_then_reject(ctx: &mut ParseContext<'_>) -> bool {
     // Faithful to MPEG.pm:675 — `$et->SetFileType` BEFORE rejecting.
     ctx.set_file_type(Some("AAC"), None, None);
     false // MPEG.pm:678 style `or return 0`
   }
 
+  #[cfg(feature = "json")]
   fn wv_overwrite_and_accept(ctx: &mut ParseContext<'_>) -> bool {
     // Try to set a DIFFERENT File:* triplet — must be a no-op because
     // candidate 1 already engaged first-call-wins on `m`. If exifast

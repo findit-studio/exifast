@@ -22,6 +22,11 @@
 //! `MetaSinker::sink` for the format tags on top and compare to the golden. The
 //! `JsonTagWriter`'s own `%noDups` first-wins dedup (`exiftool:2950-2951`)
 //! makes the lift + sink composition order-insensitive.
+//!
+//! Gated on `feature = "json"` (Codex A-R4-2): imports the `json`-gated
+//! `jsondiff`, which `std` does not imply, so a `--features std,id3` test
+//! build skips this whole file.
+#![cfg(feature = "json")]
 
 use exifast::TagWriter;
 use exifast::filetype::detection_candidates;

@@ -1,6 +1,10 @@
 //! End-to-end engine smoke: build Metadata via the public API, run a value
 //! through the conversion runtime, serialize, and confirm our own jsondiff
 //! treats the output as equivalent to itself. No format parser involved.
+//!
+//! Gated on `feature = "json"` (Codex A-R4-2): imports the `json`-gated
+//! `serialize` + `jsondiff`, which `std` does not imply.
+#![cfg(feature = "json")]
 use exifast::{
   Group, Metadata, TagValue,
   convert::apply,

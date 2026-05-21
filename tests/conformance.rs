@@ -2,6 +2,12 @@
 //! to the bundled-ExifTool golden for every ported fixture, for both the
 //! default (`-j -G1 -struct`) and `-n` snapshots. One case per ported
 //! format — add a `#[test]` per format as it lands (FORMATS.md order).
+//!
+//! Gated on `feature = "json"` (Codex A-R4-2): the suite imports the
+//! `json`-gated `jsondiff`, and `std` does NOT imply `json`, so a
+//! `--features std,id3` test build must skip this whole file (the lib still
+//! builds; this is a json-output conformance check).
+#![cfg(feature = "json")]
 use exifast::{jsondiff::json_equivalent, parser::extract_info};
 
 /// Assert exifast's output for `fixture` is equivalent to the committed

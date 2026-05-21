@@ -528,7 +528,15 @@ impl fmt::Debug for JsonTagWriter {
 // Tests
 // ===========================================================================
 
-#[cfg(test)]
+// This module is the writer-vs-serialize byte-exactness parity suite: EVERY
+// test asserts `JsonTagWriter::finish` == `to_exiftool_json(&Metadata)`, so
+// the whole module depends on `crate::serialize` (gated on `feature = "json"`,
+// which `std` does NOT imply). Gate it on `json` so a `--features std,id3`
+// test build — where `json_writer` itself compiles (alloc-gated) but
+// `serialize`/`jsondiff` do not — still BUILDS its non-json tests (Codex
+// A-R4-2). The same gating pattern the `bitstream` test module already uses
+// for its `to_exiftool_json` cases.
+#[cfg(all(test, feature = "json"))]
 mod tests {
   use super::*;
   use crate::serialize::to_exiftool_json;
