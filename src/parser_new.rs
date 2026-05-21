@@ -565,6 +565,95 @@ impl MetaSinker for AnyMeta<'_> {
   }
 }
 
+/// A mode-carrying [`Serialize`](serde::Serialize) view of a typed
+/// [`AnyMeta`]: the `-j` (PrintConv) vs `-n` (raw ValueConv) toggle that the
+/// CLI applies, packaged so a caller can render the typed parse result to JSON
+/// with `serde_json` directly — `serde_json::to_string(&Rendered::new(&meta,
+/// true))`.
+///
+/// It serializes the Meta's FORMAT tags as a flat JSON object of
+/// `"<Group1>:<Name>": value` entries (standard `serde_json` scalars; the
+/// value-semantic [`crate::jsondiff`] comparator treats token style as
+/// irrelevant). This is the typed-library counterpart of the engine's
+/// [`crate::parser::extract_info`] — it does NOT add the orchestration tags
+/// (`SourceFile`, the `File:*` triplet, `ExifTool:ExifToolVersion`); those are
+/// the engine's responsibility (`extract_info` emits them around the format
+/// tags). Chained Metas (Mp3 wrapping ID3/MPEG/APE, etc.) flatten all their
+/// sub-Metas' tags into the one object via the [`MetaSinker`] chain.
+///
+/// `#[non_exhaustive]`-free (a plain value wrapper); construct via
+/// [`Rendered::new`]. D8 convention: no public fields.
+#[cfg(all(feature = "serde", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
+#[derive(Debug, Clone, Copy)]
+pub struct Rendered<'a, 'm> {
+  meta: &'a AnyMeta<'m>,
+  print_conv: bool,
+}
+
+#[cfg(all(feature = "serde", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
+impl<'a, 'm> Rendered<'a, 'm> {
+  /// Wrap `meta` for serialization in the given mode (`print_conv = true` ⇒
+  /// `-j` PrintConv strings; `false` ⇒ `-n` raw post-ValueConv scalars).
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
+    Self { meta, print_conv }
+  }
+
+  /// The wrapped Meta.
+  #[must_use]
+  #[inline(always)]
+  pub const fn meta(&self) -> &AnyMeta<'m> {
+    self.meta
+  }
+
+  /// The render mode (`true` = `-j` PrintConv, `false` = `-n` raw).
+  #[must_use]
+  #[inline(always)]
+  pub const fn print_conv(&self) -> bool {
+    self.print_conv
+  }
+}
+
+// Optional serde `Serialize` for `Rendered` (skill §8: one anonymous gated
+// const block). It drives the existing `MetaSinker::sink` to collect the Meta's
+// tags into a `Vec<Tag>` (the same emission the engine uses), then serializes
+// them as a flat `"<Group1>:<Name>": value` object via `TagValue`'s own
+// `Serialize`. `%noDups` first-wins on the family1 token mirrors the document
+// renderer. Reusing `sink` keeps the -j/-n logic in ONE place (the per-Meta
+// `MetaSinker` impls), not duplicated here.
+#[cfg(all(feature = "serde", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
+const _: () = {
+  use crate::json_writer::JsonTagWriter;
+  use serde::ser::{Serialize, SerializeMap, Serializer};
+  use std::collections::BTreeSet;
+  use std::string::String;
+
+  impl Serialize for Rendered<'_, '_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      // Collect the Meta's tags via the SAME `MetaSinker::sink` the engine
+      // drives (so the -j/-n choice + chain flattening live in one place).
+      // The writer's `SourceFile` is unused here — `Rendered` emits only the
+      // format tags, not the orchestration triplet.
+      let mut w = JsonTagWriter::new("");
+      // `sink` is infallible (`Infallible` error), so this never fails.
+      let _ = self.meta.sink(self.print_conv, &mut w);
+      let mut map = s.serialize_map(None)?;
+      let mut seen: BTreeSet<String> = BTreeSet::new();
+      for (group, name, value) in w.records() {
+        let token = std::format!("{}:{}", group.family1(), name);
+        if seen.insert(token.clone()) {
+          map.serialize_entry(&token, value)?;
+        }
+      }
+      map.end()
+    }
+  }
+};
+
 // ===========================================================================
 // AnyError — closed-set error from `AnyParser::parse_any` + `parse_bytes`
 // ===========================================================================
@@ -1391,6 +1480,59 @@ mod tests {
     fn _check_any_error(e: &AnyError) {
       _accepts_display(e);
     }
+  }
+
+  /// `Rendered` serializes a typed `AnyMeta`'s FORMAT tags to a flat
+  /// `"<Group1>:<Name>": value` JSON object via `serde_json`, honouring the
+  /// `-j`/`-n` mode, with NO orchestration triplet (SourceFile/File:*/version).
+  /// Driven through a real AAC fixture so the chain (sink → records → serde)
+  /// is exercised end to end.
+  #[cfg(all(feature = "json", feature = "aac"))]
+  #[test]
+  fn rendered_serializes_meta_format_tags_both_modes() {
+    use crate::jsondiff::json_equivalent;
+    use crate::parser_new::Rendered;
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/AAC.aac"
+    ))
+    .expect("read AAC.aac fixture");
+    let parser = any_parser_for("AAC").expect("AAC feature enabled");
+    let mut shared = SharedFlags::new();
+    let meta = parser
+      .parse_any(&data, &mut shared, Some("AAC"))
+      .expect("parse ok")
+      .expect("AAC recognized");
+
+    // -j (PrintConv): a flat object of AAC:* tags; no SourceFile / File:* /
+    // ExifTool:* orchestration (those are the engine's job, not `Rendered`'s).
+    let j = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize -j");
+    assert!(j.starts_with('{') && j.ends_with('}'), "flat object: {j}");
+    assert!(!j.contains("SourceFile"), "no orchestration tags: {j}");
+    let v: serde_json::Value = serde_json::from_str(&j).expect("valid JSON");
+    let obj = v.as_object().expect("object");
+    assert!(
+      obj.keys().all(|k| k.starts_with("AAC:")),
+      "only AAC:* format tags: {j}"
+    );
+    // The flat object is value-equivalent to the AAC:* slice of the engine's
+    // full document (a strict subset check via a hand-picked known tag).
+    assert!(
+      obj.contains_key("AAC:SampleRate"),
+      "AAC:SampleRate present: {j}"
+    );
+
+    // -n (raw): same key set, values are the raw post-ValueConv scalars.
+    let n = serde_json::to_string(&Rendered::new(&meta, false)).expect("serialize -n");
+    let vn: serde_json::Value = serde_json::from_str(&n).expect("valid JSON");
+    assert_eq!(
+      v.as_object().unwrap().len(),
+      vn.as_object().unwrap().len(),
+      "-j and -n carry the same tag set"
+    );
+    // `Rendered` is value-stable: serializing twice yields equivalent JSON.
+    let j2 = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize again");
+    json_equivalent(&j, &j2).expect("Rendered is deterministic");
   }
 }
 

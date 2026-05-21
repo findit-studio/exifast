@@ -3,9 +3,10 @@
 //! `exifast`: a faithful Rust port of ExifTool's metadata reader.
 //!
 //! Lib-first design — the primary API exposes typed `XxxMeta<'a>` values per
-//! format (see [`formats`](crate::formats)). Byte-exact JSON output vs
-//! bundled `perl exiftool` is a secondary path derived from the typed Meta
-//! via the [`MetaSinker`](crate::parser_new::MetaSinker) trait.
+//! format (see [`formats`](crate::formats)). VALUE-equivalent JSON output vs
+//! bundled `perl exiftool` is a secondary path (standard `serde_json`): the
+//! engine renders via [`parser::extract_info`], and a typed `AnyMeta` can be
+//! serialized directly with the optional [`Rendered`](crate::Rendered) wrapper.
 //!
 //! # Usage — universal dispatch
 //!
@@ -87,11 +88,11 @@ pub mod datetime;
 pub mod error;
 pub mod filetype;
 pub mod formats;
-// `jsondiff` and `serialize` are the JSON emitter + golden-diff oracle: they
-// unconditionally depend on `serde_json` (and `serde`). They are gated on
-// the `json` feature (spec §4: `json = ["alloc", "dep:serde_json", "dep:serde", ...]`).
-// Library callers without `json` get the typed-Meta API path only; CLI
-// JSON emission requires the feature.
+// `jsondiff` (value-semantic golden-diff oracle) and `serialize` (the
+// `serde_json` document renderer) depend on `serde_json` + `serde`, gated on
+// the `json` feature (`json = ["serde", "alloc", "dep:serde_json", "dep:serde"]`).
+// Library callers without `json` get the typed-Meta API path only; the optional
+// `serde` feature alone provides the `Serialize` impls (TagValue / `Rendered`).
 // The engine's `$$et` value sink: a `TagWriter` that buffers a `Vec<Tag>`
 // (cross-format `$$et` state, FoundTag last-wins, family0-override). Gated on
 // `alloc` because the always-compiled parser/format engine emits through it.
@@ -129,6 +130,10 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 // happy path. Re-exports of `XxxMeta` + `ProcessXxx` + `XxxError` from each
 // format module are kept feature-gated to match the per-format Cargo gates.
 
+/// The optional serde [`Serialize`](serde::Serialize) view of a typed
+/// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
+#[cfg(all(feature = "serde", feature = "alloc"))]
+pub use parser_new::Rendered;
 pub use parser_new::{AnyError, AnyMeta, AnyParser, MetaSinker, SharedFlags, TagWriter};
 
 // Per-format public typed re-exports. Each module's `XxxMeta<'a>` + accessor
