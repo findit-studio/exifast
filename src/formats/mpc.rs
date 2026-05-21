@@ -602,43 +602,61 @@ impl FormatParser for ProcessMpc {
   ///
   /// Reads the 32-byte MP+ header, validates the magic (MPC.pm:92), and
   /// extracts the SV7 bit-fields when `vers == 0x07`. The chained ID3
-  /// (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are driven by the
-  /// engine entry [`ProcessMpc::process`] (which owns the `ParseContext`
-  /// value sink), not by this header-only typed `parse`.
+  /// (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are layered on top
+  /// by [`parse_full_chained`].
+  ///
+  /// **R5 (Codex adversarial)** — routes through [`parse_full_chained`]
+  /// so the embedded ID3 prefix (MPC.pm:84-87) and APE trailer
+  /// (MPC.pm:111-113) chains run and nest typed sub-Metas into the
+  /// returned [`Meta`]. Pre-fix the trait impl called the body-only
+  /// [`parse_inner_at`], silently dropping every chained sub-Meta for
+  /// callers using the typed `FormatParser` surface (only the crate-root
+  /// `parse_mpc` was fixed in R4 — R5 propagates the chain down to ALL
+  /// public surfaces). The Context's `shared` reference threads the
+  /// `DoneID3`/`DoneAPE` cross-recursion state through the chain.
   fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    parse_inner(ctx.data())
+    // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
+    // present here.
+    Ok(parse_full_chained(ctx.data, ctx.shared))
   }
 }
 
-/// Lib-first direct entry. Same as [`FormatParser::parse`] but returns an
-/// [`Meta`] that borrows from the input buffer (for the F5 placeholder
-/// byte slices; the SV7 header is owned).
+/// Lib-first direct entry. Routes through [`parse_full_chained`] so the
+/// embedded ID3 prefix (MPC.pm:84-87) and APE trailer (MPC.pm:111-113)
+/// chains run and nest typed sub-Metas into the returned [`Meta`].
+///
+/// **R5 (Codex adversarial)** — pre-fix this called the body-only
+/// [`parse_inner_at`], so an MPC with a leading ID3 or trailing APE
+/// silently dropped those tags through the module-level public path
+/// (only the crate-root `parse_mpc` was fixed in R4). A fresh
+/// [`SharedFlags`] is constructed per call (the public entry has no
+/// chain state to thread); the recursion guards inside
+/// `parse_full_chained` apply only when ID3/APE has already run on a
+/// prior chain step.
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  parse_inner(data)
+  // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
+  // present here.
+  let mut shared = crate::format_parser::SharedFlags::default();
+  Ok(parse_full_chained(data, &mut shared))
 }
 
-/// Inner parser — produces a borrow-from-input [`Meta`].
+/// Inner parser — produces a borrow-from-input [`Meta`] from the MPC
+/// body alone (32-byte MP+ header magic + SV7 bit-stream extraction).
+/// The chained ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches
+/// are layered ON TOP by [`parse_full_chained`] — same nesting pattern
+/// as `ape::parse_full_chained`. The public [`parse_borrowed`] +
+/// [`FormatParser::parse`] surfaces both route through
+/// `parse_full_chained` (R5 Codex adversarial: pre-fix they called this
+/// body-only `parse_inner` directly and dropped both chains).
 ///
-/// The MPC body itself: 32-byte MP+ header magic + SV7 bit-stream
-/// extraction. The chained ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113)
-/// dispatches are layered ON TOP by [`parse_full_chained`] (the
-/// `AnyParser::Mpc` entry) — same nesting pattern as `ape::parse_full_
-/// chained`. This bare `parse_inner` is the body-only path, used by the
-/// `header-only` typed entry [`parse_borrowed`].
-///
-/// Takes an `id3_hdr_end` offset so a typed caller that already ran
-/// ID3 (e.g. `parse_full_chained`) can pass the body offset and avoid
-/// re-detecting the prefix; defaults to 0 when no prefix.
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  parse_inner_at(data, 0)
-}
-
-/// Body-only parse starting at `offset` (the post-ID3-prefix offset, or 0).
+/// Takes an `offset` (the post-ID3-prefix offset, or 0) so a typed
+/// caller that already ran ID3 (e.g. `parse_full_chained`) can pass the
+/// body offset and avoid re-detecting the prefix.
 fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error> {
   let body = data.get(offset..).unwrap_or(&[]);
   // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
@@ -1185,13 +1203,25 @@ mod tests {
     assert!(h.gapless()); // 1 ⇒ Yes
     assert_eq!(h.encoder_version(), 115);
     assert!(!meta.warn_unsupported_version());
-    // F2 (Codex adversarial): chained sub-Metas are always `None` for the
-    // BARE `parse_borrowed` path (no chain run). The full chain (`parse_
-    // full_chained`) runs via the `AnyParser::Mpc` arm.
+    // R5 (Codex adversarial): `parse_borrowed` now routes through
+    // `parse_full_chained` (R4 fixed the crate-root `parse_mpc`; R5
+    // propagates to the module-level + trait surfaces too). For a bare
+    // MPC.mpc (no ID3 prefix) the ID3 sub-Meta stays `None`; the APE
+    // trailer-only scan always returns `Some(empty Meta)` even on no
+    // APETAGEX footer (the typed sink skips empty emission). Confirm both
+    // shapes against the new chain semantics.
     #[cfg(feature = "id3")]
-    assert!(meta.id3_ref().is_none());
+    assert!(meta.id3_ref().is_none(), "no ID3 prefix in MPC.mpc fixture");
     #[cfg(feature = "ape")]
-    assert!(meta.ape_ref().is_none());
+    {
+      let ape = meta
+        .ape_ref()
+        .expect("chain returns Some(empty) for no-trailer");
+      assert!(
+        ape.main_tags_slice().is_empty(),
+        "no APETAGEX trailer in MPC.mpc fixture ⇒ empty main_tags"
+      );
+    }
   }
 
   #[test]
