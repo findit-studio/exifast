@@ -1409,28 +1409,15 @@ impl MetaSinker for OggMeta<'_> {
           name,
           values,
         } => {
-          // The legacy bridge serializes `TagValue::List` as a JSON
-          // array. The new TagWriter API doesn't expose a list primitive
-          // (Phase F4 forward item) — for the bridge path through
-          // `MetadataTagWriter` we re-use the `push_listable` semantics
-          // by emitting each element as a separate `write_str` call into
-          // a list-aware bridge sink. Other writers (e.g. `MapTagWriter`)
-          // will see only the LAST element via the BTreeMap's last-write-
-          // wins, which is acceptable because library callers reading
-          // typed Meta directly walk the [`OggMeta::comments`] slice
-          // rather than this generic JSON-shaped sink. See the
-          // `MetadataTagWriter` bridge override below for the list-aware
-          // dispatch.
-          //
-          // For TagWriter implementors that DO want list-aware semantics,
-          // the recommended path is to detect the magic-empty `write_str`
-          // call pattern OR (Phase G) extend the TagWriter API with a
-          // `write_list` method. For now the `OldFormatParser` bridge
-          // bypasses this loop via a direct `tag_to_comment_listable`
-          // push into `Metadata::push_listable`.
-          for v in values {
-            out.write_str(group1, name, v)?;
-          }
+          // Vorbis List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:
+          // 85/86/94) coalesce into a single `TagValue::List` at
+          // first-occurrence position — faithful `FoundTag`
+          // (ExifTool.pm:9505-9520). Route through the `write_str_list`
+          // primitive so list-aware writers (`MetadataTagWriter` →
+          // `Metadata::push_listable`) coalesce correctly instead of
+          // last-write-wins (Codex CF2).
+          let refs: Vec<&str> = values.iter().map(SmolStr::as_str).collect();
+          out.write_str_list(group1, name, &refs)?;
         }
         OggComment::Binary {
           group1,
@@ -1922,6 +1909,54 @@ mod tests {
       w.get("Vorbis", "Title").map(MapValue::as_str),
       Some("Song".to_string())
     );
+  }
+
+  /// Codex CF2: the typed `MetaSinker::sink` List arm reaches
+  /// `TagWriter::write_str_list`, so a `MetadataTagWriter` consumer gets a
+  /// coalesced first-occurrence-position `TagValue::List` (faithful
+  /// `FoundTag`, ExifTool.pm:9505-9520) instead of last-write-wins. Vorbis
+  /// List=>1 tags: ARTIST/PERFORMER/CONTACT.
+  #[test]
+  fn meta_sinker_list_coalesces_into_tagvalue_list_via_metadata_writer() {
+    use crate::sink::MetadataTagWriter;
+    use crate::value::{Metadata, TagValue};
+    let meta = OggMeta {
+      file_type_override: None,
+      comments: vec![
+        // A scalar BEFORE the list to pin first-occurrence position.
+        OggComment::Scalar {
+          group1: SmolStr::from("Vorbis"),
+          name: SmolStr::from("Title"),
+          value: SmolStr::from("Song"),
+        },
+        OggComment::List {
+          group1: SmolStr::from("Vorbis"),
+          name: SmolStr::from("Artist"),
+          values: vec![SmolStr::from("Alice"), SmolStr::from("Bob")],
+        },
+      ],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut md = Metadata::new("x.ogg");
+    {
+      let mut bridge = MetadataTagWriter::new(&mut md);
+      meta.sink(true, &mut bridge).unwrap();
+    }
+    let artist = md
+      .tags()
+      .iter()
+      .find(|t| t.name() == "Artist")
+      .expect("Artist tag");
+    match artist.value() {
+      TagValue::List(items) => {
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], TagValue::Str(s) if s == "Alice"));
+        assert!(matches!(&items[1], TagValue::Str(s) if s == "Bob"));
+      }
+      other => panic!("expected coalesced TagValue::List, got {other:?}"),
+    }
   }
 
   #[test]

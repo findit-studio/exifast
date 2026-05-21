@@ -1325,16 +1325,15 @@ impl MetaSinker for FlacMeta<'_> {
   /// `print_conv=true` ⇒ PrintConv strings (`-j` mode);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
   ///
-  /// **List-tag note.** The TagWriter trait emits one (group, name) pair
-  /// per call; multiple emissions under the same key overwrite (last-write-
-  /// wins, for naive in-memory writers like `MapTagWriter`). The legacy
-  /// bridge [`OldFormatParser::process`] does NOT use this sink path for
-  /// list-tag emission; it routes Vorbis `Artist`/`Performer`/`Contact`
-  /// directly through [`crate::value::Metadata::push_listable`] to
-  /// faithfully coalesce same-(group, name) repeats into a JSON array.
-  /// This sink emits each list-item once via [`TagWriter::write_str`] so
-  /// downstream lib-first JSON sinks (added in Phase G) can choose their
-  /// own coalescing strategy.
+  /// **List-tag note (Codex CF2).** Vorbis `List => 1` tags
+  /// (Artist/Performer/Contact) coalesce into a single `TagValue::List` at
+  /// first-occurrence position via [`TagWriter::write_str_list`], so
+  /// list-aware writers (`MetadataTagWriter` → `Metadata::push_listable`)
+  /// faithfully build a JSON array (ExifTool.pm:9505-9520 `FoundTag`). The
+  /// legacy bridge [`OldFormatParser::process`] keeps its own
+  /// `push_listable` loop for the byte-exact CLI path; this typed sink now
+  /// reaches `write_str_list` so the lib-first `MetaSinker` path coalesces
+  /// too.
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     const FLAC_GROUP: &str = "FLAC";
     const VORBIS_GROUP: &str = "Vorbis";
@@ -1391,6 +1390,15 @@ impl MetaSinker for FlacMeta<'_> {
     }
 
     // -- VorbisComment (Vorbis.pm:175-203) --------------------------------
+    // List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:85/86/94) coalesce
+    // into a single `TagValue::List` at FIRST-occurrence position — faithful
+    // `FoundTag` (ExifTool.pm:9505-9520). The flat `self.vorbis` stream may
+    // carry the same listable name more than once; we gather all its values
+    // (in encounter order) and emit ONE `write_str_list` at the first
+    // occurrence, skipping later repeats so list-aware writers
+    // (`MetadataTagWriter` → `Metadata::push_listable`) coalesce instead of
+    // last-write-wins (Codex CF2).
+    let mut emitted_listable: Vec<&str> = Vec::new();
     for item in &self.vorbis {
       match item {
         VorbisItem::Vendor(s) => {
@@ -1399,11 +1407,34 @@ impl MetaSinker for FlacMeta<'_> {
         VorbisItem::Named {
           name,
           value,
-          listable: _,
+          listable,
         } => {
-          // The sink emits each value once via write_str; list-coalescing
-          // is handled by the legacy bridge (see type-level doc above).
-          out.write_str(VORBIS_GROUP, name, value)?;
+          if *listable {
+            // `name` binds as `&&'static str` (match ergonomics); `*name`
+            // is the `&str` key we coalesce on.
+            let key: &str = name;
+            if emitted_listable.contains(&key) {
+              // Already coalesced at first occurrence; skip the repeat.
+              continue;
+            }
+            // Gather every value for this name across the stream, in order.
+            let refs: Vec<&str> = self
+              .vorbis
+              .iter()
+              .filter_map(|it| match it {
+                VorbisItem::Named {
+                  name: n,
+                  value: v,
+                  listable: true,
+                } if *n == key => Some(&**v),
+                _ => None,
+              })
+              .collect();
+            out.write_str_list(VORBIS_GROUP, key, &refs)?;
+            emitted_listable.push(key);
+          } else {
+            out.write_str(VORBIS_GROUP, name, value)?;
+          }
         }
         VorbisItem::Auto { name, value } => {
           out.write_str(VORBIS_GROUP, name.as_str(), value)?;
@@ -2308,6 +2339,63 @@ mod tests {
     assert!(g("MD5Signature").is_some());
     // Vendor in Vorbis group.
     assert!(w.get("Vorbis", "Vendor").is_some());
+  }
+
+  /// Codex CF2: the typed `MetaSinker::sink` coalesces repeated Vorbis
+  /// List=>1 entries (ARTIST/PERFORMER/CONTACT) into a single
+  /// first-occurrence-position `TagValue::List` via
+  /// `TagWriter::write_str_list`, so a `MetadataTagWriter` consumer builds
+  /// a JSON array instead of last-write-wins.
+  #[test]
+  fn sink_list_coalesces_repeated_artist_via_metadata_writer() {
+    use crate::sink::MetadataTagWriter;
+    use crate::value::{Metadata, TagValue};
+    // Two ARTIST entries (listable) plus a non-listable TITLE between
+    // pins both ordering and the first-occurrence-position contract.
+    let meta = FlacMeta {
+      stream_info: StreamInfo::default(),
+      vorbis: vec![
+        VorbisItem::Named {
+          name: "Artist",
+          value: Cow::Borrowed("Alice"),
+          listable: true,
+        },
+        VorbisItem::Named {
+          name: "Title",
+          value: Cow::Borrowed("Song"),
+          listable: false,
+        },
+        VorbisItem::Named {
+          name: "Artist",
+          value: Cow::Borrowed("Bob"),
+          listable: true,
+        },
+      ],
+      pictures: vec![],
+      format_error: false,
+    };
+    let mut md = Metadata::new("x.flac");
+    {
+      let mut bridge = MetadataTagWriter::new(&mut md);
+      meta.sink(true, &mut bridge).unwrap();
+    }
+    // Exactly one Artist tag, carrying a 2-element list (not two scalars).
+    let artists: Vec<_> = md.tags().iter().filter(|t| t.name() == "Artist").collect();
+    assert_eq!(artists.len(), 1, "Artist must coalesce into one list tag");
+    match artists[0].value() {
+      TagValue::List(items) => {
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], TagValue::Str(s) if s == "Alice"));
+        assert!(matches!(&items[1], TagValue::Str(s) if s == "Bob"));
+      }
+      other => panic!("expected coalesced TagValue::List, got {other:?}"),
+    }
+    // Title still a plain scalar.
+    assert!(
+      md.tags()
+        .iter()
+        .any(|t| t.name() == "Title" && matches!(t.value(), TagValue::Str(s) if s == "Song"))
+    );
   }
 
   // ---------- ConvertDuration oracle table -------------------------------
