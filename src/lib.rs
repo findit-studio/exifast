@@ -143,9 +143,11 @@ pub use formats::dv::{DvError, DvMeta, DvParseOutcome, ProcessDv};
 pub use formats::flac::{FlacContext, FlacError, FlacMeta, ProcessFlac};
 #[cfg(feature = "id3")]
 pub use formats::id3::{
-  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, Mp3Context,
-  Mp3Error, Mp3Meta, ProcessId3, ProcessMp3,
+  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
 };
+// MP3 wrapper (Codex A-R2-1) — `mp3` feature pulls `mpeg-audio` + `ape`.
+#[cfg(feature = "mp3")]
+pub use formats::id3::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3};
 #[cfg(feature = "moi")]
 pub use formats::moi::{MoiError, MoiMeta, ProcessMoi};
 #[cfg(feature = "mpc")]

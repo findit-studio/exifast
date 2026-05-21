@@ -75,13 +75,16 @@ use crate::{
     v2_4::ID3V2_4_MAIN,
     v2_process::process_id3v2,
   },
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   value::{Group, Metadata, TagValue},
 };
 use smol_str::SmolStr;
 use std::vec::Vec;
+// `OldFormatParser` is only implemented for the `mp3`-gated `ProcessMp3`
+// wrapper (Codex A-R2-1); importing it under plain `id3` is dead.
+#[cfg(feature = "mp3")]
+use crate::parser::OldFormatParser;
 
 // ===========================================================================
 // Legacy header parser — preserved verbatim for the old chained entry points
@@ -617,6 +620,15 @@ impl<'a> Id3Meta<'a> {
 /// **Lifetimes.** `Mp3Meta` carries `'a` (input borrow); the MPEG-audio
 /// sub-Meta borrows its `encoder` field from the input. The ID3 + APE
 /// sub-Metas own their strings (`'a` phantom there).
+///
+/// **Feature gate (Codex A-R2-1).** `Mp3Meta` and the [`ProcessMp3`]
+/// wrapper are gated behind the `mp3` feature because they reference the
+/// `mpeg` (`mpeg-audio` feature) and `ape` (`ape` feature) sub-Metas
+/// directly. The plain `id3` feature (pulled by `flac`/`aiff`/`dsf`/`ape`
+/// for the ID3-prefix chain) compiles without these — only
+/// [`process_id3_chained`] / [`process_id3_v2_slice`] / the typed
+/// [`ProcessId3`] / [`Id3Meta`] are needed there.
+#[cfg(feature = "mp3")]
 #[derive(Debug, Clone)]
 pub struct Mp3Meta<'a> {
   /// Optional ID3 sub-Meta — present iff ID3v1 or ID3v2 was detected.
@@ -635,6 +647,7 @@ pub struct Mp3Meta<'a> {
   found: bool,
 }
 
+#[cfg(feature = "mp3")]
 impl<'a> Mp3Meta<'a> {
   /// Optional ID3 sub-Meta.
   #[must_use]
@@ -739,14 +752,19 @@ impl FormatParser for ProcessId3 {
 /// `Image::ExifTool::ID3::ProcessMP3` (ID3.pm:1684-1728); the chain to
 /// MPEG / APE for the audio-frame / APE-trailer tags is documented
 /// forward items (rows 17 / 5).
+///
+/// **Feature gate (Codex A-R2-1):** `mp3` — depends on `mpeg-audio` + `ape`.
+#[cfg(feature = "mp3")]
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessMp3;
 
+#[cfg(feature = "mp3")]
 impl parser_sealed::Sealed for ProcessMp3 {}
 
 /// Context for the MP3 wrapper. Bundles the input slice with shared
 /// cross-format flags + the local file extension (needed for the
 /// ID3.pm:1715-1717 `$mp3 = ($ext eq 'MUS') ? 0 : 1` Layer-II gate).
+#[cfg(feature = "mp3")]
 pub struct Mp3Context<'a> {
   data: &'a [u8],
   shared: &'a mut SharedFlags,
@@ -757,6 +775,7 @@ pub struct Mp3Context<'a> {
   ext: Option<&'a str>,
 }
 
+#[cfg(feature = "mp3")]
 impl<'a> Mp3Context<'a> {
   /// Construct an MP3 parser context.
   #[must_use]
@@ -782,6 +801,7 @@ impl<'a> Mp3Context<'a> {
   }
 }
 
+#[cfg(feature = "mp3")]
 impl FormatParser for ProcessMp3 {
   /// GAT: the Meta borrows from the input `'a` (the chained MPEG-audio
   /// sub-Meta borrows its `encoder` field; Codex AF2).
@@ -829,6 +849,7 @@ impl FormatParser for ProcessMp3 {
 /// `print_conv` is fixed to `true` (`-j`) for the typed entry: the ID3
 /// sub-Meta is mode-locked (Codex BF2), and MPEG/APE sub-Metas apply
 /// PrintConv at sink time. Sink the result with `sink(true, ...)`.
+#[cfg(feature = "mp3")]
 fn parse_mp3_typed<'a>(
   data: &'a [u8],
   ext: Option<&'a str>,
@@ -894,6 +915,7 @@ fn parse_mp3_typed<'a>(
 /// # Errors
 ///
 /// Returns the per-format [`Mp3Error`].
+#[cfg(feature = "mp3")]
 pub fn parse_mp3_borrowed<'a>(
   data: &'a [u8],
   ext: Option<&'a str>,
@@ -920,12 +942,14 @@ impl std::error::Error for Id3Error {}
 
 /// Rust-level fatal modes for MP3 parsing. Wraps [`Id3Error`] for the
 /// nested ID3 dispatch.
+#[cfg(feature = "mp3")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mp3Error {
   /// An ID3 parsing error bubbled up from the nested directory parser.
   Id3(Id3Error),
 }
 
+#[cfg(feature = "mp3")]
 impl core::fmt::Display for Mp3Error {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
@@ -934,7 +958,7 @@ impl core::fmt::Display for Mp3Error {
   }
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "mp3", feature = "std"))]
 impl std::error::Error for Mp3Error {}
 
 // ===========================================================================
@@ -1140,6 +1164,7 @@ impl MetaSinker for Id3Meta<'_> {
   }
 }
 
+#[cfg(feature = "mp3")]
 impl MetaSinker for Mp3Meta<'_> {
   /// Emit MP3 tags in bundled `ProcessMP3` order (ID3.pm:1684-1728):
   /// 1. ID3 sub-Meta (header frames + v1 trailer fields), when present;
@@ -1169,6 +1194,7 @@ impl MetaSinker for Mp3Meta<'_> {
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
+#[cfg(feature = "mp3")]
 impl OldFormatParser for ProcessMp3 {
   /// The full Phase F2 chained flow. Identical in semantics to the
   /// pre-migration implementation; the migration only adds the typed
@@ -1554,9 +1580,10 @@ pub fn parse_id3_borrowed<'a>(
 /// (Currently unused — the legacy `OldFormatParser` implementation
 /// drives the engine path directly. Kept for documentation / Phase G
 /// transition reference.)
+#[cfg(feature = "mp3")]
 #[allow(dead_code)]
 fn _phase_f2_bridge_note() {
-  let _ = MetadataTagWriter::new;
+  let _ = crate::sink::MetadataTagWriter::new;
 }
 
 // ===========================================================================
@@ -1568,6 +1595,11 @@ mod tests {
   use super::*;
   use crate::value::Metadata;
 
+  // The `run` helper drives the `mp3`-gated `ProcessMp3` legacy bridge,
+  // so it (and every test that calls it) is gated behind `mp3` (Codex
+  // A-R2-1). Pure-ID3 tests below use `process_id3_inner_legacy` /
+  // `parse_id3_borrowed` and stay ungated.
+  #[cfg(feature = "mp3")]
   fn run(data: &[u8], name: &str) -> Metadata {
     let mut m = Metadata::new(name);
     {
@@ -1582,18 +1614,21 @@ mod tests {
   // Legacy regression pins — preserved verbatim from pre-F2 process.rs
   // -------------------------------------------------------------------------
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_empty_data_rejects() {
     let m = run(&[], "x.mp3");
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_random_bytes_no_mpeg_sync_rejects() {
     let m = run(b"abcdefghij", "random.mp3");
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_valid_mpeg_audio_frame_accepts_as_mp3() {
     let mut data: Vec<u8> = vec![0u8; 32];
@@ -1617,6 +1652,7 @@ mod tests {
   /// `parse_mp3_borrowed(MP3.mp3)` returns `Some(Mp3Meta)` with the MPEG
   /// sub-Meta populated (no ID3). Bundled: `MP3.mp3` is MPEG-only
   /// (`ff fb 90 4c`), MPEGAudioVersion 1 / AudioLayer 3.
+  #[cfg(feature = "mp3")]
   #[test]
   fn typed_parse_mp3_mpeg_only_fixture_populates_mpeg() {
     let bytes = std::fs::read(
@@ -1652,6 +1688,7 @@ mod tests {
 
   /// The crate-root [`crate::parse_mp3`] (local `SharedFlags`) also returns
   /// `Some(Mp3Meta)` for the MPEG-only fixture.
+  #[cfg(feature = "mp3")]
   #[test]
   fn typed_parse_mp3_public_entry_mpeg_only_is_some() {
     let bytes = std::fs::read(
@@ -1666,6 +1703,7 @@ mod tests {
 
   /// `parse_bytes(MP3.mp3)` dispatches to `AnyMeta::Mp3` with the MPEG
   /// sub-Meta populated (the closed-dispatch path; Codex CF1).
+  #[cfg(feature = "mp3")]
   #[test]
   fn typed_parse_bytes_mp3_mpeg_only_dispatches_to_mp3_arm() {
     let bytes = std::fs::read(
@@ -1689,6 +1727,7 @@ mod tests {
   /// `parse_mp3_borrowed(ID3v2_with_mpeg_audio.mp3)` populates BOTH the
   /// ID3 sub-Meta (Title="Test") and the MPEG sub-Meta — faithful to the
   /// bundled `ProcessMP3` recursion that emits ID3v2 + MPEG tags together.
+  #[cfg(feature = "mp3")]
   #[test]
   fn typed_parse_mp3_id3v2_plus_mpeg_populates_both() {
     let bytes = std::fs::read(
@@ -1720,6 +1759,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_id3v1_only() {
     let mut data: Vec<u8> = vec![0; 256];
@@ -1749,6 +1789,7 @@ mod tests {
     assert_eq!(genre.value(), &TagValue::Str("Hip-Hop".into()));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_id3v2_2_with_title_artist() {
     let title_frame: Vec<u8> = {
@@ -1793,6 +1834,7 @@ mod tests {
     assert_eq!(id3size.value(), &TagValue::I64(10 + size as i64));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_unsync_extheader_shrinks_below_4_does_not_panic() {
     let mut data = Vec::new();
@@ -1810,6 +1852,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_layer_two_dotless_filename_rejected() {
     let mut data: Vec<u8> = vec![0u8; 32];
@@ -1821,6 +1864,7 @@ mod tests {
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_layer_two_mus_extension_accepted() {
     let mut data: Vec<u8> = vec![0u8; 32];
@@ -1833,6 +1877,7 @@ mod tests {
     assert_eq!(ft.value(), &TagValue::Str("MP3".into()));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_unsupported_id3v5_warns() {
     let mut data = Vec::new();
@@ -1849,6 +1894,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_truncated_warns() {
     let mut data = Vec::new();
@@ -1866,6 +1912,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_short_header_warns() {
     let data = b"ID3\x02\x00";
@@ -2049,6 +2096,7 @@ mod tests {
     assert_eq!(meta.id3_size(), 128);
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn format_parser_parse_mp3_wraps_id3() {
     let mut data: Vec<u8> = vec![0; 256];
