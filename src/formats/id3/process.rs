@@ -1606,6 +1606,120 @@ mod tests {
     assert_eq!(ft.value(), &TagValue::Str("MP3".into()));
   }
 
+  // -------------------------------------------------------------------------
+  // Typed-path (FormatParser / MetaSinker) regression — Codex BF1/CF1.
+  // The prior typed `ProcessMp3::parse` staged only ID3 and returned
+  // `Ok(None)` for raw-MPEG MP3 (`MP3.mp3` = `ff fb 90 4c`). The chained
+  // typed parser now mirrors `ProcessMP3` (ID3 -> MPEG -> APE) and
+  // populates the typed sub-Metas.
+  // -------------------------------------------------------------------------
+
+  /// `parse_mp3_borrowed(MP3.mp3)` returns `Some(Mp3Meta)` with the MPEG
+  /// sub-Meta populated (no ID3). Bundled: `MP3.mp3` is MPEG-only
+  /// (`ff fb 90 4c`), MPEGAudioVersion 1 / AudioLayer 3.
+  #[test]
+  fn typed_parse_mp3_mpeg_only_fixture_populates_mpeg() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("MPEG-only MP3 must be Some(Mp3Meta), not None (Codex BF1/CF1)");
+    assert!(meta.found());
+    assert!(meta.id3().is_none(), "MP3.mp3 has no ID3");
+    let mpeg = meta.mpeg().expect("MPEG sub-Meta populated");
+    assert_eq!(
+      mpeg.mpeg_audio_version(),
+      crate::formats::mpeg::MpegAudioVersion::V1
+    );
+    assert_eq!(mpeg.audio_layer(), crate::formats::mpeg::AudioLayer::L3);
+    // Sink emits MPEG:* tags.
+    let mut w = crate::sink::MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("MPEG", "MPEGAudioVersion")
+        .map(crate::sink::MapValue::as_str),
+      Some("1".into())
+    );
+    assert_eq!(
+      w.get("MPEG", "AudioBitrate")
+        .map(crate::sink::MapValue::as_str),
+      Some("128 kbps".into())
+    );
+  }
+
+  /// The crate-root [`crate::parse_mp3`] (local `SharedFlags`) also returns
+  /// `Some(Mp3Meta)` for the MPEG-only fixture.
+  #[test]
+  fn typed_parse_mp3_public_entry_mpeg_only_is_some() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let meta = crate::parse_mp3(&bytes, Some("MP3"))
+      .expect("ok")
+      .expect("public parse_mp3 must be Some for MPEG-only MP3");
+    assert!(meta.mpeg().is_some());
+  }
+
+  /// `parse_bytes(MP3.mp3)` dispatches to `AnyMeta::Mp3` with the MPEG
+  /// sub-Meta populated (the closed-dispatch path; Codex CF1).
+  #[test]
+  fn typed_parse_bytes_mp3_mpeg_only_dispatches_to_mp3_arm() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let meta = crate::parse_bytes(&bytes)
+      .expect("ok")
+      .expect("parse_bytes must accept MPEG-only MP3");
+    match meta {
+      crate::AnyMeta::Mp3(m) => {
+        assert!(
+          m.mpeg().is_some(),
+          "MPEG sub-Meta populated via parse_bytes"
+        );
+      }
+      other => panic!("expected AnyMeta::Mp3, got {other:?}"),
+    }
+  }
+
+  /// `parse_mp3_borrowed(ID3v2_with_mpeg_audio.mp3)` populates BOTH the
+  /// ID3 sub-Meta (Title="Test") and the MPEG sub-Meta — faithful to the
+  /// bundled `ProcessMP3` recursion that emits ID3v2 + MPEG tags together.
+  #[test]
+  fn typed_parse_mp3_id3v2_plus_mpeg_populates_both() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ID3v2_with_mpeg_audio.mp3"),
+    )
+    .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
+      .expect("ok")
+      .expect("found");
+    let id3 = meta.id3().expect("ID3 sub-Meta present");
+    assert_eq!(id3.title(), Some("Test"));
+    assert!(
+      meta.mpeg().is_some(),
+      "MPEG sub-Meta present for ID3v2+audio MP3 (ProcessMP3 recursion)"
+    );
+    // Sink emits BOTH ID3v2_3:Title and MPEG:* tags.
+    let mut w = crate::sink::MapTagWriter::new();
+    meta.sink(true, &mut w).unwrap();
+    assert_eq!(
+      w.get("ID3v2_3", "Title").map(crate::sink::MapValue::as_str),
+      Some("Test".into())
+    );
+    assert_eq!(
+      w.get("MPEG", "MPEGAudioVersion")
+        .map(crate::sink::MapValue::as_str),
+      Some("1".into())
+    );
+  }
+
   #[test]
   fn process_mp3_id3v1_only() {
     let mut data: Vec<u8> = vec![0; 256];
