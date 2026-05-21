@@ -961,22 +961,24 @@ impl AnyParser {
   /// This is the single closed-set engine dispatch site (resolved via
   /// [`any_parser_for`]).
   pub(crate) fn extract_into(self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
-    // No-format build (Codex CF3): `AnyParser` has no variants, so the
-    // `match` is empty and `ctx` is unused. Discard it to stay warning-clean.
+    // `ctx` is only consumed by the file-type *engine entry* arms below.
+    // `id3` and `mpeg-audio` are directory / internal parsers with no
+    // top-level engine entry (their arms return `false` without touching
+    // `ctx`), and a no-format build has no arms at all — so when none of the
+    // dispatching features is enabled, `ctx` is unused. Discard it then to
+    // stay warning-clean (Codex CF3 generalized).
     #[cfg(not(any(
       feature = "moi",
       feature = "aac",
       feature = "dv",
       feature = "audible",
       feature = "red",
-      feature = "id3",
       feature = "mp3",
       feature = "aiff",
       feature = "ape",
       feature = "dsf",
       feature = "flac",
       feature = "ogg",
-      feature = "mpeg-audio",
       feature = "mpc",
       feature = "wavpack",
     )))]
