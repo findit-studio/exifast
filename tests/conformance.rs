@@ -214,6 +214,86 @@ fn matroska_attachment_conformance() {
 }
 
 #[test]
+fn matroska_duration_before_scale_conformance() {
+  // PR #31 R3 finding — Duration ValueConv (Matroska.pm:170-171)
+  // `'$$self{TimecodeScale} ? $val * $$self{TimecodeScale} / 1e9 :
+  // $val / 1000'`. ValueConv/PrintConv are deferred to output time
+  // and read `$$self{TimecodeScale}` LAZILY (verified empirically
+  // against bundled-Perl 13.58 — for files where Duration precedes
+  // TimecodeScale, bundled still applies the FINAL TimecodeScale).
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, Duration=60000.0 raw_float, TimecodeScale=1_000_000
+  // (1 ms)]] — Duration appears BEFORE TimecodeScale in the EBML
+  // walk. Bundled emits `"Info:Duration": "0:01:00"` because the
+  // LAST `$$self{TimecodeScale}` (1 ms) is used at output-time
+  // ValueConv ⇒ `60000 * 1e6 / 1e9 = 60.0 s = "0:01:00"`. This
+  // pins the order-independence semantic so a future walk-time
+  // ValueConv refactor that misread Perl's deferred-eval semantics
+  // would regress.
+  check(
+    "Matroska_duration_before_scale.mkv",
+    "Matroska_duration_before_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_before_scale.mkv",
+    "Matroska_duration_before_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_duration_no_scale_conformance() {
+  // PR #31 R3 — Duration FALSY branch (NO TimecodeScale in the file).
+  // ValueConv: `$$self{TimecodeScale} ? ... : $val / 1000` — when
+  // TimecodeScale is absent, `$$self{TimecodeScale}` is `undef` ⇒
+  // FALSY ⇒ fallback fires ⇒ `60000 / 1000 = 60`. PrintConv ALSO
+  // gates on the same ternary ⇒ bare numeric (NOT
+  // `ConvertDuration($val)`), so `-j` and `-n` BOTH emit `60`.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, Duration=60000.0]] (no TimecodeScale element at all).
+  check(
+    "Matroska_duration_no_scale.mkv",
+    "Matroska_duration_no_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_no_scale.mkv",
+    "Matroska_duration_no_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_duration_zero_scale_conformance() {
+  // PR #31 R3 finding — the ACTUAL pre-fix bug. ValueConv:
+  // `$$self{TimecodeScale} ? $val * $$self{TimecodeScale} / 1e9 :
+  // $val / 1000` — PERL TRUTHINESS, so `$$self{TimecodeScale} = 0`
+  // is FALSY (NOT just `undef`). Pre-R3-fix Rust code matched
+  // `Some(ts) => raw * ts / 1e9` unconditionally, so `Some(0)`
+  // took the WRONG branch ⇒ `60000 * 0 / 1e9 = 0`. Post-fix
+  // adds an explicit `ts != 0` guard ⇒ both `None` AND `Some(0)`
+  // fall through to `$val / 1000` ⇒ `60.0`. PrintConv mirrors
+  // the same truthiness ⇒ bare numeric.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, TimecodeScale=0, Duration=60000.0]] — TimecodeScale
+  // explicitly stored as 0 (1-byte unsigned).
+  check(
+    "Matroska_duration_zero_scale.mkv",
+    "Matroska_duration_zero_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_zero_scale.mkv",
+    "Matroska_duration_zero_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn wavpack_conformance() {
   // FORMATS.md row 6. Native `wvpk....` 32-byte header (no RIFF wrapper,
   // no ID3, no APE) ⇒ ProcessWV runs the WavPack::Main ProcessBinaryData

@@ -2079,9 +2079,24 @@ pub enum Value<'a> {
   /// `TimecodeScale` — raw u64 nanoseconds. ValueConv `/1e9` (Matroska.pm:
   /// 160-166); PrintConv `($val * 1000) . " ms"`.
   TimecodeScaleRaw(u64),
-  /// `Duration` — raw f64 from the float decoder. ValueConv (when
-  /// `TimecodeScale` is set, the typical case) multiplies by
-  /// `TimecodeScale_ns/1e9` (Matroska.pm:167-172).
+  /// `Duration` — raw f64 from the float decoder. ValueConv and PrintConv
+  /// (Matroska.pm:170-171) are applied at output time with the FINAL
+  /// `$$self{TimecodeScale}` (RawConv at Matroska.pm:163 stores it into
+  /// `$$self`, ValueConv/PrintConv read it lazily during `FoundTag`'s
+  /// downstream `GetValue` / `PrintValue` evaluation — empirically
+  /// verified by feeding bundled-Perl a fixture with TimecodeScale AFTER
+  /// Duration: the FINAL TimecodeScale drives both branches, even with
+  /// multiple TimecodeScale values where the LAST one wins).
+  ///
+  /// Two faithfulness traps the previous implementation missed:
+  /// - Perl truthiness for `$$self{TimecodeScale}` — `0` is FALSY, so an
+  ///   explicit `TimecodeScale = 0` must take the `$val / 1000` branch
+  ///   (NOT `$val * 0 / 1e9 = 0`). Handled by an explicit `ts != 0` guard
+  ///   in [`emit_one`].
+  /// - PrintConv branch must mirror ValueConv's truthiness (both gate on
+  ///   the SAME `$$self{TimecodeScale} ?` ternary), so when the falsy
+  ///   branch fires we emit the bare numeric `$val` (`-j` and `-n` both
+  ///   become numeric).
   DurationRawF64(f64),
   /// `DefaultDuration` — raw u64 nanoseconds. ValueConv `/1e9`; PrintConv
   /// `($val * 1000) . " ms"` (Matroska.pm:301-306).
@@ -2635,7 +2650,10 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::Duration => {
-        // Matroska.pm:167-172 — `Format => 'float'`.
+        // Matroska.pm:167-172 — `Format => 'float'`. ValueConv/PrintConv
+        // are deferred to output time and read the FINAL `$$self{
+        // TimecodeScale}` (verified empirically with adversarial
+        // fixtures — see `Value::DurationRawF64`).
         let raw = decode_float(&data[w.pos..elem_end]);
         push_entry(w, def.name, Value::DurationRawF64(raw));
         w.pos = elem_end;
@@ -3025,15 +3043,30 @@ fn emit_one(
       }
     }
     Value::DurationRawF64(raw) => {
-      // Matroska.pm:167-172 — `ValueConv => '$$self{TimecodeScale} ? $val
+      // Matroska.pm:170-171 — `ValueConv => '$$self{TimecodeScale} ? $val
       // * $$self{TimecodeScale} / 1e9 : $val / 1000'`,
       // `PrintConv => '$$self{TimecodeScale} ? ConvertDuration($val) : $val'`.
-      let vc = match ts_ns {
+      //
+      // Both branches gate on the SAME `$$self{TimecodeScale} ?` ternary,
+      // which is PERL TRUTHINESS — `0` is falsy, NOT just `undef`. The
+      // pre-fix code matched `Some(ts) => raw * ts / 1e9` unconditionally,
+      // which mis-converted `TimecodeScale = 0` to `0` instead of taking
+      // the `$val / 1000` fallback. Use an explicit `ts != 0` guard so
+      // both `None` AND `Some(0)` fall through to the bare fallback —
+      // and ensure PrintConv picks the matching numeric `$val` arm.
+      //
+      // ValueConv/PrintConv read `$$self{TimecodeScale}` LAZILY at output
+      // time (not during the walk), so we use the FINAL scale `ts_ns`
+      // even when `TimecodeScale` appears AFTER `Duration` (verified
+      // empirically against bundled-Perl 13.58 — last-wins on duplicate
+      // `TimecodeScale` entries too).
+      let truthy_scale = ts_ns.filter(|ts| *ts != 0);
+      let vc = match truthy_scale {
         Some(ts) => raw * (ts as f64) / 1e9,
         None => raw / 1000.0,
       };
       if print_conv {
-        if ts_ns.is_some() {
+        if truthy_scale.is_some() {
           let s = crate::datetime::convert_duration(vc);
           out.write_str(group, name, &s)?;
         } else {
@@ -3682,6 +3715,63 @@ mod tests {
     assert_eq!(e.name, "DateReleased");
     assert!(e.is_date);
     assert!(std_tag_lookup("THIS_IS_NOT_A_REAL_KEY").is_none());
+  }
+
+  #[test]
+  fn r3_duration_perl_truthy_guard_treats_some_zero_as_falsy() {
+    // PR #31 R3 — the actual pre-fix bug. Direct fixture-based unit
+    // test (the conformance test `matroska_duration_zero_scale_*` is
+    // the load-bearing one; this one PINS the truthy-guard branch in
+    // isolation so a regression diagnosis can localize quickly).
+    //
+    // Fixture: Info[TimecodeScale=0, Duration=60000.0]. Pre-fix Rust:
+    // `Some(0) => raw * 0 / 1e9 = 0.0`. Post-fix: explicit `ts != 0`
+    // guard ⇒ falsy branch ⇒ `60000 / 1000 = 60.0`. Bundled-Perl
+    // confirms: `"Info:Duration": 60` (bare numeric — PrintConv mirrors
+    // the same truthiness).
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_duration_zero_scale.mkv"
+    ))
+    .expect("read R3 zero-scale fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    // Sanity: TimecodeScale captured as 0.
+    assert_eq!(meta.timecode_scale_ns(), Some(0));
+    // -j mode: both Duration and TimecodeScale render as bare numeric
+    // (PerlConv falsy branch fires for both). TimecodeScale's PrintConv
+    // is `($val * 1000) . " ms"` ⇒ "0 ms" (no truthy guard there —
+    // unconditional). Duration's PrintConv is `$$self{TimecodeScale} ?
+    // ConvertDuration($val) : $val` ⇒ falsy branch ⇒ bare 60.0.
+    let mut tm_j = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm_j).unwrap();
+    assert_eq!(tm_j.get_str("Info", "TimecodeScale"), Some("0 ms".into()));
+    assert_eq!(tm_j.get_str("Info", "Duration"), Some("60".into()));
+    // -n mode: same — Duration falls through to the numeric fallback.
+    let mut tm_n = crate::tagmap::TagMap::new();
+    meta.serialize_tags(false, &mut tm_n).unwrap();
+    assert_eq!(tm_n.get_str("Info", "Duration"), Some("60".into()));
+  }
+
+  #[test]
+  fn r3_duration_before_scale_uses_final_timecode_scale() {
+    // PR #31 R3 — ValueConv/PrintConv are output-time, NOT walk-time.
+    // Fixture: Info[Duration BEFORE TimecodeScale=1ms]. Bundled-Perl
+    // uses the FINAL `$$self{TimecodeScale}` = 1 ms ⇒
+    // `60000 * 1e6 / 1e9 = 60.0 s = "0:01:00"`. A walk-time-only
+    // implementation that read `$$self{TimecodeScale}` BEFORE
+    // TimecodeScale was seen would emit `60` (falsy branch) — which
+    // contradicts bundled. Pin the correct semantic here.
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska_duration_before_scale.mkv"
+    ))
+    .expect("read R3 order-skewed fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    assert_eq!(meta.timecode_scale_ns(), Some(1_000_000));
+    let mut tm_j = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut tm_j).unwrap();
+    assert_eq!(tm_j.get_str("Info", "Duration"), Some("0:01:00".into()));
+    assert_eq!(tm_j.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
   }
 
   #[test]

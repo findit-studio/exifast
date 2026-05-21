@@ -199,8 +199,8 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    133,
-    "expected exactly the 133 active conformance fixtures, found {}: {:?}",
+    136,
+    "expected exactly the 136 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
