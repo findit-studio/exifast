@@ -1589,8 +1589,29 @@ impl FormatParser for ProcessApe {
   /// `$$et{DoneAPE} = 1` runs unconditionally on entry, BEFORE any
   /// magic check. This sets `shared.set_done_ape(true)` to gate the
   /// MP3 → APE-trailer fallback at ID3.pm:1723-1726.
+  ///
+  /// **R5 (Codex adversarial)** — full-parse contexts route through
+  /// [`parse_full_chained`] so the embedded ID3 chain (APE.pm:124-127:
+  /// `ID3v2` prefix / `ID3v1` trailer) runs and nests an [`Id3Meta`]
+  /// into the returned [`Meta`]. Pre-fix the trait impl called the
+  /// body-only [`parse_body_only`], silently dropping every ID3 sub-Meta
+  /// for callers using the typed `FormatParser` surface (only the
+  /// crate-root `parse_ape` was fixed in R4 — R5 propagates the chain
+  /// down to ALL public surfaces). Trailer-only contexts (set via
+  /// [`Context::new_trailer_only`]) still take the body-only path:
+  /// bundled `APE::ProcessAPE` from a `$$et{FileType}`-already-set chain
+  /// (ID3.pm:1722-1727) only runs the trailer scan, faithful to that
+  /// gate.
   fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
-    Ok(parse_borrowed(ctx))
+    // Trailer-only: bundled APE.pm:118 (`Just looks for APE trailer if
+    // FileType is already set`) — never re-runs the embedded ID3 dispatch
+    // (the chaining parent did it). Body-only is the faithful path.
+    if ctx.trailer_only {
+      return Ok(parse_body_only(ctx));
+    }
+    // Full-parse: run the embedded ID3 chain alongside the MAC/APE body.
+    // `ape = ["id3"]` per Cargo.toml ⇒ `parse_full_chained` is always present.
+    Ok(parse_full_chained(ctx.data, ctx.shared))
   }
 }
 
@@ -1600,7 +1621,13 @@ impl FormatParser for ProcessApe {
 ///
 /// Sets `ctx.shared.done_ape = true` unconditionally before the magic
 /// check (APE.pm:131 `$$et{DoneAPE} = 1`).
-fn parse_borrowed(mut ctx: Context<'_>) -> Option<Meta<'static>> {
+///
+/// **Internal (`pub(crate)`)** — body-only path the trait impl invokes
+/// for trailer-only contexts and the typed bridge helpers
+/// ([`parse_trailer_only_owned`]) reuse. NOT a public chain entry — the
+/// full-parse chain lives in [`parse_full_chained`] and the trait impl's
+/// non-trailer arm.
+fn parse_body_only(mut ctx: Context<'_>) -> Option<Meta<'static>> {
   // APE.pm:131 `$$et{DoneAPE} = 1` — runs IMMEDIATELY after the embedded
   // ID3 dispatch and BEFORE the magic check, so even a wrong-magic file
   // (we'd reject below) faithfully marks DoneAPE. Read by ID3.pm:1723
@@ -1647,7 +1674,7 @@ fn parse_borrowed(mut ctx: Context<'_>) -> Option<Meta<'static>> {
 /// `shared` is a transient borrow that must not extend into the returned
 /// Meta's lifetime (Codex BF1/CF1 + AF2).
 ///
-/// Faithful to the private `parse_borrowed` trailer-only path: sets
+/// Faithful to the private `parse_body_only` trailer-only path: sets
 /// `done_ape` (APE.pm:131) and threads `shared.done_id3()` for the
 /// APE.pm:169 footer shift.
 pub(crate) fn parse_trailer_only_owned(
