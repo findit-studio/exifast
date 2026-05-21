@@ -4,8 +4,25 @@
 //!
 //! Stage 1 scope: video/audio formats, read-only. Per-format port status
 //! is tracked in `FORMATS.md` at the repository root.
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
+
+// Alias `alloc as std` on no_std + alloc builds so code can use
+// `std::vec::Vec` etc. uniformly across feature combos. When the
+// `std` feature is on, the real `std` crate is already in scope via
+// the prelude. The `unused_extern_crates` allow silences a
+// rust-2018-idioms false positive — the alias is needed at use-time
+// even though rustc can't see that statically.
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[allow(unused_extern_crates)]
+extern crate alloc as std;
+
+#[cfg(feature = "std")]
+#[allow(unused_extern_crates)]
+extern crate std;
 
 pub mod bitstream;
 pub mod charset;
@@ -14,11 +31,42 @@ pub mod datetime;
 pub mod error;
 pub mod filetype;
 pub mod formats;
+// `jsondiff` and `serialize` are the JSON emitter + golden-diff oracle: they
+// unconditionally depend on `serde_json` (and `serde`). They are gated on
+// the `json` feature (spec §4: `json = ["alloc", "dep:serde_json", "dep:serde", ...]`).
+// Library callers without `json` get the typed-Meta API path only; CLI
+// JSON emission requires the feature.
+// `json_scalar` builds the per-scalar JSON lexemes by hand (no `serde_json`),
+// so it needs only `alloc` (String/format!), NOT the serde-pulling `json`
+// feature. Gated on `alloc` because [`json_writer`] — the engine's mandatory
+// `$$et` value sink after task #124 — depends on it, and the engine
+// (parser + format modules) is always compiled.
+#[cfg(feature = "alloc")]
+pub mod json_scalar;
+// The direct typed-Meta → JSON `TagWriter` and the engine's `$$et` value sink
+// (task #124). Reuses the byte-exact scalar encoders in [`json_scalar`] so it
+// is byte-identical to the `Metadata`→JSON `serialize` path. Builds its JSON
+// string directly (no `serde_json`), so it is gated on `alloc` rather than the
+// serde-pulling `json` feature: the always-compiled parser/format engine now
+// emits through it, so it must be available in every engine build.
+#[cfg(feature = "alloc")]
+pub mod json_writer;
+#[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
+// Phase D — new lib-first `FormatParser` trait scaffold, lands alongside the
+// legacy `parser::FormatParser` (re-exported there as `OldFormatParser`). Per
+// the spec at `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`:
+// `parser_new` holds the new `FormatParser` / `MetaSinker` / `TagWriter` /
+// `SharedFlags` traits + `AnyParser` / `AnyMeta` enum dispatch skeletons; `sink`
+// holds the reference `TagWriter` implementor used by Phase D unit tests.
+// Format arms are added in Phase E (MOI) and Phase F (everything else).
+pub mod parser_new;
 pub mod processbinarydata;
 pub mod reader;
+#[cfg(feature = "json")]
 pub mod serialize;
+pub mod sink;
 pub mod tagtable;
 pub mod value;
 

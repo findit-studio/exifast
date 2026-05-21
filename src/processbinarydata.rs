@@ -352,14 +352,14 @@ pub fn process_binary_data(
         } else {
           let bytes = &data[base..base + avail];
           let stripped = strip_at_first_null(bytes); // :10027
-                                                     // Emit raw bytes (faithful to Perl `$val = substr(...)`, which is
-                                                     // a BYTE STRING — no UTF-8 reinterpretation, no `from_utf8_lossy`).
-                                                     // The convert layer is responsible for any MacRoman/UTF-16
-                                                     // ValueConv; hash PrintConv lookups key the bytes via
-                                                     // [`crate::convert::exiftool_val_string`] (FixUTF8 — valid UTF-8
-                                                     // preserved, invalid high bytes replaced with `?`, matching Perl
-                                                     // EscapeJSON's behavior). Codex R3 verified the divergence on
-                                                     // CompressionType `\x80ABC` (Perl: "?ABC"; pre-fix: "U+0080ABC").
+          // Emit raw bytes (faithful to Perl `$val = substr(...)`, which is
+          // a BYTE STRING — no UTF-8 reinterpretation, no `from_utf8_lossy`).
+          // The convert layer is responsible for any MacRoman/UTF-16
+          // ValueConv; hash PrintConv lookups key the bytes via
+          // [`crate::convert::exiftool_val_string`] (FixUTF8 — valid UTF-8
+          // preserved, invalid high bytes replaced with `?`, matching Perl
+          // EscapeJSON's behavior). Codex R3 verified the divergence on
+          // CompressionType `\x80ABC` (Perl: "?ABC"; pre-fix: "U+0080ABC").
           Some(TagValue::Bytes(stripped.to_vec()))
         }
       }
@@ -384,9 +384,9 @@ pub fn process_binary_data(
           } else {
             let bytes = &data[body_start..body_start + count];
             let stripped = strip_at_first_null(bytes); // :10027
-                                                       // Emit raw bytes — see the StringFixed branch above. ValueConv
-                                                       // (e.g. AIFC `CompressorName`'s MacRoman decode) reads the raw
-                                                       // bytes; Codex R1 fix.
+            // Emit raw bytes — see the StringFixed branch above. ValueConv
+            // (e.g. AIFC `CompressorName`'s MacRoman decode) reads the raw
+            // bytes; Codex R1 fix.
             Some(TagValue::Bytes(stripped.to_vec()))
           }
         }

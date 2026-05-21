@@ -1,31 +1,124 @@
 [package]
 name = "exifast"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/Findit-AI/exifast"
 homepage = "https://github.com/Findit-AI/exifast"
 documentation = "https://docs.rs/exifast"
 description = "A 1:1 Rust port of ExifTool's metadata reader (video/audio, Stage 1)"
 license = "GPL-3.0-or-later"
-rust-version = "1.74"
+rust-version = "1.95.0"
+categories = [
+  "multimedia",
+  "multimedia::audio",
+  "multimedia::video",
+  "parser-implementations",
+  "no-std",
+  "wasm",
+]
 
+# Feature graph — see docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md §4.
+#
+# Phase C status: the structure mirrors spec §4 EXACTLY. Per-format features
+# carry only their cross-format chain dependencies (e.g. `aiff = ["id3"]`),
+# with NO `alloc`/`std` implication. The source code today still uses
+# `std::vec::Vec` / `std::string::String` / `smol_str::SmolStr`
+# unconditionally under the existing push-style `Metadata` design — so
+# feature combos without `std` fail to compile. This is by design: the
+# explicit spec §9 CI tiers cover the meaningful combos, with non-default
+# tiers marked `continue-on-error: true` until Phase D/E/F migrate Meta
+# types. See `docs/tracking.md` → "Decisions deferred during overnight
+# execution" for the full audit trail.
 [features]
-default = []
+default = ["std", "json", "all-formats"]
+
+# `alloc` pulls in heap-required vocabulary:
+# - SmolStr-backed strings for stored data that doesn't borrow from input
+# - jiff's heap-allocating internals
+# Without `alloc` the crate is pure-borrow: Meta types hold `&'a str` slices
+# into the input buffer, durations are `core::time::Duration`, datetimes are
+# `jiff::civil::DateTime` (jiff's `alloc` is technically optional but we gate
+# our SmolStr/serde paths on it). Phase E and later land this contract.
+alloc = ["dep:smol_str", "jiff/alloc"]
+
+# `std` implies `alloc`. mediaframe's idiom: a `--no-default-features --features alloc`
+# build skips `std` entirely, exercising the no_std + alloc tier.
+std = ["alloc", "smol_str?/std", "jiff/std", "thiserror/default"]
+
+# CLI JSON emission. `serde_json` allocates; gates `alloc`.
+# `serde` is pulled in here too because `jsondiff` (the JSON-emission diff
+# oracle) uses `serde::de` traits to drive ordered-pair deserialization.
+json = ["alloc", "dep:serde_json", "dep:serde", "jiff/serde"]
+
+# Umbrella — enables every per-format gate.
+all-formats = [
+  "aac", "aiff", "ape", "audible", "dsf", "dv", "flac",
+  "id3", "mp3", "mpc", "moi", "ogg", "red", "wavpack",
+]
+
+# Per-format gates with cross-format dependency chains.
+# These are the canonical statement of WHO chains WHOM; currently scattered
+# across format-module comments.
+#
+# Phase C status: the structure mirrors spec §4 exactly. Feature graph leaves
+# (`aac`, `audible`, `dv`, `moi`, `ogg`, `red`) carry no `alloc`/`std`
+# implication. The source code today uses `std::vec::Vec`, `std::string::String`,
+# `smol_str::SmolStr`, etc. unconditionally — so `--no-default-features
+# --features aac` alone fails to compile. This is expected: see
+# `docs/tracking.md` for the Phase D/E migration that retires the std
+# coupling per-format. Until then, the only buildable combos are:
+#   - default (`std + json + all-formats`)
+#   - `--all-features`
+#   - `--features std,...` — anything that pulls `std`
+# The non-default CI tiers in spec §9 use `--features alloc,...` etc. and
+# are marked `continue-on-error: true` in `.github/workflows/ci.yml` until
+# the per-format migrations land.
+aac        = []
+aiff       = ["id3"]
+ape        = ["id3"]
+audible    = []
+dsf        = ["id3"]
+dv         = []
+flac       = ["id3"]
+id3        = []
+# `mp3` chains ID3 (header), MPEG-audio (frame scan), AND APE: bundled
+# `ID3::ProcessMP3` (ID3.pm:1722-1727) runs `APE::ProcessAPE` as the final
+# trailer fallback, so the typed MP3 parser unconditionally calls
+# `ape::ProcessApe`. Without the `ape` edge a `--features std,mp3` build
+# (no `ape`) fails to compile.
+mp3        = ["id3", "mpeg-audio", "ape"]
+mpc        = ["id3", "ape"]
+# `moi` is reserved here even though the actual `src/formats/moi.rs` code lives
+# on the `moi-port` branch and hasn't merged to `main` yet. The format-gating
+# `cfg` for MOI lands in Phase E when the MOI source merges.
+moi        = []
+ogg        = []
+red        = []
+wavpack    = ["id3", "ape"]
+
+# Internal: MPEG audio frame parser (sub-dep of mp3). Maps to
+# `src/formats/mpeg.rs` (the audio side). The video side of MPEG is a
+# deferred Phase-2 forward item.
+mpeg-audio = []
 
 [dependencies]
-derive_more = { version = "2", features = ["is_variant", "unwrap", "try_unwrap"] }
-serde = { version = "1", features = ["derive"] }
-smol_str = "0.3"
+derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
+# Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
+# typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
+jiff        = { version = "0.2", default-features = false }
+serde       = { version = "1", default-features = false, features = ["derive"], optional = true }
 # `raw_value` exposes `serde_json::value::RawValue`, used by `jsondiff` to
 # compare scalar lexemes byte-for-byte (strings escape-exact, numbers
 # token-exact). This subsumes the old `arbitrary_precision` number path, and
 # `preserve_order` is no longer needed because `serialize` builds the JSON
 # string directly (no `serde_json` round-trip).
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json  = { version = "1", default-features = false, features = ["raw_value", "alloc"], optional = true }
+smol_str    = { version = "0.3", default-features = false, optional = true }
+thiserror   = { version = "2", default-features = false }
 
 [dev-dependencies]
-# `serde_json` is a normal dependency (above) and is already visible to
-# unit and integration tests, so it is intentionally NOT duplicated here.
+# `serde_json` is a normal (optional) dependency above; under the `json`
+# feature it is in scope for tests too. Not duplicated here.
 tempfile = "3"
 
 [profile.bench]

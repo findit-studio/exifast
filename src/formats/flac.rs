@@ -1301,7 +1301,7 @@ mod tests {
     assert_eq!(g(TagId::Str("Bit103-107")).unwrap().name(), "BitsPerSample"); // FLAC.pm:72
     assert_eq!(g(TagId::Str("Bit108-143")).unwrap().name(), "TotalSamples"); //  FLAC.pm:76
     assert_eq!(g(TagId::Str("Bit144-271")).unwrap().name(), "MD5Signature"); //  FLAC.pm:77
-                                                                             // Channels + BitsPerSample carry a ValueConv (`$val + 1`).
+    // Channels + BitsPerSample carry a ValueConv (`$val + 1`).
     assert!(matches!(
       g(TagId::Str("Bit100-102")).unwrap().value_conv(),
       ValueConv::Func(_)
@@ -1589,8 +1589,8 @@ mod tests {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(1u32).to_le_bytes()); // vendor len = 1
     payload.push(b'v'); // vendor "v"
-                        // pos==5; append exactly 4 bytes — count slot if buggy `<=` is taken;
-                        // non-zero so the buggy branch enters the comment loop.
+    // pos==5; append exactly 4 bytes — count slot if buggy `<=` is taken;
+    // non-zero so the buggy branch enters the comment loop.
     payload.extend_from_slice(&[0x01u8, 0, 0, 0]); // would-be count=1
     let mut m = Metadata::new("x.flac");
     let ok = process_vorbis_comments(&payload, &mut m, true);
@@ -1617,10 +1617,11 @@ mod tests {
     let ok = process_vorbis_comments(&[], &mut m, true);
     assert!(!ok);
     assert!(m.tags().is_empty());
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w == "Format error in Vorbis comments"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w == "Format error in Vorbis comments")
+    );
   }
 
   #[test]
@@ -1686,10 +1687,11 @@ mod tests {
       "post-ID3 `fLaC` magic must accept and continue parsing"
     );
     // File:FileType=FLAC pushed.
-    assert!(m
-      .tags()
-      .iter()
-      .any(|t| t.name() == "FileType" && t.value() == &TagValue::Str("FLAC".into())));
+    assert!(
+      m.tags()
+        .iter()
+        .any(|t| t.name() == "FileType" && t.value() == &TagValue::Str("FLAC".into()))
+    );
     // StreamInfo tag(s) emitted from the post-ID3 body.
     assert!(
       m.tags().iter().any(|t| t.name() == "BlockSizeMin"),
@@ -1758,10 +1760,11 @@ mod tests {
     // SetFileType fired (FLAC.pm:255).
     assert!(m.tags().iter().any(|t| t.name() == "FileType"));
     // Warning recorded with the exact Perl string.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w == "Format error in FLAC file"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w == "Format error in FLAC file")
+    );
   }
 
   #[test]
@@ -1787,10 +1790,11 @@ mod tests {
     let data: &[u8] = &[b'f', b'L', b'a', b'C', 0x80, 0xff, 0xff, 0xff];
     let mut c = ParseContext::new(data, "FLAC", 0, "FLAC", None, true, &mut m);
     assert!(ProcessFlac.process(&mut c));
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w == "Format error in FLAC file"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w == "Format error in FLAC file")
+    );
   }
 
   #[test]
@@ -1802,7 +1806,7 @@ mod tests {
     // < 30 s ⇒ '%.2f s'.
     assert_eq!(convert_duration(1.543125), "1.54 s");
     assert_eq!(convert_duration(29.999), "30.00 s"); // rounds up below 30
-                                                     // == 30 ⇒ H:MM:SS arm (+0.5 round, int → 30s).
+    // == 30 ⇒ H:MM:SS arm (+0.5 round, int → 30s).
     assert_eq!(convert_duration(30.0), "0:00:30");
     // Hour boundary.
     assert_eq!(convert_duration(3600.0), "1:00:00");
@@ -1836,9 +1840,9 @@ mod tests {
     assert_eq!(decode_base64("Q2F0!garbage"), b"Cat");
     // Missing padding still decodes the bytes we can: "Cat" → "Q2F0".
     assert_eq!(decode_base64("Q2F"), b"Ca"); // 3 base64 chars → 2 bytes
-                                             // R2-F4: internal padding is DELETED, decoding continues past it.
-                                             // "AA==AA" — Perl `tr/.../d` deletes both `=`s, leaving "AAAA" which
-                                             // decodes to 3 zero bytes (verified against bundled Perl).
+    // R2-F4: internal padding is DELETED, decoding continues past it.
+    // "AA==AA" — Perl `tr/.../d` deletes both `=`s, leaving "AAAA" which
+    // decodes to 3 zero bytes (verified against bundled Perl).
     assert_eq!(decode_base64("AA==AA"), [0u8, 0, 0]);
     // "AA==" — `tr/.../d` deletes both `=`s, leaving "AA" which decodes
     // to 1 zero byte (3-base64-char → 2-byte partial chunk halves).

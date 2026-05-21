@@ -21,15 +21,20 @@
 use crate::{
   formats::id3::{
     decode::unsync_safe,
-    v1::{process_id3v1, ID3V1_MAIN},
+    v1::{ID3V1_MAIN, process_id3v1},
     v2_2::ID3V2_2_MAIN,
     v2_3::ID3V2_3_MAIN,
     v2_4::ID3V2_4_MAIN,
     v2_process::process_id3v2,
   },
-  parser::{FormatParser, ParseContext},
+  parser::ParseContext,
   value::{Group, TagValue},
 };
+// `FormatParser` is only implemented by `ProcessMp3` (gated behind `mp3`,
+// Codex A-R2-1); importing it unconditionally warns under `--features
+// std,id3`. Gate the import alongside its sole impl.
+#[cfg(feature = "mp3")]
+use crate::parser::FormatParser;
 
 /// Result of [`parse_v2_header`]. Carries the parsed header buffer + the
 /// declared body size + the flags byte — the size and flags are needed by
@@ -46,8 +51,15 @@ struct ParsedV2Header {
 /// The MP3 file-type parser. Faithful to bundled Perl's `Image::ExifTool::
 /// ID3::ProcessMP3` (ID3.pm:1684-1728); the chain to MPEG / APE for the
 /// audio-frame / APE-trailer tags is documented forward items (rows 17 / 5).
+///
+/// Gated behind `mp3` (Codex A-R2-1): `process` references
+/// `crate::formats::mpeg` (mpeg-audio) + `crate::formats::ape` (ape), so a
+/// per-format build that pulls `id3` alone (flac/aiff/dsf/ape chains) must
+/// NOT compile it. The `mp3` feature pulls both `mpeg-audio` + `ape`.
+#[cfg(feature = "mp3")]
 pub struct ProcessMp3;
 
+#[cfg(feature = "mp3")]
 impl FormatParser for ProcessMp3 {
   fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // ID3.pm:1684-1728 `ProcessMP3` is the MP3 PROCESS_PROC. The
@@ -587,6 +599,10 @@ mod tests {
   use super::*;
   use crate::value::Metadata;
 
+  // `run` + the `process_mp3_*` tests below drive `ProcessMp3`, which is
+  // gated behind `mp3` (Codex A-R2-1). Gate the helper + its tests so
+  // `cargo test --no-default-features --features std,id3` stays clean.
+  #[cfg(feature = "mp3")]
   fn run(data: &[u8], name: &str) -> Metadata {
     let mut m = Metadata::new(name);
     {
@@ -597,6 +613,7 @@ mod tests {
     m
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_empty_data_rejects() {
     // R6-F1 disposition: empty data + .mp3 ext is still REJECTED — no
@@ -606,6 +623,7 @@ mod tests {
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_random_bytes_no_mpeg_sync_rejects() {
     // Random non-MPEG bytes with a .mp3 extension → reject (no MPEG
@@ -615,6 +633,7 @@ mod tests {
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_valid_mpeg_audio_frame_accepts_as_mp3() {
     // 4-byte MPEG audio frame header that satisfies the bundled
@@ -637,11 +656,12 @@ mod tests {
     assert_eq!(ft.value(), &TagValue::Str("MP3".into()));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_id3v1_only() {
     // Construct a file: 1024 padding bytes + 128-byte ID3v1 TAG block.
     let mut data: Vec<u8> = vec![0; 256]; // some prefix that's NOT ID3
-                                          // Build TAG block.
+    // Build TAG block.
     let mut tag = Vec::with_capacity(128);
     tag.extend_from_slice(b"TAG");
     let pad = |s: &str, n: usize| {
@@ -668,6 +688,7 @@ mod tests {
     assert_eq!(genre.value(), &TagValue::Str("Hip-Hop".into()));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_id3v2_2_with_title_artist() {
     // ID3v2.2 header (10 bytes) + 6-byte TT2 frame + 6-byte TP1 frame.
@@ -715,6 +736,7 @@ mod tests {
     assert_eq!(id3size.value(), &TagValue::I64(10 + size as i64));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_unsync_extheader_shrinks_below_4_does_not_panic() {
     // R7-F2 regression: a crafted v2.3 with flags=0xc0 (unsync +
@@ -732,12 +754,14 @@ mod tests {
     data.extend_from_slice(&[0xff, 0x00, 0xff, 0x00]); // body (shrinks to 0xff 0xff)
     let m = run(&data, "x.mp3");
     // Must not panic. Faithful Warn fires.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Bad ID3 extended header"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Bad ID3 extended header")
+    );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_layer_two_dotless_filename_rejected() {
     // R8-F1 regression: a dotless filename hitting MP3 weakMagic +
@@ -755,6 +779,7 @@ mod tests {
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_layer_two_mus_extension_accepted() {
     // R8-F1 regression (positive case): bundled ID3.pm:1716 sets
@@ -771,6 +796,7 @@ mod tests {
     assert_eq!(ft.value(), &TagValue::Str("MP3".into()));
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_unsupported_id3v5_warns() {
     // ID3 magic + version 5.0 — bundled Perl emits the version Warn.
@@ -781,12 +807,14 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&[0u8, 0, 0, 0]);
     let m = run(&data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Unsupported ID3 version: 2.5.0"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Unsupported ID3 version: 2.5.0")
+    );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_truncated_warns() {
     // ID3 magic + valid header + declared size 100, but only 3 body bytes.
@@ -798,21 +826,24 @@ mod tests {
     data.extend_from_slice(&[0u8, 0, 0, 100]); // sync-safe 100
     data.extend_from_slice(&[0u8; 3]);
     let m = run(&data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Truncated ID3 data"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Truncated ID3 data")
+    );
   }
 
+  #[cfg(feature = "mp3")]
   #[test]
   fn process_mp3_short_header_warns() {
     // ID3 magic + only 2 of 7 header bytes.
     let data = b"ID3\x02\x00";
     let m = run(data, "x.mp3");
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.as_str() == "Short ID3 header"));
+    assert!(
+      m.warnings()
+        .iter()
+        .any(|w| w.as_str() == "Short ID3 header")
+    );
   }
 
   #[test]

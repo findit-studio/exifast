@@ -57,7 +57,7 @@
 
 use crate::{
   charset::decode_macroman,
-  datetime::{convert_datetime, convert_unix_time, AIFF_EPOCH_OFFSET},
+  datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_unix_time},
   parser::{FormatParser, ParseContext},
   processbinarydata::process_binary_data,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -554,13 +554,13 @@ impl FormatParser for ProcessAiff {
         break;
       };
       pos += 8; // :222 `$pos += 8`.
-                // AIFF.pm:227 `my $len2 = $len + ($len & 0x01)` — chunks padded to
-                // an even number of bytes. Perl scalars are 64-bit; on a 32-bit
-                // host `usize` is 32-bit and `len + 1` would wrap when
-                // `len == u32::MAX`. We `saturating_add`: `len2` then equals
-                // `usize::MAX`, which is guaranteed `> data.len()` so the
-                // short-read / unknown-chunk EOF arms both still fire
-                // correctly. Equivalent to Perl on the host's natural width.
+      // AIFF.pm:227 `my $len2 = $len + ($len & 0x01)` — chunks padded to
+      // an even number of bytes. Perl scalars are 64-bit; on a 32-bit
+      // host `usize` is 32-bit and `len + 1` would wrap when
+      // `len == u32::MAX`. We `saturating_add`: `len2` then equals
+      // `usize::MAX`, which is guaranteed `> data.len()` so the
+      // short-read / unknown-chunk EOF arms both still fire
+      // correctly. Equivalent to Perl on the host's natural width.
       let len2 = len.saturating_add(len & 0x01);
       // AIFF.pm:224 `$et->GetTagInfo($tagTablePtr, $tag)`.
       let tag_str = match core::str::from_utf8(&tag_bytes) {
@@ -670,8 +670,8 @@ impl FormatParser for ProcessAiff {
           }
         }
         pos = pos.saturating_add(len2); // AIFF.pm:268 `$pos += $len2`.
-                                        // AIFF.pm:269 `$n = 0;` (inside the body, before the for-step),
-                                        // then the for's `++$n` at top of next iter:
+        // AIFF.pm:269 `$n = 0;` (inside the body, before the for-step),
+        // then the for's `++$n` at top of next iter:
         n = 0;
         n = n.saturating_add(1);
       } else if len == 0 {
@@ -695,7 +695,7 @@ impl FormatParser for ProcessAiff {
           break;
         }
         n = n.saturating_add(1); // for-step `++$n` after `next`
-                                 // No `pos += len2` here (len == 0, len2 == 0) — fall-through to top.
+      // No `pos += len2` here (len == 0, len2 == 0) — fall-through to top.
       } else {
         // AIFF.pm:265-267 `else { $raf->Seek($len2, 1) or $err=1, last }`.
         // Unknown chunk with non-zero length: skip its body. Perl's `Seek`
@@ -1006,7 +1006,7 @@ mod tests {
     data.extend_from_slice(&0u16.to_be_bytes()); // markerID = 0 ⇒ skip MarkerID tag
     data.extend_from_slice(&4u16.to_be_bytes()); // size
     data.extend_from_slice(b"abcd"); // text
-                                     // Second comment header truncated: data ends after first.
+    // Second comment header truncated: data ends after first.
     process_comment(&data, &mut m, false);
     assert_eq!(m.tags().len(), 2); // CommentTime + Comment text (no MarkerID b/c 0)
     assert_eq!(m.tags()[0].name(), "CommentTime");

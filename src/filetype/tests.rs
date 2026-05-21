@@ -226,7 +226,7 @@ fn strip_subtype_leftmost_paren_matches_perl() {
   // No strip when ends with ')' but no " (" anywhere before it.
   assert_eq!(strip_subtype("(nodot)"), None); // no SPACE before "("
   assert_eq!(strip_subtype("a(b)"), None); // no space before "("
-                                           // Edge: " (" immediately before the ")".
+  // Edge: " (" immediately before the ")".
   assert_eq!(strip_subtype("stem ()"), Some("stem"));
   // Unicode in the stem is not a concern (" (" and ")" are ASCII so the
   // byte index from find is always a valid char boundary).
@@ -1062,8 +1062,8 @@ fn detection_candidate_accessor_contract() {
   // (ExifTool.pm:3038 `($type eq 'TIFF') ? $tiffType : $type`).
   assert_eq!(d.parent_type(), "FLV");
   assert_eq!(d, d.clone()); // Clone + PartialEq (derive_more-free struct)
-                            // Remaining candidates are the faithful WV.. fall-through (non-empty,
-                            // fully drainable — FusedIterator stays None after exhaustion).
+  // Remaining candidates are the faithful WV.. fall-through (non-empty,
+  // fully drainable — FusedIterator stays None after exhaustion).
   let rest: Vec<&str> = it.by_ref().map(|c| c.file_type()).collect();
   assert_eq!(
     rest,

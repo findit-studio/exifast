@@ -403,6 +403,12 @@ pub trait FormatParser: Sync {
   fn process(&self, ctx: &mut ParseContext<'_>) -> bool;
 }
 
+/// Phase D shim: the existing push-style [`FormatParser`] is being
+/// migrated to the new typed-Meta [`crate::parser_new::FormatParser`] in
+/// Phases E–F. During migration this alias documents the legacy trait
+/// without renaming, so existing impl sites continue to work verbatim.
+pub use FormatParser as OldFormatParser;
+
 /// Faithful `ConvertFileSize` (ExifTool.pm:6840-6860), default-units branch
 /// only. The `ByteUnit eq 'Binary'` arm (ExifTool.pm:6843-6850) is gated on
 /// the `ByteUnit` option, which the read path here does not expose (YAGNI;
@@ -901,7 +907,7 @@ mod tests {
     {
       let mut c = ctx_over(&mut m, "AAC", true);
       c.set_file_type(None, None, None); // MIMEType = audio/aac
-                                         // "XYZ" has no %mimeType key and we pass mime=None.
+      // "XYZ" has no %mimeType key and we pass mime=None.
       c.override_file_type("XYZ", None, None);
     }
     let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
@@ -1346,6 +1352,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn aac_fixture_matches_golden_print_on() {
     let root = env!("CARGO_MANIFEST_DIR");
@@ -1357,6 +1364,7 @@ mod tests {
       .unwrap_or_else(|e| panic!("AAC -j -G1 -struct conformance: {}", e.message()));
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn aac_fixture_matches_golden_n() {
     let root = env!("CARGO_MANIFEST_DIR");
@@ -1427,6 +1435,7 @@ mod tests {
 
   static ACCEPTING_BUT_ERRORING: AcceptingButErroring = AcceptingButErroring;
 
+  #[cfg(feature = "json")]
   #[test]
   fn accepted_parser_error_reaches_serialized_json() {
     // Register the injected parser for the REAL detected file type.
@@ -1501,6 +1510,7 @@ mod tests {
 
   static REJECTING_AFTER_SET_FILE_TYPE: RejectingAfterSetFileType = RejectingAfterSetFileType;
 
+  #[cfg(feature = "json")]
   #[test]
   fn rejecting_parser_set_file_type_side_effect_persists() {
     // Faithful Perl `$self` model: a rejecting `Process<Type>` that
@@ -1564,6 +1574,7 @@ mod tests {
   // gated exactly like the post-loop Error's `not defined $type`
   // (ExifTool.pm:3080) — NOT on `SetFileType`. This FAILS if anyone
   // adopts the reviewer's unfaithful `file_type_set` gate.
+  #[cfg(feature = "json")]
   #[test]
   fn finalization_error_keyed_on_parser_accept_not_set_file_type() {
     // (a) Parser returns true WITHOUT set_file_type ⇒ its tag emits, and
@@ -1662,6 +1673,7 @@ mod tests {
   }
   static WV_OVERWRITE_AND_ACCEPT: WvOverwriteAndAccept = WvOverwriteAndAccept;
 
+  #[cfg(feature = "json")]
   #[test]
   fn set_file_type_is_file_scoped_first_call_wins_across_candidates() {
     // `bad.aac` with head `\xff\xf1\xf0…` yields candidates beginning

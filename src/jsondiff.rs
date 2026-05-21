@@ -316,29 +316,37 @@ mod tests {
     // (key, raw-bytes) sort mispaired them and reported a FALSE
     // mismatch. Canonical-form pairing fixes it: {x:1,y:2} ≡ {y:2,x:1}
     // and {x:9} ≡ {x:9}, so the two documents are equivalent.
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1,"y":2},"A":{"x":9}}]"#,
-      r#"[{"A":{"x":9},"A":{"y":2,"x":1}}]"#,
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1,"y":2},"A":{"x":9}}]"#,
+        r#"[{"A":{"x":9},"A":{"y":2,"x":1}}]"#,
+      )
+      .is_ok()
+    );
     // Nested arrays inside dup values stay ORDER-significant.
-    assert!(json_equivalent(
-      r#"[{"A":[1,2],"A":{"q":0}}]"#,
-      r#"[{"A":{"q":0},"A":[2,1]}]"#,
-    )
-    .is_err());
+    assert!(
+      json_equivalent(
+        r#"[{"A":[1,2],"A":{"q":0}}]"#,
+        r#"[{"A":{"q":0},"A":[2,1]}]"#,
+      )
+      .is_err()
+    );
     // The fix must NOT loosen the verdict: genuinely different dup
     // values (and different value multisets) still mismatch.
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1},"A":{"x":2}}]"#,
-      r#"[{"A":{"x":1},"A":{"x":3}}]"#,
-    )
-    .is_err());
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1},"A":{"y":1}}]"#,
-      r#"[{"A":{"x":1},"A":{"x":1}}]"#,
-    )
-    .is_err());
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1},"A":{"x":2}}]"#,
+        r#"[{"A":{"x":1},"A":{"x":3}}]"#,
+      )
+      .is_err()
+    );
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1},"A":{"y":1}}]"#,
+        r#"[{"A":{"x":1},"A":{"x":1}}]"#,
+      )
+      .is_err()
+    );
   }
 
   #[test]
@@ -384,11 +392,13 @@ mod tests {
 
   #[test]
   fn nested_structures_compare_recursively() {
-    assert!(json_equivalent(
-      r#"[{"a":[1,{"x":"v"}],"b":2}]"#,
-      r#"[{"b":2,"a":[1,{"x":"v"}]}]"#
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        r#"[{"a":[1,{"x":"v"}],"b":2}]"#,
+        r#"[{"b":2,"a":[1,{"x":"v"}]}]"#
+      )
+      .is_ok()
+    );
     let m = json_equivalent(r#"[{"a":[1,{"x":"v"}]}]"#, r#"[{"a":[1,{"x":"w"}]}]"#).unwrap_err();
     assert_eq!(
       m,
@@ -407,25 +417,31 @@ mod tests {
 
   #[test]
   fn invalid_json_is_reported() {
-    assert!(json_equivalent("[1,]", "[1]")
-      .unwrap_err()
-      .message()
-      .contains("actual is invalid"));
-    assert!(json_equivalent("[1]", "nope")
-      .unwrap_err()
-      .message()
-      .contains("golden is invalid"));
+    assert!(
+      json_equivalent("[1,]", "[1]")
+        .unwrap_err()
+        .message()
+        .contains("actual is invalid")
+    );
+    assert!(
+      json_equivalent("[1]", "nope")
+        .unwrap_err()
+        .message()
+        .contains("golden is invalid")
+    );
   }
 
   #[test]
   fn whitespace_insignificant_for_containers() {
     // Internal container whitespace must not cause a mismatch (only scalar
     // lexemes are byte-compared; structure is compared recursively).
-    assert!(json_equivalent(
-      "[ { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ]",
-      r#"[{"a":1,"b":[2,3]}]"#
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        "[ { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ]",
+        r#"[{"a":1,"b":[2,3]}]"#
+      )
+      .is_ok()
+    );
   }
 
   #[test]

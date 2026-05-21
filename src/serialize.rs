@@ -8,7 +8,7 @@
 //! `serde_json` round-trip) keeps it byte-exact with ExifTool and infallible —
 //! there is no error path, so `Bytes`/`Rational` can never fail the document.
 
-use crate::value::{format_g, perl_nonfinite_str, Metadata, Rational, TagValue};
+use crate::value::{Metadata, Rational, TagValue, format_g, perl_nonfinite_str};
 use std::collections::HashSet;
 
 /// ExifTool's `%jsonChar` short escapes (`exiftool` line 250):

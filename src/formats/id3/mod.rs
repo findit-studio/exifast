@@ -51,4 +51,9 @@ pub mod v2_4;
 pub mod v2_common;
 pub mod v2_process;
 
+// MP3 wrapper re-export (Codex A-R2-1) — gated behind `mp3`, which pulls
+// `mpeg-audio` + `ape`. The plain `id3` feature (pulled by flac/aiff/dsf/ape
+// for the ID3-prefix chain) does NOT compile `ProcessMp3` because its
+// `process` references `crate::formats::mpeg` + `crate::formats::ape`.
+#[cfg(feature = "mp3")]
 pub use process::ProcessMp3;
