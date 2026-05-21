@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
-//! New lib-first `FormatParser` trait scaffold. Lands alongside the existing
-//! [`crate::parser::OldFormatParser`] (aliased from the legacy
-//! [`crate::parser::FormatParser`]); each format migrates from old to new in
-//! Phases E–F per the design spec at
+//! Lib-first `FormatParser` trait + closed-set [`AnyParser`] / [`AnyMeta`]
+//! dispatch — the sole parser architecture. The engine entry
+//! [`crate::parser::extract_info`] routes through [`any_parser_for`] →
+//! `AnyParser::extract_into`. Design spec at
 //! `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`.
 //!
 //! The four central pieces, per spec §6:
@@ -504,9 +504,10 @@ impl MetaSinker for AnyMeta<'_> {
       AnyMeta::Aac(m) => m.sink(print_conv, out),
       #[cfg(feature = "dv")]
       AnyMeta::Dv(o) => match o {
-        // DV.pm:188 — Warn + return 1 without DV:* tags. The bridge
-        // emits the warning at the legacy `OldFormatParser::process`
-        // entry; the sink path emits no tags for this variant.
+        // DV.pm:188 — Warn + return 1 without DV:* tags. This `MetaSinker`
+        // path (library `parse_bytes`/`sink`) emits the warning and no
+        // tags. The engine entry `dv::ProcessDv::process` emits the same
+        // warning via `ctx.metadata().push_warning` after `SetFileType`.
         crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
           out.write_warning("Unrecognized DV profile")
         }
@@ -895,14 +896,15 @@ impl AnyParser {
         let _ = (shared, ext);
         // The OGG typed parser returns `Some(OggMeta { success: false })`
         // (carrying the "Not a valid OGG file" warning) for non-OGG /
-        // garbage input, faithful to the legacy `ProcessOGG` return. In
-        // *closed dispatch* `Ok(Some(_))` terminates the candidate loop, so
-        // an ID3-prefixed MP3 — whose detection candidates may try OGG
-        // before MP3 — would be mis-reported as `AnyMeta::Ogg` with no MPEG
-        // tags. Map `success() == false` to `Ok(None)` so dispatch continues
-        // to the next candidate (Codex C-R2-1). The legacy bridge
-        // (`OldFormatParser`) is unchanged and still emits the OGG warning
-        // for genuinely OGG-typed files.
+        // garbage input, faithful to the bundled `ProcessOGG` return. In
+        // this `parse_any` library path `Ok(Some(_))` terminates the
+        // candidate loop, so an ID3-prefixed MP3 — whose detection
+        // candidates may try OGG before MP3 — would be mis-reported as
+        // `AnyMeta::Ogg` with no MPEG tags. Map `success() == false` to
+        // `Ok(None)` so dispatch continues to the next candidate (Codex
+        // C-R2-1). The engine entry `ogg::ProcessOgg::process` likewise
+        // returns `false` on `!success` (and only then emits the OGG
+        // warning for a genuinely OGG-typed file).
         p.parse(bytes)
           .map(|o| o.filter(|m| m.success()).map(AnyMeta::Ogg))
           .map_err(Into::into)
@@ -910,7 +912,7 @@ impl AnyParser {
       #[cfg(feature = "mpeg-audio")]
       AnyParser::MpegAudio(p) => {
         // The MPEG-audio parser is normally invoked internally by MP3 — it
-        // is never a top-level file-type in `parser_for`. The closed
+        // is never a top-level file-type in `any_parser_for`. The closed
         // dispatch arm is provided so external callers that construct an
         // `AnyParser::MpegAudio` directly (e.g. unit tests, or future
         // crates that want raw MPEG-audio access) can still route through
@@ -956,8 +958,8 @@ impl AnyParser {
   /// Each arm delegates to the format module's own `process` entry, which
   /// owns the faithful ordering of `SetFileType` / `FoundTag` / `Warn` /
   /// `Error` and any cross-format chain (ID3 → MPEG → APE trailer, etc.).
-  /// This is the single closed-set dispatch site replacing the retired
-  /// `parser_for(ft) -> &dyn OldFormatParser` registry.
+  /// This is the single closed-set engine dispatch site (resolved via
+  /// [`any_parser_for`]).
   pub(crate) fn extract_into(self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` is empty and `ctx` is unused. Discard it to stay warning-clean.
@@ -1023,10 +1025,10 @@ impl AnyParser {
 
 /// Map a finalized ExifTool file-type string to its [`AnyParser`] arm, or
 /// `None` if the format has no ported parser yet OR its Cargo feature is
-/// disabled. Mirrors [`crate::formats::parser_for`] (the legacy registry)
-/// shape-for-shape — both return `None` for feature-pruned formats, faithful
-/// to ExifTool's "module not loaded ⇒ `next` in candidate loop"
-/// (ExifTool.pm:3060-3077).
+/// disabled. This is the runtime parser registry the engine entry
+/// [`crate::parser::extract_info`] dispatches through; it returns `None` for
+/// feature-pruned formats, faithful to ExifTool's "module not loaded ⇒
+/// `next` in candidate loop" (ExifTool.pm:3060-3077).
 #[must_use]
 pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
   match file_type {
@@ -1234,10 +1236,8 @@ mod tests {
   }
 
   /// `any_parser_for` resolves every ported format that has its feature
-  /// enabled. Mirrors the same coverage as [`crate::formats::parser_for`]
-  /// (the legacy registry); the two registries are designed to be
-  /// shape-for-shape identical (same file-type strings ⇒ same `Some`/
-  /// `None` decisions).
+  /// enabled, and returns `None` for unported / video-side / empty
+  /// file-type strings (the candidate-loop fall-through cases).
   #[test]
   fn any_parser_for_resolves_ported_formats() {
     #[cfg(feature = "audible")]

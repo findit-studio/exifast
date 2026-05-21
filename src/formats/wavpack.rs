@@ -5,12 +5,11 @@
 //! Faithful port of `Image::ExifTool::WavPack` (lib/Image/ExifTool/WavPack.pm).
 //! WavPack.pm is 144 lines: one tag table + one `Process<Type>` sub.
 //!
-//! **Phase F5 — lib-first migration.** Follows the MOI pilot (Phase E) +
-//! AAC / DV leaves (Phase F1) pattern: a typed [`WvMeta<'a>`] is produced
-//! by the new [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during the per-format crawl. The bridge is retired in Phase G.
+//! A typed [`WvMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] and the chained ID3/APE trailers so
+//! the serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## What WavPack is
 //!
@@ -51,7 +50,7 @@
 //! borrow-from-input `Option<&'a [u8]>` placeholders denoting the byte
 //! ranges where ID3 / APE trailers may live (the whole input buffer,
 //! since both legacy formats scan the entire file). Actually parsing
-//! those trailers is delegated to the legacy `OldFormatParser` bridge,
+//! those trailers is delegated to the engine entry `process`,
 //! which calls the existing chained entries
 //! `crate::formats::id3::process::process_id3_chained` +
 //! `crate::formats::ape::ProcessApe::process_trailer_only` (the same
@@ -292,7 +291,7 @@ pub enum SampleRate {
 /// post-ValueConv) and two borrow-from-input `Option<&'a [u8]>` placeholders
 /// for ID3 / APE trailers. The placeholders denote the byte ranges where
 /// the legacy chained parsers can scan; actually invoking them lives in
-/// the [`OldFormatParser`] bridge for byte-exact CLI conformance during
+/// the engine entry `process` for byte-exact conformance during
 /// Phase F5–G.
 ///
 /// **D8 — no public fields, accessors only.** Construct only via
@@ -357,7 +356,7 @@ pub struct WvMeta<'a> {
   /// `Some(&data)` — the full input buffer — on the typed parse so a
   /// future lib-first ID3 typed parser can pick up the range without a
   /// re-read; `None` is reserved for a future "stop-after-header" mode.
-  /// Today the `OldFormatParser` bridge does the actual chained parsing.
+  /// Today the engine entry `process` does the actual chained parsing.
   id3_apetrailer_scan: Option<&'a [u8]>,
 }
 
@@ -414,7 +413,7 @@ impl<'a> WvMeta<'a> {
 
   /// Byte range where the chained ID3 / APE-trailer scan runs. `Some`
   /// borrows from the input buffer; today's lib-first parse always sets
-  /// this to the full buffer. The `OldFormatParser` bridge consumes it
+  /// this to the full buffer. The engine entry `process` consumes it
   /// through the existing chained entries
   /// `crate::formats::id3::process::process_id3_chained` +
   /// `crate::formats::ape::ProcessApe::process_trailer_only`.
@@ -435,7 +434,7 @@ impl<'a> WvMeta<'a> {
 ///
 /// The shared flags are reserved for the lib-first typed ID3 / APE
 /// parsers (Phase F2 / F3 work in parallel agents). Today the
-/// [`OldFormatParser`] bridge still drives ID3 / APE via the legacy
+/// engine entry `process` still drives ID3 / APE via the
 /// `Metadata` flags ([`crate::value::Metadata::set_done_id3`] /
 /// [`crate::value::Metadata::set_done_ape`]); when the typed-ID3 /
 /// typed-APE typed parsers land they'll read/write
@@ -693,7 +692,7 @@ impl core::fmt::Display for WvError {
 impl std::error::Error for WvError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessWv {
@@ -1077,7 +1076,7 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+  // Engine entry — typed parse + File:* + sink into `Metadata`
   // -------------------------------------------------------------------------
 
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {

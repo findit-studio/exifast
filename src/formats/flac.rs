@@ -4,12 +4,11 @@
 #![cfg(feature = "flac")]
 //! Faithful port of `Image::ExifTool::FLAC` (lib/Image/ExifTool/FLAC.pm).
 //!
-//! **Phase F3 — lib-first migration.** This format follows the MOI pilot
-//! (Phase E) + AAC/DV pilots (Phase F1) pattern: a typed [`FlacMeta<'a>`]
-//! is produced by the new [`crate::parser_new::FormatParser`] trait; the
-//! legacy [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during Phases F1–F5. The bridge is retired in Phase G.
+//! A typed [`FlacMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! emits StreamInfo/Picture/Composite via [`crate::parser_new::MetaSinker::sink`]
+//! and the list-aware VorbisComment stream directly into `Metadata`, so the
+//! serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## What FLAC is
 //!
@@ -49,13 +48,13 @@ use crate::value::TagValue;
 // ===========================================================================
 // Static %FLAC::StreamInfo + %FLAC::Picture + %Vorbis::Comments tables
 //
-// Kept ALONGSIDE the typed FlacMeta so the legacy `OldFormatParser` bridge
-// (and downstream consumers such as `tests/flac_streaminfo.rs`) keep their
+// Kept ALONGSIDE the typed FlacMeta so the engine entry `process` (and
+// downstream consumers such as `tests/flac_streaminfo.rs`) keep their
 // faithful tag-table identities (group strings, ValueConv functions, list
 // flags, etc.). The typed parser does NOT depend on these tables for
-// extraction — it consumes raw bytes directly — but the bridge sink path
-// emits family-1 groups derived from `TABLE.group0()` so the tables remain
-// the source of truth for group identity.
+// extraction — it consumes raw bytes directly — but the sink path emits
+// family-1 groups derived from `TABLE.group0()` so the tables remain the
+// source of truth for group identity.
 // ===========================================================================
 
 // ----- %FLAC::StreamInfo (FLAC.pm:59-82) ----------------------------------
@@ -1330,7 +1329,7 @@ impl MetaSinker for FlacMeta<'_> {
   /// first-occurrence position via [`TagWriter::write_str_list`], so
   /// list-aware writers (`MetadataTagWriter` → `Metadata::push_listable`)
   /// faithfully build a JSON array (ExifTool.pm:9505-9520 `FoundTag`). The
-  /// legacy bridge [`OldFormatParser::process`] keeps its own
+  /// legacy bridge the engine entry `process` keeps its own
   /// `push_listable` loop for the byte-exact CLI path; this typed sink now
   /// reaches `write_str_list` so the lib-first `MetaSinker` path coalesces
   /// too.
@@ -1558,7 +1557,7 @@ impl core::fmt::Display for FlacError {
 impl std::error::Error for FlacError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — byte-exact CLI JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessFlac {
@@ -2152,7 +2151,7 @@ mod tests {
     assert!(meta.has_format_error());
   }
 
-  // ---------- Legacy OldFormatParser bridge -------------------------------
+  // ---------- Engine entry (`process`) ------------------------------------
 
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
     let mut m = Metadata::new("x.flac");

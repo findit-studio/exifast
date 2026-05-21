@@ -7,10 +7,10 @@
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`AaMeta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during Phase F. The bridge is retired in Phase G.
+//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! **M4B-side DEFERRED to FORMATS.md row 25 (QuickTime/MOV).** The bundled
 //! Audible.pm also defines `%Audible::tags`, `%Audible::meta`, `%Audible::cvrx`,
@@ -26,7 +26,7 @@
 //! the oracle.
 //!
 //! PROCESS_PROC is `ProcessAA` (Audible.pm:194), invoked from
-//! [`crate::formats::parser_for`] via the `"AA"` arm. The flow is:
+//! [`crate::parser_new::any_parser_for`] via the `"AA"` arm. The flow is:
 //! magic+size gate → `SetFileType` → walk TOC (12-byte triples) → for each
 //! triple whose type ∈ {2, 6, 11}, dispatch chunk 6 (chapter count),
 //! chunk 11 (cover art) or chunk 2 (UTF-8 dictionary).
@@ -761,7 +761,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<AaMeta<'_>>, AudibleError> {
 /// 1. 16-byte magic + filesize gate (Audible.pm:201-205) — return `None`
 ///    on reject (Perl `return 0`).
 /// 2. `SetFileType()` (Audible.pm:207) — the bridge runs this in the
-///    legacy `OldFormatParser::process` path, not here; the typed parser
+///    legacy the engine entry `process` path, not here; the typed parser
 ///    doesn't push `File:*` tags.
 /// 3. `SetByteOrder('MM')` (Audible.pm:208) — every u32 read is BE.
 /// 4. TOC walk (Audible.pm:215-271) — dispatch chunk 6 (chapter count),
@@ -1297,7 +1297,7 @@ impl core::fmt::Display for AudibleError {
 impl std::error::Error for AudibleError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessAa {

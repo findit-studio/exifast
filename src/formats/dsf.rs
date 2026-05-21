@@ -6,12 +6,11 @@
 //! ExifTool 13.58, 138 lines). DSD Stream File container: `'DSD '` chunk +
 //! `'fmt '` chunk. Read-only.
 //!
-//! **Phase F3 — lib-first migration.** Follows the MOI pilot (Phase E) and
-//! the F1 leaves (AAC, DV) pattern: a typed [`DsfMeta<'a>`] is produced by
-//! the new [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during Phase F. The bridge is retired in Phase G.
+//! A typed [`DsfMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] and the chained ID3v2 trailer so the
+//! serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## Why DSF needs a `Context<'a>` struct (not the leaf `&'a [u8]`)
 //!
@@ -679,13 +678,11 @@ impl MetaSinker for DsfMeta<'_> {
   /// 1. Warning (if [`Self::fmt_warning`] is `Some`) — DSF.pm:71.
   /// 2. `fmt`-chunk tags in DSF_KEYS order (if [`Self::fmt`] is `Some`).
   ///
-  /// File:* triplet is NOT emitted by the sink — it is the
-  /// `OldFormatParser` bridge's responsibility (DSF.pm:64
-  /// `SetFileType`). The ID3 trailer is also NOT emitted by the sink
-  /// — the bridge dispatches `id3_trailer()` bytes through the legacy
-  /// `process_id3_v2_slice` so the bundled-Perl ID3.pm semantics are
-  /// preserved byte-exact. Both are bridge concerns at F3 and become
-  /// sink concerns when F4 lands typed ID3.
+  /// File:* triplet is NOT emitted by the sink — it is the engine entry
+  /// `process`'s responsibility (DSF.pm:64 `SetFileType`). The ID3 trailer
+  /// is also NOT emitted by the sink — the engine entry dispatches
+  /// `id3_trailer()` bytes through `process_id3_v2_slice` so the bundled
+  /// ID3.pm semantics are preserved byte-exact.
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     const GROUP: &str = "File";
     // (1) DSF.pm:71 — `$et->Warn('Error reading DSF fmt chunk')` is
@@ -790,7 +787,7 @@ impl core::fmt::Display for DsfError {
 impl std::error::Error for DsfError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessDsf {
@@ -1523,7 +1520,7 @@ mod tests {
     assert_eq!(fmt.sample_count(), 2_822_400);
   }
 
-  // --- OldFormatParser bridge ---------------------------------------------
+  // --- Engine entry (`process`) -------------------------------------------
 
   #[test]
   fn old_format_parser_rejects_when_short() {

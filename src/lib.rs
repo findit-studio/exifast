@@ -96,11 +96,10 @@ pub mod formats;
 pub mod jsondiff;
 pub mod parser;
 // The lib-first `FormatParser` trait scaffold + closed-set `AnyParser` /
-// `AnyMeta` dispatch. This is now the SOLE parser architecture: the engine
-// entry `parser::extract_info` routes through `any_parser_for(ft) ->
-// AnyParser::extract_into`, and the legacy push-style `OldFormatParser`
-// trait has been retired (the typed path is validated directly by the
-// byte-exact conformance suite).
+// `AnyMeta` dispatch — the SOLE parser architecture. The engine entry
+// `parser::extract_info` routes through `any_parser_for(ft) ->
+// AnyParser::extract_into`; the byte-exact conformance suite validates the
+// typed path directly.
 pub mod parser_new;
 pub mod processbinarydata;
 pub mod reader;

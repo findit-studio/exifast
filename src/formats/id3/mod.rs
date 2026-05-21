@@ -4,14 +4,13 @@
 #![cfg(feature = "id3")]
 //! Faithful port of `Image::ExifTool::ID3` (lib/Image/ExifTool/ID3.pm).
 //!
-//! **Phase F2 — lib-first migration.** Implements ID3v1, ID3v2.2/2.3/2.4
-//! plus the MP3 wrapper (`ProcessMP3` at ID3.pm:1684-1728) via the typed
-//! [`Id3Meta<'a>`] / [`Mp3Meta<'a>`] published through the new
-//! [`crate::parser_new::FormatParser`] trait, following the MOI (Phase E)
-//! and AAC/DV (Phase F1) pilots. The legacy [`crate::parser::OldFormatParser`]
-//! entry points continue to bridge through [`crate::sink::MetadataTagWriter`]
-//! so the CLI JSON output stays byte-exact for all 60+ ID3/MP3 conformance
-//! fixtures during Phase F. The bridge is retired in Phase G.
+//! Implements ID3v1, ID3v2.2/2.3/2.4 plus the MP3 wrapper (`ProcessMP3` at
+//! ID3.pm:1684-1728) via the typed [`Id3Meta<'a>`] / [`Mp3Meta<'a>`]
+//! published through the [`crate::parser_new::FormatParser`] trait. The MP3
+//! engine entry ([`ProcessMp3::process`]) drives
+//! [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact for all 60+ ID3/MP3 conformance fixtures.
 //!
 //! Per FORMATS.md row 2 (ID3 infra + MP3 completion) this module
 //! implements:

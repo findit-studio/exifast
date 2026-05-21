@@ -7,10 +7,10 @@
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`R3dMeta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during Phases F1–F5. The bridge is retired in Phase G.
+//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! ## R3D structure (Red.pm:219-223)
 //!
@@ -1664,7 +1664,7 @@ impl core::fmt::Display for R3dError {
 impl std::error::Error for R3dError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessR3D {

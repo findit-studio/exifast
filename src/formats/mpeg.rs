@@ -5,13 +5,15 @@
 //! Faithful port of `Image::ExifTool::MPEG` (lib/Image/ExifTool/MPEG.pm) —
 //! AUDIO side only.
 //!
-//! **Phase F4 — lib-first migration.** This format follows the AAC/DV
-//! pattern (Phase F1): a typed [`MpegAudioMeta<'a>`] is produced by the new
+//! A typed [`MpegAudioMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait with a per-format
-//! [`MpegAudioContext`] (data + start_offset + ext + shared flags); the legacy
-//! [`crate::parser::OldFormatParser`] entry point on [`ProcessMp3`] bridges
-//! through [`crate::sink::MetadataTagWriter`] so CLI JSON output stays
-//! byte-exact during the per-format crawl.
+//! [`MpegAudioContext`] (data + start_offset + ext + shared flags). MPEG
+//! audio is invoked internally by the MP3 file-type entry
+//! ([`crate::formats::id3::ProcessMp3`]) via
+//! [`ProcessMp3::process_with_start_offset`], which drives
+//! [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Ports
 //!
@@ -38,11 +40,10 @@
 //! The R5 fix introduced `ProcessMp3::process_with_start_offset` so the
 //! ID3 wrapper (`src/formats/id3/process.rs:117`) could mirror bundled's
 //! `Seek($hdrEnd, 0)` + `Read($buff, $scanLen)` pair (ID3.pm:1590 +
-//! ID3.pm:1705). The F4 migration **preserves the public method signature
-//! exactly** so the F2 ID3 agent's wrapper code (`mpeg::ProcessMp3.
-//! process_with_start_offset(ctx, hdr_end)`) keeps working byte-for-byte.
-//! The bridge internally drives the typed [`ProcessMpegAudio`] +
-//! [`MetaSinker`] path — same algorithm, new shape.
+//! ID3.pm:1705). The public method signature is **preserved exactly** so
+//! the ID3 wrapper code (`mpeg::ProcessMp3.process_with_start_offset(ctx,
+//! hdr_end)`) keeps working byte-for-byte. It internally drives the typed
+//! [`ProcessMpegAudio`] + [`MetaSinker`] path.
 //!
 //! ## Deferred (forward items, deliberately out of this PR's scope)
 //!
@@ -53,9 +54,9 @@
 //! - **R8 set-then-reject** — MPEG.pm:496 `$et->SetFileType()` is called
 //!   BEFORE the post-header Xing/LAME tail; the tail can `last` on any
 //!   length / magic / flag check but never `return 0`, so the File:* tags
-//!   from SetFileType always persist. The bridge preserves this: it calls
-//!   `ctx.set_file_type(None, None, None)` BEFORE sinking the typed Meta,
-//!   so File:* lands first and persists if any later code returns false.
+//!   from SetFileType always persist. The engine entry preserves this: it
+//!   calls `ctx.set_file_type(None, None, None)` BEFORE sinking the typed
+//!   Meta, so File:* lands first and persists if any later code returns false.
 
 use std::{borrow::Cow, string::String};
 
@@ -1567,17 +1568,15 @@ impl core::fmt::Display for MpegAudioError {
 impl std::error::Error for MpegAudioError {}
 
 // ===========================================================================
-// `ProcessMp3` — `OldFormatParser` bridge preserving R5 fix API
+// `ProcessMp3` — raw MPEG-audio entry preserving R5 fix API
 // ===========================================================================
 
-/// MP3 / MPEG audio-frame parser entry. Registered in `formats::parser_for`
-/// at the `"MP3"` file-type slot ONLY when the `id3` feature is OFF (the
-/// `id3` feature owns the `"MP3"` slot via its own dispatcher in
-/// `src/formats/id3/process.rs`). This struct's
-/// `process_with_start_offset` is the load-bearing entry for the
-/// ID3 dispatcher's chained MPEG-audio invocation — its public method
-/// signature is preserved verbatim from the pre-F4 R5 fix so the F2 ID3
-/// agent's wrapper code keeps working.
+/// MP3 / MPEG audio-frame parser handle. The `"MP3"` file-type slot in
+/// [`crate::parser_new::any_parser_for`] always routes to
+/// [`crate::formats::id3::ProcessMp3`] (the ID3 wrapper); this struct's
+/// [`ProcessMp3::process_with_start_offset`] is the load-bearing entry for
+/// that wrapper's chained MPEG-audio invocation — its public method
+/// signature is preserved verbatim from the R5 fix.
 pub struct ProcessMp3;
 
 /// ID3.pm:1704 — `$scanLen` selection. Constant-fold-friendly helper so
@@ -2038,7 +2037,7 @@ mod tests {
     assert_eq!(w.get("MPEG", "VBRFrames"), None);
   }
 
-  // ───────────────────────── `OldFormatParser` bridge ─────────────────────────
+  // ───────────────────────── raw-MP3 engine entry ─────────────────────────
 
   #[test]
   fn bridge_parse_emits_expected_tags_print_on() {

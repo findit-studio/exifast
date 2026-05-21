@@ -1368,13 +1368,14 @@ mod tests {
   //
   // ExifTool's `Process<Type>` may call `$et->Error('…')` (stored in
   // `$$self{VALUE}{Error}`) and still `return 1` — `Error` is emitted in
-  // `-j` regardless of the module returning success. `parser_for`
-  // (formats/mod.rs) is a fixed `match` keyed on the real file-type
+  // `-j` regardless of the module returning success. `any_parser_for`
+  // (parser_new.rs) is a fixed `match` keyed on the real file-type
   // string and no real ported format errors-while-accepting, so this test
   // uses the `#[cfg(test)]` [`INJECTED_PARSERS`] seam (consulted by
-  // [`lookup_parser`], which `extract_info` calls in place of
-  // `parser_for`): it registers an accepting-but-erroring parser for the
-  // *real* `AAC` file type, then calls the genuine `extract_info`. An
+  // [`lookup_parser`], which `extract_info` calls in place of the
+  // `any_parser_for` dispatch): it registers an accepting-but-erroring
+  // entry for the *real* `AAC` file type, then calls the genuine
+  // `extract_info`. An
   // `\xff\xf1` head passes the AAC `%magicNumber` gate (filetype_data.rs)
   // so `bad.aac` detects to `AAC`, the seam swaps in the injected parser,
   // and `extract_info` runs its real candidate→process(&mut m)→finalize
@@ -1498,7 +1499,7 @@ mod tests {
     //   "File:FileType":"MPEG"
     // simultaneously. The same pattern is exercised here via the
     // injected-parser seam against the real AAC file type, since
-    // `parser_for` has no rejecting-after-SetFileType real parser yet.
+    // `any_parser_for` has no rejecting-after-SetFileType real parser yet.
     let _guard = InjectionGuard;
     inject("AAC", rejecting_after_set_file_type);
 

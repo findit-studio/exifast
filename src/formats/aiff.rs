@@ -7,12 +7,11 @@
 //! (`%AIFF::Main`, `%AIFF::Common`, `%AIFF::FormatVers`, `%AIFF::Comment`),
 //! and the custom `ProcessComment` chunk decoder (AIFF.pm:155-178).
 //!
-//! **Phase F3 — lib-first migration.** This format follows the MOI pilot
-//! (Phase E) and AAC/DV leaves (Phase F1) pattern: a typed [`AiffMeta<'a>`]
-//! is produced by the new [`crate::parser_new::FormatParser`] trait; the
-//! legacy [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during the per-format crawl.
+//! A typed [`AiffMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Notable deferrals (in-code) — Phase-2 forward-items
 //!
@@ -1302,8 +1301,8 @@ impl MetaSinker for AiffMeta<'_> {
 
     if self.magic == AiffMagic::Djvu {
       // DjVu body parsing is deferred (see module doc). Sink emits
-      // nothing here; the File:FileType suffix is handled by the
-      // OldFormatParser bridge directly on `ctx.metadata()`.
+      // nothing here; the File:FileType suffix is handled by the engine
+      // entry `process` directly on `ctx.metadata()`.
       return Ok(());
     }
 
@@ -1493,7 +1492,7 @@ impl core::fmt::Display for AiffError {
 impl std::error::Error for AiffError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessAiff {

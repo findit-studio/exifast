@@ -4,15 +4,12 @@
 #![cfg(feature = "moi")]
 //! Faithful port of `Image::ExifTool::MOI` (lib/Image/ExifTool/MOI.pm).
 //!
-//! **Phase E pilot — lib-first design.** This is the first format migrated
-//! from the push-style [`crate::parser::OldFormatParser`] API to the typed
-//! lib-first [`crate::parser_new::FormatParser`] API per the design spec
-//! at `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`.
 //! The parser produces a typed [`MoiMeta<'a>`] holding `jiff::civil::DateTime`
-//! / `core::time::Duration` / primitive integers; the legacy `Metadata`
-//! push path is preserved through the [`crate::sink::MetadataTagWriter`]
-//! bridge so CLI JSON output stays byte-exact while Phases F1–F5 migrate
-//! the remaining 12 formats. The bridge is retired in Phase G.
+//! / `core::time::Duration` / primitive integers via the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through the
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! ## What MOI is
 //!
@@ -1105,7 +1102,7 @@ mod tests {
     );
   }
 
-  // ---------- Legacy `OldFormatParser` bridge ----------------------------
+  // ---------- Engine entry (`process`) -----------------------------------
 
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
     let mut m = Metadata::new("MOI.moi");

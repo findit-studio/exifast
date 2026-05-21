@@ -13,19 +13,15 @@
 //! tag dictionary (string-keyed), dynamic `MakeTag`-style name munging
 //! (APE.pm:102-112), and the `%Composite` Duration computation inline.
 //!
-//! **Phase F3 — lib-first migration.** This format follows the MOI pilot
-//! (Phase E) and AAC/DV (Phase F1) pattern: a typed [`ApeMeta<'a>`] is
-//! produced by the new [`crate::parser_new::FormatParser`] trait; the
-//! legacy [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during the per-format crawl. The bridge keeps the ID3-chained
-//! dispatch (`crate::formats::id3::process::process_id3_chained`) under
-//! the `ParseContext`-backed legacy path because ID3 migration is a
-//! parallel Phase F2 effort and owns the cross-format `SharedFlags`
-//! plumbing for the audio-loop seam; APE READS `done_id3` from
+//! A typed [`ApeMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`. The engine entry runs the
+//! ID3-chained dispatch (`crate::formats::id3::process::process_id3_chained`)
+//! on the `ParseContext` value sink; APE READS `done_id3` from
 //! [`crate::parser_new::SharedFlags`] (faithful APE.pm:169) and WRITES
-//! `done_ape` after running (faithful APE.pm:131 / ID3.pm:1723). Phase G
-//! retires the bridge.
+//! `done_ape` after running (faithful APE.pm:131 / ID3.pm:1723).
 //!
 //! Deferrals (in-code documented, NOT half-built — also enumerated in the
 //! spec at docs/superpowers/specs/2026-05-20-ape-port-design.md):
@@ -980,7 +976,7 @@ pub struct ApeContext<'a> {
   /// the typed parser uses `n` as the trailer shift (APE.pm:169); when
   /// `None`, the typed parser interprets it as "ID3 has not run" and
   /// falls back to `shared.done_id3()` for the same purpose. The bridge
-  /// in [`OldFormatParser::process`] populates this from
+  /// in the engine entry `process` populates this from
   /// `ctx.metadata().done_id3()` to thread the legacy v1-trailer-size
   /// state through; pure lib-callers leave it `None` and let the
   /// [`SharedFlags`] copy drive the shift.
@@ -1875,7 +1871,7 @@ fn sink_composite_duration<W: TagWriter>(
 }
 
 // =============================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // =============================================================================
 
 impl ProcessApe {
@@ -2144,7 +2140,7 @@ impl ProcessApe {
     // MetadataTagWriter migration bridge. `header_job` is always
     // `HeaderJob::None` on this path (the chained caller owns SetFileType
     // and any header tags); only main-tag stream + warn flag matters.
-    // Intra-APE composite suppression matches `OldFormatParser::process`
+    // Intra-APE composite suppression matches the engine entry `process`
     // — cross-format composite resolution runs once below.
     let mut meta = meta_from_plan(plan);
     meta.composite_duration = None;

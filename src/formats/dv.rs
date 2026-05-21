@@ -2,14 +2,13 @@
 //! Faithful port of `Image::ExifTool::DV` (`lib/Image/ExifTool/DV.pm`).
 //! Module-name dispatch: `%moduleName{DV}` defaults to `Module("DV")`
 //! (no explicit row, so Perl `$module = $type`); registered in
-//! [`crate::formats::parser_for`].
+//! [`crate::parser_new::any_parser_for`].
 //!
-//! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E)
-//! pattern: a typed [`DvMeta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during Phase F. The bridge is retired in Phase G.
+//! A typed [`DvMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 
 use crate::{
   parser::ParseContext,
@@ -998,7 +997,7 @@ impl core::fmt::Display for DvError {
 impl std::error::Error for DvError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessDv {

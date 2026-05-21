@@ -5,12 +5,11 @@
 //! Faithful port of `Image::ExifTool::MPC` (lib/Image/ExifTool/MPC.pm).
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → [`crate::bitstream`].
 //!
-//! **Phase F5 — lib-first migration.** This format follows the MOI (Phase E)
-//! and AAC/DV (Phase F1) pattern: a typed [`MpcMeta<'a>`] is produced by the
-//! new [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during the per-format crawl. The bridge is retired in Phase G.
+//! A typed [`MpcMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! drives [`crate::parser_new::MetaSinker::sink`] through
+//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Chained-format role
 //!
@@ -27,11 +26,12 @@
 //!    Always invoked after the MP+ header, even on the non-SV7 warning arm;
 //!    bundled returns 1 regardless (void context, MPC.pm:113-115).
 //!
-//! Phase F5 spec: ID3 and APE are dispatched at the legacy [`OldFormatParser`]
-//! interface (the parallel F2 ID3 / F3 APE agents own the typed `Id3Meta` /
-//! `ApeMeta`). The typed [`MpcMeta<'a>`] carries [`Option<&'a [u8]>`] byte
-//! placeholders for the ID3-prefix and APE-trailer slices so a future
-//! F5-integration pass can compose them with the typed `Id3Meta`/`ApeMeta`.
+//! ID3 and APE are dispatched by the engine entry `process` via the chained
+//! helpers (`crate::formats::id3::process::process_id3_chained`,
+//! `crate::formats::ape::ProcessApe::process_trailer_only`) on the
+//! `ParseContext` value sink. The typed [`MpcMeta<'a>`] carries
+//! [`Option<&'a [u8]>`] byte placeholders for the ID3-prefix and APE-trailer
+//! slices so a future pass can compose them with the typed `Id3Meta`/`ApeMeta`.
 //!
 //! ## %MPC::Main table (MPC.pm:21-72)
 //!
@@ -65,8 +65,8 @@ use crate::{
 // ===========================================================================
 // `%MPC::Main` tag table (MPC.pm:21-72)
 //
-// Retained so the [`process_bit_stream`] engine (and the [`OldFormatParser`]
-// bridge below) can drive the same FLAC::ProcessBitStream PROCESS_PROC as
+// Retained so the [`process_bit_stream`] engine (and the engine entry
+// `process` below) can drive the same FLAC::ProcessBitStream PROCESS_PROC as
 // bundled Perl. The typed [`MpcMeta`] holds the raw bit-field scalars
 // (post-bit-stream, pre-PrintConv); PrintConv is applied at emit time by
 // [`MetaSinker::sink`] to mirror ExifTool's `$$self{OPTIONS}{PrintConv}`
@@ -427,13 +427,12 @@ impl MpcSv7Header {
 ///
 /// ## Chained sub-blocks
 ///
-/// MPC dispatches both ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113). Phase F5
-/// spec: the typed [`Id3Meta`] / [`ApeMeta`] land in the parallel F2 / F3
-/// agents; F5's MPC migration captures their input byte slices as
-/// `Option<&'a [u8]>` placeholders so a future F5-integration pass can
-/// compose them with the typed sub-format Metas. The legacy bridge below
-/// dispatches both via [`OldFormatParser`], so the byte-exact CLI output is
-/// preserved through Phase F.
+/// MPC dispatches both ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113). The typed
+/// [`MpcMeta`] captures their input byte slices as `Option<&'a [u8]>`
+/// placeholders so a future pass can compose them with the typed
+/// [`crate::formats::id3::Id3Meta`] / [`crate::formats::ape::ApeMeta`]; the
+/// engine entry `process` below dispatches both on the `ParseContext` value
+/// sink, so the serialized JSON is byte-exact with bundled `perl exiftool`.
 ///
 /// **D8 — no public fields, accessors only.**
 ///
@@ -567,11 +566,11 @@ impl FormatParser for ProcessMpc {
   /// Parse an MPC file's bytes into a typed [`MpcMeta`], or `None` if the
   /// buffer is not a valid MP+ stream (short read or wrong magic; MPC.pm:92).
   ///
-  /// **Phase F5 scope.** Reads the 32-byte MP+ header, validates the magic
-  /// (MPC.pm:92), and extracts the SV7 bit-fields when `vers == 0x07`. The
-  /// chained ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are
-  /// deferred to the legacy [`OldFormatParser`] bridge (the parallel F2/F3
-  /// agents own typed `Id3Meta` / `ApeMeta`).
+  /// Reads the 32-byte MP+ header, validates the magic (MPC.pm:92), and
+  /// extracts the SV7 bit-fields when `vers == 0x07`. The chained ID3
+  /// (MPC.pm:84-87) and APE (MPC.pm:111-113) dispatches are driven by the
+  /// engine entry [`ProcessMpc::process`] (which owns the `ParseContext`
+  /// value sink), not by this header-only typed `parse`.
   fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MpcError> {
     parse_inner(ctx.data())
   }
@@ -861,7 +860,7 @@ impl core::fmt::Display for MpcError {
 impl std::error::Error for MpcError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessMpc {

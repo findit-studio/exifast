@@ -13,13 +13,11 @@
 //! it has accumulated each stream's leading packets, then dispatches the
 //! packet to its codec's comments handler.
 //!
-//! **Phase F4 — lib-first migration.** This format follows the MOI pilot
-//! (Phase E) + AAC/DV (Phase F1) pattern: a typed [`OggMeta<'a>`] is
-//! produced by the new [`crate::parser_new::FormatParser`] trait; the
-//! legacy [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! while the remaining formats migrate one PR at a time. The bridge is
-//! retired in Phase G.
+//! A typed [`OggMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! re-emits through the `Metadata` push path (list-aware for Vorbis
+//! Artist/Performer/Contact) so the serialized JSON stays byte-exact with
+//! bundled `perl exiftool`.
 //!
 //! ## Deliberate Phase-2 deferrals (see `docs/superpowers/plans/`):
 //! - **Codec-specific identification-header binary tables (R1 F2 scope
@@ -1010,7 +1008,7 @@ impl OggMeta<'_> {
 
   /// Whether ProcessOGG accepted at least one valid 28-byte page (Perl's
   /// `$success` flag — Ogg.pm:100-103). On `false`, the legacy bridge
-  /// returns `false` from `OldFormatParser::process` (no `SetFileType`
+  /// returns `false` from the engine entry `process` (no `SetFileType`
   /// fired); the engine post-loop emits `ExifTool:Error => "File format
   /// error"` (ExifTool.pm:3093).
   #[must_use]
@@ -1384,7 +1382,7 @@ impl MetaSinker for OggMeta<'_> {
   /// followed by accumulated warnings.
   ///
   /// **NOTE:** `File:FileType*` / file-type override is NOT emitted here.
-  /// That's the bridge's responsibility (`OldFormatParser::process`):
+  /// That's the bridge's responsibility (the engine entry `process`):
   /// `SetFileType` precedes the Vorbis:* tags in bundled output, but the
   /// pseudo-File:* tags belong to the engine's `ParseContext::set_file_
   /// type` path (not the per-format `MetaSinker`). The `MetaSinker` only
@@ -1439,7 +1437,7 @@ impl MetaSinker for OggMeta<'_> {
 }
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessOgg {

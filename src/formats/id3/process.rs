@@ -38,10 +38,10 @@
 //!   APE/MPEG typed Metas land in F3/F4 respectively.
 //!
 //! Both implement [`crate::parser_new::FormatParser`] and
-//! [`crate::parser_new::MetaSinker`]. The legacy
-//! [`crate::parser::OldFormatParser`] impl on [`ProcessMp3`] bridges
-//! through [`crate::sink::MetadataTagWriter`] so the CLI JSON output
-//! stays byte-exact for the duration of the per-format migration.
+//! [`crate::parser_new::MetaSinker`]. The MP3 engine entry
+//! [`ProcessMp3::process`] drives [`crate::parser_new::MetaSinker::sink`]
+//! through [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 //!
 //! # Byte-exact reproduction strategy
 //!
@@ -683,15 +683,15 @@ impl<'a> Mp3Meta<'a> {
 /// The ID3 directory parser. Faithful to `Image::ExifTool::ID3::ProcessID3`
 /// (ID3.pm:1431-1632). This is the *new* parser type introduced in Phase
 /// F2 for the typed-Meta API; the legacy chained entry points
-/// ([`process_id3_chained`], [`process_id3_v2_slice`], [`process_id3_inner`])
-/// remain available for the old push-style callers (APE, DSF, FLAC, AIFF,
-/// MPC, WavPack) until those formats migrate in Phase F3.
+/// ([`process_id3_chained`], [`process_id3_v2_slice`]) remain available for
+/// the chained engine entries of APE, DSF, FLAC, AIFF, MPC, WavPack.
 ///
-/// Note: this is not an `OldFormatParser` since ID3 is a *directory*
-/// (PROCESS_PROC in ID3.pm:78), not a file-type entry; only [`ProcessMp3`]
-/// has a file-type `OldFormatParser` impl. The standalone ID3 typed
-/// parser is exposed via [`FormatParser`] for chained callers that want
-/// to materialize an [`Id3Meta`] over an arbitrary byte slice.
+/// Note: ID3 is a *directory* parser (PROCESS_PROC in ID3.pm:78), not a
+/// file-type entry, so it has no engine entry in
+/// [`crate::parser_new::any_parser_for`]; only [`ProcessMp3`] is a file-type
+/// entry. The standalone ID3 typed parser is exposed via [`FormatParser`]
+/// for chained callers that want to materialize an [`Id3Meta`] over an
+/// arbitrary byte slice.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessId3;
 
@@ -1245,10 +1245,9 @@ impl MetaSinker for Mp3Meta<'_> {
   ///    audio frame sync was found;
   /// 3. APE-trailer sub-Meta, when an APETAGEX footer was found.
   ///
-  /// This typed sink now emits the SAME tag set the legacy
-  /// [`OldFormatParser::process`] bridge does, so library callers
-  /// consuming `Mp3Meta` via `MetaSinker` get the complete picture
-  /// (Codex BF1/CF1).
+  /// This typed sink emits the SAME tag set the engine entry `process`
+  /// does, so library callers consuming `Mp3Meta` via `MetaSinker` get the
+  /// complete picture (Codex BF1/CF1).
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     if let Some(id3) = &self.id3 {
       id3.sink(print_conv, out)?;
@@ -1264,7 +1263,7 @@ impl MetaSinker for Mp3Meta<'_> {
 }
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 #[cfg(feature = "mp3")]
@@ -1418,12 +1417,11 @@ pub fn process_id3_v2_slice(slice: &[u8], ctx: &mut ParseContext<'_>) -> bool {
 /// loop's `$raf->Seek($hdrEnd, 0)` at :1590 then re-reads from offset 0.
 /// We model the same: `0` ⇒ caller slices from offset 0.
 ///
-/// **Phase F2 rename note.** This function used to be called
-/// `process_id3_inner`; it is renamed to `process_id3_inner_legacy` to
-/// distinguish it from the typed-Meta inner parser [`parse_id3_inner`].
-/// All Phase F2 callers from outside `process.rs` use the typed entry;
-/// the legacy chained callers (APE/DSF/FLAC/AIFF/MPC/WV) and the
-/// `OldFormatParser` bridge inside this module use the legacy entry.
+/// **Naming note.** This push-style helper is `process_id3_inner_legacy`
+/// to distinguish it from the typed-Meta inner parser [`parse_id3_inner`].
+/// It is the shared engine for the chained callers (APE/DSF/FLAC/AIFF/MPC/WV)
+/// and the MP3 engine entry's ID3 pass; the typed entries lift its staged
+/// output into [`Id3Meta`].
 fn process_id3_inner_legacy(
   data: &[u8],
   ctx: &mut ParseContext<'_>,
@@ -1635,28 +1633,6 @@ pub fn parse_id3_borrowed<'a>(
   print_conv: bool,
 ) -> Result<Option<Id3Meta<'a>>, Id3Error> {
   parse_id3_inner(data, shared, print_conv).map(|(meta, _hdr_end)| meta)
-}
-
-// ===========================================================================
-// MetadataTagWriter bridge usage — for ProcessMp3 typed sink integration
-// ===========================================================================
-
-/// Phase F2 typed-Meta + legacy-engine bridge for the MP3 wrapper.
-///
-/// Drives the typed [`ProcessMp3`] / [`Mp3Meta`] sink path through the
-/// [`MetadataTagWriter`] adapter, then runs the legacy MPEG / APE
-/// chained engines for byte-exact CLI JSON. This is the same pattern
-/// MOI/AAC/DV use; the wrinkle here is that the MPEG / APE engines
-/// don't have typed Metas yet (F3/F4), so they continue to push into
-/// `Metadata` directly inside the bridge.
-///
-/// (Currently unused — the legacy `OldFormatParser` implementation
-/// drives the engine path directly. Kept for documentation / Phase G
-/// transition reference.)
-#[cfg(feature = "mp3")]
-#[allow(dead_code)]
-fn _phase_f2_bridge_note() {
-  let _ = crate::sink::MetadataTagWriter::new;
 }
 
 // ===========================================================================

@@ -5,12 +5,11 @@
 //! Faithful port of `Image::ExifTool::AAC` (lib/Image/ExifTool/AAC.pm).
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (AAC.pm:29) → [`crate::bitstream`].
 //!
-//! **Phase F1 — lib-first migration.** This format follows the MOI pilot
-//! (Phase E) pattern: a typed [`AacMeta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the legacy
-//! [`crate::parser::OldFormatParser`] entry point bridges through
-//! [`crate::sink::MetadataTagWriter`] so CLI JSON output stays byte-exact
-//! during the per-format crawl.
+//! A typed [`AacMeta<'a>`] is produced by the
+//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! [`ProcessAac::process`] drives [`crate::parser_new::MetaSinker::sink`]
+//! through [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
@@ -423,7 +422,7 @@ impl core::fmt::Display for AacError {
 impl std::error::Error for AacError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 impl ProcessAac {

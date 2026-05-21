@@ -5,15 +5,14 @@
 //! collector, validation harness) brings its own [`crate::parser_new::TagWriter`]
 //! impl.
 //!
-//! Phase D shipped exactly one reference implementor — [`MapTagWriter`] — to
-//! exercise the trait shape and prove the dataflow Meta → TagWriter compiles
-//! end-to-end. Phase E adds [`MetadataTagWriter`] — the migration bridge
-//! adapter that translates a typed `Meta` emission back into the push-style
-//! [`crate::value::Metadata`] sink used by the legacy
-//! [`crate::parser::OldFormatParser`] dispatch. This bridge is what lets
-//! the CLI JSON output remain byte-exact while individual formats migrate
-//! one PR at a time across Phases E–F. Retired in Phase G when the JSON
-//! emitter consumes [`AnyMeta`](crate::parser_new::AnyMeta) directly.
+//! [`MapTagWriter`] is the in-memory reference implementor (tests + generic
+//! library callers). [`MetadataTagWriter`] is the adapter the engine uses:
+//! it translates a typed `Meta` emission into the push-style
+//! [`crate::value::Metadata`] sink that the JSON serializer renders. Each
+//! format's engine entry (`ProcessXxx::process`) drives
+//! [`crate::parser_new::MetaSinker::sink`] through it so the serialized JSON
+//! is byte-exact with bundled `perl exiftool`. (A future change may have the
+//! JSON emitter consume [`AnyMeta`](crate::parser_new::AnyMeta) directly.)
 
 use crate::{
   parser_new::TagWriter,
@@ -222,25 +221,22 @@ impl TagWriter for MapTagWriter {
 }
 
 // ===========================================================================
-// `MetadataTagWriter` — Phase E–F migration bridge
+// `MetadataTagWriter` — typed-Meta → `Metadata` adapter
 // ===========================================================================
 
-/// Bridge [`TagWriter`] that emits into the push-style [`Metadata`] sink.
+/// Adapter [`TagWriter`] that emits into the push-style [`Metadata`] sink.
 ///
-/// This is the **Phase E–F migration bridge**: the legacy
-/// [`crate::parser::OldFormatParser`] dispatch (`parser_for(file_type) ->
-/// &dyn OldFormatParser`) reads `&mut Metadata` and pushes string-keyed
-/// tags into it; the new typed-Meta API ([`crate::parser_new::MetaSinker`])
-/// emits typed scalars into a [`TagWriter`]. As each format migrates from
-/// the old to the new design, its `OldFormatParser` impl uses this adapter
-/// to translate the new `Meta`'s `MetaSinker::sink` call back into pushes
-/// on the existing `Metadata`. The CLI JSON serializer (which still reads
-/// `Metadata`) stays byte-exact end-to-end during the per-format crawl.
+/// The typed-Meta API ([`crate::parser_new::MetaSinker`]) emits typed
+/// scalars into a [`TagWriter`]; each format's engine entry
+/// (`ProcessXxx::process`, dispatched from the closed-set
+/// [`crate::parser_new::AnyParser`]) drives that `MetaSinker::sink` call
+/// through this adapter, which translates the emissions into string-keyed
+/// pushes on the per-file `&mut Metadata`. The JSON serializer (which reads
+/// `Metadata`) then renders byte-exact output.
 ///
-/// **Retired in Phase G** once the JSON emitter consumes
+/// (A future change may have the JSON emitter consume
 /// [`AnyMeta`](crate::parser_new::AnyMeta) directly via a JSON-native
-/// `TagWriter`; the old `OldFormatParser` dispatch is removed at the same
-/// time.
+/// `TagWriter`, dropping this adapter.)
 ///
 /// **Group mapping** (the `group` argument of every `write_*` call):
 ///
@@ -401,11 +397,11 @@ impl TagWriter for MetadataTagWriter<'_> {
   /// list-coalesce semantics that the CLI JSON serializer expects
   /// (faithful to ExifTool.pm:9505-9520 `FoundTag` promote-and-push).
   ///
-  /// This unblocks the OGG/FLAC bridges from calling `push_listable`
-  /// directly inside their `OldFormatParser::process` impls — the typed
-  /// [`MetaSinker::sink`](crate::parser_new::MetaSinker) path can now emit
-  /// list values via `write_str_list` and the bridge translates them
-  /// faithfully. Added in Phase G (per F3-FLAC / F4-OGG integration notes).
+  /// This lets the OGG/FLAC typed
+  /// [`MetaSinker::sink`](crate::parser_new::MetaSinker) path emit list
+  /// values via `write_str_list` and have the adapter translate them
+  /// faithfully into `push_listable` (Vorbis Artist/Performer/Contact
+  /// coalescing).
   fn write_str_list(&mut self, group: &str, name: &str, values: &[&str]) -> Result<(), Infallible> {
     for v in values {
       self.meta.push_listable(
