@@ -16,7 +16,7 @@
 //!
 //! DSF chains into the bundled ID3v2 trailer at `metaPos` (DSF.pm:88-97).
 //! The chain is now fully typed: [`parse_inner`] parses the trailer slice
-//! into a nested [`crate::formats::id3::Id3Meta`] ([`DsfMeta::id3`]) via
+//! into a nested [`crate::formats::id3::Id3Meta`] ([`DsfMeta::id3_ref`]) via
 //! [`crate::formats::id3::process::parse_id3_borrowed`], and the
 //! `serialize_tags` sink emits its `File:ID3Size` + `ID3v2_*:*` tags after
 //! the `'fmt '` chunk. The `DsfContext<'a>` = `&'a [u8]` + `&'a mut
@@ -28,7 +28,7 @@
 //!
 //! [`DsfMeta::id3_trailer`] still exposes the borrowed `&'a [u8]` of the
 //! trailer bytes (faithful to `DSF.pm:88-97`'s `$dirInfo{DataPt}` slice)
-//! as a lib-first convenience; [`DsfMeta::id3`] is the typed sub-Meta
+//! as a lib-first convenience; [`DsfMeta::id3_ref`] is the typed sub-Meta
 //! parsed from those same bytes, which the sink emits.
 
 use crate::{
@@ -167,19 +167,22 @@ pub struct DsfFmtData {
 impl DsfFmtData {
   /// DSF.pm:30 `3 => 'FormatVersion'` (int32u LE).
   #[must_use]
-  pub fn format_version(&self) -> u32 {
+  #[inline(always)]
+  pub const fn format_version(&self) -> u32 {
     self.format_version
   }
   /// DSF.pm:31 raw `FormatID` (int32u LE). Use [`Self::format_id_print`]
   /// for the PrintConv-resolved name.
   #[must_use]
-  pub fn format_id(&self) -> u32 {
+  #[inline(always)]
+  pub const fn format_id(&self) -> u32 {
     self.format_id
   }
   /// DSF.pm:31 `PrintConv => { 0 => 'DSD Raw' }`. Returns `None` for
   /// hash misses (faithful — Perl emits `0` raw in that case).
   #[must_use]
-  pub fn format_id_print(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn format_id_print(&self) -> Option<&'static str> {
     match self.format_id {
       0 => Some("DSD Raw"),
       _ => None,
@@ -188,13 +191,15 @@ impl DsfFmtData {
   /// DSF.pm:32-43 raw `ChannelType` (int32u LE). Use
   /// [`Self::channel_type_print`] for the PrintConv-resolved name.
   #[must_use]
-  pub fn channel_type(&self) -> u32 {
+  #[inline(always)]
+  pub const fn channel_type(&self) -> u32 {
     self.channel_type
   }
   /// DSF.pm:32-43 `PrintConv` hash. Returns `None` on a hash miss
   /// (faithful — Perl emits the raw integer in that case).
   #[must_use]
-  pub fn channel_type_print(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn channel_type_print(&self) -> Option<&'static str> {
     match self.channel_type {
       1 => Some("Mono"),
       2 => Some("Stereo (Left, Right)"),
@@ -208,28 +213,33 @@ impl DsfFmtData {
   }
   /// DSF.pm:44 `ChannelCount` (int32u LE).
   #[must_use]
-  pub fn channel_count(&self) -> u32 {
+  #[inline(always)]
+  pub const fn channel_count(&self) -> u32 {
     self.channel_count
   }
   /// DSF.pm:45 `SampleRate` (int32u LE).
   #[must_use]
-  pub fn sample_rate(&self) -> u32 {
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> u32 {
     self.sample_rate
   }
   /// DSF.pm:46 `BitsPerSample` (int32u LE).
   #[must_use]
-  pub fn bits_per_sample(&self) -> u32 {
+  #[inline(always)]
+  pub const fn bits_per_sample(&self) -> u32 {
     self.bits_per_sample
   }
   /// DSF.pm:47 `SampleCount` (int64u LE). The full unsigned range is
   /// preserved; values above `i64::MAX` are still exact via `u64`.
   #[must_use]
-  pub fn sample_count(&self) -> u64 {
+  #[inline(always)]
+  pub const fn sample_count(&self) -> u64 {
     self.sample_count
   }
   /// DSF.pm:48 `BlockSize` (int32u LE).
   #[must_use]
-  pub fn block_size(&self) -> u32 {
+  #[inline(always)]
+  pub const fn block_size(&self) -> u32 {
     self.block_size
   }
 }
@@ -248,7 +258,7 @@ impl DsfFmtData {
 ///    `TagMap::write_warning` for byte-exact CLI JSON.
 /// 3. The optional ID3v2 trailer bytes ([`Self::id3_trailer`]) — the
 ///    `metaPos..metaPos+metaLen` slice (DSF.pm:88-97) borrowed from the
-///    input buffer (zero-alloc) — AND the typed [`Self::id3`] sub-Meta
+///    input buffer (zero-alloc) — AND the typed [`Self::id3_ref`] sub-Meta
 ///    parsed from those bytes via
 ///    [`crate::formats::id3::process::parse_id3_borrowed`]. The sink emits
 ///    `id3`'s `File:ID3Size` + `ID3v2_*:*` tags (the bundled-Perl
@@ -276,8 +286,8 @@ pub struct DsfMeta<'a> {
   /// the slice fails the bundled-Perl guards (`metaLen > 0 &&
   /// metaLen < 20_000_000 && Read == metaLen`).
   ///
-  /// Retained as a lib-first convenience alongside the typed [`Self::id3`]
-  /// sub-Meta (parsed from these same bytes). The sink emits via [`Self::id3`];
+  /// Retained as a lib-first convenience alongside the typed [`Self::id3_ref`]
+  /// sub-Meta (parsed from these same bytes). The sink emits via [`Self::id3_ref`];
   /// this raw slice lets callers re-process the trailer differently if needed.
   id3_trailer: Option<&'a [u8]>,
   /// Typed ID3 sub-Meta parsed from [`Self::id3_trailer`] (DSF.pm:88-97).
@@ -293,15 +303,21 @@ pub struct DsfMeta<'a> {
 impl<'a> DsfMeta<'a> {
   /// The `'fmt '` chunk fields, present on every happy path and absent
   /// only on the DSF.pm:71-72 Warn-then-accept path.
+  ///
+  /// §3: [`DsfFmtData`] is `Copy`, so an `Option<T: Copy>` field is
+  /// returned **by value** (`-> Option<DsfFmtData>`, bare name), not as a
+  /// borrow.
   #[must_use]
-  pub fn fmt(&self) -> Option<&DsfFmtData> {
-    self.fmt.as_ref()
+  #[inline(always)]
+  pub const fn fmt(&self) -> Option<DsfFmtData> {
+    self.fmt
   }
 
   /// The Warn text emitted by DSF.pm:71 when the fmt-chunk read fails.
   /// `Some` iff [`Self::fmt`] is `None`.
   #[must_use]
-  pub fn fmt_warning(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn fmt_warning(&self) -> Option<&'static str> {
     self.fmt_warning
   }
 
@@ -310,10 +326,11 @@ impl<'a> DsfMeta<'a> {
   /// (`metaPos == 0`) or the trailer fails the bundled-Perl guards
   /// (`metaLen > 0 && metaLen < 20_000_000 && Read == metaLen`).
   ///
-  /// **Phase F3 placeholder.** Will gain a typed `Option<Id3Meta<'a>>`
-  /// sibling once F2 lands typed ID3.
+  /// §3: the canonical `Option<&[u8]>` slice view of the borrowed trailer
+  /// (the `Copy` field is returned by value).
   #[must_use]
-  pub fn id3_trailer(&self) -> Option<&'a [u8]> {
+  #[inline(always)]
+  pub const fn id3_trailer(&self) -> Option<&'a [u8]> {
     self.id3_trailer
   }
 
@@ -321,9 +338,12 @@ impl<'a> DsfMeta<'a> {
   /// (DSF.pm:88-97). `Some` iff the trailer was present and ID3 detection
   /// accepted it. The `serialize_tags` sink
   /// emits its `File:ID3Size` + `ID3v2_*:*` tags after the `'fmt '` chunk.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[cfg(feature = "id3")]
   #[must_use]
-  pub fn id3(&self) -> Option<&crate::formats::id3::Id3Meta<'a>> {
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'a>> {
     self.id3.as_ref()
   }
 }
@@ -358,13 +378,17 @@ pub struct DsfContext<'a> {
 impl<'a> DsfContext<'a> {
   /// Construct a fresh DSF context (only constructor — D8 PRIVATE fields).
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self { data, shared }
   }
 
   /// File bytes (`$raf` in DSF.pm).
+  ///
+  /// §3: the canonical `&[u8]` slice view of the borrowed input.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 }
@@ -818,17 +842,16 @@ impl DsfMeta<'_> {
 /// `Ok(Some(DsfMeta { fmt: None, fmt_warning: Some(...) }))` (`Warn +
 /// return 1` per DSF.pm:71-72). Reserved for future I/O wrappers if
 /// streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror`
+/// (v2, `default-features = false` ⇒ `core::error::Error` in every
+/// feature tier, not just `std`); the hand-written impls are gone.
+/// `#[non_exhaustive]` lets a real variant land later without a breaking
+/// change. The enum is currently uninhabited, so it carries no
+/// `#[error(...)]` arms and no variant predicates (nothing to predicate).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DsfError {}
-
-impl core::fmt::Display for DsfError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for DsfError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1609,5 +1632,44 @@ mod tests {
       obj.get("File:FileType").and_then(|v| v.as_str()),
       Some("DSF")
     );
+  }
+
+  // --- §3/§5 skill-conformance tests for the typed DSF surface -----------
+
+  #[test]
+  fn dsf_fmt_accessor_is_byvalue_copy() {
+    // §3: `DsfFmtData` is Copy ⇒ `DsfMeta::fmt()` returns `Option<T>` by
+    // value (not `Option<&T>`), and the field getters are by-value too.
+    let buf = happy_path_dsf();
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let fmt: Option<DsfFmtData> = meta.fmt();
+    let fmt = fmt.expect("fmt present on happy path");
+    assert_eq!(fmt.channel_count(), 2);
+    assert_eq!(fmt.sample_rate(), 2_822_400);
+    assert_eq!(fmt.sample_count(), 2_822_400);
+    assert_eq!(fmt.block_size(), 4096);
+    // const-eval check: a by-value Copy getter is usable in const context.
+    const _: () = {
+      // (compile-time presence of the const fns; no runtime assert needed)
+    };
+  }
+
+  #[test]
+  #[cfg(feature = "id3")]
+  fn dsf_id3_ref_accessor_absent_without_trailer() {
+    // §3: the non-Copy nested-Meta getter is `id3_ref()`.
+    let buf = happy_path_dsf();
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    assert!(meta.id3_ref().is_none(), "metaPos=0 ⇒ no ID3 trailer");
+  }
+
+  #[test]
+  fn dsf_error_is_uninhabited_and_thiserror_derived() {
+    // §5: DsfError is uninhabited; this proves the thiserror-derived
+    // `Display`/`Error` impls exist (must compile).
+    fn _assert_error<E: core::error::Error>() {}
+    _assert_error::<DsfError>();
+    let none: Option<DsfError> = None;
+    assert!(none.is_none());
   }
 }

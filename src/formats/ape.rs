@@ -497,19 +497,33 @@ impl ApeBinaryField {
   }
 }
 
-/// The two binary-data formats APE.pm uses. Newtype-style (D8): unit
-/// variants only. Both little-endian (APE.pm:140 `SetByteOrder('II')`).
-#[derive(Clone, Copy, derive_more::IsVariant)]
+/// The two binary-data formats APE.pm uses. §2: unit variants only,
+/// `is_*` predicates (`derive_more::IsVariant`), and a `Display` routed
+/// through the single-source [`Self::as_str`]. Both little-endian
+/// (APE.pm:140 `SetByteOrder('II')`). Private to the crate, so no
+/// `#[non_exhaustive]` (that only constrains downstream crates).
+#[derive(Clone, Copy, derive_more::IsVariant, derive_more::Display)]
+#[display("{}", self.as_str())]
 enum ApeBinaryFormat {
   Int16u,
   Int32u,
 }
 
 impl ApeBinaryFormat {
+  /// Byte width of one field in this format.
   const fn width(self) -> usize {
     match self {
       ApeBinaryFormat::Int16u => 2,
       ApeBinaryFormat::Int32u => 4,
+    }
+  }
+
+  /// §2 single source of truth for [`Display`](core::fmt::Display) —
+  /// the ExifTool format name (APE.pm uses `int16u`/`int32u`).
+  const fn as_str(self) -> &'static str {
+    match self {
+      ApeBinaryFormat::Int16u => "int16u",
+      ApeBinaryFormat::Int32u => "int32u",
     }
   }
 }
@@ -995,7 +1009,8 @@ impl<'a> ApeContext<'a> {
   /// detected file type and the typed parser owns the magic check +
   /// SetFileType + binary-header block + tag-stream walk.
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self {
       data,
       shared,
@@ -1009,7 +1024,8 @@ impl<'a> ApeContext<'a> {
   /// `$$et{FileType}` already set ⇒ APE.pm:136 false ⇒ magic-and-header
   /// block skipped ⇒ trailer scan only).
   #[must_use]
-  pub fn new_trailer_only(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new_trailer_only(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self {
       data,
       shared,
@@ -1019,20 +1035,31 @@ impl<'a> ApeContext<'a> {
   }
 
   /// Input bytes.
+  ///
+  /// §3: the canonical `&[u8]` slice view of the borrowed input.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 
   /// Cross-format shared state.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix (pairs with
+  /// [`Self::shared_mut`]).
   #[must_use]
-  pub fn shared(&self) -> &SharedFlags {
+  #[inline(always)]
+  pub const fn shared_ref(&self) -> &SharedFlags {
     self.shared
   }
 
   /// Mutable cross-format shared state (the parser sets `done_ape` after
   /// running, faithful APE.pm:131).
-  pub fn shared_mut(&mut self) -> &mut SharedFlags {
+  ///
+  /// §3: mutable getter pairs with [`Self::shared_ref`]; returns
+  /// `&mut Self`-chaining-free `&mut SharedFlags` (no `#[must_use]`).
+  #[inline(always)]
+  pub const fn shared_mut(&mut self) -> &mut SharedFlags {
     self.shared
   }
 }
@@ -1041,10 +1068,33 @@ impl<'a> ApeContext<'a> {
 /// Owned `Vec<u8>` so the borrow on `ctx.data()` is released before we
 /// touch `ctx.metadata()`. `pub(crate)` to match
 /// [`plan_ape_trailer_only`]'s return type (Codex r15 finding).
+///
+/// §2: unit + newtype variants only, `is_*` predicates and
+/// `unwrap`/`try_unwrap` accessors derived (`derive_more`), `Display`
+/// routed through the single-source [`Self::as_str`]. Crate-private, so
+/// no `#[non_exhaustive]`.
+#[derive(
+  Debug, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap, derive_more::Display,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+#[display("{}", self.as_str())]
 pub(crate) enum HeaderJob {
   None,
   Old(Vec<u8>),
   New(Vec<u8>),
+}
+
+impl HeaderJob {
+  /// §2 single source of truth for [`Display`](core::fmt::Display) — the
+  /// header-table kind this job selected.
+  const fn as_str(&self) -> &'static str {
+    match self {
+      HeaderJob::None => "None",
+      HeaderJob::Old(_) => "Old",
+      HeaderJob::New(_) => "New",
+    }
+  }
 }
 
 /// The byte work the driver does in its read-only Phase 1. `Owned`
@@ -1062,17 +1112,24 @@ pub(crate) struct ApePlan {
 #[allow(dead_code)] // Phase-1: no chained-parser consumer in-tree yet; Phase-2 will wire it.
 impl ApePlan {
   /// The selected MAC header table (if any) and its body bytes.
-  pub(crate) fn header_job(&self) -> &HeaderJob {
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
+  #[inline(always)]
+  pub(crate) const fn header_job_ref(&self) -> &HeaderJob {
     &self.header_job
   }
   /// Pending tag pushes (g1, name, value), in extraction order. The
   /// chained-parser entry point [`ProcessApe::process_trailer_only`]
   /// consumes this directly.
-  pub(crate) fn pending(&self) -> &[(&'static str, String, TagValue)] {
-    &self.pending
+  ///
+  /// §3: `Vec<T>` projected to a `&[T]` slice view (`_slice` suffix).
+  #[inline(always)]
+  pub(crate) const fn pending_slice(&self) -> &[(&'static str, String, TagValue)] {
+    self.pending.as_slice()
   }
   /// Whether the post-loop `Warn('Bad APE trailer')` should fire.
-  pub(crate) fn warn_bad_trailer(&self) -> bool {
+  #[inline(always)]
+  pub(crate) const fn warn_bad_trailer(&self) -> bool {
     self.warn_bad_trailer
   }
 }
@@ -1081,56 +1138,206 @@ impl ApePlan {
 // Typed Meta — `ApeMeta<'a>`
 // =============================================================================
 
+/// `%APE::OldHeader` (APE.pm:45-62) payload — MAC version ≤ 3970.
+///
+/// §2: extracted into a named struct so [`ApeHeader::Old`] can be a
+/// single-field newtype variant (the skill forbids struct-style `{…}`
+/// variants). Fields carry the resolved post-ValueConv values; emission
+/// order at sink time follows the static [`OLD_HEADER`] table array.
+///
+/// All fields are `Copy`, so §3 getters are by-value with bare names.
+/// D8 — no public fields, accessors only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApeOldHeader {
+  /// APE.pm:50-53 `APEVersion = $val / 1000` (f64).
+  ape_version: f64,
+  /// APE.pm:54 `CompressionLevel` (raw int16u).
+  compression_level: i64,
+  /// APE.pm:56 `Channels` (raw int16u).
+  channels: i64,
+  /// APE.pm:57 `SampleRate` (raw int32u).
+  sample_rate: i64,
+  /// APE.pm:60 `TotalFrames` (raw int32u).
+  total_frames: i64,
+  /// APE.pm:61 `FinalFrameBlocks` (raw int32u).
+  final_frame_blocks: i64,
+  /// Number of fields read before short-read termination. `6` ⇒ full
+  /// header; less ⇒ truncated body (ExifTool.pm:9953 `last if $more
+  /// <= 0`). Used by [`ApeMeta::serialize_tags`] to know how many tags
+  /// to emit.
+  n_fields: u8,
+}
+
+impl ApeOldHeader {
+  /// APE.pm:50-53 `APEVersion` (post-ValueConv `$val / 1000`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn ape_version(&self) -> f64 {
+    self.ape_version
+  }
+  /// APE.pm:54 `CompressionLevel` (raw int16u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn compression_level(&self) -> i64 {
+    self.compression_level
+  }
+  /// APE.pm:56 `Channels` (raw int16u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn channels(&self) -> i64 {
+    self.channels
+  }
+  /// APE.pm:57 `SampleRate` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> i64 {
+    self.sample_rate
+  }
+  /// APE.pm:60 `TotalFrames` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn total_frames(&self) -> i64 {
+    self.total_frames
+  }
+  /// APE.pm:61 `FinalFrameBlocks` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn final_frame_blocks(&self) -> i64 {
+    self.final_frame_blocks
+  }
+  /// Number of fields read before short-read termination (≤ 6).
+  #[must_use]
+  #[inline(always)]
+  pub const fn n_fields(&self) -> u8 {
+    self.n_fields
+  }
+}
+
+/// `%APE::NewHeader` (APE.pm:65-78) payload — MAC version ≥ 3980.
+///
+/// §2: extracted into a named struct so [`ApeHeader::New`] can be a
+/// single-field newtype variant. Emission order at sink time follows the
+/// static [`NEW_HEADER`] table array.
+///
+/// All fields are `Copy`, so §3 getters are by-value with bare names.
+/// D8 — no public fields, accessors only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApeNewHeader {
+  /// APE.pm:70 `CompressionLevel` (raw int16u).
+  compression_level: i64,
+  /// APE.pm:72 `BlocksPerFrame` (raw int32u).
+  blocks_per_frame: i64,
+  /// APE.pm:73 `FinalFrameBlocks` (raw int32u).
+  final_frame_blocks: i64,
+  /// APE.pm:74 `TotalFrames` (raw int32u).
+  total_frames: i64,
+  /// APE.pm:75 `BitsPerSample` (raw int16u).
+  bits_per_sample: i64,
+  /// APE.pm:76 `Channels` (raw int16u).
+  channels: i64,
+  /// APE.pm:77 `SampleRate` (raw int32u).
+  sample_rate: i64,
+  /// Number of fields read before short-read termination. `7` ⇒ full
+  /// header; less ⇒ truncated body.
+  n_fields: u8,
+}
+
+impl ApeNewHeader {
+  /// APE.pm:70 `CompressionLevel` (raw int16u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn compression_level(&self) -> i64 {
+    self.compression_level
+  }
+  /// APE.pm:72 `BlocksPerFrame` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn blocks_per_frame(&self) -> i64 {
+    self.blocks_per_frame
+  }
+  /// APE.pm:73 `FinalFrameBlocks` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn final_frame_blocks(&self) -> i64 {
+    self.final_frame_blocks
+  }
+  /// APE.pm:74 `TotalFrames` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn total_frames(&self) -> i64 {
+    self.total_frames
+  }
+  /// APE.pm:75 `BitsPerSample` (raw int16u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn bits_per_sample(&self) -> i64 {
+    self.bits_per_sample
+  }
+  /// APE.pm:76 `Channels` (raw int16u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn channels(&self) -> i64 {
+    self.channels
+  }
+  /// APE.pm:77 `SampleRate` (raw int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> i64 {
+    self.sample_rate
+  }
+  /// Number of fields read before short-read termination (≤ 7).
+  #[must_use]
+  #[inline(always)]
+  pub const fn n_fields(&self) -> u8 {
+    self.n_fields
+  }
+}
+
 /// One emission of the MAC binary-data header (faithful APE.pm:146-162
-/// dispatch over `%OldHeader` ≤3.97 vs `%NewHeader` ≥3.98). Variant fields
-/// carry the resolved post-ValueConv values; emission order at sink time
-/// follows the static [`OLD_HEADER`] / [`NEW_HEADER`] table arrays.
+/// dispatch over `%OldHeader` ≤3.97 vs `%NewHeader` ≥3.98).
+///
+/// §2: variants are single-field newtypes wrapping the named payload
+/// structs ([`ApeOldHeader`] / [`ApeNewHeader`]); `is_*` predicates and
+/// `unwrap`/`try_unwrap` accessors are derived (`derive_more`), and
+/// `Display` is routed through the single-source [`Self::as_str`].
+/// `#[non_exhaustive]` (public enum) keeps adding a future header table
+/// non-breaking.
 ///
 /// Family-1 group of every emitted tag is `MAC` (APE.pm:47/67); family-0
 /// is `APE` (default-from-package, APE_GROUP0).
 ///
 /// D8 — no public fields, accessors only.
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(
+  Debug,
+  Clone,
+  PartialEq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+  derive_more::Display,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+#[display("{}", self.as_str())]
 pub enum ApeHeader {
   /// `%APE::OldHeader` (APE.pm:45-62) — MAC version ≤ 3970.
-  Old {
-    /// APE.pm:50-53 `APEVersion = $val / 1000` (f64).
-    ape_version: f64,
-    /// APE.pm:54 `CompressionLevel` (raw int16u).
-    compression_level: i64,
-    /// APE.pm:56 `Channels` (raw int16u).
-    channels: i64,
-    /// APE.pm:57 `SampleRate` (raw int32u).
-    sample_rate: i64,
-    /// APE.pm:60 `TotalFrames` (raw int32u).
-    total_frames: i64,
-    /// APE.pm:61 `FinalFrameBlocks` (raw int32u).
-    final_frame_blocks: i64,
-    /// Number of fields read before short-read termination. `6` ⇒ full
-    /// header; less ⇒ truncated body (ExifTool.pm:9953 `last if $more
-    /// <= 0`). Used by [`ApeMeta::sink`] to know how many tags to emit.
-    n_fields: u8,
-  },
+  Old(ApeOldHeader),
   /// `%APE::NewHeader` (APE.pm:65-78) — MAC version ≥ 3980.
-  New {
-    /// APE.pm:70 `CompressionLevel` (raw int16u).
-    compression_level: i64,
-    /// APE.pm:72 `BlocksPerFrame` (raw int32u).
-    blocks_per_frame: i64,
-    /// APE.pm:73 `FinalFrameBlocks` (raw int32u).
-    final_frame_blocks: i64,
-    /// APE.pm:74 `TotalFrames` (raw int32u).
-    total_frames: i64,
-    /// APE.pm:75 `BitsPerSample` (raw int16u).
-    bits_per_sample: i64,
-    /// APE.pm:76 `Channels` (raw int16u).
-    channels: i64,
-    /// APE.pm:77 `SampleRate` (raw int32u).
-    sample_rate: i64,
-    /// Number of fields read before short-read termination. `7` ⇒ full
-    /// header; less ⇒ truncated body.
-    n_fields: u8,
-  },
+  New(ApeNewHeader),
+}
+
+impl ApeHeader {
+  /// §2 single source of truth for [`Display`](core::fmt::Display) — the
+  /// MAC header-table name this variant came from.
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      ApeHeader::Old(_) => "OldHeader",
+      ApeHeader::New(_) => "NewHeader",
+    }
+  }
 }
 
 /// One main-table emission — a wire-format `%APE::Main` (APE.pm:21-42)
@@ -1153,15 +1360,22 @@ pub struct ApeMainTag {
 
 impl ApeMainTag {
   /// Resolved tag name (post-MakeTag / static-table lookup).
+  ///
+  /// §3: canonical `&str` view of the owned name (non-const —
+  /// `String::as_str` is not const).
   #[must_use]
+  #[inline(always)]
   pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
   /// Tag value (post-ValueConv / -PrintConv for static defs; raw
   /// `TagValue::Str` / `TagValue::Bytes` for dynamic MakeTag entries).
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[must_use]
-  pub fn value(&self) -> &TagValue {
+  #[inline(always)]
+  pub const fn value_ref(&self) -> &TagValue {
     &self.value
   }
 }
@@ -1190,7 +1404,7 @@ impl ApeMainTag {
 ///
 /// **Lifetimes.** `'a` is held for shape parity with formats that
 /// borrow string slices from the input; APE's [`ApeMainTag::name`] is
-/// owned (`MakeTag` allocates) and [`ApeMainTag::value`] is owned
+/// owned (`MakeTag` allocates) and [`ApeMainTag::value_ref`] is owned
 /// (`TagValue` is by-value), so `'a` is effectively `'static`. The
 /// parameter remains for future zero-copy work (Phase G).
 #[derive(Debug, Clone)]
@@ -1223,23 +1437,31 @@ pub struct ApeMeta<'a> {
 impl ApeMeta<'_> {
   /// MAC binary-data header tags (Old/New) if a MAC header was present.
   /// `None` when the input was APETAGEX-prefixed or trailer-only.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[must_use]
-  pub fn header(&self) -> Option<&ApeHeader> {
+  #[inline(always)]
+  pub const fn header_ref(&self) -> Option<&ApeHeader> {
     self.header.as_ref()
   }
 
   /// Dynamic `%APE::Main` tag-stream emissions, in extraction order.
   /// Always empty for a header-only input with no trailer; populated
   /// when an APETAGEX header/footer is parsed.
+  ///
+  /// §3: `Vec<T>` is projected to a `&[T]` slice view (`_slice` suffix),
+  /// never `&Vec<T>`.
   #[must_use]
-  pub fn main_tags(&self) -> &[ApeMainTag] {
-    &self.main_tags
+  #[inline(always)]
+  pub const fn main_tags_slice(&self) -> &[ApeMainTag] {
+    self.main_tags.as_slice()
   }
 
   /// `true` iff the planner detected an invalid APETAGEX trailer
   /// (APE.pm:194 `$count = -1`) ⇒ APE.pm:238 `Warn('Bad APE trailer')`.
   #[must_use]
-  pub fn warn_bad_trailer(&self) -> bool {
+  #[inline(always)]
+  pub const fn warn_bad_trailer(&self) -> bool {
     self.warn_bad_trailer
   }
 
@@ -1247,8 +1469,11 @@ impl ApeMeta<'_> {
   /// or post-ValueConv per the planner's `print_conv` mode). `None`
   /// when the intra-APE arithmetic did not produce a value (missing
   /// ingredients OR Perl-falsey `SampleRate`/`TotalFrames`).
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[must_use]
-  pub fn composite_duration(&self) -> Option<&TagValue> {
+  #[inline(always)]
+  pub const fn composite_duration_ref(&self) -> Option<&TagValue> {
     self.composite_duration.as_ref()
   }
 
@@ -1256,9 +1481,12 @@ impl ApeMeta<'_> {
   /// ID3v1 trailer was detected by [`parse_full_chained`]. The
   /// `serialize_tags` sink emits its
   /// `File:ID3Size` + `ID3v2_*:*` / `ID3v1:*` tags.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[cfg(feature = "id3")]
   #[must_use]
-  pub fn id3(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
     self.id3.as_ref()
   }
 
@@ -1267,36 +1495,42 @@ impl ApeMeta<'_> {
   /// `APE:Artist` (APE.pm:30) — the first-seen artist tag in the dynamic
   /// main-tag emissions. `None` if the wire format did not carry one.
   #[must_use]
+  #[inline(always)]
   pub fn artist(&self) -> Option<&str> {
     self.find_str("Artist")
   }
 
   /// `APE:Album` (APE.pm:29).
   #[must_use]
+  #[inline(always)]
   pub fn album(&self) -> Option<&str> {
     self.find_str("Album")
   }
 
   /// `APE:Title` (APE.pm:32).
   #[must_use]
+  #[inline(always)]
   pub fn title(&self) -> Option<&str> {
     self.find_str("Title")
   }
 
   /// `APE:Genre` (APE.pm:31).
   #[must_use]
+  #[inline(always)]
   pub fn genre(&self) -> Option<&str> {
     self.find_str("Genre")
   }
 
   /// `APE:Track` (APE.pm:33).
   #[must_use]
+  #[inline(always)]
   pub fn track(&self) -> Option<&str> {
     self.find_str("Track")
   }
 
   /// `APE:Year` (APE.pm:34).
   #[must_use]
+  #[inline(always)]
   pub fn year(&self) -> Option<&str> {
     self.find_str("Year")
   }
@@ -1304,7 +1538,7 @@ impl ApeMeta<'_> {
   fn find_str(&self, name: &str) -> Option<&str> {
     self.main_tags.iter().find_map(|t| {
       if t.name() == name {
-        match t.value() {
+        match t.value_ref() {
           TagValue::Str(s) => Some(s.as_str()),
           _ => None,
         }
@@ -1322,16 +1556,16 @@ impl ApeMeta<'_> {
 /// Rust-level fatal modes for APE parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror`
+/// (v2, `default-features = false` ⇒ `core::error::Error` in every
+/// feature tier); the hand-written impls are gone. `#[non_exhaustive]`
+/// lets a real variant land later without a breaking change. The enum is
+/// currently uninhabited, so it carries no `#[error(...)]` arms and no
+/// variant predicates (nothing to predicate).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApeError {}
-
-impl core::fmt::Display for ApeError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-impl std::error::Error for ApeError {}
 
 impl FormatParser for ProcessApe {
   /// GAT: `ApeMeta<'a>`. APE's typed Meta already owns its resolved
@@ -1575,7 +1809,7 @@ fn extract_old_header(body: &[u8]) -> ApeHeader {
     }
     n_fields += 1;
   }
-  ApeHeader::Old {
+  ApeHeader::Old(ApeOldHeader {
     ape_version,
     compression_level,
     channels,
@@ -1583,7 +1817,7 @@ fn extract_old_header(body: &[u8]) -> ApeHeader {
     total_frames,
     final_frame_blocks,
     n_fields,
-  }
+  })
 }
 
 /// Run the [`NEW_HEADER`] binary-data extraction over a MAC NewHeader
@@ -1615,7 +1849,7 @@ fn extract_new_header(body: &[u8]) -> ApeHeader {
     }
     n_fields += 1;
   }
-  ApeHeader::New {
+  ApeHeader::New(ApeNewHeader {
     compression_level,
     blocks_per_frame,
     final_frame_blocks,
@@ -1624,7 +1858,7 @@ fn extract_new_header(body: &[u8]) -> ApeHeader {
     channels,
     sample_rate,
     n_fields,
-  }
+  })
 }
 
 /// Intra-APE Composite:Duration resolution (faithful to
@@ -1670,7 +1904,7 @@ fn composite_duration_from_header_and_main(
     if target.is_some() {
       continue; // already filled by a later occurrence (we iterate reversed)
     }
-    let raw = t.value().clone();
+    let raw = t.value_ref().clone();
     let num = match &raw {
       TagValue::I64(n) => Some(*n as f64),
       TagValue::F64(x) => Some(*x),
@@ -1685,36 +1919,50 @@ fn composite_duration_from_header_and_main(
   // supply (header is chronologically earlier ⇒ only used when not overridden).
   if let Some(h) = header {
     let (sr, tf, bpf, ffb) = match h {
-      ApeHeader::Old {
-        sample_rate: sr,
-        total_frames: tf,
-        n_fields,
-        ..
-      } => {
+      ApeHeader::Old(o) => {
         // OldHeader has SampleRate (index 4) and TotalFrames (index 10).
         // BlocksPerFrame is not in OldHeader; final_frame_blocks (index
         // 12) IS, when n_fields ≥ 6. Composite needs all 4 ⇒ OldHeader
         // alone cannot satisfy unless the main-tag stream contributes
         // BlocksPerFrame.
-        let sr = if *n_fields >= 4 { Some(*sr) } else { None };
-        let tf = if *n_fields >= 5 { Some(*tf) } else { None };
+        let n_fields = o.n_fields();
+        let sr = if n_fields >= 4 {
+          Some(o.sample_rate())
+        } else {
+          None
+        };
+        let tf = if n_fields >= 5 {
+          Some(o.total_frames())
+        } else {
+          None
+        };
         (sr, tf, None, None)
       }
-      ApeHeader::New {
-        sample_rate: sr,
-        total_frames: tf,
-        blocks_per_frame: bpf,
-        final_frame_blocks: ffb,
-        n_fields,
-        ..
-      } => {
+      ApeHeader::New(nw) => {
         // NewHeader carries all 4. n_fields ordering: CompressionLevel(0),
         // BlocksPerFrame(1), FinalFrameBlocks(2), TotalFrames(3),
         // BitsPerSample(4), Channels(5), SampleRate(6).
-        let bpf = if *n_fields >= 2 { Some(*bpf) } else { None };
-        let ffb = if *n_fields >= 3 { Some(*ffb) } else { None };
-        let tf = if *n_fields >= 4 { Some(*tf) } else { None };
-        let sr = if *n_fields >= 7 { Some(*sr) } else { None };
+        let n_fields = nw.n_fields();
+        let bpf = if n_fields >= 2 {
+          Some(nw.blocks_per_frame())
+        } else {
+          None
+        };
+        let ffb = if n_fields >= 3 {
+          Some(nw.final_frame_blocks())
+        } else {
+          None
+        };
+        let tf = if n_fields >= 4 {
+          Some(nw.total_frames())
+        } else {
+          None
+        };
+        let sr = if n_fields >= 7 {
+          Some(nw.sample_rate())
+        } else {
+          None
+        };
         (sr, tf, bpf, ffb)
       }
     };
@@ -1840,47 +2088,30 @@ fn sink_header(
   // Family-1 group is `MAC` (APE.pm:47/67).
   const GROUP: &str = "MAC";
   match header {
-    ApeHeader::Old {
-      ape_version,
-      compression_level,
-      channels,
-      sample_rate,
-      total_frames,
-      final_frame_blocks,
-      n_fields,
-    } => {
-      let n = *n_fields as usize;
+    ApeHeader::Old(o) => {
+      let n = o.n_fields() as usize;
       let emits: &[(&str, EmitVal)] = &[
-        ("APEVersion", EmitVal::F64(*ape_version)),
-        ("CompressionLevel", EmitVal::I64(*compression_level)),
-        ("Channels", EmitVal::I64(*channels)),
-        ("SampleRate", EmitVal::I64(*sample_rate)),
-        ("TotalFrames", EmitVal::I64(*total_frames)),
-        ("FinalFrameBlocks", EmitVal::I64(*final_frame_blocks)),
+        ("APEVersion", EmitVal::F64(o.ape_version())),
+        ("CompressionLevel", EmitVal::I64(o.compression_level())),
+        ("Channels", EmitVal::I64(o.channels())),
+        ("SampleRate", EmitVal::I64(o.sample_rate())),
+        ("TotalFrames", EmitVal::I64(o.total_frames())),
+        ("FinalFrameBlocks", EmitVal::I64(o.final_frame_blocks())),
       ];
       for (name, val) in emits.iter().take(n) {
         emit_with_print_conv(out, GROUP, name, val, print_conv)?;
       }
     }
-    ApeHeader::New {
-      compression_level,
-      blocks_per_frame,
-      final_frame_blocks,
-      total_frames,
-      bits_per_sample,
-      channels,
-      sample_rate,
-      n_fields,
-    } => {
-      let n = *n_fields as usize;
+    ApeHeader::New(nw) => {
+      let n = nw.n_fields() as usize;
       let emits: &[(&str, EmitVal)] = &[
-        ("CompressionLevel", EmitVal::I64(*compression_level)),
-        ("BlocksPerFrame", EmitVal::I64(*blocks_per_frame)),
-        ("FinalFrameBlocks", EmitVal::I64(*final_frame_blocks)),
-        ("TotalFrames", EmitVal::I64(*total_frames)),
-        ("BitsPerSample", EmitVal::I64(*bits_per_sample)),
-        ("Channels", EmitVal::I64(*channels)),
-        ("SampleRate", EmitVal::I64(*sample_rate)),
+        ("CompressionLevel", EmitVal::I64(nw.compression_level())),
+        ("BlocksPerFrame", EmitVal::I64(nw.blocks_per_frame())),
+        ("FinalFrameBlocks", EmitVal::I64(nw.final_frame_blocks())),
+        ("TotalFrames", EmitVal::I64(nw.total_frames())),
+        ("BitsPerSample", EmitVal::I64(nw.bits_per_sample())),
+        ("Channels", EmitVal::I64(nw.channels())),
+        ("SampleRate", EmitVal::I64(nw.sample_rate())),
       ];
       for (name, val) in emits.iter().take(n) {
         emit_with_print_conv(out, GROUP, name, val, print_conv)?;
@@ -1930,10 +2161,10 @@ fn sink_main_tag(
   // Dynamic `MakeTag` entries (no static def) emit as-is in both modes
   // (faithful: bundled Perl `tagInfo` has only `Name`, no PrintConv).
   if print_conv && t.name() == "Duration" {
-    let printed = convert_duration(t.value());
+    let printed = convert_duration(t.value_ref());
     return emit_tag_value(out, "APE", t.name(), &printed);
   }
-  emit_tag_value(out, "APE", t.name(), t.value())
+  emit_tag_value(out, "APE", t.name(), t.value_ref())
 }
 
 #[cfg(feature = "alloc")]
@@ -3872,7 +4103,7 @@ mod tests {
         .expect("ok")
         .expect("parsed");
     // Header is NewHeader (MAC vers >= 3980 ⇒ NewHeader table).
-    assert!(matches!(meta.header(), Some(ApeHeader::New { .. })));
+    assert!(matches!(meta.header_ref(), Some(ApeHeader::New(_))));
     // Main-tag stream carries the synthesized Artist.
     assert_eq!(meta.artist(), Some("Tester"));
     assert_eq!(meta.album(), None);
@@ -3932,7 +4163,7 @@ mod tests {
     .expect("ok")
     .expect("trailer-only meta");
     // Trailer-only ⇒ no header.
-    assert!(meta.header().is_none());
+    assert!(meta.header_ref().is_none());
     // Wire tag extracted.
     assert_eq!(meta.title(), Some("Trailer Title"));
   }
@@ -3974,9 +4205,9 @@ mod tests {
     shared.set_done_id3(128);
     let mut ctx = ApeContext::new(&bytes, &mut shared);
     assert_eq!(ctx.data().len(), 4);
-    assert_eq!(ctx.shared().done_id3(), Some(128));
+    assert_eq!(ctx.shared_ref().done_id3(), Some(128));
     ctx.shared_mut().set_done_ape(true);
-    assert!(ctx.shared().done_ape());
+    assert!(ctx.shared_ref().done_ape());
   }
 
   #[test]
@@ -3987,8 +4218,95 @@ mod tests {
       <ProcessApe as FormatParser>::parse(&ProcessApe, ApeContext::new(&data, &mut shared))
         .expect("ok")
         .expect("parsed");
-    let mains = meta.main_tags();
+    let mains = meta.main_tags_slice();
     assert!(!mains.is_empty(), "fixture has an Artist tag");
     assert!(mains.iter().any(|t| t.name() == "Artist"));
+  }
+
+  // --- §2/§3/§5 skill-conformance tests for the typed APE surface --------
+
+  #[test]
+  fn ape_header_newtype_variant_predicates_and_unwrap() {
+    // §2: `ApeHeader` is a newtype enum with `is_*` predicates and
+    // `unwrap`/`try_unwrap` accessors handing back the named payload.
+    let data = build_minimal_ape_input();
+    let mut shared = SharedFlags::new();
+    let meta =
+      <ProcessApe as FormatParser>::parse(&ProcessApe, ApeContext::new(&data, &mut shared))
+        .expect("ok")
+        .expect("parsed");
+    let header = meta.header_ref().expect("MAC NewHeader present");
+    assert!(header.is_new());
+    assert!(!header.is_old());
+    // §2 Display via single-source as_str.
+    assert_eq!(header.as_str(), "NewHeader");
+    assert_eq!(header.to_string(), "NewHeader");
+    // try_unwrap (ref) hands back the named payload struct; the §3 by-value
+    // Copy getters read its fields. The minimal fixture has an empty header
+    // body (dlen = 0) ⇒ no fields fit ⇒ n_fields() == 0 and all-zero.
+    let nw = header.try_unwrap_new_ref().expect("New payload");
+    assert_eq!(nw.n_fields(), 0);
+    assert_eq!(nw.sample_rate(), 0);
+    assert!(header.clone().try_unwrap_old().is_err());
+  }
+
+  #[test]
+  fn ape_old_header_accessors_are_byvalue_copy() {
+    // §3: every field of the extracted payload struct is Copy ⇒ by-value
+    // bare-name getter. Round-trip a hand-built OldHeader body. The last
+    // OldHeader field is index 12 (int32u, width 4) ⇒ the body must be at
+    // least 12*2 + 4 = 28 bytes for all 6 fields to fit.
+    let mut body = vec![0u8; 16 * APE_HEADER_INCREMENT];
+    // index 0 (APEVersion int16u) = 3950 ⇒ ValueConv /1000 = 3.95
+    body[0..2].copy_from_slice(&3950u16.to_le_bytes());
+    // index 4 (SampleRate int32u) = 44100
+    let off = 4 * APE_HEADER_INCREMENT;
+    body[off..off + 4].copy_from_slice(&44100u32.to_le_bytes());
+    let h = extract_old_header(&body);
+    let o = h.try_unwrap_old_ref().expect("Old payload");
+    assert!((o.ape_version() - 3.95).abs() < 1e-9);
+    assert_eq!(o.sample_rate(), 44100);
+    assert_eq!(o.n_fields(), 6);
+    // Display + predicate.
+    assert_eq!(h.as_str(), "OldHeader");
+    assert!(h.is_old());
+  }
+
+  #[test]
+  fn ape_main_tag_value_ref_accessor() {
+    // §3: ApeMainTag::value_ref() is the non-Copy `_ref` getter.
+    let t = ApeMainTag {
+      name: "Artist".to_string(),
+      value: TagValue::Str("Tester".into()),
+    };
+    assert_eq!(t.name(), "Artist");
+    assert!(matches!(t.value_ref(), TagValue::Str(_)));
+  }
+
+  #[test]
+  fn header_job_predicates_and_display() {
+    // §2: pub(crate) HeaderJob carries unit + newtype variants with
+    // predicates, unwrap accessors, and Display-via-as_str.
+    let none = HeaderJob::None;
+    assert!(none.is_none());
+    assert_eq!(none.to_string(), "None");
+    let old = HeaderJob::Old(vec![1, 2, 3]);
+    assert!(old.is_old());
+    assert_eq!(old.as_str(), "Old");
+    assert_eq!(
+      old.try_unwrap_old_ref().expect("body").as_slice(),
+      &[1, 2, 3]
+    );
+  }
+
+  #[test]
+  fn ape_error_is_uninhabited_and_thiserror_derived() {
+    // §5: ApeError is uninhabited; this only needs to compile to prove the
+    // thiserror-derived `Display`/`Error` impls exist. `Option<ApeError>`
+    // is always None.
+    fn _assert_error<E: core::error::Error>() {}
+    _assert_error::<ApeError>();
+    let none: Option<ApeError> = None;
+    assert!(none.is_none());
   }
 }
