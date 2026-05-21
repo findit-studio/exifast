@@ -224,10 +224,14 @@ impl NumVal {
   /// `as_f64() == as_f64()` fallback silently collapses any two integers that
   /// round to the same `f64` — e.g. `9007194254740993` and `…992.0` both become
   /// the same `f64` above 2^53, so a real off-by-one mismatch reads EQUAL. So
-  /// when the float side is INTEGER-VALUED and exactly representable as the
-  /// integer type, we compare the integer values EXACTLY. Only a genuinely
-  /// fractional or out-of-integer-range float falls back to `f64` comparison
-  /// (where the float is the authoritative value anyway).
+  /// the float must be integer-valued AND exactly representable as the integer
+  /// type ([`f_as_exact_i128`] / [`f_as_exact_u128`] applies a range-check
+  /// BEFORE the cast — see R2-F3 — to keep `2^127.0` from saturating to
+  /// `i128::MAX` and falsely matching `i128::MAX (Int)`). Any out-of-range or
+  /// fractional float returns FALSE: a NumVal::Int (which is by definition an
+  /// exact integer literal) cannot value-equal a non-integer or out-of-i128
+  /// f64; falling back to `as f64` would just re-introduce the precision-loss
+  /// false-positive R1-F3 fixed at 2^53 and R2-F3 fixed at 2^127.
   ///
   /// `(Float, Float)` keeps `f64` comparison: both sides are `f64`-derived, so
   /// this is formatting-insensitive (`0.0`==`0.00000000`, `3.4e+38`==`3.4e38`).
@@ -241,41 +245,74 @@ impl NumVal {
         u128::try_from(i).is_ok_and(|i| i == u)
       }
       (NumVal::Int(i), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Int(i)) => {
-        match f_as_exact_i128(f) {
-          Some(fi) => i == fi,
-          None => i as f64 == f,
-        }
+        // R2-F3: integer-valued → range-check → cast → exact integer compare.
+        // If the float is out of i128 range (or fractional), it cannot
+        // represent the same integer value, so report UNEQUAL — do NOT fall
+        // back to `as f64`, that was the saturation hole Codex caught.
+        f_as_exact_i128(f).is_some_and(|fi| i == fi)
       }
       (NumVal::Uint(u), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Uint(u)) => {
-        match f_as_exact_u128(f) {
-          Some(fu) => u == fu,
-          None => u as f64 == f,
-        }
+        // Symmetric to the Int/Float arm — see comment above.
+        f_as_exact_u128(f).is_some_and(|fu| u == fu)
       }
       (NumVal::Float(a), NumVal::Float(b)) => a == b,
     }
   }
 }
 
-/// If `f` is integer-valued AND exactly representable as an `i128` (i.e. the
-/// round-trip `f as i128 as f64 == f` holds, which also rejects `f` outside
-/// `i128` range and any fractional `f`), return that exact `i128`. Otherwise
-/// `None` — the caller then treats `f` as a genuine float.
+/// If `f` is integer-valued AND inside the `i128` range, return that exact
+/// `i128`. Otherwise `None` — the caller then reports the values UNEQUAL (do
+/// NOT fall back to `as f64`; that is the mask Codex caught in R2-F3).
+///
+/// **Why the range-check must precede the cast.** Rust's `f64 as i128` cast
+/// is SATURATING (`-inf`/below-MIN → `i128::MIN`; `inf`/above-MAX →
+/// `i128::MAX`; NaN → 0). And `i128::MAX as f64` rounds UP to `2^127` —
+/// which is exactly the f64 literal `170141183460469231731687303715884105728.0`.
+/// A naïve "round-trip" `(f as i128 as f64) == f` therefore looks valid for
+/// `f = 2^127`: cast saturates to `i128::MAX`, the back-cast rounds UP to
+/// the same `2^127`, the check passes, and we hand back `i128::MAX` for a
+/// float that does not represent any i128. The integer comparator then reads
+/// `i128::MAX (Int) == 2^127.0 (Float)` as TRUE — a false-positive.
+///
+/// The half-open range `[-2^127, 2^127)` is exact in f64 (both endpoints are
+/// powers of two), so a literal-bound compare is exact and saturation-free.
+/// `f.fract() == 0.0` is checked FIRST so a fractional in-range float
+/// (e.g. `1.5`) also exits `None` cleanly.
 fn f_as_exact_i128(f: f64) -> Option<i128> {
   if f.fract() != 0.0 {
     return None;
   }
+  // Half-open: `f >= -2^127` AND `f < 2^127`. Reject the upper bound — that
+  // f64 value cannot represent any i128 (i128::MAX = 2^127 - 1). Both
+  // literals are exact f64 (powers of two), so no rounding hides here.
+  if !(f >= -170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64
+    && f < 170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64)
+  {
+    return None;
+  }
+  // Now safe: `f` is integer-valued AND inside [-2^127, 2^127). The cast is
+  // exact (any in-range integer-valued f64 round-trips losslessly through
+  // i128); the assert-style check guards future-proofs.
   let i = f as i128;
-  (i as f64 == f).then_some(i)
+  debug_assert_eq!(i as f64, f, "in-range integer-valued f64 must round-trip");
+  Some(i)
 }
 
-/// `u128` analogue of [`f_as_exact_i128`]. Also rejects negative `f`.
+/// `u128` analogue of [`f_as_exact_i128`]. Same range-before-cast discipline
+/// (the saturation hole is symmetric: `u128::MAX as f64` rounds UP to
+/// `2^128`, masking a `2^128.0` float as equal to `u128::MAX`). Rejects
+/// fractional `f`, negative `f`, and `f >= 2^128`. The half-open bounds
+/// `[0, 2^128)` are exact in f64 (both powers of two).
 fn f_as_exact_u128(f: f64) -> Option<u128> {
-  if f.fract() != 0.0 || f < 0.0 {
+  if f.fract() != 0.0 {
+    return None;
+  }
+  if !(f >= 0.0_f64 && f < 340_282_366_920_938_463_463_374_607_431_768_211_456.0_f64) {
     return None;
   }
   let u = f as u128;
-  (u as f64 == f).then_some(u)
+  debug_assert_eq!(u as f64, f, "in-range integer-valued f64 must round-trip");
+  Some(u)
 }
 
 /// VALUE-equality of two scalar `RawValue`s (numbers, strings, `true`/`false`/
@@ -689,6 +726,99 @@ mod tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn i128_max_vs_2pow127_float_is_unequal() {
+    // R2-F3 (Codex round-2 [high]): the R1 fix used `f as i128` round-tripped
+    // via `as f64` to decide "is this float an exact i128", but
+    // `f64 as i128` SATURATES (`>= 2^127` → `i128::MAX`) and `i128::MAX as f64`
+    // rounds UP to `2^127` — so the round-trip `(f as i128) as f64 == f` is
+    // TRUE for `f = 2^127.0`, giving a false-positive equality between the
+    // integer `i128::MAX` and the float `2^127.0` (which is one past i128's
+    // representable range).
+    //
+    // i128::MAX = 170141183460469231731687303715884105727 (2^127 - 1).
+    // The float 170141183460469231731687303715884105728.0 IS 2^127 in f64
+    // (an exact power-of-two literal).
+    let int_max = "[{\"a\":170141183460469231731687303715884105727}]";
+    let f_2pow127 = "[{\"a\":170141183460469231731687303715884105728.0}]";
+    assert!(
+      json_equivalent(int_max, f_2pow127).is_err(),
+      "i128::MAX (Int) must NOT equal 2^127.0 (Float)"
+    );
+    // Symmetric (Float on the actual side).
+    assert!(json_equivalent(f_2pow127, int_max).is_err());
+  }
+
+  #[test]
+  fn i128_min_vs_neg_2pow127_float_is_equal() {
+    // i128::MIN = -2^127 = -170141183460469231731687303715884105728, which IS
+    // exactly representable as the f64 literal of the same magnitude (it is a
+    // power of two). The half-open range `[-2^127, +2^127)` INCLUDES this
+    // value, so this pair stays EQUAL (and the equal-by-value verdict is the
+    // correct one — they ARE the same mathematical value).
+    let int_min = "[{\"a\":-170141183460469231731687303715884105728}]";
+    let f_min = "[{\"a\":-170141183460469231731687303715884105728.0}]";
+    assert!(
+      json_equivalent(int_min, f_min).is_ok(),
+      "i128::MIN (Int) must equal -2^127.0 (Float, exact)"
+    );
+    assert!(json_equivalent(f_min, int_min).is_ok());
+  }
+
+  #[test]
+  fn u128_max_vs_2pow128_float_is_unequal() {
+    // Symmetric Uint hole: `u128::MAX as f64` rounds UP to `2^128`, so the
+    // OLD round-trip masked the float `2^128.0` as equal to `u128::MAX`
+    // (which is one below `2^128`). u128::MAX = 2^128 - 1.
+    let uint_max = "[{\"a\":340282366920938463463374607431768211455}]";
+    let f_2pow128 = "[{\"a\":340282366920938463463374607431768211456.0}]";
+    assert!(
+      json_equivalent(uint_max, f_2pow128).is_err(),
+      "u128::MAX (Uint) must NOT equal 2^128.0 (Float)"
+    );
+    assert!(json_equivalent(f_2pow128, uint_max).is_err());
+  }
+
+  #[test]
+  fn float_beyond_i128_range_stays_unequal_to_any_int() {
+    // Floats far outside the i128 / u128 ranges must NOT be coerced to the
+    // saturated integer. Negative side: `-2^200.0` cannot equal any signed
+    // 128-bit integer. Positive side: `2^200.0` cannot equal any 128-bit
+    // integer either. Use exact power-of-two f64 literals.
+    let f_neg_big = "[{\"a\":-1.6069380442589903e+60}]"; // ~-2^200
+    let f_pos_big = "[{\"a\":1.6069380442589903e+60}]"; // ~2^200
+    assert!(
+      json_equivalent(f_neg_big, "[{\"a\":-1}]").is_err(),
+      "huge negative float must NOT equal a small Int"
+    );
+    assert!(
+      json_equivalent(f_pos_big, "[{\"a\":1}]").is_err(),
+      "huge positive float must NOT equal a small Int"
+    );
+    // And no Int comparison saturates into a match for the boundary itself.
+    let int_one = "[{\"a\":1}]";
+    assert!(json_equivalent(f_pos_big, int_one).is_err());
+  }
+
+  #[test]
+  fn float_in_int_range_just_below_2pow127_stays_equal() {
+    // Sanity: a clearly-in-range integer-valued float (well below 2^127)
+    // still round-trips equal to its Int spelling. `2^120` is exact in f64
+    // (power of two) and clearly inside `[-2^127, +2^127)`.
+    //
+    // 2^120 = 1329227995784915872903807060280344576.
+    let int_form = "[{\"a\":1329227995784915872903807060280344576}]";
+    let float_form = "[{\"a\":1329227995784915872903807060280344576.0}]";
+    assert!(
+      json_equivalent(int_form, float_form).is_ok(),
+      "2^120 (Int) must equal 2^120.0 (Float, well inside i128 range)"
+    );
+    // Below-range floats: -2^120 is exact and well inside the i128 range.
+    let int_neg = "[{\"a\":-1329227995784915872903807060280344576}]";
+    let float_neg = "[{\"a\":-1329227995784915872903807060280344576.0}]";
+    assert!(json_equivalent(int_neg, float_neg).is_ok());
   }
 
   #[test]
