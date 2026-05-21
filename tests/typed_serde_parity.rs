@@ -159,13 +159,17 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_121() {
+fn typed_serde_path_equals_writer_path_and_golden_all_124() {
+  // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
+  // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
+  // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
+  // APE-trailer chains the previous typed dispatch silently dropped.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    121,
-    "expected exactly the 121 active conformance fixtures, found {}: {:?}",
+    124,
+    "expected exactly the 124 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

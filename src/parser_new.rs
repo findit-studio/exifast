@@ -1078,17 +1078,23 @@ impl AnyParser {
       }
       #[cfg(feature = "mpc")]
       AnyParser::Mpc(p) => {
-        let _ = (p, ext, &mut *shared);
-        crate::formats::mpc::parse_borrowed(bytes)
-          .map(|o| o.map(AnyMeta::Mpc))
-          .map_err(Into::into)
+        let _ = (p, ext);
+        // F2 (Codex adversarial): `parse_full_chained` runs the embedded
+        // ID3 prefix (MPC.pm:84-87) and APE trailer (MPC.pm:111-113)
+        // chains and nests their typed sub-Metas — the pre-fix arm called
+        // `parse_borrowed` which dropped both chains.
+        // (`mpc` requires `id3` + `ape` in Cargo.toml so this `cfg(all)`
+        // arm is the only one — the bare `parse_borrowed` is gone.)
+        Ok(crate::formats::mpc::parse_full_chained(bytes, shared).map(AnyMeta::Mpc))
       }
       #[cfg(feature = "wavpack")]
       AnyParser::Wv(p) => {
-        let _ = (p, ext, &mut *shared);
-        crate::formats::wavpack::parse_borrowed(bytes)
-          .map(|o| o.map(AnyMeta::Wv))
-          .map_err(Into::into)
+        let _ = (p, ext);
+        // F2 (Codex adversarial): `parse_full_chained` runs the APE
+        // trailer chain (WavPack.pm:100-103 `APE::ProcessAPE`). The
+        // pre-fix arm called `parse_borrowed` which dropped the chain.
+        // (`wavpack` requires `id3` + `ape` in Cargo.toml.)
+        Ok(crate::formats::wavpack::parse_full_chained(bytes, shared).map(AnyMeta::Wv))
       }
     }
   }

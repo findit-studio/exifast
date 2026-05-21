@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "wavpack_with_apev2_trailer.wv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WV",
+  "File:FileTypeExtension": "WV",
+  "File:MIMEType": "audio/x-wavpack",
+  "File:BytesPerSample": 1,
+  "File:AudioType": 1,
+  "File:Compression": 0,
+  "File:DataFormat": 0,
+  "File:SampleRate": 10,
+  "APE:Artist": "WvApeArtist"
+}]

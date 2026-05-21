@@ -432,8 +432,29 @@ pub struct Meta<'a> {
   /// `Some(&data)` — the full input buffer — on the typed parse so a
   /// future lib-first ID3 typed parser can pick up the range without a
   /// re-read; `None` is reserved for a future "stop-after-header" mode.
-  /// Today the engine entry `process` does the actual chained parsing.
+  /// The legacy bridge / engine entry `process` consumes it.
   id3_apetrailer_scan: Option<&'a [u8]>,
+  /// Chained ID3 sub-Meta (WavPack.pm:100 comment `also look for ID3 and
+  /// APE trailers (ProcessAPE also checks for ID3)`). `Some` when an
+  /// ID3v1 trailer was detected at EOF — populated by
+  /// [`parse_full_chained`] via the embedded `ProcessID3` call (same
+  /// recursive-via-APE pattern the bundled Perl uses; we run ID3
+  /// directly first to get the `DoneID3` shift for the APE footer
+  /// scan).
+  ///
+  /// F2 (Codex adversarial): the previous typed dispatch returned
+  /// `wavpack::Meta` from `parse_borrowed` with NO chain — silently
+  /// dropping every APE/ID3 trailer.
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
+  /// Chained APE sub-Meta (WavPack.pm:101-103 — `APE::ProcessAPE`).
+  /// `Some` when an APE trailer was detected by
+  /// [`parse_full_chained`]; the typed `serialize_tags` sink emits
+  /// its `APE:*` tags. RIFF scanning (WavPack.pm:98-99) remains the
+  /// documented Phase-3+ accepted-deferral; no WavPack-RIFF fixtures
+  /// exist in scope.
+  #[cfg(feature = "ape")]
+  ape: Option<crate::formats::ape::Meta<'a>>,
 }
 
 impl<'a> Meta<'a> {
@@ -506,6 +527,26 @@ impl<'a> Meta<'a> {
   #[inline(always)]
   pub const fn id3_ape_scan_range(&self) -> Option<&'a [u8]> {
     self.id3_apetrailer_scan
+  }
+
+  /// Chained ID3 sub-Meta (WavPack.pm:100). `Some` when an ID3 trailer
+  /// was detected by [`parse_full_chained`]. §3: non-`Copy` borrow ⇒
+  /// `_ref` suffix.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
+  }
+
+  /// Chained APE sub-Meta (WavPack.pm:101-103). `Some` when an APE
+  /// trailer was detected by [`parse_full_chained`]. §3: non-`Copy`
+  /// borrow ⇒ `_ref` suffix.
+  #[cfg(feature = "ape")]
+  #[must_use]
+  #[inline(always)]
+  pub const fn ape_ref(&self) -> Option<&crate::formats::ape::Meta<'_>> {
+    self.ape.as_ref()
   }
 }
 
@@ -703,7 +744,63 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     sample_rate,
     sample_rate_raw_index: sr_raw,
     id3_apetrailer_scan: Some(data),
+    #[cfg(feature = "id3")]
+    id3: None,
+    #[cfg(feature = "ape")]
+    ape: None,
   })
+}
+
+/// Full WavPack parse with the embedded ID3 + APE trailer chains
+/// (WavPack.pm:100-103). Same nesting shape as `mpc::parse_full_chained`
+/// and `ape::parse_full_chained`.
+///
+/// Runs:
+/// 1. **WavPack body** ([`parse_inner`]) — the 32-byte `wvpk` header
+///    bit-stream walk.
+/// 2. **ID3 detection** (`ProcessID3` via
+///    [`crate::formats::id3::process::parse_id3_with_hdr_end`]) — WavPack
+///    has NO native ID3-prefix at offset 0 (the `wvpk` magic must be
+///    there), but bundled's `APE::ProcessAPE` recursively calls
+///    `ProcessID3` at APE.pm:124-127 to detect any ID3v1 trailer at EOF.
+///    We run it directly first so the resulting `DoneID3` shift correctly
+///    positions the APE footer scan below.
+/// 3. **APE trailer** ([`crate::formats::ape::parse_trailer_only_owned`])
+///    over the whole input buffer; uses the `shared.done_id3()` value
+///    set in step 2 for the APE.pm:169 footer-position shift.
+///
+/// RIFF scanning (WavPack.pm:98-99) is the documented Phase-3+ accepted-
+/// deferral (no WavPack-RIFF fixture exists). When a future RIFF port
+/// lands, this fn gains a fourth step.
+///
+/// F2 (Codex adversarial): the previous `AnyParser::Wv` arm called the
+/// bare `parse_borrowed`, dropping every APE / ID3 trailer chain.
+#[cfg(all(feature = "id3", feature = "ape"))]
+pub(crate) fn parse_full_chained<'a>(
+  data: &'a [u8],
+  shared: &mut crate::parser_new::SharedFlags,
+) -> Option<Meta<'a>> {
+  // 1. WavPack body. On wrong magic (`return 0` at WavPack.pm:87-88) we
+  // drop the whole result so the `parse_any` candidate loop tries the
+  // next type — APE / ID3 are not considered if WV magic missed.
+  let mut meta = parse_inner(data)?;
+
+  // 2. ID3 detection (ID3.pm:1435-1632). `unless ($$et{DoneID3})`
+  // recursion guard. Only the v1-trailer scan is meaningful for WV (the
+  // wvpk magic must be at offset 0, so the v2-prefix branch can't fire).
+  if shared.done_id3().is_none() {
+    meta.id3 = crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
+      .ok()
+      .and_then(|(m, _hdr_end)| m);
+  }
+
+  // 3. APE trailer (WavPack.pm:101-103). `parse_trailer_only_owned`
+  // honours `shared.done_id3()` (set in step 2) for the APE.pm:169
+  // footer shift. Returns `Some(empty meta)` when no APETAGEX footer
+  // is found — the typed sink skips empty emission.
+  meta.ape = crate::formats::ape::parse_trailer_only_owned(data, shared);
+
+  Some(meta)
 }
 
 // ===========================================================================
@@ -765,6 +862,21 @@ impl Meta<'_> {
       }
     } else {
       out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw_index))?;
+    }
+
+    // Chained ID3 sub-Meta (WavPack.pm:100). Bundled runs `ProcessID3`
+    // AFTER the WavPack body extraction (via the recursive APE call), so
+    // `File:ID3Size` + any `ID3v1:*` tags follow the `File:*` WV tags. F2
+    // (Codex adversarial): the pre-fix typed dispatch dropped this.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.serialize_tags(print_conv, out)?;
+    }
+
+    // Chained APE sub-Meta (WavPack.pm:101-103). F2 (Codex adversarial).
+    #[cfg(feature = "ape")]
+    if let Some(ape) = &self.ape {
+      ape.serialize_tags(print_conv, out)?;
     }
 
     Ok(())

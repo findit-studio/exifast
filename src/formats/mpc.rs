@@ -447,9 +447,19 @@ impl Sv7Header {
 ///
 /// **D8 — no public fields, accessors only.**
 ///
-/// **Lifetimes.** `'a` is held for the ID3/APE byte placeholders that
-/// borrow from the input slice; the SV7 header is owned primitives.
-#[derive(Debug, Clone, Copy)]
+/// **Lifetimes.** `'a` is held for the nested ID3 / APE sub-Metas (which
+/// today own their strings via `SmolStr` / owned bytes; the borrow is a
+/// phantom reserved for Phase G zero-alloc).
+///
+/// **F2 (Codex adversarial)** — the previous `id3_prefix` / `ape_trailer`
+/// `Option<&'a [u8]>` placeholders were unused (the legacy engine
+/// dispatched ID3 / APE separately); the `AnyParser::Mpc` arm therefore
+/// SILENTLY DROPPED both chains. Now `mpc::parse_full_chained` runs them
+/// inline via [`crate::formats::id3::process::parse_id3_with_hdr_end`] +
+/// [`crate::formats::ape::parse_trailer_only_owned`] and the typed
+/// `serialize_tags` sink emits the chained tags — same nesting pattern
+/// APE/DSF/FLAC use.
+#[derive(Debug, Clone)]
 pub struct Meta<'a> {
   /// MP+ version low nibble (MPC.pm:93 `ord($1) & 0x0f`). The SV7 bit
   /// walker only runs when `version == 0x07`; other versions trigger the
@@ -462,23 +472,23 @@ pub struct Meta<'a> {
   /// Whether the non-SV7 warning (MPC.pm:108 `'Audio info currently not
   /// extracted from this version MPC file'`) should be emitted.
   warn_unsupported_version: bool,
-  /// **Phase F5 placeholder.** Byte slice of any ID3-prefix block seen
-  /// BEFORE the MP+ magic (MPC.pm:84-87). The legacy bridge dispatches it
-  /// through [`crate::formats::id3::process::process_id3_chained`]; the
-  /// typed `Id3Meta` from the parallel F2 agent will eventually consume
-  /// this slice (Phase F5-integration). Today: always `None` — F5 does NOT
-  /// pre-scan for ID3 (the bridge calls ID3 directly on `ctx.data()`).
-  id3_prefix: Option<&'a [u8]>,
-  /// **Phase F5 placeholder.** Byte slice of any APE trailer block seen
-  /// AFTER the MP+ header (MPC.pm:111-113). The legacy bridge dispatches
-  /// it through [`crate::formats::ape::ProcessApe::process_trailer_only`];
-  /// the typed `ape::Meta` from the parallel F3 agent will eventually
-  /// consume this slice. Today: always `None` for the same reason as
-  /// `id3_prefix`.
-  ape_trailer: Option<&'a [u8]>,
+  /// Chained ID3 sub-Meta (MPC.pm:84-87 `ProcessID3` — runs BEFORE the
+  /// MP+ magic check). `Some` when an ID3v2 PREFIX was detected and
+  /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`];
+  /// `serialize_tags` emits its `File:ID3Size` + frame tags. (Same
+  /// nesting pattern as `flac::Meta::id3` / `ape::Meta::id3`.)
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
+  /// Chained APE sub-Meta (MPC.pm:111-113 — runs AFTER the MP+ header).
+  /// `Some` when an APE trailer was detected and parsed via
+  /// [`crate::formats::ape::parse_trailer_only_owned`]; `serialize_tags`
+  /// emits its `APE:*` tags (and ID3v1 trailer if present — `parse_full_
+  /// chained` on APE nests both v2-prefix and v1-trailer).
+  #[cfg(feature = "ape")]
+  ape: Option<crate::formats::ape::Meta<'a>>,
 }
 
-impl<'a> Meta<'a> {
+impl Meta<'_> {
   /// MP+ version low nibble (MPC.pm:93). `0x07` ⇒ SV7 path; anything else
   /// ⇒ warning arm (MPC.pm:107-109).
   #[must_use]
@@ -499,19 +509,23 @@ impl<'a> Meta<'a> {
   pub const fn warn_unsupported_version(&self) -> bool {
     self.warn_unsupported_version
   }
-  /// **Phase F5 placeholder.** ID3-prefix bytes (always `None` today; see
-  /// the field-level doc).
+  /// Chained ID3 sub-Meta (MPC.pm:84-87). `Some` when an ID3v2 prefix was
+  /// detected by [`parse_full_chained`]. §3: non-`Copy` borrow ⇒ `_ref`
+  /// suffix.
+  #[cfg(feature = "id3")]
   #[must_use]
   #[inline(always)]
-  pub const fn id3_prefix(&self) -> Option<&'a [u8]> {
-    self.id3_prefix
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
   }
-  /// **Phase F5 placeholder.** APE-trailer bytes (always `None` today; see
-  /// the field-level doc).
+  /// Chained APE sub-Meta (MPC.pm:111-113). `Some` when an APE trailer was
+  /// detected by [`parse_full_chained`]. §3: non-`Copy` borrow ⇒ `_ref`
+  /// suffix.
+  #[cfg(feature = "ape")]
   #[must_use]
   #[inline(always)]
-  pub const fn ape_trailer(&self) -> Option<&'a [u8]> {
-    self.ape_trailer
+  pub const fn ape_ref(&self) -> Option<&crate::formats::ape::Meta<'_>> {
+    self.ape.as_ref()
   }
 }
 
@@ -608,17 +622,30 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   parse_inner(data)
 }
 
-/// Inner parser — produces a borrow-from-input [`Meta`]. The
-/// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns
-/// this borrowed form directly into the closed
-/// [`crate::parser_new::AnyMeta`] enum (Codex AF2). The `id3_prefix` /
-/// `ape_trailer` placeholders are always `None` in F5.
+/// Inner parser — produces a borrow-from-input [`Meta`].
+///
+/// The MPC body itself: 32-byte MP+ header magic + SV7 bit-stream
+/// extraction. The chained ID3 (MPC.pm:84-87) and APE (MPC.pm:111-113)
+/// dispatches are layered ON TOP by [`parse_full_chained`] (the
+/// `AnyParser::Mpc` entry) — same nesting pattern as `ape::parse_full_
+/// chained`. This bare `parse_inner` is the body-only path, used by the
+/// `header-only` typed entry [`parse_borrowed`].
+///
+/// Takes an `id3_hdr_end` offset so a typed caller that already ran
+/// ID3 (e.g. `parse_full_chained`) can pass the body offset and avoid
+/// re-detecting the prefix; defaults to 0 when no prefix.
 fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+  parse_inner_at(data, 0)
+}
+
+/// Body-only parse starting at `offset` (the post-ID3-prefix offset, or 0).
+fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error> {
+  let body = data.get(offset..).unwrap_or(&[]);
   // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
-  if data.len() < 32 {
+  if body.len() < 32 {
     return Ok(None); // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
   }
-  let hdr = &data[..32];
+  let hdr = &body[..32];
   if &hdr[..3] != b"MP+" {
     return Ok(None); // magic mismatch ⇒ Perl regex no-match ⇒ return 0
   }
@@ -640,10 +667,79 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     version,
     sv7_header,
     warn_unsupported_version,
-    // F5 placeholders — see field docs on `Meta`.
-    id3_prefix: None,
-    ape_trailer: None,
+    #[cfg(feature = "id3")]
+    id3: None,
+    #[cfg(feature = "ape")]
+    ape: None,
   }))
+}
+
+/// Full MPC parse with the embedded ID3 prefix (MPC.pm:84-87) and APE
+/// trailer (MPC.pm:111-113) chains. Same shape as `ape::parse_full_chained`.
+///
+/// Runs:
+/// 1. **Embedded ID3** (MPC.pm:84-87) over the FULL buffer when `DoneID3`
+///    is unset, via [`crate::formats::id3::process::parse_id3_with_hdr_end`].
+///    Yields the post-ID3v2-header offset `hdr_end` + a typed `Id3Meta`,
+///    and records `DoneID3` (the trailer size APE.pm:169 reads).
+/// 2. **MPC body** at `data[hdr_end..]` (the bundled audio-loop's
+///    `Seek($hdrEnd, 0)` at ID3.pm:1590) via [`parse_inner_at`].
+/// 3. **APE trailer** over the FULL buffer (APE.pm:169's footer scan
+///    honours the v1-trailer-size shift in `shared.done_id3()`) via
+///    [`crate::formats::ape::parse_full_chained`] which itself nests
+///    both an ID3v1 trailer and an ID3v2 prefix on the APE side; in the
+///    MPC chain the v2-prefix has already been consumed in step 1 (the
+///    `DoneID3` recursion guard prevents a second emission), but the
+///    v1-trailer scan still runs.
+///
+/// Returns `Some(Meta)` only when the MPC body parsed (Perl
+/// `return 0` on body-magic-miss).
+///
+/// F2 (Codex adversarial): the previous `AnyParser::Mpc` arm called the
+/// bare `parse_borrowed`, which never ran the chains — so an MPC with a
+/// leading ID3 or trailing APE would silently DROP those tags. Faithful
+/// fix mirrors what the engine bridge does and what APE/DSF/FLAC already
+/// do for their own chains.
+#[cfg(all(feature = "id3", feature = "ape"))]
+pub(crate) fn parse_full_chained<'a>(
+  data: &'a [u8],
+  shared: &mut crate::parser_new::SharedFlags,
+) -> Option<Meta<'a>> {
+  // 1. Embedded ID3 prefix (MPC.pm:84-87). `unless ($$et{DoneID3})`
+  // recursion guard (ID3.pm:1435).
+  let (id3, hdr_end) = if shared.done_id3().is_none() {
+    crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
+      .unwrap_or((None, 0))
+  } else {
+    (None, shared.id3_hdr_end().unwrap_or(0))
+  };
+
+  // 2. MPC body at the post-ID3-prefix slice. Per Perl `return 0` on body-
+  // magic-miss (MPC.pm:92), drop everything (including the ID3 prefix) so
+  // the `parse_any` candidate loop tries the next type. Same semantics as
+  // APE's body-magic gate.
+  let mut meta = parse_inner_at(data, hdr_end).ok()??;
+  meta.id3 = id3;
+
+  // 3. APE trailer (MPC.pm:111-113 `require Image::ExifTool::APE;
+  // APE::ProcessAPE($et, $dirInfo);`). The MPC BODY isn't APE (no
+  // MAC/APETAGEX magic at offset 0), so we use `parse_trailer_only_owned`
+  // — the typed analogue of bundled's APE.pm:194-241 FOOTER-only scan.
+  // It honours `shared.done_id3()` for the APE.pm:169 footer-position
+  // shift (so a fixture that ALSO has an ID3v1 trailer at EOF still
+  // finds the APE footer 128 bytes earlier than EOF).
+  //
+  // (Bundled's `APE::ProcessAPE` recursively calls `ProcessID3` at
+  // APE.pm:124-127 — but step 1 above has already run it and the
+  // ID3.pm:1435 recursion guard returns 0; the v1 trailer tags are
+  // already in `meta.id3`.)
+  //
+  // The trailer-only entry returns `Some(meta)` even when no APETAGEX
+  // footer is present (empty `main_tags`, no warning); the typed sink
+  // skips empty emission, so we keep `Some` for simplicity.
+  meta.ape = crate::formats::ape::parse_trailer_only_owned(data, shared);
+
+  Some(meta)
 }
 
 /// Extract the SV7 bit-fields from the 32-byte MP+ header. Reuses
@@ -740,6 +836,15 @@ impl Meta<'_> {
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "MPC";
+
+    // (0) Chained ID3 sub-Meta (MPC.pm:84-87). Bundled runs `ProcessID3`
+    // FIRST — so `File:ID3Size` + every `ID3v2_*:*` / `ID3v1:*` frame tag
+    // precedes the MPC body tags. F2 (Codex adversarial): the pre-fix
+    // typed dispatch dropped this entirely.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.serialize_tags(print_conv, out)?;
+    }
 
     if let Some(h) = self.sv7_header.as_ref() {
       // MPC.pm:28 — TotalFrames: no conversions, identical under -j and -n.
@@ -861,6 +966,15 @@ impl Meta<'_> {
     if self.warn_unsupported_version {
       out.write_warning("Audio info currently not extracted from this version MPC file")?;
     }
+
+    // Chained APE sub-Meta (MPC.pm:111-113). Bundled runs `APE::ProcessAPE`
+    // AFTER the MPC body extraction, so `APE:*` tags follow `MPC:*`. F2
+    // (Codex adversarial): the pre-fix typed dispatch dropped these.
+    #[cfg(feature = "ape")]
+    if let Some(ape) = &self.ape {
+      ape.serialize_tags(print_conv, out)?;
+    }
+
     Ok(())
   }
 }
@@ -1071,9 +1185,13 @@ mod tests {
     assert!(h.gapless()); // 1 ⇒ Yes
     assert_eq!(h.encoder_version(), 115);
     assert!(!meta.warn_unsupported_version());
-    // F5 placeholders are always None.
-    assert!(meta.id3_prefix().is_none());
-    assert!(meta.ape_trailer().is_none());
+    // F2 (Codex adversarial): chained sub-Metas are always `None` for the
+    // BARE `parse_borrowed` path (no chain run). The full chain (`parse_
+    // full_chained`) runs via the `AnyParser::Mpc` arm.
+    #[cfg(feature = "id3")]
+    assert!(meta.id3_ref().is_none());
+    #[cfg(feature = "ape")]
+    assert!(meta.ape_ref().is_none());
   }
 
   #[test]
@@ -1128,8 +1246,10 @@ mod tests {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
-      id3_prefix: None,
-      ape_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
+      #[cfg(feature = "ape")]
+      ape: None,
     };
     let mut w = TagMap::new();
     meta.serialize_tags(true, &mut w).unwrap();
@@ -1172,8 +1292,10 @@ mod tests {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
-      id3_prefix: None,
-      ape_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
+      #[cfg(feature = "ape")]
+      ape: None,
     };
     let mut w = TagMap::new();
     meta.serialize_tags(false, &mut w).unwrap();
@@ -1196,8 +1318,10 @@ mod tests {
       version: 0x08,
       sv7_header: None,
       warn_unsupported_version: true,
-      id3_prefix: None,
-      ape_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
+      #[cfg(feature = "ape")]
+      ape: None,
     };
     // -j
     let mut w = TagMap::new();
@@ -1241,8 +1365,10 @@ mod tests {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
-      id3_prefix: None,
-      ape_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
+      #[cfg(feature = "ape")]
+      ape: None,
     };
     let mut w = TagMap::new();
     meta.serialize_tags(true, &mut w).unwrap();
@@ -1273,8 +1399,10 @@ mod tests {
       version: 0x07,
       sv7_header: Some(h),
       warn_unsupported_version: false,
-      id3_prefix: None,
-      ape_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
+      #[cfg(feature = "ape")]
+      ape: None,
     };
     let mut w = TagMap::new();
     meta.serialize_tags(true, &mut w).unwrap();

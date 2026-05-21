@@ -952,6 +952,82 @@ fn mpc_sv8_warn_conformance() {
 }
 
 #[test]
+fn mpc_with_id3v2_prefix_conformance() {
+  // F2 (Codex adversarial) regression pin: MPC.pm:84-87 ID3-prefix
+  // dispatch. Pre-fix the `AnyParser::Mpc` arm called the bare
+  // `parse_borrowed` (header-only) and DROPPED the ID3 chain — so an
+  // ID3-prefixed MPC silently lost `File:ID3Size` + every `ID3v2_*:*`
+  // frame tag. `parse_full_chained` now nests a typed `Id3Meta` on
+  // `mpc::Meta` (same pattern APE/DSF/FLAC use) and emits it.
+  //
+  // Fixture (66 bytes): ID3v2.3 with TIT2="MpcId3v2Title" (34 bytes) +
+  // 32-byte MP+ SV7 header copied from MPC.mpc. Bundled emits the full
+  // chain incl. `ID3v2_3:Title="MpcId3v2Title"`. Goldens captured from
+  // bundled `perl exiftool` via tools/gen_golden.sh (untrimmed).
+  check(
+    "mpc_with_id3v2_prefix.mpc",
+    "mpc_with_id3v2_prefix.mpc.json",
+    true,
+  );
+  check(
+    "mpc_with_id3v2_prefix.mpc",
+    "mpc_with_id3v2_prefix.mpc.n.json",
+    false,
+  );
+}
+
+#[test]
+fn mpc_with_apev2_trailer_conformance() {
+  // F2 (Codex adversarial) regression pin: MPC.pm:111-113 APE-trailer
+  // dispatch. Pre-fix the `AnyParser::Mpc` arm dropped the APE chain
+  // (`parse_borrowed` is header-only) — so an APE-trailer-on-MPC fixture
+  // silently lost every `APE:*` tag. `parse_full_chained` now runs
+  // `ape::parse_trailer_only_owned` on the post-header buffer and nests
+  // the resulting `ape::Meta`.
+  //
+  // Fixture (91 bytes): 32-byte MP+ SV7 header + APEv2 trailer carrying
+  // `APE:Artist="MpcApeArtist"` (59-byte body + 32-byte footer).
+  // Goldens captured from bundled `perl exiftool` via
+  // tools/gen_golden.sh (untrimmed).
+  check(
+    "mpc_with_apev2_trailer.mpc",
+    "mpc_with_apev2_trailer.mpc.json",
+    true,
+  );
+  check(
+    "mpc_with_apev2_trailer.mpc",
+    "mpc_with_apev2_trailer.mpc.n.json",
+    false,
+  );
+}
+
+#[test]
+fn wavpack_with_apev2_trailer_conformance() {
+  // F2 (Codex adversarial) regression pin: WavPack.pm:100-103 APE-
+  // trailer dispatch (`APE::ProcessAPE` after the wvpk-header
+  // extraction). Pre-fix the `AnyParser::Wv` arm dropped the chain.
+  // `parse_full_chained` now runs `ProcessID3` (recursion-guarded) +
+  // `parse_trailer_only_owned` and nests both typed sub-Metas on
+  // `wavpack::Meta`.
+  //
+  // Fixture (90 bytes): 32-byte wvpk header (copied from WavPack.wv) +
+  // APEv2 trailer carrying `APE:Artist="WvApeArtist"`. The WV header
+  // emits `File:BytesPerSample`/`AudioType`/`Compression`/`DataFormat`/
+  // `SampleRate`; the APE trailer adds `APE:Artist`. Goldens captured
+  // from bundled `perl exiftool` via tools/gen_golden.sh (untrimmed).
+  check(
+    "wavpack_with_apev2_trailer.wv",
+    "wavpack_with_apev2_trailer.wv.json",
+    true,
+  );
+  check(
+    "wavpack_with_apev2_trailer.wv",
+    "wavpack_with_apev2_trailer.wv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn red_r3d_conformance() {
   // FORMATS.md row 12: Image::ExifTool::Red. Bundled fixture
   // `tests/fixtures/Red.r3d` is the real `t/images/Red.r3d` (1160 bytes,
