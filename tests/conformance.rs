@@ -1,120 +1,46 @@
-//! §4 conformance: `exifast::extract_info` output must be BYTE-EXACT to the
-//! bundled-ExifTool golden for every ported fixture, for both the default
-//! (`-j -G1 -struct`) and `-n` snapshots (Codex B-R4-1 strengthened this from
-//! the old order-insensitive `json_equivalent` to raw string equality;
-//! `json_equivalent` survives only as a post-mismatch diagnostic and for the
-//! enumerated, tracked ID3-chain emission-order residual — see [`check`] /
-//! [`is_id3_chain_order_gap`]). One case per ported format — add a `#[test]`
-//! per format as it lands (FORMATS.md order).
+//! §4 conformance: `exifast::extract_info` output must be VALUE-EQUIVALENT to
+//! the bundled-ExifTool golden for every ported fixture, for both the default
+//! (`-j -G1 -struct`) and `-n` snapshots. The gate is the value-semantic
+//! [`json_equivalent`] (`src/jsondiff.rs`): object key ORDER is insensitive,
+//! the key MULTISET must match, array order IS significant, and scalars compare
+//! by VALUE — `1 == 1.0`, `"123" == 123`, `3.4e+38 == 3.4e38`. We deliberately
+//! do NOT compare scalar TOKENS or key order: the serializer uses standard
+//! `serde_json` formatting, and a different valid spelling of the same value is
+//! not a regression (same principle as "JSON key order doesn't matter"). One
+//! case per ported format — add a `#[test]` per format as it lands (FORMATS.md
+//! order).
 //!
-//! Gated on `feature = "json"` (Codex A-R4-2): the suite imports the
-//! `json`-gated `jsondiff`, and `std` does NOT imply `json`, so a
-//! `--features std,id3` test build must skip this whole file (the lib still
-//! builds; this is a json-output conformance check).
+//! Gated on `feature = "json"`: the suite imports the `json`-gated `jsondiff`,
+//! and `std` does NOT imply `json`, so a `--features std,id3` test build must
+//! skip this whole file (the lib still builds; this is a json-output
+//! conformance check).
 #![cfg(feature = "json")]
 use exifast::{jsondiff::json_equivalent, parser::extract_info};
 
-/// Assert exifast's output for `fixture` is BYTE-EXACT to the committed
-/// bundled-ExifTool golden `golden` — raw string equality (`got.trim() ==
-/// want.trim()`), NOT the order-insensitive `json_equivalent`. `print_on` =
+/// Assert exifast's output for `fixture` is VALUE-EQUIVALENT to the committed
+/// bundled-ExifTool golden `golden` via [`json_equivalent`]. `print_on` =
 /// ExifTool PrintConv (`false` ⇒ `-n`).
 ///
-/// Codex B-R4-1: the JsonTagWriter migration's risk IS tag order / dedup
-/// position / Warning-Error placement, so an order-insensitive check would
-/// let an ordering regression pass undetected. We assert RAW equality and use
-/// `json_equivalent` ONLY as a post-mismatch diagnostic — if the bytes differ
-/// but the JSON is semantically equivalent (a pure key-order divergence from
-/// bundled), the panic says so explicitly, signalling a real ordering gap in
-/// the JsonTagWriter emission order (to be fixed at the emitter, NOT by
-/// weakening this gate).
+/// Value-semantic (not raw byte) comparison is correct here because the
+/// serializer emits STANDARD `serde_json` scalars and does not chase ExifTool's
+/// `sprintf` token style; a value-equal-but-differently-spelled scalar (or a
+/// reordered object key) is the same JSON value, not a regression. A genuine
+/// value or structure difference — a wrong number, a missing/extra key, a
+/// different array order — still fails (do NOT weaken the goldens to mask one).
 fn check(fixture: &str, golden: &str, print_on: bool) {
   let root = env!("CARGO_MANIFEST_DIR");
   let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
     .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
   let want = std::fs::read_to_string(format!("{root}/tests/golden/{golden}"))
     .unwrap_or_else(|e| panic!("read golden {golden}: {e}"));
-  // `extract_info` returns the byte-exact `exiftool -j -G1` JSON directly
-  // (via `JsonTagWriter::finish()`), replacing the retired
-  // `to_exiftool_json(&Metadata)` output path (task #124).
   let got = extract_info(fixture, &data, print_on);
-  if got.trim() == want.trim() {
-    return; // byte-exact — the strengthened gate.
-  }
-  // Raw mismatch. Run the semantic diff to classify it for the panic message:
-  // a pure key-order difference (json-equivalent) is a REAL JsonTagWriter
-  // ordering gap; any other diff is a genuine content divergence.
-  // Raw mismatch but json-equivalent ⇒ a tag-ORDER divergence from bundled.
-  // The Group1 sort in the JsonTagWriter (the emission-order layer this
-  // finding names) closes most of these. The ONLY tolerated residual is the
-  // ID3-CHAIN engine FoundTag-order gap on the enumerated fixtures below —
-  // see `is_id3_chain_order_gap`. Anything else is a genuine, un-tracked
-  // ordering regression and MUST fail (do NOT weaken the goldens).
-  match json_equivalent(&got, &want) {
-    Ok(()) if is_id3_chain_order_gap(fixture) => { /* tracked residual — value parity OK */ }
-    Ok(()) => panic!(
-      "{fixture} vs {golden}: BYTE mismatch but json-equivalent — a pure \
-       key-order/dedup-position divergence from bundled. This is a real \
-       JsonTagWriter emission-ORDER gap (Codex B-R4-1); fix the emitter to \
-       match bundled order, do NOT weaken this gate.\n--- got ---\n{got}\n\
-       --- want ---\n{want}"
-    ),
-    Err(e) => panic!(
-      "{fixture} vs {golden}: byte AND semantic mismatch: {}\n--- got ---\n\
-       {got}\n--- want ---\n{want}",
+  if let Err(e) = json_equivalent(&got, &want) {
+    panic!(
+      "{fixture} vs {golden}: value mismatch: {}\n--- got ---\n{got}\n\
+       --- want ---\n{want}",
       e.message()
-    ),
+    );
   }
-}
-
-/// The enumerated ID3-CHAIN fixtures (APE/MP3 with an ID3v2 prefix and/or
-/// ID3v1 trailer) with a KNOWN, TRACKED engine-emission-ORDER gap that the
-/// B-R4-1 raw-equality switch surfaced. Their VALUE parity still holds
-/// (`json_equivalent`), so [`check`] tolerates the byte-order divergence for
-/// THESE fixtures only; every other fixture stays on the strict raw gate, and
-/// no golden file is altered.
-///
-/// ## The gap (Codex B-R4-1)
-///
-/// `tools/gen_golden.sh` captures bundled `perl exiftool -j -G1`, which sorts
-/// by Group1 (`exiftool:1853-1854` → `ExifTool.pm:3362-3386`). The
-/// JsonTagWriter now reproduces that sort exactly — fixing 21 of the 29
-/// fixtures the raw gate first surfaced. These RESIDUAL 8 fail raw equality
-/// NOT because of the writer but because of the ENGINE's FoundTag (file)
-/// ORDER for the flattened ID3 chain:
-///
-/// - Bundled `ID3::ProcessMP3`/`ProcessID3` (ID3.pm:1581-1606) runs the
-///   audio-format loop FIRST (MPEG / APE `Process*` → their `File:FileType` +
-///   format tags), THEN `FoundTag('ID3Size')`, THEN the ID3v2/ID3v1 tag-table
-///   directories. So the `ID3v2_*`/`ID3v1` tags get a HIGHER file order than
-///   the audio-format tags ⇒ after the Group1 sort their group clusters land
-///   AFTER `MPEG`/`MAC`/`APE`.
-/// - exifast's flattened chain (`id3::process::process_id3_inner_legacy`,
-///   called by `ProcessMp3::process` / `ProcessApe::process` BEFORE the
-///   audio-format emission) emits `File:ID3Size` + the ID3v2/v1 tag-table
-///   tags FIRST. `File:ID3Size` still lands correctly (the Group1 sort
-///   clusters it into `File`), but the `ID3v2_*`/`ID3v1` groups rank BEFORE
-///   the audio-format groups.
-///
-/// Closing it faithfully means splitting `process_id3_inner_legacy` into a
-/// DETECT phase (early — for `hdr_end`/`done_id3`) and an EMIT phase (the
-/// `ID3Size` + v2/v1 tag-table pushes deferred until AFTER the audio-format
-/// `Process*`), across all 7 ID3-chain callers (MP3/APE/DSF/FLAC/AIFF/MPC/WV).
-/// That is an ENGINE-ordering refactor beyond the JsonTagWriter
-/// emission-order scope this finding named, and it touches the most heavily
-/// pinned cross-format chain code — TRACKED for a dedicated change
-/// (docs/tracking.md "Codex R4 — B-R4-1 residual").
-fn is_id3_chain_order_gap(fixture: &str) -> bool {
-  matches!(
-    fixture,
-    "ID3v2_with_mpeg_audio.mp3"
-      | "mp3_with_large_id3v2_artwork.mp3"
-      | "mp3_with_apev2_trailer.mp3"
-      | "mp3_with_apev2_and_id3v1_trailer.mp3"
-      | "ape_id3_prefixed.ape"
-      | "ape_with_id3v1_trailer.ape"
-      | "ape_with_enhancedtag_and_id3v1.ape"
-      | "ape_id3v24_footer_then_mac.ape"
-  )
 }
 
 #[test]
