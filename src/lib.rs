@@ -93,6 +93,13 @@ pub mod formats;
 // Library callers without `json` get the typed-Meta API path only; CLI
 // JSON emission requires the feature.
 #[cfg(feature = "json")]
+pub mod json_scalar;
+// The direct typed-Meta → JSON `TagWriter` (Phase #124 redesign target). Gated
+// on `json`; reuses the byte-exact scalar encoders in `json_scalar` so it is
+// byte-identical to the `Metadata`→JSON `serialize` path.
+#[cfg(feature = "json")]
+pub mod json_writer;
+#[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
 // Phase D — the lib-first `FormatParser` trait scaffold; Phases E–F migrated
