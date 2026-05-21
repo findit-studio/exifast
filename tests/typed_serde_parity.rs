@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_141() {
+fn typed_serde_path_equals_writer_path_and_golden_all_143() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -214,12 +214,15 @@ fn typed_serde_path_equals_writer_path_and_golden_all_141() {
   // 139 → 141 after the Real (RM/RA) port (FORMATS.md row 19): added
   // the bundled `Real.rm` (chunk-walk + RJMD footer + ID3v1) and
   // `Real.ra` (RealAudio V4 codec table) fixtures.
+  // 128 → 130 after Codex R1 F2 (PR #33): added 2 adversarial Real
+  // fixtures pinning the ID3v1-trailer fidelity gap (empty Title
+  // preserved as `""`; sparse Genre byte 192 preserved verbatim).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    141,
-    "expected exactly the 141 active conformance fixtures, found {}: {:?}",
+    143,
+    "expected exactly the 143 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

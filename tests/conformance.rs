@@ -498,6 +498,53 @@ fn real_ra_conformance() {
 }
 
 #[test]
+fn real_synth_id3v1_empty_title_conformance() {
+  // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
+  // Title slot is ALL NULL (faithful bundled `"ID3v1:Title": ""`). The
+  // previous PrintConv-staged lift dropped the empty Title via
+  // `nonempty()` (process.rs `stuff_id3v1_field`) and Real's
+  // `emit_id3v1` skipped the tag entirely — silent metadata loss. The
+  // direct-block parser
+  // [`crate::formats::id3::v1::parse_id3v1_typed`] preserves
+  // `Some("")` so the empty Title round-trips through `-j` and `-n`.
+  check(
+    "real_synth_id3v1_empty_title.rm",
+    "real_synth_id3v1_empty_title.rm.json",
+    true,
+  );
+  check(
+    "real_synth_id3v1_empty_title.rm",
+    "real_synth_id3v1_empty_title.rm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_id3v1_sparse_genre_conformance() {
+  // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
+  // Genre byte is 192 (SPARSE — outside the GENRE_ENTRIES named-genre
+  // table, between 191 `Psybient` and 255 `None`). Bundled emits
+  // `"ID3v1:Genre": "Unknown (192)"` in `-j` mode and the raw int
+  // `"ID3v1:Genre": 192` in `-n` mode. The previous PrintConv-staged
+  // lift rendered `"Unknown (192)"` via the `%genre` hash fallback,
+  // then the back-resolver (`id3v1_genre_byte_for_name`) failed to map
+  // that string back to byte 192 — `v1.genre = None`, `v1.genre_name = None`,
+  // and Real's `emit_id3v1` SKIPPED the Genre tag entirely. The
+  // direct-block parser preserves the raw byte so both `-j` (rendered)
+  // and `-n` (bare int) emit faithfully.
+  check(
+    "real_synth_id3v1_sparse_genre.rm",
+    "real_synth_id3v1_sparse_genre.rm.json",
+    true,
+  );
+  check(
+    "real_synth_id3v1_sparse_genre.rm",
+    "real_synth_id3v1_sparse_genre.rm.n.json",
+    false,
+  );
+}
+
+#[test]
 fn dv_unknown_profile_conformance() {
   // Adversarial: 480-byte synthetic with the primary `\x1f\x07\0\x3f`
   // magic and `stype=0x1f` at offset 451 — never present in
