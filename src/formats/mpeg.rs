@@ -161,7 +161,11 @@ pub enum MpegAudioVersion {
 impl MpegAudioVersion {
   /// Decode the raw 2-bit field. Returns `None` for raw=1 (reserved); the
   /// header-validation gate ensures this is unreachable from `scan_for_header`.
+  /// Lossless over the valid domain: `from_raw(v.raw()) == Some(v)` for every
+  /// constructible `v` (the reserved raw=1 has no variant by design — it is
+  /// rejected by `check_header` and can never reach a parsed Meta).
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(raw: u8) -> Option<Self> {
     match raw {
       0 => Some(Self::V2_5),
@@ -172,12 +176,49 @@ impl MpegAudioVersion {
   }
   /// Raw 2-bit encoding (the on-disk value).
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::V2_5 => 0,
       Self::V2 => 2,
       Self::V1 => 3,
     }
+  }
+  /// The PrintConv display string (MPEG.pm:25-33): `"2.5"`, `"2"`, `"1"`.
+  /// Single source of truth for [`core::fmt::Display`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::V2_5 => "2.5",
+      Self::V2 => "2",
+      Self::V1 => "1",
+    }
+  }
+  /// `true` for MPEG version 2.5 (raw=0).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v2_5(self) -> bool {
+    matches!(self, Self::V2_5)
+  }
+  /// `true` for MPEG version 2 (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v2(self) -> bool {
+    matches!(self, Self::V2)
+  }
+  /// `true` for MPEG version 1 (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v1(self) -> bool {
+    matches!(self, Self::V1)
+  }
+}
+
+impl core::fmt::Display for MpegAudioVersion {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -196,7 +237,10 @@ pub enum AudioLayer {
 
 impl AudioLayer {
   /// Decode the raw 2-bit field. Returns `None` for raw=0 (reserved).
+  /// Lossless over the valid domain: `from_raw(l.raw()) == Some(l)` for every
+  /// constructible `l` (reserved raw=0 has no variant — rejected upstream).
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(raw: u8) -> Option<Self> {
     match raw {
       1 => Some(Self::L3),
@@ -207,6 +251,7 @@ impl AudioLayer {
   }
   /// Raw 2-bit encoding.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::L3 => 1,
@@ -214,14 +259,53 @@ impl AudioLayer {
       Self::L1 => 3,
     }
   }
-  /// Display layer number (1..3) for PrintConv emission.
+  /// Display layer number (1..3) for the numeric PrintConv emission
+  /// (MPEG.pm:34-42 maps the raw 2-bit field to the bare layer integer).
   #[must_use]
+  #[inline(always)]
   pub const fn display(self) -> u8 {
     match self {
       Self::L3 => 3,
       Self::L2 => 2,
       Self::L1 => 1,
     }
+  }
+  /// Human-readable layer name (`"Layer III"` / `"Layer II"` / `"Layer I"`).
+  /// Single source of truth for [`core::fmt::Display`]; distinct from the
+  /// numeric [`AudioLayer::display`] used in the byte-exact tag emission.
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::L3 => "Layer III",
+      Self::L2 => "Layer II",
+      Self::L1 => "Layer I",
+    }
+  }
+  /// `true` for Layer III (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_l3(self) -> bool {
+    matches!(self, Self::L3)
+  }
+  /// `true` for Layer II (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_l2(self) -> bool {
+    matches!(self, Self::L2)
+  }
+  /// `true` for Layer I (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_l1(self) -> bool {
+    matches!(self, Self::L1)
+  }
+}
+
+impl core::fmt::Display for AudioLayer {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -236,6 +320,43 @@ pub enum AudioBitrate {
   Free,
   /// Post-ValueConv bitrate in bps from the per-(version, layer) hash.
   Known(u32),
+}
+
+impl AudioBitrate {
+  /// `true` for the `Free` (raw=0) sentinel.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_free(self) -> bool {
+    matches!(self, Self::Free)
+  }
+  /// `true` for a `Known(bps)` bitrate.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_known(self) -> bool {
+    matches!(self, Self::Known(_))
+  }
+  /// The `Known` bitrate in bps, or `None` for `Free`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_known(self) -> Option<u32> {
+    match self {
+      Self::Known(bps) => Some(bps),
+      Self::Free => None,
+    }
+  }
+  /// The `Known` bitrate in bps.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `self` is [`AudioBitrate::Free`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn unwrap_known(self) -> u32 {
+    match self {
+      Self::Known(bps) => bps,
+      Self::Free => panic!("called `AudioBitrate::unwrap_known()` on a `Free` value"),
+    }
+  }
 }
 
 /// Channel mode (Bit24-25). Raw 2-bit field; PrintConv (MPEG.pm:200-209)
@@ -254,8 +375,10 @@ pub enum ChannelMode {
 
 impl ChannelMode {
   /// Decode the raw 2-bit field. The bit-stream walker always produces
-  /// a valid 0..3 value (the field is unconditional).
+  /// a valid 0..3 value (the field is unconditional). Total and lossless:
+  /// `from_raw(c.raw()) == c` for every variant.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(raw: u8) -> Self {
     match raw & 0x03 {
       0 => Self::Stereo,
@@ -266,6 +389,7 @@ impl ChannelMode {
   }
   /// Raw 2-bit encoding.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::Stereo => 0,
@@ -274,8 +398,10 @@ impl ChannelMode {
       Self::SingleChannel => 3,
     }
   }
-  /// PrintConv string (MPEG.pm:200-209).
+  /// PrintConv string (MPEG.pm:200-209). Single source of truth for
+  /// [`core::fmt::Display`].
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> &'static str {
     match self {
       Self::Stereo => "Stereo",
@@ -283,6 +409,37 @@ impl ChannelMode {
       Self::DualChannel => "Dual Channel",
       Self::SingleChannel => "Single Channel",
     }
+  }
+  /// `true` for `Stereo` (raw=0).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_stereo(self) -> bool {
+    matches!(self, Self::Stereo)
+  }
+  /// `true` for `JointStereo` (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_joint_stereo(self) -> bool {
+    matches!(self, Self::JointStereo)
+  }
+  /// `true` for `DualChannel` (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_dual_channel(self) -> bool {
+    matches!(self, Self::DualChannel)
+  }
+  /// `true` for `SingleChannel` (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_single_channel(self) -> bool {
+    matches!(self, Self::SingleChannel)
+  }
+}
+
+impl core::fmt::Display for ChannelMode {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.print_conv())
   }
 }
 
@@ -302,8 +459,10 @@ pub enum ModeExtension {
 }
 
 impl ModeExtension {
-  /// Decode the raw 2-bit field.
+  /// Decode the raw 2-bit field. Total and lossless:
+  /// `from_raw(m.raw()) == m` for every variant.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(raw: u8) -> Self {
     match raw & 0x03 {
       0 => Self::Bands4to31,
@@ -314,6 +473,7 @@ impl ModeExtension {
   }
   /// Raw 2-bit encoding.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::Bands4to31 => 0,
@@ -322,8 +482,10 @@ impl ModeExtension {
       Self::Bands16to31 => 3,
     }
   }
-  /// PrintConv string (MPEG.pm:222-232).
+  /// PrintConv string (MPEG.pm:222-232). Single source of truth for
+  /// [`core::fmt::Display`].
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> &'static str {
     match self {
       Self::Bands4to31 => "Bands 4-31",
@@ -331,6 +493,37 @@ impl ModeExtension {
       Self::Bands12to31 => "Bands 12-31",
       Self::Bands16to31 => "Bands 16-31",
     }
+  }
+  /// `true` for "Bands 4-31" (raw=0).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bands4to31(self) -> bool {
+    matches!(self, Self::Bands4to31)
+  }
+  /// `true` for "Bands 8-31" (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bands8to31(self) -> bool {
+    matches!(self, Self::Bands8to31)
+  }
+  /// `true` for "Bands 12-31" (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bands12to31(self) -> bool {
+    matches!(self, Self::Bands12to31)
+  }
+  /// `true` for "Bands 16-31" (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bands16to31(self) -> bool {
+    matches!(self, Self::Bands16to31)
+  }
+}
+
+impl core::fmt::Display for ModeExtension {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.print_conv())
   }
 }
 
@@ -351,8 +544,10 @@ pub enum Emphasis {
 }
 
 impl Emphasis {
-  /// Decode the raw 2-bit field.
+  /// Decode the raw 2-bit field. Total and lossless:
+  /// `from_raw(e.raw()) == e` for every variant.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(raw: u8) -> Self {
     match raw & 0x03 {
       0 => Self::None,
@@ -363,6 +558,7 @@ impl Emphasis {
   }
   /// Raw 2-bit encoding.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::None => 0,
@@ -371,8 +567,10 @@ impl Emphasis {
       Self::CcitJ17 => 3,
     }
   }
-  /// PrintConv string (MPEG.pm:247-255).
+  /// PrintConv string (MPEG.pm:247-255). Single source of truth for
+  /// [`core::fmt::Display`].
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> &'static str {
     match self {
       Self::None => "None",
@@ -381,11 +579,47 @@ impl Emphasis {
       Self::CcitJ17 => "CCIT J.17",
     }
   }
+  /// `true` for `None` emphasis (raw=0).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_none(self) -> bool {
+    matches!(self, Self::None)
+  }
+  /// `true` for "50/15 ms" (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_fifty_fifteen(self) -> bool {
+    matches!(self, Self::FiftyFifteen)
+  }
+  /// `true` for the reserved emphasis (raw=2; rejected upstream).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_reserved(self) -> bool {
+    matches!(self, Self::Reserved)
+  }
+  /// `true` for "CCIT J.17" (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_ccit_j17(self) -> bool {
+    matches!(self, Self::CcitJ17)
+  }
+}
+
+impl core::fmt::Display for Emphasis {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.print_conv())
+  }
 }
 
 /// LameMethod (MPEG.pm:344-357). Raw byte AND-masked with 0x0f; PrintConv
 /// hash maps 1..9. Note codes 5 and 3 both render `"VBR (old/rh)"`; we
 /// preserve the raw byte so `-n` mode emits the exact on-disk value.
+///
+/// Coded vocabulary with a lossless [`LameMethod::Unknown`] escape: the
+/// named set is `#[non_exhaustive]` (a future LAME code may gain a named
+/// variant), while any out-of-table raw byte round-trips through `Unknown`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LameMethod {
   /// raw=1 → "CBR".
@@ -410,8 +644,10 @@ pub enum LameMethod {
 }
 
 impl LameMethod {
-  /// Decode the raw post-mask 0x0f value.
+  /// Decode the raw post-mask 0x0f value. Lossless round-trip:
+  /// `from_raw(m.raw()) == m` for every value, including `Unknown(_)`.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(masked: u8) -> Self {
     match masked & 0x0f {
       1 => Self::Cbr,
@@ -427,6 +663,7 @@ impl LameMethod {
   }
   /// Raw post-mask value.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::Cbr => 1,
@@ -443,6 +680,7 @@ impl LameMethod {
   /// PrintConv name; `None` for an unknown raw (the value passes through
   /// as the raw integer in the bundled emit path).
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> Option<&'static str> {
     match self {
       Self::Cbr => Some("CBR"),
@@ -455,12 +693,107 @@ impl LameMethod {
       Self::Unknown(_) => None,
     }
   }
+  /// `true` for CBR (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cbr(self) -> bool {
+    matches!(self, Self::Cbr)
+  }
+  /// `true` for ABR (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_abr(self) -> bool {
+    matches!(self, Self::Abr)
+  }
+  /// `true` for "VBR (old/rh)" (raw=3 — the canonical encoding).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_vbr_old_rh(self) -> bool {
+    matches!(self, Self::VbrOldRh)
+  }
+  /// `true` for "VBR (new/mtrh)" (raw=4).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_vbr_new_mtrh(self) -> bool {
+    matches!(self, Self::VbrNewMtrh)
+  }
+  /// `true` for the raw=5 alias of "VBR (old/rh)".
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_vbr_old_rh_v5(self) -> bool {
+    matches!(self, Self::VbrOldRhV5)
+  }
+  /// `true` for "VBR" (raw=6).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_vbr(self) -> bool {
+    matches!(self, Self::Vbr)
+  }
+  /// `true` for "CBR (2-pass)" (raw=8).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cbr2_pass(self) -> bool {
+    matches!(self, Self::Cbr2Pass)
+  }
+  /// `true` for "ABR (2-pass)" (raw=9).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_abr2_pass(self) -> bool {
+    matches!(self, Self::Abr2Pass)
+  }
+  /// `true` for an out-of-table raw byte carried by [`LameMethod::Unknown`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_unknown(self) -> bool {
+    matches!(self, Self::Unknown(_))
+  }
+  /// The raw byte carried by [`LameMethod::Unknown`], or `None` for a named
+  /// variant.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_unknown(self) -> Option<u8> {
+    match self {
+      Self::Unknown(b) => Some(b),
+      _ => None,
+    }
+  }
+  /// The raw byte carried by [`LameMethod::Unknown`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `self` is a named variant.
+  #[must_use]
+  #[inline(always)]
+  pub const fn unwrap_unknown(self) -> u8 {
+    match self {
+      Self::Unknown(b) => b,
+      _ => panic!("called `LameMethod::unwrap_unknown()` on a named variant"),
+    }
+  }
+}
+
+impl core::fmt::Display for LameMethod {
+  /// Routes through [`LameMethod::print_conv`] (the single name source); an
+  /// `Unknown` raw byte renders as its decimal integer, mirroring the
+  /// bundled PrintConv hash-miss passthrough.
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self.print_conv() {
+      Some(name) => f.write_str(name),
+      None => write!(f, "{}", self.raw()),
+    }
+  }
 }
 
 /// LameStereoMode (MPEG.pm:369-381). Raw byte masked 0x1c then right-
 /// shifted by 2 (BitShift derived from `Mask`'s lowest set bit per
 /// ExifTool.pm:5907-5909). PrintConv hash maps 0..7; raw=5 is absent
 /// from the hash and emits as the raw integer.
+///
+/// Coded vocabulary with a lossless [`LameStereoMode::Unknown`] escape: the
+/// named set is `#[non_exhaustive]`, while any out-of-table value (raw=5 or
+/// >=8) round-trips through `Unknown`.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LameStereoMode {
   /// raw=0 → "Mono".
@@ -483,8 +816,10 @@ pub enum LameStereoMode {
 }
 
 impl LameStereoMode {
-  /// Decode the post-mask+shift (`(b & 0x1c) >> 2`) value.
+  /// Decode the post-mask+shift (`(b & 0x1c) >> 2`) value. Lossless
+  /// round-trip: `from_raw(s.raw()) == s` for every value, incl. `Unknown`.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(shifted: u8) -> Self {
     match shifted {
       0 => Self::Mono,
@@ -499,6 +834,7 @@ impl LameStereoMode {
   }
   /// Raw post-mask+shift value.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Self::Mono => 0,
@@ -513,6 +849,7 @@ impl LameStereoMode {
   }
   /// PrintConv name; `None` for an unknown raw.
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(self) -> Option<&'static str> {
     match self {
       Self::Mono => Some("Mono"),
@@ -523,6 +860,89 @@ impl LameStereoMode {
       Self::Auto => Some("Auto"),
       Self::IntensityStereo => Some("Intensity Stereo"),
       Self::Unknown(_) => None,
+    }
+  }
+  /// `true` for Mono (raw=0).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_mono(self) -> bool {
+    matches!(self, Self::Mono)
+  }
+  /// `true` for Stereo (raw=1).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_stereo(self) -> bool {
+    matches!(self, Self::Stereo)
+  }
+  /// `true` for Dual Channels (raw=2).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_dual_channels(self) -> bool {
+    matches!(self, Self::DualChannels)
+  }
+  /// `true` for Joint Stereo (raw=3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_joint_stereo(self) -> bool {
+    matches!(self, Self::JointStereo)
+  }
+  /// `true` for Forced Joint Stereo (raw=4).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_forced_joint_stereo(self) -> bool {
+    matches!(self, Self::ForcedJointStereo)
+  }
+  /// `true` for Auto (raw=6).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_auto(self) -> bool {
+    matches!(self, Self::Auto)
+  }
+  /// `true` for Intensity Stereo (raw=7).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_intensity_stereo(self) -> bool {
+    matches!(self, Self::IntensityStereo)
+  }
+  /// `true` for an out-of-table value carried by [`LameStereoMode::Unknown`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_unknown(self) -> bool {
+    matches!(self, Self::Unknown(_))
+  }
+  /// The raw value carried by [`LameStereoMode::Unknown`], or `None` for a
+  /// named variant.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_unknown(self) -> Option<u8> {
+    match self {
+      Self::Unknown(b) => Some(b),
+      _ => None,
+    }
+  }
+  /// The raw value carried by [`LameStereoMode::Unknown`].
+  ///
+  /// # Panics
+  ///
+  /// Panics if `self` is a named variant.
+  #[must_use]
+  #[inline(always)]
+  pub const fn unwrap_unknown(self) -> u8 {
+    match self {
+      Self::Unknown(b) => b,
+      _ => panic!("called `LameStereoMode::unwrap_unknown()` on a named variant"),
+    }
+  }
+}
+
+impl core::fmt::Display for LameStereoMode {
+  /// Routes through [`LameStereoMode::print_conv`]; an `Unknown` raw value
+  /// renders as its decimal integer (bundled PrintConv hash-miss passthrough).
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self.print_conv() {
+      Some(name) => f.write_str(name),
+      None => write!(f, "{}", self.raw()),
     }
   }
 }
@@ -616,64 +1036,76 @@ impl MpegAudioMeta<'_> {
 
   /// MPEGAudioVersion (Bit11-12).
   #[must_use]
-  pub fn mpeg_audio_version(&self) -> MpegAudioVersion {
+  #[inline(always)]
+  pub const fn mpeg_audio_version(&self) -> MpegAudioVersion {
     self.mpeg_audio_version
   }
   /// AudioLayer (Bit13-14).
   #[must_use]
-  pub fn audio_layer(&self) -> AudioLayer {
+  #[inline(always)]
+  pub const fn audio_layer(&self) -> AudioLayer {
     self.audio_layer
   }
   /// AudioBitrate (Bit16-19) — post-ValueConv `Free`/`Known(bps)`.
   #[must_use]
-  pub fn audio_bitrate(&self) -> AudioBitrate {
+  #[inline(always)]
+  pub const fn audio_bitrate(&self) -> AudioBitrate {
     self.audio_bitrate
   }
   /// Raw SampleRate index (Bit20-21).
   #[must_use]
-  pub fn sample_rate_raw(&self) -> u8 {
+  #[inline(always)]
+  pub const fn sample_rate_raw(&self) -> u8 {
     self.sample_rate_raw
   }
   /// SampleRate in Hz from the per-version PrintConv hash; `None` if the
   /// raw value falls outside the table (defensive — the validation gate
   /// rejects raw=3).
   #[must_use]
-  pub fn sample_rate_hz(&self) -> Option<u32> {
+  #[inline]
+  pub const fn sample_rate_hz(&self) -> Option<u32> {
     sample_rate_lookup(self.mpeg_audio_version, self.sample_rate_raw)
   }
   /// ChannelMode (Bit24-25).
   #[must_use]
-  pub fn channel_mode(&self) -> ChannelMode {
+  #[inline(always)]
+  pub const fn channel_mode(&self) -> ChannelMode {
     self.channel_mode
   }
   /// MSStereo (Bit26) — emitted only for Layer III.
   #[must_use]
-  pub fn ms_stereo(&self) -> Option<bool> {
+  #[inline(always)]
+  pub const fn ms_stereo(&self) -> Option<bool> {
     self.ms_stereo
   }
   /// ModeExtension (Bit26-27) — emitted only for Layer I/II.
   #[must_use]
-  pub fn mode_extension(&self) -> Option<ModeExtension> {
+  #[inline(always)]
+  pub const fn mode_extension(&self) -> Option<ModeExtension> {
     self.mode_extension
   }
   /// IntensityStereo (Bit27) — emitted only for Layer III.
   #[must_use]
-  pub fn intensity_stereo(&self) -> Option<bool> {
+  #[inline(always)]
+  pub const fn intensity_stereo(&self) -> Option<bool> {
     self.intensity_stereo
   }
   /// CopyrightFlag (Bit28).
   #[must_use]
-  pub fn copyright_flag(&self) -> bool {
+  #[inline(always)]
+  pub const fn copyright_flag(&self) -> bool {
     self.copyright_flag
   }
   /// OriginalMedia (Bit29).
   #[must_use]
-  pub fn original_media(&self) -> bool {
+  #[inline(always)]
+  pub const fn original_media(&self) -> bool {
     self.original_media
   }
   /// Emphasis (Bit30-31).
   #[must_use]
-  pub fn emphasis(&self) -> Emphasis {
+  #[inline(always)]
+  pub const fn emphasis(&self) -> Emphasis {
     self.emphasis
   }
 
@@ -681,33 +1113,40 @@ impl MpegAudioMeta<'_> {
 
   /// VBRFrames (Xing key 1).
   #[must_use]
-  pub fn vbr_frames(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn vbr_frames(&self) -> Option<u32> {
     self.vbr_frames
   }
   /// VBRBytes (Xing key 2).
   #[must_use]
-  pub fn vbr_bytes(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn vbr_bytes(&self) -> Option<u32> {
     self.vbr_bytes
   }
   /// VBRScale (Xing key 3).
   #[must_use]
-  pub fn vbr_scale(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn vbr_scale(&self) -> Option<u32> {
     self.vbr_scale
   }
   /// Encoder (Xing key 4) — `Cow<'a, str>` borrowed from input for LAME
-  /// version strings; owned for synthesized fallback names.
+  /// version strings; owned for synthesized fallback names. Projects the
+  /// `Option<Cow>` wrapper to `Option<&str>` (never exposes the `Cow`).
   #[must_use]
+  #[inline(always)]
   pub fn encoder(&self) -> Option<&str> {
     self.encoder.as_deref()
   }
   /// LameVBRQuality (Xing key 5).
   #[must_use]
-  pub fn lame_vbr_quality(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn lame_vbr_quality(&self) -> Option<u8> {
     self.lame_vbr_quality
   }
   /// LameQuality (Xing key 6).
   #[must_use]
-  pub fn lame_quality(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn lame_quality(&self) -> Option<u8> {
     self.lame_quality
   }
 
@@ -715,22 +1154,26 @@ impl MpegAudioMeta<'_> {
 
   /// LameMethod (offset 9, mask 0x0f).
   #[must_use]
-  pub fn lame_method(&self) -> Option<LameMethod> {
+  #[inline(always)]
+  pub const fn lame_method(&self) -> Option<LameMethod> {
     self.lame_method
   }
   /// LameLowPassFilter (offset 10, ValueConv `* 100`).
   #[must_use]
-  pub fn lame_low_pass_filter(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn lame_low_pass_filter(&self) -> Option<u32> {
     self.lame_low_pass_filter
   }
   /// LameBitrate (offset 20, ValueConv `* 1000`).
   #[must_use]
-  pub fn lame_bitrate(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn lame_bitrate(&self) -> Option<u32> {
     self.lame_bitrate
   }
   /// LameStereoMode (offset 24, mask 0x1c shifted right 2).
   #[must_use]
-  pub fn lame_stereo_mode(&self) -> Option<LameStereoMode> {
+  #[inline(always)]
+  pub const fn lame_stereo_mode(&self) -> Option<LameStereoMode> {
     self.lame_stereo_mode
   }
 }
@@ -1224,7 +1667,9 @@ impl<'a> MpegAudioContext<'a> {
   /// The `data` slice MUST be pre-bounded by the caller to the
   /// ID3.pm:1704 `$scanLen` window (8192 for `.mp3`, 256 otherwise) —
   /// `ProcessMp3::process_with_start_offset` applies that bound.
-  pub fn new(data: &'a [u8], ext: &'a str, mp3: bool, shared: &'a mut SharedFlags) -> Self {
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], ext: &'a str, mp3: bool, shared: &'a mut SharedFlags) -> Self {
     Self {
       data,
       mp3,
@@ -1235,17 +1680,20 @@ impl<'a> MpegAudioContext<'a> {
 
   /// Borrow the input bytes.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
   /// Borrow the file extension string.
   #[must_use]
-  pub fn ext(&self) -> &'a str {
+  #[inline(always)]
+  pub const fn ext(&self) -> &'a str {
     self.ext
   }
   /// The MPEG.pm:466 `$mp3` flag.
   #[must_use]
-  pub fn mp3(&self) -> bool {
+  #[inline(always)]
+  pub const fn mp3(&self) -> bool {
     self.mp3
   }
 }
@@ -1558,17 +2006,14 @@ impl MpegAudioMeta<'_> {
 /// Rust-level fatal modes for MPEG audio parsing. Currently empty — every
 /// bad input produces `Ok(None)` (Perl `return 0`). Reserved for future
 /// I/O wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror` (v2,
+/// `default-features = false`), so the trait is implemented in every feature
+/// tier. `#[non_exhaustive]` lets variants land later without a breaking
+/// change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MpegAudioError {}
-
-impl core::fmt::Display for MpegAudioError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for MpegAudioError {}
 
 // ===========================================================================
 // `ProcessMp3` — raw MPEG-audio entry preserving R5 fix API
@@ -1585,6 +2030,7 @@ pub struct ProcessMp3;
 /// ID3.pm:1704 — `$scanLen` selection. Constant-fold-friendly helper so
 /// the bound is documented at the call site AND in unit tests.
 #[must_use]
+#[inline(always)]
 pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
   if ext_is_mp3 { 8192 } else { 256 }
 }
@@ -2126,5 +2572,95 @@ mod tests {
     let mut w = TagMap::new();
     m.serialize_tags(true, &mut w).unwrap();
     assert_eq!(w.get_str("MPEG", "MSStereo"), Some("On".into()));
+  }
+
+  // ───────────────────── §2 enum-convention surface ─────────────────────
+
+  #[test]
+  fn enum_lossless_roundtrip_over_valid_domain() {
+    // Version / Layer: Option-returning (reserved raw rejected) — round-trip
+    // holds for every constructible variant.
+    for v in [
+      MpegAudioVersion::V2_5,
+      MpegAudioVersion::V2,
+      MpegAudioVersion::V1,
+    ] {
+      assert_eq!(MpegAudioVersion::from_raw(v.raw()), Some(v));
+    }
+    for l in [AudioLayer::L3, AudioLayer::L2, AudioLayer::L1] {
+      assert_eq!(AudioLayer::from_raw(l.raw()), Some(l));
+    }
+    // Total 2-bit fields: round-trip over all 4 raw values.
+    for raw in 0u8..4 {
+      assert_eq!(
+        ChannelMode::from_raw(ChannelMode::from_raw(raw).raw()),
+        ChannelMode::from_raw(raw)
+      );
+      assert_eq!(ModeExtension::from_raw(raw).raw(), raw);
+      assert_eq!(Emphasis::from_raw(raw).raw(), raw);
+    }
+  }
+
+  #[test]
+  fn lame_coded_enums_unknown_roundtrips_every_byte() {
+    // LameMethod masks 0x0f — round-trip for all 16 nibble values, incl. the
+    // out-of-table codes carried by Unknown(_).
+    for raw in 0u8..16 {
+      let m = LameMethod::from_raw(raw);
+      assert_eq!(m.raw(), raw, "LameMethod round-trip for {raw}");
+      // is_unknown ⇔ table miss.
+      assert_eq!(m.is_unknown(), m.print_conv().is_none());
+    }
+    assert_eq!(LameMethod::from_raw(0).unwrap_unknown(), 0);
+    assert_eq!(LameMethod::from_raw(7).try_unwrap_unknown(), Some(7));
+    assert_eq!(LameMethod::Cbr.try_unwrap_unknown(), None);
+    // LameStereoMode — raw=5 and >=8 fall to Unknown.
+    for raw in 0u8..32 {
+      let s = LameStereoMode::from_raw(raw);
+      assert_eq!(s.raw(), raw, "LameStereoMode round-trip for {raw}");
+      assert_eq!(s.is_unknown(), s.print_conv().is_none());
+    }
+    assert!(LameStereoMode::from_raw(5).is_unknown());
+    assert_eq!(LameStereoMode::from_raw(5).unwrap_unknown(), 5);
+  }
+
+  #[test]
+  fn enum_display_routes_through_single_source() {
+    // Version uses as_str; Layer Display is the descriptive name (distinct
+    // from the numeric `display()` used in the byte-exact emission).
+    assert_eq!(MpegAudioVersion::V2_5.to_string(), "2.5");
+    assert_eq!(AudioLayer::L3.to_string(), "Layer III");
+    assert_eq!(AudioLayer::L3.display(), 3); // numeric form unchanged
+    // print_conv-backed enums route Display through print_conv().
+    assert_eq!(ChannelMode::JointStereo.to_string(), "Joint Stereo");
+    assert_eq!(ModeExtension::Bands8to31.to_string(), "Bands 8-31");
+    assert_eq!(Emphasis::CcitJ17.to_string(), "CCIT J.17");
+    // Coded LAME enums: named variant -> name; Unknown -> raw integer.
+    assert_eq!(LameMethod::Cbr.to_string(), "CBR");
+    assert_eq!(LameMethod::from_raw(7).to_string(), "7");
+    assert_eq!(LameStereoMode::Auto.to_string(), "Auto");
+    assert_eq!(LameStereoMode::from_raw(5).to_string(), "5");
+  }
+
+  #[test]
+  fn audio_bitrate_predicates_and_unwrap() {
+    let free = AudioBitrate::Free;
+    let known = AudioBitrate::Known(128_000);
+    assert!(free.is_free() && !free.is_known());
+    assert!(known.is_known() && !known.is_free());
+    assert_eq!(known.try_unwrap_known(), Some(128_000));
+    assert_eq!(free.try_unwrap_known(), None);
+    assert_eq!(known.unwrap_known(), 128_000);
+  }
+
+  #[test]
+  fn version_layer_channel_predicates() {
+    assert!(MpegAudioVersion::V2_5.is_v2_5());
+    assert!(MpegAudioVersion::V2.is_v2());
+    assert!(MpegAudioVersion::V1.is_v1());
+    assert!(AudioLayer::L1.is_l1() && AudioLayer::L2.is_l2() && AudioLayer::L3.is_l3());
+    assert!(ChannelMode::Stereo.is_stereo());
+    assert!(ChannelMode::SingleChannel.is_single_channel());
+    assert!(Emphasis::None.is_none() && Emphasis::Reserved.is_reserved());
   }
 }

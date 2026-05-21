@@ -123,12 +123,47 @@ pub enum Id3v2Version {
 impl Id3v2Version {
   /// Family-1 group string for the version (e.g. `"ID3v2_3"`).
   #[must_use]
+  #[inline(always)]
   pub const fn group1(self) -> &'static str {
     match self {
       Id3v2Version::V2_2 => "ID3v2_2",
       Id3v2Version::V2_3 => "ID3v2_3",
       Id3v2Version::V2_4 => "ID3v2_4",
     }
+  }
+
+  /// Dotted major.minor version string (`"2.2"` / `"2.3"` / `"2.4"`).
+  /// Single source of truth for [`core::fmt::Display`]; distinct from the
+  /// underscore-separated [`Id3v2Version::group1`] used for tag groups.
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Id3v2Version::V2_2 => "2.2",
+      Id3v2Version::V2_3 => "2.3",
+      Id3v2Version::V2_4 => "2.4",
+    }
+  }
+
+  /// `true` for ID3v2.2 (3-character frame IDs).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v2_2(self) -> bool {
+    matches!(self, Id3v2Version::V2_2)
+  }
+
+  /// `true` for ID3v2.3.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v2_3(self) -> bool {
+    matches!(self, Id3v2Version::V2_3)
+  }
+
+  /// `true` for ID3v2.4 (sync-safe frame lengths).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_v2_4(self) -> bool {
+    matches!(self, Id3v2Version::V2_4)
   }
 
   /// Decode from the bundled `unpack('n', ...)` 16-bit word. The high
@@ -139,7 +174,8 @@ impl Id3v2Version {
   /// paths (Phase G).
   #[must_use]
   #[allow(dead_code)]
-  fn from_packed(vers: u16) -> Option<Self> {
+  #[inline]
+  const fn from_packed(vers: u16) -> Option<Self> {
     if vers >= 0x0400 {
       Some(Id3v2Version::V2_4)
     } else if vers >= 0x0300 {
@@ -149,6 +185,13 @@ impl Id3v2Version {
     } else {
       None
     }
+  }
+}
+
+impl core::fmt::Display for Id3v2Version {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
   }
 }
 
@@ -192,19 +235,24 @@ pub struct Id3v2Frame {
 impl Id3v2Frame {
   /// Family-1 group (`"ID3v2_2"` / `"ID3v2_3"` / `"ID3v2_4"`).
   #[must_use]
+  #[inline(always)]
   pub fn group1(&self) -> &str {
     self.group1.as_str()
   }
 
   /// Frame tag name (e.g. `"Title"`, `"Artist"`, `"Picture"`).
   #[must_use]
+  #[inline(always)]
   pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
   /// Post-conversion value (`TagValue::Str` / `I64` / `Bytes` / etc.).
+  /// `_ref`-named per the crate accessor convention for a `&T` borrow of a
+  /// non-`Copy` field (mirrors [`crate::value::Tag::value_ref`]).
   #[must_use]
-  pub fn value(&self) -> &TagValue {
+  #[inline(always)]
+  pub const fn value_ref(&self) -> &TagValue {
     &self.value
   }
 }
@@ -234,13 +282,15 @@ pub struct Id3Picture {
 impl Id3Picture {
   /// MIME type string.
   #[must_use]
+  #[inline(always)]
   pub fn mime(&self) -> &str {
     self.mime.as_str()
   }
 
   /// Picture-type byte (`%pictureType`, ID3.pm:42-64).
   #[must_use]
-  pub fn picture_type(&self) -> u8 {
+  #[inline(always)]
+  pub const fn picture_type(&self) -> u8 {
     self.picture_type
   }
 
@@ -267,12 +317,15 @@ impl Id3Picture {
 
   /// Picture description text.
   #[must_use]
+  #[inline(always)]
   pub fn description(&self) -> &str {
     self.description.as_str()
   }
 
-  /// Raw image bytes.
+  /// Raw image bytes. Projects the owned `Vec<u8>` to the `&[u8]` view
+  /// (never exposes `&Vec<u8>`).
   #[must_use]
+  #[inline(always)]
   pub fn data(&self) -> &[u8] {
     &self.data
   }
@@ -308,50 +361,58 @@ pub struct Id3v1Meta<'a> {
 impl Id3v1Meta<'_> {
   /// Song title (UTF-8). `None` if absent.
   #[must_use]
+  #[inline(always)]
   pub fn title(&self) -> Option<&str> {
     self.title.as_deref()
   }
 
   /// Artist name. `None` if absent.
   #[must_use]
+  #[inline(always)]
   pub fn artist(&self) -> Option<&str> {
     self.artist.as_deref()
   }
 
   /// Album name. `None` if absent.
   #[must_use]
+  #[inline(always)]
   pub fn album(&self) -> Option<&str> {
     self.album.as_deref()
   }
 
   /// Year (4-character ASCII string). `None` if absent.
   #[must_use]
+  #[inline(always)]
   pub fn year(&self) -> Option<&str> {
     self.year.as_deref()
   }
 
   /// Comment. `None` if absent.
   #[must_use]
+  #[inline(always)]
   pub fn comment(&self) -> Option<&str> {
     self.comment.as_deref()
   }
 
   /// Track number (ID3v1.1 only). `None` for ID3v1.0 layout.
   #[must_use]
-  pub fn track(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn track(&self) -> Option<u8> {
     self.track
   }
 
   /// Genre byte (`%genre` lookup, ID3.pm:131-332).
   #[must_use]
-  pub fn genre(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn genre(&self) -> Option<u8> {
     self.genre
   }
 
   /// PrintConv-resolved genre name (e.g. `"Hip-Hop"`). `None` if the
   /// genre byte is sparse (192..=254 except 255) or absent.
   #[must_use]
-  pub fn genre_name(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn genre_name(&self) -> Option<&'static str> {
     self.genre_name
   }
 }
@@ -407,20 +468,23 @@ pub struct Id3Meta<'a> {
 impl<'a> Id3Meta<'a> {
   /// ID3v2 major version. `None` when only an ID3v1 trailer was found.
   #[must_use]
-  pub fn v2_version(&self) -> Option<Id3v2Version> {
+  #[inline(always)]
+  pub const fn v2_version(&self) -> Option<Id3v2Version> {
     self.v2_version
   }
 
   /// Optional ID3v1 subframe.
   #[must_use]
-  pub fn id3v1(&self) -> Option<&Id3v1Meta<'a>> {
+  #[inline(always)]
+  pub const fn id3v1(&self) -> Option<&Id3v1Meta<'a>> {
     self.id3v1.as_ref()
   }
 
   /// `File:ID3Size` value — total bytes consumed by ID3 metadata
   /// (ID3v2 header + ID3v1 trailer + Enhanced TAG when present).
   #[must_use]
-  pub fn id3_size(&self) -> i64 {
+  #[inline(always)]
+  pub const fn id3_size(&self) -> i64 {
     self.id3_size
   }
 
@@ -575,18 +639,21 @@ impl<'a> Id3Meta<'a> {
     })
   }
 
-  /// Engine-emitted warnings (mirrors `Metadata::warnings`). Each entry
-  /// is the literal Warn text the legacy serializer would surface
-  /// under `ExifTool:Warning`.
+  /// Engine-emitted warnings (mirrors [`crate::value::Metadata::warnings_slice`]).
+  /// Each entry is the literal Warn text the legacy serializer would surface
+  /// under `ExifTool:Warning`. `_slice`-named per the crate convention for a
+  /// `Vec<T>` field projected to `&[T]`.
   #[must_use]
-  pub fn warnings(&self) -> &[SmolStr] {
-    &self.warnings
+  #[inline(always)]
+  pub const fn warnings_slice(&self) -> &[SmolStr] {
+    self.warnings.as_slice()
   }
 
-  /// Engine-emitted errors (mirrors `Metadata::errors`).
+  /// Engine-emitted errors (mirrors [`crate::value::Metadata::errors_slice`]).
   #[must_use]
-  pub fn errors(&self) -> &[SmolStr] {
-    &self.errors
+  #[inline(always)]
+  pub const fn errors_slice(&self) -> &[SmolStr] {
+    self.errors.as_slice()
   }
 
   /// Find a staged tag's string value by name. Searches in insertion
@@ -651,26 +718,30 @@ pub struct Mp3Meta<'a> {
 impl<'a> Mp3Meta<'a> {
   /// Optional ID3 sub-Meta.
   #[must_use]
-  pub fn id3(&self) -> Option<&Id3Meta<'a>> {
+  #[inline(always)]
+  pub const fn id3(&self) -> Option<&Id3Meta<'a>> {
     self.id3.as_ref()
   }
 
   /// Optional typed MPEG-audio sub-Meta (frame header + Xing/LAME tail).
   #[must_use]
-  pub fn mpeg(&self) -> Option<&crate::formats::mpeg::MpegAudioMeta<'a>> {
+  #[inline(always)]
+  pub const fn mpeg(&self) -> Option<&crate::formats::mpeg::MpegAudioMeta<'a>> {
     self.mpeg.as_ref()
   }
 
   /// Optional typed APE-trailer sub-Meta.
   #[must_use]
-  pub fn ape(&self) -> Option<&crate::formats::ape::ApeMeta<'a>> {
+  #[inline(always)]
+  pub const fn ape(&self) -> Option<&crate::formats::ape::ApeMeta<'a>> {
     self.ape.as_ref()
   }
 
   /// `true` iff ProcessID3 + ParseMPEGAudio accepted the file as MP3
   /// (Perl `$rtnVal` at the end of ProcessMP3).
   #[must_use]
-  pub fn found(&self) -> bool {
+  #[inline(always)]
+  pub const fn found(&self) -> bool {
     self.found
   }
 }
@@ -712,18 +783,21 @@ impl<'a> Id3Context<'a> {
   /// + body + trailer); the parser sniffs the ID3v2 magic at offset 0
   /// and the ID3v1 magic at offset `len - 128`.
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self { data, shared }
   }
 
   /// Input bytes.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 
   /// Shared cross-format flags (read/write).
-  pub fn shared(&mut self) -> &mut SharedFlags {
+  #[inline(always)]
+  pub const fn shared(&mut self) -> &mut SharedFlags {
     self.shared
   }
 }
@@ -779,24 +853,28 @@ pub struct Mp3Context<'a> {
 impl<'a> Mp3Context<'a> {
   /// Construct an MP3 parser context.
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags, ext: Option<&'a str>) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags, ext: Option<&'a str>) -> Self {
     Self { data, shared, ext }
   }
 
   /// Input bytes.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 
   /// File extension (uppercase, no leading dot).
   #[must_use]
-  pub fn ext(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn ext(&self) -> Option<&'a str> {
     self.ext
   }
 
   /// Shared cross-format flags.
-  pub fn shared(&mut self) -> &mut SharedFlags {
+  #[inline(always)]
+  pub const fn shared(&mut self) -> &mut SharedFlags {
     self.shared
   }
 }
@@ -953,40 +1031,29 @@ pub fn parse_mp3_borrowed<'a>(
 
 /// Rust-level fatal modes for ID3 parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`) or a non-fatal Warn that
-/// lands as an [`Id3Meta::warnings`] entry. Reserved for future I/O
+/// lands as an [`Id3Meta::warnings_slice`] entry. Reserved for future I/O
 /// wrappers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` are derived via `thiserror` (v2,
+/// `default-features = false`) so the trait is present in every feature tier.
+/// `#[non_exhaustive]` lets variants land later without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Id3Error {}
-
-impl core::fmt::Display for Id3Error {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Id3Error {}
 
 /// Rust-level fatal modes for MP3 parsing. Wraps [`Id3Error`] for the
 /// nested ID3 dispatch.
+///
+/// §5: derived via `thiserror`; `#[from]` on the wrapped [`Id3Error`] gives a
+/// free `From<Id3Error>` + `source()`. `#[non_exhaustive]` for additive growth.
 #[cfg(feature = "mp3")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Mp3Error {
   /// An ID3 parsing error bubbled up from the nested directory parser.
-  Id3(Id3Error),
+  #[error("MP3: ID3 parsing failed: {0}")]
+  Id3(#[from] Id3Error),
 }
-
-#[cfg(feature = "mp3")]
-impl core::fmt::Display for Mp3Error {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match self {
-      Mp3Error::Id3(e) => write!(f, "MP3: ID3 parsing failed: {e}"),
-    }
-  }
-}
-
-#[cfg(all(feature = "mp3", feature = "std"))]
-impl std::error::Error for Mp3Error {}
 
 // ===========================================================================
 // Inner parser — builds typed Meta from a staged Metadata
@@ -2478,5 +2545,43 @@ mod tests {
     assert_eq!(pic.picture_type_name(), Some("Front Cover"));
     assert_eq!(pic.description(), "cover");
     assert_eq!(pic.data(), &[0xde, 0xad, 0xbe, 0xef]);
+  }
+
+  // -------------------------------------------------------------------------
+  // §2 type-convention surface — Id3v2Version predicates / Display / as_str
+  // -------------------------------------------------------------------------
+
+  #[test]
+  fn id3v2_version_predicates_are_mutually_exclusive() {
+    for v in [Id3v2Version::V2_2, Id3v2Version::V2_3, Id3v2Version::V2_4] {
+      let hits = u8::from(v.is_v2_2()) + u8::from(v.is_v2_3()) + u8::from(v.is_v2_4());
+      assert_eq!(hits, 1, "exactly one predicate true for {v:?}");
+    }
+    assert!(Id3v2Version::V2_2.is_v2_2());
+    assert!(Id3v2Version::V2_3.is_v2_3());
+    assert!(Id3v2Version::V2_4.is_v2_4());
+  }
+
+  #[test]
+  fn id3v2_version_display_matches_as_str_and_distinct_from_group1() {
+    assert_eq!(Id3v2Version::V2_2.as_str(), "2.2");
+    assert_eq!(Id3v2Version::V2_3.as_str(), "2.3");
+    assert_eq!(Id3v2Version::V2_4.as_str(), "2.4");
+    // Display routes through as_str (single source of truth).
+    assert_eq!(Id3v2Version::V2_4.to_string(), "2.4");
+    // group1 stays the underscore tag-group form (unchanged).
+    assert_eq!(Id3v2Version::V2_4.group1(), "ID3v2_4");
+  }
+
+  #[test]
+  fn id3v2_frame_value_ref_accessor() {
+    let f = Id3v2Frame {
+      group1: SmolStr::new("ID3v2_3"),
+      name: SmolStr::new("Title"),
+      value: TagValue::Str(SmolStr::new("Song")),
+    };
+    assert_eq!(f.group1(), "ID3v2_3");
+    assert_eq!(f.name(), "Title");
+    assert_eq!(f.value_ref(), &TagValue::Str(SmolStr::new("Song")));
   }
 }
