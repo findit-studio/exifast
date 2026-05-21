@@ -646,7 +646,9 @@ fn parse_mdpr(body: &[u8]) -> MdprStream {
   let mut cursor = 31;
   if cursor + stream_name_len <= body.len() {
     let name_slice = &body[cursor..cursor + stream_name_len];
-    s.stream_name = Some(raw_bytes_to_json_string(strip_trailing_nuls(name_slice)));
+    // Real.pm:130 — `Format => 'string[$val{8}]'` ⇒ ReadValue's `s/\0.*//s`
+    // first-NUL truncation (ExifTool.pm:6300) applies; see [`null_truncate`].
+    s.stream_name = Some(raw_bytes_to_json_string(null_truncate(name_slice)));
     cursor += stream_name_len;
   } else {
     return s;
@@ -660,7 +662,14 @@ fn parse_mdpr(body: &[u8]) -> MdprStream {
   // Real.pm:132-136 — StreamMimeType string[$val{10}].
   if cursor + stream_mime_len <= body.len() {
     let mime_slice = &body[cursor..cursor + stream_mime_len];
-    s.stream_mime_type = Some(raw_bytes_to_json_string(strip_trailing_nuls(mime_slice)));
+    // Real.pm:132-136 — `Format => 'string[$val{10}]'` ⇒ ReadValue's
+    // first-NUL truncation (ExifTool.pm:6300) applies BEFORE storage.
+    // Bundled then runs `$mime =~ s/\0.*//s` AGAIN at Real.pm:643 before
+    // pushing to `@mimeTypes`; since both truncations are at the FIRST NUL,
+    // applying it once here yields the same value (mime_override sees the
+    // truncated form). Codex R2 finding — without this, embedded NULs leak
+    // through `Real-MDPR:StreamMimeType` AND `File:MIMEType`.
+    s.stream_mime_type = Some(raw_bytes_to_json_string(null_truncate(mime_slice)));
     cursor += stream_mime_len;
   } else {
     return s;
@@ -756,15 +765,37 @@ fn raw_bytes_to_json_string(bytes: &[u8]) -> String {
   fix_utf8(bytes)
 }
 
-/// Strip trailing nul bytes from a byte slice.
-fn strip_trailing_nuls(bytes: &[u8]) -> &[u8] {
-  let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-  &bytes[..end]
-}
-
-/// Strip BOTH leading and trailing nul bytes (defensive — the
-/// logical-fileinfo blocks have field values whose Perl `Format =>
-/// 'string[N]'` truncates at the FIRST embedded NUL).
+/// Truncate a byte slice at the first NUL byte (everything before it is
+/// kept; everything from the NUL onward is dropped). If no NUL exists, the
+/// whole slice is returned unchanged.
+///
+/// This mirrors bundled exiftool's `ReadValue` (ExifTool.pm:6300):
+///
+/// ```perl
+/// $vals[0] =~ s/\0.*//s if $format eq 'string';
+/// ```
+///
+/// — i.e. EVERY field whose `Format => 'string[N]'` (the only format that
+/// hits this branch besides bare `string`) is silently first-NUL truncated
+/// after the raw `substr` read. Sites in this module that store the result
+/// of a `string[N]` Real.pm field MUST use this helper, not a trailing-NUL
+/// strip; otherwise embedded NULs leak through to JSON (Codex R2 finding
+/// on `Real-MDPR:StreamMimeType`).
+///
+/// This includes:
+///
+/// - `Real::MediaProps` (Real.pm:115-183) — `StreamName`, `StreamMimeType`.
+/// - `Real::ContentDescr` (Real.pm:236-249) — `Title`, `Author`,
+///   `Copyright`, `Comment`.
+/// - `Real::AudioV3/V4` (Real.pm:270-325) — `Title`, `Artist`, `Copyright`,
+///   `Comment` (handled by [`ra_text_field`]).
+/// - `Real::Metadata` RJMD value-string types (Real.pm:31-37 maps types
+///   1/2/6/8/7 to `'string'`; ReadValue is what truncates them).
+/// - `ProcessRealMeta` tag-name read (Real.pm:450 — the only site where
+///   bundled itself spells the regex `s/\0.*//s` explicitly).
+///
+/// EXCLUDED: `undef[N]` fields (FourCC1/2/3, FileInfoProperties body),
+/// where `ReadValue` returns raw bytes WITHOUT truncating at NULs.
 fn null_truncate(bytes: &[u8]) -> &[u8] {
   let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
   &bytes[..end]
@@ -1111,7 +1142,10 @@ fn parse_cont(body: &[u8]) -> ContTags {
       let _ = i;
       return c;
     }
-    let s = raw_bytes_to_json_string(strip_trailing_nuls(&body[cursor..cursor + len]));
+    // Real.pm:242/244/246/248 — each CONT field is `Format => 'string[…]'`,
+    // so ReadValue's first-NUL truncation (ExifTool.pm:6300) applies; see
+    // [`null_truncate`].
+    let s = raw_bytes_to_json_string(null_truncate(&body[cursor..cursor + len]));
     **field = Some(s);
     cursor += len;
   }
@@ -2320,16 +2354,18 @@ mod tests {
 
   #[test]
   fn null_truncate_stops_at_first_nul() {
+    // Bundled `ReadValue` (ExifTool.pm:6300) applies `s/\0.*//s` whenever
+    // `format eq 'string'`. EVERY `Format => 'string[N]'` field in Real.pm
+    // (StreamName, StreamMimeType, CONT Title/Author/Copyright/Comment,
+    // AudioV3/V4 Title/Artist/Copyright/Comment, RJMD string/date types)
+    // funnels through this regex. The R2 finding pinned StreamMimeType as
+    // the symptomatic case (`audio/x\0pn-realaudio` ⇒ `audio/x`).
     assert_eq!(null_truncate(b"abc\0xyz"), b"abc");
     assert_eq!(null_truncate(b"abc"), b"abc");
     assert_eq!(null_truncate(b"\0"), b"");
-  }
-
-  #[test]
-  fn strip_trailing_nuls_keeps_internal_data() {
-    assert_eq!(strip_trailing_nuls(b"abc\0\0"), b"abc");
-    assert_eq!(strip_trailing_nuls(b"a\0b\0\0"), b"a\0b");
-    assert_eq!(strip_trailing_nuls(b"\0\0"), b"");
+    assert_eq!(null_truncate(b""), b"");
+    // The exact byte pattern from the Codex R2 fixture / Real.pm:643.
+    assert_eq!(null_truncate(b"audio/x\0pn-realaudio"), b"audio/x");
   }
 
   // ----------------------------------------------------------------------

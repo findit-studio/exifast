@@ -552,6 +552,30 @@ fn real_synth_id3v1_empty_title_conformance() {
 }
 
 #[test]
+fn real_synth_embedded_nul_mime_conformance() {
+  // Codex R2 adversarial — RM whose 1 MDPR carries a StreamMimeType with
+  // an EMBEDDED NUL byte (`audio/x\0pn-realaudio`). Bundled Real.pm:643
+  // runs `$mime =~ s/\0.*//s` (first-NUL truncation) before pushing to
+  // `@mimeTypes`, and the `Format => 'string[$val{10}]'` read at Real.pm:
+  // 132-136 already truncates via ReadValue's `s/\0.*//s` at
+  // ExifTool.pm:6300, so BOTH `Real-MDPR:StreamMimeType` AND
+  // `File:MIMEType` (via the single-stream override at Real.pm:653-657)
+  // emit the truncated `audio/x` form. Pre-fix the Rust port used
+  // `strip_trailing_nuls`, which preserved the embedded NUL and leaked it
+  // through both surfaces.
+  check(
+    "real_synth_embedded_nul_mime.rm",
+    "real_synth_embedded_nul_mime.rm.json",
+    true,
+  );
+  check(
+    "real_synth_embedded_nul_mime.rm",
+    "real_synth_embedded_nul_mime.rm.n.json",
+    false,
+  );
+}
+
+#[test]
 fn real_synth_id3v1_sparse_genre_conformance() {
   // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
   // Genre byte is 192 (SPARSE — outside the GENRE_ENTRIES named-genre
