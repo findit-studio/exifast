@@ -382,18 +382,23 @@ pub struct Id3Meta<'a> {
   /// tag). Aggregates ID3v2 header (10 + size [+ 10 if footer]) +
   /// ID3v1 trailer (128) + Enhanced TAG (227, when present).
   id3_size: i64,
-  /// Owned passthrough of the full staged-tag list. The sink replays
-  /// these into a [`TagWriter`] preserving the bundled emission order
-  /// + group/name/value tuples. Includes File:ID3Size + every
-  /// `ID3v2_*:*` frame + every `ID3v1:*` v1 field — the same set the
-  /// legacy serializer pushed into a `Metadata`.
+  /// Owned passthrough of the full staged-tag list in **PrintConv (`-j`)**
+  /// mode. The sink replays these into a [`TagWriter`] for `sink(true)`,
+  /// preserving the bundled emission order + group/name/value tuples.
+  /// Includes File:ID3Size + every `ID3v2_*:*` frame + every `ID3v1:*` v1
+  /// field — the same set the legacy serializer pushed into a `Metadata`.
+  /// The typed accessors ([`Id3Meta::title`], [`Id3Meta::genre`],
+  /// [`Id3Meta::frames`], [`Id3Meta::picture`], …) ALWAYS read this
+  /// PrintConv list (the human-readable contract).
   staged_tags: Vec<StagedTag>,
-  /// The `print_conv` mode the staged tag values were extracted in
-  /// (`true` = `-j` PrintConv strings; `false` = `-n` post-ValueConv
-  /// raw). [`MetaSinker::sink`] honors its `print_conv` argument by
-  /// matching against this; a mismatch is a caller contract violation
-  /// (parse and sink in the same mode). Codex BF2.
-  staged_print_conv: bool,
+  /// Owned passthrough of the full staged-tag list in **raw (`-n`,
+  /// post-ValueConv)** mode — the `sink(false)` source. Built from a
+  /// second engine pass with `print_conv = false`, so PrintConv-toggled
+  /// fields (ID3v1 Genre %genre ID3.pm:371-375; TLEN ValueConv/PrintConv
+  /// split ID3.pm:592-595) carry the raw scalar (e.g. Genre `7`, Length
+  /// `7`). Storing BOTH lets ONE `parse` serve BOTH `sink(true)` and
+  /// `sink(false)` (Codex B-R2-1) — no mode-lock, no debug-assert.
+  staged_tags_raw: Vec<StagedTag>,
   /// All warnings the engine emitted while parsing this ID3 directory.
   warnings: Vec<SmolStr>,
   /// All errors the engine emitted (rare; faithful to ExifTool's
@@ -986,46 +991,77 @@ impl std::error::Error for Mp3Error {}
 // Inner parser — builds typed Meta from a staged Metadata
 // ===========================================================================
 
+/// Run the push-style legacy engine (`process_id3_inner_legacy`) once into
+/// a scratch [`Metadata`] at the given `print_conv` mode and lift its tag
+/// list into a `Vec<StagedTag>`, preserving the bundled emission order.
+/// Returns `(found, hdr_end, staged_tags, metadata)` — the `metadata` is
+/// returned so the caller can read its `done_id3` / `warnings` / `errors`
+/// (which are mode-independent).
+fn run_id3_pass(data: &[u8], print_conv: bool) -> (bool, usize, Vec<StagedTag>, Metadata) {
+  let mut staging = Metadata::new("staging.id3");
+  let (found, hdr_end) = {
+    let mut staging_ctx = ParseContext::new(data, "ID3", 0, "ID3", None, print_conv, &mut staging);
+    process_id3_inner_legacy(data, &mut staging_ctx, false)
+  };
+  let staged_tags: Vec<StagedTag> = staging
+    .tags()
+    .iter()
+    .map(|tag| StagedTag {
+      family1: SmolStr::new(tag.group().family1()),
+      name: SmolStr::new(tag.name()),
+      value: tag.value().clone(),
+    })
+    .collect();
+  (found, hdr_end, staged_tags, staging)
+}
+
 /// Stage-and-replay parser body. Runs the existing push-style engine
 /// (`process_id3_inner_legacy`) into a temporary [`Metadata`], then lifts
 /// the resulting `Tag` list into [`Id3Meta::staged_tags`] preserving the
 /// bundled emission order. Updates `shared.done_id3` to the trailer size
 /// (the `$$et{DoneID3}` flag that APE.pm:169 reads).
+///
+/// **Both modes (Codex B-R2-1).** The engine is run TWICE — once with
+/// `print_conv = true` (the human-readable `-j` list, stored in
+/// `staged_tags` and read by every typed accessor) and once with
+/// `print_conv = false` (the raw `-n` list, stored in `staged_tags_raw`).
+/// One `parse` therefore serves BOTH `sink(true)` and `sink(false)` with no
+/// mode-lock. The `print_conv` argument is retained for source/signature
+/// compatibility but no longer gates which list is built (both always are);
+/// it selects nothing — the sink picks by its own argument.
 fn parse_id3_inner<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
 ) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
-  // Run the legacy engine into a staging Metadata. The staging Metadata
-  // is a transient scratch buffer; we lift its tags into the typed Meta
-  // afterwards. The staging `print_conv_enabled` is threaded from the
-  // caller so the staged tag values reflect the requested `-j` / `-n`
-  // mode (Codex BF2 — ID3v1 Genre %genre PrintConv ID3.pm:371-375; TLEN
-  // ValueConv/PrintConv split ID3.pm:592-595).
-  let mut staging = Metadata::new("staging.id3");
-  let mut staging_ctx = ParseContext::new(data, "ID3", 0, "ID3", None, print_conv, &mut staging);
-  let (found, hdr_end) = process_id3_inner_legacy(data, &mut staging_ctx, false);
+  let _ = print_conv; // no longer mode-locks (Codex B-R2-1); see fn docs.
+
+  // PrintConv (`-j`) pass — the accessor + `sink(true)` source.
+  let (found, hdr_end, staged_tags, staging) = run_id3_pass(data, true);
   if !found {
     return Ok((None, hdr_end));
   }
+  // Raw (`-n`) pass — the `sink(false)` source. Same input, same engine,
+  // PrintConv disabled (ID3v1 Genre %genre ID3.pm:371-375; TLEN
+  // ValueConv/PrintConv split ID3.pm:592-595 differ between the two).
+  let (_found_raw, _hdr_end_raw, staged_tags_raw, _staging_raw) = run_id3_pass(data, false);
+
   // Propagate done_id3 (the trailer size that APE.pm:169 reads). The
   // legacy `process_id3_inner_legacy` stored this on `staging.done_id3`;
   // mirror it onto the SharedFlags for the new chained-call path.
   if let Some(sf) = shared {
-    if let Some(trail_size) = staging_ctx.metadata().done_id3() {
+    if let Some(trail_size) = staging.done_id3() {
       sf.set_done_id3(trail_size);
     }
   }
-  // Determine the ID3v2 version + size + ID3v1 sub-Meta from the staged
-  // tags.
+  // Determine the ID3v2 version + size + ID3v1 sub-Meta from the PrintConv
+  // staged tags (the accessor list).
   let mut v2_version: Option<Id3v2Version> = None;
   let mut id3_size: i64 = 0;
   let mut id3v1: Option<Id3v1Meta<'_>> = None;
-  let mut staged_tags: Vec<StagedTag> = Vec::with_capacity(staging.tags().len());
-  for tag in staging.tags() {
-    let g1 = tag.group().family1();
-    let name = tag.name();
-    let value = tag.value().clone();
+  for tag in &staged_tags {
+    let g1 = tag.family1.as_str();
+    let name = tag.name.as_str();
     if g1 == "ID3v2_2" {
       v2_version = Some(Id3v2Version::V2_2);
     } else if g1 == "ID3v2_3" {
@@ -1034,19 +1070,14 @@ fn parse_id3_inner<'a>(
       v2_version.get_or_insert(Id3v2Version::V2_4);
     }
     if name == "ID3Size" {
-      if let TagValue::I64(n) = &value {
+      if let TagValue::I64(n) = &tag.value {
         id3_size = *n;
       }
     }
     if g1 == "ID3v1" {
       let v1 = id3v1.get_or_insert_with(Id3v1Meta::default);
-      stuff_id3v1_field(v1, name, &value);
+      stuff_id3v1_field(v1, name, &tag.value);
     }
-    staged_tags.push(StagedTag {
-      family1: SmolStr::new(g1),
-      name: SmolStr::new(name),
-      value,
-    });
   }
   let warnings: Vec<SmolStr> = staging.warnings().to_vec();
   let errors: Vec<SmolStr> = staging.errors().to_vec();
@@ -1056,7 +1087,7 @@ fn parse_id3_inner<'a>(
       id3v1,
       id3_size,
       staged_tags,
-      staged_print_conv: print_conv,
+      staged_tags_raw,
       warnings,
       errors,
       _phantom: core::marker::PhantomData,
@@ -1122,26 +1153,21 @@ impl MetaSinker for Id3Meta<'_> {
   /// them. Faithful to ID3.pm: File:ID3Size first, then ID3v2 frames in
   /// tag-table order, then ID3v1 fields in `%v1` order.
   ///
-  /// **`print_conv` contract (Codex BF2).** The stage-and-replay path
-  /// runs the legacy engine once at a fixed `print_conv` mode (recorded
-  /// in [`Id3Meta::staged_print_conv`]); PrintConv-toggled fields (ID3v1
-  /// Genre %genre ID3.pm:371-375; TLEN ValueConv/PrintConv split
-  /// ID3.pm:592-595) therefore carry the mode-appropriate value. `sink`'s
-  /// `print_conv` argument MUST match the parse-time mode — parse in `-n`
-  /// (`print_conv = false`) to sink `-n` raw scalars, parse in `-j` to
-  /// sink PrintConv strings. A mismatch is a `debug_assert` failure
-  /// (caught in tests; in release it emits the staged mode's values). The
-  /// public typed entries [`parse_id3`](crate::parse_id3) /
-  /// [`parse_mp3`](crate::parse_mp3) parse in `-j`; the lib-first
-  /// [`parse_id3_borrowed`] takes an explicit `print_conv` for `-n`.
+  /// **`print_conv` contract (Codex B-R2-1).** ONE `parse` stages BOTH the
+  /// PrintConv (`-j`) list and the raw (`-n`) list; `sink` honors its
+  /// `print_conv` argument by replaying the matching list. So a single typed
+  /// `parse(...)` serves BOTH `sink(true)` (PrintConv strings — Genre
+  /// `Hip-Hop`, Length `7 s`) AND `sink(false)` (raw scalars — Genre `7`,
+  /// Length `7`) with no mode-lock and no debug-assert. PrintConv-toggled
+  /// fields (ID3v1 Genre %genre ID3.pm:371-375; TLEN ValueConv/PrintConv
+  /// split ID3.pm:592-595) are the cases this distinguishes.
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
-    debug_assert_eq!(
-      print_conv, self.staged_print_conv,
-      "Id3Meta::sink(print_conv={print_conv}) must match the mode the Meta was \
-       parsed in (staged_print_conv={}); parse in the desired mode (Codex BF2)",
-      self.staged_print_conv,
-    );
-    for tag in &self.staged_tags {
+    let tags = if print_conv {
+      &self.staged_tags
+    } else {
+      &self.staged_tags_raw
+    };
+    for tag in tags {
       // Use the family-1 string as the writer's `group` argument; the
       // legacy `MetadataTagWriter` bridge mirrors family-1 to BOTH
       // family-0 and family-1 on push, which matches the legacy
@@ -2335,6 +2361,75 @@ mod tests {
         .map(crate::sink::MapValue::as_str),
       Some("7".into()),
       "-n must emit raw ValueConv seconds, not the PrintConv \"7 s\" (Codex BF2)"
+    );
+  }
+
+  /// **Codex B-R2-1.** A SINGLE `ProcessId3.parse(...)` must serve BOTH
+  /// `sink(true)` (PrintConv `-j`) AND `sink(false)` (raw `-j -n`) — the
+  /// library-correct contract (no mode-lock, no debug panic, no PrintConv
+  /// strings leaking into `-n`). Combined fixture: ID3v2.3 TLEN=7000 header
+  /// + ID3v1 genre=7 trailer. Compared to bundled `exiftool 13.58`:
+  ///   -j     → ID3v2_3:Length "7 s",  ID3v1:Genre "Hip-Hop"
+  ///   -j -n  → ID3v2_3:Length 7,      ID3v1:Genre 7
+  #[test]
+  fn id3_typed_one_parse_serves_both_sink_modes() {
+    // ID3v2.3 directory carrying a single TLEN = "7000" frame.
+    let mut frame: Vec<u8> = Vec::new();
+    frame.extend_from_slice(b"TLEN");
+    frame.extend_from_slice(&5u32.to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.push(0); // Latin-1
+    frame.extend_from_slice(b"7000");
+    let size = frame.len() as u32;
+    let ss = [
+      ((size >> 21) & 0x7f) as u8,
+      ((size >> 14) & 0x7f) as u8,
+      ((size >> 7) & 0x7f) as u8,
+      (size & 0x7f) as u8,
+    ];
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"ID3");
+    data.extend_from_slice(&[0x03, 0x00, 0x00]);
+    data.extend_from_slice(&ss);
+    data.extend_from_slice(&frame);
+    data.extend_from_slice(&[0u8; 200]); // audio-area padding
+    data.extend_from_slice(&build_id3v1_block()); // ID3v1 genre byte = 7
+
+    // ONE parse via the typed `FormatParser` entry (stages BOTH lists).
+    let mut shared = SharedFlags::new();
+    let ctx = Id3Context::new(&data, &mut shared);
+    let meta = <ProcessId3 as FormatParser>::parse(&ProcessId3, ctx)
+      .expect("ok")
+      .expect("ID3 found");
+
+    // sink(true) — PrintConv `-j`.
+    let mut wj = crate::sink::MapTagWriter::new();
+    meta.sink(true, &mut wj).unwrap();
+    assert_eq!(
+      wj.get("ID3v2_3", "Length")
+        .map(crate::sink::MapValue::as_str),
+      Some("7 s".into()),
+      "-j Length must be PrintConv \"7 s\" (bundled exiftool -j)"
+    );
+    assert_eq!(
+      wj.get("ID3v1", "Genre").map(crate::sink::MapValue::as_str),
+      Some("Hip-Hop".into()),
+      "-j Genre must be PrintConv \"Hip-Hop\" (bundled exiftool -j)"
+    );
+
+    // sink(false) — raw `-j -n`, from the SAME `meta`.
+    let mut wn = crate::sink::MapTagWriter::new();
+    meta.sink(false, &mut wn).unwrap();
+    assert_eq!(
+      wn.get("ID3v2_3", "Length")
+        .map(crate::sink::MapValue::as_str),
+      Some("7".into()),
+      "-n Length must be raw 7, not \"7 s\" — from the SAME parse (Codex B-R2-1)"
+    );
+    assert_eq!(
+      wn.get("ID3v1", "Genre").map(crate::sink::MapValue::as_str),
+      Some("7".into()),
+      "-n Genre must be raw byte 7, not \"Hip-Hop\" — from the SAME parse (Codex B-R2-1)"
     );
   }
 
