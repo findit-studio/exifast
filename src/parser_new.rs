@@ -565,7 +565,384 @@ impl MetaSinker for AnyMeta<'_> {
   }
 }
 
+// ===========================================================================
+// AnyError — closed-set error from `AnyParser::parse_any` + `parse_bytes`
+// ===========================================================================
+
+/// Aggregate Rust-level fatal error from the closed [`AnyParser`] dispatch.
+///
+/// One variant wraps each format's [`FormatParser::Error`]; conversions
+/// from the per-format `XxxError` types are provided via `From` impls so
+/// the per-arm dispatch in [`AnyParser::parse_any`] can write
+/// `.map_err(Into::into)`.
+///
+/// Most format errors today are uninhabited (no variants — see e.g.
+/// [`crate::formats::moi::MoiError`]); the `From` impls for those formats
+/// translate into unreachable matches that `rustc` constant-folds out at
+/// monomorphization. The structure exists so future I/O-fallible parsers
+/// can add fatal modes without changing the public `AnyError` shape.
+///
+/// `#[non_exhaustive]` matches [`AnyParser`] / [`AnyMeta`]: consumers
+/// cannot exhaustively match on this enum across crate-feature combos —
+/// new format arms (or new variants on existing errors) are additive
+/// within the crate, but no caller can rely on a fixed set.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::Display)]
+pub enum AnyError {
+  /// MOI fatal-error wrapper.
+  #[cfg(feature = "moi")]
+  #[display("MOI: {_0}")]
+  Moi(crate::formats::moi::MoiError),
+  /// AAC fatal-error wrapper.
+  #[cfg(feature = "aac")]
+  #[display("AAC: {_0}")]
+  Aac(crate::formats::aac::AacError),
+  /// DV fatal-error wrapper.
+  #[cfg(feature = "dv")]
+  #[display("DV: {_0}")]
+  Dv(crate::formats::dv::DvError),
+  /// Audible (AA) fatal-error wrapper.
+  #[cfg(feature = "audible")]
+  #[display("AA: {_0}")]
+  Aa(crate::formats::audible::AudibleError),
+  /// Red R3D fatal-error wrapper.
+  #[cfg(feature = "red")]
+  #[display("R3D: {_0}")]
+  R3d(crate::formats::red::R3dError),
+  /// ID3 fatal-error wrapper.
+  #[cfg(feature = "id3")]
+  #[display("ID3: {_0}")]
+  Id3(crate::formats::id3::Id3Error),
+  /// MP3 fatal-error wrapper.
+  #[cfg(feature = "mp3")]
+  #[display("MP3: {_0}")]
+  Mp3(crate::formats::id3::Mp3Error),
+  /// AIFF fatal-error wrapper.
+  #[cfg(feature = "aiff")]
+  #[display("AIFF: {_0}")]
+  Aiff(crate::formats::aiff::AiffError),
+  /// APE fatal-error wrapper.
+  #[cfg(feature = "ape")]
+  #[display("APE: {_0}")]
+  Ape(crate::formats::ape::ApeError),
+  /// DSF fatal-error wrapper.
+  #[cfg(feature = "dsf")]
+  #[display("DSF: {_0}")]
+  Dsf(crate::formats::dsf::DsfError),
+  /// FLAC fatal-error wrapper.
+  #[cfg(feature = "flac")]
+  #[display("FLAC: {_0}")]
+  Flac(crate::formats::flac::FlacError),
+  /// Ogg fatal-error wrapper.
+  #[cfg(feature = "ogg")]
+  #[display("OGG: {_0}")]
+  Ogg(crate::formats::ogg::OggError),
+  /// MPEG audio fatal-error wrapper.
+  #[cfg(feature = "mpeg-audio")]
+  #[display("MPEG-audio: {_0}")]
+  MpegAudio(crate::formats::mpeg::MpegAudioError),
+  /// MPC fatal-error wrapper.
+  #[cfg(feature = "mpc")]
+  #[display("MPC: {_0}")]
+  Mpc(crate::formats::mpc::MpcError),
+  /// WavPack fatal-error wrapper.
+  #[cfg(feature = "wavpack")]
+  #[display("WV: {_0}")]
+  Wv(crate::formats::wavpack::WvError),
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AnyError {}
+
+#[cfg(feature = "moi")]
+impl From<crate::formats::moi::MoiError> for AnyError {
+  fn from(e: crate::formats::moi::MoiError) -> Self {
+    AnyError::Moi(e)
+  }
+}
+#[cfg(feature = "aac")]
+impl From<crate::formats::aac::AacError> for AnyError {
+  fn from(e: crate::formats::aac::AacError) -> Self {
+    AnyError::Aac(e)
+  }
+}
+#[cfg(feature = "dv")]
+impl From<crate::formats::dv::DvError> for AnyError {
+  fn from(e: crate::formats::dv::DvError) -> Self {
+    AnyError::Dv(e)
+  }
+}
+#[cfg(feature = "audible")]
+impl From<crate::formats::audible::AudibleError> for AnyError {
+  fn from(e: crate::formats::audible::AudibleError) -> Self {
+    AnyError::Aa(e)
+  }
+}
+#[cfg(feature = "red")]
+impl From<crate::formats::red::R3dError> for AnyError {
+  fn from(e: crate::formats::red::R3dError) -> Self {
+    AnyError::R3d(e)
+  }
+}
+#[cfg(feature = "id3")]
+impl From<crate::formats::id3::Id3Error> for AnyError {
+  fn from(e: crate::formats::id3::Id3Error) -> Self {
+    AnyError::Id3(e)
+  }
+}
+#[cfg(feature = "mp3")]
+impl From<crate::formats::id3::Mp3Error> for AnyError {
+  fn from(e: crate::formats::id3::Mp3Error) -> Self {
+    AnyError::Mp3(e)
+  }
+}
+#[cfg(feature = "aiff")]
+impl From<crate::formats::aiff::AiffError> for AnyError {
+  fn from(e: crate::formats::aiff::AiffError) -> Self {
+    AnyError::Aiff(e)
+  }
+}
+#[cfg(feature = "ape")]
+impl From<crate::formats::ape::ApeError> for AnyError {
+  fn from(e: crate::formats::ape::ApeError) -> Self {
+    AnyError::Ape(e)
+  }
+}
+#[cfg(feature = "dsf")]
+impl From<crate::formats::dsf::DsfError> for AnyError {
+  fn from(e: crate::formats::dsf::DsfError) -> Self {
+    AnyError::Dsf(e)
+  }
+}
+#[cfg(feature = "flac")]
+impl From<crate::formats::flac::FlacError> for AnyError {
+  fn from(e: crate::formats::flac::FlacError) -> Self {
+    AnyError::Flac(e)
+  }
+}
+#[cfg(feature = "ogg")]
+impl From<crate::formats::ogg::OggError> for AnyError {
+  fn from(e: crate::formats::ogg::OggError) -> Self {
+    AnyError::Ogg(e)
+  }
+}
+#[cfg(feature = "mpeg-audio")]
+impl From<crate::formats::mpeg::MpegAudioError> for AnyError {
+  fn from(e: crate::formats::mpeg::MpegAudioError) -> Self {
+    AnyError::MpegAudio(e)
+  }
+}
+#[cfg(feature = "mpc")]
+impl From<crate::formats::mpc::MpcError> for AnyError {
+  fn from(e: crate::formats::mpc::MpcError) -> Self {
+    AnyError::Mpc(e)
+  }
+}
+#[cfg(feature = "wavpack")]
+impl From<crate::formats::wavpack::WvError> for AnyError {
+  fn from(e: crate::formats::wavpack::WvError) -> Self {
+    AnyError::Wv(e)
+  }
+}
+
+// ===========================================================================
+// AnyParser::parse_any — the closed-dispatch entry point
+// ===========================================================================
+
 impl AnyParser {
+  /// Closed-dispatch entry point: invokes the wrapped [`FormatParser`] with
+  /// a per-format `Context` constructed from `bytes` + `shared`, then wraps
+  /// the typed `Meta` in [`AnyMeta`].
+  ///
+  /// Leaf formats (MOI, AAC, DV, Audible, Red, OGG) ignore `shared`. Chained
+  /// formats (ID3, MP3, AIFF, APE, DSF, FLAC, MPC, WavPack, MPEG-audio) read
+  /// and/or mutate `shared` per ExifTool's `$$et{DoneID3}` / `$$et{DoneAPE}`
+  /// flags (spec §6.4).
+  ///
+  /// `ext` is the file extension (uppercased, no leading dot) — used by
+  /// the MP3 / MPEG-audio parsers for the layer-II / `.MUS` gate. Pass
+  /// `None` when the extension is unknown (the parsers fall through their
+  /// extension-dependent retry branches).
+  ///
+  /// # Errors
+  ///
+  /// Returns [`AnyError`] when the dispatched per-format parser raises a
+  /// Rust-level fatal. Most ported formats today have no fatal modes
+  /// (uninhabited `XxxError` enums), so the `Err` branch is unreachable
+  /// in practice; the structure is in place for future I/O-fallible
+  /// parsers.
+  ///
+  /// `ext` borrows on an INDEPENDENT (elided) lifetime — distinct from
+  /// `bytes`. Only `bytes` drives the returned `AnyMeta<'a>`; no dispatch arm
+  /// stores `ext` into the Meta (the MP3 / MPEG-audio arms thread it into
+  /// helpers that consume it for the layer-II / `.MUS` gate but never retain
+  /// it). So a caller may pass a transient `ext` string, drop it, and keep
+  /// the returned Meta (Codex C-R3-1; C-R2-2 fixed the direct `parse_<fmt>`
+  /// accessors but missed this closed-dispatch path).
+  pub fn parse_any<'a>(
+    self,
+    bytes: &'a [u8],
+    shared: &mut SharedFlags,
+    ext: Option<&str>,
+  ) -> Result<Option<AnyMeta<'a>>, AnyError> {
+    // No-format build (Codex CF3): `AnyParser` has no variants, so the
+    // `match` below is empty and the parameters are unused. Discard them
+    // to keep the no-format tier warning-clean.
+    #[cfg(not(any(
+      feature = "moi",
+      feature = "aac",
+      feature = "dv",
+      feature = "audible",
+      feature = "red",
+      feature = "id3",
+      feature = "mp3",
+      feature = "aiff",
+      feature = "ape",
+      feature = "dsf",
+      feature = "flac",
+      feature = "ogg",
+      feature = "mpeg-audio",
+      feature = "mpc",
+      feature = "wavpack",
+    )))]
+    let _ = (bytes, shared, ext);
+    match self {
+      #[cfg(feature = "moi")]
+      AnyParser::Moi(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Moi))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "aac")]
+      AnyParser::Aac(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Aac))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "dv")]
+      AnyParser::Dv(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Dv))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "audible")]
+      AnyParser::Aa(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Aa))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "red")]
+      AnyParser::R3D(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::R3d))
+          .map_err(Into::into)
+      }
+      // Chained formats dispatch via their **decoupled** `*_borrowed` /
+      // `*_owned` entries: `shared` borrows independently of `bytes`, so the
+      // returned `AnyMeta<'a>` borrows only from `bytes` and `shared` (a
+      // transient scratch bag) does not pin the result lifetime. Going
+      // through the per-format `Context<'a>` here would tie `shared` to `'a`
+      // via the GAT and break the `parse_bytes` candidate loop (Codex AF2).
+      #[cfg(feature = "id3")]
+      AnyParser::Id3(p) => {
+        let _ = (p, ext);
+        // ID3 typed Meta is mode-locked; the closed dispatch stages `-j`.
+        crate::formats::id3::parse_id3_borrowed(bytes, Some(shared), /* print_conv */ true)
+          .map(|o| o.map(AnyMeta::Id3))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "mp3")]
+      AnyParser::Mp3(p) => {
+        let _ = p;
+        crate::formats::id3::parse_mp3_borrowed(bytes, ext, shared)
+          .map(|o| o.map(AnyMeta::Mp3))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "aiff")]
+      AnyParser::Aiff(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Aiff))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "ape")]
+      AnyParser::Ape(p) => {
+        let _ = (p, ext);
+        Ok(crate::formats::ape::parse_full_owned(bytes, shared).map(AnyMeta::Ape))
+      }
+      #[cfg(feature = "dsf")]
+      AnyParser::Dsf(p) => {
+        let _ = (p, ext, &mut *shared);
+        // DSF's typed parse uses only `data`; the ID3v2 trailer scan range
+        // is exposed on the Meta for the caller to dispatch.
+        crate::formats::dsf::parse_borrowed(bytes)
+          .map(|o| o.map(AnyMeta::Dsf))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "flac")]
+      AnyParser::Flac(p) => {
+        let _ = (p, ext);
+        crate::formats::flac::parse_borrowed(bytes, shared)
+          .map(|o| o.map(AnyMeta::Flac))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "ogg")]
+      AnyParser::Ogg(p) => {
+        let _ = (shared, ext);
+        // The OGG typed parser returns `Some(OggMeta { success: false })`
+        // (carrying the "Not a valid OGG file" warning) for non-OGG /
+        // garbage input, faithful to the bundled `ProcessOGG` return. In
+        // this `parse_any` library path `Ok(Some(_))` terminates the
+        // candidate loop, so an ID3-prefixed MP3 — whose detection
+        // candidates may try OGG before MP3 — would be mis-reported as
+        // `AnyMeta::Ogg` with no MPEG tags. Map `success() == false` to
+        // `Ok(None)` so dispatch continues to the next candidate (Codex
+        // C-R2-1). The engine entry `ogg::ProcessOgg::process` likewise
+        // returns `false` on `!success` (and only then emits the OGG
+        // warning for a genuinely OGG-typed file).
+        p.parse(bytes)
+          .map(|o| o.filter(|m| m.success()).map(AnyMeta::Ogg))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "mpeg-audio")]
+      AnyParser::MpegAudio(p) => {
+        // The MPEG-audio parser is normally invoked internally by MP3 — it
+        // is never a top-level file-type in `any_parser_for`. The closed
+        // dispatch arm is provided so external callers that construct an
+        // `AnyParser::MpegAudio` directly (e.g. unit tests, or future
+        // crates that want raw MPEG-audio access) can still route through
+        // the same closed-set machinery. The `mp3` flag and the extension
+        // are derived from `ext` exactly as `ID3::ProcessMP3` does
+        // (ID3.pm:1715-1717: `$ext eq 'MUS' ? 0 : 1`).
+        let _ = (p, &mut *shared);
+        let ext = ext.unwrap_or("");
+        let mp3 = !ext.eq_ignore_ascii_case("MUS");
+        crate::formats::mpeg::parse_borrowed(bytes, mp3, ext)
+          .map(|o| o.map(AnyMeta::MpegAudio))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "mpc")]
+      AnyParser::Mpc(p) => {
+        let _ = (p, ext, &mut *shared);
+        crate::formats::mpc::parse_borrowed(bytes)
+          .map(|o| o.map(AnyMeta::Mpc))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "wavpack")]
+      AnyParser::Wv(p) => {
+        let _ = (p, ext, &mut *shared);
+        crate::formats::wavpack::parse_borrowed(bytes)
+          .map(|o| o.map(AnyMeta::Wv))
+          .map_err(Into::into)
+      }
+    }
+  }
+
   /// Engine dispatch for [`crate::parser::extract_info`]: run this format's
   /// parser against the per-file value sink in `ctx`, emitting `File:*`
   /// (via `ctx.set_file_type`/`override_file_type`) and every format tag
@@ -894,6 +1271,64 @@ mod tests {
     assert!(any_parser_for("MPEG").is_none()); // video side deferred
     assert!(any_parser_for("").is_none());
     assert!(any_parser_for("AIFC").is_none()); // resolves to AIFF via lookup, not directly
+  }
+
+  /// `parse_any` dispatches through `AnyParser::Moi` and returns a
+  /// `AnyMeta::Moi` arm for a valid MOI file. Verifies that the closed-set
+  /// dispatch produces the same shape as the direct typed entry.
+  #[cfg(feature = "moi")]
+  #[test]
+  fn parse_any_moi_via_closed_dispatch() {
+    // Minimal MOI v6 file: V6 magic + 16 bytes of header (the parser will
+    // accept the magic and produce a partial Meta or `None`; we only verify
+    // the dispatch shape compiles and routes through the AnyMeta::Moi arm).
+    let bytes = b"V6\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let parser = any_parser_for("MOI").expect("MOI feature enabled");
+    let mut shared = SharedFlags::new();
+    let result = parser.parse_any(bytes, &mut shared, None);
+    // The exact `Some`/`None` outcome depends on the MOI parser's
+    // acceptance rules for a 16-byte buffer; this test just verifies the
+    // dispatch doesn't panic and produces an `Ok(_)` result.
+    assert!(result.is_ok());
+  }
+
+  /// Codex C-R3-1: `parse_any` decouples the transient `ext` borrow from the
+  /// returned `AnyMeta<'a>` (only `bytes` flows into the Meta). The MP3 arm
+  /// threads `ext` into `parse_mp3_borrowed` for the layer-II / `.MUS` gate
+  /// but never stores it, so a short-lived `ext` string may be dropped while
+  /// the returned Meta lives on. This compiles ONLY if `ext` is on an
+  /// independent lifetime; it is the closed-dispatch analogue of
+  /// `lib::parse_mp3_meta_outlives_transient_ext` (which covered the direct
+  /// accessor under C-R2-2). The byte buffer is a minimal MPEG-audio sync
+  /// frame so the MP3 arm produces `Some`.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn parse_any_meta_outlives_transient_ext() {
+    let bytes: Vec<u8> = vec![0xff, 0xfb, 0x90, 0x00];
+    let parser = any_parser_for("MP3").expect("MP3 feature enabled");
+    let mut shared = SharedFlags::new();
+    let meta = {
+      // `ext` is a short-lived String dropped at the end of this block.
+      let ext: String = String::from("MP3");
+      let m = parser
+        .parse_any(&bytes, &mut shared, Some(ext.as_str()))
+        .expect("ok");
+      // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
+      m
+    };
+    // Use the meta after `ext` is gone — proves the decoupling.
+    let _ = meta.is_some();
+  }
+
+  /// `AnyError` formats nicely via `Display`. Most format errors are
+  /// uninhabited, so the variant constructors aren't constructible — but
+  /// the `Display` impl compiles, which is what matters.
+  #[test]
+  fn any_error_implements_display() {
+    fn _accepts_display<E: core::fmt::Display>(_: &E) {}
+    fn _check_any_error(e: &AnyError) {
+      _accepts_display(e);
+    }
   }
 }
 

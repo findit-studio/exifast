@@ -1414,10 +1414,6 @@ pub(crate) fn parse_trailer_only_owned(
 /// returned `AnyMeta<'a>` lifetime. Faithful to the private `parse_borrowed`
 /// full path (APE.pm:121-172): sets `done_ape` and threads
 /// `shared.done_id3()` for the APE.pm:169 footer shift.
-// Re-split: consumed only by `AnyParser::parse_any` (Group C public API);
-// in this migrations branch it has no in-tree caller yet. The allow is
-// removed when Group C lands `parse_any`.
-#[allow(dead_code)]
 pub(crate) fn parse_full_owned(data: &[u8], shared: &mut SharedFlags) -> Option<ApeMeta<'static>> {
   shared.set_done_ape(true);
   let done_id3 = shared.done_id3().unwrap_or(0);
