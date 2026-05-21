@@ -577,13 +577,18 @@ fn dispatch_typed(ctx: &mut ParseContext<'_>) -> bool {
 /// empty` / `File format error` / `Unknown file type` / an all-same-byte
 /// insight). [`finalization_error`] is the faithful port; `$self->Error`
 /// (ExifTool.pm:5648) ⇒ `m.push_error`.
+/// `json`-gated: the rendered JSON output goes through `serde_json` (the `json`
+/// feature). The serde-free engine tier still parses (`extract_info_to_writer`
+/// collects the typed tag stream under `alloc`); only this terminal render
+/// needs `json`.
+#[cfg(feature = "json")]
 #[must_use]
 pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String {
-  // The engine `$$et` value sink IS the `JsonTagWriter` now (task #124): the
-  // candidate loop's `ParseContext`s push File:* + sink their typed Meta + read
-  // tags back through it, and the final byte-exact JSON comes from
-  // `JsonTagWriter::finish()`. This replaces the retired `Metadata` push-bag +
-  // `serialize::to_exiftool_json(Metadata)` output path.
+  // The engine `$$et` value sink is the `JsonTagWriter`: the candidate loop's
+  // `ParseContext`s push File:* + sink their typed Meta + read tags back
+  // through it; the final VALUE-equivalent JSON comes from
+  // `JsonTagWriter::finish()` (standard `serde_json` via
+  // `serialize::render_document`).
   extract_info_to_writer(name, data, print_conv_enabled).finish()
 }
 
@@ -722,6 +727,33 @@ mod tests {
     w.records()
       .map(|(group, name, value)| (group.family1().to_string(), name.to_string(), value.clone()))
       .collect()
+  }
+
+  /// Assert the `exiftool -j -G1` document `json` carries `key` with a value
+  /// VALUE-equal to the JSON scalar `want_json` (e.g. `has_kv(&j, "AAC:Channels",
+  /// "2")`, `has_kv(&j, "File:FileType", "\"AAC\"")`). Standard `serde_json`
+  /// omits the space after `:` and emits numeric-looking values bare, so the
+  /// old `json.contains("\"K\": V")` substring checks no longer apply — this
+  /// compares by VALUE via [`crate::jsondiff::json_equivalent`] on a 1-key
+  /// document, exactly the conformance gate's semantics.
+  #[cfg(feature = "json")]
+  fn has_kv(json: &str, key: &str, want_json: &str) -> bool {
+    // Parse the array-of-one-object and pull out `key`'s raw value text.
+    let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON document");
+    let obj = v
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object());
+    let Some(obj) = obj else { return false };
+    let Some(found) = obj.get(key) else {
+      return false;
+    };
+    let got = serde_json::to_string(found).expect("re-serialize value");
+    crate::jsondiff::json_equivalent(
+      &std::format!("[{{\"k\":{got}}}]"),
+      &std::format!("[{{\"k\":{want_json}}}]"),
+    )
+    .is_ok()
   }
 
   /// A throwaway `ParseContext` over a fresh `JsonTagWriter` for the
@@ -1473,16 +1505,16 @@ mod tests {
     // the always-emitted version.
     let json = meta.finish();
     assert!(
-      json.contains("\"ExifTool:Error\": \"File format error\""),
+      has_kv(&json, "ExifTool:Error", "\"File format error\""),
       "serialized JSON must carry ExifTool:Error, got: {json}"
     );
     assert!(
-      json.contains("\"File:FileType\": \"AAC\""),
+      has_kv(&json, "File:FileType", "\"AAC\""),
       "SetFileType against &mut m must emit File:FileType, got: {json}"
     );
-    assert!(json.contains("\"AAC:Channels\": 2"), "got: {json}");
+    assert!(has_kv(&json, "AAC:Channels", "2"), "got: {json}");
     assert!(
-      json.contains("\"ExifTool:ExifToolVersion\": 13.58"),
+      has_kv(&json, "ExifTool:ExifToolVersion", "13.58"),
       "got: {json}"
     );
   }
@@ -1537,19 +1569,19 @@ mod tests {
     // The rejecting parser's SetFileType side effects PERSIST on the
     // outer Metadata (faithful Perl: no rollback).
     assert!(
-      json.contains("\"File:FileType\": \"AAC\""),
+      has_kv(&json, "File:FileType", "\"AAC\""),
       "rejecting parser's SetFileType side effect must persist (no rollback), got: {json}"
     );
     // And the pushed Channels tag persists too — every side effect of a
     // rejecting parser persists, not just SetFileType.
     assert!(
-      json.contains("\"AAC:Channels\": 2"),
+      has_kv(&json, "AAC:Channels", "2"),
       "rejecting parser's pushed tag must persist (no rollback), got: {json}"
     );
     // Reject ⇒ post-loop finalization Error fires (ExifTool.pm:3080,
     // 3093 — `.aac` is a known type).
     assert!(
-      json.contains("\"ExifTool:Error\": \"File format error\""),
+      has_kv(&json, "ExifTool:Error", "\"File format error\""),
       "post-loop finalization Error must fire on candidate-loop exhaustion, got: {json}"
     );
   }
@@ -1586,7 +1618,7 @@ mod tests {
     let meta = extract_info_to_writer("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
     let json = meta.finish();
     // The parser's tag is present (it accepted and pushed it).
-    assert!(json.contains("\"AAC:Channels\": 2"), "got: {json}");
+    assert!(has_kv(&json, "AAC:Channels", "2"), "got: {json}");
     // Accept ⇒ post-loop finalization Error SUPPRESSED: no
     // ExifTool:Error and none of its `$err` strings (ExifTool.pm:3086-
     // 3122). Asserting on the JSON token AND each finalization phrase.
@@ -1727,7 +1759,7 @@ mod tests {
     // on `meta.tags()` directly above; this is the belt-and-braces).
     let json = meta.finish();
     assert!(
-      json.contains("\"File:FileType\": \"AAC\""),
+      has_kv(&json, "File:FileType", "\"AAC\""),
       "serialized File:FileType must be \"AAC\" (candidate 1's value), got: {json}"
     );
     assert!(

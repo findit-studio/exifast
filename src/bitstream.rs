@@ -698,17 +698,20 @@ mod tests {
       "u64::MAX must be the exact decimal (Perl oracle: 18446744073709551615), \
        not -1 (the old u64→i64 sign-flip)"
     );
-    // Serializer: the number gate quotes ≥16-digit integers, exactly as
-    // ExifTool's EscapeJSON (line 3809) emits a big unsigned int.
+    // Serializer (value-semantic): the exact u64::MAX value is preserved.
+    // The numeric STRING `"18446744073709551615"` value-equals the bare
+    // `18446744073709551615`, and both differ from `-1`.
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
+    crate::jsondiff::json_equivalent(
+      &json,
+      r#"[{"SourceFile":"x.test","Test:Field":18446744073709551615}]"#,
+    )
+    .expect("u64::MAX exact value");
     assert!(
-      json.contains("\"Test:Field\": \"18446744073709551615\""),
-      "≥16-digit value must be quoted by the number gate: {json}"
-    );
-    assert!(
-      !json.contains("\"Test:Field\": -1"),
+      crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"x.test","Test:Field":-1}]"#,)
+        .is_err(),
       "must NOT be -1 (the old u64→i64 sign-flip): {json}"
     );
   }
@@ -731,16 +734,16 @@ mod tests {
       TagValue::Str("4.72236648286965e+21".into()),
       "9-byte all-0xFF promotes to NV ⇒ Perl `%.15g` (oracle: 4.72236648286965e+21)"
     );
-    // Number gate accepts scientific: emitted bare (not quoted), like
-    // bundled `perl exiftool -j` emits an NV. The gate's regex
-    // (ExifTool.pm:3809) accepts `4.72236648286965e+21`.
+    // Value-semantic: the NV-string value-equals the bare scientific number
+    // bundled `perl exiftool -j` emits.
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
-    assert!(
-      json.contains("\"Test:Field\": 4.72236648286965e+21"),
-      "NV-string must pass the number gate as a bare JSON number: {json}"
-    );
+    crate::jsondiff::json_equivalent(
+      &json,
+      r#"[{"SourceFile":"x.test","Test:Field":4.72236648286965e+21}]"#,
+    )
+    .expect("NV value-equals the bare scientific number");
   }
 
   #[test]
@@ -798,13 +801,12 @@ mod tests {
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
+    // serde emits the i64 as a bare number; value-equivalent to 65535.
+    crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"x.test","Test:Field":65535}]"#)
+      .expect("small i64 value");
     assert!(
-      json.contains("\"Test:Field\": 65535"),
-      "≤15-digit i64 must be emitted bare (not quoted): {json}"
-    );
-    assert!(
-      !json.contains("\"65535\""),
-      "must NOT be a quoted string: {json}"
+      json.contains("65535") && !json.contains("\"65535\""),
+      "i64 emitted as a bare number, not a quoted string: {json}"
     );
   }
 
@@ -837,10 +839,11 @@ mod tests {
     let mut m_max = Metadata::new("x.test");
     m_max.push(Group::new("Test", "Test"), "Field", got_max);
     let json_max = to_exiftool_json(&m_max);
-    assert!(
-      json_max.contains("\"Test:Field\": \"9223372036854775807\""),
-      "i64::MAX (19 digits) must be quoted by the number gate: {json_max}"
-    );
+    crate::jsondiff::json_equivalent(
+      &json_max,
+      r#"[{"SourceFile":"x.test","Test:Field":9223372036854775807}]"#,
+    )
+    .expect("i64::MAX exact value");
 
     // -- i64::MAX+1 side: val > i64::MAX => TagValue::Str(exact decimal) --
     let data_over = [0x80u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -854,10 +857,12 @@ mod tests {
     let mut m_over = Metadata::new("x.test");
     m_over.push(Group::new("Test", "Test"), "Field", got_over);
     let json_over = to_exiftool_json(&m_over);
-    assert!(
-      json_over.contains("\"Test:Field\": \"9223372036854775808\""),
-      "i64::MAX+1 (19 digits) must be quoted by the number gate: {json_over}"
-    );
+    // The Str holds the exact decimal; value-equals the bare i64::MAX+1.
+    crate::jsondiff::json_equivalent(
+      &json_over,
+      r#"[{"SourceFile":"x.test","Test:Field":9223372036854775808}]"#,
+    )
+    .expect("i64::MAX+1 exact value (no sign-flip)");
   }
 
   // ── process_bit_stream_cond + FrameState (MPEG.pm faithful) ──

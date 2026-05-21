@@ -45,10 +45,19 @@ alloc = ["dep:smol_str", "jiff/alloc"]
 # build skips `std` entirely, exercising the no_std + alloc tier.
 std = ["alloc", "smol_str?/std", "jiff/std", "thiserror/default"]
 
-# CLI JSON emission. `serde_json` allocates; gates `alloc`.
-# `serde` is pulled in here too because `jsondiff` (the JSON-emission diff
-# oracle) uses `serde::de` traits to drive ordered-pair deserialization.
-json = ["alloc", "dep:serde_json", "dep:serde", "jiff/serde"]
+# `serde` enables the OPTIONAL `Serialize` impls on the typed value/Meta
+# types (grouped in anonymous gated `const _` blocks per skill §8). The core
+# typed library (parse_bytes -> AnyMeta with accessors) works WITHOUT serde —
+# this is the serde-free minimal tier. `serde` itself does NOT pull `alloc`;
+# the impls are individually gated where they need heap (`Vec`/`SmolStr`),
+# matching the surrounding type's own gating.
+serde = ["dep:serde", "jiff/serde"]
+
+# CLI JSON emission (byte output via `serde_json`). DEPENDS on `serde` (the
+# `Serialize` impls) and needs `alloc` (`serde_json` + the `Vec<Tag>` engine
+# sink). `jsondiff` (the value-semantic diff oracle) also uses `serde::de`
+# under this feature.
+json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 
 # Umbrella — enables every per-format gate.
 all-formats = [

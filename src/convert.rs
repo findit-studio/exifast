@@ -1197,9 +1197,10 @@ mod tests {
     let mut m = Metadata::new("a.aac");
     m.push(Group::new("Audio", "AAC"), "Channels", v);
     let json = to_exiftool_json(&m);
-    // JSON number `2`, NOT the quoted string `"2"`.
-    assert!(json.contains("\"AAC:Channels\": 2"), "got: {json}");
-    assert!(!json.contains("\"AAC:Channels\": \"2\""), "got: {json}");
+    // serde emits the I64 as a bare JSON number `2`, NOT a quoted string `"2"`.
+    crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"a.aac","AAC:Channels":2}]"#)
+      .expect("Channels=2 numeric value");
+    assert!(!json.contains("\"AAC:Channels\":\"2\""), "got: {json}");
   }
 
   // Faithful to `Image::ExifTool::AIFF` `CompressionType` (AIFF.pm:88-101),

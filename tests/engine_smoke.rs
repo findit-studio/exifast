@@ -22,7 +22,12 @@ fn engine_pipeline_round_trips() {
   m.push(Group::new("File", "System"), "FileType", v);
 
   let json = to_exiftool_json(&m);
-  assert!(json.contains("\"System:FileType\": \"AAC\""));
+  // serde emits standard scalars (no space after `:`); value-equivalent to the
+  // expected document.
+  assert!(
+    json_equivalent(&json, r#"[{"SourceFile":"x.aac","System:FileType":"AAC"}]"#).is_ok(),
+    "got: {json}"
+  );
   // Our diff harness must consider identical output equivalent.
   assert!(json_equivalent(&json, &json).is_ok());
 }

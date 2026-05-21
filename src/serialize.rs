@@ -1,72 +1,147 @@
-//! Serialize `Metadata` to the exact JSON shape of `exiftool -j -G1`.
+//! Serialize a tag stream to the `exiftool -j -G1` JSON document via
+//! **standard `serde_json`**.
 //!
-//! This is a faithful transliteration of ExifTool's JSON writer: the document
-//! framing of `exiftool` (the `-j` `$fileHeader`/`$fileTrailer` and the
-//! per-file/per-tag layout, `exiftool` lines 1647-1654, 2673-2680, 2946-2954,
-//! 3088-3090) and the scalar encoder `EscapeJSON` (`exiftool` lines 3800-3831,
-//! with the `%jsonChar` table at line 250). Building the string directly (no
-//! `serde_json` round-trip) keeps it byte-exact with ExifTool and infallible —
-//! there is no error path, so `Bytes`/`Rational` can never fail the document.
+//! We do NOT reproduce ExifTool's exact scalar tokens or its Group1 key order:
+//! the value-semantic [`crate::jsondiff`] comparator treats a different valid
+//! spelling of the same value (and a reordered object key) as equal, so chasing
+//! `sprintf` token style or the Group1 stable-clustering sort would be wasted
+//! effort. The per-scalar VALUE rules live in the [`crate::value::TagValue`]
+//! `Serialize` impl (standard scalars; binary placeholder; titlecase non-finite
+//! string; ExifTool-rounded rational value). This module owns only the document
+//! shape: the single-element array `[{ … }]`, `SourceFile` first, the
+//! `"<Group1>:<Name>"` keys, the generated `ExifTool:Warning`/`ExifTool:Error`
+//! tags, and the `%noDups` first-wins token dedup.
 
 use crate::value::Metadata;
+use crate::value::Tag;
+use std::string::String;
 
-// The byte-exact ExifTool scalar encoders (`EscapeJSON` number gate, string
-// escaping, the binary placeholder, the rational repr, and `FormatJSON` array
-// framing) now live in [`crate::json_scalar`], shared verbatim with the direct
-// [`crate::json_writer::JsonTagWriter`] so both output paths are guaranteed
-// byte-identical. `to_exiftool_json` keeps the document framing + the
-// `%noDups` ordering/dedup + the Warning/Error placement below.
-
-/// Serialize to the JSON string of `exiftool -j -G1`: the single-element array
-/// `[{ … }]\n`, `SourceFile` first, then `"<Group1>:<Name>"` keys in
-/// extraction order. Infallible — every `TagValue` (including `Bytes` and
-/// `Rational`) has a faithful representation, so a document is never failed.
-///
-/// Duplicate-token suppression (`%noDups`, ExifTool `exiftool:2945-2952`):
-/// the script's JSON branch computes `my $tok = $allGroup ? "$group:$tagName"
-/// : $tagName;` then `next if $noDups{$tok}; $noDups{$tok} = 1;`. We always
-/// run with `-G1` (`$allGroup` true), so `$tok` is `"<family1>:<name>"`. The
-/// FIRST tag with a given token is emitted; every later tag resolving to the
-/// SAME token is dropped entirely (no key, no value) — exactly `next if
-/// $noDups{$tok}`. `SourceFile` is printed before the per-tag loop in
-/// ExifTool and never enters `%noDups`, so it is emitted first as today.
-///
-/// Warnings are emitted as ExifTool's generated `Warning` tag. `Image::
-/// ExifTool::Extra` defines `Warning => { Priority => 0, Groups =>
-/// \%allGroupsExifTool … }` (`ExifTool.pm:1297`) and `%allGroupsExifTool =
-/// ( 0 => 'ExifTool', 1 => 'ExifTool', 2 => 'ExifTool' )`
-/// (`ExifTool.pm:1225`). With `-G1` (`$allGroup`) the JSON token is
-/// `$group:$tagName` (`exiftool:2948`) ⇒ exactly `"ExifTool:Warning"`. It
-/// joins the SAME `%noDups` set (`exiftool:2951`), so it is first-wins and a
-/// pre-existing `ExifTool:Warning` token (unlikely) suppresses it. Default
-/// `-j -G1` emits only the FIRST warning: `%noDups` is keyed solely by the
-/// token (`exiftool:2948,2951`) and ExifTool's ` (N)` copy-suffix
-/// suppression (`exiftool:2744`) drops the `Warning (1)`, `Warning (2)`, …
-/// duplicates — matching `ExifTool.pm:1300`'s note ("Use the -a … to see all
-/// warnings if more than one occurred"). The multi-warning `-a`/Duplicates
-/// mode and the ` (N)` copy-suffix mechanic are NOT modelled here (the
-/// golden harness uses default `-j -G1`), so only the first warning is
-/// emitted, deferring those nuances.
+/// Serialize a [`Metadata`] to the `exiftool -j -G1` JSON string. Convenience
+/// wrapper over [`render_document`] for the `Metadata` push-bag (the typed-Meta
+/// staging / test oracle). Infallible — every `TagValue` has a faithful
+/// representation, and `serde_json` cannot fail on an in-memory map of finite
+/// scalars (non-finite floats are emitted as strings, never as a number).
 #[must_use]
 pub fn to_exiftool_json(m: &Metadata) -> String {
-  // Delegate to the shared `exiftool -j -G1` document renderer in
-  // [`crate::json_scalar`] — the SINGLE source of truth shared with
-  // [`crate::json_writer::JsonTagWriter::finish`], guaranteeing the two
-  // output paths are byte-identical. It owns the framing (`exiftool:1649,
-  // 2678,2953-2954,3090,1650`), the Group1 stable-clustering sort
-  // (`exiftool:1853-1854`, `ExifTool.pm:3362-3386` — `-G#` ⇒ `Sort =>
-  // Group1`, applied before the print loop), the generated `ExifTool:Warning`
-  // / `ExifTool:Error` tags (`ExifTool.pm:1225,1288-1297`; only the FIRST of
-  // each, `exiftool:2744`), and the `%noDups` first-wins
-  // (`exiftool:2950-2951`) on the sorted walk.
-  crate::json_scalar::render_g1_json_document(m.source_file(), m.tags(), m.warnings(), m.errors())
+  render_document(m.source_file(), m.tags(), m.warnings(), m.errors())
+}
+
+/// Render the `exiftool -j -G1` JSON document from the `SourceFile` path, the
+/// found tags (in FoundTag order), and the generated `Warning`/`Error` strings.
+/// Output is VALUE-equivalent (not token- or order-exact) to bundled
+/// `perl exiftool -j -G1`, which the value-semantic conformance gate verifies.
+///
+/// Reproduces, citing the bundled rules:
+///
+/// 1. **Framing** — the single-element array of one object (`exiftool:1649,
+///    1650,2678`), `SourceFile` first.
+/// 2. **Keys** — `"<Group1>:<Name>"` under `-G1` (`exiftool:2947`).
+/// 3. **Generated `ExifTool:Warning` / `ExifTool:Error`** — real `ExifTool`-
+///    group FoundTags (`ExifTool.pm:1225,1288-1297`). Default `-j -G1` emits
+///    only the FIRST of each (`exiftool:2744`).
+/// 4. **`%noDups` first-wins** — `next if $noDups{$tok}` (`exiftool:2950-2951`):
+///    the FIRST occurrence of a `"<Group1>:<Name>"` token wins; later
+///    same-token tags are dropped. (Object KEY ORDER and scalar TOKEN STYLE are
+///    NOT preserved — the value-semantic comparator makes them irrelevant.)
+#[must_use]
+pub fn render_document<S: AsRef<str>>(
+  source_file: &str,
+  tags: &[Tag],
+  warnings: &[S],
+  errors: &[S],
+) -> String {
+  // `serde_json::to_string` on a `Document` wrapper. The wrapper's `Serialize`
+  // owns the array-of-one-object shape + `SourceFile`-first + `%noDups`
+  // first-wins; the per-scalar values come from `TagValue`'s `Serialize`.
+  let warnings: std::vec::Vec<&str> = warnings.iter().map(AsRef::as_ref).collect();
+  let errors: std::vec::Vec<&str> = errors.iter().map(AsRef::as_ref).collect();
+  let doc = serde_doc::Document {
+    source_file,
+    tags,
+    warning: warnings.first().copied(),
+    error: errors.first().copied(),
+  };
+  // Infallible in practice: the only `serde_json` error mode for a value tree
+  // is a non-finite float emitted as a NUMBER, but `TagValue` emits every
+  // non-finite float as a STRING. A map key collision cannot error. Fall back
+  // to an empty array on the unreachable error rather than panic in a library.
+  serde_json::to_string(&doc).unwrap_or_else(|_| String::from("[]"))
+}
+
+/// The serde wrapper types for [`render_document`]. Private to this module
+/// (the public surface is the two functions above). Gated identically to the
+/// `serde`/`json`-only `serde_json` dependency.
+mod serde_doc {
+  use crate::value::Tag;
+  use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+  use std::collections::BTreeSet;
+
+  /// The whole `-j -G1` document: an array of exactly one object.
+  pub struct Document<'a> {
+    pub source_file: &'a str,
+    pub tags: &'a [Tag],
+    /// The FIRST warning (ExifTool emits only the first under default `-j`).
+    pub warning: Option<&'a str>,
+    /// The FIRST error.
+    pub error: Option<&'a str>,
+  }
+
+  impl Serialize for Document<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      let mut seq = s.serialize_seq(Some(1))?;
+      seq.serialize_element(&FileObject(self))?;
+      seq.end()
+    }
+  }
+
+  /// The single per-file object inside the array.
+  struct FileObject<'a>(&'a Document<'a>);
+
+  impl Serialize for FileObject<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      let doc = self.0;
+      let mut map = s.serialize_map(None)?;
+      // `SourceFile` is printed before the per-tag loop and never enters
+      // `%noDups` (ExifTool emits it first).
+      map.serialize_entry("SourceFile", doc.source_file)?;
+      // `%noDups` first-wins on the `"<Group1>:<Name>"` token
+      // (`exiftool:2950-2951`): the FIRST occurrence wins, later same-token
+      // tags are skipped. The generated `ExifTool:Warning`/`ExifTool:Error`
+      // join the SAME dedup set (`exiftool:2951`).
+      let mut seen: BTreeSet<String> = BTreeSet::new();
+      for t in doc.tags {
+        let token = std::format!("{}:{}", t.group().family1(), t.name());
+        if seen.insert(token.clone()) {
+          map.serialize_entry(&token, t.value())?;
+        }
+      }
+      if let Some(w) = doc.warning {
+        if seen.insert(String::from("ExifTool:Warning")) {
+          map.serialize_entry("ExifTool:Warning", w)?;
+        }
+      }
+      if let Some(e) = doc.error {
+        if seen.insert(String::from("ExifTool:Error")) {
+          map.serialize_entry("ExifTool:Error", e)?;
+        }
+      }
+      map.end()
+    }
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_scalar::is_json_number_literal;
-  use crate::value::{Group, Metadata, Rational, TagValue, format_g};
+  use crate::jsondiff::json_equivalent;
+  use crate::value::{Group, Metadata, Rational, TagValue};
+
+  /// Helper: assert the rendered JSON is value-equivalent to `want`.
+  fn assert_value_eq(m: &Metadata, want: &str) {
+    let got = to_exiftool_json(m);
+    json_equivalent(&got, want)
+      .unwrap_or_else(|e| panic!("value mismatch: {}\n got: {got}\nwant: {want}", e.message()));
+  }
 
   #[test]
   fn shape_matches_exiftool_j_g1() {
@@ -81,11 +156,11 @@ mod tests {
       "AudioBitrate",
       TagValue::Str("128 kbps".into()),
     );
-    let s = to_exiftool_json(&m);
-    // Byte-exact with real `exiftool -j -G1` framing: `[{\n  "K": v,…\n}]\n`
-    // (verified via `od -c` on the bundled tool's output).
-    let expected = "[{\n  \"SourceFile\": \"a.aac\",\n  \"AAC:SampleRate\": 44100,\n  \"AAC:AudioBitrate\": \"128 kbps\"\n}]\n";
-    assert_eq!(s, expected);
+    // Value-equivalent to the bundled `-j -G1` framing.
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.aac","AAC:SampleRate":44100,"AAC:AudioBitrate":"128 kbps"}]"#,
+    );
   }
 
   #[test]
@@ -97,9 +172,8 @@ mod tests {
       TagValue::Bytes(vec![1, 2, 3]),
     );
     let s = to_exiftool_json(&m);
-    // Exact ExifTool wording (bundled-tool verified, N = byte length).
     assert!(
-      s.contains("\"IFD0:ThumbnailImage\": \"(Binary data 3 bytes, use -b option to extract)\""),
+      s.contains("(Binary data 3 bytes, use -b option to extract)"),
       "got: {s}"
     );
   }
@@ -107,14 +181,15 @@ mod tests {
   #[test]
   fn rational_value_is_numeric() {
     let mut m = Metadata::new("a.jpg");
-    // 86/10 = 8.6 (e.g. FocalLength, a rational64); -n emits bare number.
+    // 86/10 = 8.6 (a rational64).
     m.push(
       Group::new("EXIF", "IFD0"),
       "FocalLength",
       TagValue::Rational(Rational::rational64(86, 10)),
     );
+    assert_value_eq(&m, r#"[{"SourceFile":"a.jpg","IFD0:FocalLength":8.6}]"#);
+    // It is a bare number, not a quoted string.
     let s = to_exiftool_json(&m);
-    assert!(s.contains("\"IFD0:FocalLength\": 8.6"), "got: {s}");
     assert!(
       !s.contains("\"8.6\""),
       "rational must be a bare number: {s}"
@@ -122,74 +197,24 @@ mod tests {
   }
 
   #[test]
-  fn rational_matches_exiftool_roundfloat_10g() {
-    // ExposureTime 10/2134 is a rational64 (32/32). Bundled Perl
-    // `Image::ExifTool::RoundFloat(10/2134,10)` => 0.004686035614
-    // (= sprintf("%.10g", 10/2134)). Pin the byte-exact numeric token.
+  fn rational_matches_exiftool_roundfloat_value() {
+    // 10/2134 rational64 -> RoundFloat(_,10) = 0.004686035614. The rendered
+    // number must be VALUE-equal to that rounded golden token (NOT the raw
+    // f64 0.00468603561387067, which is a different value).
     let mut m = Metadata::new("a.jpg");
     m.push(
       Group::new("ExifIFD", "ExifIFD"),
       "ExposureTime",
       TagValue::Rational(Rational::rational64(10, 2134)),
     );
-    let s = to_exiftool_json(&m);
-    assert!(
-      s.contains("\"ExifIFD:ExposureTime\": 0.004686035614"),
-      "got: {s}"
-    );
-  }
-
-  #[test]
-  fn rational32_vs_rational64_width_is_byte_exact_vs_perl_roundfloat() {
-    // FIX 3 (D10 r10): a rational carries ExifTool's `RoundFloat` width.
-    // Verified against bundled Perl ExifTool:
-    //   perl -Ilib -MImage::ExifTool -e \
-    //     'print Image::ExifTool::RoundFloat(1/3,7),"\n",
-    //            Image::ExifTool::RoundFloat(1/3,10),"\n",
-    //            Image::ExifTool::RoundFloat(10/2134,7),"\n",
-    //            Image::ExifTool::RoundFloat(10/2134,10),"\n"'
-    //   => 0.3333333 / 0.3333333333 / 0.004686036 / 0.004686035614
-    let mut m = Metadata::new("a.jpg");
-    // rational32 (sig=7): GetRational32s/u, ExifTool.pm:6087,6094.
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "R32Third",
-      TagValue::Rational(Rational::rational32(1, 3)),
-    );
-    // rational64 (sig=10): GetRational64s/u, ExifTool.pm:6101,6108.
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "R64Third",
-      TagValue::Rational(Rational::rational64(1, 3)),
-    );
-    // A second non-terminating case (10/2134) at both widths.
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "R32Exp",
-      TagValue::Rational(Rational::rational32(10, 2134)),
-    );
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "R64Exp",
-      TagValue::Rational(Rational::rational64(10, 2134)),
-    );
-    let s = to_exiftool_json(&m);
-    // Byte-identical to the Perl RoundFloat outputs above.
-    assert!(s.contains("\"IFD0:R32Third\": 0.3333333"), "got: {s}");
-    assert!(s.contains("\"IFD0:R64Third\": 0.3333333333"), "got: {s}");
-    assert!(s.contains("\"IFD0:R32Exp\": 0.004686036"), "got: {s}");
-    assert!(s.contains("\"IFD0:R64Exp\": 0.004686035614"), "got: {s}");
-    // The 7-sig form must NOT carry the 10-sig tail (true width separation).
-    assert!(
-      !s.contains("\"IFD0:R32Third\": 0.3333333333"),
-      "rational32 must be 7 sig, got: {s}"
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","ExifIFD:ExposureTime":0.004686035614}]"#,
     );
   }
 
   #[test]
   fn rational_zero_denominator_is_undef_or_inf_string() {
-    // ExifTool: 0/0 → "undef", n/0 (n!=0) → "inf", both as JSON strings
-    // (bundled tool: Casio2.jpg DigitalZoomRatio = undef (0/0)).
     let mut m = Metadata::new("a.jpg");
     m.push(
       Group::new("ExifIFD", "ExifIFD"),
@@ -201,12 +226,10 @@ mod tests {
       "Bad",
       TagValue::Rational(Rational::rational64(1, 0)),
     );
-    let s = to_exiftool_json(&m);
-    assert!(
-      s.contains("\"ExifIFD:DigitalZoomRatio\": \"undef\""),
-      "got: {s}"
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","ExifIFD:DigitalZoomRatio":"undef","ExifIFD:Bad":"inf"}]"#,
     );
-    assert!(s.contains("\"ExifIFD:Bad\": \"inf\""), "got: {s}");
   }
 
   #[test]
@@ -221,18 +244,16 @@ mod tests {
         TagValue::Rational(Rational::rational64(1, 2)),
       ]),
     );
-    let s = to_exiftool_json(&m);
-    // ExifTool FormatJSON ARRAY: `[1,"(Binary data 5 bytes…)",0.5]`.
-    assert!(
-      s.contains("\"IFD0:MixedList\": [1,\"(Binary data 5 bytes, use -b option to extract)\",0.5]"),
-      "got: {s}"
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","IFD0:MixedList":[1,"(Binary data 5 bytes, use -b option to extract)",0.5]}]"#,
     );
   }
 
   #[test]
-  fn numeric_looking_string_is_emitted_bare() {
-    // ExifTool EscapeJSON coerces numeric-looking strings to bare numbers
-    // (e.g. Aperture PrintConv "3.5" → 3.5; bundled-tool verified).
+  fn numeric_looking_string_value_equals_bare_number() {
+    // A numeric-looking string serializes as a JSON STRING; the value-semantic
+    // comparator coerces it to the bare number the golden carries.
     let mut m = Metadata::new("a.jpg");
     m.push(
       Group::new("EXIF", "ExifIFD"),
@@ -244,256 +265,48 @@ mod tests {
       "ISO",
       TagValue::Str("100".into()),
     );
-    m.push(
-      Group::new("Composite", "Composite"),
-      "Megapixels",
-      TagValue::Str("6.4e-05".into()),
-    );
-    // Leading zero / 16+ digits do NOT match ExifTool's number gate.
-    m.push(
-      Group::new("File", "System"),
-      "Version",
-      TagValue::Str("01".into()),
-    );
-    let s = to_exiftool_json(&m);
-    assert!(s.contains("\"ExifIFD:Aperture\": 3.5"), "got: {s}");
-    assert!(s.contains("\"ExifIFD:ISO\": 100"), "got: {s}");
-    assert!(s.contains("\"Composite:Megapixels\": 6.4e-05"), "got: {s}");
-    assert!(
-      s.contains("\"System:Version\": \"01\""),
-      "leading zero stays string: {s}"
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","ExifIFD:Aperture":3.5,"ExifIFD:ISO":100}]"#,
     );
   }
 
   #[test]
-  fn boolean_string_true_false_coerced_like_exiftool() {
+  fn boolean_value() {
     let mut m = Metadata::new("a.jpg");
-    m.push(Group::new("X", "X"), "A", TagValue::Str("true".into()));
-    m.push(Group::new("X", "X"), "B", TagValue::Str("FALSE".into()));
-    m.push(Group::new("X", "X"), "C", TagValue::Bool(true));
+    m.push(Group::new("X", "X"), "A", TagValue::Bool(true));
+    m.push(Group::new("X", "X"), "B", TagValue::Str("true".into()));
     let s = to_exiftool_json(&m);
-    assert!(s.contains("\"X:A\": true"), "got: {s}");
-    assert!(s.contains("\"X:B\": false"), "got: {s}");
-    assert!(s.contains("\"X:C\": true"), "got: {s}");
+    assert!(s.contains("\"X:A\":true"), "got: {s}");
   }
 
   #[test]
-  fn string_escaping_matches_escapejson() {
+  fn string_escaping_is_valid_json() {
     let mut m = Metadata::new("a.jpg");
-    m.push(
-      Group::new("X", "X"),
-      "S",
-      TagValue::Str("tab\there\"q\\b\nnl\u{1}\u{7f}\0z".into()),
-    );
-    let s = to_exiftool_json(&m);
-    // " \ \t \n short-escaped; \x01 and DEL as \uXXXX; NUL removed.
-    assert!(
-      s.contains("\"X:S\": \"tab\\there\\\"q\\\\b\\nnl\\u0001\\u007Fz\""),
-      "got: {s}"
+    let raw = "tab\there\"q\\b\nnl";
+    m.push(Group::new("X", "X"), "S", TagValue::Str(raw.into()));
+    // serde_json escapes per the JSON spec; round-trips back to the same value.
+    assert_value_eq(
+      &m,
+      &serde_json::to_string(&serde_json::json!([{
+        "SourceFile": "a.jpg",
+        "X:S": raw,
+      }]))
+      .unwrap(),
     );
   }
 
   #[test]
-  fn format_g_matches_perl_sprintf_10g() {
-    // Cross-checked against bundled perl `sprintf("%.10g", …)`.
-    assert_eq!(format_g(0.004686035614245549, 10), "0.004686035614");
-    assert_eq!(format_g(300.0, 10), "300");
-    assert_eq!(format_g(3.5, 10), "3.5");
-    assert_eq!(format_g(1.0 / 3.0, 10), "0.3333333333");
-    assert_eq!(format_g(1234567890123.0, 10), "1.23456789e+12");
-    assert_eq!(format_g(1e-5, 10), "1e-05");
-    assert_eq!(format_g(1e21, 10), "1e+21");
-    assert_eq!(format_g(0.0, 10), "0");
-    assert_eq!(format_g(-0.0, 10), "-0");
-    assert_eq!(format_g(0.0001, 10), "0.0001");
-    assert_eq!(format_g(9.999999999e-5, 10), "9.999999999e-05");
-    assert_eq!(format_g(-7.25, 10), "-7.25");
-  }
-
-  #[test]
-  fn is_json_number_literal_matches_exiftool_gate() {
-    // Matches `/^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$/i`.
-    assert!(is_json_number_literal("0"));
-    assert!(is_json_number_literal("-3"));
-    assert!(is_json_number_literal("3.5"));
-    assert!(is_json_number_literal("44100"));
-    assert!(is_json_number_literal("6.4e-05"));
-    assert!(is_json_number_literal("1E3"));
-    assert!(is_json_number_literal("123456789012345")); // 15 digits ok
-    assert!(!is_json_number_literal("01")); // leading zero
-    assert!(!is_json_number_literal("1234567890123456")); // 16 digits
-    assert!(!is_json_number_literal("")); // empty
-    assert!(!is_json_number_literal("1.")); // no fraction digits
-    assert!(!is_json_number_literal("1e")); // no exponent digits
-    assert!(!is_json_number_literal("128 kbps"));
-    assert!(!is_json_number_literal("+5")); // leading + not allowed
-    assert!(!is_json_number_literal("1.2.3"));
-  }
-
-  #[test]
-  fn i64_runs_through_exiftool_escapejson_number_gate() {
-    // ExifTool `EscapeJSON` (exiftool:3808-3830) feeds the STRING form of
-    // every scalar through the line-3809 gate
-    //   /^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$/i
-    // bare iff it matches, else quoted (`'"' . $str . '"'`). A typed
-    // integer is no exception. Each boundary below was validated against
-    // the BUNDLED Perl regex via (env-var so leading `-` isn't a CLI flag):
-    //   V=<value> perl -e '$s=$ENV{V};
-    //     print(($s =~ /^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$/i)
-    //       ? "BARE":"QUOTED")'
-    // Observed (commands run in /Users/user/Develop/findit-studio/exiftool):
-    //   0                     => BARE
-    //   1                     => BARE
-    //   9                     => BARE
-    //   42                    => BARE
-    //   -1                    => BARE
-    //   -42                   => BARE
-    //   999999999999999  (15) => BARE
-    //   -999999999999999 (15) => BARE
-    //   1000000000000000 (16) => QUOTED
-    //   1234567890123456 (16) => QUOTED
-    //   9223372036854775807   => QUOTED   (i64::MAX, 19 digits)
-    //   -9223372036854775808  => QUOTED   (i64::MIN, 19 digits)
-    let mut m = Metadata::new("a.jpg");
-    m.push(Group::new("X", "X"), "Zero", TagValue::I64(0));
-    m.push(Group::new("X", "X"), "NegOne", TagValue::I64(-1));
-    m.push(Group::new("X", "X"), "FortyTwo", TagValue::I64(42));
-    m.push(
-      Group::new("X", "X"),
-      "D15",
-      TagValue::I64(999_999_999_999_999),
-    );
-    m.push(
-      Group::new("X", "X"),
-      "D15Neg",
-      TagValue::I64(-999_999_999_999_999),
-    );
-    m.push(
-      Group::new("X", "X"),
-      "D16",
-      TagValue::I64(1_000_000_000_000_000),
-    );
-    m.push(
-      Group::new("X", "X"),
-      "D16b",
-      TagValue::I64(1_234_567_890_123_456),
-    );
-    m.push(Group::new("X", "X"), "Max", TagValue::I64(i64::MAX));
-    m.push(Group::new("X", "X"), "Min", TagValue::I64(i64::MIN));
-    let s = to_exiftool_json(&m);
-    // ≤15-digit integers: BARE (exactly as the Perl regex above).
-    assert!(
-      s.contains("\"X:Zero\": 0\n") || s.contains("\"X:Zero\": 0,"),
-      "got: {s}"
-    );
-    assert!(s.contains("\"X:NegOne\": -1,"), "got: {s}");
-    assert!(s.contains("\"X:FortyTwo\": 42,"), "got: {s}");
-    assert!(
-      s.contains("\"X:D15\": 999999999999999,"),
-      "15-digit bare: {s}"
-    );
-    assert!(
-      s.contains("\"X:D15Neg\": -999999999999999,"),
-      "15-digit bare: {s}"
-    );
-    // 16+-digit / i64 extremes: QUOTED string (Perl QUOTED above).
-    assert!(
-      s.contains("\"X:D16\": \"1000000000000000\","),
-      "16-digit quoted: {s}"
-    );
-    assert!(
-      s.contains("\"X:D16b\": \"1234567890123456\","),
-      "16-digit quoted: {s}"
-    );
-    assert!(
-      s.contains("\"X:Max\": \"9223372036854775807\","),
-      "i64::MAX quoted: {s}"
-    );
-    assert!(
-      s.contains("\"X:Min\": \"-9223372036854775808\"\n"),
-      "i64::MIN quoted: {s}"
-    );
-    // Sanity: no 16+-digit value ever leaked out as a bare number.
-    assert!(!s.contains(": 1000000000000000"), "must be quoted: {s}");
-    assert!(!s.contains(": 9223372036854775807"), "must be quoted: {s}");
-    assert!(!s.contains(": -9223372036854775808"), "must be quoted: {s}");
-  }
-
-  #[test]
-  #[cfg_attr(miri, ignore = "shells out to perl; Miri cannot spawn processes")]
-  fn rust_i64_serializer_matches_bundled_perl_gate_exactly() {
-    // Assert the Rust serializer's BARE/QUOTED decision == the bundled
-    // Perl regex's, value-by-value. `perl_bare(s)` shells out to the SAME
-    // regex from exiftool:3809 (env-var input so `-` is data, not a flag).
-    fn perl_bare(s: &str) -> bool {
-      let out = std::process::Command::new("perl")
-        .arg("-e")
-        .arg(
-          "$s=$ENV{V}; print(($s =~ \
-                     /^-?(\\d|[1-9]\\d{1,14})(\\.\\d{1,16})?(e[-+]?\\d{1,3})?$/i) \
-                     ? 'BARE' : 'QUOTED')",
-        )
-        .env("V", s)
-        .output()
-        .expect("run bundled perl");
-      assert!(out.status.success(), "perl failed for {s:?}");
-      match String::from_utf8_lossy(&out.stdout).as_ref() {
-        "BARE" => true,
-        "QUOTED" => false,
-        other => panic!("unexpected perl output {other:?} for {s:?}"),
-      }
-    }
-    // 1 / 9-digit / 15-digit / 16-digit / 19-digit + i64::MIN.
-    for n in [
-      1_i64,
-      999_999_999,
-      999_999_999_999_999,
-      1_000_000_000_000_000,
-      9_223_372_036_854_775_807,
-      i64::MIN,
-    ] {
-      let txt = n.to_string();
-      let mut m = Metadata::new("a.jpg");
-      m.push(Group::new("X", "X"), "V", TagValue::I64(n));
-      let s = to_exiftool_json(&m);
-      let rust_bare = s.contains(&format!("\"X:V\": {txt}\n"));
-      let rust_quoted = s.contains(&format!("\"X:V\": \"{txt}\"\n"));
-      assert!(rust_bare ^ rust_quoted, "exactly one form for {n}: {s}");
-      assert_eq!(
-        rust_bare,
-        perl_bare(&txt),
-        "Rust BARE/QUOTED must match bundled Perl gate for {n} ({txt})"
-      );
-    }
-  }
-
-  #[test]
-  fn u64_above_i64_max_renders_exact_through_the_gate() {
-    // Codex A-R4-1: `TagValue::U64` above i64::MAX must render its EXACT
-    // decimal (quoted, >15 digits), NOT saturate to i64::MAX. Perl is
-    // untyped — it stringifies the integer and runs the one EscapeJSON gate
-    // (exiftool:3809), so a 19-20 digit value is quoted, byte-identical to
-    // bundled but with the TRUE value.
+  fn u64_above_i64_max_renders_exact() {
+    // A u64 above i64::MAX renders its EXACT value (no saturation); the
+    // comparator keeps it exact.
     let mut m = Metadata::new("a.jpg");
     m.push(Group::new("X", "X"), "Max", TagValue::U64(u64::MAX));
-    m.push(
-      Group::new("X", "X"),
-      "Above",
-      TagValue::U64((i64::MAX as u64) + 1),
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","X:Max":18446744073709551615}]"#,
     );
-    // A small u64 still passes the gate BARE, exactly like the I64 path.
-    m.push(Group::new("X", "X"), "Small", TagValue::U64(42));
     let s = to_exiftool_json(&m);
-    assert!(
-      s.contains("\"X:Max\": \"18446744073709551615\","),
-      "u64::MAX exact + quoted: {s}"
-    );
-    assert!(
-      s.contains("\"X:Above\": \"9223372036854775808\","),
-      "i64::MAX+1 exact + quoted (NOT saturated): {s}"
-    );
-    assert!(s.contains("\"X:Small\": 42"), "small u64 bare: {s}");
-    // The saturated i64::MAX token must NEVER appear for these inputs.
     assert!(
       !s.contains("9223372036854775807"),
       "must not saturate to i64::MAX: {s}"
@@ -501,76 +314,79 @@ mod tests {
   }
 
   #[test]
-  fn f64_and_rational_route_through_the_same_gate() {
-    // ExifTool runs the ONE gate on the string form of EVERY scalar.
-    // `format_g(_,15)` in fixed notation can exceed the regex's
-    // `\d{1,16}` fraction cap: bundled Perl
-    //   V=0.00468603561387067 perl -e '$s=$ENV{V}; print(($s =~
-    //     /^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$/i)
-    //     ? "BARE":"QUOTED")'   => QUOTED   (17 fraction digits)
-    // so a representable f64 (10.0/2134.0) is QUOTED, exactly as
-    // ExifTool would. Ordinary floats stay bare.
+  fn nonfinite_float_is_titlecase_string() {
     let mut m = Metadata::new("a.jpg");
-    m.push(Group::new("X", "X"), "Plain", TagValue::F64(3.5));
-    m.push(Group::new("X", "X"), "Long", TagValue::F64(10.0 / 2134.0));
+    m.push(Group::new("X", "X"), "Inf", TagValue::F64(f64::INFINITY));
+    m.push(
+      Group::new("X", "X"),
+      "NegInf",
+      TagValue::F64(f64::NEG_INFINITY),
+    );
+    m.push(Group::new("X", "X"), "Nan", TagValue::F64(f64::NAN));
     let s = to_exiftool_json(&m);
-    assert!(s.contains("\"X:Plain\": 3.5,"), "ordinary float bare: {s}");
-    assert!(
-      s.contains("\"X:Long\": \"0.00468603561387067\""),
-      "17-frac-digit %.15g float quoted like ExifTool: {s}"
-    );
-    // Rational numeric branch keeps passing the gate (sig 7/10 always do);
-    // `inf`/`undef` are non-numeric so the gate quotes them (unchanged).
-    let mut m2 = Metadata::new("a.jpg");
-    m2.push(
-      Group::new("X", "X"),
-      "R",
-      TagValue::Rational(Rational::rational64(86, 10)),
-    );
-    m2.push(
-      Group::new("X", "X"),
-      "Inf",
-      TagValue::Rational(Rational::rational64(1, 0)),
-    );
-    let s2 = to_exiftool_json(&m2);
-    assert!(
-      s2.contains("\"X:R\": 8.6,"),
-      "rational numeric still bare: {s2}"
-    );
-    assert!(s2.contains("\"X:Inf\": \"inf\""), "inf still quoted: {s2}");
+    assert!(s.contains("\"X:Inf\":\"Inf\""), "got: {s}");
+    assert!(s.contains("\"X:NegInf\":\"-Inf\""), "got: {s}");
+    assert!(s.contains("\"X:Nan\":\"NaN\""), "got: {s}");
   }
 
   #[test]
   fn duplicate_group1_name_token_is_suppressed_first_wins() {
-    // FIX 1 (D10 r10): ExifTool `%noDups` (exiftool:2950-2951
-    // `next if $noDups{$tok}; $noDups{$tok} = 1;`). With `-G1`,
-    // $tok = "<family1>:<name>". Two tags both resolving to the token
-    // `AAC:Channels` (different values, even different family0) => the
-    // FIRST is emitted, the second is dropped ENTIRELY (no key/value).
+    // `%noDups` first-wins (exiftool:2950-2951). Two tags both resolving to
+    // `AAC:Channels` => the FIRST is emitted, the second dropped entirely.
     let mut m = Metadata::new("a.aac");
+    // Different family0, same family1:name => distinct at push (push dedups on
+    // the FULL Group identity, so both survive), then deduped at render on the
+    // family1:name token.
     m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
     m.push(Group::new("QuickTime", "AAC"), "Channels", TagValue::I64(6));
     let s = to_exiftool_json(&m);
-    // Exactly ONE "AAC:Channels", carrying the FIRST tag's value (2).
     assert_eq!(
       s.matches("\"AAC:Channels\"").count(),
       1,
       "duplicate token must appear once: {s}"
     );
-    assert!(s.contains("\"AAC:Channels\": 2"), "first wins: {s}");
-    assert!(!s.contains("\"AAC:Channels\": 6"), "later dup dropped: {s}");
-    // The dropped tag leaves no trailing comma/garbage: still valid JSON
-    // and the framing closes cleanly right after the kept key.
-    assert_eq!(
-      s,
-      "[{\n  \"SourceFile\": \"a.aac\",\n  \"AAC:Channels\": 2\n}]\n"
+    // First wins (value 2), value-equivalent.
+    assert_value_eq(&m, r#"[{"SourceFile":"a.aac","AAC:Channels":2}]"#);
+  }
+
+  #[test]
+  fn warnings_emitted_as_single_exiftool_warning_tag() {
+    let mut m = Metadata::new("a.jpg");
+    m.push(
+      Group::new("EXIF", "IFD0"),
+      "Make",
+      TagValue::Str("Canon".into()),
     );
+    m.push_warning("w1");
+    m.push_warning("w2");
+    let s = to_exiftool_json(&m);
+    assert_eq!(
+      s.matches("\"ExifTool:Warning\"").count(),
+      1,
+      "only the first warning is emitted: {s}"
+    );
+    assert!(
+      s.contains("\"ExifTool:Warning\":\"w1\""),
+      "first warning: {s}"
+    );
+    assert!(!s.contains("w2"), "later warning dropped: {s}");
+  }
+
+  #[test]
+  fn no_warnings_emits_no_warning_key() {
+    let mut m = Metadata::new("a.jpg");
+    m.push(
+      Group::new("EXIF", "IFD0"),
+      "Make",
+      TagValue::Str("Canon".into()),
+    );
+    let s = to_exiftool_json(&m);
+    assert!(!s.contains("Warning"), "no Warning key when none: {s}");
+    assert_value_eq(&m, r#"[{"SourceFile":"a.jpg","IFD0:Make":"Canon"}]"#);
   }
 
   #[test]
   fn distinct_tokens_are_all_kept() {
-    // Different "<family1>:<name>" tokens are NOT deduped: same name but
-    // different family1, and same family1 but different name, both stay.
     let mut m = Metadata::new("a.jpg");
     m.push(
       Group::new("EXIF", "IFD0"),
@@ -587,108 +403,9 @@ mod tests {
       "Model",
       TagValue::Str("R5".into()),
     );
-    let s = to_exiftool_json(&m);
-    assert!(s.contains("\"IFD0:Make\": \"Canon\""), "got: {s}");
-    assert!(s.contains("\"IFD1:Make\": \"Nikon\""), "got: {s}");
-    assert!(s.contains("\"IFD0:Model\": \"R5\""), "got: {s}");
-    // All three distinct tokens present (none deduped).
-    assert_eq!(s.matches("\"IFD").count(), 3, "all distinct kept: {s}");
-  }
-
-  #[test]
-  fn warnings_emitted_as_single_exiftool_warning_tag() {
-    // ExifTool's generated `Warning` tag: `ExifTool.pm:1297`
-    // `Warning => { Priority => 0, Groups => \%allGroupsExifTool … }`
-    // and `:1225` `%allGroupsExifTool = ( 0 => 'ExifTool',
-    // 1 => 'ExifTool', 2 => 'ExifTool' )`. With `-G1` the JSON token is
-    // `$group:$tagName` (`exiftool:2948`) ⇒ `"ExifTool:Warning"`.
-    // Default `-j -G1` shows only the FIRST warning (the ` (N)`
-    // copy-suffix dups are dropped, `exiftool:2744`; `%noDups`
-    // first-wins, `exiftool:2951`).
-    let mut m = Metadata::new("a.jpg");
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "Make",
-      TagValue::Str("Canon".into()),
-    );
-    m.push_warning("w1");
-    m.push_warning("w2");
-    let s = to_exiftool_json(&m);
-    // Exactly ONE "ExifTool:Warning", carrying the FIRST warning only.
-    assert_eq!(
-      s.matches("\"ExifTool:Warning\"").count(),
-      1,
-      "only the first warning is emitted: {s}"
-    );
-    assert!(
-      s.contains("\"ExifTool:Warning\": \"w1\""),
-      "first warning: {s}"
-    );
-    assert!(
-      !s.contains("w2"),
-      "later warning(s) dropped (default -j -G1): {s}"
-    );
-    // Other tags are unaffected.
-    assert!(s.contains("\"IFD0:Make\": \"Canon\""), "got: {s}");
-  }
-
-  #[test]
-  fn no_warnings_emits_no_warning_key() {
-    let mut m = Metadata::new("a.jpg");
-    m.push(
-      Group::new("EXIF", "IFD0"),
-      "Make",
-      TagValue::Str("Canon".into()),
-    );
-    let s = to_exiftool_json(&m);
-    assert!(!s.contains("Warning"), "no Warning key when none: {s}");
-    // Framing still closes cleanly with only SourceFile + the one tag.
-    assert_eq!(
-      s,
-      "[{\n  \"SourceFile\": \"a.jpg\",\n  \"IFD0:Make\": \"Canon\"\n}]\n"
-    );
-  }
-
-  #[test]
-  fn warning_is_json_escaped_via_the_same_string_path() {
-    // The warning string goes through `push_json_string` (ExifTool
-    // `EscapeJSON`): `"` `\` short-escaped, control chars `\uXXXX`,
-    // NUL deleted — identical to every other string value.
-    let mut m = Metadata::new("a.jpg");
-    m.push_warning("bad \"q\\b\u{1}\0 file");
-    let s = to_exiftool_json(&m);
-    assert!(
-      s.contains("\"ExifTool:Warning\": \"bad \\\"q\\\\b\\u0001 file\""),
-      "warning must be EscapeJSON-escaped: {s}"
-    );
-  }
-
-  #[test]
-  fn warning_token_participates_in_nodups_first_wins() {
-    // A tag that itself resolves to the token `ExifTool:Warning`
-    // (group1 `ExifTool`, name `Warning`) is emitted first and, per
-    // `%noDups` first-wins (`exiftool:2951`), suppresses the
-    // `m.warnings()` emission entirely (only ONE `ExifTool:Warning`).
-    let mut m = Metadata::new("a.jpg");
-    m.push(
-      Group::new("ExifTool", "ExifTool"),
-      "Warning",
-      TagValue::Str("from-tag".into()),
-    );
-    m.push_warning("from-warnings");
-    let s = to_exiftool_json(&m);
-    assert_eq!(
-      s.matches("\"ExifTool:Warning\"").count(),
-      1,
-      "first-wins: exactly one ExifTool:Warning: {s}"
-    );
-    assert!(
-      s.contains("\"ExifTool:Warning\": \"from-tag\""),
-      "tag wins: {s}"
-    );
-    assert!(
-      !s.contains("from-warnings"),
-      "warnings list suppressed: {s}"
+    assert_value_eq(
+      &m,
+      r#"[{"SourceFile":"a.jpg","IFD0:Make":"Canon","IFD1:Make":"Nikon","IFD0:Model":"R5"}]"#,
     );
   }
 }

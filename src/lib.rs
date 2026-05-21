@@ -92,19 +92,12 @@ pub mod formats;
 // the `json` feature (spec §4: `json = ["alloc", "dep:serde_json", "dep:serde", ...]`).
 // Library callers without `json` get the typed-Meta API path only; CLI
 // JSON emission requires the feature.
-// `json_scalar` builds the per-scalar JSON lexemes by hand (no `serde_json`),
-// so it needs only `alloc` (String/format!), NOT the serde-pulling `json`
-// feature. Gated on `alloc` because [`json_writer`] — the engine's mandatory
-// `$$et` value sink after task #124 — depends on it, and the engine
-// (parser + format modules) is always compiled.
-#[cfg(feature = "alloc")]
-pub mod json_scalar;
-// The direct typed-Meta → JSON `TagWriter` and the engine's `$$et` value sink
-// (task #124). Reuses the byte-exact scalar encoders in [`json_scalar`] so it
-// is byte-identical to the `Metadata`→JSON `serialize` path. Builds its JSON
-// string directly (no `serde_json`), so it is gated on `alloc` rather than the
-// serde-pulling `json` feature: the always-compiled parser/format engine now
-// emits through it, so it must be available in every engine build.
+// The engine's `$$et` value sink: a `TagWriter` that buffers a `Vec<Tag>`
+// (cross-format `$$et` state, FoundTag last-wins, family0-override). Gated on
+// `alloc` because the always-compiled parser/format engine emits through it.
+// Its terminal `finish()` render is `json`-gated (standard `serde_json` via
+// [`serialize::render_document`]) — the COLLECTION surface is serde-free; only
+// the final JSON render needs `json`.
 #[cfg(feature = "alloc")]
 pub mod json_writer;
 #[cfg(feature = "json")]
@@ -577,12 +570,18 @@ mod tests {
     let mut w = JsonTagWriter::new("ogg_id3_prefixed.ogg");
     meta.sink(true, &mut w).expect("sink is infallible");
     let json = w.finish();
-    assert!(
-      json.contains("\"Vorbis:Artist\": \"Who Knows\""),
+    // serde emits keys without a space after `:`; check by value via the
+    // parsed document (the key tokens themselves are spacing-independent).
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let obj = doc[0].as_object().expect("file object");
+    assert_eq!(
+      obj.get("Vorbis:Artist").and_then(|v| v.as_str()),
+      Some("Who Knows"),
       "post-ID3 Ogg-Vorbis tags must be present: {json}"
     );
-    assert!(
-      json.contains("\"Vorbis:Title\": \"A 4s sample for testing embedded cover art\""),
+    assert_eq!(
+      obj.get("Vorbis:Title").and_then(|v| v.as_str()),
+      Some("A 4s sample for testing embedded cover art"),
       "post-ID3 Ogg-Vorbis Title must be present: {json}"
     );
   }

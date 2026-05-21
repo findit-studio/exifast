@@ -1,52 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
-//! [`JsonTagWriter`] — a [`TagWriter`] that emits bundled-`exiftool -j -G1`
-//! JSON DIRECTLY from a typed `Meta`'s [`MetaSinker::sink`] stream, with no
-//! intermediate [`crate::value::Metadata`] push-bag.
+//! [`JsonTagWriter`] — a [`TagWriter`] that buffers a typed `Meta`'s
+//! [`MetaSinker::sink`] emission stream as a `Vec<Tag>`, then renders the
+//! `exiftool -j -G1` JSON via standard `serde_json`.
 //!
-//! Task #124 made this the engine's `$$et` value sink: the CLI JSON path is
-//! now `Meta` → [`crate::parser_new::MetaSinker::sink`] → `JsonTagWriter` →
-//! [`JsonTagWriter::finish`]. `JsonTagWriter` collapses what was previously a
-//! `Metadata` push-bag + [`crate::serialize::to_exiftool_json`] render into a
-//! single writer, dropping the `Metadata` push-bag from the OUTPUT path
-//! entirely (`Metadata` + `to_exiftool_json` survive only as the test
-//! byte-exactness oracle and as internal staging — e.g. Ogg comments).
+//! It is the engine's `$$et` value sink: the CLI JSON path is `Meta` →
+//! [`crate::parser_new::MetaSinker::sink`] → `JsonTagWriter` →
+//! [`JsonTagWriter::finish`]. The COLLECTION surface (`push`, `sink`,
+//! `records`, the `$$et` flags) is serde-free (`alloc`); the terminal
+//! [`finish`](JsonTagWriter::finish) render is `json`-gated and delegates to
+//! [`crate::serialize::render_document`] (the single document renderer shared
+//! with [`crate::serialize::to_exiftool_json`]).
 //!
-//! ## Byte-exactness contract
+//! ## Value-equivalence contract
 //!
-//! `JsonTagWriter` is a *faithful re-composition* of the push-style
-//! `Metadata` + serialize pair, so its output is byte-identical to
-//! [`to_exiftool_json`](crate::serialize::to_exiftool_json) applied to the
-//! equivalent [`crate::value::Metadata`] (the oracle the tests assert
-//! against). Specifically it mirrors, citing the source rules:
+//! The rendered JSON is VALUE-equivalent (not token- or key-order-exact) to
+//! bundled `perl exiftool -j -G1`, which the value-semantic
+//! [`crate::jsondiff`] conformance gate verifies. Scalar VALUES come from the
+//! [`TagValue`] `Serialize` impl (standard `serde_json` scalars; binary
+//! placeholder; titlecase non-finite string; ExifTool-rounded rational value).
+//! Specifically:
 //!
-//! 1. **Scalar encoding.** Every scalar goes through the SAME
-//!    [`crate::json_scalar`] encoders the serializer uses (the `EscapeJSON`
-//!    number gate at `exiftool:3809`, string escaping at `exiftool:3816-3830`,
-//!    the binary placeholder, the rational repr, and the `FormatJSON` ARRAY
-//!    framing at `exiftool:3843-3855`). One source of truth ⇒ no drift.
-//! 2. **`write_*` → `TagValue` mapping.** `write_u64` → `U64` (the EXACT
-//!    unsigned value, Codex A-R4-1 — no longer saturating to `i64::MAX`),
-//!    `write_i64` → `I64`, `write_f64` → `F64`, `write_str`/`write_fmt` →
-//!    `Str`, `write_bytes` → `Bytes`. `write_str_list` coalesces via the
+//! 1. **`write_*` → `TagValue` mapping.** `write_u64` → `U64` (the EXACT
+//!    unsigned value — no saturation to `i64::MAX`), `write_i64` → `I64`,
+//!    `write_f64` → `F64`, `write_str`/`write_fmt` → `Str`, `write_bytes` →
+//!    `Bytes`. `write_str_list` coalesces via the
 //!    [`crate::value::Metadata::push_listable`] promote-and-push rule
 //!    (`ExifTool.pm:9505-9520`).
-//! 3. **Push-level dedup / last-write-wins.** Same `(family0, family1, name)`
+//! 2. **Push-level dedup / last-write-wins.** Same `(family0, family1, name)`
 //!    identity replace-in-place as [`crate::value::Metadata::push`] (faithful
 //!    `FoundTag`, `ExifTool.pm:9437-9519`): the LATEST scalar `write_*` for a
-//!    key wins, in the FIRST occurrence's position.
-//! 4. **Framing + Group1 sort + `%noDups` first-wins + Warning/Error.** Both
-//!    [`finish`](JsonTagWriter::finish) and
-//!    [`crate::serialize::to_exiftool_json`] now delegate to the SAME
-//!    [`crate::json_scalar::render_g1_json_document`]: `[{`, `SourceFile`
-//!    first, then the entries SORTED by Group1
-//!    (`exiftool:1853-1854`/`ExifTool.pm:3362-3386` — group-clustered, groups
-//!    in first-seen order, occurrence order within a group), with `%noDups`
-//!    first-wins on the sorted walk (`exiftool:2950-2951`). The generated
+//!    key wins.
+//! 3. **Document framing + `%noDups` first-wins + Warning/Error.**
+//!    [`finish`](JsonTagWriter::finish) delegates to
+//!    [`crate::serialize::render_document`]: the array-of-one-object,
+//!    `SourceFile` first, the `"<Group1>:<Name>"` keys, the `%noDups`
+//!    first-wins token dedup (`exiftool:2950-2951`), and the generated
 //!    `ExifTool:Warning` / `ExifTool:Error` tags (`ExifTool.pm:1225,
-//!    1288-1297`) are `ExifTool`-group FoundTags that cluster right after
-//!    `ExifTool:ExifToolVersion` (rank 1). Then `\n}]\n` (Codex B-R4-1).
+//!    1288-1297`; only the first of each). Object key ORDER and scalar TOKEN
+//!    style are NOT reproduced — the value-semantic gate makes them irrelevant.
 //!
 //! ## Group mapping
 //!
@@ -357,30 +350,26 @@ impl JsonTagWriter {
     &self.errors
   }
 
-  /// Emit the buffered records as the byte-exact `exiftool -j -G1` JSON
-  /// document. Consumes the writer.
+  /// Emit the buffered records as the `exiftool -j -G1` JSON document
+  /// (VALUE-equivalent to bundled, via standard `serde_json`). Consumes the
+  /// writer.
   ///
-  /// This is a faithful re-composition of
-  /// [`crate::serialize::to_exiftool_json`]: the document framing (`[{`,
-  /// `SourceFile` first, `,\n  "tok": v` per tag, `\n}]\n`), the `%noDups`
-  /// first-wins on the `"<family1>:<name>"` token (`exiftool:2950-2951`), and
-  /// the generated `ExifTool:Warning` / `ExifTool:Error` tags joining the SAME
-  /// `%noDups` set (`ExifTool.pm:1225,1288-1297`). See the module docs for the
-  /// per-rule citations.
+  /// Delegates to [`crate::serialize::render_document`] — the SINGLE document
+  /// renderer shared with [`crate::serialize::to_exiftool_json`] — so both
+  /// output paths agree. It owns the array-of-one-object framing, `SourceFile`
+  /// first, the `"<Group1>:<Name>"` keys, the generated `ExifTool:Warning` /
+  /// `ExifTool:Error` tags (`ExifTool.pm:1225,1288-1297`), and the `%noDups`
+  /// first-wins token dedup (`exiftool:2950-2951`). Object key ORDER and scalar
+  /// TOKEN style are NOT reproduced — the value-semantic conformance gate makes
+  /// them irrelevant.
+  ///
+  /// `json`-gated: rendering goes through `serde_json` (the `json` feature). The
+  /// collection surface (`push`/`sink`/`records`) stays available under `alloc`
+  /// for the serde-free engine tier; only the final render needs `json`.
+  #[cfg(feature = "json")]
   #[must_use]
   pub fn finish(self) -> String {
-    // ExifTool framing: `$fileHeader = '['` (exiftool 1649); per file
-    // `{\n  "SourceFile": …` (exiftool 2678) then `,\n  "tok": v` per tag
-    // (exiftool 2953-2954, $ind = '  '); close `\n}` (exiftool 3090);
-    // `$fileTrailer = "]\n"` (exiftool 1650).
-    // Delegate to the shared `exiftool -j -G1` document renderer (the SINGLE
-    // source of truth shared with `crate::serialize::to_exiftool_json`), so
-    // the framing, the Group1 stable-clustering sort (`exiftool:1853-1854` +
-    // `ExifTool.pm:3362-3386`), the generated Warning/Error placement, and
-    // the `%noDups` first-wins are byte-identical across both output paths
-    // (Codex B-R4-1). The records carry the Group1 + file order; the warning
-    // and error vecs supply the generated `ExifTool:*` tags.
-    crate::json_scalar::render_g1_json_document(
+    crate::serialize::render_document(
       &self.source_file,
       &self.records,
       &self.warnings,
@@ -553,12 +542,8 @@ mod tests {
   #[test]
   fn write_u64_preserves_exact_value_above_i64_max() {
     // Codex A-R4-1 regression: a u64 ABOVE i64::MAX must round-trip its FULL
-    // value, NOT saturate to i64::MAX (`9223372036854775807`). The exact
-    // decimal is quoted (it exceeds the EscapeJSON 15-digit number gate,
-    // `exiftool:3809`), exactly as bundled `perl exiftool` quotes it —
-    // verified against the bundled Perl regex (u64::MAX = 20 digits,
-    // 10000000000000000000 = 20 digits, 9223372036854775808 = 19 digits, all
-    // QUOTED). The writer and the serialize oracle agree (both store U64).
+    // value, NOT saturate to i64::MAX (`9223372036854775807`). The writer and
+    // the serialize oracle agree (both store U64, both render via serde).
     assert_matches_serialize("a.aac", |m, w| {
       for (name, v) in [
         ("Max", u64::MAX),
@@ -569,15 +554,16 @@ mod tests {
         w.write_u64("X", name, v).unwrap();
       }
     });
-    // Direct assertion on the rendered token: the FULL exact value appears,
-    // and it is QUOTED (the >15-digit gate), NOT the truncated i64::MAX.
+    // Value-semantic: the FULL exact value renders (serde emits the u64 as a
+    // bare number), NOT the truncated i64::MAX.
     let mut w = JsonTagWriter::new("a.aac");
     w.write_u64("X", "Max", u64::MAX).unwrap();
     let out = w.finish();
-    assert!(
-      out.contains("\"X:Max\": \"18446744073709551615\""),
-      "u64::MAX must render as its full quoted decimal, got: {out}"
-    );
+    crate::jsondiff::json_equivalent(
+      &out,
+      r#"[{"SourceFile":"a.aac","X:Max":18446744073709551615}]"#,
+    )
+    .expect("u64::MAX exact value");
     assert!(
       !out.contains("9223372036854775807"),
       "u64::MAX must NOT saturate to i64::MAX, got: {out}"

@@ -572,6 +572,122 @@ impl Metadata {
   }
 }
 
+// ===========================================================================
+// Optional serde `Serialize` impls (skill §8: one anonymous gated const block;
+// single `#[cfg]` + `doc(cfg)`; private helpers scoped inside; nothing `pub`).
+//
+// DESIGN: we emit STANDARD `serde_json` scalars and do NOT reproduce ExifTool's
+// `sprintf` token style — the value-semantic [`crate::jsondiff`] comparator
+// treats a different valid spelling of the same value as equal (`"123"==123`,
+// `0.0==0.00000000`). So a numeric-looking `Str` is serialized as a plain JSON
+// string (the comparator coerces it), a finite `f64` via `serialize_f64`
+// (ryu shortest round-trip), and a large `u64` via `serialize_u64` (full
+// value). The only value-shaping needed is for the variants whose JSON VALUE
+// (not token) is special: `Bytes` -> the binary placeholder string; non-finite
+// `f64` -> the titlecase `Inf`/`-Inf`/`NaN` string (serde_json errors on a
+// non-finite number) AND `%.15g`-rounded for a finite float (ExifTool's default
+// NV stringification — a VALUE difference, not token style); `Rational` -> its
+// ExifTool-rounded numeric value (or the `inf`/`undef` word); a `"true"`/
+// `"false"` string -> a bare JSON boolean (`exiftool:3804-3805`). These mirror
+// the rules the retired hand-rolled encoder applied, VALUE-faithfully.
+// ===========================================================================
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+const _: () = {
+  use serde::ser::{Serialize, SerializeSeq, Serializer};
+
+  impl Serialize for Rational {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      if self.denominator == 0 {
+        // ExifTool: n/0 (n!=0) -> "inf", 0/0 -> "undef" (non-numeric words,
+        // emitted as JSON strings by `EscapeJSON`). Value-faithful: a string.
+        return s.serialize_str(if self.numerator != 0 { "inf" } else { "undef" });
+      }
+      // ExifTool stringifies a rational via `RoundFloat(n/d, sig)`
+      // (`%.{sig}g`). Emit that ROUNDED value as a number — re-parsing the
+      // rounded text yields the same f64 the golden's rounded token denotes,
+      // so the value-semantic comparator matches it. (Serializing the RAW
+      // `n/d` f64 would emit more digits, a DIFFERENT value than the golden's
+      // rounded one.)
+      let rounded = self.exiftool_val_str();
+      match rounded.parse::<f64>() {
+        Ok(f) if f.is_finite() => s.serialize_f64(f),
+        // Defensive: a rounded form that does not re-parse as finite (not
+        // reachable for a non-zero denominator) falls back to its text.
+        _ => s.serialize_str(&rounded),
+      }
+    }
+  }
+
+  impl Serialize for TagValue {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+      match self {
+        TagValue::I64(n) => s.serialize_i64(*n),
+        // Full unsigned value (no saturation to i64::MAX); the comparator
+        // keeps huge integers exact.
+        TagValue::U64(n) => s.serialize_u64(*n),
+        TagValue::F64(n) => {
+          if n.is_finite() {
+            // ExifTool stringifies a float with `%.15g` (its default NV
+            // stringification, `ExifTool.pm` RoundFloat / the JSON writer), so
+            // the GOLDEN value is the 15-sig-fig rounding of the true f64 —
+            // e.g. 2.639229024943311 -> 2.63922902494331. This is a VALUE
+            // difference, not token style: emit the rounded value (round via
+            // `format_g(_,15)` then re-parse, so serde's number equals the
+            // golden's rounded number). The raw f64 would be a DIFFERENT value
+            // and fail the value-semantic gate.
+            let rounded = format_g(*n, 15);
+            match rounded.parse::<f64>() {
+              Ok(f) => s.serialize_f64(f),
+              // `format_g` always yields a parseable decimal for a finite f64;
+              // fall back to the raw value defensively.
+              Err(_) => s.serialize_f64(*n),
+            }
+          } else {
+            // serde_json errors on a non-finite number; ExifTool emits the
+            // titlecase `Inf`/`-Inf`/`NaN` string. `perl_nonfinite_str`
+            // covers every non-finite f64; the `None` arm is unreachable
+            // under the `!is_finite` guard but falls back defensively.
+            match perl_nonfinite_str(*n) {
+              Some(text) => s.serialize_str(text),
+              None => s.serialize_str(&n.to_string()),
+            }
+          }
+        }
+        // ExifTool `EscapeJSON` boolean coercion (`exiftool:3804-3805`:
+        // `return lc($str) if $str =~ /^(true|false)$/i and $json < 2`): a
+        // string that case-insensitively matches `true`/`false` is emitted as
+        // a bare JSON BOOLEAN (e.g. an MPEG `CopyrightFlag` PrintConv of
+        // `"True"` -> `true`). The value-semantic comparator does NOT coerce a
+        // string to a bool (different JSON types), so this coercion must happen
+        // here to match the golden's bare `true`/`false`.
+        TagValue::Str(text) if text.eq_ignore_ascii_case("true") => s.serialize_bool(true),
+        TagValue::Str(text) if text.eq_ignore_ascii_case("false") => s.serialize_bool(false),
+        // Otherwise STANDARD string emission: a numeric-looking value (e.g. a
+        // `"3.5"` PrintConv) stays a JSON string; the value-semantic comparator
+        // coerces it to the bare number the golden carries.
+        TagValue::Str(text) => s.serialize_str(text),
+        TagValue::Bool(b) => s.serialize_bool(*b),
+        // ExifTool universal no-`-b` placeholder (a plain string, never
+        // numeric). N = byte length.
+        TagValue::Bytes(b) => s.serialize_str(&std::format!(
+          "(Binary data {} bytes, use -b option to extract)",
+          b.len()
+        )),
+        TagValue::Rational(r) => r.serialize(s),
+        TagValue::List(items) => {
+          let mut seq = s.serialize_seq(Some(items.len()))?;
+          for item in items {
+            seq.serialize_element(item)?;
+          }
+          seq.end()
+        }
+      }
+    }
+  }
+};
+
 #[cfg(test)]
 mod tests {
   use super::*;
