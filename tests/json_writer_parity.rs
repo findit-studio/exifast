@@ -237,7 +237,6 @@ const KNOWN_TYPED_GAPS: &[&str] = &[
   "ape_id3v24_footer_then_mac.ape",
   "ape_with_enhancedtag_and_id3v1.ape",
   "ape_with_id3v1_trailer.ape",
-  "dsf_with_id3v2_trailer.dsf",
 ];
 
 #[test]

@@ -15,24 +15,21 @@
 //! ## Why DSF needs a `Context<'a>` struct (not the leaf `&'a [u8]`)
 //!
 //! DSF chains into the bundled ID3v2 trailer at `metaPos` (DSF.pm:88-97).
-//! The chain itself runs through the legacy `process_id3_v2_slice`
-//! ([`crate::formats::id3::process::process_id3_v2_slice`]) which still
-//! consumes a `ParseContext` — F3 lands the typed `DsfMeta` first and
-//! leaves the chained-ID3 typed path for F4 (when typed `Id3Meta`
-//! becomes available). Per the task plan we model the F3 `Context<'a>`
-//! as `DsfContext<'a>` = `&'a [u8]` + `&'a mut SharedFlags` even though
-//! the F3 parser itself doesn't yet touch `SharedFlags`; the shape is
-//! pinned now to make the F4 follow-on a pure additive change (no
-//! signature break).
+//! The chain is now fully typed: [`parse_inner`] parses the trailer slice
+//! into a nested [`crate::formats::id3::Id3Meta`] ([`DsfMeta::id3`]) via
+//! [`crate::formats::id3::process::parse_id3_borrowed`], and the
+//! [`MetaSinker`] sink emits its `File:ID3Size` + `ID3v2_*:*` tags after
+//! the `'fmt '` chunk. The `DsfContext<'a>` = `&'a [u8]` + `&'a mut
+//! SharedFlags` shape is retained for parser-trait uniformity even though
+//! DSF itself does not read/mutate `SharedFlags` (the trailer is a
+//! self-contained ID3 "file"; the typed nesting passes `shared = None`).
 //!
-//! ## ID3 trailer placeholder
+//! ## ID3 trailer
 //!
-//! `DsfMeta::id3_trailer()` exposes a borrowed `&'a [u8]` of the trailer
-//! bytes (faithful to `DSF.pm:88-97`'s `$dirInfo{DataPt}` slice). When
-//! F2's typed `Id3Meta` lands, this field gains an `Option<Id3Meta<'a>>`
-//! sibling and the byte-slice degrades to a fallback; for now the bytes
-//! are the lib-first surface AND the bridge dispatches them through
-//! the legacy `process_id3_v2_slice` for byte-exact CLI JSON output.
+//! [`DsfMeta::id3_trailer`] still exposes the borrowed `&'a [u8]` of the
+//! trailer bytes (faithful to `DSF.pm:88-97`'s `$dirInfo{DataPt}` slice)
+//! as a lib-first convenience; [`DsfMeta::id3`] is the typed sub-Meta
+//! parsed from those same bytes, which the sink emits.
 
 use crate::{
   parser::ParseContext,
@@ -252,12 +249,12 @@ impl DsfFmtData {
 ///    `TagWriter::write_warning` for byte-exact CLI JSON.
 /// 3. The optional ID3v2 trailer bytes ([`Self::id3_trailer`]) — the
 ///    `metaPos..metaPos+metaLen` slice (DSF.pm:88-97) borrowed from the
-///    input buffer (zero-alloc). The bridge dispatches this slice
-///    through [`crate::formats::id3::process::process_id3_v2_slice`]
-///    so the bundled-Perl `ProcessDirectory(GetTagTable(
-///    'Image::ExifTool::ID3::Main'))` semantics are preserved. The
-///    typed lib-first path exposes the bytes; a future F4 sibling
-///    field will hold an `Option<Id3Meta<'a>>` parsed at the same time.
+///    input buffer (zero-alloc) — AND the typed [`Self::id3`] sub-Meta
+///    parsed from those bytes via
+///    [`crate::formats::id3::process::parse_id3_borrowed`]. The sink emits
+///    `id3`'s `File:ID3Size` + `ID3v2_*:*` tags (the bundled-Perl
+///    `ProcessDirectory(GetTagTable('Image::ExifTool::ID3::Main'))`
+///    output), so the typed Meta is self-contained.
 ///
 /// **D8 — no public fields, accessors only.**
 ///
@@ -280,12 +277,18 @@ pub struct DsfMeta<'a> {
   /// the slice fails the bundled-Perl guards (`metaLen > 0 &&
   /// metaLen < 20_000_000 && Read == metaLen`).
   ///
-  /// **Phase F3 placeholder.** Typed `Id3Meta` lives in Phase F2 (not
-  /// yet migrated at F3 time per the task plan). The bridge consumes
-  /// these bytes through the legacy `process_id3_v2_slice` for byte-
-  /// exact CLI JSON; a future F4 PR will add a typed sibling field
-  /// (likely `Option<Id3Meta<'a>>`) parsed from the same slice.
+  /// Retained as a lib-first convenience alongside the typed [`Self::id3`]
+  /// sub-Meta (parsed from these same bytes). The sink emits via [`Self::id3`];
+  /// this raw slice lets callers re-process the trailer differently if needed.
   id3_trailer: Option<&'a [u8]>,
+  /// Typed ID3 sub-Meta parsed from [`Self::id3_trailer`] (DSF.pm:88-97).
+  /// `Some` iff the trailer slice was present AND ID3 detection accepted it
+  /// (an ID3v2 header at offset 0). Carries `File:ID3Size` + the
+  /// `ID3v2_*:*` frame tags; the typed [`MetaSinker`] sink emits them after
+  /// the `'fmt '` chunk fields, replacing the engine's separate
+  /// `process_id3_v2_slice` dispatch.
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
 }
 
 impl<'a> DsfMeta<'a> {
@@ -313,6 +316,16 @@ impl<'a> DsfMeta<'a> {
   #[must_use]
   pub fn id3_trailer(&self) -> Option<&'a [u8]> {
     self.id3_trailer
+  }
+
+  /// Typed ID3 sub-Meta parsed from the [`Self::id3_trailer`] bytes
+  /// (DSF.pm:88-97). `Some` iff the trailer was present and ID3 detection
+  /// accepted it. The [`MetaSinker`](crate::parser_new::MetaSinker) sink
+  /// emits its `File:ID3Size` + `ID3v2_*:*` tags after the `'fmt '` chunk.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  pub fn id3(&self) -> Option<&crate::formats::id3::Id3Meta<'a>> {
+    self.id3.as_ref()
   }
 }
 
@@ -473,6 +486,8 @@ fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
       fmt: None,
       fmt_warning: Some("Error reading DSF fmt chunk"),
       id3_trailer,
+      #[cfg(feature = "id3")]
+      id3: id3_from_trailer(id3_trailer),
     }));
   }
   // DSF.pm:76 `$buff = substr($buff,28) . $buf2` — the dirInfo buffer
@@ -589,7 +604,24 @@ fn parse_inner(data: &[u8]) -> Result<Option<DsfMeta<'_>>, DsfError> {
     fmt,
     fmt_warning: None,
     id3_trailer,
+    #[cfg(feature = "id3")]
+    id3: id3_from_trailer(id3_trailer),
   }))
+}
+
+/// Parse the optional ID3v2 trailer slice (DSF.pm:88-97) into a typed
+/// [`crate::formats::id3::Id3Meta`]. The trailer is a self-contained ID3
+/// "file" (ID3v2 header at offset 0); DSF does NOT thread cross-format
+/// `SharedFlags` (it is the simplest chained leaf), so `shared = None`.
+/// `Some` iff the slice was present AND ID3 detection accepted it. Both
+/// `-j` and `-n` lists are staged inside the returned Meta (one parse
+/// serves both sink modes), so the `print_conv` argument is fixed `true`.
+#[cfg(feature = "id3")]
+fn id3_from_trailer(trailer: Option<&[u8]>) -> Option<crate::formats::id3::Id3Meta<'_>> {
+  let slice = trailer?;
+  crate::formats::id3::process::parse_id3_borrowed(slice, None, /* print_conv */ true)
+    .ok()
+    .flatten()
 }
 
 /// Computes the present-mask bit per `DSF_KEYS` entry based on whether
@@ -760,6 +792,15 @@ impl MetaSinker for DsfMeta<'_> {
         out.write_u64(GROUP, "BlockSize", u64::from(fmt.block_size))?;
       }
     }
+    // (3) DSF.pm:88-97 — chained ID3v2 trailer. Emitted via the nested typed
+    // `Id3Meta` sink (File:ID3Size + ID3v2_*:* frames), AFTER the fmt-chunk
+    // tags, faithful to the bundled emission order (ProcessBinaryData then the
+    // trailer ProcessDirectory). Replaces the engine's separate
+    // `process_id3_v2_slice` dispatch — the typed Meta is now self-contained.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.sink(print_conv, out)?;
+    }
     Ok(())
   }
 }
@@ -803,12 +844,12 @@ impl ProcessDsf {
   /// 2. `SetFileType` (DSF.pm:64) — runs BEFORE the fmt-chunk guard so
   ///    a Warn-then-return-1 file still emits the File:* triplet.
   /// 3. `fmt`-chunk warning (DSF.pm:71) AND/OR fmt-chunk tags
-  ///    (DSF.pm:80-85) via `MetaSinker::sink`.
-  /// 4. ID3v2 trailer dispatch (DSF.pm:88-97) via the legacy
-  ///    `process_id3_v2_slice` — chained, no SetFileType (DSF.pm:64
-  ///    already typed the file). The `id3_trailer` borrow lives long
-  ///    enough to flow into this call before the typed `Meta` is
-  ///    consumed.
+  ///    (DSF.pm:80-85) AND the chained ID3v2 trailer (DSF.pm:88-97) — all
+  ///    via the one `MetaSinker::sink` call, which now emits the nested
+  ///    typed `Id3Meta` ([`DsfMeta::id3`]). No separate
+  ///    `process_id3_v2_slice` dispatch (the typed Meta is self-contained;
+  ///    DSF.pm:64 already typed the file so the chained ID3 emits no
+  ///    `File:FileType`).
   pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let bytes = ctx.data();
     let meta = match parse_inner(bytes) {
@@ -823,35 +864,17 @@ impl ProcessDsf {
     // `-j -G1`). DSF.pm:64 is line-ordered BEFORE the guard at :67-72.
     ctx.set_file_type(None, None, None);
     let print_conv = ctx.print_conv_enabled();
-    // Snapshot the trailer before the typed Meta moves into the sink.
-    let trailer = meta.id3_trailer;
     // Sink the typed `DsfMeta` directly into the engine `JsonTagWriter`
-    // (`ctx.writer()`). Faithful to DSF.pm:80-85
-    // `ProcessBinaryData` semantics — emits the same fmt-chunk tags
-    // (or the Warn) in the same order with the same PrintConv vs
-    // ValueConv toggling.
+    // (`ctx.writer()`). Faithful to DSF.pm:80-85 `ProcessBinaryData`
+    // semantics — emits the same fmt-chunk tags (or the Warn) in the same
+    // order with the same PrintConv vs ValueConv toggling — AND the chained
+    // ID3v2 trailer (DSF.pm:88-97) via the nested typed `Id3Meta` the sink
+    // now carries (File:ID3Size + ID3v2_*:* frames). The typed `parse_inner`
+    // applied every trailer guard and parsed the slice into `DsfMeta::id3`,
+    // so a separate `process_id3_v2_slice` dispatch is no longer needed —
+    // the typed Meta is self-contained (Stage 1 of the sink-layer removal).
     {
       let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    }
-    // DSF.pm:88-97 — ID3v2 trailer dispatch via the legacy ID3 path.
-    // Faithful gate:
-    //   $metaLen = $fileSize - $metaPos;
-    //   if ($metaPos and $metaLen > 0 and $metaLen < 20000000 ...) {
-    //       my $id3Tbl = GetTagTable('Image::ExifTool::ID3::Main');
-    //       $et->ProcessDirectory(\%dirInfo, $id3Tbl);
-    //   }
-    // The typed `parse_inner` already applied every guard; the
-    // borrowed `trailer` slice is `Some` iff every guard passed.
-    if let Some(slice) = trailer {
-      // Copy the slice into an owned Vec so we can pass it through
-      // `process_id3_v2_slice` without re-borrowing `ctx.data()`
-      // (the borrow checker forbids re-borrowing the file bytes
-      // while `ctx.metadata()` is `&mut`). Faithful — the bundled
-      // Perl reads the trailer bytes from disk into `$buff` (an
-      // owned Perl scalar). Allocation: ≤ 20 MB per DSF.pm:88-97
-      // guard.
-      let trailer_owned: std::vec::Vec<u8> = slice.to_vec();
-      let _ = crate::formats::id3::process::process_id3_v2_slice(&trailer_owned, ctx);
     }
     // DSF.pm:99 `return 1`. Even the Warn path returns 1 (DSF.pm:72).
     true
@@ -1320,6 +1343,8 @@ mod tests {
       fmt: None,
       fmt_warning: Some("Error reading DSF fmt chunk"),
       id3_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
     };
     let mut w = MapTagWriter::new();
     meta.sink(true, &mut w).unwrap();
@@ -1348,6 +1373,8 @@ mod tests {
       }),
       fmt_warning: None,
       id3_trailer: None,
+      #[cfg(feature = "id3")]
+      id3: None,
     };
     let mut w = MapTagWriter::new();
     meta.sink(true, &mut w).unwrap();
