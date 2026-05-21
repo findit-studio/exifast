@@ -2204,18 +2204,19 @@ fn ape_with_enhancedtag_and_id3v1_conformance() {
   //   * 227-byte Enhanced TAG block (magic `TAG+`)
   //   * 128-byte standard ID3v1 TAG block at EOF
   //
-  // Hand-trim posture: the golden produced by bundled also emits
-  // `ID3v1_Enh:Title2`, `ID3v1_Enh:Artist2`, `ID3v1_Enh:Album2`,
-  // `ID3v1_Enh:Speed`, `ID3v1_Enh:Genre`, `ID3v1_Enh:StartTime`,
-  // `ID3v1_Enh:EndTime`, and `Composite:DateTimeOriginal`. The
-  // Enhanced TAG CONTENT extraction is deferred (only the byte-count
-  // shift is faithful for F2 per the Codex review); same FLAC-id3-
-  // prefix hand-trim precedent. The committed golden retains the
-  // F2-critical APE:Artist (proving the footer-position shift now
-  // works) plus the standard ID3v1:* fields (which the trailer parser
-  // already handled). When the Enhanced TAG content extraction lands
-  // in a future PR, re-capture via `tools/gen_golden.sh` to restore
-  // those lines.
+  // F4 fix (Codex adversarial): the 7 `ID3v1_Enh:*` fields are now
+  // emitted by `id3::v1_enh::process_id3v1_enh`, faithful to
+  // `%Image::ExifTool::ID3::v1_Enh` (ID3.pm:380-425). The committed
+  // golden retains all 7 — no longer hand-trimmed.
+  //
+  // ACCEPTED-DEFERRAL HAND-TRIM (a single line):
+  // `Composite:DateTimeOriginal: 2024` is present in bundled output
+  // and is the only Composite tag for this fixture. The Composite
+  // metadata engine is the documented Phase-3+ accepted-deferral
+  // (Composite:Duration / Composite:DateTimeOriginal etc., see
+  // docs/tracking.md → "Accepted deferrals"). Hand-trim of ONLY this
+  // one line is acceptable per the deferral contract; when the
+  // Composite engine lands, re-capture via `tools/gen_golden.sh`.
   check(
     "ape_with_enhancedtag_and_id3v1.ape",
     "ape_with_enhancedtag_and_id3v1.ape.json",

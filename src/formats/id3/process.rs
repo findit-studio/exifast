@@ -1414,6 +1414,7 @@ fn process_id3_inner_legacy(
   }
 
   let mut trailer_data: Option<Vec<u8>> = None;
+  let mut enh_data: Option<Vec<u8>> = None;
   let mut trail_size_for_done_id3: usize = 0;
   if data.len() >= 128 {
     let tail = &data[data.len() - 128..];
@@ -1425,12 +1426,20 @@ fn process_id3_inner_legacy(
       // ID3.pm:1521-1525 — Enhanced TAG (TAG+, 227 bytes) preceding
       // the standard 128-byte TAG block. Detect via the regex
       // `^TAG+/` (literal `TA` + 1+ `G`s — `starts_with(b"TAG")`
-      // covers).
+      // covers). F4 (Codex adversarial): the pre-fix code sized the
+      // block (DoneID3 += 227) but never CAPTURED the buffer. Now we
+      // copy the 227 bytes so `finalize` → `process_id3v1_enh` can
+      // emit the 7 `ID3v1_Enh:*` fields bundled does (ID3.pm:1618-1626).
+      // Note: `id3_len` (the `File:ID3Size` value) does NOT include the
+      // 227 bytes — Perl :1519 adds 128 to `$id3Len` but :1525 only adds
+      // 227 to `$trailSize`. The committed golden's `File:ID3Size = 128`
+      // pins this.
       if data.len() >= 128 + 227 {
         let e_start = data.len() - 128 - 227;
         let e_buf = &data[e_start..data.len() - 128];
         if e_buf.starts_with(b"TAG") {
           trail_size_for_done_id3 += 227;
+          enh_data = Some(e_buf.to_vec());
         }
       }
     }
@@ -1447,6 +1456,7 @@ fn process_id3_inner_legacy(
     found_any,
     header_data,
     trailer_data,
+    enh_data,
   );
   (found, hdr_end)
 }
@@ -1518,6 +1528,7 @@ fn finalize(
   found_any: bool,
   header_data: Option<(Vec<u8>, u16)>,
   trailer_data: Option<Vec<u8>>,
+  enh_data: Option<Vec<u8>>,
 ) -> bool {
   if !found_any {
     return false;
@@ -1545,6 +1556,17 @@ fn finalize(
   if let Some(t) = trailer_data {
     let _ = ID3V1_MAIN; // referenced for static link only
     process_id3v1(&t, meta, print_conv_on, cctx);
+    // ID3.pm:1618-1626 — Enhanced TAG is processed AFTER the v1 trailer (the
+    // bundled `if ($id3Trailer{EnhancedTAG})` block runs INSIDE the
+    // `if (%id3Trailer)` arm at :1613). F4 (Codex adversarial): the pre-fix
+    // engine sized the Enhanced TAG block (so `DoneID3` was right for the
+    // APE.pm:169 footer shift) but never PARSED its 227-byte content, so the
+    // golden had to be hand-trimmed. Now we extract the 7 `ID3v1_Enh:*`
+    // fields faithfully.
+    if let Some(e) = enh_data {
+      let _ = crate::formats::id3::v1_enh::ID3V1_ENH_MAIN; // static link
+      crate::formats::id3::v1_enh::process_id3v1_enh(&e, meta, print_conv_on, cctx);
+    }
   }
   true
 }

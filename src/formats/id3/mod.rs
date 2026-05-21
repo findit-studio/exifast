@@ -23,12 +23,15 @@
 //!   sync gate for file-type acceptance (MPEG:* extraction defers to
 //!   MPEG.pm row 17).
 //!
+//! **F4 (Codex adversarial — implemented):**
+//! - ID3v1 "Enhanced TAG" 227-byte trailer (ID3.pm:1521-1525, processed
+//!   per ID3.pm:1618-1626). The 7 `ID3v1_Enh:*` fields are now extracted
+//!   via [`v1_enh::process_id3v1_enh`] and staged alongside the standard
+//!   v1 fields, mirroring bundled.
+//!
 //! **Out-of-PR-scope (Codex R9-F1 — faithful forward items):**
-//! - ID3v1 "Enhanced TAG" 227-byte trailer (ID3.pm:1521-1525). NO
-//!   fixture in scope; processing deferred until a real bundled-oracle
-//!   sample is captured.
-//! - Lyrics3 v1/v2 trailer (ID3.pm:1532-1576). Same: NO fixture in
-//!   scope; processing deferred.
+//! - Lyrics3 v1/v2 trailer (ID3.pm:1532-1576). NO fixture in scope;
+//!   processing deferred.
 //! - The ID3.pm:1582-1601 audio-format loop (ID3-prefixed APE/MPC/FLAC/
 //!   OGG body in an .mp3 dispatch). Per Codex R6 finding tracked in
 //!   `docs/tracking.md` — keep the deferral; vanishingly rare in the
@@ -52,6 +55,8 @@
 //! - [`decode`] — `DecodeString` (ID3.pm:1054-1092) + `UnSyncSafe`
 //!   (ID3.pm:1098-1106).
 //! - [`v1`] — `%Image::ExifTool::ID3::v1` (ID3.pm:335-378) + ProcessID3v1.
+//! - [`v1_enh`] — `%Image::ExifTool::ID3::v1_Enh` (ID3.pm:380-425) +
+//!   ProcessID3v1Enh (the 227-byte "Enhanced TAG" trailer, F4 fix).
 //! - [`v2_2`] / [`v2_3`] / [`v2_4`] — version-specific tag tables.
 //! - [`v2_process`] — `ProcessID3v2` (ID3.pm:1111-1423).
 //! - [`process`] — `ProcessID3` (ID3.pm:1431-1632) + `ProcessMp3`
@@ -65,6 +70,7 @@ pub mod picture_type;
 pub mod process;
 pub mod text;
 pub mod v1;
+pub mod v1_enh;
 pub mod v2_2;
 pub mod v2_3;
 pub mod v2_4;
