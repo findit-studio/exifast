@@ -101,7 +101,13 @@ mpc        = ["id3", "ape"]
 # on the `moi-port` branch and hasn't merged to `main` yet. The format-gating
 # `cfg` for MOI lands in Phase E when the MOI source merges.
 moi        = []
-ogg        = []
+# `ogg` chains FLAC (METADATA_BLOCK_PICTURE — Vorbis comment's `Picture:*`
+# SubDirectory hop reuses the FLAC type-6 picture-block parser, Vorbis.pm:
+# 122-134) AND ID3 (`unless ($$et{DoneID3}) { ID3::ProcessID3 }` at
+# Ogg.pm:79-83 — ID3-prefixed Ogg-Vorbis chain). Without either edge,
+# `--features std,ogg` fails to compile (Codex R4 F1: silent feature-graph
+# breakage from the R3 picture-parse + ID3-nest fixes).
+ogg        = ["flac", "id3"]
 red        = []
 wavpack    = ["id3", "ape"]
 
