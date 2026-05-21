@@ -21,7 +21,7 @@
 //!   FLAC.pm:239-280 (ProcessFLAC — magic + metadata-block-header structure)
 
 use exifast::{
-  bitstream::{process_bit_stream, BitOrder},
+  bitstream::{BitOrder, process_bit_stream},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -225,15 +225,18 @@ fn flac_streaminfo_matches_bundled_perl() {
 
   // All 9 tags must be present.
   assert_eq!(
-    m.tags().len(),
+    m.tags_slice().len(),
     9,
     "expected 9 StreamInfo tags; got {}",
-    m.tags().len()
+    m.tags_slice().len()
   );
 
   // Build a lookup map for assertion clarity.
-  let tag_map: std::collections::HashMap<&str, &TagValue> =
-    m.tags().iter().map(|t| (t.name(), t.value())).collect();
+  let tag_map: std::collections::HashMap<&str, &TagValue> = m
+    .tags_slice()
+    .iter()
+    .map(|t| (t.name(), t.value_ref()))
+    .collect();
 
   // --- Assertions vs. bundled Perl ExifTool output (Step 2) ---
 
@@ -302,14 +305,14 @@ fn flac_streaminfo_matches_bundled_perl() {
   );
 
   // Verify family-0 group is "FLAC" for all tags (FLAC.pm:59 group0 = "FLAC").
-  for tag in m.tags() {
+  for tag in m.tags_slice() {
     assert_eq!(
-      tag.group().family0(),
+      tag.group_ref().family0(),
       "FLAC",
       "all StreamInfo tags must have family-0 = 'FLAC'"
     );
     assert_eq!(
-      tag.group().family1(),
+      tag.group_ref().family1(),
       "FLAC",
       "all StreamInfo tags must have family-1 = 'FLAC'"
     );

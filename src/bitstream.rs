@@ -7,7 +7,7 @@
 use crate::{
   convert::apply,
   tagtable::{RawConv, TagDef, TagId, TagTable},
-  value::{format_g, Group, Metadata, TagValue},
+  value::{Group, Metadata, TagValue, format_g},
 };
 
 /// Per-frame scalar state populated by [`RawConv::SetFrameState`] writes and
@@ -24,7 +24,7 @@ use crate::{
 /// growth beyond the dedicated field set — `process_bit_stream_cond` only
 /// ever touches the field a tag's `RawConv::SetFrameState(slot)` names, so
 /// an MPEG-only file never touches a hypothetical Ogg slot.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrameState {
   // Add a slot here when a faithful port first needs it.
   // MPEG.pm:27   RawConv => '$self->{MPEG_Vers} = $val'
@@ -35,10 +35,20 @@ pub struct FrameState {
   mpeg_mode: Option<i64>,
 }
 
+impl Default for FrameState {
+  /// Delegates to [`FrameState::new`] (§1: one source of truth for "empty",
+  /// not a separate `#[derive(Default)]`).
+  #[inline(always)]
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl FrameState {
   /// Construct a freshly-empty state — every slot `None` ("never set", i.e.
   /// Perl `$$self{X}` being `undef`).
   #[must_use]
+  #[inline(always)]
   pub const fn new() -> Self {
     Self {
       mpeg_vers: None,
@@ -52,6 +62,7 @@ impl FrameState {
   /// faithful port should NEVER hit the latter — it indicates a typo in a
   /// `RawConv::SetFrameState(slot)` or a Condition closure).
   #[must_use]
+  #[inline(always)]
   pub const fn get(&self, slot: &str) -> Option<i64> {
     match slot.as_bytes() {
       b"MPEG_Vers" => self.mpeg_vers,
@@ -273,7 +284,11 @@ fn extract_field(
     }
     match acc {
       // u64 mode ≤ i64::MAX ⇒ TagValue::I64 (unchanged for all ported
-      // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit).
+      // fields: AAC ≤ 2 bytes, FLAC TotalSamples 36-bit). Kept as I64 (not
+      // U64) so the SetFrameState slot (`if let TagValue::I64`, below) and
+      // the Condition `==`/`!=` integer comparisons still see these values
+      // — the no-format path's existing, tested contract (Codex A-R4-1 is
+      // scoped to `TagMap::write_u64`, not this UV accumulator).
       Acc::U(v) if v <= i64::MAX as u64 => TagValue::I64(v as i64),
       // u64 mode > i64::MAX ⇒ exact decimal string (Perl UV stringifies
       // as exact integer); the serializer's number gate quotes ≥16-digit
@@ -395,11 +410,16 @@ pub fn process_bit_stream_cond(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    serialize::to_exiftool_json,
-    tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
-    value::Group,
-  };
+  use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv};
+  // `serialize` is gated on `feature = "json"` (spec §4); tests below that use
+  // `to_exiftool_json` are correspondingly gated — and `value::Group` is used
+  // ONLY by those json-gated tests (the `Metadata::push` + serialize cases),
+  // so it shares the gate to keep a `--features std,id3` test build warning-
+  // clean (Codex A-R4-2).
+  #[cfg(feature = "json")]
+  use crate::serialize::to_exiftool_json;
+  #[cfg(feature = "json")]
+  use crate::value::Group;
 
   // Faithful AAC::Main subset for the synthetic header
   // [0xFF,0xF1,0x50,0x80,0x00,0x00,0x00]:
@@ -443,7 +463,11 @@ mod tests {
     let keys = ["Bit016-017", "Bit018-021", "Bit023-025"];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
-    let got: Vec<(&str, &TagValue)> = m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let got: Vec<(&str, &TagValue)> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     assert_eq!(
       got,
       vec![
@@ -452,7 +476,7 @@ mod tests {
         ("Channels", &TagValue::I64(2)),
       ]
     );
-    assert_eq!(m.tags()[0].group().family1(), "AAC");
+    assert_eq!(m.tags_slice()[0].group_ref().family1(), "AAC");
   }
 
   #[test]
@@ -462,7 +486,11 @@ mod tests {
     let keys = ["Bit016-017", "Bit018-021", "Bit023-025"];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, false);
-    let got: Vec<(&str, &TagValue)> = m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let got: Vec<(&str, &TagValue)> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     assert_eq!(
       got,
       vec![
@@ -481,7 +509,7 @@ mod tests {
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
     assert!(
-      m.tags().is_empty(),
+      m.tags_slice().is_empty(),
       "i2 >= dirLen must stop before emitting"
     );
   }
@@ -500,7 +528,7 @@ mod tests {
     let keys = ["Bit024-016"]; // descending cross-byte: b1=24 > b2=16, i1=3 > i2=2
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
-    assert!(m.tags().is_empty());
+    assert!(m.tags_slice().is_empty());
 
     // Sub-case 2 — same-byte descending: b1=17 > b2=16, i1==i2==2.
     // The byte loop runs once, but both f1>0 and f2<7 masks clear all bits
@@ -509,7 +537,7 @@ mod tests {
     let keys2 = ["Bit017-016"]; // same-byte descending: b1=17 > b2=16, i1==i2==2
     let mut m2 = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys2, &table, &mut m2, true);
-    assert!(m2.tags().is_empty());
+    assert!(m2.tags_slice().is_empty());
   }
 
   #[test]
@@ -553,11 +581,14 @@ mod tests {
     let mut m = Metadata::new("x.flac");
     // FLAC.pm:179-231: Format set => raw bytes [i1..i1+Size] = [0..4].
     process_bit_stream(&data, BitOrder::Mm, &["Bit000-031"], &table, &mut m, true);
-    assert_eq!(m.tags().len(), 1, "exactly one tag emitted");
-    assert_eq!(m.tags()[0].name(), "MD5Signature");
+    assert_eq!(m.tags_slice().len(), 1, "exactly one tag emitted");
+    assert_eq!(m.tags_slice()[0].name(), "MD5Signature");
     // ValueConv(Func(hex)) applied to TagValue::Bytes([DE,AD,BE,EF]).
-    assert_eq!(m.tags()[0].value(), &TagValue::Str("deadbeef".into()));
-    assert_eq!(m.tags()[0].group().family1(), "FLAC");
+    assert_eq!(
+      m.tags_slice()[0].value_ref(),
+      &TagValue::Str("deadbeef".into())
+    );
+    assert_eq!(m.tags_slice()[0].group_ref().family1(), "FLAC");
   }
 
   #[test]
@@ -570,10 +601,10 @@ mod tests {
     let buff = [0xFFu8, 0xF1, 0x50, 0x80, 0x00, 0x00, 0x00];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &["Bit016-017"], &table, &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "ProfileType");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "ProfileType");
     // print_conv_enabled=false: raw integer after unsigned-int accumulation.
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(1));
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(1));
   }
 
   #[test]
@@ -622,14 +653,14 @@ mod tests {
     // Format path: must NOT panic; must return with the correct hex string.
     process_bit_stream(&data, BitOrder::Mm, &["Bit000-127"], &table, &mut m, true);
     assert_eq!(
-      m.tags().len(),
+      m.tags_slice().len(),
       1,
       "exactly one tag emitted for the 16-byte span"
     );
-    assert_eq!(m.tags()[0].name(), "MD5Signature");
+    assert_eq!(m.tags_slice()[0].name(), "MD5Signature");
     // ValueConv(hex) applied to all 16 bytes -> exact 32-char hex string.
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::Str("00112233445566778899aabbccddeeff".into())
     );
   }
@@ -651,7 +682,7 @@ mod tests {
     let table = TagTable::new("Test", get_field);
     let mut m = Metadata::new("x.test");
     process_bit_stream(data, BitOrder::Mm, &[key], &table, &mut m, false);
-    m.tags().first().map(|t| t.value().clone())
+    m.tags_slice().first().map(|t| t.value_ref().clone())
   }
 
   #[test]
@@ -671,6 +702,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_8_byte_all_ff_is_u64_max_exact_decimal() {
     // Oracle (bundled Perl, re-derived 2026-05-19):
@@ -688,21 +720,25 @@ mod tests {
       "u64::MAX must be the exact decimal (Perl oracle: 18446744073709551615), \
        not -1 (the old u64→i64 sign-flip)"
     );
-    // Serializer: the number gate quotes ≥16-digit integers, exactly as
-    // ExifTool's EscapeJSON (line 3809) emits a big unsigned int.
+    // Serializer (value-semantic): the exact u64::MAX value is preserved.
+    // The numeric STRING `"18446744073709551615"` value-equals the bare
+    // `18446744073709551615`, and both differ from `-1`.
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
+    crate::jsondiff::json_equivalent(
+      &json,
+      r#"[{"SourceFile":"x.test","Test:Field":18446744073709551615}]"#,
+    )
+    .expect("u64::MAX exact value");
     assert!(
-      json.contains("\"Test:Field\": \"18446744073709551615\""),
-      "≥16-digit value must be quoted by the number gate: {json}"
-    );
-    assert!(
-      !json.contains("\"Test:Field\": -1"),
+      crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"x.test","Test:Field":-1}]"#,)
+        .is_err(),
       "must NOT be -1 (the old u64→i64 sign-flip): {json}"
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_9_byte_all_ff_promotes_to_nv_format_g() {
     // Oracle (bundled Perl, re-derived 2026-05-19):
@@ -720,16 +756,16 @@ mod tests {
       TagValue::Str("4.72236648286965e+21".into()),
       "9-byte all-0xFF promotes to NV ⇒ Perl `%.15g` (oracle: 4.72236648286965e+21)"
     );
-    // Number gate accepts scientific: emitted bare (not quoted), like
-    // bundled `perl exiftool -j` emits an NV. The gate's regex
-    // (ExifTool.pm:3809) accepts `4.72236648286965e+21`.
+    // Value-semantic: the NV-string value-equals the bare scientific number
+    // bundled `perl exiftool -j` emits.
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
-    assert!(
-      json.contains("\"Test:Field\": 4.72236648286965e+21"),
-      "NV-string must pass the number gate as a bare JSON number: {json}"
-    );
+    crate::jsondiff::json_equivalent(
+      &json,
+      r#"[{"SourceFile":"x.test","Test:Field":4.72236648286965e+21}]"#,
+    )
+    .expect("NV value-equals the bare scientific number");
   }
 
   #[test]
@@ -769,6 +805,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_small_value_is_i64_and_emitted_bare() {
     // Prove the common (≤ i64::MAX) path is byte-exact unchanged.
@@ -786,16 +823,16 @@ mod tests {
     let mut m = Metadata::new("x.test");
     m.push(Group::new("Test", "Test"), "Field", got);
     let json = to_exiftool_json(&m);
+    // serde emits the i64 as a bare number; value-equivalent to 65535.
+    crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"x.test","Test:Field":65535}]"#)
+      .expect("small i64 value");
     assert!(
-      json.contains("\"Test:Field\": 65535"),
-      "≤15-digit i64 must be emitted bare (not quoted): {json}"
-    );
-    assert!(
-      !json.contains("\"65535\""),
-      "must NOT be a quoted string: {json}"
+      json.contains("65535") && !json.contains("\"65535\""),
+      "i64 emitted as a bare number, not a quoted string: {json}"
     );
   }
 
+  #[cfg(feature = "json")]
   #[test]
   fn no_format_8_byte_i64_max_split_boundary() {
     // Pins the u64-mode i64::MAX / i64::MAX+1 representation-split (D5).
@@ -824,10 +861,11 @@ mod tests {
     let mut m_max = Metadata::new("x.test");
     m_max.push(Group::new("Test", "Test"), "Field", got_max);
     let json_max = to_exiftool_json(&m_max);
-    assert!(
-      json_max.contains("\"Test:Field\": \"9223372036854775807\""),
-      "i64::MAX (19 digits) must be quoted by the number gate: {json_max}"
-    );
+    crate::jsondiff::json_equivalent(
+      &json_max,
+      r#"[{"SourceFile":"x.test","Test:Field":9223372036854775807}]"#,
+    )
+    .expect("i64::MAX exact value");
 
     // -- i64::MAX+1 side: val > i64::MAX => TagValue::Str(exact decimal) --
     let data_over = [0x80u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -841,10 +879,12 @@ mod tests {
     let mut m_over = Metadata::new("x.test");
     m_over.push(Group::new("Test", "Test"), "Field", got_over);
     let json_over = to_exiftool_json(&m_over);
-    assert!(
-      json_over.contains("\"Test:Field\": \"9223372036854775808\""),
-      "i64::MAX+1 (19 digits) must be quoted by the number gate: {json_over}"
-    );
+    // The Str holds the exact decimal; value-equals the bare i64::MAX+1.
+    crate::jsondiff::json_equivalent(
+      &json_over,
+      r#"[{"SourceFile":"x.test","Test:Field":9223372036854775808}]"#,
+    )
+    .expect("i64::MAX+1 exact value (no sign-flip)");
   }
 
   // ── process_bit_stream_cond + FrameState (MPEG.pm faithful) ──
@@ -934,9 +974,9 @@ mod tests {
     // Raw extraction set MPEG_Vers=3, then SR chose SR_V1.
     assert_eq!(state.get("MPEG_Vers"), Some(3));
     let tags: Vec<_> = m
-      .tags()
+      .tags_slice()
       .iter()
-      .map(|t| (t.name(), t.value().clone()))
+      .map(|t| (t.name(), t.value_ref().clone()))
       .collect();
     assert_eq!(
       tags,
@@ -981,7 +1021,7 @@ mod tests {
       &mut m,
       true,
     );
-    assert!(m.tags().is_empty(), "no matching arm => no tag");
+    assert!(m.tags_slice().is_empty(), "no matching arm => no tag");
   }
 
   #[test]
@@ -999,11 +1039,7 @@ mod tests {
     )
     .with_raw_conv(RawConv::SetFrameState("MPEG_Layer"));
     fn choose(key: &str, _s: &FrameState) -> Option<&'static TagDef> {
-      if key == "Bit13-14" {
-        Some(&VL)
-      } else {
-        None
-      }
+      if key == "Bit13-14" { Some(&VL) } else { None }
     }
     // Layout: byte 1 bits 5-6 = layer (0xfb >> 1 & 0b11 = 0b01 = 1).
     let data = [0xffu8, 0xfb, 0x90, 0x4c];
@@ -1026,6 +1062,6 @@ mod tests {
       "RawConv must capture the raw integer, not the value-converted result"
     );
     // Emitted tag IS value-converted (99) — the tag pipeline is unaffected.
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(99));
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(99));
   }
 }

@@ -25,31 +25,36 @@ macro_rules! read_int {
 impl<'a> ByteReader<'a> {
   /// Wrap a buffer, positioned at byte 0.
   #[must_use]
-  pub fn new(buf: &'a [u8]) -> Self {
+  #[inline(always)]
+  pub const fn new(buf: &'a [u8]) -> Self {
     Self { buf, pos: 0 }
   }
 
   /// Current byte offset.
   #[must_use]
-  pub fn position(&self) -> usize {
+  #[inline(always)]
+  pub const fn position(&self) -> usize {
     self.pos
   }
 
   /// Total length of the underlying buffer.
   #[must_use]
-  pub fn len(&self) -> usize {
+  #[inline(always)]
+  pub const fn len(&self) -> usize {
     self.buf.len()
   }
 
   /// True if the buffer is empty.
   #[must_use]
-  pub fn is_empty(&self) -> bool {
+  #[inline(always)]
+  pub const fn is_empty(&self) -> bool {
     self.buf.is_empty()
   }
 
   /// Bytes remaining after the cursor.
   #[must_use]
-  pub fn remaining(&self) -> usize {
+  #[inline(always)]
+  pub const fn remaining(&self) -> usize {
     self.buf.len().saturating_sub(self.pos)
   }
 

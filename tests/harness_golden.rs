@@ -7,7 +7,11 @@
 //! suite never fails merely because this optional toolchain is missing.
 //! The check writes only into a throwaway temp dir — it never mutates the
 //! tracked `tests/golden/` files.
-#![cfg(unix)]
+//!
+//! Also gated on `feature = "json"` (Codex A-R4-2): the golden round-trip
+//! parses with `serde_json` (the `json`-feature dep), which `std` does not
+//! imply, so a `--features std,id3` test build skips this file.
+#![cfg(all(unix, feature = "json"))]
 
 use std::{
   path::{Path, PathBuf},

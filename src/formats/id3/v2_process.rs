@@ -23,7 +23,7 @@
 //! - Unhandled: faithful Warn "Don't know how to handle $id frame".
 
 use crate::{
-  convert::{apply_ctx, ConvContext},
+  convert::{ConvContext, apply_ctx},
   formats::id3::decode::{decode_string, decode_string_joined, unsync_safe},
   tagtable::{TagDef, TagId, TagTable},
   value::{Group, Metadata, TagValue},
@@ -1375,10 +1375,10 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let title = m.tags().iter().find(|t| t.name() == "Title");
+    let title = m.tags_slice().iter().find(|t| t.name() == "Title");
     assert!(title.is_some());
-    assert_eq!(title.unwrap().value(), &TagValue::Str("Hello".into()));
-    assert_eq!(title.unwrap().group().family1(), "ID3v2_2");
+    assert_eq!(title.unwrap().value_ref(), &TagValue::Str("Hello".into()));
+    assert_eq!(title.unwrap().group_ref().family1(), "ID3v2_2");
   }
 
   #[test]
@@ -1396,9 +1396,9 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let t = m.tags().iter().find(|t| t.name() == "Title").unwrap();
-    assert_eq!(t.value(), &TagValue::Str("Hi".into()));
-    assert_eq!(t.group().family1(), "ID3v2_3");
+    let t = m.tags_slice().iter().find(|t| t.name() == "Title").unwrap();
+    assert_eq!(t.value_ref(), &TagValue::Str("Hi".into()));
+    assert_eq!(t.group_ref().family1(), "ID3v2_3");
   }
 
   #[test]
@@ -1416,9 +1416,9 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let t = m.tags().iter().find(|t| t.name() == "Title").unwrap();
-    assert_eq!(t.value(), &TagValue::Str("Bye".into()));
-    assert_eq!(t.group().family1(), "ID3v2_4");
+    let t = m.tags_slice().iter().find(|t| t.name() == "Title").unwrap();
+    assert_eq!(t.value_ref(), &TagValue::Str("Bye".into()));
+    assert_eq!(t.group_ref().family1(), "ID3v2_4");
   }
 
   #[test]
@@ -1441,8 +1441,8 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    assert!(m.tags().iter().any(|t| t.name() == "Title"));
-    assert!(!m.tags().iter().any(|t| t.name() == "Artist"));
+    assert!(m.tags_slice().iter().any(|t| t.name() == "Title"));
+    assert!(!m.tags_slice().iter().any(|t| t.name() == "Artist"));
   }
 
   #[test]
@@ -1472,19 +1472,28 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let mime = m.tags().iter().find(|t| t.name() == "PictureMIMEType");
+    let mime = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "PictureMIMEType");
     assert!(mime.is_some());
-    assert_eq!(mime.unwrap().value(), &TagValue::Str("image/jpeg".into()));
-    let pic_type = m.tags().iter().find(|t| t.name() == "PictureType");
     assert_eq!(
-      pic_type.unwrap().value(),
+      mime.unwrap().value_ref(),
+      &TagValue::Str("image/jpeg".into())
+    );
+    let pic_type = m.tags_slice().iter().find(|t| t.name() == "PictureType");
+    assert_eq!(
+      pic_type.unwrap().value_ref(),
       &TagValue::Str("Front Cover".into())
     );
-    let desc = m.tags().iter().find(|t| t.name() == "PictureDescription");
-    assert_eq!(desc.unwrap().value(), &TagValue::Str("my desc".into()));
-    let pic = m.tags().iter().find(|t| t.name() == "Picture");
+    let desc = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "PictureDescription");
+    assert_eq!(desc.unwrap().value_ref(), &TagValue::Str("my desc".into()));
+    let pic = m.tags_slice().iter().find(|t| t.name() == "Picture");
     assert_eq!(
-      pic.unwrap().value(),
+      pic.unwrap().value_ref(),
       &TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
     );
   }
@@ -1519,12 +1528,12 @@ mod tests {
     // collapses `[a-z][_ ][a-z]` into `[a-z][A-Z]`). The value is just
     // `abc123` — NOT `(MusicBrainz Album Id) abc123`.
     let txxx = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "MusicBrainzAlbumId")
       .expect("synthesized TXXX tag");
-    assert_eq!(txxx.value(), &TagValue::Str("abc123".into()));
-    assert_eq!(txxx.group().family1(), "ID3v2_3");
+    assert_eq!(txxx.value_ref(), &TagValue::Str("abc123".into()));
+    assert_eq!(txxx.group_ref().family1(), "ID3v2_3");
   }
 
   #[test]
@@ -1552,8 +1561,8 @@ mod tests {
     // 4-byte length itself + 2 more bytes (the ext-flags-and-padding).
     let mut ext = Vec::new();
     ext.extend_from_slice(&[0, 0, 0, 6]); // length=6 (NOT sync-safe in v2.3;
-                                          // UnSyncSafe leaves small values
-                                          // unchanged)
+    // UnSyncSafe leaves small values
+    // unchanged)
     ext.extend_from_slice(&[0, 0]); // 2 ext bytes
     let payload: Vec<u8> = ext.into_iter().chain(title_frame).collect();
     let size = payload.len() as u32;
@@ -1571,7 +1580,7 @@ mod tests {
     // Here we just exercise the wrapper indirectly by replicating the
     // bundled behavior: strip `len` bytes from h_buff, then process.
     let mut h_buff: Vec<u8> = data[10..].to_vec(); // skip ID3v2 header
-                                                   // Read ext length (first 4 bytes of h_buff).
+    // Read ext length (first 4 bytes of h_buff).
     let ext_len_raw = u32::from_be_bytes([h_buff[0], h_buff[1], h_buff[2], h_buff[3]]);
     // UnSyncSafe leaves <=0x7F unchanged.
     let ext_len = ext_len_raw as usize;
@@ -1584,8 +1593,8 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let t = m.tags().iter().find(|t| t.name() == "Title").unwrap();
-    assert_eq!(t.value(), &TagValue::Str("Ext".into()));
+    let t = m.tags_slice().iter().find(|t| t.name() == "Title").unwrap();
+    assert_eq!(t.value_ref(), &TagValue::Str("Ext".into()));
   }
 
   #[test]
@@ -1607,10 +1616,13 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let fmt = m.tags().iter().find(|t| t.name() == "PictureFormat");
-    assert_eq!(fmt.unwrap().value(), &TagValue::Str("JPG".into()));
-    let pic_type = m.tags().iter().find(|t| t.name() == "PictureType");
-    assert_eq!(pic_type.unwrap().value(), &TagValue::Str("Other".into()));
+    let fmt = m.tags_slice().iter().find(|t| t.name() == "PictureFormat");
+    assert_eq!(fmt.unwrap().value_ref(), &TagValue::Str("JPG".into()));
+    let pic_type = m.tags_slice().iter().find(|t| t.name() == "PictureType");
+    assert_eq!(
+      pic_type.unwrap().value_ref(),
+      &TagValue::Str("Other".into())
+    );
   }
 
   #[test]
@@ -1630,16 +1642,20 @@ mod tests {
       &ConvContext::default(),
     );
     let mcdi = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "MusicCDIdentifier")
       .expect("MCDI must be emitted as raw bytes");
-    assert_eq!(mcdi.value(), &TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    assert_eq!(
+      mcdi.value_ref(),
+      &TagValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
+    );
     // No Warn for known-binary frames.
-    assert!(m
-      .warnings()
-      .iter()
-      .all(|w| !w.contains("Don't know how to handle")));
+    assert!(
+      m.warnings_slice()
+        .iter()
+        .all(|w| !w.contains("Don't know how to handle"))
+    );
   }
 
   #[test]
@@ -1665,16 +1681,18 @@ mod tests {
       &ConvContext::default(),
     );
     // No GEOB-* tags, no GeneralEncapsulatedObject.
-    assert!(m
-      .tags()
-      .iter()
-      .all(|t| !t.name().starts_with("GEOB") && t.name() != "GeneralEncapsulatedObject"));
+    assert!(
+      m.tags_slice()
+        .iter()
+        .all(|t| !t.name().starts_with("GEOB") && t.name() != "GeneralEncapsulatedObject")
+    );
     // No "Don't know how to handle" Warn — bundled silently dispatches
     // SubDirectory frames; our skip must be silent too.
-    assert!(m
-      .warnings()
-      .iter()
-      .all(|w| !w.contains("Don't know how to handle")));
+    assert!(
+      m.warnings_slice()
+        .iter()
+        .all(|w| !w.contains("Don't know how to handle"))
+    );
   }
 
   #[test]
@@ -1698,18 +1716,19 @@ mod tests {
     );
     // The v2.4 alternate table's def carries family-1 group ID3v2_4.
     let t = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "RecordingTime")
       .expect("v2.4 fallback def must resolve TDRC");
-    assert_eq!(t.group().family1(), "ID3v2_4");
+    assert_eq!(t.group_ref().family1(), "ID3v2_4");
     // dateTimeConv: XMP → EXIF date.
-    assert_eq!(t.value(), &TagValue::Str("2024:05:19".into()));
+    assert_eq!(t.value_ref(), &TagValue::Str("2024:05:19".into()));
     // Bundled minor Warn fires.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version")));
+    assert!(
+      m.warnings_slice()
+        .iter()
+        .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version"))
+    );
   }
 
   #[test]
@@ -1738,15 +1757,16 @@ mod tests {
     );
     // No PictureMIMEType / PictureType / PictureDescription / Picture
     // tags pushed for the invalid frame.
-    assert!(m.tags().iter().all(|t| !matches!(
+    assert!(m.tags_slice().iter().all(|t| !matches!(
       t.name(),
       "Picture" | "PictureMIMEType" | "PictureType" | "PictureDescription"
     )));
     // Faithful Warn.
-    assert!(m
-      .warnings()
-      .iter()
-      .any(|w| w.contains("Invalid APIC frame")));
+    assert!(
+      m.warnings_slice()
+        .iter()
+        .any(|w| w.contains("Invalid APIC frame"))
+    );
   }
 
   #[test]
@@ -1779,8 +1799,8 @@ mod tests {
       &ConvContext::default(),
     );
     // TIT2 was successfully extracted despite the preceding unknown frame.
-    let t = m.tags().iter().find(|t| t.name() == "Title").unwrap();
-    assert_eq!(t.value(), &TagValue::Str("OK".into()));
+    let t = m.tags_slice().iter().find(|t| t.name() == "Title").unwrap();
+    assert_eq!(t.value_ref(), &TagValue::Str("OK".into()));
   }
 
   #[test]
@@ -1801,8 +1821,15 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let pcnt = m.tags().iter().find(|t| t.name() == "PlayCounter").unwrap();
-    assert_eq!(pcnt.value(), &TagValue::Str("9223372036854775808".into()));
+    let pcnt = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "PlayCounter")
+      .unwrap();
+    assert_eq!(
+      pcnt.value_ref(),
+      &TagValue::Str("9223372036854775808".into())
+    );
   }
 
   #[test]
@@ -1824,11 +1851,11 @@ mod tests {
       &ConvContext::default(),
     );
     let t = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "TermsOfUse-fra")
       .expect("non-eng USER frame must emit lang-suffixed tag");
-    assert_eq!(t.value(), &TagValue::Str("Termes d'utilisation".into()));
+    assert_eq!(t.value_ref(), &TagValue::Str("Termes d'utilisation".into()));
   }
 
   #[test]
@@ -1849,9 +1876,13 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let pcnt = m.tags().iter().find(|t| t.name() == "PlayCounter").unwrap();
+    let pcnt = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "PlayCounter")
+      .unwrap();
     assert_eq!(
-      pcnt.value(),
+      pcnt.value_ref(),
       &TagValue::Str("340282366920938463463374607431768211456".into())
     );
   }
@@ -1910,14 +1941,14 @@ mod tests {
     );
     // Bundled `ucfirst('private')` = "Private".
     let p = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "Private")
       .expect("25-char owner ID must clamp to 'Private'");
-    assert_eq!(p.value(), &TagValue::Bytes(b"payload".to_vec()));
+    assert_eq!(p.value_ref(), &TagValue::Bytes(b"payload".to_vec()));
     // And NO 25-char-named tag was emitted.
     assert!(m
-      .tags()
+      .tags_slice()
       .iter()
       .all(|t| t.name() != "ABCDEFGHIJKLMNOPQRSTUVWXY" && t.name() != "Abcdefghijklmnopqrstuvwxy"));
   }
@@ -1941,11 +1972,11 @@ mod tests {
     // ucfirst("ABCDEFGHIJKLMNOPQRSTUVWX") = "ABCDEFGHIJKLMNOPQRSTUVWX"
     // (already starts with uppercase).
     let p = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "ABCDEFGHIJKLMNOPQRSTUVWX")
       .expect("24-char owner ID must be accepted");
-    assert_eq!(p.value(), &TagValue::Bytes(b"x".to_vec()));
+    assert_eq!(p.value_ref(), &TagValue::Bytes(b"x".to_vec()));
   }
 
   #[test]
@@ -1971,11 +2002,11 @@ mod tests {
     );
     // `ENG` != `eng` (case-sensitive) ⇒ suffix `-eng` emitted.
     let t = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "TermsOfUse-eng")
       .expect("upper-case ENG must emit lang-suffixed tag");
-    assert_eq!(t.value(), &TagValue::Str("Upper-case eng".into()));
+    assert_eq!(t.value_ref(), &TagValue::Str("Upper-case eng".into()));
   }
 
   #[test]
@@ -1994,8 +2025,12 @@ mod tests {
       true,
       &ConvContext::default(),
     );
-    let t = m.tags().iter().find(|t| t.name() == "TermsOfUse").unwrap();
-    assert_eq!(t.value(), &TagValue::Str("Terms of use".into()));
+    let t = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "TermsOfUse")
+      .unwrap();
+    assert_eq!(t.value_ref(), &TagValue::Str("Terms of use".into()));
   }
 
   #[test]

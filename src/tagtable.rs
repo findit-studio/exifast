@@ -5,6 +5,7 @@ use crate::{convert::ConvContext, value::TagValue};
 
 /// A value-stage conversion (ExifTool `ValueConv`). `Func` is a faithful Rust
 /// transliteration of the Perl expression.
+#[non_exhaustive]
 #[derive(Clone, Copy, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
@@ -36,6 +37,7 @@ pub enum ValueConv {
 ///
 /// `F64` is included for completeness with ExifTool hash values that are bare
 /// floats; like [`TagValue`] it therefore derives `PartialEq` only (no `Eq`).
+#[non_exhaustive]
 #[derive(
   Debug, Clone, Copy, PartialEq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -77,6 +79,7 @@ impl PrintConvHash {
   /// $val, undef, $conv)` — fallible: returning `None` ≡ Perl `undef`,
   /// which falls through to the `Unknown` fallback, `ExifTool.pm:3616`).
   #[must_use]
+  #[inline(always)]
   pub const fn new(
     direct: &'static [(&'static str, PrintValue)],
     bitmask: Option<&'static [(u8, &'static str)]>,
@@ -93,6 +96,7 @@ impl PrintConvHash {
   /// `BITMASK`, no `OTHER`) — the common case (e.g. EXIF `Orientation`,
   /// `AIFF.pm` `CompressionType`).
   #[must_use]
+  #[inline(always)]
   pub const fn direct(entries: &'static [(&'static str, PrintValue)]) -> Self {
     Self {
       direct: entries,
@@ -105,6 +109,7 @@ impl PrintConvHash {
   /// post-ValueConv `$val` is stringified for `$$conv{$val}`,
   /// `ExifTool.pm:3605`).
   #[must_use]
+  #[inline(always)]
   pub const fn direct_entries(&self) -> &'static [(&'static str, PrintValue)] {
     self.direct
   }
@@ -112,6 +117,7 @@ impl PrintConvHash {
   /// `$$conv{BITMASK}` if present: bit-position → decoded name, fed to
   /// `DecodeBits` (`ExifTool.pm:3607`).
   #[must_use]
+  #[inline(always)]
   pub const fn bitmask(&self) -> Option<&'static [(u8, &'static str)]> {
     self.bitmask
   }
@@ -119,6 +125,7 @@ impl PrintConvHash {
   /// `$$conv{OTHER}` if present: ExifTool's alternate conversion routine
   /// (`ExifTool.pm:3610-3615`), modelled as a fallible Rust fn.
   #[must_use]
+  #[inline(always)]
   pub const fn other(&self) -> Option<fn(&TagValue) -> Option<TagValue>> {
     self.other
   }
@@ -139,6 +146,7 @@ impl PrintConvHash {
 /// arms (which read the same state) see the updated value. New variants
 /// (e.g. a transforming `Func(fn(&TagValue) -> TagValue)`) are additive —
 /// add when a faithful port first needs one and pin via the oracle golden.
+#[non_exhaustive]
 #[derive(
   Clone, Copy, Debug, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -170,6 +178,7 @@ pub enum RawConv {
 /// incremental-derivation discipline as D11 / `BitOrder::Ii` / unknown-
 /// header. None of AAC, FLAC StreamInfo, or any current pathfinder tag
 /// table needs it.
+#[non_exhaustive]
 #[derive(Clone, Copy, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
@@ -230,6 +239,7 @@ impl TagDef {
   /// (most tags); set them with [`TagDef::with_print_hex`] /
   /// [`TagDef::with_bits_per_word`].
   #[must_use]
+  #[inline(always)]
   pub const fn new(
     name: &'static str,
     group1: &'static str,
@@ -254,6 +264,7 @@ impl TagDef {
   /// `Unknown (0x%x)` instead of `Unknown (%s)` (e.g. `RIFF.pm:693`,
   /// `ASF.pm:451`, `Matroska.pm:270`).
   #[must_use]
+  #[inline(always)]
   pub const fn with_print_hex(mut self, print_hex: bool) -> Self {
     self.print_hex = print_hex;
     self
@@ -262,6 +273,7 @@ impl TagDef {
   /// Set `$$tagInfo{BitsPerWord}` (`ExifTool.pm:3607` → `DecodeBits`'s 3rd
   /// arg). `None` ⇒ `DecodeBits` default of 32 (`ExifTool.pm:6377`).
   #[must_use]
+  #[inline(always)]
   pub const fn with_bits_per_word(mut self, bits_per_word: u8) -> Self {
     self.bits_per_word = Some(bits_per_word);
     self
@@ -282,6 +294,7 @@ impl TagDef {
   /// yet interpreted — deferred per the Phase-2 forward items; a format that
   /// needs one adds it then, validated against that format's golden.
   #[must_use]
+  #[inline(always)]
   pub const fn with_format(mut self, format: &'static str) -> Self {
     self.format = Some(format);
     self
@@ -302,6 +315,7 @@ impl TagDef {
   /// The flag-vs-call split keeps the seam tiny: every existing `push`
   /// site is untouched, only Vorbis/ID3-style accumulators opt in.
   #[must_use]
+  #[inline(always)]
   pub const fn with_list(mut self, list: bool) -> Self {
     self.list = list;
     self
@@ -313,6 +327,7 @@ impl TagDef {
   /// written here is observable to sibling tags' Condition arms — faithful
   /// to MPEG.pm:27/36/202 + 47/71/95/.../224.
   #[must_use]
+  #[inline(always)]
   pub const fn with_raw_conv(mut self, raw_conv: RawConv) -> Self {
     self.raw_conv = raw_conv;
     self
@@ -320,24 +335,28 @@ impl TagDef {
 
   /// Tag name as ExifTool reports it.
   #[must_use]
+  #[inline(always)]
   pub const fn name(&self) -> &'static str {
     self.name
   }
 
   /// ExifTool family-1 group (the `Group1:` JSON prefix).
   #[must_use]
+  #[inline(always)]
   pub const fn group1(&self) -> &'static str {
     self.group1
   }
 
   /// Value-stage conversion.
   #[must_use]
+  #[inline(always)]
   pub const fn value_conv(&self) -> ValueConv {
     self.value_conv
   }
 
   /// Print-stage conversion.
   #[must_use]
+  #[inline(always)]
   pub const fn print_conv(&self) -> PrintConv {
     self.print_conv
   }
@@ -345,6 +364,7 @@ impl TagDef {
   /// `$$tagInfo{PrintHex}` (`ExifTool.pm:3617`); `false` when the Perl
   /// tagInfo omits the key.
   #[must_use]
+  #[inline(always)]
   pub const fn print_hex(&self) -> bool {
     self.print_hex
   }
@@ -352,6 +372,7 @@ impl TagDef {
   /// `$$tagInfo{BitsPerWord}` (`ExifTool.pm:3607`); `None` ⇒ `DecodeBits`
   /// default of 32 (`ExifTool.pm:6377`).
   #[must_use]
+  #[inline(always)]
   pub const fn bits_per_word(&self) -> Option<u8> {
     self.bits_per_word
   }
@@ -360,6 +381,7 @@ impl TagDef {
   /// `Format` key — bit-field extracted as unsigned integer. `Some("undef")`
   /// ⇒ raw byte string passed to `ValueConv` as [`crate::value::TagValue::Bytes`].
   #[must_use]
+  #[inline(always)]
   pub const fn format(&self) -> Option<&'static str> {
     self.format
   }
@@ -367,6 +389,7 @@ impl TagDef {
   /// `$$tagInfo{List}` (e.g. `Vorbis.pm:85` ARTIST `List => 1`). See
   /// [`with_list`](Self::with_list) for the accumulation semantics.
   #[must_use]
+  #[inline(always)]
   pub const fn list(&self) -> bool {
     self.list
   }
@@ -374,6 +397,7 @@ impl TagDef {
   /// `$$tagInfo{RawConv}` (ExifTool.pm:3477-3501); [`RawConv::None`] when
   /// the Perl tagInfo omits the key.
   #[must_use]
+  #[inline(always)]
   pub const fn raw_conv(&self) -> RawConv {
     self.raw_conv
   }
@@ -388,6 +412,7 @@ impl TagDef {
 ///
 /// Both variants are `Copy` (`i64` / `&'static str`), so `TagId` is `Copy`,
 /// `Eq` and `Hash`.
+#[non_exhaustive]
 #[derive(
   Debug,
   Clone,
@@ -417,12 +442,14 @@ pub struct TagTable {
 impl TagTable {
   /// Construct a `TagTable` with the given family-0 group and lookup function.
   #[must_use]
+  #[inline(always)]
   pub const fn new(group0: &'static str, get: fn(TagId) -> Option<&'static TagDef>) -> Self {
     Self { group0, get }
   }
 
   /// ExifTool family-0 group for tags from this table.
   #[must_use]
+  #[inline(always)]
   pub const fn group0(&self) -> &'static str {
     self.group0
   }
@@ -430,6 +457,7 @@ impl TagTable {
   /// Resolve an opaque ([`TagId`]) tag id — numeric or string — to its
   /// definition, exactly as ExifTool indexes its tag-table hash.
   #[must_use]
+  #[inline(always)]
   pub const fn get(&self) -> fn(TagId) -> Option<&'static TagDef> {
     self.get
   }

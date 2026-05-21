@@ -33,7 +33,7 @@
 
 use crate::{
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv},
-  value::{format_g, TagValue},
+  value::{TagValue, format_g},
 };
 use smol_str::SmolStr;
 
@@ -63,6 +63,7 @@ impl ConvContext {
   /// `static` use (e.g. test fixtures); production callers usually want
   /// [`ConvContext::default`].
   #[must_use]
+  #[inline(always)]
   pub const fn new(charset_id3: &'static str) -> Self {
     Self { charset_id3 }
   }
@@ -70,6 +71,7 @@ impl ConvContext {
   /// `$$self{OPTIONS}{CharsetID3}` — drives `ConvertID3v1Text`
   /// (ID3.pm:897-901). Default `"Latin"` (ExifTool.pm:1118).
   #[must_use]
+  #[inline(always)]
   pub const fn charset_id3(&self) -> &'static str {
     self.charset_id3
   }
@@ -79,6 +81,7 @@ impl ConvContext {
   /// production callers stay on the default; this builder exists for
   /// tests + the documented extension contract.
   #[must_use]
+  #[inline(always)]
   pub const fn with_charset_id3(mut self, value: &'static str) -> Self {
     self.charset_id3 = value;
     self
@@ -496,14 +499,74 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
   bit_list.join(if lookup.is_some() { ", " } else { "," })
 }
 
-// `convert_bitrate` (faithful `sub ConvertBitrate($)` from
-// `ExifTool.pm:6891-6902`) is DEFERRED to the dedicated Vorbis/Theora codec
-// PRs (R1 F2 — see `src/formats/ogg.rs` top-of-module comment). The Ogg
-// pathfinder PR tightened its scope back to "container + Vorbis-comment
-// block" and the `convert_bitrate` engine helper has no in-scope consumer
-// here. When `Vorbis.pm` / `Theora.pm` codec-identification-table PRs land,
-// they will re-land this helper alongside its consumers (Vorbis.pm:55,61,67
-// + Theora.pm:88).
+/// Format-into-writer port of `Image::ExifTool::ConvertBitrate`
+/// (ExifTool.pm:6891-6902). Writes the formatted bitrate string directly
+/// into a [`core::fmt::Write`] sink — no intermediate `String` allocation.
+///
+/// Perl reference:
+/// ```perl
+/// my $bitrate = shift;
+/// IsFloat($bitrate) or return $bitrate;
+/// my @units = ('bps', 'kbps', 'Mbps', 'Gbps');
+/// for (;;) {
+///     my $units = shift @units;
+///     $bitrate >= 1000 and @units and $bitrate /= 1000, next;
+///     my $fmt = $bitrate < 100 ? '%.3g' : '%.0f';
+///     return sprintf("$fmt $units", $bitrate);
+/// }
+/// ```
+///
+/// Bundled-Perl oracle (verified 2026-05-20 / 2026-05-22):
+/// - `224_000` → `"224 kbps"`
+/// - `8_500_000` → `"8.5 Mbps"`
+/// - `50` → `"50 bps"`
+/// - `999` → `"999 bps"`
+/// - `1000` → `"1 kbps"`
+/// - `1_500_000_000` → `"1.5 Gbps"`
+/// - `32_000` (Vorbis NominalBitrate fixture) → `"32 kbps"`
+/// - `128_000` (Vorbis NominalBitrate fixture) → `"128 kbps"`
+///
+/// R2 F-OGG-TRIM: this helper had been deferred to dedicated Vorbis/Theora
+/// codec PRs (R1 F2 scope tightening). Round-2 review flagged the
+/// identification-header tables as in-scope after all — the tables are
+/// small, the deferral was creating new conformance hand-trims, and the
+/// trims violated the "no hand-trims" 1:1 bar. Helper re-landed here (was
+/// in `formats/moi.rs`) so both `formats/moi.rs` (`write_convert_bitrate`
+/// re-export) and `formats/ogg.rs` (Vorbis::Identification +
+/// Opus::Header PrintConv path) can share the single faithful
+/// implementation.
+#[allow(dead_code)] // Used under `feature = "moi"` and `feature = "ogg"`; unused under feature-pruned builds without either.
+pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  bitrate: f64,
+) -> core::fmt::Result {
+  if !bitrate.is_finite() {
+    return write!(w, "{bitrate}");
+  }
+  const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
+  let mut b = bitrate;
+  for (i, &unit) in UNITS.iter().enumerate() {
+    let is_last = i + 1 == UNITS.len();
+    if b >= 1000.0 && !is_last {
+      b /= 1000.0;
+      continue;
+    }
+    return if b < 100.0 {
+      // `%.3g` — Perl `%g` strips trailing zeros. Share the engine's
+      // existing helper so byte-exact matching against the bundled oracle
+      // is centralized.
+      let formatted = crate::value::format_g(b, 3);
+      write!(w, "{formatted} {unit}")
+    } else {
+      // `%.0f` — Perl `%.0f` is half-to-even; for bitrate ranges here the
+      // post-division values are never exactly `.5`, so Rust's
+      // half-away-from-zero `{:.0}` produces byte-identical output.
+      write!(w, "{b:.0} {unit}")
+    };
+  }
+  // Unreachable: the loop always returns on the last UNITS entry.
+  unreachable!("write_convert_bitrate loop must exit on the last unit");
+}
 
 /// Faithful transliteration of `Image::ExifTool::XMP::DecodeBase64` (an
 /// RFC 4648 decode used by `Vorbis.pm:101-104` for `COVERART` and
@@ -514,6 +577,13 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
 /// but-bounded behavior — real ExifTool COVERART payloads are clean base64,
 /// so this fallback is mostly defensive and never panics). Output is the
 /// decoded raw bytes.
+///
+/// `#[allow(dead_code)]`: only the `ogg` format uses this helper today; under
+/// feature-pruned builds without OGG the dead-code lint fires. The helper
+/// stays in `convert.rs` (not in `formats/ogg.rs`) because it's logically
+/// a `ConvertBase64` helper akin to ExifTool's `MIME::Base64::decode` and
+/// will be reused by future XMP/EXIF ports.
+#[allow(dead_code)]
 pub(crate) fn base64_decode(s: &str) -> Vec<u8> {
   // Map an ASCII byte to its 6-bit value, or `None` for ignored/invalid.
   fn val(b: u8) -> Option<u8> {
@@ -590,6 +660,8 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
   match v {
     // Perl stringifies an integer as its decimal text (`"$n"`).
     TagValue::I64(n) => Some(n.to_string()),
+    // An unsigned 64-bit integer stringifies the same way (`"$n"`).
+    TagValue::U64(n) => Some(n.to_string()),
     // Same `%.15g`-ish text the serializer feeds through `EscapeJSON`
     // (non-finite never reaches a hash PrintConv; mirror Perl's `"$n"`).
     TagValue::F64(n) => Some(if n.is_finite() {
@@ -1081,6 +1153,7 @@ fn read_one(data: &[u8], offset: usize, format: &str, byte_order: ByteOrder) -> 
 fn scalar_text(v: &TagValue) -> String {
   match v {
     TagValue::I64(n) => n.to_string(),
+    TagValue::U64(n) => n.to_string(),
     // Perl stringifies a float via `%g`-ish (default `$DIG = 15`). The
     // serializer uses `format_g(_, 15)` for floats; same here so the joined
     // text matches what ExifTool's joined `@vals` would print.
@@ -1166,6 +1239,7 @@ mod tests {
   // emits the JSON number `2`, never the string `"2"`. Pin that shape:
   // the Map hit must yield a numeric `TagValue`, and serializing it must
   // produce a bare JSON number.
+  #[cfg(feature = "json")]
   #[test]
   fn numeric_map_value_yields_number_not_string() {
     static CHANNELS: TagDef = TagDef::new(
@@ -1182,13 +1256,14 @@ mod tests {
     let v = apply(&CHANNELS, &TagValue::I64(2), true);
     assert_eq!(v, TagValue::I64(2));
 
-    use crate::{serialize::to_exiftool_json, Group, Metadata};
+    use crate::{Group, Metadata, serialize::to_exiftool_json};
     let mut m = Metadata::new("a.aac");
     m.push(Group::new("Audio", "AAC"), "Channels", v);
     let json = to_exiftool_json(&m);
-    // JSON number `2`, NOT the quoted string `"2"`.
-    assert!(json.contains("\"AAC:Channels\": 2"), "got: {json}");
-    assert!(!json.contains("\"AAC:Channels\": \"2\""), "got: {json}");
+    // serde emits the I64 as a bare JSON number `2`, NOT a quoted string `"2"`.
+    crate::jsondiff::json_equivalent(&json, r#"[{"SourceFile":"a.aac","AAC:Channels":2}]"#)
+      .expect("Channels=2 numeric value");
+    assert!(!json.contains("\"AAC:Channels\":\"2\""), "got: {json}");
   }
 
   // Faithful to `Image::ExifTool::AIFF` `CompressionType` (AIFF.pm:88-101),
@@ -2652,7 +2727,7 @@ mod tests {
     assert_eq!(pipeline(0xFFFE), "???"); // noncharacter ⇒ 3 `?`s
     assert_eq!(pipeline(0x10FFFF), "\u{10ffff}"); // max valid kept
     assert_eq!(pipeline(0x110000), "????"); // > U+10FFFF ⇒ 4 `?`s
-                                            // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
+    // R5 additions — Perl-empirical (`pack('C0U', n)` → `FixUTF8`):
     assert_eq!(pipeline(0x1_0000_0000), "???????"); // 7 `?`s (above-u32 7-byte)
     assert_eq!(pipeline(0xF_FFFF_FFFF), "???????"); // 7 `?`s (top of 7-byte range)
     assert_eq!(pipeline(0x10_0000_0000), "?????????????"); // 13 `?`s (13-byte form)

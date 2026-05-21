@@ -352,14 +352,14 @@ pub fn process_binary_data(
         } else {
           let bytes = &data[base..base + avail];
           let stripped = strip_at_first_null(bytes); // :10027
-                                                     // Emit raw bytes (faithful to Perl `$val = substr(...)`, which is
-                                                     // a BYTE STRING — no UTF-8 reinterpretation, no `from_utf8_lossy`).
-                                                     // The convert layer is responsible for any MacRoman/UTF-16
-                                                     // ValueConv; hash PrintConv lookups key the bytes via
-                                                     // [`crate::convert::exiftool_val_string`] (FixUTF8 — valid UTF-8
-                                                     // preserved, invalid high bytes replaced with `?`, matching Perl
-                                                     // EscapeJSON's behavior). Codex R3 verified the divergence on
-                                                     // CompressionType `\x80ABC` (Perl: "?ABC"; pre-fix: "U+0080ABC").
+          // Emit raw bytes (faithful to Perl `$val = substr(...)`, which is
+          // a BYTE STRING — no UTF-8 reinterpretation, no `from_utf8_lossy`).
+          // The convert layer is responsible for any MacRoman/UTF-16
+          // ValueConv; hash PrintConv lookups key the bytes via
+          // [`crate::convert::exiftool_val_string`] (FixUTF8 — valid UTF-8
+          // preserved, invalid high bytes replaced with `?`, matching Perl
+          // EscapeJSON's behavior). Codex R3 verified the divergence on
+          // CompressionType `\x80ABC` (Perl: "?ABC"; pre-fix: "U+0080ABC").
           Some(TagValue::Bytes(stripped.to_vec()))
         }
       }
@@ -384,9 +384,9 @@ pub fn process_binary_data(
           } else {
             let bytes = &data[body_start..body_start + count];
             let stripped = strip_at_first_null(bytes); // :10027
-                                                       // Emit raw bytes — see the StringFixed branch above. ValueConv
-                                                       // (e.g. AIFC `CompressorName`'s MacRoman decode) reads the raw
-                                                       // bytes; Codex R1 fix.
+            // Emit raw bytes — see the StringFixed branch above. ValueConv
+            // (e.g. AIFC `CompressorName`'s MacRoman decode) reads the raw
+            // bytes; Codex R1 fix.
             Some(TagValue::Bytes(stripped.to_vec()))
           }
         }
@@ -575,10 +575,10 @@ mod tests {
     let data = [0x00, 0x01, 0x00, 0x00, 0x2d, 0x22];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int16u", &TABLE, &[0, 1], &mut m, false);
-    assert_eq!(m.tags()[0].name(), "A");
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(1));
-    assert_eq!(m.tags()[1].name(), "B");
-    assert_eq!(m.tags()[1].value(), &TagValue::I64(11554));
+    assert_eq!(m.tags_slice()[0].name(), "A");
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(1));
+    assert_eq!(m.tags_slice()[1].name(), "B");
+    assert_eq!(m.tags_slice()[1].value_ref(), &TagValue::I64(11554));
   }
 
   #[test]
@@ -587,8 +587,8 @@ mod tests {
     let data = [0x00, 0x07];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int16u", &TABLE, &[0, 1], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(7));
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(7));
   }
 
   // Codex R1 regression: string[N] / pstring used to `from_utf8(...).unwrap_or_default()`
@@ -624,10 +624,10 @@ mod tests {
     let data = [0x02, 0x80, 0x81];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int8u", &MAC_TABLE, &[0], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "MacName");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "MacName");
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::Str("\u{00c4}\u{00c5}".into())
     );
   }
@@ -652,7 +652,7 @@ mod tests {
     let data = b"NONE";
     let mut m = Metadata::new("x");
     process_binary_data(data, "int8u", &NOVC_TABLE, &[0], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].value(), &TagValue::Str("NONE".into()));
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::Str("NONE".into()));
   }
 }

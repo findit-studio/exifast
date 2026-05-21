@@ -1,0 +1,22 @@
+[{
+  "SourceFile": "Opus.opus",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "OPUS",
+  "File:FileTypeExtension": "opus",
+  "File:MIMEType": "audio/ogg",
+  "Opus:OpusVersion": 1,
+  "Opus:AudioChannels": 1,
+  "Opus:SampleRate": 7872,
+  "Opus:OutputGain": 1,
+  "Vorbis:Vendor": "libopus 1.1",
+  "Vorbis:Encoder": "opusenc from opus-tools 0.1.9",
+  "FLAC:PictureType": "Front Cover",
+  "FLAC:PictureMIMEType": "image/png",
+  "FLAC:PictureDescription": "cover pic",
+  "FLAC:PictureWidth": 16,
+  "FLAC:PictureHeight": 16,
+  "FLAC:PictureBitsPerPixel": 1,
+  "FLAC:PictureIndexedColors": 0,
+  "FLAC:PictureLength": 85,
+  "FLAC:Picture": "(Binary data 85 bytes, use -b option to extract)"
+}]

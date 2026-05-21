@@ -1,12 +1,19 @@
+#![cfg(feature = "dv")]
 //! Faithful port of `Image::ExifTool::DV` (`lib/Image/ExifTool/DV.pm`).
 //! Module-name dispatch: `%moduleName{DV}` defaults to `Module("DV")`
 //! (no explicit row, so Perl `$module = $type`); registered in
-//! [`crate::formats::parser_for`].
+//! [`crate::format_parser::any_parser_for`].
+//!
+//! A typed [`Meta<'a>`] is produced by the
+//! [`crate::format_parser::FormatParser`] trait; the engine entry
+//! `process` drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
+//! byte-exact with bundled `perl exiftool`.
 
 use crate::{
-  parser::{FormatParser, ParseContext},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
-  value::{format_g, Group, TagValue},
+  value::{TagValue, format_g},
 };
 
 /// One row of `@dvProfiles` (DV.pm:21-113). All fields are derived
@@ -15,7 +22,7 @@ use crate::{
 /// on the exact same `f64` as `%.3g` of `30000/1001`.
 ///
 /// D8: PRIVATE fields, accessors only; `const fn new` for `static` use.
-struct DvProfile {
+struct Profile {
   dsf: u8,
   video_stype: u8,
   frame_size: u32,
@@ -30,16 +37,17 @@ struct DvProfile {
   image_width: u32,
 }
 
-impl DvProfile {
+impl Profile {
   /// Construct a profile row (DV.pm:21-113). The 9 named arguments mirror
   /// the 9 keys of a Perl `@dvProfiles` hash literal one-for-one; this is
   /// the only constructor (D8: PRIVATE fields, `const fn new` required for
   /// `static` use). `#[allow(clippy::too_many_arguments)]` is preferred
-  /// over a `DvProfileBuilder` here: the Perl table is a flat
+  /// over a `ProfileBuilder` here: the Perl table is a flat
   /// `(DSF, VideoSType, FrameSize, VideoFormat, Colorimetry, FrameRate,
   /// ImageHeight, ImageWidth)` rendering (FrameRate splits into 2 fields),
   /// and a builder would obscure the line-by-line faithful-1:1 mapping.
   #[must_use]
+  #[inline(always)]
   #[allow(clippy::too_many_arguments)]
   const fn new(
     dsf: u8,
@@ -67,41 +75,50 @@ impl DvProfile {
 
   /// DV.pm `DSF` field.
   #[must_use]
+  #[inline(always)]
   const fn dsf(&self) -> u8 {
     self.dsf
   }
   /// DV.pm `VideoSType` field (`0x0` / `0x4` / `0x14` / `0x18` / `0x1`).
   #[must_use]
+  #[inline(always)]
   const fn video_stype(&self) -> u8 {
     self.video_stype
   }
   /// DV.pm `FrameSize` field (bytes per video frame).
   #[must_use]
+  #[inline(always)]
   const fn frame_size(&self) -> u32 {
     self.frame_size
   }
   /// DV.pm `VideoFormat` field (the descriptive string).
   #[must_use]
+  #[inline(always)]
   const fn video_format(&self) -> &'static str {
     self.video_format
   }
   /// DV.pm `Colorimetry` field.
   #[must_use]
+  #[inline(always)]
   const fn colorimetry(&self) -> &'static str {
     self.colorimetry
   }
-  /// `FrameRate` as a Rust `f64` (`num/den`).
+  /// `FrameRate` as a Rust `f64` (`num/den`). (`f64::from` is not a
+  /// `const` trait call, so this getter is non-const.)
   #[must_use]
+  #[inline(always)]
   fn frame_rate_f64(&self) -> f64 {
     f64::from(self.frame_rate_num) / f64::from(self.frame_rate_den)
   }
   /// DV.pm `ImageHeight` field.
   #[must_use]
+  #[inline(always)]
   const fn image_height(&self) -> u32 {
     self.image_height
   }
   /// DV.pm `ImageWidth` field.
   #[must_use]
+  #[inline(always)]
   const fn image_width(&self) -> u32 {
     self.image_width
   }
@@ -111,9 +128,9 @@ impl DvProfile {
 /// scans the table in order and stops at the FIRST `dsf`/`stype` match.
 /// `[2]` is the SMPTE-314M PAL 4:1:1 row that DV.pm:180 forces explicitly
 /// for the 576i50 25Mbps 4:1:1 special case.
-static DV_PROFILES: &[DvProfile] = &[
+static DV_PROFILES: &[Profile] = &[
   // [0] DV.pm:22-30 — IEC 61834 NTSC 525/60.
-  DvProfile::new(
+  Profile::new(
     0,
     0x0,
     120_000,
@@ -125,7 +142,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [1] DV.pm:31-39 — IEC 61834 PAL 625/50 4:2:0.
-  DvProfile::new(
+  Profile::new(
     1,
     0x0,
     144_000,
@@ -137,7 +154,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [2] DV.pm:40-48 — SMPTE-314M PAL 625/50 4:1:1 (DV.pm:180 special case).
-  DvProfile::new(
+  Profile::new(
     1,
     0x0,
     144_000,
@@ -149,7 +166,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [3] DV.pm:49-57 — DVCPRO50 NTSC.
-  DvProfile::new(
+  Profile::new(
     0,
     0x4,
     240_000,
@@ -161,7 +178,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [4] DV.pm:58-66 — DVCPRO50 PAL.
-  DvProfile::new(
+  Profile::new(
     1,
     0x4,
     288_000,
@@ -173,7 +190,7 @@ static DV_PROFILES: &[DvProfile] = &[
     720,
   ),
   // [5] DV.pm:67-75 — DVCPRO HD 1080i60 NTSC base.
-  DvProfile::new(
+  Profile::new(
     0,
     0x14,
     480_000,
@@ -185,7 +202,7 @@ static DV_PROFILES: &[DvProfile] = &[
     1280,
   ),
   // [6] DV.pm:76-84 — DVCPRO HD 1080i50 PAL base.
-  DvProfile::new(
+  Profile::new(
     1,
     0x14,
     576_000,
@@ -197,7 +214,7 @@ static DV_PROFILES: &[DvProfile] = &[
     1440,
   ),
   // [7] DV.pm:85-93 — DVCPRO HD 720p60 NTSC base.
-  DvProfile::new(
+  Profile::new(
     0,
     0x18,
     240_000,
@@ -209,7 +226,7 @@ static DV_PROFILES: &[DvProfile] = &[
     960,
   ),
   // [8] DV.pm:94-102 — DVCPRO HD 720p50 PAL base.
-  DvProfile::new(
+  Profile::new(
     1,
     0x18,
     288_000,
@@ -221,7 +238,7 @@ static DV_PROFILES: &[DvProfile] = &[
     960,
   ),
   // [9] DV.pm:103-112 — IEC 61883-5 PAL.
-  DvProfile::new(
+  Profile::new(
     1,
     0x1,
     144_000,
@@ -478,8 +495,8 @@ fn extract_vaux_meta(
     // DV.pm:207 `for ($j=0; $j<15; ++$j)`.
     for j in 0..15usize {
       let p = vaux_pos + j * 5 + 3; // DV.pm:208
-                                    // Guard against running past the buffer: every Get8u must be in
-                                    // range (`p+0` through `p+4` for the 4-byte date/time fields).
+      // Guard against running past the buffer: every Get8u must be in
+      // range (`p+0` through `p+4` for the 4-byte date/time fields).
       if p + 4 >= buff.len() {
         break;
       }
@@ -544,40 +561,170 @@ fn extract_vaux_meta(
 /// Computed result of the bytewise parse (`compute`). Distinguishes the
 /// Perl reject paths from the two accept paths so each is independently
 /// testable; the live driver matches and runs the `&mut ctx` finalize.
-enum Parsed {
+///
+/// §2: private intermediate enum (never crosses the crate boundary, so no
+/// `Display`/lossless-escape surface) — `derive_more::IsVariant` supplies
+/// the variant predicates. All variants are unit or single-field newtype
+/// (`Found`), satisfying the unit-or-newtype-only rule.
+#[derive(derive_more::IsVariant)]
+enum Parsed<'a> {
   /// DV.pm:158 `or return 0` — `$raf->Read` empty.
   RejectEmpty,
   /// DV.pm:167 `return 0 unless defined $start` — no DIF header.
   RejectNoDif,
   /// DV.pm:171 `return 0 if $start + 80 * 6 > $len` — buffer too short.
   RejectShortDif,
-  /// DV.pm:188 `Warn("Unrecognized DV profile"), return 1`.
+  /// DV.pm:188 `Warn("Unrecognized DV profile"), return 1`. Carries
+  /// `'a` only for shape parity with [`Parsed::Found`]; no borrow today.
   UnrecognizedProfile,
   /// DV.pm:267-270 — emit tags in @dvTags order.
-  Found(ParsedFound),
+  Found(Meta<'a>),
 }
 
-/// All emit-time values from a successful parse (DV.pm:267-270 inputs).
-/// D8: PRIVATE fields, accessors only.
-struct ParsedFound {
+// ===========================================================================
+// Typed Meta — `Meta<'a>`
+// ===========================================================================
+
+/// Typed DV metadata — the lib-first output of [`ProcessDv`].
+///
+/// Holds the post-ValueConv raw scalars from `ProcessDV` (DV.pm:151-273)
+/// plus the `Profile`/`VideoFormat`/`Colorimetry` `&'static str` slices
+/// borrowed from [`DV_PROFILES`]. PrintConv (`ConvertDuration`,
+/// `ConvertBitrate`, FrameRate rounding) is applied at emit time by
+/// `serialize_tags` to mirror ExifTool's
+/// `$$self{OPTIONS}{PrintConv}` toggle.
+///
+/// **D8 — no public fields, accessors only.**
+///
+/// **Lifetimes.** `'a` is held for shape parity with formats that
+/// borrow string slices from the input; DV's only string fields are
+/// `&'static str` from the profile table, so `'a` is effectively
+/// `'static` in practice. The `date_time_original` is the only owned
+/// allocation (`String` produced by the VAUX scan).
+#[derive(Debug, Clone)]
+pub struct Meta<'a> {
+  /// `DateTimeOriginal` — VAUX-decoded date/time. `None` when the
+  /// VAUX scan failed or rejected the hex-component decode
+  /// (DV.pm:220-221).
   date_time_original: Option<String>,
+  /// `ImageWidth` from the matched [`Profile`].
   image_width: u32,
+  /// `ImageHeight` from the matched [`Profile`].
   image_height: u32,
+  /// `Duration` in seconds = file-size / byte-rate (DV.pm:196).
   duration: f64,
+  /// `TotalBitrate` in bps = 8 * frame-size * frame-rate (DV.pm:194).
   total_bitrate: f64,
-  video_format: &'static str,
-  video_scan_type: Option<&'static str>,
+  /// `VideoFormat` from the matched [`Profile`].
+  video_format: &'a str,
+  /// `VideoScanType` — `Some("Interlaced")` / `Some("Progressive")` if the
+  /// VAUX `0x61` pack was found; `None` otherwise (DV.pm:242).
+  video_scan_type: Option<&'a str>,
+  /// `FrameRate` in Hz = profile.frame_rate_num / profile.frame_rate_den.
   frame_rate: f64,
-  aspect_ratio: Option<&'static str>,
-  colorimetry: &'static str,
+  /// `AspectRatio` — `"16:9"` / `"4:3"` from the VAUX `0x61` pack
+  /// (DV.pm:241); `None` if not present.
+  aspect_ratio: Option<&'a str>,
+  /// `Colorimetry` from the matched [`Profile`].
+  colorimetry: &'a str,
+  /// `AudioChannels` — DV.pm:258-262 (0/2/4/8). `None` if no audio pack.
   audio_channels: Option<i64>,
+  /// `AudioSampleRate` — DV.pm:256-257 (48000/44100/32000). `None` if
+  /// no audio pack.
   audio_sample_rate: Option<i64>,
+  /// `AudioBitsPerSample` — DV.pm:263 (12 or 16). `None` if no audio
+  /// pack.
   audio_bits_per_sample: Option<i64>,
+}
+
+impl<'a> Meta<'a> {
+  /// `DateTimeOriginal` as a fixed-format `"YYYY:MM:DD hh:mm:ss"` string
+  /// (DV.pm:239). `None` if the VAUX scan failed. (`Option::as_deref` is
+  /// not `const`, so this getter is non-const.)
+  #[must_use]
+  #[inline(always)]
+  pub fn date_time_original(&self) -> Option<&str> {
+    self.date_time_original.as_deref()
+  }
+  /// `ImageWidth` in pixels (DV.pm `@dvProfiles{ImageWidth}`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_width(&self) -> u32 {
+    self.image_width
+  }
+  /// `ImageHeight` in pixels.
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_height(&self) -> u32 {
+    self.image_height
+  }
+  /// `Duration` in seconds (file-size / byte-rate, DV.pm:196).
+  #[must_use]
+  #[inline(always)]
+  pub const fn duration_secs(&self) -> f64 {
+    self.duration
+  }
+  /// `TotalBitrate` in bits-per-second (DV.pm:194).
+  #[must_use]
+  #[inline(always)]
+  pub const fn total_bitrate_bps(&self) -> f64 {
+    self.total_bitrate
+  }
+  /// `VideoFormat` (e.g. `"IEC 61834 - 625/50 (PAL)"`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn video_format(&self) -> &'a str {
+    self.video_format
+  }
+  /// `VideoScanType` — `"Interlaced"` / `"Progressive"`. `None` if no
+  /// VAUX `0x61` pack.
+  #[must_use]
+  #[inline(always)]
+  pub const fn video_scan_type(&self) -> Option<&'a str> {
+    self.video_scan_type
+  }
+  /// `FrameRate` raw value in Hz (post-ValueConv `num/den`,
+  /// pre-PrintConv rounding).
+  #[must_use]
+  #[inline(always)]
+  pub const fn frame_rate(&self) -> f64 {
+    self.frame_rate
+  }
+  /// `AspectRatio` — `"16:9"` / `"4:3"`. `None` if no VAUX `0x61` pack.
+  #[must_use]
+  #[inline(always)]
+  pub const fn aspect_ratio(&self) -> Option<&'a str> {
+    self.aspect_ratio
+  }
+  /// `Colorimetry` (e.g. `"4:2:0"`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn colorimetry(&self) -> &'a str {
+    self.colorimetry
+  }
+  /// `AudioChannels` count. `None` if no audio pack.
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> Option<i64> {
+    self.audio_channels
+  }
+  /// `AudioSampleRate` in Hz. `None` if no audio pack.
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_sample_rate(&self) -> Option<i64> {
+    self.audio_sample_rate
+  }
+  /// `AudioBitsPerSample` in bits (12 or 16). `None` if no audio pack.
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_bits_per_sample(&self) -> Option<i64> {
+    self.audio_bits_per_sample
+  }
 }
 
 /// Bytewise parse of the 12 KiB window. `total_len` is the full file
 /// length (`$$et{VALUE}{FileSize}`, used by DV.pm:196 for Duration).
-fn compute(buff: &[u8], total_len: usize) -> Parsed {
+fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
   if buff.is_empty() {
     return Parsed::RejectEmpty;
   }
@@ -676,7 +823,7 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed {
     audio_bits_per_sample = Some(if quant != 0 { 12 } else { 16 }); // DV.pm:263
   }
 
-  Parsed::Found(ParsedFound {
+  Parsed::Found(Meta {
     date_time_original,
     image_width: profile.image_width(),
     image_height: profile.image_height(),
@@ -693,71 +840,238 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed {
   })
 }
 
+// ===========================================================================
+// `ProcessDv` — the lib-first parser
+// ===========================================================================
+
 /// DV parser. Faithful `ProcessDV` (DV.pm:151-273).
+#[derive(Debug, Clone, Copy)]
 pub struct ProcessDv;
 
-impl FormatParser for ProcessDv {
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Capture the inputs needed for parsing under an immutable borrow,
-    // release it BEFORE the `&mut ctx` finalize block. `total_len` is the
-    // FULL file length ($$et{VALUE}{FileSize}); the parser sees the
-    // 12 KiB DV.pm:158 window.
-    let parsed: Parsed = {
-      let data = ctx.data();
-      let total_len = data.len();
-      let cap = total_len.min(12_000);
-      compute(&data[..cap], total_len)
-    };
-    match parsed {
-      Parsed::RejectEmpty | Parsed::RejectNoDif | Parsed::RejectShortDif => false,
-      Parsed::UnrecognizedProfile => {
-        ctx.set_file_type(None, None, None); // DV.pm:173 (runs BEFORE the foreach)
-        ctx.metadata().push_warning("Unrecognized DV profile"); // DV.pm:188
-        true
-      }
-      Parsed::Found(found) => {
-        ctx.set_file_type(None, None, None); // DV.pm:173
-        let print_on = ctx.print_conv_enabled();
-        let g = Group::new(DV_MAIN.group0(), "DV");
-        for &tag_name in DV_TAGS {
-          let raw: Option<TagValue> = match tag_name {
-            "DateTimeOriginal" => found
-              .date_time_original
-              .clone()
-              .map(|s| TagValue::Str(s.into())),
-            "ImageWidth" => Some(TagValue::I64(i64::from(found.image_width))),
-            "ImageHeight" => Some(TagValue::I64(i64::from(found.image_height))),
-            "Duration" => Some(TagValue::F64(found.duration)),
-            "TotalBitrate" => Some(TagValue::F64(found.total_bitrate)),
-            "VideoFormat" => Some(TagValue::Str(found.video_format.into())),
-            "VideoScanType" => found.video_scan_type.map(|s| TagValue::Str(s.into())),
-            "FrameRate" => Some(TagValue::F64(found.frame_rate)),
-            "AspectRatio" => found.aspect_ratio.map(|s| TagValue::Str(s.into())),
-            "Colorimetry" => Some(TagValue::Str(found.colorimetry.into())),
-            "AudioChannels" => found.audio_channels.map(TagValue::I64),
-            "AudioSampleRate" => found.audio_sample_rate.map(TagValue::I64),
-            "AudioBitsPerSample" => found.audio_bits_per_sample.map(TagValue::I64),
-            _ => None,
-          };
-          let Some(raw) = raw else {
-            continue; // DV.pm:268 `next unless defined $$profile{$tag}`
-          };
-          let Some(def) = (DV_MAIN.get())(TagId::Str(tag_name)) else {
-            continue; // unreachable: every @dvTags entry has a %DV::Main def
-          };
-          let out = crate::convert::apply(def, &raw, print_on);
-          ctx.metadata().push(g.clone(), def.name(), out);
-        }
-        true // DV.pm:272 `return 1`
-      }
+impl parser_sealed::Sealed for ProcessDv {}
+
+/// Result of a typed `ProcessDv::parse`. Distinguishes the recognized-but-
+/// unrecognized-profile branch (DV.pm:188 `Warn(...), return 1`) from the
+/// full-data success branch (DV.pm:267-270). Both are positive
+/// `Some(...)` returns: the legacy bridge translates them into
+/// `Warn` + return-true vs. tag-emission + return-true respectively.
+///
+/// The `Parsed::Reject*` arms map to `Ok(None)` (Perl `return 0`).
+///
+/// §2: data-carrying enum — `derive_more` supplies `is_*` predicates and
+/// `unwrap_*`/`try_unwrap_*` accessors (`ref`/`ref_mut`) so callers don't
+/// hand-match; `Display` is routed through the single [`Self::as_str`]
+/// label. Closed semantic vocabulary (the two terminal outcomes of a DV
+/// parse), so no open `Other(_)` / coded `Unknown(n)` escape applies; still
+/// `#[non_exhaustive]` so a future outcome variant is non-breaking.
+#[non_exhaustive]
+#[derive(Debug, Clone, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+pub enum ParseOutcome<'a> {
+  /// DV.pm:188 — recognized DIF header but no profile match. Bundled
+  /// Perl emits `Warning => "Unrecognized DV profile"` and returns 1
+  /// without pushing any DV:* tags.
+  UnrecognizedProfile,
+  /// DV.pm:267-270 — full success; emit tags in @dvTags order.
+  Meta(Meta<'a>),
+}
+
+impl ParseOutcome<'_> {
+  /// Stable label for each outcome (single source of truth for `Display`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      ParseOutcome::UnrecognizedProfile => "UnrecognizedProfile",
+      ParseOutcome::Meta(_) => "Meta",
     }
   }
 }
 
+impl core::fmt::Display for ParseOutcome<'_> {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+impl FormatParser for ProcessDv {
+  /// Spec §8: leaf format with no shared state; reads a single byte slice.
+  /// GAT: the Meta is parameterized by `'a`, though every string field
+  /// actually originates from the `'static` [`DV_PROFILES`] table (Codex
+  /// AF2).
+  type Meta<'a> = ParseOutcome<'a>;
+  /// Spec §8: leaf format Context is `&'a [u8]`.
+  type Context<'a> = &'a [u8];
+  /// Rust-level fatal error (none today; DV parsing has no I/O modes).
+  type Error = Error;
+
+  /// Parse a DV file's bytes into a typed [`ParseOutcome`], or `None`
+  /// if the buffer is not a valid DV file (short read, no DIF header,
+  /// fewer than 6 blocks). Returns `Err` only for Rust-level fatal
+  /// modes; the current port has none.
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+    // `parse_outcome` yields a `ParseOutcome<'static>`; covariance widens
+    // it to the caller's `'a`.
+    Ok(parse_outcome(data))
+  }
+}
+
+/// Lib-first direct entry. Same as [`FormatParser::parse`] but produces
+/// a `ParseOutcome` whose `Meta` arm carries borrows out of
+/// [`DV_PROFILES`] (i.e. `'static` in practice; the `&str` slices are
+/// const-table entries).
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved for
+/// future I/O wrappers).
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<ParseOutcome<'static>>, Error> {
+  Ok(parse_outcome(data))
+}
+
+fn parse_outcome(data: &[u8]) -> Option<ParseOutcome<'static>> {
+  let total_len = data.len();
+  let cap = total_len.min(12_000);
+  match compute(&data[..cap], total_len) {
+    Parsed::RejectEmpty | Parsed::RejectNoDif | Parsed::RejectShortDif => None,
+    Parsed::UnrecognizedProfile => Some(ParseOutcome::UnrecognizedProfile),
+    Parsed::Found(meta) => Some(ParseOutcome::Meta(meta)),
+  }
+}
+
+// NOTE: DV's typed parser always produces `Meta<'static>` because every
+// `&'a str` field originates from the `'static` [`DV_PROFILES`] table; the
+// `FormatParser::Meta` GAT (`type Meta<'a> = ParseOutcome<'a>`) widens
+// it to the caller's `'a` by covariance (Codex AF2). The `<'a>` parameter
+// is kept on the struct for shape parity with the rest of the Phase F1
+// leaves and to leave room for future bytes-borrowed accessors (e.g. a
+// raw DIF-block view).
+
+// ===========================================================================
+// `serialize_tags` — typed Meta → TagMap
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl Meta<'_> {
+  /// Emit DV tags into the writer in `@dvTags` order (DV.pm:116-121) —
+  /// faithful to the bundled-Perl iteration.
+  ///
+  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
+  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    const GROUP: &str = "DV";
+    for &tag_name in DV_TAGS {
+      match tag_name {
+        "DateTimeOriginal" => {
+          if let Some(s) = self.date_time_original.as_deref() {
+            // DV.pm:128 PrintConv => ConvertDateTime; default options
+            // pass through unchanged ⇒ same string under -j and -n.
+            out.write_str(GROUP, "DateTimeOriginal", s)?;
+          }
+        }
+        "ImageWidth" => out.write_u64(GROUP, "ImageWidth", u64::from(self.image_width))?,
+        "ImageHeight" => out.write_u64(GROUP, "ImageHeight", u64::from(self.image_height))?,
+        "Duration" => {
+          if print_conv {
+            // PrintConv: ConvertDuration formatted string.
+            out.write_fmt(GROUP, "Duration", |w| {
+              w.write_str(&convert_duration_str(&TagValue::F64(self.duration)))
+            })?;
+          } else {
+            out.write_f64(GROUP, "Duration", self.duration)?;
+          }
+        }
+        "TotalBitrate" => {
+          if print_conv {
+            out.write_fmt(GROUP, "TotalBitrate", |w| {
+              w.write_str(&convert_bitrate_str(&TagValue::F64(self.total_bitrate)))
+            })?;
+          } else {
+            out.write_f64(GROUP, "TotalBitrate", self.total_bitrate)?;
+          }
+        }
+        "VideoFormat" => out.write_str(GROUP, "VideoFormat", self.video_format)?,
+        "VideoScanType" => {
+          if let Some(s) = self.video_scan_type {
+            out.write_str(GROUP, "VideoScanType", s)?;
+          }
+        }
+        "FrameRate" => {
+          if print_conv {
+            // DV.pm:139 PrintConv: int($val * 1000 + 0.5) / 1000.
+            let rounded = ((self.frame_rate * 1000.0 + 0.5).floor()) / 1000.0;
+            out.write_f64(GROUP, "FrameRate", rounded)?;
+          } else {
+            out.write_f64(GROUP, "FrameRate", self.frame_rate)?;
+          }
+        }
+        "AspectRatio" => {
+          if let Some(s) = self.aspect_ratio {
+            out.write_str(GROUP, "AspectRatio", s)?;
+          }
+        }
+        "Colorimetry" => out.write_str(GROUP, "Colorimetry", self.colorimetry)?,
+        "AudioChannels" => {
+          if let Some(n) = self.audio_channels {
+            out.write_i64(GROUP, "AudioChannels", n)?;
+          }
+        }
+        "AudioSampleRate" => {
+          if let Some(n) = self.audio_sample_rate {
+            out.write_i64(GROUP, "AudioSampleRate", n)?;
+          }
+        }
+        "AudioBitsPerSample" => {
+          if let Some(n) = self.audio_bits_per_sample {
+            out.write_i64(GROUP, "AudioBitsPerSample", n)?;
+          }
+        }
+        _ => {} // unreachable: DV_TAGS is a fixed const list
+      }
+    }
+    Ok(())
+  }
+}
+
+// ===========================================================================
+// `Error` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for DV parsing. Currently empty — every bad
+/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
+/// wrappers if streaming readers are added.
+///
+/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
+/// feature tier — `thiserror` v2 with `default-features = false` emits
+/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
+/// `#[non_exhaustive]` lets the first real variant land without a breaking
+/// change. The derive expands `Display` to an empty `match *self {}`, so no
+/// `#[error(…)]` attribute is needed while the enum has no variants.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Error {}
+
+// ===========================================================================
+// Engine entry — typed parse + File:* + sink into `Metadata`
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{parser::ParseContext, value::Metadata};
+
+  #[test]
+  fn dv_error_is_core_error() {
+    // §5: thiserror v2 (default-features=false) makes the empty error enum
+    // a real `core::error::Error` in every feature tier.
+    fn assert_error<E: core::error::Error>() {}
+    assert_error::<Error>();
+  }
 
   #[test]
   fn profiles_and_tag_order_are_faithful() {
@@ -890,40 +1204,40 @@ mod tests {
     assert_eq!(find_dif_start(b"\x00\x00\x00"), None);
   }
 
+  // The engine path is now `crate::parser::extract_info`. These tests run it
+  // and assert on the parsed JSON object, replacing the retired
+  // `ProcessDv::process` + `TagMap` tests.
+  fn engine_obj(data: &[u8], print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.dv", data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  /// `true` if the engine finalized the file as `DV`.
+  fn is_dv(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("File:FileType").and_then(|v| v.as_str()) == Some("DV")
+  }
+
   #[test]
   fn process_rejects_empty_buffer() {
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&[], "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&[], true)));
   }
 
   #[test]
   fn process_rejects_no_dif_header() {
-    let data = vec![0u8; 200];
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&vec![0u8; 200], true)));
   }
 
   #[test]
   fn process_rejects_when_dif_header_lacks_six_blocks() {
     // 4-byte magic at offset 0; len 4 ⇒ start+480 > 4 ⇒ DV.pm:171 reject.
-    let data = vec![0x1f, 0x07, 0x00, 0x3f];
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&[0x1f, 0x07, 0x00, 0x3f], true)));
   }
 
   #[test]
   fn process_rejects_when_six_blocks_truncated() {
     let mut data = vec![0u8; 479];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
+    assert!(!is_dv(&engine_obj(&data, true)));
   }
 
   #[test]
@@ -932,21 +1246,15 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x1f; // buff[start + 80*5 + 48 + 3]
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
+    let obj = engine_obj(&data, true);
     // File:* pushed (SetFileType BEFORE the warning, DV.pm:173).
+    assert!(is_dv(&obj));
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value()),
-      Some(&TagValue::Str("DV".into()))
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Unrecognized DV profile")
     );
-    assert_eq!(m.warnings(), &["Unrecognized DV profile"]);
-    // No DV:* tags pushed (the unrecognized-profile branch returns 1
-    // BEFORE the HandleTag loop).
-    assert!(m.tags().iter().all(|t| t.group().family1() != "DV"));
+    // No DV:* tags (the unrecognized-profile branch returns 1 before HandleTag).
+    assert!(!obj.keys().any(|k| k.starts_with("DV:")));
   }
 
   #[test]
@@ -955,20 +1263,15 @@ mod tests {
     // forces an `a-f` letter in the hex sprintf — DV.pm:220-221 rejects.
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
-                                                           // VAUX block 1 at offset 80 — block_type & 0xf0 == 0x50.
     data[80] = 0x50;
-    // Pack 0 (j=0): p = 80 + 0*5 + 3 = 83. pack_type = 0x62 (date).
     data[83] = 0x62;
-    // p+1=84 timezone (ignored); p+2..p+4 = d[1], d[2], d[3].
     data[84] = 0x00;
     data[85] = 0x05;
     data[86] = 0x12;
     data[87] = 0xaa; // sprintf("%.2x", 0xaa) = "aa" ⇒ contains a-f
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    assert!(!m.tags().iter().any(|t| t.name() == "DateTimeOriginal"));
-    assert!(m.tags().iter().any(|t| t.name() == "ImageWidth"));
+    let obj = engine_obj(&data, true);
+    assert!(!obj.contains_key("DV:DateTimeOriginal"));
+    assert!(obj.contains_key("DV:ImageWidth"));
   }
 
   #[test]
@@ -977,29 +1280,16 @@ mod tests {
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x00;
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
+    let obj = engine_obj(&data, true);
     // FrameRate → 29.97 after PrintConv.
-    let fr = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FrameRate")
-      .expect("FrameRate emitted");
-    let n = match fr.value() {
-      TagValue::F64(n) => *n,
-      _ => panic!("FrameRate not F64"),
-    };
+    let n = obj
+      .get("DV:FrameRate")
+      .and_then(|v| v.as_f64())
+      .expect("FrameRate");
     assert!((n - 29.97).abs() < 1e-9, "got {n}");
     // -n: raw 30000/1001.
-    let mut m2 = Metadata::new("x.dv");
-    let mut c2 = ParseContext::new(&data, "DV", 0, "DV", None, false, &mut m2);
-    assert!(ProcessDv.process(&mut c2));
-    let fr2 = m2.tags().iter().find(|t| t.name() == "FrameRate").unwrap();
-    let n2 = match fr2.value() {
-      TagValue::F64(n) => *n,
-      _ => panic!("not F64"),
-    };
+    let obj2 = engine_obj(&data, false);
+    let n2 = obj2.get("DV:FrameRate").and_then(|v| v.as_f64()).unwrap();
     assert!((n2 - 30000.0 / 1001.0).abs() < 1e-12);
   }
 
@@ -1011,16 +1301,15 @@ mod tests {
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[4] = 0x01; // buff[4] & 0x07 == 1 (non-zero)
     data[451] = 0; // stype = 0
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    let vf = m.tags().iter().find(|t| t.name() == "VideoFormat").unwrap();
+    let obj = engine_obj(&data, true);
     assert_eq!(
-      vf.value(),
-      &TagValue::Str("SMPTE-314M - 625/50 (PAL)".into())
+      obj.get("DV:VideoFormat").and_then(|v| v.as_str()),
+      Some("SMPTE-314M - 625/50 (PAL)")
     );
-    let col = m.tags().iter().find(|t| t.name() == "Colorimetry").unwrap();
-    assert_eq!(col.value(), &TagValue::Str("4:1:1".into()));
+    assert_eq!(
+      obj.get("DV:Colorimetry").and_then(|v| v.as_str()),
+      Some("4:1:1")
+    );
   }
 
   #[test]
@@ -1030,10 +1319,132 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[451] = 0x1f;
-    let mut m = Metadata::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    assert_eq!(m.warnings(), &["Unrecognized DV profile"]);
-    assert!(m.tags().iter().all(|t| t.group().family1() != "DV"));
+    let obj = engine_obj(&data, true);
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Unrecognized DV profile")
+    );
+    assert!(!obj.keys().any(|k| k.starts_with("DV:")));
+  }
+
+  // ---------- Lib-first typed Meta surface --------------------------------
+
+  #[test]
+  fn parse_borrowed_returns_meta_outcome_for_pal_default() {
+    // PAL 25Mbps 4:2:0 default — profile[1].
+    let mut data = vec![0u8; 8000];
+    data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
+    data[451] = 0x00; // stype = 0 ⇒ profile[1] (PAL)
+    let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
+    match outcome {
+      ParseOutcome::Meta(m) => {
+        assert_eq!(m.image_width(), 720);
+        assert_eq!(m.image_height(), 576);
+        assert_eq!(m.video_format(), "IEC 61834 - 625/50 (PAL)");
+        assert_eq!(m.colorimetry(), "4:2:0");
+        assert!((m.frame_rate() - 25.0).abs() < 1e-12);
+      }
+      ParseOutcome::UnrecognizedProfile => panic!("expected Meta"),
+    }
+  }
+
+  #[test]
+  fn parse_borrowed_returns_unrecognized_for_off_table_stype() {
+    let mut data = vec![0u8; 480];
+    data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
+    data[451] = 0x1f;
+    let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
+    assert!(matches!(outcome, ParseOutcome::UnrecognizedProfile));
+  }
+
+  #[test]
+  fn parse_borrowed_rejects_empty() {
+    assert!(parse_borrowed(&[]).unwrap().is_none());
+  }
+
+  #[test]
+  fn dv_parse_outcome_variant_accessors_and_display() {
+    // §2 derive_more predicates + unwrap/try_unwrap + Display-via-as_str.
+    let unrecognized: ParseOutcome<'static> = ParseOutcome::UnrecognizedProfile;
+    assert!(unrecognized.is_unrecognized_profile());
+    assert!(!unrecognized.is_meta());
+    assert_eq!(unrecognized.as_str(), "UnrecognizedProfile");
+    assert_eq!(unrecognized.to_string(), "UnrecognizedProfile");
+    assert!(unrecognized.try_unwrap_meta().is_err());
+
+    let meta = Meta {
+      date_time_original: None,
+      image_width: 720,
+      image_height: 576,
+      duration: 1.0,
+      total_bitrate: 1.0,
+      video_format: "x",
+      video_scan_type: None,
+      frame_rate: 25.0,
+      aspect_ratio: None,
+      colorimetry: "4:2:0",
+      audio_channels: None,
+      audio_sample_rate: None,
+      audio_bits_per_sample: None,
+    };
+    let outcome = ParseOutcome::Meta(meta);
+    assert!(outcome.is_meta());
+    assert_eq!(outcome.as_str(), "Meta");
+    assert_eq!(outcome.to_string(), "Meta");
+    assert_eq!(outcome.unwrap_meta().image_width(), 720);
+  }
+
+  #[test]
+  fn meta_sinker_emits_typed_tags() {
+    use crate::tagmap::TagMap;
+    // Construct a Meta directly so we don't depend on a fixture.
+    let meta = Meta {
+      date_time_original: Some("2024:01:15 12:30:45".to_string()),
+      image_width: 720,
+      image_height: 576,
+      duration: 8.16,
+      total_bitrate: 28_800_000.0,
+      video_format: "IEC 61834 - 625/50 (PAL)",
+      video_scan_type: Some("Interlaced"),
+      frame_rate: 25.0,
+      aspect_ratio: Some("16:9"),
+      colorimetry: "4:2:0",
+      audio_channels: Some(2),
+      audio_sample_rate: Some(32_000),
+      audio_bits_per_sample: Some(16),
+    };
+    // PrintConv on: ConvertDuration/ConvertBitrate strings, FrameRate rounded.
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("DV", "Duration"), Some("8.16 s".to_string()));
+    assert_eq!(
+      w.get_str("DV", "TotalBitrate"),
+      Some("28.8 Mbps".to_string())
+    );
+    assert_eq!(w.get_str("DV", "FrameRate"), Some("25".to_string()));
+    assert_eq!(w.get_str("DV", "ImageWidth"), Some("720".to_string()));
+    assert_eq!(
+      w.get_str("DV", "VideoFormat"),
+      Some("IEC 61834 - 625/50 (PAL)".to_string())
+    );
+    // PrintConv off: raw scalars (Duration as f64, etc.).
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
+    assert_eq!(w.get_str("DV", "Duration"), Some("8.16".to_string()));
+    assert_eq!(
+      w.get_str("DV", "TotalBitrate"),
+      Some("28800000".to_string())
+    );
+  }
+
+  #[test]
+  fn format_parser_trait_returns_outcome() {
+    let mut data = vec![0u8; 8000];
+    data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]);
+    data[451] = 0x00;
+    let outcome = <ProcessDv as FormatParser>::parse(&ProcessDv, &data)
+      .expect("ok")
+      .expect("parsed");
+    assert!(matches!(outcome, ParseOutcome::Meta(_)));
   }
 }

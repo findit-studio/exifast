@@ -1,21 +1,45 @@
-//! Byte-exact JSON value equality, ignoring object key order, for comparing
+//! VALUE-semantic JSON equality, ignoring object key order, for comparing
 //! `exifast` output to ExifTool golden (spec §4: object key order is *not*
-//! significant, but the key *multiset* must match and every scalar must equal
-//! ExifTool **byte-for-byte** — number literals compared as text so `1` ≠
-//! `1.0`, and strings compared by their exact lexeme so the literal `"A"`
-//! ≠ its escaped form `"A"` (both decode to A); array element order
-//! *is* significant).
+//! significant, but the key *multiset* must match and every scalar must be
+//! equal **by value**; array element order *is* significant).
+//!
+//! ## Why value-semantic, not byte-exact
+//!
+//! We do NOT reproduce ExifTool's exact scalar *tokens*. `0.0` and
+//! `0.00000000` are the same JSON number; `3.4e+38` and `3.4e38` are the same
+//! value; a bare `123` and a quoted numeric string `"123"` carry the same
+//! value. Both spellings are valid JSON for the same value, so the token
+//! *style* is irrelevant — exactly the same principle as "JSON key order
+//! doesn't matter". The serializer therefore uses STANDARD `serde_json`
+//! scalar formatting (it does not chase ExifTool's `sprintf` tokens), and this
+//! comparator compares by VALUE, not by lexeme.
+//!
+//! ## The numeric-equality rules
+//!
+//! - **Numbers.** Two scalars are numeric-equal if both parse as the same
+//!   numeric value. Integer literals that fit `i128`/`u128` compare exactly as
+//!   integers (so a huge `18446744073709551615` u64 stays exact); a value that
+//!   is not an integer literal on either side falls back to `f64` (so
+//!   `0.0 == 0.00000000` and `3.40282366920938e+38 == 3.40282366920938e38`).
+//! - **String ↔ number coercion.** A JSON *string* whose entire content parses
+//!   as a number is numeric-comparable to a JSON *number* of the same value
+//!   (ExifTool's `EscapeJSON` number-gate blurs these — a PrintConv-`sprintf`'d
+//!   `"3.4e+38"` string equals a bare `3.4e38`). So `"123"` value-equals `123`
+//!   and `"0.00000000"` value-equals `0.0`.
+//! - **Non-numeric strings.** Compared exactly (escape/lexeme-exact). `"NaN"`,
+//!   `"Inf"`, `"-Inf"` are non-numeric strings ⇒ exact compare (both sides emit
+//!   the same titlecase via `value::perl_nonfinite_str`, so they match).
+//!
+//! ## Structure rules (unchanged)
 //!
 //! The comparison is done over `serde_json::value::RawValue`: objects are
 //! parsed into an ORDERED `Vec<(String, &RawValue)>` (a serde visitor over
 //! `MapAccess`) that PRESERVES duplicate keys, then compared as a *multiset*
-//! of `(key, raw-value-lexeme)` pairs — key ORDER is insensitive but a
-//! repeated key is significant, so `{"A":1,"A":2}` ≠ `{"A":1}` (this is what
-//! catches the ExifTool `%noDups` regression class; a `serde_json::Map` /
-//! `BTreeMap` would silently collapse the duplicate and mask it). Arrays are
-//! recursed element-wise, order-significant; every scalar leaf is compared by
-//! its raw lexeme text byte-for-byte (strings escape-exact, numbers
-//! token-exact, subsuming the old `arbitrary_precision` number path).
+//! of `(key, value)` pairs — key ORDER is insensitive but a repeated key is
+//! significant, so `{"A":1,"A":2}` ≠ `{"A":1}` (this is what catches the
+//! ExifTool `%noDups` regression class; a `serde_json::Map` / `BTreeMap` would
+//! silently collapse the duplicate and mask it). Arrays are recursed
+//! element-wise, order-significant.
 
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
@@ -28,23 +52,26 @@ pub struct Mismatch(String);
 impl Mismatch {
   /// Construct a `Mismatch` from a message string.
   #[must_use]
+  #[inline(always)]
   pub fn new(message: impl Into<String>) -> Self {
     Self(message.into())
   }
 
-  /// The mismatch description message.
+  /// The mismatch description message (`&str` view of the owned `String`
+  /// field — never expose `&String`, §3).
   #[must_use]
+  #[inline(always)]
   pub fn message(&self) -> &str {
     &self.0
   }
 }
 
 /// Compare two JSON texts as the 1:1 bar requires: object key order is NOT
-/// significant (but the key *set* must match), array element order IS
-/// significant, and every scalar is compared by its raw lexeme byte-for-byte
-/// (so `1` ≠ `1.0`, `0.50` ≠ `0.5`, and the literal `"A"` ≠ the escaped
-/// `"A"`). Returns the first
-/// `Mismatch`.
+/// significant (but the key *multiset* must match), array element order IS
+/// significant, and every scalar is compared by VALUE (so `1 == 1.0`,
+/// `0.50 == 0.5`, `"123" == 123`, `3.4e+38 == 3.4e38`; non-numeric strings are
+/// still escape-exact, so the literal `"A"` ≠ the escaped `"A"`). Returns
+/// the first `Mismatch`.
 pub fn json_equivalent(actual: &str, golden: &str) -> Result<(), Mismatch> {
   let a: &RawValue = serde_json::from_str(actual)
     .map_err(|e| Mismatch::new(format!("actual is invalid JSON: {e}")))?;
@@ -131,6 +158,202 @@ fn kind_of(r: &RawValue) -> Kind {
   }
 }
 
+/// A scalar `RawValue`'s payload, with any surrounding JSON string quoting
+/// removed: `("123", true)` for the JSON string `"123"`, `("123", false)` for
+/// the bare number `123`. Returns `None` if the lexeme is not a plain JSON
+/// string (the un-decoded inner text is returned for strings — escape-exact
+/// comparison of NON-numeric strings relies on the raw inner bytes).
+fn scalar_payload(r: &RawValue) -> (&str, bool) {
+  let s = r.get().trim();
+  match (s.strip_prefix('"'), s.strip_suffix('"')) {
+    // A genuine JSON string is `"…"` with at least the two quotes. (`len >= 2`
+    // guards the single `"` lexeme, which serde_json would never hand us as a
+    // valid scalar anyway.)
+    (Some(_), Some(_)) if s.len() >= 2 => (&s[1..s.len() - 1], true),
+    _ => (s, false),
+  }
+}
+
+/// Parse a scalar's *text* (already unquoted by [`scalar_payload`]) as a number
+/// for value comparison. Returns `None` for any text that is not a complete
+/// numeric literal (so non-numeric strings, `true`/`false`/`null`, `"NaN"`,
+/// `"Inf"`, empty, etc. fall through to exact textual comparison).
+///
+/// Integer literals (no `.`, `e`, or `E`) that fit `i128`/`u128` are kept as
+/// EXACT integers so a huge `18446744073709551615` u64 never loses precision;
+/// everything else parses as `f64`.
+fn parse_number(text: &str) -> Option<NumVal> {
+  if text.is_empty() {
+    return None;
+  }
+  let is_integer_literal = !text.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+  if is_integer_literal {
+    if let Ok(i) = text.parse::<i128>() {
+      return Some(NumVal::Int(i));
+    }
+    if let Ok(u) = text.parse::<u128>() {
+      return Some(NumVal::Uint(u));
+    }
+    // Out of even u128 range (>39 digits): fall through to f64 below.
+  }
+  // `f64::from_str` accepts `inf`/`nan`; ExifTool never emits those bare and
+  // our serializer quotes non-finite as the titlecase `Inf`/`NaN` *string*
+  // (handled by exact text compare), so reject non-finite here to keep
+  // `parse_number` strictly "a finite numeric value".
+  match text.parse::<f64>() {
+    Ok(f) if f.is_finite() => Some(NumVal::Float(f)),
+    _ => None,
+  }
+}
+
+/// A parsed numeric value used for value-equality of scalars. Integers keep
+/// full `i128`/`u128` precision; non-integers (or out-of-integer-range values)
+/// are `f64`.
+#[derive(Clone, Copy)]
+enum NumVal {
+  Int(i128),
+  Uint(u128),
+  Float(f64),
+}
+
+impl NumVal {
+  /// Value-equality across representations: same-kind integers compare
+  /// exactly; an `Int`/`Uint` pair compares exactly via `i128`↔`u128`.
+  ///
+  /// An `Int`/`Float` (or `Uint`/`Float`) pair is the subtle case. The naive
+  /// `as_f64() == as_f64()` fallback silently collapses any two integers that
+  /// round to the same `f64` — e.g. `9007194254740993` and `…992.0` both become
+  /// the same `f64` above 2^53, so a real off-by-one mismatch reads EQUAL. So
+  /// the float must be integer-valued AND exactly representable as the integer
+  /// type ([`f_as_exact_i128`] / [`f_as_exact_u128`] applies a range-check
+  /// BEFORE the cast — see R2-F3 — to keep `2^127.0` from saturating to
+  /// `i128::MAX` and falsely matching `i128::MAX (Int)`). Any out-of-range or
+  /// fractional float returns FALSE: a NumVal::Int (which is by definition an
+  /// exact integer literal) cannot value-equal a non-integer or out-of-i128
+  /// f64; falling back to `as f64` would just re-introduce the precision-loss
+  /// false-positive R1-F3 fixed at 2^53 and R2-F3 fixed at 2^127.
+  ///
+  /// `(Float, Float)` keeps `f64` comparison: both sides are `f64`-derived, so
+  /// this is formatting-insensitive (`0.0`==`0.00000000`, `3.4e+38`==`3.4e38`).
+  fn value_eq(self, other: NumVal) -> bool {
+    match (self, other) {
+      (NumVal::Int(a), NumVal::Int(b)) => a == b,
+      (NumVal::Uint(a), NumVal::Uint(b)) => a == b,
+      // `i128` spans all of `u128`'s representable-as-i128 range; a negative
+      // i128 can never equal a u128, and a non-negative i128 maps losslessly.
+      (NumVal::Int(i), NumVal::Uint(u)) | (NumVal::Uint(u), NumVal::Int(i)) => {
+        u128::try_from(i).is_ok_and(|i| i == u)
+      }
+      (NumVal::Int(i), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Int(i)) => {
+        // R2-F3: integer-valued → range-check → cast → exact integer compare.
+        // If the float is out of i128 range (or fractional), it cannot
+        // represent the same integer value, so report UNEQUAL — do NOT fall
+        // back to `as f64`, that was the saturation hole Codex caught.
+        f_as_exact_i128(f).is_some_and(|fi| i == fi)
+      }
+      (NumVal::Uint(u), NumVal::Float(f)) | (NumVal::Float(f), NumVal::Uint(u)) => {
+        // Symmetric to the Int/Float arm — see comment above.
+        f_as_exact_u128(f).is_some_and(|fu| u == fu)
+      }
+      (NumVal::Float(a), NumVal::Float(b)) => a == b,
+    }
+  }
+}
+
+/// If `f` is integer-valued AND inside the `i128` range, return that exact
+/// `i128`. Otherwise `None` — the caller then reports the values UNEQUAL (do
+/// NOT fall back to `as f64`; that is the mask Codex caught in R2-F3).
+///
+/// **Why the range-check must precede the cast.** Rust's `f64 as i128` cast
+/// is SATURATING (`-inf`/below-MIN → `i128::MIN`; `inf`/above-MAX →
+/// `i128::MAX`; NaN → 0). And `i128::MAX as f64` rounds UP to `2^127` —
+/// which is exactly the f64 literal `170141183460469231731687303715884105728.0`.
+/// A naïve "round-trip" `(f as i128 as f64) == f` therefore looks valid for
+/// `f = 2^127`: cast saturates to `i128::MAX`, the back-cast rounds UP to
+/// the same `2^127`, the check passes, and we hand back `i128::MAX` for a
+/// float that does not represent any i128. The integer comparator then reads
+/// `i128::MAX (Int) == 2^127.0 (Float)` as TRUE — a false-positive.
+///
+/// The half-open range `[-2^127, 2^127)` is exact in f64 (both endpoints are
+/// powers of two), so a literal-bound compare is exact and saturation-free.
+/// `f.fract() == 0.0` is checked FIRST so a fractional in-range float
+/// (e.g. `1.5`) also exits `None` cleanly.
+fn f_as_exact_i128(f: f64) -> Option<i128> {
+  if f.fract() != 0.0 {
+    return None;
+  }
+  // Half-open: `f >= -2^127` AND `f < 2^127`. Reject the upper bound — that
+  // f64 value cannot represent any i128 (i128::MAX = 2^127 - 1). Both
+  // literals are exact f64 (powers of two), so no rounding hides here.
+  if !(f >= -170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64
+    && f < 170_141_183_460_469_231_731_687_303_715_884_105_728.0_f64)
+  {
+    return None;
+  }
+  // Now safe: `f` is integer-valued AND inside [-2^127, 2^127). The cast is
+  // exact (any in-range integer-valued f64 round-trips losslessly through
+  // i128); the assert-style check guards future-proofs.
+  let i = f as i128;
+  debug_assert_eq!(i as f64, f, "in-range integer-valued f64 must round-trip");
+  Some(i)
+}
+
+/// `u128` analogue of [`f_as_exact_i128`]. Same range-before-cast discipline
+/// (the saturation hole is symmetric: `u128::MAX as f64` rounds UP to
+/// `2^128`, masking a `2^128.0` float as equal to `u128::MAX`). Rejects
+/// fractional `f`, negative `f`, and `f >= 2^128`. The half-open bounds
+/// `[0, 2^128)` are exact in f64 (both powers of two).
+fn f_as_exact_u128(f: f64) -> Option<u128> {
+  if f.fract() != 0.0 {
+    return None;
+  }
+  if !(f >= 0.0_f64 && f < 340_282_366_920_938_463_463_374_607_431_768_211_456.0_f64) {
+    return None;
+  }
+  let u = f as u128;
+  debug_assert_eq!(u as f64, f, "in-range integer-valued f64 must round-trip");
+  Some(u)
+}
+
+/// VALUE-equality of two scalar `RawValue`s (numbers, strings, `true`/`false`/
+/// `null`). The rule the module doc describes:
+///
+/// 1. If BOTH sides parse as a finite number (a bare number, OR a quoted string
+///    whose entire content is numeric), compare by numeric value.
+/// 2. Otherwise compare the scalars' raw lexeme text byte-for-byte — so
+///    non-numeric strings stay escape-exact, and `true`/`null`/`"NaN"` match
+///    only their identical spelling.
+fn scalar_value_eq(a: &RawValue, g: &RawValue) -> bool {
+  let (at, _) = scalar_payload(a);
+  let (gt, _) = scalar_payload(g);
+  if let (Some(an), Some(gn)) = (parse_number(at), parse_number(gt)) {
+    return an.value_eq(gn);
+  }
+  // Non-numeric (or only-one-side-numeric): exact lexeme compare. Using the
+  // raw `get()` keeps a bare `123` distinct from the string `"abc"` and a
+  // quoted `"NaN"` matching only another quoted `"NaN"`.
+  a.get().trim() == g.get().trim()
+}
+
+/// A normal form of a SCALAR under our value-equivalence, used only as a sort
+/// key when pairing duplicate object keys (`canonical`). Two scalars that are
+/// `scalar_value_eq` MUST map to the same string here, else the dup-pairing
+/// sort could mis-rank value-equal-but-differently-spelled duplicates. Numbers
+/// canonicalize to a single normalized form; non-numbers keep their raw text.
+fn canonical_scalar(r: &RawValue) -> String {
+  let (text, _) = scalar_payload(r);
+  match parse_number(text) {
+    // Integers print exactly; floats via `{}` (a single deterministic form,
+    // e.g. `0.0` and `0.00000000` both canonicalize to `0`). This is a SORT
+    // KEY only — `scalar_value_eq` remains the verdict (so f64 round-trip
+    // imprecision in the key can never change equality, only pairing order).
+    Some(NumVal::Int(i)) => format!("#{i}"),
+    Some(NumVal::Uint(u)) => format!("#{u}"),
+    Some(NumVal::Float(f)) => format!("#{}", f),
+    None => r.get().trim().to_string(),
+  }
+}
+
 /// A normal form of a value under our equivalence (object key order is
 /// insensitive, array order is significant, scalars are byte-exact). Two
 /// values have equal canonical text **iff** they are `cmp`-equivalent, so
@@ -177,9 +400,10 @@ fn canonical(r: &RawValue) -> String {
       s.push(']');
       s
     }
-    // Scalar: the raw lexeme IS the canonical form — byte-exact, so
-    // `1` ≠ `1.0`, `0.50` ≠ `0.5`, `"A"` ≠ `"A"` all stand.
-    Kind::Scalar => r.get().to_string(),
+    // Scalar: a VALUE-normalized form so value-equal-but-differently-spelled
+    // scalars (`1` vs `1.0`, `"123"` vs `123`) sort to the same rank for
+    // dup-pairing. `scalar_value_eq` remains the actual verdict.
+    Kind::Scalar => canonical_scalar(r),
   }
 }
 
@@ -244,12 +468,13 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
       }
       Ok(())
     }
-    // Scalars (and shape-mismatched pairs): compare the raw lexeme text
-    // byte-for-byte. For a scalar this is escape-exact (strings) and
-    // token-exact (numbers). For a shape mismatch (e.g. object vs array)
-    // the raw texts differ, so this still reports correctly.
+    // Scalars (and shape-mismatched pairs): compare by VALUE
+    // ([`scalar_value_eq`]) — numbers (and numeric strings) numeric-equal,
+    // non-numeric strings escape-exact, `true`/`null`/`"NaN"` spelling-exact.
+    // For a shape mismatch (e.g. object vs array) neither side parses as a
+    // number and the raw texts differ, so this still reports correctly.
     _ => {
-      if a.get() == g.get() {
+      if scalar_value_eq(a, g) {
         Ok(())
       } else {
         Err(Mismatch::new(format!(
@@ -316,29 +541,37 @@ mod tests {
     // (key, raw-bytes) sort mispaired them and reported a FALSE
     // mismatch. Canonical-form pairing fixes it: {x:1,y:2} ≡ {y:2,x:1}
     // and {x:9} ≡ {x:9}, so the two documents are equivalent.
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1,"y":2},"A":{"x":9}}]"#,
-      r#"[{"A":{"x":9},"A":{"y":2,"x":1}}]"#,
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1,"y":2},"A":{"x":9}}]"#,
+        r#"[{"A":{"x":9},"A":{"y":2,"x":1}}]"#,
+      )
+      .is_ok()
+    );
     // Nested arrays inside dup values stay ORDER-significant.
-    assert!(json_equivalent(
-      r#"[{"A":[1,2],"A":{"q":0}}]"#,
-      r#"[{"A":{"q":0},"A":[2,1]}]"#,
-    )
-    .is_err());
+    assert!(
+      json_equivalent(
+        r#"[{"A":[1,2],"A":{"q":0}}]"#,
+        r#"[{"A":{"q":0},"A":[2,1]}]"#,
+      )
+      .is_err()
+    );
     // The fix must NOT loosen the verdict: genuinely different dup
     // values (and different value multisets) still mismatch.
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1},"A":{"x":2}}]"#,
-      r#"[{"A":{"x":1},"A":{"x":3}}]"#,
-    )
-    .is_err());
-    assert!(json_equivalent(
-      r#"[{"A":{"x":1},"A":{"y":1}}]"#,
-      r#"[{"A":{"x":1},"A":{"x":1}}]"#,
-    )
-    .is_err());
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1},"A":{"x":2}}]"#,
+        r#"[{"A":{"x":1},"A":{"x":3}}]"#,
+      )
+      .is_err()
+    );
+    assert!(
+      json_equivalent(
+        r#"[{"A":{"x":1},"A":{"y":1}}]"#,
+        r#"[{"A":{"x":1},"A":{"x":1}}]"#,
+      )
+      .is_err()
+    );
   }
 
   #[test]
@@ -348,18 +581,263 @@ mod tests {
   }
 
   #[test]
-  fn number_formatting_is_byte_exact() {
-    // 1 vs 1.0 and 0.50 vs 0.5 must NOT be considered equal.
-    assert!(json_equivalent(r#"[{"a":1}]"#, r#"[{"a":1.0}]"#).is_err());
-    assert!(json_equivalent(r#"[{"a":0.50}]"#, r#"[{"a":0.5}]"#).is_err());
+  fn number_formatting_is_value_semantic() {
+    // VALUE-semantic: `1 == 1.0` and `0.50 == 0.5` (same numeric value,
+    // different spelling — both valid JSON for the same number).
+    assert!(json_equivalent(r#"[{"a":1}]"#, r#"[{"a":1.0}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":0.50}]"#, r#"[{"a":0.5}]"#).is_ok());
+    // But genuinely different numeric values still mismatch.
+    assert!(json_equivalent(r#"[{"a":1}]"#, r#"[{"a":2}]"#).is_err());
+    assert!(json_equivalent(r#"[{"a":0.5}]"#, r#"[{"a":0.6}]"#).is_err());
   }
 
   #[test]
-  fn string_lexeme_is_byte_exact_not_escape_normalized() {
-    // The bar is byte-exact string lexemes: an escaped form is NOT equal
-    // to the literal even though both decode to the letter A. Build the
-    // escaped form from explicit bytes so there is zero ambiguity:
-    // `lit` = `["A"]`, `esc` = `["A"]` (the 6-char JSON escape).
+  fn trailing_zeros_are_value_equal() {
+    // `0.0` == `0.00000000`; `1.5` == `1.50`; `-0.0` == `0`.
+    assert!(json_equivalent(r#"[{"a":0.0}]"#, r#"[{"a":0.00000000}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":1.5}]"#, r#"[{"a":1.50}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":-0.0}]"#, r#"[{"a":0}]"#).is_ok());
+  }
+
+  #[test]
+  fn scientific_notation_spelling_is_value_equal() {
+    // `3.4e+38` == `3.4e38` (the `+` is style); `1E3` == `1000`.
+    assert!(json_equivalent(r#"[{"a":3.4e+38}]"#, r#"[{"a":3.4e38}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":1E3}]"#, r#"[{"a":1000}]"#).is_ok());
+    assert!(
+      json_equivalent(
+        r#"[{"a":3.40282366920938e+38}]"#,
+        r#"[{"a":3.40282366920938e38}]"#
+      )
+      .is_ok()
+    );
+  }
+
+  #[test]
+  fn string_vs_bare_number_is_value_equal() {
+    // A quoted numeric string equals the bare number of the same value
+    // (ExifTool's `EscapeJSON` number-gate blurs these): `"123"` == `123`,
+    // `"0.00000000"` == `0.0`, `"3.4e+38"` == `3.4e38`.
+    assert!(json_equivalent(r#"[{"a":"123"}]"#, r#"[{"a":123}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":"0.00000000"}]"#, r#"[{"a":0.0}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":"3.4e+38"}]"#, r#"[{"a":3.4e38}]"#).is_ok());
+    // Both quoted, value-equal.
+    assert!(json_equivalent(r#"[{"a":"1.0"}]"#, r#"[{"a":"1"}]"#).is_ok());
+    // A numeric string vs a DIFFERENT number still mismatches.
+    assert!(json_equivalent(r#"[{"a":"123"}]"#, r#"[{"a":124}]"#).is_err());
+  }
+
+  #[test]
+  fn huge_u64_compares_exact_as_integer() {
+    // `18446744073709551615` (u64::MAX, 20 digits) exceeds f64's 53-bit
+    // mantissa; it must compare as an EXACT integer, so the true value
+    // matches itself and DIFFERS from its f64-rounded neighbour.
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551615}]"#
+      )
+      .is_ok()
+    );
+    // Quoted vs bare, both the exact huge integer ⇒ value-equal.
+    assert!(
+      json_equivalent(
+        r#"[{"a":"18446744073709551615"}]"#,
+        r#"[{"a":18446744073709551615}]"#
+      )
+      .is_ok()
+    );
+    // Off by one ⇒ mismatch (precision preserved, NOT collapsed via f64).
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551614}]"#
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn int_vs_float_above_2pow53_compares_exact() {
+    // Codex F3: the OLD `as_f64() == as_f64()` cross-arm fallback collapsed an
+    // `Int` and a `Float` that round to the same `f64`. Above 2^53 that masks a
+    // real off-by-one: `9007199254740993` (odd, Int) and `9007199254740992.0`
+    // (the nearest even f64, Float) both become the same f64 ⇒ FALSE EQUAL.
+    // The exact-integer comparison must report these UNEQUAL.
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740993}]"#,
+        r#"[{"a":9007199254740992.0}]"#
+      )
+      .is_err(),
+      "9007199254740993 (Int) must NOT equal 9007199254740992.0 (Float)"
+    );
+    // But an Int that IS exactly the float's value stays EQUAL (2^53 is exactly
+    // representable, so `…992` Int == `…992.0` Float).
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740992}]"#,
+        r#"[{"a":9007199254740992.0}]"#
+      )
+      .is_ok(),
+      "9007199254740992 (Int) must equal 9007199254740992.0 (Float)"
+    );
+    // Order-independent (Float on the actual side).
+    assert!(
+      json_equivalent(
+        r#"[{"a":9007199254740992.0}]"#,
+        r#"[{"a":9007199254740993}]"#
+      )
+      .is_err()
+    );
+    // A genuinely fractional float vs a near integer still mismatches via the
+    // f64 fallback (the float is fractional ⇒ never integer-valued).
+    assert!(json_equivalent(r#"[{"a":3}]"#, r#"[{"a":3.5}]"#).is_err());
+    // Within-mantissa Int-vs-Float value equality is unaffected.
+    assert!(json_equivalent(r#"[{"a":42}]"#, r#"[{"a":42.0}]"#).is_ok());
+  }
+
+  #[test]
+  fn float_float_spelling_stays_value_equal_after_hardening() {
+    // The `(Float, Float)` arm keeps f64 comparison, so the value-style
+    // insensitivity Codex wanted preserved still holds AFTER the F3 fix:
+    // trailing zeros and exponent spelling of the same f64 stay EQUAL.
+    assert!(json_equivalent(r#"[{"a":0.0}]"#, r#"[{"a":0.00000000}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":3.4e+38}]"#, r#"[{"a":3.4e38}]"#).is_ok());
+  }
+
+  #[test]
+  fn huge_u64_vs_float_compares_exact() {
+    // Uint cross-arm: `18446744073709551615` (u64::MAX) vs its own value as a
+    // float spelling, and vs the f64-rounded neighbour `…614`.
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551615}]"#
+      )
+      .is_ok()
+    );
+    // u64::MAX rounds to 2^64 as f64; `18446744073709551614` is NOT that f64
+    // value, so a bare-vs-bare integer pair stays exact and UNEQUAL.
+    assert!(
+      json_equivalent(
+        r#"[{"a":18446744073709551615}]"#,
+        r#"[{"a":18446744073709551614}]"#
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn i128_max_vs_2pow127_float_is_unequal() {
+    // R2-F3 (Codex round-2 [high]): the R1 fix used `f as i128` round-tripped
+    // via `as f64` to decide "is this float an exact i128", but
+    // `f64 as i128` SATURATES (`>= 2^127` → `i128::MAX`) and `i128::MAX as f64`
+    // rounds UP to `2^127` — so the round-trip `(f as i128) as f64 == f` is
+    // TRUE for `f = 2^127.0`, giving a false-positive equality between the
+    // integer `i128::MAX` and the float `2^127.0` (which is one past i128's
+    // representable range).
+    //
+    // i128::MAX = 170141183460469231731687303715884105727 (2^127 - 1).
+    // The float 170141183460469231731687303715884105728.0 IS 2^127 in f64
+    // (an exact power-of-two literal).
+    let int_max = "[{\"a\":170141183460469231731687303715884105727}]";
+    let f_2pow127 = "[{\"a\":170141183460469231731687303715884105728.0}]";
+    assert!(
+      json_equivalent(int_max, f_2pow127).is_err(),
+      "i128::MAX (Int) must NOT equal 2^127.0 (Float)"
+    );
+    // Symmetric (Float on the actual side).
+    assert!(json_equivalent(f_2pow127, int_max).is_err());
+  }
+
+  #[test]
+  fn i128_min_vs_neg_2pow127_float_is_equal() {
+    // i128::MIN = -2^127 = -170141183460469231731687303715884105728, which IS
+    // exactly representable as the f64 literal of the same magnitude (it is a
+    // power of two). The half-open range `[-2^127, +2^127)` INCLUDES this
+    // value, so this pair stays EQUAL (and the equal-by-value verdict is the
+    // correct one — they ARE the same mathematical value).
+    let int_min = "[{\"a\":-170141183460469231731687303715884105728}]";
+    let f_min = "[{\"a\":-170141183460469231731687303715884105728.0}]";
+    assert!(
+      json_equivalent(int_min, f_min).is_ok(),
+      "i128::MIN (Int) must equal -2^127.0 (Float, exact)"
+    );
+    assert!(json_equivalent(f_min, int_min).is_ok());
+  }
+
+  #[test]
+  fn u128_max_vs_2pow128_float_is_unequal() {
+    // Symmetric Uint hole: `u128::MAX as f64` rounds UP to `2^128`, so the
+    // OLD round-trip masked the float `2^128.0` as equal to `u128::MAX`
+    // (which is one below `2^128`). u128::MAX = 2^128 - 1.
+    let uint_max = "[{\"a\":340282366920938463463374607431768211455}]";
+    let f_2pow128 = "[{\"a\":340282366920938463463374607431768211456.0}]";
+    assert!(
+      json_equivalent(uint_max, f_2pow128).is_err(),
+      "u128::MAX (Uint) must NOT equal 2^128.0 (Float)"
+    );
+    assert!(json_equivalent(f_2pow128, uint_max).is_err());
+  }
+
+  #[test]
+  fn float_beyond_i128_range_stays_unequal_to_any_int() {
+    // Floats far outside the i128 / u128 ranges must NOT be coerced to the
+    // saturated integer. Negative side: `-2^200.0` cannot equal any signed
+    // 128-bit integer. Positive side: `2^200.0` cannot equal any 128-bit
+    // integer either. Use exact power-of-two f64 literals.
+    let f_neg_big = "[{\"a\":-1.6069380442589903e+60}]"; // ~-2^200
+    let f_pos_big = "[{\"a\":1.6069380442589903e+60}]"; // ~2^200
+    assert!(
+      json_equivalent(f_neg_big, "[{\"a\":-1}]").is_err(),
+      "huge negative float must NOT equal a small Int"
+    );
+    assert!(
+      json_equivalent(f_pos_big, "[{\"a\":1}]").is_err(),
+      "huge positive float must NOT equal a small Int"
+    );
+    // And no Int comparison saturates into a match for the boundary itself.
+    let int_one = "[{\"a\":1}]";
+    assert!(json_equivalent(f_pos_big, int_one).is_err());
+  }
+
+  #[test]
+  fn float_in_int_range_just_below_2pow127_stays_equal() {
+    // Sanity: a clearly-in-range integer-valued float (well below 2^127)
+    // still round-trips equal to its Int spelling. `2^120` is exact in f64
+    // (power of two) and clearly inside `[-2^127, +2^127)`.
+    //
+    // 2^120 = 1329227995784915872903807060280344576.
+    let int_form = "[{\"a\":1329227995784915872903807060280344576}]";
+    let float_form = "[{\"a\":1329227995784915872903807060280344576.0}]";
+    assert!(
+      json_equivalent(int_form, float_form).is_ok(),
+      "2^120 (Int) must equal 2^120.0 (Float, well inside i128 range)"
+    );
+    // Below-range floats: -2^120 is exact and well inside the i128 range.
+    let int_neg = "[{\"a\":-1329227995784915872903807060280344576}]";
+    let float_neg = "[{\"a\":-1329227995784915872903807060280344576.0}]";
+    assert!(json_equivalent(int_neg, float_neg).is_ok());
+  }
+
+  #[test]
+  fn nonfinite_strings_compare_exact() {
+    // `"NaN"`/`"Inf"`/`"-Inf"` are non-numeric strings ⇒ exact compare. They
+    // match their identical spelling (both sides emit the same titlecase via
+    // `perl_nonfinite_str`) and do NOT coerce to any number.
+    assert!(json_equivalent(r#"[{"a":"NaN"}]"#, r#"[{"a":"NaN"}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":"Inf"}]"#, r#"[{"a":"Inf"}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"a":"-Inf"}]"#, r#"[{"a":"-Inf"}]"#).is_ok());
+    // Different titlecase / a number does NOT match a non-finite string.
+    assert!(json_equivalent(r#"[{"a":"NaN"}]"#, r#"[{"a":"nan"}]"#).is_err());
+    assert!(json_equivalent(r#"[{"a":"Inf"}]"#, r#"[{"a":"-Inf"}]"#).is_err());
+  }
+
+  #[test]
+  fn non_numeric_string_mismatch_still_fails() {
+    // Non-numeric strings stay escape/lexeme-exact: an escaped form is NOT
+    // equal to the literal even though both decode to the letter A.
     let lit = "[\"A\"]";
     let esc = "[\"\\u0041\"]";
     assert_ne!(
@@ -367,13 +845,17 @@ mod tests {
       esc.as_bytes(),
       "fixtures must differ in bytes"
     );
-    // Both decode to "A", but the bar is byte-exact ⇒ not equivalent.
     assert!(json_equivalent(lit, esc).is_err());
     // Identical bytes ARE equal (literal vs literal, escaped vs escaped).
     assert!(json_equivalent(lit, lit).is_ok());
     assert!(json_equivalent(esc, esc).is_ok());
-    // Forward-slash escape vs plain also differ byte-wise.
+    // Forward-slash escape vs plain also differ byte-wise (non-numeric).
     assert!(json_equivalent(r#"["a/b"]"#, r#"["a\/b"]"#).is_err());
+    // Two genuinely different non-numeric strings mismatch.
+    assert!(json_equivalent(r#"["foo"]"#, r#"["bar"]"#).is_err());
+    // A numeric string vs a non-numeric string mismatches (one side not a
+    // number ⇒ exact text compare, and `"123"` ≠ `"abc"`).
+    assert!(json_equivalent(r#"[{"a":"123"}]"#, r#"[{"a":"abc"}]"#).is_err());
   }
 
   #[test]
@@ -384,11 +866,13 @@ mod tests {
 
   #[test]
   fn nested_structures_compare_recursively() {
-    assert!(json_equivalent(
-      r#"[{"a":[1,{"x":"v"}],"b":2}]"#,
-      r#"[{"b":2,"a":[1,{"x":"v"}]}]"#
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        r#"[{"a":[1,{"x":"v"}],"b":2}]"#,
+        r#"[{"b":2,"a":[1,{"x":"v"}]}]"#
+      )
+      .is_ok()
+    );
     let m = json_equivalent(r#"[{"a":[1,{"x":"v"}]}]"#, r#"[{"a":[1,{"x":"w"}]}]"#).unwrap_err();
     assert_eq!(
       m,
@@ -407,25 +891,31 @@ mod tests {
 
   #[test]
   fn invalid_json_is_reported() {
-    assert!(json_equivalent("[1,]", "[1]")
-      .unwrap_err()
-      .message()
-      .contains("actual is invalid"));
-    assert!(json_equivalent("[1]", "nope")
-      .unwrap_err()
-      .message()
-      .contains("golden is invalid"));
+    assert!(
+      json_equivalent("[1,]", "[1]")
+        .unwrap_err()
+        .message()
+        .contains("actual is invalid")
+    );
+    assert!(
+      json_equivalent("[1]", "nope")
+        .unwrap_err()
+        .message()
+        .contains("golden is invalid")
+    );
   }
 
   #[test]
   fn whitespace_insignificant_for_containers() {
     // Internal container whitespace must not cause a mismatch (only scalar
     // lexemes are byte-compared; structure is compared recursively).
-    assert!(json_equivalent(
-      "[ { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ]",
-      r#"[{"a":1,"b":[2,3]}]"#
-    )
-    .is_ok());
+    assert!(
+      json_equivalent(
+        "[ { \"a\" : 1 , \"b\" : [ 2 , 3 ] } ]",
+        r#"[{"a":1,"b":[2,3]}]"#
+      )
+      .is_ok()
+    );
   }
 
   #[test]

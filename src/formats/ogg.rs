@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "ogg")]
 //! Faithful port of `Image::ExifTool::Ogg` (`lib/Image/ExifTool/Ogg.pm`)
 //! — Ogg container framing + inline Vorbis-comment block (vendor +
 //! N KEY=VALUE comments) extraction. The Vorbis-comment block is shared
@@ -9,18 +13,21 @@
 //! it has accumulated each stream's leading packets, then dispatches the
 //! packet to its codec's comments handler.
 //!
+//! A typed [`Meta<'a>`] is produced by the
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
+//! re-emits through the `Metadata` push path (list-aware for Vorbis
+//! Artist/Performer/Contact) so the serialized JSON stays byte-exact with
+//! bundled `perl exiftool`.
+//!
 //! ## Deliberate Phase-2 deferrals (see `docs/superpowers/plans/`):
-//! - **Codec-specific identification-header binary tables (R1 F2 scope
-//!   tightening):** `%Image::ExifTool::Vorbis::Identification`
-//!   (Vorbis.pm:40-70), `%Image::ExifTool::Opus::Header` (Opus.pm:36-51),
-//!   and `%Image::ExifTool::Theora::Identification` (Theora.pm:42-104)
-//!   are deferred to dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm`
-//!   PRs. The `OverrideFileType('OGV')` / `OverrideFileType('OPUS')`
-//!   calls (Ogg.pm:49-50) remain in scope — file-type override fires
-//!   whenever the header packet is recognised. See the in-code
-//!   `// Codec-specific identification-header tables — DEFERRED (R1 F2)`
-//!   comment block for the full deferral rationale incl. the
-//!   signed-vs-unsigned `Format` audit list each follow-up PR owes.
+//! - **`%Image::ExifTool::Theora::Identification` (Theora.pm:42-104)** —
+//!   Theora is a video codec with a larger binary table (rational pixel
+//!   aspect / framerate / colourspace) and no Theora corpus fixture
+//!   exists in the suite. Queued for the dedicated Theora.pm PR. The
+//!   `OverrideFileType('OGV')` call (Ogg.pm:49) DOES fire when a Theora
+//!   packet is seen, even with the table deferred. (R2 F-OGG-TRIM
+//!   re-landed Vorbis::Identification + Opus::Header here; only
+//!   Theora::Identification remains deferred.)
 //! - **FLAC-in-Ogg transport** (Ogg.pm:176-179, 190-195): the `\x7fFLAC`
 //!   packet arm that delegates to `Image::ExifTool::FLAC::ProcessFLAC`
 //!   is deferred until the FLAC port lands (row 8). A `\x7fFLAC`-magic
@@ -40,7 +47,7 @@
 
 use crate::{
   convert::{apply, base64_decode},
-  parser::{FormatParser, ParseContext},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -56,45 +63,31 @@ use std::collections::HashMap;
 const MAX_PACKETS: u32 = 2;
 
 // ===========================================================================
-// Codec-specific identification-header tables — DEFERRED (R1 F2)
+// Codec-specific identification-header tables — STATUS
 // ===========================================================================
 //
-// The bundled-Perl tables `%Image::ExifTool::Vorbis::Identification`
-// (Vorbis.pm:40-70), `%Image::ExifTool::Opus::Header` (Opus.pm:36-51), and
-// `%Image::ExifTool::Theora::Identification` (Theora.pm:42-104) extract
-// codec-specific binary fields (Vorbis bitrate/sample-rate/channels; Opus
-// OutputGain/sample-rate/channels; Theora FrameRate/PixelAspect/etc.).
-// These tables were initially ported in the first revision of this PR but
-// have been REMOVED here to tighten this PR's scope back to its announced
-// boundary — "Ogg container framing + inline Vorbis-comment block
-// extraction". Codec-specific binary-field decoding is deferred to
-// dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm` PRs.
+// R2 F-OGG-TRIM (this commit): Vorbis::Identification (Vorbis.pm:40-70)
+// + Opus::Header (Opus.pm:36-51) are PORTED below — the R1 deferral was
+// reverted when round-2 review showed it created new conformance hand-
+// trims that violate the 1:1 bar. Theora::Identification (Theora.pm:42-104)
+// remains deferred (no fixture; on the dedicated Theora.pm queue).
 //
-// When those PRs land they MUST verify each field's signed-vs-unsigned
-// `Format` against the bundled `.pm` declarations (D5 is faithfulness to
-// the bundled ExifTool source, NOT to upstream codec specs):
+// Signedness audit (D5 — faithfulness to bundled ExifTool, NOT upstream
+// codec specs):
 //   * Vorbis.pm:53,59,65 declare MaximumBitrate / NominalBitrate /
-//     MinimumBitrate as `Format => 'int32u'` (unsigned). The Vorbis I
-//     specification itself describes them as signed 32-bit integers
-//     (RFC-style spec text), but ExifTool emits the unsigned reading —
-//     porting MUST match ExifTool, not the spec.
-//   * Opus.pm:48 declares OutputGain as `Format => 'int16u'`. RFC 7845
-//     §5.1 specifies a signed 16-bit LE field (Q7.8 fixed-point gain in
-//     dB), but again ExifTool reads it unsigned — the port MUST match.
-//   * Theora.pm uses only `int8u` / `int16u` / `int32u` / `int8u[3]` /
-//     `int16u[3]` / `rational64u`; no signedness mismatch.
+//     MinimumBitrate as `Format => 'int32u'` (UNSIGNED). The Vorbis I
+//     specification describes them as signed 32-bit integers (RFC-style
+//     spec text); the port follows ExifTool's unsigned reading.
+//   * Opus.pm:48 declares OutputGain as `Format => 'int16u'` (UNSIGNED).
+//     RFC 7845 §5.1 specifies a signed 16-bit LE field (Q7.8 fixed-point
+//     dB gain); the port follows ExifTool's unsigned reading.
+//   * Theora.pm (deferred) uses only `int8u` / `int16u` / `int32u` /
+//     `int8u[3]` / `int16u[3]` / `rational64u`; no signedness mismatch
+//     vs the Theora spec to audit when that PR lands.
 //
 // The `OverrideFileType('OGV')` / `OverrideFileType('OPUS')` calls
-// (Ogg.pm:49-50) live in `process_packet` and ARE retained — file-type
-// override fires whenever the corresponding header packet is seen, even
-// when the identification-binary table is not (yet) ported.
-//
-// Vorbis-comment-block parsing (vendor + N KEY=VALUE comments) IS in this
-// PR's scope and IS retained — see `process_vorbis_comments` below.
-//
-// Forward reference (memory note): `exifast-phase2-forward-items` —
-// "Vorbis.pm + Opus.pm codec-specific tags (identification-header binary
-// fields) deferred to dedicated Vorbis/Opus PRs".
+// (Ogg.pm:49-50) live in `process_packet` — file-type override fires
+// whenever the corresponding header packet is seen.
 
 // ===========================================================================
 // Vorbis::Comments — faithful %Vorbis::Comments (Vorbis.pm:72-135)
@@ -117,8 +110,15 @@ fn coverart_valueconv(v: &TagValue) -> TagValue {
 
 fn metadata_block_picture_valueconv(v: &TagValue) -> TagValue {
   // Vorbis.pm:122-134 `Binary => 1, RawConv => 'XMP::DecodeBase64($val)'`.
-  // The SubDirectory hop to `FLAC::Picture` is deferred (see module doc).
-  // For our scope: emit the decoded raw bytes (same shape as COVERART).
+  // The RawConv decodes base64 to raw bytes; the SubDirectory hop to
+  // `FLAC::Picture` (Vorbis.pm:130-133) then parses the resulting payload.
+  // R3 F2: the SubDirectory hop is now intercepted by
+  // `process_vorbis_comments` BEFORE this ValueConv runs (see the
+  // `METADATA_BLOCK_PICTURE` branch in that function), so the decoded
+  // bytes are parsed into an `OggPicture` and emitted as `FLAC:Picture*`
+  // fields. This ValueConv is kept as the fallback for any future call
+  // site that bypasses the comments-level intercept; today it's
+  // unreachable.
   coverart_valueconv(v)
 }
 
@@ -387,20 +387,493 @@ fn underscore_camelcase(s: &str) -> String {
 }
 
 // ===========================================================================
-// Binary-data extraction — DEFERRED (R1 F2)
+// Vorbis::Identification + Opus::Header binary tables
 //
-// The targeted `ProcessBinaryData` subset (`read_binary` /
-// `process_binary_data` / `BinaryFormat` / `binary_table_offsets` /
-// `binary_table_format` / `BinaryByteOrder { II, MM }`) lived here in the
-// first revision of this PR to drive the three codec identification
-// tables above. With those tables deferred (see the comment block at the
-// top of this module), this entire engine-subset has no consumer in this
-// PR and is REMOVED. The dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm`
-// PRs (which will re-land the codec identification tables) will either
-// promote a shared `ProcessBinaryData` into the engine layer (preferred
-// long-term — `RIFF.pm`, `QuickTime.pm`, `FLAC.pm`, etc. all need it) or
-// re-derive this targeted subset alongside the codec tables.
+// R2 F-OGG-TRIM: the codec-identification binary tables are IN SCOPE for
+// this PR after all — round-2 review showed the R1 deferral was creating
+// new conformance hand-trims (`-x Vorbis:VorbisVersion -x Vorbis:AudioChannels
+// -x Vorbis:SampleRate -x Vorbis:NominalBitrate ...` and `-x Opus:*`) and
+// the trims violated the "no hand-trims beyond the formally-accepted-
+// deferral list" 1:1 bar. The tables are bounded (a handful of fixed-offset
+// fields per codec); they're now ported here directly so the goldens can
+// be regenerated UNTRIMMED.
+//
+// Theora::Identification (Theora.pm:42-104) stays deferred — Theora is a
+// VIDEO format whose tags carry the `Theora` group, no in-scope Ogg-Theora
+// fixture exists, and the bundled fixture for `OverrideFileType('OGV')`
+// would need a real .ogv corpus. Theora is on the queue for the dedicated
+// Theora.pm PR; the `OverrideFileType('OGV')` retains for any `\x80theora`
+// / `\x81theora` packet seen (Ogg.pm:49).
+//
+// Faithful Perl reference for the in-scope tables:
+//
+// %Image::ExifTool::Vorbis::Identification (Vorbis.pm:40-70):
+//   0  => VorbisVersion (int32u)
+//   4  => AudioChannels (int8u — default Format unless declared)
+//   5  => SampleRate (int32u)
+//   9  => MaximumBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//  13  => NominalBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//  17  => MinimumBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//
+// %Image::ExifTool::Opus::Header (Opus.pm:36-51):
+//   0  => OpusVersion (int8u — default Format)
+//   1  => AudioChannels (int8u — default Format)
+//   4  => SampleRate (int32u)
+//   8  => OutputGain (int16u; ValueConv '10 ** ($val/5120)')
+//
+// Note 1: Opus.pm:48 declares OutputGain as `Format => 'int16u'` (UNSIGNED);
+// RFC 7845 §5.1 specifies a signed 16-bit field (Q7.8 fixed-point dB gain),
+// but D5 is faithfulness to bundled ExifTool, NOT to upstream codec specs —
+// so the port follows Opus.pm and reads unsigned.
+// Note 2: Vorbis.pm:53,59,65 declare MaximumBitrate / NominalBitrate /
+// MinimumBitrate as `Format => 'int32u'` (UNSIGNED). The Vorbis I
+// specification describes them as signed 32-bit integers; ExifTool emits
+// the unsigned reading. The port follows ExifTool.
+// Note 3: Vorbis identification fields are all LITTLE-ENDIAN
+// (`PROCESS_PROC => \&ProcessBinaryData` + no `ByteOrder` override on the
+// Identification table; the Vorbis I spec is LE, and Ogg.pm sets `II`
+// via `Image::ExifTool::SetByteOrder('II')` at Ogg.pm:101). Opus header
+// fields are also LE (RFC 7845 §5.1).
 // ===========================================================================
+
+/// Typed Vorbis-identification-packet payload (Vorbis.pm:40-70).
+///
+/// Holds the six fields the bundled `Vorbis::Identification` ProcessBinaryData
+/// table extracts from the `\x01vorbis` packet's 23-byte fixed-offset payload.
+/// **Every field is `Option<...>`** because bundled `ProcessBinaryData`
+/// (ExifTool.pm:9866-10065) iterates the tag table per-FIELD: each declared
+/// offset is independently checked against `$entry >= $size` (line 9927)
+/// before extracting the value, so a short payload silently emits the
+/// *subset* of fields whose `offset + width <= payload.len()`. Bitrate fields
+/// also carry the RawConv `'$val || undef'` drop-zero behaviour
+/// (Vorbis.pm:55,61,67).
+///
+/// Codex R3 F3: pre-fix the helper rejected the WHOLE table on a payload
+/// shorter than the largest declared offset (21 bytes), so a 9-byte payload
+/// emitted nothing even though bundled would emit VorbisVersion / AudioChannels
+/// / SampleRate. The fix is per-field offset-checked extraction with `Option`
+/// on every field, faithful to ProcessBinaryData's iterate-and-skip semantics.
+///
+/// §1: no public fields. §3: accessor returns `Option<primitive>` (the
+/// contained primitives are `Copy`) directly, not a reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VorbisIdentification {
+  /// `Vorbis:VorbisVersion` (offset 0, int32u). Vorbis.pm:43-46. `None` when
+  /// payload shorter than 4 bytes.
+  vorbis_version: Option<u32>,
+  /// `Vorbis:AudioChannels` (offset 4, int8u). Vorbis.pm:47 — no explicit
+  /// Format ⇒ table's default `int8u`. `None` when payload shorter than 5
+  /// bytes. Stored as u8 (faithful width).
+  audio_channels: Option<u8>,
+  /// `Vorbis:SampleRate` (offset 5, int32u). Vorbis.pm:48-51. `None` when
+  /// payload shorter than 9 bytes.
+  sample_rate: Option<u32>,
+  /// `Vorbis:MaximumBitrate` (offset 9, int32u). Vorbis.pm:52-57. `None`
+  /// when payload shorter than 13 bytes OR when RawConv `'$val || undef'`
+  /// drops the zero value.
+  maximum_bitrate: Option<u32>,
+  /// `Vorbis:NominalBitrate` (offset 13, int32u). Vorbis.pm:58-63. `None`
+  /// when payload shorter than 17 bytes OR when RawConv drops a zero raw.
+  nominal_bitrate: Option<u32>,
+  /// `Vorbis:MinimumBitrate` (offset 17, int32u). Vorbis.pm:64-69. `None`
+  /// when payload shorter than 21 bytes OR when RawConv drops a zero raw.
+  minimum_bitrate: Option<u32>,
+}
+
+impl VorbisIdentification {
+  /// True iff at least one field was successfully populated. The parse
+  /// helper [`parse_vorbis_identification`] returns this struct even on a
+  /// short payload; the caller uses [`Self::is_empty`] to distinguish a
+  /// fully-empty result (faithful: bundled ProcessBinaryData emits zero
+  /// tags when the payload doesn't reach offset 0+width).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_empty(&self) -> bool {
+    self.vorbis_version.is_none()
+      && self.audio_channels.is_none()
+      && self.sample_rate.is_none()
+      && self.maximum_bitrate.is_none()
+      && self.nominal_bitrate.is_none()
+      && self.minimum_bitrate.is_none()
+  }
+  /// `Vorbis:VorbisVersion` raw value (Vorbis.pm:43-46, int32u), `None`
+  /// when the payload was too short to cover offset 0..4 (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vorbis_version(&self) -> Option<u32> {
+    self.vorbis_version
+  }
+  /// `Vorbis:AudioChannels` raw value (Vorbis.pm:47, int8u), `None` when
+  /// the payload was too short to cover offset 4 (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> Option<u8> {
+    self.audio_channels
+  }
+  /// `Vorbis:SampleRate` raw value in Hz (Vorbis.pm:48-51, int32u), `None`
+  /// when the payload was too short to cover offset 5..9 (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> Option<u32> {
+    self.sample_rate
+  }
+  /// `Vorbis:MaximumBitrate` raw bps, `None` when out-of-bounds OR
+  /// `bundled-RawConv` would drop the tag (raw == 0). Vorbis.pm:52-57.
+  #[must_use]
+  #[inline(always)]
+  pub const fn maximum_bitrate(&self) -> Option<u32> {
+    self.maximum_bitrate
+  }
+  /// `Vorbis:NominalBitrate` raw bps, `None` when out-of-bounds OR raw == 0.
+  /// Vorbis.pm:58-63.
+  #[must_use]
+  #[inline(always)]
+  pub const fn nominal_bitrate(&self) -> Option<u32> {
+    self.nominal_bitrate
+  }
+  /// `Vorbis:MinimumBitrate` raw bps, `None` when out-of-bounds OR raw == 0.
+  /// Vorbis.pm:64-69.
+  #[must_use]
+  #[inline(always)]
+  pub const fn minimum_bitrate(&self) -> Option<u32> {
+    self.minimum_bitrate
+  }
+}
+
+/// Parse the Vorbis identification packet's payload (the bytes AFTER the
+/// `\x01vorbis` magic) into [`VorbisIdentification`]. **Per-field**
+/// offset-checked extraction — faithful to bundled `ProcessBinaryData`
+/// (ExifTool.pm:9866-10065), which iterates the table and skips any field
+/// whose `entry+width` lies past the payload end (ExifTool.pm:9927 `next if
+/// $entry >= $size` and 9953 `last if $more <= 0`).
+///
+/// Codex R3 F3: pre-fix the helper required `payload.len() >= 21` (the
+/// largest declared offset+width); a 9-byte payload would emit NOTHING
+/// even though bundled would emit version/channels/sample-rate. Now each
+/// field is independently bounds-checked: `[0..4]` for VorbisVersion,
+/// `[4..5]` for AudioChannels, `[5..9]` for SampleRate, and `[9..13]`,
+/// `[13..17]`, `[17..21]` for the three bitrates.
+///
+/// Returns `None` ONLY when the payload is so short that NO field is
+/// populated (`payload.len() < 4`, so even VorbisVersion can't be read).
+/// On a short-but-non-empty payload, returns `Some(VorbisIdentification)`
+/// with the in-range fields populated and the out-of-range fields `None`.
+fn parse_vorbis_identification(payload: &[u8]) -> Option<VorbisIdentification> {
+  // `SetByteOrder('II')` (Ogg.pm:101) — every multi-byte field is LE.
+  //
+  // Per-field offset+width check (ExifTool.pm:9927 `next if $entry >=
+  // $size`): each field is emitted only if its full width fits in the
+  // payload. Bundled does NOT all-or-nothing; an 9-byte payload emits
+  // VorbisVersion / AudioChannels / SampleRate, then skips the three
+  // bitrate fields (offset 9 + 4 = 13 > 9, etc.).
+  let len = payload.len();
+  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` — the eager form
+  // would index into `payload[4]` etc. even when the bounds check fails
+  // (causing a panic before the result is discarded).
+  let vorbis_version =
+    (len >= 4).then(|| u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]));
+  let audio_channels = (len >= 5).then(|| payload[4]);
+  let sample_rate =
+    (len >= 9).then(|| u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]));
+  let read_bitrate = |offset: usize| -> Option<u32> {
+    if len < offset + 4 {
+      return None;
+    }
+    let raw = u32::from_le_bytes([
+      payload[offset],
+      payload[offset + 1],
+      payload[offset + 2],
+      payload[offset + 3],
+    ]);
+    // RawConv `'$val || undef'` — drop zero. Vorbis.pm:55,61,67.
+    (raw != 0).then_some(raw)
+  };
+  let id = VorbisIdentification {
+    vorbis_version,
+    audio_channels,
+    sample_rate,
+    maximum_bitrate: read_bitrate(9),
+    nominal_bitrate: read_bitrate(13),
+    minimum_bitrate: read_bitrate(17),
+  };
+  // `None` ONLY when payload was too short for even VorbisVersion — keeping
+  // the call-site `match` shape (the recorder still treats `None` as "no
+  // identification packet seen at all").
+  if id.is_empty() { None } else { Some(id) }
+}
+
+/// Typed Opus-header-packet payload (Opus.pm:36-51).
+///
+/// Holds the four fields the bundled `Opus::Header` ProcessBinaryData table
+/// extracts from the `OpusHead` packet's 19-byte fixed-offset payload.
+/// **Every field is `Option<...>`** because bundled `ProcessBinaryData`
+/// (ExifTool.pm:9927) iterates the tag table per-FIELD and skips any field
+/// whose declared offset is out of bounds — a short payload silently emits
+/// only the in-range subset.
+///
+/// `output_gain` is the POST-ValueConv computed gain (Opus.pm:49
+/// `ValueConv => '10 ** ($val/5120)'`); the raw `int16u` is converted at
+/// parse time to match the bundled `$val` ValueConv chain.
+///
+/// Codex R3 F3: pre-fix the helper rejected the WHOLE table on payloads
+/// shorter than 10 bytes (the largest offset+width). Per-field offset
+/// checks are the fix; faithful to bundled.
+///
+/// §1: no public fields. §3: accessor returns `Option<primitive>` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OpusHeader {
+  /// `Opus:OpusVersion` (offset 0, int8u). Opus.pm:39. `None` when payload
+  /// is empty.
+  opus_version: Option<u8>,
+  /// `Opus:AudioChannels` (offset 1, int8u). Opus.pm:40. `None` when
+  /// payload is shorter than 2 bytes.
+  audio_channels: Option<u8>,
+  /// `Opus:SampleRate` (offset 4, int32u). Opus.pm:42-45. `None` when
+  /// payload is shorter than 8 bytes.
+  sample_rate: Option<u32>,
+  /// `Opus:OutputGain` post-ValueConv. Opus.pm:46-50 — raw int16u read at
+  /// offset 8, then `10 ** ($val/5120)`. Stored as `f64`. `None` when
+  /// payload is shorter than 10 bytes.
+  output_gain: Option<f64>,
+}
+
+impl OpusHeader {
+  /// True iff at least one field was successfully populated.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_empty(&self) -> bool {
+    self.opus_version.is_none()
+      && self.audio_channels.is_none()
+      && self.sample_rate.is_none()
+      && self.output_gain.is_none()
+  }
+  /// `Opus:OpusVersion` raw value (Opus.pm:39, int8u). `None` when out of
+  /// bounds (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn opus_version(&self) -> Option<u8> {
+    self.opus_version
+  }
+  /// `Opus:AudioChannels` raw value (Opus.pm:40, int8u). `None` when out
+  /// of bounds (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> Option<u8> {
+    self.audio_channels
+  }
+  /// `Opus:SampleRate` raw value in Hz (Opus.pm:42-45, int32u). `None`
+  /// when out of bounds (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> Option<u32> {
+    self.sample_rate
+  }
+  /// `Opus:OutputGain` POST-ValueConv (Opus.pm:46-50: `10 ** ($val/5120)`).
+  /// `None` when out of bounds (R3 F3 per-field).
+  #[must_use]
+  #[inline(always)]
+  pub const fn output_gain(&self) -> Option<f64> {
+    self.output_gain
+  }
+}
+
+/// Parse the Opus header packet's payload (the bytes AFTER the `OpusHead`
+/// magic) into [`OpusHeader`]. **Per-field** offset-checked extraction —
+/// faithful to bundled `ProcessBinaryData` (ExifTool.pm:9927).
+///
+/// Codex R3 F3: pre-fix the helper required `payload.len() >= 10`. A short
+/// payload (e.g. 5 bytes) silently dropped EVERY field even though bundled
+/// would emit OpusVersion / AudioChannels / SampleRate when their declared
+/// offsets fit.
+///
+/// Returns `None` ONLY when the payload is empty (no field can be read).
+/// On a short payload, returns `Some(OpusHeader)` with the in-range fields
+/// populated.
+fn parse_opus_header(payload: &[u8]) -> Option<OpusHeader> {
+  // Opus header fields are LE (RFC 7845 §5.1; ProcessBinaryData inherits
+  // `II` from Ogg.pm:101).
+  //
+  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` for the indexed
+  // arms — the eager form would index even when the bounds check fails.
+  let len = payload.len();
+  let opus_version = (len >= 1).then(|| payload[0]);
+  let audio_channels = (len >= 2).then(|| payload[1]);
+  // Note: offset 2 is `PreSkip` (int16u), commented out in Opus.pm:41
+  // — INTENTIONALLY not ported (commented in bundled ⇒ deliberately not
+  // emitted).
+  let sample_rate =
+    (len >= 8).then(|| u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]));
+  let output_gain = (len >= 10).then(|| {
+    let raw_gain = u16::from_le_bytes([payload[8], payload[9]]);
+    // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
+    // table; the post-ValueConv value is what bundled emits in both `-j`
+    // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
+    10.0_f64.powf(f64::from(raw_gain) / 5120.0)
+  });
+  let header = OpusHeader {
+    opus_version,
+    audio_channels,
+    sample_rate,
+    output_gain,
+  };
+  if header.is_empty() {
+    None
+  } else {
+    Some(header)
+  }
+}
+
+// ===========================================================================
+// OggPicture — owned form of a Vorbis::Comments METADATA_BLOCK_PICTURE
+//
+// R3 F2 (Codex adversarial). Bundled Vorbis.pm:122-134 defines:
+//
+//   METADATA_BLOCK_PICTURE => {
+//     Name => 'Picture', Binary => 1,
+//     RawConv => 'XMP::DecodeBase64($val)',
+//     SubDirectory => { TagTable => 'Image::ExifTool::FLAC::Picture',
+//                        ByteOrder => 'BigEndian' },
+//   };
+//
+// The base64-decoded payload has the SAME on-wire structure as a FLAC
+// METADATA_BLOCK type 6 (PictureType / MIMEType / Description /
+// Width / Height / BitsPerPixel / IndexedColors / Length / Picture
+// data; FLAC.pm:84-134). Pre-fix the OGG parser stopped at the
+// base64 decode and emitted a single `Vorbis:Picture` blob —
+// silent loss of every Picture:* sub-field that bundled emits.
+//
+// Implementation: parse the decoded payload via
+// `flac::parse_flac_picture` (same routine FLAC uses for its type-6
+// block), then OWN the fields (allocate `String` / `Vec<u8>` so the
+// typed Meta doesn't borrow from a temporary base64 buffer). The
+// emission path mirrors `flac::sink_picture` but writes directly
+// against an `OggPicture` (no lifetime juggling needed).
+// ===========================================================================
+
+/// Owned form of a FLAC Picture METADATA_BLOCK, used by the Vorbis
+/// `METADATA_BLOCK_PICTURE` SubDirectory hop (Vorbis.pm:122-134). The
+/// base64-decoded payload from the Vorbis comment is parsed via
+/// [`crate::formats::flac::parse_flac_picture`] (same on-wire layout as
+/// FLAC's type-6 metadata block, FLAC.pm:84-134) and the resulting
+/// borrowed `Picture<'_>` is cloned into owned fields so the typed
+/// `ogg::Meta` doesn't borrow from a temporary base64 buffer.
+///
+/// **D8 — no public fields, accessors only.** §3 projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OggPicture {
+  /// `FLAC:PictureType` raw int32u (FLAC.pm:88-113 PrintConv hash key).
+  picture_type: u32,
+  /// `FLAC:PictureMIMEType` (FLAC.pm:115-117, `Format => 'var_pstr32'`),
+  /// UTF-8 string. Owned `String` (the base64-decoded buffer is dropped
+  /// after parse).
+  mime_type: String,
+  /// `FLAC:PictureDescription` (FLAC.pm:118-122, UTF-8 var_pstr32).
+  description: String,
+  /// `FLAC:PictureWidth` (FLAC.pm:123, int32u BE).
+  width: u32,
+  /// `FLAC:PictureHeight` (FLAC.pm:124, int32u BE).
+  height: u32,
+  /// `FLAC:PictureBitsPerPixel` (FLAC.pm:125, int32u BE).
+  bits_per_pixel: u32,
+  /// `FLAC:PictureIndexedColors` (FLAC.pm:126, int32u BE).
+  indexed_colors: u32,
+  /// `FLAC:PictureLength` (FLAC.pm:127) — DECLARED length, may exceed
+  /// `data.len()` on truncation (faithful ExifTool::ReadValue clamp).
+  length: u32,
+  /// `FLAC:Picture` raw bytes (FLAC.pm:128-133 `Format => 'undef[$val{7}]'`,
+  /// clamped to remaining payload). Owned `Vec<u8>`.
+  data: Vec<u8>,
+}
+
+impl OggPicture {
+  /// `FLAC:PictureType` raw code (Copy → by value; §3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn picture_type(&self) -> u32 {
+    self.picture_type
+  }
+  /// Bundled-Perl PrintConv string for [`Self::picture_type`] (e.g.
+  /// `"Front Cover"`), `None` for out-of-table codes (raw int emitted
+  /// in that case). Reuses the FLAC PrintConv map.
+  #[must_use]
+  #[inline(always)]
+  pub fn picture_type_name(&self) -> Option<&'static str> {
+    crate::formats::flac::picture_type_name(self.picture_type)
+  }
+  /// MIME type, e.g. `"image/png"`. §3 string projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn mime_type(&self) -> &str {
+    self.mime_type.as_str()
+  }
+  /// Description (UTF-8). §3 string projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn description(&self) -> &str {
+    self.description.as_str()
+  }
+  /// Picture width in pixels (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+  /// Picture height in pixels (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+  /// Bits per pixel (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn bits_per_pixel(&self) -> u32 {
+    self.bits_per_pixel
+  }
+  /// Indexed-palette colour count, 0 for non-paletted (Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn indexed_colors(&self) -> u32 {
+    self.indexed_colors
+  }
+  /// Declared length in bytes (may exceed `data().len()` on truncation;
+  /// Copy → by value).
+  #[must_use]
+  #[inline(always)]
+  pub const fn length(&self) -> u32 {
+    self.length
+  }
+  /// Picture binary payload (clamped to remaining bytes per
+  /// ExifTool::ReadValue, ExifTool.pm:6290-6298). §3 byte-slice
+  /// projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn data(&self) -> &[u8] {
+    self.data.as_slice()
+  }
+}
+
+/// Parse a base64-decoded METADATA_BLOCK_PICTURE payload into an owned
+/// [`OggPicture`]. Returns `None` when the on-wire bytes are too truncated
+/// to even read PictureType + MIME length (same threshold as
+/// [`crate::formats::flac::parse_flac_picture`]).
+fn parse_metadata_block_picture(payload: &[u8]) -> Option<OggPicture> {
+  // The on-wire layout is identical to FLAC's METADATA_BLOCK type 6, so
+  // delegate the binary unpack to the FLAC helper and clone the borrowed
+  // fields into owned ones.
+  let picture = crate::formats::flac::parse_flac_picture(payload)?;
+  Some(OggPicture {
+    picture_type: picture.picture_type(),
+    mime_type: picture.mime_type().to_string(),
+    description: picture.description().to_string(),
+    width: picture.width(),
+    height: picture.height(),
+    bits_per_pixel: picture.bits_per_pixel(),
+    indexed_colors: picture.indexed_colors(),
+    length: picture.length(),
+    data: picture.data().to_vec(),
+  })
+}
 
 // ===========================================================================
 // Vorbis comments — ProcessComments (Vorbis.pm:154-210)
@@ -417,10 +890,15 @@ fn read_u32_le(data: &[u8], pos: usize) -> Option<u32> {
 /// Process a Vorbis-comment block. `data` is the comment-packet payload
 /// (after the 7-byte `\x03vorbis` magic for Vorbis, or after the 8-byte
 /// `OpusTags` magic for Opus), starting at the vendor-length u32le.
-/// `group1` is the family-1 group to use for the emitted tags (`Vorbis`
-/// always — Ogg.pm: the dispatch resolves the SubDirectory but the
-/// VorbisComments tag-table's group1 is always 'Vorbis').
-fn process_vorbis_comments(data: &[u8], meta: &mut Metadata, print_conv_enabled: bool) -> bool {
+/// `meta` is the staging buffer for Vorbis-comment tags;
+/// `picture_sink` accumulates `METADATA_BLOCK_PICTURE` payloads parsed
+/// into [`OggPicture`] (R3 F2 — Vorbis.pm:122-134 SubDirectory hop).
+fn process_vorbis_comments(
+  data: &[u8],
+  meta: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
+  print_conv_enabled: bool,
+) -> bool {
   let end = data.len();
   let mut pos = 0usize;
   // Vendor (Vorbis.pm:182-187).
@@ -507,6 +985,31 @@ fn process_vorbis_comments(data: &[u8], meta: &mut Metadata, print_conv_enabled:
     // `synthetic_vorbis_specialkeys.ogg` conformance fixture.
     if is_special_tag(&key) {
       key.push('_');
+    }
+    // R3 F2 (Codex adversarial): `METADATA_BLOCK_PICTURE` is a Vorbis
+    // comment KEY whose base64-decoded value carries a FLAC METADATA_BLOCK
+    // type-6 (Picture) structure (Vorbis.pm:122-134, SubDirectory →
+    // %FLAC::Picture FLAC.pm:84-134). Bundled emits the Picture sub-fields
+    // (`FLAC:PictureType`, `:PictureMIMEType`, ...). The pre-fix code
+    // base64-decoded the value into a single `Vorbis:Picture` blob —
+    // silent loss of every sub-field.
+    //
+    // Intercept HERE (before push) so the binary payload becomes an
+    // `OggPicture` in `picture_sink`, NOT a `Vorbis:Picture` blob in the
+    // staging Metadata. Multiple METADATA_BLOCK_PICTURE comments in one
+    // file (rare but in-spec) accumulate as separate `OggPicture` entries.
+    if key == "METADATA_BLOCK_PICTURE" {
+      let decoded = base64_decode(&raw_val);
+      if let Some(picture) = parse_metadata_block_picture(&decoded) {
+        picture_sink.push(picture);
+      } else {
+        // Truncated payload — bundled would emit an empty Picture or
+        // skip; we choose "skip" to match the typical bundled behaviour
+        // for malformed METADATA_BLOCK_PICTURE comments (no error in
+        // bundled; the SubDirectory hop fails silently when ReadValue
+        // returns undef on the header). No emission, no warning.
+      }
+      continue;
     }
     push_vorbis_comment(
       meta,
@@ -690,26 +1193,71 @@ enum OpusKind {
   Tags,
 }
 
+/// Per-packet outcome captured during `walk_packet`. Used by [`parse_inner`]
+/// to lift the legacy push-style `process_vorbis_comments` emissions into the
+/// typed [`Meta`] shape without rewriting the parser internals.
+///
+/// Comments-processed variants do NOT carry the family-1 group: the staging
+/// metadata already records the group on each emitted tag (the
+/// `process_vorbis_comments` / `process_vorbis_comments_with_group1`
+/// dispatch sets it). The outcome enum only needs to track the
+/// override-file-type decision; the per-tag group survives via the staging
+/// `Tag::group()` accessor.
+///
+/// R2 F-OGG-TRIM extends the outcome with `VorbisId` and `OpusHeader`
+/// variants so the identification fields can bubble up to [`parse_inner`]
+/// for storage on [`Meta`]. The previous design used a `&mut Metadata`
+/// staging buffer for ALL tags; the typed-Meta lift preserves bundled
+/// emission order via dedicated fields rather than mixing identification
+/// scalars into the comment-list shape.
+#[derive(Debug, Clone, Copy)]
+enum PacketOutcome {
+  /// No action — packet not recognised by `classify_packet`, OR the packet
+  /// was a recognised non-override / non-comments arm (Vorbis setup-header,
+  /// short Vorbis identification payload). Comments-only Vorbis::Comments
+  /// packets (Vorbis packet_type=3 with default group1) also map here:
+  /// `process_vorbis_comments` has already emitted into the staging
+  /// metadata, and no override is needed.
+  None,
+  /// Vorbis identification packet parsed (`\x01vorbis` + `Vorbis::
+  /// Identification` table — Vorbis.pm:30-33,40-70). No override (Vorbis
+  /// is the default OGG codec).
+  VorbisId(VorbisIdentification),
+  /// `OverrideFileType` to the given type (Ogg.pm:49 → "OGV"; :50 → "OPUS").
+  /// Comments may OR may not have been processed alongside (Theora 0x81
+  /// + Opus `OpusTags` both fire override AND comments).
+  Override { file_type: &'static str },
+  /// Opus header packet parsed (`OpusHead` + `Opus::Header` table —
+  /// Opus.pm:36-51). ALSO carries the `OPUS` override (Ogg.pm:50 fires
+  /// whenever the `OpusHead` packet is recognised).
+  OpusHeader(OpusHeader),
+  /// FLAC-in-Ogg `\x7fFLAC` — deferred (FLAC port not landed yet).
+  /// Silent no-op preserves "container OK, no codec tags".
+  FlacDeferred,
+}
+
 /// Faithful `ProcessPacket` (Ogg.pm:42-69) — dispatch one assembled packet
 /// to its codec's comments handler. The `OverrideFileType('OGV')` /
 /// `OverrideFileType('OPUS')` calls (Ogg.pm:49-50) live here and fire
-/// whenever a Theora / Opus header packet is seen, regardless of whether
-/// the identification-binary table is ported.
+/// whenever a Theora / Opus header packet is seen.
 ///
-/// **Scope tightening (R1 F2):** the identification-binary-table arms
-/// (Vorbis packet_type=1 → `Vorbis::Identification`; Theora packet_type
-/// =0x80 → `Theora::Identification`; Opus `OpusHead` → `Opus::Header`)
-/// are DEFERRED to dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm` PRs —
-/// see the top-of-module comment. Only the Vorbis-comments-block arms
-/// (Vorbis packet_type=3, Theora packet_type=0x81, Opus `OpusTags`) are
-/// in scope here.
-fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
+/// **R2 F-OGG-TRIM:** the Vorbis::Identification and Opus::Header
+/// binary-table arms are NOW IN SCOPE (round-2 review showed the R1
+/// deferral was creating goldens hand-trims). The Vorbis `packet_type=1`
+/// arm parses `\x01vorbis` → [`PacketOutcome::VorbisId`]; the Opus
+/// `OpusHead` arm parses → [`PacketOutcome::OpusHeader`] (which also
+/// carries the `OPUS` override). Theora `\x80theora` →
+/// `Theora::Identification` remains deferred (no Theora fixture; on the
+/// dedicated Theora.pm queue).
+fn process_packet(
+  staging: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
+  print_conv_enabled: bool,
+  buff: &[u8],
+) -> PacketOutcome {
   let Some(kind) = classify_packet(buff) else {
-    return;
+    return PacketOutcome::None;
   };
-  // Snapshot the PrintConv switch up-front so the mutable `ctx.metadata()`
-  // borrow inside each arm doesn't conflict with `ctx.print_conv_enabled()`.
-  let print_conv_enabled = ctx.print_conv_enabled();
   match kind {
     PacketKind::Vorbis {
       packet_type,
@@ -720,16 +1268,34 @@ fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
       // `payload_start.. .to_vec()` copy was avoidable.
       match packet_type {
         1 => {
-          // Vorbis::Identification (Vorbis.pm:30-33) — DEFERRED (R1 F2);
-          // see top-of-module note. The bundled-Perl dispatch would
-          // ProcessBinaryData over `%Vorbis::Identification` here.
+          // Vorbis::Identification (Vorbis.pm:30-33, 40-70). R2 F-OGG-TRIM:
+          // parse the 21-byte fixed-offset binary table. A short payload
+          // (under 21 bytes) returns `None` from `parse_vorbis_identification`,
+          // mirroring bundled `ProcessBinaryData`'s skip-on-out-of-bounds
+          // semantics; in that case the outcome is `None` so the
+          // identification fields are silently absent (bundled behaviour
+          // exactly).
+          match parse_vorbis_identification(&buff[payload_start..]) {
+            Some(id) => PacketOutcome::VorbisId(id),
+            None => PacketOutcome::None,
+          }
         }
         3 => {
-          // Vorbis::Comments (Vorbis.pm:34-37).
-          process_vorbis_comments(&buff[payload_start..], ctx.metadata(), print_conv_enabled);
+          // Vorbis::Comments (Vorbis.pm:34-37). No override; comments
+          // have been emitted into the staging metadata. R3 F2:
+          // `picture_sink` carries any `METADATA_BLOCK_PICTURE` payloads
+          // back to the caller for emission as `FLAC:Picture*` fields.
+          process_vorbis_comments(
+            &buff[payload_start..],
+            staging,
+            picture_sink,
+            print_conv_enabled,
+          );
+          PacketOutcome::None
         }
         _ => {
           // 0x05 Vorbis setup-header / others: tag-table has no entry, no-op.
+          PacketOutcome::None
         }
       }
     }
@@ -740,14 +1306,18 @@ fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
       // Ogg.pm:49 `$et->OverrideFileType('OGV')` when this stream is
       // Theora. RETAINED — file-type override is part of the container
       // scope and fires regardless of the codec-binary-table deferral.
-      ctx.override_file_type("OGV", None, None);
       // Ogg.pm:62 `$$et{SET_GROUP1} = $type if $type eq 'Theora'`. Theora
       // tags carry the Theora group1; our tag-table already sets `Theora`.
       // Slice borrow rather than `to_vec()`: downstream accepts `&[u8]`.
       match packet_type {
         0x80 => {
-          // Theora::Identification (Theora.pm:42-104) — DEFERRED (R1 F2);
-          // see top-of-module note.
+          // Theora::Identification (Theora.pm:42-104) — STILL DEFERRED.
+          // Theora is a VIDEO codec with a larger table (rational pixel
+          // aspect, framerate, etc.) and we have no Ogg-Theora fixture
+          // in the corpus. Queued for a dedicated Theora.pm PR; the
+          // `OverrideFileType('OGV')` continues to fire on any
+          // `\x80theora` packet seen.
+          PacketOutcome::Override { file_type: "OGV" }
         }
         0x81 => {
           // Theora::Comments delegates to Vorbis::Comments (Theora.pm:32-37).
@@ -755,13 +1325,19 @@ fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
           // when running under Theora.
           process_vorbis_comments_with_group1(
             &buff[payload_start..],
-            ctx.metadata(),
+            staging,
+            picture_sink,
             print_conv_enabled,
             "Theora",
           );
+          PacketOutcome::Override { file_type: "OGV" }
         }
         _ => {
-          // 0x82 Theora setup: no entry, no-op.
+          // 0x82 Theora setup: no entry, no-op. But we DO still want the
+          // file-type override to fire as soon as we recognise a Theora
+          // stream (faithful to Ogg.pm:49 — `OverrideFileType` is
+          // unconditional on any Theora packet within the container).
+          PacketOutcome::Override { file_type: "OGV" }
         }
       }
     }
@@ -771,26 +1347,46 @@ fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
     } => {
       // Ogg.pm:50 `$et->OverrideFileType('OPUS')` when this stream is
       // Opus. RETAINED — same reasoning as the Theora `OGV` override.
-      ctx.override_file_type("OPUS", None, None);
       // Slice borrow rather than `to_vec()`: downstream accepts `&[u8]`.
       match kind {
         OpusKind::Head => {
-          // Opus::Header (Opus.pm:36-51) — DEFERRED (R1 F2); see
-          // top-of-module note. The `OpusHead` packet is still observed
-          // (classify_packet recognises it) so the `OverrideFileType`
-          // above fires; we just don't extract the binary fields.
+          // Opus::Header (Opus.pm:36-51). R2 F-OGG-TRIM: parse the 10-byte
+          // fixed-offset binary table. A short payload returns `None`
+          // from `parse_opus_header` (mirroring bundled out-of-bounds
+          // skip); in that case fall back to override-only.
+          match parse_opus_header(&buff[payload_start..]) {
+            Some(header) => PacketOutcome::OpusHeader(header),
+            None => PacketOutcome::Override { file_type: "OPUS" },
+          }
         }
         OpusKind::Tags => {
           // Opus.pm:32 delegates to Vorbis::Comments with the default
           // group1 (Vorbis).
-          process_vorbis_comments(&buff[payload_start..], ctx.metadata(), print_conv_enabled);
+          process_vorbis_comments(
+            &buff[payload_start..],
+            staging,
+            picture_sink,
+            print_conv_enabled,
+          );
+          PacketOutcome::Override { file_type: "OPUS" }
         }
       }
     }
     PacketKind::Flac => {
-      // Ogg.pm:176-179, 190-195: FLAC-in-Ogg transport. DEFERRED.
-      // TODO(ogg-flac, FORMATS.md row 9): wire `ProcessFLAC` once the FLAC
-      // port lands. Silent no-op preserves "container OK, no codec tags".
+      // Ogg.pm:176-179, 190-195: FLAC-in-Ogg transport. The R3 F2 disposition
+      // for the codec stream itself is FORMALLY ACCEPT-DEFERRED (see the
+      // module-level note and `tests/conformance.rs`'s `flac_ogg_deferred`
+      // marker); the bundled `FLAC.ogg` fixture would exercise it, and the
+      // accumulation logic for `numFlac` header-packet packets is not yet
+      // ported. See `parse_inner` for the loop-side handling: when a
+      // `\x7fFLAC` packet is encountered the OGG body is REJECTED (the
+      // OGG candidate returns `success() == false`), so dispatch falls
+      // through to the FLAC top-level entry on the FLAC sub-stream. Today
+      // the typed Meta therefore omits FLAC body tags emitted by bundled —
+      // formally accepted-deferral until a follow-up PR ports the
+      // `numFlac` accumulator. (The METADATA_BLOCK_PICTURE handler above
+      // covers the other half of the original R3 F2 finding.)
+      PacketOutcome::FlacDeferred
     }
   }
 }
@@ -803,218 +1399,1101 @@ fn process_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
 /// each emitted tag into the caller's metadata with the family-1 group
 /// rewritten to `group1`. Family-0 (`"Vorbis"`) is preserved (Perl's
 /// `SET_GROUP1` swaps ONLY family-1; family-0 is fixed by the tag table).
+/// `picture_sink` is threaded through to `process_vorbis_comments` so
+/// `METADATA_BLOCK_PICTURE` payloads under a Theora stream are still
+/// collected (R3 F2).
 fn process_vorbis_comments_with_group1(
   data: &[u8],
   meta: &mut Metadata,
+  picture_sink: &mut Vec<OggPicture>,
   print_conv_enabled: bool,
   group1: &str,
 ) -> bool {
   let mut side = Metadata::new(meta.source_file());
-  let ok = process_vorbis_comments(data, &mut side, print_conv_enabled);
-  for tag in side.tags() {
+  let ok = process_vorbis_comments(data, &mut side, picture_sink, print_conv_enabled);
+  for tag in side.tags_slice() {
     meta.push(
-      Group::new(tag.group().family0(), group1),
+      Group::new(tag.group_ref().family0(), group1),
       tag.name(),
-      tag.value().clone(),
+      tag.value_ref().clone(),
     );
   }
   // Propagate any warnings the side-parse emitted.
-  for w in side.warnings() {
+  for w in side.warnings_slice() {
     meta.push_warning(w.clone());
   }
   ok
 }
 
 // ===========================================================================
-// ProcessOGG — the container walker (Ogg.pm:75-197)
+// Typed Meta — `Meta<'a>`
 // ===========================================================================
 
-/// OGG parser (faithful `ProcessOGG`, Ogg.pm:75-197).
-pub struct ProcessOgg;
+/// Typed OGG metadata — the lib-first output of [`ProcessOgg`].
+///
+/// Holds the post-parse emission state of an Ogg container walk:
+///
+/// 1. A file-type override (`Some("OGV")` for Theora, `Some("OPUS")` for
+///    Opus, `None` for plain Vorbis) — applied after `SetFileType('OGG')`
+///    by the bridge to mirror bundled `OverrideFileType` (Ogg.pm:49-50).
+/// 2. An ordered list of `(group1, name, value)` emissions in the SAME
+///    order bundled `perl exiftool -j -G1` produces them: vendor first,
+///    then comments in encounter order with list-tags coalesced at first
+///    occurrence (faithful FoundTag — ExifTool.pm:9505-9520).
+/// 3. The accumulated warnings (`Lost synchronization`, `Missing page(s)
+///    in Ogg file`, `Format error in Vorbis comments`) in occurrence order.
+/// 4. `success`: whether ProcessOGG accepted at least one valid page (the
+///    Perl `return $success` decision; controls SetFileType-emission and
+///    File-format-error fallback).
+///
+/// **D8 — no public fields, accessors only.** Construct only via
+/// [`ProcessOgg::parse`] or [`parse_borrowed`].
+///
+/// **Lifetimes.** Vorbis comment KEYs are uppercased + sometimes
+/// synthesised, so we cannot borrow them from input. Vorbis VALs are
+/// UTF-8-decoded from input bytes (potentially lossily). For Phase F4
+/// the typed Meta carries owned [`SmolStr`] for both name and string
+/// values: the typed Meta is a thin wrapper around the bundled-faithful
+/// emission shape, and the `&'a` lifetime is reserved for future
+/// zero-alloc revisions (Phase G + the bundled list-tag iterator
+/// follow-ups). See `[[exifast-phase2-forward-items]]` →
+/// "OGG zero-alloc revisit" for the eventual borrow-from-input plan.
+#[derive(Debug, Clone)]
+pub struct Meta<'a> {
+  /// Chained ID3 sub-Meta from the Ogg.pm:79-83 embedded ProcessID3 call
+  /// (`unless ($$et{DoneID3}) { ID3::ProcessID3($et, $dirInfo) }`). `Some`
+  /// when an ID3v2 PREFIX (in front of the `OggS` magic) was detected and
+  /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`].
+  /// Carries `File:ID3Size` + any `ID3v2_*:*` frame tags; the typed
+  /// `serialize_tags` sink emits them in the bundled-faithful order
+  /// (`File:ID3Size` ⇒ Vorbis fields ⇒ `ID3v2_*:*` frame tags). Same
+  /// nesting pattern as `ape::Meta::id3`, `flac::Meta::id3`,
+  /// `dsf::Meta::id3`.
+  ///
+  /// R3 F1 (Codex adversarial): pre-fix the engine `AnyParser::Ogg` arm
+  /// stripped the ID3v2 prefix to reparse `bytes[hdr_end..]` but never
+  /// emitted the ID3 directory — silent metadata loss. Nesting the typed
+  /// ID3 parser closes that hole (no hand-trim, no #[ignore] — the
+  /// `ogg_id3_prefixed.ogg` fixture now reaches value-equivalent with
+  /// the bundled golden).
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
+  /// `OverrideFileType` target (Ogg.pm:49-50). `Some("OPUS")` when an
+  /// `OpusHead` or `OpusTags` packet was seen; `Some("OGV")` when a
+  /// Theora `\x80theora` / `\x81theora` packet was seen; `None` otherwise.
+  /// The bridge calls `ctx.override_file_type(value, None, None)` after
+  /// `SetFileType('OGG')` to mirror bundled in-place mutation.
+  file_type_override: Option<&'static str>,
+  /// R2 F-OGG-TRIM: Vorbis identification fields parsed from the
+  /// `\x01vorbis` packet (Vorbis.pm:40-70). `None` when no Vorbis
+  /// identification packet was seen, OR when the payload was shorter than
+  /// the 21-byte fixed window the table reads. Emits at the bundled
+  /// emission position: BEFORE the Vorbis comment block (vendor + KEY=VALUE
+  /// pairs) for a Vorbis-only stream, BEFORE comments for Opus too if the
+  /// stream is mixed (real-world Opus uses `Opus:*` only; Vorbis ID +
+  /// Opus header don't coexist in a single stream by spec).
+  vorbis_identification: Option<VorbisIdentification>,
+  /// R2 F-OGG-TRIM: Opus header fields parsed from the `OpusHead` packet
+  /// (Opus.pm:36-51). `None` when no `OpusHead` packet was seen, OR when
+  /// the payload was shorter than the 10-byte fixed window the table reads.
+  /// Emits before the Vorbis-comment block on the same stream.
+  opus_header: Option<OpusHeader>,
+  /// R3 F2: `METADATA_BLOCK_PICTURE` payloads decoded into the FLAC
+  /// `%FLAC::Picture` SubDirectory shape (Vorbis.pm:122-134 → FLAC.pm:
+  /// 84-134). One entry per encountered `METADATA_BLOCK_PICTURE` Vorbis
+  /// comment. Empty `Vec` when no METADATA_BLOCK_PICTURE comments were
+  /// seen. Pre-fix the parser emitted only a single `Vorbis:Picture` blob
+  /// (the base64-decoded payload); bundled emits `FLAC:Picture*` sub-
+  /// fields. Codex round-3 caught this as silent metadata loss.
+  pictures: Vec<OggPicture>,
+  /// Emitted comment tags in bundled emission order (vendor first, then
+  /// KEY=VALUE in encounter order; list-tags coalesced at first-occurrence
+  /// position).
+  comments: Vec<Comment>,
+  /// `$et->Warn(...)` accumulator (Ogg.pm:97 + 158, Vorbis.pm:208) in
+  /// occurrence order. Owned (`SmolStr`) — no `Box::leak` (Codex AF2).
+  warnings: Vec<SmolStr>,
+  /// `$success` — at least one valid 28-byte page accepted. Drives the
+  /// bridge's `SetFileType` call AND the false-return (post-loop
+  /// `File format error`) decision.
+  success: bool,
+  /// Carries the lifetime parameter for forward-compatibility with the
+  /// borrow-from-input revisit. Today the typed Meta holds owned
+  /// [`SmolStr`] / [`Vec<u8>`] (see struct-level docs), so the `'a`
+  /// parameter is phantom; promoting it to a real borrow is a Phase G
+  /// follow-up and does NOT change the API shape.
+  _marker: core::marker::PhantomData<&'a ()>,
+}
 
-impl FormatParser for ProcessOgg {
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Ogg.pm:80-83 ID3 wrapper — DEFERRED (parallel ID3 PR). The
-    // bundled-Perl `unless ($$et{DoneID3})` then ProcessID3 short-circuit
-    // is replicated here by simply not attempting ID3 parsing.
-    // TODO(id3-pathfinder, FORMATS.md row 2): wire ID3 wrap detection.
+/// Payload of [`Comment::Scalar`] — a `Vorbis:<Name>` scalar string
+/// (the vast majority of named tags: TITLE/ALBUM/GENRE/...).
+///
+/// §2: extracted from a former struct-style variant (`Scalar { group1,
+/// name, value }`) into a named struct with private fields + accessors so
+/// the variant is a clean newtype. §1: no public fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentScalar {
+  /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
+  /// Owned (`SmolStr`) so the typed Meta needs no `Box::leak` for the
+  /// rare non-`Vorbis`/`Theora` group (Codex AF2).
+  group1: SmolStr,
+  /// Resolved tag name (`Vorbis.pm:80-121` rename hint, or
+  /// `vorbis_comment_compute_name` for unknown keys).
+  name: SmolStr,
+  /// UTF-8 string value (decoded from input bytes via
+  /// `String::from_utf8_lossy`).
+  value: SmolStr,
+}
 
-    // Borrow the file bytes directly. `ParseContext::data` returns
-    // `&'a [u8]` (the file lifetime, NOT tied to `&ctx`), so subsequent
-    // `ctx.metadata()` / `ctx.set_file_type()` calls below do not collide
-    // with this borrow. Avoids the full-file copy the original revision
-    // performed (AAC only copies its 7-byte header, which is why that
-    // pathfinder did not need the lifetime-extended accessor).
-    let data: &[u8] = ctx.data();
-
-    // Container walker state.
-    let mut success = false;
-    let mut packet_count: u32 = 0;
-    let mut stream_count: u32 = 0;
-    let mut current_stream: u32;
-    let mut stream_page: HashMap<u32, Option<u32>> = HashMap::new();
-    // Accumulated packet payload per stream (continuation pages concatenate
-    // into the same entry).
-    let mut val: HashMap<u32, Vec<u8>> = HashMap::new();
-
-    let mut cursor: usize = 0;
-    let mut current_flag: u8;
-    let mut raf_done = false;
-
-    loop {
-      // Ogg.pm:94 `if ($raf and $raf->Read($buff, 28) == 28)` — the page
-      // header read MUST succeed at exactly 28 bytes for the page to be
-      // accepted. 27 bytes is one byte short of `Get8u(\$buff, 27)` (the
-      // first segment-table entry, used later on Ogg.pm:147 `$dataLen =
-      // Get8u(\$buff, 27)`). A 27-byte `OggS`-magic input is REJECTED:
-      // the read returns 27, the `== 28` check fails, the loop never
-      // accepts the page, `$success` stays 0 ⇒ post-loop finalization
-      // emits `'File format error'` (ExifTool.pm:3093). See conformance
-      // pin `ogg_truncated_error_conformance` (R1 F1 regression).
-      let header_in_bounds = !raf_done && data.len() >= cursor + 28;
-      let header_magic_ok = header_in_bounds && &data[cursor..cursor + 4] == b"OggS";
-      let read_ok = if header_in_bounds {
-        if !header_magic_ok {
-          // Ogg.pm:97 `$success and $et->Warn('Lost synchronization')`.
-          if success {
-            ctx.metadata().push_warning("Lost synchronization");
-          }
-          false
-        } else {
-          true
-        }
-      } else {
-        false
-      };
-
-      if read_ok {
-        if !success {
-          // Ogg.pm:101-104 — first valid page: SetFileType + SetByteOrder.
-          success = true;
-          ctx.set_file_type(None, None, None);
-        }
-        // Ogg.pm:106 `$flag = Get8u(\$buff, 5)` — page-header byte 5.
-        current_flag = data[cursor + 5];
-        // Ogg.pm:107 `$stream = Get32u(\$buff, 14)`.
-        current_stream = u32::from_le_bytes([
-          data[cursor + 14],
-          data[cursor + 15],
-          data[cursor + 16],
-          data[cursor + 17],
-        ]);
-        if current_flag & 0x02 != 0 {
-          // Ogg.pm:108-110 — BOS bit set.
-          stream_count = stream_count.saturating_add(1);
-          stream_page.insert(current_stream, Some(0));
-        }
-        // Ogg.pm:114 `++$packets unless $flag & 0x01`.
-        if current_flag & 0x01 == 0 {
-          packet_count = packet_count.saturating_add(1);
-        }
-      } else {
-        // Ogg.pm:115-121 — no more data; if we still have a buffered
-        // packet, take any stream and process it.
-        if val.is_empty() {
-          break;
-        }
-        // Take the first stream key we have (Ogg.pm:118 `($stream) = sort
-        // keys %val`).
-        let mut keys: Vec<u32> = val.keys().copied().collect();
-        keys.sort();
-        current_stream = keys[0];
-        current_flag = 0;
-        raf_done = true;
-      }
-
-      // Ogg.pm:122-140 — process the previously buffered packet.
-      // (FLAC-in-Ogg `defined $numFlac` arm is DEFERRED; we fall straight
-      // through to the regular packet-processing branch.)
-      if val.contains_key(&current_stream) && current_flag & 0x01 == 0 {
-        let owned = val.remove(&current_stream).unwrap();
-        process_assembled_packet(ctx, &owned);
-        // Ogg.pm:133-136: stop if MAX_PACKETS reached AND no pending vals.
-        if (packet_count > MAX_PACKETS.saturating_mul(stream_count) || raf_done) && val.is_empty() {
-          break;
-        }
-      }
-      // Ogg.pm:138-139 `last if $packets > $MAX_PACKETS * $streams and
-      // not %val;`
-      if packet_count > MAX_PACKETS.saturating_mul(stream_count) && val.is_empty() {
-        break;
-      }
-
-      // If we were on the synthetic "raf_done" pass and have nothing to do,
-      // exit the loop.
-      if raf_done {
-        break;
-      }
-
-      // Ogg.pm:142-153 — sequence number, segment table, data length.
-      let page_num = u32::from_le_bytes([
-        data[cursor + 18],
-        data[cursor + 19],
-        data[cursor + 20],
-        data[cursor + 21],
-      ]);
-      let nseg = data[cursor + 26] as usize;
-      // We need `27 + nseg` bytes to cover the header + segment table.
-      if data.len() < cursor + 27 + nseg {
-        break;
-      }
-      let seg_table = &data[cursor + 27..cursor + 27 + nseg];
-      let data_len: usize = seg_table.iter().map(|&b| b as usize).sum();
-      // Ogg.pm:154-162 — sequence-number check.
-      let expected_opt = stream_page.get(&current_stream).copied().flatten();
-      if let Some(expected) = expected_opt {
-        if expected == page_num {
-          stream_page.insert(current_stream, Some(expected + 1));
-        } else {
-          ctx.metadata().push_warning("Missing page(s) in Ogg file");
-          stream_page.insert(current_stream, None);
-        }
-      }
-      // Ogg.pm:164 — read page data.
-      let page_data_start = cursor + 27 + nseg;
-      let page_data_end = page_data_start + data_len;
-      if data.len() < page_data_end {
-        break;
-      }
-      // Page bytes as a borrowed slice (no copy yet — the `val` HashMap
-      // owns its own `Vec<u8>` per stream; we move the bytes into it only
-      // when we actually start a new packet).
-      let page_bytes: &[u8] = &data[page_data_start..page_data_end];
-
-      // Ogg.pm:170-179 — accumulate or start new packet.
-      if let Some(existing) = val.get_mut(&current_stream) {
-        // Continuation page — concatenate (Ogg.pm:171).
-        existing.extend_from_slice(page_bytes);
-      } else if current_flag & 0x01 == 0 {
-        // New packet (not a continuation of one we aren't parsing).
-        if classify_packet(page_bytes).is_some() {
-          // Materialise the slice into the `val` map (this is the single
-          // copy needed for the packet accumulator; the prior revision
-          // double-copied via `page_data.clone()`).
-          val.insert(current_stream, page_bytes.to_vec());
-        }
-      }
-      // Ogg.pm:184-188 — EOS bit ⇒ process now.
-      if current_flag & 0x04 != 0 && val.contains_key(&current_stream) {
-        let owned = val.remove(&current_stream).unwrap();
-        process_assembled_packet(ctx, &owned);
-      }
-      cursor = page_data_end;
+impl CommentScalar {
+  /// Construct a scalar comment payload.
+  #[must_use]
+  #[inline(always)]
+  pub fn new(
+    group1: impl Into<SmolStr>,
+    name: impl Into<SmolStr>,
+    value: impl Into<SmolStr>,
+  ) -> Self {
+    Self {
+      group1: group1.into(),
+      name: name.into(),
+      value: value.into(),
     }
-    // Ogg.pm:196 `return $success`.
-    success
+  }
+  /// Family-1 group (`"Vorbis"` / `"Theora"`). §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn group1(&self) -> &str {
+    self.group1.as_str()
+  }
+  /// Resolved tag name. §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+  /// UTF-8 string value. §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn value(&self) -> &str {
+    self.value.as_str()
   }
 }
 
-/// Dispatch an assembled packet. `process_packet` does codec-classification
-/// and SubDirectory dispatch; this wrapper exists so the call site reads
-/// like Perl `ProcessPacket($et, \$val{$stream})`.
-fn process_assembled_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
-  process_packet(ctx, buff);
+/// Payload of [`Comment::List`] — a `Vorbis:Artist`-style coalesced
+/// list (Vorbis.pm:85,86,94 — ARTIST, PERFORMER, CONTACT). Emitted at
+/// FIRST-occurrence position; repeats append (faithful `FoundTag` —
+/// ExifTool.pm:9505-9520).
+///
+/// §2: extracted from a former struct-style variant into a named struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentList {
+  /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
+  group1: SmolStr,
+  /// Resolved tag name ("Artist" / "Performer" / "Contact").
+  name: SmolStr,
+  /// Coalesced UTF-8 string values, in encounter order.
+  values: Vec<SmolStr>,
 }
+
+impl CommentList {
+  /// Construct a list comment payload from coalesced values.
+  #[must_use]
+  #[inline(always)]
+  pub fn new(group1: impl Into<SmolStr>, name: impl Into<SmolStr>, values: Vec<SmolStr>) -> Self {
+    Self {
+      group1: group1.into(),
+      name: name.into(),
+      values,
+    }
+  }
+  /// Family-1 group (`"Vorbis"` / `"Theora"`). §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn group1(&self) -> &str {
+    self.group1.as_str()
+  }
+  /// Resolved tag name. §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+  /// Coalesced values in encounter order. §3 slice projection — returns
+  /// `&[SmolStr]`, never `&Vec<SmolStr>`.
+  #[must_use]
+  #[inline(always)]
+  pub fn values_slice(&self) -> &[SmolStr] {
+    self.values.as_slice()
+  }
+}
+
+/// Payload of [`Comment::Binary`] — a `Vorbis:CoverArt` / `Vorbis:
+/// Picture` base64-decoded raw byte blob. Renders downstream as `(Binary
+/// data N bytes, use -b option to extract)`. The `Picture` SubDirectory
+/// hop to `FLAC::Picture` is deferred (Vorbis.pm:122-134) — only the
+/// raw-bytes form is emitted.
+///
+/// §2: extracted from a former struct-style variant into a named struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentBinary {
+  /// Family-1 group ("Vorbis" by default; "Theora" under Theora streams).
+  group1: SmolStr,
+  /// "CoverArt" or "Picture".
+  name: SmolStr,
+  /// Base64-decoded raw bytes.
+  bytes: Vec<u8>,
+}
+
+impl CommentBinary {
+  /// Construct a binary comment payload from decoded bytes.
+  #[must_use]
+  #[inline(always)]
+  pub fn new(group1: impl Into<SmolStr>, name: impl Into<SmolStr>, bytes: Vec<u8>) -> Self {
+    Self {
+      group1: group1.into(),
+      name: name.into(),
+      bytes,
+    }
+  }
+  /// Family-1 group (`"Vorbis"` / `"Theora"`). §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn group1(&self) -> &str {
+    self.group1.as_str()
+  }
+  /// Tag name (`"CoverArt"` / `"Picture"`). §3 string view (`&str`).
+  #[must_use]
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    self.name.as_str()
+  }
+  /// Base64-decoded raw bytes. §3 byte-slice projection — returns `&[u8]`,
+  /// never `&Vec<u8>`.
+  #[must_use]
+  #[inline(always)]
+  pub fn bytes(&self) -> &[u8] {
+    self.bytes.as_slice()
+  }
+}
+
+/// A single comment emission within an [`Meta`]. Mirrors the bundled
+/// `HandleTag` family of pushes that `ProcessComments` emits per vendor
+/// + per `KEY=VALUE` pair (Vorbis.pm:181-205).
+///
+/// §2: variants are **unit-or-newtype only** — each data-carrying arm wraps
+/// a single named struct ([`CommentScalar`] / [`CommentList`] /
+/// [`CommentBinary`]) whose fields are private with accessors, instead of
+/// the former struct-style `{ … }` variants. `#[non_exhaustive]` guards
+/// future emission shapes; predicates (`is_*`) and unwrap accessors are
+/// derived (derive_more) so callers don't hand-match.
+#[non_exhaustive]
+#[derive(
+  Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
+pub enum Comment {
+  /// `Vorbis:<Name>` scalar string — see [`CommentScalar`].
+  Scalar(CommentScalar),
+  /// `Vorbis:Artist`-style coalesced list — see [`CommentList`].
+  List(CommentList),
+  /// `Vorbis:CoverArt` / `Vorbis:Picture` raw bytes — see
+  /// [`CommentBinary`].
+  Binary(CommentBinary),
+}
+
+impl Meta<'_> {
+  /// `OverrideFileType` target (`"OPUS"` or `"OGV"`), or `None` for plain
+  /// Vorbis. Applied by the bridge after `SetFileType('OGG')` to mirror
+  /// bundled Ogg.pm:49-50. `&'static str` payload is `Copy` ⇒ by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_type_override(&self) -> Option<&'static str> {
+    self.file_type_override
+  }
+
+  /// Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). `Some`
+  /// when an ID3v2 PREFIX was detected and parsed; the typed
+  /// `serialize_tags` sink emits its `File:ID3Size` + `ID3v2_*:*` frame
+  /// tags. R3 F1: this closes the silent metadata-loss hole on
+  /// ID3-prefixed Ogg.
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
+  }
+
+  /// Vorbis identification-packet fields (Vorbis.pm:40-70), or `None` if
+  /// no `\x01vorbis` identification packet was parsed for this stream.
+  /// Emits at bundled position — BEFORE the comment block. The contained
+  /// value is `Copy` so the accessor returns it by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vorbis_identification(&self) -> Option<VorbisIdentification> {
+    self.vorbis_identification
+  }
+
+  /// Opus header-packet fields (Opus.pm:36-51), or `None` if no `OpusHead`
+  /// packet was parsed. The contained value is `Copy` so the accessor
+  /// returns it by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn opus_header(&self) -> Option<OpusHeader> {
+    self.opus_header
+  }
+
+  /// `METADATA_BLOCK_PICTURE` payloads parsed from the Vorbis-comment
+  /// block (R3 F2). One entry per `METADATA_BLOCK_PICTURE` comment;
+  /// empty when none were seen. Mirrors `flac::Meta::pictures` shape
+  /// but with owned strings/bytes (the base64-decoded buffer is dropped
+  /// after parse). §3 slice projection.
+  #[must_use]
+  #[inline(always)]
+  pub fn pictures(&self) -> &[OggPicture] {
+    self.pictures.as_slice()
+  }
+
+  /// The emitted comment tags in bundled emission order. Each item is an
+  /// [`Comment`] newtype arm with the resolved family-1 group, tag name,
+  /// and value. §3 slice projection — returns `&[Comment]`, never
+  /// `&Vec<Comment>`.
+  #[must_use]
+  #[inline(always)]
+  pub fn comments(&self) -> &[Comment] {
+    self.comments.as_slice()
+  }
+
+  /// Warnings accumulated during the parse, in occurrence order. Each
+  /// element is the string bundled-Perl emits via `$et->Warn(...)`:
+  /// `"Lost synchronization"` (Ogg.pm:97), `"Missing page(s) in Ogg
+  /// file"` (Ogg.pm:158), or `"Format error in Vorbis comments"`
+  /// (Vorbis.pm:208). §3 slice projection — returns `&[SmolStr]`.
+  #[must_use]
+  #[inline(always)]
+  pub fn warnings(&self) -> &[SmolStr] {
+    self.warnings.as_slice()
+  }
+
+  /// Whether ProcessOGG accepted at least one valid 28-byte page (Perl's
+  /// `$success` flag — Ogg.pm:100-103). On `false`, the legacy bridge
+  /// returns `false` from the engine entry `process` (no `SetFileType`
+  /// fired); the engine post-loop emits `ExifTool:Error => "File format
+  /// error"` (ExifTool.pm:3093). `bool` is `Copy` ⇒ by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn success(&self) -> bool {
+    self.success
+  }
+}
+
+// ===========================================================================
+// Packet dispatch (Ogg.pm:42-69 `ProcessPacket`)
+// ===========================================================================
+
+/// Faithful `ProcessOGG` (Ogg.pm:75-197) container walker, lifted into the
+/// new lib-first parser API.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessOgg;
+
+impl parser_sealed::Sealed for ProcessOgg {}
+
+impl FormatParser for ProcessOgg {
+  /// GAT: the Meta borrows from the input `'a` directly (Codex AF2).
+  type Meta<'a> = Meta<'a>;
+  type Context<'a> = &'a [u8];
+  type Error = Error;
+
+  /// Parse an Ogg file's bytes into a typed [`Meta`].
+  ///
+  /// `Ok(Some(meta))` is returned even when `meta.success() == false`
+  /// (i.e. the bytes are not a valid Ogg stream): the typed Meta carries
+  /// the parse outcome so the bridge can fall through to the engine's
+  /// `File format error` path (Perl `return $success`). This shape
+  /// differs from MOI/AAC/DV which use `Ok(None)` for "reject"; the
+  /// reason is that OGG accumulates warnings during the walk that the
+  /// bundled output preserves even when the page-acceptance test never
+  /// passes (e.g. mid-stream `Lost synchronization`).
+  ///
+  /// **R5 (Codex adversarial)** — routes through [`parse_full_chained`]
+  /// so the embedded ID3 chain (Ogg.pm:79-83) runs for ID3-prefixed Ogg
+  /// streams and nests an [`crate::formats::id3::Id3Meta`] into the
+  /// returned [`Meta`]. Pre-fix the trait impl called the body-only
+  /// [`parse_inner`], which requires `OggS` at byte 0 — so an
+  /// ID3v2-prefixed Ogg buffer returned `success = false` and the typed
+  /// `FormatParser` surface silently dropped both the detected ID3 tags
+  /// AND the OGG body. Only the crate-root `parse_ogg` was fixed in R4;
+  /// R5 propagates the chain down to ALL public surfaces.
+  ///
+  /// A fresh [`crate::format_parser::SharedFlags`] is constructed per
+  /// call (the trait's `&[u8]` Context has no chain state to thread).
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+    // `ogg = ["flac", "id3"]` per Cargo.toml ⇒ `parse_full_chained` is
+    // always present here.
+    let mut shared = crate::format_parser::SharedFlags::default();
+    parse_full_chained(data, &mut shared, /* print_conv */ true)
+  }
+}
+
+/// Lib-first direct entry. Same as [`FormatParser::parse`] but exposes
+/// the borrow-from-input form (`Meta<'_>`) and the `print_conv`
+/// toggle. `print_conv_enabled = true` matches bundled `perl exiftool -j`;
+/// `false` matches `-j -n`. The toggle gates `convert::apply`'s
+/// ValueConv / PrintConv chain on the few tags that have one
+/// (COVERART base64 ValueConv is always applied; for known tags in OGG
+/// scope today PrintConv is `None` so the toggle is mostly cosmetic).
+///
+/// **R4 F2 (Codex adversarial)** — routes through [`parse_full_chained`]
+/// so the embedded ID3 chain (Ogg.pm:79-83) runs for ID3-prefixed Ogg
+/// streams. Pre-fix this entry called the bare [`parse_inner`], which
+/// requires `OggS` at byte 0 — so an ID3v2-prefixed Ogg buffer returned
+/// `success = false` and the public API silently dropped both the
+/// detected ID3 tags AND the OGG body. The R3 fix went into the
+/// engine path (`AnyParser::Ogg`); the lib-direct API bypassed it.
+///
+/// A fresh [`crate::format_parser::SharedFlags`] is constructed per
+/// call (the public entry has no chain state to thread); the recursion
+/// guard inside `parse_full_chained` only matters for the engine
+/// path where ID3 may have already run on a prior format candidate.
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today; reserved for
+/// future I/O wrappers).
+pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
+  // `ogg = ["id3", "flac"]` per Cargo.toml ⇒ `id3` is always present here.
+  let mut shared = crate::format_parser::SharedFlags::default();
+  parse_full_chained(data, &mut shared, print_conv_enabled)
+}
+
+/// R3 F1: full-chained parse — runs the embedded ID3 chain (`unless
+/// ($$et{DoneID3}) { ID3::ProcessID3 }`, Ogg.pm:79-83) and nests the typed
+/// [`crate::formats::id3::Id3Meta`] into the returned [`Meta`]. Then runs
+/// the OGG container walk over the POST-ID3-prefix slice (the same way
+/// bundled `ProcessID3`'s audio-format loop seeks past `$hdrEnd` and
+/// re-dispatches the OGG body, ID3.pm:1582-1601).
+///
+/// Bundled emits `File:ID3Size` for every ID3-prefixed Ogg-Vorbis stream
+/// (even an empty 10-byte header); pre-fix the engine dispatch stripped the
+/// ID3v2 prefix to reparse but never emitted the ID3 directory — silent
+/// metadata loss caught by Codex round 3.
+///
+/// Returns `Some(Meta)` (with `id3` nested) whenever the OGG body parsed
+/// successfully OR when the body parse rejected the slice (in which case
+/// the typed Meta carries `success = false` so the engine continues the
+/// candidate loop — and in particular the dispatch arm filters this case
+/// out to allow MP3 dispatch on an `ID3-prefixed MP3` to win).
+///
+/// `#[cfg(feature = "id3")]`: the `ogg` Cargo feature pulls `id3` (Cargo
+/// manifest), so this is the production path for the `OGG` file-type entry.
+/// Lifetime `'a` borrows from `data` (the ID3 sub-Meta owns its strings;
+/// the OGG Meta is mostly owned today — Phase G zero-alloc plan still
+/// applies).
+///
+/// `print_conv` is forwarded to the OGG body parse (Vorbis comment PrintConv
+/// toggle). The embedded ID3 chain is always staged in `print_conv: true`
+/// mode (the `parse_id3_with_hdr_end` contract).
+#[cfg(feature = "id3")]
+pub(crate) fn parse_full_chained<'a>(
+  data: &'a [u8],
+  shared: &mut crate::format_parser::SharedFlags,
+  print_conv: bool,
+) -> Result<Option<Meta<'a>>, Error> {
+  // 1. Embedded ID3 (Ogg.pm:79-83). The recursion guard (ID3.pm:1435 `return
+  //    0 if $$et{DoneID3}`) is honoured here via `shared.done_id3().is_none()`:
+  //    only call when ID3 has not already run on this chain (a standalone
+  //    OGG file-type entry always gets a fresh `SharedFlags`).
+  let (id3, hdr_end) = if shared.done_id3().is_none() {
+    crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
+      .unwrap_or((None, 0))
+  } else {
+    (None, shared.id3_hdr_end().unwrap_or(0))
+  };
+
+  // 2. OGG container walk on the POST-ID3 slice. ID3.pm:1590 `Seek($hdrEnd,
+  //    0)` followed by re-dispatch on the audio body — same semantics as
+  //    `ape::parse_full_chained` (the body parser sees the bytes starting at
+  //    the post-ID3-header offset).
+  let body_slice = data.get(hdr_end..).unwrap_or(&[]);
+  match parse_inner(body_slice, print_conv)? {
+    Some(mut meta) => {
+      meta.id3 = id3;
+      Ok(Some(meta))
+    }
+    // `parse_inner` always returns `Some` today (the typed Meta carries
+    // `success` even for non-OGG input). The `None` arm is reachable only
+    // if a future revision starts rejecting on Rust-level errors; treat as
+    // "no Meta" so the candidate loop continues.
+    None => Ok(None),
+  }
+}
+
+/// Inner parser — produces a borrow-from-input [`Meta`] (technically
+/// `Meta<'_>` with a phantom `'_` today; see [`Meta`] struct doc
+/// re: zero-alloc revisit). The [`FormatParser::Meta`] GAT (`type
+/// Meta<'a> = Meta<'a>`) returns this borrowed form directly into the
+/// closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
+fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
+  // Stage the legacy push-style emissions into a side `Metadata` so the
+  // bundled-faithful list-coalesce + name-synthesis paths stay byte-exact
+  // (faithful to Vorbis.pm:154-210 + ExifTool.pm:9505-9520). The side
+  // Metadata is then transposed into typed `Meta` fields below.
+  //
+  // This pattern mirrors the AAC pilot (Phase F1) — the staging Metadata
+  // is the simplest way to keep the established list-coalesce semantics
+  // (FoundTag-like first-occurrence position + same-(group, name) repeats
+  // coalesce into a single `TagValue::List`) inside the typed Meta.
+  let mut staging = Metadata::new("ogg-staging");
+
+  // R3 F2: `METADATA_BLOCK_PICTURE` Vorbis-comment payloads decoded into
+  // owned `OggPicture` entries (Vorbis.pm:122-134 SubDirectory hop into
+  // %FLAC::Picture). One entry per encountered comment; lifted into the
+  // typed Meta below.
+  let mut pictures: Vec<OggPicture> = Vec::new();
+
+  // Container walker state — verbatim Perl ProcessOGG (Ogg.pm:75-197).
+  let mut success = false;
+  let mut packet_count: u32 = 0;
+  let mut stream_count: u32 = 0;
+  let mut current_stream: u32;
+  let mut stream_page: HashMap<u32, Option<u32>> = HashMap::new();
+  // Accumulated packet payload per stream (continuation pages concatenate
+  // into the same entry).
+  let mut val: HashMap<u32, Vec<u8>> = HashMap::new();
+
+  let mut cursor: usize = 0;
+  let mut current_flag: u8;
+  let mut raf_done = false;
+
+  // `OverrideFileType` decision (Ogg.pm:49-50). First-seen wins (mirrors
+  // bundled — bundled `OverrideFileType` is idempotent for equal values
+  // and does nothing for already-overridden, per ExifTool.pm:9715).
+  let mut file_type_override: Option<&'static str> = None;
+  // R2 F-OGG-TRIM: identification fields. First-seen wins for the same
+  // reason `file_type_override` is first-wins: bundled `ProcessBinaryData`
+  // emits the FIRST occurrence's value through `HandleTag`, and the
+  // FoundTag de-dup is `(group, name)` ⇒ subsequent occurrences for the
+  // same tag are dropped by `%NO_DUPS` priority (ExifTool.pm:9540).
+  let mut vorbis_identification: Option<VorbisIdentification> = None;
+  let mut opus_header: Option<OpusHeader> = None;
+
+  loop {
+    // Ogg.pm:94 `if ($raf and $raf->Read($buff, 28) == 28)` — the page
+    // header read MUST succeed at exactly 28 bytes for the page to be
+    // accepted. 27 bytes is one byte short of `Get8u(\$buff, 27)` (the
+    // first segment-table entry, used later on Ogg.pm:147 `$dataLen =
+    // Get8u(\$buff, 27)`). A 27-byte `OggS`-magic input is REJECTED:
+    // the read returns 27, the `== 28` check fails, the loop never
+    // accepts the page, `$success` stays 0 ⇒ post-loop finalization
+    // emits `'File format error'` (ExifTool.pm:3093). See conformance
+    // pin `ogg_truncated_error_conformance` (R1 F1 regression).
+    let header_in_bounds = !raf_done && data.len() >= cursor + 28;
+    let header_magic_ok = header_in_bounds && &data[cursor..cursor + 4] == b"OggS";
+    let read_ok = if header_in_bounds {
+      if !header_magic_ok {
+        // Ogg.pm:97 `$success and $et->Warn('Lost synchronization')`.
+        if success {
+          staging.push_warning("Lost synchronization");
+        }
+        false
+      } else {
+        true
+      }
+    } else {
+      false
+    };
+
+    if read_ok {
+      if !success {
+        // Ogg.pm:101-104 — first valid page: SetFileType + SetByteOrder.
+        // (SetFileType is fired by the bridge, not here — the typed
+        // Meta records the success flag instead.)
+        success = true;
+      }
+      // Ogg.pm:106 `$flag = Get8u(\$buff, 5)` — page-header byte 5.
+      current_flag = data[cursor + 5];
+      // Ogg.pm:107 `$stream = Get32u(\$buff, 14)`.
+      current_stream = u32::from_le_bytes([
+        data[cursor + 14],
+        data[cursor + 15],
+        data[cursor + 16],
+        data[cursor + 17],
+      ]);
+      if current_flag & 0x02 != 0 {
+        // Ogg.pm:108-110 — BOS bit set.
+        stream_count = stream_count.saturating_add(1);
+        stream_page.insert(current_stream, Some(0));
+      }
+      // Ogg.pm:114 `++$packets unless $flag & 0x01`.
+      if current_flag & 0x01 == 0 {
+        packet_count = packet_count.saturating_add(1);
+      }
+    } else {
+      // Ogg.pm:115-121 — no more data; if we still have a buffered
+      // packet, take any stream and process it.
+      if val.is_empty() {
+        break;
+      }
+      // Take the first stream key we have (Ogg.pm:118 `($stream) = sort
+      // keys %val`).
+      let mut keys: Vec<u32> = val.keys().copied().collect();
+      keys.sort();
+      current_stream = keys[0];
+      current_flag = 0;
+      raf_done = true;
+    }
+
+    // Ogg.pm:122-140 — process the previously buffered packet.
+    // (FLAC-in-Ogg `defined $numFlac` arm is DEFERRED; we fall straight
+    // through to the regular packet-processing branch.)
+    if val.contains_key(&current_stream) && current_flag & 0x01 == 0 {
+      let owned = val.remove(&current_stream).unwrap();
+      let outcome = process_packet(&mut staging, &mut pictures, print_conv_enabled, &owned);
+      record_outcome(
+        &mut file_type_override,
+        &mut vorbis_identification,
+        &mut opus_header,
+        &outcome,
+      );
+      // Ogg.pm:133-136: stop if MAX_PACKETS reached AND no pending vals.
+      if (packet_count > MAX_PACKETS.saturating_mul(stream_count) || raf_done) && val.is_empty() {
+        break;
+      }
+    }
+    // Ogg.pm:138-139 `last if $packets > $MAX_PACKETS * $streams and
+    // not %val;`
+    if packet_count > MAX_PACKETS.saturating_mul(stream_count) && val.is_empty() {
+      break;
+    }
+
+    // If we were on the synthetic "raf_done" pass and have nothing to do,
+    // exit the loop.
+    if raf_done {
+      break;
+    }
+
+    // Ogg.pm:142-153 — sequence number, segment table, data length.
+    let page_num = u32::from_le_bytes([
+      data[cursor + 18],
+      data[cursor + 19],
+      data[cursor + 20],
+      data[cursor + 21],
+    ]);
+    let nseg = data[cursor + 26] as usize;
+    // We need `27 + nseg` bytes to cover the header + segment table.
+    if data.len() < cursor + 27 + nseg {
+      break;
+    }
+    let seg_table = &data[cursor + 27..cursor + 27 + nseg];
+    let data_len: usize = seg_table.iter().map(|&b| b as usize).sum();
+    // Ogg.pm:154-162 — sequence-number check.
+    let expected_opt = stream_page.get(&current_stream).copied().flatten();
+    if let Some(expected) = expected_opt {
+      if expected == page_num {
+        stream_page.insert(current_stream, Some(expected + 1));
+      } else {
+        staging.push_warning("Missing page(s) in Ogg file");
+        stream_page.insert(current_stream, None);
+      }
+    }
+    // Ogg.pm:164 — read page data.
+    let page_data_start = cursor + 27 + nseg;
+    let page_data_end = page_data_start + data_len;
+    if data.len() < page_data_end {
+      break;
+    }
+    // Page bytes as a borrowed slice (no copy yet — the `val` HashMap
+    // owns its own `Vec<u8>` per stream; we move the bytes into it only
+    // when we actually start a new packet).
+    let page_bytes: &[u8] = &data[page_data_start..page_data_end];
+
+    // Ogg.pm:170-179 — accumulate or start new packet.
+    if let Some(existing) = val.get_mut(&current_stream) {
+      // Continuation page — concatenate (Ogg.pm:171).
+      existing.extend_from_slice(page_bytes);
+    } else if current_flag & 0x01 == 0 {
+      // New packet (not a continuation of one we aren't parsing).
+      if classify_packet(page_bytes).is_some() {
+        // Materialise the slice into the `val` map (this is the single
+        // copy needed for the packet accumulator; the prior revision
+        // double-copied via `page_data.clone()`).
+        val.insert(current_stream, page_bytes.to_vec());
+      }
+    }
+    // Ogg.pm:184-188 — EOS bit ⇒ process now.
+    if current_flag & 0x04 != 0 && val.contains_key(&current_stream) {
+      let owned = val.remove(&current_stream).unwrap();
+      let outcome = process_packet(&mut staging, &mut pictures, print_conv_enabled, &owned);
+      record_outcome(
+        &mut file_type_override,
+        &mut vorbis_identification,
+        &mut opus_header,
+        &outcome,
+      );
+    }
+    cursor = page_data_end;
+  }
+  // Ogg.pm:196 `return $success`.
+
+  // Lift staging metadata into typed Meta. Warnings are cloned into
+  // owned `SmolStr` (no `Box::leak`); comments go through `tag_to_comment`
+  // per element.
+  let warnings: Vec<SmolStr> = staging
+    .warnings_slice()
+    .iter()
+    .map(|w| staged_warning_to_owned(w.as_str()))
+    .collect();
+  let comments: Vec<Comment> = staging.tags_slice().iter().map(tag_to_comment).collect();
+  Ok(Some(Meta {
+    #[cfg(feature = "id3")]
+    id3: None,
+    file_type_override,
+    vorbis_identification,
+    opus_header,
+    pictures,
+    comments,
+    warnings,
+    success,
+    _marker: core::marker::PhantomData,
+  }))
+}
+
+/// First-wins outcome reducer. Bundled `OverrideFileType`
+/// (ExifTool.pm:9715) is idempotent for equal values and does nothing for
+/// already-overridden values; bundled `FoundTag` (ExifTool.pm:9505-9520)
+/// drops duplicate emissions for the same `(group, name)`. Both behaviours
+/// collapse to "first-wins" for each of the three state slots.
+fn record_outcome(
+  override_state: &mut Option<&'static str>,
+  vorbis_id_state: &mut Option<VorbisIdentification>,
+  opus_header_state: &mut Option<OpusHeader>,
+  outcome: &PacketOutcome,
+) {
+  match outcome {
+    PacketOutcome::None | PacketOutcome::FlacDeferred => {}
+    PacketOutcome::Override { file_type } => {
+      if override_state.is_none() {
+        *override_state = Some(*file_type);
+      }
+    }
+    PacketOutcome::VorbisId(id) => {
+      if vorbis_id_state.is_none() {
+        *vorbis_id_state = Some(*id);
+      }
+      // Vorbis identification packets do NOT trigger a file-type override
+      // (Ogg.pm:49-50 only fire for Theora / Opus); Vorbis is the default
+      // OGG codec ⇒ no override needed.
+    }
+    PacketOutcome::OpusHeader(header) => {
+      if opus_header_state.is_none() {
+        *opus_header_state = Some(*header);
+      }
+      // Opus.pm:50 fires `OverrideFileType('OPUS')` whenever an `OpusHead`
+      // packet is recognised, regardless of whether the binary table is
+      // fully decodable.
+      if override_state.is_none() {
+        *override_state = Some("OPUS");
+      }
+    }
+  }
+}
+
+/// Clone a staged warning string into the typed Meta's owned warning list.
+/// The three strings OGG can emit (Ogg.pm:97, :158, Vorbis.pm:208) are all
+/// `&'static str` literals in bundled-Perl; the typed Meta now carries them
+/// as owned [`SmolStr`] (no `Box::leak`; Codex AF2). The short, fixed
+/// literals are all SmolStr-inline (≤ 23 bytes), so this is allocation-free.
+fn staged_warning_to_owned(w: &str) -> SmolStr {
+  SmolStr::from(w)
+}
+
+/// Transpose a staged `Tag` (one row of the side `Metadata`) into a typed
+/// [`Comment`]. Lossy on the [`TagValue`] enum because the typed
+/// Meta's contract is "what bundled would emit": `TagValue::Str` ⇒
+/// [`Comment::Scalar`], `TagValue::List` ⇒ [`Comment::List`],
+/// `TagValue::Bytes` ⇒ [`Comment::Binary`]. Other `TagValue` variants
+/// are not produced by the legacy parser for OGG (no I64/F64/Rational
+/// paths in the Vorbis-comment block).
+fn tag_to_comment(tag: &crate::value::Tag) -> Comment {
+  // Family-1 group is bundled's `-G1` token. For OGG it's either "Vorbis"
+  // (Vorbis::Comments / Opus comments) or "Theora" (Theora::Comments).
+  // Stored owned (`SmolStr`) so an unforeseen group needs no `Box::leak`
+  // (Codex AF2).
+  let group1 = SmolStr::from(tag.group_ref().family1());
+  let name = SmolStr::from(tag.name());
+  match tag.value_ref() {
+    TagValue::List(items) => {
+      // List tags in OGG today: Artist / Performer / Contact.
+      let values: Vec<SmolStr> = items
+        .iter()
+        .map(|v| match v {
+          TagValue::Str(s) => s.clone(),
+          // Defensive: bundled never produces non-string elements in a
+          // Vorbis-comment list (no ValueConv runs on List tags for
+          // ARTIST/PERFORMER/CONTACT). Fall back to a Display rendering.
+          other => SmolStr::from(format!("{other:?}")),
+        })
+        .collect();
+      Comment::List(CommentList::new(group1, name, values))
+    }
+    TagValue::Bytes(bytes) => Comment::Binary(CommentBinary::new(group1, name, bytes.clone())),
+    TagValue::Str(s) => Comment::Scalar(CommentScalar::new(group1, name, s.clone())),
+    // Other TagValue variants are unreachable from this module's emission
+    // paths; render via Debug to preserve diagnostic fidelity without
+    // panicking. Verified by the test
+    // `parse_inner_only_emits_str_list_bytes_variants` below.
+    other => Comment::Scalar(CommentScalar::new(
+      group1,
+      name,
+      SmolStr::from(format!("{other:?}")),
+    )),
+  }
+}
+
+// ===========================================================================
+// `Error` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for OGG parsing. Currently empty — every parse
+/// failure surfaces as `success == false` on the returned [`Meta`]
+/// (Perl `return 0`) so the bridge can emit the engine-level `ExifTool:
+/// Error => "File format error"`. Reserved for future I/O wrappers if
+/// streaming readers are added.
+///
+/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
+/// `default-features = false` ⇒ `core::error::Error` in every feature
+/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
+/// without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Error {}
+
+// ===========================================================================
+// `serialize_tags` — typed Meta → TagMap
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl Meta<'_> {
+  /// Emit OGG tags into the writer in bundled emission order:
+  ///   1. Vorbis identification fields (when present), Vorbis.pm:40-70
+  ///      order: VorbisVersion / AudioChannels / SampleRate /
+  ///      MaximumBitrate / NominalBitrate / MinimumBitrate.
+  ///   2. Opus header fields (when present), Opus.pm:36-51 order:
+  ///      OpusVersion / AudioChannels / SampleRate / OutputGain.
+  ///   3. Vorbis comments in encounter order — vendor first, then KEY=VALUE
+  ///      pairs (list-tags coalesced at first occurrence — faithful
+  ///      FoundTag, ExifTool.pm:9505-9520).
+  ///   4. Accumulated warnings.
+  ///
+  /// **NOTE:** `File:FileType*` / file-type override is NOT emitted here.
+  /// That's the bridge's responsibility (the engine entry `process`):
+  /// `SetFileType` precedes the Vorbis:* tags in bundled output, but the
+  /// pseudo-File:* tags belong to the engine's `ParseContext::set_file_
+  /// type` path (not the per-format `serialize_tags`). The `serialize_tags` only
+  /// writes Vorbis:* / Opus:* / Theora:* tags + warnings.
+  ///
+  /// `print_conv = true` matches bundled `perl exiftool -j`; `false`
+  /// matches `-j -n`. The toggle drives:
+  ///   * Vorbis bitrate fields: `-j` → `ConvertBitrate("32000")` = `"32 kbps"`;
+  ///     `-j -n` → raw u32 (`32000`).
+  ///   * Other identification fields (VorbisVersion/AudioChannels/SampleRate,
+  ///     OpusVersion/AudioChannels/SampleRate): no PrintConv ⇒ raw u32/u8
+  ///     in both modes.
+  ///   * Opus OutputGain: ValueConv `10**($val/5120)` runs in BOTH modes
+  ///     (it's a ValueConv, not a PrintConv); the toggle has no effect.
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    // 0. Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). Bundled
+    //    runs `ProcessID3` BEFORE the OGG container walk — `File:ID3Size`
+    //    + every `ID3v2_*:*` frame tag precede any Vorbis:* / Opus:* tag.
+    //    R3 F1 (Codex adversarial): the pre-fix engine arm stripped the
+    //    ID3v2 prefix to reparse `bytes[hdr_end..]` but never emitted the
+    //    ID3 directory, forcing a silent metadata-loss path. Nesting +
+    //    emitting via `Id3Meta::serialize_tags` is the same pattern
+    //    `ape::Meta`, `flac::Meta`, `dsf::Meta` use.
+    //
+    //    Bundled key ordering in `-j -G1` output places `File:ID3Size`
+    //    near `File:*` (system-emitted) and the `ID3v2_*:*` frames after
+    //    the Vorbis block. The conformance gate (object-key MULTISET,
+    //    NOT order — `tests/conformance.rs:1-7`) accepts any consistent
+    //    emission order; we emit ID3 sub-Meta first so the writer's
+    //    insertion order (which feeds `serde_json::Map` first-wins) is
+    //    deterministic, with the value multiset matching bundled exactly.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.serialize_tags(print_conv, out)?;
+    }
+
+    // 1. Vorbis identification (Vorbis.pm:40-70). Emit in DECLARED OFFSET
+    //    order: VorbisVersion (0), AudioChannels (4), SampleRate (5),
+    //    MaximumBitrate (9), NominalBitrate (13), MinimumBitrate (17).
+    //    Bundled `ProcessBinaryData` iterates the table in offset order,
+    //    so the JSON emission order matches.
+    if let Some(id) = self.vorbis_identification {
+      // R3 F3 (per-field, faithful ProcessBinaryData): every field is
+      // optional — emit only when the parse populated it (i.e. the
+      // payload covered offset+width). Mirrors bundled's iterate-and-
+      // skip semantics (ExifTool.pm:9927).
+      if let Some(v) = id.vorbis_version() {
+        out.write_u64("Vorbis", "VorbisVersion", u64::from(v))?;
+      }
+      if let Some(v) = id.audio_channels() {
+        out.write_u64("Vorbis", "AudioChannels", u64::from(v))?;
+      }
+      if let Some(v) = id.sample_rate() {
+        out.write_u64("Vorbis", "SampleRate", u64::from(v))?;
+      }
+      // Bitrate fields: RawConv `$val || undef` drops the zero case
+      // (already filtered to `None` in `parse_vorbis_identification`);
+      // PrintConv runs `ConvertBitrate` for `-j`, raw bps for `-j -n`.
+      if let Some(bps) = id.maximum_bitrate() {
+        emit_bitrate(out, "MaximumBitrate", bps, print_conv)?;
+      }
+      if let Some(bps) = id.nominal_bitrate() {
+        emit_bitrate(out, "NominalBitrate", bps, print_conv)?;
+      }
+      if let Some(bps) = id.minimum_bitrate() {
+        emit_bitrate(out, "MinimumBitrate", bps, print_conv)?;
+      }
+    }
+    // 2. Opus header (Opus.pm:36-51). DECLARED OFFSET order: OpusVersion
+    //    (0), AudioChannels (1), SampleRate (4), OutputGain (8).
+    //    R3 F3 (per-field): every field is `Option<...>`; emit only the
+    //    in-range subset.
+    if let Some(h) = self.opus_header {
+      if let Some(v) = h.opus_version() {
+        out.write_u64("Opus", "OpusVersion", u64::from(v))?;
+      }
+      if let Some(v) = h.audio_channels() {
+        out.write_u64("Opus", "AudioChannels", u64::from(v))?;
+      }
+      if let Some(v) = h.sample_rate() {
+        out.write_u64("Opus", "SampleRate", u64::from(v))?;
+      }
+      // OutputGain post-ValueConv (`10**(raw/5120)`). Bundled emits this
+      // as a bare number — `1` when raw is 0 (the common in-spec case);
+      // for non-zero raw the f64 result is emitted via the JSON-number
+      // gate (the serializer already handles integer-valued f64 ⇒ no `.0`,
+      // matching Perl's stringification of `1`).
+      if let Some(g) = h.output_gain() {
+        out.write_f64("Opus", "OutputGain", g)?;
+      }
+    }
+    // 3. Vorbis comments (vendor + KEY=VALUE) — encounter order with
+    //    list-coalescing.
+    for comment in &self.comments {
+      match comment {
+        Comment::Scalar(s) => {
+          out.write_str(s.group1(), s.name(), s.value())?;
+        }
+        Comment::List(l) => {
+          // Vorbis List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:
+          // 85/86/94) coalesce into a single `TagValue::List` at
+          // first-occurrence position — faithful `FoundTag`
+          // (ExifTool.pm:9505-9520). Route through the `write_str_list`
+          // primitive so list-aware writers coalesce correctly instead of
+          // last-write-wins (Codex CF2).
+          let refs: Vec<&str> = l.values_slice().iter().map(SmolStr::as_str).collect();
+          out.write_str_list(l.group1(), l.name(), &refs)?;
+        }
+        Comment::Binary(b) => {
+          out.write_bytes(b.group1(), b.name(), b.bytes())?;
+        }
+      }
+    }
+    // 3b. R3 F2: `METADATA_BLOCK_PICTURE` payloads (Vorbis.pm:122-134
+    //     → %FLAC::Picture FLAC.pm:84-134). Emit each Picture sub-field
+    //     under the `FLAC` family-1 group with the same names FLAC's
+    //     own `sink_picture` uses (FLAC.pm:84-134), so the value-multiset
+    //     conformance check matches bundled byte-for-byte.
+    for p in &self.pictures {
+      sink_ogg_picture(p, print_conv, out)?;
+    }
+    // 4. Warnings emit in occurrence order. The engine `TagMap` routes
+    //    these to its `warnings()` accumulator (ExifTool:Warning surface);
+    //    `TagMap` collects into a `warnings()` vec.
+    for w in &self.warnings {
+      out.write_warning(w)?;
+    }
+    Ok(())
+  }
+}
+
+/// Sink one [`OggPicture`] under the bundled `FLAC` family-1 group in
+/// the same emission order `flac::sink_picture` uses (FLAC.pm:84-134).
+/// R3 F2: Vorbis `METADATA_BLOCK_PICTURE` SubDirectory hop into
+/// `Image::ExifTool::FLAC::Picture` (Vorbis.pm:122-134). Mirrors the
+/// emission shape: `PictureType` (PrintConv-mapped under -j), then
+/// `PictureMIMEType` / `PictureDescription` / `PictureWidth` /
+/// `PictureHeight` / `PictureBitsPerPixel` / `PictureIndexedColors` /
+/// `PictureLength` / `Picture` (binary).
+#[cfg(feature = "alloc")]
+fn sink_ogg_picture(
+  p: &OggPicture,
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  const GROUP: &str = "FLAC";
+  // PictureType — PrintConv hash (FLAC.pm:88-113). On a hash miss the
+  // Perl default falls back to the numeric value as a string; we emit
+  // the raw u32.
+  if print_conv {
+    if let Some(name) = p.picture_type_name() {
+      out.write_str(GROUP, "PictureType", name)?;
+    } else {
+      out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
+    }
+  } else {
+    out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
+  }
+  out.write_str(GROUP, "PictureMIMEType", p.mime_type())?;
+  out.write_str(GROUP, "PictureDescription", p.description())?;
+  out.write_u64(GROUP, "PictureWidth", u64::from(p.width()))?;
+  out.write_u64(GROUP, "PictureHeight", u64::from(p.height()))?;
+  out.write_u64(GROUP, "PictureBitsPerPixel", u64::from(p.bits_per_pixel()))?;
+  out.write_u64(GROUP, "PictureIndexedColors", u64::from(p.indexed_colors()))?;
+  out.write_u64(GROUP, "PictureLength", u64::from(p.length()))?;
+  // Picture binary — same skip-on-zero-payload sentinel as FLAC's
+  // sink_picture (FLAC.pm:128-133 + ExifTool.pm:6292 ReadValue clamp).
+  if p.length() > 0 && p.data().is_empty() {
+    // Faithful skip — bundled ReadValue returns undef ⇒ no tag.
+  } else {
+    out.write_bytes(GROUP, "Picture", p.data())?;
+  }
+  Ok(())
+}
+
+/// Emit a Vorbis bitrate field (`MaximumBitrate` / `NominalBitrate` /
+/// `MinimumBitrate`). `bps` is the raw u32 value (already filtered against
+/// the `$val || undef` RawConv). PrintConv path goes through
+/// [`crate::convert::write_convert_bitrate`] for the human-readable
+/// `"X kbps"`/`"X.X Mbps"` form (the bundled `ConvertBitrate`); the
+/// `-n` (no-PrintConv) path emits the raw u32 as a bare JSON integer.
+#[cfg(feature = "alloc")]
+fn emit_bitrate(
+  out: &mut crate::tagmap::TagMap,
+  name: &str,
+  bps: u32,
+  print_conv: bool,
+) -> Result<(), core::convert::Infallible> {
+  if print_conv {
+    out.write_fmt("Vorbis", name, |w| {
+      crate::convert::write_convert_bitrate(w, f64::from(bps))
+    })
+  } else {
+    out.write_u64("Vorbis", name, u64::from(bps))
+  }
+}
+
+// ===========================================================================
+// Engine entry — typed parse + File:* + sink into `Metadata`
+// ===========================================================================
 
 // ===========================================================================
 // Tests
@@ -1023,13 +2502,13 @@ fn process_assembled_packet(ctx: &mut ParseContext<'_>, buff: &[u8]) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::tagmap::TagMap;
 
-  // `convert_bitrate` unit-tests REMOVED (R1 F2): `convert_bitrate` is a
-  // PrintConv helper used only by the now-deferred Vorbis/Theora codec
-  // binary tables. The engine-level `convert::convert_bitrate` (faithful
-  // to ExifTool.pm:6891-6902) remains and its own engine-tier tests cover
-  // the breakpoints — the duplicate cover here was only useful while the
-  // Ogg PR was the first consumer of it.
+  // `convert_bitrate` unit-tests live next to the helper in `convert.rs`
+  // (the helper itself moved out of `formats/moi.rs` into `convert.rs` in
+  // R2 F-OGG-TRIM so both `formats/moi.rs` and `formats/ogg.rs` can share
+  // the faithful port). The breakpoints under `moi::tests` already cover
+  // the bundled oracle (50, 999, 1000, 32000, 128000, 224000, 8.5e6, 1.5e9).
 
   #[test]
   fn base64_decode_examples() {
@@ -1198,8 +2677,14 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogg");
-    assert!(process_vorbis_comments(&data, &mut meta, true));
-    let names: Vec<&str> = meta.tags().iter().map(|t| t.name()).collect();
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
+    let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     // Order: Vendor first, then comments in insertion order.
     assert_eq!(
       names,
@@ -1241,17 +2726,27 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogg");
-    assert!(process_vorbis_comments(&data, &mut meta, true));
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
     // Vendor first, then Title, then a single Artist as a List of 2.
-    let names: Vec<&str> = meta.tags().iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     assert_eq!(names, vec!["Vendor", "Title", "Artist"]);
-    let artist = meta.tags().iter().find(|t| t.name() == "Artist").unwrap();
-    if let TagValue::List(items) = artist.value() {
+    let artist = meta
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "Artist")
+      .unwrap();
+    if let TagValue::List(items) = artist.value_ref() {
       assert_eq!(items.len(), 2);
       assert_eq!(items[0], TagValue::Str("Alice".into()));
       assert_eq!(items[1], TagValue::Str("Bob".into()));
     } else {
-      panic!("Artist should be List, got {:?}", artist.value());
+      panic!("Artist should be List, got {:?}", artist.value_ref());
     }
   }
 
@@ -1260,18 +2755,28 @@ mod tests {
     // Vendor-length larger than available data.
     let data: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff];
     let mut meta = Metadata::new("x.ogg");
-    assert!(!process_vorbis_comments(&data, &mut meta, true));
-    assert_eq!(meta.warnings()[0], "Format error in Vorbis comments");
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(!process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
+    assert_eq!(meta.warnings_slice()[0], "Format error in Vorbis comments");
   }
 
-  // Tests `vorbis_identification_format_lookup`,
-  // `process_vorbis_comments_zero_nominal_bitrate_dropped`,
-  // `process_binary_data_opus_header_extracts_fields`, and
-  // `binary_format_rational64u_emits_rational` REMOVED (R1 F2): they
-  // exercise the deferred codec-identification binary tables and
-  // `process_binary_data` / `read_binary` engine subset. The Vorbis/Opus
-  // /Theora codec PRs that re-land those tables will re-derive these
-  // tests against bundled-Perl oracle fixtures.
+  // R2 F-OGG-TRIM: the Vorbis::Identification + Opus::Header binary
+  // tables are NOW ported here, see the `parse_vorbis_identification` +
+  // `parse_opus_header` helpers and their unit tests
+  // (`vorbis_identification_typical_payload`,
+  // `vorbis_identification_short_payload_rejected`,
+  // `vorbis_identification_all_bitrates_nonzero`,
+  // `opus_header_typical_payload`, `opus_header_nonzero_output_gain`,
+  // `opus_header_short_payload_rejected`,
+  // `vorbis_identification_emits_in_declared_offset_order`,
+  // `vorbis_identification_n_mode_emits_raw_bitrate`,
+  // `opus_header_serialize_emits_declared_order`). Theora::Identification
+  // remains deferred until the dedicated Theora.pm PR.
 
   #[test]
   fn process_vorbis_comments_with_group1_retags_to_theora() {
@@ -1288,13 +2793,18 @@ mod tests {
       data.extend_from_slice(e);
     }
     let mut meta = Metadata::new("x.ogv");
+    let mut pictures: Vec<OggPicture> = Vec::new();
     assert!(process_vorbis_comments_with_group1(
-      &data, &mut meta, true, "Theora"
+      &data,
+      &mut meta,
+      &mut pictures,
+      true,
+      "Theora"
     ));
-    for t in meta.tags() {
+    for t in meta.tags_slice() {
       // Family-0 stays "Vorbis" (from the tag table); family-1 is "Theora".
-      assert_eq!(t.group().family0(), "Vorbis");
-      assert_eq!(t.group().family1(), "Theora");
+      assert_eq!(t.group_ref().family0(), "Vorbis");
+      assert_eq!(t.group_ref().family1(), "Theora");
     }
   }
 
@@ -1307,17 +2817,569 @@ mod tests {
 
   #[test]
   fn process_ogg_short_buffer_rejects_cleanly() {
-    use crate::parser::ParseContext;
-    let mut m = Metadata::new("x.ogg");
     // Only the 4-byte `OggS` magic — header is far short of the 28-byte
-    // minimum Ogg.pm:94 demands. `ProcessOgg` returns false; nothing
-    // pushed to metadata. (See also `tests/conformance.rs::
-    // ogg_truncated_error_conformance` for the 27-byte boundary pin.)
-    let mut ctx = ParseContext::new(b"OggS", "OGG", 0, "OGG", None, true, &mut m);
-    assert!(!ProcessOgg.process(&mut ctx));
-    assert!(m.tags().is_empty(), "no tags pushed before SetFileType");
+    // minimum Ogg.pm:94 demands. The engine does not finalize OGG; the
+    // post-loop emits a finalization error instead. (See also
+    // `tests/conformance.rs::ogg_truncated_error_conformance`.)
+    let json = crate::parser::extract_info("x.ogg", b"OggS", true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let obj = v.as_array().unwrap()[0].as_object().unwrap();
+    assert_ne!(
+      obj.get("File:FileType").and_then(|x| x.as_str()),
+      Some("OGG")
+    );
   }
 
-  // `binary_format_rational64u_emits_rational` REMOVED (R1 F2) — see the
-  // shared "tests REMOVED" note further up in this module.
+  // -------------------------------------------------------------------------
+  // Lib-first typed Meta surface
+  // -------------------------------------------------------------------------
+
+  #[test]
+  fn parse_borrowed_rejects_short_buffer() {
+    // 4-byte OggS magic only — ProcessOGG never accepts a page, so success
+    // is false but the typed Meta still exists with empty comments/warnings.
+    let meta = parse_borrowed(b"OggS", true).expect("ok").expect("meta");
+    assert!(!meta.success());
+    assert!(meta.comments().is_empty());
+    assert!(meta.warnings().is_empty());
+    assert_eq!(meta.file_type_override(), None);
+  }
+
+  #[test]
+  fn meta_sinker_emits_vorbis_scalars() {
+    // Drive a typed Meta with a vendor + a non-list scalar; verify
+    // serialize_tags emits both via write_str.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
+      comments: vec![
+        Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "test vendor")),
+        Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
+      ],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(
+      w.get_str("Vorbis", "Vendor"),
+      Some("test vendor".to_string())
+    );
+    assert_eq!(w.get_str("Vorbis", "Title"), Some("Song".to_string()));
+  }
+
+  /// Codex CF2: the typed `serialize_tags` List arm reaches
+  /// `TagMap::write_str_list`, so a `TagMap` consumer gets a
+  /// coalesced first-occurrence-position `TagValue::List` (faithful
+  /// `FoundTag`, ExifTool.pm:9505-9520) instead of last-write-wins. Vorbis
+  /// List=>1 tags: ARTIST/PERFORMER/CONTACT.
+  #[test]
+  fn meta_sinker_list_coalesces_into_tagvalue_list_via_json_writer() {
+    use crate::value::TagValue;
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
+      comments: vec![
+        // A scalar BEFORE the list to pin first-occurrence position.
+        Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
+        Comment::List(CommentList::new(
+          "Vorbis",
+          "Artist",
+          vec![SmolStr::from("Alice"), SmolStr::from("Bob")],
+        )),
+      ],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut md = TagMap::new();
+    meta.serialize_tags(true, &mut md).unwrap();
+    let artist = md.get("Vorbis", "Artist").expect("Artist tag");
+    match artist {
+      TagValue::List(items) => {
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], TagValue::Str(s) if s == "Alice"));
+        assert!(matches!(&items[1], TagValue::Str(s) if s == "Bob"));
+      }
+      other => panic!("expected coalesced TagValue::List, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn meta_sinker_emits_warnings() {
+    // A typed Meta with no comments but two warnings — serialize_tags
+    // routes them to write_warning.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![
+        SmolStr::from("Lost synchronization"),
+        SmolStr::from("Missing page(s) in Ogg file"),
+      ],
+      success: false,
+      _marker: core::marker::PhantomData,
+    };
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(
+      w.warnings(),
+      &[
+        "Lost synchronization".to_string(),
+        "Missing page(s) in Ogg file".to_string()
+      ]
+    );
+  }
+
+  #[test]
+  fn format_parser_trait_returns_borrowed_meta() {
+    // GAT path: `Meta<'a> = Meta<'a>` (phantom `'a`). Drive the trait
+    // API with empty bytes and confirm the shape.
+    let meta: Meta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
+      .expect("ok")
+      .expect("meta");
+    assert!(!meta.success());
+  }
+
+  #[test]
+  fn typed_meta_owns_its_data() {
+    // The typed Meta carries owned SmolStr/Vec<u8> (the `'a` lifetime is
+    // phantom). Verify field accessors round-trip.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: None,
+      comments: vec![Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "v"))],
+      warnings: vec![SmolStr::from("Lost synchronization")],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    assert_eq!(meta.file_type_override(), Some("OPUS"));
+    assert!(meta.success());
+    assert_eq!(meta.warnings(), &[SmolStr::from("Lost synchronization")]);
+    assert_eq!(meta.comments().len(), 1);
+    // §2: predicate + unwrap accessor on the public enum.
+    let c = &meta.comments()[0];
+    assert!(c.is_scalar());
+    assert_eq!(c.unwrap_scalar_ref().value(), "v");
+  }
+
+  #[test]
+  fn vorbis_identification_typical_payload() {
+    // Synthetic Vorbis identification payload — 21 bytes minimum:
+    //   offset 0..4   VorbisVersion = 0 (little-endian u32)
+    //   offset 4      AudioChannels = 2
+    //   offset 5..9   SampleRate = 44100
+    //   offset 9..13  MaximumBitrate = 0 (RawConv `$val || undef` ⇒ None)
+    //   offset 13..17 NominalBitrate = 128000
+    //   offset 17..21 MinimumBitrate = 0 ⇒ None
+    let mut payload = [0u8; 23];
+    // VorbisVersion = 0 (already zeroed)
+    payload[4] = 2; // AudioChannels = 2
+    payload[5..9].copy_from_slice(&44100u32.to_le_bytes()); // SampleRate
+    // MaximumBitrate = 0 (already zeroed)
+    payload[13..17].copy_from_slice(&128_000u32.to_le_bytes()); // NominalBitrate
+    // MinimumBitrate = 0
+    let id = parse_vorbis_identification(&payload).expect("21-byte payload accepted");
+    assert_eq!(id.vorbis_version(), Some(0));
+    assert_eq!(id.audio_channels(), Some(2));
+    assert_eq!(id.sample_rate(), Some(44100));
+    assert_eq!(
+      id.maximum_bitrate(),
+      None,
+      "zero bitrate dropped via RawConv"
+    );
+    assert_eq!(id.nominal_bitrate(), Some(128_000));
+    assert_eq!(id.minimum_bitrate(), None);
+  }
+
+  #[test]
+  fn vorbis_identification_empty_payload_rejected() {
+    // R3 F3: per-field semantics. An EMPTY payload yields `None` (the helper
+    // returns `None` only when not even VorbisVersion fits).
+    let payload = [0u8; 0];
+    assert!(parse_vorbis_identification(&payload).is_none());
+  }
+
+  #[test]
+  fn vorbis_identification_short_payload_per_field_emit() {
+    // R3 F3: per-FIELD offset-checked extraction. A 9-byte payload (covers
+    // offsets 0..4 VorbisVersion, 4 AudioChannels, 5..9 SampleRate, but
+    // NOT 9..13 MaximumBitrate / 13..17 NominalBitrate / 17..21
+    // MinimumBitrate) emits only the in-range subset. Bundled
+    // ProcessBinaryData (ExifTool.pm:9927 `next if $entry >= $size`)
+    // does exactly this — the pre-fix all-or-nothing reject violated
+    // faithfulness.
+    let mut payload = [0u8; 9];
+    payload[0..4].copy_from_slice(&0u32.to_le_bytes()); // VorbisVersion = 0
+    payload[4] = 2; // AudioChannels
+    payload[5..9].copy_from_slice(&44_100u32.to_le_bytes()); // SampleRate
+    let id = parse_vorbis_identification(&payload).expect("9 bytes ⇒ Some(partial)");
+    assert_eq!(id.vorbis_version(), Some(0));
+    assert_eq!(id.audio_channels(), Some(2));
+    assert_eq!(id.sample_rate(), Some(44_100));
+    assert_eq!(
+      id.maximum_bitrate(),
+      None,
+      "offset 9 out of bounds at len 9"
+    );
+    assert_eq!(id.nominal_bitrate(), None, "offset 13 out of bounds");
+    assert_eq!(id.minimum_bitrate(), None, "offset 17 out of bounds");
+  }
+
+  #[test]
+  fn vorbis_identification_just_first_field() {
+    // R3 F3: a 4-byte payload covers ONLY VorbisVersion; all other fields
+    // are out of bounds and emit `None`.
+    let payload = 42u32.to_le_bytes();
+    let id = parse_vorbis_identification(&payload).expect("4 bytes ⇒ Some(version-only)");
+    assert_eq!(id.vorbis_version(), Some(42));
+    assert_eq!(id.audio_channels(), None);
+    assert_eq!(id.sample_rate(), None);
+    assert_eq!(id.maximum_bitrate(), None);
+    assert_eq!(id.nominal_bitrate(), None);
+    assert_eq!(id.minimum_bitrate(), None);
+  }
+
+  #[test]
+  fn vorbis_identification_too_short_for_first_field() {
+    // R3 F3: a 3-byte payload doesn't even cover VorbisVersion (offset 0,
+    // width 4); the helper returns `None` so the caller treats this as
+    // "no identification packet seen".
+    let payload = [0u8; 3];
+    assert!(parse_vorbis_identification(&payload).is_none());
+  }
+
+  #[test]
+  fn vorbis_identification_all_bitrates_nonzero() {
+    // All three bitrate fields non-zero: each becomes Some(raw).
+    let mut payload = [0u8; 21];
+    payload[4] = 1;
+    payload[5..9].copy_from_slice(&48_000u32.to_le_bytes());
+    payload[9..13].copy_from_slice(&320_000u32.to_le_bytes());
+    payload[13..17].copy_from_slice(&192_000u32.to_le_bytes());
+    payload[17..21].copy_from_slice(&64_000u32.to_le_bytes());
+    let id = parse_vorbis_identification(&payload).unwrap();
+    assert_eq!(id.audio_channels(), Some(1));
+    assert_eq!(id.sample_rate(), Some(48_000));
+    assert_eq!(id.maximum_bitrate(), Some(320_000));
+    assert_eq!(id.nominal_bitrate(), Some(192_000));
+    assert_eq!(id.minimum_bitrate(), Some(64_000));
+  }
+
+  #[test]
+  fn opus_header_typical_payload() {
+    // Synthetic Opus header payload — at least 10 bytes:
+    //   offset 0   OpusVersion = 1
+    //   offset 1   AudioChannels = 2
+    //   offset 2..4 PreSkip (int16u, NOT emitted per Opus.pm:41 comment)
+    //   offset 4..8 SampleRate = 48000 (int32u LE)
+    //   offset 8..10 OutputGain raw int16u = 0 ⇒ 10**(0/5120) = 1.0
+    let mut payload = [0u8; 19];
+    payload[0] = 1;
+    payload[1] = 2;
+    payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
+    // OutputGain raw stays 0.
+    let header = parse_opus_header(&payload).expect("10-byte payload accepted");
+    assert_eq!(header.opus_version(), Some(1));
+    assert_eq!(header.audio_channels(), Some(2));
+    assert_eq!(header.sample_rate(), Some(48_000));
+    // 10 ** (0 / 5120) = 10^0 = 1.0 exactly.
+    let gain = header.output_gain().expect("output_gain present");
+    assert!((gain - 1.0).abs() < 1e-12);
+  }
+
+  #[test]
+  fn opus_header_nonzero_output_gain() {
+    // OutputGain raw = 5120 ⇒ 10**(5120/5120) = 10.0
+    let mut payload = [0u8; 10];
+    payload[0] = 1;
+    payload[1] = 1;
+    payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
+    payload[8..10].copy_from_slice(&5120u16.to_le_bytes());
+    let header = parse_opus_header(&payload).unwrap();
+    let gain = header.output_gain().expect("output_gain present");
+    assert!(
+      (gain - 10.0).abs() < 1e-10,
+      "10^(5120/5120) must be exactly 10.0, got {gain}"
+    );
+  }
+
+  #[test]
+  fn opus_header_empty_payload_rejected() {
+    // R3 F3: an EMPTY payload yields None (not even OpusVersion fits).
+    let payload = [0u8; 0];
+    assert!(parse_opus_header(&payload).is_none());
+  }
+
+  #[test]
+  fn opus_header_short_payload_per_field_emit() {
+    // R3 F3: per-field. A 5-byte payload covers OpusVersion (offset 0),
+    // AudioChannels (offset 1), but NOT SampleRate (offset 4..8) and
+    // NOT OutputGain (offset 8..10).
+    let mut payload = [0u8; 5];
+    payload[0] = 1;
+    payload[1] = 2;
+    let header = parse_opus_header(&payload).expect("partial Opus header populated");
+    assert_eq!(header.opus_version(), Some(1));
+    assert_eq!(header.audio_channels(), Some(2));
+    assert_eq!(
+      header.sample_rate(),
+      None,
+      "offset 4..8 out of bounds at len 5"
+    );
+    assert_eq!(header.output_gain(), None, "offset 8..10 out of bounds");
+  }
+
+  #[test]
+  fn opus_header_just_first_byte() {
+    // R3 F3: a 1-byte payload covers ONLY OpusVersion.
+    let payload = [3u8; 1];
+    let header = parse_opus_header(&payload).expect("partial");
+    assert_eq!(header.opus_version(), Some(3));
+    assert_eq!(header.audio_channels(), None);
+    assert_eq!(header.sample_rate(), None);
+    assert_eq!(header.output_gain(), None);
+  }
+
+  #[test]
+  fn vorbis_identification_emits_in_declared_offset_order() {
+    // serialize_tags emits the Vorbis identification fields in DECLARED
+    // OFFSET order (Vorbis.pm:40-70): VorbisVersion / AudioChannels /
+    // SampleRate / MaximumBitrate? / NominalBitrate? / MinimumBitrate?.
+    // Zero-bitrate fields are dropped (RawConv `$val || undef`).
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44100),
+        maximum_bitrate: None,
+        nominal_bitrate: Some(128_000),
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // The insertion order is exactly the declared-offset order: every key
+    // present in the map appears, NOT including the dropped bitrate fields.
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Vorbis:VorbisVersion",
+        "Vorbis:AudioChannels",
+        "Vorbis:SampleRate",
+        "Vorbis:NominalBitrate",
+      ],
+      "declared-offset emission order"
+    );
+    // PrintConv on ⇒ NominalBitrate renders via ConvertBitrate ("128 kbps").
+    assert_eq!(
+      tm.get_str("Vorbis", "NominalBitrate"),
+      Some("128 kbps".to_string()),
+      "PrintConv ConvertBitrate output"
+    );
+  }
+
+  #[test]
+  fn vorbis_identification_n_mode_emits_raw_bitrate() {
+    // `print_conv = false` ⇒ raw u32 bps (no ConvertBitrate). Pins the
+    // `-n` mode emission shape for the bitrate fields.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44100),
+        maximum_bitrate: None,
+        nominal_bitrate: Some(128_000),
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(false, &mut tm).unwrap();
+    // -n: NominalBitrate is the raw u32 = 128000 — written via write_u64,
+    // so the TagMap holds a U64 value, not a Str.
+    let v = tm.get("Vorbis", "NominalBitrate").expect("present");
+    match v {
+      TagValue::U64(n) => assert_eq!(*n, 128_000),
+      other => panic!("expected U64(128000), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn vorbis_identification_partial_payload_serialize_emits_subset() {
+    // R3 F3 regression pin: a partial VorbisIdentification (e.g. a 9-byte
+    // payload yields VorbisVersion / AudioChannels / SampleRate only) must
+    // emit ONLY the populated fields — not the bitrate trio. This pins the
+    // per-field emit gate in `serialize_tags`.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44_100),
+        maximum_bitrate: None,
+        nominal_bitrate: None,
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Vorbis:VorbisVersion",
+        "Vorbis:AudioChannels",
+        "Vorbis:SampleRate",
+      ],
+      "partial payload emits only populated fields (R3 F3)"
+    );
+  }
+
+  #[test]
+  fn opus_header_serialize_emits_declared_order() {
+    // Opus.pm:36-51 declared-offset order: OpusVersion / AudioChannels /
+    // SampleRate / OutputGain.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: Some(OpusHeader {
+        opus_version: Some(1),
+        audio_channels: Some(2),
+        sample_rate: Some(48_000),
+        output_gain: Some(1.0),
+      }),
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Opus:OpusVersion",
+        "Opus:AudioChannels",
+        "Opus:SampleRate",
+        "Opus:OutputGain",
+      ],
+      "declared-offset emission order"
+    );
+  }
+
+  #[test]
+  fn opus_header_partial_serialize_emits_subset() {
+    // R3 F3: serialize emits only the in-range subset. A partial
+    // OpusHeader with only OpusVersion + AudioChannels populated must
+    // emit just those two keys.
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: Some(OpusHeader {
+        opus_version: Some(1),
+        audio_channels: Some(2),
+        sample_rate: None,
+        output_gain: None,
+      }),
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec!["Opus:OpusVersion", "Opus:AudioChannels"],
+      "Opus partial emits only populated fields (R3 F3)"
+    );
+  }
+
+  #[test]
+  fn parse_inner_only_emits_str_list_bytes_variants() {
+    // Defensive: confirm that staging Metadata never holds anything other
+    // than Str/List/Bytes for the OGG emission paths. If a future code
+    // change introduces I64/F64 (e.g. via a ValueConv on a known tag),
+    // the `tag_to_comment` Debug-string fallback would surface it; this
+    // pin ensures no such regression slips in without an explicit test.
+    let vendor = b"test";
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    data.extend_from_slice(vendor);
+    let entries: &[&[u8]] = &[b"TITLE=Hello", b"ARTIST=Alice", b"ARTIST=Bob"];
+    data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+      data.extend_from_slice(&(e.len() as u32).to_le_bytes());
+      data.extend_from_slice(e);
+    }
+    let mut meta = Metadata::new("x.ogg");
+    let mut pictures: Vec<OggPicture> = Vec::new();
+    assert!(process_vorbis_comments(
+      &data,
+      &mut meta,
+      &mut pictures,
+      true
+    ));
+    for tag in meta.tags_slice() {
+      match tag.value_ref() {
+        TagValue::Str(_) | TagValue::List(_) | TagValue::Bytes(_) => {}
+        other => panic!(
+          "OGG staging Metadata produced unexpected variant: {other:?} (tag {})",
+          tag.name()
+        ),
+      }
+    }
+  }
 }

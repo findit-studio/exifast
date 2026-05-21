@@ -82,6 +82,7 @@ impl FileType {
 
   /// List-context `GetFileType`: ordered candidate file types (1 or more).
   #[must_use]
+  #[inline(always)]
   pub const fn candidate_types(&self) -> &'static [&'static str] {
     self.candidate_types
   }
@@ -89,12 +90,14 @@ impl FileType {
   /// Scalar-context `GetFileType`: the uppercased extension if the resolved
   /// entry was a multi-candidate list, otherwise the single file type.
   #[must_use]
+  #[inline(always)]
   pub fn primary_type(&self) -> &str {
     &self.primary
   }
 
   /// Description from the resolved `%fileTypeLookup` entry.
   #[must_use]
+  #[inline(always)]
   pub const fn description(&self) -> &'static str {
     self.description
   }
@@ -301,6 +304,7 @@ impl DetectionCandidate {
   /// relabelled to `AVI`/`WAV` — that happens in the RIFF module, a later
   /// phase).
   #[must_use]
+  #[inline(always)]
   pub const fn file_type(&self) -> &'static str {
     self.file_type
   }
@@ -309,6 +313,7 @@ impl DetectionCandidate {
   /// only by scanning past an unknown header (Perl `pos($buff) -
   /// length($1)`); `0` for every other candidate.
   #[must_use]
+  #[inline(always)]
   pub const fn header_skip(&self) -> usize {
     self.header_skip
   }
@@ -316,6 +321,7 @@ impl DetectionCandidate {
   /// `true` iff this candidate was produced via the terminal JPEG/TIFF
   /// header-skip scan (Perl `$unkHeader = 1`).
   #[must_use]
+  #[inline(always)]
   pub const fn after_unknown_header(&self) -> bool {
     self.after_unknown_header
   }
@@ -330,6 +336,7 @@ impl DetectionCandidate {
   ///
   /// [`file_type`]: DetectionCandidate::file_type
   #[must_use]
+  #[inline(always)]
   pub fn parent_type(&self) -> &str {
     &self.parent_type
   }
@@ -570,8 +577,8 @@ pub fn detection_candidates(name: &str, head: &[u8]) -> DetectionCandidates {
     // (Perl reaches this branch only when $recognizedExt is false — it is
     // the `else` of the `elsif ($recognizedExt)`.)
     let skip = end - marker_len; // Perl: pos($buff) - length($1)
-                                 // L3038 applies to this terminal $type too: a JPEG terminal's Parent
-                                 // is "JPEG"; a TIFF terminal's Parent is $tiffType.
+    // L3038 applies to this terminal $type too: a JPEG terminal's Parent
+    // is "JPEG"; a TIFF terminal's Parent is $tiffType.
     out.push(DetectionCandidate {
       file_type: ty,
       header_skip: skip,

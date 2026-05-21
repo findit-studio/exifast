@@ -17,5 +17,12 @@
   "ID3v1:Album": "StdAlbumX",
   "ID3v1:Year": 2024,
   "ID3v1:Comment": "StdCommentX",
-  "ID3v1:Genre": 7
+  "ID3v1:Genre": 7,
+  "ID3v1_Enh:Title2": "EnhancedTitle",
+  "ID3v1_Enh:Artist2": "EnhancedArtist",
+  "ID3v1_Enh:Album2": "EnhancedAlbum",
+  "ID3v1_Enh:Speed": 2,
+  "ID3v1_Enh:Genre": "Rock",
+  "ID3v1_Enh:StartTime": "00:00 ",
+  "ID3v1_Enh:EndTime": "03:45 "
 }]
