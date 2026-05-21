@@ -871,20 +871,13 @@ fn parse_mp3_typed<'a>(
   // it unconditionally would re-emit the ID3 sub-Meta a second time (Codex
   // B-R2-2).
   let (id3, hdr_end) = if shared.done_id3().is_none() {
-    // Stage in `-j` mode (the typed MP3 entry's fixed mode).
-    let (id3, hdr_end) = parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?;
-    // ID3.pm:1435-1436: `ProcessID3` sets `$$et{DoneID3} = 1` BEFORE
-    // scanning — truthy even when NO ID3 is found. `parse_id3_inner` only
-    // propagates the trailer size on a hit; mirror the no-ID3 side effect so
-    // a subsequent chained parser (or a recursive MP3 dispatch) observes
-    // `DoneID3` as set (`Some(0)` = no trailer).
-    if shared.done_id3().is_none() {
-      shared.set_done_id3(0);
-    }
-    // `parse_id3_inner` already recorded the post-ID3v2-header offset
-    // (bundled `$hdrEnd`) on `shared` for the DoneID3-skip path (Codex
-    // B-R3-1); no extra carry needed here.
-    (id3, hdr_end)
+    // Stage in `-j` mode (the typed MP3 entry's fixed mode). `parse_id3_inner`
+    // sets BOTH the `DoneID3` "ran" marker (`Some(trailer)` on a hit, else
+    // `Some(0)` — ID3.pm:1435-1436) AND the post-ID3v2-header offset (bundled
+    // `$hdrEnd`) on `shared` so a subsequent chained parser / recursive MP3
+    // dispatch observes them (Codex B-R3-1/B-R3-2). No manual marker patch
+    // is needed here.
+    parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?
   } else {
     // DoneID3 already set ⇒ bundled `ProcessID3` returns 0 and the `unless`
     // skips it (ID3.pm:1691-1693). No ID3 sub-Meta. The bundled flow only
@@ -1049,24 +1042,39 @@ fn parse_id3_inner<'a>(
 ) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
   let _ = print_conv; // no longer mode-locks (Codex B-R2-1); see fn docs.
 
+  // ID3.pm:1435 `return 0 if $$et{DoneID3}` — the `ProcessID3` recursion
+  // guard. A chained typed caller (APE/FLAC/DSF/MP3 → ID3) that has already
+  // run ID3 must NOT re-enter and duplicate the work (Codex B-R3-2). Honored
+  // here at the typed-ID3 chokepoint so EVERY typed entry
+  // (`parse_id3_borrowed`, `ProcessId3::parse`, `parse_mp3_typed`) inherits
+  // it. Returns the no-op shape (`hdr_end = 0`); the bundled skip path does
+  // not produce a directory. `shared == None` (bridge-style scratch calls)
+  // has no cross-format state to guard on — the legacy scratch `Metadata`
+  // owns its own `DoneID3` for internal recursion.
+  if shared.as_ref().is_some_and(|sf| sf.done_id3().is_some()) {
+    return Ok((None, 0));
+  }
+
   // PrintConv (`-j`) pass — the accessor + `sink(true)` source.
   let (found, hdr_end, staged_tags, staging) = run_id3_pass(data, true);
 
-  // Record the post-ID3v2-header offset (bundled `$hdrEnd`) on the shared
-  // state for EVERY typed ID3 run — found or not. A later chained
-  // `ProcessMP3` re-entering with `DoneID3` already set scans MPEG from this
-  // offset (the audio-format loop's `$raf->Seek($hdrEnd, 0)`, ID3.pm:1590),
-  // not from 0, so a large-ID3 file still yields MPEG tags (Codex B-R3-1).
-  // Done before the no-ID3 early return so the offset is carried regardless
-  // of the return shape (FormatParser side-effects persist).
+  // ID3.pm:1436 `$$et{DoneID3} = 1` — set the "ran" marker BEFORE scanning,
+  // truthy even when NO ID3 is found. Combined with the post-ID3v2-header
+  // offset (bundled `$hdrEnd`), recorded on the shared state for EVERY typed
+  // ID3 run — found or not. A later chained `ProcessMP3` re-entering with
+  // `DoneID3` set scans MPEG from this offset (the audio-format loop's
+  // `$raf->Seek($hdrEnd, 0)`, ID3.pm:1590), not from 0, so a large-ID3 file
+  // still yields MPEG tags (Codex B-R3-1). Done before the no-ID3 early
+  // return so both side effects persist regardless of the return shape (the
+  // FormatParser contract; Codex B-R3-2).
   if let Some(sf) = shared {
     sf.set_id3_hdr_end(hdr_end);
-    // Propagate done_id3 (the trailer size that APE.pm:169 reads). The
-    // legacy `process_id3_inner_legacy` stored this on `staging.done_id3`;
-    // mirror it onto the SharedFlags for the new chained-call path.
-    if let Some(trail_size) = staging.done_id3() {
-      sf.set_done_id3(trail_size);
-    }
+    // `done_id3` ends up the trailer size on a hit (APE.pm:169 reads it),
+    // else the `Some(0)` "ran, no v1 trailer" marker (ID3.pm:1436's truthy
+    // `1`; the APE `> 1` shift treats `0`/`1` identically). The legacy
+    // `process_id3_inner_legacy` stores the trailer size on `staging`; mirror
+    // it, falling back to `0` so a no-ID3 run still marks DoneID3 (B-R3-2).
+    sf.set_done_id3(staging.done_id3().unwrap_or(0));
   }
 
   if !found {
@@ -2315,6 +2323,55 @@ mod tests {
     let mut shared = SharedFlags::new();
     let _ = parse_id3_borrowed(&data, Some(&mut shared), true).expect("ok");
     assert_eq!(shared.done_id3(), Some(128));
+  }
+
+  /// Codex B-R3-2: typed `ProcessID3` must honor the recursion guard
+  /// `return 0 if $$et{DoneID3}` (ID3.pm:1435). With `DoneID3` already set, a
+  /// chained typed caller (APE/FLAC → ID3, or `parse_id3_borrowed`) must
+  /// return `Ok(None)` WITHOUT re-running — even over a buffer that DOES
+  /// contain an ID3v1 trailer. The pre-existing `done_id3` value is left
+  /// untouched (the guarded pass does not overwrite it).
+  #[test]
+  fn typed_id3_honors_done_id3_recursion_guard() {
+    let mut data: Vec<u8> = vec![0; 256];
+    data.extend_from_slice(&build_id3v1_block());
+    let mut shared = SharedFlags::new();
+    // A prior parser already ran ID3 and consumed a 128-byte v1 trailer.
+    shared.set_done_id3(128);
+    let meta = parse_id3_borrowed(&data, Some(&mut shared), true).expect("ok");
+    assert!(
+      meta.is_none(),
+      "guard returns Ok(None) without re-running (ID3.pm:1435)"
+    );
+    assert_eq!(
+      shared.done_id3(),
+      Some(128),
+      "pre-existing DoneID3 left untouched by the guarded pass"
+    );
+  }
+
+  /// Codex B-R3-2: the `$$et{DoneID3} = 1` marker (ID3.pm:1436) is set BEFORE
+  /// scanning, so it persists even when NO ID3 is found. A no-ID3 typed run
+  /// via `parse_id3_borrowed` must propagate `DoneID3 = Some(0)` (the
+  /// ran-with-no-trailer marker) onto the shared state BEFORE returning
+  /// `None` — the FormatParser side-effect-persists contract. `MP3.mp3` is
+  /// raw MPEG with no ID3 directory.
+  #[cfg(feature = "mp3")]
+  #[test]
+  fn typed_id3_no_id3_run_marks_done_id3_before_returning_none() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
+    )
+    .expect("read MP3.mp3 fixture");
+    let mut shared = SharedFlags::new();
+    assert_eq!(shared.done_id3(), None, "precondition: DoneID3 unset");
+    let meta = parse_id3_borrowed(&bytes, Some(&mut shared), true).expect("ok");
+    assert!(meta.is_none(), "MP3.mp3 has no ID3 directory");
+    assert_eq!(
+      shared.done_id3(),
+      Some(0),
+      "DoneID3 marked Some(0) before the no-ID3 None return (ID3.pm:1436, Codex B-R3-2)"
+    );
   }
 
   #[test]
