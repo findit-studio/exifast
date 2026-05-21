@@ -8,8 +8,8 @@
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`R3dMeta<'a>`] is produced by the new
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! `process` drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! `process` drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## R3D structure (Red.pm:219-223)
@@ -44,8 +44,7 @@
 
 use crate::{
   convert::{ByteOrder, read_value},
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
+  parser_new::{FormatParser, parser_sealed},
   value::{Rational, TagValue, format_g},
 };
 
@@ -1332,21 +1331,26 @@ fn dispatch_directory_tag<'a>(
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
 const GROUP: &str = "Red";
 
-impl MetaSinker for R3dMeta<'_> {
+#[cfg(feature = "alloc")]
+impl R3dMeta<'_> {
   /// Emit R3D tags into the writer in faithful Red.pm emission order:
   ///
   /// 1. RED1/RED2 header subtable fields (Red.pm:240 HandleTag).
   /// 2. Directory tags in walk order (Red.pm:277-291).
-  /// 3. Warnings via [`TagWriter::write_warning`].
+  /// 3. Warnings via `TagMap::write_warning`.
   ///
   /// `print_conv=true` ⇒ PrintConv formatted strings (`-j`);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n`).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     // 1. Header subtable fields.
     if let Some(v) = self.redcode_version_str() {
       // RedcodeVersion is an ASCII digit string; ExifTool's JSON emitter
@@ -1396,12 +1400,12 @@ impl MetaSinker for R3dMeta<'_> {
 
 impl R3dMeta<'_> {
   /// Emit a single directory tag.
-  fn sink_directory_tag<W: TagWriter>(
+  fn sink_directory_tag(
     &self,
     dt: DirectoryTag,
     print_conv: bool,
-    out: &mut W,
-  ) -> Result<(), W::Error> {
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     match dt.id() {
       0x1000 => {
         if let Some(v) = self.start_edge_code {
@@ -1635,7 +1639,12 @@ impl R3dMeta<'_> {
 }
 
 /// Emit a generic `R3dValue` (no per-tag PrintConv).
-fn emit_r3d_value<W: TagWriter>(out: &mut W, name: &str, v: &R3dValue<'_>) -> Result<(), W::Error> {
+#[cfg(feature = "alloc")]
+fn emit_r3d_value(
+  out: &mut crate::tagmap::TagMap,
+  name: &str,
+  v: &R3dValue<'_>,
+) -> Result<(), core::convert::Infallible> {
   match v {
     R3dValue::I64(n) => out.write_i64(GROUP, name, *n),
     R3dValue::F64(n) => out.write_f64(GROUP, name, *n),
@@ -1670,28 +1679,6 @@ impl std::error::Error for R3dError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessR3D {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    let meta = {
-      let data = ctx.data();
-      match parse_inner(data) {
-        Some(m) => m,
-        None => return false,
-      }
-    };
-    // Red.pm:230 `$et->SetFileType()` — happens BEFORE tag emission.
-    ctx.set_file_type(None, None, None);
-    let print_conv = ctx.print_conv_enabled();
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    true
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1699,7 +1686,6 @@ impl ProcessR3D {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_writer::JsonTagWriter;
 
   #[test]
   fn red_format_table_matches_pm() {
@@ -1717,48 +1703,44 @@ mod tests {
     assert_eq!(red_format(15), None);
   }
 
+  // The engine path is now `crate::parser::extract_info`. These run it and
+  // assert on the parsed JSON object (replacing the retired `ProcessR3D::process`
+  // + `TagMap` tests).
+  fn engine_obj(data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("Red.r3d", data, true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  fn is_r3d(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("File:FileType").and_then(|v| v.as_str()) == Some("R3D")
+  }
+
   #[test]
   fn reject_short_input() {
-    let mut m = JsonTagWriter::new("Red.r3d");
-    let bytes = [0u8; 7];
-    let mut ctx = ParseContext::new(&bytes, "R3D", 0, "R3D", None, true, &mut m);
-    assert!(!ProcessR3D.process(&mut ctx));
-    assert!(m.tags().is_empty());
+    assert!(!is_r3d(&engine_obj(&[0u8; 7])));
   }
 
   #[test]
   fn reject_bad_magic() {
-    let mut m = JsonTagWriter::new("Red.r3d");
-    let bytes = b"\x00\x00\x00\x10ABCD";
-    let mut ctx = ParseContext::new(bytes, "R3D", 0, "R3D", None, true, &mut m);
-    assert!(!ProcessR3D.process(&mut ctx));
-    assert!(m.tags().is_empty());
+    assert!(!is_r3d(&engine_obj(b"\x00\x00\x00\x10ABCD")));
   }
 
   #[test]
   fn reject_size_less_than_8() {
-    let mut m = JsonTagWriter::new("Red.r3d");
-    let bytes = b"\x00\x00\x00\x04RED1";
-    let mut ctx = ParseContext::new(bytes, "R3D", 0, "R3D", None, true, &mut m);
-    assert!(!ProcessR3D.process(&mut ctx));
-    assert!(m.tags().is_empty());
+    assert!(!is_r3d(&engine_obj(b"\x00\x00\x00\x04RED1")));
   }
 
   #[test]
   fn truncated_header_emits_warning_and_filetype_triplet() {
-    let mut m = JsonTagWriter::new("Red.r3d");
     // size = 0x40 — header validates, SetFileType runs, then Read($size-8)
     // fails ⇒ Warn("Truncated R3D file"). Faithful: no header tag emission.
-    let bytes = b"\x00\x00\x00\x40RED1";
-    let mut ctx = ParseContext::new(bytes, "R3D", 0, "R3D", None, true, &mut m);
-    assert!(ProcessR3D.process(&mut ctx));
-    let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    assert!(names.contains(&"FileType"));
-    assert!(names.contains(&"FileTypeExtension"));
-    assert!(names.contains(&"MIMEType"));
+    let obj = engine_obj(b"\x00\x00\x00\x40RED1");
+    assert!(obj.contains_key("File:FileType"));
+    assert!(obj.contains_key("File:FileTypeExtension"));
+    assert!(obj.contains_key("File:MIMEType"));
     assert_eq!(
-      m.warnings(),
-      &[smol_str::SmolStr::new("Truncated R3D file")]
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Truncated R3D file")
     );
   }
 
@@ -2060,43 +2042,34 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_typed_tags_via_map_writer() {
-    use crate::sink::{MapTagWriter, MapValue};
+    use crate::tagmap::TagMap;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
     let meta = parse_borrowed(&bytes)
       .expect("ok")
       .expect("real Red.r3d parses");
     // PrintConv ON.
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("Red", "RedcodeVersion"), Some("2".to_string()));
+    assert_eq!(w.get_str("Red", "ImageWidth"), Some("5120".to_string()));
+    assert_eq!(w.get_str("Red", "FrameRate"), Some("23.976".to_string()));
     assert_eq!(
-      w.get("Red", "RedcodeVersion").map(MapValue::as_str),
-      Some("2".to_string())
-    );
-    assert_eq!(
-      w.get("Red", "ImageWidth").map(MapValue::as_str),
-      Some("5120".to_string())
-    );
-    assert_eq!(
-      w.get("Red", "FrameRate").map(MapValue::as_str),
-      Some("23.976".to_string())
-    );
-    assert_eq!(
-      w.get("Red", "FocusDistance").map(MapValue::as_str),
+      w.get_str("Red", "FocusDistance"),
       Some("-0.001 m".to_string())
     );
     // PrintConv OFF (raw F64).
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
     let fr = w.get("Red", "FrameRate").unwrap();
     let raw_f = match fr {
-      MapValue::F64(n) => *n,
+      TagValue::F64(n) => *n,
       other => panic!("expected F64 for FrameRate, got {other:?}"),
     };
     assert!((raw_f - 24000.0 / 1001.0).abs() < 1e-6);
     let fd = w.get("Red", "FocusDistance").unwrap();
     let raw_fd = match fd {
-      MapValue::F64(n) => *n,
+      TagValue::F64(n) => *n,
       other => panic!("expected F64 for FocusDistance, got {other:?}"),
     };
     assert_eq!(raw_fd, -0.001);

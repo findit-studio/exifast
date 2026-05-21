@@ -15,8 +15,8 @@
 //!
 //! A typed [`ApeMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`. The engine entry runs the
 //! ID3-chained dispatch (`crate::formats::id3::process::process_id3_chained`)
 //! on the `ParseContext` value sink; APE READS `done_id3` from
@@ -44,12 +44,10 @@
 //!   this engine.
 
 use crate::{
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  parser_new::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{Group, TagValue},
 };
-use smol_str::SmolStr;
 
 // =============================================================================
 // Family-0 group: APE
@@ -1213,7 +1211,7 @@ pub struct ApeMeta<'a> {
   /// ID3v1 TRAILER (at EOF) was detected and parsed via
   /// [`crate::formats::id3::process::parse_id3_with_hdr_end`]. Carries
   /// `File:ID3Size` + the `ID3v2_*:*` / `ID3v1:*` frame tags; the typed
-  /// [`MetaSinker`] sink emits them so the typed Meta is self-contained
+  /// `serialize_tags` sink emits them so the typed Meta is self-contained
   /// (replaces the engine's separate `process_id3_chained` dispatch). The
   /// MAC/main extraction runs over the POST-prefix slice and the footer
   /// scan honours the v1-trailer shift (APE.pm:169) via `SharedFlags`.
@@ -1256,7 +1254,7 @@ impl ApeMeta<'_> {
 
   /// Chained ID3 sub-Meta (APE.pm:124-127), `Some` when an ID3v2 prefix or
   /// ID3v1 trailer was detected by [`parse_full_chained`]. The
-  /// [`MetaSinker`](crate::parser_new::MetaSinker) sink emits its
+  /// `serialize_tags` sink emits its
   /// `File:ID3Size` + `ID3v2_*:*` / `ID3v1:*` tags.
   #[cfg(feature = "id3")]
   #[must_use]
@@ -1774,10 +1772,11 @@ fn composite_duration_from_header_and_main(
 }
 
 // =============================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // =============================================================================
 
-impl MetaSinker for ApeMeta<'_> {
+#[cfg(feature = "alloc")]
+impl ApeMeta<'_> {
   /// Emit APE tags into the writer in faithful APE.pm extraction order:
   /// (1) MAC binary-data header tags, (2) dynamic main-tag stream, (3)
   /// `Warning('Bad APE trailer')` if the planner detected an invalid
@@ -1795,7 +1794,11 @@ impl MetaSinker for ApeMeta<'_> {
   /// output. This dual-pass approach mirrors AAC/DV's pattern: PrintConv
   /// is a global engine toggle (ExifTool.pm:5710 `OPTIONS{PrintConv}`),
   /// not a writer choice.
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     // (0) Chained ID3 sub-Meta (APE.pm:124-127 embedded ProcessID3). Emitted
     // FIRST — bundled runs `ProcessID3` before the MAC/APE body extraction, so
     // `File:ID3Size` + the ID3 frames precede the MAC tags. (Object key order
@@ -1803,7 +1806,7 @@ impl MetaSinker for ApeMeta<'_> {
     // the streams identical.)
     #[cfg(feature = "id3")]
     if let Some(id3) = &self.id3 {
-      id3.sink(print_conv, out)?;
+      id3.serialize_tags(print_conv, out)?;
     }
     // (1) MAC binary-data header.
     if let Some(header) = &self.header {
@@ -1827,11 +1830,12 @@ impl MetaSinker for ApeMeta<'_> {
   }
 }
 
-fn sink_header<W: TagWriter>(
+#[cfg(feature = "alloc")]
+fn sink_header(
   header: &ApeHeader,
   print_conv: bool,
-  out: &mut W,
-) -> Result<(), W::Error> {
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
   // Faithful emission order = the static OLD_HEADER / NEW_HEADER arrays.
   // Family-1 group is `MAC` (APE.pm:47/67).
   const GROUP: &str = "MAC";
@@ -1894,13 +1898,14 @@ enum EmitVal {
   F64(f64),
 }
 
-fn emit_with_print_conv<W: TagWriter>(
-  out: &mut W,
+#[cfg(feature = "alloc")]
+fn emit_with_print_conv(
+  out: &mut crate::tagmap::TagMap,
   group: &str,
   name: &str,
   val: &EmitVal,
   _print_conv: bool,
-) -> Result<(), W::Error> {
+) -> Result<(), core::convert::Infallible> {
   // Header fields have `PrintConv::None` (APE.pm:50-78 — none of the
   // static defs set a PrintConv), so the `-j` and `-n` emission is
   // identical: emit the post-ValueConv scalar verbatim.
@@ -1910,11 +1915,12 @@ fn emit_with_print_conv<W: TagWriter>(
   }
 }
 
-fn sink_main_tag<W: TagWriter>(
+#[cfg(feature = "alloc")]
+fn sink_main_tag(
   t: &ApeMainTag,
   print_conv: bool,
-  out: &mut W,
-) -> Result<(), W::Error> {
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
   // The planner runs in `print_conv_enabled = false` ⇒ the value is the
   // POST-VALUECONV RAW scalar. For `print_conv = true` the sink applies
   // the static def's PrintConv on emit; for `print_conv = false` we emit
@@ -1930,12 +1936,13 @@ fn sink_main_tag<W: TagWriter>(
   emit_tag_value(out, "APE", t.name(), t.value())
 }
 
-fn emit_tag_value<W: TagWriter>(
-  out: &mut W,
+#[cfg(feature = "alloc")]
+fn emit_tag_value(
+  out: &mut crate::tagmap::TagMap,
   group: &str,
   name: &str,
   v: &TagValue,
-) -> Result<(), W::Error> {
+) -> Result<(), core::convert::Infallible> {
   match v {
     TagValue::Str(s) => out.write_str(group, name, s.as_str()),
     TagValue::I64(n) => out.write_i64(group, name, *n),
@@ -1958,11 +1965,12 @@ fn emit_tag_value<W: TagWriter>(
   }
 }
 
-fn sink_composite_duration<W: TagWriter>(
+#[cfg(feature = "alloc")]
+fn sink_composite_duration(
   comp: &TagValue,
   print_conv: bool,
-  out: &mut W,
-) -> Result<(), W::Error> {
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
   const GROUP: &str = "Composite";
   // `composite_duration` is stored as RAW f64 (or Str for non-finite —
   // see `composite_duration_from_header_and_main`). The sink applies
@@ -1983,316 +1991,6 @@ fn sink_composite_duration<W: TagWriter>(
     // Non-finite stored as Str ("Inf"/"-Inf"/"NaN") — emit verbatim
     // (faithful: bundled Perl emits the quoted string in both -j and -n).
     other => emit_tag_value(out, GROUP, "Duration", other),
-  }
-}
-
-// =============================================================================
-// Engine entry — typed parse + File:* + sink into `Metadata`
-// =============================================================================
-
-impl ProcessApe {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the ID3 chained
-  /// dispatch, then drives the typed [`FormatParser::parse`] +
-  /// [`MetaSinker::sink`] path into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (APE.pm:119-241):
-  ///   1. Embedded ID3 dispatch (APE.pm:124-127) via the existing
-  ///      `process_id3_chained` helper — F2 ID3 migration owns this seam.
-  ///   2. `set_done_ape` (APE.pm:131) — runs unconditionally on entry.
-  ///   3. Magic check + SetFileType (APE.pm:137-141) iff the typed
-  ///      planner produces a result.
-  ///   4. Tag emission via `MetaSinker::sink` ⇒ engine `JsonTagWriter`.
-  ///   5. Cross-format Composite Duration resolution via the existing
-  ///      `emit_composite_duration_if_present` (reads back off the engine
-  ///      `JsonTagWriter` records — covers cross-format injected ingredients
-  ///      that the typed intra-APE meta cannot see). Phase G unifies
-  ///      this when Composite is engine-tier.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // require Image::ExifTool::ID3; Image::ExifTool::ID3::ProcessID3(
-    // $et, $dirInfo) and return 1; }`. The bundled audio-dispatch loop
-    // INSIDE ProcessID3 (ID3.pm:1582-1601) recursively re-invokes
-    // ProcessAPE for the MAC/APETAGEX body extraction when an ID3 prefix
-    // is present, so a faithful flattened model runs BOTH the ID3 tag
-    // extraction AND the APE MAC/APE-trailer extraction within a single
-    // ProcessApe::process. The audio loop's recursive ProcessAPE skips
-    // the embedded-ID3 check (DoneID3 set) but DOES call SetFileType
-    // (APE.pm:141, "APE"), which then wins over the later
-    // SetFileType('MP3') at ID3.pm:1604 via the FoundTag('FileType')
-    // first-call-wins gate. Bundled `$hdrEnd` (ID3.pm:1505) marks the
-    // file offset PAST the ID3v2 header; the audio loop's `Seek(
-    // $hdrEnd, 0)` (ID3.pm:1590) is how the recursive ProcessAPE sees
-    // `MAC `/`APETAGEX` at offset 0 of its slice. Verified vs bundled
-    // `perl exiftool` on `tests/fixtures/ape_id3_prefixed.ape`
-    // (FileType=APE, with both ID3v2_3:* and MAC:* + APE:* tags).
-    let id3 = if ctx.writer().done_id3().is_none() {
-      crate::formats::id3::process::process_id3_chained(ctx)
-    } else {
-      crate::formats::id3::process::Id3ChainedResult::default()
-    };
-    let id3_found = id3.found();
-    let hdr_end = id3.hdr_end_offset();
-
-    // APE.pm:131 `$$et{DoneAPE} = 1` — runs immediately after the ID3
-    // arm AND BEFORE the magic check, so even a wrong-magic file (one
-    // we'd reject below) faithfully marks DoneAPE. Read by ID3.pm:1723
-    // to gate the MP3→APE trailer fallback.
-    ctx.writer().set_done_ape();
-
-    let print_conv_enabled = ctx.print_conv_enabled();
-
-    // ----- Phase 1: planning (read-only over ctx.data()) -------------------
-    // Slice past the ID3v2 header (bundled `$raf->Seek($hdrEnd, 0)` at
-    // ID3.pm:1590). The recursive ProcessAPE inside the audio loop sees
-    // `MAC `/`APETAGEX` at offset 0 of this slice. When `hdr_end == 0`
-    // (no ID3 prefix), the slice IS `ctx.data()` unchanged.
-    //
-    // Codex R4 F1 fix: `hdr_end` may legitimately exceed `ctx.data().len()`
-    // for a TRUNCATED v2.4-footer file. Bundled's `$raf->Seek(10, 1)` at
-    // ID3.pm:1486 is unconditional — filesystems allow seeking past EOF, so
-    // `$raf->Tell()` at :1504 yields `10 + size + 10` regardless of whether
-    // the 10 footer bytes physically exist. Subsequent `$raf->Read` calls
-    // in the audio loop just return short/empty (no crash). We model the
-    // same byte-exact behavior with `get(hdr_end..).unwrap_or(&[])`: when
-    // `hdr_end > data.len()`, the saturating-empty slice routes through
-    // `plan_ape` → wrong-magic → ID3-only outcome (no panic).
-    let ape_slice = ctx.data().get(hdr_end..).unwrap_or(&[]);
-    // APE.pm:169 `$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1` —
-    // when ProcessID3 (above) found an ID3v1 trailer at EOF, walk PAST
-    // it when scanning for the APETAGEX 32-byte trailer header. Codex R3
-    // F2 fix: previously the footer scan used `data.len() - 32`
-    // unconditionally, so files with both APEv2 + ID3v1 trailers at EOF
-    // had the trailer header read from the wrong offset (32 bytes back
-    // from EOF lands INSIDE the ID3v1 TAG block, not on `APETAGEX`).
-    let done_id3 = ctx.writer().done_id3().unwrap_or(0);
-    // The planner runs in `print_conv_enabled = false` so the post-
-    // ValueConv RAW scalars are carried through the typed Meta. The
-    // sink applies PrintConv at emission time per `print_conv_enabled`
-    // (the legacy bridge's `ctx.print_conv_enabled()` decides which
-    // mode the sink runs in). This matches the AAC/DV pattern.
-    let plan = match plan_ape(ape_slice, false, done_id3) {
-      Some(p) => p,
-      // APE.pm:137-138 — short or wrong-magic. Two faithful outcomes:
-      //   (a) ID3 was found above ⇒ APE.pm:125-126 `ProcessID3 ... and
-      //       return 1` semantics: return TRUE so the engine treats the
-      //       file as ID3-only (audio-loop fallback at ID3.pm:1604 would
-      //       set FileType='MP3' — we don't model the loop, but
-      //       ID3-only is the bundled outcome).
-      //   (b) ID3 was NOT found ⇒ return FALSE so the candidate loop
-      //       tries the next type (faithful APE.pm:138 `return 0`).
-      None => return id3_found,
-    };
-
-    // APE.pm:139 `$et->SetFileType();` — no-arg ⇒ detected ("APE").
-    // Called after the file is validated, BEFORE pushing any tags
-    // (faithful: SetFileType pushes File:* via FoundTag, ordered first).
-    // Faithful to the bundled audio-loop recursion: the recursive
-    // ProcessAPE invoked from ID3.pm:1582-1601 calls this same
-    // SetFileType (APE.pm:141), engaging first-call-wins so the later
-    // ID3.pm:1604 `SetFileType('MP3')` is a no-op.
-    ctx.set_file_type(None, None, None);
-
-    // ----- Phase 2: typed Meta → engine JsonTagWriter sink -----------------
-    // The plan-derived typed Meta carries the MAC header tags, the
-    // dynamic main tags (with PrintConv-mode applied), the warn flag,
-    // and the intra-APE Composite:Duration. The sink writes all of them
-    // straight into the engine `JsonTagWriter` (`ctx.writer()`).
-    //
-    // BUT: cross-format Composite:Duration resolution (the test
-    // `composite_lookup_resolves_via_family0_apes_not_only_mac` injects
-    // MAC tags from outside the parser) requires reading the writer's
-    // buffered records AFTER the APE pushes — so we suppress the intra-APE
-    // composite emission inside the typed sink here, and instead defer
-    // to `emit_composite_duration_if_present` below which reads back off
-    // the engine `JsonTagWriter` and covers both intra-APE and cross-format
-    // ingredient sources.
-    let mut meta = meta_from_plan(plan);
-    meta.composite_duration = None; // suppress intra-APE sink; helper runs below.
-    {
-      // Pin family-0 = "APE" for the APE sink ONLY (the MAC-header / main-tag
-      // split keyed by family-0 = `APE:`, APE.pm:84-87), then clear it so the
-      // surrounding File:* (family-0 "File") and chained-ID3 emissions keep the
-      // default mapping. The shared engine `JsonTagWriter`'s
-      // `set_family0_override` does this now that one `JsonTagWriter` is
-      // shared across the whole `process`.
-      ctx.writer().set_family0_override(Some(APE_GROUP0));
-      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv_enabled, ctx.writer());
-      ctx.writer().set_family0_override(None);
-    }
-
-    emit_composite_duration_if_present(ctx, print_conv_enabled);
-
-    // Side effect — mirror DoneAPE into shared flags for any future
-    // typed callers reading the cross-format state. (The legacy
-    // `Metadata::set_done_ape()` is the path the engine actually reads
-    // today; the SharedFlags mirror is groundwork for Phase G.)
-    let _ = id3_found;
-    true // APE.pm:240 `return 1;`.
-  }
-}
-
-/// Faithful Composite::Duration emission (APE.pm:81-93). Looks up the four
-/// Require ingredients on the metadata sink and pushes
-/// `Composite:Duration` if both `SampleRate` and `TotalFrames` are
-/// Perl-truthy. Shared by the regular [`ProcessApe::process`] entry
-/// point AND the chained-parser [`ProcessApe::process_trailer_only`]
-/// entry (Codex r16 finding) — both paths see the same composite
-/// resolution rule.
-///
-/// Require resolution detail:
-///   * ExifTool's `GroupMatches('APE', ...)` (ExifTool.pm:5207-5246)
-///     checks ALL families of each candidate tag — family-0 = `APE`
-///     (default-from-package on every APE-module tag) matches the
-///     `APE:` prefix. Both header tags (group1=MAC, group0=APE) and
-///     dynamic Main tags (group1=APE, group0=APE) qualify by name.
-///   * Tolerates F64 and Str values (Codex r8): RawConv arithmetic
-///     runs Perl numeric coercion on each ingredient. Coerce Str via
-///     `perl_numeric_coerce_f64`.
-///   * Duplicate-name override (Codex r9): when both MAC header and
-///     wire tag carry the same canonical name, ExifTool's HandleTag/
-///     DUPL_TAG renames the earlier value's key to `Name (1)` and
-///     gives the bare key to the LATEST FoundTag call. Faithful match:
-///     use `iter().rev()` (last-wins).
-///   * Perl BOOLEAN truthiness (Codex r10): `($val[0] && $val[1])` runs
-///     on the RAW VALUE scalar (not the coerced f64). Strings: TRUE iff
-///     non-empty AND not exact `"0"` (`"0E0"`, `"0.0"`, etc. are TRUE).
-///     Numeric: TRUE iff `!= 0`. NaN: TRUE (Perl NaN is truthy). We use
-///     `perl_boolean_truthy` for this.
-///   * Non-finite arithmetic (Codex r9): when any ingredient is
-///     `Inf`/`-Inf`/`NaN`, `dur` is non-finite. Perl stringifies with
-///     capital-I `Inf`/`-Inf`/`NaN` and EscapeJSON quotes the result;
-///     Rust `f64::to_string()` would emit lowercase `inf`,
-///     byte-diverging. We promote to Perl-cased `TagValue::Str` here.
-fn emit_composite_duration_if_present(ctx: &mut ParseContext<'_>, print_conv_enabled: bool) {
-  let (sample_rate, total_frames, blocks_per_frame, final_frame_blocks) = {
-    // Read the four Require ingredients back off the engine `JsonTagWriter`'s
-    // buffered records (faithful `Metadata::tags()` analogue). Collect the
-    // family-0 = `APE:` records once (the iterator is single-pass), then the
-    // per-name lookup scans them last-occurrence-first (`.rev()`).
-    let ape_records: std::vec::Vec<(SmolStr, TagValue)> = ctx
-      .writer()
-      .records()
-      .filter(|(g, _, _)| g.family0() == APE_GROUP0)
-      .map(|(_, n, v)| (SmolStr::new(n), v.clone()))
-      .collect();
-    let lookup = |name: &str| -> Option<(TagValue, f64)> {
-      ape_records
-        .iter()
-        .rev()
-        .find(|(n, _)| n == name)
-        .and_then(|(_, value)| {
-          let raw = value.clone();
-          let num = match &raw {
-            TagValue::I64(n) => Some(*n as f64),
-            TagValue::F64(x) => Some(*x),
-            TagValue::Str(s) => Some(perl_numeric_coerce_f64(s)),
-            // Bytes / Bool / Rational / List: ExifTool's RawConv would
-            // either error or coerce via Perl context that's irrelevant
-            // for APE — none of the 4 ingredient kinds can realistically
-            // be one of these. Skip cleanly (no Composite ⇒ undef tag).
-            _ => None,
-          }?;
-          Some((raw, num))
-        })
-    };
-    (
-      lookup("SampleRate"),
-      lookup("TotalFrames"),
-      lookup("BlocksPerFrame"),
-      lookup("FinalFrameBlocks"),
-    )
-  };
-  if let (Some((sr_raw, sr)), Some((tf_raw, tf)), Some((_, bpf)), Some((_, ffb))) = (
-    sample_rate,
-    total_frames,
-    blocks_per_frame,
-    final_frame_blocks,
-  ) {
-    // APE.pm:90 `($val[0] && $val[1]) ? (($val[1]-1)*$val[2]+$val[3])/$val[0] : undef`.
-    let sr_truthy = perl_boolean_truthy(&sr_raw);
-    let tf_truthy = perl_boolean_truthy(&tf_raw);
-    if sr_truthy && tf_truthy {
-      // All computation in f64 from the start (no usize subtraction;
-      // forward-item Phase-2 signed-arithmetic discipline).
-      let dur = ((tf - 1.0) * bpf + ffb) / sr;
-      let composite_val = if !dur.is_finite() {
-        let s = if dur.is_nan() {
-          "NaN"
-        } else if dur.is_sign_negative() {
-          "-Inf"
-        } else {
-          "Inf"
-        };
-        TagValue::Str(s.into())
-      } else if print_conv_enabled {
-        convert_duration(&TagValue::F64(dur))
-      } else {
-        TagValue::F64(dur)
-      };
-      ctx.writer().push(
-        Group::new("Composite", "Composite"),
-        "Duration",
-        composite_val,
-      );
-    }
-  }
-}
-
-impl ProcessApe {
-  /// Faithful APE.pm:118 docstring + APE.pm:136 `unless ($$et{FileType})`:
-  /// invoked by a chained parser that has ALREADY typed the file (e.g.
-  /// `ID3::ProcessID3` then `APE::ProcessAPE`, or `ProcessMP3` via the
-  /// trailer fallback at ID3.pm:1722-1727). Skips the magic check +
-  /// SetFileType and binary-header block (APE.pm:137-162) and runs ONLY
-  /// the APETAGEX-trailer scan (APE.pm:165-237).
-  ///
-  /// Production consumer: the MP3 → APE-trailer fallback in
-  /// `crate::formats::id3::process::ProcessMp3` (R2-F2).
-  pub(crate) fn process_trailer_only(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // APE.pm:131 `$$et{DoneAPE} = 1` — runs unconditionally on entry to
-    // ProcessAPE (whether the embedded-ID3 arm fired or not). The
-    // trailer-only path IS reached via ID3.pm:1722-1727 from ProcessMP3
-    // and (transitively) from the audio-loop recursion at
-    // ID3.pm:1582-1601, both of which expect DoneAPE marked.
-    ctx.writer().set_done_ape();
-    let print_conv_enabled = ctx.print_conv_enabled();
-    // APE.pm:169 — when ProcessID3 (called earlier in the chain by
-    // `ProcessMp3` at ID3.pm:1692) stored an ID3v1-trailer size in
-    // `$$et{DoneID3}`, the APETAGEX 32-byte trailer header sits BEFORE
-    // that block. The Codex R3 F2 fix threads the size in so the scan
-    // walks the right offset (mirroring `$footPos -= $$et{DoneID3} if
-    // $$et{DoneID3} > 1`).
-    let done_id3 = ctx.writer().done_id3().unwrap_or(0);
-    // Planner runs in `print_conv_enabled = false` (raw scalars); sink
-    // applies PrintConv at emit time per the requested mode.
-    let plan = plan_apetagex_trailer_only(ctx.data(), false, done_id3);
-    // Lift the plan into a typed Meta and sink into the engine
-    // `JsonTagWriter`. `header_job` is always
-    // `HeaderJob::None` on this path (the chained caller owns SetFileType
-    // and any header tags); only main-tag stream + warn flag matters.
-    // Intra-APE composite suppression matches the engine entry `process`
-    // — cross-format composite resolution runs once below.
-    let mut meta = meta_from_plan(plan);
-    meta.composite_duration = None;
-    {
-      // Family-0 = "APE" pinned for the APE sink only (see `process` above).
-      ctx.writer().set_family0_override(Some(APE_GROUP0));
-      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv_enabled, ctx.writer());
-      ctx.writer().set_family0_override(None);
-    }
-    // Composite Duration emission via the shared helper (Codex r16
-    // finding): the trailer-only path MUST run Composite resolution
-    // because the wire-format APE trailer can carry the four
-    // ingredients directly (e.g. `Sample Rate=48000`, etc.). Bundled
-    // ExifTool runs `BuildCompositeTags` over the per-file VALUE hash
-    // at the end of ExtractInfo regardless of which parser provided
-    // the ingredients; our single-parser engine has no separate
-    // composite pass, so each parser emits its own composites at the
-    // end of `process*`.
-    emit_composite_duration_if_present(ctx, print_conv_enabled);
-    true
   }
 }
 
@@ -2780,8 +2478,20 @@ fn key_to_static_lookup(key: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_writer::JsonTagWriter;
+  use crate::tagmap::TagMap;
   use crate::value::Metadata;
+
+  // The engine path is now `crate::parser::extract_info`. `engine_obj` runs it
+  // and returns the parsed file object (replacing the retired
+  // `ProcessApe::process` + `TagMap` tests). `is_ape` checks finalization.
+  fn engine_obj(data: &[u8], print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.ape", data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  fn is_ape(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("File:FileType").and_then(|v| v.as_str()) == Some("APE")
+  }
 
   // ExifTool.pm:6866-6884 sub ConvertDuration:
   //   return $time unless IsFloat($time);
@@ -3044,23 +2754,27 @@ mod tests {
     for byte in data.iter_mut().skip(32) {
       *byte = 0xCC;
     }
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    let by_name: std::collections::HashMap<&str, &TagValue> = m
-      .tags()
-      .iter()
-      .filter(|t| t.group().family1() == "MAC")
-      .map(|t| (t.name(), t.value()))
-      .collect();
-    assert_eq!(by_name.get("APEVersion"), Some(&&TagValue::F64(3.97)));
-    assert_eq!(by_name.get("CompressionLevel"), Some(&&TagValue::I64(2500)));
-    assert_eq!(by_name.get("Channels"), Some(&&TagValue::I64(2)));
-    assert_eq!(by_name.get("SampleRate"), Some(&&TagValue::I64(48000)));
-    assert_eq!(by_name.get("TotalFrames"), Some(&&TagValue::I64(500)));
+    let obj = engine_obj(&data, true);
     assert_eq!(
-      by_name.get("FinalFrameBlocks"),
-      Some(&&TagValue::I64(65536))
+      obj.get("MAC:APEVersion").and_then(|v| v.as_f64()),
+      Some(3.97)
+    );
+    assert_eq!(
+      obj.get("MAC:CompressionLevel").and_then(|v| v.as_i64()),
+      Some(2500)
+    );
+    assert_eq!(obj.get("MAC:Channels").and_then(|v| v.as_i64()), Some(2));
+    assert_eq!(
+      obj.get("MAC:SampleRate").and_then(|v| v.as_i64()),
+      Some(48000)
+    );
+    assert_eq!(
+      obj.get("MAC:TotalFrames").and_then(|v| v.as_i64()),
+      Some(500)
+    );
+    assert_eq!(
+      obj.get("MAC:FinalFrameBlocks").and_then(|v| v.as_i64()),
+      Some(65536)
     );
   }
 
@@ -3210,20 +2924,11 @@ mod tests {
     assert_eq!(perl_numeric_coerce_f64("123Eabc"), 123.0);
   }
 
-  // The driver must reject short/non-APE inputs cleanly without pushing tags.
+  // The driver must reject short/non-APE inputs cleanly (no APE finalization).
   #[test]
   fn rejects_short_and_non_ape_inputs() {
-    let mut m = JsonTagWriter::new("x");
-    let too_short = [0u8; 31];
-    let mut c = ParseContext::new(&too_short, "APE", 0, "APE", None, true, &mut m);
-    assert!(!ProcessApe.process(&mut c));
-    assert!(m.tags().is_empty());
-
-    let mut m2 = JsonTagWriter::new("x");
-    let wrong_magic = [0xffu8; 32];
-    let mut c2 = ParseContext::new(&wrong_magic, "APE", 0, "APE", None, true, &mut m2);
-    assert!(!ProcessApe.process(&mut c2));
-    assert!(m2.tags().is_empty());
+    assert!(!is_ape(&engine_obj(&[0u8; 31], true)));
+    assert!(!is_ape(&engine_obj(&[0xffu8; 32], true)));
   }
 
   // key_to_static_lookup must funnel non-static keys to the empty string
@@ -3252,12 +2957,13 @@ mod tests {
     data[..8].copy_from_slice(b"APETAGEX");
     // version, then size = 0x80000000.
     data[12..16].copy_from_slice(&0x8000_0000_u32.to_le_bytes());
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
+    let obj = engine_obj(&data, true);
     // Bundled-ExifTool behaviour: File:* tags present + ExifTool:Warning.
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
-    assert!(m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"));
+    assert!(obj.contains_key("File:FileType"));
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Bad APE trailer")
+    );
   }
 
   // Footer present, declared body size exceeds available bytes ⇒
@@ -3278,10 +2984,11 @@ mod tests {
     // than the 32 bytes available before the footer).
     data[32..40].copy_from_slice(b"APETAGEX");
     data[32 + 12..32 + 16].copy_from_slice(&1024u32.to_le_bytes());
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    assert!(m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"));
+    let obj = engine_obj(&data, true);
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Bad APE trailer")
+    );
   }
 
   // Codex r2 finding 2: APE.pm:180-181 `$size -= 32` is SIGNED Perl
@@ -3300,11 +3007,9 @@ mod tests {
     data[..8].copy_from_slice(b"APETAGEX");
     data[12..16].copy_from_slice(&10u32.to_le_bytes()); // size_raw < 32
     data[16..20].copy_from_slice(&0u32.to_le_bytes()); // count = 0
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
+    let obj = engine_obj(&data, true);
     assert!(
-      m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"),
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()) == Some("Bad APE trailer"),
       "size_raw < 32 must trigger Bad APE trailer warning (APE.pm:180-181 signed arith)"
     );
   }
@@ -3320,10 +3025,11 @@ mod tests {
     data[32..40].copy_from_slice(b"APETAGEX");
     data[32 + 12..32 + 16].copy_from_slice(&5u32.to_le_bytes());
     data[32 + 16..32 + 20].copy_from_slice(&0u32.to_le_bytes());
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    assert!(m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"));
+    let obj = engine_obj(&data, true);
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Bad APE trailer")
+    );
   }
 
   // Codex r14 + r15: APE.pm subtracts 32 FIRST, then checks bit 31 on
@@ -3363,35 +3069,30 @@ mod tests {
   // semantics intact.
   #[test]
   fn apetagex_process_warns_on_invalid_sizes_small_fixture() {
-    fn run(size_raw: u32) -> Vec<String> {
+    fn warn(size_raw: u32) -> Option<String> {
       let mut data = vec![0u8; 32];
       data[..8].copy_from_slice(b"APETAGEX");
       data[12..16].copy_from_slice(&size_raw.to_le_bytes());
       data[16..20].copy_from_slice(&0u32.to_le_bytes()); // count = 0
-      let mut m = JsonTagWriter::new("x");
-      let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-      ProcessApe.process(&mut c);
-      m.warnings()
-        .iter()
-        .map(|s| s.as_str().to_string())
-        .collect()
+      engine_obj(&data, true)
+        .get("ExifTool:Warning")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
     }
     // Bit-31-rejected raws.
-    assert!(run(0x8000_0020).iter().any(|w| w == "Bad APE trailer"));
-    assert!(run(0xffff_ffff).iter().any(|w| w == "Bad APE trailer"));
-    // Bit-31-accepted but body unreadable in 32B fixture ⇒ HeaderInvalid
-    // via short-read path.
-    assert!(run(0x8000_0000).iter().any(|w| w == "Bad APE trailer"));
-    assert!(run(0x8000_001f).iter().any(|w| w == "Bad APE trailer"));
-    assert!(run(0x7fff_ffff).iter().any(|w| w == "Bad APE trailer"));
+    assert_eq!(warn(0x8000_0020).as_deref(), Some("Bad APE trailer"));
+    assert_eq!(warn(0xffff_ffff).as_deref(), Some("Bad APE trailer"));
+    // Bit-31-accepted but body unreadable in 32B fixture ⇒ HeaderInvalid.
+    assert_eq!(warn(0x8000_0000).as_deref(), Some("Bad APE trailer"));
+    assert_eq!(warn(0x8000_001f).as_deref(), Some("Bad APE trailer"));
+    assert_eq!(warn(0x7fff_ffff).as_deref(), Some("Bad APE trailer"));
     // Sub-32 values.
-    assert!(run(0x1f).iter().any(|w| w == "Bad APE trailer"));
+    assert_eq!(warn(0x1f).as_deref(), Some("Bad APE trailer"));
     // Exact-32: body_size==0; count==0 ⇒ silent (APE.pm:172 path).
-    let w32 = run(32);
-    assert!(
-      !w32.iter().any(|w| w == "Bad APE trailer"),
-      "raw=32 (body_size=0, count=0) must NOT emit warning, got: {:?}",
-      w32
+    assert_ne!(
+      warn(32).as_deref(),
+      Some("Bad APE trailer"),
+      "raw=32 (body_size=0, count=0) must NOT emit warning"
     );
   }
 
@@ -3441,17 +3142,13 @@ mod tests {
     let value = b"\0BINARY";
     // flags = 0x02 ⇒ binary tag (per APE.pm:214 `($flags & 0x06) == 0x02`).
     let data = build_single_tag_apetagex("Cover Art (Front)", value, 0x02);
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    // Locate the cover-art tag.
-    let cover = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "CoverArtFront")
-      .expect("CoverArtFront tag");
+    // Use the typed parse + TagMap (binary value preserved as Bytes).
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
     // Binary value MUST be "BINARY" (6 bytes), not "\0BINARY" (7 bytes).
-    match cover.value() {
+    match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => {
         assert_eq!(b.as_slice(), b"BINARY", "leading \\0 must be stripped");
         assert_eq!(b.len(), 6);
@@ -3460,7 +3157,7 @@ mod tests {
     }
     // NO Desc tag for an empty (falsey) description.
     assert!(
-      !m.tags().iter().any(|t| t.name() == "CoverArtFrontDesc"),
+      tm.get("APE", "CoverArtFrontDesc").is_none(),
       "empty Desc is falsey ⇒ no Desc tag"
     );
   }
@@ -3471,19 +3168,15 @@ mod tests {
     // boolean coercion ⇒ NO Desc tag. But strip still happens.
     let value = b"0\0BINARY";
     let data = build_single_tag_apetagex("Cover Art (Front)", value, 0x02);
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    let cover = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "CoverArtFront")
-      .expect("CoverArtFront tag");
-    match cover.value() {
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"BINARY"),
       other => panic!("expected Bytes, got {other:?}"),
     }
-    assert!(!m.tags().iter().any(|t| t.name() == "CoverArtFrontDesc"));
+    assert!(tm.get("APE", "CoverArtFrontDesc").is_none());
   }
 
   #[test]
@@ -3491,32 +3184,27 @@ mod tests {
     // Truthy Desc: "Foo\0BINARY". $1 = "Foo".
     let value = b"Foo\0BINARY";
     let data = build_single_tag_apetagex("Cover Art (Front)", value, 0x02);
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    let desc = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "CoverArtFrontDesc")
-      .expect("CoverArtFrontDesc tag");
-    assert_eq!(desc.value(), &TagValue::Str("Foo".into()));
-    let cover = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "CoverArtFront")
-      .expect("CoverArtFront tag");
-    match cover.value() {
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    assert_eq!(
+      tm.get("APE", "CoverArtFrontDesc"),
+      Some(&TagValue::Str("Foo".into()))
+    );
+    match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"BINARY"),
       other => panic!("expected Bytes, got {other:?}"),
     }
-    // Desc tag MUST appear BEFORE the CoverArtFront tag (APE.pm:225
-    // HandleTag is INSIDE the if-binary block BEFORE the outer
-    // HandleTag at APE.pm:229).
-    let desc_idx = m
-      .tags()
+    // Desc tag MUST appear BEFORE the CoverArtFront tag (APE.pm:225).
+    let desc_idx = tm
+      .entries()
       .iter()
-      .position(|t| t.name() == "CoverArtFrontDesc");
-    let cover_idx = m.tags().iter().position(|t| t.name() == "CoverArtFront");
+      .position(|(k, _)| k == "APE:CoverArtFrontDesc");
+    let cover_idx = tm
+      .entries()
+      .iter()
+      .position(|(k, _)| k == "APE:CoverArtFront");
     assert!(desc_idx < cover_idx);
   }
 
@@ -3609,24 +3297,9 @@ mod tests {
   // header tags.
   #[test]
   fn process_trailer_only_chained_parser_boundary() {
-    use crate::value::Group;
-    // Simulate a prior parser that ran SetFileType('MP3').
-    let mut m = JsonTagWriter::new("x");
-    m.push(
-      Group::new("File", "File"),
-      "FileType",
-      TagValue::Str("MP3".into()),
-    );
-    m.push(
-      Group::new("File", "File"),
-      "FileTypeExtension",
-      TagValue::Str("mp3".into()),
-    );
-    m.push(
-      Group::new("File", "File"),
-      "MIMEType",
-      TagValue::Str("audio/mpeg".into()),
-    );
+    // The trailer-only chained path is now the typed `parse_trailer_only_owned`
+    // (used by the MP3/MPC/WV typed chains). It extracts ONLY the APETAGEX
+    // trailer tags (the prior parser owns File:*); the typed Meta carries them.
 
     // Build payload: 64 bytes of "MP3 frames" + APETAGEX trailer.
     let mut data = Vec::new();
@@ -3652,26 +3325,23 @@ mod tests {
     data.extend_from_slice(&0u32.to_le_bytes());
     data.extend_from_slice(&[0u8; 8]);
 
-    let n_before = m.tags().len();
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", None, true, &mut m);
-    assert!(ProcessApe.process_trailer_only(&mut c));
-    let tags = m.tags();
-    // File:* preserved (the prior parser owns them).
-    assert!(
-      tags.iter().any(|t| t.name() == "FileType"
-        && t.group().family1() == "File"
-        && t.value() == &TagValue::Str("MP3".into())),
-      "prior parser's File:FileType=MP3 must be untouched"
+    let mut shared = SharedFlags::new();
+    let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // Exactly two APE:* trailer tags, in order, no File:*.
+    let names: Vec<&str> = tm
+      .entries()
+      .iter()
+      .filter_map(|(k, _)| k.strip_prefix("APE:"))
+      .collect();
+    assert_eq!(names, &["Title", "Artist"]);
+    assert_eq!(
+      tm.get("APE", "Title"),
+      Some(&TagValue::Str("Chained Title".into()))
     );
-    // Two new APE:* tags appended.
-    let new_tags: Vec<_> = tags.iter().skip(n_before).collect();
-    assert_eq!(new_tags.len(), 2, "exactly two trailer tags appended");
-    assert_eq!(new_tags[0].name(), "Title");
-    assert_eq!(new_tags[1].name(), "Artist");
-    assert_eq!(new_tags[0].group().family1(), "APE");
-    assert!(matches!(new_tags[0].value(), TagValue::Str(s) if s.as_str() == "Chained Title"));
     // No 'Bad APE trailer' warning.
-    assert!(!m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"));
+    assert!(tm.warnings().iter().all(|w| w != "Bad APE trailer"));
   }
 
   // Codex r16 finding: the trailer-only chained-parser path MUST also
@@ -3684,15 +3354,6 @@ mod tests {
   // `emit_composite_duration_if_present` helper.
   #[test]
   fn process_trailer_only_emits_composite_when_ingredients_in_trailer() {
-    use crate::value::Group;
-    let mut m = JsonTagWriter::new("x");
-    // Simulate prior MP3 parser.
-    m.push(
-      Group::new("File", "File"),
-      "FileType",
-      TagValue::Str("MP3".into()),
-    );
-
     fn tag_entry(key: &str, value: &[u8]) -> Vec<u8> {
       let mut e = Vec::new();
       e.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -3720,19 +3381,16 @@ mod tests {
     data.extend_from_slice(&0u32.to_le_bytes());
     data.extend_from_slice(&[0u8; 8]);
 
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", None, true, &mut m);
-    assert!(ProcessApe.process_trailer_only(&mut c));
-    // Composite:Duration MUST be present (14.71 s, as in the standalone
-    // APE_spaced_composite fixture — same arithmetic, same PrintConv).
-    let comp = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "Duration" && t.group().family0() == "Composite")
-      .expect("Composite:Duration from trailer-only chained call");
-    match comp.value() {
-      TagValue::Str(s) => assert_eq!(s.as_str(), "14.71 s"),
-      other => panic!("expected Str composite, got {:?}", other),
-    }
+    let mut shared = SharedFlags::new();
+    let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // Composite:Duration MUST be present (14.71 s — same arithmetic + PrintConv
+    // as the standalone APE_spaced_composite fixture).
+    assert_eq!(
+      tm.get("Composite", "Duration"),
+      Some(&TagValue::Str("14.71 s".into()))
+    );
   }
 
   // APE.pm:172: `$buff =~ /^APETAGEX/ or return 1` — no trailer at EOF ⇒
@@ -3747,149 +3405,24 @@ mod tests {
     // (no body), still falls through to the footer scan — which then
     // finds NO APETAGEX at the end.
     data[4..6].copy_from_slice(&3990u16.to_le_bytes());
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
+    let obj = engine_obj(&data, true);
     // File:* tags must exist.
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
+    assert!(obj.contains_key("File:FileType"));
     // NO 'Bad APE trailer' warning (faithful APE.pm:172 silent return).
     assert!(
-      !m.warnings().iter().any(|w| w.as_str() == "Bad APE trailer"),
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()) != Some("Bad APE trailer"),
       "no-trailer path must be silent (APE.pm:172 `return 1`)"
     );
   }
 
-  // Codex r5 finding: Composite Duration's `Require => 'APE:Name'`
-  // resolves against ANY tag whose family-0 is `APE` (the GroupMatches
-  // rule, ExifTool.pm:5207-5246). Earlier code hardcoded family-1=MAC,
-  // which would miss a SampleRate tag emitted by the Main table (group1
-  // would be APE, not MAC). Test by INJECTING a fake "SampleRate"
-  // (group1=APE) via Metadata::push directly, then verifying the
-  // composite lookup picks it up alongside MAC-sourced TotalFrames etc.
-  //
-  // NOTE: this is purely a robustness regression — the wire format
-  // doesn't actually carry `SampleRate` as an APE key (APE keys are
-  // user-facing names like Album/Artist/Year), so the only way to hit
-  // this path is by adversarial / synthetic injection. But the resolved
-  // FAITHFUL rule is family-0 match.
-  #[test]
-  fn composite_lookup_resolves_via_family0_apes_not_only_mac() {
-    use crate::value::Group;
-    let mut m = JsonTagWriter::new("x");
-    // File:FileType etc — pretend SetFileType already ran.
-    m.push(
-      Group::new("File", "File"),
-      "FileType",
-      TagValue::Str("APE".into()),
-    );
-    // Inject the 4 Composite ingredients with family-0=APE but
-    // family-1=APE (NOT MAC). Faithful Perl Require would still pick
-    // these up because GroupMatches('APE', ...) checks ALL families.
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "SampleRate",
-      TagValue::I64(48000),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "TotalFrames",
-      TagValue::I64(10),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "BlocksPerFrame",
-      TagValue::I64(73728),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "FinalFrameBlocks",
-      TagValue::I64(42662),
-    );
-    // Now feed a minimal APETAGEX-only-with-no-tags input to ProcessApe
-    // so the composite block runs against the already-populated metadata.
-    let mut data = vec![0u8; 32];
-    data[..8].copy_from_slice(b"APETAGEX");
-    data[12..16].copy_from_slice(&32u32.to_le_bytes()); // size == 32 ⇒ body_size==0
-    data[16..20].copy_from_slice(&0u32.to_le_bytes()); // count == 0
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    // Composite must be present — the family-0 lookup succeeded.
-    let comp = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "Duration" && t.group().family0() == "Composite")
-      .expect("Composite:Duration must be emitted via family-0 lookup");
-    // Verify it's a sensible duration value: ((10-1)*73728 + 42662)/48000
-    // = (663552 + 42662) / 48000 = 706214 / 48000 ≈ 14.71 — which is
-    // less than 30 seconds, so ConvertDuration uses the "%.2f s" form
-    // (ExifTool.pm:6872), not the h:m:s form.
-    if let TagValue::Str(s) = comp.value() {
-      assert_eq!(s.as_str(), "14.71 s");
-    } else {
-      panic!("expected Str composite, got {:?}", comp.value());
-    }
-  }
-
-  // Codex r8 finding: APE RawConv arithmetic runs Perl numeric coercion
-  // on each Composite ingredient ⇒ Str values must be accepted. The
-  // wire-format conformance fixture (APE_wire_composite_ingredients.ape)
-  // proves Perl does NOT emit a Composite for such inputs because
-  // MakeTag's `ucfirst lc` mangles the wire keys to `Samplerate`,
-  // `Totalframes`, etc. — not matching the `APE:SampleRate` Require. To
-  // exercise the Str-coercion code path itself we must inject tags with
-  // the CANONICAL ingredient names via Metadata::push (bypassing
-  // MakeTag); the lookup then finds them with Str values and Perl-coerces.
-  #[test]
-  fn composite_lookup_accepts_str_ingredients_perl_coerce() {
-    use crate::value::Group;
-    let mut m = JsonTagWriter::new("x");
-    m.push(
-      Group::new("File", "File"),
-      "FileType",
-      TagValue::Str("APE".into()),
-    );
-    // String-valued ingredients — Perl numeric coercion via the lookup
-    // closure must yield the same arithmetic as I64 variants.
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "SampleRate",
-      TagValue::Str("48000".into()),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "TotalFrames",
-      TagValue::Str("10".into()),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "BlocksPerFrame",
-      TagValue::Str("73728".into()),
-    );
-    m.push(
-      Group::new(APE_GROUP0, "APE"),
-      "FinalFrameBlocks",
-      TagValue::Str("42662".into()),
-    );
-    // Drive ProcessApe with a minimal APETAGEX header carrying no tag-
-    // stream entries so the composite block runs against pre-populated m.
-    let mut data = vec![0u8; 32];
-    data[..8].copy_from_slice(b"APETAGEX");
-    data[12..16].copy_from_slice(&32u32.to_le_bytes());
-    data[16..20].copy_from_slice(&0u32.to_le_bytes());
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
-    // Same arithmetic as the I64-only test: (10-1)*73728+42662 = 706214;
-    // /48000 = 14.71... ⇒ ConvertDuration's `%.2f s` form.
-    let comp = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "Duration" && t.group().family0() == "Composite")
-      .expect("Composite:Duration from Str ingredients");
-    match comp.value() {
-      TagValue::Str(s) => assert_eq!(s.as_str(), "14.71 s"),
-      other => panic!("expected Str composite, got {:?}", other),
-    }
-  }
+  // NOTE: the two `composite_lookup_*` engine tests (family-0 lookup +
+  // Str-coercion via external `Metadata::push` injection) were removed with
+  // the engine's cross-format Composite read-back (`emit_composite_duration_
+  // if_present`). The typed path computes Composite:Duration from the
+  // `ApeMeta`'s OWN header + wire main tags (`composite_duration_from_header_
+  // and_main`), covered by `APE_dup_override`/`APE_spaced_composite`
+  // conformance + `process_trailer_only_emits_composite_when_ingredients_in_
+  // trailer` above. Cross-format ingredient injection is a deferred item.
 
   // Codex r10 finding: ConvertDuration must handle huge finite values
   // by keeping the arithmetic in f64 (NV-style) and stringifying the
@@ -4265,23 +3798,22 @@ mod tests {
     data.extend_from_slice(&0u32.to_le_bytes()); // flags
     data.extend_from_slice(&[0u8; 8]); // reserved
     data.extend_from_slice(&tag_block);
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(&data, "APE", 0, "APE", None, true, &mut m);
-    assert!(ProcessApe.process(&mut c));
+    // Typed parse + TagMap (raw JPEG bytes preserved as Bytes).
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
     // Confirm CoverArtFront is emitted with the raw JPEG bytes intact.
-    let cover = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "CoverArtFront")
-      .expect("CoverArtFront must be emitted");
-    match cover.value() {
+    match tm
+      .get("APE", "CoverArtFront")
+      .expect("CoverArtFront must be emitted")
+    {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), payload),
       other => panic!("expected Bytes, got {other:?}"),
     }
     // Crucially: NO CoverArtFrontDesc emitted (refutes Codex r6 finding 1).
-    let has_desc = m.tags().iter().any(|t| t.name() == "CoverArtFrontDesc");
     assert!(
-      !has_desc,
+      tm.get("APE", "CoverArtFrontDesc").is_none(),
       "no CoverArtFrontDesc must appear (faithful to bundled Perl ExifTool \
        13.58 on the same fixture: only APE:CoverArtFront is emitted, no Desc)"
     );
@@ -4401,21 +3933,18 @@ mod tests {
 
   #[test]
   fn typed_sink_into_map_writer_emits_main_tags() {
-    use crate::sink::{MapTagWriter, MapValue};
+    use crate::tagmap::TagMap;
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta =
       <ProcessApe as FormatParser>::parse(&ProcessApe, ApeContext::new(&data, &mut shared))
         .expect("ok")
         .expect("parsed");
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     // Family-1 key is "APE" for main-tag emissions in the writer's
     // single-string `group` model.
-    assert_eq!(
-      w.get("APE", "Artist").map(MapValue::as_str),
-      Some("Tester".to_string())
-    );
+    assert_eq!(w.get_str("APE", "Artist"), Some("Tester".to_string()));
   }
 
   #[test]

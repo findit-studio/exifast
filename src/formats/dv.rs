@@ -6,13 +6,12 @@
 //!
 //! A typed [`DvMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! `process` drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! `process` drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 
 use crate::{
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
+  parser_new::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{TagValue, format_g},
 };
@@ -576,7 +575,7 @@ enum Parsed<'a> {
 /// plus the `Profile`/`VideoFormat`/`Colorimetry` `&'static str` slices
 /// borrowed from [`DV_PROFILES`]. PrintConv (`ConvertDuration`,
 /// `ConvertBitrate`, FrameRate rounding) is applied at emit time by
-/// [`MetaSinker::sink`] to mirror ExifTool's
+/// `serialize_tags` to mirror ExifTool's
 /// `$$self{OPTIONS}{PrintConv}` toggle.
 ///
 /// **D8 — no public fields, accessors only.**
@@ -892,16 +891,21 @@ fn parse_outcome(data: &[u8]) -> Option<DvParseOutcome<'static>> {
 // raw DIF-block view).
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for DvMeta<'_> {
+#[cfg(feature = "alloc")]
+impl DvMeta<'_> {
   /// Emit DV tags into the writer in `@dvTags` order (DV.pm:116-121) —
   /// faithful to the bundled-Perl iteration.
   ///
   /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "DV";
     for &tag_name in DV_TAGS {
       match tag_name {
@@ -999,42 +1003,9 @@ impl std::error::Error for DvError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessDv {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    let outcome: Option<DvParseOutcome<'static>> = {
-      let data = ctx.data();
-      parse_outcome(data)
-    };
-    match outcome {
-      None => false, // RejectEmpty / RejectNoDif / RejectShortDif
-      Some(DvParseOutcome::UnrecognizedProfile) => {
-        ctx.set_file_type(None, None, None); // DV.pm:173 (runs BEFORE the foreach)
-        ctx.writer().push_warning("Unrecognized DV profile"); // DV.pm:188
-        true
-      }
-      Some(DvParseOutcome::Meta(meta)) => {
-        ctx.set_file_type(None, None, None); // DV.pm:173
-        let print_conv = ctx.print_conv_enabled();
-        // Sink the typed `DvMeta` directly into the engine `JsonTagWriter`
-        // (`ctx.writer()`). Faithful to DV.pm:267-270
-        // `HandleTag` semantics — emits the same DV:* tags in the same
-        // order with the same PrintConv vs ValueConv toggling.
-        let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-        true // DV.pm:272 `return 1`
-      }
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{json_writer::JsonTagWriter, parser::ParseContext};
 
   #[test]
   fn profiles_and_tag_order_are_faithful() {
@@ -1167,40 +1138,40 @@ mod tests {
     assert_eq!(find_dif_start(b"\x00\x00\x00"), None);
   }
 
+  // The engine path is now `crate::parser::extract_info`. These tests run it
+  // and assert on the parsed JSON object, replacing the retired
+  // `ProcessDv::process` + `TagMap` tests.
+  fn engine_obj(data: &[u8], print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.dv", data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  /// `true` if the engine finalized the file as `DV`.
+  fn is_dv(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("File:FileType").and_then(|v| v.as_str()) == Some("DV")
+  }
+
   #[test]
   fn process_rejects_empty_buffer() {
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&[], "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&[], true)));
   }
 
   #[test]
   fn process_rejects_no_dif_header() {
-    let data = vec![0u8; 200];
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&vec![0u8; 200], true)));
   }
 
   #[test]
   fn process_rejects_when_dif_header_lacks_six_blocks() {
     // 4-byte magic at offset 0; len 4 ⇒ start+480 > 4 ⇒ DV.pm:171 reject.
-    let data = vec![0x1f, 0x07, 0x00, 0x3f];
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_dv(&engine_obj(&[0x1f, 0x07, 0x00, 0x3f], true)));
   }
 
   #[test]
   fn process_rejects_when_six_blocks_truncated() {
     let mut data = vec![0u8; 479];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(!ProcessDv.process(&mut c));
+    assert!(!is_dv(&engine_obj(&data, true)));
   }
 
   #[test]
@@ -1209,21 +1180,15 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x1f; // buff[start + 80*5 + 48 + 3]
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
+    let obj = engine_obj(&data, true);
     // File:* pushed (SetFileType BEFORE the warning, DV.pm:173).
+    assert!(is_dv(&obj));
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value()),
-      Some(&TagValue::Str("DV".into()))
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Unrecognized DV profile")
     );
-    assert_eq!(m.warnings(), &["Unrecognized DV profile"]);
-    // No DV:* tags pushed (the unrecognized-profile branch returns 1
-    // BEFORE the HandleTag loop).
-    assert!(m.tags().iter().all(|t| t.group().family1() != "DV"));
+    // No DV:* tags (the unrecognized-profile branch returns 1 before HandleTag).
+    assert!(!obj.keys().any(|k| k.starts_with("DV:")));
   }
 
   #[test]
@@ -1232,20 +1197,15 @@ mod tests {
     // forces an `a-f` letter in the hex sprintf — DV.pm:220-221 rejects.
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
-    // VAUX block 1 at offset 80 — block_type & 0xf0 == 0x50.
     data[80] = 0x50;
-    // Pack 0 (j=0): p = 80 + 0*5 + 3 = 83. pack_type = 0x62 (date).
     data[83] = 0x62;
-    // p+1=84 timezone (ignored); p+2..p+4 = d[1], d[2], d[3].
     data[84] = 0x00;
     data[85] = 0x05;
     data[86] = 0x12;
     data[87] = 0xaa; // sprintf("%.2x", 0xaa) = "aa" ⇒ contains a-f
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    assert!(!m.tags().iter().any(|t| t.name() == "DateTimeOriginal"));
-    assert!(m.tags().iter().any(|t| t.name() == "ImageWidth"));
+    let obj = engine_obj(&data, true);
+    assert!(!obj.contains_key("DV:DateTimeOriginal"));
+    assert!(obj.contains_key("DV:ImageWidth"));
   }
 
   #[test]
@@ -1254,29 +1214,16 @@ mod tests {
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x00;
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
+    let obj = engine_obj(&data, true);
     // FrameRate → 29.97 after PrintConv.
-    let fr = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FrameRate")
-      .expect("FrameRate emitted");
-    let n = match fr.value() {
-      TagValue::F64(n) => *n,
-      _ => panic!("FrameRate not F64"),
-    };
+    let n = obj
+      .get("DV:FrameRate")
+      .and_then(|v| v.as_f64())
+      .expect("FrameRate");
     assert!((n - 29.97).abs() < 1e-9, "got {n}");
     // -n: raw 30000/1001.
-    let mut m2 = JsonTagWriter::new("x.dv");
-    let mut c2 = ParseContext::new(&data, "DV", 0, "DV", None, false, &mut m2);
-    assert!(ProcessDv.process(&mut c2));
-    let fr2 = m2.tags().iter().find(|t| t.name() == "FrameRate").unwrap();
-    let n2 = match fr2.value() {
-      TagValue::F64(n) => *n,
-      _ => panic!("not F64"),
-    };
+    let obj2 = engine_obj(&data, false);
+    let n2 = obj2.get("DV:FrameRate").and_then(|v| v.as_f64()).unwrap();
     assert!((n2 - 30000.0 / 1001.0).abs() < 1e-12);
   }
 
@@ -1288,16 +1235,15 @@ mod tests {
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[4] = 0x01; // buff[4] & 0x07 == 1 (non-zero)
     data[451] = 0; // stype = 0
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    let vf = m.tags().iter().find(|t| t.name() == "VideoFormat").unwrap();
+    let obj = engine_obj(&data, true);
     assert_eq!(
-      vf.value(),
-      &TagValue::Str("SMPTE-314M - 625/50 (PAL)".into())
+      obj.get("DV:VideoFormat").and_then(|v| v.as_str()),
+      Some("SMPTE-314M - 625/50 (PAL)")
     );
-    let col = m.tags().iter().find(|t| t.name() == "Colorimetry").unwrap();
-    assert_eq!(col.value(), &TagValue::Str("4:1:1".into()));
+    assert_eq!(
+      obj.get("DV:Colorimetry").and_then(|v| v.as_str()),
+      Some("4:1:1")
+    );
   }
 
   #[test]
@@ -1307,11 +1253,12 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[451] = 0x1f;
-    let mut m = JsonTagWriter::new("x.dv");
-    let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(ProcessDv.process(&mut c));
-    assert_eq!(m.warnings(), &["Unrecognized DV profile"]);
-    assert!(m.tags().iter().all(|t| t.group().family1() != "DV"));
+    let obj = engine_obj(&data, true);
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Unrecognized DV profile")
+    );
+    assert!(!obj.keys().any(|k| k.starts_with("DV:")));
   }
 
   // ---------- Lib-first typed Meta surface --------------------------------
@@ -1351,7 +1298,7 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_typed_tags() {
-    use crate::sink::{MapTagWriter, MapValue};
+    use crate::tagmap::TagMap;
     // Construct a DvMeta directly so we don't depend on a fixture.
     let meta = DvMeta {
       date_time_original: Some("2024:01:15 12:30:45".to_string()),
@@ -1369,37 +1316,25 @@ mod tests {
       audio_bits_per_sample: Some(16),
     };
     // PrintConv on: ConvertDuration/ConvertBitrate strings, FrameRate rounded.
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("DV", "Duration"), Some("8.16 s".to_string()));
     assert_eq!(
-      w.get("DV", "Duration").map(MapValue::as_str),
-      Some("8.16 s".to_string())
-    );
-    assert_eq!(
-      w.get("DV", "TotalBitrate").map(MapValue::as_str),
+      w.get_str("DV", "TotalBitrate"),
       Some("28.8 Mbps".to_string())
     );
+    assert_eq!(w.get_str("DV", "FrameRate"), Some("25".to_string()));
+    assert_eq!(w.get_str("DV", "ImageWidth"), Some("720".to_string()));
     assert_eq!(
-      w.get("DV", "FrameRate").map(MapValue::as_str),
-      Some("25".to_string())
-    );
-    assert_eq!(
-      w.get("DV", "ImageWidth").map(MapValue::as_str),
-      Some("720".to_string())
-    );
-    assert_eq!(
-      w.get("DV", "VideoFormat").map(MapValue::as_str),
+      w.get_str("DV", "VideoFormat"),
       Some("IEC 61834 - 625/50 (PAL)".to_string())
     );
     // PrintConv off: raw scalars (Duration as f64, etc.).
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
+    assert_eq!(w.get_str("DV", "Duration"), Some("8.16".to_string()));
     assert_eq!(
-      w.get("DV", "Duration").map(MapValue::as_str),
-      Some("8.16".to_string())
-    );
-    assert_eq!(
-      w.get("DV", "TotalBitrate").map(MapValue::as_str),
+      w.get_str("DV", "TotalBitrate"),
       Some("28800000".to_string())
     );
   }

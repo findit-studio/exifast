@@ -7,8 +7,8 @@
 //! The parser produces a typed [`MoiMeta<'a>`] holding `jiff::civil::DateTime`
 //! / `core::time::Duration` / primitive integers via the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## What MOI is
@@ -40,8 +40,7 @@
 use core::time::Duration;
 use jiff::civil::DateTime;
 
-use crate::parser::ParseContext;
-use crate::parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed};
+use crate::parser_new::{FormatParser, parser_sealed};
 
 // ===========================================================================
 // Typed Meta — `MoiMeta<'a>`
@@ -586,19 +585,24 @@ fn parse_video_bitrate(b: &[u8]) -> VideoBitrate {
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → JSON / Metadata via `TagWriter`
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for MoiMeta<'_> {
+#[cfg(feature = "alloc")]
+impl MoiMeta<'_> {
   /// Emit MOI tags into the writer in MOI.pm sorted-offset order (faithful
   /// to ExifTool.pm:9907 `sort { $a <=> $b }` keyed iteration). Family-1
   /// group is `"MOI"` (the Perl module-name suffix).
   ///
   /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  /// See [`MetaSinker`]'s type-level docs for the rationale on this
+  /// See `serialize_tags`'s type-level docs for the rationale on this
   /// Phase E spec evolution.
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "MOI";
 
     // 0x00 MOIVersion — no conversions, identical under both modes.
@@ -768,47 +772,6 @@ impl std::error::Error for MoiError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessMoi {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and then drives [`MetaSinker::sink`] into the
-  /// engine [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the
-  /// serialized JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (MOI.pm:104-119): magic + filesize gate ⇒
-  /// `SetFileType` ⇒ binary walk. The `SetFileType` happens BEFORE
-  /// sinking the typed `Meta` so `File:*` lands first (the bundled
-  /// emission order under `-j -G1`).
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Run the new typed parser on the input bytes. The borrow lives
-    // through this call; we sink it before mutating `ctx`.
-    let bytes = ctx.data();
-    let meta = match parse_inner(bytes) {
-      Ok(Some(m)) => m,
-      Ok(None) => return false,
-      // No Rust-level fatal modes today; cover the arm to future-proof.
-      Err(_) => return false,
-    };
-    // MOI.pm:115 — `$et->SetFileType()`. No-arg ⇒ detected file type
-    // ("MOI"). This pushes File:FileType / File:FileTypeExtension /
-    // File:MIMEType under `("File", "File")` BEFORE the MOI:* tags
-    // (the bundled-Perl iteration order under `-j -G1`).
-    ctx.set_file_type(None, None, None);
-    // Sink the typed `MoiMeta` directly into the engine `JsonTagWriter`
-    // (`ctx.writer()`). Faithful to MOI.pm:117-118
-    // `ProcessBinaryData(...)` semantics — emits the same MOI:* tags
-    // in the same order with the same PrintConv vs ValueConv toggling.
-    let print_conv = ctx.print_conv_enabled();
-    // Sink the typed `MoiMeta` DIRECTLY into the engine `JsonTagWriter`
-    // (`ctx.writer()`) — no adapter bridge, no separate output push-bag.
-    // `JsonTagWriter::Error` is `Infallible`, so the call cannot fail.
-    // Faithful to MOI.pm:117-118 `ProcessBinaryData(...)`.
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    // MOI.pm:118 — `ProcessBinaryData` always returns 1 in the read path.
-    true
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -816,8 +779,7 @@ impl ProcessMoi {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_writer::JsonTagWriter;
-  use crate::sink::MapTagWriter;
+  use crate::tagmap::TagMap;
 
   // ---------- ValueConv helpers ------------------------------------------
 
@@ -1020,19 +982,19 @@ mod tests {
     assert!(parse_borrowed(&buf).unwrap().is_none());
   }
 
-  // ---------- MetaSinker (print_conv on / off) ---------------------------
+  // ---------- serialize_tags (print_conv on / off) ---------------------------
 
-  fn collect(buf: &[u8], print_conv: bool) -> MapTagWriter {
-    let mut w = MapTagWriter::new();
+  fn collect(buf: &[u8], print_conv: bool) -> TagMap {
+    let mut w = TagMap::new();
     let meta = parse_borrowed(buf).expect("ok").expect("parsed");
-    meta.sink(print_conv, &mut w).unwrap();
+    meta.serialize_tags(print_conv, &mut w).unwrap();
     w
   }
 
   #[test]
   fn sink_print_on_emits_formatted_tags() {
     let w = collect(&fixture_buffer(), true);
-    let g = |n: &str| w.get("MOI", n).map(crate::sink::MapValue::as_str);
+    let g = |n: &str| w.get_str("MOI", n);
     assert_eq!(g("MOIVersion"), Some("V6".into()));
     assert_eq!(
       g("DateTimeOriginal"),
@@ -1048,7 +1010,7 @@ mod tests {
   #[test]
   fn sink_print_off_emits_raw_scalars() {
     let w = collect(&fixture_buffer(), false);
-    let g = |n: &str| w.get("MOI", n).map(crate::sink::MapValue::as_str);
+    let g = |n: &str| w.get_str("MOI", n);
     assert_eq!(g("MOIVersion"), Some("V6".into()));
     assert_eq!(
       g("DateTimeOriginal"),
@@ -1068,15 +1030,12 @@ mod tests {
     b[0x84..0x86].copy_from_slice(&0xdeadu16.to_be_bytes());
     let on = collect(&b, true);
     assert_eq!(
-      on.get("MOI", "AudioCodec")
-        .map(crate::sink::MapValue::as_str),
+      on.get_str("MOI", "AudioCodec"),
       Some("Unknown (0xdead)".into())
     );
     let off = collect(&b, false);
     assert_eq!(
-      off
-        .get("MOI", "AudioCodec")
-        .map(crate::sink::MapValue::as_str),
+      off.get_str("MOI", "AudioCodec"),
       Some("57005".into()) // 0xdead
     );
   }
@@ -1090,114 +1049,108 @@ mod tests {
     b[0xda..0xdc].copy_from_slice(&0xbeefu16.to_be_bytes());
     let on = collect(&b, true);
     assert_eq!(
-      on.get("MOI", "VideoBitrate")
-        .map(crate::sink::MapValue::as_str),
+      on.get_str("MOI", "VideoBitrate"),
       Some("Unknown (0xbeef)".into())
     );
     let off = collect(&b, false);
     assert_eq!(
-      off
-        .get("MOI", "VideoBitrate")
-        .map(crate::sink::MapValue::as_str),
+      off.get_str("MOI", "VideoBitrate"),
       Some("Unknown (0xbeef)".into())
     );
   }
 
-  // ---------- Engine entry (`process`) -----------------------------------
+  // ---------- Engine entry (`extract_info`) ------------------------------
+  // The engine path is now `crate::parser::extract_info`. These tests run it
+  // and assert on the parsed JSON object (replacing the retired
+  // `ProcessMoi::process` + `TagMap` tests).
 
-  fn run_bridge(data: &[u8], print_on: bool) -> JsonTagWriter {
-    let mut m = JsonTagWriter::new("MOI.moi");
-    let mut c = ParseContext::new(data, "MOI", 0, "MOI", None, print_on, &mut m);
-    ProcessMoi.process(&mut c);
-    m
+  fn engine_obj(data: &[u8], print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("MOI.moi", data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
   }
 
   #[test]
-  fn bridge_fixture_round_trip_print_on() {
-    let m = run_bridge(&fixture_buffer(), true);
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-    };
-    use crate::value::TagValue;
-    assert_eq!(by_name("FileType"), Some(TagValue::Str("MOI".into())));
-    assert_eq!(by_name("MOIVersion"), Some(TagValue::Str("V6".into())));
+  fn engine_fixture_round_trip_print_on() {
+    let obj = engine_obj(&fixture_buffer(), true);
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    assert_eq!(s("File:FileType"), Some("MOI"));
+    assert_eq!(s("MOI:MOIVersion"), Some("V6"));
+    assert_eq!(s("MOI:DateTimeOriginal"), Some("2011:05:15 17:58:48.000"));
+    assert_eq!(s("MOI:Duration"), Some("8.16 s"));
+    assert_eq!(s("MOI:AspectRatio"), Some("4:3 PAL"));
+    assert_eq!(s("MOI:AudioCodec"), Some("AC3"));
+    assert_eq!(s("MOI:AudioBitrate"), Some("224 kbps"));
+    assert_eq!(s("MOI:VideoBitrate"), Some("8.5 Mbps"));
+  }
+
+  #[test]
+  fn engine_fixture_round_trip_print_off() {
+    let obj = engine_obj(&fixture_buffer(), false);
     assert_eq!(
-      by_name("DateTimeOriginal"),
-      Some(TagValue::Str("2011:05:15 17:58:48.000".into()))
-    );
-    assert_eq!(by_name("Duration"), Some(TagValue::Str("8.16 s".into())));
-    assert_eq!(
-      by_name("AspectRatio"),
-      Some(TagValue::Str("4:3 PAL".into()))
-    );
-    assert_eq!(by_name("AudioCodec"), Some(TagValue::Str("AC3".into())));
-    assert_eq!(
-      by_name("AudioBitrate"),
-      Some(TagValue::Str("224 kbps".into()))
+      obj.get("MOI:MOIVersion").and_then(|v| v.as_str()),
+      Some("V6")
     );
     assert_eq!(
-      by_name("VideoBitrate"),
-      Some(TagValue::Str("8.5 Mbps".into()))
+      obj.get("MOI:DateTimeOriginal").and_then(|v| v.as_str()),
+      Some("2011:05:15 17:58:48.000")
+    );
+    // -n raw scalars: bare numbers in the JSON.
+    assert_eq!(obj.get("MOI:Duration").and_then(|v| v.as_f64()), Some(8.16));
+    assert_eq!(
+      obj.get("MOI:AspectRatio").and_then(|v| v.as_u64()),
+      Some(0x51)
+    );
+    assert_eq!(
+      obj.get("MOI:AudioCodec").and_then(|v| v.as_u64()),
+      Some(0x00c1)
+    );
+    assert_eq!(
+      obj.get("MOI:AudioBitrate").and_then(|v| v.as_u64()),
+      Some(224_000)
+    );
+    assert_eq!(
+      obj.get("MOI:VideoBitrate").and_then(|v| v.as_u64()),
+      Some(8_500_000)
     );
   }
 
   #[test]
-  fn bridge_fixture_round_trip_print_off() {
-    let m = run_bridge(&fixture_buffer(), false);
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-    };
-    use crate::value::TagValue;
-    assert_eq!(by_name("MOIVersion"), Some(TagValue::Str("V6".into())));
-    assert_eq!(
-      by_name("DateTimeOriginal"),
-      Some(TagValue::Str("2011:05:15 17:58:48.000".into()))
+  fn engine_rejects_short_buffer() {
+    let obj = engine_obj(&[], true);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MOI")
     );
-    assert_eq!(by_name("Duration"), Some(TagValue::F64(8.16)));
-    // -n raw integers emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1).
-    assert_eq!(by_name("AspectRatio"), Some(TagValue::U64(0x51)));
-    assert_eq!(by_name("AudioCodec"), Some(TagValue::U64(0x00c1)));
-    assert_eq!(by_name("AudioBitrate"), Some(TagValue::U64(224_000)));
-    assert_eq!(by_name("VideoBitrate"), Some(TagValue::U64(8_500_000)));
   }
 
   #[test]
-  fn bridge_rejects_short_buffer() {
-    let mut m = JsonTagWriter::new("X.moi");
-    let mut c = ParseContext::new(&[], "MOI", 0, "MOI", None, true, &mut m);
-    assert!(!ProcessMoi.process(&mut c));
-    assert!(m.tags().is_empty());
-  }
-
-  #[test]
-  fn bridge_rejects_filesize_mismatch() {
+  fn engine_rejects_filesize_mismatch() {
     let mut buf = vec![0u8; 320];
     buf[0] = b'V';
     buf[1] = b'6';
     buf[2..6].copy_from_slice(&999u32.to_be_bytes());
-    let mut m = JsonTagWriter::new("X.moi");
-    let mut c = ParseContext::new(&buf, "MOI", 0, "MOI", None, true, &mut m);
-    assert!(!ProcessMoi.process(&mut c));
-    // SetFileType is NOT called on a reject (faithful to MOI.pm:114 `or
-    // return 0` BEFORE :115 `SetFileType()`).
-    assert!(m.tags().is_empty());
+    let obj = engine_obj(&buf, true);
+    // SetFileType is NOT called on a reject (MOI.pm:114 `or return 0` BEFORE
+    // :115 `SetFileType()`) ⇒ no MOI File:FileType.
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MOI")
+    );
   }
 
   #[test]
-  fn bridge_emits_tags_in_ascending_offset_order() {
-    // Faithful to ExifTool.pm:9907 sorted-key walk.
-    let m = run_bridge(&fixture_buffer(), true);
-    let format_names: std::vec::Vec<&str> = m
-      .tags()
+  fn engine_emits_tags_in_ascending_offset_order() {
+    // Faithful to ExifTool.pm:9907 sorted-key walk. Order is preserved by the
+    // typed `serialize_tags` -> `TagMap` entry order (the JSON object loses it).
+    let buf = fixture_buffer();
+    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let format_names: std::vec::Vec<&str> = tm
+      .entries()
       .iter()
-      .filter(|t| t.group().family1() == "MOI")
-      .map(crate::value::Tag::name)
+      .filter_map(|(k, _)| k.strip_prefix("MOI:"))
       .collect();
     assert_eq!(
       format_names,

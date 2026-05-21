@@ -277,7 +277,7 @@ fn extract_field(
       // U64) so the SetFrameState slot (`if let TagValue::I64`, below) and
       // the Condition `==`/`!=` integer comparisons still see these values
       // — the no-format path's existing, tested contract (Codex A-R4-1 is
-      // scoped to `JsonTagWriter::write_u64`, not this UV accumulator).
+      // scoped to `TagMap::write_u64`, not this UV accumulator).
       Acc::U(v) if v <= i64::MAX as u64 => TagValue::I64(v as i64),
       // u64 mode > i64::MAX ⇒ exact decimal string (Perl UV stringifies
       // as exact integer); the serializer's number gate quotes ≥16-digit

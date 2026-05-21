@@ -9,8 +9,8 @@
 //!
 //! A typed [`AiffMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Notable deferrals (in-code) — Phase-2 forward-items
@@ -55,11 +55,10 @@
 use crate::{
   charset::decode_macroman,
   datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_duration, convert_unix_time},
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
+  parser_new::{FormatParser, parser_sealed},
   processbinarydata::process_binary_data,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
-  value::{Group, Metadata, TagValue, perl_nonfinite_str},
+  value::{Metadata, TagValue, perl_nonfinite_str},
 };
 use std::{
   string::{String, ToString},
@@ -422,7 +421,7 @@ impl AiffSampleRate {
 
 /// `%AIFF::Common`'s `CompressionType` post-decode shape (AIFC only).
 /// AIFF.pm:95-110 PrintConv hash. The on-disk bytes are a fixed 4-byte
-/// string; we stash the raw 4-byte tag here so [`MetaSinker`] can
+/// string; we stash the raw 4-byte tag here so `serialize_tags` can
 /// re-apply the PrintConv hash lookup at sink time.
 ///
 /// Codex R3 — the on-disk byte string may carry HIGH bytes (e.g. `\x80ABC`);
@@ -447,7 +446,7 @@ pub enum AiffCompressionType {
 
 /// One `%AIFF::Comment` entry. AIFF.pm:155-178 walks `numComments` × (time
 /// u32, markerID u16, size u16, text<size>); we capture the post-ValueConv
-/// outputs per comment so [`MetaSinker`] can re-emit in the same order
+/// outputs per comment so `serialize_tags` can re-emit in the same order
 /// the chunk loop produced them.
 ///
 /// `comment_time` is the post-ValueConv `ConvertUnixTime` formatted string
@@ -547,7 +546,7 @@ impl AiffCommon {
 
 /// One chronological emission entry. The chunk loop produces these in the
 /// order encountered in the file; [`AiffMeta::events`] preserves that
-/// order so [`MetaSinker::sink`] emits byte-exact-to-Perl iteration.
+/// order so `serialize_tags` emits byte-exact-to-Perl iteration.
 ///
 /// Each variant is the smallest typed shape sufficient to re-emit with
 /// PrintConv toggled at sink time.
@@ -1282,10 +1281,11 @@ fn tag_str_to_static(s: &str) -> &'static str {
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for AiffMeta<'_> {
+#[cfg(feature = "alloc")]
+impl AiffMeta<'_> {
   /// Emit AIFF tags into the writer in faithful chunk-order plus the
   /// post-loop Composite Duration. `print_conv = true` ⇒ PrintConv
   /// formatted strings (`-j` mode); `print_conv = false` ⇒ post-ValueConv
@@ -1295,7 +1295,11 @@ impl MetaSinker for AiffMeta<'_> {
   /// File:* triplet from SetFileType (driven outside this sink path by
   /// the legacy bridge). The (multi-page) suffix is handled by the
   /// bridge re-rewriting File:FileType.
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "AIFF";
 
     if self.magic == AiffMagic::Djvu {
@@ -1362,11 +1366,12 @@ impl MetaSinker for AiffMeta<'_> {
   }
 }
 
-fn sink_common<W: TagWriter>(
-  out: &mut W,
+#[cfg(feature = "alloc")]
+fn sink_common(
+  out: &mut crate::tagmap::TagMap,
   c: &AiffCommon,
   print_conv: bool,
-) -> Result<(), W::Error> {
+) -> Result<(), core::convert::Infallible> {
   const GROUP: &str = "AIFF";
   // ExifTool.pm:9907 `sort { $a <=> $b }` iteration order — keys are
   // 0, 1, 3, 4, 9, 11. Each tag is emitted exactly as
@@ -1423,18 +1428,23 @@ fn sink_common<W: TagWriter>(
   Ok(())
 }
 
-fn sink_compressor_name<W: TagWriter>(
-  out: &mut W,
+#[cfg(feature = "alloc")]
+fn sink_compressor_name(
+  out: &mut crate::tagmap::TagMap,
   c: &AiffCommon,
   _print_conv: bool,
-) -> Result<(), W::Error> {
+) -> Result<(), core::convert::Infallible> {
   if let Some(name) = &c.compressor_name {
     out.write_str("AIFF", "CompressorName", name)?;
   }
   Ok(())
 }
 
-fn sink_sample_rate<W: TagWriter>(out: &mut W, sr: &AiffSampleRate) -> Result<(), W::Error> {
+#[cfg(feature = "alloc")]
+fn sink_sample_rate(
+  out: &mut crate::tagmap::TagMap,
+  sr: &AiffSampleRate,
+) -> Result<(), core::convert::Infallible> {
   // Spec §8: extended → I64 (Perl IV), F64 (Perl NV), or Str("<decimal>")
   // (Perl UV path, > i64::MAX positive). The writer routes:
   //   - I64 ⇒ bare number JSON (write_i64)
@@ -1455,7 +1465,11 @@ fn sink_sample_rate<W: TagWriter>(out: &mut W, sr: &AiffSampleRate) -> Result<()
   }
 }
 
-fn sink_comment<W: TagWriter>(out: &mut W, c: &AiffComment) -> Result<(), W::Error> {
+#[cfg(feature = "alloc")]
+fn sink_comment(
+  out: &mut crate::tagmap::TagMap,
+  c: &AiffComment,
+) -> Result<(), core::convert::Infallible> {
   const GROUP: &str = "AIFF";
   // AIFF.pm:169 — CommentTime always emitted. PrintConv is identity
   // (ConvertDateTime under default options).
@@ -1494,49 +1508,6 @@ impl std::error::Error for AiffError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessAiff {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (AIFF.pm:184-273):
-  ///   1. Magic + header gate (AIFF.pm:191, 199, 209) — reject as `false`.
-  ///   2. `SetFileType` (AIFF.pm:202 / 210) with the magic-derived `$1`.
-  ///   3. DjVu multi-page File:FileType suffix (AIFF.pm:206).
-  ///   4. Chunk loop emission via `MetaSinker::sink`.
-  ///   5. Composite Duration appended post-loop.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    let bytes = ctx.data();
-    let meta = match parse_inner(bytes) {
-      Ok(Some(m)) => m,
-      Ok(None) => return false,
-      Err(_) => return false,
-    };
-    // AIFF.pm:202 / 210 `SetFileType($1)` — pass the AIFF/AIFC/DJVU
-    // string explicitly.
-    let ft = meta.magic.as_file_type();
-    ctx.set_file_type(Some(ft), None, None);
-
-    // DjVu multi-page suffix (AIFF.pm:206). Done on the bridge side
-    // because it mutates File:FileType directly (not a sinked tag).
-    if meta.djvm_multi_page {
-      let file_grp = Group::new("File", "File");
-      ctx.writer().set_tag_value(
-        &file_grp,
-        "FileType",
-        TagValue::Str("DJVU (multi-page)".into()),
-      );
-    }
-    // Sink the typed Meta into Metadata via the bridge writer.
-    let print_conv = ctx.print_conv_enabled();
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    // AIFF.pm:272 `return 1` — once SetFileType ran the parser accepts.
-    true
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1544,7 +1515,6 @@ impl ProcessAiff {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{json_writer::JsonTagWriter, parser::ParseContext};
 
   #[test]
   fn main_table_and_keys_resolve_per_aiff_pm() {
@@ -1592,89 +1562,86 @@ mod tests {
     assert_eq!(entries[10], ("GSM ", PrintValue::Str("GSM")));
   }
 
+  // The engine path is now `crate::parser::extract_info`. These run it and
+  // assert on the parsed JSON object (replacing the retired `ProcessAiff::process`
+  // + `TagMap` tests).
+  fn engine_obj(name: &str, data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info(name, data, true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  /// `true` if the engine finalized a File:FileType in the AIFF family
+  /// (AIFF/AIFC/DJVU/DJVU (multi-page)).
+  fn aiff_typed(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    matches!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AIFF" | "AIFC" | "DJVU" | "DJVU (multi-page)")
+    )
+  }
+
   #[test]
   fn rejects_non_form_data() {
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(b"NOFORMxxxAIFF", "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(!ProcessAiff.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!aiff_typed(&engine_obj("x", b"NOFORMxxxAIFF")));
   }
 
   #[test]
   fn rejects_short_data() {
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(b"FORM\x00\x00", "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(!ProcessAiff.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!aiff_typed(&engine_obj("x", b"FORM\x00\x00")));
   }
 
   #[test]
   fn djvu_signature_sets_file_type_and_accepts_with_no_body_tags() {
-    let mut m = JsonTagWriter::new("x.djvu");
-    let mut c = ParseContext::new(b"AT&TFORMxxxxDJVU", "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("DJVU".into()));
-    let body_names: Vec<&str> = m
-      .tags()
-      .iter()
-      .map(|t| t.name())
-      .filter(|n| {
-        !matches!(
-          *n,
-          "ExifToolVersion" | "FileType" | "FileTypeExtension" | "MIMEType"
-        )
-      })
-      .collect();
-    assert!(
-      body_names.is_empty(),
-      "no body tags allowed: {body_names:?}"
+    let obj = engine_obj("x.djvu", b"AT&TFORMxxxxDJVU");
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DJVU")
     );
+    // No body tags (only SourceFile + ExifTool:* + File:*).
+    let body: Vec<&String> = obj
+      .keys()
+      .filter(|k| *k != "SourceFile" && !k.starts_with("ExifTool:") && !k.starts_with("File:"))
+      .collect();
+    assert!(body.is_empty(), "no body tags allowed: {body:?}");
   }
 
   #[test]
   fn at_t_form_without_djvu_djvm_rejects() {
-    let mut m = JsonTagWriter::new("x");
-    let mut c = ParseContext::new(b"AT&TFORMxxxxFOOO", "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(!ProcessAiff.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!aiff_typed(&engine_obj("x", b"AT&TFORMxxxxFOOO")));
   }
 
   #[test]
   fn djvm_signature_appends_multi_page_suffix_to_file_type() {
-    let mut m = JsonTagWriter::new("x.djvu");
-    let mut c = ParseContext::new(b"AT&TFORMxxxxDJVM", "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("DJVU (multi-page)".into()));
-    let fte = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FileTypeExtension")
-      .unwrap();
-    assert_eq!(fte.value(), &TagValue::Str("djvu".into()));
-    let mime = m.tags().iter().find(|t| t.name() == "MIMEType").unwrap();
-    assert_eq!(mime.value(), &TagValue::Str("image/vnd.djvu".into()));
+    let obj = engine_obj("x.djvu", b"AT&TFORMxxxxDJVM");
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DJVU (multi-page)")
+    );
+    assert_eq!(
+      obj.get("File:FileTypeExtension").and_then(|v| v.as_str()),
+      Some("djvu")
+    );
+    assert_eq!(
+      obj.get("File:MIMEType").and_then(|v| v.as_str()),
+      Some("image/vnd.djvu")
+    );
   }
 
   #[test]
   fn aiff_minimal_header_accepts_and_sets_file_type() {
-    let mut m = JsonTagWriter::new("x.aif");
-    let data = b"FORM\x00\x00\x00\x04AIFF";
-    let mut c = ParseContext::new(data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("AIFF".into()));
+    let obj = engine_obj("x.aif", b"FORM\x00\x00\x00\x04AIFF");
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AIFF")
+    );
   }
 
   #[test]
   fn aifc_magic_sets_file_type_aifc() {
-    let mut m = JsonTagWriter::new("x.aifc");
-    let data = b"FORM\x00\x00\x00\x04AIFC";
-    let mut c = ParseContext::new(data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("AIFC".into()));
+    let obj = engine_obj("x.aifc", b"FORM\x00\x00\x00\x04AIFC");
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AIFC")
+    );
   }
 
   /// Synthesize an AIFF stream with `n_empty` zero-length unknown chunks.
@@ -1690,36 +1657,29 @@ mod tests {
   #[test]
   fn empty_chunk_streak_below_threshold_does_not_abort() {
     // Perl `for ($n=0;;++$n)` cadence: 50 empties from $n=0 ⇒ no abort.
-    let mut m = JsonTagWriter::new("x.aif");
-    let data = aiff_with_n_empty_chunks(50);
-    let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
+    let obj = engine_obj("x.aif", &aiff_with_n_empty_chunks(50));
     assert!(
-      !m.warnings().iter().any(|w| w.contains("Aborting scan")),
-      "warnings: {:?}",
-      m.warnings()
+      obj
+        .get("ExifTool:Warning")
+        .and_then(|v| v.as_str())
+        .is_none_or(|w| !w.contains("Aborting scan")),
+      "warning: {:?}",
+      obj.get("ExifTool:Warning")
     );
   }
 
   #[test]
   fn empty_chunk_streak_at_threshold_aborts_at_perl_iter_51() {
     // 51 consecutive empty chunks from $n=0 ⇒ Warn + last.
-    let mut m = JsonTagWriter::new("x.aif");
-    let data = aiff_with_n_empty_chunks(60);
-    let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    assert!(
-      m.warnings()
-        .iter()
-        .any(|w| w == "Aborting scan.  Too many empty chunks"),
-      "expected the abort warning; got: {:?}",
-      m.warnings()
+    let obj = engine_obj("x.aif", &aiff_with_n_empty_chunks(60));
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Aborting scan.  Too many empty chunks")
     );
   }
 
   #[test]
   fn id3_chunk_recognized_then_silently_skipped() {
-    let mut m = JsonTagWriter::new("x.aif");
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(b"FORM");
     let body_inner = b"ID3 \x00\x00\x00\x04ID3v";
@@ -1727,19 +1687,17 @@ mod tests {
     data.extend_from_slice(&(total as u32).to_be_bytes());
     data.extend_from_slice(b"AIFF");
     data.extend_from_slice(body_inner);
-    let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
+    let obj = engine_obj("x.aif", &data);
+    assert!(obj.contains_key("File:FileType"));
     assert!(
-      m.tags().iter().all(|t| t.group().family1() != "AIFF"),
+      !obj.keys().any(|k| k.starts_with("AIFF:")),
       "no AIFF:* tags expected from silent ID3 skip"
     );
-    assert!(m.warnings().is_empty(), "warnings: {:?}", m.warnings());
+    assert!(!obj.contains_key("ExifTool:Warning"));
   }
 
   #[test]
   fn composite_duration_emitted_when_both_inputs_nonzero() {
-    let mut m = JsonTagWriter::new("x.aif");
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(b"FORM");
     // COMM with SampleRate=22050, NumSampleFrames=44100.
@@ -1756,30 +1714,23 @@ mod tests {
     let body = [b"AIFF".as_slice(), &comm_chunk].concat();
     data.extend_from_slice(&(body.len() as u32).to_be_bytes());
     data.extend_from_slice(&body);
-    let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
-    let dur = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "Duration" && t.group().family1() == "Composite")
-      .expect("Composite:Duration emitted");
-    assert_eq!(dur.value(), &TagValue::Str("2.00 s".into()));
+    let obj = engine_obj("x.aif", &data);
+    assert_eq!(
+      obj.get("Composite:Duration").and_then(|v| v.as_str()),
+      Some("2.00 s")
+    );
   }
 
   #[test]
   fn composite_duration_skipped_when_sample_rate_zero() {
-    let mut m = JsonTagWriter::new("x.aif");
     let data = std::fs::read(format!(
       "{}/tests/fixtures/AIFF.aif",
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFF.aif fixture");
-    let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
-    assert!(ProcessAiff.process(&mut c));
+    let obj = engine_obj("x.aif", &data);
     assert!(
-      m.tags()
-        .iter()
-        .all(|t| !(t.name() == "Duration" && t.group().family1() == "Composite")),
+      !obj.contains_key("Composite:Duration"),
       "Composite:Duration must NOT be emitted when SampleRate=0"
     );
   }

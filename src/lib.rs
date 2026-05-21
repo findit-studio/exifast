@@ -93,28 +93,26 @@ pub mod formats;
 // the `json` feature (`json = ["serde", "alloc", "dep:serde_json", "dep:serde"]`).
 // Library callers without `json` get the typed-Meta API path only; the optional
 // `serde` feature alone provides the `Serialize` impls (TagValue / `Rendered`).
-// The engine's `$$et` value sink: a `TagWriter` that buffers a `Vec<Tag>`
-// (cross-format `$$et` state, FoundTag last-wins, family0-override). Gated on
-// `alloc` because the always-compiled parser/format engine emits through it.
-// Its terminal `finish()` render is `json`-gated (standard `serde_json` via
-// [`serialize::render_document`]) — the COLLECTION surface is serde-free; only
-// the final JSON render needs `json`.
-#[cfg(feature = "alloc")]
-pub mod json_writer;
 #[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
 // The lib-first `FormatParser` trait scaffold + closed-set `AnyParser` /
 // `AnyMeta` dispatch — the SOLE parser architecture. The engine entry
 // `parser::extract_info` routes through `any_parser_for(ft) ->
-// AnyParser::extract_into`; the byte-exact conformance suite validates the
-// typed path directly.
+// AnyParser::parse_any`; each typed Meta's `serialize_tags` renders into a
+// `tagmap::TagMap`, then serde-renders. The byte-exact conformance suite
+// validates the typed path directly.
 pub mod parser_new;
 pub mod processbinarydata;
 pub mod reader;
 #[cfg(feature = "json")]
 pub mod serialize;
-pub mod sink;
+// The single inline tag-collection sink the typed-Meta rendering path emits
+// into (replaces the removed `TagWriter`/`MetaSinker` trait pair and the
+// `JsonTagWriter`/`MapTagWriter` collectors). `pub(crate)`, `alloc`-gated so
+// the `serde`-only `Rendered` wrapper can use it without `serde_json`.
+#[cfg(feature = "alloc")]
+pub(crate) mod tagmap;
 pub mod tagtable;
 pub mod value;
 
@@ -134,7 +132,7 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use parser_new::Rendered;
-pub use parser_new::{AnyError, AnyMeta, AnyParser, MetaSinker, SharedFlags, TagWriter};
+pub use parser_new::{AnyError, AnyMeta, AnyParser, FileTypeFinalize, SharedFlags};
 
 // Per-format public typed re-exports. Each module's `XxxMeta<'a>` + accessor
 // methods are the lib-first surface; the `ProcessXxx` unit-struct is the
@@ -324,8 +322,7 @@ pub fn parse_r3d(bytes: &[u8]) -> core::result::Result<Option<R3dMeta<'_>>, R3dE
 ///
 /// `print_conv = true` stages the tags in `-j` PrintConv mode (e.g. ID3v1
 /// Genre `"Hip-Hop"`); `false` stages in `-n` post-ValueConv raw mode
-/// (e.g. Genre `7`). The returned Meta must be sinked in the same mode
-/// (see the [`MetaSinker`] impl for `Id3Meta`).
+/// (e.g. Genre `7`). One parse stages BOTH lists; the renderer picks by mode.
 ///
 /// # Errors
 ///
@@ -551,8 +548,6 @@ mod tests {
   #[test]
   #[cfg(all(feature = "ogg", feature = "mp3", feature = "json"))]
   fn parse_bytes_id3_prefixed_ogg_dispatches_to_ogg_not_mp3() {
-    use crate::json_writer::JsonTagWriter;
-    use crate::parser_new::MetaSinker;
     let data = std::fs::read(concat!(
       env!("CARGO_MANIFEST_DIR"),
       "/tests/fixtures/ogg_id3_prefixed.ogg"
@@ -568,26 +563,21 @@ mod tests {
       matches!(meta, AnyMeta::Ogg(_)),
       "ID3-prefixed Ogg must dispatch to AnyMeta::Ogg, not {meta:?}"
     );
-    // Content check: sinking the post-ID3 Ogg stream yields the SAME Vorbis
-    // tags bundled `perl exiftool` reports (e.g. Vorbis:Artist "Who Knows"),
-    // proving the ID3v2 prefix was correctly skipped and the real Ogg-Vorbis
-    // stream parsed (byte-exact-equivalent to bundled, verified manually).
-    let mut w = JsonTagWriter::new("ogg_id3_prefixed.ogg");
-    meta.sink(true, &mut w).expect("sink is infallible");
-    let json = w.finish();
-    // serde emits keys without a space after `:`; check by value via the
-    // parsed document (the key tokens themselves are spacing-independent).
-    let doc: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-    let obj = doc[0].as_object().expect("file object");
+    // Content check: serde-rendering the post-ID3 Ogg stream (the public typed
+    // `Rendered` serde view) yields the SAME Vorbis tags bundled `perl exiftool`
+    // reports (e.g. Vorbis:Artist "Who Knows"), proving the ID3v2 prefix was
+    // correctly skipped and the real Ogg-Vorbis stream parsed.
+    let obj = serde_json::to_value(Rendered::new(&meta, true)).expect("render");
+    let obj = obj.as_object().expect("flat object");
     assert_eq!(
       obj.get("Vorbis:Artist").and_then(|v| v.as_str()),
       Some("Who Knows"),
-      "post-ID3 Ogg-Vorbis tags must be present: {json}"
+      "post-ID3 Ogg-Vorbis tags must be present: {obj:?}"
     );
     assert_eq!(
       obj.get("Vorbis:Title").and_then(|v| v.as_str()),
       Some("A 4s sample for testing embedded cover art"),
-      "post-ID3 Ogg-Vorbis Title must be present: {json}"
+      "post-ID3 Ogg-Vorbis Title must be present: {obj:?}"
     );
   }
 

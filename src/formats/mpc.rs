@@ -7,8 +7,8 @@
 //!
 //! A typed [`MpcMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Chained-format role
@@ -55,8 +55,7 @@
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  parser_new::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -68,7 +67,7 @@ use crate::{
 // `process` below) can drive the same FLAC::ProcessBitStream PROCESS_PROC as
 // bundled Perl. The typed [`MpcMeta`] holds the raw bit-field scalars
 // (post-bit-stream, pre-PrintConv); PrintConv is applied at emit time by
-// [`MetaSinker::sink`] to mirror ExifTool's `$$self{OPTIONS}{PrintConv}`
+// `serialize_tags` to mirror ExifTool's `$$self{OPTIONS}{PrintConv}`
 // toggle (ExifTool.pm:5710).
 // ===========================================================================
 
@@ -287,7 +286,7 @@ pub const MPC_BIT_KEYS: &[&str] = &[
 /// (e.g. 32-bit `TotalFrames`, 16-bit `ReplayGain*`, 8-bit `EncoderVersion`).
 ///
 /// PrintConv (`%SampleRate`, `%Quality`, `%FastSeek/Gapless`,
-/// [`encoder_version_print`]) is applied at emit time by [`MetaSinker::sink`]
+/// [`encoder_version_print`]) is applied at emit time by `serialize_tags`
 /// — `print_conv=true` ⇒ formatted strings or substituted numbers; `false` ⇒
 /// the raw scalars here as JSON numbers.
 ///
@@ -421,7 +420,7 @@ impl MpcSv7Header {
 /// Holds the typed bit-field scalars from the SV7 header (when present) +
 /// the version-specific warning string (when the MP+ version is anything
 /// other than SV7, MPC.pm:107-109). PrintConv (hash + func) is applied at
-/// emit time by [`MetaSinker::sink`] to mirror ExifTool's
+/// emit time by `serialize_tags` to mirror ExifTool's
 /// `$$self{OPTIONS}{PrintConv}` toggle (ExifTool.pm:5710).
 ///
 /// ## Chained sub-blocks
@@ -633,7 +632,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<MpcMeta<'_>>, MpcError> {
 /// The bit-stream walker pushes into a side [`Metadata`] (`print_conv=false`
 /// so the staged values are post-ValueConv raw scalars — `ValueConv::None`
 /// for every MPC field, so these are the literal bit-extracted integers).
-/// [`MetaSinker::sink`] applies PrintConv at emit time.
+/// `serialize_tags` applies PrintConv at emit time.
 fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
   // Staging Metadata captures the bit-stream walker's emissions. The walker
   // always emits `TagValue::I64` for these ≤ 32-bit fields (see the AAC
@@ -690,10 +689,11 @@ fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for MpcMeta<'_> {
+#[cfg(feature = "alloc")]
+impl MpcMeta<'_> {
   /// Emit MPC tags into the writer in `%MPC::Main` walk order (MPC.pm:21-72:
   /// TotalFrames, SampleRate, Quality, MaxBand, ReplayGain×4, FastSeek,
   /// Gapless, EncoderVersion) — faithful to the bundled-Perl bit-stream
@@ -711,8 +711,12 @@ impl MetaSinker for MpcMeta<'_> {
   /// **Non-SV7 arm.** When [`MpcMeta::sv7_header`] is `None`
   /// (MPC.pm:107-109), no MPC:* tags are emitted; the warning is pushed by
   /// the legacy bridge or directly by a lib caller via
-  /// [`TagWriter::write_warning`] at the end of this fn.
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  /// `TagMap::write_warning` at the end of this fn.
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "MPC";
 
     if let Some(h) = self.sv7_header.as_ref() {
@@ -830,8 +834,8 @@ impl MetaSinker for MpcMeta<'_> {
     // MPC.pm:107-109 — non-SV7 warning. Emit AFTER the (empty) tag block;
     // bundled `perl exiftool -j -G1` surfaces `ExifTool:Warning` as the
     // first non-File: entry (the serializer emits the warning at the front
-    // of the JSON object). Both the engine [`JsonTagWriter`] and lib callers
-    // (MapTagWriter) route this through [`TagWriter::write_warning`].
+    // of the JSON object). Both the engine [`TagMap`] and lib callers
+    // (TagMap) route this through `TagMap::write_warning`.
     if self.warn_unsupported_version {
       out.write_warning("Audio info currently not extracted from this version MPC file")?;
     }
@@ -862,105 +866,6 @@ impl std::error::Error for MpcError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessMpc {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Faithful to `ProcessMPC`
-  /// (MPC.pm:79-116):
-  /// 1. **ID3 prefix dispatch** (MPC.pm:84-87) — `unless ($$et{DoneID3})
-  ///    { ProcessID3 ... and return 1; }`. Via the parallel F2 agent's
-  ///    [`crate::formats::id3::process::process_id3_chained`] entry. When
-  ///    ID3 finds a prefix, MPC continues at the post-ID3 offset (faithful
-  ///    APE-style flattened model — bundled's audio-loop recursion folds
-  ///    into a single pass). No-ID3 case is the in-scope MPC fixture set:
-  ///    `process_id3_chained` returns `found=false, hdr_end=0`.
-  /// 2. **MP+ magic gate + SV7/non-SV7 dispatch** (MPC.pm:92-109). On a
-  ///    short read or wrong magic ⇒ return 0 BEFORE SetFileType (faithful
-  ///    to the bundled `or return 0` at MPC.pm:92).
-  /// 3. **SetFileType** (MPC.pm:94) — no-arg, detected ("MPC"). Called
-  ///    AFTER magic passes, BEFORE the version dispatch (so the non-SV7
-  ///    warning arm still emits File:* alongside the Warning).
-  /// 4. **SV7 bit-stream walk** (MPC.pm:97-106) or **non-SV7 warning**
-  ///    (MPC.pm:107-109).
-  /// 5. **APE trailer** (MPC.pm:111-113) — `Image::ExifTool::APE::
-  ///    ProcessAPE(...)` via the parallel F3 agent's
-  ///    [`crate::formats::ape::ProcessApe::process_trailer_only`] entry
-  ///    (chained-from-typed-file path, APE.pm:165-237). Bundled is void-
-  ///    context; the result is discarded. APE.pm:131 `$$et{DoneAPE} = 1`
-  ///    happens inside, so subsequent chained parsers see DoneAPE set.
-  /// 6. **Return 1** (MPC.pm:115).
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // ----- (1) ID3 prefix dispatch (MPC.pm:84-87) --------------------------
-    // `unless ($$et{DoneID3}) { ProcessID3 ... and return 1; }`. Bundled's
-    // `and return 1` chains: a successful ProcessID3 makes MPC return 1
-    // immediately. The bundled audio-loop (ID3.pm:1582-1601) then recursively
-    // re-invokes ProcessMPC with DoneID3 set, which reads MP+ at $hdrEnd.
-    //
-    // Faithful flattened model (mirrors APE's APE.pm:122-127 chained
-    // ID3 dispatch in `src/formats/ape.rs`): run ID3 first, then continue
-    // MPC's own work at the post-ID3 offset. For the in-scope MPC fixtures
-    // (`MPC.mpc` / `sv8.mpc`) which have NO ID3 prefix, this returns
-    // `found=false, hdr_end=0` and is a no-op.
-    let id3 = if ctx.writer().done_id3().is_none() {
-      crate::formats::id3::process::process_id3_chained(ctx)
-    } else {
-      crate::formats::id3::process::Id3ChainedResult::default()
-    };
-    let id3_found = id3.found();
-    let hdr_end = id3.hdr_end_offset();
-
-    // ----- (2) MP+ magic gate (MPC.pm:92) ----------------------------------
-    // Slice past any ID3v2 header. When `hdr_end == 0` (no ID3 prefix —
-    // the in-scope fixture case), the slice IS `ctx.data()` from offset 0.
-    // Codex R4 F1 fix mirror (from APE): `hdr_end` may exceed `data.len()`
-    // for truncated v2.4-footer files — saturate-to-empty.
-    let body = ctx.data().get(hdr_end..).unwrap_or(&[]);
-    let meta = match parse_inner(body) {
-      Ok(Some(m)) => m,
-      // Bundled `or return 0` (MPC.pm:92): no magic, no SetFileType, no
-      // tags. Two faithful outcomes:
-      //   (a) ID3 was found above ⇒ bundled `and return 1` semantics:
-      //       return TRUE so the engine treats the file as ID3-only.
-      //   (b) ID3 was NOT found ⇒ return FALSE so the candidate loop
-      //       tries the next type.
-      Ok(None) | Err(_) => return id3_found,
-    };
-
-    // ----- (3) SetFileType (MPC.pm:94) -------------------------------------
-    // `$et->SetFileType()` no-arg ⇒ detected file type ("MPC"). Pushes
-    // File:FileType / File:FileTypeExtension / File:MIMEType under
-    // ("File", "File") BEFORE the MPC:* tags (the bundled iteration order
-    // under `-j -G1`).
-    ctx.set_file_type(None, None, None);
-
-    // ----- (4) SV7 walk OR non-SV7 warning (MPC.pm:97-109) -----------------
-    // Sink the typed `MpcMeta` directly into the engine `JsonTagWriter`
-    // (`ctx.writer()`). The MetaSinker emits the SV7 tags + the optional
-    // warning in faithful order via `TagWriter::write_*` / `write_warning`.
-    // `JsonTagWriter::Error` is `Infallible` ⇒ the call cannot fail.
-    let print_conv = ctx.print_conv_enabled();
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-
-    // ----- (5) APE trailer (MPC.pm:111-113) --------------------------------
-    // `require Image::ExifTool::APE; ProcessAPE(...)`. Bundled is void
-    // context (`ProcessAPE($et, $dirInfo)` with no `and`/`or` chain), so
-    // the result is discarded — MPC's final return is always 1 (MPC.pm:115).
-    //
-    // Use the chained `process_trailer_only` (APE.pm:165-237 — the
-    // `unless ($header)` block) because MPC has already typed the file at
-    // step (3). APE.pm:131 `$$et{DoneAPE} = 1` happens INSIDE the trailer-
-    // only entry, regardless of whether a trailer is found.
-    //
-    // For the in-scope MPC fixtures (32-byte files, no APE trailer), the
-    // trailer scan finds no `APETAGEX` magic at the trailer position and
-    // emits no APE tags / no warning — byte-exact to the prior MPC.rs
-    // which simply omitted the APE dispatch entirely.
-    let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
-
-    // ----- (6) Return 1 (MPC.pm:115) ---------------------------------------
-    true
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -968,12 +873,8 @@ impl ProcessMpc {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    json_writer::JsonTagWriter,
-    parser::ParseContext,
-    parser_new::FormatParser,
-    sink::{MapTagWriter, MapValue},
-  };
+  use crate::parser_new::FormatParser;
+  use crate::tagmap::TagMap;
 
   // ---------- Tag table + bit-keys faithfulness --------------------------
 
@@ -1081,26 +982,32 @@ mod tests {
 
   // ---------- Reject paths (Perl `return 0`) -----------------------------
 
+  /// Run the engine over `data` (named `x.mpc`) and return the file object.
+  fn engine_obj(data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.mpc", data, true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+
   #[test]
   fn rejects_non_mpc_magic() {
     // MPC.pm:92 `... $buff =~ /^MP\+(.)/s or return 0` — magic mismatch
-    // returns 0 BEFORE SetFileType (MPC.pm:94), so nothing is pushed.
-    let mut m = JsonTagWriter::new("x.mpc");
-    let data = [0u8; 32];
-    let mut c = ParseContext::new(&data, "MPC", 0, "MPC", None, true, &mut m);
-    assert!(!ProcessMpc.process(&mut c));
-    assert!(m.tags().is_empty());
+    // returns 0 BEFORE SetFileType (MPC.pm:94), so MPC is not finalized.
+    let obj = engine_obj(&[0u8; 32]);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MPC")
+    );
   }
 
   #[test]
   fn rejects_short_read() {
     // MPC.pm:92 `$raf->Read($buff,32) == 32 ...` — < 32 bytes ⇒ return 0.
-    // Faithful even for a buffer that starts with "MP+" but is too short.
-    let mut m = JsonTagWriter::new("x.mpc");
-    let data = b"MP+\x07\x00\x00\x00";
-    let mut c = ParseContext::new(data, "MPC", 0, "MPC", None, true, &mut m);
-    assert!(!ProcessMpc.process(&mut c));
-    assert!(m.tags().is_empty());
+    let obj = engine_obj(b"MP+\x07\x00\x00\x00");
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MPC")
+    );
   }
 
   // ---------- Lib-first typed Meta surface --------------------------------
@@ -1180,7 +1087,7 @@ mod tests {
     assert_eq!(h.encoder_version(), 115);
   }
 
-  // ---------- MetaSinker: -j (PrintConv on) ------------------------------
+  // ---------- serialize_tags: -j (PrintConv on) ------------------------------
 
   #[test]
   fn meta_sinker_emits_sv7_print_conv_strings() {
@@ -1205,37 +1112,22 @@ mod tests {
       id3_prefix: None,
       ape_trailer: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("MPC", "TotalFrames").map(MapValue::as_str),
-      Some("102".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("MPC", "TotalFrames"), Some("102".to_string()));
     // SampleRate -j: PrintConv hash hit ⇒ 44100 (number)
-    assert_eq!(
-      w.get("MPC", "SampleRate").map(MapValue::as_str),
-      Some("44100".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "SampleRate"), Some("44100".to_string()));
     // Quality -j: hash hit ⇒ "5 (Standard)"
     assert_eq!(
-      w.get("MPC", "Quality").map(MapValue::as_str),
+      w.get_str("MPC", "Quality"),
       Some("5 (Standard)".to_string())
     );
-    assert_eq!(
-      w.get("MPC", "MaxBand").map(MapValue::as_str),
-      Some("28".to_string())
-    );
-    assert_eq!(
-      w.get("MPC", "FastSeek").map(MapValue::as_str),
-      Some("No".to_string())
-    );
-    assert_eq!(
-      w.get("MPC", "Gapless").map(MapValue::as_str),
-      Some("Yes".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "MaxBand"), Some("28".to_string()));
+    assert_eq!(w.get_str("MPC", "FastSeek"), Some("No".to_string()));
+    assert_eq!(w.get_str("MPC", "Gapless"), Some("Yes".to_string()));
     // EncoderVersion -j: 115 ⇒ "1.1.5"
     assert_eq!(
-      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
+      w.get_str("MPC", "EncoderVersion"),
       Some("1.1.5".to_string())
     );
     // No warning when sv7_header is Some.
@@ -1264,33 +1156,18 @@ mod tests {
       id3_prefix: None,
       ape_trailer: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
     // SampleRate -n: raw idx = 0
-    assert_eq!(
-      w.get("MPC", "SampleRate").map(MapValue::as_str),
-      Some("0".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "SampleRate"), Some("0".to_string()));
     // Quality -n: raw idx = 10
-    assert_eq!(
-      w.get("MPC", "Quality").map(MapValue::as_str),
-      Some("10".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "Quality"), Some("10".to_string()));
     // FastSeek -n: 0
-    assert_eq!(
-      w.get("MPC", "FastSeek").map(MapValue::as_str),
-      Some("0".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "FastSeek"), Some("0".to_string()));
     // Gapless -n: 1
-    assert_eq!(
-      w.get("MPC", "Gapless").map(MapValue::as_str),
-      Some("1".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "Gapless"), Some("1".to_string()));
     // EncoderVersion -n: raw 115
-    assert_eq!(
-      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
-      Some("115".to_string())
-    );
+    assert_eq!(w.get_str("MPC", "EncoderVersion"), Some("115".to_string()));
   }
 
   #[test]
@@ -1304,21 +1181,20 @@ mod tests {
       ape_trailer: None,
     };
     // -j
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    // No MPC:* tags emitted (sv7_header is None). `MapTagWriter::iter`
-    // only yields keyed (group, name, value) triples — warnings/errors
-    // live in their own accumulator (`MapTagWriter::warnings/errors`)
-    // and would not be returned here even if the sink had emitted them.
-    assert!(w.iter().all(|(g, _, _)| g != "MPC"));
-    // The warning is pushed through write_warning ⇒ MapTagWriter::warnings.
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    // No MPC:* tags emitted (sv7_header is None). The format-tag entries
+    // carry the `"<Group1>:<Name>"` keys; warnings live in their own
+    // accumulator (`TagMap::warnings`).
+    assert!(w.entries().iter().all(|(k, _)| !k.starts_with("MPC:")));
+    // The warning is pushed through write_warning ⇒ TagMap::warnings.
     assert_eq!(
       w.warnings(),
       &["Audio info currently not extracted from this version MPC file"]
     );
     // -n: identical (no MPC:* tags, same warning).
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
     assert_eq!(
       w.warnings(),
       &["Audio info currently not extracted from this version MPC file"]
@@ -1349,18 +1225,12 @@ mod tests {
       id3_prefix: None,
       ape_trailer: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("MPC", "Quality").map(MapValue::as_str),
-      Some("Unknown (2)".to_string())
-    );
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
-    assert_eq!(
-      w.get("MPC", "Quality").map(MapValue::as_str),
-      Some("2".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("MPC", "Quality"), Some("Unknown (2)".to_string()));
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
+    assert_eq!(w.get_str("MPC", "Quality"), Some("2".to_string()));
   }
 
   #[test]
@@ -1387,11 +1257,8 @@ mod tests {
       id3_prefix: None,
       ape_trailer: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("MPC", "EncoderVersion").map(MapValue::as_str),
-      Some("15".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("MPC", "EncoderVersion"), Some("15".to_string()));
   }
 }

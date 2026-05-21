@@ -25,9 +25,8 @@
 use crate::{
   convert::{ConvContext, apply_ctx},
   formats::id3::decode::{decode_string, decode_string_joined, unsync_safe},
-  json_writer::JsonTagWriter,
   tagtable::{TagDef, TagId, TagTable},
-  value::{Group, TagValue},
+  value::{Group, Metadata, TagValue},
 };
 use smol_str::SmolStr;
 
@@ -41,7 +40,7 @@ pub fn process_id3v2(
   data: &[u8],
   vers: u16,
   table: &'static TagTable,
-  meta: &mut JsonTagWriter,
+  meta: &mut Metadata,
   print_conv_on: bool,
   ctx: &ConvContext,
 ) {
@@ -381,7 +380,7 @@ fn dispatch_frame(
   id: &str,
   value: &[u8],
   vers: u16,
-  meta: &mut JsonTagWriter,
+  meta: &mut Metadata,
   group: &Group,
   print_conv_on: bool,
   ctx: &ConvContext,
@@ -871,7 +870,7 @@ fn handle_picture(
   id: &str,
   value: &[u8],
   table: &'static TagTable,
-  meta: &mut JsonTagWriter,
+  meta: &mut Metadata,
   group: &Group,
   print_conv_on: bool,
   ctx: &ConvContext,
@@ -1367,7 +1366,7 @@ mod tests {
     let mut body: Vec<u8> = vec![0];
     body.extend_from_slice(b"Hello");
     let data = build_v2_2_frame(b"TT2", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0200,
@@ -1388,7 +1387,7 @@ mod tests {
     let mut body: Vec<u8> = vec![0];
     body.extend_from_slice(b"Hi");
     let data = build_v2_3_frame(b"TIT2", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1408,7 +1407,7 @@ mod tests {
     let mut body: Vec<u8> = vec![0];
     body.extend_from_slice(b"Bye");
     let data = build_v2_3_frame(b"TIT2", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0400,
@@ -1433,7 +1432,7 @@ mod tests {
     let mut after: Vec<u8> = vec![0];
     after.extend_from_slice(b"shouldnt");
     data.extend_from_slice(&build_v2_3_frame(b"TPE1", &after));
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1464,7 +1463,7 @@ mod tests {
     body.push(0);
     body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // image
     let data = build_v2_3_frame(b"APIC", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1507,7 +1506,7 @@ mod tests {
     body.push(0);
     body.extend_from_slice(b"abc123");
     let data = build_v2_3_frame(b"TXXX", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1565,7 +1564,7 @@ mod tests {
     data.push(0x40); // flags: ext-header bit (0x40)
     data.extend_from_slice(&size.to_be_bytes());
     data.extend_from_slice(&payload);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     // This test invokes `process_id3v2` directly; the ProcessID3 wrapper
     // handles the ext-header strip itself. For the integration path see
     // `crate::formats::id3::process::tests` (the ID3v2 fixture set).
@@ -1599,7 +1598,7 @@ mod tests {
     body.push(0);
     body.extend_from_slice(&[0xde, 0xad]);
     let data = build_v2_2_frame(b"PIC", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0200,
@@ -1621,7 +1620,7 @@ mod tests {
     // NOT emit a "Don't know how to handle" Warn.
     let body: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef]; // dummy MCDI payload
     let data = build_v2_3_frame(b"MCDI", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1657,7 +1656,7 @@ mod tests {
     // table parsers land (forward item documented in mod.rs).
     let body: Vec<u8> = vec![0x42, 0x42, 0x42, 0x42];
     let data = build_v2_3_frame(b"GEOB", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1691,7 +1690,7 @@ mod tests {
     let mut body: Vec<u8> = vec![0];
     body.extend_from_slice(b"2024-05-19");
     let data = build_v2_3_frame(b"TDRC", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300, // v2.3 file
@@ -1732,7 +1731,7 @@ mod tests {
     body.extend_from_slice(b"no-terminator");
     // No trailing NUL → the description doesn't terminate.
     let data = build_v2_3_frame(b"APIC", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1775,7 +1774,7 @@ mod tests {
     body.extend_from_slice(b"OK");
     let title_frame = build_v2_3_frame(b"TIT2", &body);
     let combined: Vec<u8> = bad_frame.into_iter().chain(title_frame).collect();
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &combined,
       0x0300,
@@ -1798,7 +1797,7 @@ mod tests {
     // as a decimal string for values > i64::MAX.
     let body: Vec<u8> = vec![0x80, 0, 0, 0, 0, 0, 0, 0];
     let data = build_v2_3_frame(b"PCNT", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1820,7 +1819,7 @@ mod tests {
     body.extend_from_slice(b"fra"); // 3-byte language
     body.extend_from_slice(b"Termes d'utilisation");
     let data = build_v2_3_frame(b"USER", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1846,7 +1845,7 @@ mod tests {
     let mut body: Vec<u8> = vec![0x01];
     body.extend(std::iter::repeat(0u8).take(16));
     let data = build_v2_3_frame(b"PCNT", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1905,7 +1904,7 @@ mod tests {
     body.push(0); // owner-id terminator
     body.extend_from_slice(b"payload");
     let data = build_v2_3_frame(b"PRIV", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1935,7 +1934,7 @@ mod tests {
     body.push(0);
     body.extend_from_slice(b"x");
     let data = build_v2_3_frame(b"PRIV", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1966,7 +1965,7 @@ mod tests {
     body.extend_from_slice(b"ENG"); // upper-case 3-letter language
     body.extend_from_slice(b"Upper-case eng");
     let data = build_v2_3_frame(b"USER", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,
@@ -1991,7 +1990,7 @@ mod tests {
     body.extend_from_slice(b"eng");
     body.extend_from_slice(b"Terms of use");
     let data = build_v2_3_frame(b"USER", &body);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     process_id3v2(
       &data,
       0x0300,

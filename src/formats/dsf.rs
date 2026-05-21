@@ -8,8 +8,8 @@
 //!
 //! A typed [`DsfMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] and the chained ID3v2 trailer so the
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` and the chained ID3v2 trailer so the
 //! serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## Why DSF needs a `Context<'a>` struct (not the leaf `&'a [u8]`)
@@ -18,7 +18,7 @@
 //! The chain is now fully typed: [`parse_inner`] parses the trailer slice
 //! into a nested [`crate::formats::id3::Id3Meta`] ([`DsfMeta::id3`]) via
 //! [`crate::formats::id3::process::parse_id3_borrowed`], and the
-//! [`MetaSinker`] sink emits its `File:ID3Size` + `ID3v2_*:*` tags after
+//! `serialize_tags` sink emits its `File:ID3Size` + `ID3v2_*:*` tags after
 //! the `'fmt '` chunk. The `DsfContext<'a>` = `&'a [u8]` + `&'a mut
 //! SharedFlags` shape is retained for parser-trait uniformity even though
 //! DSF itself does not read/mutate `SharedFlags` (the trailer is a
@@ -32,8 +32,7 @@
 //! parsed from those same bytes, which the sink emits.
 
 use crate::{
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  parser_new::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -127,7 +126,7 @@ const DSF_KEYS: &[i64] = &[3, 4, 5, 6, 7, 8, 9, 11];
 
 /// The `'fmt '` chunk fields (DSF.pm:30-48). Every field is the raw
 /// post-decode integer — PrintConv hashes (FormatID, ChannelType) are
-/// applied at [`MetaSinker::sink`] time mirroring the
+/// applied at `serialize_tags` time mirroring the
 /// `$$self{OPTIONS}{PrintConv}` toggle.
 ///
 /// `present_mask` tracks which `DSF_KEYS` entries the parser successfully
@@ -246,7 +245,7 @@ impl DsfFmtData {
 /// 2. The fmt-chunk warning text ([`Self::fmt_warning`]). When
 ///    [`Self::fmt`] is `None`, this is `Some("Error reading DSF fmt
 ///    chunk")` (DSF.pm:71) so the sink re-emits it through
-///    `TagWriter::write_warning` for byte-exact CLI JSON.
+///    `TagMap::write_warning` for byte-exact CLI JSON.
 /// 3. The optional ID3v2 trailer bytes ([`Self::id3_trailer`]) — the
 ///    `metaPos..metaPos+metaLen` slice (DSF.pm:88-97) borrowed from the
 ///    input buffer (zero-alloc) — AND the typed [`Self::id3`] sub-Meta
@@ -284,7 +283,7 @@ pub struct DsfMeta<'a> {
   /// Typed ID3 sub-Meta parsed from [`Self::id3_trailer`] (DSF.pm:88-97).
   /// `Some` iff the trailer slice was present AND ID3 detection accepted it
   /// (an ID3v2 header at offset 0). Carries `File:ID3Size` + the
-  /// `ID3v2_*:*` frame tags; the typed [`MetaSinker`] sink emits them after
+  /// `ID3v2_*:*` frame tags; the typed `serialize_tags` sink emits them after
   /// the `'fmt '` chunk fields, replacing the engine's separate
   /// `process_id3_v2_slice` dispatch.
   #[cfg(feature = "id3")]
@@ -320,7 +319,7 @@ impl<'a> DsfMeta<'a> {
 
   /// Typed ID3 sub-Meta parsed from the [`Self::id3_trailer`] bytes
   /// (DSF.pm:88-97). `Some` iff the trailer was present and ID3 detection
-  /// accepted it. The [`MetaSinker`](crate::parser_new::MetaSinker) sink
+  /// accepted it. The `serialize_tags` sink
   /// emits its `File:ID3Size` + `ID3v2_*:*` tags after the `'fmt '` chunk.
   #[cfg(feature = "id3")]
   #[must_use]
@@ -693,10 +692,11 @@ fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for DsfMeta<'_> {
+#[cfg(feature = "alloc")]
+impl DsfMeta<'_> {
   /// Emit DSF tags into the writer in `%DSF::Main` ascending-key order
   /// (DSF.pm has no `FIRST_ENTRY` hint, so ExifTool walks keys via
   /// `sort { $a <=> $b }` — DSF_KEYS). Family-0/1 group is `"File"`
@@ -714,7 +714,11 @@ impl MetaSinker for DsfMeta<'_> {
   /// is also NOT emitted by the sink — the engine entry dispatches
   /// `id3_trailer()` bytes through `process_id3_v2_slice` so the bundled
   /// ID3.pm semantics are preserved byte-exact.
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "File";
     // (1) DSF.pm:71 — `$et->Warn('Error reading DSF fmt chunk')` is
     // emitted BEFORE the (skipped) ProcessBinaryData walk. The bridge
@@ -799,7 +803,7 @@ impl MetaSinker for DsfMeta<'_> {
     // `process_id3_v2_slice` dispatch — the typed Meta is now self-contained.
     #[cfg(feature = "id3")]
     if let Some(id3) = &self.id3 {
-      id3.sink(print_conv, out)?;
+      id3.serialize_tags(print_conv, out)?;
     }
     Ok(())
   }
@@ -830,57 +834,6 @@ impl std::error::Error for DsfError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessDsf {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] (via [`parse_inner`] to preserve the
-  /// `id3_trailer` borrow) and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (DSF.pm:62-99):
-  /// 1. Header magic gate (DSF.pm:62-63) — `parse_inner` rejects with
-  ///    `Ok(None)` and the bridge returns `false` (no File:* emitted).
-  /// 2. `SetFileType` (DSF.pm:64) — runs BEFORE the fmt-chunk guard so
-  ///    a Warn-then-return-1 file still emits the File:* triplet.
-  /// 3. `fmt`-chunk warning (DSF.pm:71) AND/OR fmt-chunk tags
-  ///    (DSF.pm:80-85) AND the chained ID3v2 trailer (DSF.pm:88-97) — all
-  ///    via the one `MetaSinker::sink` call, which now emits the nested
-  ///    typed `Id3Meta` ([`DsfMeta::id3`]). No separate
-  ///    `process_id3_v2_slice` dispatch (the typed Meta is self-contained;
-  ///    DSF.pm:64 already typed the file so the chained ID3 emits no
-  ///    `File:FileType`).
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    let bytes = ctx.data();
-    let meta = match parse_inner(bytes) {
-      Ok(Some(m)) => m,
-      // DSF.pm:62-63 — header miss ⇒ no File:* emission.
-      Ok(None) => return false,
-      Err(_) => return false,
-    };
-    // DSF.pm:64 — `$et->SetFileType()`. No-arg ⇒ detected file type
-    // ("DSF"). MUST run BEFORE the fmt-chunk warning so the File:*
-    // triplet lands first (the bundled-Perl emission order under
-    // `-j -G1`). DSF.pm:64 is line-ordered BEFORE the guard at :67-72.
-    ctx.set_file_type(None, None, None);
-    let print_conv = ctx.print_conv_enabled();
-    // Sink the typed `DsfMeta` directly into the engine `JsonTagWriter`
-    // (`ctx.writer()`). Faithful to DSF.pm:80-85 `ProcessBinaryData`
-    // semantics — emits the same fmt-chunk tags (or the Warn) in the same
-    // order with the same PrintConv vs ValueConv toggling — AND the chained
-    // ID3v2 trailer (DSF.pm:88-97) via the nested typed `Id3Meta` the sink
-    // now carries (File:ID3Size + ID3v2_*:* frames). The typed `parse_inner`
-    // applied every trailer guard and parsed the slice into `DsfMeta::id3`,
-    // so a separate `process_id3_v2_slice` dispatch is no longer needed —
-    // the typed Meta is self-contained (Stage 1 of the sink-layer removal).
-    {
-      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    }
-    // DSF.pm:99 `return 1`. Even the Warn path returns 1 (DSF.pm:72).
-    true
-  }
-}
-
 // ===========================================================================
 // DSF-local ProcessBinaryData walk — exercised by the pathological
 // out-of-range test; the typed parser only emits full / no fmt
@@ -891,7 +844,7 @@ impl ProcessDsf {
 /// `sub ProcessBinaryData`). Pinned for the pathological out-of-range
 /// test (`walk_out_of_range_field_is_skipped` exercises a custom
 /// dirInfo buffer that's too short to cover key 9 or key 11). The
-/// production happy path goes through `parse_inner` ⇒ `MetaSinker::sink`
+/// production happy path goes through `parse_inner` ⇒ `serialize_tags`
 /// and never calls this helper.
 ///
 /// `buf` is the dirInfo-shape buffer (`'fmt '` + 8-byte chunkSize +
@@ -942,12 +895,7 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    json_writer::JsonTagWriter,
-    parser::ParseContext,
-    sink::{MapTagWriter, MapValue},
-    value::Metadata,
-  };
+  use crate::tagmap::TagMap;
 
   // --- Table + dispatch ---------------------------------------------------
 
@@ -1276,47 +1224,29 @@ mod tests {
     assert!(meta.id3_trailer().is_none());
   }
 
-  // --- MetaSinker ---------------------------------------------------------
+  // --- serialize_tags ---------------------------------------------------------
 
   #[test]
   fn sink_emits_full_fmt_set_in_key_order_print_conv() {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     // Spot-check: PrintConv-resolved names + numeric raw scalars.
+    assert_eq!(w.get_str("File", "FormatVersion"), Some("1".to_string()));
+    assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
     assert_eq!(
-      w.get("File", "FormatVersion").map(MapValue::as_str),
-      Some("1".to_string())
-    );
-    assert_eq!(
-      w.get("File", "FormatID").map(MapValue::as_str),
-      Some("DSD Raw".to_string())
-    );
-    assert_eq!(
-      w.get("File", "ChannelType").map(MapValue::as_str),
+      w.get_str("File", "ChannelType"),
       Some("Stereo (Left, Right)".to_string())
     );
+    assert_eq!(w.get_str("File", "ChannelCount"), Some("2".to_string()));
+    assert_eq!(w.get_str("File", "SampleRate"), Some("2822400".to_string()));
+    assert_eq!(w.get_str("File", "BitsPerSample"), Some("1".to_string()));
     assert_eq!(
-      w.get("File", "ChannelCount").map(MapValue::as_str),
-      Some("2".to_string())
-    );
-    assert_eq!(
-      w.get("File", "SampleRate").map(MapValue::as_str),
+      w.get_str("File", "SampleCount"),
       Some("2822400".to_string())
     );
-    assert_eq!(
-      w.get("File", "BitsPerSample").map(MapValue::as_str),
-      Some("1".to_string())
-    );
-    assert_eq!(
-      w.get("File", "SampleCount").map(MapValue::as_str),
-      Some("2822400".to_string())
-    );
-    assert_eq!(
-      w.get("File", "BlockSize").map(MapValue::as_str),
-      Some("4096".to_string())
-    );
+    assert_eq!(w.get_str("File", "BlockSize"), Some("4096".to_string()));
     assert!(w.warnings().is_empty());
   }
 
@@ -1324,17 +1254,11 @@ mod tests {
   fn sink_emits_full_fmt_set_print_conv_off() {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
     // -n: raw numeric for FormatID / ChannelType (hash NOT applied).
-    assert_eq!(
-      w.get("File", "FormatID").map(MapValue::as_str),
-      Some("0".to_string())
-    );
-    assert_eq!(
-      w.get("File", "ChannelType").map(MapValue::as_str),
-      Some("2".to_string())
-    );
+    assert_eq!(w.get_str("File", "FormatID"), Some("0".to_string()));
+    assert_eq!(w.get_str("File", "ChannelType"), Some("2".to_string()));
   }
 
   #[test]
@@ -1346,8 +1270,8 @@ mod tests {
       #[cfg(feature = "id3")]
       id3: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(w.warnings(), &["Error reading DSF fmt chunk".to_string()]);
     // No fmt-chunk tags emitted on the warn path.
     assert!(w.get("File", "FormatVersion").is_none());
@@ -1376,10 +1300,10 @@ mod tests {
       #[cfg(feature = "id3")]
       id3: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(
-      w.get("File", "SampleCount").map(MapValue::as_str),
+      w.get_str("File", "SampleCount"),
       Some("18446744073709551615".to_string())
     );
   }
@@ -1411,16 +1335,10 @@ mod tests {
     assert_eq!(fmt.format_version(), 7);
     assert_eq!(fmt.format_id(), 0);
     // The sink emits ONLY the present prefix.
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("File", "FormatVersion").map(MapValue::as_str),
-      Some("7".to_string())
-    );
-    assert_eq!(
-      w.get("File", "FormatID").map(MapValue::as_str),
-      Some("DSD Raw".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("File", "FormatVersion"), Some("7".to_string()));
+    assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
     assert!(w.get("File", "ChannelType").is_none());
     assert!(w.get("File", "BlockSize").is_none());
   }
@@ -1446,8 +1364,8 @@ mod tests {
       meta.fmt().is_none(),
       "fmt_len just over 12 with no key-3 coverage ⇒ fmt is None"
     );
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert!(w.is_empty());
   }
 
@@ -1546,72 +1464,85 @@ mod tests {
     assert_eq!(fmt.sample_count(), 2_822_400);
   }
 
-  // --- Engine entry (`process`) -------------------------------------------
+  // --- Engine entry (`extract_info`) --------------------------------------
+  // The engine path is now `crate::parser::extract_info` (detect → typed parse
+  // → serde-render). These tests run it and assert on the parsed JSON object,
+  // replacing the retired `ProcessDsf::process` + `TagMap` tests.
+
+  /// Run the engine over `data` (named `x.dsf`) in `-j` mode and return the
+  /// single file object. `None` is impossible (always a one-object array).
+  fn engine_obj(data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.dsf", data, true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
 
   #[test]
-  fn old_format_parser_rejects_when_short() {
+  fn engine_rejects_when_short() {
     for n in [0usize, 39] {
       let buf = std::vec![0u8; n];
-      let mut m = JsonTagWriter::new("x.dsf");
-      let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-      assert!(!ProcessDsf.process(&mut c));
-      assert!(m.tags().is_empty(), "n={n}");
+      let obj = engine_obj(&buf);
+      // No DSF File:FileType (header miss ⇒ not finalized as DSF).
+      assert_ne!(
+        obj.get("File:FileType").and_then(|v| v.as_str()),
+        Some("DSF"),
+        "n={n}"
+      );
     }
   }
 
   #[test]
-  fn old_format_parser_rejects_when_wrong_magic() {
+  fn engine_rejects_when_wrong_magic() {
     let mut bad = happy_path_dsf()[..40].to_vec();
     bad[0..4].copy_from_slice(b"XXXX");
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&bad, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(!ProcessDsf.process(&mut c));
-    assert!(m.tags().is_empty());
-  }
-
-  #[test]
-  fn old_format_parser_accepts_minimal_valid_emits_full_set() {
-    let buf = happy_path_dsf();
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
-    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    assert_eq!(
-      names,
-      [
-        "FileType",
-        "FileTypeExtension",
-        "MIMEType",
-        "FormatVersion",
-        "FormatID",
-        "ChannelType",
-        "ChannelCount",
-        "SampleRate",
-        "BitsPerSample",
-        "SampleCount",
-        "BlockSize",
-      ]
-    );
-    assert!(m.warnings().is_empty());
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-        .unwrap()
-    };
-    assert_eq!(by_name("FileType"), TagValue::Str("DSF".into()));
-    assert_eq!(by_name("FileTypeExtension"), TagValue::Str("dsf".into()));
-    assert_eq!(by_name("MIMEType"), TagValue::Str("audio/x-dsf".into()));
-    assert_eq!(by_name("FormatID"), TagValue::Str("DSD Raw".into()));
-    assert_eq!(
-      by_name("ChannelType"),
-      TagValue::Str("Stereo (Left, Right)".into())
+    let obj = engine_obj(&bad);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DSF")
     );
   }
 
   #[test]
-  fn old_format_parser_warns_on_short_fmt_chunk_returns_true() {
+  fn engine_accepts_minimal_valid_emits_full_set() {
+    let obj = engine_obj(&happy_path_dsf());
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DSF")
+    );
+    assert_eq!(
+      obj.get("File:FileTypeExtension").and_then(|v| v.as_str()),
+      Some("dsf")
+    );
+    assert_eq!(
+      obj.get("File:MIMEType").and_then(|v| v.as_str()),
+      Some("audio/x-dsf")
+    );
+    // fmt-chunk tags present.
+    for key in [
+      "File:FormatVersion",
+      "File:FormatID",
+      "File:ChannelType",
+      "File:ChannelCount",
+      "File:SampleRate",
+      "File:BitsPerSample",
+      "File:SampleCount",
+      "File:BlockSize",
+    ] {
+      assert!(obj.contains_key(key), "missing {key}");
+    }
+    assert!(!obj.contains_key("ExifTool:Warning"));
+    assert_eq!(
+      obj.get("File:FormatID").and_then(|v| v.as_str()),
+      Some("DSD Raw")
+    );
+    assert_eq!(
+      obj.get("File:ChannelType").and_then(|v| v.as_str()),
+      Some("Stereo (Left, Right)")
+    );
+  }
+
+  #[test]
+  fn engine_warns_on_short_fmt_chunk_returns_true() {
     let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&0x1cu64.to_le_bytes());
@@ -1619,19 +1550,21 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12)
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c)); // DSF.pm:72 return 1
-    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
-    assert_eq!(names, ["FileType", "FileTypeExtension", "MIMEType"]);
+    let obj = engine_obj(&buf);
+    // File:* triplet emitted (DSF.pm:64 SetFileType before the Warn).
     assert_eq!(
-      m.warnings(),
-      ["Error reading DSF fmt chunk".to_string()].as_slice()
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DSF")
+    );
+    assert!(!obj.contains_key("File:FormatVersion"));
+    assert_eq!(
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Error reading DSF fmt chunk")
     );
   }
 
   #[test]
-  fn old_format_parser_warns_on_truncated_fmt_payload_returns_true() {
+  fn engine_warns_on_truncated_fmt_payload_returns_true() {
     let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
     buf.extend_from_slice(&0x1cu64.to_le_bytes());
@@ -1639,21 +1572,16 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
+    let obj = engine_obj(&buf);
     assert_eq!(
-      m.warnings(),
-      ["Error reading DSF fmt chunk".to_string()].as_slice()
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Error reading DSF fmt chunk")
     );
-    assert!(m.tags().iter().all(|t| {
-      let n = t.name();
-      n == "FileType" || n == "FileTypeExtension" || n == "MIMEType"
-    }));
+    assert!(!obj.contains_key("File:FormatVersion"));
   }
 
   #[test]
-  fn old_format_parser_fmt_len_equals_12_underflow_guard() {
+  fn engine_fmt_len_equals_12_underflow_guard() {
     // CRITICAL: DSF.pm:68 strict `$fmtLen > 12` underflow guard.
     let mut buf = std::vec::Vec::with_capacity(40);
     buf.extend_from_slice(b"DSD ");
@@ -1662,38 +1590,24 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
+    let obj = engine_obj(&buf);
     assert_eq!(
-      m.warnings(),
-      ["Error reading DSF fmt chunk".to_string()].as_slice()
+      obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
+      Some("Error reading DSF fmt chunk")
     );
   }
 
   #[test]
-  fn old_format_parser_dispatches_id3_trailer() {
-    // Synthesize a DSF file with a small ID3v2.3 header attached.
-    // The trailer must be ≥ 10 bytes for ID3v2 magic + flags + size.
-    // ID3v2.3 frame: "ID3" 03 00 flags=00 size=4×7bit=0 ⇒ empty body.
+  fn engine_dispatches_id3_trailer() {
+    // Synthesize a DSF file with a small ID3v2.3 header attached (empty body).
     let id3 = b"ID3\x03\x00\x00\x00\x00\x00\x00";
     let buf = dsf_with_trailer(id3);
-    let mut m = JsonTagWriter::new("x.dsf");
-    let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(ProcessDsf.process(&mut c));
-    // File:* triplet + fmt-chunk tags ARE emitted. The ID3 trailer
-    // dispatches but emits no payload tags for a body-empty header —
-    // it's enough that the dispatch ran without panicking and didn't
-    // emit any error.
-    assert!(m.warnings().is_empty());
-    // FileType still DSF (DSF.pm:64 SetFileType runs before the
-    // trailer dispatch — the chained ID3 path does NOT SetFileType).
-    let ft = m
-      .tags()
-      .iter()
-      .find(|t| t.name() == "FileType")
-      .map(|t| t.value().clone())
-      .unwrap();
-    assert_eq!(ft, TagValue::Str("DSF".into()));
+    let obj = engine_obj(&buf);
+    assert!(!obj.contains_key("ExifTool:Warning"));
+    // FileType still DSF (the chained ID3 path does NOT SetFileType).
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("DSF")
+    );
   }
 }

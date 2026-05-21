@@ -1,32 +1,35 @@
-//! STAGE-1 PARITY CHECKPOINT for the sink-layer removal.
+//! PARITY CHECKPOINT for the sink-layer removal.
 //!
-//! Proves that the **typed serde path** — `detect → parse (typed AnyMeta) →
-//! serde-render` via [`exifast::Rendered`] — reproduces, for EVERY active
-//! conformance fixture in BOTH `-j` (PrintConv) and `-n` (numeric) modes,
-//! EXACTLY what the current writer path
-//! ([`exifast::parser::extract_info`], the `JsonTagWriter` collector) produces
-//! AND the committed bundled-ExifTool golden. This is the hard checkpoint the
-//! sink-layer deletion (Stage 2) rides on: once the typed serde document is
-//! value-equivalent to the writer document for all 121, the writer is
-//! redundant on the output path.
+//! Proves that an independently-assembled **typed serde document** — the
+//! orchestration tags lifted off [`exifast::parser::extract_info`] PLUS the
+//! format tags from `serde_json::to_value(&`[`exifast::Rendered`]`)` — is, for
+//! EVERY active conformance fixture in BOTH `-j` (PrintConv) and `-n` (numeric)
+//! modes, value-equivalent to the engine document [`extract_info`] produces AND
+//! the committed bundled-ExifTool golden.
+//!
+//! After the sink layer was deleted, `extract_info` IS the typed-serde path
+//! (`detect → parse → serde-render`), so the "vs `extract_info`" arm is now a
+//! self-consistency check (the document assembled via the public
+//! [`exifast::Rendered`] serde wrapper matches the engine's own serde render);
+//! the "vs golden" arm remains the load-bearing conformance check. Kept as a
+//! standalone harness because it exercises the public `Rendered` serde view +
+//! the `parse_bytes`-style candidate loop independently of the engine entry.
 //!
 //! ## What the typed serde document is
 //!
-//! The end-state `extract_info` will: detect the file type, run the parse
-//! (yielding a complete typed `AnyMeta` incl. chains), emit the orchestration
-//! tags (`ExifTool:ExifToolVersion`, `SourceFile`, the `File:*` triplet), and
-//! serde-render the whole thing. At Stage 1 the writer still exists, so this
-//! harness assembles the SAME document by:
+//! `extract_info` detects the file type, runs the parse (yielding a complete
+//! typed `AnyMeta` incl. chains), emits the orchestration tags
+//! (`ExifTool:ExifToolVersion`, `SourceFile`, the `File:*` triplet), and
+//! serde-renders the whole thing. This harness assembles an EQUIVALENT document
+//! by:
 //!
 //!   1. Lifting the orchestration tags (`ExifTool:*` + `File:*`) and the
 //!      warnings/errors (incl. the post-loop finalization `Error`) off the
-//!      authoritative engine document ([`extract_info`], itself §4-conformant)
-//!      — these are the engine's responsibility, OUTSIDE the per-format typed
-//!      Meta, in BOTH the current and end-state designs.
+//!      engine document ([`extract_info`], itself §4-conformant) — these are
+//!      the engine's responsibility, OUTSIDE the per-format typed Meta.
 //!   2. Serde-rendering the typed `AnyMeta` for the FORMAT tags via
-//!      `serde_json::to_value(&Rendered::new(&meta, print_conv))` — the actual
-//!      Stage-2 output mechanism (NOT the `MetaSinker::sink`-into-writer path
-//!      that `json_writer_parity.rs` exercises).
+//!      `serde_json::to_value(&Rendered::new(&meta, print_conv))` — the public
+//!      typed serde view.
 //!   3. Merging into the single `[{ … }]` document with `%noDups` first-wins
 //!      (orchestration keys are inserted first, so they win over any
 //!      coincident typed key — though typed Metas never emit `File:*`).

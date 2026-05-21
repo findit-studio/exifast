@@ -50,8 +50,7 @@
 
 use crate::{
   convert::{apply, base64_decode},
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
+  parser_new::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -1372,10 +1371,11 @@ impl core::fmt::Display for OggError {
 impl std::error::Error for OggError {}
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for OggMeta<'_> {
+#[cfg(feature = "alloc")]
+impl OggMeta<'_> {
   /// Emit OGG tags into the writer in bundled emission order — vendor
   /// first, then comments in encounter order with list-tags coalesced at
   /// first occurrence (faithful FoundTag — ExifTool.pm:9505-9520),
@@ -1385,14 +1385,18 @@ impl MetaSinker for OggMeta<'_> {
   /// That's the bridge's responsibility (the engine entry `process`):
   /// `SetFileType` precedes the Vorbis:* tags in bundled output, but the
   /// pseudo-File:* tags belong to the engine's `ParseContext::set_file_
-  /// type` path (not the per-format `MetaSinker`). The `MetaSinker` only
+  /// type` path (not the per-format `serialize_tags`). The `serialize_tags` only
   /// writes Vorbis:* / Theora:* tags + warnings.
   ///
   /// `print_conv = true` matches bundled `perl exiftool -j`; `false`
   /// matches `-j -n`. For OGG today every known tag has `PrintConv::None`,
   /// so the toggle is mostly cosmetic — the bridge consumes both values
   /// of the toggle and routes byte-exact via the serializer.
-  fn sink<W: TagWriter>(&self, _print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    _print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     for comment in &self.comments {
       match comment {
         OggComment::Scalar {
@@ -1425,9 +1429,9 @@ impl MetaSinker for OggMeta<'_> {
         }
       }
     }
-    // Warnings emit in occurrence order. The engine `JsonTagWriter` routes
+    // Warnings emit in occurrence order. The engine `TagMap` routes
     // these to its `warnings()` accumulator (ExifTool:Warning surface);
-    // `MapTagWriter` collects into a `warnings()` vec.
+    // `TagMap` collects into a `warnings()` vec.
     for w in &self.warnings {
       out.write_warning(w)?;
     }
@@ -1439,118 +1443,6 @@ impl MetaSinker for OggMeta<'_> {
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessOgg {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and then re-emits through the `Metadata` push
-  /// path so the serialized JSON stays byte-exact with bundled `perl
-  /// exiftool`.
-  ///
-  /// Faithful order (Ogg.pm:75-197): page-walk ⇒ on first-accept,
-  /// `SetFileType('OGG')` ⇒ post-walk, `OverrideFileType('OGV'/'OPUS')`
-  /// in place ⇒ Vorbis:* / Theora:* tags ⇒ ExifTool:Warning / Error.
-  ///
-  /// The list-tag path (Artist/Performer/Contact) routes through
-  /// `Metadata::push_listable` directly — bypassing [`MetaSinker::sink`]'s
-  /// stateless write_str loop — because the bridge sink must drop the
-  /// emissions into the existing `&mut Metadata` whose list-coalesce
-  /// semantics are first-occurrence-position. See the loop body below for
-  /// the explicit dispatch.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Run the new typed parser on the input bytes. Pass through the
-    // `print_conv` toggle so any future ValueConv/PrintConv on a known
-    // OGG tag honours `-n`.
-    let bytes = ctx.data();
-    let print_conv = ctx.print_conv_enabled();
-    let meta = match parse_inner(bytes, print_conv) {
-      Ok(Some(m)) => m,
-      // No Rust-level fatal modes today; both `Ok(None)` and `Err(_)`
-      // surface as "reject" (Perl `return 0`). Today `parse_inner`
-      // always returns `Ok(Some(_))`, so this arm is defensive.
-      _ => return false,
-    };
-    // Ogg.pm:196 `return $success`. If no valid page was ever accepted,
-    // we DO NOT call `SetFileType` — the engine post-loop emits
-    // `ExifTool:Error => "File format error"` instead.
-    if !meta.success {
-      return false;
-    }
-    // Ogg.pm:101-103 first valid page ⇒ `SetFileType()`. The no-arg form
-    // resolves to the detected file type ("OGG"); the bundled emission
-    // order is `File:FileType / File:FileTypeExtension / File:MIMEType`
-    // BEFORE Vorbis:* / Theora:* tags.
-    ctx.set_file_type(None, None, None);
-    // Ogg.pm:49-50 `OverrideFileType('OGV')` / `OverrideFileType('OPUS')`.
-    // Faithful in-place mutation (ExifTool.pm:9717-9724) — does NOT
-    // append duplicate File:* rows.
-    if let Some(target) = meta.file_type_override {
-      ctx.override_file_type(target, None, None);
-    }
-    // Vorbis:* / Theora:* tags. We walk `OggMeta::comments` directly and
-    // emit straight into the engine `JsonTagWriter` (`ctx.writer()`) via
-    // `push` / `push_listable`, rather than driving the generic
-    // `MetaSinker::sink` path, so the list-tag (Artist/Performer/Contact)
-    // first-occurrence-position coalescing uses the writer's own
-    // `push_listable` seam directly.
-    {
-      let meta_sink = ctx.writer();
-      for comment in &meta.comments {
-        match comment {
-          OggComment::Scalar {
-            group1,
-            name,
-            value,
-          } => {
-            meta_sink.push(
-              Group::new("Vorbis", group1.as_str()),
-              name.as_str(),
-              TagValue::Str(value.clone()),
-            );
-          }
-          OggComment::List {
-            group1,
-            name,
-            values,
-          } => {
-            // First-occurrence position + same-(group, name) coalesce
-            // into TagValue::List — faithful `FoundTag` (ExifTool.pm:
-            // 9505-9520). The legacy `push_listable` does exactly this.
-            for v in values {
-              meta_sink.push_listable(
-                Group::new("Vorbis", group1.as_str()),
-                name.as_str(),
-                TagValue::Str(v.clone()),
-              );
-            }
-          }
-          OggComment::Binary {
-            group1,
-            name,
-            bytes,
-          } => {
-            meta_sink.push(
-              Group::new("Vorbis", group1.as_str()),
-              name.as_str(),
-              TagValue::Bytes(bytes.clone()),
-            );
-          }
-        }
-      }
-      for w in &meta.warnings {
-        meta_sink.push_warning(w.as_str());
-      }
-    }
-    // NOTE: the engine entry walks `OggMeta::comments` directly and calls
-    // `JsonTagWriter::push_listable` for `OggComment::List` arms (Vorbis
-    // ARTIST=Alice/Bob coalescing into a single `TagValue::List` at
-    // first-occurrence position — faithful FoundTag semantics,
-    // ExifTool.pm:9505-9520), bypassing the generic `MetaSinker::sink`
-    // path. The `MetaSinker` impl above emits the same coalescing via
-    // `TagWriter::write_str_list` for generic sinks (MapTagWriter tests).
-    true
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1558,8 +1450,7 @@ impl ProcessOgg {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_writer::JsonTagWriter;
-  use crate::sink::{MapTagWriter, MapValue};
+  use crate::tagmap::TagMap;
 
   // `convert_bitrate` unit-tests REMOVED (R1 F2): `convert_bitrate` is a
   // PrintConv helper used only by the now-deferred Vorbis/Theora codec
@@ -1844,14 +1735,17 @@ mod tests {
 
   #[test]
   fn process_ogg_short_buffer_rejects_cleanly() {
-    let mut m = JsonTagWriter::new("x.ogg");
     // Only the 4-byte `OggS` magic — header is far short of the 28-byte
-    // minimum Ogg.pm:94 demands. `ProcessOgg` returns false; nothing
-    // pushed to metadata. (See also `tests/conformance.rs::
-    // ogg_truncated_error_conformance` for the 27-byte boundary pin.)
-    let mut ctx = ParseContext::new(b"OggS", "OGG", 0, "OGG", None, true, &mut m);
-    assert!(!ProcessOgg.process(&mut ctx));
-    assert!(m.tags().is_empty(), "no tags pushed before SetFileType");
+    // minimum Ogg.pm:94 demands. The engine does not finalize OGG; the
+    // post-loop emits a finalization error instead. (See also
+    // `tests/conformance.rs::ogg_truncated_error_conformance`.)
+    let json = crate::parser::extract_info("x.ogg", b"OggS", true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let obj = v.as_array().unwrap()[0].as_object().unwrap();
+    assert_ne!(
+      obj.get("File:FileType").and_then(|x| x.as_str()),
+      Some("OGG")
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -1872,7 +1766,7 @@ mod tests {
   #[test]
   fn meta_sinker_emits_vorbis_scalars() {
     // Drive a typed Meta with a vendor + a non-list scalar; verify
-    // MetaSinker emits both via write_str.
+    // serialize_tags emits both via write_str.
     let meta = OggMeta {
       file_type_override: None,
       comments: vec![
@@ -1891,20 +1785,17 @@ mod tests {
       success: true,
       _marker: core::marker::PhantomData,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(
-      w.get("Vorbis", "Vendor").map(MapValue::as_str),
+      w.get_str("Vorbis", "Vendor"),
       Some("test vendor".to_string())
     );
-    assert_eq!(
-      w.get("Vorbis", "Title").map(MapValue::as_str),
-      Some("Song".to_string())
-    );
+    assert_eq!(w.get_str("Vorbis", "Title"), Some("Song".to_string()));
   }
 
-  /// Codex CF2: the typed `MetaSinker::sink` List arm reaches
-  /// `TagWriter::write_str_list`, so a `JsonTagWriter` consumer gets a
+  /// Codex CF2: the typed `serialize_tags` List arm reaches
+  /// `TagMap::write_str_list`, so a `TagMap` consumer gets a
   /// coalesced first-occurrence-position `TagValue::List` (faithful
   /// `FoundTag`, ExifTool.pm:9505-9520) instead of last-write-wins. Vorbis
   /// List=>1 tags: ARTIST/PERFORMER/CONTACT.
@@ -1930,14 +1821,10 @@ mod tests {
       success: true,
       _marker: core::marker::PhantomData,
     };
-    let mut md = JsonTagWriter::new("x.ogg");
-    meta.sink(true, &mut md).unwrap();
-    let artist = md
-      .tags()
-      .iter()
-      .find(|t| t.name() == "Artist")
-      .expect("Artist tag");
-    match artist.value() {
+    let mut md = TagMap::new();
+    meta.serialize_tags(true, &mut md).unwrap();
+    let artist = md.get("Vorbis", "Artist").expect("Artist tag");
+    match artist {
       TagValue::List(items) => {
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], TagValue::Str(s) if s == "Alice"));
@@ -1949,7 +1836,7 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_warnings() {
-    // A typed Meta with no comments but two warnings — MetaSinker
+    // A typed Meta with no comments but two warnings — serialize_tags
     // routes them to write_warning.
     let meta = OggMeta {
       file_type_override: None,
@@ -1961,8 +1848,8 @@ mod tests {
       success: false,
       _marker: core::marker::PhantomData,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(
       w.warnings(),
       &[

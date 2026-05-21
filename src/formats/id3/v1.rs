@@ -9,9 +9,8 @@
 use crate::{
   convert::{ConvContext, apply_ctx},
   formats::id3::text::convert_id3v1_text,
-  json_writer::JsonTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
-  value::{Group, TagValue},
+  value::{Group, Metadata, TagValue},
 };
 use smol_str::SmolStr;
 
@@ -310,12 +309,7 @@ fn truncate_at_first_null(b: &[u8]) -> &[u8] {
 ///
 /// `data` must be exactly 128 bytes and begin with `b"TAG"` (the magic;
 /// the caller's `ProcessID3` matches `^TAG`, ID3.pm:1511).
-pub fn process_id3v1(
-  data: &[u8],
-  meta: &mut JsonTagWriter,
-  print_conv_on: bool,
-  ctx: &ConvContext,
-) {
+pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx: &ConvContext) {
   // Caller (`ProcessID3`, ID3.pm:1511) guarantees a 128-byte TAG block.
   // Validate panic-free: any other shape is a faithful no-op (Perl
   // ProcessBinaryData over a too-short block would emit no tags).
@@ -330,7 +324,7 @@ pub fn process_id3v1(
   // first, then trailer), so the order is correct for our push-based
   // serializer.
 
-  let push_text = |off: usize, len: usize, def: &'static TagDef, meta: &mut JsonTagWriter| {
+  let push_text = |off: usize, len: usize, def: &'static TagDef, meta: &mut Metadata| {
     let raw = &data[off..off + len];
     let raw = truncate_at_first_null(raw);
     if raw.is_empty() {
@@ -484,7 +478,7 @@ mod tests {
     let data = make_tag_block(
       "Title", "Artist", "Album", "2003", "Comment", None, 7, /* Hip-Hop */
     );
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
     let names: Vec<(&str, &str, TagValue)> = m
@@ -516,7 +510,7 @@ mod tests {
       Some(5), /* track */
       7,       /* Hip-Hop */
     );
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
     let track = m.tags().iter().find(|t| t.name() == "Track");
@@ -528,7 +522,7 @@ mod tests {
   fn process_id3v1_minus_n_emits_genre_as_byte() {
     // PrintConv off → raw byte value (i64 7) instead of "Hip-Hop".
     let data = make_tag_block("T", "A", "Al", "2003", "Cmt", None, 7);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, false, &ctx);
     let g = m.tags().iter().find(|t| t.name() == "Genre").unwrap();
@@ -539,7 +533,7 @@ mod tests {
   fn process_id3v1_unknown_genre_byte_yields_unknown_fallback() {
     // Genre 200 is sparse — ExifTool hash lookup misses → "Unknown (200)".
     let data = make_tag_block("T", "A", "Al", "2003", "Cmt", None, 200);
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
     let g = m.tags().iter().find(|t| t.name() == "Genre").unwrap();
@@ -557,7 +551,7 @@ mod tests {
     block[94] = b'0';
     block[95] = 0;
     block[96] = b'X';
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&block, &mut m, true, &ctx);
     let year = m.tags().iter().find(|t| t.name() == "Year").unwrap();
@@ -578,7 +572,7 @@ mod tests {
     // Comment field bytes (offset 97..127):
     // "Cmt" + 25 nulls + "\0\x07" (Track sentinel + track 7)
     // After R2 fix: comment value = "Cmt" (truncated at first NUL).
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
     let cmt = m.tags().iter().find(|t| t.name() == "Comment").unwrap();
@@ -589,7 +583,7 @@ mod tests {
 
   #[test]
   fn process_id3v1_non_128_byte_block_is_no_op() {
-    let mut m = JsonTagWriter::new("x.mp3");
+    let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     // <128 bytes: silently no-op (real callers gate by file length).
     process_id3v1(b"TAG\x00", &mut m, true, &ctx);

@@ -7,16 +7,18 @@
 //! `AnyParser::extract_into`. Design spec at
 //! `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`.
 //!
-//! The four central pieces, per spec §6:
+//! The central pieces, per spec §6:
 //!
 //! - [`FormatParser`] — the central parser trait with associated `Meta`,
 //!   `Context<'a>`, and `Error` types. Sealed via [`parser_sealed::Sealed`]
 //!   so downstream crates cannot add format arms.
-//! - [`TagWriter`] — fallible sink receiving tag emissions. Mirrors
-//!   `mediaframe::PixelSink`. Implementors that cannot fail use
-//!   [`core::convert::Infallible`] as `Error`.
-//! - [`MetaSinker`] — implemented by `Meta` types; emits the format's tags
-//!   into a `TagWriter`.
+//! - Each `Meta` type's inherent `serialize_tags(print_conv, &mut
+//!   crate::tagmap::TagMap)` method — the typed-Meta rendering seam that emits
+//!   the format's `(Group1, Name, value)` tags into the inline
+//!   [`crate::tagmap::TagMap`] sink (which applies the faithful first-wins
+//!   dedup). [`AnyMeta::serialize_tags`] dispatches across the closed set and
+//!   flattens chained sub-Metas. The optional [`Rendered`] wrapper drives it
+//!   for the `-j`/`-n` serde view.
 //! - [`SharedFlags`] — cross-format shared state (DoneID3 / DoneAPE / file-type
 //!   stack) threaded through chained parsers.
 //!
@@ -24,8 +26,6 @@
 //! runtime-keyed parser registry. Each format adds an arm in Phase E (MOI)
 //! / Phase F (everything else). Both are `#[non_exhaustive]` so new format
 //! arms are additive.
-
-use core::fmt;
 
 pub(crate) mod parser_sealed {
   /// Sealed marker for the new [`super::FormatParser`] trait. Downstream
@@ -61,7 +61,7 @@ pub(crate) mod parser_sealed {
 /// 1. Implementing [`parser_sealed::Sealed`] on the new parser type;
 /// 2. Implementing this `FormatParser` trait on it;
 /// 3. Adding a `#[cfg(feature = "<fmt>")]`-gated arm to [`AnyParser`],
-///    [`AnyMeta`], and [`AnyMeta`]'s [`MetaSinker`] impl.
+///    [`AnyMeta`], and [`AnyMeta`]'s `serialize_tags` impl.
 pub trait FormatParser: parser_sealed::Sealed {
   /// The typed metadata structure this parser produces on a successful
   /// parse, as a **generic associated type** parameterized by the input
@@ -85,111 +85,14 @@ pub trait FormatParser: parser_sealed::Sealed {
   where
     Self: 'a;
   /// Rust-level fatal error (distinct from Perl `Warn`/`Error` tags, which
-  /// belong to `Meta` and propagate via [`TagWriter::write_warning`] /
-  /// [`TagWriter::write_error`]).
+  /// belong to `Meta` and surface through the typed `serialize_tags` emission
+  /// into [`crate::tagmap::TagMap`]).
   type Error;
 
   /// Run the parser on a per-format `Context`. The returned `Meta<'a>`
   /// borrows from the same `'a` as the input `Context`. See trait docs for
   /// return value semantics.
   fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error>;
-}
-
-/// Receivers of tag emissions. Implemented by JSON writers, in-memory
-/// `BTreeMap` collectors, validation harnesses, etc.
-///
-/// Sinks that cannot fail use [`core::convert::Infallible`] as `Error` —
-/// the compiler eliminates the `Result` branching at every call site.
-/// Same pattern as `mediaframe::PixelSink::Error`.
-///
-/// Methods take primitive types directly rather than a `TagValue` enum:
-/// this lets implementors write specialized output paths (e.g., JSON
-/// numeric-vs-string emission for `u64` vs `&str`) without an intermediate
-/// boxed/enum allocation. The [`Self::write_fmt`] entry is the no-alloc
-/// workhorse: `PrintConv` strings format directly into the writer's sink,
-/// never materializing as a `String`.
-pub trait TagWriter {
-  /// Sink-level error type. Implementors that cannot fail set this to
-  /// [`core::convert::Infallible`].
-  type Error;
-
-  /// Emit a `&str` value (e.g., `File:FileType=MOI`).
-  fn write_str(&mut self, group: &str, name: &str, value: &str) -> Result<(), Self::Error>;
-  /// Emit a `u64` value (e.g., `File:FileSize=12345`).
-  fn write_u64(&mut self, group: &str, name: &str, value: u64) -> Result<(), Self::Error>;
-  /// Emit an `i64` value (e.g., a signed integer tag).
-  fn write_i64(&mut self, group: &str, name: &str, value: i64) -> Result<(), Self::Error>;
-  /// Emit an `f64` value (e.g., a rational converted to floating point).
-  fn write_f64(&mut self, group: &str, name: &str, value: f64) -> Result<(), Self::Error>;
-  /// Emit raw bytes (e.g., a cover-art payload).
-  fn write_bytes(&mut self, group: &str, name: &str, value: &[u8]) -> Result<(), Self::Error>;
-  /// Format directly into the writer's `core::fmt::Write` sink — no
-  /// intermediate `String` allocation. Used by `PrintConv` emissions
-  /// (e.g., `ConvertDuration` → `"0:05:00.300"`).
-  fn write_fmt(
-    &mut self,
-    group: &str,
-    name: &str,
-    f: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
-  ) -> Result<(), Self::Error>;
-  /// Emit a `Warning` tag (Perl `$et->Warn`).
-  fn write_warning(&mut self, text: &str) -> Result<(), Self::Error>;
-  /// Emit an `Error` tag (Perl `$et->Error`).
-  fn write_error(&mut self, text: &str) -> Result<(), Self::Error>;
-  /// Emit a list of `&str` values for a single (group, name) key — the
-  /// list-coalesce primitive used by Vorbis ARTIST=Alice/Bob style tag
-  /// repeats and APE's `Track-tag/Tag2-trailing-list` walker.
-  ///
-  /// The default implementation calls [`Self::write_str`] for each
-  /// element in order. Writers that DO want list-aware semantics (e.g.
-  /// the engine [`crate::json_writer::JsonTagWriter`]) override this method
-  /// to coalesce into a single first-occurrence-position list value.
-  /// Stateless writers (`MapTagWriter`, future JSON-array sinks) keep the
-  /// default and either see last-write-wins (map storage) or emit each
-  /// element as a separate JSON value (array sinks).
-  ///
-  /// Added in Phase G to let OGG/FLAC bridges use the generic
-  /// [`MetaSinker`] path instead of calling `Metadata::push_listable`
-  /// directly (per F3-FLAC / F4-OGG integration notes).
-  fn write_str_list(
-    &mut self,
-    group: &str,
-    name: &str,
-    values: &[&str],
-  ) -> Result<(), Self::Error> {
-    for v in values {
-      self.write_str(group, name, v)?;
-    }
-    Ok(())
-  }
-}
-
-/// Implemented by `Meta` types: emits the format's tags into a [`TagWriter`].
-/// "One who sinks metadata into a destination."
-///
-/// Errors propagate from the writer (the Meta itself has no error states —
-/// fallibility belongs to the destination).
-///
-/// **Phase E discovery — `print_conv` parameter.** Spec §6.3 originally
-/// shaped this as `sink<W>(&self, out: &mut W)` with no mode flag. The MOI
-/// pilot (Phase E) surfaced that byte-exact reproduction of the bundled
-/// `perl exiftool -j` / `-n` JSON pair requires the Meta to know whether
-/// PrintConv strings (e.g. `ConvertDuration("8.16 s")`) or post-ValueConv
-/// raw values (e.g. `8.16` as `f64`) should be emitted. This mirrors
-/// ExifTool's `$$self{OPTIONS}{PrintConv}` flag (ExifTool.pm:5710): the
-/// PrintConv toggle is a global engine option, not a writer/sink choice.
-///
-/// Library callers consuming typed accessors on the Meta directly never
-/// touch this trait; only the CLI JSON path (`MetaSinker` → `TagWriter`)
-/// needs the toggle.
-pub trait MetaSinker {
-  /// Emit this Meta's tags into `out`. Emission order should mirror the
-  /// bundled-Perl iteration order of the format's tag table.
-  ///
-  /// `print_conv = true` emits PrintConv strings (faithful to
-  /// `perl exiftool -j`); `print_conv = false` emits post-ValueConv raw
-  /// scalars (faithful to `perl exiftool -j -n`).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error>;
 }
 
 /// Cross-format shared state. Threaded through chained parsers
@@ -489,8 +392,19 @@ pub enum AnyMeta<'a> {
   _Phantom(core::marker::PhantomData<&'a ()>),
 }
 
-impl MetaSinker for AnyMeta<'_> {
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+#[cfg(feature = "alloc")]
+impl AnyMeta<'_> {
+  /// Serialize this typed Meta's FORMAT tags into the inline tag-collection
+  /// sink [`crate::tagmap::TagMap`] (the typed-path replacement for the deleted
+  /// `serialize_tags`). Dispatches to each format's inherent
+  /// `serialize_tags`, flattening nested sub-Metas (Mp3 → ID3/MPEG/APE,
+  /// Dsf/Ape → ID3). `print_conv = true` emits PrintConv strings (`-j`);
+  /// `false` emits post-ValueConv raw scalars (`-n`). Infallible.
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     // `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)` gates
     // means a `_`-less match is exhaustive when ≥1 format feature is on
     // (the real arms), and when NO format feature is on (only the
@@ -499,47 +413,46 @@ impl MetaSinker for AnyMeta<'_> {
     // type-checking.
     match self {
       #[cfg(feature = "moi")]
-      AnyMeta::Moi(m) => m.sink(print_conv, out),
+      AnyMeta::Moi(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "aac")]
-      AnyMeta::Aac(m) => m.sink(print_conv, out),
+      AnyMeta::Aac(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "dv")]
       AnyMeta::Dv(o) => match o {
-        // DV.pm:188 — Warn + return 1 without DV:* tags. This `MetaSinker`
-        // path (library `parse_bytes`/`sink`) emits the warning and no
-        // tags. The engine entry `dv::ProcessDv::process` emits the same
-        // warning via `ctx.metadata().push_warning` after `SetFileType`.
+        // DV.pm:188 — Warn + return 1 without DV:* tags. The typed path emits
+        // the warning and no tags (the document builder surfaces it as the
+        // ExifTool:Warning).
         crate::formats::dv::DvParseOutcome::UnrecognizedProfile => {
           out.write_warning("Unrecognized DV profile")
         }
-        crate::formats::dv::DvParseOutcome::Meta(m) => m.sink(print_conv, out),
+        crate::formats::dv::DvParseOutcome::Meta(m) => m.serialize_tags(print_conv, out),
       },
       #[cfg(feature = "audible")]
-      AnyMeta::Aa(m) => m.sink(print_conv, out),
+      AnyMeta::Aa(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "red")]
-      AnyMeta::R3d(m) => m.sink(print_conv, out),
+      AnyMeta::R3d(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "id3")]
-      AnyMeta::Id3(m) => m.sink(print_conv, out),
+      AnyMeta::Id3(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mp3")]
-      AnyMeta::Mp3(m) => m.sink(print_conv, out),
+      AnyMeta::Mp3(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "aiff")]
-      AnyMeta::Aiff(m) => m.sink(print_conv, out),
+      AnyMeta::Aiff(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "ape")]
-      AnyMeta::Ape(m) => m.sink(print_conv, out),
+      AnyMeta::Ape(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "dsf")]
-      AnyMeta::Dsf(m) => m.sink(print_conv, out),
+      AnyMeta::Dsf(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "flac")]
-      AnyMeta::Flac(m) => m.sink(print_conv, out),
+      AnyMeta::Flac(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "ogg")]
-      AnyMeta::Ogg(m) => m.sink(print_conv, out),
+      AnyMeta::Ogg(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mpeg-audio")]
-      AnyMeta::MpegAudio(m) => m.sink(print_conv, out),
+      AnyMeta::MpegAudio(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mpc")]
-      AnyMeta::Mpc(m) => m.sink(print_conv, out),
+      AnyMeta::Mpc(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "wavpack")]
-      AnyMeta::Wv(m) => m.sink(print_conv, out),
+      AnyMeta::Wv(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
-      // (Codex CF3). `PhantomData` carries no data, so there is nothing to
-      // sink; the arm exists purely for exhaustiveness.
+      // (Codex CF3). `PhantomData` carries no data; the arm exists purely
+      // for exhaustiveness.
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -565,6 +478,118 @@ impl MetaSinker for AnyMeta<'_> {
   }
 }
 
+/// How the engine ([`crate::parser::extract_info`]) should finalize the
+/// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
+/// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
+/// (now-removed) `process` entry used to make. The format chooses the variant;
+/// the engine applies it against its file-type-resolution helpers.
+///
+/// `#[non_exhaustive]` like the sibling closed-set enums: variants are
+/// additive within the crate.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTypeFinalize {
+  /// `SetFileType()` with no argument — finalize to the DETECTED candidate
+  /// type (ExifTool.pm:9684). The MOI/AAC/DV/Audible/Red/APE/DSF/FLAC/MPC/WV
+  /// `Process<Type>` entries all do this (`AAC.pm:107` etc.).
+  Detected,
+  /// `SetFileType($explicit)` — finalize to an EXPLICIT type the parser
+  /// derived from the file body (AIFF: `AIFF`/`AIFC`/`DJVU` from the FORM
+  /// magic, AIFF.pm:202/210).
+  Explicit(&'static str),
+  /// `SetFileType()` then `OverrideFileType($target)` — finalize to the
+  /// detected type, then in-place override (OGG → `OGV`/`OPUS`, Ogg.pm:49-50).
+  DetectedThenOverride(&'static str),
+  /// `SetFileType($set)` then raw-replace the `File:FileType` VALUE with
+  /// `$literal` (AIFF DjVu multi-page: `SetFileType('DJVU')` then
+  /// `$$self{VALUE}{FileType} = 'DJVU (multi-page)'`, AIFF.pm:206). The
+  /// `FileTypeExtension` / `MIMEType` are derived from `$set`, NOT `$literal`.
+  ExplicitThenLiteral {
+    /// The type passed to `SetFileType` (drives `FileTypeExtension`/`MIMEType`).
+    set: &'static str,
+    /// The literal that replaces the `File:FileType` value in place.
+    literal: &'static str,
+  },
+}
+
+impl AnyMeta<'_> {
+  /// How the engine should finalize the `File:*` triplet for this accepted
+  /// Meta (the typed-path replacement for the per-format `SetFileType` /
+  /// `OverrideFileType` calls). See [`FileTypeFinalize`].
+  #[must_use]
+  pub fn finalize_file_type(&self) -> FileTypeFinalize {
+    match self {
+      // Leaf + chained formats that finalize to the detected candidate type.
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(_) => FileTypeFinalize::Detected,
+      // ID3 is a directory parser (no top-level file type); it has no engine
+      // entry. Treat as detected for completeness (unreachable from
+      // `extract_info`, which never dispatches ID3 as a file type).
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(_) => FileTypeFinalize::Detected,
+      // AIFF: explicit magic-derived type, with the DjVu multi-page literal.
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => {
+        let ft = m.magic().as_file_type();
+        if m.djvu_multi_page() {
+          FileTypeFinalize::ExplicitThenLiteral {
+            set: ft,
+            literal: "DJVU (multi-page)",
+          }
+        } else {
+          FileTypeFinalize::Explicit(ft)
+        }
+      }
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(_) => FileTypeFinalize::Detected,
+      // OGG: detected ("OGG"), then optional content override (OGV/OPUS).
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => match m.file_type_override() {
+        Some(target) => FileTypeFinalize::DetectedThenOverride(target),
+        None => FileTypeFinalize::Detected,
+      },
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(_) => FileTypeFinalize::Detected,
+      #[cfg(not(any(
+        feature = "moi",
+        feature = "aac",
+        feature = "dv",
+        feature = "audible",
+        feature = "red",
+        feature = "id3",
+        feature = "mp3",
+        feature = "aiff",
+        feature = "ape",
+        feature = "dsf",
+        feature = "flac",
+        feature = "ogg",
+        feature = "mpeg-audio",
+        feature = "mpc",
+        feature = "wavpack",
+      )))]
+      AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
+    }
+  }
+}
+
 /// A mode-carrying [`Serialize`](serde::Serialize) view of a typed
 /// [`AnyMeta`]: the `-j` (PrintConv) vs `-n` (raw ValueConv) toggle that the
 /// CLI applies, packaged so a caller can render the typed parse result to JSON
@@ -579,7 +604,7 @@ impl MetaSinker for AnyMeta<'_> {
 /// (`SourceFile`, the `File:*` triplet, `ExifTool:ExifToolVersion`); those are
 /// the engine's responsibility (`extract_info` emits them around the format
 /// tags). Chained Metas (Mp3 wrapping ID3/MPEG/APE, etc.) flatten all their
-/// sub-Metas' tags into the one object via the [`MetaSinker`] chain.
+/// sub-Metas' tags into the one object via the `serialize_tags` chain.
 ///
 /// `#[non_exhaustive]`-free (a plain value wrapper); construct via
 /// [`Rendered::new`]. D8 convention: no public fields.
@@ -618,36 +643,28 @@ impl<'a, 'm> Rendered<'a, 'm> {
 }
 
 // Optional serde `Serialize` for `Rendered` (skill §8: one anonymous gated
-// const block). It drives the existing `MetaSinker::sink` to collect the Meta's
-// tags into a `Vec<Tag>` (the same emission the engine uses), then serializes
-// them as a flat `"<Group1>:<Name>": value` object via `TagValue`'s own
-// `Serialize`. `%noDups` first-wins on the family1 token mirrors the document
-// renderer. Reusing `sink` keeps the -j/-n logic in ONE place (the per-Meta
-// `MetaSinker` impls), not duplicated here.
+// const block). It drives the typed Meta's inherent `serialize_tags` to collect
+// the format tags into a `TagMap` (the same emission the engine uses, with the
+// -j/-n choice + chain flattening in ONE place), then serializes them as a flat
+// `"<Group1>:<Name>": value` object via `TagValue`'s own `Serialize`. The
+// `TagMap` already applied `%noDups` first-wins on the `"<Group1>:<Name>"` key.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
 const _: () = {
-  use crate::json_writer::JsonTagWriter;
+  use crate::tagmap::TagMap;
   use serde::ser::{Serialize, SerializeMap, Serializer};
-  use std::collections::BTreeSet;
-  use std::string::String;
 
   impl Serialize for Rendered<'_, '_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-      // Collect the Meta's tags via the SAME `MetaSinker::sink` the engine
-      // drives (so the -j/-n choice + chain flattening live in one place).
-      // The writer's `SourceFile` is unused here — `Rendered` emits only the
-      // format tags, not the orchestration triplet.
-      let mut w = JsonTagWriter::new("");
-      // `sink` is infallible (`Infallible` error), so this never fails.
-      let _ = self.meta.sink(self.print_conv, &mut w);
-      let mut map = s.serialize_map(None)?;
-      let mut seen: BTreeSet<String> = BTreeSet::new();
-      for (group, name, value) in w.records() {
-        let token = std::format!("{}:{}", group.family1(), name);
-        if seen.insert(token.clone()) {
-          map.serialize_entry(&token, value)?;
-        }
+      // Collect the Meta's FORMAT tags via the inherent `serialize_tags` (the
+      // typed-path tag emission). `Rendered` emits only the format tags, not
+      // the orchestration triplet. `serialize_tags` is infallible.
+      let mut tm = TagMap::new();
+      let _ = self.meta.serialize_tags(self.print_conv, &mut tm);
+      let entries = tm.entries();
+      let mut map = s.serialize_map(Some(entries.len()))?;
+      for (key, value) in entries {
+        map.serialize_entry(key.as_str(), value)?;
       }
       map.end()
     }
@@ -1098,87 +1115,6 @@ impl AnyParser {
       }
     }
   }
-
-  /// Engine dispatch for [`crate::parser::extract_info`]: run this format's
-  /// parser against the per-file value sink in `ctx`, emitting `File:*`
-  /// (via `ctx.set_file_type`/`override_file_type`) and every format tag
-  /// directly into `ctx.metadata()`.
-  ///
-  /// Returns `true` (Perl `return 1`) when the parser accepted the data —
-  /// finalizing this file type — and `false` (Perl `return 0`) so
-  /// `extract_info` tries the next detection candidate. **Side effects
-  /// already made on `ctx.metadata()` PERSIST regardless of the return
-  /// value** (faithful to ExifTool's `$self` model; e.g. MPEG.pm:675
-  /// `SetFileType` then :678 `or return 0` keeps `File:FileType=MPEG`).
-  ///
-  /// Each arm delegates to the format module's own `process` entry, which
-  /// owns the faithful ordering of `SetFileType` / `FoundTag` / `Warn` /
-  /// `Error` and any cross-format chain (ID3 → MPEG → APE trailer, etc.).
-  /// This is the single closed-set engine dispatch site (resolved via
-  /// [`any_parser_for`]).
-  pub(crate) fn extract_into(self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
-    // `ctx` is only consumed by the file-type *engine entry* arms below.
-    // `id3` and `mpeg-audio` are directory / internal parsers with no
-    // top-level engine entry (their arms return `false` without touching
-    // `ctx`), and a no-format build has no arms at all — so when none of the
-    // dispatching features is enabled, `ctx` is unused. Discard it then to
-    // stay warning-clean (Codex CF3 generalized).
-    #[cfg(not(any(
-      feature = "moi",
-      feature = "aac",
-      feature = "dv",
-      feature = "audible",
-      feature = "red",
-      feature = "mp3",
-      feature = "aiff",
-      feature = "ape",
-      feature = "dsf",
-      feature = "flac",
-      feature = "ogg",
-      feature = "mpc",
-      feature = "wavpack",
-    )))]
-    let _ = ctx;
-    match self {
-      #[cfg(feature = "moi")]
-      AnyParser::Moi(p) => p.process(ctx),
-      #[cfg(feature = "aac")]
-      AnyParser::Aac(p) => p.process(ctx),
-      #[cfg(feature = "dv")]
-      AnyParser::Dv(p) => p.process(ctx),
-      #[cfg(feature = "audible")]
-      AnyParser::Aa(p) => p.process(ctx),
-      #[cfg(feature = "red")]
-      AnyParser::R3D(p) => p.process(ctx),
-      // ID3 is a *directory* parser (PROCESS_PROC, ID3.pm:78), never a
-      // top-level file-type in `any_parser_for`; it has no engine entry.
-      // The arm is unreachable from `extract_info` but must be covered.
-      #[cfg(feature = "id3")]
-      AnyParser::Id3(_) => false,
-      #[cfg(feature = "mp3")]
-      AnyParser::Mp3(p) => p.process(ctx),
-      #[cfg(feature = "aiff")]
-      AnyParser::Aiff(p) => p.process(ctx),
-      #[cfg(feature = "ape")]
-      AnyParser::Ape(p) => p.process(ctx),
-      #[cfg(feature = "dsf")]
-      AnyParser::Dsf(p) => p.process(ctx),
-      #[cfg(feature = "flac")]
-      AnyParser::Flac(p) => p.process(ctx),
-      #[cfg(feature = "ogg")]
-      AnyParser::Ogg(p) => p.process(ctx),
-      // MPEG-audio is invoked internally by MP3 (ID3.pm:1716), never a
-      // top-level file-type in `any_parser_for`; it has no standalone
-      // engine entry. The arm is unreachable from `extract_info` but must
-      // be covered by the closed-set match.
-      #[cfg(feature = "mpeg-audio")]
-      AnyParser::MpegAudio(_) => false,
-      #[cfg(feature = "mpc")]
-      AnyParser::Mpc(p) => p.process(ctx),
-      #[cfg(feature = "wavpack")]
-      AnyParser::Wv(p) => p.process(ctx),
-    }
-  }
 }
 
 /// Map a finalized ExifTool file-type string to its [`AnyParser`] arm, or
@@ -1227,149 +1163,6 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::sink::{MapTagWriter, MapValue};
-  use core::convert::Infallible;
-  use std::string::ToString;
-
-  /// Smoke test: `MapTagWriter` actually implements [`TagWriter`] and the
-  /// trait methods are callable without going through any other type.
-  #[test]
-  fn map_tag_writer_implements_tag_writer() {
-    let mut w = MapTagWriter::new();
-    w.write_str("Group", "Name", "value").unwrap();
-    w.write_u64("Group", "U64", 42).unwrap();
-    w.write_i64("Group", "I64", -7).unwrap();
-    w.write_f64("Group", "F64", 3.5).unwrap();
-    w.write_bytes("Group", "Bytes", &[1, 2, 3]).unwrap();
-    w.write_fmt("Group", "Fmt", |f| write!(f, "0:05:00.300"))
-      .unwrap();
-    w.write_warning("warn-text").unwrap();
-    w.write_error("err-text").unwrap();
-
-    // 6 keyed entries + 1 warning + 1 error = 8 total entries in the map.
-    assert_eq!(w.len(), 8);
-    assert_eq!(
-      w.get("Group", "Name").map(MapValue::as_str),
-      Some("value".to_string())
-    );
-    assert_eq!(
-      w.get("Group", "U64").map(MapValue::as_str),
-      Some("42".to_string())
-    );
-    assert_eq!(
-      w.get("Group", "I64").map(MapValue::as_str),
-      Some("-7".to_string())
-    );
-    assert_eq!(
-      w.get("Group", "F64").map(MapValue::as_str),
-      Some("3.5".to_string())
-    );
-    assert_eq!(
-      w.get("Group", "Fmt").map(MapValue::as_str),
-      Some("0:05:00.300".to_string())
-    );
-    assert!(w.warnings().iter().any(|s| s == "warn-text"));
-    assert!(w.errors().iter().any(|s| s == "err-text"));
-  }
-
-  /// A toy Meta + MetaSinker impl proves the dataflow Meta → TagWriter
-  /// compiles end-to-end (associated `Error` type plumbing, lifetime
-  /// bounds on the writer, etc.).
-  #[derive(Debug, Clone, Copy)]
-  struct DummyMeta<'a> {
-    name: &'a str,
-    size: u64,
-  }
-
-  impl MetaSinker for DummyMeta<'_> {
-    fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
-      out.write_str("Dummy", "Name", self.name)?;
-      if print_conv {
-        // Faithful to the PrintConv toggle: emit a formatted text view
-        // when print_conv is on; the raw numeric otherwise.
-        out.write_fmt("Dummy", "Size", |w| write!(w, "{} bytes", self.size))?;
-      } else {
-        out.write_u64("Dummy", "Size", self.size)?;
-      }
-      Ok(())
-    }
-  }
-
-  #[test]
-  fn meta_sinker_emits_into_map_tag_writer() {
-    let meta = DummyMeta {
-      name: "moi-fake",
-      size: 1234,
-    };
-    // -j (PrintConv on) — formatted bytes-string.
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("Dummy", "Name").map(MapValue::as_str),
-      Some("moi-fake".to_string())
-    );
-    assert_eq!(
-      w.get("Dummy", "Size").map(MapValue::as_str),
-      Some("1234 bytes".to_string())
-    );
-    // -n (PrintConv off) — raw u64.
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
-    assert_eq!(
-      w.get("Dummy", "Size").map(MapValue::as_str),
-      Some("1234".to_string())
-    );
-  }
-
-  /// Demonstrates that an `Infallible`-erroring sink compiles cleanly —
-  /// the Result path is collapsed at type-check time, so a
-  /// `?`-propagating sink chain never needs runtime branching on the
-  /// no-fail leg.
-  struct InfallibleSink;
-
-  impl TagWriter for InfallibleSink {
-    type Error = Infallible;
-    fn write_str(&mut self, _g: &str, _n: &str, _v: &str) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_u64(&mut self, _g: &str, _n: &str, _v: u64) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_i64(&mut self, _g: &str, _n: &str, _v: i64) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_f64(&mut self, _g: &str, _n: &str, _v: f64) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_bytes(&mut self, _g: &str, _n: &str, _v: &[u8]) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_fmt(
-      &mut self,
-      _g: &str,
-      _n: &str,
-      _f: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
-    ) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_warning(&mut self, _t: &str) -> Result<(), Infallible> {
-      Ok(())
-    }
-    fn write_error(&mut self, _t: &str) -> Result<(), Infallible> {
-      Ok(())
-    }
-  }
-
-  #[test]
-  fn infallible_sink_compiles_cleanly() {
-    let meta = DummyMeta { name: "x", size: 0 };
-    let mut sink = InfallibleSink;
-    // The `unwrap()` on an `Infallible` result is what the doc claims is
-    // collapsed at type-check; here we just ensure the dataflow compiles.
-    let result: Result<(), Infallible> = meta.sink(true, &mut sink);
-    let () = result.unwrap();
-  }
-
   #[test]
   fn shared_flags_round_trip() {
     let mut sf = SharedFlags::new();

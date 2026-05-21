@@ -7,8 +7,8 @@
 //!
 //! A typed [`WvMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] and the chained ID3/APE trailers so
+//! drives the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` and the chained ID3/APE trailers so
 //! the serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## What WavPack is
@@ -67,12 +67,7 @@
 //! yet; FORMATS.md row 22 will wire it. On the committed fixtures the
 //! deferral is observably no-op (no RIFF wrapper present).
 
-use core::convert::Infallible;
-
-use crate::{
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-};
+use crate::parser_new::{FormatParser, SharedFlags, parser_sealed};
 
 // ===========================================================================
 // Mask + BitShift constants
@@ -612,10 +607,11 @@ fn parse_inner(data: &[u8]) -> Option<WvMeta<'_>> {
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for WvMeta<'_> {
+#[cfg(feature = "alloc")]
+impl WvMeta<'_> {
   /// Emit WavPack tags into the writer in ExifTool numeric sort order
   /// (WavPack.pm:31-73 → ExifTool.pm:9907 sorted-key walk): 6.1
   /// BytesPerSample, 6.2 AudioType, 6.3 Compression, 6.4 DataFormat, 6.5
@@ -626,7 +622,11 @@ impl MetaSinker for WvMeta<'_> {
   /// `print_conv=true` ⇒ PrintConv strings (`-j` mode, e.g.
   /// `"Mono"`/`"Lossless"`/`"Custom"`); `print_conv=false` ⇒ post-ValueConv
   /// raw scalars (`-n` mode, e.g. `1`/`0`/`15`).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "File";
 
     // 6.1 BytesPerSample — post-ValueConv `+1` already applied at parse
@@ -694,95 +694,6 @@ impl std::error::Error for WvError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessWv {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (WavPack.pm:87-104):
-  /// 1. Magic + version-byte gate (`return 0` on reject) — WavPack.pm:87-88.
-  /// 2. `SetFileType` — WavPack.pm:89.
-  /// 3. ProcessBinaryData over the WavPack::Main table — WavPack.pm:91-95.
-  ///    The five header tags emit in numeric-key sort order
-  ///    (ExifTool.pm:9907).
-  /// 4. `Seek(0, 0)` + `RIFF::ProcessRIFF` — WavPack.pm:97-99
-  ///    (Phase-2 forward item; RIFF parser not ported yet — observably
-  ///    no-op on the committed fixtures).
-  /// 5. APE-trailer chain: `APE::ProcessAPE` — WavPack.pm:100-102.
-  ///    Routes through `crate::formats::ape::ProcessApe::process_trailer_only`
-  ///    (the same entry the bundled audio loop uses recursively).
-  ///    `ProcessApe::process_trailer_only` ALSO sets `done_ape`
-  ///    (APE.pm:131); this matches the bundled flag-setting order. On
-  ///    the committed fixtures (no APE trailer present) this is
-  ///    observably no-op.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Phase F5 bridge: extract the typed Meta from a fresh shared-flags
-    // workspace, then sink it back into the legacy `Metadata` plumbing.
-    // The lib-first `SharedFlags` is NOT the same store as the legacy
-    // `Metadata::done_id3` / `Metadata::done_ape`; the legacy chained
-    // parsers below read the latter, so we don't need to thread the
-    // former through here.
-    let meta_opt = {
-      let data = ctx.data();
-      parse_inner(data)
-    };
-    let Some(meta) = meta_opt else {
-      return false; // WavPack.pm:87-88 reject — `return 0`.
-    };
-
-    // WavPack.pm:89 `$et->SetFileType()` — no-arg ⇒ detected file type ("WV").
-    ctx.set_file_type(None, None, None);
-    let print_conv = ctx.print_conv_enabled();
-
-    // WavPack.pm:91-95 — sink the 5 header tags through the typed Meta.
-    // Faithful to the ProcessBinaryData iteration order (numeric-key
-    // sort) and the PrintConv / ValueConv toggle.
-    {
-      let _: Result<(), Infallible> = meta.sink(print_conv, ctx.writer());
-    }
-
-    // WavPack.pm:96-103: `RIFF::ProcessRIFF` + `APE::ProcessAPE` trailers.
-    // ----------------------------------------------------------------
-    // WavPack.pm:97-99 `Seek(0, 0)` + `RIFF::ProcessRIFF` — RIFF parser
-    // not ported yet (FORMATS.md row 22 forward item). On the committed
-    // fixtures (no RIFF wrapper) this is observably no-op.
-    //
-    // WavPack.pm:100-103 `$$et{PATH}[-1] = 'APE'` then
-    // `APE::ProcessAPE($et, $dirInfo)`. The bundled `ProcessAPE` itself
-    // dispatches to `ProcessID3` first (APE.pm:122-127 — the embedded
-    // ID3 arm). We invoke
-    // [`crate::formats::ape::ProcessApe::process_trailer_only`], which
-    // is the same entry the bundled audio loop uses recursively for
-    // the "wrapper has already set FileType, just scan for trailer"
-    // case. That entry:
-    //   * does NOT re-run the embedded-ID3 dispatch (APE.pm:122-127);
-    //     the bundled WavPack.pm DOES (the WavPack-level ProcessAPE
-    //     call goes through APE.pm:119 which checks `unless ($$et{
-    //     DoneID3})`). We need to drive the ID3 detection separately
-    //     before the APE trailer.
-    //   * DOES set `done_ape` (APE.pm:131) and scan for the APE-tag
-    //     trailer at EOF / ID3v1-adjusted position.
-    //
-    // ID3 dispatch — bundled APE.pm:122-127 `unless ($$et{DoneID3}) {
-    // require Image::ExifTool::ID3; Image::ExifTool::ID3::ProcessID3(
-    // $et, $dirInfo) and return 1; }`. The `and return 1` only fires
-    // when ProcessID3 succeeds AND we're in APE's own entry; in the
-    // WavPack chain, after the WavPack header tags are already pushed,
-    // hitting `return 1` from inside the APE call just means APE bails
-    // out of its own MAC body scan — the WavPack-level `return 1`
-    // (WavPack.pm:104) is unaffected. We model this faithfully via the
-    // chained `process_id3_chained` entry.
-    if ctx.writer().done_id3().is_none() {
-      let _ = crate::formats::id3::process::process_id3_chained(ctx);
-    }
-    let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
-
-    true // WavPack.pm:104 `return 1`.
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -790,11 +701,7 @@ impl ProcessWv {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    json_writer::JsonTagWriter,
-    sink::{MapTagWriter, MapValue},
-    value::TagValue,
-  };
+  use crate::tagmap::TagMap;
 
   // -------------------------------------------------------------------------
   // Mask + shift derivation
@@ -1014,25 +921,25 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // `MetaSinker` — typed Meta → TagWriter (PrintConv on / off)
+  // `serialize_tags` — typed Meta → TagMap (PrintConv on / off)
   // -------------------------------------------------------------------------
 
-  fn collect(flags_le: u32, print_conv: bool) -> MapTagWriter {
+  fn collect(flags_le: u32, print_conv: bool) -> TagMap {
     let data = header_with_flags(flags_le);
     let mut shared = SharedFlags::new();
     let ctx = WvContext::new(&data, &mut shared);
     let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
       .unwrap()
       .unwrap();
-    let mut w = MapTagWriter::new();
-    meta.sink(print_conv, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(print_conv, &mut w).unwrap();
     w
   }
 
   #[test]
   fn sink_print_on_emits_fixture_strings() {
     let w = collect(0x0480_008d, true);
-    let g = |n: &str| w.get("File", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("File", n);
     assert_eq!(g("BytesPerSample"), Some("1".into()));
     assert_eq!(g("AudioType"), Some("Mono".into()));
     assert_eq!(g("Compression"), Some("Lossless".into()));
@@ -1043,7 +950,7 @@ mod tests {
   #[test]
   fn sink_print_on_emits_adversarial_strings() {
     let w = collect(0xFFFF_FFFF, true);
-    let g = |n: &str| w.get("File", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("File", n);
     assert_eq!(g("BytesPerSample"), Some("4".into()));
     assert_eq!(g("AudioType"), Some("Mono".into()));
     assert_eq!(g("Compression"), Some("Hybrid".into()));
@@ -1054,7 +961,7 @@ mod tests {
   #[test]
   fn sink_print_off_emits_fixture_raw() {
     let w = collect(0x0480_008d, false);
-    let g = |n: &str| w.get("File", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("File", n);
     assert_eq!(g("BytesPerSample"), Some("1".into())); // +1 applied
     assert_eq!(g("AudioType"), Some("1".into()));
     assert_eq!(g("Compression"), Some("0".into()));
@@ -1066,7 +973,7 @@ mod tests {
   #[test]
   fn sink_print_off_emits_adversarial_raw() {
     let w = collect(0xFFFF_FFFF, false);
-    let g = |n: &str| w.get("File", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("File", n);
     assert_eq!(g("BytesPerSample"), Some("4".into())); // raw=3 +1
     assert_eq!(g("AudioType"), Some("1".into()));
     assert_eq!(g("Compression"), Some("1".into()));
@@ -1075,144 +982,121 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // Engine entry — typed parse + File:* + sink into `JsonTagWriter`
+  // Engine entry — typed parse + File:* + sink into `TagMap`
   // -------------------------------------------------------------------------
 
-  fn run_bridge(data: &[u8], print_on: bool) -> JsonTagWriter {
-    let mut m = JsonTagWriter::new("WavPack.wv");
-    let mut c = ParseContext::new(data, "WV", 0, "WV", None, print_on, &mut m);
-    ProcessWv.process(&mut c);
-    m
+  // The engine path is now `crate::parser::extract_info`. These run it and
+  // assert on the parsed JSON object (replacing the retired `ProcessWv::process`
+  // + `TagMap` tests).
+  fn engine_obj(data: &[u8], print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("WavPack.wv", data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+  fn is_wv(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("File:FileType").and_then(|v| v.as_str()) == Some("WV")
   }
 
   #[test]
   fn bridge_fixture_round_trip_print_on() {
-    let data = header_with_flags(0x0480_008d);
-    let m = run_bridge(&data, true);
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-    };
-    assert_eq!(by_name("FileType"), Some(TagValue::Str("WV".into())));
-    // `write_u64`-emitted integers ⇒ `TagValue::U64` (Codex A-R4-1).
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(1)));
-    assert_eq!(by_name("AudioType"), Some(TagValue::Str("Mono".into())));
+    let obj = engine_obj(&header_with_flags(0x0480_008d), true);
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    assert_eq!(s("File:FileType"), Some("WV"));
     assert_eq!(
-      by_name("Compression"),
-      Some(TagValue::Str("Lossless".into()))
+      obj.get("File:BytesPerSample").and_then(|v| v.as_u64()),
+      Some(1)
     );
-    assert_eq!(by_name("DataFormat"), Some(TagValue::Str("Integer".into())));
-    assert_eq!(by_name("SampleRate"), Some(TagValue::U64(48000)));
+    assert_eq!(s("File:AudioType"), Some("Mono"));
+    assert_eq!(s("File:Compression"), Some("Lossless"));
+    assert_eq!(s("File:DataFormat"), Some("Integer"));
+    assert_eq!(
+      obj.get("File:SampleRate").and_then(|v| v.as_u64()),
+      Some(48000)
+    );
   }
 
   #[test]
   fn bridge_fixture_round_trip_print_off() {
-    let data = header_with_flags(0x0480_008d);
-    let m = run_bridge(&data, false);
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-    };
-    // -n raw integers all emit via `write_u64` ⇒ `TagValue::U64`
-    // (Codex A-R4-1).
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(1)));
-    assert_eq!(by_name("AudioType"), Some(TagValue::U64(1)));
-    assert_eq!(by_name("Compression"), Some(TagValue::U64(0)));
-    assert_eq!(by_name("DataFormat"), Some(TagValue::U64(0)));
-    assert_eq!(by_name("SampleRate"), Some(TagValue::U64(10)));
+    let obj = engine_obj(&header_with_flags(0x0480_008d), false);
+    let u = |k: &str| obj.get(k).and_then(|v| v.as_u64());
+    assert_eq!(u("File:BytesPerSample"), Some(1));
+    assert_eq!(u("File:AudioType"), Some(1));
+    assert_eq!(u("File:Compression"), Some(0));
+    assert_eq!(u("File:DataFormat"), Some(0));
+    assert_eq!(u("File:SampleRate"), Some(10));
   }
 
   #[test]
   fn bridge_adversarial_round_trip_print_on() {
-    let data = header_with_flags(0xFFFF_FFFF);
-    let m = run_bridge(&data, true);
-    let by_name = |n: &str| {
-      m.tags()
-        .iter()
-        .find(|t| t.name() == n)
-        .map(|t| t.value().clone())
-    };
-    assert_eq!(by_name("BytesPerSample"), Some(TagValue::U64(4)));
-    assert_eq!(by_name("AudioType"), Some(TagValue::Str("Mono".into())));
-    assert_eq!(by_name("Compression"), Some(TagValue::Str("Hybrid".into())));
+    let obj = engine_obj(&header_with_flags(0xFFFF_FFFF), true);
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str());
     assert_eq!(
-      by_name("DataFormat"),
-      Some(TagValue::Str("Floating Point".into()))
+      obj.get("File:BytesPerSample").and_then(|v| v.as_u64()),
+      Some(4)
     );
-    assert_eq!(by_name("SampleRate"), Some(TagValue::Str("Custom".into())));
+    assert_eq!(s("File:AudioType"), Some("Mono"));
+    assert_eq!(s("File:Compression"), Some("Hybrid"));
+    assert_eq!(s("File:DataFormat"), Some("Floating Point"));
+    assert_eq!(s("File:SampleRate"), Some("Custom"));
   }
 
   #[test]
   fn bridge_rejects_short() {
-    let mut m = JsonTagWriter::new("WavPack.wv");
-    let data = vec![0u8; 16];
-    let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!ProcessWv.process(&mut c));
-    assert!(m.tags().is_empty()); // no SetFileType run
+    assert!(!is_wv(&engine_obj(&vec![0u8; 16], true)));
   }
 
   #[test]
   fn bridge_rejects_bad_magic() {
-    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"WVPK");
-    let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!ProcessWv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_wv(&engine_obj(&data, true)));
   }
 
   #[test]
   fn bridge_rejects_bad_version_byte_8() {
-    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x05;
     data[9] = 0x04;
-    let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!ProcessWv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_wv(&engine_obj(&data, true)));
   }
 
   #[test]
   fn bridge_rejects_bad_version_byte_9() {
-    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x10;
     data[9] = 0x05;
-    let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!ProcessWv.process(&mut c));
-    assert!(m.tags().is_empty());
+    assert!(!is_wv(&engine_obj(&data, true)));
   }
 
   #[test]
   fn bridge_accepts_version_byte_02() {
     let mut data = header_with_flags(0);
     data[8] = 0x02;
-    let m = run_bridge(&data, true);
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
-    assert!(m.tags().iter().any(|t| t.name() == "BytesPerSample"));
+    let obj = engine_obj(&data, true);
+    assert!(is_wv(&obj));
+    assert!(obj.contains_key("File:BytesPerSample"));
   }
 
   #[test]
   fn bridge_emits_tags_in_expected_order() {
-    // ExifTool.pm:9907 numeric sort ⇒ 6.1, 6.2, 6.3, 6.4, 6.5. After
-    // SetFileType pushes the File:* triplet, the bridge sinks the 5
-    // WavPack tags in that order. The chained ID3 + APE trailer
-    // entries emit nothing on the fixture (no ID3 / no APE trailer).
+    // ExifTool.pm:9907 numeric sort ⇒ 6.1..6.5. Order is preserved by the
+    // typed `serialize_tags` -> `TagMap` entries (the JSON object loses it).
     let data = header_with_flags(0x0480_008d);
-    let m = run_bridge(&data, true);
-    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
+    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // WavPack tags use family-1 group "File" (WavPack.pm GROUPS{1}); the
+    // typed sink emits ONLY these 5 (the File:* triplet is engine-added).
+    let names: std::vec::Vec<&str> = tm
+      .entries()
+      .iter()
+      .filter_map(|(k, _)| k.strip_prefix("File:"))
+      .collect();
     assert_eq!(
       names,
       vec![
-        "FileType",
-        "FileTypeExtension",
-        "MIMEType",
         "BytesPerSample",
         "AudioType",
         "Compression",
@@ -1223,12 +1107,10 @@ mod tests {
   }
 
   #[test]
-  fn bridge_marks_done_ape_after_running() {
-    // APE.pm:131 `$$et{DoneAPE} = 1` runs INSIDE `process_trailer_only`,
-    // regardless of whether an APE trailer is actually present. Pin
-    // that the WavPack chain drives the flag.
-    let data = header_with_flags(0x0480_008d);
-    let m = run_bridge(&data, true);
-    assert!(m.done_ape());
+  fn bridge_accepts_wavpack_fixture() {
+    // The WavPack chain runs ID3 + APE-trailer dispatch internally
+    // (SharedFlags DoneAPE); the observable effect is acceptance as WV.
+    let obj = engine_obj(&header_with_flags(0x0480_008d), true);
+    assert!(is_wv(&obj));
   }
 }

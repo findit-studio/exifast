@@ -7,14 +7,13 @@
 //!
 //! A typed [`AacMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! [`ProcessAac::process`] drives [`crate::parser_new::MetaSinker::sink`]
-//! into the engine [`crate::json_writer::JsonTagWriter`] so the serialized
+//! [`ProcessAac::process`] drives the typed `serialize_tags` path
+//! into the engine `tagmap::TagMap` so the serialized
 //! JSON stays byte-exact with bundled `perl exiftool`.
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
+  parser_new::{FormatParser, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -104,7 +103,7 @@ pub const AAC_BIT_KEYS: &[&str] = &["Bit016-017", "Bit018-021", "Bit023-025"];
 /// Typed AAC metadata — the lib-first output of [`ProcessAac`].
 ///
 /// Holds the **post-ValueConv** raw scalars (PrintConv is applied at emit
-/// time by [`MetaSinker::sink`], mirroring ExifTool's
+/// time by `serialize_tags`, mirroring ExifTool's
 /// `$$self{OPTIONS}{PrintConv}` toggle). The bit-stream walker
 /// ([`process_bit_stream`]) extracts `ProfileType` (raw), `SampleRate`
 /// (post-hash-ValueConv u32), and `Channels` (raw); `Encoder` is the
@@ -356,17 +355,22 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for AacMeta<'_> {
+#[cfg(feature = "alloc")]
+impl AacMeta<'_> {
   /// Emit AAC tags into the writer in `%AAC::Main` walk order (ProfileType,
   /// SampleRate, Channels, then Encoder) — faithful to AAC.pm:38-74 +
   /// bit-stream walker.
   ///
   /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "AAC";
     // ProfileType (raw u8, 0..=2).
     if print_conv {
@@ -424,46 +428,6 @@ impl std::error::Error for AacError {}
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl ProcessAac {
-  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
-  /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
-  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
-  /// JSON stays byte-exact with bundled `perl exiftool`.
-  ///
-  /// Faithful order (AAC.pm:99-140): header magic + filesize + SF index
-  /// gates ⇒ `SetFileType` ⇒ bit-stream walk ⇒ Encoder filler scan.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    let bytes = ctx.data();
-    let meta = match parse_inner(bytes) {
-      Ok(Some(m)) => m,
-      Ok(None) => return false,
-      Err(_) => return false,
-    };
-    // AAC.pm:107 — `$et->SetFileType()` (no-arg). The new typed parser
-    // emits its own tags after this finalize.
-    ctx.set_file_type(None, None, None);
-    let print_conv = ctx.print_conv_enabled();
-    // The Encoder field needs the legacy `convert::apply` path for the
-    // family-1 group routing (the AAC_MAIN.group1 dispatch lands family-1
-    // as "AAC"). Use the typed sink which mirrors that mapping exactly.
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
-    // Note: the Channels PrintConv hash maps `0 ⇒ "?"`. The bundled-Perl
-    // JSON emitter writes `"?"` as a quoted JSON string. Our
-    // `JsonTagWriter::write_str` records `TagValue::Str`, which the JSON
-    // emitter quotes — byte-exact.
-    //
-    // For Channels values 1..=5, PrintConv returns I64; the bundled JSON
-    // emits a bare number. The sink calls `write_u64` for these arms ⇒
-    // bridge pushes `TagValue::I64` ⇒ serializer emits bare number ⇒
-    // byte-exact.
-    //
-    // For Channels 6/7, PrintConv returns "5+1"/"7+1" strings ⇒
-    // `write_str` ⇒ `TagValue::Str` ⇒ quoted ⇒ byte-exact.
-    true // return 1  (AAC.pm:139)
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -471,7 +435,6 @@ impl ProcessAac {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::json_writer::JsonTagWriter;
 
   #[test]
   fn table_and_keys_are_faithful() {
@@ -500,21 +463,28 @@ mod tests {
     }
   }
 
+  /// Run the engine over `data` (named `x.aac`) in `-j` mode and return the
+  /// single file object.
+  fn engine_obj(data: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info("x.aac", data, true);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+
   #[test]
   fn rejects_non_aac_sync() {
-    use crate::parser::ParseContext;
-    // A reject must push nothing AND not finalize a type (return 0 happens
-    // before AAC.pm:107 `$et->SetFileType()`).
-    let mut m = JsonTagWriter::new("x");
-    let data = [0u8; 7];
-    let mut c = ParseContext::new(&data, "AAC", 0, "AAC", None, true, &mut m);
-    assert!(!ProcessAac.process(&mut c));
-    assert!(m.tags().is_empty());
-    let mut m2 = JsonTagWriter::new("x");
-    let bad = [0xff, 0x00];
-    let mut c2 = ParseContext::new(&bad, "AAC", 0, "AAC", None, true, &mut m2);
-    assert!(!ProcessAac.process(&mut c2)); // too short / bad sync
-    assert!(m2.tags().is_empty());
+    // A reject must not finalize AAC (return 0 happens before AAC.pm:107
+    // `$et->SetFileType()`).
+    let obj = engine_obj(&[0u8; 7]);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AAC")
+    );
+    let obj2 = engine_obj(&[0xff, 0x00]);
+    assert_ne!(
+      obj2.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AAC")
+    );
   }
 
   #[test]
@@ -537,17 +507,12 @@ mod tests {
       0xde, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // frame: id=6 cnt=15 byte=0 …
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    let mut m = JsonTagWriter::new("x");
-    let mut c = crate::parser::ParseContext::new(&input, "AAC", 0, "AAC", None, true, &mut m);
-    assert!(ProcessAac.process(&mut c));
-    assert!(m.tags().iter().all(|t| t.name() != "Encoder"));
+    let obj = engine_obj(&input);
+    assert!(!obj.contains_key("AAC:Encoder"));
     // Accept ⇒ the parser drove SetFileType (AAC.pm:107): File:* present.
     assert_eq!(
-      m.tags()
-        .iter()
-        .find(|t| t.name() == "FileType")
-        .map(|t| t.value()),
-      Some(&TagValue::Str("AAC".into()))
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("AAC")
     );
   }
 
@@ -597,7 +562,7 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_typed_tags() {
-    use crate::sink::{MapTagWriter, MapValue};
+    use crate::tagmap::TagMap;
     let meta = AacMeta {
       profile_type: 1,
       sample_rate: 44100,
@@ -605,41 +570,26 @@ mod tests {
       encoder: Some("TestEncoder"),
     };
     // PrintConv on.
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
     assert_eq!(
-      w.get("AAC", "ProfileType").map(MapValue::as_str),
+      w.get_str("AAC", "ProfileType"),
       Some("Low Complexity".to_string())
     );
-    assert_eq!(
-      w.get("AAC", "SampleRate").map(MapValue::as_str),
-      Some("44100".to_string())
-    );
-    assert_eq!(
-      w.get("AAC", "Channels").map(MapValue::as_str),
-      Some("2".to_string())
-    );
-    assert_eq!(
-      w.get("AAC", "Encoder").map(MapValue::as_str),
-      Some("TestEncoder".to_string())
-    );
+    assert_eq!(w.get_str("AAC", "SampleRate"), Some("44100".to_string()));
+    assert_eq!(w.get_str("AAC", "Channels"), Some("2".to_string()));
+    assert_eq!(w.get_str("AAC", "Encoder"), Some("TestEncoder".to_string()));
 
     // PrintConv off.
-    let mut w = MapTagWriter::new();
-    meta.sink(false, &mut w).unwrap();
-    assert_eq!(
-      w.get("AAC", "ProfileType").map(MapValue::as_str),
-      Some("1".to_string())
-    );
-    assert_eq!(
-      w.get("AAC", "Channels").map(MapValue::as_str),
-      Some("2".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(false, &mut w).unwrap();
+    assert_eq!(w.get_str("AAC", "ProfileType"), Some("1".to_string()));
+    assert_eq!(w.get_str("AAC", "Channels"), Some("2".to_string()));
   }
 
   #[test]
   fn meta_sinker_emits_channels_special_cases() {
-    use crate::sink::{MapTagWriter, MapValue};
+    use crate::tagmap::TagMap;
     // Channels=0 ⇒ "?"
     let meta = AacMeta {
       profile_type: 0,
@@ -647,12 +597,9 @@ mod tests {
       channels: 0,
       encoder: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("AAC", "Channels").map(MapValue::as_str),
-      Some("?".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("AAC", "Channels"), Some("?".to_string()));
     // Channels=6 ⇒ "5+1"
     let meta = AacMeta {
       profile_type: 0,
@@ -660,12 +607,9 @@ mod tests {
       channels: 6,
       encoder: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("AAC", "Channels").map(MapValue::as_str),
-      Some("5+1".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("AAC", "Channels"), Some("5+1".to_string()));
     // Channels=7 ⇒ "7+1"
     let meta = AacMeta {
       profile_type: 0,
@@ -673,12 +617,9 @@ mod tests {
       channels: 7,
       encoder: None,
     };
-    let mut w = MapTagWriter::new();
-    meta.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("AAC", "Channels").map(MapValue::as_str),
-      Some("7+1".to_string())
-    );
+    let mut w = TagMap::new();
+    meta.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("AAC", "Channels"), Some("7+1".to_string()));
   }
 
   #[test]

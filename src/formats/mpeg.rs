@@ -11,8 +11,8 @@
 //! audio is invoked internally by the MP3 file-type entry
 //! ([`crate::formats::id3::ProcessMp3`]) via
 //! [`ProcessMp3::process_with_start_offset`], which drives
-//! [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Ports
@@ -43,7 +43,7 @@
 //! ID3.pm:1705). The public method signature is **preserved exactly** so
 //! the ID3 wrapper code (`mpeg::ProcessMp3.process_with_start_offset(ctx,
 //! hdr_end)`) keeps working byte-for-byte. It internally drives the typed
-//! [`ProcessMpegAudio`] + [`MetaSinker`] path.
+//! [`ProcessMpegAudio`] + `serialize_tags` path.
 //!
 //! ## Deferred (forward items, deliberately out of this PR's scope)
 //!
@@ -61,8 +61,7 @@
 use std::{borrow::Cow, string::String};
 
 use crate::{
-  parser::ParseContext,
-  parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
+  parser_new::{FormatParser, SharedFlags, parser_sealed},
   value::format_g,
 };
 
@@ -535,7 +534,7 @@ impl LameStereoMode {
 /// Typed MPEG audio metadata — the lib-first output of [`ProcessMpegAudio`].
 ///
 /// Holds the **post-ValueConv** raw scalars (PrintConv is applied at emit
-/// time by [`MetaSinker::sink`], mirroring ExifTool's
+/// time by `serialize_tags`, mirroring ExifTool's
 /// `$$self{OPTIONS}{PrintConv}` toggle). The audio frame header fields
 /// (MPEG.pm:23-256) are mandatory; the Xing/Info VBR fields (MPEG.pm:323-
 /// 337) and the LAME sub-table (MPEG.pm:339-382) are `Option<…>` because
@@ -1323,10 +1322,11 @@ fn parse_inner<'a>(
 }
 
 // ===========================================================================
-// `MetaSinker` — typed Meta → TagWriter
+// `serialize_tags` — typed Meta → TagMap
 // ===========================================================================
 
-impl MetaSinker for MpegAudioMeta<'_> {
+#[cfg(feature = "alloc")]
+impl MpegAudioMeta<'_> {
   /// Emit MPEG tags into the writer in `%MPEG::Audio` walk order
   /// (Bit11-12 → … → Bit30-31) then `%MPEG::Xing` keys 1..6 then
   /// `%MPEG::Lame` offsets 9/10/20/24 — faithful to MPEG.pm:23-256 +
@@ -1334,7 +1334,11 @@ impl MetaSinker for MpegAudioMeta<'_> {
   ///
   /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
   /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
     const GROUP: &str = "MPEG";
 
     // ─── Bit11-12 MPEGAudioVersion ────────────────────────────────────
@@ -1585,113 +1589,6 @@ pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
   if ext_is_mp3 { 8192 } else { 256 }
 }
 
-impl ProcessMp3 {
-  /// Offset-aware variant of [`ProcessMp3::process`] that mirrors bundled's
-  /// `$raf->Seek($hdrEnd, 0)` + `$raf->Read($buff, $scanLen)` sequence at
-  /// ID3.pm:1590 + ID3.pm:1705. Used by the ID3 dispatcher
-  /// (`crate::formats::id3::process::ProcessMp3`) AFTER `process_id3_inner`
-  /// returns: when an ID3v2 prefix was found, the audio loop seeks PAST the
-  /// header (offset = bundled `$hdrEnd` = ID3.pm:1504) so that
-  /// `ParseMPEGAudio` gets a FRESH $scanLen-byte window starting at the
-  /// post-ID3 file position.
-  ///
-  /// **F4 invariant: signature preserved verbatim from R5 fix.** The F2
-  /// ID3 agent's wrapper calls
-  /// `crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end)`
-  /// expecting `bool` return. Internally this drives the typed
-  /// [`ProcessMpegAudio`] parser + `MetaSinker` sink — same algorithm,
-  /// new shape.
-  pub(crate) fn process_with_start_offset(
-    &self,
-    ctx: &mut ParseContext<'_>,
-    start_offset: usize,
-  ) -> bool {
-    // ID3.pm:1684-1729 `sub ProcessMP3`: bound the buffer to `$scanLen`
-    // BEFORE invoking the typed parser. The Perl `$buff` is a HARD slice
-    // — the bytes BEYOND `$scanLen` are simply absent from the parser's
-    // view, so a late sync byte cannot be latched (Codex R1/F1).
-    let ext_is_mp3 = ctx.ext().is_some_and(|e| e.eq_ignore_ascii_case("MP3"));
-    let scan_len = id3_process_mp3_scan_len(ext_is_mp3);
-    // ID3.pm:1715-1717 `my $mp3 = ($ext eq 'MUS') ? 0 : 1`. The caller's
-    // `$mp3` flag is computed from the file extension: bundled drops
-    // the Layer III gate when FILE_EXT is `MUS` (Layer II audio dressed
-    // in a `.mus` container; Codex R3 finding).
-    let mp3_flag = !ctx.ext().is_some_and(|e| e.eq_ignore_ascii_case("MUS"));
-    let print_conv_enabled = ctx.print_conv_enabled();
-    // Pull all scalar/string inputs into owned snapshots BEFORE the
-    // mutable split-borrow on `data_and_metadata`. Faithful to the
-    // pre-F4 bridge's borrow discipline.
-    let ext_owned: smol_str::SmolStr = ctx
-      .ext()
-      .map_or(smol_str::SmolStr::new_inline(""), smol_str::SmolStr::new);
-    let file_type_owned: smol_str::SmolStr = smol_str::SmolStr::new(ctx.file_type());
-    let parent_type_owned: smol_str::SmolStr = smol_str::SmolStr::new(ctx.parent_type());
-    let header_skip = ctx.header_skip();
-    let ext_for_sub: Option<smol_str::SmolStr> = if ext_owned.is_empty() {
-      None
-    } else {
-      Some(ext_owned.clone())
-    };
-    // Split borrow: `(&data, &mut writer)` via disjoint fields — avoids any
-    // `Vec<u8>` copy of the scan buffer.
-    let (data, meta) = ctx.data_and_writer();
-    let post_id3 = data.get(start_offset..).unwrap_or(&[]);
-    let bounded_len = scan_len.min(post_id3.len());
-    let bounded = &post_id3[..bounded_len];
-    // Run the typed parser. The lib-first API takes data+ext+mp3.
-    let typed_meta = match parse_inner(bounded, mp3_flag, &ext_owned) {
-      Ok(Some(m)) => m,
-      Ok(None) => return false,
-      Err(_) => return false,
-    };
-    // MPEG.pm:496 `$et->SetFileType()` — finalize file type BEFORE
-    // sinking the typed Meta. The first-call-wins guard in
-    // `ParseContext::set_file_type` ensures any prior caller (e.g.
-    // ID3.pm:1521 `$et->SetFileType("MP3")`) wins — bridge stays no-op
-    // in the wrapped case. For the raw-MP3 path (start_offset==0,
-    // hdr_end==0) this is the first call and the File:* tags emit.
-    //
-    // We need a fresh `ParseContext` to call `set_file_type` since the
-    // accessors above split-borrowed `ctx`. Build a sub-context over
-    // the bounded slice carrying the original ctx's file_type/ext/etc.
-    let mut sub = ParseContext::new(
-      bounded,
-      &file_type_owned,
-      header_skip,
-      &parent_type_owned,
-      ext_for_sub,
-      print_conv_enabled,
-      meta,
-    );
-    sub.set_file_type(None, None, None);
-    // Sink the typed Meta DIRECTLY into the engine `JsonTagWriter` — File:* +
-    // MPEG:* in MPEG.pm iteration order. The sink writes group="MPEG" for
-    // every tag, matching the bundled `-G1` family-1 group. (No adapter
-    // bridge, no separate output push-bag.)
-    let _: Result<(), core::convert::Infallible> =
-      typed_meta.sink(print_conv_enabled, sub.writer());
-    // MPEG.pm:580 `return 1`.
-    true
-  }
-}
-
-#[cfg(test)]
-impl ProcessMp3 {
-  /// Raw-MPEG-audio entry (no preceding ID3) — the `start_offset == 0`
-  /// convenience over [`Self::process_with_start_offset`]. Faithful order
-  /// (MPEG.pm:464-581): sync scan ⇒ `SetFileType` ⇒ bit-extract ⇒
-  /// Xing/LAME tail, driving the typed parser through `MetaSinker` →
-  /// `JsonTagWriter`. Test-only: the production raw-MP3 dispatch goes
-  /// through `id3::ProcessMp3` (the `MP3` file-type entry), which calls
-  /// `process_with_start_offset` after the ID3 pass.
-  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-    // Raw-MP3 dispatch path (no preceding ID3) — `$hdrEnd == 0`.
-    // Delegates to the offset-aware variant; the bounded slice IS
-    // `data[..scan_len]` byte-for-byte unchanged.
-    self.process_with_start_offset(ctx, 0)
-  }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1699,16 +1596,7 @@ impl ProcessMp3 {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    json_writer::JsonTagWriter,
-    sink::{MapTagWriter, MapValue},
-    value::TagValue,
-  };
-
-  fn ctx_over<'a>(meta: &'a mut JsonTagWriter, data: &'a [u8], ft: &'a str) -> ParseContext<'a> {
-    let ext = crate::filetype::file_ext_for_name(meta.source_file());
-    ParseContext::new(data, ft, 0, ft, ext, true, meta)
-  }
+  use crate::tagmap::TagMap;
 
   // ───────────────────────── check_header ─────────────────────────
 
@@ -1880,14 +1768,14 @@ mod tests {
     assert_eq!(fmt_lowpass(16_500.0), "16.5 kHz");
   }
 
-  // ───────────────────────── MetaSinker (MapTagWriter) ─────────────────────────
+  // ───────────────────────── serialize_tags (TagMap) ─────────────────────────
 
-  fn collect(buf: &[u8], print_conv: bool) -> MapTagWriter {
-    let mut w = MapTagWriter::new();
+  fn collect(buf: &[u8], print_conv: bool) -> TagMap {
+    let mut w = TagMap::new();
     let meta = parse_borrowed(buf, true, "MP3")
       .expect("ok")
       .expect("parsed");
-    meta.sink(print_conv, &mut w).unwrap();
+    meta.serialize_tags(print_conv, &mut w).unwrap();
     w
   }
 
@@ -1897,7 +1785,7 @@ mod tests {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
     let w = collect(&data, true);
-    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("MPEG", n);
     assert_eq!(g("MPEGAudioVersion"), Some("1".into()));
     assert_eq!(g("AudioLayer"), Some("3".into()));
     assert_eq!(g("AudioBitrate"), Some("128 kbps".into()));
@@ -1918,7 +1806,7 @@ mod tests {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
     let w = collect(&data, false);
-    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("MPEG", n);
     // -n: raw on-disk values + post-ValueConv numerics.
     assert_eq!(g("MPEGAudioVersion"), Some("3".into())); // raw V1==3
     assert_eq!(g("AudioLayer"), Some("1".into())); // raw L3==1
@@ -1965,7 +1853,7 @@ mod tests {
   fn xing_lame_emits_typed_tags_print_on() {
     let data = build_vbr_xing_lame_fixture();
     let w = collect(&data, true);
-    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("MPEG", n);
     assert_eq!(g("VBRFrames"), Some("1000".into()));
     assert_eq!(g("VBRBytes"), Some("200000".into()));
     assert_eq!(g("VBRScale"), Some("78".into()));
@@ -1982,7 +1870,7 @@ mod tests {
   fn xing_lame_emits_typed_tags_print_off() {
     let data = build_vbr_xing_lame_fixture();
     let w = collect(&data, false);
-    let g = |n: &str| w.get("MPEG", n).map(MapValue::as_str);
+    let g = |n: &str| w.get_str("MPEG", n);
     // VBRFrames, VBRBytes, VBRScale — no conversions.
     assert_eq!(g("VBRFrames"), Some("1000".into()));
     assert_eq!(g("Encoder"), Some("LAME3.99r".into()));
@@ -2005,10 +1893,7 @@ mod tests {
     assert_eq!(w.get("MPEG", "VBRBytes"), None);
     assert_eq!(w.get("MPEG", "VBRScale"), None);
     // Encoder still emits from the LAME branch.
-    assert_eq!(
-      w.get("MPEG", "Encoder").map(MapValue::as_str),
-      Some("LAME3.99r".into())
-    );
+    assert_eq!(w.get_str("MPEG", "Encoder"), Some("LAME3.99r".into()));
   }
 
   #[test]
@@ -2040,93 +1925,99 @@ mod tests {
 
   // ───────────────────────── raw-MP3 engine entry ─────────────────────────
 
+  // The MP3 engine path is now `crate::parser::extract_info` (the synthetic
+  // raw-MPEG buffers detect as MP3 by frame-sync magic). These run it and
+  // assert on the parsed JSON object (replacing the retired
+  // `ProcessMp3::process` + `TagMap` tests).
+  fn engine_obj(
+    name: &str,
+    data: &[u8],
+    print_on: bool,
+  ) -> serde_json::Map<String, serde_json::Value> {
+    let json = crate::parser::extract_info(name, data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    v.as_array().unwrap()[0].as_object().unwrap().clone()
+  }
+
   #[test]
   fn bridge_parse_emits_expected_tags_print_on() {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.mp3");
-    let mut c = ctx_over(&mut m, &data, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names_vals: std::vec::Vec<_> = m
-      .tags()
-      .iter()
-      .map(|t| (t.name(), t.value().clone()))
-      .collect();
-    assert!(names_vals.contains(&("FileType", TagValue::Str("MP3".into()))));
-    // Integer tags emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1: the
-    // writer preserves the exact unsigned value; small values render bare,
-    // byte-identical to the old I64 mapping).
-    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::U64(1))));
-    assert!(names_vals.contains(&("AudioLayer", TagValue::U64(3))));
-    assert!(names_vals.contains(&("AudioBitrate", TagValue::Str("128 kbps".into()))));
-    assert!(names_vals.contains(&("SampleRate", TagValue::U64(44100))));
-    assert!(names_vals.contains(&("ChannelMode", TagValue::Str("Joint Stereo".into()))));
-    assert!(names_vals.contains(&("MSStereo", TagValue::Str("Off".into()))));
-    assert!(names_vals.contains(&("IntensityStereo", TagValue::Str("Off".into()))));
-    assert!(names_vals.contains(&("CopyrightFlag", TagValue::Str("True".into()))));
-    assert!(names_vals.contains(&("OriginalMedia", TagValue::Str("True".into()))));
-    assert!(names_vals.contains(&("Emphasis", TagValue::Str("None".into()))));
-    assert!(!names_vals.iter().any(|(n, _)| *n == "ModeExtension"));
+    let obj = engine_obj("x.mp3", &data, true);
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
+    assert_eq!(
+      obj.get("MPEG:MPEGAudioVersion").and_then(|v| v.as_u64()),
+      Some(1)
+    );
+    assert_eq!(obj.get("MPEG:AudioLayer").and_then(|v| v.as_u64()), Some(3));
+    assert_eq!(s("MPEG:AudioBitrate"), Some("128 kbps"));
+    assert_eq!(
+      obj.get("MPEG:SampleRate").and_then(|v| v.as_u64()),
+      Some(44100)
+    );
+    assert_eq!(s("MPEG:ChannelMode"), Some("Joint Stereo"));
+    assert_eq!(s("MPEG:MSStereo"), Some("Off"));
+    assert_eq!(s("MPEG:IntensityStereo"), Some("Off"));
+    // CopyrightFlag/OriginalMedia "True" → JSON bool true (EscapeJSON coercion).
+    assert_eq!(
+      obj.get("MPEG:CopyrightFlag").and_then(|v| v.as_bool()),
+      Some(true)
+    );
+    assert_eq!(
+      obj.get("MPEG:OriginalMedia").and_then(|v| v.as_bool()),
+      Some(true)
+    );
+    assert_eq!(s("MPEG:Emphasis"), Some("None"));
+    assert!(!obj.contains_key("MPEG:ModeExtension"));
   }
 
   #[test]
   fn bridge_parse_emits_expected_tags_print_off() {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.mp3");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, false, &mut m);
-    assert!(ProcessMp3.process(&mut c));
-    let names_vals: std::vec::Vec<_> = m
-      .tags()
-      .iter()
-      .map(|t| (t.name(), t.value().clone()))
-      .collect();
-    // -n raw integers emit via `write_u64` ⇒ `TagValue::U64` (Codex A-R4-1).
-    assert!(names_vals.contains(&("MPEGAudioVersion", TagValue::U64(3))));
-    assert!(names_vals.contains(&("AudioLayer", TagValue::U64(1))));
-    assert!(names_vals.contains(&("AudioBitrate", TagValue::U64(128000))));
-    assert!(names_vals.contains(&("SampleRate", TagValue::U64(0))));
-    assert!(names_vals.contains(&("ChannelMode", TagValue::U64(1))));
-    assert!(names_vals.contains(&("MSStereo", TagValue::U64(0))));
-    assert!(names_vals.contains(&("IntensityStereo", TagValue::U64(0))));
-    assert!(names_vals.contains(&("CopyrightFlag", TagValue::U64(1))));
-    assert!(names_vals.contains(&("OriginalMedia", TagValue::U64(1))));
-    assert!(names_vals.contains(&("Emphasis", TagValue::U64(0))));
+    let obj = engine_obj("x.mp3", &data, false);
+    let u = |k: &str| obj.get(k).and_then(|v| v.as_u64());
+    assert_eq!(u("MPEG:MPEGAudioVersion"), Some(3));
+    assert_eq!(u("MPEG:AudioLayer"), Some(1));
+    assert_eq!(u("MPEG:AudioBitrate"), Some(128000));
+    assert_eq!(u("MPEG:SampleRate"), Some(0));
+    assert_eq!(u("MPEG:ChannelMode"), Some(1));
+    assert_eq!(u("MPEG:MSStereo"), Some(0));
+    assert_eq!(u("MPEG:IntensityStereo"), Some(0));
+    assert_eq!(u("MPEG:CopyrightFlag"), Some(1));
+    assert_eq!(u("MPEG:OriginalMedia"), Some(1));
+    assert_eq!(u("MPEG:Emphasis"), Some(0));
   }
 
   #[test]
   fn bridge_reject_returns_false_with_no_filetype_tag() {
-    let data = [0x00u8; 32];
-    let mut m = JsonTagWriter::new("x.mp3");
-    let mut c = ctx_over(&mut m, &data, "MP3");
-    assert!(!ProcessMp3.process(&mut c));
-    assert!(m.tags().iter().all(|t| t.name() != "FileType"));
+    let obj = engine_obj("x.mp3", &[0x00u8; 32], true);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
   }
 
   #[test]
   fn bridge_parse_emits_xing_lame_tags() {
     let data = build_vbr_xing_lame_fixture();
-    let mut m = JsonTagWriter::new("x.mp3");
-    let mut c = ctx_over(&mut m, &data, "MP3");
-    assert!(ProcessMp3.process(&mut c));
-    let names_vals: std::vec::Vec<_> = m
-      .tags()
-      .iter()
-      .map(|t| (t.name(), t.value().clone()))
-      .collect();
-    // VBR/Lame integer tags emit via `write_u64` ⇒ `TagValue::U64` (Codex
-    // A-R4-1); the string-PrintConv tags below stay `Str`.
-    assert!(names_vals.contains(&("VBRFrames", TagValue::U64(1000))));
-    assert!(names_vals.contains(&("VBRBytes", TagValue::U64(200_000))));
-    assert!(names_vals.contains(&("VBRScale", TagValue::U64(78))));
-    assert!(names_vals.contains(&("Encoder", TagValue::Str("LAME3.99r".into()))));
-    assert!(names_vals.contains(&("LameVBRQuality", TagValue::U64(2))));
-    assert!(names_vals.contains(&("LameQuality", TagValue::U64(2))));
-    assert!(names_vals.contains(&("LameMethod", TagValue::Str("VBR (new/mtrh)".into()))));
-    assert!(names_vals.contains(&("LameLowPassFilter", TagValue::Str("16 kHz".into()))));
-    assert!(names_vals.contains(&("LameBitrate", TagValue::Str("128 kbps".into()))));
-    assert!(names_vals.contains(&("LameStereoMode", TagValue::Str("Joint Stereo".into()))));
+    let obj = engine_obj("x.mp3", &data, true);
+    let s = |k: &str| obj.get(k).and_then(|v| v.as_str());
+    let u = |k: &str| obj.get(k).and_then(|v| v.as_u64());
+    assert_eq!(u("MPEG:VBRFrames"), Some(1000));
+    assert_eq!(u("MPEG:VBRBytes"), Some(200_000));
+    assert_eq!(u("MPEG:VBRScale"), Some(78));
+    assert_eq!(s("MPEG:Encoder"), Some("LAME3.99r"));
+    assert_eq!(u("MPEG:LameVBRQuality"), Some(2));
+    assert_eq!(u("MPEG:LameQuality"), Some(2));
+    assert_eq!(s("MPEG:LameMethod"), Some("VBR (new/mtrh)"));
+    assert_eq!(s("MPEG:LameLowPassFilter"), Some("16 kHz"));
+    assert_eq!(s("MPEG:LameBitrate"), Some("128 kbps"));
+    assert_eq!(s("MPEG:LameStereoMode"), Some("Joint Stereo"));
   }
 
   // ───────────────────────── ID3.pm:1684-1729 ProcessMP3 bounded-scan ─────────────────────────
@@ -2148,11 +2039,11 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.mp3");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
-    assert!(!ProcessMp3.process(&mut c));
-    assert!(m.tags().iter().all(|t| t.name() != "FileType"));
+    let obj = engine_obj("x.mp3", &data, true);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
   }
 
   #[test]
@@ -2164,12 +2055,12 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.mp3");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
-    assert!(ProcessMp3.process(&mut c));
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
-    assert!(m.tags().iter().any(|t| t.name() == "AudioBitrate"));
+    let obj = engine_obj("x.mp3", &data, true);
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
+    assert!(obj.contains_key("MPEG:AudioBitrate"));
   }
 
   #[test]
@@ -2181,11 +2072,11 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.dat");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
-    assert!(!ProcessMp3.process(&mut c));
-    assert!(m.tags().iter().all(|t| t.name() != "FileType"));
+    let obj = engine_obj("x.dat", &data, true);
+    assert_ne!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
   }
 
   #[test]
@@ -2197,11 +2088,11 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = JsonTagWriter::new("x.dat");
-    let ext = crate::filetype::file_ext_for_name(m.source_file());
-    let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
-    assert!(ProcessMp3.process(&mut c));
-    assert!(m.tags().iter().any(|t| t.name() == "FileType"));
+    let obj = engine_obj("x.dat", &data, true);
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("MP3")
+    );
   }
 
   // ───────────────────────── FormatParser trait surface ─────────────────────────
@@ -2232,11 +2123,8 @@ mod tests {
     let m = extract_header_fields(header).unwrap();
     assert_eq!(m.ms_stereo(), Some(true));
     // Sink under -j.
-    let mut w = MapTagWriter::new();
-    m.sink(true, &mut w).unwrap();
-    assert_eq!(
-      w.get("MPEG", "MSStereo").map(MapValue::as_str),
-      Some("On".into())
-    );
+    let mut w = TagMap::new();
+    m.serialize_tags(true, &mut w).unwrap();
+    assert_eq!(w.get_str("MPEG", "MSStereo"), Some("On".into()));
   }
 }

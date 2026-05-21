@@ -8,8 +8,8 @@
 //! ID3.pm:1684-1728) via the typed [`Id3Meta<'a>`] / [`Mp3Meta<'a>`]
 //! published through the [`crate::parser_new::FormatParser`] trait. The MP3
 //! engine entry ([`ProcessMp3::process`]) drives
-//! [`crate::parser_new::MetaSinker::sink`] into the engine
-//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
+//! the typed `serialize_tags` path into the engine
+//! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact for all 60+ ID3/MP3 conformance fixtures.
 //!
 //! Per FORMATS.md row 2 (ID3 infra + MP3 completion) this module
@@ -56,7 +56,7 @@
 //! - [`v2_process`] — `ProcessID3v2` (ID3.pm:1111-1423).
 //! - [`process`] — `ProcessID3` (ID3.pm:1431-1632) + `ProcessMp3`
 //!   (ID3.pm:1684-1728) + the typed [`Id3Meta`]/[`Mp3Meta`] types and
-//!   their [`crate::parser_new::FormatParser`] / [`crate::parser_new::MetaSinker`]
+//!   their [`crate::parser_new::FormatParser`] / `serialize_tags`
 //!   impls.
 
 pub mod decode;
