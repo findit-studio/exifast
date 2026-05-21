@@ -65,7 +65,13 @@ use crate::parser_new::TagWriter;
 use crate::value::{Group, Tag, TagValue};
 use core::{convert::Infallible, fmt};
 use smol_str::SmolStr;
-use std::{collections::HashSet, string::String, vec::Vec};
+// `BTreeSet` (not `HashSet`) for the `%noDups` seen-token set: this module
+// is `#[cfg(feature = "alloc")]`-gated, and in a no_std + alloc build the
+// crate aliases `alloc as std` (lib.rs) — but `alloc::collections` has NO
+// `HashSet` (it needs a std hasher), so `std::collections::HashSet` would
+// fail to compile outside std (Codex A-R4-3). `BTreeSet` lives in `alloc`
+// and is a drop-in for the insert-returns-bool dedup.
+use std::{collections::BTreeSet, string::String, vec::Vec};
 
 /// A [`TagWriter`] that emits bundled-`exiftool -j -G1` JSON directly from a
 /// typed `Meta`'s emission stream — see the module docs for the byte-exact
@@ -376,7 +382,7 @@ impl JsonTagWriter {
     // ExifTool `%noDups` (exiftool:2950-2951 `next if $noDups{$tok};
     // $noDups{$tok} = 1;`): first occurrence of a "<family1>:<name>" token
     // wins; later same-token records are skipped entirely (no key, no value).
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     for rec in &self.records {
       // exiftool:2947 `my $tok = $allGroup ? "$group:$tagName" : $tagName;`
       // (`-G1` => $allGroup true => "<family1>:<name>").

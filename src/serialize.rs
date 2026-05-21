@@ -10,7 +10,12 @@
 
 use crate::json_scalar::{push_json_string, push_value};
 use crate::value::Metadata;
-use std::collections::HashSet;
+// `BTreeSet` (not `HashSet`) for the `%noDups` seen-token set: this module is
+// `#[cfg(feature = "json")]`-gated and `json` implies `alloc` but not `std`,
+// so in a no_std + alloc + json build the crate aliases `alloc as std`
+// (lib.rs) and `alloc::collections` has NO `HashSet` (Codex A-R4-3).
+// `BTreeSet` lives in `alloc` and is a drop-in for the dedup set.
+use std::collections::BTreeSet;
 
 // The byte-exact ExifTool scalar encoders (`EscapeJSON` number gate, string
 // escaping, the binary placeholder, the rational repr, and `FormatJSON` array
@@ -63,7 +68,7 @@ pub fn to_exiftool_json(m: &Metadata) -> String {
   // ExifTool `%noDups` (exiftool:2950-2951 `next if $noDups{$tok};
   // $noDups{$tok} = 1;`): first occurrence of a "<family1>:<name>" token
   // wins; later same-token tags are skipped entirely (no key, no value).
-  let mut seen: HashSet<String> = HashSet::new();
+  let mut seen: BTreeSet<String> = BTreeSet::new();
   for t in m.tags() {
     // exiftool:2947 `my $tok = $allGroup ? "$group:$tagName" : $tagName;`
     // (`-G1` => $allGroup true => "<family1>:<name>").
