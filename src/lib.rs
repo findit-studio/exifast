@@ -540,6 +540,53 @@ mod tests {
     let _ = result;
   }
 
+  /// Codex C-R4-1: an ID3v2-PREFIXED Ogg stream must dispatch to
+  /// [`AnyMeta::Ogg`], NOT the mis-routed [`AnyMeta::Mp3`]. The
+  /// `%magicNumber{OGG}` gate is `(OggS|ID3)` (ExifTool.pm:1004), so the
+  /// ID3-prefixed buffer detects as OGG and the OGG arm is tried first; before
+  /// this fix the OGG parse failed (`OggS` not at offset 0) and the weak-magic
+  /// MP3 arm wrongly accepted. The OGG arm now seeks past the ID3v2 header
+  /// (bundled `Seek($hdrEnd, 0)`, Ogg.pm:79-82 → ID3.pm:1590) and re-parses
+  /// Ogg on the post-ID3 slice. Verified byte-exact-equivalent vs bundled
+  /// `perl exiftool` (FileType=OGG, Vorbis:* tags) — the fixture is
+  /// `Vorbis.ogg` with a synthesized 34-byte ID3v2.3 TIT2 prefix.
+  #[test]
+  #[cfg(all(feature = "ogg", feature = "mp3", feature = "json"))]
+  fn parse_bytes_id3_prefixed_ogg_dispatches_to_ogg_not_mp3() {
+    use crate::json_writer::JsonTagWriter;
+    use crate::parser_new::MetaSinker;
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/ogg_id3_prefixed.ogg"
+    ))
+    .expect("read ogg_id3_prefixed.ogg fixture");
+    // Sanity: the fixture really does start with an ID3v2 prefix (NOT OggS).
+    assert!(data.starts_with(b"ID3"), "fixture must be ID3-prefixed");
+    let meta = parse_bytes(&data)
+      .expect("parse_bytes must not error")
+      .expect("ID3-prefixed Ogg must be recognized");
+    // Core C-R4-1 assertion: dispatch to Ogg, NOT the mis-routed Mp3.
+    assert!(
+      matches!(meta, AnyMeta::Ogg(_)),
+      "ID3-prefixed Ogg must dispatch to AnyMeta::Ogg, not {meta:?}"
+    );
+    // Content check: sinking the post-ID3 Ogg stream yields the SAME Vorbis
+    // tags bundled `perl exiftool` reports (e.g. Vorbis:Artist "Who Knows"),
+    // proving the ID3v2 prefix was correctly skipped and the real Ogg-Vorbis
+    // stream parsed (byte-exact-equivalent to bundled, verified manually).
+    let mut w = JsonTagWriter::new("ogg_id3_prefixed.ogg");
+    meta.sink(true, &mut w).expect("sink is infallible");
+    let json = w.finish();
+    assert!(
+      json.contains("\"Vorbis:Artist\": \"Who Knows\""),
+      "post-ID3 Ogg-Vorbis tags must be present: {json}"
+    );
+    assert!(
+      json.contains("\"Vorbis:Title\": \"A 4s sample for testing embedded cover art\""),
+      "post-ID3 Ogg-Vorbis Title must be present: {json}"
+    );
+  }
+
   /// Each per-format `parse_<fmt>` entry can be invoked with a byte slice
   /// (compile-time check — the test body just confirms the call shapes).
   /// The actual semantics are exercised by per-format conformance tests.
