@@ -1556,15 +1556,46 @@ fn composite_duration_from_header_and_main(
   header: &Option<ApeHeader>,
   main_tags: &[ApeMainTag],
 ) -> Option<TagValue> {
-  // Pull the four ingredients from header (preferred — the on-disk MAC
-  // header is the canonical source) AND from main_tags (the wire format
-  // can carry spaced keys like `Sample Rate` that MakeTag mangles to
-  // `SampleRate` matching the Require). Last-wins (Codex r9 finding).
+  // Pull the four ingredients from header (the on-disk MAC header) AND from
+  // main_tags (the wire format can carry spaced keys like `Sample Rate` that
+  // MakeTag mangles to `SampleRate` matching the Require). LAST-WINS: the MAC
+  // header tags are emitted FIRST and the wire main tags AFTER, so a wire tag
+  // of the same name OVERRIDES the header value (faithful to the engine's
+  // `emit_composite_duration_if_present` last-occurrence `.rev().find()` over
+  // the buffered records — APE_dup_override.ape has `MAC:SampleRate=44100` and
+  // wire `APE:SampleRate=48000`; Composite must use 48000). We therefore lift
+  // the wire main tags FIRST (taking the LAST occurrence per name), and only
+  // fall back to the header for ingredients the wire stream did not supply.
   let mut sample_rate: Option<(TagValue, f64)> = None;
   let mut total_frames: Option<(TagValue, f64)> = None;
   let mut blocks_per_frame: Option<(TagValue, f64)> = None;
   let mut final_frame_blocks: Option<(TagValue, f64)> = None;
-  // First, lift from the header (chronologically earlier in extraction order).
+  // Lift from the main-tag stream first (it wins over the header). Reverse
+  // iteration so we take the LAST occurrence per name.
+  for t in main_tags.iter().rev() {
+    let target = match t.name() {
+      "SampleRate" => &mut sample_rate,
+      "TotalFrames" => &mut total_frames,
+      "BlocksPerFrame" => &mut blocks_per_frame,
+      "FinalFrameBlocks" => &mut final_frame_blocks,
+      _ => continue,
+    };
+    if target.is_some() {
+      continue; // already filled by a later occurrence (we iterate reversed)
+    }
+    let raw = t.value().clone();
+    let num = match &raw {
+      TagValue::I64(n) => Some(*n as f64),
+      TagValue::F64(x) => Some(*x),
+      TagValue::Str(s) => Some(perl_numeric_coerce_f64(s)),
+      _ => None,
+    };
+    if let Some(n) = num {
+      *target = Some((raw, n));
+    }
+  }
+  // Then fall back to the header for any ingredient the wire stream did NOT
+  // supply (header is chronologically earlier ⇒ only used when not overridden).
   if let Some(h) = header {
     let (sr, tf, bpf, ffb) = match h {
       ApeHeader::Old {
@@ -1600,42 +1631,27 @@ fn composite_duration_from_header_and_main(
         (sr, tf, bpf, ffb)
       }
     };
-    if let Some(v) = sr {
-      sample_rate = Some((TagValue::I64(v), v as f64));
+    // Only fill ingredients the wire main-tag stream did not already supply
+    // (the wire tags win — see the last-wins note above).
+    if sample_rate.is_none() {
+      if let Some(v) = sr {
+        sample_rate = Some((TagValue::I64(v), v as f64));
+      }
     }
-    if let Some(v) = tf {
-      total_frames = Some((TagValue::I64(v), v as f64));
+    if total_frames.is_none() {
+      if let Some(v) = tf {
+        total_frames = Some((TagValue::I64(v), v as f64));
+      }
     }
-    if let Some(v) = bpf {
-      blocks_per_frame = Some((TagValue::I64(v), v as f64));
+    if blocks_per_frame.is_none() {
+      if let Some(v) = bpf {
+        blocks_per_frame = Some((TagValue::I64(v), v as f64));
+      }
     }
-    if let Some(v) = ffb {
-      final_frame_blocks = Some((TagValue::I64(v), v as f64));
-    }
-  }
-  // Then lift from the main-tag stream (later in extraction order
-  // ⇒ overrides header values per Codex r9 last-wins). Reverse iteration
-  // so we take the LAST occurrence per name.
-  for t in main_tags.iter().rev() {
-    let target = match t.name() {
-      "SampleRate" => &mut sample_rate,
-      "TotalFrames" => &mut total_frames,
-      "BlocksPerFrame" => &mut blocks_per_frame,
-      "FinalFrameBlocks" => &mut final_frame_blocks,
-      _ => continue,
-    };
-    if target.is_some() {
-      continue; // already filled by a later occurrence (we iterate reversed)
-    }
-    let raw = t.value().clone();
-    let num = match &raw {
-      TagValue::I64(n) => Some(*n as f64),
-      TagValue::F64(x) => Some(*x),
-      TagValue::Str(s) => Some(perl_numeric_coerce_f64(s)),
-      _ => None,
-    };
-    if let Some(n) = num {
-      *target = Some((raw, n));
+    if final_frame_blocks.is_none() {
+      if let Some(v) = ffb {
+        final_frame_blocks = Some((TagValue::I64(v), v as f64));
+      }
     }
   }
   // Run the arithmetic only when ALL four ingredients resolve AND the
