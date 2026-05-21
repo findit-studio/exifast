@@ -40,8 +40,8 @@
 //! Both implement [`crate::parser_new::FormatParser`] and
 //! [`crate::parser_new::MetaSinker`]. The MP3 engine entry
 //! [`ProcessMp3::process`] drives [`crate::parser_new::MetaSinker::sink`]
-//! through [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
-//! byte-exact with bundled `perl exiftool`.
+//! into the engine [`crate::json_writer::JsonTagWriter`] so the serialized
+//! JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! # Byte-exact reproduction strategy
 //!
@@ -75,9 +75,10 @@ use crate::{
     v2_4::ID3V2_4_MAIN,
     v2_process::process_id3v2,
   },
+  json_writer::JsonTagWriter,
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  value::{Group, Metadata, TagValue},
+  value::{Group, TagValue},
 };
 use smol_str::SmolStr;
 use std::vec::Vec;
@@ -160,9 +161,9 @@ impl Id3v2Version {
 ///
 /// Family-0 is not stored: the legacy engine produces every ID3 group with
 /// `family0 == "ID3"`, and the writer-side `group` argument uses family-1
-/// (the `-G1` key the JSON serializer consumes). The
-/// [`MetadataTagWriter`] bridge mirrors the writer-side group to BOTH
-/// family-0 and family-1 on push, which matches the legacy emission for
+/// (the `-G1` key the JSON serializer consumes). The engine
+/// [`crate::json_writer::JsonTagWriter`] mirrors the writer-side group to
+/// BOTH family-0 and family-1 on push, which matches the legacy emission for
 /// ID3 groups whose family-0 was `"ID3"` (the engine attribution paths
 /// here go through `tagtable.group0()` + `def.group1()`, not via the
 /// writer-side group). Verified across all 60+ ID3/MP3 conformance
@@ -999,19 +1000,25 @@ impl std::error::Error for Mp3Error {}
 /// Returns `(found, hdr_end, staged_tags, metadata)` — the `metadata` is
 /// returned so the caller can read its `done_id3` / `warnings` / `errors`
 /// (which are mode-independent).
-fn run_id3_pass(data: &[u8], print_conv: bool) -> (bool, usize, Vec<StagedTag>, Metadata) {
-  let mut staging = Metadata::new("staging.id3");
+fn run_id3_pass(data: &[u8], print_conv: bool) -> (bool, usize, Vec<StagedTag>, JsonTagWriter) {
+  // INTERNAL STAGING (not output): the typed ID3 `parse` runs the push-style
+  // legacy engine into a SCRATCH `JsonTagWriter`, then lifts its buffered
+  // records into `Id3Meta::staged_tags`. This scratch writer's JSON is never
+  // emitted — it is purely the `$$et` value sink the legacy `finalize` /
+  // `process_id3v2` / `process_id3v1` push into; the caller reads its records,
+  // `done_id3`, `warnings`, and `errors` back. (Replaces the scratch
+  // `Metadata` that played this role before task #124.)
+  let mut staging = JsonTagWriter::new("staging.id3");
   let (found, hdr_end) = {
     let mut staging_ctx = ParseContext::new(data, "ID3", 0, "ID3", None, print_conv, &mut staging);
     process_id3_inner_legacy(data, &mut staging_ctx, false)
   };
   let staged_tags: Vec<StagedTag> = staging
-    .tags()
-    .iter()
-    .map(|tag| StagedTag {
-      family1: SmolStr::new(tag.group().family1()),
-      name: SmolStr::new(tag.name()),
-      value: tag.value().clone(),
+    .records()
+    .map(|(group, name, value)| StagedTag {
+      family1: SmolStr::new(group.family1()),
+      name: SmolStr::new(name),
+      value: value.clone(),
     })
     .collect();
   (found, hdr_end, staged_tags, staging)
@@ -1105,8 +1112,8 @@ fn parse_id3_inner<'a>(
       stuff_id3v1_field(v1, name, &tag.value);
     }
   }
-  let warnings: Vec<SmolStr> = staging.warnings().to_vec();
-  let errors: Vec<SmolStr> = staging.errors().to_vec();
+  let warnings: Vec<SmolStr> = staging.warnings().iter().map(SmolStr::new).collect();
+  let errors: Vec<SmolStr> = staging.errors().iter().map(SmolStr::new).collect();
   Ok((
     Some(Id3Meta {
       v2_version,
@@ -1195,7 +1202,7 @@ impl MetaSinker for Id3Meta<'_> {
     };
     for tag in tags {
       // Use the family-1 string as the writer's `group` argument; the
-      // legacy `MetadataTagWriter` bridge mirrors family-1 to BOTH
+      // engine `JsonTagWriter` mirrors family-1 to BOTH
       // family-0 and family-1 on push, which matches the legacy
       // engine's emission for ID3 (every ID3 group has family-0 ==
       // family-1, e.g. `("ID3", "ID3v2_3")` is engineered via
@@ -1311,7 +1318,7 @@ impl ProcessMp3 {
     let (id3_found, hdr_end) = process_id3_inner_legacy(data, ctx, true);
     let mpeg_found = crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end);
     let rtn_val = id3_found || mpeg_found;
-    if rtn_val && !ctx.metadata().done_ape() {
+    if rtn_val && !ctx.writer().done_ape() {
       // ID3.pm:1722-1727 APE trailer fallback. void context per
       // bundled (no `and ...` on the `ProcessAPE($et, $dirInfo)` line).
       let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
@@ -1430,10 +1437,10 @@ fn process_id3_inner_legacy(
   // ID3.pm:1435-1436 `return 0 if $$et{DoneID3}; $$et{DoneID3} = 1;` —
   // avoids the cross-parser infinite recursion bundled relies on for the
   // ID3 → audio-format dispatch loop.
-  if ctx.metadata().done_id3().is_some() {
+  if ctx.writer().done_id3().is_some() {
     return (false, 0);
   }
-  ctx.metadata().set_done_id3(0);
+  ctx.writer().set_done_id3(0);
 
   let cctx = ConvContext::default();
 
@@ -1482,7 +1489,7 @@ fn process_id3_inner_legacy(
   }
 
   if trail_size_for_done_id3 > 0 {
-    ctx.metadata().set_done_id3(trail_size_for_done_id3);
+    ctx.writer().set_done_id3(trail_size_for_done_id3);
   }
   let found = finalize(
     ctx,
@@ -1504,7 +1511,7 @@ fn process_id3_inner_legacy(
 /// bundled `while ($buff =~ /^ID3/) { ... last }` loop body.
 fn parse_v2_header(data: &[u8], ctx: &mut ParseContext<'_>) -> Option<ParsedV2Header> {
   if data.len() < 10 {
-    ctx.metadata().push_warning("Short ID3 header");
+    ctx.writer().push_warning("Short ID3 header");
     return None;
   }
   let h = &data[3..10];
@@ -1514,19 +1521,19 @@ fn parse_v2_header(data: &[u8], ctx: &mut ParseContext<'_>) -> Option<ParsedV2He
   let size = match unsync_safe(size_raw) {
     Some(s) => s as usize,
     None => {
-      ctx.metadata().push_warning("Invalid ID3 header");
+      ctx.writer().push_warning("Invalid ID3 header");
       return None;
     }
   };
   if vers >= 0x0500 {
     let ver_str = format!("2.{}.{}", vers >> 8, vers & 0xff);
     ctx
-      .metadata()
+      .writer()
       .push_warning(format!("Unsupported ID3 version: {ver_str}"));
     return None;
   }
   if 10 + size > data.len() {
-    ctx.metadata().push_warning("Truncated ID3 data");
+    ctx.writer().push_warning("Truncated ID3 data");
     return None;
   }
   let mut h_buff: Vec<u8> = data[10..10 + size].to_vec();
@@ -1535,7 +1542,7 @@ fn parse_v2_header(data: &[u8], ctx: &mut ParseContext<'_>) -> Option<ParsedV2He
   }
   if flags & 0x40 != 0 {
     if h_buff.len() < 4 {
-      ctx.metadata().push_warning("Bad ID3 extended header");
+      ctx.writer().push_warning("Bad ID3 extended header");
       return None;
     }
     let ext_len_raw = u32::from_be_bytes([h_buff[0], h_buff[1], h_buff[2], h_buff[3]]);
@@ -1544,7 +1551,7 @@ fn parse_v2_header(data: &[u8], ctx: &mut ParseContext<'_>) -> Option<ParsedV2He
       None => ext_len_raw as usize,
     };
     if ext_len > h_buff.len() {
-      ctx.metadata().push_warning("Truncated ID3 extended header");
+      ctx.writer().push_warning("Truncated ID3 extended header");
       return None;
     }
     h_buff = h_buff[ext_len..].to_vec();
@@ -1573,7 +1580,7 @@ fn finalize(
   if do_set_file_type {
     ctx.set_file_type(Some("MP3"), None, None);
   }
-  ctx.metadata().push(
+  ctx.writer().push(
     Group::new("File", "File"),
     "ID3Size",
     TagValue::I64(id3_len as i64),
@@ -1586,11 +1593,11 @@ fn finalize(
     } else {
       &ID3V2_2_MAIN
     };
-    process_id3v2(&h_buff, vers, table, ctx.metadata(), print_conv_on, cctx);
+    process_id3v2(&h_buff, vers, table, ctx.writer(), print_conv_on, cctx);
   }
   if let Some(t) = trailer_data {
     let _ = ID3V1_MAIN; // referenced for static link only
-    process_id3v1(&t, ctx.metadata(), print_conv_on, cctx);
+    process_id3v1(&t, ctx.writer(), print_conv_on, cctx);
   }
   true
 }
@@ -1642,15 +1649,14 @@ pub fn parse_id3_borrowed<'a>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::value::Metadata;
 
   // The `run` helper drives the `mp3`-gated `ProcessMp3` legacy bridge,
   // so it (and every test that calls it) is gated behind `mp3` (Codex
   // A-R2-1). Pure-ID3 tests below use `process_id3_inner_legacy` /
   // `parse_id3_borrowed` and stay ungated.
   #[cfg(feature = "mp3")]
-  fn run(data: &[u8], name: &str) -> Metadata {
-    let mut m = Metadata::new(name);
+  fn run(data: &[u8], name: &str) -> JsonTagWriter {
+    let mut m = JsonTagWriter::new(name);
     {
       let ext = crate::filetype::file_ext_for_name(name);
       let mut c = ParseContext::new(data, "MP3", 0, "MP3", ext, true, &mut m);
@@ -2149,7 +2155,7 @@ mod tests {
     data.extend_from_slice(&id3v1);
     assert_eq!(data.len(), 100 + 227 + 128);
 
-    let mut meta = Metadata::new("x.mp3");
+    let mut meta = JsonTagWriter::new("x.mp3");
     {
       let ext = crate::filetype::file_ext_for_name("x.mp3");
       let mut ctx = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut meta);
@@ -2166,7 +2172,7 @@ mod tests {
     data.extend_from_slice(&id3v1);
     assert_eq!(data.len(), 100 + 227 + 128);
 
-    let mut meta = Metadata::new("x.mp3");
+    let mut meta = JsonTagWriter::new("x.mp3");
     {
       let ext = crate::filetype::file_ext_for_name("x.mp3");
       let mut ctx = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut meta);
@@ -2186,7 +2192,7 @@ mod tests {
     data.extend_from_slice(&vec![0u8; 24]);
     assert_eq!(data.len(), 34);
 
-    let mut meta = Metadata::new("x.mp3");
+    let mut meta = JsonTagWriter::new("x.mp3");
     let hdr_end = {
       let ext = crate::filetype::file_ext_for_name("x.mp3");
       let mut ctx = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut meta);

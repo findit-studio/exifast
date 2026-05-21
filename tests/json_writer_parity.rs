@@ -1,46 +1,34 @@
-//! Byte-exact parity for the direct [`exifast::json_writer::JsonTagWriter`]:
-//! for EVERY conformance fixture, the JSON it emits — driven from the TYPED
-//! parse path (`any_parser_for` → `AnyParser::parse_any` → `AnyMeta` →
-//! `MetaSinker::sink`) — must be jsondiff-equivalent to the committed
+//! Byte-exact parity for the TYPED parse path through
+//! [`exifast::json_writer::JsonTagWriter`]: for EVERY conformance fixture, the
+//! JSON the TYPED path emits (`any_parser_for` → `AnyParser::parse_any` →
+//! `AnyMeta` → `MetaSinker::sink`) must be jsondiff-equivalent to the committed
 //! bundled-ExifTool golden, in BOTH `-j` (PrintConv) and `-n` (numeric) modes.
 //!
-//! This proves the redesign target (Phase #124): `JsonTagWriter` can replace
-//! the `MetadataTagWriter` → `Metadata` → `to_exiftool_json` chain on the
-//! OUTPUT path, producing bundled-identical JSON DIRECTLY from a typed `Meta`.
+//! ## Relationship to `conformance.rs` (task #124)
 //!
-//! ## What the typed path emits vs. what the golden contains
+//! After task #124, `JsonTagWriter` IS the engine's `$$et` value sink:
+//! `parser::extract_info` produces its byte-exact JSON directly via
+//! `JsonTagWriter::finish()`, and `conformance.rs` already pins that ENGINE
+//! (`process(ctx)`) path against the goldens. So the old "writer-only vs
+//! `to_exiftool_json`" comparison this file used to run is now exactly what
+//! `conformance.rs` proves — it has been removed here (the `Metadata` →
+//! `to_exiftool_json` output path it compared against no longer exists).
 //!
-//! The golden = `ExifTool:ExifToolVersion` + the `File:*` triplet
-//! (`FileType` / `FileTypeExtension` / `MIMEType`) + the format's tags
-//! (+ any `ExifTool:Warning` / `ExifTool:Error`). The typed
-//! `MetaSinker::sink` emits ONLY the format's tags (and any warnings/errors
-//! the Meta itself raises) — the `ExifTool:*` version tag and the `File:*`
-//! triplet are *orchestration* set by `parser::extract_info` /
-//! `ParseContext::set_file_type` (`AAC.pm:107` `$et->SetFileType()`,
-//! `ExifTool.pm:3060` `ExifToolVersion`), OUTSIDE the per-format `Meta`.
-//!
-//! So this harness reproduces `extract_info`'s orchestration around the
-//! writer: it lifts the `ExifTool:*` + `File:*` tags (and the
-//! warnings/errors, which include the post-loop finalization `Error`) from
-//! the authoritative `extract_info` `Metadata` — those are plain
-//! `TagValue::Str` pushes, already pinned byte-exact by the §4 conformance
-//! suite — then drives the TYPED `sink` for the format tags on top. The
+//! What remains UNIQUE to this harness is the TYPED `parse_any` path
+//! (`parse_bytes`-style), which `conformance.rs` does NOT exercise. We lift the
+//! orchestration tags (`ExifTool:ExifToolVersion` + the `File:*` triplet) and
+//! warnings/errors off the authoritative engine writer
+//! ([`extract_info_to_writer`], itself §4-conformant), then drive the TYPED
+//! `MetaSinker::sink` for the format tags on top and compare to the golden. The
 //! `JsonTagWriter`'s own `%noDups` first-wins dedup (`exiftool:2950-2951`)
 //! makes the lift + sink composition order-insensitive.
-//!
-//! For comparison rigour, every fixture is ALSO checked the "writer-only"
-//! way: the COMPLETE `extract_info` tag stream replayed through the writer
-//! must equal `to_exiftool_json` over the same `Metadata` — a byte-for-byte
-//! proof that the writer is a faithful re-composition of the serializer for
-//! the real, full tag set of every format.
 
 use exifast::TagWriter;
 use exifast::filetype::detection_candidates;
 use exifast::json_writer::JsonTagWriter;
 use exifast::jsondiff::json_equivalent;
-use exifast::parser::extract_info;
+use exifast::parser::extract_info_to_writer;
 use exifast::parser_new::{MetaSinker, SharedFlags, any_parser_for};
-use exifast::serialize::to_exiftool_json;
 use exifast::value::TagValue;
 
 /// The full fixture set: every `tests/fixtures/<f>` that has both a
@@ -112,37 +100,6 @@ fn replay_value<W: TagWriter>(
   }
 }
 
-/// WRITER-ONLY parity: the COMPLETE `extract_info` tag stream replayed
-/// through `JsonTagWriter` must be byte-identical to `to_exiftool_json` over
-/// the same `Metadata`. Proves the direct writer reproduces the serializer
-/// for the real, full tag set (every variant the format actually emits).
-fn writer_matches_serialize(fixture: &str, data: &[u8], print_on: bool) -> Result<(), String> {
-  let m = extract_info(fixture, data, print_on);
-  let via_serialize = to_exiftool_json(&m);
-  let mut w = JsonTagWriter::new(fixture);
-  for t in m.tags() {
-    // `extract_info`'s tags carry family-1 == JSON token group. Replay each
-    // through the writer (family-0 == family-1 here, which matches the
-    // serializer's `%noDups` family-1 token).
-    replay_value(&mut w, t.group().family1(), t.name(), t.value())
-      .expect("JsonTagWriter is Infallible");
-  }
-  for warn in m.warnings() {
-    w.write_warning(warn).expect("JsonTagWriter is Infallible");
-  }
-  for err in m.errors() {
-    w.write_error(err).expect("JsonTagWriter is Infallible");
-  }
-  let via_writer = w.finish();
-  if via_writer == via_serialize {
-    Ok(())
-  } else {
-    Err(format!(
-      "writer != serialize\n  writer:    {via_writer}\n  serialize: {via_serialize}"
-    ))
-  }
-}
-
 /// Resolve the typed parser the SAME way `extract_info` does — walk the
 /// detection candidates in `ExtractInfo` loop order; the first whose
 /// `any_parser_for` is `Some` AND whose `parse_any` returns `Ok(Some(meta))`
@@ -184,18 +141,20 @@ fn typed_path_matches_golden(
   golden: &str,
   print_on: bool,
 ) -> Result<bool, String> {
-  // Authoritative full Metadata (orchestration + format tags) — already
+  // Authoritative full engine writer (orchestration + format tags) — already
   // §4-conformant. We lift ONLY the orchestration tags + warnings/errors
-  // from it; the format tags are produced by the typed sink below.
-  let m = extract_info(fixture, data, print_on);
+  // from its buffered records; the format tags are produced by the typed sink
+  // below. `extract_info_to_writer` is `extract_info` minus the final
+  // `.finish()`, so its records are exactly the engine's emission.
+  let m = extract_info_to_writer(fixture, data, print_on);
   let mut w = JsonTagWriter::new(fixture);
 
   // Orchestration: `ExifTool:ExifToolVersion` + the `File:*` triplet
   // (`extract_info` + `set_file_type`, OUTSIDE the per-format Meta).
-  for t in m.tags() {
-    let g1 = t.group().family1();
+  for (group, name, value) in m.records() {
+    let g1 = group.family1();
     if g1 == "ExifTool" || g1 == "File" {
-      replay_value(&mut w, g1, t.name(), t.value()).expect("JsonTagWriter is Infallible");
+      replay_value(&mut w, g1, name, value).expect("JsonTagWriter is Infallible");
     }
   }
   // Warnings/errors (incl. the post-loop finalization `Error`). Lifted first
@@ -220,10 +179,10 @@ fn typed_path_matches_golden(
     // any non-orchestration format tags so the comparison is honest about
     // what the typed path could NOT yet produce.
     let mut lifted_format = false;
-    for t in m.tags() {
-      let g1 = t.group().family1();
+    for (group, name, value) in m.records() {
+      let g1 = group.family1();
       if g1 != "ExifTool" && g1 != "File" {
-        replay_value(&mut w, g1, t.name(), t.value()).expect("JsonTagWriter is Infallible");
+        replay_value(&mut w, g1, name, value).expect("JsonTagWriter is Infallible");
         lifted_format = true;
       }
     }
@@ -286,14 +245,9 @@ fn json_writer_byte_exact_parity_all_fixtures() {
     fixtures.len()
   );
 
-  let mut writer_ok_j = 0usize;
-  let mut writer_ok_n = 0usize;
   let mut typed_ok_j = 0usize;
   let mut typed_ok_n = 0usize;
   let mut typed_handled = 0usize;
-  // The WRITER deliverable: byte-exact rendering of the full tag stream. ANY
-  // entry here is a hard failure.
-  let mut writer_failures: Vec<String> = Vec::new();
   // Typed-path mismatches NOT on the known-gap allowlist — a regression in
   // the typed parse path; hard failure.
   let mut unexpected_typed_failures: Vec<String> = Vec::new();
@@ -312,16 +266,6 @@ fn json_writer_byte_exact_parity_all_fixtures() {
       .unwrap_or_else(|e| panic!("read golden {fixture}.json: {e}"));
     let golden_n = std::fs::read_to_string(format!("{root}/tests/golden/{fixture}.n.json"))
       .unwrap_or_else(|e| panic!("read golden {fixture}.n.json: {e}"));
-
-    // ---- WRITER-ONLY parity (hard gate, both modes) ----
-    match writer_matches_serialize(fixture, &data, true) {
-      Ok(()) => writer_ok_j += 1,
-      Err(e) => writer_failures.push(format!("[writer -j] {fixture}: {e}")),
-    }
-    match writer_matches_serialize(fixture, &data, false) {
-      Ok(()) => writer_ok_n += 1,
-      Err(e) => writer_failures.push(format!("[writer -n] {fixture}: {e}")),
-    }
 
     // ---- TYPED-PATH parity (allowlist-gated, both modes) ----
     let mut typed_pass = true;
@@ -358,13 +302,8 @@ fn json_writer_byte_exact_parity_all_fixtures() {
   }
 
   let total = fixtures.len();
-  eprintln!("=== JsonTagWriter parity over {total} fixtures ===");
-  eprintln!(
-    "WRITER-ONLY vs to_exiftool_json (the deliverable): -j {writer_ok_j}/{total}, -n {writer_ok_n}/{total}"
-  );
-  eprintln!(
-    "TYPED-PATH vs bundled golden:                      -j {typed_ok_j}/{total}, -n {typed_ok_n}/{total}"
-  );
+  eprintln!("=== JsonTagWriter TYPED-PATH parity over {total} fixtures ===");
+  eprintln!("TYPED-PATH vs bundled golden: -j {typed_ok_j}/{total}, -n {typed_ok_n}/{total}");
   eprintln!("  (typed Meta contributed format tags for {typed_handled}/{total} in -j)");
   if !known_gap_hits.is_empty() {
     eprintln!(
@@ -377,18 +316,12 @@ fn json_writer_byte_exact_parity_all_fixtures() {
     }
   }
 
-  // Hard gate 1: the writer must be byte-exact for the full tag stream of
-  // EVERY fixture, in BOTH modes. This is the component deliverable.
-  assert!(
-    writer_failures.is_empty(),
-    "{} WRITER parity failure(s) (these are JsonTagWriter bugs):\n{}",
-    writer_failures.len(),
-    writer_failures.join("\n")
-  );
-  assert_eq!(writer_ok_j, total, "writer-only -j must be 122/122");
-  assert_eq!(writer_ok_n, total, "writer-only -n must be 122/122");
+  // The WRITER-ONLY vs `to_exiftool_json` gate this test used to assert is now
+  // covered by `conformance.rs` (the engine `process` path IS the
+  // `JsonTagWriter` after task #124); the `Metadata` → `to_exiftool_json`
+  // output path it compared against no longer exists.
 
-  // Hard gate 2: no NEW typed-path mismatch outside the known-gap allowlist.
+  // Hard gate: no NEW typed-path mismatch outside the known-gap allowlist.
   assert!(
     unexpected_typed_failures.is_empty(),
     "{} UNEXPECTED typed-path failure(s) (regression outside KNOWN_TYPED_GAPS):\n{}",

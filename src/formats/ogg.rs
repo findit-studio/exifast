@@ -1411,8 +1411,7 @@ impl MetaSinker for OggMeta<'_> {
           // 85/86/94) coalesce into a single `TagValue::List` at
           // first-occurrence position — faithful `FoundTag`
           // (ExifTool.pm:9505-9520). Route through the `write_str_list`
-          // primitive so list-aware writers (`MetadataTagWriter` →
-          // `Metadata::push_listable`) coalesce correctly instead of
+          // primitive so list-aware writers coalesce correctly instead of
           // last-write-wins (Codex CF2).
           let refs: Vec<&str> = values.iter().map(SmolStr::as_str).collect();
           out.write_str_list(group1, name, &refs)?;
@@ -1426,9 +1425,9 @@ impl MetaSinker for OggMeta<'_> {
         }
       }
     }
-    // Warnings emit in occurrence order. `MetadataTagWriter` routes these
-    // to `Metadata::push_warning` (ExifTool:Warning surface); `MapTagWriter`
-    // collects into a `warnings()` vec.
+    // Warnings emit in occurrence order. The engine `JsonTagWriter` routes
+    // these to its `warnings()` accumulator (ExifTool:Warning surface);
+    // `MapTagWriter` collects into a `warnings()` vec.
     for w in &self.warnings {
       out.write_warning(w)?;
     }
@@ -1487,16 +1486,14 @@ impl ProcessOgg {
     if let Some(target) = meta.file_type_override {
       ctx.override_file_type(target, None, None);
     }
-    // Vorbis:* / Theora:* tags. We walk `OggMeta::comments` directly
-    // rather than driving the generic `MetaSinker` sink path because the
-    // list-tag (Artist/Performer/Contact) emission needs
-    // `Metadata::push_listable`'s first-occurrence-position semantics —
-    // the bridge's `MetadataTagWriter` cannot express that today
-    // (`TagWriter` has no list primitive; Phase G forward item). For
-    // scalars and binary we route through `MetadataTagWriter` to keep
-    // the path uniform with AAC / MOI / DV.
+    // Vorbis:* / Theora:* tags. We walk `OggMeta::comments` directly and
+    // emit straight into the engine `JsonTagWriter` (`ctx.writer()`) via
+    // `push` / `push_listable`, rather than driving the generic
+    // `MetaSinker::sink` path, so the list-tag (Artist/Performer/Contact)
+    // first-occurrence-position coalescing uses the writer's own
+    // `push_listable` seam directly.
     {
-      let meta_sink = ctx.metadata();
+      let meta_sink = ctx.writer();
       for comment in &meta.comments {
         match comment {
           OggComment::Scalar {
@@ -1543,18 +1540,13 @@ impl ProcessOgg {
         meta_sink.push_warning(w.as_str());
       }
     }
-    // NOTE: this migration does NOT route through `MetadataTagWriter`
-    // because OGG's emission shape requires list-aware semantics
-    // (Vorbis ARTIST=Alice/Bob coalescing into a single
-    // `TagValue::List` at first-occurrence position — faithful FoundTag
-    // semantics, ExifTool.pm:9505-9520). The `TagWriter` trait has no
-    // `write_list` primitive today (Phase G forward item: see
-    // `[[exifast-phase2-forward-items]]` → "TagWriter list primitive").
-    // Until then, OGG's bridge walks `OggMeta::comments` directly and
-    // calls `Metadata::push_listable` for `OggComment::List` arms —
-    // bypassing the generic `MetaSinker::sink` path. The `MetaSinker`
-    // impl above still emits via stateless `write_str` for use by
-    // non-list-aware sinks (MapTagWriter tests + future JSON sink).
+    // NOTE: the engine entry walks `OggMeta::comments` directly and calls
+    // `JsonTagWriter::push_listable` for `OggComment::List` arms (Vorbis
+    // ARTIST=Alice/Bob coalescing into a single `TagValue::List` at
+    // first-occurrence position — faithful FoundTag semantics,
+    // ExifTool.pm:9505-9520), bypassing the generic `MetaSinker::sink`
+    // path. The `MetaSinker` impl above emits the same coalescing via
+    // `TagWriter::write_str_list` for generic sinks (MapTagWriter tests).
     true
   }
 }
@@ -1566,6 +1558,7 @@ impl ProcessOgg {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::json_writer::JsonTagWriter;
   use crate::sink::{MapTagWriter, MapValue};
 
   // `convert_bitrate` unit-tests REMOVED (R1 F2): `convert_bitrate` is a
@@ -1851,7 +1844,7 @@ mod tests {
 
   #[test]
   fn process_ogg_short_buffer_rejects_cleanly() {
-    let mut m = Metadata::new("x.ogg");
+    let mut m = JsonTagWriter::new("x.ogg");
     // Only the 4-byte `OggS` magic — header is far short of the 28-byte
     // minimum Ogg.pm:94 demands. `ProcessOgg` returns false; nothing
     // pushed to metadata. (See also `tests/conformance.rs::
@@ -1911,14 +1904,13 @@ mod tests {
   }
 
   /// Codex CF2: the typed `MetaSinker::sink` List arm reaches
-  /// `TagWriter::write_str_list`, so a `MetadataTagWriter` consumer gets a
+  /// `TagWriter::write_str_list`, so a `JsonTagWriter` consumer gets a
   /// coalesced first-occurrence-position `TagValue::List` (faithful
   /// `FoundTag`, ExifTool.pm:9505-9520) instead of last-write-wins. Vorbis
   /// List=>1 tags: ARTIST/PERFORMER/CONTACT.
   #[test]
-  fn meta_sinker_list_coalesces_into_tagvalue_list_via_metadata_writer() {
-    use crate::sink::MetadataTagWriter;
-    use crate::value::{Metadata, TagValue};
+  fn meta_sinker_list_coalesces_into_tagvalue_list_via_json_writer() {
+    use crate::value::TagValue;
     let meta = OggMeta {
       file_type_override: None,
       comments: vec![
@@ -1938,11 +1930,8 @@ mod tests {
       success: true,
       _marker: core::marker::PhantomData,
     };
-    let mut md = Metadata::new("x.ogg");
-    {
-      let mut bridge = MetadataTagWriter::new(&mut md);
-      meta.sink(true, &mut bridge).unwrap();
-    }
+    let mut md = JsonTagWriter::new("x.ogg");
+    meta.sink(true, &mut md).unwrap();
     let artist = md
       .tags()
       .iter()

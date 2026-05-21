@@ -5,27 +5,28 @@
 //! JSON DIRECTLY from a typed `Meta`'s [`MetaSinker::sink`] stream, with no
 //! intermediate [`crate::value::Metadata`] push-bag.
 //!
-//! This is the Phase #124 redesign target: today the CLI JSON path is
-//! `Meta` → [`crate::sink::MetadataTagWriter`] → [`crate::value::Metadata`] →
-//! [`crate::serialize::to_exiftool_json`]. `JsonTagWriter` collapses the last
-//! three steps into one writer, so the lib-first redesign can eventually drop
-//! the `Metadata` push-bag from the OUTPUT path entirely.
+//! Task #124 made this the engine's `$$et` value sink: the CLI JSON path is
+//! now `Meta` → [`crate::parser_new::MetaSinker::sink`] → `JsonTagWriter` →
+//! [`JsonTagWriter::finish`]. `JsonTagWriter` collapses what was previously a
+//! `Metadata` push-bag + [`crate::serialize::to_exiftool_json`] render into a
+//! single writer, dropping the `Metadata` push-bag from the OUTPUT path
+//! entirely (`Metadata` + `to_exiftool_json` survive only as the test
+//! byte-exactness oracle and as internal staging — e.g. Ogg comments).
 //!
 //! ## Byte-exactness contract
 //!
-//! `JsonTagWriter` is a *faithful re-composition* of that bridge+serialize
-//! pair, so its output is byte-identical to
+//! `JsonTagWriter` is a *faithful re-composition* of the push-style
+//! `Metadata` + serialize pair, so its output is byte-identical to
 //! [`to_exiftool_json`](crate::serialize::to_exiftool_json) applied to the
-//! `Metadata` the bridge would build. Specifically it mirrors, citing the
-//! source rules:
+//! equivalent [`crate::value::Metadata`] (the oracle the tests assert
+//! against). Specifically it mirrors, citing the source rules:
 //!
 //! 1. **Scalar encoding.** Every scalar goes through the SAME
 //!    [`crate::json_scalar`] encoders the serializer uses (the `EscapeJSON`
 //!    number gate at `exiftool:3809`, string escaping at `exiftool:3816-3830`,
 //!    the binary placeholder, the rational repr, and the `FormatJSON` ARRAY
 //!    framing at `exiftool:3843-3855`). One source of truth ⇒ no drift.
-//! 2. **`write_*` → `TagValue` mapping.** Identical to
-//!    [`crate::sink::MetadataTagWriter`]: `write_u64` → `I64` (saturating to
+//! 2. **`write_*` → `TagValue` mapping.** `write_u64` → `I64` (saturating to
 //!    `i64::MAX`, matching the push-style `Metadata`'s `I64` storage),
 //!    `write_i64` → `I64`, `write_f64` → `F64`, `write_str`/`write_fmt` →
 //!    `Str`, `write_bytes` → `Bytes`. `write_str_list` coalesces via the
@@ -43,7 +44,7 @@
 //!
 //! ## Group mapping
 //!
-//! Mirrors [`crate::sink::MetadataTagWriter`]: the writer-side `group`
+//! The writer-side `group`
 //! argument is taken as BOTH family-0 and family-1 by default, or — when
 //! constructed via [`JsonTagWriter::with_family0`] — family-0 is pinned and
 //! `group` is family-1. Only family-1 reaches the JSON token (`exiftool:2948`
@@ -61,18 +62,10 @@
 
 use crate::json_scalar::{push_json_string, push_value};
 use crate::parser_new::TagWriter;
-use crate::value::{Group, TagValue};
+use crate::value::{Group, Tag, TagValue};
 use core::{convert::Infallible, fmt};
+use smol_str::SmolStr;
 use std::{collections::HashSet, string::String, vec::Vec};
-
-/// One buffered tag record, in first-occurrence order. `group` carries BOTH
-/// families (family-0 participates in the push-level dedup identity; family-1
-/// is the `-G1` JSON token prefix).
-struct Record {
-  group: Group,
-  name: String,
-  value: TagValue,
-}
 
 /// A [`TagWriter`] that emits bundled-`exiftool -j -G1` JSON directly from a
 /// typed `Meta`'s emission stream — see the module docs for the byte-exact
@@ -87,19 +80,42 @@ struct Record {
 /// D8 convention: no public fields; constructors + accessors only.
 pub struct JsonTagWriter {
   source_file: String,
-  /// Buffered records in first-occurrence order (mirrors the push-style
+  /// Buffered tags in first-occurrence order (mirrors the retired push-style
   /// `Metadata`'s `Vec<Tag>` ordering, which the `%noDups` pass then walks).
-  records: Vec<Record>,
+  /// Stored as [`crate::value::Tag`] — the SAME element type the retired
+  /// `Metadata` used — so the engine read-back surface ([`Self::tags`] /
+  /// [`Self::records`]) is a 1:1 replacement for `Metadata::tags()`.
+  records: Vec<Tag>,
   /// Warning accumulator, in call order (`ExifTool.pm:1297`; the first is
   /// surfaced as `ExifTool:Warning` under `-j -G1`).
   warnings: Vec<String>,
   /// Error accumulator, in call order (`ExifTool.pm:1288-1296`; the first is
   /// surfaced as `ExifTool:Error`).
   errors: Vec<String>,
-  /// Optional family-0 override (per [`crate::sink::MetadataTagWriter`]'s
-  /// `with_family0`): when `Some(f0)`, family-0 = `f0` and family-1 =
-  /// the writer-side `group`; when `None`, family-0 = family-1 = `group`.
+  /// Optional family-0 override: when `Some(f0)`, family-0 = `f0` and
+  /// family-1 = the writer-side `group`; when `None`, family-0 = family-1 =
+  /// `group`. Mutable at runtime via [`JsonTagWriter::set_family0_override`]
+  /// so the engine's APE entry can pin family-0 = `"APE"` for the duration of
+  /// the APE `MetaSinker::sink` call (the MAC/main split, APE.pm:84-87) while
+  /// leaving the surrounding `File:*` / chained-ID3 emissions on the default
+  /// `group == family-0 == family-1` mapping — a single writer-level seam in
+  /// place of any per-sink family-0 wrapper.
   family0_override: Option<&'static str>,
+  /// Faithful `$$et{DoneID3}` flag (ID3.pm:1435-1436, APE.pm:124, etc.) for
+  /// the ENGINE path (`crate::parser::extract_info` -> `process(ctx)`), which
+  /// carries cross-format state on this `$$et` value sink. `None` => ProcessID3
+  /// has not run on this `$self`; `Some(n)` => run, with `n` the ID3v1-trailer
+  /// size (ID3.pm:1527) read by APE.pm:169 to walk PAST the trailer. Moved here
+  /// verbatim from the retired `crate::value::Metadata::done_id3` so the engine
+  /// `process` chain (ID3 -> APE/MPC/WV/etc.) keeps its `$self`-scoped flag.
+  /// (The TYPED `parse`/`parse_bytes` path uses `SharedFlags` instead — these
+  /// are two parallel ExifTool-`$$et` mirrors, unchanged by this migration.)
+  done_id3: Option<usize>,
+  /// Faithful `$$et{DoneAPE}` flag (APE.pm:131, ID3.pm:1723) for the engine
+  /// path. Set by `ProcessAPE` immediately after the ID3 check; read by
+  /// ID3.pm:1723 to gate the MP3->APE trailer fallback. Moved verbatim from
+  /// the retired `Metadata::done_ape`.
+  done_ape: bool,
 }
 
 impl JsonTagWriter {
@@ -113,12 +129,13 @@ impl JsonTagWriter {
       warnings: Vec::new(),
       errors: Vec::new(),
       family0_override: None,
+      done_id3: None,
+      done_ape: false,
     }
   }
 
   /// Construct a writer that pins family-0 to `family0` for every emission
-  /// (the writer-side `group` becomes family-1 only). Mirrors
-  /// [`crate::sink::MetadataTagWriter::with_family0`] — used by APE's MAC vs
+  /// (the writer-side `group` becomes family-1 only). Used by APE's MAC vs
   /// main-tag family-0 split.
   #[must_use]
   pub fn with_family0(source_file: impl Into<String>, family0: &'static str) -> Self {
@@ -128,6 +145,8 @@ impl JsonTagWriter {
       warnings: Vec::new(),
       errors: Vec::new(),
       family0_override: Some(family0),
+      done_id3: None,
+      done_ape: false,
     }
   }
 
@@ -138,8 +157,7 @@ impl JsonTagWriter {
   }
 
   /// Build a [`Group`] from the writer-side single-string `group` argument,
-  /// honouring the optional family-0 override (mirrors
-  /// [`crate::sink::MetadataTagWriter::group`]).
+  /// honouring the optional family-0 override.
   fn group(&self, group: &str) -> Group {
     match self.family0_override {
       Some(f0) => Group::new(f0, group),
@@ -147,52 +165,191 @@ impl JsonTagWriter {
     }
   }
 
-  /// Push a scalar record with [`crate::value::Metadata::push`] semantics:
-  /// replace-in-place (last-write-wins) when a record with the SAME
-  /// `(family0, family1, name)` identity already exists, else append in
-  /// first-occurrence order (faithful `FoundTag`, `ExifTool.pm:9437-9519`).
-  fn push_scalar(&mut self, group: Group, name: &str, value: TagValue) {
-    if let Some(rec) = self
+  // -------------------------------------------------------------------------
+  // Engine `$$et` value-sink surface — read-back + state. These methods make
+  // `JsonTagWriter` a drop-in for the retired `crate::value::Metadata` push-bag
+  // on the ENGINE path (`crate::parser::extract_info` -> `process(ctx)`): the
+  // `ParseContext` carries `&mut JsonTagWriter` and the format `process`
+  // entries push File:* + sink their typed Meta + read tags back (Composite
+  // ingredient lookup, SetFileType first-call-wins) directly here.
+  // -------------------------------------------------------------------------
+
+  /// Set (or clear) the runtime family-0 override. The engine's APE entry
+  /// pins family-0 = `"APE"` for the duration of its `MetaSinker::sink` call
+  /// (the MAC-header vs main-tag split keyed by family-0 = `APE:`,
+  /// APE.pm:84-87) then clears it, so the surrounding `File:*` and chained-ID3
+  /// emissions keep the default `group == family-0 == family-1` mapping. This
+  /// is a single writer-level seam (in place of any per-sink family-0
+  /// wrapper) now that a single writer is shared across the whole `process`.
+  pub fn set_family0_override(&mut self, family0: Option<&'static str>) {
+    self.family0_override = family0;
+  }
+
+  /// `$$et{DoneID3}` — `None` until `ProcessID3` runs on this engine `$self`;
+  /// `Some(n)` once run, with `n` the ID3v1-trailer size. Faithful read of
+  /// the retired `Metadata::done_id3` (ID3.pm:1435, APE.pm:124/169).
+  #[must_use]
+  pub fn done_id3(&self) -> Option<usize> {
+    self.done_id3
+  }
+
+  /// Set `$$et{DoneID3} = trailer_size` (ID3.pm:1436/1527). Mirrors the
+  /// retired `Metadata::set_done_id3`.
+  pub fn set_done_id3(&mut self, trailer_size: usize) {
+    self.done_id3 = Some(trailer_size);
+  }
+
+  /// `$$et{DoneAPE}` (APE.pm:131, ID3.pm:1723). Faithful read of the retired
+  /// `Metadata::done_ape`.
+  #[must_use]
+  pub fn done_ape(&self) -> bool {
+    self.done_ape
+  }
+
+  /// Set `$$et{DoneAPE} = 1` (APE.pm:131). Mirrors the retired
+  /// `Metadata::set_done_ape`.
+  pub fn set_done_ape(&mut self) {
+    self.done_ape = true;
+  }
+
+  /// Is `File:FileType` (family-1 `File`) already buffered? Faithful to
+  /// ExifTool's per-file `$$self{FileType}` first-call-wins marker
+  /// (ExifTool.pm:9681/9701). Read by `ParseContext::set_file_type` before
+  /// pushing the `File:*` triplet. Verbatim port of the retired
+  /// `Metadata::has_file_type`.
+  #[must_use]
+  pub fn has_file_type(&self) -> bool {
+    self
+      .records
+      .iter()
+      .any(|t| t.group().family1() == "File" && t.name() == "FileType")
+  }
+
+  /// Existence query for `(group, name)` (family-0 AND family-1 + name).
+  /// Verbatim port of the retired `Metadata::has_tag` — used by
+  /// format-specific duplicate-handling paths.
+  #[must_use]
+  pub fn has_tag(&self, group: &Group, name: &str) -> bool {
+    self
+      .records
+      .iter()
+      .any(|t| t.group() == group && t.name() == name)
+  }
+
+  /// Push (FoundTag) a tag in first-occurrence order, or overwrite an existing
+  /// same-`(group, name)` tag's value in place (last-write-wins). Verbatim
+  /// port of the retired `Metadata::push` (ExifTool.pm:9437-9519). The
+  /// `group` carries BOTH families explicitly — the engine's `set_file_type`,
+  /// the Composite emission, and the chained-ID3 push helpers call this
+  /// exactly as they called `Metadata::push`.
+  pub fn push(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
+    let name = name.into();
+    if let Some(tag) = self
       .records
       .iter_mut()
-      .find(|r| r.group == group && r.name == name)
+      .find(|t| t.group() == &group && t.name() == name.as_str())
     {
-      rec.value = value;
+      tag.set_value(value);
     } else {
-      self.records.push(Record {
-        group,
-        name: name.into(),
-        value,
-      });
+      self.records.push(Tag::new(group, name, value));
     }
   }
 
-  /// Append `value` under `(group, name)` with
-  /// [`crate::value::Metadata::push_listable`] semantics: promote an existing
-  /// scalar to a 1-element list then push, or extend an existing list, or — on
-  /// first occurrence — append a plain scalar (`ExifTool.pm:9505-9520`).
-  fn push_listable(&mut self, group: Group, name: &str, value: TagValue) {
-    if let Some(rec) = self
+  /// Push `value` under `(group, name)` with `List`-coalesce semantics
+  /// (promote scalar -> 1-elem list, extend list, else append scalar).
+  /// Verbatim port of the retired `Metadata::push_listable`
+  /// (ExifTool.pm:9505-9520). The engine's chained-ID3 / Vorbis push helpers
+  /// call this exactly as they called `Metadata::push_listable`.
+  pub fn push_listable(&mut self, group: Group, name: impl Into<SmolStr>, value: TagValue) {
+    let name = name.into();
+    if let Some(tag) = self
       .records
       .iter_mut()
-      .find(|r| r.group == group && r.name == name)
+      .find(|t| t.group() == &group && t.name() == name.as_str())
     {
       let placeholder = TagValue::List(Vec::new());
-      let new_val = match core::mem::replace(&mut rec.value, placeholder) {
+      let new_val = match core::mem::replace(tag.value_mut(), placeholder) {
         TagValue::List(mut items) => {
           items.push(value);
           TagValue::List(items)
         }
         scalar => TagValue::List(std::vec![scalar, value]),
       };
-      rec.value = new_val;
+      tag.set_value(new_val);
     } else {
-      self.records.push(Record {
-        group,
-        name: name.into(),
-        value,
-      });
+      self.records.push(Tag::new(group, name, value));
     }
+  }
+
+  /// Replace the value of the existing `(group, name)` tag in place;
+  /// returns `true` if found (else no-op `false`). Verbatim port of the
+  /// retired `Metadata::set_tag_value` (the `OverrideFileType` path,
+  /// ExifTool.pm:9717-9724).
+  pub fn set_tag_value(&mut self, group: &Group, name: &str, value: TagValue) -> bool {
+    match self
+      .records
+      .iter_mut()
+      .find(|t| t.group() == group && t.name() == name)
+    {
+      Some(tag) => {
+        tag.set_value(value);
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// Record a non-fatal warning, in occurrence order (`$self->Warn`,
+  /// ExifTool.pm:1297). Verbatim port of the retired `Metadata::push_warning`.
+  /// (Identical to the [`TagWriter::write_warning`] impl, exposed under the
+  /// `Metadata`-style name so the engine `process` chain migrates 1:1.)
+  pub fn push_warning(&mut self, warning: impl Into<String>) {
+    self.warnings.push(warning.into());
+  }
+
+  /// Record an error, in occurrence order (`$self->Error`, ExifTool.pm:5648).
+  /// Verbatim port of the retired `Metadata::push_error`.
+  pub fn push_error(&mut self, error: impl Into<String>) {
+    self.errors.push(error.into());
+  }
+
+  /// The buffered tags, in first-occurrence order. The 1:1 read analogue of
+  /// the retired `Metadata::tags()` (same [`crate::value::Tag`] element type,
+  /// same ordering the `%noDups` pass walks). The engine's Composite
+  /// ingredient lookup (APE.pm:81-93, scanning family-0 = `APE:`) and the ID3
+  /// stage-and-replay lift (a scratch `JsonTagWriter` collects the legacy
+  /// engine's emission, then [`crate::formats::id3`] reads it back) iterate
+  /// this.
+  #[must_use]
+  pub fn tags(&self) -> &[Tag] {
+    &self.records
+  }
+
+  /// Iterate the buffered tags in first-occurrence order as
+  /// `(&Group, &str name, &TagValue)` triples — a destructured convenience
+  /// over [`Self::tags`] for the `.rev()` Composite ingredient scan and the
+  /// orchestration-tag lift.
+  pub fn records(&self) -> impl DoubleEndedIterator<Item = (&Group, &str, &TagValue)> {
+    self
+      .records
+      .iter()
+      .map(|t| (t.group(), t.name(), t.value()))
+  }
+
+  /// Accumulated warnings, in call order (`$self->Warn`). Read by the ID3
+  /// stage-and-replay lift off its scratch writer; the public output document
+  /// surfaces only the FIRST via [`Self::finish`]. Faithful read analogue of
+  /// the retired `Metadata::warnings`.
+  #[must_use]
+  pub fn warnings(&self) -> &[String] {
+    &self.warnings
+  }
+
+  /// Accumulated errors, in call order (`$self->Error`). Faithful read
+  /// analogue of the retired `Metadata::errors`.
+  #[must_use]
+  pub fn errors(&self) -> &[String] {
+    &self.errors
   }
 
   /// Emit the buffered records as the byte-exact `exiftool -j -G1` JSON
@@ -223,7 +380,7 @@ impl JsonTagWriter {
     for rec in &self.records {
       // exiftool:2947 `my $tok = $allGroup ? "$group:$tagName" : $tagName;`
       // (`-G1` => $allGroup true => "<family1>:<name>").
-      let tok = std::format!("{}:{}", rec.group.family1(), rec.name);
+      let tok = std::format!("{}:{}", rec.group().family1(), rec.name());
       // exiftool:2950 `next if $noDups{$tok};` — first wins, drop the rest.
       if !seen.insert(tok.clone()) {
         continue;
@@ -231,7 +388,7 @@ impl JsonTagWriter {
       out.push_str(",\n  ");
       push_json_string(&mut out, &tok);
       out.push_str(": ");
-      push_value(&mut out, &rec.value);
+      push_value(&mut out, rec.value());
     }
     // ExifTool's generated `Warning` tag: group1 = `ExifTool`
     // (`ExifTool.pm:1225,1297`) ⇒ `-G1` token `"ExifTool:Warning"`
@@ -276,7 +433,7 @@ impl TagWriter for JsonTagWriter {
 
   fn write_str(&mut self, group: &str, name: &str, value: &str) -> Result<(), Infallible> {
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::Str(value.into()));
+    self.push(g, name, TagValue::Str(value.into()));
     Ok(())
   }
 
@@ -287,25 +444,25 @@ impl TagWriter for JsonTagWriter {
     // gate just like the bridge path would).
     let n = i64::try_from(value).unwrap_or(i64::MAX);
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::I64(n));
+    self.push(g, name, TagValue::I64(n));
     Ok(())
   }
 
   fn write_i64(&mut self, group: &str, name: &str, value: i64) -> Result<(), Infallible> {
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::I64(value));
+    self.push(g, name, TagValue::I64(value));
     Ok(())
   }
 
   fn write_f64(&mut self, group: &str, name: &str, value: f64) -> Result<(), Infallible> {
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::F64(value));
+    self.push(g, name, TagValue::F64(value));
     Ok(())
   }
 
   fn write_bytes(&mut self, group: &str, name: &str, value: &[u8]) -> Result<(), Infallible> {
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::Bytes(value.to_vec()));
+    self.push(g, name, TagValue::Bytes(value.to_vec()));
     Ok(())
   }
 
@@ -321,7 +478,7 @@ impl TagWriter for JsonTagWriter {
     let mut s = String::new();
     f(&mut s).expect("JsonTagWriter::write_fmt: in-memory String write cannot fail");
     let g = self.group(group);
-    self.push_scalar(g, name, TagValue::Str(s.into()));
+    self.push(g, name, TagValue::Str(s.into()));
     Ok(())
   }
 
@@ -338,8 +495,7 @@ impl TagWriter for JsonTagWriter {
   /// Override the default per-element `write_str` to coalesce into a single
   /// first-occurrence-position list value, via
   /// [`crate::value::Metadata::push_listable`] semantics (faithful
-  /// `FoundTag` promote-and-push, `ExifTool.pm:9505-9520`) — identical to
-  /// [`crate::sink::MetadataTagWriter::write_str_list`].
+  /// `FoundTag` promote-and-push, `ExifTool.pm:9505-9520`).
   fn write_str_list(&mut self, group: &str, name: &str, values: &[&str]) -> Result<(), Infallible> {
     for v in values {
       let g = self.group(group);
@@ -479,8 +635,8 @@ mod tests {
     m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
     m.push(Group::new("QuickTime", "AAC"), "Channels", TagValue::I64(6));
     let mut wr = JsonTagWriter::new("a.aac");
-    wr.push_scalar(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-    wr.push_scalar(Group::new("QuickTime", "AAC"), "Channels", TagValue::I64(6));
+    wr.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    wr.push(Group::new("QuickTime", "AAC"), "Channels", TagValue::I64(6));
     assert_eq!(wr.finish(), to_exiftool_json(&m));
   }
 
@@ -620,7 +776,7 @@ mod tests {
       ]),
     );
     let mut w = JsonTagWriter::new("a.jpg");
-    w.push_scalar(
+    w.push(
       Group::new("EXIF", "IFD0"),
       "MixedList",
       TagValue::List(std::vec![

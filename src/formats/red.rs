@@ -8,8 +8,8 @@
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`R3dMeta<'a>`] is produced by the new
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## R3D structure (Red.pm:219-223)
@@ -46,7 +46,6 @@ use crate::{
   convert::{ByteOrder, read_value},
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   value::{Rational, TagValue, format_g},
 };
 
@@ -1670,9 +1669,9 @@ impl std::error::Error for R3dError {}
 impl ProcessR3D {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let meta = {
       let data = ctx.data();
@@ -1684,8 +1683,7 @@ impl ProcessR3D {
     // Red.pm:230 `$et->SetFileType()` — happens BEFORE tag emission.
     ctx.set_file_type(None, None, None);
     let print_conv = ctx.print_conv_enabled();
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
     true
   }
 }
@@ -1697,7 +1695,7 @@ impl ProcessR3D {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::value::Metadata;
+  use crate::json_writer::JsonTagWriter;
 
   #[test]
   fn red_format_table_matches_pm() {
@@ -1717,7 +1715,7 @@ mod tests {
 
   #[test]
   fn reject_short_input() {
-    let mut m = Metadata::new("Red.r3d");
+    let mut m = JsonTagWriter::new("Red.r3d");
     let bytes = [0u8; 7];
     let mut ctx = ParseContext::new(&bytes, "R3D", 0, "R3D", None, true, &mut m);
     assert!(!ProcessR3D.process(&mut ctx));
@@ -1726,7 +1724,7 @@ mod tests {
 
   #[test]
   fn reject_bad_magic() {
-    let mut m = Metadata::new("Red.r3d");
+    let mut m = JsonTagWriter::new("Red.r3d");
     let bytes = b"\x00\x00\x00\x10ABCD";
     let mut ctx = ParseContext::new(bytes, "R3D", 0, "R3D", None, true, &mut m);
     assert!(!ProcessR3D.process(&mut ctx));
@@ -1735,7 +1733,7 @@ mod tests {
 
   #[test]
   fn reject_size_less_than_8() {
-    let mut m = Metadata::new("Red.r3d");
+    let mut m = JsonTagWriter::new("Red.r3d");
     let bytes = b"\x00\x00\x00\x04RED1";
     let mut ctx = ParseContext::new(bytes, "R3D", 0, "R3D", None, true, &mut m);
     assert!(!ProcessR3D.process(&mut ctx));
@@ -1744,7 +1742,7 @@ mod tests {
 
   #[test]
   fn truncated_header_emits_warning_and_filetype_triplet() {
-    let mut m = Metadata::new("Red.r3d");
+    let mut m = JsonTagWriter::new("Red.r3d");
     // size = 0x40 — header validates, SetFileType runs, then Read($size-8)
     // fails ⇒ Warn("Truncated R3D file"). Faithful: no header tag emission.
     let bytes = b"\x00\x00\x00\x40RED1";

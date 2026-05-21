@@ -9,8 +9,8 @@
 //!
 //! A typed [`AiffMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Notable deferrals (in-code) — Phase-2 forward-items
@@ -58,7 +58,6 @@ use crate::{
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   processbinarydata::process_binary_data,
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue, perl_nonfinite_str},
 };
@@ -1498,9 +1497,9 @@ impl std::error::Error for AiffError {}
 impl ProcessAiff {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (AIFF.pm:184-273):
   ///   1. Magic + header gate (AIFF.pm:191, 199, 209) — reject as `false`.
@@ -1524,7 +1523,7 @@ impl ProcessAiff {
     // because it mutates File:FileType directly (not a sinked tag).
     if meta.djvm_multi_page {
       let file_grp = Group::new("File", "File");
-      ctx.metadata().set_tag_value(
+      ctx.writer().set_tag_value(
         &file_grp,
         "FileType",
         TagValue::Str("DJVU (multi-page)".into()),
@@ -1532,8 +1531,7 @@ impl ProcessAiff {
     }
     // Sink the typed Meta into Metadata via the bridge writer.
     let print_conv = ctx.print_conv_enabled();
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
     // AIFF.pm:272 `return 1` — once SetFileType ran the parser accepts.
     true
   }
@@ -1546,7 +1544,7 @@ impl ProcessAiff {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{parser::ParseContext, value::Metadata};
+  use crate::{json_writer::JsonTagWriter, parser::ParseContext};
 
   #[test]
   fn main_table_and_keys_resolve_per_aiff_pm() {
@@ -1596,7 +1594,7 @@ mod tests {
 
   #[test]
   fn rejects_non_form_data() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(b"NOFORMxxxAIFF", "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(!ProcessAiff.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1604,7 +1602,7 @@ mod tests {
 
   #[test]
   fn rejects_short_data() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(b"FORM\x00\x00", "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(!ProcessAiff.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1612,7 +1610,7 @@ mod tests {
 
   #[test]
   fn djvu_signature_sets_file_type_and_accepts_with_no_body_tags() {
-    let mut m = Metadata::new("x.djvu");
+    let mut m = JsonTagWriter::new("x.djvu");
     let mut c = ParseContext::new(b"AT&TFORMxxxxDJVU", "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
     let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
@@ -1636,7 +1634,7 @@ mod tests {
 
   #[test]
   fn at_t_form_without_djvu_djvm_rejects() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(b"AT&TFORMxxxxFOOO", "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(!ProcessAiff.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1644,7 +1642,7 @@ mod tests {
 
   #[test]
   fn djvm_signature_appends_multi_page_suffix_to_file_type() {
-    let mut m = Metadata::new("x.djvu");
+    let mut m = JsonTagWriter::new("x.djvu");
     let mut c = ParseContext::new(b"AT&TFORMxxxxDJVM", "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
     let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
@@ -1661,7 +1659,7 @@ mod tests {
 
   #[test]
   fn aiff_minimal_header_accepts_and_sets_file_type() {
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let data = b"FORM\x00\x00\x00\x04AIFF";
     let mut c = ParseContext::new(data, "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
@@ -1671,7 +1669,7 @@ mod tests {
 
   #[test]
   fn aifc_magic_sets_file_type_aifc() {
-    let mut m = Metadata::new("x.aifc");
+    let mut m = JsonTagWriter::new("x.aifc");
     let data = b"FORM\x00\x00\x00\x04AIFC";
     let mut c = ParseContext::new(data, "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
@@ -1692,7 +1690,7 @@ mod tests {
   #[test]
   fn empty_chunk_streak_below_threshold_does_not_abort() {
     // Perl `for ($n=0;;++$n)` cadence: 50 empties from $n=0 ⇒ no abort.
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let data = aiff_with_n_empty_chunks(50);
     let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
@@ -1706,7 +1704,7 @@ mod tests {
   #[test]
   fn empty_chunk_streak_at_threshold_aborts_at_perl_iter_51() {
     // 51 consecutive empty chunks from $n=0 ⇒ Warn + last.
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let data = aiff_with_n_empty_chunks(60);
     let mut c = ParseContext::new(&data, "AIFF", 0, "AIFF", None, true, &mut m);
     assert!(ProcessAiff.process(&mut c));
@@ -1721,7 +1719,7 @@ mod tests {
 
   #[test]
   fn id3_chunk_recognized_then_silently_skipped() {
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(b"FORM");
     let body_inner = b"ID3 \x00\x00\x00\x04ID3v";
@@ -1741,7 +1739,7 @@ mod tests {
 
   #[test]
   fn composite_duration_emitted_when_both_inputs_nonzero() {
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(b"FORM");
     // COMM with SampleRate=22050, NumSampleFrames=44100.
@@ -1770,7 +1768,7 @@ mod tests {
 
   #[test]
   fn composite_duration_skipped_when_sample_rate_zero() {
-    let mut m = Metadata::new("x.aif");
+    let mut m = JsonTagWriter::new("x.aif");
     let data = std::fs::read(format!(
       "{}/tests/fixtures/AIFF.aif",
       env!("CARGO_MANIFEST_DIR")

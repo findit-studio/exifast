@@ -8,8 +8,8 @@
 //!
 //! A typed [`DsfMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] and the chained ID3v2 trailer so the
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] and the chained ID3v2 trailer so the
 //! serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## Why DSF needs a `Context<'a>` struct (not the leaf `&'a [u8]`)
@@ -37,7 +37,6 @@
 use crate::{
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -249,8 +248,8 @@ impl DsfFmtData {
 ///    path this is `Some` with all eight integers populated.
 /// 2. The fmt-chunk warning text ([`Self::fmt_warning`]). When
 ///    [`Self::fmt`] is `None`, this is `Some("Error reading DSF fmt
-///    chunk")` (DSF.pm:71) so the bridge re-pushes it through
-///    `MetadataTagWriter::write_warning` for byte-exact CLI JSON.
+///    chunk")` (DSF.pm:71) so the sink re-emits it through
+///    `TagWriter::write_warning` for byte-exact CLI JSON.
 /// 3. The optional ID3v2 trailer bytes ([`Self::id3_trailer`]) — the
 ///    `metaPos..metaPos+metaLen` slice (DSF.pm:88-97) borrowed from the
 ///    input buffer (zero-alloc). The bridge dispatches this slice
@@ -794,9 +793,9 @@ impl ProcessDsf {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
   /// [`FormatParser::parse`] (via [`parse_inner`] to preserve the
-  /// `id3_trailer` borrow) and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// `id3_trailer` borrow) and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (DSF.pm:62-99):
   /// 1. Header magic gate (DSF.pm:62-63) — `parse_inner` rejects with
@@ -826,14 +825,13 @@ impl ProcessDsf {
     let print_conv = ctx.print_conv_enabled();
     // Snapshot the trailer before the typed Meta moves into the sink.
     let trailer = meta.id3_trailer;
-    // Bridge: typed `DsfMeta` ⇒ `Metadata` via the Phase F3
-    // `MetadataTagWriter` adapter. Faithful to DSF.pm:80-85
+    // Sink the typed `DsfMeta` directly into the engine `JsonTagWriter`
+    // (`ctx.writer()`). Faithful to DSF.pm:80-85
     // `ProcessBinaryData` semantics — emits the same fmt-chunk tags
     // (or the Warn) in the same order with the same PrintConv vs
     // ValueConv toggling.
     {
-      let mut bridge = MetadataTagWriter::new(ctx.metadata());
-      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+      let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
     }
     // DSF.pm:88-97 — ID3v2 trailer dispatch via the legacy ID3 path.
     // Faithful gate:
@@ -922,6 +920,7 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
 mod tests {
   use super::*;
   use crate::{
+    json_writer::JsonTagWriter,
     parser::ParseContext,
     sink::{MapTagWriter, MapValue},
     value::Metadata,
@@ -1526,7 +1525,7 @@ mod tests {
   fn old_format_parser_rejects_when_short() {
     for n in [0usize, 39] {
       let buf = std::vec![0u8; n];
-      let mut m = Metadata::new("x.dsf");
+      let mut m = JsonTagWriter::new("x.dsf");
       let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
       assert!(!ProcessDsf.process(&mut c));
       assert!(m.tags().is_empty(), "n={n}");
@@ -1537,7 +1536,7 @@ mod tests {
   fn old_format_parser_rejects_when_wrong_magic() {
     let mut bad = happy_path_dsf()[..40].to_vec();
     bad[0..4].copy_from_slice(b"XXXX");
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&bad, "DSF", 0, "DSF", None, true, &mut m);
     assert!(!ProcessDsf.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1546,7 +1545,7 @@ mod tests {
   #[test]
   fn old_format_parser_accepts_minimal_valid_emits_full_set() {
     let buf = happy_path_dsf();
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
     assert!(ProcessDsf.process(&mut c));
     let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
@@ -1593,7 +1592,7 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12)
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
     assert!(ProcessDsf.process(&mut c)); // DSF.pm:72 return 1
     let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
@@ -1613,7 +1612,7 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
     assert!(ProcessDsf.process(&mut c));
     assert_eq!(
@@ -1636,7 +1635,7 @@ mod tests {
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(b"fmt ");
     buf.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
     assert!(ProcessDsf.process(&mut c));
     assert_eq!(
@@ -1652,7 +1651,7 @@ mod tests {
     // ID3v2.3 frame: "ID3" 03 00 flags=00 size=4×7bit=0 ⇒ empty body.
     let id3 = b"ID3\x03\x00\x00\x00\x00\x00\x00";
     let buf = dsf_with_trailer(id3);
-    let mut m = Metadata::new("x.dsf");
+    let mut m = JsonTagWriter::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
     assert!(ProcessDsf.process(&mut c));
     // File:* triplet + fmt-chunk tags ARE emitted. The ID3 trailer

@@ -2,7 +2,7 @@
 //! to the bundled-ExifTool golden for every ported fixture, for both the
 //! default (`-j -G1 -struct`) and `-n` snapshots. One case per ported
 //! format — add a `#[test]` per format as it lands (FORMATS.md order).
-use exifast::{jsondiff::json_equivalent, parser::extract_info, serialize::to_exiftool_json};
+use exifast::{jsondiff::json_equivalent, parser::extract_info};
 
 /// Assert exifast's output for `fixture` is equivalent to the committed
 /// bundled-ExifTool golden `golden` via `json_equivalent` (object key
@@ -14,7 +14,10 @@ fn check(fixture: &str, golden: &str, print_on: bool) {
     .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
   let want = std::fs::read_to_string(format!("{root}/tests/golden/{golden}"))
     .unwrap_or_else(|e| panic!("read golden {golden}: {e}"));
-  let got = to_exiftool_json(&extract_info(fixture, &data, print_on));
+  // `extract_info` now returns the byte-exact `exiftool -j -G1` JSON directly
+  // (via `JsonTagWriter::finish()`), replacing the retired
+  // `to_exiftool_json(&Metadata)` output path (task #124).
+  let got = extract_info(fixture, &data, print_on);
   json_equivalent(&got, &want).unwrap_or_else(|e| panic!("{fixture} vs {golden}: {}", e.message()));
 }
 

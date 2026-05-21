@@ -7,8 +7,8 @@
 //! The parser produces a typed [`MoiMeta<'a>`] holding `jiff::civil::DateTime`
 //! / `core::time::Duration` / primitive integers via the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] through the
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## What MOI is
@@ -42,7 +42,6 @@ use jiff::civil::DateTime;
 
 use crate::parser::ParseContext;
 use crate::parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed};
-use crate::sink::MetadataTagWriter;
 
 // ===========================================================================
 // Typed Meta — `MoiMeta<'a>`
@@ -772,9 +771,9 @@ impl std::error::Error for MoiError {}
 impl ProcessMoi {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and then drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and then drives [`MetaSinker::sink`] into the
+  /// engine [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the
+  /// serialized JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (MOI.pm:104-119): magic + filesize gate ⇒
   /// `SetFileType` ⇒ binary walk. The `SetFileType` happens BEFORE
@@ -795,14 +794,16 @@ impl ProcessMoi {
     // File:MIMEType under `("File", "File")` BEFORE the MOI:* tags
     // (the bundled-Perl iteration order under `-j -G1`).
     ctx.set_file_type(None, None, None);
-    // Bridge: typed `MoiMeta` ⇒ `Metadata` via the Phase E–F
-    // `MetadataTagWriter` adapter. Faithful to MOI.pm:117-118
+    // Sink the typed `MoiMeta` directly into the engine `JsonTagWriter`
+    // (`ctx.writer()`). Faithful to MOI.pm:117-118
     // `ProcessBinaryData(...)` semantics — emits the same MOI:* tags
     // in the same order with the same PrintConv vs ValueConv toggling.
     let print_conv = ctx.print_conv_enabled();
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    // `MetadataTagWriter::Error` is `Infallible` — the call cannot fail.
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    // Sink the typed `MoiMeta` DIRECTLY into the engine `JsonTagWriter`
+    // (`ctx.writer()`) — no adapter bridge, no separate output push-bag.
+    // `JsonTagWriter::Error` is `Infallible`, so the call cannot fail.
+    // Faithful to MOI.pm:117-118 `ProcessBinaryData(...)`.
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
     // MOI.pm:118 — `ProcessBinaryData` always returns 1 in the read path.
     true
   }
@@ -815,8 +816,8 @@ impl ProcessMoi {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::json_writer::JsonTagWriter;
   use crate::sink::MapTagWriter;
-  use crate::value::Metadata;
 
   // ---------- ValueConv helpers ------------------------------------------
 
@@ -1104,8 +1105,8 @@ mod tests {
 
   // ---------- Engine entry (`process`) -----------------------------------
 
-  fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
-    let mut m = Metadata::new("MOI.moi");
+  fn run_bridge(data: &[u8], print_on: bool) -> JsonTagWriter {
+    let mut m = JsonTagWriter::new("MOI.moi");
     let mut c = ParseContext::new(data, "MOI", 0, "MOI", None, print_on, &mut m);
     ProcessMoi.process(&mut c);
     m
@@ -1167,7 +1168,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_short_buffer() {
-    let mut m = Metadata::new("X.moi");
+    let mut m = JsonTagWriter::new("X.moi");
     let mut c = ParseContext::new(&[], "MOI", 0, "MOI", None, true, &mut m);
     assert!(!ProcessMoi.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1179,7 +1180,7 @@ mod tests {
     buf[0] = b'V';
     buf[1] = b'6';
     buf[2..6].copy_from_slice(&999u32.to_be_bytes());
-    let mut m = Metadata::new("X.moi");
+    let mut m = JsonTagWriter::new("X.moi");
     let mut c = ParseContext::new(&buf, "MOI", 0, "MOI", None, true, &mut m);
     assert!(!ProcessMoi.process(&mut c));
     // SetFileType is NOT called on a reject (faithful to MOI.pm:114 `or

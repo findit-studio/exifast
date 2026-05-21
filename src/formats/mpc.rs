@@ -7,8 +7,8 @@
 //!
 //! A typed [`MpcMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Chained-format role
@@ -57,7 +57,6 @@ use crate::{
   bitstream::{BitOrder, process_bit_stream},
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -831,7 +830,7 @@ impl MetaSinker for MpcMeta<'_> {
     // MPC.pm:107-109 — non-SV7 warning. Emit AFTER the (empty) tag block;
     // bundled `perl exiftool -j -G1` surfaces `ExifTool:Warning` as the
     // first non-File: entry (the serializer emits the warning at the front
-    // of the JSON object). Both [`MetadataTagWriter`] and lib callers
+    // of the JSON object). Both the engine [`JsonTagWriter`] and lib callers
     // (MapTagWriter) route this through [`TagWriter::write_warning`].
     if self.warn_unsupported_version {
       out.write_warning("Audio info currently not extracted from this version MPC file")?;
@@ -901,7 +900,7 @@ impl ProcessMpc {
     // MPC's own work at the post-ID3 offset. For the in-scope MPC fixtures
     // (`MPC.mpc` / `sv8.mpc`) which have NO ID3 prefix, this returns
     // `found=false, hdr_end=0` and is a no-op.
-    let id3 = if ctx.metadata().done_id3().is_none() {
+    let id3 = if ctx.writer().done_id3().is_none() {
       crate::formats::id3::process::process_id3_chained(ctx)
     } else {
       crate::formats::id3::process::Id3ChainedResult::default()
@@ -934,14 +933,12 @@ impl ProcessMpc {
     ctx.set_file_type(None, None, None);
 
     // ----- (4) SV7 walk OR non-SV7 warning (MPC.pm:97-109) -----------------
-    // Bridge: typed `MpcMeta` ⇒ `Metadata` via the Phase E–F
-    // `MetadataTagWriter` adapter. The MetaSinker emits the SV7 tags + the
-    // optional warning in faithful order; the bridge writes them through
-    // `Metadata::push` / `push_warning`. `MetadataTagWriter::Error` is
-    // `Infallible` ⇒ the call cannot fail.
+    // Sink the typed `MpcMeta` directly into the engine `JsonTagWriter`
+    // (`ctx.writer()`). The MetaSinker emits the SV7 tags + the optional
+    // warning in faithful order via `TagWriter::write_*` / `write_warning`.
+    // `JsonTagWriter::Error` is `Infallible` ⇒ the call cannot fail.
     let print_conv = ctx.print_conv_enabled();
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
 
     // ----- (5) APE trailer (MPC.pm:111-113) --------------------------------
     // `require Image::ExifTool::APE; ProcessAPE(...)`. Bundled is void
@@ -972,10 +969,10 @@ impl ProcessMpc {
 mod tests {
   use super::*;
   use crate::{
+    json_writer::JsonTagWriter,
     parser::ParseContext,
     parser_new::FormatParser,
     sink::{MapTagWriter, MapValue},
-    value::Metadata,
   };
 
   // ---------- Tag table + bit-keys faithfulness --------------------------
@@ -1088,7 +1085,7 @@ mod tests {
   fn rejects_non_mpc_magic() {
     // MPC.pm:92 `... $buff =~ /^MP\+(.)/s or return 0` — magic mismatch
     // returns 0 BEFORE SetFileType (MPC.pm:94), so nothing is pushed.
-    let mut m = Metadata::new("x.mpc");
+    let mut m = JsonTagWriter::new("x.mpc");
     let data = [0u8; 32];
     let mut c = ParseContext::new(&data, "MPC", 0, "MPC", None, true, &mut m);
     assert!(!ProcessMpc.process(&mut c));
@@ -1099,7 +1096,7 @@ mod tests {
   fn rejects_short_read() {
     // MPC.pm:92 `$raf->Read($buff,32) == 32 ...` — < 32 bytes ⇒ return 0.
     // Faithful even for a buffer that starts with "MP+" but is too short.
-    let mut m = Metadata::new("x.mpc");
+    let mut m = JsonTagWriter::new("x.mpc");
     let data = b"MP+\x07\x00\x00\x00";
     let mut c = ParseContext::new(data, "MPC", 0, "MPC", None, true, &mut m);
     assert!(!ProcessMpc.process(&mut c));

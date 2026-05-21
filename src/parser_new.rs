@@ -142,7 +142,7 @@ pub trait TagWriter {
   ///
   /// The default implementation calls [`Self::write_str`] for each
   /// element in order. Writers that DO want list-aware semantics (e.g.
-  /// `MetadataTagWriter` → `Metadata::push_listable`) override this method
+  /// the engine [`crate::json_writer::JsonTagWriter`]) override this method
   /// to coalesce into a single first-occurrence-position list value.
   /// Stateless writers (`MapTagWriter`, future JSON-array sinks) keep the
   /// default and either see last-write-wins (map storage) or emit each

@@ -11,8 +11,8 @@
 //! audio is invoked internally by the MP3 file-type entry
 //! ([`crate::formats::id3::ProcessMp3`]) via
 //! [`ProcessMp3::process_with_start_offset`], which drives
-//! [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! ## Ports
@@ -63,7 +63,6 @@ use std::{borrow::Cow, string::String};
 use crate::{
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   value::format_g,
 };
 
@@ -1633,9 +1632,9 @@ impl ProcessMp3 {
     } else {
       Some(ext_owned.clone())
     };
-    // Split borrow: `(&data, &mut meta)` via disjoint fields — avoids any
+    // Split borrow: `(&data, &mut writer)` via disjoint fields — avoids any
     // `Vec<u8>` copy of the scan buffer.
-    let (data, meta) = ctx.data_and_metadata();
+    let (data, meta) = ctx.data_and_writer();
     let post_id3 = data.get(start_offset..).unwrap_or(&[]);
     let bounded_len = scan_len.min(post_id3.len());
     let bounded = &post_id3[..bounded_len];
@@ -1665,11 +1664,12 @@ impl ProcessMp3 {
       meta,
     );
     sub.set_file_type(None, None, None);
-    // Sink the typed Meta into the bridge — File:* + MPEG:* in MPEG.pm
-    // iteration order. The `MetadataTagWriter` writes group="MPEG" for
-    // every tag, matching the bundled `-G1` family-1 group.
-    let mut bridge = MetadataTagWriter::new(sub.metadata());
-    let _: Result<(), core::convert::Infallible> = typed_meta.sink(print_conv_enabled, &mut bridge);
+    // Sink the typed Meta DIRECTLY into the engine `JsonTagWriter` — File:* +
+    // MPEG:* in MPEG.pm iteration order. The sink writes group="MPEG" for
+    // every tag, matching the bundled `-G1` family-1 group. (No adapter
+    // bridge, no separate output push-bag.)
+    let _: Result<(), core::convert::Infallible> =
+      typed_meta.sink(print_conv_enabled, sub.writer());
     // MPEG.pm:580 `return 1`.
     true
   }
@@ -1681,7 +1681,7 @@ impl ProcessMp3 {
   /// convenience over [`Self::process_with_start_offset`]. Faithful order
   /// (MPEG.pm:464-581): sync scan ⇒ `SetFileType` ⇒ bit-extract ⇒
   /// Xing/LAME tail, driving the typed parser through `MetaSinker` →
-  /// `MetadataTagWriter`. Test-only: the production raw-MP3 dispatch goes
+  /// `JsonTagWriter`. Test-only: the production raw-MP3 dispatch goes
   /// through `id3::ProcessMp3` (the `MP3` file-type entry), which calls
   /// `process_with_start_offset` after the ID3 pass.
   pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
@@ -1700,11 +1700,12 @@ impl ProcessMp3 {
 mod tests {
   use super::*;
   use crate::{
+    json_writer::JsonTagWriter,
     sink::{MapTagWriter, MapValue},
-    value::{Metadata, TagValue},
+    value::TagValue,
   };
 
-  fn ctx_over<'a>(meta: &'a mut Metadata, data: &'a [u8], ft: &'a str) -> ParseContext<'a> {
+  fn ctx_over<'a>(meta: &'a mut JsonTagWriter, data: &'a [u8], ft: &'a str) -> ParseContext<'a> {
     let ext = crate::filetype::file_ext_for_name(meta.source_file());
     ParseContext::new(data, ft, 0, ft, ext, true, meta)
   }
@@ -2043,7 +2044,7 @@ mod tests {
   fn bridge_parse_emits_expected_tags_print_on() {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let mut c = ctx_over(&mut m, &data, "MP3");
     assert!(ProcessMp3.process(&mut c));
     let names_vals: std::vec::Vec<_> = m
@@ -2069,7 +2070,7 @@ mod tests {
   fn bridge_parse_emits_expected_tags_print_off() {
     let mut data = vec![0xff, 0xfb, 0x90, 0x4c];
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, false, &mut m);
     assert!(ProcessMp3.process(&mut c));
@@ -2093,7 +2094,7 @@ mod tests {
   #[test]
   fn bridge_reject_returns_false_with_no_filetype_tag() {
     let data = [0x00u8; 32];
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let mut c = ctx_over(&mut m, &data, "MP3");
     assert!(!ProcessMp3.process(&mut c));
     assert!(m.tags().iter().all(|t| t.name() != "FileType"));
@@ -2102,7 +2103,7 @@ mod tests {
   #[test]
   fn bridge_parse_emits_xing_lame_tags() {
     let data = build_vbr_xing_lame_fixture();
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let mut c = ctx_over(&mut m, &data, "MP3");
     assert!(ProcessMp3.process(&mut c));
     let names_vals: std::vec::Vec<_> = m
@@ -2141,7 +2142,7 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(!ProcessMp3.process(&mut c));
@@ -2157,7 +2158,7 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.mp3");
+    let mut m = JsonTagWriter::new("x.mp3");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(ProcessMp3.process(&mut c));
@@ -2174,7 +2175,7 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.dat");
+    let mut m = JsonTagWriter::new("x.dat");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(!ProcessMp3.process(&mut c));
@@ -2190,7 +2191,7 @@ mod tests {
     let mut data: std::vec::Vec<u8> = filler;
     data.extend_from_slice(&0xfffb_904c_u32.to_be_bytes());
     data.extend(std::iter::repeat(0).take(413));
-    let mut m = Metadata::new("x.dat");
+    let mut m = JsonTagWriter::new("x.dat");
     let ext = crate::filetype::file_ext_for_name(m.source_file());
     let mut c = ParseContext::new(&data, "MP3", 0, "MP3", ext, true, &mut m);
     assert!(ProcessMp3.process(&mut c));

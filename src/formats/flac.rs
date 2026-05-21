@@ -1326,13 +1326,12 @@ impl MetaSinker for FlacMeta<'_> {
   ///
   /// **List-tag note (Codex CF2).** Vorbis `List => 1` tags
   /// (Artist/Performer/Contact) coalesce into a single `TagValue::List` at
-  /// first-occurrence position via [`TagWriter::write_str_list`], so
-  /// list-aware writers (`MetadataTagWriter` → `Metadata::push_listable`)
-  /// faithfully build a JSON array (ExifTool.pm:9505-9520 `FoundTag`). The
-  /// legacy bridge the engine entry `process` keeps its own
-  /// `push_listable` loop for the byte-exact CLI path; this typed sink now
-  /// reaches `write_str_list` so the lib-first `MetaSinker` path coalesces
-  /// too.
+  /// first-occurrence position via [`TagWriter::write_str_list`], so any
+  /// list-aware writer faithfully builds a JSON array (ExifTool.pm:9505-9520
+  /// `FoundTag`). The engine entry `process` keeps its own `write_str_list`
+  /// loop (`bridge_emit_vorbis`) for the byte-exact CLI path; this typed
+  /// sink reaches the same `write_str_list` so the lib-first `MetaSinker`
+  /// path coalesces too.
   fn sink<W: TagWriter>(&self, print_conv: bool, out: &mut W) -> Result<(), W::Error> {
     const FLAC_GROUP: &str = "FLAC";
     const VORBIS_GROUP: &str = "Vorbis";
@@ -1394,9 +1393,8 @@ impl MetaSinker for FlacMeta<'_> {
     // `FoundTag` (ExifTool.pm:9505-9520). The flat `self.vorbis` stream may
     // carry the same listable name more than once; we gather all its values
     // (in encounter order) and emit ONE `write_str_list` at the first
-    // occurrence, skipping later repeats so list-aware writers
-    // (`MetadataTagWriter` → `Metadata::push_listable`) coalesce instead of
-    // last-write-wins (Codex CF2).
+    // occurrence, skipping later repeats so list-aware writers coalesce
+    // instead of last-write-wins (Codex CF2).
     let mut emitted_listable: Vec<&str> = Vec::new();
     for item in &self.vorbis {
       match item {
@@ -1563,10 +1561,11 @@ impl std::error::Error for FlacError {}
 impl ProcessFlac {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed parser then
-  /// drives a byte-exact emission path: StreamInfo + Picture + Composite
-  /// via [`MetaSinker::sink`] over a [`MetadataTagWriter`]; VorbisComments
-  /// custom-routed so list-tags (Artist/Performer/Contact) get
-  /// [`crate::value::Metadata::push_listable`] coalescing semantics.
+  /// drives a byte-exact emission path directly into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) (`ctx.writer()`):
+  /// StreamInfo + Picture + Composite + VorbisComments, with list-tags
+  /// (Artist/Performer/Contact) coalesced via
+  /// [`TagWriter::write_str_list`].
   ///
   /// Faithful order (FLAC.pm:239-280):
   ///   1. ID3v2 prefix skip (FLAC.pm:243-247).
@@ -1611,7 +1610,7 @@ impl ProcessFlac {
 
     // Emit tags. Split: StreamInfo + Picture + Composite via sink path;
     // VorbisComment via explicit list-aware loop on Metadata.
-    let (meta_data, meta_md) = ctx.data_and_metadata();
+    let (meta_data, meta_md) = ctx.data_and_writer();
     let _ = meta_data; // unused — we already extracted via parse_inner.
     bridge_emit_streaminfo(&meta.stream_info, meta_md);
     bridge_emit_vorbis(&meta.vorbis, meta_md);
@@ -1670,7 +1669,7 @@ fn detect_vorbis_format_error(data: &[u8]) -> bool {
 /// Emit StreamInfo tags onto `meta` faithfully (FLAC.pm:59-82). All scalars
 /// already carry the post-ValueConv values; only MD5Signature needs the
 /// `unpack("H*", $val)` rendering.
-fn bridge_emit_streaminfo(si: &StreamInfo, meta: &mut crate::value::Metadata) {
+fn bridge_emit_streaminfo(si: &StreamInfo, meta: &mut crate::json_writer::JsonTagWriter) {
   use crate::value::Group;
   let g = || Group::new("FLAC", "FLAC");
   if let Some(v) = si.block_size_min {
@@ -1713,7 +1712,7 @@ fn bridge_emit_streaminfo(si: &StreamInfo, meta: &mut crate::value::Metadata) {
 /// Emit Vorbis comment items onto `meta` with faithful list-coalescing
 /// semantics. List-tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:85,86,94)
 /// use `push_listable`; everything else uses plain `push`.
-fn bridge_emit_vorbis(items: &[VorbisItem<'_>], meta: &mut crate::value::Metadata) {
+fn bridge_emit_vorbis(items: &[VorbisItem<'_>], meta: &mut crate::json_writer::JsonTagWriter) {
   use crate::value::Group;
   let g = || Group::new(VORBIS_COMMENTS_TABLE.group0(), "Vorbis");
   for item in items {
@@ -1751,7 +1750,7 @@ fn bridge_emit_vorbis(items: &[VorbisItem<'_>], meta: &mut crate::value::Metadat
 /// (skipped iff declared length > 0 but no bytes remain).
 fn bridge_emit_pictures(
   pictures: &[FlacPicture<'_>],
-  meta: &mut crate::value::Metadata,
+  meta: &mut crate::json_writer::JsonTagWriter,
   print_on: bool,
 ) {
   use crate::convert::apply;
@@ -1801,7 +1800,7 @@ fn bridge_emit_pictures(
 /// Emit `Composite:Duration` post-loop (FLAC.pm:137-149).
 fn bridge_emit_composite_duration(
   meta_typed: &FlacMeta<'_>,
-  meta: &mut crate::value::Metadata,
+  meta: &mut crate::json_writer::JsonTagWriter,
   print_on: bool,
 ) {
   use crate::value::Group;
@@ -1820,21 +1819,21 @@ fn bridge_emit_composite_duration(
 }
 
 // ===========================================================================
-// MetadataTagWriter rationale
+// bridge_emit_* split rationale
 //
-// The bridge above bypasses MetaSinker::sink + MetadataTagWriter because
-// TagWriter doesn't expose listable emission (push_listable). Vorbis ARTIST/
-// PERFORMER/CONTACT (Vorbis.pm:85,86,94) need same-(group, name)
-// coalescing into a JSON array, which TagWriter's flat write_str last-wins
-// model cannot express. When Phase G ships an AnyMeta-aware JSON sink that
-// handles list-coalescing natively (e.g. via a TagWriter::write_str_list
-// addition), the bridge can collapse to the one-liner MOI/AAC/DV use:
-//
-//     let mut w = MetadataTagWriter::new(ctx.metadata());
-//     meta.sink(print_on, &mut w)?;
-//
-// Until then, lib-first MetaSinker emission is for lib-first JSON sinks
-// (MapTagWriter etc.) and the bridge handles legacy byte-exact output.
+// The engine entry `process` writes each tag group with the dedicated
+// `bridge_emit_streaminfo`/`_vorbis`/`_pictures`/`_composite_duration`
+// helpers (all emitting straight into the engine `JsonTagWriter` via
+// `ctx.writer()`) instead of a single `meta.sink(print_on, ctx.writer())`
+// call. The split exists so the two FLAC warnings — "Format error in
+// Vorbis comments" (FLAC.pm via Vorbis::ProcessComments returning 0) and
+// "Format error in FLAC file" (FLAC.pm:278) — can be interleaved at their
+// faithful `-G1` emission positions, which the typed `FlacMeta` cannot
+// carry on its own. List coalescing (Vorbis ARTIST/PERFORMER/CONTACT,
+// Vorbis.pm:85,86,94) is identical on both paths: `bridge_emit_vorbis` and
+// `MetaSinker::sink` both call `TagWriter::write_str_list`. The standalone
+// `MetaSinker::sink` impl above remains the lib-first emission path for
+// generic sinks (`MapTagWriter` etc.).
 // ===========================================================================
 
 // ===========================================================================
@@ -1844,9 +1843,9 @@ fn bridge_emit_composite_duration(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::json_writer::JsonTagWriter;
   use crate::parser::ParseContext;
   use crate::sink::MapTagWriter;
-  use crate::value::Metadata;
 
   // ---------- StreamInfo bit-stream decoding -----------------------------
 
@@ -2153,14 +2152,14 @@ mod tests {
 
   // ---------- Engine entry (`process`) ------------------------------------
 
-  fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
-    let mut m = Metadata::new("x.flac");
+  fn run_bridge(data: &[u8], print_on: bool) -> JsonTagWriter {
+    let mut m = JsonTagWriter::new("x.flac");
     let mut c = ParseContext::new(data, "FLAC", 0, "FLAC", None, print_on, &mut m);
     ProcessFlac.process(&mut c);
     m
   }
 
-  fn find_value(meta: &Metadata, name: &str) -> Option<TagValue> {
+  fn find_value(meta: &JsonTagWriter, name: &str) -> Option<TagValue> {
     meta
       .tags()
       .iter()
@@ -2196,7 +2195,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_missing_magic() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(b"not-flac-here", "FLAC", 0, "FLAC", None, true, &mut m);
     assert!(!ProcessFlac.process(&mut c));
     assert!(m.tags().is_empty());
@@ -2343,12 +2342,10 @@ mod tests {
   /// Codex CF2: the typed `MetaSinker::sink` coalesces repeated Vorbis
   /// List=>1 entries (ARTIST/PERFORMER/CONTACT) into a single
   /// first-occurrence-position `TagValue::List` via
-  /// `TagWriter::write_str_list`, so a `MetadataTagWriter` consumer builds
+  /// `TagWriter::write_str_list`, so a `JsonTagWriter` consumer builds
   /// a JSON array instead of last-write-wins.
   #[test]
-  fn sink_list_coalesces_repeated_artist_via_metadata_writer() {
-    use crate::sink::MetadataTagWriter;
-    use crate::value::{Metadata, TagValue};
+  fn sink_list_coalesces_repeated_artist_via_json_writer() {
     // Two ARTIST entries (listable) plus a non-listable TITLE between
     // pins both ordering and the first-occurrence-position contract.
     let meta = FlacMeta {
@@ -2373,11 +2370,8 @@ mod tests {
       pictures: vec![],
       format_error: false,
     };
-    let mut md = Metadata::new("x.flac");
-    {
-      let mut bridge = MetadataTagWriter::new(&mut md);
-      meta.sink(true, &mut bridge).unwrap();
-    }
+    let mut md = JsonTagWriter::new("x.flac");
+    meta.sink(true, &mut md).unwrap();
     // Exactly one Artist tag, carrying a 2-element list (not two scalars).
     let artists: Vec<_> = md.tags().iter().filter(|t| t.name() == "Artist").collect();
     assert_eq!(artists.len(), 1, "Artist must coalesce into one list tag");

@@ -8,8 +8,8 @@
 //! ID3.pm:1684-1728) via the typed [`Id3Meta<'a>`] / [`Mp3Meta<'a>`]
 //! published through the [`crate::parser_new::FormatParser`] trait. The MP3
 //! engine entry ([`ProcessMp3::process`]) drives
-//! [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact for all 60+ ID3/MP3 conformance fixtures.
 //!
 //! Per FORMATS.md row 2 (ID3 infra + MP3 completion) this module

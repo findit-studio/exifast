@@ -8,8 +8,8 @@
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`AaMeta<'a>`] is produced by the new
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 //!
 //! **M4B-side DEFERRED to FORMATS.md row 25 (QuickTime/MOV).** The bundled
@@ -35,7 +35,6 @@ use crate::{
   convert::{fix_utf8, pack_c0u},
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
 };
 use smol_str::SmolStr;
@@ -1303,9 +1302,9 @@ impl std::error::Error for AudibleError {}
 impl ProcessAa {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`parse_inner`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`parse_inner`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (Audible.pm:201-272):
   /// 1. Magic + filesize gate (lines 201-205) — reject ⇒ `return 0`.
@@ -1326,14 +1325,14 @@ impl ProcessAa {
     // File:* tags BEFORE the AA:* tags (the bundled emission order
     // under `-j -G1`).
     ctx.set_file_type(None, None, None);
-    // Bridge: typed `AaMeta` ⇒ `Metadata` via `MetadataTagWriter`.
+    // Sink the typed `AaMeta` directly into the engine `JsonTagWriter`
+    // (`ctx.writer()`) via `MetaSinker::sink`.
     // `print_conv` is accepted for trait conformance but unused for AA
     // (no PrintConv on any static def — see [`MetaSinker::sink`] docs).
     let print_conv = ctx.print_conv_enabled();
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    // `MetadataTagWriter::Error` is `Infallible` — the sink cannot fail.
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
-    // The bridge maps `write_str` to `Group::new(group, group)` (family-0
+    // `JsonTagWriter::Error` is `Infallible` — the sink cannot fail.
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
+    // The sink maps `write_str` to `Group::new(group, group)` (family-0
     // == family-1 == "Audible") which matches the existing AA path
     // exactly — Audible.pm static defs all have `group1 = "Audible"` and
     // the dynamic-name path used `Group::new(AUDIBLE_MAIN.group0(),
@@ -1349,7 +1348,8 @@ impl ProcessAa {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::value::{Metadata, TagValue};
+  use crate::json_writer::JsonTagWriter;
+  use crate::value::TagValue;
 
   // ----- Static table -----
 
@@ -1512,7 +1512,7 @@ mod tests {
 
   #[test]
   fn reject_short_data_does_not_set_filetype() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let data = [0u8; 8]; // < 16
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
     assert!(!ProcessAa.process(&mut c));
@@ -1521,7 +1521,7 @@ mod tests {
 
   #[test]
   fn reject_bad_magic_does_not_set_filetype() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = [0u8; 16];
     data[4..8].copy_from_slice(&[0, 0, 0, 0]);
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
@@ -1531,7 +1531,7 @@ mod tests {
 
   #[test]
   fn reject_file_size_mismatch_does_not_set_filetype() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = [0u8; 20];
     data[0..4].copy_from_slice(&[0, 0, 3, 0xe7]); // 999 BE
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
@@ -1542,7 +1542,7 @@ mod tests {
 
   #[test]
   fn accept_empty_toc_emits_only_filetype_triplet() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = [0u8; 16];
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
@@ -1561,7 +1561,7 @@ mod tests {
 
   #[test]
   fn invalid_toc_warns_and_accepts() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = vec![0u8; 16];
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
@@ -1573,7 +1573,7 @@ mod tests {
 
   #[test]
   fn truncated_toc_warns_and_accepts() {
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = vec![0u8; 16];
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
@@ -1618,7 +1618,7 @@ mod tests {
   #[test]
   fn duplicate_static_dict_tag_emits_last_value() {
     let bytes = build_aa_with_dict(&[("author", "FIRST"), ("author", "SECOND")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let author_tags: Vec<_> = m
@@ -1633,7 +1633,7 @@ mod tests {
   #[test]
   fn duplicate_dynamic_dict_tag_emits_last_value() {
     let bytes = build_aa_with_dict(&[("title", "FIRST"), ("title", "SECOND")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let title_tags: Vec<_> = m
@@ -1648,7 +1648,7 @@ mod tests {
   #[test]
   fn duplicate_dict_tag_preserves_first_position() {
     let bytes = build_aa_with_dict(&[("author", "A"), ("title", "T"), ("author", "B")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
@@ -1693,7 +1693,7 @@ mod tests {
   #[test]
   fn duplicate_chapter_count_chunks_emit_last_value() {
     let bytes = build_aa_with_two_chap_chunks(1, 2);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let chap_tags: Vec<_> = m
@@ -1708,7 +1708,7 @@ mod tests {
   #[test]
   fn dict_cover_art_uses_binary_placeholder() {
     let bytes = build_aa_with_dict(&[("_cover_art", "ABCDE")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let cover: Vec<_> = m
@@ -1726,7 +1726,7 @@ mod tests {
   #[test]
   fn reserved_special_dict_tags_are_dropped() {
     let bytes = build_aa_with_dict(&[("GROUPS", "g_val"), ("FORMAT", "f_val"), ("title", "T")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
@@ -1742,7 +1742,7 @@ mod tests {
   #[test]
   fn dynamic_name_colliding_with_engine_filetype_is_first_wins() {
     let bytes = build_aa_with_dict(&[("file_type", "FIRST"), ("FileType", "SECOND")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_filetype: Vec<_> = m
@@ -1767,7 +1767,7 @@ mod tests {
       ("file_type_extension", "FIRST"),
       ("FileTypeExtension", "SECOND"),
     ]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_ftypeext: Vec<_> = m
@@ -1785,7 +1785,7 @@ mod tests {
       ("exif_tool_version", "FIRST"),
       ("ExifToolVersion", "SECOND"),
     ]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_etver: Vec<_> = m
@@ -1800,7 +1800,7 @@ mod tests {
   #[test]
   fn dict_value_with_fatal_numeric_entity_emits_exiftool_error() {
     let bytes = build_aa_with_dict(&[("title", "X&#x8000000000000000;Y")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
@@ -1817,7 +1817,7 @@ mod tests {
   #[test]
   fn dict_value_with_fatal_decimal_entity_emits_exiftool_error() {
     let bytes = build_aa_with_dict(&[("title", "X&#9223372036854775808;Y")]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let errs = m.errors();
@@ -1832,7 +1832,7 @@ mod tests {
       ("title", "Y&#x8000000000000000;Z"),
       ("narrator", "should-not-appear"),
     ]);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let names: Vec<_> = m
@@ -1885,7 +1885,7 @@ mod tests {
   #[test]
   fn dict_fatal_entity_stops_later_toc_chunks() {
     let bytes = build_aa_dict_then_chap(&[("title", "X&#x8000000000000000;Y")], 7);
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
@@ -1968,14 +1968,14 @@ mod tests {
   #[test]
   fn meta_sinker_emits_warnings() {
     use crate::sink::MapTagWriter;
-    let mut m = Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut data = vec![0u8; 16];
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     data[8..12].copy_from_slice(&[0, 0, 0x01, 0x01]); // 257
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
     assert!(ProcessAa.process(&mut c));
-    // The bridge picks up the warning via push_warning ⇒ MetadataTagWriter.
+    // The warning reaches the engine `JsonTagWriter` via `write_warning`.
     assert_eq!(m.warnings(), &["Invalid TOC"]);
 
     // Also verify the typed path: parse_borrowed produces the same warning.

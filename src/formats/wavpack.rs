@@ -7,8 +7,8 @@
 //!
 //! A typed [`WvMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
-//! drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] and the chained ID3/APE trailers so
+//! drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] and the chained ID3/APE trailers so
 //! the serialized JSON stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## What WavPack is
@@ -72,7 +72,6 @@ use core::convert::Infallible;
 use crate::{
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
 };
 
 // ===========================================================================
@@ -698,9 +697,9 @@ impl std::error::Error for WvError {}
 impl ProcessWv {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (WavPack.pm:87-104):
   /// 1. Magic + version-byte gate (`return 0` on reject) — WavPack.pm:87-88.
@@ -741,8 +740,7 @@ impl ProcessWv {
     // Faithful to the ProcessBinaryData iteration order (numeric-key
     // sort) and the PrintConv / ValueConv toggle.
     {
-      let mut bridge = MetadataTagWriter::new(ctx.metadata());
-      let _: Result<(), Infallible> = meta.sink(print_conv, &mut bridge);
+      let _: Result<(), Infallible> = meta.sink(print_conv, ctx.writer());
     }
 
     // WavPack.pm:96-103: `RIFF::ProcessRIFF` + `APE::ProcessAPE` trailers.
@@ -776,7 +774,7 @@ impl ProcessWv {
     // out of its own MAC body scan — the WavPack-level `return 1`
     // (WavPack.pm:104) is unaffected. We model this faithfully via the
     // chained `process_id3_chained` entry.
-    if ctx.metadata().done_id3().is_none() {
+    if ctx.writer().done_id3().is_none() {
       let _ = crate::formats::id3::process::process_id3_chained(ctx);
     }
     let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
@@ -793,8 +791,9 @@ impl ProcessWv {
 mod tests {
   use super::*;
   use crate::{
+    json_writer::JsonTagWriter,
     sink::{MapTagWriter, MapValue},
-    value::{Metadata, TagValue},
+    value::TagValue,
   };
 
   // -------------------------------------------------------------------------
@@ -1076,11 +1075,11 @@ mod tests {
   }
 
   // -------------------------------------------------------------------------
-  // Engine entry — typed parse + File:* + sink into `Metadata`
+  // Engine entry — typed parse + File:* + sink into `JsonTagWriter`
   // -------------------------------------------------------------------------
 
-  fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
-    let mut m = Metadata::new("WavPack.wv");
+  fn run_bridge(data: &[u8], print_on: bool) -> JsonTagWriter {
+    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut c = ParseContext::new(data, "WV", 0, "WV", None, print_on, &mut m);
     ProcessWv.process(&mut c);
     m
@@ -1146,7 +1145,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_short() {
-    let mut m = Metadata::new("WavPack.wv");
+    let mut m = JsonTagWriter::new("WavPack.wv");
     let data = vec![0u8; 16];
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
     assert!(!ProcessWv.process(&mut c));
@@ -1155,7 +1154,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_bad_magic() {
-    let mut m = Metadata::new("WavPack.wv");
+    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"WVPK");
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
@@ -1165,7 +1164,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_bad_version_byte_8() {
-    let mut m = Metadata::new("WavPack.wv");
+    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x05;
@@ -1177,7 +1176,7 @@ mod tests {
 
   #[test]
   fn bridge_rejects_bad_version_byte_9() {
-    let mut m = Metadata::new("WavPack.wv");
+    let mut m = JsonTagWriter::new("WavPack.wv");
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x10;

@@ -6,14 +6,13 @@
 //!
 //! A typed [`DvMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
-//! `process` drives [`crate::parser_new::MetaSinker::sink`] through
-//! [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
+//! `process` drives [`crate::parser_new::MetaSinker::sink`] into the engine
+//! [`crate::json_writer::JsonTagWriter`] so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 
 use crate::{
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{TagValue, format_g},
 };
@@ -1003,9 +1002,9 @@ impl std::error::Error for DvError {}
 impl ProcessDv {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let outcome: Option<DvParseOutcome<'static>> = {
       let data = ctx.data();
@@ -1015,18 +1014,17 @@ impl ProcessDv {
       None => false, // RejectEmpty / RejectNoDif / RejectShortDif
       Some(DvParseOutcome::UnrecognizedProfile) => {
         ctx.set_file_type(None, None, None); // DV.pm:173 (runs BEFORE the foreach)
-        ctx.metadata().push_warning("Unrecognized DV profile"); // DV.pm:188
+        ctx.writer().push_warning("Unrecognized DV profile"); // DV.pm:188
         true
       }
       Some(DvParseOutcome::Meta(meta)) => {
         ctx.set_file_type(None, None, None); // DV.pm:173
         let print_conv = ctx.print_conv_enabled();
-        // Bridge: typed `DvMeta` ⇒ `Metadata` via the Phase E–F
-        // `MetadataTagWriter` adapter. Faithful to DV.pm:267-270
+        // Sink the typed `DvMeta` directly into the engine `JsonTagWriter`
+        // (`ctx.writer()`). Faithful to DV.pm:267-270
         // `HandleTag` semantics — emits the same DV:* tags in the same
         // order with the same PrintConv vs ValueConv toggling.
-        let mut bridge = MetadataTagWriter::new(ctx.metadata());
-        let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+        let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
         true // DV.pm:272 `return 1`
       }
     }
@@ -1036,7 +1034,7 @@ impl ProcessDv {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{parser::ParseContext, value::Metadata};
+  use crate::{json_writer::JsonTagWriter, parser::ParseContext};
 
   #[test]
   fn profiles_and_tag_order_are_faithful() {
@@ -1171,7 +1169,7 @@ mod tests {
 
   #[test]
   fn process_rejects_empty_buffer() {
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&[], "DV", 0, "DV", None, true, &mut m);
     assert!(!ProcessDv.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1180,7 +1178,7 @@ mod tests {
   #[test]
   fn process_rejects_no_dif_header() {
     let data = vec![0u8; 200];
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(!ProcessDv.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1190,7 +1188,7 @@ mod tests {
   fn process_rejects_when_dif_header_lacks_six_blocks() {
     // 4-byte magic at offset 0; len 4 ⇒ start+480 > 4 ⇒ DV.pm:171 reject.
     let data = vec![0x1f, 0x07, 0x00, 0x3f];
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(!ProcessDv.process(&mut c));
     assert!(m.tags().is_empty());
@@ -1200,7 +1198,7 @@ mod tests {
   fn process_rejects_when_six_blocks_truncated() {
     let mut data = vec![0u8; 479];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(!ProcessDv.process(&mut c));
   }
@@ -1211,7 +1209,7 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x1f; // buff[start + 80*5 + 48 + 3]
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(ProcessDv.process(&mut c));
     // File:* pushed (SetFileType BEFORE the warning, DV.pm:173).
@@ -1243,7 +1241,7 @@ mod tests {
     data[85] = 0x05;
     data[86] = 0x12;
     data[87] = 0xaa; // sprintf("%.2x", 0xaa) = "aa" ⇒ contains a-f
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(ProcessDv.process(&mut c));
     assert!(!m.tags().iter().any(|t| t.name() == "DateTimeOriginal"));
@@ -1256,7 +1254,7 @@ mod tests {
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x00;
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(ProcessDv.process(&mut c));
     // FrameRate → 29.97 after PrintConv.
@@ -1271,7 +1269,7 @@ mod tests {
     };
     assert!((n - 29.97).abs() < 1e-9, "got {n}");
     // -n: raw 30000/1001.
-    let mut m2 = Metadata::new("x.dv");
+    let mut m2 = JsonTagWriter::new("x.dv");
     let mut c2 = ParseContext::new(&data, "DV", 0, "DV", None, false, &mut m2);
     assert!(ProcessDv.process(&mut c2));
     let fr2 = m2.tags().iter().find(|t| t.name() == "FrameRate").unwrap();
@@ -1290,7 +1288,7 @@ mod tests {
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[4] = 0x01; // buff[4] & 0x07 == 1 (non-zero)
     data[451] = 0; // stype = 0
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(ProcessDv.process(&mut c));
     let vf = m.tags().iter().find(|t| t.name() == "VideoFormat").unwrap();
@@ -1309,7 +1307,7 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[451] = 0x1f;
-    let mut m = Metadata::new("x.dv");
+    let mut m = JsonTagWriter::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
     assert!(ProcessDv.process(&mut c));
     assert_eq!(m.warnings(), &["Unrecognized DV profile"]);

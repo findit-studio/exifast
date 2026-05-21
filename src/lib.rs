@@ -92,12 +92,20 @@ pub mod formats;
 // the `json` feature (spec §4: `json = ["alloc", "dep:serde_json", "dep:serde", ...]`).
 // Library callers without `json` get the typed-Meta API path only; CLI
 // JSON emission requires the feature.
-#[cfg(feature = "json")]
+// `json_scalar` builds the per-scalar JSON lexemes by hand (no `serde_json`),
+// so it needs only `alloc` (String/format!), NOT the serde-pulling `json`
+// feature. Gated on `alloc` because [`json_writer`] — the engine's mandatory
+// `$$et` value sink after task #124 — depends on it, and the engine
+// (parser + format modules) is always compiled.
+#[cfg(feature = "alloc")]
 pub mod json_scalar;
-// The direct typed-Meta → JSON `TagWriter` (Phase #124 redesign target). Gated
-// on `json`; reuses the byte-exact scalar encoders in `json_scalar` so it is
-// byte-identical to the `Metadata`→JSON `serialize` path.
-#[cfg(feature = "json")]
+// The direct typed-Meta → JSON `TagWriter` and the engine's `$$et` value sink
+// (task #124). Reuses the byte-exact scalar encoders in [`json_scalar`] so it
+// is byte-identical to the `Metadata`→JSON `serialize` path. Builds its JSON
+// string directly (no `serde_json`), so it is gated on `alloc` rather than the
+// serde-pulling `json` feature: the always-compiled parser/format engine now
+// emits through it, so it must be available in every engine build.
+#[cfg(feature = "alloc")]
 pub mod json_writer;
 #[cfg(feature = "json")]
 pub mod jsondiff;

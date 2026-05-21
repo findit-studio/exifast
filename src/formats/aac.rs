@@ -8,14 +8,13 @@
 //! A typed [`AacMeta<'a>`] is produced by the
 //! [`crate::parser_new::FormatParser`] trait; the engine entry
 //! [`ProcessAac::process`] drives [`crate::parser_new::MetaSinker::sink`]
-//! through [`crate::sink::MetadataTagWriter`] so the serialized JSON stays
-//! byte-exact with bundled `perl exiftool`.
+//! into the engine [`crate::json_writer::JsonTagWriter`] so the serialized
+//! JSON stays byte-exact with bundled `perl exiftool`.
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
   parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
-  sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -428,9 +427,9 @@ impl std::error::Error for AacError {}
 impl ProcessAac {
   /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
   /// dispatch (`crate::parser::extract_info`). Runs the typed
-  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
-  /// bundled `perl exiftool`.
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] into the engine
+  /// [`JsonTagWriter`](crate::json_writer::JsonTagWriter) so the serialized
+  /// JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (AAC.pm:99-140): header magic + filesize + SF index
   /// gates ⇒ `SetFileType` ⇒ bit-stream walk ⇒ Encoder filler scan.
@@ -448,12 +447,11 @@ impl ProcessAac {
     // The Encoder field needs the legacy `convert::apply` path for the
     // family-1 group routing (the AAC_MAIN.group1 dispatch lands family-1
     // as "AAC"). Use the typed sink which mirrors that mapping exactly.
-    let mut bridge = MetadataTagWriter::new(ctx.metadata());
-    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, &mut bridge);
+    let _: Result<(), core::convert::Infallible> = meta.sink(print_conv, ctx.writer());
     // Note: the Channels PrintConv hash maps `0 ⇒ "?"`. The bundled-Perl
     // JSON emitter writes `"?"` as a quoted JSON string. Our
-    // `MetadataTagWriter::write_str` pushes `TagValue::Str`, which the
-    // serializer quotes — byte-exact.
+    // `JsonTagWriter::write_str` records `TagValue::Str`, which the JSON
+    // emitter quotes — byte-exact.
     //
     // For Channels values 1..=5, PrintConv returns I64; the bundled JSON
     // emits a bare number. The sink calls `write_u64` for these arms ⇒
@@ -473,6 +471,7 @@ impl ProcessAac {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::json_writer::JsonTagWriter;
 
   #[test]
   fn table_and_keys_are_faithful() {
@@ -506,12 +505,12 @@ mod tests {
     use crate::parser::ParseContext;
     // A reject must push nothing AND not finalize a type (return 0 happens
     // before AAC.pm:107 `$et->SetFileType()`).
-    let mut m = crate::value::Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let data = [0u8; 7];
     let mut c = ParseContext::new(&data, "AAC", 0, "AAC", None, true, &mut m);
     assert!(!ProcessAac.process(&mut c));
     assert!(m.tags().is_empty());
-    let mut m2 = crate::value::Metadata::new("x");
+    let mut m2 = JsonTagWriter::new("x");
     let bad = [0xff, 0x00];
     let mut c2 = ParseContext::new(&bad, "AAC", 0, "AAC", None, true, &mut m2);
     assert!(!ProcessAac.process(&mut c2)); // too short / bad sync
@@ -538,7 +537,7 @@ mod tests {
       0xde, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // frame: id=6 cnt=15 byte=0 …
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    let mut m = crate::value::Metadata::new("x");
+    let mut m = JsonTagWriter::new("x");
     let mut c = crate::parser::ParseContext::new(&input, "AAC", 0, "AAC", None, true, &mut m);
     assert!(ProcessAac.process(&mut c));
     assert!(m.tags().iter().all(|t| t.name() != "Encoder"));
