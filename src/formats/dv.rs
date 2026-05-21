@@ -2,16 +2,16 @@
 //! Faithful port of `Image::ExifTool::DV` (`lib/Image/ExifTool/DV.pm`).
 //! Module-name dispatch: `%moduleName{DV}` defaults to `Module("DV")`
 //! (no explicit row, so Perl `$module = $type`); registered in
-//! [`crate::parser_new::any_parser_for`].
+//! [`crate::format_parser::any_parser_for`].
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! [`crate::format_parser::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 
 use crate::{
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{TagValue, format_g},
 };

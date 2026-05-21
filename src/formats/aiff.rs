@@ -8,7 +8,7 @@
 //! and the custom `ProcessComment` chunk decoder (AIFF.pm:155-178).
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
@@ -55,7 +55,7 @@
 use crate::{
   charset::decode_macroman,
   datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_duration, convert_unix_time},
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   processbinarydata::process_binary_data,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue, perl_nonfinite_str},
@@ -647,7 +647,7 @@ enum AiffEvent {
 /// ## Library usage
 ///
 /// ```ignore
-/// use exifast::parser_new::FormatParser;
+/// use exifast::format_parser::FormatParser;
 /// use exifast::formats::aiff::ProcessAiff;
 ///
 /// let bytes = std::fs::read("track.aif")?;

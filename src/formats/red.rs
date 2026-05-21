@@ -7,7 +7,7 @@
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`Meta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! [`crate::format_parser::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
@@ -44,7 +44,7 @@
 
 use crate::{
   convert::{ByteOrder, read_value},
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   value::{Rational, TagValue, format_g},
 };
 
@@ -1907,7 +1907,7 @@ fn emit_r3d_value(
 /// §5: derived via `thiserror` (v2, `default-features = false` ⇒
 /// `core::error::Error`), `#[non_exhaustive]` so variants can be added
 /// without a breaking change. Variant names are kept stable for
-/// [`crate::parser_new::AnyError`]'s `From`.
+/// [`crate::format_parser::AnyError`]'s `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {}

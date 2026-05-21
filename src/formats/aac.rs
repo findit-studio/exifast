@@ -6,14 +6,14 @@
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (AAC.pm:29) → [`crate::bitstream`].
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! [`crate::format_parser::FormatParser`] trait; the engine entry
 //! [`ProcessAac::process`] drives the typed `serialize_tags` path
 //! into the engine `tagmap::TagMap` so the serialized
 //! JSON stays byte-exact with bundled `perl exiftool`.
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -211,7 +211,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 
 /// Inner parser — produces a borrow-from-input [`Meta`]. The
 /// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns this
-/// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
+/// borrowed form directly into the closed [`crate::format_parser::AnyMeta`]
 /// enum — no `'static` upgrade (Codex AF2).
 fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // AAC.pm:99-105 header validation. A reject here returns `Ok(None)` —

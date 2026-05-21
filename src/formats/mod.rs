@@ -1,7 +1,7 @@
 //! Per-format parser modules. Each `pub mod <fmt>;` is gated on its Cargo
 //! feature (spec §4). The runtime ExifTool-file-type → parser registry is
-//! [`crate::parser_new::any_parser_for`] (returning a closed-set
-//! [`crate::parser_new::AnyParser`]); the engine entry
+//! [`crate::format_parser::any_parser_for`] (returning a closed-set
+//! [`crate::format_parser::AnyParser`]); the engine entry
 //! [`crate::parser::extract_info`] dispatches through it. When a format
 //! feature is disabled, its file-type string returns `None` (faithful to
 //! ExifTool's "Process<Type> not loaded → `next` in candidate loop" —

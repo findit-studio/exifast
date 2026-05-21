@@ -7,7 +7,7 @@
 //! `'fmt '` chunk. Read-only.
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` and the chained ID3v2 trailer so the
 //! serialized JSON stays byte-exact with bundled `perl exiftool`.
@@ -32,7 +32,7 @@
 //! parsed from those same bytes, which the sink emits.
 
 use crate::{
-  parser_new::{FormatParser, SharedFlags, parser_sealed},
+  format_parser::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -438,7 +438,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 /// Inner parser — produces a borrow-from-input [`Meta`]. The
 /// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns
 /// this borrowed form (including the live ID3v2 trailer slice) directly
-/// into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
+/// into the closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
 ///
 /// Returns:
 /// - `Ok(None)` — header magic missed (`return 0` BEFORE

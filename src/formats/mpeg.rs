@@ -6,7 +6,7 @@
 //! AUDIO side only.
 //!
 //! A typed [`AudioMeta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait with a per-format
+//! [`crate::format_parser::FormatParser`] trait with a per-format
 //! [`AudioContext`] (data + start_offset + ext + shared flags). MPEG
 //! audio is invoked internally by the MP3 file-type entry
 //! ([`crate::formats::id3::ProcessMp3`]) via
@@ -61,7 +61,7 @@
 use std::{borrow::Cow, string::String};
 
 use crate::{
-  parser_new::{FormatParser, SharedFlags, parser_sealed},
+  format_parser::{FormatParser, SharedFlags, parser_sealed},
   value::format_g,
 };
 
@@ -1736,7 +1736,7 @@ pub fn parse_borrowed<'a>(
 /// Inner parser — produces a borrow-from-input [`AudioMeta`] (the
 /// `encoder` field borrows from `data`). The [`FormatParser::Meta`] GAT
 /// (`type Meta<'a> = AudioMeta<'a>`) returns this borrowed form
-/// directly into the closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
+/// directly into the closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
 fn parse_inner<'a>(
   data: &'a [u8],
   mp3: bool,
@@ -2016,7 +2016,7 @@ pub enum AudioError {}
 // ===========================================================================
 
 /// MP3 / MPEG audio-frame parser handle. The `"MP3"` file-type slot in
-/// [`crate::parser_new::any_parser_for`] always routes to
+/// [`crate::format_parser::any_parser_for`] always routes to
 /// [`crate::formats::id3::ProcessMp3`] (the ID3 wrapper); this struct's
 /// [`ProcessMp3::process_with_start_offset`] is the load-bearing entry for
 /// that wrapper's chained MPEG-audio invocation — its public method

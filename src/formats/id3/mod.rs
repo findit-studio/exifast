@@ -6,7 +6,7 @@
 //!
 //! Implements ID3v1, ID3v2.2/2.3/2.4 plus the MP3 wrapper (`ProcessMP3` at
 //! ID3.pm:1684-1728) via the typed [`Id3Meta<'a>`] / [`Mp3Meta<'a>`]
-//! published through the [`crate::parser_new::FormatParser`] trait. The MP3
+//! published through the [`crate::format_parser::FormatParser`] trait. The MP3
 //! engine entry ([`ProcessMp3::process`]) drives
 //! the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
@@ -61,7 +61,7 @@
 //! - [`v2_process`] — `ProcessID3v2` (ID3.pm:1111-1423).
 //! - [`process`] — `ProcessID3` (ID3.pm:1431-1632) + `ProcessMp3`
 //!   (ID3.pm:1684-1728) + the typed [`Id3Meta`]/[`Mp3Meta`] types and
-//!   their [`crate::parser_new::FormatParser`] / `serialize_tags`
+//!   their [`crate::format_parser::FormatParser`] / `serialize_tags`
 //!   impls.
 
 pub mod decode;

@@ -14,13 +14,13 @@
 //! (APE.pm:102-112), and the `%Composite` Duration computation inline.
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`. The engine entry runs the
 //! ID3-chained dispatch (`crate::formats::id3::process::process_id3_chained`)
 //! on the `ParseContext` value sink; APE READS `done_id3` from
-//! [`crate::parser_new::SharedFlags`] (faithful APE.pm:169) and WRITES
+//! [`crate::format_parser::SharedFlags`] (faithful APE.pm:169) and WRITES
 //! `done_ape` after running (faithful APE.pm:131 / ID3.pm:1723).
 //!
 //! Deferrals (in-code documented, NOT half-built — also enumerated in the
@@ -44,7 +44,7 @@
 //!   this engine.
 
 use crate::{
-  parser_new::{FormatParser, SharedFlags, parser_sealed},
+  format_parser::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
   value::{Group, TagValue},
 };
@@ -975,7 +975,7 @@ impl parser_sealed::Sealed for ProcessApe {}
 
 /// Per-format parser context for APE (spec §6.4). Chained format ⇒ wraps
 /// the input bytes alongside the cross-format
-/// [`SharedFlags`](crate::parser_new::SharedFlags) state read for
+/// [`SharedFlags`](crate::format_parser::SharedFlags) state read for
 /// `done_id3` (APE.pm:169) and written for `done_ape` (APE.pm:131 →
 /// ID3.pm:1723). Leaves like AAC/DV/MOI take just `&'a [u8]`; APE chains
 /// so it takes both.
@@ -1663,7 +1663,7 @@ pub(crate) fn parse_trailer_only_owned(
 
 /// Full APE parse (header + trailer) with **decoupled lifetimes** — `data`
 /// and `shared` borrow independently and the returned [`Meta`] is owned
-/// (`'static`). Used by the closed [`crate::parser_new::AnyParser`]
+/// (`'static`). Used by the closed [`crate::format_parser::AnyParser`]
 /// dispatch (Codex AF2) so the transient `shared` does not pin the
 /// returned `AnyMeta<'a>` lifetime. Faithful to the private `parse_borrowed`
 /// full path (APE.pm:121-172): sets `done_ape` and threads

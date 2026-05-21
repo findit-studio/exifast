@@ -1271,8 +1271,8 @@ mod tests {
   #[cfg(all(feature = "json", feature = "aac"))]
   #[test]
   fn rendered_serializes_meta_format_tags_both_modes() {
+    use crate::format_parser::Rendered;
     use crate::jsondiff::json_equivalent;
-    use crate::parser_new::Rendered;
     let data = std::fs::read(concat!(
       env!("CARGO_MANIFEST_DIR"),
       "/tests/fixtures/AAC.aac"
@@ -1324,7 +1324,7 @@ mod tests {
 /// (trait not satisfied) compilation error.
 ///
 /// ```compile_fail
-/// use exifast::parser_new::FormatParser;
+/// use exifast::format_parser::FormatParser;
 ///
 /// struct ForeignParser;
 ///

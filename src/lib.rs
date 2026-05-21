@@ -11,8 +11,8 @@
 //! # Usage — universal dispatch
 //!
 //! Detect the file type from the input bytes and dispatch to the right
-//! per-format parser through the closed [`AnyParser`](crate::parser_new::AnyParser)
-//! / [`AnyMeta`](crate::parser_new::AnyMeta) enums. Most callers don't
+//! per-format parser through the closed [`AnyParser`](crate::format_parser::AnyParser)
+//! / [`AnyMeta`](crate::format_parser::AnyMeta) enums. Most callers don't
 //! know the format up front; this is the typical entry point:
 //!
 //! ```no_run
@@ -102,7 +102,7 @@ pub mod parser;
 // AnyParser::parse_any`; each typed Meta's `serialize_tags` renders into a
 // `tagmap::TagMap`, then serde-renders. The byte-exact conformance suite
 // validates the typed path directly.
-pub mod parser_new;
+pub mod format_parser;
 pub mod processbinarydata;
 pub mod reader;
 #[cfg(feature = "json")]
@@ -138,8 +138,8 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 /// The optional serde [`Serialize`](serde::Serialize) view of a typed
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
 #[cfg(all(feature = "serde", feature = "alloc"))]
-pub use parser_new::Rendered;
-pub use parser_new::{
+pub use format_parser::Rendered;
+pub use format_parser::{
   AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags,
 };
 
@@ -214,7 +214,7 @@ pub use formats::wavpack::ProcessWv;
 /// (which lets ExifTool's `%fileTypeLookup` add extension-based candidates)
 /// can fall back to the legacy [`parser::extract_info`] for byte-exact CLI
 /// JSON output, or build their own `AnyParser` resolution via
-/// [`parser_new::any_parser_for`].
+/// [`format_parser::any_parser_for`].
 ///
 /// # Errors
 ///
@@ -247,7 +247,7 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
   let mut shared = SharedFlags::new();
   for cand in filetype::detection_candidates("", bytes) {
     let ft = cand.file_type();
-    let Some(parser) = parser_new::any_parser_for(ft) else {
+    let Some(parser) = format_parser::any_parser_for(ft) else {
       continue;
     };
     if let Some(m) = parser.parse_any(bytes, &mut shared, None)? {

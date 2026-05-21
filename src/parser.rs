@@ -17,7 +17,7 @@
 use crate::{
   convert::apply,
   filetype::detection_candidates,
-  parser_new::any_parser_for,
+  format_parser::any_parser_for,
   tagtable::{PrintConv, TagDef, ValueConv},
   value::TagValue,
 };
@@ -287,7 +287,7 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String
 /// The typed-serde engine entry — `extract_info`'s implementation. Detects the
 /// file type, runs the closed [`AnyParser::parse_any`] dispatch over the
 /// `ExtractInfo` candidate loop (faithful to ExifTool.pm:3060-3128), finalizes
-/// the accepted parser's `File:*` triplet via [`crate::parser_new::AnyMeta::finalize_file_type`],
+/// the accepted parser's `File:*` triplet via [`crate::format_parser::AnyMeta::finalize_file_type`],
 /// and serde-renders the typed `AnyMeta`'s format tags + the orchestration
 /// tags + the finalization `Warning`/`Error` into the `[{ … }]` document
 /// (value-equivalent to bundled `perl exiftool -j -G1`).
@@ -324,7 +324,7 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   // `$$self{FILE_TYPE}` bookkeeping (ExifTool.pm:3080): set once finalized.
   let mut finalized = false;
   // Fresh per-candidate cross-format state (mirrors `parse_bytes`).
-  let mut shared = crate::parser_new::SharedFlags::new();
+  let mut shared = crate::format_parser::SharedFlags::new();
 
   for cand in detection_candidates(name, data) {
     let ft = cand.file_type();
@@ -360,17 +360,17 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
       Ok(Some(meta)) => meta,
       Ok(None) => {
         // Rejected candidate: reset shared so partial side effects don't leak.
-        shared = crate::parser_new::SharedFlags::new();
+        shared = crate::format_parser::SharedFlags::new();
         continue;
       }
       Err(_) => {
-        shared = crate::parser_new::SharedFlags::new();
+        shared = crate::format_parser::SharedFlags::new();
         continue;
       }
     };
 
     // ----- Finalize File:* per the typed Meta's plan ---------------------
-    use crate::parser_new::FileTypeFinalize;
+    use crate::format_parser::FileTypeFinalize;
     match meta.finalize_file_type() {
       FileTypeFinalize::Detected => {
         let t = resolve_file_type(ft, None, ext_ref, print_conv_enabled);

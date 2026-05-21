@@ -6,7 +6,7 @@
 //! WavPack.pm is 144 lines: one tag table + one `Process<Type>` sub.
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` and the chained ID3/APE trailers so
 //! the serialized JSON stays byte-exact with bundled `perl exiftool`.
@@ -67,7 +67,7 @@
 //! yet; FORMATS.md row 22 will wire it. On the committed fixtures the
 //! deferral is observably no-op (no RIFF wrapper present).
 
-use crate::parser_new::{FormatParser, SharedFlags, parser_sealed};
+use crate::format_parser::{FormatParser, SharedFlags, parser_sealed};
 
 // ===========================================================================
 // Mask + BitShift constants
@@ -382,7 +382,7 @@ impl core::fmt::Display for SampleRate {
 /// ## Library usage
 ///
 /// ```ignore
-/// use exifast::parser_new::{FormatParser, SharedFlags};
+/// use exifast::format_parser::{FormatParser, SharedFlags};
 /// use exifast::formats::wavpack::{ProcessWv, Context};
 ///
 /// let bytes = std::fs::read("file.wv")?;
@@ -662,7 +662,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 
 /// Inner parser — produces a borrow-from-input [`Meta`]. The
 /// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns this
-/// borrowed form directly into the closed [`crate::parser_new::AnyMeta`]
+/// borrowed form directly into the closed [`crate::format_parser::AnyMeta`]
 /// enum, keeping the live trailer-scan slice (Codex AF2).
 fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // WavPack.pm:87 `return 0 unless $raf->Read($buff, 32) == 32`.
@@ -778,7 +778,7 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
 #[cfg(all(feature = "id3", feature = "ape"))]
 pub(crate) fn parse_full_chained<'a>(
   data: &'a [u8],
-  shared: &mut crate::parser_new::SharedFlags,
+  shared: &mut crate::format_parser::SharedFlags,
 ) -> Option<Meta<'a>> {
   // 1. WavPack body. On wrong magic (`return 0` at WavPack.pm:87-88) we
   // drop the whole result so the `parse_any` candidate loop tries the

@@ -37,7 +37,7 @@
 //!   raw passthrough for the MPEG audio body and the APE trailer; the
 //!   APE/MPEG typed Metas land in F3/F4 respectively.
 //!
-//! Both implement [`crate::parser_new::FormatParser`] and
+//! Both implement [`crate::format_parser::FormatParser`] and
 //! `serialize_tags`. The MP3 engine entry
 //! [`ProcessMp3::process`] drives the typed `serialize_tags` path
 //! into the engine `tagmap::TagMap` so the serialized
@@ -67,6 +67,7 @@
 
 use crate::{
   convert::ConvContext,
+  format_parser::{FormatParser, SharedFlags, parser_sealed},
   formats::id3::{
     decode::unsync_safe,
     v1::{ID3V1_MAIN, process_id3v1},
@@ -75,7 +76,6 @@ use crate::{
     v2_4::ID3V2_4_MAIN,
     v2_process::process_id3v2,
   },
-  parser_new::{FormatParser, SharedFlags, parser_sealed},
   value::{Group, Metadata, TagValue},
 };
 use smol_str::SmolStr;
@@ -758,7 +758,7 @@ impl<'a> Mp3Meta<'a> {
 ///
 /// Note: ID3 is a *directory* parser (PROCESS_PROC in ID3.pm:78), not a
 /// file-type entry, so it has no engine entry in
-/// [`crate::parser_new::any_parser_for`]; only [`ProcessMp3`] is a file-type
+/// [`crate::format_parser::any_parser_for`]; only [`ProcessMp3`] is a file-type
 /// entry. The standalone ID3 typed parser is exposed via [`FormatParser`]
 /// for chained callers that want to materialize an [`Id3Meta`] over an
 /// arbitrary byte slice.

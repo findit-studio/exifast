@@ -7,7 +7,7 @@
 //!
 //! **Phase F1 — lib-first migration.** Follows the MOI pilot (Phase E) +
 //! AAC/DV pattern: a typed [`Meta<'a>`] is produced by the new
-//! [`crate::parser_new::FormatParser`] trait; the engine entry
+//! [`crate::format_parser::FormatParser`] trait; the engine entry
 //! `process` drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
@@ -26,14 +26,14 @@
 //! the oracle.
 //!
 //! PROCESS_PROC is `ProcessAA` (Audible.pm:194), invoked from
-//! [`crate::parser_new::any_parser_for`] via the `"AA"` arm. The flow is:
+//! [`crate::format_parser::any_parser_for`] via the `"AA"` arm. The flow is:
 //! magic+size gate → `SetFileType` → walk TOC (12-byte triples) → for each
 //! triple whose type ∈ {2, 6, 11}, dispatch chunk 6 (chapter count),
 //! chunk 11 (cover art) or chunk 2 (UTF-8 dictionary).
 
 use crate::{
   convert::{fix_utf8, pack_c0u},
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
 };
 use smol_str::SmolStr;
@@ -809,7 +809,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 /// Inner parser — produces a borrow-from-input [`Meta`] (chunk-11 cover
 /// art borrows). The [`FormatParser::Meta`] GAT (`type Meta<'a> =
 /// Meta<'a>`) returns this borrowed form directly into the closed
-/// [`crate::parser_new::AnyMeta`] enum — no `'static` upgrade (Codex AF2).
+/// [`crate::format_parser::AnyMeta`] enum — no `'static` upgrade (Codex AF2).
 ///
 /// Faithful to `ProcessAA` (Audible.pm:194-273):
 /// 1. 16-byte magic + filesize gate (Audible.pm:201-205) — return `None`
@@ -1343,7 +1343,7 @@ impl Meta<'_> {
 /// §5: derived via `thiserror` (v2, `default-features = false` ⇒
 /// `core::error::Error`), `#[non_exhaustive]` so variants can be added
 /// without a breaking change. Variant names are kept stable for
-/// [`crate::parser_new::AnyError`]'s `From`.
+/// [`crate::format_parser::AnyError`]'s `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {}

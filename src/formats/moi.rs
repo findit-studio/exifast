@@ -6,7 +6,7 @@
 //!
 //! The parser produces a typed [`Meta<'a>`] holding `jiff::civil::DateTime`
 //! / `core::time::Duration` / primitive integers via the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
@@ -40,7 +40,7 @@
 use core::time::Duration;
 use jiff::civil::DateTime;
 
-use crate::parser_new::{FormatParser, parser_sealed};
+use crate::format_parser::{FormatParser, parser_sealed};
 
 // ===========================================================================
 // Typed Meta — `Meta<'a>`
@@ -64,7 +64,7 @@ use crate::parser_new::{FormatParser, parser_sealed};
 /// ## Library usage
 ///
 /// ```ignore
-/// use exifast::parser_new::FormatParser;
+/// use exifast::format_parser::FormatParser;
 /// use exifast::formats::moi::ProcessMoi;
 ///
 /// let bytes = std::fs::read("file.moi")?;

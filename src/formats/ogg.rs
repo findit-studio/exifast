@@ -14,7 +14,7 @@
 //! packet to its codec's comments handler.
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! re-emits through the `Metadata` push path (list-aware for Vorbis
 //! Artist/Performer/Contact) so the serialized JSON stays byte-exact with
 //! bundled `perl exiftool`.
@@ -50,7 +50,7 @@
 
 use crate::{
   convert::{apply, base64_decode},
-  parser_new::{FormatParser, parser_sealed},
+  format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -1204,7 +1204,7 @@ pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Me
 /// `Meta<'_>` with a phantom `'_` today; see [`Meta`] struct doc
 /// re: zero-alloc revisit). The [`FormatParser::Meta`] GAT (`type
 /// Meta<'a> = Meta<'a>`) returns this borrowed form directly into the
-/// closed [`crate::parser_new::AnyMeta`] enum (Codex AF2).
+/// closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
 fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
   // Stage the legacy push-style emissions into a side `Metadata` so the
   // bundled-faithful list-coalesce + name-synthesis paths stay byte-exact

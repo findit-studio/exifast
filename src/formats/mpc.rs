@@ -6,7 +6,7 @@
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (MPC.pm:22) → [`crate::bitstream`].
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! drives the typed `serialize_tags` path into the engine
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
@@ -55,7 +55,7 @@
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser_new::{FormatParser, SharedFlags, parser_sealed},
+  format_parser::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
   value::{Metadata, TagValue},
 };
@@ -703,7 +703,7 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error>
 #[cfg(all(feature = "id3", feature = "ape"))]
 pub(crate) fn parse_full_chained<'a>(
   data: &'a [u8],
-  shared: &mut crate::parser_new::SharedFlags,
+  shared: &mut crate::format_parser::SharedFlags,
 ) -> Option<Meta<'a>> {
   // 1. Embedded ID3 prefix (MPC.pm:84-87). `unless ($$et{DoneID3})`
   // recursion guard (ID3.pm:1435).
@@ -1006,7 +1006,7 @@ pub enum Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::parser_new::FormatParser;
+  use crate::format_parser::FormatParser;
   use crate::tagmap::TagMap;
 
   // ---------- Tag table + bit-keys faithfulness --------------------------

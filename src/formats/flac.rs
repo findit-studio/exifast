@@ -5,7 +5,7 @@
 //! Faithful port of `Image::ExifTool::FLAC` (lib/Image/ExifTool/FLAC.pm).
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::parser_new::FormatParser`] trait; the engine entry `process`
+//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
 //! emits StreamInfo/Picture/Composite via the typed `serialize_tags` path
 //! and the list-aware VorbisComment stream directly into `Metadata`, so the
 //! serialized JSON stays byte-exact with bundled `perl exiftool`.
@@ -44,7 +44,7 @@ use std::borrow::Cow;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::parser_new::{FormatParser, parser_sealed};
+use crate::format_parser::{FormatParser, parser_sealed};
 use crate::tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv};
 use crate::value::TagValue;
 
@@ -774,7 +774,7 @@ pub struct ProcessFlac;
 impl parser_sealed::Sealed for ProcessFlac {}
 
 /// Per-format context for FLAC. Carries the input bytes plus a reference to
-/// the cross-format [`SharedFlags`](crate::parser_new::SharedFlags) that
+/// the cross-format [`SharedFlags`](crate::format_parser::SharedFlags) that
 /// tracks `$$et{DoneID3}` for the FLAC.pm:243-247 ID3-chain handoff.
 ///
 /// **Side effects on the shared flags PERSIST regardless of return value**
@@ -785,14 +785,14 @@ pub struct Context<'a> {
   /// File bytes — typically the whole file (FLAC parsing is offset-based).
   data: &'a [u8],
   /// Cross-format shared state.
-  shared: &'a mut crate::parser_new::SharedFlags,
+  shared: &'a mut crate::format_parser::SharedFlags,
 }
 
 impl<'a> Context<'a> {
   /// Construct a FLAC parser context.
   #[must_use]
   #[inline(always)]
-  pub const fn new(data: &'a [u8], shared: &'a mut crate::parser_new::SharedFlags) -> Self {
+  pub const fn new(data: &'a [u8], shared: &'a mut crate::format_parser::SharedFlags) -> Self {
     Self { data, shared }
   }
 
@@ -806,7 +806,7 @@ impl<'a> Context<'a> {
   /// Shared flags (read-only access; §3: non-`Copy` borrow projection).
   #[must_use]
   #[inline(always)]
-  pub const fn shared(&self) -> &crate::parser_new::SharedFlags {
+  pub const fn shared(&self) -> &crate::format_parser::SharedFlags {
     self.shared
   }
 }
@@ -814,7 +814,7 @@ impl<'a> Context<'a> {
 impl FormatParser for ProcessFlac {
   /// GAT: the Meta borrows from the input `'a` directly (including borrowed
   /// Vorbis-comment strings and the picture payload), publishing into the
-  /// closed [`AnyMeta`](crate::parser_new::AnyMeta) enum with no `'static`
+  /// closed [`AnyMeta`](crate::format_parser::AnyMeta) enum with no `'static`
   /// upgrade (Codex AF2).
   type Meta<'a> = Meta<'a>;
   /// Spec §6.1: chained-format context with shared flags.
@@ -839,7 +839,7 @@ impl FormatParser for ProcessFlac {
 ///
 /// `shared` borrows independently of `data` (decoupled lifetimes): the
 /// returned `Meta<'a>` borrows only from `data`, so the closed
-/// [`crate::parser_new::AnyParser`] dispatch can pass a transient
+/// [`crate::format_parser::AnyParser`] dispatch can pass a transient
 /// `shared` without pinning the returned `AnyMeta<'a>` (Codex AF2).
 ///
 /// # Errors
@@ -848,7 +848,7 @@ impl FormatParser for ProcessFlac {
 /// future I/O wrappers).
 pub fn parse_borrowed<'a>(
   data: &'a [u8],
-  shared: &mut crate::parser_new::SharedFlags,
+  shared: &mut crate::format_parser::SharedFlags,
 ) -> Result<Option<Meta<'a>>, Error> {
   parse_inner(data, shared)
 }
@@ -856,7 +856,7 @@ pub fn parse_borrowed<'a>(
 /// Inner parser — produces a borrow-from-input [`Meta`].
 fn parse_inner<'a>(
   data: &'a [u8],
-  shared: &mut crate::parser_new::SharedFlags,
+  shared: &mut crate::format_parser::SharedFlags,
 ) -> Result<Option<Meta<'a>>, Error> {
   // -- FLAC.pm:243-247 — embedded ID3 (`ProcessID3`) ----------------------
   //
@@ -1932,7 +1932,7 @@ mod tests {
   #[test]
   fn process_flac_typed_parser_extracts_real_fixture() {
     let data = fixture("FLAC.flac");
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared)
       .expect("ok")
       .expect("flac");
@@ -1967,7 +1967,7 @@ mod tests {
 
   #[test]
   fn process_flac_typed_rejects_missing_magic() {
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     assert!(
       parse_borrowed(b"not-flac-data-here", &mut shared)
         .unwrap()
@@ -1981,7 +1981,7 @@ mod tests {
     let mut data = Vec::new();
     data.extend_from_slice(&[b'I', b'D', b'3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     data.extend_from_slice(&body);
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared)
       .expect("ok")
       .expect("flac");
@@ -1992,7 +1992,7 @@ mod tests {
   fn process_flac_typed_panics_free_on_truncated_header() {
     // Just `fLaC` — magic OK, no blocks. format_error stays false (silent
     // exit on pos+4 > len, faithful).
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(b"fLaC", &mut shared)
       .expect("ok")
       .expect("flac");
@@ -2003,7 +2003,7 @@ mod tests {
   #[test]
   fn process_flac_typed_oversized_block_sets_format_error() {
     let data: &[u8] = &[b'f', b'L', b'a', b'C', 0x80, 0xff, 0xff, 0xff];
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(data, &mut shared)
       .expect("ok")
       .expect("flac");
@@ -2099,7 +2099,7 @@ mod tests {
     // Order is preserved by the typed `serialize_tags` -> `TagMap` entries
     // (the JSON object loses key order).
     let data = fixture("FLAC_picture.flac");
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
     let mut tm = TagMap::new();
     meta.serialize_tags(true, &mut tm).unwrap();
@@ -2181,7 +2181,7 @@ mod tests {
   #[test]
   fn sink_into_map_writer_emits_streaminfo_tags() {
     let data = fixture("FLAC.flac");
-    let mut shared = crate::parser_new::SharedFlags::new();
+    let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
     let mut w = TagMap::new();
     meta.serialize_tags(true, &mut w).unwrap();

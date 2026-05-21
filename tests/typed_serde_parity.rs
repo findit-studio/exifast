@@ -50,9 +50,9 @@
 #![cfg(feature = "json")]
 
 use exifast::filetype::detection_candidates;
+use exifast::format_parser::{Rendered, SharedFlags, any_parser_for};
 use exifast::jsondiff::json_equivalent;
 use exifast::parser::extract_info;
-use exifast::parser_new::{Rendered, SharedFlags, any_parser_for};
 
 /// The one fixture excluded from the 121 active conformance set — the AIFF
 /// ID3-chunk SubDirectory forward item (deferred in BOTH the engine and typed
