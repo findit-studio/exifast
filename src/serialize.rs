@@ -34,7 +34,12 @@ use std::string::String;
 /// scalars (non-finite floats are emitted as strings, never as a number).
 #[must_use]
 pub fn to_exiftool_json(m: &Metadata) -> String {
-  render_document(m.source_file(), m.tags(), m.warnings(), m.errors())
+  render_document(
+    m.source_file(),
+    m.tags_slice(),
+    m.warnings_slice(),
+    m.errors_slice(),
+  )
 }
 
 /// Render the `exiftool -j -G1` JSON document from the `SourceFile` path, the
@@ -121,9 +126,9 @@ mod serde_doc {
       // join the SAME dedup set (`exiftool:2951`).
       let mut seen: BTreeSet<String> = BTreeSet::new();
       for t in doc.tags {
-        let token = std::format!("{}:{}", t.group().family1(), t.name());
+        let token = std::format!("{}:{}", t.group_ref().family1(), t.name());
         if seen.insert(token.clone()) {
-          map.serialize_entry(&token, t.value())?;
+          map.serialize_entry(&token, t.value_ref())?;
         }
       }
       if let Some(w) = doc.warning {

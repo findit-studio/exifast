@@ -1153,25 +1153,25 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
   let mut compression_type: Option<AiffCompressionType> = None;
   let mut compressor_name: Option<String> = None;
 
-  for tag in staging.tags() {
+  for tag in staging.tags_slice() {
     match tag.name() {
       "NumChannels" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           num_channels = Some(*n as u16);
         }
       }
       "NumSampleFrames" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           num_sample_frames = Some(*n as u32);
         }
       }
       "SampleSize" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           sample_size = Some(*n as u16);
         }
       }
       "SampleRate" => {
-        sample_rate = Some(match tag.value() {
+        sample_rate = Some(match tag.value_ref() {
           TagValue::I64(n) => AiffSampleRate::Int(*n),
           TagValue::F64(x) => AiffSampleRate::Float(*x),
           TagValue::Str(s) => AiffSampleRate::BigUInt(s.to_string()),
@@ -1191,7 +1191,7 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
         // the FixUTF8-rendered text (e.g. `?ABC`) — we store that as
         // the RawText since the PrintConv hash lookup uses the same
         // FixUTF8 form for keying.
-        let raw = match tag.value() {
+        let raw = match tag.value_ref() {
           TagValue::Str(s) => s.as_bytes().to_vec(),
           TagValue::Bytes(b) => b.clone(),
           _ => Vec::new(),
@@ -1200,7 +1200,7 @@ fn stage_common(body: &[u8]) -> Option<AiffCommon> {
       }
       "CompressorName" => {
         // Post-ValueConv `Decode(MacRoman)` ⇒ TagValue::Str.
-        if let TagValue::Str(s) = tag.value() {
+        if let TagValue::Str(s) = tag.value_ref() {
           compressor_name = Some(s.to_string());
         }
       }

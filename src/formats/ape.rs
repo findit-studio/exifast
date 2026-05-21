@@ -2691,8 +2691,11 @@ mod tests {
     let mut m = Metadata::new("x");
     process_ape_binary_data(&hdr, NEW_HEADER, &mut m, true);
 
-    let by_name: std::collections::HashMap<&str, &TagValue> =
-      m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let by_name: std::collections::HashMap<&str, &TagValue> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     assert_eq!(by_name.get("CompressionLevel"), Some(&&TagValue::I64(3000)));
     assert_eq!(by_name.get("BlocksPerFrame"), Some(&&TagValue::I64(73728)));
     assert_eq!(
@@ -2704,9 +2707,9 @@ mod tests {
     assert_eq!(by_name.get("Channels"), Some(&&TagValue::I64(2)));
     assert_eq!(by_name.get("SampleRate"), Some(&&TagValue::I64(44100)));
     // Family-0 = APE (package default), family-1 = MAC (GROUPS{1}).
-    for t in m.tags() {
-      assert_eq!(t.group().family0(), "APE");
-      assert_eq!(t.group().family1(), "MAC");
+    for t in m.tags_slice() {
+      assert_eq!(t.group_ref().family0(), "APE");
+      assert_eq!(t.group_ref().family1(), "MAC");
     }
   }
 
@@ -2721,8 +2724,11 @@ mod tests {
     hdr[8..12].copy_from_slice(&44100u32.to_le_bytes()); // SampleRate (index 4 ⇒ offset 8)
     let mut m = Metadata::new("x");
     process_ape_binary_data(&hdr, OLD_HEADER, &mut m, true);
-    let by_name: std::collections::HashMap<&str, &TagValue> =
-      m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let by_name: std::collections::HashMap<&str, &TagValue> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     // Raw 3970 / 1000 = 3.97 (f64).
     assert_eq!(by_name.get("APEVersion"), Some(&&TagValue::F64(3.97)));
     assert_eq!(by_name.get("CompressionLevel"), Some(&&TagValue::I64(1000)));
@@ -2788,8 +2794,8 @@ mod tests {
     // < 6 ⇒ CompressionLevel @ offset 0 (2 bytes) OK; nothing else fits.
     let mut m = Metadata::new("x");
     process_ape_binary_data(&short, NEW_HEADER, &mut m, true);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "CompressionLevel");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "CompressionLevel");
   }
 
   // Static %Main lookup (APE.pm:29-42).

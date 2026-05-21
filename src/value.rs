@@ -35,6 +35,7 @@ impl Rational {
   /// ExifTool only ever uses `sig == 7` (rational32) or `sig == 10`
   /// (rational64); prefer [`Rational::rational32`] / [`Rational::rational64`].
   #[must_use]
+  #[inline(always)]
   pub const fn new(numerator: i64, denominator: i64, sig: u8) -> Self {
     Self {
       numerator,
@@ -47,6 +48,7 @@ impl Rational {
   /// round the quotient to **7** significant figures
   /// (`ExifTool.pm:6087,6094` → `RoundFloat(n/d, 7)`).
   #[must_use]
+  #[inline(always)]
   pub const fn rational32(numerator: i64, denominator: i64) -> Self {
     Self {
       numerator,
@@ -60,6 +62,7 @@ impl Rational {
   /// (`ExifTool.pm:6101,6108` → `RoundFloat(n/d, 10)`). This is the
   /// dominant EXIF width (`XResolution`, `ExposureTime`, `FNumber`, GPS, …).
   #[must_use]
+  #[inline(always)]
   pub const fn rational64(numerator: i64, denominator: i64) -> Self {
     Self {
       numerator,
@@ -70,12 +73,14 @@ impl Rational {
 
   /// The numerator of the rational number.
   #[must_use]
+  #[inline(always)]
   pub const fn numerator(&self) -> i64 {
     self.numerator
   }
 
   /// The denominator of the rational number.
   #[must_use]
+  #[inline(always)]
   pub const fn denominator(&self) -> i64 {
     self.denominator
   }
@@ -83,6 +88,7 @@ impl Rational {
   /// The significant-digit width ExifTool's `RoundFloat` applies
   /// (`%.{sig}g`): `7` for a rational32, `10` for a rational64.
   #[must_use]
+  #[inline(always)]
   pub const fn sig(&self) -> u8 {
     self.sig
   }
@@ -188,6 +194,11 @@ pub fn perl_nonfinite_str(val: f64) -> Option<&'static str> {
 
 /// A metadata value. The variants cover what Stage-1 video/audio tags need;
 /// `Bytes`/`Rational` JSON encoding is wired in the first format plan (AAC).
+///
+/// `#[non_exhaustive]`: the value vocabulary is open (a future format may need
+/// a new scalar shape); downstream crates must keep a wildcard arm. In-crate
+/// matches stay exhaustive (the attribute only constrains other crates).
+#[non_exhaustive]
 #[derive(
   Debug, Clone, PartialEq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -230,6 +241,7 @@ pub struct Group {
 impl Group {
   /// Construct a group from two string-ish values.
   #[must_use]
+  #[inline(always)]
   pub fn new(family0: impl Into<SmolStr>, family1: impl Into<SmolStr>) -> Self {
     Self {
       family0: family0.into(),
@@ -239,12 +251,14 @@ impl Group {
 
   /// The broad category (ExifTool family 0).
   #[must_use]
+  #[inline(always)]
   pub fn family0(&self) -> &str {
     self.family0.as_str()
   }
 
   /// The specific group used as the JSON key prefix (ExifTool family 1).
   #[must_use]
+  #[inline(always)]
   pub fn family1(&self) -> &str {
     self.family1.as_str()
   }
@@ -261,6 +275,7 @@ pub struct Tag {
 impl Tag {
   /// Construct a tag from its group, name, and value.
   #[must_use]
+  #[inline(always)]
   pub fn new(group: Group, name: impl Into<SmolStr>, value: TagValue) -> Self {
     Self {
       group,
@@ -269,21 +284,26 @@ impl Tag {
     }
   }
 
-  /// The tag's group.
+  /// The tag's group (non-`Copy` `&T` borrow → `_ref` per the accessor naming
+  /// convention; pairs with no mutator since group is set at construction).
   #[must_use]
-  pub fn group(&self) -> &Group {
+  #[inline(always)]
+  pub const fn group_ref(&self) -> &Group {
     &self.group
   }
 
   /// The tag's name (e.g. `"Duration"`).
   #[must_use]
+  #[inline(always)]
   pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
-  /// The value as it should appear in `-j` output (post-conversion).
+  /// The value as it should appear in `-j` output (post-conversion). Non-`Copy`
+  /// `&T` borrow → `_ref` (pairs with [`Self::value_mut`]).
   #[must_use]
-  pub fn value(&self) -> &TagValue {
+  #[inline(always)]
+  pub const fn value_ref(&self) -> &TagValue {
     &self.value
   }
 
@@ -291,16 +311,21 @@ impl Tag {
   /// overwriting `$$self{VALUE}{$tag}` (`ExifTool.pm:9717,9722,9724`).
   /// Crate-internal: the only faithful caller is [`Metadata::set_tag_value`]
   /// (the `OverrideFileType` path); regular extraction still appends via
-  /// [`Metadata::push`].
-  pub(crate) fn set_value(&mut self, value: TagValue) {
+  /// [`Metadata::push`]. Returns `&mut Self` to chain (§3 setter convention).
+  /// Not `const`: assigning the field drops the previous (non-`Copy`)
+  /// `TagValue`, which a `const fn` cannot run.
+  #[inline(always)]
+  pub(crate) fn set_value(&mut self, value: TagValue) -> &mut Self {
     self.value = value;
+    self
   }
 
-  /// Mutable access to the tag's value — only used by
-  /// [`Metadata::push_listable`] to `mem::replace` the existing value out
-  /// (avoiding an O(n) clone of the inner `Vec` per appended repeat).
+  /// Mutable access to the tag's value (`_mut` pairs with [`Self::value_ref`]) —
+  /// only used by [`Metadata::push_listable`] to `mem::replace` the existing
+  /// value out (avoiding an O(n) clone of the inner `Vec` per appended repeat).
   /// Crate-internal: regular write paths still go through [`Self::set_value`].
-  pub(crate) fn value_mut(&mut self) -> &mut TagValue {
+  #[inline(always)]
+  pub(crate) const fn value_mut(&mut self) -> &mut TagValue {
     &mut self.value
   }
 }
@@ -334,6 +359,7 @@ impl Metadata {
   /// Construct a `Metadata` for the given source file path (tags, warnings
   /// and errors empty).
   #[must_use]
+  #[inline(always)]
   pub fn new(source_file: impl Into<SmolStr>) -> Self {
     Self {
       source_file: source_file.into(),
@@ -347,32 +373,39 @@ impl Metadata {
 
   /// The path as ExifTool would echo it in the `SourceFile` key.
   #[must_use]
+  #[inline(always)]
   pub fn source_file(&self) -> &str {
     self.source_file.as_str()
   }
 
-  /// Extracted tags, in extraction order (order is significant).
+  /// Extracted tags, in extraction order (order is significant). `_slice`
+  /// projection of the `Vec<Tag>` field (§3: never expose `&Vec<T>`).
   #[must_use]
-  pub fn tags(&self) -> &[Tag] {
-    &self.tags
+  #[inline(always)]
+  pub const fn tags_slice(&self) -> &[Tag] {
+    self.tags.as_slice()
   }
 
-  /// Non-fatal warnings (ExifTool emits these as `Warning` tags).
+  /// Non-fatal warnings (ExifTool emits these as `Warning` tags). `_slice`
+  /// projection of the `Vec<SmolStr>` field.
   #[must_use]
-  pub fn warnings(&self) -> &[SmolStr] {
-    &self.warnings
+  #[inline(always)]
+  pub const fn warnings_slice(&self) -> &[SmolStr] {
+    self.warnings.as_slice()
   }
 
   /// Errors (ExifTool emits these as its generated `Error` tag). Mirrors
-  /// [`warnings`](Self::warnings): `Error` is defined in `Image::ExifTool::
-  /// Extra` (`ExifTool.pm:1288-1296`) with `Groups => \%allGroupsExifTool`
-  /// (group1 `ExifTool`, `ExifTool.pm:1225`) — exactly like `Warning`
-  /// (`ExifTool.pm:1297`). `sub Error` (`ExifTool.pm:5648`) is the plain
-  /// `$self->FoundTag('Error', $str)`, so the serializer emits the first as
-  /// `ExifTool:Error` under `-j -G1`.
+  /// [`warnings_slice`](Self::warnings_slice): `Error` is defined in
+  /// `Image::ExifTool::Extra` (`ExifTool.pm:1288-1296`) with `Groups =>
+  /// \%allGroupsExifTool` (group1 `ExifTool`, `ExifTool.pm:1225`) — exactly
+  /// like `Warning` (`ExifTool.pm:1297`). `sub Error` (`ExifTool.pm:5648`) is
+  /// the plain `$self->FoundTag('Error', $str)`, so the serializer emits the
+  /// first as `ExifTool:Error` under `-j -G1`. `_slice` projection of the
+  /// `Vec<SmolStr>` field.
   #[must_use]
-  pub fn errors(&self) -> &[SmolStr] {
-    &self.errors
+  #[inline(always)]
+  pub const fn errors_slice(&self) -> &[SmolStr] {
+    self.errors.as_slice()
   }
 
   /// Append a tag in extraction order, OR overwrite an existing same-key
@@ -402,7 +435,7 @@ impl Metadata {
     if let Some(tag) = self
       .tags
       .iter_mut()
-      .find(|t| t.group() == &group && t.name() == name.as_str())
+      .find(|t| t.group_ref() == &group && t.name() == name.as_str())
     {
       tag.set_value(value);
     } else {
@@ -442,7 +475,7 @@ impl Metadata {
     if let Some(tag) = self
       .tags
       .iter_mut()
-      .find(|t| t.group() == &group && t.name() == name.as_str())
+      .find(|t| t.group_ref() == &group && t.name() == name.as_str())
     {
       // ExifTool.pm:9514-9518 promote-and-push: a scalar becomes a 1-elem
       // list, then `push` appends. We model that with one `TagValue::List`
@@ -496,7 +529,7 @@ impl Metadata {
     self
       .tags
       .iter()
-      .any(|t| t.group().family1() == "File" && t.name() == "FileType")
+      .any(|t| t.group_ref().family1() == "File" && t.name() == "FileType")
   }
 
   /// Replace the value of the existing tag identified by `group` (family-0
@@ -511,7 +544,7 @@ impl Metadata {
     match self
       .tags
       .iter_mut()
-      .find(|t| t.group() == group && t.name() == name)
+      .find(|t| t.group_ref() == group && t.name() == name)
     {
       Some(tag) => {
         tag.set_value(value);
@@ -532,7 +565,7 @@ impl Metadata {
     self
       .tags
       .iter()
-      .any(|t| t.group() == group && t.name() == name)
+      .any(|t| t.group_ref() == group && t.name() == name)
   }
 
   /// Faithful `$$et{DoneID3}` getter. `None` ⇒ ProcessID3 has not run;
@@ -541,23 +574,27 @@ impl Metadata {
   /// by `unless ($$et{DoneID3})` guards (APE.pm:124, MPC.pm:84, etc.) and
   /// by APE.pm:169 `$footPos -= $$et{DoneID3} if $$et{DoneID3} > 1`.
   #[must_use]
-  pub fn done_id3(&self) -> Option<usize> {
+  #[inline(always)]
+  pub const fn done_id3(&self) -> Option<usize> {
     self.done_id3
   }
 
   /// Faithful `$$et{DoneID3} = $n` setter. Pass `0` for the "ID3v2 found,
   /// no v1 trailer" case (ID3.pm:1436 `$$et{DoneID3} = 1` — Perl-truthy,
   /// not used in arithmetic; the trailer-aware path at ID3.pm:1527
-  /// overwrites with `$trailSize`).
-  pub fn set_done_id3(&mut self, trailer_size: usize) {
+  /// overwrites with `$trailSize`). Returns `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn set_done_id3(&mut self, trailer_size: usize) -> &mut Self {
     self.done_id3 = Some(trailer_size);
+    self
   }
 
   /// Faithful `$$et{DoneAPE}` getter. `true` ⇒ ProcessAPE has run on this
   /// `$self`. Used by ID3.pm:1723 `if ($rtnVal and not $$et{DoneAPE})` to
   /// gate the MP3→APE trailer fallback at ID3.pm:1722-1727.
   #[must_use]
-  pub fn done_ape(&self) -> bool {
+  #[inline(always)]
+  pub const fn done_ape(&self) -> bool {
     self.done_ape
   }
 
@@ -566,9 +603,11 @@ impl Metadata {
   /// called by every entry point that runs APE's tag-extraction work
   /// (full `ProcessApe::process` AND the chained `process_trailer_only`),
   /// so a subsequent MP3 `ProcessMp3::process` skips the APE.pm:1722-1727
-  /// trailer fallback faithfully.
-  pub fn set_done_ape(&mut self) {
+  /// trailer fallback faithfully. Returns `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn set_done_ape(&mut self) -> &mut Self {
     self.done_ape = true;
+    self
   }
 }
 
@@ -705,9 +744,9 @@ mod tests {
       "SampleRate",
       TagValue::I64(44100),
     );
-    let names: Vec<&str> = m.tags().iter().map(Tag::name).collect();
+    let names: Vec<&str> = m.tags_slice().iter().map(Tag::name).collect();
     assert_eq!(names, ["FileType", "SampleRate"]);
-    assert_eq!(m.tags()[1].group().family1(), "AAC");
+    assert_eq!(m.tags_slice()[1].group_ref().family1(), "AAC");
   }
 
   #[test]
@@ -721,10 +760,10 @@ mod tests {
     let g = Group::new("Vorbis", "Vorbis");
     m.push_listable(g.clone(), "Artist", TagValue::Str("Alice".into()));
     m.push_listable(g.clone(), "Artist", TagValue::Str("Bob".into()));
-    assert_eq!(m.tags().len(), 1, "two pushes coalesce to one tag");
-    assert_eq!(m.tags()[0].name(), "Artist");
+    assert_eq!(m.tags_slice().len(), 1, "two pushes coalesce to one tag");
+    assert_eq!(m.tags_slice()[0].name(), "Artist");
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::List(vec![
         TagValue::Str("Alice".into()),
         TagValue::Str("Bob".into()),
@@ -733,9 +772,9 @@ mod tests {
 
     // Third push extends the list (ExifTool.pm:9518 `push @{...}`).
     m.push_listable(g.clone(), "Artist", TagValue::Str("Carol".into()));
-    assert_eq!(m.tags().len(), 1);
+    assert_eq!(m.tags_slice().len(), 1);
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::List(vec![
         TagValue::Str("Alice".into()),
         TagValue::Str("Bob".into()),
@@ -746,8 +785,12 @@ mod tests {
     // First-call for a fresh (group, name) is identical to push(): a new
     // scalar tag — NOT a 1-element list.
     m.push_listable(g.clone(), "Performer", TagValue::Str("X".into()));
-    let p = m.tags().iter().find(|t| t.name() == "Performer").unwrap();
-    assert_eq!(p.value(), &TagValue::Str("X".into())); // scalar, not List
+    let p = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "Performer")
+      .unwrap();
+    assert_eq!(p.value_ref(), &TagValue::Str("X".into())); // scalar, not List
 
     // Different group (family-1) ⇒ NOT the same tag identity (ExifTool's
     // `$$valueHash{$tag}` keyed implicitly by group too).
@@ -756,7 +799,11 @@ mod tests {
       "Artist",
       TagValue::Str("Z".into()),
     );
-    let artists: Vec<_> = m.tags().iter().filter(|t| t.name() == "Artist").collect();
+    let artists: Vec<_> = m
+      .tags_slice()
+      .iter()
+      .filter(|t| t.name() == "Artist")
+      .collect();
     assert_eq!(artists.len(), 2, "different family1 ⇒ separate tag");
   }
 
@@ -769,11 +816,11 @@ mod tests {
     m.push_listable(g.clone(), "Artist", TagValue::Str("Alice".into()));
     m.push(g.clone(), "Title", TagValue::Str("T".into())); // plain push
     m.push_listable(g.clone(), "Artist", TagValue::Str("Bob".into()));
-    let names: Vec<_> = m.tags().iter().map(Tag::name).collect();
+    let names: Vec<_> = m.tags_slice().iter().map(Tag::name).collect();
     // Order: Artist (coalesced), Title. NO second Artist tag.
     assert_eq!(names, vec!["Artist", "Title"]);
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::List(vec![
         TagValue::Str("Alice".into()),
         TagValue::Str("Bob".into()),
@@ -795,10 +842,10 @@ mod tests {
     m.push(aiff.clone(), "Name", TagValue::Str("First Name".into()));
     m.push(aiff.clone(), "Name", TagValue::Str("Second Name".into()));
     // No new tag appended — overwritten in place.
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "Name");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "Name");
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::Str("Second Name".into()),
       "LAST `push` value must win for duplicate group+name"
     );
@@ -827,7 +874,7 @@ mod tests {
       "MIMEType",
       TagValue::Str("audio/aac".into()),
     );
-    assert_eq!(m.tags().len(), 3);
+    assert_eq!(m.tags_slice().len(), 3);
   }
 
   #[test]
@@ -841,19 +888,26 @@ mod tests {
       TagValue::Str("M4A".into()),
     );
     m.push(Group::new("AAC", "AAC"), "SampleRate", TagValue::I64(44100));
-    let before = m.tags().len();
+    let before = m.tags_slice().len();
     let replaced = m.set_tag_value(
       &Group::new("File", "File"),
       "FileType",
       TagValue::Str("AAC".into()),
     );
     assert!(replaced); // existed ⇒ true
-    assert_eq!(m.tags().len(), before); // no new tag appended
-    let ft = m.tags().iter().find(|t| t.name() == "FileType").unwrap();
-    assert_eq!(ft.value(), &TagValue::Str("AAC".into())); // value changed
+    assert_eq!(m.tags_slice().len(), before); // no new tag appended
+    let ft = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "FileType")
+      .unwrap();
+    assert_eq!(ft.value_ref(), &TagValue::Str("AAC".into())); // value changed
     // exactly one FileType tag — the value was overwritten, not duplicated.
     assert_eq!(
-      m.tags().iter().filter(|t| t.name() == "FileType").count(),
+      m.tags_slice()
+        .iter()
+        .filter(|t| t.name() == "FileType")
+        .count(),
       1
     );
   }
@@ -864,14 +918,14 @@ mod tests {
     // guard (ExifTool.pm:9715): absent ⇒ false, nothing changes.
     let mut m = Metadata::new("x");
     m.push(Group::new("AAC", "AAC"), "SampleRate", TagValue::I64(44100));
-    let before = m.tags().len();
+    let before = m.tags_slice().len();
     let replaced = m.set_tag_value(
       &Group::new("File", "File"),
       "FileType",
       TagValue::Str("AAC".into()),
     );
     assert!(!replaced); // absent ⇒ false
-    assert_eq!(m.tags().len(), before); // len unchanged
+    assert_eq!(m.tags_slice().len(), before); // len unchanged
   }
 
   #[test]
@@ -891,6 +945,6 @@ mod tests {
       TagValue::Str("AAC".into()),
     );
     assert!(!replaced);
-    assert_eq!(m.tags()[0].value(), &TagValue::Str("nope".into()));
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::Str("nope".into()));
   }
 }

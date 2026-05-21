@@ -1393,7 +1393,7 @@ mod tests {
     assert_eq!(buf.len(), 36);
     let mut m = Metadata::new("x");
     walk_binary_data(&buf, &mut m, false);
-    let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
+    let names: std::vec::Vec<&str> = m.tags_slice().iter().map(|t| t.name()).collect();
     assert_eq!(
       names,
       [
@@ -1405,8 +1405,8 @@ mod tests {
         "BitsPerSample",
       ]
     );
-    assert!(m.tags().iter().all(|t| t.name() != "SampleCount"));
-    assert!(m.tags().iter().all(|t| t.name() != "BlockSize"));
+    assert!(m.tags_slice().iter().all(|t| t.name() != "SampleCount"));
+    assert!(m.tags_slice().iter().all(|t| t.name() != "BlockSize"));
   }
 
   #[test]
@@ -1418,11 +1418,11 @@ mod tests {
     let mut m = Metadata::new("x");
     walk_binary_data(&buf, &mut m, false);
     let sc = m
-      .tags()
+      .tags_slice()
       .iter()
       .find(|t| t.name() == "SampleCount")
       .unwrap()
-      .value()
+      .value_ref()
       .clone();
     assert_eq!(sc, TagValue::Str("18446744073709551615".into()));
   }

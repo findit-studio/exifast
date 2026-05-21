@@ -452,7 +452,11 @@ mod tests {
     let keys = ["Bit016-017", "Bit018-021", "Bit023-025"];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
-    let got: Vec<(&str, &TagValue)> = m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let got: Vec<(&str, &TagValue)> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     assert_eq!(
       got,
       vec![
@@ -461,7 +465,7 @@ mod tests {
         ("Channels", &TagValue::I64(2)),
       ]
     );
-    assert_eq!(m.tags()[0].group().family1(), "AAC");
+    assert_eq!(m.tags_slice()[0].group_ref().family1(), "AAC");
   }
 
   #[test]
@@ -471,7 +475,11 @@ mod tests {
     let keys = ["Bit016-017", "Bit018-021", "Bit023-025"];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, false);
-    let got: Vec<(&str, &TagValue)> = m.tags().iter().map(|t| (t.name(), t.value())).collect();
+    let got: Vec<(&str, &TagValue)> = m
+      .tags_slice()
+      .iter()
+      .map(|t| (t.name(), t.value_ref()))
+      .collect();
     assert_eq!(
       got,
       vec![
@@ -490,7 +498,7 @@ mod tests {
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
     assert!(
-      m.tags().is_empty(),
+      m.tags_slice().is_empty(),
       "i2 >= dirLen must stop before emitting"
     );
   }
@@ -509,7 +517,7 @@ mod tests {
     let keys = ["Bit024-016"]; // descending cross-byte: b1=24 > b2=16, i1=3 > i2=2
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys, &table, &mut m, true);
-    assert!(m.tags().is_empty());
+    assert!(m.tags_slice().is_empty());
 
     // Sub-case 2 — same-byte descending: b1=17 > b2=16, i1==i2==2.
     // The byte loop runs once, but both f1>0 and f2<7 masks clear all bits
@@ -518,7 +526,7 @@ mod tests {
     let keys2 = ["Bit017-016"]; // same-byte descending: b1=17 > b2=16, i1==i2==2
     let mut m2 = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &keys2, &table, &mut m2, true);
-    assert!(m2.tags().is_empty());
+    assert!(m2.tags_slice().is_empty());
   }
 
   #[test]
@@ -562,11 +570,14 @@ mod tests {
     let mut m = Metadata::new("x.flac");
     // FLAC.pm:179-231: Format set => raw bytes [i1..i1+Size] = [0..4].
     process_bit_stream(&data, BitOrder::Mm, &["Bit000-031"], &table, &mut m, true);
-    assert_eq!(m.tags().len(), 1, "exactly one tag emitted");
-    assert_eq!(m.tags()[0].name(), "MD5Signature");
+    assert_eq!(m.tags_slice().len(), 1, "exactly one tag emitted");
+    assert_eq!(m.tags_slice()[0].name(), "MD5Signature");
     // ValueConv(Func(hex)) applied to TagValue::Bytes([DE,AD,BE,EF]).
-    assert_eq!(m.tags()[0].value(), &TagValue::Str("deadbeef".into()));
-    assert_eq!(m.tags()[0].group().family1(), "FLAC");
+    assert_eq!(
+      m.tags_slice()[0].value_ref(),
+      &TagValue::Str("deadbeef".into())
+    );
+    assert_eq!(m.tags_slice()[0].group_ref().family1(), "FLAC");
   }
 
   #[test]
@@ -579,10 +590,10 @@ mod tests {
     let buff = [0xFFu8, 0xF1, 0x50, 0x80, 0x00, 0x00, 0x00];
     let mut m = Metadata::new("x.aac");
     process_bit_stream(&buff, BitOrder::Mm, &["Bit016-017"], &table, &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "ProfileType");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "ProfileType");
     // print_conv_enabled=false: raw integer after unsigned-int accumulation.
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(1));
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(1));
   }
 
   #[test]
@@ -631,14 +642,14 @@ mod tests {
     // Format path: must NOT panic; must return with the correct hex string.
     process_bit_stream(&data, BitOrder::Mm, &["Bit000-127"], &table, &mut m, true);
     assert_eq!(
-      m.tags().len(),
+      m.tags_slice().len(),
       1,
       "exactly one tag emitted for the 16-byte span"
     );
-    assert_eq!(m.tags()[0].name(), "MD5Signature");
+    assert_eq!(m.tags_slice()[0].name(), "MD5Signature");
     // ValueConv(hex) applied to all 16 bytes -> exact 32-char hex string.
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::Str("00112233445566778899aabbccddeeff".into())
     );
   }
@@ -660,7 +671,7 @@ mod tests {
     let table = TagTable::new("Test", get_field);
     let mut m = Metadata::new("x.test");
     process_bit_stream(data, BitOrder::Mm, &[key], &table, &mut m, false);
-    m.tags().first().map(|t| t.value().clone())
+    m.tags_slice().first().map(|t| t.value_ref().clone())
   }
 
   #[test]
@@ -952,9 +963,9 @@ mod tests {
     // Raw extraction set MPEG_Vers=3, then SR chose SR_V1.
     assert_eq!(state.get("MPEG_Vers"), Some(3));
     let tags: Vec<_> = m
-      .tags()
+      .tags_slice()
       .iter()
-      .map(|t| (t.name(), t.value().clone()))
+      .map(|t| (t.name(), t.value_ref().clone()))
       .collect();
     assert_eq!(
       tags,
@@ -999,7 +1010,7 @@ mod tests {
       &mut m,
       true,
     );
-    assert!(m.tags().is_empty(), "no matching arm => no tag");
+    assert!(m.tags_slice().is_empty(), "no matching arm => no tag");
   }
 
   #[test]
@@ -1040,6 +1051,6 @@ mod tests {
       "RawConv must capture the raw integer, not the value-converted result"
     );
     // Emitted tag IS value-converted (99) — the tag pipeline is unaffected.
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(99));
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(99));
   }
 }

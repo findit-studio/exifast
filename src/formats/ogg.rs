@@ -857,15 +857,15 @@ fn process_vorbis_comments_with_group1(
 ) -> bool {
   let mut side = Metadata::new(meta.source_file());
   let ok = process_vorbis_comments(data, &mut side, print_conv_enabled);
-  for tag in side.tags() {
+  for tag in side.tags_slice() {
     meta.push(
-      Group::new(tag.group().family0(), group1),
+      Group::new(tag.group_ref().family0(), group1),
       tag.name(),
-      tag.value().clone(),
+      tag.value_ref().clone(),
     );
   }
   // Propagate any warnings the side-parse emitted.
-  for w in side.warnings() {
+  for w in side.warnings_slice() {
     meta.push_warning(w.clone());
   }
   ok
@@ -1255,11 +1255,11 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<OggMeta<'
   // owned `SmolStr` (no `Box::leak`); comments go through `tag_to_comment`
   // per element.
   let warnings: Vec<SmolStr> = staging
-    .warnings()
+    .warnings_slice()
     .iter()
     .map(|w| staged_warning_to_owned(w.as_str()))
     .collect();
-  let comments: Vec<OggComment> = staging.tags().iter().map(tag_to_comment).collect();
+  let comments: Vec<OggComment> = staging.tags_slice().iter().map(tag_to_comment).collect();
   Ok(Some(OggMeta {
     file_type_override,
     comments,
@@ -1306,9 +1306,9 @@ fn tag_to_comment(tag: &crate::value::Tag) -> OggComment {
   // (Vorbis::Comments / Opus comments) or "Theora" (Theora::Comments).
   // Stored owned (`SmolStr`) so an unforeseen group needs no `Box::leak`
   // (Codex AF2).
-  let group1 = SmolStr::from(tag.group().family1());
+  let group1 = SmolStr::from(tag.group_ref().family1());
   let name = SmolStr::from(tag.name());
-  match tag.value() {
+  match tag.value_ref() {
     TagValue::List(items) => {
       // List tags in OGG today: Artist / Performer / Contact.
       let values: Vec<SmolStr> = items
@@ -1627,7 +1627,7 @@ mod tests {
     }
     let mut meta = Metadata::new("x.ogg");
     assert!(process_vorbis_comments(&data, &mut meta, true));
-    let names: Vec<&str> = meta.tags().iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     // Order: Vendor first, then comments in insertion order.
     assert_eq!(
       names,
@@ -1671,15 +1671,19 @@ mod tests {
     let mut meta = Metadata::new("x.ogg");
     assert!(process_vorbis_comments(&data, &mut meta, true));
     // Vendor first, then Title, then a single Artist as a List of 2.
-    let names: Vec<&str> = meta.tags().iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = meta.tags_slice().iter().map(|t| t.name()).collect();
     assert_eq!(names, vec!["Vendor", "Title", "Artist"]);
-    let artist = meta.tags().iter().find(|t| t.name() == "Artist").unwrap();
-    if let TagValue::List(items) = artist.value() {
+    let artist = meta
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "Artist")
+      .unwrap();
+    if let TagValue::List(items) = artist.value_ref() {
       assert_eq!(items.len(), 2);
       assert_eq!(items[0], TagValue::Str("Alice".into()));
       assert_eq!(items[1], TagValue::Str("Bob".into()));
     } else {
-      panic!("Artist should be List, got {:?}", artist.value());
+      panic!("Artist should be List, got {:?}", artist.value_ref());
     }
   }
 
@@ -1689,7 +1693,7 @@ mod tests {
     let data: Vec<u8> = vec![0xff, 0xff, 0xff, 0xff];
     let mut meta = Metadata::new("x.ogg");
     assert!(!process_vorbis_comments(&data, &mut meta, true));
-    assert_eq!(meta.warnings()[0], "Format error in Vorbis comments");
+    assert_eq!(meta.warnings_slice()[0], "Format error in Vorbis comments");
   }
 
   // Tests `vorbis_identification_format_lookup`,
@@ -1719,10 +1723,10 @@ mod tests {
     assert!(process_vorbis_comments_with_group1(
       &data, &mut meta, true, "Theora"
     ));
-    for t in meta.tags() {
+    for t in meta.tags_slice() {
       // Family-0 stays "Vorbis" (from the tag table); family-1 is "Theora".
-      assert_eq!(t.group().family0(), "Vorbis");
-      assert_eq!(t.group().family1(), "Theora");
+      assert_eq!(t.group_ref().family0(), "Vorbis");
+      assert_eq!(t.group_ref().family1(), "Theora");
     }
   }
 
@@ -1909,8 +1913,8 @@ mod tests {
     }
     let mut meta = Metadata::new("x.ogg");
     assert!(process_vorbis_comments(&data, &mut meta, true));
-    for tag in meta.tags() {
-      match tag.value() {
+    for tag in meta.tags_slice() {
+      match tag.value_ref() {
         TagValue::Str(_) | TagValue::List(_) | TagValue::Bytes(_) => {}
         other => panic!(
           "OGG staging Metadata produced unexpected variant: {other:?} (tag {})",

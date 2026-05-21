@@ -665,8 +665,8 @@ fn extract_sv7_header(hdr: &[u8]) -> MpcSv7Header {
     gapless: 0,
     encoder_version: 0,
   };
-  for tag in staging.tags() {
-    let TagValue::I64(n) = tag.value() else {
+  for tag in staging.tags_slice() {
+    let TagValue::I64(n) = tag.value_ref() else {
       continue; // unreachable for these fields under print_conv=false
     };
     let n = *n;

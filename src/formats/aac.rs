@@ -260,20 +260,20 @@ fn parse_inner(data: &[u8]) -> Result<Option<AacMeta<'_>>, AacError> {
   let mut profile_type: u8 = 0;
   let mut sample_rate: u32 = 0;
   let mut channels: u8 = 0;
-  for tag in staging.tags() {
+  for tag in staging.tags_slice() {
     match tag.name() {
       "ProfileType" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           profile_type = (*n as u64) as u8;
         }
       }
       "SampleRate" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           sample_rate = (*n as u64) as u32;
         }
       }
       "Channels" => {
-        if let TagValue::I64(n) = tag.value() {
+        if let TagValue::I64(n) = tag.value_ref() {
           channels = (*n as u64) as u8;
         }
       }

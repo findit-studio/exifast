@@ -575,10 +575,10 @@ mod tests {
     let data = [0x00, 0x01, 0x00, 0x00, 0x2d, 0x22];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int16u", &TABLE, &[0, 1], &mut m, false);
-    assert_eq!(m.tags()[0].name(), "A");
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(1));
-    assert_eq!(m.tags()[1].name(), "B");
-    assert_eq!(m.tags()[1].value(), &TagValue::I64(11554));
+    assert_eq!(m.tags_slice()[0].name(), "A");
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(1));
+    assert_eq!(m.tags_slice()[1].name(), "B");
+    assert_eq!(m.tags_slice()[1].value_ref(), &TagValue::I64(11554));
   }
 
   #[test]
@@ -587,8 +587,8 @@ mod tests {
     let data = [0x00, 0x07];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int16u", &TABLE, &[0, 1], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].value(), &TagValue::I64(7));
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::I64(7));
   }
 
   // Codex R1 regression: string[N] / pstring used to `from_utf8(...).unwrap_or_default()`
@@ -624,10 +624,10 @@ mod tests {
     let data = [0x02, 0x80, 0x81];
     let mut m = Metadata::new("x");
     process_binary_data(&data, "int8u", &MAC_TABLE, &[0], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].name(), "MacName");
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].name(), "MacName");
     assert_eq!(
-      m.tags()[0].value(),
+      m.tags_slice()[0].value_ref(),
       &TagValue::Str("\u{00c4}\u{00c5}".into())
     );
   }
@@ -652,7 +652,7 @@ mod tests {
     let data = b"NONE";
     let mut m = Metadata::new("x");
     process_binary_data(data, "int8u", &NOVC_TABLE, &[0], &mut m, false);
-    assert_eq!(m.tags().len(), 1);
-    assert_eq!(m.tags()[0].value(), &TagValue::Str("NONE".into()));
+    assert_eq!(m.tags_slice().len(), 1);
+    assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::Str("NONE".into()));
   }
 }

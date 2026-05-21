@@ -1008,12 +1008,12 @@ fn run_id3_pass(data: &[u8], print_conv: bool) -> (bool, usize, Vec<StagedTag>, 
   let mut staging = Metadata::new("staging.id3");
   let (found, hdr_end) = process_id3_inner_legacy(data, &mut staging, print_conv);
   let staged_tags: Vec<StagedTag> = staging
-    .tags()
+    .tags_slice()
     .iter()
     .map(|t| StagedTag {
-      family1: SmolStr::new(t.group().family1()),
+      family1: SmolStr::new(t.group_ref().family1()),
       name: SmolStr::new(t.name()),
-      value: t.value().clone(),
+      value: t.value_ref().clone(),
     })
     .collect();
   (found, hdr_end, staged_tags, staging)
@@ -1107,8 +1107,8 @@ fn parse_id3_inner<'a>(
       stuff_id3v1_field(v1, name, &tag.value);
     }
   }
-  let warnings: Vec<SmolStr> = staging.warnings().iter().map(SmolStr::new).collect();
-  let errors: Vec<SmolStr> = staging.errors().iter().map(SmolStr::new).collect();
+  let warnings: Vec<SmolStr> = staging.warnings_slice().iter().map(SmolStr::new).collect();
+  let errors: Vec<SmolStr> = staging.errors_slice().iter().map(SmolStr::new).collect();
   Ok((
     Some(Id3Meta {
       v2_version,

@@ -482,9 +482,9 @@ mod tests {
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
     let names: Vec<(&str, &str, TagValue)> = m
-      .tags()
+      .tags_slice()
       .iter()
-      .map(|t| (t.group().family1(), t.name(), t.value().clone()))
+      .map(|t| (t.group_ref().family1(), t.name(), t.value_ref().clone()))
       .collect();
     assert_eq!(
       names,
@@ -513,9 +513,9 @@ mod tests {
     let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
-    let track = m.tags().iter().find(|t| t.name() == "Track");
+    let track = m.tags_slice().iter().find(|t| t.name() == "Track");
     assert!(track.is_some(), "v1.1 Track must be emitted");
-    assert_eq!(track.unwrap().value(), &TagValue::I64(5));
+    assert_eq!(track.unwrap().value_ref(), &TagValue::I64(5));
   }
 
   #[test]
@@ -525,8 +525,8 @@ mod tests {
     let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, false, &ctx);
-    let g = m.tags().iter().find(|t| t.name() == "Genre").unwrap();
-    assert_eq!(g.value(), &TagValue::I64(7));
+    let g = m.tags_slice().iter().find(|t| t.name() == "Genre").unwrap();
+    assert_eq!(g.value_ref(), &TagValue::I64(7));
   }
 
   #[test]
@@ -536,8 +536,8 @@ mod tests {
     let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
-    let g = m.tags().iter().find(|t| t.name() == "Genre").unwrap();
-    assert_eq!(g.value(), &TagValue::Str("Unknown (200)".into()));
+    let g = m.tags_slice().iter().find(|t| t.name() == "Genre").unwrap();
+    assert_eq!(g.value_ref(), &TagValue::Str("Unknown (200)".into()));
   }
 
   #[test]
@@ -554,8 +554,8 @@ mod tests {
     let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&block, &mut m, true, &ctx);
-    let year = m.tags().iter().find(|t| t.name() == "Year").unwrap();
-    assert_eq!(year.value(), &TagValue::Str("20".into()));
+    let year = m.tags_slice().iter().find(|t| t.name() == "Year").unwrap();
+    assert_eq!(year.value_ref(), &TagValue::Str("20".into()));
   }
 
   #[test]
@@ -575,10 +575,14 @@ mod tests {
     let mut m = Metadata::new("x.mp3");
     let ctx = ConvContext::default();
     process_id3v1(&data, &mut m, true, &ctx);
-    let cmt = m.tags().iter().find(|t| t.name() == "Comment").unwrap();
-    assert_eq!(cmt.value(), &TagValue::Str("Cmt".into()));
-    let tr = m.tags().iter().find(|t| t.name() == "Track").unwrap();
-    assert_eq!(tr.value(), &TagValue::I64(7));
+    let cmt = m
+      .tags_slice()
+      .iter()
+      .find(|t| t.name() == "Comment")
+      .unwrap();
+    assert_eq!(cmt.value_ref(), &TagValue::Str("Cmt".into()));
+    let tr = m.tags_slice().iter().find(|t| t.name() == "Track").unwrap();
+    assert_eq!(tr.value_ref(), &TagValue::I64(7));
   }
 
   #[test]
@@ -587,6 +591,6 @@ mod tests {
     let ctx = ConvContext::default();
     // <128 bytes: silently no-op (real callers gate by file length).
     process_id3v1(b"TAG\x00", &mut m, true, &ctx);
-    assert!(m.tags().is_empty());
+    assert!(m.tags_slice().is_empty());
   }
 }
