@@ -640,24 +640,45 @@ impl FormatParser for ProcessWv {
   /// the buffer is not a valid WavPack file (short read, bad magic, or
   /// version-byte mismatch — WavPack.pm:87-88).
   ///
+  /// **R5 (Codex adversarial)** — routes through [`parse_full_chained`]
+  /// so the embedded ID3 detection (WavPack.pm:100) and APE trailer
+  /// (WavPack.pm:101-103) chains run and nest typed sub-Metas into the
+  /// returned [`Meta`]. Pre-fix the trait impl called the body-only
+  /// [`parse_inner`], silently dropping every chained sub-Meta for
+  /// callers using the typed `FormatParser` surface (only the crate-root
+  /// `parse_wavpack` was fixed in R4 — R5 propagates the chain down to
+  /// ALL public surfaces). The Context's `shared` reference threads the
+  /// `DoneID3`/`DoneAPE` cross-recursion state through the chain.
+  ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
   fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(ctx.data))
+    // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is
+    // always present here.
+    Ok(parse_full_chained(ctx.data, ctx.shared))
   }
 }
 
-/// Lib-first direct entry. Same as [`FormatParser::parse`] now that the
-/// [`FormatParser::Meta`] GAT threads the input borrow lifetime through —
-/// returns a [`Meta`] borrowing from the input buffer (zero allocation,
-/// including the chained ID3/APE trailer scan range; Codex AF2).
+/// Lib-first direct entry. Routes through [`parse_full_chained`] so the
+/// embedded ID3 detection (WavPack.pm:100) and APE trailer
+/// (WavPack.pm:101-103) chains run and nest typed sub-Metas into the
+/// returned [`Meta`].
+///
+/// **R5 (Codex adversarial)** — pre-fix this called the body-only
+/// [`parse_inner`], so a WavPack with an ID3v1 trailer or APE trailer
+/// silently dropped those tags through the module-level public path
+/// (only the crate-root `parse_wavpack` was fixed in R4). A fresh
+/// [`SharedFlags`] is constructed per call.
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  Ok(parse_inner(data))
+  // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
+  // present here.
+  let mut shared = crate::format_parser::SharedFlags::default();
+  Ok(parse_full_chained(data, &mut shared))
 }
 
 /// Inner parser — produces a borrow-from-input [`Meta`]. The
@@ -1144,8 +1165,10 @@ mod tests {
 
   #[test]
   fn wv_context_exposes_shared_mut_for_chained_parsers() {
-    // Reserved-for-Phase-F2/F3 wiring smoke test — the lib-first parse
-    // does not actually flip shared flags today.
+    // Smoke test — verify the `shared()` / `shared_mut()` accessors on
+    // `Context` propagate state to the outer `SharedFlags` so chained
+    // parsers (ID3, APE) can read/write `DoneID3`/`DoneAPE` via the
+    // routed `parse_full_chained` path (R5).
     let data = header_with_flags(0);
     let mut shared = SharedFlags::new();
     {
