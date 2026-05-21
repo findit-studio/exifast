@@ -459,61 +459,11 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
   write!(w, "{sign}{h}:{m:02}:{s_int:02}")
 }
 
-/// Format-into-writer port of `Image::ExifTool::ConvertBitrate`
-/// (ExifTool.pm:6891-6902). Writes the formatted bitrate string directly
-/// into a [`core::fmt::Write`] sink — no intermediate `String` allocation.
-///
-/// Perl reference:
-/// ```perl
-/// my $bitrate = shift;
-/// IsFloat($bitrate) or return $bitrate;
-/// my @units = ('bps', 'kbps', 'Mbps', 'Gbps');
-/// for (;;) {
-///     my $units = shift @units;
-///     $bitrate >= 1000 and @units and $bitrate /= 1000, next;
-///     my $fmt = $bitrate < 100 ? '%.3g' : '%.0f';
-///     return sprintf("$fmt $units", $bitrate);
-/// }
-/// ```
-///
-/// Bundled-Perl oracle (verified 2026-05-20):
-/// - `224_000` → `"224 kbps"`
-/// - `8_500_000` → `"8.5 Mbps"`
-/// - `50` → `"50 bps"`
-/// - `999` → `"999 bps"`
-/// - `1000` → `"1 kbps"`
-/// - `1_500_000_000` → `"1.5 Gbps"`
-pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
-  w: &mut W,
-  bitrate: f64,
-) -> core::fmt::Result {
-  if !bitrate.is_finite() {
-    return write!(w, "{bitrate}");
-  }
-  const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
-  let mut b = bitrate;
-  for (i, &unit) in UNITS.iter().enumerate() {
-    let is_last = i + 1 == UNITS.len();
-    if b >= 1000.0 && !is_last {
-      b /= 1000.0;
-      continue;
-    }
-    return if b < 100.0 {
-      // `%.3g` — Perl `%g` strips trailing zeros. Share the engine's
-      // existing helper so byte-exact matching against the bundled oracle
-      // is centralized.
-      let formatted = crate::value::format_g(b, 3);
-      write!(w, "{formatted} {unit}")
-    } else {
-      // `%.0f` — Perl `%.0f` is half-to-even; for bitrate ranges here the
-      // post-division values are never exactly `.5`, so Rust's
-      // half-away-from-zero `{:.0}` produces byte-identical output.
-      write!(w, "{b:.0} {unit}")
-    };
-  }
-  // Unreachable: the loop always returns on the last UNITS entry.
-  unreachable!("write_convert_bitrate loop must exit on the last unit");
-}
+/// `ConvertBitrate` PrintConv helper. Re-exported from [`crate::convert`]
+/// for backward compatibility; the implementation moved out of `formats/moi`
+/// in R2 F-OGG-TRIM so both `moi` and `ogg` (Vorbis::Identification +
+/// Opus::Header PrintConv) can share the single faithful port.
+pub use crate::convert::write_convert_bitrate;
 
 // ===========================================================================
 // `ProcessMoi` — the lib-first parser

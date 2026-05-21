@@ -20,17 +20,14 @@
 //! bundled `perl exiftool`.
 //!
 //! ## Deliberate Phase-2 deferrals (see `docs/superpowers/plans/`):
-//! - **Codec-specific identification-header binary tables (R1 F2 scope
-//!   tightening):** `%Image::ExifTool::Vorbis::Identification`
-//!   (Vorbis.pm:40-70), `%Image::ExifTool::Opus::Header` (Opus.pm:36-51),
-//!   and `%Image::ExifTool::Theora::Identification` (Theora.pm:42-104)
-//!   are deferred to dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm`
-//!   PRs. The `OverrideFileType('OGV')` / `OverrideFileType('OPUS')`
-//!   calls (Ogg.pm:49-50) remain in scope — file-type override fires
-//!   whenever the header packet is recognised. See the in-code
-//!   `// Codec-specific identification-header tables — DEFERRED (R1 F2)`
-//!   comment block for the full deferral rationale incl. the
-//!   signed-vs-unsigned `Format` audit list each follow-up PR owes.
+//! - **`%Image::ExifTool::Theora::Identification` (Theora.pm:42-104)** —
+//!   Theora is a video codec with a larger binary table (rational pixel
+//!   aspect / framerate / colourspace) and no Theora corpus fixture
+//!   exists in the suite. Queued for the dedicated Theora.pm PR. The
+//!   `OverrideFileType('OGV')` call (Ogg.pm:49) DOES fire when a Theora
+//!   packet is seen, even with the table deferred. (R2 F-OGG-TRIM
+//!   re-landed Vorbis::Identification + Opus::Header here; only
+//!   Theora::Identification remains deferred.)
 //! - **FLAC-in-Ogg transport** (Ogg.pm:176-179, 190-195): the `\x7fFLAC`
 //!   packet arm that delegates to `Image::ExifTool::FLAC::ProcessFLAC`
 //!   is deferred until the FLAC port lands (row 8). A `\x7fFLAC`-magic
@@ -66,45 +63,31 @@ use std::collections::HashMap;
 const MAX_PACKETS: u32 = 2;
 
 // ===========================================================================
-// Codec-specific identification-header tables — DEFERRED (R1 F2)
+// Codec-specific identification-header tables — STATUS
 // ===========================================================================
 //
-// The bundled-Perl tables `%Image::ExifTool::Vorbis::Identification`
-// (Vorbis.pm:40-70), `%Image::ExifTool::Opus::Header` (Opus.pm:36-51), and
-// `%Image::ExifTool::Theora::Identification` (Theora.pm:42-104) extract
-// codec-specific binary fields (Vorbis bitrate/sample-rate/channels; Opus
-// OutputGain/sample-rate/channels; Theora FrameRate/PixelAspect/etc.).
-// These tables were initially ported in the first revision of this PR but
-// have been REMOVED here to tighten this PR's scope back to its announced
-// boundary — "Ogg container framing + inline Vorbis-comment block
-// extraction". Codec-specific binary-field decoding is deferred to
-// dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm` PRs.
+// R2 F-OGG-TRIM (this commit): Vorbis::Identification (Vorbis.pm:40-70)
+// + Opus::Header (Opus.pm:36-51) are PORTED below — the R1 deferral was
+// reverted when round-2 review showed it created new conformance hand-
+// trims that violate the 1:1 bar. Theora::Identification (Theora.pm:42-104)
+// remains deferred (no fixture; on the dedicated Theora.pm queue).
 //
-// When those PRs land they MUST verify each field's signed-vs-unsigned
-// `Format` against the bundled `.pm` declarations (D5 is faithfulness to
-// the bundled ExifTool source, NOT to upstream codec specs):
+// Signedness audit (D5 — faithfulness to bundled ExifTool, NOT upstream
+// codec specs):
 //   * Vorbis.pm:53,59,65 declare MaximumBitrate / NominalBitrate /
-//     MinimumBitrate as `Format => 'int32u'` (unsigned). The Vorbis I
-//     specification itself describes them as signed 32-bit integers
-//     (RFC-style spec text), but ExifTool emits the unsigned reading —
-//     porting MUST match ExifTool, not the spec.
-//   * Opus.pm:48 declares OutputGain as `Format => 'int16u'`. RFC 7845
-//     §5.1 specifies a signed 16-bit LE field (Q7.8 fixed-point gain in
-//     dB), but again ExifTool reads it unsigned — the port MUST match.
-//   * Theora.pm uses only `int8u` / `int16u` / `int32u` / `int8u[3]` /
-//     `int16u[3]` / `rational64u`; no signedness mismatch.
+//     MinimumBitrate as `Format => 'int32u'` (UNSIGNED). The Vorbis I
+//     specification describes them as signed 32-bit integers (RFC-style
+//     spec text); the port follows ExifTool's unsigned reading.
+//   * Opus.pm:48 declares OutputGain as `Format => 'int16u'` (UNSIGNED).
+//     RFC 7845 §5.1 specifies a signed 16-bit LE field (Q7.8 fixed-point
+//     dB gain); the port follows ExifTool's unsigned reading.
+//   * Theora.pm (deferred) uses only `int8u` / `int16u` / `int32u` /
+//     `int8u[3]` / `int16u[3]` / `rational64u`; no signedness mismatch
+//     vs the Theora spec to audit when that PR lands.
 //
 // The `OverrideFileType('OGV')` / `OverrideFileType('OPUS')` calls
-// (Ogg.pm:49-50) live in `process_packet` and ARE retained — file-type
-// override fires whenever the corresponding header packet is seen, even
-// when the identification-binary table is not (yet) ported.
-//
-// Vorbis-comment-block parsing (vendor + N KEY=VALUE comments) IS in this
-// PR's scope and IS retained — see `process_vorbis_comments` below.
-//
-// Forward reference (memory note): `exifast-phase2-forward-items` —
-// "Vorbis.pm + Opus.pm codec-specific tags (identification-header binary
-// fields) deferred to dedicated Vorbis/Opus PRs".
+// (Ogg.pm:49-50) live in `process_packet` — file-type override fires
+// whenever the corresponding header packet is seen.
 
 // ===========================================================================
 // Vorbis::Comments — faithful %Vorbis::Comments (Vorbis.pm:72-135)
@@ -397,20 +380,249 @@ fn underscore_camelcase(s: &str) -> String {
 }
 
 // ===========================================================================
-// Binary-data extraction — DEFERRED (R1 F2)
+// Vorbis::Identification + Opus::Header binary tables
 //
-// The targeted `ProcessBinaryData` subset (`read_binary` /
-// `process_binary_data` / `BinaryFormat` / `binary_table_offsets` /
-// `binary_table_format` / `BinaryByteOrder { II, MM }`) lived here in the
-// first revision of this PR to drive the three codec identification
-// tables above. With those tables deferred (see the comment block at the
-// top of this module), this entire engine-subset has no consumer in this
-// PR and is REMOVED. The dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm`
-// PRs (which will re-land the codec identification tables) will either
-// promote a shared `ProcessBinaryData` into the engine layer (preferred
-// long-term — `RIFF.pm`, `QuickTime.pm`, `FLAC.pm`, etc. all need it) or
-// re-derive this targeted subset alongside the codec tables.
+// R2 F-OGG-TRIM: the codec-identification binary tables are IN SCOPE for
+// this PR after all — round-2 review showed the R1 deferral was creating
+// new conformance hand-trims (`-x Vorbis:VorbisVersion -x Vorbis:AudioChannels
+// -x Vorbis:SampleRate -x Vorbis:NominalBitrate ...` and `-x Opus:*`) and
+// the trims violated the "no hand-trims beyond the formally-accepted-
+// deferral list" 1:1 bar. The tables are bounded (a handful of fixed-offset
+// fields per codec); they're now ported here directly so the goldens can
+// be regenerated UNTRIMMED.
+//
+// Theora::Identification (Theora.pm:42-104) stays deferred — Theora is a
+// VIDEO format whose tags carry the `Theora` group, no in-scope Ogg-Theora
+// fixture exists, and the bundled fixture for `OverrideFileType('OGV')`
+// would need a real .ogv corpus. Theora is on the queue for the dedicated
+// Theora.pm PR; the `OverrideFileType('OGV')` retains for any `\x80theora`
+// / `\x81theora` packet seen (Ogg.pm:49).
+//
+// Faithful Perl reference for the in-scope tables:
+//
+// %Image::ExifTool::Vorbis::Identification (Vorbis.pm:40-70):
+//   0  => VorbisVersion (int32u)
+//   4  => AudioChannels (int8u — default Format unless declared)
+//   5  => SampleRate (int32u)
+//   9  => MaximumBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//  13  => NominalBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//  17  => MinimumBitrate (int32u; RawConv '$val || undef'; PrintConv ConvertBitrate)
+//
+// %Image::ExifTool::Opus::Header (Opus.pm:36-51):
+//   0  => OpusVersion (int8u — default Format)
+//   1  => AudioChannels (int8u — default Format)
+//   4  => SampleRate (int32u)
+//   8  => OutputGain (int16u; ValueConv '10 ** ($val/5120)')
+//
+// Note 1: Opus.pm:48 declares OutputGain as `Format => 'int16u'` (UNSIGNED);
+// RFC 7845 §5.1 specifies a signed 16-bit field (Q7.8 fixed-point dB gain),
+// but D5 is faithfulness to bundled ExifTool, NOT to upstream codec specs —
+// so the port follows Opus.pm and reads unsigned.
+// Note 2: Vorbis.pm:53,59,65 declare MaximumBitrate / NominalBitrate /
+// MinimumBitrate as `Format => 'int32u'` (UNSIGNED). The Vorbis I
+// specification describes them as signed 32-bit integers; ExifTool emits
+// the unsigned reading. The port follows ExifTool.
+// Note 3: Vorbis identification fields are all LITTLE-ENDIAN
+// (`PROCESS_PROC => \&ProcessBinaryData` + no `ByteOrder` override on the
+// Identification table; the Vorbis I spec is LE, and Ogg.pm sets `II`
+// via `Image::ExifTool::SetByteOrder('II')` at Ogg.pm:101). Opus header
+// fields are also LE (RFC 7845 §5.1).
 // ===========================================================================
+
+/// Typed Vorbis-identification-packet payload (Vorbis.pm:40-70).
+///
+/// Holds the six fields the bundled `Vorbis::Identification` ProcessBinaryData
+/// table extracts from the `\x01vorbis` packet's 23-byte fixed-offset
+/// payload. Bitrate fields are `Option<u32>` so the RawConv
+/// `'$val || undef'` (Vorbis.pm:55,61,67) maps cleanly to `None` for a
+/// zero-bitrate field — bundled drops the tag entirely when the raw value
+/// is 0, so emission iterates `if let Some(_)`.
+///
+/// §1: no public fields. §3: accessor returns the primitive (Copy) directly,
+/// not a reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VorbisIdentification {
+  /// `Vorbis:VorbisVersion` (offset 0, int32u). Vorbis.pm:43-46.
+  vorbis_version: u32,
+  /// `Vorbis:AudioChannels` (offset 4, int8u). Vorbis.pm:47 — no explicit
+  /// Format ⇒ table's default `int8u`. Stored as u8 (faithful width).
+  audio_channels: u8,
+  /// `Vorbis:SampleRate` (offset 5, int32u). Vorbis.pm:48-51.
+  sample_rate: u32,
+  /// `Vorbis:MaximumBitrate` (offset 9, int32u). Vorbis.pm:52-57. RawConv
+  /// `'$val || undef'` ⇒ `None` when raw is 0 (bundled drops the tag).
+  maximum_bitrate: Option<u32>,
+  /// `Vorbis:NominalBitrate` (offset 13, int32u). Vorbis.pm:58-63.
+  nominal_bitrate: Option<u32>,
+  /// `Vorbis:MinimumBitrate` (offset 17, int32u). Vorbis.pm:64-69.
+  minimum_bitrate: Option<u32>,
+}
+
+impl VorbisIdentification {
+  /// `Vorbis:VorbisVersion` raw value (Vorbis.pm:43-46, int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vorbis_version(&self) -> u32 {
+    self.vorbis_version
+  }
+  /// `Vorbis:AudioChannels` raw value (Vorbis.pm:47, int8u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> u8 {
+    self.audio_channels
+  }
+  /// `Vorbis:SampleRate` raw value in Hz (Vorbis.pm:48-51, int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+  /// `Vorbis:MaximumBitrate` raw bps, or `None` when bundled-RawConv would
+  /// drop the tag (raw == 0). Vorbis.pm:52-57.
+  #[must_use]
+  #[inline(always)]
+  pub const fn maximum_bitrate(&self) -> Option<u32> {
+    self.maximum_bitrate
+  }
+  /// `Vorbis:NominalBitrate` raw bps, or `None` (raw == 0).
+  /// Vorbis.pm:58-63.
+  #[must_use]
+  #[inline(always)]
+  pub const fn nominal_bitrate(&self) -> Option<u32> {
+    self.nominal_bitrate
+  }
+  /// `Vorbis:MinimumBitrate` raw bps, or `None` (raw == 0).
+  /// Vorbis.pm:64-69.
+  #[must_use]
+  #[inline(always)]
+  pub const fn minimum_bitrate(&self) -> Option<u32> {
+    self.minimum_bitrate
+  }
+}
+
+/// Parse the Vorbis identification packet's payload (the bytes AFTER the
+/// `\x01vorbis` magic) into [`VorbisIdentification`]. Returns `None` if the
+/// payload is shorter than the 23-byte fixed window the
+/// `Vorbis::Identification` table reads (the last documented offset is 17,
+/// reading 4 bytes for `int32u` MinimumBitrate ⇒ offset 17..21; the table
+/// itself stops at 21 bytes total, but the Vorbis I spec packet trailer
+/// adds blocksize + framing for total 23 ⇒ we require at least 21).
+///
+/// Bundled `ProcessBinaryData` (ExifTool.pm `ProcessBinaryData`) reads only
+/// declared offsets; a short payload silently emits a subset of tags.
+/// Faithful behaviour: the bundled-Perl `ProcessBinaryData` `GetTagValue`
+/// returns `undef` for an out-of-bounds offset and `HandleTag` skips it.
+/// Our `None` mirrors that for a payload shorter than the largest declared
+/// offset+width (`17 + 4 = 21`).
+fn parse_vorbis_identification(payload: &[u8]) -> Option<VorbisIdentification> {
+  // Largest declared offset+width in %Vorbis::Identification: 17 + 4 = 21.
+  // Bundled would emit only the in-range subset; for the in-scope
+  // conformance fixtures every Vorbis packet payload is the full ~23-byte
+  // header, so this all-or-nothing rejection matches every observed input.
+  if payload.len() < 21 {
+    return None;
+  }
+  // `SetByteOrder('II')` (Ogg.pm:101) — every multi-byte field is LE.
+  let vorbis_version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+  let audio_channels = payload[4];
+  let sample_rate = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+  let read_bitrate = |offset: usize| -> Option<u32> {
+    let raw = u32::from_le_bytes([
+      payload[offset],
+      payload[offset + 1],
+      payload[offset + 2],
+      payload[offset + 3],
+    ]);
+    // RawConv `'$val || undef'` — drop zero. Vorbis.pm:55,61,67.
+    (raw != 0).then_some(raw)
+  };
+  Some(VorbisIdentification {
+    vorbis_version,
+    audio_channels,
+    sample_rate,
+    maximum_bitrate: read_bitrate(9),
+    nominal_bitrate: read_bitrate(13),
+    minimum_bitrate: read_bitrate(17),
+  })
+}
+
+/// Typed Opus-header-packet payload (Opus.pm:36-51).
+///
+/// Holds the four fields the bundled `Opus::Header` ProcessBinaryData table
+/// extracts from the `OpusHead` packet's 19-byte fixed-offset payload.
+/// `output_gain` is the POST-ValueConv computed gain (Opus.pm:49
+/// `ValueConv => '10 ** ($val/5120)'`); the raw `int16u` is converted at
+/// parse time to match the bundled `$val` ValueConv chain.
+///
+/// §1: no public fields. §3: accessor returns the primitive (Copy) directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpusHeader {
+  /// `Opus:OpusVersion` (offset 0, int8u). Opus.pm:39.
+  opus_version: u8,
+  /// `Opus:AudioChannels` (offset 1, int8u). Opus.pm:40.
+  audio_channels: u8,
+  /// `Opus:SampleRate` (offset 4, int32u). Opus.pm:42-45.
+  sample_rate: u32,
+  /// `Opus:OutputGain` post-ValueConv. Opus.pm:46-50 — raw int16u read at
+  /// offset 8, then `10 ** ($val/5120)`. Stored as `f64`.
+  output_gain: f64,
+}
+
+impl OpusHeader {
+  /// `Opus:OpusVersion` raw value (Opus.pm:39, int8u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn opus_version(&self) -> u8 {
+    self.opus_version
+  }
+  /// `Opus:AudioChannels` raw value (Opus.pm:40, int8u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn audio_channels(&self) -> u8 {
+    self.audio_channels
+  }
+  /// `Opus:SampleRate` raw value in Hz (Opus.pm:42-45, int32u).
+  #[must_use]
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+  /// `Opus:OutputGain` POST-ValueConv (Opus.pm:46-50: `10 ** ($val/5120)`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn output_gain(&self) -> f64 {
+    self.output_gain
+  }
+}
+
+/// Parse the Opus header packet's payload (the bytes AFTER the `OpusHead`
+/// magic) into [`OpusHeader`]. Returns `None` if the payload is shorter
+/// than the 10-byte fixed window the `Opus::Header` table reads (largest
+/// declared offset+width: `8 + 2 = 10`).
+fn parse_opus_header(payload: &[u8]) -> Option<OpusHeader> {
+  if payload.len() < 10 {
+    return None;
+  }
+  // Opus header fields are LE (RFC 7845 §5.1; ProcessBinaryData inherits
+  // `II` from Ogg.pm:101).
+  let opus_version = payload[0];
+  let audio_channels = payload[1];
+  // Note: offset 2 is `PreSkip` (int16u), commented out in Opus.pm:41
+  // — INTENTIONALLY not ported (commented in bundled ⇒ deliberately not
+  // emitted).
+  let sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+  let raw_gain = u16::from_le_bytes([payload[8], payload[9]]);
+  // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
+  // table; the post-ValueConv value is what bundled emits in both `-j`
+  // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
+  let output_gain = 10.0_f64.powf(f64::from(raw_gain) / 5120.0);
+  Some(OpusHeader {
+    opus_version,
+    audio_channels,
+    sample_rate,
+    output_gain,
+  })
+}
 
 // ===========================================================================
 // Vorbis comments — ProcessComments (Vorbis.pm:154-210)
@@ -710,19 +922,34 @@ enum OpusKind {
 /// dispatch sets it). The outcome enum only needs to track the
 /// override-file-type decision; the per-tag group survives via the staging
 /// `Tag::group()` accessor.
+///
+/// R2 F-OGG-TRIM extends the outcome with `VorbisId` and `OpusHeader`
+/// variants so the identification fields can bubble up to [`parse_inner`]
+/// for storage on [`Meta`]. The previous design used a `&mut Metadata`
+/// staging buffer for ALL tags; the typed-Meta lift preserves bundled
+/// emission order via dedicated fields rather than mixing identification
+/// scalars into the comment-list shape.
 #[derive(Debug, Clone, Copy)]
 enum PacketOutcome {
   /// No action — packet not recognised by `classify_packet`, OR the packet
   /// was a recognised non-override / non-comments arm (Vorbis setup-header,
-  /// identification-header deferral). Comments-only Vorbis::Comments
+  /// short Vorbis identification payload). Comments-only Vorbis::Comments
   /// packets (Vorbis packet_type=3 with default group1) also map here:
   /// `process_vorbis_comments` has already emitted into the staging
   /// metadata, and no override is needed.
   None,
+  /// Vorbis identification packet parsed (`\x01vorbis` + `Vorbis::
+  /// Identification` table — Vorbis.pm:30-33,40-70). No override (Vorbis
+  /// is the default OGG codec).
+  VorbisId(VorbisIdentification),
   /// `OverrideFileType` to the given type (Ogg.pm:49 → "OGV"; :50 → "OPUS").
   /// Comments may OR may not have been processed alongside (Theora 0x81
   /// + Opus `OpusTags` both fire override AND comments).
   Override { file_type: &'static str },
+  /// Opus header packet parsed (`OpusHead` + `Opus::Header` table —
+  /// Opus.pm:36-51). ALSO carries the `OPUS` override (Ogg.pm:50 fires
+  /// whenever the `OpusHead` packet is recognised).
+  OpusHeader(OpusHeader),
   /// FLAC-in-Ogg `\x7fFLAC` — deferred (FLAC port not landed yet).
   /// Silent no-op preserves "container OK, no codec tags".
   FlacDeferred,
@@ -731,16 +958,16 @@ enum PacketOutcome {
 /// Faithful `ProcessPacket` (Ogg.pm:42-69) — dispatch one assembled packet
 /// to its codec's comments handler. The `OverrideFileType('OGV')` /
 /// `OverrideFileType('OPUS')` calls (Ogg.pm:49-50) live here and fire
-/// whenever a Theora / Opus header packet is seen, regardless of whether
-/// the identification-binary table is ported.
+/// whenever a Theora / Opus header packet is seen.
 ///
-/// **Scope tightening (R1 F2):** the identification-binary-table arms
-/// (Vorbis packet_type=1 → `Vorbis::Identification`; Theora packet_type
-/// =0x80 → `Theora::Identification`; Opus `OpusHead` → `Opus::Header`)
-/// are DEFERRED to dedicated `Vorbis.pm` / `Opus.pm` / `Theora.pm` PRs —
-/// see the top-of-module comment. Only the Vorbis-comments-block arms
-/// (Vorbis packet_type=3, Theora packet_type=0x81, Opus `OpusTags`) are
-/// in scope here.
+/// **R2 F-OGG-TRIM:** the Vorbis::Identification and Opus::Header
+/// binary-table arms are NOW IN SCOPE (round-2 review showed the R1
+/// deferral was creating goldens hand-trims). The Vorbis `packet_type=1`
+/// arm parses `\x01vorbis` → [`PacketOutcome::VorbisId`]; the Opus
+/// `OpusHead` arm parses → [`PacketOutcome::OpusHeader`] (which also
+/// carries the `OPUS` override). Theora `\x80theora` →
+/// `Theora::Identification` remains deferred (no Theora fixture; on the
+/// dedicated Theora.pm queue).
 fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8]) -> PacketOutcome {
   let Some(kind) = classify_packet(buff) else {
     return PacketOutcome::None;
@@ -755,10 +982,17 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
       // `payload_start.. .to_vec()` copy was avoidable.
       match packet_type {
         1 => {
-          // Vorbis::Identification (Vorbis.pm:30-33) — DEFERRED (R1 F2);
-          // see top-of-module note. The bundled-Perl dispatch would
-          // ProcessBinaryData over `%Vorbis::Identification` here.
-          PacketOutcome::None
+          // Vorbis::Identification (Vorbis.pm:30-33, 40-70). R2 F-OGG-TRIM:
+          // parse the 21-byte fixed-offset binary table. A short payload
+          // (under 21 bytes) returns `None` from `parse_vorbis_identification`,
+          // mirroring bundled `ProcessBinaryData`'s skip-on-out-of-bounds
+          // semantics; in that case the outcome is `None` so the
+          // identification fields are silently absent (bundled behaviour
+          // exactly).
+          match parse_vorbis_identification(&buff[payload_start..]) {
+            Some(id) => PacketOutcome::VorbisId(id),
+            None => PacketOutcome::None,
+          }
         }
         3 => {
           // Vorbis::Comments (Vorbis.pm:34-37). No override; comments
@@ -784,8 +1018,12 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
       // Slice borrow rather than `to_vec()`: downstream accepts `&[u8]`.
       match packet_type {
         0x80 => {
-          // Theora::Identification (Theora.pm:42-104) — DEFERRED (R1 F2);
-          // see top-of-module note.
+          // Theora::Identification (Theora.pm:42-104) — STILL DEFERRED.
+          // Theora is a VIDEO codec with a larger table (rational pixel
+          // aspect, framerate, etc.) and we have no Ogg-Theora fixture
+          // in the corpus. Queued for a dedicated Theora.pm PR; the
+          // `OverrideFileType('OGV')` continues to fire on any
+          // `\x80theora` packet seen.
           PacketOutcome::Override { file_type: "OGV" }
         }
         0x81 => {
@@ -818,11 +1056,14 @@ fn process_packet(staging: &mut Metadata, print_conv_enabled: bool, buff: &[u8])
       // Slice borrow rather than `to_vec()`: downstream accepts `&[u8]`.
       match kind {
         OpusKind::Head => {
-          // Opus::Header (Opus.pm:36-51) — DEFERRED (R1 F2); see
-          // top-of-module note. The `OpusHead` packet is still observed
-          // (classify_packet recognises it) so the `OverrideFileType`
-          // above fires; we just don't extract the binary fields.
-          PacketOutcome::Override { file_type: "OPUS" }
+          // Opus::Header (Opus.pm:36-51). R2 F-OGG-TRIM: parse the 10-byte
+          // fixed-offset binary table. A short payload returns `None`
+          // from `parse_opus_header` (mirroring bundled out-of-bounds
+          // skip); in that case fall back to override-only.
+          match parse_opus_header(&buff[payload_start..]) {
+            Some(header) => PacketOutcome::OpusHeader(header),
+            None => PacketOutcome::Override { file_type: "OPUS" },
+          }
         }
         OpusKind::Tags => {
           // Opus.pm:32 delegates to Vorbis::Comments with the default
@@ -912,6 +1153,20 @@ pub struct Meta<'a> {
   /// The bridge calls `ctx.override_file_type(value, None, None)` after
   /// `SetFileType('OGG')` to mirror bundled in-place mutation.
   file_type_override: Option<&'static str>,
+  /// R2 F-OGG-TRIM: Vorbis identification fields parsed from the
+  /// `\x01vorbis` packet (Vorbis.pm:40-70). `None` when no Vorbis
+  /// identification packet was seen, OR when the payload was shorter than
+  /// the 21-byte fixed window the table reads. Emits at the bundled
+  /// emission position: BEFORE the Vorbis comment block (vendor + KEY=VALUE
+  /// pairs) for a Vorbis-only stream, BEFORE comments for Opus too if the
+  /// stream is mixed (real-world Opus uses `Opus:*` only; Vorbis ID +
+  /// Opus header don't coexist in a single stream by spec).
+  vorbis_identification: Option<VorbisIdentification>,
+  /// R2 F-OGG-TRIM: Opus header fields parsed from the `OpusHead` packet
+  /// (Opus.pm:36-51). `None` when no `OpusHead` packet was seen, OR when
+  /// the payload was shorter than the 10-byte fixed window the table reads.
+  /// Emits before the Vorbis-comment block on the same stream.
+  opus_header: Option<OpusHeader>,
   /// Emitted comment tags in bundled emission order (vendor first, then
   /// KEY=VALUE in encounter order; list-tags coalesced at first-occurrence
   /// position).
@@ -1119,6 +1374,25 @@ impl Meta<'_> {
     self.file_type_override
   }
 
+  /// Vorbis identification-packet fields (Vorbis.pm:40-70), or `None` if
+  /// no `\x01vorbis` identification packet was parsed for this stream.
+  /// Emits at bundled position — BEFORE the comment block. The contained
+  /// value is `Copy` so the accessor returns it by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vorbis_identification(&self) -> Option<VorbisIdentification> {
+    self.vorbis_identification
+  }
+
+  /// Opus header-packet fields (Opus.pm:36-51), or `None` if no `OpusHead`
+  /// packet was parsed. The contained value is `Copy` so the accessor
+  /// returns it by value (§3).
+  #[must_use]
+  #[inline(always)]
+  pub const fn opus_header(&self) -> Option<OpusHeader> {
+    self.opus_header
+  }
+
   /// The emitted comment tags in bundled emission order. Each item is an
   /// [`Comment`] newtype arm with the resolved family-1 group, tag name,
   /// and value. §3 slice projection — returns `&[Comment]`, never
@@ -1235,6 +1509,13 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
   // bundled — bundled `OverrideFileType` is idempotent for equal values
   // and does nothing for already-overridden, per ExifTool.pm:9715).
   let mut file_type_override: Option<&'static str> = None;
+  // R2 F-OGG-TRIM: identification fields. First-seen wins for the same
+  // reason `file_type_override` is first-wins: bundled `ProcessBinaryData`
+  // emits the FIRST occurrence's value through `HandleTag`, and the
+  // FoundTag de-dup is `(group, name)` ⇒ subsequent occurrences for the
+  // same tag are dropped by `%NO_DUPS` priority (ExifTool.pm:9540).
+  let mut vorbis_identification: Option<VorbisIdentification> = None;
+  let mut opus_header: Option<OpusHeader> = None;
 
   loop {
     // Ogg.pm:94 `if ($raf and $raf->Read($buff, 28) == 28)` — the page
@@ -1308,7 +1589,12 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     if val.contains_key(&current_stream) && current_flag & 0x01 == 0 {
       let owned = val.remove(&current_stream).unwrap();
       let outcome = process_packet(&mut staging, print_conv_enabled, &owned);
-      update_override(&mut file_type_override, &outcome);
+      record_outcome(
+        &mut file_type_override,
+        &mut vorbis_identification,
+        &mut opus_header,
+        &outcome,
+      );
       // Ogg.pm:133-136: stop if MAX_PACKETS reached AND no pending vals.
       if (packet_count > MAX_PACKETS.saturating_mul(stream_count) || raf_done) && val.is_empty() {
         break;
@@ -1378,7 +1664,12 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     if current_flag & 0x04 != 0 && val.contains_key(&current_stream) {
       let owned = val.remove(&current_stream).unwrap();
       let outcome = process_packet(&mut staging, print_conv_enabled, &owned);
-      update_override(&mut file_type_override, &outcome);
+      record_outcome(
+        &mut file_type_override,
+        &mut vorbis_identification,
+        &mut opus_header,
+        &outcome,
+      );
     }
     cursor = page_data_end;
   }
@@ -1395,6 +1686,8 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
   let comments: Vec<Comment> = staging.tags_slice().iter().map(tag_to_comment).collect();
   Ok(Some(Meta {
     file_type_override,
+    vorbis_identification,
+    opus_header,
     comments,
     warnings,
     success,
@@ -1402,19 +1695,43 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
   }))
 }
 
-/// First-wins override accumulator. Bundled `OverrideFileType`
+/// First-wins outcome reducer. Bundled `OverrideFileType`
 /// (ExifTool.pm:9715) is idempotent for equal values and does nothing for
-/// already-overridden values; we record the FIRST non-`None` outcome and
-/// ignore subsequent ones to match.
-fn update_override(state: &mut Option<&'static str>, outcome: &PacketOutcome) {
-  let candidate: Option<&'static str> = match outcome {
-    PacketOutcome::None | PacketOutcome::FlacDeferred => None,
-    PacketOutcome::Override { file_type } => Some(*file_type),
-  };
-  if let Some(c) = candidate
-    && state.is_none()
-  {
-    *state = Some(c);
+/// already-overridden values; bundled `FoundTag` (ExifTool.pm:9505-9520)
+/// drops duplicate emissions for the same `(group, name)`. Both behaviours
+/// collapse to "first-wins" for each of the three state slots.
+fn record_outcome(
+  override_state: &mut Option<&'static str>,
+  vorbis_id_state: &mut Option<VorbisIdentification>,
+  opus_header_state: &mut Option<OpusHeader>,
+  outcome: &PacketOutcome,
+) {
+  match outcome {
+    PacketOutcome::None | PacketOutcome::FlacDeferred => {}
+    PacketOutcome::Override { file_type } => {
+      if override_state.is_none() {
+        *override_state = Some(*file_type);
+      }
+    }
+    PacketOutcome::VorbisId(id) => {
+      if vorbis_id_state.is_none() {
+        *vorbis_id_state = Some(*id);
+      }
+      // Vorbis identification packets do NOT trigger a file-type override
+      // (Ogg.pm:49-50 only fire for Theora / Opus); Vorbis is the default
+      // OGG codec ⇒ no override needed.
+    }
+    PacketOutcome::OpusHeader(header) => {
+      if opus_header_state.is_none() {
+        *opus_header_state = Some(*header);
+      }
+      // Opus.pm:50 fires `OverrideFileType('OPUS')` whenever an `OpusHead`
+      // packet is recognised, regardless of whether the binary table is
+      // fully decodable.
+      if override_state.is_none() {
+        *override_state = Some("OPUS");
+      }
+    }
   }
 }
 
@@ -1494,27 +1811,75 @@ pub enum Error {}
 
 #[cfg(feature = "alloc")]
 impl Meta<'_> {
-  /// Emit OGG tags into the writer in bundled emission order — vendor
-  /// first, then comments in encounter order with list-tags coalesced at
-  /// first occurrence (faithful FoundTag — ExifTool.pm:9505-9520),
-  /// followed by accumulated warnings.
+  /// Emit OGG tags into the writer in bundled emission order:
+  ///   1. Vorbis identification fields (when present), Vorbis.pm:40-70
+  ///      order: VorbisVersion / AudioChannels / SampleRate /
+  ///      MaximumBitrate / NominalBitrate / MinimumBitrate.
+  ///   2. Opus header fields (when present), Opus.pm:36-51 order:
+  ///      OpusVersion / AudioChannels / SampleRate / OutputGain.
+  ///   3. Vorbis comments in encounter order — vendor first, then KEY=VALUE
+  ///      pairs (list-tags coalesced at first occurrence — faithful
+  ///      FoundTag, ExifTool.pm:9505-9520).
+  ///   4. Accumulated warnings.
   ///
   /// **NOTE:** `File:FileType*` / file-type override is NOT emitted here.
   /// That's the bridge's responsibility (the engine entry `process`):
   /// `SetFileType` precedes the Vorbis:* tags in bundled output, but the
   /// pseudo-File:* tags belong to the engine's `ParseContext::set_file_
   /// type` path (not the per-format `serialize_tags`). The `serialize_tags` only
-  /// writes Vorbis:* / Theora:* tags + warnings.
+  /// writes Vorbis:* / Opus:* / Theora:* tags + warnings.
   ///
   /// `print_conv = true` matches bundled `perl exiftool -j`; `false`
-  /// matches `-j -n`. For OGG today every known tag has `PrintConv::None`,
-  /// so the toggle is mostly cosmetic — the bridge consumes both values
-  /// of the toggle and routes byte-exact via the serializer.
+  /// matches `-j -n`. The toggle drives:
+  ///   * Vorbis bitrate fields: `-j` → `ConvertBitrate("32000")` = `"32 kbps"`;
+  ///     `-j -n` → raw u32 (`32000`).
+  ///   * Other identification fields (VorbisVersion/AudioChannels/SampleRate,
+  ///     OpusVersion/AudioChannels/SampleRate): no PrintConv ⇒ raw u32/u8
+  ///     in both modes.
+  ///   * Opus OutputGain: ValueConv `10**($val/5120)` runs in BOTH modes
+  ///     (it's a ValueConv, not a PrintConv); the toggle has no effect.
   pub(crate) fn serialize_tags(
     &self,
-    _print_conv: bool,
+    print_conv: bool,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
+    // 1. Vorbis identification (Vorbis.pm:40-70). Emit in DECLARED OFFSET
+    //    order: VorbisVersion (0), AudioChannels (4), SampleRate (5),
+    //    MaximumBitrate (9), NominalBitrate (13), MinimumBitrate (17).
+    //    Bundled `ProcessBinaryData` iterates the table in offset order,
+    //    so the JSON emission order matches.
+    if let Some(id) = self.vorbis_identification {
+      out.write_u64("Vorbis", "VorbisVersion", u64::from(id.vorbis_version()))?;
+      out.write_u64("Vorbis", "AudioChannels", u64::from(id.audio_channels()))?;
+      out.write_u64("Vorbis", "SampleRate", u64::from(id.sample_rate()))?;
+      // Bitrate fields: RawConv `$val || undef` drops the zero case
+      // (already filtered to `None` in `parse_vorbis_identification`);
+      // PrintConv runs `ConvertBitrate` for `-j`, raw bps for `-j -n`.
+      if let Some(bps) = id.maximum_bitrate() {
+        emit_bitrate(out, "MaximumBitrate", bps, print_conv)?;
+      }
+      if let Some(bps) = id.nominal_bitrate() {
+        emit_bitrate(out, "NominalBitrate", bps, print_conv)?;
+      }
+      if let Some(bps) = id.minimum_bitrate() {
+        emit_bitrate(out, "MinimumBitrate", bps, print_conv)?;
+      }
+    }
+    // 2. Opus header (Opus.pm:36-51). DECLARED OFFSET order: OpusVersion
+    //    (0), AudioChannels (1), SampleRate (4), OutputGain (8).
+    if let Some(h) = self.opus_header {
+      out.write_u64("Opus", "OpusVersion", u64::from(h.opus_version()))?;
+      out.write_u64("Opus", "AudioChannels", u64::from(h.audio_channels()))?;
+      out.write_u64("Opus", "SampleRate", u64::from(h.sample_rate()))?;
+      // OutputGain post-ValueConv (`10**(raw/5120)`). Bundled emits this
+      // as a bare number — `1` when raw is 0 (the common in-spec case);
+      // for non-zero raw the f64 result is emitted via the JSON-number
+      // gate (the serializer already handles integer-valued f64 ⇒ no `.0`,
+      // matching Perl's stringification of `1`).
+      out.write_f64("Opus", "OutputGain", h.output_gain())?;
+    }
+    // 3. Vorbis comments (vendor + KEY=VALUE) — encounter order with
+    //    list-coalescing.
     for comment in &self.comments {
       match comment {
         Comment::Scalar(s) => {
@@ -1535,13 +1900,35 @@ impl Meta<'_> {
         }
       }
     }
-    // Warnings emit in occurrence order. The engine `TagMap` routes
-    // these to its `warnings()` accumulator (ExifTool:Warning surface);
-    // `TagMap` collects into a `warnings()` vec.
+    // 4. Warnings emit in occurrence order. The engine `TagMap` routes
+    //    these to its `warnings()` accumulator (ExifTool:Warning surface);
+    //    `TagMap` collects into a `warnings()` vec.
     for w in &self.warnings {
       out.write_warning(w)?;
     }
     Ok(())
+  }
+}
+
+/// Emit a Vorbis bitrate field (`MaximumBitrate` / `NominalBitrate` /
+/// `MinimumBitrate`). `bps` is the raw u32 value (already filtered against
+/// the `$val || undef` RawConv). PrintConv path goes through
+/// [`crate::convert::write_convert_bitrate`] for the human-readable
+/// `"X kbps"`/`"X.X Mbps"` form (the bundled `ConvertBitrate`); the
+/// `-n` (no-PrintConv) path emits the raw u32 as a bare JSON integer.
+#[cfg(feature = "alloc")]
+fn emit_bitrate(
+  out: &mut crate::tagmap::TagMap,
+  name: &str,
+  bps: u32,
+  print_conv: bool,
+) -> Result<(), core::convert::Infallible> {
+  if print_conv {
+    out.write_fmt("Vorbis", name, |w| {
+      crate::convert::write_convert_bitrate(w, f64::from(bps))
+    })
+  } else {
+    out.write_u64("Vorbis", name, u64::from(bps))
   }
 }
 
@@ -1558,12 +1945,11 @@ mod tests {
   use super::*;
   use crate::tagmap::TagMap;
 
-  // `convert_bitrate` unit-tests REMOVED (R1 F2): `convert_bitrate` is a
-  // PrintConv helper used only by the now-deferred Vorbis/Theora codec
-  // binary tables. The engine-level `convert::convert_bitrate` (faithful
-  // to ExifTool.pm:6891-6902) remains and its own engine-tier tests cover
-  // the breakpoints — the duplicate cover here was only useful while the
-  // Ogg PR was the first consumer of it.
+  // `convert_bitrate` unit-tests live next to the helper in `convert.rs`
+  // (the helper itself moved out of `formats/moi.rs` into `convert.rs` in
+  // R2 F-OGG-TRIM so both `formats/moi.rs` and `formats/ogg.rs` can share
+  // the faithful port). The breakpoints under `moi::tests` already cover
+  // the bundled oracle (50, 999, 1000, 32000, 128000, 224000, 8.5e6, 1.5e9).
 
   #[test]
   fn base64_decode_examples() {
@@ -1802,14 +2188,18 @@ mod tests {
     assert_eq!(meta.warnings_slice()[0], "Format error in Vorbis comments");
   }
 
-  // Tests `vorbis_identification_format_lookup`,
-  // `process_vorbis_comments_zero_nominal_bitrate_dropped`,
-  // `process_binary_data_opus_header_extracts_fields`, and
-  // `binary_format_rational64u_emits_rational` REMOVED (R1 F2): they
-  // exercise the deferred codec-identification binary tables and
-  // `process_binary_data` / `read_binary` engine subset. The Vorbis/Opus
-  // /Theora codec PRs that re-land those tables will re-derive these
-  // tests against bundled-Perl oracle fixtures.
+  // R2 F-OGG-TRIM: the Vorbis::Identification + Opus::Header binary
+  // tables are NOW ported here, see the `parse_vorbis_identification` +
+  // `parse_opus_header` helpers and their unit tests
+  // (`vorbis_identification_typical_payload`,
+  // `vorbis_identification_short_payload_rejected`,
+  // `vorbis_identification_all_bitrates_nonzero`,
+  // `opus_header_typical_payload`, `opus_header_nonzero_output_gain`,
+  // `opus_header_short_payload_rejected`,
+  // `vorbis_identification_emits_in_declared_offset_order`,
+  // `vorbis_identification_n_mode_emits_raw_bitrate`,
+  // `opus_header_serialize_emits_declared_order`). Theora::Identification
+  // remains deferred until the dedicated Theora.pm PR.
 
   #[test]
   fn process_vorbis_comments_with_group1_retags_to_theora() {
@@ -1879,6 +2269,8 @@ mod tests {
     // serialize_tags emits both via write_str.
     let meta = Meta {
       file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
       comments: vec![
         Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "test vendor")),
         Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
@@ -1906,6 +2298,8 @@ mod tests {
     use crate::value::TagValue;
     let meta = Meta {
       file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
       comments: vec![
         // A scalar BEFORE the list to pin first-occurrence position.
         Comment::Scalar(CommentScalar::new("Vorbis", "Title", "Song")),
@@ -1938,6 +2332,8 @@ mod tests {
     // routes them to write_warning.
     let meta = Meta {
       file_type_override: None,
+      vorbis_identification: None,
+      opus_header: None,
       comments: vec![],
       warnings: vec![
         SmolStr::from("Lost synchronization"),
@@ -1973,6 +2369,8 @@ mod tests {
     // phantom). Verify field accessors round-trip.
     let meta = Meta {
       file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: None,
       comments: vec![Comment::Scalar(CommentScalar::new("Vorbis", "Vendor", "v"))],
       warnings: vec![SmolStr::from("Lost synchronization")],
       success: true,
@@ -1986,6 +2384,216 @@ mod tests {
     let c = &meta.comments()[0];
     assert!(c.is_scalar());
     assert_eq!(c.unwrap_scalar_ref().value(), "v");
+  }
+
+  #[test]
+  fn vorbis_identification_typical_payload() {
+    // Synthetic Vorbis identification payload — 21 bytes minimum:
+    //   offset 0..4   VorbisVersion = 0 (little-endian u32)
+    //   offset 4      AudioChannels = 2
+    //   offset 5..9   SampleRate = 44100
+    //   offset 9..13  MaximumBitrate = 0 (RawConv `$val || undef` ⇒ None)
+    //   offset 13..17 NominalBitrate = 128000
+    //   offset 17..21 MinimumBitrate = 0 ⇒ None
+    let mut payload = [0u8; 23];
+    // VorbisVersion = 0 (already zeroed)
+    payload[4] = 2; // AudioChannels = 2
+    payload[5..9].copy_from_slice(&44100u32.to_le_bytes()); // SampleRate
+    // MaximumBitrate = 0 (already zeroed)
+    payload[13..17].copy_from_slice(&128_000u32.to_le_bytes()); // NominalBitrate
+    // MinimumBitrate = 0
+    let id = parse_vorbis_identification(&payload).expect("21-byte payload accepted");
+    assert_eq!(id.vorbis_version(), 0);
+    assert_eq!(id.audio_channels(), 2);
+    assert_eq!(id.sample_rate(), 44100);
+    assert_eq!(
+      id.maximum_bitrate(),
+      None,
+      "zero bitrate dropped via RawConv"
+    );
+    assert_eq!(id.nominal_bitrate(), Some(128_000));
+    assert_eq!(id.minimum_bitrate(), None);
+  }
+
+  #[test]
+  fn vorbis_identification_short_payload_rejected() {
+    // Bundled ProcessBinaryData treats a short payload (under 21 bytes,
+    // the largest declared offset+width) as a partial table that emits
+    // only the in-range subset. Our coarser policy is all-or-nothing
+    // rejection (the in-scope conformance fixtures all have >= 21 bytes),
+    // so a 20-byte payload returns None.
+    let payload = [0u8; 20];
+    assert!(parse_vorbis_identification(&payload).is_none());
+  }
+
+  #[test]
+  fn vorbis_identification_all_bitrates_nonzero() {
+    // All three bitrate fields non-zero: each becomes Some(raw).
+    let mut payload = [0u8; 21];
+    payload[4] = 1;
+    payload[5..9].copy_from_slice(&48_000u32.to_le_bytes());
+    payload[9..13].copy_from_slice(&320_000u32.to_le_bytes());
+    payload[13..17].copy_from_slice(&192_000u32.to_le_bytes());
+    payload[17..21].copy_from_slice(&64_000u32.to_le_bytes());
+    let id = parse_vorbis_identification(&payload).unwrap();
+    assert_eq!(id.audio_channels(), 1);
+    assert_eq!(id.sample_rate(), 48_000);
+    assert_eq!(id.maximum_bitrate(), Some(320_000));
+    assert_eq!(id.nominal_bitrate(), Some(192_000));
+    assert_eq!(id.minimum_bitrate(), Some(64_000));
+  }
+
+  #[test]
+  fn opus_header_typical_payload() {
+    // Synthetic Opus header payload — at least 10 bytes:
+    //   offset 0   OpusVersion = 1
+    //   offset 1   AudioChannels = 2
+    //   offset 2..4 PreSkip (int16u, NOT emitted per Opus.pm:41 comment)
+    //   offset 4..8 SampleRate = 48000 (int32u LE)
+    //   offset 8..10 OutputGain raw int16u = 0 ⇒ 10**(0/5120) = 1.0
+    let mut payload = [0u8; 19];
+    payload[0] = 1;
+    payload[1] = 2;
+    payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
+    // OutputGain raw stays 0.
+    let header = parse_opus_header(&payload).expect("10-byte payload accepted");
+    assert_eq!(header.opus_version(), 1);
+    assert_eq!(header.audio_channels(), 2);
+    assert_eq!(header.sample_rate(), 48_000);
+    // 10 ** (0 / 5120) = 10^0 = 1.0 exactly.
+    assert!((header.output_gain() - 1.0).abs() < 1e-12);
+  }
+
+  #[test]
+  fn opus_header_nonzero_output_gain() {
+    // OutputGain raw = 5120 ⇒ 10**(5120/5120) = 10.0
+    let mut payload = [0u8; 10];
+    payload[0] = 1;
+    payload[1] = 1;
+    payload[4..8].copy_from_slice(&48_000u32.to_le_bytes());
+    payload[8..10].copy_from_slice(&5120u16.to_le_bytes());
+    let header = parse_opus_header(&payload).unwrap();
+    assert!(
+      (header.output_gain() - 10.0).abs() < 1e-10,
+      "10^(5120/5120) must be exactly 10.0, got {}",
+      header.output_gain()
+    );
+  }
+
+  #[test]
+  fn opus_header_short_payload_rejected() {
+    // Below the 10-byte minimum (offset 8 + width 2).
+    let payload = [0u8; 9];
+    assert!(parse_opus_header(&payload).is_none());
+  }
+
+  #[test]
+  fn vorbis_identification_emits_in_declared_offset_order() {
+    // serialize_tags emits the Vorbis identification fields in DECLARED
+    // OFFSET order (Vorbis.pm:40-70): VorbisVersion / AudioChannels /
+    // SampleRate / MaximumBitrate? / NominalBitrate? / MinimumBitrate?.
+    // Zero-bitrate fields are dropped (RawConv `$val || undef`).
+    let meta = Meta {
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: 0,
+        audio_channels: 2,
+        sample_rate: 44100,
+        maximum_bitrate: None,
+        nominal_bitrate: Some(128_000),
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    // The insertion order is exactly the declared-offset order: every key
+    // present in the map appears, NOT including the dropped bitrate fields.
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Vorbis:VorbisVersion",
+        "Vorbis:AudioChannels",
+        "Vorbis:SampleRate",
+        "Vorbis:NominalBitrate",
+      ],
+      "declared-offset emission order"
+    );
+    // PrintConv on ⇒ NominalBitrate renders via ConvertBitrate ("128 kbps").
+    assert_eq!(
+      tm.get_str("Vorbis", "NominalBitrate"),
+      Some("128 kbps".to_string()),
+      "PrintConv ConvertBitrate output"
+    );
+  }
+
+  #[test]
+  fn vorbis_identification_n_mode_emits_raw_bitrate() {
+    // `print_conv = false` ⇒ raw u32 bps (no ConvertBitrate). Pins the
+    // `-n` mode emission shape for the bitrate fields.
+    let meta = Meta {
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: 0,
+        audio_channels: 2,
+        sample_rate: 44100,
+        maximum_bitrate: None,
+        nominal_bitrate: Some(128_000),
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(false, &mut tm).unwrap();
+    // -n: NominalBitrate is the raw u32 = 128000 — written via write_u64,
+    // so the TagMap holds a U64 value, not a Str.
+    let v = tm.get("Vorbis", "NominalBitrate").expect("present");
+    match v {
+      TagValue::U64(n) => assert_eq!(*n, 128_000),
+      other => panic!("expected U64(128000), got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn opus_header_serialize_emits_declared_order() {
+    // Opus.pm:36-51 declared-offset order: OpusVersion / AudioChannels /
+    // SampleRate / OutputGain.
+    let meta = Meta {
+      file_type_override: Some("OPUS"),
+      vorbis_identification: None,
+      opus_header: Some(OpusHeader {
+        opus_version: 1,
+        audio_channels: 2,
+        sample_rate: 48_000,
+        output_gain: 1.0,
+      }),
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut tm = TagMap::new();
+    meta.serialize_tags(true, &mut tm).unwrap();
+    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    assert_eq!(
+      keys,
+      vec![
+        "Opus:OpusVersion",
+        "Opus:AudioChannels",
+        "Opus:SampleRate",
+        "Opus:OutputGain",
+      ],
+      "declared-offset emission order"
+    );
   }
 
   #[test]

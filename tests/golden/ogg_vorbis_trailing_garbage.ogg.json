@@ -4,5 +4,9 @@
   "File:FileType": "OGG",
   "File:FileTypeExtension": "ogg",
   "File:MIMEType": "audio/ogg",
+  "Vorbis:VorbisVersion": 0,
+  "Vorbis:AudioChannels": 2,
+  "Vorbis:SampleRate": 44100,
+  "Vorbis:NominalBitrate": "128 kbps",
   "Vorbis:Vendor": "test"
 }]

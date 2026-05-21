@@ -4,6 +4,10 @@
   "File:FileType": "OPUS",
   "File:FileTypeExtension": "OPUS",
   "File:MIMEType": "audio/ogg",
+  "Opus:OpusVersion": 1,
+  "Opus:AudioChannels": 2,
+  "Opus:SampleRate": 48000,
+  "Opus:OutputGain": 1,
   "Vorbis:Vendor": "libopus 1.5 synth",
   "Vorbis:Title": "Synth Tone",
   "Vorbis:Artist": "exifast tests"

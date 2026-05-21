@@ -132,13 +132,14 @@ fn dv_unknown_profile_conformance() {
 fn ogg_conformance() {
   // FORMATS.md row 9 (Ogg + Vorbis-comments): a real Ogg-Vorbis fixture
   // from the bundled-ExifTool corpus. The committed golden is bundled
-  // `perl exiftool -j -G1 -struct ... -x Composite:all -x
-  // Vorbis:{VorbisVersion,AudioChannels,SampleRate,NominalBitrate,
-  // MaximumBitrate,MinimumBitrate}`: `Composite:Duration` is deferred (no
-  // Composite engine yet) and the Vorbis identification-binary fields
-  // are deferred (R1 F2 scope tightening — see `src/formats/ogg.rs`
-  // module docs). Every emitted tag is byte-exact with bundled Perl,
-  // both with PrintConv on (default) and `-n`.
+  // `perl exiftool -j -G1 -struct ... -x Composite:all`:
+  // `Composite:Duration` is the only hand-trim (Composite engine is on
+  // the accepted-deferral list — see `docs/tracking.md` → "Residual
+  // (still in accepted-deferral list)"). Every emitted tag —
+  // including the `Vorbis:VorbisVersion` / `Vorbis:AudioChannels` /
+  // `Vorbis:SampleRate` / `Vorbis:NominalBitrate` identification fields
+  // ported in R2 F-OGG-TRIM — is value-equivalent to bundled Perl in both
+  // PrintConv-on (default) and `-n` modes.
   check("Vorbis.ogg", "Vorbis.ogg.json", true);
   check("Vorbis.ogg", "Vorbis.ogg.n.json", false);
 }
@@ -181,7 +182,9 @@ fn ogg_vorbis_trailing_garbage_conformance() {
   // The Codex round-2 finding claimed bundled ExifTool emits
   // `ExifTool:Warning => 'Format error in Vorbis comments'` on this input.
   // EMPIRICAL EVIDENCE (this committed golden, captured from bundled
-  // `perl exiftool`): NO `ExifTool:Warning` is emitted — only `Vorbis:Vendor`.
+  // `perl exiftool`): NO `ExifTool:Warning` is emitted — only the Vorbis
+  // identification fields (`VorbisVersion`/`AudioChannels`/`SampleRate`/
+  // `NominalBitrate` — R2 F-OGG-TRIM port) plus `Vorbis:Vendor`.
   //
   // The reason (Vorbis.pm:157-210): `ProcessComments` reads the vendor in
   // the FIRST loop iteration (line 175 else-branch), sets `$num =
@@ -227,11 +230,10 @@ fn ogg_vorbis_interleaved_list_conformance() {
   // routes them through `Metadata::push_listable` at encounter time —
   // identical seam to FLAC's Vorbis-comment path (`flac.rs:888-895`).
   //
-  // Identification-header tags (`Vorbis:VorbisVersion`, `:AudioChannels`,
-  // `:SampleRate`) are excluded from the goldens via `-x` because the
-  // `Vorbis::Identification` binary table port is deferred to a dedicated
-  // Vorbis.pm PR (`process_packet` R1-F2 scope note in ogg.rs); the
-  // ID-header tags appear in bundled output but not yet in exifast.
+  // R2 F-OGG-TRIM: identification-header tags (`Vorbis:VorbisVersion`,
+  // `:AudioChannels`, `:SampleRate`) are now PORTED and present in the
+  // golden — the R1-F2 deferral was reversed when the round-2 review
+  // showed it forced new hand-trims that the 1:1 bar disallows.
   check(
     "ogg_vorbis_interleaved_list.ogg",
     "ogg_vorbis_interleaved_list.ogg.json",
@@ -374,10 +376,10 @@ fn ogg_vorbis_specialkeys_conformance() {
   //     nominal_bitrate=128000, blocksize0/1=0xB8, framing=1).
   //   - Page (header_type=0x00, seq=1): `\x03vorbis` comment packet
   //     with vendor="test vendor" + 11 KEY=VALUE comments + framing=1.
-  // Composite:Duration and the Vorbis identification-binary fields
-  // (VorbisVersion/AudioChannels/SampleRate/NominalBitrate/...) are
-  // deferred (R1 F2 scope tightening) so the golden excludes them via
-  // `-x Composite:all -x Vorbis:{VorbisVersion,AudioChannels,...}`.
+  // R2 F-OGG-TRIM: identification-binary fields (VorbisVersion /
+  // AudioChannels / SampleRate / NominalBitrate) are now PORTED and
+  // present in the golden — only `Composite:Duration` is hand-trimmed
+  // (accepted-deferral; see `docs/tracking.md`).
   check(
     "synthetic_vorbis_specialkeys.ogg",
     "synthetic_vorbis_specialkeys.ogg.json",
@@ -398,11 +400,11 @@ fn ogg_opus_synthetic_conformance() {
   // `Opus.opus` corpus fixture's `METADATA_BLOCK_PICTURE` which
   // SubDirectory-hops into `FLAC::Picture` (DEFERRED — see Picture
   // forward-items entry). Exercises `OverrideFileType('OPUS')`
-  // (Ogg.pm:50) firing on the `OpusHead` packet, AND the `OpusTags`
-  // Vorbis-comments delegation (Opus.pm:32) — the `Opus::Header`
-  // binary table (Opus.pm:36-51) is deferred (R1 F2 scope tightening),
-  // so `Opus:OpusVersion`/`AudioChannels`/`SampleRate`/`OutputGain` are
-  // excluded from the golden via `-x`.
+  // (Ogg.pm:50) firing on the `OpusHead` packet, the `OpusTags`
+  // Vorbis-comments delegation (Opus.pm:32), AND the `Opus::Header`
+  // binary table (Opus.pm:36-51, R2 F-OGG-TRIM port) emitting
+  // `Opus:OpusVersion`/`AudioChannels`/`SampleRate`/`OutputGain` byte-
+  // exact against the bundled golden.
   check(
     "synthetic_opus_minimal.opus",
     "synthetic_opus_minimal.opus.json",

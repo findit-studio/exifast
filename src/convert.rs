@@ -499,14 +499,74 @@ fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
   bit_list.join(if lookup.is_some() { ", " } else { "," })
 }
 
-// `convert_bitrate` (faithful `sub ConvertBitrate($)` from
-// `ExifTool.pm:6891-6902`) is DEFERRED to the dedicated Vorbis/Theora codec
-// PRs (R1 F2 — see `src/formats/ogg.rs` top-of-module comment). The Ogg
-// pathfinder PR tightened its scope back to "container + Vorbis-comment
-// block" and the `convert_bitrate` engine helper has no in-scope consumer
-// here. When `Vorbis.pm` / `Theora.pm` codec-identification-table PRs land,
-// they will re-land this helper alongside its consumers (Vorbis.pm:55,61,67
-// + Theora.pm:88).
+/// Format-into-writer port of `Image::ExifTool::ConvertBitrate`
+/// (ExifTool.pm:6891-6902). Writes the formatted bitrate string directly
+/// into a [`core::fmt::Write`] sink — no intermediate `String` allocation.
+///
+/// Perl reference:
+/// ```perl
+/// my $bitrate = shift;
+/// IsFloat($bitrate) or return $bitrate;
+/// my @units = ('bps', 'kbps', 'Mbps', 'Gbps');
+/// for (;;) {
+///     my $units = shift @units;
+///     $bitrate >= 1000 and @units and $bitrate /= 1000, next;
+///     my $fmt = $bitrate < 100 ? '%.3g' : '%.0f';
+///     return sprintf("$fmt $units", $bitrate);
+/// }
+/// ```
+///
+/// Bundled-Perl oracle (verified 2026-05-20 / 2026-05-22):
+/// - `224_000` → `"224 kbps"`
+/// - `8_500_000` → `"8.5 Mbps"`
+/// - `50` → `"50 bps"`
+/// - `999` → `"999 bps"`
+/// - `1000` → `"1 kbps"`
+/// - `1_500_000_000` → `"1.5 Gbps"`
+/// - `32_000` (Vorbis NominalBitrate fixture) → `"32 kbps"`
+/// - `128_000` (Vorbis NominalBitrate fixture) → `"128 kbps"`
+///
+/// R2 F-OGG-TRIM: this helper had been deferred to dedicated Vorbis/Theora
+/// codec PRs (R1 F2 scope tightening). Round-2 review flagged the
+/// identification-header tables as in-scope after all — the tables are
+/// small, the deferral was creating new conformance hand-trims, and the
+/// trims violated the "no hand-trims" 1:1 bar. Helper re-landed here (was
+/// in `formats/moi.rs`) so both `formats/moi.rs` (`write_convert_bitrate`
+/// re-export) and `formats/ogg.rs` (Vorbis::Identification +
+/// Opus::Header PrintConv path) can share the single faithful
+/// implementation.
+#[allow(dead_code)] // Used under `feature = "moi"` and `feature = "ogg"`; unused under feature-pruned builds without either.
+pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  bitrate: f64,
+) -> core::fmt::Result {
+  if !bitrate.is_finite() {
+    return write!(w, "{bitrate}");
+  }
+  const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
+  let mut b = bitrate;
+  for (i, &unit) in UNITS.iter().enumerate() {
+    let is_last = i + 1 == UNITS.len();
+    if b >= 1000.0 && !is_last {
+      b /= 1000.0;
+      continue;
+    }
+    return if b < 100.0 {
+      // `%.3g` — Perl `%g` strips trailing zeros. Share the engine's
+      // existing helper so byte-exact matching against the bundled oracle
+      // is centralized.
+      let formatted = crate::value::format_g(b, 3);
+      write!(w, "{formatted} {unit}")
+    } else {
+      // `%.0f` — Perl `%.0f` is half-to-even; for bitrate ranges here the
+      // post-division values are never exactly `.5`, so Rust's
+      // half-away-from-zero `{:.0}` produces byte-identical output.
+      write!(w, "{b:.0} {unit}")
+    };
+  }
+  // Unreachable: the loop always returns on the last UNITS entry.
+  unreachable!("write_convert_bitrate loop must exit on the last unit");
+}
 
 /// Faithful transliteration of `Image::ExifTool::XMP::DecodeBase64` (an
 /// RFC 4648 decode used by `Vorbis.pm:101-104` for `COVERART` and
