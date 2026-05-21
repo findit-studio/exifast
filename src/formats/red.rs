@@ -465,7 +465,10 @@ pub struct R3dMeta<'a> {
 }
 
 /// One value extracted via [`read_value`] from a directory entry.
+/// `#[non_exhaustive]`: a new typed value kind can be added without a
+/// breaking change for downstream matchers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum R3dValue<'a> {
   /// `int8u` / `int16u` / `int32u` count==1 typed scalar.
   I64(i64),
@@ -479,9 +482,90 @@ pub enum R3dValue<'a> {
   Rational(Rational),
 }
 
+impl<'a> R3dValue<'a> {
+  /// True iff this is an [`R3dValue::I64`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_i64(&self) -> bool {
+    matches!(self, R3dValue::I64(_))
+  }
+  /// True iff this is an [`R3dValue::F64`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_f64(&self) -> bool {
+    matches!(self, R3dValue::F64(_))
+  }
+  /// True iff this is an [`R3dValue::Str`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_str(&self) -> bool {
+    matches!(self, R3dValue::Str(_))
+  }
+  /// True iff this is an [`R3dValue::Bytes`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bytes(&self) -> bool {
+    matches!(self, R3dValue::Bytes(_))
+  }
+  /// True iff this is an [`R3dValue::Rational`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_rational(&self) -> bool {
+    matches!(self, R3dValue::Rational(_))
+  }
+
+  /// The integer payload of an [`R3dValue::I64`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_i64(&self) -> Option<i64> {
+    match self {
+      R3dValue::I64(n) => Some(*n),
+      _ => None,
+    }
+  }
+  /// The float payload of an [`R3dValue::F64`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_f64(&self) -> Option<f64> {
+    match self {
+      R3dValue::F64(f) => Some(*f),
+      _ => None,
+    }
+  }
+  /// The string payload of an [`R3dValue::Str`] (borrow), else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_str(&self) -> Option<&R3dStrCow<'a>> {
+    match self {
+      R3dValue::Str(s) => Some(s),
+      _ => None,
+    }
+  }
+  /// The byte payload of an [`R3dValue::Bytes`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub fn try_unwrap_bytes(&self) -> Option<&[u8]> {
+    match self {
+      R3dValue::Bytes(b) => Some(b.as_slice()),
+      _ => None,
+    }
+  }
+  /// The rational payload of an [`R3dValue::Rational`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_rational(&self) -> Option<Rational> {
+    match self {
+      R3dValue::Rational(r) => Some(*r),
+      _ => None,
+    }
+  }
+}
+
 /// Borrowed-or-owned `&str` carry. Distinct from `std::borrow::Cow` to
-/// avoid the cross-feature `alloc::borrow` dance.
+/// avoid the cross-feature `alloc::borrow` dance. `#[non_exhaustive]`:
+/// stays open for a future carry kind without breaking downstream matchers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum R3dStrCow<'a> {
   /// Borrowed from input.
   Borrowed(&'a str),
@@ -489,18 +573,54 @@ pub enum R3dStrCow<'a> {
   Owned(String),
 }
 
-impl R3dStrCow<'_> {
-  /// Returns the underlying `&str`.
+impl<'a> R3dStrCow<'a> {
+  /// Returns the underlying `&str` (the canonical string view).
+  #[must_use]
+  #[inline(always)]
   pub fn as_str(&self) -> &str {
     match self {
       R3dStrCow::Borrowed(s) => s,
       R3dStrCow::Owned(s) => s.as_str(),
     }
   }
+
+  /// True iff this is an [`R3dStrCow::Borrowed`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_borrowed(&self) -> bool {
+    matches!(self, R3dStrCow::Borrowed(_))
+  }
+  /// True iff this is an [`R3dStrCow::Owned`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_owned(&self) -> bool {
+    matches!(self, R3dStrCow::Owned(_))
+  }
+
+  /// The input-borrowed slice of an [`R3dStrCow::Borrowed`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_borrowed(&self) -> Option<&'a str> {
+    match self {
+      R3dStrCow::Borrowed(s) => Some(s),
+      _ => None,
+    }
+  }
+  /// The owned string of an [`R3dStrCow::Owned`] (borrow), else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub fn try_unwrap_owned(&self) -> Option<&str> {
+    match self {
+      R3dStrCow::Owned(s) => Some(s.as_str()),
+      _ => None,
+    }
+  }
 }
 
 /// `ReelNumber` typed carry (string or coerced integer).
+/// `#[non_exhaustive]`: kept open for a future carry kind.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum R3dStrOrInt<'a> {
   /// Borrowed string slice.
   Str(&'a str),
@@ -508,13 +628,83 @@ pub enum R3dStrOrInt<'a> {
   I64(i64),
 }
 
-/// `FrameRate` in the typed Meta.
+impl<'a> R3dStrOrInt<'a> {
+  /// True iff this is an [`R3dStrOrInt::Str`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_str(&self) -> bool {
+    matches!(self, R3dStrOrInt::Str(_))
+  }
+  /// True iff this is an [`R3dStrOrInt::I64`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_i64(&self) -> bool {
+    matches!(self, R3dStrOrInt::I64(_))
+  }
+
+  /// The input-borrowed slice of an [`R3dStrOrInt::Str`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_str(&self) -> Option<&'a str> {
+    match self {
+      R3dStrOrInt::Str(s) => Some(s),
+      _ => None,
+    }
+  }
+  /// The integer payload of an [`R3dStrOrInt::I64`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_i64(&self) -> Option<i64> {
+    match self {
+      R3dStrOrInt::I64(n) => Some(*n),
+      _ => None,
+    }
+  }
+}
+
+/// `FrameRate` in the typed Meta. `#[non_exhaustive]`: kept open for a
+/// future frame-rate representation without a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum FrameRate {
   /// RED1 `rational32u` at 0x3e.
   Rational(Rational),
   /// RED2 post-ValueConv F64.
   F64(f64),
+}
+
+impl FrameRate {
+  /// True iff this is a [`FrameRate::Rational`] (RED1 `rational32u`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_rational(&self) -> bool {
+    matches!(self, FrameRate::Rational(_))
+  }
+  /// True iff this is a [`FrameRate::F64`] (RED2 post-ValueConv).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_f64(&self) -> bool {
+    matches!(self, FrameRate::F64(_))
+  }
+
+  /// The rational payload of a [`FrameRate::Rational`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_rational(&self) -> Option<Rational> {
+    match self {
+      FrameRate::Rational(r) => Some(*r),
+      _ => None,
+    }
+  }
+  /// The float payload of a [`FrameRate::F64`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_f64(&self) -> Option<f64> {
+    match self {
+      FrameRate::F64(f) => Some(*f),
+      _ => None,
+    }
+  }
 }
 
 /// Directory tag identifier — used for emission ordering.
@@ -524,11 +714,13 @@ pub struct DirectoryTag(u16);
 impl DirectoryTag {
   /// Construct from the 16-bit Red `%Main` tag ID.
   #[must_use]
+  #[inline(always)]
   pub const fn new(id: u16) -> Self {
     Self(id)
   }
   /// The 16-bit Red `%Main` tag ID.
   #[must_use]
+  #[inline(always)]
   pub const fn id(self) -> u16 {
     self.0
   }
@@ -537,247 +729,295 @@ impl DirectoryTag {
 impl<'a> R3dMeta<'a> {
   /// `RedcodeVersion` — ASCII digit byte (`b'1'` or `b'2'`).
   #[must_use]
-  pub fn redcode_version(&self) -> Option<u8> {
+  #[inline(always)]
+  pub const fn redcode_version(&self) -> Option<u8> {
     self.redcode_version
   }
   /// `RedcodeVersion` as a `&'static str` ("1"/"2").
   #[must_use]
-  pub fn redcode_version_str(&self) -> Option<&'static str> {
-    match self.redcode_version? {
-      b'1' => Some("1"),
-      b'2' => Some("2"),
+  #[inline(always)]
+  pub const fn redcode_version_str(&self) -> Option<&'static str> {
+    match self.redcode_version {
+      Some(b'1') => Some("1"),
+      Some(b'2') => Some("2"),
       _ => None,
     }
   }
   /// `ImageWidth` from header subtable.
   #[must_use]
-  pub fn image_width(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn image_width(&self) -> Option<u32> {
     self.image_width
   }
   /// `ImageHeight` from header subtable.
   #[must_use]
-  pub fn image_height(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn image_height(&self) -> Option<u32> {
     self.image_height
   }
-  /// `FrameRate`.
+  /// `FrameRate` (borrow of the non-`Copy` [`FrameRate`]).
   #[must_use]
-  pub fn frame_rate(&self) -> Option<&FrameRate> {
+  #[inline(always)]
+  pub const fn frame_rate_ref(&self) -> Option<&FrameRate> {
     self.frame_rate.as_ref()
   }
   /// RED1 header `OriginalFileName`.
   #[must_use]
-  pub fn red1_original_file_name(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn red1_original_file_name(&self) -> Option<&'a str> {
     self.red1_original_file_name
   }
   /// `StartEdgeCode` (0x1000).
   #[must_use]
-  pub fn start_edge_code(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn start_edge_code(&self) -> Option<&'a str> {
     self.start_edge_code
   }
   /// `StartTimecode` (0x1001).
   #[must_use]
-  pub fn start_timecode(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn start_timecode(&self) -> Option<&'a str> {
     self.start_timecode
   }
   /// `OtherDate1` (0x1002).
   #[must_use]
+  #[inline(always)]
   pub fn other_date_1(&self) -> Option<&str> {
     self.other_date_1.as_deref()
   }
   /// `OtherDate2` (0x1003).
   #[must_use]
+  #[inline(always)]
   pub fn other_date_2(&self) -> Option<&str> {
     self.other_date_2.as_deref()
   }
   /// `OtherDate3` (0x1004).
   #[must_use]
+  #[inline(always)]
   pub fn other_date_3(&self) -> Option<&str> {
     self.other_date_3.as_deref()
   }
   /// `DateTimeOriginal` (0x1005).
   #[must_use]
+  #[inline(always)]
   pub fn date_time_original(&self) -> Option<&str> {
     self.date_time_original.as_deref()
   }
   /// `SerialNumber` (0x1006).
   #[must_use]
-  pub fn serial_number(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn serial_number(&self) -> Option<&'a str> {
     self.serial_number
   }
   /// `CameraType` (0x1019).
   #[must_use]
-  pub fn camera_type(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn camera_type(&self) -> Option<&'a str> {
     self.camera_type
   }
-  /// `ReelNumber` (0x101a).
+  /// `ReelNumber` (0x101a) — borrow of the non-`Copy` [`R3dStrOrInt`].
   #[must_use]
-  pub fn reel_number(&self) -> Option<&R3dStrOrInt<'a>> {
+  #[inline(always)]
+  pub const fn reel_number_ref(&self) -> Option<&R3dStrOrInt<'a>> {
     self.reel_number.as_ref()
   }
   /// `Take` (0x101b).
   #[must_use]
-  pub fn take(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn take(&self) -> Option<&'a str> {
     self.take
   }
   /// `DateCreated` (0x1023).
   #[must_use]
+  #[inline(always)]
   pub fn date_created(&self) -> Option<&str> {
     self.date_created.as_deref()
   }
   /// `TimeCreated` (0x1024).
   #[must_use]
+  #[inline(always)]
   pub fn time_created(&self) -> Option<&str> {
     self.time_created.as_deref()
   }
   /// `FirmwareVersion` (0x1025).
   #[must_use]
-  pub fn firmware_version(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn firmware_version(&self) -> Option<&'a str> {
     self.firmware_version
   }
   /// `ReelTimecode` (0x1029).
   #[must_use]
-  pub fn reel_timecode(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn reel_timecode(&self) -> Option<&'a str> {
     self.reel_timecode
   }
   /// `StorageType` (0x102a).
   #[must_use]
-  pub fn storage_type(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn storage_type(&self) -> Option<&'a str> {
     self.storage_type
   }
   /// `StorageFormatDate` (0x1030).
   #[must_use]
+  #[inline(always)]
   pub fn storage_format_date(&self) -> Option<&str> {
     self.storage_format_date.as_deref()
   }
   /// `StorageFormatTime` (0x1031).
   #[must_use]
+  #[inline(always)]
   pub fn storage_format_time(&self) -> Option<&str> {
     self.storage_format_time.as_deref()
   }
   /// `StorageSerialNumber` (0x1032).
   #[must_use]
-  pub fn storage_serial_number(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn storage_serial_number(&self) -> Option<&'a str> {
     self.storage_serial_number
   }
   /// `StorageModel` (0x1033).
   #[must_use]
-  pub fn storage_model(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn storage_model(&self) -> Option<&'a str> {
     self.storage_model
   }
   /// `AspectRatio` (0x1036).
   #[must_use]
-  pub fn aspect_ratio(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn aspect_ratio(&self) -> Option<&'a str> {
     self.aspect_ratio
   }
   /// `Revision` (0x1042).
   #[must_use]
-  pub fn revision(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn revision(&self) -> Option<&'a str> {
     self.revision
   }
   /// `OriginalFileName` (0x1056) — directory tag.
   #[must_use]
-  pub fn original_file_name(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn original_file_name(&self) -> Option<&'a str> {
     self.original_file_name
   }
   /// `LensMake` (0x106e).
   #[must_use]
-  pub fn lens_make(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn lens_make(&self) -> Option<&'a str> {
     self.lens_make
   }
   /// `LensNumber` (0x106f).
   #[must_use]
-  pub fn lens_number(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn lens_number(&self) -> Option<&'a str> {
     self.lens_number
   }
   /// `LensModel` (0x1070).
   #[must_use]
-  pub fn lens_model(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn lens_model(&self) -> Option<&'a str> {
     self.lens_model
   }
   /// `Model` (0x1071).
   #[must_use]
-  pub fn model(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn model(&self) -> Option<&'a str> {
     self.model
   }
   /// `CameraOperator` (0x107c).
   #[must_use]
-  pub fn camera_operator(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn camera_operator(&self) -> Option<&'a str> {
     self.camera_operator
   }
   /// `VideoFormat` (0x1086).
   #[must_use]
-  pub fn video_format(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn video_format(&self) -> Option<&'a str> {
     self.video_format
   }
   /// `Filter` (0x1096).
   #[must_use]
-  pub fn filter(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn filter(&self) -> Option<&'a str> {
     self.filter
   }
   /// `Brain` (0x10a0).
   #[must_use]
-  pub fn brain(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn brain(&self) -> Option<&'a str> {
     self.brain
   }
   /// `Sensor` (0x10a1).
   #[must_use]
-  pub fn sensor(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn sensor(&self) -> Option<&'a str> {
     self.sensor
   }
   /// `Quality` (0x10be).
   #[must_use]
-  pub fn quality(&self) -> Option<&'a str> {
+  #[inline(always)]
+  pub const fn quality(&self) -> Option<&'a str> {
     self.quality
   }
-  /// `ColorTemperature` (0x200d).
+  /// `ColorTemperature` (0x200d) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn color_temperature(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn color_temperature_ref(&self) -> Option<&R3dValue<'a>> {
     self.color_temperature.as_ref()
   }
-  /// `RGBCurves` (0x204b).
+  /// `RGBCurves` (0x204b) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn rgb_curves(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn rgb_curves_ref(&self) -> Option<&R3dValue<'a>> {
     self.rgb_curves.as_ref()
   }
-  /// `OriginalFrameRate` (0x2066).
+  /// `OriginalFrameRate` (0x2066) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn original_frame_rate(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn original_frame_rate_ref(&self) -> Option<&R3dValue<'a>> {
     self.original_frame_rate.as_ref()
   }
-  /// `CropArea` (0x4037).
+  /// `CropArea` (0x4037) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn crop_area(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn crop_area_ref(&self) -> Option<&R3dValue<'a>> {
     self.crop_area.as_ref()
   }
-  /// `ISO` (0x403b).
+  /// `ISO` (0x403b) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn iso(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn iso_ref(&self) -> Option<&R3dValue<'a>> {
     self.iso.as_ref()
   }
   /// `FNumber` (0x406a) post-ValueConv.
   #[must_use]
-  pub fn f_number(&self) -> Option<f64> {
+  #[inline(always)]
+  pub const fn f_number(&self) -> Option<f64> {
     self.f_number
   }
-  /// `FocalLength` (0x406b).
+  /// `FocalLength` (0x406b) — borrow of the non-`Copy` [`R3dValue`].
   #[must_use]
-  pub fn focal_length(&self) -> Option<&R3dValue<'a>> {
+  #[inline(always)]
+  pub const fn focal_length_ref(&self) -> Option<&R3dValue<'a>> {
     self.focal_length.as_ref()
   }
   /// `FocusDistance` (0x606c) post-ValueConv.
   #[must_use]
-  pub fn focus_distance(&self) -> Option<f64> {
+  #[inline(always)]
+  pub const fn focus_distance(&self) -> Option<f64> {
     self.focus_distance
   }
   /// Warnings emitted during parsing, in emission order.
   #[must_use]
+  #[inline(always)]
   pub fn warnings(&self) -> &[&'static str] {
-    &self.warnings
+    self.warnings.as_slice()
   }
   /// Order in which directory tags appeared in the binary.
   #[must_use]
+  #[inline(always)]
   pub fn directory_tag_order(&self) -> &[DirectoryTag] {
-    &self.directory_tag_order
+    self.directory_tag_order.as_slice()
   }
 }
 
@@ -1663,17 +1903,14 @@ fn emit_r3d_value(
 
 /// Rust-level fatal modes for R3D parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
+/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
+/// without a breaking change. Variant names are kept stable for
+/// [`crate::parser_new::AnyError`]'s `From`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum R3dError {}
-
-impl core::fmt::Display for R3dError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for R3dError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1701,6 +1938,67 @@ mod tests {
     assert_eq!(red_format(9), Some("undef"));
     assert_eq!(red_format(10), None);
     assert_eq!(red_format(15), None);
+  }
+
+  #[test]
+  fn frame_rate_predicates_and_unwrap_accessors() {
+    let r = FrameRate::Rational(Rational::rational32(24000, 1001));
+    assert!(r.is_rational() && !r.is_f64());
+    assert_eq!(
+      r.try_unwrap_rational(),
+      Some(Rational::rational32(24000, 1001))
+    );
+    assert_eq!(r.try_unwrap_f64(), None);
+
+    let f = FrameRate::F64(25.0);
+    assert!(f.is_f64() && !f.is_rational());
+    assert_eq!(f.try_unwrap_f64(), Some(25.0));
+    assert_eq!(f.try_unwrap_rational(), None);
+  }
+
+  #[test]
+  fn r3d_value_predicates_and_unwrap_accessors() {
+    let i = R3dValue::I64(3);
+    assert!(i.is_i64());
+    assert_eq!(i.try_unwrap_i64(), Some(3));
+    assert_eq!(i.try_unwrap_f64(), None);
+
+    let s = R3dValue::Str(R3dStrCow::Borrowed("xy"));
+    assert!(s.is_str());
+    assert_eq!(s.try_unwrap_str().map(R3dStrCow::as_str), Some("xy"));
+    assert!(s.try_unwrap_bytes().is_none());
+
+    let b = R3dValue::Bytes(vec![9, 8]);
+    assert!(b.is_bytes());
+    assert_eq!(b.try_unwrap_bytes(), Some(&[9u8, 8][..]));
+
+    let rat = R3dValue::Rational(Rational::rational32(10, 2));
+    assert!(rat.is_rational());
+    assert_eq!(rat.try_unwrap_rational(), Some(Rational::rational32(10, 2)));
+  }
+
+  #[test]
+  fn r3d_str_cow_and_str_or_int_accessors() {
+    let bor = R3dStrCow::Borrowed("a");
+    assert!(bor.is_borrowed() && !bor.is_owned());
+    assert_eq!(bor.try_unwrap_borrowed(), Some("a"));
+    assert_eq!(bor.try_unwrap_owned(), None);
+    assert_eq!(bor.as_str(), "a");
+
+    let own = R3dStrCow::Owned(String::from("b"));
+    assert!(own.is_owned() && !own.is_borrowed());
+    assert_eq!(own.try_unwrap_owned(), Some("b"));
+    assert_eq!(own.try_unwrap_borrowed(), None);
+
+    let s = R3dStrOrInt::Str("r1");
+    assert!(s.is_str() && !s.is_i64());
+    assert_eq!(s.try_unwrap_str(), Some("r1"));
+    assert_eq!(s.try_unwrap_i64(), None);
+
+    let n = R3dStrOrInt::I64(5);
+    assert!(n.is_i64() && !n.is_str());
+    assert_eq!(n.try_unwrap_i64(), Some(5));
+    assert_eq!(n.try_unwrap_str(), None);
   }
 
   // The engine path is now `crate::parser::extract_info`. These run it and
@@ -2014,7 +2312,7 @@ mod tests {
     assert_eq!(meta.redcode_version(), Some(b'2'));
     assert_eq!(meta.image_width(), Some(5120));
     assert_eq!(meta.image_height(), Some(2560));
-    match meta.frame_rate() {
+    match meta.frame_rate_ref() {
       Some(FrameRate::F64(n)) => {
         assert!((n - 24000.0 / 1001.0).abs() < 1e-12);
       }

@@ -567,12 +567,14 @@ pub struct AaEntry<'a> {
 impl<'a> AaEntry<'a> {
   /// Tag name (e.g. `"Author"`).
   #[must_use]
+  #[inline(always)]
   pub fn name(&self) -> &str {
     self.name.as_str()
   }
-  /// Typed tag value.
+  /// Typed tag value (borrow of the non-`Copy` [`AaValue`]).
   #[must_use]
-  pub fn value(&self) -> &AaValue<'a> {
+  #[inline(always)]
+  pub const fn value_ref(&self) -> &AaValue<'a> {
     &self.value
   }
 }
@@ -585,8 +587,10 @@ impl<'a> AaEntry<'a> {
 /// `TagValue::I64` JSON path).
 ///
 /// D8 newtype-style — variants are flat data carriers; consumers match
-/// directly.
+/// directly. `#[non_exhaustive]`: AA could grow a typed value kind without a
+/// breaking change for downstream matchers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AaValue<'a> {
   /// UTF-8 text post-UnescapeHTML + post-fix_utf8 (synthesized — does not
   /// borrow from input because the pipeline materially transforms bytes).
@@ -600,6 +604,55 @@ pub enum AaValue<'a> {
   /// [`alloc::borrow::Cow`] so the chunk-11 hot path stays zero-copy while
   /// the dict path can still hand off owned bytes.
   Bytes(std::borrow::Cow<'a, [u8]>),
+}
+
+impl AaValue<'_> {
+  /// True iff this is an [`AaValue::Str`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_str(&self) -> bool {
+    matches!(self, AaValue::Str(_))
+  }
+  /// True iff this is an [`AaValue::I64`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_i64(&self) -> bool {
+    matches!(self, AaValue::I64(_))
+  }
+  /// True iff this is an [`AaValue::Bytes`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_bytes(&self) -> bool {
+    matches!(self, AaValue::Bytes(_))
+  }
+
+  /// The string payload of an [`AaValue::Str`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub fn try_unwrap_str(&self) -> Option<&str> {
+    match self {
+      AaValue::Str(s) => Some(s.as_str()),
+      _ => None,
+    }
+  }
+  /// The integer payload of an [`AaValue::I64`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn try_unwrap_i64(&self) -> Option<i64> {
+    match self {
+      AaValue::I64(n) => Some(*n),
+      _ => None,
+    }
+  }
+  /// The byte payload of an [`AaValue::Bytes`], else `None`.
+  #[must_use]
+  #[inline(always)]
+  pub fn try_unwrap_bytes(&self) -> Option<&[u8]> {
+    match self {
+      AaValue::Bytes(b) => Some(b.as_ref()),
+      _ => None,
+    }
+  }
 }
 
 /// Typed AA metadata — the lib-first output of [`ProcessAa`].
@@ -646,6 +699,7 @@ impl<'a> AaMeta<'a> {
   /// All emitted tag entries in bundled-Perl `FoundTag` call order
   /// (post-last-wins resolution).
   #[must_use]
+  #[inline(always)]
   pub fn entries(&self) -> &[AaEntry<'a>] {
     &self.entries
   }
@@ -655,6 +709,7 @@ impl<'a> AaMeta<'a> {
   /// 238 `Bad dictionary`, 240 `Bad dictionary count`, 246
   /// `Truncated dictionary`, 252 `Bad dictionary entry`).
   #[must_use]
+  #[inline(always)]
   pub fn warnings(&self) -> &[SmolStr] {
     &self.warnings
   }
@@ -662,6 +717,7 @@ impl<'a> AaMeta<'a> {
   /// Accumulated errors (R9: numeric entity above Perl `pack('C0U')`'s
   /// i64::MAX cap surfaces as the engine's `ExifTool:Error` substitute).
   #[must_use]
+  #[inline(always)]
   pub fn errors(&self) -> &[SmolStr] {
     &self.errors
   }
@@ -1287,17 +1343,14 @@ impl AaMeta<'_> {
 /// warnings/errors inside the typed [`AaMeta`] (Perl `$et->Warn` /
 /// `$et->Error`). Reserved for future I/O wrappers if streaming readers
 /// are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
+/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
+/// without a breaking change. Variant names are kept stable for
+/// [`crate::parser_new::AnyError`]'s `From`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum AudibleError {}
-
-impl core::fmt::Display for AudibleError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for AudibleError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -1824,7 +1877,7 @@ mod tests {
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
     let names: Vec<&str> = meta.entries().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["Author", "Title"]);
-    match &meta.entries()[0].value() {
+    match meta.entries()[0].value_ref() {
       AaValue::Str(s) => assert_eq!(s.as_str(), "Alice"),
       other => panic!("expected Str, got {other:?}"),
     }
@@ -1835,6 +1888,25 @@ mod tests {
     let bytes = build_aa_with_two_chap_chunks(1, 42);
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
     assert_eq!(meta.chapter_count(), Some(42));
+  }
+
+  #[test]
+  fn aa_value_predicates_and_unwrap_accessors() {
+    let s = AaValue::Str(SmolStr::from("hi"));
+    assert!(s.is_str() && !s.is_i64() && !s.is_bytes());
+    assert_eq!(s.try_unwrap_str(), Some("hi"));
+    assert_eq!(s.try_unwrap_i64(), None);
+    assert_eq!(s.try_unwrap_bytes(), None);
+
+    let n = AaValue::I64(7);
+    assert!(n.is_i64() && !n.is_str() && !n.is_bytes());
+    assert_eq!(n.try_unwrap_i64(), Some(7));
+    assert_eq!(n.try_unwrap_str(), None);
+
+    let b = AaValue::Bytes(std::borrow::Cow::Borrowed(&[1u8, 2, 3]));
+    assert!(b.is_bytes() && !b.is_str() && !b.is_i64());
+    assert_eq!(b.try_unwrap_bytes(), Some(&[1u8, 2, 3][..]));
+    assert_eq!(b.try_unwrap_i64(), None);
   }
 
   #[test]
