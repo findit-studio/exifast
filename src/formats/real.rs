@@ -334,13 +334,13 @@ impl<'a> RealMeta<'a> {
     self.kind
   }
 
-  /// `File:MIMEType` override (Real.pm:653-657): when the RM file has
+  /// `File:MIMEType` override (Real.pm:639-657): when the RM file has
   /// exactly one stream whose `MimeType` is NOT `logical-fileinfo` AND
   /// that MimeType has non-zero length, bundled `ProcessReal` overrides
   /// the engine's table-derived MIMEType with the stream's MimeType.
   /// Returns the override target, or `None` when the override does NOT
   /// fire (multi-stream files, RA, Metafile, or zero non-logical-fileinfo
-  /// streams).
+  /// streams, or every non-logical stream MIME is empty).
   ///
   /// The returned slice is borrowed from the `String` stored on the
   /// matching `MdprStream::stream_mime_type` — but exposed via a
@@ -348,13 +348,32 @@ impl<'a> RealMeta<'a> {
   /// derived). The accessor returns `Option<&str>` borrowing from
   /// `self`; the engine clones to `String` (used only for the
   /// `File:MIMEType` JSON insertion).
+  ///
+  /// **Codex R1 F1 — faithful empty-MIME filtering.** Bundled
+  /// Real.pm:641 has a `if ($mime)` Perl-falsy guard that drops empty
+  /// AND undefined MIMEs BEFORE pushing into `@mimeTypes`. The Rust
+  /// filter chain composes the three exclusions (None, `^logical-`,
+  /// empty) in exactly the order bundled does (truthy-or-falsy guard
+  /// at 641 + `^logical-` filter at 644). Empirically verified on the
+  /// synthesized `tests/fixtures/real_synth_2_empty_audio.rm` fixture:
+  /// 1 empty + 1 audio stream ⇒ bundled @mimeTypes = ["audio/x-pn-…"]
+  /// (length 1) ⇒ override FIRES with `audio/x-pn-realaudio`. The
+  /// `mime_override_*` unit tests in this module pin each branch.
   #[must_use]
   pub fn mime_override(&self) -> Option<&str> {
     if !matches!(self.kind, RealKind::Rm) {
       return None;
     }
+    // Real.pm:641 `if ($mime)`     — Perl-falsy drops empty/undef MIMEs.
     // Real.pm:644 `push @mimeTypes, $mime unless $mime =~ /^logical-/`.
     // Real.pm:654 `if (@mimeTypes == 1 and length $mimeTypes[0])`.
+    //
+    // The three composed filters below mirror the bundled exclusion
+    // set (commutative composition; the order is chosen for clarity,
+    // not faithfulness). The `length $mimeTypes[0]` check at line 654
+    // is subsumed by the `!is_empty()` filter — once the falsy guard
+    // at 641 has dropped empties, the surviving element cannot be
+    // empty, so the `length` check is a tautology here.
     let mut filtered = self
       .mdpr_streams
       .iter()
@@ -2311,5 +2330,135 @@ mod tests {
     assert_eq!(strip_trailing_nuls(b"abc\0\0"), b"abc");
     assert_eq!(strip_trailing_nuls(b"a\0b\0\0"), b"a\0b");
     assert_eq!(strip_trailing_nuls(b"\0\0"), b"");
+  }
+
+  // ----------------------------------------------------------------------
+  // Codex R1 F1 — `mime_override` correspondence to bundled Real.pm:639-657
+  // ----------------------------------------------------------------------
+  //
+  // Bundled (Real.pm:639-657):
+  //
+  // ```perl
+  // my $mime = $$et{RealStreamMime};
+  // if ($mime) {                           # 641: Perl-falsy skip — '' and undef out
+  //     delete $$et{RealStreamMime};
+  //     $mime =~ s/\0.*//s;
+  //     push @mimeTypes, $mime unless $mime =~ /^logical-/;  # 644
+  // }
+  // …
+  // if (@mimeTypes == 1 and length $mimeTypes[0]) {  # 654
+  //     $$et{VALUE}{MIMEType} = $mimeTypes[0];
+  // }
+  // ```
+  //
+  // Critical observation (verified empirically against bundled exiftool
+  // 13.58 on `tests/fixtures/real_synth_*.rm`): line 641's `if ($mime)`
+  // is a PERL-FALSY GUARD that drops empty AND undefined MIMEs BEFORE
+  // they reach `@mimeTypes`. So the count at line 654 reflects only
+  // the NON-empty NON-logical MIMEs. The current Rust filter chain
+  // (`filter_map(stream_mime_type) → filter(!starts_with("logical-"))
+  // → filter(!is_empty())`) is the precise faithful analog of this
+  // composition (the order of the two filters does not matter — they
+  // commute — but isolating both is clearer than collapsing them).
+  //
+  // These unit tests pin the EMPIRICALLY-VERIFIED bundled behavior for
+  // each of the 5 finding-listed cases.
+
+  fn synth_rm_meta_with_mimes<'a>(mimes: &[Option<&str>]) -> RealMeta<'a> {
+    RealMeta {
+      kind: RealKind::Rm,
+      prop: PropTags::default(),
+      mdpr_streams: mimes
+        .iter()
+        .map(|m| MdprStream {
+          stream_mime_type: m.map(|s| s.to_owned()),
+          ..MdprStream::default()
+        })
+        .collect(),
+      cont: ContTags::default(),
+      rjmd_tags: Vec::new(),
+      ra_version: None,
+      ra_fields: Vec::new(),
+      id3v1: None,
+      _phantom: core::marker::PhantomData,
+    }
+  }
+
+  #[test]
+  fn mime_override_none_when_zero_non_logical_streams() {
+    // Bundled @mimeTypes empty ⇒ count != 1 ⇒ no override.
+    let m = synth_rm_meta_with_mimes(&[]);
+    assert_eq!(m.mime_override(), None);
+    let m = synth_rm_meta_with_mimes(&[Some("logical-fileinfo")]);
+    assert_eq!(m.mime_override(), None, "logical-* filtered by line 644");
+  }
+
+  #[test]
+  fn mime_override_none_when_single_stream_empty_mime() {
+    // Bundled: `$mime = ""` ⇒ falsy ⇒ `if ($mime)` SKIPS ⇒ @mimeTypes
+    // stays empty ⇒ count != 1 ⇒ no override.
+    let m = synth_rm_meta_with_mimes(&[Some("")]);
+    assert_eq!(m.mime_override(), None);
+  }
+
+  #[test]
+  fn mime_override_fires_when_single_audio_stream() {
+    // Bundled @mimeTypes = ["audio/x-pn-realaudio"] ⇒ count == 1 AND
+    // non-empty ⇒ override fires.
+    let m = synth_rm_meta_with_mimes(&[Some("audio/x-pn-realaudio")]);
+    assert_eq!(m.mime_override(), Some("audio/x-pn-realaudio"));
+  }
+
+  #[test]
+  fn mime_override_none_when_two_audio_streams() {
+    // Bundled @mimeTypes = ["audio/x-pn-realaudio", "audio/x-pn-realaudio"]
+    // ⇒ count == 2 ⇒ override does NOT fire.
+    let m = synth_rm_meta_with_mimes(&[Some("audio/x-pn-realaudio"), Some("audio/x-pn-realaudio")]);
+    assert_eq!(m.mime_override(), None);
+  }
+
+  #[test]
+  fn mime_override_fires_when_empty_plus_audio_streams() {
+    // Bundled VERIFIED EMPIRICALLY on `real_synth_2_empty_audio.rm`:
+    // Stream 0 has `$mime = ""` ⇒ Real.pm:641 SKIPS (empty is falsy).
+    // Stream 1 has `$mime = "audio/x-pn-realaudio"` ⇒ pushed. Final
+    // @mimeTypes = ["audio/x-pn-realaudio"] (length 1, non-empty) ⇒
+    // override FIRES with `audio/x-pn-realaudio`. This contradicts a
+    // naive reading of the Codex R1 F1 description; the Codex finding's
+    // "count == 2 ⇒ no override" assumption was based on counting
+    // empties — bundled does not count empties.
+    let m = synth_rm_meta_with_mimes(&[Some(""), Some("audio/x-pn-realaudio")]);
+    assert_eq!(
+      m.mime_override(),
+      Some("audio/x-pn-realaudio"),
+      "bundled `if ($mime)` filter at Real.pm:641 drops the empty stream BEFORE counting"
+    );
+  }
+
+  #[test]
+  fn mime_override_none_for_non_rm() {
+    let mut m = synth_rm_meta_with_mimes(&[Some("audio/x-pn-realaudio")]);
+    m.kind = RealKind::Ra;
+    assert_eq!(m.mime_override(), None, "override applies to RM only");
+    m.kind = RealKind::Ram;
+    assert_eq!(m.mime_override(), None);
+    m.kind = RealKind::Rpm;
+    assert_eq!(m.mime_override(), None);
+  }
+
+  #[test]
+  fn mime_override_filters_logical_fileinfo_then_counts() {
+    // 1 logical + 1 audio: bundled filters the logical, leaving 1 audio
+    // ⇒ override fires.
+    let m = synth_rm_meta_with_mimes(&[Some("logical-fileinfo"), Some("audio/x-pn-realaudio")]);
+    assert_eq!(m.mime_override(), Some("audio/x-pn-realaudio"));
+    // 2 audio + 1 logical: bundled filters the logical, leaving 2 audio
+    // ⇒ count==2 ⇒ no override.
+    let m = synth_rm_meta_with_mimes(&[
+      Some("audio/x-pn-realaudio"),
+      Some("logical-fileinfo"),
+      Some("audio/x-pn-realaudio"),
+    ]);
+    assert_eq!(m.mime_override(), None);
   }
 }

@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_143() {
+fn typed_serde_path_equals_writer_path_and_golden_all_145() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -217,12 +217,20 @@ fn typed_serde_path_equals_writer_path_and_golden_all_143() {
   // 128 → 130 after Codex R1 F2 (PR #33): added 2 adversarial Real
   // fixtures pinning the ID3v1-trailer fidelity gap (empty Title
   // preserved as `""`; sparse Genre byte 192 preserved verbatim).
+  // 130 → 132 after Codex R1 F1 (PR #33): added 2 adversarial Real
+  // fixtures pinning the MIME-override branch (1-stream audio MIME
+  // ⇒ override fires; 2 populated streams ⇒ no override). The 2
+  // empty-MIME F1 variants (1empty, 2_empty_audio) live in fixtures/
+  // for unit tests only — bundled emits a Perl-interpreter-level
+  // `Condition FileInfoLen2: Use of uninitialized value` warning that
+  // this Rust port does not (and should not) replicate, so they
+  // cannot be value-equivalent at the JSON surface.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    143,
-    "expected exactly the 143 active conformance fixtures, found {}: {:?}",
+    145,
+    "expected exactly the 145 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

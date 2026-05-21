@@ -498,6 +498,38 @@ fn real_ra_conformance() {
 }
 
 #[test]
+fn real_synth_1audio_conformance() {
+  // Codex R1 F1 adversarial — pinpoints the bundled `File:MIMEType`
+  // override (Real.pm:653-657) for a 1-stream RM whose sole MDPR
+  // carries `audio/x-pn-realaudio`. Bundled OVERRIDES the table-derived
+  // `application/vnd.rn-realmedia` with the stream MIME (exactly the
+  // override case that fires); this Rust port must agree.
+  // Synthesized fixture (RMF header + PROP + 1 MDPR + DATA terminator);
+  // goldens captured with `-x Composite:all`.
+  check("real_synth_1audio.rm", "real_synth_1audio.rm.json", true);
+  check("real_synth_1audio.rm", "real_synth_1audio.rm.n.json", false);
+}
+
+#[test]
+fn real_synth_2_audio_audio_conformance() {
+  // Codex R1 F1 adversarial — 2-stream RM with BOTH MIMEs populated
+  // (`audio/x-pn-realaudio` each). Bundled @mimeTypes has 2 entries, so
+  // the `@mimeTypes == 1` gate (Real.pm:654) fails ⇒ NO override; the
+  // table-derived `application/vnd.rn-realmedia` is kept. Pins the
+  // count-mismatch arm of the override branch.
+  check(
+    "real_synth_2_audio_audio.rm",
+    "real_synth_2_audio_audio.rm.json",
+    true,
+  );
+  check(
+    "real_synth_2_audio_audio.rm",
+    "real_synth_2_audio_audio.rm.n.json",
+    false,
+  );
+}
+
+#[test]
 fn real_synth_id3v1_empty_title_conformance() {
   // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
   // Title slot is ALL NULL (faithful bundled `"ID3v1:Title": ""`). The
