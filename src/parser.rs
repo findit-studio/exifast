@@ -410,9 +410,10 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
           Value::String(ov_mime.unwrap_or(base.mime_type)),
         );
       }
-      FileTypeFinalize::ExplicitThenLiteral { set, literal } => {
+      FileTypeFinalize::ExplicitThenLiteral(payload) => {
         // SetFileType(set) then raw-replace FileType value with `literal`; the
         // extension + MIME come from `set` (AIFF DjVu multi-page, AIFF.pm:206).
+        let (set, literal) = (payload.set(), payload.literal());
         let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
         insert(
           &mut obj,

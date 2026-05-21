@@ -145,6 +145,7 @@ pub struct SharedFlags {
 impl SharedFlags {
   /// Construct empty shared flags (alias of [`Default::default`]).
   #[must_use]
+  #[inline(always)]
   pub fn new() -> Self {
     Self::default()
   }
@@ -156,16 +157,20 @@ impl SharedFlags {
   /// `done_id3().is_some_and(|n| n > 1)`. Mirrors
   /// [`crate::value::Metadata::done_id3`] (Codex AF1/BF3).
   #[must_use]
-  pub fn done_id3(&self) -> Option<usize> {
+  #[inline(always)]
+  pub const fn done_id3(&self) -> Option<usize> {
     self.done_id3
   }
 
   /// Set `$$et{DoneID3} = trailer_size`. Called by the ID3 parser after a
   /// v1 trailer is consumed (pass `0` for the "ID3v2 found, no v1 trailer"
   /// case — ID3.pm:1436 sets the truthy `1` marker; the APE `> 1` arithmetic
-  /// guard treats `0` and `1` identically, so we normalize to `0`).
-  pub fn set_done_id3(&mut self, trailer_size: usize) {
+  /// guard treats `0` and `1` identically, so we normalize to `0`). Returns
+  /// `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn set_done_id3(&mut self, trailer_size: usize) -> &mut Self {
     self.done_id3 = Some(trailer_size);
+    self
   }
 
   /// The post-ID3v2-header file position (bundled `$hdrEnd`) recorded by the
@@ -175,50 +180,62 @@ impl SharedFlags {
   /// `$raf->Seek($hdrEnd, 0)` (ID3.pm:1590) before recursive `ProcessMP3`
   /// (Codex B-R3-1).
   #[must_use]
-  pub fn id3_hdr_end(&self) -> Option<usize> {
+  #[inline(always)]
+  pub const fn id3_hdr_end(&self) -> Option<usize> {
     self.id3_hdr_end
   }
 
   /// Record the post-ID3v2-header file position (bundled `$hdrEnd`). Called
   /// by the typed ID3 pass after it determines the header end so a later
   /// chained `ProcessMP3` skip path can scan MPEG from there (Codex B-R3-1).
-  pub fn set_id3_hdr_end(&mut self, hdr_end: usize) {
+  /// Returns `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn set_id3_hdr_end(&mut self, hdr_end: usize) -> &mut Self {
     self.id3_hdr_end = Some(hdr_end);
+    self
   }
 
   /// `$$et{DoneAPE}` — APE-trailer-already-handled flag, gates the
   /// wrapper fallback in `ID3.pm:1723-1726`.
   #[must_use]
-  pub fn done_ape(&self) -> bool {
+  #[inline(always)]
+  pub const fn done_ape(&self) -> bool {
     self.done_ape
   }
 
-  /// Set `$$et{DoneAPE}`. Called by the APE parser after running.
-  pub fn set_done_ape(&mut self, value: bool) {
+  /// Set `$$et{DoneAPE}`. Called by the APE parser after running. Returns
+  /// `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn set_done_ape(&mut self, value: bool) -> &mut Self {
     self.done_ape = value;
+    self
   }
 
-  /// View the current file-type stack as a slice (in push order).
+  /// View the current file-type stack as a slice (in push order). `_slice`
+  /// projection of the fixed-capacity backing array (§3).
   #[must_use]
-  pub fn file_type_stack(&self) -> &[Option<&'static str>] {
-    &self.file_type_stack[..self.file_type_stack_len]
+  #[inline(always)]
+  pub const fn file_type_stack_slice(&self) -> &[Option<&'static str>] {
+    self.file_type_stack.split_at(self.file_type_stack_len).0
   }
 
   /// Push a file-type tag onto the stack. Panics if the stack is full
-  /// (current cap = 4; see the struct doc).
-  pub fn push_file_type(&mut self, file_type: &'static str) {
+  /// (current cap = 4; see the struct doc). Returns `&mut Self` to chain (§3).
+  #[inline(always)]
+  pub const fn push_file_type(&mut self, file_type: &'static str) -> &mut Self {
     assert!(
       self.file_type_stack_len < self.file_type_stack.len(),
-      "SharedFlags::push_file_type: stack overflow (cap={}, observed depth in bundled ExifTool is ≤ 2)",
-      self.file_type_stack.len(),
+      "SharedFlags::push_file_type: stack overflow (cap=4, observed depth in bundled ExifTool is ≤ 2)",
     );
     self.file_type_stack[self.file_type_stack_len] = Some(file_type);
     self.file_type_stack_len += 1;
+    self
   }
 
   /// Pop the most recent file-type tag, returning it if the stack was
   /// non-empty.
-  pub fn pop_file_type(&mut self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn pop_file_type(&mut self) -> Option<&'static str> {
     if self.file_type_stack_len == 0 {
       return None;
     }
@@ -228,7 +245,8 @@ impl SharedFlags {
 
   /// Peek the most recent file-type tag without popping it.
   #[must_use]
-  pub fn current_file_type(&self) -> Option<&'static str> {
+  #[inline(always)]
+  pub const fn current_file_type(&self) -> Option<&'static str> {
     if self.file_type_stack_len == 0 {
       None
     } else {
@@ -478,6 +496,41 @@ impl AnyMeta<'_> {
   }
 }
 
+/// Payload for [`FileTypeFinalize::ExplicitThenLiteral`]: a `SetFileType($set)`
+/// followed by a raw replacement of the `File:FileType` value with `$literal`
+/// (AIFF DjVu multi-page, AIFF.pm:206). Extracted into a named struct so the
+/// enum stays unit-or-newtype only (§2 — no struct-style variants); the
+/// `FileTypeExtension` / `MIMEType` are derived from `set`, NOT `literal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitThenLiteral {
+  set: &'static str,
+  literal: &'static str,
+}
+
+impl ExplicitThenLiteral {
+  /// Construct from the `SetFileType` argument and the literal that replaces
+  /// the `File:FileType` value in place.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(set: &'static str, literal: &'static str) -> Self {
+    Self { set, literal }
+  }
+
+  /// The type passed to `SetFileType` (drives `FileTypeExtension`/`MIMEType`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn set(&self) -> &'static str {
+    self.set
+  }
+
+  /// The literal that replaces the `File:FileType` value in place.
+  #[must_use]
+  #[inline(always)]
+  pub const fn literal(&self) -> &'static str {
+    self.literal
+  }
+}
+
 /// How the engine ([`crate::parser::extract_info`]) should finalize the
 /// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
 /// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
@@ -485,9 +538,21 @@ impl AnyMeta<'_> {
 /// the engine applies it against its file-type-resolution helpers.
 ///
 /// `#[non_exhaustive]` like the sibling closed-set enums: variants are
-/// additive within the crate.
+/// additive within the crate. Variants are unit or newtype only (§2): the
+/// two-field finalize case lives in the [`ExplicitThenLiteral`] named struct.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum FileTypeFinalize {
   /// `SetFileType()` with no argument — finalize to the DETECTED candidate
   /// type (ExifTool.pm:9684). The MOI/AAC/DV/Audible/Red/APE/DSF/FLAC/MPC/WV
@@ -503,13 +568,8 @@ pub enum FileTypeFinalize {
   /// `SetFileType($set)` then raw-replace the `File:FileType` VALUE with
   /// `$literal` (AIFF DjVu multi-page: `SetFileType('DJVU')` then
   /// `$$self{VALUE}{FileType} = 'DJVU (multi-page)'`, AIFF.pm:206). The
-  /// `FileTypeExtension` / `MIMEType` are derived from `$set`, NOT `$literal`.
-  ExplicitThenLiteral {
-    /// The type passed to `SetFileType` (drives `FileTypeExtension`/`MIMEType`).
-    set: &'static str,
-    /// The literal that replaces the `File:FileType` value in place.
-    literal: &'static str,
-  },
+  /// payload (see [`ExplicitThenLiteral`]) carries the `set` + `literal`.
+  ExplicitThenLiteral(ExplicitThenLiteral),
 }
 
 impl AnyMeta<'_> {
@@ -542,10 +602,7 @@ impl AnyMeta<'_> {
       AnyMeta::Aiff(m) => {
         let ft = m.magic().as_file_type();
         if m.djvu_multi_page() {
-          FileTypeFinalize::ExplicitThenLiteral {
-            set: ft,
-            literal: "DJVU (multi-page)",
-          }
+          FileTypeFinalize::ExplicitThenLiteral(ExplicitThenLiteral::new(ft, "DJVU (multi-page)"))
         } else {
           FileTypeFinalize::Explicit(ft)
         }
@@ -692,73 +749,81 @@ const _: () = {
 /// cannot exhaustively match on this enum across crate-feature combos —
 /// new format arms (or new variants on existing errors) are additive
 /// within the crate, but no caller can rely on a fixed set.
+///
+/// §5: derived via `thiserror` (`Display` + `core::error::Error`, no-std
+/// clean — was a `std`-only hand-written `impl std::error::Error`). The
+/// per-arm `From<XxxError>` impls below stay hand-written rather than using
+/// thiserror's `#[from]`: `#[from]` implies `#[source]`, which would bound
+/// each wrapped `XxxError: core::error::Error`, but the per-format error
+/// types only implement `Error` under `std` today (their no-std `Error`
+/// impl is a Wave-2 item). The `#[error("PREFIX: {0}")]` Display uses each
+/// field's `Display` (which IS unconditional), so `AnyError` is no-std
+/// clean now; once the format errors gain a no-std `Error` impl, the manual
+/// `From` block can collapse to `#[from]`.
 #[non_exhaustive]
-#[derive(Debug, Clone, derive_more::Display)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AnyError {
   /// MOI fatal-error wrapper.
   #[cfg(feature = "moi")]
-  #[display("MOI: {_0}")]
+  #[error("MOI: {0}")]
   Moi(crate::formats::moi::MoiError),
   /// AAC fatal-error wrapper.
   #[cfg(feature = "aac")]
-  #[display("AAC: {_0}")]
+  #[error("AAC: {0}")]
   Aac(crate::formats::aac::AacError),
   /// DV fatal-error wrapper.
   #[cfg(feature = "dv")]
-  #[display("DV: {_0}")]
+  #[error("DV: {0}")]
   Dv(crate::formats::dv::DvError),
   /// Audible (AA) fatal-error wrapper.
   #[cfg(feature = "audible")]
-  #[display("AA: {_0}")]
+  #[error("AA: {0}")]
   Aa(crate::formats::audible::AudibleError),
   /// Red R3D fatal-error wrapper.
   #[cfg(feature = "red")]
-  #[display("R3D: {_0}")]
+  #[error("R3D: {0}")]
   R3d(crate::formats::red::R3dError),
   /// ID3 fatal-error wrapper.
   #[cfg(feature = "id3")]
-  #[display("ID3: {_0}")]
+  #[error("ID3: {0}")]
   Id3(crate::formats::id3::Id3Error),
   /// MP3 fatal-error wrapper.
   #[cfg(feature = "mp3")]
-  #[display("MP3: {_0}")]
+  #[error("MP3: {0}")]
   Mp3(crate::formats::id3::Mp3Error),
   /// AIFF fatal-error wrapper.
   #[cfg(feature = "aiff")]
-  #[display("AIFF: {_0}")]
+  #[error("AIFF: {0}")]
   Aiff(crate::formats::aiff::AiffError),
   /// APE fatal-error wrapper.
   #[cfg(feature = "ape")]
-  #[display("APE: {_0}")]
+  #[error("APE: {0}")]
   Ape(crate::formats::ape::ApeError),
   /// DSF fatal-error wrapper.
   #[cfg(feature = "dsf")]
-  #[display("DSF: {_0}")]
+  #[error("DSF: {0}")]
   Dsf(crate::formats::dsf::DsfError),
   /// FLAC fatal-error wrapper.
   #[cfg(feature = "flac")]
-  #[display("FLAC: {_0}")]
+  #[error("FLAC: {0}")]
   Flac(crate::formats::flac::FlacError),
   /// Ogg fatal-error wrapper.
   #[cfg(feature = "ogg")]
-  #[display("OGG: {_0}")]
+  #[error("OGG: {0}")]
   Ogg(crate::formats::ogg::OggError),
   /// MPEG audio fatal-error wrapper.
   #[cfg(feature = "mpeg-audio")]
-  #[display("MPEG-audio: {_0}")]
+  #[error("MPEG-audio: {0}")]
   MpegAudio(crate::formats::mpeg::MpegAudioError),
   /// MPC fatal-error wrapper.
   #[cfg(feature = "mpc")]
-  #[display("MPC: {_0}")]
+  #[error("MPC: {0}")]
   Mpc(crate::formats::mpc::MpcError),
   /// WavPack fatal-error wrapper.
   #[cfg(feature = "wavpack")]
-  #[display("WV: {_0}")]
+  #[error("WV: {0}")]
   Wv(crate::formats::wavpack::WvError),
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for AnyError {}
 
 #[cfg(feature = "moi")]
 impl From<crate::formats::moi::MoiError> for AnyError {
@@ -1168,7 +1233,7 @@ mod tests {
     let mut sf = SharedFlags::new();
     assert_eq!(sf.done_id3(), None);
     assert!(!sf.done_ape());
-    assert!(sf.file_type_stack().is_empty());
+    assert!(sf.file_type_stack_slice().is_empty());
     assert_eq!(sf.current_file_type(), None);
 
     sf.set_done_id3(128);
@@ -1178,12 +1243,12 @@ mod tests {
     assert_eq!(sf.done_id3(), Some(128));
     assert!(sf.done_ape());
     assert_eq!(sf.current_file_type(), Some("ID3"));
-    assert_eq!(sf.file_type_stack(), &[Some("MP3"), Some("ID3")]);
+    assert_eq!(sf.file_type_stack_slice(), &[Some("MP3"), Some("ID3")]);
 
     assert_eq!(sf.pop_file_type(), Some("ID3"));
     assert_eq!(sf.pop_file_type(), Some("MP3"));
     assert_eq!(sf.pop_file_type(), None);
-    assert!(sf.file_type_stack().is_empty());
+    assert!(sf.file_type_stack_slice().is_empty());
   }
 
   /// `any_parser_for` resolves every ported format that has its feature

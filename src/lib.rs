@@ -132,7 +132,9 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use parser_new::Rendered;
-pub use parser_new::{AnyError, AnyMeta, AnyParser, FileTypeFinalize, SharedFlags};
+pub use parser_new::{
+  AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags,
+};
 
 // Per-format public typed re-exports. Each module's `XxxMeta<'a>` + accessor
 // methods are the lib-first surface; the `ProcessXxx` unit-struct is the
