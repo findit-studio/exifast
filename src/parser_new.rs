@@ -751,169 +751,81 @@ const _: () = {
 /// within the crate, but no caller can rely on a fixed set.
 ///
 /// §5: derived via `thiserror` (`Display` + `core::error::Error`, no-std
-/// clean — was a `std`-only hand-written `impl std::error::Error`). The
-/// per-arm `From<XxxError>` impls below stay hand-written rather than using
-/// thiserror's `#[from]`: `#[from]` implies `#[source]`, which would bound
-/// each wrapped `XxxError: core::error::Error`, but the per-format error
-/// types only implement `Error` under `std` today (their no-std `Error`
-/// impl is a Wave-2 item). The `#[error("PREFIX: {0}")]` Display uses each
-/// field's `Display` (which IS unconditional), so `AnyError` is no-std
-/// clean now; once the format errors gain a no-std `Error` impl, the manual
-/// `From` block can collapse to `#[from]`.
+/// clean — was a `std`-only hand-written `impl std::error::Error`). Each
+/// wrapped source is `#[from]` (which implies `#[source]`): thiserror
+/// generates the per-arm `From<XxxError>` conversion AND threads the wrapped
+/// error through `source()`, so the dispatch in [`AnyParser::parse_any`] can
+/// write `.map_err(Into::into)` for free. This was a Wave-1 forward item: it
+/// became possible once the Wave-2 sweep gave every format error a
+/// `#[derive(thiserror::Error)]` `core::error::Error` impl in all feature
+/// tiers (the `#[from]`-implied `XxxError: core::error::Error` bound is now
+/// satisfied unconditionally, not just under `std`). `#[from]` works even on
+/// the uninhabited (empty-enum) format errors — thiserror emits a
+/// `From<Empty>` whose body is type-correct but never callable, which `rustc`
+/// constant-folds out at monomorphization.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AnyError {
   /// MOI fatal-error wrapper.
   #[cfg(feature = "moi")]
   #[error("MOI: {0}")]
-  Moi(crate::formats::moi::MoiError),
+  Moi(#[from] crate::formats::moi::MoiError),
   /// AAC fatal-error wrapper.
   #[cfg(feature = "aac")]
   #[error("AAC: {0}")]
-  Aac(crate::formats::aac::AacError),
+  Aac(#[from] crate::formats::aac::AacError),
   /// DV fatal-error wrapper.
   #[cfg(feature = "dv")]
   #[error("DV: {0}")]
-  Dv(crate::formats::dv::DvError),
+  Dv(#[from] crate::formats::dv::DvError),
   /// Audible (AA) fatal-error wrapper.
   #[cfg(feature = "audible")]
   #[error("AA: {0}")]
-  Aa(crate::formats::audible::AudibleError),
+  Aa(#[from] crate::formats::audible::AudibleError),
   /// Red R3D fatal-error wrapper.
   #[cfg(feature = "red")]
   #[error("R3D: {0}")]
-  R3d(crate::formats::red::R3dError),
+  R3d(#[from] crate::formats::red::R3dError),
   /// ID3 fatal-error wrapper.
   #[cfg(feature = "id3")]
   #[error("ID3: {0}")]
-  Id3(crate::formats::id3::Id3Error),
+  Id3(#[from] crate::formats::id3::Id3Error),
   /// MP3 fatal-error wrapper.
   #[cfg(feature = "mp3")]
   #[error("MP3: {0}")]
-  Mp3(crate::formats::id3::Mp3Error),
+  Mp3(#[from] crate::formats::id3::Mp3Error),
   /// AIFF fatal-error wrapper.
   #[cfg(feature = "aiff")]
   #[error("AIFF: {0}")]
-  Aiff(crate::formats::aiff::AiffError),
+  Aiff(#[from] crate::formats::aiff::AiffError),
   /// APE fatal-error wrapper.
   #[cfg(feature = "ape")]
   #[error("APE: {0}")]
-  Ape(crate::formats::ape::ApeError),
+  Ape(#[from] crate::formats::ape::ApeError),
   /// DSF fatal-error wrapper.
   #[cfg(feature = "dsf")]
   #[error("DSF: {0}")]
-  Dsf(crate::formats::dsf::DsfError),
+  Dsf(#[from] crate::formats::dsf::DsfError),
   /// FLAC fatal-error wrapper.
   #[cfg(feature = "flac")]
   #[error("FLAC: {0}")]
-  Flac(crate::formats::flac::FlacError),
+  Flac(#[from] crate::formats::flac::FlacError),
   /// Ogg fatal-error wrapper.
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
-  Ogg(crate::formats::ogg::OggError),
+  Ogg(#[from] crate::formats::ogg::OggError),
   /// MPEG audio fatal-error wrapper.
   #[cfg(feature = "mpeg-audio")]
   #[error("MPEG-audio: {0}")]
-  MpegAudio(crate::formats::mpeg::MpegAudioError),
+  MpegAudio(#[from] crate::formats::mpeg::MpegAudioError),
   /// MPC fatal-error wrapper.
   #[cfg(feature = "mpc")]
   #[error("MPC: {0}")]
-  Mpc(crate::formats::mpc::MpcError),
+  Mpc(#[from] crate::formats::mpc::MpcError),
   /// WavPack fatal-error wrapper.
   #[cfg(feature = "wavpack")]
   #[error("WV: {0}")]
-  Wv(crate::formats::wavpack::WvError),
-}
-
-#[cfg(feature = "moi")]
-impl From<crate::formats::moi::MoiError> for AnyError {
-  fn from(e: crate::formats::moi::MoiError) -> Self {
-    AnyError::Moi(e)
-  }
-}
-#[cfg(feature = "aac")]
-impl From<crate::formats::aac::AacError> for AnyError {
-  fn from(e: crate::formats::aac::AacError) -> Self {
-    AnyError::Aac(e)
-  }
-}
-#[cfg(feature = "dv")]
-impl From<crate::formats::dv::DvError> for AnyError {
-  fn from(e: crate::formats::dv::DvError) -> Self {
-    AnyError::Dv(e)
-  }
-}
-#[cfg(feature = "audible")]
-impl From<crate::formats::audible::AudibleError> for AnyError {
-  fn from(e: crate::formats::audible::AudibleError) -> Self {
-    AnyError::Aa(e)
-  }
-}
-#[cfg(feature = "red")]
-impl From<crate::formats::red::R3dError> for AnyError {
-  fn from(e: crate::formats::red::R3dError) -> Self {
-    AnyError::R3d(e)
-  }
-}
-#[cfg(feature = "id3")]
-impl From<crate::formats::id3::Id3Error> for AnyError {
-  fn from(e: crate::formats::id3::Id3Error) -> Self {
-    AnyError::Id3(e)
-  }
-}
-#[cfg(feature = "mp3")]
-impl From<crate::formats::id3::Mp3Error> for AnyError {
-  fn from(e: crate::formats::id3::Mp3Error) -> Self {
-    AnyError::Mp3(e)
-  }
-}
-#[cfg(feature = "aiff")]
-impl From<crate::formats::aiff::AiffError> for AnyError {
-  fn from(e: crate::formats::aiff::AiffError) -> Self {
-    AnyError::Aiff(e)
-  }
-}
-#[cfg(feature = "ape")]
-impl From<crate::formats::ape::ApeError> for AnyError {
-  fn from(e: crate::formats::ape::ApeError) -> Self {
-    AnyError::Ape(e)
-  }
-}
-#[cfg(feature = "dsf")]
-impl From<crate::formats::dsf::DsfError> for AnyError {
-  fn from(e: crate::formats::dsf::DsfError) -> Self {
-    AnyError::Dsf(e)
-  }
-}
-#[cfg(feature = "flac")]
-impl From<crate::formats::flac::FlacError> for AnyError {
-  fn from(e: crate::formats::flac::FlacError) -> Self {
-    AnyError::Flac(e)
-  }
-}
-#[cfg(feature = "ogg")]
-impl From<crate::formats::ogg::OggError> for AnyError {
-  fn from(e: crate::formats::ogg::OggError) -> Self {
-    AnyError::Ogg(e)
-  }
-}
-#[cfg(feature = "mpeg-audio")]
-impl From<crate::formats::mpeg::MpegAudioError> for AnyError {
-  fn from(e: crate::formats::mpeg::MpegAudioError) -> Self {
-    AnyError::MpegAudio(e)
-  }
-}
-#[cfg(feature = "mpc")]
-impl From<crate::formats::mpc::MpcError> for AnyError {
-  fn from(e: crate::formats::mpc::MpcError) -> Self {
-    AnyError::Mpc(e)
-  }
-}
-#[cfg(feature = "wavpack")]
-impl From<crate::formats::wavpack::WvError> for AnyError {
-  fn from(e: crate::formats::wavpack::WvError) -> Self {
-    AnyError::Wv(e)
-  }
+  Wv(#[from] crate::formats::wavpack::WvError),
 }
 
 /// Compute the bundled `$hdrEnd` (ID3.pm:1457-1465,1504) for an `ID3`-prefixed
