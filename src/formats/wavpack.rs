@@ -138,8 +138,15 @@ const fn sample_rate_lookup(index: u8) -> Option<SampleRate> {
 
 /// `AudioType` PrintConv (WavPack.pm:39): 0 ⇒ "Stereo", 1 ⇒ "Mono".
 ///
-/// D8: newtype-style enum — no fields on variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §2: unit-only variant enum. The on-disk source is a single `Mask => 0x04`
+/// bit (WavPack.pm:38), so the vocabulary is **closed and total** — every
+/// raw value (0 or 1) maps to a variant and `from_raw`/`raw` round-trip for
+/// both, so no lossless `Unknown` escape is needed. `#[non_exhaustive]`
+/// guards future additions (the `AudioType` axis could grow if a later
+/// WavPack revision widened the field). Predicates (`is_*`) and `Display`
+/// route through [`AudioType::as_str`] (single source of truth).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
 pub enum AudioType {
   /// WavPack.pm:39 — raw 0 ⇒ "Stereo".
   Stereo,
@@ -150,6 +157,7 @@ pub enum AudioType {
 impl AudioType {
   /// Decode the raw bit (already mask + shift extracted) — 0 or 1.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(b: u8) -> AudioType {
     if b == 0 {
       AudioType::Stereo
@@ -159,8 +167,9 @@ impl AudioType {
   }
 
   /// The on-disk raw bit (0 = Stereo, 1 = Mono). Used by the `-n` raw
-  /// emission path.
+  /// emission path. Round-trips with [`Self::from_raw`] for every value.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       AudioType::Stereo => 0,
@@ -168,9 +177,11 @@ impl AudioType {
     }
   }
 
-  /// WavPack.pm:39 PrintConv string.
+  /// WavPack.pm:39 PrintConv string. Single source of truth for both the
+  /// PrintConv emission and [`Display`](core::fmt::Display).
   #[must_use]
-  pub const fn print_conv(self) -> &'static str {
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
     match self {
       AudioType::Stereo => "Stereo",
       AudioType::Mono => "Mono",
@@ -178,10 +189,21 @@ impl AudioType {
   }
 }
 
+impl core::fmt::Display for AudioType {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
 /// `Compression` PrintConv (WavPack.pm:44): 0 ⇒ "Lossless", 1 ⇒ "Hybrid".
 ///
-/// D8: newtype-style enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §2: unit-only variant enum, closed-and-total over the single
+/// `Mask => 0x08` bit (WavPack.pm:43) — `from_raw`/`raw` round-trip for both
+/// values, so no `Unknown` escape is needed. `#[non_exhaustive]` +
+/// predicates + `Display` via [`Compression::as_str`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
 pub enum Compression {
   /// WavPack.pm:44 — raw 0 ⇒ "Lossless".
   Lossless,
@@ -192,6 +214,7 @@ pub enum Compression {
 impl Compression {
   /// Decode the raw bit (already mask + shift extracted) — 0 or 1.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(b: u8) -> Compression {
     if b == 0 {
       Compression::Lossless
@@ -200,8 +223,10 @@ impl Compression {
     }
   }
 
-  /// The on-disk raw bit (0 = Lossless, 1 = Hybrid).
+  /// The on-disk raw bit (0 = Lossless, 1 = Hybrid). Round-trips with
+  /// [`Self::from_raw`] for every value.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       Compression::Lossless => 0,
@@ -209,9 +234,11 @@ impl Compression {
     }
   }
 
-  /// WavPack.pm:44 PrintConv string.
+  /// WavPack.pm:44 PrintConv string. Single source of truth for both the
+  /// PrintConv emission and [`Display`](core::fmt::Display).
   #[must_use]
-  pub const fn print_conv(self) -> &'static str {
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
     match self {
       Compression::Lossless => "Lossless",
       Compression::Hybrid => "Hybrid",
@@ -219,10 +246,21 @@ impl Compression {
   }
 }
 
+impl core::fmt::Display for Compression {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
 /// `DataFormat` PrintConv (WavPack.pm:49): 0 ⇒ "Integer", 1 ⇒ "Floating Point".
 ///
-/// D8: newtype-style enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §2: unit-only variant enum, closed-and-total over the single
+/// `Mask => 0x80` bit (WavPack.pm:48) — `from_raw`/`raw` round-trip for both
+/// values, so no `Unknown` escape is needed. `#[non_exhaustive]` +
+/// predicates + `Display` via [`DataFormat::as_str`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
 pub enum DataFormat {
   /// WavPack.pm:49 — raw 0 ⇒ "Integer".
   Integer,
@@ -233,6 +271,7 @@ pub enum DataFormat {
 impl DataFormat {
   /// Decode the raw bit (already mask + shift extracted) — 0 or 1.
   #[must_use]
+  #[inline(always)]
   pub const fn from_raw(b: u8) -> DataFormat {
     if b == 0 {
       DataFormat::Integer
@@ -241,8 +280,10 @@ impl DataFormat {
     }
   }
 
-  /// The on-disk raw bit (0 = Integer, 1 = FloatingPoint).
+  /// The on-disk raw bit (0 = Integer, 1 = FloatingPoint). Round-trips with
+  /// [`Self::from_raw`] for every value.
   #[must_use]
+  #[inline(always)]
   pub const fn raw(self) -> u8 {
     match self {
       DataFormat::Integer => 0,
@@ -250,9 +291,11 @@ impl DataFormat {
     }
   }
 
-  /// WavPack.pm:49 PrintConv string.
+  /// WavPack.pm:49 PrintConv string. Single source of truth for both the
+  /// PrintConv emission and [`Display`](core::fmt::Display).
   #[must_use]
-  pub const fn print_conv(self) -> &'static str {
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
     match self {
       DataFormat::Integer => "Integer",
       DataFormat::FloatingPoint => "Floating Point",
@@ -260,19 +303,58 @@ impl DataFormat {
   }
 }
 
+impl core::fmt::Display for DataFormat {
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
 /// `SampleRate` PrintConv decoded shape (WavPack.pm:55-72). Indices
 /// 0..=14 map to known integer rates; index 15 is the `"Custom"` string.
 ///
-/// D8: newtype-style enum — the `Hz` variant payload is the post-PrintConv
-/// numeric rate, NOT the raw 4-bit index (`raw_index` is preserved
-/// separately on [`WvMeta`] for `-n` emission).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// §2: unit-or-newtype variants only — `Hz(u32)` (newtype) carries the
+/// post-PrintConv numeric rate, NOT the raw 4-bit index (the raw index is
+/// preserved separately on [`WvMeta::sample_rate_raw_index`] for `-n`
+/// emission and provides the lossless on-disk round-trip). The
+/// externally-numbered 4-bit index is **total** over [0, 15] via
+/// [`sample_rate_lookup`], so this decoded form needs no `Unknown` escape.
+/// `#[non_exhaustive]` guards future rate additions. Data-carrying, so it
+/// gets `is_*` predicates plus `unwrap_hz`/`try_unwrap_hz` accessors
+/// (derive_more) and a `Display` routed through the same numeric/`"Custom"`
+/// rendering the serializer uses. The `Hz` payload is `Copy` (`u32`), so the
+/// by-value `unwrap_hz()`/`try_unwrap_hz()` accessors are the ergonomic form
+/// (no `ref` variants needed).
+#[non_exhaustive]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
 pub enum SampleRate {
   /// WavPack.pm:55-71 — known sample rate in Hz (e.g. `48000`).
   Hz(u32),
   /// WavPack.pm:72 — index 15 ⇒ `"Custom"` (sample rate not encoded in
   /// the header; the rate is "custom" / out-of-table).
   Custom,
+}
+
+impl core::fmt::Display for SampleRate {
+  /// Single source of truth for `SampleRate`'s textual rendering — matches
+  /// the `serialize_tags` PrintConv emission (`Hz(n)` ⇒ the bare number,
+  /// `Custom` ⇒ `"Custom"`).
+  #[inline(always)]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      SampleRate::Hz(n) => write!(f, "{n}"),
+      SampleRate::Custom => f.write_str("Custom"),
+    }
+  }
 }
 
 // ===========================================================================
@@ -355,34 +437,40 @@ pub struct WvMeta<'a> {
 }
 
 impl<'a> WvMeta<'a> {
-  /// WavPack.pm:31-35 — `BytesPerSample` post-ValueConv (1..=4).
+  /// WavPack.pm:31-35 — `BytesPerSample` post-ValueConv (1..=4). Copy ⇒
+  /// returned by value under the bare name (§3).
   #[must_use]
-  pub fn bytes_per_sample(&self) -> u8 {
+  #[inline(always)]
+  pub const fn bytes_per_sample(&self) -> u8 {
     self.bytes_per_sample
   }
 
-  /// WavPack.pm:36-40 — `AudioType` decoded enum.
+  /// WavPack.pm:36-40 — `AudioType` decoded enum. Copy ⇒ by value (§3).
   #[must_use]
-  pub fn audio_type(&self) -> AudioType {
+  #[inline(always)]
+  pub const fn audio_type(&self) -> AudioType {
     self.audio_type
   }
 
-  /// WavPack.pm:41-45 — `Compression` decoded enum.
+  /// WavPack.pm:41-45 — `Compression` decoded enum. Copy ⇒ by value (§3).
   #[must_use]
-  pub fn compression(&self) -> Compression {
+  #[inline(always)]
+  pub const fn compression(&self) -> Compression {
     self.compression
   }
 
-  /// WavPack.pm:46-50 — `DataFormat` decoded enum.
+  /// WavPack.pm:46-50 — `DataFormat` decoded enum. Copy ⇒ by value (§3).
   #[must_use]
-  pub fn data_format(&self) -> DataFormat {
+  #[inline(always)]
+  pub const fn data_format(&self) -> DataFormat {
     self.data_format
   }
 
   /// WavPack.pm:51-73 — `SampleRate` typed decoded form (`Hz(u32)` or
-  /// `Custom`).
+  /// `Custom`). Copy ⇒ by value (§3).
   #[must_use]
-  pub fn sample_rate(&self) -> SampleRate {
+  #[inline(always)]
+  pub const fn sample_rate(&self) -> SampleRate {
     self.sample_rate
   }
 
@@ -390,7 +478,8 @@ impl<'a> WvMeta<'a> {
   /// index 15. Convenience accessor for callers that want a numeric
   /// rate or nothing.
   #[must_use]
-  pub fn sample_rate_hz(&self) -> Option<u32> {
+  #[inline(always)]
+  pub const fn sample_rate_hz(&self) -> Option<u32> {
     match self.sample_rate {
       SampleRate::Hz(n) => Some(n),
       SampleRate::Custom => None,
@@ -399,9 +488,10 @@ impl<'a> WvMeta<'a> {
 
   /// Raw 4-bit `SampleRate` index ∈ [0, 15]. Equivalent to the bundled
   /// `perl exiftool -n` numeric output for `File:SampleRate` (which
-  /// emits the pre-PrintConv raw mask value).
+  /// emits the pre-PrintConv raw mask value). Copy ⇒ by value (§3).
   #[must_use]
-  pub fn sample_rate_raw_index(&self) -> u8 {
+  #[inline(always)]
+  pub const fn sample_rate_raw_index(&self) -> u8 {
     self.sample_rate_raw_index
   }
 
@@ -410,9 +500,11 @@ impl<'a> WvMeta<'a> {
   /// this to the full buffer. The engine entry `process` consumes it
   /// through the existing chained entries
   /// `crate::formats::id3::process::process_id3_chained` +
-  /// `crate::formats::ape::ProcessApe::process_trailer_only`.
+  /// `crate::formats::ape::ProcessApe::process_trailer_only`. §3 slice
+  /// projection: returns `Option<&[u8]>`, never `&Option<&[u8]>`.
   #[must_use]
-  pub fn id3_ape_scan_range(&self) -> Option<&'a [u8]> {
+  #[inline(always)]
+  pub const fn id3_ape_scan_range(&self) -> Option<&'a [u8]> {
     self.id3_apetrailer_scan
   }
 }
@@ -450,27 +542,35 @@ impl<'a> WvContext<'a> {
   /// Build a context wrapping `data` and a borrowed `shared` flags
   /// table. The flags are not mutated by the lib-first parse today;
   /// see the type-level docs for the Phase F2 / F3 plan.
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self { data, shared }
   }
 
-  /// View the input bytes.
+  /// View the input bytes. §3 slice projection — returns `&[u8]`.
   #[must_use]
-  pub fn data(&self) -> &'a [u8] {
+  #[inline(always)]
+  pub const fn data(&self) -> &'a [u8] {
     self.data
   }
 
   /// Read-only view of the shared flags. The mutable borrow is exposed
   /// via [`Self::shared_mut`] for the typed ID3 / APE parsers (Phase F2 /
-  /// F3) once they migrate.
+  /// F3) once they migrate. (The `shared`/`shared_mut` pairing mirrors the
+  /// established cross-format `SharedFlags` accessor convention —
+  /// `ape.rs`, `id3/process.rs` — rather than the generic `_ref`/`_mut`
+  /// pair, kept identical for chained-dispatch call-site uniformity.)
   #[must_use]
-  pub fn shared(&self) -> &SharedFlags {
+  #[inline(always)]
+  pub const fn shared(&self) -> &SharedFlags {
     self.shared
   }
 
   /// Mutable view of the shared flags (reserved for typed chained
   /// parsers; today's WavPack parse leaves them untouched).
-  pub fn shared_mut(&mut self) -> &mut SharedFlags {
+  #[inline(always)]
+  pub const fn shared_mut(&mut self) -> &mut SharedFlags {
     self.shared
   }
 }
@@ -636,21 +736,21 @@ impl WvMeta<'_> {
 
     // 6.2 AudioType — -j: PrintConv string; -n: raw u8.
     if print_conv {
-      out.write_str(GROUP, "AudioType", self.audio_type.print_conv())?;
+      out.write_str(GROUP, "AudioType", self.audio_type.as_str())?;
     } else {
       out.write_u64(GROUP, "AudioType", u64::from(self.audio_type.raw()))?;
     }
 
     // 6.3 Compression — -j: PrintConv string; -n: raw u8.
     if print_conv {
-      out.write_str(GROUP, "Compression", self.compression.print_conv())?;
+      out.write_str(GROUP, "Compression", self.compression.as_str())?;
     } else {
       out.write_u64(GROUP, "Compression", u64::from(self.compression.raw()))?;
     }
 
     // 6.4 DataFormat — -j: PrintConv string; -n: raw u8.
     if print_conv {
-      out.write_str(GROUP, "DataFormat", self.data_format.print_conv())?;
+      out.write_str(GROUP, "DataFormat", self.data_format.as_str())?;
     } else {
       out.write_u64(GROUP, "DataFormat", u64::from(self.data_format.raw()))?;
     }
@@ -678,17 +778,14 @@ impl WvMeta<'_> {
 /// Rust-level fatal modes for WavPack parsing. Currently empty — every
 /// bad input produces `Ok(None)` (Perl `return 0`). Reserved for future
 /// I/O wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
+/// `default-features = false` ⇒ `core::error::Error` in every feature
+/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
+/// without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WvError {}
-
-impl core::fmt::Display for WvError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for WvError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
@@ -734,6 +831,22 @@ mod tests {
     assert_eq!(sample_rate_lookup(16), None);
   }
 
+  #[test]
+  fn sample_rate_variant_accessors() {
+    // §2 predicates + unwrap accessors (derive_more) + Display single source.
+    let hz = SampleRate::Hz(48000);
+    assert!(hz.is_hz());
+    assert!(!hz.is_custom());
+    assert_eq!(hz.unwrap_hz(), 48000u32);
+    assert_eq!(hz.try_unwrap_hz().ok(), Some(48000u32));
+    assert_eq!(hz.to_string(), "48000");
+    let custom = SampleRate::Custom;
+    assert!(custom.is_custom());
+    assert!(!custom.is_hz());
+    assert!(custom.try_unwrap_hz().is_err());
+    assert_eq!(custom.to_string(), "Custom");
+  }
+
   // -------------------------------------------------------------------------
   // Typed enums
   // -------------------------------------------------------------------------
@@ -744,8 +857,13 @@ mod tests {
     assert_eq!(AudioType::from_raw(1), AudioType::Mono);
     assert_eq!(AudioType::Stereo.raw(), 0);
     assert_eq!(AudioType::Mono.raw(), 1);
-    assert_eq!(AudioType::Stereo.print_conv(), "Stereo");
-    assert_eq!(AudioType::Mono.print_conv(), "Mono");
+    assert_eq!(AudioType::Stereo.as_str(), "Stereo");
+    assert_eq!(AudioType::Mono.as_str(), "Mono");
+    // §2 Display routes through as_str (single source of truth).
+    assert_eq!(AudioType::Stereo.to_string(), "Stereo");
+    // §2 predicates (derive_more::IsVariant).
+    assert!(AudioType::Stereo.is_stereo());
+    assert!(!AudioType::Stereo.is_mono());
   }
 
   #[test]
@@ -754,8 +872,11 @@ mod tests {
     assert_eq!(Compression::from_raw(1), Compression::Hybrid);
     assert_eq!(Compression::Lossless.raw(), 0);
     assert_eq!(Compression::Hybrid.raw(), 1);
-    assert_eq!(Compression::Lossless.print_conv(), "Lossless");
-    assert_eq!(Compression::Hybrid.print_conv(), "Hybrid");
+    assert_eq!(Compression::Lossless.as_str(), "Lossless");
+    assert_eq!(Compression::Hybrid.as_str(), "Hybrid");
+    assert_eq!(Compression::Hybrid.to_string(), "Hybrid");
+    assert!(Compression::Lossless.is_lossless());
+    assert!(Compression::Hybrid.is_hybrid());
   }
 
   #[test]
@@ -764,8 +885,11 @@ mod tests {
     assert_eq!(DataFormat::from_raw(1), DataFormat::FloatingPoint);
     assert_eq!(DataFormat::Integer.raw(), 0);
     assert_eq!(DataFormat::FloatingPoint.raw(), 1);
-    assert_eq!(DataFormat::Integer.print_conv(), "Integer");
-    assert_eq!(DataFormat::FloatingPoint.print_conv(), "Floating Point");
+    assert_eq!(DataFormat::Integer.as_str(), "Integer");
+    assert_eq!(DataFormat::FloatingPoint.as_str(), "Floating Point");
+    assert_eq!(DataFormat::FloatingPoint.to_string(), "Floating Point");
+    assert!(DataFormat::Integer.is_integer());
+    assert!(DataFormat::FloatingPoint.is_floating_point());
   }
 
   // -------------------------------------------------------------------------

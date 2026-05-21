@@ -324,12 +324,14 @@ pub struct MpcSv7Header {
 impl MpcSv7Header {
   /// `TotalFrames` raw u32 (MPC.pm:28).
   #[must_use]
+  #[inline(always)]
   pub const fn total_frames(&self) -> u32 {
     self.total_frames
   }
   /// `SampleRate` raw index (0..=3, MPC.pm:29-37). Use
   /// [`Self::sample_rate_hz`] for the PrintConv-mapped Hz number.
   #[must_use]
+  #[inline(always)]
   pub const fn sample_rate_index(&self) -> u8 {
     self.sample_rate_index
   }
@@ -337,6 +339,7 @@ impl MpcSv7Header {
   /// raw index is off-table (unreachable: bit field is 2-bit, all 4 values
   /// are mapped).
   #[must_use]
+  #[inline(always)]
   pub const fn sample_rate_hz(&self) -> Option<u32> {
     match self.sample_rate_index {
       0 => Some(44100), // MPC.pm:32
@@ -348,6 +351,7 @@ impl MpcSv7Header {
   }
   /// `Quality` raw index (1..=15, MPC.pm:38-54).
   #[must_use]
+  #[inline(always)]
   pub const fn quality_index(&self) -> u8 {
     self.quality_index
   }
@@ -355,6 +359,7 @@ impl MpcSv7Header {
   /// (raw 0, 2, 3, 4 — sparse keys); the legacy bridge then emits the
   /// generic `Unknown (N)` fallback (ExifTool.pm:3622).
   #[must_use]
+  #[inline(always)]
   pub const fn quality_name(&self) -> Option<&'static str> {
     match self.quality_index {
       1 => Some("Unstable/Experimental"),
@@ -374,42 +379,50 @@ impl MpcSv7Header {
   }
   /// `MaxBand` raw 6-bit (MPC.pm:55).
   #[must_use]
+  #[inline(always)]
   pub const fn max_band(&self) -> u8 {
     self.max_band
   }
   /// `ReplayGainTrackPeak` raw u16 (MPC.pm:56).
   #[must_use]
+  #[inline(always)]
   pub const fn replay_gain_track_peak(&self) -> u16 {
     self.replay_gain_track_peak
   }
   /// `ReplayGainTrackGain` raw u16 (MPC.pm:57).
   #[must_use]
+  #[inline(always)]
   pub const fn replay_gain_track_gain(&self) -> u16 {
     self.replay_gain_track_gain
   }
   /// `ReplayGainAlbumPeak` raw u16 (MPC.pm:58).
   #[must_use]
+  #[inline(always)]
   pub const fn replay_gain_album_peak(&self) -> u16 {
     self.replay_gain_album_peak
   }
   /// `ReplayGainAlbumGain` raw u16 (MPC.pm:59).
   #[must_use]
+  #[inline(always)]
   pub const fn replay_gain_album_gain(&self) -> u16 {
     self.replay_gain_album_gain
   }
   /// `FastSeek` raw 1-bit (MPC.pm:60-63). `true` ⇒ "Yes".
   #[must_use]
+  #[inline(always)]
   pub const fn fast_seek(&self) -> bool {
     self.fast_seek != 0
   }
   /// `Gapless` raw 1-bit (MPC.pm:64-67). `true` ⇒ "Yes".
   #[must_use]
+  #[inline(always)]
   pub const fn gapless(&self) -> bool {
     self.gapless != 0
   }
   /// `EncoderVersion` raw byte (MPC.pm:68-71). Use
   /// [`Self::encoder_version_str`] for the dotted PrintConv form.
   #[must_use]
+  #[inline(always)]
   pub const fn encoder_version(&self) -> u8 {
     self.encoder_version
   }
@@ -469,29 +482,34 @@ impl<'a> MpcMeta<'a> {
   /// MP+ version low nibble (MPC.pm:93). `0x07` ⇒ SV7 path; anything else
   /// ⇒ warning arm (MPC.pm:107-109).
   #[must_use]
+  #[inline(always)]
   pub const fn version(&self) -> u8 {
     self.version
   }
   /// SV7 header fields, present iff [`Self::version`] returned `0x07`.
   #[must_use]
+  #[inline(always)]
   pub const fn sv7_header(&self) -> Option<&MpcSv7Header> {
     self.sv7_header.as_ref()
   }
   /// `true` if the MPC.pm:108 warning (`'Audio info currently not extracted
   /// from this version MPC file'`) should be emitted.
   #[must_use]
+  #[inline(always)]
   pub const fn warn_unsupported_version(&self) -> bool {
     self.warn_unsupported_version
   }
   /// **Phase F5 placeholder.** ID3-prefix bytes (always `None` today; see
   /// the field-level doc).
   #[must_use]
+  #[inline(always)]
   pub const fn id3_prefix(&self) -> Option<&'a [u8]> {
     self.id3_prefix
   }
   /// **Phase F5 placeholder.** APE-trailer bytes (always `None` today; see
   /// the field-level doc).
   #[must_use]
+  #[inline(always)]
   pub const fn ape_trailer(&self) -> Option<&'a [u8]> {
     self.ape_trailer
   }
@@ -527,18 +545,22 @@ impl<'a> MpcContext<'a> {
   /// Construct a chained-MPC context with the input bytes and a mutable
   /// [`SharedFlags`] handle.
   #[must_use]
-  pub fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
+  #[inline(always)]
+  pub const fn new(data: &'a [u8], shared: &'a mut SharedFlags) -> Self {
     Self { data, shared }
   }
-  /// Borrow the input bytes.
+  /// Borrow the input bytes. §3 slice projection — returns `&[u8]`.
   #[must_use]
+  #[inline(always)]
   pub const fn data(&self) -> &'a [u8] {
     self.data
   }
   /// Borrow the cross-format shared flags. Phase G integration will use
   /// this to thread `done_id3` / `done_ape` updates from typed `Id3Meta` /
-  /// `ApeMeta` runs.
-  pub fn shared(&mut self) -> &mut SharedFlags {
+  /// `ApeMeta` runs. (Named `shared` to mirror the established cross-format
+  /// `SharedFlags` accessor convention — `ape.rs`, `id3/process.rs`.)
+  #[inline(always)]
+  pub const fn shared(&mut self) -> &mut SharedFlags {
     self.shared
   }
 }
@@ -850,17 +872,14 @@ impl MpcMeta<'_> {
 /// Rust-level fatal modes for MPC parsing. Currently empty — every bad
 /// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
 /// wrappers if streaming readers are added.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
+/// `default-features = false` ⇒ `core::error::Error` in every feature
+/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
+/// without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MpcError {}
-
-impl core::fmt::Display for MpcError {
-  fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match *self {}
-  }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for MpcError {}
 
 // ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
