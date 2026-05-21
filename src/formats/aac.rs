@@ -14,7 +14,7 @@
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -426,15 +426,16 @@ impl std::error::Error for AacError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessAac {
-  /// Phase E–F migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so the
-  /// CLI JSON output stays byte-exact during Phases F1–F5. Retired in
-  /// Phase G.
+impl ProcessAac {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (AAC.pm:99-140): header magic + filesize + SF index
   /// gates ⇒ `SetFileType` ⇒ bit-stream walk ⇒ Encoder filler scan.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let bytes = ctx.data();
     let meta = match parse_inner(bytes) {
       Ok(Some(m)) => m,
@@ -509,18 +510,17 @@ mod tests {
     let mut m = crate::value::Metadata::new("x");
     let data = [0u8; 7];
     let mut c = ParseContext::new(&data, "AAC", 0, "AAC", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessAac, &mut c));
+    assert!(!ProcessAac.process(&mut c));
     assert!(m.tags().is_empty());
     let mut m2 = crate::value::Metadata::new("x");
     let bad = [0xff, 0x00];
     let mut c2 = ParseContext::new(&bad, "AAC", 0, "AAC", None, true, &mut m2);
-    assert!(!OldFormatParser::process(&ProcessAac, &mut c2)); // too short / bad sync
+    assert!(!ProcessAac.process(&mut c2)); // too short / bad sync
     assert!(m2.tags().is_empty());
   }
 
   #[test]
   fn filler_cnt15_byte0_no_panic() {
-    use crate::parser::FormatParser as _OldFP;
     // Byte derivation:
     //   [0]=0xff [1]=0xf1 → sync OK, no_crc=true (bit16 of t0 set)
     //   t0 = 0xff_f1_00_00; (t0>>16)&0x03 = 0x01 ≠ 3 ✓; (t0>>12)&0x0f = 0x00 ≤ 12 ✓
@@ -541,7 +541,7 @@ mod tests {
     ];
     let mut m = crate::value::Metadata::new("x");
     let mut c = crate::parser::ParseContext::new(&input, "AAC", 0, "AAC", None, true, &mut m);
-    assert!(_OldFP::process(&ProcessAac, &mut c));
+    assert!(ProcessAac.process(&mut c));
     assert!(m.tags().iter().all(|t| t.name() != "Encoder"));
     // Accept ⇒ the parser drove SetFileType (AAC.pm:107): File:* present.
     assert_eq!(

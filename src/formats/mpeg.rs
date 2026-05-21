@@ -60,7 +60,7 @@
 use std::{borrow::Cow, string::String};
 
 use crate::{
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   value::format_g,
@@ -1676,13 +1676,16 @@ impl ProcessMp3 {
   }
 }
 
-impl OldFormatParser for ProcessMp3 {
-  /// Phase F4 migration bridge. Faithful order (MPEG.pm:464-581): sync
-  /// scan ⇒ `SetFileType` ⇒ bit-extract ⇒ Xing/LAME tail. The bridge
-  /// retains identical byte-exact behavior to the pre-F4 push-style
-  /// path by driving the typed parser through `MetaSinker` →
-  /// `MetadataTagWriter`.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+#[cfg(test)]
+impl ProcessMp3 {
+  /// Raw-MPEG-audio entry (no preceding ID3) — the `start_offset == 0`
+  /// convenience over [`Self::process_with_start_offset`]. Faithful order
+  /// (MPEG.pm:464-581): sync scan ⇒ `SetFileType` ⇒ bit-extract ⇒
+  /// Xing/LAME tail, driving the typed parser through `MetaSinker` →
+  /// `MetadataTagWriter`. Test-only: the production raw-MP3 dispatch goes
+  /// through `id3::ProcessMp3` (the `MP3` file-type entry), which calls
+  /// `process_with_start_offset` after the ID3 pass.
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // Raw-MP3 dispatch path (no preceding ID3) — `$hdrEnd == 0`.
     // Delegates to the offset-aware variant; the bounded slice IS
     // `data[..scan_len]` byte-for-byte unchanged.

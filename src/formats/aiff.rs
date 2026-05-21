@@ -56,7 +56,7 @@
 use crate::{
   charset::decode_macroman,
   datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_duration, convert_unix_time},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   processbinarydata::process_binary_data,
   sink::MetadataTagWriter,
@@ -1496,11 +1496,12 @@ impl std::error::Error for AiffError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessAiff {
-  /// Phase F3 migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so
-  /// the CLI JSON output stays byte-exact during Phases F1–F5. Retired
-  /// in Phase G.
+impl ProcessAiff {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (AIFF.pm:184-273):
   ///   1. Magic + header gate (AIFF.pm:191, 199, 209) — reject as `false`.
@@ -1508,7 +1509,7 @@ impl OldFormatParser for ProcessAiff {
   ///   3. DjVu multi-page File:FileType suffix (AIFF.pm:206).
   ///   4. Chunk loop emission via `MetaSinker::sink`.
   ///   5. Composite Duration appended post-loop.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let bytes = ctx.data();
     let meta = match parse_inner(bytes) {
       Ok(Some(m)) => m,

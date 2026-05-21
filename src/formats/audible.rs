@@ -33,7 +33,7 @@
 
 use crate::{
   convert::{fix_utf8, pack_c0u},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -1300,11 +1300,12 @@ impl std::error::Error for AudibleError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessAa {
-  /// Phase E–F migration bridge. Runs the new typed [`parse_inner`] and
-  /// drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so the
-  /// CLI JSON output stays byte-exact during Phases F1–F5. Retired in
-  /// Phase G.
+impl ProcessAa {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`parse_inner`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (Audible.pm:201-272):
   /// 1. Magic + filesize gate (lines 201-205) — reject ⇒ `return 0`.
@@ -1315,7 +1316,7 @@ impl OldFormatParser for ProcessAa {
   /// 3. Sink the typed Meta — emits Audible:* tags in TOC walk order
   ///    plus accumulated warnings/errors.
   /// 4. `return 1` (line 272).
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let bytes = ctx.data();
     let meta = match parse_inner(bytes) {
       Some(m) => m,
@@ -1514,7 +1515,7 @@ mod tests {
     let mut m = Metadata::new("x");
     let data = [0u8; 8]; // < 16
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(!ProcessAa.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1524,7 +1525,7 @@ mod tests {
     let mut data = [0u8; 16];
     data[4..8].copy_from_slice(&[0, 0, 0, 0]);
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(!ProcessAa.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1535,7 +1536,7 @@ mod tests {
     data[0..4].copy_from_slice(&[0, 0, 3, 0xe7]); // 999 BE
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(!ProcessAa.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1546,7 +1547,7 @@ mod tests {
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let names: Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(names, ["FileType", "FileTypeExtension", "MIMEType"]);
     assert_eq!(
@@ -1566,7 +1567,7 @@ mod tests {
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     data[8..12].copy_from_slice(&[0, 0, 0x01, 0x01]); // 257 ⇒ 3084 > 3072
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     assert_eq!(m.warnings(), &["Invalid TOC"]);
   }
 
@@ -1578,7 +1579,7 @@ mod tests {
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     data[8..12].copy_from_slice(&[0, 0, 0, 5]);
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     assert_eq!(m.warnings(), &["Truncated TOC"]);
   }
 
@@ -1619,7 +1620,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("author", "FIRST"), ("author", "SECOND")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let author_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1634,7 +1635,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("title", "FIRST"), ("title", "SECOND")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let title_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1649,7 +1650,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("author", "A"), ("title", "T"), ("author", "B")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1694,7 +1695,7 @@ mod tests {
     let bytes = build_aa_with_two_chap_chunks(1, 2);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let chap_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1709,7 +1710,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("_cover_art", "ABCDE")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let cover: Vec<_> = m
       .tags()
       .iter()
@@ -1727,7 +1728,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("GROUPS", "g_val"), ("FORMAT", "f_val"), ("title", "T")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1743,7 +1744,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("file_type", "FIRST"), ("FileType", "SECOND")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_filetype: Vec<_> = m
       .tags()
       .iter()
@@ -1768,7 +1769,7 @@ mod tests {
     ]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_ftypeext: Vec<_> = m
       .tags()
       .iter()
@@ -1786,7 +1787,7 @@ mod tests {
     ]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_etver: Vec<_> = m
       .tags()
       .iter()
@@ -1801,7 +1802,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("title", "X&#x8000000000000000;Y")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1818,7 +1819,7 @@ mod tests {
     let bytes = build_aa_with_dict(&[("title", "X&#9223372036854775808;Y")]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let errs = m.errors();
     assert_eq!(errs.len(), 1);
     assert!(errs[0].contains("Use of code point"));
@@ -1833,7 +1834,7 @@ mod tests {
     ]);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let names: Vec<_> = m
       .tags()
       .iter()
@@ -1886,7 +1887,7 @@ mod tests {
     let bytes = build_aa_dict_then_chap(&[("title", "X&#x8000000000000000;Y")], 7);
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(&bytes, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     let audible_tags: Vec<_> = m
       .tags()
       .iter()
@@ -1973,7 +1974,7 @@ mod tests {
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     data[8..12].copy_from_slice(&[0, 0, 0x01, 0x01]); // 257
     let mut c = ParseContext::new(&data, "AA", 0, "AA", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessAa, &mut c));
+    assert!(ProcessAa.process(&mut c));
     // The bridge picks up the warning via push_warning ⇒ MetadataTagWriter.
     assert_eq!(m.warnings(), &["Invalid TOC"]);
 

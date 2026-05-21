@@ -81,10 +81,6 @@ use crate::{
 };
 use smol_str::SmolStr;
 use std::vec::Vec;
-// `OldFormatParser` is only implemented for the `mp3`-gated `ProcessMp3`
-// wrapper (Codex A-R2-1); importing it under plain `id3` is dead.
-#[cfg(feature = "mp3")]
-use crate::parser::OldFormatParser;
 
 // ===========================================================================
 // Legacy header parser — preserved verbatim for the old chained entry points
@@ -1272,11 +1268,11 @@ impl MetaSinker for Mp3Meta<'_> {
 // ===========================================================================
 
 #[cfg(feature = "mp3")]
-impl OldFormatParser for ProcessMp3 {
-  /// The full Phase F2 chained flow. Identical in semantics to the
-  /// pre-migration implementation; the migration only adds the typed
-  /// [`Mp3Meta`] sink path on top, which the typed-API callers
-  /// consume separately via [`FormatParser::parse`].
+impl ProcessMp3 {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). The full chained flow;
+  /// the typed [`Mp3Meta`] sink path is consumed separately by typed-API
+  /// callers via [`FormatParser::parse`].
   ///
   /// Faithful to bundled `Image::ExifTool::ID3::ProcessMP3`
   /// (ID3.pm:1684-1728). The bundled flow is SUBTLE — what looks like
@@ -1311,7 +1307,7 @@ impl OldFormatParser for ProcessMp3 {
   /// `process_id3_inner_legacy` and invoke `mpeg::ProcessMp3` via the
   /// offset-aware `process_with_start_offset`, mirroring the bundled
   /// Seek+Read pair exactly.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let data = ctx.data();
     let (id3_found, hdr_end) = process_id3_inner_legacy(data, ctx, true);
     let mpeg_found = crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end);

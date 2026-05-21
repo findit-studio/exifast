@@ -41,7 +41,7 @@ use std::borrow::Cow;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::parser::{OldFormatParser, ParseContext};
+use crate::parser::ParseContext;
 use crate::parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed};
 use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv};
 use crate::value::TagValue;
@@ -1561,13 +1561,13 @@ impl std::error::Error for FlacError {}
 // Legacy `OldFormatParser` bridge — byte-exact CLI JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessFlac {
-  /// Phase E–F migration bridge. Runs the new typed parser then drives a
-  /// byte-exact emission path: StreamInfo + Picture + Composite via
-  /// [`MetaSinker::sink`] over a [`MetadataTagWriter`]; VorbisComments
+impl ProcessFlac {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed parser then
+  /// drives a byte-exact emission path: StreamInfo + Picture + Composite
+  /// via [`MetaSinker::sink`] over a [`MetadataTagWriter`]; VorbisComments
   /// custom-routed so list-tags (Artist/Performer/Contact) get
-  /// [`crate::value::Metadata::push_listable`] coalescing semantics
-  /// (`TagWriter` doesn't expose listable emission). Retired in Phase G.
+  /// [`crate::value::Metadata::push_listable`] coalescing semantics.
   ///
   /// Faithful order (FLAC.pm:239-280):
   ///   1. ID3v2 prefix skip (FLAC.pm:243-247).
@@ -1577,7 +1577,7 @@ impl OldFormatParser for ProcessFlac {
   ///   5. Format-error warning (FLAC.pm:278).
   ///   6. `Composite:Duration` (FLAC.pm:137-149) post-loop.
   ///   7. Return `true` unconditionally (FLAC.pm:279).
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // Run the typed parser. SharedFlags is constructed locally — the
     // F2 ID3 migration will replace this with a context-borrowed flag
     // set so the cross-format `DoneID3` handshake lands at the right
@@ -2157,7 +2157,7 @@ mod tests {
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
     let mut m = Metadata::new("x.flac");
     let mut c = ParseContext::new(data, "FLAC", 0, "FLAC", None, print_on, &mut m);
-    OldFormatParser::process(&ProcessFlac, &mut c);
+    ProcessFlac.process(&mut c);
     m
   }
 
@@ -2199,7 +2199,7 @@ mod tests {
   fn bridge_rejects_missing_magic() {
     let mut m = Metadata::new("x");
     let mut c = ParseContext::new(b"not-flac-here", "FLAC", 0, "FLAC", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessFlac, &mut c));
+    assert!(!ProcessFlac.process(&mut c));
     assert!(m.tags().is_empty());
   }
 

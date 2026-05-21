@@ -44,7 +44,7 @@
 
 use crate::{
   convert::{ByteOrder, read_value},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   value::{Rational, TagValue, format_g},
@@ -1667,12 +1667,13 @@ impl std::error::Error for R3dError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessR3D {
-  /// Phase F1 migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so
-  /// the CLI JSON output stays byte-exact during Phases F1–F5. Retired
-  /// in Phase G.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+impl ProcessR3D {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let meta = {
       let data = ctx.data();
       match parse_inner(data) {

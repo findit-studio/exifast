@@ -95,11 +95,12 @@ pub mod formats;
 #[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
-// Phase D — the lib-first `FormatParser` trait scaffold; Phases E–F migrated
-// every format onto it. The legacy `parser::FormatParser` (re-exported as
-// `OldFormatParser`) remains in place for the byte-exact CLI JSON bridge;
-// the spec at `docs/superpowers/specs/2026-05-21-lib-first-formatparser-design.md`
-// flags its retirement as a Phase H follow-up.
+// The lib-first `FormatParser` trait scaffold + closed-set `AnyParser` /
+// `AnyMeta` dispatch. This is now the SOLE parser architecture: the engine
+// entry `parser::extract_info` routes through `any_parser_for(ft) ->
+// AnyParser::extract_into`, and the legacy push-style `OldFormatParser`
+// trait has been retired (the typed path is validated directly by the
+// byte-exact conformance suite).
 pub mod parser_new;
 pub mod processbinarydata;
 pub mod reader;

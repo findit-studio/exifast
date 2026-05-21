@@ -48,7 +48,7 @@
 //!   this engine.
 
 use crate::{
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -1878,12 +1878,12 @@ fn sink_composite_duration<W: TagWriter>(
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // =============================================================================
 
-impl OldFormatParser for ProcessApe {
-  /// Phase E–F migration bridge. Runs the existing ID3 chained dispatch,
-  /// then drives the new typed [`FormatParser::parse`] +
+impl ProcessApe {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the ID3 chained
+  /// dispatch, then drives the typed [`FormatParser::parse`] +
   /// [`MetaSinker::sink`] path through a [`MetadataTagWriter`] so the
-  /// CLI JSON output stays byte-exact during Phases F1–F5. Retired in
-  /// Phase G.
+  /// serialized JSON stays byte-exact with bundled `perl exiftool`.
   ///
   /// Faithful order (APE.pm:119-241):
   ///   1. Embedded ID3 dispatch (APE.pm:124-127) via the existing
@@ -1897,7 +1897,7 @@ impl OldFormatParser for ProcessApe {
   ///      `Metadata::tags()` — covers cross-format injected ingredients
   ///      that the typed intra-APE meta cannot see). Phase G unifies
   ///      this when Composite is engine-tier.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // require Image::ExifTool::ID3; Image::ExifTool::ID3::ProcessID3(
     // $et, $dirInfo) and return 1; }`. The bundled audio-dispatch loop
     // INSIDE ProcessID3 (ID3.pm:1582-1601) recursively re-invokes

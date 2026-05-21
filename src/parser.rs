@@ -17,7 +17,7 @@
 use crate::{
   convert::apply,
   filetype::detection_candidates,
-  formats::parser_for,
+  parser_new::any_parser_for,
   tagtable::{PrintConv, TagDef, ValueConv},
   value::{Group, Metadata, TagValue},
 };
@@ -373,42 +373,6 @@ impl<'a> ParseContext<'a> {
   }
 }
 
-/// One ported format parser. `process` reads `ctx.data()` and may push tags
-/// / call `ctx.set_file_type(...)` / push warnings/errors via `ctx.metadata()`.
-/// Returning `true` (Perl `return 1`) finalizes this file type; returning
-/// `false` (Perl `return 0`) lets `extract_info` try the next detection
-/// candidate. **Side effects already made on `ctx.metadata()` PERSIST
-/// regardless of return value** — faithful to ExifTool's `$self` model.
-// `Sync` is required so `&'static dyn FormatParser` can be returned/shared.
-pub trait FormatParser: Sync {
-  /// Returns `true` if this parser accepted the data (Perl `return 1`).
-  /// Returns `false` (Perl `return 0`) so `extract_info` tries the next
-  /// candidate.
-  ///
-  /// IMPORTANT: `false` means only **"keep scanning"** — any side effects
-  /// already made on `ctx.metadata()` (tags, `set_file_type`, warnings,
-  /// errors) PERSIST. Each parser MUST mirror its Perl module's exact
-  /// ordering of `SetFileType`/`FoundTag`/`Warn`/`Error` calls and the
-  /// `return 0` line; e.g. `MPEG.pm:675 $et->SetFileType()` then `:678
-  /// $raf->Read(...) or return 0;` on a short read — bundled `perl
-  /// exiftool` emits the `File:FileType=MPEG` triplet plus the post-loop
-  /// `ExifTool:Error`, and exifast matches byte-exact because of this
-  /// contract.
-  ///
-  /// On accept, call `ctx.set_file_type(...)` BEFORE pushing any format
-  /// tags via `ctx.metadata()` — faithful to ExifTool, where
-  /// `$et->SetFileType` precedes `ProcessDirectory` (e.g. `AAC.pm:107`
-  /// before `:109`). Output tag order follows push order; `File:*` must
-  /// precede format-specific tags.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool;
-}
-
-/// Phase D shim: the existing push-style [`FormatParser`] is being
-/// migrated to the new typed-Meta [`crate::parser_new::FormatParser`] in
-/// Phases E–F. During migration this alias documents the legacy trait
-/// without renaming, so existing impl sites continue to work verbatim.
-pub use FormatParser as OldFormatParser;
-
 /// Faithful `ConvertFileSize` (ExifTool.pm:6840-6860), default-units branch
 /// only. The `ByteUnit eq 'Binary'` arm (ExifTool.pm:6843-6850) is gated on
 /// the `ByteUnit` option, which the read path here does not expose (YAGNI;
@@ -523,13 +487,19 @@ fn finalization_error(name: &str, data: &[u8]) -> Option<String> {
   Some(err)
 }
 
-// Test-only parser-lookup override seam. `parser_for` (formats/mod.rs) is a
-// fixed `match` keyed on the real file-type string, and no real ported
+/// A parser engine entry: runs a `Process<Type>` against `ctx`, returning
+/// Perl `$result` (`true` ⇒ accept/finalize, `false` ⇒ try next candidate).
+/// Production dispatch resolves these via [`any_parser_for`]; the
+/// `#[cfg(test)]` seam below lets a test inject one for engine-loop tests.
+type EngineEntry = fn(&mut ParseContext<'_>) -> bool;
+
+// Test-only parser-lookup override seam. `any_parser_for` (parser_new.rs) is
+// a fixed `match` keyed on the real file-type string, and no real ported
 // format errors-while-accepting or set-file-type-then-rejects, so these
 // scenarios cannot be exercised end-to-end by any real input. This
-// thread-local lets a test register one OR MORE injected parsers (one per
-// file type); `lookup_parser` consults it FIRST, so `extract_info` runs its
-// genuine candidate→process(&mut m)→finalize block with that parser,
+// thread-local lets a test register one OR MORE injected engine entries (one
+// per file type); `lookup_parser` consults it FIRST, so `extract_info` runs
+// its genuine candidate→process(&mut m)→finalize block with that entry,
 // against the real outer `Metadata`. A `Vec` (not `Option`) because the
 // file-scoped first-call-wins-across-candidates test needs to inject TWO
 // distinct file types in one run (one for the early candidate, one for a
@@ -541,31 +511,47 @@ fn finalization_error(name: &str, data: &[u8]) -> Option<String> {
 #[cfg(test)]
 thread_local! {
   static INJECTED_PARSERS: std::cell::RefCell<
-    Vec<(&'static str, &'static dyn FormatParser)>,
+    Vec<(&'static str, EngineEntry)>,
   > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Parser lookup for [`extract_info`]. Production: exactly [`parser_for`].
-/// Under `#[cfg(test)]` the [`INJECTED_PARSERS`] table is consulted first —
-/// see the seam comment above for why and how. First matching entry wins,
-/// so a test can override a real ported file type if it needs to.
+/// Engine-entry lookup for [`extract_info`]. Production: the closed-set
+/// [`any_parser_for`] dispatch (`AnyParser::extract_into`). Under
+/// `#[cfg(test)]` the [`INJECTED_PARSERS`] table is consulted first — see the
+/// seam comment above for why and how. First matching entry wins, so a test
+/// can override a real ported file type if it needs to.
 #[cfg(test)]
-fn lookup_parser(file_type: &str) -> Option<&'static dyn FormatParser> {
+fn lookup_parser(file_type: &str) -> Option<EngineEntry> {
   let injected = INJECTED_PARSERS.with(|c| {
     c.borrow()
       .iter()
       .find(|(ft, _)| *ft == file_type)
       .map(|(_, p)| *p)
   });
-  if let Some(parser) = injected {
-    return Some(parser);
+  if let Some(entry) = injected {
+    return Some(entry);
   }
-  parser_for(file_type)
+  any_parser_for(file_type).map(|_| dispatch_typed as EngineEntry)
 }
 
 #[cfg(not(test))]
-fn lookup_parser(file_type: &str) -> Option<&'static dyn FormatParser> {
-  parser_for(file_type)
+fn lookup_parser(file_type: &str) -> Option<EngineEntry> {
+  any_parser_for(file_type).map(|_| dispatch_typed as EngineEntry)
+}
+
+/// Production engine entry: re-resolves the file type from `ctx` and routes
+/// through the closed [`crate::parser_new::AnyParser`] dispatch. (Indirecting
+/// through a `fn(&mut ParseContext) -> bool` keeps a uniform shape with the
+/// `#[cfg(test)]` injection seam, which cannot carry a captured `AnyParser`.)
+fn dispatch_typed(ctx: &mut ParseContext<'_>) -> bool {
+  // `ctx.file_type()` is the candidate type `extract_info` constructed this
+  // context with — the same key `lookup_parser` matched on.
+  match any_parser_for(ctx.file_type()) {
+    Some(parser) => parser.extract_into(ctx),
+    // Unreachable: `lookup_parser` only returns `Some(dispatch_typed)` when
+    // `any_parser_for` already matched. Fall through as a non-accept.
+    None => false,
+  }
 }
 
 /// The `ExtractInfo` finalization consumer (spec D10(5);
@@ -634,8 +620,9 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metada
       finalized = true; // ExifTool.pm:3037 $$self{FILE_TYPE}=$type (defined)
       break; // ExifTool.pm:3057 last
     }
-    // `lookup_parser` ≡ `parser_for(ft)` in release (test seam compiled
-    // out; see above) — kept identical so tests exercise THIS block.
+    // `lookup_parser` ≡ `any_parser_for(ft)`-keyed dispatch in release (test
+    // seam compiled out; see above) — kept identical so tests exercise THIS
+    // block.
     let Some(parser) = lookup_parser(ft) else {
       continue;
     };
@@ -661,7 +648,7 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> Metada
         print_conv_enabled,
         &mut m,
       );
-      parser.process(&mut ctx)
+      parser(&mut ctx)
     };
     if accepted {
       // Finalization is keyed on the parser returning truthy
@@ -1393,24 +1380,21 @@ mod tests {
   // and `extract_info` runs its real candidate→process(&mut m)→finalize
   // block against the outer Metadata directly (faithful to Perl
   // `&$func($self, \%dirInfo)`, ExifTool.pm:3066).
-  struct AcceptingButErroring;
-  impl FormatParser for AcceptingButErroring {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to every real accepting parser: `$et->SetFileType()`
-      // BEFORE pushing format tags (e.g. AAC.pm:107). All-`None` = the
-      // detected type (AAC.pm:107 no-arg style). Releases the &mut ctx
-      // borrow before `ctx.metadata()` re-borrows below.
-      ctx.set_file_type(None, None, None);
-      // Push via the real `&mut Metadata` seam parsers reach through
-      // `ctx.metadata()` (no public surface added for the test).
-      let m = ctx.metadata();
-      m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      m.push_warning("a non-fatal warning");
-      // ExifTool `$et->Error('File format error')` while still handling
-      // the file (sets $$self{VALUE}{Error}), then `return 1`.
-      m.push_error("File format error");
-      true // Perl `return 1`
-    }
+  fn accepting_but_erroring(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to every real accepting parser: `$et->SetFileType()`
+    // BEFORE pushing format tags (e.g. AAC.pm:107). All-`None` = the
+    // detected type (AAC.pm:107 no-arg style). Releases the &mut ctx
+    // borrow before `ctx.metadata()` re-borrows below.
+    ctx.set_file_type(None, None, None);
+    // Push via the real `&mut Metadata` seam parsers reach through
+    // `ctx.metadata()` (no public surface added for the test).
+    let m = ctx.metadata();
+    m.push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    m.push_warning("a non-fatal warning");
+    // ExifTool `$et->Error('File format error')` while still handling
+    // the file (sets $$self{VALUE}{Error}), then `return 1`.
+    m.push_error("File format error");
+    true // Perl `return 1`
   }
 
   /// RAII guard so the `#[cfg(test)]` injection table is always cleared —
@@ -1429,18 +1413,16 @@ mod tests {
   /// (the file-scoped first-call-wins test uses TWO: an early file-type's
   /// parser AND a later file-type's parser — both from the same
   /// `detection_candidates` iterator on the same input).
-  fn inject(file_type: &'static str, parser: &'static dyn FormatParser) {
+  fn inject(file_type: &'static str, parser: EngineEntry) {
     INJECTED_PARSERS.with(|c| c.borrow_mut().push((file_type, parser)));
   }
-
-  static ACCEPTING_BUT_ERRORING: AcceptingButErroring = AcceptingButErroring;
 
   #[cfg(feature = "json")]
   #[test]
   fn accepted_parser_error_reaches_serialized_json() {
     // Register the injected parser for the REAL detected file type.
     let _guard = InjectionGuard;
-    inject("AAC", &ACCEPTING_BUT_ERRORING);
+    inject("AAC", accepting_but_erroring);
 
     // Drive the genuine `extract_info`: `\xff\xf1…` passes the AAC magic
     // gate ⇒ `bad.aac` detects to `AAC` ⇒ `lookup_parser("AAC")` returns
@@ -1491,24 +1473,19 @@ mod tests {
   // rejection exhausts the loop and the post-loop finalization Error
   // fires — yet `File:FileType=AAC` must remain (no rollback). This
   // FAILS the moment anyone re-introduces a trial-and-rollback model.
-  struct RejectingAfterSetFileType;
-  impl FormatParser for RejectingAfterSetFileType {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to MPEG.pm:675: `$et->SetFileType()` (no-arg ⇒ detected
-      // type) BEFORE reading/rejecting.
-      ctx.set_file_type(None, None, None);
-      // Push one tag for assertion clarity — also a side effect that
-      // must persist post-reject (faithful: `FoundTag` writes to
-      // `$$self{VALUE}` directly).
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      // MPEG.pm:678 style `or return 0` — reject AFTER SetFileType.
-      false
-    }
+  fn rejecting_after_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to MPEG.pm:675: `$et->SetFileType()` (no-arg ⇒ detected
+    // type) BEFORE reading/rejecting.
+    ctx.set_file_type(None, None, None);
+    // Push one tag for assertion clarity — also a side effect that
+    // must persist post-reject (faithful: `FoundTag` writes to
+    // `$$self{VALUE}` directly).
+    ctx
+      .metadata()
+      .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    // MPEG.pm:678 style `or return 0` — reject AFTER SetFileType.
+    false
   }
-
-  static REJECTING_AFTER_SET_FILE_TYPE: RejectingAfterSetFileType = RejectingAfterSetFileType;
 
   #[cfg(feature = "json")]
   #[test]
@@ -1523,7 +1500,7 @@ mod tests {
     // injected-parser seam against the real AAC file type, since
     // `parser_for` has no rejecting-after-SetFileType real parser yet.
     let _guard = InjectionGuard;
-    inject("AAC", &REJECTING_AFTER_SET_FILE_TYPE);
+    inject("AAC", rejecting_after_set_file_type);
 
     // `\xff\xf1…` passes the AAC magic gate ⇒ detects to AAC ⇒ the
     // injected parser runs ⇒ SetFileType pushes File:* THEN parser
@@ -1555,18 +1532,13 @@ mod tests {
   // `set_file_type` (no real parser does this, but ExifTool's accept is
   // keyed ONLY on the truthy Process return). Same `INJECTED_PARSERS`
   // seam as Part B.
-  struct AcceptingNoSetFileType;
-  impl FormatParser for AcceptingNoSetFileType {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // One tag, NO set_file_type, NO error — then `return 1`.
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
-      true // Perl `return 1`
-    }
+  fn accepting_no_set_file_type(ctx: &mut ParseContext<'_>) -> bool {
+    // One tag, NO set_file_type, NO error — then `return 1`.
+    ctx
+      .metadata()
+      .push(Group::new("Audio", "AAC"), "Channels", TagValue::I64(2));
+    true // Perl `return 1`
   }
-
-  static ACCEPTING_NO_SET_FILE_TYPE: AcceptingNoSetFileType = AcceptingNoSetFileType;
 
   // Executable pin of the faithful finalization criterion: finalization
   // (and thus suppression of the post-loop Error) is keyed on the parser
@@ -1581,7 +1553,7 @@ mod tests {
     //     NO finalization ExifTool:Error and NO File:FileType (exifast's
     //     current faithful behavior; the regression guard vs the gate).
     let _guard = InjectionGuard;
-    inject("AAC", &ACCEPTING_NO_SET_FILE_TYPE);
+    inject("AAC", accepting_no_set_file_type);
     // `\xff\xf1…` passes the AAC magic gate ⇒ `bad.aac` detects to
     // `AAC` ⇒ the injected parser runs and accepts (returns true).
     let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
@@ -1646,32 +1618,24 @@ mod tests {
   // `fk2`) and accepts. Exactly one `File:FileType` (= `"AAC"`) must
   // remain on `m`, with the second parser's marker tag present and no
   // finalization Error (the second parser accepted).
-  struct AacSetThenReject;
-  impl FormatParser for AacSetThenReject {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Faithful to MPEG.pm:675 — `$et->SetFileType` BEFORE rejecting.
-      ctx.set_file_type(Some("AAC"), None, None);
-      false // MPEG.pm:678 style `or return 0`
-    }
+  fn aac_set_then_reject(ctx: &mut ParseContext<'_>) -> bool {
+    // Faithful to MPEG.pm:675 — `$et->SetFileType` BEFORE rejecting.
+    ctx.set_file_type(Some("AAC"), None, None);
+    false // MPEG.pm:678 style `or return 0`
   }
-  static AAC_SET_THEN_REJECT: AacSetThenReject = AacSetThenReject;
 
-  struct WvOverwriteAndAccept;
-  impl FormatParser for WvOverwriteAndAccept {
-    fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
-      // Try to set a DIFFERENT File:* triplet — must be a no-op because
-      // candidate 1 already engaged first-call-wins on `m`. If exifast
-      // ever drops the file-scoped guard, this call leaks a duplicate
-      // File:FileType (= "FAKE2") into `m`, and the assertions below fire.
-      ctx.set_file_type(Some("FAKE2"), Some("application/fake"), Some("fk2"));
-      // Distinguishing marker so the test can confirm THIS parser ran.
-      ctx
-        .metadata()
-        .push(Group::new("Audio", "WV"), "Marker", TagValue::I64(1));
-      true // Perl `return 1` — accept ⇒ no post-loop Error
-    }
+  fn wv_overwrite_and_accept(ctx: &mut ParseContext<'_>) -> bool {
+    // Try to set a DIFFERENT File:* triplet — must be a no-op because
+    // candidate 1 already engaged first-call-wins on `m`. If exifast
+    // ever drops the file-scoped guard, this call leaks a duplicate
+    // File:FileType (= "FAKE2") into `m`, and the assertions below fire.
+    ctx.set_file_type(Some("FAKE2"), Some("application/fake"), Some("fk2"));
+    // Distinguishing marker so the test can confirm THIS parser ran.
+    ctx
+      .metadata()
+      .push(Group::new("Audio", "WV"), "Marker", TagValue::I64(1));
+    true // Perl `return 1` — accept ⇒ no post-loop Error
   }
-  static WV_OVERWRITE_AND_ACCEPT: WvOverwriteAndAccept = WvOverwriteAndAccept;
 
   #[cfg(feature = "json")]
   #[test]
@@ -1683,8 +1647,8 @@ mod tests {
     // (`AAC`) and a LATER (`WV`) candidate; the loop must invoke `AAC`'s
     // parser then `WV`'s — both against the SAME outer Metadata.
     let _guard = InjectionGuard;
-    inject("AAC", &AAC_SET_THEN_REJECT);
-    inject("WV", &WV_OVERWRITE_AND_ACCEPT);
+    inject("AAC", aac_set_then_reject);
+    inject("WV", wv_overwrite_and_accept);
 
     let meta = extract_info("bad.aac", b"\xff\xf1\xf0\x00\x00\x00\x00", true);
 

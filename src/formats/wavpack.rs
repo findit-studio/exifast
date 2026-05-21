@@ -71,7 +71,7 @@
 use core::convert::Infallible;
 
 use crate::{
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
 };
@@ -696,11 +696,12 @@ impl std::error::Error for WvError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessWv {
-  /// Phase F5 migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so
-  /// the CLI JSON output stays byte-exact during Phases F1–F5. Retired
-  /// in Phase G.
+impl ProcessWv {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (WavPack.pm:87-104):
   /// 1. Magic + version-byte gate (`return 0` on reject) — WavPack.pm:87-88.
@@ -718,7 +719,7 @@ impl OldFormatParser for ProcessWv {
   ///    (APE.pm:131); this matches the bundled flag-setting order. On
   ///    the committed fixtures (no APE trailer present) this is
   ///    observably no-op.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // Phase F5 bridge: extract the typed Meta from a fresh shared-flags
     // workspace, then sink it back into the legacy `Metadata` plumbing.
     // The lib-first `SharedFlags` is NOT the same store as the legacy
@@ -1082,7 +1083,7 @@ mod tests {
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
     let mut m = Metadata::new("WavPack.wv");
     let mut c = ParseContext::new(data, "WV", 0, "WV", None, print_on, &mut m);
-    OldFormatParser::process(&ProcessWv, &mut c);
+    ProcessWv.process(&mut c);
     m
   }
 
@@ -1149,7 +1150,7 @@ mod tests {
     let mut m = Metadata::new("WavPack.wv");
     let data = vec![0u8; 16];
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessWv, &mut c));
+    assert!(!ProcessWv.process(&mut c));
     assert!(m.tags().is_empty()); // no SetFileType run
   }
 
@@ -1159,7 +1160,7 @@ mod tests {
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"WVPK");
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessWv, &mut c));
+    assert!(!ProcessWv.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1171,7 +1172,7 @@ mod tests {
     data[8] = 0x05;
     data[9] = 0x04;
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessWv, &mut c));
+    assert!(!ProcessWv.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1183,7 +1184,7 @@ mod tests {
     data[8] = 0x10;
     data[9] = 0x05;
     let mut c = ParseContext::new(&data, "WV", 0, "WV", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessWv, &mut c));
+    assert!(!ProcessWv.process(&mut c));
     assert!(m.tags().is_empty());
   }
 

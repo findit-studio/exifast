@@ -43,7 +43,7 @@
 use core::time::Duration;
 use jiff::civil::DateTime;
 
-use crate::parser::{OldFormatParser, ParseContext};
+use crate::parser::ParseContext;
 use crate::parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed};
 use crate::sink::MetadataTagWriter;
 
@@ -769,21 +769,21 @@ impl core::fmt::Display for MoiError {
 impl std::error::Error for MoiError {}
 
 // ===========================================================================
-// Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
+// Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
-impl OldFormatParser for ProcessMoi {
-  /// Phase E–F migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and then drives [`MetaSinker::sink`] through a [`MetadataTagWriter`]
-  /// so the CLI JSON output stays byte-exact for the duration of the per-
-  /// format migration. Retired in Phase G when the JSON emitter consumes
-  /// `AnyMeta` directly.
+impl ProcessMoi {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and then drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (MOI.pm:104-119): magic + filesize gate ⇒
   /// `SetFileType` ⇒ binary walk. The `SetFileType` happens BEFORE
   /// sinking the typed `Meta` so `File:*` lands first (the bundled
   /// emission order under `-j -G1`).
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // Run the new typed parser on the input bytes. The borrow lives
     // through this call; we sink it before mutating `ctx`.
     let bytes = ctx.data();
@@ -1110,7 +1110,7 @@ mod tests {
   fn run_bridge(data: &[u8], print_on: bool) -> Metadata {
     let mut m = Metadata::new("MOI.moi");
     let mut c = ParseContext::new(data, "MOI", 0, "MOI", None, print_on, &mut m);
-    OldFormatParser::process(&ProcessMoi, &mut c);
+    ProcessMoi.process(&mut c);
     m
   }
 
@@ -1172,7 +1172,7 @@ mod tests {
   fn bridge_rejects_short_buffer() {
     let mut m = Metadata::new("X.moi");
     let mut c = ParseContext::new(&[], "MOI", 0, "MOI", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessMoi, &mut c));
+    assert!(!ProcessMoi.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1184,7 +1184,7 @@ mod tests {
     buf[2..6].copy_from_slice(&999u32.to_be_bytes());
     let mut m = Metadata::new("X.moi");
     let mut c = ParseContext::new(&buf, "MOI", 0, "MOI", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessMoi, &mut c));
+    assert!(!ProcessMoi.process(&mut c));
     // SetFileType is NOT called on a reject (faithful to MOI.pm:114 `or
     // return 0` BEFORE :115 `SetFileType()`).
     assert!(m.tags().is_empty());

@@ -52,7 +52,7 @@
 
 use crate::{
   convert::{apply, base64_decode},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   tagtable::{PrintConv, TagDef, ValueConv},
   value::{Group, Metadata, TagValue},
@@ -1442,11 +1442,12 @@ impl MetaSinker for OggMeta<'_> {
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessOgg {
-  /// Phase F4 migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and then re-emits through the legacy `Metadata` push path so the CLI
-  /// JSON output stays byte-exact during the per-format crawl. Retired
-  /// in Phase G.
+impl ProcessOgg {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and then re-emits through the `Metadata` push
+  /// path so the serialized JSON stays byte-exact with bundled `perl
+  /// exiftool`.
   ///
   /// Faithful order (Ogg.pm:75-197): page-walk ⇒ on first-accept,
   /// `SetFileType('OGG')` ⇒ post-walk, `OverrideFileType('OGV'/'OPUS')`
@@ -1458,7 +1459,7 @@ impl OldFormatParser for ProcessOgg {
   /// emissions into the existing `&mut Metadata` whose list-coalesce
   /// semantics are first-occurrence-position. See the loop body below for
   /// the explicit dispatch.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // Run the new typed parser on the input bytes. Pass through the
     // `print_conv` toggle so any future ValueConv/PrintConv on a known
     // OGG tag honours `-n`.
@@ -1858,7 +1859,7 @@ mod tests {
     // pushed to metadata. (See also `tests/conformance.rs::
     // ogg_truncated_error_conformance` for the 27-byte boundary pin.)
     let mut ctx = ParseContext::new(b"OggS", "OGG", 0, "OGG", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessOgg, &mut ctx));
+    assert!(!ProcessOgg.process(&mut ctx));
     assert!(m.tags().is_empty(), "no tags pushed before SetFileType");
   }
 

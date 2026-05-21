@@ -36,7 +36,7 @@
 //! the legacy `process_id3_v2_slice` for byte-exact CLI JSON output.
 
 use crate::{
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -793,12 +793,13 @@ impl std::error::Error for DsfError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessDsf {
-  /// Phase F3 migration bridge. Runs the new typed
+impl ProcessDsf {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
   /// [`FormatParser::parse`] (via [`parse_inner`] to preserve the
   /// `id3_trailer` borrow) and drives [`MetaSinker::sink`] through a
-  /// [`MetadataTagWriter`] so the CLI JSON output stays byte-exact.
-  /// Retired in Phase G.
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
   ///
   /// Faithful order (DSF.pm:62-99):
   /// 1. Header magic gate (DSF.pm:62-63) — `parse_inner` rejects with
@@ -812,7 +813,7 @@ impl OldFormatParser for ProcessDsf {
   ///    already typed the file). The `id3_trailer` borrow lives long
   ///    enough to flow into this call before the typed `Meta` is
   ///    consumed.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let bytes = ctx.data();
     let meta = match parse_inner(bytes) {
       Ok(Some(m)) => m,
@@ -1530,7 +1531,7 @@ mod tests {
       let buf = std::vec![0u8; n];
       let mut m = Metadata::new("x.dsf");
       let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-      assert!(!OldFormatParser::process(&ProcessDsf, &mut c));
+      assert!(!ProcessDsf.process(&mut c));
       assert!(m.tags().is_empty(), "n={n}");
     }
   }
@@ -1541,7 +1542,7 @@ mod tests {
     bad[0..4].copy_from_slice(b"XXXX");
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&bad, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(!ProcessDsf.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1550,7 +1551,7 @@ mod tests {
     let buf = happy_path_dsf();
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(ProcessDsf.process(&mut c));
     let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(
       names,
@@ -1597,7 +1598,7 @@ mod tests {
     buf.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12)
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDsf, &mut c)); // DSF.pm:72 return 1
+    assert!(ProcessDsf.process(&mut c)); // DSF.pm:72 return 1
     let names: std::vec::Vec<&str> = m.tags().iter().map(|t| t.name()).collect();
     assert_eq!(names, ["FileType", "FileTypeExtension", "MIMEType"]);
     assert_eq!(
@@ -1617,7 +1618,7 @@ mod tests {
     buf.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(ProcessDsf.process(&mut c));
     assert_eq!(
       m.warnings(),
       ["Error reading DSF fmt chunk".to_string()].as_slice()
@@ -1640,7 +1641,7 @@ mod tests {
     buf.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(ProcessDsf.process(&mut c));
     assert_eq!(
       m.warnings(),
       ["Error reading DSF fmt chunk".to_string()].as_slice()
@@ -1656,7 +1657,7 @@ mod tests {
     let buf = dsf_with_trailer(id3);
     let mut m = Metadata::new("x.dsf");
     let mut c = ParseContext::new(&buf, "DSF", 0, "DSF", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDsf, &mut c));
+    assert!(ProcessDsf.process(&mut c));
     // File:* triplet + fmt-chunk tags ARE emitted. The ID3 trailer
     // dispatches but emits no payload tags for a body-empty header —
     // it's enough that the dispatch ran without panicking and didn't

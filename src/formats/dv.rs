@@ -12,7 +12,7 @@
 //! during Phase F. The bridge is retired in Phase G.
 
 use crate::{
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -1001,12 +1001,13 @@ impl std::error::Error for DvError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessDv {
-  /// Phase E–F migration bridge. Runs the new typed [`FormatParser::parse`]
-  /// and drives [`MetaSinker::sink`] through a [`MetadataTagWriter`] so the
-  /// CLI JSON output stays byte-exact during Phases F1–F5. Retired in
-  /// Phase G.
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+impl ProcessDv {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Runs the typed
+  /// [`FormatParser::parse`] and drives [`MetaSinker::sink`] through a
+  /// [`MetadataTagWriter`] so the serialized JSON stays byte-exact with
+  /// bundled `perl exiftool`.
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     let outcome: Option<DvParseOutcome<'static>> = {
       let data = ctx.data();
       parse_outcome(data)
@@ -1311,7 +1312,7 @@ mod tests {
     data[451] = 0x1f;
     let mut m = Metadata::new("x.dv");
     let mut c = ParseContext::new(&data, "DV", 0, "DV", None, true, &mut m);
-    assert!(OldFormatParser::process(&ProcessDv, &mut c));
+    assert!(ProcessDv.process(&mut c));
     assert_eq!(m.warnings(), &["Unrecognized DV profile"]);
     assert!(m.tags().iter().all(|t| t.group().family1() != "DV"));
   }

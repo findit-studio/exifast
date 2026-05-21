@@ -940,6 +940,85 @@ impl AnyParser {
       }
     }
   }
+
+  /// Engine dispatch for [`crate::parser::extract_info`]: run this format's
+  /// parser against the per-file value sink in `ctx`, emitting `File:*`
+  /// (via `ctx.set_file_type`/`override_file_type`) and every format tag
+  /// directly into `ctx.metadata()`.
+  ///
+  /// Returns `true` (Perl `return 1`) when the parser accepted the data —
+  /// finalizing this file type — and `false` (Perl `return 0`) so
+  /// `extract_info` tries the next detection candidate. **Side effects
+  /// already made on `ctx.metadata()` PERSIST regardless of the return
+  /// value** (faithful to ExifTool's `$self` model; e.g. MPEG.pm:675
+  /// `SetFileType` then :678 `or return 0` keeps `File:FileType=MPEG`).
+  ///
+  /// Each arm delegates to the format module's own `process` entry, which
+  /// owns the faithful ordering of `SetFileType` / `FoundTag` / `Warn` /
+  /// `Error` and any cross-format chain (ID3 → MPEG → APE trailer, etc.).
+  /// This is the single closed-set dispatch site replacing the retired
+  /// `parser_for(ft) -> &dyn OldFormatParser` registry.
+  pub(crate) fn extract_into(self, ctx: &mut crate::parser::ParseContext<'_>) -> bool {
+    // No-format build (Codex CF3): `AnyParser` has no variants, so the
+    // `match` is empty and `ctx` is unused. Discard it to stay warning-clean.
+    #[cfg(not(any(
+      feature = "moi",
+      feature = "aac",
+      feature = "dv",
+      feature = "audible",
+      feature = "red",
+      feature = "id3",
+      feature = "mp3",
+      feature = "aiff",
+      feature = "ape",
+      feature = "dsf",
+      feature = "flac",
+      feature = "ogg",
+      feature = "mpeg-audio",
+      feature = "mpc",
+      feature = "wavpack",
+    )))]
+    let _ = ctx;
+    match self {
+      #[cfg(feature = "moi")]
+      AnyParser::Moi(p) => p.process(ctx),
+      #[cfg(feature = "aac")]
+      AnyParser::Aac(p) => p.process(ctx),
+      #[cfg(feature = "dv")]
+      AnyParser::Dv(p) => p.process(ctx),
+      #[cfg(feature = "audible")]
+      AnyParser::Aa(p) => p.process(ctx),
+      #[cfg(feature = "red")]
+      AnyParser::R3D(p) => p.process(ctx),
+      // ID3 is a *directory* parser (PROCESS_PROC, ID3.pm:78), never a
+      // top-level file-type in `any_parser_for`; it has no engine entry.
+      // The arm is unreachable from `extract_info` but must be covered.
+      #[cfg(feature = "id3")]
+      AnyParser::Id3(_) => false,
+      #[cfg(feature = "mp3")]
+      AnyParser::Mp3(p) => p.process(ctx),
+      #[cfg(feature = "aiff")]
+      AnyParser::Aiff(p) => p.process(ctx),
+      #[cfg(feature = "ape")]
+      AnyParser::Ape(p) => p.process(ctx),
+      #[cfg(feature = "dsf")]
+      AnyParser::Dsf(p) => p.process(ctx),
+      #[cfg(feature = "flac")]
+      AnyParser::Flac(p) => p.process(ctx),
+      #[cfg(feature = "ogg")]
+      AnyParser::Ogg(p) => p.process(ctx),
+      // MPEG-audio is invoked internally by MP3 (ID3.pm:1716), never a
+      // top-level file-type in `any_parser_for`; it has no standalone
+      // engine entry. The arm is unreachable from `extract_info` but must
+      // be covered by the closed-set match.
+      #[cfg(feature = "mpeg-audio")]
+      AnyParser::MpegAudio(_) => false,
+      #[cfg(feature = "mpc")]
+      AnyParser::Mpc(p) => p.process(ctx),
+      #[cfg(feature = "wavpack")]
+      AnyParser::Wv(p) => p.process(ctx),
+    }
+  }
 }
 
 /// Map a finalized ExifTool file-type string to its [`AnyParser`] arm, or

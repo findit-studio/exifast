@@ -55,7 +55,7 @@
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
-  parser::{OldFormatParser, ParseContext},
+  parser::ParseContext,
   parser_new::{FormatParser, MetaSinker, SharedFlags, TagWriter, parser_sealed},
   sink::MetadataTagWriter,
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -864,8 +864,10 @@ impl std::error::Error for MpcError {}
 // Legacy `OldFormatParser` bridge — preserves CLI byte-exact JSON
 // ===========================================================================
 
-impl OldFormatParser for ProcessMpc {
-  /// Phase E–F migration bridge. Faithful to `ProcessMPC` (MPC.pm:79-116):
+impl ProcessMpc {
+  /// Engine entry used by the closed [`crate::parser_new::AnyParser`]
+  /// dispatch (`crate::parser::extract_info`). Faithful to `ProcessMPC`
+  /// (MPC.pm:79-116):
   /// 1. **ID3 prefix dispatch** (MPC.pm:84-87) — `unless ($$et{DoneID3})
   ///    { ProcessID3 ... and return 1; }`. Via the parallel F2 agent's
   ///    [`crate::formats::id3::process::process_id3_chained`] entry. When
@@ -888,7 +890,7 @@ impl OldFormatParser for ProcessMpc {
   ///    context; the result is discarded. APE.pm:131 `$$et{DoneAPE} = 1`
   ///    happens inside, so subsequent chained parsers see DoneAPE set.
   /// 6. **Return 1** (MPC.pm:115).
-  fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
+  pub(crate) fn process(&self, ctx: &mut ParseContext<'_>) -> bool {
     // ----- (1) ID3 prefix dispatch (MPC.pm:84-87) --------------------------
     // `unless ($$et{DoneID3}) { ProcessID3 ... and return 1; }`. Bundled's
     // `and return 1` chains: a successful ProcessID3 makes MPC return 1
@@ -971,7 +973,7 @@ impl OldFormatParser for ProcessMpc {
 mod tests {
   use super::*;
   use crate::{
-    parser::{OldFormatParser, ParseContext},
+    parser::ParseContext,
     parser_new::FormatParser,
     sink::{MapTagWriter, MapValue},
     value::Metadata,
@@ -1090,7 +1092,7 @@ mod tests {
     let mut m = Metadata::new("x.mpc");
     let data = [0u8; 32];
     let mut c = ParseContext::new(&data, "MPC", 0, "MPC", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessMpc, &mut c));
+    assert!(!ProcessMpc.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
@@ -1101,7 +1103,7 @@ mod tests {
     let mut m = Metadata::new("x.mpc");
     let data = b"MP+\x07\x00\x00\x00";
     let mut c = ParseContext::new(data, "MPC", 0, "MPC", None, true, &mut m);
-    assert!(!OldFormatParser::process(&ProcessMpc, &mut c));
+    assert!(!ProcessMpc.process(&mut c));
     assert!(m.tags().is_empty());
   }
 
