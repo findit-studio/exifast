@@ -30,10 +30,14 @@
 //! Bundled FLAC reads ID3v2 first via `ID3::ProcessID3` — sets `$$et{DoneID3}`
 //! and continues to the FLAC body iff the ID3 path returns 0. The FLAC body
 //! starts AFTER the ID3v2 header (10-byte hdr + synchsafe-encoded payload
-//! length + optional 10-byte v2.4 footer if `flags & 0x10`). The current
-//! port skips the ID3v2 header inline; full ID3 content extraction is a
-//! [`SharedFlags::done_id3`](crate::parser_new::SharedFlags::done_id3)
-//! handshake item — wires up when F2 ID3 migration lands.
+//! length + optional 10-byte v2.4 footer if `flags & 0x10`).
+//!
+//! F1 (Codex adversarial): the typed parser nests an `Id3Meta` sub-Meta on
+//! `flac::Meta` via the SAME entry APE/DSF use
+//! (`crate::formats::id3::process::parse_id3_with_hdr_end`). The sink emits
+//! `File:ID3Size` + every `ID3v2_*:*` frame BEFORE the FLAC body tags — so
+//! the lib-first `serialize_tags` path matches bundled `perl exiftool` byte-
+//! for-byte on ID3-prefixed FLAC fixtures (no hand-trimming required).
 
 use core::time::Duration;
 use std::borrow::Cow;
@@ -610,6 +614,23 @@ pub struct Meta<'a> {
   /// a boolean so the sink can emit the canonical warning text without
   /// duplication.
   format_error: bool,
+  /// Chained ID3 sub-Meta from the FLAC.pm:243-247 embedded ProcessID3 call
+  /// (`unless ($$et{DoneID3}) { ID3::ProcessID3($et, $dirInfo) }`). `Some`
+  /// when an ID3v2 PREFIX (in front of the `fLaC` magic) was detected and
+  /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`].
+  /// Carries `File:ID3Size` + any `ID3v2_*:*` frame tags; the typed
+  /// `serialize_tags` sink emits them BEFORE the FLAC body tags so the
+  /// stream stays faithful to bundled (ID3 is processed first, then the
+  /// `fLaC` magic check & FLAC body extraction at FLAC.pm:254-278). Same
+  /// nesting pattern as `ape::Meta::id3` and `dsf::Meta::id3`.
+  ///
+  /// F1 (Codex adversarial): bundled emits `File:ID3Size` for every
+  /// ID3-prefixed FLAC (even a 10-byte empty header); the pre-F1 code
+  /// skipped the prefix bytes to reach `fLaC` but never emitted the ID3
+  /// content, forcing a hand-trimmed golden. Nesting the typed ID3 parser
+  /// closes that hole.
+  #[cfg(feature = "id3")]
+  id3: Option<crate::formats::id3::Id3Meta<'a>>,
 }
 
 impl<'a> Meta<'a> {
@@ -719,6 +740,19 @@ impl<'a> Meta<'a> {
     // Duration::from_secs_f64 panics on negative/NaN/Inf — we filter above.
     Some(Duration::from_secs_f64(secs))
   }
+  /// Chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`). `Some`
+  /// when an ID3v2 PREFIX was detected and parsed; the
+  /// `serialize_tags` sink emits its `File:ID3Size` + frame tags BEFORE the
+  /// FLAC body tags (faithful bundled order).
+  ///
+  /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
+  #[cfg(feature = "id3")]
+  #[must_use]
+  #[inline(always)]
+  pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
+    self.id3.as_ref()
+  }
+
   /// True iff FLAC.pm:263 set `$err = 1` during the block-chain walk (a
   /// truncated block read). Bundled emits the warning at FLAC.pm:278.
   #[must_use]
@@ -822,33 +856,36 @@ pub fn parse_borrowed<'a>(
 /// Inner parser — produces a borrow-from-input [`Meta`].
 fn parse_inner<'a>(
   data: &'a [u8],
-  _shared: &mut crate::parser_new::SharedFlags,
+  shared: &mut crate::parser_new::SharedFlags,
 ) -> Result<Option<Meta<'a>>, Error> {
-  // -- FLAC.pm:243-247 — ID3-prefix skip ----------------------------------
+  // -- FLAC.pm:243-247 — embedded ID3 (`ProcessID3`) ----------------------
   //
   //    unless ($$et{DoneID3}) {
   //        require Image::ExifTool::ID3;
   //        Image::ExifTool::ID3::ProcessID3($et, $dirInfo) and return 1;
   //    }
   //
-  // Bundled `ID3::ProcessID3` would emit ID3 content tags here if successful
-  // (`return 1` aborts FLAC processing entirely); on fall-through the RAF is
-  // positioned past the ID3v2 header and the `fLaC` magic check below
-  // continues.
-  //
-  // The full ID3 content extraction is the F2 ID3 migration target — when
-  // that lands, this function gains a typed ID3 sub-parse call that drives
-  // `set_done_id3` on the shared state. For now we skip the v2 header inline
-  // so the FLAC body is parseable in the ID3-prefix-only fixture
-  // (`FLAC_id3_prefix.flac`, `FLAC_id3v24_footer.flac`).
-  //
-  // ID3v2 header (ID3v2.3/2.4 spec):
-  //   bytes 0..3:  "ID3"
-  //   byte  3:     major version (reject 0xFF)
-  //   byte  4:     revision     (reject 0xFF)
-  //   byte  5:     flags (bit 4 = v2.4 footer flag)
-  //   bytes 6..10: synchsafe 28-bit length — each byte's high bit is 0.
-  let offset = id3v2_prefix_offset(data);
+  // Run the typed ID3 parser BEFORE the `fLaC` magic check (F1, Codex
+  // adversarial): bundled emits `File:ID3Size` + every ID3v2 frame tag for
+  // every ID3-prefixed FLAC, including the empty-header case (`File:ID3Size
+  // = 10`); the pre-F1 code just skipped the prefix bytes to reach `fLaC`
+  // and silently dropped that content. `parse_id3_with_hdr_end` is the
+  // SAME entry APE/DSF use (`ape::parse_full_chained`, `dsf::Meta::id3`)
+  // and returns the typed `Id3Meta` + the post-ID3v2-header offset
+  // (`$hdrEnd`, ID3.pm:1504). The recursion guard (ID3.pm:1435
+  // `return 0 if $$et{DoneID3}`) is honoured: only call when ID3 has not
+  // already run on this chain. (`flac` requires `id3` in Cargo.toml so
+  // this code path is the only one — see [`Meta::id3_ref`].)
+  let (id3, offset) = if shared.done_id3().is_none() {
+    crate::formats::id3::process::parse_id3_with_hdr_end(
+      data,
+      Some(&mut *shared),
+      /* print_conv */ true,
+    )
+    .unwrap_or((None, 0))
+  } else {
+    (None, shared.id3_hdr_end().unwrap_or(0))
+  };
 
   // -- FLAC.pm:254 — `fLaC` magic check -----------------------------------
   // `$raf->Read($buff, 4) == 4 and $buff eq 'fLaC' or return 0`
@@ -859,6 +896,7 @@ fn parse_inner<'a>(
   // -- FLAC.pm:256-280 — block chain walk ---------------------------------
   // SetByteOrder('MM') is implicit (every multi-byte read below uses BE).
   let mut meta = Meta::default();
+  meta.id3 = id3;
   let mut pos = offset + 4;
   loop {
     // FLAC.pm:260 — `$raf->Read($buff, 4) == 4 or last` (silent exit; no err).
@@ -925,6 +963,12 @@ fn parse_inner<'a>(
 /// ID3v2 prefix. Returns 0 if no ID3 prefix is present. Faithful to the
 /// `FLAC.pm:243-247` skip + the `ID3.pm:1484-1487 v2.4 footer` skip
 /// (R2-F1).
+///
+/// Used only when the `id3` feature is OFF — the default path runs the
+/// typed `parse_id3_with_hdr_end` to also capture `File:ID3Size` + frame
+/// tags (F1). Kept so the `cargo build --no-default-features --features
+/// std,flac` tier compiles without dragging in `id3`.
+#[cfg(not(feature = "id3"))]
 fn id3v2_prefix_offset(data: &[u8]) -> usize {
   if data.len() < 10 || !data.starts_with(b"ID3") {
     return 0;
@@ -1415,6 +1459,19 @@ impl Meta<'_> {
     const VORBIS_GROUP: &str = "Vorbis";
     const COMPOSITE_GROUP: &str = "Composite";
     const EXIFTOOL_GROUP: &str = "ExifTool";
+
+    // (0) Chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`).
+    // Bundled runs `ProcessID3` BEFORE the FLAC body extraction (it's the
+    // very first thing FLAC.pm:243-247 does — see ID3.pm:1606
+    // `FoundTag('ID3Size', $id3Len)` and the ID3v2 header / v1 trailer
+    // ProcessDirectory calls at ID3.pm:1607-1617), so `File:ID3Size` + every
+    // `ID3v2_*:*` frame tag precedes the FLAC StreamInfo / Vorbis / Picture
+    // tags. F1 (Codex adversarial): the pre-F1 code dropped this entirely,
+    // forcing a hand-trimmed golden — now we emit it via the typed sink.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      id3.serialize_tags(print_conv, out)?;
+    }
 
     // FLAC.pm:278 — `$err and Warn('Format error in FLAC file')`. ExifTool
     // serializer surfaces the first Warn as `ExifTool:Warning` (ExifTool.pm:
@@ -2154,6 +2211,7 @@ mod tests {
       ],
       pictures: vec![],
       format_error: false,
+      id3: None,
     };
     let mut md = TagMap::new();
     meta.serialize_tags(true, &mut md).unwrap();

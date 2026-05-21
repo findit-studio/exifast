@@ -4,6 +4,7 @@
   "File:FileType": "FLAC",
   "File:FileTypeExtension": "FLAC",
   "File:MIMEType": "audio/flac",
+  "File:ID3Size": 10,
   "FLAC:BlockSizeMin": 4608,
   "FLAC:BlockSizeMax": 4608,
   "FLAC:FrameSizeMin": 16777215,

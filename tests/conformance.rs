@@ -1222,18 +1222,14 @@ fn red2_framerate_div_by_zero_conformance() {
 fn flac_id3_prefix_conformance() {
   // R1-F1 regression pin: FLAC.pm:244-247 ID3-prefix dispatch. Fixture is
   // a real FLAC body prefixed with a (10-byte, no-extended-header) empty
-  // ID3v2 tag. Bundled ExifTool extracts the FLAC tags AFTER skipping the
-  // ID3 header (no ExifTool:Error finalization). exifast must skip the
-  // ID3 header faithfully — full ID3-content extraction is deferred to
-  // the ID3 pathfinder PR per [[exifast-phase2-forward-items]].
+  // ID3v2 tag. Bundled ExifTool runs `ID3::ProcessID3` first (emits
+  // `File:ID3Size = 10` + any ID3v2 frames) then extracts the FLAC body.
   //
-  // The bundled-Perl `tools/gen_golden.sh` capture for this fixture
-  // includes a `"File:ID3Size": 10` line emitted by ID3.pm:1606
-  // (`$et->FoundTag('ID3Size', $id3Len)`); that tag belongs to the ID3
-  // module's content extraction, NOT to FLAC.pm. We hand-trim that single
-  // line from the committed golden because faithful disposition here is
-  // skip-only — when the ID3 pathfinder PR lands and emits `File:ID3Size`,
-  // re-capture the golden via `tools/gen_golden.sh` to restore it.
+  // F1 fix (Codex adversarial): `flac::parse_inner` now invokes the typed
+  // `parse_id3_with_hdr_end` (same nesting pattern APE/DSF use) and the
+  // sink emits the chained ID3 sub-Meta BEFORE the FLAC body tags. The
+  // golden is regenerated UNTRIMMED from bundled — `File:ID3Size = 10`
+  // is committed (the previous hand-trim is removed).
   check("FLAC_id3_prefix.flac", "FLAC_id3_prefix.flac.json", true);
   check("FLAC_id3_prefix.flac", "FLAC_id3_prefix.flac.n.json", false);
 }
@@ -1281,11 +1277,14 @@ fn flac_id3v24_footer_conformance() {
   // Seek(10, 1); }` skips the optional v2.4 footer (10 bytes) AFTER the
   // header + synchsafe-size payload. Fixture is a real FLAC body prefixed
   // with an ID3v2.4 header (flags=0x10, size=0) immediately followed by a
-  // 10-byte `3DI` footer and the `fLaC` magic. Bundled ExifTool extracts
-  // the FLAC tags AFTER skipping (header + footer); exifast must mirror
-  // that. Per [[exifast-phase2-forward-items]], `File:ID3Size` is hand-
-  // trimmed from the committed golden (skip-only port; full ID3 content
-  // extraction lives in the deferred ID3 pathfinder PR).
+  // 10-byte `3DI` footer and the `fLaC` magic. Bundled ExifTool runs
+  // `ID3::ProcessID3` (emits `File:ID3Size = 10`), then extracts the FLAC
+  // body.
+  //
+  // F1 fix (Codex adversarial): the typed FLAC parser nests the ID3 sub-
+  // Meta via `parse_id3_with_hdr_end` (which honours the v2.4 footer flag
+  // in its hdr_end calculation, matching ID3.pm:1484-1487). The golden
+  // is regenerated UNTRIMMED — `File:ID3Size = 10` is committed.
   check(
     "FLAC_id3v24_footer.flac",
     "FLAC_id3v24_footer.flac.json",
