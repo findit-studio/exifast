@@ -88,6 +88,11 @@ pub mod datetime;
 pub mod error;
 pub mod filetype;
 pub mod formats;
+// The normalized typed-metadata domain layer (`MediaMetadata` and its
+// per-domain structs) plus the faithful per-format parse mirrors (e.g.
+// `QuickTimeMeta`). Unconditional — pure typed data with no serde/json
+// dependency; the QuickTime port's `from_quicktime` projection lives here.
+pub mod metadata;
 // `jsondiff` (value-semantic golden-diff oracle) and `serialize` (the
 // `serde_json` document renderer) depend on `serde_json` + `serde`, gated on
 // the `json` feature (`json = ["serde", "alloc", "dep:serde_json", "dep:serde"]`).
@@ -184,6 +189,8 @@ pub use formats::mpc::ProcessMpc;
 pub use formats::mpeg::ProcessMpegAudio;
 #[cfg(feature = "ogg")]
 pub use formats::ogg::ProcessOgg;
+#[cfg(feature = "quicktime")]
+pub use formats::quicktime::ProcessMov;
 #[cfg(feature = "real")]
 pub use formats::real::ProcessReal;
 #[cfg(feature = "red")]
@@ -306,6 +313,21 @@ pub fn parse_matroska(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::matroska::Meta<'_>>, formats::matroska::Error> {
   formats::matroska::parse_borrowed(bytes)
+}
+
+/// Parse a QuickTime / MP4 / MOV / M4A / M4V / 3GP / 3G2 buffer directly.
+/// See [`formats::quicktime::parse_borrowed`]. **SP1**: the box/atom walker
+/// plus the core structural atoms only (see the module docs).
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::quicktime::Error`] (currently
+/// uninhabited).
+#[cfg(feature = "quicktime")]
+pub fn parse_quicktime(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::quicktime::Meta<'_>>, formats::quicktime::Error> {
+  formats::quicktime::parse_borrowed(bytes)
 }
 
 /// Parse an AAC (ADTS) buffer directly. See [`formats::aac::parse_borrowed`].

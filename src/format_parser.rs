@@ -321,6 +321,9 @@ pub enum AnyParser {
   /// Matroska (FORMATS.md row 23 — MKV/MKA/MKS/WebM EBML container).
   #[cfg(feature = "matroska")]
   Matroska(crate::formats::matroska::ProcessMatroska),
+  /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — ISO-BMFF box container).
+  #[cfg(feature = "quicktime")]
+  QuickTime(crate::formats::quicktime::ProcessMov),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -413,6 +416,9 @@ pub enum AnyMeta<'a> {
   /// Matroska (FORMATS.md row 23).
   #[cfg(feature = "matroska")]
   Matroska(crate::formats::matroska::Meta<'a>),
+  /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — SP1 core structural atoms).
+  #[cfg(feature = "quicktime")]
+  QuickTime(crate::formats::quicktime::Meta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -439,6 +445,7 @@ pub enum AnyMeta<'a> {
     feature = "mpc",
     feature = "wavpack",
     feature = "matroska",
+    feature = "quicktime",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -510,6 +517,8 @@ impl AnyMeta<'_> {
       AnyMeta::Wv(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness.
@@ -533,6 +542,7 @@ impl AnyMeta<'_> {
         feature = "mpc",
         feature = "wavpack",
         feature = "matroska",
+        feature = "quicktime",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = (print_conv, out);
@@ -577,6 +587,44 @@ impl ExplicitThenLiteral {
   }
 }
 
+/// Payload for [`FileTypeFinalize::ExplicitWithMime`]: a
+/// `SetFileType($set, $mime)` where the parser supplies BOTH the explicit
+/// file type AND its MIME (QuickTime.pm:10008 `SetFileType($fileType,
+/// $mimeLookup{$fileType} || 'video/mp4')` — the M4A/M4V/M4B MIMEs are NOT in
+/// the generic `%mimeType` table, so they must be carried through). Extracted
+/// into a named struct so the enum stays unit-or-newtype only (§2). The
+/// `FileTypeExtension` is still derived from `set`; only the `MIMEType` comes
+/// from `mime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitWithMime {
+  set: &'static str,
+  mime: &'static str,
+}
+
+impl ExplicitWithMime {
+  /// Construct from the `SetFileType` type argument and its explicit MIME.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(set: &'static str, mime: &'static str) -> Self {
+    Self { set, mime }
+  }
+
+  /// The type passed to `SetFileType` (drives `FileType`/`FileTypeExtension`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn set(&self) -> &'static str {
+    self.set
+  }
+
+  /// The explicit `File:MIMEType` the parser supplies (the second
+  /// `SetFileType` argument).
+  #[must_use]
+  #[inline(always)]
+  pub const fn mime(&self) -> &'static str {
+    self.mime
+  }
+}
+
 /// How the engine ([`crate::parser::extract_info`]) should finalize the
 /// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
 /// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
@@ -616,6 +664,12 @@ pub enum FileTypeFinalize {
   /// `$$self{VALUE}{FileType} = 'DJVU (multi-page)'`, AIFF.pm:206). The
   /// payload (see [`ExplicitThenLiteral`]) carries the `set` + `literal`.
   ExplicitThenLiteral(ExplicitThenLiteral),
+  /// `SetFileType($set, $mime)` — finalize to an EXPLICIT type WITH an
+  /// explicit MIME the parser derived from the body, bypassing the generic
+  /// `%mimeType` table lookup (QuickTime: M4A→`audio/mp4`, M4V→`video/x-m4v`,
+  /// which are absent from `%mimeType`, QuickTime.pm:10008). The payload (see
+  /// [`ExplicitWithMime`]) carries the `set` + `mime`.
+  ExplicitWithMime(ExplicitWithMime),
 }
 
 impl AnyMeta<'_> {
@@ -695,6 +749,16 @@ impl AnyMeta<'_> {
           FileTypeFinalize::Detected
         }
       }
+      // QuickTime: `SetFileType($fileType, $mimeLookup{$fileType} ||
+      // 'video/mp4')` where `$fileType`/MIME are derived from the `ftyp`
+      // major/compatible brands (QuickTime.pm:9986-10008); a non-`ftyp` first
+      // atom finalizes to MOV/`video/quicktime` (QuickTime.pm:10012). The
+      // parser supplies BOTH — the M4A/M4V/M4B MIMEs are absent from the
+      // generic `%mimeType` table, so the engine must NOT recompute them (F2).
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => {
+        FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
+      }
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -715,6 +779,7 @@ impl AnyMeta<'_> {
         feature = "mpc",
         feature = "wavpack",
         feature = "matroska",
+        feature = "quicktime",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -925,6 +990,10 @@ pub enum AnyError {
   #[cfg(feature = "matroska")]
   #[error("Matroska: {0}")]
   Matroska(#[from] crate::formats::matroska::Error),
+  /// QuickTime fatal-error wrapper.
+  #[cfg(feature = "quicktime")]
+  #[error("QuickTime: {0}")]
+  QuickTime(#[from] crate::formats::quicktime::Error),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -997,6 +1066,7 @@ impl AnyParser {
       feature = "mpc",
       feature = "wavpack",
       feature = "matroska",
+      feature = "quicktime",
     )))]
     let _ = (bytes, shared, ext);
     match self {
@@ -1199,6 +1269,18 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::Matroska))
           .map_err(Into::into)
       }
+      #[cfg(feature = "quicktime")]
+      AnyParser::QuickTime(p) => {
+        // QuickTime SP1 is a leaf format with no shared chain state, but it
+        // DOES read `$$et{FILE_EXT}` for the `%useExt` rule (QuickTime.pm:240,
+        // 10006-10007: `.glv` + MP4-compatible ftyp ⇒ `File:FileType=GLV`).
+        // The leaf `FormatParser::parse` has no extension channel, so the
+        // dispatch uses the extension-aware `parse_with_ext` entry instead.
+        let _ = (p, shared);
+        crate::formats::quicktime::parse_with_ext(bytes, ext)
+          .map(|o| o.map(AnyMeta::QuickTime))
+          .map_err(Into::into)
+      }
     }
   }
 }
@@ -1236,6 +1318,14 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MP3" => Some(AnyParser::Mp3(crate::formats::id3::ProcessMp3)),
     #[cfg(feature = "moi")]
     "MOI" => Some(AnyParser::Moi(crate::formats::moi::ProcessMoi)),
+    // ExifTool maps every QuickTime extension (MOV / MP4 / M4A / M4V /
+    // M4B / M4P / 3GP / 3G2 / …) to base type `"MOV"` via the
+    // `%fileTypeLookup` table; `detection_candidates` yields `"MOV"` as
+    // the candidate file_type. The parser differentiates MP4/M4A/… from
+    // the `ftyp` brands and drives the right `SetFileType` (via
+    // `FileTypeFinalize::Explicit`).
+    #[cfg(feature = "quicktime")]
+    "MOV" => Some(AnyParser::QuickTime(crate::formats::quicktime::ProcessMov)),
     #[cfg(feature = "mpc")]
     "MPC" => Some(AnyParser::Mpc(crate::formats::mpc::ProcessMpc)),
     #[cfg(feature = "ogg")]
@@ -1389,8 +1479,7 @@ mod tests {
   #[cfg(all(feature = "json", feature = "aac"))]
   #[test]
   fn rendered_serializes_meta_format_tags_both_modes() {
-    use crate::format_parser::Rendered;
-    use crate::jsondiff::json_equivalent;
+    use crate::{format_parser::Rendered, jsondiff::json_equivalent};
     let data = std::fs::read(concat!(
       env!("CARGO_MANIFEST_DIR"),
       "/tests/fixtures/AAC.aac"

@@ -62,7 +62,8 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 # Umbrella — enables every per-format gate.
 all-formats = [
   "aac", "aiff", "ape", "audible", "dsf", "dv", "flac", "flash",
-  "h264", "id3", "matroska", "mp3", "mpc", "moi", "ogg", "real", "red", "wavpack",
+  "h264", "id3", "matroska", "mp3", "mpc", "moi", "ogg", "quicktime",
+  "real", "red", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -126,6 +127,10 @@ moi        = []
 # `--features std,ogg` fails to compile (Codex R4 F1: silent feature-graph
 # breakage from the R3 picture-parse + ID3-nest fixes).
 ogg        = ["flac", "id3"]
+# `quicktime` — MOV / MP4 / M4A / M4V / 3GP / 3G2. SP1 (the box/atom
+# walker + core structural atoms) is a leaf format with no cross-format
+# chains. SP3 will add an `exif` edge for the embedded-Exif atom hop.
+quicktime  = []
 # `real` chains ID3 (Real.pm:678-687: ID3v1 trailer scan on RM files;
 # the typed parser reuses `formats::id3::parse_id3v1_from_block` to
 # decode the 128-byte TAG block via the same path the ID3 engine

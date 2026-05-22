@@ -43,6 +43,8 @@ pub mod mpc;
 pub mod mpeg;
 #[cfg(feature = "ogg")]
 pub mod ogg;
+#[cfg(feature = "quicktime")]
+pub mod quicktime;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]

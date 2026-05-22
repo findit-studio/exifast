@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "QuickTime_nested_invalid_tkhd.mov",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "mov",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "Apple QuickTime (.MOV/QT)",
+  "QuickTime:MinorVersion": "0.0.0",
+  "Track1:Warning": "Invalid atom size"
+}]

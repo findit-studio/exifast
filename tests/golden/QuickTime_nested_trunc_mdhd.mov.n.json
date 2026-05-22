@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "QuickTime_nested_trunc_mdhd.mov",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "MOV",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "qt  ",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["qt  "],
+  "Track1:Warning": "Truncated 'mdhd' data (missing 36 bytes)"
+}]

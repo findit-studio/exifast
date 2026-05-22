@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "QuickTime_nested_trunc_mvhd.mov",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Truncated 'mvhd' data (missing 88 bytes)",
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "MOV",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "qt  ",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["qt  "]
+}]

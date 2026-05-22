@@ -57,10 +57,12 @@
 //! `serde_json` rendering of `Rendered`.
 #![cfg(feature = "json")]
 
-use exifast::filetype::detection_candidates;
-use exifast::format_parser::{Rendered, SharedFlags, any_parser_for};
-use exifast::jsondiff::json_equivalent;
-use exifast::parser::extract_info;
+use exifast::{
+  filetype::detection_candidates,
+  format_parser::{Rendered, SharedFlags, any_parser_for},
+  jsondiff::json_equivalent,
+  parser::extract_info,
+};
 
 /// Fixtures excluded from the active conformance set — known
 /// formally-accept-deferred residuals (NOT silent metadata losses;
@@ -184,7 +186,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_186() {
+fn typed_serde_path_equals_writer_path_and_golden_all_225() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -491,12 +493,148 @@ fn typed_serde_path_equals_writer_path_and_golden_all_186() {
   // ValueConv tags became `0`/`0 bps`) and `ConvertBitrate`/`ConvertDuration`
   // emitted Rust's lowercase `inf`/`-inf`. Both pinned here vs the bundled
   // oracle.
+  // 149 → 150 after the QuickTime port Sub-Port 1 (the box/atom walker +
+  // core structural atoms): added the synthetic `QuickTime_sp1.mov`
+  // fixture exercising `ftyp` + `moov`(`mvhd` + 2 `trak`s) + `mdat`. The
+  // real bundled `QuickTime.mov`/`QuickTime.m4a` fixtures land in a later
+  // sub-port (see `docs/tracking.md`).
+  // 150 → 153 after PR #38 Codex R1 findings F2/F4/F5: added three
+  // synthetic adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_v1tkhd.mov` (version-1 tkhd ImageWidth/Height at offsets
+  // 88/92, F2), `QuickTime_moov_order.mov` (trak-before-mvhd ⇒ final-
+  // TimeScale durationInfo, F4-refuted), `QuickTime_nested_size0.mov`
+  // (contained size-0 terminator drops the trailing trak, F5).
+  // 153 → 158 after PR #38 Codex R2 findings F1/F2/F3/F4: added five
+  // synthetic adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_zerodate.mov` (raw-0 mvhd/tkhd/mdhd dates ⇒ "0000:00:00
+  // 00:00:00" sentinel, not dropped, R2/F1), `QuickTime_m4a.mov` +
+  // `QuickTime_m4v.mov` (ftyp-derived MIME audio/mp4 + video/x-m4v carried
+  // through finalization, R2/F2), `QuickTime_zerotimescale.mov` (TimeScale=0
+  // ⇒ Duration/TrackDuration emit the bare raw value, R2/F3),
+  // `QuickTime_maclang.mov` (Macintosh MediaLanguageCode 12 ⇒ ttLang
+  // PrintConv "ar", -n raw 12, R2/F4).
+  // 158 → 160 after PR #38 Codex R3 findings F1/F2: added two synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_matrixfrac.mov` (a FRACTIONAL mvhd MatrixStructure exercising
+  // GetFixed32s' 5-dp rounding + Perl `%.15g` ⇒ "2e-05 0 0 0 2e-05 0 0 0
+  // 1.220703125e-09", R3/F1) and `QuickTime_multimoov.mov` (TWO top-level
+  // moovs; the second's mvhd overwrites the GLOBAL TimeScale to 300, so the
+  // first track's TrackDuration converts as 1200/300 = 4 against the FINAL
+  // TimeScale, R3/F2).
+  // 160 → 162 after PR #38 Codex R4 findings F1/F2: added two synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_size0_moov.mov` (ftyp + a TOP-LEVEL size-0 `moov` whose `mvhd`
+  // payload is NOT decoded — ExifTool prints "extends to end of file" and
+  // STOPS, QuickTime.pm:10044-10056 — so ONLY the ftyp tags survive, R4/F1)
+  // and `QuickTime_multimoov_tracks.mov` (TWO top-level moovs each with one
+  // `trak`; ExifTool's `$track` counter is a `my` local of each moov's
+  // ProcessMOV call so it RESETS per moov ⇒ BOTH are `Track1`, and the second
+  // collapses on the family-1 collision in default JSON — no `Track2`, R4/F2).
+  // 162 → 164 after PR #38 Codex R5 findings F1/F2: added two synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_multimoov_tracksdistinct.mov` (TWO top-level moovs both numbering
+  // their lone `trak` as `Track1` but carrying DISTINCT tags — moov1 a bare
+  // `tkhd` with TrackID, moov2 a bare `mdhd`/`hdlr` with MediaTimeScale/
+  // MediaDuration/HandlerType; ExifTool's `%noDups` first-wins is per rendered
+  // tag KEY not per group, so BOTH sets of `Track1:*` tags survive, R5/F1) and
+  // `QuickTime_size0_mdat_first.mov` (a file whose VERY FIRST top-level atom is
+  // `size == 0, type = mdat`; the first-atom gate keys on the 4-byte type
+  // regardless of size ⇒ FileType MOV + MediaDataSize/Offset then `last`,
+  // QuickTime.pm:9984/10044-10056, R5/F2).
+  // 164 → 167 after PR #38 Codex R6 findings F1/F2: added three synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_multimoov_movdur.mov` (TWO top-level moovs; moov1's `mvhd` has
+  // Duration=3000 under TimeScale=600, moov2's SHORT `mvhd` carries only
+  // TimeScale=300 with NO Duration ⇒ movie `Duration` = 3000/300 = "10.00 s" —
+  // the `%durationInfo` ValueConv runs at OUTPUT against the FINAL global
+  // TimeScale and an absent field in the later `mvhd` does NOT erase the
+  // earlier count, R6/F1), `QuickTime_trunc_ftyp.mov` (a 12-byte file whose
+  // first `ftyp` declares size 100; the format is gated on the 4-byte `$tag`
+  // alone ⇒ accepted, FileType MP4 default + a `Truncated 'ftyp' data`
+  // warning, R6/F2) and `QuickTime_overrun_mdat.mov` (a 12-byte file whose
+  // first `mdat` declares size 100 ⇒ FileType MOV + MediaDataSize=92 +
+  // MediaDataOffset=8 from the DECLARED size + a `Truncated 'mdat' data at
+  // offset 0x0` warning, R6/F2).
+  // 167 → 171 after PR #38 Codex R7 findings F1/F2: added four synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_dupmdhd.mov` (a `moov/trak/mdia` with a FULL `mdhd`
+  // TimeScale=600/Duration=1200 followed by a SHORT `mdhd` carrying only
+  // TimeScale=300 ⇒ `Track1:MediaDuration = "2.00 s"` is NOT erased by the
+  // later absent Duration while `MediaTimeScale = 300` is last-wins, R7/F1),
+  // `QuickTime_nested_trunc_mvhd.mov` (a truncated `mvhd` inside `moov` ⇒
+  // `ExifTool:Warning = "Truncated 'mvhd' data (missing 88 bytes)"` — a
+  // contained `TruncatedAtom` now surfaces the warning instead of breaking
+  // silently, R7/F2), `QuickTime_nested_trunc_tkhd.mov` (a truncated `tkhd`
+  // inside `moov/trak` ⇒ `Track1:Warning`, the warning attaches to the
+  // current family-1 group, R7/F2) and `QuickTime_nested_trunc_mdhd.mov` (a
+  // truncated `mdhd` three levels deep in `moov/trak/mdia` ⇒ `Track1:Warning`,
+  // R7/F2).
+  // 171 → 175 after PR #38 Codex R8 findings F1/F2: added four synthetic
+  // adversarial QuickTime fixtures verified vs bundled, pinning the
+  // first-atom size/header malformation class-sweep —
+  // `QuickTime_invalid_size.mov` (an 8-byte `00000004 ftyp`: a `size < 8`
+  // first atom ⇒ FileType MOV + `ExifTool:Warning = "Invalid atom size"`,
+  // R8/F1), `QuickTime_trunc_ext_hdr.mov` (a 12-byte `size==1 ftyp` whose
+  // 8-byte extended-size header is truncated ⇒ FileType MOV + `Truncated atom
+  // header`, R8/F1), `QuickTime_short_ftyp.mov` (an 8-byte `size==8 ftyp`
+  // whose RAW 32-bit size is `< 12` ⇒ `else { SetFileType() }` ⇒ MOV, not the
+  // MP4 default, R8/F1) and `QuickTime_ext_ftyp.mov` (an extended-size `ftyp`
+  // with the `isom` brand: the `$size >= 12` gate sees the RAW 32-bit
+  // `size == 1` so it FAILS ⇒ MOV, even though the brand alone would resolve
+  // to MP4, R8/F1). R8/F2 — a lowercase `pict` first atom is now a recognized
+  // MOV magic atom (`is_known_top_level` += `pict`, −`meta`) — is pinned by
+  // the `lowercase_pict_first_atom_accepted_as_mov` /
+  // `meta_first_atom_is_rejected` unit tests (a `pict` conformance fixture
+  // would force the SP2-scope `Binary` `PreviewPICT` payload tag).
+  // 175 → 178 after PR #38 Codex R9 findings F1/F2: added three synthetic
+  // adversarial QuickTime fixtures verified vs bundled —
+  // `QuickTime_ftyp_first_qt.mov` (a `ftyp` `isom` major + `qt  ` in the FIRST
+  // compatible-brand slot ⇒ FileType MP4: the `^.{8}(.{4})+(qt  )` regex needs
+  // a NON-first compatible-brand slot, so a first-slot `qt  ` does not
+  // override the MP4 default, R9/F1), `QuickTime_nested_invalid_mvhd.mov` (a
+  // `moov` containing an `mvhd` with declared `size == 4` ⇒ `ExifTool:Warning
+  // = "Invalid atom size"`: a contained `Malformed` header now surfaces the
+  // bundled `$warnStr` instead of `walk_atoms` breaking silently, R9/F2) and
+  // `QuickTime_nested_invalid_tkhd.mov` (a `tkhd` with invalid `size == 4`
+  // inside `moov/trak` ⇒ `Track1:Warning = "Invalid atom size"`, R9/F2).
+  // 178 → 179 after PR #38 Codex R10 finding F1: added the synthetic
+  // adversarial QuickTime fixture `QuickTime_m4a_isom_override.mov` (an `ftyp`
+  // `isom` MAJOR brand + a lone `soun`-handler track and NO `vide` handler ⇒
+  // bundled ExifTool's post-walk `OverrideFileType('M4A','audio/mp4')` flips
+  // the MP4-resolved type to `File:FileType=M4A` / `File:FileTypeExtension=m4a`
+  // / `File:MIMEType=audio/mp4` while `QuickTime:MajorBrand` keeps the `isom`
+  // PrintConv — the audio-only `.m4a` real-world-file case,
+  // QuickTime.pm:10619-10624, verified vs bundled 13.58, R10/F1). R10/F2 — the
+  // mvhd/tkhd/mdhd Hooks widen on a TRUTHY version (not strictly `== 1`) — is
+  // crafted-input-only (v2+ atoms are undefined by the MP4 spec), so it adds
+  // NO fixture; the existing v0/v1 fixtures stay byte-exact green.
+  // 179 → 180 after PR #38 Codex R11 finding F1: added the QuickTime fixture
+  // `QuickTime_useext_glv.glv` — the BYTE-IDENTICAL twin of
+  // `QuickTime_m4a_isom_override.mov` but named `.glv`. The `%useExt` rule
+  // (QuickTime.pm:240 `( GLV => 'MP4' )`, applied at QuickTime.pm:10006-10007)
+  // promotes the ftyp-derived MP4 to GLV BEFORE the post-walk MP4→M4A override
+  // (gated on `FileType eq 'MP4'`), so the same audio-only bytes yield
+  // `File:FileType=GLV` / `File:FileTypeExtension=glv` / `File:MIMEType=video/mp4`
+  // as `.glv` vs `M4A` as `.mov` (verified vs bundled 13.58, R11/F1). The
+  // `%useExt` table has exactly this one entry, so no other fixture is needed.
+  // 180 → 182 after PR #38 Codex R12 finding F1 [REAL-INPUT]: added two
+  // synthetic adversarial QuickTime fixtures verified vs bundled, pinning the
+  // default `LargeFileSupport => 1` (ExifTool.pm:1167) 64-bit extended-size
+  // handling — `QuickTime_mdat64_moov.mov` (`ftyp` + a `size == 1` 64-bit
+  // `mdat` that FITS + a trailing `moov`; the walker skips the 64-bit `mdat`
+  // by its declared size and REACHES the trailing `moov` ⇒ full
+  // Duration/TimeScale/dates/MatrixStructure/NextTrackID — the real >2GB-video
+  // shape, QuickTime.pm:10062-10074) and `QuickTime_mdat64_large.mov` (a
+  // `size == 1` `mdat` declaring 0x80000010, i.e. `lo > 0x7fffffff` — PARSED,
+  // not rejected: MediaDataSize=2147483648 from the DECLARED 64-bit size +
+  // `Truncated 'mdat' data at offset 0x14`, NOT the dead `LargeFileSupport not
+  // enabled` branch the port emitted before the fix, R12/F1).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    192,
-    "expected exactly the 192 active conformance fixtures, found {}: {:?}",
+    225,
+    "expected exactly the 225 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

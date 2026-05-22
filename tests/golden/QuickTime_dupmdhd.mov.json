@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "QuickTime_dupmdhd.mov",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "mov",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "Apple QuickTime (.MOV/QT)",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["qt  "],
+  "Track1:MediaDuration": "2.00 s",
+  "Track1:MediaHeaderVersion": 0,
+  "Track1:MediaCreateDate": "0000:00:00 00:00:00",
+  "Track1:MediaModifyDate": "0000:00:00 00:00:00",
+  "Track1:MediaTimeScale": 300
+}]

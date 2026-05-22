@@ -50,6 +50,711 @@ fn aac_conformance() {
 }
 
 #[test]
+fn quicktime_sp1_conformance() {
+  // QuickTime port Sub-Port 1 (the box/atom walker + core structural
+  // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal
+  // `.mov` exercising exactly the atoms SP1 implements: `ftyp` +
+  // `moov`(`mvhd` + 2 `trak`s, each `tkhd`/`mdia`(`mdhd`/`hdlr`)) +
+  // `mdat`. The real bundled `QuickTime.mov`/`QuickTime.m4a` fixtures
+  // land in a later sub-port (SP1 cannot reach byte-exact parity on
+  // them — most of their tags belong to SP2-SP4).
+  //
+  // PR #38 Codex R1/F1: the goldens are now the FULL UNSTRIPPED bundled
+  // `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` output — every tag
+  // ExifTool emits for the ftyp/mvhd/tkhd/mdhd/mdat atoms SP1 implements
+  // (MajorBrand/MinorVersion/CompatibleBrands, PreferredRate/Volume,
+  // MatrixStructure, the Preview/Poster/Selection/Current time tags,
+  // NextTrackID, MediaDataSize/Offset, TrackCreate/ModifyDate, TrackLayer/
+  // Volume, MediaCreate/ModifyDate, …). Only the STANDARD `System:*` /
+  // `Composite:*` exclusions remain (composite synthesis is deferred per
+  // `[[exifast-phase2-forward-items]]`, the same uniform exclusion every
+  // other format golden applies). No per-tag stripping.
+  check("QuickTime_sp1.mov", "QuickTime_sp1.mov.json", true);
+  check("QuickTime_sp1.mov", "QuickTime_sp1.mov.n.json", false);
+}
+
+#[test]
+fn quicktime_v1_tkhd_conformance() {
+  // PR #38 Codex R1/F2: a SYNTHETIC `.mov` with a VERSION-1 tkhd. The v1
+  // Hook widens only the three time/duration fields (create/modify/duration,
+  // +12 bytes), so ImageWidth/ImageHeight (int32u table indices 19/20) sit
+  // at byte offsets 88/92 — NOT 96/100. Verified vs bundled ExifTool:
+  // ImageWidth=1280, ImageHeight=720. Without the F2 fix the decoder read
+  // garbage from 96/100.
+  check("QuickTime_v1tkhd.mov", "QuickTime_v1tkhd.mov.json", true);
+  check("QuickTime_v1tkhd.mov", "QuickTime_v1tkhd.mov.n.json", false);
+}
+
+#[test]
+fn quicktime_moov_order_conformance() {
+  // PR #38 Codex R1/F4 (REFUTED): a SYNTHETIC `.mov` whose `trak` precedes
+  // `mvhd` inside `moov`. The `TrackDuration` durationInfo is a ValueConv
+  // applied at OUTPUT time using the FINAL movie TimeScale — so the trak's
+  // TrackDuration is `18000/600 = 30 s` even though the trak is parsed
+  // before mvhd (verified vs bundled). Pins the final-TimeScale semantics
+  // against the Codex-suggested (incorrect) parse-order threading.
+  check(
+    "QuickTime_moov_order.mov",
+    "QuickTime_moov_order.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_moov_order.mov",
+    "QuickTime_moov_order.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_size0_conformance() {
+  // PR #38 Codex R1/F5: a SYNTHETIC `.mov` whose `moov` contains a size-0
+  // `free` atom (a CONTAINED zero-size = terminator, QuickTime.pm:10036-
+  // 10043) BEFORE a `trak`. Bundled ExifTool stops the contained walk at the
+  // terminator, so the trailing `trak` is DROPPED (no `Track1:*` tags). A
+  // top-level size-0 still extends to EOF (the `mdat`-size path). Pins the
+  // top-level-vs-contained size-0 distinction.
+  check(
+    "QuickTime_nested_size0.mov",
+    "QuickTime_nested_size0.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_size0.mov",
+    "QuickTime_nested_size0.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_zerodate_conformance() {
+  // PR #38 Codex R2/F1: a SYNTHETIC `.mov` whose mvhd/tkhd/mdhd carry RAW-ZERO
+  // CreateDate/ModifyDate/Track*Date/Media*Date. The timeInfo RawConv only
+  // `undef`s a zero date under `StrictDate` (QuickTime.pm:265, unimplemented +
+  // off in the gen-golden config); otherwise the ValueConv
+  // `ConvertUnixTime(0, …)` emits the zero sentinel "0000:00:00 00:00:00"
+  // (ExifTool.pm:6776). Verified vs bundled — the zero dates are EMITTED, not
+  // dropped. Without the fix the typed layer silently omitted them.
+  check(
+    "QuickTime_zerodate.mov",
+    "QuickTime_zerodate.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_zerodate.mov",
+    "QuickTime_zerodate.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_m4a_conformance() {
+  // PR #38 Codex R2/F2: a SYNTHETIC `.mov` with an `M4A ` major brand. The
+  // QuickTime parser derives `File:FileType=M4A` AND `File:MIMEType=audio/mp4`
+  // from `ftyp` (QuickTime.pm:10008 `SetFileType($ft, $mimeLookup{$ft})`).
+  // M4A is ABSENT from the generic `%mimeType` table, so the engine must carry
+  // the parser-supplied MIME through finalization. Verified vs bundled —
+  // MIMEType=audio/mp4 (not the base MOV `video/quicktime`).
+  check("QuickTime_m4a.mov", "QuickTime_m4a.mov.json", true);
+  check("QuickTime_m4a.mov", "QuickTime_m4a.mov.n.json", false);
+}
+
+#[test]
+fn quicktime_m4a_isom_override_conformance() {
+  // PR #38 Codex R10/F1: a SYNTHETIC `.mov` with an `isom` MAJOR brand whose
+  // brands resolve to MP4, plus a single `soun`-handler track and NO `vide`
+  // handler. ExifTool runs a post-walk override (QuickTime.pm:10619-10624):
+  // when the resolved type is MP4 AND `save_ftyp` (the major brand) matches
+  // `^(iso|dash|mp42)` AND a `soun` handler exists AND no `vide` handler
+  // exists, `OverrideFileType('M4A','audio/mp4')` flips the type. So this
+  // audio-only `.m4a` is `File:FileType=M4A` / `File:FileTypeExtension=m4a` /
+  // `File:MIMEType=audio/mp4`, while `QuickTime:MajorBrand` keeps the `isom`
+  // PrintConv ("MP4 Base Media v1 …"). Verified vs bundled ExifTool 13.58 —
+  // this is the ubiquitous real-world M4A audio-file fidelity case.
+  check(
+    "QuickTime_m4a_isom_override.mov",
+    "QuickTime_m4a_isom_override.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_m4a_isom_override.mov",
+    "QuickTime_m4a_isom_override.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_useext_glv_conformance() {
+  // PR #38 Codex R11/F1: the `%useExt` rule (QuickTime.pm:240
+  // `%useExt = ( GLV => 'MP4' )`, applied at QuickTime.pm:10006-10007). This
+  // fixture is the BYTE-IDENTICAL twin of `QuickTime_m4a_isom_override.mov`
+  // (same `isom` major brand, audio-only `soun` track, MP4-resolving brands)
+  // but named with a `.glv` extension. ExifTool's `%useExt` rule promotes the
+  // ftyp-derived `MP4` to `GLV` BEFORE `SetFileType` — and because that runs
+  // before the post-walk MP4→M4A override (gated on `$$et{FileType} eq 'MP4'`,
+  // QuickTime.pm:10619), the audio-only override no longer fires. So the same
+  // bytes that yield `File:FileType=M4A` as `.mov` yield `File:FileType=GLV` /
+  // `File:FileTypeExtension=glv` (raw `GLV`) / `File:MIMEType=video/mp4` as
+  // `.glv` (`%mimeLookup` has no `GLV` entry ⇒ the `'video/mp4'` fallback).
+  // Verified vs bundled ExifTool 13.58 — the canonical Garmin Low-resolution
+  // Video real-world fidelity case. Exercises the engine's `ext` channel
+  // (`extract_info` derives `$$et{FILE_EXT}` from the `.glv` fixture name).
+  check(
+    "QuickTime_useext_glv.glv",
+    "QuickTime_useext_glv.glv.json",
+    true,
+  );
+  check(
+    "QuickTime_useext_glv.glv",
+    "QuickTime_useext_glv.glv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_m4v_conformance() {
+  // PR #38 Codex R2/F2: a SYNTHETIC `.mov` with an `M4V ` major brand ⇒
+  // `File:FileType=M4V`, `File:MIMEType=video/x-m4v` (QuickTime.pm:10008 +
+  // %mimeLookup). M4V is absent from the generic `%mimeType` table; the
+  // ftyp-derived MIME is carried through finalization (verified vs bundled).
+  check("QuickTime_m4v.mov", "QuickTime_m4v.mov.json", true);
+  check("QuickTime_m4v.mov", "QuickTime_m4v.mov.n.json", false);
+}
+
+#[test]
+fn quicktime_zerotimescale_conformance() {
+  // PR #38 Codex R2/F3: a SYNTHETIC `.mov` with movie TimeScale=0 and
+  // Duration=1200. The durationInfo PrintConv gates on TimeScale TRUTHINESS
+  // (`$$self{TimeScale} ? ConvertDuration($val) : $val`, QuickTime.pm:315) —
+  // a zero TimeScale is falsy, so Duration emits the BARE raw value 1200 (not
+  // a ConvertDuration string). Likewise the Preview/Poster/etc. movie-scale
+  // durations emit their raw 0. Verified vs bundled.
+  check(
+    "QuickTime_zerotimescale.mov",
+    "QuickTime_zerotimescale.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_zerotimescale.mov",
+    "QuickTime_zerotimescale.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_maclang_conformance() {
+  // PR #38 Codex R2/F4: a SYNTHETIC `.mov` whose mdhd MediaLanguageCode is a
+  // MACINTOSH numeric code (12, < 0x400). The ValueConv keeps the bare number
+  // (QuickTime.pm:7280); the PrintConv maps numeric values through
+  // `$ttLang{Macintosh}` (Font.pm:92-117) ⇒ 12 → "ar", with an
+  // `Unknown ($val)` fallback (QuickTime.pm:7281-7285). Verified vs bundled —
+  // `-j` "ar", `-n` raw 12. Without the fix `-j` leaked the raw number.
+  check("QuickTime_maclang.mov", "QuickTime_maclang.mov.json", true);
+  check(
+    "QuickTime_maclang.mov",
+    "QuickTime_maclang.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_matrixfrac_conformance() {
+  // PR #38 Codex R3/F1: a SYNTHETIC `.mov` whose mvhd MatrixStructure carries
+  // raw 1 in the a/d/w slots. The `Format => 'fixed32s[9]'` reads each entry
+  // through GetFixed32s (ExifTool.pm:6121-6127) which divides by 0x10000 then
+  // ROUNDS to 5 decimal places: 1/65536 = 1.52587890625e-05 → 2e-05. The
+  // ValueConv then applies `$_ /= 0x4000` to the right column (entry 8: that
+  // rounded 2e-05 / 0x4000 = 1.220703125e-09). Perl interpolates each into
+  // `"@a"` via `%.15g`. Verified vs bundled —
+  // `MatrixStructure: "2e-05 0 0 0 2e-05 0 0 0 1.220703125e-09"`. Without the
+  // GetFixed32s rounding + `%.15g` formatting, the port emitted the full Rust
+  // float `0.0000152587890625 …`.
+  check(
+    "QuickTime_matrixfrac.mov",
+    "QuickTime_matrixfrac.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_matrixfrac.mov",
+    "QuickTime_matrixfrac.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_multimoov_conformance() {
+  // PR #38 Codex R3/F2: a SYNTHETIC `.mov` with TWO top-level `moov` atoms.
+  // The first carries the track (tkhd Duration=1200) under mvhd TimeScale=600;
+  // a SECOND top-level moov overwrites the GLOBAL movie TimeScale to 300. The
+  // `mvhd` TimeScale RawConv (`$$self{TimeScale} = $val`, QuickTime.pm:1384)
+  // is a single global slot, last-wins; the TrackDuration durationInfo
+  // ValueConv runs at OUTPUT against that FINAL value ⇒ 1200/300 = 4. Verified
+  // vs bundled — `Track1:TrackDuration = 4`. Without learning every mvhd's
+  // TimeScale BEFORE converting any TrackDuration the port emitted 1200/600 =
+  // 2.
+  check(
+    "QuickTime_multimoov.mov",
+    "QuickTime_multimoov.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_multimoov.mov",
+    "QuickTime_multimoov.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_size0_moov_conformance() {
+  // PR #38 Codex R4/F1: a SYNTHETIC `.mov` = ftyp + a TOP-LEVEL size-0 `moov`
+  // containing a real `mvhd`. For a top-level size-0 atom ExifTool prints
+  // "extends to end of file", records the synthetic `$tag-size`/`$tag-offset`
+  // tags ONLY if they exist (just `mdat`), then `last` — STOPS the walk WITHOUT
+  // processing the payload (QuickTime.pm:10044-10056). So the size-0 `moov`'s
+  // `mvhd` is NEVER decoded; verified vs bundled — ONLY the ftyp tags survive
+  // (no CreateDate/TimeScale/Duration/tracks). Previously the size-0 atom was
+  // treated as a normal extends-to-EOF Atom and the `mvhd` payload was decoded.
+  check(
+    "QuickTime_size0_moov.mov",
+    "QuickTime_size0_moov.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_size0_moov.mov",
+    "QuickTime_size0_moov.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_multimoov_tracks_conformance() {
+  // PR #38 Codex R4/F2: a SYNTHETIC `.mov` with TWO top-level `moov` atoms,
+  // each holding ONE (byte-identical) `trak`. ExifTool's `$track` counter is a
+  // `my` local of EACH moov's `ProcessMOV` invocation (QuickTime.pm:9944),
+  // `++`-incremented per `trak` (QuickTime.pm:10354) — so it RESETS to 1 per
+  // moov and BOTH traks become `Track1` (NOT `Track1` + `Track2`). In default
+  // JSON the second `Track1` collapses on the family-1 collision; verified vs
+  // bundled — a single `Track1` group, NO `Track2`. Previously the tracks were
+  // flattened into one Vec and numbered with a GLOBAL `enumerate()+1`, wrongly
+  // yielding `Track1` + `Track2`.
+  check(
+    "QuickTime_multimoov_tracks.mov",
+    "QuickTime_multimoov_tracks.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_multimoov_tracks.mov",
+    "QuickTime_multimoov_tracks.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_multimoov_tracksdistinct_conformance() {
+  // PR #38 Codex R5/F1: a SYNTHETIC `.mov` with TWO top-level `moov` atoms,
+  // BOTH numbering their lone `trak` as `Track1`, but carrying DISTINCT tags:
+  // moov1's `Track1` comes from a bare `tkhd` (TrackID=7, TrackDuration,
+  // TrackLayer/Volume, MatrixStructure, ImageWidth/Height, …) while moov2's
+  // `Track1` comes from a bare `mdia`(`mdhd`/`hdlr`) (MediaTimeScale=90000,
+  // MediaDuration, MediaLanguageCode, HandlerType, …). ExifTool's `%noDups`
+  // first-wins collision is per rendered tag KEY (`(family-1 group, tag name)`),
+  // NOT per group: verified vs bundled — the single `Track1` group carries BOTH
+  // moov1's TrackID and moov2's MediaTimeScale/MediaDuration/HandlerType. The
+  // R4/F2 serializer wrongly `continue`d the ENTIRE later same-group track,
+  // dropping every Media* tag. (TrackDuration = 1200/300 = 4 — the FINAL global
+  // TimeScale=300 from moov2's mvhd, last-wins, R3/F2.)
+  check(
+    "QuickTime_multimoov_tracksdistinct.mov",
+    "QuickTime_multimoov_tracksdistinct.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_multimoov_tracksdistinct.mov",
+    "QuickTime_multimoov_tracksdistinct.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_size0_mdat_first_conformance() {
+  // PR #38 Codex R5/F2: a SYNTHETIC `.mov` whose VERY FIRST top-level atom is
+  // `size == 0, type = mdat` (extends to EOF). ExifTool's first-atom recognition
+  // gate (QuickTime.pm:9984 `$$tagTablePtr{$tag} or return 0`) keys on the
+  // 4-byte `$tag` REGARDLESS of size, so `mdat` is recognized → FileType MOV;
+  // the per-atom loop then treats the size-0 `mdat` as extends-to-EOF, records
+  // the synthetic `mdat-size`/`mdat-offset` (QuickTime.pm:10044-10056), and
+  // `last`. Verified vs bundled — FileType MOV + MediaDataSize=32 (40-byte file,
+  // 8-byte header) + MediaDataOffset=8, nothing else. The port previously
+  // rejected the file at the first-atom gate (which accepted only
+  // `HeaderOutcome::Atom`, not a top-level size-0 `ExtendsToEof`) and returned
+  // `Ok(None)`, losing the QuickTime result entirely.
+  check(
+    "QuickTime_size0_mdat_first.mov",
+    "QuickTime_size0_mdat_first.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_size0_mdat_first.mov",
+    "QuickTime_size0_mdat_first.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_multimoov_movdur_conformance() {
+  // PR #38 Codex R6/F1: a SYNTHETIC `.mov` with TWO top-level `moov` atoms.
+  // moov1's `mvhd` has TimeScale=600 + Duration=3000; moov2's `mvhd` is a
+  // SHORT 16-byte header carrying only version/create/modify/TimeScale=300 —
+  // NO Duration field. The movie `Duration` is a `%durationInfo` tag whose
+  // ValueConv `$val / $$self{TimeScale}` runs at OUTPUT against the FINAL
+  // global movie TimeScale (last-wins, 300) — and an absent Duration in the
+  // later short `mvhd` must NOT erase moov1's found count. Verified vs
+  // bundled: `QuickTime:Duration = "10.00 s"` (3000 / 300), with
+  // MovieHeaderVersion/CreateDate/ModifyDate/TimeScale from moov2 (last-wins
+  // for the fields it DOES carry). The port previously converted Duration at
+  // `mvhd` decode against the SAME mvhd's TimeScale and let the short moov2
+  // overwrite the field with `None`.
+  check(
+    "QuickTime_multimoov_movdur.mov",
+    "QuickTime_multimoov_movdur.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_multimoov_movdur.mov",
+    "QuickTime_multimoov_movdur.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_trunc_ftyp_conformance() {
+  // PR #38 Codex R6/F2: a 12-byte file whose first atom is `ftyp` with a
+  // DECLARED size of 100 — the header is intact but the brand payload
+  // overruns EOF. ExifTool gates the format on the 4-byte `$tag` ALONE
+  // (QuickTime.pm:9984), so the file IS QuickTime: `$tag eq 'ftyp' and $size
+  // >= 12` runs, the short brand read fails, `$fileType` stays undef and
+  // defaults to MP4 (QuickTime.pm:10004), then the `Truncated 'ftyp' data`
+  // warning stops the walk. Verified vs bundled: FileType=MP4 +
+  // `ExifTool:Warning = "Truncated 'ftyp' data (missing 92 bytes)"`, no
+  // `QuickTime:*` tags. The port previously rejected the file outright (the
+  // payload-bounds check returned `None` at the first-atom gate).
+  check(
+    "QuickTime_trunc_ftyp.mov",
+    "QuickTime_trunc_ftyp.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_trunc_ftyp.mov",
+    "QuickTime_trunc_ftyp.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_overrun_mdat_conformance() {
+  // PR #38 Codex R6/F2: a 12-byte file whose first atom is `mdat` with a
+  // DECLARED size of 100. ExifTool records the synthetic `mdat-size` /
+  // `mdat-offset` from the DECLARED size BEFORE the short payload read
+  // (QuickTime.pm:10156-10158); `mdat` is `Unknown` so `GetTagInfo` returns
+  // undef and the seek-past `else` branch fires `Truncated 'mdat' data at
+  // offset 0x0` (QuickTime.pm:10590). Verified vs bundled: FileType=MOV +
+  // MediaDataSize=92 + MediaDataOffset=8 + the truncation warning. The port
+  // previously rejected the file at the first-atom gate.
+  check(
+    "QuickTime_overrun_mdat.mov",
+    "QuickTime_overrun_mdat.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_overrun_mdat.mov",
+    "QuickTime_overrun_mdat.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_mdat64_moov_conformance() {
+  // PR #38 Codex R12/F1 [REAL-INPUT]: `ftyp` + a `size == 1` 64-bit `mdat`
+  // (declared total 48, FITS) + a trailing `moov`. With the DEFAULT
+  // `LargeFileSupport => 1` (ExifTool.pm:1167) the walker decodes the 64-bit
+  // size (`$size = $hi*4294967296 + $lo - 16`, QuickTime.pm:10074) and SKIPS
+  // the `mdat` to REACH the trailing `moov` — the exact path a real >2GB video
+  // takes (a 64-bit `mdat` before a trailing `moov`). Verified vs bundled
+  // ExifTool 13.58: the full `mvhd` tags appear (Duration=5.00 s, TimeScale,
+  // CreateDate/ModifyDate, MatrixStructure, NextTrackID), plus MediaDataSize=32
+  // / MediaDataOffset=36. Before the fix the walker stopped at the `mdat` with
+  // the bogus `LargeFileSupport not enabled` Malformed and lost everything in
+  // the `moov`.
+  check(
+    "QuickTime_mdat64_moov.mov",
+    "QuickTime_mdat64_moov.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_mdat64_moov.mov",
+    "QuickTime_mdat64_moov.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_mdat64_large_conformance() {
+  // PR #38 Codex R12/F1 [REAL-INPUT]: a `size == 1` 64-bit `mdat` declaring a
+  // total of 0x80000010 — i.e. `lo > 0x7fffffff` (hi == 0), the real >2GB
+  // shape. ExifTool's `not LargeFileSupport ⇒ 'End of processing at large
+  // atom'` branch (QuickTime.pm:10067) is DEAD under the default
+  // `LargeFileSupport => 1`, so the 64-bit size is PARSED: the synthetic
+  // `mdat-size` is the full DECLARED payload (0x80000010 - 16 = 2147483648,
+  // QuickTime.pm:10074/10156-10158), recorded BEFORE the short read; the read
+  // then comes up short and the `Unknown` `mdat` fires `Truncated 'mdat' data
+  // at offset 0x14` (QuickTime.pm:10590). Verified vs bundled ExifTool 13.58:
+  // FileType=MOV + MediaDataSize=2147483648 + MediaDataOffset=36 + that
+  // warning — NOT the `LargeFileSupport not enabled` rejection the port emitted
+  // before the fix.
+  check(
+    "QuickTime_mdat64_large.mov",
+    "QuickTime_mdat64_large.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_mdat64_large.mov",
+    "QuickTime_mdat64_large.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_dupmdhd_conformance() {
+  // PR #38 Codex R7/F1: a SYNTHETIC `.mov` whose `moov/trak/mdia` holds TWO
+  // `mdhd` atoms — a FULL mdhd (TimeScale=600, Duration=1200) followed by a
+  // SHORT 16-byte mdhd carrying only version/create/modify/TimeScale=300, NO
+  // Duration field. `MediaDuration`/`MediaTimeScale` are per-track binary-data
+  // fields; bundled ExifTool never erases an earlier FoundTag when a later
+  // field is absent. Verified vs bundled: `Track1:MediaDuration = "2.00 s"`
+  // (the FULL mdhd's 1200/600, NOT erased) + `Track1:MediaTimeScale = 300`
+  // (the short mdhd's, last-wins for the field it DOES carry). The port
+  // previously passed the short mdhd's absent Duration `None` into
+  // `set_media_duration_seconds`, clearing the earlier 2.00 s.
+  check("QuickTime_dupmdhd.mov", "QuickTime_dupmdhd.mov.json", true);
+  check(
+    "QuickTime_dupmdhd.mov",
+    "QuickTime_dupmdhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_trunc_mvhd_conformance() {
+  // PR #38 Codex R7/F2: a SYNTHETIC `.mov` with a truncated `mvhd` CONTAINED
+  // inside `moov` — the mvhd header is intact but its declared 92-byte payload
+  // overruns EOF (only 4 bytes present). `walk_atoms` must surface the same
+  // `Truncated '...' data` warning the top-level loop emits. Verified vs
+  // bundled: `ExifTool:Warning = "Truncated 'mvhd' data (missing 88 bytes)"`.
+  // The port's `walk_atoms` previously broke silently on a contained
+  // `TruncatedAtom` outcome.
+  check(
+    "QuickTime_nested_trunc_mvhd.mov",
+    "QuickTime_nested_trunc_mvhd.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_trunc_mvhd.mov",
+    "QuickTime_nested_trunc_mvhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_trunc_tkhd_conformance() {
+  // PR #38 Codex R7/F2: a truncated `tkhd` inside `moov/trak` (declared
+  // 90-byte payload, 4 bytes present). ExifTool attaches the truncation
+  // warning to the CURRENT family-1 group, so it surfaces as `Track1:Warning`
+  // (NOT the document-level `ExifTool:Warning`). Verified vs bundled:
+  // `Track1:Warning = "Truncated 'tkhd' data (missing 86 bytes)"`.
+  check(
+    "QuickTime_nested_trunc_tkhd.mov",
+    "QuickTime_nested_trunc_tkhd.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_trunc_tkhd.mov",
+    "QuickTime_nested_trunc_tkhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_trunc_mdhd_conformance() {
+  // PR #38 Codex R7/F2: a truncated `mdhd` nested THREE levels deep inside
+  // `moov/trak/mdia` (declared 40-byte payload, 4 bytes present). The
+  // recursive `walk_atoms` surfaces the warning into the enclosing track's
+  // family-1 group. Verified vs bundled:
+  // `Track1:Warning = "Truncated 'mdhd' data (missing 36 bytes)"`.
+  check(
+    "QuickTime_nested_trunc_mdhd.mov",
+    "QuickTime_nested_trunc_mdhd.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_trunc_mdhd.mov",
+    "QuickTime_nested_trunc_mdhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_invalid_size_conformance() {
+  // PR #38 Codex R8/F1: an 8-byte file `00000004 66747970` — the first atom's
+  // 4-byte type `ftyp` is a recognized magic atom but its declared `size == 4`
+  // is structurally invalid (`< 8`). ExifTool gates the format on the 4-byte
+  // `$tag` ALONE (QuickTime.pm:9984) and `SetFileType`s ⇒ MOV BEFORE the
+  // per-atom loop's `$size < 8` check sets `$warnStr = 'Invalid atom size'`
+  // and `last`s (QuickTime.pm:10058). Verified vs bundled: FileType MOV +
+  // `ExifTool:Warning = "Invalid atom size"`. The port previously rejected
+  // the file outright — `read_atom_header` returned `None` for `size < 8` and
+  // `parse_inner` turned that into `Ok(None)`, losing the QuickTime result.
+  check(
+    "QuickTime_invalid_size.mov",
+    "QuickTime_invalid_size.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_invalid_size.mov",
+    "QuickTime_invalid_size.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_trunc_ext_hdr_conformance() {
+  // PR #38 Codex R8/F1: a 12-byte file whose first atom is `size == 1 ftyp`
+  // but whose 8-byte extended-size header is truncated (only 4 of 8 bytes).
+  // QuickTime.pm:10059 `$raf->Read($buff,8) == 8 or $warnStr = 'Truncated
+  // atom header', last` — but the 8-byte tag/size header was already read and
+  // `SetFileType` already ran. Verified vs bundled: FileType MOV +
+  // `ExifTool:Warning = "Truncated atom header"`. The port previously
+  // returned `Ok(None)` (the truncated-extended-header path returned `None`).
+  check(
+    "QuickTime_trunc_ext_hdr.mov",
+    "QuickTime_trunc_ext_hdr.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_trunc_ext_hdr.mov",
+    "QuickTime_trunc_ext_hdr.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_short_ftyp_conformance() {
+  // PR #38 Codex R8/F1: an 8-byte file `00000008 66747970` — a `ftyp` first
+  // atom whose RAW 32-bit `size` is `8`, i.e. `< 12`. ExifTool's file-type
+  // branch `if ($tag eq 'ftyp' and $size >= 12)` FAILS (the brand path needs
+  // `$size >= 12`) so it takes `else { SetFileType() }` ⇒ MOV
+  // (QuickTime.pm:9986/10012). Verified vs bundled: FileType MOV. The port
+  // previously defaulted a short `ftyp` to MP4 (it keyed the brand path on a
+  // readable >=4-byte payload rather than the RAW 32-bit size >= 12).
+  check(
+    "QuickTime_short_ftyp.mov",
+    "QuickTime_short_ftyp.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_short_ftyp.mov",
+    "QuickTime_short_ftyp.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_ext_ftyp_conformance() {
+  // PR #38 Codex R8/F1: a 24-byte file whose first atom is an EXTENDED-size
+  // `ftyp` (`size32 == 1`, 64-bit size 24) with the `isom` major brand.
+  // ExifTool's `$size >= 12` ftyp gate sees the RAW 32-bit `$size == 1` (the
+  // 64-bit decode happens later, INSIDE the per-atom loop), so it FAILS ⇒
+  // `else { SetFileType() }` ⇒ MOV — even though the `isom` brand would
+  // otherwise resolve to MP4. The brand is still decoded from the (valid)
+  // extended-size atom walk. Verified vs bundled: FileType MOV +
+  // `QuickTime:MajorBrand = "MP4 Base Media v1 [IS0 14496-12:2003]"` +
+  // `QuickTime:MinorVersion = "0.0.0"`. The port previously resolved the
+  // file type from the normalized payload brand and wrongly yielded MP4.
+  check(
+    "QuickTime_ext_ftyp.mov",
+    "QuickTime_ext_ftyp.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_ext_ftyp.mov",
+    "QuickTime_ext_ftyp.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_ftyp_first_qt_conformance() {
+  // PR #38 Codex R9/F1: a `ftyp` whose major brand is `isom`, minor version 0,
+  // and FIRST compatible brand is `qt  `. ExifTool's compatible-brand regex
+  // `/^.{8}(.{4})+(qt  )/s` (QuickTime.pm:10000) skips the major brand + minor
+  // version via `^.{8}`, then `(.{4})+` requires ONE OR MORE 4-byte slots
+  // BEFORE the matched brand — so a `qt  ` in the FIRST compatible-brand slot
+  // (buffer offset 8) can NOT trigger the match. `$fileType` stays undef ⇒
+  // `$fileType or $fileType = 'MP4'` (QuickTime.pm:10004). Verified vs bundled:
+  // FileType MP4 (not MOV). The port previously scanned every slot from offset
+  // 8 and returned MOV on the first `qt  ` it saw.
+  check(
+    "QuickTime_ftyp_first_qt.mov",
+    "QuickTime_ftyp_first_qt.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_ftyp_first_qt.mov",
+    "QuickTime_ftyp_first_qt.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_invalid_mvhd_conformance() {
+  // PR #38 Codex R9/F2: a `moov` containing an `mvhd` whose declared
+  // `size == 4` is structurally invalid (`< 8`). ExifTool runs the same
+  // `ProcessMOV` per-atom `for(;;)` loop on the contained `moov` directory
+  // (QuickTime.pm:10035-10075), so the `size < 8` check sets `$warnStr =
+  // 'Invalid atom size'` and `last`s; the warning is emitted at the
+  // directory's exit. Verified vs bundled: `ExifTool:Warning = "Invalid atom
+  // size"`. The port's `walk_atoms` previously treated a contained
+  // `HeaderOutcome::Malformed` like a size-0 terminator — a SILENT break.
+  check(
+    "QuickTime_nested_invalid_mvhd.mov",
+    "QuickTime_nested_invalid_mvhd.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_invalid_mvhd.mov",
+    "QuickTime_nested_invalid_mvhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_nested_invalid_tkhd_conformance() {
+  // PR #38 Codex R9/F2: a `tkhd` with an invalid declared `size == 4` inside
+  // `moov/trak`. ExifTool attaches the `Invalid atom size` warning to the
+  // CURRENT family-1 group — the `trak`'s `Track#` — so it surfaces as
+  // `Track1:Warning`, NOT the document-level `ExifTool:Warning`. Verified vs
+  // bundled: `Track1:Warning = "Invalid atom size"`.
+  check(
+    "QuickTime_nested_invalid_tkhd.mov",
+    "QuickTime_nested_invalid_tkhd.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_nested_invalid_tkhd.mov",
+    "QuickTime_nested_invalid_tkhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_conformance() {
   // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
   // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio
