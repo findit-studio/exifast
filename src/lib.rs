@@ -165,6 +165,8 @@ pub use formats::dsf::ProcessDsf;
 pub use formats::dv::ProcessDv;
 #[cfg(feature = "flac")]
 pub use formats::flac::ProcessFlac;
+#[cfg(feature = "flash")]
+pub use formats::flash::ProcessFlv;
 #[cfg(feature = "h264")]
 pub use formats::h264::ProcessH264;
 #[cfg(feature = "id3")]
@@ -512,6 +514,19 @@ pub fn parse_h264(
   formats::h264::parse_borrowed(bytes)
 }
 
+/// Parse a Flash Video (FLV) buffer directly. See
+/// [`formats::flash::parse_borrowed`].
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::flash::Error`] (currently uninhabited).
+#[cfg(feature = "flash")]
+pub fn parse_flv(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::flash::Meta<'_>>, formats::flash::Error> {
+  formats::flash::parse_borrowed(bytes)
+}
+
 /// Parse an Ogg container (Vorbis / Opus / Theora) buffer directly. See
 /// [`formats::ogg::parse_borrowed`].
 ///
@@ -741,6 +756,8 @@ mod tests {
       let mut shared = SharedFlags::new();
       let _ = parse_flac(bytes, &mut shared);
     }
+    #[cfg(feature = "flash")]
+    let _ = parse_flv(bytes);
     #[cfg(feature = "ape")]
     {
       let mut shared = SharedFlags::new();

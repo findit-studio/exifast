@@ -3447,6 +3447,1383 @@ fn h264_forbidden_bit_surfaces_warning() {
   }
 }
 
+#[test]
+fn flash_conformance() {
+  // FORMATS.md row 18: Image::ExifTool::Flash (FLV side). Bundled fixture
+  // `tests/fixtures/Flash.flv` is the real `t/images/Flash.flv` (1358 bytes,
+  // FLV\x01 with onMetaData script-data, audio MP3 11kHz mono, video On2
+  // VP6, cue-points, key-frame index). Goldens captured from bundled
+  // `perl exiftool` (`-j -G1 -struct` and `-j -G1 -struct -n`), with
+  // `System:*` lines stripped (consistent with the established trim
+  // precedent) AND the `Composite:ImageSize` / `Composite:Megapixels`
+  // pair stripped — Composite metadata synthesis is an engine-level
+  // forward-item (see `docs/tracking.md` Composite-engine accepted
+  // deferral, also noted in the Red/DV/Audible conformance goldens).
+  //
+  // Exercises:
+  //   - 9-byte FLV header gate (Flash.pm:474-475)
+  //   - tag-stream loop (Flash.pm:483-523) with prev-tag-size + 11-byte
+  //     header decode
+  //   - `0x08` audio packet bit-stream (`%Flash::Audio`, Flash.pm:91-135)
+  //   - `0x09` video packet bit-stream (`%Flash::Video`, Flash.pm:138-154)
+  //   - `0x12` script-data Meta with AMF0 object/mixed-array/array/double/
+  //     boolean/string/date dispatch (`ProcessMeta`, Flash.pm:290-461)
+  //   - `onMetaData` packet-gate (Flash.pm:444-447 `%processMetaPacket`)
+  //   - struct-prefixed sub-tag names (CuePoint0Name / CuePoint1ParameterParam1,
+  //     Flash.pm:380 `$structName . ucfirst($tag)`)
+  //   - ValueConv `*1000` for `audiodatarate` / `videodatarate` (Flash.pm:168/237)
+  //   - PrintConv `ConvertBitrate` (Flash.pm:169/238)
+  //   - PrintConv `ConvertDuration` (Flash.pm:192)
+  //   - PrintConv `int($val * 1000 + 0.5) / 1000` for FrameRate (Flash.pm:197)
+  //   - AMF date type with timezone suffix (Flash.pm:309-325)
+  //   - auto-add path `ucfirst($tag)` for the `test` key (Flash.pm:391)
+  //   - double-array emission (KeyFramesTimes / KeyFramePositions,
+  //     Flash.pm:410-426)
+  check("Flash.flv", "Flash.flv.json", true);
+  check("Flash.flv", "Flash.flv.n.json", false);
+}
+
+#[test]
+fn flash_amf_strict_array_string_conformance() {
+  // Codex R1/F1 adversarial fixture: AMF0 strict-array (0x0a) of strings
+  // (type 0x02). Bundled Flash.pm:410-426 collects every non-struct child
+  // (`push @vals, $v unless $isStruct{$t}`) and `HandleTag` emits the
+  // whole list under the auto-added `StrList` name as a JSON array of
+  // strings: `["alpha","beta","gamma"]`. Pins the F1 fix: the prior
+  // walker silently dropped every non-double element.
+  check(
+    "flash_array_strings.flv",
+    "flash_array_strings.flv.json",
+    true,
+  );
+  check(
+    "flash_array_strings.flv",
+    "flash_array_strings.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_nonfinite_string_conformance() {
+  // Codex PR #32 R20/F1 fixtures: numeric `%Flash::Meta` fields encoded as
+  // AMF strings carrying the IEEE non-finite spellings. Perl's `Perl_my_atof`
+  // coerces `inf`/`nan`/`infinity`/`1.#INF` (any case + optional sign) to
+  // `±Inf`/`NaN` in numeric context, so the `$val * 1000` ValueConv
+  // (audiodatarate/videodatarate/totaldatarate, Flash.pm:168/230/237) yields a
+  // non-finite NV. `ConvertBitrate` (audio/video, Flash.pm:169/238) and
+  // `int($val+0.5)` (total, Flash.pm:231) then `IsFloat`-reject the non-finite
+  // (ExifTool.pm:6894 / the regex needs a leading digit) and pass it through —
+  // stringifying to Perl's titlecase `Inf`/`-Inf`/`NaN` in BOTH `-j` and `-n`.
+  // `framerate` (no ValueConv, Flash.pm:195-198) keeps the RAW AMF string under
+  // `-n` (lowercase `inf`/`nan` as authored) and runs the RoundMilli arithmetic
+  // under `-j` (→ titlecase). `flash_amf_nonfinite_inf.flv` is all-`inf`;
+  // `flash_amf_nonfinite_nan.flv` mixes `NaN` (AudioBitrate), `Inf`
+  // (VideoBitrate), `-inf` (TotalDataRate → `-Inf`) and `nan` (FrameRate).
+  // Pre-fix `perl_str_to_f64` returned `0.0` for every spelling, so the
+  // ValueConv tags collapsed to `0`/`0 bps`, and `ConvertBitrate`/
+  // `ConvertDuration` emitted Rust's lowercase `inf`/`-inf`.
+  check(
+    "flash_amf_nonfinite_inf.flv",
+    "flash_amf_nonfinite_inf.flv.json",
+    true,
+  );
+  check(
+    "flash_amf_nonfinite_inf.flv",
+    "flash_amf_nonfinite_inf.flv.n.json",
+    false,
+  );
+  check(
+    "flash_amf_nonfinite_nan.flv",
+    "flash_amf_nonfinite_nan.flv.json",
+    true,
+  );
+  check(
+    "flash_amf_nonfinite_nan.flv",
+    "flash_amf_nonfinite_nan.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_creationdate_valueconv_conformance() {
+  // Codex PR #32 R15/F1 fixture: AMF0 strict-array (0x0a) of strings under
+  // the `creationdate` key, whose elements carry trailing whitespace
+  // (`["A   ", "B\t "]`). Bundled `GetValue` (ExifTool.pm:3567-3681) applies
+  // the owning tag's ValueConv (`$val=~s/\s+$//; $val`, Flash.pm:182) to
+  // EACH TOP-LEVEL array element, so bundled emits `Flash:CreateDate
+  // ["A","B"]` under BOTH `-j` and `-n` (the ValueConv is pre-PrintConv).
+  // Pins R15/F1: the prior walker stored top-level array strings raw,
+  // preserving the trailing whitespace and diverging from bundled.
+  check(
+    "flash_creationdate_strict_array.flv",
+    "flash_creationdate_strict_array.flv.json",
+    true,
+  );
+  check(
+    "flash_creationdate_strict_array.flv",
+    "flash_creationdate_strict_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_bool_conformance() {
+  // Codex R1/F1 fixture: strict-array of booleans (type 0x01). Bundled
+  // Flash.pm:329 converts each `0/1` to `"No"/"Yes"` INSIDE ProcessMeta
+  // (pre-PrintConv) so both `-j` and `-n` see the string array
+  // `["Yes","No","Yes"]` (verified — bundled `-n` shows the same shape).
+  check("flash_array_bools.flv", "flash_array_bools.flv.json", true);
+  check(
+    "flash_array_bools.flv",
+    "flash_array_bools.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_date_conformance() {
+  // Codex R1/F1 fixture: strict-array of dates (type 0x0b). Bundled
+  // Flash.pm:316-324 emits each as the `YYYY:MM:DD HH:MM:SS.ssssss±HH:MM`
+  // string (NO local-tz shift; the tz suffix is the AMF-recorded value).
+  check("flash_array_dates.flv", "flash_array_dates.flv.json", true);
+  check(
+    "flash_array_dates.flv",
+    "flash_array_dates.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_mixed_conformance() {
+  // Codex R1/F1 fixture: strict-array of heterogeneous AMF types
+  // (string + double + boolean + date). Bundled emits a single mixed
+  // JSON array `["hello",42.5,"Yes","2024:01:01 00:00:00.000000+00:00"]`
+  // — pins the F1 fix's per-element shape preservation across the four
+  // common AMF leaf types.
+  check("flash_array_mixed.flv", "flash_array_mixed.flv.json", true);
+  check(
+    "flash_array_mixed.flv",
+    "flash_array_mixed.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_truncated_double_conformance() {
+  // Codex R1/F2 fixture: AMF double (type 0x00) truncated mid-payload
+  // inside a mixed-array. Bundled Flash.pm:456 emits
+  // `ExifTool:Warning: Truncated AMF record 0x0` AND retains the prior
+  // good entry (`Flash:GoodVal: 1.5`). Pins the F2 fix: the prior
+  // walker silently aborted the packet with NO warning.
+  check(
+    "flash_trunc_double.flv",
+    "flash_trunc_double.flv.json",
+    true,
+  );
+  check(
+    "flash_trunc_double.flv",
+    "flash_trunc_double.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_truncated_string_conformance() {
+  // Codex R1/F2 fixture: AMF string (type 0x02) with a length field that
+  // overruns the buffer. Bundled emits `Truncated AMF record 0x2` +
+  // retains the prior good entry.
+  check(
+    "flash_trunc_string.flv",
+    "flash_trunc_string.flv.json",
+    true,
+  );
+  check(
+    "flash_trunc_string.flv",
+    "flash_trunc_string.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_truncated_date_conformance() {
+  // Codex R1/F2 fixture: AMF date (type 0x0b) — f64 parses cleanly but
+  // the 2-byte tz suffix is missing. Bundled has a SUBTLE branch here
+  // (Flash.pm:309-313): the `last if $pos + 2 > $dirLen` exits the
+  // Record AFTER `$val` is already assigned to the raw double; line 455
+  // sees `defined $val` so NO truncation warning. The half-parsed value
+  // is emitted as a bare double (`$val/1000`, no date formatting). Pins
+  // this exact bundled behavior.
+  check("flash_trunc_date.flv", "flash_trunc_date.flv.json", true);
+  check("flash_trunc_date.flv", "flash_trunc_date.flv.n.json", false);
+}
+
+#[test]
+fn flash_amf_truncated_array_conformance() {
+  // Codex R1/F2 fixture: AMF strict-array (type 0x0a) with claimed count
+  // > available elements. Bundled emits `Truncated AMF record 0xa`
+  // (Flash.pm:456 fires from Frame 2 because `$val = \@vals` is never
+  // reached) + retains the prior good entry. Pins the F2 array path.
+  check("flash_trunc_array.flv", "flash_trunc_array.flv.json", true);
+  check(
+    "flash_trunc_array.flv",
+    "flash_trunc_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_rec0_double_walks_past_conformance() {
+  // Codex R2/F1 adversarial fixture: rec=0 is a top-level AMF Double
+  // (0x00 + 8-byte payload `42.0`), followed by `onMetaData` at rec=1
+  // and a normal onMetaData object at rec=2.
+  //
+  // Bundled Flash.pm (verified via `perl exiftool` on this synthetic):
+  // the post-record gate at line 442-447 only `last`s when `$type ==
+  // 0x02 and not $rec` AND the string is NOT in `%processMetaPacket`.
+  // For a non-string at rec=0 the else-arm (line 448-452) is a verbose-
+  // only no-op; the loop CONTINUES to rec=1 and walks the onMetaData
+  // packet. Bundled net output for this fixture is `Flash:Duration:
+  // "7.50 s"` (PrintConv on) / `7.5` (PrintConv off) — pins that
+  // exifast's walker matches bundled (the original Codex R2/F1 framing
+  // suggested bundled rejects, but bundled empirically does NOT).
+  check(
+    "flash_f1_double_first.flv",
+    "flash_f1_double_first.flv.json",
+    true,
+  );
+  check(
+    "flash_f1_double_first.flv",
+    "flash_f1_double_first.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_rec0_struct_walks_inline_conformance() {
+  // Codex R2/F1 fixture: rec=0 is a top-level AMF object (`0x03`) with
+  // one key/value pair (`Preroll: 1`). Flash.pm:337-440's isStruct
+  // branch walks the children INLINE (no rec-0 gate — line 442's
+  // `unless ($isStruct{$type})` SKIPS the gate). Loop then advances
+  // and the next record is `onMetaData` + Duration object.
+  //
+  // Bundled net output: BOTH `Flash:Preroll: 1` AND `Flash:Duration:
+  // "7.50 s"` (verified empirically). Pins exifast's struct-at-rec=0
+  // path — the original Codex R2/F1 framing claimed bundled rejects
+  // structs at rec=0, but Flash.pm:442 demonstrably bypasses the gate
+  // for any struct type.
+  check(
+    "flash_f1_struct_first.flv",
+    "flash_f1_struct_first.flv.json",
+    true,
+  );
+  check(
+    "flash_f1_struct_first.flv",
+    "flash_f1_struct_first.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_nested_strict_array_conformance() {
+  // Codex R2/F2 fixture: an `onMetaData` object whose `outerArr` tag is
+  // a strict-array (`0x0a`) of two elements — element[0] is itself a
+  // nested strict-array `[1.0, 2.0]`, element[1] is the double `99.0`.
+  //
+  // Bundled Flash.pm:410-426 recurses into the inner ProcessMeta call
+  // for a 0x0a child; the inner call builds `$val = \@vals` and returns
+  // `(0x0a, $val)`. The outer Frame 2 then `push @vals, $v unless
+  // $isStruct{$t}` — `0x0a` is NOT in `%isStruct`, so the inner array
+  // reference IS appended. Bundled emits `OuterArr: [[1,2],99]` (the
+  // nested list is preserved verbatim in the JSON output).
+  //
+  // PRIOR BUG (pre-R2/F2): walk_array's leaf path called read_value on
+  // 0x0a, which returned `AmfValue::StrictArray` WITHOUT consuming the
+  // nested count+payload. The cursor then sat mid-nested-array → silent
+  // data corruption (an arbitrary subsequent f64 read interpreted the
+  // inner array bytes as a leaf double, producing junk values like
+  // `1.087e-311`).
+  check(
+    "flash_f2_nested_array.flv",
+    "flash_f2_nested_array.flv.json",
+    true,
+  );
+  check(
+    "flash_f2_nested_array.flv",
+    "flash_f2_nested_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_unsupported_after_valid_packet_conformance() {
+  // Codex R2/F3 fixture: valid `onMetaData` + Duration object, followed
+  // by an unsupported AMF type byte (`0x11` — AMF3 data marker,
+  // Flash.pm:434 in the `else` arm at lines 435-439).
+  //
+  // Bundled emits BOTH `Flash:Duration: "7.50 s"` AND the dedicated
+  // warning `"AMF AMF3data record not yet supported"`. Flash.pm:437's
+  // `$et->Warn(...)` is UNCONDITIONAL — it does NOT gate on the
+  // `$val` defined check at line 455-457.
+  //
+  // PRIOR BUG (pre-R2/F3): `read_value` returned the unsupported-type
+  // marker via `ReadResult::Truncated(t)` (reusing the truncation
+  // discriminant). The top-level walker's `if top_val_seen { warnings
+  // .pop(); }` then SILENTLY POPPED the unsupported warning, dropping
+  // the diagnostic for any unsupported type that followed a valid
+  // record. The new `ReadResult::Unsupported(t)` discriminant
+  // preserves the warning at all callers.
+  check(
+    "flash_f3_unsupported.flv",
+    "flash_f3_unsupported.flv.json",
+    true,
+  );
+  check(
+    "flash_f3_unsupported.flv",
+    "flash_f3_unsupported.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_empty_and_reference_scalars_conformance() {
+  // Codex R3/F1 fixture: onMetaData mixed-array holding the five AMF
+  // scalar shapes whose emission bundled handles via the
+  // `$val = ''` (Flash.pm:403-405, null/undef/0x0d) and
+  // `$val = Get16u(...)` (Flash.pm:406-409, reference) branches — plus
+  // one real double for control. Bundled `perl exiftool` emits all
+  // five keys: `Flash:NullKey: ""`, `Flash:UndefKey: ""`,
+  // `Flash:UnsupKey: ""`, `Flash:RefKey: 3`, `Flash:DoubleKey: 7.5`.
+  //
+  // PRIOR BUG (pre-R3/F1): `emit_resolved` mapped `AmfValue::Empty` and
+  // `AmfValue::Reference(_)` to `return;` — silently dropping FOUR of
+  // the five children. Net Rust output was a single-entry `Flash:
+  // DoubleKey: 7.5`. Post-fix: Empty → `""`, Reference(v) → numeric v.
+  check("flash_amf_scalars.flv", "flash_amf_scalars.flv.json", true);
+  check(
+    "flash_amf_scalars.flv",
+    "flash_amf_scalars.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_with_empties_conformance() {
+  // Codex R3/F2 fixture: onMetaData mixed-array with one key `mixList`
+  // holding a strict-array `[null, undef, ref(3), double(4.0)]`.
+  // Bundled Flash.pm:417-422 pushes EVERY non-struct `$v` into `@vals`
+  // — null/undef contribute `""`, reference contributes its u16 value
+  // (3), double contributes 4 — yielding `Flash:MixList: ["","",3,4]`.
+  //
+  // PRIOR BUG (pre-R3/F2): `collect_array_items`'s match arm for
+  // `AmfValue::Empty | Reference(_) | ObjectEnd` did `{}` (drop). Net
+  // Rust output was `Flash:MixList: [4]` — a silent 75% data loss
+  // that matched neither `-j` nor `-n` bundled output.
+  check(
+    "flash_array_with_empties.flv",
+    "flash_array_with_empties.flv.json",
+    true,
+  );
+  check(
+    "flash_array_with_empties.flv",
+    "flash_array_with_empties.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_top_level_strict_array_walks_past_conformance() {
+  // Codex R3/F3 fixture: onMetaData (rec=0) + top-level strict-array
+  // (rec=1, `[1.0, 2.0]`) + mixed-array (rec=2) with `goodKey: 7.5`.
+  // Bundled Flash.pm:410-426's `0x0a` branch is reachable from the
+  // OUTER record loop — it consumes the u32 count + every element via
+  // recursive `ProcessMeta`, sets `$val = \@vals`, falls through to
+  // line 442's `unless ($isStruct{$type})`, hits the else at lines
+  // 448-452 (verbose-only "ignored lone array value" — NO emit),
+  // then advances to the next record. Net bundled output is
+  // `Flash:GoodKey: 7.5` (proving walk-past of the top-level 0x0a).
+  //
+  // PRIOR BUG (pre-R3/F3): `process_meta` sent the top-level 0x0a
+  // record to `read_value`, which returned `AmfValue::StrictArray`
+  // WITHOUT consuming the nested count+payload. The cursor remained
+  // mid-array → the next record (`0x08` mixed-array) was parsed from
+  // a wrong offset → spurious garbage and silent loss of the
+  // `goodKey` entry.
+  check(
+    "flash_top_strict_array.flv",
+    "flash_top_strict_array.flv.json",
+    true,
+  );
+  check(
+    "flash_top_strict_array.flv",
+    "flash_top_strict_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_array_abort_propagates_to_sibling_conformance() {
+  // Codex R4/F1 fixture: onMetaData mixed-array containing two pairs —
+  // `badArr` whose strict-array payload starts with an unsupported AMF
+  // type byte (0x11 = AMF3 data marker, Flash.pm:434), followed by a
+  // sibling `after` with a valid double. Bundled Flash.pm:382-386's
+  // `last Record unless defined $t and defined $v` ABORTS the entire
+  // struct walk on the failed inner ProcessMeta call (the unsupported
+  // type at line 437-439 sets `undef $type; last` → outer Frame 2 array
+  // branch never assigns `$val = \@vals` → returns `(0x0a, undef)` → the
+  // struct walker's defined-$v check fails → `last Record`).
+  //
+  // Net bundled output: the dedicated unsupported warning
+  // `"AMF AMF3data record not yet supported"` AND no `Flash:BadArr` AND
+  // no `Flash:After` (both siblings dropped). The `after` key MUST NOT
+  // appear — that is the assertion this fixture pins.
+  //
+  // PRIOR BUG (pre-R4/F1): `walk_pairs` called `walk_array` then
+  // unconditionally `continue`d, ignoring the abort cue. Sibling `after`
+  // was then emitted as `Flash:After: 99` → divergence from bundled (one
+  // extra tag).
+  check(
+    "flash_f4_array_abort_sibling.flv",
+    "flash_f4_array_abort_sibling.flv.json",
+    true,
+  );
+  check(
+    "flash_f4_array_abort_sibling.flv",
+    "flash_f4_array_abort_sibling.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_nested_strict_array_prefix_propagation_conformance() {
+  // Codex R4/F2 fixture: onMetaData mixed-array with one key `outerArr`
+  // holding a strict-array of TWO nested strict-arrays, each containing
+  // TWO object elements `{name: "X"}`. Bundled Flash.pm:415-418 captures
+  // `$structName = $$dirInfo{StructName}` at array entry then sets
+  // `$$dirInfo{StructName} = $structName . $i` for each element BEFORE
+  // the recursive ProcessMeta call. When the recursive call hits another
+  // 0x0a, it ALSO captures the (now per-index-prefixed) structName and
+  // applies its own `$i` suffix to inner elements. Net: bundled emits
+  // `Flash:OuterArr00Name: "A"`, `OuterArr01Name: "B"`, `OuterArr10Name:
+  // "C"`, `OuterArr11Name: "D"` (PLUS `Flash:OuterArr: [[],[]]` because
+  // the empty `@vals` of each inner array — its struct children were
+  // emitted as their own tags, removed by `unless $isStruct{$t}` at line
+  // 422 — IS still pushed into the outer `@vals`).
+  //
+  // PRIOR BUG (pre-R4/F2): `collect_array_items` recursed into the
+  // nested strict-array WITH THE OUTER `struct_name` UNCHANGED, so the
+  // inner object's `name` key built tag `OuterArr0Name` for BOTH
+  // outerArr[0][0] AND outerArr[1][0] → silent collision under first-wins
+  // emission. Post-fix: recurse with `format!("{struct_name}{i}")` so
+  // the inner walker uses `OuterArr0`/`OuterArr1` as its prefix.
+  check(
+    "flash_f4_nested_array_prefix.flv",
+    "flash_f4_nested_array_prefix.flv.json",
+    true,
+  );
+  check(
+    "flash_f4_nested_array_prefix.flv",
+    "flash_f4_nested_array_prefix.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_array_struct_element_failure_does_not_abort_conformance() {
+  // Codex R5 fixture (FALSE POSITIVE — see explanation below).
+  // onMetaData mixed-array with key `arr` whose strict-array payload
+  // is `[object{badChild: unsupported(0x11)}, object{name: "Valid"}]`
+  // PLUS a parent-level sibling `after: 42.0`. The R5 finding asserted
+  // that the inner-inner ProcessMeta call for the struct element
+  // returns `(undef, undef)` (driving the array loop to abort via line
+  // 420 `last Record unless defined $v`), and that `collect_array_items`
+  // discards the `WalkOutcome::Abort` from the nested `walk_pairs`
+  // recursion — emitting siblings bundled would drop.
+  //
+  // EMPIRICAL VERIFICATION via `perl exiftool 13.58` on this fixture
+  // CONTRADICTS the abort-propagation claim:
+  //
+  //   bundled emits: `Flash:Arr: [1.25323377490797e-308]` PLUS the
+  //   `AMF AMF3data record not yet supported` warning, AND drops
+  //   both `Flash:Arr1Name` (the would-be `name="Valid"` tag) AND
+  //   the parent-level sibling `Flash:After`.
+  //
+  // The `[1.25e-308]` value is a deliberate misparse — bundled's
+  // cursor sits past the 0x11 byte after the inner-inner returns; at
+  // array i=1 the next byte 0x00 is read as a `double` (AMF type 0x00)
+  // and the following 8 bytes happen to decode as `1.25e-308`.
+  // Subsequent reads desync further — the outer mixedArray pair loop
+  // eventually hits a truncated key (the `Truncated mixedArray record`
+  // warning appears in verbose output but JSON dedups warnings).
+  //
+  // Why bundled does NOT abort: Flash.pm:337-440's isStruct branch
+  // sets `$val = ''` at line 340 as a DUMMY VALUE — `$val` stays
+  // DEFINED across the inner pair-loop's `last Record` at line 386.
+  // The struct's ProcessMeta thus returns `(0x03, '')` (NOT
+  // `(undef, undef)`); the array loop's line 420 `last Record unless
+  // defined $v` checks only `$v`, which is `''` and is therefore
+  // DEFINED. The loop continues at i+1 with the desynced cursor.
+  // Contrast with R4/F1's case (`flash_f4_array_abort_sibling.flv`)
+  // where the array element is a DIRECT unsupported scalar — there
+  // the inner ProcessMeta hits Flash.pm:435-439's `undef $type; last`
+  // BEFORE any `$val = ''` assignment, returning `(undef, undef)`,
+  // and the array loop's line 420 DOES fire.
+  //
+  // The current Rust walker already matches bundled value-for-value
+  // for this fixture in both `-j` and `-n` modes: `collect_array_items`
+  // discards the `Abort` from the struct child's `walk_pairs` (lines
+  // 1564-1572 in src/formats/flash.rs) and continues to i=1, which
+  // reads 0x00 then 8 bytes as the same `1.25e-308` double; the outer
+  // `walk_pairs` then hits its own truncated-key warning at the
+  // misparsed length, which is deduped against the unsupported warning
+  // at the JSON emission stage. NO CODE CHANGE; this fixture PINS
+  // the cursor-desync-after-struct-element-failure behaviour so a
+  // future regression (e.g., a well-meaning "propagate abort"
+  // refactor that would drop `Flash:Arr` here) would fail conformance.
+  check(
+    "flash_f5_array_struct_abort.flv",
+    "flash_f5_array_struct_abort.flv.json",
+    true,
+  );
+  check(
+    "flash_f5_array_struct_abort.flv",
+    "flash_f5_array_struct_abort.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_nested_struct_child_abort_does_not_drop_parent_sibling_conformance() {
+  // Codex PR #32 R16/F1 — onMetaData mixed-array with a STRUCT-VALUED
+  // child `badChild` (AMF object 0x03) whose object body starts with an
+  // empty-key pair (`00 00`) followed by an unsupported AMF3 marker
+  // (`0x11`), then a parent sibling `after: 9.0`, then the mixed-array
+  // object-end (`00 00 09`). Fixture bytes: the `00 00 11` triple the
+  // finding calls out.
+  //
+  // The inner-inner ProcessMeta call for the empty-key pair's value
+  // reads 0x11 → Flash.pm:435-439 `undef $type; last` → returns
+  // `(undef, '')`. Back in `badChild`'s OWN isStruct pair loop
+  // (Flash.pm:337-411), line 386 `last Record unless defined $t and
+  // defined $v` fires → the inner pair loop exits. But `badChild`'s
+  // ProcessMeta was entered as a `$single` struct child: line 340 set
+  // `$val = ''` (the struct dummy) BEFORE any of this, so control
+  // falls to line 441 `last if $single` and `badChild` RETURNS
+  // `($type=0x03, $val='')` — both DEFINED. The parent (outer) pair
+  // loop's line 386 check passes, line 387 `next if $isStruct{$t}`
+  // fires, and the parent CONTINUES — parsing the `after` sibling.
+  //
+  // Bundled `perl exiftool 13.58` emits (BOTH `-j` and `-n`):
+  //   `ExifTool:Warning: AMF AMF3data record not yet supported`
+  //   `Flash:After: 9`
+  //
+  // Pre-R16/F1 the Rust `walk_pairs` struct-child branch `return`ed
+  // `WalkOutcome::Abort` on a recursive `walk_pairs == Abort` (and on
+  // an `IntroOutcome::Truncated` introducer), aborting the PARENT walk
+  // and silently dropping `Flash:After`. R16/F1 discards the recursive
+  // `WalkOutcome` (mirroring `collect_array_items`'s R5 array-of-struct
+  // resolution) — warnings + advanced cursor preserved, parent loop
+  // continues exactly as Perl does with `(type, '')`. This fixture
+  // PINS that recovery.
+  check(
+    "flash_r16_nested_struct_abort.flv",
+    "flash_r16_nested_struct_abort.flv.json",
+    true,
+  );
+  check(
+    "flash_r16_nested_struct_abort.flv",
+    "flash_r16_nested_struct_abort.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_struct_child_truncated_intro_preserves_parent_warning_conformance() {
+  // Codex PR #32 R17/F1 — a struct-valued child whose struct INTRODUCER
+  // is itself truncated must NOT enter the child pair loop.
+  //
+  // Fixture: `onMetaData` mixedArray → key `obj` → an AMF object (0x03)
+  // → key `child` → value type `0x08` (mixedArray) followed by only the
+  // two bytes `00 05` (a 4-byte mixed-array top-index is required, so
+  // the introducer is truncated).
+  //
+  // Bundled Flash.pm: the struct branch (lines 337-411) sets `$val=''`
+  // (line 340) THEN runs the `0x08` introducer check `last if
+  // $pos + 4 > $dirLen` (line 342) — `last`ing OUT of the struct branch
+  // BEFORE the `for(;;)` pair loop is ever entered. The `child`
+  // ProcessMeta (a `$single` call) falls to line 441 `last if $single`
+  // and returns `(0x08, '')` — both DEFINED. The `obj` object's own
+  // pair loop continues (line 387 `next if $isStruct{$t}`), reads the
+  // `00 05` bytes as a key length, hits `$pos + 2 + 5 > $dirLen` →
+  // `Warn("Truncated object record")` (line 354, struct type 0x03) →
+  // `last Record`. `obj`'s ProcessMeta returns `(0x03,'')`; the
+  // grandparent `onMetaData` mixedArray loop continues, re-reads the
+  // SAME `00 05` bytes → `Warn("Truncated mixedArray record")`.
+  //
+  // Bundled `perl exiftool 13.58` `-v3` emits both warnings IN ORDER —
+  // `Truncated object record` then `Truncated mixedArray record`. The
+  // `-j` / `-n` JSON `Warning` key is first-wins, so it surfaces
+  // `Truncated object record` (BOTH modes).
+  //
+  // Pre-R17/F1 the Rust struct-child branch ALWAYS called `walk_pairs`
+  // — bundled's `for(;;)` pair loop — even for a truncated introducer.
+  // For the truncated `0x08` child, `walk_pairs(struct_type=0x08)`
+  // re-read the `00 05` bytes FIRST and pushed `Truncated mixedArray
+  // record` BEFORE the `obj` parent could push `Truncated object
+  // record`, inverting the warning order and surfacing the wrong
+  // first-wins JSON warning. R17/F1 branches on `consume_struct_intro`:
+  // `walk_pairs` runs ONLY for `IntroOutcome::Ok`; a `Truncated`
+  // introducer preserves the cursor + any helper warning and continues
+  // the parent pair loop without descending. This fixture PINS the
+  // warning text + order.
+  check(
+    "flash_r17_struct_child_trunc_intro.flv",
+    "flash_r17_struct_child_trunc_intro.flv.json",
+    true,
+  );
+  check(
+    "flash_r17_struct_child_trunc_intro.flv",
+    "flash_r17_struct_child_trunc_intro.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_nested_livexml_preserved_conformance() {
+  // Codex PR #32 R7 — adversarial fixture for the XMP SubDirectory gate.
+  //
+  // The R6 gate `(SubTable::Meta && raw_key == "liveXML")` was TOO BROAD:
+  // it dropped a NESTED `foo.liveXML` (a key named `liveXML` UNDER a
+  // parent struct named `foo`) with the XMP-deferral warning, even
+  // though bundled Flash.pm emits the nested case as a plain auto-add
+  // scalar `Flash:FooLiveXML`. The pre-R7 walker:
+  //
+  //   - probed `SubDirectory` on the RAW key `liveXML` → matched the
+  //     Meta entry,
+  //   - hit `is_xmp_subdirectory_dispatch(Meta, "liveXML") == true`,
+  //   - dropped the value and pushed `XMP SubDirectory dispatch
+  //     deferred (Phase-3+)`.
+  //
+  // Silent metadata loss. Bundled Flash.pm:365-394 handles the nested
+  // case differently:
+  //
+  //   - Flash.pm:365 probes `$$subTablePtr{$tag}` with the RAW
+  //     un-prefixed key `liveXML` → matches the SubDirectory entry.
+  //   - Flash.pm:370 `if ($subTable =~ /^Image::ExifTool::Flash::/)`
+  //     guard FAILS (target is `XMP::Main`, foreign) → `$tag` is NOT
+  //     rewritten and `$subTablePtr` is NOT swapped.
+  //   - Flash.pm:380 applies the parent prefix: `$tag = $structName .
+  //     ucfirst($tag)` → `$tag = "FooLiveXML"`.
+  //   - Flash.pm:390-393 then runs `$$subTablePtr{"FooLiveXML"}` on
+  //     the UN-SWAPPED Meta table → no match → AddTagToTable +
+  //     HandleTag with the plain string value.
+  //
+  // Bundled output (oracle `perl exiftool 13.58`, captured 2026-05-22):
+  //
+  //   Flash:FooLiveXML: "some_value"
+  //
+  // NO warning, NO XMP suppression. R7 fix: narrow the gate to
+  // `struct_name.is_empty()` (the un-prefixed top-level case — the
+  // ONLY shape that reaches the Meta `liveXML` SubDirectory in
+  // bundled). The pre-R7 top-level fixture
+  // (`flash_xmp_livexml.flv`) still triggers the deferral warning;
+  // this fixture covers the nested branch.
+  check(
+    "flash_nested_livexml.flv",
+    "flash_nested_livexml.flv.json",
+    true,
+  );
+  check(
+    "flash_nested_livexml.flv",
+    "flash_nested_livexml.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+#[ignore = "FORMATS.md row 15 XMP infra Phase-3+ deferral (Codex PR #32 R6): \
+  Flash.pm:243-246 dispatches the `liveXML` AMF key through \
+  `SubDirectory => { TagTable => 'Image::ExifTool::XMP::Main' }`. Bundled \
+  emits `XMP-*:*` tags via XMP::ProcessXMP; exifast cannot synthesize them \
+  without the XMP parser (6693 LOC). Interim behaviour pins a deferral \
+  Warning (visible non-silent deferral, see src/formats/flash.rs:: \
+  `is_xmp_subdirectory_dispatch`). This fixture pins the POST-XMP-port \
+  oracle output (XMP-dc:Format='application/x-shockwave-flash') so when \
+  XMP::Main lands the test will auto-pass; today it documents the \
+  deliberate divergence. Run manually with: \
+  `cargo test --ignored flash_xmp_livexml_subdirectory_deferred_conformance`"]
+fn flash_xmp_livexml_subdirectory_deferred_conformance() {
+  // Codex PR #32 R6 fixture: a synthetic FLV with one `0x12` Script Data
+  // packet containing an AMF onXMPData top-level packet whose inner
+  // mixed-array carries a single key `liveXML` mapping to an XMP packet
+  // string (`<x:xmpmeta...><dc:format>application/x-shockwave-flash
+  // </dc:format>...</x:xmpmeta>`).
+  //
+  // Bundled `perl exiftool 13.58` (oracle captured 2026-05-22) emits
+  // `XMP-dc:Format: "application/x-shockwave-flash"` via Flash.pm:243-246's
+  // SubDirectory dispatch into `Image::ExifTool::XMP::Main` (XMP.pm +
+  // XMP2.pl, FORMATS.md row 15, 6693 LOC, Phase-3+).
+  //
+  // exifast's current Flash port surfaces the deferral as
+  // `ExifTool:Warning: "XMP SubDirectory dispatch deferred (Phase-3+)"`
+  // and DROPS the auto-add `Flash:LiveXML` scalar that would otherwise
+  // carry the raw `<x:xmpmeta>` blob (a WRONG-SHAPE divergence bundled
+  // never emits). See `src/formats/flash.rs::is_xmp_subdirectory_dispatch`
+  // for the accept-deferral comment and behaviour.
+  //
+  // Per-user contract: this is FORMALLY ACCEPT-DEFERRED, NOT silent. The
+  // `#[ignore]` keeps the test off the default run but committed; the
+  // golden is committed for the eventual XMP port; `docs/tracking.md`
+  // records the residual under "PR #32 R6 — liveXML/onXMPData XMP
+  // deferral"; the parser-side handling is anchored at
+  // `is_xmp_subdirectory_dispatch` so the deferral is visible in code too.
+  //
+  // The fixture is also listed in
+  // `tests/typed_serde_parity.rs::NOT_ACTIVE` so the active-conformance
+  // fixture-count sweep skips it (matches `FLAC.ogg` + `AIFF_id3.aif`).
+  //
+  // Remove the `#[ignore]` (and the warning emission) when the XMP
+  // parser lands.
+  check("flash_xmp_livexml.flv", "flash_xmp_livexml.flv.json", true);
+  check(
+    "flash_xmp_livexml.flv",
+    "flash_xmp_livexml.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_empty_key_livexml_preserved_conformance() {
+  // Codex PR #32 R8/F1 — adversarial fixture for the
+  // `is_xmp_subdirectory_dispatch` gate's Option<&str> distinction.
+  //
+  // Pre-R8 the gate was `struct_name.is_empty()`, collapsing two
+  // distinct Perl states that Flash.pm:380's `if defined $structName`
+  // treats differently:
+  //
+  //   * Perl `undef $structName` (top-level / no struct in effect) —
+  //     line 380 does NOT fire, the SubDirectory dispatches XMP at
+  //     line 390. This is the original `flash_xmp_livexml.flv`
+  //     accept-deferred case (R6).
+  //
+  //   * Perl defined `$structName = ""` (e.g. a child under a key
+  //     `""`) — line 380 DOES fire: `$tag = "" . ucfirst("liveXML") =
+  //     "LiveXML"`. The line 390 SubDirectory lookup on `"LiveXML"`
+  //     MISSES the lowercase-keyed Meta `liveXML` entry. Auto-add
+  //     emits `Flash:LiveXML` as a plain string scalar — bundled DOES
+  //     NOT dispatch XMP for this shape, and the value is preserved.
+  //
+  // Bundled output (oracle `perl exiftool 13.58`, captured
+  // 2026-05-22) on a synthetic FLV containing
+  // `onMetaData{"": {liveXML: "some_value"}}`:
+  //
+  //   Flash:LiveXML: "some_value"
+  //
+  // NO warning, NO XMP suppression. R8 fix: refactor `struct_name`
+  // from `&str` to `Option<&str>` throughout (`None` = Perl undef,
+  // `Some(s)` = Perl defined including empty), gate the XMP
+  // dispatch on `is_none()` not `is_empty()`. The pre-R7 top-level
+  // fixture (`flash_xmp_livexml.flv`) and the R7 nested fixture
+  // (`flash_nested_livexml.flv`) continue to exercise their original
+  // branches; this fixture covers the empty-key-parent gap.
+  check(
+    "flash_empty_key_livexml.flv",
+    "flash_empty_key_livexml.flv.json",
+    true,
+  );
+  check(
+    "flash_empty_key_livexml.flv",
+    "flash_empty_key_livexml.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_toplevel_array_objects_conformance() {
+  // Codex PR #32 R8/F2 — adversarial fixture for the array-index
+  // append site's Option<&str> distinction.
+  //
+  // Flash.pm:418 gates the per-element struct-name append on
+  // `if defined $structName`:
+  //
+  //   $$dirInfo{StructName} = $structName . $i if defined $structName;
+  //
+  // At the TOP LEVEL, `$structName` is `undef` (Flash.pm:296 declares
+  // but never assigns at outer scope). So when a top-level strict-array
+  // (Flash.pm:410-426 reached via the outer Record loop) contains
+  // object elements, the recursive ProcessMeta calls for each element
+  // inherit `$$dirInfo{StructName}` UNCHANGED (still undef). The inner
+  // struct walker then hits line 380 with `$structName=undef` → the
+  // prefix application does NOT fire → tag stays raw lowercase
+  // (`name`) → `resolve_emit` Meta lookup MISSES → auto-add ucfirsts
+  // → emits `Flash:Name` for EACH object element.
+  //
+  // Net bundled output (oracle `perl exiftool 13.58`, captured
+  // 2026-05-22) on a synthetic FLV with a top-level strict-array
+  // `[{name: "A"}, {name: "B"}]` followed by a mixed-array
+  // `{trailKey: 9}`:
+  //
+  //   Flash:Name: "B"        (last-wins from the 2 object elements)
+  //   Flash:TrailKey: 9      (walk-past proof — see R3/F3 fixture)
+  //
+  // PRIOR BUG (pre-R8): `collect_array_items` unconditionally ran
+  // `format!("{struct_name}{i}")` regardless of `struct_name == ""`
+  // sentinel, manufacturing prefix `0`/`1` and emitting
+  // `Flash:0Name: "A"` + `Flash:1Name: "B"` — two tags bundled NEVER
+  // emits (the `0Name` / `1Name` names also fail the
+  // `is_word_key` `/^\w+$/` check because they start with a digit;
+  // pre-R8 the names were silently dropped instead of merging into
+  // the bundled `Flash:Name` last-wins shape).
+  //
+  // R8 fix: gate the array-index append on `struct_name.is_some()`,
+  // propagating `None` to the inner walker when the outer carry is
+  // also `None`. EMPIRICAL via `-v3` confirms bundled prints
+  // `(adding name)` twice (no per-element prefix) and `(ignored lone
+  // array value)` for the top-level 0x0a record.
+  check(
+    "flash_toplevel_array_objects.flv",
+    "flash_toplevel_array_objects.flv.json",
+    true,
+  );
+  check(
+    "flash_toplevel_array_objects.flv",
+    "flash_toplevel_array_objects.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_keyed_array_truncated_count_conformance() {
+  // Codex PR #32 R9/F1 — adversarial fixture pinning the keyed-array-
+  // truncated-count case. A mixed-array contains a key whose value type
+  // is `0x0a` (strict-array), but with FEWER THAN 4 BYTES following for
+  // the count (`pos + 4 > dirLen`).
+  //
+  // Bundled Flash.pm:410-411 hits `last if $pos + 4 > $dirLen` inside the
+  // recursive ProcessMeta call (the inner frame has $val=undef from
+  // line 297's fresh declaration); the inner frame's loop exits without
+  // assigning $val. Line 455 (`not defined $val and defined $type`)
+  // then fires → emits `"Truncated AMF record 0xa"` because $type=0x0a
+  // was set at line 303 before the count check. Returns `(0x0a, undef)`;
+  // the outer struct walker at line 386 (`last Record unless defined
+  // $t and defined $v`) sees $v=undef → `last Record` aborts.
+  //
+  // Net bundled (oracle `perl exiftool 13.58`, captured 2026-05-22):
+  //   ExifTool:Warning: "Truncated AMF record 0xa"
+  //   Flash:GoodKey: 9             (preserved from before the abort)
+  //
+  // PRIOR BUG (pre-R9/F1): `collect_array_items` returned `None`
+  // SILENTLY when `*pos + 4 > data.len()` at the count read — no
+  // warning pushed, the outer struct walker continued past the abort,
+  // silently dropping the bundled `Truncated AMF record 0xa`
+  // diagnostic. Silent metadata loss in the malformed-AMF path.
+  //
+  // R9 fix: distinguish missing-count failure (`Outcome::TruncatedCount`)
+  // from element-failure (`Outcome::Abort`) in `collect_array_items`'s
+  // return value; the keyed-value caller (`walk_array` from
+  // `walk_pairs`) emits the warning + aborts.
+  check(
+    "flash_keyed_array_truncated_count.flv",
+    "flash_keyed_array_truncated_count.flv.json",
+    true,
+  );
+  check(
+    "flash_keyed_array_truncated_count.flv",
+    "flash_keyed_array_truncated_count.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_typed_object_truncated_name_conformance() {
+  // Codex PR #32 R9/F2 — adversarial fixture pinning the top-level
+  // typed-object (`0x10`) truncated-name case. rec=0 is the packet name
+  // `onMetaData`; rec=1 is type 0x10 with a declared u16 name length of
+  // 5 but no name bytes following.
+  //
+  // Bundled Flash.pm:340-354: enters the isStruct branch, sets $val='',
+  // sets $getName=1; the inner for(;;) pair loop runs line 350-353:
+  // reads the u16 length (5), checks `$pos + 2 + $len > $dirLen` —
+  // TRUE → emits `et->Warn("Truncated $amfType[$type] record")` where
+  // $amfType[0x10] = "typedObject", then `last Record`.
+  //
+  // Net bundled (oracle `perl exiftool 13.58`, captured 2026-05-22):
+  //   ExifTool:Warning: "Truncated typedObject record"
+  //
+  // PRIOR BUG (pre-R9/F2): `skip_struct_intro` consumed the typed-object
+  // name as a SILENT introducer, returning false on overrun. The
+  // top-level walker dropped the warning entirely. Silent metadata
+  // loss in the malformed-AMF path.
+  //
+  // R9 fix: split the typed-object name parsing from the generic
+  // `skip_struct_intro`; on overrun push `"Truncated typedObject
+  // record"` and signal abort to the caller (matching Flash.pm:353's
+  // exact warning text + `last Record` cue).
+  check(
+    "flash_typed_object_truncated_name.flv",
+    "flash_typed_object_truncated_name.flv.json",
+    true,
+  );
+  check(
+    "flash_typed_object_truncated_name.flv",
+    "flash_typed_object_truncated_name.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_array_typed_object_truncated_name_conformance() {
+  // Codex PR #32 R9/F2 — adversarial fixture pinning the nested-inside-
+  // strict-array typed-object truncated-name case. A mixed-array
+  // contains key `arr` → strict-array of 1 element, where the element
+  // is a type 0x10 typed-object with declared name length 5 but no
+  // name bytes.
+  //
+  // Bundled trace (`-v3` 2026-05-22):
+  //   + [mixedArray]                  (outer mixed-array)
+  //     + [typedObject]               (inner ProcessMeta call from
+  //       Warning = Truncated typedObject record   array-element loop)
+  //     Warning = Truncated mixedArray record      (outer struct walker
+  //                                                 re-reads the same
+  //                                                 truncated 2 bytes as
+  //                                                 a key-length and hits
+  //                                                 line 353 with
+  //                                                 $type=0x08)
+  //
+  // In `-j` JSON output, ONLY the FIRST warning surfaces via
+  // `ExifTool:Warning`. Bundled `-j` net (captured 2026-05-22):
+  //   ExifTool:Warning: "Truncated typedObject record"
+  //   Flash:GoodKey: 9
+  //
+  // R9 fix: the typed-object truncated-name path now emits the faithful
+  // `"Truncated typedObject record"` warning whether reached at top
+  // level OR nested-in-array. Pins that the bundled FIRST warning
+  // (typedObject, NOT the array-trunc or mixedArray) surfaces.
+  check(
+    "flash_array_typed_object_truncated_name.flv",
+    "flash_array_typed_object_truncated_name.flv.json",
+    true,
+  );
+  check(
+    "flash_array_typed_object_truncated_name.flv",
+    "flash_array_typed_object_truncated_name.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_array_typed_object_truncated_length_conformance() {
+  // Codex PR #32 R10 — adversarial fixture pinning the nested-inside-
+  // strict-array typed-object NAME-LENGTH-truncation (silent) path. A
+  // mixed-array contains key `arr` → strict-array of 1 element, where
+  // the element is a type 0x10 typed-object with 0 bytes remaining for
+  // the 2-byte name-length field.
+  //
+  // Bundled trace (`-v3` 2026-05-22): the array element's inner
+  // ProcessMeta enters the 0x10 isStruct branch (Flash.pm:337), sets
+  // `$val=''` (line 340), `$getName=1` (line 346), enters the inner
+  // pair loop `for (;;)` (line 348). Line 350 `last Record if $pos+2
+  //   > $dirLen` fires (silent — NO warning), exits the inner Record
+  // loop. Post-loop sees `$val=''` defined → no line 455 warning
+  // either. Inner returns (0x10, '') to the array walker (Flash.pm:419).
+  // Array walker continues: `$v=''` defined, `$isStruct{0x10}` skips
+  // push, num=1 exits loop. `$val=\@vals` (empty) assigned (line 426).
+  // Returns (0x0a, []) to the outer mixedArray pair loop. Pair loop's
+  // empty-array check at line 388 skips emit. Next pair-loop iteration:
+  // line 350 `last Record` (out of bytes, silent) exits the outer too.
+  // Post-loop $val='' defined → no warning.
+  //
+  // Bundled `-j` net (captured 2026-05-22):
+  //   Flash:GoodKey: 9
+  //   (NO ExifTool:Warning)
+  //
+  // R10 fix: pre-R10 `collect_array_items` lumped EVERY
+  // `IntroOutcome::Truncated` from `consume_struct_intro` into a single
+  // abort path that ALWAYS pushed `"Truncated AMF record 0xa"` (the
+  // outer 0xa frame's bundled-faithful warning). For the silent paths
+  // (0x10 name-LENGTH-truncation and 0x08 top-index-truncation),
+  // bundled emits NO warning across the entire stack — the inner's
+  // `$val=''` keeps every higher frame's line 455 check silent. The
+  // fix splits `IntroOutcome::Truncated` into reason-tagged variants
+  // and the array caller skips the spurious "Truncated AMF record 0xa"
+  // push for the silent reasons. Pins NO warning emission in both `-j`
+  // and `-j -n` modes.
+  check(
+    "flash_array_typed_object_truncated_length.flv",
+    "flash_array_typed_object_truncated_length.flv.json",
+    true,
+  );
+  check(
+    "flash_array_typed_object_truncated_length.flv",
+    "flash_array_typed_object_truncated_length.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_array_mixed_array_truncated_top_index_conformance() {
+  // Codex PR #32 R10 — adversarial fixture pinning the nested-inside-
+  // strict-array mixed-array TOP-INDEX-truncation (silent) path. A
+  // mixed-array contains key `arr` → strict-array of 1 element, where
+  // the element is a type 0x08 mixed-array with 0 bytes remaining for
+  // the 4-byte top-index field.
+  //
+  // Bundled trace (`-v3` 2026-05-22): the array element's inner
+  // ProcessMeta enters the 0x08 isStruct branch (Flash.pm:337), sets
+  // `$val=''` (line 340), hits the `$type==0x08` block at line 341,
+  // line 343 `last if $pos+4 > $dirLen` fires `last` (unlabeled,
+  // exits the inner Record loop since the inner for(;;) hasn't
+  // started yet) — silent, NO warning. Post-loop sees `$val=''`
+  // defined → no line 455 warning. Inner returns (0x08, '') to the
+  // array walker. Same continuation as the typed-object-length case:
+  // array completes with empty @vals, outer mixedArray skips empty
+  // array, outer Record loop exits silently.
+  //
+  // Bundled `-j` net (captured 2026-05-22):
+  //   Flash:GoodKey: 9
+  //   (NO ExifTool:Warning)
+  //
+  // Same R10 fix as `flash_array_typed_object_truncated_length` — the
+  // silent 0x08 top-index path now propagates as
+  // `IntroTruncReason::TopIndex` (not bundled with the warn-emitting
+  // typedObject-name-overrun path), so the array caller skips the
+  // spurious "Truncated AMF record 0xa" push.
+  check(
+    "flash_array_mixed_array_truncated_top_index.flv",
+    "flash_array_mixed_array_truncated_top_index.flv.json",
+    true,
+  );
+  check(
+    "flash_array_mixed_array_truncated_top_index.flv",
+    "flash_array_mixed_array_truncated_top_index.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_array_struct_intro_trunc_continues_conformance() {
+  // Codex PR #32 R11/F1 — adversarial fixture pinning that a struct-
+  // introducer truncation on a NON-LAST strict-array element does NOT
+  // abort the element loop early. A mixed-array contains key `arr` →
+  // strict-array with COUNT=2; element 0 is a type 0x10 typed-object
+  // with ZERO bytes remaining for the 2-byte name-length field
+  // (`IntroTruncReason::NameLength` — the SILENT introducer path).
+  //
+  // Bundled trace (`-v3` 2026-05-22 on
+  // `flash_array_struct_intro_trunc_continues.flv`):
+  //   + [mixedArray]
+  //   | (adding goodKey)
+  //   + [typedObject]                 (element 0 inner ProcessMeta)
+  //   | Warning = Truncated AMF record 0xa
+  //
+  // Element 0: inner ProcessMeta enters the 0x10 isStruct branch
+  // (Flash.pm:337), sets `$val=''` (line 340, the dummy), hits the
+  // inner pair-loop's `last Record if $pos + 2 > $dirLen` (line 350)
+  // — `$val` STAYS DEFINED (`''`). Inner returns `(0x10, '')`. The
+  // array loop's `last Record unless defined $v` (line 420) is
+  // SATISFIED → loop continues to element 1. Element 1: inner
+  // ProcessMeta hits `last if $pos >= $dirLen` (line 302) →
+  // `(undef, undef)` → array loop `last Record` → the array frame's
+  // `$val = \@vals` (line 426) is never assigned → `$val=undef +
+  // $type=0xa` → line 455 emits `Truncated AMF record 0xa`.
+  //
+  // Bundled `-j` net (captured 2026-05-22):
+  //   ExifTool:Warning: "Truncated AMF record 0xa"
+  //   Flash:GoodKey: 9
+  //
+  // PRIOR BUG (pre-R11): `collect_array_items` mapped EVERY
+  // `IntroOutcome::Truncated(_)` to a SILENT `ArrayOutcome::Abort`,
+  // terminating the element loop at element 0. The Rust path emitted
+  // NEITHER the `Truncated AMF record 0xa` warning NOR continued to
+  // surface the array-frame diagnostic — silent metadata divergence.
+  //
+  // R11 fix: the `IntroOutcome::Truncated(_)` arm now `continue`s the
+  // element loop (collecting no list item — struct types are never
+  // pushed), faithfully modelling bundled's `($type, '')` defined
+  // return; the next iteration's EOF check raises the frame warning.
+  check(
+    "flash_array_struct_intro_trunc_continues.flv",
+    "flash_array_struct_intro_trunc_continues.flv.json",
+    true,
+  );
+  check(
+    "flash_array_struct_intro_trunc_continues.flv",
+    "flash_array_struct_intro_trunc_continues.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_date_zero_sentinel_conformance() {
+  // Codex PR #32 R11/F2 — adversarial fixture pinning ExifTool's
+  // zero-time sentinel for an AMF date (type 0x0b) of 0 milliseconds.
+  // A mixed-array contains key `epoch` → AMF date with double payload
+  // `0.0` and tz int16 `0`.
+  //
+  // Flash.pm:305-324: `$val = GetDouble(...) = 0`, `$val /= 1000` → 0,
+  // `$val = ConvertUnixTime($val, 0, 6)`. Bundled ExifTool.pm:6776:
+  // `return '0000:00:00 00:00:00' if $time == 0;` — the sentinel is
+  // returned BEFORE any `gmtime`/`$dec` fractional formatting (so NO
+  // `.ssssss`). Flash.pm:317-324 then appends the AMF tz suffix.
+  //
+  // Bundled `-j` net (captured 2026-05-22 via `perl exiftool 13.58`):
+  //   Flash:Epoch: "0000:00:00 00:00:00+00:00"
+  //
+  // PRIOR BUG (pre-R11): `convert_unix_time` ran
+  // `unix_to_civil_micro(0.0)` unconditionally → `1970:01:01
+  // 00:00:00.000000+00:00` — diverging from bundled's sentinel.
+  //
+  // R11 fix: `convert_unix_time` short-circuits `secs == 0.0` to the
+  // `"0000:00:00 00:00:00"` sentinel + AMF tz suffix.
+  check(
+    "flash_amf_date_zero_sentinel.flv",
+    "flash_amf_date_zero_sentinel.flv.json",
+    true,
+  );
+  check(
+    "flash_amf_date_zero_sentinel.flv",
+    "flash_amf_date_zero_sentinel.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_strict_array_known_tag_printconv_conformance() {
+  // Codex PR #32 R12/F1 — adversarial fixture pinning per-element
+  // PrintConv for a KNOWN Flash tag whose AMF value is a strict-array
+  // (type 0x0a). A mixed-array carries key `duration` → strict-array of
+  // two doubles `[1.5, 61.0]`.
+  //
+  // Flash.pm:394/516: `HandleTag` is called with the AMF array
+  // reference itself; ExifTool's `GetValue` (ExifTool.pm:3567-3685)
+  // then iterates the arrayref and applies the tag's PrintConv to EVERY
+  // element. `duration` → `ConvertDuration($val)` (Flash.pm:190-193):
+  //   -j: Flash:Duration: ["1.50 s","0:01:01"]
+  //   -n: Flash:Duration: [1.5,61]   (PrintConv skipped)
+  //
+  // PRIOR BUG (pre-R12): the `FlashValue::List` emit arm serialized the
+  // raw numeric list for BOTH modes, ignoring `entry.pc` — `-j` emitted
+  // `[1.5,61]` instead of the per-element PrintConv strings.
+  //
+  // R12 fix: `flash_list_item_with_pc` applies `entry.pc` to each
+  // numeric element when `print_conv` is set; raw pass-through under -n.
+  check(
+    "flash_duration_strict_array.flv",
+    "flash_duration_strict_array.flv.json",
+    true,
+  );
+  check(
+    "flash_duration_strict_array.flv",
+    "flash_duration_strict_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_date_pre1000_year_padding_conformance() {
+  // Codex PR #32 R12/F2 — adversarial fixture pinning the space-padded
+  // year of a pre-1000 AMF date. A mixed-array carries key
+  // `metadatadate` → AMF date (type 0x0b) with double payload
+  // -30641760000000 ms (= Unix second -30641760000 = 0999-01-01 UTC)
+  // and tz int16 `0`.
+  //
+  // Flash.pm:305-324: `$val = GetDouble(...)`, `$val /= 1000`,
+  // `$val = ConvertUnixTime($val, 0, 6)`. Bundled ExifTool.pm:6797
+  // formats the year via Perl `sprintf` `%4d` — MINIMUM-WIDTH
+  // SPACE-padded, NOT zero-padded:
+  //   Flash:MetadataDate: " 999:01:01 00:00:00.000000+00:00"
+  //
+  // PRIOR BUG (pre-R12): `convert_unix_time` used `{:04}` (zero-pad) →
+  // `"0999:01:01 ..."`, diverging from bundled's leading space.
+  //
+  // R12 fix: `convert_unix_time` formats the year with `{:>4}`
+  // (right-justify, space fill) to mirror `%4d`.
+  check(
+    "flash_amf_date_pre1000.flv",
+    "flash_amf_date_pre1000.flv.json",
+    true,
+  );
+  check(
+    "flash_amf_date_pre1000.flv",
+    "flash_amf_date_pre1000.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_nested_strict_array_known_tag_raw_conformance() {
+  // Codex PR #32 R13/F1 — adversarial fixture pinning that a NESTED
+  // strict-array element does NOT inherit the owning tag's PrintConv. A
+  // mixed-array carries key `duration` → strict-array of ONE element,
+  // which is itself a strict-array `[1.5, 61.0]`.
+  //
+  // ExifTool's `GetValue` (ExifTool.pm:3577 `$val = $$vals[0]` / 3678
+  // `$val = $$vals[$i]`) iterates only the TOP-LEVEL arrayref; it never
+  // recurses into a nested arrayref. The tag PrintConv eval
+  // (`ConvertDuration($val)`) is applied to the SCALAR top-level element
+  // only — here the single element IS the nested arrayref, so the
+  // PrintConv passes the ref through unchanged and the nested numbers
+  // stay raw:
+  //   -j: Flash:Duration: [[1.5,61]]
+  //   -n: Flash:Duration: [[1.5,61]]   (PrintConv skipped either way)
+  //
+  // PRIOR BUG (pre-R13): `flash_list_item_with_pc` recursed into the
+  // nested `List` with the SAME parent `pc`, so under -j it wrongly
+  // emitted `[["1.50 s","0:01:01"]]`.
+  //
+  // R13 fix: the nested `List` arm renders via `flash_list_item_raw`
+  // (PrintConv disabled at every depth).
+  check(
+    "flash_duration_nested_array.flv",
+    "flash_duration_nested_array.flv.json",
+    true,
+  );
+  check(
+    "flash_duration_nested_array.flv",
+    "flash_duration_nested_array.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_mixed_top_level_conversion_conformance() {
+  // Codex PR #32 R14/F1 — adversarial fixture pinning that the owning tag
+  // conversion is applied ONCE PER TOP-LEVEL element (not disabled
+  // wholesale, and not recursed). A mixed-array carries key `duration` →
+  // strict-array of THREE top-level elements: scalar `1.5`, a nested
+  // strict-array `[2,3]`, scalar `61`.
+  //
+  // ExifTool's `GetValue` (ExifTool.pm:3567-3672) iterates the TOP-LEVEL
+  // arrayref, running `ConvertDuration($val)` on each element. The two
+  // scalars convert (`"1.50 s"`, `"0:01:01"`); the nested arrayref hits
+  // `return $time unless IsFloat($time)` (ExifTool.pm:6869) and passes
+  // through unchanged WITHOUT recursive descent — its inner numbers stay
+  // raw:
+  //   -j: Flash:Duration: ["1.50 s",[2,3],"0:01:01"]
+  //   -n: Flash:Duration: [1.5,[2,3],61]
+  //
+  // The R13 fix rendered EVERY nested `List` raw, which is correct here
+  // (and for the pure-nested `flash_duration_nested_array.flv`) BUT R14
+  // observed it also disables the conversion for the top-level SCALAR
+  // siblings if naively framed as "PrintConv off at depth". This fixture
+  // proves the scalars STILL convert while the nested arrayref stays raw.
+  //
+  // Arithmetic / *datarate tags (FrameRate, TotalDataRate, AudioBitrate)
+  // are deliberately NOT fixtured for the nested-arrayref case: bundled
+  // coerces the arrayref to a non-deterministic Perl SV memory address
+  // (changes every run under ASLR), so no stable golden exists. See the
+  // `flash_list_item_with_pc` doc and the `collect_array_items_*_mul_1000`
+  // unit tests for the deterministic port behavior.
+  check(
+    "flash_duration_mixed_nested.flv",
+    "flash_duration_mixed_nested.flv.json",
+    true,
+  );
+  check(
+    "flash_duration_mixed_nested.flv",
+    "flash_duration_mixed_nested.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_audio_encoding_reserved_unknown_printconv_conformance() {
+  // Codex PR #32 R13/F2 — adversarial fixture pinning the hash-PrintConv
+  // MISS idiom. An audio-only FLV (header flags 0x04) with audio config
+  // octet 0x9F → AudioEncoding nibble = 9 (reserved; absent from the
+  // `%Flash::Audio` Bit0-3 hash, Flash.pm:96-113).
+  //
+  // ExifTool's `GetValue` (ExifTool.pm:3603-3625) sets `$value =
+  // "Unknown ($val)"` when `$$conv{$val}` is undefined and the hash has
+  // no BITMASK/OTHER. None of the Flash audio/video hashes declares
+  // PrintHex, so the decimal `Unknown (N)` form is used:
+  //   -j: Flash:AudioEncoding: "Unknown (9)"
+  //   -n: Flash:AudioEncoding: 9   (PrintConv skipped → raw nibble)
+  //
+  // PRIOR BUG (pre-R13): the hash miss fell through to the raw numeric
+  // under -j, emitting `9` instead of `"Unknown (9)"`.
+  check(
+    "flash_audio_encoding_reserved.flv",
+    "flash_audio_encoding_reserved.flv.json",
+    true,
+  );
+  check(
+    "flash_audio_encoding_reserved.flv",
+    "flash_audio_encoding_reserved.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_audio_tail_truncation_emits_tags_conformance() {
+  // Codex PR #32 R13/F3 — adversarial fixture pinning that an audio
+  // packet whose DECLARED payload is truncated AFTER the first config
+  // byte still emits all four Flash audio tags with NO warning. An
+  // audio-only FLV (flags 0x04) tag declares dataSize 5 but the file ends
+  // right after the single config byte (octet 0x2F → MP3 / 44100 / 16 /
+  // stereo).
+  //
+  // Flash.pm:500 reads only ONE byte for an audio packet
+  // (`$raf->Read($buff,1)==1`), subtracts it from `$len`, HandleTag, then
+  // `last unless $flags` (line 521) BEFORE the residual `Seek($len,1)`
+  // (line 522). Since the audio flag (0x04) was the only requested flag,
+  // `$flags` clears to 0 and the loop exits before the residual seek ever
+  // touches the truncated tail:
+  //   -j: AudioEncoding "MP3" / SampleRate 44100 / BitsPerSample 16 /
+  //       Channels "2 (stereo)" — no warning.
+  //   -n: AudioEncoding 2 / 44100 / 16 / 2 — no warning.
+  //
+  // PRIOR BUG (pre-R13): `parse_inner` required the ENTIRE declared body
+  // before dispatching, so the truncated tail took the failure path,
+  // pushed `Bad Audio packet`, and emitted nothing.
+  //
+  // R13 fix: the full-body availability check moved into the per-type
+  // branches — audio/video need only `len >= 1` + one config byte, and
+  // the residual seek emulates Perl's later skip/stop.
+  check(
+    "flash_audio_tail_truncated.flv",
+    "flash_audio_tail_truncated.flv.json",
+    true,
+  );
+  check(
+    "flash_audio_tail_truncated.flv",
+    "flash_audio_tail_truncated.flv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn flash_amf_bad_utf8_fixup_conformance() {
+  // Codex PR #32 R18/F1 — adversarial fixture pinning ExifTool's
+  // FixUTF8-at-JSON semantics for every AMF string-like kind. The
+  // onMetaData mixed-array carries three values whose payload is the
+  // invalid-UTF-8 byte run `41 ff 42`:
+  //   * `badStr`  — AMF string     (0x02, Flash.pm:331-336)
+  //   * `badLong` — AMF long string (0x0c, Flash.pm:427-432)
+  //   * `badXml`  — AMF XML doc      (0x0f, Flash.pm:427-432)
+  //
+  // Bundled Flash.pm keeps the RAW bytes (`$val = substr(...)`) and the
+  // `exiftool` JSON emitter applies `Image::ExifTool::XMP::FixUTF8`
+  // (exiftool:3822 → XMP.pm:2948-2972), replacing the stray `0xff` with
+  // the literal ASCII `?`. Bundled `perl exiftool` (verified oracle)
+  // emits `Flash:BadStr/BadLong/BadXml = "A?B"` in BOTH -j and -n.
+  //
+  // PRIOR BUG (pre-R18): the 0x02 and 0x0c/0x0f arms decoded via
+  // `String::from_utf8_lossy`, materializing U+FFFD (`EF BF BD`) — a
+  // 3-byte mismatch versus the single `?` byte, failing the jsondiff
+  // gate. R18 fix routes all payload-derived AMF strings through
+  // `crate::convert::fix_utf8`, the faithful FixUTF8 transliteration.
+  check(
+    "flash_amf_bad_utf8.flv",
+    "flash_amf_bad_utf8.flv.json",
+    true,
+  );
+  check(
+    "flash_amf_bad_utf8.flv",
+    "flash_amf_bad_utf8.flv.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

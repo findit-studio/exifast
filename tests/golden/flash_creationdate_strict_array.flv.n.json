@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "flash_creationdate_strict_array.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "FLV",
+  "File:MIMEType": "video/x-flv",
+  "Flash:CreateDate": ["A","B"]
+}]

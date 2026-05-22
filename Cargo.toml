@@ -61,7 +61,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 
 # Umbrella — enables every per-format gate.
 all-formats = [
-  "aac", "aiff", "ape", "audible", "dsf", "dv", "flac",
+  "aac", "aiff", "ape", "audible", "dsf", "dv", "flac", "flash",
   "h264", "id3", "matroska", "mp3", "mpc", "moi", "ogg", "real", "red", "wavpack",
 ]
 
@@ -89,6 +89,17 @@ audible    = []
 dsf        = ["id3"]
 dv         = []
 flac       = ["id3"]
+# `flash` (FLV/SWF) — Engine-only deps (no cross-format chains today; bundled
+# Flash.pm uses `Image::ExifTool::FLAC` only for the SWF compressed-buffer
+# read helper, which the port hasn't ported — SWF is deferred). The FLV
+# audio/video header bit-stream extraction is faithful inline (not via the
+# `FLAC::ProcessBitStream` shared engine path) because the Flash tables
+# carry HASH PrintConvs the shared walker doesn't natively render.
+# Re-uses `moi`'s ConvertDuration helper for `Flash:Duration`/`StartTime`
+# PrintConv (`-j` only); the shared `write_convert_bitrate` helper for
+# `Flash:AudioBitrate`/`VideoBitrate` PrintConv. Both live in
+# `crate::convert` / `crate::formats::moi` and don't pull `moi`'s feature.
+flash      = []
 # `h264` — engine-only per FORMATS.md row 16 (no `H264` file type; consumed
 # by M2TS/MPEG demuxers via `H264::ParseH264Video`). Leaf format, no
 # cross-format chains; ports the NAL/SEI/MDPM walker + Exp-Golomb SPS parser.

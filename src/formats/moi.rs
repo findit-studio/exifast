@@ -427,37 +427,7 @@ const fn audio_codec_lookup(code: u16) -> Option<&'static str> {
 /// - `86461` → `"24:01:01"`
 /// - `90000` → `"1 days 1:00:00"`
 /// - `-30` → `"-0:00:30"`
-pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
-  w: &mut W,
-  time: f64,
-) -> core::fmt::Result {
-  // See the moved-from-port comment above for ExifTool.pm:5949 (IsFloat regex)
-  // — finite gate covers NaN/Inf, which Perl's IsFloat would reject; MOI
-  // Duration is int32u/1000 so this branch is unreachable from the real
-  // call site.
-  if !time.is_finite() {
-    return write!(w, "{time}");
-  }
-  if time == 0.0 {
-    return w.write_str("0 s"); // ExifTool.pm:6870
-  }
-  let (sign, mut t) = if time > 0.0 { ("", time) } else { ("-", -time) }; // ExifTool.pm:6871
-  if t < 30.0 {
-    return write!(w, "{sign}{t:.2} s"); // ExifTool.pm:6872
-  }
-  t += 0.5; // ExifTool.pm:6873 round to nearest second
-  let mut h: i64 = (t / 3600.0) as i64;
-  t -= (h as f64) * 3600.0;
-  let m: i64 = (t / 60.0) as i64;
-  t -= (m as f64) * 60.0;
-  let s_int: i64 = t as i64;
-  if h > 24 {
-    let d = h / 24;
-    h -= d * 24;
-    return write!(w, "{sign}{d} days {h}:{m:02}:{s_int:02}");
-  }
-  write!(w, "{sign}{h}:{m:02}:{s_int:02}")
-}
+pub use crate::convert::write_convert_duration;
 
 /// `ConvertBitrate` PrintConv helper. Re-exported from [`crate::convert`]
 /// for backward compatibility; the implementation moved out of `formats/moi`

@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "flash_amf_string_conv_array.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "FLV",
+  "File:MIMEType": "video/x-flv",
+  "Flash:Duration": [1.5,"notnum","12,5"],
+  "Flash:AudioBitrate": [65800,0],
+  "Flash:FrameRate": [29.97,"xx"],
+  "Flash:TotalDataRate": [1500,2000],
+  "Flash:CreateDate": ["A","B"]
+}]

@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "flash_duration_mixed_nested.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "flv",
+  "File:MIMEType": "video/x-flv",
+  "Flash:Duration": ["1.50 s",[2,3],"0:01:01"]
+}]

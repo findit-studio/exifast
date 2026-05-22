@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "flash_f4_nested_array_prefix.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "flv",
+  "File:MIMEType": "video/x-flv",
+  "Flash:OuterArr00Name": "A",
+  "Flash:OuterArr01Name": "B",
+  "Flash:OuterArr10Name": "C",
+  "Flash:OuterArr11Name": "D",
+  "Flash:OuterArr": [[],[]],
+  "Flash:Trailer": 7
+}]

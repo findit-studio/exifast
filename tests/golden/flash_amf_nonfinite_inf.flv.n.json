@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "flash_amf_nonfinite_inf.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "FLV",
+  "File:MIMEType": "video/x-flv",
+  "Flash:AudioBitrate": "Inf",
+  "Flash:VideoBitrate": "Inf",
+  "Flash:TotalDataRate": "Inf",
+  "Flash:FrameRate": "inf"
+}]

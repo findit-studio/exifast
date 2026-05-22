@@ -188,6 +188,19 @@ impl TagMap {
     Ok(())
   }
 
+  /// Emit a list of arbitrary `TagValue` items for one key (e.g. an AMF
+  /// array of doubles for `Flash:KeyFramesTimes` / `KeyFramePositions`).
+  /// First-wins on the key like every other emission.
+  pub(crate) fn write_value_list(
+    &mut self,
+    group: &str,
+    name: &str,
+    items: Vec<TagValue>,
+  ) -> Result<(), Infallible> {
+    self.insert(group, name, TagValue::List(items));
+    Ok(())
+  }
+
   /// Record a `Warning` in occurrence order (`$self->Warn`, ExifTool.pm:1297).
   pub(crate) fn write_warning(&mut self, text: &str) -> Result<(), Infallible> {
     self.warnings.push(text.to_string());

@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "flash_audio_encoding_reserved.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "FLV",
+  "File:MIMEType": "video/x-flv",
+  "Flash:AudioEncoding": 9,
+  "Flash:AudioSampleRate": 44100,
+  "Flash:AudioBitsPerSample": 16,
+  "Flash:AudioChannels": 2
+}]

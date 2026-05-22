@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "flash_amf_string_conv.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "FLV",
+  "File:MIMEType": "video/x-flv",
+  "Flash:AudioBitrate": 65800,
+  "Flash:VideoBitrate": 12000,
+  "Flash:TotalDataRate": 565800,
+  "Flash:Duration": 1.5,
+  "Flash:StartTime": "notnum",
+  "Flash:FrameRate": 29.97,
+  "Flash:CreateDate": 2020,
+  "Flash:MetadataDate": "2020:01:02 03:04:05",
+  "Flash:AudioDelay": 0.5
+}]

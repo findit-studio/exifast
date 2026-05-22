@@ -300,6 +300,9 @@ pub enum AnyParser {
   /// H264 (FORMATS.md row 16 — H.264 NAL stream; engine-only, no file type).
   #[cfg(feature = "h264")]
   H264(crate::formats::h264::ProcessH264),
+  /// Flash FLV (Phase F-wave-a — Flash Video).
+  #[cfg(feature = "flash")]
+  Flv(crate::formats::flash::ProcessFlv),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::ProcessOgg),
@@ -382,6 +385,9 @@ pub enum AnyMeta<'a> {
   /// port to carry an H.264 sub-Meta through the closed dispatch.
   #[cfg(feature = "h264")]
   H264(crate::formats::h264::H264Meta<'a>),
+  /// Flash FLV (Phase F-wave-a).
+  #[cfg(feature = "flash")]
+  Flv(crate::formats::flash::Meta<'a>),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
   /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces a
   /// borrowed `ogg::Meta<'a>` via the [`FormatParser::Meta`] GAT (Codex
@@ -426,6 +432,7 @@ pub enum AnyMeta<'a> {
     feature = "dsf",
     feature = "flac",
     feature = "h264",
+    feature = "flash",
     feature = "ogg",
     feature = "real",
     feature = "mpeg-audio",
@@ -489,6 +496,8 @@ impl AnyMeta<'_> {
       AnyMeta::Flac(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "h264")]
       AnyMeta::H264(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "real")]
@@ -517,6 +526,7 @@ impl AnyMeta<'_> {
         feature = "dsf",
         feature = "flac",
         feature = "h264",
+        feature = "flash",
         feature = "ogg",
         feature = "real",
         feature = "mpeg-audio",
@@ -654,6 +664,8 @@ impl AnyMeta<'_> {
       // the inert default for the closed-set exhaustiveness.
       #[cfg(feature = "h264")]
       AnyMeta::H264(_) => FileTypeFinalize::Detected,
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(_) => FileTypeFinalize::Detected,
       // OGG: detected ("OGG"), then optional content override (OGV/OPUS).
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => match m.file_type_override() {
@@ -696,6 +708,7 @@ impl AnyMeta<'_> {
         feature = "dsf",
         feature = "flac",
         feature = "h264",
+        feature = "flash",
         feature = "ogg",
         feature = "real",
         feature = "mpeg-audio",
@@ -884,6 +897,10 @@ pub enum AnyError {
   #[cfg(feature = "h264")]
   #[error("H264: {0}")]
   H264(#[from] crate::formats::h264::H264Error),
+  /// Flash FLV fatal-error wrapper.
+  #[cfg(feature = "flash")]
+  #[error("FLV: {0}")]
+  Flv(#[from] crate::formats::flash::Error),
   /// Ogg fatal-error wrapper.
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
@@ -973,6 +990,7 @@ impl AnyParser {
       feature = "dsf",
       feature = "flac",
       feature = "h264",
+      feature = "flash",
       feature = "ogg",
       feature = "real",
       feature = "mpeg-audio",
@@ -1079,6 +1097,15 @@ impl AnyParser {
         let _ = (shared, ext);
         p.parse(bytes)
           .map(|o| o.map(AnyMeta::H264))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "flash")]
+      AnyParser::Flv(p) => {
+        let _ = (p, shared, ext);
+        // FLV is a leaf format (no cross-format chain): ignore `shared`
+        // and `ext`. The typed `parse_borrowed` accepts only a byte slice.
+        crate::formats::flash::parse_borrowed(bytes)
+          .map(|o| o.map(AnyMeta::Flv))
           .map_err(Into::into)
       }
       #[cfg(feature = "ogg")]
@@ -1203,6 +1230,8 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MKV" => Some(AnyParser::Matroska(
       crate::formats::matroska::ProcessMatroska,
     )),
+    #[cfg(feature = "flash")]
+    "FLV" => Some(AnyParser::Flv(crate::formats::flash::ProcessFlv)),
     #[cfg(feature = "mp3")]
     "MP3" => Some(AnyParser::Mp3(crate::formats::id3::ProcessMp3)),
     #[cfg(feature = "moi")]
@@ -1273,6 +1302,8 @@ mod tests {
     assert!(any_parser_for("DV").is_some());
     #[cfg(feature = "flac")]
     assert!(any_parser_for("FLAC").is_some());
+    #[cfg(feature = "flash")]
+    assert!(any_parser_for("FLV").is_some());
     #[cfg(feature = "moi")]
     assert!(any_parser_for("MOI").is_some());
     #[cfg(feature = "mp3")]

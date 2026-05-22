@@ -21,6 +21,8 @@ pub mod dsf;
 pub mod dv;
 #[cfg(feature = "flac")]
 pub mod flac;
+#[cfg(feature = "flash")]
+pub mod flash;
 // H264 is engine-only (FORMATS.md row 16 — no `H264` file type); the
 // typed parser is consumed by a future M2TS / MPEG port.
 #[cfg(feature = "h264")]
