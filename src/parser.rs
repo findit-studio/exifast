@@ -450,6 +450,25 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
         );
         insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
       }
+      FileTypeFinalize::ExplicitWithMime(payload) => {
+        // SetFileType($set, $mime): FileType + FileTypeExtension come from the
+        // explicit `set` (via resolve_file_type), but the MIMEType is the
+        // parser-supplied `mime` — NOT the generic %mimeType lookup, which
+        // lacks M4A/M4V/M4B (QuickTime.pm:10008, F2).
+        let (set, mime) = (payload.set(), payload.mime());
+        let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
+        insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
+        insert(
+          &mut obj,
+          "File:FileTypeExtension".into(),
+          serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+        );
+        insert(
+          &mut obj,
+          "File:MIMEType".into(),
+          Value::String(mime.to_string()),
+        );
+      }
     }
 
     // ----- MIME override (Real.pm:653-657 single-stream override) ----------

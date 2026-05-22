@@ -38,10 +38,20 @@ COMMON=(-j -G1 -struct -api QuickTimeUTC=1 \
         --FileName --Directory --FileSize --FileModifyDate \
         --FileAccessDate --FileInodeChangeDate --FilePermissions)
 
+# Optional standard exclusions, applied verbatim to BOTH the -j and -n runs.
+# Formats whose bundled output carries engine-synthesized `Composite:*` or
+# filesystem `System:*` tags (deferred per the Phase-2 forward items) pass
+# `EXCLUDE="-x System:all -x Composite:all"` so the regeneration is
+# reproducible (e.g. QuickTime, Matroska). Defaults to nothing — formats
+# whose goldens legitimately carry Composite tags (e.g. FLAC) regenerate
+# unchanged.
+# shellcheck disable=SC2206  # intentional word-splitting of the exclusion list
+EXCLUDE_ARR=(${EXCLUDE:-})
+
 # Run from the fixtures dir and pass only the basename so the embedded
 # `SourceFile` is a stable, environment-independent relative path
 # (e.g. "AAC.aac") instead of a machine-specific absolute path that
 # would make the committed goldens non-portable.
-( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}"    "$FIX" ) > "$OUT"
-( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" -n "$FIX" ) > "$OUT_N"
+( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" "${EXCLUDE_ARR[@]}"    "$FIX" ) > "$OUT"
+( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" "${EXCLUDE_ARR[@]}" -n "$FIX" ) > "$OUT_N"
 echo "wrote $OUT and $OUT_N"
