@@ -39,8 +39,180 @@ pub fn convert_unix_time(time: i64) -> String {
   if time == 0 {
     return "0000:00:00 00:00:00".to_string(); // ExifTool.pm:6776
   }
-  let (y, mo, d, h, mi, s) = gmtime(time);
+  render_gmt(time)
+}
+
+/// `ConvertUnixTime($time)` (the `$toLocal == 0` GMT branch) for a *floating-
+/// point* `$time` — the form PLIST's `DateTimeOriginal` `ValueConv`
+/// (`PLIST.pm:73`, `ConvertUnixTime(($val - 25569) * 24 * 3600)`) hits.
+///
+/// Ports `ExifTool.pm:6776-6789` byte-for-byte: the `$time == 0` sentinel is
+/// checked against the **float** (`:6776`); the fractional second is reduced
+/// to an integer `$itime` via [`reduce_unix_time_float`] (half-to-even
+/// rounding + carry, `:6780-6785`); the result is `gmtime($itime)` (`:6787`).
+///
+/// Critically, the sentinel is on the *original* float, NOT on the reduced
+/// `$itime`: e.g. `ConvertUnixTime(0.4)` ⇒ `1970:01:01 00:00:00` (itime 0,
+/// but NOT the `0000:…` sentinel), verified against bundled ExifTool 13.58.
+#[must_use]
+pub fn convert_unix_time_f64(time: f64) -> String {
+  // ExifTool.pm:6776 `return '0000:00:00 00:00:00' if $time == 0;` — on the
+  // ORIGINAL float input (before any fractional reduction).
+  if time == 0.0 {
+    return "0000:00:00 00:00:00".to_string();
+  }
+  render_gmt(reduce_unix_time_float(time))
+}
+
+/// `ConvertUnixTime($time, 1)` (the `$toLocal = 1` localtime branch) for a
+/// *floating-point* `$time` — the form PLIST's binary `<date>` path
+/// (`PLIST.pm:277`, `ConvertUnixTime($val + 11323*24*3600, 1)`) hits.
+///
+/// Ports `ExifTool.pm:6776-6795`: the `$time == 0` sentinel on the **float**
+/// (`:6776`), the fractional reduction via [`reduce_unix_time_float`]
+/// (`:6780-6785`), then the localtime / `TimeZoneString` rendering
+/// ([`convert_unix_time_local`], `:6794-6795`).
+#[must_use]
+pub fn convert_unix_time_local_f64(time: f64) -> String {
+  // ExifTool.pm:6776 — sentinel on the ORIGINAL float.
+  if time == 0.0 {
+    return "0000:00:00 00:00:00".to_string();
+  }
+  // The reduced `$itime` is fed to the integer localtime renderer. An
+  // `$itime` of exactly 0 (reached only when the original float was a
+  // sub-second non-zero value, already handled above) must render as
+  // `1970:01:01 …`, NOT the sentinel — so dispatch on a sentinel-free
+  // localtime path by adding the carry first. `convert_unix_time_local`
+  // re-checks `time == 0`; an `$itime == 0` survivor is impossible here
+  // because a float whose reduced `$itime` is 0 and whose `$time` is non-
+  // zero rounds to `1970:01:01 00:00:00±..` only through the GMT/localtime
+  // formatter — which we reach via the dedicated zero-aware renderer below.
+  render_local(reduce_unix_time_float(time))
+}
+
+/// `int($time)` truncate-toward-zero ⇒ `$itime`, then the fractional
+/// adjustment of `ExifTool.pm:6780-6785` (default `$dec = 0`):
+///
+/// ```text
+/// $itime = int($time);
+/// $frac  = $time - $itime;
+/// $frac < 0 and $frac += 1, $itime -= 1;     # fold frac into [0,1)
+/// $dec = sprintf('%.0f', $frac);             # half-to-EVEN (Perl sprintf)
+/// $dec =~ s/^(\d)// and $1 eq '1' and $itime += 1;   # carry on round-up
+/// ```
+///
+/// Returns the carry-adjusted integer `$itime`. The half-to-even tie rule is
+/// the load-bearing fix (Codex R4 F1): Rust's `f64::round()` is half-AWAY-
+/// from-zero, so `frac == 0.5` would carry (giving `…:01`) whereas Perl's
+/// `sprintf('%.0f', 0.5)` ⇒ `"0"` (no carry, `…:00`). `format!("{:.0}", _)`
+/// uses Rust's round-half-to-even formatter, matching Perl's `sprintf`.
+fn reduce_unix_time_float(time: f64) -> i64 {
+  // ExifTool.pm:6780 `$itime = int($time)` — truncate toward zero.
+  #[allow(clippy::cast_possible_truncation)]
+  let mut itime = time.trunc() as i64;
+  // ExifTool.pm:6781 `$frac = $time - $itime`.
+  let mut frac = time - time.trunc();
+  // ExifTool.pm:6782 `$frac < 0 and $frac += 1, $itime -= 1` — fold a
+  // negative fraction into [0,1) by borrowing a second (true floor).
+  if frac < 0.0 {
+    frac += 1.0;
+    itime -= 1;
+  }
+  // ExifTool.pm:6783 `$dec = sprintf('%.0f', $frac)`. `$frac` is in `[0,1)`,
+  // so this is `"0"` or `"1"`. Rust's `format!("{:.0}", _)` rounds half-to-
+  // EVEN exactly like Perl's `sprintf('%.0f', _)` (`0.5` ⇒ `"0"`), the R4 F1
+  // fix vs `f64::round()`'s half-away-from-zero (`0.5` ⇒ `1`).
+  // ExifTool.pm:6785 `$dec =~ s/^(\d)// and $1 eq '1' and $itime += 1` — a
+  // leading `1` (rounded up to the next whole second) carries into `$itime`.
+  if format!("{frac:.0}") == "1" {
+    itime += 1;
+  }
+  itime
+}
+
+/// `gmtime($itime)` rendered the `:6796-6797` way (no TZ suffix, `:6789`).
+/// Shared by the integer and float GMT entry points; no `$time == 0`
+/// sentinel (callers apply the sentinel against their own input form).
+#[must_use]
+fn render_gmt(itime: i64) -> String {
+  let (y, mo, d, h, mi, s) = gmtime(itime);
   format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// Faithful `ConvertUnixTime($time, 1)` (ExifTool.pm:6773-6800) — the
+/// `$toLocal = 1` branch (`@tm = localtime($itime); $tz =
+/// TimeZoneString(\@tm, $itime)`, ExifTool.pm:6794-6795).
+///
+/// Input: seconds since the Unix epoch. Output: `"YYYY:MM:DD HH:MM:SS±HH:MM"`
+/// — the OS-LOCAL broken-down clock with a `TimeZoneString` numeric-offset
+/// suffix (ExifTool.pm:6753-6764). The conformance harness pins `TZ=UTC`
+/// (`tools/gen_golden.sh`) so this code path is exercised deterministically.
+///
+/// Under `std` the OS timezone is read via `jiff::tz::TimeZone::system()`
+/// (jiff reads `TZ` / `/etc/localtime`, exactly as Perl's `localtime`).
+/// Under `no_std` (no OS TZ database) this falls back to the UTC clock with
+/// a `+00:00` suffix — a documented faithful fallback (`localtime ≡ gmtime`
+/// and `TimeZoneString ⇒ +00:00` on a UTC host).
+///
+/// Special case (ExifTool.pm:6776): `$time == 0` ⇒ `"0000:00:00 00:00:00"`.
+#[must_use]
+pub fn convert_unix_time_local(time: i64) -> String {
+  if time == 0 {
+    return "0000:00:00 00:00:00".to_string(); // ExifTool.pm:6776
+  }
+  render_local(time)
+}
+
+/// `localtime($itime)` + `TimeZoneString` rendered the `:6794-6795`/`:6796`
+/// way. Shared by the integer and float localtime entry points; no
+/// `$time == 0` sentinel (callers apply the sentinel against their own input
+/// form — the float path checks the original float, not the reduced `$itime`).
+#[must_use]
+fn render_local(time: i64) -> String {
+  #[cfg(feature = "std")]
+  {
+    use jiff::{Timestamp, tz::TimeZone};
+    // ExifTool.pm:6794 `@tm = localtime($itime)`.
+    if let Ok(ts) = Timestamp::from_second(time) {
+      let zoned = ts.to_zoned(TimeZone::system());
+      let dt = zoned.datetime();
+      // ExifTool.pm:6795 `$tz = TimeZoneString(\@tm, $itime)` — the numeric
+      // UTC offset in `±HH:MM` (ExifTool.pm:6753-6764). jiff's offset is the
+      // local-minus-UTC seconds; render it the `TimeZoneString` way (round
+      // to the nearest minute, `sprintf('%s%.2d:%.2d', …)`).
+      let off_secs = zoned.offset().seconds();
+      let tz = format_tz_offset(i64::from(off_secs));
+      return format!(
+        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}{tz}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+      );
+    }
+    // `Timestamp::from_second` rejects only out-of-range values no real
+    // file date hits; fall through to the UTC rendering below.
+  }
+  // `no_std` (no OS TZ) — documented faithful fallback: a UTC host's
+  // `localtime` equals `gmtime` and `TimeZoneString` yields `+00:00`.
+  let (y, mo, d, h, mi, s) = gmtime(time);
+  format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}+00:00")
+}
+
+/// Faithful `TimeZoneString` numeric rendering (ExifTool.pm:6759-6764) for a
+/// UTC offset in seconds: `$min = int($min + 0.5)` (round to nearest minute),
+/// then `sprintf('%s%.2d:%.2d', $sign, $h, $min - $h*60)`.
+#[must_use]
+fn format_tz_offset(offset_secs: i64) -> String {
+  let sign = if offset_secs < 0 { '-' } else { '+' };
+  let abs_secs = offset_secs.unsigned_abs();
+  // ExifTool.pm:6761 `int($min + 0.5)` — round the minute count to nearest.
+  let total_min = (abs_secs + 30) / 60;
+  let h = total_min / 60;
+  let m = total_min % 60;
+  format!("{sign}{h:02}:{m:02}")
 }
 
 /// Faithful subset of `ConvertDateTime($val)` (ExifTool.pm:6563). With no
@@ -208,6 +380,37 @@ mod tests {
   }
 
   #[test]
+  fn format_tz_offset_matches_timezonestring() {
+    // ExifTool.pm:6759-6764 `TimeZoneString` numeric rendering.
+    assert_eq!(format_tz_offset(0), "+00:00");
+    assert_eq!(format_tz_offset(-5 * 3600), "-05:00"); // US Eastern (EST)
+    assert_eq!(format_tz_offset(5 * 3600 + 30 * 60), "+05:30"); // India
+    assert_eq!(format_tz_offset(-9 * 3600 - 30 * 60), "-09:30"); // Marquesas
+    // `int($min + 0.5)` rounds the minute count to nearest — a 29-second
+    // sub-minute remainder rounds down, 30+ rounds up.
+    assert_eq!(format_tz_offset(3600 + 29), "+01:00");
+    assert_eq!(format_tz_offset(3600 + 30), "+01:01");
+  }
+
+  #[test]
+  fn convert_unix_time_local_zero_is_zero_string() {
+    // ExifTool.pm:6776 — the `$time == 0` short-circuit precedes the
+    // localtime branch.
+    assert_eq!(convert_unix_time_local(0), "0000:00:00 00:00:00");
+  }
+
+  #[test]
+  fn convert_unix_time_local_has_offset_suffix() {
+    // The localtime branch always appends a `±HH:MM` `TimeZoneString`
+    // suffix (the exact offset is OS-TZ dependent — assert the shape).
+    let s = convert_unix_time_local(1_000_000_000);
+    let b = s.as_bytes();
+    assert_eq!(b.len(), 25, "expected `YYYY:MM:DD HH:MM:SS±HH:MM`: {s}");
+    assert!(b[19] == b'+' || b[19] == b'-', "missing tz sign: {s}");
+    assert_eq!(b[22], b':', "missing tz colon: {s}");
+  }
+
+  #[test]
   fn known_oracle_aiff_comment_time() {
     // Bundled oracle: AIFF.aif fixture has CommentTime u32 = 0xbc71b50e
     // (Mac/AIFF time). After subtracting AIFF_EPOCH_OFFSET, Perl's
@@ -224,6 +427,52 @@ mod tests {
     let mac = 0xa2805140_i64;
     let unix = mac - AIFF_EPOCH_OFFSET;
     assert_eq!(convert_unix_time(unix), "1990:05:23 14:40:00");
+  }
+
+  // -- Codex R4: the float-input ConvertUnixTime entry points --------------
+
+  #[test]
+  fn convert_unix_time_f64_float_sentinel_and_fractional_rounding() {
+    // ExifTool.pm:6776 — sentinel on the ORIGINAL float, NOT the reduced
+    // `$itime`. Bundled ExifTool 13.58 (TZ=UTC):
+    //   ConvertUnixTime(0.0) => 0000:00:00 00:00:00
+    //   ConvertUnixTime(0.4) => 1970:01:01 00:00:00   (itime 0, NOT sentinel)
+    //   ConvertUnixTime(0.6) => 1970:01:01 00:00:01
+    //   ConvertUnixTime(-0.4) => 1970:01:01 00:00:00  (floor to -1 then carry)
+    assert_eq!(convert_unix_time_f64(0.0), "0000:00:00 00:00:00");
+    assert_eq!(convert_unix_time_f64(0.4), "1970:01:01 00:00:00");
+    assert_eq!(convert_unix_time_f64(0.6), "1970:01:01 00:00:01");
+    assert_eq!(convert_unix_time_f64(-0.4), "1970:01:01 00:00:00");
+  }
+
+  #[test]
+  fn reduce_unix_time_float_is_half_to_even() {
+    // ExifTool.pm:6783 `sprintf('%.0f', $frac)` is round-half-to-EVEN. An
+    // exact `.5` fraction therefore does NOT carry (rounds to the even `0`):
+    //   reduce(0.5) == 0   (NOT 1, which `f64::round()` would give)
+    //   reduce(1.5) == 1   (frac 0.5 ⇒ "0", no carry)
+    //   reduce(-0.5) == -1 (floor 0→-1, frac 0.5 ⇒ "0", no carry)
+    assert_eq!(reduce_unix_time_float(0.5), 0);
+    assert_eq!(reduce_unix_time_float(1.5), 1);
+    assert_eq!(reduce_unix_time_float(-0.5), -1);
+    // Just past the tie carries.
+    assert_eq!(reduce_unix_time_float(0.500_000_1), 1);
+    // A negative non-tie fraction floors then may carry: -0.4 ⇒ floor -1,
+    // frac 0.6 ⇒ "1" carry ⇒ 0.
+    assert_eq!(reduce_unix_time_float(-0.4), 0);
+  }
+
+  #[test]
+  fn convert_unix_time_local_f64_float_sentinel() {
+    // ExifTool.pm:6776 — the `$time == 0.0` float sentinel precedes the
+    // localtime branch. A non-zero sub-second float reduces to `$itime == 0`
+    // but renders `1970:01:01 00:00:00±..` (NOT the sentinel).
+    assert_eq!(convert_unix_time_local_f64(0.0), "0000:00:00 00:00:00");
+    let s = convert_unix_time_local_f64(0.4);
+    assert!(
+      s.starts_with("1970:01:01 00:00:00"),
+      "sub-second non-zero float must not hit the sentinel: {s}"
+    );
   }
 
   #[test]

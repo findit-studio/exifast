@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>MetaDataList</key>
+  <array><dict>
+    <key>DateTimeOriginal</key><real>41327.5</real>
+    <key>Duration</key><real>3725.0</real>
+    <key>Geolocation</key><dict>
+      <key>Latitude</key><real>37.7749</real>
+      <key>MapDatum</key><string>WGS-84</string>
+    </dict>
+  </dict></array>
+</dict>
+</plist>

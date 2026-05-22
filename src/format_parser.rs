@@ -333,6 +333,9 @@ pub enum AnyParser {
   /// MXF (FORMATS.md row 24 — Material Exchange Format KLV container).
   #[cfg(feature = "mxf")]
   Mxf(crate::formats::mxf::ProcessMxf),
+  /// PLIST (FORMATS.md row 12b — Apple Property List, binary + XML).
+  #[cfg(feature = "plist")]
+  Plist(crate::formats::plist::ProcessPlist),
   /// Exif/TIFF (FORMATS.md row 13 — a standalone TIFF file IS an Exif/TIFF
   /// block; GPS row 14 is its sub-IFD, decoded through the same walker).
   #[cfg(feature = "exif")]
@@ -451,6 +454,9 @@ pub enum AnyMeta<'a> {
   /// phantom there, kept for GAT uniformity.
   #[cfg(feature = "mxf")]
   Mxf(crate::formats::mxf::MxfMeta<'a>),
+  /// PLIST (FORMATS.md row 12b — Apple Property List, binary + XML).
+  #[cfg(feature = "plist")]
+  Plist(crate::formats::plist::PlistMeta<'a>),
   /// Exif/TIFF (FORMATS.md row 13 — typed `ExifMeta<'a>` carrying the IFD
   /// chain's tags + the captured-but-deferred MakerNote blob). GPS sub-IFD
   /// tags (row 14) are inside this same Meta.
@@ -486,6 +492,7 @@ pub enum AnyMeta<'a> {
     feature = "matroska",
     feature = "quicktime",
     feature = "mxf",
+    feature = "plist",
     feature = "exif",
   )))]
   #[doc(hidden)]
@@ -566,6 +573,13 @@ impl AnyMeta<'_> {
       AnyMeta::QuickTime(m) => m.tags(mode).collect(),
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => m.tags(mode).collect(),
+      // PLIST: `tags()` yields the recognized-PLIST error tag (binary
+      // `PLIST:Error`, family-1 — a TAG not a diagnostic), then the walk-order
+      // plist tags (PLIST / XML family-1), each leaf already rendered for the
+      // mode. The AAE inflate `$et->Warn` is a diagnostic (drained in
+      // `drain_diagnostics`), NOT a tag.
+      #[cfg(feature = "plist")]
+      AnyMeta::Plist(m) => m.tags(mode).collect(),
       // EXIF's `tags()` yields `File:ExifByteOrder` first (when a TIFF block
       // was processed), then the IFD-walk entries, then the MakerNote vendor
       // emissions — uniform with every other format.
@@ -598,6 +612,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "plist",
         feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => {
@@ -1055,6 +1070,21 @@ impl AnyMeta<'_> {
       }
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(_) => Ok(()),
+      #[cfg(feature = "plist")]
+      AnyMeta::Plist(m) => {
+        // PLIST.pm:234 — the AAE `adjustmentData` raw-DEFLATE inflate failure
+        // `$et->Warn(...)`. The bundled `Warn` API does NOT honor the
+        // `SET_GROUP1 = 'PLIST'` scope, so it surfaces as the family-0
+        // `ExifTool:Warning` via `TagMap::first_warning` (the retired inherent
+        // `serialize_tags` drained it via `write_warning`, same here). The
+        // recognized-PLIST binary `PLIST:Error` is a family-1 TAG, NOT a
+        // diagnostic — it is emitted by `tags()` (via `collect_emitted`), so it
+        // is NOT drained here.
+        if let Some(msg) = m.warning() {
+          out.write_warning(msg)?;
+        }
+        Ok(())
+      }
       #[cfg(feature = "exif")]
       AnyMeta::Exif(m) => {
         // EXIF's `$et->Warn(...)` (IFD-bounds checks, `Malformed APP1 EXIF
@@ -1094,6 +1124,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "plist",
         feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => {
@@ -1230,6 +1261,15 @@ pub enum FileTypeFinalize {
   /// `SetFileType()` then `OverrideFileType($target)` — finalize to the
   /// detected type, then in-place override (OGG → `OGV`/`OPUS`, Ogg.pm:49-50).
   DetectedThenOverride(&'static str),
+  /// `SetFileType($baseType, $mimeType)` — finalize to the DETECTED type but
+  /// with an EXPLICIT MIME type passed as `SetFileType`'s 2nd argument
+  /// (ExifTool.pm:9679/9693 `$mimeType or $mimeType = …`). The binary-PLIST
+  /// path does this: `SetFileType('PLIST', 'application/x-plist')`
+  /// (PLIST.pm:483) — the FileType + FileTypeExtension come from the detected
+  /// `PLIST` type, but the MIME is forced to `application/x-plist` (the
+  /// detected `%mimeType{PLIST}` is `application/xml`, which the XML-PLIST
+  /// path keeps). The payload is the explicit MIME string.
+  DetectedWithMime(&'static str),
   /// `SetFileType($set)` then raw-replace the `File:FileType` VALUE with
   /// `$literal` (AIFF DjVu multi-page: `SetFileType('DJVU')` then
   /// `$$self{VALUE}{FileType} = 'DJVU (multi-page)'`, AIFF.pm:206). The
@@ -1318,6 +1358,12 @@ impl AnyMeta<'_> {
       AnyMeta::QuickTime(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => crate::metadata::Project::project(m),
+      // PLIST: an Apple Property List carries no camera/lens/GPS/capture facts
+      // the cross-format domain consumes (it is a generic key/value document),
+      // so its `Project` impl returns the empty aggregate. Routed through the
+      // `Project` trait like every other arm for uniformity.
+      #[cfg(feature = "plist")]
+      AnyMeta::Plist(m) => crate::metadata::Project::project(m),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3); it projects to the empty aggregate for exhaustiveness.
       #[cfg(not(any(
@@ -1343,6 +1389,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "plist",
         feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => crate::metadata::MediaMetadata::new(),
@@ -1449,6 +1496,19 @@ impl AnyMeta<'_> {
       // (MXF.pm:2820) ⇒ finalize to the detected candidate type.
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(_) => FileTypeFinalize::Detected,
+      // PLIST: the binary path calls `SetFileType('PLIST',
+      // 'application/x-plist')` (PLIST.pm:483) — detected FileType, explicit
+      // MIME. The XML path has NO `SetFileType` (it finalizes via the normal
+      // detection — `application/xml` MIME, PLIST.pm:48/466-469). So binary ⇒
+      // `DetectedWithMime`, XML ⇒ plain `Detected`.
+      #[cfg(feature = "plist")]
+      AnyMeta::Plist(m) => {
+        if m.format().is_binary() {
+          FileTypeFinalize::DetectedWithMime("application/x-plist")
+        } else {
+          FileTypeFinalize::Detected
+        }
+      }
       // Exif/TIFF: `DoProcessTIFF` calls `SetFileType($t)` (ExifTool.pm:
       // 8683) — finalize to the DETECTED candidate type ("TIFF" for a
       // standalone `.tif`). DNG/NEF/RAW overrides (ExifTool.pm:8754-8765)
@@ -1480,6 +1540,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "plist",
         feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
@@ -1707,6 +1768,10 @@ pub enum AnyError {
   #[cfg(feature = "mxf")]
   #[error("MXF: {0}")]
   Mxf(#[from] crate::formats::mxf::MxfError),
+  /// PLIST fatal-error wrapper.
+  #[cfg(feature = "plist")]
+  #[error("PLIST: {0}")]
+  Plist(#[from] crate::formats::plist::Error),
   /// Exif/TIFF fatal-error wrapper.
   #[cfg(feature = "exif")]
   #[error("Exif: {0}")]
@@ -1804,6 +1869,7 @@ impl AnyParser {
       feature = "matroska",
       feature = "quicktime",
       feature = "mxf",
+      feature = "plist",
       feature = "exif",
     )))]
     let _ = (bytes, shared, ext, header_skip, tiff_parent_type);
@@ -2061,6 +2127,15 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::Mxf))
           .map_err(Into::into)
       }
+      #[cfg(feature = "plist")]
+      AnyParser::Plist(p) => {
+        // PLIST is a leaf format (no cross-format chains); `shared` / `ext`
+        // are unused. The parser detects the binary vs XML encoding itself.
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Plist))
+          .map_err(Into::into)
+      }
       #[cfg(feature = "exif")]
       AnyParser::Exif(p) => {
         // Exif/TIFF is a leaf format — `shared` (cross-format chain state)
@@ -2225,6 +2300,8 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MXF" => Some(AnyParser::Mxf(crate::formats::mxf::ProcessMxf)),
     #[cfg(feature = "ogg")]
     "OGG" => Some(AnyParser::Ogg(crate::formats::ogg::ProcessOgg)),
+    #[cfg(feature = "plist")]
+    "PLIST" => Some(AnyParser::Plist(crate::formats::plist::ProcessPlist)),
     // PNG (FORMATS.md row 11) — `%fileTypeLookup{PNG}` resolves the
     // `.png`/`.apng`/`.mng`/`.jng` extension and the 8-byte signature to
     // file type "PNG"; bundled `ProcessPNG` (PNG.pm:1410) dispatches the
@@ -2314,6 +2391,8 @@ mod tests {
     assert!(any_parser_for("MPC").is_some());
     #[cfg(feature = "ogg")]
     assert!(any_parser_for("OGG").is_some());
+    #[cfg(feature = "plist")]
+    assert!(any_parser_for("PLIST").is_some());
     #[cfg(feature = "real")]
     assert!(any_parser_for("Real").is_some());
     #[cfg(feature = "red")]

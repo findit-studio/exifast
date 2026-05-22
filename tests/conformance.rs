@@ -43,6 +43,24 @@ fn check(fixture: &str, golden: &str, print_on: bool) {
   }
 }
 
+/// Pin `TZ=UTC` before the first `jiff::tz::TimeZone::system()` call
+/// (Codex R2 F1). The binary-plist `<date>` path ports the faithful
+/// `ConvertUnixTime(_, 1)` localtime branch — its offset is OS-TZ dependent.
+/// The committed goldens are captured `TZ=UTC` (`tools/gen_golden.sh`), so
+/// every plist conformance case that has a `<date>` pins the same UTC zone
+/// here for a host-independent comparison. `jiff` caches the system zone on
+/// first use; `Once` makes this idempotent and ordered.
+fn pin_utc() {
+  use std::sync::Once;
+  static ONCE: Once = Once::new();
+  ONCE.call_once(|| {
+    // SAFETY: runs before the first `TimeZone::system()` call (every
+    // date-bearing plist case calls this first) and the test does not
+    // spawn threads that read the environment concurrently.
+    unsafe { std::env::set_var("TZ", "UTC") };
+  });
+}
+
 #[test]
 fn aac_conformance() {
   check("AAC.aac", "AAC.aac.json", true);
@@ -1436,6 +1454,1195 @@ fn matroska_duration_zero_scale_conformance() {
   check(
     "Matroska_duration_zero_scale.mkv",
     "Matroska_duration_zero_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn plist_bin_conformance() {
+  // FORMATS.md row 12b. `tests/fixtures/PLIST-bin.plist` is the bundled
+  // `lib/Image/ExifTool/t/images/PLIST-bin.plist` (351 bytes — a binary
+  // `bplist00` with a `<dict>` of one each of every plist scalar shape
+  // plus an `<array>` and `<data>`). Goldens are bundled
+  // `tools/gen_golden.sh` output (`perl exiftool -j -G1 -struct`, the
+  // canonical generator — `System:*` fs-dependent fields stripped). The
+  // binary `<array>` is a real Perl arrayref ⇒ emitted as a list
+  // (`["one","two","three"]`); the binary `<date>` uses the local-time
+  // `ConvertUnixTime(_, 1)` branch — the port now ports that faithful
+  // localtime path (Codex R2 F1), so the test pins `TZ=UTC` (the golden's
+  // capture zone) for a host-independent `+00:00` suffix.
+  pin_utc();
+  check("PLIST-bin.plist", "PLIST-bin.plist.json", true);
+  check("PLIST-bin.plist", "PLIST-bin.plist.n.json", false);
+}
+
+/// Codex R14 F1 — a truncated `bplist00` (the 8-byte magic only, no trailer):
+/// a plausible short/partially-copied binary plist in a real media library.
+/// Bundled recognizes the `bplist0` magic (PLIST.pm:480), calls
+/// `SetFileType('PLIST', 'application/x-plist')` (PLIST.pm:483), and — because
+/// `ProcessBinaryPLIST` fails on the missing trailer — adds `$et->Error('Error
+/// reading binary PLIST file')` (PLIST.pm:485-486) while still finalizing as
+/// PLIST (`$result = 1`, PLIST.pm:489). The error lands in the family-1 `PLIST`
+/// group (`SET_GROUP1 = 'PLIST'`, PLIST.pm:484), so the `-G1` golden keys it
+/// `PLIST:Error`. Before the fix the port returned `None` (dropping the file:
+/// no FileType/MIME/error). Goldens are bundled `tools/gen_golden.sh` output
+/// (`perl exiftool -j -G1 -struct`; the perl exit code is 1 because of the
+/// error, so the `.n.json` was captured with the same flags + `-n`).
+///
+/// This exercises the engine surface (`extract_info` via `check`). The typed
+/// `parse_bytes` surface is asserted in `plist_trunc_bin_parse_bytes_recognized`.
+#[test]
+fn plist_trunc_bin_conformance() {
+  check("plist_trunc_bin.plist", "plist_trunc_bin.plist.json", true);
+  check(
+    "plist_trunc_bin.plist",
+    "plist_trunc_bin.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R14 F1 (the typed `parse_bytes` surface) — the SAME truncated
+/// `bplist00` must NOT be dropped by the public typed dispatch either: it is a
+/// RECOGNIZED PLIST carrying the error, not `Ok(None)`. Asserts the typed
+/// `AnyMeta::Plist` arm is returned with `format() == Binary` and
+/// `error() == Some("Error reading binary PLIST file")` (PLIST.pm:486), and
+/// that the rendered engine output carries `PLIST:Error` + `File:FileType =
+/// PLIST` + `File:MIMEType = application/x-plist` (PLIST.pm:483) — the
+/// observability bundled emits and the pre-fix `Ok(None)` lost.
+#[test]
+fn plist_trunc_bin_parse_bytes_recognized() {
+  let trunc: &[u8] = b"bplist00";
+  // Typed public dispatch must recognize it (not `Ok(None)`).
+  let meta = exifast::parse_bytes(trunc)
+    .expect("parse_bytes is infallible for PLIST")
+    .expect("truncated bplist00 is a RECOGNIZED PLIST, not Ok(None)");
+  match meta {
+    exifast::format_parser::AnyMeta::Plist(p) => {
+      assert!(p.format().is_binary(), "binary plist");
+      assert_eq!(
+        p.error(),
+        Some("Error reading binary PLIST file"),
+        "carries the bundled PLIST.pm:486 error"
+      );
+      assert!(
+        p.tags_slice().is_empty(),
+        "an error meta has no extracted tags"
+      );
+    }
+    other => panic!("expected AnyMeta::Plist, got {other:?}"),
+  }
+  // And the engine render carries the recognized-PLIST classification + error.
+  let json = extract_info("plist_trunc_bin.plist", trunc, true);
+  let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+  let obj = v.as_array().unwrap()[0].as_object().unwrap();
+  assert_eq!(
+    obj.get("File:FileType").and_then(|x| x.as_str()),
+    Some("PLIST")
+  );
+  assert_eq!(
+    obj.get("File:MIMEType").and_then(|x| x.as_str()),
+    Some("application/x-plist")
+  );
+  assert_eq!(
+    obj.get("PLIST:Error").and_then(|x| x.as_str()),
+    Some("Error reading binary PLIST file")
+  );
+  // The error is family-1 `PLIST:Error` (PLIST.pm:484 SET_GROUP1), NOT the
+  // family-0 `ExifTool:Error` the engine uses for finalization-stage errors.
+  assert!(
+    !obj.contains_key("ExifTool:Error"),
+    "the error is the PLIST-grouped tag, not ExifTool:Error"
+  );
+}
+
+#[test]
+fn plist_xml_conformance() {
+  // FORMATS.md row 12b. `tests/fixtures/PLIST-xml.plist` is the bundled
+  // `lib/Image/ExifTool/t/images/PLIST-xml.plist` (795 bytes — the same
+  // value set as the binary fixture, XML-encoded). Family-1 group is
+  // `"XML"` (the XMP-machinery path, PLIST.pm:48/466-469). Under
+  // `exiftool -struct` (the golden generator) the XML `<array>` collapses
+  // to the last-value-wins scalar (`"three"`) — each `<string>` is a
+  // separate `FoundTag` call and `-struct` suppresses list accumulation.
+  check("PLIST-xml.plist", "PLIST-xml.plist.json", true);
+  check("PLIST-xml.plist", "PLIST-xml.plist.n.json", false);
+}
+
+/// Codex R1 F1 — an XML `<array>` of `<dict>` elements. The XMP event parser
+/// inserts an EMPTY key-stack component for the `<array>` level
+/// (PLIST.pm:191-194 `push '' while @keys < @props-3`), so a `cast`→array→
+/// `{name}` reaches the `cast//name` tag ID and emits `XML:Cast`. Under
+/// `-struct` the repeated `name` keys collapse last-value-wins (`"Bob"`). The
+/// `plainstr` string array confirms the verified string-array last-wins
+/// behavior is unchanged. Bundled `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_array_of_dict_conformance() {
+  check(
+    "plist_synth_xml_array_of_dict.plist",
+    "plist_synth_xml_array_of_dict.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_array_of_dict.plist",
+    "plist_synth_xml_array_of_dict.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R5 F1 — the `XMLFileType=ModdXML` content override (PLIST.pm:133-141
+/// RawConv → `OverrideFileType('MODD')`). The fixture has a `.xml` extension
+/// (NO `.modd`/`.plist`), so ExifTool types it `XMP` first
+/// (`$$self{FILE_TYPE} eq 'XMP'`) and the override fires: `File:FileType=MODD`,
+/// `File:FileTypeExtension=modd`/`MODD` (PrintConv/-n), MIME stays
+/// `application/xml` (MODD has no `%mimeType` entry). Bundled
+/// `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_modd_content_conformance() {
+  check(
+    "plist_synth_xml_modd_content.xml",
+    "plist_synth_xml_modd_content.xml.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_modd_content.xml",
+    "plist_synth_xml_modd_content.xml.n.json",
+    false,
+  );
+}
+
+/// Codex R11 F1 — the `XMLFileType` MODD override is keyed on the EXACT RAW tag
+/// ID (PLIST.pm:203 table lookup), NOT the generated tag NAME. The fixture's
+/// raw key `xMLFileType` generates the SAME emitted name `XMLFileType` (ucfirst,
+/// PLIST.pm:210-212), but its raw ID differs from `XMLFileType`, so the RawConv
+/// is absent and NO override fires. Bundled (`.xml` ⇒ `FILE_TYPE eq 'XMP'`)
+/// reports `File:FileType=PLIST` with `XML:XMLFileType=ModdXML` — i.e. the name
+/// collides while the override does not. The old port checked the generated
+/// name and would have wrongly typed this `MODD`.
+#[test]
+fn plist_xml_xmlfiletype_collide_conformance() {
+  check(
+    "plist_synth_xml_xmlfiletype_collide.xml",
+    "plist_synth_xml_xmlfiletype_collide.xml.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_xmlfiletype_collide.xml",
+    "plist_synth_xml_xmlfiletype_collide.xml.n.json",
+    false,
+  );
+}
+
+/// Codex R11 F2 — the `%plistType` AAE override (PLIST.pm:42, applied at :225:
+/// `OverrideFileType($plistType{$tag})`) keyed on the EXACT RAW tag ID
+/// `adjustmentBaseVersion`. The fixture has a `.xml` extension (NO `.aae`), so
+/// ExifTool types it `XMP` first (`$$self{FILE_TYPE} eq 'XMP'`) and the override
+/// fires: `File:FileType=AAE`, `File:FileTypeExtension=aae`/`AAE` (PrintConv/-n),
+/// MIME `application/vnd.apple.photos` (`%mimeType{AAE}`, ExifTool.pm:621). This
+/// is an ACTIVE, NON-compressed AAE fixture — distinct from the existing
+/// `plist_aae_compressed.aae` (which is typed AAE by its `.aae` extension, not
+/// by content). Bundled `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_aae_override_conformance() {
+  check(
+    "plist_synth_xml_aae_override.xml",
+    "plist_synth_xml_aae_override.xml.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_aae_override.xml",
+    "plist_synth_xml_aae_override.xml.n.json",
+    false,
+  );
+}
+
+/// Codex R12 F1 — a valid XML plist carrying a leading UTF-8 BOM (`EF BB BF`).
+/// Bundled accepts it ONLY through its XMP path: the XMP `%magicNumber`
+/// (ExifTool.pm:1045 `…(\xef\xbb\xbf)?…\s*<`) matches the BOM that the PLIST
+/// `%magicNumber` (ExifTool.pm:1015 `(bplist0|\s*<|…)`) does NOT, so XMP is the
+/// first/only detection candidate; `ProcessXMP` then content-sniffs `<plist>`
+/// (XMP.pm:4349 BOM-tolerant `<?xml` + :4385 `<plist[\s>]`), `SetFileType(
+/// 'PLIST','application/xml')`, and routes the body to `PLIST::FoundTag`. The
+/// oracle yields `File:FileType=PLIST`, `File:MIMEType=application/xml`, and the
+/// plist key values for this in-memory BOM plist. Before the fix the port
+/// dropped it entirely (Unknown file type / File format error): `parse_inner`
+/// only treated ASCII-whitespace-then-`<` as XML, and the engine had no XMP
+/// fallback to hand a BOM XML plist to `ProcessPlist`. The fix skips the BOM at
+/// the XML gate and routes the BOM-prefixed XML `<plist>` candidate (detected as
+/// XMP) to `ProcessPlist`; nested-dict key flattening (`TestDictAuthor`) still
+/// works. Bundled `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_utf8bom_conformance() {
+  check(
+    "plist_synth_xml_utf8bom.plist",
+    "plist_synth_xml_utf8bom.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_utf8bom.plist",
+    "plist_synth_xml_utf8bom.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R5 F2 — a nested XML `<array>` of SCALARS. `<key>outer</key>` then
+/// `<array><array><string>Deep</string></array></array>`: a value event leaves
+/// the `@keys` stack untouched (PLIST.pm:200-202), so the deeply nested scalar
+/// is stored under the bare `outer` key ID ⇒ `XML:Outer="Deep"`. The prior
+/// pass dropped nested arrays (the wildcard arm + `scalar_to_leaf`→None).
+#[test]
+fn plist_xml_nested_scalar_array_conformance() {
+  check(
+    "plist_synth_xml_nested_scalar_array.plist",
+    "plist_synth_xml_nested_scalar_array.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_nested_scalar_array.plist",
+    "plist_synth_xml_nested_scalar_array.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R5 F2 — a nested XML `<array>` containing a `<dict>`. Two `<array>`
+/// levels each insert an empty key-stack slot (PLIST.pm:191-194), so
+/// `<key>top</key>`→array→array→`{inner}` reaches tag ID `top///inner` ⇒
+/// `XML:TopInner="Val"`. Confirms the empty-slot accounting recurses through
+/// nested arrays, not just the single-array-of-dict case.
+#[test]
+fn plist_xml_nested_array_of_dict_conformance() {
+  check(
+    "plist_synth_xml_nested_array_of_dict.plist",
+    "plist_synth_xml_nested_array_of_dict.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_nested_array_of_dict.plist",
+    "plist_synth_xml_nested_array_of_dict.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R6 F2 — a HETEROGENEOUS XML `<array>` (mixed `<dict>` + scalar
+/// members). Bundled processes XML as ONE event stream with a single sticky
+/// `@keys` stack (PLIST.pm:160-202): a scalar value event NEVER extends
+/// `@keys`, so a scalar following a `<dict>` in the same `<array>` inherits the
+/// dict's last `<key>` (`<key>top</key>`→array→`{foo→A}`,`B` ⇒ both A and B
+/// land at `top//foo`, last-wins `B` under `-struct`), while a scalar BEFORE a
+/// dict keeps the array's bare key (`<key>rev</key>`→array→`S`,`{bar→D}` ⇒
+/// `Rev="S"` + `RevBar="D"`). The prior tree walker popped the dict key path
+/// before the sibling scalar (`Top="B"` / `TopFoo="A"`); the event-stream
+/// rework reproduces the sticky state. Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_mixed_array_conformance() {
+  check(
+    "plist_synth_xml_mixed_array.plist",
+    "plist_synth_xml_mixed_array.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_mixed_array.plist",
+    "plist_synth_xml_mixed_array.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R6 F3 — EMPTY XML containers surface as `XML:<Tag> = ""`. An empty
+/// `<dict/>`, `<array/>`, or empty container body fires a value event with the
+/// (un-trimmed) raw body string under the current `<key>` (PLIST.pm:200-202 via
+/// the XMP parser's no-child-elements value path), rather than being treated as
+/// pure structure and dropped. Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_empty_containers_conformance() {
+  check(
+    "plist_synth_xml_empty_containers.plist",
+    "plist_synth_xml_empty_containers.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_empty_containers.plist",
+    "plist_synth_xml_empty_containers.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R6 F1 — an ARRAY-emitted top-level `XMLFileType` still drives the MODD
+/// override. `<key>XMLFileType</key><array><string>ModdXML</string></array>`:
+/// the scalar value event does not extend `@keys`, so the EMITTED tag ID is
+/// still `XMLFileType` (PLIST.pm:200-202) and its `ModdXML` value fires the
+/// `RawConv`→`OverrideFileType('MODD')` (PLIST.pm:133-141). The fixture has a
+/// `.xml` extension (FILE_TYPE=XMP) so the override's `eq 'XMP'` guard holds ⇒
+/// `File:FileType=MODD`. The prior `is_modd_xml_root` only matched a direct
+/// root string; the override is now derived from the event-stream emission.
+/// Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_modd_array_conformance() {
+  check(
+    "plist_synth_xml_modd_array.xml",
+    "plist_synth_xml_modd_array.xml.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_modd_array.xml",
+    "plist_synth_xml_modd_array.xml.n.json",
+    false,
+  );
+}
+
+/// Codex R1 F2 — a binary `<array>` with one member of every scalar shape
+/// (`int` / `real` / `string` / `bool` / `data`). PLIST.pm:381-386 keeps
+/// every non-`HASH` referenced object, so the list preserves each member's
+/// TYPE (`[42,3.5,"hi",false,"(Binary data …)"]`) — not the prior
+/// `Vec<String>` flattening that dropped `real` / `data`.
+#[test]
+fn plist_bin_mixed_array_conformance() {
+  check(
+    "plist_synth_bin_mixed_array.plist",
+    "plist_synth_bin_mixed_array.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_mixed_array.plist",
+    "plist_synth_bin_mixed_array.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R1 F3 — binary dict keys exercising the binary-only `Tag`-prefix
+/// guard (PLIST.pm:364): a key shorter than 2 chars, one starting with a
+/// digit, and one starting with `-` are all prefixed `Tag` (`TagX`,
+/// `Tag9Abc`, `Tag-Foo`), while a normal key (`Good`) is not. The XML-only
+/// `MetaDataList//` / `//name` strips do NOT apply on the binary path.
+#[test]
+fn plist_bin_tag_prefix_conformance() {
+  check(
+    "plist_synth_bin_tag_prefix.plist",
+    "plist_synth_bin_tag_prefix.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_tag_prefix.plist",
+    "plist_synth_bin_tag_prefix.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R2 F1 — a binary `<date>` exercises the faithful
+/// `ConvertUnixTime(_, 1)` localtime branch (PLIST.pm:277, ExifTool.pm:6794).
+/// The port now ports that localtime path (jiff `TimeZone::system()` under
+/// `std`); the golden is captured `TZ=UTC` (`tools/gen_golden.sh`), so the
+/// test pins the same UTC zone — the `<date>` renders `2021:07:04
+/// 03:30:00+00:00` (UTC clock + `TimeZoneString` `+00:00`). The prior port
+/// hard-coded `+00:00` regardless of OS TZ; this fixture pins the localtime
+/// code path's UTC-host output.
+#[test]
+fn plist_bin_date_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_bin_date.plist",
+    "plist_synth_bin_date.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_date.plist",
+    "plist_synth_bin_date.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R2 F3 — an XML plist whose dict keys exercise the generic
+/// `AddTagToTable` name cleanup (ExifTool.pm:9254): a key shorter than 2
+/// chars (`x`), a digit-leading key (`9abc`) and a dash-leading key (`-foo`)
+/// are all `Tag`-prefixed on the XML path too (`XML:TagX`, `XML:Tag9Abc`,
+/// `XML:Tag-Foo`), while a normal letter-leading key (`good`) is left bare
+/// (`XML:Good`). R1 F3 had added the guard to the binary path only; bundled
+/// `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_short_keys_conformance() {
+  check(
+    "plist_synth_xml_short_keys.plist",
+    "plist_synth_xml_short_keys.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_short_keys.plist",
+    "plist_synth_xml_short_keys.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R2 F4 — a binary `<array>` of `<dict>` elements (the `cast`→array→
+/// `{name}` shape). PLIST.pm:347-377 routes each dict member's `key`/`value`
+/// pairs through `HandleTag` as a separate `parent/key` tag (`cast/name` ⇒
+/// `CastName`, accumulated across the consecutive members into a list), then
+/// PLIST.pm:384 `ref ne 'HASH'` drops the dict from the arrayref so the
+/// array's own tag is the empty list (`Cast => []`). The prior port dropped
+/// the dict children entirely (`value_to_list_leaf` returned `None`);
+/// bundled `exiftool -j -G1 -struct` is the golden — emits BOTH
+/// `PLIST:CastName` and `PLIST:Cast`.
+#[test]
+fn plist_bin_array_of_dict_conformance() {
+  check(
+    "plist_synth_bin_array_of_dict.plist",
+    "plist_synth_bin_array_of_dict.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_array_of_dict.plist",
+    "plist_synth_bin_array_of_dict.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R3 F1 — the `%PLIST::Main` static tag table is consulted by raw tag
+/// ID BEFORE dynamic name generation (PLIST.pm:203 / :358). The XML
+/// `FoundTag` path inserts an empty key-stack slot per nesting level
+/// (PLIST.pm:191-194), so `MetaDataList`→array→`{DateTimeOriginal,Duration,
+/// Geolocation/{Latitude,MapDatum}}` reaches the double-slash `MetaDataList//
+/// …` static IDs — applying the fixed `Name`, the `DateTimeOriginal`
+/// `ValueConv` (days-since-1899 ⇒ `ConvertUnixTime`, mode-independent), the
+/// `Duration` `ConvertDuration` `PrintConv` (print-mode only ⇒ `1:02:05` vs
+/// raw `3725.0`), and the `GPSLatitude` `ToDMS` `PrintConv` (`-j` DMS string
+/// vs `-n` raw float). The prior port generated dynamic `MetaDataList…` names
+/// and missed every conversion; bundled `exiftool -j/-n -G1 -struct` is the
+/// golden.
+#[test]
+fn plist_xml_static_table_conformance() {
+  check(
+    "plist_synth_xml_static_table.plist",
+    "plist_synth_xml_static_table.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_static_table.plist",
+    "plist_synth_xml_static_table.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R3 F1 — the `GPSLongitude` static-table tag, exercising the `ToDMS`
+/// hemisphere flip (`E`→`W`) on a negative value (PLIST.pm:89 `ToDMS($self,
+/// $val, 1, "E")`). Kept in a fixture WITHOUT a Latitude so the GPS
+/// `Composite:GPSPosition` (a global Composite tag, outside the PLIST
+/// module's no-`%Composite` scope) does not fire. `-j` ⇒ `122 deg 25' 9.84"
+/// W`, `-n` ⇒ raw `-122.4194`.
+#[test]
+fn plist_xml_gps_longitude_conformance() {
+  check(
+    "plist_synth_xml_gps_longitude.plist",
+    "plist_synth_xml_gps_longitude.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_gps_longitude.plist",
+    "plist_synth_xml_gps_longitude.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R3 F2 — a binary-plist integer object whose `Get64u` value exceeds
+/// `i64::MAX` (`0x8000000000000000`). PLIST.pm:35 reads integers UNSIGNED
+/// (`8 => \&Get64u`) and never sign-extends, so bundled emits the unsigned
+/// scalar `9223372036854775808`; the prior `as i64` cast wrapped it to
+/// `-9223372036854775808`. Bundled `exiftool` is the golden.
+#[test]
+fn plist_bin_uint64_conformance() {
+  check(
+    "plist_synth_bin_uint64.plist",
+    "plist_synth_bin_uint64.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_uint64.plist",
+    "plist_synth_bin_uint64.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R3 F3 — a binary `<array>` whose member is itself an `<array>`
+/// containing a `<dict>` (`cast=[[{name:"Ann"}]]`). PLIST.pm:381-383 calls
+/// `ExtractObject($et,$plistInfo,$parent)` at EVERY array level with the
+/// array's `$parent` unchanged, so the nested dict's `key`/`value` pairs
+/// STILL route through `HandleTag` as `cast/name` (⇒ `CastName`) BEFORE
+/// PLIST.pm:384 `ref ne 'HASH'` drops the dict from the inner arrayref. The
+/// R2/F4 fix only recursed into IMMEDIATE-member dicts; a dict one array level
+/// deeper was dropped by `value_to_list_leaf`. Bundled emits BOTH
+/// `PLIST:CastName="Ann"` and `PLIST:Cast=[[]]`.
+#[test]
+fn plist_bin_nested_array_dict_conformance() {
+  check(
+    "plist_synth_bin_nested_array_dict.plist",
+    "plist_synth_bin_nested_array_dict.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_nested_array_dict.plist",
+    "plist_synth_bin_nested_array_dict.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R3 F4 — a binary `<date>` with a FRACTIONAL second (0.6 s past the
+/// Apple epoch). `ConvertUnixTime` (ExifTool.pm:6780-6786) ROUNDS the
+/// fraction (`sprintf('%.0f',$frac)` with the default `dec=0` + the
+/// leading-`1` carry), so 0.6 s ⇒ `2001:01:01 00:00:01`; the prior port
+/// `trunc()`'d ⇒ `…00:00:00`. `TZ=UTC`-pinned (`pin_utc`) for a
+/// host-independent `+00:00` offset. Bundled `exiftool` is the golden.
+#[test]
+fn plist_bin_frac_date_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_bin_frac_date.plist",
+    "plist_synth_bin_frac_date.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_frac_date.plist",
+    "plist_synth_bin_frac_date.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F1 — a binary `<date>` with an EXACT half-second fraction. Perl's
+/// `sprintf('%.0f', $frac)` (ExifTool.pm:6783) rounds half-to-EVEN, so an
+/// exact `.5` does NOT carry: `apple=0.5` ⇒ `2001:01:01 00:00:00`. The prior
+/// port used `f64::round()` (half-AWAY-from-zero) which mis-rounded this to
+/// `…00:00:01`. `TZ=UTC`-pinned; bundled `exiftool` is the golden
+/// (`ConvertUnixTime(0.5 + 11323*24*3600, 1)` ⇒ `2001:01:01 00:00:00+00:00`).
+#[test]
+fn plist_bin_halfeven_date_half_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_bin_halfeven_date_half.plist",
+    "plist_synth_bin_halfeven_date_half.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_halfeven_date_half.plist",
+    "plist_synth_bin_halfeven_date_half.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F1 — a binary `<date>` just PAST the half-second tie
+/// (`apple=0.5000001`), which DOES round up to `2001:01:01 00:00:01`. Pairs
+/// with the exact-tie case to pin both sides of the half-to-even boundary.
+#[test]
+fn plist_bin_halfeven_date_halfup_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_bin_halfeven_date_halfup.plist",
+    "plist_synth_bin_halfeven_date_halfup.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_halfeven_date_halfup.plist",
+    "plist_synth_bin_halfeven_date_halfup.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F1 — a binary `<date>` with a NEGATIVE half-second fraction
+/// (`apple=-0.5`). ExifTool.pm:6782 folds the negative fraction into `[0,1)`
+/// by borrowing a second (true floor), then half-to-even leaves `…:00` (no
+/// carry) ⇒ one second before the epoch, `2000:12:31 23:59:59`.
+#[test]
+fn plist_bin_halfeven_date_neghalf_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_bin_halfeven_date_neghalf.plist",
+    "plist_synth_bin_halfeven_date_neghalf.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_halfeven_date_neghalf.plist",
+    "plist_synth_bin_halfeven_date_neghalf.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F2 — an XML MODD `DateTimeOriginal` with a POSITIVE fractional
+/// day (`25569 + 0.6/86400`). PLIST.pm:73 `ConvertUnixTime(($val - 25569) *
+/// 24 * 3600)` is applied to the FLOAT; the prior port truncated to an i64
+/// first, dropping the fraction (and mis-firing the `$time == 0` sentinel for
+/// sub-second values). Bundled `exiftool` ⇒ `1970:01:01 00:00:01`.
+#[test]
+fn plist_xml_frac_dto_pos_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_xml_frac_dto_pos.plist",
+    "plist_synth_xml_frac_dto_pos.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_frac_dto_pos.plist",
+    "plist_synth_xml_frac_dto_pos.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F2 — an XML MODD `DateTimeOriginal` whose fractional day lands at
+/// the half-second (`25569 + 0.5/86400`; the IEEE-754 value is ~0.5000001 s,
+/// not a true tie, so it rounds UP) ⇒ `1970:01:01 00:00:01`.
+#[test]
+fn plist_xml_frac_dto_half_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_xml_frac_dto_half.plist",
+    "plist_synth_xml_frac_dto_half.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_frac_dto_half.plist",
+    "plist_synth_xml_frac_dto_half.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R4 F2 — an XML MODD `DateTimeOriginal` with a NEGATIVE fractional
+/// day (`25569 - 0.6/86400`). The float is `-0.5999998888` s; ExifTool floors
+/// to `$itime = -1` and rounds the folded fraction ⇒ `1969:12:31 23:59:59`.
+#[test]
+fn plist_xml_frac_dto_neg_conformance() {
+  pin_utc();
+  check(
+    "plist_synth_xml_frac_dto_neg.plist",
+    "plist_synth_xml_frac_dto_neg.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_frac_dto_neg.plist",
+    "plist_synth_xml_frac_dto_neg.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R20 F1 — AAE `adjustmentData` `CompressedPLIST` sub-directory.
+///
+/// An AAE file's `adjustmentData` key carries a (potentially raw-DEFLATE-
+/// compressed) binary PLIST payload — bundled `PLIST.pm:142-146`
+/// `CompressedPLIST => 1` + `SubDirectory => { TagTable => 'PLIST::Main' }`.
+/// `FoundTag` (PLIST.pm:228-241) skips inflate when the payload is already
+/// `bplist00`-prefixed (`$$val !~ /^bplist00/`), otherwise inflates via
+/// `IO::Uncompress::RawInflate::rawinflate`. The inflated/raw bytes re-enter
+/// `ProcessBinaryPLIST`, whose `SET_GROUP1='PLIST'` (PLIST.pm:484) scopes the
+/// resulting tags into the family-1 `PLIST` group even when the outer XML
+/// plist's siblings remain under `XML`.
+///
+/// This fixture's payload IS already `bplist00`-prefixed (the AAE
+/// `SlowMotionRegions*` family); the port hits the bundled short-circuit and
+/// dispatches the embedded binary plist via [`process_compressed_plist`]
+/// without engaging `miniz_oxide`'s inflate path. The dep is still wired for
+/// the truly-DEFLATE'd class (an AAE producer that compresses); the
+/// PLIST.pm:228 short-circuit keeps the no-inflate path byte-identical to
+/// bundled. Class-sweep verified — `adjustmentData` is the SOLE
+/// `CompressedPLIST => 1` entry in `%PLIST::Main`
+/// (`rg -n 'CompressedPLIST' PLIST.pm` = 2 matches, both this entry).
+#[test]
+fn plist_aae_compressed_conformance() {
+  check(
+    "plist_aae_compressed.aae",
+    "plist_aae_compressed.aae.json",
+    true,
+  );
+  check(
+    "plist_aae_compressed.aae",
+    "plist_aae_compressed.aae.n.json",
+    false,
+  );
+}
+
+/// Codex R20 F2 — legacy UCS-2BE PLIST recognition arm (PLIST.pm:494-499).
+///
+/// A `.plist` file whose body begins `\xfe\xff\x00` (BOM + first-char-NUL —
+/// `$$et{FILE_EXT} eq 'PLIST'` + `$$dataPt =~ /^\xfe\xff\x00/`) is recognized
+/// by `ProcessPLIST` as a legacy UCS-2BE-encoded plist. Bundled emits
+/// `$et->Error('Old PLIST format currently not supported')` (PLIST.pm:498)
+/// then `$result = 1` (PLIST.pm:499) — the Error is family-0 (the bundled
+/// call sits OUTSIDE the binary-PLIST `SET_GROUP1='PLIST'` scope at :484), so
+/// the JSON renders `ExifTool:Error` with NO `File:FileType` triplet
+/// (the UCS-2BE branch never calls `SetFileType`). The port routes this at
+/// the [`finalization_error`] seam (`src/parser.rs`): `ProcessPlist::parse`
+/// rejects the body (neither `bplist0` nor `<`), every other candidate fails
+/// the actual decode, and finalization short-circuits the `File format error`
+/// arm to bundled's exact wording. Class-sweep verified — UCS-2BE is the
+/// only XML-encoding recognition special case after UTF-8 BOM
+/// (`rg -n 'FILE_EXT|encoding|BOM|UTF|UCS' PLIST.pm` = the UTF-8 charset
+/// decode at :186 + the UCS-2BE-string binary type-6 at :308-311 + this
+/// recognition arm; JSON branch is separate, handled at PLIST.pm:490-493).
+#[test]
+fn plist_ucs2be_legacy_conformance() {
+  check(
+    "plist_synth_ucs2be_legacy.plist",
+    "plist_synth_ucs2be_legacy.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_ucs2be_legacy.plist",
+    "plist_synth_ucs2be_legacy.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R20 F3 — binary dict CONSECUTIVE-duplicate-key list-fold
+/// (PLIST.pm:362-378). A binary `<dict>` whose `[(key, value)…]` sequence has
+/// adjacent same-key emissions accumulates them into one `List => 1` arrayref
+/// via `LastPListTag` / `LIST_TAGS` (PLIST.pm:373-376), but the prior port's
+/// `walk_tree` Dict branch emitted children straight into `out` — TagMap's
+/// last-wins-by-name then silently discarded the first value. The fix runs
+/// the dict-level emissions through a scratch buffer + `fold_consecutive
+/// _lists`, so a root binary dict `{ a: v1, a: v2, b: v3 }` emits
+/// `PLIST:TagA=[v1, v2], PLIST:TagB=v3` (matches the oracle).
+#[test]
+fn plist_bin_dup_consec_conformance() {
+  check(
+    "plist_synth_bin_dup_consec.plist",
+    "plist_synth_bin_dup_consec.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_dup_consec.plist",
+    "plist_synth_bin_dup_consec.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R20 F3 (class-sweep) — consecutive-duplicate list-fold inside a
+/// NESTED binary dict. Class-sweep proof that the dict-level fold applies at
+/// EVERY nesting level: an outer dict `{ x: { a: v1, a: v2 }, b: v3 }` must
+/// emit `PLIST:XA=[v1, v2], PLIST:TagB=v3` — the inner dict's consecutive
+/// `a, a` pair folds at the inner level, the outer dict has nothing else
+/// adjacent to fold. The scratch+fold is applied to EVERY [`PlistValue::Dict`]
+/// in the binary-plist walker; dicts nested inside arrays already had this via
+/// the array branch's `child_scratch` (Codex R2 F4), so the class is fully
+/// covered.
+#[test]
+fn plist_bin_dup_nested_conformance() {
+  check(
+    "plist_synth_bin_dup_nested.plist",
+    "plist_synth_bin_dup_nested.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_dup_nested.plist",
+    "plist_synth_bin_dup_nested.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R20 F3 (negative case) — NON-consecutive same-name duplicates do NOT
+/// fold. Bundled's `LastPListTag` / `LIST_TAGS` run-break (PLIST.pm:373-375)
+/// drops the accumulator when the next emission is a different tagInfo; a
+/// later re-emission of the original tag DOES NOT resume the run. With
+/// dynamic-name `List => 1` tags, the second same-name `HandleTag` then
+/// REPLACES the prior value (oracle behavior: a root dict
+/// `{ a: v1, b: v2, a: v3 }` ⇒ `PLIST:TagA=v3, PLIST:TagB=v2`). The port
+/// matches via TagMap's last-wins-in-place insert — `fold_consecutive_lists`
+/// is a no-op for non-adjacent same-name pairs, so the second `TagA`
+/// emission overwrites the first.
+#[test]
+fn plist_bin_dup_nonconsec_conformance() {
+  check(
+    "plist_synth_bin_dup_nonconsec.plist",
+    "plist_synth_bin_dup_nonconsec.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_dup_nonconsec.plist",
+    "plist_synth_bin_dup_nonconsec.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R7 F1 — a binary-plist type-8 UID whose byte width `%readProc` does
+/// NOT cover (5/9 bytes) is rendered as a full `0x…` lower-hex string of ALL
+/// its bytes (PLIST.pm:290 `"0x" . unpack 'H*', $buff`). The fixtures carry a
+/// 5-byte UID `11 22 33 44 55` ⇒ `PLIST:Uid="0x1122334455"` and a 9-byte UID
+/// `11..99` ⇒ `"0x112233445566778899"`.
+#[test]
+fn plist_bin_uid5_conformance() {
+  check(
+    "plist_synth_bin_uid5.plist",
+    "plist_synth_bin_uid5.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_uid5.plist",
+    "plist_synth_bin_uid5.plist.n.json",
+    false,
+  );
+}
+
+#[test]
+fn plist_bin_uid9_conformance() {
+  check(
+    "plist_synth_bin_uid9.plist",
+    "plist_synth_bin_uid9.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_uid9.plist",
+    "plist_synth_bin_uid9.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R7 F1 — a 16-byte type-8 UID is rendered as an ASF GUID via
+/// `Image::ExifTool::ASF::GetGUID` (PLIST.pm:286-288, ASF.pm:525-533): the
+/// first 4/2/2-byte fields are byte-reversed (`VvvNN`→`NnnNN`) and the result
+/// is hex-formatted `8-4-4-4-12` upper-case. The fixture's UID bytes
+/// `00 11 22 … FF` ⇒ `PLIST:Uid="33221100-5544-7766-8899-AABBCCDDEEFF"`.
+#[test]
+fn plist_bin_uid16_conformance() {
+  check(
+    "plist_synth_bin_uid16.plist",
+    "plist_synth_bin_uid16.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_uid16.plist",
+    "plist_synth_bin_uid16.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R7 F2 — a leading XML comment containing a complete fake
+/// `<plist>…</plist>` must NOT shadow the real root: the token-aware tag
+/// scan (`next_markup`) skips the comment, so only the real
+/// `<key>Real</key>` is extracted (`XML:Real="RealValue"`; the `Fake` tag
+/// never appears).
+#[test]
+fn plist_xml_comment_fake_root_conformance() {
+  check(
+    "plist_synth_xml_comment_fake_root.plist",
+    "plist_synth_xml_comment_fake_root.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_comment_fake_root.plist",
+    "plist_synth_xml_comment_fake_root.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R7 F2 — a `<!-- <array> … </array> -->` comment INSIDE an `<array>`
+/// must not move the nesting depth: `match_close_offset` token-skips the
+/// comment, so the real `</array>` is matched and the sibling
+/// `<key>After</key>` is still parsed (`XML:Items="beta"`,
+/// `XML:After="tail"`).
+#[test]
+fn plist_xml_comment_in_container_conformance() {
+  check(
+    "plist_synth_xml_comment_in_container.plist",
+    "plist_synth_xml_comment_in_container.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_comment_in_container.plist",
+    "plist_synth_xml_comment_in_container.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R8 F1 — an XML comment INSIDE a scalar value must NOT leak into the
+/// emitted value. XMP.pm:3847 sets `$wasComment` when the close-scan crosses
+/// a comment; XMP.pm:4181 then strips `<!--…-->` from the leaf value before
+/// `&$foundProc`. So `<string>foo<!-- <array/> -->bar</string>` decodes to
+/// `foobar` (the comment text is dropped). Bundled `exiftool -j -G1 -struct`
+/// golden — `XML:Title="foobar"`.
+#[test]
+fn plist_xml_scalar_comment_conformance() {
+  check(
+    "plist_synth_xml_scalar_comment.plist",
+    "plist_synth_xml_scalar_comment.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_scalar_comment.plist",
+    "plist_synth_xml_scalar_comment.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R8 F2 — a whitespace-wrapped `<data>` payload picks the Base64
+/// branch, not hex. PLIST.pm:172 tests the unescaped value DIRECTLY with
+/// `/^[0-9a-f]+$/` (no whitespace removal), so `<data> 48656c6c6f </data>`
+/// FAILS the lower-hex test (leading/trailing spaces) and falls through to
+/// `DecodeBase64` (PLIST.pm:177-178) — yielding a 7-byte payload, NOT the
+/// 5-byte hex decode of `Hello`. Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_data_ws_hex_conformance() {
+  check(
+    "plist_synth_xml_data_ws_hex.plist",
+    "plist_synth_xml_data_ws_hex.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_data_ws_hex.plist",
+    "plist_synth_xml_data_ws_hex.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R8 F3 — the slowMotion `*Flags` tags carry a BITMASK `PrintConv`
+/// (PLIST.pm:98-104 / :111-117). `DecodeBits` (ExifTool.pm:6374) prints set
+/// bits 0-4 as `Valid` / `Has been rounded` / `Positive infinity` /
+/// `Negative infinity` / `Indefinite`, joined with `, `. `flags=1` ⇒
+/// `Valid`; `flags=3` ⇒ `Valid, Has been rounded`. The `-n` snapshot shows
+/// the raw integers. Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_slowmotion_flags_conformance() {
+  check(
+    "plist_synth_xml_slowmotion_flags.plist",
+    "plist_synth_xml_slowmotion_flags.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_slowmotion_flags.plist",
+    "plist_synth_xml_slowmotion_flags.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R9 F1 — XMP.pm:4181 strips inline comments from a leaf via
+/// `$val =~ s/<!--.*?-->//g`, a substitution with NO `/s` modifier. Perl's
+/// regex `.` therefore does NOT match a newline: a `<!--…-->` run whose span
+/// crosses a newline is left VERBATIM, while a single-line run is removed.
+/// The fixture exercises both in a `<string>` value (`foo<!--\n…\n-->bar`
+/// preserved, `aaa<!-- one line -->bbb` ⇒ `aaabbb`) AND in a `<key>` name
+/// (`k<!--\n…\n-->ey` survives comment-stripping, then the auto-name cleanup
+/// drops the illegal `<`/`!`/`>`/`\n` ⇒ `K--Mlkey--Ey`). Bundled
+/// `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_multiline_comment_conformance() {
+  check(
+    "plist_synth_xml_multiline_comment.plist",
+    "plist_synth_xml_multiline_comment.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_multiline_comment.plist",
+    "plist_synth_xml_multiline_comment.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R9 F2 — the slowMotion `*Flags` BITMASK `PrintConv` runs `DecodeBits`
+/// (ExifTool.pm:6374) over the scalar leaf REGARDLESS of XML plist leaf type.
+/// `split ' ', $vals` then numifies each word the Perl way, so a `<string>`
+/// flags value is decoded just like an `<integer>`: `<string>3</string>` ⇒
+/// `Valid, Has been rounded`; `<string>abc</string>` numifies to 0 ⇒
+/// `(none)`. The `-n` snapshot keeps the raw leaf (`3` / `abc`). Bundled
+/// `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_slowmotion_flags_string_conformance() {
+  check(
+    "plist_synth_xml_slowmotion_flags_string.plist",
+    "plist_synth_xml_slowmotion_flags_string.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_slowmotion_flags_string.plist",
+    "plist_synth_xml_slowmotion_flags_string.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R10 F1 — XMP.pm:4181 `s/<!--.*?-->//g` strips an inline comment
+/// from a leaf. The port walks `<!--…-->` candidates one BYTE at a time;
+/// a non-ASCII char inside an inline single-line comment (`Ti<!-- café
+/// -->tle` in a `<key>`, `foo<!-- résumé -->bar` in a `<string>`) used to
+/// make a `str` slice land mid-UTF-8-char and PANIC. The scan is now
+/// byte-only — both comments are stripped, the `<key>` becomes `Title`
+/// (PLIST.pm:188 Tag-prefix normalization) and `XML:Title` ⇒ `foobar`.
+/// Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_comment_non_ascii_conformance() {
+  check(
+    "plist_synth_xml_comment_non_ascii.plist",
+    "plist_synth_xml_comment_non_ascii.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_comment_non_ascii.plist",
+    "plist_synth_xml_comment_non_ascii.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R10 F2 — the slowMotion `*Flags` `DecodeBits` (ExifTool.pm:6379
+/// `$val & (1 << $i)`) numifies each `split ' '` word the way Perl's `&`
+/// does: a numeric prefix WITH an exponent. `<string>1e2</string>` numifies
+/// to 100 (bits 2,5,6 ⇒ `Positive infinity, [5], [6]`), NOT `1` as a
+/// digit-only scan would give; `<string>-1e2</string>` ⇒ -100 ⇒ low-32
+/// `0xFFFFFF9C`. The `-n` snapshot keeps the raw leaf (`1e2` / `-1e2`).
+/// Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_slowmotion_flags_exponent_conformance() {
+  check(
+    "plist_synth_xml_slowmotion_flags_exponent.plist",
+    "plist_synth_xml_slowmotion_flags_exponent.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_slowmotion_flags_exponent.plist",
+    "plist_synth_xml_slowmotion_flags_exponent.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R10 F2 — a slowMotion `*Flags` word that overflows the integer
+/// types. `<string>18446744073709551615</string>` (`u64::MAX`) stays EXACT
+/// through Perl's UV — `&` sees every low-32 bit set (all five names +
+/// `[5]`..`[31]`), where an `i64`-only parse would overflow to `0` ⇒
+/// `(none)`. `<string>9e99</string>` overflows to a double whose `&`
+/// saturates the UV high to all-ones — same all-bits decode. The `-n`
+/// snapshot keeps the raw leaf. Bundled `exiftool -j -G1 -struct` golden.
+#[test]
+fn plist_xml_slowmotion_flags_overflow_conformance() {
+  check(
+    "plist_synth_xml_slowmotion_flags_overflow.plist",
+    "plist_synth_xml_slowmotion_flags_overflow.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_slowmotion_flags_overflow.plist",
+    "plist_synth_xml_slowmotion_flags_overflow.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R15 F1 — a binary type-4 `data` object AT the 1 000 000-byte
+/// threshold. PLIST.pm:300 (`if ($size < 1000000 or $et->Options('Binary'))`)
+/// reads the payload only for `$size < 1000000`; AT `1000000` (and without
+/// `-b`) PLIST.pm:302-303 stores the literal `"Binary data $size bytes"`
+/// placeholder and never `$raf->Read`s the bytes — note the `else` branch is
+/// also NOT bounds-checked, so the fixture can claim 1 000 000 bytes while
+/// being only 57 bytes long. The default JSON path renders the placeholder
+/// `(Binary data 1000000 bytes, use -b option to extract)` reporting the TRUE
+/// size (the `exiftool` script wraps the PLIST.pm-stored scalar verbatim,
+/// exiftool:3983-3984). The port now stores a length-only `PlistLeaf::DataLen`
+/// — never copying the multi-MB payload. Bundled `exiftool -j -G1 -struct`
+/// golden; identical in `-n`.
+#[test]
+fn plist_bin_data_boundary_conformance() {
+  check(
+    "plist_synth_bin_data_boundary.plist",
+    "plist_synth_bin_data_boundary.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_data_boundary.plist",
+    "plist_synth_bin_data_boundary.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R15 F1 — a binary type-4 `data` object ABOVE the 1 000 000-byte
+/// threshold (claims 2 000 000 bytes). Same PLIST.pm:300-303 placeholder path
+/// as the boundary case: `$size >= 1000000` ⇒ the length-only
+/// `"Binary data 2000000 bytes"` scalar, no `$raf->Read`. The pre-fix port
+/// always sliced `dec.data.get(cursor..end)?` and `.to_vec()`'d the payload —
+/// for this truncated fixture that slice is out of range, so the pre-fix code
+/// also DROPPED the tag; the fix both avoids the copy AND mirrors bundled's
+/// no-bounds-check `else` branch ⇒ `PLIST:Blob = (Binary data 2000000 bytes,
+/// use -b option to extract)`. Bundled `exiftool -j -G1 -struct` golden;
+/// identical in `-n`.
+#[test]
+fn plist_bin_data_oversize_conformance() {
+  check(
+    "plist_synth_bin_data_oversize.plist",
+    "plist_synth_bin_data_oversize.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_bin_data_oversize.plist",
+    "plist_synth_bin_data_oversize.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R17 F1 — an XML `<real>` carrying a NON-FINITE word (`inf`, `-inf`,
+/// `nan`). PLIST.pm's XML path (`FoundTag`, PLIST.pm:171-198) routes `<real>`
+/// into the final `else` branch (PLIST.pm:184-186 `$val = $et->Decode($val,
+/// 'UTF8')`) — a charset decode only, with NO numeric type-parse: the
+/// UNESCAPED scalar text is stored verbatim. The pre-fix port `parse::<f64>()`'d
+/// the body, so `<real>inf</real>` became a non-finite `f64` and serialized as
+/// the titlecase Perl-NV string `Inf` / `-Inf` / `NaN` — a VALUE change vs the
+/// oracle's verbatim lowercase `"inf"` / `"-inf"` / `"nan"` (standard plist
+/// writers emit lowercase for a non-finite float, so this is real input). The
+/// fix stores `PlistValue::Str` and never type-parses on the XML path ⇒
+/// `XML:RealInf="inf"`, `XML:RealNegInf="-inf"`, `XML:RealNan="nan"`,
+/// identical for `-j` and `-n`. Bundled `exiftool -j -G1 -struct` is the
+/// golden.
+#[test]
+fn plist_xml_real_nonfinite_conformance() {
+  check(
+    "plist_synth_xml_real_nonfinite.plist",
+    "plist_synth_xml_real_nonfinite.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_real_nonfinite.plist",
+    "plist_synth_xml_real_nonfinite.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R17 F1 (class-sweep) — XML `<real>` / `<integer>` raw-text fidelity.
+/// PLIST.pm's XML path never canonicalizes a numeric leaf (PLIST.pm:184-186),
+/// so a trailing zero (`<real>1.50</real>`), an exponent form (`<real>1.4e2
+/// </real>`), a whitespace-wrapped body (`<real> 3.0 </real>`), a leading zero
+/// (`<integer>007</integer>`) and a hex-looking value (`<integer>0x10
+/// </integer>`) are all stored as the verbatim scalar. The pre-fix port's
+/// `.trim().parse::<f64>()` / `parse::<i64>()` discarded the trailing zero
+/// (`1.50`→`1.5`), stripped the surrounding whitespace AND re-spelled the
+/// number (`" 3.0 "`→`3`); `007` happened to survive only because `i64` parse
+/// re-stringified it back — but `0x10` failed the parse and was already a
+/// string. After the fix every XML numeric leaf is `PlistValue::Str`: the
+/// value-semantic JSON comparator matches a numeric-shaped string against the
+/// oracle's bare-number token (`"1.50"` ≈ `1.50`, `"1.4e2"` ≈ `1.4e2`) while a
+/// non-JSON-numeric value (`"007"`, `"0x10"`, `" 3.0 "`) stays a quoted string
+/// both sides. Bundled `exiftool -j -G1 -struct` is the golden.
+#[test]
+fn plist_xml_integer_real_raw_conformance() {
+  check(
+    "plist_synth_xml_integer_real_raw.plist",
+    "plist_synth_xml_integer_real_raw.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_integer_real_raw.plist",
+    "plist_synth_xml_integer_real_raw.plist.n.json",
+    false,
+  );
+}
+
+/// Codex R17 F1 (XML-leaf class-sweep) — an XML `<date>` body reaches
+/// `ConvertXMPDate` whitespace-VERBATIM. PLIST.pm:180-181 calls
+/// `ConvertXMPDate($val)` on the raw unescaped scalar, and the XMP read-path
+/// that feeds `FoundTag` only trims (`s/^\s+//;s/\s+$//`) for an
+/// `rdf:Description` prop (XMP.pm:4178-4181) — a plist `<date>` prop is never
+/// `rdf:Description`, so no trim runs. `ConvertXMPDate`'s rewrite regex
+/// `^(\d{4})-…$` is anchored: a clean body (`<date>2013-02-22T12:49:10Z</date>`)
+/// matches and is rewritten to EXIF form (`2013:02:22 12:49:10Z`), but a
+/// leading/trailing-whitespace body (`<date> … </date>`, `<date>\n…\n</date>`)
+/// FAILS the match and passes through UNCHANGED with separators intact. The
+/// pre-fix port did `convert_xmp_date(unescape_xml(inner).trim())` — the extra
+/// `.trim()` made the whitespace forms match, emitting `"2013:02:22 …"` and
+/// changing the VALUE. The fix drops the `.trim()` ⇒ `XML:DateWs` /
+/// `XML:DateNl` keep their verbatim whitespace and raw `-`/`T` separators,
+/// only `XML:DateClean` is rewritten. Bundled `exiftool -j -G1 -struct` is the
+/// golden.
+#[test]
+fn plist_xml_date_raw_conformance() {
+  check(
+    "plist_synth_xml_date_raw.plist",
+    "plist_synth_xml_date_raw.plist.json",
+    true,
+  );
+  check(
+    "plist_synth_xml_date_raw.plist",
+    "plist_synth_xml_date_raw.plist.n.json",
     false,
   );
 }

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "plist_synth_xml_modd_content.xml",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MODD",
+  "File:FileTypeExtension": "modd",
+  "File:MIMEType": "application/xml",
+  "XML:XMLFileType": "ModdXML",
+  "XML:SomeTag": "Hello"
+}]

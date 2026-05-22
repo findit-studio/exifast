@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>slowMotion</key>
+  <dict>
+    <key>regions</key>
+    <dict>
+      <key>timeRange</key>
+      <dict>
+        <key>start</key>
+        <dict>
+          <key>flags</key>
+          <string>3</string>
+        </dict>
+        <key>duration</key>
+        <dict>
+          <key>flags</key>
+          <string>abc</string>
+        </dict>
+      </dict>
+    </dict>
+  </dict>
+</dict>
+</plist>

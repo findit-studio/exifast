@@ -1,0 +1,22 @@
+[{
+  "SourceFile": "plist_aae_compressed.aae",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AAE",
+  "File:FileTypeExtension": "AAE",
+  "File:MIMEType": "application/vnd.apple.photos",
+  "XML:AdjustmentBaseVersion": 0,
+  "XML:AdjustmentEditorBundleID": "",
+  "XML:AdjustmentFormatIdentifier": "com.apple.video.slomo",
+  "XML:AdjustmentFormatVersion": 1.1,
+  "XML:AdjustmentRenderTypes": 0,
+  "PLIST:SlowMotionRegionsStartTimeFlags": 1,
+  "PLIST:SlowMotionRegionsStartTimeValue": 6296250000,
+  "PLIST:SlowMotionRegionsStartTimeScale": 1000000000,
+  "PLIST:SlowMotionRegionsStartTimeEpoch": 0,
+  "PLIST:SlowMotionRegionsDurationFlags": 1,
+  "PLIST:SlowMotionRegionsDurationValue": 29382500000,
+  "PLIST:SlowMotionRegionsDurationTimeScale": 1000000000,
+  "PLIST:SlowMotionRegionsDurationEpoch": 0,
+  "PLIST:SlowMotionRegions": [],
+  "PLIST:SlowMotionRate": 0.125
+}]

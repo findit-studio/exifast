@@ -343,6 +343,26 @@ fn finalization_error(name: &str, data: &[u8]) -> Option<String> {
   if data.is_empty() {
     return Some("File is empty".to_string()); // ExifTool.pm:3086
   }
+  // PLIST.pm:494-499 — `$$et{FILE_EXT} eq 'PLIST'` and `^\xfe\xff\x00`: the
+  // legacy UCS-2BE PLIST recognition arm of `ProcessPLIST`. Bundled emits
+  // `$et->Error('Old PLIST format currently not supported')` with NO preceding
+  // `SetFileType` (the branch never sets the file type, PLIST.pm:498-499 only
+  // calls `Error` and `$result = 1`), so the resulting JSON carries
+  // `ExifTool:Error` and NO `File:FileType` triplet (oracle-verified). In our
+  // engine, `ProcessPlist::parse` returns `Ok(None)` for this input (XML and
+  // binary gates both reject it), so the candidate loop exhausts without a
+  // claim and lands here — short-circuit the `File format error` arm below
+  // with bundled's exact wording. Routed at the finalization-error seam so the
+  // engine's per-format dispatch needn't model a fourth `FileTypeFinalize` mode
+  // (suppress-triplet), and faithful to PLIST.pm:494's `$$et{FILE_EXT} eq
+  // 'PLIST'` guard (a non-`.plist` extension with the same magic would NOT
+  // fire this branch in bundled).
+  #[cfg(feature = "plist")]
+  if crate::filetype::file_ext_for_name(name).as_deref() == Some("PLIST")
+    && data.starts_with(&[0xfe, 0xff, 0x00])
+  {
+    return Some("Old PLIST format currently not supported".to_string());
+  }
   // ExifTool.pm:3088 `my $ch = substr($buff, 0, 1)`.
   let ch = data[0];
   // ExifTool.pm:3003 `$raf->Read($buff, $testLen)` — `$buff` is the first
@@ -469,8 +489,40 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   // Fresh per-candidate cross-format state (mirrors `parse_bytes`).
   let mut shared = crate::format_parser::SharedFlags::new();
 
+  // ExifTool's `$$self{FILE_TYPE}` is whatever module FIRST claims the file —
+  // the FIRST detection candidate (ExifTool.pm:3035-3045 `SetFileType` sets
+  // FILE_TYPE on the first recognized type). The PLIST `XMLFileType=ModdXML`
+  // override (PLIST.pm:136) is gated on `FILE_TYPE eq 'XMP'`: an XML plist
+  // reached via an `.xml`-family extension (first candidate `XMP`), NOT via an
+  // explicit `.plist`/`.modd` extension (first candidate `PLIST`).
+  let file_type_is_xmp = detection_candidates(name, data)
+    .next()
+    .is_some_and(|c| c.file_type() == "XMP");
+
   for cand in detection_candidates(name, data) {
     let ft = cand.file_type();
+    // ExifTool.pm:3035-3045 / XMP.pm:4369-4387 — the XMP module's content sniff
+    // routes an XML `<plist>` (or `<!DOCTYPE plist>`) to `ProcessPLIST`. Bundled
+    // reaches a UTF-8-BOM-prefixed XML plist ONLY this way: its XMP `%magicNumber`
+    // (ExifTool.pm:1045 `…(\xef\xbb\xbf)?…\s*<`) accepts the BOM that the PLIST
+    // `%magicNumber` (ExifTool.pm:1015 `(bplist0|\s*<|…)`) does not, so XMP is the
+    // first/only candidate; `ProcessXMP` then `SetFileType('PLIST',
+    // 'application/xml')` and hands the body to `PLIST::FoundTag`. This port has
+    // no standalone XMP parser, so replicate that hop here: when the candidate is
+    // `XMP` and the content is an XML `<plist>`, finalize as `PLIST` and dispatch
+    // to `ProcessPlist`. `magic()` stays a faithful 1:1 of `%magicNumber` (the
+    // PLIST gate is unchanged); the BOM tolerance lives only in this XMP→PLIST
+    // route, exactly where bundled's lives. (A non-BOM XML plist is unaffected:
+    // `ProcessPlist` accepts it here just as it did at the later PLIST candidate.)
+    #[cfg(feature = "plist")]
+    let ft = if ft == "XMP"
+      && any_parser_for("XMP").is_none()
+      && crate::formats::plist::xml_content_is_plist(data)
+    {
+      "PLIST"
+    } else {
+      ft
+    };
     // ExifTool.pm:3046-3057 — recognized but UNSUPPORTED ⇒ SetFileType + Warn,
     // terminal (no parser runs, loop stops, post-loop Error suppressed).
     if crate::filetype::module_for_type(ft).is_unsupported() {
@@ -636,6 +688,53 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
             "File:MIMEType".into(),
             Value::String(mime.to_string()),
           );
+        }
+        FileTypeFinalize::DetectedWithMime(mime) => {
+          // SetFileType($baseType, $mimeType) — the FileType + FileTypeExtension
+          // are the detected triplet's, but the MIME is the explicit 2nd arg
+          // (binary PLIST: `SetFileType('PLIST', 'application/x-plist')`,
+          // PLIST.pm:483). `resolve_file_type` with no explicit type yields the
+          // detected FileType/Extension; we replace ONLY the MIME.
+          let t = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(mime.to_string()),
+          );
+        }
+      }
+
+      // ----- PLIST content file-type override (PLIST.pm:41-43, :133-141, :225) -
+      // An XML plist may carry a content-derived `OverrideFileType` target: the
+      // `%plistType` table (`adjustmentBaseVersion => 'AAE'`, PLIST.pm:42/:225) or
+      // the `XMLFileType == ModdXML` RawConv (`MODD`, PLIST.pm:136). Both are
+      // keyed on the EXACT raw tag ID (computed in the typed Meta) and fire ONLY
+      // when `$$self{FILE_TYPE} eq 'XMP'` (PLIST.pm:136/:225) — i.e. the file was
+      // reached via the `.xml`-family (XMP) extension, not an explicit
+      // `.plist`/`.modd`/`.aae`. The override replaces FileType + FileTypeExtension
+      // in place, plus MIMEType when the target has a `%mimeType` entry (`AAE` ⇒
+      // `application/vnd.apple.photos`; `MODD` has none, so the XML plist's
+      // `application/xml` is kept — ExifTool.pm:9724 `... if $mimeType`). Skipped
+      // with the rest of the `File:*` triplet after an unknown leading header.
+      #[cfg(feature = "plist")]
+      if let crate::format_parser::AnyMeta::Plist(m) = &meta
+        && file_type_is_xmp
+        && let Some(ov) = m.content_override()
+      {
+        let (ov_ft, ov_ext, ov_mime) = resolve_override_file_type(ov.as_str(), print_conv_enabled);
+        obj.insert("File:FileType".into(), Value::String(ov_ft));
+        obj.insert(
+          "File:FileTypeExtension".into(),
+          serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
+        );
+        if let Some(mime) = ov_mime {
+          obj.insert("File:MIMEType".into(), Value::String(mime));
         }
       }
 

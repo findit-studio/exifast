@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "plist_synth_xml_short_keys.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/xml",
+  "XML:TagX": "shortkey",
+  "XML:Tag9Abc": "digitlead",
+  "XML:Tag-Foo": "dashlead",
+  "XML:Good": "normal"
+}]

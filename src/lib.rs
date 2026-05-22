@@ -225,6 +225,8 @@ pub use formats::mpeg::ProcessMpegAudio;
 pub use formats::mxf::ProcessMxf;
 #[cfg(feature = "ogg")]
 pub use formats::ogg::ProcessOgg;
+#[cfg(feature = "plist")]
+pub use formats::plist::ProcessPlist;
 #[cfg(feature = "quicktime")]
 pub use formats::quicktime::ProcessMov;
 #[cfg(feature = "real")]
@@ -298,6 +300,28 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
   let mut shared = SharedFlags::new();
   for cand in filetype::detection_candidates("", bytes) {
     let ft = cand.file_type();
+    // ExifTool.pm:3035-3045 / XMP.pm:4369-4387 — the XMP module's content sniff
+    // routes an XML `<plist>` (or `<!DOCTYPE plist>`) to `ProcessPLIST`. With an
+    // empty filename, a UTF-8-BOM-prefixed XML plist is reached ONLY this way:
+    // its XMP `%magicNumber` (ExifTool.pm:1045 `…(\xef\xbb\xbf)?…\s*<`) accepts
+    // the BOM that the PLIST `%magicNumber` (ExifTool.pm:1015 `(bplist0|\s*<|…)`)
+    // does not, so `XMP` is the first/only candidate; `ProcessXMP` then
+    // `SetFileType('PLIST', 'application/xml')` and hands the body to
+    // `PLIST::FoundTag`. This port has no standalone XMP parser, so replicate that
+    // hop here — exactly as `parser::extract_info_typed` does — and dispatch as
+    // `PLIST` so the typed API yields `AnyMeta::Plist` (not silently `Ok(None)`).
+    // `magic()` stays a faithful 1:1 of `%magicNumber` (the PLIST gate is
+    // unchanged); the BOM tolerance lives only in this XMP→PLIST route, and
+    // `ProcessPlist` itself skips a leading UTF-8 BOM at its XML gate.
+    #[cfg(feature = "plist")]
+    let ft = if ft == "XMP"
+      && format_parser::any_parser_for("XMP").is_none()
+      && formats::plist::xml_content_is_plist(bytes)
+    {
+      "PLIST"
+    } else {
+      ft
+    };
     let Some(parser) = format_parser::any_parser_for(ft) else {
       continue;
     };
@@ -438,6 +462,20 @@ pub fn parse_mxf(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::mxf::MxfMeta<'_>>, formats::mxf::MxfError> {
   formats::mxf::parse_borrowed(bytes)
+}
+
+/// Parse an Apple Property List buffer directly — decodes both the binary
+/// (`bplist0…`) and XML (`<?xml …?>`) encodings. See
+/// [`formats::plist::parse_borrowed`].
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::plist::Error`] (currently uninhabited).
+#[cfg(feature = "plist")]
+pub fn parse_plist(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::plist::PlistMeta<'_>>, formats::plist::Error> {
+  formats::plist::parse_borrowed(bytes)
 }
 
 /// Parse an AAC (ADTS) buffer directly. See [`formats::aac::parse_borrowed`].
@@ -902,6 +940,42 @@ mod tests {
     );
   }
 
+  /// Codex R13/F1 [REAL-INPUT]: a UTF-8-BOM XML plist with NO filename must
+  /// dispatch to [`AnyMeta::Plist`] through the public typed `parse_bytes` API —
+  /// NOT silently return `Ok(None)`. With an empty filename, magic-only detection
+  /// yields `XMP` first (XMP `%magicNumber` accepts the `\xef\xbb\xbf` BOM,
+  /// ExifTool.pm:1045) while the PLIST `%magicNumber` (ExifTool.pm:1015) does NOT,
+  /// so the later PLIST candidate never matches. Bundled ExifTool reaches this
+  /// file via `ProcessXMP`'s `<plist>` content-sniff (XMP.pm:4385) →
+  /// `SetFileType('PLIST', 'application/xml')` → `PLIST::FoundTag`. `parse_bytes`
+  /// now mirrors `extract_info_typed`'s XMP→PLIST relabel via the
+  /// [`formats::plist::xml_content_is_plist`] gate, so the typed API yields the
+  /// plist metadata. Verified vs bundled `perl exiftool -j -G1` on the same bytes
+  /// (extensionless): `File:FileType` "PLIST", `File:MIMEType` "application/xml",
+  /// `XML:TestString` "BOM plist", `XML:TestInteger` 256.
+  #[test]
+  #[cfg(all(feature = "plist", feature = "std"))]
+  fn parse_bytes_bom_xml_plist_relabels_xmp_to_plist() {
+    let data = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/plist_synth_xml_utf8bom.plist"
+    ))
+    .expect("read plist_synth_xml_utf8bom.plist fixture");
+    // Sanity: the fixture really does start with a UTF-8 BOM (NOT `<?xml` / `bplist`).
+    assert!(
+      data.starts_with(&[0xEF, 0xBB, 0xBF]),
+      "fixture must be UTF-8-BOM-prefixed"
+    );
+    let meta = parse_bytes(&data)
+      .expect("parse_bytes must not error")
+      .expect("BOM XML plist must be recognized via XMP→PLIST relabel, not Ok(None)");
+    // Core R13/F1 assertion: the typed API dispatches to the PLIST arm.
+    assert!(
+      matches!(meta, AnyMeta::Plist(_)),
+      "BOM XML plist must dispatch to AnyMeta::Plist, not {meta:?}"
+    );
+  }
+
   /// Each per-format `parse_<fmt>` entry can be invoked with a byte slice
   /// (compile-time check — the test body just confirms the call shapes).
   /// The actual semantics are exercised by per-format conformance tests.
@@ -914,6 +988,8 @@ mod tests {
     let _ = parse_matroska(bytes);
     #[cfg(feature = "mxf")]
     let _ = parse_mxf(bytes);
+    #[cfg(feature = "plist")]
+    let _ = parse_plist(bytes);
     #[cfg(feature = "aac")]
     let _ = parse_aac(bytes);
     #[cfg(feature = "dv")]

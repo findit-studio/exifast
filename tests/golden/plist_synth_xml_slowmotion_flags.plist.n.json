@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "plist_synth_xml_slowmotion_flags.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/xml",
+  "XML:SlowMotionRegionsStartTimeFlags": 1,
+  "XML:SlowMotionRegionsDurationFlags": 3
+}]

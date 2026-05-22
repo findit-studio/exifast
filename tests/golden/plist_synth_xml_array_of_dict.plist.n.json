@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "plist_synth_xml_array_of_dict.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/xml",
+  "XML:Cast": "Bob",
+  "XML:Plainstr": "two"
+}]

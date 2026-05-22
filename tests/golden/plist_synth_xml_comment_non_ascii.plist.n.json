@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_xml_comment_non_ascii.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/xml",
+  "XML:Title": "foobar"
+}]

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "plist_synth_bin_dup_nested.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:XA": ["v1","v2"],
+  "PLIST:TagB": "v3"
+}]

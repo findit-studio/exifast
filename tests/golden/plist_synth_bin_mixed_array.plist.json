@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_bin_mixed_array.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:Mixed": [42,3.5,"hi",false,"(Binary data 2 bytes, use -b option to extract)"]
+}]
