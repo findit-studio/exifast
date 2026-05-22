@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_xml_mixed_array.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:TopFoo": "B",
+  "XML:Rev": "S",
+  "XML:RevBar": "D"
+}]

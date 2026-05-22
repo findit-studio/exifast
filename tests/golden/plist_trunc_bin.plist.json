@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_trunc_bin.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:Error": "Error reading binary PLIST file"
+}]

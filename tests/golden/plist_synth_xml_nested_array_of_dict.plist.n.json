@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_xml_nested_array_of_dict.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/xml",
+  "XML:TopInner": "Val"
+}]

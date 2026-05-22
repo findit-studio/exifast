@@ -164,6 +164,29 @@ fn strip_g_trailing_zeros(s: &str) -> String {
   s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+/// ExifTool's universal no-`-b` placeholder for a binary value — the string
+/// `(Binary data N bytes, use -b option to extract)` the `exiftool` script
+/// substitutes for a scalar-ref tag value in default (non-`-b`) JSON output
+/// (`exiftool:3982-3986` — `'(Binary data ' . length($$obj) . " bytes$bOpt)"`,
+/// `$bOpt = ', use -b option to extract'`).
+///
+/// `len` is the REAL byte count to report. A caller that retains the bytes
+/// (`TagValue::Bytes`) passes `bytes.len()`; a caller that deliberately did
+/// NOT read the payload (e.g. an oversized binary plist `data` object — see
+/// `formats::plist`, PLIST.pm:300-303) passes the known size directly, so the
+/// placeholder still reports the true `N` without the bytes ever being copied.
+///
+/// Gated on `alloc` (needs `String`); reachable only via the value
+/// `Serialize` impl (`serde`) and the plist serde-render path, so a plain
+/// `alloc`-only build that links neither compiles it dead — same as
+/// `formats::plist::apply_print_conv`.
+#[cfg(feature = "alloc")]
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn binary_data_placeholder(len: usize) -> String {
+  std::format!("(Binary data {len} bytes, use -b option to extract)")
+}
+
 /// Perl-style stringification of a non-finite `f64` (Codex R8 fix).
 ///
 /// Rust's `f64::to_string` emits lowercase `inf`/`-inf` and `NaN`; Perl's
@@ -709,11 +732,8 @@ const _: () = {
         TagValue::Str(text) => s.serialize_str(text),
         TagValue::Bool(b) => s.serialize_bool(*b),
         // ExifTool universal no-`-b` placeholder (a plain string, never
-        // numeric). N = byte length.
-        TagValue::Bytes(b) => s.serialize_str(&std::format!(
-          "(Binary data {} bytes, use -b option to extract)",
-          b.len()
-        )),
+        // numeric). N = byte length of the retained buffer.
+        TagValue::Bytes(b) => s.serialize_str(&binary_data_placeholder(b.len())),
         TagValue::Rational(r) => r.serialize(s),
         TagValue::List(items) => {
           let mut seq = s.serialize_seq(Some(items.len()))?;

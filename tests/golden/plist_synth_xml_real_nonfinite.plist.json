@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_xml_real_nonfinite.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:RealInf": "inf",
+  "XML:RealNegInf": "-inf",
+  "XML:RealNan": "nan"
+}]

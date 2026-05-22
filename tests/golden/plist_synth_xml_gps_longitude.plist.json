@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_xml_gps_longitude.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:GPSLongitude": "122 deg 25' 9.84\" W"
+}]

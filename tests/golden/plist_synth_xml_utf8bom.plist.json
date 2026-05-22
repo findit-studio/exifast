@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_xml_utf8bom.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:TestString": "BOM plist",
+  "XML:TestInteger": 256,
+  "XML:TestDictAuthor": "Phil"
+}]

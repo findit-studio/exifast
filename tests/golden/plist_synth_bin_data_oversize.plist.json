@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_bin_data_oversize.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:Blob": "(Binary data 2000000 bytes, use -b option to extract)"
+}]

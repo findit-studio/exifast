@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_xml_aae_override.xml",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "AAE",
+  "File:FileTypeExtension": "aae",
+  "File:MIMEType": "application/vnd.apple.photos",
+  "XML:AdjustmentBaseVersion": 0,
+  "XML:AdjustmentFormatIdentifier": "com.apple.photo",
+  "XML:AdjustmentFormatVersion": 1.4
+}]

@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_bin_uint64.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:Big": "9223372036854775808"
+}]
