@@ -426,6 +426,96 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
   }
 }
 
+// ===========================================================================
+// Direct-from-bytes typed parse — Codex Round-1 F2 (Real ID3v1 fidelity)
+// ===========================================================================
+
+/// Parse a 128-byte ID3v1 `TAG` block DIRECTLY into the typed [`Id3v1Meta`],
+/// bypassing the PrintConv-staged `Metadata` path. Faithful preservation of
+/// bundled-Perl's emission shape:
+///
+/// - **Empty fields** (e.g. an all-null Title block, byte-truncated at the
+///   FIRST embedded NUL — bundled `ReadValue` for `Format => 'string[N]'`,
+///   ExifTool.pm:6296-6300) round-trip as `Some("")`, NOT `None`.
+///   Real.pm:678-687's `ProcessDirectory(ID3::v1)` emits `"ID3v1:Title": ""`
+///   for an all-null Title; the typed Meta MUST reflect that.
+/// - **Sparse genre bytes** (192..=254 except 255 — outside the
+///   GENRE_ENTRIES table) preserve the raw byte in [`Id3v1Meta::genre`]
+///   AND leave [`Id3v1Meta::genre_name`] as `None` (the back-resolver
+///   would map a `"Unknown (192)"` PrintConv string to `None` and drop the
+///   byte entirely — exactly the F2 fidelity gap this helper closes).
+/// - **Track** (ID3v1.1) is emitted only when byte 125 == 0 AND byte 126 != 0
+///   (ID3.pm:365-370 `RawConv => '($val =~ s/^0 // and $val) ? $val : undef'`).
+///
+/// Returns `None` when `data` is not exactly 128 bytes or does not begin
+/// with `b"TAG"` (the magic; bundled `ProcessID3` matches `^TAG`,
+/// ID3.pm:1511). Used by Real.pm:678-687 (the RM ID3v1 trailer) and by
+/// future format ports that scan a 128-byte trailer themselves (AIFF,
+/// FLAC, …).
+///
+/// **F2 rationale**: the previous staged-tag lift via `stuff_id3v1_field`
+/// (process.rs) dropped empty text fields via `nonempty()` and dropped
+/// sparse genre bytes (the PrintConv-rendered `"Unknown (192)"` string had
+/// no inverse in `GENRE_ENTRIES`, so the back-resolver returned `None`
+/// and Real's `emit_id3v1` skipped the tag entirely). Direct byte parsing
+/// preserves both — no metadata loss.
+#[must_use]
+pub fn parse_id3v1_typed(data: &[u8]) -> Option<super::process::Id3v1Meta<'static>> {
+  use super::process::Id3v1Meta;
+  if data.len() != 128 || !data.starts_with(b"TAG") {
+    return None;
+  }
+
+  // Latin-1 decode of `data[off..off + len]`, truncated at the FIRST NUL
+  // (faithful `ReadValue`'s `s/\0.*//s`, ExifTool.pm:6299-6300). Returns
+  // `Some(SmolStr)` even for empty input — `None` would mean "the field
+  // was literally absent", which never happens for a fixed-width
+  // ID3v1 byte slot.
+  let decode = |off: usize, len: usize| -> Option<SmolStr> {
+    let raw = &data[off..off + len];
+    let raw = truncate_at_first_null(raw);
+    // Latin-1 → UTF-8: each byte = Unicode code point. Empty input
+    // yields an empty SmolStr (cheap inline buffer).
+    let mut s = String::with_capacity(raw.len());
+    for &b in raw {
+      s.push(b as char);
+    }
+    Some(SmolStr::new(s))
+  };
+
+  let title = decode(3, 30);
+  let artist = decode(33, 30);
+  let album = decode(63, 30);
+  let year = decode(93, 4);
+  // Comment + Track (v1.1 layout). For v1.1, byte 125 is the NUL
+  // separator; the truncate-at-first-NUL behavior already handles that
+  // since `decode(97, 30)` will see the NUL at offset 125-97=28.
+  let comment = decode(97, 30);
+  let track = if data[125] == 0 && data[126] != 0 {
+    Some(data[126])
+  } else {
+    None
+  };
+  // Genre: raw byte ALWAYS preserved. `genre_name` is `Some(&'static str)`
+  // for the 192 numbered entries in `GENRE_ENTRIES`, else `None` (the
+  // sparse range 192..=254 except 255). The Real `emit_id3v1` then renders
+  // `Unknown ({byte})` for sparse genres in `-j` mode and the raw byte
+  // in `-n` mode (faithful to bundled).
+  let genre_byte = data[127];
+  let genre_name_lookup = crate::formats::id3::genre::genre_name(i64::from(genre_byte));
+
+  Some(Id3v1Meta::__internal_from_bytes(
+    title,
+    artist,
+    album,
+    year,
+    comment,
+    track,
+    Some(genre_byte),
+    genre_name_lookup,
+  ))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -592,5 +682,126 @@ mod tests {
     // <128 bytes: silently no-op (real callers gate by file length).
     process_id3v1(b"TAG\x00", &mut m, true, &ctx);
     assert!(m.tags_slice().is_empty());
+  }
+
+  // ----------------------------------------------------------------------
+  // Codex R1 F2 — direct-from-bytes typed parse fidelity (`parse_id3v1_typed`)
+  // ----------------------------------------------------------------------
+
+  #[test]
+  fn parse_id3v1_typed_returns_none_for_short_block() {
+    assert!(parse_id3v1_typed(b"TAG\x00").is_none());
+  }
+
+  #[test]
+  fn parse_id3v1_typed_returns_none_for_non_tag_magic() {
+    let block = [0u8; 128];
+    assert!(parse_id3v1_typed(&block).is_none(), "no TAG magic");
+  }
+
+  #[test]
+  fn parse_id3v1_typed_preserves_empty_title_as_present() {
+    // F2 regression: the previous PrintConv-staged lift dropped
+    // `Some("")` via `nonempty()`. The direct-bytes parser MUST surface
+    // a present-but-empty Title as `Some("")` so Real's `emit_id3v1`
+    // can emit `"ID3v1:Title": ""` faithfully (bundled Real.pm:678-687
+    // emits the empty string for an all-null Title slot).
+    let block = make_tag_block(
+      "", /* empty Title */
+      "Artist", "Album", "2003", "Comment", None, 0,
+    );
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(
+      v1.title(),
+      Some(""),
+      "empty Title slot must surface as `Some(\"\")` (Codex R1 F2)"
+    );
+    assert_eq!(v1.artist(), Some("Artist"));
+  }
+
+  #[test]
+  fn parse_id3v1_typed_preserves_sparse_genre_byte() {
+    // F2 regression: byte 192 is sparse (no entry in GENRE_ENTRIES).
+    // The previous PrintConv-staged lift rendered `"Unknown (192)"`
+    // then the back-resolver returned `None` for both `genre` and
+    // `genre_name`, and Real's `emit_id3v1` SKIPPED the Genre tag.
+    // The direct-bytes parser MUST preserve byte 192 in `genre`,
+    // with `genre_name` left `None` (the emit path renders
+    // `"Unknown (192)"` for sparse bytes).
+    let block = make_tag_block("T", "A", "Al", "2003", "Cmt", None, 192);
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(
+      v1.genre(),
+      Some(192),
+      "raw genre byte must be preserved verbatim (Codex R1 F2)"
+    );
+    assert_eq!(
+      v1.genre_name(),
+      None,
+      "byte 192 has no GENRE_ENTRIES name; `-j` emit synthesizes `Unknown (192)` instead"
+    );
+  }
+
+  #[test]
+  fn parse_id3v1_typed_preserves_known_genre_name() {
+    // Sanity: byte 7 → "Hip-Hop" (a named entry). Both `genre` and
+    // `genre_name` populate.
+    let block = make_tag_block("T", "A", "Al", "2003", "Cmt", None, 7);
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(v1.genre(), Some(7));
+    assert_eq!(v1.genre_name(), Some("Hip-Hop"));
+  }
+
+  #[test]
+  fn parse_id3v1_typed_emits_track_in_v1_1_layout() {
+    // Track field gate: data[125] == 0 AND data[126] != 0.
+    let block = make_tag_block("T", "A", "Al", "2003", "Cmt", Some(5), 7);
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(v1.track(), Some(5));
+    // v1.0 comment truncates at the internal NUL at offset 125 — so
+    // `comment` here is "Cmt" (the first 3 bytes), NOT "Cmt" + padding.
+    assert_eq!(v1.comment(), Some("Cmt"));
+  }
+
+  #[test]
+  fn parse_id3v1_typed_year_truncates_at_first_null() {
+    // Bundled `ReadValue` for `Format => 'string[N]'` truncates at the
+    // FIRST embedded NUL (`s/\0.*//s`, ExifTool.pm:6299-6300). For
+    // Year bytes `"20\0X"` ⇒ `"20"`, NOT `"20X"` and NOT `"20\0X"`.
+    let mut block = make_tag_block("T", "A", "Al", "    ", "Cmt", None, 7);
+    block[93] = b'2';
+    block[94] = b'0';
+    block[95] = 0;
+    block[96] = b'X';
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(
+      v1.year(),
+      Some("20"),
+      "first-NUL truncation faithful to bundled"
+    );
+  }
+
+  #[test]
+  fn parse_id3v1_typed_all_null_text_fields_are_all_some_empty() {
+    // ALL text fields all-null → every field surfaces as `Some("")`.
+    // Faithful to bundled Real.pm:678-687 which emits an empty string
+    // for each. The previous staged-lift path collapsed all these to
+    // `None`, dropping every text tag from Real's emit.
+    //
+    // Note: `make_tag_block` pads Year with ASCII SPACE (`b' '`), so
+    // its all-null variant requires hand-zeroing the Year slot.
+    let mut block = make_tag_block("", "", "", "", "", None, 0);
+    block[93] = 0;
+    block[94] = 0;
+    block[95] = 0;
+    block[96] = 0;
+    let v1 = parse_id3v1_typed(&block).expect("parse");
+    assert_eq!(v1.title(), Some(""));
+    assert_eq!(v1.artist(), Some(""));
+    assert_eq!(v1.album(), Some(""));
+    assert_eq!(v1.year(), Some(""));
+    assert_eq!(v1.comment(), Some(""));
+    assert_eq!(v1.genre(), Some(0));
+    assert_eq!(v1.genre_name(), Some("Blues")); // 0 → Blues
   }
 }

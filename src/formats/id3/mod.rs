@@ -79,7 +79,7 @@ pub mod v2_process;
 
 pub use process::{
   Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
-  parse_id3_borrowed,
+  parse_id3_borrowed, parse_id3v1_from_block,
 };
 
 // MP3 wrapper re-exports (Codex A-R2-1) — gated behind `mp3`, which pulls

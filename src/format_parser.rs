@@ -300,6 +300,9 @@ pub enum AnyParser {
   /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::ProcessOgg),
+  /// Real (RM/RV/RMVB/RA/RAM/RPM — RealMedia + RealAudio container + Metafile).
+  #[cfg(feature = "real")]
+  Real(crate::formats::real::ProcessReal),
   /// MPEG audio (Phase F4 — MP3 / MP2 / MUS frame parser + Xing/LAME tail).
   #[cfg(feature = "mpeg-audio")]
   MpegAudio(crate::formats::mpeg::ProcessMpegAudio),
@@ -376,6 +379,12 @@ pub enum AnyMeta<'a> {
   /// AF2; `'a` is phantom there since `ogg::Meta` owns its data).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::Meta<'a>),
+  /// Real (RM/RV/RMVB/RA/RAM/RPM). The typed
+  /// [`crate::formats::real::ProcessReal`] handles both the RealMedia
+  /// chunked container AND the RealAudio fixed-layout header, including
+  /// the embedded RJMD metadata + ID3v1 trailer on RM files.
+  #[cfg(feature = "real")]
+  Real(crate::formats::real::RealMeta<'a>),
   /// MPEG audio (Phase F4 — frame parser, Xing/LAME tail). Produced as
   /// `mpeg::AudioMeta<'static>` by [`crate::formats::mpeg::ProcessMpegAudio`].
   #[cfg(feature = "mpeg-audio")]
@@ -408,6 +417,7 @@ pub enum AnyMeta<'a> {
     feature = "dsf",
     feature = "flac",
     feature = "ogg",
+    feature = "real",
     feature = "mpeg-audio",
     feature = "mpc",
     feature = "wavpack",
@@ -469,6 +479,8 @@ impl AnyMeta<'_> {
       AnyMeta::Flac(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "real")]
+      AnyMeta::Real(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mpeg-audio")]
       AnyMeta::MpegAudio(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mpc")]
@@ -493,6 +505,7 @@ impl AnyMeta<'_> {
         feature = "dsf",
         feature = "flac",
         feature = "ogg",
+        feature = "real",
         feature = "mpeg-audio",
         feature = "mpc",
         feature = "wavpack",
@@ -629,6 +642,11 @@ impl AnyMeta<'_> {
         Some(target) => FileTypeFinalize::DetectedThenOverride(target),
         None => FileTypeFinalize::Detected,
       },
+      // Real: SetFileType($type) where $type = 'RM' / 'RA' / 'RAM' / 'RPM'
+      // (Real.pm:528-558). The candidate detected as "Real" is finalized
+      // to whichever sub-type the magic prefix selected.
+      #[cfg(feature = "real")]
+      AnyMeta::Real(m) => FileTypeFinalize::Explicit(m.kind().file_type()),
       #[cfg(feature = "mpeg-audio")]
       AnyMeta::MpegAudio(_) => FileTypeFinalize::Detected,
       #[cfg(feature = "mpc")]
@@ -660,6 +678,7 @@ impl AnyMeta<'_> {
         feature = "dsf",
         feature = "flac",
         feature = "ogg",
+        feature = "real",
         feature = "mpeg-audio",
         feature = "mpc",
         feature = "wavpack",
@@ -837,6 +856,10 @@ pub enum AnyError {
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
   Ogg(#[from] crate::formats::ogg::Error),
+  /// Real (RM/RA/RAM/RPM) fatal-error wrapper.
+  #[cfg(feature = "real")]
+  #[error("Real: {0}")]
+  Real(#[from] crate::formats::real::RealError),
   /// MPEG audio fatal-error wrapper.
   #[cfg(feature = "mpeg-audio")]
   #[error("MPEG-audio: {0}")]
@@ -918,6 +941,7 @@ impl AnyParser {
       feature = "dsf",
       feature = "flac",
       feature = "ogg",
+      feature = "real",
       feature = "mpeg-audio",
       feature = "mpc",
       feature = "wavpack",
@@ -1042,6 +1066,25 @@ impl AnyParser {
         }
         Ok(None)
       }
+      #[cfg(feature = "real")]
+      AnyParser::Real(p) => {
+        // Real has its own internal ID3v1 trailer scan (Real.pm:678-687)
+        // for the RM family. The typed parser handles that inline via
+        // `formats::id3::parse_id3v1_from_block`, so no `SharedFlags`
+        // threading is needed here — `done_id3` would not be set by the
+        // inline path since the engine never recurses into ID3 dispatch
+        // under the Real candidate.
+        //
+        // `ext` IS threaded: `ProcessReal` reads `$$et{FILE_EXT}`
+        // (Real.pm:535) to distinguish a RAM Metafile (default) from an
+        // RPM Plug-in Metafile (`.rpm` extension). The leaf
+        // `FormatParser::parse` has no extension channel, so the dispatch
+        // uses the extension-aware `parse_with_ext` entry instead.
+        let _ = (p, shared);
+        crate::formats::real::parse_with_ext(bytes, ext)
+          .map(|o| o.map(AnyMeta::Real))
+          .map_err(Into::into)
+      }
       #[cfg(feature = "mpeg-audio")]
       AnyParser::MpegAudio(p) => {
         // The MPEG-audio parser is normally invoked internally by MP3 — it
@@ -1125,6 +1168,11 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MPC" => Some(AnyParser::Mpc(crate::formats::mpc::ProcessMpc)),
     #[cfg(feature = "ogg")]
     "OGG" => Some(AnyParser::Ogg(crate::formats::ogg::ProcessOgg)),
+    // ExifTool maps RM / RA / RMVB / RV / RAM / RPM extensions to base type
+    // `"Real"` via the `%fileTypeLookup` aliases; detection_candidates
+    // yields `"Real"` as the candidate file_type.
+    #[cfg(feature = "real")]
+    "Real" => Some(AnyParser::Real(crate::formats::real::ProcessReal)),
     #[cfg(feature = "red")]
     "R3D" => Some(AnyParser::R3D(crate::formats::red::ProcessR3D)),
     #[cfg(feature = "wavpack")]
@@ -1190,6 +1238,8 @@ mod tests {
     assert!(any_parser_for("MPC").is_some());
     #[cfg(feature = "ogg")]
     assert!(any_parser_for("OGG").is_some());
+    #[cfg(feature = "real")]
+    assert!(any_parser_for("Real").is_some());
     #[cfg(feature = "red")]
     assert!(any_parser_for("R3D").is_some());
     #[cfg(feature = "wavpack")]

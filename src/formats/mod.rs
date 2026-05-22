@@ -37,6 +37,8 @@ pub mod mpc;
 pub mod mpeg;
 #[cfg(feature = "ogg")]
 pub mod ogg;
+#[cfg(feature = "real")]
+pub mod real;
 #[cfg(feature = "red")]
 pub mod red;
 #[cfg(feature = "wavpack")]

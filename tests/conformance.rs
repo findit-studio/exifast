@@ -471,6 +471,205 @@ fn dv_conformance() {
 }
 
 #[test]
+fn real_rm_conformance() {
+  // FORMATS.md row 19. `tests/fixtures/Real.rm` is the bundled
+  // `lib/Image/ExifTool/t/images/Real.rm` (1915 bytes). Exercises the
+  // RealMedia chunk walk (PROP / MDPR×2 / CONT), the RJMD footer
+  // metadata block, and the 128-byte ID3v1 trailer. The golden is bundled
+  // `perl exiftool -j -G1 -struct` output with `System:*` + `Composite:*`
+  // stripped uniformly (composite-tag synthesis is engine infrastructure
+  // outside Real.pm's scope — deferred per `[[exifast-phase2-forward-items]]`;
+  // bundled emits one Composite:DateTimeOriginal=2003 lifted from the
+  // ID3v1:Year frame).
+  check("Real.rm", "Real.rm.json", true);
+  check("Real.rm", "Real.rm.n.json", false);
+}
+
+#[test]
+fn real_ra_conformance() {
+  // FORMATS.md row 19. `tests/fixtures/Real.ra` is the bundled
+  // `lib/Image/ExifTool/t/images/Real.ra` (130 bytes, RealAudio V4).
+  // Exercises the `.ra\xfd` magic, the V4 codec table (AudioBytes /
+  // BytesPerMinute / AudioFrameSize / SampleRate / BitsPerSample /
+  // Channels / Title / Copyright; the file has no Artist or Comment).
+  // Goldens captured the same way as RM.
+  check("Real.ra", "Real.ra.json", true);
+  check("Real.ra", "Real.ra.n.json", false);
+}
+
+#[test]
+fn real_synth_1audio_conformance() {
+  // Codex R1 F1 adversarial — pinpoints the bundled `File:MIMEType`
+  // override (Real.pm:653-657) for a 1-stream RM whose sole MDPR
+  // carries `audio/x-pn-realaudio`. Bundled OVERRIDES the table-derived
+  // `application/vnd.rn-realmedia` with the stream MIME (exactly the
+  // override case that fires); this Rust port must agree.
+  // Synthesized fixture (RMF header + PROP + 1 MDPR + DATA terminator);
+  // goldens captured with `-x Composite:all`.
+  check("real_synth_1audio.rm", "real_synth_1audio.rm.json", true);
+  check("real_synth_1audio.rm", "real_synth_1audio.rm.n.json", false);
+}
+
+#[test]
+fn real_synth_2_audio_audio_conformance() {
+  // Codex R1 F1 adversarial — 2-stream RM with BOTH MIMEs populated
+  // (`audio/x-pn-realaudio` each). Bundled @mimeTypes has 2 entries, so
+  // the `@mimeTypes == 1` gate (Real.pm:654) fails ⇒ NO override; the
+  // table-derived `application/vnd.rn-realmedia` is kept. Pins the
+  // count-mismatch arm of the override branch.
+  check(
+    "real_synth_2_audio_audio.rm",
+    "real_synth_2_audio_audio.rm.json",
+    true,
+  );
+  check(
+    "real_synth_2_audio_audio.rm",
+    "real_synth_2_audio_audio.rm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_id3v1_empty_title_conformance() {
+  // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
+  // Title slot is ALL NULL (faithful bundled `"ID3v1:Title": ""`). The
+  // previous PrintConv-staged lift dropped the empty Title via
+  // `nonempty()` (process.rs `stuff_id3v1_field`) and Real's
+  // `emit_id3v1` skipped the tag entirely — silent metadata loss. The
+  // direct-block parser
+  // [`crate::formats::id3::v1::parse_id3v1_typed`] preserves
+  // `Some("")` so the empty Title round-trips through `-j` and `-n`.
+  check(
+    "real_synth_id3v1_empty_title.rm",
+    "real_synth_id3v1_empty_title.rm.json",
+    true,
+  );
+  check(
+    "real_synth_id3v1_empty_title.rm",
+    "real_synth_id3v1_empty_title.rm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_embedded_nul_mime_conformance() {
+  // Codex R2 adversarial — RM whose 1 MDPR carries a StreamMimeType with
+  // an EMBEDDED NUL byte (`audio/x\0pn-realaudio`). Bundled Real.pm:643
+  // runs `$mime =~ s/\0.*//s` (first-NUL truncation) before pushing to
+  // `@mimeTypes`, and the `Format => 'string[$val{10}]'` read at Real.pm:
+  // 132-136 already truncates via ReadValue's `s/\0.*//s` at
+  // ExifTool.pm:6300, so BOTH `Real-MDPR:StreamMimeType` AND
+  // `File:MIMEType` (via the single-stream override at Real.pm:653-657)
+  // emit the truncated `audio/x` form. Pre-fix the Rust port used
+  // `strip_trailing_nuls`, which preserved the embedded NUL and leaked it
+  // through both surfaces.
+  check(
+    "real_synth_embedded_nul_mime.rm",
+    "real_synth_embedded_nul_mime.rm.json",
+    true,
+  );
+  check(
+    "real_synth_embedded_nul_mime.rm",
+    "real_synth_embedded_nul_mime.rm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_id3v1_sparse_genre_conformance() {
+  // Codex R1 F2 adversarial — RM + RJMD footer + ID3v1 trailer whose
+  // Genre byte is 192 (SPARSE — outside the GENRE_ENTRIES named-genre
+  // table, between 191 `Psybient` and 255 `None`). Bundled emits
+  // `"ID3v1:Genre": "Unknown (192)"` in `-j` mode and the raw int
+  // `"ID3v1:Genre": 192` in `-n` mode. The previous PrintConv-staged
+  // lift rendered `"Unknown (192)"` via the `%genre` hash fallback,
+  // then the back-resolver (`id3v1_genre_byte_for_name`) failed to map
+  // that string back to byte 192 — `v1.genre = None`, `v1.genre_name = None`,
+  // and Real's `emit_id3v1` SKIPPED the Genre tag entirely. The
+  // direct-block parser preserves the raw byte so both `-j` (rendered)
+  // and `-n` (bare int) emit faithfully.
+  check(
+    "real_synth_id3v1_sparse_genre.rm",
+    "real_synth_id3v1_sparse_genre.rm.json",
+    true,
+  );
+  check(
+    "real_synth_id3v1_sparse_genre.rm",
+    "real_synth_id3v1_sparse_genre.rm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_ram_pnm_conformance() {
+  // PR #33 Copilot finding — the RAM/RPM Metafile branch (Real.pm:533-555).
+  // `tests/fixtures/real_synth_ram_pnm.ram` is a synthetic RAM playlist:
+  // a `pnm://` URL line, an `rtsp://` URL line, and a plain text line.
+  // Exercises (1) the `RealKind::Ram` default when the extension is not
+  // `RPM` (Real.pm:535-536), (2) the `^[a-z]{3,4}://` URL-vs-text split
+  // (Real.pm:552 — `Real:URL` / `Real:Text`), and (3) the last-wins
+  // duplicate-tag semantics: TWO `url` lines ⇒ bundled JSON keeps the
+  // FINAL line (`rtsp://…/feature.rm`) as `Real:URL`. Goldens captured
+  // with bundled `perl exiftool 13.58 -j -G1 -struct` (`-n` variant
+  // identical — the `Real::Metafile` table has no PrintConv).
+  check(
+    "real_synth_ram_pnm.ram",
+    "real_synth_ram_pnm.ram.json",
+    true,
+  );
+  check(
+    "real_synth_ram_pnm.ram",
+    "real_synth_ram_pnm.ram.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_rpm_pnm_conformance() {
+  // PR #33 Copilot finding — RAM-vs-RPM is decided ONLY by the file
+  // extension (Real.pm:535-536 `$$et{FILE_EXT} eq 'RPM'`). Same kind of
+  // `pnm://`-headed metafile as `real_synth_ram_pnm.ram`, but the `.rpm`
+  // extension flips the typed `RealKind` to `Rpm` ⇒ `File:FileType=RPM`
+  // and the RPM MIME `audio/x-pn-realaudio-plugin`. Pins that the `ext`
+  // channel is threaded through `AnyParser::Real` → `parse_with_ext` →
+  // `parse_metafile` (the pre-fix stub discarded `ext` and always
+  // returned `RealKind::Ram`).
+  check(
+    "real_synth_rpm_pnm.rpm",
+    "real_synth_rpm_pnm.rpm.json",
+    true,
+  );
+  check(
+    "real_synth_rpm_pnm.rpm",
+    "real_synth_rpm_pnm.rpm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_metafile_http_accept_conformance() {
+  // PR #33 Copilot finding — the `http`-line acceptance gate (Real.pm:546:
+  // `return 0 if $buff =~ /^http/ and $buff !~ /\.(ra|rm|rv|rmvb|smil)$/i`).
+  // `real_synth_metafile_http_accept.ram`'s first non-empty line is
+  // `http://…/promo.ra` — the `.ra` suffix SATISFIES the gate, so bundled
+  // ACCEPTS the file as RAM. (The rejection half of the gate — an
+  // `http://` line WITHOUT a Real media suffix ⇒ `return 0` ⇒ the file
+  // falls through to `TXT` — is pinned by the `parse_metafile_http_*`
+  // unit tests in `src/formats/real.rs`: exifast has no `Text`-module
+  // parser, so a rejected metafile cannot be a conformance fixture.)
+  check(
+    "real_synth_metafile_http_accept.ram",
+    "real_synth_metafile_http_accept.ram.json",
+    true,
+  );
+  check(
+    "real_synth_metafile_http_accept.ram",
+    "real_synth_metafile_http_accept.ram.n.json",
+    false,
+  );
+}
+
+#[test]
 fn dv_unknown_profile_conformance() {
   // Adversarial: 480-byte synthetic with the primary `\x1f\x07\0\x3f`
   // magic and `stype=0x1f` at offset 451 — never present in

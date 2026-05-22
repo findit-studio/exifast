@@ -180,6 +180,8 @@ pub use formats::mpc::ProcessMpc;
 pub use formats::mpeg::ProcessMpegAudio;
 #[cfg(feature = "ogg")]
 pub use formats::ogg::ProcessOgg;
+#[cfg(feature = "real")]
+pub use formats::real::ProcessReal;
 #[cfg(feature = "red")]
 pub use formats::red::ProcessR3D;
 #[cfg(feature = "wavpack")]
@@ -476,6 +478,19 @@ pub fn parse_flac<'a>(
   formats::flac::parse_borrowed(bytes, shared)
 }
 
+/// Parse a Real (RM / RA / RAM / RPM) buffer directly. See
+/// [`formats::real::parse_borrowed`].
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::real::RealError`] (currently uninhabited).
+#[cfg(feature = "real")]
+pub fn parse_real(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::real::RealMeta<'_>>, formats::real::RealError> {
+  formats::real::parse_borrowed(bytes)
+}
+
 /// Parse an Ogg container (Vorbis / Opus / Theora) buffer directly. See
 /// [`formats::ogg::parse_borrowed`].
 ///
@@ -684,6 +699,8 @@ mod tests {
     let _ = parse_dsf(bytes);
     #[cfg(feature = "ogg")]
     let _ = parse_ogg(bytes, true);
+    #[cfg(feature = "real")]
+    let _ = parse_real(bytes);
     #[cfg(feature = "mpc")]
     let _ = parse_mpc(bytes);
     #[cfg(feature = "wavpack")]

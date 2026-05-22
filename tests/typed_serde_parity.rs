@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_127() {
+fn typed_serde_path_equals_writer_path_and_golden_all_149() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -211,12 +211,37 @@ fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // = $val` is plain Perl hash assignment) AND TagDefault absorbed-not-
   // emitted (Matroska.pm:1224-1226 routes ALL leaves into struct when
   // active; Matroska.pm:929 explicitly drops TagDefault at flush).
+  // 139 → 141 after the Real (RM/RA) port (FORMATS.md row 19): added
+  // the bundled `Real.rm` (chunk-walk + RJMD footer + ID3v1) and
+  // `Real.ra` (RealAudio V4 codec table) fixtures.
+  // 128 → 130 after Codex R1 F2 (PR #33): added 2 adversarial Real
+  // fixtures pinning the ID3v1-trailer fidelity gap (empty Title
+  // preserved as `""`; sparse Genre byte 192 preserved verbatim).
+  // 130 → 132 after Codex R1 F1 (PR #33): added 2 adversarial Real
+  // fixtures pinning the MIME-override branch (1-stream audio MIME
+  // ⇒ override fires; 2 populated streams ⇒ no override). The 2
+  // empty-MIME F1 variants (1empty, 2_empty_audio) live in fixtures/
+  // for unit tests only — bundled emits a Perl-interpreter-level
+  // `Condition FileInfoLen2: Use of uninitialized value` warning that
+  // this Rust port does not (and should not) replicate, so they
+  // cannot be value-equivalent at the JSON surface.
+  // 132 → 133 after Codex R2 (PR #33): added 1 adversarial Real fixture
+  // (`real_synth_embedded_nul_mime.rm`) pinning the bundled first-NUL
+  // truncation (ReadValue at ExifTool.pm:6300 + Real.pm:643) on
+  // `Format => 'string[$val{10}]'` StreamMimeType. Without the fix,
+  // an embedded NUL leaks through both `Real-MDPR:StreamMimeType` AND
+  // the single-stream `File:MIMEType` override.
+  // 146 → 149 after the PR #33 Copilot RAM/RPM fix: added 3 Metafile
+  // fixtures (`real_synth_ram_pnm.ram`, `real_synth_rpm_pnm.rpm`,
+  // `real_synth_metafile_http_accept.ram`) pinning the Real.pm:533-555
+  // Metafile branch — the RAM-vs-RPM extension discrimination, the
+  // `^[a-z]{3,4}://` URL/text split, and the `http`-line acceptance gate.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    139,
-    "expected exactly the 139 active conformance fixtures, found {}: {:?}",
+    149,
+    "expected exactly the 149 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "real_synth_metafile_http_accept.ram",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "RAM",
+  "File:FileTypeExtension": "RAM",
+  "File:MIMEType": "audio/x-pn-realaudio",
+  "Real:URL": "http://media.example.com/promo-hd.rm",
+  "Real:Text": "Real audio promo metafile"
+}]

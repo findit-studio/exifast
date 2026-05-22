@@ -359,35 +359,44 @@ pub struct Id3v1Meta<'a> {
 }
 
 impl Id3v1Meta<'_> {
-  /// Song title (UTF-8). `None` if absent.
+  /// Song title (Latin-1 → UTF-8). `Some("")` when the 128-byte TAG block
+  /// had an all-null Title slot (bundled emits `"ID3v1:Title": ""` —
+  /// faithful; see Codex R1 F2). `None` only when the lift path did not
+  /// see any Title staging (the chained ID3v2+v1 case via
+  /// `stuff_id3v1_field`'s legacy `nonempty()` filter, which the typed
+  /// direct-block path [`v1::parse_id3v1_typed`] BYPASSES).
   #[must_use]
   #[inline(always)]
   pub fn title(&self) -> Option<&str> {
     self.title.as_deref()
   }
 
-  /// Artist name. `None` if absent.
+  /// Artist name (Latin-1 → UTF-8). `Some("")` for present-but-empty,
+  /// `None` for absent — see [`Self::title`].
   #[must_use]
   #[inline(always)]
   pub fn artist(&self) -> Option<&str> {
     self.artist.as_deref()
   }
 
-  /// Album name. `None` if absent.
+  /// Album name (Latin-1 → UTF-8). `Some("")` for present-but-empty,
+  /// `None` for absent — see [`Self::title`].
   #[must_use]
   #[inline(always)]
   pub fn album(&self) -> Option<&str> {
     self.album.as_deref()
   }
 
-  /// Year (4-character ASCII string). `None` if absent.
+  /// Year (4-character ASCII string). `Some("")` for present-but-empty,
+  /// `None` for absent — see [`Self::title`].
   #[must_use]
   #[inline(always)]
   pub fn year(&self) -> Option<&str> {
     self.year.as_deref()
   }
 
-  /// Comment. `None` if absent.
+  /// Comment (Latin-1 → UTF-8). `Some("")` for present-but-empty,
+  /// `None` for absent — see [`Self::title`].
   #[must_use]
   #[inline(always)]
   pub fn comment(&self) -> Option<&str> {
@@ -401,7 +410,12 @@ impl Id3v1Meta<'_> {
     self.track
   }
 
-  /// Genre byte (`%genre` lookup, ID3.pm:131-332).
+  /// Genre byte (`%genre` lookup, ID3.pm:131-332). `Some(byte)` even for
+  /// SPARSE bytes (192..=254 except 255) that have no entry in
+  /// `GENRE_ENTRIES` — the byte is preserved verbatim so callers can
+  /// emit `Unknown ({byte})` in `-j` mode and the raw int in `-n` mode
+  /// (faithful Codex R1 F2; the previous PrintConv-staged path returned
+  /// `None` here for sparse bytes and silently dropped the Genre tag).
   #[must_use]
   #[inline(always)]
   pub const fn genre(&self) -> Option<u8> {
@@ -409,11 +423,49 @@ impl Id3v1Meta<'_> {
   }
 
   /// PrintConv-resolved genre name (e.g. `"Hip-Hop"`). `None` if the
-  /// genre byte is sparse (192..=254 except 255) or absent.
+  /// genre byte is sparse (192..=254 except 255) or absent. Use
+  /// [`Self::genre`] for the raw byte, which is `Some` for ALL bytes when
+  /// the direct-block parser [`crate::formats::id3::v1::parse_id3v1_typed`]
+  /// populated this Meta.
   #[must_use]
   #[inline(always)]
   pub const fn genre_name(&self) -> Option<&'static str> {
     self.genre_name
+  }
+
+  /// Private constructor used by the direct-from-bytes parser
+  /// [`crate::formats::id3::v1::parse_id3v1_typed`] (Codex R1 F2 fix).
+  /// Bypasses the PrintConv-staging `stuff_id3v1_field` path so present-
+  /// but-empty text fields land as `Some("")` and sparse genre bytes
+  /// preserve the raw `u8`.
+  ///
+  /// Crate-private (NOT part of the public `pub` API surface — the
+  /// double-underscore prefix is an additional discouragement); the
+  /// argument tuple is intentionally positional (a builder struct
+  /// would over-engineer a constructor with one caller).
+  #[doc(hidden)]
+  #[must_use]
+  pub fn __internal_from_bytes(
+    title: Option<SmolStr>,
+    artist: Option<SmolStr>,
+    album: Option<SmolStr>,
+    year: Option<SmolStr>,
+    comment: Option<SmolStr>,
+    track: Option<u8>,
+    genre: Option<u8>,
+    genre_name: Option<&'static str>,
+  ) -> Self {
+    Self {
+      title,
+      artist,
+      album,
+      year,
+      comment,
+      track,
+      genre,
+      genre_name,
+      _phantom: core::marker::PhantomData,
+    }
   }
 }
 
@@ -1630,6 +1682,36 @@ pub(crate) fn parse_id3_with_hdr_end<'a>(
   print_conv: bool,
 ) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
   parse_id3_inner(data, shared, print_conv)
+}
+
+/// Parse a stand-alone 128-byte ID3v1 `TAG` block into the typed
+/// [`Id3v1Meta`]. Used by callers that scan the ID3v1 trailer themselves
+/// (Real.pm:678-687 does so for RM files: `seek(-128, 2); read(128);
+/// /^TAG/; ProcessDirectory(ID3::v1)`). Returns `None` when the block is
+/// not exactly 128 bytes or does not begin with `b"TAG"`.
+///
+/// **Codex R1 F2 fix (no-silent-metadata-loss mandate).** Previously this
+/// drove a scratch [`crate::value::Metadata`] through `process_id3v1` with
+/// `print_conv_on=true` and lifted via `stuff_id3v1_field`. That path
+/// LOST two classes of valid metadata:
+///
+/// 1. **Empty text fields.** `stuff_id3v1_field`'s `nonempty()` filter
+///    dropped `Some("")` to `None`; the Real `emit_id3v1` then SKIPPED
+///    the tag, contradicting bundled `"ID3v1:Title": ""`.
+/// 2. **Sparse genre bytes.** PrintConv'd `"Unknown (192)"` had no
+///    inverse in `GENRE_ENTRIES`, so the back-resolver
+///    (`id3v1_genre_byte_for_name`) returned `None`. Real lost both
+///    `"ID3v1:Genre": "Unknown (192)"` (-j) and `"ID3v1:Genre": 192` (-n).
+///
+/// Now delegates to [`crate::formats::id3::v1::parse_id3v1_typed`], which
+/// parses the 128-byte block DIRECTLY into `Id3v1Meta` — no Metadata
+/// staging, no `stuff_id3v1_field` round-trip, no information loss. The
+/// helper preserves empty text as `Some("")` and the raw genre byte as
+/// `Some(byte)`, with `genre_name` left `None` for sparse bytes (Real's
+/// `emit_id3v1` then renders `Unknown ({byte})` in `-j` mode).
+#[must_use]
+pub fn parse_id3v1_from_block(data: &[u8]) -> Option<Id3v1Meta<'static>> {
+  crate::formats::id3::v1::parse_id3v1_typed(data)
 }
 
 // ===========================================================================
