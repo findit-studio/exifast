@@ -1,0 +1,16 @@
+[
+  {
+    "SourceFile": "Matroska_cluster_skip.mkv",
+    "ExifTool:ExifToolVersion": 13.58,
+    "File:FileType": "MKV",
+    "File:FileTypeExtension": "MKV",
+    "File:MIMEType": "video/x-matroska",
+    "Matroska:EBMLVersion": 1,
+    "Matroska:EBMLReadVersion": 1,
+    "Matroska:DocType": "matroska",
+    "Matroska:DocTypeVersion": 1,
+    "Matroska:DocTypeReadVersion": 1,
+    "Info:TimecodeScale": 0.001,
+    "Info:MuxingApp": "clu"
+  }
+]

@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "Matroska_chapters.mkv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MKV",
+  "File:FileTypeExtension": "mkv",
+  "File:MIMEType": "video/x-matroska",
+  "Matroska:EBMLVersion": 1,
+  "Matroska:EBMLReadVersion": 1,
+  "Matroska:DocType": "matroska",
+  "Matroska:DocTypeVersion": 1,
+  "Matroska:DocTypeReadVersion": 1,
+  "Info:TimecodeScale": "1 ms",
+  "Info:MuxingApp": "test",
+  "Info:WritingApp": "synth",
+  "Chapter1:ChapterTimeStart": "0:01:00",
+  "Chapter1:ChapterTimeEnd": "0:02:00",
+  "Chapter1:ChapterString": "Intro"
+}]

@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_126() {
+fn typed_serde_path_equals_writer_path_and_golden_all_127() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -179,12 +179,44 @@ fn typed_serde_path_equals_writer_path_and_golden_all_126() {
   // Vorbis-comment SubDirectory hop into `%FLAC::Picture` (FLAC.pm:84-
   // 134). The other R3 F2 fixture (`FLAC.ogg`, Ogg-FLAC transport) is
   // formally accept-deferred — see `NOT_ACTIVE`.
+  // 126 → 127 after FORMATS.md row 23 lib/matroska: added `Matroska.mkv`
+  // (bundled t/images fixture, 507 bytes) to exercise the EBML walker +
+  // tag-table dispatch ported in `src/formats/matroska.rs`.
+  // 127 → 131 after PR #31 Round-1 findings (F1, F2, F3, F5): added
+  // `Matroska_simpletag.mkv`, `Matroska_unknown_segment.mkv`,
+  // `Matroska_cluster_skip.mkv`, `Matroska_attachment.mkv` — synthetic
+  // adversarial fixtures exercising SimpleTag/StdTag mapping,
+  // unknown-size Segment, default Cluster-stop, and binary-placeholder
+  // emission (see `tests/conformance.rs::matroska_*_conformance`).
+  // 131 → 133 after PR #31 Round-2 finding (DateUTC subsecond loss):
+  // added `Matroska_subsecond_date.mkv` (positive raw_ns with non-zero
+  // nanosecond remainder) and `Matroska_negative_subsecond_date.mkv`
+  // (pre-2001 raw_ns < 0 exercising both the EBML 8-byte signed-decode
+  // f64 promotion loss and the $frac < 0 correction branch). Both
+  // verify the new `convert_matroska_date` faithful transliteration of
+  // `Matroska.pm:1184-1198` + `ExifTool.pm:6773-6800` fractional branch.
+  // 136 → 137 after PR #31 R4 finding F1 (Codex adversarial): added
+  // `Matroska_chapters.mkv` exercising ChapterTimeStart/ChapterTimeEnd
+  // (Matroska.pm:580-592 unsigned-ns → /1e9 → ConvertDuration), the
+  // ChapterDisplay (ID 0) traversal fix, and the `Chapter<n>` family-1
+  // group attribution (Matroska.pm:1117-1119 chapterNum counter).
+  // 137 → 138 after PR #31 R4 finding F2 (Codex adversarial): added
+  // `Matroska_track_targeted_tag.mkv` exercising the
+  // TagTrackUID → Track<N> group override (Matroska.pm:1207-1216
+  // %trackNum map populated from TrackUID inside TrackEntry, looked up
+  // at TagTrackUID time to switch SET_GROUP1 for the enclosing Tag).
+  // 138 → 139 after PR #31 R5 finding (Codex adversarial): added
+  // `Matroska_simpletag_duplicates.mkv` exercising last-wins overwrite
+  // semantics on SimpleTag children (Matroska.pm:1226 `$$struct{$tagName}
+  // = $val` is plain Perl hash assignment) AND TagDefault absorbed-not-
+  // emitted (Matroska.pm:1224-1226 routes ALL leaves into struct when
+  // active; Matroska.pm:929 explicitly drops TagDefault at flush).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    126,
-    "expected exactly the 126 active conformance fixtures, found {}: {:?}",
+    139,
+    "expected exactly the 139 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

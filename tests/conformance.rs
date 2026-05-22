@@ -50,6 +50,364 @@ fn aac_conformance() {
 }
 
 #[test]
+fn matroska_conformance() {
+  // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
+  // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio
+  // tracks with `DocType="matroska"`). Goldens are bundled
+  // `perl exiftool -j -G1:1 -api struct=1` output with `System:*` and
+  // `Composite:*` stripped uniformly (matching every other format
+  // conformance — composite-tag system is deferred per
+  // `[[exifast-phase2-forward-items]]`).
+  check("Matroska.mkv", "Matroska.mkv.json", true);
+  check("Matroska.mkv", "Matroska.mkv.n.json", false);
+}
+
+#[test]
+fn matroska_simpletag_conformance() {
+  // PR #31 R1 finding F1 — Tags → SimpleTag → TagName/TagString
+  // mapping via `Image::ExifTool::Matroska::StdTag` (Matroska.pm:750-
+  // 891). Synthetic fixture: EBMLHeader + Segment[Info + Tracks +
+  // Tags[Tag[SimpleTag(TITLE, "Hello World"), SimpleTag(ARTIST, "Test
+  // Artist"), SimpleTag(DATE_RELEASED, "2010-01-15")]]]. Exercises the
+  // StdTag canonical-name lookup (TITLE→Title, ARTIST→Artist,
+  // DATE_RELEASED→DateReleased + dateInfo separator conversion).
+  // Goldens captured with `perl exiftool -j -G1:1 -api struct=1
+  // -x System:all -x Composite:all`.
+  check(
+    "Matroska_simpletag.mkv",
+    "Matroska_simpletag.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_simpletag.mkv",
+    "Matroska_simpletag.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_unknown_segment_conformance() {
+  // PR #31 R1 finding F2 — unknown-size master element handling
+  // (Matroska.pm:1073-1085, 1114). Synthetic fixture: EBMLHeader +
+  // Segment(size = unknown-8-byte-VINT)[Info + Tracks]. Without F2
+  // the walker breaks on the unknown-size VINT after EBMLHeader and
+  // emits ONLY File:* + EBMLHeader children (losing Info + Tracks).
+  // With F2 the walker descends the unknown-size Segment using the
+  // parent's end (here EOF) as the effective bound, faithful to
+  // Matroska.pm:1073 `$size = 1e20` for unknown-size masters.
+  check(
+    "Matroska_unknown_segment.mkv",
+    "Matroska_unknown_segment.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_unknown_segment.mkv",
+    "Matroska_unknown_segment.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_cluster_skip_conformance() {
+  // PR #31 R1 finding F3 — Cluster default-skip (Matroska.pm:1096-
+  // 1105). Synthetic fixture: EBMLHeader + Segment[Info + Cluster
+  // (with Timecode + SimpleBlock body) + Tags]. Bundled DEFAULT
+  // behavior is to `last` the walker at the first Cluster (no
+  // `-v`/`-U > 1`/`-ee`), so Tags AFTER Cluster MUST NOT be emitted —
+  // matches our `Kind::SkipBody` → `break` semantics. Verifies we
+  // emit Info:* but neither walk into Cluster's body (SimpleBlock
+  // would emit nothing anyway since it's NoSave) nor pick up the
+  // Tags AFTER Cluster.
+  check(
+    "Matroska_cluster_skip.mkv",
+    "Matroska_cluster_skip.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_cluster_skip.mkv",
+    "Matroska_cluster_skip.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_negative_subsecond_date_conformance() {
+  // PR #31 R2 finding companion fixture — pre-2001 DateUTC (signed
+  // nanoseconds < 0) exercises BOTH (a) the EBML 8-byte signed-decode
+  // f64-promotion loss (`Matroska.pm:1184-1191` — Perl's `$val * 256 +
+  // $byte` accumulator promotes IV→NV at ~2^64 magnitude, so the
+  // post-subtract `$val` is OFF FROM THE EXACT INTEGER by ~256), and
+  // (b) the fractional-second `$frac < 0 → frac += 1, $itime -= 1`
+  // correction branch in `ExifTool.pm:6782`.
+  //
+  // Synthetic fixture: raw_ns = -1_500_000_000 (1.5 s before Matroska
+  // epoch). Bundled-Perl emits "2000:12:31 23:59:58.499999762Z" — the
+  // `.499999762` (not `.5`) is Perl's deliberate decode loss; our
+  // `convert_matroska_date` replays it via `(raw_ns as u64) as f64 -
+  // 2^64` for byte-exact match.
+  check(
+    "Matroska_negative_subsecond_date.mkv",
+    "Matroska_negative_subsecond_date.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_negative_subsecond_date.mkv",
+    "Matroska_negative_subsecond_date.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_subsecond_date_conformance() {
+  // PR #31 R2 finding — `Value::Date` rendering used `as i64` casting on
+  // `secs_unix` (f64), silently dropping the subsecond component that
+  // Perl's `ConvertUnixTime($t, undef, -9) . 'Z'` preserves
+  // (ExifTool.pm:6773-6800 fractional branch + `dec=-9` trim). The
+  // bundled Matroska.mkv fixture's DateTimeOriginal carries integer
+  // nanoseconds (`2010:02:03 21:17:48Z` — no fractional), so the
+  // original conformance didn't catch the loss.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[TimecodeScale,
+  // MuxingApp, WritingApp, DateUTC = 286_658_268_123_456_789]] →
+  // post-Matroska-offset `$t = 1264965468.123456789` → bundled-Perl
+  // emits `"2010:01:31 19:17:48.123456717Z"` (the `.717` instead of
+  // `.789` is the inherent f64 precision loss of Perl's `$val / 1e9`,
+  // which our `convert_matroska_date` faithfully transliterates).
+  //
+  // Goldens captured with `EXIFTOOL=...exiftool tools/gen_golden.sh
+  // Matroska_subsecond_date.mkv` — UNTRIMMED; the synthetic body is so
+  // minimal there are no System:* / Composite:* tags emitted by Perl
+  // for this fixture (gen_golden.sh strips fs-dependent System fields).
+  check(
+    "Matroska_subsecond_date.mkv",
+    "Matroska_subsecond_date.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_subsecond_date.mkv",
+    "Matroska_subsecond_date.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_attachment_conformance() {
+  // PR #31 R1 finding F5 — Binary elements (Matroska.pm:552
+  // `AttachedFileData`, 695 `TagBinary`). Synthetic fixture:
+  // EBMLHeader + Segment[Info + Tracks + Attachments[AttachedFile
+  // (Name=cover.jpg, MIME=image/jpeg, UID=deadbeef, Data=32B)]].
+  // Bundled emits AttachedFileData as
+  // `"(Binary data 32 bytes, use -b option to extract)"` (identical
+  // string for both `-j` and `-n` — TagValue::Bytes serialization in
+  // `src/value.rs:711-716`). With pre-F5 `Kind::Skip` the binary
+  // payload was silently dropped.
+  check(
+    "Matroska_attachment.mkv",
+    "Matroska_attachment.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_attachment.mkv",
+    "Matroska_attachment.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_duration_before_scale_conformance() {
+  // PR #31 R3 finding — Duration ValueConv (Matroska.pm:170-171)
+  // `'$$self{TimecodeScale} ? $val * $$self{TimecodeScale} / 1e9 :
+  // $val / 1000'`. ValueConv/PrintConv are deferred to output time
+  // and read `$$self{TimecodeScale}` LAZILY (verified empirically
+  // against bundled-Perl 13.58 — for files where Duration precedes
+  // TimecodeScale, bundled still applies the FINAL TimecodeScale).
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, Duration=60000.0 raw_float, TimecodeScale=1_000_000
+  // (1 ms)]] — Duration appears BEFORE TimecodeScale in the EBML
+  // walk. Bundled emits `"Info:Duration": "0:01:00"` because the
+  // LAST `$$self{TimecodeScale}` (1 ms) is used at output-time
+  // ValueConv ⇒ `60000 * 1e6 / 1e9 = 60.0 s = "0:01:00"`. This
+  // pins the order-independence semantic so a future walk-time
+  // ValueConv refactor that misread Perl's deferred-eval semantics
+  // would regress.
+  check(
+    "Matroska_duration_before_scale.mkv",
+    "Matroska_duration_before_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_before_scale.mkv",
+    "Matroska_duration_before_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_duration_no_scale_conformance() {
+  // PR #31 R3 — Duration FALSY branch (NO TimecodeScale in the file).
+  // ValueConv: `$$self{TimecodeScale} ? ... : $val / 1000` — when
+  // TimecodeScale is absent, `$$self{TimecodeScale}` is `undef` ⇒
+  // FALSY ⇒ fallback fires ⇒ `60000 / 1000 = 60`. PrintConv ALSO
+  // gates on the same ternary ⇒ bare numeric (NOT
+  // `ConvertDuration($val)`), so `-j` and `-n` BOTH emit `60`.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, Duration=60000.0]] (no TimecodeScale element at all).
+  check(
+    "Matroska_duration_no_scale.mkv",
+    "Matroska_duration_no_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_no_scale.mkv",
+    "Matroska_duration_no_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_track_targeted_tag_conformance() {
+  // PR #31 R4 finding F2 — Track-targeted SimpleTag misattribution
+  // (Matroska.pm:1207-1216). Bundled records every `TrackUID` inside a
+  // TrackEntry into `%trackNum{$val} = $$et{SET_GROUP1}` (raw bytes →
+  // Track<N>); when `TagTrackUID` is later read inside `Tags/Tag/
+  // Targets`, the matching raw bytes look up the mapped `Track<N>` and
+  // OVERRIDE SET_GROUP1 for the duration of the enclosing `Tag` master.
+  // SimpleTag children then emit under `Track<N>` instead of the
+  // default file-level group.
+  //
+  // Synthetic fixture: TrackEntry[TrackNumber=1, TrackUID=01020304,
+  // TrackType=Video] + Tags[Tag[Targets[TagTrackUID=01020304],
+  // SimpleTag[TagName="TITLE", TagString="Track Title"]]]. Bundled
+  // emits `Track1:TagTrackUID: "01020304"` AND `Track1:Title: "Track
+  // Title"` (NOT `Matroska:TagTrackUID` / `Matroska:Title`, which is
+  // what the pre-fix walker emitted).
+  //
+  // Lock-depth semantics: the `Tag` master's index in `Walker.ends` is
+  // used as the reset trigger, faithful to Perl's
+  // `$trackIndent = substr($$et{INDENT}, 0, -2)` one-level-up reset
+  // (Matroska.pm:1215). Multiple sibling Tags in the same Tags section
+  // can each re-set/reset independently.
+  check(
+    "Matroska_track_targeted_tag.mkv",
+    "Matroska_track_targeted_tag.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_track_targeted_tag.mkv",
+    "Matroska_track_targeted_tag.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_simpletag_duplicates_conformance() {
+  // PR #31 R5 finding — SimpleTag accumulator semantics. Matroska.pm:1224-
+  // 1226 is `if ($$tagInfo{NoSave} or $struct) { ... $$struct{$tagName} =
+  // $val if $struct; }` — i.e. plain Perl hash assignment, which is
+  // OVERWRITE semantics. Two divergences from the pre-R5 Rust port:
+  //   (1) The accumulator was first-wins on TagName/TagString/TagBinary —
+  //       Perl is last-wins (a second-occurrence `$$struct{TagString}` would
+  //       silently overwrite the first).
+  //   (2) Only TagBinary/TagName/TagString routed into the struct; other
+  //       leaves inside SimpleTag (e.g. `TagDefault` 0x484, `Format =>
+  //       'unsigned'`, Matroska.pm:690) fell through `Kind::Unsigned` →
+  //       `push_entry` → emitted as a TOP-LEVEL `Tags:TagDefault` tag.
+  //       Bundled NEVER emits such children (HandleStruct, Matroska.pm:
+  //       897-948, only reads TagName/TagString/TagBinary/TagLanguage — the
+  //       absorbed TagDefault is silently dropped at flush time per the
+  //       explicit "not currently handling TagDefault attribute" comment
+  //       at Matroska.pm:929).
+  //
+  // Synthetic fixture: a single Tag block with TWO SimpleTags:
+  //   #1: TagName="TITLE", TagString="First", TagString="Last",
+  //       TagDefault=1 → bundled emits `Matroska:Title: "Last"`.
+  //   #2: TagName="ARTIST", TagString="Original Artist",
+  //       TagName="REPLACED_ARTIST", TagDefault=0 → bundled emits
+  //       `Matroska:ReplacedArtist: "Original Artist"` (the LAST TagName
+  //       binds the canonical lookup key; `REPLACED_ARTIST` is NOT in
+  //       StdTag so `synthesize_tag_name` kicks in: lowercase →
+  //       `replaced_artist`, ucfirst → `Replaced_artist`, then `_a` → `A`
+  //       per `s/_([a-z])/\U$1/g` ⇒ `ReplacedArtist`).
+  //
+  // Neither golden contains `Matroska:TagDefault` (or any TagDefault
+  // emission anywhere) — the pre-R5 Rust would have emitted both as
+  // top-level tags.
+  check(
+    "Matroska_simpletag_duplicates.mkv",
+    "Matroska_simpletag_duplicates.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_simpletag_duplicates.mkv",
+    "Matroska_simpletag_duplicates.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_chapters_conformance() {
+  // PR #31 R4 finding F1 — ChapterTimeStart (0x11) + ChapterTimeEnd (0x12)
+  // were `Kind::Skip` (silent drop). Bundled extracts both as
+  // `Format => 'unsigned'`, `ValueConv => '$val / 1e9'`,
+  // `PrintConv => 'ConvertDuration($val)'` (Matroska.pm:580-592). Group
+  // attribution: each ChapterAtom (Matroska.pm:1117-1118) bumps a 1-based
+  // counter and SET_GROUP1 → `Chapter<n>`, so a fixture with one
+  // ChapterAtom emits `Chapter1:ChapterTimeStart`, etc.
+  //
+  // Two ancillary fixes wrapped into this finding:
+  //   (a) The walker's ID-validity guard previously rejected ID 0
+  //       (`id_v.value() <= 0` ⇒ `< 0`, faithful to Matroska.pm:1068
+  //       `$tag >= 0`). ChapterDisplay's ID IS 0 (Matroska.pm:615), so
+  //       any chapter content (including ChapterString) was being
+  //       dropped.
+  //   (b) The new `Kind::ChapterTimeNs` carries raw u64 ns through to
+  //       output-time `ValueConv` + `ConvertDuration` (faithful to the
+  //       deferred-eval semantics the rest of the Matroska module uses).
+  //
+  // Synthetic fixture: EBMLHeader + Segment[Info(TimecodeScale=1ms,
+  // MuxingApp, WritingApp) + Chapters[EditionEntry[ChapterAtom[
+  // ChapterTimeStart=60s in ns, ChapterTimeEnd=120s in ns, ChapterDisplay
+  // [ChapterString="Intro"]]]]]. Bundled `-j` emits
+  // `Chapter1:ChapterTimeStart: "0:01:00"`, ChapterTimeEnd: "0:02:00",
+  // ChapterString: "Intro". Bundled `-n` emits the bare numeric seconds.
+  check("Matroska_chapters.mkv", "Matroska_chapters.mkv.json", true);
+  check(
+    "Matroska_chapters.mkv",
+    "Matroska_chapters.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_duration_zero_scale_conformance() {
+  // PR #31 R3 finding — the ACTUAL pre-fix bug. ValueConv:
+  // `$$self{TimecodeScale} ? $val * $$self{TimecodeScale} / 1e9 :
+  // $val / 1000` — PERL TRUTHINESS, so `$$self{TimecodeScale} = 0`
+  // is FALSY (NOT just `undef`). Pre-R3-fix Rust code matched
+  // `Some(ts) => raw * ts / 1e9` unconditionally, so `Some(0)`
+  // took the WRONG branch ⇒ `60000 * 0 / 1e9 = 0`. Post-fix
+  // adds an explicit `ts != 0` guard ⇒ both `None` AND `Some(0)`
+  // fall through to `$val / 1000` ⇒ `60.0`. PrintConv mirrors
+  // the same truthiness ⇒ bare numeric.
+  //
+  // Synthetic fixture: minimal EBMLHeader + Segment[Info[MuxingApp,
+  // WritingApp, TimecodeScale=0, Duration=60000.0]] — TimecodeScale
+  // explicitly stored as 0 (1-byte unsigned).
+  check(
+    "Matroska_duration_zero_scale.mkv",
+    "Matroska_duration_zero_scale.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_duration_zero_scale.mkv",
+    "Matroska_duration_zero_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn wavpack_conformance() {
   // FORMATS.md row 6. Native `wvpk....` 32-byte header (no RIFF wrapper,
   // no ID3, no APE) ⇒ ProcessWV runs the WavPack::Main ProcessBinaryData
