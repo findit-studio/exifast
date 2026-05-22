@@ -106,6 +106,55 @@ fn quicktime_moov_order_conformance() {
 }
 
 #[test]
+fn mxf_conformance() {
+  // FORMATS.md row 24 (Engine-only). `tests/fixtures/MXF.mxf` is the
+  // bundled `lib/Image/ExifTool/t/images/MXF.mxf` (7510 bytes — header
+  // partition pack + Primer + Preface/Identification/Material+Source
+  // Package/Track/SequenceSet/TimecodeComponent/WaveAudioDescriptor local
+  // sets + footer). Exercises the KLV walker, BER length decoder, Primer
+  // local-id→UL map, local-set walker, the MXF-specific value decoders
+  // (UTF-16BE, Timestamp, VersionType, ProductVersion, GUID, PackageID,
+  // rational64s, Boolean, Length+%duration), `Track<N>` family-1 group
+  // attribution via the object-tree walk, EditRate-based duration
+  // conversion, the synthesized best `MXF:Duration`, and the reverse-order
+  // duplicate removal. Goldens are bundled `perl exiftool -j -G1:1
+  // -api struct=1` output with `System:*` stripped (the engine emits no
+  // `System:*`); the bundled MXF output has NO `Composite:*` rows, so the
+  // goldens are otherwise UNTRIMMED.
+  check("MXF.mxf", "MXF.mxf.json", true);
+  check("MXF.mxf", "MXF.mxf.n.json", false);
+}
+
+#[test]
+fn mxf_multidescriptor_conformance() {
+  // Codex R1/F1 regression: a multi-essence MXF whose audio descriptors are
+  // reachable from the `Preface` root ONLY through the HIDDEN structural
+  // edges `SourcePackage.EssenceDescription (StrongReference) ->
+  // MultipleDescriptor.FileDescriptors (StrongReferenceArray) ->
+  // [WaveAudioDescriptor, WaveAudioDescriptor]`, and whose SourcePackage
+  // tracks hang off `PackageTracks` (StrongReferenceArray) rather than
+  // `Tracks`. Neither `FileDescriptors`, `MultipleDescriptor.SampleRate`'s
+  // owning set, nor `PackageTracks` are ever EMITTED (all `Unknown => 1`),
+  // but ExifTool decodes them into `@strongRef` (MXF.pm:2638) so `SetGroups`
+  // (MXF.pm:2770) walks the descriptor subtree and re-stamps the descriptor
+  // tags with the linked `Track<N>` group (`Track3`/`Track4` here, via each
+  // descriptor's `LinkedTrackID`). Before the fix the descriptor ULs were
+  // dropped at the tag-table lookup, so `set_groups` never visited the
+  // descriptors and their tags stayed under `MXF` with un-converted
+  // durations. Goldens are the bundled oracle (`tools/gen_golden.sh`).
+  check(
+    "MXF_MultiDescriptor.mxf",
+    "MXF_MultiDescriptor.mxf.json",
+    true,
+  );
+  check(
+    "MXF_MultiDescriptor.mxf",
+    "MXF_MultiDescriptor.mxf.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_nested_size0_conformance() {
   // PR #38 Codex R1/F5: a SYNTHETIC `.mov` whose `moov` contains a size-0
   // `free` atom (a CONTAINED zero-size = terminator, QuickTime.pm:10036-
@@ -750,6 +799,76 @@ fn quicktime_nested_invalid_tkhd_conformance() {
   check(
     "QuickTime_nested_invalid_tkhd.mov",
     "QuickTime_nested_invalid_tkhd.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn mxf_utf16_bom_conformance() {
+  // Codex R2/F1 regression: `MXF.mxf` with every UTF-16 `ApplicationName` /
+  // `TrackName` value rewritten to carry a byte-order mark (byte-length
+  // preserved by dropping one trailing char). MXF.pm:2484 decodes UTF-16 via
+  // `$et->Decode($val, 'UTF16')` with no byte-order arg, so Charset::Decompose
+  // (Charset.pm:188-206) defaults to GetByteOrder() = 'MM' (big-endian, set at
+  // MXF.pm:2821) and then strips a leading BOM: `$val =~ s/^(\xfe\xff|\xff\xfe)//`
+  // sets `$fmt = $1 eq "\xfe\xff" ? 'n*' : 'v*'`. So a `FE FF` (BE) BOM is
+  // stripped and the remainder decoded big-endian (NOT preserved as a leading
+  // U+FEFF), and a `FF FE` (LE) BOM is stripped AND the remainder decoded
+  // little-endian (NOT garbled by a big-endian read). Both goldens come from
+  // the bundled oracle (`tools/gen_golden.sh`) and decode to the identical
+  // BOM-stripped text ("ExifToo", "Timecode Trac", "Sound Trac").
+  check("MXF_BomBE.mxf", "MXF_BomBE.mxf.json", true);
+  check("MXF_BomBE.mxf", "MXF_BomBE.mxf.n.json", false);
+  check("MXF_BomLE.mxf", "MXF_BomLE.mxf.json", true);
+  check("MXF_BomLE.mxf", "MXF_BomLE.mxf.n.json", false);
+}
+
+#[test]
+fn mxf_dup_duration_all_ff_conformance() {
+  // Codex R3/F1 regression: two same-InstanceUID `TimecodeComponent` sets, the
+  // EARLIER carrying a VALID `Duration` (100) and the LATER (footer-style)
+  // carrying an all-`0xff` `Duration`. MXF.pm:98's `%duration` RawConv
+  // (`$val > 1e18 ? undef : $val`) returns `undef` for the all-`0xff` value, so
+  // `FoundTag` stores NO key (ExifTool.pm:9493) and MXF.pm:2666's
+  // `next unless $key` skips its `push @groups`. The dropped value is therefore
+  // ABSENT from the reverse-file-order duplicate pass (MXF.pm:2946-2962): it
+  // never claims the `"Duration <UID>"` key, so the earlier VALID `Duration`
+  // is the one kept. Before the fix the port queued a `Duration(i64::MIN)`
+  // sentinel `WalkEntry` for the drop; being LATER in file order it won the
+  // dedup and DELETED the valid earlier `Duration`, then emitted nothing —
+  // erasing `MXF:Duration` entirely. The oracle keeps the valid `0:01:40`
+  // (`-n`: `100`). Goldens are the bundled oracle (`tools/gen_golden.sh`).
+  check("MXF_DupDurationFF.mxf", "MXF_DupDurationFF.mxf.json", true);
+  check(
+    "MXF_DupDurationFF.mxf",
+    "MXF_DupDurationFF.mxf.n.json",
+    false,
+  );
+}
+
+#[test]
+fn mxf_utf16_embedded_nul_conformance() {
+  // Codex R4/F1 regression: `MXF.mxf` with the UTF-16 `ApplicationName` value
+  // changed from `ExifTool` to `E\0ifTool` — the second code unit `00 78`
+  // (`x`, U+0078) flipped to `00 00` (U+0000) in all 3 metadata sets carrying
+  // it (3 bytes total: 0x78 -> 0x00). The NUL is followed by NON-zero stale
+  // text `ifTool`. MXF.pm:2484 decodes UTF-16 via `$et->Decode($val,'UTF16')`,
+  // which routes through Charset::Decompose then Charset::Recompose. Recompose's
+  // UTF-8 branch (Charset.pm:318-327, `$csType == 0x100`) packs the code-point
+  // array and runs `$outVal =~ s/\0.*//s` — TRUNCATING the UTF-8 output at the
+  // first NUL (sub header, Charset.pm:308: "truncated at null character if it
+  // exists"). So the oracle emits `MXF:ApplicationName` as `"E"`, dropping the
+  // post-NUL `ifTool`. Before the fix `decode_utf16` SKIPPED NUL code units
+  // (`tr/\0//d`-style), wrongly concatenating the stale text into `"EifTool"`.
+  // Golden is the bundled oracle (`tools/gen_golden.sh`).
+  check(
+    "MXF_Utf16EmbeddedNul.mxf",
+    "MXF_Utf16EmbeddedNul.mxf.json",
+    true,
+  );
+  check(
+    "MXF_Utf16EmbeddedNul.mxf",
+    "MXF_Utf16EmbeddedNul.mxf.n.json",
     false,
   );
 }

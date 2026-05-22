@@ -35,6 +35,8 @@ pub mod matroska;
 pub mod moi;
 #[cfg(feature = "mpc")]
 pub mod mpc;
+#[cfg(feature = "mxf")]
+pub mod mxf;
 // MPEG audio frame parser is the internal `mpeg-audio` feature (gates
 // `mp3` and is reused by other audio chained formats). Phase D may split
 // `mpeg::audio` from a future `mpeg::video` submodule; today the file

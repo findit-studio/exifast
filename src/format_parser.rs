@@ -324,6 +324,9 @@ pub enum AnyParser {
   /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — ISO-BMFF box container).
   #[cfg(feature = "quicktime")]
   QuickTime(crate::formats::quicktime::ProcessMov),
+  /// MXF (FORMATS.md row 24 — Material Exchange Format KLV container).
+  #[cfg(feature = "mxf")]
+  Mxf(crate::formats::mxf::ProcessMxf),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -419,6 +422,11 @@ pub enum AnyMeta<'a> {
   /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — SP1 core structural atoms).
   #[cfg(feature = "quicktime")]
   QuickTime(crate::formats::quicktime::Meta<'a>),
+  /// MXF (FORMATS.md row 24 — Material Exchange Format). `MxfMeta` owns its
+  /// data (every value is transformed during the KLV walk); `'a` is a
+  /// phantom there, kept for GAT uniformity.
+  #[cfg(feature = "mxf")]
+  Mxf(crate::formats::mxf::MxfMeta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -446,6 +454,7 @@ pub enum AnyMeta<'a> {
     feature = "wavpack",
     feature = "matroska",
     feature = "quicktime",
+    feature = "mxf",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -519,6 +528,8 @@ impl AnyMeta<'_> {
       AnyMeta::Matroska(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "mxf")]
+      AnyMeta::Mxf(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness.
@@ -543,6 +554,7 @@ impl AnyMeta<'_> {
         feature = "wavpack",
         feature = "matroska",
         feature = "quicktime",
+        feature = "mxf",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = (print_conv, out);
@@ -759,6 +771,10 @@ impl AnyMeta<'_> {
       AnyMeta::QuickTime(m) => {
         FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
       }
+      // MXF: `ProcessMXF` calls `SetFileType()` with no argument
+      // (MXF.pm:2820) ⇒ finalize to the detected candidate type.
+      #[cfg(feature = "mxf")]
+      AnyMeta::Mxf(_) => FileTypeFinalize::Detected,
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -780,6 +796,7 @@ impl AnyMeta<'_> {
         feature = "wavpack",
         feature = "matroska",
         feature = "quicktime",
+        feature = "mxf",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -994,6 +1011,10 @@ pub enum AnyError {
   #[cfg(feature = "quicktime")]
   #[error("QuickTime: {0}")]
   QuickTime(#[from] crate::formats::quicktime::Error),
+  /// MXF fatal-error wrapper.
+  #[cfg(feature = "mxf")]
+  #[error("MXF: {0}")]
+  Mxf(#[from] crate::formats::mxf::MxfError),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -1067,6 +1088,7 @@ impl AnyParser {
       feature = "wavpack",
       feature = "matroska",
       feature = "quicktime",
+      feature = "mxf",
     )))]
     let _ = (bytes, shared, ext);
     match self {
@@ -1281,6 +1303,15 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::QuickTime))
           .map_err(Into::into)
       }
+      #[cfg(feature = "mxf")]
+      AnyParser::Mxf(p) => {
+        // MXF is a leaf format (Engine-only, no chained state): `shared`
+        // and `ext` are unused.
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Mxf))
+          .map_err(Into::into)
+      }
     }
   }
 }
@@ -1328,6 +1359,8 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MOV" => Some(AnyParser::QuickTime(crate::formats::quicktime::ProcessMov)),
     #[cfg(feature = "mpc")]
     "MPC" => Some(AnyParser::Mpc(crate::formats::mpc::ProcessMpc)),
+    #[cfg(feature = "mxf")]
+    "MXF" => Some(AnyParser::Mxf(crate::formats::mxf::ProcessMxf)),
     #[cfg(feature = "ogg")]
     "OGG" => Some(AnyParser::Ogg(crate::formats::ogg::ProcessOgg)),
     // ExifTool maps RM / RA / RMVB / RV / RAM / RPM extensions to base type

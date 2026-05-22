@@ -186,7 +186,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_225() {
+fn typed_serde_path_equals_writer_path_and_golden_all_231() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -629,12 +629,39 @@ fn typed_serde_path_equals_writer_path_and_golden_all_225() {
   // not rejected: MediaDataSize=2147483648 from the DECLARED 64-bit size +
   // `Truncated 'mdat' data at offset 0x14`, NOT the dead `LargeFileSupport not
   // enabled` branch the port emitted before the fix, R12/F1).
+  // — after FORMATS.md row 24 lib/mxf: added `MXF.mxf` (bundled
+  // t/images fixture, 7510 bytes) exercising the KLV walker + BER length
+  // decoder + Primer local-id→UL map + local-set walker + the MXF-specific
+  // value decoders + `Track<N>` group attribution ported in
+  // `src/formats/mxf.rs`.
+  // after Codex R1/F1: added `MXF_MultiDescriptor.mxf` (synthetic,
+  // 2426 bytes) — a multi-essence MXF whose audio descriptors are reachable
+  // ONLY through the hidden `MultipleDescriptor.FileDescriptors` /
+  // `SourcePackage.PackageTracks` StrongReference edges, exercising the
+  // complete structural-edge subset of `TAG_TABLE`.
+  // after Codex R2/F1: added `MXF_BomBE.mxf` + `MXF_BomLE.mxf`
+  // (each MXF.mxf with its UTF-16 `ApplicationName`/`TrackName` values
+  // rewritten to carry a `FE FF` / `FF FE` byte-order mark, byte-length
+  // preserved) — pinning `Charset.pm:203-206` BOM handling in the UTF-16
+  // decoder: a BE BOM is stripped (not preserved as U+FEFF) and a LE BOM is
+  // stripped AND the remainder decoded little-endian (not garbled).
+  // after Codex R3/F1: added `MXF_DupDurationFF.mxf` (synthetic, two
+  // same-InstanceUID `TimecodeComponent` sets — earlier valid `Duration`,
+  // later all-`0xff`) — pinning that MXF.pm:98's `%duration` RawConv-`undef`
+  // drop is a NON-entry (ExifTool.pm:9493 + MXF.pm:2666 `next unless $key`),
+  // so the dropped value never participates in the reverse-order duplicate
+  // pass and the earlier valid `Duration` survives.
+  // after Codex R4/F1: added `MXF_Utf16EmbeddedNul.mxf` (`MXF.mxf`
+  // with the UTF-16 `ApplicationName` `ExifTool` rewritten to `E\0ifTool` —
+  // an in-band NUL followed by non-zero stale text) — pinning that
+  // `Charset.pm:326`'s `Recompose` runs `s/\0.*//s` and TRUNCATES the UTF-8
+  // output at the first NUL, so the oracle emits `"E"` (not `"EifTool"`).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    225,
-    "expected exactly the 225 active conformance fixtures, found {}: {:?}",
+    231,
+    "expected exactly the 231 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

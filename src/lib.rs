@@ -187,6 +187,8 @@ pub use formats::moi::ProcessMoi;
 pub use formats::mpc::ProcessMpc;
 #[cfg(feature = "mpeg-audio")]
 pub use formats::mpeg::ProcessMpegAudio;
+#[cfg(feature = "mxf")]
+pub use formats::mxf::ProcessMxf;
 #[cfg(feature = "ogg")]
 pub use formats::ogg::ProcessOgg;
 #[cfg(feature = "quicktime")]
@@ -328,6 +330,19 @@ pub fn parse_quicktime(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::quicktime::Meta<'_>>, formats::quicktime::Error> {
   formats::quicktime::parse_borrowed(bytes)
+}
+
+/// Parse an MXF (Material Exchange Format) buffer directly. See
+/// [`formats::mxf::parse_borrowed`].
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::mxf::MxfError`] (currently uninhabited).
+#[cfg(feature = "mxf")]
+pub fn parse_mxf(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::mxf::MxfMeta<'_>>, formats::mxf::MxfError> {
+  formats::mxf::parse_borrowed(bytes)
 }
 
 /// Parse an AAC (ADTS) buffer directly. See [`formats::aac::parse_borrowed`].
@@ -743,6 +758,8 @@ mod tests {
     let _ = parse_moi(bytes);
     #[cfg(feature = "matroska")]
     let _ = parse_matroska(bytes);
+    #[cfg(feature = "mxf")]
+    let _ = parse_mxf(bytes);
     #[cfg(feature = "aac")]
     let _ = parse_aac(bytes);
     #[cfg(feature = "dv")]
