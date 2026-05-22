@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "flash_nested_livexml.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "flv",
+  "File:MIMEType": "video/x-flv",
+  "Flash:FooLiveXML": "some_value"
+}]

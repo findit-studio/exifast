@@ -21,6 +21,8 @@ pub mod dsf;
 pub mod dv;
 #[cfg(feature = "flac")]
 pub mod flac;
+#[cfg(feature = "flash")]
+pub mod flash;
 #[cfg(feature = "id3")]
 pub mod id3;
 #[cfg(feature = "matroska")]

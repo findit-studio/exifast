@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "flash_array_strings.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "flv",
+  "File:MIMEType": "video/x-flv",
+  "Flash:StrList": ["alpha","beta","gamma"]
+}]

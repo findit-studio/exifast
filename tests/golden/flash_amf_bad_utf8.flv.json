@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "flash_amf_bad_utf8.flv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "FLV",
+  "File:FileTypeExtension": "flv",
+  "File:MIMEType": "video/x-flv",
+  "Flash:BadStr": "A?B",
+  "Flash:BadLong": "A?B",
+  "Flash:BadXml": "A?B"
+}]

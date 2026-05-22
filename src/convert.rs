@@ -308,6 +308,261 @@ fn is_int(s: &str) -> bool {
   !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
 }
 
+/// Faithful transliteration of ExifTool `sub IsFloat($)`
+/// (`ExifTool.pm:5936-5942`):
+///
+/// ```perl
+/// return 1 if $_[0] =~ /^[+-]?(?=\d|\.\d)\d*(\.\d*)?([Ee]([+-]?\d+))?$/;
+/// # allow comma separators (for other locales)
+/// return 0 unless $_[0] =~ /^[+-]?(?=\d|,\d)\d*(,\d*)?([Ee]([+-]?\d+))?$/;
+/// $_[0] =~ tr/,/./;   # but translate ',' to '.'
+/// return 1;
+/// ```
+///
+/// Two anchored, whole-string forms (NO leading/trailing whitespace, NO hex):
+/// an optional sign, then either a dot-decimal float (`12.5`, `.5`, `3.`,
+/// `+3`, `1e3`) OR a single comma-decimal float (`12,5`, `,5` — at most one
+/// comma per the `(,\d*)?` group). On the comma branch the caller's value is
+/// rewritten `,`→`.` (the Perl `tr` mutates `$_[0]`), so we return the
+/// already-translated owned string alongside the boolean. The caller uses the
+/// returned string for the subsequent numeric coercion.
+///
+/// Returns `(matched, value_to_coerce)`:
+/// - `matched == false` ⇒ NOT a float; `value_to_coerce` is the input
+///   unchanged (the caller's `return $val unless IsFloat($val)`).
+/// - `matched == true` ⇒ a float; `value_to_coerce` is the input with a sole
+///   comma (if any) translated to a dot — a clean dot-decimal numeric string.
+///
+/// Bundled-Perl oracle (verified 2026-05-22 via `Image::ExifTool::IsFloat`):
+/// `"12.5"`/`".5"`/`"3."`/`"+3"`/`"1e3"`/`"-2.5"` → matched; `"12,5"`/`",5"`
+/// → matched + translated to `"12.5"`/`".5"`; `"  12.5"`/`"12.5 "`/`"0x10"`/
+/// `"12abc"`/`""`/`"1e"`/`"1,5,6"`/`"inf"`/`"nan"` → NOT matched.
+fn is_float(s: &str) -> (bool, std::borrow::Cow<'_, str>) {
+  use std::borrow::Cow;
+  // Dot-decimal branch (ExifTool.pm:5937) — `(?=\d|\.\d)` requires the
+  // mantissa to start with a digit OR a `.` immediately followed by a digit.
+  if matches_float_shape(s, b'.') {
+    return (true, Cow::Borrowed(s));
+  }
+  // Comma-decimal branch (ExifTool.pm:5939) — same shape with `,` as the
+  // single decimal separator; on a match the Perl `tr/,/./` rewrites the
+  // value. At most one comma is permitted by the `(,\d*)?` group.
+  if matches_float_shape(s, b',') {
+    return (true, Cow::Owned(s.replace(',', ".")));
+  }
+  (false, Cow::Borrowed(s))
+}
+
+/// Whole-string match of ExifTool's `IsFloat` mantissa shape with `sep` as the
+/// decimal separator: `^[+-]?(?=\d|<sep>\d)\d*(<sep>\d*)?([Ee]([+-]?\d+))?$`.
+/// `sep` is `b'.'` for the primary branch (ExifTool.pm:5937) or `b','` for the
+/// locale branch (ExifTool.pm:5939).
+fn matches_float_shape(s: &str, sep: u8) -> bool {
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  // Optional leading sign.
+  if matches!(bytes.first(), Some(b'+' | b'-')) {
+    i += 1;
+  }
+  // Lookahead `(?=\d|<sep>\d)`: next char is a digit, OR `<sep>` followed by a
+  // digit. Anything else (including end-of-string, a bare `<sep>`, or a
+  // trailing separator like `<sep>` with no digit) fails the anchor.
+  let look_ok = match bytes.get(i) {
+    Some(b) if b.is_ascii_digit() => true,
+    Some(&b) if b == sep => matches!(bytes.get(i + 1), Some(d) if d.is_ascii_digit()),
+    _ => false,
+  };
+  if !look_ok {
+    return false;
+  }
+  // `\d*` integer part.
+  while matches!(bytes.get(i), Some(b) if b.is_ascii_digit()) {
+    i += 1;
+  }
+  // `(<sep>\d*)?` — at most one separator, then zero-or-more digits.
+  if bytes.get(i) == Some(&sep) {
+    i += 1;
+    while matches!(bytes.get(i), Some(b) if b.is_ascii_digit()) {
+      i += 1;
+    }
+  }
+  // `([Ee]([+-]?\d+))?` — optional exponent with a MANDATORY ≥1-digit power.
+  if matches!(bytes.get(i), Some(b'e' | b'E')) {
+    i += 1;
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
+      i += 1;
+    }
+    let exp_start = i;
+    while matches!(bytes.get(i), Some(b) if b.is_ascii_digit()) {
+      i += 1;
+    }
+    if i == exp_start {
+      return false; // `[Ee]` with no power (e.g. `"1e"`) ⇒ no match.
+    }
+  }
+  // `$` — the whole string must be consumed.
+  i == bytes.len()
+}
+
+/// Perl numeric-context coercion of a string to an `f64`, matching Perl's
+/// `$val + 0` / `$val * N` on a non-numeric or partially-numeric scalar.
+///
+/// Perl skips leading ASCII whitespace, then takes the longest leading prefix
+/// matching `[+-]? ( \d* (\. \d*)? | \. \d+ ) ( [eE] [+-]? \d+ )?` and parses
+/// that prefix as a double; the remainder of the string is ignored. A `,`
+/// is NOT a decimal separator in raw arithmetic (it terminates the prefix),
+/// matching Perl (`"1,5" + 0 == 1`). No leading numeric prefix ⇒ `0.0`; no
+/// hex parsing (`"0x10" + 0 == 0`).
+///
+/// In addition to the finite numeric grammar, Perl's `Perl_my_atof` recognises
+/// the IEEE non-finite spellings (oracle 2026-05-22 via `no warnings "numeric";
+/// $s+0`), AFTER the same leading-whitespace skip and optional sign:
+///   * `inf` (case-insensitive) → `±Inf`. The match is PREFIX-only: any tail
+///     is ignored, so `inf`, `Inf`, `INFINITY`, `infinity`, `infinit`, `infX`
+///     all coerce to `Inf` (`-inf` → `-Inf`). A leading sign carries.
+///   * `nan` (case-insensitive) → `NaN`. Prefix-only likewise (`nan`, `NaN`,
+///     `nan(123)`, `nanX` → `NaN`); any sign is dropped (`-nan` → `NaN`).
+///   * The legacy MSVCRT spellings `1.#INF` / `1.#IND` / `1.#NAN` / `1.#QNAN`
+///     / `1.#SNAN` (and the `1#INF` variant): a mantissa of EXACTLY `1`
+///     (`1` or `1.`, not `1.0` / `01.`) followed by `#` then a case-insensitive
+///     `INF` / `IND` / `NAN` / `QNAN` / `SNAN` prefix → `Inf` / `NaN`
+///     (sign carries for `INF`: `-1.#INF` → `-Inf`). `1.#IN` / `1.#I` (no full
+///     keyword) fall back to the finite mantissa `1`.
+///
+/// Leading junk before `inf`/`nan` is NOT a numeric prefix (`xinf`/`12inf` →
+/// `0` / `12`, matching the finite rule), and a partial keyword (`in`, `na`,
+/// `i`, `n`) yields `0`.
+///
+/// This is the `f64` analogue of [`perl_numeric_coerce`] (which truncates to a
+/// `u64` for bitwise contexts). It is used by the Flash AMF-string ValueConv
+/// `$val * 1000` (Flash.pm:168/230/237) and the `framerate` PrintConv
+/// `int($val * 1000 + 0.5) / 1000` (Flash.pm:197), where Perl coerces an
+/// AMF-string-typed value through arithmetic. A non-finite ValueConv result
+/// (e.g. `"inf" * 1000 == Inf`) then flows into `ConvertBitrate` /
+/// `ConvertDuration` (both `IsFloat`-reject it → pass through) or the bare
+/// numeric emit, all of which render it via [`crate::value::perl_nonfinite_str`]
+/// to Perl's `Inf` / `-Inf` / `NaN` casing.
+///
+/// Bundled-Perl oracle (verified 2026-05-22 via `no warnings "numeric"; $s+0`):
+/// `"65.8"`/`"  65.8  "`/`"65.8 kbps"` → `65.8`; `"12abc"` → `12.0`;
+/// `"1e3"` → `1000.0`; `"1,5"`/`"12,5"` → `1.0`/`12.0` (comma terminates);
+/// `".5"` → `0.5`; `"3."` → `3.0`; `"+3.5"` → `3.5`; `"-2"` → `-2.0`;
+/// `"abc"`/`""`/`"  "`/`"0x10"` → `0.0`; `"inf"`/`"Infinity"`/`"+inf"` → `Inf`;
+/// `"-inf"`/`"-1.#INF"` → `-Inf`; `"nan"`/`"NaN"`/`"1.#IND"`/`"-nan"` → `NaN`.
+#[allow(dead_code)] // Used by `feature = "flash"`; unused under feature-pruned builds without it.
+pub fn perl_str_to_f64(s: &str) -> f64 {
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  // Perl skips leading whitespace (space, tab, NL, CR, FF, VT — exactly
+  // `is_ascii_whitespace`) before numeric coercion (oracle 2026-05-22).
+  while matches!(bytes.get(i), Some(b) if b.is_ascii_whitespace()) {
+    i += 1;
+  }
+  let prefix_start = i;
+  // Optional sign (captured for the non-finite spellings — `-inf` carries the
+  // sign onto `Inf`; `nan`/`-nan` are unsigned `NaN`).
+  let negative = bytes.get(i) == Some(&b'-');
+  if matches!(bytes.get(i), Some(b'+' | b'-')) {
+    i += 1;
+  }
+  // IEEE non-finite spellings — checked AFTER the sign, BEFORE the digit grammar
+  // (a leading digit means a finite mantissa, so `inf`/`nan` can only begin the
+  // post-sign run; `12inf` falls through to the digit path and stops at `12`).
+  if ascii_prefix_eq_ci(&bytes[i..], b"inf") {
+    return if negative {
+      f64::NEG_INFINITY
+    } else {
+      f64::INFINITY
+    };
+  }
+  if ascii_prefix_eq_ci(&bytes[i..], b"nan") {
+    return f64::NAN; // Perl drops the sign on NaN (`-nan` + 0 == NaN).
+  }
+  let mantissa_start = i;
+  // Integer digits.
+  while matches!(bytes.get(i), Some(b) if b.is_ascii_digit()) {
+    i += 1;
+  }
+  // Optional fraction `. \d*` (a `.` joins the prefix only if a digit precedes
+  // it OR follows it — `"."`/`"+."` alone is not numeric).
+  if bytes.get(i) == Some(&b'.') {
+    let had_int_digits = i > mantissa_start;
+    let frac_start = i + 1;
+    let mut j = frac_start;
+    while matches!(bytes.get(j), Some(b) if b.is_ascii_digit()) {
+      j += 1;
+    }
+    if had_int_digits || j > frac_start {
+      // `"3."`, `".5"`, or `"3.5"` — consume the dot + fraction digits.
+      i = j;
+    }
+    // else: a lone `.` with no surrounding digit — leave `i` before the dot.
+  }
+  // Legacy MSVCRT `1.#INF` / `1.#IND` / `1.#NAN` / `1.#QNAN` / `1.#SNAN` forms
+  // (and `1#INF`): the consumed mantissa must be EXACTLY `1` — i.e. the bytes
+  // `[mantissa_start..i]` are `"1"` or `"1."` (so `1.0` / `01.` / `2.` do NOT
+  // qualify; oracle: `1.0#INF` → 1, `2.#INF` → 2). The `#` then a keyword
+  // prefix selects Inf/NaN; `INF` honours the sign, the NaN keywords drop it.
+  if bytes.get(i) == Some(&b'#') {
+    let mantissa = &bytes[mantissa_start..i];
+    if mantissa == b"1" || mantissa == b"1." {
+      let kw = &bytes[i + 1..];
+      if ascii_prefix_eq_ci(kw, b"inf") {
+        return if negative {
+          f64::NEG_INFINITY
+        } else {
+          f64::INFINITY
+        };
+      }
+      // `IND`, `NAN`, `QNAN`, `SNAN` all coerce to NaN (oracle 2026-05-22).
+      if ascii_prefix_eq_ci(kw, b"ind")
+        || ascii_prefix_eq_ci(kw, b"nan")
+        || ascii_prefix_eq_ci(kw, b"qnan")
+        || ascii_prefix_eq_ci(kw, b"snan")
+      {
+        return f64::NAN;
+      }
+    }
+    // Not a recognised `1.#…` form (e.g. `1.#IN`, `1.0#INF`): fall through to the
+    // finite mantissa parse below (`#` terminates the prefix).
+  }
+  // Optional exponent `[eE][+-]?\d+` (only consumed when ≥1 power digit).
+  if matches!(bytes.get(i), Some(b'e' | b'E')) {
+    let mut j = i + 1;
+    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+      j += 1;
+    }
+    let exp_start = j;
+    while matches!(bytes.get(j), Some(b) if b.is_ascii_digit()) {
+      j += 1;
+    }
+    if j > exp_start {
+      i = j;
+    }
+  }
+  // No numeric prefix (only whitespace, a lone sign, or junk) ⇒ Perl yields 0.
+  if i == prefix_start || i == mantissa_start {
+    return 0.0;
+  }
+  // The prefix is a clean numeric form Rust's `f64` parser accepts (it handles
+  // `"3."`, `".5"`, `"+3"`, `"1e3"`). On the rare overflow-to-inf parse, Perl
+  // would likewise carry ±Inf, so the parsed value is faithful; the unreachable
+  // `Err` arm (the prefix is always well-formed) falls back to 0.
+  s[prefix_start..i].parse::<f64>().unwrap_or(0.0)
+}
+
+/// Case-insensitive ASCII prefix test: does `hay` begin with `needle` (which
+/// MUST be lowercase ASCII)? Used by [`perl_str_to_f64`] for the prefix-only
+/// `inf` / `nan` / `1.#…` keyword recognition (Perl's `Perl_my_atof` ignores
+/// any tail after the keyword, so a prefix match suffices).
+fn ascii_prefix_eq_ci(hay: &[u8], needle: &[u8]) -> bool {
+  hay.len() >= needle.len()
+    && hay[..needle.len()]
+      .iter()
+      .zip(needle)
+      .all(|(h, n)| h.to_ascii_lowercase() == *n)
+}
+
 /// Perl string-to-integer coercion for bitwise operations, matching Perl's
 /// `$val & (1 << $i)` where `$val` is a string in numeric context.
 ///
@@ -540,8 +795,13 @@ pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
   w: &mut W,
   bitrate: f64,
 ) -> core::fmt::Result {
+  // ExifTool.pm:6894 `IsFloat($bitrate) or return $bitrate`. `IsFloat`'s regex
+  // rejects the stringified `Inf`/`-Inf`/`NaN` (it requires a leading digit or
+  // `.digit`), so a non-finite bitrate is returned VERBATIM and stringifies via
+  // Perl's NV default — titlecase `Inf`/`-Inf`/`NaN` (NOT Rust's lowercase
+  // `inf`/`-inf` from `{}`). `perl_nonfinite_str` produces Perl's casing.
   if !bitrate.is_finite() {
-    return write!(w, "{bitrate}");
+    return w.write_str(crate::value::perl_nonfinite_str(bitrate).unwrap_or("NaN"));
   }
   const UNITS: &[&str] = &["bps", "kbps", "Mbps", "Gbps"];
   let mut b = bitrate;
@@ -566,6 +826,126 @@ pub fn write_convert_bitrate<W: core::fmt::Write + ?Sized>(
   }
   // Unreachable: the loop always returns on the last UNITS entry.
   unreachable!("write_convert_bitrate loop must exit on the last unit");
+}
+
+/// Format-into-writer port of `Image::ExifTool::ConvertDuration`
+/// (ExifTool.pm:6866-6884). Writes the formatted duration string directly
+/// into a [`core::fmt::Write`] sink — no intermediate `String` allocation.
+///
+/// Perl reference (verbatim from MOI.pm port comments):
+/// ```perl
+/// my $time = shift;
+/// return $time unless IsFloat($time);
+/// return '0 s' if $time == 0;
+/// my $sign = ($time > 0 ? '' : (($time = -$time), '-'));
+/// return sprintf("$sign%.2f s", $time) if $time < 30;
+/// $time += 0.5;
+/// my $h = int($time / 3600);
+/// $time -= $h * 3600;
+/// my $m = int($time / 60);
+/// $time -= $m * 60;
+/// if ($h > 24) {
+///     my $d = int($h / 24);
+///     $h -= $d * 24;
+///     $sign = "$sign$d days ";
+/// }
+/// return sprintf("$sign%d:%.2d:%.2d", $h, $m, int($time));
+/// ```
+///
+/// Bundled-Perl oracle (verified 2026-05-20 / 2026-05-22):
+/// - `8.16` → `"8.16 s"` (the MOI fixture)
+/// - `3.089` → `"3.09 s"` (the FLV fixture)
+/// - `0` → `"0 s"`
+/// - `30` → `"0:00:30"`
+/// - `86461` → `"24:01:01"`
+/// - `90000` → `"1 days 1:00:00"`
+/// - `-30` → `"-0:00:30"`
+///
+/// R2 wave-a-flash: this helper had lived in `formats/moi.rs` for the MOI
+/// pilot. With FLV (Flash.pm:192/221/226 `ConvertDuration`) landing here it
+/// moved to `crate::convert` so a feature-pruned `--features std,flash` build
+/// without `moi` still resolves the symbol. The MOI module re-exports it for
+/// backward compatibility with its own port site.
+#[allow(dead_code)] // Used under `feature = "moi"` and `feature = "flash"`; unused under feature-pruned builds without either.
+pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  time: f64,
+) -> core::fmt::Result {
+  // ExifTool.pm:6869 `return $time unless IsFloat($time)`. As in
+  // `write_convert_bitrate`, `IsFloat` rejects a stringified non-finite, so the
+  // value passes through verbatim and stringifies to Perl's titlecase
+  // `Inf`/`-Inf`/`NaN` (via `perl_nonfinite_str`), not Rust's lowercase `{}`.
+  if !time.is_finite() {
+    return w.write_str(crate::value::perl_nonfinite_str(time).unwrap_or("NaN"));
+  }
+  if time == 0.0 {
+    return w.write_str("0 s"); // ExifTool.pm:6870
+  }
+  let (sign, mut t) = if time > 0.0 { ("", time) } else { ("-", -time) }; // ExifTool.pm:6871
+  if t < 30.0 {
+    return write!(w, "{sign}{t:.2} s"); // ExifTool.pm:6872
+  }
+  t += 0.5; // ExifTool.pm:6873 round to nearest second
+  let mut h: i64 = (t / 3600.0) as i64;
+  t -= (h as f64) * 3600.0;
+  let m: i64 = (t / 60.0) as i64;
+  t -= (m as f64) * 60.0;
+  let s_int: i64 = t as i64;
+  if h > 24 {
+    let d = h / 24;
+    h -= d * 24;
+    return write!(w, "{sign}{d} days {h}:{m:02}:{s_int:02}");
+  }
+  write!(w, "{sign}{h}:{m:02}:{s_int:02}")
+}
+
+/// `ConvertDuration($val)` applied to a STRING-typed value, honouring the
+/// `IsFloat($time) or return $time` guard (ExifTool.pm:6869). When the AMF
+/// value carried a `duration`/`starttime` (Flash.pm:192/221) as a string,
+/// bundled `GetValue` runs `ConvertDuration` on that string: a float-shaped
+/// string (incl. a single comma-decimal, which `IsFloat` translates `,`→`.`)
+/// is coerced and formatted; anything else is returned VERBATIM (e.g.
+/// `"65.8 kbps"` → `"65.8 kbps"`, `"notnum"` → `"notnum"`). Coercion of the
+/// (comma-translated) float string uses Perl arithmetic semantics
+/// ([`perl_str_to_f64`]); since `IsFloat` already guaranteed the whole string
+/// is numeric, the prefix parse consumes all of it.
+///
+/// Bundled-Perl oracle (verified 2026-05-22 on synthetic FLVs):
+/// `"1.5"` → `"1.50 s"`; `"12,5"` → `"12.50 s"`; `"2.25"` → `"2.25 s"`;
+/// `"notnum"`/`"65.8 kbps"` → returned verbatim.
+#[allow(dead_code)] // Used under `feature = "flash"`; unused under feature-pruned builds without it.
+pub fn write_convert_duration_str<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  val: &str,
+) -> core::fmt::Result {
+  // ExifTool.pm:6869 `return $time unless IsFloat($time)`.
+  let (matched, coerce_src) = is_float(val);
+  if !matched {
+    return w.write_str(val);
+  }
+  write_convert_duration(w, perl_str_to_f64(&coerce_src))
+}
+
+/// `ConvertBitrate($val)` applied to a STRING-typed value, honouring the
+/// `IsFloat($bitrate) or return $bitrate` guard (ExifTool.pm:6894).
+///
+/// In `%Flash::Meta` the `ConvertBitrate` PrintConv is only ever paired with a
+/// `$val * 1000` ValueConv (Flash.pm:168-169/237-238), so by the time bundled
+/// reaches the PrintConv the value is ALWAYS the numeric ValueConv result —
+/// this string entry point is therefore unreachable on real Flash data and
+/// exists only for defensive symmetry with [`write_convert_duration_str`]. It
+/// mirrors the same IsFloat guard: a float-shaped string formats, anything
+/// else is returned verbatim.
+#[allow(dead_code)] // Defensive symmetry; the Flash *bitrate ValueConv always pre-numifies.
+pub fn write_convert_bitrate_str<W: core::fmt::Write + ?Sized>(
+  w: &mut W,
+  val: &str,
+) -> core::fmt::Result {
+  let (matched, coerce_src) = is_float(val);
+  if !matched {
+    return w.write_str(val);
+  }
+  write_convert_bitrate(w, perl_str_to_f64(&coerce_src))
 }
 
 /// Faithful transliteration of `Image::ExifTool::XMP::DecodeBase64` (an
@@ -2032,6 +2412,205 @@ mod tests {
     assert_eq!(perl_numeric_coerce("2.9"), 2);
     assert_eq!(perl_numeric_coerce("1e3"), 1000);
     assert_eq!(perl_numeric_coerce("-2.9"), (-2i64) as u64);
+  }
+
+  // ── Codex PR #32 R19/F1 — Perl string→f64 numeric coercion + ExifTool
+  // IsFloat + the string-typed ConvertDuration guard. Oracle pinned against
+  // bundled Perl 2026-05-22:
+  //   perl -e 'no warnings "numeric"; print $ARGV[0]+0' -- '<s>'   (coercion)
+  //   perl -I.../exiftool/lib -MImage::ExifTool -e '...IsFloat...'  (IsFloat)
+  //   perl .../exiftool on synthetic FLVs                            (ConvertDuration)
+
+  #[test]
+  fn perl_str_to_f64_matches_bundled_arithmetic_coercion() {
+    let cases: &[(&str, f64)] = &[
+      ("65.8", 65.8),      // plain float
+      ("  65.8  ", 65.8),  // leading/trailing ws skipped (trailing ignored)
+      ("65.8 kbps", 65.8), // leading numeric prefix, rest ignored
+      ("12abc", 12.0),     // integer prefix
+      ("1e3", 1000.0),     // exponent
+      ("1,5", 1.0),        // comma TERMINATES the prefix (raw arithmetic)
+      ("12,5", 12.0),      // ditto
+      (".5", 0.5),         // leading-dot fraction
+      ("3.", 3.0),         // trailing-dot integer
+      ("+3.5", 3.5),       // leading plus
+      ("-2", -2.0),        // negative integer
+      ("abc", 0.0),        // no numeric prefix ⇒ 0
+      ("", 0.0),           // empty ⇒ 0
+      ("  ", 0.0),         // all whitespace ⇒ 0
+      ("0x10", 0.0),       // NO hex parsing ⇒ 0 (Perl "0x10"+0 == 0)
+      (".", 0.0),          // lone dot ⇒ 0
+      ("+", 0.0),          // lone sign ⇒ 0
+      ("1e", 1.0),         // dangling exponent ⇒ mantissa only (Perl "1e"+0==1)
+    ];
+    for &(s, want) in cases {
+      let got = perl_str_to_f64(s);
+      assert!(
+        (got - want).abs() < 1e-12 || (got == 0.0 && want == 0.0),
+        "perl_str_to_f64({s:?}) = {got}, want {want}"
+      );
+    }
+  }
+
+  // ── Codex PR #32 R20/F1 — Perl `Perl_my_atof` non-finite string coercion.
+  // Oracle pinned against bundled Perl 2026-05-22 via:
+  //   perl -e 'no warnings "numeric"; printf("%s\n", $ARGV[0]+0)' -- '<s>'
+  // Categorise the expected f64 by sign/class so Inf/NaN compare correctly
+  // (NaN != NaN, so a value-equality table is insufficient).
+  #[derive(Clone, Copy)]
+  enum NonFinite {
+    PosInf,
+    NegInf,
+    Nan,
+    Finite(f64),
+  }
+
+  #[test]
+  fn perl_str_to_f64_recognises_perl_nonfinite_spellings() {
+    use NonFinite::{Finite, Nan, NegInf, PosInf};
+    let cases: &[(&str, NonFinite)] = &[
+      // Plain `inf`/`nan`, any case → Inf/NaN.
+      ("inf", PosInf),
+      ("Inf", PosInf),
+      ("INF", PosInf),
+      ("iNf", PosInf),
+      ("nan", Nan),
+      ("NaN", Nan),
+      ("NAN", Nan),
+      // Signs: `-inf` carries; NaN drops the sign.
+      ("+inf", PosInf),
+      ("-inf", NegInf),
+      ("+nan", Nan),
+      ("-nan", Nan),
+      // Leading whitespace skipped, sign honoured.
+      (" +inf", PosInf),
+      (" -inf ", NegInf),
+      (" nan ", Nan),
+      // `infinity` word + any trailing tail (prefix match only).
+      ("infinity", PosInf),
+      ("Infinity", PosInf),
+      ("INFINITY", PosInf),
+      ("infinit", PosInf),
+      ("infi", PosInf),
+      ("infX", PosInf),
+      ("infZZZ", PosInf),
+      ("infinityandbeyond", PosInf),
+      // `nan` + trailing tail (incl. the MSVCRT `nan(...)` payload).
+      ("nanX", Nan),
+      ("nan(123)", Nan),
+      ("nanZZZ", Nan),
+      // Leading junk is NOT a numeric prefix → 0 / digit-prefix.
+      ("xinf", Finite(0.0)),
+      ("Xnan", Finite(0.0)),
+      ("12inf", Finite(12.0)),
+      ("12nan", Finite(12.0)),
+      ("1e3inf", Finite(1000.0)),
+      // Partial keywords → 0.
+      ("in", Finite(0.0)),
+      ("i", Finite(0.0)),
+      ("na", Finite(0.0)),
+      ("n", Finite(0.0)),
+      // Legacy MSVCRT `1.#…` forms.
+      ("1.#INF", PosInf),
+      ("1#INF", PosInf),
+      ("1.#inf", PosInf),
+      ("1.#INFINITY", PosInf),
+      ("1.#INFX", PosInf),
+      ("-1.#INF", NegInf),
+      ("+1.#INF", PosInf),
+      ("1.#IND", Nan),
+      ("1.#NAN", Nan),
+      ("1.#QNAN", Nan),
+      ("1.#SNAN", Nan),
+      ("1.#qnan", Nan),
+      ("1.#INDX", Nan),
+      // Non-qualifying `1.#…`: mantissa not exactly `1`, or incomplete keyword.
+      ("1.0#INF", Finite(1.0)),
+      ("01.#INF", Finite(1.0)),
+      ("2.#INF", Finite(2.0)),
+      ("0.#INF", Finite(0.0)),
+      ("1.#IN", Finite(1.0)),
+      ("1.#I", Finite(1.0)),
+      ("#INF", Finite(0.0)),
+    ];
+    for &(s, want) in cases {
+      let got = perl_str_to_f64(s);
+      match want {
+        PosInf => assert!(
+          got.is_infinite() && got.is_sign_positive(),
+          "perl_str_to_f64({s:?}) = {got}, want +Inf"
+        ),
+        NegInf => assert!(
+          got.is_infinite() && got.is_sign_negative(),
+          "perl_str_to_f64({s:?}) = {got}, want -Inf"
+        ),
+        Nan => assert!(got.is_nan(), "perl_str_to_f64({s:?}) = {got}, want NaN"),
+        Finite(w) => assert!(
+          (got - w).abs() < 1e-12 || (got == 0.0 && w == 0.0),
+          "perl_str_to_f64({s:?}) = {got}, want {w}"
+        ),
+      }
+    }
+  }
+
+  // ── Codex PR #32 R20/F1 — non-finite ConvertBitrate / ConvertDuration emit
+  // Perl's titlecase `Inf`/`-Inf`/`NaN` (the `IsFloat or return` verbatim path
+  // stringifies the NV with Perl's casing, NOT Rust's lowercase `{}`).
+  // Oracle 2026-05-22: synthetic FLVs `audiodatarate="inf"` → "Inf",
+  // `videodatarate="NaN"` → "NaN"; `ConvertBitrate(Inf*1000)` == "Inf".
+  #[test]
+  fn convert_bitrate_duration_nonfinite_use_perl_casing() {
+    for (v, want) in [
+      (f64::INFINITY, "Inf"),
+      (f64::NEG_INFINITY, "-Inf"),
+      (f64::NAN, "NaN"),
+    ] {
+      let mut br = std::string::String::new();
+      write_convert_bitrate(&mut br, v).unwrap();
+      assert_eq!(br, want, "write_convert_bitrate({v})");
+      let mut du = std::string::String::new();
+      write_convert_duration(&mut du, v).unwrap();
+      assert_eq!(du, want, "write_convert_duration({v})");
+    }
+  }
+
+  #[test]
+  fn is_float_matches_exiftool_regex_and_comma_translation() {
+    use std::borrow::Cow;
+    // Matched, no translation (dot branch).
+    for s in ["12.5", ".5", "3.", "+3", "1e3", "1E3", "-2.5"] {
+      let (m, v) = is_float(s);
+      assert!(m, "IsFloat({s:?}) should match");
+      assert_eq!(v, Cow::Borrowed(s), "no translation for {s:?}");
+    }
+    // Matched, comma translated to dot (comma branch, Perl tr/,/./).
+    assert_eq!(is_float("12,5"), (true, Cow::Owned("12.5".to_string())));
+    assert_eq!(is_float(",5"), (true, Cow::Owned(".5".to_string())));
+    // NOT matched (whitespace, hex, junk, multi-comma, dangling exponent).
+    for s in [
+      "  12.5", "12.5 ", "0x10", "12abc", "", "  ", "1e", "1,5,6", "inf", "nan",
+    ] {
+      let (m, _) = is_float(s);
+      assert!(!m, "IsFloat({s:?}) should NOT match");
+    }
+  }
+
+  #[test]
+  fn write_convert_duration_str_honours_isfloat_guard() {
+    fn dur(s: &str) -> String {
+      let mut out = String::new();
+      write_convert_duration_str(&mut out, s).unwrap();
+      out
+    }
+    // Float-shaped strings coerce + format.
+    assert_eq!(dur("1.5"), "1.50 s");
+    assert_eq!(dur("2.25"), "2.25 s");
+    assert_eq!(dur("12,5"), "12.50 s"); // comma-decimal via IsFloat translation
+    assert_eq!(dur("1e3"), "0:16:40"); // 1000 s
+    // Non-float strings returned VERBATIM (the IsFloat guard).
+    assert_eq!(dur("notnum"), "notnum");
+    assert_eq!(dur("65.8 kbps"), "65.8 kbps");
+    assert_eq!(dur("  1.5"), "  1.5"); // leading ws ⇒ not IsFloat ⇒ verbatim
   }
 
   // ── PART A: float-path NV→UV unification (fixes residual 64-bit
