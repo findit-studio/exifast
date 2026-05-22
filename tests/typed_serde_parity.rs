@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_153() {
+fn typed_serde_path_equals_writer_path_and_golden_all_155() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -258,12 +258,17 @@ fn typed_serde_path_equals_writer_path_and_golden_all_153() {
   // drop is a NON-entry (ExifTool.pm:9493 + MXF.pm:2666 `next unless $key`),
   // so the dropped value never participates in the reverse-order duplicate
   // pass and the earlier valid `Duration` survives.
+  // 154 → 155 after Codex R4/F1: added `MXF_Utf16EmbeddedNul.mxf` (`MXF.mxf`
+  // with the UTF-16 `ApplicationName` `ExifTool` rewritten to `E\0ifTool` —
+  // an in-band NUL followed by non-zero stale text) — pinning that
+  // `Charset.pm:326`'s `Recompose` runs `s/\0.*//s` and TRUNCATES the UTF-8
+  // output at the first NUL, so the oracle emits `"E"` (not `"EifTool"`).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    154,
-    "expected exactly the 154 active conformance fixtures, found {}: {:?}",
+    155,
+    "expected exactly the 155 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

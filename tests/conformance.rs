@@ -142,6 +142,33 @@ fn mxf_dup_duration_all_ff_conformance() {
 }
 
 #[test]
+fn mxf_utf16_embedded_nul_conformance() {
+  // Codex R4/F1 regression: `MXF.mxf` with the UTF-16 `ApplicationName` value
+  // changed from `ExifTool` to `E\0ifTool` — the second code unit `00 78`
+  // (`x`, U+0078) flipped to `00 00` (U+0000) in all 3 metadata sets carrying
+  // it (3 bytes total: 0x78 -> 0x00). The NUL is followed by NON-zero stale
+  // text `ifTool`. MXF.pm:2484 decodes UTF-16 via `$et->Decode($val,'UTF16')`,
+  // which routes through Charset::Decompose then Charset::Recompose. Recompose's
+  // UTF-8 branch (Charset.pm:318-327, `$csType == 0x100`) packs the code-point
+  // array and runs `$outVal =~ s/\0.*//s` — TRUNCATING the UTF-8 output at the
+  // first NUL (sub header, Charset.pm:308: "truncated at null character if it
+  // exists"). So the oracle emits `MXF:ApplicationName` as `"E"`, dropping the
+  // post-NUL `ifTool`. Before the fix `decode_utf16` SKIPPED NUL code units
+  // (`tr/\0//d`-style), wrongly concatenating the stale text into `"EifTool"`.
+  // Golden is the bundled oracle (`tools/gen_golden.sh`).
+  check(
+    "MXF_Utf16EmbeddedNul.mxf",
+    "MXF_Utf16EmbeddedNul.mxf.json",
+    true,
+  );
+  check(
+    "MXF_Utf16EmbeddedNul.mxf",
+    "MXF_Utf16EmbeddedNul.mxf.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_conformance() {
   // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
   // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio

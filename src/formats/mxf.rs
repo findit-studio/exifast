@@ -1437,13 +1437,15 @@ fn read_ber_length(buf: &[u8], pos: usize) -> Option<BerLength> {
 /// `FF FE` (LE) BOM is stripped and the rest decoded little-endian. No BOM ⇒
 /// the default big-endian order. We mirror that exactly before the loop.
 ///
-/// NUL handling: ExifTool's `Decode` does NOT NUL-trim a UTF-16 value;
-/// instead the JSON writer's `EscapeJSON` drops every NUL (`exiftool:3818`
-/// `$str =~ tr/\0//d`). We fold that into the decoder by SKIPPING every
-/// `U+0000` code unit (a UTF-16 string's trailing `00 00` terminator, or
-/// any embedded NUL) — net-identical to `tr/\0//d` since the decoded value
-/// is only ever consumed by the JSON renderer. (Truncating at the first NUL
-/// would diverge: ExifTool keeps text AFTER an embedded NUL.)
+/// NUL handling: ExifTool's `Decode` routes UTF-16 → UTF-8 through
+/// `Charset::Decompose` then `Charset::Recompose`. `Recompose`'s UTF-8
+/// branch (`Charset.pm:318-327`, `$csType == 0x100`) packs the code-point
+/// array and then runs `$outVal =~ s/\0.*//s` — TRUNCATING the UTF-8 output
+/// at the first NUL (the sub header even documents "truncated at null
+/// character if it exists", `Charset.pm:308`). So we stop at the first
+/// decoded `U+0000`: text AFTER an embedded NUL is dropped, exactly like
+/// ExifTool. (A `tr/\0//d`-style skip would diverge — it would keep stale
+/// padding/text that follows an in-band terminator.)
 ///
 /// Lone surrogates are dropped (MXF.pm Notes §2 — "UTF-16 surrogate pairs
 /// are not handled properly"; we decode well-formed pairs and drop unpaired
@@ -1467,8 +1469,10 @@ fn decode_utf16(bytes: &[u8]) -> String {
     };
     i += 2;
     if unit == 0 {
-      // `EscapeJSON` `tr/\0//d` — drop NUL code units (terminator etc.).
-      continue;
+      // `Charset.pm:326` `Recompose`: `$outVal =~ s/\0.*//s` truncates the
+      // UTF-8 output at the first NUL — a terminator OR an embedded NUL
+      // ends the string; any padding/stale text after it is discarded.
+      break;
     }
     if (0xd800..0xdc00).contains(&unit) {
       // High surrogate — pair with the following low surrogate.
@@ -2955,10 +2959,11 @@ mod tests {
   fn decode_utf16_basic() {
     // "Hi" in UTF-16BE (no BOM ⇒ GetByteOrder() = 'MM' = big-endian).
     assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x69]), "Hi");
-    // NUL code units are dropped (EscapeJSON `tr/\0//d`), NOT truncated —
-    // text after an embedded NUL survives, matching ExifTool.
-    assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x00, 0x00, 0x69]), "Hi");
-    // A trailing UTF-16 NUL terminator is dropped.
+    // An embedded NUL TRUNCATES the value — `Charset.pm:326` `Recompose`
+    // runs `s/\0.*//s` on the UTF-8 output, so text after the NUL (here
+    // the `i`) is discarded. `H\0i` ⇒ `H`, NOT `Hi`.
+    assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x00, 0x00, 0x69]), "H");
+    // A trailing UTF-16 NUL terminator likewise ends the string.
     assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x00]), "H");
   }
 
