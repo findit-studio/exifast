@@ -1,0 +1,13 @@
+{
+  "H264:TimeCode": "04:03:02:01",
+  "H264:ApertureSetting": 128,
+  "H264:Gain": 9,
+  "H264:ExposureProgram": 1,
+  "H264:WhiteBalance": 2,
+  "H264:Focus": 5,
+  "H264:ImageStabilization": 63,
+  "H264:Make": 4113,
+  "H264:RecordingMode": 6,
+  "H264:CaptureFrameRate": 30,
+  "H264:VideoFrameRate": 25
+}

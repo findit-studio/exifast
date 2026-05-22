@@ -165,6 +165,8 @@ pub use formats::dsf::ProcessDsf;
 pub use formats::dv::ProcessDv;
 #[cfg(feature = "flac")]
 pub use formats::flac::ProcessFlac;
+#[cfg(feature = "h264")]
+pub use formats::h264::ProcessH264;
 #[cfg(feature = "id3")]
 pub use formats::id3::ProcessId3;
 #[cfg(feature = "matroska")]
@@ -491,6 +493,25 @@ pub fn parse_real(
   formats::real::parse_borrowed(bytes)
 }
 
+/// Parse an H.264 NAL byte stream directly. See [`formats::h264::parse_borrowed`].
+///
+/// H264 is **engine-only** — ExifTool has no `H264` file type ([`parse_bytes`]
+/// will never dispatch to it). This entry point is for callers that already
+/// have a de-packetized H.264 elementary stream (e.g. an M2TS / MPEG demuxer
+/// that extracted the PES payload) and want the typed [`formats::h264::H264Meta`].
+///
+/// Returns `Ok(None)` when `bytes` contains no NAL start code at all.
+///
+/// # Errors
+///
+/// Returns the per-format [`formats::h264::H264Error`] (currently uninhabited).
+#[cfg(feature = "h264")]
+pub fn parse_h264(
+  bytes: &[u8],
+) -> core::result::Result<Option<formats::h264::H264Meta<'_>>, formats::h264::H264Error> {
+  formats::h264::parse_borrowed(bytes)
+}
+
 /// Parse an Ogg container (Vorbis / Opus / Theora) buffer directly. See
 /// [`formats::ogg::parse_borrowed`].
 ///
@@ -701,6 +722,8 @@ mod tests {
     let _ = parse_ogg(bytes, true);
     #[cfg(feature = "real")]
     let _ = parse_real(bytes);
+    #[cfg(feature = "h264")]
+    let _ = parse_h264(bytes);
     #[cfg(feature = "mpc")]
     let _ = parse_mpc(bytes);
     #[cfg(feature = "wavpack")]

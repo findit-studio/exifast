@@ -1,0 +1,16 @@
+{
+  "GPS:GPSVersionID": "2.3.0.0",
+  "GPS:GPSLatitudeRef": "North",
+  "GPS:GPSLatitude": "10 deg 30' 0.00\"",
+  "GPS:GPSLongitudeRef": "West",
+  "GPS:GPSLongitude": "20 deg 15' 30.00\"",
+  "GPS:GPSAltitudeRef": "Below Sea Level",
+  "GPS:GPSAltitude": "123",
+  "GPS:GPSTimeStamp": "12:30:45",
+  "GPS:GPSStatus": "Measurement Active",
+  "GPS:GPSMeasureMode": "3-Dimensional Measurement",
+  "GPS:GPSSpeedRef": "km/h",
+  "GPS:GPSSpeed": "88",
+  "GPS:GPSMapDatum": "WGS-84",
+  "GPS:GPSDateStamp": "2021:05:22"
+}

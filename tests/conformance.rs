@@ -3021,6 +3021,432 @@ fn moi_conformance() {
   check("MOI.moi", "MOI.moi.n.json", false);
 }
 
+#[test]
+#[cfg(all(feature = "h264", feature = "serde"))]
+fn h264_conformance() {
+  // FORMATS.md row 16: Image::ExifTool::H264. H264 is ENGINE-ONLY — ExifTool
+  // has NO `H264` file type (`%magicNumber`/`%fileTypeLookup` carry no
+  // entry), so a raw `.h264` NAL stream is reported as `Unknown file type`
+  // by bundled `exiftool`. `H264::ParseH264Video` is invoked solely as a
+  // callback by `M2TS::ProcessM2TS` (M2TS.pm:343-346) on the de-packetized
+  // PES payload.
+  //
+  // Because there is no file type, this format CANNOT be driven through the
+  // file-type-dispatched `extract_info` path the other `*_conformance`
+  // tests use (`check(...)` above resolves a parser via `any_parser_for`,
+  // which intentionally has no `H264` arm). This test therefore drives the
+  // typed `parse_h264` entry directly and renders via the public `Rendered`
+  // serde view — the same value-equivalence gate, minus the file-type hop.
+  //
+  // Fixture: `tests/golden/h264/H264_avchd.h264` — a SYNTHESIZED 68-byte
+  // raw H.264 stream (one SEI NAL whose type-5 user-data payload carries an
+  // MDPM block with the UUID 17ee8c60f84d11d98cd60800200c9a66). It exercises
+  // TimeCode (reverse-hex ValueConv), the Shutter binary subdir (LittleEndian
+  // int16u + masked ExposureTime + PrintExposureTime), the int32u-enum tags
+  // ExposureProgram / WhiteBalance / SceneCaptureType, and the MakeModel
+  // subdir (int16u Make → convMake → "Canon"). Goldens captured by invoking
+  // bundled `Image::ExifTool::H264::ParseH264Video` directly (PrintConv on /
+  // off) — see the fixture-synthesis note in the PR.
+  use exifast::{AnyMeta, Rendered};
+
+  let root = env!("CARGO_MANIFEST_DIR");
+
+  // Each fixture: the synthesized `.h264` NAL stream + `-j`/`-n` goldens.
+  // Goldens were captured by invoking bundled `Image::ExifTool::H264::
+  // ParseH264Video` directly (under `SetByteOrder('MM')`, matching the
+  // M2TS::ProcessM2TS pipeline — M2TS.pm:619 — that delivers a real AVCHD
+  // SEI). The adversarial fixtures (added for Codex R1 F1/F2) cover each
+  // MDPM tag family the original happy-path fixture missed:
+  //   * `H264_avchd`    — TimeCode / Shutter / int32u-enum / MakeModel.
+  //   * `h264_gps`      — the full GPS block (0xb0-0xca): GPSVersionID,
+  //                       lat/long (`Combine => 2` + ToDegrees/ToDMS),
+  //                       altitude, GPSTimeStamp (ConvertTimeStamp/
+  //                       PrintTimeStamp), the string `*Ref` enums,
+  //                       GPSMapDatum (`Combine => 1`) and GPSDateStamp
+  //                       (`Combine => 2` + ExifDate).
+  //   * `h264_exif`     — the rational32u/s image tags (0xa0-0xa9):
+  //                       ExposureTime (PrintExposureTime), FNumber,
+  //                       BrightnessValue, ExposureCompensation
+  //                       (PrintFraction), MaxApertureValue (`2**(v/2)`),
+  //                       Flash (%Exif::flash), CustomRendered,
+  //                       FocalLengthIn35mmFormat.
+  //   * `h264_maker`    — Camera1 / Camera2 subdirs plus the Canon-only
+  //                       RecInfo (0xe1) and FrameInfo (0xee) subdirs,
+  //                       gated by the `Make eq "Canon"` Condition.
+  //   * `h264_sony_model` — the Sony-only Model tag (0xe4, `Combine => 2`
+  //                       string), gated by `Make eq "Sony"`.
+  //   * `h264_trunc_sps` — Codex R1 F2: a `0x67` SPS NAL with a truncated
+  //                       body. The Exp-Golomb reader drains, so
+  //                       `ParseSeqParamSet`'s `return unless $$bstr{Mask}`
+  //                       (H264.pm:787) drops the size — bundled
+  //                       `ParseH264Video` emits NOTHING, so the goldens
+  //                       are empty objects.
+  //   * `h264_gps_zerodenom` — Codex R2 F1: GPSLatitude (`1/0, 30/1, 0/1`)
+  //                       and GPSLongitude (`2/0, 0/0, 0/1`) carry
+  //                       zero-denominator components. `GetRational32u`
+  //                       yields `inf`/`undef` (ExifTool.pm:6089), and
+  //                       `GPS::ToDegrees` voids the WHOLE coordinate
+  //                       (`return ''` — GPS.pm:584); bundled emits the
+  //                       tag with an empty ValueConv AND PrintConv.
+  //   * `h264_gps_ts_zerodenom` — Codex R2 F1: GPSTimeStamp (`1/0, 30/1,
+  //                       45/1`) with a zero-denominator hour. The `inf`
+  //                       component numifies to infinity in
+  //                       `GPS::ConvertTimeStamp` (GPS.pm:459), yielding
+  //                       `Inf:NaN:000000000NaN` for both `-j` and `-n`.
+  //   * `h264_exif_frac` — Codex R3 F1: non-terminating rational32 ValueConv
+  //                       inputs. BrightnessValue / FocalLengthIn35mmFormat /
+  //                       MaxApertureValue all carry `1/3`. `GetRational32u`
+  //                       hands `2 ** ($val/2)` the `RoundFloat(1/3, 7)`
+  //                       STRING `0.3333333` (ExifTool.pm:6094), so bundled
+  //                       MaxApertureValue `-n` is `1.12246203534218`, NOT
+  //                       the exact `1.12246204830937`.
+  //   * `h264_gps_frac`  — Codex R3 F1: GPSLatitude (`10/1, 1/3, 1/3`) and
+  //                       GPSTimeStamp (`1/3, 1/3, 1/3`) — non-terminating
+  //                       components. `GPS::ToDegrees` / `ConvertTimeStamp`
+  //                       combine the `RoundFloat(n/d, 7)` STRINGS, so
+  //                       bundled latitude `-n` is `10.0056481475833`, NOT
+  //                       the exact `10.0056481481481`.
+  //   * `h264_exif_zerodenom`  — Codex R4 F1: zero-denominator EXIF rationals
+  //                       must numify (NOT short-circuit to the raw word)
+  //                       before ValueConv/PrintConv. ExposureCompensation
+  //                       (0xa4 `1/0`) and MaxApertureValue (0xa5 `1/0`).
+  //                       `GetRational32*` ⇒ `inf` (ExifTool.pm:6087/6094).
+  //                       0xa4 has no ValueConv: `-n` is the raw `inf`, `-j`
+  //                       runs `PrintFraction(inf→+∞)` = `+Inf`. 0xa5's
+  //                       ValueConv `2 ** (inf/2)` = `+∞` ⇒ `-n` `Inf`, `-j`
+  //                       `sprintf("%.1f", +∞)` = `Inf`.
+  //   * `h264_exif_zerodenom2` — Codex R4 F1: the `0/0` companions.
+  //                       `GetRational32*` ⇒ `undef`. 0xa4 `-n` is the raw
+  //                       `undef`, `-j` `PrintFraction(undef→0)` = `0`. 0xa5
+  //                       ValueConv `2 ** (0/2)` = `1` ⇒ `-n` `1`, `-j`
+  //                       `sprintf("%.1f", 1)` = `1.0`.
+  //   * `h264_offmap` — Codex R5 F2: PrintConv-hash MISSES render as
+  //                       `Unknown (N)` (normal) / `Unknown (0x%x)` (PrintHex)
+  //                       in `-j`, raw in `-n` (ExifTool.pm:3616-3623).
+  //                       ExposureProgram (0xa2=9) ⇒ `Unknown (9)`; Flash
+  //                       (0xa6=0x99, PrintHex) ⇒ `Unknown (0x99)`;
+  //                       CustomRendered (0xa7=5) ⇒ `Unknown (5)`; GPSStatus
+  //                       string-enum (0xbe="Z", GPS group) ⇒ `Unknown (Z)`;
+  //                       Make convMake-miss (0xe0=0x9999, PrintHex) ⇒
+  //                       `Unknown (0x9999)`. (Also exercises R5 F1: GPSStatus
+  //                       lands under the family-1 `GPS` group.)
+  //   * `h264_camera_offmap` — Codex R5 F2 in the Camera1 subtable: the
+  //                       masked sub-byte enums also render misses as
+  //                       `Unknown (N)`. ExposureProgram (mask 0xf0 ⇒ 5) and
+  //                       WhiteBalance (mask 0xe0 ⇒ 5) ⇒ `Unknown (5)`; the
+  //                       computed-OTHER tags (ApertureSetting, Gain) are
+  //                       unaffected.
+  //   * `h264_camera_priority` — Codex R15 F1: an ASCENDING MDPM stream with a
+  //                       `0x70` Camera1 subdirectory (`ff 00 20 00` ⇒ Camera1
+  //                       `WhiteBalance` mask 0xe0 ⇒ 1 ⇒ "Hold") FOLLOWED by a
+  //                       top-level `0xa8` `WhiteBalance` (`00 00 00 00` ⇒ 0 ⇒
+  //                       "Auto") whose table entry is `Priority => 0`
+  //                       (H264.pm:215). `FoundTag` keeps the higher-priority
+  //                       Camera1 value as the visible `H264:WhiteBalance` and
+  //                       relegates the later `Priority => 0` value to a
+  //                       `WhiteBalance (1)` duplicate copy
+  //                       (ExifTool.pm:9458-9580); the default `Duplicates`-off
+  //                       render drops that copy (ExifTool.pm:5396-5404 /
+  //                       5522-5538), so bundled `ParseH264Video` emits
+  //                       `H264:WhiteBalance` = "Hold" (`-j`) / `1` (`-n`) — NOT
+  //                       the later "Auto"/`0`. The pre-fix port wrote every
+  //                       entry with last-wins, overwriting "Hold" with the
+  //                       lower-priority "Auto"; this fixture pins the
+  //                       priority-winner. (Camera1 also emits ApertureSetting=
+  //                       Auto, Gain=-3 dB, ExposureProgram=Program AE, Focus=
+  //                       Auto (0) from the same 4 bytes.)
+  //   * `h264_gps_mapdatum_empty` — Codex R6 F1: an all-NUL `0xc7 GPSMapDatum`
+  //                       (Combine=1 with an all-NUL `0xc8`). GPSMapDatum has
+  //                       NO `RawConv` (H264.pm:371-377), so bundled
+  //                       `ParseH264Video`/`HandleTag` emit a present-but-empty
+  //                       `GPS:GPSMapDatum` (`""`) in both `-j` and `-n` —
+  //                       it must NOT be dropped (contrast the Sony `0xe4
+  //                       Model` drop-empty RawConv).
+  //   * `h264_gps_datestamp_empty` — Codex R6 F1: an all-NUL `0xca
+  //                       GPSDateStamp` (Combine=2 with all-NUL `0xcb`/`0xcc`).
+  //                       No `RawConv`; `ExifDate("")` returns `""`
+  //                       (Exif.pm:6068-6076), so bundled `ParseH264Video`
+  //                       emits a present-but-empty `GPS:GPSDateStamp` (`""`)
+  //                       in both `-j` and `-n`.
+  //   * `h264_oos_mdpm` — Codex R7 F1: an out-of-order MDPM block — `0xa8`
+  //                       WhiteBalance=1 then `0xa2` ExposureProgram=2
+  //                       (`0xa2 < 0xa8`). H264.pm:988-990 emits
+  //                       `Warn('Entries in MDPM directory are out of
+  //                       sequence')` and stops the walk, so bundled
+  //                       `ParseH264Video` yields `H264:WhiteBalance` PLUS
+  //                       `ExifTool:Warning` — the `0xa2` record is dropped.
+  //                       Codex R8 F1: under `-n` the WhiteBalance value is the
+  //                       bare JSON NUMBER `1` (not `"1"`) — the EscapeJSON
+  //                       number gate (exiftool:3809). See the dedicated
+  //                       `h264_oos_mdpm_n_emits_json_number` exact-type test.
+  //   * `h264_forbidden_bit` — Codex R8 F2: a stream `00 00 00 01 86` whose
+  //                       NAL header `0x86` has forbidden_zero_bit set.
+  //                       H264.pm:1058 emits `Warn('H264 forbidden bit error')`
+  //                       before stopping the scan, so bundled `ParseH264Video`
+  //                       yields a lone `ExifTool:Warning`.
+  //   * `h264_sei_leading_emulation` — Codex R9 F1: an SEI NAL body that
+  //                       STARTS with a `00 00 03` triple (`06 | 00 00 03
+  //                       00 05 1a <UUID+MDPM> 01 b1 4e 00 00 00 80`).
+  //                       H264.pm:1064 seeds the de-escape regex at
+  //                       `pos = $pos + 1`, so a `00 00 03` whose first
+  //                       byte is at NAL-body index 0 is NEVER stripped —
+  //                       the body parses as SEI type0/size0, type3/size0,
+  //                       type5/size26, reaching the MDPM payload. Bundled
+  //                       `ParseH264Video` emits `GPS:GPSLatitudeRef`.
+  //   * `h264_mdpm_trunc_record` — Codex R9 F2: a type-5 MDPM payload with
+  //                       `count=1`, tag `0xb1`, and a SINGLE data byte
+  //                       `N` (fewer than the nominal four). H264.pm:993
+  //                       `substr($$dataPt, $pos+1, 4)` short-reads — the
+  //                       record still dispatches via `HandleTag`, so the
+  //                       one-byte string yields `GPS:GPSLatitudeRef`.
+  //   * `h264_mdpm_short_num` — Codex R10 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0xa8` WhiteBalance (`int32u`), and
+  //                       a SINGLE `0x00` data byte. ExifTool's `ReadValue`
+  //                       returns the empty string `''` for an underlength
+  //                       `Count`-less fixed-width format (`ExifTool.pm:6285`
+  //                       — `return '' if … $size < $len`); `HandleTag`
+  //                       still emits the tag. The empty value misses the
+  //                       WhiteBalance PrintConv hash, so bundled
+  //                       `ParseH264Video` yields `H264:WhiteBalance` =
+  //                       `"Unknown ()"` (`-j`) / `""` (`-n`) — the
+  //                       underlength record must NOT be dropped.
+  //   * `h264_mdpm_trunc_combine` — Codex R10 F2: a type-5 MDPM payload with
+  //                       `count=2`: `0xc7 GPSMapDatum` data `WGS8`
+  //                       (`Combine => 1`) followed by a TRUNCATED `0xc8`
+  //                       consecutive record whose sole data byte is `4`.
+  //                       H264.pm:1005 only checks the consecutive tag byte
+  //                       exists before the payload end (`$pos + 5 >= $end`),
+  //                       then H264.pm:1009 `substr($$dataPt, $pos+1, 4)`
+  //                       SHORT-READS the truncated record's lone byte. The
+  //                       combined string is `WGS8` + `4` = `WGS84`, so
+  //                       bundled `ParseH264Video` emits `GPS:GPSMapDatum`
+  //                       = `"WGS84"` — the truncated next record is
+  //                       absorbed, not dropped.
+  //   * `h264_mdpm_short_rational` — Codex R11 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0xa0` ExposureTime (`rational32u`),
+  //                       and a SINGLE `0x01` data byte. ExifTool's
+  //                       `ReadValue` returns the empty string `''` for an
+  //                       underlength `Count`-less `rational32u` (`$len = 4`,
+  //                       `$size = 1 < $len` ⇒ `return ''`, `ExifTool.pm:6285`)
+  //                       — the SAME short-read rule as the R10 F1 integer
+  //                       fix. `HandleTag` still emits the tag, and
+  //                       `PrintExposureTime('')` returns `''` verbatim
+  //                       (`IsFloat('')` false), so bundled `ParseH264Video`
+  //                       yields `H264:ExposureTime` = `""` in BOTH `-j` and
+  //                       `-n` — the underlength rational must NOT be dropped.
+  //   * `h264_mdpm_short_gps` — Codex R11 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0xb2` GPSLatitude (`rational32u`,
+  //                       `Combine => 2`), and only THREE data bytes. No
+  //                       consecutive `0xb3` record exists, so the combined
+  //                       buffer stays three bytes (`< 4`); `ReadValue`
+  //                       returns `''`. `GPS::ToDegrees('')` finds no decimal
+  //                       (`return '' unless defined $d`, GPS.pm:594) and
+  //                       `GPS::ToDMS('')` returns `''`, so bundled
+  //                       `ParseH264Video` emits `GPS:GPSLatitude` = `""` in
+  //                       BOTH `-j` and `-n` — the short combined rational
+  //                       must NOT be dropped.
+  //   * `h264_mdpm_short_timecode` — Codex R12 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0x13` TimeCode, and a SINGLE `0x01`
+  //                       data byte. `0x13` has only a `ValueConv` (no
+  //                       fixed-width `Format`), so `ProcessSEI`'s short-read
+  //                       `$buff` flows straight into the ValueConv with NO
+  //                       length gate. `sprintf("%.2x:%.2x:%.2x:%.2x",
+  //                       reverse unpack("C*",$val))` consumes the one byte
+  //                       and three Perl-undef args (⇒ `00`), so bundled
+  //                       `ParseH264Video` emits `H264:TimeCode` =
+  //                       `"01:00:00:00"` — the short record must NOT drop.
+  //   * `h264_mdpm_empty_timecode` — Codex R12 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0x13`, and ZERO data bytes (the NAL
+  //                       ends right after the tag id). `unpack("C*","")`
+  //                       yields the empty list; all four `%.2x` specs see
+  //                       Perl-undef, so bundled `ParseH264Video` emits
+  //                       `H264:TimeCode` = `"00:00:00:00"`.
+  //   * `h264_mdpm_short_datetime` — Codex R12 F1: a type-5 MDPM payload with
+  //                       `count=1`, tag `0x18` DateTimeOriginal, and only
+  //                       FOUR bytes (`80 20 13 05`) — fewer than the eight
+  //                       its ValueConv expects, with no consecutive `0x19`
+  //                       to `Combine`. `ProcessSEI` short-reads `$buff`;
+  //                       `0x18` has only a `ValueConv`, so it runs with NO
+  //                       length gate. Perl's `sprintf` consumes its 11 specs
+  //                       positionally against `(@a, tz_sign, tz_hours,
+  //                       tz_min, dst)` — the short `@a` slides the computed
+  //                       args into earlier `%.2x` slots (numifying there)
+  //                       and leaves the tail specs Perl-undef, so bundled
+  //                       `ParseH264Video` emits a malformed-but-PRESENT
+  //                       `H264:DateTimeOriginal` = `"2013:05:00 00:00:0000:"`
+  //                       — the short record must NOT be dropped.
+  //   * `h264_mdpm_partial_datetime` — Codex R12 F1: a type-5 MDPM payload
+  //                       with `count=2`: a full 4-byte `0x18` record
+  //                       (`80 20 13 05`) followed by a TRUNCATED consecutive
+  //                       `0x19` whose data is only `16 0a 1e` (three bytes).
+  //                       `Combine => 1` absorbs the truncated `0x19` (H264.pm
+  //                       :1005 only checks the tag byte precedes the payload
+  //                       end), giving a 7-byte buffer — still short of eight.
+  //                       Bundled `ParseH264Video` emits a malformed-but-
+  //                       PRESENT `H264:DateTimeOriginal` =
+  //                       `"2013:05:16 0a:1e:00000:"`.
+  //   * `h264_sei_ext_type` — Codex R13 F1: an SEI message whose payload TYPE
+  //                       is 255-extended (`ff 06` ⇒ H264.pm:941-946
+  //                       `$type += $t` = 261), followed by a byte-perfect
+  //                       type-5 MDPM payload (UUID + "MDPM" + `0xa8`
+  //                       WhiteBalance). 261 is neither 5 nor 0x80, so bundled
+  //                       `ProcessSEI` skips the message at H264.pm:965
+  //                       (`$pos += $size`) and the MDPM payload is NEVER
+  //                       decoded — `ParseH264Video` emits NOTHING (`{}` in
+  //                       both `-j` and `-n`). The port must accumulate the
+  //                       255-extended type WITHOUT wrapping a narrow integer
+  //                       into 5/0x80; see the dedicated in-crate test
+  //                       `sei_payload_type_extension_does_not_overflow_into_type5`
+  //                       which drives the full 2^32 wrap pattern.
+  //   * `h264_sps_golomb63` — Codex R14 F1: a `0x67` SPS whose
+  //                       `pic_width_in_mbs_minus1` / `pic_height_in_map_units
+  //                       _minus1` Exp-Golomb codes each have 63 leading zero
+  //                       bits (after emulation de-escape). Bundled `GetGolomb`
+  //                       returns huge UNSIGNED values (`≈ 9.2e18`); the
+  //                       `(w + 1) * 16` size math then PROMOTES TO A FLOAT
+  //                       (`≈ 1.5e20`), failing the `<= 4096` window, so
+  //                       bundled `ParseH264Video` emits NOTHING (`{}`). The
+  //                       pre-fix port cast the `u64` Golomb to `i64`
+  //                       (negative) and `wrapping_mul`-ed it back into the
+  //                       window, fabricating `ImageWidth=160`/`ImageHeight
+  //                       =128` — this fixture pins the `{}` agreement.
+  //   * `h264_sps_golomb64` — Codex R14 F1 boundary companion: the SAME SPS
+  //                       shape but with 64-leading-zero Golomb codes. After
+  //                       de-escape this one decodes to a GENUINELY valid
+  //                       small size, so bundled `ParseH264Video` emits
+  //                       `ImageWidth=160`/`ImageHeight=128` in BOTH `-j` and
+  //                       `-n`. It guards that the rewritten `get_golomb`
+  //                       (which now reads `count + 1` bits directly instead
+  //                       of synthesising the leading 1 with `1u64 <<
+  //                       count.min(63)`) still tracks Perl across the
+  //                       64-bit-`UV`-wrap boundary, where the old synthesis
+  //                       was wrong.
+  for fixture in [
+    "H264_avchd",
+    "h264_gps",
+    "h264_exif",
+    "h264_maker",
+    "h264_sony_model",
+    "h264_trunc_sps",
+    "h264_gps_zerodenom",
+    "h264_gps_ts_zerodenom",
+    "h264_exif_frac",
+    "h264_gps_frac",
+    "h264_exif_zerodenom",
+    "h264_exif_zerodenom2",
+    "h264_offmap",
+    "h264_camera_offmap",
+    "h264_camera_priority",
+    "h264_gps_mapdatum_empty",
+    "h264_gps_datestamp_empty",
+    "h264_oos_mdpm",
+    "h264_forbidden_bit",
+    "h264_sei_leading_emulation",
+    "h264_mdpm_trunc_record",
+    "h264_mdpm_short_num",
+    "h264_mdpm_trunc_combine",
+    "h264_mdpm_short_rational",
+    "h264_mdpm_short_gps",
+    "h264_mdpm_short_timecode",
+    "h264_mdpm_empty_timecode",
+    "h264_mdpm_short_datetime",
+    "h264_mdpm_partial_datetime",
+    "h264_sei_ext_type",
+    "h264_sps_golomb63",
+    "h264_sps_golomb64",
+  ] {
+    let data = std::fs::read(format!("{root}/tests/golden/h264/{fixture}.h264"))
+      .unwrap_or_else(|e| panic!("read {fixture}.h264 fixture: {e}"));
+    for (print_on, suffix) in [(true, "json"), (false, "n.json")] {
+      let golden_name = format!("{fixture}.h264.{suffix}");
+      let want = std::fs::read_to_string(format!("{root}/tests/golden/h264/{golden_name}"))
+        .unwrap_or_else(|e| panic!("read golden {golden_name}: {e}"));
+      let meta = exifast::parse_h264(&data)
+        .expect("parse_h264 must not error")
+        .expect("synthetic H264 stream must be accepted");
+      let any = AnyMeta::H264(meta);
+      let got = serde_json::to_string(&Rendered::new(&any, print_on)).expect("render H264 meta");
+      if let Err(e) = json_equivalent(&got, &want) {
+        panic!(
+          "{fixture}.h264 vs {golden_name}: value mismatch: {}\n--- got ---\n{got}\n\
+           --- want ---\n{want}",
+          e.message()
+        );
+      }
+    }
+  }
+}
+
+/// Codex R8 F1 — EXACT JSON-type regression. `h264_conformance` compares H264
+/// goldens with [`json_equivalent`], which deliberately blurs `"1"` (string)
+/// and `1` (number) so it would PASS even if a numeric `-n` value regressed to
+/// a JSON string. This test asserts the concrete JSON TOKEN type instead:
+/// under `-n`, bundled `ParseH264Video` emits `H264:WhiteBalance` as the bare
+/// number `1` (the EscapeJSON number gate, exiftool:3809), NOT `"1"`.
+#[test]
+#[cfg(all(feature = "h264", feature = "serde"))]
+fn h264_oos_mdpm_n_emits_json_number() {
+  use exifast::{AnyMeta, Rendered};
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/golden/h264/h264_oos_mdpm.h264"))
+    .expect("read h264_oos_mdpm fixture");
+  let meta = exifast::parse_h264(&data)
+    .expect("parse_h264 must not error")
+    .expect("h264_oos_mdpm must be accepted");
+  let any = AnyMeta::H264(meta);
+
+  // `-n` (print_conv = false): WhiteBalance must be a bare JSON NUMBER.
+  let n_json = serde_json::to_string(&Rendered::new(&any, false)).expect("render -n");
+  let n_val: serde_json::Value = serde_json::from_str(&n_json).expect("parse -n json");
+  let wb_n = &n_val["H264:WhiteBalance"];
+  assert!(
+    wb_n.is_number() && !wb_n.is_string(),
+    "h264_oos_mdpm -n WhiteBalance must be a JSON number, got: {wb_n} (full: {n_json})"
+  );
+  assert_eq!(
+    wb_n.as_u64(),
+    Some(1),
+    "h264_oos_mdpm -n WhiteBalance value"
+  );
+
+  // `-j` (print_conv = true): WhiteBalance is the PrintConv STRING "Manual".
+  let j_json = serde_json::to_string(&Rendered::new(&any, true)).expect("render -j");
+  let j_val: serde_json::Value = serde_json::from_str(&j_json).expect("parse -j json");
+  let wb_j = &j_val["H264:WhiteBalance"];
+  assert_eq!(
+    wb_j.as_str(),
+    Some("Manual"),
+    "h264_oos_mdpm -j WhiteBalance must be the PrintConv string (full: {j_json})"
+  );
+}
+
+/// Codex R8 F2 — a NAL header with forbidden_zero_bit set must surface
+/// `ExifTool:Warning: H264 forbidden bit error` (H264.pm:1058
+/// `$et->Warn('H264 forbidden bit error'), last`). The stream `00 00 00 01 86`
+/// has a single NAL whose header `0x86` (`0b1000_0110`) sets the forbidden bit.
+#[test]
+#[cfg(all(feature = "h264", feature = "serde"))]
+fn h264_forbidden_bit_surfaces_warning() {
+  use exifast::{AnyMeta, Rendered};
+
+  let data: [u8; 5] = [0x00, 0x00, 0x00, 0x01, 0x86];
+  let meta = exifast::parse_h264(&data)
+    .expect("parse_h264 must not error")
+    .expect("a stream with a start code must be accepted");
+  let any = AnyMeta::H264(meta);
+
+  for print_on in [true, false] {
+    let json = serde_json::to_string(&Rendered::new(&any, print_on)).expect("render forbidden");
+    let val: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+    assert_eq!(
+      val["ExifTool:Warning"].as_str(),
+      Some("H264 forbidden bit error"),
+      "forbidden-bit warning must be surfaced (print_conv={print_on}, full: {json})"
+    );
+  }
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

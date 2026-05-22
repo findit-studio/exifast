@@ -297,6 +297,9 @@ pub enum AnyParser {
   /// FLAC (Phase F3 — Free Lossless Audio Codec).
   #[cfg(feature = "flac")]
   Flac(crate::formats::flac::ProcessFlac),
+  /// H264 (FORMATS.md row 16 — H.264 NAL stream; engine-only, no file type).
+  #[cfg(feature = "h264")]
+  H264(crate::formats::h264::ProcessH264),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::ProcessOgg),
@@ -373,6 +376,12 @@ pub enum AnyMeta<'a> {
   /// FLAC (Phase F3).
   #[cfg(feature = "flac")]
   Flac(crate::formats::flac::Meta<'a>),
+  /// H264 (FORMATS.md row 16 — H.264 NAL stream). Engine-only: there is no
+  /// `H264` file type, so this variant is never produced by
+  /// [`crate::parser::extract_info`]; it exists for a future M2TS / MPEG
+  /// port to carry an H.264 sub-Meta through the closed dispatch.
+  #[cfg(feature = "h264")]
+  H264(crate::formats::h264::H264Meta<'a>),
   /// Ogg (Phase F4 — Ogg container + Vorbis comments). The
   /// [`crate::formats::ogg::ProcessOgg`] `FormatParser` impl produces a
   /// borrowed `ogg::Meta<'a>` via the [`FormatParser::Meta`] GAT (Codex
@@ -416,6 +425,7 @@ pub enum AnyMeta<'a> {
     feature = "ape",
     feature = "dsf",
     feature = "flac",
+    feature = "h264",
     feature = "ogg",
     feature = "real",
     feature = "mpeg-audio",
@@ -477,6 +487,8 @@ impl AnyMeta<'_> {
       AnyMeta::Dsf(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "flac")]
       AnyMeta::Flac(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "real")]
@@ -504,6 +516,7 @@ impl AnyMeta<'_> {
         feature = "ape",
         feature = "dsf",
         feature = "flac",
+        feature = "h264",
         feature = "ogg",
         feature = "real",
         feature = "mpeg-audio",
@@ -636,6 +649,11 @@ impl AnyMeta<'_> {
       AnyMeta::Dsf(_) => FileTypeFinalize::Detected,
       #[cfg(feature = "flac")]
       AnyMeta::Flac(_) => FileTypeFinalize::Detected,
+      // H264: engine-only — `any_parser_for` never resolves an `H264` file
+      // type, so this arm is unreachable from `extract_info`. `Detected` is
+      // the inert default for the closed-set exhaustiveness.
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(_) => FileTypeFinalize::Detected,
       // OGG: detected ("OGG"), then optional content override (OGV/OPUS).
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => match m.file_type_override() {
@@ -677,6 +695,7 @@ impl AnyMeta<'_> {
         feature = "ape",
         feature = "dsf",
         feature = "flac",
+        feature = "h264",
         feature = "ogg",
         feature = "real",
         feature = "mpeg-audio",
@@ -761,9 +780,18 @@ const _: () = {
       let mut tm = TagMap::new();
       let _ = self.meta.serialize_tags(self.print_conv, &mut tm);
       let entries = tm.entries();
-      let mut map = s.serialize_map(Some(entries.len()))?;
+      // The FIRST `$et->Warn` surfaces as `ExifTool:Warning`, faithful to
+      // the full document serializer (`serialize.rs:134-138`). `Rendered`
+      // is the warning-bearing path for engine-only formats with no file
+      // type (H264 — H264.pm:989 MDPM out-of-sequence).
+      let warning = tm.first_warning();
+      let extra = usize::from(warning.is_some());
+      let mut map = s.serialize_map(Some(entries.len() + extra))?;
       for (key, value) in entries {
         map.serialize_entry(key.as_str(), value)?;
+      }
+      if let Some(w) = warning {
+        map.serialize_entry("ExifTool:Warning", w)?;
       }
       map.end()
     }
@@ -852,6 +880,10 @@ pub enum AnyError {
   #[cfg(feature = "flac")]
   #[error("FLAC: {0}")]
   Flac(#[from] crate::formats::flac::Error),
+  /// H264 fatal-error wrapper.
+  #[cfg(feature = "h264")]
+  #[error("H264: {0}")]
+  H264(#[from] crate::formats::h264::H264Error),
   /// Ogg fatal-error wrapper.
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
@@ -940,6 +972,7 @@ impl AnyParser {
       feature = "ape",
       feature = "dsf",
       feature = "flac",
+      feature = "h264",
       feature = "ogg",
       feature = "real",
       feature = "mpeg-audio",
@@ -1036,6 +1069,16 @@ impl AnyParser {
         let _ = (p, ext);
         crate::formats::flac::parse_borrowed(bytes, shared)
           .map(|o| o.map(AnyMeta::Flac))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "h264")]
+      AnyParser::H264(p) => {
+        // Engine-only — `any_parser_for` never returns this arm, so the
+        // dispatch is unreachable in practice. It is wired for a future
+        // M2TS / MPEG port that resolves an `AnyParser::H264` directly.
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::H264))
           .map_err(Into::into)
       }
       #[cfg(feature = "ogg")]

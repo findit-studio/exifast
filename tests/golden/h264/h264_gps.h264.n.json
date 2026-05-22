@@ -1,0 +1,16 @@
+{
+  "GPS:GPSVersionID": "2 3 0 0",
+  "GPS:GPSLatitudeRef": "N",
+  "GPS:GPSLatitude": 10.5,
+  "GPS:GPSLongitudeRef": "W",
+  "GPS:GPSLongitude": 20.2583333333333,
+  "GPS:GPSAltitudeRef": 1,
+  "GPS:GPSAltitude": 123,
+  "GPS:GPSTimeStamp": "12:30:45",
+  "GPS:GPSStatus": "A",
+  "GPS:GPSMeasureMode": 3,
+  "GPS:GPSSpeedRef": "K",
+  "GPS:GPSSpeed": 88,
+  "GPS:GPSMapDatum": "WGS-84",
+  "GPS:GPSDateStamp": "2021:05:22"
+}
