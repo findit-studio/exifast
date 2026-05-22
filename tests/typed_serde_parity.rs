@@ -362,12 +362,24 @@ fn typed_serde_path_equals_writer_path_and_golden_all_175() {
   // `File:FileType=GLV` / `File:FileTypeExtension=glv` / `File:MIMEType=video/mp4`
   // as `.glv` vs `M4A` as `.mov` (verified vs bundled 13.58, R11/F1). The
   // `%useExt` table has exactly this one entry, so no other fixture is needed.
+  // 180 → 182 after PR #38 Codex R12 finding F1 [REAL-INPUT]: added two
+  // synthetic adversarial QuickTime fixtures verified vs bundled, pinning the
+  // default `LargeFileSupport => 1` (ExifTool.pm:1167) 64-bit extended-size
+  // handling — `QuickTime_mdat64_moov.mov` (`ftyp` + a `size == 1` 64-bit
+  // `mdat` that FITS + a trailing `moov`; the walker skips the 64-bit `mdat`
+  // by its declared size and REACHES the trailing `moov` ⇒ full
+  // Duration/TimeScale/dates/MatrixStructure/NextTrackID — the real >2GB-video
+  // shape, QuickTime.pm:10062-10074) and `QuickTime_mdat64_large.mov` (a
+  // `size == 1` `mdat` declaring 0x80000010, i.e. `lo > 0x7fffffff` — PARSED,
+  // not rejected: MediaDataSize=2147483648 from the DECLARED 64-bit size +
+  // `Truncated 'mdat' data at offset 0x14`, NOT the dead `LargeFileSupport not
+  // enabled` branch the port emitted before the fix, R12/F1).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    180,
-    "expected exactly the 180 active conformance fixtures, found {}: {:?}",
+    182,
+    "expected exactly the 182 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

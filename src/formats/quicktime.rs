@@ -17,7 +17,11 @@
 //! `size` counts the header itself. Three special values
 //! (QuickTime.pm:10035-10078):
 //!  - `size == 1` ⇒ a 64-bit extended size follows the type (`int64u`);
-//!    the real payload size is `extended - 16`.
+//!    the real payload size is `extended - 16`. With the default
+//!    `LargeFileSupport => 1` (ExifTool.pm:1167) a 64-bit size `> 0x7fffffff`
+//!    is PARSED and the walk continues (only `hi > 0x7fffffff` is rejected) —
+//!    so a real >2GB `mdat` is skipped by its declared size to reach a
+//!    trailing `moov` (R12/F1, QuickTime.pm:10062-10074).
 //!  - `size == 0` ⇒ the atom extends to end-of-file (QuickTime.pm:10036-10056).
 //!  - `size < 8` (and not 0/1) ⇒ `'Invalid atom size'` — stop.
 //!
@@ -105,18 +109,33 @@ enum HeaderOutcome {
   /// type finalized, `mdat` size/offset synthesized from the declared size,
   /// then the walk stops. Carries the type, the absolute payload start, and
   /// the DECLARED payload byte count (used for the synthetic `mdat-size`).
+  ///
+  /// **R12/F1.** `declared_payload_len` is a `u64` (not `usize`): with the
+  /// default `LargeFileSupport => 1` (ExifTool.pm:1167) a `size == 1` 64-bit
+  /// `mdat` may declare a payload `> 0x7fffffff` (a real >2GB video) or even
+  /// `> 4GB` (`hi != 0`). ExifTool records the FULL 64-bit `$tag-size`
+  /// (`$size = $hi*4294967296 + $lo - 16`, QuickTime.pm:10074) before the
+  /// short read, so this carries the full 64-bit count — never a `usize`-
+  /// truncated value (faithful on 32-bit platforms too).
   TruncatedAtom {
     atom_type: [u8; 4],
     payload_start: usize,
-    declared_payload_len: usize,
+    declared_payload_len: u64,
   },
   /// An atom whose 8-byte tag/size header WAS read, but whose declared size
   /// is structurally invalid: a `size` in `2..=7` (`Invalid atom size`,
   /// QuickTime.pm:10058), a `size == 1` whose 8-byte extended-size header is
-  /// truncated (`Truncated atom header`, QuickTime.pm:10059), an out-of-range
-  /// 64-bit size (`Invalid atom size` / `End of processing at large atom`,
-  /// QuickTime.pm:10062-10068), or an extended size `< 16` (`Invalid extended
+  /// truncated (`Truncated atom header`, QuickTime.pm:10059), a 64-bit size
+  /// whose HIGH word alone exceeds `0x7fffffff` (`Invalid atom size`,
+  /// QuickTime.pm:10064-10066), or an extended size `< 16` (`Invalid extended
   /// size`, QuickTime.pm:10075).
+  ///
+  /// **R12/F1.** The `not LargeFileSupport ⇒ 'End of processing at large
+  /// atom'` branch (QuickTime.pm:10067-10069) is NOT reachable here:
+  /// `LargeFileSupport` defaults to `1` (ExifTool.pm:1167) and the gen-golden
+  /// config never disables it, so a merely-large 64-bit size (`hi == 0` with
+  /// `lo > 0x7fffffff`, or any `hi <= 0x7fffffff`) is PARSED, not rejected.
+  /// Only a genuinely out-of-range value (`hi > 0x7fffffff`) is `Malformed`.
   ///
   /// **R8/F1.** QuickTime.pm validates the declared size INSIDE the per-atom
   /// `for(;;)` loop (QuickTime.pm:10035-10075) — *after* the first-atom tag
@@ -184,17 +203,31 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
       data[pos + 14],
       data[pos + 15],
     ]);
-    // QuickTime.pm:10062-10068: a high word or `$lo > 0x7fffffff` needs
-    // LargeFileSupport — OFF by default (the gen-golden config), so a 64-bit
-    // size in that range stops with the bundled warning.
-    if hi != 0 || lo > 0x7fff_ffff {
-      if hi > 0x7fff_ffff {
-        return Some(HeaderOutcome::Malformed {
-          warning: "Invalid atom size",
-        });
-      }
+    // QuickTime.pm:10062-10071. **R12/F1.** ExifTool guards a `size == 1`
+    // 64-bit size as:
+    //
+    // ```perl
+    // if ($hi or $lo > 0x7fffffff) {
+    //     if ($hi > 0x7fffffff) { $warnStr = 'Invalid atom size'; last; }
+    //     elsif (not $et->Options('LargeFileSupport')) {
+    //         $warnStr = 'End of processing at large atom ...'; last;
+    //     } elsif ($et->Options('LargeFileSupport') eq '2') { ...warn... }
+    // }
+    // ```
+    //
+    // `LargeFileSupport` DEFAULTS to `1` (ExifTool.pm:1167 `[ 'LargeFileSupport',
+    // 1, ... ]`) and the gen-golden config never disables it, so:
+    //   * `hi > 0x7fffffff` ⇒ `Invalid atom size` (the lone truly-invalid case);
+    //   * the `not LargeFileSupport` and `eq '2'` branches are DEAD under the
+    //     default ⇒ a merely-large 64-bit size is PARSED and the walk continues.
+    // This is the bug R12/F1 fixes: real >2GB videos commonly carry a `size == 1`
+    // 64-bit `mdat` (`lo > 0x7fffffff`, sometimes `hi != 0`) before a trailing
+    // `moov`; the walker MUST skip it by its declared size to reach that `moov`.
+    if hi > 0x7fff_ffff {
+      // QuickTime.pm:10064-10066: high word alone overflows int31 ⇒ a size that
+      // cannot be a valid 63-bit-ish QuickTime offset. Bundled `Invalid atom size`.
       return Some(HeaderOutcome::Malformed {
-        warning: "End of processing at large atom (LargeFileSupport not enabled)",
+        warning: "Invalid atom size",
       });
     }
     let ext = (u64::from(hi) << 32) | u64::from(lo);
@@ -205,19 +238,36 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
         warning: "Invalid extended size",
       });
     }
-    let payload = (ext - 16) as usize;
+    // The DECLARED 64-bit payload byte count (`$size`). Kept as `u64` so the
+    // synthetic `mdat-size` is faithful even when it exceeds the in-memory
+    // buffer (a real >2GB `mdat`) or, on a 32-bit target, `usize`.
+    let declared = ext - 16;
     let start = pos + 16;
-    let end = start.checked_add(payload)?;
-    if end > data.len() {
-      // R6/F2: header fully read, declared payload overruns EOF — surface a
-      // TruncatedAtom so the top-level caller can still recognize the format.
-      return Some(HeaderOutcome::TruncatedAtom {
-        atom_type,
-        payload_start: start,
-        declared_payload_len: payload,
-      });
+    // Resolve the payload to an in-buffer range. Three things make the declared
+    // payload UNREPRESENTABLE in this in-memory buffer model — all of which are
+    // the SAME ExifTool outcome (the `$raf->Read($val,$size)` short read ⇒
+    // `Truncated '...' data`), NOT the LargeFileSupport stop:
+    //   * `declared` exceeds `usize` (only possible on a 32-bit target);
+    //   * `start + declared` overflows `usize`;
+    //   * `start + declared` runs past the actual input length.
+    // In every such case surface a `TruncatedAtom` carrying the FULL 64-bit
+    // declared count (so `mdat-size` is the faithful `$size`), letting the
+    // top-level caller still recognize the format and record `mdat`
+    // size/offset before stopping (QuickTime.pm:10156-10158, 10238-10242).
+    let fits = usize::try_from(declared)
+      .ok()
+      .and_then(|p| start.checked_add(p))
+      .filter(|&end| end <= data.len());
+    match fits {
+      Some(end) => (start, end),
+      None => {
+        return Some(HeaderOutcome::TruncatedAtom {
+          atom_type,
+          payload_start: start,
+          declared_payload_len: declared,
+        });
+      }
     }
-    (start, end)
   } else if size32 < 8 {
     // QuickTime.pm:10058 `$size == 1 or $warnStr = 'Invalid atom size'`. The
     // 8-byte header WAS read (a recognized magic type for the first atom is
@@ -228,7 +278,8 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
       warning: "Invalid atom size",
     });
   } else {
-    // QuickTime.pm:10077 `$size -= 8` — normal atom.
+    // QuickTime.pm:10077 `$size -= 8` — normal atom. A 32-bit `$size` is at
+    // most ~4GB, so the payload fits `usize` on every supported target.
     let payload = size32 as usize - 8;
     let start = pos + 8;
     let end = start.checked_add(payload)?;
@@ -239,7 +290,7 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
       return Some(HeaderOutcome::TruncatedAtom {
         atom_type,
         payload_start: start,
-        declared_payload_len: payload,
+        declared_payload_len: payload as u64,
       });
     }
     (start, end)
@@ -262,10 +313,12 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
 fn truncated_atom_warning(
   atom_type: &[u8; 4],
   payload_start: usize,
-  declared: usize,
+  declared: u64,
   end: usize,
 ) -> String {
-  let available = end.saturating_sub(payload_start);
+  // `declared` is the full 64-bit `$size` (R12/F1), so compute the shortfall in
+  // u64 — a contained >2GB atom's `missing` count must not wrap a 32-bit math.
+  let available = end.saturating_sub(payload_start) as u64;
   let missing = declared.saturating_sub(available);
   let tag = String::from_utf8_lossy(atom_type).into_owned();
   std::format!("Truncated '{tag}' data (missing {missing} bytes)")
@@ -328,8 +381,10 @@ fn walk_atoms(
         // R9/F2: a CONTAINED atom whose 8-byte tag/size header WAS read but
         // whose declared size is structurally invalid — a `size` in `2..=7`
         // (`Invalid atom size`), a `size == 1` with a truncated 8-byte
-        // extended-size header (`Truncated atom header`), an out-of-range
-        // 64-bit size, or an extended size `< 16` (`Invalid extended size`).
+        // extended-size header (`Truncated atom header`), a 64-bit `size`
+        // whose high word alone exceeds `0x7fffffff` (`Invalid atom size`,
+        // R12/F1 — a merely-large 64-bit size is PARSED, not malformed), or an
+        // extended size `< 16` (`Invalid extended size`).
         // ExifTool runs the SAME `ProcessMOV` per-atom `for(;;)` loop on a
         // contained directory buffer (`$dataPt` set, QuickTime.pm:10035-
         // 10075), so the size check sets `$warnStr` and `last`s here exactly
@@ -1555,7 +1610,9 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
         // size/offset come from the declared size; a truncated `moov` (or any
         // other atom) contributes nothing — its payload is never decoded.
         if &atom_type == b"mdat" {
-          qt.set_media_data_size(Some(declared_payload_len as u64));
+          // R12/F1: `declared_payload_len` is the full 64-bit `$size`, so a
+          // real >2GB `mdat` records its true `MediaDataSize` (no usize cast).
+          qt.set_media_data_size(Some(declared_payload_len));
           qt.set_media_data_offset(Some(payload_start as u64));
           // `mdat` carries `Unknown => 1` (QuickTime.pm:688), so `GetTagInfo`
           // returns undef without the Unknown option ⇒ the seek-past `else`
@@ -1576,7 +1633,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
           // bytes ⇒ `$missing` is the WHOLE declared payload. Any other
           // recognized atom is not pre-read, so `$missing` is the declared
           // payload minus the bytes still available before EOF.
-          let available = data.len().saturating_sub(payload_start);
+          let available = data.len().saturating_sub(payload_start) as u64;
           let consumed_by_ftyp_preread = pos == 0 && &atom_type == b"ftyp";
           let missing = if consumed_by_ftyp_preread {
             declared_payload_len
@@ -2126,6 +2183,140 @@ mod tests {
     assert_eq!(h.payload_start, 16);
     assert_eq!(h.payload_end, 20);
     assert_eq!(next, 20);
+  }
+
+  /// Build a `size == 1` 64-bit extended-size atom header with `total` as the
+  /// declared 64-bit size (includes the 16-byte header), plus `body` bytes.
+  fn ext_atom64(t: &[u8; 4], total: u64, body: &[u8]) -> Vec<u8> {
+    let mut v = 1u32.to_be_bytes().to_vec();
+    v.extend_from_slice(t);
+    v.extend_from_slice(&total.to_be_bytes());
+    v.extend_from_slice(body);
+    v
+  }
+
+  #[test]
+  fn ext_size_above_int31_is_parsed_not_large_file_rejected() {
+    // R12/F1: a `size == 1` 64-bit `mdat` whose declared total `> 0x7fffffff`
+    // (here 0x8000_0010, hi==0, lo > 0x7fffffff) — the real >2GB shape. With
+    // the DEFAULT `LargeFileSupport => 1` (ExifTool.pm:1167) this is PARSED,
+    // NOT rejected. The 2GB payload overruns the tiny header buffer, so the
+    // outcome is a `TruncatedAtom` carrying the FULL 64-bit declared payload
+    // (`0x8000_0010 - 16 = 2147483648`) — never the old `Malformed
+    // { "End of processing at large atom (LargeFileSupport not enabled)" }`.
+    let data = ext_atom64(b"mdat", 0x8000_0010, &[]);
+    match read_atom_header(&data, 0, true).expect("header") {
+      HeaderOutcome::TruncatedAtom {
+        atom_type,
+        payload_start,
+        declared_payload_len,
+      } => {
+        assert_eq!(&atom_type, b"mdat");
+        assert_eq!(payload_start, 16);
+        assert_eq!(declared_payload_len, 0x8000_0000); // 2147483648, full 64-bit
+      }
+      _ => panic!("expected TruncatedAtom for a >0x7fffffff 64-bit mdat (LFS=1 parses it)"),
+    }
+  }
+
+  #[test]
+  fn ext_size_high_word_set_is_parsed_not_large_file_rejected() {
+    // R12/F1: a 64-bit `mdat` with `hi != 0` (here total 0x1_0000_0010 — a
+    // genuinely >4GB atom). `hi == 1 <= 0x7fffffff`, so this is NOT the
+    // `Invalid atom size` case; with default LargeFileSupport it is PARSED and
+    // (overrunning the buffer) surfaces a `TruncatedAtom` carrying the full
+    // 64-bit declared payload `0x1_0000_0010 - 16 = 4294967296`.
+    let data = ext_atom64(b"mdat", 0x1_0000_0010, &[]);
+    match read_atom_header(&data, 0, true).expect("header") {
+      HeaderOutcome::TruncatedAtom {
+        declared_payload_len,
+        ..
+      } => assert_eq!(declared_payload_len, 0x1_0000_0000), // 4294967296
+      _ => panic!("expected TruncatedAtom for a hi!=0 64-bit mdat (LFS=1 parses it)"),
+    }
+  }
+
+  #[test]
+  fn ext_size_high_word_above_int31_is_invalid() {
+    // R12/F1: the LONE truly-invalid 64-bit case (QuickTime.pm:10064-10066) —
+    // the HIGH word alone exceeds 0x7fffffff. Bundled `$warnStr = 'Invalid atom
+    // size'`. (This branch is unchanged by the fix; pinned to guard the edge.)
+    let data = ext_atom64(b"mdat", 0xFFFF_FFFF_0000_0000, &[]);
+    assert!(matches!(
+      read_atom_header(&data, 0, true),
+      Some(HeaderOutcome::Malformed {
+        warning: "Invalid atom size"
+      })
+    ));
+  }
+
+  #[test]
+  fn ext_size_64bit_atom_that_fits_advances_to_sibling() {
+    // R12/F1: a fitting `size == 1` 64-bit `mdat` (declared total 24, 8-byte
+    // payload) decodes as a NORMAL `Atom` and its `next` points at the trailing
+    // sibling so the walk REACHES it. (The `> 0x7fffffff` fitting case can only
+    // be proven against the oracle — a 2GB buffer is impractical in a unit
+    // test — and is covered by the `QuickTime_mdat64_moov` golden.)
+    let mut data = ext_atom64(b"mdat", 16 + 8, b"PAYLOAD!"); // 8-byte payload
+    let sibling_at = data.len();
+    data.extend_from_slice(&atom(b"moov", b"")); // trailing sibling
+    let (h, next) = read_atom(&data, 0, true);
+    assert_eq!(&h.atom_type, b"mdat");
+    assert_eq!(next, sibling_at, "next must point at the trailing sibling");
+    let (h2, _) = read_atom(&data, next, true);
+    assert_eq!(&h2.atom_type, b"moov");
+  }
+
+  #[test]
+  fn ext_size_64bit_mdat_walk_reaches_trailing_moov() {
+    // R12/F1 end-to-end (small, fitting 64-bit `mdat`): ftyp + a `size == 1`
+    // 64-bit `mdat` (fits) + a trailing `moov` with an `mvhd`. The walker MUST
+    // skip the 64-bit `mdat` by its declared size and DECODE the trailing
+    // `moov` — proving real >2GB videos (64-bit `mdat` before a trailing
+    // `moov`) still yield duration/timescale/dates. Mirrors the
+    // `QuickTime_mdat64_moov` golden.
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    // mvhd v0: TimeScale=1000 (offset 12), Duration=5000 (offset 16).
+    let mut mvhd_payload = vec![0u8; 100];
+    mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    mvhd_payload[16..20].copy_from_slice(&5000u32.to_be_bytes());
+    let moov = atom(b"moov", &atom(b"mvhd", &mvhd_payload));
+    // 64-bit mdat: size==1, total = 16 + 32 (fits).
+    let mdat = ext_atom64(b"mdat", 16 + 32, &[0xABu8; 32]);
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    // Walker reached the trailing moov ⇒ mvhd state present.
+    assert_eq!(meta.qt.time_scale(), Some(1000));
+    assert_eq!(meta.qt.movie_header_version(), Some(0));
+    assert_eq!(meta.qt.duration_count(), Some(5000));
+    // And the synthetic mdat tags reflect the 64-bit atom (size 32).
+    assert_eq!(meta.qt.media_data_size(), Some(32));
+  }
+
+  #[test]
+  fn ext_size_64bit_mdat_overrun_records_full_size_and_truncates() {
+    // R12/F1 end-to-end (overrunning 64-bit `mdat`, the >2GB shape): ftyp + a
+    // `size == 1` `mdat` declaring 0x8000_0010 in a tiny file. The walk records
+    // the FULL 64-bit MediaDataSize (0x8000_0000 = 2147483648) and emits the
+    // `Truncated 'mdat' data at offset …` warning — never the LargeFileSupport
+    // rejection. Mirrors the `QuickTime_mdat64_large` golden.
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let mdat = ext_atom64(b"mdat", 0x8000_0010, &[]);
+    let mdat_offset = ftyp.len(); // header start of the mdat atom
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+
+    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    assert_eq!(meta.qt.media_data_size(), Some(2_147_483_648));
+    assert_eq!(meta.qt.media_data_offset(), Some((mdat_offset + 16) as u64));
+    assert_eq!(meta.file_type, "MOV");
+    assert_eq!(
+      meta.warning.as_deref(),
+      Some(&format!("Truncated 'mdat' data at offset {mdat_offset:#x}")[..])
+    );
   }
 
   #[test]

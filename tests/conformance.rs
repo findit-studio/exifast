@@ -472,6 +472,57 @@ fn quicktime_overrun_mdat_conformance() {
 }
 
 #[test]
+fn quicktime_mdat64_moov_conformance() {
+  // PR #38 Codex R12/F1 [REAL-INPUT]: `ftyp` + a `size == 1` 64-bit `mdat`
+  // (declared total 48, FITS) + a trailing `moov`. With the DEFAULT
+  // `LargeFileSupport => 1` (ExifTool.pm:1167) the walker decodes the 64-bit
+  // size (`$size = $hi*4294967296 + $lo - 16`, QuickTime.pm:10074) and SKIPS
+  // the `mdat` to REACH the trailing `moov` — the exact path a real >2GB video
+  // takes (a 64-bit `mdat` before a trailing `moov`). Verified vs bundled
+  // ExifTool 13.58: the full `mvhd` tags appear (Duration=5.00 s, TimeScale,
+  // CreateDate/ModifyDate, MatrixStructure, NextTrackID), plus MediaDataSize=32
+  // / MediaDataOffset=36. Before the fix the walker stopped at the `mdat` with
+  // the bogus `LargeFileSupport not enabled` Malformed and lost everything in
+  // the `moov`.
+  check(
+    "QuickTime_mdat64_moov.mov",
+    "QuickTime_mdat64_moov.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_mdat64_moov.mov",
+    "QuickTime_mdat64_moov.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_mdat64_large_conformance() {
+  // PR #38 Codex R12/F1 [REAL-INPUT]: a `size == 1` 64-bit `mdat` declaring a
+  // total of 0x80000010 — i.e. `lo > 0x7fffffff` (hi == 0), the real >2GB
+  // shape. ExifTool's `not LargeFileSupport ⇒ 'End of processing at large
+  // atom'` branch (QuickTime.pm:10067) is DEAD under the default
+  // `LargeFileSupport => 1`, so the 64-bit size is PARSED: the synthetic
+  // `mdat-size` is the full DECLARED payload (0x80000010 - 16 = 2147483648,
+  // QuickTime.pm:10074/10156-10158), recorded BEFORE the short read; the read
+  // then comes up short and the `Unknown` `mdat` fires `Truncated 'mdat' data
+  // at offset 0x14` (QuickTime.pm:10590). Verified vs bundled ExifTool 13.58:
+  // FileType=MOV + MediaDataSize=2147483648 + MediaDataOffset=36 + that
+  // warning — NOT the `LargeFileSupport not enabled` rejection the port emitted
+  // before the fix.
+  check(
+    "QuickTime_mdat64_large.mov",
+    "QuickTime_mdat64_large.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_mdat64_large.mov",
+    "QuickTime_mdat64_large.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_dupmdhd_conformance() {
   // PR #38 Codex R7/F1: a SYNTHETIC `.mov` whose `moov/trak/mdia` holds TWO
   // `mdhd` atoms — a FULL mdhd (TimeScale=600, Duration=1200) followed by a

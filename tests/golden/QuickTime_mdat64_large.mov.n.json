@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "QuickTime_mdat64_large.mov",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Truncated 'mdat' data at offset 0x14",
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "MOV",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "qt  ",
+  "QuickTime:MinorVersion": "0.2.0",
+  "QuickTime:CompatibleBrands": ["qt  "],
+  "QuickTime:MediaDataSize": 2147483648,
+  "QuickTime:MediaDataOffset": 36
+}]
