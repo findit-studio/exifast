@@ -1424,9 +1424,18 @@ fn read_ber_length(buf: &[u8], pos: usize) -> Option<BerLength> {
 // variant has an explicit decode arm), so a separate membership check is
 // unnecessary — the match is exhaustive by construction.
 
-/// Decode `Type => 'UTF-16'` — UTF-16BE → UTF-8 (MXF.pm:2483-2484
-/// `$et->Decode($val, 'UTF16')`). MXF UTF-16 is big-endian (the file is
-/// `SetByteOrder('MM')`, MXF.pm:2821).
+/// Decode `Type => 'UTF-16'` (MXF.pm:2483-2484 `$et->Decode($val, 'UTF16')`).
+///
+/// Byte order + BOM: `Decode` forwards to `Charset::Decompose` with
+/// `$fromOrder` undef (MXF.pm:2484 passes no byte-order arg), so
+/// `Decompose` falls back to `GetByteOrder()` — 'MM' here, since MXF is read
+/// `SetByteOrder('MM')` (MXF.pm:2821) — making the default format big-endian
+/// (`Charset.pm:191-197` `$fmt = 'n*'`). `Decompose` then strips a leading
+/// BOM (`Charset.pm:203-206`): `$val =~ s/^(\xfe\xff|\xff\xfe)//` removes the
+/// 2 BOM bytes and sets `$fmt = $1 eq "\xfe\xff" ? 'n*' : 'v*'`, i.e. a
+/// `FE FF` (BE) BOM is stripped and the rest decoded big-endian, while a
+/// `FF FE` (LE) BOM is stripped and the rest decoded little-endian. No BOM ⇒
+/// the default big-endian order. We mirror that exactly before the loop.
 ///
 /// NUL handling: ExifTool's `Decode` does NOT NUL-trim a UTF-16 value;
 /// instead the JSON writer's `EscapeJSON` drops every NUL (`exiftool:3818`
@@ -1439,11 +1448,23 @@ fn read_ber_length(buf: &[u8], pos: usize) -> Option<BerLength> {
 /// Lone surrogates are dropped (MXF.pm Notes §2 — "UTF-16 surrogate pairs
 /// are not handled properly"; we decode well-formed pairs and drop unpaired
 /// code units rather than panic).
-fn decode_utf16be(bytes: &[u8]) -> String {
+fn decode_utf16(bytes: &[u8]) -> String {
+  // `Charset.pm:203-206` BOM strip + byte-order select. Default is 'MM'
+  // (big-endian) per the `GetByteOrder()` fallback above.
+  let (bytes, little_endian) = match bytes {
+    [0xfe, 0xff, rest @ ..] => (rest, false), // BE BOM: strip, decode 'n*'
+    [0xff, 0xfe, rest @ ..] => (rest, true),  // LE BOM: strip, decode 'v*'
+    _ => (bytes, false),                      // no BOM: GetByteOrder() = 'MM'
+  };
   let mut out = String::with_capacity(bytes.len() / 2);
   let mut i = 0;
   while i + 1 < bytes.len() {
-    let unit = u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+    let pair = [bytes[i], bytes[i + 1]];
+    let unit = if little_endian {
+      u16::from_le_bytes(pair)
+    } else {
+      u16::from_be_bytes(pair)
+    };
     i += 2;
     if unit == 0 {
       // `EscapeJSON` `tr/\0//d` — drop NUL code units (terminator etc.).
@@ -1452,7 +1473,12 @@ fn decode_utf16be(bytes: &[u8]) -> String {
     if (0xd800..0xdc00).contains(&unit) {
       // High surrogate — pair with the following low surrogate.
       if i + 1 < bytes.len() {
-        let lo = u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+        let lo_pair = [bytes[i], bytes[i + 1]];
+        let lo = if little_endian {
+          u16::from_le_bytes(lo_pair)
+        } else {
+          u16::from_be_bytes(lo_pair)
+        };
         if (0xdc00..0xe000).contains(&lo) {
           i += 2;
           let cp = 0x1_0000 + ((u32::from(unit) - 0xd800) << 10) + (u32::from(lo) - 0xdc00);
@@ -2429,7 +2455,7 @@ fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> MxfValue {
       }
     }
     Kind::AsciiString => MxfValue::Str(SmolStr::new(decode_ascii(bytes))),
-    Kind::Utf16 => MxfValue::Str(SmolStr::new(decode_utf16be(bytes))),
+    Kind::Utf16 => MxfValue::Str(SmolStr::new(decode_utf16(bytes))),
     Kind::Boolean => {
       // MXF.pm:2508-2509 — `$val eq "\0" ? 'False' : 'True'`. A single NUL
       // byte ⇒ False; anything else ⇒ True.
@@ -2912,14 +2938,47 @@ mod tests {
   }
 
   #[test]
-  fn decode_utf16be_basic() {
-    // "Hi" in UTF-16BE.
-    assert_eq!(decode_utf16be(&[0x00, 0x48, 0x00, 0x69]), "Hi");
+  fn decode_utf16_basic() {
+    // "Hi" in UTF-16BE (no BOM ⇒ GetByteOrder() = 'MM' = big-endian).
+    assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x69]), "Hi");
     // NUL code units are dropped (EscapeJSON `tr/\0//d`), NOT truncated —
     // text after an embedded NUL survives, matching ExifTool.
-    assert_eq!(decode_utf16be(&[0x00, 0x48, 0x00, 0x00, 0x00, 0x69]), "Hi");
+    assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x00, 0x00, 0x69]), "Hi");
     // A trailing UTF-16 NUL terminator is dropped.
-    assert_eq!(decode_utf16be(&[0x00, 0x48, 0x00, 0x00]), "H");
+    assert_eq!(decode_utf16(&[0x00, 0x48, 0x00, 0x00]), "H");
+  }
+
+  #[test]
+  fn decode_utf16_strips_be_bom() {
+    // `Charset.pm:203-206`: a leading `FE FF` (BE) BOM is stripped and the
+    // remainder decoded big-endian — the BOM is NOT preserved as U+FEFF.
+    assert_eq!(decode_utf16(&[0xfe, 0xff, 0x00, 0x48, 0x00, 0x69]), "Hi");
+    // BOM-only value decodes to empty (BOM stripped, nothing left).
+    assert_eq!(decode_utf16(&[0xfe, 0xff]), "");
+  }
+
+  #[test]
+  fn decode_utf16_strips_le_bom_and_decodes_little_endian() {
+    // `Charset.pm:203-204`: a leading `FF FE` (LE) BOM is stripped and the
+    // remainder decoded little-endian (`$fmt = 'v*'`) — not garbled.
+    assert_eq!(decode_utf16(&[0xff, 0xfe, 0x48, 0x00, 0x69, 0x00]), "Hi");
+    // LE BOM with a trailing LE NUL terminator (00 00) — dropped.
+    assert_eq!(decode_utf16(&[0xff, 0xfe, 0x48, 0x00, 0x00, 0x00]), "H");
+  }
+
+  #[test]
+  fn decode_utf16_bom_surrogate_pairs_respect_byte_order() {
+    // U+1F600 (😀) = surrogate pair D83D DE00. BE BOM ⇒ big-endian units.
+    assert_eq!(
+      decode_utf16(&[0xfe, 0xff, 0xd8, 0x3d, 0xde, 0x00]),
+      "\u{1f600}"
+    );
+    // Same code point, LE BOM ⇒ little-endian units (bytes within each u16
+    // swapped). A naive BE read here would mis-pair the surrogates.
+    assert_eq!(
+      decode_utf16(&[0xff, 0xfe, 0x3d, 0xd8, 0x00, 0xde]),
+      "\u{1f600}"
+    );
   }
 
   #[test]

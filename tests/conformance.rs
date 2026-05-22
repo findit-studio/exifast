@@ -99,6 +99,26 @@ fn mxf_multidescriptor_conformance() {
 }
 
 #[test]
+fn mxf_utf16_bom_conformance() {
+  // Codex R2/F1 regression: `MXF.mxf` with every UTF-16 `ApplicationName` /
+  // `TrackName` value rewritten to carry a byte-order mark (byte-length
+  // preserved by dropping one trailing char). MXF.pm:2484 decodes UTF-16 via
+  // `$et->Decode($val, 'UTF16')` with no byte-order arg, so Charset::Decompose
+  // (Charset.pm:188-206) defaults to GetByteOrder() = 'MM' (big-endian, set at
+  // MXF.pm:2821) and then strips a leading BOM: `$val =~ s/^(\xfe\xff|\xff\xfe)//`
+  // sets `$fmt = $1 eq "\xfe\xff" ? 'n*' : 'v*'`. So a `FE FF` (BE) BOM is
+  // stripped and the remainder decoded big-endian (NOT preserved as a leading
+  // U+FEFF), and a `FF FE` (LE) BOM is stripped AND the remainder decoded
+  // little-endian (NOT garbled by a big-endian read). Both goldens come from
+  // the bundled oracle (`tools/gen_golden.sh`) and decode to the identical
+  // BOM-stripped text ("ExifToo", "Timecode Trac", "Sound Trac").
+  check("MXF_BomBE.mxf", "MXF_BomBE.mxf.json", true);
+  check("MXF_BomBE.mxf", "MXF_BomBE.mxf.n.json", false);
+  check("MXF_BomLE.mxf", "MXF_BomLE.mxf.json", true);
+  check("MXF_BomLE.mxf", "MXF_BomLE.mxf.n.json", false);
+}
+
+#[test]
 fn matroska_conformance() {
   // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
   // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio

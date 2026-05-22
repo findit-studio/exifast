@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_151() {
+fn typed_serde_path_equals_writer_path_and_golden_all_153() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -246,12 +246,18 @@ fn typed_serde_path_equals_writer_path_and_golden_all_151() {
   // ONLY through the hidden `MultipleDescriptor.FileDescriptors` /
   // `SourcePackage.PackageTracks` StrongReference edges, exercising the
   // complete structural-edge subset of `TAG_TABLE`.
+  // 151 → 153 after Codex R2/F1: added `MXF_BomBE.mxf` + `MXF_BomLE.mxf`
+  // (each MXF.mxf with its UTF-16 `ApplicationName`/`TrackName` values
+  // rewritten to carry a `FE FF` / `FF FE` byte-order mark, byte-length
+  // preserved) — pinning `Charset.pm:203-206` BOM handling in the UTF-16
+  // decoder: a BE BOM is stripped (not preserved as U+FEFF) and a LE BOM is
+  // stripped AND the remainder decoded little-endian (not garbled).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    151,
-    "expected exactly the 151 active conformance fixtures, found {}: {:?}",
+    153,
+    "expected exactly the 153 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
