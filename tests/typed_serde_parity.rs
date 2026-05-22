@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_149() {
+fn typed_serde_path_equals_writer_path_and_golden_all_151() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -236,12 +236,22 @@ fn typed_serde_path_equals_writer_path_and_golden_all_149() {
   // `real_synth_metafile_http_accept.ram`) pinning the Real.pm:533-555
   // Metafile branch — the RAM-vs-RPM extension discrimination, the
   // `^[a-z]{3,4}://` URL/text split, and the `http`-line acceptance gate.
+  // 149 → 150 after FORMATS.md row 24 lib/mxf: added `MXF.mxf` (bundled
+  // t/images fixture, 7510 bytes) exercising the KLV walker + BER length
+  // decoder + Primer local-id→UL map + local-set walker + the MXF-specific
+  // value decoders + `Track<N>` group attribution ported in
+  // `src/formats/mxf.rs`.
+  // 150 → 151 after Codex R1/F1: added `MXF_MultiDescriptor.mxf` (synthetic,
+  // 2426 bytes) — a multi-essence MXF whose audio descriptors are reachable
+  // ONLY through the hidden `MultipleDescriptor.FileDescriptors` /
+  // `SourcePackage.PackageTracks` StrongReference edges, exercising the
+  // complete structural-edge subset of `TAG_TABLE`.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    149,
-    "expected exactly the 149 active conformance fixtures, found {}: {:?}",
+    151,
+    "expected exactly the 151 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

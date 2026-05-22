@@ -62,7 +62,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 # Umbrella — enables every per-format gate.
 all-formats = [
   "aac", "aiff", "ape", "audible", "dsf", "dv", "flac",
-  "id3", "matroska", "mp3", "mpc", "moi", "ogg", "real", "red", "wavpack",
+  "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg", "real", "red", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -104,6 +104,10 @@ mpc        = ["id3", "ape"]
 # on the `moi-port` branch and hasn't merged to `main` yet. The format-gating
 # `cfg` for MOI lands in Phase E when the MOI source merges.
 moi        = []
+# `mxf` — engine-only per FORMATS.md row 24. Leaf format (no cross-format
+# chains); ports the KLV walker + BER length decoder + Primer + local-set
+# walker + the MXF-specific value-type decoders.
+mxf        = []
 # `ogg` chains FLAC (METADATA_BLOCK_PICTURE — Vorbis comment's `Picture:*`
 # SubDirectory hop reuses the FLAC type-6 picture-block parser, Vorbis.pm:
 # 122-134) AND ID3 (`unless ($$et{DoneID3}) { ID3::ProcessID3 }` at
