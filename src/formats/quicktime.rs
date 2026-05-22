@@ -908,6 +908,40 @@ fn file_type_from_ftyp(payload: &[u8]) -> (&'static str, &'static str) {
   ("MP4", "video/mp4")
 }
 
+/// `%useExt` — "use extension to determine file type" (QuickTime.pm:240).
+///
+/// The WHOLE table is a single entry: `( GLV => 'MP4' )`. The promotion at
+/// QuickTime.pm:10007 fires only when ALL of the following hold:
+///
+/// ```perl
+/// my $ext = $$et{FILE_EXT};
+/// $fileType = $ext if $ext and $useExt{$ext} and $fileType eq $useExt{$ext};
+/// ```
+///
+/// i.e. the file extension is set, IS a `%useExt` key, AND the ftyp-derived
+/// `$fileType` equals the value that key maps to. So a `.glv` file whose ftyp
+/// resolves to the generic `MP4` (the GLV mapped value) is promoted to `GLV`;
+/// a `.glv` whose ftyp resolves to anything else (`MOV`, `M4A`, …) is NOT
+/// promoted here — the generic `SetFileType` sub-type-by-extension block
+/// (ExifTool.pm:9686-9692, ported in `resolve_file_type`) handles those, since
+/// every QuickTime sub-type shares the `MOV` root in `%fileTypeLookup`.
+///
+/// `$$et{FILE_EXT}` is the UPPERCASED, dotless extension (ExifTool.pm:9096-
+/// 9106 `GetFileExtension`), so `ext` here is the engine's `file_ext_for_name`
+/// value (already uppercased); the lone key `GLV` is uppercase, matched
+/// case-insensitively for robustness.
+///
+/// Returns the promoted file type when the predicate fires, else `None`.
+fn use_ext(file_type: &str, ext: Option<&str>) -> Option<&'static str> {
+  let ext = ext?;
+  // `%useExt = ( GLV => 'MP4' )` — the entire table (QuickTime.pm:240).
+  if ext.eq_ignore_ascii_case("GLV") && file_type == "MP4" {
+    // QuickTime.pm:10007 `$fileType = $ext` — the canonical uppercase key.
+    return Some("GLV");
+  }
+  None
+}
+
 // ===========================================================================
 // mvhd / tkhd / mdhd binary-data decoders
 // ===========================================================================
@@ -1332,24 +1366,48 @@ impl FormatParser for ProcessMov {
   type Error = Error;
 
   fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    parse_inner(data)
+    // The leaf `FormatParser::parse` carries no extension channel; the
+    // closed dispatch in `format_parser.rs` routes the `%useExt` rule
+    // through the extension-aware [`parse_with_ext`] entry instead.
+    parse_inner(data, None)
   }
 }
 
 /// Lib-first direct entry — borrow-from-input (phantom `'a`; the Meta owns
-/// its data, so the lifetime is purely a GAT anchor).
+/// its data, so the lifetime is purely a GAT anchor). Equivalent to
+/// [`parse_with_ext`] with no extension (`%useExt` never fires; faithful to a
+/// QuickTime buffer with an unknown source name).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  parse_inner(data)
+  parse_inner(data, None)
+}
+
+/// Extension-aware QuickTime entry — faithful to `ProcessMOV` reading
+/// `$$et{FILE_EXT}` for the `%useExt` rule (QuickTime.pm:240, 10006-10007).
+///
+/// `ext` is the uppercased, dotless file extension (`$$self{FILE_EXT}`,
+/// ExifTool.pm:2966/9096) — e.g. `Some("GLV")`, or `None` when the source has
+/// no extension. It is consumed only during this call; the returned [`Meta`]
+/// owns its data, so a transient `ext` string may be dropped while the meta
+/// lives on.
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (none today).
+pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>, Error> {
+  parse_inner(data, ext)
 }
 
 /// Inner parser. Returns `Ok(None)` (Perl `return 0`) when the first
 /// top-level atom is not a recognized `%QuickTime::Main` key
 /// (QuickTime.pm:9984).
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+///
+/// `ext` is the uppercased `$$et{FILE_EXT}` (ExifTool.pm:2966), used only for
+/// the `%useExt` rule (QuickTime.pm:10006-10007).
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>, Error> {
   // QuickTime.pm:9966 `$raf->Read($buff,8) == 8 or return 0` — the FIRST step
   // is a plain 8-byte read; QuickTime.pm:9973 `($size, $tag) = unpack('Na4',
   // $buff)` then yields the RAW 32-bit `$size` and the 4-byte `$tag`.
@@ -1412,6 +1470,27 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
       // atom, a short `ftyp` (`size32 < 12`), or an extended-size `ftyp`.
       ("MOV", "video/quicktime")
     };
+
+  // **R11/F1.** The `%useExt` rule (QuickTime.pm:240, 10006-10007). ExifTool
+  // applies it INSIDE the `if ($tag eq 'ftyp' and $size >= 12)` branch, after
+  // the ftyp-derived `$fileType` and BEFORE `SetFileType` — so it can promote
+  // `MP4` (the only `%useExt` mapped value) to the extension type. The lone
+  // table entry is `GLV => 'MP4'`: a `.glv` file with an MP4-compatible ftyp
+  // becomes `File:FileType=GLV`. Because `%useExt` only ever maps to `MP4` and
+  // the non-`ftyp` `else` branch above yields `MOV` (never `MP4`), running the
+  // promotion here is equivalent to running it inside the ftyp branch — the
+  // `MOV` result can never satisfy `use_ext`'s `file_type == "MP4"` predicate.
+  // The MIME is recomputed exactly as `SetFileType($fileType,
+  // $mimeLookup{$fileType} || 'video/mp4')` would: `%mimeLookup` has no `GLV`
+  // entry, so it falls back to `video/mp4` (which the MP4 source already
+  // carried). This MUST run BEFORE the post-walk MP4→M4A override below, which
+  // is gated on `$$et{FileType} eq 'MP4'` (QuickTime.pm:10619) — once promoted
+  // to GLV the audio-only override no longer fires (verified vs bundled).
+  if let Some(promoted) = use_ext(file_type, ext) {
+    file_type = promoted;
+    // QuickTime.pm:10008 `$mimeLookup{$fileType} || 'video/mp4'` for `GLV`.
+    mime = "video/mp4";
+  }
 
   // Walk the TOP-LEVEL atoms in FILE ORDER, in TWO passes (R3-F2). The movie
   // `TimeScale` set by `mvhd`'s RawConv is a single GLOBAL slot, last-wins
@@ -2092,7 +2171,7 @@ mod tests {
     let mut data = ftyp;
     data.extend_from_slice(&moov_zero);
 
-    let meta = parse_inner(&data).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
     // ftyp tags ARE present.
     assert_eq!(meta.qt.major_brand(), Some("qt  "));
     // The size-0 moov payload was NOT decoded: no mvhd-derived state.
@@ -2118,7 +2197,7 @@ mod tests {
     let payload_start = data.len() + 8; // after ftyp + the mdat 8-byte header
     data.extend_from_slice(&mdat_zero);
 
-    let meta = parse_inner(&data).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
     assert_eq!(meta.qt.media_data_offset(), Some(payload_start as u64));
     assert_eq!(
       meta.qt.media_data_size(),
@@ -2358,13 +2437,13 @@ mod tests {
   #[test]
   fn parse_inner_rejects_unknown_first_atom() {
     let data = atom(b"XXXX", b"\0\0\0\0");
-    assert!(parse_inner(&data).expect("ok").is_none());
+    assert!(parse_inner(&data, None).expect("ok").is_none());
   }
 
   #[test]
   fn parse_inner_accepts_ftyp_and_resolves_type() {
     let data = atom(b"ftyp", b"M4A \0\0\0\0M4A mp42");
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "M4A");
     // MajorBrand keeps the trailing space (the %ftypLookup PrintConv key).
     assert_eq!(meta.quicktime().major_brand(), Some("M4A "));
@@ -2398,7 +2477,7 @@ mod tests {
     };
     let ft = |major: &[u8; 4], handlers: &[&[u8; 4]]| {
       let data = build(major, handlers);
-      let meta = parse_inner(&data).expect("ok").expect("accepted");
+      let meta = parse_inner(&data, None).expect("ok").expect("accepted");
       (meta.file_type(), meta.mime())
     };
 
@@ -2417,6 +2496,94 @@ mod tests {
     // A non-matching major brand (`3gp4` ⇒ resolves to MP4 via the mp42 compat
     // slot, but the brand does not start with iso/dash/mp42) ⇒ no override.
     assert_eq!(ft(b"3gp4", &[b"soun"]), ("MP4", "video/mp4"));
+  }
+
+  #[test]
+  fn use_ext_table_is_glv_to_mp4_only() {
+    // R11/F1: `%useExt = ( GLV => 'MP4' )` (QuickTime.pm:240) — the WHOLE
+    // table is this single entry, and the predicate (QuickTime.pm:10007)
+    // `$fileType = $ext if $ext and $useExt{$ext} and $fileType eq
+    // $useExt{$ext}` fires only when ALL three hold.
+
+    // The lone covered entry: ext `GLV` AND ftyp-derived `MP4` ⇒ promote GLV.
+    assert_eq!(use_ext("MP4", Some("GLV")), Some("GLV"));
+    // `$$et{FILE_EXT}` is uppercased upstream; accept any case defensively.
+    assert_eq!(use_ext("MP4", Some("glv")), Some("GLV"));
+    assert_eq!(use_ext("MP4", Some("Glv")), Some("GLV"));
+
+    // Predicate guard: ext is a `%useExt` key but `$fileType ne $useExt{$ext}`
+    // ⇒ NO promotion. A `.glv` whose ftyp resolved to anything but MP4 is left
+    // for the generic `SetFileType` sub-type-by-extension path (the `MOV` root
+    // shared by GLV handles MOV→GLV; M4A/M4V/M4B are NOT promoted there).
+    assert_eq!(use_ext("MOV", Some("GLV")), None);
+    assert_eq!(use_ext("M4A", Some("GLV")), None);
+    assert_eq!(use_ext("M4V", Some("GLV")), None);
+    assert_eq!(use_ext("F4V", Some("GLV")), None);
+
+    // Predicate guard: ext is NOT a `%useExt` key ⇒ NO promotion, regardless
+    // of the ftyp-derived type. (`%useExt` has exactly one key — `GLV`.)
+    assert_eq!(use_ext("MP4", Some("MP4")), None);
+    assert_eq!(use_ext("MP4", Some("MOV")), None);
+    assert_eq!(use_ext("MP4", Some("M4A")), None);
+    assert_eq!(use_ext("MP4", Some("MKV")), None);
+    // Predicate guard: `$ext` undef (dotless source name) ⇒ NO promotion.
+    assert_eq!(use_ext("MP4", None), None);
+  }
+
+  #[test]
+  fn use_ext_glv_promotion_suppresses_m4a_override() {
+    // R11/F1 end-to-end: the BYTE-IDENTICAL audio-only `isom` file resolves to
+    // MP4, then either the `%useExt` GLV promotion OR the post-walk MP4→M4A
+    // override applies depending ONLY on the extension. `%useExt` runs FIRST
+    // (QuickTime.pm:10007, before the atom loop), so a `.glv` ext flips the
+    // type to GLV and the M4A override (gated on `FileType eq 'MP4'`,
+    // QuickTime.pm:10619) no longer fires.
+    let hdlr = atom(b"hdlr", &[&[0u8; 8], &b"soun"[..], &[0u8; 12]].concat());
+    // ftyp `isom` + a non-first `mp42` compat slot ⇒ resolves MP4; audio-only.
+    let ftyp = atom(
+      b"ftyp",
+      &[&b"isom"[..], &[0u8; 4], &b"isom"[..], b"mp42"].concat(),
+    );
+    let moov = atom(b"moov", &atom(b"trak", &atom(b"mdia", &hdlr)));
+    let data = [ftyp, moov].concat();
+
+    // `.glv` extension ⇒ `%useExt` promotes MP4→GLV (override skipped).
+    let glv = parse_inner(&data, Some("GLV"))
+      .expect("ok")
+      .expect("accepted");
+    assert_eq!(glv.file_type(), "GLV");
+    // `%mimeLookup{GLV}` is undef ⇒ the `'video/mp4'` fallback (QuickTime.pm:10008).
+    assert_eq!(glv.mime(), "video/mp4");
+
+    // Same bytes, NO `.glv` ext ⇒ MP4 not promoted ⇒ the audio-only MP4→M4A
+    // override fires (QuickTime.pm:10619-10624).
+    let m4a = parse_inner(&data, None).expect("ok").expect("accepted");
+    assert_eq!(m4a.file_type(), "M4A");
+    assert_eq!(m4a.mime(), "audio/mp4");
+
+    // A `.glv` ext on a `qt  ` major (resolves MOV, not MP4) ⇒ `%useExt` does
+    // NOT fire here (MOV ne MP4); the parser leaves MOV and the generic engine
+    // path performs the MOV→GLV sub-type promotion downstream.
+    let qt_ftyp = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    let qt_data = [
+      qt_ftyp,
+      atom(
+        b"moov",
+        &atom(
+          b"trak",
+          &atom(
+            b"mdia",
+            &atom(b"hdlr", &[&[0u8; 8], &b"vide"[..], &[0u8; 12]].concat()),
+          ),
+        ),
+      ),
+    ]
+    .concat();
+    let qt = parse_inner(&qt_data, Some("GLV"))
+      .expect("ok")
+      .expect("accepted");
+    assert_eq!(qt.file_type(), "MOV");
+    assert_eq!(qt.mime(), "video/quicktime");
   }
 
   #[test]
@@ -2455,7 +2622,7 @@ mod tests {
     let data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     let mut full = data;
     full.extend_from_slice(&atom(b"moov", &moov_body));
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     let track = &meta.quicktime().tracks()[0];
     // 1200 / 600 = 2.0 — the final movie TimeScale is used regardless of the
     // trak-before-mvhd file order (faithful durationInfo ValueConv).
@@ -2497,7 +2664,7 @@ mod tests {
     full.extend_from_slice(&moov1);
     full.extend_from_slice(&moov2);
 
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     // Final global TimeScale is the SECOND moov's (last-wins).
     assert_eq!(meta.quicktime().time_scale(), Some(300));
     let track = &meta.quicktime().tracks()[0];
@@ -2531,7 +2698,7 @@ mod tests {
     full.extend_from_slice(&moov1);
     full.extend_from_slice(&moov2);
 
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     let qt = meta.quicktime();
     // The raw Duration COUNT survives moov2's short mvhd (absent ⇒ no erase).
     assert_eq!(qt.duration_count(), Some(3000));
@@ -2554,7 +2721,7 @@ mod tests {
     let mut data = 100u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"ftyp");
     data.extend_from_slice(b"mp42"); // 12 bytes total
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MP4");
     assert_eq!(meta.mime(), "video/mp4");
     // Truncated payload ⇒ no ftyp tags decoded.
@@ -2576,7 +2743,7 @@ mod tests {
     let mut data = 100u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"mdat");
     data.extend_from_slice(b"XXXX"); // 12 bytes total
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     // mdat-size/offset from the DECLARED size (100 - 8 = 92), offset = 8.
     assert_eq!(meta.quicktime().media_data_size(), Some(92));
@@ -2596,7 +2763,7 @@ mod tests {
     let mut data = 10u32.to_be_bytes().to_vec(); // declared size 10 (< 12)
     data.extend_from_slice(b"ftyp");
     data.push(b'm'); // 9 bytes total, declared 2-byte payload overruns
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -2612,7 +2779,7 @@ mod tests {
     for size in 2u32..=7 {
       let mut data = size.to_be_bytes().to_vec();
       data.extend_from_slice(b"ftyp");
-      let meta = parse_inner(&data).expect("ok").expect("accepted");
+      let meta = parse_inner(&data, None).expect("ok").expect("accepted");
       assert_eq!(meta.file_type(), "MOV", "size {size}: file type");
       assert_eq!(
         meta.warning.as_deref(),
@@ -2623,7 +2790,7 @@ mod tests {
     // The same for a `moov`/`mdat` first atom — any magic type is accepted.
     let mut moov4 = 4u32.to_be_bytes().to_vec();
     moov4.extend_from_slice(b"moov");
-    let meta = parse_inner(&moov4).expect("ok").expect("accepted");
+    let meta = parse_inner(&moov4, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Invalid atom size"));
   }
@@ -2639,7 +2806,7 @@ mod tests {
     let mut data = 1u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"ftyp");
     data.extend_from_slice(&[0u8; 4]); // only 4 of the 8 ext-size bytes
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Truncated atom header"));
 
@@ -2647,7 +2814,7 @@ mod tests {
     let mut mdat = 1u32.to_be_bytes().to_vec();
     mdat.extend_from_slice(b"mdat");
     mdat.extend_from_slice(&[0u8; 3]);
-    let meta = parse_inner(&mdat).expect("ok").expect("accepted");
+    let meta = parse_inner(&mdat, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Truncated atom header"));
   }
@@ -2665,7 +2832,7 @@ mod tests {
       .chain(b"ftyp")
       .copied()
       .collect::<Vec<u8>>();
-    let meta = parse_inner(&size8).expect("ok").expect("accepted");
+    let meta = parse_inner(&size8, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.mime(), "video/quicktime");
 
@@ -2673,7 +2840,7 @@ mod tests {
     let mut size11 = 11u32.to_be_bytes().to_vec();
     size11.extend_from_slice(b"ftyp");
     size11.extend_from_slice(b"qt ");
-    let meta = parse_inner(&size11).expect("ok").expect("accepted");
+    let meta = parse_inner(&size11, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -2690,7 +2857,7 @@ mod tests {
     data.extend_from_slice(&24u64.to_be_bytes()); // 64-bit size = 24
     data.extend_from_slice(b"isom"); // major brand
     data.extend_from_slice(&[0u8; 4]); // minor version
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     // MOV via SetFileType(), NOT MP4 from the `isom` brand.
     assert_eq!(meta.file_type(), "MOV");
     // The brand is still decoded from the (valid) extended-size atom walk.
@@ -2707,7 +2874,7 @@ mod tests {
     let mut data = 16u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"pict");
     data.extend_from_slice(&[0u8; 8]);
-    let meta = parse_inner(&data).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -2721,7 +2888,7 @@ mod tests {
     data.extend_from_slice(b"meta");
     data.extend_from_slice(&[0u8; 8]);
     assert!(
-      parse_inner(&data).expect("ok").is_none(),
+      parse_inner(&data, None).expect("ok").is_none(),
       "`meta` is not a magic-regex first atom — must be rejected"
     );
     // `moof` / `udta` likewise: Main keys but not magic atoms.
@@ -2729,7 +2896,7 @@ mod tests {
       let mut d = 16u32.to_be_bytes().to_vec();
       d.extend_from_slice(tag);
       d.extend_from_slice(&[0u8; 8]);
-      assert!(parse_inner(&d).expect("ok").is_none());
+      assert!(parse_inner(&d, None).expect("ok").is_none());
     }
   }
 
@@ -2765,7 +2932,7 @@ mod tests {
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full.extend_from_slice(&moov);
 
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     let track = &meta.quicktime().tracks()[0];
     // MediaTimeScale is last-wins (the field IS present in the short mdhd).
     assert_eq!(track.media_time_scale(), Some(300));
@@ -2789,7 +2956,7 @@ mod tests {
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full.extend_from_slice(&moov);
 
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     assert_eq!(
       meta.warning.as_deref(),
       Some("Truncated 'mvhd' data (missing 88 bytes)")
@@ -2810,7 +2977,9 @@ mod tests {
     let moov_tkhd = atom(b"moov", &atom(b"trak", &trak_body));
     let mut full_tkhd = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full_tkhd.extend_from_slice(&moov_tkhd);
-    let meta = parse_inner(&full_tkhd).expect("ok").expect("accepted");
+    let meta = parse_inner(&full_tkhd, None)
+      .expect("ok")
+      .expect("accepted");
     // The truncation is per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
@@ -2827,7 +2996,9 @@ mod tests {
     let moov_mdhd = atom(b"moov", &atom(b"trak", &atom(b"mdia", &mdia_body)));
     let mut full_mdhd = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full_mdhd.extend_from_slice(&moov_mdhd);
-    let meta = parse_inner(&full_mdhd).expect("ok").expect("accepted");
+    let meta = parse_inner(&full_mdhd, None)
+      .expect("ok")
+      .expect("accepted");
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
     assert_eq!(
@@ -2850,7 +3021,7 @@ mod tests {
     moov_body.extend_from_slice(b"mvhd");
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0");
     full.extend_from_slice(&atom(b"moov", &moov_body));
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     assert_eq!(meta.warning.as_deref(), Some("Invalid atom size"));
     // The invalid-size mvhd is never decoded.
     assert_eq!(meta.quicktime().time_scale(), None);
@@ -2867,7 +3038,7 @@ mod tests {
     trak_body.extend_from_slice(b"tkhd");
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0");
     full.extend_from_slice(&atom(b"moov", &atom(b"trak", &trak_body)));
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     // Per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
@@ -2903,7 +3074,7 @@ mod tests {
     full.extend_from_slice(&mk_moov(600, &mk_trak(1, 600))); // Track1 (first)
     full.extend_from_slice(&mk_moov(600, &mk_trak(2, 1200))); // Track1 again
 
-    let meta = parse_inner(&full).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
     let tracks = meta.quicktime().tracks();
     assert_eq!(tracks.len(), 2, "both traks are decoded into the list");
     // BOTH tracks carry family-1 group Track1 (per-moov reset).

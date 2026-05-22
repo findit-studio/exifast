@@ -1201,10 +1201,13 @@ impl AnyParser {
       }
       #[cfg(feature = "quicktime")]
       AnyParser::QuickTime(p) => {
-        // QuickTime SP1 is a leaf format: no shared chain state, no
-        // extension dependence.
-        let _ = (shared, ext);
-        p.parse(bytes)
+        // QuickTime SP1 is a leaf format with no shared chain state, but it
+        // DOES read `$$et{FILE_EXT}` for the `%useExt` rule (QuickTime.pm:240,
+        // 10006-10007: `.glv` + MP4-compatible ftyp ⇒ `File:FileType=GLV`).
+        // The leaf `FormatParser::parse` has no extension channel, so the
+        // dispatch uses the extension-aware `parse_with_ext` entry instead.
+        let _ = (p, shared);
+        crate::formats::quicktime::parse_with_ext(bytes, ext)
           .map(|o| o.map(AnyMeta::QuickTime))
           .map_err(Into::into)
       }

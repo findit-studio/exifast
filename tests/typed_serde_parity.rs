@@ -353,12 +353,21 @@ fn typed_serde_path_equals_writer_path_and_golden_all_175() {
   // mvhd/tkhd/mdhd Hooks widen on a TRUTHY version (not strictly `== 1`) — is
   // crafted-input-only (v2+ atoms are undefined by the MP4 spec), so it adds
   // NO fixture; the existing v0/v1 fixtures stay byte-exact green.
+  // 179 → 180 after PR #38 Codex R11 finding F1: added the QuickTime fixture
+  // `QuickTime_useext_glv.glv` — the BYTE-IDENTICAL twin of
+  // `QuickTime_m4a_isom_override.mov` but named `.glv`. The `%useExt` rule
+  // (QuickTime.pm:240 `( GLV => 'MP4' )`, applied at QuickTime.pm:10006-10007)
+  // promotes the ftyp-derived MP4 to GLV BEFORE the post-walk MP4→M4A override
+  // (gated on `FileType eq 'MP4'`), so the same audio-only bytes yield
+  // `File:FileType=GLV` / `File:FileTypeExtension=glv` / `File:MIMEType=video/mp4`
+  // as `.glv` vs `M4A` as `.mov` (verified vs bundled 13.58, R11/F1). The
+  // `%useExt` table has exactly this one entry, so no other fixture is needed.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    179,
-    "expected exactly the 179 active conformance fixtures, found {}: {:?}",
+    180,
+    "expected exactly the 180 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

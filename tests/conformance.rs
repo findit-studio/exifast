@@ -183,6 +183,34 @@ fn quicktime_m4a_isom_override_conformance() {
 }
 
 #[test]
+fn quicktime_useext_glv_conformance() {
+  // PR #38 Codex R11/F1: the `%useExt` rule (QuickTime.pm:240
+  // `%useExt = ( GLV => 'MP4' )`, applied at QuickTime.pm:10006-10007). This
+  // fixture is the BYTE-IDENTICAL twin of `QuickTime_m4a_isom_override.mov`
+  // (same `isom` major brand, audio-only `soun` track, MP4-resolving brands)
+  // but named with a `.glv` extension. ExifTool's `%useExt` rule promotes the
+  // ftyp-derived `MP4` to `GLV` BEFORE `SetFileType` — and because that runs
+  // before the post-walk MP4→M4A override (gated on `$$et{FileType} eq 'MP4'`,
+  // QuickTime.pm:10619), the audio-only override no longer fires. So the same
+  // bytes that yield `File:FileType=M4A` as `.mov` yield `File:FileType=GLV` /
+  // `File:FileTypeExtension=glv` (raw `GLV`) / `File:MIMEType=video/mp4` as
+  // `.glv` (`%mimeLookup` has no `GLV` entry ⇒ the `'video/mp4'` fallback).
+  // Verified vs bundled ExifTool 13.58 — the canonical Garmin Low-resolution
+  // Video real-world fidelity case. Exercises the engine's `ext` channel
+  // (`extract_info` derives `$$et{FILE_EXT}` from the `.glv` fixture name).
+  check(
+    "QuickTime_useext_glv.glv",
+    "QuickTime_useext_glv.glv.json",
+    true,
+  );
+  check(
+    "QuickTime_useext_glv.glv",
+    "QuickTime_useext_glv.glv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_m4v_conformance() {
   // PR #38 Codex R2/F2: a SYNTHETIC `.mov` with an `M4V ` major brand ⇒
   // `File:FileType=M4V`, `File:MIMEType=video/x-m4v` (QuickTime.pm:10008 +
