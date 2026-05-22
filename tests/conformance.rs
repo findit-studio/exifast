@@ -159,6 +159,30 @@ fn quicktime_m4a_conformance() {
 }
 
 #[test]
+fn quicktime_m4a_isom_override_conformance() {
+  // PR #38 Codex R10/F1: a SYNTHETIC `.mov` with an `isom` MAJOR brand whose
+  // brands resolve to MP4, plus a single `soun`-handler track and NO `vide`
+  // handler. ExifTool runs a post-walk override (QuickTime.pm:10619-10624):
+  // when the resolved type is MP4 AND `save_ftyp` (the major brand) matches
+  // `^(iso|dash|mp42)` AND a `soun` handler exists AND no `vide` handler
+  // exists, `OverrideFileType('M4A','audio/mp4')` flips the type. So this
+  // audio-only `.m4a` is `File:FileType=M4A` / `File:FileTypeExtension=m4a` /
+  // `File:MIMEType=audio/mp4`, while `QuickTime:MajorBrand` keeps the `isom`
+  // PrintConv ("MP4 Base Media v1 …"). Verified vs bundled ExifTool 13.58 —
+  // this is the ubiquitous real-world M4A audio-file fidelity case.
+  check(
+    "QuickTime_m4a_isom_override.mov",
+    "QuickTime_m4a_isom_override.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_m4a_isom_override.mov",
+    "QuickTime_m4a_isom_override.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_m4v_conformance() {
   // PR #38 Codex R2/F2: a SYNTHETIC `.mov` with an `M4V ` major brand ⇒
   // `File:FileType=M4V`, `File:MIMEType=video/x-m4v` (QuickTime.pm:10008 +

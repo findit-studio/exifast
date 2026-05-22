@@ -342,12 +342,23 @@ fn typed_serde_path_equals_writer_path_and_golden_all_175() {
   // bundled `$warnStr` instead of `walk_atoms` breaking silently, R9/F2) and
   // `QuickTime_nested_invalid_tkhd.mov` (a `tkhd` with invalid `size == 4`
   // inside `moov/trak` ⇒ `Track1:Warning = "Invalid atom size"`, R9/F2).
+  // 178 → 179 after PR #38 Codex R10 finding F1: added the synthetic
+  // adversarial QuickTime fixture `QuickTime_m4a_isom_override.mov` (an `ftyp`
+  // `isom` MAJOR brand + a lone `soun`-handler track and NO `vide` handler ⇒
+  // bundled ExifTool's post-walk `OverrideFileType('M4A','audio/mp4')` flips
+  // the MP4-resolved type to `File:FileType=M4A` / `File:FileTypeExtension=m4a`
+  // / `File:MIMEType=audio/mp4` while `QuickTime:MajorBrand` keeps the `isom`
+  // PrintConv — the audio-only `.m4a` real-world-file case,
+  // QuickTime.pm:10619-10624, verified vs bundled 13.58, R10/F1). R10/F2 — the
+  // mvhd/tkhd/mdhd Hooks widen on a TRUTHY version (not strictly `== 1`) — is
+  // crafted-input-only (v2+ atoms are undefined by the MP4 spec), so it adds
+  // NO fixture; the existing v0/v1 fixtures stay byte-exact green.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    178,
-    "expected exactly the 178 active conformance fixtures, found {}: {:?}",
+    179,
+    "expected exactly the 179 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

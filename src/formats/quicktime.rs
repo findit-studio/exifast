@@ -916,16 +916,21 @@ fn file_type_from_ftyp(payload: &[u8]) -> (&'static str, &'static str) {
 /// (`%QuickTime::MovieHeader`, QuickTime.pm:1343-1421).
 ///
 /// The table FORMAT is `int32u`, so binary-data index `N` maps to byte
-/// offset `4*N + varSize` (ExifTool.pm:9946). The `version == 1` Hook
-/// widens entries 1 (CreateDate), 2 (ModifyDate) and 4 (Duration) to
-/// `int64u`, each adding 4 to `varSize` as it is processed; so every entry
-/// with index ≥ 5 sits 12 bytes later (`varSize == 12`) in a v1 mvhd
-/// (QuickTime.pm:1373/1380/1390 Hooks).
+/// offset `4*N + varSize` (ExifTool.pm:9946). The TRUTHY-version Hook
+/// (`$$self{MovieHeaderVersion} and ...`) widens entries 1 (CreateDate),
+/// 2 (ModifyDate) and 4 (Duration) to `int64u`, each adding 4 to `varSize`
+/// as it is processed; so every entry with index ≥ 5 sits 12 bytes later
+/// (`varSize == 12`) in a non-v0 mvhd (QuickTime.pm:1373/1380/1390 Hooks).
 fn decode_mvhd(payload: &[u8], qt: &mut QuickTimeMeta) {
   let Some(&version) = payload.first() else {
     return;
   };
-  let wide = version == 1;
+  // **R10/F2.** The mvhd Hooks widen on a TRUTHY version
+  // (`$$self{MovieHeaderVersion} and $format = "int64u"`,
+  // QuickTime.pm:1373/1380/1390), not strictly `== 1` — so any non-zero
+  // version takes the int64u layout. v0/v1 are the only spec-defined cases
+  // (so the observable behavior is unchanged), but this matches Perl exactly.
+  let wide = version != 0;
   // create(idx1)=4, modify(idx2)=8/16, ts(idx3)=12/20, duration(idx4)=16/24.
   let (create, modify, ts_off): (Option<u64>, Option<u64>, usize) = if wide {
     (be_u64(payload, 4), be_u64(payload, 12), 20)
@@ -1002,10 +1007,11 @@ fn fix_wrong_format(raw: u32) -> Option<u32> {
 /// TimeScale).
 ///
 /// As with mvhd, the table FORMAT is `int32u` so binary-data index `N` maps
-/// to byte offset `4*N + varSize`. The `version == 1` Hook widens entries
-/// 1 (TrackCreateDate), 2 (TrackModifyDate) and 5 (TrackDuration) to
-/// `int64u`; every entry with index ≥ 6 is therefore 12 bytes later in a v1
-/// tkhd. **This is the F2 fix**: v1 ImageWidth/ImageHeight (indices 19/20)
+/// to byte offset `4*N + varSize`. The TRUTHY-version Hook
+/// (`$$self{TrackHeaderVersion} and ...`) widens entries 1 (TrackCreateDate),
+/// 2 (TrackModifyDate) and 5 (TrackDuration) to `int64u`; every entry with
+/// index ≥ 6 is therefore 12 bytes later in a non-v0 tkhd. **(R1/F2)**: v1
+/// ImageWidth/ImageHeight (indices 19/20)
 /// are at byte offsets 88/92 (`4*19+12` / `4*20+12`), NOT 96/100 — only
 /// three time/duration fields widen, adding 12 bytes, not 20.
 fn decode_tkhd(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
@@ -1013,7 +1019,11 @@ fn decode_tkhd(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
   let Some(&version) = payload.first() else {
     return track;
   };
-  let wide = version == 1;
+  // **R10/F2.** The tkhd Hooks widen on a TRUTHY version
+  // (`$$self{TrackHeaderVersion} and $format = "int64u"`,
+  // QuickTime.pm:1512/1520/1531), not strictly `== 1`. v0/v1 are the only
+  // spec-defined cases; this matches Perl's predicate exactly.
+  let wide = version != 0;
   // create(idx1)=4; modify(idx2)=8/12; id(idx3)=12/20; duration(idx5)=20/28.
   // For v1 the create int64u occupies bytes 4-11, so modify int64u starts at
   // byte 12 (idx2 = 4*2 + varSize=4).
@@ -1060,14 +1070,18 @@ fn decode_tkhd(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
 }
 
 /// Decode the `mdhd` (Media Header) atom into `track`
-/// (`%QuickTime::MediaHeader`, QuickTime.pm:7239-7287). The `version == 1`
-/// Hook widens MediaCreateDate (idx1), MediaModifyDate (idx2) and
-/// MediaDuration (idx4) to `int64u`.
+/// (`%QuickTime::MediaHeader`, QuickTime.pm:7239-7287). The TRUTHY-version
+/// Hook (`$$self{MediaHeaderVersion} and ...`) widens MediaCreateDate (idx1),
+/// MediaModifyDate (idx2) and MediaDuration (idx4) to `int64u`.
 fn decode_mdhd(payload: &[u8], track: &mut MediaTrack) {
   let Some(&version) = payload.first() else {
     return;
   };
-  let wide = version == 1;
+  // **R10/F2.** The mdhd Hooks widen on a TRUTHY version
+  // (`$$self{MediaHeaderVersion} and $format = "int64u"`,
+  // QuickTime.pm:7255/7262/7273), not strictly `== 1`. v0/v1 are the only
+  // spec-defined cases; this matches Perl's predicate exactly.
+  let wide = version != 0;
   // create(idx1)=4; modify(idx2)=8/12; ts(idx3)=12/20. For v1 the create
   // int64u occupies bytes 4-11, so modify int64u starts at byte 12.
   let (create, modify, ts_off): (Option<u64>, Option<u64>, usize) = if wide {
@@ -1378,25 +1392,26 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // overruns EOF) follows QuickTime.pm:9988-10004: `$raf->Read($buff,$size-8)`
   // comes up short, the brand-detection `if` body is skipped, `$fileType`
   // stays undef, and `$fileType or $fileType = 'MP4'` defaults it to MP4.
-  let (file_type, mime): (&'static str, &'static str) = if &first == b"ftyp" && raw_size32 >= 12 {
-    // The `ftyp` brand path: read whatever payload is available. A full
-    // `Atom` gives the whole brand list; a `TruncatedAtom` (overrun) gives
-    // nothing readable ⇒ `file_type_from_ftyp` of an empty/short slice
-    // defaults to MP4, matching the bundled short-read default.
-    match read_atom_header(data, 0, true) {
-      Some(HeaderOutcome::Atom(header, _)) => {
-        file_type_from_ftyp(&data[header.payload_start..header.payload_end])
+  let (mut file_type, mut mime): (&'static str, &'static str) =
+    if &first == b"ftyp" && raw_size32 >= 12 {
+      // The `ftyp` brand path: read whatever payload is available. A full
+      // `Atom` gives the whole brand list; a `TruncatedAtom` (overrun) gives
+      // nothing readable ⇒ `file_type_from_ftyp` of an empty/short slice
+      // defaults to MP4, matching the bundled short-read default.
+      match read_atom_header(data, 0, true) {
+        Some(HeaderOutcome::Atom(header, _)) => {
+          file_type_from_ftyp(&data[header.payload_start..header.payload_end])
+        }
+        // A truncated `ftyp` with `size32 >= 12`: brand read fails ⇒ MP4
+        // (QuickTime.pm:10004). `read_atom_header` cannot surface a
+        // size-0/Malformed `ftyp` here (`size32 >= 12` excludes both).
+        _ => ("MP4", "video/mp4"),
       }
-      // A truncated `ftyp` with `size32 >= 12`: brand read fails ⇒ MP4
-      // (QuickTime.pm:10004). `read_atom_header` cannot surface a
-      // size-0/Malformed `ftyp` here (`size32 >= 12` excludes both).
-      _ => ("MP4", "video/mp4"),
-    }
-  } else {
-    // QuickTime.pm:10012 `else { SetFileType() }` ⇒ MOV: a non-`ftyp` first
-    // atom, a short `ftyp` (`size32 < 12`), or an extended-size `ftyp`.
-    ("MOV", "video/quicktime")
-  };
+    } else {
+      // QuickTime.pm:10012 `else { SetFileType() }` ⇒ MOV: a non-`ftyp` first
+      // atom, a short `ftyp` (`size32 < 12`), or an extended-size `ftyp`.
+      ("MOV", "video/quicktime")
+    };
 
   // Walk the TOP-LEVEL atoms in FILE ORDER, in TWO passes (R3-F2). The movie
   // `TimeScale` set by `mvhd`'s RawConv is a single GLOBAL slot, last-wins
@@ -1532,6 +1547,42 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
       break;
     }
     pos = next;
+  }
+
+  // **R10/F1.** Post-walk MP4→M4A override (QuickTime.pm:10619-10624):
+  //
+  // ```perl
+  // if ($topLevel and $$et{FileType} and $$et{FileType} eq 'MP4' and
+  //     $$et{save_ftyp} and $$et{HasHandler} and $$et{save_ftyp} =~ /^(iso|dash|mp42)/ and
+  //     $$et{HasHandler}{soun} and not $$et{HasHandler}{vide})
+  // {
+  //     $et->OverrideFileType('M4A', 'audio/mp4');
+  // }
+  // ```
+  //
+  // `$$et{save_ftyp}` is the `ftyp` MAJOR brand (the first 4 bytes,
+  // QuickTime.pm:9990-9991) — here `qt.major_brand()`. `$$et{HasHandler}{$h}`
+  // records every `hdlr` HandlerType seen (QuickTime.pm:8414); `soun`/`vide`
+  // only ever appear as the MEDIA handler in `trak/mdia/hdlr` (SP1's sole
+  // `hdlr` decode site), so the per-track handler codes are the faithful
+  // source for these two keys. The override fires only when the resolved type
+  // is MP4, the major brand starts with `iso`/`dash`/`mp42`, at least one
+  // track is a `soun` handler, and NO track is a `vide` handler — flipping the
+  // common audio-only `.m4a` (e.g. `ftyp isom` + a lone `soun` track) to
+  // `File:FileType=M4A` / `File:MIMEType=audio/mp4`. `OverrideFileType`
+  // additionally rewrites `FileTypeExtension` to `uc($fileTypeExt{M4A} //
+  // 'M4A') = 'M4A'` (PrintConv `lc` ⇒ `m4a`); the engine derives that from
+  // the new `file_type` via the shared `resolve_file_type`, so setting the
+  // type + MIME here is sufficient (verified vs bundled ExifTool 13.58).
+  if file_type == "MP4"
+    && qt
+      .major_brand()
+      .is_some_and(|b| b.starts_with("iso") || b.starts_with("dash") || b.starts_with("mp42"))
+    && qt.tracks().iter().any(|t| t.handler_code() == Some("soun"))
+    && !qt.tracks().iter().any(|t| t.handler_code() == Some("vide"))
+  {
+    file_type = "M4A";
+    mime = "audio/mp4";
   }
 
   Ok(Some(Meta {
@@ -2321,6 +2372,51 @@ mod tests {
     assert_eq!(meta.quicktime().minor_version(), Some("0.0.0"));
     // CompatibleBrands: "M4A " and "mp42" (no NULs ⇒ both kept).
     assert_eq!(meta.quicktime().compatible_brands(), &["M4A ", "mp42"]);
+  }
+
+  #[test]
+  fn mp4_override_to_m4a_predicate() {
+    // R10/F1: the post-walk MP4→M4A override (QuickTime.pm:10619-10624).
+    // Build `ftyp <major> <minor> mp42` + `moov{ <hdlr handlers> }` so the
+    // brands resolve to MP4 (a non-first `mp42` compat slot), then vary the
+    // handler set. The override fires iff major brand ∈ {iso*,dash,mp42},
+    // a `soun` handler exists, and NO `vide` handler exists.
+    let hdlr = |code: &[u8; 4]| atom(b"hdlr", &[&[0u8; 8], &code[..], &[0u8; 12]].concat());
+    let build = |major: &[u8; 4], handlers: &[&[u8; 4]]| {
+      // ftyp = major + minor + <first compat slot> + `mp42` (a NON-first compat
+      // slot ⇒ `file_type_from_ftyp` resolves MP4 for any non-`qt  ` major).
+      let ftyp = atom(
+        b"ftyp",
+        &[&major[..], &[0u8; 4], &major[..], b"mp42"].concat(),
+      );
+      let traks: Vec<u8> = handlers
+        .iter()
+        .flat_map(|h| atom(b"trak", &atom(b"mdia", &hdlr(h))))
+        .collect();
+      let moov = atom(b"moov", &traks);
+      [ftyp, moov].concat()
+    };
+    let ft = |major: &[u8; 4], handlers: &[&[u8; 4]]| {
+      let data = build(major, handlers);
+      let meta = parse_inner(&data).expect("ok").expect("accepted");
+      (meta.file_type(), meta.mime())
+    };
+
+    // soun only + `isom` major ⇒ override to M4A / audio/mp4.
+    assert_eq!(ft(b"isom", &[b"soun"]), ("M4A", "audio/mp4"));
+    // soun + vide ⇒ a `vide` handler present suppresses the override ⇒ MP4.
+    assert_eq!(ft(b"isom", &[b"soun", b"vide"]), ("MP4", "video/mp4"));
+    // vide only ⇒ no `soun` handler ⇒ MP4.
+    assert_eq!(ft(b"isom", &[b"vide"]), ("MP4", "video/mp4"));
+    // soun only but a `qt  ` major (resolves to MOV, not MP4) ⇒ no override.
+    assert_eq!(ft(b"qt  ", &[b"soun"]), ("MOV", "video/quicktime"));
+    // soun only with `dash` / `mp42` / `iso2` majors ⇒ all override to M4A.
+    assert_eq!(ft(b"dash", &[b"soun"]), ("M4A", "audio/mp4"));
+    assert_eq!(ft(b"mp42", &[b"soun"]), ("M4A", "audio/mp4"));
+    assert_eq!(ft(b"iso2", &[b"soun"]), ("M4A", "audio/mp4"));
+    // A non-matching major brand (`3gp4` ⇒ resolves to MP4 via the mp42 compat
+    // slot, but the brand does not start with iso/dash/mp42) ⇒ no override.
+    assert_eq!(ft(b"3gp4", &[b"soun"]), ("MP4", "video/mp4"));
   }
 
   #[test]
