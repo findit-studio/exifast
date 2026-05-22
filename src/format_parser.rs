@@ -1068,14 +1068,20 @@ impl AnyParser {
       }
       #[cfg(feature = "real")]
       AnyParser::Real(p) => {
-        // Leaf-style dispatch: Real has its own internal ID3v1 trailer
-        // scan (Real.pm:678-687) for the RM family. The typed parser
-        // handles that inline via `formats::id3::parse_id3v1_from_block`,
-        // so no `SharedFlags` threading is needed here — `done_id3` would
-        // not be set by the inline path since the engine never recurses
-        // into ID3 dispatch under the Real candidate.
-        let _ = (shared, ext);
-        p.parse(bytes)
+        // Real has its own internal ID3v1 trailer scan (Real.pm:678-687)
+        // for the RM family. The typed parser handles that inline via
+        // `formats::id3::parse_id3v1_from_block`, so no `SharedFlags`
+        // threading is needed here — `done_id3` would not be set by the
+        // inline path since the engine never recurses into ID3 dispatch
+        // under the Real candidate.
+        //
+        // `ext` IS threaded: `ProcessReal` reads `$$et{FILE_EXT}`
+        // (Real.pm:535) to distinguish a RAM Metafile (default) from an
+        // RPM Plug-in Metafile (`.rpm` extension). The leaf
+        // `FormatParser::parse` has no extension channel, so the dispatch
+        // uses the extension-aware `parse_with_ext` entry instead.
+        let _ = (p, shared);
+        crate::formats::real::parse_with_ext(bytes, ext)
           .map(|o| o.map(AnyMeta::Real))
           .map_err(Into::into)
       }

@@ -601,6 +601,75 @@ fn real_synth_id3v1_sparse_genre_conformance() {
 }
 
 #[test]
+fn real_synth_ram_pnm_conformance() {
+  // PR #33 Copilot finding — the RAM/RPM Metafile branch (Real.pm:533-555).
+  // `tests/fixtures/real_synth_ram_pnm.ram` is a synthetic RAM playlist:
+  // a `pnm://` URL line, an `rtsp://` URL line, and a plain text line.
+  // Exercises (1) the `RealKind::Ram` default when the extension is not
+  // `RPM` (Real.pm:535-536), (2) the `^[a-z]{3,4}://` URL-vs-text split
+  // (Real.pm:552 — `Real:URL` / `Real:Text`), and (3) the last-wins
+  // duplicate-tag semantics: TWO `url` lines ⇒ bundled JSON keeps the
+  // FINAL line (`rtsp://…/feature.rm`) as `Real:URL`. Goldens captured
+  // with bundled `perl exiftool 13.58 -j -G1 -struct` (`-n` variant
+  // identical — the `Real::Metafile` table has no PrintConv).
+  check(
+    "real_synth_ram_pnm.ram",
+    "real_synth_ram_pnm.ram.json",
+    true,
+  );
+  check(
+    "real_synth_ram_pnm.ram",
+    "real_synth_ram_pnm.ram.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_rpm_pnm_conformance() {
+  // PR #33 Copilot finding — RAM-vs-RPM is decided ONLY by the file
+  // extension (Real.pm:535-536 `$$et{FILE_EXT} eq 'RPM'`). Same kind of
+  // `pnm://`-headed metafile as `real_synth_ram_pnm.ram`, but the `.rpm`
+  // extension flips the typed `RealKind` to `Rpm` ⇒ `File:FileType=RPM`
+  // and the RPM MIME `audio/x-pn-realaudio-plugin`. Pins that the `ext`
+  // channel is threaded through `AnyParser::Real` → `parse_with_ext` →
+  // `parse_metafile` (the pre-fix stub discarded `ext` and always
+  // returned `RealKind::Ram`).
+  check(
+    "real_synth_rpm_pnm.rpm",
+    "real_synth_rpm_pnm.rpm.json",
+    true,
+  );
+  check(
+    "real_synth_rpm_pnm.rpm",
+    "real_synth_rpm_pnm.rpm.n.json",
+    false,
+  );
+}
+
+#[test]
+fn real_synth_metafile_http_accept_conformance() {
+  // PR #33 Copilot finding — the `http`-line acceptance gate (Real.pm:546:
+  // `return 0 if $buff =~ /^http/ and $buff !~ /\.(ra|rm|rv|rmvb|smil)$/i`).
+  // `real_synth_metafile_http_accept.ram`'s first non-empty line is
+  // `http://…/promo.ra` — the `.ra` suffix SATISFIES the gate, so bundled
+  // ACCEPTS the file as RAM. (The rejection half of the gate — an
+  // `http://` line WITHOUT a Real media suffix ⇒ `return 0` ⇒ the file
+  // falls through to `TXT` — is pinned by the `parse_metafile_http_*`
+  // unit tests in `src/formats/real.rs`: exifast has no `Text`-module
+  // parser, so a rejected metafile cannot be a conformance fixture.)
+  check(
+    "real_synth_metafile_http_accept.ram",
+    "real_synth_metafile_http_accept.ram.json",
+    true,
+  );
+  check(
+    "real_synth_metafile_http_accept.ram",
+    "real_synth_metafile_http_accept.ram.n.json",
+    false,
+  );
+}
+
+#[test]
 fn dv_unknown_profile_conformance() {
   // Adversarial: 480-byte synthetic with the primary `\x1f\x07\0\x3f`
   // magic and `stype=0x1f` at offset 451 — never present in

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "real_synth_rpm_pnm.rpm",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "RPM",
+  "File:FileTypeExtension": "RPM",
+  "File:MIMEType": "audio/x-pn-realaudio-plugin",
+  "Real:URL": "pnm://media.example.com/plugin-clip.rm",
+  "Real:Text": "Loaded via the RealMedia browser plug-in"
+}]

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "real_synth_ram_pnm.ram",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "RAM",
+  "File:FileTypeExtension": "ram",
+  "File:MIMEType": "audio/x-pn-realaudio",
+  "Real:URL": "rtsp://media.example.com/feature.rm",
+  "Real:Text": "Playlist generated for the conformance corpus"
+}]

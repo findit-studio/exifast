@@ -297,6 +297,22 @@ struct RaCodecField {
   emit_as_int: bool,
 }
 
+/// One line extracted from a RAM/RPM Metafile (Real.pm:551-553). Each
+/// non-empty line of the metafile is tagged `url` when it begins with a
+/// `[a-z]{3,4}://` URI scheme, else `txt`. Stored in file order; the
+/// `serialize_tags` Metafile path replays them through last-wins `insert`,
+/// so a metafile with several `url` lines surfaces the LAST as `Real:URL`
+/// (verified against bundled `perl exiftool` 13.58: `-G4` shows the final
+/// line as the primary instance, earlier lines as `Copy{N}`).
+#[derive(Debug, Clone)]
+struct MetafileLine {
+  /// `true` when the line matched `^[a-z]{3,4}://` (Real.pm:552) ⇒ emitted
+  /// as `Real:URL`; `false` ⇒ emitted as `Real:Text`.
+  is_url: bool,
+  /// The chomped line text (Real.pm:543 `chomp $buff`).
+  text: String,
+}
+
 /// Typed Real metadata — the lib-first output of [`ProcessReal`].
 ///
 /// Holds:
@@ -311,6 +327,7 @@ struct RaCodecField {
 /// - [`ra_version`](Self::ra_version) + [`ra_fields`](Self::ra_fields): the
 ///   RA codec-table fields (RA only).
 /// - [`id3v1`](Self::id3v1): the optional 128-byte ID3v1 trailer (RM only).
+/// - `metafile_lines`: the RAM/RPM Metafile `url`/`txt` lines (RAM/RPM only).
 ///
 /// **D8 — no public fields, accessors only.**
 #[derive(Debug, Clone)]
@@ -323,6 +340,9 @@ pub struct RealMeta<'a> {
   ra_version: Option<RealAudioVersion>,
   ra_fields: Vec<RaCodecField>,
   id3v1: Option<crate::formats::id3::Id3v1Meta<'a>>,
+  /// RAM/RPM Metafile `url`/`txt` lines in file order (Real.pm:551-553).
+  /// Empty for RM/RA.
+  metafile_lines: Vec<MetafileLine>,
   _phantom: core::marker::PhantomData<&'a ()>,
 }
 
@@ -485,22 +505,51 @@ impl FormatParser for ProcessReal {
 
   /// Parse a Real file's bytes into a typed [`RealMeta`], or `None` if the
   /// buffer is not a Real file (no magic match — Real.pm:523).
+  ///
+  /// The leaf-style [`FormatParser::parse`] has no extension channel, so
+  /// the Metafile branch sees `ext = None` ⇒ it defaults to `RAM`
+  /// (Real.pm:536 `($ext and $ext eq 'RPM')` is false). Callers that
+  /// need the RAM-vs-RPM distinction use [`parse_with_ext`] (the engine
+  /// dispatch in `AnyParser::parse_any` does).
   fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, RealError> {
-    parse_inner(data)
+    parse_inner(data, None)
   }
 }
 
 /// Lib-first direct entry — alias for [`FormatParser::parse`].
+///
+/// The Metafile branch defaults to `RAM` (no extension channel — see
+/// [`parse_with_ext`] for the RAM-vs-RPM-aware entry).
 ///
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (currently none — every bad
 /// input is `Ok(None)` per Perl `return 0`).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
-  parse_inner(data)
+  parse_inner(data, None)
 }
 
-fn parse_inner(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
+/// Extension-aware Real entry — faithful to `ProcessReal` reading
+/// `$$et{FILE_EXT}` (Real.pm:535) to distinguish RAM (default) from RPM.
+///
+/// `ext` is the uppercased, dotless file extension (`$$self{FILE_EXT}`,
+/// ExifTool.pm:2966) — e.g. `Some("RPM")`, `Some("RAM")`, or `None` when
+/// the source has no extension. It is consumed only during this call; the
+/// returned [`RealMeta`] borrows solely from `data`, so a transient `ext`
+/// string may be dropped while the meta lives on.
+///
+/// # Errors
+///
+/// Returns `Err` for Rust-level fatal modes (currently none — every bad
+/// input is `Ok(None)` per Perl `return 0`).
+pub fn parse_with_ext<'a>(
+  data: &'a [u8],
+  ext: Option<&str>,
+) -> Result<Option<RealMeta<'a>>, RealError> {
+  parse_inner(data, ext)
+}
+
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<RealMeta<'a>>, RealError> {
   // Real.pm:522 — `$raf->Read($buff,8) == 8`.
   if data.len() < 8 {
     return Ok(None);
@@ -513,7 +562,10 @@ fn parse_inner(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
     return Ok(Some(parse_ra(data)));
   }
   if data.starts_with(b"pnm://") || data.starts_with(b"rtsp://") || data.starts_with(b"http://") {
-    return Ok(Some(parse_metafile(data)));
+    // Real.pm:533-555 — Metafile branch. `parse_metafile` itself decides
+    // acceptance (Real.pm:546 http-URL gate); a rejected buffer returns
+    // `Ok(None)` ⇒ `return 0` ⇒ the engine candidate loop continues.
+    return Ok(parse_metafile(data, ext));
   }
   Ok(None)
 }
@@ -1380,6 +1432,7 @@ fn parse_rm(data: &[u8]) -> RealMeta<'_> {
     ra_version: None,
     ra_fields: Vec::new(),
     id3v1: None,
+    metafile_lines: Vec::new(),
     _phantom: core::marker::PhantomData,
   };
   // Real.pm:595 — skip rest of RM header: `$size = unpack('x4N', $buff); seek($size-8, 1)`.
@@ -1512,6 +1565,7 @@ fn parse_ra(data: &[u8]) -> RealMeta<'_> {
     ra_version: None,
     ra_fields: Vec::new(),
     id3v1: None,
+    metafile_lines: Vec::new(),
     _phantom: core::marker::PhantomData,
   };
   // Real.pm:566 — `($vers, $extra) = unpack('x4nn', $buff)`. Vers at
@@ -1873,21 +1927,110 @@ fn ra_text_field(header: &[u8], cursor: usize, name: &str, meta: &mut RealMeta<'
 // RAM/RPM driver (Real.pm:533-555) — text-line scan
 // ===========================================================================
 
-/// Parse RAM/RPM Metafile (Real.pm:533-555). Bundled walks lines of ≤256
-/// chars (longer lines abort); each line that begins with a URI scheme
-/// `[a-z]{3,4}://` is emitted as `Real-RAM:url`, everything else as
-/// `Real-RAM:txt`. The first non-empty line — when its URI scheme is
-/// `http://` — also gates file-type acceptance: a `http://` line without
-/// a `.ra/.rm/.rv/.rmvb/.smil` extension causes `return 0` (Real.pm:546).
-fn parse_metafile(data: &[u8]) -> RealMeta<'_> {
-  // RAM/RPM Metafile decoding has no committed fixture; we record the
-  // file kind and (for future fixtures) leave the URL/txt list empty.
-  // The Metafile codepath is faithfully implementable but currently
-  // exercises only the kind detection. Fixtures: bundled
-  // `t/images/Real.ram` is not in the test corpus.
-  let _ = data;
-  RealMeta {
-    kind: RealKind::Ram,
+/// Detect the input record separator the way bundled
+/// `Image::ExifTool::PostScript::GetInputRecordSeparator` does
+/// (PostScript.pm:192-213): scan the first 256 bytes, locate the first
+/// `\x0a` (LF) and first `\x0d` (CR); a CR immediately followed by LF ⇒
+/// `"\r\n"`, CR alone ⇒ `"\r"`, LF alone ⇒ `"\n"`. When neither byte
+/// appears the Perl returns `undef` and Real.pm:538's `|| "\n"` falls
+/// back to LF — we return `b"\n"` directly for the same net result.
+fn input_record_separator(data: &[u8]) -> &'static [u8] {
+  let window = &data[..data.len().min(256)];
+  // Perl `pos()` after a `/g` match is the offset of the byte AFTER the
+  // match; we mirror that with `position(..) + 1`.
+  let lf = window.iter().position(|&b| b == 0x0a).map(|i| i + 1);
+  let cr = window.iter().position(|&b| b == 0x0d).map(|i| i + 1);
+  match (lf, cr) {
+    // `$diff = $a - $d` with 999 sentinels for "not found".
+    (Some(a), Some(d)) if a == d + 1 => b"\r\n",
+    (Some(a), Some(d)) if a + 1 == d => b"\n\r",
+    (Some(a), Some(d)) if a > d => b"\r",
+    (Some(a), Some(d)) if a < d => b"\n",
+    (Some(_), None) => b"\n", // LF found, CR absent ⇒ `$diff = a - 999 < 0`.
+    (None, Some(_)) => b"\r", // CR found, LF absent ⇒ `$diff = 999 - d > 0`.
+    // Neither byte: Perl `$sep = undef` ⇒ Real.pm:538 `|| "\n"`.
+    _ => b"\n",
+  }
+}
+
+/// Parse RAM/RPM Metafile (Real.pm:533-555). Bundled `ProcessReal` seeks
+/// to byte 0 and `ReadLine`-walks the file using the record separator from
+/// `GetInputRecordSeparator` (Real.pm:538). For each line: a line longer
+/// than 256 bytes aborts the loop (`last`, Real.pm:541 — already-accepted
+/// file stays accepted), an empty/falsy line is skipped (`next unless
+/// $buff`, Real.pm:542), and the rest is `chomp`-ed (Real.pm:543).
+///
+/// The FIRST non-empty line gates file-type acceptance (`if ($type)`,
+/// Real.pm:544-549): when that line begins with `http` it must ALSO end
+/// in `.ra`/`.rm`/`.rv`/`.rmvb`/`.smil` (case-insensitive) or bundled
+/// `return 0` (Real.pm:546) — the file is NOT a Real metafile. Once the
+/// gate passes, `$type` is `undef`'d so it fires exactly once. Every
+/// non-empty line is then tagged `url` when it matches `^[a-z]{3,4}://`
+/// (case-sensitive, Real.pm:552) else `txt`, and emitted via `HandleTag`.
+///
+/// RAM vs RPM: Real.pm:535-536 reads `$$et{FILE_EXT}` — `RPM` iff the
+/// uppercased extension is exactly `"RPM"`, else `RAM`.
+///
+/// Returns `None` when the gate rejects the buffer (faithful `return 0`),
+/// so the engine's candidate loop falls through (typically to `TXT`).
+fn parse_metafile<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
+  // Real.pm:535-536 — `$type = ($ext and $ext eq 'RPM') ? 'RPM' : 'RAM'`.
+  // `$$et{FILE_EXT}` is already uppercased (ExifTool.pm:2966 → exifast
+  // `file_ext_for_name`), so the comparison is a plain `== "RPM"`.
+  let kind = if ext == Some("RPM") {
+    RealKind::Rpm
+  } else {
+    RealKind::Ram
+  };
+
+  let sep = input_record_separator(data);
+  // `if ($type) { ... }` — the first-non-empty-line acceptance gate; once
+  // it fires we set `gated = true` so it never re-runs (Perl `undef $type`).
+  let mut gated = false;
+  let mut lines: Vec<MetafileLine> = Vec::new();
+
+  // Real.pm:539-540 — `$raf->Seek(0,0); while ($raf->ReadLine($buff))`.
+  // `ReadLine` keeps the separator on each chunk; the final chunk may have
+  // no trailing separator. We replicate that by splitting INCLUSIVELY.
+  let mut rest = data;
+  while !rest.is_empty() {
+    let (raw_line, tail) = match find_subslice(rest, sep) {
+      Some(idx) => (&rest[..idx + sep.len()], &rest[idx + sep.len()..]),
+      None => (rest, &rest[rest.len()..]),
+    };
+    rest = tail;
+    // Real.pm:541 — `last if length $buff > 256` (length is of the
+    // UN-chomped line, separator included; aborts the whole loop).
+    if raw_line.len() > 256 {
+      break;
+    }
+    // Real.pm:543 — `chomp $buff` strips ONE trailing record separator.
+    let line = chomp(raw_line, sep);
+    // Real.pm:542 — `next unless $buff` (Perl-falsy: empty string skipped).
+    if line.is_empty() {
+      continue;
+    }
+    if !gated {
+      // Real.pm:546 — `return 0 if $buff =~ /^http/ and
+      //                 $buff !~ /\.(ra|rm|rv|rmvb|smil)$/i`.
+      if line.starts_with(b"http") && !has_real_metafile_extension(line) {
+        return None;
+      }
+      // `SetFileType($type)` happens here (Real.pm:547); `undef $type`
+      // ⇒ the gate is one-shot.
+      gated = true;
+    }
+    // Real.pm:552 — `$buff =~ m{^[a-z]{3,4}://} ? 'url' : 'txt'`. The
+    // scheme class is lowercase-only and case-SENSITIVE.
+    let is_url = uri_scheme_prefix(line);
+    lines.push(MetafileLine {
+      is_url,
+      text: raw_bytes_to_json_string(line),
+    });
+  }
+
+  Some(RealMeta {
+    kind,
     prop: PropTags::default(),
     mdpr_streams: Vec::new(),
     cont: ContTags::default(),
@@ -1895,8 +2038,49 @@ fn parse_metafile(data: &[u8]) -> RealMeta<'_> {
     ra_version: None,
     ra_fields: Vec::new(),
     id3v1: None,
+    metafile_lines: lines,
     _phantom: core::marker::PhantomData,
+  })
+}
+
+/// `index($haystack, $needle)` — first byte offset of `needle` in
+/// `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+  if needle.is_empty() || needle.len() > haystack.len() {
+    return None;
   }
+  haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Perl `chomp $buff` against the active `$/` record separator: strip ONE
+/// trailing `sep` occurrence if present (Real.pm:543). `chomp` removes at
+/// most one separator and only when the string actually ends with it.
+fn chomp<'a>(line: &'a [u8], sep: &[u8]) -> &'a [u8] {
+  if line.ends_with(sep) {
+    &line[..line.len() - sep.len()]
+  } else {
+    line
+  }
+}
+
+/// `$buff =~ /^[a-z]{3,4}://` — line begins with a 3-or-4-char lowercase
+/// URI scheme followed by `://` (Real.pm:552, case-sensitive).
+fn uri_scheme_prefix(line: &[u8]) -> bool {
+  let scheme_len = line.iter().take_while(|&&b| b.is_ascii_lowercase()).count();
+  (3..=4).contains(&scheme_len) && line.get(scheme_len..scheme_len + 3) == Some(b"://")
+}
+
+/// `$buff =~ /\.(ra|rm|rv|rmvb|smil)$/i` — line ends in one of the Real
+/// media extensions (case-insensitive, Real.pm:546). Used by the
+/// `http`-line acceptance gate.
+fn has_real_metafile_extension(line: &[u8]) -> bool {
+  const EXTS: [&[u8]; 5] = [b".ra", b".rm", b".rv", b".rmvb", b".smil"];
+  EXTS.iter().any(|ext| {
+    line.len() >= ext.len() && {
+      let tail = &line[line.len() - ext.len()..];
+      tail.eq_ignore_ascii_case(ext)
+    }
+  })
 }
 
 // ===========================================================================
@@ -1917,9 +2101,30 @@ impl RealMeta<'_> {
     match self.kind {
       RealKind::Rm => self.serialize_rm(print_conv, out)?,
       RealKind::Ra => self.serialize_ra(print_conv, out)?,
-      RealKind::Ram | RealKind::Rpm => {
-        // No fixtures committed for the Metafile path; nothing to emit.
-      }
+      RealKind::Ram | RealKind::Rpm => self.serialize_metafile(out)?,
+    }
+    Ok(())
+  }
+
+  /// Emit the RAM/RPM Metafile `url`/`txt` lines (Real.pm:551-553). The
+  /// `Real::Metafile` table maps `url => 'URL'` / `txt => 'Text'` with NO
+  /// PrintConv, so `-j` and `-n` agree — `print_conv` is irrelevant here.
+  /// The table has `GROUPS => { 2 => 'Video' }` and no family-1 override,
+  /// so family-1 falls back to the module name `Real` (verified against
+  /// bundled `perl exiftool` 13.58: `Real:URL` / `Real:Text`).
+  ///
+  /// Each line is `insert`-ed in file order; `TagMap::insert` is last-wins
+  /// in place, which is exactly the bundled JSON-writer behavior for the
+  /// repeated `URL`/`Text` tag names (without `-a`, the LAST instance of a
+  /// duplicate tag is the displayed value — `-G4` confirms the final line
+  /// as the primary, earlier lines as `Copy{N}`).
+  fn serialize_metafile(
+    &self,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    for line in &self.metafile_lines {
+      let name = if line.is_url { "URL" } else { "Text" };
+      out.write_str("Real", name, &line.text)?;
     }
     Ok(())
   }
@@ -2317,20 +2522,20 @@ mod tests {
 
   #[test]
   fn parse_inner_rejects_short_buffer() {
-    assert!(parse_inner(&[]).unwrap().is_none());
-    assert!(parse_inner(&[0u8; 4]).unwrap().is_none());
+    assert!(parse_inner(&[], None).unwrap().is_none());
+    assert!(parse_inner(&[0u8; 4], None).unwrap().is_none());
   }
 
   #[test]
   fn parse_inner_rejects_bad_magic() {
-    assert!(parse_inner(b"NOMAGIC1").unwrap().is_none());
+    assert!(parse_inner(b"NOMAGIC1", None).unwrap().is_none());
   }
 
   #[test]
   fn parse_inner_accepts_rm_magic() {
     let mut buf = b".RMF\x00\x00\x00\x12".to_vec();
     buf.resize(64, 0);
-    let m = parse_inner(&buf).unwrap().expect("RM accepted");
+    let m = parse_inner(&buf, None).unwrap().expect("RM accepted");
     assert_eq!(m.kind(), RealKind::Rm);
   }
 
@@ -2338,7 +2543,7 @@ mod tests {
   fn parse_inner_accepts_ra_magic() {
     let mut buf = b".ra\xfd\x00\x04\x00\x00".to_vec();
     buf.resize(520, 0);
-    let m = parse_inner(&buf).unwrap().expect("RA accepted");
+    let m = parse_inner(&buf, None).unwrap().expect("RA accepted");
     assert_eq!(m.kind(), RealKind::Ra);
     assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
   }
@@ -2346,10 +2551,181 @@ mod tests {
   #[test]
   fn parse_inner_accepts_pnm_uri_metafile() {
     // RAM URL line.
-    let m = parse_inner(b"pnm://host/file.ra\n")
+    let m = parse_inner(b"pnm://host/file.ra\n", None)
       .unwrap()
       .expect("metafile accepted");
     assert_eq!(m.kind(), RealKind::Ram);
+  }
+
+  // ----------------------------------------------------------------------
+  // PR #33 Copilot finding — RAM/RPM Metafile branch (Real.pm:533-555)
+  // ----------------------------------------------------------------------
+
+  /// Collect the `(is_url, text)` lines from a parsed Metafile meta.
+  fn metafile_lines_of(m: &RealMeta<'_>) -> Vec<(bool, String)> {
+    m.metafile_lines
+      .iter()
+      .map(|l| (l.is_url, l.text.clone()))
+      .collect()
+  }
+
+  #[test]
+  fn parse_metafile_defaults_to_ram_without_rpm_ext() {
+    // Real.pm:535-536 — `($ext and $ext eq 'RPM') ? 'RPM' : 'RAM'`. No
+    // extension, or any extension other than the exact `"RPM"`, ⇒ RAM.
+    for ext in [None, Some("RAM"), Some("SMIL"), Some("rpm")] {
+      let m = parse_metafile(b"pnm://host/clip.rm\n", ext)
+        .unwrap_or_else(|| panic!("metafile accepted for ext={ext:?}"));
+      assert_eq!(m.kind(), RealKind::Ram, "ext={ext:?}");
+    }
+  }
+
+  #[test]
+  fn parse_metafile_rpm_only_for_uppercase_rpm_ext() {
+    // `$$et{FILE_EXT}` is pre-uppercased — the comparison is `eq 'RPM'`.
+    let m = parse_metafile(b"pnm://host/clip.rm\n", Some("RPM")).expect("accepted");
+    assert_eq!(m.kind(), RealKind::Rpm);
+  }
+
+  #[test]
+  fn parse_metafile_http_gate_rejects_non_real_extension() {
+    // Real.pm:546 — first non-empty line starts with `http` but does NOT
+    // end in `.ra/.rm/.rv/.rmvb/.smil` ⇒ `return 0` ⇒ `parse_metafile`
+    // yields `None` so the engine candidate loop falls through (to TXT).
+    assert!(parse_metafile(b"http://host/page.html\n", None).is_none());
+    assert!(parse_metafile(b"http://host/index\n", Some("RAM")).is_none());
+    // The reject decision is taken on the FIRST non-empty line only — a
+    // bad http first line rejects the whole file even if a later line
+    // would have qualified.
+    assert!(parse_metafile(b"http://host/page.html\nhttp://host/ok.rm\n", None).is_none());
+    // `parse_inner` propagates the `None` (the magic prefix matched, but
+    // the Metafile branch declined).
+    assert!(
+      parse_inner(b"http://host/page.html\n", None)
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn parse_metafile_http_gate_accepts_real_extension() {
+    // Real.pm:546 — a `http` first line ENDING in a Real media extension
+    // passes the gate (case-insensitive). Each accepted suffix variant.
+    for line in [
+      &b"http://host/a.ra\n"[..],
+      &b"http://host/a.RM\n"[..],
+      &b"http://host/a.rv\n"[..],
+      &b"http://host/a.rmvb\n"[..],
+      &b"http://host/a.SMIL\n"[..],
+    ] {
+      let m = parse_metafile(line, None)
+        .unwrap_or_else(|| panic!("expected accept for {:?}", core::str::from_utf8(line)));
+      assert_eq!(m.kind(), RealKind::Ram);
+    }
+  }
+
+  #[test]
+  fn parse_metafile_url_vs_text_classification() {
+    // Real.pm:552 — `^[a-z]{3,4}://` ⇒ url, else txt. The `pnm`/`rtsp`
+    // lines are urls; the plain line is text.
+    let m = parse_metafile(
+      b"pnm://host/a.rm\nrtsp://host/b.rm\nplain playlist note\n",
+      None,
+    )
+    .expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![
+        (true, "pnm://host/a.rm".to_string()),
+        (true, "rtsp://host/b.rm".to_string()),
+        (false, "plain playlist note".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn parse_metafile_uri_scheme_class_is_3_or_4_lowercase() {
+    // `[a-z]{3,4}` — a 5-char scheme (`https`) or an uppercase scheme is
+    // NOT a url under Real.pm:552; it falls to `txt`.
+    let m = parse_metafile(b"pnm://host/seed.rm\nhttps://host/x\nHTTP://host/y\n", None)
+      .expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![
+        (true, "pnm://host/seed.rm".to_string()),
+        (false, "https://host/x".to_string()),
+        (false, "HTTP://host/y".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn parse_metafile_skips_empty_lines() {
+    // Real.pm:542 — `next unless $buff` drops empty lines; they produce
+    // no `url`/`txt` tag and do NOT consume the one-shot acceptance gate.
+    let m = parse_metafile(b"pnm://host/a.rm\n\n\nplain\n", None).expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![
+        (true, "pnm://host/a.rm".to_string()),
+        (false, "plain".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn parse_metafile_aborts_loop_on_overlong_line() {
+    // Real.pm:541 — `last if length $buff > 256` aborts the WHOLE loop.
+    // An accepted file stays accepted, but lines AT or AFTER the overlong
+    // line are not emitted. Line 1 (short url) is kept; line 2 is 300
+    // bytes (> 256) ⇒ loop stops; line 3 never reached.
+    let mut data = b"pnm://host/a.rm\n".to_vec();
+    data.extend(core::iter::repeat_n(b'x', 300));
+    data.push(b'\n');
+    data.extend_from_slice(b"pnm://host/never.rm\n");
+    let m = parse_metafile(&data, None).expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![(true, "pnm://host/a.rm".to_string())]
+    );
+  }
+
+  #[test]
+  fn parse_metafile_final_line_without_separator() {
+    // `ReadLine` yields a final chunk with no trailing separator; it is
+    // still scanned (Real.pm walks until EOF).
+    let m = parse_metafile(b"pnm://host/a.rm\nlast line no newline", None).expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![
+        (true, "pnm://host/a.rm".to_string()),
+        (false, "last line no newline".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn parse_metafile_crlf_separator() {
+    // `GetInputRecordSeparator` (PostScript.pm:192-213): a `\r\n`-delimited
+    // metafile uses `"\r\n"` as `$/`; `chomp` then strips the full CRLF.
+    let m = parse_metafile(b"pnm://host/a.rm\r\nplain text\r\n", None).expect("accepted");
+    assert_eq!(
+      metafile_lines_of(&m),
+      vec![
+        (true, "pnm://host/a.rm".to_string()),
+        (false, "plain text".to_string()),
+      ]
+    );
+  }
+
+  #[test]
+  fn input_record_separator_detection() {
+    // LF-only ⇒ "\n"; CR before LF ⇒ "\r\n"; CR-only ⇒ "\r"; neither ⇒
+    // "\n" (Perl `undef` → Real.pm:538 `|| "\n"`).
+    assert_eq!(input_record_separator(b"abc\ndef"), b"\n");
+    assert_eq!(input_record_separator(b"abc\r\ndef"), b"\r\n");
+    assert_eq!(input_record_separator(b"abc\rdef"), b"\r");
+    assert_eq!(input_record_separator(b"no terminators here"), b"\n");
   }
 
   #[test]
@@ -2416,6 +2792,7 @@ mod tests {
       ra_version: None,
       ra_fields: Vec::new(),
       id3v1: None,
+      metafile_lines: Vec::new(),
       _phantom: core::marker::PhantomData,
     }
   }

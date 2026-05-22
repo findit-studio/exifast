@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_146() {
+fn typed_serde_path_equals_writer_path_and_golden_all_149() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -231,12 +231,17 @@ fn typed_serde_path_equals_writer_path_and_golden_all_146() {
   // `Format => 'string[$val{10}]'` StreamMimeType. Without the fix,
   // an embedded NUL leaks through both `Real-MDPR:StreamMimeType` AND
   // the single-stream `File:MIMEType` override.
+  // 146 → 149 after the PR #33 Copilot RAM/RPM fix: added 3 Metafile
+  // fixtures (`real_synth_ram_pnm.ram`, `real_synth_rpm_pnm.rpm`,
+  // `real_synth_metafile_http_accept.ram`) pinning the Real.pm:533-555
+  // Metafile branch — the RAM-vs-RPM extension discrimination, the
+  // `^[a-z]{3,4}://` URL/text split, and the `http`-line acceptance gate.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    146,
-    "expected exactly the 146 active conformance fixtures, found {}: {:?}",
+    149,
+    "expected exactly the 149 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
