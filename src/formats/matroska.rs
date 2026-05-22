@@ -99,16 +99,10 @@ impl VInt {
 /// Read one VINT from `buf` at `pos`. Returns `None` on insufficient bytes
 /// (matches Perl `return undef` — Matroska.pm:958/962/974).
 ///
-/// `keep_marker` controls whether the length-marker bit is retained in the
-/// decoded value (`true` for element IDs per EBML spec; `false` for sizes,
-/// which strip it — Matroska.pm:967-972 masks it off in both cases, but
-/// element IDs are decoded with the marker BIT preserved because they're
-/// looked up against tables that include the marker. The bundled Perl uses
-/// `GetVInt` for BOTH IDs and sizes and the IDs in `%Image::ExifTool::
-/// Matroska::Main` are stored WITHOUT the length marker — Matroska.pm:39-40
-/// "The tag ID's in the Matroska documentation include the length
-/// designation (the upper bits), which is not included in the tag ID's
-/// below."). So `keep_marker = false` in both cases for faithfulness.
+/// The decoded value always has the EBML length-marker bit stripped. This
+/// matches the bundled Perl `GetVInt` behavior used by this port for both
+/// element IDs and sizes; Matroska tag IDs in the bundled tables are stored
+/// without the length designation bits (Matroska.pm:39-40).
 #[must_use]
 pub fn get_vint(buf: &[u8], pos: usize) -> Option<VInt> {
   if pos >= buf.len() {
