@@ -252,12 +252,18 @@ fn typed_serde_path_equals_writer_path_and_golden_all_153() {
   // preserved) — pinning `Charset.pm:203-206` BOM handling in the UTF-16
   // decoder: a BE BOM is stripped (not preserved as U+FEFF) and a LE BOM is
   // stripped AND the remainder decoded little-endian (not garbled).
+  // 153 → 154 after Codex R3/F1: added `MXF_DupDurationFF.mxf` (synthetic, two
+  // same-InstanceUID `TimecodeComponent` sets — earlier valid `Duration`,
+  // later all-`0xff`) — pinning that MXF.pm:98's `%duration` RawConv-`undef`
+  // drop is a NON-entry (ExifTool.pm:9493 + MXF.pm:2666 `next unless $key`),
+  // so the dropped value never participates in the reverse-order duplicate
+  // pass and the earlier valid `Duration` survives.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    153,
-    "expected exactly the 153 active conformance fixtures, found {}: {:?}",
+    154,
+    "expected exactly the 154 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

@@ -119,6 +119,29 @@ fn mxf_utf16_bom_conformance() {
 }
 
 #[test]
+fn mxf_dup_duration_all_ff_conformance() {
+  // Codex R3/F1 regression: two same-InstanceUID `TimecodeComponent` sets, the
+  // EARLIER carrying a VALID `Duration` (100) and the LATER (footer-style)
+  // carrying an all-`0xff` `Duration`. MXF.pm:98's `%duration` RawConv
+  // (`$val > 1e18 ? undef : $val`) returns `undef` for the all-`0xff` value, so
+  // `FoundTag` stores NO key (ExifTool.pm:9493) and MXF.pm:2666's
+  // `next unless $key` skips its `push @groups`. The dropped value is therefore
+  // ABSENT from the reverse-file-order duplicate pass (MXF.pm:2946-2962): it
+  // never claims the `"Duration <UID>"` key, so the earlier VALID `Duration`
+  // is the one kept. Before the fix the port queued a `Duration(i64::MIN)`
+  // sentinel `WalkEntry` for the drop; being LATER in file order it won the
+  // dedup and DELETED the valid earlier `Duration`, then emitted nothing —
+  // erasing `MXF:Duration` entirely. The oracle keeps the valid `0:01:40`
+  // (`-n`: `100`). Goldens are the bundled oracle (`tools/gen_golden.sh`).
+  check("MXF_DupDurationFF.mxf", "MXF_DupDurationFF.mxf.json", true);
+  check(
+    "MXF_DupDurationFF.mxf",
+    "MXF_DupDurationFF.mxf.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_conformance() {
   // FORMATS.md row 23. `tests/fixtures/Matroska.mkv` is the bundled
   // `lib/Image/ExifTool/t/images/Matroska.mkv` (507 bytes, video+audio

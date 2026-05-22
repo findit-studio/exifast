@@ -1737,8 +1737,10 @@ pub enum MxfValue {
   Bytes(Vec<u8>),
   /// A `%duration`-flagged raw value (Length/Origin/StartTimecode/…),
   /// carrying the pre-`ConvertDuration` integer. `RawConv` already dropped
-  /// all-`0xff` values before this variant is constructed (a dropped value
-  /// is carried as `Duration(i64::MIN)` — the emitter skips it).
+  /// all-`0xff` (`> 1e18`) values before this variant is constructed — a
+  /// dropped value yields `None` from `decode_tag_value` and is never queued
+  /// as a `WalkEntry` (MXF.pm:98, ExifTool.pm:9493), so this variant only
+  /// ever carries a value that ExifTool actually stored.
   Duration(i64),
   /// A `%duration` value AFTER division by the owning track's `EditRate`
   /// (MXF.pm:2798) — a possibly-fractional `f64`.
@@ -2297,8 +2299,19 @@ fn process_local_set(w: &mut Walker, dir_name: &'static str, buf: &[u8]) {
       continue;
     };
 
-    // Decode the value (MXF.pm:2634-2648).
-    let decoded = decode_tag_value(def, value_bytes);
+    // Decode the value (MXF.pm:2634-2648). `None` ⇒ the row's `RawConv`
+    // returned `undef` (the `%duration` `> 1e18` all-`0xff` drop, MXF.pm:98):
+    // `HandleTag`/`FoundTag` stores no key (ExifTool.pm:9493), so `next unless
+    // $key` (MXF.pm:2666) skips the `push @groups`. We model that by skipping
+    // this tag entirely — no `WalkEntry` is queued, so the dropped value is
+    // absent from `entry_indices`, the duplicate-removal pass, the
+    // `FixDuration` set, and the best-`Duration` synthesis. (The only modeled
+    // `RawConv => undef` row is `%duration`, which is a `Format` row with no
+    // `Type`, so MXF.pm:2636's `ReadMXFValue`/InstanceUID/strong-ref/EditRate
+    // book-keeping never runs for it either — `continue` is faithful.)
+    let Some(decoded) = decode_tag_value(def, value_bytes) else {
+      continue;
+    };
 
     // Per-object book-keeping (MXF.pm:2640-2685).
     match def.name {
@@ -2407,26 +2420,29 @@ fn emit_tag_default(def: &TagDef) -> bool {
 
 /// Decode one local-set tag's value bytes per its [`Kind`] (MXF.pm:2634-2648
 /// for `Type` rows + ExifTool's generic `ReadValue` for `Format` rows).
-fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> MxfValue {
-  // `%duration` rows: the RawConv `$val > 1e18 ? undef : $val` drops the
-  // all-`0xff` sentinel BEFORE the value is stored (MXF.pm:98). A dropped
-  // value still needs *a* MxfValue — we use a sentinel the emitter skips.
-  match def.kind {
+///
+/// Returns `None` when the row's `RawConv` would yield `undef` — for the
+/// `%duration` family that is `$val > 1e18` (the all-`0xff` sentinel,
+/// MXF.pm:98). A `None` decode mirrors `FoundTag` returning no key
+/// (ExifTool.pm:9493 `return undef unless defined $value`): the caller then
+/// runs `next unless $key` (MXF.pm:2666) so the value is NEVER pushed onto
+/// `@groups` — i.e. it does not participate in the duplicate-removal pass,
+/// the `FixDuration` set, or the best-`Duration` synthesis.
+fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> Option<MxfValue> {
+  let value = match def.kind {
     Kind::Int8u | Kind::Int16u | Kind::Int32u => {
       let n = decode_uint(bytes);
       if def.is_duration {
-        duration_or_drop(n as i64)
-      } else {
-        MxfValue::U64(n)
+        return duration_or_drop(n as i64);
       }
+      MxfValue::U64(n)
     }
     Kind::Int64s => {
       let n = decode_int(bytes);
       if def.is_duration {
-        duration_or_drop(n)
-      } else {
-        MxfValue::I64(n)
+        return duration_or_drop(n);
       }
+      MxfValue::I64(n)
     }
     Kind::Length => {
       // MXF.pm:2506-2507 — `Position`/`Length` decode as `Get64u`. The
@@ -2434,12 +2450,12 @@ fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> MxfValue {
       let n = decode_uint(bytes);
       if def.is_duration {
         // The raw u64 may exceed i64::MAX (the `0xff…` sentinel) — compare
-        // as u64 against the 1e18 threshold before the i64 cast.
+        // as u64 against the 1e18 threshold before the i64 cast. RawConv
+        // `undef` ⇒ no tag (MXF.pm:98).
         if n > 1_000_000_000_000_000_000u64 {
-          MxfValue::Duration(i64::MIN) // sentinel: dropped by RawConv
-        } else {
-          MxfValue::Duration(n as i64)
+          return None;
         }
+        MxfValue::Duration(n as i64)
       } else {
         MxfValue::U64(n)
       }
@@ -2495,19 +2511,22 @@ fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> MxfValue {
       MxfValue::List(list.iter().map(SmolStr::new).collect())
     }
     Kind::Binary => MxfValue::Bytes(bytes.to_vec()),
-  }
+  };
+  Some(value)
 }
 
 /// Apply the `%duration` `RawConv` (MXF.pm:98): drop `> 1e18` (the all-`0xff`
-/// sentinel), else carry the raw integer as a [`MxfValue::Duration`].
-fn duration_or_drop(raw: i64) -> MxfValue {
+/// sentinel) by returning `None` — exactly as the RawConv returns `undef` so
+/// no tag key is stored (ExifTool.pm:9493). Otherwise carry the raw integer
+/// as a [`MxfValue::Duration`].
+fn duration_or_drop(raw: i64) -> Option<MxfValue> {
   // `$val > 1e18` — a 64-bit Length of `0xff…` decodes (via `Get64u`) to
   // ~1.84e19; an `int64s` of all-`0xff` decodes to -1. Only the former
   // exceeds 1e18, so a negative raw value is NOT dropped.
   if raw > 1_000_000_000_000_000_000 {
-    MxfValue::Duration(i64::MIN)
+    None
   } else {
-    MxfValue::Duration(raw)
+    Some(MxfValue::Duration(raw))
   }
 }
 
@@ -2618,9 +2637,6 @@ fn convert_durations(w: &mut Walker) {
     let MxfValue::Duration(raw) = e.value else {
       continue;
     };
-    if raw == i64::MIN {
-      continue; // dropped by the `%duration` RawConv (`> 1e18`).
-    }
     // MXF.pm:2796 `or next` — only durations whose family-1 group is a
     // `Track<N>` with a recorded EditRate are divided. Perl's `$editRate`
     // truthiness also skips a zero EditRate.
@@ -2774,11 +2790,9 @@ fn emit_one(
     MxfValue::Bytes(b) => out.write_bytes(group, name, b)?,
     MxfValue::Duration(raw) => {
       // A `%duration` tag that was NOT divided by an EditRate (no track
-      // EditRate found) — still apply the PrintConv.
-      if *raw == i64::MIN {
-        // RawConv dropped this value (`> 1e18`) — emit nothing.
-        return Ok(());
-      }
+      // EditRate found) — still apply the PrintConv. (RawConv-dropped values
+      // never reach here: they yield `None` at decode time and are never
+      // queued — MXF.pm:98.)
       if print_conv {
         // PrintConv `ConvertDuration($val)`.
         let s = crate::datetime::convert_duration(*raw as f64);
