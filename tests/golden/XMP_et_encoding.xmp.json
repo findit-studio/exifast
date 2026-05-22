@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "XMP_et_encoding.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Payload is not a structure!",
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:PayloadEncoding": "base64",
+  "XMP-foo:Payload": "aGVsbG8=",
+  "XMP-foo:DatatypePayload": "world"
+}]

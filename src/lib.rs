@@ -140,7 +140,8 @@ pub use value::{Group, Metadata, Rational, Tag, TagValue};
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use format_parser::Rendered;
 pub use format_parser::{
-  AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags,
+  AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, OverrideWithMime,
+  SharedFlags,
 };
 
 // Per-format parser-handle re-exports. The `ProcessXxx` unit-struct is the

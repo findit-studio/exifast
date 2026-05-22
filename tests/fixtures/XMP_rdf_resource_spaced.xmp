@@ -1,0 +1,13 @@
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="http://example.com/foo/">
+   <foo:link rdf:resource = "http://example.com/page"></foo:link>
+   <foo:linkTight rdf:resource="http://example.com/tight"></foo:linkTight>
+   <foo:valSpaced rdf:value = "spacedValue"></foo:valSpaced>
+   <foo:valTight rdf:value="tightValue"></foo:valTight>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

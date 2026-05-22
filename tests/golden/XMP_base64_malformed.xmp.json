@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "XMP_base64_malformed.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:TrailingJunk": "hello",
+  "XMP-foo:VtabTruncate": "hel",
+  "XMP-foo:NoPadding": "hello"
+}]

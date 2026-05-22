@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "XMP7.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "XMP",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-x:XMPToolkit": "Image::ExifTool 11.57",
+  "XMP-iptcExt:LocationShown": [{
+    "City": "London",
+    "CountryCode": "GB"
+  },{
+    "City": "Paris",
+    "CountryCode": "FR"
+  },{
+    "City": "Berlin",
+    "CountryCode": "DE"
+  }]
+}]

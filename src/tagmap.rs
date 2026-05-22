@@ -188,6 +188,21 @@ impl TagMap {
     Ok(())
   }
 
+  /// Emit a pre-built [`TagValue`] verbatim. Used by formats whose typed
+  /// `Meta` already produces a finished value tree — e.g. XMP's
+  /// structured (`-struct`) output, where a nested
+  /// [`TagValue::Map`]/[`TagValue::List`] is assembled by the parser's
+  /// own struct-rebuild pass (`RestoreStruct`, XMPStruct.pl:708).
+  pub(crate) fn write_value(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: TagValue,
+  ) -> Result<(), Infallible> {
+    self.insert(group, name, value);
+    Ok(())
+  }
+
   /// Record a `Warning` in occurrence order (`$self->Warn`, ExifTool.pm:1297).
   pub(crate) fn write_warning(&mut self, text: &str) -> Result<(), Infallible> {
     self.warnings.push(text.to_string());
@@ -281,7 +296,7 @@ impl TagMap {
         let _ = write!(&mut s, "{}/{}", r.numerator(), r.denominator());
         s
       }
-      TagValue::List(_) => std::format!("{v:?}"),
+      TagValue::List(_) | TagValue::Map(_) => std::format!("{v:?}"),
     })
   }
 }

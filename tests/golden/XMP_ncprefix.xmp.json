@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "XMP_ncprefix.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:Test": "hello",
+  "XMP-foo:JpegHead": "????",
+  "XMP-foo:Canonical": "world",
+  "XMP-foo:Link": ""
+}]

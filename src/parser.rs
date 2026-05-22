@@ -450,6 +450,59 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
         );
         insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
       }
+      FileTypeFinalize::DetectedThenOverrideWithMime(payload) => {
+        // SetFileType() (detected) then OverrideFileType($file_type,$mime) with
+        // an EXPLICIT MIME (XMP Nikon NX-D, XMP.pm:3916).
+        //
+        // `OverrideFileType` is GUARDED by `$fileType ne $$self{VALUE}{FileType}`
+        // (ExifTool.pm:9715): it fires ONLY when the override type DIFFERS from
+        // the type `SetFileType` already produced. For a `.xmp` Nikon NX-D
+        // sidecar `SetFileType` resolves `XMP`, so `NXD ne XMP` ⇒ the override
+        // fires: FileType + FileTypeExtension are replaced (from the override
+        // type) and the MIME is taken VERBATIM from the explicit argument
+        // (ExifTool.pm:9723 — the passed `$mimeType` wins over `%mimeType`,
+        // which has NO `NXD` entry). When the detected type is ALREADY the
+        // override type (e.g. a `.nxd`-extension input whose `SetFileType`
+        // resolves `NXD`), the guard is FALSE ⇒ the override is a no-op and the
+        // base triplet (incl. its table MIME) stands — verified vs bundled 13.58
+        // (a `.nxd` file keeps `application/rdf+xml`, NOT the explicit MIME).
+        let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+        if base.file_type == payload.file_type() {
+          // `$fileType ne $$self{VALUE}{FileType}` FALSE ⇒ no override.
+          insert(
+            &mut obj,
+            "File:FileType".into(),
+            Value::String(base.file_type),
+          );
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&base.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(base.mime_type),
+          );
+        } else {
+          // Override fires: FileType + extension from the override type; MIME
+          // verbatim from the explicit argument (`resolve_override_file_type`'s
+          // table-derived MIME is `None` for `NXD`, so it is discarded).
+          let (ov_ft, ov_ext, _ov_mime) =
+            resolve_override_file_type(payload.file_type(), print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(ov_ft));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(payload.mime().to_string()),
+          );
+        }
+      }
     }
 
     // ----- MIME override (Real.pm:653-657 single-stream override) ----------

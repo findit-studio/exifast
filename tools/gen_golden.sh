@@ -34,7 +34,12 @@ EXIFTOOL="$(cd "$(dirname "$EXIFTOOL")" && pwd)/$(basename "$EXIFTOOL")"
 mkdir -p "$OUTDIR"
 
 # Stable output: drop filesystem-dependent tags, force C locale & UTC.
-COMMON=(-j -G1 -struct -api QuickTimeUTC=1 \
+# `-x Composite:all` drops the synthesized `Composite:*` tags (Aperture,
+# ImageSize, LensID, …) — a deferred Phase-2 forward item across the whole
+# crate (no per-format Composite-table port exists yet). The audio formats
+# emit no Composite tags so this is a no-op for them; XMP genuinely does,
+# so the exclusion keeps the XMP goldens aligned with the engine output.
+COMMON=(-j -G1 -struct -api QuickTimeUTC=1 -x Composite:all \
         --FileName --Directory --FileSize --FileModifyDate \
         --FileAccessDate --FileInodeChangeDate --FilePermissions)
 

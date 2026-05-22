@@ -167,7 +167,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_149() {
+fn typed_serde_path_equals_writer_path_and_golden_all_180() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -236,12 +236,193 @@ fn typed_serde_path_equals_writer_path_and_golden_all_149() {
   // `real_synth_metafile_http_accept.ram`) pinning the Real.pm:533-555
   // Metafile branch — the RAM-vs-RPM extension discrimination, the
   // `^[a-z]{3,4}://` URL/text split, and the `http`-line acceptance gate.
+  // 149 → 154 after the XMP infra port: added XMP / XMP4 / XMP6 / XMP7 /
+  // XMP8 standalone-`.xmp` sidecar fixtures (RDF/XML walker, `%nsURI`
+  // namespace taming, camera-critical exif/tiff/photoshop/aux tag tables,
+  // struct rebuild, lang-alt). Five further XMP fixtures (PLUS, XMP2,
+  // XMP3, XMP5, XMP9) exercising the `plus`/`mwg-*` namespace tables, full
+  // `rdf:nodeID` blank-node resolution, and list-of-lang-alt rebuild are
+  // deferred — see `docs/tracking.md` and the `#[ignore]`'d
+  // `xmp_unported_namespace_printconv_deferred` accept-defer test.
+  // 154 → 159 after Codex R1 (PR #37): added 5 adversarial XMP fixtures
+  // pinning the four fixes — `XMP_bom_utf8.xmp` + `XMP_bom_utf16le.xmp`
+  // (F1: BOM-prefixed recognition reaches the decoder), `XMP_gps.xmp`
+  // (F2: `%latConv`/`%longConv` ToDegrees ValueConv + ToDMS PrintConv for
+  // GPSLatitude/Longitude + Dest variants — `-j` DMS, `-n` decimal degrees),
+  // `XMP_hashmiss.xmp` (F3: string-keyed PrintConv hash, `"05"`/`"99"`/`"Z"`
+  // misses ⇒ `Unknown ($val)`, no integer coercion), and `XMP_langalt.xmp`
+  // (F4: `StandardLangCase` + `GetLangInfo` underscore handling —
+  // `en-us-x-private`→`-en-US-x-private`, `zh-Hant-CN`→`-zh-hant-cn`,
+  // `de_DE`→`-de-de`, `es-419`→`-es-419`).
+  // 159 → 160 after Codex R2 F1 (PR #37): added `XMP_gps_carry.xmp` pinning the
+  // GPS ToDMS seconds round-off carry (GPS.pm:559-561) — the carry subtracts
+  // 60 from the ROUNDED `sprintf('%.2f', $c[-1])` value, not the original
+  // unrounded seconds, so `12.9999999999N` → `13 deg 0' 0.00" N` (not the
+  // negative-zero `-0.00"`). Four boundary cardinals: N/W degree-carry, a
+  // signed-decimal Dest S sign-flip carry, and a minute-only E carry
+  // (`0.0166666666` → `0 deg 1' 0.00" E`, no degree increment).
+  // 160 → 162 after Codex R3 F1 (PR #37): added 2 adversarial XMP fixtures
+  // pinning the `rdf:datatype="base64"` decoded-payload binary/text SPLIT
+  // (XMP.pm:3646-3647: `$val = $$val unless length $$val > 100 or
+  // $$val =~ /[\0-\x08\x0b\x0e-\x1f]/`). `XMP_base64_ctrl.xmp` — single
+  // control bytes: NUL/vtab/0x0e ⇒ `(Binary data 1 bytes, …)`, while FF
+  // (0x0c) / tab+LF+CR / "hello" ⇒ TEXT (the `\0x0c` Perl token is `\0` +
+  // literal `x0c`, NOT `\x0c`, so 0x0c stays text — verified vs bundled
+  // 13.58). `XMP_base64_binary.xmp` — a `<=100`-byte non-UTF-8 JPEG header
+  // (`FF D8 FF E0`) ⇒ lossy text `"????"` (FixUTF8 at JSON time), a
+  // `>100`-byte printable payload ⇒ binary by length, and a `>100`-byte
+  // non-UTF-8 PNG-like blob ⇒ binary. Before the fix `decode_base64_text`
+  // coerced every payload through `String::from_utf8`, so the NUL became a
+  // text string and the non-UTF-8 image bytes failed and stayed base64.
+  // 162 → 163 after Codex R4 F1 (PR #37): added 1 adversarial XMP fixture
+  // pinning `DecodeBase64`'s truncate-and-decode semantics (XMP.pm:2981) —
+  // `XMP_base64_malformed.xmp`: trailing junk `aGVsbG8=#junk` → "hello",
+  // VT-truncate `aGVs<VT>bG8=` → "hel", unpadded `aGVsbG8` → "hello". Before
+  // the fix the decoder returned `None` on the first invalid byte and the
+  // caller fell back to the literal undecoded base64 text.
+  // 163 → 164 after Codex R5 F1 (PR #37): added 1 adversarial XMP fixture
+  // pinning the base64 decode-BEFORE-unescape order. Perl runs
+  // `DecodeBase64($val)` on the still-escaped value (XMP.pm:3645) and only
+  // THEN un-escapes (XMP.pm:3655-3669). `XMP_base64_escaped.xmp`:
+  // `aGVs&#x62;G8=` → "hel" (the `&` truncates DecodeBase64; un-escaping
+  // `&#x62;`→`b` first would wrongly yield "hello"), and `YSZhbXA7Yg==` →
+  // "a&b" (decodes to `a&amp;b`, un-escaped post-decode). Before the fix the
+  // value was un-escaped BEFORE the base64 decode.
+  // 164 → 165 after Codex R6 F1 (PR #37): added 1 adversarial XMP fixture
+  // pinning namespace-NORMALIZED structural-attribute lookup. `FoundXMP`
+  // reads `rdf:datatype`/`et:encoding` (XMP.pm:3644) and `xml:lang`
+  // (XMP.pm:3497) from the `%attrs` HASH, whose keys are prefix-translated
+  // by the attribute loop (XMP.pm:3976). `XMP_ncprefix.xmp` declares the
+  // RDF namespace under a noncanonical `r:` prefix: `r:datatype="base64"`
+  // ⇒ `aGVsbG8=` decodes to "hello" and `/9j/4A==` to a binary JPEG header
+  // ("????"), exactly as a canonical `rdf:datatype` does (Canonical=world).
+  // Before the fix the lookup scanned the RAW attribute text for a literal
+  // `rdf:datatype`, missed it, and emitted the undecoded base64. The
+  // `rdf:resource` fallback (XMP.pm:4186) is the OPPOSITE — ExifTool matches
+  // the RAW `$attrs` string with a literal `\brdf:`, so a noncanonical
+  // `r:resource` does NOT trigger it: Link stays "" (verified vs bundled).
+  // 165 → 167 after Codex R7 (PR #37): added 2 adversarial XMP fixtures.
+  // `XMP_rdf_resource_spaced.xmp` (F1) pins the empty-value fallback's
+  // LITERAL raw-regex match (XMP.pm:4185-4186 `\brdf:(?:value|resource)=`
+  // / `\brdf:about=` — NO `\s*` around `=`): `rdf:resource = "…"` written
+  // with spaces does NOT match, so `Link`/`ValSpaced` stay "" while the
+  // tight `LinkTight`/`ValTight` keep their values. `XMP_et_encoding.xmp`
+  // (F2) pins shorthand-attr DELETE semantics (XMP.pm:4133): `et:encoding`
+  // is a non-ignored shorthand attr — extracted as its own tag
+  // (`PayloadEncoding`) AND deleted from `%attrs`, so it does NOT drive the
+  // parent decode (`Payload` stays raw `aGVsbG8=`); the un-deleted
+  // `rdf:datatype` still decodes its parent (`d29ybGQ=` → "world").
+  // 167 → 168 after Codex R8 F1 (PR #37): added `XMP_li_cap.xmp` pinning
+  // the `rdf:li` 1000-item cap (XMP.pm:3991-3999). The fixture has 1001
+  // `<rdf:li>` keywords; ExifTool's default read path (no
+  // `IgnoreMinorErrors` — `exifast` has no such option) extracts exactly
+  // the first 1000 (`Subject` = [kw1..kw1000]) and raises the minor
+  // warning `[Minor] Extracted only 1000 dc:subject items. Ignore minor
+  // errors to extract all` (`Warn(..., 2)` ⇒ literal `[Minor] ` prefix,
+  // ExifTool.pm:5619), then `last`s out of the element loop. Before the
+  // fix the Rust `rdf:li` branch extracted every item with no cap and no
+  // warning. (R8/F2 — SVG/XML/PLIST inputs now rejected by the XMP parser
+  // — adds no fixture: it is covered by the `xmp_svg_*` conformance test
+  // and the `parse_inner_accepts_only_*` unit test, and a rejected input
+  // produces no golden.)
+  // 168 → 169 after Codex R9 F2 (PR #37): added `XMP_numentity.xmp` pinning
+  // `UnescapeChar`'s `pack('C0U')` numeric-entity semantics (XMP.pm:2919-2936
+  // + the downstream `FixUTF8`, XMP.pm:2943-2972). Out-of-range / surrogate
+  // numeric refs are encoded as malformed loose-UTF-8 and then mapped to ONE
+  // `?` per bad byte (`A&#x100000000;B` → "A???????B", `S&#xD800;E` → "S???E",
+  // `over&#x110000;flow` → "over????flow"), while `&#x100;` → `Ā` and the
+  // class-sweep literals `&#X41;` (uppercase X) / `&#x+41;` (sign breaks
+  // `\w+`) stay verbatim. Before the fix the overflow/surrogate path bailed to
+  // `None` and left the literal entity text. (R9/F1 — leading-whitespace
+  // recognition anchoring — adds no fixture: a leading-whitespace `<rdf:RDF`/
+  // `<?xml` finalizes to TXT in ExifTool, a deferred FileType with no golden;
+  // it is covered by the `xmp_leading_whitespace_recognition_anchoring`
+  // conformance test and the `parse_inner_*` unit tests.)
+  // 169 → 171 after Codex R10 (PR #37): added 2 adversarial XMP fixtures
+  // pinning the UTF text-encoding decode paths (the class sweep). ExifTool
+  // transcodes via `unpack` + `pack('C0U*')` (each 16/32-bit unit decoded
+  // INDEPENDENTLY) then `FixUTF8` (XMP.pm:2943-2972 / 4467-4498 / 4571-4587),
+  // mangling non-ASCII the port previously kept verbatim. `XMP_double_utf8.xmp`
+  // (F1) — a UTF-8-BOM + `<?xpacket begin=` sidecar (the `$double` capture,
+  // XMP.pm:4351): the body `é` (U+00E9) is decode-UTF8'd then byte-truncated
+  // (`pack('C*', unpack('C0U*'))`, XMP.pm:4476-4480) to `0xE9` → `?`, with the
+  // `XMP is double UTF-encoded` warning (XMP.pm:4494). `XMP_utf16le_nonbmp.xmp`
+  // (F2) — a UTF-16LE sidecar whose `dc:title = A😀B`: the surrogate PAIR is
+  // two `unpack('v*')` units → `pack('C0U*')` 6 loose-UTF-8 bytes
+  // (`ed a0 bd ed b8 80`) → `FixUTF8` → `A??????B` (no warning — the BOM marker
+  // validates, XMP.pm:4567). Before the fix the port `String::from_utf16_lossy`
+  // combined the pair into the real scalar (`A😀B`) and skipped the `$double`
+  // branch entirely. The class sweep also fixed the plain-UTF-8 path (a
+  // malformed byte now → `?`, not `from_utf8_lossy`'s U+FFFD) — covered by the
+  // `parse_inner_encoding_paths_end_to_end` / `decode_paths_*` unit tests.
+  // 171 -> 174 after Codex R11 (PR #37): added 3 adversarial XMP fixtures.
+  // `XMP_nikon_nxd.xmp` (F1) pins the namespace-driven `OverrideFileType`
+  // (XMP.pm:3915-3916): an `xmlns` URI beginning `http://ns.nikon.com/
+  // BASIC_PARAM` is a Nikon NX-D settings sidecar, so ExifTool calls
+  // `OverrideFileType('NXD','application/x-nikon-nxd')` and finalizes
+  // `File:FileType=NXD` / `File:FileTypeExtension=nxd` (the `-n` form keeps
+  // the uppercase `NXD`) / `File:MIMEType=application/x-nikon-nxd` (the
+  // EXPLICIT MIME, since `NXD` has no `%mimeType` entry) instead of generic
+  // XMP. Before the fix the port indexed it as `XMP` + `application/rdf+xml`.
+  // `XMP_nikon_nxd_ext.nxd` (F1 class-sweep) pins the `OverrideFileType`
+  // GUARD `$fileType ne $$self{VALUE}{FileType}` (ExifTool.pm:9715): the SAME
+  // content under a `.nxd` extension already has `SetFileType` resolve `NXD`
+  // (the `NXD => XMP` sub-type-by-ext promotion, ExifTool.pm:9686-9690), so
+  // `NXD ne NXD` is FALSE ⇒ the override is a NO-OP and the base MIME
+  // `application/rdf+xml` stands (NOT the explicit `application/x-nikon-nxd`).
+  // `XMP_base64_x0c.xmp` (F2) pins the base64 binary-guard TYPO (XMP.pm:3647
+  // `... or $$val =~ /[\0-\x08\x0b\0x0c\x0e-\x1f]/`): `\0x0c` parses as
+  // `\0` + the LITERAL bytes `x`/`0`/`c`, so a short base64 payload decoding
+  // to `cat`/`x`/`0`/`c` is a binary placeholder, while a payload without
+  // control/`x`/`0`/`c` bytes stays text (`dog` decodes to "dog", `9` to 9 --
+  // only the digit `0` is special, not all digits). Before the fix the port
+  // omitted the literal `x`/`0`/`c` bytes and emitted `cat`/`x`/`0`/`c` as
+  // text. (The all-control-range coverage stays in `XMP_base64_ctrl.xmp`.)
+  // 174 -> 175 after Codex R12 (PR #37): added `XMP_rational_plus.xmp`
+  // pinning the numeric-parsing leniency class. `ConvertRational`
+  // (XMP.pm:3402) gates the value with `^(-?\d+)/(-?\d+)$` — an OPTIONAL
+  // `-` (never `+`) per side — so a `+N/D` rational is NOT converted; the
+  // looser Rust `i64::parse` accepted the `+`. The fixture's
+  // `exif:ExposureBiasValue=+1/3` therefore stays `+1/3` in `-n`, and the
+  // un-gated `PrintFraction` (Exif.pm:5520, no `IsFloat`) coerces it the
+  // Perl way (`"+1/3" + 0 == 1`) to `+1` in `-j` (verified vs bundled
+  // 13.58). The class-sweep companions: `exif:FocalLength=+50/1` exercises
+  // the raw-`sprintf("%.1f mm",$val)` `FocalMm` PrintConv (`-n` `+50/1`,
+  // `-j` `50.0 mm`); `exif:ApertureValue=+2/1` the un-gated
+  // `sqrt(2)**$val` APEX `ValueConv` coercing `+2/1`->`2` (`-n` `2`,
+  // `-j` `2.0` via `sprintf("%.1f",$val)`); and `exif:BrightnessValue=-1/3`
+  // is the control — a valid `-`-signed rational still converts to
+  // `-0.333333333333333` in both modes. Before the fix the port converted
+  // `+1/3` to a `0.333...` quotient and the `f64::parse`-based converters
+  // (stricter than Perl coercion — they reject `+1/3`/`+50/1`) left the
+  // un-converted `+`-rationals verbatim in `-j`.
+  // 175 -> 180 after Codex R14 F1 (PR #37): added 5 real-input value-parity
+  // XMP fixtures pinning the `exif:ColorSpace` / `aux:LensInfo` /
+  // `aux:ApproximateFocusDistance` conversions that the table previously
+  // declared raw/identity. `XMP_colorspace.xmp` (`exif:ColorSpace`) pins the
+  // `'$val == 0xffffffff ? 0xffff : $val'` ValueConv (XMP.pm:2003) — a
+  // written `4294967295` collapses to `65535` (`-n`) and PrintConv-maps to
+  // `Uncalibrated` (`-j`); before the fix the missing ValueConv left
+  // `4294967295` raw, a PrintConv hash miss => `Unknown (4294967295)`.
+  // `XMP_lensinfo.xmp` + `XMP_lensinfo_prime.xmp` (`aux:LensInfo`) pin
+  // `\&ConvertRationalList` (XMP.pm:2600 / 3418) + `\&Exif::PrintLensInfo`
+  // (XMP.pm:2615 / Exif.pm:5800): `24/1 70/1 28/10 40/10` -> `24 70 2.8 4`
+  // (`-n`) -> `24-70mm f/2.8-4` (`-j`); the prime `50/1 0/1 14/10 14/10` ->
+  // `50 0 1.4 1.4` -> `50mm f/1.4` exercises `PrintLensInfo`'s Perl-truthy
+  // `if $vals[1]` guard dropping the `"0"` upper focal (Exif.pm:5814).
+  // `XMP_aux_focusdist.xmp` + `XMP_aux_focusdist_inf.xmp`
+  // (`aux:ApproximateFocusDistance`) pin the `4294967295 => 'infinity'`
+  // PrintConv hash whose `OTHER => sub` (XMP.pm:2634-2638) returns the value
+  // UNCHANGED on a read-direction miss: a `rational` Writable so
+  // `ConvertRational` runs first — `53/10` -> `5.3` (a hash miss, OTHER
+  // passes it through) and `4294967295/1` -> `4294967295` keys the
+  // `infinity` row.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    149,
-    "expected exactly the 149 active conformance fixtures, found {}: {:?}",
+    180,
+    "expected exactly the 180 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

@@ -1323,7 +1323,7 @@ fn dispatch_directory_tag<'a>(
       TagValue::Bytes(b) => Value::Bytes(b),
       TagValue::Rational(r) => Value::Rational(r),
       TagValue::Bool(b) => Value::I64(i64::from(b)),
-      TagValue::List(_) => Value::Str(R3dStrCow::Owned(String::new())),
+      TagValue::List(_) | TagValue::Map(_) => Value::Str(R3dStrCow::Owned(String::new())),
     }
   };
 

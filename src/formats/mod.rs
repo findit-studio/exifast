@@ -43,3 +43,5 @@ pub mod real;
 pub mod red;
 #[cfg(feature = "wavpack")]
 pub mod wavpack;
+#[cfg(feature = "xmp")]
+pub mod xmp;

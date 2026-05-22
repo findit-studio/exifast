@@ -315,6 +315,9 @@ pub enum AnyParser {
   /// Matroska (FORMATS.md row 23 — MKV/MKA/MKS/WebM EBML container).
   #[cfg(feature = "matroska")]
   Matroska(crate::formats::matroska::ProcessMatroska),
+  /// XMP (`.xmp` sidecar — RDF/XML metadata).
+  #[cfg(feature = "xmp")]
+  Xmp(crate::formats::xmp::ProcessXmp),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -398,6 +401,9 @@ pub enum AnyMeta<'a> {
   /// Matroska (FORMATS.md row 23).
   #[cfg(feature = "matroska")]
   Matroska(crate::formats::matroska::Meta<'a>),
+  /// XMP (`.xmp` sidecar — RDF/XML metadata).
+  #[cfg(feature = "xmp")]
+  Xmp(crate::formats::xmp::XmpMeta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -422,6 +428,7 @@ pub enum AnyMeta<'a> {
     feature = "mpc",
     feature = "wavpack",
     feature = "matroska",
+    feature = "xmp",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -489,6 +496,8 @@ impl AnyMeta<'_> {
       AnyMeta::Wv(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness.
@@ -510,6 +519,7 @@ impl AnyMeta<'_> {
         feature = "mpc",
         feature = "wavpack",
         feature = "matroska",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = (print_conv, out);
@@ -554,6 +564,44 @@ impl ExplicitThenLiteral {
   }
 }
 
+/// Payload for [`FileTypeFinalize::DetectedThenOverrideWithMime`]: a
+/// `SetFileType()` (detected) followed by `OverrideFileType($file_type,$mime)`
+/// where the override carries an EXPLICIT MIME (ExifTool.pm:9723 — the explicit
+/// `$mimeType` argument wins, so `%mimeType` is NOT consulted). XMP's Nikon
+/// NX-D path is the lone case: `OverrideFileType('NXD','application/x-nikon-nxd')`
+/// (XMP.pm:3916), where `NXD` has NO `%mimeType` entry so the explicit MIME is
+/// the only source. Extracted into a named struct so the enum stays
+/// unit-or-newtype only (§2). The `FileTypeExtension` is still derived from
+/// `file_type` (ExifTool.pm:9718-9722); only the MIME is taken verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideWithMime {
+  file_type: &'static str,
+  mime: &'static str,
+}
+
+impl OverrideWithMime {
+  /// Construct from the `OverrideFileType` type + explicit MIME arguments.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(file_type: &'static str, mime: &'static str) -> Self {
+    Self { file_type, mime }
+  }
+
+  /// The override `FileType` (drives `File:FileType` + `FileTypeExtension`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_type(&self) -> &'static str {
+    self.file_type
+  }
+
+  /// The EXPLICIT `MIMEType` argument (verbatim, NOT a `%mimeType` lookup).
+  #[must_use]
+  #[inline(always)]
+  pub const fn mime(&self) -> &'static str {
+    self.mime
+  }
+}
+
 /// How the engine ([`crate::parser::extract_info`]) should finalize the
 /// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
 /// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
@@ -593,6 +641,14 @@ pub enum FileTypeFinalize {
   /// `$$self{VALUE}{FileType} = 'DJVU (multi-page)'`, AIFF.pm:206). The
   /// payload (see [`ExplicitThenLiteral`]) carries the `set` + `literal`.
   ExplicitThenLiteral(ExplicitThenLiteral),
+  /// `SetFileType()` then `OverrideFileType($file_type,$mime)` with an
+  /// EXPLICIT MIME argument (XMP Nikon NX-D: `OverrideFileType('NXD',
+  /// 'application/x-nikon-nxd')`, XMP.pm:3916). Distinct from
+  /// [`DetectedThenOverride`] because the override type (`NXD`) has NO
+  /// `%mimeType` entry, so the MIME MUST come from the explicit argument
+  /// rather than a table lookup. The payload (see [`OverrideWithMime`])
+  /// carries the `file_type` + `mime`.
+  DetectedThenOverrideWithMime(OverrideWithMime),
 }
 
 impl AnyMeta<'_> {
@@ -665,6 +721,28 @@ impl AnyMeta<'_> {
           FileTypeFinalize::Detected
         }
       }
+      // XMP: `SetFileType()` finalizes to the detected `XMP` candidate.
+      // `ProcessXMP` also `SetFileType`s SVG/PLIST/XML for those XML
+      // flavours (XMP.pm:4420-4427), but `XmpMeta` is only ever produced
+      // for genuine FileType-`XMP` input: `ProcessXmp::parse` rejects every
+      // `<svg`-rooted / non-XMP-`<?xml`-rooted input as `Ok(None)` (Codex
+      // R8/F2 — the SVG/PLIST/XML sub-ports are deferred, see
+      // `docs/tracking.md`). The one in-walk exception is a Nikon NX-D
+      // sidecar: an `xmlns` URI beginning `http://ns.nikon.com/BASIC_PARAM`
+      // triggers `OverrideFileType('NXD','application/x-nikon-nxd')`
+      // (XMP.pm:3916), so finalize to `NXD` with that explicit MIME (Codex
+      // R11/F1). Otherwise `Detected` ⇒ `XMP`.
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => {
+        if m.is_nikon_nxd() {
+          FileTypeFinalize::DetectedThenOverrideWithMime(OverrideWithMime::new(
+            "NXD",
+            "application/x-nikon-nxd",
+          ))
+        } else {
+          FileTypeFinalize::Detected
+        }
+      }
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -683,6 +761,7 @@ impl AnyMeta<'_> {
         feature = "mpc",
         feature = "wavpack",
         feature = "matroska",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -876,6 +955,10 @@ pub enum AnyError {
   #[cfg(feature = "matroska")]
   #[error("Matroska: {0}")]
   Matroska(#[from] crate::formats::matroska::Error),
+  /// XMP fatal-error wrapper.
+  #[cfg(feature = "xmp")]
+  #[error("XMP: {0}")]
+  Xmp(#[from] crate::formats::xmp::Error),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -946,6 +1029,7 @@ impl AnyParser {
       feature = "mpc",
       feature = "wavpack",
       feature = "matroska",
+      feature = "xmp",
     )))]
     let _ = (bytes, shared, ext);
     match self {
@@ -1129,6 +1213,13 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::Matroska))
           .map_err(Into::into)
       }
+      #[cfg(feature = "xmp")]
+      AnyParser::Xmp(p) => {
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Xmp))
+          .map_err(Into::into)
+      }
     }
   }
 }
@@ -1177,6 +1268,8 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "R3D" => Some(AnyParser::R3D(crate::formats::red::ProcessR3D)),
     #[cfg(feature = "wavpack")]
     "WV" => Some(AnyParser::Wv(crate::formats::wavpack::ProcessWv)),
+    #[cfg(feature = "xmp")]
+    "XMP" => Some(AnyParser::Xmp(crate::formats::xmp::ProcessXmp)),
     _ => None,
   }
 }
@@ -1244,6 +1337,8 @@ mod tests {
     assert!(any_parser_for("R3D").is_some());
     #[cfg(feature = "wavpack")]
     assert!(any_parser_for("WV").is_some());
+    #[cfg(feature = "xmp")]
+    assert!(any_parser_for("XMP").is_some());
     assert!(any_parser_for("MPEG").is_none()); // video side deferred
     assert!(any_parser_for("").is_none());
     assert!(any_parser_for("AIFC").is_none()); // resolves to AIFF via lookup, not directly

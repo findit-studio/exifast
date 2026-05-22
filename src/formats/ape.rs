@@ -703,6 +703,9 @@ fn perl_boolean_truthy(v: &TagValue) -> bool {
     TagValue::Bytes(b) => !b.is_empty() && b.as_slice() != b"0",
     TagValue::Rational(r) => r.numerator() != 0,
     TagValue::List(l) => !l.is_empty(),
+    // `Map` (XMP structured value) never reaches an APE boolean conv;
+    // a non-empty struct is truthy by the same count semantics as List.
+    TagValue::Map(m) => !m.is_empty(),
   }
 }
 
@@ -2199,8 +2202,8 @@ fn emit_tag_value(
         write!(w, "{}/{}", r.numerator(), r.denominator())
       })
     }
-    TagValue::List(_) => {
-      // No APE Main tag emits List today. Reserved for forward compat.
+    TagValue::List(_) | TagValue::Map(_) => {
+      // No APE Main tag emits List/Map today. Reserved for forward compat.
       out.write_str(group, name, "<list>")
     }
   }

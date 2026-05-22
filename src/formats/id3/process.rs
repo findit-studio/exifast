@@ -1341,8 +1341,8 @@ impl Id3Meta<'_> {
         TagValue::F64(n) => out.write_f64(group, name, *n)?,
         TagValue::Bool(b) => out.write_u64(group, name, u64::from(*b))?,
         TagValue::Bytes(b) => out.write_bytes(group, name, b)?,
-        TagValue::Rational(_) | TagValue::List(_) => {
-          // ID3 today never produces Rational or List values; if a
+        TagValue::Rational(_) | TagValue::List(_) | TagValue::Map(_) => {
+          // ID3 today never produces Rational, List or Map values; if a
           // future frame type does, extend this match with the
           // appropriate writer emission (e.g. a rational-to-decimal
           // write_fmt or a per-item write_str loop).
