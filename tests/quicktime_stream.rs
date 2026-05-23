@@ -637,6 +637,19 @@ fn canon_ctmd_real_fixture_conformance() {
   }
 }
 
+/// Real-fixture conformance stub for Insta360 INSV/INSP.
+///
+/// Bundled exiftool has no Insta360 fixture in `t/images/`; the synthetic-
+/// trailer unit tests carry the algorithmic coverage. When a small INSV/
+/// INSP fixture lands (per follow-up issue #91), unignore this test and
+/// add the round-trip assertions against `perl /Users/user/Develop/
+/// findit-studio/exiftool/exiftool -j -G -ee <fixture>`.
+#[test]
+#[ignore = "needs real Insta360 INSV/INSP fixture; see #91"]
+fn insta360_real_fixture_conformance() {
+  // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
+}
+
 // ===========================================================================
 // SP4 — Sony rtmd (Real-Time MetaData)
 // ===========================================================================
@@ -1120,4 +1133,199 @@ fn atom_bytes(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
   v.extend_from_slice(t);
   v.extend_from_slice(body);
   v
+}
+
+// ===========================================================================
+// SP4 — Insta360 trailer
+// ===========================================================================
+
+/// Build a minimal QuickTime file with an Insta360 trailer appended.
+///
+/// File layout: `[ftyp][moov][mdat]` (standard MOV) followed by the
+/// Insta360 trailer (records + 78-byte footer).
+fn build_mov_with_insta360_trailer(records: &[(u16, Vec<u8>)]) -> Vec<u8> {
+  // Minimal valid MOV (ftyp + moov + mdat) prefix.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mvhd_atom = atom_bytes(b"mvhd", &mvhd);
+  let moov = atom_bytes(b"moov", &mvhd_atom);
+
+  let mdat_payload = vec![0u8; 16];
+  let mdat = atom_bytes(b"mdat", &mdat_payload);
+
+  let mut file = ftyp;
+  file.extend_from_slice(&moov);
+  file.extend_from_slice(&mdat);
+
+  // Append the Insta360 trailer. Each record body is followed by its 6-byte
+  // [id:u16-LE][len:u32-LE] footer; the trailer ends with a 78-byte footer
+  // whose first 6 bytes are the LAST record's id+len (so the LAST record's
+  // 6-byte footer IS the first 6 bytes of the 78-byte trailer footer).
+  let trailer_start = file.len();
+  for (id, body) in records {
+    file.extend_from_slice(body);
+    file.extend_from_slice(&id.to_le_bytes());
+    file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+  }
+  let (last_id, last_len) = if let Some((id, body)) = records.last() {
+    (*id, body.len() as u32)
+  } else {
+    (0u16, 0u32)
+  };
+  // Strip the last 6-byte footer; we'll fold it into the 78-byte trailer footer.
+  file.truncate(file.len() - 6);
+  let trailer_len = (file.len() - trailer_start) as u32 + 78;
+  // 78-byte trailer footer: [last_id:u16-LE][last_len:u32-LE][32 opaque]
+  // [trailer_len:u32-LE][4 opaque][32-byte ASCII magic].
+  file.extend_from_slice(&last_id.to_le_bytes());
+  file.extend_from_slice(&last_len.to_le_bytes());
+  file.extend_from_slice(&[0u8; 32]);
+  file.extend_from_slice(&trailer_len.to_le_bytes());
+  file.extend_from_slice(&[0u8; 4]);
+  file.extend_from_slice(b"8db42d694ccc418790edff439fe026bf");
+  file
+}
+
+/// One 0x101 identity record body: `[tag:u8][len:u8][value]` items.
+fn insta360_identity_body(items: &[(u8, &[u8])]) -> Vec<u8> {
+  let mut out = Vec::new();
+  for (t, v) in items {
+    out.push(*t);
+    out.push(v.len() as u8);
+    out.extend_from_slice(v);
+  }
+  out
+}
+
+/// One 53-byte 0x700 GPS row.
+#[allow(clippy::too_many_arguments)]
+fn insta360_gps_row(
+  unixtime: u32,
+  ms: u16,
+  status: u8,
+  lat: f64,
+  ns: u8,
+  lon: f64,
+  ew: u8,
+  speed_mps: f64,
+  track_deg: f64,
+  altitude_m: f64,
+) -> Vec<u8> {
+  let mut out = Vec::with_capacity(53);
+  out.extend_from_slice(&unixtime.to_le_bytes());
+  out.extend_from_slice(&0u32.to_le_bytes());
+  out.extend_from_slice(&ms.to_le_bytes());
+  out.push(status);
+  out.extend_from_slice(&lat.to_le_bytes());
+  out.push(ns);
+  out.extend_from_slice(&lon.to_le_bytes());
+  out.push(ew);
+  out.extend_from_slice(&speed_mps.to_le_bytes());
+  out.extend_from_slice(&track_deg.to_le_bytes());
+  out.extend_from_slice(&altitude_m.to_le_bytes());
+  out
+}
+
+#[test]
+fn quicktime_insta360_trailer_identity_only_projects_camera_info() {
+  // An Insta360 file with only a `0x101` identity record. The parser must
+  // populate `Meta::insta360()` and `MediaMetadata::camera_info()` with
+  // Make=Insta360 + Model=Insta360 X3 + Software=1.0.07 + Serial=IXX00123.
+  let id_body = insta360_identity_body(&[
+    (0x0a, b"IXX00123"),      // SerialNumber
+    (0x12, b"Insta360 X3"),   // Model
+    (0x1a, b"1.0.07"),        // Firmware
+    (0x2a, b"2_6_4032_3024"), // Parameters
+  ]);
+  let data = build_mov_with_insta360_trailer(&[(0x101, id_body)]);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized as MOV");
+  let i = meta.insta360();
+  assert!(!i.is_empty(), "insta360() must populate");
+  let id = i.identity().expect("identity decoded");
+  assert_eq!(id.model(), Some("Insta360 X3"));
+  assert_eq!(id.serial_number(), Some("IXX00123"));
+  assert_eq!(id.firmware(), Some("1.0.07"));
+  assert_eq!(id.parameters(), Some("2 6 4032 3024"));
+
+  // MediaMetadata projection: CameraInfo with Insta360 fields.
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("CameraInfo from Insta360");
+  assert_eq!(cam.make(), Some("Insta360"));
+  assert_eq!(cam.model(), Some("Insta360 X3"));
+  assert_eq!(cam.serial(), Some("IXX00123"));
+  assert_eq!(cam.software(), Some("1.0.07"));
+}
+
+#[test]
+fn quicktime_insta360_trailer_gps_record_projects_gps_location() {
+  // An Insta360 file with one 0x700 GPS record carrying one active fix.
+  // The parser must populate `Meta::insta360().first_fix()` AND
+  // `MediaMetadata::gps_location()`.
+  let gps_body = insta360_gps_row(
+    1717250400, // 2024:06:01 14:00:00 UTC
+    0, b'A', 45.0, b'N', 8.0, b'E', 10.0, 90.0, 200.0,
+  );
+  let data = build_mov_with_insta360_trailer(&[(0x700, gps_body)]);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let fix = meta.insta360().first_fix().expect("fix");
+  assert!((fix.latitude().unwrap() - 45.0).abs() < 1e-9);
+  assert!((fix.longitude().unwrap() - 8.0).abs() < 1e-9);
+  assert!((fix.altitude_m().unwrap() - 200.0).abs() < 1e-9);
+  assert!((fix.speed_kph().unwrap() - 36.0).abs() < 1e-9); // 10 m/s * 3.6
+  assert_eq!(fix.date_time(), Some("2024:06:01 14:00:00Z"));
+  // GpsLocation projection
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation from Insta360");
+  assert!((gps.latitude().unwrap() - 45.0).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 8.0).abs() < 1e-9);
+  assert!((gps.altitude_m().unwrap() - 200.0).abs() < 1e-9);
+  assert_eq!(gps.timestamp(), Some("2024:06:01 14:00:00Z"));
+}
+
+#[test]
+fn quicktime_insta360_identity_and_gps_full_projection() {
+  // An Insta360 file with BOTH identity + GPS records. The projection
+  // should yield CameraInfo + GpsLocation.
+  let id_body = insta360_identity_body(&[(0x12, b"Insta360 ONE RS"), (0x1a, b"1.0.01")]);
+  let gps_body = insta360_gps_row(
+    1717250400, 250, b'A', 37.7749, b'N', -122.4194, b'W', 5.0, 0.0, 10.0,
+  );
+  let data = build_mov_with_insta360_trailer(&[(0x101, id_body), (0x700, gps_body)]);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("CameraInfo");
+  assert_eq!(cam.make(), Some("Insta360"));
+  assert_eq!(cam.model(), Some("Insta360 ONE RS"));
+  let gps = md.gps().expect("GpsLocation");
+  assert!((gps.latitude().unwrap() - 37.7749).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - -122.4194).abs() < 1e-9);
+  // ms=250 ⇒ ".25" suffix (after trailing-zero strip).
+  assert_eq!(gps.timestamp(), Some("2024:06:01 14:00:00.25Z"));
+}
+
+#[test]
+fn quicktime_no_insta360_trailer_leaves_meta_empty() {
+  // A plain QuickTime file (no Insta360 trailer) must have an empty
+  // `insta360()` meta — the signature check is a 32-byte compare at file
+  // EOF; nothing else should fire.
+  let data = build_mov_with_freegps_in_mdat();
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  assert!(meta.insta360().is_empty());
 }

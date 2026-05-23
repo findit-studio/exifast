@@ -80,6 +80,17 @@ pub mod android_camm;
 // [`quicktime_stream`]. Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod canon_ctmd;
+// Insta360 — INSV/INSP trailer walker. Faithful port of
+// `Image::ExifTool::QuickTimeStream::ProcessInsta360`
+// (QuickTimeStream.pl:3252-3478) + the `%insvDataLen` length catalogue
+// (QuickTimeStream.pl:85-99) and the `INSV_MakerNotes` identity table
+// (QuickTimeStream.pl:696-707). Located at file EOF by the magic ASCII
+// hex string `8db42d694ccc418790edff439fe026bf`. Reached via a direct
+// file-end pass in `quicktime::parse_inner` (no metadata-track dispatch
+// — Insta360 is a trailer, not a `gpmd`/`camm`/`CTMD`-style track).
+// Gated on the `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod insta360;
 // Sony rtmd — Real-Time MetaData timed records in Sony Alpha A7/A9/FX/
 // RX/Cinema-line MP4/MOV recorders. Faithful port of
 // `Image::ExifTool::Sony::Process_rtmd` (Sony.pm:11566-11602) + the

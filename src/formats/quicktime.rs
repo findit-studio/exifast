@@ -53,10 +53,10 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::{gopro, quicktime_freegps, quicktime_stream},
+  formats::{gopro, insta360 as insta360_fmt, quicktime_freegps, quicktime_stream},
   metadata::{
-    CammMeta, CanonCtmdMeta, GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta,
-    SonyRtmdMeta,
+    CammMeta, CanonCtmdMeta, GoProMeta, Insta360Meta, MediaTrack, QuickTimeMeta,
+    QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::format_g,
 };
@@ -1395,6 +1395,15 @@ pub struct Meta<'a> {
   /// plus the `Canon::CTMD` / `FocalInfo` / `ExposureInfo` tag tables
   /// (Canon.pm:9790-9887).
   canon_ctmd: CanonCtmdMeta,
+  /// **SP4** — Insta360 INSV/INSP trailer metadata (identity / GPS /
+  /// exposure-time records). Decoded by [`insta360_fmt::scan_trailer`]
+  /// at the end of the QuickTime parse — Insta360 is a file-end
+  /// trailer, NOT a `gpmd`/`camm`/`CTMD`-style timed-metadata track.
+  /// Empty ([`Insta360Meta::is_empty`]) for a non-Insta360 video.
+  /// Faithful port of `Image::ExifTool::QuickTimeStream::ProcessInsta360`
+  /// (QuickTimeStream.pl:3252-3478) and the `INSV_MakerNotes` identity
+  /// table (QuickTimeStream.pl:696-707).
+  insta360: Insta360Meta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1499,6 +1508,21 @@ impl Meta<'_> {
     &self.canon_ctmd
   }
 
+  /// **SP4** — Insta360 INSV/INSP trailer metadata.
+  /// [`Insta360Meta::is_empty`] for a non-Insta360 file (or one whose
+  /// trailer signature is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::QuickTimeStream::ProcessInsta360`
+  /// (QuickTimeStream.pl:3252-3478) and the `INSV_MakerNotes` identity
+  /// table (QuickTimeStream.pl:696-707). Populated by a direct
+  /// file-end pass after the QuickTime moov walk — Insta360 trailers
+  /// live AFTER the QuickTime box hierarchy.
+  #[must_use]
+  #[inline(always)]
+  pub const fn insta360(&self) -> &Insta360Meta {
+    &self.insta360
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1529,6 +1553,7 @@ impl Meta<'_> {
     self.android_camm.project_into(&mut md);
     self.sony_rtmd.project_into(&mut md);
     self.canon_ctmd.project_into(&mut md);
+    self.insta360.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -1948,6 +1973,19 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     gopro::process_gopro(gpmf_payload, &mut gopro_meta);
   }
 
+  // **SP4** — Insta360 INSV/INSP trailer (QuickTime.pm:9975-9979 +
+  // QuickTime.pm:10669-10673 + QuickTimeStream.pl:3258-3478). The
+  // Insta360 trailer lives AFTER the QuickTime box hierarchy (at file
+  // EOF, identified by the 32-byte ASCII magic
+  // `8db42d694ccc418790edff439fe026bf`). Faithful gating: bundled's
+  // `IdentifyTrailers` (QuickTime.pm:9897-9926) only looks for the
+  // signature unconditionally — there is no file-extension gate.
+  // `scan_trailer` returns the input unchanged when no signature is
+  // present, so a plain (non-Insta360) MP4 pays only the cost of one
+  // 32-byte compare at file end.
+  let mut insta360_meta = crate::metadata::Insta360Meta::new();
+  insta360_fmt::scan_trailer(data, &mut insta360_meta);
+
   Ok(Some(Meta {
     qt,
     stream,
@@ -1955,6 +1993,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     android_camm: camm_meta,
     sony_rtmd: sony_rtmd_meta,
     canon_ctmd: canon_ctmd_meta,
+    insta360: insta360_meta,
     embedded_exif_deferred,
     file_type,
     mime,

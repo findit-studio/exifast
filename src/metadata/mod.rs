@@ -25,6 +25,7 @@ mod android_camm;
 mod canon_ctmd;
 mod domain;
 mod gopro;
+mod insta360;
 mod quicktime;
 mod quicktime_stream;
 mod sony_rtmd;
@@ -35,6 +36,7 @@ pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, MetaProjectInto,
 };
 pub use gopro::{GoProGpsSample, GoProMeta};
+pub use insta360::{Insta360ExposureSample, Insta360GpsSample, Insta360Identity, Insta360Meta};
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
 pub use sony_rtmd::{SonyRtmdCameraSnapshot, SonyRtmdGpsSample, SonyRtmdMeta};
