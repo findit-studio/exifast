@@ -91,6 +91,17 @@ pub mod canon_ctmd;
 // Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod insta360;
+// Parrot mett — drone timed-metadata walker. Faithful port of
+// `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) +
+// the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
+// `V3`/`TimeStamp`/`FollowMe`/`Automation` (Parrot.pm:86-660).
+// Reached through the `mett` MetaFormat dispatch in [`quicktime_stream`]
+// (QuickTimeStream.pl:312-315 routes `mett` SubDirectory → Parrot::mett).
+// Surfaces drone GPS + flight telemetry for Anafi / Anafi USA / Anafi
+// Ai / Anafi Thermal / Bebop / Bebop 2 / Disco bodies. Gated on the
+// `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod parrot;
 // Sony rtmd — Real-Time MetaData timed records in Sony Alpha A7/A9/FX/
 // RX/Cinema-line MP4/MOV recorders. Faithful port of
 // `Image::ExifTool::Sony::Process_rtmd` (Sony.pm:11566-11602) + the

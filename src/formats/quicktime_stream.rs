@@ -71,7 +71,7 @@ use alloc::{
 
 use crate::{
   datetime::{convert_datetime, convert_unix_time},
-  metadata::{GpsSample, MebxSample, QuickTimeStreamMeta},
+  metadata::{GpsSample, MebxSample, ParrotMeta, QuickTimeStreamMeta},
 };
 
 /// QuickTime epoch offset: seconds between 1904-01-01 and 1970-01-01.
@@ -899,6 +899,12 @@ struct StreamTrack {
   /// `stsd` MetaFormat — the sample-description format code
   /// (QuickTime.pm:7765-7768).
   meta_format: [u8; 4],
+  /// `stsd` MetaType — the `(application/...)` substring extracted from
+  /// the sample-description entry bytes per QuickTime.pm:7769-7774. Empty
+  /// when no `application/...` string was present. Used by the `mett`
+  /// MetaFormat dispatch to switch the Parrot walker between ARCore-TLV
+  /// and drone-`[EP]\d` modes (Parrot.pm:802-822 vs :823-852).
+  meta_type: alloc::string::String,
   /// `mdhd` MediaTimeScale.
   media_ts: u32,
   /// The `stbl` sample tables.
@@ -929,6 +935,7 @@ fn process_samples(
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
 ) {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -955,6 +962,7 @@ fn process_samples(
       camm_out,
       sony_rtmd_out,
       canon_ctmd_out,
+      parrot_out,
     );
   }
 }
@@ -972,6 +980,7 @@ fn decode_one_sample(
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
 ) {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1029,6 +1038,22 @@ fn decode_one_sample(
   // (which may carry a TimeStamp, FocalInfo, and/or ExposureInfo).
   if &track.meta_format == b"CTMD" {
     crate::formats::canon_ctmd::process_ctmd(buff, canon_ctmd_out);
+    return;
+  }
+  // Parrot `mett` MetaFormat (QuickTimeStream.pl:312-315 — the SubDirectory
+  // route into `Image::ExifTool::Parrot::mett` whose PROCESS_PROC is
+  // `Parrot::Process_mett`). Drone metadata samples (Parrot.pm:23-84)
+  // dispatch by 2-char ID `[EP]\d` to per-version V1/V2/V3 binary tables;
+  // ARCore phone-camera variants dispatch by `MetaType` (an `application/
+  // arcore-*` string extracted from the `stsd` entry by QuickTime.pm:7769-
+  // 7774). `process_mett` carries both walker shapes.
+  if &track.meta_format == b"mett" {
+    let meta_type = if track.meta_type.is_empty() {
+      None
+    } else {
+      Some(track.meta_type.as_str())
+    };
+    crate::formats::parrot::process_mett(buff, meta_type, parrot_out);
     return;
   }
   // `tx3g` / …:
@@ -1146,9 +1171,16 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
   let mut fmt = [0u8; 4];
   fmt.copy_from_slice(&data[pos + 4..pos + 8]);
   track.meta_format = fmt;
+  // QuickTime.pm:7769-7774 — MetaType is decoded by matching the regex
+  // `(application[^\0]+)` against the SampleDescription entry bytes
+  // starting at offset 8. Faithful: extract the first `application/...`
+  // run from the entry body. Empty when no match.
+  let entry_end = pos + size;
+  if entry_end > pos + 8 {
+    track.meta_type = scan_application_string(&data[pos + 8..entry_end]);
+  }
   // Child atoms follow the 16-byte SampleDescription header. Scan for
   // `keys` (the `mebx` metadata-key table).
-  let entry_end = pos + size;
   for_each_atom(data, pos + 16, entry_end, |t, body| {
     if t == b"keys" {
       // The `keys` box body is itself `[version+flags:4][count:4]` then the
@@ -1158,6 +1190,36 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
       }
     }
   });
+}
+
+/// QuickTime.pm:7773 — extract the first `application/...` substring
+/// from a `stsd` sample-description entry body, terminated by NUL or
+/// end-of-buffer. Returns an empty string when no match is found.
+/// Faithful: the bundled regex `(application[^\0]+)` matches greedily
+/// from the first occurrence of `"application"` up to (but not
+/// including) the first `\0` byte after that point.
+fn scan_application_string(bytes: &[u8]) -> alloc::string::String {
+  const NEEDLE: &[u8] = b"application";
+  // Sliding window over `bytes` looking for `NEEDLE`. Bail when the
+  // remaining buffer is shorter than the needle (no possible match).
+  if bytes.len() < NEEDLE.len() {
+    return alloc::string::String::new();
+  }
+  let upper = bytes.len() - NEEDLE.len();
+  for i in 0..=upper {
+    if &bytes[i..i + NEEDLE.len()] == NEEDLE {
+      // Run forward until NUL or end.
+      let mut end = i + NEEDLE.len();
+      while end < bytes.len() && bytes[end] != 0 {
+        end += 1;
+      }
+      // Faithful to Perl: the regex matches the entire `application[^\0]+`
+      // run as one capture. Stay UTF-8-lossy-tolerant (the typed layer
+      // matches against the byte content via `is_arcore_meta_type`).
+      return alloc::string::String::from_utf8_lossy(&bytes[i..end]).into_owned();
+    }
+  }
+  alloc::string::String::new()
 }
 
 /// Walk one `trak`, collecting its `HandlerType`, `MediaTimeScale` and (when
@@ -1216,6 +1278,7 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 ///
 /// Returns an empty [`QuickTimeStreamMeta`] for the common case of a video
 /// with no timed metadata (or only deferred-format metadata).
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub(crate) fn extract_stream(
   data: &[u8],
@@ -1224,6 +1287,7 @@ pub(crate) fn extract_stream(
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
 ) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
@@ -1247,6 +1311,7 @@ pub(crate) fn extract_stream(
         camm_out,
         sony_rtmd_out,
         canon_ctmd_out,
+        parrot_out,
       ),
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       b"gps0" => process_gps0(&data[ps..body_end], &mut out),
@@ -1282,6 +1347,7 @@ fn walk_moov(
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
 ) {
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
@@ -1300,6 +1366,7 @@ fn walk_moov(
             camm_out,
             sony_rtmd_out,
             canon_ctmd_out,
+            parrot_out,
           );
         }
       }
@@ -1545,12 +1612,32 @@ mod tests {
     let mut cm = crate::metadata::CammMeta::new();
     let mut sr = crate::metadata::SonyRtmdMeta::new();
     let mut cc = crate::metadata::CanonCtmdMeta::new();
-    let meta = extract_stream(&data, None, &mut gp, &mut cm, &mut sr, &mut cc);
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let meta = extract_stream(&data, None, &mut gp, &mut cm, &mut sr, &mut cc, &mut pr);
     assert!(meta.is_empty());
     assert!(gp.is_empty());
     assert!(cm.is_empty());
     assert!(sr.is_empty());
     assert!(cc.is_empty());
+    assert!(pr.is_empty());
+  }
+
+  #[test]
+  fn scan_application_string_extracts_arcore_metatype() {
+    // QuickTime.pm:7773 — the regex `(application[^\0]+)` captures the
+    // run from "application" up to (not including) the first NUL.
+    let mut bytes = alloc::vec![0u8; 4];
+    bytes.extend_from_slice(b"application/arcore-accel");
+    bytes.push(0);
+    bytes.extend_from_slice(b"trailing-bytes");
+    let s = scan_application_string(&bytes);
+    assert_eq!(s, "application/arcore-accel");
+    // No `application` substring ⇒ empty string.
+    let none = scan_application_string(b"random opaque bytes");
+    assert!(none.is_empty());
+    // Runs all the way to end-of-buffer when no NUL is present.
+    let unterminated = scan_application_string(b"application/x-foo");
+    assert_eq!(unterminated, "application/x-foo");
   }
 
   #[test]

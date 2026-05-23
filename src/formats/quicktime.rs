@@ -55,7 +55,7 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   formats::{gopro, insta360 as insta360_fmt, quicktime_freegps, quicktime_stream},
   metadata::{
-    CammMeta, CanonCtmdMeta, GoProMeta, Insta360Meta, MediaTrack, QuickTimeMeta,
+    CammMeta, CanonCtmdMeta, GoProMeta, Insta360Meta, MediaTrack, ParrotMeta, QuickTimeMeta,
     QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::format_g,
@@ -1404,6 +1404,14 @@ pub struct Meta<'a> {
   /// (QuickTimeStream.pl:3252-3478) and the `INSV_MakerNotes` identity
   /// table (QuickTimeStream.pl:696-707).
   insta360: Insta360Meta,
+  /// **SP4** — Parrot drone `mett` timed-metadata (GPS + flight
+  /// telemetry). Decoded through the `mett` MetaFormat dispatch in
+  /// [`quicktime_stream`]. Empty ([`ParrotMeta::is_empty`]) for a
+  /// non-Parrot video. Faithful port of
+  /// `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) plus
+  /// the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
+  /// `V3`/`TimeStamp` (Parrot.pm:86-551).
+  parrot: ParrotMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1523,6 +1531,19 @@ impl Meta<'_> {
     &self.insta360
   }
 
+  /// **SP4** — Parrot drone `mett` timed metadata. [`ParrotMeta::is_empty`]
+  /// for a non-Parrot video (or one whose `mett` track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::Parrot::Process_mett`
+  /// (Parrot.pm:791-854) plus the per-version binary tables
+  /// `Image::ExifTool::Parrot::V1`/`V2`/`V3` (Parrot.pm:86-539).
+  /// Populated by the `mett` MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn parrot(&self) -> &ParrotMeta {
+    &self.parrot
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1551,6 +1572,11 @@ impl Meta<'_> {
     // source already populated the domain it would write).
     self.gopro.project_into(&mut md);
     self.android_camm.project_into(&mut md);
+    // Parrot mett is on-device-GNSS (drone hardware GPS) — same fidelity
+    // tier as GoPro / CAMM; ordered after CAMM by implementation arrival
+    // (a single file is produced by exactly one body so the tie-break is
+    // hypothetical).
+    self.parrot.project_into(&mut md);
     self.sony_rtmd.project_into(&mut md);
     self.canon_ctmd.project_into(&mut md);
     self.insta360.project_into(&mut md);
@@ -1922,6 +1948,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // metadata sample whose track carries Canon Timed MetaData (CR3 / CRM
   // / MP4 / MOV bodies).
   let mut canon_ctmd_meta = CanonCtmdMeta::new();
+  // **SP4 — Parrot mett**: the `mett` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `parrot_meta` for each timed-
+  // metadata sample whose track carries Parrot drone telemetry. Faithful
+  // port of `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) +
+  // the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
+  // `V3` (Parrot.pm:86-539).
+  let mut parrot_meta = ParrotMeta::new();
   let mut stream = quicktime_stream::extract_stream(
     data,
     create_date_raw,
@@ -1929,6 +1962,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     &mut camm_meta,
     &mut sony_rtmd_meta,
     &mut canon_ctmd_meta,
+    &mut parrot_meta,
   );
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
@@ -1994,6 +2028,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     sony_rtmd: sony_rtmd_meta,
     canon_ctmd: canon_ctmd_meta,
     insta360: insta360_meta,
+    parrot: parrot_meta,
     embedded_exif_deferred,
     file_type,
     mime,

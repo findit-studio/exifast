@@ -341,6 +341,12 @@ pub enum AnyParser {
 /// [`AnyMeta::_Phantom`] variant — present ONLY in a no-format build —
 /// anchors `'a`. Under the `all-formats` default the phantom is `cfg`'d
 /// OUT (Codex CF3).
+// `AnyMeta::QuickTime` carries the QuickTime [`crate::formats::quicktime::Meta`]
+// which accumulates sub-Metas across the SP3 timed-metadata chain (camm,
+// sony_rtmd, canon_ctmd, insta360, gopro, parrot, …) and has grown past
+// 1024 bytes. The architectural fix — boxing the variants — is tracked
+// at issue #106; allow locally so the size-diff doesn't bite each new port.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum AnyMeta<'a> {
