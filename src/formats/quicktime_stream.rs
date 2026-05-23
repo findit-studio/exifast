@@ -925,6 +925,7 @@ fn process_samples(
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -941,7 +942,15 @@ fn process_samples(
     if buff.is_empty() {
       continue;
     }
-    decode_one_sample(buff, track, sample, create_date_raw, out, gopro_out);
+    decode_one_sample(
+      buff,
+      track,
+      sample,
+      create_date_raw,
+      out,
+      gopro_out,
+      camm_out,
+    );
   }
 }
 
@@ -954,6 +963,7 @@ fn decode_one_sample(
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -980,7 +990,23 @@ fn decode_one_sample(
     crate::formats::gopro::process_gopro(buff, gopro_out);
     return;
   }
-  // Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
+  // The `camm` MetaFormat (QuickTimeStream.pl:251-309) — Google's Camera
+  // Motion Metadata. Bundled dispatches by the int16u-LE packet-type at
+  // sample-bytes +2 to one of seven `%QuickTime::camm<N>` tag tables
+  // (camm0..camm7, QuickTimeStream.pl:405-572). Our `process_camm`
+  // (faithful port of `ProcessCAMM`:3481-3506) walks the sample as a
+  // multi-packet stream and dispatches by type internally.
+  //
+  // `create_date_raw` is the raw 1904-epoch `mvhd` CreateDate; we route
+  // it to camm6's GPS-vs-Unix-epoch heuristic
+  // (QuickTimeStream.pl:519) after a 1904→1970 epoch shift via
+  // `android_camm::create_date_to_unix`.
+  if &track.meta_format == b"camm" {
+    let create_date_unix = create_date_raw.map(crate::formats::android_camm::create_date_to_unix);
+    crate::formats::android_camm::process_camm(buff, create_date_unix, camm_out);
+    return;
+  }
+  // Sony `rtmd` / Canon `CTMD` / `tx3g` / …:
   // DEFERRED — these re-dispatch into other ExifTool modules (Sony.pm,
   // Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
   // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
@@ -1170,6 +1196,7 @@ pub(crate) fn extract_stream(
   data: &[u8],
   create_date_raw: Option<u64>,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
@@ -1183,7 +1210,15 @@ pub(crate) fn extract_stream(
     };
     let body_end = pe.min(data.len());
     match &t {
-      b"moov" => walk_moov(data, ps, body_end, create_date_raw, &mut out, gopro_out),
+      b"moov" => walk_moov(
+        data,
+        ps,
+        body_end,
+        create_date_raw,
+        &mut out,
+        gopro_out,
+        camm_out,
+      ),
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       b"gps0" => process_gps0(&data[ps..body_end], &mut out),
       // Top-level DuDuBell / VSYS `gsen` (3-byte accelerometer triples).
@@ -1214,6 +1249,7 @@ fn walk_moov(
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) {
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
@@ -1223,7 +1259,7 @@ fn walk_moov(
         // Only metadata-bearing handlers feed `ProcessSamples`
         // (QuickTimeStream.pl:1315-1331 — `vide`/`soun` are hash-only).
         if is_meta_handler(&track.handler) {
-          process_samples(data, &track, create_date_raw, out, gopro_out);
+          process_samples(data, &track, create_date_raw, out, gopro_out, camm_out);
         }
       }
       // The `moov`-level Novatek `gps ` box (`%eeBox` `'gps ' => 'moov'`,
@@ -1465,9 +1501,11 @@ mod tests {
     let mut data = ftyp;
     data.extend_from_slice(&moov);
     let mut gp = crate::metadata::GoProMeta::new();
-    let meta = extract_stream(&data, None, &mut gp);
+    let mut cm = crate::metadata::CammMeta::new();
+    let meta = extract_stream(&data, None, &mut gp, &mut cm);
     assert!(meta.is_empty());
     assert!(gp.is_empty());
+    assert!(cm.is_empty());
   }
 
   #[test]

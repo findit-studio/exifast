@@ -54,7 +54,7 @@ use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
   formats::{gopro, quicktime_freegps, quicktime_stream},
-  metadata::{GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
+  metadata::{CammMeta, GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
   value::format_g,
 };
 
@@ -1372,6 +1372,11 @@ pub struct Meta<'a> {
   /// scan in `mdat` (see [`crate::formats::gopro`]). Empty
   /// ([`GoProMeta::is_empty`]) for a non-GoPro video.
   gopro: GoProMeta,
+  /// **SP4** — Android Google CAMM (Camera Motion Metadata) — decoded
+  /// through the `camm` MetaFormat dispatch in [`quicktime_stream`]. Empty
+  /// ([`CammMeta::is_empty`]) for a non-Android video (or one whose CAMM
+  /// track is absent).
+  android_camm: CammMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1434,6 +1439,20 @@ impl Meta<'_> {
     &self.gopro
   }
 
+  /// **SP4** — Android Google CAMM (Camera Motion Metadata).
+  /// [`CammMeta::is_empty`] for a non-Android video (or one whose `camm`
+  /// metadata track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::QuickTime::ProcessCAMM`
+  /// (QuickTimeStream.pl:3481-3506) and the seven `%QuickTime::camm<N>` tag
+  /// tables (QuickTimeStream.pl:405-572). Populated by the `camm`
+  /// MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn android_camm(&self) -> &CammMeta {
+    &self.android_camm
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1461,6 +1480,7 @@ impl Meta<'_> {
     // (highest-priority FIRST — each port no-ops if a higher-priority
     // source already populated the domain it would write).
     self.gopro.project_into(&mut md);
+    self.android_camm.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -1816,7 +1836,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // `mdat` outside of a metadata track) and by the moov-level `GPMF`
   // atom walk after the freeGPS scan.
   let mut gopro_meta = GoProMeta::new();
-  let mut stream = quicktime_stream::extract_stream(data, create_date_raw, &mut gopro_meta);
+  // **SP4 — Android CAMM**: the `camm` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `camm_meta` for each timed-metadata
+  // sample whose track carries Google Camera Motion Metadata.
+  let mut camm_meta = CammMeta::new();
+  let mut stream =
+    quicktime_stream::extract_stream(data, create_date_raw, &mut gopro_meta, &mut camm_meta);
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -1864,6 +1889,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     qt,
     stream,
     gopro: gopro_meta,
+    android_camm: camm_meta,
     embedded_exif_deferred,
     file_type,
     mime,

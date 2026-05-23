@@ -21,11 +21,13 @@
 //! `None` for later sub-ports and other formats to fill — the layer is
 //! deliberately extensible.
 
+mod android_camm;
 mod domain;
 mod gopro;
 mod quicktime;
 mod quicktime_stream;
 
+pub use android_camm::{CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammVector3};
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, MetaProjectInto,
 };

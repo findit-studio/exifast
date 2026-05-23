@@ -461,3 +461,316 @@ fn klv(tag: &[u8; 4], fmt: u8, sample_size: u8, count: u16, payload: &[u8]) -> V
   }
   out
 }
+
+// ===========================================================================
+// SP4 — Android Google CAMM (Camera Motion Metadata)
+// ===========================================================================
+
+#[test]
+fn quicktime_camm_decodes_camm5_minimal_gps() {
+  // Synthetic .mov with a `camm` MetaFormat metadata track carrying one
+  // 28-byte camm5 packet (minimal GPS: 3×f64 lat/lon/alt). The walker must
+  // populate `Meta::android_camm` and the MediaMetadata projection must
+  // fill GpsLocation from the first fix.
+  let data = build_mov_with_camm_track(&camm5_packet(37.5, -122.0, 50.0));
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let camm = meta.android_camm();
+  assert!(!camm.is_empty(), "camm5 must populate android_camm");
+  assert_eq!(camm.gps_samples().len(), 1);
+  let s = &camm.gps_samples()[0];
+  assert_eq!(s.packet_type(), 5);
+  assert_eq!(s.latitude(), Some(37.5));
+  assert_eq!(s.longitude(), Some(-122.0));
+  assert_eq!(s.altitude_m(), Some(50.0));
+  // MediaMetadata projects the first fix into GpsLocation.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from camm5");
+  assert_eq!(gps.latitude(), Some(37.5));
+  assert_eq!(gps.longitude(), Some(-122.0));
+  assert_eq!(gps.altitude_m(), Some(50.0));
+}
+
+#[test]
+fn quicktime_camm_decodes_camm6_full_gps_with_date_time() {
+  // Synthetic .mov with a camm6 packet (60 bytes: f64 ts + u32 mm + 2×f64 +
+  // 7×f32). The projected GpsLocation carries the timestamp.
+  let unix_ts = 1_704_067_200.0f64; // 2024-01-01 00:00 UTC
+  let data = build_mov_with_camm_track(&camm6_packet(
+    unix_ts, /* measure_mode */ 3, /* lat */ 40.0, /* lon */ -75.0,
+    /* alt */ 200.0, /* h_acc */ 5.0, /* v_acc */ 10.0, /* v_e */ 1.0,
+    /* v_n */ 2.0, /* v_u */ 0.5, /* spd_acc */ 0.1,
+  ));
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let camm = meta.android_camm();
+  assert_eq!(camm.gps_samples().len(), 1);
+  let s = &camm.gps_samples()[0];
+  assert_eq!(s.packet_type(), 6);
+  assert_eq!(s.latitude(), Some(40.0));
+  assert_eq!(s.longitude(), Some(-75.0));
+  assert!((s.altitude_m().unwrap() - 200.0).abs() < 1e-3);
+  assert_eq!(s.measure_mode(), Some(3));
+  assert_eq!(s.horizontal_accuracy_m(), Some(5.0));
+  assert_eq!(s.velocity_east_mps(), Some(1.0));
+  // Date/time renders via convert_unix_time + 'Z'.
+  assert_eq!(s.date_time(), Some("2024:01:01 00:00:00Z"));
+  // MediaMetadata projection picks up the timestamp.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from camm6");
+  assert_eq!(gps.timestamp(), Some("2024:01:01 00:00:00Z"));
+}
+
+#[test]
+fn quicktime_camm_decodes_motion_records() {
+  // Synthetic .mov with a camm track carrying the four "motion" packet
+  // types in a single sample: camm1 (exposure), camm2 (gyro), camm3
+  // (accel), camm7 (magnetic field). All must populate their respective
+  // Vec in android_camm.
+  let mut payload = Vec::new();
+  payload.extend_from_slice(&camm_packet(
+    1,
+    &[
+      &500_000_000i32.to_le_bytes()[..], // 0.5 s pixel exposure
+      &200_000_000i32.to_le_bytes()[..], // 0.2 s skew
+    ]
+    .concat(),
+  ));
+  payload.extend_from_slice(&camm_packet(2, &vec3_le(0.1, 0.2, 0.3)));
+  payload.extend_from_slice(&camm_packet(3, &vec3_le(0.0, 0.0, 9.81)));
+  payload.extend_from_slice(&camm_packet(7, &vec3_le(25.0, -10.0, 40.0)));
+  let data = build_mov_with_camm_track(&payload);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let camm = meta.android_camm();
+  assert_eq!(camm.exposure().len(), 1);
+  assert!((camm.exposure()[0].pixel_exposure_time_s() - 0.5).abs() < 1e-9);
+  assert!((camm.exposure()[0].rolling_shutter_skew_time_s() - 0.2).abs() < 1e-9);
+  assert_eq!(camm.angular_velocity().len(), 1);
+  assert!((camm.angular_velocity()[0].x() - 0.1).abs() < 1e-6);
+  assert_eq!(camm.acceleration().len(), 1);
+  assert!((camm.acceleration()[0].z() - 9.81).abs() < 1e-3);
+  assert_eq!(camm.magnetic_field().len(), 1);
+  assert!((camm.magnetic_field()[0].z() - 40.0).abs() < 1e-3);
+}
+
+#[test]
+fn quicktime_camm_round_trip_via_media_metadata_priority() {
+  // The MediaMetadata GPS projection orders sources GoPro → camm → stream;
+  // with NO GoPro data, a camm5 packet wins over an absent stream/freeGPS
+  // sample.
+  let data = build_mov_with_camm_track(&camm5_packet(1.23, 4.56, 100.0));
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  assert!(meta.gopro().is_empty());
+  assert!(meta.stream().is_empty());
+  assert!(!meta.android_camm().is_empty());
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("projected from camm");
+  assert!((gps.latitude().unwrap() - 1.23).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 4.56).abs() < 1e-9);
+}
+
+/// Real-fixture conformance stub for Android CAMM.
+///
+/// Bundled exiftool has no Pixel/Samsung CAMM `.mp4` fixture in
+/// `t/images/`; the synthetic-packet unit tests carry the algorithmic
+/// coverage. When a small camm5/camm6 `.mp4` fixture lands (per follow-up
+/// issue #60), unignore this test and add the round-trip assertions
+/// against `perl /Users/user/Develop/findit-studio/exiftool/exiftool -j
+/// -G -ee <fixture>`.
+#[test]
+#[ignore = "needs real Pixel/Samsung CAMM .mp4 fixture; see #60"]
+fn camm_real_fixture_conformance() {
+  // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
+}
+
+// --- camm packet builders ---------------------------------------------------
+
+/// Build a CAMM packet `[reserved:2 (=0)][type:int16u-le][payload]`.
+fn camm_packet(t: u16, payload: &[u8]) -> Vec<u8> {
+  let mut v = Vec::with_capacity(4 + payload.len());
+  v.extend_from_slice(&[0u8, 0u8]); // reserved
+  v.extend_from_slice(&t.to_le_bytes());
+  v.extend_from_slice(payload);
+  v
+}
+
+fn camm5_packet(lat: f64, lon: f64, alt: f64) -> Vec<u8> {
+  let mut payload = Vec::with_capacity(24);
+  payload.extend_from_slice(&lat.to_le_bytes());
+  payload.extend_from_slice(&lon.to_le_bytes());
+  payload.extend_from_slice(&alt.to_le_bytes());
+  camm_packet(5, &payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn camm6_packet(
+  gps_dt: f64,
+  measure_mode: u32,
+  lat: f64,
+  lon: f64,
+  alt: f32,
+  h_acc: f32,
+  v_acc: f32,
+  v_e: f32,
+  v_n: f32,
+  v_u: f32,
+  spd_acc: f32,
+) -> Vec<u8> {
+  let mut payload = Vec::with_capacity(56);
+  payload.extend_from_slice(&gps_dt.to_le_bytes());
+  payload.extend_from_slice(&measure_mode.to_le_bytes());
+  payload.extend_from_slice(&lat.to_le_bytes());
+  payload.extend_from_slice(&lon.to_le_bytes());
+  payload.extend_from_slice(&alt.to_le_bytes());
+  payload.extend_from_slice(&h_acc.to_le_bytes());
+  payload.extend_from_slice(&v_acc.to_le_bytes());
+  payload.extend_from_slice(&v_e.to_le_bytes());
+  payload.extend_from_slice(&v_n.to_le_bytes());
+  payload.extend_from_slice(&v_u.to_le_bytes());
+  payload.extend_from_slice(&spd_acc.to_le_bytes());
+  camm_packet(6, &payload)
+}
+
+fn vec3_le(x: f32, y: f32, z: f32) -> Vec<u8> {
+  let mut v = Vec::with_capacity(12);
+  v.extend_from_slice(&x.to_le_bytes());
+  v.extend_from_slice(&y.to_le_bytes());
+  v.extend_from_slice(&z.to_le_bytes());
+  v
+}
+
+/// Build a minimal but valid .mov whose moov contains ONE metadata `trak`
+/// with `mhlr/meta` handler + a `mebx`-style stsd whose first 4-byte
+/// "format" code is `camm`. The track's single sample is `sample_bytes`,
+/// stored at the start of `mdat`.
+fn build_mov_with_camm_track(sample_bytes: &[u8]) -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+
+  let sample_len = sample_bytes.len() as u32;
+
+  // mdat — sample data lives at offset (ftyp.len() + 8) from file start
+  // (after ftyp + mdat 8-byte header). The stco entry below points at it.
+  let mut mdat = (sample_len + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(sample_bytes);
+  let sample_file_offset_val = (ftyp.len() as u32) + 8;
+
+  // mvhd (v0, 100 bytes payload).
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mvhd.extend_from_slice(&[0u8; 8]); // create/modify
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // duration
+  mvhd.extend_from_slice(&[0u8; 80]); // rest
+
+  // hdlr (mhlr/meta), 33-byte payload incl. version+flags+pre_defined+type+reserved+name(empty).
+  let mut hdlr = Vec::new();
+  hdlr.extend_from_slice(&[0u8; 4]); // version+flags
+  hdlr.extend_from_slice(b"mhlr"); // pre_defined (matches mebx fixture)
+  hdlr.extend_from_slice(b"meta"); // handler_type — meta_handler dispatches
+  hdlr.extend_from_slice(&[0u8; 12]); // reserved
+  hdlr.push(0); // name (empty)
+
+  // mdhd (v0, 24-byte payload).
+  let mut mdhd = Vec::new();
+  mdhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mdhd.extend_from_slice(&[0u8; 8]); // create/modify
+  mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mdhd.extend_from_slice(&1000u32.to_be_bytes()); // duration
+  mdhd.extend_from_slice(&[0u8; 4]); // language+quality
+
+  // stsd — 1 entry whose first 4-byte format code is `camm`.
+  // [version+flags:4][count:4][entry-size:4][format:4][reserved:6][data-ref-index:2]
+  let mut stsd_entry = Vec::new();
+  // Entry: size(=16)+format=camm+6 reserved bytes+data-ref-index(=1).
+  stsd_entry.extend_from_slice(&16u32.to_be_bytes());
+  stsd_entry.extend_from_slice(b"camm");
+  stsd_entry.extend_from_slice(&[0u8; 6]);
+  stsd_entry.extend_from_slice(&1u16.to_be_bytes());
+  let mut stsd = Vec::new();
+  stsd.extend_from_slice(&[0u8; 4]); // version+flags
+  stsd.extend_from_slice(&1u32.to_be_bytes()); // entry count
+  stsd.extend_from_slice(&stsd_entry);
+
+  // stts: 1 entry, count=1 delta=1000.
+  let mut stts = Vec::new();
+  stts.extend_from_slice(&[0u8; 4]);
+  stts.extend_from_slice(&1u32.to_be_bytes());
+  stts.extend_from_slice(&1u32.to_be_bytes());
+  stts.extend_from_slice(&1000u32.to_be_bytes());
+
+  // stsc: 1 entry (first_chunk=1, samples_per_chunk=1, desc_index=1).
+  let mut stsc = Vec::new();
+  stsc.extend_from_slice(&[0u8; 4]);
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+
+  // stsz: 1 sample, explicit size.
+  let mut stsz = Vec::new();
+  stsz.extend_from_slice(&[0u8; 4]); // version+flags
+  stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size=0 (variable)
+  stsz.extend_from_slice(&1u32.to_be_bytes()); // count
+  stsz.extend_from_slice(&sample_len.to_be_bytes());
+
+  // stco: 1 chunk offset (pointing at the sample inside mdat).
+  let mut stco = Vec::new();
+  stco.extend_from_slice(&[0u8; 4]);
+  stco.extend_from_slice(&1u32.to_be_bytes());
+  stco.extend_from_slice(&sample_file_offset_val.to_be_bytes());
+
+  // Assemble stbl from the tables.
+  let mut stbl = Vec::new();
+  stbl.extend_from_slice(&atom_bytes(b"stsd", &stsd));
+  stbl.extend_from_slice(&atom_bytes(b"stts", &stts));
+  stbl.extend_from_slice(&atom_bytes(b"stsc", &stsc));
+  stbl.extend_from_slice(&atom_bytes(b"stsz", &stsz));
+  stbl.extend_from_slice(&atom_bytes(b"stco", &stco));
+
+  // minf with nmhd + stbl.
+  let nmhd = atom_bytes(b"nmhd", &[0u8; 4]);
+  let mut minf = nmhd;
+  minf.extend_from_slice(&atom_bytes(b"stbl", &stbl));
+
+  // mdia with mdhd + hdlr + minf.
+  let mut mdia = atom_bytes(b"mdhd", &mdhd);
+  mdia.extend_from_slice(&atom_bytes(b"hdlr", &hdlr));
+  mdia.extend_from_slice(&atom_bytes(b"minf", &minf));
+
+  // trak with tkhd (minimal) + mdia.
+  let tkhd_payload = vec![0u8; 84];
+  let mut trak = atom_bytes(b"tkhd", &tkhd_payload);
+  trak.extend_from_slice(&atom_bytes(b"mdia", &mdia));
+
+  // moov with mvhd + trak.
+  let mut moov = atom_bytes(b"mvhd", &mvhd);
+  moov.extend_from_slice(&atom_bytes(b"trak", &trak));
+
+  let mut out = ftyp;
+  // Mirror the fixture order: ftyp / mdat / moov is also valid; we use
+  // ftyp / moov / mdat which matches build_mov_with_gpro6_in_mdat.
+  // Note: stco offset MUST land inside the mdat we emit; we placed mdat
+  // RIGHT AFTER ftyp, so sample_file_offset is correct.
+  out.extend_from_slice(&mdat);
+  out.extend_from_slice(&atom_bytes(b"moov", &moov));
+  out
+}
+
+/// Wrap `body` as a top-level atom `[size:u32 BE][type:4][body]`.
+fn atom_bytes(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
+  let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+  v.extend_from_slice(t);
+  v.extend_from_slice(body);
+  v
+}

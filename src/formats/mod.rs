@@ -65,6 +65,13 @@ pub mod quicktime_freegps;
 // metadata is always reached through a QuickTime container.
 #[cfg(feature = "quicktime")]
 pub mod gopro;
+// Android CAMM — Google Camera Motion Metadata. Faithful port of
+// `Image::ExifTool::QuickTime::ProcessCAMM` (QuickTimeStream.pl:3481-3506) +
+// the seven `%QuickTime::camm0..camm7` tag tables (QuickTimeStream.pl:405-
+// 572). Reached through the `camm` MetaFormat dispatch in
+// [`quicktime_stream`]. Gated on the `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod android_camm;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]
