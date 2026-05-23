@@ -26,6 +26,7 @@ mod domain;
 mod gopro;
 mod quicktime;
 mod quicktime_stream;
+mod sony_rtmd;
 
 pub use android_camm::{CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammVector3};
 pub use domain::{
@@ -34,3 +35,4 @@ pub use domain::{
 pub use gopro::{GoProGpsSample, GoProMeta};
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
+pub use sony_rtmd::{SonyRtmdCameraSnapshot, SonyRtmdGpsSample, SonyRtmdMeta};

@@ -72,9 +72,17 @@ pub mod gopro;
 // [`quicktime_stream`]. Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod android_camm;
+// Sony rtmd — Real-Time MetaData timed records in Sony Alpha A7/A9/FX/
+// RX/Cinema-line MP4/MOV recorders. Faithful port of
+// `Image::ExifTool::Sony::Process_rtmd` (Sony.pm:11566-11602) + the
+// `Image::ExifTool::Sony::rtmd` tag table (Sony.pm:10686-10850). Reached
+// through the `rtmd` MetaFormat dispatch in [`quicktime_stream`]. Gated
+// on the `quicktime` feature.
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]
 pub mod red;
+#[cfg(feature = "quicktime")]
+pub mod sony_rtmd;
 #[cfg(feature = "wavpack")]
 pub mod wavpack;
