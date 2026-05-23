@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_usercomment_ascii.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "ExifIFD:UserComment": "Hello World"
+}]

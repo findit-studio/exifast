@@ -145,6 +145,59 @@ fn resolve_file_type(
   }
 }
 
+/// Faithful `DoProcessTIFF` file-type finalization (ExifTool.pm:8685-8694) for
+/// an accepted Exif/TIFF parse on the `Detected` path. `DoProcessTIFF` does
+/// NOT call the bare `SetFileType()` — it computes a `$t` argument from the
+/// directory's PARENT type and the TIFF/RAW base-type rule, then
+/// `SetFileType($t)`:
+/// ```text
+/// my $fileType = $$dirInfo{Parent} || '';     # the candidate's Parent (8546)
+/// ...
+/// if ($fileType and not $$self{VALUE}{FileType}) {
+///     my $lookup   = $fileTypeLookup{$fileType};                 # (alias-deref)
+///     my $baseType = ...first module of $lookup, or '';
+///     my $t = ($baseType eq 'TIFF' or $fileType =~ /RAW/) ? $fileType : undef;
+///     $self->SetFileType($t);
+/// }
+/// ```
+/// So a TIFF-backed SUBTYPE extension (`.fff`/`.3fr`/`.nef`/…) — whose
+/// `Parent` is the uppercased extension and whose lookup root is `TIFF` (or
+/// whose Parent matches `/RAW/`) — promotes `File:FileType` to that subtype,
+/// NOT the literal `"TIFF"`. A plain `.tif` has `Parent == "TIFF"` (root
+/// `TIFF`) ⇒ `$t = "TIFF"`; an embedded/dotless TIFF has `Parent == ""` ⇒ the
+/// guard's `$fileType` is falsey ⇒ bundled never re-finalizes here, leaving
+/// the detection-time `SetFileType()` (== bare detected `"TIFF"`).
+///
+/// `base_type` is `$$self{FILE_TYPE}` (the detection `$type`, always `"TIFF"`
+/// for the standalone-TIFF dispatch); `parent_type` is the candidate's
+/// `$dirInfo{Parent}` ([`crate::filetype::DetectionCandidate::parent_type`]).
+#[cfg(feature = "exif")]
+fn tiff_finalize_file_type(
+  base_type: &str,
+  parent_type: &str,
+  ext: Option<&str>,
+  print_conv: bool,
+) -> FileTypeTriplet {
+  // ExifTool.pm:8685 `if ($fileType and ...)` — an empty Parent (dotless /
+  // embedded TIFF) skips the re-finalization; bundled keeps the bare
+  // detected `"TIFF"` from the detection-time `SetFileType()`.
+  if parent_type.is_empty() {
+    return resolve_file_type(base_type, None, ext, print_conv);
+  }
+  // ExifTool.pm:8687-8689 `$baseType` = first module of `$fileType`'s row.
+  let base_module = crate::filetype::file_type_base_module(parent_type);
+  // ExifTool.pm:8690 `$t = ($baseType eq 'TIFF' or $fileType =~ /RAW/) ?
+  // $fileType : undef`.
+  let t: Option<&str> = if base_module == "TIFF" || parent_type.contains("RAW") {
+    Some(parent_type)
+  } else {
+    None
+  };
+  // ExifTool.pm:8693 `$self->SetFileType($t)` — `$$self{FILE_TYPE}` stays
+  // the detection `$type` (`base_type`), the explicit arg is `$t`.
+  resolve_file_type(base_type, t, ext, print_conv)
+}
+
 /// Pure `OverrideFileType` resolution (ExifTool.pm:9712-9730) — the
 /// COMPUTATION half of [`ParseContext::override_file_type`]. Returns the
 /// `(FileType, FileTypeExtension-shown, Option<MIMEType>)` to overwrite in
@@ -379,7 +432,10 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     };
     // Faithful closed-dispatch parse. A Rust-level fatal (unreachable for the
     // ported formats — uninhabited error enums) maps to "not this candidate".
-    let meta = match parser.parse_any(data, &mut shared, ext_ref) {
+    // `cand.header_skip()` is the unknown-leading-header byte count (Perl
+    // `$skip`, `ExifTool.pm:3029`) for the terminal JPEG/TIFF candidate — `0`
+    // for every ordinary candidate; the JPEG/TIFF arm slices `data` at it.
+    let meta = match parser.parse_any(data, &mut shared, ext_ref, cand.header_skip()) {
       Ok(Some(meta)) => meta,
       Ok(None) => {
         // Rejected candidate: reset shared so partial side effects don't leak.
@@ -392,98 +448,139 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
       }
     };
 
-    // ----- Finalize File:* per the typed Meta's plan ---------------------
-    use crate::format_parser::FileTypeFinalize;
-    match meta.finalize_file_type() {
-      FileTypeFinalize::Detected => {
-        let t = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
-        insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
-        insert(
-          &mut obj,
-          "File:FileTypeExtension".into(),
-          serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
-        );
-        insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
-      }
-      FileTypeFinalize::Explicit(set) => {
-        let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
-        insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
-        insert(
-          &mut obj,
-          "File:FileTypeExtension".into(),
-          serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
-        );
-        insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
-      }
-      FileTypeFinalize::DetectedThenOverride(target) => {
-        // SetFileType() (detected) then OverrideFileType(target): the override
-        // replaces FileType + FileTypeExtension in place, and MIMEType only
-        // when known. Compose them: the override values win where present.
-        let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
-        let (ov_ft, ov_ext, ov_mime) = resolve_override_file_type(target, print_conv_enabled);
-        insert(&mut obj, "File:FileType".into(), Value::String(ov_ft));
-        insert(
-          &mut obj,
-          "File:FileTypeExtension".into(),
-          serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
-        );
-        insert(
-          &mut obj,
-          "File:MIMEType".into(),
-          Value::String(ov_mime.unwrap_or(base.mime_type)),
-        );
-      }
-      FileTypeFinalize::ExplicitThenLiteral(payload) => {
-        // SetFileType(set) then raw-replace FileType value with `literal`; the
-        // extension + MIME come from `set` (AIFF DjVu multi-page, AIFF.pm:206).
-        let (set, literal) = (payload.set(), payload.literal());
-        let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
-        insert(
-          &mut obj,
-          "File:FileType".into(),
-          Value::String(literal.to_string()),
-        );
-        insert(
-          &mut obj,
-          "File:FileTypeExtension".into(),
-          serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
-        );
-        insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
-      }
-      FileTypeFinalize::ExplicitWithMime(payload) => {
-        // SetFileType($set, $mime): FileType + FileTypeExtension come from the
-        // explicit `set` (via resolve_file_type), but the MIMEType is the
-        // parser-supplied `mime` — NOT the generic %mimeType lookup, which
-        // lacks M4A/M4V/M4B (QuickTime.pm:10008, F2).
-        let (set, mime) = (payload.set(), payload.mime());
-        let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
-        insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
-        insert(
-          &mut obj,
-          "File:FileTypeExtension".into(),
-          serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
-        );
-        insert(
-          &mut obj,
-          "File:MIMEType".into(),
-          Value::String(mime.to_string()),
-        );
-      }
+    // ----- Unknown-leading-header reset (ExifTool.pm:3069-3073) -----------
+    // The detector's terminal candidate scanned PAST an unknown `header_skip`-
+    // byte header to find this JPEG/TIFF (`ExifTool.pm:3026-3034`). After the
+    // parser succeeds, bundled `DeleteTag`s `FileType`, `FileTypeExtension`
+    // AND `MIMEType` ("Reset file type due to unknown header") — so a
+    // junk-prefixed JPEG/TIFF emits NO `File:*` triplet, only the recovered
+    // tags and the detection-time `Warn`. The warning is raised at detection
+    // (`ExifTool.pm:3033`), BEFORE the parser runs, so it precedes — and wins
+    // over — any parser warning in the FIRST-warning `%noDups` slot.
+    if cand.after_unknown_header() {
+      warning.get_or_insert_with(|| {
+        std::format!(
+          "Processing {}-like data after unknown {}-byte header",
+          ft,
+          cand.header_skip()
+        )
+      });
     }
 
-    // ----- MIME override (Real.pm:653-657 single-stream override) ----------
-    // After `SetFileType` resolves the engine table-derived `File:MIMEType`,
-    // certain typed Metas can supply a CONTENT-DERIVED MIME that overrides
-    // the table value (`$$self{VALUE}{MIMEType} = $mime`). Real.pm's RM
-    // path does this when exactly one stream has a non-`logical-fileinfo`
-    // MIME. The override must run BEFORE the format-tag emission below so
-    // `%noDups` first-wins doesn't lock the table value.
-    if let Some(mime) = meta_mime_override(&meta) {
-      // The base `insert` macro is `or_insert` (first-wins); we need to
-      // REPLACE the just-inserted `File:MIMEType` entry. Use direct
-      // `insert` to write over.
-      obj.insert("File:MIMEType".into(), Value::String(mime));
-    }
+    // ----- Finalize File:* per the typed Meta's plan ---------------------
+    // SKIPPED entirely after an unknown leading header — bundled deletes the
+    // whole `File:*` triplet (above), so the engine simply never inserts it.
+    use crate::format_parser::FileTypeFinalize;
+    if !cand.after_unknown_header() {
+      match meta.finalize_file_type() {
+        FileTypeFinalize::Detected => {
+          // The Exif/TIFF parser is `DoProcessTIFF`, which finalizes via
+          // `SetFileType($t)` where `$t` is derived from the candidate's
+          // PARENT type (ExifTool.pm:8685-8694) — so a TIFF-backed subtype
+          // extension (`.fff`/`.3fr`/`.nef`/…) promotes to that subtype, not
+          // the literal `"TIFF"`. Every OTHER `Detected` parser calls the bare
+          // `SetFileType()` (no `$t`), and its candidate's `Parent` equals its
+          // own type (`parent_of` differs from the type only for a `TIFF`
+          // candidate), so the parent-aware path would be a faithful no-op for
+          // them too — but routing it only through the Exif arm keeps the
+          // TIFF/RAW-specific `$baseType` rule scoped to `DoProcessTIFF`.
+          #[cfg(feature = "exif")]
+          let t = if matches!(&meta, crate::format_parser::AnyMeta::Exif(_)) {
+            tiff_finalize_file_type(ft, cand.parent_type(), ext_ref, print_conv_enabled)
+          } else {
+            resolve_file_type(ft, None, ext_ref, print_conv_enabled)
+          };
+          #[cfg(not(feature = "exif"))]
+          let t = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
+        }
+        FileTypeFinalize::Explicit(set) => {
+          let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
+        }
+        FileTypeFinalize::DetectedThenOverride(target) => {
+          // SetFileType() (detected) then OverrideFileType(target): the override
+          // replaces FileType + FileTypeExtension in place, and MIMEType only
+          // when known. Compose them: the override values win where present.
+          let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+          let (ov_ft, ov_ext, ov_mime) = resolve_override_file_type(target, print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(ov_ft));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(ov_mime.unwrap_or(base.mime_type)),
+          );
+        }
+        FileTypeFinalize::ExplicitThenLiteral(payload) => {
+          // SetFileType(set) then raw-replace FileType value with `literal`; the
+          // extension + MIME come from `set` (AIFF DjVu multi-page, AIFF.pm:206).
+          let (set, literal) = (payload.set(), payload.literal());
+          let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
+          insert(
+            &mut obj,
+            "File:FileType".into(),
+            Value::String(literal.to_string()),
+          );
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(&mut obj, "File:MIMEType".into(), Value::String(t.mime_type));
+        }
+        FileTypeFinalize::ExplicitWithMime(payload) => {
+          // SetFileType($set, $mime): FileType + FileTypeExtension come from the
+          // explicit `set` (via resolve_file_type), but the MIMEType is the
+          // parser-supplied `mime` — NOT the generic %mimeType lookup, which
+          // lacks M4A/M4V/M4B (QuickTime.pm:10008, F2).
+          let (set, mime) = (payload.set(), payload.mime());
+          let t = resolve_file_type(ft, Some(set), ext_ref, print_conv_enabled);
+          insert(&mut obj, "File:FileType".into(), Value::String(t.file_type));
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&t.file_type_extension).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(mime.to_string()),
+          );
+        }
+      }
+
+      // ----- MIME override (Real.pm:653-657 single-stream override) ----------
+      // After `SetFileType` resolves the engine table-derived `File:MIMEType`,
+      // certain typed Metas can supply a CONTENT-DERIVED MIME that overrides
+      // the table value (`$$self{VALUE}{MIMEType} = $mime`). Real.pm's RM
+      // path does this when exactly one stream has a non-`logical-fileinfo`
+      // MIME. The override must run BEFORE the format-tag emission below so
+      // `%noDups` first-wins doesn't lock the table value. Skipped with the
+      // rest of the `File:*` triplet after an unknown leading header.
+      if let Some(mime) = meta_mime_override(&meta) {
+        // The base `insert` macro is `or_insert` (first-wins); we need to
+        // REPLACE the just-inserted `File:MIMEType` entry. Use direct
+        // `insert` to write over.
+        obj.insert("File:MIMEType".into(), Value::String(mime));
+      }
+    } // end `if !cand.after_unknown_header()` — `File:*` finalization
 
     // ----- Format tags + diagnostics via the typed tag emission ----------
     // Drive the typed Meta's inherent `serialize_tags` into a `TagMap` (the
@@ -868,6 +965,59 @@ mod tests {
     // Detected PDF + $ext=AI ⇒ stays PDF.
     let t2 = resolve_file_type("PDF", None, Some("AI"), true);
     assert_eq!(t2.file_type, "PDF", "multi-row ext ⇒ no promotion");
+  }
+
+  #[cfg(feature = "exif")]
+  #[test]
+  fn tiff_subtype_finalizes_to_parent_not_tiff() {
+    // Codex F3: `DoProcessTIFF` finalizes via `SetFileType($t)` where `$t` is
+    // the candidate's PARENT type, not the bare detected `"TIFF"`
+    // (ExifTool.pm:8685-8694). For a TIFF-backed subtype extension the
+    // detection candidate is `file_type()=="TIFF"` with
+    // `parent_type()==$$self{FILE_EXT}` (the uppercased ext), so the
+    // finalization must promote to the subtype. Ground-truth from bundled
+    // `perl exiftool`'s DoProcessTIFF `$t` + SetFileType (oracle 2026-05-29).
+    for (parent_ext, want_type, want_ext_lc, want_mime) in [
+      ("FFF", "FFF", "fff", "image/x-hasselblad-fff"),
+      ("3FR", "3FR", "3fr", "image/x-hasselblad-3fr"),
+      ("NEF", "NEF", "nef", "image/x-nikon-nef"),
+      ("RAW", "RAW", "raw", "image/x-raw"),
+    ] {
+      // The engine passes `base_type = "TIFF"` (the detection `$type`),
+      // `parent_type` and `ext` both == the file extension (`$tiffType ==
+      // $$self{FILE_EXT}`).
+      let t = tiff_finalize_file_type("TIFF", parent_ext, Some(parent_ext), true);
+      assert_eq!(t.file_type, want_type, "{parent_ext}: promoted FileType");
+      assert_eq!(
+        t.file_type_extension,
+        TagValue::Str(want_ext_lc.into()),
+        "{parent_ext}: FileTypeExtension"
+      );
+      assert_eq!(t.mime_type, want_mime, "{parent_ext}: MIMEType");
+    }
+
+    // A plain `.tif` has `parent_type == "TIFF"` (root TIFF) ⇒ `$t = "TIFF"` ⇒
+    // stays TIFF (no spurious promotion).
+    let tif = tiff_finalize_file_type("TIFF", "TIFF", Some("TIFF"), true);
+    assert_eq!(tif.file_type, "TIFF");
+    assert_eq!(tif.mime_type, "image/tiff");
+
+    // An embedded / dotless TIFF has `parent_type == ""` ⇒ the
+    // `if ($fileType ...)` guard is FALSE ⇒ bundled never re-finalizes here,
+    // leaving the detection-time bare `"TIFF"`.
+    let embedded = tiff_finalize_file_type("TIFF", "", None, true);
+    assert_eq!(embedded.file_type, "TIFF");
+    assert_eq!(embedded.mime_type, "image/tiff");
+
+    // A subtype whose lookup root is NOT TIFF and whose Parent doesn't match
+    // /RAW/ would yield `$t = undef` ⇒ falls back to the detected base
+    // `"TIFF"`. (`X3F`'s root is `X3F`, not TIFF.) Faithful even though no
+    // real X3F file dispatches through DoProcessTIFF.
+    let non_tiff_root = tiff_finalize_file_type("TIFF", "X3F", Some("X3F"), true);
+    assert_eq!(
+      non_tiff_root.file_type, "TIFF",
+      "non-TIFF-root parent ⇒ $t=undef ⇒ stays detected TIFF"
+    );
   }
 
   #[test]

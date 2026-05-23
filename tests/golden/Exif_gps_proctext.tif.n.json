@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "Exif_gps_proctext.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "II",
+  "GPS:GPSProcessingMethod": "GPS",
+  "GPS:GPSAreaInformation": "Tokyo"
+}]

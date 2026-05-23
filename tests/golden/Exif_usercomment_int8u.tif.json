@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_usercomment_int8u.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "ExifIFD:UserComment": "Hello World"
+}]

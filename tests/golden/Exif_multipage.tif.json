@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "Exif_multipage.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "Canon EOS R",
+  "IFD0:Orientation": "Horizontal (normal)",
+  "IFD1:Compression": "JPEG (old-style)",
+  "IFD1:ThumbnailOffset": 0,
+  "IFD1:ThumbnailLength": 0,
+  "IFD2:Compression": "Uncompressed",
+  "IFD2:Software": "exifast IFD2",
+  "IFD2:Orientation": "Rotate 270 CW"
+}]

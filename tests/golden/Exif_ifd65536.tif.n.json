@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "Exif_ifd65536.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "Canon EOS R",
+  "IFD0:Compression": 6,
+  "IFD65534:Compression": 1,
+  "IFD65534:Software": "exifast IFD65534",
+  "IFD65534:Orientation": 7,
+  "IFD65535:Compression": 1,
+  "IFD65535:Software": "exifast IFD65535",
+  "IFD65535:Orientation": 8,
+  "IFD65536:Compression": 1,
+  "IFD65536:Software": "exifast IFD65536",
+  "IFD65536:Orientation": 1
+}]

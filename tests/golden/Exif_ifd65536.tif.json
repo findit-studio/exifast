@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "Exif_ifd65536.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "Canon EOS R",
+  "IFD0:Compression": "JPEG (old-style)",
+  "IFD65534:Compression": "Uncompressed",
+  "IFD65534:Software": "exifast IFD65534",
+  "IFD65534:Orientation": "Mirror horizontal and rotate 90 CW",
+  "IFD65535:Compression": "Uncompressed",
+  "IFD65535:Software": "exifast IFD65535",
+  "IFD65535:Orientation": "Rotate 270 CW",
+  "IFD65536:Compression": "Uncompressed",
+  "IFD65536:Software": "exifast IFD65536",
+  "IFD65536:Orientation": "Horizontal (normal)"
+}]

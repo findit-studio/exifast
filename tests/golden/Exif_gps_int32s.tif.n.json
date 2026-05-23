@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "Exif_gps_int32s.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "II",
+  "IFD0:Orientation": 1,
+  "GPS:GPSVersionID": "2 3 0 0"
+}]

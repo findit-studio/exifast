@@ -84,7 +84,19 @@ use exifast::{
 ///   is_xmp_subdirectory_dispatch`). Pinned by
 ///   `tests/conformance.rs::flash_xmp_livexml_subdirectory_deferred_conformance`
 ///   (#[ignore]d).
-const NOT_ACTIVE: &[&str] = &["AIFF_id3.aif", "FLAC.ogg", "flash_xmp_livexml.flv"];
+/// - `Exif_makernote.tif` — the Exif port captures the MakerNote (0x927c)
+///   raw bytes but DEFERS vendor parsing to the MakerNotes wave; bundled
+///   `perl exiftool` emits an `ExifTool:Warning` (or MakerNotes:* tags for
+///   a recognized vendor) the exifast Exif port does not. 4-surface
+///   accept-defer (see `tests/conformance.rs::
+///   exif_makernote_subdirectory_deferred_conformance`, the
+///   `SubDirKind::MakerNote` code comment, and docs/tracking.md).
+const NOT_ACTIVE: &[&str] = &[
+  "AIFF_id3.aif",
+  "FLAC.ogg",
+  "flash_xmp_livexml.flv",
+  "Exif_makernote.tif",
+];
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -126,7 +138,10 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
     let Some(parser) = any_parser_for(ft) else {
       continue;
     };
-    match parser.parse_any(data, &mut shared, ext_ref) {
+    // `cand.header_skip()` threads the unknown-leading-header byte count for
+    // the terminal JPEG/TIFF candidate (`0` for ordinary candidates) — same
+    // dispatch the engine's `extract_info` runs.
+    match parser.parse_any(data, &mut shared, ext_ref, cand.header_skip()) {
       Ok(Some(meta)) => return Some(meta),
       Ok(None) => shared = SharedFlags::new(),
       Err(_) => shared = SharedFlags::new(),
@@ -186,7 +201,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_231() {
+fn typed_serde_path_equals_writer_path_and_golden_all_265() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -656,12 +671,207 @@ fn typed_serde_path_equals_writer_path_and_golden_all_231() {
   // an in-band NUL followed by non-zero stale text) — pinning that
   // `Charset.pm:326`'s `Recompose` runs `s/\0.*//s` and TRUNCATES the UTF-8
   // output at the first NUL, so the oracle emits `"E"` (not `"EifTool"`).
+  // ----- PR #36 / FORMATS.md rows 13-14 (Exif+GPS) ----------------------
+  // The chronology below is from the lib/exif-gps branch (forked before
+  // Flash/MXF/QuickTime landed in main, so its `139 → 149` collapses Real's
+  // multi-step chain into one recap). The post-recap `149 → ...` lines
+  // document the Exif/JPEG fixture additions; the active-count assertion
+  // below was recomputed post-rebase to the actual fixture-count total
+  // (main's Flash/MXF/QuickTime fixtures PLUS the Exif/JPEG additions).
+  // 149 → 151 after FORMATS.md rows 13-14 lib/exif-gps: added the two
+  // synthetic standalone-TIFF fixtures `Exif.tif` (IFD0 + ExifIFD + IFD1
+  // chain — the camera-tag IFD machinery) and `ExifGPS.tif` (IFD0 + GPS
+  // sub-IFD — the GPS coordinate ValueConv). The MakerNote-bearing
+  // `Exif_makernote.tif` is formally accept-deferred — see `NOT_ACTIVE`.
+  // 151 → 155 after PR #36 Codex R1 (F1/F2/F3): four adversarial
+  // standalone-TIFFs — `Exif_badoffset_low.tif` (out-of-line value
+  // offset < 8 ⇒ `Suspicious … offset` warning + tag dropped),
+  // `Exif_badoffset_eof.tif` (offset + size past EOF ⇒ `Error reading
+  // value …` warning + tag dropped), `Exif_truncated_ifd.tif` (IFD0
+  // declares more entries than the file holds ⇒ `Bad IFD0 directory`
+  // and the whole directory aborts), `Exif_focallength35.tif`
+  // (FocalLengthIn35mmFormat 0xa405 — the no-decimal `"$val mm"`
+  // PrintConv, distinct from FocalLength 0x920a's `sprintf("%.1f mm")`).
+  // 155 → 161 after PR #36 Codex R2 (F1/F2/F3): six adversarial
+  // standalone-TIFFs — `Exif_badformat_entry0.tif` (entry-0 bad format
+  // code ⇒ `Bad format (99) for IFD0 entry 0` + directory abort),
+  // `Exif_illegal_ifd0_size.tif` / `Exif_illegal_subifd_size.tif`
+  // (`$bytesFromEnd` ∈ {1,3} ⇒ `Illegal … directory size (n entries)`
+  // + abort, at IFD0 and a GPS sub-IFD), `Exif_gps_baddir.tif` (GPS
+  // pointer past EOF ⇒ `Bad GPS directory`), `Exif_gps_badoffset.tif` /
+  // `Exif_gps_eofoverrun.tif` (GPS-IFD warning tag names resolved
+  // against `%GPS::Main` — 0x0002 = GPSLatitude, not InteropVersion).
+  // 161 → 163 after PR #36 Codex R3 (F1/F2): two adversarial standalone-
+  // TIFFs — `Exif_badformat_ifd1.tif` (entry-0 bad format in IFD0 with a
+  // valid IFD1 next-IFD pointer ⇒ the `return 0` abort suppresses IFD1
+  // too — no `IFD1:*` tags), `Exif_gps_proctext.tif`
+  // (GPSProcessingMethod/GPSAreaInformation with the `ASCII\0\0\0` charset
+  // prefix ⇒ `ConvertExifText` strips the prefix and decodes the text).
+  // 163 → 164 after PR #36 Codex R4 (F1): one adversarial standalone-TIFF —
+  // `Exif_gps_unicode.tif` (big-endian TIFF carrying UTF-16LE `UNICODE\0`
+  // GPSProcessingMethod with NO BOM + GPSAreaInformation with an LE BOM ⇒
+  // `ConvertExifText`'s `Decode(...,'UTF16','Unknown')` seeds the order from
+  // `GetByteOrder()` then flips on the Charset.pm distribution heuristic, so
+  // both decode to ASCII text rather than mojibake).
+  // 164 → 167 after PR #36 Codex R5 (F1): three adversarial standalone-TIFFs
+  // exercising ExifIFD `UserComment` (0x9286), which is `Format => 'undef'` +
+  // `RawConv => ConvertExifText` (Exif.pm:2497-2507) — the SAME RawConv the
+  // GPS text tags use, but in the ExifIFD and WITHOUT the `gps` feature.
+  // `Exif_usercomment_ascii.tif` (`ASCII\0\0\0` prefix ⇒ "Hello World", was
+  // wrongly `Conv::None` ⇒ binary placeholder), `Exif_usercomment_unicode.tif`
+  // (MM TIFF, `UNICODE\0` + UTF-16LE no-BOM ⇒ heuristic flip ⇒ "MANUAL"),
+  // `Exif_usercomment_bom.tif` (MM TIFF, `UNICODE\0` + LE BOM ⇒ BOM pins LE
+  // order ⇒ "Tokyo"). The `ConvertExifText` impl moved out of the gps-only
+  // module into `exif::exiftext` (feature = "exif") so UserComment decodes
+  // without `gps`.
+  // 167 → 169 after PR #36 Codex R6 (F1): two adversarial standalone-TIFFs —
+  // `Exif_usercomment_string.tif` / `Exif_usercomment_int8u.tif` — an ExifIFD
+  // UserComment (0x9286) whose ON-DISK format code is `string` (2) / `int8u`
+  // (1), the documented mis-writers (Exif.pm:2499). ExifTool's `Format =>
+  // 'undef'` (Exif.pm:2500) is a READ-side override applied BEFORE `ReadValue`
+  // (Exif.pm:6729-6744): it forces the value through `undef` so the on-disk
+  // bytes are not NUL-trimmed, then `ConvertExifText` strips the 8-byte
+  // `ASCII\0\0\0` prefix ⇒ "Hello World". Without it the `string` decode
+  // truncates at the first NUL to "ASCII". The fix adds `tables::
+  // format_override` (the `$$tagInfo{Format}` lookup) applied in the IFD
+  // walker before `read_value`, keyed on `Format` (UserComment) not `Writable`
+  // (GPS text tags carry only `Writable => 'undef'`, so a `string`-on-disk GPS
+  // text tag IS NUL-trimmed by bundled — the contrast pins the scoping).
+  // 169 → 170 after PR #36 Codex R7 (F1): one adversarial standalone-TIFF —
+  // `Exif_gps_datestamp.tif` — a GPS sub-IFD GPSDateStamp (0x001d) whose
+  // ON-DISK format is `string` (2) but whose bytes use `\0` separators
+  // (`2024\0 05\0 22\0`, the Casio EX-H20G variant, GPS.pm:312). The GPS table
+  // sets `Format => 'undef'` (GPS.pm:312), a READ-side override (Exif.pm:6729-
+  // 6744) that forces the undef re-read so the interior NULs survive ⇒ the
+  // RawConv strips only the trailing run and `ExifDate` re-separates to
+  // "2024:05:22". The R6 fix gated the override off for ALL GPS entries; R7
+  // resolves it per-table (`gps::format_override(0x001d)` → `Format::Undef`),
+  // honoring 0x001d while keeping the GPS text tags 0x001b/0x001c (only
+  // `Writable => 'undef'`, no `Format`) NUL-trimmed exactly as bundled does.
+  // 170 → 171 after PR #36 Codex R8 (F1): one adversarial standalone-TIFF —
+  // `Exif_gps_wrongfmt.tif` — an IFD0 GPSInfo pointer (0x8825) mis-encoded as
+  // `string[4]` instead of an integer. GPSInfo carries `Flags => 'SubIFD'`
+  // (Exif.pm:2134), so the offset-integrality check (Exif.pm:6747) warns
+  // `Wrong format (string) for IFD0 0x8825 GPSInfo` and `next`-skips the entry
+  // in default mode — the GPS sub-IFD is NOT walked. Pins the fix for a
+  // silently-swallowed pointer (the would-be GPS IFD at the encoded offset is
+  // never reached, so no GPS:* leaks); IFD0:Orientation still emits.
+  // 171 → 172 after PR #36 Codex R9 (F1): one adversarial standalone-TIFF —
+  // `Exif_gps_int32s.tif` — an IFD0 GPSInfo pointer (0x8825) encoded as
+  // `int32s` (format 9, a SIGNED integer) with a POSITIVE offset. `%intFormat`
+  // (Exif.pm:125-136) lists `int32s => 9`, so the signed format passes the
+  // offset-integrality gate (Exif.pm:6747) WITHOUT a warning and the pointer
+  // is used as `Start => '$val'` — the GPS sub-IFD IS walked. Pins the fix for
+  // the SubIFD-pointer extraction accepting `RawValue::I64` (not only `U64`);
+  // bundled emits `GPS:GPSVersionID` = "2.3.0.0".
+  // 172 → 173 after PR #36 Codex R10 (F1): one synthetic standalone-TIFF —
+  // `Exif_multipage.tif` — a three-deep next-IFD chain IFD0 -> IFD1 -> IFD2.
+  // ExifTool's `Multi` trailing-directory scan (Exif.pm:7202-7232) is a
+  // `for (;;)` loop that re-reads `Get32u($dataPt, $dirEnd)` and increments
+  // the directory number after each trailing IFD (`DirName .= $ifdNum + 1`,
+  // Exif.pm:7215-7216). The R10 bug stopped the walker after IFD1 because
+  // `walk_one_ifd` returned the next pointer only for `IfdKind::Ifd0`; the
+  // fix follows the chain for `IfdKind::Ifd0 | IfdKind::Trailing(_)` and
+  // numbers each trailing IFD (`Trailing(n)` → family-1 group `IFDn`), so
+  // bundled's `IFD2:Compression` / `IFD2:Software` / `IFD2:Orientation` are
+  // emitted.
+  // 173 → 174 after PR #36 Codex R11 (F1): one synthetic standalone-TIFF —
+  // `Exif_manyifd.tif` — a 66-deep next-IFD chain IFD0 -> ... -> IFD65.
+  // ExifTool's `Multi` trailing-directory scan is an UNCAPPED `for (;;)`
+  // loop (Exif.pm:7211). The R11 bug capped `walk_ifd_chain` at `0..MAX_IFDS`
+  // (64) — counting IFD0, so IFD64/IFD65 were silently dropped from a valid
+  // multipage TIFF. The fix removes the fixed cap (the seen-offset reprocess
+  // guard keeps the `loop {}` finite) and widens `IfdKind::Trailing` to `u16`
+  // so `IFDn` numbers past 64; bundled's `IFD64:Software` / `IFD65:Software`
+  // are emitted.
+  // 174 → 175 after PR #36 Codex R12 (F1): one synthetic standalone-TIFF —
+  // `Exif_ifd65536.tif` — a 65537-deep next-IFD chain IFD0 -> ... -> IFD65536.
+  // ExifTool numbers each trailing IFD with plain Perl arithmetic
+  // `DirName .= $ifdNum + 1` (Exif.pm:7215-7216) — uncapped. The R12/F1 bug
+  // stored the trailing-IFD number in a `u16` advanced with `saturating_add`,
+  // so past IFD65535 it pinned at 65535 and mislabeled IFD65536 as IFD65535
+  // (overwriting the real IFD65535 tags). The fix widens `IfdKind::Trailing`
+  // to `u32` with an unsaturating `+ 1` and a 13-byte `IfdName` buffer, so
+  // bundled's distinct `IFD65535:Software` / `IFD65536:Software` are emitted.
+  // 175 → 176 after PR #36 Codex R12 (F2): one synthetic standalone-TIFF —
+  // `Exif_gps_after_interop.tif` — IFD0's GPSInfo (0x8825) and ExifIFD's
+  // InteropOffset (0xa005) BOTH point at one shared sub-IFD. ExifTool's
+  // `%PROCESSED` reprocess guard (ExifTool.pm:9050-9061) is gated on
+  // `$$dirInfo{DirLen}` being non-zero; IFD-pointer SubDirectories carry
+  // `DirLen => 0`, so the guard never fires and ExifTool reprocesses the
+  // shared offset as GPS (the Windows Phone 7.5 O/S bug, ExifTool.pm:9059).
+  // The R12/F2 bug rejected any previously seen IFD offset, dropping all
+  // GPS tags. The fix tracks each seen offset WITH its owning `IfdKind` and
+  // allows the GPS-after-InteropIFD reprocess; the shared dir carries only
+  // GPS IDs absent from `%InteropIFD` (GPSVersionID/GPSSatellites/
+  // GPSMapDatum) so bundled's `GPS:*` tags emit with no Interop/Composite
+  // golden noise.
+  // 176 → 177 after PR #36 Codex R13 (F1): one synthetic standalone-TIFF —
+  // `Exif_gps_shared_pointer.tif` — IFD0's ExifOffset (0x8769) AND GPSInfo
+  // (0x8825) BOTH point at one shared sub-IFD. This is the GENERAL form of
+  // the R12/F2 pointer-collision: ExifTool's `%PROCESSED` guard is gated on
+  // a non-zero `DirLen` (ExifTool.pm:9052) and a standalone TIFF's
+  // IFD-pointer SubDirectories carry `DirLen 0` (Exif.pm:7020-7026 resets
+  // `$size` for an out-of-buffer subdirectory start), so the guard is
+  // SKIPPED for EVERY IFD-pointer subdirectory — ExifTool reprocesses any
+  // shared offset, not just GPS-after-InteropIFD. The R12/F2 carve-out
+  // admitted only GPS-after-InteropIFD, so the GPS pass over an
+  // ExifIFD-owned offset returned `None` and every GPS tag was dropped. The
+  // re-modelled guard records only chain IFDs (IFD0/Trailing) in the
+  // seen-offset loop breaker and reprocesses IFD-pointer subdirectory
+  // revisits, rejecting only a true ancestor cycle (active recursion path).
+  // Bundled emits `ExifIFD:Orientation` AND `GPS:GPSVersionID`, no warning.
+  // 177 → 178 after PR #36 Codex R14 (F1): one adversarial standalone-TIFF —
+  // `Exif_eofoverrun_chain.tif` — IFD0 entry 1 is an out-of-line value
+  // (Software) whose `offset + size` runs past EOF, with a VALID entry 2
+  // (Orientation) AFTER it AND a non-zero next-IFD pointer to a structurally
+  // valid IFD1. A standalone TIFF carries a RAF (`DoProcessTIFF` sets
+  // `RAF => $raf`, ExifTool.pm:8717; `ProcessExif` reads it, Exif.pm:6289),
+  // so the out-of-line read takes the `if ($raf)` path (Exif.pm:6552); the
+  // past-EOF `$raf->Read` fails (Exif.pm:6593) ⇒ `Error reading value for
+  // IFD0 entry 1, ID 0x0131 Software` (Exif.pm:6594) ⇒ `return 0 unless
+  // $inMakerNotes or $htmlDump or $truncOK` (Exif.pm:6602) — the WHOLE
+  // directory aborts BEFORE the line-7202 trailing-IFD scan. The R14/F1 bug
+  // recorded the warning but returned `true` (continue), so `IFD0:Orientation`
+  // and the IFD1:* tags leaked. The fix returns `false` (abort) from
+  // `walk_entry` on the EOF read-failure branch; the MakerNotes/truncOK
+  // exemption never applies (this walker defers MakerNote parsing and emits
+  // no TruncateOK tag). Bundled emits ONLY `IFD0:Make` + the warning.
+  // 178 → 179 after PR #36 Codex R15 (F1): one standalone-TIFF —
+  // `Exif_trailing_space.tif` — whose IFD0 Make/Model/Software/Artist and
+  // ExifIFD SubSecTime* fields are space-padded; bundled trims the trailing
+  // whitespace (`RawConv s/\s+$//`) / trailing spaces (`ValueConv s/ +$//`) in
+  // both -j and -n, so the port must too (else duplicate camera/software
+  // facets). Exif.pm:585/599/906/925 + 2543/2552/2560.
+  // 179 → 180 after PR #36 Codex R16 (F1): the REAL camera-JPEG fixture
+  // `ExifGPS.jpg` (bundled `t/images/GPS.jpg`) — the JPEG container front-end
+  // (`src/exif/jpeg.rs`) walks the markers, dispatches the `APP1` `Exif\0\0`
+  // segment to ProcessTIFF → ProcessExif (ExifTool.pm:7736-7783), and the
+  // typed `ExifMeta` carries the full IFD0/ExifIFD/GPS/IFD1 set. This is the
+  // first real-input (non-synthetic) Exif fixture and the core product
+  // capability (camera photos read their Make/Model/DateTime/GPS).
+  // 180 → 182 after PR #36 Codex R17: two JPEG-container fixtures.
+  //  - `JPEG_malformed_app1_exif.jpg` (R17/F1) — a valid JPEG whose `APP1`
+  //    `Exif\0\0` block is NOT a valid TIFF; bundled `ProcessJPEG`
+  //    `SetFileType`s it `JPEG` (ExifTool.pm:7304) regardless of the Exif arm
+  //    and `Warn`s `Malformed APP1 EXIF segment` (ExifTool.pm:7783). The JPEG
+  //    container is ACCEPTED — never mis-rejected into a finalization error.
+  //  - `JPEG_two_app1_exif.jpg` (R17/F2) — a JPEG with two INDEPENDENT `APP1`
+  //    Exif blocks (each a self-contained `Exif\0\0II\x2a\0` TIFF); the marker
+  //    walk continues after the first (ExifTool.pm:7821 `next`) so both
+  //    contribute tags (`IFD0:Make` from block 1, `IFD0:Model` from block 2).
+  // 182 → 183 after PR #36 Codex R18 (F2): `JPEG_unknown_header.jpg` — a
+  // valid JPEG behind a 4-byte unknown leading header. The file-type
+  // detector's terminal JPEG candidate carries a non-zero `header_skip`
+  // (`ExifTool.pm:3026-3034`); the Exif dispatch slices `bytes` at that offset
+  // and rebases the embedded Exif `Base` by it. Pre-fix the candidate was
+  // detected then mis-rejected into a finalization error.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    231,
-    "expected exactly the 231 active conformance fixtures, found {}: {:?}",
+    265,
+    "expected exactly the 265 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

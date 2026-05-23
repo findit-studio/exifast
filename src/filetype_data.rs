@@ -773,6 +773,43 @@ pub(crate) fn file_type_lookup_defined(key: &str) -> bool {
     file_type_lookup(key).is_some()
 }
 
+/// `$baseType` of `DoProcessTIFF` (ExifTool.pm:8687-8689):
+/// ```text
+/// my $lookup = $fileTypeLookup{$fileType};
+/// $lookup = $fileTypeLookup{$lookup} unless ref $lookup or not $lookup; # alias deref
+/// my $baseType = $lookup ? (ref $$lookup[0] ? $$lookup[0][0] : $$lookup[0]) : '';
+/// ```
+/// i.e. the FIRST module name of `key`'s `%fileTypeLookup` row — `$$lookup[0]`
+/// for a single-type row (a string) or `$$lookup[0][0]` for a multi-type row
+/// (the first element of the leading arrayref). A string ALIAS is dereferenced
+/// once to its target row first. Returns `""` (Perl's empty `$baseType`) when
+/// the key (or a one-hop alias target) is absent. Unlike
+/// [`file_type_lookup_root`] this DOES return the root for a [`Lookup::Multi`]
+/// row (e.g. `FFF` → `[["TIFF","FLIR"], …]` → `"TIFF"`), because here the Perl
+/// reads the arrayref's first element rather than string-comparing it.
+///
+/// Sole caller is the Exif/TIFF `DoProcessTIFF` finalization
+/// ([`crate::parser`], `feature = "exif"`); `allow(dead_code)` keeps a
+/// no-`exif` build warning-clean.
+#[must_use]
+#[cfg_attr(not(feature = "exif"), allow(dead_code))]
+pub(crate) fn file_type_base_module(key: &str) -> &'static str {
+    // `$lookup = $fileTypeLookup{$fileType}`, then one alias hop.
+    let row = match file_type_lookup(key) {
+        Some(Lookup::Alias(target)) => file_type_lookup(target),
+        other => other,
+    };
+    match row {
+        // Single: `$$lookup[0]` is the TYPE string.
+        Some(Lookup::Single(types, _)) => types.first().copied().unwrap_or(""),
+        // Multi: `ref $$lookup[0]` is true ⇒ `$$lookup[0][0]` (first module).
+        Some(Lookup::Multi(types, _)) => types.first().copied().unwrap_or(""),
+        // A dangling/absent key (or alias→alias, which `%fileTypeLookup`
+        // never contains) ⇒ Perl's empty-string `$baseType`.
+        Some(Lookup::Alias(_)) | None => "",
+    }
+}
+
 /// `@fileTypes` master scan order (ExifTool.pm:197-204), verbatim. The
 /// content-gated selection loop (`ExtractInfo`) appends every entry not in
 /// the `GetFileType` candidate list (in this order) so all types are tested;

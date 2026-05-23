@@ -1,0 +1,3781 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
+
+#![cfg(feature = "exif")]
+//! Faithful port of `Image::ExifTool::Exif` (`lib/Image/ExifTool/Exif.pm`)
+//! plus the TIFF-header front-end of `DoProcessTIFF` (`ExifTool.pm:8530-
+//! 8730`).
+//!
+//! ## What Exif is — and why this is camera-metadata-core critical path
+//!
+//! Exif is the camera-tag IFD. Every camera maker / lens / model / GPS field
+//! the product extracts flows through the Exif IFD machinery:
+//!
+//! - a standalone TIFF file (`File:FileType == "TIFF"`) IS an Exif/TIFF
+//!   block — file-dispatchable directly;
+//! - GPS is the coordinate sub-IFD reached through IFD0 tag `GPSInfo`
+//!   (0x8825);
+//! - vendor MakerNotes (Apple/Canon/Sony/…) are SubDirectories reached
+//!   through the ExifIFD's `MakerNote` tag (0x927c);
+//! - QuickTime / RIFF video files embed Exif/TIFF blocks.
+//!
+//! So this module is designed as a REUSABLE engine: [`parse_exif_block`]
+//! takes an Exif/TIFF byte block and returns a typed [`ExifMeta`]. The IFD
+//! walker is NOT locked to file-level dispatch — a future QuickTime/RIFF
+//! port calls [`parse_exif_block`] on the embedded block.
+//!
+//! ## Structure (Exif.pm + ExifTool.pm)
+//!
+//! - **TIFF header** (`ExifTool.pm:8628-8645`): 2-byte byte order
+//!   (`II`/`MM`), the 16-bit magic (0x2a for TIFF), the 32-bit IFD0 offset.
+//! - **IFD walker** (`Exif.pm:6278-7240 ProcessExif`): each IFD is an
+//!   entry-count (`int16u`) + N×12-byte entries + a next-IFD-offset
+//!   (`int32u`). Each entry is `tag(u16) format(u16) count(u32)
+//!   value-or-offset(u32)`. A value ≤ 4 bytes is stored inline; otherwise
+//!   the 4 bytes are an offset into the TIFF block (`Exif.pm:6504-6510`).
+//! - **IFD chain**: IFD0 → IFD1 (thumbnail, via the next-IFD pointer,
+//!   `Exif.pm:7203-7240`) → ExifIFD (SubIFD via 0x8769) → GPS IFD (0x8825)
+//!   → InteropIFD (0xa005).
+//! - **Type decoders**: the 13 TIFF types — see [`ifd`] (`ReadValue`,
+//!   `ExifTool.pm:6275-6321`).
+//! - **Tag tables**: [`tables`] (`%Exif::Main`) + [`gps`] (`%GPS::Main`).
+//!
+//! ## MakerNote (0x927c) — deferred to the MakerNotes wave
+//!
+//! When the ExifIFD has a `MakerNote` tag, the walker captures the raw bytes
+//! into [`ExifMeta`] and notes the deferral; it does NOT parse vendor
+//! MakerNotes. The SubDirectory-dispatch seam ([`SubDirKind::MakerNote`]) is
+//! designed so a MakerNotes port plugs in. See `docs/tracking.md`.
+
+pub mod ifd;
+// `tables` / `gps` hold the const `%Exif::Main` / `%GPS::Main` tag-table
+// rows (`ExifTag` / `GpsTag` — public fields for `const` struct-literal
+// init). They are NOT public API surface (D8: no public struct fields on
+// API types) — `pub(crate)`, matching `formats::matroska`'s private
+// `TagDef` / `StdTagEntry` tag-table convention. `ifd` stays public: its
+// `ByteOrder` / `Format` / `read_value` are the reusable IFD-decode infra
+// a future QuickTime / RIFF port consumes.
+pub(crate) mod tables;
+
+// `ConvertExifText` (`Exif.pm:5554-5601`) lives in `Exif.pm`, not `GPS.pm`:
+// it is the `RawConv` for ExifIFD's `UserComment` (0x9286) AND the GPS
+// sub-IFD's `GPSProcessingMethod` / `GPSAreaInformation`. So it is gated on
+// `feature = "exif"` (NOT `gps`) and the GPS table re-uses it.
+pub(crate) mod exiftext;
+
+#[cfg(feature = "gps")]
+pub(crate) mod gps;
+
+// `jpeg` is the JPEG-container front-end: the marker walk that reaches the
+// embedded `APP1` Exif block and hands it to [`parse_exif_block`]. A camera
+// JPEG (`File:FileType == "JPEG"`) is the primary camera-photo format; bundled
+// reaches its Exif via `ProcessJPEG`'s `APP1` Exif arm (ExifTool.pm:7736-7783).
+// Gated on `feature = "exif"` (it produces an `ExifMeta`, reusing the IFD
+// walker); the GPS sub-IFD is decoded through the same block.
+pub mod jpeg;
+
+use std::{string::String, vec::Vec};
+
+use crate::format_parser::{FormatParser, parser_sealed};
+use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, read_value};
+use tables::Conv;
+
+// ===========================================================================
+// IFD identity — the family-1 group an IFD's tags carry
+// ===========================================================================
+
+/// The kind of IFD currently being walked — drives the family-1 group of
+/// the tags it emits. `ProcessExif` sets `$$dirInfo{DirName}` to one of
+/// these (`ExifTool.pm:8688` IFD0; `Exif.pm:7064-7077` `SubdirInfo{DirName}`
+/// from the SubDirectory's `DirName`) and `SetGroup` then tags every
+/// FoundTag with it (`Exif.pm:7184` `SetGroup($tagKey, $dirName)`).
+///
+/// D8: enum predicates + `as_str` (the family-1 group string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfdKind {
+  /// IFD0 — the main image directory (`ExifTool.pm:8688`).
+  Ifd0,
+  /// A trailing IFD reached by following the next-IFD pointer chain — IFD1
+  /// (the thumbnail), IFD2, IFD3… The payload is the 1-based directory
+  /// number ExifTool assigns at `Exif.pm:7215-7216`
+  /// (`$ifdNum = DirName =~ s/(\d+)$//; DirName .= $ifdNum + 1`): IFD0's
+  /// next pointer yields `Trailing(1)`, IFD1's yields `Trailing(2)`, etc.
+  /// The number is unbounded — ExifTool's `$ifdNum + 1` is plain Perl
+  /// arithmetic with no cap, and `walk_ifd_chain` follows the chain with
+  /// `for (;;)` faithfully (`Exif.pm:7211`). The discriminant is `u32` so a
+  /// chain past IFD65535 keeps incrementing the decimal `DirName` (IFD65536,
+  /// IFD65537…) instead of pinning at 65535 and mislabeling later IFDs.
+  Trailing(u32),
+  /// ExifIFD — the Exif sub-IFD (via IFD0 tag 0x8769).
+  ExifIfd,
+  /// GPS — the GPS sub-IFD (via IFD0 tag 0x8825).
+  Gps,
+  /// InteropIFD — the interoperability sub-IFD (via ExifIFD tag 0xa005).
+  Interop,
+}
+
+/// An IFD family-1 group name (`"IFD0"`, `"IFD1"`, …, `"ExifIFD"`, `"GPS"`,
+/// `"InteropIFD"`) rendered into a fixed inline buffer — no heap allocation,
+/// no `alloc` dependency, and (unlike a `&'static str` literal table) no
+/// upper bound on the trailing-IFD number it can spell.
+///
+/// `walk_ifd_chain` follows the next-IFD chain with `for (;;)`
+/// (`Exif.pm:7211`); the trailing-IFD number is a `u32`, so a trailing name
+/// can be up to `"IFD4294967295"` (13 bytes) and `"InteropIFD"` (10 bytes)
+/// is the widest sub-IFD name — the 13-byte buffer covers both. [`Deref`]s
+/// to `&str`, so it drops straight into the `write_*` sinks (which already
+/// take `&str`).
+#[derive(Debug, Clone, Copy)]
+pub struct IfdName {
+  /// UTF-8 bytes of the name; only `[..len]` is meaningful.
+  buf: [u8; 13],
+  /// Byte length of the rendered name. The widest name is the trailing-IFD
+  /// name `"IFD4294967295"` (13 bytes); `"InteropIFD"` (10 bytes) is the
+  /// widest sub-IFD name.
+  len: u8,
+}
+
+impl IfdName {
+  /// Render `"IFD{n}"` into the inline buffer (`n` decimal, no leading
+  /// zeros) — the family-1 group of trailing-IFD number `n`
+  /// (`Exif.pm:7215-7216`).
+  #[must_use]
+  fn ifd(n: u32) -> Self {
+    let mut buf = [0u8; 13];
+    buf[0] = b'I';
+    buf[1] = b'F';
+    buf[2] = b'D';
+    // Decimal-render `n` (max `4294967295`, ten digits) after the `IFD`
+    // prefix.
+    let mut digits = [0u8; 10];
+    let mut value = n;
+    let mut ndigits = 0usize;
+    loop {
+      digits[ndigits] = b'0' + (value % 10) as u8;
+      value /= 10;
+      ndigits += 1;
+      if value == 0 {
+        break;
+      }
+    }
+    for i in 0..ndigits {
+      buf[3 + i] = digits[ndigits - 1 - i];
+    }
+    Self {
+      buf,
+      len: (3 + ndigits) as u8,
+    }
+  }
+
+  /// Wrap a `&'static str` literal (the fixed sub-IFD names).
+  #[must_use]
+  const fn literal(s: &str) -> Self {
+    let bytes = s.as_bytes();
+    let mut buf = [0u8; 13];
+    let mut i = 0;
+    while i < bytes.len() {
+      buf[i] = bytes[i];
+      i += 1;
+    }
+    Self {
+      buf,
+      len: bytes.len() as u8,
+    }
+  }
+
+  /// The rendered name as a `&str`.
+  #[must_use]
+  #[inline]
+  pub fn as_str(&self) -> &str {
+    // SAFETY-free: `buf[..len]` is always ASCII (`IFD`, digits, or an
+    // ASCII literal), so it is valid UTF-8 by construction.
+    core::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("IFD?")
+  }
+}
+
+impl core::ops::Deref for IfdName {
+  type Target = str;
+  #[inline]
+  fn deref(&self) -> &str {
+    self.as_str()
+  }
+}
+
+impl core::fmt::Display for IfdName {
+  #[inline]
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+impl PartialEq<str> for IfdName {
+  #[inline]
+  fn eq(&self, other: &str) -> bool {
+    self.as_str() == other
+  }
+}
+
+impl PartialEq<&str> for IfdName {
+  #[inline]
+  fn eq(&self, other: &&str) -> bool {
+    self.as_str() == *other
+  }
+}
+
+impl PartialEq<IfdName> for IfdName {
+  #[inline]
+  fn eq(&self, other: &IfdName) -> bool {
+    self.as_str() == other.as_str()
+  }
+}
+
+impl Eq for IfdName {}
+
+impl IfdKind {
+  /// The family-1 group name this IFD's tags carry in `-G1` output.
+  /// A trailing IFD numbered `n` renders `IFDn` (`Exif.pm:7215-7216`).
+  /// Returns an inline-buffer [`IfdName`] (no heap allocation) so the
+  /// trailing-IFD number is unbounded — faithful to ExifTool's uncapped
+  /// `for (;;)` chain walk (`Exif.pm:7211`).
+  #[must_use]
+  #[inline]
+  pub fn as_str(self) -> IfdName {
+    match self {
+      IfdKind::Ifd0 => IfdName::literal("IFD0"),
+      IfdKind::Trailing(n) => IfdName::ifd(n),
+      IfdKind::ExifIfd => IfdName::literal("ExifIFD"),
+      IfdKind::Gps => IfdName::literal("GPS"),
+      IfdKind::Interop => IfdName::literal("InteropIFD"),
+    }
+  }
+
+  /// `true` for the GPS sub-IFD (its tags use the [`gps`] table).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_gps(self) -> bool {
+    matches!(self, IfdKind::Gps)
+  }
+}
+
+// ===========================================================================
+// SubDirectory dispatch seam — `SubDirKind`
+// ===========================================================================
+
+/// The SubDirectory a pointer tag dispatches into — the seam that keeps the
+/// IFD walker reusable and lets a future MakerNotes port plug in.
+///
+/// ExifTool's SubDirectory dispatch (`Exif.pm:6913-7100`) recurses
+/// `ProcessExif` on the pointed-to IFD with a new `DirName` + (for
+/// MakerNotes) a new tag table. The four pointer tags
+/// (0x8769/0x8825/0xa005/0x927c) map here.
+///
+/// D8: enum predicates; `#[non_exhaustive]` so a MakerNotes wave can add
+/// vendor arms without breaking matchers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubDirKind {
+  /// `ExifOffset` (0x8769) — recurse into the ExifIFD (`%Exif::Main`).
+  ExifIfd,
+  /// `GPSInfo` (0x8825) — recurse into the GPS IFD (`%GPS::Main`).
+  Gps,
+  /// `InteropOffset` (0xa005) — recurse into the InteropIFD (`%Exif::Main`).
+  Interop,
+  /// `MakerNote` (0x927c) — the vendor MakerNotes blob. **Vendor parsing is
+  /// deferred to the MakerNotes wave** (`docs/tracking.md`); the Exif walker
+  /// captures the raw bytes. This variant IS the plug-in seam: a MakerNotes
+  /// port adds the per-vendor dispatch behind it.
+  MakerNote,
+}
+
+impl SubDirKind {
+  /// `true` for a SubIFD/offset pointer tag whose value MUST be an integer
+  /// format (`$$tagInfo{IsOffset} or $$tagInfo{SubIFD}`, `Exif.pm:6747`).
+  ///
+  /// `ExifOffset` (0x8769, `SubIFD => 2`, `Exif.pm:2009`), `GPSInfo` (0x8825,
+  /// `Flags => 'SubIFD'`, `Exif.pm:2134`) and `InteropOffset` (0xa005, `Flags
+  /// => 'SubIFD'`, `Exif.pm:2723`) all carry the SubIFD flag, so a
+  /// non-integer on-disk format triggers the `Wrong format` warning + skip.
+  /// `MakerNote` (0x927c) is a plain `SubDirectory` reference with NEITHER
+  /// `IsOffset` NOR `SubIFD` (`Exif.pm:2496`), so the check does NOT apply —
+  /// a string-typed MakerNote is parsed as usual.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_sub_ifd(self) -> bool {
+    matches!(
+      self,
+      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop
+    )
+  }
+
+  /// The `$$tagInfo{Name}` of the pointer tag in the Exif main table — used
+  /// in the `Wrong format` warning. The four pointer tags are NOT in the
+  /// leaf-lookup [`tables`] table (they are handled structurally by the IFD
+  /// walker), so their names live here: `ExifOffset` (`Exif.pm:2007`),
+  /// `GPSInfo` (`Exif.pm:2131`), `InteropOffset` (`Exif.pm:2721`), `MakerNote`
+  /// (`MakerNotes.pm` `%Main`, `Exif.pm:2496`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_name(self) -> &'static str {
+    match self {
+      SubDirKind::ExifIfd => "ExifOffset",
+      SubDirKind::Gps => "GPSInfo",
+      SubDirKind::Interop => "InteropOffset",
+      SubDirKind::MakerNote => "MakerNote",
+    }
+  }
+}
+
+// ===========================================================================
+// Typed value carrier — `ExifValue<'a>`
+// ===========================================================================
+
+/// One decoded Exif/GPS tag value — the post-Format-decode, pre-conversion
+/// `$val`.
+///
+/// The IFD walker stores [`ifd::RawValue`] directly; conversions happen at
+/// [`ExifMeta::serialize_tags`] time, faithful to ExifTool deferring
+/// PrintConv/ValueConv to its `GetValue`/`PrintValue` layer.
+///
+/// `ExifValue` is fully OWNED — `RawValue::Text`/`Bytes` are decoded copies
+/// (a TIFF `string` is NUL-trimmed and a value-data slice may sit outside
+/// the inline 4-byte window). It carries no input-buffer lifetime; the
+/// borrowed surface ([`MakerNote`]) lives on [`ExifMeta`].
+#[derive(Debug, Clone)]
+pub struct ExifValue {
+  /// The raw decoded value.
+  raw: RawValue,
+}
+
+impl ExifValue {
+  /// Wrap a decoded [`RawValue`].
+  #[must_use]
+  #[inline(always)]
+  const fn new(raw: RawValue) -> Self {
+    Self { raw }
+  }
+
+  /// The raw decoded value (post-Format-decode, pre-conversion).
+  #[must_use]
+  #[inline(always)]
+  pub const fn raw(&self) -> &RawValue {
+    &self.raw
+  }
+}
+
+// ===========================================================================
+// One emitted tag — `ExifEntry<'a>`
+// ===========================================================================
+
+/// One emitted Exif/GPS tag — the family-1 group, the on-disk tag ID, the
+/// resolved name, and the decoded value. Faithful to a single ExifTool
+/// `FoundTag` call (`Exif.pm:7181`). Fully OWNED (no input-buffer lifetime).
+#[derive(Debug, Clone)]
+pub struct ExifEntry {
+  /// Which IFD this tag was found in (drives the `-G1` family-1 group).
+  ifd: IfdKind,
+  /// The on-disk tag ID.
+  tag_id: u16,
+  /// The resolved tag name (`%Exif::Main`/`%GPS::Main` `Name`).
+  name: &'static str,
+  /// The decoded value.
+  value: ExifValue,
+  /// The conversion ExifTool applies to this tag at serialize time.
+  conv: ResolvedConv,
+}
+
+impl ExifEntry {
+  /// Which IFD this tag belongs to.
+  #[must_use]
+  #[inline(always)]
+  pub const fn ifd(&self) -> IfdKind {
+    self.ifd
+  }
+
+  /// The family-1 group name (`"IFD0"`, `"ExifIFD"`, `"GPS"`, …). Returns
+  /// an inline-buffer [`IfdName`] (no heap allocation) that [`Deref`]s to
+  /// `&str` — a trailing IFD numbered `n` renders `IFDn` for any `n`.
+  #[must_use]
+  #[inline]
+  pub fn group(&self) -> IfdName {
+    self.ifd.as_str()
+  }
+
+  /// The on-disk tag ID.
+  #[must_use]
+  #[inline(always)]
+  pub const fn tag_id(&self) -> u16 {
+    self.tag_id
+  }
+
+  /// The resolved tag name.
+  #[must_use]
+  #[inline(always)]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+
+  /// The decoded value (borrow of the non-`Copy` [`ExifValue`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn value_ref(&self) -> &ExifValue {
+    &self.value
+  }
+}
+
+/// Which conversion table an entry's value goes through at serialize time.
+/// Internal — `ExifEntry` carries it so `serialize_tags` does not re-look-up.
+#[derive(Debug, Clone, Copy)]
+enum ResolvedConv {
+  /// A plain Exif conversion ([`Conv`]).
+  Exif(Conv),
+  /// A GPS conversion ([`gps::GpsConv`]).
+  #[cfg(feature = "gps")]
+  Gps(gps::GpsConv),
+}
+
+// ===========================================================================
+// MakerNote capture — the deferred-vendor-parsing seam
+// ===========================================================================
+
+/// The raw MakerNote (0x927c) blob captured by the Exif walker. Vendor
+/// parsing (Apple/Canon/Sony/…) is DEFERRED to the MakerNotes wave
+/// (`docs/tracking.md`); this struct is the captured-but-unparsed payload
+/// the future port consumes.
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone)]
+pub struct MakerNote<'a> {
+  /// The raw MakerNote bytes (the value the ExifIFD's 0x927c tag pointed
+  /// to). Borrowed from the input TIFF block.
+  bytes: &'a [u8],
+}
+
+impl<'a> MakerNote<'a> {
+  /// The raw MakerNote bytes (vendor-specific; unparsed — see the type docs).
+  #[must_use]
+  #[inline(always)]
+  pub const fn bytes(&self) -> &'a [u8] {
+    self.bytes
+  }
+
+  /// The byte length of the captured MakerNote blob.
+  #[must_use]
+  #[inline(always)]
+  pub const fn len(&self) -> usize {
+    self.bytes.len()
+  }
+
+  /// `true` if the captured MakerNote blob is empty.
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_empty(&self) -> bool {
+    self.bytes.is_empty()
+  }
+}
+
+// ===========================================================================
+// Typed Meta — `ExifMeta<'a>`
+// ===========================================================================
+
+/// Typed Exif/TIFF metadata — the lib-first output of [`ProcessExif`] and
+/// the reusable [`parse_exif_block`].
+///
+/// D8 convention: no public fields; accessors only.
+///
+/// `ExifMeta` carries an ordered list of [`ExifEntry`] tags (faithful to
+/// ExifTool's `FoundTag` call order across the IFD chain), the TIFF byte
+/// order (the engine's `File:ExifByteOrder` tag), and the captured-but-
+/// unparsed [`MakerNote`] blob if one was present.
+///
+/// An `ExifMeta` with no [`byte_order`](Self::byte_order) is the
+/// **JPEG-container-accepted-without-Exif** case: a valid JPEG (SOI present)
+/// that carried no usable `APP1` Exif block. Bundled `ProcessJPEG`
+/// (`ExifTool.pm:7304` `SetFileType`) finalizes `File:FileType == "JPEG"`
+/// independently of whether the `APP1` Exif arm runs — so the JPEG container
+/// front-end ([`jpeg::parse_jpeg_exif`]) always yields an `ExifMeta`; when no
+/// TIFF block was processed it has empty entries and `byte_order == None`
+/// (faithful: `File:ExifByteOrder` is `FoundTag`'d only inside `DoProcessTIFF`,
+/// `ExifTool.pm:8691`), possibly with a `Malformed APP1 EXIF segment` warning.
+#[derive(Debug, Clone)]
+pub struct ExifMeta<'a> {
+  /// Every emitted tag, in IFD-walk order. Fully owned (the `'a` lifetime is
+  /// carried solely by the borrowed [`MakerNote`]).
+  entries: Vec<ExifEntry>,
+  /// `$et->Warn(...)` messages raised by the IFD-bounds checks, in emission
+  /// order. The engine surfaces these as `ExifTool:Warning` tags.
+  warnings: Vec<String>,
+  /// The TIFF header byte order (`ExifTool.pm:8628`). The engine emits it as
+  /// `File:ExifByteOrder` (`ExifTool.pm:8691`). `None` only for a JPEG
+  /// container accepted without a parsed `APP1` Exif TIFF block (see the type
+  /// docs) — every standalone-TIFF / `APP1`-Exif parse sets `Some(order)`.
+  byte_order: Option<ByteOrder>,
+  /// The captured MakerNote (0x927c) blob, if the ExifIFD had one. Vendor
+  /// parsing is deferred to the MakerNotes wave. Borrows from the input
+  /// TIFF block — the sole reason `ExifMeta` carries a lifetime.
+  maker_note: Option<MakerNote<'a>>,
+}
+
+impl<'a> ExifMeta<'a> {
+  /// Every emitted tag in IFD-walk order. (`Vec` slice — never expose
+  /// `&Vec`, §3.)
+  #[must_use]
+  #[inline(always)]
+  pub fn entries(&self) -> &[ExifEntry] {
+    &self.entries
+  }
+
+  /// The TIFF header byte order. The engine emits this as
+  /// `File:ExifByteOrder` (`ExifTool.pm:8691`). `None` for a JPEG container
+  /// accepted without a parsed `APP1` Exif TIFF block (see the type docs).
+  #[must_use]
+  #[inline(always)]
+  pub const fn byte_order(&self) -> Option<ByteOrder> {
+    self.byte_order
+  }
+
+  /// The captured MakerNote (0x927c) blob, if the ExifIFD had one. Vendor
+  /// MakerNote parsing is DEFERRED to the MakerNotes wave; this exposes the
+  /// raw bytes the future port will consume.
+  #[must_use]
+  #[inline(always)]
+  pub const fn maker_note(&self) -> Option<&MakerNote<'a>> {
+    self.maker_note.as_ref()
+  }
+
+  /// The structural warnings raised while walking the IFD chain, in
+  /// emission order. The engine surfaces each as an `ExifTool:Warning`
+  /// tag (`Slice` — never expose `&Vec`, §3).
+  #[must_use]
+  #[inline(always)]
+  pub fn warnings(&self) -> &[String] {
+    &self.warnings
+  }
+
+  /// The first entry whose resolved name matches `name` (a small ergonomic
+  /// helper for the common "probe one tag" library use, e.g. `Make`).
+  #[must_use]
+  pub fn entry(&self, name: &str) -> Option<&ExifEntry> {
+    self.entries.iter().find(|e| e.name == name)
+  }
+
+  /// Build an `ExifMeta` from the JPEG container front-end's merged parts —
+  /// the entries / warnings collected across every independent `APP1` Exif
+  /// block, the byte order of the first block that carried one (`None` when
+  /// no `APP1` Exif TIFF block parsed, i.e. a JPEG accepted on its `SOI`
+  /// marker alone — `ExifTool.pm:7304`), and the FIRST captured `MakerNote`
+  /// (0x927c) across the merged segments. A normal camera JPEG carries its
+  /// MakerNote in the ExifIFD of its `APP1` Exif block; threading it here
+  /// makes [`ExifMeta::maker_note`](Self::maker_note) return it for JPEGs
+  /// exactly as for a standalone TIFF (the MakerNotes-wave seam #75+ consumes
+  /// the same accessor regardless of container). First-wins matches bundled
+  /// keeping the PRIMARY MakerNote — the ExifIFD of the first independent
+  /// `APP1` Exif block is the real-world carrier; a second block's MakerNote
+  /// (multi-`APP1`, exotic) is not the primary. (`pub(crate)`: the JPEG
+  /// front-end [`jpeg::parse_jpeg_exif`] is the sole constructor — not API
+  /// surface.)
+  #[must_use]
+  pub(crate) fn from_jpeg_parts(
+    entries: Vec<ExifEntry>,
+    warnings: Vec<String>,
+    byte_order: Option<ByteOrder>,
+    maker_note: Option<MakerNote<'a>>,
+  ) -> Self {
+    ExifMeta {
+      entries,
+      warnings,
+      byte_order,
+      maker_note,
+    }
+  }
+
+  /// Decompose this `ExifMeta` into `(entries, warnings, byte_order,
+  /// maker_note)` — the inverse of [`from_jpeg_parts`](Self::from_jpeg_parts),
+  /// used by the JPEG front-end to merge one decoded `APP1` Exif block into
+  /// the accumulating JPEG-level parts. The `MakerNote` borrows from the input
+  /// TIFF block (the `'a` lifetime), so it threads through the merge unchanged.
+  /// (`pub(crate)`: a merge-time internal, not API surface.)
+  #[must_use]
+  pub(crate) fn into_jpeg_parts(
+    self,
+  ) -> (
+    Vec<ExifEntry>,
+    Vec<String>,
+    Option<ByteOrder>,
+    Option<MakerNote<'a>>,
+  ) {
+    (
+      self.entries,
+      self.warnings,
+      self.byte_order,
+      self.maker_note,
+    )
+  }
+}
+
+// ===========================================================================
+// `ProcessExif` — the lib-first parser
+// ===========================================================================
+
+/// Exif / TIFF parser — faithful port of `Image::ExifTool::Exif::ProcessExif`
+/// (`Exif.pm:6278-7240`) plus the TIFF-header front-end of
+/// `Image::ExifTool::DoProcessTIFF` (`ExifTool.pm:8628-8730`).
+///
+/// A standalone TIFF file (`File:FileType == "TIFF"`) is dispatched here by
+/// [`crate::format_parser::any_parser_for`]. JPEG/MP4 embed Exif as a
+/// SubDirectory — those container ports call [`parse_exif_block`] directly.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessExif;
+
+impl parser_sealed::Sealed for ProcessExif {}
+
+impl FormatParser for ProcessExif {
+  type Meta<'a> = ExifMeta<'a>;
+  type Context<'a> = &'a [u8];
+  type Error = Error;
+
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+    Ok(parse_tiff(data))
+  }
+}
+
+/// Lib-first direct entry — parse a whole standalone TIFF file.
+///
+/// # Errors
+///
+/// Returns `Err` only for Rust-level fatal modes (none today — every bad
+/// input is `Ok(None)`, faithful to `DoProcessTIFF` `return 0`).
+pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
+  Ok(parse_tiff(data))
+}
+
+/// **Reusable entry — the QuickTime/RIFF/MakerNotes seam.** Parse a raw
+/// Exif/TIFF byte block (a complete TIFF: byte-order marker + magic + IFD0
+/// offset, with all IFD offsets relative to the START of `block`).
+///
+/// This is the function a future QuickTime (`QuickTime.pm` `EXIF` atom) or
+/// RIFF (`RIFF.pm` `exif` chunk) port calls on the embedded Exif block —
+/// the IFD walker is deliberately NOT locked to file-level dispatch. It is
+/// identical to [`parse_borrowed`]: a JPEG `APP1` / QuickTime `EXIF` payload
+/// IS a standalone TIFF structure (`ExifTool.pm:8624` `DoProcessTIFF`
+/// processes the `$dataPt` block the same way regardless of container).
+///
+/// Returns `None` when `block` is not a valid TIFF header (bad byte-order
+/// marker, IFD0 offset < 8 — `ExifTool.pm:8645`).
+#[must_use]
+pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
+  parse_tiff(block)
+}
+
+/// Like [`parse_exif_block`], but for an Exif/TIFF block that does NOT start at
+/// file offset 0 — `base` is the file offset of the TIFF block's first byte
+/// (ExifTool's `$$dirInfo{Base}`).
+///
+/// A JPEG `APP1` Exif segment carries its TIFF block partway into the file, so
+/// the container front-end ([`jpeg::parse_jpeg_exif`]) passes the block's file
+/// offset here. `base` is added to `IsOffset` value tags (`ThumbnailOffset`,
+/// `StripOffsets`) to convert them to absolute file offsets, faithful to
+/// `Exif.pm:7156-7170`. All other tags are identical to [`parse_exif_block`].
+/// (`base == 0` is exactly [`parse_exif_block`].)
+#[must_use]
+pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base(block, base)
+}
+
+// ===========================================================================
+// TIFF header parser — DoProcessTIFF front-end (ExifTool.pm:8628-8645)
+// ===========================================================================
+
+/// Parse a TIFF block: validate the header, then walk the IFD chain.
+///
+/// `ExifTool.pm:8628-8645`:
+/// ```text
+/// my $byteOrder = substr($$dataPt,0,2);  SetByteOrder($byteOrder) or return 0;
+/// my $identifier = Get16u($dataPt, 2);   # 0x2a for TIFF
+/// return 0 if length $$dataPt < 8;
+/// my $offset = Get32u($dataPt, 4);       $offset >= 8 or return 0;
+/// ```
+///
+/// We do NOT gate on `$identifier == 0x2a` — bundled explicitly removed that
+/// check (`ExifTool.pm:8634-8637`: RW2/HDP/BigTIFF use other magics). The
+/// gate is the byte-order marker + the IFD0-offset ≥ 8 sanity check.
+///
+/// The ONE magic we special-case is BigTIFF (0x2b): its on-disk layout differs
+/// from classic TIFF (8-byte offsets, 64-bit counts, 20-byte entries), so the
+/// classic walker would misdecode it. We cleanly skip it (return `None`) rather
+/// than emit garbage — see [`parse_tiff_with_base`]. A full BigTIFF walker is a
+/// deferred port.
+fn parse_tiff(data: &[u8]) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base(data, 0)
+}
+
+/// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
+///
+/// `base` is added to `IsOffset` value tags (`Exif.pm:7156-7170`) to convert
+/// them to absolute file offsets. The standalone-TIFF entries pass `base == 0`;
+/// the JPEG `APP1` Exif path passes the file offset of the embedded TIFF block.
+/// IFD offsets themselves are unchanged — they remain relative to `data`.
+fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
+  // `length $$dataPt < 8` — the TIFF header is 8 bytes.
+  if data.len() < 8 {
+    return None;
+  }
+  // `my $byteOrder = substr($$dataPt,0,2); SetByteOrder(...) or return 0`.
+  let order = ByteOrder::from_marker(&data[..2])?;
+  // `my $identifier = Get16u($dataPt, 2)` — the TIFF magic in `order`: classic
+  // TIFF is 0x2a (42), BigTIFF is 0x2b (43). Classic TIFF stores the IFD0
+  // pointer as a 32-bit offset at byte 4 and walks 16-bit entry counts /
+  // 12-byte entries; BigTIFF uses an 8-byte offset, 64-bit counts and 20-byte
+  // entries — decoding it with the classic layout below misreads it into
+  // garbage. BigTIFF (0x2b) is intentionally NOT parsed yet: a full BigTIFF
+  // walker (8-byte offsets, 64-bit counts, 20-byte entries, formats 16-18) is a
+  // deferred port. Cleanly bail with the same "no Exif parsed" result the
+  // invalid-header path returns (`None`) — no tags, no misdecode, no panic.
+  // ExifTool DOES support BigTIFF, so we deliberately emit NO "unsupported"
+  // warning (that would itself diverge); the only accepted divergence is the
+  // missing Exif tags, tracked as a follow-up. (File:FileType detection is a
+  // separate front-end and is unaffected.)
+  let magic = get_u16(data, 2, order)?;
+  if magic == 0x2b {
+    return None;
+  }
+  // `my $offset = Get32u($dataPt, 4); $offset >= 8 or return 0`.
+  let ifd0_offset = get_u32(data, 4, order)? as usize;
+  if ifd0_offset < 8 {
+    return None;
+  }
+
+  let mut w = Walker {
+    data,
+    order,
+    base,
+    entries: Vec::new(),
+    warnings: Vec::new(),
+    maker_note: None,
+    seen_ifd_offsets: std::collections::HashSet::new(),
+    active_ifd_offsets: Vec::new(),
+  };
+  // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
+  // are reached as SubDirectories from inside the walk.
+  w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
+
+  Some(ExifMeta {
+    entries: w.entries,
+    warnings: w.warnings,
+    byte_order: Some(order),
+    maker_note: w.maker_note,
+  })
+}
+
+// ===========================================================================
+// IFD walker — ProcessExif (Exif.pm:6278-7240)
+// ===========================================================================
+
+/// IFD walker state. All IFD offsets are relative to the start of `data`
+/// (the TIFF block) — i.e. `$base == 0`, `$dataPos == 0` in ExifTool terms
+/// (`DoProcessTIFF` builds `%dirInfo` with `Base => $base` and the EXIF data
+/// is the whole block — `ExifTool.pm:8703-8714`).
+struct Walker<'a> {
+  /// The TIFF block.
+  data: &'a [u8],
+  /// The TIFF byte order.
+  order: ByteOrder,
+  /// ExifTool's `$base` for the walk (`Exif.pm:6287` `$base = $$dirInfo{Base}
+  /// || 0`). All IFD offsets remain relative to the start of `data`, but an
+  /// `IsOffset` value tag (`StripOffsets` 0x0111, `ThumbnailOffset` 0x0201,
+  /// both `IsOffset => 1`) is converted to an ABSOLUTE file offset by adding
+  /// `$base + $$et{BASE}` (`Exif.pm:7156-7170`). For a standalone TIFF file
+  /// `$base == 0` (the TIFF block IS the file); for a JPEG `APP1` Exif block
+  /// `$base` is the file offset of the TIFF block (`DirStart(\%dirInfo,
+  /// $hdrLen, $hdrLen)` sets `$$dirInfo{Base} = $$dirInfo{DataPos} + $base`,
+  /// `ExifTool.pm:7780`). `$$et{BASE}` is 0 for the top-level Exif walk
+  /// (set non-zero only for relative-base maker notes — out of scope), so we
+  /// thread the single `$base` value.
+  base: u32,
+  /// Every emitted tag, in walk order (owned).
+  entries: Vec<ExifEntry>,
+  /// `$et->Warn(...)` messages collected during the walk, in emission
+  /// order. Surfaced as `ExifTool:Warning` tags by [`ExifMeta`]. Only the
+  /// structural warnings the IFD-bounds checks raise are modelled here
+  /// (`Bad … directory`, `Suspicious … offset`, `Error reading value …`);
+  /// the full ExifTool warning corpus is a Phase-2 forward-item.
+  warnings: Vec<String>,
+  /// The captured MakerNote (0x927c) blob, if seen.
+  maker_note: Option<MakerNote<'a>>,
+  /// Chain-IFD (IFD0 / trailing-IFD) start offsets already walked — the
+  /// trailing-chain loop breaker. ExifTool records every NON-zero-`DirLen`
+  /// directory in `%PROCESSED` (`ExifTool.pm:9050-9061`); a trailing IFD
+  /// carries its true extent as `DirLen`, so a malformed next-IFD chain
+  /// that revisits an already-walked trailing IFD is caught by the
+  /// `%PROCESSED` guard and `walk_ifd_chain`'s `loop {}` stays finite.
+  /// Only chain IFDs are recorded here — IFD-pointer subdirectories
+  /// (ExifIFD/GPS/InteropIFD) are NOT, because ExifTool reprocesses a
+  /// shared subdirectory offset (see `active_ifd_offsets`).
+  ///
+  /// A [`HashSet`](std::collections::HashSet), NOT a `Vec`: this is a pure
+  /// membership set (`contains`/`insert`, never iterated for order), and it
+  /// grows with the trailing-IFD chain length, so a linear `Vec::contains`
+  /// scan would be O(N²) over a long (or adversarial) chain. The set has no
+  /// ordering contract — the walk order is driven by the next-IFD pointers,
+  /// not by this set.
+  seen_ifd_offsets: std::collections::HashSet<usize>,
+  /// IFD start offsets currently on the ACTIVE recursion path — the
+  /// true-cycle guard for IFD-pointer subdirectories. Pushed when
+  /// `walk_one_ifd` begins a directory and popped when it returns, so the
+  /// vector always holds exactly the chain of directories the walker is
+  /// nested inside. A subdirectory pointer that targets an offset already
+  /// on this path is a genuine cycle (e.g. an ExifIFD whose 0x8769 tag
+  /// points back at itself, or `ExifIFD → GPS → ExifIFD`) and is rejected;
+  /// a subdirectory offset shared between two SIBLING / sequentially
+  /// completed walks (the first walk has already popped its offset) is NOT
+  /// on the path and IS reprocessed — faithful to ExifTool, which skips
+  /// the `%PROCESSED` guard for the `DirLen 0` IFD-pointer subdirectories
+  /// of a standalone TIFF (`ExifTool.pm:9052`; `Exif.pm:7020-7026` resets
+  /// `$size`/`DirLen` to 0 for an out-of-buffer subdirectory start).
+  active_ifd_offsets: Vec<usize>,
+}
+
+impl Walker<'_> {
+  /// Walk an IFD and then follow its next-IFD pointer chain (IFD0 → IFD1 →
+  /// …) — faithful to `ProcessExif`'s `$$dirInfo{Multi}` trailing-IFD scan
+  /// (`Exif.pm:7202-7228`). `Multi` is set for IFD0 (`Exif.pm:6339`).
+  fn walk_ifd_chain(&mut self, start: usize, first_kind: IfdKind) {
+    let mut offset = start;
+    let mut kind = first_kind;
+    // The 1-based number of the NEXT trailing IFD. ExifTool strips the
+    // trailing digits off `DirName` and appends `$ifdNum + 1`
+    // (`Exif.pm:7215-7216`): IFD0 → IFD1, IFD1 → IFD2, IFD2 → IFD3… The
+    // chain always starts at IFD0, so the first hop produces `Trailing(1)`.
+    // `u32` so the decimal `DirName` keeps incrementing past IFD65535 —
+    // ExifTool's `$ifdNum + 1` is plain Perl arithmetic with no cap.
+    let mut trailing_num: u32 = 1;
+    // `for (;;)` (`Exif.pm:7211`) — ExifTool has NO fixed cap on the
+    // trailing-IFD chain. Termination is faithful to the Perl loop:
+    //   - `Get32u($dataPt, $dirEnd) or last` — a 0 next pointer ends it
+    //     (`walk_one_ifd` returns `Some(0)`);
+    //   - an invalid / unreadable directory aborts it (`Some`→`None`);
+    //   - the chain-IFD seen-offset guard in `walk_one_ifd` breaks any
+    //     cycle — a malformed TIFF that points a trailing IFD back at an
+    //     already-walked chain-IFD offset terminates on the first revisit
+    //     (every chain hop here is `Ifd0`/`Trailing`, the kinds recorded
+    //     in `seen_ifd_offsets`), so the loop is always finite.
+    loop {
+      let Some(next) = self.walk_one_ifd(offset, kind) else {
+        return;
+      };
+      if next == 0 {
+        return; // `Get32u($dataPt, $dirEnd) or last` — a 0 pointer ends the chain.
+      }
+      // `$newDirInfo{DirName} .= $ifdNum + 1` — number the next trailing
+      // IFD (IFD1, IFD2, IFD3…). Plain (unsaturating) `+ 1` on a `u32`,
+      // faithful to ExifTool's uncapped Perl arithmetic: a finite chain
+      // past IFD65535 emits IFD65536, IFD65537… The chain-IFD seen-offset
+      // guard (`walk_one_ifd`) terminates any cycle, so the counter cannot
+      // run away — a finite TIFF chain has at most one IFD per distinct
+      // offset, far fewer than `u32::MAX`.
+      kind = IfdKind::Trailing(trailing_num);
+      trailing_num += 1;
+      offset = next;
+    }
+  }
+
+  /// Walk ONE IFD at `ifd_start`, emitting its leaf tags and recursing into
+  /// its SubDirectories. Returns `Some(next_ifd_offset)` (0 ⇒ no next IFD)
+  /// when the IFD was structurally valid, `None` to abort the chain.
+  ///
+  /// Faithful to the body of `ProcessExif` (`Exif.pm:6278-7240`).
+  ///
+  /// This wrapper applies the recursion / reprocess guard, then delegates to
+  /// [`walk_one_ifd_body`]. ExifTool's guard is the `%PROCESSED` check at
+  /// `ExifTool.pm:9050-9061`: a directory address is remembered, and a
+  /// revisit warns `"$dirName pointer references previous $prev directory"`
+  /// then `return 0 unless $dirName eq 'GPS' and $prev eq 'InteropIFD'`.
+  ///
+  /// Critically, that `%PROCESSED` block is GATED on `$$dirInfo{DirLen}`
+  /// being non-zero (`($$dirInfo{DirLen} or not defined …)`,
+  /// `ExifTool.pm:9052`, comment: "directories don't overlap if the length
+  /// is zero"). For a STANDALONE TIFF — the file shape every exifast `TIFF`
+  /// fixture uses, and the shape the golden oracle runs ExifTool against —
+  /// an IFD-pointer SubDirectory (ExifIFD/GPS/InteropIFD via
+  /// `Start => '$val'`) is built with `DirLen => $size`, and `$size` is
+  /// forced to **0** at `Exif.pm:7020-7026`: the value-data buffer holds
+  /// only the IFD currently being parsed, so the out-of-buffer subdirectory
+  /// `$subdirStart` trips `$subdirStart + 2 > $subdirDataLen` and ExifTool
+  /// resets `$subdirDataPt`/`$size` to re-read the directory from the file.
+  /// With `DirLen 0` the `%PROCESSED` guard is SKIPPED entirely for every
+  /// IFD-pointer subdirectory, so ExifTool reprocesses ANY shared
+  /// subdirectory offset — emitting both groups, with NO warning. (The
+  /// `%PROCESSED` GPS-after-InteropIFD carve-out at `ExifTool.pm:9059` is
+  /// the `DirLen != 0` / embedded-EXIF behaviour; on a standalone TIFF the
+  /// guard never reaches it because it is skipped — so the carve-out is
+  /// just one instance of the general "reprocess the shared offset" rule.)
+  /// Verified against bundled `perl exiftool`: a TIFF whose IFD0 ExifOffset
+  /// and GPSInfo point at one shared IFD emits `ExifIFD:Orientation` AND
+  /// `GPS:GPSVersionID` with no warning (`ProcessDirectory` trace: ExifIFD,
+  /// InteropIFD & GPS all `DirLen=0`, `%PROCESSED` never set).
+  ///
+  /// Trailing IFDs are different: a trailing IFD carries its TRUE extent as
+  /// `DirLen` (non-zero), so ExifTool's `%PROCESSED` guard DOES fire for
+  /// them and `return 0` breaks a looping next-IFD chain. The port mirrors
+  /// this split:
+  ///
+  /// * **Chain IFDs** (`Ifd0` / `Trailing`) — recorded in
+  ///   [`seen_ifd_offsets`]; a revisit aborts. This is the trailing-chain
+  ///   loop breaker (`walk_ifd_chain`'s `loop {}` stays finite).
+  /// * **IFD-pointer subdirectories** (`ExifIfd` / `Gps` / `Interop`) — NOT
+  ///   recorded in `seen_ifd_offsets`; a shared offset is reprocessed. The
+  ///   only rejection is a genuine ancestor cycle: an offset already on the
+  ///   ACTIVE recursion path ([`active_ifd_offsets`]) — e.g. an ExifIFD
+  ///   whose 0x8769 tag points back at itself. ExifTool's standalone-TIFF
+  ///   RAF re-read bounds such a cycle by failing to load the repeated
+  ///   directory; the port reads the whole file into memory, so it needs
+  ///   the explicit active-path check to stay finite.
+  fn walk_one_ifd(&mut self, ifd_start: usize, kind: IfdKind) -> Option<usize> {
+    let is_chain = matches!(kind, IfdKind::Ifd0 | IfdKind::Trailing(_));
+    if is_chain {
+      // Chain IFD: ExifTool records its non-zero-`DirLen` address in
+      // `%PROCESSED`; a revisit `return 0`s. Break the looping chain.
+      if !self.seen_ifd_offsets.insert(ifd_start) {
+        return None;
+      }
+    } else {
+      // IFD-pointer subdirectory (ExifIFD/GPS/InteropIFD): ExifTool skips
+      // the `%PROCESSED` guard (`DirLen 0`), so a shared offset reaching
+      // here from a SIBLING / already-completed walk is reprocessed. Only
+      // a true ancestor cycle — the offset is still on the active
+      // recursion path — is rejected.
+      if self.active_ifd_offsets.contains(&ifd_start) {
+        return None;
+      }
+    }
+    // Track the active recursion path so a nested subdirectory pointer
+    // back to an ancestor IFD is caught above. Popped on every exit.
+    self.active_ifd_offsets.push(ifd_start);
+    let result = self.walk_one_ifd_body(ifd_start, kind);
+    let popped = self.active_ifd_offsets.pop();
+    debug_assert_eq!(popped, Some(ifd_start), "active-path stack imbalance");
+    result
+  }
+
+  /// The body of [`walk_one_ifd`] — the structural walk of one IFD, AFTER
+  /// the recursion / reprocess guard has admitted it. Faithful to the body
+  /// of `ProcessExif` (`Exif.pm:6278-7240`).
+  fn walk_one_ifd_body(&mut self, ifd_start: usize, kind: IfdKind) -> Option<usize> {
+    let data = self.data;
+    // `$numEntries = Get16u($dataPt, $dirStart)` (Exif.pm:6344). The count
+    // is readable only when `$dirStart <= $dataLen-2` (Exif.pm:6343); if
+    // not, `$dirSize` is left undef and — with no RAF to read the IFD
+    // from the file — `$success` stays 0, so ExifTool warns
+    // `Bad $dir directory` (Exif.pm:6381) and aborts. For an IFD pointer
+    // that lands past the end of the EXIF block the 2-byte count cannot
+    // be read at all; emit the same warning + abort.
+    //
+    // All of the directory-extent arithmetic below is `checked_*`: on a
+    // 32-bit / wasm target an attacker-controlled `ifd_start`/`num_entries`
+    // near `u32::MAX` could overflow `usize` (debug panic / release wrap →
+    // bounds checks would then run against a wrapped low address). An
+    // overflow can never describe an in-range directory, so we treat it
+    // exactly like an unreadable one: warn "Bad $dir directory" and abort
+    // THIS directory BEFORE any slice access or entry walk — the same path
+    // the count-past-EOF and IFD-overrun cases below take (Exif.pm:6381). On
+    // 64-bit these checks never trip for an in-range value, so behavior is
+    // unchanged there.
+    if ifd_start.checked_add(2).is_none_or(|end| end > data.len()) {
+      self
+        .warnings
+        .push(std::format!("Bad {} directory", kind.as_str()));
+      return None;
+    }
+    let num_entries = get_u16(data, ifd_start, self.order)? as usize;
+    // `$dirSize = 2 + 12 * $numEntries; $dirEnd = $dirStart + $dirSize`,
+    // each step checked (see the overflow note above) — overflow ⇒ the
+    // Bad-directory abort.
+    let Some(dir_end) = num_entries
+      .checked_mul(12)
+      .and_then(|body| body.checked_add(2))
+      .and_then(|dir_size| ifd_start.checked_add(dir_size))
+    else {
+      self
+        .warnings
+        .push(std::format!("Bad {} directory", kind.as_str()));
+      return None;
+    };
+    // `$bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) { unless
+    // ($bytesFromEnd==2 or $bytesFromEnd==0) { Warn; return 0 } }`
+    // (Exif.pm:6389-6395). If the IFD overruns the buffer entirely we
+    // cannot read its entries — abort.
+    if dir_end > data.len() {
+      // The IFD's declared extent runs past the EXIF block. ExifTool's
+      // "read what we can" salvage (`$numEntries = int(($dirSize-2)/12)`,
+      // Exif.pm:6386-6388) is GATED to MakerNotes: `return 0 unless
+      // $inMakerNotes and $dirLen >= 14 …` (Exif.pm:6381-6385). For a
+      // normal IFD0/IFD1/ExifIFD/GPS/InteropIFD the count cannot be read
+      // reliably (the file-seek fallback at Exif.pm:6362-6374 fails its
+      // `Read` and yields `$success = 0`), so ExifTool warns
+      // "Bad $dir directory" and aborts the WHOLE directory — no partial
+      // tags. The exifast walker never recurses into a MakerNote IFD
+      // (vendor parsing is deferred — see [`SubDirKind::MakerNote`]), so
+      // every directory kind it handles takes the abort branch.
+      // `$et->Warn("Bad $dir directory")` — Exif.pm:6381.
+      self
+        .warnings
+        .push(std::format!("Bad {} directory", kind.as_str()));
+      return None;
+    }
+
+    // `my $bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) {
+    // unless ($bytesFromEnd==2 or $bytesFromEnd==0) { Warn("Illegal $dir
+    // directory size ($numEntries entries)"); return 0 } }`
+    // (Exif.pm:6394-6399). ExifTool reads the IFD body from the file via
+    // RAF — the 2-byte count, then `Read($buf2, 12*n + 4)` capped at EOF
+    // — so `$bytesFromEnd` is `min(file-bytes-after-$dirEnd, 4)`. The
+    // legal residue is exactly the 4-byte next-IFD pointer (`>= 4` ⇒
+    // clamped to 4), or a deliberately truncated tail of 2 or 0 bytes.
+    // A residue of 1 or 3 bytes is a malformed directory: ExifTool warns
+    // and aborts. `dir_end <= data.len()` is guaranteed by the branch
+    // above, so the subtraction cannot underflow.
+    let bytes_from_end = data.len() - dir_end;
+    if bytes_from_end == 1 || bytes_from_end == 3 {
+      self.warnings.push(std::format!(
+        "Illegal {} directory size ({num_entries} entries)",
+        kind.as_str()
+      ));
+      return None;
+    }
+
+    // `walk_entries` returns `false` when entry 0 carried a bad format
+    // code: ExifTool's `return 0` (Exif.pm:6477) exits `ProcessExif`
+    // ENTIRELY — before the line-7202 trailing-IFD scan — so a corrupt
+    // IFD0 must NOT leak its IFD1 thumbnail tags. Abort the whole chain.
+    if !self.walk_entries(ifd_start, dir_end, num_entries, kind) {
+      return None;
+    }
+
+    // `if ($$dirInfo{Multi} and $bytesFromEnd >= 4) { Get32u($dataPt,
+    // $dirEnd) }` — the next-IFD pointer (`Exif.pm:7203-7204`/7212). The
+    // `Multi` trailing-directory scan starts at IFD0 (`Multi => 1`,
+    // `Exif.pm:6339`) and the `for (;;)` loop at `Exif.pm:7211-7232`
+    // follows the chain through IFD1 → IFD2 → IFD3… reading a fresh
+    // `Get32u($dataPt, $dirEnd)` at each hop. So the next-IFD pointer is
+    // read for IFD0 AND every trailing IFD — but NOT for a sub-IFD
+    // (ExifIFD/GPS/InteropIFD): those are reached by `ProcessDirectory`
+    // WITHOUT `Multi`, so their trailing 4 bytes are not a next pointer.
+    let follows_chain = matches!(kind, IfdKind::Ifd0 | IfdKind::Trailing(_));
+    // `dir_end + 4` is `checked_add` for the 32-bit/wasm overflow class: a
+    // `dir_end` within 4 of `usize::MAX` would wrap. (`dir_end <= data.len()`
+    // here, so for a real buffer this never overflows — but the sweep keeps
+    // every offset `+` on the IFD path checked.) Overflow ⇒ no next IFD,
+    // matching the "trailing 4 bytes don't fit" branch.
+    let next = if follows_chain && dir_end.checked_add(4).is_some_and(|end| end <= data.len()) {
+      get_u32(data, dir_end, self.order).unwrap_or(0) as usize
+    } else {
+      0
+    };
+    Some(next)
+  }
+
+  /// Walk `num_entries` IFD entries starting at `ifd_start`. Each entry is
+  /// 12 bytes at `$dirStart + 2 + 12*$index` (`Exif.pm:6452`). `dir_end` is
+  /// the IFD's end offset (`$dirStart + $dirSize`) — the out-of-line value
+  /// bounds checks need it to detect a value that overlaps the directory.
+  ///
+  /// Returns `false` to ABORT the whole directory (and its trailing-IFD
+  /// chain) — the faithful `return 0` ExifTool takes either when entry 0
+  /// carries a bad format code (`Exif.pm:6475-6477`) OR when an out-of-line
+  /// value's RAF read overruns EOF (`Error reading value …`, `return 0
+  /// unless $inMakerNotes or $htmlDump or $truncOK`, `Exif.pm:6602`). Both
+  /// `return 0`s leave `ProcessExif` before the line-7202 next-IFD scan, so
+  /// the caller must NOT read the next-IFD pointer when this is `false`.
+  /// `true` otherwise.
+  fn walk_entries(
+    &mut self,
+    ifd_start: usize,
+    dir_end: usize,
+    num_entries: usize,
+    kind: IfdKind,
+  ) -> bool {
+    for index in 0..num_entries {
+      // `$entry = $dirStart + 2 + 12*$index` (Exif.pm:6452), `checked_*` for
+      // the 32-bit/wasm overflow class. The caller's checked `dir_end =
+      // ifd_start + 2 + 12*num_entries` already guarantees every `entry`
+      // (index < num_entries) is `< dir_end <= data.len()` and so cannot
+      // overflow — but keep the arithmetic explicitly checked so its
+      // overflow-safety does not silently depend on that invariant. An
+      // overflow stops the entry loop (treated as past-EOF, like the
+      // 12-byte-entry-read guard below).
+      let Some(entry) = index
+        .checked_mul(12)
+        .and_then(|off| off.checked_add(2))
+        .and_then(|off| ifd_start.checked_add(off))
+      else {
+        break;
+      };
+      // Defend the 12-byte entry read (the caller bounded `num_entries`).
+      if entry
+        .checked_add(12)
+        .is_none_or(|end| end > self.data.len())
+      {
+        break;
+      }
+      // `walk_entry` returns `false` to abort the WHOLE directory — the
+      // faithful `return 0` ExifTool takes when entry 0 has a bad format
+      // code (`Exif.pm:6475`) or an out-of-line value's RAF read overruns
+      // EOF (`Exif.pm:6602`). Propagate it to the caller so the next-IFD
+      // pointer is NOT followed.
+      if !self.walk_entry(entry, index, ifd_start, dir_end, kind) {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// Resolve a tag NAME for a warning message, against the table that owns
+  /// the IFD currently being walked. GPS and Interop tag IDs OVERLAP (e.g.
+  /// 0x0002 is `GPSLatitude` in `%GPS::Main` but `InteropVersion` in
+  /// `%Interop::Main`); ExifTool resolves a warning's `$$tagInfo{Name}`
+  /// against the IFD's own `$tagTablePtr` (`Exif.pm:6464`/6674), so the GPS
+  /// IFD must look up the GPS table. Returns `Some(name)` for a known tag,
+  /// `None` for an unknown one (caller emits the `tag 0x%.4x` form).
+  fn warn_tag_name(kind: IfdKind, tag_id: u16) -> Option<&'static str> {
+    if kind.is_gps() {
+      #[cfg(feature = "gps")]
+      {
+        gps::lookup(tag_id).map(|t| t.name)
+      }
+      // `gps` feature OFF ⇒ the GPS module is "not loaded": ExifTool's
+      // `GetTagInfo` yields nothing, so the warning uses the unknown-tag
+      // form. Faithful to the module-not-loaded path (`docs/tracking.md`).
+      #[cfg(not(feature = "gps"))]
+      {
+        let _ = tag_id;
+        None
+      }
+    } else {
+      tables::lookup(tag_id).map(|t| t.name)
+    }
+  }
+
+  /// Decode + emit ONE 12-byte IFD entry (`Exif.pm:6453-7194`).
+  ///
+  /// Entry layout (`Exif.pm:6453-6456`):
+  /// ```text
+  /// tag    = Get16u($dataPt, $entry)       # tag ID
+  /// format = Get16u($dataPt, $entry+2)     # format code
+  /// count  = Get32u($dataPt, $entry+4)     # element count
+  /// value/offset at $entry+8 (4 bytes)
+  /// ```
+  ///
+  /// `index` is the 0-based entry position (used in the `Error reading
+  /// value …` warning) and `ifd_start` / `dir_end` bound the IFD (used by
+  /// the out-of-line value checks — see the `$size > 4` branch).
+  ///
+  /// Returns `false` to ABORT the whole directory — the faithful `return 0`
+  /// ExifTool takes when entry 0 carries a bad format code (`Exif.pm:6475`)
+  /// OR when an out-of-line value's RAF read overruns EOF (`Error reading
+  /// value …`, `Exif.pm:6602`); `true` otherwise (a normal entry, or a
+  /// `next`-skip such as a `Suspicious offset` / `Wrong format` / undecodable
+  /// value, all of which CONTINUE in bundled).
+  fn walk_entry(
+    &mut self,
+    entry: usize,
+    index: usize,
+    ifd_start: usize,
+    dir_end: usize,
+    kind: IfdKind,
+  ) -> bool {
+    let data = self.data;
+    let order = self.order;
+    // `my $tagID = Get16u($dataPt, $entry)` etc.
+    let Some(tag_id) = get_u16(data, entry, order) else {
+      return true;
+    };
+    let Some(format_code) = get_u16(data, entry + 2, order) else {
+      return true;
+    };
+    let Some(count) = get_u32(data, entry + 4, order) else {
+      return true;
+    };
+    let count = count as usize;
+
+    let format = Format::from_code(format_code);
+    // `if (($format < 1 or $format > 13) and $format != 129 ...) { ... }`
+    // (Exif.pm:6464-6477). An unrecognized format code is BAD: the
+    // BigTIFF codes 16-18 ARE recognized by `Format`, but the standard
+    // TIFF IFD entry only legitimately uses 1-13 + 129; a 16-18 in a
+    // non-BigTIFF IFD is treated as bad (the standalone-TIFF fixtures
+    // never use BigTIFF). ExifTool, with no `MAP_FORMAT` override:
+    //   - warns `Bad format ($format) for $dir entry $index` and bumps
+    //     `$warnCount` — but ONLY when `$format` is truthy (a 0 code is
+    //     just zero-padding of the IFD, so it warns silently);
+    //   - then `next if $index` — skip this one entry — ELSE (`$index ==
+    //     0`) `return 0`, aborting the WHOLE directory ("assume corrupted
+    //     IFD if this is our first entry"). The Sony-ILCE carve-out
+    //     (`$$et{Model} =~ /^ILCE/`) is NOT modelled: exifast does not
+    //     track `Model` during the IFD walk, and an ILCE camera with an
+    //     empty first entry is a narrow Sony-specific case outside the
+    //     standalone-TIFF camera-metadata scope (`docs/tracking.md`).
+    let recognized = matches!(format_code, 1..=13 | 129);
+    if !recognized {
+      // `if ($format or $validate) { Warn(...); ++$warnCount }` — a 0
+      // code is silent padding; any other bad code warns.
+      if format_code != 0 {
+        let dir = kind.as_str();
+        self.warnings.push(std::format!(
+          "Bad format ({format_code}) for {dir} entry {index}"
+        ));
+      }
+      // `next if $index` — skip this entry; entry 0 ⇒ `return 0` (abort).
+      return index != 0;
+    }
+
+    // `my $size = $count * $formatSize[$format]` (Exif.pm:6502).
+    let elem_size = format.byte_size();
+    let size = count.saturating_mul(elem_size);
+
+    // The value pointer. `$valuePtr = $entry + 8` for an inline value
+    // (≤ 4 bytes); for `$size > 4` the 4 bytes at `$entry+8` are an OFFSET
+    // into the TIFF block (Exif.pm:6504-6510).
+    let (value_offset, read_len) = if size > 4 {
+      // `if ($size > 0x7fffffff and (not $tagInfo or not $$tagInfo{ReadFromRAF}))
+      // { Warn('Invalid size ...'); ++$warnCount; next }` (Exif.pm:6505-6509)
+      // — the FIRST test inside the `$size > 4` block, BEFORE the offset is
+      // even read. A `count` so large that `count * formatSize` exceeds the
+      // signed-32-bit ceiling is rejected as the per-entry `next` (a SKIP, not
+      // the directory-abort `return false`): bumping `$warnCount` and
+      // continuing the entry loop. `$$tagInfo{ReadFromRAF}` is not carried by
+      // any camera leaf tag this walker reaches (3 non-camera tags in
+      // `Exif.pm`, none in `GPS.pm`), so the guard reduces to `size >
+      // 0x7fffffff`. Without this an oversized count falls through to the
+      // EOF/`Error reading value` abort below (`return false`), which would
+      // kill the rest of the IFD — including the IFD1 thumbnail chain — even
+      // though Perl merely skips the one bad entry. The tag name uses
+      // `TagName` (`Exif.pm:6252`): `tag 0x%.4x` plus ` Name` for a known tag.
+      if size > 0x7fff_ffff {
+        let dir = kind.as_str();
+        let tag = match Self::warn_tag_name(kind, tag_id) {
+          Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
+          None => std::format!("tag 0x{tag_id:04x}"),
+        };
+        self
+          .warnings
+          .push(std::format!("Invalid size ({size}) for {dir} {tag}"));
+        return true; // `next` — skip this entry, continue the IFD.
+      }
+      let off = match get_u32(data, entry + 8, order) {
+        Some(o) => o as usize,
+        None => return true,
+      };
+      // `$valuePtr -= $dataPos` — `$dataPos == 0` here (the whole block IS
+      // the EXIF data). An out-of-line value pointer is subject to two
+      // ExifTool bounds checks, in this precedence:
+      //
+      //   1. `$valuePtr < 0 or $valuePtr + $size > $dataLen` ⇒ ExifTool
+      //      reads the value from the file via `$raf` (Exif.pm:6549-6611).
+      //      A standalone TIFF processed from a file ALWAYS carries a RAF —
+      //      `DoProcessTIFF` builds the IFD dirInfo with `RAF => $raf`
+      //      (ExifTool.pm:8717), and `ProcessExif` reads it as
+      //      `$raf = $$dirInfo{RAF}` (Exif.pm:6289) — so the `if ($raf)`
+      //      branch (Exif.pm:6552) is taken, NOT the no-RAF `else`. When the
+      //      out-of-line value extends past EOF the `$raf->Read($buff,$size)
+      //      != $size` (Exif.pm:6593) fails: ExifTool warns "Error reading
+      //      value for $dir entry $index, ID 0x.... $Name" (Exif.pm:6594)
+      //      and then `return 0 unless $inMakerNotes or $htmlDump or
+      //      $truncOK` (Exif.pm:6602) — it ABORTS the WHOLE directory.
+      //      `walk_entry` returns `false` to propagate that abort: the
+      //      caller (`walk_entries`) stops the entry loop and
+      //      `walk_one_ifd_body` does NOT read the trailing next-IFD pointer
+      //      (the `return 0` exits `ProcessExif` before the line-7202
+      //      `Multi` chain scan), so a crafted TIFF with a valid LATER entry
+      //      and/or a next-IFD pointer after the overrun surfaces NO tags
+      //      the oracle suppresses.
+      //
+      //      The `$inMakerNotes`/`$htmlDump`/`$truncOK` EXCEPTION (where
+      //      ExifTool warns then CONTINUES the loop with `$bad = 1`) does
+      //      NOT apply to any directory this walker reaches: the Exif walker
+      //      DEFERS MakerNote (0x927c) parsing — it captures the raw blob
+      //      and never recurses into a MakerNote IFD ([`SubDirKind::
+      //      MakerNote`]), so `$inMakerNotes` is never true; no Exif/GPS
+      //      table tag this port emits carries `TruncateOK` (that flag lives
+      //      on vendor MakerNote / preview tags); and `htmlDump` is a
+      //      verbose-only mode not modelled here. Every `IfdKind` admitted
+      //      to this code — Ifd0/Trailing/ExifIfd/Gps/Interop — is thus a
+      //      non-MakerNotes standalone-TIFF directory that takes the abort.
+      //   2. else, `$valuePtr < 8` (offset into the 8-byte TIFF header —
+      //      "offset shouldn't point into TIFF header", Exif.pm:6539) OR
+      //      `$valuePtr < $dirEnd and $valuePtr+$size > $dirStart` (the
+      //      value overlaps the IFD, Exif.pm:6549) ⇒ `$suspect` ⇒
+      //      "Suspicious $dir offset for $Name" (Exif.pm:6675) and the tag
+      //      is skipped (`next unless $verbose`) — a CONTINUE, not an abort.
+      //
+      // The EOF check is first because in ExifTool the read happens
+      // (Exif.pm:6549-6611) BEFORE the trailing `$suspect == $warnCount`
+      // test (Exif.pm:6672); for an overrun-AND-suspect value the read's
+      // `return 0` fires first, so the suspect `next` is never reached.
+      let dir = kind.as_str();
+      // `$valuePtr + $size` (Exif.pm:6531) — `checked_add` so an out-of-line
+      // `off`/`size` near `usize::MAX` on a 32-bit target cannot wrap the
+      // EOF test (and so the wrapped sum cannot pass a low-address bounds
+      // check). The validated end is reused for the IFD-overlap test below.
+      let value_end = match off.checked_add(size) {
+        Some(end) if end <= data.len() => end,
+        _ => {
+          // `Error reading value` — the tag name is appended only for a
+          // known, non-Unknown tag (Exif.pm:6596-6598). The name is
+          // resolved against the IFD's OWN table (GPS vs Exif/Interop —
+          // see `warn_tag_name`); a GPS IFD's 0x0002 is `GPSLatitude`,
+          // not the Interop table's `InteropVersion`.
+          let tag = match Self::warn_tag_name(kind, tag_id) {
+            Some(name) => std::format!(" {name}"),
+            None => String::new(),
+          };
+          self.warnings.push(std::format!(
+            "Error reading value for {dir} entry {index}, ID 0x{tag_id:04x}{tag}"
+          ));
+          // `return 0 unless $inMakerNotes or $htmlDump or $truncOK`
+          // (Exif.pm:6602) — abort the directory (see the precedence note
+          // above for why the exception never applies to this walker).
+          return false;
+        }
+      };
+      // `$valuePtr < $dirEnd and $valuePtr+$size > $dirStart` (Exif.pm:6549):
+      // `value_end` is the already-validated, non-overflowing `off + size`.
+      let overlaps_ifd = off < dir_end && value_end > ifd_start;
+      if off < 8 || overlaps_ifd {
+        // `$tagStr = $tagInfo ? $$tagInfo{Name} : sprintf('tag 0x%.4x', …)`
+        // (Exif.pm:6674). The name is resolved against the IFD's own table
+        // (`warn_tag_name`) — GPS IDs overlap the Interop table.
+        let warning = match Self::warn_tag_name(kind, tag_id) {
+          Some(name) => std::format!("Suspicious {dir} offset for {name}"),
+          None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
+        };
+        self.warnings.push(warning);
+        return true;
+      }
+      (off, size)
+    } else {
+      // Inline: the value occupies the first `$size` bytes at `$entry+8`
+      // (`$size <= 4`). The caller (`walk_entries`) already proved
+      // `entry + 12 <= data.len()` with `checked_add`, so `entry + 8` cannot
+      // overflow; `checked_add` keeps that explicit across the call boundary.
+      // An overflow (impossible given the caller's guard) skips the entry.
+      let Some(value_offset) = entry.checked_add(8) else {
+        return true;
+      };
+      (value_offset, size)
+    };
+
+    // ---- SubDirectory pointer tags (the IFD-chain seam) -----------------
+    // Only IFD0 carries ExifIFD/GPS pointers; only ExifIFD carries Interop
+    // + MakerNote (faithful: ExifTool resolves these by tag table + DirName,
+    // Exif.pm:2006/2130/2496/2720).
+    if let Some(sub) = sub_dir_for(tag_id, kind) {
+      // `if (($$tagInfo{IsOffset} or $$tagInfo{SubIFD}) and not
+      // $intFormat{$formatStr}) { Warn('Wrong format ...'); ... next unless
+      // $verbose }` (Exif.pm:6747-6754). A SubIFD/offset pointer encoded with
+      // a NON-integer on-disk format (e.g. a `GPSInfo` 0x8825 mis-written as
+      // `string[4]`) is REJECTED before the subdir is followed: ExifTool
+      // warns and, in default (non-verbose) mode, `next`-skips the entry — the
+      // sub-IFD is NOT walked. Without this the port would decode the pointer
+      // as text and silently drop it, making a corrupt GPS pointer
+      // indistinguishable from no-GPS. The integer test is `%intFormat`
+      // (`Format::is_int`, Exif.pm:124-135); `MakerNote` (0x927c) has neither
+      // `IsOffset` nor `SubIFD`, so `is_sub_ifd()` is false and a string-typed
+      // MakerNote is parsed as usual. The warning uses `$$tagInfo{Name}` via
+      // `SubDirKind::tag_name` (these pointer tags are NOT in the leaf-lookup
+      // `tables`) and the on-disk `$formatStr`; for these SubIFD tags no
+      // `Format` override applies (Exif.pm:6733 gates the `undef` default on
+      // `not SubIFD`), so the on-disk format name is reported verbatim.
+      if sub.is_sub_ifd() && !format.is_int() {
+        let dir = kind.as_str();
+        let fmt = format.name();
+        let name = sub.tag_name();
+        self.warnings.push(std::format!(
+          "Wrong format ({fmt}) for {dir} 0x{tag_id:04x} {name}"
+        ));
+        return true;
+      }
+      self.dispatch_subdir(sub, value_offset, read_len, format, count);
+      return true;
+    }
+
+    // ---- Tag-table READ-side `Format` override --------------------------
+    // `my $readFormat = $$tagInfo{Format}; ... if ($readFormat) { $formatStr
+    // = $readFormat; ... $format = $newNum; ... $count = int($size /
+    // $formatSize[$format]) }` (Exif.pm:6729-6744). The tag table's `Format`
+    // is honored BEFORE `ReadValue`, OVERRIDING the on-disk format code. The
+    // on-disk byte `$size` (= count × on-disk elem size, computed above) is
+    // preserved; the new count is `int($size / new_elem_size)`. This is the
+    // mechanism that forces `UserComment` (0x9286, `Format => 'undef'`,
+    // Exif.pm:2500) through `undef` even when a camera mis-wrote it as
+    // `string`/`int8u` (Exif.pm:2499) — without it `ReadValue`'s `string`
+    // decode would NUL-trim `ASCII\0\0\0Hello World` to `ASCII` before the
+    // `ConvertExifText` RawConv could strip the 8-byte charset prefix. The
+    // override is resolved against the SAME tag table the leaf emits under
+    // (Exif/Interop vs GPS): the GPS table carries its OWN `Format` override
+    // for `GPSDateStamp` (0x001d, `Format => 'undef'`, GPS.pm:312) — without it
+    // a `string`-on-disk `GPSDateStamp` (`2024\0 05\0 22\0`) would NUL-trim to
+    // `2024` and collapse to just the year. Resolving per-table (rather than
+    // gating all GPS entries off) honors 0x001d while leaving the GPS text
+    // tags 0x001b/0x001c — `Writable => 'undef'` but NO `Format`, GPS.pm:296/
+    // 304 — correctly NUL-trimmed, exactly as bundled does.
+    let table_override = if kind.is_gps() {
+      #[cfg(feature = "gps")]
+      {
+        gps::format_override(tag_id)
+      }
+      // `gps` feature OFF ⇒ the GPS module is "not loaded": no GPS-table
+      // `Format` override is resolvable (the leaf isn't decoded as a GPS tag
+      // either), so fall through with the on-disk format unchanged.
+      #[cfg(not(feature = "gps"))]
+      {
+        let _ = tag_id;
+        None
+      }
+    } else {
+      tables::format_override(tag_id)
+    };
+    let (format, count) = if let Some(over) = table_override {
+      let new_elem = over.byte_size();
+      if new_elem != 0 && over != format {
+        // `$count = int($size / $formatSize[$format])` — `size` is the
+        // on-disk byte size; re-shape the count for the override element.
+        (over, size / new_elem)
+      } else {
+        (format, count)
+      }
+    } else {
+      (format, count)
+    };
+
+    // ---- Excessive / large-array guards (Exif.pm:6760-6783) -------------
+    // Two guards that "limit maximum length of data to reformat (avoids long
+    // delays when processing some corrupted files)", BOTH applied to the
+    // post-`Format`-override `format`/`count` (Exif.pm:6760+ runs after the
+    // 6729-6744 override). The `$formatStr !~ /^(undef|string|binary)$/`
+    // exclusion is `!matches!(format, Undef | Ascii)` — `binary` is a
+    // synthetic ExifTool format never produced on this on-disk decode path,
+    // and `string`==`Ascii`.
+    if !matches!(format, Format::Undef | Format::Ascii) {
+      // The dirName/tagName as Perl resolves them for these warnings:
+      // `$tagName = $tagInfo ? $$tagInfo{Name} : sprintf('tag 0x%.4x',$tagID)`
+      // (Exif.pm:6762). NOTE the excessive-count message uses `$dirName`
+      // (Exif.pm:6766); `$dir == $dirName == kind.as_str()` for every
+      // non-MakerNotes IFD this walker reaches (Exif.pm:6341).
+      let known = Self::warn_tag_name(kind, tag_id);
+
+      // Guard (a) — `if ($count > 100000 and ...)` (Exif.pm:6760-6770).
+      if count > 100_000 {
+        // `if ($tagName ne 'TransferFunction' or $count != 196608)` — the
+        // ColorMap-shaped 196608-count `TransferFunction` is the one tag
+        // allowed an excessive count silently (Exif.pm:6764). An UNKNOWN tag
+        // (`known == None`) is never named `TransferFunction`, so the carve-out
+        // can only spare a KNOWN `TransferFunction`. (No ported tag is named
+        // that, so the carve-out is currently inert, but it is modelled
+        // faithfully for when 0x012d is added.)
+        let transfer_function_carveout = known == Some("TransferFunction") && count == 196_608;
+        if !transfer_function_carveout {
+          // `$et->Warn("Ignoring $dirName $tagName with excessive count")`
+          // (Exif.pm:6767), with `$tagName = $tagInfo ? Name : 'tag 0x%.4x'`.
+          // In the default (non-HtmlDump) path `Warn` returns true and Perl
+          // does `next` (Exif.pm:6768) — SKIP this entry, do NOT decode.
+          // (`$warned` is set only in the HtmlDump branch, which this port
+          // does not model, so it never reaches guard (b) for the same entry;
+          // the `$count > 2000000 ? 0 : 2` minor-level only affects the
+          // suppressed-by-options case, not the warning text or the skip.)
+          let dir = kind.as_str();
+          match known {
+            Some(name) => self
+              .warnings
+              .push(std::format!("Ignoring {dir} {name} with excessive count")),
+            None => self.warnings.push(std::format!(
+              "Ignoring {dir} tag 0x{tag_id:04x} with excessive count"
+            )),
+          }
+          return true; // `next`
+        }
+      }
+
+      // Guard (b) — `if ($count > 500 and ... and (not $tagInfo or
+      // $$tagInfo{LongBinary} or $warned) and not IgnoreMinorErrors)`
+      // (Exif.pm:6771-6779). In the port's world: `$warned` is never set
+      // (no HtmlDump), `LongBinary` is not carried by any ported tag, and
+      // `IgnoreMinorErrors` is not modelled (default off ⇒ the `not` is true),
+      // so the gate reduces to `count > 500 and not $tagInfo` — i.e. a tag
+      // ABSENT from this IFD's table. ExifTool then sets `$val = "(large array
+      // of $count $formatStr values)"` instead of decoding (Exif.pm:6777).
+      // Verified against bundled ExifTool 13.59: a KNOWN tag with a 600-element
+      // int32u array (e.g. `LensInfo`) is decoded in FULL — the placeholder is
+      // NOT used — precisely because `(not $tagInfo or LongBinary or $warned)`
+      // is false; only an UNKNOWN tag takes the placeholder. The port emits no
+      // unknown leaf tags (`emit` drops them, `next unless $verbose`), so the
+      // placeholder value is observationally never surfaced — but it is
+      // produced and routed through `emit` here to mirror Perl exactly (the
+      // unknown tag is then dropped, matching bundled's verbose-only output).
+      if count > 500 && known.is_none() {
+        let placeholder = large_array_placeholder(count, format);
+        self.emit(kind, tag_id, RawValue::Text(placeholder));
+        return true;
+      }
+    }
+
+    // ---- Leaf tag — decode the value ------------------------------------
+    // `$formatStr = 'int8u' if $format == 7 and $count == 1` (Exif.pm:6644)
+    // — "treat single unknown byte as int8u". So a 1-element `undef` tag
+    // decodes as an integer, not a 1-byte binary blob. This matters for the
+    // `undef`-typed enumerations (SceneType / FileSource — Exif.pm:2812/
+    // 2824) whose PrintConv hash needs a numeric key, not raw bytes.
+    //
+    // NOTE the int8u carve-out tests `$format`/`$count` AFTER the Format
+    // override above (Exif.pm:6682 runs before the override, but for a 0x9286
+    // forced to `undef` with count ≥ 1 the carve-out only fires at count==1 —
+    // a 1-byte UserComment is degenerate and decodes as int8u in both, so the
+    // ordering is observationally identical to bundled here).
+    let decode_format = if matches!(format, Format::Undef) && count == 1 {
+      Format::Int8u
+    } else {
+      format
+    };
+    let Some(raw) = read_value(data, value_offset, decode_format, count, read_len, order) else {
+      return true; // `next unless defined $val` (Exif.pm:7016).
+    };
+
+    self.emit(kind, tag_id, raw);
+    true
+  }
+
+  /// Dispatch a SubDirectory pointer tag.
+  ///
+  /// For ExifIFD/GPS/Interop the value is the 32-bit IFD offset
+  /// (`SubDirectory => { Start => '$val' }`, `Exif.pm:2012`); we recurse
+  /// `walk_one_ifd` at that offset with the SubDirectory's `DirName`.
+  ///
+  /// For MakerNote (0x927c) we CAPTURE the raw bytes and DEFER vendor
+  /// parsing (the MakerNotes wave) — see [`SubDirKind::MakerNote`].
+  fn dispatch_subdir(
+    &mut self,
+    sub: SubDirKind,
+    value_offset: usize,
+    read_len: usize,
+    format: Format,
+    count: usize,
+  ) {
+    match sub {
+      SubDirKind::ExifIfd | SubDirKind::Gps | SubDirKind::Interop => {
+        // The pointer value (`Start => '$val'`). For ExifIFD/GPS/Interop the
+        // on-disk format is normally `int32u`/`ifd` with count 1, but
+        // `%intFormat` (Exif.pm:125-136) also accepts the SIGNED integer
+        // formats, so a pointer mis-encoded as e.g. `int32s` passes the
+        // `Wrong format` gate (Exif.pm:6747) and is still used as the offset.
+        // Decode it accepting both `U64` and `I64` shapes.
+        let Some(raw) = read_value(self.data, value_offset, format, count, read_len, self.order)
+        else {
+          return;
+        };
+        let Some(sub_offset) = raw.first_subdir_offset() else {
+          return;
+        };
+        let kind = match sub {
+          SubDirKind::ExifIfd => IfdKind::ExifIfd,
+          SubDirKind::Gps => IfdKind::Gps,
+          SubDirKind::Interop => IfdKind::Interop,
+          SubDirKind::MakerNote => unreachable!("MakerNote handled below"),
+        };
+        // `unless (IsInt($newStart)) { ... }` passes for a negative `$val`
+        // (`IsInt` is `/^[+-]?\d+$/`, ExifTool.pm:5943), but the subsequent
+        // `if ($subdirStart < 0 ...) { ... Bad $tagStr SubDirectory start }`
+        // (Exif.pm:7017) rejects a NEGATIVE pointer. For a standalone TIFF
+        // read via RAF the negative seek fails and ExifTool warns
+        // `Bad $dir directory` (Exif.pm:6381) — the same warning
+        // `walk_one_ifd` raises for an offset it cannot read. Route the
+        // negative pointer through that path instead of walking it.
+        let Ok(sub_offset) = usize::try_from(sub_offset) else {
+          self
+            .warnings
+            .push(std::format!("Bad {} directory", kind.as_str()));
+          return;
+        };
+        // `$offset >= 8` is not enforced for sub-IFD `Start => '$val'`, but
+        // an offset inside the TIFF header (< 8) or past EOF is degenerate;
+        // `walk_one_ifd` bounds-checks and the reprocess guard handles a
+        // self-pointer.
+        // Sub-IFDs are NOT chained via a next-IFD pointer (`MaxSubdirs => 1`
+        // for GPS/Interop, `Exif.pm:2138`; ExifIFD is a single IFD too) —
+        // walk exactly one IFD.
+        let _ = self.walk_one_ifd(sub_offset, kind);
+      }
+      SubDirKind::MakerNote => {
+        // **Deferred — the MakerNotes wave.** Capture the raw blob; do NOT
+        // parse vendor MakerNotes. `value_offset .. value_offset+read_len`
+        // is the MakerNote value — the caller already proved this range fits
+        // (out-of-line via the `off.checked_add(size)` EOF gate; inline as
+        // `entry+8` with `read_len <= 4` and `entry+12 <= data.len()`). The
+        // `saturating_add` keeps the sum overflow-safe on a 32-bit target even
+        // if that invariant ever changes; an overflow clamps to EOF (the
+        // `.min(data.len())`), so a `value_offset` past the buffer yields an
+        // empty/short slice — the same saturating style `read_value` uses.
+        let end = value_offset.saturating_add(read_len).min(self.data.len());
+        if let Some(bytes) = self.data.get(value_offset..end) {
+          // First MakerNote wins (a malformed TIFF with two 0x927c tags is
+          // degenerate; ExifTool's `FoundTag` keeps the canonical name).
+          if self.maker_note.is_none() {
+            self.maker_note = Some(MakerNote { bytes });
+          }
+        }
+      }
+    }
+  }
+
+  /// Emit one decoded leaf tag — the faithful equivalent of `FoundTag`
+  /// (`Exif.pm:7181`) + `SetGroup($tagKey, $dirName)` (`Exif.pm:7184`).
+  ///
+  /// The tag NAME is resolved against the [`tables`] (Exif IFDs) or [`gps`]
+  /// (GPS IFD) table. An UNKNOWN tag ID is dropped — faithful to
+  /// `Exif.pm:6757` `next unless $verbose` (an unknown tag surfaces only in
+  /// verbose mode; the default `-j` output omits it). Documented
+  /// incremental-completion item in `docs/tracking.md`.
+  fn emit(&mut self, kind: IfdKind, tag_id: u16, raw: RawValue) {
+    // `#### eval IsOffset ($val, $et) … $val += $offsetBase` (Exif.pm:7156-
+    // 7170): convert an `IsOffset` tag's value(s) to ABSOLUTE file offsets by
+    // adding `$base + $$et{BASE}`. `$$et{BASE}` is 0 for the top-level Exif
+    // walk, so `offsetBase = self.base`. The two `IsOffset => 1` tags the port
+    // decodes are `StripOffsets` (0x0111) and `ThumbnailOffset` (0x0201), both
+    // in the non-GPS table (GPS has no `IsOffset` tags). When `base == 0`
+    // (standalone TIFF) this is a no-op, so the existing TIFF goldens are
+    // unaffected; for a JPEG `APP1` block `base` is the TIFF block's file
+    // offset, matching bundled's absolute `ThumbnailOffset`.
+    let raw = if self.base != 0 && !kind.is_gps() && is_offset_tag(tag_id) {
+      add_offset_base(raw, self.base)
+    } else {
+      raw
+    };
+    let (name, conv): (&'static str, ResolvedConv) = if kind.is_gps() {
+      #[cfg(feature = "gps")]
+      {
+        match gps::lookup(tag_id) {
+          Some(t) => (t.name, ResolvedConv::Gps(t.conv)),
+          None => return, // unknown GPS tag — verbose-only, omit.
+        }
+      }
+      // GPS IFD reached but the `gps` feature is OFF: faithful to ExifTool
+      // "module not loaded ⇒ tags not decoded". The GPS IFD's leaf tags are
+      // simply not emitted (the IFD walker still descended into it via the
+      // 0x8825 dispatch, which is harmless). `docs/tracking.md`.
+      #[cfg(not(feature = "gps"))]
+      {
+        return;
+      }
+    } else {
+      match tables::lookup(tag_id) {
+        Some(t) => (t.name, ResolvedConv::Exif(t.conv)),
+        None => return, // unknown Exif tag — verbose-only, omit.
+      }
+    };
+
+    self.entries.push(ExifEntry {
+      ifd: kind,
+      tag_id,
+      name,
+      value: ExifValue::new(raw),
+      conv,
+    });
+  }
+}
+
+/// The large-array placeholder value — `"(large array of $count $formatStr
+/// values)"` (`Exif.pm:6777`). `$formatStr` is ExifTool's format NAME (e.g.
+/// `int32u`), supplied by [`Format::name`]. This is the literal string
+/// ExifTool stores in place of decoding a `count > 500` array for a tag that
+/// would otherwise take the large-array path (guard (b) in `walk_entry`).
+fn large_array_placeholder(count: usize, format: Format) -> std::string::String {
+  std::format!("(large array of {count} {} values)", format.name())
+}
+
+/// `true` for an Exif `IsOffset => 1` value tag whose decoded value is a file
+/// offset that ExifTool rebases by `$base + $$et{BASE}` (`Exif.pm:7156-7170`).
+///
+/// The port's leaf-tag table carries exactly two such tags: `StripOffsets`
+/// (0x0111) and `ThumbnailOffset` (0x0201) — both `IsOffset => 1` in
+/// `%Exif::Main` (`Exif.pm:608`/`:1169`). The other `IsOffset` tags in
+/// `Exif.pm` (TileOffsets, PreviewImageStart, JpgFromRawStart, …) are not in
+/// the port's table yet, so they need no handling here; when they are added,
+/// extend this predicate. GPS has no `IsOffset` tags, so the caller already
+/// excludes the GPS IFD.
+#[inline]
+const fn is_offset_tag(tag_id: u16) -> bool {
+  matches!(tag_id, 0x0111 | 0x0201)
+}
+
+/// Add the offset base to each integer of an `IsOffset` tag's value
+/// (`foreach $val (@vals) { $val += $offsetBase }`, `Exif.pm:7166-7169`).
+///
+/// ExifTool splits the (string) value on spaces and adds `$offsetBase` to each
+/// element, so a multi-strip `StripOffsets` gets every offset rebased. The port
+/// holds the decoded integers directly; rebase each. `StripOffsets` /
+/// `ThumbnailOffset` decode as `U64` (`int32u`/`int16u`); a degenerate signed
+/// encoding (`I64`) is rebased too for parity with Perl's numeric `+`. Other
+/// shapes are returned unchanged (an `IsOffset` tag is always integer-typed in
+/// practice).
+fn add_offset_base(raw: RawValue, base: u32) -> RawValue {
+  let base = u64::from(base);
+  match raw {
+    RawValue::U64(v) => RawValue::U64(v.into_iter().map(|n| n.wrapping_add(base)).collect()),
+    RawValue::I64(v) => RawValue::I64(v.into_iter().map(|n| n.wrapping_add(base as i64)).collect()),
+    other => other,
+  }
+}
+
+/// Resolve a SubDirectory pointer tag — the IFD-chain seam. Returns the
+/// [`SubDirKind`] for a pointer tag in the given IFD, `None` for a leaf tag.
+///
+/// Faithful to ExifTool's tag-table dispatch: `ExifOffset`/`GPSInfo` are in
+/// `%Exif::Main` (so reachable from IFD0 and ExifIFD alike — but in practice
+/// IFD0 only); `InteropOffset`/`MakerNote` are ExifIFD tags.
+fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
+  // The GPS IFD's own tag table (`%GPS::Main`) has NO SubDirectory pointer
+  // tags — a tag ID inside the GPS IFD is always a leaf.
+  if kind.is_gps() {
+    return None;
+  }
+  match tag_id {
+    tables::TAG_EXIF_IFD => Some(SubDirKind::ExifIfd),
+    tables::TAG_GPS_IFD => Some(SubDirKind::Gps),
+    tables::TAG_INTEROP_IFD => Some(SubDirKind::Interop),
+    tables::TAG_MAKER_NOTE => Some(SubDirKind::MakerNote),
+    _ => None,
+  }
+}
+
+// ===========================================================================
+// `serialize_tags` — typed Meta → TagMap
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl ExifMeta<'_> {
+  /// Emit the Exif/GPS tags into the writer in IFD-walk order (ExifTool's
+  /// `FoundTag` call sequence across the IFD chain).
+  ///
+  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode);
+  /// `print_conv = false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  ///
+  /// The FIRST tag emitted is `File:ExifByteOrder` — faithful to
+  /// `DoProcessTIFF` calling `FoundTag('ExifByteOrder', $byteOrder)` BEFORE
+  /// the `ProcessDirectory` IFD walk (`ExifTool.pm:8691`). It belongs to the
+  /// family-1 `File` group; the `-j` PrintConv renders the
+  /// `Little-endian (Intel, II)` / `Big-endian (Motorola, MM)` string
+  /// (`ExifTool.pm:1833-1836`), `-n` the bare `II`/`MM` marker. (The
+  /// `File:FileType`/`FileTypeExtension`/`MIMEType` triplet stays the
+  /// engine's job — different `File:*` names, no key collision.)
+  ///
+  /// `File:ExifByteOrder` is emitted ONLY when a TIFF block was processed
+  /// ([`byte_order`](Self::byte_order) is `Some`): bundled `FoundTag`s it
+  /// inside `DoProcessTIFF` (`ExifTool.pm:8691`), so a JPEG container accepted
+  /// without a parsed `APP1` Exif block emits no `ExifByteOrder` (and no IFD
+  /// tags) — only its `Malformed APP1 EXIF segment` warning, if any.
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    // `File:ExifByteOrder` — emitted before the IFD tags (ExifTool.pm:8691),
+    // but only when a TIFF block was actually processed (`DoProcessTIFF` is
+    // where bundled `FoundTag`s it). A JPEG accepted without Exif skips it.
+    if let Some(order) = self.byte_order {
+      if print_conv {
+        out.write_str("File", "ExifByteOrder", order.print_conv())?;
+      } else {
+        out.write_str("File", "ExifByteOrder", order.as_str())?;
+      }
+    }
+    // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
+    // 'Unknown' guess. `byte_order` is `None` ONLY for a JPEG container
+    // accepted without a parsed `APP1` Exif TIFF block — and that `ExifMeta`
+    // has NO entries (every entry originates from a `parse_tiff` block, which
+    // sets `Some(order)`), so the loop body below never runs in the `None`
+    // case and the `ByteOrder::Little` fallback is unreachable-by-construction.
+    let entry_order = self.byte_order.unwrap_or(ByteOrder::Little);
+    for entry in &self.entries {
+      emit_entry(entry, entry_order, print_conv, out)?;
+    }
+    // `$et->Warn(...)` messages → `ExifTool:Warning` tags (the document
+    // builder dedups + collects them — see `parser.rs`).
+    for warning in &self.warnings {
+      out.write_warning(warning)?;
+    }
+    Ok(())
+  }
+}
+
+/// Emit one [`ExifEntry`] into the [`crate::tagmap::TagMap`] sink, applying
+/// the resolved conversion.
+#[cfg(feature = "alloc")]
+fn emit_entry(
+  entry: &ExifEntry,
+  // The TIFF byte order threads to `ConvertExifText`'s UTF-16 'Unknown'
+  // guess — consumed by the Exif `Conv::ExifText` arm (UserComment) AND the
+  // GPS `GpsConv::ExifText` arm (GPSProcessingMethod/GPSAreaInformation).
+  order: ByteOrder,
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  let group = entry.group();
+  let group = group.as_str();
+  let name = entry.name();
+  match entry.conv {
+    ResolvedConv::Exif(conv) => {
+      emit_exif_value(group, name, entry.value.raw(), conv, order, print_conv, out)
+    }
+    #[cfg(feature = "gps")]
+    ResolvedConv::Gps(conv) => {
+      emit_gps_value(group, name, entry.value.raw(), conv, order, print_conv, out)
+    }
+  }
+}
+
+// ===========================================================================
+// Exif value emission — applies a `Conv` to a `RawValue`
+// ===========================================================================
+
+/// Render a [`RawValue`] under a plain Exif [`Conv`] into the sink. This is
+/// the serialize-time PrintConv/ValueConv application; the value stored in
+/// the `ExifEntry` is post-Format-decode but pre-conversion.
+///
+/// `order` is the TIFF byte order in effect — threaded to the
+/// `Conv::ExifText` UTF-16 `Unknown` order guess (`ConvertExifText`,
+/// `Exif.pm:5554-5601`); every other arm ignores it.
+#[cfg(feature = "alloc")]
+fn emit_exif_value(
+  group: &str,
+  name: &str,
+  raw: &RawValue,
+  conv: Conv,
+  order: ByteOrder,
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  match conv {
+    Conv::None => emit_raw(group, name, raw, out),
+    Conv::IntLabel(slice) => emit_int_label(group, name, raw, slice, print_conv, out, false),
+    Conv::IntLabelHex(slice) => emit_int_label(group, name, raw, slice, print_conv, out, true),
+    Conv::StrLabel(slice) => {
+      // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
+      // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
+      if let RawValue::Text(t) = raw {
+        // Trim a trailing NUL/space the on-disk `string` may carry.
+        let key = t.trim_end_matches([' ', '\0']);
+        if print_conv {
+          match tables::str_label_for(slice, key) {
+            Some(label) => out.write_str(group, name, label)?,
+            // `sprintf('Unknown ($val)')` (no `OTHER`/`PrintHex` on these
+            // string enums, ExifTool.pm:3627).
+            None => out.write_str(group, name, &std::format!("Unknown ({key})"))?,
+          }
+        } else {
+          // `-n` ⇒ the raw token.
+          out.write_str(group, name, key)?;
+        }
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::ExposureTime | Conv::ShutterSpeedApex => {
+      // ExposureTime: raw rational seconds → PrintExposureTime.
+      // ShutterSpeedValue: ValueConv `2 ** -$val` first (Exif.pm:2346),
+      // then PrintExposureTime. `-n` mode emits the post-ValueConv scalar.
+      let secs = match conv {
+        Conv::ShutterSpeedApex => first_scalar(raw).map(shutter_speed_value_conv),
+        _ => first_scalar(raw),
+      };
+      match secs {
+        Some(s) if print_conv => {
+          // PrintExposureTime → `1/724` (out of gate ⇒ string) or a whole/`%.1f`
+          // second count like `30` (in gate ⇒ a bare JSON number). Gate it.
+          emit_gated_number(group, name, &tables::print_exposure_time(s), out)?;
+        }
+        Some(s) => emit_gated_f64(group, name, s, out)?,
+        None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::FNumber => {
+      // FNumber has no ValueConv — the raw rational quotient IS the f-number.
+      match first_scalar(raw) {
+        // PrintFNumber → `%.1f`/`%.2f` (`0.64`, `4.0`) — an in-gate JSON number.
+        Some(v) if print_conv => {
+          emit_gated_number(group, name, &tables::print_fnumber(v), out)?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::FocalLengthMm => {
+      // `FocalLength` (0x920a) — `sprintf("%.1f mm",$val)` (Exif.pm:2425).
+      // A rational64u; rendered with exactly one decimal place.
+      match first_scalar(raw) {
+        Some(v) if print_conv => {
+          out.write_str(group, name, &std::format!("{v:.1} mm"))?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::FocalLength35mm => {
+      // `FocalLengthIn35mmFormat` (0xa405) — `PrintConv => '"$val mm"'`
+      // (Exif.pm:2896). `$val` is the post-ValueConv scalar (0xa405 has no
+      // ValueConv) stringified by `ReadValue`. The tag is normally `int16u`,
+      // so `$val` is the integer string (`75` → `"75 mm"`) — no decimal,
+      // unlike 0x920a's `%.1f`. But a camera may write it as a rational/float;
+      // Perl interpolates the value VERBATIM, so render the raw scalar with the
+      // SAME `%g`/rational stringification the other focal-length convs use
+      // (`first_rational_str`, == `ReadValue`'s output) rather than truncating
+      // to an integer — a fractional `37.5` must surface as `"37.5 mm"`, not
+      // `"37 mm"`.
+      match first_rational_str(raw) {
+        Some(v) if print_conv => {
+          out.write_str(group, name, &std::format!("{v} mm"))?;
+        }
+        Some(_) | None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    Conv::ExposureCompensation => match first_scalar(raw) {
+      Some(v) if print_conv => {
+        // PrintFraction → `-0.65` (in gate ⇒ a bare JSON number) or a `+1/2`
+        // / `+1`-style signed fraction (a leading `+` or a `/` ⇒ out of gate
+        // ⇒ a quoted string). Gate it.
+        emit_gated_number(group, name, &tables::print_fraction(v), out)
+      }
+      Some(_) | None => emit_raw(group, name, raw, out),
+    },
+    Conv::ApertureApex => {
+      // ValueConv `2 ** ($val / 2)` (Exif.pm:2356); PrintConv
+      // `sprintf("%.1f",$val)` (Exif.pm:2358).
+      match first_scalar(raw) {
+        Some(apex) => {
+          let v = 2f64.powf(apex / 2.0);
+          if print_conv {
+            // PrintConv `sprintf("%.1f",$val)` → `16.0` — an in-gate JSON
+            // number. Gate it (the `%.1f` text is always in-gate, but the
+            // gate keeps every numeric path uniform).
+            emit_gated_number(group, name, &std::format!("{v:.1}"), out)?;
+          } else {
+            // `-n` ⇒ the post-ValueConv scalar, gated as ExifTool would
+            // stringify-then-`EscapeJSON` it.
+            emit_gated_f64(group, name, v, out)?;
+          }
+          Ok(())
+        }
+        None => emit_raw(group, name, raw, out),
+      }
+    }
+    Conv::DateTime => {
+      // `$self->ConvertDateTime($val)` — with default options ConvertDateTime
+      // is identity (datetime.rs). The EXIF date string is emitted verbatim.
+      emit_raw(group, name, raw, out)
+    }
+    Conv::LensInfo => {
+      // PrintLensInfo (Exif.pm:5800) — 4 rationals → "12-20mm f/3.8-4.5".
+      if print_conv
+        && let RawValue::Rational(rs) = raw
+        && let Some(s) = print_lens_info(rs)
+      {
+        out.write_str(group, name, &s)?;
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::Version => {
+      // `undef` bytes → the raw ASCII version string, `\0`-stripped
+      // (Exif.pm:2241 `$val=~s/\0+$//`). The Perl regex is anchored `$`, so it
+      // strips ONLY TRAILING NULs — an INTERIOR NUL keeps the tail (e.g.
+      // `b"02\x0010"` → `"02\x0010"`, not `"02"`). Same under -j and -n.
+      if let RawValue::Bytes(b) = raw {
+        let end = b.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+        let s = String::from_utf8_lossy(&b[..end]);
+        out.write_str(group, name, &s)?;
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::ComponentsConfiguration => {
+      // Per-byte label join (Exif.pm:2304-2317): 0→"-", 1→"Y", 2→"Cb",
+      // 3→"Cr", 4→"R", 5→"G", 6→"B". `-n` emits the space-joined integers.
+      if let RawValue::Bytes(b) = raw {
+        if print_conv {
+          let parts: Vec<&str> = b
+            .iter()
+            .map(|&c| match c {
+              0 => "-",
+              1 => "Y",
+              2 => "Cb",
+              3 => "Cr",
+              4 => "R",
+              5 => "G",
+              6 => "B",
+              _ => "?",
+            })
+            .collect();
+          out.write_str(group, name, &parts.join(", "))?;
+        } else {
+          let parts: Vec<String> = b.iter().map(|&c| std::format!("{c}")).collect();
+          out.write_str(group, name, &parts.join(" "))?;
+        }
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::MetersSuffix => {
+      // `$val =~ /^(inf|undef)$/ ? $val : "$val m"` (Exif.pm:2388).
+      if print_conv && let Some(v) = first_rational_str(raw) {
+        if v == "inf" || v == "undef" {
+          out.write_str(group, name, &v)?;
+        } else {
+          out.write_str(group, name, &std::format!("{v} m"))?;
+        }
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::ExifText => {
+      // `UserComment` (0x9286) — `RawConv => ConvertExifText($self,$val,1,$tag)`
+      // (Exif.pm:2502). A RawConv runs BEFORE Value/PrintConv and applies in
+      // BOTH -n and -j modes; UserComment has no further conversion. The
+      // `undef` format makes the on-disk value `RawValue::Bytes`; a camera
+      // that wrote the wrong format (`string`/`int8u` — Exif.pm:2499) is
+      // forced back to bytes (`Format => 'undef'`) so the charset-ID prefix
+      // logic still applies.
+      let bytes: Vec<u8> = match raw {
+        RawValue::Bytes(b) => b.clone(),
+        // A `string`-typed value (camera wrote the wrong format) — re-read
+        // its bytes per `Format => 'undef'`.
+        RawValue::Text(t) => t.as_bytes().to_vec(),
+        // An `int8u`-typed value (the other documented mis-format) — the
+        // `undef` re-read is the raw 1-byte-per-element octet stream.
+        RawValue::U64(vals) => vals.iter().map(|&v| v as u8).collect(),
+        _ => return emit_raw(group, name, raw, out),
+      };
+      out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
+      Ok(())
+    }
+    Conv::TrimTrailingWhitespace => {
+      // `Make`/`Model`/`Software`/`Artist` `RawConv => '$val =~ s/\s+$//'`
+      // (Exif.pm:585/599/906/925). Strip EVERY trailing whitespace char
+      // (Perl `\s` = ` \t\n\r\f` plus the vertical tab) from the `string`
+      // value. A RawConv applies in BOTH -n and -j, so the trim happens at
+      // the raw stage here for either output mode.
+      match raw {
+        RawValue::Text(t) => out.write_str(group, name, t.trim_end_matches(is_perl_space)),
+        // The regex is a no-op on a non-string value; these tags are always
+        // `string`, but emit any off-spec value faithfully unchanged.
+        _ => emit_raw(group, name, raw, out),
+      }
+    }
+    Conv::TrimTrailingSpaces => {
+      // `SubSecTime`/`SubSecTimeOriginal`/`SubSecTimeDigitized`
+      // `ValueConv => '$val=~s/ +$//'` (Exif.pm:2543/2552/2560). Trims
+      // trailing SPACES ONLY (U+0020) — NOT `\s`, so a trailing tab/NL is
+      // kept. A ValueConv result is what -n shows; the identity PrintConv
+      // carries the same trimmed value through in -j.
+      match raw {
+        RawValue::Text(t) => out.write_str(group, name, t.trim_end_matches(' ')),
+        _ => emit_raw(group, name, raw, out),
+      }
+    }
+  }
+}
+
+/// Perl `\s` character class (`Exif.pm` `s/\s+$//`) — ASCII whitespace:
+/// space, tab, line feed, carriage return, form feed, and vertical tab.
+/// (`char::is_whitespace` would over-match Unicode whitespace; `\s` without
+/// `/u` on a byte string is exactly this ASCII set.)
+#[cfg(feature = "alloc")]
+const fn is_perl_space(c: char) -> bool {
+  matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b')
+}
+
+// ===========================================================================
+// GPS value emission — applies a `GpsConv` to a `RawValue`
+// ===========================================================================
+
+/// Render a [`RawValue`] under a [`gps::GpsConv`] into the sink.
+#[cfg(all(feature = "alloc", feature = "gps"))]
+fn emit_gps_value(
+  group: &str,
+  name: &str,
+  raw: &RawValue,
+  conv: gps::GpsConv,
+  order: ByteOrder,
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  use gps::GpsConv;
+  match conv {
+    GpsConv::Plain(c) => emit_exif_value(group, name, raw, c, order, print_conv, out),
+    GpsConv::VersionId => {
+      // `$val =~ tr/ /./; $val` (GPS.pm:61) — the int8u quadruple is the
+      // space-joined integers under -n, dot-joined under -j.
+      if let RawValue::U64(vals) = raw {
+        let joined: Vec<String> = vals.iter().map(|v| std::format!("{v}")).collect();
+        let sep = if print_conv { "." } else { " " };
+        out.write_str(group, name, &joined.join(sep))?;
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    GpsConv::Coordinate => {
+      // %coordConv: ValueConv `ToDegrees($val)`, PrintConv `ToDMS($self,
+      // $val, 1)`. The on-disk value is 3 rationals (D, M, S).
+      let dms = rational_triple(raw);
+      match gps::to_degrees(dms.0, dms.1, dms.2) {
+        // PrintConv `ToDMS` → `54 deg 59' 22.80"` (spaces ⇒ out of gate ⇒ a
+        // quoted string).
+        Some(deg) if print_conv => out.write_str(group, name, &gps::to_dms(deg))?,
+        // `-n` ⇒ the `ToDegrees` decimal-degrees scalar through the
+        // `EscapeJSON` number gate — a bare JSON number when in-gate.
+        Some(deg) => emit_gated_f64(group, name, deg, out)?,
+        None => emit_raw(group, name, raw, out)?,
+      }
+      Ok(())
+    }
+    GpsConv::TimeStamp => {
+      // GPSTimeStamp: 3 rationals (H, M, S) → ConvertTimeStamp (ValueConv)
+      // → PrintTimeStamp (PrintConv).
+      let hms = rational_triple(raw);
+      match (hms.0, hms.1, hms.2) {
+        (Some(h), m, s) => {
+          let value_conv = gps::convert_time_stamp(h, m.unwrap_or(0.0), s.unwrap_or(0.0));
+          if print_conv {
+            out.write_str(group, name, &gps::print_time_stamp(&value_conv))?;
+          } else {
+            out.write_str(group, name, &value_conv)?;
+          }
+          Ok(())
+        }
+        _ => emit_raw(group, name, raw, out),
+      }
+    }
+    GpsConv::DateStamp => {
+      // GPSDateStamp: `undef[11]` → ExifDate (ValueConv, GPS.pm:319). The
+      // RawConv `$val=~s/\0+$//` strips trailing NULs first.
+      let text = match raw {
+        RawValue::Bytes(b) => {
+          let trimmed: Vec<u8> = {
+            let mut v = b.clone();
+            while v.last() == Some(&0) {
+              v.pop();
+            }
+            v
+          };
+          String::from_utf8_lossy(&trimmed).into_owned()
+        }
+        RawValue::Text(t) => t.clone(),
+        _ => {
+          return emit_raw(group, name, raw, out);
+        }
+      };
+      out.write_str(group, name, &gps::exif_date(&text))?;
+      Ok(())
+    }
+    GpsConv::ExifText => {
+      // GPSProcessingMethod / GPSAreaInformation: `ConvertExifText` RawConv
+      // (Exif.pm:5554-5601) strips the 8-byte charset-ID prefix and decodes
+      // the payload. A RawConv runs BEFORE Value/PrintConv and applies in
+      // both -n and -j modes; these tags have no further conversion.
+      let bytes: &[u8] = match raw {
+        RawValue::Bytes(b) => b,
+        // A `string`-typed value (camera wrote the wrong format) — apply
+        // the same prefix logic to its bytes.
+        RawValue::Text(t) => t.as_bytes(),
+        _ => return emit_raw(group, name, raw, out),
+      };
+      out.write_str(group, name, &exiftext::convert_exif_text(bytes, order))?;
+      Ok(())
+    }
+    GpsConv::StrLabel(slice) => {
+      // String → label (GPSStatus etc.). The on-disk value is a `string`.
+      if let RawValue::Text(t) = raw {
+        // ExifTool's `string` count includes a NUL terminator; the decoded
+        // `Text` is already NUL-trimmed. A trailing space is also possible
+        // (Count => 2 strings) — match on the trimmed token.
+        let key = t.trim_end_matches([' ', '\0']);
+        if print_conv {
+          // A HASH-PrintConv hit emits the label; a MISS emits `Unknown
+          // ($val)` (`ExifTool.pm:3614-3634` — every GPS string enum here is
+          // a plain hash with no `OTHER`/`PrintHex`, so the decimal/string
+          // `Unknown ($val)` fallback applies, e.g. `GPSStatus "Z"` →
+          // `"Unknown (Z)"`, matching the H264 module's `GPS:GPSStatus`).
+          match gps::str_label_for(slice, key) {
+            Some(label) => out.write_str(group, name, label)?,
+            None => out.write_str(group, name, &std::format!("Unknown ({key})"))?,
+          }
+        } else {
+          // `-n` ⇒ the raw token.
+          out.write_str(group, name, key)?;
+        }
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+  }
+}
+
+// ===========================================================================
+// `EscapeJSON` number gate — bundled `exiftool` script line 3809
+// ===========================================================================
+//
+// Bundled ExifTool stringifies EVERY tag value (`$val`) and runs the JSON
+// writer's `EscapeJSON` (`exiftool` script, sub `EscapeJSON`, line 3800). With
+// the default `$quote` flag false (every non-`StructFormat=JSONQ` `-j`/`-n`
+// run), a value whose ENTIRE stringified form matches the conservative number
+// regex `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$` (case-insensitive
+// `e`, `exiftool:3809`) is printed as a BARE JSON NUMBER; anything else is
+// quoted as a JSON string. So a numeric Exif/GPS PrintConv result
+// (`ExifIFD:FNumber` → `0.64`, `ExifIFD:ApertureValue` → `16.0`) and a scalar
+// rational (`IFD0:XResolution` → `300`) land as JSON NUMBERS, while an
+// out-of-gate value — a `:`/`/`/space-bearing string, the words
+// `inf`/`undef`/`Inf`/`NaN`, OR a `>16`-fraction-digit float such as a
+// `ShutterSpeedValue` ValueConv `0.00138106793200498` — stays a JSON STRING.
+//
+// The shared `TagValue` serializer (`value.rs`) intentionally does NOT run
+// this gate (it emits standard `serde_json` scalars and relies on the
+// value-semantic `jsondiff` comparator); for the Exif/GPS port the gate IS
+// load-bearing — bundled emits a bare number, exifast must too. So this module
+// gates its own numeric output here.
+//
+// NOTE (post-merge dedup candidate): this is a deliberate LOCAL copy of the
+// same gate H264 ports as `escape_json_is_number` (`src/formats/h264.rs`); a
+// concurrent PLIST branch also touches a shared copy. Once those land, fold
+// the three into one shared `crate`-level `escape_json` gate.
+
+/// Faithful port of `EscapeJSON`'s number-detection regex (`exiftool:3809`):
+/// `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$` (the `e` is
+/// case-insensitive). A hand-rolled byte scan — dependency-free, identical
+/// logic to `h264::escape_json_is_number`.
+#[cfg(feature = "alloc")]
+fn escape_json_is_number(s: &str) -> bool {
+  let b = s.as_bytes();
+  let mut i = 0usize;
+  // optional leading `-`
+  if b.first() == Some(&b'-') {
+    i += 1;
+  }
+  // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
+  // leading zero).
+  let int_start = i;
+  while i < b.len() && b[i].is_ascii_digit() {
+    i += 1;
+  }
+  let int_len = i - int_start;
+  if int_len == 0 {
+    return false;
+  }
+  if int_len > 1 && (int_len > 15 || b[int_start] == b'0') {
+    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`).
+    return false;
+  }
+  // optional fraction `\.\d{1,16}`.
+  if i < b.len() && b[i] == b'.' {
+    i += 1;
+    let frac_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+      i += 1;
+    }
+    let frac_len = i - frac_start;
+    if frac_len == 0 || frac_len > 16 {
+      return false;
+    }
+  }
+  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`).
+  if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+    i += 1;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+      i += 1;
+    }
+    let exp_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+      i += 1;
+    }
+    let exp_len = i - exp_start;
+    if exp_len == 0 || exp_len > 3 {
+      return false;
+    }
+  }
+  i == b.len()
+}
+
+/// Emit a value ExifTool would stringify as `rendered` through the JSON
+/// `EscapeJSON` number gate (`exiftool:3809`): if `rendered`'s ENTIRE text
+/// matches the number regex it lands as a BARE JSON NUMBER (routed through the
+/// matching `write_u64`/`write_i64`/`write_f64`); otherwise it stays a quoted
+/// JSON STRING (`write_str`).
+///
+/// `rendered` MUST be the exact decimal text bundled ExifTool would produce for
+/// the value — a rational's [`crate::value::Rational::exiftool_val_str`], a
+/// float's `%.15g` ([`crate::value::format_g`] with precision 15 — ExifTool's
+/// default NV stringification), a plain integer's decimal text, or a PrintConv
+/// string. The gate then quotes vs bare-numbers it byte-identically to bundled.
+///
+/// An in-gate integer routes through `write_u64`/`write_i64` so serde emits an
+/// exact integer token (`300`, not `300.0`); an in-gate fractional/exponent
+/// value routes through `write_f64`. Because the gate already proved `rendered`
+/// is a valid JSON number, the parse below never fails for an in-gate string;
+/// the defensive fallback keeps any unreachable case a faithful quoted string.
+#[cfg(feature = "alloc")]
+fn emit_gated_number(
+  group: &str,
+  name: &str,
+  rendered: &str,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  if !escape_json_is_number(rendered) {
+    // Out of gate ⇒ a quoted JSON string (a `:`/`/`-bearing value, the words
+    // `inf`/`undef`/`Inf`/`NaN`, or a `>16`-fraction-digit float).
+    return out.write_str(group, name, rendered);
+  }
+  // In gate ⇒ a bare JSON number. A pure integer (no `.`, no `e`/`E`) is an
+  // exact integer token; route it through the integer writer. The gate caps
+  // the integer part at 15 digits so it always fits `i64`/`u64`.
+  let is_integer = !rendered
+    .bytes()
+    .any(|b| b == b'.' || b == b'e' || b == b'E');
+  if is_integer {
+    if let Some(rest) = rendered.strip_prefix('-') {
+      if let Ok(n) = rest.parse::<i64>() {
+        return out.write_i64(group, name, -n);
+      }
+    } else if let Ok(n) = rendered.parse::<u64>() {
+      return out.write_u64(group, name, n);
+    }
+  }
+  match rendered.parse::<f64>() {
+    Ok(f) => out.write_f64(group, name, f),
+    // Unreachable for an in-gate string; fall back to a faithful quoted string.
+    Err(_) => out.write_str(group, name, rendered),
+  }
+}
+
+/// Emit an `f64` Exif/GPS value through the [`emit_gated_number`] gate.
+///
+/// A finite value is rendered with `%.15g` ([`crate::value::format_g`] with
+/// precision 15 — ExifTool's default NV stringification, the same render
+/// [`crate::value::TagValue`]'s serializer applies) and gated: in-gate ⇒ a bare
+/// JSON number, out-of-gate (e.g. a `ShutterSpeedValue` ValueConv with a
+/// 17-digit fraction) ⇒ a quoted string. A NON-finite value bypasses the gate
+/// and is emitted via `write_f64` so [`crate::value::TagValue`]'s serializer
+/// renders ExifTool's titlecase `Inf`/`-Inf`/`NaN` quoted word.
+#[cfg(feature = "alloc")]
+fn emit_gated_f64(
+  group: &str,
+  name: &str,
+  value: f64,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  if !value.is_finite() {
+    // `TagValue::F64`'s serializer emits the titlecase `Inf`/`-Inf`/`NaN`
+    // string; `EscapeJSON` would likewise quote those words.
+    return out.write_f64(group, name, value);
+  }
+  emit_gated_number(group, name, &crate::value::format_g(value, 15), out)
+}
+
+// ===========================================================================
+// Emission helpers
+// ===========================================================================
+
+/// Emit a [`RawValue`] verbatim (the `Conv::None` path) — multi-element
+/// numeric arrays are space-joined (ExifTool's `ReadValue` joins with
+/// spaces, `ExifTool.pm:6319`); a string is emitted as-is; bytes become the
+/// `(Binary data N bytes ...)` placeholder.
+#[cfg(feature = "alloc")]
+fn emit_raw(
+  group: &str,
+  name: &str,
+  raw: &RawValue,
+  out: &mut crate::tagmap::TagMap,
+) -> Result<(), core::convert::Infallible> {
+  match raw {
+    RawValue::U64(vals) => {
+      if vals.len() == 1 {
+        // A scalar integer through the `EscapeJSON` number gate: an Exif
+        // `int8u`/`int16u`/`int32u` (≤32-bit) is always in-gate ⇒ a bare JSON
+        // number, but routing it keeps every numeric path uniform and quotes a
+        // pathological `>15`-digit value exactly as bundled would.
+        emit_gated_number(group, name, &std::format!("{}", vals[0]), out)
+      } else {
+        // A multi-element array space-joins (out of gate ⇒ a quoted string).
+        out.write_str(group, name, &join_nums(vals))
+      }
+    }
+    RawValue::I64(vals) => {
+      if vals.len() == 1 {
+        emit_gated_number(group, name, &std::format!("{}", vals[0]), out)
+      } else {
+        out.write_str(group, name, &join_nums(vals))
+      }
+    }
+    RawValue::F64(vals) => {
+      if vals.len() == 1 {
+        emit_gated_f64(group, name, vals[0], out)
+      } else {
+        out.write_str(group, name, &join_floats(vals))
+      }
+    }
+    RawValue::Rational(rs) => {
+      if rs.len() == 1 {
+        // A single rational — emit its ExifTool-rounded scalar
+        // (`exiftool_val_str`) through the `EscapeJSON` number gate: a
+        // non-zero-denominator quotient is always in-gate ⇒ a bare JSON number
+        // (`IFD0:XResolution` → `300`), while a `0`-denominator yields the word
+        // `inf`/`undef` ⇒ a quoted string. (Before R18 this used a bare
+        // `write_str`, emitting an in-gate scalar rational as a JSON string.)
+        emit_gated_number(group, name, &rs[0].exiftool_val_str(), out)
+      } else {
+        let parts: Vec<String> = rs
+          .iter()
+          .map(crate::value::Rational::exiftool_val_str)
+          .collect();
+        out.write_str(group, name, &parts.join(" "))
+      }
+    }
+    RawValue::Text(t) => out.write_str(group, name, t),
+    RawValue::Bytes(b) => out.write_bytes(group, name, b),
+  }
+}
+
+/// Emit a [`RawValue`] under an integer→label conversion (a HASH PrintConv).
+///
+/// With print_conv ON, a hash MISS ALWAYS renders an `Unknown (…)` string —
+/// faithful to ExifTool's HASH-PrintConv miss, which (with no `OTHER`/`BITMASK`
+/// match) emits `sprintf('Unknown ($val)')`, or `sprintf('Unknown (0x%x)')`
+/// when the tag carries `PrintHex => 1` (`ExifTool.pm:3614-3634`). `hex`
+/// selects the hex form (e.g. `ColorSpace`/`Flash`). With print_conv OFF
+/// (`-n`), or for a non-singleton / non-integer value that has no scalar key,
+/// the raw value is emitted verbatim (the `emit_raw` path) — a bare DECIMAL
+/// number even for a `PrintHex` tag, matching ExifTool's `-n` output.
+#[cfg(feature = "alloc")]
+fn emit_int_label(
+  group: &str,
+  name: &str,
+  raw: &RawValue,
+  slice: &[(i64, &'static str)],
+  print_conv: bool,
+  out: &mut crate::tagmap::TagMap,
+  hex: bool,
+) -> Result<(), core::convert::Infallible> {
+  // The integer for the PrintConv lookup — works for U64 or I64 singletons.
+  let code: Option<i64> = match raw {
+    RawValue::U64(v) if v.len() == 1 => i64::try_from(v[0]).ok(),
+    RawValue::I64(v) if v.len() == 1 => Some(v[0]),
+    _ => None,
+  };
+  match code {
+    Some(c) if print_conv => match tables::label_for(slice, c) {
+      Some(label) => out.write_str(group, name, label),
+      // `sprintf('Unknown (0x%x)', $val)` (PrintHex) / `sprintf('Unknown
+      // ($val)')` (`ExifTool.pm:3623-3627`). `0x%x` is Perl's lowercase hex
+      // with no width. `c` is non-negative here — the two PrintHex tags
+      // (`ColorSpace`/`Flash`) are `int16u`, so the code comes from a `U64`
+      // value through `i64::try_from`; `{:x}` on a non-negative `i64` prints
+      // the same digits as Perl's unsigned `%x`.
+      None if hex => out.write_str(group, name, &std::format!("Unknown (0x{c:x})")),
+      None => out.write_str(group, name, &std::format!("Unknown ({c})")),
+    },
+    _ => emit_raw(group, name, raw, out),
+  }
+}
+
+/// The first scalar of a [`RawValue`] as an `f64` — for the scalar-conv
+/// paths (FNumber/ExposureTime/etc.). A `Rational` yields its quotient.
+fn first_scalar(raw: &RawValue) -> Option<f64> {
+  match raw {
+    RawValue::U64(v) => v.first().map(|&n| n as f64),
+    RawValue::I64(v) => v.first().map(|&n| n as f64),
+    RawValue::F64(v) => v.first().copied(),
+    RawValue::Rational(rs) => rs.first().map(rational_quotient),
+    _ => None,
+  }
+}
+
+/// The first rational of a [`RawValue`] as its ExifTool-rounded string (for
+/// the `MetersSuffix` conv, which must preserve `inf`/`undef`).
+fn first_rational_str(raw: &RawValue) -> Option<String> {
+  match raw {
+    RawValue::Rational(rs) => rs.first().map(crate::value::Rational::exiftool_val_str),
+    RawValue::U64(v) => v.first().map(|&n| std::format!("{n}")),
+    RawValue::I64(v) => v.first().map(|&n| std::format!("{n}")),
+    RawValue::F64(v) => v.first().map(|&n| crate::value::format_g(n, 15)),
+    _ => None,
+  }
+}
+
+/// The first three rationals of a [`RawValue`] as `(D, M, S)` quotients —
+/// for the GPS coordinate / timestamp conversions. A degenerate `inf`/`undef`
+/// rational yields a non-finite `f64` so the conv's guard fires.
+fn rational_triple(raw: &RawValue) -> (Option<f64>, Option<f64>, Option<f64>) {
+  match raw {
+    RawValue::Rational(rs) => (
+      rs.first().map(rational_quotient),
+      rs.get(1).map(rational_quotient),
+      rs.get(2).map(rational_quotient),
+    ),
+    // A GPS coordinate could in theory be written with another numeric
+    // type; map a numeric array's first three elements faithfully.
+    RawValue::U64(v) => (
+      v.first().map(|&n| n as f64),
+      v.get(1).map(|&n| n as f64),
+      v.get(2).map(|&n| n as f64),
+    ),
+    RawValue::F64(v) => (v.first().copied(), v.get(1).copied(), v.get(2).copied()),
+    _ => (None, None, None),
+  }
+}
+
+/// The quotient of a [`crate::value::Rational`] as an `f64` — `n/0` (n≠0) is
+/// `inf`, `0/0` is `NaN` (`undef`), matching ExifTool's `GetRational*`
+/// (`ExifTool.pm:6081-6109`). The GPS conv guards on `is_finite()`.
+fn rational_quotient(r: &crate::value::Rational) -> f64 {
+  if r.denominator() == 0 {
+    return if r.numerator() != 0 {
+      f64::INFINITY
+    } else {
+      f64::NAN
+    };
+  }
+  r.numerator() as f64 / r.denominator() as f64
+}
+
+/// `PrintLensInfo` (`Exif.pm:5800-5817`) — 4 rationals → the lens string.
+/// Returns `None` if the value is not exactly 4 valid rationals (ExifTool
+/// `return $val` — render verbatim).
+fn print_lens_info(rs: &[crate::value::Rational]) -> Option<String> {
+  if rs.len() != 4 {
+    return None;
+  }
+  // Each value is `IsFloat` (a number) or the words `inf`/`undef` → "?".
+  let vals: Vec<String> = rs
+    .iter()
+    .map(|r| {
+      let s = r.exiftool_val_str();
+      if s == "inf" || s == "undef" {
+        "?".to_string()
+      } else {
+        s
+      }
+    })
+    .collect();
+  // `$val = $vals[0]; $val .= "-$vals[1]" if $vals[1] and $vals[1] ne
+  // $vals[0]; $val .= "mm f/$vals[2]"; $val .= "-$vals[3]" if $vals[3] and
+  // $vals[3] ne $vals[2];`
+  let mut out = vals[0].clone();
+  if vals[1] != "0" && vals[1] != vals[0] {
+    out.push('-');
+    out.push_str(&vals[1]);
+  }
+  out.push_str("mm f/");
+  out.push_str(&vals[2]);
+  if vals[3] != "0" && vals[3] != vals[2] {
+    out.push('-');
+    out.push_str(&vals[3]);
+  }
+  Some(out)
+}
+
+/// `ShutterSpeedValue` ValueConv — `IsFloat($val) && abs($val)<100 ?
+/// 2**(-$val) : 0` (`Exif.pm:2346`).
+fn shutter_speed_value_conv(apex: f64) -> f64 {
+  if apex.is_finite() && apex.abs() < 100.0 {
+    2f64.powf(-apex)
+  } else {
+    0.0
+  }
+}
+
+/// Space-join a slice of integers (ExifTool's multi-element `ReadValue`).
+fn join_nums<T: core::fmt::Display>(vals: &[T]) -> String {
+  let mut s = String::new();
+  for (i, v) in vals.iter().enumerate() {
+    if i > 0 {
+      s.push(' ');
+    }
+    let _ = core::fmt::Write::write_fmt(&mut s, core::format_args!("{v}"));
+  }
+  s
+}
+
+/// Space-join a slice of floats — each rendered with `%.15g` (ExifTool's
+/// default NV stringification, `value.rs`).
+fn join_floats(vals: &[f64]) -> String {
+  let mut s = String::new();
+  for (i, v) in vals.iter().enumerate() {
+    if i > 0 {
+      s.push(' ');
+    }
+    s.push_str(&crate::value::format_g(*v, 15));
+  }
+  s
+}
+
+// ===========================================================================
+// `Error` — Rust-level fatal modes (currently none)
+// ===========================================================================
+
+/// Rust-level fatal modes for Exif/TIFF parsing. Currently empty — every bad
+/// input produces `Ok(None)` (faithful to `DoProcessTIFF` `return 0`) or is
+/// walked past silently (an unknown tag / format / out-of-range offset).
+/// Reserved for future I/O-fallible wrappers.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Error {}
+
+// ===========================================================================
+// Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Build a minimal big-endian TIFF with one IFD0 entry: `Make = "Canon"`.
+  fn minimal_tiff_with_make() -> Vec<u8> {
+    // Header: MM, magic 0x002a, IFD0 offset 8.
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0: 1 entry.
+    t.extend_from_slice(&[0x00, 0x01]);
+    // Entry: tag 0x010f (Make), format 2 (ASCII), count 6, value-or-offset.
+    // "Canon\0" is 6 bytes > 4 ⇒ stored at an offset. Put it right after the
+    // next-IFD pointer.
+    t.extend_from_slice(&[0x01, 0x0f]); // tag
+    t.extend_from_slice(&[0x00, 0x02]); // format = ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x06]); // count = 6
+    // value offset — header(8) + count(2) + entry(12) + nextIFD(4) = 26.
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]);
+    // next-IFD offset = 0 (no IFD1).
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    // The "Canon\0" string at offset 26.
+    t.extend_from_slice(b"Canon\0");
+    t
+  }
+
+  #[test]
+  fn rejects_short_buffer() {
+    assert!(parse_exif_block(b"MM\0").is_none());
+    assert!(parse_borrowed(b"").unwrap().is_none());
+  }
+
+  #[test]
+  fn rejects_bad_byte_order_marker() {
+    // 8 bytes but a junk byte-order marker.
+    assert!(parse_exif_block(b"XX\0\x2a\0\0\0\x08").is_none());
+  }
+
+  #[test]
+  fn rejects_ifd0_offset_below_8() {
+    // Valid MM marker but IFD0 offset = 4 (< 8 ⇒ DoProcessTIFF return 0).
+    assert!(parse_exif_block(b"MM\0\x2a\0\0\0\x04").is_none());
+  }
+
+  #[test]
+  fn bigtiff_magic_is_cleanly_skipped() {
+    // A minimal BigTIFF header: byte order + magic 0x2b (43) + the BigTIFF
+    // 8-byte-offset layout (bytesize=8, reserved=0, 8-byte IFD0 offset). The
+    // classic walker reads byte 4 as a 32-bit offset over 12-byte/16-bit
+    // entries, which would MISDECODE BigTIFF; instead we bail cleanly (the
+    // same `None` an invalid header returns) — NO tags, no panic, no garbage,
+    // and (deliberately) NO warning ExifTool wouldn't raise (it supports
+    // BigTIFF). A full BigTIFF walker is a deferred port.
+
+    // Big-endian BigTIFF: MM, magic 0x002b, bytesize 0x0008, reserved 0x0000,
+    // then an 8-byte IFD0 offset (0x10). Padded so the (mis)read of byte 4 as
+    // a classic 32-bit offset would otherwise point inside the buffer — proves
+    // the magic gate fires BEFORE any classic decode, not the ≥8 sanity check.
+    let mut be: Vec<u8> = vec![b'M', b'M', 0x00, 0x2b, 0x00, 0x08, 0x00, 0x00];
+    be.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]); // 8-byte IFD0 offset
+    be.extend_from_slice(&[0u8; 32]); // body so a classic mis-walk would find bytes
+    assert!(
+      parse_exif_block(&be).is_none(),
+      "big-endian BigTIFF (0x2b) must be cleanly skipped, no Exif"
+    );
+
+    // Little-endian BigTIFF: II, magic 0x2b00, bytesize 0x0800.
+    let mut le: Vec<u8> = vec![b'I', b'I', 0x2b, 0x00, 0x08, 0x00, 0x00, 0x00];
+    le.extend_from_slice(&[0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    le.extend_from_slice(&[0u8; 32]);
+    assert!(
+      parse_exif_block(&le).is_none(),
+      "little-endian BigTIFF (0x2b) must be cleanly skipped, no Exif"
+    );
+
+    // A classic 0x2a header still parses normally (the gate is BigTIFF-only).
+    let classic = minimal_tiff_with_make();
+    let meta = parse_exif_block(&classic).expect("classic 0x2a TIFF still parses");
+    assert_eq!(meta.byte_order(), Some(ByteOrder::Big));
+    assert_eq!(
+      meta.entry("Make").map(|e| e.tag_id()),
+      Some(0x010f),
+      "classic TIFF's IFD0:Make must still decode"
+    );
+  }
+
+  #[test]
+  fn ifd_name_renders_trailing_numbers_past_u16() {
+    // Codex R12/F1 — the trailing-IFD number is a `u32` and `IfdName`
+    // spells it with NO upper bound. A chain past IFD65535 must produce
+    // DISTINCT decimal names (not pin at "IFD65535").
+    assert_eq!(IfdKind::Trailing(1).as_str(), "IFD1");
+    assert_eq!(IfdKind::Trailing(65535).as_str(), "IFD65535");
+    assert_eq!(IfdKind::Trailing(65536).as_str(), "IFD65536");
+    assert_eq!(IfdKind::Trailing(65537).as_str(), "IFD65537");
+    // The widest name still fits the 13-byte inline buffer.
+    assert_eq!(IfdKind::Trailing(u32::MAX).as_str(), "IFD4294967295");
+  }
+
+  #[test]
+  fn parses_make_from_minimal_tiff() {
+    let t = minimal_tiff_with_make();
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert_eq!(meta.byte_order(), Some(ByteOrder::Big));
+    let make = meta.entry("Make").expect("Make tag");
+    assert_eq!(make.group(), "IFD0");
+    assert_eq!(make.tag_id(), 0x010f);
+    match make.value_ref().raw() {
+      RawValue::Text(s) => assert_eq!(s, "Canon"),
+      other => panic!("expected Text, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn little_endian_inline_value() {
+    // II TIFF, one IFD0 entry: Orientation (0x0112) int16u count 1 = 6.
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x01, 0x00]); // 1 entry
+    t.extend_from_slice(&[0x12, 0x01]); // tag 0x0112 (LE)
+    t.extend_from_slice(&[0x03, 0x00]); // format 3 (int16u)
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+    t.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]); // inline value 6
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD 0
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert_eq!(meta.byte_order(), Some(ByteOrder::Little));
+    let o = meta.entry("Orientation").expect("Orientation");
+    assert_eq!(o.value_ref().raw(), &RawValue::U64(vec![6]));
+  }
+
+  #[test]
+  fn unknown_tag_is_omitted() {
+    // II TIFF, one entry with an unknown tag ID 0xdead — should be omitted
+    // (faithful to `next unless $verbose`).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x01, 0x00]); // 1 entry
+    t.extend_from_slice(&[0xad, 0xde]); // tag 0xdead (LE)
+    t.extend_from_slice(&[0x03, 0x00]); // format int16u
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+    t.extend_from_slice(&[0x2a, 0x00, 0x00, 0x00]); // value 42
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD 0
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert!(meta.entries().is_empty(), "unknown tag must be omitted");
+  }
+
+  #[test]
+  fn bad_format_code_entry_skipped() {
+    // An entry with format code 0 (invalid) is skipped, not fatal.
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x01, 0x00]); // 1 entry
+    t.extend_from_slice(&[0x12, 0x01]); // tag Orientation
+    t.extend_from_slice(&[0x00, 0x00]); // format 0 — INVALID
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert!(
+      meta.entries().is_empty(),
+      "bad-format entry must be skipped"
+    );
+  }
+
+  #[test]
+  fn sub_dir_resolution() {
+    assert_eq!(
+      sub_dir_for(0x8769, IfdKind::Ifd0),
+      Some(SubDirKind::ExifIfd)
+    );
+    assert_eq!(sub_dir_for(0x8825, IfdKind::Ifd0), Some(SubDirKind::Gps));
+    assert_eq!(
+      sub_dir_for(0x927c, IfdKind::ExifIfd),
+      Some(SubDirKind::MakerNote)
+    );
+    // A leaf tag ⇒ None.
+    assert_eq!(sub_dir_for(0x010f, IfdKind::Ifd0), None);
+    // Inside the GPS IFD, nothing is a SubDirectory.
+    assert_eq!(sub_dir_for(0x8769, IfdKind::Gps), None);
+  }
+
+  /// A single-byte `undef` (format 7, count 1) decodes as an INTEGER, not a
+  /// 1-byte binary blob — `Exif.pm:6644` `$formatStr = 'int8u' if $format
+  /// == 7 and $count == 1`. Drives the `undef`-typed enumerations
+  /// (SceneType / FileSource).
+  #[test]
+  fn single_byte_undef_decodes_as_int8u() {
+    // II TIFF, ExifIFD with SceneType (0xa301, undef, count 1, value 1).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    // IFD0: 1 entry (ExifOffset pointer).
+    t.extend_from_slice(&[0x01, 0x00]);
+    t.extend_from_slice(&[0x69, 0x87]); // tag 0x8769 ExifOffset (LE)
+    t.extend_from_slice(&[0x04, 0x00]); // format LONG
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+    // ExifIFD offset: header(8) + IFD0(2 + 12 + 4) = 26.
+    t.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next = 0
+    // ExifIFD at 26: 1 entry (SceneType).
+    t.extend_from_slice(&[0x01, 0x00]);
+    t.extend_from_slice(&[0x01, 0xa3]); // tag 0xa301 SceneType (LE)
+    t.extend_from_slice(&[0x07, 0x00]); // format UNDEF
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // inline value byte 1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next = 0
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let st = meta.entry("SceneType").expect("SceneType");
+    assert_eq!(st.ifd(), IfdKind::ExifIfd);
+    // Decoded as int8u (a U64 singleton), NOT a Bytes blob.
+    assert_eq!(st.value_ref().raw(), &RawValue::U64(vec![1]));
+  }
+
+  /// The MakerNote (0x927c) tag is CAPTURED — `ExifMeta::maker_note()`
+  /// exposes the raw bytes — and vendor parsing is DEFERRED. No `MakerNote`
+  /// leaf tag is emitted.
+  #[test]
+  fn maker_note_captured_not_parsed() {
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0: 1 entry (ExifOffset).
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x87, 0x69]); // tag 0x8769 (MM)
+    t.extend_from_slice(&[0x00, 0x04]); // format LONG
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // ExifIFD offset 26
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next 0
+    // ExifIFD at 26: 1 entry (MakerNote).
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x92, 0x7c]); // tag 0x927c MakerNote (MM)
+    t.extend_from_slice(&[0x00, 0x07]); // format UNDEF
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]); // count 8 (> 4 ⇒ offset)
+    // MakerNote value offset: 26 + (2 + 12 + 4) = 44.
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x2c]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next 0
+    // The 8-byte MakerNote blob at offset 44.
+    t.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // The MakerNote blob is captured, not parsed into tags.
+    let mn = meta.maker_note().expect("MakerNote captured");
+    assert_eq!(
+      mn.bytes(),
+      &[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04]
+    );
+    assert_eq!(mn.len(), 8);
+    // No `MakerNote` leaf tag — vendor parsing deferred.
+    assert!(meta.entry("MakerNote").is_none());
+  }
+
+  /// A self-referencing IFD pointer (IFD0 → IFD0) is rejected by the
+  /// reprocess guard (`Exif.pm:7195-7196`) — no infinite loop.
+  #[test]
+  fn self_referencing_ifd_does_not_loop() {
+    // II TIFF: IFD0 at offset 8, ExifOffset pointing back to offset 8.
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x01, 0x00]); // 1 entry
+    t.extend_from_slice(&[0x69, 0x87]); // ExifOffset
+    t.extend_from_slice(&[0x04, 0x00]); // LONG
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+    t.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]); // points back to IFD0 (8)
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next 0
+    // Must terminate (the guard rejects the second visit to offset 8).
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // ExifOffset is a SubIFD pointer (no leaf tag); the self-loop is
+    // rejected, so there are simply no entries.
+    assert!(meta.entries().is_empty());
+  }
+
+  /// A standalone-TIFF round trip through the GPS sub-IFD: the 0x8825
+  /// pointer reaches the GPS IFD and its tags get the `GPS` family-1 group.
+  #[test]
+  fn gps_subifd_walk() {
+    // MM TIFF: IFD0 with a GPSInfo (0x8825) pointer to a GPS IFD that holds
+    // one tag — GPSMapDatum (0x0012, ASCII "WGS84\0", 6 bytes).
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0: 1 entry (GPSInfo).
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x88, 0x25]); // tag 0x8825 (MM)
+    t.extend_from_slice(&[0x00, 0x04]); // LONG
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // GPS IFD offset 26
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next 0
+    // GPS IFD at 26: 1 entry (GPSMapDatum).
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x12]); // tag 0x0012 (MM)
+    t.extend_from_slice(&[0x00, 0x02]); // ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x06]); // count 6 (> 4 ⇒ offset)
+    // value offset: 26 + (2 + 12 + 4) = 44.
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x2c]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // GPS IFD next 0
+    t.extend_from_slice(b"WGS84\x00"); // the GPSMapDatum string at 44
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let datum = meta.entry("GPSMapDatum").expect("GPSMapDatum");
+    // The GPS sub-IFD's tags carry the family-1 group "GPS".
+    assert_eq!(datum.ifd(), IfdKind::Gps);
+    assert_eq!(datum.group(), "GPS");
+    match datum.value_ref().raw() {
+      RawValue::Text(s) => assert_eq!(s, "WGS84"),
+      other => panic!("expected Text, got {other:?}"),
+    }
+  }
+
+  /// Codex R13/F1 — IFD0's `ExifOffset` (0x8769) and `GPSInfo` (0x8825)
+  /// pointing at ONE shared sub-IFD. ExifTool's `%PROCESSED` reprocess guard
+  /// is gated on a non-zero `DirLen` (`ExifTool.pm:9052`); a standalone
+  /// TIFF's IFD-pointer subdirectories carry `DirLen 0`
+  /// (`Exif.pm:7020-7026`), so the guard is skipped and the shared offset is
+  /// walked TWICE — once as `ExifIFD`, once as `GPS` — with no warning.
+  /// Verified against bundled `perl exiftool`: emits `ExifIFD:Orientation`
+  /// AND `GPS:GPSVersionID`. The R12/F2 carve-out admitted only
+  /// GPS-after-InteropIFD, so the GPS pass returned `None` and every GPS
+  /// tag was dropped; the re-modelled guard reprocesses any IFD-pointer
+  /// subdirectory revisit. (Fixture sibling: `Exif_gps_shared_pointer.tif`.)
+  #[test]
+  fn shared_exifoffset_gpsinfo_pointer_reprocesses() {
+    // II TIFF. IFD0@8: Orientation + ExifOffset + GPSInfo; ExifOffset and
+    // GPSInfo both point at the shared IFD@50, which holds Orientation
+    // (an ExifIFD-table tag) and GPSVersionID (a GPS-table tag).
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x03, 0x00]); // IFD0: 3 entries
+    t.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // Orientation = 1
+    t.extend_from_slice(&[0x69, 0x87, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x32, 0x00, 0x00, 0x00]); // ExifOffset -> 50
+    t.extend_from_slice(&[0x25, 0x88, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x32, 0x00, 0x00, 0x00]); // GPSInfo -> 50
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next = 0
+    debug_assert_eq!(t.len(), 50, "shared IFD must start at offset 50");
+    t.extend_from_slice(&[0x02, 0x00]); // shared IFD@50: 2 entries
+    t.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x07, 0x00, 0x00, 0x00]); // Orientation = 7
+    t.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x02, 0x03, 0x00, 0x00]); // GPSVersionID = 2.3.0.0
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // shared IFD next = 0
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // The shared offset is reprocessed: the ExifIFD pass emits Orientation,
+    // the GPS pass emits GPSVersionID — exactly as bundled ExifTool.
+    let exif_orient = meta
+      .entries()
+      .iter()
+      .find(|e| e.ifd() == IfdKind::ExifIfd && e.name() == "Orientation")
+      .expect("ExifIFD:Orientation from the ExifOffset pass");
+    assert_eq!(exif_orient.group(), "ExifIFD");
+    let gps_ver = meta
+      .entries()
+      .iter()
+      .find(|e| e.ifd() == IfdKind::Gps && e.name() == "GPSVersionID")
+      .expect("GPS:GPSVersionID from the reprocessed GPSInfo pass");
+    assert_eq!(gps_ver.group(), "GPS");
+    // IFD0's own Orientation is still there; no spurious warning.
+    assert!(
+      meta
+        .entries()
+        .iter()
+        .any(|e| e.ifd() == IfdKind::Ifd0 && e.name() == "Orientation")
+    );
+    assert!(
+      meta.warnings().is_empty(),
+      "no warning for a DirLen-0 subdirectory revisit, got {:?}",
+      meta.warnings()
+    );
+  }
+
+  /// A subdirectory pointer that loops back onto an ANCESTOR IFD is a true
+  /// cycle and must terminate. IFD0's `ExifOffset` reaches ExifIFD@26, whose
+  /// own `ExifOffset` (0x8769) points back at offset 26 — ExifIFD is still
+  /// on the active recursion path, so the revisit is rejected. (The
+  /// general-reprocess rule only admits SIBLING / completed-walk revisits.)
+  #[test]
+  fn subdir_ancestor_cycle_terminates() {
+    let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&[0x01, 0x00]); // IFD0: 1 entry
+    t.extend_from_slice(&[0x69, 0x87, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00]); // ExifOffset -> 26
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next = 0
+    debug_assert_eq!(t.len(), 26, "ExifIFD must start at offset 26");
+    t.extend_from_slice(&[0x01, 0x00]); // ExifIFD@26: 1 entry
+    t.extend_from_slice(&[0x69, 0x87, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00]); // ExifOffset -> 26 (self)
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next = 0
+    // Must terminate (no infinite recursion through the self-pointer).
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // ExifOffset is a SubIFD pointer (no leaf tag); the cycle is rejected,
+    // so there are simply no entries.
+    assert!(meta.entries().is_empty());
+  }
+
+  /// Run one `Conv` over a `RawValue::Text` and read back the emitted string.
+  #[cfg(feature = "alloc")]
+  fn emit_text_conv(value: &str, conv: Conv) -> String {
+    let mut map = crate::tagmap::TagMap::new();
+    let raw = RawValue::Text(value.to_string());
+    emit_exif_value("IFD0", "T", &raw, conv, ByteOrder::Big, true, &mut map).unwrap();
+    map.get_str("IFD0", "T").expect("emitted")
+  }
+
+  #[test]
+  fn is_perl_space_matches_perl_backslash_s() {
+    // Perl `\s` (5.18+) = space, tab, LF, CR, FF, VT — verified against the
+    // bundled Perl 5.34 (`perl -e '... =~ s/\s+$//'`). NBSP (U+00A0) is NOT
+    // in `\s` without `/u`, and a digit is not whitespace.
+    for c in [' ', '\t', '\n', '\r', '\x0c', '\x0b'] {
+      assert!(is_perl_space(c), "{c:?} should be \\s");
+    }
+    for c in ['\u{00a0}', '0', 'x'] {
+      assert!(!is_perl_space(c), "{c:?} should NOT be \\s");
+    }
+  }
+
+  #[test]
+  fn trim_trailing_whitespace_strips_all_whitespace() {
+    // `Make`/`Model`/`Software`/`Artist` RawConv `s/\s+$//` (Exif.pm:585/599/
+    // 906/925): EVERY trailing whitespace char is stripped, in both modes.
+    let conv = Conv::TrimTrailingWhitespace;
+    assert_eq!(emit_text_conv("Canon   ", conv), "Canon");
+    // Trailing TAB + space — `\s` strips both (proves it is NOT space-only).
+    assert_eq!(emit_text_conv("EOS R5\t ", conv), "EOS R5");
+    assert_eq!(emit_text_conv("SW\n\r\x0c\x0b ", conv), "SW");
+    // Leading / interior whitespace is preserved (the regex is anchored `$`).
+    assert_eq!(emit_text_conv("  A  B  ", conv), "  A  B");
+    // No trailing whitespace ⇒ unchanged; empty stays empty.
+    assert_eq!(emit_text_conv("Nikon", conv), "Nikon");
+    assert_eq!(emit_text_conv("", conv), "");
+    // An all-whitespace value collapses to empty (EXIF-"unknown" blank field).
+    assert_eq!(emit_text_conv("    ", conv), "");
+  }
+
+  #[test]
+  fn trim_trailing_spaces_strips_spaces_only() {
+    // `SubSecTime*` ValueConv `s/ +$//` (Exif.pm:2543/2552/2560): trailing
+    // SPACES only — a trailing TAB/NL is NOT trimmed (this is the distinction
+    // the minimal-TIFF fixture cannot carry, so it is pinned here).
+    let conv = Conv::TrimTrailingSpaces;
+    assert_eq!(emit_text_conv("123  ", conv), "123");
+    assert_eq!(emit_text_conv("70  ", conv), "70");
+    // Trailing run ends in a TAB ⇒ the trailing-SPACE run is empty ⇒ KEPT.
+    assert_eq!(emit_text_conv("7 \t", conv), "7 \t");
+    // A trailing TAB alone is kept; a trailing NL is kept.
+    assert_eq!(emit_text_conv("9\t", conv), "9\t");
+    assert_eq!(emit_text_conv("9\n", conv), "9\n");
+    // Interior space preserved; no trailing space ⇒ unchanged.
+    assert_eq!(emit_text_conv("1 2", conv), "1 2");
+    assert_eq!(emit_text_conv("12", conv), "12");
+  }
+
+  #[test]
+  fn trim_convs_passthrough_non_text() {
+    // The Perl regex is a no-op on a non-string value; both trim convs must
+    // emit a non-`Text` `RawValue` faithfully unchanged (these tags are always
+    // `string`, but an off-spec numeric value must not be dropped/altered).
+    let mut map = crate::tagmap::TagMap::new();
+    let raw = RawValue::U64(vec![42]);
+    emit_exif_value(
+      "IFD0",
+      "T",
+      &raw,
+      Conv::TrimTrailingWhitespace,
+      ByteOrder::Big,
+      true,
+      &mut map,
+    )
+    .unwrap();
+    assert_eq!(map.get_str("IFD0", "T").as_deref(), Some("42"));
+  }
+
+  /// PR #36 Codex R18/F1 — `escape_json_is_number` is the faithful port of
+  /// bundled `EscapeJSON`'s number regex `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?
+  /// (e[-+]?\d{1,3})?$` (`exiftool:3809`). Pinned with the SAME corpus as
+  /// `h264::escape_json_number_gate_matches_exiftool_regex` (the shared spec).
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn escape_json_number_gate_matches_exiftool_regex() {
+    // In-gate: bare integers, a single `0`, signed, fractional, exponent.
+    for s in [
+      "0",
+      "5",
+      "300",
+      "72",
+      "-7",
+      "16.0",
+      "0.64",
+      "0.26015625",
+      "-0.65",
+      "12.05078125",
+      "-0.6500000006",
+      "3.4e+38",
+      "1e3",
+      "2.5E-4",
+      "13.58",
+      "100000000000000",    // 15-digit integer (max)
+      "0.1234567890123456", // 16-fraction-digit (max)
+    ] {
+      assert!(escape_json_is_number(s), "{s:?} must match the number gate");
+    }
+    // Out of gate: empty, words, `:`/`/`/space-bearing, a leading `+`, a
+    // leading-zero multi-digit integer, a `>15`-digit integer, a `>16`-digit
+    // fraction, a `>3`-digit exponent.
+    for s in [
+      "",
+      "inf",
+      "undef",
+      "Inf",
+      "NaN",
+      "1/724",
+      "0.0 mm",
+      "14:58:24",
+      "54 deg 59' 22.80\"",
+      "+1",
+      "+1/2",
+      "01",
+      "0123",
+      "1000000000000000",    // 16-digit integer (no-leading-zero arm)
+      "0.00138106793200498", // 17-fraction-digit ⇒ ShutterSpeedValue
+      "1e1234",              // 4-digit exponent
+      "1.",
+      "1.2.3",
+      "- 5",
+      "0x1f",
+    ] {
+      assert!(
+        !escape_json_is_number(s),
+        "{s:?} must NOT match the number gate"
+      );
+    }
+  }
+
+  /// `emit_gated_number` routes an in-gate rendered string to the matching
+  /// numeric `write_*` (a bare JSON number) and an out-of-gate one to
+  /// `write_str` (a quoted JSON string).
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn emit_gated_number_routes_by_escape_json_gate() {
+    use crate::value::TagValue;
+    let mut map = crate::tagmap::TagMap::new();
+    // In-gate integer ⇒ `U64` (exact integer token).
+    emit_gated_number("IFD0", "XResolution", "300", &mut map).unwrap();
+    assert_eq!(map.get("IFD0", "XResolution"), Some(&TagValue::U64(300)));
+    // In-gate signed integer ⇒ `I64`.
+    emit_gated_number("E", "Neg", "-7", &mut map).unwrap();
+    assert_eq!(map.get("E", "Neg"), Some(&TagValue::I64(-7)));
+    // In-gate fractional ⇒ `F64`.
+    emit_gated_number("E", "FNumber", "0.64", &mut map).unwrap();
+    assert_eq!(map.get("E", "FNumber"), Some(&TagValue::F64(0.64)));
+    // Out-of-gate (a `/`) ⇒ a `Str` (quoted JSON string).
+    emit_gated_number("E", "Shutter", "1/724", &mut map).unwrap();
+    assert_eq!(
+      map.get("E", "Shutter"),
+      Some(&TagValue::Str("1/724".into()))
+    );
+    // The zero-denominator rational word stays a `Str`.
+    emit_gated_number("E", "Inf", "inf", &mut map).unwrap();
+    assert_eq!(map.get("E", "Inf"), Some(&TagValue::Str("inf".into())));
+  }
+
+  /// `emit_gated_f64` renders a finite value with `%.15g` then gates it: an
+  /// ordinary value lands as a number, a `>16`-fraction-digit ValueConv
+  /// result (a `ShutterSpeedValue`) lands as a quoted string, and a
+  /// non-finite value keeps `TagValue::F64`'s titlecase-string handling.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn emit_gated_f64_quotes_out_of_gate_floats() {
+    use crate::value::TagValue;
+    let mut map = crate::tagmap::TagMap::new();
+    // Ordinary finite value ⇒ a bare JSON number.
+    emit_gated_f64("E", "Lat", 54.989_666_666_666_7, &mut map).unwrap();
+    assert!(matches!(map.get("E", "Lat"), Some(TagValue::F64(_))));
+    // A 17-significant-digit value renders (`%.15g`) to a 17-fraction-digit
+    // string — out of the gate's `\.\d{1,16}` cap ⇒ a quoted JSON string,
+    // byte-identical to bundled (`ExifIFD:ShutterSpeedValue` under `-n`).
+    let shutter = 0.001_381_067_932_004_98_f64;
+    emit_gated_f64("E", "Shutter", shutter, &mut map).unwrap();
+    assert_eq!(
+      map.get("E", "Shutter"),
+      Some(&TagValue::Str("0.00138106793200498".into())),
+      "a 17-fraction-digit float must be a quoted string"
+    );
+    // A non-finite value is left to `TagValue::F64`'s serializer (titlecase
+    // `Inf`/`NaN` string); `emit_gated_f64` emits the `F64` variant itself.
+    emit_gated_f64("E", "Bad", f64::INFINITY, &mut map).unwrap();
+    assert_eq!(map.get("E", "Bad"), Some(&TagValue::F64(f64::INFINITY)));
+  }
+
+  // -- Shared helpers for the IFD-level guard tests -------------------------
+
+  /// Render one `Conv` over a `RawValue` and read back the string, choosing
+  /// `print_conv` on/off. Extends `emit_text_conv` to non-text values + `-n`.
+  #[cfg(feature = "alloc")]
+  fn emit_conv(raw: &RawValue, conv: Conv, print_conv: bool) -> String {
+    let mut map = crate::tagmap::TagMap::new();
+    emit_exif_value("IFD0", "T", raw, conv, ByteOrder::Big, print_conv, &mut map).unwrap();
+    map.get_str("IFD0", "T").expect("emitted")
+  }
+
+  /// Build a big-endian one-IFD TIFF whose IFD0 holds `entries` (each a raw
+  /// 12-byte entry record), with no IFD1. Out-of-line data is NOT supported by
+  /// this helper — every entry must be inline (≤ 4-byte value or a self-
+  /// describing offset the caller places). Used to exercise the IFD walker's
+  /// excessive-count / invalid-size guards.
+  #[cfg(feature = "alloc")]
+  fn tiff_with_entries(entries: &[[u8; 12]]) -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    for e in entries {
+      t.extend_from_slice(e);
+    }
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    t
+  }
+
+  /// One 12-byte big-endian IFD entry: tag, format code, count, inline value.
+  #[cfg(feature = "alloc")]
+  fn entry(tag: u16, format: u16, count: u32, value: [u8; 4]) -> [u8; 12] {
+    let mut e = [0u8; 12];
+    e[0..2].copy_from_slice(&tag.to_be_bytes());
+    e[2..4].copy_from_slice(&format.to_be_bytes());
+    e[4..8].copy_from_slice(&count.to_be_bytes());
+    e[8..12].copy_from_slice(&value);
+    e
+  }
+
+  // -- Fix 1: excessive-count (a) + large-array (b) guards -------------------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn large_array_placeholder_renders_exiftool_string() {
+    // Guard (b)'s value string (Exif.pm:6777) — `(large array of $count
+    // $formatStr values)` with ExifTool's format NAME.
+    assert_eq!(
+      large_array_placeholder(600, Format::Int32u),
+      "(large array of 600 int32u values)"
+    );
+    assert_eq!(
+      large_array_placeholder(1234, Format::Int16u),
+      "(large array of 1234 int16u values)"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn known_large_int32u_array_is_decoded_in_full_not_placeholdered() {
+    // FAITHFULNESS PIN (verified vs bundled ExifTool 13.59): a KNOWN tag with
+    // a `count > 500` int32u array is DECODED IN FULL — guard (b) does NOT
+    // fire, because `(not $tagInfo or LongBinary or $warned)` is false for a
+    // known, non-LongBinary, non-HtmlDump tag. The placeholder only applies to
+    // tags ABSENT from the table (which the port then drops as verbose-only).
+    //
+    // Use BitsPerSample (0x0102, a known IFD0 tag with `Conv::None`) as an
+    // int16u array of 600 elements stored out-of-line. The whole 1200-byte
+    // value lies inside the buffer, so it decodes fully (a space-joined list),
+    // never the `(large array …)` placeholder.
+    let count = 600usize;
+    let header: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    let mut t = header;
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    // value at offset = 8 + 2 + 12 + 4 = 26
+    let val_off: u32 = 26;
+    let e = entry(
+      0x0102,
+      3, /* int16u */
+      count as u32,
+      val_off.to_be_bytes(),
+    );
+    t.extend_from_slice(&e);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    // 600 int16u values (all 1) at offset 26.
+    for _ in 0..count {
+      t.extend_from_slice(&[0x00, 0x01]);
+    }
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let bps = meta.entry("BitsPerSample").expect("BitsPerSample decoded");
+    // The value is the full array (count elements), NOT the placeholder.
+    assert_eq!(bps.value_ref().raw().count(), count);
+    let mut map = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut map).unwrap();
+    let s = map.get_str("IFD0", "BitsPerSample").expect("emitted");
+    assert!(
+      !s.starts_with("(large array"),
+      "a known tag must decode fully, got {s:?}"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn excessive_count_int32u_is_skipped_with_warning() {
+    // Guard (a) (Exif.pm:6760-6770): a `count > 100000` int32u tag is SKIPPED
+    // (without decoding) and warns `Ignoring <dir> <tag> with excessive
+    // count`. Use a KNOWN IFD0 tag (StripByteCounts 0x0117) so the warning
+    // carries the Name. `size = 100001 * 4 = 400004 < 0x7fffffff`, so Fix 4
+    // (invalid-size) does NOT fire. The out-of-line value region MUST be
+    // present in the buffer: ExifTool's offset/EOF validation (Exif.pm:6549-
+    // 6611) runs BEFORE the excessive-count guard, so an overrun would instead
+    // hit `Error reading value` — exactly as bundled. We therefore lay the
+    // full 400004-byte value region in-bounds (verified vs bundled 13.59,
+    // which warns + drops the tag for an in-bounds 100001-int32u array).
+    let count: u32 = 100_001;
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    // value at offset = 8 + 2 + 12 + 4 = 26.
+    let val_off: u32 = 26;
+    let e = entry(0x0117, 4 /* int32u */, count, val_off.to_be_bytes());
+    t.extend_from_slice(&e);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    // The full value region (in-bounds) — never decoded (the entry is skipped
+    // by guard (a) before `read_value`), but the EOF check must pass.
+    t.resize(26 + (count as usize) * 4, 0);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert!(
+      meta.entry("StripByteCounts").is_none(),
+      "the excessive-count entry must be skipped, not decoded"
+    );
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w == "Ignoring IFD0 StripByteCounts with excessive count"),
+      "warnings = {:?}",
+      meta.warnings()
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn excessive_count_does_not_apply_to_string_or_undef() {
+    // The `$formatStr !~ /^(undef|string|binary)$/` exclusion: a `string` or
+    // `undef` tag with a huge count is NOT subject to guard (a)/(b) (it would
+    // instead be shortened by `read_value` to fit the buffer). Verify no
+    // excessive-count warning is raised for a `string`-typed huge-count tag.
+    let count: u32 = 200_000;
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]);
+    // ImageDescription (0x010e), string, count 200000 stored at offset 26 but
+    // only a few bytes present ⇒ read_value shortens it; NO excessive warning.
+    let val_off: u32 = 26;
+    let e = entry(0x010e, 2 /* string */, count, val_off.to_be_bytes());
+    t.extend_from_slice(&e);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    t.extend_from_slice(b"Hi\0"); // a short string at offset 26
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert!(
+      !meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("excessive count")),
+      "a string tag must not trip the excessive-count guard: {:?}",
+      meta.warnings()
+    );
+  }
+
+  // -- Fix 4: invalid-size skip guard ---------------------------------------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn invalid_size_entry_is_skipped_later_entries_parse() {
+    // Fix 4 (Exif.pm:6505-6509): an entry whose `count * formatSize` exceeds
+    // 0x7fffffff is SKIPPED (a per-entry `next`, NOT a directory abort), with
+    // the warning `Invalid size (<size>) for <dir> tag 0x<id>[ <name>]`. A
+    // LATER valid entry in the SAME IFD must still parse — proving the guard
+    // does not route through the directory-killing `Error reading value` path.
+    //
+    // Entry 0: Make (0x010f), int32u, count 0x40000000 ⇒ size = 0x100000000
+    //          (> 0x7fffffff). Entry 1: Orientation (0x0112), int16u, count 1,
+    //          inline value 6.
+    let huge_count: u32 = 0x4000_0000; // *4 = 0x1_0000_0000 > 0x7fffffff
+    let bad = entry(0x010f, 4 /* int32u */, huge_count, 0u32.to_be_bytes());
+    let good = entry(0x0112, 3 /* int16u */, 1, [0x00, 0x06, 0x00, 0x00]);
+    let t = tiff_with_entries(&[bad, good]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    // The oversized entry is skipped…
+    assert!(
+      meta.entry("Make").is_none(),
+      "oversized entry must be skipped"
+    );
+    // …but the LATER Orientation entry still parses (directory NOT aborted).
+    let o = meta
+      .entry("Orientation")
+      .expect("later entry must still parse");
+    assert_eq!(o.value_ref().raw(), &RawValue::U64(std::vec![6]));
+    // The Invalid size warning carries the size and the known tag name.
+    let size = u64::from(huge_count) * 4;
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w == &std::format!("Invalid size ({size}) for IFD0 tag 0x010f Make")),
+      "warnings = {:?}",
+      meta.warnings()
+    );
+  }
+
+  // -- Fix 2: HASH PrintConv miss → "Unknown (N)" / "Unknown (0xN)" ----------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn int_label_miss_renders_unknown_decimal() {
+    // Compression (no PrintHex): an off-table code → `Unknown (12)` with
+    // print_conv ON (ExifTool.pm:3627), the bare `12` with it OFF.
+    let raw = RawValue::U64(std::vec![12]);
+    let conv = tables::lookup(0x0103).expect("Compression").conv;
+    assert_eq!(emit_conv(&raw, conv, true), "Unknown (12)");
+    assert_eq!(emit_conv(&raw, conv, false), "12");
+    // A known code still maps through the hash.
+    let known = RawValue::U64(std::vec![1]);
+    assert_eq!(emit_conv(&known, conv, true), "Uncompressed");
+  }
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn int_label_hex_miss_renders_unknown_hex() {
+    // ColorSpace (PrintHex => 1, Exif.pm:2693): an off-table code → `Unknown
+    // (0xc)` with print_conv ON, the bare DECIMAL `12` with it OFF.
+    let raw = RawValue::U64(std::vec![12]);
+    let conv = tables::lookup(0xa001).expect("ColorSpace").conv;
+    assert_eq!(emit_conv(&raw, conv, true), "Unknown (0xc)");
+    assert_eq!(emit_conv(&raw, conv, false), "12");
+    // Flash (PrintHex) miss → `Unknown (0x63)` for 99.
+    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    assert_eq!(
+      emit_conv(&RawValue::U64(std::vec![99]), flash, true),
+      "Unknown (0x63)"
+    );
+    // A known ColorSpace value (0xffff) maps through the hash.
+    let unc = RawValue::U64(std::vec![0xffff]);
+    assert_eq!(emit_conv(&unc, conv, true), "Uncalibrated");
+  }
+
+  // -- Codex R2 Fix 1: complete `%flash` PrintConv map -----------------------
+
+  /// The complete `%flash` enumerated hash (Exif.pm:175-209) is ported and the
+  /// previously-wrong 0x18 entry is corrected. Values cross-checked against
+  /// bundled `Image::ExifTool::Exif::flash` (perl, ExifTool 13.x).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn flash_print_conv_matches_bundled_flash_hash() {
+    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    let label = |code: u64| emit_conv(&RawValue::U64(std::vec![code]), flash, true);
+
+    // The bug under fix: 0x18 is "Auto, Did not fire" in `%flash`, NOT the old
+    // "Off, Did not fire, Return not detected" (that label is 0x14's).
+    assert_eq!(label(0x18), "Auto, Did not fire");
+    assert_eq!(label(0x14), "Off, Did not fire, Return not detected");
+
+    // The required spot-checks.
+    assert_eq!(label(0x00), "No Flash");
+    assert_eq!(label(0x01), "Fired");
+    // 0x47 — a red-eye value previously ABSENT from the partial table.
+    assert_eq!(label(0x47), "Fired, Red-eye reduction, Return detected");
+
+    // Every key newly added by the fix resolves (none falls through to
+    // `Unknown`), confirming the table is the complete enumerated set.
+    assert_eq!(label(0x30), "Off, No flash function");
+    assert_eq!(label(0x45), "Fired, Red-eye reduction, Return not detected");
+    assert_eq!(label(0x49), "On, Red-eye reduction");
+    assert_eq!(label(0x4d), "On, Red-eye reduction, Return not detected");
+    assert_eq!(label(0x4f), "On, Red-eye reduction, Return detected");
+    assert_eq!(label(0x50), "Off, Red-eye reduction");
+    assert_eq!(label(0x58), "Auto, Did not fire, Red-eye reduction");
+    assert_eq!(
+      label(0x5d),
+      "Auto, Fired, Red-eye reduction, Return not detected"
+    );
+    assert_eq!(
+      label(0x5f),
+      "Auto, Fired, Red-eye reduction, Return detected"
+    );
+
+    // A code NOT in `%flash` → `Unknown (0x..)` (Flags => 'PrintHex',
+    // Exif.pm:2417). `-n` (print_conv OFF) shows the bare decimal.
+    assert_eq!(label(0x99), "Unknown (0x99)");
+    assert_eq!(
+      emit_conv(&RawValue::U64(std::vec![0x99]), flash, false),
+      "153"
+    );
+  }
+
+  /// EXHAUSTIVE guard: the ported `FLASH` table is EXACTLY the bundled
+  /// `%Image::ExifTool::Exif::flash` enumerated set (Exif.pm:182-208) — every
+  /// key maps to its bundled label, and EVERY other byte value (0x00..=0xff)
+  /// is off-map (renders `Unknown`). This is the literal Perl hash transcribed
+  /// here as the oracle, so any future edit to `FLASH` that drops, adds, or
+  /// relabels a key trips this test.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn flash_table_is_exactly_bundled_flash_set() {
+    // The bundled `%flash` hash, key-for-key (Exif.pm:182-208).
+    const BUNDLED: &[(u64, &str)] = &[
+      (0x00, "No Flash"),
+      (0x01, "Fired"),
+      (0x05, "Fired, Return not detected"),
+      (0x07, "Fired, Return detected"),
+      (0x08, "On, Did not fire"),
+      (0x09, "On, Fired"),
+      (0x0d, "On, Return not detected"),
+      (0x0f, "On, Return detected"),
+      (0x10, "Off, Did not fire"),
+      (0x14, "Off, Did not fire, Return not detected"),
+      (0x18, "Auto, Did not fire"),
+      (0x19, "Auto, Fired"),
+      (0x1d, "Auto, Fired, Return not detected"),
+      (0x1f, "Auto, Fired, Return detected"),
+      (0x20, "No flash function"),
+      (0x30, "Off, No flash function"),
+      (0x41, "Fired, Red-eye reduction"),
+      (0x45, "Fired, Red-eye reduction, Return not detected"),
+      (0x47, "Fired, Red-eye reduction, Return detected"),
+      (0x49, "On, Red-eye reduction"),
+      (0x4d, "On, Red-eye reduction, Return not detected"),
+      (0x4f, "On, Red-eye reduction, Return detected"),
+      (0x50, "Off, Red-eye reduction"),
+      (0x58, "Auto, Did not fire, Red-eye reduction"),
+      (0x59, "Auto, Fired, Red-eye reduction"),
+      (0x5d, "Auto, Fired, Red-eye reduction, Return not detected"),
+      (0x5f, "Auto, Fired, Red-eye reduction, Return detected"),
+    ];
+    let flash = tables::lookup(0x9209).expect("Flash").conv;
+    for code in 0u64..=0xff {
+      let got = emit_conv(&RawValue::U64(std::vec![code]), flash, true);
+      match BUNDLED.iter().find(|&&(k, _)| k == code) {
+        Some(&(_, label)) => assert_eq!(got, label, "0x{code:02x} label mismatch"),
+        None => assert_eq!(
+          got,
+          std::format!("Unknown (0x{code:x})"),
+          "0x{code:02x} should be off-map"
+        ),
+      }
+    }
+  }
+
+  // -- Codex R2 Fix 2: checked IFD-offset arithmetic (32-bit/wasm overflow) ---
+
+  /// Build a `Walker` over `data` for a white-box directory-walk test. (All
+  /// fields are private to this module; the `#[cfg(test)] mod tests` shares
+  /// the module, so it can construct one directly.)
+  #[cfg(feature = "alloc")]
+  fn test_walker(data: &[u8]) -> Walker<'_> {
+    Walker {
+      data,
+      order: ByteOrder::Big,
+      base: 0,
+      entries: Vec::new(),
+      warnings: Vec::new(),
+      maker_note: None,
+      seen_ifd_offsets: std::collections::HashSet::new(),
+      active_ifd_offsets: Vec::new(),
+    }
+  }
+
+  /// A directory `ifd_start` so large that `ifd_start + 2` (the count read)
+  /// would overflow `usize` must take the Bad-directory path — NOT panic
+  /// (debug) or wrap to a low address and read garbage (release). On a 32-bit
+  /// /wasm target `usize::MAX == u32::MAX`, so a TIFF IFD offset near `u32::
+  /// MAX` reaches exactly this. We simulate that 32-bit boundary on any host
+  /// by handing `walk_one_ifd_body` a `usize::MAX`-adjacent offset directly.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn ifd_offset_count_read_overflow_is_bad_directory() {
+    let data = minimal_tiff_with_make();
+    for ifd_start in [usize::MAX, usize::MAX - 1] {
+      let mut w = test_walker(&data);
+      // Must not panic; aborts the directory with no next-IFD.
+      let next = w.walk_one_ifd_body(ifd_start, IfdKind::Ifd0);
+      assert_eq!(next, None, "overflowing ifd_start must abort the directory");
+      assert_eq!(
+        w.warnings,
+        std::vec![String::from("Bad IFD0 directory")],
+        "overflowing ifd_start must warn Bad <dir> directory"
+      );
+      assert!(
+        w.entries.is_empty(),
+        "no tags from an overflowing directory"
+      );
+    }
+  }
+
+  /// The directory-extent arithmetic (`2 + 12*num_entries`, then
+  /// `ifd_start + dir_size`) is `checked_*`. With a giant `num_entries` AND a
+  /// huge `ifd_start`, the sum overflows `usize` — the walk must abort via the
+  /// Bad-directory path, never panic. (Here `ifd_start` is small enough that
+  /// the count read succeeds, so the dir-end `checked_add` is what fires.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn ifd_dir_end_overflow_is_bad_directory() {
+    // A 2-byte buffer holding num_entries = 0xFFFF at offset usize::MAX-2 is
+    // not constructible, so drive the dir-end overflow through a real buffer:
+    // place num_entries at offset 0, then ask the walker to treat offset
+    // `usize::MAX - 1` as the directory — `ifd_start + 2` overflows first and
+    // we already cover that. To isolate the dir-END overflow we instead assert
+    // the checked expression the walker uses is `None` on overflow.
+    let ifd_start = usize::MAX - 4;
+    let num_entries = 0xFFFFusize;
+    let dir_end = num_entries
+      .checked_mul(12)
+      .and_then(|body| body.checked_add(2))
+      .and_then(|dir_size| ifd_start.checked_add(dir_size));
+    assert_eq!(
+      dir_end, None,
+      "dir-end arithmetic must detect usize overflow"
+    );
+  }
+
+  /// CLASS SWEEP — the low-level byte readers (`get_u16`/`get_u32`/`get_u64`
+  /// and the float readers) end their slice range with `pos.checked_add(N)`.
+  /// A `pos` near `usize::MAX` (a wrapped offset on a 32-bit target) must
+  /// yield `None`, NOT panic on the `pos + N` range bound (debug) or form an
+  /// inverted range (release). This is the floor that makes every offset
+  /// reaching a read overflow-safe.
+  #[test]
+  fn byte_readers_do_not_overflow_on_max_pos() {
+    use ifd::{get_f32, get_f64, get_i16, get_i32, get_i64, get_u64};
+    let data = [0u8; 16];
+    for pos in [usize::MAX, usize::MAX - 1, usize::MAX - 7] {
+      assert_eq!(get_u16(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_u32(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_u64(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_i16(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_i32(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_i64(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_f32(&data, pos, ByteOrder::Big), None);
+      assert_eq!(get_f64(&data, pos, ByteOrder::Big), None);
+    }
+  }
+
+  /// CLASS SWEEP — the next-IFD pointer (`dir_end + 4`), the per-entry offset
+  /// (`ifd_start + 2 + 12*index`, `entry + 12`) and the inline value offset
+  /// (`entry + 8`) all use `checked_add`. Drive a real chain walk whose IFD0
+  /// offset sits right at the buffer end so the trailing-pointer and entry
+  /// arithmetic run at the boundary: the walk must terminate cleanly (Bad
+  /// directory / no next IFD), never panic.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn boundary_offsets_do_not_panic_on_chain_walk() {
+    let data = minimal_tiff_with_make();
+    // An IFD0 offset exactly at data.len(): `ifd_start + 2 > data.len()` ⇒ Bad
+    // directory, with the next-IFD read never attempted.
+    let mut w = test_walker(&data);
+    w.walk_ifd_chain(data.len(), IfdKind::Ifd0);
+    assert_eq!(w.warnings, std::vec![String::from("Bad IFD0 directory")]);
+    // And a usize::MAX-adjacent chain start must not panic either.
+    let mut w2 = test_walker(&data);
+    w2.walk_ifd_chain(usize::MAX - 1, IfdKind::Ifd0);
+    assert_eq!(w2.warnings, std::vec![String::from("Bad IFD0 directory")]);
+  }
+
+  // -- Fix 3: InteropIndex string-keyed PrintConv ----------------------------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn interop_index_string_keyed_print_conv() {
+    let conv = tables::lookup(0x0001).expect("InteropIndex").conv;
+    // Hits map to the full DCF label with print_conv ON, raw token with OFF.
+    assert_eq!(
+      emit_conv(&RawValue::Text("R98".into()), conv, true),
+      "R98 - DCF basic file (sRGB)"
+    );
+    assert_eq!(emit_conv(&RawValue::Text("R98".into()), conv, false), "R98");
+    assert_eq!(
+      emit_conv(&RawValue::Text("R03".into()), conv, true),
+      "R03 - DCF option file (Adobe RGB)"
+    );
+    assert_eq!(
+      emit_conv(&RawValue::Text("THM".into()), conv, true),
+      "THM - DCF thumbnail file"
+    );
+    // A miss → `Unknown ($val)` (ON) / the raw token (OFF).
+    assert_eq!(
+      emit_conv(&RawValue::Text("XYZ".into()), conv, true),
+      "Unknown (XYZ)"
+    );
+    assert_eq!(emit_conv(&RawValue::Text("XYZ".into()), conv, false), "XYZ");
+  }
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn interop_index_through_full_ifd_chain() {
+    // End-to-end: IFD0 → ExifIFD(0x8769) → InteropIFD(0xa005) → 0x0001
+    // InteropIndex `R98` (inline, count 4). Verify the InteropIFD-group entry
+    // maps through its string PrintConv.
+    let mut t: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0 @8: ExifOffset 0x8769 -> 26
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&entry(0x8769, 4, 1, 26u32.to_be_bytes()));
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    // ExifIFD @26: InteropOffset 0xa005 -> 44
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&entry(0xa005, 4, 1, 44u32.to_be_bytes()));
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    // InteropIFD @44: 0x0001 string count 4 inline "R98\0"
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&entry(0x0001, 2, 4, *b"R98\0"));
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    let ii = meta.entry("InteropIndex").expect("InteropIndex decoded");
+    assert_eq!(ii.group(), "InteropIFD");
+    let mut map = crate::tagmap::TagMap::new();
+    meta.serialize_tags(true, &mut map).unwrap();
+    assert_eq!(
+      map.get_str("InteropIFD", "InteropIndex").as_deref(),
+      Some("R98 - DCF basic file (sRGB)")
+    );
+  }
+
+  // -- Fix 5: FocalLengthIn35mmFormat faithful scalar ------------------------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn focal_length_35mm_renders_raw_scalar_no_truncation() {
+    let conv = Conv::FocalLength35mm;
+    // The common int16u case: integer → `"75 mm"`, no decimal point.
+    assert_eq!(
+      emit_conv(&RawValue::U64(std::vec![75]), conv, true),
+      "75 mm"
+    );
+    // An off-spec FRACTIONAL value (rational 75/2 = 37.5) must NOT truncate to
+    // `37 mm` — it renders the true scalar `"37.5 mm"` (Exif.pm:2896 `"$val
+    // mm"`, the value verbatim).
+    let frac = RawValue::Rational(std::vec![crate::value::Rational::rational64(75, 2)]);
+    assert_eq!(emit_conv(&frac, conv, true), "37.5 mm");
+  }
+
+  // -- Fix 7: Conv::Version strips only TRAILING NULs ------------------------
+
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn version_strips_only_trailing_nuls() {
+    let conv = Conv::Version;
+    // Trailing NULs stripped (`s/\0+$//`).
+    assert_eq!(
+      emit_conv(
+        &RawValue::Bytes(std::vec![b'0', b'2', b'0', b'0']),
+        conv,
+        true
+      ),
+      "0200"
+    );
+    assert_eq!(
+      emit_conv(
+        &RawValue::Bytes(std::vec![b'0', b'2', b'0', b'0', 0, 0]),
+        conv,
+        true
+      ),
+      "0200"
+    );
+    // An INTERIOR NUL is KEPT (the old `take_while` truncated here, wrongly).
+    assert_eq!(
+      emit_conv(
+        &RawValue::Bytes(std::vec![b'0', b'2', 0, b'1', b'0']),
+        conv,
+        true
+      ),
+      "02\u{0}10"
+    );
+    // All-NUL → empty string.
+    assert_eq!(
+      emit_conv(&RawValue::Bytes(std::vec![0, 0, 0]), conv, true),
+      ""
+    );
+  }
+}

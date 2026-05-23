@@ -327,6 +327,10 @@ pub enum AnyParser {
   /// MXF (FORMATS.md row 24 — Material Exchange Format KLV container).
   #[cfg(feature = "mxf")]
   Mxf(crate::formats::mxf::ProcessMxf),
+  /// Exif/TIFF (FORMATS.md row 13 — a standalone TIFF file IS an Exif/TIFF
+  /// block; GPS row 14 is its sub-IFD, decoded through the same walker).
+  #[cfg(feature = "exif")]
+  Exif(crate::exif::ProcessExif),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -427,6 +431,11 @@ pub enum AnyMeta<'a> {
   /// phantom there, kept for GAT uniformity.
   #[cfg(feature = "mxf")]
   Mxf(crate::formats::mxf::MxfMeta<'a>),
+  /// Exif/TIFF (FORMATS.md row 13 — typed `ExifMeta<'a>` carrying the IFD
+  /// chain's tags + the captured-but-deferred MakerNote blob). GPS sub-IFD
+  /// tags (row 14) are inside this same Meta.
+  #[cfg(feature = "exif")]
+  Exif(crate::exif::ExifMeta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -455,6 +464,7 @@ pub enum AnyMeta<'a> {
     feature = "matroska",
     feature = "quicktime",
     feature = "mxf",
+    feature = "exif",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -530,6 +540,8 @@ impl AnyMeta<'_> {
       AnyMeta::QuickTime(m) => m.serialize_tags(print_conv, out),
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => m.serialize_tags(print_conv, out),
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) => m.serialize_tags(print_conv, out),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness.
@@ -555,6 +567,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = (print_conv, out);
@@ -775,6 +788,13 @@ impl AnyMeta<'_> {
       // (MXF.pm:2820) ⇒ finalize to the detected candidate type.
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(_) => FileTypeFinalize::Detected,
+      // Exif/TIFF: `DoProcessTIFF` calls `SetFileType($t)` (ExifTool.pm:
+      // 8683) — finalize to the DETECTED candidate type ("TIFF" for a
+      // standalone `.tif`). DNG/NEF/RAW overrides (ExifTool.pm:8754-8765)
+      // depend on MakerNote/DNGVersion tags — deferred to the MakerNotes
+      // wave; the camera-metadata-core TIFF fixtures finalize as TIFF.
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(_) => FileTypeFinalize::Detected,
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -797,6 +817,7 @@ impl AnyMeta<'_> {
         feature = "matroska",
         feature = "quicktime",
         feature = "mxf",
+        feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -1015,6 +1036,10 @@ pub enum AnyError {
   #[cfg(feature = "mxf")]
   #[error("MXF: {0}")]
   Mxf(#[from] crate::formats::mxf::MxfError),
+  /// Exif/TIFF fatal-error wrapper.
+  #[cfg(feature = "exif")]
+  #[error("Exif: {0}")]
+  Exif(#[from] crate::exif::Error),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -1043,6 +1068,13 @@ impl AnyParser {
   /// `None` when the extension is unknown (the parsers fall through their
   /// extension-dependent retry branches).
   ///
+  /// `header_skip` is the byte count of an unknown leading header that the
+  /// file-type detector scanned past for the terminal JPEG/TIFF candidate
+  /// ([`crate::filetype::DetectionCandidate::header_skip`], Perl `$skip` at
+  /// `ExifTool.pm:3029`); `0` for every ordinary candidate. The `JPEG`/`TIFF`
+  /// arms slice `bytes` at that offset before dispatch and rebase the embedded
+  /// Exif `Base` by it, so an `IsOffset` tag stays a TRUE absolute file offset.
+  ///
   /// # Errors
   ///
   /// Returns [`AnyError`] when the dispatched per-format parser raises a
@@ -1063,6 +1095,7 @@ impl AnyParser {
     bytes: &'a [u8],
     shared: &mut SharedFlags,
     ext: Option<&str>,
+    header_skip: usize,
   ) -> Result<Option<AnyMeta<'a>>, AnyError> {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` below is empty and the parameters are unused. Discard them
@@ -1089,8 +1122,15 @@ impl AnyParser {
       feature = "matroska",
       feature = "quicktime",
       feature = "mxf",
+      feature = "exif",
     )))]
-    let _ = (bytes, shared, ext);
+    let _ = (bytes, shared, ext, header_skip);
+    // `header_skip` is consumed ONLY by the `JPEG`/`TIFF` (`AnyParser::Exif`)
+    // arm; every other format starts at file offset 0 and the detector never
+    // produces a header-skip candidate for it. Discard it here so a
+    // single-format build whose one arm is not `Exif` stays warning-clean
+    // (the `Exif` arm's later use of the `Copy` `usize` is unaffected).
+    let _ = header_skip;
     match self {
       #[cfg(feature = "moi")]
       AnyParser::Moi(p) => {
@@ -1312,6 +1352,61 @@ impl AnyParser {
           .map(|o| o.map(AnyMeta::Mxf))
           .map_err(Into::into)
       }
+      #[cfg(feature = "exif")]
+      AnyParser::Exif(p) => {
+        // Exif/TIFF is a leaf format — `shared` (cross-format chain state)
+        // and `ext` are unused. The IFD walker decodes the whole chain
+        // (IFD0 → IFD1 → ExifIFD → GPS → InteropIFD) from the byte block.
+        //
+        // Container branch (faithful to ExifTool dispatching the right
+        // `Process<Type>` by file magic): a camera JPEG starts with the SOI
+        // marker `\xff\xd8`. For that we walk the JPEG markers and decode the
+        // embedded `APP1` `Exif\0\0` block(s) (ExifTool.pm:7736-7783 — the
+        // Exif arm of `ProcessJPEG`); otherwise the bytes are a standalone
+        // TIFF and go straight to the IFD walker (`p.parse`). Both produce an
+        // `ExifMeta`. A real TIFF never begins `\xff\xd8`, so the branch is
+        // unambiguous, and the direct standalone-TIFF API
+        // (`ProcessExif::parse` / `parse_exif_block`) is unaffected — only
+        // this engine dispatch adds the JPEG hop.
+        //
+        // JPEG-container acceptance is SPLIT from Exif extraction (faithful to
+        // bundled `SetFileType` at ExifTool.pm:7304, run before — and
+        // independent of — the `APP1` Exif arm): `parse_jpeg_exif` returns
+        // `None` ONLY for a non-JPEG, so once the SOI magic matched here the
+        // result is always `Ok(Some(..))` and the JPEG candidate is ALWAYS
+        // accepted — finalizing `File:FileType = JPEG` even for a stripped /
+        // editor JPEG with no usable `APP1` Exif (its `ExifMeta` then carries
+        // no entries, just a `Malformed APP1 EXIF segment` warning where
+        // bundled warns). Engine `Ok(None)` candidate-rejection can no longer
+        // mis-reject a valid JPEG into a finalization error.
+        //
+        // Unknown-leading-header (Codex R18 F2): the file-type detector's
+        // terminal candidate (`ExifTool.pm:3026-3034`) scans PAST `header_skip`
+        // junk bytes to find a JPEG `SOI` (`\xff\xd8\xff`) or a TIFF magic.
+        // When `header_skip > 0` the JPEG/TIFF body therefore starts at
+        // `bytes[header_skip..]`, and the embedded Exif `Base` must be rebased
+        // by `header_skip` (Perl `$dirInfo{Base} = $pos + $skip` —
+        // `ExifTool.pm:3030` — flows into the TIFF block's `Base`, keeping
+        // `IsOffset` tags absolute). Pre-fix this arm only matched a `SOI` at
+        // byte 0, so a recoverable/edited JPEG with a small unknown header was
+        // detected then mis-rejected into a `File format error`.
+        // Exif/TIFF is a leaf format — `shared` and `ext` are unused, and the
+        // `p` unit dispatcher is bypassed for the base-aware entry below.
+        let _ = (p, shared, ext);
+        let body = bytes.get(header_skip..).unwrap_or(&[]);
+        if body.len() >= 2 && body[0] == 0xff && body[1] == 0xd8 {
+          return Ok(
+            crate::exif::jpeg::parse_jpeg_exif_with_base(body, header_skip).map(AnyMeta::Exif),
+          );
+        }
+        // A standalone TIFF — at byte 0 normally, or at `bytes[header_skip..]`
+        // for the detector's terminal TIFF-after-unknown-header candidate.
+        // `base == header_skip` rebases its `IsOffset` tags to absolute file
+        // offsets; `base == 0` for the ordinary case is exactly `p.parse`
+        // (`ProcessExif::parse` → `parse_tiff` → `parse_tiff_with_base(_, 0)`).
+        let base = u32::try_from(header_skip).unwrap_or(u32::MAX);
+        Ok(crate::exif::parse_exif_block_with_base(body, base).map(AnyMeta::Exif))
+      }
     }
   }
 }
@@ -1339,6 +1434,19 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "DV" => Some(AnyParser::Dv(crate::formats::dv::ProcessDv)),
     #[cfg(feature = "flac")]
     "FLAC" => Some(AnyParser::Flac(crate::formats::flac::ProcessFlac)),
+    // A camera JPEG (`File:FileType == "JPEG"`) is the primary camera-photo
+    // format. Bundled `ProcessJPEG` (ExifTool.pm:7260-7821) walks the JPEG
+    // markers and dispatches the `APP1` `Exif\0\0` segment to ProcessTIFF →
+    // ProcessExif (ExifTool.pm:7736-7783). We route JPEG to the SAME
+    // `AnyParser::Exif` arm: the dispatch in `parse_any` branches on the JPEG
+    // SOI magic (`\xff\xd8`) to run the marker walk
+    // ([`crate::exif::jpeg::parse_jpeg_exif`]) before falling through to the
+    // standalone-TIFF path. Both yield an `ExifMeta` (the GPS sub-IFD, row 14,
+    // is decoded through it). The non-Exif JPEG segments (APP0/APP13/SOF/…)
+    // and multi-segment APP1 XMP are a deferred JPEG-container follow-up
+    // (`docs/tracking.md`).
+    #[cfg(feature = "exif")]
+    "JPEG" => Some(AnyParser::Exif(crate::exif::ProcessExif)),
     #[cfg(feature = "matroska")]
     "MKV" => Some(AnyParser::Matroska(
       crate::formats::matroska::ProcessMatroska,
@@ -1370,6 +1478,16 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "Real" => Some(AnyParser::Real(crate::formats::real::ProcessReal)),
     #[cfg(feature = "red")]
     "R3D" => Some(AnyParser::R3D(crate::formats::red::ProcessR3D)),
+    // A standalone TIFF file IS an Exif/TIFF block (FORMATS.md row 13):
+    // `%fileTypeLookup{TIFF}` resolves the `.tif`/`.tiff` extension and the
+    // `II*\0`/`MM\0*` magic to file type "TIFF", dispatched here. The Exif
+    // IFD walker decodes IFD0 → IFD1 → ExifIFD → GPS → InteropIFD; the GPS
+    // sub-IFD (row 14) is reached through it. RAW formats whose base type is
+    // "TIFF" (CR2/NEF/DNG/ARW/…) also resolve to file type "TIFF" — they
+    // dispatch here too, decoding their standard Exif IFDs (vendor MakerNote
+    // parsing is the deferred MakerNotes wave).
+    #[cfg(feature = "exif")]
+    "TIFF" => Some(AnyParser::Exif(crate::exif::ProcessExif)),
     #[cfg(feature = "wavpack")]
     "WV" => Some(AnyParser::Wv(crate::formats::wavpack::ProcessWv)),
     _ => None,
@@ -1441,6 +1559,15 @@ mod tests {
     assert!(any_parser_for("R3D").is_some());
     #[cfg(feature = "wavpack")]
     assert!(any_parser_for("WV").is_some());
+    // Exif/TIFF: a standalone TIFF AND a camera JPEG both route to the Exif
+    // walker (the JPEG dispatch branches on SOI magic in `parse_any`). Codex
+    // R16/F1: the JPEG arm is the core product capability — without it a
+    // camera photo's Make/Model/DateTime/GPS were never extracted.
+    #[cfg(feature = "exif")]
+    {
+      assert!(any_parser_for("TIFF").is_some());
+      assert!(any_parser_for("JPEG").is_some());
+    }
     assert!(any_parser_for("MPEG").is_none()); // video side deferred
     assert!(any_parser_for("").is_none());
     assert!(any_parser_for("AIFC").is_none()); // resolves to AIFF via lookup, not directly
@@ -1458,7 +1585,8 @@ mod tests {
     let bytes = b"V6\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
     let parser = any_parser_for("MOI").expect("MOI feature enabled");
     let mut shared = SharedFlags::new();
-    let result = parser.parse_any(bytes, &mut shared, None);
+    // `header_skip == 0`: an ordinary (non-header-skip) candidate.
+    let result = parser.parse_any(bytes, &mut shared, None, 0);
     // The exact `Some`/`None` outcome depends on the MOI parser's
     // acceptance rules for a 16-byte buffer; this test just verifies the
     // dispatch doesn't panic and produces an `Ok(_)` result.
@@ -1484,7 +1612,7 @@ mod tests {
       // `ext` is a short-lived String dropped at the end of this block.
       let ext: String = String::from("MP3");
       let m = parser
-        .parse_any(&bytes, &mut shared, Some(ext.as_str()))
+        .parse_any(&bytes, &mut shared, Some(ext.as_str()), 0)
         .expect("ok");
       // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
       m
@@ -1521,7 +1649,7 @@ mod tests {
     let parser = any_parser_for("AAC").expect("AAC feature enabled");
     let mut shared = SharedFlags::new();
     let meta = parser
-      .parse_any(&data, &mut shared, Some("AAC"))
+      .parse_any(&data, &mut shared, Some("AAC"), 0)
       .expect("parse ok")
       .expect("AAC recognized");
 

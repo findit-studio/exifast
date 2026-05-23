@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "Exif_gps_unicode.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "GPS:GPSProcessingMethod": "MANUAL",
+  "GPS:GPSAreaInformation": "Tokyo"
+}]

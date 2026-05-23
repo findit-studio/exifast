@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "Exif_trailing_space.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "EOS R5",
+  "IFD0:Software": "FW v2.0",
+  "IFD0:Artist": "Jane Doe",
+  "ExifIFD:DateTimeOriginal": "2021:08:14 16:45:09",
+  "ExifIFD:SubSecTime": 123,
+  "ExifIFD:SubSecTimeOriginal": 45,
+  "ExifIFD:SubSecTimeDigitized": 70
+}]

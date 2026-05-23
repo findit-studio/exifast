@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "Exif_gps_datestamp.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "GPS:GPSVersionID": "2.3.0.0",
+  "GPS:GPSDateStamp": "2024:05:22"
+}]

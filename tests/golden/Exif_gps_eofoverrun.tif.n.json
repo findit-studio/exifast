@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "Exif_gps_eofoverrun.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Error reading value for GPS entry 1, ID 0x0002 GPSLatitude",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "II",
+  "IFD0:Make": "Apple",
+  "GPS:GPSVersionID": "2 3 0 0"
+}]

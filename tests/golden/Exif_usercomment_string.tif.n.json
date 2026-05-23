@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_usercomment_string.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "ExifIFD:UserComment": "Hello World"
+}]

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_truncated_ifd.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Bad IFD0 directory",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)"
+}]

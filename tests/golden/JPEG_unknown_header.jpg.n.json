@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "JPEG_unknown_header.jpg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Processing JPEG-like data after unknown 4-byte header",
+  "File:ExifByteOrder": "II",
+  "IFD0:Make": "Canon",
+  "IFD1:Compression": 6,
+  "IFD1:ThumbnailOffset": 90,
+  "IFD1:ThumbnailLength": 4
+}]
