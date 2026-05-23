@@ -873,12 +873,21 @@ fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
     maker_note: None,
     captured_make: None,
     captured_model: None,
-    seen_ifd_offsets: std::collections::HashSet::new(),
+    // COMMON path: a fresh per-block set ⇒ silent trailing-chain revisit
+    // (no cross-source cycle-guard). Byte-identical to before.
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
     active_ifd_offsets: Vec::new(),
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk.
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
+  // The Owned guard never raises a cross-source cycle-guard warning, so this
+  // is always empty on the common path — assert it to lock the invariant.
+  debug_assert!(
+    w.cycle_guard_warnings.is_empty(),
+    "the common (Owned) path must never produce cross-source cycle-guard warnings"
+  );
 
   Some(ExifMeta {
     entries: w.entries,
@@ -888,15 +897,165 @@ fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
   })
 }
 
+/// **PNG multi-EXIF-source seam — ExifTool's object-level `$$et{PROCESSED}`.**
+/// Parse one Exif/TIFF block whose chain-IFD reprocess guard is the EXTERNAL
+/// `processed` map, SHARED across every block in a single PNG file
+/// (`ExifTool.pm:9061-9072`). Returns the parsed [`ExifMeta`] (whatever
+/// directories were NOT blocked) plus the cross-source cycle-guard warnings
+/// raised while walking THIS block.
+///
+/// This is a thin, ADDITIVE wrapper over [`parse_tiff_with_base`]: it injects a
+/// [`ChainGuard::Shared`] over `processed` (instead of the common path's fresh
+/// internal [`HashSet`](std::collections::HashSet)) and surfaces the collected
+/// cycle-guard warnings. NOTHING else differs — the same TIFF-header gate, the
+/// same IFD walk, the same tag decoding, the same `DirLen=0` sub-IFD skip
+/// (ExifIFD/GPS/InteropIFD are STILL reprocessed across sources, matching
+/// `ExifTool.pm:9052`). The common [`parse_exif_block`] /
+/// [`parse_exif_block_with_base`] / `parse_tiff_with_base` entries keep their
+/// behaviour EXACTLY (fresh [`ChainGuard::Owned`], silent revisit, no warning).
+///
+/// `processed` maps a chain-IFD `$addr` (the IFD0 pointer for IFD0; the
+/// next-IFD pointer for a trailing IFD) to the `$dirName` that first claimed it
+/// (`IFD0` / `IFD1` / …). A later block whose IFD0 lands on an `$addr` already
+/// in the map is BLOCKED: its IFD0 directory is skipped (so it contributes NO
+/// tags — ExifTool `return 0`s out of `ProcessExif` before the trailing scan,
+/// so the whole block yields nothing), and a
+/// `"IFD0 pointer references previous <prev> directory"` warning is returned
+/// (`<prev>` = the recorded name, e.g. `IFD1` for a cross-source trailing-IFD
+/// collision). A `ProcessProfile` source resets `$$et{PROCESSED}` BEFORE
+/// calling this (`PNG.pm:1193`) — the caller clears `processed` first.
+///
+/// The block's OWN `$et->Warn` corpus (Bad-directory, suspicious-offset, …)
+/// stays in the returned [`ExifMeta`]'s [`warnings`](ExifMeta::warnings); the
+/// cycle-guard warnings are returned SEPARATELY so the PNG layer can sequence
+/// them faithfully (ExifTool raises them from the `ProcessDirectory`
+/// dispatcher, around the per-source warnings).
+///
+/// Returns `(None, vec![])` when `block` is not a valid TIFF header (same gate
+/// as [`parse_exif_block`]) — a malformed block neither blocks itself nor a
+/// later source and registers no `$addr`.
+///
+/// Gated on `feature = "exif"` only — exactly like [`parse_exif_block`] /
+/// [`parse_exif_block_with_base`] (the surrounding walker uses `Vec` / `SmolStr`
+/// freely; the whole module is de-facto `alloc`-requiring, so no extra `alloc`
+/// gate is added here — keeping this in lock-step with its siblings avoids a
+/// gating mismatch with the `exif`-gated PNG caller).
+#[must_use]
+pub fn parse_exif_block_with_shared_processed<'a>(
+  block: &'a [u8],
+  base: u32,
+  processed: &mut std::collections::HashMap<usize, IfdName>,
+) -> (Option<ExifMeta<'a>>, Vec<smol_str::SmolStr>) {
+  parse_tiff_with_base_shared(block, base, processed)
+}
+
+/// The [`ChainGuard::Shared`] sibling of [`parse_tiff_with_base`] — see
+/// [`parse_exif_block_with_shared_processed`]. Factored out so the public
+/// wrapper stays a one-liner and the header gate / walk body is shared with the
+/// common path verbatim.
+fn parse_tiff_with_base_shared<'a>(
+  data: &'a [u8],
+  base: u32,
+  processed: &mut std::collections::HashMap<usize, IfdName>,
+) -> (Option<ExifMeta<'a>>, Vec<smol_str::SmolStr>) {
+  // Same TIFF-header gate as `parse_tiff_with_base` (kept in lock-step). A
+  // malformed header yields no meta and no warnings, and (crucially) does NOT
+  // touch `processed` — so a broken block neither blocks itself nor a later
+  // source.
+  if data.len() < 8 {
+    return (None, Vec::new());
+  }
+  let Some(order) = ByteOrder::from_marker(&data[..2]) else {
+    return (None, Vec::new());
+  };
+  let Some(magic) = get_u16(data, 2, order) else {
+    return (None, Vec::new());
+  };
+  if magic == 0x2b {
+    // BigTIFF — deferred, same as the common path.
+    return (None, Vec::new());
+  }
+  let Some(ifd0_offset) = get_u32(data, 4, order).map(|o| o as usize) else {
+    return (None, Vec::new());
+  };
+  if ifd0_offset < 8 {
+    return (None, Vec::new());
+  }
+
+  let mut w = Walker {
+    data,
+    order,
+    base,
+    entries: Vec::new(),
+    warnings: Vec::new(),
+    maker_note: None,
+    captured_make: None,
+    captured_model: None,
+    // SHARED path: the external `$$et{PROCESSED}` map. A chain-IFD revisit —
+    // within this block or from an earlier source — warns + skips.
+    chain_guard: ChainGuard::Shared(processed),
+    cycle_guard_warnings: Vec::new(),
+    active_ifd_offsets: Vec::new(),
+  };
+  w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
+
+  let cycle_guard_warnings = w.cycle_guard_warnings;
+  let meta = ExifMeta {
+    entries: w.entries,
+    warnings: w.warnings,
+    byte_order: Some(order),
+    maker_note: w.maker_note,
+  };
+  (Some(meta), cycle_guard_warnings)
+}
+
 // ===========================================================================
 // IFD walker — ProcessExif (Exif.pm:6278-7240)
 // ===========================================================================
+
+/// The chain-IFD (IFD0 / trailing-IFD) reprocess guard — the storage behind
+/// ExifTool's `$$self{PROCESSED}` for the non-zero-`DirLen` directories
+/// (`ExifTool.pm:9050-9072`). Two modes:
+///
+/// * [`ChainGuard::Owned`] — a fresh per-block `HashSet<usize>`. This is the
+///   COMMON path ([`parse_exif_block`] / [`parse_exif_block_with_base`] /
+///   [`parse_tiff_with_base`]): a chain-IFD revisit silently `return 0`s (no
+///   warning), exactly the pre-existing trailing-chain loop breaker. Every
+///   non-PNG format and every standalone TIFF takes this path, so its
+///   behaviour is byte-identical to before this guard was made pluggable.
+/// * [`ChainGuard::Shared`] — an EXTERNAL `HashMap<usize, IfdName>` borrowed
+///   from the caller and SHARED across several TIFF blocks
+///   ([`parse_exif_block_with_shared_processed`], used only by the PNG
+///   multi-EXIF-source replay). This is ExifTool's OBJECT-level `$$et{PROCESSED}`:
+///   one set spanning every `ProcessTIFF` call in the file, keyed on each
+///   directory's `$addr` and mapping it to the `$dirName` that first claimed it
+///   (`ExifTool.pm:9066-9071`). A revisit — within ONE block (a looping next-IFD
+///   chain) OR across two PNG EXIF sources (a later source's IFD0 landing on an
+///   earlier source's already-walked IFD0 *or trailing IFD*) — warns
+///   `"<DirName> pointer references previous <prev> directory"` and `return 0`s
+///   that directory (`ExifTool.pm:9068`). The map (not a bare `HashSet`) is
+///   required to spell `<prev>`: the cross-source TRAILING-IFD case reports the
+///   previous directory as `IFD1`/`IFD2`/… (the recorded name), not `IFD0`
+///   (verified against bundled 13.59 — see `tests/png.rs`'s
+///   `engine_cross_source_trailing_ifd_collision_*`).
+enum ChainGuard<'g> {
+  /// A fresh per-block set — silent collision (the common, behaviour-preserving
+  /// path).
+  Owned(std::collections::HashSet<usize>),
+  /// An external map shared across TIFF blocks — collision warns + skips (the
+  /// PNG multi-source path, ExifTool's object-level `$$et{PROCESSED}`).
+  Shared(&'g mut std::collections::HashMap<usize, IfdName>),
+}
 
 /// IFD walker state. All IFD offsets are relative to the start of `data`
 /// (the TIFF block) — i.e. `$base == 0`, `$dataPos == 0` in ExifTool terms
 /// (`DoProcessTIFF` builds `%dirInfo` with `Base => $base` and the EXIF data
 /// is the whole block — `ExifTool.pm:8703-8714`).
-struct Walker<'a> {
+///
+/// `'g` is the lifetime of the optional external `$$et{PROCESSED}` map borrowed
+/// by [`ChainGuard::Shared`]; for the common [`ChainGuard::Owned`] path it is
+/// unconstrained (the set is owned inline).
+struct Walker<'a, 'g> {
   /// The TIFF block.
   data: &'a [u8],
   /// The TIFF byte order.
@@ -939,8 +1098,9 @@ struct Walker<'a> {
   /// dispatch conditions (`$$self{Model} eq "DC-FT7"` etc.,
   /// `MakerNotes.pm:735` Panasonic-DC-FT7 carve-out).
   captured_model: Option<String>,
-  /// Chain-IFD (IFD0 / trailing-IFD) start offsets already walked — the
-  /// trailing-chain loop breaker. ExifTool records every NON-zero-`DirLen`
+  /// Chain-IFD (IFD0 / trailing-IFD) reprocess guard — the trailing-chain
+  /// loop breaker AND (in [`ChainGuard::Shared`] mode) the cross-source
+  /// `$$et{PROCESSED}` cycle-guard. ExifTool records every NON-zero-`DirLen`
   /// directory in `%PROCESSED` (`ExifTool.pm:9050-9061`); a trailing IFD
   /// carries its true extent as `DirLen`, so a malformed next-IFD chain
   /// that revisits an already-walked trailing IFD is caught by the
@@ -949,13 +1109,26 @@ struct Walker<'a> {
   /// (ExifIFD/GPS/InteropIFD) are NOT, because ExifTool reprocesses a
   /// shared subdirectory offset (see `active_ifd_offsets`).
   ///
-  /// A [`HashSet`](std::collections::HashSet), NOT a `Vec`: this is a pure
-  /// membership set (`contains`/`insert`, never iterated for order), and it
-  /// grows with the trailing-IFD chain length, so a linear `Vec::contains`
-  /// scan would be O(N²) over a long (or adversarial) chain. The set has no
-  /// ordering contract — the walk order is driven by the next-IFD pointers,
-  /// not by this set.
-  seen_ifd_offsets: std::collections::HashSet<usize>,
+  /// The membership store is either an inline `HashSet` (common path, silent
+  /// revisit) or an external `HashMap` shared across TIFF blocks (PNG
+  /// multi-source path, warning revisit) — see [`ChainGuard`]. Either way it
+  /// is a pure membership lookup (`contains`/`insert`, never iterated for
+  /// order) that grows with the trailing-IFD chain length, so the
+  /// `HashSet`/`HashMap` keeps the revisit check O(1) over a long (or
+  /// adversarial) chain. There is no ordering contract — the walk order is
+  /// driven by the next-IFD pointers, not by this store.
+  chain_guard: ChainGuard<'g>,
+  /// Cross-source cycle-guard warnings collected during a
+  /// [`ChainGuard::Shared`] walk — the
+  /// `"<DirName> pointer references previous <prev> directory"` messages
+  /// (`ExifTool.pm:9068`). EMPTY on the common [`ChainGuard::Owned`] path (a
+  /// trailing-chain revisit there silently `return 0`s, matching pre-existing
+  /// behaviour), so this never allocates for a standalone TIFF or any non-PNG
+  /// format. The PNG replay drains these into the document warnings in source
+  /// order. They are kept SEPARATE from [`Walker::warnings`] (the directory's
+  /// own `$et->Warn` corpus) because ExifTool raises them from the
+  /// `ProcessDirectory` dispatcher, not from inside `ProcessExif`.
+  cycle_guard_warnings: Vec<smol_str::SmolStr>,
   /// IFD start offsets currently on the ACTIVE recursion path — the
   /// true-cycle guard for IFD-pointer subdirectories. Pushed when
   /// `walk_one_ifd` begins a directory and popped when it returns, so the
@@ -972,7 +1145,7 @@ struct Walker<'a> {
   active_ifd_offsets: Vec<usize>,
 }
 
-impl Walker<'_> {
+impl Walker<'_, '_> {
   /// Walk an IFD and then follow its next-IFD pointer chain (IFD0 → IFD1 →
   /// …) — faithful to `ProcessExif`'s `$$dirInfo{Multi}` trailing-IFD scan
   /// (`Exif.pm:7202-7228`). `Multi` is set for IFD0 (`Exif.pm:6339`).
@@ -1057,10 +1230,13 @@ impl Walker<'_> {
   /// this split:
   ///
   /// * **Chain IFDs** (`Ifd0` / `Trailing`) — recorded in
-  ///   [`seen_ifd_offsets`]; a revisit aborts. This is the trailing-chain
-  ///   loop breaker (`walk_ifd_chain`'s `loop {}` stays finite).
+  ///   [`chain_guard`](Self::chain_guard); a revisit aborts. This is the
+  ///   trailing-chain loop breaker (`walk_ifd_chain`'s `loop {}` stays
+  ///   finite). In [`ChainGuard::Owned`] mode the revisit is silent (the
+  ///   common path); in [`ChainGuard::Shared`] mode it raises the
+  ///   cross-source cycle-guard warning (the PNG multi-source path).
   /// * **IFD-pointer subdirectories** (`ExifIfd` / `Gps` / `Interop`) — NOT
-  ///   recorded in `seen_ifd_offsets`; a shared offset is reprocessed. The
+  ///   recorded in `chain_guard`; a shared offset is reprocessed. The
   ///   only rejection is a genuine ancestor cycle: an offset already on the
   ///   ACTIVE recursion path ([`active_ifd_offsets`]) — e.g. an ExifIFD
   ///   whose 0x8769 tag points back at itself. ExifTool's standalone-TIFF
@@ -1071,9 +1247,40 @@ impl Walker<'_> {
     let is_chain = matches!(kind, IfdKind::Ifd0 | IfdKind::Trailing(_));
     if is_chain {
       // Chain IFD: ExifTool records its non-zero-`DirLen` address in
-      // `%PROCESSED`; a revisit `return 0`s. Break the looping chain.
-      if !self.seen_ifd_offsets.insert(ifd_start) {
-        return None;
+      // `%PROCESSED` (`ExifTool.pm:9066-9071`); a revisit `return 0`s.
+      // Break the looping chain.
+      match &mut self.chain_guard {
+        // COMMON path: a fresh per-block set; a revisit silently aborts (no
+        // warning) — byte-identical to the pre-existing trailing-chain loop
+        // breaker that every standalone TIFF / non-PNG format relies on.
+        ChainGuard::Owned(set) => {
+          if !set.insert(ifd_start) {
+            return None;
+          }
+        }
+        // PNG multi-source path: an EXTERNAL map shared across TIFF blocks
+        // (ExifTool's object-level `$$et{PROCESSED}`). A revisit — within this
+        // block OR from an earlier PNG EXIF source — warns
+        // `"<DirName> pointer references previous <prev> directory"`
+        // (`ExifTool.pm:9068`) and `return 0`s. `<prev>` is the recorded name
+        // (`$$self{PROCESSED}{$addr}`), so a cross-source TRAILING-IFD hit
+        // reports `IFD1`/`IFD2`/… — NOT necessarily `IFD0`. Keep the ORIGINAL
+        // recorded name (do not overwrite): ExifTool sets `$$self{PROCESSED}
+        // {$addr} = $dirName` only when not already present (the assignment is
+        // skipped on the `return 0`).
+        ChainGuard::Shared(processed) => {
+          if let Some(prev) = processed.get(&ifd_start) {
+            self
+              .cycle_guard_warnings
+              .push(smol_str::SmolStr::from(std::format!(
+                "{} pointer references previous {} directory",
+                kind.as_str(),
+                prev
+              )));
+            return None;
+          }
+          processed.insert(ifd_start, kind.as_str());
+        }
       }
     } else {
       // IFD-pointer subdirectory (ExifIFD/GPS/InteropIFD): ExifTool skips
@@ -4255,7 +4462,7 @@ mod tests {
   /// fields are private to this module; the `#[cfg(test)] mod tests` shares
   /// the module, so it can construct one directly.)
   #[cfg(feature = "alloc")]
-  fn test_walker(data: &[u8]) -> Walker<'_> {
+  fn test_walker(data: &[u8]) -> Walker<'_, 'static> {
     Walker {
       data,
       order: ByteOrder::Big,
@@ -4265,7 +4472,8 @@ mod tests {
       maker_note: None,
       captured_make: None,
       captured_model: None,
-      seen_ifd_offsets: std::collections::HashSet::new(),
+      chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+      cycle_guard_warnings: Vec::new(),
       active_ifd_offsets: Vec::new(),
     }
   }
