@@ -393,6 +393,513 @@ fn canon_eos_real_fixture_decodes_typed_fields() {
   assert!((range.1 - 55.0).abs() < 0.1, "max focal {}", range.1);
 }
 
+// ===========================================================================
+// Phase 3 — real-input Sony/Panasonic JPEG fixtures
+// ===========================================================================
+
+/// Sony DSC-F828 JPEG (bundled from `exiftool/t/images/Sony.jpg`). The
+/// bundled fixture's MakerNotes IFD has 9 entries (`Sony_0x2000` through
+/// `Sony_0x9008`) — ALL unrecognized in `%Image::ExifTool::Sony::Main`,
+/// so bundled emits no `MakerNotes:` group either. The port's behavior is
+/// FAITHFUL: dispatch the Sony signature, walk the body, omit unknown
+/// tags. The integration verifies dispatch + empty typed surface (no
+/// false positives).
+#[test]
+fn sony_dsc_real_fixture_dispatches_with_no_recognized_tags() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Sony.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Sony JPEG parsed");
+
+  // IFD0 Make = "SONY"
+  let make_entry = meta.entry("Make").expect("Make tag in IFD0");
+  let make = match make_entry.value_ref().raw() {
+    exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+    other => panic!("Make is not a Text RawValue: {other:?}"),
+  };
+  assert_eq!(make, "SONY");
+
+  let mn = meta.maker_note().expect("MakerNote captured");
+  // Sony PRIMARY signature `SONY DSC \0` dispatches to Vendor::Sony.
+  assert!(mn.vendor().is_sony(), "vendor = {:?}", mn.vendor());
+  assert_eq!(mn.detected().body_offset(), 12);
+
+  // No recognized tags in this fixture's MakerNotes IFD (`Sony_0x2000`..
+  // `Sony_0x9008` — bundled emits `Sony_0xNNNN` placeholder names only in
+  // verbose mode; the default `-j` output omits them, and we do the same).
+  let emissions = mn.emissions_print_conv();
+  assert!(
+    emissions.is_empty(),
+    "Sony fixture has no recognized tags — got {emissions:?}"
+  );
+  // Typed surface populated only for tags we recognize — all None here.
+  let sony = mn.meta().sony().expect("Sony slot allocated");
+  assert!(sony.model_id().is_none());
+  assert!(sony.quality().is_none());
+  assert!(sony.lens_type().is_none());
+}
+
+/// Synthetic Sony JPEG: build the same dispatch path used in the real
+/// fixture but with a HEADERLESS Sony body that carries a single
+/// `Quality` (0x0102) tag. Verify the typed surface and emissions
+/// populate the print-conv label.
+#[test]
+fn synthetic_sony_typed_populates_quality_and_model_id() {
+  // Direct parse via the public sony API (the dispatcher integration is
+  // already covered by `synthetic_sony_makernote_dispatches`).
+  use exifast::exif::makernotes::vendors::sony;
+  // Headerless body: 2 entries — Quality=2 ("Fine") + SonyModelID=358 ("ILCE-9")
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(&[0x02, 0x00]); // 2 entries LE
+  // Entry 1: Quality (0x0102, int32u, count=1, value=2)
+  blob.extend_from_slice(&[0x02, 0x01, 0x04, 0x00]);
+  blob.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+  blob.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
+  // Entry 2: SonyModelID (0xb001, int16u, count=1, value=358)
+  blob.extend_from_slice(&[0x01, 0xb0, 0x03, 0x00]);
+  blob.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+  blob.extend_from_slice(&[0x66, 0x01, 0x00, 0x00]);
+  let (typed, emissions) = sony::parse(&blob, 0, exifast::exif::ifd::ByteOrder::Little);
+  assert_eq!(typed.quality(), Some(2));
+  assert_eq!(typed.model_id(), Some(358));
+  assert_eq!(typed.model_name(), Some("ILCE-9"));
+  assert_eq!(emissions.len(), 2);
+  use exifast::value::TagValue;
+  let find = |n: &str| {
+    emissions
+      .iter()
+      .find(|e| e.name() == n)
+      .map(|e| e.value().clone())
+  };
+  assert_eq!(find("Quality"), Some(TagValue::Str("Fine".into())));
+  assert_eq!(find("SonyModelID"), Some(TagValue::Str("ILCE-9".into())));
+}
+
+/// Panasonic Lumix DMC-FZ3 JPEG (bundled from `exiftool/t/images/Panasonic.jpg`).
+/// Verify the Panasonic body decoder populates `MakerNotesPanasonic` with
+/// the per-tag values the bundled `perl exiftool -j` oracle emits.
+///
+/// Oracle (excerpt):
+///
+/// ```text
+/// "MakerNotes:ImageQuality": "High",
+/// "MakerNotes:FirmwareVersion": "0.1.0.8",
+/// "MakerNotes:WhiteBalance": "Auto",
+/// "MakerNotes:FocusMode": "Auto",
+/// "MakerNotes:ImageStabilization": "On, Mode 2",
+/// "MakerNotes:MacroMode": "Off",
+/// "MakerNotes:ShootingMode": "Program",
+/// "MakerNotes:Audio": "No",
+/// "MakerNotes:InternalSerialNumber": "(S00) 2004:07:19 no. 0102",
+/// "MakerNotes:PanasonicExifVersion": "0100",
+/// "MakerNotes:VideoFrameRate": "n/a",
+/// "MakerNotes:ColorEffect": "Off",
+/// "MakerNotes:TimeSincePowerOn": "00:00:06.96",
+/// "MakerNotes:BurstMode": "Off",
+/// "MakerNotes:SequenceNumber": 0,
+/// "MakerNotes:ContrastMode": "Normal",
+/// "MakerNotes:NoiseReduction": "Standard",
+/// "MakerNotes:SelfTimer": "Off",
+/// ```
+#[test]
+fn panasonic_lumix_real_fixture_decodes_typed_fields() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Panasonic.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Panasonic JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_panasonic(), "vendor = Panasonic");
+  assert_eq!(mn.detected().body_offset(), 12);
+
+  let pana = mn.meta().panasonic().expect("Panasonic typed populated");
+
+  // Body identity.
+  assert_eq!(pana.firmware_version(), Some("0.1.0.8"));
+  assert_eq!(
+    pana.internal_serial_number(),
+    Some("(S00) 2004:07:19 no. 0102")
+  );
+  assert_eq!(pana.panasonic_exif_version(), Some("0100"));
+
+  // Capture-mode integers.
+  assert_eq!(pana.shooting_mode(), Some(6)); // 6 = Program
+  assert_eq!(pana.image_stabilization(), Some(4)); // 4 = On, Mode 2
+}
+
+/// Panasonic emissions include the named MakerNote tags under
+/// `MakerNotes:<Name>` with their print-conv labels.
+#[test]
+fn panasonic_lumix_real_fixture_emits_print_conv_labels() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Panasonic.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Panasonic JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  let emissions = mn.emissions_print_conv();
+
+  let find = |name: &str| -> Option<exifast::value::TagValue> {
+    emissions
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  };
+  use exifast::value::TagValue;
+  assert_eq!(find("ImageQuality"), Some(TagValue::Str("High".into())));
+  assert_eq!(
+    find("FirmwareVersion"),
+    Some(TagValue::Str("0.1.0.8".into()))
+  );
+  assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Auto".into())));
+  assert_eq!(find("FocusMode"), Some(TagValue::Str("Auto".into())));
+  assert_eq!(
+    find("ImageStabilization"),
+    Some(TagValue::Str("On, Mode 2".into()))
+  );
+  assert_eq!(find("MacroMode"), Some(TagValue::Str("Off".into())));
+  assert_eq!(find("ShootingMode"), Some(TagValue::Str("Program".into())));
+  assert_eq!(find("Audio"), Some(TagValue::Str("No".into())));
+  assert_eq!(
+    find("InternalSerialNumber"),
+    Some(TagValue::Str("(S00) 2004:07:19 no. 0102".into()))
+  );
+  assert_eq!(
+    find("PanasonicExifVersion"),
+    Some(TagValue::Str("0100".into()))
+  );
+  assert_eq!(find("VideoFrameRate"), Some(TagValue::Str("n/a".into())));
+  assert_eq!(find("ColorEffect"), Some(TagValue::Str("Off".into())));
+  assert_eq!(
+    find("TimeSincePowerOn"),
+    Some(TagValue::Str("00:00:06.96".into()))
+  );
+  assert_eq!(find("BurstMode"), Some(TagValue::Str("Off".into())));
+  assert_eq!(find("SequenceNumber"), Some(TagValue::I64(0)));
+  assert_eq!(find("ContrastMode"), Some(TagValue::Str("Normal".into())));
+  assert_eq!(
+    find("NoiseReduction"),
+    Some(TagValue::Str("Standard".into()))
+  );
+  assert_eq!(find("SelfTimer"), Some(TagValue::Str("Off".into())));
+}
+
+// ===========================================================================
+// MakerNotePanasonic3 (DC-FT7) — `Base => 12` out-of-line offset regression
+// ===========================================================================
+//
+// `MakerNotePanasonic3` (`MakerNotes.pm:752-760`) is the DC-FT7 variant of
+// `%Panasonic::Main`. It carries `Base => 12` (`:758`, bundled comment
+// `# crazy!`). ExifTool resolves the child IFD's `$$dirInfo{Base}` to
+// `eval(12) + $base` (`Exif.pm:7003`) and shifts `$subdirDataPos` by
+// `$base - $subdirBase` (`Exif.pm:7040`); the value-offset resolver then does
+// `$valuePtr -= $dataPos` (`Exif.pm:6546`). Net effect, in the port's buffer
+// coordinates (parent `base == 0`, `dataPos == 0`): an OUT-OF-LINE value
+// offset `off` resolves to buffer position `off + 12`. Reading it at `off`
+// (base 0, the pre-fix behaviour) lands 12 bytes EARLY ⇒ the string/binary is
+// corrupted. Inline values (≤ 4 bytes) carry no offset and are unaffected.
+//
+// The synthetic TIFF below was VERIFIED against the bundled ExifTool 13.59
+// binary (`exiftool -G1 -j`): it reports
+//   "IFD0:Make": "Panasonic", "IFD0:Model": "DC-FT7",
+//   "Panasonic:LensType": "LUMIX-LENS-12"
+// i.e. ExifTool reads the out-of-line LensType string via the `Base => 12`
+// rule. The bytes encode a little-endian standalone TIFF: IFD0 (Make,
+// Model=DC-FT7, ExifIFD ptr) → ExifIFD (0x927c MakerNote) →
+// "Panasonic\0\0\0" + a 1-entry IFD whose 0x51 LensType (string, count 14,
+// OUT-OF-LINE) stores its offset 12 LESS than the real string position (the
+// DC-FT7 base-12 convention) → the string "LUMIX-LENS-12\0" → the Make/Model
+// strings.
+
+/// DC-FT7 standalone TIFF; out-of-line LensType offset stored base-12
+/// (the FAITHFUL DC-FT7 encoding). `Panasonic:LensType` == "LUMIX-LENS-12".
+const DCFT7_BASE12_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 10, 0, 0, 0, 112, 0, 0, 0, 16, 1, 2, 0, 7, 0, 0, 0,
+  122, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 146, 7, 0, 44, 0,
+  0, 0, 68, 0, 0, 0, 0, 0, 0, 0, 80, 97, 110, 97, 115, 111, 110, 105, 99, 0, 0, 0, 1, 0, 81, 0, 2,
+  0, 14, 0, 0, 0, 86, 0, 0, 0, 0, 0, 0, 0, 76, 85, 77, 73, 88, 45, 76, 69, 78, 83, 45, 49, 50, 0,
+  80, 97, 110, 97, 115, 111, 110, 105, 99, 0, 68, 67, 45, 70, 84, 55, 0,
+];
+
+/// SAME TIFF but the LensType out-of-line offset is stored base-0 (the real
+/// file position, 98 instead of 86). Under the `Base => 12` rule ExifTool
+/// reads at 98+12=110 ⇒ corruption (it reported `"Panasonic:LensType": 2`).
+/// This is the NEGATIVE CONTROL: with the +12 fix the faithful walker must
+/// NOT produce "LUMIX-LENS-12" from this buffer.
+const DCFT7_BASE0_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 10, 0, 0, 0, 112, 0, 0, 0, 16, 1, 2, 0, 7, 0, 0, 0,
+  122, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 146, 7, 0, 44, 0,
+  0, 0, 68, 0, 0, 0, 0, 0, 0, 0, 80, 97, 110, 97, 115, 111, 110, 105, 99, 0, 0, 0, 1, 0, 81, 0, 2,
+  0, 14, 0, 0, 0, 98, 0, 0, 0, 0, 0, 0, 0, 76, 85, 77, 73, 88, 45, 76, 69, 78, 83, 45, 49, 50, 0,
+  80, 97, 110, 97, 115, 111, 110, 105, 99, 0, 68, 67, 45, 70, 84, 55, 0,
+];
+
+/// The dispatcher routes a DC-FT7 `Panasonic`-prefixed blob to
+/// `MakerNotePanasonic3` (`BaseRule::Literal(12)`, body_offset 12), and the
+/// walker reads the OUT-OF-LINE LensType string via the +12 base shift —
+/// matching the bundled `exiftool -G1 -j` output ("LUMIX-LENS-12").
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn panasonic3_dcft7_base12_out_of_line_lenstype() {
+  use exifast::exif::makernotes::BaseRule;
+  use exifast::value::TagValue;
+
+  let meta = exifast::parse_exif(DCFT7_BASE12_TIFF)
+    .expect("parse ok")
+    .expect("TIFF recognized");
+
+  // Model selected the Panasonic3 (DC-FT7) variant: the dispatcher gave it
+  // `Base => 12` (`MakerNotes.pm:758`) and the 12-byte header.
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_panasonic(), "vendor = Panasonic");
+  assert_eq!(mn.detected().body_offset(), 12);
+  assert_eq!(
+    mn.detected().base_rule(),
+    BaseRule::Literal(12),
+    "DC-FT7 must dispatch as MakerNotePanasonic3 (Base => 12)"
+  );
+
+  // The out-of-line LensType resolves via off+12 ⇒ the real string.
+  let find = |name: &str| -> Option<TagValue> {
+    mn.emissions_print_conv()
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  };
+  assert_eq!(
+    find("LensType"),
+    Some(TagValue::Str("LUMIX-LENS-12".into())),
+    "Base => 12 out-of-line read must match bundled ExifTool (LUMIX-LENS-12)"
+  );
+}
+
+/// NEGATIVE CONTROL: with the offset stored base-0, the `Base => 12` rule
+/// reads 12 bytes too far ⇒ the walker must NOT recover "LUMIX-LENS-12".
+/// Proves the +12 shift is load-bearing (and matches ExifTool, which also
+/// corrupts this buffer — it reported `2`, not the string).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn panasonic3_dcft7_base0_offset_is_corrupted() {
+  use exifast::value::TagValue;
+  let meta = exifast::parse_exif(DCFT7_BASE0_TIFF)
+    .expect("parse ok")
+    .expect("TIFF recognized");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  let lens = mn
+    .emissions_print_conv()
+    .iter()
+    .find(|e| e.name() == "LensType")
+    .map(|e| e.value().clone());
+  assert_ne!(
+    lens,
+    Some(TagValue::Str("LUMIX-LENS-12".into())),
+    "a base-0-stored offset must NOT yield the real string under Base => 12"
+  );
+}
+
+/// Cross-check the DC-FT7 synthetic TIFF against the bundled ExifTool binary
+/// (when `$EXIFTOOL` is set / on PATH): `exiftool -G1 -j -LensType` must emit
+/// "LUMIX-LENS-12", proving the Rust read is byte-faithful. Skipped (not
+/// failed) when the binary is unavailable.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn panasonic3_dcft7_matches_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  // Probe availability.
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; DC-FT7 cross-check skipped");
+    return;
+  }
+  let dir = std::env::temp_dir();
+  let path = dir.join("exifast_dcft7_base12.tif");
+  std::fs::write(&path, DCFT7_BASE12_TIFF).expect("write temp DC-FT7 tif");
+  let out = Command::new(&tool)
+    .args(["-G1", "-j", "-LensType", "-Model"])
+    .arg(&path)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&path);
+  assert!(out.status.success(), "exiftool failed");
+  let json = String::from_utf8(out.stdout).expect("utf8");
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  // Confirm the bundled binary detects DC-FT7 and reads the base-12 string.
+  assert_eq!(
+    obj.get("IFD0:Model").and_then(|v| v.as_str()),
+    Some("DC-FT7"),
+    "bundled exiftool must see Model DC-FT7"
+  );
+  assert_eq!(
+    obj.get("Panasonic:LensType").and_then(|v| v.as_str()),
+    Some("LUMIX-LENS-12"),
+    "bundled exiftool must read the Base => 12 out-of-line LensType"
+  );
+}
+
+/// `MakerNotePanasonic2` (the "MKE" Type2 variant, `MakerNotes.pm:742-749`)
+/// uses `Panasonic::Type2` — a `ProcessBinaryData` table (`Panasonic.pm:2259`),
+/// NOT `%Panasonic::Main`. The dispatcher routes it to `Vendor::Panasonic`,
+/// but the Panasonic Main IFD parser must NOT run on it (Type2 BinaryData is
+/// unported / deferred). Build a Panasonic-make TIFF whose 0x927c blob starts
+/// with "MKE" AND — critically — is shaped so that IF the Main IFD walker were
+/// (wrongly) run, it WOULD decode a real Main tag (ImageQuality at the count=1
+/// position after the 12-byte header). Assert the vendor is Panasonic but NO
+/// Main emissions surface — proving the Type2 gate is load-bearing, not just
+/// that this blob happens to decode empty.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn panasonic2_mke_type2_does_not_run_main_parser() {
+  // Little-endian TIFF. IFD0: Make ("Panasonic\0", out-of-line) + ExifIFD ptr.
+  // Layout offsets:
+  //   header 0..8
+  //   IFD0 @8: count=2 -> 2 + 24 + 4 = 30 -> ends @38
+  //   ExifIFD @38: count=1 -> 2 + 12 + 4 = 18 -> ends @56
+  //   MakerNote blob @56 (len 30) — "MKE\0" then a VALID 1-entry Main IFD
+  //   Make "Panasonic\0" @86 (10 bytes)
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(&[b'I', b'I', 0x2a, 0x00, 8, 0, 0, 0]); // header, IFD0@8
+  // IFD0: 2 entries.
+  t.extend_from_slice(&2u16.to_le_bytes());
+  // Make 0x010f, ASCII(2), count=10, offset=86 (out-of-line).
+  t.extend_from_slice(&0x010fu16.to_le_bytes());
+  t.extend_from_slice(&2u16.to_le_bytes());
+  t.extend_from_slice(&10u32.to_le_bytes());
+  t.extend_from_slice(&86u32.to_le_bytes());
+  // ExifIFD ptr 0x8769, LONG(4), count=1, value=38.
+  t.extend_from_slice(&0x8769u16.to_le_bytes());
+  t.extend_from_slice(&4u16.to_le_bytes());
+  t.extend_from_slice(&1u32.to_le_bytes());
+  t.extend_from_slice(&38u32.to_le_bytes());
+  t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  // ExifIFD @38: 1 entry (MakerNote).
+  t.extend_from_slice(&1u16.to_le_bytes());
+  t.extend_from_slice(&0x927cu16.to_le_bytes());
+  t.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
+  t.extend_from_slice(&30u32.to_le_bytes()); // count = 30
+  t.extend_from_slice(&56u32.to_le_bytes()); // offset = 56
+  t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  // MakerNote blob @56 (30 bytes): "MKE\0" + 8 filler bytes to fill the
+  // 12-byte header slot, THEN a valid Main IFD the Main walker WOULD decode:
+  //   [12..14) count = 1
+  //   [14..26) entry: tag 0x01 ImageQuality, int16u(3), count 1, value 2
+  //   [26..30) next-IFD ptr = 0
+  let blob_start = t.len();
+  assert_eq!(blob_start, 56);
+  t.extend_from_slice(b"MKE\x00"); // Type2 magic
+  t.extend_from_slice(&[0u8; 8]); // pad header to 12 bytes
+  t.extend_from_slice(&1u16.to_le_bytes()); // count = 1 (Main walker would read here)
+  t.extend_from_slice(&0x01u16.to_le_bytes()); // tag 0x01 = ImageQuality
+  t.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  t.extend_from_slice(&2u32.to_le_bytes()); // value 2 (= "High") inline
+  t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  assert_eq!(t.len() - blob_start, 30);
+  // Make string @86.
+  assert_eq!(t.len(), 86);
+  t.extend_from_slice(b"Panasonic\x00");
+
+  let meta = exifast::parse_exif(&t).expect("parse ok").expect("TIFF");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  // Dispatched to Panasonic (MakerNotePanasonic2 — make=Panasonic + "MKE").
+  assert!(
+    mn.vendor().is_panasonic(),
+    "MKE blob dispatches to Vendor::Panasonic"
+  );
+  // But the Main parser was NOT run: no Main typed fields, no emissions —
+  // even though the blob WOULD decode an ImageQuality entry if it had.
+  assert!(
+    mn.meta().panasonic().is_none(),
+    "Panasonic Main typed must be ABSENT for a Type2/MKE blob"
+  );
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "Panasonic Main emissions must be EMPTY for a Type2/MKE blob (Type2 deferred)"
+  );
+}
+
+/// AUDIT (Sony side): `MakerNoteSonyEricsson` (`MakerNotes.pm:1082-1090`,
+/// `SEMC MS\0`) routes to `Sony::Ericsson` with `Base => '$start - 8'` — NOT
+/// `%Sony::Main`. The dispatcher collapses it to `Vendor::Sony`, but the Sony
+/// Main IFD walker must NOT run on it: at body_offset 20 the Ericsson bytes
+/// can coincidentally decode a real Main tag id (e.g. 0x0102 Quality ⇒ a bogus
+/// "Standard"), which `routes_to_main` now suppresses. Real Sony Ericsson
+/// bodies report Make `"Sony Ericsson"` (mixed case, so they do NOT match
+/// Sony5's `/^SONY/` gate — they reach the Ericsson arm in both ExifTool and
+/// the port). Build such a TIFF and assert NO Sony Main emissions surface.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn sony_ericsson_does_not_run_main_parser() {
+  // Little-endian TIFF. IFD0: Make ("Sony Ericsson\0", out-of-line) + ExifIFD
+  // ptr. ExifIFD: MakerNote (0x927c) = "SEMC MS\0" + padding to body_offset 20
+  // + a 1-entry IFD that WOULD decode Quality (0x0102) if the Main walker ran.
+  //   header 0..8
+  //   IFD0 @8: count=2 -> 30 -> ends @38
+  //   ExifIFD @38: count=1 -> 18 -> ends @56
+  //   MakerNote blob @56 (len 38)
+  //   Make "Sony Ericsson\0" @94 (14 bytes)
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(&[b'I', b'I', 0x2a, 0x00, 8, 0, 0, 0]);
+  t.extend_from_slice(&2u16.to_le_bytes());
+  // Make 0x010f, ASCII(2), count=14, offset=94.
+  t.extend_from_slice(&0x010fu16.to_le_bytes());
+  t.extend_from_slice(&2u16.to_le_bytes());
+  t.extend_from_slice(&14u32.to_le_bytes());
+  t.extend_from_slice(&94u32.to_le_bytes());
+  // ExifIFD ptr 0x8769, LONG(4), count=1, value=38.
+  t.extend_from_slice(&0x8769u16.to_le_bytes());
+  t.extend_from_slice(&4u16.to_le_bytes());
+  t.extend_from_slice(&1u32.to_le_bytes());
+  t.extend_from_slice(&38u32.to_le_bytes());
+  t.extend_from_slice(&0u32.to_le_bytes());
+  // ExifIFD @38: 1 entry (MakerNote).
+  t.extend_from_slice(&1u16.to_le_bytes());
+  t.extend_from_slice(&0x927cu16.to_le_bytes());
+  t.extend_from_slice(&7u16.to_le_bytes());
+  t.extend_from_slice(&38u32.to_le_bytes()); // count = 38
+  t.extend_from_slice(&56u32.to_le_bytes()); // offset = 56
+  t.extend_from_slice(&0u32.to_le_bytes());
+  // MakerNote blob @56 (38 bytes): "SEMC MS\0" + pad to offset 20 + valid IFD.
+  let blob_start = t.len();
+  assert_eq!(blob_start, 56);
+  t.extend_from_slice(b"SEMC MS\x00"); // 8 bytes
+  t.extend_from_slice(&[0u8; 12]); // pad to body_offset 20
+  t.extend_from_slice(&1u16.to_le_bytes()); // count = 1 (Main would read here)
+  t.extend_from_slice(&0x0102u16.to_le_bytes()); // tag 0x0102 = Quality
+  t.extend_from_slice(&4u16.to_le_bytes()); // int32u
+  t.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  t.extend_from_slice(&2u32.to_le_bytes()); // value 2 (= "Fine") inline
+  t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  assert_eq!(t.len() - blob_start, 38);
+  // Make string @94.
+  assert_eq!(t.len(), 94);
+  t.extend_from_slice(b"Sony Ericsson\x00");
+
+  let meta = exifast::parse_exif(&t).expect("parse ok").expect("TIFF");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(
+    mn.vendor().is_sony(),
+    "SEMC MS\\0 dispatches to Vendor::Sony"
+  );
+  // The Main parser must NOT run ⇒ no spurious Quality.
+  assert!(
+    mn.meta().sony().is_none(),
+    "Sony Main typed must be ABSENT for a SonyEricsson blob"
+  );
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "Sony Main emissions must be EMPTY for a SonyEricsson blob (Ericsson table deferred)"
+  );
+}
+
 /// Canon emissions include the named MakerNote tags under
 /// `MakerNotes:<Name>` and apply the print-conv labels.
 #[test]
@@ -630,4 +1137,1075 @@ fn apple_unknown_tags_suppressed_in_default_output() {
       "supported Apple:AccelerationVector must still be present ({mode})"
     );
   }
+}
+
+// ===========================================================================
+// FIX 1 / VALUE ORACLE — Panasonic serialized `-G1` group + conversions.
+//
+// `MakerNotes_Panasonic.jpg` (a DMC-FZ3 Lumix) is NOT a `conformance.rs`
+// fixture: the engine does not yet emit the JPEG SOF `File:*` tags
+// (ImageWidth/Height/EncodingProcess/BitsPerSample/ColorComponents/
+// YCbCrSubSampling), the `IFD1:ThumbnailImage`, or `PrintIM:PrintIMVersion`
+// that bundled exiftool reports for this JPEG, and the crate's
+// `ExifTool:ExifToolVersion` is pinned to 13.58 while the bundled oracle is
+// 13.59 — all unrelated to the Sony/Panasonic MakerNote findings (Apple/Canon
+// JPEG fixtures share the same gaps, which is why neither is a conformance
+// entry either). So we verify the Panasonic group end-to-end HERE, against
+// the exiftool-verified `Panasonic:*` subset, in BOTH `-j` and `-n`.
+//
+// This is the end-to-end check the `emissions_print_conv()` dispatch tests
+// missed: it drives the FULL serializer (`extract_info` → the cached-MakerNote
+// emission site) and asserts the rendered `"<family1>:<Name>"` keys — i.e.
+// that the family-1 group is `Panasonic` (FIX 1), not the family-0
+// `MakerNotes`, AND that every conversion is value-identical to bundled.
+// ===========================================================================
+
+/// The bundled `perl exiftool -j -G1 MakerNotes_Panasonic.jpg` `Panasonic:*`
+/// subset (PrintConv on, `print_on=true`) and the `-n` subset
+/// (`print_on=false`). Captured from ExifTool 13.59; compared value-semantic
+/// (so `"0"`/`0` and `0.0`/`0` match — same rule as `conformance.rs`).
+#[cfg(feature = "json")]
+fn panasonic_oracle(print_on: bool) -> &'static [(&'static str, &'static str)] {
+  if print_on {
+    &[
+      ("Panasonic:ImageQuality", "\"High\""),
+      ("Panasonic:FirmwareVersion", "\"0.1.0.8\""),
+      ("Panasonic:WhiteBalance", "\"Auto\""),
+      ("Panasonic:FocusMode", "\"Auto\""),
+      ("Panasonic:AFAreaMode", "\"9-area\""),
+      ("Panasonic:ImageStabilization", "\"On, Mode 2\""),
+      ("Panasonic:MacroMode", "\"Off\""),
+      ("Panasonic:ShootingMode", "\"Program\""),
+      ("Panasonic:Audio", "\"No\""),
+      (
+        "Panasonic:DataDump",
+        "\"(Binary data 5428 bytes, use -b option to extract)\"",
+      ),
+      ("Panasonic:WhiteBalanceBias", "0"),
+      ("Panasonic:FlashBias", "0"),
+      (
+        "Panasonic:InternalSerialNumber",
+        "\"(S00) 2004:07:19 no. 0102\"",
+      ),
+      ("Panasonic:PanasonicExifVersion", "\"0100\""),
+      ("Panasonic:VideoFrameRate", "\"n/a\""),
+      ("Panasonic:ColorEffect", "\"Off\""),
+      ("Panasonic:TimeSincePowerOn", "\"00:00:06.96\""),
+      ("Panasonic:BurstMode", "\"Off\""),
+      ("Panasonic:SequenceNumber", "0"),
+      ("Panasonic:ContrastMode", "\"Normal\""),
+      ("Panasonic:NoiseReduction", "\"Standard\""),
+      ("Panasonic:SelfTimer", "\"Off\""),
+    ]
+  } else {
+    &[
+      ("Panasonic:ImageQuality", "2"),
+      ("Panasonic:FirmwareVersion", "\"0 1 0 8\""),
+      ("Panasonic:WhiteBalance", "1"),
+      ("Panasonic:FocusMode", "1"),
+      ("Panasonic:AFAreaMode", "\"0 1\""),
+      ("Panasonic:ImageStabilization", "4"),
+      ("Panasonic:MacroMode", "2"),
+      ("Panasonic:ShootingMode", "6"),
+      ("Panasonic:Audio", "2"),
+      (
+        "Panasonic:DataDump",
+        "\"(Binary data 5428 bytes, use -b option to extract)\"",
+      ),
+      ("Panasonic:WhiteBalanceBias", "0"),
+      ("Panasonic:FlashBias", "0"),
+      ("Panasonic:InternalSerialNumber", "\"S000407190102\""),
+      ("Panasonic:PanasonicExifVersion", "\"0100\""),
+      ("Panasonic:VideoFrameRate", "0"),
+      ("Panasonic:ColorEffect", "1"),
+      ("Panasonic:TimeSincePowerOn", "6.96"),
+      ("Panasonic:BurstMode", "0"),
+      ("Panasonic:SequenceNumber", "0"),
+      ("Panasonic:ContrastMode", "0"),
+      ("Panasonic:NoiseReduction", "0"),
+      ("Panasonic:SelfTimer", "1"),
+    ]
+  }
+}
+
+/// FIX 1 + conversions — every Panasonic MakerNote tag in this fixture
+/// serializes under the `Panasonic:` family-1 group (NOT `MakerNotes:`) with
+/// the exact value bundled ExifTool emits, in BOTH `-j` and `-n`. Compared
+/// value-semantic via [`json_equivalent`] (`"0"`==`0`, `0.0`==`0`).
+#[cfg(feature = "json")]
+#[test]
+fn panasonic_serialized_group_and_values_match_bundled() {
+  use exifast::jsondiff::json_equivalent;
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Panasonic.jpg", print_on);
+    for (key, want_val) in panasonic_oracle(print_on) {
+      let got = map.get(*key).unwrap_or_else(|| {
+        panic!(
+          "missing {key} ({mode}); keys: {:?}",
+          map.keys().collect::<Vec<_>>()
+        )
+      });
+      let got_doc = serde_json::to_string(got).unwrap();
+      // Wrap both sides as a 1-element array of {v: …} so the value-semantic
+      // comparator runs on the scalar.
+      let got_obj = format!("[{{\"v\":{got_doc}}}]");
+      let want_obj = format!("[{{\"v\":{want_val}}}]");
+      assert!(
+        json_equivalent(&got_obj, &want_obj).is_ok(),
+        "{key} ({mode}): got {got_doc}, want {want_val}"
+      );
+    }
+    // FIX 1: no MakerNote tag leaks under the family-0 `MakerNotes` group.
+    for leaked in [
+      "MakerNotes:ImageQuality",
+      "MakerNotes:ContrastMode",
+      "MakerNotes:AFAreaMode",
+    ] {
+      assert!(
+        !map.contains_key(leaked),
+        "{leaked} leaked under family-0 MakerNotes group ({mode})"
+      );
+    }
+  }
+}
+
+// ===========================================================================
+// `MakerNotesMeta::from_blob` — variant/base gate (parallel-path regression)
+//
+// The production `ProcessExif` IFD walk gates the Sony/Panasonic Main parser
+// (variant routing + DC-FT7 `Base => 12`) through the SINGLE gated entries
+// `sony::parse_main_gated` / `panasonic::parse_main_gated`. The public
+// `MakerNotesMeta::from_blob` constructor is a PARALLEL entry path into the
+// same Main parser; it must use the SAME gate so a non-Main variant or a
+// base-12 blob cannot produce wrong Main values. These tests drive `from_blob`
+// directly (the production path is covered by the `*_does_not_run_main_parser`
+// / `panasonic3_dcft7_*` tests above) and assert the gate holds there too.
+// ===========================================================================
+
+/// `from_blob` with a `SEMC MS\0` SonyEricsson blob (`MakerNotes.pm:1082-1090`,
+/// → `Sony::Ericsson`, NOT `%Sony::Main`). The dispatcher collapses it to
+/// `Vendor::Sony`, but the gated entry must reject it (no make ⇒ not a
+/// prefixed Main variant) so the Sony slot stays ABSENT — even though the blob
+/// is shaped to decode a real Main `Quality` (0x0102) if the ungated walker
+/// ran. Regression for the parallel-path bypass bug.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_sony_ericsson_leaves_sony_slot_absent() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Standalone SonyEricsson blob: "SEMC MS\0" + pad to body_offset 20 + a
+  // 1-entry IFD that WOULD decode Quality=2 ("Fine") if Sony::Main ran.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"SEMC MS\x00"); // 8 bytes
+  blob.extend_from_slice(&[0u8; 12]); // pad to body_offset 20
+  blob.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+  blob.extend_from_slice(&0x0102u16.to_le_bytes()); // tag 0x0102 = Quality
+  blob.extend_from_slice(&4u16.to_le_bytes()); // int32u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&2u32.to_le_bytes()); // value 2 (= "Fine") inline
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+  // Dispatch as bundled would (Make is mixed-case "Sony Ericsson", which does
+  // NOT match Sony5's /^SONY/ — it reaches the Ericsson arm). The dispatcher
+  // collapses it to Vendor::Sony regardless.
+  let detected = dispatch(&blob, Some("Sony Ericsson"), Some("K800i"), None);
+  assert!(
+    detected.vendor().is_sony(),
+    "SEMC MS\\0 dispatches to Vendor::Sony"
+  );
+
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  assert!(meta.vendor().is_sony());
+  assert!(
+    meta.sony().is_none(),
+    "from_blob must leave the Sony Main slot ABSENT for a SonyEricsson blob \
+     (Ericsson table deferred; the gate rejects the non-Main variant)"
+  );
+}
+
+/// Positive control: `from_blob` with a PREFIXED `SONY DSC` Main blob
+/// (`MakerNoteSony`, `MakerNotes.pm:1032`) — its signature gates `true`
+/// regardless of Make, so the gated entry DOES run `%Sony::Main` and
+/// populates the Sony slot. Proves the gate is not over-rejecting (the
+/// `SEMC MS` absence above is a true rejection, not a blanket "from_blob
+/// never parses Sony").
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_sony_prefixed_main_populates_slot() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // "SONY DSC " (8-byte sig + space) + 4 pad bytes = 12-byte header
+  // (body_offset 12), then a 1-entry IFD: Quality (0x0102, int32u) = 2.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"SONY DSC "); // 9 bytes
+  blob.extend_from_slice(&[0u8; 3]); // pad to body_offset 12
+  blob.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+  blob.extend_from_slice(&0x0102u16.to_le_bytes()); // Quality
+  blob.extend_from_slice(&4u16.to_le_bytes()); // int32u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&2u32.to_le_bytes()); // value 2 (= "Fine")
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+  let detected = dispatch(&blob, Some("SONY"), Some("DSC-RX100"), None);
+  assert!(detected.vendor().is_sony());
+  assert_eq!(detected.body_offset(), 12, "SONY DSC ⇒ body_offset 12");
+
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  let sony = meta
+    .sony()
+    .expect("from_blob must populate the Sony slot for a prefixed Main blob");
+  assert_eq!(
+    sony.quality(),
+    Some(2),
+    "the prefixed Main variant decodes Quality through the gated entry"
+  );
+}
+
+/// `from_blob_with_context` resolves the HEADERLESS `MakerNoteSony5`
+/// (`MakerNotes.pm:1069-1080`) make-only Main route. Sony5 is identified ONLY
+/// by `$$self{Make} =~ /^SONY/` (no blob signature, `Start => '$valuePtr'`),
+/// so the make-LESS `from_blob` leaves the slot ABSENT (the documented
+/// caveat), whereas threading `make = "SONY"` through the context API gates
+/// `routes_to_main` true and decodes `%Sony::Main`.
+///
+/// Bundled cross-check: `exiftool -j -G1` on a headerless Sony body whose
+/// IFD0 Make is `SONY` emits `Sony:Quality` (the body routes through
+/// `MakerNoteSony5` → `Image::ExifTool::Sony::Main`); a value of 2 is "Fine"
+/// (`Sony.pm:770-786`).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_with_context_resolves_headerless_sony5() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Headerless Sony5 body (Start => '$valuePtr', body_offset 0): a bare IFD
+  // with NO prefix signature. The count MUST NOT be `\x01\x00`: a body
+  // starting `\x01\x00` is the SonySRF case (`Sony::SRF`, `MakerNotes.pm:1093`
+  // / the Sony5 `$$valPt !~ /^\x01\x00/` lookahead `:1072`), which is NOT
+  // `%Sony::Main` — so use a 2-entry IFD (count `\x02\x00`): Quality (0x0102,
+  // int32u) = 2 + SonyModelID (0xb001, int16u) = 358 ("ILCE-9"). Entries must
+  // be tag-id sorted.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(&2u16.to_le_bytes()); // count = 2 (avoids the SonySRF \x01\x00 case)
+  // Entry 1: Quality (0x0102, int32u, count 1) = 2 ("Fine").
+  blob.extend_from_slice(&0x0102u16.to_le_bytes());
+  blob.extend_from_slice(&4u16.to_le_bytes()); // int32u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&2u32.to_le_bytes()); // value 2 inline
+  // Entry 2: SonyModelID (0xb001, int16u, count 1) = 358.
+  blob.extend_from_slice(&0xb001u16.to_le_bytes());
+  blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&358u32.to_le_bytes()); // value 358 inline
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+  // The dispatcher routes a `Make =~ /^SONY/` headerless body to Sony5
+  // (body_offset 0). The Make is REQUIRED at dispatch time too.
+  let detected = dispatch(&blob, Some("SONY"), Some("DSLR-A700"), None);
+  assert!(
+    detected.vendor().is_sony(),
+    "headerless SONY ⇒ Vendor::Sony"
+  );
+  assert_eq!(
+    detected.body_offset(),
+    0,
+    "Sony5 is headerless (body_offset 0)"
+  );
+
+  // make-LESS: the headerless Sony5 make-gate cannot fire ⇒ slot ABSENT.
+  let meta_no_ctx = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  assert!(
+    meta_no_ctx.sony().is_none(),
+    "from_blob (make-less) must leave the Sony slot ABSENT for a headerless \
+     Sony5 body (make-only Main route)"
+  );
+
+  // WITH context (make = "SONY"): the gate fires ⇒ %Sony::Main decodes.
+  let meta = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("SONY"),
+    Some("DSLR-A700"),
+  );
+  let sony = meta.sony().expect(
+    "from_blob_with_context must populate the Sony slot for a headerless \
+     Sony5 body when Make=SONY threads the make-gate",
+  );
+  assert_eq!(
+    sony.quality(),
+    Some(2),
+    "the headerless Sony5 variant decodes Quality through the context gate"
+  );
+}
+
+/// `from_blob` with a Panasonic Type2 (`MKE`) blob (`MakerNotePanasonic2`,
+/// `MakerNotes.pm:743` → `Panasonic::Type2` `ProcessBinaryData`, NOT
+/// `%Panasonic::Main`). The dispatcher collapses it to `Vendor::Panasonic`,
+/// but the gated entry rejects the non-`Panasonic`-prefixed blob so the
+/// Panasonic slot stays ABSENT — even though the blob is shaped to decode a
+/// real Main `ImageQuality` (0x01) if the ungated walker ran.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_panasonic_type2_mke_leaves_panasonic_slot_absent() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Standalone "MKE\0" Type2 blob: "MKE\0" + 8 filler bytes (12-byte header
+  // slot) + a valid 1-entry Main IFD the Main walker WOULD decode.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"MKE\x00"); // Type2 magic
+  blob.extend_from_slice(&[0u8; 8]); // pad header to 12 bytes
+  blob.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+  blob.extend_from_slice(&0x01u16.to_le_bytes()); // tag 0x01 = ImageQuality
+  blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&2u32.to_le_bytes()); // value 2 (= "High") inline
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+  // The "MKE" signature only matches MakerNotePanasonic2 under Make=Panasonic.
+  let detected = dispatch(&blob, Some("Panasonic"), Some("DMC-FZ30"), None);
+  assert!(
+    detected.vendor().is_panasonic(),
+    "MKE blob (Make=Panasonic) dispatches to Vendor::Panasonic"
+  );
+
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  assert!(meta.vendor().is_panasonic());
+  assert!(
+    meta.panasonic().is_none(),
+    "from_blob must leave the Panasonic Main slot ABSENT for a Type2/MKE blob \
+     (Type2 BinaryData deferred; the gate rejects the non-Main variant)"
+  );
+}
+
+/// `from_blob` with a `MakerNotePanasonic3` (DC-FT7, `Base => 12`) blob: an
+/// OUT-OF-LINE `LensType` (0x51) whose stored offset is base-12 (the DC-FT7
+/// convention). The gated entry threads `BaseRule::Literal(12)` so the value
+/// is read at `stored + 12` (the real string) instead of 12 bytes early. The
+/// OLD `from_blob` (calling `panasonic::parse`, base 0) read it corrupted.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_panasonic3_dcft7_base12_reads_out_of_line_at_correct_offset() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{
+    BaseRule, ChildByteOrder, DetectedMakerNote, MakerNotesMeta, Vendor, dispatch,
+  };
+
+  // Self-contained Panasonic3 blob (the standalone equivalent of
+  // DCFT7_BASE12_TIFF, with offsets relative to the BLOB start):
+  //   [0..12)  "Panasonic\0\0\0" header
+  //   [12..14) count = 1
+  //   [14..26) entry: tag 0x51 LensType, ASCII(2), count 14, OUT-OF-LINE
+  //            offset stored = 18 (real string @30 read via +12 base)
+  //   [26..30) next-IFD = 0
+  //   [30..44) "LUMIX-LENS-12\0" (14 bytes)
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"Panasonic\x00\x00\x00"); // 12-byte header
+  blob.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+  blob.extend_from_slice(&0x51u16.to_le_bytes()); // tag 0x51 = LensType
+  blob.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+  blob.extend_from_slice(&14u32.to_le_bytes()); // count 14 (out-of-line)
+  // Stored offset = real_pos(30) - 12 (DC-FT7 Base => 12 convention).
+  blob.extend_from_slice(&18u32.to_le_bytes());
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  assert_eq!(blob.len(), 30, "string must start at blob offset 30");
+  blob.extend_from_slice(b"LUMIX-LENS-12\x00"); // 14 bytes @30
+
+  // The dispatcher selects MakerNotePanasonic3 only for Model "DC-FT7"
+  // (`MakerNotes.pm:752-760`): Panasonic prefix + Base => 12 + body_offset 12.
+  let detected = dispatch(&blob, Some("Panasonic"), Some("DC-FT7"), None);
+  assert!(detected.vendor().is_panasonic());
+  assert_eq!(
+    detected.base_rule(),
+    BaseRule::Literal(12),
+    "DC-FT7 must dispatch as MakerNotePanasonic3 (Base => 12)"
+  );
+
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  let pana = meta
+    .panasonic()
+    .expect("from_blob must populate the Panasonic slot for a DC-FT7 blob");
+  assert_eq!(
+    pana.lens_type(),
+    Some("LUMIX-LENS-12"),
+    "from_blob must read the Base => 12 out-of-line LensType at +12 (the \
+     ungated base-0 path read it 12 bytes early)"
+  );
+
+  // NEGATIVE CONTROL: the SAME blob dispatched with `BaseRule::Inherit`
+  // (base 0) reads the out-of-line offset 12 bytes early ⇒ NOT the string.
+  // Proves the +12 threading through the gate is load-bearing in `from_blob`.
+  let detected_base0 = DetectedMakerNote::new(
+    Vendor::Panasonic,
+    12,
+    BaseRule::Inherit,
+    ChildByteOrder::Unknown,
+    false,
+  );
+  let meta0 = MakerNotesMeta::from_blob(detected_base0, &blob, ByteOrder::Little);
+  let lens0 = meta0.panasonic().and_then(|p| p.lens_type());
+  assert_ne!(
+    lens0,
+    Some("LUMIX-LENS-12"),
+    "a base-0 (Inherit) read must NOT recover the real string from a \
+     base-12-stored offset"
+  );
+}
+
+// ===========================================================================
+// MakerNoteLeica10 (D-Lux7) — cross-vendor `%Panasonic::Main` route
+// ===========================================================================
+//
+// `MakerNoteLeica10` (`MakerNotes.pm:724-730`) is a `Vendor::Leica` blob
+// (`Condition => '$$valPt =~ /^LEICA CAMERA AG\0/'`, `:725`) routed to the
+// PANASONIC Main table (`TagTable => 'Image::ExifTool::Panasonic::Main'`,
+// `:727`) with `Start => '$valuePtr + 18'` (`:728`, body offset 18, NOT the
+// 12-byte `Panasonic\0\0\0` offset) and NO `Base` line (inherit). Bundled
+// `exiftool -G1 -j` therefore emits the resulting tags under the `Panasonic:*`
+// family-1 group (they ARE `%Panasonic::Main` tags).
+//
+// The dispatcher classifies the blob as `Vendor::Leica`, but the production
+// dispatch only ran `panasonic::parse_main_gated` for `Vendor::Panasonic`, so
+// the Panasonic Main tags were DROPPED. This fix routes a Leica10-signature
+// blob through `panasonic::parse_leica10_gated` (body offset 18, Panasonic
+// group), while leaving the nine Leica-specific-table variants
+// (`Panasonic::Leica2..Leica9`, unported) gated/emitting-nothing.
+//
+// The bytes below were VERIFIED against bundled ExifTool 13.59
+// (`exiftool -G1 -j`): it reports
+//   "IFD0:Make": "LEICA CAMERA AG", "IFD0:Model": "D-Lux 7",
+//   "Panasonic:ImageQuality": "High"
+// Little-endian standalone TIFF: IFD0 (Make, Model, ExifIFD ptr) → ExifIFD
+// (0x927c MakerNote) → "LEICA CAMERA AG\0" (16) + 2 pad (body @18) + a 1-entry
+// IFD whose 0x01 ImageQuality (int16u, count 1, value 2 = "High", INLINE) →
+// the Make/Model strings.
+
+/// Byte-built Leica10 standalone TIFF (the verified oracle fixture).
+/// `Panasonic:ImageQuality` == "High" in bundled ExifTool 13.59.
+const LEICA10_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 104, 0, 0, 0, 16, 1, 2, 0, 8, 0, 0, 0,
+  120, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 146, 7, 0, 36, 0,
+  0, 0, 68, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 32, 67, 65, 77, 69, 82, 65, 32, 65, 71, 0, 0,
+  0, 1, 0, 1, 0, 3, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 32, 67, 65, 77, 69,
+  82, 65, 32, 65, 71, 0, 68, 45, 76, 117, 120, 32, 55, 0,
+];
+
+/// The dispatcher classifies the `LEICA CAMERA AG\0` blob as `Vendor::Leica`
+/// with body_offset 18 (`MakerNoteLeica10`, `MakerNotes.pm:724-730`); the
+/// production walk routes it through the cross-table Panasonic Main parser and
+/// the typed Panasonic slot + cached emissions carry `ImageQuality = High`,
+/// under the `Panasonic` emission group (NOT `MakerNotes`/`Leica`).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn leica10_dispatches_to_panasonic_main_image_quality() {
+  use exifast::exif::makernotes::BaseRule;
+  use exifast::value::TagValue;
+
+  let meta = exifast::parse_exif(LEICA10_TIFF)
+    .expect("parse ok")
+    .expect("TIFF recognized");
+  let mn = meta.maker_note().expect("MakerNote captured");
+
+  // Dispatched as Leica10: Vendor::Leica, body_offset 18, inherit base.
+  assert!(mn.vendor().is_leica(), "vendor = Leica (Leica10 signature)");
+  assert_eq!(
+    mn.detected().body_offset(),
+    18,
+    "Leica10 Start => '$valuePtr + 18' (MakerNotes.pm:728)"
+  );
+  assert_eq!(
+    mn.detected().base_rule(),
+    BaseRule::Inherit,
+    "Leica10 has no Base line (MakerNotes.pm:726-730) ⇒ inherit"
+  );
+
+  // The cross-table Panasonic Main parser ran ⇒ the Panasonic typed slot is
+  // populated (Leica10's tags ARE %Panasonic::Main tags).
+  assert!(
+    mn.meta().panasonic().is_some(),
+    "Leica10 must populate the Panasonic typed slot via the Main table"
+  );
+
+  // The cached emission carries ImageQuality = "High" under the Panasonic
+  // group (the emission group1 is overridden to Panasonic even though the
+  // vendor is Leica). ImageQuality (tag 0x01, value 2) ⇒ "High"
+  // (Panasonic.pm:276).
+  assert_eq!(
+    mn.emission_group1(),
+    "Panasonic",
+    "Leica10 tags emit as Panasonic:* (they are %Panasonic::Main tags)"
+  );
+  let iq = mn
+    .emissions_print_conv()
+    .iter()
+    .find(|e| e.name() == "ImageQuality")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    iq,
+    Some(TagValue::Str("High".into())),
+    "Leica10 ImageQuality (tag 0x01, value 2) ⇒ \"High\""
+  );
+}
+
+/// END-TO-END SERIALIZED `-G1` fidelity: the full serializer
+/// (`extract_info`, the conformance-gate path) must emit
+/// `"Panasonic:ImageQuality": "High"` for the byte-built Leica10 TIFF —
+/// matching bundled ExifTool's `Panasonic:*` output — and must NOT leak the
+/// tag under a `Leica:` or family-0 `MakerNotes:` group.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica10_serialized_keys_use_panasonic_group1() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("leica10.tif", LEICA10_TIFF, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{json}"));
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("doc is not [{{…}}]:\n{json}"));
+    // Make/Model decode (sanity); ImageQuality under the Panasonic group.
+    assert_eq!(
+      obj.get("IFD0:Make").and_then(|v| v.as_str()),
+      Some("LEICA CAMERA AG"),
+      "IFD0:Make ({mode})"
+    );
+    // `-j` renders the PrintConv label "High"; `-n` keeps the raw int 2.
+    if print_on {
+      assert_eq!(
+        obj.get("Panasonic:ImageQuality").and_then(|v| v.as_str()),
+        Some("High"),
+        "Leica10 ImageQuality must serialize as Panasonic:ImageQuality=\"High\" ({mode}); \
+         keys: {:?}",
+        obj.keys().collect::<Vec<_>>()
+      );
+    } else {
+      assert_eq!(
+        obj
+          .get("Panasonic:ImageQuality")
+          .and_then(serde_json::Value::as_i64),
+        Some(2),
+        "Leica10 ImageQuality -n raw int ({mode})"
+      );
+    }
+    // The family-1 group is Panasonic, never Leica or the family-0 MakerNotes.
+    assert!(
+      !obj.contains_key("Leica:ImageQuality"),
+      "Leica10 tag must NOT emit under a Leica: group ({mode})"
+    );
+    assert!(
+      !obj.contains_key("MakerNotes:ImageQuality"),
+      "Leica10 tag must NOT emit under family-0 MakerNotes ({mode})"
+    );
+  }
+}
+
+/// Cross-check the Leica10 synthetic TIFF against the bundled ExifTool binary
+/// (when `$EXIFTOOL` is set / on PATH): `exiftool -G1 -j` must emit
+/// `Panasonic:ImageQuality` == "High", proving the Rust read is byte-faithful
+/// to the cross-vendor route. Skipped (not failed) when the binary is absent.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica10_matches_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Leica10 cross-check skipped");
+    return;
+  }
+  let dir = std::env::temp_dir();
+  let path = dir.join("exifast_leica10.tif");
+  std::fs::write(&path, LEICA10_TIFF).expect("write temp Leica10 tif");
+  let out = Command::new(&tool)
+    .args(["-G1", "-j", "-ImageQuality", "-Make", "-Model"])
+    .arg(&path)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&path);
+  assert!(out.status.success(), "exiftool failed");
+  let json = String::from_utf8(out.stdout).expect("utf8");
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  assert_eq!(
+    obj.get("IFD0:Model").and_then(|v| v.as_str()),
+    Some("D-Lux 7"),
+    "bundled exiftool must see Model D-Lux 7"
+  );
+  // The load-bearing oracle: bundled emits the Leica10 ImageQuality under the
+  // Panasonic group (it is a %Panasonic::Main tag).
+  assert_eq!(
+    obj.get("Panasonic:ImageQuality").and_then(|v| v.as_str()),
+    Some("High"),
+    "bundled exiftool must emit Panasonic:ImageQuality=\"High\" for the Leica10 route"
+  );
+}
+
+/// `from_blob` (the public constructor — a parallel code path) must ALSO route
+/// a Leica10-signature blob through the gate and populate the Panasonic slot
+/// at body offset 18, while a genuinely-Leica-table blob (`LEICA\0\0\0`, the
+/// `Panasonic::Leica2` M8 variant) leaves the slot ABSENT (unported/deferred).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_leica10_populates_panasonic_slot_others_deferred() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Self-contained Leica10 blob: "LEICA CAMERA AG\0" (16) + 2 pad (body @18)
+  // + 1-entry IFD (0x1a ImageStabilization int16u count1 value4 inline) +
+  // next=0. Tag 0x1a is a TYPED field on the Panasonic struct (`Panasonic.pm:
+  // ImageStabilization`); `from_blob` returns only the typed meta (no
+  // emissions), so this gives a concrete typed assertion through the gate.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"LEICA CAMERA AG\x00");
+  blob.extend_from_slice(&[0x00, 0x00]);
+  blob.extend_from_slice(&1u16.to_le_bytes());
+  blob.extend_from_slice(&0x1au16.to_le_bytes()); // tag 0x1a ImageStabilization
+  blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&4u32.to_le_bytes()); // value 4 = "On, Mode 2"
+  blob.extend_from_slice(&0u32.to_le_bytes());
+
+  let detected = dispatch(&blob, Some("LEICA CAMERA AG"), Some("D-Lux 7"), None);
+  assert!(detected.vendor().is_leica(), "Leica10 dispatches to Leica");
+  assert_eq!(detected.body_offset(), 18);
+
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  let pana = meta
+    .panasonic()
+    .expect("from_blob must populate the Panasonic slot for a Leica10 blob");
+  assert_eq!(
+    pana.image_stabilization(),
+    Some(4),
+    "from_blob must decode the Leica10 body at offset 18 (ImageStabilization=4)"
+  );
+
+  // NEGATIVE: a `LEICA\0\0\0` (Leica2 / M8, `Panasonic::Leica2` table) blob is
+  // a `Vendor::Leica` detection too, but it does NOT match the Leica10
+  // signature ⇒ the gate returns `None` ⇒ Panasonic slot ABSENT (the Leica2
+  // table is unported/deferred — no spurious Panasonic Main tags). The blob is
+  // shaped so that IF the Main walker were (wrongly) run at body offset 18 it
+  // WOULD see a 1-entry IFD; the signature gate is what suppresses it.
+  let mut leica2: Vec<u8> = Vec::new();
+  leica2.extend_from_slice(b"LEICA\x00\x00\x00"); // 8-byte LEICA2 header
+  leica2.extend_from_slice(&[0x00; 10]); // pad so body @18 is a plausible IFD
+  leica2.extend_from_slice(&1u16.to_le_bytes());
+  leica2.extend_from_slice(&0x01u16.to_le_bytes());
+  leica2.extend_from_slice(&3u16.to_le_bytes());
+  leica2.extend_from_slice(&1u32.to_le_bytes());
+  leica2.extend_from_slice(&2u32.to_le_bytes());
+  leica2.extend_from_slice(&0u32.to_le_bytes());
+  let det2 = dispatch(&leica2, Some("Leica Camera AG"), Some("M8"), None);
+  assert!(
+    det2.vendor().is_leica(),
+    "LEICA\\0\\0\\0 dispatches to Leica"
+  );
+  let meta2 = MakerNotesMeta::from_blob(det2, &leica2, ByteOrder::Little);
+  assert!(
+    meta2.panasonic().is_none(),
+    "a genuinely-Leica-table blob (LEICA\\0\\0\\0 / Leica2) must leave the \
+     Panasonic slot ABSENT (Panasonic::Leica2 unported/deferred)"
+  );
+}
+
+// ===========================================================================
+// MakerNoteLeica (Leica1) — cross-vendor `%Panasonic::Main` route (make-only)
+// ===========================================================================
+//
+// `MakerNoteLeica` (Leica1, `MakerNotes.pm:599-608`) is the older-Leica
+// make-only variant routed to the PANASONIC Main table (`TagTable =>
+// 'Image::ExifTool::Panasonic::Main'`, `:604`). Its `Condition` is the
+// MAKE-only `$$self{Make} eq "LEICA"` (`:602`) — there is NO `$$valPt`
+// signature term — with `Start => '$valuePtr + 8'` (`:606`, the 8-byte
+// `LEICA\0\0\0` header) and NO `Base` line (inherit). It is the FIRST Leica
+// entry in `%Main`, so a `Make eq "LEICA"` body is claimed by it regardless
+// of signature; the later Leica2-9/Leica10 arms (which need a different
+// Make, or sit after Leica1) are never reached. Bundled `exiftool -G1 -j`
+// emits the resulting tags under the `Panasonic:*` family-1 group (they ARE
+// `%Panasonic::Main` tags).
+//
+// Before this fix the production walk only ran `panasonic::parse_main_gated`
+// (for `Vendor::Panasonic`) and `parse_leica10_gated` (for the Leica10
+// signature), so a make-only `LEICA` body — older Leica Digilux / early
+// D-Lux / V-Lux — DROPPED its Panasonic Main tags. The fix routes it through
+// `panasonic::parse_leica1_gated` (make `== "LEICA"` gate, body offset 8,
+// Panasonic group), while leaving the eight Leica-specific-table variants
+// (`Panasonic::Leica2..Leica9`, unported) gated/emitting-nothing.
+//
+// The bytes below were VERIFIED against bundled ExifTool 13.59
+// (`exiftool -G1 -j`): it reports
+//   "IFD0:Make": "LEICA", "IFD0:Model": "DIGILUX 2",
+//   "Panasonic:ImageQuality": "High"
+// Little-endian standalone TIFF: IFD0 (Make="LEICA", Model="DIGILUX 2",
+// ExifIFD ptr) → ExifIFD (0x927c MakerNote) → "LEICA\0\0\0" (8, body @8) +
+// a 1-entry IFD whose 0x01 ImageQuality (int16u, count 1, value 2 = "High",
+// INLINE) → the Make/Model strings.
+
+/// Byte-built Leica1 standalone TIFF (the verified oracle fixture).
+/// `Panasonic:ImageQuality` == "High" in bundled ExifTool 13.59.
+const LEICA1_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 6, 0, 0, 0, 94, 0, 0, 0, 16, 1, 2, 0, 10, 0, 0, 0,
+  100, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 146, 7, 0, 26, 0,
+  0, 0, 68, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 0, 0, 1, 0, 1, 0, 3, 0, 1, 0, 0, 0, 2, 0,
+  0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 68, 73, 71, 73, 76, 85, 88, 32, 50, 0,
+];
+
+/// Byte-built NEGATIVE fixture: a `Make="Leica Camera AG"` body whose
+/// MakerNote carries a Leica5 signature (`LEICA\0\x01\0`, `MakerNotes.pm:
+/// 650-663`). This routes to the Leica-specific `Panasonic::Leica5` table
+/// (UNPORTED here), NOT `%Panasonic::Main` — bundled ExifTool 13.59 emits NO
+/// `Panasonic:ImageQuality` for it (verified). The make is NOT exactly
+/// "LEICA", so the Leica1 make-gate must reject it and the Panasonic slot
+/// must stay ABSENT (no spurious Main leak).
+const LEICA5_NEG_TIFF: &[u8] = &[
+  73, 73, 42, 0, 8, 0, 0, 0, 3, 0, 15, 1, 2, 0, 16, 0, 0, 0, 94, 0, 0, 0, 16, 1, 2, 0, 4, 0, 0, 0,
+  110, 0, 0, 0, 105, 135, 4, 0, 1, 0, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 1, 0, 124, 146, 7, 0, 26, 0,
+  0, 0, 68, 0, 0, 0, 0, 0, 0, 0, 76, 69, 73, 67, 65, 0, 1, 0, 1, 0, 1, 0, 3, 0, 1, 0, 0, 0, 2, 0,
+  0, 0, 0, 0, 0, 0, 76, 101, 105, 99, 97, 32, 67, 97, 109, 101, 114, 97, 32, 65, 71, 0, 77, 57, 0,
+  0,
+];
+
+/// The dispatcher classifies the make-only `LEICA` body as `Vendor::Leica`
+/// with body_offset 8 (`MakerNoteLeica`/Leica1, `MakerNotes.pm:599-608`); the
+/// production walk routes it through the cross-table Panasonic Main parser via
+/// `parse_leica1_gated` and the typed Panasonic slot + cached emissions carry
+/// `ImageQuality = High`, under the `Panasonic` emission group (NOT
+/// `MakerNotes`/`Leica`).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn leica1_dispatches_to_panasonic_main_image_quality() {
+  use exifast::exif::makernotes::BaseRule;
+  use exifast::value::TagValue;
+
+  let meta = exifast::parse_exif(LEICA1_TIFF)
+    .expect("parse ok")
+    .expect("TIFF recognized");
+  let mn = meta.maker_note().expect("MakerNote captured");
+
+  // Dispatched as Leica1: Vendor::Leica, body_offset 8, inherit base.
+  assert!(mn.vendor().is_leica(), "vendor = Leica (make-only LEICA)");
+  assert_eq!(
+    mn.detected().body_offset(),
+    8,
+    "Leica1 Start => '$valuePtr + 8' (MakerNotes.pm:606)"
+  );
+  assert_eq!(
+    mn.detected().base_rule(),
+    BaseRule::Inherit,
+    "Leica1 has no Base line (MakerNotes.pm:603-607) ⇒ inherit"
+  );
+
+  // The cross-table Panasonic Main parser ran ⇒ the Panasonic typed slot is
+  // populated (Leica1's tags ARE %Panasonic::Main tags).
+  assert!(
+    mn.meta().panasonic().is_some(),
+    "Leica1 must populate the Panasonic typed slot via the Main table"
+  );
+
+  // The cached emission carries ImageQuality = "High" under the Panasonic
+  // group (the emission group1 is overridden to Panasonic even though the
+  // vendor is Leica). ImageQuality (tag 0x01, value 2) ⇒ "High"
+  // (Panasonic.pm:276).
+  assert_eq!(
+    mn.emission_group1(),
+    "Panasonic",
+    "Leica1 tags emit as Panasonic:* (they are %Panasonic::Main tags)"
+  );
+  let iq = mn
+    .emissions_print_conv()
+    .iter()
+    .find(|e| e.name() == "ImageQuality")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    iq,
+    Some(TagValue::Str("High".into())),
+    "Leica1 ImageQuality (tag 0x01, value 2) ⇒ \"High\""
+  );
+}
+
+/// END-TO-END SERIALIZED `-G1` fidelity: the full serializer
+/// (`extract_info`, the conformance-gate path) must emit
+/// `"Panasonic:ImageQuality": "High"` for the byte-built Leica1 TIFF —
+/// matching bundled ExifTool's `Panasonic:*` output — and must NOT leak the
+/// tag under a `Leica:` or family-0 `MakerNotes:` group.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica1_serialized_keys_use_panasonic_group1() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("leica1.tif", LEICA1_TIFF, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{json}"));
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("doc is not [{{…}}]:\n{json}"));
+    assert_eq!(
+      obj.get("IFD0:Make").and_then(|v| v.as_str()),
+      Some("LEICA"),
+      "IFD0:Make ({mode})"
+    );
+    // `-j` renders the PrintConv label "High"; `-n` keeps the raw int 2.
+    if print_on {
+      assert_eq!(
+        obj.get("Panasonic:ImageQuality").and_then(|v| v.as_str()),
+        Some("High"),
+        "Leica1 ImageQuality must serialize as Panasonic:ImageQuality=\"High\" ({mode}); \
+         keys: {:?}",
+        obj.keys().collect::<Vec<_>>()
+      );
+    } else {
+      assert_eq!(
+        obj
+          .get("Panasonic:ImageQuality")
+          .and_then(serde_json::Value::as_i64),
+        Some(2),
+        "Leica1 ImageQuality -n raw int ({mode})"
+      );
+    }
+    // The family-1 group is Panasonic, never Leica or the family-0 MakerNotes.
+    assert!(
+      !obj.contains_key("Leica:ImageQuality"),
+      "Leica1 tag must NOT emit under a Leica: group ({mode})"
+    );
+    assert!(
+      !obj.contains_key("MakerNotes:ImageQuality"),
+      "Leica1 tag must NOT emit under family-0 MakerNotes ({mode})"
+    );
+  }
+}
+
+/// END-TO-END NEGATIVE: a `Make="Leica Camera AG"` body carrying a Leica5
+/// signature (`LEICA\0\x01\0`) routes to the unported `Panasonic::Leica5`
+/// table — NOT `%Panasonic::Main`. The full serializer must therefore emit
+/// NO `Panasonic:ImageQuality` (bundled ExifTool 13.59 emits none either),
+/// proving the Leica1 make-gate does not over-capture a Leica2-9 body and
+/// the deferred Leica-specific tables leak nothing.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica5_signature_make_not_leica_emits_no_panasonic() {
+  let meta = exifast::parse_exif(LEICA5_NEG_TIFF)
+    .expect("parse ok")
+    .expect("TIFF recognized");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  // Dispatched as Leica (a Leica5-signature blob), body_offset 8.
+  assert!(mn.vendor().is_leica(), "vendor = Leica (Leica5 signature)");
+  // Neither gate admits it: make != "LEICA" (Leica1 rejects) and the blob is
+  // not `LEICA CAMERA AG\0` (Leica10 rejects) ⇒ Panasonic slot ABSENT.
+  assert!(
+    mn.meta().panasonic().is_none(),
+    "a Leica5-signature body (Make != \"LEICA\") must leave the Panasonic slot \
+     ABSENT (Panasonic::Leica5 unported/deferred)"
+  );
+
+  for print_on in [true, false] {
+    let json = exifast::parser::extract_info("leica5neg.tif", LEICA5_NEG_TIFF, print_on);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    let obj = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .expect("doc is [{…}]");
+    assert!(
+      !obj.contains_key("Panasonic:ImageQuality"),
+      "Leica5-signature body must NOT emit Panasonic:ImageQuality (it routes to \
+       the unported Leica5 table); keys: {:?}",
+      obj.keys().collect::<Vec<_>>()
+    );
+  }
+}
+
+/// Cross-check the Leica1 + Leica5-negative synthetic TIFFs against the
+/// bundled ExifTool binary (when `$EXIFTOOL` is set / on PATH): bundled
+/// `exiftool -G1 -j` must emit `Panasonic:ImageQuality` == "High" for the
+/// Leica1 fixture and NONE for the Leica5-negative fixture, proving the Rust
+/// read is byte-faithful to the cross-vendor route. Skipped (not failed) when
+/// the binary is absent.
+#[cfg(all(feature = "exif", feature = "std", feature = "json"))]
+#[test]
+fn leica1_matches_bundled_exiftool() {
+  use std::process::Command;
+  let tool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".to_string());
+  if Command::new(&tool).arg("-ver").output().is_err() {
+    eprintln!("SKIP: exiftool binary not available; Leica1 cross-check skipped");
+    return;
+  }
+  let dir = std::env::temp_dir();
+
+  // POSITIVE — Leica1 emits Panasonic:ImageQuality == "High".
+  let path = dir.join("exifast_leica1.tif");
+  std::fs::write(&path, LEICA1_TIFF).expect("write temp Leica1 tif");
+  let out = Command::new(&tool)
+    .args(["-G1", "-j", "-ImageQuality", "-Make", "-Model"])
+    .arg(&path)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&path);
+  assert!(out.status.success(), "exiftool failed");
+  let json = String::from_utf8(out.stdout).expect("utf8");
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  assert_eq!(
+    obj.get("IFD0:Make").and_then(|v| v.as_str()),
+    Some("LEICA"),
+    "bundled exiftool must see Make LEICA"
+  );
+  assert_eq!(
+    obj.get("Panasonic:ImageQuality").and_then(|v| v.as_str()),
+    Some("High"),
+    "bundled exiftool must emit Panasonic:ImageQuality=\"High\" for the Leica1 route"
+  );
+
+  // NEGATIVE — a Leica5-signature body (Make != "LEICA") emits no
+  // Panasonic:ImageQuality (it routes to the Leica-specific Leica5 table).
+  let npath = dir.join("exifast_leica5neg.tif");
+  std::fs::write(&npath, LEICA5_NEG_TIFF).expect("write temp Leica5-neg tif");
+  let nout = Command::new(&tool)
+    .args(["-G1", "-j"])
+    .arg(&npath)
+    .output()
+    .expect("run exiftool");
+  let _ = std::fs::remove_file(&npath);
+  assert!(nout.status.success(), "exiftool failed");
+  let njson = String::from_utf8(nout.stdout).expect("utf8");
+  let ndoc: serde_json::Value = serde_json::from_str(&njson).expect("valid json");
+  let nobj = ndoc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .expect("doc is [{…}]");
+  assert!(
+    !nobj.contains_key("Panasonic:ImageQuality"),
+    "bundled exiftool must NOT emit Panasonic:ImageQuality for a Leica5-signature \
+     body (it routes to the Leica5 table, not %Panasonic::Main)"
+  );
+}
+
+/// `from_blob` make-less caveat (same shape as the Sony5-headerless caveat):
+/// the public `from_blob` constructor does NOT carry the parent IFD0 `Make`,
+/// so the make-only Leica1 gate (`$$self{Make} eq "LEICA"`) cannot fire there
+/// — it passes `make = None` and leaves the Panasonic slot ABSENT. That is
+/// faithful (a `Vendor::Leica` + body-offset-8 detection is ambiguous between
+/// Leica1 and the unported Leica2-9 tables WITHOUT the make). The production
+/// `parse_exif` walk — which HAS the Make — decodes Leica1 fully (asserted in
+/// `leica1_dispatches_to_panasonic_main_image_quality`). The signature-gated
+/// Leica10 route still decodes through `from_blob` (covered separately).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_leica1_make_only_slot_absent_without_make() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Self-contained Leica1 blob: "LEICA\0\0\0" (8, body @8) + 1-entry IFD
+  // (0x1a ImageStabilization int16u count1 value4 inline) + next=0.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"LEICA\x00\x00\x00");
+  blob.extend_from_slice(&1u16.to_le_bytes());
+  blob.extend_from_slice(&0x1au16.to_le_bytes()); // tag 0x1a ImageStabilization
+  blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&4u32.to_le_bytes()); // value 4
+  blob.extend_from_slice(&0u32.to_le_bytes());
+
+  // The dispatcher routes a make-only "LEICA" body to Leica1 (offset 8).
+  let detected = dispatch(&blob, Some("LEICA"), Some("DIGILUX 2"), None);
+  assert!(
+    detected.vendor().is_leica(),
+    "make-only LEICA dispatches to Leica"
+  );
+  assert_eq!(detected.body_offset(), 8, "Leica1 body offset 8");
+
+  // from_blob has no Make ⇒ the make-only Leica1 gate yields None ⇒ slot
+  // ABSENT (the faithful make-less choice).
+  let meta = MakerNotesMeta::from_blob(detected, &blob, ByteOrder::Little);
+  assert!(
+    meta.panasonic().is_none(),
+    "from_blob (make-less) must leave the Panasonic slot ABSENT for a Leica1 \
+     body — the make-only gate cannot fire without Make (the production \
+     parse_exif walk, which has Make, decodes it; see \
+     leica1_dispatches_to_panasonic_main_image_quality)"
+  );
+}
+
+/// `from_blob_with_context` resolves the make-only `MakerNoteLeica` (Leica1,
+/// `MakerNotes.pm:599-608`) route. Leica1's `Condition` is `$$self{Make} eq
+/// "LEICA"` (`:602`) — no blob signature — so the make-LESS `from_blob`
+/// leaves the slot ABSENT (asserted above), whereas threading `make =
+/// "LEICA"` through the context API gates `parse_leica1_gated` true and
+/// decodes `%Panasonic::Main` (Leica1 routes there, `:604`) at body_offset 8
+/// (`:606`). Same shape as the headerless-Sony5 context test.
+///
+/// Bundled cross-check: this is the byte-built equivalent of the
+/// `parse_exif` LEICA1_TIFF case (`leica1_dispatches_to_panasonic_main_image_quality`),
+/// which HAS the IFD0 Make and decodes Leica1 fully; here the context API
+/// supplies the Make to the same gate. 0x1a ImageStabilization = 4 populates
+/// the typed `image_stabilization` field (`Panasonic.pm` IS-mode integer).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn from_blob_with_context_resolves_make_only_leica1() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch};
+
+  // Same self-contained Leica1 blob as the make-less test.
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(b"LEICA\x00\x00\x00"); // 8-byte header (body @8)
+  blob.extend_from_slice(&1u16.to_le_bytes());
+  blob.extend_from_slice(&0x1au16.to_le_bytes()); // 0x1a ImageStabilization
+  blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+  blob.extend_from_slice(&1u32.to_le_bytes()); // count 1
+  blob.extend_from_slice(&4u32.to_le_bytes()); // value 4
+  blob.extend_from_slice(&0u32.to_le_bytes());
+
+  let detected = dispatch(&blob, Some("LEICA"), Some("DIGILUX 2"), None);
+  assert!(detected.vendor().is_leica());
+  assert_eq!(detected.body_offset(), 8, "Leica1 body offset 8");
+
+  // WITH context (make = "LEICA"): the make-only Leica1 gate fires ⇒ the
+  // Panasonic Main parser runs and populates the Panasonic typed slot
+  // (Leica1's tags ARE %Panasonic::Main tags).
+  let meta = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("LEICA"),
+    Some("DIGILUX 2"),
+  );
+  let pana = meta.panasonic().expect(
+    "from_blob_with_context must populate the Panasonic slot for a make-only \
+     Leica1 body when Make=LEICA threads the gate",
+  );
+  assert_eq!(
+    pana.image_stabilization(),
+    Some(4),
+    "Leica1 (via %Panasonic::Main) decodes ImageStabilization=4 through the \
+     context gate"
+  );
+
+  // Negative control on the SAME body: a non-LEICA make does NOT satisfy the
+  // make-only Leica1 gate (and is not the signature-gated Leica10), so the
+  // slot stays ABSENT — proving the gate, not a blanket parse, is load-bearing.
+  let meta_other = MakerNotesMeta::from_blob_with_context(
+    detected,
+    &blob,
+    ByteOrder::Little,
+    Some("Panasonic"),
+    None,
+  );
+  assert!(
+    meta_other.panasonic().is_none(),
+    "a non-LEICA make must NOT resolve the make-only Leica1 route"
+  );
 }

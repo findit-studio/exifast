@@ -120,21 +120,127 @@ impl MakerNotesMeta {
     self.canon = Some(canon);
   }
 
+  /// Replace the Sony slot — used by the IFD walker during walk (Phase 3).
+  #[inline(always)]
+  pub fn set_sony(&mut self, sony: SonyMakerNote) {
+    self.sony = Some(sony);
+  }
+
+  /// Replace the Panasonic slot — used by the IFD walker during walk
+  /// (Phase 3).
+  #[inline(always)]
+  pub fn set_panasonic(&mut self, panasonic: PanasonicMakerNote) {
+    self.panasonic = Some(panasonic);
+  }
+
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
-  /// dispatcher resolved a Phase-2-supported vendor.
+  /// dispatcher resolved a supported vendor.
   ///
-  /// Phase 2 populates [`Self::apple`] and [`Self::canon`] from the
-  /// captured blob; Phase 3/4 (Sony, Panasonic, GoPro, DJI) still leaves
-  /// the slot empty.
+  /// Phase 2 populates [`Self::apple`] / [`Self::canon`]; Phase 3 adds
+  /// [`Self::sony`] / [`Self::panasonic`]; GoPro/DJI remain empty until
+  /// Phase 4.
   ///
   /// `blob` is the raw 0x927C MakerNote value; `parent_order` is the
   /// parent IFD walk's byte order (used as the body-marker fallback per
-  /// [`resolve_child_byte_order`]).
+  /// [`resolve_child_byte_order`]). The standalone `blob` IS the parser's
+  /// TIFF context (`mn_offset == 0`, `mn_len == blob.len()`), so a vendor's
+  /// out-of-line value offsets resolve against the blob itself — correct
+  /// when the blob is self-contained (the common case for a captured
+  /// MakerNote value).
+  ///
+  /// ## Sony / Panasonic gating — the variant gate cannot be bypassed
+  ///
+  /// The dispatcher collapses every Sony/Panasonic `MakerNotes.pm` variant
+  /// to [`Vendor::Sony`] / [`Vendor::Panasonic`], but only a SUBSET routes
+  /// to `%Sony::Main` / `%Panasonic::Main`. This constructor runs the Main
+  /// parser through the SAME gated entry the production `ProcessExif` IFD
+  /// walk uses — [`vendors::sony::parse_main_gated`] and
+  /// [`vendors::panasonic::parse_main_gated`] — so:
+  ///
+  /// - A non-Main Sony variant (a `SEMC MS\0` SonyEricsson blob, a
+  ///   `SONY PIC\0` Sony4 blob, …) returns `None` from the gate and the
+  ///   [`sony`](Self::sony) slot stays ABSENT — no spurious Main tag from a
+  ///   coincidental tag-id collision.
+  /// - A Panasonic Type2 (`MKE`) blob returns `None` and the
+  ///   [`panasonic`](Self::panasonic) slot stays ABSENT (Type2 is a
+  ///   `ProcessBinaryData` table, unported).
+  /// - A Panasonic `MakerNotePanasonic3` (DC-FT7, `Base => 12`) blob threads
+  ///   the dispatched [`BaseRule`](crate::exif::makernotes::BaseRule) through
+  ///   the gate, so an out-of-line value (e.g. `LensType`) is read at the
+  ///   `+12` base instead of 12 bytes early.
+  /// - A cross-vendor `MakerNoteLeica10` (`LEICA CAMERA AG\0` signature)
+  ///   blob routes to `%Panasonic::Main` via
+  ///   [`vendors::panasonic::parse_leica10_gated`] and populates the
+  ///   [`panasonic`](Self::panasonic) slot. The make-only `MakerNoteLeica`
+  ///   (Leica1, `$$self{Make} eq "LEICA"`) route shares the same Sony5
+  ///   make-less caveat below — it cannot fire here.
+  ///
+  /// ## Sony5 / Leica1 make-less caveat (`make`/`model` unavailable here)
+  ///
+  /// The Sony gate's `routes_to_main` make-condition (`MakerNoteSony5`'s
+  /// `Make =~ /^SONY/` headerless arm, `MakerNotes.pm:1072-1075`) and the
+  /// make-only `MakerNoteLeica` (Leica1, `$$self{Make} eq "LEICA"`,
+  /// `:602`) need the IFD0 `$$self{Make}`/`$$self{Model}`. THIS constructor
+  /// carries NO Make/Model (it receives only the already-computed `detected`
+  /// + the raw blob), so it passes `make = model = None`. The PREFIXED Main
+  /// variants (`SONY DSC`/`SONY CAM`/`SONY MOBILE`/`VHAB`/TF1, and the
+  /// signature-gated `MakerNoteLeica10` `LEICA CAMERA AG\0`) carry their own
+  /// signature and resolve here regardless of Make; a HEADERLESS Sony5 blob
+  /// (identified ONLY by `Make =~ /^SONY/`) and a make-only Leica1 blob gate
+  /// `false` without the Make, leaving the slot absent. That is the FAITHFUL
+  /// choice for this make-less entry — leaving the slot absent is correct (no
+  /// wrong values), whereas an ungated Main parse would re-introduce the
+  /// spurious-tag bug for the non-Main variants.
+  ///
+  /// To resolve the make-only variants, use
+  /// [`from_blob_with_context`](Self::from_blob_with_context) — it threads the
+  /// IFD0 `Make`/`Model` into the SAME gates the production `ProcessExif` walk
+  /// uses, so a headerless Sony5 / make-only Leica1 blob populates its slot.
+  /// `from_blob` is the no-context convenience for callers that have only the
+  /// captured blob.
   #[must_use]
+  #[inline]
   pub fn from_blob(
     detected: DetectedMakerNote,
     blob: &[u8],
     parent_order: crate::exif::ifd::ByteOrder,
+  ) -> Self {
+    Self::from_blob_with_context(detected, blob, parent_order, None, None)
+  }
+
+  /// Build a `MakerNotesMeta` from a captured blob WITH the IFD0
+  /// `$$self{Make}`/`$$self{Model}` context, populating the per-vendor slot
+  /// when the dispatcher resolved a supported vendor.
+  ///
+  /// This is the context-bearing form of [`from_blob`](Self::from_blob): the
+  /// `make`/`model` are threaded into the SAME gated entries the production
+  /// `ProcessExif` IFD walk uses, so the MAKE-ONLY variants resolve here too:
+  ///
+  /// - **Headerless `MakerNoteSony5`** (`MakerNotes.pm:1070-1082`) — the
+  ///   `routes_to_main` make-gate `Make =~ /^SONY/` (or the HASSELBLAD-rebrand
+  ///   arm) needs `make`; with it, a headerless Sony5 body decodes through
+  ///   `%Sony::Main` and populates the [`sony`](Self::sony) slot.
+  /// - **Make-only `MakerNoteLeica` (Leica1)** (`:599-608`) — the
+  ///   `Condition` `$$self{Make} eq "LEICA"` needs `make`; with it, a
+  ///   `LEICA`-make body decodes through `%Panasonic::Main` (Leica1 routes
+  ///   there, `:604`) and populates the [`panasonic`](Self::panasonic) slot.
+  /// - `model` additionally selects the model-conditional Sony AF rows
+  ///   (0x201c/0x201e/0x2020/0x2022, `Sony.pm`) and Panasonic 0x0f/0x2c
+  ///   branches — exactly as the production walk threads `$$self{Model}`.
+  ///
+  /// The gating contract is otherwise identical to [`from_blob`]: a non-Main
+  /// Sony variant / Panasonic Type2 (`MKE`) / genuinely-Leica-table blob
+  /// returns `None` from its gate and leaves the slot ABSENT (no spurious
+  /// tags), and the `MakerNotePanasonic3` (`Base => 12`) base-rule is threaded
+  /// through. Pass `make`/`model` as the IFD0 values (`None` if unknown — then
+  /// this behaves exactly like [`from_blob`]).
+  #[must_use]
+  pub fn from_blob_with_context(
+    detected: DetectedMakerNote,
+    blob: &[u8],
+    parent_order: crate::exif::ifd::ByteOrder,
+    make: Option<&str>,
+    model: Option<&str>,
   ) -> Self {
     let mut meta = Self::from_detected(detected);
     match detected.vendor() {
@@ -145,6 +251,94 @@ impl MakerNotesMeta {
       Vendor::Canon => {
         let (typed, _emissions) = vendors::canon::parse(blob, parent_order);
         meta.canon = Some(typed);
+      }
+      Vendor::Sony => {
+        // Route through the SINGLE gated entry (same as `ProcessExif`): the
+        // `routes_to_main` variant gate lives inside it. `make`/`model` are
+        // threaded so the headerless Sony5 make-gate + the model-conditional
+        // AF rows resolve; without them (the `from_blob` path) only the
+        // prefixed Main variants parse.
+        let body_off = detected.body_offset() as usize;
+        if let Some((typed, _emissions)) = vendors::sony::parse_main_gated(
+          blob,
+          0,
+          blob.len(),
+          body_off,
+          parent_order,
+          true,
+          make,
+          model,
+        ) {
+          meta.sony = Some(typed);
+        }
+      }
+      Vendor::Panasonic => {
+        // Route through the SINGLE gated entry (same as `ProcessExif`): the
+        // `Panasonic`-prefix gate + the `Base => 12` base-rule threading
+        // live inside it. A Type2/`MKE` blob leaves the slot absent; a
+        // DC-FT7 out-of-line value is read at the correct `+12` base.
+        // `model` selects the 0x0f/0x2c model-conditional branches.
+        if let Some((typed, _emissions)) = vendors::panasonic::parse_main_gated(
+          blob,
+          0,
+          blob.len(),
+          parent_order,
+          true,
+          model,
+          detected.base_rule(),
+        ) {
+          meta.panasonic = Some(typed);
+        }
+      }
+      Vendor::Leica => {
+        // Cross-vendor routes: TWO Leica variants decode with the PANASONIC
+        // Main table —
+        //   - `MakerNoteLeica` (Leica1, `MakerNotes.pm:599-608`) — make-only
+        //     `$$self{Make} eq "LEICA"` (`:602`), `Start => '$valuePtr + 8'`
+        //     (`:606`).
+        //   - `MakerNoteLeica10` (`:724-730`) — `LEICA CAMERA AG\0` signature
+        //     (`:725`), `Start => '$valuePtr + 18'` (`:728`).
+        // Route through the SAME SINGLE gated entries as `ProcessExif`
+        // (`parse_leica1_gated` / `parse_leica10_gated`), so a
+        // genuinely-Leica-table blob (`LEICA\0\0\0`, …) returns `None` from
+        // both and the Panasonic slot stays ABSENT (those tables are
+        // unported/deferred). The body offset is the dispatched
+        // `body_offset()` (8 for Leica1, 18 for Leica10). The resulting tags
+        // are `%Panasonic::Main` tags ⇒ they populate the Panasonic slot
+        // (bundled emits them as `Panasonic:*`).
+        //
+        // Leica1 is tried FIRST, mirroring `%Main` order (Leica1 `:599`
+        // precedes Leica10 `:724`): its `Condition` reads `$$self{Make}`,
+        // threaded here as `make` — with `make == "LEICA"` a make-only Leica1
+        // body resolves; without the make (the `from_blob` path) the Leica1
+        // gate yields `None` and only the signature-gated Leica10 route
+        // decodes. The two are mutually exclusive for real bodies (Leica1
+        // make is exactly "LEICA"; Leica10 bodies report "LEICA CAMERA AG").
+        let body_off = detected.body_offset() as usize;
+        let parsed = vendors::panasonic::parse_leica1_gated(
+          blob,
+          0,
+          blob.len(),
+          body_off,
+          parent_order,
+          true,
+          make,
+          model,
+        )
+        .or_else(|| {
+          vendors::panasonic::parse_leica10_gated(
+            blob,
+            0,
+            blob.len(),
+            body_off,
+            parent_order,
+            true,
+            model,
+          )
+        });
+        if let Some((typed, _emissions)) = parsed {
+          meta.panasonic = Some(typed);
+        }
       }
       _ => {}
     }
