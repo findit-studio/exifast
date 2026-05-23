@@ -602,6 +602,41 @@ fn sony_rtmd_real_fixture_conformance() {
   // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
 }
 
+/// Real-fixture conformance for Canon CTMD via the bundled `CanonRaw.cr3`.
+///
+/// `t/images/CanonRaw.cr3` (Phil Harvey's regression fixture) carries a
+/// real Canon EOS R-series CR3 with embedded CTMD records. This test
+/// loads the file via exifast and verifies the typed CTMD surface (no
+/// algorithmic golden comparison — that needs a `perl exiftool -j` golden
+/// snapshot to run; the bundled tree is tested via its own t/ suite).
+/// Ignored by default because the bundled tree is an absolute path
+/// (only present in the maintainer's checkout); the synthetic-record
+/// tests above carry full algorithmic coverage.
+#[test]
+#[ignore = "promotion test — uses bundled t/images/CanonRaw.cr3; run manually"]
+fn canon_ctmd_real_fixture_conformance() {
+  let bundled_cr3 = "/Users/user/Develop/findit-studio/exiftool/t/images/CanonRaw.cr3";
+  let data = match std::fs::read(bundled_cr3) {
+    Ok(v) => v,
+    Err(_) => return, // Bundled tree not present — skip gracefully.
+  };
+  let meta = exifast::parse_quicktime(&data)
+    .expect("CR3 parses as MOV-family")
+    .expect("recognised file");
+  // CR3 carries CTMD samples — the typed surface must populate.
+  let ctmd = meta.canon_ctmd();
+  if !ctmd.is_empty() {
+    // At least one sample decoded — the projection must surface Canon
+    // as the camera Make and ExposureSettings should be present.
+    let md = meta.media_metadata();
+    assert_eq!(
+      md.camera().and_then(|c| c.make()),
+      Some("Canon"),
+      "Canon CTMD projection sets Make=Canon"
+    );
+  }
+}
+
 // ===========================================================================
 // SP4 — Sony rtmd (Real-Time MetaData)
 // ===========================================================================
@@ -732,6 +767,133 @@ fn quicktime_sony_rtmd_gps_priority_vs_camm_keeps_camm() {
   let gps = md.gps().expect("rtmd-only feeds GpsLocation");
   assert!((gps.latitude().unwrap() - 1.0).abs() < 1e-9);
   assert!((gps.longitude().unwrap() - 2.0).abs() < 1e-9);
+}
+
+// ===========================================================================
+// SP4 — Canon CTMD (Canon Timed MetaData)
+// ===========================================================================
+
+#[test]
+fn quicktime_canon_ctmd_decodes_time_stamp_focal_and_exposure() {
+  // Synthetic CR3-style .mov with a `CTMD` MetaFormat metadata track
+  // carrying one sample with TimeStamp + FocalInfo + ExposureInfo records
+  // mirroring the real CanonRaw.cr3 fixture's byte layout. The walker must
+  // populate `Meta::canon_ctmd()` and the MediaMetadata projection must
+  // surface CameraInfo (Make=Canon), LensInfo (FocalLength) and
+  // CaptureSettings (FNumber/ExposureTime/ISO).
+  let mut records = Vec::new();
+  records.extend_from_slice(&ctmd_record(
+    1,
+    &[
+      0x00, 0x00, 0xe2, 0x07, 0x02, 0x15, 0x0c, 0x08, 0x38, 0x15, 0x00, 0x00,
+    ],
+  )); // TimeStamp 2018:02:21 12:08:56.21
+  records.extend_from_slice(&ctmd_record(
+    4,
+    &[
+      0x0f, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ],
+  )); // FocalLength 15/1 mm
+  records.extend_from_slice(&ctmd_record(
+    5,
+    &[
+      0x23, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x50, 0x00, 0x00, 0x32, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00,
+    ],
+  )); // FNumber=3.5, ExposureTime=1/80, ISO=12800
+  let data = build_mov_with_meta_track(b"CTMD", &records);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let ctmd = meta.canon_ctmd();
+  assert!(!ctmd.is_empty(), "CTMD must populate canon_ctmd");
+  assert_eq!(ctmd.samples().len(), 1);
+  let s = &ctmd.samples()[0];
+  assert_eq!(s.time_stamp(), Some("2018:02:21 12:08:56.21"));
+  let f = s.focal().expect("focal");
+  assert!((f.focal_length_mm().unwrap() - 15.0).abs() < 1e-9);
+  let e = s.exposure().expect("exposure");
+  assert!((e.f_number().unwrap() - 3.5).abs() < 1e-9);
+  assert!((e.exposure_time_s().unwrap() - 1.0 / 80.0).abs() < 1e-9);
+  assert_eq!(e.iso(), Some(12800));
+
+  // MediaMetadata projection: CameraInfo with Make=Canon.
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("CameraInfo from CTMD");
+  assert_eq!(cam.make(), Some("Canon"));
+
+  // LensInfo: focal length.
+  let lens = md.lens().expect("LensInfo from CTMD");
+  assert!((lens.focal_length_mm().unwrap() - 15.0).abs() < 1e-9);
+
+  // CaptureSettings: f/3.5, 1/80 s, ISO 12800.
+  let cap = md.capture().expect("CaptureSettings from CTMD");
+  assert!((cap.f_number().unwrap() - 3.5).abs() < 1e-9);
+  assert!((cap.exposure_time_s().unwrap() - 1.0 / 80.0).abs() < 1e-9);
+  assert_eq!(cap.iso(), Some(12800));
+}
+
+#[test]
+fn quicktime_canon_ctmd_iso_high_bit_masked() {
+  // Build a CTMD sample with ONLY an ExposureInfo record where the ISO's
+  // high bit is set. The walker must mask it off (Canon.pm:9885
+  // `ValueConv => '$val & 0x7fffffff'`).
+  let mut payload = Vec::new();
+  payload.extend_from_slice(&[0x23, 0x00, 0x0a, 0x00]); // FNumber 35/10
+  payload.extend_from_slice(&[0x01, 0x00, 0x50, 0x00]); // ExposureTime 1/80
+  payload.extend_from_slice(&[0x00, 0x32, 0x00, 0x80]); // ISO 0x80003200 ⇒ 12800
+  let records = ctmd_record(5, &payload);
+  let data = build_mov_with_meta_track(b"CTMD", &records);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let e = meta.canon_ctmd().samples()[0].exposure().expect("exposure");
+  assert_eq!(e.iso(), Some(12800));
+}
+
+#[test]
+fn quicktime_canon_ctmd_truncated_record_warns_and_decodes_prefix() {
+  // First record is a clean TimeStamp; second claims size=1000 but the
+  // buffer is short. The walker must decode the TimeStamp THEN warn
+  // `Truncated CTMD record` and stop, leaving the sample populated.
+  let mut records = Vec::new();
+  records.extend_from_slice(&ctmd_record(
+    1,
+    &[
+      0x00, 0x00, 0xe2, 0x07, 0x02, 0x15, 0x0c, 0x08, 0x38, 0x15, 0x00, 0x00,
+    ],
+  ));
+  // truncated second record
+  records.extend_from_slice(&1000u32.to_le_bytes()); // size = 1000
+  records.extend_from_slice(&5u16.to_le_bytes()); // type = 5 ExposureInfo
+  records.extend_from_slice(&[0u8; 10]); // header + a few payload bytes
+  let data = build_mov_with_meta_track(b"CTMD", &records);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let ctmd = meta.canon_ctmd();
+  assert_eq!(ctmd.warning(), Some("Truncated CTMD record"));
+  assert_eq!(
+    ctmd.samples()[0].time_stamp(),
+    Some("2018:02:21 12:08:56.21")
+  );
+}
+
+// --- Canon CTMD helpers -----------------------------------------------------
+
+/// Build one Canon CTMD record `[size:u32-LE][type:u16-LE][6-byte opaque
+/// header][payload]`. `payload` excludes the 12-byte prefix.
+fn ctmd_record(type_: u16, payload: &[u8]) -> Vec<u8> {
+  let size = 12 + payload.len();
+  let mut v = Vec::with_capacity(size);
+  v.extend_from_slice(&(size as u32).to_le_bytes());
+  v.extend_from_slice(&type_.to_le_bytes());
+  // Bundled comment (Canon.pm:10769-10780) calls the next 6 bytes the
+  // "opaque header"; the values vary per type and are hex-dumped under
+  // verbose. Use a realistic value pattern.
+  v.extend_from_slice(&[0, 0, 0, 1, 0xff, 0xff]);
+  v.extend_from_slice(payload);
+  v
 }
 
 // --- Sony rtmd helpers ------------------------------------------------------

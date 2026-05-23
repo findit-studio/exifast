@@ -919,6 +919,7 @@ struct StreamTrack {
 /// Only the self-contained sample formats are decoded here; an unrecognized
 /// or deferred `MetaFormat` simply yields no samples (faithful: ExifTool
 /// `VPrint`s "Unknown $type format" and moves on, QuickTimeStream.pl:1547).
+#[allow(clippy::too_many_arguments)]
 fn process_samples(
   data: &[u8],
   track: &StreamTrack,
@@ -927,6 +928,7 @@ fn process_samples(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -952,6 +954,7 @@ fn process_samples(
       gopro_out,
       camm_out,
       sony_rtmd_out,
+      canon_ctmd_out,
     );
   }
 }
@@ -968,6 +971,7 @@ fn decode_one_sample(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1019,11 +1023,19 @@ fn decode_one_sample(
     crate::formats::sony_rtmd::process_rtmd(buff, sony_rtmd_out);
     return;
   }
-  // Canon `CTMD` / `tx3g` / …:
-  // DEFERRED — these re-dispatch into other ExifTool modules (Canon.pm)
-  // or the 850-line ProcessFreeGPS. See module docs +
-  // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
-  // as ExifTool's "Unknown $type format" branch (QuickTimeStream.pl:1547).
+  // Canon `CTMD` MetaFormat (QuickTimeStream.pl:227-230 — the SubDirectory
+  // route into `Image::ExifTool::Canon::CTMD` whose PROCESS_PROC is
+  // `Canon::ProcessCTMD`). Each sample yields one [`CanonCtmdSample`]
+  // (which may carry a TimeStamp, FocalInfo, and/or ExposureInfo).
+  if &track.meta_format == b"CTMD" {
+    crate::formats::canon_ctmd::process_ctmd(buff, canon_ctmd_out);
+    return;
+  }
+  // `tx3g` / …:
+  // DEFERRED — `tx3g` re-dispatches into `Image::ExifTool::QuickTime::tx3g`;
+  // ExifInfo7/8/9 inside CTMD type 7/8/9 records would re-dispatch into the
+  // TIFF walker. An unrecognized MetaFormat yields no samples, exactly as
+  // ExifTool's "Unknown $type format" branch (QuickTimeStream.pl:1547).
   let _ = (buff, create_date_raw, &track.handler);
 }
 
@@ -1211,6 +1223,7 @@ pub(crate) fn extract_stream(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
@@ -1233,6 +1246,7 @@ pub(crate) fn extract_stream(
         gopro_out,
         camm_out,
         sony_rtmd_out,
+        canon_ctmd_out,
       ),
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       b"gps0" => process_gps0(&data[ps..body_end], &mut out),
@@ -1267,6 +1281,7 @@ fn walk_moov(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) {
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
@@ -1284,6 +1299,7 @@ fn walk_moov(
             gopro_out,
             camm_out,
             sony_rtmd_out,
+            canon_ctmd_out,
           );
         }
       }
@@ -1528,11 +1544,13 @@ mod tests {
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
     let mut sr = crate::metadata::SonyRtmdMeta::new();
-    let meta = extract_stream(&data, None, &mut gp, &mut cm, &mut sr);
+    let mut cc = crate::metadata::CanonCtmdMeta::new();
+    let meta = extract_stream(&data, None, &mut gp, &mut cm, &mut sr, &mut cc);
     assert!(meta.is_empty());
     assert!(gp.is_empty());
     assert!(cm.is_empty());
     assert!(sr.is_empty());
+    assert!(cc.is_empty());
   }
 
   #[test]

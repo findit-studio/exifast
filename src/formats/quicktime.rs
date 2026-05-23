@@ -54,7 +54,10 @@ use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
   formats::{gopro, quicktime_freegps, quicktime_stream},
-  metadata::{CammMeta, GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta},
+  metadata::{
+    CammMeta, CanonCtmdMeta, GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta,
+    SonyRtmdMeta,
+  },
   value::format_g,
 };
 
@@ -1384,6 +1387,14 @@ pub struct Meta<'a> {
   /// `Image::ExifTool::Sony::Process_rtmd` (Sony.pm:11566-11602) + the
   /// `Image::ExifTool::Sony::rtmd` tag table (Sony.pm:10686-10850).
   sony_rtmd: SonyRtmdMeta,
+  /// **SP4** — Canon EOS R-line / Cinema-line `CTMD` (Canon Timed
+  /// MetaData) — decoded through the `CTMD` MetaFormat dispatch in
+  /// [`quicktime_stream`]. Empty ([`CanonCtmdMeta::is_empty`]) for a
+  /// non-Canon video (or one whose `CTMD` track is absent). Faithful
+  /// port of `Image::ExifTool::Canon::ProcessCTMD` (Canon.pm:10758-10804)
+  /// plus the `Canon::CTMD` / `FocalInfo` / `ExposureInfo` tag tables
+  /// (Canon.pm:9790-9887).
+  canon_ctmd: CanonCtmdMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1474,6 +1485,20 @@ impl Meta<'_> {
     &self.sony_rtmd
   }
 
+  /// **SP4** — Canon EOS R-line / Cinema-line `CTMD` (Canon Timed
+  /// MetaData). [`CanonCtmdMeta::is_empty`] for a non-Canon video (or
+  /// one whose `CTMD` metadata track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::Canon::ProcessCTMD`
+  /// (Canon.pm:10758-10804) and the `Image::ExifTool::Canon::CTMD` /
+  /// `FocalInfo` / `ExposureInfo` tag tables (Canon.pm:9790-9887).
+  /// Populated by the `CTMD` MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn canon_ctmd(&self) -> &CanonCtmdMeta {
+    &self.canon_ctmd
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1503,6 +1528,7 @@ impl Meta<'_> {
     self.gopro.project_into(&mut md);
     self.android_camm.project_into(&mut md);
     self.sony_rtmd.project_into(&mut md);
+    self.canon_ctmd.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -1866,12 +1892,18 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // [`quicktime_stream`] populates `sony_rtmd_meta` for each timed-
   // metadata sample whose track carries Sony "Real-Time MetaData".
   let mut sony_rtmd_meta = SonyRtmdMeta::new();
+  // **SP4 — Canon CTMD**: the `CTMD` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `canon_ctmd_meta` for each timed-
+  // metadata sample whose track carries Canon Timed MetaData (CR3 / CRM
+  // / MP4 / MOV bodies).
+  let mut canon_ctmd_meta = CanonCtmdMeta::new();
   let mut stream = quicktime_stream::extract_stream(
     data,
     create_date_raw,
     &mut gopro_meta,
     &mut camm_meta,
     &mut sony_rtmd_meta,
+    &mut canon_ctmd_meta,
   );
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
@@ -1922,6 +1954,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     gopro: gopro_meta,
     android_camm: camm_meta,
     sony_rtmd: sony_rtmd_meta,
+    canon_ctmd: canon_ctmd_meta,
     embedded_exif_deferred,
     file_type,
     mime,

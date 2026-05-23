@@ -22,6 +22,7 @@
 //! deliberately extensible.
 
 mod android_camm;
+mod canon_ctmd;
 mod domain;
 mod gopro;
 mod quicktime;
@@ -29,6 +30,7 @@ mod quicktime_stream;
 mod sony_rtmd;
 
 pub use android_camm::{CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammVector3};
+pub use canon_ctmd::{CanonCtmdExposure, CanonCtmdFocal, CanonCtmdMeta, CanonCtmdSample};
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, MetaProjectInto,
 };
