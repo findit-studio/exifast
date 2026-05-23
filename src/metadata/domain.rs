@@ -19,7 +19,12 @@
 
 use core::time::Duration;
 
+use smol_str::SmolStr;
+
 use crate::metadata::{HandlerKind, QuickTimeMeta};
+
+extern crate alloc;
+use alloc::vec::Vec;
 
 // ===========================================================================
 // CameraInfo
@@ -659,6 +664,11 @@ pub struct MediaMetadata {
   gps: Option<GpsLocation>,
   /// Capture-settings domain, or `None` if undecoded.
   capture: Option<CaptureSettings>,
+  /// Per-port warnings surfaced during projection — each entry is prefixed
+  /// by the originating port (e.g. `"[Sony rtmd] Truncated Sony rtmd"`).
+  /// Mirrors bundled ExifTool's single `Warning` channel; the [`MetaProjectInto`]
+  /// trait is the seam each port writes through.
+  warnings: Vec<SmolStr>,
 }
 
 impl MediaMetadata {
@@ -673,6 +683,7 @@ impl MediaMetadata {
       lens: None,
       gps: None,
       capture: None,
+      warnings: Vec::new(),
     }
   }
 
@@ -719,6 +730,7 @@ impl MediaMetadata {
       lens: None,
       gps: None,
       capture: None,
+      warnings: Vec::new(),
     }
   }
 
@@ -815,6 +827,26 @@ impl MediaMetadata {
     self.capture = Some(capture);
     self
   }
+
+  /// Per-port warnings surfaced during projection.
+  ///
+  /// Each entry is a port-prefixed string like
+  /// `"[Sony rtmd] Truncated Sony rtmd"`, mirroring bundled ExifTool's
+  /// single `Warning` channel. A port's [`MetaProjectInto`] impl appends
+  /// its own warnings here.
+  #[inline(always)]
+  #[must_use]
+  pub fn warnings(&self) -> &[SmolStr] {
+    &self.warnings
+  }
+
+  /// Append a port-prefixed warning. Callers (port-specific
+  /// [`MetaProjectInto`] impls) prefix the message with `"[<port>] "`.
+  #[inline(always)]
+  pub fn push_warning(&mut self, w: impl Into<SmolStr>) -> &mut Self {
+    self.warnings.push(w.into());
+    self
+  }
 }
 
 impl Default for MediaMetadata {
@@ -822,6 +854,34 @@ impl Default for MediaMetadata {
   fn default() -> Self {
     Self::new()
   }
+}
+
+// ===========================================================================
+// MetaProjectInto — the per-port projection seam
+// ===========================================================================
+
+/// The seam each per-format `XxxMeta` implements to project into the
+/// aggregate [`MediaMetadata`].
+///
+/// Splits the format-specific projection logic out of the host parser's
+/// `media_metadata()` constructor: each port owns its own `project_into`
+/// impl beside its `XxxMeta` struct, and the host calls them in priority
+/// order. The order encodes the cross-format GPS / camera-identity /
+/// capture-settings priority chain — earlier ports win when a later port
+/// would fill an already-set domain (each impl is expected to no-op when
+/// the domain it would write is already populated).
+///
+/// This is a Rust-side organizational seam — there is no Perl equivalent
+/// (ExifTool flattens every decoder into a shared tag soup). Each format
+/// port wires its impl up at the branch where the port lands.
+pub trait MetaProjectInto {
+  /// Project this format-specific metadata into `md`. Each impl is
+  /// expected to:
+  ///
+  ///  - skip a domain (Camera/Lens/GPS/Capture) when `md` already has it
+  ///    set (priority-chain semantics);
+  ///  - prefix any pushed warning with `"[<port>] "`.
+  fn project_into(&self, md: &mut MediaMetadata);
 }
 
 /// Convert a duration in (possibly fractional) seconds to a
@@ -913,5 +973,29 @@ mod tests {
     m.set_camera(cam);
     assert_eq!(m.camera().expect("camera").make(), Some("Apple"));
     assert!(!m.camera().expect("camera").is_empty());
+  }
+
+  #[test]
+  fn warnings_channel_starts_empty_and_appends_in_order() {
+    let mut m = MediaMetadata::new();
+    assert!(m.warnings().is_empty());
+    m.push_warning("[Sony rtmd] Truncated Sony rtmd");
+    m.push_warning("[Canon CTMD] Short CTMD record");
+    assert_eq!(m.warnings().len(), 2);
+    assert_eq!(m.warnings()[0], "[Sony rtmd] Truncated Sony rtmd");
+    assert_eq!(m.warnings()[1], "[Canon CTMD] Short CTMD record");
+  }
+
+  #[test]
+  fn project_into_seam_is_a_trait_with_one_required_method() {
+    // Anchor test: every per-port `XxxMeta` impl must populate `md` via
+    // this single seam. Branches above SP3 wire their concrete impls.
+    struct Noop;
+    impl MetaProjectInto for Noop {
+      fn project_into(&self, _md: &mut MediaMetadata) {}
+    }
+    let mut m = MediaMetadata::new();
+    Noop.project_into(&mut m);
+    assert!(m.warnings().is_empty());
   }
 }

@@ -31,19 +31,30 @@
 //!
 //! This sub-port implements the walker plus the core structural atoms:
 //! `ftyp` (major brand), `moov`/`mvhd`, `trak`/`tkhd`, `mdia`/`mdhd`,
-//! `hdlr`. The camera/user-data atoms (`udta`, Keys, ItemList), embedded
-//! Exif/GPS, brand variants and `QuickTimeStream` are deferred to SP2-SP4
-//! (see `docs/tracking.md`).
+//! `hdlr`. The camera/user-data atoms (`udta`, Keys, ItemList) and brand
+//! variants are deferred to SP2 / SP4 (see `docs/tracking.md`).
+//!
+//! ## SP3 — embedded timed GPS metadata
+//!
+//! **SP3** layers the QuickTimeStream timed-metadata extraction on top:
+//! [`parse_inner`] runs [`quicktime_stream::extract_stream`] over the file,
+//! decoding per-frame GPS / sensor telemetry (dashcam / action-cam / drone
+//! videos) into [`crate::metadata::QuickTimeStreamMeta`] — exposed via
+//! [`Meta::stream`]. It also DETECTS embedded Exif/TIFF blocks
+//! ([`Meta::embedded_exif_deferred`]); the actual Exif IFD parse is deferred
+//! until the Exif+GPS port lands (see [`detect_embedded_exif`]).
 //!
 //! The faithful-parse output is the typed [`Meta`] (wrapping
-//! [`crate::metadata::QuickTimeMeta`]); the normalized
-//! [`crate::metadata::MediaMetadata`] projection is built from it via
-//! [`Meta::media_metadata`].
+//! [`crate::metadata::QuickTimeMeta`] + the SP3 stream layer); the
+//! normalized [`crate::metadata::MediaMetadata`] projection — incl. the
+//! [`crate::metadata::GpsLocation`] from the first embedded GPS fix — is
+//! built from it via [`Meta::media_metadata`].
 
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  metadata::{MediaTrack, QuickTimeMeta},
+  formats::quicktime_stream,
+  metadata::{MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
   value::format_g,
 };
 
@@ -1339,11 +1350,12 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
 
 /// Typed QuickTime metadata — the lib-first output of [`ProcessMov`].
 ///
-/// SP1 carries the core structural atoms only (see the module docs); the
-/// payload is the faithful-parse [`QuickTimeMeta`] from
-/// [`crate::metadata`]. The `'a` lifetime is phantom — `QuickTimeMeta` owns
-/// its data (the structural atoms are decoded into owned strings/Vecs, not
-/// borrowed) — but the [`FormatParser`] GAT requires it.
+/// SP1 carries the core structural atoms; **SP3** adds the embedded
+/// timed-metadata GPS layer ([`QuickTimeStreamMeta`]). The payload is the
+/// faithful-parse [`QuickTimeMeta`] from [`crate::metadata`]. The `'a`
+/// lifetime is phantom — `QuickTimeMeta` owns its data (the structural atoms
+/// are decoded into owned strings/Vecs, not borrowed) — but the
+/// [`FormatParser`] GAT requires it.
 ///
 /// **D8 — no public fields, accessors only.** Construct only via
 /// [`ProcessMov::parse`].
@@ -1351,6 +1363,16 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
 pub struct Meta<'a> {
   /// The faithful-parse QuickTime structural data.
   qt: QuickTimeMeta,
+  /// **SP3** — the embedded QuickTimeStream timed GPS / sensor metadata
+  /// (`Image::ExifTool::QuickTime::Stream`, QuickTimeStream.pl). Empty for a
+  /// video with no timed metadata (the common case).
+  stream: QuickTimeStreamMeta,
+  /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
+  /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
+  /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
+  /// Surfaces as an `ExifTool:Warning` so the gap is visible (see
+  /// `docs/tracking.md`).
+  embedded_exif_deferred: bool,
   /// The detected file type + MIME, derived from `ftyp` (or the MOV
   /// default). Drives [`crate::format_parser::FileTypeFinalize`].
   file_type: &'static str,
@@ -1389,14 +1411,44 @@ impl Meta<'_> {
     self.mime
   }
 
+  /// **SP3** — the embedded QuickTimeStream timed GPS / sensor metadata.
+  /// [`QuickTimeStreamMeta::is_empty`] for a video with no timed metadata.
+  #[must_use]
+  #[inline(always)]
+  pub const fn stream(&self) -> &QuickTimeStreamMeta {
+    &self.stream
+  }
+
+  /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
+  /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn embedded_exif_deferred(&self) -> bool {
+    self.embedded_exif_deferred
+  }
+
   /// Build the normalized [`crate::metadata::MediaMetadata`] projection from
-  /// this faithful-parse layer. SP1 populates only the `MediaInfo` basics
-  /// (duration / dimensions / created / track kinds); camera / lens / GPS /
-  /// capture are left `None` for SP2+ and other formats to fill.
+  /// this faithful-parse layer. SP1 populates the `MediaInfo` basics
+  /// (duration / dimensions / created / track kinds); **SP3** fills
+  /// [`crate::metadata::GpsLocation`] from the FIRST embedded
+  /// timed-metadata GPS fix. Camera / lens / capture stay `None` for SP2+
+  /// and the embedded-Exif hop to fill.
   #[must_use]
   #[inline(always)]
   pub fn media_metadata(&self) -> crate::metadata::MediaMetadata {
-    crate::metadata::MediaMetadata::from_quicktime(&self.qt)
+    let mut md = crate::metadata::MediaMetadata::from_quicktime(&self.qt);
+    // SP3: project the first GPS fix from the embedded timed metadata into
+    // the normalized GpsLocation domain.
+    if let Some(fix) = self.stream.first_fix() {
+      let mut gps = crate::metadata::GpsLocation::new();
+      gps
+        .update_latitude(fix.latitude())
+        .update_longitude(fix.longitude())
+        .update_altitude_m(fix.altitude_m())
+        .update_timestamp(fix.date_time().map(str::to_string));
+      md.set_gps(gps);
+    }
+    md
   }
 }
 
@@ -1721,13 +1773,145 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     mime = "audio/mp4";
   }
 
+  // **SP3** — extract the embedded QuickTimeStream timed GPS / sensor
+  // metadata (QuickTimeStream.pl `ProcessSamples`). ExifTool gates this on
+  // the `ExtractEmbedded` option; exifast always decodes the self-contained
+  // timed-metadata atoms (the camera-metadata product goal, see
+  // `docs/tracking.md`). `GPSDateTime` synthesis uses the `mvhd` CreateDate
+  // RAW 1904-epoch seconds — the `qt_date_string`-formatted value can't be
+  // re-parsed, so we re-derive the raw count from the first decoded `mvhd`
+  // via `qt`'s stored Duration timescale-count is unrelated; instead the
+  // stream walker is given the raw CreateDate it can recover from the file.
+  let create_date_raw = first_moov_create_date_raw(data);
+  let stream = quicktime_stream::extract_stream(data, create_date_raw);
+
+  // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
+  // (`QVMI` Casio, `MVTG` FujiFilm, `uuid`-Exif) to
+  // `Image::ExifTool::Exif::ProcessExif` (QuickTime.pm:2058-2110). exifast's
+  // Exif IFD parser is on the UNMERGED PR #36 (`lib/exif-gps`); detect the
+  // block here and DEFER the parse.
+  // DEFERRED: wire exif::parse_exif_block once #36 (Exif+GPS) merges.
+  let embedded_exif_deferred = detect_embedded_exif(data);
+
   Ok(Some(Meta {
     qt,
+    stream,
+    embedded_exif_deferred,
     file_type,
     mime,
     warning,
     _marker: core::marker::PhantomData,
   }))
+}
+
+/// Recover the FIRST `moov`/`mvhd` CreateDate as the RAW 1904-epoch second
+/// count (QuickTime.pm:1355-1374 — the `timeInfo` RawConv input, BEFORE the
+/// epoch subtraction). Used by [`quicktime_stream`] for `GPSDateTime`
+/// synthesis (`SetGPSDateTime` adds the raw create-date to the sample time).
+///
+/// This re-walks for `moov`→`mvhd` because [`QuickTimeMeta`] stores only the
+/// already-formatted `CreateDate` string, which cannot be re-parsed back to
+/// the raw count. `None` when no `mvhd` carried a (non-zero) create date.
+fn first_moov_create_date_raw(data: &[u8]) -> Option<u64> {
+  let mut found: Option<u64> = None;
+  let mut pos = 0usize;
+  while pos < data.len() {
+    let Some(HeaderOutcome::Atom(header, next)) = read_atom_header(data, pos, true) else {
+      break;
+    };
+    if &header.atom_type == b"moov" {
+      let body = &data[header.payload_start..header.payload_end.min(data.len())];
+      walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+        if &inner.atom_type == b"mvhd"
+          && let Some(&version) = ibody.first()
+        {
+          // mvhd CreateDate (idx 1): int32u at byte 4 (v0) / int64u at byte
+          // 4 (v1, the truthy-version-widened layout).
+          let raw = if version != 0 {
+            be_u64(ibody, 4)
+          } else {
+            be_u32(ibody, 4).map(u64::from)
+          };
+          // Last-wins, like the SP1 mvhd state — and skip a zero date
+          // (a zero CreateDate cannot anchor a GPSDateTime).
+          if let Some(r) = raw
+            && r != 0
+          {
+            found = Some(r);
+          }
+        }
+      });
+    }
+    if next <= pos {
+      break;
+    }
+    pos = next;
+  }
+  found
+}
+
+/// Detect an embedded Exif/TIFF block inside a QuickTime file — the atoms
+/// QuickTime.pm dispatches to `Image::ExifTool::Exif::ProcessExif`
+/// (QuickTime.pm:2058-2110, 2299-2357): the Casio `QVMI`, FujiFilm `MVTG`
+/// and a `uuid`-Exif atom (a `uuid` whose payload begins with the JFIF/TIFF
+/// `Exif\0\0` marker or a bare TIFF byte-order mark).
+///
+/// **DEFERRED.** exifast's Exif IFD parser (`exif::parse_exif_block`) lives
+/// on the unmerged PR #36 (`lib/exif-gps`). This function only performs the
+/// QuickTime-side DETECTION so the deferral is visible (`embedded_exif_*`);
+/// the actual IFD parse is wired once #36 merges. Returns `true` when such a
+/// block is present.
+fn detect_embedded_exif(data: &[u8]) -> bool {
+  let mut detected = false;
+  // Walk top-level atoms; the embedded-Exif atoms sit inside `moov`/`udta`.
+  let mut pos = 0usize;
+  while pos < data.len() {
+    let Some(HeaderOutcome::Atom(header, next)) = read_atom_header(data, pos, true) else {
+      break;
+    };
+    let body = &data[header.payload_start..header.payload_end.min(data.len())];
+    detected |= match &header.atom_type {
+      b"moov" => detect_embedded_exif_in_dir(body),
+      // A top-level `uuid` carrying an `Exif` TIFF block.
+      b"uuid" => is_uuid_exif_payload(body),
+      _ => false,
+    };
+    if next <= pos {
+      break;
+    }
+    pos = next;
+  }
+  detected
+}
+
+/// Recursively scan a `moov`/`udta`/`meta` directory for an embedded-Exif
+/// atom (`QVMI` / `MVTG` / `Exif` / `uuid`-Exif). QuickTime.pm nests these
+/// under `moov`→`udta` (QuickTime.pm:2058, 2070).
+fn detect_embedded_exif_in_dir(body: &[u8]) -> bool {
+  let mut found = false;
+  walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+    found |= match &inner.atom_type {
+      // Casio `QVMI` / FujiFilm `MVTG` — standard Exif IFD blocks
+      // (QuickTime.pm:2056-2080) — and a bare `Exif`-type atom (TIFF block).
+      b"QVMI" | b"MVTG" | b"Exif" => true,
+      b"uuid" => is_uuid_exif_payload(ibody),
+      // Recurse into nested containers (`udta`, `meta`, `trak`).
+      b"udta" | b"meta" | b"trak" => detect_embedded_exif_in_dir(ibody),
+      _ => false,
+    };
+  });
+  found
+}
+
+/// `true` when a `uuid` atom payload carries an embedded Exif/TIFF block —
+/// the payload (after the 16-byte UUID) begins with the JFIF `Exif\0\0`
+/// marker or a TIFF byte-order mark (`II*\0` / `MM\0*`).
+fn is_uuid_exif_payload(body: &[u8]) -> bool {
+  // 16-byte UUID, then the embedded block.
+  let Some(rest) = body.get(16..) else {
+    return false;
+  };
+  rest.starts_with(b"Exif\0\0") || rest.starts_with(b"II*\0") || rest.starts_with(b"MM\0*")
 }
 
 /// The QuickTime / MOV first-atom acceptance gate.
@@ -2051,6 +2235,51 @@ impl Meta<'_> {
           out.write_str(grp, "HandlerType", code)?;
         }
       }
+    }
+
+    // ── SP3: embedded timed-metadata (QuickTimeStream) ─────────────────
+    // ExifTool emits one `Doc<N>` sub-document per timed sample; exifast's
+    // flat TagMap cannot reproduce that JSON shape, so the FIRST GPS fix is
+    // summarized under the `QuickTime` group (the typed [`Meta::stream`]
+    // accessor exposes the full per-sample list). Faithful to the
+    // `%QuickTime::Stream` PrintConv/ValueConv (QuickTimeStream.pl:116-162).
+    if let Some(fix) = self.stream.first_fix() {
+      // GPSLatitude/GPSLongitude: the `%QuickTime::Stream` PrintConv is
+      // `GPS::ToDMS` (QuickTimeStream.pl:116-117) — a GPS-port dependency.
+      // The typed layer keeps post-ValueConv decimal degrees; emit those in
+      // both modes (the DMS PrintConv is wired with the Exif+GPS port).
+      let _ = print_conv;
+      if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
+        out.write_f64(GROUP, "GPSLatitude", lat)?;
+        out.write_f64(GROUP, "GPSLongitude", lon)?;
+      }
+      if let Some(alt) = fix.altitude_m() {
+        out.write_f64(GROUP, "GPSAltitude", alt)?;
+      }
+      if let Some(spd) = fix.speed_kph() {
+        out.write_f64(GROUP, "GPSSpeed", spd)?;
+      }
+      if let Some(trk) = fix.track() {
+        out.write_f64(GROUP, "GPSTrack", trk)?;
+      }
+      if let Some(dt) = fix.date_time() {
+        out.write_str(GROUP, "GPSDateTime", dt)?;
+      }
+    }
+    // The Apple `mebx` key/value pairs — emitted under the `QuickTime`
+    // group by their resolved key name (QuickTimeStream.pl Process_mebx).
+    for sample in self.stream.mebx_samples() {
+      out.write_str(GROUP, sample.name(), sample.value())?;
+    }
+
+    // ── SP3: embedded-Exif hop deferral ────────────────────────────────
+    // DEFERRED: wire exif::parse_exif_block once #36 (Exif+GPS) merges. The
+    // QuickTime-side detection ran (`embedded_exif_deferred`); surface the
+    // gap as a warning so it is visible (cf. docs/tracking.md).
+    if self.embedded_exif_deferred {
+      out.write_warning(
+        "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
+      )?;
     }
     Ok(())
   }

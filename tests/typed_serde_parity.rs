@@ -53,6 +53,16 @@
 //! cannot synthesize without the XMP parser. Pinned by the `#[ignore]`-d
 //! `flash_xmp_livexml_subdirectory_deferred_conformance` test. Codex PR #32 R6.
 //!
+//! The QuickTime SP3 timed-metadata fixtures (`QuickTime_mebx_gps.mov`,
+//! `QuickTime_gps_kenwood.mov`, `QuickTime_gps0.mov`, `QuickTime_gsen.mov`)
+//! are NOT in this set: `Image::ExifTool::QuickTime::Stream` is gated behind
+//! the bundled `ExtractEmbedded` (`-ee`) option, which `tools/gen_golden.sh`
+//! never passes — so those fixtures carry only an `-ee`-captured
+//! `<f>.ee.json` golden (no standard `<f>.json` / `<f>.n.json`) and are
+//! exercised by the dedicated `tests/quicktime_stream.rs` harness instead.
+//! The both-standard-goldens [`active_fixtures`] filter skips them
+//! automatically.
+//!
 //! Gated on `feature = "json"`: imports the `json`-gated `jsondiff` +
 //! `serde_json` rendering of `Rendered`.
 #![cfg(feature = "json")]

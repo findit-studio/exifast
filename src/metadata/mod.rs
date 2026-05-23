@@ -23,6 +23,10 @@
 
 mod domain;
 mod quicktime;
+mod quicktime_stream;
 
-pub use domain::{CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata};
+pub use domain::{
+  CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, MetaProjectInto,
+};
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
+pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
