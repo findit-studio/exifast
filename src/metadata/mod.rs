@@ -21,6 +21,7 @@
 //! `None` for later sub-ports and other formats to fill — the layer is
 //! deliberately extensible.
 
+mod android_camm;
 #[cfg(feature = "crw")]
 pub(crate) mod crw;
 mod domain;
@@ -36,6 +37,7 @@ mod quicktime_stream;
 #[cfg(feature = "riff")]
 pub(crate) mod riff;
 
+pub use android_camm::{CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammVector3};
 #[cfg(feature = "crw")]
 pub use crw::{
   CrwDecoderTable, CrwExposureInfo, CrwFlashInfo, CrwImageInfo, CrwMeta, CrwRawArray,

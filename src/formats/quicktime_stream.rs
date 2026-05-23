@@ -1634,8 +1634,10 @@ struct StreamTrack {
 fn process_samples(
   data: &[u8],
   track: &StreamTrack,
+  create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -1660,13 +1662,21 @@ fn process_samples(
     // skip left `FoundEmbedded` false on an empty-then-buried-GP6 file, so the
     // scan ran and emitted GP6/freeGPS tags ExifTool suppresses. The `gpmd` arm
     // of `decode_one_sample` returns `true` unconditionally (even for an empty
-    // buffer); `process_mebx` and the other arms are no-ops on empty bytes
-    // (their `pos + 8 < len` loop never runs), so removing the skip is faithful
-    // across formats.
+    // buffer); `process_mebx`, the `camm` arm and the other arms are no-ops on
+    // empty bytes (their `pos + N < len` loop never runs), so removing the skip
+    // is faithful across formats.
     //
     // `FoundEmbedded` is sticky — once any GoPro sample is recognized it
     // stays set (ExifTool only ever assigns `= 1`, GoPro.pm:822).
-    found_embedded |= decode_one_sample(buff, track, sample, out, gopro_out);
+    found_embedded |= decode_one_sample(
+      buff,
+      track,
+      sample,
+      create_date_raw,
+      out,
+      gopro_out,
+      camm_out,
+    );
   }
   found_embedded
 }
@@ -1713,8 +1723,10 @@ fn decode_one_sample(
   buff: &[u8],
   track: &StreamTrack,
   sample: &Sample,
+  create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1761,12 +1773,31 @@ fn decode_one_sample(
     let _extracted = crate::formats::gopro::process_gopro(buff, gopro_out);
     return true;
   }
+  // The `camm` MetaFormat (QuickTimeStream.pl:251-309) — Google's Camera
+  // Motion Metadata. Bundled dispatches by the int16u-LE packet-type at
+  // sample-bytes +2 to one of seven `%QuickTime::camm<N>` tag tables
+  // (camm0..camm7, QuickTimeStream.pl:405-572). Our `process_camm`
+  // (faithful port of `ProcessCAMM`:3481-3506) walks the sample as a
+  // multi-packet stream and dispatches by type internally.
+  //
+  // `create_date_raw` is the raw 1904-epoch `mvhd` CreateDate; we route it to
+  // camm6's GPS-vs-Unix-epoch heuristic (QuickTimeStream.pl:519) after a
+  // 1904→1970 epoch shift via `android_camm::create_date_to_unix`.
+  //
+  // Returns `false`: `ProcessCAMM` does NOT set `$$et{FoundEmbedded}` (only
+  // `ProcessGoPro` (GoPro.pm:822) and a `moov`-level `gps `-box freeGPS decode
+  // do), so a `camm` track must NOT suppress the brute-force `mdat` scan.
+  if &track.meta_format == b"camm" {
+    let create_date_unix = create_date_raw.map(crate::formats::android_camm::create_date_to_unix);
+    crate::formats::android_camm::process_camm(buff, create_date_unix, camm_out);
+    return false;
+  }
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
   // reaches `process_samples` ([`is_meta_handler`] excludes `gps `, faithful
   // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
   // EMPTY-HandlerType `moov`-level box ([`process_moov_gps_box`]), not a track.
   //
-  // Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
+  // Sony `rtmd` / Canon `CTMD` / `tx3g` / …:
   // DEFERRED — these re-dispatch into other ExifTool modules (Sony.pm,
   // Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
   // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
@@ -1985,6 +2016,7 @@ pub(crate) fn extract_stream(
   create_date_raw: Option<u64>,
   kodak_version: Option<&str>,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) -> (QuickTimeStreamMeta, bool) {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
@@ -2019,6 +2051,7 @@ pub(crate) fn extract_stream(
           &mut free_gps_state,
           &mut out,
           gopro_out,
+          camm_out,
         );
       }
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
@@ -2198,6 +2231,7 @@ fn walk_moov(
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
+  camm_out: &mut crate::metadata::CammMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
   for_each_atom(data, start, end, |t, body| {
@@ -2213,7 +2247,8 @@ fn walk_moov(
         // HandlerType is `gps ` is ignored for embedded extraction. See
         // [`is_meta_handler`].
         if is_meta_handler(&track.handler) {
-          gopro_found_embedded |= process_samples(data, &track, out, gopro_out);
+          gopro_found_embedded |=
+            process_samples(data, &track, create_date_raw, out, gopro_out, camm_out);
         }
       }
       // The `moov`-level Novatek `gps ` box — a DIRECT child atom of `moov`
@@ -2346,6 +2381,7 @@ mod tests {
     };
     let mut out = QuickTimeStreamMeta::default();
     let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
 
     // A zero-filled `gpmd` sample: `process_gopro` extracts nothing (the KLV
     // walker bails on the four-NUL tag, GoPro.pm:844) — but it is NOT a
@@ -2353,7 +2389,15 @@ mod tests {
     // is set on entry. Pre-fix this returned the walker's `false`; now `true`.
     let zero = [0u8; 64];
     assert!(
-      decode_one_sample(&zero, &gpmd_track, &sample, &mut out, &mut gopro),
+      decode_one_sample(
+        &zero,
+        &gpmd_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
     );
 
@@ -2368,7 +2412,15 @@ mod tests {
       "the non-printable sample is NOT a deferred variant"
     );
     assert!(
-      decode_one_sample(&nonprintable, &gpmd_track, &sample, &mut out, &mut gopro),
+      decode_one_sample(
+        &nonprintable,
+        &gpmd_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
     );
 
@@ -2377,26 +2429,70 @@ mod tests {
     let fmas = b"FMAS\0\0\0\0\xde\xad\xbe\xef";
     assert!(is_deferred_gpmd_variant(fmas));
     assert!(
-      !decode_one_sample(fmas, &gpmd_track, &sample, &mut out, &mut gopro),
+      !decode_one_sample(
+        fmas,
+        &gpmd_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
     );
 
     // And a real GoPro `DEVC` sample (valid record) of course returns true.
     let devc = b"DEVC\0\x01\x00\x01\x00\x00\x00\x00";
     assert!(
-      decode_one_sample(devc, &gpmd_track, &sample, &mut out, &mut gopro),
+      decode_one_sample(
+        devc,
+        &gpmd_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
     );
 
-    // A non-`gpmd`, non-`mebx` track sets nothing (the default arm).
+    // A non-`gpmd`, non-`mebx`, non-`camm` track sets nothing (the default,
+    // deferred arm — e.g. Sony `rtmd`).
     let other_track = StreamTrack {
+      meta_format: *b"rtmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    assert!(
+      !decode_one_sample(
+        &zero,
+        &other_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
+      "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
+    );
+    // A `camm` track also sets no FoundEmbedded (ProcessCAMM never sets it),
+    // even though it now dispatches into the CAMM decoder.
+    let camm_track = StreamTrack {
       meta_format: *b"camm",
       handler: *b"camm",
       ..StreamTrack::default()
     };
     assert!(
-      !decode_one_sample(&zero, &other_track, &sample, &mut out, &mut gopro),
-      "a non-gpmd/non-mebx track sets no FoundEmbedded"
+      !decode_one_sample(
+        &zero,
+        &camm_track,
+        &sample,
+        None,
+        &mut out,
+        &mut gopro,
+        &mut camm
+      ),
+      "a camm track does not set FoundEmbedded"
     );
   }
 
@@ -2959,11 +3055,13 @@ mod tests {
     let mut data = ftyp;
     data.extend_from_slice(&moov);
     let mut gp = crate::metadata::GoProMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
+    let mut cm = crate::metadata::CammMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
     assert!(!found_embedded);
     assert!(gp.is_empty());
+    assert!(cm.is_empty());
   }
 
   /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box
@@ -3015,7 +3113,8 @@ mod tests {
     data.extend_from_slice(&moov);
 
     let mut gp = crate::metadata::GoProMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
+    let mut cm = crate::metadata::CammMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
     assert_eq!(
       meta.gps_samples().len(),
       1,
@@ -3106,7 +3205,8 @@ mod tests {
     data.extend_from_slice(&moov);
 
     let mut gp = crate::metadata::GoProMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
+    let mut cm = crate::metadata::CammMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
     assert!(
       meta.is_empty(),
       "a gps '-HandlerType trak must yield no embedded GPS (ExifTool ignores it)"

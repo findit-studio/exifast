@@ -57,8 +57,8 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   formats::{quicktime_freegps, quicktime_stream},
   metadata::{
-    GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeGps, QuickTimeMeta,
-    QuickTimeStreamMeta,
+    CammMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeGps,
+    QuickTimeMeta, QuickTimeStreamMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -3005,6 +3005,11 @@ pub struct Meta<'a> {
   /// scan in `mdat` (see [`crate::formats::gopro`]). Empty
   /// ([`GoProMeta::is_empty`]) for a non-GoPro video.
   gopro: GoProMeta,
+  /// **SP4** — Android Google CAMM (Camera Motion Metadata) — decoded
+  /// through the `camm` MetaFormat dispatch in [`quicktime_stream`]. Empty
+  /// ([`CammMeta::is_empty`]) for a non-Android video (or one whose CAMM
+  /// track is absent).
+  android_camm: CammMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3079,6 +3084,20 @@ impl Meta<'_> {
     &self.gopro
   }
 
+  /// **SP4** — Android Google CAMM (Camera Motion Metadata).
+  /// [`CammMeta::is_empty`] for a non-Android video (or one whose `camm`
+  /// metadata track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::QuickTime::ProcessCAMM`
+  /// (QuickTimeStream.pl:3481-3506) and the seven `%QuickTime::camm<N>` tag
+  /// tables (QuickTimeStream.pl:405-572). Populated by the `camm`
+  /// MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn android_camm(&self) -> &CammMeta {
+    &self.android_camm
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3111,6 +3130,12 @@ impl Meta<'_> {
     // preferred over `udta` per ExifTool's ItemList-over-UserData rule
     // (QuickTime.pm:1601).
     self.project_sp2_into(&mut md);
+    // **SP4 — Android CAMM** on-device GNSS (camm5/camm6). Sits BELOW GoPro
+    // and the explicit SP2 container metadata but ABOVE the generic SP3
+    // timed-metadata scan. Set-once per domain (no-ops when a higher-priority
+    // source already populated GPS); fills only the GPS domain (CAMM carries
+    // no camera-identity record).
+    self.android_camm.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -3546,6 +3571,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // by the brute-force `GP\x06\0\0` scan (some GoPro firmware writes
   // unreferenced GPMF records in `mdat` outside of a metadata track).
   let mut gopro_meta = GoProMeta::new();
+  // **SP4 — Android CAMM**: the `camm` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `camm_meta` for each timed-metadata sample
+  // whose track carries Google Camera Motion Metadata. Threaded ALONGSIDE the
+  // GoPro meta + the `found_embedded`/`kodak_version` state below (the camm arm
+  // is purely additive to the existing per-format sample dispatch).
+  let mut camm_meta = CammMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
   // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
   // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
@@ -3576,8 +3607,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `moov/GPMF` child stays IGNORED (GPMF is reached only via `udta` — R8);
   // the R7 multi-moov order is preserved (the walk runs per top-level `moov`
   // in file order).
-  let (mut stream, found_embedded) =
-    quicktime_stream::extract_stream(data, create_date_raw, kodak_version, &mut gopro_meta);
+  let (mut stream, found_embedded) = quicktime_stream::extract_stream(
+    data,
+    create_date_raw,
+    kodak_version,
+    &mut gopro_meta,
+    &mut camm_meta,
+  );
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -3620,6 +3656,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     qt,
     stream,
     gopro: gopro_meta,
+    android_camm: camm_meta,
     embedded_exif_deferred,
     file_type,
     mime,
@@ -4765,6 +4802,70 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── SP4: Android CAMM (Image::ExifTool::QuickTime::camm5/camm6) ─────
+    // The `%QuickTime::camm5`/`camm6` GPS tables (QuickTimeStream.pl:479-560)
+    // emit under family-2 `Location`/`Time`; ExifTool yields one `Doc<N>`
+    // sub-document per CAMM packet, which exifast's flat TagMap cannot
+    // reproduce — so, like the SP3 stream and GoPro GPMF first-fix summaries
+    // above, the FIRST GPS fix is summarized here (the full per-sample list is
+    // on [`Meta::android_camm`]). Emitted under the `QuickTime` group (the
+    // family-2 `Location`/`Time` re-scope is the same accepted flat-TagMap
+    // limitation as the SP3 `mebx`/stream tags). The per-sample motion records
+    // (camm1-4/7 exposure/gyro/accel/position/magnetic) stay on the typed
+    // accessor — not emitted, matching the gps0/gsen/3gf sensor precedent.
+    if let Some(fix) = self.android_camm.first_fix() {
+      // GPSLatitude/GPSLongitude: the `camm5`/`camm6` PrintConv is `GPS::ToDMS`
+      // (QuickTimeStream.pl:488/494/541/547) — a GPS-port dependency. The typed
+      // layer keeps post-ValueConv decimal degrees; emit those in both modes
+      // (the DMS PrintConv is wired with the Exif+GPS port), matching the SP3
+      // stream first-fix emission above.
+      let _ = print_conv;
+      if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSLatitude".into(),
+          TagValue::F64(lat),
+          false,
+        ));
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSLongitude".into(),
+          TagValue::F64(lon),
+          false,
+        ));
+      }
+      if let Some(alt) = fix.altitude_m() {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSAltitude".into(),
+          TagValue::F64(alt),
+          false,
+        ));
+      }
+      // GPSDateTime — camm6 only (the typed layer stores the post-ValueConv
+      // `YYYY:MM:DD HH:MM:SS[.sss]Z` string; the `ConvertDateTime` PrintConv is
+      // a no-op cosmetic on that shape — emit in both modes).
+      if let Some(dt) = fix.date_time() {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSDateTime".into(),
+          TagValue::Str(dt.into()),
+          false,
+        ));
+      }
+      // GPSMeasureMode — camm6 only. PrintConv (QuickTimeStream.pl:530-534):
+      // 0 → "No Measurement", 2/3 → "<n>-Dimensional Measurement"; `-n` emits
+      // the raw code.
+      if let Some(mode) = fix.measure_mode() {
+        tags.push(EmittedTag::new(
+          main(),
+          "GPSMeasureMode".into(),
+          camm_gps_measure_mode_value(mode, print_conv),
+          false,
+        ));
+      }
+    }
+
     // ── SP2: moov/meta HandlerClass + HandlerType (QuickTime.pm:8391-8444) ─
     // The `moov/meta` `hdlr` uses the SAME `%QuickTime::Handler` table as the
     // trak hdlr, so it emits BOTH HandlerClass (offset-4 ComponentType, dropped
@@ -4969,6 +5070,26 @@ fn gps_measure_mode_value(mode: u32, print_conv: bool) -> crate::value::TagValue
   use crate::value::TagValue;
   if print_conv {
     match mode {
+      2 => TagValue::Str("2-Dimensional Measurement".into()),
+      3 => TagValue::Str("3-Dimensional Measurement".into()),
+      other => TagValue::Str(std::format!("Unknown ({other})").into()),
+    }
+  } else {
+    TagValue::U64(u64::from(mode))
+  }
+}
+
+/// Build an Android CAMM `GPSMeasureMode` tag value (`%QuickTime::camm6`,
+/// QuickTimeStream.pl:527-535). PrintConv hash `{0 => 'No Measurement',
+/// 2 => '2-Dimensional Measurement', 3 => '3-Dimensional Measurement'}` — note
+/// camm6 carries the extra `0 => 'No Measurement'` entry the GoPro GPSF table
+/// lacks, so this cannot share [`gps_measure_mode_value`]. A hash miss yields
+/// `Unknown ($val)` (ExifTool.pm:3622); `-n` (ValueConv) emits the raw code.
+fn camm_gps_measure_mode_value(mode: u32, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    match mode {
+      0 => TagValue::Str("No Measurement".into()),
       2 => TagValue::Str("2-Dimensional Measurement".into()),
       3 => TagValue::Str("3-Dimensional Measurement".into()),
       other => TagValue::Str(std::format!("Unknown ({other})").into()),
@@ -8169,7 +8290,13 @@ mod tests {
     data.extend_from_slice(&moov2);
 
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+      &data,
+      None,
+      None,
+      &mut meta,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert_eq!(meta.device_name(), Some("Hero8 Black"));
     assert!(
       found_embedded,
@@ -8196,7 +8323,13 @@ mod tests {
     data.extend_from_slice(&moov2);
 
     let mut meta = GoProMeta::new();
-    let _ = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    let _ = quicktime_stream::extract_stream(
+      &data,
+      None,
+      None,
+      &mut meta,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert_eq!(
       meta.device_name(),
       Some("Second"),
@@ -8230,7 +8363,13 @@ mod tests {
     let mut data_a = atom(b"ftyp", b"qt  ");
     data_a.extend_from_slice(&moov_a);
     let mut meta_a = GoProMeta::new();
-    let _ = quicktime_stream::extract_stream(&data_a, None, None, &mut meta_a);
+    let _ = quicktime_stream::extract_stream(
+      &data_a,
+      None,
+      None,
+      &mut meta_a,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert_eq!(
       meta_a.device_name(),
       Some("XfromUDTA"),
@@ -8250,7 +8389,13 @@ mod tests {
     let mut data_b = atom(b"ftyp", b"qt  ");
     data_b.extend_from_slice(&moov_b);
     let mut meta_b = GoProMeta::new();
-    let _ = quicktime_stream::extract_stream(&data_b, None, None, &mut meta_b);
+    let _ = quicktime_stream::extract_stream(
+      &data_b,
+      None,
+      None,
+      &mut meta_b,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert_eq!(
       meta_b.device_name(),
       Some("XfromUDTA"),
@@ -8268,7 +8413,13 @@ mod tests {
     let mut data = atom(b"ftyp", b"qt  ");
     data.extend_from_slice(&moov);
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+      &data,
+      None,
+      None,
+      &mut meta,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert_eq!(meta.device_name(), Some("Hero6 Black"));
     assert!(found_embedded);
   }
@@ -8279,7 +8430,13 @@ mod tests {
   fn moov_udta_gpmf_none_and_truncation_safe() {
     let data = atom(b"ftyp", b"qt  ");
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+      &data,
+      None,
+      None,
+      &mut meta,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert!(meta.is_empty());
     assert!(!found_embedded);
 
@@ -8290,7 +8447,13 @@ mod tests {
     trunc.extend_from_slice(b"moov");
     trunc.extend_from_slice(b"\x00\x00\x00\x10udta"); // truncated body
     let mut meta2 = GoProMeta::new();
-    let _ = quicktime_stream::extract_stream(&trunc, None, None, &mut meta2);
+    let _ = quicktime_stream::extract_stream(
+      &trunc,
+      None,
+      None,
+      &mut meta2,
+      &mut crate::metadata::CammMeta::new(),
+    );
     assert!(meta2.is_empty());
   }
 
