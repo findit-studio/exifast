@@ -407,6 +407,166 @@ fn build_mov_with_gpro6_in_mdat() -> Vec<u8> {
   out
 }
 
+// ===========================================================================
+// gpmd dashcam variants — Kingslim / Rove / FMAS / Wolfbox
+// (QuickTimeStream.pl:181-212 Condition cascade)
+// ===========================================================================
+
+#[test]
+fn quicktime_gpmd_rove_dispatch_decodes_xor_aa_block() {
+  // QuickTimeStream.pl:190-194 — `gpmd_Rove` Condition
+  // `^\0\0\xf2\xe1\xf0\xeeTT` re-routes to Process_text → BlueSkySea /
+  // Ambarella XOR-0xAA decoder (1175-1211). The sample bytes carry the
+  // signature + an XOR-encrypted date/lat/lon/spd/alt block.
+  let sample = build_rove_xor_aa_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "Rove gpmd must produce one GPS sample");
+  let s = &samples[0];
+  assert!(s.date_time().unwrap().contains("2019:08:20 07:51:57"));
+  assert!((s.latitude().unwrap() - (48.0 + 515873.0 / 600000.0)).abs() < 1e-4);
+  assert!((s.longitude().unwrap() - (2.0 + 197769.0 / 600000.0)).abs() < 1e-4);
+  // MediaMetadata projects the GPS fix.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from Rove gpmd");
+  assert!(gps.latitude().is_some());
+  assert!(gps.longitude().is_some());
+}
+
+#[test]
+fn quicktime_gpmd_fmas_dispatch_decodes_vantrue_n2s_record() {
+  // QuickTimeStream.pl:196-201 — `gpmd_FMAS` (Vantrue N2S) routes to
+  // ProcessFMAS (3580-3609).
+  let sample = build_fmas_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "FMAS gpmd must produce one GPS sample");
+  let s = &samples[0];
+  // Lat 47 + (37 + 4200/6000)/60 ≈ 47.628333
+  let want_lat = 47.0 + (37.0 + 4200.0 / 6000.0) / 60.0;
+  assert!((s.latitude().unwrap() - want_lat).abs() < 1e-6);
+  // 50 mph * 1.60934 = 80.467 kph
+  assert!((s.speed_kph().unwrap() - 80.467).abs() < 0.01);
+  // Projection.
+  let md = meta.media_metadata();
+  assert!(md.gps().is_some());
+}
+
+#[test]
+fn quicktime_gpmd_wolfbox_dispatch_decodes_g900_record() {
+  // QuickTimeStream.pl:203-208 — `gpmd_Wolfbox` routes to ProcessWolfbox
+  // (3615-3676). The Wolfbox G900 marker `00000000HYTH` at offset 152.
+  let sample = build_wolfbox_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "Wolfbox gpmd must produce one GPS sample");
+  let s = &samples[0];
+  // ConvertLatLon(4737.7053) ≈ 47.628421
+  assert!((s.latitude().unwrap() - 47.628421).abs() < 1e-4);
+  assert_eq!(s.altitude_m(), Some(412.5));
+  // 25.5 knots * 1.852 = 47.226
+  assert!((s.speed_kph().unwrap() - 47.226).abs() < 0.01);
+}
+
+/// Build a 282-byte Rove `gpmd` sample (Ambarella A12 XOR-0xAA cipher,
+/// matching the bundled `gpmd_Rove` Condition `^\0\0\xf2\xe1\xf0\xeeTT`).
+fn build_rove_xor_aa_sample() -> Vec<u8> {
+  let mut data = vec![0u8; 282];
+  // Ambarella sig: literal `\0\0\xf2\xe1\xf0\xee\x54\x54` at offset 0..8.
+  data[0..8].copy_from_slice(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54]);
+  // Encrypted date+time `20190820075157` at offset 8 (XOR'd later via
+  // decode_xor_aa_block).
+  for (i, &c) in b"20190820075157".iter().enumerate() {
+    data[8 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"N48515873".iter().enumerate() {
+    data[38 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"E002197769".iter().enumerate() {
+    data[47 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"+0031".iter().enumerate() {
+    data[0x39 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"045".iter().enumerate() {
+    data[0x3e + i] = c ^ 0xaa;
+  }
+  data
+}
+
+/// Build a 160-byte Vantrue N2S FMAS sample.
+fn build_fmas_sample() -> Vec<u8> {
+  let mut d = vec![0u8; 160];
+  d[0..8].copy_from_slice(b"FMAS\0\0\0\0");
+  d[80..84].copy_from_slice(b"SAMM");
+  d[120] = b'A';
+  d[0x60..0x62].copy_from_slice(&2025u16.to_le_bytes());
+  d[0x62] = 6;
+  d[0x63] = 15;
+  d[0x64] = 14;
+  d[0x65] = 30;
+  d[0x66] = 45;
+  d[0x78] = b'A';
+  d[0x79] = b'E';
+  d[0x7a] = b'N';
+  d[0x7b] = 8;
+  d[0x7c] = 30;
+  d[0x7d] = 0;
+  d[0x7e..0x80].copy_from_slice(&600u16.to_le_bytes());
+  d[0x80] = 47;
+  d[0x81] = 37;
+  d[0x82..0x84].copy_from_slice(&4200u16.to_le_bytes());
+  d[0x84..0x86].copy_from_slice(&50u16.to_le_bytes());
+  d[0x86..0x88].copy_from_slice(&180u16.to_le_bytes());
+  d[0x6c..0x70].copy_from_slice(&0.1f32.to_le_bytes());
+  d[0x70..0x74].copy_from_slice(&0.2f32.to_le_bytes());
+  d[0x74..0x78].copy_from_slice(&0.3f32.to_le_bytes());
+  d
+}
+
+/// Build a 0x100-byte Wolfbox G900 sample.
+fn build_wolfbox_sample() -> Vec<u8> {
+  let mut d = vec![0u8; 0x100];
+  for i in 0..16 {
+    d[136 + i] = b'0';
+  }
+  d[152..156].copy_from_slice(b"HYTH");
+  d[0x68..0x6c].copy_from_slice(&15u32.to_le_bytes());
+  d[0x6c..0x70].copy_from_slice(&6u32.to_le_bytes());
+  d[0x70..0x74].copy_from_slice(&2025u32.to_le_bytes());
+  d[0xa0..0xa4].copy_from_slice(&14u32.to_le_bytes());
+  d[0xa4..0xa8].copy_from_slice(&30u32.to_le_bytes());
+  d[0xa8..0xac].copy_from_slice(&45u32.to_le_bytes());
+  // Speed val/div: 25.5 knots
+  d[0x48..0x50].copy_from_slice(&25500i64.to_le_bytes());
+  d[0x50..0x58].copy_from_slice(&1000i64.to_le_bytes());
+  // Track val/div: 90.0
+  d[0x58..0x60].copy_from_slice(&9000i64.to_le_bytes());
+  d[0x60..0x68].copy_from_slice(&100i64.to_le_bytes());
+  // Lat val/div: 4737.7053
+  d[0xb0..0xb8].copy_from_slice(&47377053i64.to_le_bytes());
+  d[0xb8..0xc0].copy_from_slice(&10000i64.to_le_bytes());
+  // Lon val/div: 822.5076
+  d[0xc0..0xc8].copy_from_slice(&8225076i64.to_le_bytes());
+  d[0xc8..0xd0].copy_from_slice(&10000i64.to_le_bytes());
+  // Alt val/div: 412.5
+  d[0xe8..0xf0].copy_from_slice(&4125i64.to_le_bytes());
+  d[0xf0..0xf8].copy_from_slice(&10i64.to_le_bytes());
+  d
+}
+
 /// Build a minimal but valid `.mov` whose moov/udta carries a `GPMF` atom
 /// with a one-DVNM-record DEVC payload.
 fn build_mov_with_gpmf_in_udta() -> Vec<u8> {

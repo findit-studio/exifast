@@ -981,20 +981,20 @@ fn decode_one_sample(
     return;
   }
   // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
-  // dispatched variants. The fallback (no other Condition matches) is
-  // `gpmd_GoPro`, whose SubDirectory routes the sample bytes into
-  // `Image::ExifTool::GoPro::GPMF`. exifast's GoPro KLV parser is
-  // [`crate::formats::gopro::process_gopro`]. The Kingslim / Rove / FMAS /
-  // Wolfbox variants re-dispatch into ProcessFreeGPS / Process_text /
-  // ProcessFMAS / ProcessWolfbox — DEFERRED at the `gpmd` dispatch level
-  // (the brute-force `mdat` scan already locates Kingslim/Rove/FMAS records
-  // when they're stored in `free`/`mdat` rather than as `gpmd` samples).
+  // dispatched variants. exifast's dispatch mirrors the bundled Condition
+  // cascade in [`crate::formats::quicktime_freegps::dispatch_gpmd`]: the
+  // Kingslim D4 dashcam, Rove Stealth 4K, Vantrue N2S (FMAS), and Wolfbox
+  // G900 / Redtiger F9 4K branches feed the typed [`GpsSample`] vector via
+  // [`crate::formats::quicktime_freegps`]; the unmatched fallback routes
+  // through the GoPro KLV walker
+  // (`Image::ExifTool::GoPro::GPMF`).
   if &track.meta_format == b"gpmd" {
-    // Faithful: the GoPro fallback always fires unless another condition
-    // matches. Pass the sample bytes straight into the KLV walker — a
-    // non-GoPro `gpmd` sample (Kingslim/Rove/FMAS/Wolfbox) won't carry a
-    // valid GoPro tag so the walker will bail early via the
-    // `Unrecognized GoPro record` guard (GoPro.pm:833).
+    if crate::formats::quicktime_freegps::dispatch_gpmd(buff, out) {
+      return;
+    }
+    // Faithful: the GoPro fallback always fires when none of the dashcam
+    // conditions matched. The walker bails early via the
+    // `Unrecognized GoPro record` guard (GoPro.pm:833) on a non-GPMF sample.
     crate::formats::gopro::process_gopro(buff, gopro_out);
     return;
   }
