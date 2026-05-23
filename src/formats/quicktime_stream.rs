@@ -136,7 +136,7 @@ fn le_f64(b: &[u8], off: usize) -> Option<f64> {
 /// `ConvertLatLon` (QuickTimeStream.pl:1599-1605): convert a coordinate from
 /// `DDDMM.MMMM` (degrees*100 + decimal minutes) to decimal degrees. Works for
 /// negative coordinates (`int()` truncates toward zero, matching Perl `int`).
-fn convert_lat_lon(v: f64) -> f64 {
+pub(crate) fn convert_lat_lon(v: f64) -> f64 {
   // Perl `int($v / 100)` truncates toward zero.
   let deg = (v / 100.0) as i64 as f64;
   deg + (v - deg * 100.0) / 60.0
@@ -161,7 +161,10 @@ fn convert_lat_lon(v: f64) -> f64 {
 /// `YYYY:MM:DD HH:MM:SS[.sss]Z` string, or `None` when there is no
 /// CreateDate to anchor against (QuickTimeStream.pl:984 `if defined
 /// $sampleTime and $$value{CreateDate}`).
-fn synth_gps_date_time(create_date_raw: Option<u64>, sample_time: Option<f64>) -> Option<String> {
+pub(crate) fn synth_gps_date_time(
+  create_date_raw: Option<u64>,
+  sample_time: Option<f64>,
+) -> Option<String> {
   let create = create_date_raw?;
   let st = sample_time?;
   // $sampleTime += CreateDate (1904-epoch seconds), then to Unix epoch.
@@ -874,7 +877,7 @@ fn process_gsen(data: &[u8], out: &mut QuickTimeStreamMeta) {
 
 /// Join a 3-axis reading the way ExifTool's `"$x $y $z"` interpolation does —
 /// each component via Perl's default `%.15g` numeric stringification.
-fn join3(x: f64, y: f64, z: f64) -> String {
+pub(crate) fn join3(x: f64, y: f64, z: f64) -> String {
   let mut s = crate::value::format_g(x, 15);
   s.push(' ');
   s.push_str(&crate::value::format_g(y, 15));
