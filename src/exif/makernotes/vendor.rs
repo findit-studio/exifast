@@ -132,11 +132,6 @@ pub enum Vendor {
   /// dispatcher distinguishes it; Phase 1 surfaces as `Google` (no
   /// per-vendor decode yet).
   Google,
-  /// GoPro action cameras. The bundled dispatcher does NOT carry a
-  /// dedicated `MakerNoteGoPro` entry — GoPro MakerNotes attach via the
-  /// generic Exif IFD without a vendor signature, so identification is
-  /// by `$$self{Make}` only. Phase 4 will add the explicit signature.
-  GoPro,
   /// Hasselblad (`MakerNoteHasselblad`, `MakerNotes.pm:169-182`).
   /// Deferred long-tail.
   Hasselblad,
@@ -230,7 +225,6 @@ impl Vendor {
       Vendor::Fuji => "MakerNoteFujiFilm",
       Vendor::Ge => "MakerNoteGE",
       Vendor::Google => "MakerNoteGoogle",
-      Vendor::GoPro => "MakerNoteGoPro",
       Vendor::Hasselblad => "MakerNoteHasselblad",
       Vendor::Hp => "MakerNoteHP",
       Vendor::Isl => "MakerNoteISL",
@@ -270,9 +264,10 @@ impl Vendor {
   /// Sony — empirically confirmed against the bundled fixtures).
   ///
   /// Only the vendors that currently emit cached MakerNote tags (Phase 2:
-  /// Apple, Canon; Phase 3: Sony, Panasonic) have a distinct group here; the
-  /// rest fall back to the family-0 `"MakerNotes"` since they emit nothing at
-  /// the serializer's MakerNote site yet.
+  /// Apple, Canon; Phase 3: Sony, Panasonic; Phase 4: DJI) have a distinct
+  /// group here; the rest fall back to the family-0 `"MakerNotes"` since they
+  /// emit nothing at the serializer's MakerNote site yet (GoPro is
+  /// identification-only — bundled has no `%GoPro::Main` table).
   #[must_use]
   #[inline]
   pub const fn group1(self) -> &'static str {
@@ -281,6 +276,11 @@ impl Vendor {
       Vendor::Canon => "Canon",
       Vendor::Sony => "Sony",
       Vendor::Panasonic => "Panasonic",
+      // DJI MakerNotes route to `Image::ExifTool::DJI::Main`
+      // (`MakerNotes.pm:100`, `Name => 'MakerNoteDJI'`); the family-1
+      // group is the vendor name `DJI` (DJI.pm:56 sets only family-0
+      // `MakerNotes`), so `-G1` emits `DJI:Pitch` etc.
+      Vendor::Dji => "DJI",
       _ => "MakerNotes",
     }
   }
@@ -297,7 +297,7 @@ impl Vendor {
     match self {
       Vendor::Apple | Vendor::Canon => VendorStatus::Phase2,
       Vendor::Sony | Vendor::Panasonic => VendorStatus::Phase3,
-      Vendor::GoPro | Vendor::Dji => VendorStatus::Phase4,
+      Vendor::Dji => VendorStatus::Phase4,
       Vendor::Unknown => VendorStatus::Unknown,
       Vendor::Casio
       | Vendor::Flir
@@ -342,7 +342,6 @@ impl Vendor {
     !matches!(
       self,
       Vendor::Canon // make-only (`$$self{Make} =~ /^Canon/`)
-        | Vendor::GoPro // make-only (Phase-4 placeholder)
         | Vendor::Unknown // the catch-all
     )
   }
@@ -375,13 +374,6 @@ impl Vendor {
   #[inline(always)]
   pub const fn is_panasonic(self) -> bool {
     matches!(self, Vendor::Panasonic)
-  }
-
-  /// `true` if this is [`Vendor::GoPro`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn is_gopro(self) -> bool {
-    matches!(self, Vendor::GoPro)
   }
 
   /// `true` if this is [`Vendor::Dji`].

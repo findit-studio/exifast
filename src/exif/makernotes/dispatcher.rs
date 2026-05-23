@@ -271,6 +271,14 @@ pub fn dispatch(
     );
   }
 
+  // ----- GoPro: intentionally NOT dispatched (faithful). Bundled
+  // `MakerNotes.pm` carries NO `MakerNoteGoPro` entry, so GoPro JPEG
+  // MakerNote bytes fall through to the `Vendor::Unknown` catch-all
+  // (bundled emits `MakerNoteUnknown` + `Warning: [minor] Unrecognized
+  // MakerNotes`, verified against `t/images/GoPro.jpg`). GoPro files are
+  // identified by the standard IFD0 `Make` tag, NOT a MakerNote vendor.
+  // Do not add a `Make = "GoPro"` arm — it diverges from bundled.
+
   // ----- Hasselblad — `MakerNoteHasselblad` (`MakerNotes.pm:169-182`).
   // `$$self{Make} eq "Hasselblad"`. `Base => 0` is a LITERAL absolute 0
   // (`MakerNotes.pm:176` — the bundled comment notes "avoids warnings
@@ -2317,7 +2325,6 @@ mod tests {
     assert_eq!(Vendor::Canon.status(), VendorStatus::Phase2);
     assert_eq!(Vendor::Sony.status(), VendorStatus::Phase3);
     assert_eq!(Vendor::Panasonic.status(), VendorStatus::Phase3);
-    assert_eq!(Vendor::GoPro.status(), VendorStatus::Phase4);
     assert_eq!(Vendor::Dji.status(), VendorStatus::Phase4);
     assert_eq!(Vendor::Nikon.status(), VendorStatus::Deferred);
     assert_eq!(Vendor::Unknown.status(), VendorStatus::Unknown);
@@ -2329,9 +2336,8 @@ mod tests {
   /// Phase-tagging predicates surface every vendor's status correctly.
   #[test]
   fn signature_based_predicate() {
-    // Canon / GoPro / Unknown are make-only (no signature).
+    // Canon / Unknown are make-only (no signature).
     assert!(!Vendor::Canon.is_signature_based());
-    assert!(!Vendor::GoPro.is_signature_based());
     assert!(!Vendor::Unknown.is_signature_based());
     // The rest are signature-bearing.
     assert!(Vendor::Apple.is_signature_based());
