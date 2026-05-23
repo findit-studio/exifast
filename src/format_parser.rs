@@ -340,6 +340,13 @@ pub enum AnyParser {
   /// block; GPS row 14 is its sub-IFD, decoded through the same walker).
   #[cfg(feature = "exif")]
   Exif(crate::exif::ProcessExif),
+  /// RIFF / AVI (FORMATS.md row 26 — Resource Interchange File Format).
+  /// Walker dispatches AVI sub-tables (Info / Hdrl / Stream / Exif /
+  /// OpenDML / AVIHeader / StreamHeader / AudioFormat / inline BMP-strf
+  /// VideoFormat). WAV/WEBP carry the same outer walker but their interior
+  /// sub-tables are deferred (see `src/formats/riff.rs` module doc).
+  #[cfg(feature = "riff")]
+  Riff(crate::formats::riff::ProcessRiff),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -462,6 +469,11 @@ pub enum AnyMeta<'a> {
   /// tags (row 14) are inside this same Meta.
   #[cfg(feature = "exif")]
   Exif(crate::exif::ExifMeta<'a>),
+  /// RIFF / AVI (FORMATS.md row 26). `RiffMeta` owns its data (FourCCs are
+  /// transformed to SmolStr, dates run through `ConvertRIFFDate`); `'a` is
+  /// a phantom kept for GAT uniformity.
+  #[cfg(feature = "riff")]
+  Riff(crate::formats::riff::RiffMeta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -494,6 +506,7 @@ pub enum AnyMeta<'a> {
     feature = "mxf",
     feature = "plist",
     feature = "exif",
+    feature = "riff",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -585,6 +598,11 @@ impl AnyMeta<'_> {
       // emissions — uniform with every other format.
       #[cfg(feature = "exif")]
       AnyMeta::Exif(m) => m.tags(mode).collect(),
+      // RIFF: `tags()` yields the AVI sub-table entries (RIFF / File family-1,
+      // each leaf already rendered for the mode) in file order — uniform with
+      // every other format.
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(m) => m.tags(mode).collect(),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and yields no tags.
@@ -614,6 +632,7 @@ impl AnyMeta<'_> {
         feature = "mxf",
         feature = "plist",
         feature = "exif",
+        feature = "riff",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = mode;
@@ -1110,6 +1129,13 @@ impl AnyMeta<'_> {
         }
         Ok(())
       }
+      // RIFF emits NO `$et->Warn`/`$et->Error` for the ported AVI sub-tables:
+      // the RIFF.pm/ProcessChunks warning paths (`Bad ... data`, truncated
+      // chunks) are not modeled in the typed `RiffMeta` (every bad input is
+      // `Ok(None)` / a silently-skipped chunk), so `RiffMeta` carries no
+      // warning channel. Nothing to drain.
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(_) => Ok(()),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and drains nothing.
@@ -1138,6 +1164,7 @@ impl AnyMeta<'_> {
         feature = "mxf",
         feature = "plist",
         feature = "exif",
+        feature = "riff",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = out;
@@ -1376,6 +1403,12 @@ impl AnyMeta<'_> {
       // `Project` trait like every other arm for uniformity.
       #[cfg(feature = "plist")]
       AnyMeta::Plist(m) => crate::metadata::Project::project(m),
+      // RIFF/AVI: the container projection (AVI header dimensions, FrameCount/
+      // FrameRate duration, IDIT created, ISFT software, LIST_exif Make/Model,
+      // per-stream track-kinds) via the `Project` trait (delegating to
+      // `MediaMetadata::from_riff`).
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(m) => crate::metadata::Project::project(m),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3); it projects to the empty aggregate for exhaustiveness.
       #[cfg(not(any(
@@ -1403,6 +1436,7 @@ impl AnyMeta<'_> {
         feature = "mxf",
         feature = "plist",
         feature = "exif",
+        feature = "riff",
       )))]
       AnyMeta::_Phantom(_) => crate::metadata::MediaMetadata::new(),
     }
@@ -1528,6 +1562,16 @@ impl AnyMeta<'_> {
       // wave; the camera-metadata-core TIFF fixtures finalize as TIFF.
       #[cfg(feature = "exif")]
       AnyMeta::Exif(_) => FileTypeFinalize::Detected,
+      // RIFF: `SetFileType($type, $mime)` where `$type` is the body TYPE
+      // (RIFF.pm:2053) and `$mime` is the `%riffMimeType` lookup. The
+      // parser supplies BOTH (the MIMEs `video/x-msvideo`/`audio/x-wav`/
+      // `image/webp` are absent from the engine's generic table). The
+      // engine surfaces `File:FileType` = AVI / WAV / WEBP / LA / OFR /
+      // PAC / WV, with the matching MIME.
+      #[cfg(feature = "riff")]
+      AnyMeta::Riff(m) => {
+        FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
+      }
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -1554,6 +1598,7 @@ impl AnyMeta<'_> {
         feature = "mxf",
         feature = "plist",
         feature = "exif",
+        feature = "riff",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -1788,6 +1833,11 @@ pub enum AnyError {
   #[cfg(feature = "exif")]
   #[error("Exif: {0}")]
   Exif(#[from] crate::exif::Error),
+  /// RIFF fatal-error wrapper. Currently empty (every bad input is `Ok(None)`)
+  /// but kept for thiserror-`From` symmetry with the other formats.
+  #[cfg(feature = "riff")]
+  #[error("RIFF: {0}")]
+  Riff(#[from] crate::formats::riff::RiffError),
 }
 
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
@@ -1883,6 +1933,7 @@ impl AnyParser {
       feature = "mxf",
       feature = "plist",
       feature = "exif",
+      feature = "riff",
     )))]
     let _ = (bytes, shared, ext, header_skip, tiff_parent_type);
     // `header_skip` and `tiff_parent_type` are consumed ONLY by the `JPEG`/`TIFF`
@@ -2239,6 +2290,15 @@ impl AnyParser {
           .map(AnyMeta::Exif),
         )
       }
+      #[cfg(feature = "riff")]
+      AnyParser::Riff(p) => {
+        // RIFF is a leaf format (no chained state today): `shared` and
+        // `ext` are unused.
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Riff))
+          .map_err(Into::into)
+      }
     }
   }
 }
@@ -2338,6 +2398,14 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     // parsing is the deferred MakerNotes wave).
     #[cfg(feature = "exif")]
     "TIFF" => Some(AnyParser::Exif(crate::exif::ProcessExif)),
+    // ExifTool maps `.avi`/`.wav`/`.webp` extensions to base type `"RIFF"`
+    // via the `%fileTypeLookup` table; `detection_candidates` yields
+    // `"RIFF"` as the candidate file_type. The parser differentiates
+    // AVI/WAV/WEBP from the body TYPE bytes at offset 8 and drives the
+    // right `SetFileType($type, $mime)` via `FileTypeFinalize::
+    // ExplicitWithMime`.
+    #[cfg(feature = "riff")]
+    "RIFF" => Some(AnyParser::Riff(crate::formats::riff::ProcessRiff)),
     #[cfg(feature = "wavpack")]
     "WV" => Some(AnyParser::Wv(crate::formats::wavpack::ProcessWv)),
     _ => None,

@@ -277,6 +277,25 @@ fn crw_zero_length_records_conformance() {
 }
 
 #[test]
+fn riff_avi_conformance() {
+  // FORMATS.md row 26 — bundled `lib/Image/ExifTool/t/images/RIFF.avi`
+  // (1262 bytes, Canon MotionJPEG Camera AVI from 2003). Exercises the
+  // RIFF/AVI walker end-to-end:
+  //  - outer RIFF/AVI magic + 4-byte body TYPE (RIFF.pm:2040-2053)
+  //  - `LIST_hdrl` → `avih` (`%AVIHeader` int32u table, RIFF.pm:1076-1108)
+  //  - `LIST_strl` x2 (vids + auds), each with `strh` (`%StreamHeader`
+  //    PRIORITY=0 first-wins, RIFF.pm:1160-1248) + `strf` (`%AudioFormat`
+  //    for auds RIFF.pm:687-709; inline BMP-V3 for vids BMP.pm:36-150)
+  //  - `LIST_INFO` → `ISFT` Software (RIFF.pm:869-874)
+  //  - `IDIT` DateTimeOriginal via `ConvertRIFFDate` (RIFF.pm:1601-1619)
+  // Goldens are the bundled `perl exiftool -j -G1 -struct` output with
+  // `System:*` + `Composite:*` + `XMP-*:*` stripped (the standard uniform
+  // exclusion; Composite synthesis + XMP infra are Phase-3+ forward items).
+  check("RIFF.avi", "RIFF.avi.json", true);
+  check("RIFF.avi", "RIFF.avi.n.json", false);
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

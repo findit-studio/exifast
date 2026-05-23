@@ -121,7 +121,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// PLIST chronology's running `… → 283` figure is relative to lib/plist's
 /// older fork base; the absolute total against the live golden directory is
 /// 327 (`275 + 52`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 327;
+const EXPECTED_ACTIVE_FIXTURES: usize = 328;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -246,7 +246,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_327() {
+fn typed_serde_path_equals_writer_path_and_golden_all_328() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -1172,6 +1172,13 @@ fn typed_serde_path_equals_writer_path_and_golden_all_327() {
   //     `PLIST:TagA=v3, PLIST:TagB=v2`). `walk_tree`'s Dict branch now
   //     routes pairs through a scratch buffer + `fold_consecutive_lists`,
   //     faithful to PLIST.pm:362-378 `LastPListTag`/`LIST_TAGS`.
+  // ----- FORMATS.md row 26 (RIFF / AVI) ---------------------------------
+  // 327 → 328 after FORMATS.md row 26 lib/riff: added `RIFF.avi` (bundled
+  // t/images fixture, 1262 bytes, Canon MotionJPEG 2003 AVI) exercising
+  // the RIFF/AVI walker + sub-tables (Info / Hdrl / Stream / AVIHeader /
+  // StreamHeader / AudioFormat + inline BMP-strf VideoFormat) ported in
+  // `src/formats/riff.rs`. Golden-migrated onto the `Taggable`/`Project`
+  // engine during the rebase onto golden main.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(

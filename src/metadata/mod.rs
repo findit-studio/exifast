@@ -29,6 +29,11 @@ pub(crate) mod png;
 pub mod project;
 mod quicktime;
 mod quicktime_stream;
+// RIFF / AVI domain projection (`impl Project for RiffMeta`). Gated on the
+// `riff` feature; the module holds only the trait impl (no public items to
+// re-export).
+#[cfg(feature = "riff")]
+pub(crate) mod riff;
 
 #[cfg(feature = "crw")]
 pub use crw::{
