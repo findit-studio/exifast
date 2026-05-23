@@ -53,10 +53,18 @@ pub mod quicktime;
 pub mod quicktime_stream;
 // QuickTime SP3.5 — ProcessFreeGPS + brute-force scan (QuickTimeStream.pl
 // :1637-2484, :3679-3789). Self-contained camera-variant decoders; vendor-
-// module dispatches (GoPro GPMF, Sony rtmd, Canon CTMD, LigoGPS, full camm)
-// are stubbed.
+// module dispatches (Sony rtmd, Canon CTMD, LigoGPS, full camm) are
+// stubbed; GoPro GPMF wires through to [`gopro`] (SP4).
 #[cfg(feature = "quicktime")]
 pub mod quicktime_freegps;
+// GoPro SP4 — GPMF KLV parser + the GPS family of GoPro.pm tag tables.
+// Reached either via the QuickTime ProcessFreeGPS brute-force scan (GoPro
+// `GP\x06\0\0` records in `mdat`) or via the `gpmd` timed-metadata sample
+// dispatch (`Image::ExifTool::GoPro::GPMF` SubDirectory). Gated on the
+// `quicktime` feature — there is no separate GoPro file type, GoPro
+// metadata is always reached through a QuickTime container.
+#[cfg(feature = "quicktime")]
+pub mod gopro;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]

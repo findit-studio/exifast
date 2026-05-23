@@ -924,6 +924,7 @@ fn process_samples(
   track: &StreamTrack,
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut crate::metadata::GoProMeta,
 ) {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -940,7 +941,7 @@ fn process_samples(
     if buff.is_empty() {
       continue;
     }
-    decode_one_sample(buff, track, sample, create_date_raw, out);
+    decode_one_sample(buff, track, sample, create_date_raw, out, gopro_out);
   }
 }
 
@@ -952,6 +953,7 @@ fn decode_one_sample(
   sample: &Sample,
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut crate::metadata::GoProMeta,
 ) {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -960,9 +962,27 @@ fn decode_one_sample(
     process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
     return;
   }
-  // `gpmd` GoPro / Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
-  // DEFERRED — these re-dispatch into other ExifTool modules (GoPro.pm,
-  // Sony.pm, Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
+  // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
+  // dispatched variants. The fallback (no other Condition matches) is
+  // `gpmd_GoPro`, whose SubDirectory routes the sample bytes into
+  // `Image::ExifTool::GoPro::GPMF`. exifast's GoPro KLV parser is
+  // [`crate::formats::gopro::process_gopro`]. The Kingslim / Rove / FMAS /
+  // Wolfbox variants re-dispatch into ProcessFreeGPS / Process_text /
+  // ProcessFMAS / ProcessWolfbox — DEFERRED at the `gpmd` dispatch level
+  // (the brute-force `mdat` scan already locates Kingslim/Rove/FMAS records
+  // when they're stored in `free`/`mdat` rather than as `gpmd` samples).
+  if &track.meta_format == b"gpmd" {
+    // Faithful: the GoPro fallback always fires unless another condition
+    // matches. Pass the sample bytes straight into the KLV walker — a
+    // non-GoPro `gpmd` sample (Kingslim/Rove/FMAS/Wolfbox) won't carry a
+    // valid GoPro tag so the walker will bail early via the
+    // `Unrecognized GoPro record` guard (GoPro.pm:833).
+    crate::formats::gopro::process_gopro(buff, gopro_out);
+    return;
+  }
+  // Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
+  // DEFERRED — these re-dispatch into other ExifTool modules (Sony.pm,
+  // Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
   // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
   // as ExifTool's "Unknown $type format" branch (QuickTimeStream.pl:1547).
   let _ = (buff, create_date_raw, &track.handler);
@@ -1146,7 +1166,11 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// Returns an empty [`QuickTimeStreamMeta`] for the common case of a video
 /// with no timed metadata (or only deferred-format metadata).
 #[must_use]
-pub(crate) fn extract_stream(data: &[u8], create_date_raw: Option<u64>) -> QuickTimeStreamMeta {
+pub(crate) fn extract_stream(
+  data: &[u8],
+  create_date_raw: Option<u64>,
+  gopro_out: &mut crate::metadata::GoProMeta,
+) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
   // `moov`-level `gps ` box; the `gps0`/`gsen`/`GPS ` magic boxes are
@@ -1159,7 +1183,7 @@ pub(crate) fn extract_stream(data: &[u8], create_date_raw: Option<u64>) -> Quick
     };
     let body_end = pe.min(data.len());
     match &t {
-      b"moov" => walk_moov(data, ps, body_end, create_date_raw, &mut out),
+      b"moov" => walk_moov(data, ps, body_end, create_date_raw, &mut out, gopro_out),
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       b"gps0" => process_gps0(&data[ps..body_end], &mut out),
       // Top-level DuDuBell / VSYS `gsen` (3-byte accelerometer triples).
@@ -1189,6 +1213,7 @@ fn walk_moov(
   end: usize,
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut crate::metadata::GoProMeta,
 ) {
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
@@ -1198,7 +1223,7 @@ fn walk_moov(
         // Only metadata-bearing handlers feed `ProcessSamples`
         // (QuickTimeStream.pl:1315-1331 — `vide`/`soun` are hash-only).
         if is_meta_handler(&track.handler) {
-          process_samples(data, &track, create_date_raw, out);
+          process_samples(data, &track, create_date_raw, out, gopro_out);
         }
       }
       // The `moov`-level Novatek `gps ` box (`%eeBox` `'gps ' => 'moov'`,
@@ -1439,8 +1464,10 @@ mod tests {
     let moov = atom(b"moov", &mvhd);
     let mut data = ftyp;
     data.extend_from_slice(&moov);
-    let meta = extract_stream(&data, None);
+    let mut gp = crate::metadata::GoProMeta::new();
+    let meta = extract_stream(&data, None, &mut gp);
     assert!(meta.is_empty());
+    assert!(gp.is_empty());
   }
 
   #[test]

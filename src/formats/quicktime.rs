@@ -53,8 +53,8 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::{quicktime_freegps, quicktime_stream},
-  metadata::{MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
+  formats::{gopro, quicktime_freegps, quicktime_stream},
+  metadata::{GoProMeta, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
   value::format_g,
 };
 
@@ -1367,6 +1367,11 @@ pub struct Meta<'a> {
   /// (`Image::ExifTool::QuickTime::Stream`, QuickTimeStream.pl). Empty for a
   /// video with no timed metadata (the common case).
   stream: QuickTimeStreamMeta,
+  /// **SP4** — the decoded GoPro GPMF metadata. Reached either through the
+  /// `gpmd` timed-metadata sample dispatch or the brute-force `GP\x06\0\0`
+  /// scan in `mdat` (see [`crate::formats::gopro`]). Empty
+  /// ([`GoProMeta::is_empty`]) for a non-GoPro video.
+  gopro: GoProMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1419,6 +1424,16 @@ impl Meta<'_> {
     &self.stream
   }
 
+  /// **SP4** — the decoded GoPro GPMF metadata. [`GoProMeta::is_empty`] for
+  /// a non-GoPro video (or one whose GoPro records were not located by
+  /// either the timed-metadata `gpmd` dispatch or the brute-force
+  /// `GP\x06\0\0` `mdat` scan).
+  #[must_use]
+  #[inline(always)]
+  pub const fn gopro(&self) -> &GoProMeta {
+    &self.gopro
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1430,16 +1445,27 @@ impl Meta<'_> {
   /// Build the normalized [`crate::metadata::MediaMetadata`] projection from
   /// this faithful-parse layer. SP1 populates the `MediaInfo` basics
   /// (duration / dimensions / created / track kinds); **SP3** fills
-  /// [`crate::metadata::GpsLocation`] from the FIRST embedded
-  /// timed-metadata GPS fix. Camera / lens / capture stay `None` for SP2+
-  /// and the embedded-Exif hop to fill.
+  /// [`crate::metadata::GpsLocation`] from the FIRST embedded timed-metadata
+  /// GPS fix; **SP4** fills [`crate::metadata::CameraInfo`] AND
+  /// [`crate::metadata::GpsLocation`] from the decoded GoPro GPMF (model,
+  /// serial, firmware, GPS samples). Lens / capture stay `None` for SP2+ and
+  /// the embedded-Exif hop to fill.
   #[must_use]
   #[inline(always)]
   pub fn media_metadata(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::MetaProjectInto;
     let mut md = crate::metadata::MediaMetadata::from_quicktime(&self.qt);
-    // SP3: project the first GPS fix from the embedded timed metadata into
-    // the normalized GpsLocation domain.
-    if let Some(fix) = self.stream.first_fix() {
+    // The per-port projection seam: each `XxxMeta` writes its own Camera /
+    // Lens / GPS / Capture / warning contribution into `md` via
+    // `MetaProjectInto`. Order ENCODES the cross-format priority chain
+    // (highest-priority FIRST — each port no-ops if a higher-priority
+    // source already populated the domain it would write).
+    self.gopro.project_into(&mut md);
+    // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
+    // populates when no higher-priority source set `md.gps()`.
+    if md.gps().is_none()
+      && let Some(fix) = self.stream.first_fix()
+    {
       let mut gps = crate::metadata::GpsLocation::new();
       gps
         .update_latitude(fix.latitude())
@@ -1783,7 +1809,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // via `qt`'s stored Duration timescale-count is unrelated; instead the
   // stream walker is given the raw CreateDate it can recover from the file.
   let create_date_raw = first_moov_create_date_raw(data);
-  let mut stream = quicktime_stream::extract_stream(data, create_date_raw);
+  // **SP4** — the GoPro `gpmd` MetaFormat dispatch in [`quicktime_stream`]
+  // fills `gopro_meta` for each GoPro-style timed-metadata sample. The
+  // same meta is then ALSO populated by the brute-force `GP\x06\0\0`
+  // scan below (some GoPro firmware writes unreferenced GPMF records in
+  // `mdat` outside of a metadata track) and by the moov-level `GPMF`
+  // atom walk after the freeGPS scan.
+  let mut gopro_meta = GoProMeta::new();
+  let mut stream = quicktime_stream::extract_stream(data, create_date_raw, &mut gopro_meta);
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -1792,9 +1825,23 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // `moov`-level `gps ` table). The freeGPS scan also captures samples that
   // live OUTSIDE timed-metadata tracks (action-cams, dashcams, drones with
   // padding-buried GPS) — see `quicktime_freegps`.
+  //
+  // **SP4** — the brute-force scanner ALSO reports GoPro `GP\x06\0\0`
+  // records (QuickTimeStream.pl:3717-3748); each one re-dispatches into
+  // `Image::ExifTool::GoPro::ProcessGP6` which parses the contained GPMF
+  // KLV. exifast routes both through this single call: `scan_media_data`
+  // now appends to the freeGPS-style stream samples AND fills `gopro`.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = !stream.is_empty();
-    quicktime_freegps::scan_media_data(data, off, size, create_date_raw, already, &mut stream);
+    quicktime_freegps::scan_media_data(
+      data,
+      off,
+      size,
+      create_date_raw,
+      already,
+      &mut stream,
+      &mut gopro_meta,
+    );
   }
 
   // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
@@ -1805,15 +1852,87 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // DEFERRED: wire exif::parse_exif_block once #36 (Exif+GPS) merges.
   let embedded_exif_deferred = detect_embedded_exif(data);
 
+  // **SP4** — also walk a moov-level `GPMF` atom (QuickTime.pm:2132-2135)
+  // when present, populating `gopro_meta` from the udta/GPMF body. Some
+  // GoPro photo files (APP6 in JPEG) and some MP4s carry the GPMF block
+  // outside of `gpmd` timed metadata; the dedicated atom path catches them.
+  if let Some(gpmf_payload) = find_udta_gpmf(data) {
+    gopro::process_gopro(gpmf_payload, &mut gopro_meta);
+  }
+
   Ok(Some(Meta {
     qt,
     stream,
+    gopro: gopro_meta,
     embedded_exif_deferred,
     file_type,
     mime,
     warning,
     _marker: core::marker::PhantomData,
   }))
+}
+
+/// Locate a moov-level / file-level `GPMF` atom and return its payload
+/// slice (QuickTime.pm:2132-2135). Faithful: the `GPMF` atom can appear
+/// either as a child of `moov/udta` (the standard QuickTime user-data
+/// path) or as a sibling of `moov` at the file root in some GoPro
+/// firmware variants. Returns `None` when no `GPMF` atom is found.
+fn find_udta_gpmf(data: &[u8]) -> Option<&[u8]> {
+  // Walk the top-level box list looking for `moov`; inside `moov`, walk
+  // the children looking for `udta`; inside `udta` walk for `GPMF`. We
+  // also opportunistically check for `GPMF` as a direct child of `moov`.
+  let moov = find_top_level_box(data, *b"moov")?;
+  if let Some(g) = find_top_level_box(moov, *b"GPMF") {
+    return Some(g);
+  }
+  let udta = find_top_level_box(moov, *b"udta")?;
+  find_top_level_box(udta, *b"GPMF")
+}
+
+/// Walk a flat list of QuickTime atoms in `buf` and return the payload of
+/// the first one matching `tag`. Returns `None` on a truncated or empty
+/// buffer / when no atom with that tag is present.
+fn find_top_level_box(buf: &[u8], tag: [u8; 4]) -> Option<&[u8]> {
+  let mut pos = 0usize;
+  while pos + 8 <= buf.len() {
+    let size = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+    let mut t = [0u8; 4];
+    t.copy_from_slice(&buf[pos + 4..pos + 8]);
+    let (body_start, body_end, next) = if size == 1 {
+      // 64-bit size at bytes 8..16.
+      if pos + 16 > buf.len() {
+        return None;
+      }
+      let ext = u64::from_be_bytes([
+        buf[pos + 8],
+        buf[pos + 9],
+        buf[pos + 10],
+        buf[pos + 11],
+        buf[pos + 12],
+        buf[pos + 13],
+        buf[pos + 14],
+        buf[pos + 15],
+      ]) as usize;
+      if ext < 16 {
+        return None;
+      }
+      (pos + 16, pos + ext, pos + ext)
+    } else if size == 0 {
+      (pos + 8, buf.len(), buf.len())
+    } else if size < 8 {
+      return None;
+    } else {
+      (pos + 8, pos + size, pos + size)
+    };
+    if body_end > buf.len() {
+      return None;
+    }
+    if t == tag {
+      return Some(&buf[body_start..body_end]);
+    }
+    pos = next;
+  }
+  None
 }
 
 /// Recover the FIRST `moov`/`mvhd` CreateDate as the RAW 1904-epoch second

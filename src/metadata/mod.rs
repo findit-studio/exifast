@@ -22,11 +22,13 @@
 //! deliberately extensible.
 
 mod domain;
+mod gopro;
 mod quicktime;
 mod quicktime_stream;
 
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, MetaProjectInto,
 };
+pub use gopro::{GoProGpsSample, GoProMeta};
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};

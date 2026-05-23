@@ -93,8 +93,11 @@ use alloc::{
 use smol_str::SmolStr;
 
 use crate::{
-  formats::quicktime_stream::{convert_lat_lon, join3},
-  metadata::{GpsSample, QuickTimeStreamMeta},
+  formats::{
+    gopro,
+    quicktime_stream::{convert_lat_lon, join3},
+  },
+  metadata::{GoProMeta, GpsSample, QuickTimeStreamMeta},
 };
 
 // ── conversion factors (QuickTimeStream.pl:73-75) ──────────────────────────
@@ -180,6 +183,7 @@ pub fn scan_media_data(
   create_date_raw: Option<u64>,
   already_found_embedded: bool,
   out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut GoProMeta,
 ) {
   // QuickTimeStream.pl:3689 `return if $$et{FoundEmbedded} or not $dataPos`.
   if already_found_embedded || mdat_offset == 0 {
@@ -235,11 +239,30 @@ pub fn scan_media_data(
         }
         MagicKind::GoPro => {
           // QuickTimeStream.pl:3717-3748: a GoPro `GP\x06\0\0` record
-          // re-dispatches into Image::ExifTool::GoPro::ProcessGP6.
-          // DEFERRED: port the GoPro GPMF module separately.
-          // We must still advance past this byte to avoid an infinite
-          // re-match.
-          search_off = abs + 5;
+          // re-dispatches into Image::ExifTool::GoPro::ProcessGP6 (GoPro.pm:
+          // 783-803). exifast's port is in [`crate::formats::gopro`]: the
+          // contained record (a GPMF KLV starting `DEVC`) goes through the
+          // recursive KLV walker.
+          //
+          // QuickTimeStream.pl:3731 calls `ProcessGP6($et, { RAF => $raf,
+          // DirLen => $maxLen })` with the REST of the media-data slice from
+          // this magic onward, and the function returns the byte count it
+          // consumed. Mirror that — pass `&mdat[pos+abs..]` so `process_gp6`
+          // can walk consecutive `GP\x06\0\0` records as a sequence.
+          let consumed = gopro::process_gp6(&mdat[pos + abs..], gopro_out);
+          if consumed > 0 {
+            // QuickTimeStream.pl:3739 `Seek($start + $size)` — advance the
+            // outer loop past the consumed records. consumed == 0 means
+            // the record didn't validate; ExifTool's fallback is to
+            // continue with the search (3743-3745 `Seek($filePos);
+            // $buf2 = substr($buff, $buffPos)`).
+            search_off = abs + consumed;
+            found = true;
+          } else {
+            // Fallback: advance past the 5-byte magic to avoid an
+            // infinite re-match.
+            search_off = abs + 5;
+          }
         }
       }
     }
@@ -2126,16 +2149,28 @@ mod tests {
     file.extend_from_slice(&[0u8; 100]);
 
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat_size, None, false, &mut out);
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
     assert_eq!(out.gps_samples().len(), 1);
+    assert!(gp.is_empty());
   }
 
   #[test]
   fn scan_media_data_short_circuits_when_embedded_found() {
     let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
     let file = vec![0u8; 0x10000];
-    scan_media_data(&file, 0, file.len() as u64, None, true, &mut out);
+    scan_media_data(&file, 0, file.len() as u64, None, true, &mut out, &mut gp);
     assert!(out.is_empty());
+    assert!(gp.is_empty());
   }
 
   #[test]
