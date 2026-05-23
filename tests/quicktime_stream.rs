@@ -1489,3 +1489,161 @@ fn quicktime_no_insta360_trailer_leaves_meta_empty() {
     .expect("recognized");
   assert!(meta.insta360().is_empty());
 }
+
+// ===========================================================================
+// SP4 — LigoGPS dashcam vendor GPS module + trailer (LigoGPS.pm:1-431,
+// QuickTime.pm:9906-9907 + :10658-10668)
+// ===========================================================================
+
+/// Build a minimal `.mov` with a LigoGPS `&&&& `-prefixed trailer carrying
+/// one plain-ASCII (Redtiger F9 4K format) record. The trailer layout
+/// (QuickTime.pm:10658-10668) is:
+///
+///   [base file: ftyp + moov + mdat]
+///   [trailer body:
+///     [skip atom header: size:u32-BE = body_len, "skip"]
+///     [LIGOGPSINFO\0]
+///     [8 more bytes of preamble incl. \0\0\0\x14 at offset 12]
+///     [0x84 bytes of plain-ASCII record]
+///   ]
+///   [&&&& : 4 bytes]
+///   [trailer_len : u32-LE]
+fn build_mov_with_ligogps_trailer(record_text: &[u8]) -> Vec<u8> {
+  // Reuse the minimal ftyp+moov+mdat from `build_mov_with_freegps_in_mdat`
+  // but discard the freeGPS block so the file is truly plain QuickTime.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  let mut moov = (mvhd_atom.len() as u32 + 8).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  moov.extend_from_slice(&mvhd_atom);
+  let mdat_payload = vec![0u8; 16];
+  let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(&mdat_payload);
+
+  // Build the trailer payload: LIGOGPSINFO\0 + 8-byte preamble + 0x84 rec.
+  let mut payload = Vec::new();
+  payload.extend_from_slice(b"LIGOGPSINFO\0");
+  // 8 more preamble bytes: bytes [pos-8..pos-4] (pos = 0x14) = [0,0,0,0x14]
+  // triggers the LigoGPS no_fuzz auto-detect for the BlueSkySea-style
+  // firmware (LigoGPS.pm:299).
+  payload.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]);
+  // Build one 0x84-byte record. First 4 bytes are the counter; rest is
+  // the ASCII text payload (null-padded to 0x84).
+  let mut record = Vec::with_capacity(0x84);
+  record.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+  record.extend_from_slice(record_text);
+  while record.len() < 0x84 {
+    record.push(0);
+  }
+  payload.extend_from_slice(&record);
+
+  // Trailer body: skip atom header + payload.
+  let body_len = 8usize + payload.len();
+  let mut body = Vec::with_capacity(body_len);
+  body.extend_from_slice(&(body_len as u32).to_be_bytes());
+  body.extend_from_slice(b"skip");
+  body.extend_from_slice(&payload);
+
+  let trailer_len = (body.len() + 8) as u32;
+
+  // Assemble the file.
+  let mut file = ftyp;
+  file.extend_from_slice(&moov);
+  file.extend_from_slice(&mdat);
+  file.extend_from_slice(&body);
+  file.extend_from_slice(b"&&&&");
+  file.extend_from_slice(&trailer_len.to_le_bytes());
+  file
+}
+
+#[test]
+fn quicktime_ligogps_trailer_decodes_plain_ascii_record() {
+  // The Redtiger F9 4K plain-ASCII record format: `[4 bytes counter]
+  // YYYY/MM/DD HH:MM:SS [NS]:lat [EW]:lon spd [optional " km/h"]`.
+  let data = build_mov_with_ligogps_trailer(
+    b"2024/06/15 14:30:00 N:45.500 W:120.500 50.0 km/h A:90.0 H:100.0 x:0 y:0 z:0",
+  );
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let ligo = meta.ligogps();
+  assert!(!ligo.is_empty(), "ligogps() must populate");
+  let s = ligo.samples().first().expect("decoded sample");
+  assert_eq!(s.date_time(), Some("2024:06:15 14:30:00"));
+  assert_eq!(s.latitude(), Some(45.5));
+  assert_eq!(s.longitude(), Some(-120.5));
+  assert_eq!(s.speed_kph(), Some(50.0));
+  assert_eq!(s.track_deg(), Some(90.0));
+  assert_eq!(s.altitude_m(), Some(100.0));
+}
+
+#[test]
+fn quicktime_ligogps_trailer_projects_gps_location() {
+  // The decoded sample's lat/lon/altitude/timestamp must surface through
+  // `MediaMetadata::gps()`. Date format in the record body is YYYY/MM/DD
+  // (LigoGPS.pm:244 `tr|/|:|` normalises it to YYYY:MM:DD on output).
+  let data =
+    build_mov_with_ligogps_trailer(b"2024/01/15 10:00:00 N:35.000 E:139.000 30.0 km/h H:50.0");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation from LigoGPS");
+  assert!((gps.latitude().unwrap() - 35.000).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 139.000).abs() < 1e-9);
+  assert!((gps.altitude_m().unwrap() - 50.0).abs() < 1e-9);
+  assert_eq!(gps.timestamp(), Some("2024:01:15 10:00:00"));
+}
+
+#[test]
+fn quicktime_no_ligogps_trailer_leaves_meta_empty() {
+  // A plain QuickTime file (no LigoGPS trailer) must have an empty
+  // `ligogps()` meta. The signature check is a 4-byte compare at offset
+  // EOF-8.
+  let data = build_mov_with_freegps_in_mdat();
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  assert!(meta.ligogps().is_empty());
+}
+
+#[test]
+fn quicktime_ligogps_trailer_with_explicit_south_latitude() {
+  // S = negative latitude (LigoGPS.pm:258).
+  let data =
+    build_mov_with_ligogps_trailer(b"2024/12/25 23:59:59 S:33.865 E:151.209 80.0 km/h H:25.0");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let s = meta.ligogps().samples().first().expect("sample");
+  // Latitude is negative (S).
+  assert_eq!(s.latitude(), Some(-33.865));
+  // Longitude is positive (E).
+  assert_eq!(s.longitude(), Some(151.209));
+}
+
+#[test]
+fn quicktime_ligogps_trailer_short_file_silent() {
+  // A file shorter than 40 bytes can't carry the trailer signature; the
+  // scan_trailer fast-path returns silently without warning.
+  let data = vec![0u8; 30];
+  // Must use parse_borrowed direct since this isn't a real QT file.
+  let meta = exifast::formats::quicktime::parse_borrowed(&data).expect("parse ok");
+  assert!(
+    meta.is_none(),
+    "30-byte all-zero data isn't recognised as QT"
+  );
+}

@@ -197,6 +197,35 @@ pub fn scan_media_data(
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut GoProMeta,
 ) {
+  scan_media_data_with_ligo(
+    data,
+    mdat_offset,
+    mdat_size,
+    create_date_raw,
+    already_found_embedded,
+    out,
+    gopro_out,
+    None,
+  );
+}
+
+/// [`scan_media_data`] variant that additionally accepts a
+/// [`LigoGpsMeta`] accumulator — when a `freeGPS` block triggers the
+/// `LIGOGPSINFO\0` fingerprint hit
+/// (QuickTimeStream.pl:1843-1888) it is dispatched into
+/// [`crate::formats::ligogps::process_ligogps_with_scale`] via
+/// [`process_free_gps_with_ligo`].
+#[allow(clippy::too_many_arguments)]
+pub fn scan_media_data_with_ligo(
+  data: &[u8],
+  mdat_offset: u64,
+  mdat_size: u64,
+  create_date_raw: Option<u64>,
+  already_found_embedded: bool,
+  out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut GoProMeta,
+  mut ligogps_out: Option<&mut crate::metadata::LigoGpsMeta>,
+) {
   // QuickTimeStream.pl:3689 `return if $$et{FoundEmbedded} or not $dataPos`.
   if already_found_embedded || mdat_offset == 0 {
     return;
@@ -244,7 +273,7 @@ pub fn scan_media_data(
           }
           let block = &chunk[abs..abs + len];
           // QuickTimeStream.pl:3777-3778: pass DataPt=&block, DirLen=len.
-          process_free_gps(block, create_date_raw, out);
+          process_free_gps_with_ligo(block, create_date_raw, out, ligogps_out.as_deref_mut());
           found = true;
           // QuickTimeStream.pl:3781 `$pos += $len`.
           search_off = abs + len;
@@ -387,7 +416,26 @@ fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
 ///
 /// QuickTimeStream.pl:1645 `return 0 if $dirLen < 82` — a block too short to
 /// carry any fingerprint is silently dropped.
-pub fn process_free_gps(data: &[u8], _create_date_raw: Option<u64>, out: &mut QuickTimeStreamMeta) {
+///
+/// Back-compat wrapper around [`process_free_gps_with_ligo`] for callers
+/// that don't have a [`LigoGpsMeta`] accumulator at hand. The LigoGPS
+/// fingerprint (`LIGOGPSINFO\0`) is silently dropped in this path — the
+/// trailer-only LigoGPS reach path covers the common case.
+pub fn process_free_gps(data: &[u8], create_date_raw: Option<u64>, out: &mut QuickTimeStreamMeta) {
+  process_free_gps_with_ligo(data, create_date_raw, out, None);
+}
+
+/// [`process_free_gps`] variant that additionally accepts a
+/// [`LigoGpsMeta`] accumulator. When the GPSType 5 (LigoGPS)
+/// fingerprint is hit (QuickTimeStream.pl:1843), the block is
+/// dispatched to [`crate::formats::ligogps::process_ligogps_with_scale`]
+/// with the per-offset scale rule from QuickTimeStream.pl:1886.
+pub fn process_free_gps_with_ligo(
+  data: &[u8],
+  _create_date_raw: Option<u64>,
+  out: &mut QuickTimeStreamMeta,
+  ligogps_out: Option<&mut crate::metadata::LigoGpsMeta>,
+) {
   // QuickTimeStream.pl:1645
   if data.len() < 82 {
     return;
@@ -419,12 +467,27 @@ pub fn process_free_gps(data: &[u8], _create_date_raw: Option<u64>, out: &mut Qu
     return;
   }
 
-  // GPSType 5: LigoGPS — DEFERRED.
-  // (QuickTimeStream.pl:1843-1904). Detected by `LIGOGPSINFO\0` at offset
-  // 16/48/80. We DETECT the fingerprint here to match the dispatch, but the
-  // actual parse needs `Image::ExifTool::LigoGPS::ProcessLigoGPS`.
-  if detect_type5_ligogps(data).is_some() {
-    // DEFERRED: port the LigoGPS module separately.
+  // GPSType 5: LigoGPS embedded-in-freeGPS path.
+  // (QuickTimeStream.pl:1843-1888). Detected by `LIGOGPSINFO\0` at offset
+  // 16/48/80; dispatch to `Image::ExifTool::LigoGPS::ProcessLigoGPS`.
+  // The offset-16 + `\xf0\x03\0\0...{16}\0{4}` fingerprint sets the
+  // ABASK A8 4K scale = 3 (QuickTimeStream.pl:1886).
+  if let Some(off) = detect_type5_ligogps(data) {
+    if let Some(ligo_meta) = ligogps_out {
+      // QuickTimeStream.pl:1886 — scale = 3 when offset = 16 AND the
+      // `\xf0\x03\0\0`+20-zero-bytes Rexing/ABASK fingerprint matches.
+      let scale_id = if off == 16
+        && data.len() >= 32
+        && data.get(12..16) == Some(&[0xf0, 0x03, 0x00, 0x00])
+        && data.get(32..36) == Some(&[0x00, 0x00, 0x00, 0x00])
+      {
+        Some(3)
+      } else {
+        None
+      };
+      // QuickTimeStream.pl:1883 — `DirStart = $pos` (i.e. `off`).
+      crate::formats::ligogps::process_ligogps_with_scale(data, off, ligo_meta, false, scale_id);
+    }
     return;
   }
 

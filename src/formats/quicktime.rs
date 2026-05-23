@@ -53,10 +53,12 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::{gopro, insta360 as insta360_fmt, quicktime_freegps, quicktime_stream},
+  formats::{
+    gopro, insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
+  },
   metadata::{
-    CammMeta, CanonCtmdMeta, GoProMeta, Insta360Meta, MediaTrack, ParrotMeta, QuickTimeMeta,
-    QuickTimeStreamMeta, SonyRtmdMeta,
+    CammMeta, CanonCtmdMeta, GoProMeta, Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta,
+    QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::format_g,
 };
@@ -1412,6 +1414,17 @@ pub struct Meta<'a> {
   /// the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
   /// `V3`/`TimeStamp` (Parrot.pm:86-551).
   parrot: ParrotMeta,
+  /// **SP4** — LigoGPS dashcam vendor GPS records. Decoded via TWO
+  /// faithful entry points: (a) the `&&&& `-prefixed trailer at file
+  /// EOF (QuickTime.pm:9906-9907 + 10658-10668) — populated by
+  /// [`ligogps_fmt::scan_trailer`]; (b) the freeGPS-embedded sample
+  /// dispatch (QuickTimeStream.pl:1843-1888) — populated by
+  /// [`quicktime_freegps::process_free_gps`] which calls
+  /// [`ligogps_fmt::process_ligogps_with_scale`] on a `LIGOGPSINFO\0`
+  /// fingerprint hit. Empty ([`LigoGpsMeta::is_empty`]) for a non-
+  /// LigoGPS file. Faithful port of `Image::ExifTool::LigoGPS`
+  /// (LigoGPS.pm:1-431).
+  ligogps: LigoGpsMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1544,6 +1557,23 @@ impl Meta<'_> {
     &self.parrot
   }
 
+  /// **SP4** — LigoGPS dashcam vendor GPS records.
+  /// [`LigoGpsMeta::is_empty`] for a non-LigoGPS file (or one whose
+  /// trailer / embedded fingerprint is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::LigoGPS` (LigoGPS.pm:1-431).
+  /// Reached through TWO paths:
+  ///  - the `&&&& `-prefixed trailer at file EOF (QuickTime.pm:9906-9907 +
+  ///    :10658-10668) — populated by [`ligogps_fmt::scan_trailer`];
+  ///  - the freeGPS-embedded sample dispatch (QuickTimeStream.pl:1843-
+  ///    1888) — populated by [`quicktime_freegps::process_free_gps`]
+  ///    when it detects `LIGOGPSINFO\0` at offset 16/48/80.
+  #[must_use]
+  #[inline(always)]
+  pub const fn ligogps(&self) -> &LigoGpsMeta {
+    &self.ligogps
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1593,6 +1623,13 @@ impl Meta<'_> {
         .update_timestamp(fix.date_time().map(str::to_string));
       md.set_gps(gps);
     }
+    // LigoGPS sits at the SAME tier as the SP3 stream — dashcam vendor
+    // GPS (best-effort brute-force-scan) projects AFTER everything
+    // else. The freeGPS embedded path already routes its decoded
+    // LigoGPS samples through this same field (see
+    // [`quicktime_freegps::process_free_gps`]), so this projection
+    // covers both the trailer + embedded sources.
+    self.ligogps.project_into(&mut md);
     md
   }
 }
@@ -1978,9 +2015,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // `Image::ExifTool::GoPro::ProcessGP6` which parses the contained GPMF
   // KLV. exifast routes both through this single call: `scan_media_data`
   // now appends to the freeGPS-style stream samples AND fills `gopro`.
+  // The LigoGpsMeta accumulator is declared HERE because both the
+  // brute-force `freeGPS` scan (below) AND the file-end trailer scan
+  // (further below) populate it. Most files leave it empty
+  // (`LigoGpsMeta::is_empty() == true`).
+  let mut ligogps_meta = crate::metadata::LigoGpsMeta::new();
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = !stream.is_empty();
-    quicktime_freegps::scan_media_data(
+    quicktime_freegps::scan_media_data_with_ligo(
       data,
       off,
       size,
@@ -1988,6 +2030,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
       already,
       &mut stream,
       &mut gopro_meta,
+      Some(&mut ligogps_meta),
     );
   }
 
@@ -2020,6 +2063,20 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   let mut insta360_meta = crate::metadata::Insta360Meta::new();
   insta360_fmt::scan_trailer(data, &mut insta360_meta);
 
+  // **SP4** — LigoGPS dashcam trailer (QuickTime.pm:9906-9907 +
+  // :10658-10668). Identified by `&&&& ` at bytes 32..36 of the
+  // 40-byte EOF buffer, followed by a 4-byte LE u32 trailer length.
+  // The trailer body begins with an 8-byte `skip` atom header and a
+  // `LIGOGPSINFO\0`-prefixed payload. `scan_trailer` is a no-op when
+  // the signature is absent — cost is one 4-byte compare per non-
+  // LigoGPS file.
+  //
+  // The freeGPS-embedded LigoGPS path (`LIGOGPSINFO\0` at offset
+  // 16/48/80 inside a freeGPS atom) is wired separately above through
+  // [`quicktime_freegps::scan_media_data_with_ligo`] which populates
+  // THIS same `ligogps_meta` holder when it detects the fingerprint.
+  ligogps_fmt::scan_trailer(data, &mut ligogps_meta);
+
   Ok(Some(Meta {
     qt,
     stream,
@@ -2029,6 +2086,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     canon_ctmd: canon_ctmd_meta,
     insta360: insta360_meta,
     parrot: parrot_meta,
+    ligogps: ligogps_meta,
     embedded_exif_deferred,
     file_type,
     mime,

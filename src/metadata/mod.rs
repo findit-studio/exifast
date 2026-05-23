@@ -26,6 +26,7 @@ mod canon_ctmd;
 mod domain;
 mod gopro;
 mod insta360;
+mod ligogps;
 mod parrot;
 mod quicktime;
 mod quicktime_stream;
@@ -38,6 +39,7 @@ pub use domain::{
 };
 pub use gopro::{GoProGpsSample, GoProMeta};
 pub use insta360::{Insta360ExposureSample, Insta360GpsSample, Insta360Identity, Insta360Meta};
+pub use ligogps::{LigoGpsMeta, LigoGpsSample};
 pub use parrot::{
   ParrotFlightSample, ParrotFlyingState, ParrotGpsSample, ParrotMeta, ParrotPilotingMode,
   ParrotRecordVersion,

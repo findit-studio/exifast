@@ -91,6 +91,21 @@ pub mod canon_ctmd;
 // Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod insta360;
+// LigoGPS — dashcam vendor GPS module. Faithful port of
+// `Image::ExifTool::LigoGPS` (LigoGPS.pm:1-431). Reached via TWO paths:
+//   (a) the `&&&& `-prefixed trailer at file EOF (QuickTime.pm:9906-9907
+//       + 10658-10668) — `IdentifyTrailers` matches `/\&\&\&\&(.{4})$/`
+//       at EOF-40, the trailer body begins `[size:u32-BE][skip]
+//       [LIGOGPSINFO\0...]`.
+//   (b) the freeGPS-embedded sample dispatch (QuickTimeStream.pl
+//       :1843-1888) — `LIGOGPSINFO\0` at offset 16/48/80 inside a
+//       freeGPS block. Wired through `quicktime_freegps::process_free_gps`.
+// Records are fixed-stride 0x84 bytes, either `####`-prefixed encrypted
+// (LigoGPS.pm:50-99 DecryptLigoGPS) or plain-ASCII (Redtiger F9 4K).
+// JSON variant (LigoGPS.pm:334-398 ProcessLigoJSON) handles Yada
+// RoadCam Pro 4K BT58189. Gated on the `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod ligogps;
 // Parrot mett — drone timed-metadata walker. Faithful port of
 // `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) +
 // the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
