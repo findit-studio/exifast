@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "JPEG_two_app1_exif.jpg",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "JPEG",
+  "File:FileTypeExtension": "jpg",
+  "File:MIMEType": "image/jpeg",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Canon",
+  "IFD0:Model": "EOS5D"
+}]

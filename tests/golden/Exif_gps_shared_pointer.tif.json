@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "Exif_gps_shared_pointer.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Orientation": "Horizontal (normal)",
+  "ExifIFD:Orientation": "Mirror horizontal and rotate 90 CW",
+  "GPS:GPSVersionID": "2.3.0.0"
+}]

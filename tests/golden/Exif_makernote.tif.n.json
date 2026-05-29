@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "Exif_makernote.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[minor] Unrecognized MakerNotes",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "IFD0:Make": "PENTAX",
+  "IFD0:Model": "PENTAX K1",
+  "ExifIFD:FNumber": 2.8,
+  "ExifIFD:ISO": 200
+}]

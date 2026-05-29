@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "Exif_gps_badoffset.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Suspicious GPS offset for GPSLatitude",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Apple",
+  "GPS:GPSVersionID": "2.3.0.0"
+}]

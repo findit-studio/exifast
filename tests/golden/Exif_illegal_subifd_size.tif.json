@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "Exif_illegal_subifd_size.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Illegal GPS directory size (1 entries)",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Apple"
+}]

@@ -1,0 +1,13 @@
+[{
+  "SourceFile": "Exif_gps_after_interop.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Apple",
+  "ExifIFD:ISO": 100,
+  "GPS:GPSVersionID": "2.3.0.0",
+  "GPS:GPSSatellites": "GPS L1L2",
+  "GPS:GPSMapDatum": "WGS-84"
+}]

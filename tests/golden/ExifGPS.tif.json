@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "ExifGPS.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "IFD0:Make": "Apple",
+  "IFD0:Model": "iPhone 12",
+  "GPS:GPSVersionID": "2.3.0.0",
+  "GPS:GPSLatitudeRef": "North",
+  "GPS:GPSLatitude": "48 deg 51' 29.34\"",
+  "GPS:GPSLongitudeRef": "East",
+  "GPS:GPSLongitude": "2 deg 20' 56.16\"",
+  "GPS:GPSAltitudeRef": "Above Sea Level",
+  "GPS:GPSAltitude": "35 m",
+  "GPS:GPSTimeStamp": "16:45:09",
+  "GPS:GPSMapDatum": "WGS84",
+  "GPS:GPSDateStamp": "2021:08:14"
+}]

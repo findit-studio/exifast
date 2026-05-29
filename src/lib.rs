@@ -86,6 +86,14 @@ pub mod charset;
 pub mod convert;
 pub mod datetime;
 pub mod error;
+// The Exif/TIFF IFD infrastructure (`exif` feature) + the GPS sub-IFD tag
+// table (`gps` feature). `src/exif/` is a top-level module (not under
+// `formats/`) because the Exif port is REUSABLE infra — QuickTime / RIFF /
+// MakerNotes ports call `exif::parse_exif_block` on embedded Exif blocks, so
+// it is not a leaf file-format like the `formats::*` modules. See
+// `src/exif/mod.rs` for the camera-metadata-core rationale.
+#[cfg(feature = "exif")]
+pub mod exif;
 pub mod filetype;
 pub mod formats;
 // The normalized typed-metadata domain layer (`MediaMetadata` and its
@@ -168,6 +176,12 @@ pub use formats::audible::ProcessAa;
 pub use formats::dsf::ProcessDsf;
 #[cfg(feature = "dv")]
 pub use formats::dv::ProcessDv;
+// Exif/TIFF IFD parser handle (FORMATS.md row 13). The typed `ExifMeta<'a>`
+// + the reusable `parse_exif_block` entry are reached via `exifast::exif::*`
+// (the bare §6 names — `Meta` would collide with the `formats::*` Metas, so
+// only the unique `ProcessExif` handle is re-exported at the crate root).
+#[cfg(feature = "exif")]
+pub use exif::ProcessExif;
 #[cfg(feature = "flac")]
 pub use formats::flac::ProcessFlac;
 #[cfg(feature = "flash")]
@@ -267,7 +281,10 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
     let Some(parser) = format_parser::any_parser_for(ft) else {
       continue;
     };
-    if let Some(m) = parser.parse_any(bytes, &mut shared, None)? {
+    // `cand.header_skip()` threads the unknown-leading-header byte count
+    // (Perl `$skip`, `ExifTool.pm:3029`) for the terminal JPEG/TIFF candidate;
+    // `0` for every ordinary candidate.
+    if let Some(m) = parser.parse_any(bytes, &mut shared, None, cand.header_skip())? {
       return Ok(Some(m));
     }
     // Reset shared flags between rejected candidates so partial
@@ -367,6 +384,36 @@ pub fn parse_dv(
   bytes: &[u8],
 ) -> core::result::Result<Option<formats::dv::ParseOutcome<'static>>, formats::dv::Error> {
   formats::dv::parse_borrowed(bytes)
+}
+
+/// Parse a standalone TIFF file (an Exif/TIFF block) directly. See
+/// [`exif::parse_borrowed`].
+///
+/// A standalone TIFF file IS an Exif/TIFF block: the byte-order marker +
+/// magic + IFD0 offset are at offset 0. JPEG / MP4 embed Exif as a
+/// SubDirectory — those container ports call [`exif::parse_exif_block`]
+/// directly on the embedded block.
+///
+/// # Errors
+///
+/// Returns the per-format [`exif::Error`] (currently uninhabited — every bad
+/// input is `Ok(None)`).
+#[cfg(feature = "exif")]
+pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_>>, exif::Error> {
+  exif::parse_borrowed(bytes)
+}
+
+/// Parse a raw Exif/TIFF byte block directly into a typed
+/// [`exif::ExifMeta`] — the **reusable** entry a QuickTime / RIFF /
+/// MakerNotes port calls on an embedded Exif block. See
+/// [`exif::parse_exif_block`]. The GPS sub-IFD is decoded automatically when
+/// the `gps` feature is enabled (reached through the IFD0 `GPSInfo` tag).
+///
+/// Returns `None` when `block` is not a valid TIFF header.
+#[cfg(feature = "exif")]
+#[must_use]
+pub fn parse_exif_block(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  exif::parse_exif_block(block)
 }
 
 /// Parse an Audible (AA) buffer directly. See [`formats::audible::parse_borrowed`].
@@ -764,6 +811,11 @@ mod tests {
     let _ = parse_aac(bytes);
     #[cfg(feature = "dv")]
     let _ = parse_dv(bytes);
+    #[cfg(feature = "exif")]
+    {
+      let _ = parse_exif(bytes);
+      let _ = parse_exif_block(bytes);
+    }
     #[cfg(feature = "audible")]
     let _ = parse_audible(bytes);
     #[cfg(feature = "red")]
@@ -776,8 +828,6 @@ mod tests {
     let _ = parse_ogg(bytes, true);
     #[cfg(feature = "real")]
     let _ = parse_real(bytes);
-    #[cfg(feature = "h264")]
-    let _ = parse_h264(bytes);
     #[cfg(feature = "mpc")]
     let _ = parse_mpc(bytes);
     #[cfg(feature = "wavpack")]

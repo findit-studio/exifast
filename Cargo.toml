@@ -61,8 +61,8 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 
 # Umbrella — enables every per-format gate.
 all-formats = [
-  "aac", "aiff", "ape", "audible", "dsf", "dv", "flac", "flash",
-  "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
+  "aac", "aiff", "ape", "audible", "dsf", "dv", "exif", "flac", "flash",
+  "gps", "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
   "quicktime", "real", "red", "wavpack",
 ]
 
@@ -89,6 +89,12 @@ ape        = ["id3"]
 audible    = []
 dsf        = ["id3"]
 dv         = []
+# `exif` — the Exif/TIFF IFD infrastructure (FORMATS.md row 13). A standalone
+# TIFF file IS an Exif/TIFF block (`File:FileType == "TIFF"` dispatches to
+# `ProcessExif`). The IFD walker is camera-metadata-core critical path:
+# QuickTime/RIFF/MakerNotes ports call `exif::parse_exif_block` on embedded
+# Exif blocks. Leaf format (no cross-format chains).
+exif       = []
 flac       = ["id3"]
 # `flash` (FLV/SWF) — Engine-only deps (no cross-format chains today; bundled
 # Flash.pm uses `Image::ExifTool::FLAC` only for the SWF compressed-buffer
@@ -101,6 +107,11 @@ flac       = ["id3"]
 # `Flash:AudioBitrate`/`VideoBitrate` PrintConv. Both live in
 # `crate::convert` / `crate::formats::moi` and don't pull `moi`'s feature.
 flash      = []
+# `gps` — the EXIF GPS sub-IFD tag table + coordinate ValueConv (FORMATS.md
+# row 14). The GPS IFD is a standard Exif sub-IFD reached through the Exif
+# port's IFD0 tag 0x8825 (`GPSInfo`); the IFD walker is shared, so `gps`
+# chains `exif`. Without the `exif` edge the GPS table has no walker.
+gps        = ["exif"]
 # `h264` — engine-only per FORMATS.md row 16 (no `H264` file type; consumed
 # by M2TS/MPEG demuxers via `H264::ParseH264Video`). Leaf format, no
 # cross-format chains; ports the NAL/SEI/MDPM walker + Exp-Golomb SPS parser.
