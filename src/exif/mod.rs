@@ -48,6 +48,7 @@
 //! designed so a MakerNotes port plugs in. See `docs/tracking.md`.
 
 pub mod ifd;
+pub mod makernotes;
 // `tables` / `gps` hold the const `%Exif::Main` / `%GPS::Main` tag-table
 // rows (`ExifTag` / `GpsTag` — public fields for `const` struct-literal
 // init). They are NOT public API surface (D8: no public struct fields on
@@ -437,10 +438,16 @@ enum ResolvedConv {
 // MakerNote capture — the deferred-vendor-parsing seam
 // ===========================================================================
 
-/// The raw MakerNote (0x927c) blob captured by the Exif walker. Vendor
-/// parsing (Apple/Canon/Sony/…) is DEFERRED to the MakerNotes wave
-/// (`docs/tracking.md`); this struct is the captured-but-unparsed payload
-/// the future port consumes.
+/// The raw MakerNote (0x927c) blob captured by the Exif walker, together
+/// with the Phase-1 dispatch outcome (vendor identification +
+/// `SubDirectory` directives — see [`makernotes::dispatch`]).
+///
+/// Phase 1 carries the vendor identification + the `Start`/`Base`/
+/// `ByteOrder`/`NotIFD` directives that bundled `MakerNotes.pm` computes
+/// per dispatch (`MakerNotes.pm:35-1127`). Per-vendor TAG TABLE parsing
+/// (Apple.pm, Canon.pm, Sony.pm, …) is deferred to Phase 2-4 (rescope
+/// priority: Apple+Canon first, then Sony+Panasonic, then GoPro+DJI;
+/// long-tail vendors after).
 ///
 /// D8: no public fields; accessors only.
 #[derive(Debug, Clone)]
@@ -448,6 +455,12 @@ pub struct MakerNote<'a> {
   /// The raw MakerNote bytes (the value the ExifIFD's 0x927c tag pointed
   /// to). Borrowed from the input TIFF block.
   bytes: &'a [u8],
+  /// The typed [`MakerNotesMeta`](makernotes::MakerNotesMeta) — carries
+  /// the [`DetectedMakerNote`](makernotes::DetectedMakerNote) dispatch
+  /// outcome (vendor identification + `SubDirectory` directives; the
+  /// dispatcher is TOTAL so it is always present) plus the per-vendor
+  /// decoded slots (`None` in Phase 1; populated Phase 2-4).
+  meta: makernotes::MakerNotesMeta,
 }
 
 impl<'a> MakerNote<'a> {
@@ -470,6 +483,50 @@ impl<'a> MakerNote<'a> {
   #[inline(always)]
   pub const fn is_empty(&self) -> bool {
     self.bytes.is_empty()
+  }
+
+  /// The dispatched [`Vendor`](makernotes::Vendor) — Phase-1's primary
+  /// surface. Even without per-vendor tag tables, vendor identification
+  /// is camera-metadata-meaningful (it tells downstream code which
+  /// vendor's IFD layout, byte-order, and offset semantics apply).
+  #[must_use]
+  #[inline(always)]
+  pub const fn vendor(&self) -> makernotes::Vendor {
+    self.meta.vendor()
+  }
+
+  /// The full Phase-1 dispatch outcome — vendor + body offset + base
+  /// rule + byte-order directive + NotIFD flag. See
+  /// [`DetectedMakerNote`](makernotes::DetectedMakerNote).
+  #[must_use]
+  #[inline(always)]
+  pub const fn detected(&self) -> makernotes::DetectedMakerNote {
+    self.meta.detected()
+  }
+
+  /// The typed [`MakerNotesMeta`](makernotes::MakerNotesMeta) — Phase 2-4
+  /// will populate the matching per-vendor `Option<…>` slot. Phase 1
+  /// gives only the vendor identification ([`Self::vendor`]).
+  #[must_use]
+  #[inline(always)]
+  pub const fn meta(&self) -> &makernotes::MakerNotesMeta {
+    &self.meta
+  }
+
+  /// The MakerNote BODY — `blob[detected.body_offset()..]`. After the
+  /// dispatcher strips the vendor header, this is what a Phase 2+ vendor
+  /// IFD parser walks. For Canon (no header) this equals
+  /// [`Self::bytes`]; for Apple/Olympus/Pentax/etc. the header is
+  /// excluded.
+  #[must_use]
+  #[inline]
+  pub fn body(&self) -> &'a [u8] {
+    let off = self.meta.detected().body_offset() as usize;
+    if off >= self.bytes.len() {
+      &[]
+    } else {
+      &self.bytes[off..]
+    }
   }
 }
 
@@ -751,6 +808,8 @@ fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
     entries: Vec::new(),
     warnings: Vec::new(),
     maker_note: None,
+    captured_make: None,
+    captured_model: None,
     seen_ifd_offsets: std::collections::HashSet::new(),
     active_ifd_offsets: Vec::new(),
   };
@@ -801,6 +860,22 @@ struct Walker<'a> {
   warnings: Vec<String>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
+  /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
+  /// the MakerNotes dispatcher (`MakerNotes.pm`'s `$$self{Make}`
+  /// conditions) sees it when the ExifIFD's 0x927c is reached. For a
+  /// well-formed IFD0 (`Make`/`Model` precede the ExifIFD pointer 0x8769
+  /// in file order, matching ExifTool's `FoundTag` order), the walk has
+  /// `Make` resolved before MakerNote dispatch; a malformed file that
+  /// orders 0x8769 before `Make` would dispatch with `None`. `None` also
+  /// for a file with no `Make` tag.
+  /// Owned `String` (transient builder per SmolStr policy: this lives a
+  /// few microseconds during one TIFF parse).
+  captured_make: Option<String>,
+  /// IFD0's `Model` tag value (`Exif.pm:599`) — same role as
+  /// [`captured_make`](Self::captured_make), used for the Model-keyed
+  /// dispatch conditions (`$$self{Model} eq "DC-FT7"` etc.,
+  /// `MakerNotes.pm:735` Panasonic-DC-FT7 carve-out).
+  captured_model: Option<String>,
   /// Chain-IFD (IFD0 / trailing-IFD) start offsets already walked — the
   /// trailing-chain loop breaker. ExifTool records every NON-zero-`DirLen`
   /// directory in `%PROCESSED` (`ExifTool.pm:9050-9061`); a trailing IFD
@@ -1603,21 +1678,38 @@ impl Walker<'_> {
         let _ = self.walk_one_ifd(sub_offset, kind);
       }
       SubDirKind::MakerNote => {
-        // **Deferred — the MakerNotes wave.** Capture the raw blob; do NOT
-        // parse vendor MakerNotes. `value_offset .. value_offset+read_len`
-        // is the MakerNote value — the caller already proved this range fits
-        // (out-of-line via the `off.checked_add(size)` EOF gate; inline as
-        // `entry+8` with `read_len <= 4` and `entry+12 <= data.len()`). The
-        // `saturating_add` keeps the sum overflow-safe on a 32-bit target even
-        // if that invariant ever changes; an overflow clamps to EOF (the
-        // `.min(data.len())`), so a `value_offset` past the buffer yields an
-        // empty/short slice — the same saturating style `read_value` uses.
+        // **MakerNotes Phase 1: identify vendor + capture `SubDirectory`
+        // directives; do NOT walk vendor IFDs (Phase 2-4).** Capture the
+        // raw blob, dispatch it through [`makernotes::dispatch`] against
+        // the IFD0-captured Make/Model, and store the outcome. Phase 2+
+        // will consume the captured directives to walk the per-vendor table.
+        //
+        // `value_offset .. value_offset+read_len` is the MakerNote value
+        // (bounds already checked by the caller). `saturating_add` keeps the
+        // sum overflow-safe on a 32-bit target (per the #36 IFD-offset
+        // hardening); an overflow clamps to EOF via `.min(data.len())`.
         let end = value_offset.saturating_add(read_len).min(self.data.len());
         if let Some(bytes) = self.data.get(value_offset..end) {
           // First MakerNote wins (a malformed TIFF with two 0x927c tags is
           // degenerate; ExifTool's `FoundTag` keeps the canonical name).
           if self.maker_note.is_none() {
-            self.maker_note = Some(MakerNote { bytes });
+            // `tiff_type` (`$$self{TIFF_TYPE}`, `ExifTool.pm:8715`) is read
+            // ONLY by `MakerNoteSamsung2`'s SRW clause (`MakerNotes.pm:969`).
+            // The IFD walker does not yet carry the container's detected file
+            // type, so pass `None`: the Samsung2 SRW-without-magic case is the
+            // documented Phase-1 gap (a SAMSUNG body that IS an EXIF-format
+            // maker note still matches via its magic clause). Threading the
+            // real file type here closes the gap with no dispatcher change.
+            let detected = makernotes::dispatch(
+              bytes,
+              self.captured_make.as_deref(),
+              self.captured_model.as_deref(),
+              None,
+            );
+            self.maker_note = Some(MakerNote {
+              bytes,
+              meta: makernotes::MakerNotesMeta::from_detected(detected),
+            });
           }
         }
       }
@@ -1669,6 +1761,29 @@ impl Walker<'_> {
         None => return, // unknown Exif tag — verbose-only, omit.
       }
     };
+
+    // Capture `Make` (0x010f) and `Model` (0x0110) — both are IFD0 string
+    // tags (`Exif.pm:585`/`:599`) needed by the MakerNotes dispatcher
+    // (`MakerNotes.pm`'s `$$self{Make}` / `$$self{Model}` conditions).
+    // Bundled trims trailing whitespace via `RawConv => '$val =~ s/\s+$//'`
+    // (Exif.pm:585/599 — `Conv::TrimTrailingWhitespace`); apply the same
+    // trim here so the dispatcher sees the trimmed value, faithful to
+    // bundled's view of `$$self{Make}` (which is the RawConv'd value).
+    //
+    // `kind.is_ifd0()` gate: bundled stores `$$self{Make}` only from the
+    // top-level Exif walk (IFD0); a trailing-IFD or maker-note re-emission
+    // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
+    // Make alone.
+    if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110) {
+      if let RawValue::Text(s) = &raw {
+        let trimmed = s.trim_end_matches(is_perl_space);
+        if tag_id == 0x010f && self.captured_make.is_none() {
+          self.captured_make = Some(trimmed.to_string());
+        } else if tag_id == 0x0110 && self.captured_model.is_none() {
+          self.captured_model = Some(trimmed.to_string());
+        }
+      }
+    }
 
     self.entries.push(ExifEntry {
       ifd: kind,
@@ -3563,6 +3678,8 @@ mod tests {
       entries: Vec::new(),
       warnings: Vec::new(),
       maker_note: None,
+      captured_make: None,
+      captured_model: None,
       seen_ifd_offsets: std::collections::HashSet::new(),
       active_ifd_offsets: Vec::new(),
     }
