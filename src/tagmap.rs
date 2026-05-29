@@ -239,12 +239,6 @@ impl TagMap {
     &self.warnings
   }
 
-  /// All recorded errors in call order (test-only read-back).
-  #[cfg(test)]
-  pub(crate) fn errors(&self) -> &[String] {
-    &self.errors
-  }
-
   /// Look up an emitted tag's [`TagValue`] by `(group, name)` — the
   /// `"<group>:<name>"` key (test-only read-back, mirrors the retired
   /// `MapTagWriter::get`). `None` if never emitted.
