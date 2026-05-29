@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "id3v2_ape_body_in_mp3.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "APE",
+  "File:FileTypeExtension": "APE",
+  "File:MIMEType": "audio/x-monkeys-audio",
+  "File:ID3Size": 30,
+  "MAC:APEVersion": 3,
+  "MAC:CompressionLevel": 2000,
+  "MAC:Channels": 2,
+  "MAC:SampleRate": 44100,
+  "MAC:TotalFrames": 100,
+  "MAC:FinalFrameBlocks": 1024,
+  "ID3v2_3:Title": "TestTitle"
+}]

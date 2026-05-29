@@ -1232,6 +1232,123 @@ impl ProcessApe {
     emit_composite_duration_if_present(ctx, print_conv_enabled);
     true
   }
+
+  /// Faithful port of the audio-format dispatch loop's APE pass
+  /// (ID3.pm:1582-1601 + APE.pm:128-238) — the path invoked by
+  /// `ProcessID3` after detecting an ID3v2 prefix. Unlike
+  /// [`ProcessApe::process`] which is the file-type ENTRY POINT for an
+  /// `.ape`-dispatched file, this helper:
+  ///
+  ///  - Skips the embedded-ID3 detection arm (APE.pm:124-127): the
+  ///    caller (`ProcessID3` ⇒ audio loop ⇒ here) has already set
+  ///    `$$et{DoneID3}` = 1, so APE.pm's `unless ($$et{DoneID3})` is
+  ///    false — that arm contributes nothing.
+  ///  - Unconditionally marks `$$et{DoneAPE} = 1` (APE.pm:132). This
+  ///    fires even when the magic check below fails — bundled does it
+  ///    BEFORE the magic check (`$$et{DoneAPE} = 1` at APE.pm:132 then
+  ///    the magic test at APE.pm:138). Side effect read by
+  ///    ID3.pm:1723's `if ($rtnVal and not $$et{DoneAPE})` gate on the
+  ///    MP3 → APE-trailer fallback.
+  ///  - Slices `ctx.data()` from `hdr_end` (the audio loop's
+  ///    `$raf->Seek($hdrEnd, 0)` at ID3.pm:1590). Empty slice (hdr_end
+  ///    past EOF — bundled's `Seek` past EOF behavior) routes through
+  ///    the wrong-magic path.
+  ///  - On magic match: calls `SetFileType("APE")` (APE.pm:139 no-arg
+  ///    using `$$et{FILE_TYPE}="APE"` set by the loop at ID3.pm:1592).
+  ///    First-call-wins gate: the later `SetFileType('MP3')` at
+  ///    ID3.pm:1604 then no-ops. Emits MAC OldHeader/NewHeader tags
+  ///    AND the APETAGEX trailer scan over the same slice.
+  ///  - On wrong magic: returns `false` (loop `&$func ... and last`
+  ///    sees 0, continues to next type — but the YAGNI brief here
+  ///    skips MPC/FLAC/OGG; the caller in `id3::ProcessMp3` proceeds
+  ///    to MPEG dispatch instead).
+  ///
+  /// Returns `true` iff the magic matched and the APE body extraction
+  /// ran (the `and last` arm). The CALLER (id3::ProcessMp3) uses this
+  /// to gate the subsequent MPEG-dispatch step: when APE accepted the
+  /// post-ID3 body, the MPEG scan would over-emit. Faithful to bundled:
+  /// ID3.pm:1696 `unless ($rtnVal)` skips ParseMPEGAudio in the
+  /// audio-loop-accepted case.
+  pub(crate) fn try_audio_loop_body_at_offset(
+    &self,
+    ctx: &mut ParseContext<'_>,
+    hdr_end: usize,
+  ) -> bool {
+    // APE.pm:132 `$$et{DoneAPE} = 1` — unconditional on entry,
+    // BEFORE the magic check. This is the side effect Codex R6
+    // identified as the load-bearing audio-loop signal: bundled's
+    // ID3.pm:1723 wrapper-fallback gate `if ($rtnVal and not
+    // $$et{DoneAPE})` reads DoneAPE; once we set it here, the
+    // wrapper-fallback `process_trailer_only` invocation will be
+    // suppressed even when the magic below fails. Equivalently faithful
+    // to the bundled audio-loop's APE pass returning 0 but still having
+    // run the unconditional DoneAPE assignment.
+    ctx.metadata().set_done_ape();
+
+    let print_conv_enabled = ctx.print_conv_enabled();
+    // ID3.pm:1590 `$raf->Seek($hdrEnd, 0)` — slice at the post-ID3
+    // file position. Codex R4 F1 (mirror of `ProcessApe::process`):
+    // hdr_end may exceed `data.len()` for a truncated-footer file
+    // (bundled allows `Seek` past EOF and short-reads). Saturating-
+    // empty slice ⇒ plan_ape returns None ⇒ caller sees `false` and
+    // proceeds to MPEG dispatch.
+    let ape_slice = ctx.data().get(hdr_end..).unwrap_or(&[]);
+    // APE.pm:169 — when ProcessID3 (the OUTER call that reached this
+    // audio-loop step) found an ID3v1 trailer at EOF, `$$et{DoneID3}`
+    // carries its byte count. The APETAGEX trailer scan walks PAST
+    // that block. Note: for the audio-loop's APE pass over a slice
+    // that ALSO excludes the leading ID3v2 prefix, the `done_id3`
+    // shift applies relative to the slice EOF (which equals the
+    // file's EOF — `ape_slice` is `data[hdr_end..]`, so its `len()`
+    // matches the bytes from `$hdrEnd` to EOF, and `Seek($footPos, 2)`
+    // anchors from EOF identically).
+    let done_id3 = ctx.metadata().done_id3().unwrap_or(0);
+    let plan = match plan_ape(ape_slice, print_conv_enabled, done_id3) {
+      Some(p) => p,
+      // APE.pm:137-138 — short or wrong-magic ⇒ `return 0`. The audio
+      // loop's `&$func ... and last` then continues to the next type.
+      None => return false,
+    };
+
+    // APE.pm:139 `$et->SetFileType();` — no-arg picks
+    // `$$et{FILE_TYPE}` which the loop set to "APE" at ID3.pm:1592.
+    // We pass it explicitly because our `ParseContext::file_type` is
+    // fixed at construction ("MP3" for an .mp3 dispatch) and does not
+    // carry the loop's per-iteration FILE_TYPE override. First-call-
+    // wins: the subsequent `SetFileType('MP3')` at ID3.pm:1604 then
+    // no-ops (per the FoundTag('FileType') one-shot gate).
+    ctx.set_file_type(Some("APE"), None, None);
+
+    // APE.pm:146-162 — MAC header processing OR APE.pm:142-144
+    // header-at-start path (when the magic was `APETAGEX`, the
+    // 32-byte block read at offset 0 IS the trailer header itself).
+    // `plan_ape` already encoded these into `plan.header_job` and
+    // `plan.pending` — apply identically to `ProcessApe::process`.
+    match &plan.header_job {
+      HeaderJob::None => {}
+      HeaderJob::Old(body) => {
+        ctx.metadata_then(|m| process_ape_binary_data(body, OLD_HEADER, m, print_conv_enabled))
+      }
+      HeaderJob::New(body) => {
+        ctx.metadata_then(|m| process_ape_binary_data(body, NEW_HEADER, m, print_conv_enabled))
+      }
+    }
+    let warn = plan.warn_bad_trailer;
+    let pending = plan.pending;
+    ctx.metadata_then(|m| {
+      for (g1, name, value) in pending {
+        m.push(Group::new(APE_GROUP0, g1), name, value);
+      }
+      if warn {
+        m.push_warning("Bad APE trailer");
+      }
+    });
+    // APE.pm:240 ProcessAPE returns 1 — Composite Duration emission
+    // is part of that "success" return (the same `ProcessApe::process`
+    // body runs it; see APE.pm:81-93 Composite resolution).
+    emit_composite_duration_if_present(ctx, print_conv_enabled);
+    true // bundled `return 1` ⇒ audio-loop `and last`.
+  }
 }
 
 /// Push `(g1, name, value)` into `pending`, but if a prior entry has the

@@ -2243,6 +2243,90 @@ fn id3v24_footer_truncated_then_nothing_conformance() {
   );
 }
 
+#[test]
+fn id3v2_no_mpeg_apev2_trailer_conformance() {
+  // Codex R6 Fixture A: post-ID3 MPEG miss skips audio-loop side
+  // effects (DoneAPE). Bundled `ID3.pm:1582-1601` audio-format loop
+  // (`@audioFormats = qw(APE MPC FLAC OGG MP3)`) runs INSIDE
+  // ProcessID3 on the rtnVal-truthy branch. For this fixture (ID3v2
+  // + APEv2 trailer, no MPEG audio, no MAC body):
+  //   - Audio-loop's APE pass reads 32 bytes at `$hdrEnd` (the post-
+  //     ID3 file position). Those bytes are the APE tag-item bytes
+  //     (`Artist\0ApeTester`) — NOT `^(MAC |APETAGEX)`, so APE.pm:138
+  //     `$buff =~ /^(MAC |APETAGEX)/ or return 0` returns 0.
+  //   - BUT bundled `$$et{DoneAPE} = 1` (APE.pm:132) was set BEFORE
+  //     the magic check. So when ProcessMP3 reaches the wrapper APE-
+  //     trailer fallback at ID3.pm:1722-1727, the `unless ($$et{
+  //     DoneAPE})` gate is FALSE → the trailer fallback is suppressed.
+  //   - Bundled emits: File:FileType=MP3, File:ID3Size=30,
+  //     ID3v2_3:Title=TestTitle. NO `APE:Artist` (the APEv2 trailer
+  //     items are not extracted).
+  //
+  // Pre-R6-fix behavior: our `ProcessMp3::process` ran the wrapper
+  // APE-trailer fallback because no DoneAPE side-effect existed —
+  // spurious `APE:Artist` extraction. The Codex R6 fix introduces
+  // `try_audio_loop_body_at_offset` which UNCONDITIONALLY sets
+  // DoneAPE on entry (matching APE.pm:132), suppressing the wrapper
+  // fallback even when the magic check fails — byte-exact to bundled.
+  check(
+    "id3v2_no_mpeg_apev2_trailer.mp3",
+    "id3v2_no_mpeg_apev2_trailer.mp3.json",
+    true,
+  );
+  check(
+    "id3v2_no_mpeg_apev2_trailer.mp3",
+    "id3v2_no_mpeg_apev2_trailer.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
+fn id3v2_ape_body_in_mp3_conformance() {
+  // Codex R6 Fixture B: post-ID3 MAC body in a .mp3-dispatched file.
+  // Bundled `ID3.pm:1582-1601` audio-format loop's APE pass reads
+  // 32 bytes at `$hdrEnd` — for this fixture (ID3v2 + `MAC ` magic +
+  // OldHeader payload), the magic check matches `^MAC `. APE.pm:139
+  // `$et->SetFileType()` no-arg picks `$$et{FILE_TYPE}="APE"` (set
+  // by the loop at ID3.pm:1592). First-call-wins gate locks
+  // FileType="APE"; the subsequent `SetFileType('MP3')` at
+  // ID3.pm:1604 is a no-op. ProcessAPE then runs the OldHeader
+  // binary-data step (APE.pm:147-151) emitting MAC:* tags
+  // (APEVersion, CompressionLevel, Channels, SampleRate,
+  // TotalFrames, FinalFrameBlocks).
+  //
+  // Bundled emission order (faithful to ID3.pm:1580-1611):
+  //   1. Audio loop's ProcessAPE → File:FileType=APE +
+  //      FileTypeExtension=ape + MIMEType=audio/x-monkeys-audio +
+  //      MAC:* binary-data tags.
+  //   2. ID3.pm:1604 SetFileType('MP3') — no-op.
+  //   3. ID3.pm:1606 FoundTag('ID3Size', 30) → File:ID3Size=30.
+  //   4. ID3.pm:1610 ProcessDirectory(ID3v2_3) → ID3v2_3:Title.
+  //
+  // Pre-R6-fix behavior: our `ProcessMp3::process` called finalize
+  // (which sets FileType=MP3) BEFORE the audio loop, missing the
+  // MAC body extraction entirely AND emitting FileType=MP3 instead
+  // of APE. The Codex R6 split (detect_id3 → audio loop →
+  // finalize_id3) interleaves the audio loop between detection and
+  // tag emission, matching bundled's flow exactly.
+  //
+  // YAGNI scope note: only the APE branch of the audio-format loop
+  // is implemented. Real-world ID3+MPC-body or ID3+FLAC-body or
+  // ID3+OGG-body in a .mp3 file is effectively mythological (each
+  // format has its own dispatch via its own extension); no fixture
+  // in the suite exercises them. Tracked as a forward item in
+  // `ape::try_audio_loop_body_at_offset`'s docstring.
+  check(
+    "id3v2_ape_body_in_mp3.mp3",
+    "id3v2_ape_body_in_mp3.mp3.json",
+    true,
+  );
+  check(
+    "id3v2_ape_body_in_mp3.mp3",
+    "id3v2_ape_body_in_mp3.mp3.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

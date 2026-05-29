@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "id3v2_no_mpeg_apev2_trailer.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "mp3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 30,
+  "ID3v2_3:Title": "TestTitle"
+}]

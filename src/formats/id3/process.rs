@@ -108,25 +108,136 @@ impl FormatParser for ProcessMp3 {
     // is `$rtnVal` from the ID3/MPEG dispatch, NOT APE's. Faithful
     // exactly to ID3.pm:1723-1727.
     let data = ctx.data();
-    // Capture `hdr_end` so the chained MPEG dispatch below can slice
-    // from the post-ID3 file position (bundled `$raf->Seek($hdrEnd, 0)`
-    // at ID3.pm:1590). When no ID3v2 prefix was found, `hdr_end == 0`
-    // and the MPEG slice IS `data` from offset 0 — byte-exact to the
-    // pre-R5 raw-MP3 path.
-    let (id3_found, hdr_end) = process_id3_inner(data, ctx, true);
-    let mpeg_found = crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end);
-    // Bundled `ProcessMP3` returns 1 if EITHER ProcessID3 OR
-    // ParseMPEGAudio succeeded (ID3.pm:1692 sets rtnVal, then 1711/
-    // 1717 may also set rtnVal = 1; final `return $rtnVal` at 1727).
-    let rtn_val = id3_found || mpeg_found;
+    // ===== Stage 1: detection only (no tag emission yet) =====
+    // Codex R6 split: detect_id3 assembles header/trailer buffers + the
+    // post-ID3 `hdr_end` offset WITHOUT emitting any tags. The audio
+    // loop below (Stage 2) needs to run BEFORE finalize_id3 (Stage 3)
+    // so its `SetFileType("APE")` can win first-call-wins over
+    // finalize_id3's `SetFileType('MP3')` AND so its MAC/APE:* tags
+    // appear in the emission order bundled produces (audio-loop body
+    // tags → File:ID3Size → ID3v2_*:Title — see ID3.pm:1582-1611).
+    let detected = detect_id3(data, ctx);
+    let id3_found = detected.as_ref().map(|d| d.found_any).unwrap_or(false);
+    let hdr_end = detected.as_ref().map(|d| d.hdr_end).unwrap_or(0);
+
+    // ===== Stage 2: @audioFormats loop (ID3.pm:1582-1601) =====
+    // Codex R6 fix: bundled runs this loop INSIDE ProcessID3 on the
+    // rtnVal-truthy branch (only when ID3v2/ID3v1 was found). Side
+    // effects + ordering:
+    //
+    //   @types order — bundled (ID3.pm:1585-1586) computes
+    //     `my @types = grep /^$oldType$/, @audioFormats;`   # [MP3]
+    //     `push @types, grep(!/^$oldType$/, @audioFormats);` # [MP3,APE,MPC,FLAC,OGG]
+    //   So MP3 is FIRST. The loop's `&$func ... and last` exits on
+    //   the first Process sub that returns 1.
+    //
+    //   Per-type semantics:
+    //
+    //   - type=MP3 (recursive ProcessMP3 via audioModule{MP3}='ID3'):
+    //     short-circuits its own ProcessID3 (DoneID3 set) and falls
+    //     through to ParseMPEGAudio. Inside that recursive call, IF
+    //     ParseMPEGAudio finds MPEG sync at `hdr_end`, it sets
+    //     rtnVal=1 — then the recursive's own APE-trailer wrapper
+    //     fallback at ID3.pm:1722-1727 fires (DoneAPE=undef on entry).
+    //     ProcessAPE wrapper: DoneID3 set, FileType="MP3" set by
+    //     ParseMPEGAudio's no-arg SetFileType — trailer-only path,
+    //     emits APE:* tags from the APETAGEX footer if present.
+    //     We model this faithfully: mpeg::ProcessMp3 +
+    //     ape::process_trailer_only.
+    //
+    //   - type=APE: ProcessAPE called with FILE_TYPE="APE" set by
+    //     the loop. DoneAPE=1 unconditionally (APE.pm:132). Magic
+    //     check at offset 0 of the post-hdr_end slice: on `MAC `/
+    //     `APETAGEX` match, SetFileType (FILE_TYPE="APE"), emit MAC
+    //     body / APE trailer tags. We model this via
+    //     ape::try_audio_loop_body_at_offset (Fixture B).
+    //
+    //   - type=MPC, FLAC, OGG: YAGNI per the brief — no fixture in
+    //     the suite exercises an MPC/FLAC/OGG body in a .mp3
+    //     dispatch. Tracked as a forward item in the docstring of
+    //     `ape::try_audio_loop_body_at_offset`.
+    //
+    // The audio-loop runs only when id3_found is truthy (ID3.pm:1580
+    // `if ($rtnVal) { ... }`). When ID3 was not detected, the loop
+    // is skipped; the outer ProcessMP3 then runs ParseMPEGAudio +
+    // wrapper APE-trailer fallback (Stage 4 / 5 path).
+    let mut audio_loop_accepted = false;
+    if id3_found {
+      // type=MP3 (loop pass 1): recursive ProcessMP3 = mpeg
+      // dispatch at hdr_end + wrapper APE-trailer fallback when mpeg
+      // succeeds. Bundled `&$func ... and last`: the recursive
+      // returns 1 iff mpeg accepted. Codex R6 fix: this DOES set
+      // DoneAPE (via process_trailer_only ⇒ APE.pm:132) but only
+      // when mpeg accepted — bundled identical (recursive
+      // ProcessMP3:1723 sees rtnVal=1 → fires fallback → DoneAPE=1).
+      let mp3_recursive_accepted =
+        crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, hdr_end);
+      if mp3_recursive_accepted {
+        // Recursive ProcessMP3's APE-trailer wrapper-fallback
+        // (ID3.pm:1722-1727 of the RECURSIVE call). DoneAPE undef
+        // on entry (the audio loop hasn't touched it yet); fires.
+        if !ctx.metadata().done_ape() {
+          let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
+        }
+        audio_loop_accepted = true; // loop exits via `and last`
+      } else {
+        // Recursive returned 0 (no MPEG sync at hdr_end). bundled
+        // moves to next type. type=APE:
+        if crate::formats::ape::ProcessApe.try_audio_loop_body_at_offset(ctx, hdr_end) {
+          audio_loop_accepted = true; // loop exits via `and last`
+        }
+        // type=MPC, FLAC, OGG: forward items (see docstring).
+      }
+    }
+
+    // ===== Stage 3: finalize (SetFileType + ID3Size + tags) =====
+    // ID3.pm:1604-1627. `SetFileType('MP3')` is no-op when the audio
+    // loop already set FileType (e.g. APE or MP3). Then
+    // `FoundTag('ID3Size', $id3Len)` + ID3v2/ID3v1 tag pushes — these
+    // appear AFTER the audio loop's body tags in the bundled
+    // emission order, matching the golden JSON.
+    let id3_finalized = detected.is_some_and(|d| finalize_id3(ctx, d, true));
+
+    // ===== Stage 4: outer ParseMPEGAudio (ID3.pm:1696-1719) =====
+    // Bundled outer `ProcessMP3` runs `ParseMPEGAudio` only when
+    // ProcessID3 returned 0 (`unless ($rtnVal)`). For id3_found=true,
+    // ProcessID3's return is 1 → skip outer ParseMPEGAudio (the
+    // audio loop's MP3 pass already handled MPEG). For id3_found=
+    // false (no ID3 detected), bundled enters the outer
+    // ParseMPEGAudio arm.
+    //
+    // R5 buffer-offset (preserved for the no-ID3 path): hdr_end=0
+    // there, so `process_with_start_offset(ctx, 0)` slices from
+    // start of file — byte-exact to the pre-R6 raw-MP3 path.
+    let outer_mpeg_found = if id3_found {
+      false
+    } else {
+      crate::formats::mpeg::ProcessMp3.process_with_start_offset(ctx, 0)
+    };
+
+    // Bundled `ProcessMP3` final `return $rtnVal`. `$rtnVal` flows
+    // through ProcessID3 (Stage 1+2+3) OR outer ParseMPEGAudio
+    // (Stage 4). When the audio loop accepted, ProcessID3 returned
+    // 1, so id3_finalized is true.
+    let rtn_val = id3_finalized || outer_mpeg_found || audio_loop_accepted;
+
+    // ===== Stage 5: outer APE-trailer wrapper fallback (ID3.pm:1722-1727) =====
+    // Faithful gate `if ($rtnVal and not $$et{DoneAPE})`:
+    //  - For the id3_found=true + MP3-pass case: DoneAPE was set
+    //    inside the recursive (Stage 2 type=MP3 fallback) → gate is
+    //    false → skip.
+    //  - For the id3_found=true + APE-pass case: DoneAPE was set
+    //    by try_audio_loop_body_at_offset → gate is false → skip.
+    //  - For the id3_found=false + outer-MPEG-accepted case:
+    //    DoneAPE is undef (no audio loop ran) → gate fires, attempt
+    //    APE-trailer fallback. Faithful to bundled's outer
+    //    ProcessMP3:1722-1727 path.
     if rtn_val && !ctx.metadata().done_ape() {
-      // ID3.pm:1724 `require Image::ExifTool::APE` then 1725
-      // `Image::ExifTool::APE::ProcessAPE($et, $dirInfo)` — void
-      // context: result ignored. Use the chained `process_trailer_only`
-      // (APE.pm:165-237 — the `unless ($header)` block) because the
-      // caller has already set FileType. APE.pm:131 `$$et{DoneAPE} = 1`
-      // happens INSIDE ProcessAPE BEFORE the trailer search, regardless
-      // of whether a trailer is found, so the flag fires either way.
+      // Void context (APE.pm `ProcessAPE` at ID3.pm:1725, no
+      // `and ...`): result ignored. `process_trailer_only`
+      // (APE.pm:165-237 — `unless ($header)` block) skips the magic
+      // check + SetFileType because the caller has already set
+      // FileType.
       let _ = crate::formats::ape::ProcessApe.process_trailer_only(ctx);
     }
     rtn_val
@@ -235,11 +346,57 @@ pub fn process_id3_v2_slice(slice: &[u8], ctx: &mut ParseContext<'_>) -> bool {
 /// :1463, :1475, :1478), bundled leaves `$hdrEnd = 0` — the audio
 /// loop's `$raf->Seek($hdrEnd, 0)` at :1590 then re-reads from offset 0.
 /// We model the same: `0` ⇒ caller slices from offset 0.
+///
+/// Codex R6: the MP3 file-type dispatch path needs to interleave the
+/// `@audioFormats` loop (ID3.pm:1582-1602) BETWEEN the detection step
+/// (header/trailer assembly) and the `finalize` step that pushes
+/// `SetFileType('MP3') + ID3Size + ID3 tags` (ID3.pm:1604-1627). The
+/// audio loop's APE acceptance calls `SetFileType("APE")` which must
+/// win first-call-wins over the subsequent `SetFileType('MP3')`, AND
+/// must emit MAC/APE:* tags BEFORE the `File:ID3Size` + ID3v2 tags
+/// (bundled emission order: audio-loop body tags → ID3.pm:1604 MP3 set
+/// → ID3.pm:1606 ID3Size → ID3.pm:1610 ID3v2 tags). The
+/// [`detect_id3`] + [`finalize_id3`] split exposes that interleaving
+/// seam to `ProcessMp3::process` while keeping the chained
+/// {APE,DSF}-from-ID3 callers (which do not need the interleaving) on
+/// the same code path via [`process_id3_inner`].
 fn process_id3_inner(
   data: &[u8],
   ctx: &mut ParseContext<'_>,
   do_set_file_type: bool,
 ) -> (bool, usize) {
+  let Some(detected) = detect_id3(data, ctx) else {
+    return (false, 0);
+  };
+  let hdr_end = detected.hdr_end;
+  let found = finalize_id3(ctx, detected, do_set_file_type);
+  (found, hdr_end)
+}
+
+/// Result of the ID3 detection step ([`detect_id3`]) — assembled
+/// header/trailer buffers + offsets, BEFORE [`finalize_id3`] applies
+/// them to the metadata sink. `found_any` carries bundled's `$rtnVal`
+/// status (set at ID3.pm:1453 `^ID3` and/or :1520 `^TAG`). The
+/// MP3-dispatch path inserts the audio-format loop (ID3.pm:1582-1601)
+/// between detection and finalize so the loop's `SetFileType("APE")`
+/// can win first-call-wins over the subsequent `SetFileType('MP3')`
+/// at ID3.pm:1604.
+struct DetectedId3 {
+  found_any: bool,
+  id3_len: u64,
+  hdr_end: usize,
+  header_data: Option<(Vec<u8>, u16)>,
+  trailer_data: Option<Vec<u8>>,
+}
+
+/// Pure detection step of ProcessID3 (ID3.pm:1431-1576) — assembles
+/// header/trailer buffers + offsets WITHOUT emitting any tags. Returns
+/// `None` when `DoneID3` is already set (early-return at ID3.pm:1435)
+/// OR when the data slice is shorter than the 3-byte magic peek
+/// (ID3.pm:1446). The `Some(DetectedId3)` carries `found_any=false`
+/// when no `^ID3` or `^TAG` was matched — caller still proceeds to
+/// finalize, which is a no-op in the no-id3 case.
+fn detect_id3(data: &[u8], ctx: &mut ParseContext<'_>) -> Option<DetectedId3> {
   // ID3.pm:1435-1436 `return 0 if $$et{DoneID3}; $$et{DoneID3} = 1;` —
   // avoids the cross-parser infinite recursion bundled relies on for the
   // ID3 → audio-format dispatch loop. Our port models the chained ID3-
@@ -247,7 +404,7 @@ fn process_id3_inner(
   // directly; the guard makes that idempotent if a second parser also
   // tries to detect ID3 over the same `$self`.
   if ctx.metadata().done_id3().is_some() {
-    return (false, 0);
+    return None;
   }
   // We tentatively set DoneID3=Some(0) BEFORE detection — matching
   // ID3.pm:1436 `$$et{DoneID3} = 1` (set before any header parsing).
@@ -270,9 +427,12 @@ fn process_id3_inner(
   // (:1590) then re-reads from start of file.
   let mut hdr_end: usize = 0;
 
-  // ID3.pm:1446 `$raf->Seek(0, 0); $raf->Read($buff, 3) == 3`.
+  // ID3.pm:1446 `$raf->Seek(0, 0); $raf->Read($buff, 3) == 3`. Return
+  // `None` so the caller treats it as the "no ID3 at all" path
+  // (skip audio loop + finalize); bundled equivalently exits ProcessID3
+  // with rtnVal=0 and the outer ProcessMP3 falls to ParseMPEGAudio.
   if data.len() < 3 {
-    return (false, 0);
+    return None;
   }
 
   // ID3v2 header parsing — faithful to ID3.pm:1452-1505. CRITICAL
@@ -384,16 +544,46 @@ fn process_id3_inner(
     // ID3.pm:1527. Read by APE.pm:169 for the footer-position shift.
     ctx.metadata().set_done_id3(trail_size_for_done_id3);
   }
-  let found = finalize(
-    ctx,
-    &cctx,
-    id3_len,
+  // _cctx kept on the stack for forward compatibility but unused at
+  // this stage — finalize_id3 builds its own ConvContext.
+  let _ = cctx;
+  Some(DetectedId3 {
     found_any,
+    id3_len,
+    hdr_end,
     header_data,
     trailer_data,
+  })
+}
+
+/// Apply the detected ID3 to the metadata sink (ID3.pm:1604-1627):
+/// `SetFileType('MP3')` when requested (the MP3 dispatch path), then
+/// `FoundTag('ID3Size', $id3Len)`, then the ID3v2 frame pushes
+/// (`ProcessDirectory(\%id3Header, $tagTablePtr)`), then the ID3v1
+/// trailer pushes. Faithful return: bundled `$rtnVal` from ID3.pm:1631.
+///
+/// Caller contract (Codex R6): the MP3 file-type dispatch path calls
+/// `detect_id3` → audio-format loop (potentially `SetFileType("APE")`)
+/// → `finalize_id3(do_set_file_type=true)`. The first-call-wins
+/// SetFileType gate then suppresses the MP3 set when APE won. The
+/// chained {APE,DSF}-from-ID3 callers do not run an audio loop and
+/// pass `do_set_file_type=false` (their outer parser owns
+/// SetFileType).
+fn finalize_id3(
+  ctx: &mut ParseContext<'_>,
+  detected: DetectedId3,
+  do_set_file_type: bool,
+) -> bool {
+  let cctx = crate::convert::ConvContext::default();
+  finalize(
+    ctx,
+    &cctx,
+    detected.id3_len,
+    detected.found_any,
+    detected.header_data,
+    detected.trailer_data,
     do_set_file_type,
-  );
-  (found, hdr_end)
+  )
 }
 
 /// Parse the ID3v2 header (ID3.pm:1452-1505). Returns `Some(ParsedV2Header)`
