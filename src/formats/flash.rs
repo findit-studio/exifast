@@ -7,9 +7,11 @@
 //! (no SWF fixture in this port's scope; the FORMATS.md row 18 target is FLV).
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::format_parser::FormatParser`] trait; the engine entry runs
-//! [`Meta::serialize_tags`] into [`crate::tagmap::TagMap`] so the serialized
-//! JSON stays value-equivalent with bundled `perl exiftool`.
+//! [`crate::format_parser::FormatParser`] trait; the engine entry drives its
+//! [`Taggable`](crate::emit::Taggable) impl through
+//! [`run_emission`](crate::emit::run_emission) into
+//! [`crate::tagmap::TagMap`] so the serialized JSON stays value-equivalent
+//! with bundled `perl exiftool`.
 //!
 //! ## What FLV is
 //!
@@ -2917,44 +2919,63 @@ fn unix_to_civil_micro(secs: f64) -> ((i32, u32, u32, u32, u32), u32, u32) {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit Flash tags into the TagMap sink in Meta-walk order (faithful to
-  /// bundled `FoundTag` call order — Flash.pm runs the audio/video bit-
-  /// table emissions ALSO interleaved with meta packet emissions as the
-  /// containing FLV tag is read).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield Flash tags in Meta-walk order (faithful to bundled `FoundTag`
+  /// call order — Flash.pm runs the audio/video bit-table emissions ALSO
+  /// interleaved with meta packet emissions as the containing FLV tag is
+  /// read) — the golden-pattern parallel to the retired `serialize_tags`:
+  /// the SINK changes (an [`EmittedTag`](crate::emit::EmittedTag) per value
+  /// instead of `out.write_*`), the per-tag PrintConv/ValueConv branches are
+  /// preserved verbatim. The `Warn` emissions stay OUT of this stream
+  /// (`run_emission` has no warning channel); the
+  /// `format_parser::AnyMeta::Flv` arm drains [`Meta::warnings`] after the
+  /// engine (Flash.pm:353/437/456/504/511).
   ///
-  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode); `print_conv =
-  /// false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings; `mode == ValueConv`
+  /// (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `"Flash"` (the `%Flash::Main` table group);
+  /// `family1` = `"Flash"` (the `-G1` key — constant for every FLV tag),
+  /// byte-identical to the retired sink. No Flash tag is `Unknown => 1` ⇒
+  /// `unknown: false`.
   #[cfg_attr(not(feature = "json"), allow(dead_code))]
-  pub(crate) fn serialize_tags(
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "Flash";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(self.entries.len());
     for entry in &self.entries {
-      emit_entry(out, GROUP, entry, print_conv)?;
+      push_entry(&mut tags, entry, print_conv);
     }
-    for w in &self.warnings {
-      out.write_warning(w.as_str())?;
-    }
-    Ok(())
+    tags.into_iter()
   }
 }
 
+/// Push a single Flash entry as an [`EmittedTag`] (family0 `"Flash"`, family1
+/// `"Flash"`, `unknown: false`). Preserves every per-value PrintConv/ValueConv
+/// branch of the retired `emit_entry` verbatim.
 #[cfg(feature = "alloc")]
 #[cfg_attr(not(feature = "json"), allow(dead_code))]
-fn emit_entry(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  entry: &Entry,
-  print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+fn push_entry(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, entry: &Entry, print_conv: bool) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  const GROUP: &str = "Flash";
   let name = entry.name.as_str();
+  // family0 "Flash" / family1 "Flash" for every Flash tag (constant).
+  let push = |tags: &mut std::vec::Vec<EmittedTag>, value: TagValue| {
+    tags.push(EmittedTag::new(
+      Group::new(GROUP, GROUP),
+      name.into(),
+      value,
+      false,
+    ));
+  };
   match &entry.value {
     FlashValue::Double(d) => {
       // Special-case: AudioEncoding / AudioChannels / VideoEncoding have
@@ -2977,35 +2998,36 @@ fn emit_entry(
           "AudioChannels" => audio_channels_pc(code),
           _ => video_encoding_pc(code),
         };
-        return match hit {
-          Some(s) => out.write_str(group, name, s),
-          None => out.write_fmt(group, name, |w| write!(w, "Unknown ({code})")),
-        };
+        match hit {
+          Some(s) => push(tags, TagValue::Str(s.into())),
+          None => push(tags, TagValue::Str(std::format!("Unknown ({code})").into())),
+        }
+        return;
       }
       match entry.pc {
         PrintConvMode::None | PrintConvMode::RoundMilli if !print_conv => {
           // `-n` raw — emit as integer when value is whole and fits.
-          emit_number(out, group, name, *d)
+          push(tags, fold_double(*d));
         }
         PrintConvMode::None => {
           // `-j` PrintConv-on but no PrintConv configured ⇒ same numeric
           // emission. Note: `width/height/datasize/...` are doubles in
           // AMF, but bundled Perl's number stringification drops trailing
           // `.0` so a whole-number double like `320.0` emits as `320`.
-          emit_number(out, group, name, *d)
+          push(tags, fold_double(*d));
         }
         PrintConvMode::ConvertBitrate => {
           if print_conv {
-            out.write_fmt(group, name, |w| write_convert_bitrate(w, *d))
+            push(tags, str_from_writer(|w| write_convert_bitrate(w, *d)));
           } else {
-            emit_number(out, group, name, *d)
+            push(tags, fold_double(*d));
           }
         }
         PrintConvMode::ConvertDuration => {
           if print_conv {
-            out.write_fmt(group, name, |w| write_convert_duration(w, *d))
+            push(tags, str_from_writer(|w| write_convert_duration(w, *d)));
           } else {
-            emit_number(out, group, name, *d)
+            push(tags, fold_double(*d));
           }
         }
         PrintConvMode::RoundMilli => {
@@ -3013,22 +3035,22 @@ fn emit_entry(
           // the rounded numeric (the value-semantic gate matches `20`
           // against `20.0`). For -n same (handled above).
           let rounded = (d * 1000.0 + 0.5).trunc() / 1000.0;
-          emit_number(out, group, name, rounded)
+          push(tags, fold_double(rounded));
         }
         PrintConvMode::RoundInt => {
           // Flash.pm:231 — `int($val + 0.5)`.
           let rounded = (d + 0.5).trunc();
           if print_conv {
             // -j: integer.
-            emit_number(out, group, name, rounded)
+            push(tags, fold_double(rounded));
           } else {
-            emit_number(out, group, name, *d)
+            push(tags, fold_double(*d));
           }
         }
         PrintConvMode::ConvertDateTime => {
           // Default options: ConvertDateTime is a no-op pass-through;
           // emit the raw double.
-          emit_number(out, group, name, *d)
+          push(tags, fold_double(*d));
         }
       }
     }
@@ -3040,9 +3062,9 @@ fn emit_entry(
       // bare number, matching Perl's silent fallthrough.
       let _ = print_conv; // bundled doesn't gate on the -n flag here
       match b {
-        0 => out.write_str(group, name, "No"),
-        1 => out.write_str(group, name, "Yes"),
-        _ => out.write_u64(group, name, u64::from(*b)),
+        0 => push(tags, TagValue::Str("No".into())),
+        1 => push(tags, TagValue::Str("Yes".into())),
+        _ => push(tags, TagValue::U64(u64::from(*b))),
       }
     }
     FlashValue::Str(s) => {
@@ -3065,23 +3087,26 @@ fn emit_entry(
       // bare JSON number the oracle carries.
       match entry.pc {
         PrintConvMode::ConvertDuration if print_conv => {
-          out.write_fmt(group, name, |w| write_convert_duration_str(w, s.as_str()))
+          push(
+            tags,
+            str_from_writer(|w| write_convert_duration_str(w, s.as_str())),
+          );
         }
         PrintConvMode::RoundMilli if print_conv => {
           // `int($val * 1000 + 0.5) / 1000` — raw arithmetic coercion of the
           // string (comma terminates; non-numeric ⇒ 0). Emit the rounded
           // numeric; the value-semantic gate matches the oracle's number.
           let rounded = (perl_str_to_f64(s.as_str()) * 1000.0 + 0.5).trunc() / 1000.0;
-          emit_number(out, group, name, rounded)
+          push(tags, fold_double(rounded));
         }
         // None / ConvertDateTime (pass-through), or `-n` for any pc: emit the
         // raw string. ConvertBitrate / RoundInt never reach here on a string
         // (their tags carry `mul_1000`, so `emit_resolved` already numified
         // the value to `FlashValue::Double`).
-        _ => out.write_str(group, name, s.as_str()),
+        _ => push(tags, TagValue::Str(s.clone())),
       }
     }
-    FlashValue::Date(s) => out.write_str(group, name, s.as_str()),
+    FlashValue::Date(s) => push(tags, TagValue::Str(s.clone())),
     FlashValue::List(items) => {
       // AMF strict-array (0x0a) — emit as a heterogeneous JSON array.
       // Each FlashListItem was already converted per-AMF-type at parse
@@ -3099,34 +3124,27 @@ fn emit_entry(
       // "0:01:01"]` under `-j`. Under `-n` PrintConv is skipped and the
       // raw numerics pass through (`[1.5,61]`). Pre-R12 the port emitted
       // the raw list for both modes, dropping the per-element PrintConv.
-      use crate::value::TagValue;
       let list: std::vec::Vec<TagValue> = items
         .iter()
         .map(|it| flash_list_item_with_pc(it, entry.pc, print_conv))
         .collect();
-      write_value_list(out, group, name, list)
+      push(tags, TagValue::List(list));
     }
   }
 }
 
-/// Number-emit helper for `-n`/`-j` numeric paths. Bundled `perl exiftool`
-/// stringifies a double via Perl `%.15g`; the serializer's number gate
-/// rounds f64 to 15 sig figs before serialization, so a value-equivalent
-/// f64 is enough. For an integer-valued double (e.g. `320.0`) we emit as
-/// integer to match bundled's `320` vs `320.0`.
+/// Build a [`TagValue::Str`](crate::value::TagValue::Str) by running a
+/// `write_*` closure into a fresh `String` — the golden-pattern replacement
+/// for the retired sink's `out.write_fmt(group, name, closure)` (an in-memory
+/// `String` write is infallible, so the closure's `Result` is discarded).
 #[cfg(feature = "alloc")]
 #[cfg_attr(not(feature = "json"), allow(dead_code))]
-fn emit_number(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  d: f64,
-) -> Result<(), core::convert::Infallible> {
-  if d.is_finite() && d.fract() == 0.0 && d >= i64::MIN as f64 && d <= i64::MAX as f64 {
-    out.write_i64(group, name, d as i64)
-  } else {
-    out.write_f64(group, name, d)
-  }
+fn str_from_writer(
+  f: impl FnOnce(&mut dyn core::fmt::Write) -> core::fmt::Result,
+) -> crate::value::TagValue {
+  let mut s = std::string::String::new();
+  let _ = f(&mut s);
+  crate::value::TagValue::Str(s.into())
 }
 
 /// Convert one [`FlashListItem`] to its `TagValue` shape, applying the
@@ -3286,20 +3304,30 @@ fn fold_double(d: f64) -> crate::value::TagValue {
   }
 }
 
-/// Emit a list of `TagValue` items under one `(group, name)` key. Used
-/// for AMF strict-array (0x0a) emission — the list may contain
-/// `TagValue::I64`/`F64` (doubles) interleaved with `TagValue::Str`
-/// (pre-converted booleans/strings/dates), matching bundled's
-/// heterogeneous JSON array shape.
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
 #[cfg(feature = "alloc")]
-#[cfg_attr(not(feature = "json"), allow(dead_code))]
-fn write_value_list(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  values: std::vec::Vec<crate::value::TagValue>,
-) -> Result<(), core::convert::Infallible> {
-  out.write_value_list(group, name, values)
+impl crate::metadata::Project for Meta<'_> {
+  /// Project Flash (FLV) metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// FLV is a video container: the faithful structural contribution is one
+  /// video [`TrackKind`](crate::metadata::TrackKind). A finer audio/video
+  /// split is not surfaced here — the typed `Meta` records only the emitted
+  /// `onMetaData` tags (which MAY include `audiocodecid` etc.), not a clean
+  /// "this file carries an audio stream" accessor the projection can consume
+  /// without re-parsing. Duration is left `None`: the decoded `Duration` is a
+  /// `Flash:Duration` TAG (ConvertDuration / raw seconds) inside the tag
+  /// stream, not a clean wall-clock accessor. Camera / lens / GPS / capture
+  /// stay `None` (FLV carries no such facts).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
+  }
 }
 
 // ===========================================================================
@@ -4093,5 +4121,90 @@ mod tests {
     assert_eq!(outcome, IntroOutcome::Ok);
     assert!(warnings.is_empty());
     assert_eq!(pos, 0);
+  }
+
+  /// Drive the `Meta` through the production sink path that replaced the
+  /// retired `serialize_tags`: the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for the tag stream, then —
+  /// exactly like the `format_parser::AnyMeta::Flv` arm — drain
+  /// [`Meta::warnings`] into the [`TagMap`](crate::tagmap::TagMap).
+  #[cfg(feature = "alloc")]
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    for warn in meta.warnings() {
+      let _ = w.write_warning(warn.as_str());
+    }
+    w
+  }
+
+  #[test]
+  fn taggable_emits_typed_tags() {
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Flash.flv"
+    ))
+    .expect("read Flash.flv fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("FLV accepted");
+    // -j: PrintConv strings + the per-tag conversions.
+    let tm = emit_into_tagmap(&meta, true);
+    assert_eq!(tm.get_str("Flash", "AudioEncoding"), Some("MP3".into()));
+    assert_eq!(
+      tm.get_str("Flash", "AudioChannels"),
+      Some("1 (mono)".into())
+    );
+    assert_eq!(tm.get_str("Flash", "Duration"), Some("3.09 s".into()));
+    assert_eq!(tm.get_str("Flash", "VideoBitrate"), Some("419 kbps".into()));
+    assert_eq!(tm.get_str("Flash", "HasVideo"), Some("Yes".into()));
+    // -n: AudioEncoding PrintConv off ⇒ the raw numeric code (MP3 ⇒ 2).
+    let tm = emit_into_tagmap(&meta, false);
+    assert_eq!(tm.get_str("Flash", "AudioEncoding"), Some("2".into()));
+    assert_eq!(tm.get_str("Flash", "ImageWidth"), Some("320".into()));
+  }
+
+  #[test]
+  fn taggable_group_is_flash_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Flash.flv"
+    ))
+    .expect("read Flash.flv fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty(), "the onMetaData packet must yield tags");
+    for t in &tags {
+      // family0 = "Flash" (table group); family1 = "Flash" (constant -G1 key).
+      assert_eq!(t.tag().group_ref().family0(), "Flash");
+      assert_eq!(t.tag().group_ref().family1(), "Flash");
+      assert!(!t.unknown(), "Flash has no Unknown=>1 tags");
+    }
+  }
+
+  #[test]
+  fn project_populates_video_track() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Flash.flv"
+    ))
+    .expect("read Flash.flv fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let projected = meta.project();
+    // FLV projects to a video container; the rest of MediaInfo is empty.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().created().is_none());
+    // FLV carries no camera / lens / GPS / capture facts here.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

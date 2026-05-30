@@ -888,7 +888,7 @@ fn condition_holds(cond: MakeCondition, make: &Option<SmolStr>) -> bool {
 // ===========================================================================
 
 /// One decoded H.264 value, kept post-byte-decode but pre-PrintConv (the
-/// `-j`/`-n` split happens in [`H264Meta::serialize_tags`]).
+/// `-j`/`-n` split happens in the [`Taggable`](crate::emit::Taggable) impl).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum H264Value {
@@ -2733,8 +2733,9 @@ fn smol_i64(n: i64) -> SmolStr {
 /// the words `inf`/`undef`/`Inf`/`NaN` and `:`-bearing TimeCode/GPS values stay
 /// strings (Codex R8 F1).
 ///
-/// Gated with `serialize_tags` (`feature = "alloc"`) — it is only consumed by
-/// the typed-Meta → `TagMap` lowering, which itself needs heap.
+/// Gated with the [`Taggable`](crate::emit::Taggable) emission path
+/// (`feature = "alloc"`) — it is only consumed by the typed-Meta → `TagMap`
+/// lowering, which itself needs heap.
 #[cfg(feature = "alloc")]
 enum JsonScalar {
   /// Matched the number gate with no fractional/exponent part and fits `u64`.
@@ -2839,22 +2840,30 @@ fn escape_json_is_number(s: &str) -> bool {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl H264Meta<'_> {
-  /// Emit the H.264 tags into the writer in extraction order (Perl
-  /// `HandleTag` call sequence).
+impl crate::emit::Taggable for H264Meta<'_> {
+  /// Yield the H.264 tags in extraction order (Perl `HandleTag` call
+  /// sequence) — the golden-pattern parallel to the retired `serialize_tags`:
+  /// the SINK changes (an [`EmittedTag`](crate::emit::EmittedTag) per value
+  /// instead of `out.write_*`), the per-tag PrintConv/ValueConv branches AND
+  /// the visibility filter are preserved verbatim. The `Warn` emission stays
+  /// OUT of this stream — `run_emission` has no warning channel; the
+  /// `format_parser::AnyMeta::H264` arm drains `self.warnings()` after the
+  /// engine (H264.pm:989).
   ///
-  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode);
-  /// `print_conv = false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings; `mode == ValueConv`
+  /// (`-n`) ⇒ post-ValueConv raw scalars (routed through ExifTool's
+  /// `EscapeJSON` number gate).
   ///
-  /// Each tag is emitted under its own family-1 group: `"H264"` for the SPS
-  /// image-size, the MDPM non-GPS tags, and every binary subdirectory tag
-  /// (H264.pm:43-53 — `%Image::ExifTool::H264::Main` and the MDPM table
-  /// resolve to `group 0/1 = H264`); `"GPS"` for the MDPM GPS block
-  /// (0xb0-0xca, `Groups => { 1 => 'GPS' }`, H264.pm:241-387 — Codex R5 F1).
+  /// Group: `family0` = `"H264"` (the `%H264::Main` table group — H264.pm
+  /// `GROUPS` sets only family2 `Video`/`Camera`, so family0 defaults to the
+  /// module name); `family1` = `entry.group().as_str()` (the per-entry `-G1`
+  /// key — `"H264"` for SPS / MDPM non-GPS / binary subdir tags, `"GPS"` for
+  /// the MDPM GPS block, H264.pm:241-387), byte-identical to the retired
+  /// sink. No H264 table row is `Unknown => 1` ⇒ `unknown: false`.
   ///
   /// ## `FoundTag` priority (Codex R15 F1)
   ///
@@ -2868,17 +2877,20 @@ impl H264Meta<'_> {
   /// `(N)` copy and shows only the priority winner (ExifTool.pm:5396-5404 and
   /// 5522-5538, `Duplicates` off — the supported output never sets `-a`). The
   /// [`crate::tagmap::TagMap`] models that DEFAULT one-per-`group:name` view, so
-  /// here we emit only the visible winner for each `group:name`: the entry with
+  /// here we yield only the visible winner for each `group:name`: the entry with
   /// the maximum [`H264Priority`], ties broken by LAST occurrence (the same
   /// last-wins `TagMap` already applies to equal-priority duplicates such as
   /// repeated AIFF `NAME` chunks). The relegated `(N)` copy is intentionally
-  /// not emitted — it is invisible under the default render the goldens pin; see
+  /// not yielded — it is invisible under the default render the goldens pin; see
   /// `docs/tracking.md` for the scoped `-a` duplicate-copy follow-up.
-  pub(crate) fn serialize_tags(
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
     for (idx, entry) in self.entries.iter().enumerate() {
       // Skip an entry that a higher-priority — or equal-priority-but-later —
       // same-`group:name` entry outranks (the relegated duplicate copy, dropped
@@ -2887,9 +2899,11 @@ impl H264Meta<'_> {
       if !self.is_visible_winner(idx, entry) {
         continue;
       }
-      let group = entry.group().as_str();
-      match entry.value_ref() {
-        H264Value::U64(n) => out.write_u64(group, entry.name(), *n)?,
+      // family0 "H264" (table group0); family1 = the per-entry group.
+      let group = Group::new("H264", entry.group().as_str());
+      let name = entry.name();
+      let value = match entry.value_ref() {
+        H264Value::U64(n) => TagValue::U64(*n),
         H264Value::Text(t) => {
           if print_conv {
             // `-j` ⇒ the PrintConv string. ExifTool's `EscapeJSON` number gate
@@ -2897,34 +2911,31 @@ impl H264Meta<'_> {
             // as a bare number), but the shared `TagValue::Str` serializer +
             // `json_equivalent` already model that string↔number coercion, so
             // emitting the raw string here is faithful for `-j`.
-            out.write_str(group, entry.name(), t.print_conv())?;
+            TagValue::Str(t.print_conv().into())
           } else {
             // `-n` ⇒ the post-ValueConv scalar. Route it through ExifTool's
             // `EscapeJSON` number gate so a numeric value lands as a bare JSON
-            // NUMBER (`write_u64`/`write_i64`/`write_f64`), exactly as bundled
-            // `ParseH264Video` emits it; non-numeric words (`inf`, `undef`,
-            // `Inf`, `NaN`) and `:`-bearing TimeCode/GPS values stay strings
-            // (Codex R8 F1).
+            // NUMBER (`U64`/`I64`/`F64`), exactly as bundled `ParseH264Video`
+            // emits it; non-numeric words (`inf`, `undef`, `Inf`, `NaN`) and
+            // `:`-bearing TimeCode/GPS values stay strings (Codex R8 F1).
             let n = t.numeric();
             match classify_json_scalar(n) {
-              JsonScalar::U64(v) => out.write_u64(group, entry.name(), v)?,
-              JsonScalar::I64(v) => out.write_i64(group, entry.name(), v)?,
-              JsonScalar::F64(v) => out.write_f64(group, entry.name(), v)?,
-              JsonScalar::Str => out.write_str(group, entry.name(), n)?,
+              JsonScalar::U64(v) => TagValue::U64(v),
+              JsonScalar::I64(v) => TagValue::I64(v),
+              JsonScalar::F64(v) => TagValue::F64(v),
+              JsonScalar::Str => TagValue::Str(n.into()),
             }
           }
         }
-      }
+      };
+      tags.push(EmittedTag::new(group, name.into(), value, false));
     }
-    // H264.pm:989 `$et->Warn('Entries in MDPM directory are out of
-    // sequence')`. The bundled output joins these into the same `%noDups`
-    // set as the tags (exiftool:2951), surfaced as `ExifTool:Warning`.
-    for w in &self.warnings {
-      out.write_warning(w.as_str())?;
-    }
-    Ok(())
+    tags.into_iter()
   }
+}
 
+#[cfg(feature = "alloc")]
+impl H264Meta<'_> {
   /// `true` when `entry` (at extraction index `idx`) is the value the default
   /// render shows for its `group:name` — i.e. no OTHER entry with the same
   /// `group:name` outranks it. An entry is outranked by a peer with strictly
@@ -2958,6 +2969,32 @@ impl H264Meta<'_> {
 }
 
 // ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for H264Meta<'_> {
+  /// Project H.264 metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// H.264 is a video elementary stream (parsed only as the M2TS PES-payload
+  /// callback), so the single faithful structural contribution is one video
+  /// [`TrackKind`](crate::metadata::TrackKind). The SPS pixel dimensions are
+  /// surfaced as the `H264:ImageWidth`/`ImageHeight` TAGS but are not mapped
+  /// onto [`MediaInfo`](crate::metadata::MediaInfo) here (the typed `Meta`
+  /// carries them only inside the tag stream, not as clean `u32` accessors);
+  /// duration / created stay `None` (an elementary stream carries no
+  /// container duration). Camera / lens / GPS / capture stay `None` — those
+  /// MDPM facts surface as tags but have no normalized-domain slot yet.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
+  }
+}
+
+// ===========================================================================
 // `Error` — Rust-level fatal modes (currently none)
 // ===========================================================================
 
@@ -2984,6 +3021,26 @@ pub enum H264Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Drive the `H264Meta` through the production sink path that replaced the
+  /// retired `serialize_tags`: the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for the tag stream, then —
+  /// exactly like the `format_parser::AnyMeta::H264` arm — drain
+  /// [`H264Meta::warnings`] into the [`TagMap`](crate::tagmap::TagMap) as
+  /// `Warning`s (H264.pm:989/1058). Returns the populated map.
+  #[cfg(feature = "alloc")]
+  fn emit_into_tagmap(meta: &H264Meta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    for warn in meta.warnings() {
+      let _ = w.write_warning(warn.as_str());
+    }
+    w
+  }
 
   /// Emulation-prevention encoder — the inverse of [`unescape_rbsp`], used
   /// to build test NAL bodies the way a real H.264 encoder would.
@@ -3069,8 +3126,7 @@ mod tests {
   fn avchd_fixture_print_conv_tags() {
     let data = avchd_fixture();
     let meta = parse_borrowed(&data).unwrap().unwrap();
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     // -j mode — PrintConv labels.
     assert_eq!(
       tm.get_str("H264", "TimeCode").as_deref(),
@@ -3097,8 +3153,7 @@ mod tests {
   fn avchd_fixture_numeric_tags() {
     let data = avchd_fixture();
     let meta = parse_borrowed(&data).unwrap().unwrap();
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, false);
     // -n mode — raw post-ValueConv scalars.
     assert_eq!(
       tm.get_str("H264", "TimeCode").as_deref(),
@@ -3139,19 +3194,19 @@ mod tests {
     assert_eq!(names, ["WhiteBalance"], "must stop before the 0xa2 record");
 
     // Codex R7 F1 — H264.pm:989 emits the out-of-sequence Warn. The typed
-    // meta must carry it and `serialize_tags` must surface it as a TagMap
-    // warning (the engine's `ExifTool:Warning`).
+    // meta must carry it and the production sink path (the
+    // `format_parser::AnyMeta::H264` arm, replicated by `emit_into_tagmap`)
+    // must surface it as a TagMap warning (the engine's `ExifTool:Warning`).
     assert_eq!(
       meta.warnings(),
       ["Entries in MDPM directory are out of sequence"],
       "out-of-order MDPM must record the H264.pm:989 warning"
     );
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     assert_eq!(
       tm.first_warning(),
       Some("Entries in MDPM directory are out of sequence"),
-      "serialize_tags must emit the warning into the TagMap"
+      "the H264 arm must emit the warning into the TagMap after run_emission"
     );
   }
 
@@ -3212,8 +3267,7 @@ mod tests {
 
     // The VISIBLE WhiteBalance is the higher-priority Camera1 "Hold", NOT the
     // later Priority=>0 "Auto" — `-j` PrintConv.
-    let mut j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut j).unwrap();
+    let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "WhiteBalance").as_deref(),
       Some("Hold"),
@@ -3221,8 +3275,7 @@ mod tests {
     );
 
     // `-n` post-ValueConv: the Camera1 raw `1`, not the 0xa8 raw `0`.
-    let mut n = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut n).unwrap();
+    let n = emit_into_tagmap(&meta, false);
     assert_eq!(
       n.get_str("H264", "WhiteBalance").as_deref(),
       Some("1"),
@@ -3269,8 +3322,7 @@ mod tests {
       warnings: Vec::new(),
       _marker: core::marker::PhantomData,
     };
-    let mut j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut j).unwrap();
+    let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "WhiteBalance").as_deref(),
       Some("Hold"),
@@ -3303,8 +3355,7 @@ mod tests {
       .unwrap();
     assert!(wb.group().is_h264(), "non-GPS MDPM ⇒ family-1 H264");
     // serialize_tags must key the GPS tag under "GPS".
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     assert_eq!(
       tm.get_str("GPS", "GPSLatitudeRef").as_deref(),
       Some("North")
@@ -3325,8 +3376,7 @@ mod tests {
       0xbe, b'Z', 0x00, 0x00, 0x00, // GPSStatus="Z" (string-enum miss)
     ]);
     let meta = parse_borrowed(&stream).unwrap().unwrap();
-    let mut j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut j).unwrap();
+    let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "ExposureProgram").as_deref(),
       Some("Unknown (9)")
@@ -3339,8 +3389,7 @@ mod tests {
       j.get_str("GPS", "GPSStatus").as_deref(),
       Some("Unknown (Z)")
     );
-    let mut n = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut n).unwrap();
+    let n = emit_into_tagmap(&meta, false);
     assert_eq!(n.get_str("H264", "ExposureProgram").as_deref(), Some("9"));
     assert_eq!(n.get_str("H264", "Flash").as_deref(), Some("153"));
     assert_eq!(n.get_str("GPS", "GPSStatus").as_deref(), Some("Z"));
@@ -3353,14 +3402,12 @@ mod tests {
     // `39321` in -n — NOT the `RawConv` "Unknown" string (Codex R5 F2).
     let stream = mdpm_stream(&[0xe0, 0x99, 0x99, 0x00, 0x00]);
     let meta = parse_borrowed(&stream).unwrap().unwrap();
-    let mut j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut j).unwrap();
+    let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "Make").as_deref(),
       Some("Unknown (0x9999)")
     );
-    let mut n = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut n).unwrap();
+    let n = emit_into_tagmap(&meta, false);
     assert_eq!(n.get_str("H264", "Make").as_deref(), Some("39321"));
   }
 
@@ -3371,8 +3418,7 @@ mod tests {
     // (Codex R5 F2). b1=0x50 ⇒ ep=5; b2=0xa0 ⇒ wb=5; b3=0xff ⇒ no Focus.
     let stream = mdpm_stream(&[0x70, 0x00, 0x50, 0xa0, 0xff]);
     let meta = parse_borrowed(&stream).unwrap().unwrap();
-    let mut j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut j).unwrap();
+    let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "ExposureProgram").as_deref(),
       Some("Unknown (5)")
@@ -3381,8 +3427,7 @@ mod tests {
       j.get_str("H264", "WhiteBalance").as_deref(),
       Some("Unknown (5)")
     );
-    let mut n = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut n).unwrap();
+    let n = emit_into_tagmap(&meta, false);
     assert_eq!(n.get_str("H264", "ExposureProgram").as_deref(), Some("5"));
     assert_eq!(n.get_str("H264", "WhiteBalance").as_deref(), Some("5"));
   }
@@ -3445,8 +3490,7 @@ mod tests {
     stream.extend_from_slice(sps_rbsp);
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
     let meta = parse_borrowed(&stream).unwrap().unwrap();
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("H264", "ImageWidth").as_deref(), Some("1280"));
     assert_eq!(tm.get_str("H264", "ImageHeight").as_deref(), Some("720"));
   }
@@ -3963,5 +4007,60 @@ mod tests {
       .find(|e| e.name() == "WhiteBalance")
       .expect("the 0xa8 record inside the 255-entry block must emit");
     assert!(wb.group().is_h264());
+  }
+
+  #[test]
+  fn taggable_group_is_h264_family0_and_entry_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let data = avchd_fixture();
+    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty(), "the MDPM block must yield tags");
+    // No H264 table row is `Unknown => 1`.
+    assert!(tags.iter().all(|t| !t.unknown()));
+    // family0 is the constant "H264" table group; the avchd fixture's tags
+    // (TimeCode / ExposureProgram / WhiteBalance / Make …) are all in the
+    // family-1 "H264" group (no GPS block in this fixture).
+    assert!(tags.iter().all(|t| t.tag().group_ref().family0() == "H264"));
+    let time_code = tags
+      .iter()
+      .find(|t| t.tag().name() == "TimeCode")
+      .expect("TimeCode emitted");
+    assert_eq!(time_code.tag().group_ref().family1(), "H264");
+  }
+
+  #[test]
+  fn taggable_yields_only_visible_winner_for_duplicate_name() {
+    use crate::emit::{ConvMode, Taggable};
+    // The 255-entry maximal block ends with a real 0xa8 WhiteBalance; build a
+    // meta whose tag stream the visibility filter governs. Here we reuse the
+    // avchd fixture (single WhiteBalance) and assert the filter yields exactly
+    // one WhiteBalance — the engine's one-per-`group:name` default render.
+    let data = avchd_fixture();
+    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let wb_count = meta
+      .tags(ConvMode::PrintConv)
+      .filter(|t| t.tag().name() == "WhiteBalance")
+      .count();
+    assert_eq!(wb_count, 1, "the visibility filter yields one winner");
+  }
+
+  #[test]
+  fn project_populates_video_track() {
+    use crate::metadata::{Project, TrackKind};
+    let data = avchd_fixture();
+    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let projected = meta.project();
+    // H.264 is a video elementary stream ⇒ a single video track kind.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().created().is_none());
+    // The MDPM camera facts surface as tags but have no domain slot yet.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

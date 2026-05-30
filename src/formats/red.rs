@@ -1571,38 +1571,74 @@ fn dispatch_directory_tag<'a>(
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 const GROUP: &str = "Red";
 
+/// Build the family-0 = family-1 = `"Red"` group for every emitted R3D tag.
+/// `family1` is the `-G1` key (golden-verified `"Red:…"`); Red.pm:168 sets
+/// only `GROUPS{2} => 'Video'`, so family0 defaults to the module name.
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit R3D tags into the writer in faithful Red.pm emission order:
+#[inline]
+fn red_group() -> crate::value::Group {
+  crate::value::Group::new(GROUP, GROUP)
+}
+
+/// Push one already-rendered R3D tag (no `Unknown => 1` in Red.pm ⇒
+/// `unknown: false`).
+#[cfg(feature = "alloc")]
+#[inline]
+fn push_red(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, name: &str, value: TagValue) {
+  tags.push(crate::emit::EmittedTag::new(
+    red_group(),
+    name.into(),
+    value,
+    false,
+  ));
+}
+
+#[cfg(feature = "alloc")]
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield R3D tags in faithful Red.pm emission order:
   ///
   /// 1. RED1/RED2 header subtable fields (Red.pm:240 HandleTag).
   /// 2. Directory tags in walk order (Red.pm:277-291).
-  /// 3. Warnings via `TagMap::write_warning`.
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j`);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n`).
-  pub(crate) fn serialize_tags(
+  /// The golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`), the per-tag PrintConv/ValueConv branches are
+  /// preserved verbatim. `mode == PrintConv` (`-j`) ⇒ PrintConv formatted
+  /// strings; `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `family1` = `"Red"` (golden `"Red:…"`; see
+  /// [`red_group`]). Red.pm has no `Unknown => 1` tags ⇒ `unknown: false`.
+  ///
+  /// **Warnings are NOT part of this stream.** Red.pm's `$et->Warn`
+  /// accumulator ([`Self::warnings`]) has no [`EmittedTag`] channel —
+  /// [`run_emission`](crate::emit::run_emission) only carries tags. The
+  /// `AnyMeta::R3d` arm in [`crate::format_parser`] writes them into the
+  /// [`TagMap`](crate::tagmap::TagMap) after `run_emission`, so they still
+  /// surface through `TagMap::first_warning`.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+
     // 1. Header subtable fields.
     if let Some(v) = self.redcode_version_str() {
       // RedcodeVersion is an ASCII digit string; ExifTool's JSON emitter
       // numerically-coerces such strings under -j and -n.
       let n: u64 = v.parse().unwrap_or(0);
-      out.write_u64(GROUP, "RedcodeVersion", n)?;
+      push_red(&mut tags, "RedcodeVersion", TagValue::U64(n));
     }
     if let Some(w) = self.image_width {
-      out.write_u64(GROUP, "ImageWidth", u64::from(w))?;
+      push_red(&mut tags, "ImageWidth", TagValue::U64(u64::from(w)));
     }
     if let Some(h) = self.image_height {
-      out.write_u64(GROUP, "ImageHeight", u64::from(h))?;
+      push_red(&mut tags, "ImageHeight", TagValue::U64(u64::from(h)));
     }
     if let Some(fr) = &self.frame_rate {
       // Red.pm:169/202 PrintConv `int($val*1000+0.5)/1000`.
@@ -1610,217 +1646,251 @@ impl Meta<'_> {
         FrameRate::Rational(r) => TagValue::Rational(r.clone()),
         FrameRate::F64(n) => TagValue::F64(*n),
       };
-      if print_conv {
-        out.write_f64(GROUP, "FrameRate", round_to_3dp(&pre_pc))?;
+      let value = if print_conv {
+        TagValue::F64(round_to_3dp(&pre_pc))
       } else {
         // -n raw: Rational → `%.7g` text → f64.
         let raw_f = match fr {
           FrameRate::Rational(r) => perl_arithmetic_to_f64(&r.exiftool_val_str()),
           FrameRate::F64(n) => *n,
         };
-        out.write_f64(GROUP, "FrameRate", raw_f)?;
-      }
+        TagValue::F64(raw_f)
+      };
+      push_red(&mut tags, "FrameRate", value);
     }
     if let Some(n) = self.red1_original_file_name {
-      out.write_str(GROUP, "OriginalFileName", n)?;
+      push_red(&mut tags, "OriginalFileName", TagValue::Str(n.into()));
     }
 
     // 2. Directory tags in walk order.
     for dt in &self.directory_tag_order {
-      self.sink_directory_tag(*dt, print_conv, out)?;
+      self.push_directory_tag(*dt, print_conv, &mut tags);
     }
 
-    // 3. Warnings.
-    for w in &self.warnings {
-      out.write_warning(w)?;
-    }
-    Ok(())
+    tags.into_iter()
   }
 }
 
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project R3D (Redcode) metadata onto the normalized [`MediaMetadata`]
+  /// domain.
+  ///
+  /// R3D is Redcode VIDEO (`%Red::Main` `GROUPS{2} => 'Video'`,
+  /// Red.pm:168). The faithful [`MediaInfo`](crate::metadata::MediaInfo)
+  /// contributions are the header pixel dimensions
+  /// (`ImageWidth`/`ImageHeight`, when present) and a single video
+  /// [`TrackKind`](crate::metadata::TrackKind). Duration is NOT decoded by
+  /// `ProcessR3D` (Red.pm extracts a per-frame `FrameRate`, not a clip
+  /// duration — there is no frame count to multiply), and `MediaInfo` has
+  /// no frame-rate slot, so `duration` stays `None`; `created` stays `None`
+  /// (the R3D dates are camera/storage timestamps, not a single canonical
+  /// container creation time the domain models). The lens-identity facts
+  /// (`LensModel` etc.) are deferred (no Red-specific projection lands them
+  /// yet); the camera / lens / GPS / capture domains stay `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media
+      .media_mut()
+      .update_width(self.image_width)
+      .update_height(self.image_height);
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl Meta<'_> {
-  /// Emit a single directory tag.
-  fn sink_directory_tag(
+  /// Push a single directory tag (golden-pattern parallel to the retired
+  /// `sink_directory_tag`: each `out.write_*(GROUP, name, v)` becomes a
+  /// [`push_red`]; the per-tag PrintConv/ValueConv branches are preserved
+  /// verbatim).
+  fn push_directory_tag(
     &self,
     dt: DirectoryTag,
     print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+  ) {
     match dt.id() {
       0x1000 => {
         if let Some(v) = self.start_edge_code {
-          out.write_str(GROUP, "StartEdgeCode", v)?;
+          push_red(tags, "StartEdgeCode", TagValue::Str(v.into()));
         }
       }
       0x1001 => {
         if let Some(v) = self.start_timecode {
-          out.write_str(GROUP, "StartTimecode", v)?;
+          push_red(tags, "StartTimecode", TagValue::Str(v.into()));
         }
       }
       0x1002 => {
         if let Some(v) = self.other_date_1.as_deref() {
-          out.write_str(GROUP, "OtherDate1", v)?;
+          push_red(tags, "OtherDate1", TagValue::Str(v.into()));
         }
       }
       0x1003 => {
         if let Some(v) = self.other_date_2.as_deref() {
-          out.write_str(GROUP, "OtherDate2", v)?;
+          push_red(tags, "OtherDate2", TagValue::Str(v.into()));
         }
       }
       0x1004 => {
         if let Some(v) = self.other_date_3.as_deref() {
-          out.write_str(GROUP, "OtherDate3", v)?;
+          push_red(tags, "OtherDate3", TagValue::Str(v.into()));
         }
       }
       0x1005 => {
         if let Some(v) = self.date_time_original.as_deref() {
           // Red.pm:73 PrintConv `$self->ConvertDateTime($val)` is the
           // identity under default options.
-          out.write_str(GROUP, "DateTimeOriginal", v)?;
+          push_red(tags, "DateTimeOriginal", TagValue::Str(v.into()));
         }
       }
       0x1006 => {
         if let Some(v) = self.serial_number {
-          out.write_str(GROUP, "SerialNumber", v)?;
+          push_red(tags, "SerialNumber", TagValue::Str(v.into()));
         }
       }
       0x1019 => {
         if let Some(v) = self.camera_type {
-          out.write_str(GROUP, "CameraType", v)?;
+          push_red(tags, "CameraType", TagValue::Str(v.into()));
         }
       }
       0x101a => {
         if let Some(v) = &self.reel_number {
           // Bundled output: JSON integer when on-disk numeric.
           match v {
-            R3dStrOrInt::Str(s) => out.write_str(GROUP, "ReelNumber", s)?,
-            R3dStrOrInt::I64(n) => out.write_i64(GROUP, "ReelNumber", *n)?,
+            R3dStrOrInt::Str(s) => push_red(tags, "ReelNumber", TagValue::Str((*s).into())),
+            R3dStrOrInt::I64(n) => push_red(tags, "ReelNumber", TagValue::I64(*n)),
           }
         }
       }
       0x101b => {
         if let Some(v) = self.take {
-          out.write_str(GROUP, "Take", v)?;
+          push_red(tags, "Take", TagValue::Str(v.into()));
         }
       }
       0x1023 => {
         if let Some(v) = self.date_created.as_deref() {
-          out.write_str(GROUP, "DateCreated", v)?;
+          push_red(tags, "DateCreated", TagValue::Str(v.into()));
         }
       }
       0x1024 => {
         if let Some(v) = self.time_created.as_deref() {
-          out.write_str(GROUP, "TimeCreated", v)?;
+          push_red(tags, "TimeCreated", TagValue::Str(v.into()));
         }
       }
       0x1025 => {
         if let Some(v) = self.firmware_version {
-          out.write_str(GROUP, "FirmwareVersion", v)?;
+          push_red(tags, "FirmwareVersion", TagValue::Str(v.into()));
         }
       }
       0x1029 => {
         if let Some(v) = self.reel_timecode {
-          out.write_str(GROUP, "ReelTimecode", v)?;
+          push_red(tags, "ReelTimecode", TagValue::Str(v.into()));
         }
       }
       0x102a => {
         if let Some(v) = self.storage_type {
-          out.write_str(GROUP, "StorageType", v)?;
+          push_red(tags, "StorageType", TagValue::Str(v.into()));
         }
       }
       0x1030 => {
         if let Some(v) = self.storage_format_date.as_deref() {
-          out.write_str(GROUP, "StorageFormatDate", v)?;
+          push_red(tags, "StorageFormatDate", TagValue::Str(v.into()));
         }
       }
       0x1031 => {
         if let Some(v) = self.storage_format_time.as_deref() {
-          out.write_str(GROUP, "StorageFormatTime", v)?;
+          push_red(tags, "StorageFormatTime", TagValue::Str(v.into()));
         }
       }
       0x1032 => {
         if let Some(v) = self.storage_serial_number {
-          out.write_str(GROUP, "StorageSerialNumber", v)?;
+          push_red(tags, "StorageSerialNumber", TagValue::Str(v.into()));
         }
       }
       0x1033 => {
         if let Some(v) = self.storage_model {
-          out.write_str(GROUP, "StorageModel", v)?;
+          push_red(tags, "StorageModel", TagValue::Str(v.into()));
         }
       }
       0x1036 => {
         if let Some(v) = self.aspect_ratio {
-          out.write_str(GROUP, "AspectRatio", v)?;
+          push_red(tags, "AspectRatio", TagValue::Str(v.into()));
         }
       }
       0x1042 => {
         if let Some(v) = self.revision {
-          out.write_str(GROUP, "Revision", v)?;
+          push_red(tags, "Revision", TagValue::Str(v.into()));
         }
       }
       0x1056 => {
         if let Some(v) = self.original_file_name {
-          out.write_str(GROUP, "OriginalFileName", v)?;
+          push_red(tags, "OriginalFileName", TagValue::Str(v.into()));
         }
       }
       0x106e => {
         if let Some(v) = self.lens_make {
-          out.write_str(GROUP, "LensMake", v)?;
+          push_red(tags, "LensMake", TagValue::Str(v.into()));
         }
       }
       0x106f => {
         if let Some(v) = self.lens_number {
-          out.write_str(GROUP, "LensNumber", v)?;
+          push_red(tags, "LensNumber", TagValue::Str(v.into()));
         }
       }
       0x1070 => {
         if let Some(v) = self.lens_model {
-          out.write_str(GROUP, "LensModel", v)?;
+          push_red(tags, "LensModel", TagValue::Str(v.into()));
         }
       }
       0x1071 => {
         if let Some(v) = self.model {
-          out.write_str(GROUP, "Model", v)?;
+          push_red(tags, "Model", TagValue::Str(v.into()));
         }
       }
       0x107c => {
         if let Some(v) = self.camera_operator {
-          out.write_str(GROUP, "CameraOperator", v)?;
+          push_red(tags, "CameraOperator", TagValue::Str(v.into()));
         }
       }
       0x1086 => {
         if let Some(v) = self.video_format {
-          out.write_str(GROUP, "VideoFormat", v)?;
+          push_red(tags, "VideoFormat", TagValue::Str(v.into()));
         }
       }
       0x1096 => {
         if let Some(v) = self.filter {
-          out.write_str(GROUP, "Filter", v)?;
+          push_red(tags, "Filter", TagValue::Str(v.into()));
         }
       }
       0x10a0 => {
         if let Some(v) = self.brain {
-          out.write_str(GROUP, "Brain", v)?;
+          push_red(tags, "Brain", TagValue::Str(v.into()));
         }
       }
       0x10a1 => {
         if let Some(v) = self.sensor {
-          out.write_str(GROUP, "Sensor", v)?;
+          push_red(tags, "Sensor", TagValue::Str(v.into()));
         }
       }
       0x10be => {
         if let Some(v) = self.quality {
-          out.write_str(GROUP, "Quality", v)?;
+          push_red(tags, "Quality", TagValue::Str(v.into()));
         }
       }
       0x200d => {
         if let Some(v) = &self.color_temperature {
-          emit_r3d_value(out, "ColorTemperature", v)?;
+          push_r3d_value(tags, "ColorTemperature", v);
         }
       }
       0x204b => {
         if let Some(v) = &self.rgb_curves {
-          emit_r3d_value(out, "RGBCurves", v)?;
+          push_r3d_value(tags, "RGBCurves", v);
         }
       }
       0x2066 => {
@@ -1834,67 +1904,63 @@ impl Meta<'_> {
               Value::Bytes(_) => TagValue::I64(0),
               Value::Rational(r) => TagValue::Rational(r.clone()),
             };
-            out.write_f64(GROUP, "OriginalFrameRate", round_to_3dp(&raw))?;
+            push_red(tags, "OriginalFrameRate", TagValue::F64(round_to_3dp(&raw)));
           } else {
-            emit_r3d_value(out, "OriginalFrameRate", v)?;
+            push_r3d_value(tags, "OriginalFrameRate", v);
           }
         }
       }
       0x4037 => {
         if let Some(v) = &self.crop_area {
-          emit_r3d_value(out, "CropArea", v)?;
+          push_r3d_value(tags, "CropArea", v);
         }
       }
       0x403b => {
         if let Some(v) = &self.iso {
-          emit_r3d_value(out, "ISO", v)?;
+          push_r3d_value(tags, "ISO", v);
         }
       }
       0x406a => {
         if let Some(v) = self.f_number {
-          out.write_f64(GROUP, "FNumber", v)?;
+          push_red(tags, "FNumber", TagValue::F64(v));
         }
       }
       0x406b => {
         if let Some(v) = &self.focal_length {
-          emit_r3d_value(out, "FocalLength", v)?;
+          push_r3d_value(tags, "FocalLength", v);
         }
       }
       0x606c => {
         if let Some(v) = self.focus_distance {
           if print_conv {
             // Red.pm:147 PrintConv `"$val m"`.
-            out.write_fmt(GROUP, "FocusDistance", |w| {
-              w.write_str(&focus_distance_print_conv(v))
-            })?;
+            push_red(
+              tags,
+              "FocusDistance",
+              TagValue::Str(focus_distance_print_conv(v).into()),
+            );
           } else {
-            out.write_f64(GROUP, "FocusDistance", v)?;
+            push_red(tags, "FocusDistance", TagValue::F64(v));
           }
         }
       }
       _ => {}
     }
-    Ok(())
   }
 }
 
-/// Emit a generic `Value` (no per-tag PrintConv).
+/// Push a generic `Value` (no per-tag PrintConv) — golden-pattern parallel
+/// to the retired `emit_r3d_value`.
 #[cfg(feature = "alloc")]
-fn emit_r3d_value(
-  out: &mut crate::tagmap::TagMap,
-  name: &str,
-  v: &Value<'_>,
-) -> Result<(), core::convert::Infallible> {
-  match v {
-    Value::I64(n) => out.write_i64(GROUP, name, *n),
-    Value::F64(n) => out.write_f64(GROUP, name, *n),
-    Value::Str(s) => out.write_str(GROUP, name, s.as_str()),
-    Value::Bytes(b) => out.write_bytes(GROUP, name, b),
-    Value::Rational(r) => {
-      let f = perl_arithmetic_to_f64(&r.exiftool_val_str());
-      out.write_f64(GROUP, name, f)
-    }
-  }
+fn push_r3d_value(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, name: &str, v: &Value<'_>) {
+  let value = match v {
+    Value::I64(n) => TagValue::I64(*n),
+    Value::F64(n) => TagValue::F64(*n),
+    Value::Str(s) => TagValue::Str(s.as_str().into()),
+    Value::Bytes(b) => TagValue::Bytes(b.clone()),
+    Value::Rational(r) => TagValue::F64(perl_arithmetic_to_f64(&r.exiftool_val_str())),
+  };
+  push_red(tags, name, value);
 }
 
 // ===========================================================================
@@ -2338,17 +2404,27 @@ mod tests {
     assert_eq!(meta.start_edge_code(), Some("01:49:54:11"));
   }
 
+  /// Drive `meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)).
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    w
+  }
+
   #[test]
-  fn meta_sinker_emits_typed_tags_via_map_writer() {
-    use crate::tagmap::TagMap;
+  fn taggable_emits_typed_tags() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
     let meta = parse_borrowed(&bytes)
       .expect("ok")
       .expect("real Red.r3d parses");
     // PrintConv ON.
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Red", "RedcodeVersion"), Some("2".to_string()));
     assert_eq!(w.get_str("Red", "ImageWidth"), Some("5120".to_string()));
     assert_eq!(w.get_str("Red", "FrameRate"), Some("23.976".to_string()));
@@ -2357,8 +2433,7 @@ mod tests {
       Some("-0.001 m".to_string())
     );
     // PrintConv OFF (raw F64).
-    let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, false);
     let fr = w.get("Red", "FrameRate").unwrap();
     let raw_f = match fr {
       TagValue::F64(n) => *n,
@@ -2371,5 +2446,50 @@ mod tests {
       other => panic!("expected F64 for FocusDistance, got {other:?}"),
     };
     assert_eq!(raw_fd, -0.001);
+  }
+
+  #[test]
+  fn taggable_group_is_red_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
+    let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
+    let meta = parse_borrowed(&bytes)
+      .expect("ok")
+      .expect("real Red.r3d parses");
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty());
+    for t in &tags {
+      // family0 = family1 = "Red" (golden `"Red:…"`; Red.pm:168 sets only
+      // GROUPS{2}='Video', so family0 defaults to the module name).
+      assert_eq!(t.tag().group_ref().family0(), "Red");
+      assert_eq!(t.tag().group_ref().family1(), "Red");
+      assert!(!t.unknown(), "Red has no Unknown=>1 tags");
+    }
+    // First emitted tag is the RED2 header RedcodeVersion.
+    assert_eq!(tags[0].tag().name(), "RedcodeVersion");
+  }
+
+  #[test]
+  fn project_populates_video_track_and_dimensions() {
+    use crate::metadata::{Project, TrackKind};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
+    let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
+    let meta = parse_borrowed(&bytes)
+      .expect("ok")
+      .expect("real Red.r3d parses");
+    let projected = meta.project();
+    // R3D is Redcode video: one video track kind + header pixel dimensions.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert_eq!(projected.media().width(), Some(5120));
+    assert!(projected.media().height().is_some());
+    // ProcessR3D decodes no clip duration / canonical created time.
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().created().is_none());
+    // Camera / lens / GPS / capture domains stay None (no Red projection yet).
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

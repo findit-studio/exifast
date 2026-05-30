@@ -51,6 +51,8 @@ pub use detected::{BaseRule, ChildByteOrder, DetectedMakerNote};
 pub use dispatcher::dispatch;
 pub use offset::resolve_child_base;
 pub use vendor::{Vendor, VendorStatus};
+#[cfg(feature = "alloc")]
+pub use vendors::VendorEmission;
 pub use vendors::{
   AppleMakerNote, CanonMakerNote, DjiMakerNote, GoProMakerNote, PanasonicMakerNote, SonyMakerNote,
 };
@@ -68,7 +70,7 @@ pub use vendors::{
 /// emits into (Phase 2+).
 ///
 /// D8: no public fields; accessors only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MakerNotesMeta {
   /// The dispatched vendor (newtype-only D8 enum).
   detected: DetectedMakerNote,
@@ -103,6 +105,50 @@ impl MakerNotesMeta {
       gopro: None,
       dji: None,
     }
+  }
+
+  /// Replace the Apple slot — used by the IFD walker during walk to
+  /// populate the typed surface from the parsed Apple body.
+  #[inline(always)]
+  pub fn set_apple(&mut self, apple: AppleMakerNote) {
+    self.apple = Some(apple);
+  }
+
+  /// Replace the Canon slot — used by the IFD walker during walk.
+  #[inline(always)]
+  pub fn set_canon(&mut self, canon: CanonMakerNote) {
+    self.canon = Some(canon);
+  }
+
+  /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
+  /// dispatcher resolved a Phase-2-supported vendor.
+  ///
+  /// Phase 2 populates [`Self::apple`] and [`Self::canon`] from the
+  /// captured blob; Phase 3/4 (Sony, Panasonic, GoPro, DJI) still leaves
+  /// the slot empty.
+  ///
+  /// `blob` is the raw 0x927C MakerNote value; `parent_order` is the
+  /// parent IFD walk's byte order (used as the body-marker fallback per
+  /// [`resolve_child_byte_order`]).
+  #[must_use]
+  pub fn from_blob(
+    detected: DetectedMakerNote,
+    blob: &[u8],
+    parent_order: crate::exif::ifd::ByteOrder,
+  ) -> Self {
+    let mut meta = Self::from_detected(detected);
+    match detected.vendor() {
+      Vendor::Apple => {
+        let (typed, _emissions) = vendors::apple::parse(blob, parent_order);
+        meta.apple = Some(typed);
+      }
+      Vendor::Canon => {
+        let (typed, _emissions) = vendors::canon::parse(blob, parent_order);
+        meta.canon = Some(typed);
+      }
+      _ => {}
+    }
+    meta
   }
 
   /// The dispatched [`Vendor`] — the most useful Phase-1 accessor.

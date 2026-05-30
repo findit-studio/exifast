@@ -716,120 +716,192 @@ fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit DSF tags into the writer in `%DSF::Main` ascending-key order
-  /// (DSF.pm has no `FIRST_ENTRY` hint, so ExifTool walks keys via
-  /// `sort { $a <=> $b }` — DSF_KEYS). Family-0/1 group is `"File"`
-  /// (DSF.pm:22).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield DSF tags in `%DSF::Main` ascending-key order (DSF.pm has no
+  /// `FIRST_ENTRY` hint, so ExifTool walks keys via `sort { $a <=> $b }` —
+  /// [`DSF_KEYS`]), then splice the chained ID3v2 trailer tags. The
+  /// golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`), the per-tag PrintConv branches + the
+  /// `present_mask`/[`DSF_KEYS`] conditional emission are preserved verbatim.
   ///
-  /// `print_conv=true` ⇒ PrintConv hashes resolved (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw integers (`-n` mode).
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv hashes resolved;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw integers.
+  ///
+  /// **Group.** Family-0/1 both `"File"` (DSF.pm:22 `GROUPS => { 0 =>
+  /// 'File', 1 => 'File', 2 => 'Audio' }`; family-2 `'Audio'` is not emitted
+  /// under `-G1`). Every DSF fmt tag is a known tag ⇒ `unknown: false`.
   ///
   /// **Emission order (DSF.pm faithful)**:
-  /// 1. Warning (if [`Self::fmt_warning`] is `Some`) — DSF.pm:71.
-  /// 2. `fmt`-chunk tags in DSF_KEYS order (if [`Self::fmt`] is `Some`).
+  /// 1. `fmt`-chunk tags in [`DSF_KEYS`] order (if [`Meta::fmt`] is `Some`).
+  /// 2. DSF.pm:88-97 chained ID3v2 trailer tags (if [`Meta::id3_ref`] is
+  ///    `Some`) — AFTER the fmt-chunk tags, faithful to the bundled emission
+  ///    order (ProcessBinaryData then the trailer ProcessDirectory).
   ///
-  /// File:* triplet is NOT emitted by the sink — it is the engine entry
-  /// `process`'s responsibility (DSF.pm:64 `SetFileType`). The ID3 trailer
-  /// is also NOT emitted by the sink — the engine entry dispatches
-  /// `id3_trailer()` bytes through `process_id3_v2_slice` so the bundled
-  /// ID3.pm semantics are preserved byte-exact.
-  pub(crate) fn serialize_tags(
+  /// The fmt-chunk read failure WARNING ([`Meta::fmt_warning`], DSF.pm:71)
+  /// and the chained ID3 sub-Meta's warnings/errors are NOT part of this
+  /// tag stream ([`run_emission`](crate::emit::run_emission) has no
+  /// warning/error channel) — the `AnyMeta::Dsf` dispatch arm drains them
+  /// after `run_emission`, so the net output is unchanged.
+  ///
+  /// The File:* triplet is NOT emitted here — it is the engine
+  /// ([`crate::parser::extract_info`]) `SetFileType` responsibility
+  /// (DSF.pm:64).
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "File";
-    // (1) DSF.pm:71 — `$et->Warn('Error reading DSF fmt chunk')` is
-    // emitted BEFORE the (skipped) ProcessBinaryData walk. The bridge
-    // captures it via write_warning which routes to `meta.push_warning`.
-    if let Some(text) = self.fmt_warning {
-      out.write_warning(text)?;
-    }
-    // (2) DSF.pm:30-48 fmt-chunk tags, ascending key order. The
-    // happy-path mask is 0xFF (every field present). Partial-walk
-    // pathological inputs are exercised through the legacy
-    // `walk_binary_data` helper (not the typed parser).
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // Family-0 "File" / family-1 "File" for every DSF fmt tag (see fn docs).
+    let group = || Group::new("File", "File");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+
+    // (1) DSF.pm:30-48 fmt-chunk tags, ascending key order. The happy-path
+    // mask is 0xFF (every field present). Partial-walk pathological inputs
+    // are exercised through the legacy `walk_binary_data` helper.
     if let Some(fmt) = self.fmt {
       // `present_mask` bit ordering matches `DSF_KEYS`: bit 0 = key 3
-      // (FormatVersion), …, bit 7 = key 11 (BlockSize). Each arm
-      // guards on the corresponding mask bit so a partial-fit
-      // dirInfo buffer emits only the present prefix (faithful to
-      // ExifTool.pm:9953 early-exit).
+      // (FormatVersion), …, bit 7 = key 11 (BlockSize). Each arm guards on
+      // the corresponding mask bit so a partial-fit dirInfo buffer emits
+      // only the present prefix (faithful to ExifTool.pm:9953 early-exit).
       let mask = fmt.present_mask;
       // Key 3 — FormatVersion (DSF.pm:30, no PrintConv).
       if mask & (1 << 0) != 0 {
-        out.write_u64(GROUP, "FormatVersion", u64::from(fmt.format_version))?;
+        tags.push(EmittedTag::new(
+          group(),
+          "FormatVersion".into(),
+          TagValue::U64(u64::from(fmt.format_version)),
+          false,
+        ));
       }
       // Key 4 — FormatID (DSF.pm:31). PrintConv: 0 ⇒ "DSD Raw".
       if mask & (1 << 1) != 0 {
-        if print_conv {
-          if let Some(name) = fmt.format_id_print() {
-            out.write_str(GROUP, "FormatID", name)?;
-          } else {
-            // Hash miss: emit the raw integer (faithful — Perl emits
-            // the unconverted value).
-            out.write_u64(GROUP, "FormatID", u64::from(fmt.format_id))?;
+        let value = if print_conv {
+          match fmt.format_id_print() {
+            Some(name) => TagValue::Str(name.into()),
+            // Hash miss: emit the raw integer (faithful — Perl emits the
+            // unconverted value).
+            None => TagValue::U64(u64::from(fmt.format_id)),
           }
         } else {
-          out.write_u64(GROUP, "FormatID", u64::from(fmt.format_id))?;
-        }
+          TagValue::U64(u64::from(fmt.format_id))
+        };
+        tags.push(EmittedTag::new(group(), "FormatID".into(), value, false));
       }
       // Key 5 — ChannelType (DSF.pm:32-43). PrintConv: hash.
       if mask & (1 << 2) != 0 {
-        if print_conv {
-          if let Some(name) = fmt.channel_type_print() {
-            out.write_str(GROUP, "ChannelType", name)?;
-          } else {
-            out.write_u64(GROUP, "ChannelType", u64::from(fmt.channel_type))?;
+        let value = if print_conv {
+          match fmt.channel_type_print() {
+            Some(name) => TagValue::Str(name.into()),
+            None => TagValue::U64(u64::from(fmt.channel_type)),
           }
         } else {
-          out.write_u64(GROUP, "ChannelType", u64::from(fmt.channel_type))?;
-        }
+          TagValue::U64(u64::from(fmt.channel_type))
+        };
+        tags.push(EmittedTag::new(group(), "ChannelType".into(), value, false));
       }
       // Key 6 — ChannelCount (DSF.pm:44, no PrintConv).
       if mask & (1 << 3) != 0 {
-        out.write_u64(GROUP, "ChannelCount", u64::from(fmt.channel_count))?;
+        tags.push(EmittedTag::new(
+          group(),
+          "ChannelCount".into(),
+          TagValue::U64(u64::from(fmt.channel_count)),
+          false,
+        ));
       }
       // Key 7 — SampleRate (DSF.pm:45, no PrintConv).
       if mask & (1 << 4) != 0 {
-        out.write_u64(GROUP, "SampleRate", u64::from(fmt.sample_rate))?;
+        tags.push(EmittedTag::new(
+          group(),
+          "SampleRate".into(),
+          TagValue::U64(u64::from(fmt.sample_rate)),
+          false,
+        ));
       }
       // Key 8 — BitsPerSample (DSF.pm:46, no PrintConv).
       if mask & (1 << 5) != 0 {
-        out.write_u64(GROUP, "BitsPerSample", u64::from(fmt.bits_per_sample))?;
+        tags.push(EmittedTag::new(
+          group(),
+          "BitsPerSample".into(),
+          TagValue::U64(u64::from(fmt.bits_per_sample)),
+          false,
+        ));
       }
-      // Key 9 — SampleCount (DSF.pm:47, int64u, no PrintConv). Values
-      // above i64::MAX get the decimal-string treatment (the
-      // serializer's number gate keeps a ≥16-digit bare integer as a
-      // JSON number — byte-exact vs `exiftool -j` for large unsigned
-      // values).
+      // Key 9 — SampleCount (DSF.pm:47, int64u, no PrintConv). Values above
+      // i64::MAX get the decimal-string treatment (the serializer's number
+      // gate keeps a ≥16-digit bare integer as a JSON number — byte-exact
+      // vs `exiftool -j` for large unsigned values). The retired sink used
+      // `write_fmt(|w| write!(w, "{}", n))`; the decimal `TagValue::Str`
+      // here renders identically.
       if mask & (1 << 6) != 0 {
-        if fmt.sample_count_is_decimal_string {
-          out.write_fmt(GROUP, "SampleCount", |w| write!(w, "{}", fmt.sample_count))?;
+        let value = if fmt.sample_count_is_decimal_string {
+          TagValue::Str(fmt.sample_count.to_string().into())
         } else {
-          out.write_u64(GROUP, "SampleCount", fmt.sample_count)?;
-        }
+          TagValue::U64(fmt.sample_count)
+        };
+        tags.push(EmittedTag::new(group(), "SampleCount".into(), value, false));
       }
       // Key 11 — BlockSize (DSF.pm:48, no PrintConv).
       if mask & (1 << 7) != 0 {
-        out.write_u64(GROUP, "BlockSize", u64::from(fmt.block_size))?;
+        tags.push(EmittedTag::new(
+          group(),
+          "BlockSize".into(),
+          TagValue::U64(u64::from(fmt.block_size)),
+          false,
+        ));
       }
     }
-    // (3) DSF.pm:88-97 — chained ID3v2 trailer. Emitted via the nested typed
-    // `Id3Meta` sink (File:ID3Size + ID3v2_*:* frames), AFTER the fmt-chunk
-    // tags, faithful to the bundled emission order (ProcessBinaryData then the
-    // trailer ProcessDirectory). Replaces the engine's separate
-    // `process_id3_v2_slice` dispatch — the typed Meta is now self-contained.
+
+    // (2) DSF.pm:88-97 — chained ID3v2 trailer. Spliced AFTER the fmt-chunk
+    // tags, faithful to the bundled emission order (the retired sink called
+    // `id3.serialize_tags(print_conv, out)` at this exact point). `Id3Meta`
+    // is `Taggable`, so its tags flow through the same engine; its
+    // warnings/errors are drained by the `AnyMeta::Dsf` arm.
     #[cfg(feature = "id3")]
-    if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
+    if let Some(id3) = self.id3.as_ref() {
+      tags.extend(id3.tags(mode));
     }
-    Ok(())
+
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project DSF metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// DSF is a DSD audio stream: it carries no camera / lens / GPS / capture
+  /// facts (those domains stay `None`). The single faithful structural
+  /// contribution is one audio [`TrackKind`](crate::metadata::TrackKind):
+  /// DSF files are audio-only (`%DSF::Main` `GROUPS{2} => 'Audio'`,
+  /// DSF.pm:22).
+  ///
+  /// **Duration stays `None`.** DSF.pm emits no `Duration` tag, and the
+  /// `'fmt '` chunk exposes only raw `SampleCount` / `SampleRate` integers
+  /// — there is no decoded duration accessor on [`FmtData`]. Synthesizing
+  /// `sample_count / sample_rate` would invent a value ExifTool never
+  /// surfaces, so this projection leaves `duration` (and dimensions /
+  /// created) `None`. The chained ID3 trailer's `Length` (TLEN) frame is
+  /// NOT folded here (DSF's `Project` mirrors the bare-stream AAC shape;
+  /// ID3 duration folding stays in [`Id3Meta`]'s own projection).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -918,7 +990,29 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::emit::{ConvMode, Taggable};
   use crate::tagmap::TagMap;
+
+  /// Drive a [`Meta`] through the golden [`run_emission`](crate::emit) engine
+  /// PLUS the `AnyMeta::Dsf` arm's warning drain (the DSF.pm:71 fmt-read
+  /// warning + the chained ID3 sub-Meta's warnings/errors). Mirrors the
+  /// `format_parser.rs` arm exactly so the in-module tests exercise the same
+  /// net `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
+  fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
+    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    if let Some(w) = meta.fmt_warning() {
+      let _ = out.write_warning(w);
+    }
+    #[cfg(feature = "id3")]
+    if let Some(id3) = meta.id3_ref() {
+      for w in id3.warnings_slice() {
+        let _ = out.write_warning(w.as_str());
+      }
+      for e in id3.errors_slice() {
+        let _ = out.write_error(e.as_str());
+      }
+    }
+  }
 
   // --- Table + dispatch ---------------------------------------------------
 
@@ -1254,7 +1348,7 @@ mod tests {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     // Spot-check: PrintConv-resolved names + numeric raw scalars.
     assert_eq!(w.get_str("File", "FormatVersion"), Some("1".to_string()));
     assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
@@ -1278,7 +1372,7 @@ mod tests {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
     let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    emit_via_engine(&meta, false, &mut w);
     // -n: raw numeric for FormatID / ChannelType (hash NOT applied).
     assert_eq!(w.get_str("File", "FormatID"), Some("0".to_string()));
     assert_eq!(w.get_str("File", "ChannelType"), Some("2".to_string()));
@@ -1294,7 +1388,7 @@ mod tests {
       id3: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(w.warnings(), &["Error reading DSF fmt chunk".to_string()]);
     // No fmt-chunk tags emitted on the warn path.
     assert!(w.get("File", "FormatVersion").is_none());
@@ -1324,7 +1418,7 @@ mod tests {
       id3: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(
       w.get_str("File", "SampleCount"),
       Some("18446744073709551615".to_string())
@@ -1359,7 +1453,7 @@ mod tests {
     assert_eq!(fmt.format_id(), 0);
     // The sink emits ONLY the present prefix.
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(w.get_str("File", "FormatVersion"), Some("7".to_string()));
     assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
     assert!(w.get("File", "ChannelType").is_none());
@@ -1388,7 +1482,7 @@ mod tests {
       "fmt_len just over 12 with no key-3 coverage ⇒ fmt is None"
     );
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert!(w.is_empty());
   }
 
@@ -1671,5 +1765,127 @@ mod tests {
     _assert_error::<Error>();
     let none: Option<Error> = None;
     assert!(none.is_none());
+  }
+
+  // --- Golden-pattern `Taggable` / `Project` ------------------------------
+
+  /// `Taggable::tags(-j)` yields the full fmt-chunk set in DSF_KEYS order
+  /// with PrintConv hashes resolved (FormatID ⇒ "DSD Raw", ChannelType ⇒
+  /// the descriptive string), driven through `run_emission`.
+  #[test]
+  fn taggable_emits_full_fmt_set_print_conv() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(w.get_str("File", "FormatVersion"), Some("1".to_string()));
+    assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
+    assert_eq!(
+      w.get_str("File", "ChannelType"),
+      Some("Stereo (Left, Right)".to_string())
+    );
+    assert_eq!(
+      w.get_str("File", "SampleCount"),
+      Some("2822400".to_string())
+    );
+    assert_eq!(w.get_str("File", "BlockSize"), Some("4096".to_string()));
+  }
+
+  /// `Taggable::tags(-n)` yields the raw integers (no PrintConv hashes):
+  /// FormatID / ChannelType emit their numeric values.
+  #[test]
+  fn taggable_emits_raw_scalars_value_conv() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
+    assert_eq!(w.get_str("File", "FormatID"), Some("0".to_string()));
+    assert_eq!(w.get_str("File", "ChannelType"), Some("2".to_string()));
+    assert_eq!(w.get_str("File", "SampleRate"), Some("2822400".to_string()));
+  }
+
+  /// Every DSF fmt tag carries family-0 AND family-1 group `"File"`
+  /// (DSF.pm:22), so the emitted [`crate::emit::EmittedTag`]s key under
+  /// `File:*`.
+  #[test]
+  fn taggable_group_is_file_family0_and_family1() {
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty());
+    for t in &tags {
+      assert_eq!(t.tag().group_ref().family0(), "File");
+      assert_eq!(t.tag().group_ref().family1(), "File");
+      assert!(!t.unknown());
+    }
+  }
+
+  /// An id3-bearing DSF (the `dsf_with_id3v2_trailer.dsf` fixture) splices
+  /// the chained ID3v2 trailer tags AFTER the fmt-chunk tags — proving the
+  /// `id3.tags(mode)` chaining position matches the retired
+  /// `id3.serialize_tags` call site. The fmt tags must still be `File:*`,
+  /// and the ID3 trailer must contribute `File:ID3Size` + `ID3v2_*:*`
+  /// entries.
+  #[test]
+  #[cfg(feature = "id3")]
+  fn taggable_chains_id3_trailer_after_fmt() {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dsf_with_id3v2_trailer.dsf"),
+    )
+    .expect("read dsf_with_id3v2_trailer.dsf fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 trailer");
+
+    // The tag stream: fmt-chunk `File:*` tags, THEN the ID3 trailer tags.
+    let names: std::vec::Vec<String> = meta
+      .tags(ConvMode::PrintConv)
+      .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
+      .collect();
+    // fmt-chunk FormatVersion is first; it precedes any ID3 entry.
+    let fmt_pos = names
+      .iter()
+      .position(|n| n == "File:FormatVersion")
+      .expect("FormatVersion emitted");
+    let id3_pos = names
+      .iter()
+      .position(|n| n.starts_with("ID3v2") || n == "File:ID3Size")
+      .expect("an ID3 trailer tag is spliced");
+    assert!(
+      fmt_pos < id3_pos,
+      "ID3 trailer tags must follow the fmt-chunk tags (fmt_pos={fmt_pos}, id3_pos={id3_pos}): {names:?}"
+    );
+
+    // Driven through the engine, both the fmt set and the ID3 trailer land.
+    let mut w = TagMap::new();
+    emit_via_engine(&meta, true, &mut w);
+    assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
+    assert!(
+      w.entries()
+        .iter()
+        .any(|(k, _)| k.starts_with("ID3v2") || k == "File:ID3Size"),
+      "ID3 trailer tags present in the engine output"
+    );
+  }
+
+  /// `Project` reports DSF as audio-only (one `TrackKind::Audio`) with no
+  /// camera / lens / GPS / capture facts and no synthesized duration.
+  #[test]
+  fn project_is_audio_only_no_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = happy_path_dsf();
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let md = Project::project(&meta);
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(
+      md.media().duration().is_none(),
+      "DSF synthesizes no duration"
+    );
+    assert!(md.media().width().is_none());
+    assert!(md.media().height().is_none());
+    assert!(md.camera().is_none());
+    assert!(md.lens().is_none());
+    assert!(md.gps().is_none());
+    assert!(md.capture().is_none());
   }
 }

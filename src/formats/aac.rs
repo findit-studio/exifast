@@ -6,10 +6,12 @@
 //! PROCESS_PROC is `FLAC::ProcessBitStream` (AAC.pm:29) → [`crate::bitstream`].
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::format_parser::FormatParser`] trait; the engine entry
-//! [`ProcessAac::process`] drives the typed `serialize_tags` path
-//! into the engine `tagmap::TagMap` so the serialized
-//! JSON stays byte-exact with bundled `perl exiftool`.
+//! [`crate::format_parser::FormatParser`] trait; it implements
+//! [`crate::emit::Taggable`] (the golden-pattern emission path) so
+//! [`crate::emit::run_emission`] drives its tags into the engine
+//! `tagmap::TagMap`, keeping the serialized JSON byte-exact with bundled
+//! `perl exiftool`. It also implements [`crate::metadata::Project`] for the
+//! normalized cross-format domain layer.
 
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
@@ -360,53 +362,118 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit AAC tags into the writer in `%AAC::Main` walk order (ProfileType,
-  /// SampleRate, Channels, then Encoder) — faithful to AAC.pm:38-74 +
-  /// bit-stream walker.
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield AAC tags in `%AAC::Main` walk order (ProfileType, SampleRate,
+  /// Channels, then Encoder) — faithful to AAC.pm:38-74 + the bit-stream
+  /// walker. The golden-pattern parallel to the retired `serialize_tags`:
+  /// the SINK changes (an [`EmittedTag`](crate::emit::EmittedTag) per value
+  /// instead of `out.write_*`), the per-tag PrintConv/ValueConv branches are
+  /// preserved verbatim.
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv formatted values;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `"AAC"` (the `%AAC::Main` table group — AAC.pm:28
+  /// sets only `GROUPS{2} => 'Audio'`, so family0 defaults to the table
+  /// name; matches [`AAC_MAIN`]`.group0()`); `family1` = `"AAC"` (the `-G1`
+  /// key, unchanged from the retired `serialize_tags`). Every AAC tag is a
+  /// known tag (no `Unknown => 1` in AAC.pm) ⇒ `unknown: false`.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "AAC";
-    // ProfileType (raw u8, 0..=2).
-    if print_conv {
-      out.write_str(GROUP, "ProfileType", self.profile_type_name())?;
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // Family-0 "AAC" / family-1 "AAC" for every emitted tag (see fn docs).
+    let group = || Group::new("AAC", "AAC");
+    // `-j` (PrintConv) vs `-n` (ValueConv) maps to the `print_conv` bool the
+    // retired `serialize_tags` threaded.
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(4);
+
+    // ProfileType (raw u8, 0..=2). `write_str(name)` → `TagValue::Str`;
+    // `write_u64(n)` → `TagValue::U64` (byte-identical to the retired sink).
+    let profile_type = if print_conv {
+      TagValue::Str(self.profile_type_name().into())
     } else {
-      out.write_u64(GROUP, "ProfileType", u64::from(self.profile_type))?;
-    }
-    // SampleRate (post-ValueConv u32; PrintConv is None for this tag,
-    // so -j and -n emit the same numeric value).
-    out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate))?;
-    // Channels (raw u8). PrintConv hash: 0 → "?", 1..=5 → numeric I64,
-    // 6 → "5+1", 7 → "7+1". When PrintConv yields an integer (1..=5), the
-    // serializer emits a bare JSON number — same as -n. When PrintConv
-    // yields a string (?, 5+1, 7+1), serializer emits a quoted string.
-    if print_conv {
+      TagValue::U64(u64::from(self.profile_type))
+    };
+    tags.push(EmittedTag::new(
+      group(),
+      "ProfileType".into(),
+      profile_type,
+      false,
+    ));
+
+    // SampleRate (post-ValueConv u32; PrintConv is None for this tag, so -j
+    // and -n emit the same numeric value).
+    tags.push(EmittedTag::new(
+      group(),
+      "SampleRate".into(),
+      TagValue::U64(u64::from(self.sample_rate)),
+      false,
+    ));
+
+    // Channels (raw u8). PrintConv hash: 0 → "?", 1..=5 → numeric, 6 → "5+1",
+    // 7 → "7+1". When PrintConv yields an integer (1..=5) the serializer emits
+    // a bare JSON number — same as -n; when it yields a string ("?","5+1",
+    // "7+1") it emits a quoted string.
+    let channels = if print_conv {
       match self.channels {
-        0 => out.write_str(GROUP, "Channels", "?")?,
-        1..=5 => out.write_u64(GROUP, "Channels", u64::from(self.channels))?,
-        6 => out.write_str(GROUP, "Channels", "5+1")?,
-        7 => out.write_str(GROUP, "Channels", "7+1")?,
+        0 => TagValue::Str("?".into()),
+        1..=5 => TagValue::U64(u64::from(self.channels)),
+        6 => TagValue::Str("5+1".into()),
+        7 => TagValue::Str("7+1".into()),
         // unreachable: Channels is a 3-bit field (0..=7).
-        _ => out.write_u64(GROUP, "Channels", u64::from(self.channels))?,
+        _ => TagValue::U64(u64::from(self.channels)),
       }
     } else {
-      out.write_u64(GROUP, "Channels", u64::from(self.channels))?;
-    }
-    // Encoder (optional ASCII string). No conversions — identical under -j and -n.
+      TagValue::U64(u64::from(self.channels))
+    };
+    tags.push(EmittedTag::new(group(), "Channels".into(), channels, false));
+
+    // Encoder (optional ASCII string). No conversions — identical under -j/-n.
     if let Some(enc) = self.encoder {
-      out.write_str(GROUP, "Encoder", enc)?;
+      tags.push(EmittedTag::new(
+        group(),
+        "Encoder".into(),
+        TagValue::Str(enc.into()),
+        false,
+      ));
     }
-    Ok(())
+
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project AAC metadata onto the normalized [`MediaMetadata`] domain.
+  ///
+  /// AAC is a bare audio bit-stream: it carries no camera / lens / GPS /
+  /// capture facts (those domains stay `None`). Of the
+  /// [`MediaInfo`](crate::metadata::MediaInfo) container fields
+  /// (duration / dimensions / created / track kinds), AAC's scalars
+  /// (ProfileType / SampleRate / Channels / Encoder) have no matching field —
+  /// `MediaInfo` has no sample-rate or channel-count slot — so the single
+  /// faithful contribution is one audio [`TrackKind`](crate::metadata::TrackKind):
+  /// AAC files are audio-only (`%AAC::Main` `GROUPS{2} => 'Audio'`,
+  /// AAC.pm:30). Duration / dimensions / created stay `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -572,18 +639,26 @@ mod tests {
     assert!(parse_borrowed(&data).unwrap().is_none());
   }
 
+  /// Drive the `Meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for `mode` and return the
+  /// resulting [`TagMap`](crate::tagmap::TagMap) — the production sink path.
+  fn emit_into_tagmap(meta: &Meta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(meta, mode, &mut w);
+    w
+  }
+
   #[test]
-  fn meta_sinker_emits_typed_tags() {
-    use crate::tagmap::TagMap;
+  fn taggable_emits_typed_tags() {
+    use crate::emit::ConvMode;
     let meta = Meta {
       profile_type: 1,
       sample_rate: 44100,
       channels: 2,
       encoder: Some("TestEncoder"),
     };
-    // PrintConv on.
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    // PrintConv on (-j).
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(
       w.get_str("AAC", "ProfileType"),
       Some("Low Complexity".to_string())
@@ -592,16 +667,15 @@ mod tests {
     assert_eq!(w.get_str("AAC", "Channels"), Some("2".to_string()));
     assert_eq!(w.get_str("AAC", "Encoder"), Some("TestEncoder".to_string()));
 
-    // PrintConv off.
-    let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    // PrintConv off (-n).
+    let w = emit_into_tagmap(&meta, ConvMode::ValueConv);
     assert_eq!(w.get_str("AAC", "ProfileType"), Some("1".to_string()));
     assert_eq!(w.get_str("AAC", "Channels"), Some("2".to_string()));
   }
 
   #[test]
-  fn meta_sinker_emits_channels_special_cases() {
-    use crate::tagmap::TagMap;
+  fn taggable_emits_channels_special_cases() {
+    use crate::emit::ConvMode;
     // Channels=0 ⇒ "?"
     let meta = Meta {
       profile_type: 0,
@@ -609,8 +683,7 @@ mod tests {
       channels: 0,
       encoder: None,
     };
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(w.get_str("AAC", "Channels"), Some("?".to_string()));
     // Channels=6 ⇒ "5+1"
     let meta = Meta {
@@ -619,8 +692,7 @@ mod tests {
       channels: 6,
       encoder: None,
     };
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(w.get_str("AAC", "Channels"), Some("5+1".to_string()));
     // Channels=7 ⇒ "7+1"
     let meta = Meta {
@@ -629,9 +701,56 @@ mod tests {
       channels: 7,
       encoder: None,
     };
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(w.get_str("AAC", "Channels"), Some("7+1".to_string()));
+  }
+
+  #[test]
+  fn taggable_group_is_aac_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let meta = Meta {
+      profile_type: 1,
+      sample_rate: 44100,
+      channels: 2,
+      encoder: Some("Enc"),
+    };
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    // ProfileType, SampleRate, Channels, Encoder — four tags, none Unknown.
+    assert_eq!(tags.len(), 4);
+    for t in &tags {
+      // family0 = "AAC" (table group; AAC.pm:28 sets only GROUPS{2}='Audio').
+      assert_eq!(t.tag().group_ref().family0(), "AAC");
+      // family1 = "AAC" (the -G1 key, unchanged from serialize_tags).
+      assert_eq!(t.tag().group_ref().family1(), "AAC");
+      assert!(!t.unknown(), "AAC has no Unknown=>1 tags");
+    }
+    assert_eq!(tags[0].tag().name(), "ProfileType");
+    assert_eq!(tags[3].tag().name(), "Encoder");
+  }
+
+  #[test]
+  fn project_populates_audio_track_only() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/AAC.aac"),
+    )
+    .expect("read AAC.aac fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let projected = meta.project();
+    // The one faithful MediaInfo contribution: a single audio track kind.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(projected.media().has_audio());
+    assert!(!projected.media().has_video());
+    // MediaInfo carries no sample-rate/channel slot ⇒ the rest stays empty.
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().height().is_none());
+    assert!(projected.media().created().is_none());
+    // AAC has no camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 
   #[test]

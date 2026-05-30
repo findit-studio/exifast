@@ -268,3 +268,366 @@ fn vendor_status_phase_buckets_are_observable() {
   assert!(Vendor::Pentax.status().is_deferred());
   assert!(Vendor::Fuji.status().is_deferred());
 }
+
+// ===========================================================================
+// Phase 2 — real-input Apple/Canon JPEG fixtures
+// ===========================================================================
+
+/// Apple iPhone 7 JPEG (bundled from `exiftool/t/images/Apple.jpg`).
+/// Verify that the Apple body decoder populates `MakerNotesApple` with
+/// the per-tag values the bundled `perl exiftool -j` oracle emits.
+///
+/// Oracle (excerpt):
+///
+/// ```text
+/// "MakerNotes:MakerNoteVersion": 4,
+/// "MakerNotes:AEStable": "Yes",
+/// "MakerNotes:AETarget": 177,
+/// "MakerNotes:AEAverage": 185,
+/// "MakerNotes:AFStable": "Yes",
+/// "MakerNotes:AccelerationVector": "-0.6483164083 0.002264119004 -0.7500767578",
+/// "MakerNotes:FocusDistanceRange": "0.54 - 0.68 m",
+/// "MakerNotes:OISMode": 2,
+/// "MakerNotes:ImageCaptureType": "Unknown (5)",
+/// ```
+#[test]
+fn apple_iphone_real_fixture_decodes_typed_fields() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Apple.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Apple JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_apple(), "vendor = Apple");
+
+  let apple = mn.meta().apple().expect("Apple typed populated");
+
+  // MakerNoteVersion (tag 0x0001) — the bundled oracle says 4.
+  assert_eq!(apple.maker_note_version(), Some(4));
+  // OISMode (tag 0x000f) — oracle says 2.
+  assert_eq!(apple.ois_mode(), Some(2));
+  // ImageCaptureType (tag 0x0014) — oracle says "Unknown (5)" (value 5).
+  assert_eq!(apple.image_capture_type(), Some(5));
+  // AccelerationVector (tag 0x0008) — 3 rational64s.
+  let accel = apple.acceleration_vector().expect("AccelerationVector");
+  assert!((accel.0 - (-0.6483164083)).abs() < 1e-6, "x = {}", accel.0);
+  assert!((accel.1 - 0.002264119).abs() < 1e-6, "y = {}", accel.1);
+  assert!((accel.2 - (-0.7500767578)).abs() < 1e-6, "z = {}", accel.2);
+  // FocusDistanceRange (tag 0x000c) — bundled oracle PrintConv:
+  // "0.54 - 0.68 m". Our typed surface stores the f64 pair.
+  let range = apple.focus_distance_range().expect("FocusDistanceRange");
+  assert!((range.0 - 0.539).abs() < 0.01, "min = {}", range.0);
+  assert!((range.1 - 0.684).abs() < 0.01, "max = {}", range.1);
+}
+
+/// Apple emissions include the named MakerNote tags under
+/// `MakerNotes:<Name>` for the JSON serializer.
+#[test]
+fn apple_iphone_real_fixture_emits_makernote_group() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Apple.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Apple JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  let emissions = mn.emissions_print_conv();
+  assert!(!emissions.is_empty(), "Apple emissions populated");
+  // Should include MakerNoteVersion.
+  let mnv = emissions
+    .iter()
+    .find(|e| e.name() == "MakerNoteVersion")
+    .map(|e| e.value().clone());
+  assert!(mnv.is_some(), "MakerNoteVersion emitted");
+}
+
+/// Canon EOS 300D / Digital Rebel JPEG (bundled from
+/// `exiftool/t/images/Canon.jpg`). Verify the Canon body decoder
+/// populates `MakerNotesCanon` with the per-tag values the bundled
+/// `perl exiftool -j` oracle emits.
+///
+/// Oracle (excerpt):
+///
+/// ```text
+/// "MakerNotes:CanonImageType": "CRW:EOS DIGITAL REBEL CMOS RAW",
+/// "MakerNotes:CanonFirmwareVersion": "Firmware Version 1.1.1",
+/// "MakerNotes:SerialNumber": "0560018150",
+/// "MakerNotes:FileNumber": "118-1861",
+/// "MakerNotes:OwnerName": "Phil Harvey",
+/// "MakerNotes:CanonModelID": "EOS Digital Rebel / 300D / Kiss Digital",
+/// "MakerNotes:LensType": "n/a",
+/// "MakerNotes:MaxFocalLength": "55 mm",
+/// "MakerNotes:MinFocalLength": "18 mm",
+/// ```
+#[test]
+fn canon_eos_real_fixture_decodes_typed_fields() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Canon.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Canon JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_canon(), "vendor = Canon");
+
+  let canon = mn.meta().canon().expect("Canon typed populated");
+
+  // Camera identity.
+  assert_eq!(canon.image_type(), Some("CRW:EOS DIGITAL REBEL CMOS RAW"));
+  assert_eq!(canon.firmware_version(), Some("Firmware Version 1.1.1"));
+  assert_eq!(canon.serial_number(), Some(560_018_150));
+  assert_eq!(canon.file_number(), Some(1_181_861));
+  assert_eq!(canon.owner_name(), Some("Phil Harvey"));
+  assert_eq!(canon.model_id(), Some(0x80000170));
+  assert_eq!(
+    canon.model_name(),
+    Some("EOS Digital Rebel / 300D / Kiss Digital")
+  );
+
+  // Lens identity.
+  assert_eq!(canon.lens_type(), Some(65535));
+  assert_eq!(canon.lens_name(), Some("n/a"));
+  let range = canon.focal_range_mm().expect("focal range");
+  assert!((range.0 - 18.0).abs() < 0.1, "min focal {}", range.0);
+  assert!((range.1 - 55.0).abs() < 0.1, "max focal {}", range.1);
+}
+
+/// Canon emissions include the named MakerNote tags under
+/// `MakerNotes:<Name>` and apply the print-conv labels.
+#[test]
+fn canon_eos_real_fixture_emits_print_conv_labels() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotes_Canon.jpg"
+  ))
+  .unwrap();
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("Canon JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  let emissions = mn.emissions_print_conv();
+
+  // Find named emissions.
+  let find = |name: &str| -> Option<exifast::value::TagValue> {
+    emissions
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  };
+  use exifast::value::TagValue;
+  assert_eq!(
+    find("CanonImageType"),
+    Some(TagValue::Str("CRW:EOS DIGITAL REBEL CMOS RAW".into()))
+  );
+  assert_eq!(
+    find("CanonFirmwareVersion"),
+    Some(TagValue::Str("Firmware Version 1.1.1".into()))
+  );
+  assert_eq!(
+    find("SerialNumber"),
+    Some(TagValue::Str("0560018150".into()))
+  );
+  assert_eq!(find("FileNumber"), Some(TagValue::Str("118-1861".into())));
+  assert_eq!(find("OwnerName"), Some(TagValue::Str("Phil Harvey".into())));
+  assert_eq!(
+    find("CanonModelID"),
+    Some(TagValue::Str(
+      "EOS Digital Rebel / 300D / Kiss Digital".into()
+    ))
+  );
+  // CameraSettings sub-table emissions.
+  assert_eq!(find("LensType"), Some(TagValue::Str("n/a".into())));
+  assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("55 mm".into())));
+  assert_eq!(find("MinFocalLength"), Some(TagValue::Str("18 mm".into())));
+}
+
+// ===========================================================================
+// SERIALIZED-OUTPUT (`-G1`) fidelity — what the JSON document actually emits
+//
+// The typed-field tests above validate the decoded struct; these validate the
+// rendered `"<family1>:<Name>"` keys/values the conformance gate compares
+// against `perl exiftool -j -G1`. `extract_info` is the end-to-end serializer
+// path — it runs `ExifMeta::serialize_tags`, i.e. the cached-MakerNote
+// emission site — and emits the `-G1` JSON document. The output is COMPACT
+// `serde_json` (no token-spacing guarantees), so we PARSE it and assert on the
+// `"<group>:<Name>"` object keys / values rather than substring-matching the
+// raw text. Gated on `json` (the feature `extract_info` needs).
+// ===========================================================================
+
+/// Parse the single-object `-G1` document `extract_info` emits and return its
+/// `"<group>:<Name>" -> value` map.
+#[cfg(feature = "json")]
+fn extract_info_map(fixture: &str, print_on: bool) -> serde_json::Map<String, serde_json::Value> {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+    .unwrap_or_else(|e| panic!("read {fixture}: {e}"));
+  let json = exifast::parser::extract_info(fixture, &data, print_on);
+  let doc: serde_json::Value = serde_json::from_str(&json)
+    .unwrap_or_else(|e| panic!("{fixture}: invalid JSON ({e}):\n{json}"));
+  doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .cloned()
+    .unwrap_or_else(|| panic!("{fixture}: doc is not [{{…}}]:\n{json}"))
+}
+
+/// FIX 1 — cached Apple MakerNote emissions use the vendor FAMILY-1 group.
+///
+/// Under `-G1` ExifTool emits `Apple:<Name>` (the vendor module name), NOT the
+/// family-0 `MakerNotes:<Name>`. Oracle (`perl exiftool -j -G1` on this
+/// fixture) emits `"Apple:MakerNoteVersion"`, `"Apple:AccelerationVector"`,
+/// `"Apple:FocusDistanceRange"`. Assert the serialized keys carry the `Apple:`
+/// prefix and that NO `MakerNotes:` MakerNote key leaks through — in both `-j`
+/// (PrintConv on) and `-n` (off), which share the emission site.
+#[cfg(feature = "json")]
+#[test]
+fn apple_serialized_keys_use_apple_group1() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Apple.jpg", print_on);
+    assert!(
+      map.contains_key("Apple:MakerNoteVersion"),
+      "expected Apple:MakerNoteVersion ({mode}); keys: {:?}",
+      map.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      map.contains_key("Apple:AccelerationVector"),
+      "expected Apple:AccelerationVector ({mode})"
+    );
+    // The family-1 group is the VENDOR, never the family-0 `MakerNotes`.
+    assert!(
+      !map.contains_key("MakerNotes:MakerNoteVersion"),
+      "MakerNote tag leaked under family-0 MakerNotes group ({mode})"
+    );
+    assert!(
+      !map.contains_key("MakerNotes:AccelerationVector"),
+      "MakerNote tag leaked under family-0 MakerNotes group ({mode})"
+    );
+  }
+}
+
+/// FIX 1 — cached Canon MakerNote emissions use the `Canon:` family-1 group.
+///
+/// Oracle (`perl exiftool -j -G1`) emits `"Canon:CanonImageType"`,
+/// `"Canon:LensType"`, `"Canon:MaxFocalLength"` — NOT `MakerNotes:`.
+#[cfg(feature = "json")]
+#[test]
+fn canon_serialized_keys_use_canon_group1() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Canon.jpg", print_on);
+    assert!(
+      map.contains_key("Canon:CanonImageType"),
+      "expected Canon:CanonImageType ({mode}); keys: {:?}",
+      map.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      map.contains_key("Canon:LensType"),
+      "expected Canon:LensType ({mode})"
+    );
+    assert!(
+      !map.contains_key("MakerNotes:CanonImageType"),
+      "MakerNote tag leaked under family-0 MakerNotes group ({mode})"
+    );
+    assert!(
+      !map.contains_key("MakerNotes:LensType"),
+      "MakerNote tag leaked under family-0 MakerNotes group ({mode})"
+    );
+  }
+}
+
+/// FIX 2 — Apple multi-rational with NO PrintConv renders as space-joined
+/// DECIMAL components, NOT `n/d` fractions.
+///
+/// AccelerationVector (`Apple.pm:62`, `rational64s` Count 3, no PrintConv)
+/// serializes the same as the generic EXIF serializer: each rational via
+/// `Rational::exiftool_val_str` (decimal), space-joined. Oracle emits
+/// `"Apple:AccelerationVector": "-0.6483164083 0.002264119004 -0.7500767578"`
+/// in BOTH `-j` and `-n` (no PrintConv applies to this tag, so the two modes
+/// agree). Assert the exact decimal string and that it carries no `/`.
+#[cfg(feature = "json")]
+#[test]
+fn apple_multi_rational_serializes_as_decimals_not_fractions() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Apple.jpg", print_on);
+    let v = map
+      .get("Apple:AccelerationVector")
+      .and_then(|v| v.as_str())
+      .unwrap_or_else(|| panic!("Apple:AccelerationVector missing/non-string ({mode})"));
+    // Decimal scalar form — matches the oracle and the generic EXIF serializer.
+    assert_eq!(
+      v, "-0.6483164083 0.002264119004 -0.7500767578",
+      "AccelerationVector must be space-joined decimals ({mode})"
+    );
+    assert!(
+      !v.contains('/'),
+      "AccelerationVector rendered as n/d fractions ({mode}): {v:?}"
+    );
+  }
+}
+
+/// Unknown-tag suppression (Canon) — `Unknown => 1` MakerNote tags are
+/// OMITTED from the default `-j -G1` output, matching ExifTool
+/// (`ExifTool.pm:9179-9185` returns undef for them with no `-u`).
+///
+/// `0x3 CanonFlashInfo` (`Canon.pm:1237-1239`, `Unknown => 1`) is present in
+/// this fixture (`-u` reveals it as "100 0 0 0"), but the golden
+/// `perl exiftool -j -G1` (no `-u`) omits `Canon:CanonFlashInfo`. Assert it
+/// is absent while a SUPPORTED Canon tag (`Canon:LensType`) is still present,
+/// in BOTH `-j` (PrintConv on) and `-n` (off).
+#[cfg(feature = "json")]
+#[test]
+fn canon_unknown_tags_suppressed_in_default_output() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Canon.jpg", print_on);
+    assert!(
+      !map.contains_key("Canon:CanonFlashInfo"),
+      "Canon:CanonFlashInfo (Unknown => 1) must be suppressed in default output ({mode}); keys: {:?}",
+      map.keys().collect::<Vec<_>>()
+    );
+    // A supported tag is still emitted.
+    assert!(
+      map.contains_key("Canon:LensType"),
+      "supported Canon:LensType must still be present ({mode})"
+    );
+  }
+}
+
+/// Unknown-tag suppression (Apple) — the `Unknown => 1` Apple MakerNote tags
+/// (`Apple.pm` AEMatrix 0x0002, ImageProcessingFlags 0x0019, SceneFlags
+/// 0x0025, …) are OMITTED from the default `-j -G1` output. This fixture
+/// carries `AEMatrix` (0x0002, `Apple.pm:36 Unknown => 1`), which `-u`
+/// reveals but the no-`-u` golden omits. Assert the Unknown keys are absent
+/// while a SUPPORTED Apple tag (`Apple:AccelerationVector`) is still present,
+/// in BOTH `-j` and `-n`.
+#[cfg(feature = "json")]
+#[test]
+fn apple_unknown_tags_suppressed_in_default_output() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Apple.jpg", print_on);
+    for unknown_key in [
+      "Apple:AEMatrix",
+      "Apple:ImageProcessingFlags",
+      "Apple:SceneFlags",
+      "Apple:QualityHint",
+      "Apple:ImageCaptureRequestID",
+      "Apple:SignalToNoiseRatioType",
+      "Apple:GreenGhostMitigationStatus",
+      "Apple:ColorCorrectionMatrix",
+    ] {
+      assert!(
+        !map.contains_key(unknown_key),
+        "{unknown_key} (Unknown => 1) must be suppressed in default output ({mode}); keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+      );
+    }
+    // A supported tag is still emitted.
+    assert!(
+      map.contains_key("Apple:AccelerationVector"),
+      "supported Apple:AccelerationVector must still be present ({mode})"
+    );
+  }
+}

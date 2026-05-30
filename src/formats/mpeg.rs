@@ -1766,232 +1766,271 @@ fn parse_inner<'a>(
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl AudioMeta<'_> {
-  /// Emit MPEG tags into the writer in `%MPEG::Audio` walk order
-  /// (Bit11-12 → … → Bit30-31) then `%MPEG::Xing` keys 1..6 then
-  /// `%MPEG::Lame` offsets 9/10/20/24 — faithful to MPEG.pm:23-256 +
-  /// 323-337 + 339-382 iteration order.
+impl crate::emit::Taggable for AudioMeta<'_> {
+  /// Yield MPEG-audio tags in `%MPEG::Audio` walk order (Bit11-12 → … →
+  /// Bit30-31) then `%MPEG::Xing` keys 1..6 then `%MPEG::Lame` offsets
+  /// 9/10/20/24 — the golden-pattern emission path for MPEG audio (the MP3
+  /// wrapper splices these via `mpeg.tags(mode)`; standalone MPEG-audio files
+  /// dispatch through it directly). Each value is handed to an
+  /// [`EmittedTag`](crate::emit::EmittedTag); every per-tag PrintConv/ValueConv
+  /// branch is preserved, so [`run_emission`](crate::emit::run_emission)
+  /// produces the [`TagMap`](crate::tagmap::TagMap) the legacy engine emitted
+  /// byte-for-byte.
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv formatted values;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// **Group.** Family-0 = family-1 = `"MPEG"` (MPEG.pm:520 sets
+  /// `GROUPS{2} => 'Audio'`, so family-0 defaults to the table name
+  /// `"MPEG"`; the `-G1` key is `"MPEG"`, unchanged from the inherent
+  /// serializer). The sink keys only on family-1; we mirror `"MPEG"` into
+  /// both [`Group`](crate::value::Group) slots.
+  ///
+  /// **Unknown.** No MPEG-audio tag carries an `Unknown => 1` flag ⇒ every
+  /// yielded tag is `unknown: false`. No lists, no warnings/errors.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "MPEG";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
 
-    // ─── Bit11-12 MPEGAudioVersion ────────────────────────────────────
-    // -j (PrintConv hash): 0 → 2.5 (f64), 2 → 2 (i64), 3 → 1 (i64).
-    // -n (raw): u8 of the on-disk 2-bit field.
+    // Family-0 "MPEG" / family-1 "MPEG" for every emitted tag (see fn docs).
+    let group = || Group::new("MPEG", "MPEG");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    // The inherent serializer's `write_fmt` renders into a String; reproduce
+    // it here so the stored `TagValue::Str` is byte-identical.
+    let fmt_str = |f: &dyn Fn(&mut dyn core::fmt::Write) -> core::fmt::Result| -> TagValue {
+      let mut s = String::new();
+      let _ = f(&mut s);
+      TagValue::Str(s.into())
+    };
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(20);
+    let mut push = |name: &str, value: TagValue| {
+      tags.push(EmittedTag::new(group(), name.into(), value, false));
+    };
+
+    // ─── Bit11-12 MPEGAudioVersion ──────────────────────────────────────
     if print_conv {
-      match self.mpeg_audio_version {
-        AudioVersion::V2_5 => out.write_f64(GROUP, "MPEGAudioVersion", 2.5)?,
-        AudioVersion::V2 => out.write_u64(GROUP, "MPEGAudioVersion", 2)?,
-        AudioVersion::V1 => out.write_u64(GROUP, "MPEGAudioVersion", 1)?,
-      }
+      let v = match self.mpeg_audio_version {
+        AudioVersion::V2_5 => TagValue::F64(2.5),
+        AudioVersion::V2 => TagValue::U64(2),
+        AudioVersion::V1 => TagValue::U64(1),
+      };
+      push("MPEGAudioVersion", v);
     } else {
-      out.write_u64(
-        GROUP,
+      push(
         "MPEGAudioVersion",
-        u64::from(self.mpeg_audio_version.raw()),
-      )?;
+        TagValue::U64(u64::from(self.mpeg_audio_version.raw())),
+      );
     }
 
-    // ─── Bit13-14 AudioLayer ──────────────────────────────────────────
-    // -j (PrintConv hash): 1 → 3, 2 → 2, 3 → 1.
-    // -n (raw): u8 1..3 on-disk.
+    // ─── Bit13-14 AudioLayer ────────────────────────────────────────────
     if print_conv {
-      out.write_u64(GROUP, "AudioLayer", u64::from(self.audio_layer.display()))?;
+      push(
+        "AudioLayer",
+        TagValue::U64(u64::from(self.audio_layer.display())),
+      );
     } else {
-      out.write_u64(GROUP, "AudioLayer", u64::from(self.audio_layer.raw()))?;
+      push(
+        "AudioLayer",
+        TagValue::U64(u64::from(self.audio_layer.raw())),
+      );
     }
 
-    // ─── Bit16-19 AudioBitrate ────────────────────────────────────────
-    // -j: ConvertBitrate string. -n: post-ValueConv u32 OR the "free"
-    // sentinel string passthrough.
+    // ─── Bit16-19 AudioBitrate ──────────────────────────────────────────
     match (self.audio_bitrate, print_conv) {
-      (AudioBitrate::Free, _) => {
-        // "free" sentinel under -j: ConvertBitrate IsFloat-rejects ⇒
-        // returns the string unchanged. Under -n: bare ValueConv
-        // value is the string "free". Same emission either way.
-        out.write_str(GROUP, "AudioBitrate", "free")?;
-      }
-      (AudioBitrate::Known(bps), true) => {
-        out.write_fmt(GROUP, "AudioBitrate", |w| {
-          write_convert_bitrate(w, f64::from(bps))
-        })?;
-      }
+      (AudioBitrate::Free, _) => push("AudioBitrate", TagValue::Str("free".into())),
+      (AudioBitrate::Known(bps), true) => push(
+        "AudioBitrate",
+        fmt_str(&|w| write_convert_bitrate(w, f64::from(bps))),
+      ),
       (AudioBitrate::Known(bps), false) => {
-        out.write_u64(GROUP, "AudioBitrate", u64::from(bps))?;
+        push("AudioBitrate", TagValue::U64(u64::from(bps)));
       }
     }
 
-    // ─── Bit20-21 SampleRate ──────────────────────────────────────────
-    // -j (PrintConv hash): Hz integer from per-version table.
-    // -n (raw): u8 0..2 on-disk (no ValueConv).
+    // ─── Bit20-21 SampleRate ────────────────────────────────────────────
     if print_conv {
-      // If the version/raw combo is out of table (defensive), bundled
-      // ExifTool falls back to "Unknown (raw)" via PrintConv default
-      // — but raw=3 is rejected by `check_header`, so this branch is
-      // unreachable from a successful parse. Emit raw as u64 as a
-      // defensive fallback.
       if let Some(hz) = self.sample_rate_hz() {
-        out.write_u64(GROUP, "SampleRate", u64::from(hz))?;
+        push("SampleRate", TagValue::U64(u64::from(hz)));
       } else {
-        out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw))?;
+        push("SampleRate", TagValue::U64(u64::from(self.sample_rate_raw)));
       }
     } else {
-      out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw))?;
+      push("SampleRate", TagValue::U64(u64::from(self.sample_rate_raw)));
     }
 
-    // ─── Bit24-25 ChannelMode ─────────────────────────────────────────
-    // -j: PrintConv string. -n: raw u8.
+    // ─── Bit24-25 ChannelMode ───────────────────────────────────────────
     if print_conv {
-      out.write_str(GROUP, "ChannelMode", self.channel_mode.print_conv())?;
+      push(
+        "ChannelMode",
+        TagValue::Str(self.channel_mode.print_conv().into()),
+      );
     } else {
-      out.write_u64(GROUP, "ChannelMode", u64::from(self.channel_mode.raw()))?;
+      push(
+        "ChannelMode",
+        TagValue::U64(u64::from(self.channel_mode.raw())),
+      );
     }
 
-    // ─── Bit26 MSStereo (Layer III only) ──────────────────────────────
-    // -j: "Off" / "On". -n: 0 / 1.
+    // ─── Bit26 MSStereo (Layer III only) ────────────────────────────────
     if let Some(b) = self.ms_stereo {
       if print_conv {
-        out.write_str(GROUP, "MSStereo", if b { "On" } else { "Off" })?;
+        push(
+          "MSStereo",
+          TagValue::Str(if b { "On" } else { "Off" }.into()),
+        );
       } else {
-        out.write_u64(GROUP, "MSStereo", u64::from(b))?;
+        push("MSStereo", TagValue::U64(u64::from(b)));
       }
     }
 
-    // ─── Bit26-27 ModeExtension (Layer I/II only) ─────────────────────
-    // NOTE: bundled `sort keys %$tagTablePtr` orders `Bit26` <
-    // `Bit26-27` < `Bit27` (lex). For Layer III the chooser emits
-    // MSStereo (Bit26) and IntensityStereo (Bit27) and skips Bit26-27;
-    // for Layer I/II it emits ModeExtension (Bit26-27) and skips
-    // Bit26 + Bit27. Either way the emission order is monotonic.
+    // ─── Bit26-27 ModeExtension (Layer I/II only) ───────────────────────
     if let Some(me) = self.mode_extension {
       if print_conv {
-        out.write_str(GROUP, "ModeExtension", me.print_conv())?;
+        push("ModeExtension", TagValue::Str(me.print_conv().into()));
       } else {
-        out.write_u64(GROUP, "ModeExtension", u64::from(me.raw()))?;
+        push("ModeExtension", TagValue::U64(u64::from(me.raw())));
       }
     }
 
-    // ─── Bit27 IntensityStereo (Layer III only) ───────────────────────
+    // ─── Bit27 IntensityStereo (Layer III only) ─────────────────────────
     if let Some(b) = self.intensity_stereo {
       if print_conv {
-        out.write_str(GROUP, "IntensityStereo", if b { "On" } else { "Off" })?;
+        push(
+          "IntensityStereo",
+          TagValue::Str(if b { "On" } else { "Off" }.into()),
+        );
       } else {
-        out.write_u64(GROUP, "IntensityStereo", u64::from(b))?;
+        push("IntensityStereo", TagValue::U64(u64::from(b)));
       }
     }
 
-    // ─── Bit28 CopyrightFlag ──────────────────────────────────────────
-    // -j: "True" / "False" — serialize.rs translates the Str("True")
-    // / Str("False") into JSON booleans `true` / `false` (bundled
-    // quirk handled engine-side). -n: 0 / 1.
+    // ─── Bit28 CopyrightFlag ────────────────────────────────────────────
     if print_conv {
-      out.write_str(
-        GROUP,
+      push(
         "CopyrightFlag",
-        if self.copyright_flag { "True" } else { "False" },
-      )?;
+        TagValue::Str(if self.copyright_flag { "True" } else { "False" }.into()),
+      );
     } else {
-      out.write_u64(GROUP, "CopyrightFlag", u64::from(self.copyright_flag))?;
+      push(
+        "CopyrightFlag",
+        TagValue::U64(u64::from(self.copyright_flag)),
+      );
     }
 
-    // ─── Bit29 OriginalMedia ──────────────────────────────────────────
+    // ─── Bit29 OriginalMedia ────────────────────────────────────────────
     if print_conv {
-      out.write_str(
-        GROUP,
+      push(
         "OriginalMedia",
-        if self.original_media { "True" } else { "False" },
-      )?;
+        TagValue::Str(if self.original_media { "True" } else { "False" }.into()),
+      );
     } else {
-      out.write_u64(GROUP, "OriginalMedia", u64::from(self.original_media))?;
+      push(
+        "OriginalMedia",
+        TagValue::U64(u64::from(self.original_media)),
+      );
     }
 
-    // ─── Bit30-31 Emphasis ────────────────────────────────────────────
-    // -j: PrintConv string. -n: raw u8.
+    // ─── Bit30-31 Emphasis ──────────────────────────────────────────────
     if print_conv {
-      out.write_str(GROUP, "Emphasis", self.emphasis.print_conv())?;
+      push("Emphasis", TagValue::Str(self.emphasis.print_conv().into()));
     } else {
-      out.write_u64(GROUP, "Emphasis", u64::from(self.emphasis.raw()))?;
+      push("Emphasis", TagValue::U64(u64::from(self.emphasis.raw())));
     }
 
-    // ─── Xing keys 1..6 (MPEG.pm:327-332) ─────────────────────────────
-    // VBRFrames / VBRBytes / VBRScale / Encoder / LameVBRQuality /
-    // LameQuality — bare integers and the Encoder ASCII string.
+    // ─── Xing keys 1..6 (MPEG.pm:327-332) ───────────────────────────────
     if let Some(n) = self.vbr_frames {
-      out.write_u64(GROUP, "VBRFrames", u64::from(n))?;
+      push("VBRFrames", TagValue::U64(u64::from(n)));
     }
     if let Some(n) = self.vbr_bytes {
-      out.write_u64(GROUP, "VBRBytes", u64::from(n))?;
+      push("VBRBytes", TagValue::U64(u64::from(n)));
     }
     if let Some(n) = self.vbr_scale {
-      out.write_u64(GROUP, "VBRScale", u64::from(n))?;
+      push("VBRScale", TagValue::U64(u64::from(n)));
     }
     if let Some(s) = self.encoder.as_deref() {
-      out.write_str(GROUP, "Encoder", s)?;
+      push("Encoder", TagValue::Str(s.into()));
     }
     if let Some(n) = self.lame_vbr_quality {
-      out.write_u64(GROUP, "LameVBRQuality", u64::from(n))?;
+      push("LameVBRQuality", TagValue::U64(u64::from(n)));
     }
     if let Some(n) = self.lame_quality {
-      out.write_u64(GROUP, "LameQuality", u64::from(n))?;
+      push("LameQuality", TagValue::U64(u64::from(n)));
     }
 
-    // ─── LAME sub-table offsets 9/10/20/24 (MPEG.pm:344-381) ──────────
-
+    // ─── LAME sub-table offsets 9/10/20/24 (MPEG.pm:344-381) ────────────
     if let Some(method) = self.lame_method {
       if print_conv {
-        if let Some(name) = method.print_conv() {
-          out.write_str(GROUP, "LameMethod", name)?;
-        } else {
-          // PrintConv hash miss: bundled emits the raw integer
-          // (PrintConv hash with no default — Perl's $$conv{$val}
-          // returns undef ⇒ HandleTag returns the input unchanged).
-          out.write_u64(GROUP, "LameMethod", u64::from(method.raw()))?;
+        match method.print_conv() {
+          Some(name) => push("LameMethod", TagValue::Str(name.into())),
+          None => push("LameMethod", TagValue::U64(u64::from(method.raw()))),
         }
       } else {
-        out.write_u64(GROUP, "LameMethod", u64::from(method.raw()))?;
+        push("LameMethod", TagValue::U64(u64::from(method.raw())));
       }
     }
     if let Some(v) = self.lame_low_pass_filter {
       if print_conv {
-        out.write_fmt(GROUP, "LameLowPassFilter", |w| {
-          write_lame_lowpass(w, f64::from(v))
-        })?;
+        push(
+          "LameLowPassFilter",
+          fmt_str(&|w| write_lame_lowpass(w, f64::from(v))),
+        );
       } else {
-        out.write_u64(GROUP, "LameLowPassFilter", u64::from(v))?;
+        push("LameLowPassFilter", TagValue::U64(u64::from(v)));
       }
     }
     if let Some(v) = self.lame_bitrate {
       if print_conv {
-        out.write_fmt(GROUP, "LameBitrate", |w| {
-          write_convert_bitrate(w, f64::from(v))
-        })?;
+        push(
+          "LameBitrate",
+          fmt_str(&|w| write_convert_bitrate(w, f64::from(v))),
+        );
       } else {
-        out.write_u64(GROUP, "LameBitrate", u64::from(v))?;
+        push("LameBitrate", TagValue::U64(u64::from(v)));
       }
     }
     if let Some(stereo) = self.lame_stereo_mode {
       if print_conv {
-        if let Some(name) = stereo.print_conv() {
-          out.write_str(GROUP, "LameStereoMode", name)?;
-        } else {
-          out.write_u64(GROUP, "LameStereoMode", u64::from(stereo.raw()))?;
+        match stereo.print_conv() {
+          Some(name) => push("LameStereoMode", TagValue::Str(name.into())),
+          None => push("LameStereoMode", TagValue::U64(u64::from(stereo.raw()))),
         }
       } else {
-        out.write_u64(GROUP, "LameStereoMode", u64::from(stereo.raw()))?;
+        push("LameStereoMode", TagValue::U64(u64::from(stereo.raw())));
       }
     }
 
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for AudioMeta<'_> {
+  /// Project MPEG-audio metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// An MPEG-audio frame is a bare audio bit-stream: the faithful structural
+  /// contribution is one audio [`TrackKind`](crate::metadata::TrackKind).
+  /// `ParseMPEGAudio` decodes no wall-clock duration (only the per-frame
+  /// header + Xing/LAME annotations — none of which is a clean total-duration
+  /// accessor on [`AudioMeta`]), so `duration` stays `None`, as do
+  /// dimensions / created and the camera / lens / GPS / capture domains.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -2210,14 +2249,18 @@ mod tests {
     assert_eq!(fmt_lowpass(16_500.0), "16.5 kHz");
   }
 
-  // ───────────────────────── serialize_tags (TagMap) ─────────────────────────
+  // ───────────────────────── emission (TagMap) ─────────────────────────
 
   fn collect(buf: &[u8], print_conv: bool) -> TagMap {
     let mut w = TagMap::new();
     let meta = parse_borrowed(buf, true, "MP3")
       .expect("ok")
       .expect("parsed");
-    meta.serialize_tags(print_conv, &mut w).unwrap();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
     w
   }
 
@@ -2564,9 +2607,9 @@ mod tests {
     let header = 0xfffb_906c_u32;
     let m = extract_header_fields(header).unwrap();
     assert_eq!(m.ms_stereo(), Some(true));
-    // Sink under -j.
+    // Emit under -j via the golden engine.
     let mut w = TagMap::new();
-    m.serialize_tags(true, &mut w).unwrap();
+    crate::emit::run_emission(&m, crate::emit::ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("MPEG", "MSStereo"), Some("On".into()));
   }
 

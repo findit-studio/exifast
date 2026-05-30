@@ -469,6 +469,130 @@ impl Id3v1Meta<'_> {
   }
 }
 
+// ===========================================================================
+// `Id3v1Meta` `Taggable` / `Project` — the golden-pattern emission path
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::emit::Taggable for Id3v1Meta<'_> {
+  /// Yield the ID3v1 sub-Meta's tags under family-1 group `"ID3v1"`, in
+  /// `%v1`-field order: Title, Artist, Album, Year, Comment, Track, Genre.
+  ///
+  /// [`Id3v1Meta`] is a PROVIDER chained by `real` (Real.pm:678-687 reads a
+  /// standalone 128-byte `TAG` trailer into an [`Id3v1Meta`]); it has no
+  /// inherent `serialize_tags`, and its consumer (`real::emit_id3v1`) owns
+  /// the standalone emission. This `Taggable` is the faithful golden-pattern
+  /// equivalent of `real::emit_id3v1` — same group, same field order, same
+  /// per-field value variants and the same `-j`/`-n` Genre toggle — so a
+  /// future `real` migration can route through [`run_emission`](crate::emit::run_emission)
+  /// with byte-identical output. A differential test pins the equivalence.
+  ///
+  /// Per-field value mapping (matching `real::emit_id3v1`):
+  /// - Title / Artist / Album / Comment → `TagValue::Str`.
+  /// - Year → `TagValue::I64` when the 4-char string parses as an integer
+  ///   (bundled emits a bare JSON number), else `TagValue::Str`.
+  /// - Track (ID3v1.1) → `TagValue::U64`.
+  /// - Genre — `mode == PrintConv` (`-j`): the resolved `%genre` name
+  ///   ([`genre_name`](Self::genre_name)) as `TagValue::Str`, or
+  ///   `"Unknown ({byte})"` for a sparse byte with no name;
+  ///   `mode == ValueConv` (`-n`): the raw genre byte as `TagValue::U64`.
+  ///
+  /// Every field is a known tag (`unknown: false`); ID3v1 carries no
+  /// `Unknown => 1` and no warnings/errors.
+  fn tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // family-0 is "ID3" (the module group0), family-1 "ID3v1" — matches
+    // bundled `exiftool -G0:1` (`ID3:ID3v1:Title`). `-G1` conformance keys
+    // only on family-1, so the family-0 fix is observed via `iter_tags`.
+    let group = || Group::new("ID3", "ID3v1");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::with_capacity(7);
+
+    if let Some(s) = self.title() {
+      tags.push(EmittedTag::new(
+        group(),
+        "Title".into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
+    }
+    if let Some(s) = self.artist() {
+      tags.push(EmittedTag::new(
+        group(),
+        "Artist".into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
+    }
+    if let Some(s) = self.album() {
+      tags.push(EmittedTag::new(
+        group(),
+        "Album".into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
+    }
+    if let Some(s) = self.year() {
+      // Year is a 4-digit string; bundled emits as a bare JSON number when
+      // it parses (matching `real::emit_id3v1`'s `write_i64` branch).
+      let v = match s.parse::<i64>() {
+        Ok(n) => TagValue::I64(n),
+        Err(_) => TagValue::Str(s.into()),
+      };
+      tags.push(EmittedTag::new(group(), "Year".into(), v, false));
+    }
+    if let Some(s) = self.comment() {
+      tags.push(EmittedTag::new(
+        group(),
+        "Comment".into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
+    }
+    if let Some(t) = self.track() {
+      tags.push(EmittedTag::new(
+        group(),
+        "Track".into(),
+        TagValue::U64(u64::from(t)),
+        false,
+      ));
+    }
+    if let Some(g) = self.genre() {
+      let v = if print_conv {
+        match self.genre_name() {
+          Some(name) => TagValue::Str(name.into()),
+          None => TagValue::Str(std::format!("Unknown ({g})").into()),
+        }
+      } else {
+        TagValue::U64(u64::from(g))
+      };
+      tags.push(EmittedTag::new(group(), "Genre".into(), v, false));
+    }
+
+    tags.into_iter()
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Id3v1Meta<'_> {
+  /// Project the ID3v1 sub-Meta onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain. ID3v1 is a
+  /// music-tagging trailer ⇒ one audio
+  /// [`TrackKind`](crate::metadata::TrackKind); it carries no duration /
+  /// dimensions / camera / lens / GPS / capture facts (all `None`).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
+  }
+}
+
 /// Typed ID3 metadata — the lib-first output of [`ProcessId3`].
 ///
 /// Carries the unified ID3v1 + ID3v2 view: common scalar fields (title,
@@ -1292,105 +1416,221 @@ fn id3v1_genre_byte_for_name(name: &str) -> Option<(u8, &'static str)> {
 }
 
 // ===========================================================================
-// `serialize_tags` — replay staged tags into a TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Id3Meta<'_> {
-  /// Emit every staged ID3 tag in the order the legacy engine produced
-  /// them. Faithful to ID3.pm: File:ID3Size first, then ID3v2 frames in
-  /// tag-table order, then ID3v1 fields in `%v1` order.
+impl crate::emit::Taggable for Id3Meta<'_> {
+  /// Yield every staged ID3 tag in the order the legacy engine produced
+  /// them — the golden-pattern emission path for ID3 (every wrapper format —
+  /// MP3/DSF/FLAC/MPC/OGG/WavPack — splices these via `id3.tags(mode)`). The
+  /// staged group / name / value tuples are handed to an
+  /// [`EmittedTag`](crate::emit::EmittedTag) per tuple, so
+  /// [`run_emission`](crate::emit::run_emission) produces the
+  /// [`TagMap`](crate::tagmap::TagMap) the legacy engine emitted byte-for-byte.
   ///
-  /// **`print_conv` contract (Codex B-R2-1).** ONE `parse` stages BOTH the
-  /// PrintConv (`-j`) list and the raw (`-n`) list; `sink` honors its
-  /// `print_conv` argument by replaying the matching list. So a single typed
-  /// `parse(...)` serves BOTH `sink(true)` (PrintConv strings — Genre
-  /// `Hip-Hop`, Length `7 s`) AND `sink(false)` (raw scalars — Genre `7`,
-  /// Length `7`) with no mode-lock and no debug-assert. PrintConv-toggled
-  /// fields (ID3v1 Genre %genre ID3.pm:371-375; TLEN ValueConv/PrintConv
-  /// split ID3.pm:592-595) are the cases this distinguishes.
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) replays the [`Id3Meta`]'s PrintConv staged
+  /// list (`staged_tags`); `mode == ValueConv` (`-n`) replays the raw
+  /// post-ValueConv list (`staged_tags_raw`) — the per-tag `print_conv`
+  /// branch ID3.pm applies (Codex B-R2-1).
+  ///
+  /// **Group.** Family-0 is NOT stored on a [`StagedTag`]: the legacy ID3
+  /// engine produces every ID3 group with `family0 == family1`, and the
+  /// sink keys only on family-1 (`exiftool:2948`). The inherent serializer
+  /// passes the family-1 string as the writer `group` argument;
+  /// [`run_emission`](crate::emit::run_emission) likewise reads only
+  /// `family1()`. We therefore mirror family-1 into BOTH slots of the
+  /// [`Group`](crate::value::Group) — identical key, identical output. The
+  /// family-1 string is the EXACT stored value (`"ID3v1"`, `"ID3v1_Enh"`,
+  /// `"ID3v2_2"` / `"_3"` / `"_4"`, or `"File"` for `File:ID3Size`).
+  ///
+  /// **Value normalization.** The staged [`TagValue`] is replayed unchanged
+  /// for `Str`/`I64`/`U64`/`F64`/`Bytes` (the sink stores the same variant
+  /// the inherent serializer's `write_str`/`write_i64`/`write_u64`/
+  /// `write_f64`/`write_bytes` would). The inherent serializer normalizes
+  /// two extra variants, so we reproduce them HERE to stay byte-identical:
+  /// `Bool(b)` ⇒ `U64(u64::from(b))` (matching `write_u64`), and
+  /// `Rational`/`List` ⇒ the `{:?}` Debug string (matching the
+  /// `write_fmt` fallback). ID3 produces no `Rational`/`List`/`Bool` today,
+  /// so these are dormant — kept faithful for net-identical output.
+  ///
+  /// **Unknown.** No staged ID3 tag carries an `Unknown => 1` flag (the
+  /// staged list is the engine's already-emitted output, which omits
+  /// unknowns), so every yielded tag is `unknown: false`.
+  ///
+  /// **Warnings / errors.** Unlike the inherent serializer (which appends
+  /// `self.warnings` / `self.errors` to the [`TagMap`](crate::tagmap::TagMap)
+  /// after the tags), the `Taggable` stream carries TAGS only —
+  /// [`run_emission`](crate::emit::run_emission) has no warning/error
+  /// channel. The standalone `AnyMeta::Id3` dispatch arm drains
+  /// [`warnings_slice`](Self::warnings_slice) /
+  /// [`errors_slice`](Self::errors_slice) after `run_emission` (the
+  /// Audible/Red/AIFF arm pattern), so the net output is unchanged.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    let tags = if print_conv {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    let tags = if matches!(mode, crate::emit::ConvMode::PrintConv) {
       &self.staged_tags
     } else {
       &self.staged_tags_raw
     };
-    for tag in tags {
-      // Use the family-1 string as the writer's `group` argument; the
-      // engine `TagMap` mirrors family-1 to BOTH
-      // family-0 and family-1 on push, which matches the legacy
-      // engine's emission for ID3 (every ID3 group has family-0 ==
-      // family-1, e.g. `("ID3", "ID3v2_3")` is engineered via
-      // `tagtable.group0()` + `def.group1()`, not via the writer-side
-      // group). However, the writer-side `group` must encode family-1
-      // (the `-G1 -j` key) because that's what the JSON serializer
-      // keys on; the bridge handles family-0 by virtue of the legacy
-      // engine's own family-0 attribution at push time, which we
-      // preserved via the staged-tag list (`StagedTag::family0` is
-      // not used by the writer path but is retained for debugging).
-      let group = tag.family1.as_str();
-      let name = tag.name.as_str();
-      match &tag.value {
-        TagValue::Str(s) => out.write_str(group, name, s.as_str())?,
-        TagValue::I64(n) => out.write_i64(group, name, *n)?,
-        TagValue::U64(n) => out.write_u64(group, name, *n)?,
-        TagValue::F64(n) => out.write_f64(group, name, *n)?,
-        TagValue::Bool(b) => out.write_u64(group, name, u64::from(*b))?,
-        TagValue::Bytes(b) => out.write_bytes(group, name, b)?,
+    tags.iter().map(|tag| {
+      // family-0 is "ID3" for the ID3v1/ID3v1_Enh/ID3v2_* frame groups and
+      // "File" for `File:ID3Size` — matches bundled `exiftool -G0:1`
+      // (`ID3:ID3v2_3:Title`, `File:ID3Size`). family-1 is the staged frame
+      // group. `-G1` conformance keys only on family-1 (so this family-0
+      // reconstruction is exercised through `iter_tags`, not the JSON path).
+      let family0 = if tag.family1.as_str() == "File" {
+        "File"
+      } else {
+        "ID3"
+      };
+      let group = Group::new(family0, tag.family1.as_str());
+      // Reproduce the inherent serializer's value normalization so the sink
+      // stores the byte-identical variant.
+      let value = match &tag.value {
+        TagValue::Bool(b) => TagValue::U64(u64::from(*b)),
         TagValue::Rational(_) | TagValue::List(_) => {
-          // ID3 today never produces Rational or List values; if a
-          // future frame type does, extend this match with the
-          // appropriate writer emission (e.g. a rational-to-decimal
-          // write_fmt or a per-item write_str loop).
-          //
-          // For now, render via Display to surface the value rather
-          // than silently dropping. Use write_fmt to avoid
-          // intermediate String allocations.
-          out.write_fmt(group, name, |w| write!(w, "{:?}", tag.value))?;
+          TagValue::Str(std::format!("{:?}", tag.value).into())
         }
+        // Str / I64 / U64 / F64 / Bytes replay unchanged.
+        other => other.clone(),
+      };
+      EmittedTag::new(group, tag.name.clone(), value, false)
+    })
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Id3Meta<'_> {
+  /// Project ID3 metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// ID3 is a music-tagging container: it always implies audio content, so
+  /// the faithful structural contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind). If a `Length` (TLEN) frame
+  /// was decoded, its post-ValueConv value (seconds — `ValueConv => '$val /
+  /// 1000'`, ID3.pm:594) fills [`MediaInfo`](crate::metadata::MediaInfo)'s
+  /// `duration`; otherwise duration stays `None`. The `Length` value is
+  /// read from the RAW staged list (`staged_tags_raw`), where TLEN is the
+  /// bare seconds scalar (the PrintConv list renders it as `"NN s"`).
+  /// Camera / lens / GPS / capture carry no ID3 facts ⇒ `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+
+    // `Length` (TLEN) seconds → Duration, from the RAW staged list (where
+    // TLEN is the post-ValueConv bare scalar, not the `"NN s"` PrintConv).
+    // The find_map already filters to a finite, non-negative seconds value,
+    // so the surviving `Some` feeds `update_duration` directly.
+    if let Some(secs) = self.staged_tags_raw.iter().find_map(|t| {
+      if t.name.as_str() != "Length" {
+        return None;
       }
+      let secs = match &t.value {
+        TagValue::F64(f) => *f,
+        TagValue::I64(n) => *n as f64,
+        TagValue::U64(n) => *n as f64,
+        _ => return None,
+      };
+      (secs.is_finite() && secs >= 0.0).then_some(secs)
+    }) {
+      media
+        .media_mut()
+        .update_duration(Some(core::time::Duration::from_secs_f64(secs)));
     }
-    for warn in &self.warnings {
-      out.write_warning(warn.as_str())?;
-    }
-    for err in &self.errors {
-      out.write_error(err.as_str())?;
-    }
-    Ok(())
+
+    media
   }
 }
 
 #[cfg(feature = "mp3")]
 #[cfg(feature = "alloc")]
-impl Mp3Meta<'_> {
-  /// Emit MP3 tags in bundled `ProcessMP3` order (ID3.pm:1684-1728):
+impl crate::emit::Taggable for Mp3Meta<'_> {
+  /// Yield MP3 tags in bundled `ProcessMP3` order (ID3.pm:1684-1728) — the
+  /// golden-pattern parallel of the retired inherent `serialize_tags`: only
+  /// the SINK changes (each sub-Meta yields [`EmittedTag`](crate::emit::EmittedTag)s
+  /// instead of `out.write_*`); the chain ORDER is preserved verbatim:
   /// 1. ID3 sub-Meta (header frames + v1 trailer fields), when present;
   /// 2. MPEG-audio sub-Meta (frame header + Xing/LAME tail), when an
   ///    audio frame sync was found;
   /// 3. APE-trailer sub-Meta, when an APETAGEX footer was found.
   ///
-  /// This typed sink emits the SAME tag set the engine entry `process`
-  /// does, so library callers consuming `Mp3Meta` via `serialize_tags` get the
-  /// complete picture (Codex BF1/CF1).
-  pub(crate) fn serialize_tags(
+  /// Each sub-Meta is itself [`Taggable`], so its own family-0/1 groups flow
+  /// through unchanged ([`Id3Meta`] mirrors the staged family-1; MPEG-audio
+  /// is `"MPEG"`; APE is `"MAC"`/`"APE"`/`"Composite"`).
+  ///
+  /// **What is NOT in this stream:** the chained sub-Metas' warnings/errors —
+  /// [`run_emission`](crate::emit::run_emission) has no warning/error channel.
+  /// The retired `serialize_tags` emitted them in this order: (a) the ID3
+  /// sub-Meta's own warnings then errors (during its `serialize_tags`); (b)
+  /// MPEG-audio emits none; (c) the APE sub-Meta's own — APE first emits its
+  /// nested ID3v1-trailer sub-Meta's warnings then errors, then the APE.pm:238
+  /// `Warn('Bad APE trailer')`. The `AnyMeta::Mp3` dispatch arm drains them
+  /// after `run_emission` in that exact order, so the net `TagMap` is identical.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+
+    let mut tags: Vec<EmittedTag> = Vec::new();
+    // 1. ID3 sub-Meta (header frames + v1 trailer). `Id3Meta` is `Taggable`;
+    // its warnings/errors are drained by the `AnyMeta::Mp3` arm.
     if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
+      tags.extend(id3.tags(mode));
     }
+    // 2. MPEG-audio sub-Meta (frame header + Xing/LAME tail). `AudioMeta` is
+    // `Taggable` and emits no warnings/errors.
     if let Some(mpeg) = &self.mpeg {
-      mpeg.serialize_tags(print_conv, out)?;
+      tags.extend(mpeg.tags(mode));
     }
+    // 3. APE-trailer sub-Meta. `ape::Meta` is `Taggable`; its `Bad APE
+    // trailer` warning + any nested-ID3 warnings/errors are drained by the
+    // `AnyMeta::Mp3` arm.
     if let Some(ape) = &self.ape {
-      ape.serialize_tags(print_conv, out)?;
+      tags.extend(ape.tags(mode));
     }
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "mp3")]
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Mp3Meta<'_> {
+  /// Project MP3 metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// An MP3 file is an audio stream: it carries no camera / lens / GPS /
+  /// capture facts (those domains stay `None`). The single faithful
+  /// structural contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind).
+  ///
+  /// **Duration stays `None`.** Neither the MPEG-audio sub-Meta nor the
+  /// MP3 wrapper exposes a decoded-duration accessor (MPEG.pm emits no
+  /// `Duration` tag; [`crate::formats::mpeg::AudioMeta`]'s own projection is
+  /// likewise audio-only-no-duration). The chained ID3 sub-Meta's `Length`
+  /// (TLEN) fact is NOT folded here (MP3's `Project` mirrors the bare-stream
+  /// MPEG-audio shape; ID3-duration folding stays in [`Id3Meta`]'s own
+  /// projection).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -1814,9 +2054,10 @@ mod tests {
       crate::formats::mpeg::AudioVersion::V1
     );
     assert_eq!(mpeg.audio_layer(), crate::formats::mpeg::AudioLayer::L3);
-    // Sink emits MPEG:* tags.
+    // Sink emits MPEG:* tags (golden `run_emission` over the `Mp3Meta`
+    // `Taggable` chain).
     let mut w = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("MPEG", "MPEGAudioVersion"), Some("1".into()));
     assert_eq!(w.get_str("MPEG", "AudioBitrate"), Some("128 kbps".into()));
   }
@@ -1880,9 +2121,10 @@ mod tests {
       meta.mpeg().is_some(),
       "MPEG sub-Meta present for ID3v2+audio MP3 (ProcessMP3 recursion)"
     );
-    // Sink emits BOTH ID3v2_3:Title and MPEG:* tags.
+    // Sink emits BOTH ID3v2_3:Title and MPEG:* tags (golden `run_emission`
+    // over the `Mp3Meta` `Taggable` chain).
     let mut w = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("ID3v2_3", "Title"), Some("Test".into()));
     assert_eq!(w.get_str("MPEG", "MPEGAudioVersion"), Some("1".into()));
   }
@@ -2457,7 +2699,7 @@ mod tests {
       .expect("ok")
       .expect("found");
     let mut w = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("ID3v1", "Title"), Some("Hello".into()));
     assert_eq!(w.get_str("ID3v1", "Genre"), Some("Hip-Hop".into()));
     assert_eq!(w.get_str("File", "ID3Size"), Some("128".into()));
@@ -2484,7 +2726,7 @@ mod tests {
       .expect("ok")
       .expect("found");
     let mut wj = crate::tagmap::TagMap::new();
-    meta_j.serialize_tags(true, &mut wj).unwrap();
+    crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
     assert_eq!(wj.get_str("ID3v1", "Genre"), Some("Hip-Hop".into()));
 
     // -n mode: parse + sink in raw mode → "7" (the raw genre byte),
@@ -2493,7 +2735,7 @@ mod tests {
       .expect("ok")
       .expect("found");
     let mut wn = crate::tagmap::TagMap::new();
-    meta_n.serialize_tags(false, &mut wn).unwrap();
+    crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
     assert_eq!(
       wn.get_str("ID3v1", "Genre"),
       Some("7".into()),
@@ -2531,7 +2773,7 @@ mod tests {
       .expect("ok")
       .expect("found");
     let mut wj = crate::tagmap::TagMap::new();
-    meta_j.serialize_tags(true, &mut wj).unwrap();
+    crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
     assert_eq!(wj.get_str("ID3v2_3", "Length"), Some("7 s".into()));
 
     // -n: 7 (raw ValueConv seconds), matching bundled `exiftool -j -n`.
@@ -2539,7 +2781,7 @@ mod tests {
       .expect("ok")
       .expect("found");
     let mut wn = crate::tagmap::TagMap::new();
-    meta_n.serialize_tags(false, &mut wn).unwrap();
+    crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
     assert_eq!(
       wn.get_str("ID3v2_3", "Length"),
       Some("7".into()),
@@ -2587,7 +2829,7 @@ mod tests {
 
     // sink(true) — PrintConv `-j`.
     let mut wj = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut wj).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut wj);
     assert_eq!(
       wj.get_str("ID3v2_3", "Length"),
       Some("7 s".into()),
@@ -2601,7 +2843,7 @@ mod tests {
 
     // sink(false) — raw `-j -n`, from the SAME `meta`.
     let mut wn = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut wn).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::ValueConv, &mut wn);
     assert_eq!(
       wn.get_str("ID3v2_3", "Length"),
       Some("7".into()),
@@ -2687,5 +2929,108 @@ mod tests {
     assert_eq!(f.group1(), "ID3v2_3");
     assert_eq!(f.name(), "Title");
     assert_eq!(f.value_ref(), &TagValue::Str(SmolStr::new("Song")));
+  }
+
+  // ---------- Golden-pattern faithfulness: `Taggable` ≡ kept `serialize_tags` ----------
+
+  /// Read a fixture file from `tests/fixtures/`.
+  #[cfg(feature = "alloc")]
+  fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+  }
+
+  /// The ordered `(key, value)` entries a `Taggable` produces through the
+  /// production engine ([`crate::emit::run_emission`]) for `mode`.
+  #[cfg(feature = "alloc")]
+  fn emit_entries<T: crate::emit::Taggable>(
+    meta: &T,
+    mode: crate::emit::ConvMode,
+  ) -> Vec<(SmolStr, TagValue)> {
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(meta, mode, &mut tm);
+    tm.entries().to_vec()
+  }
+
+  /// `Id3v1Meta`'s `Taggable` reproduces `real::emit_id3v1` byte-for-byte —
+  /// the canonical standalone ID3v1 emission. `Id3v1Meta` has no inherent
+  /// `serialize_tags`, so the reference logic is inlined here (a faithful
+  /// transcription of `real::emit_id3v1`) and compared against the engine
+  /// path, in both `-j` and `-n` modes, across a normal-genre fixture and a
+  /// sparse-genre + empty-title fixture.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn id3v1_taggable_matches_reference_emission() {
+    // Faithful transcription of `crate::formats::real::emit_id3v1`.
+    fn reference(id3: &Id3v1Meta<'_>, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+      let mut out = crate::tagmap::TagMap::new();
+      let group = "ID3v1";
+      if let Some(s) = id3.title() {
+        out.write_str(group, "Title", s).unwrap();
+      }
+      if let Some(s) = id3.artist() {
+        out.write_str(group, "Artist", s).unwrap();
+      }
+      if let Some(s) = id3.album() {
+        out.write_str(group, "Album", s).unwrap();
+      }
+      if let Some(s) = id3.year() {
+        if let Ok(n) = s.parse::<i64>() {
+          out.write_i64(group, "Year", n).unwrap();
+        } else {
+          out.write_str(group, "Year", s).unwrap();
+        }
+      }
+      if let Some(s) = id3.comment() {
+        out.write_str(group, "Comment", s).unwrap();
+      }
+      if let Some(t) = id3.track() {
+        out.write_u64(group, "Track", u64::from(t)).unwrap();
+      }
+      if let Some(g) = id3.genre() {
+        if print_conv {
+          if let Some(name) = id3.genre_name() {
+            out.write_str(group, "Genre", name).unwrap();
+          } else {
+            out
+              .write_fmt(group, "Genre", |w| write!(w, "Unknown ({g})"))
+              .unwrap();
+          }
+        } else {
+          out.write_u64(group, "Genre", u64::from(g)).unwrap();
+        }
+      }
+      out.entries().to_vec()
+    }
+
+    // Two distinct ID3v1 shapes: a normal-genre trailer (last 128 bytes of
+    // ID3v1.mp3) and the synthesized sparse-genre + empty-title RM fixtures
+    // (which exercise the `Unknown (n)` Genre branch + `Some("")` fields).
+    let v1_bytes = fixture("ID3v1.mp3");
+    let v1_trailer = &v1_bytes[v1_bytes.len() - 128..];
+    let normal = parse_id3v1_from_block(v1_trailer).expect("ID3v1.mp3 trailer parses");
+
+    let sparse_rm = fixture("real_synth_id3v1_sparse_genre.rm");
+    let sparse_trailer = &sparse_rm[sparse_rm.len() - 128..];
+    let sparse = parse_id3v1_from_block(sparse_trailer).expect("sparse-genre trailer parses");
+
+    for v1 in [&normal, &sparse] {
+      for (print_conv, mode) in [
+        (true, crate::emit::ConvMode::PrintConv),
+        (false, crate::emit::ConvMode::ValueConv),
+      ] {
+        let reference = reference(v1, print_conv);
+        let actual = emit_entries(v1, mode);
+        assert_eq!(
+          reference.as_slice(),
+          actual.as_slice(),
+          "Id3v1Meta Taggable diverged from emit_id3v1 reference (print_conv={print_conv})"
+        );
+      }
+    }
   }
 }

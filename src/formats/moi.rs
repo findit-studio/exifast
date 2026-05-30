@@ -606,118 +606,154 @@ fn parse_video_bitrate(b: &[u8]) -> VideoBitrate {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit MOI tags into the writer in MOI.pm sorted-offset order (faithful
-  /// to ExifTool.pm:9907 `sort { $a <=> $b }` keyed iteration). Family-1
-  /// group is `"MOI"` (the Perl module-name suffix).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield MOI tags in MOI.pm sorted-offset order (faithful to
+  /// ExifTool.pm:9907 `sort { $a <=> $b }` keyed iteration). The
+  /// golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`), the per-tag PrintConv/ValueConv branches are
+  /// preserved verbatim. `write_fmt`'s `String` build folds into a
+  /// `TagValue::Str` (byte-identical to the retired sink, which itself
+  /// built a `String` then stored `TagValue::Str`).
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  /// See `serialize_tags`'s type-level docs for the rationale on this
-  /// Phase E spec evolution.
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv formatted strings;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `"MOI"` (MOI.pm:21 sets only `GROUPS{2} =>
+  /// 'Video'`, so family0 defaults to the module name); `family1` = `"MOI"`
+  /// (the `-G1` key, unchanged from the retired `serialize_tags`). MOI.pm
+  /// has no `Unknown => 1` tags ⇒ `unknown: false`.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "MOI";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+    use core::fmt::Write as _;
+    use std::string::String;
+
+    let group = || Group::new("MOI", "MOI");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(7);
 
     // 0x00 MOIVersion — no conversions, identical under both modes.
-    out.write_str(GROUP, "MOIVersion", self.version)?;
+    tags.push(EmittedTag::new(
+      group(),
+      "MOIVersion".into(),
+      TagValue::Str(self.version.into()),
+      false,
+    ));
 
     // 0x06 DateTimeOriginal — ValueConv produces the formatted string;
     // PrintConv is identity (no DateFormat option). Under both -j and -n
-    // we emit the same formatted text via write_fmt (no String alloc on
-    // the writer side). See MOI.pm:32-40 for the sprintf format.
+    // we emit the same formatted text. See MOI.pm:32-40 for the sprintf
+    // format.
     if let Some(dt) = self.datetime_original {
-      out.write_fmt(GROUP, "DateTimeOriginal", |w| {
-        // `%.4d:%.2d:%.2d %.2d:%.2d:%06.3f` — width-6 zero-padded
-        // fractional seconds (`{:06.3}` matches Perl's `%06.3f` for
-        // non-negative finite values; bundled-oracle verified at 0.0,
-        // 7.123, 48.0). second_dec = second + (subsec_nanos / 1e9).
-        let sec_dec = f64::from(dt.second()) + f64::from(dt.subsec_nanosecond()) / 1e9;
-        write!(
-          w,
-          "{:04}:{:02}:{:02} {:02}:{:02}:{:06.3}",
-          dt.year(),
-          dt.month(),
-          dt.day(),
-          dt.hour(),
-          dt.minute(),
-          sec_dec,
-        )
-      })?;
+      // `%.4d:%.2d:%.2d %.2d:%.2d:%06.3f` — width-6 zero-padded
+      // fractional seconds (`{:06.3}` matches Perl's `%06.3f` for
+      // non-negative finite values; bundled-oracle verified at 0.0,
+      // 7.123, 48.0). second_dec = second + (subsec_nanos / 1e9).
+      let sec_dec = f64::from(dt.second()) + f64::from(dt.subsec_nanosecond()) / 1e9;
+      let mut s = String::new();
+      let _ = write!(
+        s,
+        "{:04}:{:02}:{:02} {:02}:{:02}:{:06.3}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        sec_dec,
+      );
+      tags.push(EmittedTag::new(
+        group(),
+        "DateTimeOriginal".into(),
+        TagValue::Str(s.into()),
+        false,
+      ));
     }
 
     // 0x0e Duration — ValueConv `/1000` ⇒ f64 seconds.
     if let Some(d) = self.duration {
       let secs = d.as_secs_f64();
-      if print_conv {
+      let value = if print_conv {
         // PrintConv: ConvertDuration formatted string.
-        out.write_fmt(GROUP, "Duration", |w| write_convert_duration(w, secs))?;
+        let mut s = String::new();
+        let _ = write_convert_duration(&mut s, secs);
+        TagValue::Str(s.into())
       } else {
         // -n: raw seconds as f64. Bundled `perl exiftool -n` emits the
-        // ValueConv output `8.16` as a bare JSON number; `write_f64`
-        // produces the same numeric token via the serializer's
-        // `push_numeric_gated`.
-        out.write_f64(GROUP, "Duration", secs)?;
-      }
+        // ValueConv output `8.16` as a bare JSON number; `TagValue::F64`
+        // produces the same numeric token via the serializer.
+        TagValue::F64(secs)
+      };
+      tags.push(EmittedTag::new(group(), "Duration".into(), value, false));
     }
 
     // 0x80 AspectRatio — no ValueConv. -j: PrintConv string. -n: raw u8
     // (as the JSON number 81 for the fixture).
     if let Some(ar) = self.aspect_ratio {
-      if print_conv {
-        out.write_str(GROUP, "AspectRatio", ar.print_conv())?;
+      let value = if print_conv {
+        TagValue::Str(ar.print_conv().into())
       } else {
-        out.write_u64(GROUP, "AspectRatio", u64::from(aspect_ratio_raw(ar)))?;
-      }
+        TagValue::U64(u64::from(aspect_ratio_raw(ar)))
+      };
+      tags.push(EmittedTag::new(group(), "AspectRatio".into(), value, false));
     }
 
     // 0x84 AudioCodec — no ValueConv. -j: hash hit ⇒ name; miss ⇒
     // PrintHex `"Unknown (0xHEX)"`. -n: raw u16.
     if let Some(code) = self.audio_codec {
-      if print_conv {
+      let value = if print_conv {
         if let Some(name) = audio_codec_lookup(code) {
-          out.write_str(GROUP, "AudioCodec", name)?;
+          TagValue::Str(name.into())
         } else {
           // PrintHex fallback (ExifTool.pm:3617 — `Unknown (0x%x)` form).
-          out.write_fmt(GROUP, "AudioCodec", |w| write!(w, "Unknown (0x{code:x})"))?;
+          let mut s = String::new();
+          let _ = write!(s, "Unknown (0x{code:x})");
+          TagValue::Str(s.into())
         }
       } else {
-        out.write_u64(GROUP, "AudioCodec", u64::from(code))?;
-      }
+        TagValue::U64(u64::from(code))
+      };
+      tags.push(EmittedTag::new(group(), "AudioCodec".into(), value, false));
     }
 
     // 0x86 AudioBitrate — ValueConv `*16000+48000`. -j: ConvertBitrate.
     // -n: post-ValueConv u32.
     if let Some(bps) = self.audio_bitrate {
-      if print_conv {
-        out.write_fmt(GROUP, "AudioBitrate", |w| {
-          write_convert_bitrate(w, f64::from(bps))
-        })?;
+      let value = if print_conv {
+        let mut s = String::new();
+        let _ = write_convert_bitrate(&mut s, f64::from(bps));
+        TagValue::Str(s.into())
       } else {
-        out.write_u64(GROUP, "AudioBitrate", u64::from(bps))?;
-      }
+        TagValue::U64(u64::from(bps))
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        "AudioBitrate".into(),
+        value,
+        false,
+      ));
     }
 
     // 0xda VideoBitrate — hash ValueConv + ConvertBitrate.
     if let Some(vb) = self.video_bitrate {
-      match (vb, print_conv) {
+      let value = match (vb, print_conv) {
         (VideoBitrate::Known(bps), true) => {
-          out.write_fmt(GROUP, "VideoBitrate", |w| {
-            write_convert_bitrate(w, f64::from(bps))
-          })?;
+          let mut s = String::new();
+          let _ = write_convert_bitrate(&mut s, f64::from(bps));
+          TagValue::Str(s.into())
         }
         (VideoBitrate::Known(bps), false) => {
           // -n: emit the post-ValueConv numeric. The bundled `perl exiftool
           // -n` on MOI.moi emits `"MOI:VideoBitrate": 8500000` (bare
           // JSON number).
-          out.write_u64(GROUP, "VideoBitrate", u64::from(bps))?;
+          TagValue::U64(u64::from(bps))
         }
         (VideoBitrate::Unknown(code), true) => {
           // -j: PrintHex fallback. Perl's `Unknown (0x%x)` is then fed
@@ -725,17 +761,68 @@ impl Meta<'_> {
           // the same string unchanged (ExifTool.pm:6892 `IsFloat or
           // return $bitrate`). Net effect: the `Unknown (0xHEX)` string
           // is what's emitted.
-          out.write_fmt(GROUP, "VideoBitrate", |w| write!(w, "Unknown (0x{code:x})"))?;
+          let mut s = String::new();
+          let _ = write!(s, "Unknown (0x{code:x})");
+          TagValue::Str(s.into())
         }
         (VideoBitrate::Unknown(code), false) => {
           // -n: hash miss ⇒ the PrintHex fallback STRING `"Unknown (0x%x)"`
           // is the ValueConv output (because MOI.pm uses `ValueConv` for
           // the hash; misses produce the PrintHex form). Faithful.
-          out.write_fmt(GROUP, "VideoBitrate", |w| write!(w, "Unknown (0x{code:x})"))?;
+          let mut s = String::new();
+          let _ = write!(s, "Unknown (0x{code:x})");
+          TagValue::Str(s.into())
         }
-      }
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        "VideoBitrate".into(),
+        value,
+        false,
+      ));
     }
-    Ok(())
+
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project MOI metadata onto the normalized [`MediaMetadata`] domain.
+  ///
+  /// MOI is a camcorder VIDEO sidecar (`%MOI::Main` `GROUPS{2} => 'Video'`,
+  /// MOI.pm:21). The faithful [`MediaInfo`](crate::metadata::MediaInfo)
+  /// contributions are the recording duration, the creation timestamp
+  /// (`DateTimeOriginal`, the only datetime MOI decodes), and a single
+  /// video [`TrackKind`](crate::metadata::TrackKind). The camera / lens /
+  /// GPS / capture domains stay `None` (MOI carries no such facts);
+  /// dimensions stay `None` (`%MOI::Main` decodes AspectRatio, not pixel
+  /// width/height).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().update_duration(self.duration);
+    // `DateTimeOriginal` is MOI's only timestamp; surface it as the
+    // container creation time, formatted as ExifTool's
+    // `YYYY:MM:DD HH:MM:SS` (seconds truncated — the domain `created`
+    // string carries no sub-second component).
+    if let Some(dt) = self.datetime_original {
+      media.media_mut().update_created(Some(std::format!(
+        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+      )));
+    }
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
   }
 }
 
@@ -1048,13 +1135,24 @@ mod tests {
     assert!(parse_borrowed(&buf).unwrap().is_none());
   }
 
-  // ---------- serialize_tags (print_conv on / off) ---------------------------
+  // ---------- Taggable emission (print_conv on / off) ------------------------
+
+  /// Drive `meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) and return the resulting
+  /// [`TagMap`](crate::tagmap::TagMap) — the production sink path.
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> TagMap {
+    let mut w = TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    w
+  }
 
   fn collect(buf: &[u8], print_conv: bool) -> TagMap {
-    let mut w = TagMap::new();
     let meta = parse_borrowed(buf).expect("ok").expect("parsed");
-    meta.serialize_tags(print_conv, &mut w).unwrap();
-    w
+    emit_into_tagmap(&meta, print_conv)
   }
 
   #[test]
@@ -1208,11 +1306,10 @@ mod tests {
   #[test]
   fn engine_emits_tags_in_ascending_offset_order() {
     // Faithful to ExifTool.pm:9907 sorted-key walk. Order is preserved by the
-    // typed `serialize_tags` -> `TagMap` entry order (the JSON object loses it).
+    // `Taggable` emission order -> `TagMap` entry order (the JSON object loses it).
     let buf = fixture_buffer();
     let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
-    let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     let format_names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
@@ -1230,6 +1327,52 @@ mod tests {
         "VideoBitrate",
       ]
     );
+  }
+
+  #[test]
+  fn taggable_group_is_moi_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let buf = fixture_buffer();
+    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    // MOIVersion, DateTimeOriginal, Duration, AspectRatio, AudioCodec,
+    // AudioBitrate, VideoBitrate — 7 tags, none Unknown.
+    assert_eq!(tags.len(), 7);
+    for t in &tags {
+      // family0 = "MOI" (MOI.pm:21 sets only GROUPS{2}='Video').
+      assert_eq!(t.tag().group_ref().family0(), "MOI");
+      // family1 = "MOI" (the -G1 key, unchanged from serialize_tags).
+      assert_eq!(t.tag().group_ref().family1(), "MOI");
+      assert!(!t.unknown(), "MOI has no Unknown=>1 tags");
+    }
+    assert_eq!(tags[0].tag().name(), "MOIVersion");
+    assert_eq!(tags[6].tag().name(), "VideoBitrate");
+  }
+
+  #[test]
+  fn project_populates_video_track_duration_and_created() {
+    use crate::metadata::{Project, TrackKind};
+    let buf = fixture_buffer();
+    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let projected = meta.project();
+    // MOI is a camcorder video sidecar: one video track kind.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert!(!projected.media().has_audio());
+    // Duration (8160 ms) + DateTimeOriginal-derived created.
+    assert_eq!(
+      projected.media().duration(),
+      Some(core::time::Duration::from_millis(8160))
+    );
+    assert_eq!(projected.media().created(), Some("2011:05:15 17:58:48"));
+    // MOI decodes AspectRatio, not pixel dimensions.
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().height().is_none());
+    // No camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 
   // ---------- `FormatParser` trait surface --------------------------------

@@ -101,7 +101,20 @@ impl TagMap {
   // signature swap, not a body rewrite). `Infallible` lets the compiler
   // eliminate the error branch.
 
+  // `write_str` / `write_u64` / `write_i64` / `write_f64` / `write_fmt`: with
+  // EXIF's `File:ExifByteOrder` folded into `ExifMeta::tags()` (the LAST
+  // production `write_str` caller — it now emits an `EmittedTag` carrying a
+  // pre-built `TagValue::Str` through the golden engine), NO lib-build caller
+  // remains for ANY of these per-type writers — every production tag now flows
+  // through `write_value` (carrying a pre-built [`TagValue`]). Their only
+  // surviving callers are test code: the `#[cfg(test)]` `ExifSink for TagMap`
+  // impl ([`crate::exif`]) and the ID3v1 differential test in
+  // `formats::id3::process`. Gated `#[cfg(all(test, feature = "alloc"))]` to
+  // match those callers exactly (mirrors the same-reason gate on the
+  // `ExifSink for TagMap` test impl) so the lib build carries no dead code.
+
   /// Emit a `&str` value.
+  #[cfg(all(test, feature = "alloc"))]
   pub(crate) fn write_str(
     &mut self,
     group: &str,
@@ -113,6 +126,7 @@ impl TagMap {
   }
 
   /// Emit a `u64` value (EXACT — no saturation to `i64::MAX`).
+  #[cfg(all(test, feature = "alloc"))]
   pub(crate) fn write_u64(
     &mut self,
     group: &str,
@@ -124,6 +138,7 @@ impl TagMap {
   }
 
   /// Emit an `i64` value.
+  #[cfg(all(test, feature = "alloc"))]
   pub(crate) fn write_i64(
     &mut self,
     group: &str,
@@ -135,6 +150,7 @@ impl TagMap {
   }
 
   /// Emit an `f64` value.
+  #[cfg(all(test, feature = "alloc"))]
   pub(crate) fn write_f64(
     &mut self,
     group: &str,
@@ -145,21 +161,10 @@ impl TagMap {
     Ok(())
   }
 
-  /// Emit raw bytes (rendered as the no-`-b` binary placeholder by
-  /// `TagValue::Bytes`'s `Serialize`).
-  pub(crate) fn write_bytes(
-    &mut self,
-    group: &str,
-    name: &str,
-    value: &[u8],
-  ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::Bytes(value.to_vec()));
-    Ok(())
-  }
-
   /// Format directly into a `String`, then emit as a `&str` value. The
   /// no-alloc workhorse on the old sink; the typed store holds an owned value,
   /// so the single allocation happens here.
+  #[cfg(all(test, feature = "alloc"))]
   pub(crate) fn write_fmt(
     &mut self,
     group: &str,
@@ -172,32 +177,17 @@ impl TagMap {
     Ok(())
   }
 
-  /// Emit a list of `&str` values for one key as a single `TagValue::List`
-  /// (Vorbis ARTIST/PERFORMER/CONTACT coalesce, Vorbis.pm:85/86/94; faithful
-  /// `FoundTag` promote-and-push, ExifTool.pm:9505-9520). First-wins on the
-  /// key like every other emission. Each typed sink passes ALL values for the
-  /// key in one call, so no cross-call coalescing is needed.
-  pub(crate) fn write_str_list(
+  /// Emit a pre-built [`TagValue`] directly (no per-type conversion). The
+  /// MakerNotes typed-vendor parsers ([`crate::exif::makernotes::vendors`])
+  /// produce already-typed values (the per-tag PrintConv has run), so
+  /// `write_value` is the right sink for them.
+  pub(crate) fn write_value(
     &mut self,
     group: &str,
     name: &str,
-    values: &[&str],
+    value: TagValue,
   ) -> Result<(), Infallible> {
-    let items: Vec<TagValue> = values.iter().map(|v| TagValue::Str((*v).into())).collect();
-    self.insert(group, name, TagValue::List(items));
-    Ok(())
-  }
-
-  /// Emit a list of arbitrary `TagValue` items for one key (e.g. an AMF
-  /// array of doubles for `Flash:KeyFramesTimes` / `KeyFramePositions`).
-  /// First-wins on the key like every other emission.
-  pub(crate) fn write_value_list(
-    &mut self,
-    group: &str,
-    name: &str,
-    items: Vec<TagValue>,
-  ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::List(items));
+    self.insert(group, name, value);
     Ok(())
   }
 
