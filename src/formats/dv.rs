@@ -950,92 +950,201 @@ fn parse_outcome(data: &[u8]) -> Option<ParseOutcome<'static>> {
 // raw DIF-block view).
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit DV tags into the writer in `@dvTags` order (DV.pm:116-121) —
-  /// faithful to the bundled-Perl iteration.
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield DV tags in `@dvTags` order (DV.pm:116-121) — faithful to the
+  /// bundled-Perl iteration. The golden-pattern parallel to the retired
+  /// `serialize_tags`: the SINK changes (an
+  /// [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`), the per-tag PrintConv/ValueConv branches are preserved
+  /// verbatim (`write_fmt`'s `String` build folds into a `TagValue::Str`).
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted strings (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv formatted strings;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `"DV"` (DV.pm:125 sets only `GROUPS{2} => 'Video'`,
+  /// so family0 defaults to the table name; AudioChannels/Rate/BitsPerSample
+  /// promote family-2 to "Audio" — family-2 is not emitted under `-G1`);
+  /// `family1` = `"DV"` (the `-G1` key, unchanged from the retired
+  /// `serialize_tags`). DV.pm has no `Unknown => 1` tags ⇒ `unknown: false`.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "DV";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::Group;
+
+    let group = || Group::new("DV", "DV");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(DV_TAGS.len());
+
     for &tag_name in DV_TAGS {
       match tag_name {
         "DateTimeOriginal" => {
           if let Some(s) = self.date_time_original.as_deref() {
             // DV.pm:128 PrintConv => ConvertDateTime; default options
             // pass through unchanged ⇒ same string under -j and -n.
-            out.write_str(GROUP, "DateTimeOriginal", s)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "DateTimeOriginal".into(),
+              TagValue::Str(s.into()),
+              false,
+            ));
           }
         }
-        "ImageWidth" => out.write_u64(GROUP, "ImageWidth", u64::from(self.image_width))?,
-        "ImageHeight" => out.write_u64(GROUP, "ImageHeight", u64::from(self.image_height))?,
+        "ImageWidth" => tags.push(EmittedTag::new(
+          group(),
+          "ImageWidth".into(),
+          TagValue::U64(u64::from(self.image_width)),
+          false,
+        )),
+        "ImageHeight" => tags.push(EmittedTag::new(
+          group(),
+          "ImageHeight".into(),
+          TagValue::U64(u64::from(self.image_height)),
+          false,
+        )),
         "Duration" => {
-          if print_conv {
+          let value = if print_conv {
             // PrintConv: ConvertDuration formatted string.
-            out.write_fmt(GROUP, "Duration", |w| {
-              w.write_str(&convert_duration_str(&TagValue::F64(self.duration)))
-            })?;
+            TagValue::Str(convert_duration_str(&TagValue::F64(self.duration)).into())
           } else {
-            out.write_f64(GROUP, "Duration", self.duration)?;
-          }
+            TagValue::F64(self.duration)
+          };
+          tags.push(EmittedTag::new(group(), "Duration".into(), value, false));
         }
         "TotalBitrate" => {
-          if print_conv {
-            out.write_fmt(GROUP, "TotalBitrate", |w| {
-              w.write_str(&convert_bitrate_str(&TagValue::F64(self.total_bitrate)))
-            })?;
+          let value = if print_conv {
+            TagValue::Str(convert_bitrate_str(&TagValue::F64(self.total_bitrate)).into())
           } else {
-            out.write_f64(GROUP, "TotalBitrate", self.total_bitrate)?;
-          }
+            TagValue::F64(self.total_bitrate)
+          };
+          tags.push(EmittedTag::new(
+            group(),
+            "TotalBitrate".into(),
+            value,
+            false,
+          ));
         }
-        "VideoFormat" => out.write_str(GROUP, "VideoFormat", self.video_format)?,
+        "VideoFormat" => tags.push(EmittedTag::new(
+          group(),
+          "VideoFormat".into(),
+          TagValue::Str(self.video_format.into()),
+          false,
+        )),
         "VideoScanType" => {
           if let Some(s) = self.video_scan_type {
-            out.write_str(GROUP, "VideoScanType", s)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "VideoScanType".into(),
+              TagValue::Str(s.into()),
+              false,
+            ));
           }
         }
         "FrameRate" => {
-          if print_conv {
+          let value = if print_conv {
             // DV.pm:139 PrintConv: int($val * 1000 + 0.5) / 1000.
             let rounded = ((self.frame_rate * 1000.0 + 0.5).floor()) / 1000.0;
-            out.write_f64(GROUP, "FrameRate", rounded)?;
+            TagValue::F64(rounded)
           } else {
-            out.write_f64(GROUP, "FrameRate", self.frame_rate)?;
-          }
+            TagValue::F64(self.frame_rate)
+          };
+          tags.push(EmittedTag::new(group(), "FrameRate".into(), value, false));
         }
         "AspectRatio" => {
           if let Some(s) = self.aspect_ratio {
-            out.write_str(GROUP, "AspectRatio", s)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "AspectRatio".into(),
+              TagValue::Str(s.into()),
+              false,
+            ));
           }
         }
-        "Colorimetry" => out.write_str(GROUP, "Colorimetry", self.colorimetry)?,
+        "Colorimetry" => tags.push(EmittedTag::new(
+          group(),
+          "Colorimetry".into(),
+          TagValue::Str(self.colorimetry.into()),
+          false,
+        )),
         "AudioChannels" => {
           if let Some(n) = self.audio_channels {
-            out.write_i64(GROUP, "AudioChannels", n)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "AudioChannels".into(),
+              TagValue::I64(n),
+              false,
+            ));
           }
         }
         "AudioSampleRate" => {
           if let Some(n) = self.audio_sample_rate {
-            out.write_i64(GROUP, "AudioSampleRate", n)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "AudioSampleRate".into(),
+              TagValue::I64(n),
+              false,
+            ));
           }
         }
         "AudioBitsPerSample" => {
           if let Some(n) = self.audio_bits_per_sample {
-            out.write_i64(GROUP, "AudioBitsPerSample", n)?;
+            tags.push(EmittedTag::new(
+              group(),
+              "AudioBitsPerSample".into(),
+              TagValue::I64(n),
+              false,
+            ));
           }
         }
         _ => {} // unreachable: DV_TAGS is a fixed const list
       }
     }
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project DV metadata onto the normalized [`MediaMetadata`] domain.
+  ///
+  /// DV is a VIDEO stream (`%DV::Main` `GROUPS{2} => 'Video'`, DV.pm:125).
+  /// The faithful [`MediaInfo`](crate::metadata::MediaInfo) contributions
+  /// are the matched profile's pixel dimensions (`ImageWidth`/`ImageHeight`,
+  /// always decoded on the success path), the computed recording duration
+  /// (`Duration` seconds, DV.pm:196), the VAUX-decoded creation timestamp
+  /// (`DateTimeOriginal`, present only when the date+time VAUX packs were
+  /// found), and a single video [`TrackKind`](crate::metadata::TrackKind).
+  /// The camera / lens / GPS / capture domains stay `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    use core::time::Duration;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media
+      .media_mut()
+      .update_width(Some(self.image_width))
+      .update_height(Some(self.image_height));
+    // DV.pm:196 Duration in seconds; only a finite, non-negative value maps
+    // onto `core::time::Duration` (a degenerate byte-rate could yield NaN /
+    // inf, which `Duration` cannot represent).
+    if self.duration.is_finite() && self.duration >= 0.0 {
+      media
+        .media_mut()
+        .update_duration(Some(Duration::from_secs_f64(self.duration)));
+    }
+    media
+      .media_mut()
+      .update_created(self.date_time_original.clone());
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
   }
 }
 
@@ -1394,11 +1503,11 @@ mod tests {
     assert_eq!(outcome.unwrap_meta().image_width(), 720);
   }
 
-  #[test]
-  fn meta_sinker_emits_typed_tags() {
-    use crate::tagmap::TagMap;
-    // Construct a Meta directly so we don't depend on a fixture.
-    let meta = Meta {
+  /// A fully-populated DV `Meta` for the Taggable/Project tests (constructed
+  /// directly — in-module access to the private fields — so the tests don't
+  /// depend on a fixture).
+  fn sample_meta() -> Meta<'static> {
+    Meta {
       date_time_original: Some("2024:01:15 12:30:45".to_string()),
       image_width: 720,
       image_height: 576,
@@ -1412,10 +1521,26 @@ mod tests {
       audio_channels: Some(2),
       audio_sample_rate: Some(32_000),
       audio_bits_per_sample: Some(16),
-    };
+    }
+  }
+
+  /// Drive `meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)).
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    w
+  }
+
+  #[test]
+  fn taggable_emits_typed_tags() {
+    let meta = sample_meta();
     // PrintConv on: ConvertDuration/ConvertBitrate strings, FrameRate rounded.
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("DV", "Duration"), Some("8.16 s".to_string()));
     assert_eq!(
       w.get_str("DV", "TotalBitrate"),
@@ -1428,13 +1553,49 @@ mod tests {
       Some("IEC 61834 - 625/50 (PAL)".to_string())
     );
     // PrintConv off: raw scalars (Duration as f64, etc.).
-    let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, false);
     assert_eq!(w.get_str("DV", "Duration"), Some("8.16".to_string()));
     assert_eq!(
       w.get_str("DV", "TotalBitrate"),
       Some("28800000".to_string())
     );
+  }
+
+  #[test]
+  fn taggable_group_is_dv_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let meta = sample_meta();
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    // All 13 @dvTags present (every field is Some on `sample_meta`).
+    assert_eq!(tags.len(), DV_TAGS.len());
+    for t in &tags {
+      // family0 = "DV" (DV.pm:125 sets only GROUPS{2}='Video').
+      assert_eq!(t.tag().group_ref().family0(), "DV");
+      // family1 = "DV" (the -G1 key, unchanged from serialize_tags).
+      assert_eq!(t.tag().group_ref().family1(), "DV");
+      assert!(!t.unknown(), "DV has no Unknown=>1 tags");
+    }
+    assert_eq!(tags[0].tag().name(), "DateTimeOriginal");
+  }
+
+  #[test]
+  fn project_populates_video_track_dimensions_duration_created() {
+    use crate::metadata::{Project, TrackKind};
+    let projected = sample_meta().project();
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert_eq!(projected.media().width(), Some(720));
+    assert_eq!(projected.media().height(), Some(576));
+    assert_eq!(
+      projected.media().duration(),
+      Some(core::time::Duration::from_secs_f64(8.16))
+    );
+    assert_eq!(projected.media().created(), Some("2024:01:15 12:30:45"));
+    // No camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 
   #[test]

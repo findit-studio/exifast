@@ -85,6 +85,13 @@ pub mod bitstream;
 pub mod charset;
 pub mod convert;
 pub mod datetime;
+// The format-agnostic emission framework (`Taggable` + the `run_emission`
+// engine + `ConvMode`/`EmittedTag`): the single place the cross-cutting
+// emission rules (Unknown-suppression, sink dedup) are applied, so every
+// format's typed `Meta` emits through ONE engine instead of a hand-rolled
+// `serialize_tags`. `alloc`-gated to match `tagmap` (the engine's sink).
+#[cfg(feature = "alloc")]
+pub mod emit;
 pub mod error;
 // The Exif/TIFF IFD infrastructure (`exif` feature) + the GPS sub-IFD tag
 // table (`gps` feature). `src/exif/` is a top-level module (not under
@@ -131,6 +138,19 @@ pub mod value;
 
 pub use error::{Error, OutOfBounds, Result, UnexpectedEof};
 pub use value::{Group, Metadata, Rational, Tag, TagValue};
+
+// The normalized cross-format domain layer (golden pattern L2). Re-exported
+// at the crate root so the top-level [`media_metadata`] convenience entry's
+// return type — and the [`Project`](crate::metadata::Project) seam each
+// per-format `Meta` implements — are reachable without traversing into the
+// [`metadata`] module. The per-domain structs stay under `exifast::metadata`.
+pub use metadata::{MediaMetadata, Project};
+
+// The emission-framework public surface (`run_emission` stays `pub(crate)` —
+// it writes into the crate-private `TagMap` sink). `alloc`-gated to match the
+// `emit` module.
+#[cfg(feature = "alloc")]
+pub use emit::{ConvMode, EmittedTag, Taggable};
 
 // ===========================================================================
 // Public lib-first API surface — Phase G
@@ -292,6 +312,57 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
     shared = SharedFlags::new();
   }
   Ok(None)
+}
+
+// ===========================================================================
+// `media_metadata` — top-level domain-projection entry (golden pattern L2)
+// ===========================================================================
+
+/// Detect the file type from `bytes`, parse it, and project the result onto
+/// the normalized cross-format [`MediaMetadata`] domain — the lib-first
+/// "give me camera / lens / GPS / capture / container facts regardless of
+/// format" convenience entry.
+///
+/// This is the one-call wrapper over [`parse_bytes`] +
+/// [`AnyMeta::project`](crate::AnyMeta::project): it dispatches to the right
+/// per-format parser, then folds the typed `Meta` into the domain aggregate.
+///
+/// Returns:
+/// - `Some(md)` — the bytes parsed to a known format; `md` carries whatever
+///   domains that format projects. Today only EXIF/TIFF (incl. JPEG-embedded
+///   Exif + the vendor MakerNote) fills camera / lens / GPS / capture; every
+///   other format projects an **empty** [`MediaMetadata`] (all domains `None`)
+///   until its Phase-2 projection lands. So a recognized non-EXIF file yields
+///   `Some(MediaMetadata)` whose [`camera`](MediaMetadata::camera) etc. are
+///   `None`.
+/// - `None` — no parser accepted the bytes (unknown/empty input), OR a
+///   per-format parser raised a Rust-level fatal. **Parse errors are
+///   intentionally swallowed as `None`** for this convenience entry; a caller
+///   that needs to distinguish "unrecognized" from "fatal parser error"
+///   should use [`parse_bytes`] (which returns `Result<Option<_>, AnyError>`)
+///   and call [`AnyMeta::project`](crate::AnyMeta::project) itself.
+///
+/// # Examples
+///
+/// ```no_run
+/// # #[cfg(feature = "exif")] {
+/// let bytes = std::fs::read("photo.jpg").unwrap();
+/// if let Some(md) = exifast::media_metadata(&bytes) {
+///   if let Some(make) = md.camera().and_then(|c| c.make()) {
+///     println!("shot on a {make}");
+///   }
+/// }
+/// # }
+/// ```
+#[cfg(feature = "std")]
+#[must_use]
+pub fn media_metadata(bytes: &[u8]) -> Option<MediaMetadata> {
+  // `parse_bytes` errors are convenience-swallowed to `None` (see the doc
+  // contract); `Ok(None)` (no format matched) is likewise `None`.
+  match parse_bytes(bytes) {
+    Ok(Some(any)) => Some(any.project()),
+    Ok(None) | Err(_) => None,
+  }
 }
 
 // ===========================================================================
@@ -715,6 +786,35 @@ mod tests {
   fn parse_bytes_empty_input_returns_none() {
     let result = parse_bytes(b"").unwrap();
     assert!(result.is_none());
+  }
+
+  /// `media_metadata` over a real Canon JPEG projects the camera domain
+  /// through `parse_bytes` → `AnyMeta::Exif` → `Project::project` (the
+  /// JPEG candidate routes to the Exif walker). The make comes from IFD0
+  /// `Make`; the model/serial fold in the Canon MakerNote merge.
+  #[test]
+  #[cfg(all(feature = "exif", feature = "std"))]
+  fn media_metadata_canon_jpeg_projects_camera() {
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/MakerNotes_Canon.jpg"
+    ))
+    .expect("read MakerNotes_Canon.jpg fixture");
+    let md = media_metadata(&bytes).expect("Canon JPEG projects to Some(MediaMetadata)");
+    let camera = md.camera().expect("camera domain populated");
+    assert_eq!(camera.make(), Some("Canon"));
+    // Sanity that the projection is the full EXIF+MakerNote one (not empty).
+    assert!(camera.model().is_some_and(|m| m.starts_with("Canon EOS")));
+  }
+
+  /// `media_metadata` returns `None` for empty input (no parser accepts an
+  /// empty buffer) — the convenience entry's `Ok(None) | Err(_) => None`
+  /// contract.
+  #[test]
+  #[cfg(feature = "std")]
+  fn media_metadata_empty_input_is_none() {
+    assert!(media_metadata(b"").is_none());
+    assert!(media_metadata(b"\x00\x00\x00\x00not-a-format").is_none());
   }
 
   /// `parse_bytes` returns `Ok(None)` for a buffer that no parser

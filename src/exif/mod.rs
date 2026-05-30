@@ -67,6 +67,14 @@ pub(crate) mod exiftext;
 #[cfg(feature = "gps")]
 pub(crate) mod gps;
 
+// `render` holds the single faithful default (no-PrintConv) `RawValue` →
+// `TagValue` renderer (`render_value`) — the golden-pattern L3b shared
+// renderer that consolidates `emit_raw`'s default path with the Apple
+// MakerNote `to_default_tag_value`. `pub(crate)`: an internal emission helper,
+// not API surface. Gated on `alloc` (matches the surrounding emission code).
+#[cfg(feature = "alloc")]
+pub(crate) mod render;
+
 // `jpeg` is the JPEG-container front-end: the marker walk that reaches the
 // embedded `APP1` Exif block and hands it to [`parse_exif_block`]. A camera
 // JPEG (`File:FileType == "JPEG"`) is the primary camera-photo format; bundled
@@ -461,6 +469,16 @@ pub struct MakerNote<'a> {
   /// dispatcher is TOTAL so it is always present) plus the per-vendor
   /// decoded slots (`None` in Phase 1; populated Phase 2-4).
   meta: makernotes::MakerNotesMeta,
+  /// Cached vendor emissions from the Phase-2 vendor body decoder in
+  /// `-j` (print-conv) mode — each carries the rendered `(name, value)`
+  /// plus the `Unknown => 1` flag (the emission engine suppresses the
+  /// Unknown ones; the legacy `serialize_tags` path filters them on read).
+  /// Computed once at walk time so the serializer doesn't need to
+  /// re-resolve out-of-line offsets against the TIFF block.
+  cached_emissions_print_conv: std::vec::Vec<makernotes::VendorEmission>,
+  /// Same as [`cached_emissions_print_conv`] but for `-n` (post-
+  /// ValueConv raw) mode.
+  cached_emissions_value_conv: std::vec::Vec<makernotes::VendorEmission>,
 }
 
 impl<'a> MakerNote<'a> {
@@ -527,6 +545,27 @@ impl<'a> MakerNote<'a> {
     } else {
       &self.bytes[off..]
     }
+  }
+
+  /// The Phase-2 cached vendor emissions in `-j` (print-conv) mode —
+  /// Apple/Canon vendor bodies are parsed at walk time and the emissions
+  /// (each a [`VendorEmission`](makernotes::VendorEmission) carrying name +
+  /// rendered value + the `Unknown => 1` flag) are stored for the
+  /// emission engine / serializer.
+  ///
+  /// Empty for vendors other than Apple/Canon (Phase 3/4 vendors don't
+  /// have a body parser yet).
+  #[must_use]
+  #[inline(always)]
+  pub fn emissions_print_conv(&self) -> &[makernotes::VendorEmission] {
+    &self.cached_emissions_print_conv
+  }
+
+  /// `-n` mode emissions.
+  #[must_use]
+  #[inline(always)]
+  pub fn emissions_value_conv(&self) -> &[makernotes::VendorEmission] {
+    &self.cached_emissions_value_conv
   }
 }
 
@@ -1706,9 +1745,51 @@ impl Walker<'_> {
               self.captured_model.as_deref(),
               None,
             );
+            // Phase 2: parse Apple/Canon vendor bodies here. The walker
+            // pre-computes BOTH PrintConv (-j) and ValueConv (-n)
+            // emissions while it still has access to the parent TIFF
+            // block (Canon's out-of-line value offsets resolve against
+            // the parent TIFF block, not the captured blob).
+            let mut meta = makernotes::MakerNotesMeta::from_detected(detected);
+            let mut cached_pc = std::vec::Vec::<makernotes::VendorEmission>::new();
+            let mut cached_vc = std::vec::Vec::<makernotes::VendorEmission>::new();
+            match detected.vendor() {
+              makernotes::Vendor::Apple => {
+                // Apple: parse using the body (after the 14-byte header).
+                // Apple's `Base => '$start - 14'` rebases offsets to the
+                // start of the BLOB, so the standalone-blob walker is
+                // faithful here.
+                let (typed_pc, emi_pc) =
+                  makernotes::vendors::apple::parse_with_print_conv(bytes, self.order, true);
+                let (_typed_vc, emi_vc) =
+                  makernotes::vendors::apple::parse_with_print_conv(bytes, self.order, false);
+                meta.set_apple(typed_pc);
+                cached_pc = emi_pc;
+                cached_vc = emi_vc;
+              }
+              makernotes::Vendor::Canon => {
+                // Canon: parse using the parent TIFF context so
+                // out-of-line offsets resolve correctly.
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let model = self.captured_model.as_deref();
+                let (typed_pc, emi_pc) = makernotes::vendors::canon::parse_in_tiff(
+                  self.data, mn_offset, mn_len, self.order, true, model,
+                );
+                let (_typed_vc, emi_vc) = makernotes::vendors::canon::parse_in_tiff(
+                  self.data, mn_offset, mn_len, self.order, false, model,
+                );
+                meta.set_canon(typed_pc);
+                cached_pc = emi_pc;
+                cached_vc = emi_vc;
+              }
+              _ => {}
+            }
             self.maker_note = Some(MakerNote {
               bytes,
-              meta: makernotes::MakerNotesMeta::from_detected(detected),
+              meta,
+              cached_emissions_print_conv: cached_pc,
+              cached_emissions_value_conv: cached_vc,
             });
           }
         }
@@ -1860,61 +1941,354 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path (EXIF entries + MakerNotes)
+//
+// EXIF no longer has an inherent `serialize_tags`: the full EXIF tag stream
+// (`File:ExifByteOrder` first, then the IFD-walk entries, then the MakerNote
+// vendor emissions) flows through the generic `Taggable`/`run_emission` engine,
+// single-sourced by `AnyMeta::serialize_tags` / `AnyMeta::iter_tags`. The
+// `$et->Warn(...)` channel is drained by `AnyMeta::drain_diagnostics`.
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
 impl ExifMeta<'_> {
-  /// Emit the Exif/GPS tags into the writer in IFD-walk order (ExifTool's
-  /// `FoundTag` call sequence across the IFD chain).
+  /// Render this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into a
+  /// [`Vec<EmittedTag>`](crate::emit::EmittedTag) for the requested
+  /// [`ConvMode`](crate::emit::ConvMode) — the golden-pattern parallel to the
+  /// `emit_entry` loop in [`serialize_tags`](Self::serialize_tags).
   ///
-  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode);
-  /// `print_conv = false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  /// Each entry is converted by the SAME `emit_entry`/`emit_exif_value`/
+  /// `emit_gps_value` logic the production path uses, but written into an
+  /// [`EmittedTagSink`] (which produces the identical [`TagValue`]) instead of
+  /// the [`TagMap`](crate::tagmap::TagMap). The result carries
+  /// `Group{family0:"EXIF", family1:<IfdName>}`, `unknown:false`.
   ///
-  /// The FIRST tag emitted is `File:ExifByteOrder` — faithful to
-  /// `DoProcessTIFF` calling `FoundTag('ExifByteOrder', $byteOrder)` BEFORE
-  /// the `ProcessDirectory` IFD walk (`ExifTool.pm:8691`). It belongs to the
-  /// family-1 `File` group; the `-j` PrintConv renders the
-  /// `Little-endian (Intel, II)` / `Big-endian (Motorola, MM)` string
-  /// (`ExifTool.pm:1833-1836`), `-n` the bare `II`/`MM` marker. (The
-  /// `File:FileType`/`FileTypeExtension`/`MIMEType` triplet stays the
-  /// engine's job — different `File:*` names, no key collision.)
-  ///
-  /// `File:ExifByteOrder` is emitted ONLY when a TIFF block was processed
-  /// ([`byte_order`](Self::byte_order) is `Some`): bundled `FoundTag`s it
-  /// inside `DoProcessTIFF` (`ExifTool.pm:8691`), so a JPEG container accepted
-  /// without a parsed `APP1` Exif block emits no `ExifByteOrder` (and no IFD
-  /// tags) — only its `Malformed APP1 EXIF segment` warning, if any.
-  pub(crate) fn serialize_tags(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    // `File:ExifByteOrder` — emitted before the IFD tags (ExifTool.pm:8691),
-    // but only when a TIFF block was actually processed (`DoProcessTIFF` is
-    // where bundled `FoundTag`s it). A JPEG accepted without Exif skips it.
-    if let Some(order) = self.byte_order {
-      if print_conv {
-        out.write_str("File", "ExifByteOrder", order.print_conv())?;
-      } else {
-        out.write_str("File", "ExifByteOrder", order.as_str())?;
-      }
-    }
+  /// **EXIF entries only**: the `File:ExifByteOrder` tag is prepended by
+  /// [`tags`](crate::emit::Taggable::tags) (not here), and the
+  /// `ExifTool:Warning` messages stay a separate channel drained by
+  /// [`serialize_tags`](Self::serialize_tags). The MakerNote vendor emissions
+  /// are appended separately by [`tags`](crate::emit::Taggable::tags) via
+  /// [`push_maker_note_tags`](Self::push_maker_note_tags). So this is the
+  /// EXIF (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) tag stream, byte-identical in value
+  /// to the legacy `serialize_tags` entry loop.
+  #[must_use]
+  fn emitted_exif_tags(&self, print_conv: bool) -> std::vec::Vec<crate::emit::EmittedTag> {
+    let mut sink = EmittedTagSink::new();
     // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
-    // 'Unknown' guess. `byte_order` is `None` ONLY for a JPEG container
-    // accepted without a parsed `APP1` Exif TIFF block — and that `ExifMeta`
-    // has NO entries (every entry originates from a `parse_tiff` block, which
-    // sets `Some(order)`), so the loop body below never runs in the `None`
-    // case and the `ByteOrder::Little` fallback is unreachable-by-construction.
+    // 'Unknown' guess — identical to `serialize_tags`'s `entry_order`. `None`
+    // only for a JPEG accepted without a parsed Exif block, which then has NO
+    // entries, so the fallback is unreachable-by-construction (same as
+    // `serialize_tags`).
     let entry_order = self.byte_order.unwrap_or(ByteOrder::Little);
     for entry in &self.entries {
-      emit_entry(entry, entry_order, print_conv, out)?;
+      // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
+      let Ok(()) = emit_entry(entry, entry_order, print_conv, &mut sink);
     }
-    // `$et->Warn(...)` messages → `ExifTool:Warning` tags (the document
-    // builder dedups + collects them — see `parser.rs`).
-    for warning in &self.warnings {
-      out.write_warning(warning)?;
+    sink.tags
+  }
+
+  /// Append the captured MakerNote's cached vendor emissions to `out` as
+  /// [`EmittedTag`](crate::emit::EmittedTag)s — the golden-pattern parallel to
+  /// the MakerNote branch of [`serialize_tags`](Self::serialize_tags).
+  ///
+  /// Each [`VendorEmission`](makernotes::VendorEmission) becomes an
+  /// `EmittedTag` under `Group{family0:"MakerNotes", family1:<vendor group1>}`
+  /// (`Apple`/`Canon` — [`Vendor::group1`](makernotes::Vendor::group1)),
+  /// carrying the emission's own `Unknown => 1` flag. The flag is NOT filtered
+  /// here: the engine ([`run_emission`](crate::emit::run_emission)) drops the
+  /// Unknown ones once, reproducing the OLD per-vendor pre-filter generically
+  /// (the legacy `serialize_tags` path still filters on read for byte-identity
+  /// until the flip).
+  fn push_maker_note_tags(
+    &self,
+    print_conv: bool,
+    out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+  ) {
+    let Some(mn) = &self.maker_note else { return };
+    // The vendor FAMILY-1 group (`Apple`/`Canon`); other vendors fall back to
+    // `"MakerNotes"` and emit nothing here yet (empty cached emissions).
+    let group1 = mn.vendor().group1();
+    let emissions = if print_conv {
+      mn.emissions_print_conv()
+    } else {
+      mn.emissions_value_conv()
+    };
+    out.reserve(emissions.len());
+    for e in emissions {
+      out.push(crate::emit::EmittedTag::new(
+        crate::value::Group::new("MakerNotes", group1),
+        smol_str::SmolStr::new(e.name()),
+        e.value().clone(),
+        e.unknown(),
+      ));
     }
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl crate::emit::Taggable for ExifMeta<'_> {
+  /// Yield this `ExifMeta`'s EXIF/GPS tags then its MakerNote vendor tags as
+  /// [`EmittedTag`](crate::emit::EmittedTag)s for `mode` — the golden-pattern
+  /// emission path.
+  ///
+  /// Emission order (faithful to ExifTool's `FoundTag` call sequence):
+  ///
+  /// 1. `File:ExifByteOrder` — `FoundTag`'d FIRST inside `DoProcessTIFF`
+  ///    (`ExifTool.pm:8691`), BEFORE the IFD walk. Emitted ONLY when a TIFF
+  ///    block was processed ([`byte_order`](Self::byte_order) is `Some`): a
+  ///    JPEG container accepted without a parsed `APP1` Exif block has no byte
+  ///    order, so no `ExifByteOrder` (and no IFD entries). Group is family-1
+  ///    `File` (`Group::new("File", "File")`); the `-j` PrintConv renders
+  ///    `Little-endian (Intel, II)` / `Big-endian (Motorola, MM)`
+  ///    (`ExifTool.pm:1833-1836`), `-n` the bare `II`/`MM` marker
+  ///    (`unknown:false`). The `File:FileType`/`FileTypeExtension`/`MIMEType`
+  ///    triplet stays the engine's job — different `File:*` names, no key
+  ///    collision.
+  /// 2. The EXIF entries (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) in IFD-walk order.
+  /// 3. The captured MakerNote's vendor emissions (`Apple:*`/`Canon:*`)
+  ///    carrying their `Unknown => 1` flag for the engine to suppress.
+  ///
+  /// This is the SINGLE source of the EXIF tag stream: both `serialize_tags`
+  /// (`-j`/`-n` JSON) and [`crate::format_parser::AnyMeta::iter_tags`] drive
+  /// it. The `$et->Warn` messages are NOT tags — they stay a separate channel
+  /// drained by `serialize_tags`.
+  fn tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    // `-j` (PrintConv) vs `-n` (ValueConv) maps to the `print_conv` bool the
+    // EXIF emitters thread (identical to `serialize_tags`'s argument).
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    // `File:ExifByteOrder` FIRST (ExifTool.pm:8691), only when a TIFF block
+    // was processed. `unknown:false` (a real extracted tag), family-1 `File`.
+    if let Some(order) = self.byte_order {
+      let value = if print_conv {
+        order.print_conv()
+      } else {
+        order.as_str()
+      };
+      tags.push(crate::emit::EmittedTag::new(
+        crate::value::Group::new("File", "File"),
+        smol_str::SmolStr::new_static("ExifByteOrder"),
+        crate::value::TagValue::Str(smol_str::SmolStr::new_static(value)),
+        false,
+      ));
+    }
+    tags.append(&mut self.emitted_exif_tags(print_conv));
+    self.push_maker_note_tags(print_conv, &mut tags);
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `ExifSink` — the value-emission sink seam (golden-pattern refactor)
+// ===========================================================================
+
+/// The per-value sink the Exif/GPS emitters (`emit_exif_value` /
+/// `emit_gps_value` + helpers) write a CONVERTED scalar into. Abstracting the
+/// sink behind these five typed writers lets the conversion-logic bodies stay
+/// destination-agnostic: each writer maps a `(group, name, scalar)` to the
+/// [`TagValue`] shape the engine will emit.
+///
+/// The sole implementor is [`EmittedTagSink`] — the golden-pattern
+/// [`Taggable`](crate::emit::Taggable) path ([`ExifMeta::tags`]), where each
+/// writer pushes an [`EmittedTag`](crate::emit::EmittedTag) carrying the
+/// rendered [`TagValue`] under `Group{family0:"EXIF", family1:<IfdName>}`,
+/// `unknown:false`. The engine ([`run_emission`](crate::emit::run_emission))
+/// then drives those [`EmittedTag`]s into the
+/// [`TagMap`](crate::tagmap::TagMap) sink, so `serialize_tags` no longer writes
+/// to `TagMap` directly.
+///
+/// The method set is exactly the `write_*` surface the emitters call.
+/// `Result<(), Infallible>` preserves the emitters' `?`-propagation unchanged.
+#[cfg(feature = "alloc")]
+trait ExifSink {
+  /// A `&str` value → [`TagValue::Str`].
+  fn write_str(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible>;
+  /// An `i64` value → [`TagValue::I64`].
+  fn write_i64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: i64,
+  ) -> Result<(), core::convert::Infallible>;
+  /// A `u64` value → [`TagValue::U64`] (EXACT — no saturation).
+  fn write_u64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: u64,
+  ) -> Result<(), core::convert::Infallible>;
+  /// An `f64` value → [`TagValue::F64`].
+  fn write_f64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: f64,
+  ) -> Result<(), core::convert::Infallible>;
+  /// Raw bytes → [`TagValue::Bytes`] (the no-`-b` binary placeholder).
+  fn write_bytes(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &[u8],
+  ) -> Result<(), core::convert::Infallible>;
+}
+
+/// Test-only sink: each writer delegates to the matching inherent
+/// [`TagMap`](crate::tagmap::TagMap) method so the emitter unit tests can read
+/// the routed scalar back through `TagMap`'s `get`/`get_str` accessors and
+/// assert the exact [`TagValue`] variant the emitter chose. Production no
+/// longer routes `emit_*` into a `TagMap` (the EXIF stream flows through the
+/// [`Taggable`](crate::emit::Taggable) engine via [`EmittedTagSink`]), so this
+/// impl is `#[cfg(test)]` — absent from the lib build, where it would be dead.
+#[cfg(all(test, feature = "alloc"))]
+impl ExifSink for crate::tagmap::TagMap {
+  #[inline(always)]
+  fn write_str(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_str(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_i64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: i64,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_i64(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_u64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: u64,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_u64(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_f64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: f64,
+  ) -> Result<(), core::convert::Infallible> {
+    crate::tagmap::TagMap::write_f64(self, group, name, value)
+  }
+  #[inline(always)]
+  fn write_bytes(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &[u8],
+  ) -> Result<(), core::convert::Infallible> {
+    // Inlined former `TagMap::write_bytes` (the inherent helper was retired
+    // with the provider `serialize_tags` paths that were its last callers;
+    // this `ExifSink for TagMap` impl is the only remaining `write_bytes`
+    // user and owns the insert directly now).
+    self.write_value(group, name, crate::value::TagValue::Bytes(value.to_vec()))
+  }
+}
+
+/// The golden-pattern sink: each writer pushes one
+/// [`EmittedTag`](crate::emit::EmittedTag) carrying the SAME [`TagValue`]
+/// shape the [`TagMap`](crate::tagmap::TagMap) sink would store, under
+/// `Group{family0:"EXIF", family1:<the IfdName the emitter passed as group>}`.
+/// Every EXIF/GPS tag table row is `Unknown => 0` (the EXIF tables carry no
+/// `Unknown=>1`), so `unknown` is always `false`.
+///
+/// Drives [`ExifMeta::tags`]; the engine ([`run_emission`](crate::emit::run_emission))
+/// then applies Unknown-suppression (a no-op here) + the sink dedup.
+#[cfg(feature = "alloc")]
+struct EmittedTagSink {
+  /// The collected EXIF [`EmittedTag`]s, in emission order.
+  tags: std::vec::Vec<crate::emit::EmittedTag>,
+}
+
+#[cfg(feature = "alloc")]
+impl EmittedTagSink {
+  /// An empty collector.
+  #[inline(always)]
+  const fn new() -> Self {
+    Self {
+      tags: std::vec::Vec::new(),
+    }
+  }
+
+  /// Push one rendered [`EmittedTag`] — `Group{family0:"EXIF", family1:group}`,
+  /// `unknown:false` (EXIF tables have no `Unknown=>1`).
+  #[inline(always)]
+  fn push(&mut self, group: &str, name: &str, value: crate::value::TagValue) {
+    self.tags.push(crate::emit::EmittedTag::new(
+      crate::value::Group::new("EXIF", group),
+      smol_str::SmolStr::new(name),
+      value,
+      false,
+    ));
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl ExifSink for EmittedTagSink {
+  #[inline(always)]
+  fn write_str(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &str,
+  ) -> Result<(), core::convert::Infallible> {
+    self.push(group, name, crate::value::TagValue::Str(value.into()));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_i64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: i64,
+  ) -> Result<(), core::convert::Infallible> {
+    self.push(group, name, crate::value::TagValue::I64(value));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_u64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: u64,
+  ) -> Result<(), core::convert::Infallible> {
+    self.push(group, name, crate::value::TagValue::U64(value));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_f64(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: f64,
+  ) -> Result<(), core::convert::Infallible> {
+    self.push(group, name, crate::value::TagValue::F64(value));
+    Ok(())
+  }
+  #[inline(always)]
+  fn write_bytes(
+    &mut self,
+    group: &str,
+    name: &str,
+    value: &[u8],
+  ) -> Result<(), core::convert::Infallible> {
+    self.push(group, name, crate::value::TagValue::Bytes(value.to_vec()));
     Ok(())
   }
 }
@@ -1922,14 +2296,14 @@ impl ExifMeta<'_> {
 /// Emit one [`ExifEntry`] into the [`crate::tagmap::TagMap`] sink, applying
 /// the resolved conversion.
 #[cfg(feature = "alloc")]
-fn emit_entry(
+fn emit_entry<S: ExifSink>(
   entry: &ExifEntry,
   // The TIFF byte order threads to `ConvertExifText`'s UTF-16 'Unknown'
   // guess — consumed by the Exif `Conv::ExifText` arm (UserComment) AND the
   // GPS `GpsConv::ExifText` arm (GPSProcessingMethod/GPSAreaInformation).
   order: ByteOrder,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   let group = entry.group();
   let group = group.as_str();
@@ -1957,14 +2331,14 @@ fn emit_entry(
 /// `Conv::ExifText` UTF-16 `Unknown` order guess (`ConvertExifText`,
 /// `Exif.pm:5554-5601`); every other arm ignores it.
 #[cfg(feature = "alloc")]
-fn emit_exif_value(
+fn emit_exif_value<S: ExifSink>(
   group: &str,
   name: &str,
   raw: &RawValue,
   conv: Conv,
   order: ByteOrder,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   match conv {
     Conv::None => emit_raw(group, name, raw, out),
@@ -2212,14 +2586,14 @@ const fn is_perl_space(c: char) -> bool {
 
 /// Render a [`RawValue`] under a [`gps::GpsConv`] into the sink.
 #[cfg(all(feature = "alloc", feature = "gps"))]
-fn emit_gps_value(
+fn emit_gps_value<S: ExifSink>(
   group: &str,
   name: &str,
   raw: &RawValue,
   conv: gps::GpsConv,
   order: ByteOrder,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   use gps::GpsConv;
   match conv {
@@ -2434,11 +2808,11 @@ fn escape_json_is_number(s: &str) -> bool {
 /// is a valid JSON number, the parse below never fails for an in-gate string;
 /// the defensive fallback keeps any unreachable case a faithful quoted string.
 #[cfg(feature = "alloc")]
-fn emit_gated_number(
+fn emit_gated_number<S: ExifSink>(
   group: &str,
   name: &str,
   rendered: &str,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   if !escape_json_is_number(rendered) {
     // Out of gate ⇒ a quoted JSON string (a `:`/`/`-bearing value, the words
@@ -2477,11 +2851,11 @@ fn emit_gated_number(
 /// and is emitted via `write_f64` so [`crate::value::TagValue`]'s serializer
 /// renders ExifTool's titlecase `Inf`/`-Inf`/`NaN` quoted word.
 #[cfg(feature = "alloc")]
-fn emit_gated_f64(
+fn emit_gated_f64<S: ExifSink>(
   group: &str,
   name: &str,
   value: f64,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   if !value.is_finite() {
     // `TagValue::F64`'s serializer emits the titlecase `Inf`/`-Inf`/`NaN`
@@ -2500,11 +2874,11 @@ fn emit_gated_f64(
 /// spaces, `ExifTool.pm:6319`); a string is emitted as-is; bytes become the
 /// `(Binary data N bytes ...)` placeholder.
 #[cfg(feature = "alloc")]
-fn emit_raw(
+fn emit_raw<S: ExifSink>(
   group: &str,
   name: &str,
   raw: &RawValue,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
   match raw {
     RawValue::U64(vals) => {
@@ -2566,13 +2940,13 @@ fn emit_raw(
 /// the raw value is emitted verbatim (the `emit_raw` path) — a bare DECIMAL
 /// number even for a `PrintHex` tag, matching ExifTool's `-n` output.
 #[cfg(feature = "alloc")]
-fn emit_int_label(
+fn emit_int_label<S: ExifSink>(
   group: &str,
   name: &str,
   raw: &RawValue,
   slice: &[(i64, &'static str)],
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
+  out: &mut S,
   hex: bool,
 ) -> Result<(), core::convert::Infallible> {
   // The integer for the PrintConv lookup — works for U64 or I64 singletons.
@@ -3410,7 +3784,9 @@ mod tests {
     // The value is the full array (count elements), NOT the placeholder.
     assert_eq!(bps.value_ref().raw().count(), count);
     let mut map = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut map).unwrap();
+    // The EXIF tag stream flows through the golden-pattern engine (the same
+    // `run_emission` over `ExifMeta::tags()` the document path drives).
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut map);
     let s = map.get_str("IFD0", "BitsPerSample").expect("emitted");
     assert!(
       !s.starts_with("(large array"),
@@ -3832,7 +4208,9 @@ mod tests {
     let ii = meta.entry("InteropIndex").expect("InteropIndex decoded");
     assert_eq!(ii.group(), "InteropIFD");
     let mut map = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut map).unwrap();
+    // The EXIF tag stream flows through the golden-pattern engine (the same
+    // `run_emission` over `ExifMeta::tags()` the document path drives).
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut map);
     assert_eq!(
       map.get_str("InteropIFD", "InteropIndex").as_deref(),
       Some("R98 - DCF basic file (sRGB)")

@@ -825,175 +825,243 @@ fn extract_sv7_header(hdr: &[u8]) -> Sv7Header {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit MPC tags into the writer in `%MPC::Main` walk order (MPC.pm:21-72:
-  /// TotalFrames, SampleRate, Quality, MaxBand, ReplayGain×4, FastSeek,
-  /// Gapless, EncoderVersion) — faithful to the bundled-Perl bit-stream
-  /// iteration order.
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield MPC tags: first the chained ID3 sub-Meta's tags (MPC.pm:84-87 —
+  /// bundled runs `ProcessID3` BEFORE the MP+ body), then the `%MPC::Main`
+  /// bit-fields in walk order (MPC.pm:21-72: TotalFrames, SampleRate,
+  /// Quality, MaxBand, ReplayGain×4, FastSeek, Gapless, EncoderVersion).
+  /// The golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`), the per-tag PrintConv hash/func branches are
+  /// preserved verbatim.
   ///
-  /// `print_conv=true` ⇒ PrintConv formatted values (`-j` mode):
+  /// `mode == PrintConv` (`-j`):
   /// - `SampleRate` ⇒ Hz number from the hash (e.g. `44100`)
-  /// - `Quality` ⇒ named string from the hash (e.g. `"5 (Standard)"`)
+  /// - `Quality` ⇒ named string (e.g. `"5 (Standard)"`), or the generic
+  ///   `"Unknown (N)"` hash-miss fallback (ExifTool.pm:3622)
   /// - `FastSeek` / `Gapless` ⇒ `"No"` / `"Yes"`
-  /// - `EncoderVersion` ⇒ dotted string (e.g. `"1.1.5"`)
+  /// - `EncoderVersion` ⇒ dotted string (115 ⇒ `"1.1.5"`), or the raw
+  ///   integer on the `< 100` no-match path
   ///
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode): every
-  /// field emits its raw integer (sample_rate_index, quality_index, etc.).
+  /// `mode == ValueConv` (`-n`) ⇒ every field emits its raw integer.
   ///
-  /// **Non-SV7 arm.** When [`Meta::sv7_header`] is `None`
-  /// (MPC.pm:107-109), no MPC:* tags are emitted; the warning is pushed by
-  /// the legacy bridge or directly by a lib caller via
-  /// `TagMap::write_warning` at the end of this fn.
-  pub(crate) fn serialize_tags(
+  /// **Group.** Family-0/1 both `"MPC"` (MPC.pm:21 package; MPC.pm:23
+  /// `GROUPS => { 2 => 'Audio' }` — family-2 `'Audio'` is not emitted under
+  /// `-G1`). Every MPC bit-field is a known tag ⇒ `unknown: false`.
+  ///
+  /// **Chained APE trailer (MPC.pm:111-113).** [`crate::formats::ape::Meta`]
+  /// is now `Taggable`, so its `APE:*` tags (and any APE-side ID3v1 trailer)
+  /// are spliced into THIS stream AFTER the MPC body — preserving the bundled
+  /// order (`APE:*` follows `MPC:*`). Its `Bad APE trailer` warning + any
+  /// APE-side nested-ID3 warnings/errors are NOT in this stream (see below).
+  ///
+  /// **What is NOT in this stream:** (1) the MPC.pm:107-109 non-SV7 warning
+  /// (`Meta::warn_unsupported_version`); (2) the chained ID3 sub-Meta's
+  /// warnings/errors; (3) the chained APE sub-Meta's `Bad APE trailer`
+  /// warning + any APE-side nested-ID3 warnings/errors.
+  /// [`run_emission`](crate::emit::run_emission) has no warning/error
+  /// channel, so the `AnyMeta::Mpc` arm drains (1) + (2) + (3) after
+  /// `run_emission`. The net `TagMap` is identical.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "MPC";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // Family-0 "MPC" / family-1 "MPC" for every MPC bit-field (see fn docs).
+    let group = || Group::new("MPC", "MPC");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
 
     // (0) Chained ID3 sub-Meta (MPC.pm:84-87). Bundled runs `ProcessID3`
     // FIRST — so `File:ID3Size` + every `ID3v2_*:*` / `ID3v1:*` frame tag
-    // precedes the MPC body tags. F2 (Codex adversarial): the pre-fix
-    // typed dispatch dropped this entirely.
+    // precedes the MPC body tags (the retired sink spliced these at this
+    // exact point). `Id3Meta` is `Taggable`; its warnings/errors are drained
+    // by the `AnyMeta::Mpc` arm.
     #[cfg(feature = "id3")]
-    if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
+    if let Some(id3) = self.id3.as_ref() {
+      tags.extend(id3.tags(mode));
     }
 
     if let Some(h) = self.sv7_header.as_ref() {
       // MPC.pm:28 — TotalFrames: no conversions, identical under -j and -n.
-      out.write_u64(GROUP, "TotalFrames", u64::from(h.total_frames))?;
+      tags.push(EmittedTag::new(
+        group(),
+        "TotalFrames".into(),
+        TagValue::U64(u64::from(h.total_frames())),
+        false,
+      ));
 
       // MPC.pm:29-37 — SampleRate. -j: hash hit yields the Hz integer
-      // (PrintValue::I64). -n: raw index.
-      if print_conv {
-        // sample_rate_hz() is always Some for a 2-bit index (all 4
-        // values mapped); fall through to raw if ever None.
+      // (PrintValue::I64). -n: raw index. `sample_rate_hz()` is always Some
+      // for a 2-bit index (all 4 values mapped); fall through to raw if None.
+      let sample_rate = if print_conv {
         match h.sample_rate_hz() {
-          Some(hz) => out.write_u64(GROUP, "SampleRate", u64::from(hz))?,
-          None => out.write_u64(GROUP, "SampleRate", u64::from(h.sample_rate_index))?,
+          Some(hz) => TagValue::U64(u64::from(hz)),
+          None => TagValue::U64(u64::from(h.sample_rate_index())),
         }
       } else {
-        out.write_u64(GROUP, "SampleRate", u64::from(h.sample_rate_index))?;
-      }
+        TagValue::U64(u64::from(h.sample_rate_index()))
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        "SampleRate".into(),
+        sample_rate,
+        false,
+      ));
 
-      // MPC.pm:38-54 — Quality. -j: hash hit yields a PrintValue::Str
-      // (e.g. "5 (Standard)" for index 10); miss falls back to "Unknown
-      // (N)" (ExifTool.pm:3622 — the generic PrintConv hash-miss path).
-      // -n: raw index.
-      if print_conv {
-        if let Some(name) = h.quality_name() {
-          out.write_str(GROUP, "Quality", name)?;
-        } else {
-          let idx = h.quality_index;
-          out.write_fmt(GROUP, "Quality", |w| write!(w, "Unknown ({idx})"))?;
+      // MPC.pm:38-54 — Quality. -j: hash hit yields a PrintValue::Str (e.g.
+      // "5 (Standard)" for index 10); miss falls back to "Unknown (N)"
+      // (ExifTool.pm:3622 — the generic PrintConv hash-miss path). -n: raw.
+      let quality = if print_conv {
+        match h.quality_name() {
+          Some(name) => TagValue::Str(name.into()),
+          None => TagValue::Str(std::format!("Unknown ({})", h.quality_index()).into()),
         }
       } else {
-        out.write_u64(GROUP, "Quality", u64::from(h.quality_index))?;
-      }
+        TagValue::U64(u64::from(h.quality_index()))
+      };
+      tags.push(EmittedTag::new(group(), "Quality".into(), quality, false));
 
       // MPC.pm:55 — MaxBand: no conversions.
-      out.write_u64(GROUP, "MaxBand", u64::from(h.max_band))?;
+      tags.push(EmittedTag::new(
+        group(),
+        "MaxBand".into(),
+        TagValue::U64(u64::from(h.max_band())),
+        false,
+      ));
 
       // MPC.pm:56-59 — ReplayGain×4: no conversions.
-      out.write_u64(
-        GROUP,
-        "ReplayGainTrackPeak",
-        u64::from(h.replay_gain_track_peak),
-      )?;
-      out.write_u64(
-        GROUP,
-        "ReplayGainTrackGain",
-        u64::from(h.replay_gain_track_gain),
-      )?;
-      out.write_u64(
-        GROUP,
-        "ReplayGainAlbumPeak",
-        u64::from(h.replay_gain_album_peak),
-      )?;
-      out.write_u64(
-        GROUP,
-        "ReplayGainAlbumGain",
-        u64::from(h.replay_gain_album_gain),
-      )?;
+      tags.push(EmittedTag::new(
+        group(),
+        "ReplayGainTrackPeak".into(),
+        TagValue::U64(u64::from(h.replay_gain_track_peak())),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        group(),
+        "ReplayGainTrackGain".into(),
+        TagValue::U64(u64::from(h.replay_gain_track_gain())),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        group(),
+        "ReplayGainAlbumPeak".into(),
+        TagValue::U64(u64::from(h.replay_gain_album_peak())),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        group(),
+        "ReplayGainAlbumGain".into(),
+        TagValue::U64(u64::from(h.replay_gain_album_gain())),
+        false,
+      ));
 
-      // MPC.pm:60-63 — FastSeek. -j: 0⇒"No", 1⇒"Yes". -n: raw 0/1.
-      if print_conv {
-        out.write_str(
-          GROUP,
-          "FastSeek",
-          if h.fast_seek != 0 { "Yes" } else { "No" },
-        )?;
+      // MPC.pm:60-63 — FastSeek. -j: 0⇒"No", 1⇒"Yes". -n: raw 0/1. Note:
+      // `h.fast_seek()` returns the bool; the raw byte is `u64::from(bool)`
+      // (the field is 1-bit, so the byte is 0/1 — identical to the retired
+      // `u64::from(h.fast_seek /* u8 */)`).
+      let fast_seek = if print_conv {
+        TagValue::Str(if h.fast_seek() { "Yes" } else { "No" }.into())
       } else {
-        out.write_u64(GROUP, "FastSeek", u64::from(h.fast_seek))?;
-      }
+        TagValue::U64(u64::from(h.fast_seek()))
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        "FastSeek".into(),
+        fast_seek,
+        false,
+      ));
 
       // MPC.pm:64-67 — Gapless. Same shape as FastSeek.
-      if print_conv {
-        out.write_str(GROUP, "Gapless", if h.gapless != 0 { "Yes" } else { "No" })?;
+      let gapless = if print_conv {
+        TagValue::Str(if h.gapless() { "Yes" } else { "No" }.into())
       } else {
-        out.write_u64(GROUP, "Gapless", u64::from(h.gapless))?;
-      }
+        TagValue::U64(u64::from(h.gapless()))
+      };
+      tags.push(EmittedTag::new(group(), "Gapless".into(), gapless, false));
 
       // MPC.pm:68-71 — EncoderVersion. -j: dotted via the substitution
-      // function (115 ⇒ "1.1.5"). -n: raw byte (115). The match path is
-      // unconditional for valid 3-digit numbers: every u8 ≥ 100 takes the
-      // match path; u8 < 100 (1- or 2-digit) takes the no-match path and
-      // emits the raw integer faithfully.
-      if print_conv {
-        // Stringify the raw u8 and apply the Perl `s/(\d)(\d)(\d)$/$1.$2.$3/`
-        // substitution. For raw byte n:
-        //   n >= 100 ⇒ 3 trailing digits ⇒ match ⇒ "head.lhs.mid.tail"
-        //   n < 100  ⇒ no match ⇒ emit raw integer
-        // (This mirrors `encoder_version_print` above with the I64 input.)
-        let n = u32::from(h.encoder_version);
-        let s = n.to_string();
-        let bytes = s.as_bytes();
-        if bytes.len() >= 3 && bytes[bytes.len() - 3..].iter().all(u8::is_ascii_digit) {
-          out.write_fmt(GROUP, "EncoderVersion", |w| {
-            let (head, tail) = s.split_at(s.len() - 3);
-            let tb = tail.as_bytes();
-            w.write_str(head)?;
-            w.write_char(tb[0] as char)?;
-            w.write_char('.')?;
-            w.write_char(tb[1] as char)?;
-            w.write_char('.')?;
-            w.write_char(tb[2] as char)?;
-            Ok(())
-          })?;
+      // function (115 ⇒ "1.1.5"). -n: raw byte (115). For raw byte n:
+      //   n >= 100 ⇒ 3 trailing digits ⇒ match ⇒ "head.a.b.c"
+      //   n < 100  ⇒ no match ⇒ emit raw integer (Perl `s///` leaves $val
+      //              unchanged, preserving I64 typing — a bare JSON number).
+      let encoder_version = if print_conv {
+        let s = u32::from(h.encoder_version()).to_string();
+        let b = s.as_bytes();
+        if b.len() >= 3 && b[b.len() - 3..].iter().all(u8::is_ascii_digit) {
+          let (head, tail) = s.split_at(s.len() - 3);
+          let tb = tail.as_bytes();
+          let mut out = std::string::String::with_capacity(head.len() + 5);
+          out.push_str(head);
+          out.push(tb[0] as char);
+          out.push('.');
+          out.push(tb[1] as char);
+          out.push('.');
+          out.push(tb[2] as char);
+          TagValue::Str(out.into())
         } else {
-          // No-match path: emit the raw integer faithfully (Perl `s///`
-          // leaves $val unchanged, preserving I64 typing — the JSON
-          // writer emits a bare number, NOT a quoted string).
-          out.write_u64(GROUP, "EncoderVersion", u64::from(h.encoder_version))?;
+          TagValue::U64(u64::from(h.encoder_version()))
         }
       } else {
-        out.write_u64(GROUP, "EncoderVersion", u64::from(h.encoder_version))?;
-      }
+        TagValue::U64(u64::from(h.encoder_version()))
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        "EncoderVersion".into(),
+        encoder_version,
+        false,
+      ));
     }
 
-    // MPC.pm:107-109 — non-SV7 warning. Emit AFTER the (empty) tag block;
-    // bundled `perl exiftool -j -G1` surfaces `ExifTool:Warning` as the
-    // first non-File: entry (the serializer emits the warning at the front
-    // of the JSON object). Both the engine [`TagMap`] and lib callers
-    // (TagMap) route this through `TagMap::write_warning`.
-    if self.warn_unsupported_version {
-      out.write_warning("Audio info currently not extracted from this version MPC file")?;
-    }
-
-    // Chained APE sub-Meta (MPC.pm:111-113). Bundled runs `APE::ProcessAPE`
-    // AFTER the MPC body extraction, so `APE:*` tags follow `MPC:*`. F2
-    // (Codex adversarial): the pre-fix typed dispatch dropped these.
+    // (4) Chained APE trailer (MPC.pm:111-113 `APE::ProcessAPE`). Bundled
+    // runs it AFTER the MP+ header, so `APE:*` (and any APE-side ID3v1
+    // trailer) tags follow the MPC body. `ape::Meta` is `Taggable`; its
+    // `Bad APE trailer` warning + any APE-side nested-ID3 warnings/errors are
+    // drained by the `AnyMeta::Mpc` arm.
     #[cfg(feature = "ape")]
-    if let Some(ape) = &self.ape {
-      ape.serialize_tags(print_conv, out)?;
+    if let Some(ape) = self.ape.as_ref() {
+      tags.extend(ape.tags(mode));
     }
 
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project MPC metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// MPC (Musepack) is an audio stream: it carries no camera / lens / GPS /
+  /// capture facts (those domains stay `None`). The single faithful
+  /// structural contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind): MPC files are audio-only
+  /// (`%MPC::Main` `GROUPS{2} => 'Audio'`, MPC.pm:23).
+  ///
+  /// **Duration stays `None`.** MPC.pm emits no `Duration` tag, and the SV7
+  /// header exposes only `TotalFrames` / a `SampleRate` *index* — there is
+  /// no decoded duration accessor on [`Sv7Header`]. Synthesizing a duration
+  /// from frames × samples-per-frame ÷ sample-rate would invent a value
+  /// ExifTool never surfaces, so this projection leaves `duration` (and
+  /// dimensions / created) `None`. The chained ID3 / APE sub-Metas' own
+  /// facts are NOT folded here (MPC's `Project` mirrors the bare-stream AAC
+  /// shape).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -1024,8 +1092,50 @@ pub enum Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::emit::{ConvMode, Taggable};
   use crate::format_parser::FormatParser;
   use crate::tagmap::TagMap;
+
+  /// Drive a [`Meta`] through the golden [`run_emission`](crate::emit) engine
+  /// PLUS the `AnyMeta::Mpc` arm's tail (the chained ID3 sub-Meta's
+  /// warnings/errors, then the MPC.pm:107-109 non-SV7 warning, then the
+  /// chained APE trailer via the still-inherent `ape::Meta::serialize_tags`).
+  /// Mirrors the `format_parser.rs` arm exactly so the in-module tests
+  /// exercise the same net `TagMap` the engine produces. `print_conv` ⇒ `-j`,
+  /// else `-n`.
+  fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
+    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    #[cfg(feature = "id3")]
+    if let Some(id3) = meta.id3_ref() {
+      for w in id3.warnings_slice() {
+        let _ = out.write_warning(w.as_str());
+      }
+      for e in id3.errors_slice() {
+        let _ = out.write_error(e.as_str());
+      }
+    }
+    if meta.warn_unsupported_version() {
+      let _ = out.write_warning("Audio info currently not extracted from this version MPC file");
+    }
+    // APE:* tags now flow through `run_emission` (ape::Meta is Taggable);
+    // the arm drains only the APE-side nested-ID3 warnings/errors + the
+    // `Bad APE trailer` warning.
+    #[cfg(feature = "ape")]
+    if let Some(ape) = meta.ape_ref() {
+      #[cfg(feature = "id3")]
+      if let Some(id3) = ape.id3_ref() {
+        for w in id3.warnings_slice() {
+          let _ = out.write_warning(w.as_str());
+        }
+        for e in id3.errors_slice() {
+          let _ = out.write_error(e.as_str());
+        }
+      }
+      if ape.warn_bad_trailer() {
+        let _ = out.write_warning("Bad APE trailer");
+      }
+    }
+  }
 
   // ---------- Tag table + bit-keys faithfulness --------------------------
 
@@ -1282,7 +1392,7 @@ mod tests {
       ape: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(w.get_str("MPC", "TotalFrames"), Some("102".to_string()));
     // SampleRate -j: PrintConv hash hit ⇒ 44100 (number)
     assert_eq!(w.get_str("MPC", "SampleRate"), Some("44100".to_string()));
@@ -1328,7 +1438,7 @@ mod tests {
       ape: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    emit_via_engine(&meta, false, &mut w);
     // SampleRate -n: raw idx = 0
     assert_eq!(w.get_str("MPC", "SampleRate"), Some("0".to_string()));
     // Quality -n: raw idx = 10
@@ -1355,7 +1465,7 @@ mod tests {
     };
     // -j
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     // No MPC:* tags emitted (sv7_header is None). The format-tag entries
     // carry the `"<Group1>:<Name>"` keys; warnings live in their own
     // accumulator (`TagMap::warnings`).
@@ -1367,7 +1477,7 @@ mod tests {
     );
     // -n: identical (no MPC:* tags, same warning).
     let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    emit_via_engine(&meta, false, &mut w);
     assert_eq!(
       w.warnings(),
       &["Audio info currently not extracted from this version MPC file"]
@@ -1401,10 +1511,10 @@ mod tests {
       ape: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(w.get_str("MPC", "Quality"), Some("Unknown (2)".to_string()));
     let mut w = TagMap::new();
-    meta.serialize_tags(false, &mut w).unwrap();
+    emit_via_engine(&meta, false, &mut w);
     assert_eq!(w.get_str("MPC", "Quality"), Some("2".to_string()));
   }
 
@@ -1435,7 +1545,170 @@ mod tests {
       ape: None,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(w.get_str("MPC", "EncoderVersion"), Some("15".to_string()));
+  }
+
+  // --- Golden-pattern `Taggable` / `Project` ------------------------------
+
+  fn fixture(name: &str) -> std::vec::Vec<u8> {
+    std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read {name} fixture: {e}"))
+  }
+
+  /// `Taggable::tags(-j)` over the real MPC.mpc fixture yields the SV7 set
+  /// with PrintConv hashes/func resolved, driven through `run_emission`.
+  #[test]
+  fn taggable_emits_sv7_print_conv() {
+    let bytes = fixture("MPC.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(w.get_str("MPC", "TotalFrames"), Some("102".to_string()));
+    assert_eq!(w.get_str("MPC", "SampleRate"), Some("44100".to_string()));
+    assert_eq!(
+      w.get_str("MPC", "Quality"),
+      Some("5 (Standard)".to_string())
+    );
+    assert_eq!(w.get_str("MPC", "FastSeek"), Some("No".to_string()));
+    assert_eq!(w.get_str("MPC", "Gapless"), Some("Yes".to_string()));
+    assert_eq!(
+      w.get_str("MPC", "EncoderVersion"),
+      Some("1.1.5".to_string())
+    );
+  }
+
+  /// `Taggable::tags(-n)` yields the raw indices (no PrintConv).
+  #[test]
+  fn taggable_emits_raw_scalars_value_conv() {
+    let bytes = fixture("MPC.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
+    assert_eq!(w.get_str("MPC", "SampleRate"), Some("0".to_string()));
+    assert_eq!(w.get_str("MPC", "Quality"), Some("10".to_string()));
+    assert_eq!(w.get_str("MPC", "Gapless"), Some("1".to_string()));
+    assert_eq!(w.get_str("MPC", "EncoderVersion"), Some("115".to_string()));
+  }
+
+  /// Every MPC bit-field tag carries family-0 AND family-1 group `"MPC"`
+  /// (MPC.pm:21/23).
+  #[test]
+  fn taggable_group_is_mpc_family0_and_family1() {
+    let bytes = fixture("MPC.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let tags: std::vec::Vec<_> = meta
+      .tags(ConvMode::PrintConv)
+      .filter(|t| t.tag().group_ref().family1() == "MPC")
+      .collect();
+    assert!(
+      !tags.is_empty(),
+      "MPC.mpc has no ID3 prefix ⇒ all tags are MPC:*"
+    );
+    for t in &tags {
+      assert_eq!(t.tag().group_ref().family0(), "MPC");
+      assert_eq!(t.tag().group_ref().family1(), "MPC");
+      assert!(!t.unknown());
+    }
+  }
+
+  /// An MPC with a leading ID3v2 prefix (`mpc_with_id3v2_prefix.mpc`) splices
+  /// the chained ID3 tags BEFORE the MPC body bit-fields — proving the
+  /// `id3.tags(mode)` chaining position matches the retired
+  /// `id3.serialize_tags` call site (step 0, before the MPC body).
+  #[test]
+  #[cfg(feature = "id3")]
+  fn taggable_chains_id3_prefix_before_mpc_body() {
+    let bytes = fixture("mpc_with_id3v2_prefix.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
+
+    let names: std::vec::Vec<String> = meta
+      .tags(ConvMode::PrintConv)
+      .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
+      .collect();
+    let id3_pos = names
+      .iter()
+      .position(|n| n.starts_with("ID3v2") || n == "File:ID3Size")
+      .expect("an ID3 prefix tag is spliced");
+    // The first MPC:* tag (TotalFrames) must come AFTER the ID3 prefix.
+    if let Some(mpc_pos) = names.iter().position(|n| n == "MPC:TotalFrames") {
+      assert!(
+        id3_pos < mpc_pos,
+        "ID3 prefix tags must precede the MPC body (id3_pos={id3_pos}, mpc_pos={mpc_pos}): {names:?}"
+      );
+    }
+  }
+
+  /// An MPC with an APEv2 trailer (`mpc_with_apev2_trailer.mpc`) emits the
+  /// `APE:*` tags AFTER the `MPC:*` body — proving the chained order. Now that
+  /// `ape::Meta` is `Taggable`, the `APE:*` tags are folded INTO the `tags()`
+  /// stream (spliced after the MPC body), NOT emitted via the arm.
+  #[test]
+  #[cfg(feature = "ape")]
+  fn taggable_arm_chains_ape_trailer_after_mpc_body() {
+    let bytes = fixture("mpc_with_apev2_trailer.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    // The `tags()` stream now carries the APE:* tags (ape::Meta is Taggable);
+    // they follow the MPC:* body in the same stream.
+    let names: std::vec::Vec<String> = meta
+      .tags(ConvMode::PrintConv)
+      .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
+      .collect();
+    let stream_mpc = names.iter().position(|n| n.starts_with("MPC:"));
+    let stream_ape = names.iter().position(|n| n.starts_with("APE:"));
+    if let (Some(mp), Some(ap)) = (stream_mpc, stream_ape) {
+      assert!(
+        mp < ap,
+        "APE:* tags must follow MPC:* body in the tags() stream (mpc_pos={mp}, ape_pos={ap}): {names:?}"
+      );
+    }
+
+    // Driven through the engine (run_emission + arm tail), the APE:* tags land
+    // AND they follow the MPC:* body. Build the ordered key list from the
+    // TagMap entries (which preserve first-occurrence position).
+    let mut w = TagMap::new();
+    emit_via_engine(&meta, true, &mut w);
+    let keys: std::vec::Vec<&str> = w.entries().iter().map(|(k, _)| k.as_str()).collect();
+    let mpc_pos = keys.iter().position(|k| k.starts_with("MPC:"));
+    let ape_pos = keys.iter().position(|k| k.starts_with("APE:"));
+    if let (Some(mp), Some(ap)) = (mpc_pos, ape_pos) {
+      assert!(
+        mp < ap,
+        "APE:* tags must follow MPC:* body (mpc_pos={mp}, ape_pos={ap}): {keys:?}"
+      );
+    } else {
+      // At minimum, the APE trailer must have contributed SOME APE:* tag for
+      // this fixture (the whole point of `mpc_with_apev2_trailer.mpc`).
+      assert!(
+        ape_pos.is_some(),
+        "APEv2 trailer fixture must emit APE:* tags: {keys:?}"
+      );
+    }
+  }
+
+  /// `Project` reports MPC as audio-only (one `TrackKind::Audio`) with no
+  /// camera / lens / GPS / capture facts and no synthesized duration.
+  #[test]
+  fn project_is_audio_only_no_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = fixture("MPC.mpc");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let md = Project::project(&meta);
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(
+      md.media().duration().is_none(),
+      "MPC synthesizes no duration"
+    );
+    assert!(md.media().width().is_none());
+    assert!(md.media().height().is_none());
+    assert!(md.camera().is_none());
+    assert!(md.lens().is_none());
+    assert!(md.gps().is_none());
+    assert!(md.capture().is_none());
   }
 }

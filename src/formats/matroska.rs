@@ -252,7 +252,7 @@ enum Kind {
   /// `ChapterTimeStart` / `ChapterTimeEnd` (Matroska.pm:580-592) —
   /// `Format => 'unsigned'`, `ValueConv => '$val / 1e9'`,
   /// `PrintConv => 'ConvertDuration($val)'`. The raw u64 nanoseconds are
-  /// stored; output-time `serialize_tags` divides by 1e9 to seconds and
+  /// stored; the output-time emission path divides by 1e9 to seconds and
   /// (in `-j` mode) runs `ConvertDuration` for the `H:MM:SS` rendering.
   ChapterTimeNs,
 }
@@ -2176,8 +2176,9 @@ impl<'a> Entry<'a> {
 /// `Meta` carries an ordered list of [`Entry`] tags (faithful to Perl's
 /// `FoundTag` call order), plus a few `Option<>` accessors for known-
 /// scalar fields (DocType, TimecodeScale-ns) that callers commonly probe.
-/// PrintConv strings are rendered at emit time via [`Self::serialize_tags`];
-/// the raw values stored here are post-Format-decode but pre-conversion.
+/// PrintConv strings are rendered at emit time via the
+/// [`Taggable`](crate::emit::Taggable) impl; the raw values stored here are
+/// post-Format-decode but pre-conversion.
 #[derive(Debug, Clone)]
 pub struct Meta<'a> {
   entries: Vec<Entry<'a>>,
@@ -3141,33 +3142,45 @@ fn hex_lower(b: &[u8]) -> SmolStr {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 // Use the rust standard library's String for transient builders.
 use std::string::String;
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit Matroska tags into the writer in extraction order (Perl
-  /// `FoundTag` call sequence).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield Matroska tags in extraction order (Perl `FoundTag` call sequence)
+  /// — the golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`), the per-tag PrintConv/ValueConv branches are preserved
+  /// verbatim.
   ///
-  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode);
-  /// `print_conv = false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings; `mode == ValueConv`
+  /// (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: `family0` = `"Matroska"` (the `%Matroska::Main` table group —
+  /// Matroska.pm:60 `GROUPS => { 2 => 'Video' }`, so family0 defaults to the
+  /// module name); `family1` = `entry.group()` (the per-entry `-G1` key —
+  /// `"Matroska"`, `"Info"`, `"Track<N>"`, …), byte-identical to the retired
+  /// sink. Every Matroska tag is a known table/SimpleTag row (no
+  /// `Unknown => 1`) ⇒ `unknown: false`.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
     for entry in &self.entries {
-      emit_one(entry, self.timecode_scale_ns, print_conv, out)?;
+      push_one(&mut tags, entry, self.timecode_scale_ns, print_conv);
     }
-    Ok(())
+    tags.into_iter()
   }
 }
 
 /// Resolve `name` → `Kind` by re-looking it up in `TAG_TABLE`. Used by
-/// `emit_one` to know which PrintConv to apply. Accepts `&str` so it works
+/// `push_one` to know which PrintConv to apply. Accepts `&str` so it works
 /// for both static-table names AND SimpleTag synthesized names (which won't
 /// match — the caller falls back to `PrintConv::Identity`).
 fn kind_for_name(name: &str) -> Option<Kind> {
@@ -3176,14 +3189,22 @@ fn kind_for_name(name: &str) -> Option<Kind> {
     .find_map(|t| (t.name == name).then(|| t.kind))
 }
 
-fn emit_one(
+/// Push a single Matroska entry as an [`EmittedTag`] (family0 `"Matroska"`,
+/// family1 = `entry.group()`, `unknown: false`). Preserves every per-value
+/// PrintConv/ValueConv branch of the retired `emit_one` verbatim.
+#[cfg(feature = "alloc")]
+fn push_one(
+  tags: &mut Vec<crate::emit::EmittedTag>,
   entry: &Entry<'_>,
   ts_ns: Option<u64>,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  let group = entry.group();
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
   let name = entry.name();
+  // family0 = "Matroska" (table group0); family1 = the per-entry group.
+  let group = || Group::new("Matroska", entry.group());
+  let mut push = |value: TagValue| tags.push(EmittedTag::new(group(), name.into(), value, false));
   match entry.value_ref() {
     Value::U64(n) => {
       // Lookup the PrintConv variant for this name.
@@ -3193,36 +3214,36 @@ fn emit_one(
       };
       if print_conv {
         match pc {
-          PrintConv::Identity => out.write_u64(group, name, *n)?,
+          PrintConv::Identity => push(TagValue::U64(*n)),
           PrintConv::Map(map) => {
             if let Some(label) = lookup_map(map, *n) {
-              out.write_str(group, name, label)?;
+              push(TagValue::Str(label.into()));
             } else {
               // Off-table ⇒ Perl emits the bare numeric (verbose tracks
               // the unknown but tag value is the raw integer).
-              out.write_u64(group, name, *n)?;
+              push(TagValue::U64(*n));
             }
           }
           PrintConv::NoYes => {
             if let Some(label) = no_yes_print_conv(*n) {
-              out.write_str(group, name, label)?;
+              push(TagValue::Str(label.into()));
             } else {
-              out.write_u64(group, name, *n)?;
+              push(TagValue::U64(*n));
             }
           }
         }
       } else {
-        out.write_u64(group, name, *n)?;
+        push(TagValue::U64(*n));
       }
     }
     Value::I64(n) => {
-      out.write_i64(group, name, *n)?;
+      push(TagValue::I64(*n));
     }
     Value::F64(x) => {
-      out.write_f64(group, name, *x)?;
+      push(TagValue::F64(*x));
     }
     Value::Str(s) => {
-      out.write_str(group, name, s.as_ref())?;
+      push(TagValue::Str(s.as_ref().into()));
     }
     Value::Date(raw_ns) => {
       // Matroska.pm:1193-1198 — `$t = $val / 1e9; $t += (((2001-1970)*365+8)
@@ -3232,12 +3253,12 @@ fn emit_one(
       // faithful transliteration of `ConvertUnixTime`'s fractional branch
       // (ExifTool.pm:6773-6800).
       let s = convert_matroska_date(*raw_ns);
-      out.write_str(group, name, &s)?;
+      push(TagValue::Str(s.into()));
     }
     Value::UidHex(hex) => {
       // Matroska.pm:33-36 — `ValueConv => 'unpack("H*",$val)'`. Same
       // string under -j and -n (no PrintConv).
-      out.write_str(group, name, hex.as_str())?;
+      push(TagValue::Str(hex.as_str().into()));
     }
     Value::TimecodeScaleRaw(raw_ns) => {
       // Matroska.pm:160-166 — ValueConv `$val / 1e9`, PrintConv
@@ -3253,9 +3274,9 @@ fn emit_one(
         let mut s = String::new();
         write_perl_compact_num(&mut s, ms);
         s.push_str(" ms");
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
-        out.write_f64(group, name, vc)?;
+        push(TagValue::F64(vc));
       }
     }
     Value::DurationRawF64(raw) => {
@@ -3284,12 +3305,12 @@ fn emit_one(
       if print_conv {
         if truthy_scale.is_some() {
           let s = crate::datetime::convert_duration(vc);
-          out.write_str(group, name, &s)?;
+          push(TagValue::Str(s.into()));
         } else {
-          out.write_f64(group, name, vc)?;
+          push(TagValue::F64(vc));
         }
       } else {
-        out.write_f64(group, name, vc)?;
+        push(TagValue::F64(vc));
       }
     }
     Value::DefaultDurationRaw(raw_ns) => {
@@ -3301,9 +3322,9 @@ fn emit_one(
         let mut s = String::new();
         write_perl_compact_num(&mut s, ms);
         s.push_str(" ms");
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
-        out.write_f64(group, name, vc)?;
+        push(TagValue::F64(vc));
       }
     }
     Value::VideoFrameRateRaw(raw_ns_per_frame) => {
@@ -3324,16 +3345,16 @@ fn emit_one(
         // FrameRate has no unit appended).
         let mut s = String::new();
         write_perl_compact_num(&mut s, rounded);
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
-        out.write_f64(group, name, vc)?;
+        push(TagValue::F64(vc));
       }
     }
     Value::Bytes(b) => {
       // Matroska.pm:552 (AttachedFileData) + 695 (TagBinary). ExifTool's
       // universal no-`-b` placeholder is rendered by `TagValue::Bytes`'s
       // Serialize impl (`value.rs`) — identical bytes for `-j` and `-n`.
-      out.write_bytes(group, name, b.as_ref())?;
+      push(TagValue::Bytes(b.as_ref().to_vec()));
     }
     Value::ChapterTimeRawNs(raw_ns) => {
       // Matroska.pm:580-592 — `ValueConv => '$val / 1e9'`,
@@ -3345,13 +3366,39 @@ fn emit_one(
       let vc = (*raw_ns as f64) / 1e9;
       if print_conv {
         let s = crate::datetime::convert_duration(vc);
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
-        out.write_f64(group, name, vc)?;
+        push(TagValue::F64(vc));
       }
     }
   }
-  Ok(())
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project Matroska metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// Matroska / WebM is a multimedia container; the faithful structural
+  /// contribution is a single video [`TrackKind`](crate::metadata::TrackKind)
+  /// (the dominant kind for the container — a precise per-track kind would
+  /// require decoding each `TrackType` enum, which the typed `Meta` carries
+  /// only as a raw tag-stream value, not a clean accessor). Duration /
+  /// dimensions / created are left `None`: the decoded `Duration` is a raw
+  /// edit-unit value whose seconds form depends on the lazily-read
+  /// `TimecodeScale` (resolved only inside the tag-emission path), not a
+  /// clean wall-clock accessor the projection can consume. Camera / lens /
+  /// GPS / capture stay `None` (Matroska carries no such facts here).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
+  }
 }
 
 /// Matroska date epoch offset — seconds from 1970-01-01 to 2001-01-01
@@ -3593,6 +3640,21 @@ pub enum Error {}
 mod tests {
   use super::*;
 
+  /// Drive the `Meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for `print_conv` and
+  /// return the resulting [`TagMap`](crate::tagmap::TagMap) — the production
+  /// sink path that replaced the retired `serialize_tags`.
+  #[cfg(feature = "alloc")]
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    w
+  }
+
   #[test]
   fn matroska_error_is_core_error() {
     fn assert_error<E: core::error::Error>() {}
@@ -3819,8 +3881,7 @@ mod tests {
     ))
     .expect("read F4 fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     // Info emitted under `Info:`
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
     assert_eq!(tm.get_str("Info", "MuxingApp"), Some("unkseg".into()));
@@ -3842,8 +3903,7 @@ mod tests {
     ))
     .expect("read F3 fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     // Info BEFORE cluster: emitted
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
     assert_eq!(tm.get_str("Info", "MuxingApp"), Some("clu".into()));
@@ -3867,8 +3927,7 @@ mod tests {
     .expect("read F5 fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
     for print_conv in [true, false] {
-      let mut tm = crate::tagmap::TagMap::new();
-      meta.serialize_tags(print_conv, &mut tm).unwrap();
+      let tm = emit_into_tagmap(&meta, print_conv);
       // The raw `TagValue::Bytes` storage stringifies as lower-hex via
       // `tm.get_str` — a sanity check that the 32-byte attachment WAS
       // captured (vs the pre-F5 silent drop).
@@ -3894,8 +3953,7 @@ mod tests {
     ))
     .expect("read F1 fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     // TITLE → Title, ARTIST → Artist (Matroska.pm:764, 777).
     assert_eq!(tm.get_str("Matroska", "Title"), Some("Hello World".into()));
     assert_eq!(tm.get_str("Matroska", "Artist"), Some("Test Artist".into()));
@@ -3984,13 +4042,11 @@ mod tests {
     // is `($val * 1000) . " ms"` ⇒ "0 ms" (no truthy guard there —
     // unconditional). Duration's PrintConv is `$$self{TimecodeScale} ?
     // ConvertDuration($val) : $val` ⇒ falsy branch ⇒ bare 60.0.
-    let mut tm_j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm_j).unwrap();
+    let tm_j = emit_into_tagmap(&meta, true);
     assert_eq!(tm_j.get_str("Info", "TimecodeScale"), Some("0 ms".into()));
     assert_eq!(tm_j.get_str("Info", "Duration"), Some("60".into()));
     // -n mode: same — Duration falls through to the numeric fallback.
-    let mut tm_n = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut tm_n).unwrap();
+    let tm_n = emit_into_tagmap(&meta, false);
     assert_eq!(tm_n.get_str("Info", "Duration"), Some("60".into()));
   }
 
@@ -4010,8 +4066,7 @@ mod tests {
     .expect("read R3 order-skewed fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
     assert_eq!(meta.timecode_scale_ns(), Some(1_000_000));
-    let mut tm_j = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm_j).unwrap();
+    let tm_j = emit_into_tagmap(&meta, true);
     assert_eq!(tm_j.get_str("Info", "Duration"), Some("0:01:00".into()));
     assert_eq!(tm_j.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
   }
@@ -4027,8 +4082,7 @@ mod tests {
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
     // Pre-F2: walker breaks on the unknown-size VINT → Info/Tracks lost.
     // Post-F2: Info+Tracks descended.
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
     assert_eq!(tm.get_str("Info", "MuxingApp"), Some("unkseg".into()));
     assert_eq!(tm.get_str("Track1", "TrackNumber"), Some("1".into()));
@@ -4042,8 +4096,7 @@ mod tests {
     ))
     .expect("read fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("Matroska", "DocType"), Some("matroska".into()));
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
     assert_eq!(tm.get_str("Info", "Duration"), Some("0:02:29".into()));
@@ -4067,5 +4120,64 @@ mod tests {
       tm.get_str("Track2", "AudioSampleRate"),
       Some("48000".into())
     );
+  }
+
+  #[test]
+  fn taggable_group_is_matroska_family0_and_entry_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska.mkv"
+    ))
+    .expect("read fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    // No Matroska tag carries `Unknown => 1`.
+    assert!(tags.iter().all(|t| !t.unknown()));
+    // family0 is the constant "Matroska" table group; family1 is the
+    // per-entry `-G1` key ("Matroska", "Info", "Track<N>", …).
+    assert!(
+      tags
+        .iter()
+        .all(|t| t.tag().group_ref().family0() == "Matroska")
+    );
+    let doc_type = tags
+      .iter()
+      .find(|t| t.tag().name() == "DocType")
+      .expect("DocType emitted");
+    assert_eq!(doc_type.tag().group_ref().family1(), "Matroska");
+    let tcs = tags
+      .iter()
+      .find(|t| t.tag().name() == "TimecodeScale")
+      .expect("TimecodeScale emitted");
+    assert_eq!(tcs.tag().group_ref().family1(), "Info");
+    let track_no = tags
+      .iter()
+      .find(|t| t.tag().name() == "TrackNumber")
+      .expect("TrackNumber emitted");
+    assert_eq!(track_no.tag().group_ref().family1(), "Track1");
+  }
+
+  #[test]
+  fn project_populates_video_track() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/Matroska.mkv"
+    ))
+    .expect("read fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let projected = meta.project();
+    // Matroska projects to a video container; the rest of MediaInfo is empty.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().created().is_none());
+    // Matroska carries no camera / lens / GPS / capture facts here.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

@@ -5,10 +5,11 @@
 //! Faithful port of `Image::ExifTool::FLAC` (lib/Image/ExifTool/FLAC.pm).
 //!
 //! A typed [`Meta<'a>`] is produced by the
-//! [`crate::format_parser::FormatParser`] trait; the engine entry `process`
-//! emits StreamInfo/Picture/Composite via the typed `serialize_tags` path
-//! and the list-aware VorbisComment stream directly into `Metadata`, so the
-//! serialized JSON stays byte-exact with bundled `perl exiftool`.
+//! [`crate::format_parser::FormatParser`] trait; the golden-pattern
+//! [`Taggable`](crate::emit::Taggable) impl emits StreamInfo/Picture/Composite
+//! plus the list-aware VorbisComment stream through the generic
+//! [`run_emission`](crate::emit::run_emission) engine, so the serialized JSON
+//! stays byte-exact with bundled `perl exiftool`.
 //!
 //! ## What FLAC is
 //!
@@ -34,10 +35,11 @@
 //!
 //! F1 (Codex adversarial): the typed parser nests an `Id3Meta` sub-Meta on
 //! `flac::Meta` via the SAME entry APE/DSF use
-//! (`crate::formats::id3::process::parse_id3_with_hdr_end`). The sink emits
-//! `File:ID3Size` + every `ID3v2_*:*` frame BEFORE the FLAC body tags — so
-//! the lib-first `serialize_tags` path matches bundled `perl exiftool` byte-
-//! for-byte on ID3-prefixed FLAC fixtures (no hand-trimming required).
+//! (`crate::formats::id3::process::parse_id3_with_hdr_end`). The `Taggable`
+//! impl splices the chained ID3 tags (`File:ID3Size` + every `ID3v2_*:*`
+//! frame) BEFORE the FLAC body tags — so the golden emission path matches
+//! bundled `perl exiftool` byte-for-byte on ID3-prefixed FLAC fixtures (no
+//! hand-trimming required).
 
 use core::time::Duration;
 use std::borrow::Cow;
@@ -623,11 +625,12 @@ pub struct Meta<'a> {
   /// (`unless ($$et{DoneID3}) { ID3::ProcessID3($et, $dirInfo) }`). `Some`
   /// when an ID3v2 PREFIX (in front of the `fLaC` magic) was detected and
   /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`].
-  /// Carries `File:ID3Size` + any `ID3v2_*:*` frame tags; the typed
-  /// `serialize_tags` sink emits them BEFORE the FLAC body tags so the
-  /// stream stays faithful to bundled (ID3 is processed first, then the
-  /// `fLaC` magic check & FLAC body extraction at FLAC.pm:254-278). Same
-  /// nesting pattern as `ape::Meta::id3` and `dsf::Meta::id3`.
+  /// Carries `File:ID3Size` + any `ID3v2_*:*` frame tags; the golden
+  /// [`Taggable`](crate::emit::Taggable) impl splices them BEFORE the FLAC
+  /// body tags so the stream stays faithful to bundled (ID3 is processed
+  /// first, then the `fLaC` magic check & FLAC body extraction at
+  /// FLAC.pm:254-278). Same nesting pattern as `ape::Meta::id3` and
+  /// `dsf::Meta::id3`.
   ///
   /// F1 (Codex adversarial): bundled emits `File:ID3Size` for every
   /// ID3-prefixed FLAC (even a 10-byte empty header); the pre-F1 code
@@ -746,9 +749,9 @@ impl<'a> Meta<'a> {
     Some(Duration::from_secs_f64(secs))
   }
   /// Chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`). `Some`
-  /// when an ID3v2 PREFIX was detected and parsed; the
-  /// `serialize_tags` sink emits its `File:ID3Size` + frame tags BEFORE the
-  /// FLAC body tags (faithful bundled order).
+  /// when an ID3v2 PREFIX was detected and parsed; the golden
+  /// [`Taggable`](crate::emit::Taggable) impl splices its `File:ID3Size` +
+  /// frame tags BEFORE the FLAC body tags (faithful bundled order).
   ///
   /// §3: non-`Copy` borrow ⇒ `_ref` suffix.
   #[cfg(feature = "id3")]
@@ -1437,37 +1440,71 @@ fn decode_base64(s: &str) -> Vec<u8> {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit FLAC tags into the writer in bundled `perl exiftool -j -G1` order:
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield FLAC tags in bundled `perl exiftool -j -G1` order:
+  /// (0) the chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`) →
   /// `FLAC:*` StreamInfo (FLAC.pm:59-82) → `Vorbis:*` comments (Vorbis.pm:
   /// 175-203, vendor first then user comments in extraction order) →
   /// `FLAC:Picture*` (FLAC.pm:84-134, one Picture block at a time) →
   /// `Composite:Duration` (FLAC.pm:137-149).
   ///
-  /// `print_conv=true` ⇒ PrintConv strings (`-j` mode);
-  /// `print_conv=false` ⇒ post-ValueConv raw scalars (`-n` mode).
+  /// The golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`); the value variants (`TagValue::U64` for StreamInfo /
+  /// Picture integers, `TagValue::Str` for MD5 hex / Vorbis scalars / Picture
+  /// MIME+Description, `TagValue::List` for the Vorbis `List => 1` coalesce,
+  /// `TagValue::Bytes` for CoverArt + the Picture binary), the emission ORDER,
+  /// the ID3-chain position, and every PrintConv/ValueConv branch are
+  /// preserved verbatim.
+  ///
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings (e.g. PictureType →
+  /// "Front Cover", Duration → `ConvertDuration`); `mode == ValueConv` (`-n`)
+  /// ⇒ post-ValueConv raw scalars.
+  ///
+  /// **Groups.** Family-0/1 both `"FLAC"` for StreamInfo + Picture, both
+  /// `"Vorbis"` for Vorbis comments, both `"Composite"` for Duration (each
+  /// sub-table's group0 == group1 — none carries a `Groups => { 1 => ... }`
+  /// override). Every FLAC tag is a known tag ⇒ `unknown: false`.
   ///
   /// **List-tag note (Codex CF2).** Vorbis `List => 1` tags
-  /// (Artist/Performer/Contact) coalesce into a single `TagValue::List` at
-  /// first-occurrence position via `TagMap::write_str_list`, so any
-  /// list-aware writer faithfully builds a JSON array (ExifTool.pm:9505-9520
-  /// `FoundTag`). The engine entry `process` keeps its own `write_str_list`
-  /// loop (`bridge_emit_vorbis`) for the byte-exact CLI path; this typed
-  /// sink reaches the same `write_str_list` so the lib-first `serialize_tags`
-  /// path coalesces too.
-  pub(crate) fn serialize_tags(
+  /// (Artist/Performer/Contact, Vorbis.pm:85/86/94) coalesce into a single
+  /// `TagValue::List` at first-occurrence position (faithful `FoundTag`,
+  /// ExifTool.pm:9505-9520). The flat `self.vorbis` stream may carry the same
+  /// listable name more than once; we gather all its values (in encounter
+  /// order) and emit ONE `EmittedTag` carrying the list at the first
+  /// occurrence, skipping later repeats.
+  ///
+  /// **Warnings are NOT part of this tag stream** ([`run_emission`](crate::emit::run_emission)
+  /// has no warning/error channel). The FLAC.pm:278 "Format error in FLAC
+  /// file" warning, the Vorbis.pm:122-135 "Picture pointer references previous
+  /// VorbisComment directory" recursion warning, and the chained ID3 sub-Meta's
+  /// warnings/errors are drained by the `AnyMeta::Flac` dispatch arm AFTER
+  /// `run_emission`, in the same order the retired `serialize_tags` emitted
+  /// them (ID3 warnings/errors first — they were written during the top-of-fn
+  /// `id3.serialize_tags` call — then the FLAC format-error, then each
+  /// picture-recursion warning), so the net `TagMap` stays byte-identical.
+  ///
+  /// The File:* triplet is NOT emitted here — it is the engine
+  /// ([`crate::parser::extract_info`]) `SetFileType` responsibility.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const FLAC_GROUP: &str = "FLAC";
-    const VORBIS_GROUP: &str = "Vorbis";
-    const COMPOSITE_GROUP: &str = "Composite";
-    const EXIFTOOL_GROUP: &str = "ExifTool";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // family-0 == family-1 per sub-table (see fn docs). FLAC.pm StreamInfo /
+    // Picture → "FLAC"; Vorbis.pm comments → "Vorbis"; Composite → "Composite".
+    let flac_group = || Group::new("FLAC", "FLAC");
+    let vorbis_group = || Group::new("Vorbis", "Vorbis");
+    let composite_group = || Group::new("Composite", "Composite");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: Vec<EmittedTag> = Vec::new();
 
     // (0) Chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`).
     // Bundled runs `ProcessID3` BEFORE the FLAC body extraction (it's the
@@ -1475,75 +1512,111 @@ impl Meta<'_> {
     // `FoundTag('ID3Size', $id3Len)` and the ID3v2 header / v1 trailer
     // ProcessDirectory calls at ID3.pm:1607-1617), so `File:ID3Size` + every
     // `ID3v2_*:*` frame tag precedes the FLAC StreamInfo / Vorbis / Picture
-    // tags. F1 (Codex adversarial): the pre-F1 code dropped this entirely,
-    // forcing a hand-trimmed golden — now we emit it via the typed sink.
+    // tags. The retired sink called `id3.serialize_tags(print_conv, out)` at
+    // this exact point; `Id3Meta` is `Taggable`, so its tags flow through the
+    // same engine here. Its warnings/errors are drained by the `AnyMeta::Flac`
+    // arm (matching the retired position — see fn docs).
     #[cfg(feature = "id3")]
-    if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
-    }
-
-    // FLAC.pm:278 — `$err and Warn('Format error in FLAC file')`. ExifTool
-    // serializer surfaces the first Warn as `ExifTool:Warning` (ExifTool.pm:
-    // 1225). The bridge re-emits this via `Metadata::push_warning` so the
-    // CLI JSON path stays byte-exact; here we mirror the surface emission
-    // for lib-first consumers reading purely from a `TagMap`.
-    let _ = EXIFTOOL_GROUP;
-    if self.format_error {
-      out.write_warning("Format error in FLAC file")?;
+    if let Some(id3) = self.id3.as_ref() {
+      tags.extend(id3.tags(mode));
     }
 
     // -- StreamInfo (FLAC.pm:59-82) ---------------------------------------
-    // ValueConv on Channels/BitsPerSample (`$val + 1`) is already applied
-    // on the stored scalars. MD5Signature ValueConv (`unpack("H*",$val)`)
-    // is applied at emit time via `format_md5_hex`.
-    let _ = print_conv; // No PrintConv on any StreamInfo tag (FLAC.pm:59-82).
+    // ValueConv on Channels/BitsPerSample (`$val + 1`) is already applied on
+    // the stored scalars. No PrintConv on any StreamInfo tag (FLAC.pm:59-82),
+    // so -j and -n are identical here. MD5Signature ValueConv
+    // (`unpack("H*",$val)`) is applied below via `format_md5_hex`.
     if let Some(v) = self.stream_info.block_size_min {
-      out.write_u64(FLAC_GROUP, "BlockSizeMin", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "BlockSizeMin".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.block_size_max {
-      out.write_u64(FLAC_GROUP, "BlockSizeMax", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "BlockSizeMax".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.frame_size_min {
-      out.write_u64(FLAC_GROUP, "FrameSizeMin", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "FrameSizeMin".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.frame_size_max {
-      out.write_u64(FLAC_GROUP, "FrameSizeMax", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "FrameSizeMax".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.sample_rate {
-      out.write_u64(FLAC_GROUP, "SampleRate", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "SampleRate".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.channels {
-      out.write_u64(FLAC_GROUP, "Channels", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "Channels".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.bits_per_sample {
-      out.write_u64(FLAC_GROUP, "BitsPerSample", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "BitsPerSample".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(v) = self.stream_info.total_samples {
-      out.write_u64(FLAC_GROUP, "TotalSamples", v)?;
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "TotalSamples".into(),
+        TagValue::U64(v),
+        false,
+      ));
     }
     if let Some(md5) = &self.stream_info.md5_signature {
-      // unpack("H*",$val) — lowercase hex of all 16 bytes.
-      out.write_fmt(FLAC_GROUP, "MD5Signature", |w| {
-        for x in md5 {
-          write!(w, "{x:02x}")?;
-        }
-        Ok(())
-      })?;
+      // unpack("H*",$val) — lowercase hex of all 16 bytes. The retired sink
+      // used `write_fmt(|w| write!(w, "{x:02x}"))` → `TagValue::Str`; the
+      // `format_md5_hex` String here renders identically.
+      tags.push(EmittedTag::new(
+        flac_group(),
+        "MD5Signature".into(),
+        TagValue::Str(format_md5_hex(md5).into()),
+        false,
+      ));
     }
 
     // -- VorbisComment (Vorbis.pm:175-203) --------------------------------
-    // List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:85/86/94) coalesce
-    // into a single `TagValue::List` at FIRST-occurrence position — faithful
-    // `FoundTag` (ExifTool.pm:9505-9520). The flat `self.vorbis` stream may
-    // carry the same listable name more than once; we gather all its values
-    // (in encounter order) and emit ONE `write_str_list` at the first
-    // occurrence, skipping later repeats so list-aware writers coalesce
-    // instead of last-write-wins (Codex CF2).
+    // List=>1 tags coalesce into a single `TagValue::List` at FIRST-occurrence
+    // position; we gather all values for each listable name (in encounter
+    // order) and emit ONE list `EmittedTag` at the first occurrence, skipping
+    // later repeats (Codex CF2). Non-listable scalars emit verbatim.
     let mut emitted_listable: Vec<&str> = Vec::new();
     for item in &self.vorbis {
       match item {
         VorbisItem::Vendor(s) => {
-          out.write_str(VORBIS_GROUP, "Vendor", s)?;
+          tags.push(EmittedTag::new(
+            vorbis_group(),
+            "Vendor".into(),
+            TagValue::Str(s.as_ref().into()),
+            false,
+          ));
         }
         VorbisItem::Named(named) => {
           if named.is_listable() {
@@ -1552,91 +1625,194 @@ impl Meta<'_> {
               // Already coalesced at first occurrence; skip the repeat.
               continue;
             }
-            // Gather every value for this name across the stream, in order.
-            let refs: Vec<&str> = self
+            // Gather every value for this name across the stream, in order
+            // (faithful `TagMap::write_str_list` → `TagValue::List(Str…)`).
+            let items: Vec<TagValue> = self
               .vorbis
               .iter()
               .filter_map(|it| match it {
-                VorbisItem::Named(n) if n.is_listable() && n.name() == key => Some(n.value()),
+                VorbisItem::Named(n) if n.is_listable() && n.name() == key => {
+                  Some(TagValue::Str(n.value().into()))
+                }
                 _ => None,
               })
               .collect();
-            out.write_str_list(VORBIS_GROUP, key, &refs)?;
+            tags.push(EmittedTag::new(
+              vorbis_group(),
+              key.into(),
+              TagValue::List(items),
+              false,
+            ));
             emitted_listable.push(key);
           } else {
-            out.write_str(VORBIS_GROUP, named.name(), named.value())?;
+            tags.push(EmittedTag::new(
+              vorbis_group(),
+              named.name().into(),
+              TagValue::Str(named.value().into()),
+              false,
+            ));
           }
         }
         VorbisItem::Auto(auto) => {
-          out.write_str(VORBIS_GROUP, auto.name(), auto.value())?;
+          tags.push(EmittedTag::new(
+            vorbis_group(),
+            auto.name().into(),
+            TagValue::Str(auto.value().into()),
+            false,
+          ));
         }
         VorbisItem::CoverArt(bytes) => {
-          out.write_bytes(VORBIS_GROUP, "CoverArt", bytes)?;
+          tags.push(EmittedTag::new(
+            vorbis_group(),
+            "CoverArt".into(),
+            TagValue::Bytes(bytes.clone()),
+            false,
+          ));
         }
-        VorbisItem::PictureRecursionWarning(_) => {
-          out.write_warning("Picture pointer references previous VorbisComment directory")?;
-        }
+        // PictureRecursionWarning emits ONLY a warning, no tag — drained by
+        // the `AnyMeta::Flac` arm (see fn docs).
+        VorbisItem::PictureRecursionWarning(_) => {}
       }
     }
 
     // -- Picture (FLAC.pm:84-134) -----------------------------------------
     for p in &self.pictures {
-      sink_picture(p, print_conv, out)?;
+      push_picture_tags(&mut tags, p, print_conv);
     }
 
     // -- Composite:Duration (FLAC.pm:137-149) -----------------------------
     if let Some(d) = self.duration() {
       let secs = d.as_secs_f64();
-      if print_conv {
-        out.write_fmt(COMPOSITE_GROUP, "Duration", |w| {
-          write_convert_duration(w, secs)
-        })?;
+      let value = if print_conv {
+        // ConvertDuration (the retired `write_fmt` → `TagValue::Str`).
+        let mut s = String::new();
+        let _ = write_convert_duration(&mut s, secs);
+        TagValue::Str(s.into())
       } else {
-        out.write_f64(COMPOSITE_GROUP, "Duration", secs)?;
-      }
+        TagValue::F64(secs)
+      };
+      tags.push(EmittedTag::new(
+        composite_group(),
+        "Duration".into(),
+        value,
+        false,
+      ));
     }
-    Ok(())
+
+    tags.into_iter()
   }
 }
 
-/// Sink a single [`Picture`] in faithful FLAC.pm:84-134 order. Drops
-/// the Picture sub-field iff `length > 0 && data.is_empty()` (ExifTool::
-/// ReadValue clamp at ExifTool.pm:6292 `count < 1 and return undef`).
+/// Push a single [`Picture`]'s tags in faithful FLAC.pm:84-134 order onto
+/// `tags`. Drops the Picture sub-field iff `length > 0 && data.is_empty()`
+/// (ExifTool::ReadValue clamp at ExifTool.pm:6292 `count < 1 and return
+/// undef`). Value variants match the retired `sink_picture`: `TagValue::Str`
+/// for PictureType (PrintConv) / MIME / Description, `TagValue::U64` for the
+/// numeric fields (incl. PictureType under `-n` and on a PrintConv hash miss),
+/// `TagValue::Bytes` for the Picture binary.
 #[cfg(feature = "alloc")]
-fn sink_picture(
-  p: &Picture<'_>,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  const GROUP: &str = "FLAC";
+fn push_picture_tags(tags: &mut Vec<crate::emit::EmittedTag>, p: &Picture<'_>, print_conv: bool) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let group = || Group::new("FLAC", "FLAC");
   // PictureType — PrintConv hash (FLAC.pm:88-113). On a hash miss the Perl
   // default falls back to the numeric value as a string (we emit raw u32).
-  if print_conv {
-    if let Some(name) = p.picture_type_name() {
-      out.write_str(GROUP, "PictureType", name)?;
-    } else {
-      out.write_u64(GROUP, "PictureType", u64::from(p.picture_type))?;
+  let picture_type = if print_conv {
+    match p.picture_type_name() {
+      Some(name) => TagValue::Str(name.into()),
+      None => TagValue::U64(u64::from(p.picture_type)),
     }
   } else {
-    out.write_u64(GROUP, "PictureType", u64::from(p.picture_type))?;
-  }
-  out.write_str(GROUP, "PictureMIMEType", &p.mime_type)?;
-  out.write_str(GROUP, "PictureDescription", &p.description)?;
-  out.write_u64(GROUP, "PictureWidth", u64::from(p.width))?;
-  out.write_u64(GROUP, "PictureHeight", u64::from(p.height))?;
-  out.write_u64(GROUP, "PictureBitsPerPixel", u64::from(p.bits_per_pixel))?;
-  out.write_u64(GROUP, "PictureIndexedColors", u64::from(p.indexed_colors))?;
-  out.write_u64(GROUP, "PictureLength", u64::from(p.length))?;
+    TagValue::U64(u64::from(p.picture_type))
+  };
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureType".into(),
+    picture_type,
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureMIMEType".into(),
+    TagValue::Str(p.mime_type().into()),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureDescription".into(),
+    TagValue::Str(p.description().into()),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureWidth".into(),
+    TagValue::U64(u64::from(p.width)),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureHeight".into(),
+    TagValue::U64(u64::from(p.height)),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureBitsPerPixel".into(),
+    TagValue::U64(u64::from(p.bits_per_pixel)),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureIndexedColors".into(),
+    TagValue::U64(u64::from(p.indexed_colors)),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureLength".into(),
+    TagValue::U64(u64::from(p.length)),
+    false,
+  ));
   // Picture binary — skip emission when ReadValue's count-clamped-to-zero
-  // sentinel fires (declared > 0 but no bytes left). The empty-payload
-  // case (length == 0) still emits an empty `TagValue::Bytes` for the
-  // serializer to render as `(Binary data 0 bytes, …)`.
+  // sentinel fires (declared > 0 but no bytes left). The empty-payload case
+  // (length == 0) still emits an empty `TagValue::Bytes` for the serializer
+  // to render as `(Binary data 0 bytes, …)`.
   if p.length > 0 && p.data.is_empty() {
     // Faithful skip — ExifTool.pm:6292 returns undef → no tag.
   } else {
-    out.write_bytes(GROUP, "Picture", p.data)?;
+    tags.push(EmittedTag::new(
+      group(),
+      "Picture".into(),
+      TagValue::Bytes(p.data.to_vec()),
+      false,
+    ));
   }
-  Ok(())
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project FLAC metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// FLAC is a lossless audio stream: it carries no camera / lens / GPS /
+  /// capture facts (those domains stay `None`). The structural contributions
+  /// are one audio [`TrackKind`](crate::metadata::TrackKind) (FLAC files are
+  /// audio-only — `%FLAC::StreamInfo` `GROUPS{2} => 'Audio'`, FLAC.pm:60) and
+  /// the `Composite:Duration` (FLAC.pm:137-149 `TotalSamples / SampleRate`),
+  /// which `Meta` already exposes as a clean `Option<Duration>` accessor
+  /// ([`Meta::duration`]) — so unlike DSF (raw `SampleCount` only), FLAC has a
+  /// faithful decoded duration to surface. Dimensions / created stay `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media.media_mut().update_duration(self.duration());
+    media
+  }
 }
 
 /// Format-into-writer port of `Image::ExifTool::ConvertDuration`
@@ -1690,21 +1866,24 @@ pub enum Error {}
 // ===========================================================================
 
 // ===========================================================================
-// bridge_emit_* split rationale
+// Warning/error drain rationale (golden pattern)
 //
-// The engine entry `process` writes each tag group with the dedicated
-// `bridge_emit_streaminfo`/`_vorbis`/`_pictures`/`_composite_duration`
-// helpers (all emitting straight into the engine `TagMap` via
-// `ctx.writer()`) instead of a single `meta.sink(print_on, ctx.writer())`
-// call. The split exists so the two FLAC warnings — "Format error in
-// Vorbis comments" (FLAC.pm via Vorbis::ProcessComments returning 0) and
-// "Format error in FLAC file" (FLAC.pm:278) — can be interleaved at their
-// faithful `-G1` emission positions, which the typed `Meta` cannot
-// carry on its own. List coalescing (Vorbis ARTIST/PERFORMER/CONTACT,
-// Vorbis.pm:85,86,94) is identical on both paths: `bridge_emit_vorbis` and
-// `serialize_tags` both call `TagMap::write_str_list`. The standalone
-// `serialize_tags` impl above remains the lib-first emission path for
-// generic sinks (`TagMap` etc.).
+// The golden [`Taggable`] impl above yields only the TAG stream; the
+// `run_emission` engine has no warning/error channel. FLAC's three warning
+// sources — the chained ID3 sub-Meta's warnings/errors (FLAC.pm:243-247), the
+// FLAC.pm:278 "Format error in FLAC file" warning, and the Vorbis.pm:122-135
+// "Picture pointer references previous VorbisComment directory" recursion
+// warning (one per METADATA_BLOCK_PICTURE comment) — are drained by the
+// `AnyMeta::Flac` dispatch arm in `format_parser.rs` AFTER `run_emission`, in
+// the exact order the retired `serialize_tags` emitted them (ID3 warnings then
+// errors, then the FLAC format-error, then each picture-recursion warning), so
+// `TagMap::first_warning`/`first_error` and the net `TagMap` stay
+// byte-identical. The Vorbis "Format error in Vorbis comments" warning was
+// never emitted by the retired `serialize_tags` path either (the typed Meta
+// stops early on malformed input without recording it), so the net output is
+// unchanged. List coalescing (Vorbis ARTIST/PERFORMER/CONTACT, Vorbis.pm:
+// 85/86/94) is reproduced as ONE `EmittedTag` carrying a `TagValue::List`,
+// byte-identical to the retired `TagMap::write_str_list`.
 // ===========================================================================
 
 // ===========================================================================
@@ -1714,6 +1893,7 @@ pub enum Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::emit::{ConvMode, Taggable};
   use crate::tagmap::TagMap;
 
   // ---------- StreamInfo bit-stream decoding -----------------------------
@@ -1721,6 +1901,35 @@ mod tests {
   fn fixture(path: &str) -> Vec<u8> {
     let root = env!("CARGO_MANIFEST_DIR");
     std::fs::read(format!("{root}/tests/fixtures/{path}")).expect("fixture exists")
+  }
+
+  /// Drive a [`Meta`] through the golden [`run_emission`](crate::emit) engine
+  /// PLUS the `AnyMeta::Flac` arm's warning/error drain, in the SAME order the
+  /// arm uses: (a) the chained ID3 sub-Meta's warnings then errors, (b) the
+  /// FLAC.pm:278 "Format error in FLAC file" warning, (c) one "Picture pointer
+  /// references previous VorbisComment directory" warning per
+  /// METADATA_BLOCK_PICTURE Vorbis item. Mirrors `format_parser.rs` exactly so
+  /// the in-module tests exercise the same net `TagMap` the engine produces.
+  /// `print_conv` ⇒ `-j`, else `-n`.
+  fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
+    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    #[cfg(feature = "id3")]
+    if let Some(id3) = meta.id3_ref() {
+      for w in id3.warnings_slice() {
+        let _ = out.write_warning(w.as_str());
+      }
+      for e in id3.errors_slice() {
+        let _ = out.write_error(e.as_str());
+      }
+    }
+    if meta.has_format_error() {
+      let _ = out.write_warning("Format error in FLAC file");
+    }
+    for item in meta.vorbis_items() {
+      if item.is_picture_recursion_warning() {
+        let _ = out.write_warning("Picture pointer references previous VorbisComment directory");
+      }
+    }
   }
 
   #[test]
@@ -2105,13 +2314,13 @@ mod tests {
 
   #[test]
   fn bridge_picture_block_emits_all_subfields() {
-    // Order is preserved by the typed `serialize_tags` -> `TagMap` entries
-    // (the JSON object loses key order).
+    // Order is preserved by the golden engine -> `TagMap` entries (the JSON
+    // object loses key order).
     let data = fixture("FLAC_picture.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    emit_via_engine(&meta, true, &mut tm);
     let names: Vec<&str> = tm
       .entries()
       .iter()
@@ -2185,7 +2394,7 @@ mod tests {
     );
   }
 
-  // ---------- serialize_tags via TagMap ----------------------------------
+  // ---------- golden-pattern emission via TagMap -------------------------
 
   #[test]
   fn sink_into_map_writer_emits_streaminfo_tags() {
@@ -2193,7 +2402,7 @@ mod tests {
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     let g = |n: &str| w.get("FLAC", n).cloned();
     assert!(g("BlockSizeMin").is_some());
     assert!(g("Channels").is_some());
@@ -2202,11 +2411,10 @@ mod tests {
     assert!(w.get("Vorbis", "Vendor").is_some());
   }
 
-  /// Codex CF2: the typed `serialize_tags` coalesces repeated Vorbis
-  /// List=>1 entries (ARTIST/PERFORMER/CONTACT) into a single
-  /// first-occurrence-position `TagValue::List` via
-  /// `TagMap::write_str_list`, so a `TagMap` consumer builds
-  /// a JSON array instead of last-write-wins.
+  /// Codex CF2: the golden engine coalesces repeated Vorbis List=>1 entries
+  /// (ARTIST/PERFORMER/CONTACT) into a single first-occurrence-position
+  /// `TagValue::List`, so a `TagMap` consumer builds a JSON array instead of
+  /// last-write-wins.
   #[test]
   fn sink_list_coalesces_repeated_artist_via_json_writer() {
     // Two ARTIST entries (listable) plus a non-listable TITLE between
@@ -2223,7 +2431,7 @@ mod tests {
       id3: None,
     };
     let mut md = TagMap::new();
-    meta.serialize_tags(true, &mut md).unwrap();
+    emit_via_engine(&meta, true, &mut md);
     // One Artist tag carrying a 2-element list (not two scalars).
     match md.get("Vorbis", "Artist") {
       Some(TagValue::List(items)) => {
@@ -2352,5 +2560,203 @@ mod tests {
     // trait bound holds without needing to construct a value.
     fn assert_error<E: core::error::Error>() {}
     assert_error::<Error>();
+  }
+
+  // ---------- Golden-pattern `Taggable` / `Project` ----------------------
+
+  /// `Taggable::tags(-j)` yields the StreamInfo set (no PrintConv) through
+  /// `run_emission`: SampleRate/Channels/BitsPerSample/TotalSamples are raw
+  /// numerics, MD5Signature is the lowercase-hex string.
+  #[test]
+  fn taggable_emits_streaminfo_print_conv() {
+    let data = fixture("FLAC.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(w.get_str("FLAC", "SampleRate"), Some("8000".to_string()));
+    assert_eq!(w.get_str("FLAC", "Channels"), Some("2".to_string()));
+    assert_eq!(w.get_str("FLAC", "BitsPerSample"), Some("8".to_string()));
+    assert_eq!(w.get_str("FLAC", "TotalSamples"), Some("0".to_string()));
+    assert_eq!(
+      w.get_str("FLAC", "MD5Signature"),
+      Some("d41d8cd98f00b204e9800998ecf8427e".to_string())
+    );
+    // A single (non-listable) Vorbis field stays a plain scalar.
+    assert_eq!(
+      w.get_str("Vorbis", "Title"),
+      Some("ExifTool test".to_string())
+    );
+    assert_eq!(
+      w.get_str("Vorbis", "Vendor"),
+      Some("reference libFLAC 1.1.2 20050205".to_string())
+    );
+  }
+
+  /// `Taggable::tags` reproduces the Vorbis `List => 1` coalesce as ONE
+  /// `EmittedTag` carrying a `TagValue::List` (multi-artist fixture), driven
+  /// through `run_emission` — the `-n` value is identical (no PrintConv on
+  /// Vorbis fields).
+  #[test]
+  fn taggable_emits_vorbis_multi_artist_list() {
+    let data = fixture("FLAC_multi_artist.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let mut w = TagMap::new();
+      crate::emit::run_emission(&meta, mode, &mut w);
+      match w.get("Vorbis", "Artist") {
+        Some(TagValue::List(items)) => {
+          assert_eq!(items.len(), 2, "mode={mode:?}");
+          assert!(matches!(&items[0], TagValue::Str(s) if s == "Alice"));
+          assert!(matches!(&items[1], TagValue::Str(s) if s == "Bob"));
+        }
+        other => panic!("expected coalesced Artist List, got {other:?} (mode={mode:?})"),
+      }
+    }
+  }
+
+  /// `Taggable::tags(-j)` renders the Picture block: PictureType resolves via
+  /// the PrintConv hash ("Front Cover"), and the Picture binary is a
+  /// `TagValue::Bytes`. `-n` emits the raw numeric PictureType.
+  #[test]
+  fn taggable_emits_picture_tags() {
+    let data = fixture("FLAC_picture.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    // -j: PrintConv name + binary bytes.
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(
+      w.get_str("FLAC", "PictureType"),
+      Some("Front Cover".to_string())
+    );
+    assert!(matches!(w.get("FLAC", "Picture"), Some(TagValue::Bytes(_))));
+    // -n: raw numeric PictureType (3 = Front Cover).
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    assert_eq!(wn.get_str("FLAC", "PictureType"), Some("3".to_string()));
+  }
+
+  /// Group identity: StreamInfo + Picture tags carry family-0/1 `"FLAC"`,
+  /// Vorbis comments `"Vorbis"`, and `Composite:Duration` `"Composite"`
+  /// (each sub-table group0 == group1). Every tag is known ⇒ `!unknown`.
+  #[test]
+  fn taggable_group_family0_and_family1_per_subtable() {
+    let data = fixture("FLAC_duration.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty());
+    let mut saw_flac = false;
+    let mut saw_vorbis = false;
+    let mut saw_composite = false;
+    for t in &tags {
+      let g = t.tag().group_ref();
+      // family-0 always equals family-1 across FLAC's sub-tables.
+      assert_eq!(g.family0(), g.family1(), "tag {}", t.tag().name());
+      assert!(!t.unknown());
+      match g.family1() {
+        "FLAC" => saw_flac = true,
+        "Vorbis" => saw_vorbis = true,
+        "Composite" => saw_composite = true,
+        other => panic!("unexpected FLAC group {other:?} for {}", t.tag().name()),
+      }
+    }
+    assert!(saw_flac, "StreamInfo FLAC:* tags present");
+    assert!(saw_vorbis, "Vorbis:* tags present");
+    assert!(saw_composite, "Composite:Duration present");
+  }
+
+  /// `Composite:Duration` (FLAC.pm:137-149): `-j` is `ConvertDuration`
+  /// ("0:00:30"), `-n` is the raw f64 (30.0).
+  #[test]
+  fn taggable_emits_composite_duration() {
+    let data = fixture("FLAC_duration.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(
+      w.get_str("Composite", "Duration"),
+      Some("0:00:30".to_string())
+    );
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == 30.0));
+  }
+
+  /// An ID3-prefixed FLAC (the `FLAC_id3_prefix.flac` fixture) splices the
+  /// chained ID3 tags FIRST inside `tags()` — proving the `id3.tags(mode)`
+  /// position matches the retired `id3.serialize_tags` call site (BEFORE the
+  /// FLAC body). `File:ID3Size` precedes `FLAC:SampleRate`.
+  #[test]
+  #[cfg(feature = "id3")]
+  fn taggable_chains_id3_before_flac_body() {
+    let data = fixture("FLAC_id3_prefix.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
+    let names: Vec<String> = meta
+      .tags(ConvMode::PrintConv)
+      .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
+      .collect();
+    let id3_pos = names
+      .iter()
+      .position(|n| n.starts_with("ID3v2") || n == "File:ID3Size")
+      .expect("an ID3 tag is spliced");
+    let flac_pos = names
+      .iter()
+      .position(|n| n == "FLAC:SampleRate")
+      .expect("FLAC:SampleRate emitted");
+    assert!(
+      id3_pos < flac_pos,
+      "ID3 tags must precede the FLAC body (id3_pos={id3_pos}, flac_pos={flac_pos}): {names:?}"
+    );
+    // Driven through the engine arm, both the ID3 prefix and the FLAC body land.
+    let mut w = TagMap::new();
+    emit_via_engine(&meta, true, &mut w);
+    assert_eq!(w.get_str("FLAC", "SampleRate"), Some("8000".to_string()));
+    assert!(
+      w.entries()
+        .iter()
+        .any(|(k, _)| k.starts_with("ID3v2") || k == "File:ID3Size"),
+      "ID3 tags present in the engine output"
+    );
+  }
+
+  /// `Project` reports FLAC as audio-only (one `TrackKind::Audio`) and folds
+  /// the FLAC.pm:137-149 `Composite:Duration` (`TotalSamples / SampleRate`)
+  /// into `MediaInfo`. No camera / lens / GPS / capture / dimensions.
+  #[test]
+  fn project_is_audio_with_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let data = fixture("FLAC_duration.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let md = Project::project(&meta);
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert_eq!(md.media().duration(), Some(Duration::from_secs(30)));
+    assert!(md.media().width().is_none());
+    assert!(md.media().height().is_none());
+    assert!(md.camera().is_none());
+    assert!(md.lens().is_none());
+    assert!(md.gps().is_none());
+    assert!(md.capture().is_none());
+  }
+
+  /// `Project` on a FLAC with no usable `TotalSamples`/`SampleRate` leaves
+  /// duration `None` (still audio-only) — matches [`Meta::duration`].
+  #[test]
+  fn project_no_duration_when_streaminfo_lacks_samples() {
+    use crate::metadata::{Project, TrackKind};
+    // FLAC.flac has TotalSamples == 0 ⇒ duration() is None.
+    let data = fixture("FLAC.flac");
+    let mut shared = crate::format_parser::SharedFlags::new();
+    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    assert!(meta.duration().is_none());
+    let md = Project::project(&meta);
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(md.media().duration().is_none());
   }
 }

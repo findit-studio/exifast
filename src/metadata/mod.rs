@@ -22,7 +22,11 @@
 //! deliberately extensible.
 
 mod domain;
+pub mod project;
 mod quicktime;
 
-pub use domain::{CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata};
+pub use domain::{
+  CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
+};
+pub use project::Project;
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};

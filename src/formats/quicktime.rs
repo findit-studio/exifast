@@ -1389,6 +1389,18 @@ impl Meta<'_> {
     self.mime
   }
 
+  /// The FIRST `ProcessMOV` warning, if any — surfaced by the
+  /// [`AnyMeta::QuickTime`](crate::format_parser) emission arm as the
+  /// document-level `ExifTool:Warning` (the `Taggable` stream has no warning
+  /// channel; R6/F2, QuickTime.pm:10242/10590). A header-valid but
+  /// payload-overrunning recognized first atom is still accepted as QuickTime,
+  /// then stops the walk with this warning.
+  #[must_use]
+  #[inline(always)]
+  pub fn warning(&self) -> Option<&str> {
+    self.warning.as_deref()
+  }
+
   /// Build the normalized [`crate::metadata::MediaMetadata`] projection from
   /// this faithful-parse layer. SP1 populates only the `MediaInfo` basics
   /// (duration / dimensions / created / track kinds); camera / lens / GPS /
@@ -1770,75 +1782,122 @@ fn is_known_top_level(t: &[u8; 4]) -> bool {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path (replaces `serialize_tags`)
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit `QuickTime:*` / `Track<N>:*` tags into the inline tag sink. Tag
-  /// order mirrors ExifTool's atom-walk order (mvhd fields, then per-track
-  /// fields). `print_conv = true` ⇒ PrintConv strings (`-j`); `false` ⇒
-  /// post-ValueConv raw scalars (`-n`). Infallible.
-  pub(crate) fn serialize_tags(
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield `QuickTime:*` / `Track<N>:*` tags in ExifTool's atom-walk order
+  /// (mvhd fields, then per-track fields) — the golden-pattern parallel to the
+  /// retired inherent `serialize_tags`: the SINK changes (an
+  /// [`EmittedTag`](crate::emit::EmittedTag) per value instead of `out.write_*`),
+  /// but the per-tag PrintConv/ValueConv branches, the emission ORDER, the
+  /// per-track iteration, the first-wins `Track<N>` dedup, and the
+  /// `CompatibleBrands` list are preserved VERBATIM.
+  ///
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings; `mode == ValueConv`
+  /// (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: family0 = `"QuickTime"` (the `%QuickTime::Main` table group,
+  /// QuickTime.pm:1424) for every emitted tag; family1 is `"QuickTime"` for the
+  /// main/ftyp/mvhd/mdat atoms and the per-`moov` `Track<N>` string for the
+  /// track atoms (QuickTime.pm:1427 `1 => 'Track#'`). Every QuickTime SP1 tag
+  /// is a known table key (no `Unknown => 1`) ⇒ `unknown: false`.
+  ///
+  /// The `ProcessMOV` warning (`Meta::warning`) is NOT part of this stream —
+  /// `run_emission` has no warning channel; the `AnyMeta::QuickTime` arm drains
+  /// [`Meta::warning`] into `out.write_warning` (R6/F2).
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "QuickTime";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
 
-    // ── diagnostics ────────────────────────────────────────────────────
-    // R6/F2: a `ProcessMOV` `Truncated '...' data` warning surfaces as the
-    // document-level `ExifTool:Warning` (parser.rs lifts `first_warning`).
-    if let Some(w) = &self.warning {
-      out.write_warning(w)?;
-    }
+    // family0/family1 = "QuickTime" for the main/ftyp/mvhd/mdat atoms (see
+    // fn docs). Track atoms compute their own family1 below.
+    let main = || Group::new("QuickTime", "QuickTime");
+    // `-j` (PrintConv) vs `-n` (ValueConv) maps to the `print_conv` bool the
+    // retired `serialize_tags` threaded.
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
 
     // ── ftyp ───────────────────────────────────────────────────────────
     if let Some(brand) = self.qt.major_brand() {
       // MajorBrand PrintConv `%ftypLookup` (QuickTime.pm:1036-1038); a hash
       // miss yields `Unknown ($val)` (ExifTool.pm:3622). -n emits the raw
       // 4-byte brand string.
-      if print_conv {
+      let value = if print_conv {
         match ftyp_lookup(brand) {
-          Some(desc) => out.write_str(GROUP, "MajorBrand", desc)?,
-          None => out.write_fmt(GROUP, "MajorBrand", |w| {
-            w.write_str("Unknown (")?;
-            w.write_str(brand)?;
-            w.write_str(")")
-          })?,
+          Some(desc) => TagValue::Str(desc.into()),
+          None => TagValue::Str(std::format!("Unknown ({brand})").into()),
         }
       } else {
-        out.write_str(GROUP, "MajorBrand", brand)?;
-      }
+        TagValue::Str(brand.into())
+      };
+      tags.push(EmittedTag::new(main(), "MajorBrand".into(), value, false));
     }
     if let Some(mv) = self.qt.minor_version() {
       // MinorVersion: ValueConv only, no PrintConv (QuickTime.pm:1040-1044).
-      out.write_str(GROUP, "MinorVersion", mv)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "MinorVersion".into(),
+        TagValue::Str(mv.into()),
+        false,
+      ));
     }
     if !self.qt.compatible_brands().is_empty() {
-      // CompatibleBrands List (QuickTime.pm:1045-1051).
-      let brands: std::vec::Vec<&str> = self
+      // CompatibleBrands List (QuickTime.pm:1045-1051). One EmittedTag carrying
+      // a `TagValue::List` of the per-brand `TagValue::Str` (byte-identical to
+      // the retired `out.write_str_list` — see `TagMap::write_str_list`).
+      let items: std::vec::Vec<TagValue> = self
         .qt
         .compatible_brands()
         .iter()
-        .map(String::as_str)
+        .map(|b| TagValue::Str(b.as_str().into()))
         .collect();
-      out.write_str_list(GROUP, "CompatibleBrands", &brands)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "CompatibleBrands".into(),
+        TagValue::List(items),
+        false,
+      ));
     }
 
     // ── mvhd ───────────────────────────────────────────────────────────
     if let Some(v) = self.qt.movie_header_version() {
-      out.write_u64(GROUP, "MovieHeaderVersion", u64::from(v))?;
+      tags.push(EmittedTag::new(
+        main(),
+        "MovieHeaderVersion".into(),
+        TagValue::U64(u64::from(v)),
+        false,
+      ));
     }
     if let Some(d) = self.qt.create_date() {
-      out.write_str(GROUP, "CreateDate", d)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "CreateDate".into(),
+        TagValue::Str(d.into()),
+        false,
+      ));
     }
     if let Some(d) = self.qt.modify_date() {
-      out.write_str(GROUP, "ModifyDate", d)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "ModifyDate".into(),
+        TagValue::Str(d.into()),
+        false,
+      ));
     }
     let movie_ts = self.qt.time_scale();
     if let Some(ts) = movie_ts {
-      out.write_u64(GROUP, "TimeScale", u64::from(ts))?;
+      tags.push(EmittedTag::new(
+        main(),
+        "TimeScale".into(),
+        TagValue::U64(u64::from(ts)),
+        false,
+      ));
     }
     // R6/F1: the mvhd `%durationInfo` tags store RAW timescale-counts; the
     // ValueConv `$$self{TimeScale} ? $val / $$self{TimeScale} : $val` is
@@ -1846,18 +1905,38 @@ impl Meta<'_> {
     // across every `mvhd` in the file) — see `durationinfo_value_conv`.
     if let Some(count) = self.qt.duration_count() {
       let secs = durationinfo_value_conv(count, movie_ts);
-      write_duration(out, GROUP, "Duration", secs, movie_ts, print_conv)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "Duration".into(),
+        duration_value(secs, movie_ts, print_conv),
+        false,
+      ));
     }
     if let Some(r) = self.qt.preferred_rate() {
       // PreferredRate: ValueConv `$val / 0x10000`, no PrintConv.
-      out.write_f64(GROUP, "PreferredRate", r)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "PreferredRate".into(),
+        TagValue::F64(r),
+        false,
+      ));
     }
     if let Some(v) = self.qt.preferred_volume() {
       // PreferredVolume PrintConv `sprintf("%.2f%%", $val * 100)`.
-      write_volume(out, GROUP, "PreferredVolume", v, print_conv)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "PreferredVolume".into(),
+        volume_value(v, print_conv),
+        false,
+      ));
     }
     if let Some(m) = self.qt.matrix_structure() {
-      out.write_str(GROUP, "MatrixStructure", m)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "MatrixStructure".into(),
+        TagValue::Str(m.into()),
+        false,
+      ));
     }
     // The Preview/Poster/Selection/Current `%durationInfo` counts (idx18-23).
     for (count, name) in [
@@ -1870,19 +1949,39 @@ impl Meta<'_> {
     ] {
       if let Some(c) = count {
         let secs = durationinfo_value_conv(u64::from(c), movie_ts);
-        write_duration(out, GROUP, name, secs, movie_ts, print_conv)?;
+        tags.push(EmittedTag::new(
+          main(),
+          name.into(),
+          duration_value(secs, movie_ts, print_conv),
+          false,
+        ));
       }
     }
     if let Some(id) = self.qt.next_track_id() {
-      out.write_u64(GROUP, "NextTrackID", u64::from(id))?;
+      tags.push(EmittedTag::new(
+        main(),
+        "NextTrackID".into(),
+        TagValue::U64(u64::from(id)),
+        false,
+      ));
     }
 
     // ── mdat (synthetic) ───────────────────────────────────────────────
     if let Some(sz) = self.qt.media_data_size() {
-      out.write_u64(GROUP, "MediaDataSize", sz)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "MediaDataSize".into(),
+        TagValue::U64(sz),
+        false,
+      ));
     }
     if let Some(off) = self.qt.media_data_offset() {
-      out.write_u64(GROUP, "MediaDataOffset", off)?;
+      tags.push(EmittedTag::new(
+        main(),
+        "MediaDataOffset".into(),
+        TagValue::U64(off),
+        false,
+      ));
     }
 
     // ── per-track (tkhd / mdhd / hdlr) ─────────────────────────────────
@@ -1899,15 +1998,16 @@ impl Meta<'_> {
     // `mdhd`/`hdlr` (MediaTimeScale, MediaDuration, HandlerType, …) BOTH appear.
     // Only a tag already emitted under that exact `Track<N>:Name` key is dropped.
     //
-    // The TagMap sink is LAST-wins in place, so we cannot rely on it for
-    // first-wins; we suppress duplicates HERE per full `(group, name)` key. We
-    // serialize EVERY track using its stored `Track<N>` group, recording each
-    // emitted key in `emitted_keys` so a later same-group track contributes only
-    // its NOVEL tags. `Vec<SmolStr>` of `"Track<N>:Name"` keys (counts are tiny).
+    // The `run_emission` sink (TagMap) is LAST-wins in place, so we cannot rely
+    // on it for first-wins; we suppress duplicates HERE per full `(group, name)`
+    // key — only the NOVEL tags reach the `Vec<EmittedTag>`. We walk EVERY track
+    // using its stored `Track<N>` group, recording each emitted key in
+    // `emitted_keys` so a later same-group track contributes only its novel
+    // tags. `Vec<SmolStr>` of `"Track<N>:Name"` keys (counts are tiny).
     let mut emitted_keys: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
     // First-wins gate: `true` (and records the key) only the FIRST time a
     // `(grp, name)` pair is seen; a repeat returns `false` so the caller skips
-    // the emission, leaving the earlier value in place (ExifTool.pm:2950-2951).
+    // the push, leaving the earlier value in place (ExifTool.pm:2950-2951).
     let mut first_seen = |grp: &str, name: &str| -> bool {
       let key = smol_str::SmolStr::new(std::format!("{grp}:{name}"));
       if emitted_keys.contains(&key) {
@@ -1920,8 +2020,11 @@ impl Meta<'_> {
       // Fall back to the 1-based Vec index only for tracks built directly in
       // unit tests (no `track_group` recorded).
       let group_num = track.track_group().unwrap_or((idx + 1) as u32);
-      let grp = alloc_track_group(group_num as usize);
-      let grp = grp.as_str();
+      let grp_owned = alloc_track_group(group_num as usize);
+      let grp = grp_owned.as_str();
+      // The per-track family1 is the computed `Track<N>` string; family0 stays
+      // "QuickTime" (the `%QuickTime::Main` table group).
+      let track_group = || Group::new("QuickTime", grp);
       // R7/F2: a `Truncated '...' data` warning raised inside this `trak`'s
       // walk (a header-valid but payload-overrunning tkhd / mdhd) surfaces
       // under this track's family-1 group — ExifTool attaches the warning to
@@ -1929,7 +2032,12 @@ impl Meta<'_> {
       if let Some(w) = track.warning()
         && first_seen(grp, "Warning")
       {
-        out.write_str(grp, "Warning", w)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "Warning".into(),
+          TagValue::Str(w.into()),
+          false,
+        ));
       }
       // Each emission is a `let Some(..)` value-presence test let-chained with
       // the `first_seen` first-wins gate: the gate's side effect (recording the
@@ -1938,81 +2046,156 @@ impl Meta<'_> {
       if let Some(v) = track.track_header_version()
         && first_seen(grp, "TrackHeaderVersion")
       {
-        out.write_u64(grp, "TrackHeaderVersion", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackHeaderVersion".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(d) = track.track_create_date()
         && first_seen(grp, "TrackCreateDate")
       {
-        out.write_str(grp, "TrackCreateDate", d)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackCreateDate".into(),
+          TagValue::Str(d.into()),
+          false,
+        ));
       }
       if let Some(d) = track.track_modify_date()
         && first_seen(grp, "TrackModifyDate")
       {
-        out.write_str(grp, "TrackModifyDate", d)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackModifyDate".into(),
+          TagValue::Str(d.into()),
+          false,
+        ));
       }
       if let Some(id) = track.track_id()
         && first_seen(grp, "TrackID")
       {
-        out.write_u64(grp, "TrackID", u64::from(id))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackID".into(),
+          TagValue::U64(u64::from(id)),
+          false,
+        ));
       }
       if let Some(secs) = track.duration_seconds()
         && first_seen(grp, "TrackDuration")
       {
         // TrackDuration durationInfo uses the MOVIE TimeScale.
-        write_duration(out, grp, "TrackDuration", secs, movie_ts, print_conv)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackDuration".into(),
+          duration_value(secs, movie_ts, print_conv),
+          false,
+        ));
       }
       if let Some(l) = track.track_layer()
         && first_seen(grp, "TrackLayer")
       {
-        out.write_u64(grp, "TrackLayer", u64::from(l))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackLayer".into(),
+          TagValue::U64(u64::from(l)),
+          false,
+        ));
       }
       if let Some(v) = track.track_volume()
         && first_seen(grp, "TrackVolume")
       {
-        write_volume(out, grp, "TrackVolume", v, print_conv)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "TrackVolume".into(),
+          volume_value(v, print_conv),
+          false,
+        ));
       }
       if let Some(m) = track.matrix_structure()
         && first_seen(grp, "MatrixStructure")
       {
-        out.write_str(grp, "MatrixStructure", m)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MatrixStructure".into(),
+          TagValue::Str(m.into()),
+          false,
+        ));
       }
       if let Some(w) = track.image_width()
         && first_seen(grp, "ImageWidth")
       {
-        out.write_u64(grp, "ImageWidth", u64::from(w))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "ImageWidth".into(),
+          TagValue::U64(u64::from(w)),
+          false,
+        ));
       }
       if let Some(h) = track.image_height()
         && first_seen(grp, "ImageHeight")
       {
-        out.write_u64(grp, "ImageHeight", u64::from(h))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "ImageHeight".into(),
+          TagValue::U64(u64::from(h)),
+          false,
+        ));
       }
       if let Some(v) = track.media_header_version()
         && first_seen(grp, "MediaHeaderVersion")
       {
-        out.write_u64(grp, "MediaHeaderVersion", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaHeaderVersion".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(d) = track.media_create_date()
         && first_seen(grp, "MediaCreateDate")
       {
-        out.write_str(grp, "MediaCreateDate", d)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaCreateDate".into(),
+          TagValue::Str(d.into()),
+          false,
+        ));
       }
       if let Some(d) = track.media_modify_date()
         && first_seen(grp, "MediaModifyDate")
       {
-        out.write_str(grp, "MediaModifyDate", d)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaModifyDate".into(),
+          TagValue::Str(d.into()),
+          false,
+        ));
       }
       let media_ts = track.media_time_scale();
       if let Some(ts) = media_ts
         && first_seen(grp, "MediaTimeScale")
       {
-        out.write_u64(grp, "MediaTimeScale", u64::from(ts))?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaTimeScale".into(),
+          TagValue::U64(u64::from(ts)),
+          false,
+        ));
       }
       if let Some(secs) = track.media_duration_seconds()
         && first_seen(grp, "MediaDuration")
       {
         // MediaDuration durationInfo uses the MEDIA TimeScale
         // (QuickTime.pm:7270-7271 `$$self{MediaTS}`).
-        write_duration(out, grp, "MediaDuration", secs, media_ts, print_conv)?;
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaDuration".into(),
+          duration_value(secs, media_ts, print_conv),
+          false,
+        ));
       }
       if let Some(lang) = track.media_language()
         && first_seen(grp, "MediaLanguageCode")
@@ -2021,84 +2204,97 @@ impl Meta<'_> {
         // (Macintosh) value gets the ttLang{Macintosh} PrintConv with an
         // `Unknown ($val)` fallback (QuickTime.pm:7281-7285, F4). -n emits
         // the post-ValueConv raw string (the bare number or 3-letter code).
-        if print_conv {
-          out.write_fmt(grp, "MediaLanguageCode", |w| {
-            w.write_str(&mac_language_print(lang))
-          })?;
+        let value = if print_conv {
+          TagValue::Str(mac_language_print(lang).into())
         } else {
-          out.write_str(grp, "MediaLanguageCode", lang)?;
-        }
+          TagValue::Str(lang.into())
+        };
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MediaLanguageCode".into(),
+          value,
+          false,
+        ));
       }
       if let Some(code) = track.handler_code()
         && first_seen(grp, "HandlerType")
       {
         // HandlerType: the flat tag is driven by the RAW 4-byte code (F3).
-        if print_conv {
+        let value = if print_conv {
           // hdlr HandlerType PrintConv (QuickTime.pm:8418-8444); a hash miss
           // yields `Unknown ($val)` (ExifTool.pm:3622).
           let printed = handler_type_print(code);
           if printed.is_empty() {
-            out.write_fmt(grp, "HandlerType", |w| {
-              w.write_str("Unknown (")?;
-              w.write_str(code)?;
-              w.write_str(")")
-            })?;
+            TagValue::Str(std::format!("Unknown ({code})").into())
           } else {
-            out.write_str(grp, "HandlerType", printed)?;
+            TagValue::Str(printed.into())
           }
         } else {
           // -n: the raw post-RawConv value is the 4-char code string.
-          out.write_str(grp, "HandlerType", code)?;
-        }
+          TagValue::Str(code.into())
+        };
+        tags.push(EmittedTag::new(
+          track_group(),
+          "HandlerType".into(),
+          value,
+          false,
+        ));
       }
     }
-    Ok(())
+    tags.into_iter()
   }
 }
 
-/// Emit a `%durationInfo` tag: PrintConv `$$self{TimeScale} ?
-/// ConvertDuration($val) : $val` (QuickTime.pm:315); -n emits the raw
+/// Build a `%durationInfo` tag value: PrintConv `$$self{TimeScale} ?
+/// ConvertDuration($val) : $val` (QuickTime.pm:315); -n yields the raw
 /// post-ValueConv float seconds. The PrintConv gate is on the TimeScale's
 /// TRUTHINESS, not merely its presence — a `TimeScale == 0` is falsy in Perl,
 /// so the PrintConv yields the bare value `$val` (which the matching
 /// ValueConv `$$self{TimeScale} ? $val/$$self{TimeScale} : $val` already left
 /// as the raw count). So only a `Some(ts)` with `ts != 0` runs ConvertDuration
-/// (F3); a `None` or `Some(0)` TimeScale emits the bare float.
+/// (F3); a `None` or `Some(0)` TimeScale yields the bare float
+/// ([`TagValue::F64`], byte-identical to the retired `write_f64`).
 #[cfg(feature = "alloc")]
-fn write_duration(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  secs: f64,
-  timescale: Option<u32>,
-  print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+fn duration_value(secs: f64, timescale: Option<u32>, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
   // QuickTime.pm:315 `$$self{TimeScale} ? ...` — a zero TimeScale is falsy.
   let truthy_ts = matches!(timescale, Some(ts) if ts != 0);
   if print_conv && truthy_ts {
-    out.write_fmt(group, name, |w| w.write_str(&convert_duration(secs)))
+    TagValue::Str(convert_duration(secs).into())
   } else {
-    out.write_f64(group, name, secs)
+    TagValue::F64(secs)
   }
 }
 
-/// Emit a volume tag: PreferredVolume / TrackVolume PrintConv
-/// `sprintf("%.2f%%", $val * 100)` (QuickTime.pm:1402, 1549); -n emits the
-/// raw post-ValueConv float (`$val / 256`).
+/// Build a volume tag value: PreferredVolume / TrackVolume PrintConv
+/// `sprintf("%.2f%%", $val * 100)` (QuickTime.pm:1402, 1549); -n yields the
+/// raw post-ValueConv float ([`TagValue::F64`], `$val / 256`).
 #[cfg(feature = "alloc")]
-fn write_volume(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  val: f64,
-  print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+fn volume_value(val: f64, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
   if print_conv {
-    out.write_fmt(group, name, |w| {
-      w.write_str(&format!("{:.2}%", val * 100.0))
-    })
+    TagValue::Str(format!("{:.2}%", val * 100.0).into())
   } else {
-    out.write_f64(group, name, val)
+    TagValue::F64(val)
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project QuickTime metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain by reusing the
+  /// existing [`MediaMetadata::from_quicktime`](crate::metadata::MediaMetadata::from_quicktime)
+  /// builder (the single extensible projection seam) against this `Meta`'s
+  /// wrapped [`QuickTimeMeta`]. SP1 populates only the `MediaInfo` basics
+  /// (duration / dimensions / created / track kinds); camera / lens / GPS /
+  /// capture stay `None` for SP2+ to fill. Identical to the pre-existing
+  /// [`Meta::media_metadata`] convenience accessor.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    crate::metadata::MediaMetadata::from_quicktime(&self.qt)
   }
 }
 
@@ -2135,6 +2331,17 @@ pub enum Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Drive a `Meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for `mode` and return the
+  /// resulting [`TagMap`](crate::tagmap::TagMap) — the production sink path
+  /// (the inherent `serialize_tags` was retired in favor of `Taggable`).
+  #[cfg(feature = "alloc")]
+  fn emit_into_tagmap(meta: &Meta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(meta, mode, &mut w);
+    w
+  }
 
   /// Build a 4-byte-size + type atom around `body`.
   fn atom(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -3274,11 +3481,12 @@ mod tests {
     assert_eq!(tracks[0].track_id(), Some(1));
     assert_eq!(tracks[1].track_id(), Some(2));
 
-    // Default JSON: serialize into the TagMap. BOTH traks emit `Track1:*`; the
-    // FIRST moov's `Track1:TrackID` survives at its first-occurrence position
-    // (matching bundled `Track1:TrackID = 1`), and NO `Track2` group exists.
-    let mut map = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut map).expect("infallible");
+    // Default JSON: drive the golden engine into the TagMap. BOTH traks emit
+    // `Track1:*`; the FIRST moov's `Track1:TrackID` survives at its
+    // first-occurrence position (matching bundled `Track1:TrackID = 1`) because
+    // the `Taggable` first-wins gate suppresses the second moov's duplicate
+    // before it reaches the sink, and NO `Track2` group exists.
+    let map = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
     assert_eq!(
       map.get_str("Track1", "TrackID").as_deref(),
       Some("1"),
@@ -3305,32 +3513,25 @@ mod tests {
   }
 
   #[test]
-  fn write_duration_zero_timescale_emits_bare_value() {
+  fn duration_value_zero_timescale_emits_bare_value() {
     // F3: a zero TimeScale is falsy in the durationInfo PrintConv gate, so the
-    // duration emits the bare raw value (here 1200.0) even in print_conv mode.
-    use crate::tagmap::TagMap;
-    let mut out = TagMap::new();
-    write_duration(&mut out, "QuickTime", "Duration", 1200.0, Some(0), true).expect("infallible");
+    // duration value is the bare raw float (here 1200.0) even in print_conv
+    // mode — `TagValue::F64`, NOT a ConvertDuration string.
+    use crate::value::TagValue;
+    assert_eq!(duration_value(1200.0, Some(0), true), TagValue::F64(1200.0));
+    // A non-zero TimeScale runs ConvertDuration in print_conv mode (a Str).
     assert_eq!(
-      out.get_str("QuickTime", "Duration"),
-      Some("1200".to_string())
+      duration_value(2.0, Some(600), true),
+      TagValue::Str(convert_duration(2.0).into())
     );
-    // A non-zero TimeScale runs ConvertDuration in print_conv mode (the bare
-    // "2" would be the un-converted value — confirm it differs).
-    let mut out2 = TagMap::new();
-    write_duration(&mut out2, "QuickTime", "Duration", 2.0, Some(600), true).expect("infallible");
-    assert_eq!(
-      out2.get_str("QuickTime", "Duration"),
-      Some(convert_duration(2.0))
+    assert_ne!(
+      duration_value(2.0, Some(600), true),
+      TagValue::Str("2".into())
     );
-    assert_ne!(out2.get_str("QuickTime", "Duration"), Some("2".to_string()));
     // A None TimeScale (no mvhd TimeScale at all) also emits the bare value.
-    let mut out3 = TagMap::new();
-    write_duration(&mut out3, "QuickTime", "Duration", 42.0, None, true).expect("infallible");
-    assert_eq!(
-      out3.get_str("QuickTime", "Duration"),
-      Some("42".to_string())
-    );
+    assert_eq!(duration_value(42.0, None, true), TagValue::F64(42.0));
+    // `-n` (print_conv=false) is always the bare float regardless of TimeScale.
+    assert_eq!(duration_value(2.0, Some(600), false), TagValue::F64(2.0));
   }
 
   #[test]
@@ -3344,5 +3545,199 @@ mod tests {
     assert_eq!(track.handler_code(), Some("mdta"));
     // The normalized projection kind is still Metadata (for MediaMetadata).
     assert!(track.handler().expect("kind").is_metadata());
+  }
+
+  // ---------- golden-pattern `Taggable` / `Project` surface --------------
+
+  /// Parse the `QuickTime_sp1.mov` fixture (a two-track MOV: a 1920×1080 video
+  /// track + an audio track, 30 s, `qt  ` major brand) through the production
+  /// entry point — the shared input for the golden-pattern tests below.
+  fn sp1_meta() -> Meta<'static> {
+    let bytes = std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/QuickTime_sp1.mov"),
+    )
+    .expect("read QuickTime_sp1.mov fixture");
+    // `Meta` owns its data (phantom `'a`); leak the buffer so the returned
+    // `Meta` is `'static` for the test helper (the process exits after tests).
+    let leaked: &'static [u8] = std::boxed::Box::leak(bytes.into_boxed_slice());
+    parse_borrowed(leaked).expect("ok").expect("parsed")
+  }
+
+  #[test]
+  fn taggable_emits_main_atoms_printconv() {
+    // `-j`: representative ftyp/mvhd/mdat atoms render their PrintConv forms,
+    // byte-identical to the `QuickTime_sp1.mov.json` golden.
+    let meta = sp1_meta();
+    let w = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    // MajorBrand %ftypLookup PrintConv (qt  ⇒ the Apple description).
+    assert_eq!(
+      w.get_str("QuickTime", "MajorBrand").as_deref(),
+      Some("Apple QuickTime (.MOV/QT)")
+    );
+    assert_eq!(
+      w.get_str("QuickTime", "MinorVersion").as_deref(),
+      Some("0.2.0")
+    );
+    // Duration durationInfo PrintConv (ConvertDuration vs the 600 TimeScale).
+    assert_eq!(
+      w.get_str("QuickTime", "Duration").as_deref(),
+      Some("0:00:30")
+    );
+    // PreferredVolume PrintConv sprintf("%.2f%%", $val*100).
+    assert_eq!(
+      w.get_str("QuickTime", "PreferredVolume").as_deref(),
+      Some("100.00%")
+    );
+    assert_eq!(w.get_str("QuickTime", "TimeScale").as_deref(), Some("600"));
+    assert_eq!(
+      w.get_str("QuickTime", "MediaDataSize").as_deref(),
+      Some("16")
+    );
+  }
+
+  #[test]
+  fn taggable_emits_compatible_brands_list() {
+    // The CompatibleBrands List tag is ONE EmittedTag carrying a
+    // `TagValue::List` of per-brand `TagValue::Str` (byte-identical to the
+    // retired `write_str_list`) — identical under `-j` and `-n`.
+    use crate::emit::{ConvMode, Taggable};
+    use crate::value::TagValue;
+    let meta = sp1_meta();
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let list = meta
+        .tags(mode)
+        .find(|t| t.tag().name() == "CompatibleBrands")
+        .expect("CompatibleBrands emitted");
+      assert_eq!(
+        list.tag().value_ref(),
+        &TagValue::List(std::vec![TagValue::Str("qt  ".into())]),
+        "CompatibleBrands is a single List value of the brand strings"
+      );
+      assert_eq!(list.tag().group_ref().family1(), "QuickTime");
+      assert!(!list.unknown());
+    }
+  }
+
+  #[test]
+  fn taggable_emits_raw_values_valueconv() {
+    // `-n`: the SAME atoms render their post-ValueConv raw scalars,
+    // byte-identical to the `QuickTime_sp1.mov.n.json` golden.
+    let meta = sp1_meta();
+    let w = emit_into_tagmap(&meta, crate::emit::ConvMode::ValueConv);
+    // MajorBrand -n is the raw 4-byte brand string (no %ftypLookup).
+    assert_eq!(
+      w.get_str("QuickTime", "MajorBrand").as_deref(),
+      Some("qt  ")
+    );
+    // Duration -n is the bare post-ValueConv float seconds.
+    assert_eq!(w.get_str("QuickTime", "Duration").as_deref(), Some("30"));
+    // PreferredVolume -n is the raw float ($val/256 = 1).
+    assert_eq!(
+      w.get_str("QuickTime", "PreferredVolume").as_deref(),
+      Some("1")
+    );
+    // Per-track HandlerType -n is the raw 4-byte code.
+    assert_eq!(w.get_str("Track1", "HandlerType").as_deref(), Some("vide"));
+    assert_eq!(w.get_str("Track2", "HandlerType").as_deref(), Some("soun"));
+  }
+
+  #[test]
+  fn taggable_emits_per_track_printconv() {
+    // `-j`: the per-track family1 = `Track<N>` group carries the tkhd/mdhd/hdlr
+    // PrintConv values, byte-identical to the golden's `Track1:`/`Track2:` keys.
+    let meta = sp1_meta();
+    let w = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(w.get_str("Track1", "TrackID").as_deref(), Some("1"));
+    assert_eq!(w.get_str("Track1", "ImageWidth").as_deref(), Some("1920"));
+    assert_eq!(w.get_str("Track1", "ImageHeight").as_deref(), Some("1080"));
+    assert_eq!(
+      w.get_str("Track1", "HandlerType").as_deref(),
+      Some("Video Track")
+    );
+    assert_eq!(
+      w.get_str("Track1", "MediaLanguageCode").as_deref(),
+      Some("eng")
+    );
+    assert_eq!(w.get_str("Track2", "TrackID").as_deref(), Some("2"));
+    assert_eq!(
+      w.get_str("Track2", "HandlerType").as_deref(),
+      Some("Audio Track")
+    );
+  }
+
+  #[test]
+  fn taggable_group_family0_quicktime_family1_main_and_track() {
+    // family0 = "QuickTime" for EVERY tag (the %QuickTime::Main table group);
+    // family1 = "QuickTime" for the main/ftyp/mvhd/mdat atoms and "Track<N>"
+    // for the per-track atoms. No tag carries Unknown=>1 in SP1.
+    use crate::emit::{ConvMode, Taggable};
+    let meta = sp1_meta();
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    for t in &tags {
+      assert_eq!(
+        t.tag().group_ref().family0(),
+        "QuickTime",
+        "family0 is the %QuickTime::Main table group for every tag"
+      );
+      assert!(!t.unknown(), "QuickTime SP1 has no Unknown=>1 tags");
+      let f1 = t.tag().group_ref().family1();
+      assert!(
+        f1 == "QuickTime" || f1.starts_with("Track"),
+        "family1 is QuickTime or Track<N>, got {f1:?}"
+      );
+    }
+    // The main atoms (first ones emitted) carry family1 "QuickTime".
+    assert_eq!(tags[0].tag().name(), "MajorBrand");
+    assert_eq!(tags[0].tag().group_ref().family1(), "QuickTime");
+    // At least one Track1 tag exists with family1 "Track1".
+    assert!(
+      tags
+        .iter()
+        .any(|t| t.tag().group_ref().family1() == "Track1"),
+      "the video track emits under family1 Track1"
+    );
+  }
+
+  #[test]
+  fn project_reuses_from_quicktime() {
+    // `Project::project` reuses `MediaMetadata::from_quicktime` against the
+    // wrapped `QuickTimeMeta`: duration (30 s), the primary video track's
+    // dimensions (1920×1080), and BOTH track kinds (video + audio).
+    use crate::metadata::{Project, TrackKind};
+    let meta = sp1_meta();
+    let projected = meta.project();
+    // Identical to the pre-existing `media_metadata` convenience accessor.
+    let via_accessor = meta.media_metadata();
+    assert_eq!(
+      projected.media().duration(),
+      via_accessor.media().duration()
+    );
+    assert_eq!(projected.media().width(), via_accessor.media().width());
+
+    // 30 s movie duration (mvhd Duration 18000 / TimeScale 600).
+    assert_eq!(
+      projected.media().duration(),
+      Some(core::time::Duration::from_secs(30))
+    );
+    // Primary (video) track tkhd dimensions.
+    assert_eq!(projected.media().width(), Some(1920));
+    assert_eq!(projected.media().height(), Some(1080));
+    // mvhd CreateDate.
+    assert_eq!(
+      projected.media().created(),
+      Some("2024:01:02 03:04:05+00:00")
+    );
+    // Both track kinds, in track order (video then audio).
+    assert_eq!(
+      projected.media().track_kinds(),
+      &[TrackKind::Video, TrackKind::Audio]
+    );
+    assert!(projected.media().has_video());
+    assert!(projected.media().has_audio());
+    // SP1 carries no camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

@@ -94,7 +94,6 @@
 //!   set is `#[non_exhaustive]` so they can be added without a breaking
 //!   change when a fixture needs them.
 
-use core::convert::Infallible;
 use smol_str::SmolStr;
 use std::{borrow::Cow, string::String, vec::Vec};
 
@@ -1721,7 +1720,7 @@ fn decode_ref_list(bytes: &[u8], guid_entries: bool) -> RefList {
 
 /// One decoded MXF tag value, post-format-decode but pre-PrintConv. The
 /// PrintConv (Boolean string, `ConvertDuration`, `%componentDataDef` label)
-/// is applied at emit time by [`MxfMeta::serialize_tags`].
+/// is applied at emit time by the [`Taggable`](crate::emit::Taggable) impl.
 ///
 /// `#[non_exhaustive]`, single-field newtype variants only (D8 §2).
 #[derive(Debug, Clone, PartialEq)]
@@ -1817,16 +1816,29 @@ impl MxfValue {
 // §8. Typed entry + Meta — `MxfEntry`, `MxfMeta`
 // ===========================================================================
 
-/// One emitted MXF tag: family-1 group, tag name, decoded value.
+/// One emitted MXF tag: family-1 group, tag name, decoded value, plus the
+/// ExifTool `Unknown => 1` visibility flag.
 ///
 /// D8 convention: no public fields; accessors only. `group` and `name` are
 /// [`SmolStr`] — `group` may be a synthesized `Track<N>` string, `name` is a
 /// static-table `&'static str` that inlines heap-free.
+///
+/// `unknown` carries the ported `Unknown => 1` marker (MXF.pm — InstanceUID /
+/// PackageID / reference-batch rows, auto-`Binary` so suppressed from the
+/// default `-j`/`-n` view). The golden-pattern engine
+/// ([`crate::emit::run_emission`]) performs that suppression centrally
+/// (`ExifTool.pm:9179`), so [`MxfMeta`]'s [`Taggable`](crate::emit::Taggable)
+/// yields EVERY entry with its `unknown` flag set faithfully rather than
+/// pre-filtering. In the current parser the upstream KLV walk only queues
+/// VISIBLE rows (`emit_tag_default` at the `WalkEntry` gate), so every
+/// production [`MxfEntry`] is `unknown == false`; the flag exists so the
+/// engine-suppression contract is expressible (and unit-tested) end-to-end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MxfEntry {
   group: SmolStr,
   name: SmolStr,
   value: MxfValue,
+  unknown: bool,
 }
 
 impl MxfEntry {
@@ -1847,6 +1859,15 @@ impl MxfEntry {
   #[inline(always)]
   pub const fn value_ref(&self) -> &MxfValue {
     &self.value
+  }
+  /// The ExifTool `Unknown => 1` flag — `true` ⇒ suppressed from the default
+  /// output by the emission engine (`ExifTool.pm:9179`). Always `false` for
+  /// production entries (the walk pre-filters unknown rows); see the type
+  /// docs.
+  #[must_use]
+  #[inline(always)]
+  pub const fn unknown(&self) -> bool {
+    self.unknown
   }
 }
 
@@ -2710,6 +2731,9 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
       group: e.group.clone(),
       name: e.name.clone(),
       value: e.value.clone(),
+      // The walk only queued visible (`emit_tag_default`) rows, so every
+      // surviving entry is a default-visible tag.
+      unknown: false,
     });
     // MXF.pm:2960 — `HandleTag($tagTablePtr, '…Duration…', $val)` runs
     // inline right after the kept best-duration `Duration` tag, so the
@@ -2720,6 +2744,7 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
           group: SmolStr::new_static(GROUP_MXF),
           name: SmolStr::new_static("Duration"),
           value: val.clone(),
+          unknown: false,
         });
       }
     }
@@ -2736,51 +2761,73 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
 const GROUP_MXF: &str = "MXF";
 
 // ===========================================================================
-// §18. `serialize_tags` — typed Meta → TagMap
+// §18. `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl MxfMeta<'_> {
-  /// Emit MXF tags into the writer in final order (post dedup + group fixup).
+impl crate::emit::Taggable for MxfMeta<'_> {
+  /// Yield MXF tags in final order (post dedup + group fixup) — the
+  /// golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`), the per-tag PrintConv branches are preserved
+  /// verbatim.
   ///
-  /// `print_conv = true` ⇒ PrintConv strings (`-j` mode):
-  /// `ConvertDuration` for `%duration` tags, `%componentDataDef` label for
-  /// `ComponentDataDefinition`. `print_conv = false` ⇒ post-ValueConv raw
-  /// scalars (`-n` mode).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings: `ConvertDuration` for
+  /// `%duration` tags, `%componentDataDef` label for
+  /// `ComponentDataDefinition`. `mode == ValueConv` (`-n`) ⇒ post-ValueConv
+  /// raw scalars.
+  ///
+  /// Group: `family0` = `"MXF"` (the `%MXF::Main` table group — bundled
+  /// `$$et{SET_GROUP1} = 'MXF'`, MXF.pm:2838 — and the default group0);
+  /// `family1` = `entry.group()` (the per-entry `-G1` key — `"MXF"` or a
+  /// synthesized `"Track<N>"`), byte-identical to the retired sink.
+  ///
+  /// `unknown` is carried PER ENTRY from [`MxfEntry::unknown`]; the engine
+  /// ([`run_emission`](crate::emit::run_emission)) drops `Unknown => 1` tags
+  /// centrally (`ExifTool.pm:9179`). The walk pre-filters unknown rows
+  /// (`emit_tag_default`), so every production entry is visible
+  /// (`unknown == false`) — but yielding the flag rather than re-filtering
+  /// keeps the suppression contract in the engine (proven by the
+  /// `taggable_yields_unknown_but_engine_suppresses` test).
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), Infallible> {
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
     for entry in &self.entries {
-      emit_one(entry, print_conv, out)?;
+      push_one(&mut tags, entry, print_conv);
     }
-    Ok(())
+    tags.into_iter()
   }
 }
 
-/// Emit a single MXF entry into the `TagMap`.
+/// Push a single MXF entry as an [`EmittedTag`] (family0 `"MXF"`, family1 =
+/// `entry.group()`, the entry's `unknown` flag). Preserves every per-value
+/// PrintConv branch of the retired `emit_one` verbatim.
 #[cfg(feature = "alloc")]
-fn emit_one(
-  entry: &MxfEntry,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), Infallible> {
-  let group = entry.group();
+fn push_one(tags: &mut Vec<crate::emit::EmittedTag>, entry: &MxfEntry, print_conv: bool) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
   let name = entry.name();
+  // family0 = "MXF" (table group0); family1 = the per-entry group (`-G1` key).
+  let group = || Group::new(GROUP_MXF, entry.group());
+  let unknown = entry.unknown();
+  let mut push = |value: TagValue| tags.push(EmittedTag::new(group(), name.into(), value, unknown));
   match entry.value_ref() {
-    MxfValue::U64(n) => out.write_u64(group, name, *n)?,
-    MxfValue::I64(n) => out.write_i64(group, name, *n)?,
+    MxfValue::U64(n) => push(TagValue::U64(*n)),
+    MxfValue::I64(n) => push(TagValue::I64(*n)),
     MxfValue::Str(s) => {
       if name == "ComponentDataDefinition" && print_conv {
         // %componentDataDef PrintConv (MXF.pm:103-113) — map the decoded UL
         // to a human label; an unrecognized UL passes through unchanged.
         match component_data_def_label(s.as_str()) {
-          Some(label) => out.write_str(group, name, label)?,
-          None => out.write_str(group, name, s.as_str())?,
+          Some(label) => push(TagValue::Str(label.into())),
+          None => push(TagValue::Str(s.as_str().into())),
         }
       } else {
-        out.write_str(group, name, s.as_str())?;
+        push(TagValue::Str(s.as_str().into()));
       }
     }
     MxfValue::List(items) => {
@@ -2788,10 +2835,13 @@ fn emit_one(
       // bracketed list. None of the fixture's emitted tags are List-typed
       // (the reference rows are `Unknown => 1`, suppressed), but a future
       // tag-table row could be: emit as a string list.
-      let refs: Vec<&str> = items.iter().map(SmolStr::as_str).collect();
-      out.write_str_list(group, name, &refs)?;
+      let list: Vec<TagValue> = items
+        .iter()
+        .map(|s| TagValue::Str(s.as_str().into()))
+        .collect();
+      push(TagValue::List(list));
     }
-    MxfValue::Bytes(b) => out.write_bytes(group, name, b)?,
+    MxfValue::Bytes(b) => push(TagValue::Bytes(b.clone())),
     MxfValue::Duration(raw) => {
       // A `%duration` tag that was NOT divided by an EditRate (no track
       // EditRate found) — still apply the PrintConv. (RawConv-dropped values
@@ -2800,18 +2850,18 @@ fn emit_one(
       if print_conv {
         // PrintConv `ConvertDuration($val)`.
         let s = crate::datetime::convert_duration(*raw as f64);
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
         // -n: the post-ValueConv raw integer.
-        out.write_i64(group, name, *raw)?;
+        push(TagValue::I64(*raw));
       }
     }
     MxfValue::DurationF64(v) => {
       if print_conv {
         let s = crate::datetime::convert_duration(*v);
-        out.write_str(group, name, &s)?;
+        push(TagValue::Str(s.into()));
       } else {
-        out.write_f64(group, name, *v)?;
+        push(TagValue::F64(*v));
       }
     }
     MxfValue::Rational(num, den) => {
@@ -2823,12 +2873,35 @@ fn emit_one(
       // Emit as a numeric value when the quotient is a finite number, else
       // the `inf`/`undef` word string.
       match text.parse::<f64>() {
-        Ok(f) if f.is_finite() => out.write_f64(group, name, f)?,
-        _ => out.write_str(group, name, &text)?,
+        Ok(f) if f.is_finite() => push(TagValue::F64(f)),
+        _ => push(TagValue::Str(text.into())),
       }
     }
   }
-  Ok(())
+}
+
+// ===========================================================================
+// §18b. `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for MxfMeta<'_> {
+  /// Project MXF metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// MXF is a professional video container: the single faithful structural
+  /// contribution is one video [`TrackKind`](crate::metadata::TrackKind).
+  /// Duration is left `None` — the decoded MXF `Duration` is a per-instance
+  /// edit-unit count (divided by a track EditRate) carried as an
+  /// [`MxfValue`] inside the tag stream, not a clean wall-clock seconds
+  /// accessor the projection can faithfully consume. Camera / lens / GPS /
+  /// capture stay `None` (MXF carries no such facts here).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Video);
+    media
+  }
 }
 
 // ===========================================================================
@@ -3127,16 +3200,26 @@ mod tests {
     assert!(names.contains(&"TrackName"));
   }
 
+  /// Drive the `MxfMeta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for `mode` and return the
+  /// resulting [`TagMap`](crate::tagmap::TagMap) — the production sink path.
+  #[cfg(feature = "alloc")]
+  fn emit_into_tagmap(meta: &MxfMeta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(meta, mode, &mut w);
+    w
+  }
+
   #[test]
   fn fixture_emits_expected_tags() {
+    use crate::emit::ConvMode;
     let bytes = std::fs::read(concat!(
       env!("CARGO_MANIFEST_DIR"),
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(tm.get_str("MXF", "MXFVersion"), Some("1.2".into()));
     assert_eq!(
       tm.get_str("MXF", "ApplicationName"),
@@ -3173,18 +3256,117 @@ mod tests {
 
   #[test]
   fn fixture_n_mode_raw_scalars() {
+    use crate::emit::ConvMode;
     let bytes = std::fs::read(concat!(
       env!("CARGO_MANIFEST_DIR"),
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
     let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
-    let mut tm = crate::tagmap::TagMap::new();
-    meta.serialize_tags(false, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, ConvMode::ValueConv);
     // -n: ComponentDataDefinition is the raw UL string.
     assert_eq!(
       tm.get_str("Track1", "ComponentDataDefinition"),
       Some("060e2b34.0401.0101.01030201.01000000".into())
     );
+  }
+
+  #[test]
+  fn taggable_group_is_mxf_family0_and_entry_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/MXF.mxf"
+    ))
+    .expect("read fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    // Every production entry is visible (the walk pre-filters Unknown rows).
+    assert!(tags.iter().all(|t| !t.unknown()));
+    // family0 is the constant "MXF" table group; family1 is the per-entry
+    // `-G1` key ("MXF" for top-level tags, "Track<N>" for per-track tags).
+    assert!(tags.iter().all(|t| t.tag().group_ref().family0() == "MXF"));
+    let mxf_version = tags
+      .iter()
+      .find(|t| t.tag().name() == "MXFVersion")
+      .expect("MXFVersion emitted");
+    assert_eq!(mxf_version.tag().group_ref().family1(), "MXF");
+    let track_name = tags
+      .iter()
+      .find(|t| t.tag().name() == "TrackName")
+      .expect("TrackName emitted");
+    assert_eq!(track_name.tag().group_ref().family1(), "Track1");
+  }
+
+  /// The golden-pattern engine gate: an `Unknown => 1` entry is YIELDED by
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) with `unknown == true`,
+  /// but [`run_emission`](crate::emit::run_emission) suppresses it from the
+  /// [`TagMap`](crate::tagmap::TagMap) output (`ExifTool.pm:9179`). This
+  /// proves the suppression lives in the ENGINE, not the format — production
+  /// entries are all visible, so a synthetic `Unknown` entry is used to
+  /// exercise the gate.
+  #[test]
+  fn taggable_yields_unknown_but_engine_suppresses() {
+    use crate::emit::{ConvMode, Taggable};
+    let meta = MxfMeta {
+      entries: std::vec![
+        MxfEntry {
+          group: SmolStr::new_static(GROUP_MXF),
+          name: SmolStr::new_static("MXFVersion"),
+          value: MxfValue::Str("1.2".into()),
+          unknown: false,
+        },
+        // An `Unknown => 1` row (e.g. InstanceUID) — decoded for the object
+        // tree but suppressed from default output.
+        MxfEntry {
+          group: SmolStr::new_static(GROUP_MXF),
+          name: SmolStr::new_static("InstanceUID"),
+          value: MxfValue::Str("060e2b34.deadbeef".into()),
+          unknown: true,
+        },
+      ],
+      header_type: None,
+      _marker: core::marker::PhantomData,
+    };
+
+    // `tags()` yields BOTH entries, the second flagged unknown.
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert_eq!(tags.len(), 2);
+    let hidden = tags
+      .iter()
+      .find(|t| t.tag().name() == "InstanceUID")
+      .expect("Unknown entry is still yielded by tags()");
+    assert!(hidden.unknown(), "the Unknown=>1 entry carries the flag");
+
+    // The engine suppresses it: only the visible tag reaches the sink.
+    let tm = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    assert_eq!(tm.get_str("MXF", "MXFVersion"), Some("1.2".into()));
+    assert!(
+      tm.get("MXF", "InstanceUID").is_none(),
+      "run_emission must drop the Unknown=>1 tag"
+    );
+  }
+
+  #[test]
+  fn project_populates_single_video_track() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = std::fs::read(concat!(
+      env!("CARGO_MANIFEST_DIR"),
+      "/tests/fixtures/MXF.mxf"
+    ))
+    .expect("read fixture");
+    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let projected = meta.project();
+    // MXF projects to a single video track; the rest of MediaInfo is empty.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
+    assert!(projected.media().has_video());
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().created().is_none());
+    // MXF carries no camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

@@ -1284,49 +1284,91 @@ fn collides_with_priority2_engine_tag(name: &str) -> bool {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit AA tags into the writer in `ProcessAA` extraction order
-  /// (Audible.pm:215-271): TOC-walk order of (chunk_type ∈ {2, 6, 11})
-  /// emissions, post-last-wins/first-wins resolution.
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield AA tags in `ProcessAA` extraction order (Audible.pm:215-271):
+  /// TOC-walk order of (chunk_type ∈ {2, 6, 11}) emissions, post-last-wins/
+  /// first-wins resolution (resolved at parse time in `parse_inner`). The
+  /// golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead
+  /// of `out.write_*`).
   ///
   /// AA has no PrintConv conversions — every static `TagDef` carries
-  /// `ValueConv::None` + `PrintConv::None` (Audible.pm:24-48); dynamic
-  /// dict entries are plain strings. So `-j` and `-n` emit identical
-  /// tag values from this sink; the `print_conv` parameter is
-  /// accepted for trait conformance but has no effect on AA emission.
-  /// (The only -j vs -n difference for AA files is the engine's
-  /// `File:FileTypeExtension` PrintConv `"aa"` vs `"AA"`, applied by
-  /// `ctx.set_file_type` outside this sink.)
-  pub(crate) fn serialize_tags(
+  /// `ValueConv::None` + `PrintConv::None` (Audible.pm:24-48); dynamic dict
+  /// entries are plain strings. So `-j` and `-n` emit identical tag values;
+  /// the `mode` parameter is accepted for trait conformance but has no
+  /// effect on AA emission. (The only -j vs -n difference for AA files is
+  /// the engine's `File:FileTypeExtension` PrintConv `"aa"` vs `"AA"`,
+  /// applied by the engine outside this stream.)
+  ///
+  /// Group: `family0` = `family1` = `"Audible"` (Audible.pm sets no
+  /// `GROUPS{0}` override, so family0 defaults to the module name; the
+  /// `-G1` key is unchanged from the retired `serialize_tags`). AA has no
+  /// `Unknown => 1` tags ⇒ `unknown: false`.
+  ///
+  /// **Warnings / errors are NOT part of this stream.** Audible.pm's
+  /// `$et->Warn` / `$et->Error` accumulators ([`Self::warnings`] /
+  /// [`Self::errors`]) have no [`EmittedTag`] channel — [`run_emission`]
+  /// only carries tags. The `AnyMeta::Aa` arm in
+  /// [`crate::format_parser`] writes them into the
+  /// [`TagMap`](crate::tagmap::TagMap) after `run_emission`, so they still
+  /// surface through `TagMap::first_warning` / `first_error`.
+  ///
+  /// [`run_emission`]: crate::emit::run_emission
+  fn tags(
     &self,
-    _print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "Audible";
-    // Tags first (TOC walk order, last-wins resolved at parse time).
+    _mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    let group = || Group::new("Audible", "Audible");
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(self.entries.len());
+
+    // Tags in TOC walk order (last-wins resolved at parse time).
     for entry in &self.entries {
-      match &entry.value {
-        Value::Str(s) => out.write_str(GROUP, entry.name.as_str(), s.as_str())?,
-        Value::I64(n) => out.write_i64(GROUP, entry.name.as_str(), *n)?,
-        Value::Bytes(b) => out.write_bytes(GROUP, entry.name.as_str(), b.as_ref())?,
-      }
+      let value = match &entry.value {
+        Value::Str(s) => TagValue::Str(s.as_str().into()),
+        Value::I64(n) => TagValue::I64(*n),
+        Value::Bytes(b) => TagValue::Bytes(b.as_ref().to_vec()),
+      };
+      tags.push(EmittedTag::new(
+        group(),
+        entry.name.as_str().into(),
+        value,
+        false,
+      ));
     }
-    // Warnings (Audible.pm `$et->Warn` accumulator). The CLI serializer
-    // emits only the FIRST warning (`%noDups` first-token filter +
-    // copy-suffix dedup); pushing every warning here lets a future
-    // engine grow `-a`/Duplicates without breaking the typed path.
-    for w in &self.warnings {
-      out.write_warning(w.as_str())?;
-    }
-    // Errors (R9 fatal-entity ExifTool:Error substitute).
-    for e in &self.errors {
-      out.write_error(e.as_str())?;
-    }
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project AA (Audible audiobook) metadata onto the normalized
+  /// [`MediaMetadata`] domain.
+  ///
+  /// AA is a DRM'd AUDIObook container (`%Audible::*` groups are `Audio`).
+  /// Its tag set is title / author / description / chapter-count text plus
+  /// cover-art bytes — none of which maps onto a
+  /// [`MediaInfo`](crate::metadata::MediaInfo) container field (`MediaInfo`
+  /// has no duration slot that AA decodes — `ProcessAA` does not compute a
+  /// playback duration — nor a sample-rate / chapter slot). So the single
+  /// faithful contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind); duration / dimensions /
+  /// created and the camera / lens / GPS / capture domains stay `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -1625,12 +1667,24 @@ mod tests {
     out
   }
 
+  /// Drive `meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) and return the resulting
+  /// [`TagMap`](crate::tagmap::TagMap).
+  fn emit_into_tagmap(meta: &Meta<'_>, print_conv: bool) -> TagMap {
+    let mut w = TagMap::new();
+    crate::emit::run_emission(
+      meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
+    w
+  }
+
   /// Typed parse + TagMap, returning the `Audible:*` entries in order
   /// (key without the prefix, value). Order is preserved by the typed sink.
   fn audible_entries(bytes: &[u8]) -> Vec<(String, TagValue)> {
     let meta = parse_borrowed(bytes).expect("ok").expect("parsed");
-    let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     tm.entries()
       .iter()
       .filter_map(|(k, v)| {
@@ -1713,8 +1767,7 @@ mod tests {
     // Raw bytes preserved via the typed parse + TagMap.
     let bytes = build_aa_with_dict(&[("_cover_art", "ABCDE")]);
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
-    let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    let tm = emit_into_tagmap(&meta, true);
     match tm.get("Audible", "CoverArt").expect("CoverArt") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"ABCDE"),
       other => panic!("expected Bytes, got {other:?}"),
@@ -1922,43 +1975,74 @@ mod tests {
   }
 
   #[test]
-  fn meta_sinker_emits_typed_tags() {
-    use crate::tagmap::TagMap;
+  fn taggable_emits_typed_tags() {
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Audible", "Author"), Some("Alice".to_string()));
     assert_eq!(w.get_str("Audible", "Title"), Some("Book".to_string()));
   }
 
   #[test]
-  fn meta_sinker_emits_chapter_count_as_i64() {
-    use crate::tagmap::TagMap;
+  fn taggable_emits_chapter_count_as_i64() {
     let bytes = build_aa_with_two_chap_chunks(1, 7);
     let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Audible", "ChapterCount"), Some("7".to_string()));
   }
 
   #[test]
-  fn meta_sinker_emits_warnings() {
+  fn taggable_group_is_audible_family0_and_family1() {
+    use crate::emit::{ConvMode, Taggable};
+    let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert_eq!(tags.len(), 2);
+    for t in &tags {
+      // family0 = family1 = "Audible" (no GROUPS{0} override → module name).
+      assert_eq!(t.tag().group_ref().family0(), "Audible");
+      assert_eq!(t.tag().group_ref().family1(), "Audible");
+      assert!(!t.unknown(), "Audible has no Unknown=>1 tags");
+    }
+  }
+
+  #[test]
+  fn warnings_reach_engine_document_and_typed_meta() {
     let mut data = vec![0u8; 16];
     data[0..4].copy_from_slice(&[0, 0, 0, 16]);
     data[4..8].copy_from_slice(&[0x57, 0x90, 0x75, 0x36]);
     data[8..12].copy_from_slice(&[0, 0, 0x01, 0x01]); // 257
-    // The warning reaches the engine document as ExifTool:Warning.
+    // The warning reaches the engine document as ExifTool:Warning. The
+    // `AnyMeta::Aa` arm writes the typed Meta's warnings into the TagMap
+    // AFTER `run_emission` (warnings have no `Taggable`/EmittedTag channel).
     let obj = engine_obj(&data);
     assert_eq!(
       obj.get("ExifTool:Warning").and_then(|v| v.as_str()),
       Some("Invalid TOC")
     );
 
-    // Also verify the typed path: parse_borrowed produces the same warning.
+    // The typed Meta carries the warning on its `warnings()` accessor.
     let meta = parse_borrowed(&data).expect("ok").expect("parsed");
-    let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
-    assert!(w.warnings().iter().any(|s| s == "Invalid TOC"));
+    assert!(meta.warnings().iter().any(|s| s == "Invalid TOC"));
+  }
+
+  #[test]
+  fn project_populates_audio_track_only() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
+    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let projected = meta.project();
+    // AA is an audiobook: one audio track kind, nothing else decoded.
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(projected.media().has_audio());
+    assert!(!projected.media().has_video());
+    assert!(projected.media().duration().is_none());
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().height().is_none());
+    assert!(projected.media().created().is_none());
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
   }
 }

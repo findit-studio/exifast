@@ -1163,8 +1163,8 @@ pub struct OldHeader {
   final_frame_blocks: i64,
   /// Number of fields read before short-read termination. `6` ⇒ full
   /// header; less ⇒ truncated body (ExifTool.pm:9953 `last if $more
-  /// <= 0`). Used by [`Meta::serialize_tags`] to know how many tags
-  /// to emit.
+  /// <= 0`). Used by the [`Taggable`](crate::emit::Taggable) emission path
+  /// to know how many header tags to emit.
   n_fields: u8,
 }
 
@@ -2030,208 +2030,244 @@ fn composite_duration_from_header_and_main(
 }
 
 // =============================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `EmitVal` — typed header scalar (shared by the `Taggable` emission path)
 // =============================================================================
 
-#[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit APE tags into the writer in faithful APE.pm extraction order:
-  /// (1) MAC binary-data header tags, (2) dynamic main-tag stream, (3)
-  /// `Warning('Bad APE trailer')` if the planner detected an invalid
-  /// trailer, (4) intra-APE `Composite:Duration` if the ingredients
-  /// resolve.
-  ///
-  /// `print_conv = true` ⇒ PrintConv formatted strings (`-j` mode);
-  /// `print_conv = false` ⇒ post-ValueConv raw scalars (`-n` mode).
-  ///
-  /// **Note on `print_conv` for main-tag stream.** The planner runs in
-  /// `print_conv_enabled = true` (always) so the static-def tags
-  /// (`DURATION` → `MAIN_DURATION`) get their PrintConv string applied
-  /// up front. When the sink is called with `print_conv = false`, we
-  /// re-derive the raw f64 form by reading the static def's ValueConv
-  /// output. This dual-pass approach mirrors AAC/DV's pattern: PrintConv
-  /// is a global engine toggle (ExifTool.pm:5710 `OPTIONS{PrintConv}`),
-  /// not a writer choice.
-  pub(crate) fn serialize_tags(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    // (0) Chained ID3 sub-Meta (APE.pm:124-127 embedded ProcessID3). Emitted
-    // FIRST — bundled runs `ProcessID3` before the MAC/APE body extraction, so
-    // `File:ID3Size` + the ID3 frames precede the MAC tags. (Object key order
-    // is value-semantically irrelevant, but matching the engine order keeps
-    // the streams identical.)
-    #[cfg(feature = "id3")]
-    if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
-    }
-    // (1) MAC binary-data header.
-    if let Some(header) = &self.header {
-      sink_header(header, print_conv, out)?;
-    }
-    // (2) Main-tag stream.
-    for t in &self.main_tags {
-      sink_main_tag(t, print_conv, out)?;
-    }
-    // (3) Bad APE trailer warning (APE.pm:238).
-    if self.warn_bad_trailer {
-      out.write_warning("Bad APE trailer")?;
-    }
-    // (4) Intra-APE Composite:Duration emission. Cross-format composite
-    // resolution remains in the legacy bridge — this sink covers the
-    // header+main self-contained case.
-    if let Some(comp) = &self.composite_duration {
-      sink_composite_duration(comp, print_conv, out)?;
-    }
-    Ok(())
-  }
-}
-
-#[cfg(feature = "alloc")]
-fn sink_header(
-  header: &Header,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  // Faithful emission order = the static OLD_HEADER / NEW_HEADER arrays.
-  // Family-1 group is `MAC` (APE.pm:47/67).
-  const GROUP: &str = "MAC";
-  match header {
-    Header::Old(o) => {
-      let n = o.n_fields() as usize;
-      let emits: &[(&str, EmitVal)] = &[
-        ("APEVersion", EmitVal::F64(o.ape_version())),
-        ("CompressionLevel", EmitVal::I64(o.compression_level())),
-        ("Channels", EmitVal::I64(o.channels())),
-        ("SampleRate", EmitVal::I64(o.sample_rate())),
-        ("TotalFrames", EmitVal::I64(o.total_frames())),
-        ("FinalFrameBlocks", EmitVal::I64(o.final_frame_blocks())),
-      ];
-      for (name, val) in emits.iter().take(n) {
-        emit_with_print_conv(out, GROUP, name, val, print_conv)?;
-      }
-    }
-    Header::New(nw) => {
-      let n = nw.n_fields() as usize;
-      let emits: &[(&str, EmitVal)] = &[
-        ("CompressionLevel", EmitVal::I64(nw.compression_level())),
-        ("BlocksPerFrame", EmitVal::I64(nw.blocks_per_frame())),
-        ("FinalFrameBlocks", EmitVal::I64(nw.final_frame_blocks())),
-        ("TotalFrames", EmitVal::I64(nw.total_frames())),
-        ("BitsPerSample", EmitVal::I64(nw.bits_per_sample())),
-        ("Channels", EmitVal::I64(nw.channels())),
-        ("SampleRate", EmitVal::I64(nw.sample_rate())),
-      ];
-      for (name, val) in emits.iter().take(n) {
-        emit_with_print_conv(out, GROUP, name, val, print_conv)?;
-      }
-    }
-  }
-  Ok(())
-}
-
-/// Typed scalar emitted by `sink_header` — keyed by the header field's
-/// VALUECONV output type. APE OldHeader `APEVersion` is the only F64
-/// (after ValueConv `$val / 1000`); every other header field is raw I64.
+/// Typed scalar for a MAC header field — keyed by the field's ValueConv
+/// output type. APE OldHeader `APEVersion` is the only F64 (after ValueConv
+/// `$val / 1000`); every other header field is raw I64. Consumed by the
+/// [`Taggable`](crate::emit::Taggable) impl's header-emission arm.
 enum EmitVal {
   I64(i64),
   F64(f64),
 }
 
-#[cfg(feature = "alloc")]
-fn emit_with_print_conv(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  val: &EmitVal,
-  _print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
-  // Header fields have `PrintConv::None` (APE.pm:50-78 — none of the
-  // static defs set a PrintConv), so the `-j` and `-n` emission is
-  // identical: emit the post-ValueConv scalar verbatim.
-  match val {
-    EmitVal::I64(n) => out.write_i64(group, name, *n),
-    EmitVal::F64(x) => out.write_f64(group, name, *x),
-  }
-}
+// =============================================================================
+// `Taggable` — the golden-pattern emission path
+// =============================================================================
 
+/// Faithful in-Vec analogue of [`emit_tag_value`] — yields the EXACT
+/// [`TagValue`] that the `write_*` sink would `insert` for `v`. Variant-
+/// preserving for `Str`/`I64`/`U64`/`F64`/`Bytes`; the `Bool`/`Rational`/
+/// `List` branches mirror the sink's textual rendering (`Bool` ⇒
+/// `"true"`/`"false"`, `Rational` ⇒ `"num/den"`, `List` ⇒ `"<list>"`).
 #[cfg(feature = "alloc")]
-fn sink_main_tag(
-  t: &MainTag,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  // The planner runs in `print_conv_enabled = false` ⇒ the value is the
-  // POST-VALUECONV RAW scalar. For `print_conv = true` the sink applies
-  // the static def's PrintConv on emit; for `print_conv = false` we emit
-  // the raw scalar verbatim. Only `MAIN_DURATION` (APE.pm:35-39) has a
-  // non-trivial PrintConv (`ConvertDuration`); the other main-table
-  // static defs are `PrintConv::None` ⇒ `-j` and `-n` emit identically.
-  // Dynamic `MakeTag` entries (no static def) emit as-is in both modes
-  // (faithful: bundled Perl `tagInfo` has only `Name`, no PrintConv).
-  if print_conv && t.name() == "Duration" {
-    let printed = convert_duration(t.value_ref());
-    return emit_tag_value(out, "APE", t.name(), &printed);
-  }
-  emit_tag_value(out, "APE", t.name(), t.value_ref())
-}
-
-#[cfg(feature = "alloc")]
-fn emit_tag_value(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
-  name: &str,
-  v: &TagValue,
-) -> Result<(), core::convert::Infallible> {
+fn emitted_tag_value(v: &TagValue) -> TagValue {
   match v {
-    TagValue::Str(s) => out.write_str(group, name, s.as_str()),
-    TagValue::I64(n) => out.write_i64(group, name, *n),
-    TagValue::U64(n) => out.write_u64(group, name, *n),
-    TagValue::F64(x) => out.write_f64(group, name, *x),
-    TagValue::Bytes(b) => out.write_bytes(group, name, b.as_slice()),
-    TagValue::Bool(b) => out.write_str(group, name, if *b { "true" } else { "false" }),
+    // `write_str` ⇒ TagValue::Str (clone the borrowed contents).
+    TagValue::Str(s) => TagValue::Str(s.clone()),
+    // `write_i64`/`write_u64`/`write_f64` ⇒ same scalar variant.
+    TagValue::I64(n) => TagValue::I64(*n),
+    TagValue::U64(n) => TagValue::U64(*n),
+    TagValue::F64(x) => TagValue::F64(*x),
+    // `write_bytes` ⇒ TagValue::Bytes (clone the borrowed slice).
+    TagValue::Bytes(b) => TagValue::Bytes(b.clone()),
+    // `emit_tag_value` renders Bool via `write_str("true"/"false")`.
+    TagValue::Bool(b) => TagValue::Str(if *b { "true" } else { "false" }.into()),
+    // `emit_tag_value` renders Rational via `write_fmt("{num}/{den}")` —
+    // reserved forward-compat (APE Main has no Rational tags).
     TagValue::Rational(r) => {
-      // Faithful Perl: rational tags stringify as `num/den` in default
-      // context. APE Main has no Rational tags (verified against
-      // APE.pm:21-42), so this is reserved for forward compatibility.
-      out.write_fmt(group, name, |w| {
-        write!(w, "{}/{}", r.numerator(), r.denominator())
-      })
+      TagValue::Str(std::format!("{}/{}", r.numerator(), r.denominator()).into())
     }
-    TagValue::List(_) => {
-      // No APE Main tag emits List today. Reserved for forward compat.
-      out.write_str(group, name, "<list>")
-    }
+    // `emit_tag_value` renders List via `write_str("<list>")` — reserved
+    // forward-compat (no APE Main tag emits List today).
+    TagValue::List(_) => TagValue::Str("<list>".into()),
   }
 }
 
 #[cfg(feature = "alloc")]
-fn sink_composite_duration(
-  comp: &TagValue,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  const GROUP: &str = "Composite";
-  // `composite_duration` is stored as RAW f64 (or Str for non-finite —
-  // see `composite_duration_from_header_and_main`). The sink applies
-  // ConvertDuration here when print_conv = true.
-  match comp {
-    TagValue::F64(dur) => {
-      if print_conv {
-        let converted = convert_duration(&TagValue::F64(*dur));
-        match converted {
-          TagValue::Str(s) => out.write_str(GROUP, "Duration", s.as_str()),
-          TagValue::F64(x) => out.write_f64(GROUP, "Duration", x),
-          other => emit_tag_value(out, GROUP, "Duration", &other),
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield APE tags in faithful APE.pm extraction order — the golden-pattern
+  /// emission path for APE (the WavPack/MP3/MPC chained consumers splice these
+  /// via `ape.tags(mode)`; standalone APE dispatches through it directly).
+  /// Each value is handed to an [`EmittedTag`](crate::emit::EmittedTag); the
+  /// emission ORDER, the chained-ID3 position, the MAC header `n_fields()`
+  /// prefix-take, the dynamic main-tag value variants, the `Duration`
+  /// PrintConv branch, and the intra-APE `Composite:Duration` arithmetic are
+  /// all preserved.
+  ///
+  /// **Emission order (0)→(3):**
+  /// 0. Chained ID3 sub-Meta (APE.pm:124-127 embedded `ProcessID3`) — spliced
+  ///    FIRST (`Id3Meta` is `Taggable`; its warnings/errors are drained by the
+  ///    `AnyMeta::Ape` dispatch arm, NOT in this stream).
+  /// 1. MAC binary-data header tags (Old/New), under family-1 `"MAC"`, only
+  ///    the first `n_fields()` of each static array (faithful partial-walk).
+  /// 2. The dynamic `%APE::Main` main-tag stream, under family-1 `"APE"`, in
+  ///    extraction order (repeated-key dedup / dup-override already resolved by
+  ///    the planner's `push_or_replace_last`, so `main_tags` is already the
+  ///    faithful last-wins-by-key sequence — emitted as-is).
+  /// 3. Intra-APE `Composite:Duration` (APE.pm:83-92), under family-1
+  ///    `"Composite"`, if the planner resolved the ingredients.
+  ///
+  /// **Group.** Family-0 is `"APE"` (`APE_GROUP0` — APE.pm does not override
+  /// `GROUPS{0}`); family-1 is `"MAC"` for header tags (APE.pm:47/67), `"APE"`
+  /// for main tags (default-from-package), `"Composite"` for the composite.
+  /// Every APE tag is a known tag ⇒ `unknown: false`.
+  ///
+  /// **What is NOT in this stream:** the APE.pm:238 `Warn('Bad APE trailer')`
+  /// ([`Meta::warn_bad_trailer`]) and the chained ID3 sub-Meta's
+  /// warnings/errors — [`run_emission`](crate::emit::run_emission) has no
+  /// warning/error channel, so the `AnyMeta::Ape` arm drains them after
+  /// `run_emission` (matching the retired order: ID3 tags emit first, then MAC
+  /// + main, then the `Bad APE trailer` warning). The net `TagMap` is identical.
+  ///
+  /// `mode == PrintConv` (`-j`) ⇒ `Duration` (main + composite) gets
+  /// `ConvertDuration`; `mode == ValueConv` (`-n`) ⇒ the raw scalar. Every
+  /// other APE tag has `PrintConv::None` ⇒ identical under both modes.
+  fn tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::new();
+
+    // (0) Chained ID3 sub-Meta (APE.pm:124-127). Spliced FIRST — the retired
+    // `serialize_tags` called `id3.serialize_tags` at this exact point, so
+    // `File:ID3Size` + every `ID3v2_*:*` / `ID3v1:*` frame tag precedes the
+    // MAC/main body. `Id3Meta` is `Taggable`; its warnings/errors are drained
+    // by the `AnyMeta::Ape` arm.
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      tags.extend(id3.tags(mode));
+    }
+
+    // (1) MAC binary-data header. Family-1 group `"MAC"` (APE.pm:47/67).
+    // Mirrors `sink_header` + `emit_with_print_conv`: header fields have
+    // `PrintConv::None`, so `-j`/`-n` emit the post-ValueConv scalar verbatim
+    // (`APEVersion` is the only F64 — ValueConv `$val / 1000`; the rest I64).
+    // Only the first `n_fields()` of each static array are emitted (faithful
+    // partial-walk on a short header buffer; `0xFF`-equivalent in production).
+    if let Some(header) = &self.header {
+      let mac = || Group::new(APE_GROUP0, "MAC");
+      match header {
+        Header::Old(o) => {
+          let n = o.n_fields() as usize;
+          let emits: &[(&str, EmitVal)] = &[
+            ("APEVersion", EmitVal::F64(o.ape_version())),
+            ("CompressionLevel", EmitVal::I64(o.compression_level())),
+            ("Channels", EmitVal::I64(o.channels())),
+            ("SampleRate", EmitVal::I64(o.sample_rate())),
+            ("TotalFrames", EmitVal::I64(o.total_frames())),
+            ("FinalFrameBlocks", EmitVal::I64(o.final_frame_blocks())),
+          ];
+          for (name, val) in emits.iter().take(n) {
+            let value = match val {
+              EmitVal::I64(x) => TagValue::I64(*x),
+              EmitVal::F64(x) => TagValue::F64(*x),
+            };
+            tags.push(EmittedTag::new(mac(), (*name).into(), value, false));
+          }
         }
-      } else {
-        out.write_f64(GROUP, "Duration", *dur)
+        Header::New(nw) => {
+          let n = nw.n_fields() as usize;
+          let emits: &[(&str, EmitVal)] = &[
+            ("CompressionLevel", EmitVal::I64(nw.compression_level())),
+            ("BlocksPerFrame", EmitVal::I64(nw.blocks_per_frame())),
+            ("FinalFrameBlocks", EmitVal::I64(nw.final_frame_blocks())),
+            ("TotalFrames", EmitVal::I64(nw.total_frames())),
+            ("BitsPerSample", EmitVal::I64(nw.bits_per_sample())),
+            ("Channels", EmitVal::I64(nw.channels())),
+            ("SampleRate", EmitVal::I64(nw.sample_rate())),
+          ];
+          for (name, val) in emits.iter().take(n) {
+            let value = match val {
+              EmitVal::I64(x) => TagValue::I64(*x),
+              EmitVal::F64(x) => TagValue::F64(*x),
+            };
+            tags.push(EmittedTag::new(mac(), (*name).into(), value, false));
+          }
+        }
       }
     }
-    // Non-finite stored as Str ("Inf"/"-Inf"/"NaN") — emit verbatim
-    // (faithful: bundled Perl emits the quoted string in both -j and -n).
-    other => emit_tag_value(out, GROUP, "Duration", other),
+
+    // (2) Main-tag stream. Family-1 group `"APE"` (APE_GROUP0 default).
+    // Mirrors `sink_main_tag`: only `Duration` (APE.pm:35-39) has a
+    // non-trivial PrintConv (`ConvertDuration`) under `-j`; everything else
+    // (static `PrintConv::None` + dynamic `MakeTag`) emits its raw value
+    // verbatim in both modes via `emitted_tag_value`. The planner already
+    // resolved repeated-key dedup / dup-override (`push_or_replace_last`),
+    // so `main_tags` is the faithful last-wins-by-key sequence.
+    let ape = || Group::new(APE_GROUP0, APE_GROUP0);
+    for t in &self.main_tags {
+      let value = if print_conv && t.name() == "Duration" {
+        emitted_tag_value(&convert_duration(t.value_ref()))
+      } else {
+        emitted_tag_value(t.value_ref())
+      };
+      tags.push(EmittedTag::new(ape(), t.name().into(), value, false));
+    }
+
+    // (3) Intra-APE Composite:Duration (APE.pm:83-92). Family-1 group
+    // `"Composite"`. Mirrors `sink_composite_duration`: a finite f64 gets
+    // `ConvertDuration` under `-j` (a `TagValue::Str`) and the raw f64 under
+    // `-n`; a non-finite value is stored as `Str` ("Inf"/"-Inf"/"NaN") and
+    // emitted verbatim in both modes via `emitted_tag_value`.
+    if let Some(comp) = &self.composite_duration {
+      let composite = || Group::new("Composite", "Composite");
+      let value = match comp {
+        TagValue::F64(dur) => {
+          if print_conv {
+            emitted_tag_value(&convert_duration(&TagValue::F64(*dur)))
+          } else {
+            TagValue::F64(*dur)
+          }
+        }
+        other => emitted_tag_value(other),
+      };
+      tags.push(EmittedTag::new(
+        composite(),
+        "Duration".into(),
+        value,
+        false,
+      ));
+    }
+
+    tags.into_iter()
+  }
+}
+
+// =============================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// =============================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project APE (Monkey's Audio) metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// APE is a lossless audio stream: it carries no camera / lens / GPS /
+  /// capture facts (those domains stay `None`). The structural contribution is
+  /// one audio [`TrackKind`](crate::metadata::TrackKind) (APE files are
+  /// audio-only — `%APE::Main`/`%APE::*Header` `GROUPS{2} => 'Audio'`).
+  ///
+  /// **Duration.** The intra-APE `Composite:Duration`
+  /// ([`Meta::composite_duration_ref`]) is the only decoded-seconds quantity
+  /// APE exposes, and only as a RAW f64 (or a non-finite `Str` placeholder).
+  /// When it is a finite f64 we fold it into [`MediaInfo`]'s `duration`; a
+  /// non-finite / absent composite leaves `duration` `None` (synthesizing a
+  /// value ExifTool never surfaces would be unfaithful). The chained ID3
+  /// sub-Meta's own facts (e.g. a TLEN `Length`) are NOT folded here (APE's
+  /// `Project` mirrors the bare-stream shape used by AAC/DSF/MPC).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    // Fold the intra-APE Composite:Duration when it is a clean, non-negative
+    // finite f64. `core::time::Duration` cannot represent a negative span
+    // (and `from_secs_f64` panics on negative / non-finite), so a pathological
+    // negative result (e.g. `TotalFrames == 0`) leaves `duration` `None` —
+    // ExifTool still emits the raw number, which the `Taggable` path covers.
+    if let Some(TagValue::F64(secs)) = self.composite_duration.as_ref()
+      && secs.is_finite()
+      && *secs >= 0.0
+    {
+      media
+        .media_mut()
+        .update_duration(Some(core::time::Duration::from_secs_f64(*secs)));
+    }
+    media
   }
 }
 
@@ -3393,7 +3429,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     // Binary value MUST be "BINARY" (6 bytes), not "\0BINARY" (7 bytes).
     match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => {
@@ -3418,7 +3454,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"BINARY"),
       other => panic!("expected Bytes, got {other:?}"),
@@ -3434,7 +3470,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     assert_eq!(
       tm.get("APE", "CoverArtFrontDesc"),
       Some(&TagValue::Str("Foo".into()))
@@ -3575,7 +3611,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     // Exactly two APE:* trailer tags, in order, no File:*.
     let names: Vec<&str> = tm
       .entries()
@@ -3631,7 +3667,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     // Composite:Duration MUST be present (14.71 s — same arithmetic + PrintConv
     // as the standalone APE_spaced_composite fixture).
     assert_eq!(
@@ -4049,7 +4085,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
     // Confirm CoverArtFront is emitted with the raw JPEG bytes intact.
     match tm
       .get("APE", "CoverArtFront")
@@ -4186,7 +4222,7 @@ mod tests {
       .expect("ok")
       .expect("parsed");
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     // Family-1 key is "APE" for main-tag emissions in the writer's
     // single-string `group` model.
     assert_eq!(w.get_str("APE", "Artist"), Some("Tester".to_string()));
@@ -4313,5 +4349,115 @@ mod tests {
     _assert_error::<Error>();
     let none: Option<Error> = None;
     assert!(none.is_none());
+  }
+
+  // --- Golden-pattern `Taggable` / `Project` tests ------------------------
+
+  use crate::emit::{ConvMode, Taggable};
+
+  /// Load a `tests/fixtures/<name>` byte blob.
+  fn fixture(name: &str) -> std::vec::Vec<u8> {
+    std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("fixture {name}: {e}"))
+  }
+
+  /// `Taggable` emits the MAC header tags under family-1 `"MAC"` (family-0
+  /// `"APE"`) and the dynamic main tags under family-1 `"APE"` (family-0
+  /// `"APE"`), in the faithful order — header first, then the main stream.
+  #[test]
+  fn taggable_emits_mac_then_ape_groups() {
+    let bytes = fixture("APE.ape");
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&bytes, &mut shared).expect("APE parsed");
+
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty(), "APE.ape must emit tags");
+
+    // MAC header + main tags are family-0 "APE" (APE_GROUP0); the intra-APE
+    // Composite:Duration is family-0/1 "Composite" (its own group). family-1
+    // is "MAC" (header), "APE" (main), or "Composite" (duration).
+    for t in &tags {
+      let (g0, g1) = (t.tag().group_ref().family0(), t.tag().group_ref().family1());
+      match g1 {
+        "MAC" | "APE" => assert_eq!(g0, "APE", "MAC/APE tags are family-0 APE"),
+        "Composite" => assert_eq!(g0, "Composite", "Composite is family-0 Composite"),
+        other => panic!("unexpected family-1 group {other:?}"),
+      }
+      assert!(!t.unknown(), "no APE tag carries Unknown=>1");
+    }
+
+    // The MAC header block (if present) precedes the first APE main tag.
+    let first_ape = tags
+      .iter()
+      .position(|t| t.tag().group_ref().family1() == "APE");
+    let last_mac = tags
+      .iter()
+      .rposition(|t| t.tag().group_ref().family1() == "MAC");
+    if let (Some(fa), Some(lm)) = (first_ape, last_mac) {
+      assert!(lm < fa, "MAC header tags must precede the APE main stream");
+    }
+  }
+
+  /// `Project` marks APE as an audio-only stream (one `TrackKind::Audio`,
+  /// no camera/lens/gps/capture facts) and folds the intra-APE
+  /// `Composite:Duration` into `MediaInfo::duration` when it is a finite f64.
+  #[test]
+  fn project_is_audio_only_with_duration() {
+    use crate::metadata::{Project, TrackKind};
+    // `APE_spaced_composite.ape` resolves a finite composite duration
+    // (~14.71 s — displayed as "14.71 s" by ConvertDuration, raw f64
+    // ≈ 14.712791667 s).
+    let bytes = fixture("APE_spaced_composite.ape");
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&bytes, &mut shared).expect("APE parsed");
+    // Sanity: this fixture carries a finite composite duration; capture the
+    // exact raw seconds so the domain fold is asserted against the SAME f64
+    // (not the PrintConv-rounded display string).
+    let Some(TagValue::F64(raw_secs)) = meta.composite_duration_ref() else {
+      panic!("expected a finite f64 composite duration");
+    };
+    let raw_secs = *raw_secs;
+
+    let media = Project::project(&meta);
+    assert_eq!(media.media().track_kinds(), &[TrackKind::Audio]);
+    // No camera / lens / gps / capture facts on an audio stream.
+    assert!(media.camera().is_none());
+    assert!(media.lens().is_none());
+    assert!(media.gps().is_none());
+    assert!(media.capture().is_none());
+    // Duration folded from the finite composite f64 (exact, not the rounded
+    // PrintConv display).
+    let dur = media.media().duration().expect("composite duration folded");
+    assert!(
+      (dur.as_secs_f64() - raw_secs).abs() < 1e-9,
+      "expected {raw_secs} s, got {}",
+      dur.as_secs_f64()
+    );
+  }
+
+  /// A non-finite composite (`APE_nonfinite_composite.ape` → stored as a
+  /// `Str` "Inf"/"-Inf"/"NaN") is NOT folded into the domain duration
+  /// (`core::time::Duration` cannot represent it); the track is still audio.
+  #[test]
+  fn project_skips_nonfinite_composite_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let bytes = fixture("APE_nonfinite_composite.ape");
+    let mut shared = SharedFlags::new();
+    let meta = parse_full_chained(&bytes, &mut shared).expect("APE parsed");
+    // Sanity: the composite resolved to a non-finite Str placeholder.
+    assert!(matches!(
+      meta.composite_duration_ref(),
+      Some(TagValue::Str(_))
+    ));
+    let media = Project::project(&meta);
+    assert_eq!(media.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(
+      media.media().duration().is_none(),
+      "non-finite composite must not fold a domain duration"
+    );
   }
 }

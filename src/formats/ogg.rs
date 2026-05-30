@@ -2272,222 +2272,375 @@ fn tag_to_comment(tag: &crate::value::Tag) -> Comment {
 pub enum Error {}
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit OGG tags into the writer in bundled emission order:
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield OGG tags in bundled `perl exiftool -j -G1` emission order:
+  ///   0. The chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`),
+  ///      spliced FIRST — `File:ID3Size` + every `ID3v2_*:*` frame tag.
   ///   1. Vorbis identification fields (when present), Vorbis.pm:40-70
-  ///      order: VorbisVersion / AudioChannels / SampleRate /
+  ///      DECLARED-OFFSET order: VorbisVersion / AudioChannels / SampleRate /
   ///      MaximumBitrate / NominalBitrate / MinimumBitrate.
-  ///   2. Opus header fields (when present), Opus.pm:36-51 order:
-  ///      OpusVersion / AudioChannels / SampleRate / OutputGain.
+  ///   2. Opus header fields (when present), Opus.pm:36-51 DECLARED-OFFSET
+  ///      order: OpusVersion / AudioChannels / SampleRate / OutputGain.
   ///   3. Vorbis comments in encounter order — vendor first, then KEY=VALUE
   ///      pairs (list-tags coalesced at first occurrence — faithful
   ///      FoundTag, ExifTool.pm:9505-9520).
-  ///   4. Accumulated warnings.
+  ///   3b. `METADATA_BLOCK_PICTURE` Picture sub-fields (Vorbis.pm:122-134 →
+  ///      `%FLAC::Picture`), one block at a time.
   ///
-  /// **NOTE:** `File:FileType*` / file-type override is NOT emitted here.
-  /// That's the bridge's responsibility (the engine entry `process`):
-  /// `SetFileType` precedes the Vorbis:* tags in bundled output, but the
-  /// pseudo-File:* tags belong to the engine's `ParseContext::set_file_
-  /// type` path (not the per-format `serialize_tags`). The `serialize_tags` only
-  /// writes Vorbis:* / Opus:* / Theora:* tags + warnings.
+  /// The golden-pattern parallel to the retired `serialize_tags`: the SINK
+  /// changes (an [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`); the value variants (`TagValue::U64` for the
+  /// identification / header / Picture integers, `TagValue::Str` for Vorbis
+  /// scalars / bitrate-PrintConv / Picture MIME+Description, `TagValue::F64`
+  /// for Opus OutputGain, `TagValue::List` for the Vorbis `List => 1`
+  /// coalesce, `TagValue::Bytes` for CoverArt + the Picture binary), the
+  /// emission ORDER, the ID3-chain position, and every PrintConv / ValueConv
+  /// branch are preserved verbatim.
   ///
-  /// `print_conv = true` matches bundled `perl exiftool -j`; `false`
-  /// matches `-j -n`. The toggle drives:
-  ///   * Vorbis bitrate fields: `-j` → `ConvertBitrate("32000")` = `"32 kbps"`;
-  ///     `-j -n` → raw u32 (`32000`).
-  ///   * Other identification fields (VorbisVersion/AudioChannels/SampleRate,
-  ///     OpusVersion/AudioChannels/SampleRate): no PrintConv ⇒ raw u32/u8
-  ///     in both modes.
-  ///   * Opus OutputGain: ValueConv `10**($val/5120)` runs in BOTH modes
-  ///     (it's a ValueConv, not a PrintConv); the toggle has no effect.
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings (Vorbis bitrate →
+  /// `ConvertBitrate`, e.g. `"128 kbps"`; Picture type → `"Front Cover"`);
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars (bitrate → raw
+  /// u32). Opus OutputGain's ValueConv `10**($val/5120)` runs in BOTH modes
+  /// (it's a ValueConv, not a PrintConv), so the toggle has no effect there.
+  ///
+  /// **Groups.** Vorbis identification + comments carry family-0/1 `"Vorbis"`
+  /// (`%Vorbis::Identification` / `%Vorbis::Comments` group0 == group1);
+  /// comments under a Theora stream keep family-0 `"Vorbis"` but family-1
+  /// `"Theora"` (Ogg.pm:62 `SET_GROUP1`), so the per-comment group1 is
+  /// preserved exactly. Opus header tags carry family-0/1 `"Opus"`
+  /// (`%Opus::Header`). `METADATA_BLOCK_PICTURE` Picture sub-fields carry
+  /// family-0/1 `"FLAC"` (the SubDirectory target `%FLAC::Picture`). Every
+  /// OGG tag is a known tag ⇒ `unknown: false`.
+  ///
+  /// **List-tag note (Codex CF2).** Vorbis `List => 1` tags
+  /// (ARTIST/PERFORMER/CONTACT, Vorbis.pm:85/86/94) were already coalesced
+  /// into a single [`Comment::List`] at first-occurrence position during the
+  /// parse (faithful `FoundTag`); we emit ONE `EmittedTag` carrying a
+  /// `TagValue::List` of the values in encounter order — byte-identical to
+  /// the retired `TagMap::write_str_list`.
+  ///
+  /// **Warnings are NOT part of this tag stream** ([`run_emission`](crate::emit::run_emission)
+  /// has no warning/error channel). The chained ID3 sub-Meta's warnings/errors
+  /// and OGG's own accumulated warnings (`Lost synchronization` Ogg.pm:97,
+  /// `Missing page(s) in Ogg file` Ogg.pm:158, `Format error in Vorbis
+  /// comments` Vorbis.pm:208) are drained by the `AnyMeta::Ogg` dispatch arm
+  /// AFTER `run_emission`, in the same order the retired `serialize_tags`
+  /// emitted them (ID3 warnings then errors — they were written during the
+  /// top-of-fn `id3.serialize_tags` call — then OGG's own warnings), so the
+  /// net `TagMap` stays byte-identical.
+  ///
+  /// The File:* triplet (and the `OverrideFileType` OGV/OPUS decision) is NOT
+  /// emitted here — that is the engine ([`crate::parser::extract_info`])
+  /// `SetFileType` / `finalize_file_type` responsibility.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    // 0. Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). Bundled
-    //    runs `ProcessID3` BEFORE the OGG container walk — `File:ID3Size`
-    //    + every `ID3v2_*:*` frame tag precede any Vorbis:* / Opus:* tag.
-    //    R3 F1 (Codex adversarial): the pre-fix engine arm stripped the
-    //    ID3v2 prefix to reparse `bytes[hdr_end..]` but never emitted the
-    //    ID3 directory, forcing a silent metadata-loss path. Nesting +
-    //    emitting via `Id3Meta::serialize_tags` is the same pattern
-    //    `ape::Meta`, `flac::Meta`, `dsf::Meta` use.
-    //
-    //    Bundled key ordering in `-j -G1` output places `File:ID3Size`
-    //    near `File:*` (system-emitted) and the `ID3v2_*:*` frames after
-    //    the Vorbis block. The conformance gate (object-key MULTISET,
-    //    NOT order — `tests/conformance.rs:1-7`) accepts any consistent
-    //    emission order; we emit ID3 sub-Meta first so the writer's
-    //    insertion order (which feeds `serde_json::Map` first-wins) is
-    //    deterministic, with the value multiset matching bundled exactly.
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    // family-0 == family-1 per sub-table: Vorbis identification/comments →
+    // "Vorbis" (comments may override family-1 to "Theora"); Opus header →
+    // "Opus". (`%Vorbis::Identification`/`%Vorbis::Comments`/`%Opus::Header`
+    // each set group0 == group1.)
+    let vorbis_group = || Group::new("Vorbis", "Vorbis");
+    let opus_group = || Group::new("Opus", "Opus");
+
+    let mut tags: Vec<EmittedTag> = Vec::new();
+
+    // (0) Chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`). Bundled
+    // runs `ProcessID3` BEFORE the OGG container walk — `File:ID3Size` + every
+    // `ID3v2_*:*` frame tag precede any Vorbis:* / Opus:* tag. The retired
+    // sink called `id3.serialize_tags(print_conv, out)` at this exact point;
+    // `Id3Meta` is `Taggable`, so its tags flow through the same engine here.
+    // Its warnings/errors are drained by the `AnyMeta::Ogg` arm (matching the
+    // retired position — see fn docs).
     #[cfg(feature = "id3")]
-    if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
+    if let Some(id3) = self.id3.as_ref() {
+      tags.extend(id3.tags(mode));
     }
 
-    // 1. Vorbis identification (Vorbis.pm:40-70). Emit in DECLARED OFFSET
-    //    order: VorbisVersion (0), AudioChannels (4), SampleRate (5),
-    //    MaximumBitrate (9), NominalBitrate (13), MinimumBitrate (17).
-    //    Bundled `ProcessBinaryData` iterates the table in offset order,
-    //    so the JSON emission order matches.
+    // (1) Vorbis identification (Vorbis.pm:40-70). DECLARED-OFFSET order:
+    // VorbisVersion (0), AudioChannels (4), SampleRate (5), MaximumBitrate
+    // (9), NominalBitrate (13), MinimumBitrate (17). R3 F3 (per-field,
+    // faithful ProcessBinaryData): every field is optional — emit only when
+    // the parse populated it (ExifTool.pm:9927 iterate-and-skip).
     if let Some(id) = self.vorbis_identification {
-      // R3 F3 (per-field, faithful ProcessBinaryData): every field is
-      // optional — emit only when the parse populated it (i.e. the
-      // payload covered offset+width). Mirrors bundled's iterate-and-
-      // skip semantics (ExifTool.pm:9927).
       if let Some(v) = id.vorbis_version() {
-        out.write_u64("Vorbis", "VorbisVersion", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          vorbis_group(),
+          "VorbisVersion".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(v) = id.audio_channels() {
-        out.write_u64("Vorbis", "AudioChannels", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          vorbis_group(),
+          "AudioChannels".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(v) = id.sample_rate() {
-        out.write_u64("Vorbis", "SampleRate", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          vorbis_group(),
+          "SampleRate".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
-      // Bitrate fields: RawConv `$val || undef` drops the zero case
-      // (already filtered to `None` in `parse_vorbis_identification`);
-      // PrintConv runs `ConvertBitrate` for `-j`, raw bps for `-j -n`.
+      // Bitrate fields: RawConv `$val || undef` drops the zero case (already
+      // filtered to `None` in `parse_vorbis_identification`); PrintConv runs
+      // `ConvertBitrate` for `-j`, raw bps for `-j -n`.
       if let Some(bps) = id.maximum_bitrate() {
-        emit_bitrate(out, "MaximumBitrate", bps, print_conv)?;
+        tags.push(bitrate_tag("MaximumBitrate", bps, print_conv));
       }
       if let Some(bps) = id.nominal_bitrate() {
-        emit_bitrate(out, "NominalBitrate", bps, print_conv)?;
+        tags.push(bitrate_tag("NominalBitrate", bps, print_conv));
       }
       if let Some(bps) = id.minimum_bitrate() {
-        emit_bitrate(out, "MinimumBitrate", bps, print_conv)?;
+        tags.push(bitrate_tag("MinimumBitrate", bps, print_conv));
       }
     }
-    // 2. Opus header (Opus.pm:36-51). DECLARED OFFSET order: OpusVersion
-    //    (0), AudioChannels (1), SampleRate (4), OutputGain (8).
-    //    R3 F3 (per-field): every field is `Option<...>`; emit only the
-    //    in-range subset.
+
+    // (2) Opus header (Opus.pm:36-51). DECLARED-OFFSET order: OpusVersion
+    // (0), AudioChannels (1), SampleRate (4), OutputGain (8). R3 F3
+    // (per-field): emit only the in-range subset.
     if let Some(h) = self.opus_header {
       if let Some(v) = h.opus_version() {
-        out.write_u64("Opus", "OpusVersion", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          opus_group(),
+          "OpusVersion".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(v) = h.audio_channels() {
-        out.write_u64("Opus", "AudioChannels", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          opus_group(),
+          "AudioChannels".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
       if let Some(v) = h.sample_rate() {
-        out.write_u64("Opus", "SampleRate", u64::from(v))?;
+        tags.push(EmittedTag::new(
+          opus_group(),
+          "SampleRate".into(),
+          TagValue::U64(u64::from(v)),
+          false,
+        ));
       }
-      // OutputGain post-ValueConv (`10**(raw/5120)`). Bundled emits this
-      // as a bare number — `1` when raw is 0 (the common in-spec case);
-      // for non-zero raw the f64 result is emitted via the JSON-number
-      // gate (the serializer already handles integer-valued f64 ⇒ no `.0`,
-      // matching Perl's stringification of `1`).
+      // OutputGain post-ValueConv (`10**(raw/5120)`) — a bare number (`1`
+      // when raw is 0, the common in-spec case). The serializer's JSON-number
+      // gate renders integer-valued f64 without a trailing `.0`, matching
+      // Perl's stringification.
       if let Some(g) = h.output_gain() {
-        out.write_f64("Opus", "OutputGain", g)?;
+        tags.push(EmittedTag::new(
+          opus_group(),
+          "OutputGain".into(),
+          TagValue::F64(g),
+          false,
+        ));
       }
     }
-    // 3. Vorbis comments (vendor + KEY=VALUE) — encounter order with
-    //    list-coalescing.
+
+    // (3) Vorbis comments (vendor + KEY=VALUE) — encounter order with
+    // list-coalescing already applied during the parse (Codex CF2). Each
+    // comment carries its own resolved family-1 group ("Vorbis", or "Theora"
+    // under a Theora stream); family-0 stays "Vorbis" (the tag-table group0,
+    // preserved on `SET_GROUP1` — Ogg.pm:62).
     for comment in &self.comments {
       match comment {
         Comment::Scalar(s) => {
-          out.write_str(s.group1(), s.name(), s.value())?;
+          tags.push(EmittedTag::new(
+            Group::new("Vorbis", s.group1()),
+            s.name().into(),
+            TagValue::Str(s.value().into()),
+            false,
+          ));
         }
         Comment::List(l) => {
-          // Vorbis List=>1 tags (ARTIST/PERFORMER/CONTACT, Vorbis.pm:
-          // 85/86/94) coalesce into a single `TagValue::List` at
-          // first-occurrence position — faithful `FoundTag`
-          // (ExifTool.pm:9505-9520). Route through the `write_str_list`
-          // primitive so list-aware writers coalesce correctly instead of
-          // last-write-wins (Codex CF2).
-          let refs: Vec<&str> = l.values_slice().iter().map(SmolStr::as_str).collect();
-          out.write_str_list(l.group1(), l.name(), &refs)?;
+          let items: Vec<TagValue> = l
+            .values_slice()
+            .iter()
+            .map(|v| TagValue::Str(v.as_str().into()))
+            .collect();
+          tags.push(EmittedTag::new(
+            Group::new("Vorbis", l.group1()),
+            l.name().into(),
+            TagValue::List(items),
+            false,
+          ));
         }
         Comment::Binary(b) => {
-          out.write_bytes(b.group1(), b.name(), b.bytes())?;
+          tags.push(EmittedTag::new(
+            Group::new("Vorbis", b.group1()),
+            b.name().into(),
+            TagValue::Bytes(b.bytes().to_vec()),
+            false,
+          ));
         }
       }
     }
-    // 3b. R3 F2: `METADATA_BLOCK_PICTURE` payloads (Vorbis.pm:122-134
-    //     → %FLAC::Picture FLAC.pm:84-134). Emit each Picture sub-field
-    //     under the `FLAC` family-1 group with the same names FLAC's
-    //     own `sink_picture` uses (FLAC.pm:84-134), so the value-multiset
-    //     conformance check matches bundled byte-for-byte.
+
+    // (3b) `METADATA_BLOCK_PICTURE` payloads (Vorbis.pm:122-134 →
+    // `%FLAC::Picture` FLAC.pm:84-134). Each Picture sub-field is emitted
+    // under the `FLAC` family-1 group with the same names FLAC's own
+    // `push_picture_tags` uses, so the value-multiset stays byte-for-byte.
     for p in &self.pictures {
-      sink_ogg_picture(p, print_conv, out)?;
+      push_ogg_picture_tags(&mut tags, p, print_conv);
     }
-    // 4. Warnings emit in occurrence order. The engine `TagMap` routes
-    //    these to its `warnings()` accumulator (ExifTool:Warning surface);
-    //    `TagMap` collects into a `warnings()` vec.
-    for w in &self.warnings {
-      out.write_warning(w)?;
-    }
-    Ok(())
+
+    tags.into_iter()
   }
 }
 
-/// Sink one [`OggPicture`] under the bundled `FLAC` family-1 group in
-/// the same emission order `flac::sink_picture` uses (FLAC.pm:84-134).
-/// R3 F2: Vorbis `METADATA_BLOCK_PICTURE` SubDirectory hop into
-/// `Image::ExifTool::FLAC::Picture` (Vorbis.pm:122-134). Mirrors the
-/// emission shape: `PictureType` (PrintConv-mapped under -j), then
-/// `PictureMIMEType` / `PictureDescription` / `PictureWidth` /
-/// `PictureHeight` / `PictureBitsPerPixel` / `PictureIndexedColors` /
-/// `PictureLength` / `Picture` (binary).
+/// Build a single Vorbis bitrate `EmittedTag` (`MaximumBitrate` /
+/// `NominalBitrate` / `MinimumBitrate`). `bps` is the raw u32 value (already
+/// filtered against the `$val || undef` RawConv). The PrintConv path renders
+/// through [`crate::convert::write_convert_bitrate`] (the bundled
+/// `ConvertBitrate`, e.g. `"128 kbps"`) into a `TagValue::Str` — byte-
+/// identical to the retired `out.write_fmt(...)`; the `-n` path emits the raw
+/// u32 as `TagValue::U64`.
 #[cfg(feature = "alloc")]
-fn sink_ogg_picture(
+fn bitrate_tag(name: &'static str, bps: u32, print_conv: bool) -> crate::emit::EmittedTag {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let group = Group::new("Vorbis", "Vorbis");
+  if print_conv {
+    let mut s = std::string::String::new();
+    let _ = crate::convert::write_convert_bitrate(&mut s, f64::from(bps));
+    EmittedTag::new(group, name.into(), TagValue::Str(s.into()), false)
+  } else {
+    EmittedTag::new(group, name.into(), TagValue::U64(u64::from(bps)), false)
+  }
+}
+
+/// Push one [`OggPicture`]'s tags in faithful FLAC.pm:84-134 order onto
+/// `tags` (R3 F2: Vorbis `METADATA_BLOCK_PICTURE` SubDirectory hop into
+/// `%FLAC::Picture`, Vorbis.pm:122-134). Mirrors `flac::push_picture_tags`:
+/// `TagValue::Str` for PictureType (PrintConv) / MIME / Description,
+/// `TagValue::U64` for the numeric fields (incl. PictureType under `-n` and
+/// on a PrintConv hash miss), `TagValue::Bytes` for the Picture binary.
+/// Drops the Picture sub-field iff `length > 0 && data.is_empty()`
+/// (ExifTool::ReadValue clamp at ExifTool.pm:6292 `count < 1 and return
+/// undef`).
+#[cfg(feature = "alloc")]
+fn push_ogg_picture_tags(
+  tags: &mut Vec<crate::emit::EmittedTag>,
   p: &OggPicture,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  const GROUP: &str = "FLAC";
-  // PictureType — PrintConv hash (FLAC.pm:88-113). On a hash miss the
-  // Perl default falls back to the numeric value as a string; we emit
-  // the raw u32.
-  if print_conv {
-    if let Some(name) = p.picture_type_name() {
-      out.write_str(GROUP, "PictureType", name)?;
-    } else {
-      out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let group = || Group::new("FLAC", "FLAC");
+  // PictureType — PrintConv hash (FLAC.pm:88-113). On a hash miss the Perl
+  // default falls back to the numeric value as a string (we emit raw u32).
+  let picture_type = if print_conv {
+    match p.picture_type_name() {
+      Some(name) => TagValue::Str(name.into()),
+      None => TagValue::U64(u64::from(p.picture_type())),
     }
   } else {
-    out.write_u64(GROUP, "PictureType", u64::from(p.picture_type()))?;
-  }
-  out.write_str(GROUP, "PictureMIMEType", p.mime_type())?;
-  out.write_str(GROUP, "PictureDescription", p.description())?;
-  out.write_u64(GROUP, "PictureWidth", u64::from(p.width()))?;
-  out.write_u64(GROUP, "PictureHeight", u64::from(p.height()))?;
-  out.write_u64(GROUP, "PictureBitsPerPixel", u64::from(p.bits_per_pixel()))?;
-  out.write_u64(GROUP, "PictureIndexedColors", u64::from(p.indexed_colors()))?;
-  out.write_u64(GROUP, "PictureLength", u64::from(p.length()))?;
-  // Picture binary — same skip-on-zero-payload sentinel as FLAC's
-  // sink_picture (FLAC.pm:128-133 + ExifTool.pm:6292 ReadValue clamp).
+    TagValue::U64(u64::from(p.picture_type()))
+  };
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureType".into(),
+    picture_type,
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureMIMEType".into(),
+    TagValue::Str(p.mime_type().into()),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureDescription".into(),
+    TagValue::Str(p.description().into()),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureWidth".into(),
+    TagValue::U64(u64::from(p.width())),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureHeight".into(),
+    TagValue::U64(u64::from(p.height())),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureBitsPerPixel".into(),
+    TagValue::U64(u64::from(p.bits_per_pixel())),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureIndexedColors".into(),
+    TagValue::U64(u64::from(p.indexed_colors())),
+    false,
+  ));
+  tags.push(EmittedTag::new(
+    group(),
+    "PictureLength".into(),
+    TagValue::U64(u64::from(p.length())),
+    false,
+  ));
+  // Picture binary — same skip-on-zero-payload sentinel as FLAC
+  // (FLAC.pm:128-133 + ExifTool.pm:6292 ReadValue clamp).
   if p.length() > 0 && p.data().is_empty() {
     // Faithful skip — bundled ReadValue returns undef ⇒ no tag.
   } else {
-    out.write_bytes(GROUP, "Picture", p.data())?;
+    tags.push(EmittedTag::new(
+      group(),
+      "Picture".into(),
+      TagValue::Bytes(p.data().to_vec()),
+      false,
+    ));
   }
-  Ok(())
 }
 
-/// Emit a Vorbis bitrate field (`MaximumBitrate` / `NominalBitrate` /
-/// `MinimumBitrate`). `bps` is the raw u32 value (already filtered against
-/// the `$val || undef` RawConv). PrintConv path goes through
-/// [`crate::convert::write_convert_bitrate`] for the human-readable
-/// `"X kbps"`/`"X.X Mbps"` form (the bundled `ConvertBitrate`); the
-/// `-n` (no-PrintConv) path emits the raw u32 as a bare JSON integer.
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
 #[cfg(feature = "alloc")]
-fn emit_bitrate(
-  out: &mut crate::tagmap::TagMap,
-  name: &str,
-  bps: u32,
-  print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
-  if print_conv {
-    out.write_fmt("Vorbis", name, |w| {
-      crate::convert::write_convert_bitrate(w, f64::from(bps))
-    })
-  } else {
-    out.write_u64("Vorbis", name, u64::from(bps))
+impl crate::metadata::Project for Meta<'_> {
+  /// Project OGG metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// OGG (Vorbis / Opus / Theora-comments) is treated here as an audio
+  /// container: it carries no camera / lens / GPS / capture facts (those
+  /// domains stay `None`). The single structural contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind) — `%Vorbis::Identification`
+  /// (Vorbis.pm:42) and `%Opus::Header` (Opus.pm:38) both set
+  /// `GROUPS{2} => 'Audio'`.
+  ///
+  /// **Duration is `None`.** Unlike FLAC (which exposes a clean decoded
+  /// `Composite:Duration` from `TotalSamples / SampleRate`), OGG's
+  /// `Composite:Duration` (Vorbis.pm:138-147) needs the Composite engine +
+  /// a `File:FileSize` source and is on the formally-accepted deferral list
+  /// (see the module-level "Deliberate Phase-2 deferrals" note); the typed
+  /// [`Meta`] exposes no decoded `Option<Duration>` accessor, so there is
+  /// nothing clean to surface here. Dimensions / created stay `None` too.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -2502,7 +2655,30 @@ fn emit_bitrate(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::emit::{ConvMode, Taggable};
   use crate::tagmap::TagMap;
+
+  /// Drive a typed [`Meta`] through the golden [`run_emission`](crate::emit)
+  /// engine PLUS the `AnyMeta::Ogg` arm's warning/error drain, in the SAME
+  /// order the arm uses: (a) the chained ID3 sub-Meta's warnings then errors,
+  /// (b) OGG's own accumulated warnings in occurrence order. Mirrors
+  /// `format_parser.rs` exactly so the in-module tests exercise the same net
+  /// `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
+  fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
+    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    #[cfg(feature = "id3")]
+    if let Some(id3) = meta.id3_ref() {
+      for w in id3.warnings_slice() {
+        let _ = out.write_warning(w.as_str());
+      }
+      for e in id3.errors_slice() {
+        let _ = out.write_error(e.as_str());
+      }
+    }
+    for w in meta.warnings() {
+      let _ = out.write_warning(w.as_str());
+    }
+  }
 
   // `convert_bitrate` unit-tests live next to the helper in `convert.rs`
   // (the helper itself moved out of `formats/moi.rs` into `convert.rs` in
@@ -2865,7 +3041,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(
       w.get_str("Vorbis", "Vendor"),
       Some("test vendor".to_string())
@@ -2902,7 +3078,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut md = TagMap::new();
-    meta.serialize_tags(true, &mut md).unwrap();
+    emit_via_engine(&meta, true, &mut md);
     let artist = md.get("Vorbis", "Artist").expect("Artist tag");
     match artist {
       TagValue::List(items) => {
@@ -2934,7 +3110,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut w = TagMap::new();
-    meta.serialize_tags(true, &mut w).unwrap();
+    emit_via_engine(&meta, true, &mut w);
     assert_eq!(
       w.warnings(),
       &[
@@ -3184,7 +3360,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    emit_via_engine(&meta, true, &mut tm);
     // The insertion order is exactly the declared-offset order: every key
     // present in the map appears, NOT including the dropped bitrate fields.
     let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
@@ -3230,7 +3406,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut tm = TagMap::new();
-    meta.serialize_tags(false, &mut tm).unwrap();
+    emit_via_engine(&meta, false, &mut tm);
     // -n: NominalBitrate is the raw u32 = 128000 — written via write_u64,
     // so the TagMap holds a U64 value, not a Str.
     let v = tm.get("Vorbis", "NominalBitrate").expect("present");
@@ -3266,7 +3442,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    emit_via_engine(&meta, true, &mut tm);
     let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
     assert_eq!(
       keys,
@@ -3301,7 +3477,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    emit_via_engine(&meta, true, &mut tm);
     let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
     assert_eq!(
       keys,
@@ -3338,7 +3514,7 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    emit_via_engine(&meta, true, &mut tm);
     let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
     assert_eq!(
       keys,
@@ -3381,5 +3557,264 @@ mod tests {
         ),
       }
     }
+  }
+
+  // ---------- Golden-pattern `Taggable` / `Project` ----------------------
+
+  fn fixture(path: &str) -> Vec<u8> {
+    let root = env!("CARGO_MANIFEST_DIR");
+    std::fs::read(format!("{root}/tests/fixtures/{path}")).expect("fixture exists")
+  }
+
+  /// `Taggable::tags` drives the Vorbis comment block through `run_emission`:
+  /// the `Vorbis.ogg` fixture carries vendor + scalar comments (no PrintConv
+  /// on any Vorbis comment ⇒ `-j` and `-n` identical). Vendor + a known
+  /// scalar land under family-1 `"Vorbis"`.
+  #[test]
+  fn taggable_emits_vorbis_comments() {
+    let data = fixture("Vorbis.ogg");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    // Vendor is always emitted (Vorbis.pm:181-187).
+    assert!(w.get("Vorbis", "Vendor").is_some(), "Vorbis:Vendor present");
+    // The fixture carries an ENCODER comment among others; at least one
+    // scalar Vorbis comment beyond vendor must be present.
+    assert!(
+      w.entries()
+        .iter()
+        .any(|(k, _)| k.starts_with("Vorbis:") && k != "Vorbis:Vendor"),
+      "at least one Vorbis comment beyond vendor: {:?}",
+      w.entries()
+    );
+  }
+
+  /// `Taggable::tags` reproduces the Vorbis `List => 1` coalesce as ONE
+  /// `EmittedTag` carrying a `TagValue::List` (interleaved multi-value
+  /// fixture), driven through `run_emission` — the `-n` value is identical
+  /// (no PrintConv on Vorbis comment fields). Proves first-occurrence-position
+  /// coalescing survives the golden cutover.
+  #[test]
+  fn taggable_emits_vorbis_interleaved_list() {
+    let data = fixture("ogg_vorbis_interleaved_list.ogg");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    // Find the coalesced list comment (ARTIST/PERFORMER/CONTACT) in the
+    // typed Meta to learn its name + expected values.
+    let list = meta
+      .comments()
+      .iter()
+      .find_map(|c| c.try_unwrap_list_ref().ok())
+      .expect("an interleaved List comment is present");
+    let name = list.name().to_string();
+    let expected: Vec<String> = list.values_slice().iter().map(|s| s.to_string()).collect();
+    assert!(
+      expected.len() >= 2,
+      "interleaved fixture has >= 2 list values, got {expected:?}"
+    );
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let mut w = TagMap::new();
+      crate::emit::run_emission(&meta, mode, &mut w);
+      match w.get("Vorbis", &name) {
+        Some(TagValue::List(items)) => {
+          let got: Vec<String> = items
+            .iter()
+            .map(|v| match v {
+              TagValue::Str(s) => s.to_string(),
+              other => panic!("non-Str list element {other:?}"),
+            })
+            .collect();
+          assert_eq!(got, expected, "mode={mode:?} interleaved list order");
+        }
+        other => panic!("expected coalesced Vorbis:{name} List, got {other:?} (mode={mode:?})"),
+      }
+    }
+  }
+
+  /// `Taggable::tags(-j)` renders the Opus header (`synthetic_opus_minimal.opus`):
+  /// OpusVersion / AudioChannels / SampleRate as raw numerics, OutputGain as
+  /// the post-ValueConv f64. Group family-0/1 is `"Opus"`.
+  #[test]
+  fn taggable_emits_opus_header() {
+    let data = fixture("synthetic_opus_minimal.opus");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    assert!(
+      meta.opus_header().is_some(),
+      "fixture carries an OpusHead packet"
+    );
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    // OpusVersion present and family-1 group is "Opus".
+    assert!(w.get("Opus", "OpusVersion").is_some(), "Opus:OpusVersion");
+    // No Vorbis-identification fields under an Opus stream.
+    assert!(
+      w.get("Vorbis", "VorbisVersion").is_none(),
+      "Opus stream has no Vorbis:VorbisVersion"
+    );
+  }
+
+  /// `Taggable::tags(-j)` renders the `METADATA_BLOCK_PICTURE` Picture
+  /// sub-fields (the `Opus.opus` fixture carries one): PictureType resolves
+  /// via the PrintConv hash ("Front Cover"), the Picture binary is a
+  /// `TagValue::Bytes`, all under the `FLAC` family-1 group (the SubDirectory
+  /// target). `-n` emits the raw numeric PictureType.
+  #[test]
+  fn taggable_emits_metadata_block_picture() {
+    let data = fixture("Opus.opus");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    assert!(
+      !meta.pictures().is_empty(),
+      "Opus.opus carries a METADATA_BLOCK_PICTURE"
+    );
+    // -j: PrintConv name + binary bytes under the FLAC group.
+    let mut w = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    assert_eq!(
+      w.get_str("FLAC", "PictureType"),
+      Some("Front Cover".to_string())
+    );
+    assert!(matches!(w.get("FLAC", "Picture"), Some(TagValue::Bytes(_))));
+    assert_eq!(
+      w.get_str("FLAC", "PictureMIMEType"),
+      Some("image/png".to_string())
+    );
+    // -n: raw numeric PictureType (3 = Front Cover).
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    assert_eq!(wn.get_str("FLAC", "PictureType"), Some("3".to_string()));
+  }
+
+  /// Group identity: Vorbis identification + comments carry family-1
+  /// `"Vorbis"`; Opus header tags `"Opus"`; Picture sub-fields `"FLAC"`. Each
+  /// sub-table's family-0 == family-1. Every tag is known ⇒ `!unknown`.
+  #[test]
+  fn taggable_group_family0_and_family1_per_subtable() {
+    // Opus.opus exercises Opus:* header tags + FLAC:* Picture sub-fields +
+    // Vorbis:* comments in one stream.
+    let data = fixture("Opus.opus");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    assert!(!tags.is_empty());
+    let mut saw_opus = false;
+    let mut saw_flac = false;
+    let mut saw_vorbis = false;
+    for t in &tags {
+      let g = t.tag().group_ref();
+      assert!(!t.unknown(), "tag {} should be known", t.tag().name());
+      // family-0 == family-1 across OGG's sub-tables (Vorbis comments under a
+      // Theora stream would differ, but Opus.opus has no Theora stream).
+      assert_eq!(
+        g.family0(),
+        g.family1(),
+        "tag {} family0 == family1",
+        t.tag().name()
+      );
+      match g.family1() {
+        "Opus" => saw_opus = true,
+        "FLAC" => saw_flac = true,
+        "Vorbis" => saw_vorbis = true,
+        // ID3 prefix is possible on some fixtures but not Opus.opus.
+        other => panic!("unexpected OGG group {other:?} for {}", t.tag().name()),
+      }
+    }
+    assert!(saw_opus, "Opus:* header tags present");
+    assert!(saw_flac, "FLAC:* Picture sub-fields present");
+    assert!(saw_vorbis, "Vorbis:* comment tags present");
+  }
+
+  /// An ID3-prefixed OGG (`ogg_id3_prefixed.ogg`) splices the chained ID3 tags
+  /// FIRST inside `tags()` — proving the `id3.tags(mode)` position matches the
+  /// retired `id3.serialize_tags` call site (BEFORE the OGG body). A spliced
+  /// ID3 tag precedes the first `Vorbis:*` tag.
+  #[test]
+  #[cfg(feature = "id3")]
+  fn taggable_chains_id3_before_ogg_body() {
+    let data = fixture("ogg_id3_prefixed.ogg");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
+    let names: Vec<String> = meta
+      .tags(ConvMode::PrintConv)
+      .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
+      .collect();
+    let id3_pos = names
+      .iter()
+      .position(|n| n.starts_with("ID3v2") || n == "File:ID3Size")
+      .expect("an ID3 tag is spliced");
+    let body_pos = names
+      .iter()
+      .position(|n| n.starts_with("Vorbis:") || n.starts_with("Opus:"))
+      .expect("an OGG body tag emitted");
+    assert!(
+      id3_pos < body_pos,
+      "ID3 tags must precede the OGG body (id3_pos={id3_pos}, body_pos={body_pos}): {names:?}"
+    );
+    // Driven through the engine arm, both the ID3 prefix and the OGG body land.
+    let mut w = TagMap::new();
+    emit_via_engine(&meta, true, &mut w);
+    assert!(
+      w.entries()
+        .iter()
+        .any(|(k, _)| k.starts_with("ID3v2") || k == "File:ID3Size"),
+      "ID3 tags present in the engine output"
+    );
+    assert!(
+      w.entries().iter().any(|(k, _)| k.starts_with("Vorbis:")),
+      "OGG body tags present in the engine output"
+    );
+  }
+
+  /// The bitrate PrintConv path: a Vorbis identification with a non-zero
+  /// NominalBitrate emits `ConvertBitrate` ("128 kbps") under `-j` and the raw
+  /// u32 under `-n` — driven through `run_emission` (proves `bitrate_tag`
+  /// matches the retired `emit_bitrate` byte-for-byte).
+  #[test]
+  fn taggable_bitrate_printconv_vs_valueconv() {
+    let meta = Meta {
+      #[cfg(feature = "id3")]
+      id3: None,
+      pictures: vec![],
+      file_type_override: None,
+      vorbis_identification: Some(VorbisIdentification {
+        vorbis_version: Some(0),
+        audio_channels: Some(2),
+        sample_rate: Some(44_100),
+        maximum_bitrate: None,
+        nominal_bitrate: Some(128_000),
+        minimum_bitrate: None,
+      }),
+      opus_header: None,
+      comments: vec![],
+      warnings: vec![],
+      success: true,
+      _marker: core::marker::PhantomData,
+    };
+    let mut wj = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut wj);
+    assert_eq!(
+      wj.get_str("Vorbis", "NominalBitrate"),
+      Some("128 kbps".to_string())
+    );
+    let mut wn = TagMap::new();
+    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    assert!(matches!(wn.get("Vorbis", "NominalBitrate"), Some(TagValue::U64(n)) if *n == 128_000));
+  }
+
+  /// `Project` reports OGG as audio-only (one `TrackKind::Audio`), no
+  /// camera / lens / GPS / capture / dimensions, and `duration == None`
+  /// (Composite:Duration is a formally-accepted deferral — no clean decoded
+  /// accessor on the typed Meta).
+  #[test]
+  fn project_is_audio_only_no_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let data = fixture("Vorbis.ogg");
+    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let md = Project::project(&meta);
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(md.media().duration().is_none());
+    assert!(md.media().width().is_none());
+    assert!(md.media().height().is_none());
+    assert!(md.camera().is_none());
+    assert!(md.lens().is_none());
+    assert!(md.gps().is_none());
+    assert!(md.capture().is_none());
   }
 }

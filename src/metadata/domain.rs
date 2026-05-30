@@ -118,6 +118,19 @@ impl CameraInfo {
     self.software = v;
     self
   }
+
+  /// Field-by-field merge: `self`'s `Some` wins; each `None` field is
+  /// filled from `other`. The precedence the [`MediaMetadata::merge`]
+  /// aggregate relies on — a higher-priority source (`self`) overrides a
+  /// lower-priority one (`other`) per field, never wholesale.
+  #[must_use]
+  pub fn merge(mut self, other: Self) -> Self {
+    self.make = self.make.or(other.make);
+    self.model = self.model.or(other.model);
+    self.serial = self.serial.or(other.serial);
+    self.software = self.software.or(other.software);
+    self
+  }
 }
 
 impl Default for CameraInfo {
@@ -221,6 +234,18 @@ impl LensInfo {
   #[inline(always)]
   pub const fn update_aperture(&mut self, v: Option<f64>) -> &mut Self {
     self.aperture = v;
+    self
+  }
+
+  /// Field-by-field merge: `self`'s `Some` wins; each `None` field is
+  /// filled from `other`. See [`MediaMetadata::merge`] for the precedence
+  /// contract.
+  #[must_use]
+  pub fn merge(mut self, other: Self) -> Self {
+    self.make = self.make.or(other.make);
+    self.model = self.model.or(other.model);
+    self.focal_length_mm = self.focal_length_mm.or(other.focal_length_mm);
+    self.aperture = self.aperture.or(other.aperture);
     self
   }
 }
@@ -328,6 +353,18 @@ impl GpsLocation {
     self.timestamp = v;
     self
   }
+
+  /// Field-by-field merge: `self`'s `Some` wins; each `None` field is
+  /// filled from `other`. See [`MediaMetadata::merge`] for the precedence
+  /// contract.
+  #[must_use]
+  pub fn merge(mut self, other: Self) -> Self {
+    self.latitude = self.latitude.or(other.latitude);
+    self.longitude = self.longitude.or(other.longitude);
+    self.altitude_m = self.altitude_m.or(other.altitude_m);
+    self.timestamp = self.timestamp.or(other.timestamp);
+    self
+  }
 }
 
 impl Default for GpsLocation {
@@ -412,6 +449,25 @@ impl CaptureSettings {
   #[inline(always)]
   pub const fn update_f_number(&mut self, v: Option<f64>) -> &mut Self {
     self.f_number = v;
+    self
+  }
+
+  /// Field-by-field merge: `self`'s `Some` wins; each `None` field is
+  /// filled from `other`. See [`MediaMetadata::merge`] for the precedence
+  /// contract.
+  #[must_use]
+  pub const fn merge(mut self, other: Self) -> Self {
+    // `Option::or` is not yet `const`; expand it by hand so this stays a
+    // `const fn` (every field here is `Copy`).
+    if self.exposure_time_s.is_none() {
+      self.exposure_time_s = other.exposure_time_s;
+    }
+    if self.iso.is_none() {
+      self.iso = other.iso;
+    }
+    if self.f_number.is_none() {
+      self.f_number = other.f_number;
+    }
     self
   }
 }
@@ -540,6 +596,21 @@ impl MediaInfo {
   #[inline(always)]
   pub const fn track_kinds_mut(&mut self) -> &mut Vec<TrackKind> {
     &mut self.track_kinds
+  }
+
+  /// Field-by-field merge: `self`'s `Some` (and non-empty `track_kinds`)
+  /// wins; each gap is filled from `other`. See [`MediaMetadata::merge`]
+  /// for the precedence contract.
+  #[must_use]
+  pub fn merge(mut self, other: Self) -> Self {
+    self.duration = self.duration.or(other.duration);
+    self.width = self.width.or(other.width);
+    self.height = self.height.or(other.height);
+    self.created = self.created.or(other.created);
+    if self.track_kinds.is_empty() {
+      self.track_kinds = other.track_kinds;
+    }
+    self
   }
 }
 
@@ -815,6 +886,47 @@ impl MediaMetadata {
     self.capture = Some(capture);
     self
   }
+
+  /// Combine two projections into one, with `self` taking precedence.
+  ///
+  /// The merge is **field-by-field, not domain-by-domain**: for every leaf
+  /// field, `self`'s `Some` value wins and `other` only fills the gaps
+  /// where `self` is `None`. The always-present [`MediaInfo`] merges the
+  /// same way ([`MediaInfo::merge`]); each optional domain
+  /// ([`CameraInfo`] / [`LensInfo`] / [`GpsLocation`] / [`CaptureSettings`])
+  /// is combined per-field when both sides carry it, or taken wholesale
+  /// when only one does.
+  ///
+  /// This is the seam that lets a base projection (e.g. EXIF IFD0/ExifIFD)
+  /// be enriched by a secondary, more-specific source (e.g. the vendor
+  /// MakerNote) without either clobbering the other: the caller puts the
+  /// higher-priority source on the left (`self`) and the fallback on the
+  /// right (`other`).
+  #[must_use]
+  pub fn merge(self, other: Self) -> Self {
+    Self {
+      media: self.media.merge(other.media),
+      camera: merge_opt(self.camera, other.camera, CameraInfo::merge),
+      lens: merge_opt(self.lens, other.lens, LensInfo::merge),
+      gps: merge_opt(self.gps, other.gps, GpsLocation::merge),
+      capture: merge_opt(self.capture, other.capture, CaptureSettings::merge),
+    }
+  }
+}
+
+/// Combine two optional domains: when both are present, `merge` them
+/// (`self`-field-wins, per the domain's own `merge`); when only one is
+/// present, take it; when neither, `None`. The single helper every
+/// optional [`MediaMetadata`] domain routes through so the
+/// field-by-field precedence is uniform.
+#[inline]
+fn merge_opt<T>(lhs: Option<T>, rhs: Option<T>, merge: impl FnOnce(T, T) -> T) -> Option<T> {
+  match (lhs, rhs) {
+    (Some(a), Some(b)) => Some(merge(a, b)),
+    (Some(a), None) => Some(a),
+    (None, Some(b)) => Some(b),
+    (None, None) => None,
+  }
 }
 
 impl Default for MediaMetadata {
@@ -913,5 +1025,69 @@ mod tests {
     m.set_camera(cam);
     assert_eq!(m.camera().expect("camera").make(), Some("Apple"));
     assert!(!m.camera().expect("camera").is_empty());
+  }
+
+  #[test]
+  fn merge_self_some_wins_other_fills_gaps() {
+    // `self`: make + model set, serial absent.
+    let mut base_cam = CameraInfo::new();
+    base_cam
+      .update_make(Some("Canon".into()))
+      .update_model(Some("EOS".into()));
+    let mut base = MediaMetadata::new();
+    base.set_camera(base_cam);
+
+    // `other`: make DIFFERENT (must NOT win), serial present (fills the gap).
+    let mut over_cam = CameraInfo::new();
+    over_cam
+      .update_make(Some("Nikon".into()))
+      .update_serial(Some("SN-123".into()));
+    let mut over = MediaMetadata::new();
+    over.set_camera(over_cam);
+
+    let merged = base.merge(over);
+    let cam = merged.camera().expect("camera present");
+    // self's Some wins on a conflicting field…
+    assert_eq!(cam.make(), Some("Canon"));
+    assert_eq!(cam.model(), Some("EOS"));
+    // …and other fills the field self left None.
+    assert_eq!(cam.serial(), Some("SN-123"));
+  }
+
+  #[test]
+  fn merge_takes_domain_present_on_only_one_side() {
+    // `self` carries only lens; `other` carries only gps. Neither is lost.
+    let mut lens = LensInfo::new();
+    lens.update_model(Some("EF 50mm".into()));
+    let mut base = MediaMetadata::new();
+    base.set_lens(lens);
+
+    let mut gps = GpsLocation::new();
+    gps.update_latitude(Some(48.5));
+    let mut other = MediaMetadata::new();
+    other.set_gps(gps);
+
+    let merged = base.merge(other);
+    assert_eq!(merged.lens().expect("lens").model(), Some("EF 50mm"));
+    assert_eq!(merged.gps().expect("gps").latitude(), Some(48.5));
+    // A domain absent on both stays absent.
+    assert!(merged.capture().is_none());
+  }
+
+  #[test]
+  fn merge_media_info_is_field_wise() {
+    // self: width set, height absent; other: both set (height fills, width
+    // does NOT overwrite).
+    let mut base = MediaMetadata::new();
+    base.media_mut().update_width(Some(1920));
+    let mut other = MediaMetadata::new();
+    other
+      .media_mut()
+      .update_width(Some(640))
+      .update_height(Some(480));
+
+    let merged = base.merge(other);
+    assert_eq!(merged.media().width(), Some(1920)); // self wins
+    assert_eq!(merged.media().height(), Some(480)); // other fills the gap
   }
 }

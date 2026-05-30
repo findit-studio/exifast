@@ -1335,208 +1335,339 @@ fn tag_str_to_static(s: &str) -> &'static str {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit AIFF tags into the writer in faithful chunk-order plus the
-  /// post-loop Composite Duration. `print_conv = true` ⇒ PrintConv
-  /// formatted strings (`-j` mode); `print_conv = false` ⇒ post-ValueConv
-  /// raw scalars (`-n` mode).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield AIFF tags in faithful chunk-order plus the post-loop Composite
+  /// `Duration`. The golden-pattern parallel to the retired
+  /// `serialize_tags`: the SINK changes (an [`EmittedTag`](crate::emit::EmittedTag)
+  /// per value instead of `out.write_*`), but the emission ORDER, the
+  /// per-tag PrintConv/ValueConv branches, and the value variants are
+  /// preserved verbatim.
   ///
-  /// The DjVu branch (AIFF.pm:202-207) emits NO body tags — only the
-  /// File:* triplet from SetFileType (driven outside this sink path by
-  /// the legacy bridge). The (multi-page) suffix is handled by the
-  /// bridge re-rewriting File:FileType.
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv-formatted strings;
+  /// `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars.
+  ///
+  /// Group: AIFF tags use `family0 = family1 = "AIFF"` (AIFF.pm:32 sets only
+  /// `GROUPS{2} => 'Audio'`, so family-0/1 default to the table name "AIFF",
+  /// verified against the `AIFF.aif` oracle's `AIFF:Name` etc.). The post-loop
+  /// Composite `Duration` (AIFF.pm:136-145) is in ExifTool's own `Composite`
+  /// table ⇒ `family0 = family1 = "Composite"`. Only family-1 reaches the
+  /// `-G1` conformance key (`exiftool:2948`); family-0 is carried faithfully
+  /// for the later `iter_tags`. Every AIFF tag is a known tag (no `Unknown=>1`
+  /// in any AIFF table) ⇒ `unknown: false`.
+  ///
+  /// The DjVu branch (AIFF.pm:202-207) emits NO body tags — only the File:*
+  /// triplet from `SetFileType` (driven outside the emission path by the
+  /// engine's `finalize_file_type` arm). The `(multi-page)` suffix is handled
+  /// there too.
+  ///
+  /// Warnings ([`AiffEvent::Warning`]) are NOT part of the tag stream:
+  /// `run_emission` has no warning channel. They are drained from
+  /// [`Meta::warnings`] in the `AnyMeta::Aiff` `serialize_tags` arm
+  /// (`format_parser.rs`), surfacing through `TagMap::first_warning` as the
+  /// `ExifTool:Warning` tag — faithful, and order-independent of the tag
+  /// stream (warnings accumulate in their own channel).
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "AIFF";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
 
+    // Family-0/1 "AIFF" for every AIFF tag (see fn docs).
+    let aiff = || Group::new("AIFF", "AIFF");
+    // `-j` (PrintConv) vs `-n` (ValueConv) maps to the `print_conv` bool the
+    // retired `serialize_tags` threaded.
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: Vec<EmittedTag> = Vec::new();
+
+    // DjVu body parsing is deferred (see module doc). The emission path emits
+    // nothing here; the File:FileType suffix is handled by the engine's
+    // `finalize_file_type` arm.
     if self.magic == Magic::Djvu {
-      // DjVu body parsing is deferred (see module doc). Sink emits
-      // nothing here; the File:FileType suffix is handled by the engine
-      // entry `process` directly on `ctx.metadata()`.
-      return Ok(());
+      return tags.into_iter();
     }
 
     for ev in &self.events {
       match ev {
-        AiffEvent::Warning(w) => {
-          out.write_warning(w)?;
-        }
+        // Warnings are surfaced via the arm draining `Meta::warnings()`, not
+        // through the tag stream (`run_emission` has no warning channel).
+        AiffEvent::Warning(_) => {}
         AiffEvent::FormatVersionTime(s) => {
           // ValueConv ConvertUnixTime ⇒ already formatted; PrintConv
           // ConvertDateTime is identity under default options ⇒ same
           // string under `-j` and `-n`.
-          out.write_str(GROUP, "FormatVersionTime", s)?;
+          tags.push(EmittedTag::new(
+            aiff(),
+            "FormatVersionTime".into(),
+            TagValue::Str(s.as_str().into()),
+            false,
+          ));
         }
-        AiffEvent::Common(c) => sink_common(out, c, print_conv)?,
-        AiffEvent::Comment(c) => sink_comment(out, c)?,
-        AiffEvent::Name(s) => out.write_str(GROUP, "Name", s)?,
-        AiffEvent::Author(s) => out.write_str(GROUP, "Author", s)?,
-        AiffEvent::Copyright(s) => out.write_str(GROUP, "Copyright", s)?,
-        AiffEvent::Annotation(s) => out.write_str(GROUP, "Annotation", s)?,
+        AiffEvent::Common(c) => push_common(&mut tags, c, print_conv),
+        AiffEvent::Comment(c) => push_comment(&mut tags, c),
+        AiffEvent::Name(s) => tags.push(EmittedTag::new(
+          aiff(),
+          "Name".into(),
+          TagValue::Str(s.as_str().into()),
+          false,
+        )),
+        AiffEvent::Author(s) => tags.push(EmittedTag::new(
+          aiff(),
+          "Author".into(),
+          TagValue::Str(s.as_str().into()),
+          false,
+        )),
+        AiffEvent::Copyright(s) => tags.push(EmittedTag::new(
+          aiff(),
+          "Copyright".into(),
+          TagValue::Str(s.as_str().into()),
+          false,
+        )),
+        AiffEvent::Annotation(s) => tags.push(EmittedTag::new(
+          aiff(),
+          "Annotation".into(),
+          TagValue::Str(s.as_str().into()),
+          false,
+        )),
         AiffEvent::ApplicationData(b) => {
           // Bundled-Perl emits APPL raw bytes through FixUTF8 (XMP.pm:2943
           // under EscapeJSON). Codex R3 verified an APPL signature like
           // `\x80ABC` lands as `"?ABC"` in JSON. We materialize the
-          // FixUTF8 text here and emit as Str (the writer's Str path
+          // FixUTF8 text here and emit as Str (the sink's Str path
           // ⇒ Metadata::push of TagValue::Str ⇒ EscapeJSON of an
           // already-valid UTF-8 string, identity).
           let fixed = crate::convert::fix_utf8(b);
-          out.write_str(GROUP, "ApplicationData", &fixed)?;
+          tags.push(EmittedTag::new(
+            aiff(),
+            "ApplicationData".into(),
+            TagValue::Str(fixed.as_str().into()),
+            false,
+          ));
         }
       }
     }
 
-    // Composite Duration (AIFF.pm:136-145). Emitted POST-chunk-loop in
-    // the bundled-Perl AddCompositeTags pass.
+    // Composite Duration (AIFF.pm:136-145). Emitted POST-chunk-loop in the
+    // bundled-Perl AddCompositeTags pass. Group is ExifTool's own `Composite`
+    // table (family-0/1 = "Composite").
     if let Some(secs) = self.composite_duration {
-      if print_conv {
+      let value = if print_conv {
         // PrintConv = ConvertDuration. ConvertDuration's `unless
         // IsFloat($time)` early-return is wired through
-        // `perl_nonfinite_str` for byte-exact casing of Inf/NaN.
-        out.write_fmt("Composite", "Duration", |w| {
-          w.write_str(&convert_duration(secs))
-        })?;
+        // `perl_nonfinite_str` for byte-exact casing of Inf/NaN — but
+        // `convert_duration` already routes non-finite values through it, so
+        // the formatted string is byte-exact either way.
+        TagValue::Str(convert_duration(secs).into())
+      } else if let Some(non_finite) = perl_nonfinite_str(secs) {
+        // `-n` mode, non-finite. Perl still emits the titlecase text (the
+        // serializer's `EscapeJSON` quotes non-numeric scalars); a
+        // `TagValue::Str` reproduces that quoted string.
+        TagValue::Str(non_finite.into())
       } else {
-        // `-n` mode. For non-finite values Perl still emits the titlecase
-        // text (the serializer's `EscapeJSON` quotes non-numeric scalars);
-        // we use `write_fmt` with `perl_nonfinite_str` to keep the writer
-        // path stable, and use `write_f64` for the finite case so the
-        // serializer's bare-number gate applies.
-        if let Some(non_finite) = perl_nonfinite_str(secs) {
-          out.write_fmt("Composite", "Duration", |w| w.write_str(non_finite))?;
-        } else {
-          out.write_f64("Composite", "Duration", secs)?;
-        }
-      }
+        // `-n` mode, finite. `TagValue::F64` routes through the serializer's
+        // bare-number gate (byte-identical to the retired `write_f64`).
+        TagValue::F64(secs)
+      };
+      tags.push(EmittedTag::new(
+        Group::new("Composite", "Composite"),
+        "Duration".into(),
+        value,
+        false,
+      ));
     }
-    Ok(())
+
+    tags.into_iter()
   }
 }
 
+/// Push the `%AIFF::Common` (COMM) sub-fields in `ExifTool.pm:9907`
+/// `sort { $a <=> $b }` iteration order — keys 0, 1, 3, 4, 9, 11. Each tag is
+/// emitted exactly as `process_binary_data` + `convert::apply` produced it
+/// (byte-identical to the retired `sink_common`).
 #[cfg(feature = "alloc")]
-fn sink_common(
-  out: &mut crate::tagmap::TagMap,
-  c: &Common,
-  print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
-  const GROUP: &str = "AIFF";
-  // ExifTool.pm:9907 `sort { $a <=> $b }` iteration order — keys are
-  // 0, 1, 3, 4, 9, 11. Each tag is emitted exactly as
-  // process_binary_data + convert::apply produced it.
+fn push_common(tags: &mut Vec<crate::emit::EmittedTag>, c: &Common, print_conv: bool) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let aiff = || Group::new("AIFF", "AIFF");
 
   // 0 NumChannels (int16u)
-  out.write_i64(GROUP, "NumChannels", i64::from(c.num_channels))?;
+  tags.push(EmittedTag::new(
+    aiff(),
+    "NumChannels".into(),
+    TagValue::I64(i64::from(c.num_channels)),
+    false,
+  ));
   // 1 NumSampleFrames (int32u)
-  out.write_u64(GROUP, "NumSampleFrames", u64::from(c.num_sample_frames))?;
+  tags.push(EmittedTag::new(
+    aiff(),
+    "NumSampleFrames".into(),
+    TagValue::U64(u64::from(c.num_sample_frames)),
+    false,
+  ));
   // 3 SampleSize (int16u)
-  out.write_i64(GROUP, "SampleSize", i64::from(c.sample_size))?;
+  tags.push(EmittedTag::new(
+    aiff(),
+    "SampleSize".into(),
+    TagValue::I64(i64::from(c.sample_size)),
+    false,
+  ));
   // 4 SampleRate (extended)
-  sink_sample_rate(out, &c.sample_rate)?;
-  // 9 CompressionType (string[4], AIFC only). PrintConv hash applied
-  //   at sink time (or `-n` raw text).
+  push_sample_rate(tags, &c.sample_rate);
+  // 9 CompressionType (string[4], AIFC only). PrintConv hash applied here
+  //   (or `-n` raw text).
   if let Some(CompressionType::RawText(raw)) = &c.compression_type {
     let key = crate::convert::fix_utf8(raw);
-    if print_conv {
+    let value = if print_conv {
       // PrintConv hash lookup. Miss ⇒ "Unknown (X)" where X is the
       // FixUTF8-coerced text (faithful to ExifTool's default-PrintConv
       // fallback path).
-      let display = match key.as_str() {
-        "NONE" => "None",
-        "ACE2" => "ACE 2-to-1",
-        "ACE8" => "ACE 8-to-3",
-        "MAC3" => "MAC 3-to-1",
-        "MAC6" => "MAC 6-to-1",
-        "sowt" => "Little-endian, no compression",
-        "alaw" => "a-law",
-        "ALAW" => "A-law",
-        "ulaw" => "mu-law",
-        "ULAW" => "Mu-law",
-        "GSM " => "GSM",
-        "G722" => "G722",
-        "G726" => "G726",
-        "G728" => "G728",
-        other => {
-          let formatted = format!("Unknown ({other})");
-          out.write_fmt(GROUP, "CompressionType", |w| w.write_str(&formatted))?;
-          // Continue to CompressorName below (no early return).
-          return sink_compressor_name(out, c, print_conv);
-        }
-      };
-      out.write_str(GROUP, "CompressionType", display)?;
+      match key.as_str() {
+        "NONE" => TagValue::Str("None".into()),
+        "ACE2" => TagValue::Str("ACE 2-to-1".into()),
+        "ACE8" => TagValue::Str("ACE 8-to-3".into()),
+        "MAC3" => TagValue::Str("MAC 3-to-1".into()),
+        "MAC6" => TagValue::Str("MAC 6-to-1".into()),
+        "sowt" => TagValue::Str("Little-endian, no compression".into()),
+        "alaw" => TagValue::Str("a-law".into()),
+        "ALAW" => TagValue::Str("A-law".into()),
+        "ulaw" => TagValue::Str("mu-law".into()),
+        "ULAW" => TagValue::Str("Mu-law".into()),
+        "GSM " => TagValue::Str("GSM".into()),
+        "G722" => TagValue::Str("G722".into()),
+        "G726" => TagValue::Str("G726".into()),
+        "G728" => TagValue::Str("G728".into()),
+        other => TagValue::Str(format!("Unknown ({other})").into()),
+      }
     } else {
       // `-n`: emit the raw FixUTF8'd text. Faithful to Perl `-j -n`:
       // the value is whatever `$val` was after ValueConv (None ⇒ raw
       // FixUTF8 string).
-      out.write_str(GROUP, "CompressionType", &key)?;
-    }
+      TagValue::Str(key.as_str().into())
+    };
+    tags.push(EmittedTag::new(
+      aiff(),
+      "CompressionType".into(),
+      value,
+      false,
+    ));
   }
   // 11 CompressorName (pstring, MacRoman-decoded)
-  sink_compressor_name(out, c, print_conv)?;
-  Ok(())
+  push_compressor_name(tags, c);
 }
 
+/// Push `CompressorName` (pstring, MacRoman-decoded) when present. No
+/// conversions — identical under `-j`/`-n` (byte-identical to the retired
+/// `sink_compressor_name`).
 #[cfg(feature = "alloc")]
-fn sink_compressor_name(
-  out: &mut crate::tagmap::TagMap,
-  c: &Common,
-  _print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+fn push_compressor_name(tags: &mut Vec<crate::emit::EmittedTag>, c: &Common) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
   if let Some(name) = &c.compressor_name {
-    out.write_str("AIFF", "CompressorName", name)?;
-  }
-  Ok(())
-}
-
-#[cfg(feature = "alloc")]
-fn sink_sample_rate(
-  out: &mut crate::tagmap::TagMap,
-  sr: &SampleRate,
-) -> Result<(), core::convert::Infallible> {
-  // Spec §8: extended → I64 (Perl IV), F64 (Perl NV), or Str("<decimal>")
-  // (Perl UV path, > i64::MAX positive). The writer routes:
-  //   - I64 ⇒ bare number JSON (write_i64)
-  //   - F64 ⇒ bare number JSON or quoted Inf/-Inf/NaN (write_f64
-  //     for finite; write_fmt for non-finite via perl_nonfinite_str)
-  //   - BigUInt(s) ⇒ Str token; serializer quotes > 15-digit text
-  //     (write_str)
-  match sr {
-    SampleRate::Int(n) => out.write_i64("AIFF", "SampleRate", *n),
-    SampleRate::BigUInt(s) => out.write_str("AIFF", "SampleRate", s),
-    SampleRate::Float(x) => {
-      if let Some(non_finite) = perl_nonfinite_str(*x) {
-        out.write_fmt("AIFF", "SampleRate", |w| w.write_str(non_finite))
-      } else {
-        out.write_f64("AIFF", "SampleRate", *x)
-      }
-    }
+    tags.push(EmittedTag::new(
+      Group::new("AIFF", "AIFF"),
+      "CompressorName".into(),
+      TagValue::Str(name.as_str().into()),
+      false,
+    ));
   }
 }
 
+/// Push the `SampleRate` (80-bit extended) in its faithful Perl scalar shape
+/// (byte-identical to the retired `sink_sample_rate`):
+///   - [`SampleRate::Int`] ⇒ `TagValue::I64` (bare number JSON)
+///   - [`SampleRate::BigUInt`] ⇒ `TagValue::Str` (serializer quotes the
+///     > 15-digit text — the Perl UV path)
+///   - [`SampleRate::Float`] finite ⇒ `TagValue::F64` (bare number JSON);
+///     non-finite ⇒ `TagValue::Str("Inf"/"-Inf"/"NaN")` via
+///     [`perl_nonfinite_str`].
 #[cfg(feature = "alloc")]
-fn sink_comment(
-  out: &mut crate::tagmap::TagMap,
-  c: &Comment,
-) -> Result<(), core::convert::Infallible> {
-  const GROUP: &str = "AIFF";
+fn push_sample_rate(tags: &mut Vec<crate::emit::EmittedTag>, sr: &SampleRate) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let value = match sr {
+    SampleRate::Int(n) => TagValue::I64(*n),
+    SampleRate::BigUInt(s) => TagValue::Str(s.as_str().into()),
+    SampleRate::Float(x) => match perl_nonfinite_str(*x) {
+      Some(non_finite) => TagValue::Str(non_finite.into()),
+      None => TagValue::F64(*x),
+    },
+  };
+  tags.push(EmittedTag::new(
+    Group::new("AIFF", "AIFF"),
+    "SampleRate".into(),
+    value,
+    false,
+  ));
+}
+
+/// Push one `%AIFF::Comment` entry's sub-fields in `(CommentTime, [MarkerID],
+/// Comment)` order (AIFF.pm:169-174; byte-identical to the retired
+/// `sink_comment`).
+#[cfg(feature = "alloc")]
+fn push_comment(tags: &mut Vec<crate::emit::EmittedTag>, c: &Comment) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let aiff = || Group::new("AIFF", "AIFF");
   // AIFF.pm:169 — CommentTime always emitted. PrintConv is identity
   // (ConvertDateTime under default options).
-  out.write_str(GROUP, "CommentTime", &c.comment_time)?;
+  tags.push(EmittedTag::new(
+    aiff(),
+    "CommentTime".into(),
+    TagValue::Str(c.comment_time.as_str().into()),
+    false,
+  ));
   // AIFF.pm:170 — MarkerID emitted only when non-zero (we stash None
   // when raw was 0).
   if let Some(mid) = c.marker_id {
-    out.write_i64(GROUP, "MarkerID", i64::from(mid))?;
+    tags.push(EmittedTag::new(
+      aiff(),
+      "MarkerID".into(),
+      TagValue::I64(i64::from(mid)),
+      false,
+    ));
   }
   // AIFF.pm:173-174 — Comment text emitted regardless (when truncated
   // we emit empty per the stage_comments overrun branch).
-  out.write_str(GROUP, "Comment", &c.comment)?;
-  Ok(())
+  tags.push(EmittedTag::new(
+    aiff(),
+    "Comment".into(),
+    TagValue::Str(c.comment.as_str().into()),
+    false,
+  ));
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project AIFF metadata onto the normalized [`MediaMetadata`] domain.
+  ///
+  /// AIFF is an audio container (`%AIFF::Main` `GROUPS{2} => 'Audio'`,
+  /// AIFF.pm:32). The faithful [`MediaInfo`](crate::metadata::MediaInfo)
+  /// contributions are the recording duration (the Composite `Duration`,
+  /// AIFF.pm:136-145, when finite and non-negative) and a single audio
+  /// [`TrackKind`](crate::metadata::TrackKind). Dimensions / created stay
+  /// `None` (AIFF decodes neither pixel size nor a container creation
+  /// timestamp — `FormatVersionTime`/`CommentTime` are chunk-local, not the
+  /// file's creation time). Camera / lens / GPS / capture stay `None`
+  /// (AIFF carries no such facts).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    // `Meta::duration` already gates to finite, non-negative seconds (returns
+    // `None` for the Inf/NaN/negative adversarial Composite values), so the
+    // domain duration is faithfully populated only for sane inputs.
+    media.media_mut().update_duration(self.duration());
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
+  }
 }
 
 // ===========================================================================
@@ -1907,5 +2038,196 @@ mod tests {
     // §5: empty enum derives core::error::Error via thiserror.
     fn assert_error<E: core::error::Error>() {}
     assert_error::<Error>();
+  }
+
+  // ---------- golden-pattern `Taggable` / `Project` surface --------------
+
+  /// Drive the `Meta` through the golden-pattern engine
+  /// ([`run_emission`](crate::emit::run_emission)) for `mode` and return the
+  /// resulting [`TagMap`](crate::tagmap::TagMap) — the production sink path.
+  fn emit_into_tagmap(meta: &Meta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(meta, mode, &mut w);
+    w
+  }
+
+  /// AIFC.aifc: the COMM sub-fields (incl. the CompressionType PrintConv
+  /// hash + CompressorName + the Int(0) SampleRate) and the FormatVersionTime
+  /// / Name scalars emit byte-identically to the `AIFC.aifc` golden under
+  /// both `-j` and `-n`.
+  #[test]
+  fn taggable_emits_aifc_common_and_scalars() {
+    use crate::emit::ConvMode;
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFC.aifc",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFC.aifc fixture");
+    let meta = parse_borrowed(&data).unwrap().expect("AIFC parsed");
+
+    // -j (PrintConv).
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    assert_eq!(
+      w.get_str("AIFF", "FormatVersionTime"),
+      Some("1990:05:23 14:40:00".to_string())
+    );
+    assert_eq!(w.get_str("AIFF", "NumChannels"), Some("1".to_string()));
+    assert_eq!(
+      w.get_str("AIFF", "NumSampleFrames"),
+      Some("11554".to_string())
+    );
+    assert_eq!(w.get_str("AIFF", "SampleSize"), Some("8".to_string()));
+    // SampleRate Int(0) ⇒ bare number "0".
+    assert_eq!(w.get("AIFF", "SampleRate"), Some(&TagValue::I64(0)));
+    // CompressionType PrintConv hash: "NONE" ⇒ "None".
+    assert_eq!(
+      w.get_str("AIFF", "CompressionType"),
+      Some("None".to_string())
+    );
+    assert_eq!(
+      w.get_str("AIFF", "CompressorName"),
+      Some("Not Compressed".to_string())
+    );
+    assert_eq!(
+      w.get_str("AIFF", "Name"),
+      Some("ExifTool test AIFC".to_string())
+    );
+
+    // -n (ValueConv): CompressionType emits the raw FixUTF8 text "NONE".
+    let w = emit_into_tagmap(&meta, ConvMode::ValueConv);
+    assert_eq!(
+      w.get_str("AIFF", "CompressionType"),
+      Some("NONE".to_string())
+    );
+    assert_eq!(w.get("AIFF", "SampleRate"), Some(&TagValue::I64(0)));
+  }
+
+  /// AIFF_duration.aif: the post-loop Composite `Duration` lands under the
+  /// `Composite` family-1 group as the ConvertDuration string `"2.00 s"`
+  /// (`-j`) / the bare number `2` from `F64(2.0)` (`-n`) — byte-identical to
+  /// the `AIFF_duration.aif` golden.
+  #[test]
+  fn taggable_emits_composite_duration() {
+    use crate::emit::ConvMode;
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFF_duration.aif",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFF_duration.aif fixture");
+    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+
+    // -j: ConvertDuration string, under the Composite (-G1) group.
+    let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
+    assert_eq!(
+      w.get_str("Composite", "Duration"),
+      Some("2.00 s".to_string())
+    );
+    assert_eq!(w.get_str("AIFF", "SampleRate"), Some("22050".to_string()));
+
+    // -n: finite f64 ⇒ bare number (serializer renders 2.0 as `2`); assert
+    // the variant carried is F64 so the bare-number gate applies.
+    let w = emit_into_tagmap(&meta, ConvMode::ValueConv);
+    assert_eq!(w.get("Composite", "Duration"), Some(&TagValue::F64(2.0)));
+  }
+
+  /// `tags()` yields AIFF tags under family-0/1 `"AIFF"` and the Composite
+  /// `Duration` under family-0/1 `"Composite"`; no tag is `Unknown=>1`.
+  #[test]
+  fn taggable_group_family0_family1_and_unknown() {
+    use crate::emit::{ConvMode, Taggable};
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFF_duration.aif",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFF_duration.aif fixture");
+    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+
+    let mut saw_aiff = false;
+    let mut saw_composite = false;
+    for t in &tags {
+      assert!(!t.unknown(), "no AIFF table carries Unknown=>1");
+      match t.tag().name() {
+        "Duration" => {
+          // Composite table is its own group0/1.
+          assert_eq!(t.tag().group_ref().family0(), "Composite");
+          assert_eq!(t.tag().group_ref().family1(), "Composite");
+          saw_composite = true;
+        }
+        _ => {
+          assert_eq!(t.tag().group_ref().family0(), "AIFF");
+          assert_eq!(t.tag().group_ref().family1(), "AIFF");
+          saw_aiff = true;
+        }
+      }
+    }
+    assert!(saw_aiff, "expected at least one AIFF-group tag");
+    assert!(saw_composite, "expected the Composite Duration tag");
+    // Emission order: the COMM sub-fields precede the post-loop Duration.
+    assert_eq!(tags.last().unwrap().tag().name(), "Duration");
+  }
+
+  /// The DjVu branch (`AT&TFORM` + `DJVU`) emits NO body tags through the
+  /// `Taggable` stream — the File:* triplet is the engine's job.
+  #[test]
+  fn taggable_djvu_emits_no_body_tags() {
+    use crate::emit::{ConvMode, Taggable};
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"AT&TFORM");
+    data.extend_from_slice(&0u32.to_be_bytes()); // FORM length (unused here)
+    data.extend_from_slice(b"DJVU");
+    let meta = parse_borrowed(&data).unwrap().expect("DjVu parsed");
+    assert_eq!(meta.magic(), Magic::Djvu);
+    assert_eq!(meta.tags(ConvMode::PrintConv).count(), 0);
+  }
+
+  /// `project()` populates one audio [`TrackKind`] plus the finite Composite
+  /// `Duration`; camera / lens / GPS / capture / dimensions / created stay
+  /// empty (AIFF carries none of those).
+  #[test]
+  fn project_populates_audio_track_and_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFF_duration.aif",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFF_duration.aif fixture");
+    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let projected = meta.project();
+
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(projected.media().has_audio());
+    assert!(!projected.media().has_video());
+    // The Composite Duration (2 s) flows into the domain duration.
+    assert_eq!(
+      projected.media().duration().map(|d| d.as_secs_f64()),
+      Some(2.0)
+    );
+    // AIFF decodes no pixel size / container creation timestamp.
+    assert!(projected.media().width().is_none());
+    assert!(projected.media().height().is_none());
+    assert!(projected.media().created().is_none());
+    // No camera / lens / GPS / capture facts.
+    assert!(projected.camera().is_none());
+    assert!(projected.lens().is_none());
+    assert!(projected.gps().is_none());
+    assert!(projected.capture().is_none());
+  }
+
+  /// A file with no finite Composite Duration (the `AIFF.aif` oracle has
+  /// SampleRate=0 ⇒ no Duration) still projects the audio track kind, with
+  /// the domain duration left `None`.
+  #[test]
+  fn project_audio_track_without_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let data = std::fs::read(format!(
+      "{}/tests/fixtures/AIFF.aif",
+      env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read AIFF.aif fixture");
+    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let projected = meta.project();
+    assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
+    assert!(projected.media().duration().is_none());
   }
 }

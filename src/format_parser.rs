@@ -472,79 +472,82 @@ pub enum AnyMeta<'a> {
 
 #[cfg(feature = "alloc")]
 impl AnyMeta<'_> {
-  /// Serialize this typed Meta's FORMAT tags into the inline tag-collection
-  /// sink [`crate::tagmap::TagMap`] (the typed-path replacement for the deleted
-  /// `serialize_tags`). Dispatches to each format's inherent
-  /// `serialize_tags`, flattening nested sub-Metas (Mp3 → ID3/MPEG/APE,
-  /// Dsf/Ape → ID3). `print_conv = true` emits PrintConv strings (`-j`);
-  /// `false` emits post-ValueConv raw scalars (`-n`). Infallible.
-  pub(crate) fn serialize_tags(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    // `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)` gates
-    // means a `_`-less match is exhaustive when ≥1 format feature is on
-    // (the real arms), and when NO format feature is on (only the
-    // `_Phantom` arm, Codex CF3). The `all-formats` default takes the
-    // former path; the phantom arm below keeps the no-format build
-    // type-checking.
+  /// Collect this typed Meta's FORMAT [`EmittedTag`](crate::emit::EmittedTag)
+  /// stream — the SINGLE source of the tag dispatch shared by
+  /// [`serialize_tags`](Self::serialize_tags) (the `-j`/`-n` JSON path) and
+  /// [`iter_tags`](Self::iter_tags) (the public generic-extraction path).
+  ///
+  /// Each arm is exactly `m.tags(mode).collect()` — the format's
+  /// [`Taggable`](crate::emit::Taggable) stream, already rendered for `mode`
+  /// (PrintConv vs ValueConv), with each sub-Meta's tags spliced in the
+  /// faithful `FoundTag` order inside its own `tags()`. NO warning/error
+  /// logic here (tags only); the diagnostics live in
+  /// [`drain_diagnostics`](Self::drain_diagnostics).
+  ///
+  /// `#[non_exhaustive]` on `AnyMeta` plus per-format `cfg(feature)` gates
+  /// makes a `_`-less match exhaustive when ≥1 format feature is on (the real
+  /// arms), and when NO format feature is on (only the `_Phantom` arm, Codex
+  /// CF3). The `all-formats` default takes the former path; the phantom arm
+  /// keeps the no-format build type-checking.
+  fn collect_emitted(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::emit::EmittedTag> {
+    use crate::emit::Taggable as _;
     match self {
       #[cfg(feature = "moi")]
-      AnyMeta::Moi(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Moi(m) => m.tags(mode).collect(),
       #[cfg(feature = "aac")]
-      AnyMeta::Aac(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Aac(m) => m.tags(mode).collect(),
+      // DV: only the `Meta` variant yields tags; `UnrecognizedProfile`
+      // (DV.pm:188 — Warn + return 1 without DV:* tags) yields NONE — its
+      // warning is drained by `drain_diagnostics`.
       #[cfg(feature = "dv")]
       AnyMeta::Dv(o) => match o {
-        // DV.pm:188 — Warn + return 1 without DV:* tags. The typed path emits
-        // the warning and no tags (the document builder surfaces it as the
-        // ExifTool:Warning).
-        crate::formats::dv::ParseOutcome::UnrecognizedProfile => {
-          out.write_warning("Unrecognized DV profile")
-        }
-        crate::formats::dv::ParseOutcome::Meta(m) => m.serialize_tags(print_conv, out),
+        crate::formats::dv::ParseOutcome::UnrecognizedProfile => std::vec::Vec::new(),
+        crate::formats::dv::ParseOutcome::Meta(m) => m.tags(mode).collect(),
       },
       #[cfg(feature = "audible")]
-      AnyMeta::Aa(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Aa(m) => m.tags(mode).collect(),
       #[cfg(feature = "red")]
-      AnyMeta::R3d(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::R3d(m) => m.tags(mode).collect(),
       #[cfg(feature = "id3")]
-      AnyMeta::Id3(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Id3(m) => m.tags(mode).collect(),
       #[cfg(feature = "mp3")]
-      AnyMeta::Mp3(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Mp3(m) => m.tags(mode).collect(),
       #[cfg(feature = "aiff")]
-      AnyMeta::Aiff(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Aiff(m) => m.tags(mode).collect(),
       #[cfg(feature = "ape")]
-      AnyMeta::Ape(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Ape(m) => m.tags(mode).collect(),
       #[cfg(feature = "dsf")]
-      AnyMeta::Dsf(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Dsf(m) => m.tags(mode).collect(),
       #[cfg(feature = "flac")]
-      AnyMeta::Flac(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Flac(m) => m.tags(mode).collect(),
       #[cfg(feature = "h264")]
-      AnyMeta::H264(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::H264(m) => m.tags(mode).collect(),
       #[cfg(feature = "flash")]
-      AnyMeta::Flv(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Flv(m) => m.tags(mode).collect(),
       #[cfg(feature = "ogg")]
-      AnyMeta::Ogg(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Ogg(m) => m.tags(mode).collect(),
       #[cfg(feature = "real")]
-      AnyMeta::Real(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Real(m) => m.tags(mode).collect(),
       #[cfg(feature = "mpeg-audio")]
-      AnyMeta::MpegAudio(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::MpegAudio(m) => m.tags(mode).collect(),
       #[cfg(feature = "mpc")]
-      AnyMeta::Mpc(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Mpc(m) => m.tags(mode).collect(),
       #[cfg(feature = "wavpack")]
-      AnyMeta::Wv(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Wv(m) => m.tags(mode).collect(),
       #[cfg(feature = "matroska")]
-      AnyMeta::Matroska(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Matroska(m) => m.tags(mode).collect(),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::QuickTime(m) => m.tags(mode).collect(),
       #[cfg(feature = "mxf")]
-      AnyMeta::Mxf(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Mxf(m) => m.tags(mode).collect(),
+      // EXIF's `tags()` yields `File:ExifByteOrder` first (when a TIFF block
+      // was processed), then the IFD-walk entries, then the MakerNote vendor
+      // emissions — uniform with every other format.
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => m.serialize_tags(print_conv, out),
+      AnyMeta::Exif(m) => m.tags(mode).collect(),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
-      // for exhaustiveness.
+      // for exhaustiveness and yields no tags.
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -570,10 +573,453 @@ impl AnyMeta<'_> {
         feature = "exif",
       )))]
       AnyMeta::_Phantom(_) => {
-        let _ = (print_conv, out);
+        let _ = mode;
+        std::vec::Vec::new()
+      }
+    }
+  }
+
+  /// The format tag stream as [`value::Tag`](crate::value::Tag)s
+  /// (golden-pattern **L4**) — the public, no-JSON generic-extraction API.
+  /// Yields the Unknown-gated, de-duplicated tag set carrying the full
+  /// [`Group`](crate::value::Group) (family-0 + family-1). Diagnostics
+  /// (`ExifTool:Warning` / `ExifTool:Error`) are NOT included — they are a
+  /// separate channel surfaced by the JSON path (and the engine-orchestration
+  /// tags `SourceFile` / `File:FileType` / version are added by
+  /// [`crate::parser::extract_info`], not here).
+  ///
+  /// This yields the same tag set the JSON path produces (same keys, same
+  /// values, same dedup) MINUS those diagnostics + orchestration tags, but it
+  /// carries family-0 too (which the `-G1` JSON key drops). `mode` selects
+  /// PrintConv (`-j`) vs ValueConv (`-n`) values.
+  #[must_use = "iter_tags yields the tag stream lazily; consume the iterator"]
+  pub fn iter_tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::value::Tag> + '_ {
+    let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
+    for e in self.collect_emitted(mode) {
+      // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
+      // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
+      if e.unknown() {
+        continue;
+      }
+      let tag = e.into_tag();
+      // Faithful last-wins-IN-PLACE dedup on the (family1, name) key — the
+      // same identity the `TagMap` sink dedups on (keeps first-occurrence
+      // POSITION, latest value wins). Linear scan (no_std + alloc clean; tag
+      // counts are small).
+      if let Some(slot) = out
+        .iter_mut()
+        .find(|t| t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name())
+      {
+        *slot = tag;
+      } else {
+        out.push(tag);
+      }
+    }
+    out.into_iter()
+  }
+
+  /// Serialize this typed Meta's FORMAT tags into the inline tag-collection
+  /// sink [`crate::tagmap::TagMap`], then drain its diagnostics. Single-sources
+  /// the tag path through [`collect_emitted`](Self::collect_emitted) (which
+  /// dispatches to each format's [`Taggable`](crate::emit::Taggable) stream,
+  /// flattening nested sub-Metas — Mp3 → ID3/MPEG/APE, Dsf/Ape → ID3, …), then
+  /// drains the per-format `$et->Warn`/`$et->Error` channel via
+  /// [`drain_diagnostics`](Self::drain_diagnostics).
+  ///
+  /// `print_conv = true` emits PrintConv strings (`-j`); `false` emits
+  /// post-ValueConv raw scalars (`-n`). Infallible.
+  ///
+  /// The tag write is driven by the canonical engine
+  /// [`run_emission`](crate::emit::run_emission) over this `AnyMeta`'s
+  /// [`Taggable`](crate::emit::Taggable) stream (the `collect_emitted`
+  /// dispatch), so the Unknown-suppression + `write_value(family1, name,
+  /// value)` + last-wins dedup are EXACTLY the engine's — then the per-format
+  /// diagnostics are drained. Because an `AnyMeta` is a SINGLE Meta (exactly
+  /// one arm fires), "all tags then all diagnostics" is identical to the prior
+  /// per-arm "run_emission then drain" — byte-identical JSON.
+  pub(crate) fn serialize_tags(
+    &self,
+    print_conv: bool,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    let mode = crate::emit::ConvMode::from_print_conv(print_conv);
+    crate::emit::run_emission(self, mode, out);
+    self.drain_diagnostics(out)
+  }
+
+  /// Drain this typed Meta's per-format diagnostic channel (the `$et->Warn` /
+  /// `$et->Error` accumulators) into the [`TagMap`](crate::tagmap::TagMap)
+  /// sink, in the exact order each format's retired inherent `serialize_tags`
+  /// emitted them. The TAG emission is done separately (via
+  /// [`collect_emitted`](Self::collect_emitted) / [`run_emission`]); this is
+  /// the diagnostics-only second half of [`serialize_tags`](Self::serialize_tags).
+  ///
+  /// `run_emission` has no warning/error channel, so the warnings/errors that
+  /// used to be drained after the per-arm `run_emission` call are relocated
+  /// here VERBATIM (same accessors, same order, same conditions). The net
+  /// `TagMap` (and `first_warning`/`first_error`) stays byte-identical.
+  fn drain_diagnostics(
+    &self,
+    out: &mut crate::tagmap::TagMap,
+  ) -> Result<(), core::convert::Infallible> {
+    match self {
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(_) => Ok(()),
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(_) => Ok(()),
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(o) => match o {
+        // DV.pm:188 — Warn + return 1 without DV:* tags. The typed path emits
+        // the warning and no tags (the document builder surfaces it as the
+        // ExifTool:Warning).
+        crate::formats::dv::ParseOutcome::UnrecognizedProfile => {
+          out.write_warning("Unrecognized DV profile")
+        }
+        crate::formats::dv::ParseOutcome::Meta(_) => Ok(()),
+      },
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(m) => {
+        // Warnings/errors stay outside the `Taggable` stream (`run_emission`
+        // has no warning/error channel — Audible.pm `$et->Warn`/`$et->Error`
+        // accumulators surface through `TagMap::first_warning`/`first_error`).
+        for w in m.warnings() {
+          out.write_warning(w.as_str())?;
+        }
+        for e in m.errors() {
+          out.write_error(e.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(m) => {
+        // Red.pm `$et->Warn` accumulators surface through `TagMap::first_warning`.
+        for w in m.warnings() {
+          out.write_warning(w)?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(m) => {
+        // The kept inherent `Id3Meta::serialize_tags` appended these after the
+        // tags; ID3 is a directory parser, never dispatched standalone, so this
+        // arm is inert today — kept consistent with the migration.
+        for w in m.warnings_slice() {
+          out.write_warning(w.as_str())?;
+        }
+        for e in m.errors_slice() {
+          out.write_error(e.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(m) => {
+        // Bundled `ProcessMP3` order (ID3.pm:1684-1728): (a) the ID3 sub-Meta's
+        // own warnings then errors; (b) MPEG-audio emits none; (c) the APE
+        // sub-Meta's own — APE first emits its nested ID3v1-trailer sub-Meta's
+        // warnings then errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
+        if let Some(id3) = m.id3() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        #[cfg(feature = "ape")]
+        if let Some(ape) = m.ape() {
+          if let Some(id3) = ape.id3_ref() {
+            for w in id3.warnings_slice() {
+              out.write_warning(w.as_str())?;
+            }
+            for e in id3.errors_slice() {
+              out.write_error(e.as_str())?;
+            }
+          }
+          if ape.warn_bad_trailer() {
+            out.write_warning("Bad APE trailer")?;
+          }
+        }
+        Ok(())
+      }
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => {
+        // AIFF.pm's `$et->Warn("Skipping large ... chunk")` surfaces through
+        // `TagMap::first_warning`. AIFF emits no `$et->Error` (the short-header
+        // reject returns `Ok(None)` ⇒ the engine's post-loop `ExifTool:Error`
+        // block fires instead).
+        for w in m.warnings() {
+          out.write_warning(w)?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(m) => {
+        // The KEPT inherent `ape::Meta::serialize_tags` emitted these in order:
+        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
+        // MAC/main body); (b) the APE.pm:238 `Warn('Bad APE trailer')` (AFTER
+        // the main stream).
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        if m.warn_bad_trailer() {
+          out.write_warning("Bad APE trailer")?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(m) => {
+        // The retired `dsf::Meta::serialize_tags` emitted the DSF.pm:71
+        // fmt-read warning BEFORE the tags, then `id3.serialize_tags` appended
+        // the ID3 sub-Meta's own warnings/errors AFTER its tags. Draining in
+        // that order (fmt warning, then ID3 warnings, then ID3 errors) keeps
+        // the net `TagMap` byte-identical.
+        if let Some(w) = m.fmt_warning() {
+          out.write_warning(w)?;
+        }
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        Ok(())
+      }
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(m) => {
+        // The retired `flac::Meta::serialize_tags` emitted these in order:
+        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
+        // FLAC body); (b) the FLAC.pm:278 "Format error in FLAC file" warning;
+        // (c) one "Picture pointer references previous VorbisComment directory"
+        // warning per METADATA_BLOCK_PICTURE Vorbis item (Vorbis.pm:122-135).
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        if m.has_format_error() {
+          out.write_warning("Format error in FLAC file")?;
+        }
+        for item in m.vorbis_items() {
+          if item.is_picture_recursion_warning() {
+            out.write_warning("Picture pointer references previous VorbisComment directory")?;
+          }
+        }
+        Ok(())
+      }
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(m) => {
+        // The `Warn('Entries in MDPM directory are out of sequence')` /
+        // forbidden-bit warnings (H264.pm:989/1058) surface through
+        // `TagMap::first_warning`.
+        for w in m.warnings() {
+          out.write_warning(w.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(m) => {
+        // The FLV `$et->Warn` accumulators (Flash.pm:353/437/456/504/511)
+        // surface through `TagMap::first_warning`.
+        for w in m.warnings() {
+          out.write_warning(w.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => {
+        // The retired `ogg::Meta::serialize_tags` emitted these in order:
+        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
+        // OGG body); (b) OGG's own accumulated warnings (`Lost synchronization`
+        // Ogg.pm:97, `Missing page(s) in Ogg file` Ogg.pm:158, `Format error in
+        // Vorbis comments` Vorbis.pm:208) in occurrence order.
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        for w in m.warnings() {
+          out.write_warning(w.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "real")]
+      AnyMeta::Real(_) => {
+        // Real emits NO warnings/errors (Real.pm `return 0` on bad input; the
+        // "Unsupported RealAudio version" `Warn` produces no tags AND no tagmap
+        // warning), and the chained `Id3v1Meta` likewise carries none.
+        Ok(())
+      }
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(_) => Ok(()),
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(m) => {
+        // The retired `mpc::Meta::serialize_tags` emitted these in order:
+        // (a) the ID3 sub-Meta's own warnings then errors (BEFORE the MPC
+        // body); (b) the MPC.pm:107-109 non-SV7 warning; (c) the APE sub-Meta's
+        // own — APE first emits its nested ID3v1-trailer sub-Meta's warnings
+        // then errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        if m.warn_unsupported_version() {
+          out.write_warning("Audio info currently not extracted from this version MPC file")?;
+        }
+        #[cfg(feature = "ape")]
+        if let Some(ape) = m.ape_ref() {
+          #[cfg(feature = "id3")]
+          if let Some(id3) = ape.id3_ref() {
+            for w in id3.warnings_slice() {
+              out.write_warning(w.as_str())?;
+            }
+            for e in id3.errors_slice() {
+              out.write_error(e.as_str())?;
+            }
+          }
+          if ape.warn_bad_trailer() {
+            out.write_warning("Bad APE trailer")?;
+          }
+        }
+        Ok(())
+      }
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(m) => {
+        // The retired `wavpack::Meta::serialize_tags` emitted these in order:
+        // (a) the chained ID3 sub-Meta's own warnings then errors (AFTER the WV
+        // header tags); (b) the chained APE sub-Meta's own warnings/errors —
+        // APE first emits its nested ID3v1-trailer sub-Meta's warnings then
+        // errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
+        #[cfg(feature = "id3")]
+        if let Some(id3) = m.id3_ref() {
+          for w in id3.warnings_slice() {
+            out.write_warning(w.as_str())?;
+          }
+          for e in id3.errors_slice() {
+            out.write_error(e.as_str())?;
+          }
+        }
+        #[cfg(feature = "ape")]
+        if let Some(ape) = m.ape_ref() {
+          #[cfg(feature = "id3")]
+          if let Some(id3) = ape.id3_ref() {
+            for w in id3.warnings_slice() {
+              out.write_warning(w.as_str())?;
+            }
+            for e in id3.errors_slice() {
+              out.write_error(e.as_str())?;
+            }
+          }
+          if ape.warn_bad_trailer() {
+            out.write_warning("Bad APE trailer")?;
+          }
+        }
+        Ok(())
+      }
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(_) => Ok(()),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => {
+        // The FIRST `ProcessMOV` warning (`Truncated '...' data` / `Invalid
+        // atom size`) stays OUTSIDE the `Taggable` stream — QuickTime.pm:
+        // 10242/10590 surfaces it as the document-level `ExifTool:Warning` via
+        // `TagMap::first_warning`. R6/F2: the per-track truncation warnings are
+        // emitted IN the tag stream under their `Track<N>:Warning` key, not here.
+        if let Some(w) = m.warning() {
+          out.write_warning(w)?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "mxf")]
+      AnyMeta::Mxf(_) => Ok(()),
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) => {
+        // EXIF's `$et->Warn(...)` (IFD-bounds checks, `Malformed APP1 EXIF
+        // segment`, …) → `ExifTool:Warning`. `File:ExifByteOrder` is a real
+        // tag now emitted by `tags()` (via `collect_emitted`), NOT a
+        // diagnostic — so only the warnings are drained here, matching the
+        // warning loop the inherent `ExifMeta::serialize_tags` runs after its
+        // `run_emission`.
+        for w in m.warnings() {
+          out.write_warning(w)?;
+        }
+        Ok(())
+      }
+      // No-format build: the only variant is the uninhabitable phantom
+      // (Codex CF3). `PhantomData` carries no data; the arm exists purely
+      // for exhaustiveness and drains nothing.
+      #[cfg(not(any(
+        feature = "moi",
+        feature = "aac",
+        feature = "dv",
+        feature = "audible",
+        feature = "red",
+        feature = "id3",
+        feature = "mp3",
+        feature = "aiff",
+        feature = "ape",
+        feature = "dsf",
+        feature = "flac",
+        feature = "h264",
+        feature = "flash",
+        feature = "ogg",
+        feature = "real",
+        feature = "mpeg-audio",
+        feature = "mpc",
+        feature = "wavpack",
+        feature = "matroska",
+        feature = "quicktime",
+        feature = "mxf",
+        feature = "exif",
+      )))]
+      AnyMeta::_Phantom(_) => {
+        let _ = out;
         Ok(())
       }
     }
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl crate::emit::Taggable for AnyMeta<'_> {
+  /// The closed-set FORMAT tag stream — every format arm's
+  /// [`Taggable`](crate::emit::Taggable) emission, dispatched through
+  /// [`collect_emitted`](AnyMeta::collect_emitted) and flattened over chained
+  /// sub-Metas. This is what lets the document path drive the whole `AnyMeta`
+  /// through the canonical [`run_emission`](crate::emit::run_emission) engine
+  /// (see [`serialize_tags`](AnyMeta::serialize_tags)) instead of re-deriving
+  /// the Unknown-gate + `write_value` + dedup per arm. Diagnostics
+  /// (`$et->Warn`/`$et->Error`) are NOT part of this stream — they are drained
+  /// separately by [`drain_diagnostics`](AnyMeta::drain_diagnostics).
+  fn tags(
+    &self,
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    self.collect_emitted(mode).into_iter()
   }
 }
 
@@ -698,6 +1144,106 @@ pub enum FileTypeFinalize {
 }
 
 impl AnyMeta<'_> {
+  /// Project this typed Meta onto the normalized cross-format
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain — the
+  /// closed-dispatch entry to the golden-pattern **L2** layer, mirroring the
+  /// [`serialize_tags`](Self::serialize_tags) dispatch shape.
+  ///
+  /// Today only the `Exif` arm carries a domain projection (it routes through
+  /// [`Project::project`](crate::metadata::Project) on its
+  /// [`ExifMeta`](crate::exif::ExifMeta), folding the EXIF IFDs + the vendor
+  /// MakerNote into camera / lens / GPS / capture). **Every other arm — and
+  /// the no-format `_Phantom` arm — returns an empty
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata)** (all domains `None`):
+  /// those formats do not yet implement
+  /// [`Project`](crate::metadata::Project). As each per-format projection
+  /// lands (Phase 2), its arm switches from the empty default to
+  /// `m.project()` — purely additive, no emission/output change.
+  #[must_use]
+  pub fn project(&self) -> crate::metadata::MediaMetadata {
+    match self {
+      // The only arm with a domain projection today: EXIF/TIFF (incl. the
+      // vendor MakerNote merge) via the `Project` trait. Phase 2 switches the
+      // arms below from the empty default to their own `m.project()`.
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "moi")]
+      AnyMeta::Moi(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "aac")]
+      AnyMeta::Aac(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "dv")]
+      AnyMeta::Dv(o) => match o {
+        crate::formats::dv::ParseOutcome::UnrecognizedProfile => {
+          crate::metadata::MediaMetadata::new()
+        }
+        crate::formats::dv::ParseOutcome::Meta(m) => crate::metadata::Project::project(m),
+      },
+      #[cfg(feature = "audible")]
+      AnyMeta::Aa(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "red")]
+      AnyMeta::R3d(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "id3")]
+      AnyMeta::Id3(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "mp3")]
+      AnyMeta::Mp3(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "aiff")]
+      AnyMeta::Aiff(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "ape")]
+      AnyMeta::Ape(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "dsf")]
+      AnyMeta::Dsf(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "flac")]
+      AnyMeta::Flac(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "h264")]
+      AnyMeta::H264(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "flash")]
+      AnyMeta::Flv(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "ogg")]
+      AnyMeta::Ogg(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "real")]
+      AnyMeta::Real(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "mpeg-audio")]
+      AnyMeta::MpegAudio(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "mpc")]
+      AnyMeta::Mpc(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "wavpack")]
+      AnyMeta::Wv(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "matroska")]
+      AnyMeta::Matroska(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::QuickTime(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "mxf")]
+      AnyMeta::Mxf(m) => crate::metadata::Project::project(m),
+      // No-format build: the only variant is the uninhabitable phantom
+      // (Codex CF3); it projects to the empty aggregate for exhaustiveness.
+      #[cfg(not(any(
+        feature = "moi",
+        feature = "aac",
+        feature = "dv",
+        feature = "audible",
+        feature = "red",
+        feature = "id3",
+        feature = "mp3",
+        feature = "aiff",
+        feature = "ape",
+        feature = "dsf",
+        feature = "flac",
+        feature = "h264",
+        feature = "flash",
+        feature = "ogg",
+        feature = "real",
+        feature = "mpeg-audio",
+        feature = "mpc",
+        feature = "wavpack",
+        feature = "matroska",
+        feature = "quicktime",
+        feature = "mxf",
+        feature = "exif",
+      )))]
+      AnyMeta::_Phantom(_) => crate::metadata::MediaMetadata::new(),
+    }
+  }
+
   /// How the engine should finalize the `File:*` triplet for this accepted
   /// Meta (the typed-path replacement for the per-format `SetFileType` /
   /// `OverrideFileType` calls). See [`FileTypeFinalize`].

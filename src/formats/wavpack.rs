@@ -825,82 +825,171 @@ pub(crate) fn parse_full_chained<'a>(
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl Meta<'_> {
-  /// Emit WavPack tags into the writer in ExifTool numeric sort order
-  /// (WavPack.pm:31-73 → ExifTool.pm:9907 sorted-key walk): 6.1
-  /// BytesPerSample, 6.2 AudioType, 6.3 Compression, 6.4 DataFormat, 6.5
-  /// SampleRate. The family-0/-1 group is `"File"` (WavPack.pm:23
-  /// `GROUPS => { 0 => 'File', 1 => 'File', 2 => 'Audio' }`; `-G1` ⇒
-  /// `"File:"` prefix; the family-2 `'Audio'` is not emitted under `-G1`).
+impl crate::emit::Taggable for Meta<'_> {
+  /// Yield WavPack tags in ExifTool numeric sort order (WavPack.pm:31-73 →
+  /// ExifTool.pm:9907 sorted-key walk): 6.1 BytesPerSample, 6.2 AudioType,
+  /// 6.3 Compression, 6.4 DataFormat, 6.5 SampleRate; then splice the chained
+  /// ID3 + APE trailer sub-Meta tags. The golden-pattern parallel to the
+  /// retired `serialize_tags`: the SINK changes (an
+  /// [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`); the per-tag PrintConv branches + the chain ORDER are
+  /// preserved verbatim.
   ///
-  /// `print_conv=true` ⇒ PrintConv strings (`-j` mode, e.g.
-  /// `"Mono"`/`"Lossless"`/`"Custom"`); `print_conv=false` ⇒ post-ValueConv
-  /// raw scalars (`-n` mode, e.g. `1`/`0`/`15`).
-  pub(crate) fn serialize_tags(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings (e.g.
+  /// `"Mono"`/`"Lossless"`/`"Custom"`); `mode == ValueConv` (`-n`) ⇒
+  /// post-ValueConv raw scalars (e.g. `1`/`0`/`15`).
+  ///
+  /// **Group.** Family-0/1 both `"File"` (WavPack.pm:23 `GROUPS => { 0 =>
+  /// 'File', 1 => 'File', 2 => 'Audio' }`; `-G1` ⇒ `"File:"` prefix; the
+  /// family-2 `'Audio'` is not emitted under `-G1`). Every WavPack header tag
+  /// is a known tag ⇒ `unknown: false`.
+  ///
+  /// **Emission order (WavPack.pm faithful)**:
+  /// 1. The 5 `%WavPack::Main` header tags (always present).
+  /// 2. WavPack.pm:100 chained ID3 sub-Meta tags (`File:ID3Size` + any
+  ///    `ID3v1:*` fields) — AFTER the header tags (bundled runs `ProcessID3`
+  ///    after the WavPack body via the recursive APE call).
+  /// 3. WavPack.pm:101-103 chained APE trailer sub-Meta tags (`APE:*`) —
+  ///    AFTER the ID3 tags.
+  ///
+  /// **What is NOT in this stream:** the chained ID3 / APE sub-Metas'
+  /// warnings/errors — [`run_emission`](crate::emit::run_emission) has no
+  /// warning/error channel, so the `AnyMeta::Wv` dispatch arm drains them
+  /// after `run_emission` in the retired order (ID3 warnings then errors;
+  /// then the APE-side nested-ID3 warnings then errors, then `Bad APE
+  /// trailer`). The net `TagMap` is identical.
+  fn tags(
     &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    const GROUP: &str = "File";
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
+    use crate::value::{Group, TagValue};
+
+    // Family-0 "File" / family-1 "File" for every WavPack header tag.
+    let group = || Group::new("File", "File");
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+
+    let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
 
     // 6.1 BytesPerSample — post-ValueConv `+1` already applied at parse
     // time. PrintConv is None, so the post-ValueConv integer is emitted
     // directly under both -j and -n.
-    out.write_u64(GROUP, "BytesPerSample", u64::from(self.bytes_per_sample))?;
+    tags.push(EmittedTag::new(
+      group(),
+      "BytesPerSample".into(),
+      TagValue::U64(u64::from(self.bytes_per_sample)),
+      false,
+    ));
 
     // 6.2 AudioType — -j: PrintConv string; -n: raw u8.
-    if print_conv {
-      out.write_str(GROUP, "AudioType", self.audio_type.as_str())?;
+    let audio_type = if print_conv {
+      TagValue::Str(self.audio_type.as_str().into())
     } else {
-      out.write_u64(GROUP, "AudioType", u64::from(self.audio_type.raw()))?;
-    }
+      TagValue::U64(u64::from(self.audio_type.raw()))
+    };
+    tags.push(EmittedTag::new(
+      group(),
+      "AudioType".into(),
+      audio_type,
+      false,
+    ));
 
     // 6.3 Compression — -j: PrintConv string; -n: raw u8.
-    if print_conv {
-      out.write_str(GROUP, "Compression", self.compression.as_str())?;
+    let compression = if print_conv {
+      TagValue::Str(self.compression.as_str().into())
     } else {
-      out.write_u64(GROUP, "Compression", u64::from(self.compression.raw()))?;
-    }
+      TagValue::U64(u64::from(self.compression.raw()))
+    };
+    tags.push(EmittedTag::new(
+      group(),
+      "Compression".into(),
+      compression,
+      false,
+    ));
 
     // 6.4 DataFormat — -j: PrintConv string; -n: raw u8.
-    if print_conv {
-      out.write_str(GROUP, "DataFormat", self.data_format.as_str())?;
+    let data_format = if print_conv {
+      TagValue::Str(self.data_format.as_str().into())
     } else {
-      out.write_u64(GROUP, "DataFormat", u64::from(self.data_format.raw()))?;
-    }
+      TagValue::U64(u64::from(self.data_format.raw()))
+    };
+    tags.push(EmittedTag::new(
+      group(),
+      "DataFormat".into(),
+      data_format,
+      false,
+    ));
 
-    // 6.5 SampleRate — -j: PrintConv hash. Hash returns I64 for known
-    // rates (0..=14) ⇒ bare JSON number; Str("Custom") for index 15 ⇒
+    // 6.5 SampleRate — -j: PrintConv hash. Hash returns the Hz integer for
+    // known rates (0..=14) ⇒ bare JSON number; "Custom" for index 15 ⇒
     // quoted JSON string. -n: raw 4-bit index 0..=15 (bare number).
-    if print_conv {
+    let sample_rate = if print_conv {
       match self.sample_rate {
-        SampleRate::Hz(n) => out.write_u64(GROUP, "SampleRate", u64::from(n))?,
-        SampleRate::Custom => out.write_str(GROUP, "SampleRate", "Custom")?,
+        SampleRate::Hz(n) => TagValue::U64(u64::from(n)),
+        SampleRate::Custom => TagValue::Str("Custom".into()),
       }
     } else {
-      out.write_u64(GROUP, "SampleRate", u64::from(self.sample_rate_raw_index))?;
-    }
+      TagValue::U64(u64::from(self.sample_rate_raw_index))
+    };
+    tags.push(EmittedTag::new(
+      group(),
+      "SampleRate".into(),
+      sample_rate,
+      false,
+    ));
 
     // Chained ID3 sub-Meta (WavPack.pm:100). Bundled runs `ProcessID3`
     // AFTER the WavPack body extraction (via the recursive APE call), so
-    // `File:ID3Size` + any `ID3v1:*` tags follow the `File:*` WV tags. F2
-    // (Codex adversarial): the pre-fix typed dispatch dropped this.
+    // `File:ID3Size` + any `ID3v1:*` tags follow the `File:*` WV tags.
+    // `Id3Meta` is `Taggable`; its warnings/errors are drained by the
+    // `AnyMeta::Wv` arm.
     #[cfg(feature = "id3")]
     if let Some(id3) = &self.id3 {
-      id3.serialize_tags(print_conv, out)?;
+      tags.extend(id3.tags(mode));
     }
 
-    // Chained APE sub-Meta (WavPack.pm:101-103). F2 (Codex adversarial).
+    // Chained APE sub-Meta (WavPack.pm:101-103). `ape::Meta` is `Taggable`;
+    // its `Bad APE trailer` warning + any APE-side nested-ID3 warnings/errors
+    // are drained by the `AnyMeta::Wv` arm.
     #[cfg(feature = "ape")]
     if let Some(ape) = &self.ape {
-      ape.serialize_tags(print_conv, out)?;
+      tags.extend(ape.tags(mode));
     }
 
-    Ok(())
+    tags.into_iter()
+  }
+}
+
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::metadata::Project for Meta<'_> {
+  /// Project WavPack metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// WavPack is a hybrid-lossless audio stream: it carries no camera / lens /
+  /// GPS / capture facts (those domains stay `None`). The single faithful
+  /// structural contribution is one audio
+  /// [`TrackKind`](crate::metadata::TrackKind): WavPack files are audio-only
+  /// (`%WavPack::Main` `GROUPS{2} => 'Audio'`, WavPack.pm:23).
+  ///
+  /// **Duration stays `None`.** WavPack.pm emits no `Duration` tag, and the
+  /// header exposes only a `SampleRate` (index/Hz) — there is no decoded
+  /// duration accessor on [`Meta`]. The chained ID3 / APE sub-Metas' own
+  /// facts are NOT folded here (WavPack's `Project` mirrors the bare-stream
+  /// AAC/MPC shape; ID3-duration folding stays in [`Id3Meta`]'s own
+  /// projection).
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    media.media_mut().track_kinds_mut().push(TrackKind::Audio);
+    media
   }
 }
 
@@ -1191,7 +1280,11 @@ mod tests {
       .unwrap()
       .unwrap();
     let mut w = TagMap::new();
-    meta.serialize_tags(print_conv, &mut w).unwrap();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut w,
+    );
     w
   }
 
@@ -1341,11 +1434,11 @@ mod tests {
   #[test]
   fn bridge_emits_tags_in_expected_order() {
     // ExifTool.pm:9907 numeric sort ⇒ 6.1..6.5. Order is preserved by the
-    // typed `serialize_tags` -> `TagMap` entries (the JSON object loses it).
+    // golden `run_emission` -> `TagMap` entries (the JSON object loses it).
     let data = header_with_flags(0x0480_008d);
     let meta = parse_borrowed(&data).unwrap().unwrap();
     let mut tm = TagMap::new();
-    meta.serialize_tags(true, &mut tm).unwrap();
+    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut tm);
     // WavPack tags use family-1 group "File" (WavPack.pm GROUPS{1}); the
     // typed sink emits ONLY these 5 (the File:* triplet is engine-added).
     let names: std::vec::Vec<&str> = tm

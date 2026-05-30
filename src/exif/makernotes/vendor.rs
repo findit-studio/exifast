@@ -256,6 +256,30 @@ impl Vendor {
     }
   }
 
+  /// The ExifTool FAMILY-1 group name for this vendor's MakerNote tags
+  /// (the `"<family1>:<Name>"` key prefix under `-G1`).
+  ///
+  /// The per-vendor tag tables (`Apple.pm`/`Canon.pm`) declare only
+  /// `GROUPS => { 0 => 'MakerNotes', … }` (`Apple.pm:28`, `Canon.pm:1225`),
+  /// so family-0 is the literal `"MakerNotes"`. Under `-G1` ExifTool
+  /// instead emits the family-1 group, which it derives from the MakerNote
+  /// MODULE/vendor — i.e. the VENDOR name (`exiftool -j -G1` emits
+  /// `Apple:RunTime` on an iPhone, `Canon:LensType` on a Canon).
+  ///
+  /// Only the vendors that currently emit cached MakerNote tags (Phase 2:
+  /// Apple, Canon) have a distinct group here; the rest fall back to the
+  /// family-0 `"MakerNotes"` since they emit nothing at the serializer's
+  /// MakerNote site yet.
+  #[must_use]
+  #[inline]
+  pub const fn group1(self) -> &'static str {
+    match self {
+      Vendor::Apple => "Apple",
+      Vendor::Canon => "Canon",
+      _ => "MakerNotes",
+    }
+  }
+
   /// The implementation status of this vendor's MakerNote port.
   ///
   /// Phase 2 = Apple / Canon (rescope-priority).

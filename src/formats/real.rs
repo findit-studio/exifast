@@ -2084,87 +2084,106 @@ fn has_real_metafile_extension(line: &[u8]) -> bool {
 }
 
 // ===========================================================================
-// `serialize_tags` — typed Meta → TagMap
+// `Taggable` — the golden-pattern emission path
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
-impl RealMeta<'_> {
-  /// Emit Real tags into the writer faithfully to bundled `perl exiftool`
-  /// emission order: PROP first, then each MDPR stream in order
-  /// (Real-MDPR, Real-MDPR2, Real-MDPR3, …), then CONT, then RJMD, then
-  /// (for RA) the codec-table fields under `Real-RA{3,4,5}`, then ID3v1.
-  pub(crate) fn serialize_tags(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    match self.kind {
-      RealKind::Rm => self.serialize_rm(print_conv, out)?,
-      RealKind::Ra => self.serialize_ra(print_conv, out)?,
-      RealKind::Ram | RealKind::Rpm => self.serialize_metafile(out)?,
-    }
-    Ok(())
-  }
-
-  /// Emit the RAM/RPM Metafile `url`/`txt` lines (Real.pm:551-553). The
-  /// `Real::Metafile` table maps `url => 'URL'` / `txt => 'Text'` with NO
-  /// PrintConv, so `-j` and `-n` agree — `print_conv` is irrelevant here.
-  /// The table has `GROUPS => { 2 => 'Video' }` and no family-1 override,
-  /// so family-1 falls back to the module name `Real` (verified against
-  /// bundled `perl exiftool` 13.58: `Real:URL` / `Real:Text`).
+impl crate::emit::Taggable for RealMeta<'_> {
+  /// Yield Real tags faithfully to bundled `perl exiftool` emission order:
+  /// PROP first, then each MDPR stream in order (Real-MDPR, Real-MDPR2,
+  /// Real-MDPR3, …), then CONT, then RJMD, then ID3v1 — for RM; the codec-
+  /// table fields under `Real-RA{3,4,5}` — for RA; the `url`/`txt` lines
+  /// under `Real` — for RAM/RPM. The golden-pattern parallel to the retired
+  /// `serialize_tags`: the SINK changes (an
+  /// [`EmittedTag`](crate::emit::EmittedTag) per value instead of
+  /// `out.write_*`); the [`RealKind`] dispatch, the per-stream MDPR group
+  /// numbering, the per-tag PrintConv/ValueConv branches, the value variants,
+  /// and the id3v1-chain POSITION are all preserved verbatim.
   ///
-  /// Each line is `insert`-ed in file order; `TagMap::insert` is last-wins
-  /// in place, which is exactly the bundled JSON-writer behavior for the
-  /// repeated `URL`/`Text` tag names (without `-a`, the LAST instance of a
-  /// duplicate tag is the displayed value — `-G4` confirms the final line
-  /// as the primary, earlier lines as `Copy{N}`).
-  fn serialize_metafile(
+  /// `mode == PrintConv` (`-j`) ⇒ PrintConv strings (bitrate `"32 kbps"`,
+  /// duration `"1.86 s"`, Flags BITMASK names, ContentRating name, ID3v1
+  /// Genre name); `mode == ValueConv` (`-n`) ⇒ post-ValueConv raw scalars
+  /// (bitrate bare int, duration f64 / `0`, Flags raw u16, ContentRating raw
+  /// int, ID3v1 Genre raw byte).
+  ///
+  /// **Groups (family0 / family1):** every Real-* subgroup keeps family-0 =
+  /// the module name `"Real"` (the bundled `Image::ExifTool::Real` tables
+  /// carry only a family-2 `GROUPS{2}`, so family-0 falls back to the module
+  /// name) with family-1 the literal subgroup string — `"Real-PROP"`,
+  /// `"Real-MDPR"`/`"Real-MDPR{N}"`, `"Real-CONT"`, `"Real-RJMD"`,
+  /// `"Real-RA{3,4,5}"`, and the metafile `"Real"`. The chained ID3v1 tags
+  /// keep family-0/1 both `"ID3v1"` (via [`Id3v1Meta`](crate::formats::id3::Id3v1Meta)'s
+  /// own `Taggable`). The sink keys on family-1 only (`exiftool:2948`), so
+  /// these family-1 strings are the byte-exact conformance surface.
+  ///
+  /// Every Real tag is a known tag ⇒ `unknown: false`. Real emits no
+  /// `Unknown => 1` tags (the `Unknown => 1` PROP/MDPR/RA fields are dropped
+  /// at PARSE time — never stored) and no warnings/errors (Real.pm `return 0`
+  /// on bad input; the "Unsupported RealAudio version" `Warn` produces no
+  /// tags AND no tagmap warning), so the `AnyMeta::Real` arm needs no drain.
+  fn tags(
     &self,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    for line in &self.metafile_lines {
-      let name = if line.is_url { "URL" } else { "Text" };
-      out.write_str("Real", name, &line.text)?;
-    }
-    Ok(())
-  }
+    mode: crate::emit::ConvMode,
+  ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    use crate::emit::EmittedTag;
 
-  fn serialize_rm(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+    let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
+    let mut tags: Vec<EmittedTag> = Vec::new();
+    match self.kind {
+      RealKind::Rm => self.emit_rm(print_conv, &mut tags),
+      RealKind::Ra => self.emit_ra(&mut tags),
+      RealKind::Ram | RealKind::Rpm => self.emit_metafile(&mut tags),
+    }
+    // Chained ID3v1 sub-Meta (RM only; Real.pm:678-687). `Id3v1Meta::tags()`
+    // reproduces the retired `emit_id3v1` byte-for-byte (proven by the
+    // `id3v1_taggable_matches_reference_emission` differential test + the
+    // `real_synth_id3v1_*` conformance fixtures), so chaining it here at the
+    // SAME position the old `serialize_rm` called `emit_id3v1` keeps the
+    // net output identical. ID3v1 has no warnings/errors to drain.
+    if let Some(id3) = &self.id3v1 {
+      tags.extend(id3.tags(mode));
+    }
+    tags.into_iter()
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl RealMeta<'_> {
+  /// Push the RM tags (PROP → MDPR streams → CONT → RJMD) in bundled order.
+  /// The chained ID3v1 trailer is appended by [`Taggable::tags`] AFTER these
+  /// (same position the retired `serialize_rm` called `emit_id3v1`).
+  fn emit_rm(&self, print_conv: bool, out: &mut Vec<crate::emit::EmittedTag>) {
     // PROP family-1 = "Real-PROP".
-    let prop_group = "Real-PROP";
+    let prop_group = group1("Real-PROP");
     if let Some(v) = self.prop.max_bitrate {
-      emit_bitrate(out, prop_group, "MaxBitrate", v, print_conv)?;
+      push_bitrate(out, &prop_group, "MaxBitrate", v, print_conv);
     }
     if let Some(v) = self.prop.avg_bitrate {
-      emit_bitrate(out, prop_group, "AvgBitrate", v, print_conv)?;
+      push_bitrate(out, &prop_group, "AvgBitrate", v, print_conv);
     }
     if let Some(v) = self.prop.max_packet_size {
-      out.write_u64(prop_group, "MaxPacketSize", u64::from(v))?;
+      push_u64(out, &prop_group, "MaxPacketSize", u64::from(v));
     }
     if let Some(v) = self.prop.avg_packet_size {
-      out.write_u64(prop_group, "AvgPacketSize", u64::from(v))?;
+      push_u64(out, &prop_group, "AvgPacketSize", u64::from(v));
     }
     if let Some(v) = self.prop.num_packets {
-      out.write_u64(prop_group, "NumPackets", u64::from(v))?;
+      push_u64(out, &prop_group, "NumPackets", u64::from(v));
     }
     if let Some(ms) = self.prop.duration_ms {
-      emit_duration(out, prop_group, "Duration", ms, print_conv)?;
+      push_duration(out, &prop_group, "Duration", ms, print_conv);
     }
     if let Some(ms) = self.prop.preroll_ms {
-      emit_duration(out, prop_group, "Preroll", ms, print_conv)?;
+      push_duration(out, &prop_group, "Preroll", ms, print_conv);
     }
     if let Some(v) = self.prop.num_streams {
-      out.write_u64(prop_group, "NumStreams", u64::from(v))?;
+      push_u64(out, &prop_group, "NumStreams", u64::from(v));
     }
     if let Some(v) = self.prop.flags {
       if print_conv {
-        out.write_str(prop_group, "Flags", &flags_print_conv(u32::from(v)))?;
+        push_str(out, &prop_group, "Flags", flags_print_conv(u32::from(v)));
       } else {
-        out.write_u64(prop_group, "Flags", u64::from(v))?;
+        push_u64(out, &prop_group, "Flags", u64::from(v));
       }
     }
     // Each MDPR stream — first stream is `Real-MDPR`, subsequent `Real-MDPR{N}`.
@@ -2173,233 +2192,290 @@ impl RealMeta<'_> {
       // is NOT renamed (`Real-MDPR`), the second is `Real-MDPR2`, etc.
       // (bundled's `$dirCount{$tag} += 1` and `++$dirCount{$tag}` start
       // at 2.)
-      let group_owned: String;
-      let group: &str = if i == 0 {
-        "Real-MDPR"
+      let group = if i == 0 {
+        group1("Real-MDPR")
       } else {
-        group_owned = format!("Real-MDPR{}", i + 1);
-        &group_owned
+        crate::value::Group::new("Real", format!("Real-MDPR{}", i + 1))
       };
-      serialize_mdpr(stream, group, print_conv, out)?;
+      emit_mdpr(stream, &group, print_conv, out);
     }
     // CONT.
-    let cont_group = "Real-CONT";
+    let cont_group = group1("Real-CONT");
     if let Some(s) = &self.cont.title {
-      out.write_str(cont_group, "Title", s)?;
+      push_str(out, &cont_group, "Title", s.clone());
     }
     if let Some(s) = &self.cont.author {
-      out.write_str(cont_group, "Author", s)?;
+      push_str(out, &cont_group, "Author", s.clone());
     }
     if let Some(s) = &self.cont.copyright {
-      out.write_str(cont_group, "Copyright", s)?;
+      push_str(out, &cont_group, "Copyright", s.clone());
     }
     if let Some(s) = &self.cont.comment {
-      out.write_str(cont_group, "Comment", s)?;
+      push_str(out, &cont_group, "Comment", s.clone());
     }
     // RJMD.
-    let rjmd_group = "Real-RJMD";
+    let rjmd_group = group1("Real-RJMD");
     for tag in &self.rjmd_tags {
+      // RJMD has no PrintConv hashes today; -j and -n agree on raw int (the
+      // retired `serialize_rm` wrote `raw_int` in BOTH branches).
       if tag.emit_as_int {
-        if print_conv {
-          // RJMD has no PrintConv hashes today; -j and -n agree on raw int.
-          out.write_u64(rjmd_group, &tag.name, u64::from(tag.raw_int))?;
-        } else {
-          out.write_u64(rjmd_group, &tag.name, u64::from(tag.raw_int))?;
-        }
+        push_u64(out, &rjmd_group, &tag.name, u64::from(tag.raw_int));
       } else {
-        out.write_str(rjmd_group, &tag.name, &tag.value)?;
+        push_str(out, &rjmd_group, &tag.name, tag.value.clone());
       }
     }
-    // ID3v1.
-    if let Some(id3) = &self.id3v1 {
-      emit_id3v1(id3, print_conv, out)?;
-    }
-    Ok(())
   }
 
-  fn serialize_ra(
-    &self,
-    print_conv: bool,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
-    let _ = print_conv;
+  /// Push the RA codec-table fields under `Real-RA{3,4,5}` (Real.pm:270-350).
+  fn emit_ra(&self, out: &mut Vec<crate::emit::EmittedTag>) {
     // Family-1 group depends on the version (Real-RA3 / Real-RA4 / Real-RA5).
-    let Some(group) = self.ra_version.and_then(RealAudioVersion::group1) else {
-      return Ok(());
+    let Some(name) = self.ra_version.and_then(RealAudioVersion::group1) else {
+      return;
     };
+    let group = group1(name);
     for field in &self.ra_fields {
       if field.emit_as_int {
         // Emit as numeric — bundled `-j` and `-n` both render bare JSON
         // integers for these table entries (no PrintConv toggles).
         if let Ok(n) = field.value.parse::<u64>() {
-          out.write_u64(group, &field.name, n)?;
+          push_u64(out, &group, &field.name, n);
         } else {
-          out.write_str(group, &field.name, &field.value)?;
+          push_str(out, &group, &field.name, field.value.clone());
         }
       } else {
-        out.write_str(group, &field.name, &field.value)?;
+        push_str(out, &group, &field.name, field.value.clone());
       }
     }
-    Ok(())
+  }
+
+  /// Push the RAM/RPM Metafile `url`/`txt` lines (Real.pm:551-553). The
+  /// `Real::Metafile` table maps `url => 'URL'` / `txt => 'Text'` with NO
+  /// PrintConv, so `-j` and `-n` agree. The table has `GROUPS => { 2 =>
+  /// 'Video' }` and no family-0/1 override, so family-0/1 both fall back to
+  /// the module name `Real` (verified against bundled `perl exiftool` 13.58:
+  /// `Real:URL` / `Real:Text`).
+  ///
+  /// Each line is pushed in file order; the [`TagMap`](crate::tagmap::TagMap)
+  /// sink is last-wins-in-place, which is exactly the bundled JSON-writer
+  /// behavior for the repeated `URL`/`Text` tag names (without `-a`, the LAST
+  /// instance of a duplicate tag is the displayed value — `-G4` confirms the
+  /// final line as the primary, earlier lines as `Copy{N}`).
+  fn emit_metafile(&self, out: &mut Vec<crate::emit::EmittedTag>) {
+    let group = group1("Real");
+    for line in &self.metafile_lines {
+      let name = if line.is_url { "URL" } else { "Text" };
+      push_str(out, &group, name, line.text.clone());
+    }
   }
 }
 
-/// Emit `(group, name) = bitrate` in PrintConv (`-j`: `ConvertBitrate`) or
-/// raw (`-n`: bare int) mode.
+/// A Real-* family-1 group with family-0 fixed to the module name `"Real"`.
 #[cfg(feature = "alloc")]
-fn emit_bitrate(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
+#[inline]
+fn group1(family1: &str) -> crate::value::Group {
+  crate::value::Group::new("Real", family1)
+}
+
+/// Push a `TagValue::Str` (known tag).
+#[cfg(feature = "alloc")]
+#[inline]
+fn push_str(
+  out: &mut Vec<crate::emit::EmittedTag>,
+  group: &crate::value::Group,
+  name: &str,
+  value: impl Into<smol_str::SmolStr>,
+) {
+  out.push(crate::emit::EmittedTag::new(
+    group.clone(),
+    name.into(),
+    crate::value::TagValue::Str(value.into()),
+    false,
+  ));
+}
+
+/// Push a `TagValue::U64` (known tag).
+#[cfg(feature = "alloc")]
+#[inline]
+fn push_u64(
+  out: &mut Vec<crate::emit::EmittedTag>,
+  group: &crate::value::Group,
+  name: &str,
+  value: u64,
+) {
+  out.push(crate::emit::EmittedTag::new(
+    group.clone(),
+    name.into(),
+    crate::value::TagValue::U64(value),
+    false,
+  ));
+}
+
+/// Push `(group, name) = bitrate` in PrintConv (`-j`: `ConvertBitrate`) or
+/// raw (`-n`: bare int) form. Faithful to the retired `emit_bitrate`.
+#[cfg(feature = "alloc")]
+fn push_bitrate(
+  out: &mut Vec<crate::emit::EmittedTag>,
+  group: &crate::value::Group,
   name: &str,
   bps: u32,
   print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+) {
   if print_conv {
-    out.write_fmt(group, name, |w| write_convert_bitrate(w, f64::from(bps)))?;
+    let mut s = String::new();
+    let _ = write_convert_bitrate(&mut s, f64::from(bps));
+    push_str(out, group, name, s);
   } else {
-    out.write_u64(group, name, u64::from(bps))?;
+    push_u64(out, group, name, u64::from(bps));
   }
-  Ok(())
 }
 
-/// Emit `(group, name) = duration` from milliseconds. ValueConv divides
-/// by 1000; PrintConv applies `ConvertDuration` (datetime.rs).
+/// Push `(group, name) = duration` from milliseconds. ValueConv divides by
+/// 1000; PrintConv applies `ConvertDuration` (datetime.rs). Faithful to the
+/// retired `emit_duration`.
 #[cfg(feature = "alloc")]
-fn emit_duration(
-  out: &mut crate::tagmap::TagMap,
-  group: &str,
+fn push_duration(
+  out: &mut Vec<crate::emit::EmittedTag>,
+  group: &crate::value::Group,
   name: &str,
   ms: u32,
   print_conv: bool,
-) -> Result<(), core::convert::Infallible> {
+) {
   let secs = f64::from(ms) / 1000.0;
   if print_conv {
-    let s = convert_duration_string(secs);
-    out.write_str(group, name, &s)?;
+    push_str(out, group, name, convert_duration_string(secs));
   } else {
     // -n: bundled emits the post-ValueConv numeric (e.g. `0.095`, `1.857`,
     // `0` for zero-duration). For zero we want the bare integer `0`
     // (matches bundled `"Real-MDPR2:StreamDuration": 0`); for fractional
     // values we want the f64 token.
     if ms == 0 {
-      out.write_u64(group, name, 0)?;
+      push_u64(out, group, name, 0);
     } else {
-      out.write_f64(group, name, secs)?;
+      out.push(crate::emit::EmittedTag::new(
+        group.clone(),
+        name.into(),
+        crate::value::TagValue::F64(secs),
+        false,
+      ));
     }
   }
-  Ok(())
 }
 
-/// Serialize one MDPR stream into the given family-1 group.
+/// Push one MDPR stream's tags into the given family-1 group. Faithful to
+/// the retired `serialize_mdpr`.
 #[cfg(feature = "alloc")]
-fn serialize_mdpr(
+fn emit_mdpr(
   s: &MdprStream,
-  group: &str,
+  group: &crate::value::Group,
   print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
+  out: &mut Vec<crate::emit::EmittedTag>,
+) {
   if let Some(v) = s.stream_number {
-    out.write_u64(group, "StreamNumber", u64::from(v))?;
+    push_u64(out, group, "StreamNumber", u64::from(v));
   }
   if let Some(v) = s.stream_max_bitrate {
-    emit_bitrate(out, group, "StreamMaxBitrate", v, print_conv)?;
+    push_bitrate(out, group, "StreamMaxBitrate", v, print_conv);
   }
   if let Some(v) = s.stream_avg_bitrate {
-    emit_bitrate(out, group, "StreamAvgBitrate", v, print_conv)?;
+    push_bitrate(out, group, "StreamAvgBitrate", v, print_conv);
   }
   if let Some(v) = s.stream_max_packet_size {
-    out.write_u64(group, "StreamMaxPacketSize", u64::from(v))?;
+    push_u64(out, group, "StreamMaxPacketSize", u64::from(v));
   }
   if let Some(v) = s.stream_avg_packet_size {
-    out.write_u64(group, "StreamAvgPacketSize", u64::from(v))?;
+    push_u64(out, group, "StreamAvgPacketSize", u64::from(v));
   }
   if let Some(v) = s.stream_start_time {
-    out.write_u64(group, "StreamStartTime", u64::from(v))?;
+    push_u64(out, group, "StreamStartTime", u64::from(v));
   }
   if let Some(ms) = s.stream_preroll_ms {
-    emit_duration(out, group, "StreamPreroll", ms, print_conv)?;
+    push_duration(out, group, "StreamPreroll", ms, print_conv);
   }
   if let Some(ms) = s.stream_duration_ms {
-    emit_duration(out, group, "StreamDuration", ms, print_conv)?;
+    push_duration(out, group, "StreamDuration", ms, print_conv);
   }
   if let Some(name) = &s.stream_name {
     if !name.is_empty() {
-      out.write_str(group, "StreamName", name)?;
+      push_str(out, group, "StreamName", name.clone());
     }
   }
   if let Some(mime) = &s.stream_mime_type {
     if !mime.is_empty() {
-      out.write_str(group, "StreamMimeType", mime)?;
+      push_str(out, group, "StreamMimeType", mime.clone());
     }
   }
   if let Some(v) = s.file_info_version {
-    out.write_u64(group, "FileInfoVersion", u64::from(v))?;
+    push_u64(out, group, "FileInfoVersion", u64::from(v));
   }
   // Dynamic FileInfo properties.
   for prop in &s.file_info_props {
     if prop.emit_raw_as_int && !print_conv {
       // -n: emit the on-disk int.
       if let Ok(n) = prop.value_raw.parse::<u64>() {
-        out.write_u64(group, &prop.name, n)?;
+        push_u64(out, group, &prop.name, n);
       } else {
-        out.write_str(group, &prop.name, &prop.value_raw)?;
+        push_str(out, group, &prop.name, prop.value_raw.clone());
       }
     } else if print_conv {
-      out.write_str(group, &prop.name, &prop.value_print)?;
+      push_str(out, group, &prop.name, prop.value_print.clone());
     } else {
       // -n string property (no PrintConv toggle).
-      out.write_str(group, &prop.name, &prop.value_raw)?;
+      push_str(out, group, &prop.name, prop.value_raw.clone());
     }
   }
-  Ok(())
 }
 
-/// Emit the ID3v1 sub-Meta tags under family-1 group `"ID3v1"`. Bundled
-/// `perl exiftool` emits 5–6 string/int tags here (Title/Artist/Album/Year/
-/// Comment/Genre [+Track]); the `-j` vs `-n` toggle only affects Genre
-/// (string name vs raw byte).
+// ===========================================================================
+// `Project` — the normalized cross-format domain projection (golden L2)
+// ===========================================================================
+
 #[cfg(feature = "alloc")]
-fn emit_id3v1(
-  id3: &crate::formats::id3::Id3v1Meta<'_>,
-  print_conv: bool,
-  out: &mut crate::tagmap::TagMap,
-) -> Result<(), core::convert::Infallible> {
-  let group = "ID3v1";
-  if let Some(s) = id3.title() {
-    out.write_str(group, "Title", s)?;
-  }
-  if let Some(s) = id3.artist() {
-    out.write_str(group, "Artist", s)?;
-  }
-  if let Some(s) = id3.album() {
-    out.write_str(group, "Album", s)?;
-  }
-  if let Some(s) = id3.year() {
-    // Year is a 4-digit string; bundled emits as bare JSON number.
-    if let Ok(n) = s.parse::<i64>() {
-      out.write_i64(group, "Year", n)?;
-    } else {
-      out.write_str(group, "Year", s)?;
-    }
-  }
-  if let Some(s) = id3.comment() {
-    out.write_str(group, "Comment", s)?;
-  }
-  if let Some(t) = id3.track() {
-    out.write_u64(group, "Track", u64::from(t))?;
-  }
-  if let Some(g) = id3.genre() {
-    if print_conv {
-      if let Some(name) = id3.genre_name() {
-        out.write_str(group, "Genre", name)?;
-      } else {
-        out.write_fmt(group, "Genre", |w| write!(w, "Unknown ({g})"))?;
+impl crate::metadata::Project for RealMeta<'_> {
+  /// Project Real metadata onto the normalized
+  /// [`MediaMetadata`](crate::metadata::MediaMetadata) domain.
+  ///
+  /// Real carries no camera / lens / GPS / capture facts (those domains stay
+  /// `None`). The structural contribution is the
+  /// [`MediaInfo`](crate::metadata::MediaInfo):
+  ///
+  /// - **Tracks** — for RM, one [`TrackKind`](crate::metadata::TrackKind) per
+  ///   MDPR stream, classified by its `StreamMimeType` (`audio/*` ⇒
+  ///   [`TrackKind::Audio`], `video/*` ⇒ [`TrackKind::Video`]); the
+  ///   `logical-fileinfo` metadata stream and any other MIME contribute no
+  ///   track. For RA (a single RealAudio stream) the track list is one
+  ///   [`TrackKind::Audio`]. RAM/RPM metafiles are text playlists with no
+  ///   decodable streams ⇒ no tracks.
+  /// - **Duration** — for RM, the PROP `Duration` (milliseconds ÷ 1000),
+  ///   which is the only clean duration accessor on [`RealMeta`]. RA / RAM /
+  ///   RPM expose no duration accessor ⇒ `None`.
+  fn project(&self) -> crate::metadata::MediaMetadata {
+    use crate::metadata::TrackKind;
+    let mut media = crate::metadata::MediaMetadata::new();
+    let info = media.media_mut();
+    match self.kind {
+      RealKind::Rm => {
+        for s in &self.mdpr_streams {
+          match s.stream_mime_type.as_deref() {
+            Some(m) if m.starts_with("audio/") => {
+              info.track_kinds_mut().push(TrackKind::Audio);
+            }
+            Some(m) if m.starts_with("video/") => {
+              info.track_kinds_mut().push(TrackKind::Video);
+            }
+            _ => {}
+          }
+        }
+        if let Some(ms) = self.prop.duration_ms {
+          info.update_duration(Some(core::time::Duration::from_millis(u64::from(ms))));
+        }
       }
-    } else {
-      out.write_u64(group, "Genre", u64::from(g))?;
+      RealKind::Ra => {
+        info.track_kinds_mut().push(TrackKind::Audio);
+      }
+      RealKind::Ram | RealKind::Rpm => {}
     }
+    media
   }
-  Ok(())
 }
 
 // ===========================================================================
@@ -2873,5 +2949,357 @@ mod tests {
       Some("audio/x-pn-realaudio"),
     ]);
     assert_eq!(m.mime_override(), None);
+  }
+
+  // ----------------------------------------------------------------------
+  // Golden-pattern `Taggable` / `Project` (#30 — real migrated last)
+  // ----------------------------------------------------------------------
+  //
+  // These drive the same `run_emission` engine the production
+  // `AnyMeta::Real` arm uses, asserting the byte-exact family-1 / value /
+  // order contract the `Real.*` + `real_synth_*` conformance fixtures pin
+  // at the JSON level. Fixtures are read through the typed parser entry
+  // (`parse_borrowed` for `.rm`/`.ra`, `parse_with_ext` for `.ram`/`.rpm`).
+
+  #[cfg(feature = "alloc")]
+  fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name),
+    )
+    .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
+  }
+
+  /// Run `run_emission` over a `RealMeta` and return the resulting `TagMap`.
+  #[cfg(feature = "alloc")]
+  fn emit(m: &RealMeta<'_>, print_conv: bool) -> crate::tagmap::TagMap {
+    let mut tm = crate::tagmap::TagMap::new();
+    crate::emit::run_emission(
+      m,
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      &mut tm,
+    );
+    tm
+  }
+
+  /// Ordered `family1:name` keys from a `TagMap` (the engine preserves
+  /// emission order; `entries()` is first-occurrence order).
+  #[cfg(feature = "alloc")]
+  fn keys(tm: &crate::tagmap::TagMap) -> Vec<String> {
+    tm.entries().iter().map(|(k, _)| k.to_string()).collect()
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_emits_rm_prop_mdpr_print_and_raw() {
+    let data = fixture("Real.rm");
+    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+
+    // -j (PrintConv): bitrate/duration/Flags render as strings.
+    let pj = emit(&m, true);
+    assert_eq!(
+      pj.get_str("Real-PROP", "MaxBitrate").as_deref(),
+      Some("32 kbps")
+    );
+    assert_eq!(
+      pj.get_str("Real-PROP", "Duration").as_deref(),
+      Some("0.10 s")
+    );
+    assert_eq!(pj.get_str("Real-PROP", "NumStreams").as_deref(), Some("2"));
+    assert_eq!(
+      pj.get_str("Real-PROP", "Flags").as_deref(),
+      Some("Allow Recording, Allow Download")
+    );
+    // First MDPR stream is family-1 `Real-MDPR`.
+    assert_eq!(
+      pj.get_str("Real-MDPR", "StreamNumber").as_deref(),
+      Some("0")
+    );
+    assert_eq!(
+      pj.get_str("Real-MDPR", "StreamMimeType").as_deref(),
+      Some("audio/x-pn-realaudio")
+    );
+    assert_eq!(
+      pj.get_str("Real-MDPR", "StreamDuration").as_deref(),
+      Some("1.86 s")
+    );
+    // Second stream is the numbered `Real-MDPR2`, with the logical-fileinfo
+    // dynamic props (ContentRating PrintConv name, date ValueConv).
+    assert_eq!(
+      pj.get_str("Real-MDPR2", "ContentRating").as_deref(),
+      Some("All Ages")
+    );
+    assert_eq!(
+      pj.get_str("Real-MDPR2", "CreateDate").as_deref(),
+      Some("2004:12:05 09:54:03")
+    );
+
+    // -n (ValueConv): bitrate bare int, duration f64 / 0, Flags raw u16,
+    // ContentRating raw int.
+    let pn = emit(&m, false);
+    assert_eq!(
+      pn.get_str("Real-PROP", "MaxBitrate").as_deref(),
+      Some("32041")
+    );
+    assert_eq!(
+      pn.get_str("Real-PROP", "Duration").as_deref(),
+      Some("0.095")
+    );
+    assert_eq!(pn.get_str("Real-PROP", "Flags").as_deref(), Some("9"));
+    assert_eq!(
+      pn.get_str("Real-MDPR", "StreamDuration").as_deref(),
+      Some("1.857")
+    );
+    // Zero-duration stream emits the bare integer `0` (not `0.0`).
+    assert_eq!(
+      pn.get_str("Real-MDPR2", "StreamDuration").as_deref(),
+      Some("0")
+    );
+    assert_eq!(
+      pn.get_str("Real-MDPR2", "ContentRating").as_deref(),
+      Some("1")
+    );
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_emits_ra_header_under_versioned_group() {
+    let data = fixture("Real.ra");
+    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
+    // The RA fixture decodes as RA4 ⇒ codec fields live under `Real-RA4`.
+    // (Identity table: -j and -n agree on the value.)
+    for print_conv in [true, false] {
+      let tm = emit(&m, print_conv);
+      // At least one numeric codec field + the string Title are present and
+      // grouped under the versioned family-1.
+      assert!(
+        tm.get("Real-RA4", "Channels").is_some(),
+        "RA4 Channels present (print_conv={print_conv})"
+      );
+      // Every emitted RA tag is under `Real-RA4` (no leakage to other groups).
+      for k in keys(&tm) {
+        assert!(
+          k.starts_with("Real-RA4:"),
+          "RA tag {k} grouped under Real-RA4"
+        );
+      }
+    }
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_group_family0_is_real_across_subgroups() {
+    // Build the tag stream directly to inspect the FULL Group (family-0 +
+    // family-1), which the `TagMap` sink collapses to family-1 only.
+    use crate::emit::{ConvMode, Taggable};
+    let rm = fixture("Real.rm");
+    let m = parse_borrowed(&rm).unwrap().expect("RM parses");
+    let tags: Vec<_> = m.tags(ConvMode::PrintConv).collect();
+    // Every Real-* subgroup carries family-0 = the module name "Real"; the
+    // chained ID3v1 carries family-0/1 both "ID3v1".
+    let mut saw_prop = false;
+    let mut saw_mdpr = false;
+    let mut saw_mdpr2 = false;
+    let mut saw_cont = false;
+    let mut saw_rjmd = false;
+    let mut saw_id3v1 = false;
+    for t in &tags {
+      let g = t.tag().group_ref();
+      match g.family1() {
+        "Real-PROP" => {
+          assert_eq!(g.family0(), "Real");
+          saw_prop = true;
+        }
+        "Real-MDPR" => {
+          assert_eq!(g.family0(), "Real");
+          saw_mdpr = true;
+        }
+        "Real-MDPR2" => {
+          assert_eq!(g.family0(), "Real");
+          saw_mdpr2 = true;
+        }
+        "Real-CONT" => {
+          assert_eq!(g.family0(), "Real");
+          saw_cont = true;
+        }
+        "Real-RJMD" => {
+          assert_eq!(g.family0(), "Real");
+          saw_rjmd = true;
+        }
+        "ID3v1" => {
+          // Chained ID3v1 trailer: family-0 is the ID3 module group
+          // (exiftool `ID3:ID3v1:*`), NOT the family-1 frame group.
+          assert_eq!(g.family0(), "ID3");
+          saw_id3v1 = true;
+        }
+        other => panic!("unexpected family-1 group {other} in RM stream"),
+      }
+    }
+    assert!(saw_prop && saw_mdpr && saw_mdpr2 && saw_cont && saw_rjmd && saw_id3v1);
+
+    // RA header subgroup: family-0 "Real", family-1 "Real-RA4".
+    let ra = fixture("Real.ra");
+    let mra = parse_borrowed(&ra).unwrap().expect("RA parses");
+    let ra_tags: Vec<_> = mra.tags(ConvMode::PrintConv).collect();
+    assert!(!ra_tags.is_empty());
+    for t in &ra_tags {
+      assert_eq!(t.tag().group_ref().family0(), "Real");
+      assert_eq!(t.tag().group_ref().family1(), "Real-RA4");
+    }
+
+    // Metafile subgroup: family-0/1 both "Real".
+    let ram = fixture("real_synth_ram_pnm.ram");
+    let mram = parse_with_ext(&ram, Some("RAM"))
+      .unwrap()
+      .expect("RAM parses");
+    let ram_tags: Vec<_> = mram.tags(ConvMode::PrintConv).collect();
+    assert!(!ram_tags.is_empty());
+    for t in &ram_tags {
+      assert_eq!(t.tag().group_ref().family0(), "Real");
+      assert_eq!(t.tag().group_ref().family1(), "Real");
+      assert!(matches!(t.tag().name(), "URL" | "Text"));
+    }
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_chains_id3v1_after_real_tags() {
+    // Real.rm carries a normal-genre ID3v1 trailer; the chained sub-Meta's
+    // tags follow ALL the Real-* tags (PROP→MDPR→CONT→RJMD), at the position
+    // the retired `emit_id3v1` ran.
+    let data = fixture("Real.rm");
+    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+
+    let pj = emit(&m, true);
+    assert_eq!(
+      pj.get_str("ID3v1", "Title").as_deref(),
+      Some("This is a title")
+    );
+    // Year is a bare JSON number (I64 branch).
+    assert_eq!(
+      pj.get("ID3v1", "Year"),
+      Some(&crate::value::TagValue::I64(2003))
+    );
+    // -j Genre = the %genre name.
+    assert_eq!(pj.get_str("ID3v1", "Genre").as_deref(), Some("Rock & Roll"));
+
+    // Ordering: the first ID3v1 key appears AFTER the last Real- key.
+    let ks = keys(&pj);
+    let last_real = ks
+      .iter()
+      .rposition(|k| k.starts_with("Real-"))
+      .expect("Real- keys");
+    let first_id3 = ks
+      .iter()
+      .position(|k| k.starts_with("ID3v1:"))
+      .expect("ID3v1 keys");
+    assert!(
+      first_id3 > last_real,
+      "ID3v1 tags chained after Real-* tags (first_id3={first_id3}, last_real={last_real})"
+    );
+
+    // -n Genre = the raw byte (78 for the Real.rm trailer).
+    let pn = emit(&m, false);
+    assert_eq!(
+      pn.get("ID3v1", "Genre"),
+      Some(&crate::value::TagValue::U64(78))
+    );
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_chains_id3v1_sparse_genre_and_empty_title() {
+    // The synthesized fixtures prove the chain reproduces `emit_id3v1`'s
+    // edge branches: present-but-empty Title (`Some("")`) and a sparse genre
+    // byte (no %genre entry ⇒ `Unknown (n)` in -j, raw byte in -n).
+    let empty = fixture("real_synth_id3v1_empty_title.rm");
+    let me = parse_borrowed(&empty).unwrap().expect("RM parses");
+    let ej = emit(&me, true);
+    // Present-but-empty Title is emitted as the empty string (faithful).
+    assert_eq!(
+      ej.get("ID3v1", "Title"),
+      Some(&crate::value::TagValue::Str("".into()))
+    );
+
+    let sparse = fixture("real_synth_id3v1_sparse_genre.rm");
+    let ms = parse_borrowed(&sparse).unwrap().expect("RM parses");
+    let sj = emit(&ms, true);
+    // Sparse genre ⇒ `Unknown (n)` PrintConv string.
+    let g = sj.get_str("ID3v1", "Genre").expect("Genre present");
+    assert!(
+      g.starts_with("Unknown ("),
+      "sparse genre renders Unknown (n): {g}"
+    );
+    // -n ⇒ the raw byte as a JSON number.
+    let sn = emit(&ms, false);
+    assert!(matches!(
+      sn.get("ID3v1", "Genre"),
+      Some(crate::value::TagValue::U64(_))
+    ));
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn taggable_metafile_emits_url_and_text_under_real() {
+    // Drive the typed parser on a synthesized metafile and assert the
+    // `Real:URL` / `Real:Text` emission (last-wins-in-place dedup keeps the
+    // final URL line).
+    let m = parse_metafile(
+      b"pnm://host/a.rm\nrtsp://host/b.rm\nplain note\n",
+      Some("RAM"),
+    )
+    .expect("metafile accepted");
+    let tm = emit(&m, true);
+    // Two URL lines collapse to the LAST (faithful TagMap last-wins).
+    assert_eq!(
+      tm.get_str("Real", "URL").as_deref(),
+      Some("rtsp://host/b.rm")
+    );
+    assert_eq!(tm.get_str("Real", "Text").as_deref(), Some("plain note"));
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn project_rm_audio_track_and_duration() {
+    use crate::metadata::{Project, TrackKind};
+    let data = fixture("Real.rm");
+    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let md = m.project();
+    // Real.rm: stream 0 is audio/x-pn-realaudio ⇒ one Audio track; stream 1
+    // is logical-fileinfo ⇒ no track.
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    // PROP Duration = 95 ms ⇒ duration set from ms.
+    assert_eq!(
+      md.media().duration(),
+      Some(core::time::Duration::from_millis(95))
+    );
+    // Real carries no camera/lens/gps/capture facts.
+    assert!(md.camera().is_none());
+    assert!(md.gps().is_none());
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn project_ra_is_single_audio_track() {
+    use crate::metadata::{Project, TrackKind};
+    let data = fixture("Real.ra");
+    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    let md = m.project();
+    // RA is a single RealAudio stream ⇒ one Audio track, no duration accessor.
+    assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
+    assert_eq!(md.media().duration(), None);
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn project_metafile_has_no_tracks() {
+    use crate::metadata::Project;
+    let m = parse_metafile(b"pnm://host/a.rm\n", Some("RAM")).expect("metafile accepted");
+    let md = m.project();
+    // RAM/RPM are text playlists ⇒ no decodable streams.
+    assert!(md.media().track_kinds().is_empty());
+    assert_eq!(md.media().duration(), None);
   }
 }
