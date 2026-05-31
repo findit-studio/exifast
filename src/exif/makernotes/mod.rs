@@ -29,7 +29,8 @@
 //!
 //! - Phase 2: Apple + Canon (rescope-priority cameras).
 //! - Phase 3: Sony + Panasonic (mirrorless / Lumix).
-//! - Phase 4: GoPro + DJI (action cams / drones).
+//! - Phase 4: DJI (drones). GoPro is intentionally NOT a MakerNote
+//!   vendor — bundled has no `MakerNoteGoPro` (see `vendors/mod.rs`).
 //! - Phase ∞ (deferred): Nikon, Pentax, Fuji, Olympus, Casio, Kyocera,
 //!   Leica, Minolta, Ricoh, Samsung, Sanyo, Sigma — the long-tail.
 //!
@@ -54,7 +55,7 @@ pub use vendor::{Vendor, VendorStatus};
 #[cfg(feature = "alloc")]
 pub use vendors::VendorEmission;
 pub use vendors::{
-  AppleMakerNote, CanonMakerNote, DjiMakerNote, GoProMakerNote, PanasonicMakerNote, SonyMakerNote,
+  AppleMakerNote, CanonMakerNote, DjiMakerNote, PanasonicMakerNote, SonyMakerNote,
 };
 
 /// Typed MakerNotes metadata — the top-level surface for vendor MakerNote
@@ -83,8 +84,6 @@ pub struct MakerNotesMeta {
   sony: Option<SonyMakerNote>,
   /// Panasonic decoded data — Phase 3.
   panasonic: Option<PanasonicMakerNote>,
-  /// GoPro decoded data — Phase 4.
-  gopro: Option<GoProMakerNote>,
   /// DJI decoded data — Phase 4.
   dji: Option<DjiMakerNote>,
 }
@@ -102,7 +101,6 @@ impl MakerNotesMeta {
       canon: None,
       sony: None,
       panasonic: None,
-      gopro: None,
       dji: None,
     }
   }
@@ -133,12 +131,20 @@ impl MakerNotesMeta {
     self.panasonic = Some(panasonic);
   }
 
+  /// Replace the DJI slot — used by the IFD walker during walk
+  /// (Phase 4).
+  #[inline(always)]
+  pub fn set_dji(&mut self, dji: DjiMakerNote) {
+    self.dji = Some(dji);
+  }
+
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
   /// dispatcher resolved a supported vendor.
   ///
   /// Phase 2 populates [`Self::apple`] / [`Self::canon`]; Phase 3 adds
-  /// [`Self::sony`] / [`Self::panasonic`]; GoPro/DJI remain empty until
-  /// Phase 4.
+  /// [`Self::sony`] / [`Self::panasonic`]; Phase 4 adds [`Self::dji`]
+  /// (full Main table). GoPro is not a MakerNote vendor (bundled has no
+  /// `MakerNoteGoPro`) — see `vendors/mod.rs`.
   ///
   /// `blob` is the raw 0x927C MakerNote value; `parent_order` is the
   /// parent IFD walk's byte order (used as the body-marker fallback per
@@ -340,6 +346,10 @@ impl MakerNotesMeta {
           meta.panasonic = Some(typed);
         }
       }
+      Vendor::Dji => {
+        let (typed, _emissions) = vendors::dji::parse(blob, parent_order);
+        meta.dji = Some(typed);
+      }
       _ => {}
     }
     meta
@@ -393,13 +403,6 @@ impl MakerNotesMeta {
     self.panasonic.as_ref()
   }
 
-  /// GoPro decoded data. Phase 1 returns `None`; Phase 4 will populate.
-  #[must_use]
-  #[inline(always)]
-  pub const fn gopro(&self) -> Option<&GoProMakerNote> {
-    self.gopro.as_ref()
-  }
-
   /// DJI decoded data. Phase 1 returns `None`; Phase 4 will populate.
   #[must_use]
   #[inline(always)]
@@ -435,7 +438,6 @@ mod tests {
     assert!(meta.canon().is_none());
     assert!(meta.sony().is_none());
     assert!(meta.panasonic().is_none());
-    assert!(meta.gopro().is_none());
     assert!(meta.dji().is_none());
   }
 

@@ -261,7 +261,6 @@ fn vendor_status_phase_buckets_are_observable() {
   assert!(Vendor::Canon.status().is_scheduled());
   assert!(Vendor::Sony.status().is_scheduled());
   assert!(Vendor::Panasonic.status().is_scheduled());
-  assert!(Vendor::GoPro.status().is_scheduled());
   assert!(Vendor::Dji.status().is_scheduled());
   // Long-tail vendors are deferred.
   assert!(Vendor::Nikon.status().is_deferred());
@@ -2208,4 +2207,283 @@ fn from_blob_with_context_resolves_make_only_leica1() {
     meta_other.panasonic().is_none(),
     "a non-LEICA make must NOT resolve the make-only Leica1 route"
   );
+}
+
+// ===========================================================================
+// Phase 4 — GoPro + DJI dispatch + typed parse
+// ===========================================================================
+
+/// SYNTHETIC: a GoPro file (`$$self{Make} == "GoPro"`). Bundled
+/// `MakerNotes.pm` has NO `MakerNoteGoPro` entry, so the 0x927C bytes
+/// are NOT a recognized MakerNote — they fall through to
+/// `Vendor::Unknown` (bundled emits `MakerNoteUnknown` + `Warning:
+/// [minor] Unrecognized MakerNotes`). Faithful regression guard: GoPro
+/// must NOT resolve a dedicated vendor or surface any `MakerNotes:*`
+/// keys; GoPro files are identified by the standard IFD0 `Make` tag.
+#[test]
+fn gopro_makernote_falls_through_to_unknown() {
+  // MM TIFF: IFD0 with Make = "GoPro" (5 bytes — inline; count 5 ≤ 4-byte
+  // slot is wrong — use count 5 → must be offset). Use count 6 to be safe.
+  let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+  // IFD0: 2 entries (Make + ExifIFD).
+  t.extend_from_slice(&[0x00, 0x02]);
+  // Entry 1: Make (0x010f, ASCII, count 6 = "GoPro\0", offset).
+  t.extend_from_slice(&[0x01, 0x0f]); // Make
+  t.extend_from_slice(&[0x00, 0x02]); // ASCII
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x06]); // count 6
+  // Offset: header(8) + IFD0(2 + 12 + 12 + 4) = 38.
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x26]); // 38
+  // Entry 2: ExifIFD pointer.
+  t.extend_from_slice(&[0x87, 0x69]); // ExifIFD
+  t.extend_from_slice(&[0x00, 0x04]); // LONG
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
+  // ExifIFD offset: 38 + 6 = 44.
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x2c]); // 44
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next 0
+  // Make string at 38: "GoPro\0".
+  t.extend_from_slice(b"GoPro\x00");
+  // ExifIFD at 44: 1 entry (MakerNote).
+  t.extend_from_slice(&[0x00, 0x01]);
+  t.extend_from_slice(&[0x92, 0x7c]); // MakerNote
+  t.extend_from_slice(&[0x00, 0x07]); // UNDEF
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x10]); // count 16
+  // MakerNote offset: 44 + (2 + 12 + 4) = 62.
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x3e]); // 62
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next 0
+  // 16-byte GoPro MakerNote bytes — modeled on the t/images/GoPro.jpg
+  // shape (`\x0b\x00\x11\x00...` — an IFD-like header bundled doesn't
+  // decode). The dispatcher routes on Make alone; the bytes are
+  // captured but the body decoder returns empty.
+  t.extend_from_slice(&[
+    0x0b, 0x00, 0x11, 0x00, 0x00, 0xc0, 0x86, 0x46, 0x00, 0x00, 0x4c, 0x41, 0x4a, 0x37, 0x30, 0x36,
+  ]);
+
+  let meta = exifast::parse_exif_block(&t).expect("valid TIFF");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  // Bundled has no MakerNoteGoPro → the captured 0x927C bytes are an
+  // unrecognized MakerNote: Vendor::Unknown, NOT a dedicated GoPro vendor.
+  assert!(
+    matches!(mn.vendor(), Vendor::Unknown),
+    "GoPro has no bundled MakerNoteGoPro → Vendor::Unknown, got {:?}",
+    mn.vendor()
+  );
+  // No per-vendor typed surface, no decoded MakerNote emissions (faithful:
+  // bundled emits MakerNoteUnknown + a minor warning, zero decoded keys).
+  assert!(mn.meta().dji().is_none());
+  assert!(
+    mn.emissions_print_conv().is_empty(),
+    "unrecognized GoPro MakerNote emits no decoded MakerNote keys"
+  );
+}
+
+/// SYNTHETIC: DJI MakerNote — `$$self{Make} == "DJI"` + body bytes that
+/// do NOT start with `DJI` or `...@AMBA` (those go to a deferred
+/// signature). Dispatch resolves on Make alone (`MakerNotes.pm:99-106`).
+/// Phase-4 walks the body and populates [`MakerNotesDji`].
+#[test]
+fn synthetic_dji_makernote_dispatches_and_decodes_pose() {
+  let t = synthetic_dji_pitch_tiff();
+
+  let meta = exifast::parse_exif_block(&t).expect("valid TIFF");
+  // Sanity: Make was extracted.
+  let make_entry = meta.entry("Make").expect("Make in IFD0");
+  let make = match make_entry.value_ref().raw() {
+    exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+    other => panic!("Make not Text, got {other:?}"),
+  };
+  assert!(make.starts_with("DJI"), "Make = {make:?}");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(
+    mn.vendor().is_dji(),
+    "Make=DJI dispatches to Vendor::Dji, got {:?}",
+    mn.vendor()
+  );
+  assert_eq!(mn.detected().body_offset(), 0);
+  assert!(mn.detected().base_rule().is_inherit());
+  // The typed surface populates from the body walk.
+  let dji = mn.meta().dji().expect("DJI typed populated");
+  let pitch = dji
+    .flight_pitch()
+    .expect("Pitch tag should be present and parsed");
+  assert!((pitch - 12.5).abs() < 1e-6, "got {pitch}");
+  // PrintConv emission carries the signed-2-decimal form.
+  let emissions = mn.emissions_print_conv();
+  assert!(
+    emissions
+      .iter()
+      .any(|e| e.name() == "Pitch" && *e.value() == exifast::value::TagValue::Str("+12.50".into())),
+    "Pitch emission with PrintConv label, got {emissions:?}"
+  );
+}
+
+/// Build the synthetic LE DJI TIFF shared by the DJI dispatch +
+/// serialized-grouping tests: IFD0 `Make = "DJI"`, ExifIFD → 0x927C
+/// MakerNote whose 24-byte headerless body carries one entry
+/// `Pitch (0x06)` = float 12.5.
+fn synthetic_dji_pitch_tiff() -> Vec<u8> {
+  // LE TIFF (DJI is byte-order-unknown, but the parent IFD order
+  // governs since the body has no marker). Use LE for the synthetic
+  // build.
+  let mut t: Vec<u8> = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+  // IFD0: 2 entries.
+  t.extend_from_slice(&[0x02, 0x00]);
+  // Entry 1: Make = "DJI\0" (count 4, inline).
+  t.extend_from_slice(&[0x0f, 0x01]); // 0x010f LE
+  t.extend_from_slice(&[0x02, 0x00]); // ASCII
+  t.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]); // count 4
+  t.extend_from_slice(b"DJI\x00"); // inline
+  // Entry 2: ExifIFD pointer.
+  t.extend_from_slice(&[0x69, 0x87]); // 0x8769 LE
+  t.extend_from_slice(&[0x04, 0x00]); // LONG
+  t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+  // ExifIFD offset: header(8) + IFD0(2 + 12 + 12 + 4) = 38.
+  t.extend_from_slice(&[0x26, 0x00, 0x00, 0x00]); // 38 LE
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next 0
+  // ExifIFD at 38: 1 entry (MakerNote).
+  t.extend_from_slice(&[0x01, 0x00]);
+  t.extend_from_slice(&[0x7c, 0x92]); // 0x927c MakerNote LE
+  t.extend_from_slice(&[0x07, 0x00]); // UNDEF
+  // The 24-byte DJI body — 1 entry header (count=1) + 1 entry (12 bytes)
+  // = 14 bytes minimum; pad to 24.
+  t.extend_from_slice(&[0x18, 0x00, 0x00, 0x00]); // count 24
+  // MakerNote offset: 38 + (2 + 12 + 4) = 56.
+  t.extend_from_slice(&[0x38, 0x00, 0x00, 0x00]); // 56 LE
+  t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next 0
+  // DJI body at offset 56: headerless. 1 entry: Pitch (0x06) float 12.5
+  // inline.
+  t.extend_from_slice(&[0x01, 0x00]); // 1 entry LE
+  t.extend_from_slice(&[0x06, 0x00]); // tag 0x06
+  t.extend_from_slice(&[0x0b, 0x00]); // float
+  t.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count 1
+  t.extend_from_slice(&12.5f32.to_le_bytes()); // 12.5 inline
+  // Pad to 24 bytes.
+  while t.len() < 56 + 24 {
+    t.push(0);
+  }
+  t
+}
+
+/// SERIALIZED `-G1`: DJI MakerNote tags carry the vendor family-1 group
+/// `DJI:` — NOT the family-0 `MakerNotes:`. `MakerNotes.pm:100`
+/// (`Name => 'MakerNoteDJI'`) routes to `Image::ExifTool::DJI::Main`,
+/// whose `-G1` group ExifTool derives from the vendor module name;
+/// `DJI.pm:56` sets only family-0 `MakerNotes`. Bundled 13.59 on a DJI
+/// file emits `DJI:Pitch` (with `-j`, `sprintf("%+.2f")` → `+12.50`),
+/// NEVER `MakerNotes:Pitch`. Regression guard for the `Vendor::group1()`
+/// wiring (both `-j` PrintConv-on and `-n` PrintConv-off share the site).
+#[cfg(feature = "json")]
+#[test]
+fn dji_serialized_keys_use_dji_group1() {
+  let t = synthetic_dji_pitch_tiff();
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("dji.tif", &t, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{json}"));
+    let map = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("doc is not [{{…}}]:\n{json}"));
+    assert!(
+      map.contains_key("DJI:Pitch"),
+      "expected DJI:Pitch ({mode}); keys: {:?}",
+      map.keys().collect::<Vec<_>>()
+    );
+    // The family-1 group is the VENDOR, never the family-0 `MakerNotes`.
+    assert!(
+      !map.contains_key("MakerNotes:Pitch"),
+      "DJI MakerNote tag leaked under family-0 MakerNotes group ({mode})"
+    );
+  }
+}
+
+/// SYNTHETIC: DJI typed parse via the public API (round-trips the
+/// full Main IFD table — 10 tags). The dispatcher integration is
+/// covered by [`synthetic_dji_makernote_dispatches_and_decodes_pose`];
+/// this exercise the full tag coverage in isolation.
+#[test]
+fn synthetic_dji_typed_populates_all_main_tags() {
+  use exifast::exif::makernotes::vendors::dji;
+  // Build a synthetic DJI body with one entry per Main IFD tag.
+  // Headerless body, LE byte order.
+  let entries: Vec<(u16, u16, u32, Vec<u8>)> = vec![
+    (0x01, 0x02, 4, b"DJI\x00".to_vec()),
+    (0x03, 0x0b, 1, 1.5f32.to_le_bytes().to_vec()),
+    (0x04, 0x0b, 1, (-2.25f32).to_le_bytes().to_vec()),
+    (0x05, 0x0b, 1, 0.0f32.to_le_bytes().to_vec()),
+    (0x06, 0x0b, 1, 10.5f32.to_le_bytes().to_vec()),
+    (0x07, 0x0b, 1, (-45.0f32).to_le_bytes().to_vec()),
+    (0x08, 0x0b, 1, 5.0f32.to_le_bytes().to_vec()),
+    (0x09, 0x0b, 1, (-30.0f32).to_le_bytes().to_vec()),
+    (0x0a, 0x0b, 1, 90.0f32.to_le_bytes().to_vec()),
+    (0x0b, 0x0b, 1, 0.0f32.to_le_bytes().to_vec()),
+  ];
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+  let entries_start = blob.len();
+  let dir_size = 12 * entries.len();
+  let mut data_off = entries_start + dir_size;
+  let elem_sizes: [usize; 14] = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4];
+  let mut pending: Vec<Vec<u8>> = Vec::new();
+  for (tag, format, count, value) in &entries {
+    let total = elem_sizes[*format as usize] * (*count as usize);
+    blob.extend_from_slice(&tag.to_le_bytes());
+    blob.extend_from_slice(&format.to_le_bytes());
+    blob.extend_from_slice(&count.to_le_bytes());
+    if total <= 4 {
+      let mut padded = [0u8; 4];
+      padded[..value.len().min(4)].copy_from_slice(&value[..value.len().min(4)]);
+      blob.extend_from_slice(&padded);
+    } else {
+      blob.extend_from_slice(&(data_off as u32).to_le_bytes());
+      data_off += total;
+      pending.push(value.clone());
+    }
+  }
+  for v in pending {
+    blob.extend_from_slice(&v);
+  }
+  let (typed, emissions) = dji::parse(&blob, exifast::exif::ifd::ByteOrder::Little);
+  assert_eq!(typed.make(), Some("DJI"));
+  assert!((typed.speed_x().unwrap() - 1.5).abs() < 1e-6);
+  assert!((typed.speed_y().unwrap() + 2.25).abs() < 1e-6);
+  assert!((typed.speed_z().unwrap() - 0.0).abs() < 1e-6);
+  assert!((typed.flight_pitch().unwrap() - 10.5).abs() < 1e-6);
+  assert!((typed.flight_yaw().unwrap() + 45.0).abs() < 1e-6);
+  assert!((typed.flight_roll().unwrap() - 5.0).abs() < 1e-6);
+  assert!((typed.camera_pitch().unwrap() + 30.0).abs() < 1e-6);
+  assert!((typed.camera_yaw().unwrap() - 90.0).abs() < 1e-6);
+  assert!((typed.camera_roll().unwrap() - 0.0).abs() < 1e-6);
+  // PrintConv labels.
+  use exifast::value::TagValue;
+  let find = |n: &str| {
+    emissions
+      .iter()
+      .find(|e| e.name() == n)
+      .map(|e| e.value().clone())
+  };
+  assert_eq!(find("Make"), Some(TagValue::Str("DJI".into())));
+  assert_eq!(find("SpeedX"), Some(TagValue::Str("+1.50".into())));
+  assert_eq!(find("SpeedY"), Some(TagValue::Str("-2.25".into())));
+  assert_eq!(find("SpeedZ"), Some(TagValue::Str("+0.00".into())));
+  assert_eq!(find("Pitch"), Some(TagValue::Str("+10.50".into())));
+  assert_eq!(find("Yaw"), Some(TagValue::Str("-45.00".into())));
+  assert_eq!(find("Roll"), Some(TagValue::Str("+5.00".into())));
+  assert_eq!(find("CameraPitch"), Some(TagValue::Str("-30.00".into())));
+  assert_eq!(find("CameraYaw"), Some(TagValue::Str("+90.00".into())));
+  assert_eq!(find("CameraRoll"), Some(TagValue::Str("+0.00".into())));
+}
+
+/// Phase 4 status surface — DJI is `Phase4` and observable. DJI has a
+/// signature: the `MakerNotes.pm:101` negative-lookahead
+/// `$$valPt !~ /^(...@AMBA|DJI)/` makes it Make+blob. (GoPro is
+/// intentionally NOT a MakerNote vendor — bundled has no
+/// `MakerNoteGoPro` — so there is no GoPro vendor surface to observe.)
+#[test]
+fn phase4_vendor_surface_is_observable() {
+  assert!(Vendor::Dji.status().is_scheduled());
+  assert!(Vendor::Dji.is_dji());
+  // DJI has a signature (the negative-lookahead body shape carving).
+  assert!(Vendor::Dji.is_signature_based());
 }

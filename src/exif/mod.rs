@@ -1973,6 +1973,23 @@ impl Walker<'_> {
                   emission_group1 = makernotes::Vendor::Panasonic.group1();
                 }
               }
+              makernotes::Vendor::Dji => {
+                // DJI: headerless body (Start => '$valuePtr',
+                // MakerNotes.pm:104). DJI inherits the parent Base, so
+                // out-of-line offsets in entries are TIFF-relative —
+                // parse with parent-TIFF context.
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let (typed_pc, emi_pc) = makernotes::vendors::dji::parse_in_tiff(
+                  self.data, mn_offset, mn_len, self.order, true,
+                );
+                let (_typed_vc, emi_vc) = makernotes::vendors::dji::parse_in_tiff(
+                  self.data, mn_offset, mn_len, self.order, false,
+                );
+                meta.set_dji(typed_pc);
+                cached_pc = emi_pc;
+                cached_vc = emi_vc;
+              }
               _ => {}
             }
             self.maker_note = Some(MakerNote {

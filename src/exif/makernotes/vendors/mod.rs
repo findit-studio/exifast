@@ -7,26 +7,29 @@
 //!   `canon::MakerNotesCanon` from real IFD bodies.
 //! - Phase 3 ports populate `sony::MakerNotesSony` and
 //!   `panasonic::MakerNotesPanasonic`.
-//! - Phase 4/deferred modules are empty shells exposing a stable
-//!   accessor surface (`GoProMakerNote`, `DjiMakerNote`).
+//! - Phase 4 populates `dji::MakerNotesDji` (full Main IFD table — 10
+//!   tags). GoPro is intentionally NOT a MakerNote vendor: bundled
+//!   `MakerNotes.pm` carries no `MakerNoteGoPro` entry, so GoPro
+//!   MakerNotes fall through to `Vendor::Unknown` (faithful) — GoPro
+//!   files are identified by the standard IFD0 `Make` tag.
 //!
 //! Type aliases preserve the Phase-1 API names (`AppleMakerNote`,
-//! `CanonMakerNote`, `SonyMakerNote`, `PanasonicMakerNote`) for downstream
-//! `match` arms — `MakerNotesApple` / `MakerNotesCanon` /
-//! `MakerNotesSony` / `MakerNotesPanasonic` are the canonical names per
-//! the [[exifast-api-conventions]] memory ("no module-name stutter" naming).
+//! `CanonMakerNote`, `SonyMakerNote`, `PanasonicMakerNote`,
+//! `DjiMakerNote`) for downstream `match` arms —
+//! `MakerNotesApple` / `MakerNotesCanon` / `MakerNotesSony` /
+//! `MakerNotesPanasonic` / `MakerNotesDji` are the
+//! canonical names per the [[exifast-api-conventions]] memory ("no
+//! module-name stutter" naming).
 
 pub mod apple;
 pub mod canon;
 pub mod dji;
-pub mod gopro;
 pub mod panasonic;
 pub mod sony;
 
 pub use apple::MakerNotesApple;
 pub use canon::MakerNotesCanon;
-pub use dji::DjiMakerNote;
-pub use gopro::GoProMakerNote;
+pub use dji::MakerNotesDji;
 pub use panasonic::MakerNotesPanasonic;
 pub use sony::MakerNotesSony;
 
@@ -105,6 +108,8 @@ impl VendorEmission {
 pub type SonyMakerNote = MakerNotesSony;
 /// Compatibility alias — Phase-1 API name preserved.
 pub type PanasonicMakerNote = MakerNotesPanasonic;
+/// Compatibility alias — Phase-1 API name preserved.
+pub type DjiMakerNote = MakerNotesDji;
 
 /// A `Format => '…'` (with an optional `Count => N`) directive on a vendor
 /// Main-table tag row that OVERRIDES the entry's on-disk TIFF format when the
