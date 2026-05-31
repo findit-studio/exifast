@@ -1072,8 +1072,9 @@ impl ApexFNumber for f64 {
 }
 
 /// Canon.pm:9943-9962 `sub CanonEv`. Converts the int16s encoded value
-/// to an APEX float.
-fn canon_ev(val: i64) -> f64 {
+/// to an APEX float. Shared with [`super::shot_info`] (AEBBracketValue
+/// uses `CanonEv($val)` then `PrintFraction`).
+pub(super) fn canon_ev(val: i64) -> f64 {
   if val < 0 {
     return -canon_ev(-val);
   }

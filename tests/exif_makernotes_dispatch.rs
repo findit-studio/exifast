@@ -390,6 +390,47 @@ fn canon_eos_real_fixture_decodes_typed_fields() {
   let range = canon.focal_range_mm().expect("focal range");
   assert!((range.0 - 18.0).abs() < 0.1, "min focal {}", range.0);
   assert!((range.1 - 55.0).abs() < 0.1, "max focal {}", range.1);
+
+  // ShotInfo deep sub-table (issue #86) — real-input parity vs the oracle
+  // (`exiftool -j MakerNotes_Canon.jpg`).
+  let shot = canon.shot_info().expect("ShotInfo decoded");
+  assert_eq!(shot.white_balance(), Some("Auto"));
+  assert_eq!(shot.sequence_number(), Some(0));
+  // CameraTemperature raw is 0 → RawConv drops it (300D is EOS but the
+  // sensor temp wasn't recorded).
+  assert_eq!(shot.camera_temperature_c(), None);
+  assert_eq!(shot.flash_guide_number(), Some(0.0));
+  assert_eq!(shot.auto_exposure_bracketing(), Some("Off"));
+  assert_eq!(shot.control_mode(), Some("Camera Local Control"));
+  // FocusDistanceUpper raw 65535 → 655.35 m → "inf" (f64::INFINITY).
+  assert_eq!(shot.focus_distance_upper_m(), Some(f64::INFINITY));
+  assert_eq!(shot.focus_distance_lower_m(), Some(5.46));
+  assert_eq!(shot.measured_ev2(), Some(-1.25));
+  assert_eq!(shot.bulb_duration(), Some(4.0));
+  assert_eq!(shot.nd_filter(), Some("n/a"));
+
+  // AFInfo deep sub-table (issue #86) — older AFInfo record (tag 0x12).
+  let af = canon.af_info().expect("AFInfo decoded");
+  assert!(!af.is_v2(), "EOS 300D uses the older AFInfo record");
+  assert_eq!(af.num_af_points(), Some(7));
+  assert_eq!(af.valid_af_points(), Some(7));
+  assert_eq!(af.canon_image_width(), Some(3072));
+  assert_eq!(af.canon_image_height(), Some(2048));
+  assert_eq!(af.af_image_width(), Some(3072));
+  assert_eq!(af.af_image_height(), Some(2048));
+  assert_eq!(af.af_area_x_positions(), &[1014, 608, 0, 0, 0, -608, -1014]);
+  assert_eq!(af.af_area_y_positions(), &[0, 0, -506, 0, 506, 0, 0]);
+  // EOS body → PrimaryAFPoint is NOT emitted (serial processing stops).
+  assert_eq!(af.primary_af_point(), None);
+
+  // FileInfo model-conditional decode (issue #88). The 300D's FileInfo
+  // position 1 matches NONE of the FileNumber/ShutterCount conditions
+  // (not 20D/350D/30D/400D/1D), and positions 20/21 are out of range in
+  // this 18-byte blob — so the conditional surface stays empty. (The
+  // visible "FileNumber" comes from the Main IFD 0x08 tag, not FileInfo.)
+  assert_eq!(canon.file_number_decoded(), None);
+  assert_eq!(canon.shutter_count_decoded(), None);
+  assert_eq!(canon.focus_distance_decoded(), None);
 }
 
 // ===========================================================================
@@ -944,6 +985,56 @@ fn canon_eos_real_fixture_emits_print_conv_labels() {
   assert_eq!(find("LensType"), Some(TagValue::Str("n/a".into())));
   assert_eq!(find("MaxFocalLength"), Some(TagValue::Str("55 mm".into())));
   assert_eq!(find("MinFocalLength"), Some(TagValue::Str("18 mm".into())));
+
+  // ShotInfo sub-table emissions (issue #86) — PrintConv labels match the
+  // oracle exactly.
+  assert_eq!(find("WhiteBalance"), Some(TagValue::Str("Auto".into())));
+  assert_eq!(find("SequenceNumber"), Some(TagValue::I64(0)));
+  assert_eq!(
+    find("AutoExposureBracketing"),
+    Some(TagValue::Str("Off".into()))
+  );
+  assert_eq!(find("AEBBracketValue"), Some(TagValue::Str("0".into())));
+  assert_eq!(
+    find("ControlMode"),
+    Some(TagValue::Str("Camera Local Control".into()))
+  );
+  assert_eq!(
+    find("FocusDistanceUpper"),
+    Some(TagValue::Str("inf".into()))
+  );
+  assert_eq!(
+    find("FocusDistanceLower"),
+    Some(TagValue::Str("5.46 m".into()))
+  );
+  assert_eq!(find("MeasuredEV2"), Some(TagValue::F64(-1.25)));
+  assert_eq!(find("BulbDuration"), Some(TagValue::I64(4)));
+  assert_eq!(find("NDFilter"), Some(TagValue::Str("n/a".into())));
+  // CameraTemperature raw 0 → RawConv drops it (absent).
+  assert_eq!(find("CameraTemperature"), None);
+
+  // AFInfo sub-table emissions (issue #86).
+  assert_eq!(find("NumAFPoints"), Some(TagValue::I64(7)));
+  assert_eq!(find("ValidAFPoints"), Some(TagValue::I64(7)));
+  assert_eq!(find("CanonImageWidth"), Some(TagValue::I64(3072)));
+  assert_eq!(find("CanonImageHeight"), Some(TagValue::I64(2048)));
+  assert_eq!(find("AFImageWidth"), Some(TagValue::I64(3072)));
+  assert_eq!(find("AFImageHeight"), Some(TagValue::I64(2048)));
+  assert_eq!(find("AFAreaWidth"), Some(TagValue::I64(151)));
+  assert_eq!(find("AFAreaHeight"), Some(TagValue::I64(151)));
+  assert_eq!(
+    find("AFAreaXPositions"),
+    Some(TagValue::Str("1014 608 0 0 0 -608 -1014".into()))
+  );
+  assert_eq!(
+    find("AFAreaYPositions"),
+    Some(TagValue::Str("0 0 -506 0 506 0 0".into()))
+  );
+  // AFPointsInFocus = 0 → DecodeBits → "(none)".
+  assert_eq!(
+    find("AFPointsInFocus"),
+    Some(TagValue::Str("(none)".into()))
+  );
 }
 
 // ===========================================================================
@@ -2486,4 +2577,397 @@ fn phase4_vendor_surface_is_observable() {
   assert!(Vendor::Dji.is_dji());
   // DJI has a signature (the negative-lookahead body shape carving).
   assert!(Vendor::Dji.is_signature_based());
+}
+
+// ===========================================================================
+// Canon deep sub-table focused regressions (PR #164 — AFInfo2 0x26 all-zero
+// suppression / AFInfo3 0x3c dispatch / FileInfo `-n` / Unknown-flagged
+// AFInfoSize). Each value/behaviour below was oracled against the bundled
+// `perl exiftool 13.59` binary (see the per-test cites).
+// ===========================================================================
+
+/// Build a one-entry Canon Main IFD blob (little-endian) carrying `tag` as an
+/// `int16u[count]` array stored OUT-OF-LINE, with `words` the array contents.
+/// The blob is laid out so `canon::parse_in_tiff(blob, 0, blob.len(), ..)`
+/// resolves the value offset (blob-relative, Canon inherits the parent base).
+#[cfg(all(feature = "exif", feature = "std"))]
+fn canon_mn_one_int16u_array(tag: u16, words: &[i16]) -> Vec<u8> {
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+  blob.extend_from_slice(&tag.to_le_bytes()); // tag id
+  blob.extend_from_slice(&3u16.to_le_bytes()); // format 3 = int16u
+  blob.extend_from_slice(&(words.len() as u32).to_le_bytes()); // count
+  // value offset: after the 2-byte count + one 12-byte entry + 4-byte next = 18.
+  let data_off = 2 + 12 + 4;
+  blob.extend_from_slice(&(data_off as u32).to_le_bytes());
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+  for &w in words {
+    blob.extend_from_slice(&w.to_le_bytes());
+  }
+  blob
+}
+
+/// 0x26 all-zero suppression (`Canon.pm:1713`,
+/// `Condition => '$$valPt !~ /^\0\0\0\0/'`).
+///
+/// When the CanonAFInfo2 record's first four bytes are all zero (the all-zero
+/// 0x26 record bundled documents for "thumbnail of 60D MOV video"), bundled
+/// does NOT enter the AFInfo2 SubDirectory and emits NOTHING for it. Oracle:
+/// a crafted Canon TIFF with a zeroed 0x26 → `perl exiftool -j -G1` produces
+/// no `Canon:AF*` keys (verified). The port must likewise emit nothing.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_afinfo2_0x26_all_zero_is_suppressed() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+  // A 48-word record whose FIRST TWO words (= first 4 bytes) are zero, but
+  // whose later words would decode to real AF tags if the walk ran. (AFInfoSize
+  // = word 0 = 0, AFAreaMode = word 1 = 0.)
+  let mut words = vec![0i16; 48];
+  words[2] = 9; // NumAFPoints — would drive arrays if (wrongly) parsed
+  words[3] = 9; // ValidAFPoints
+  let blob = canon_mn_one_int16u_array(0x26, &words);
+  let (typed, em) = canon::parse_in_tiff(
+    &blob,
+    0,
+    blob.len(),
+    ByteOrder::Little,
+    true,
+    Some("Canon EOS 60D"),
+  );
+  // No AFInfo2 leaves emitted, and the typed AF surface stays unset.
+  assert!(
+    !em.iter().any(|e| e.name() == "NumAFPoints"
+      || e.name() == "AFAreaMode"
+      || e.name() == "ValidAFPoints"),
+    "all-zero 0x26 must emit no AFInfo2 tags; got {:?}",
+    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
+  );
+  assert!(
+    typed.af_info().is_none(),
+    "all-zero 0x26 must not populate the typed AFInfo surface"
+  );
+}
+
+/// A NON-zero 0x26 (only the first word zero, second word non-zero) is NOT
+/// suppressed — `/^\0\0\0\0/` requires the first FOUR bytes zero. With
+/// AFInfoSize=0 but AFAreaMode!=0, the first 4 bytes are `00 00 02 00`, which
+/// does not match, so bundled enters the SubDirectory.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_afinfo2_0x26_only_first_word_zero_is_not_suppressed() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+  let mut words = vec![0i16; 48];
+  words[0] = 0; // AFInfoSize = 0 (bytes 0-1 zero)
+  words[1] = 2; // AFAreaMode = 2 (bytes 2-3 = 02 00, non-zero) → not all-zero
+  words[2] = 9; // NumAFPoints
+  words[3] = 9; // ValidAFPoints
+  let blob = canon_mn_one_int16u_array(0x26, &words);
+  let (_typed, em) = canon::parse_in_tiff(
+    &blob,
+    0,
+    blob.len(),
+    ByteOrder::Little,
+    true,
+    Some("Canon EOS 60D"),
+  );
+  assert!(
+    em.iter()
+      .any(|e| e.name() == "NumAFPoints" && *e.value() == exifast::value::TagValue::I64(9)),
+    "0x26 with a non-zero second word must still decode NumAFPoints; got {:?}",
+    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
+  );
+}
+
+/// 0x3c AFInfo3 dispatch (`Canon.pm:1764-1770`): the SAME `Canon::AFInfo2`
+/// walker runs, but `$$self{AFInfo3} = 1` suppresses the index-14
+/// `PrimaryAFPoint` (`Condition => '$$self{Model} !~ /EOS/ and not
+/// $$self{AFInfo3}'`, `Canon.pm:6602`).
+///
+/// Oracle: a crafted G1XmkII (non-EOS) TIFF with a 0x3c record →
+/// `perl exiftool -j -G1` emits `Canon:AFAreaMode "Single-point AF"`,
+/// `Canon:NumAFPoints 9`, `Canon:AFAreaWidths`, `Canon:AFAreaXPositions`,
+/// `Canon:AFPointsInFocus "0,2"`, and crucially NO `Canon:PrimaryAFPoint`
+/// (verified). Before this fix the port left 0x3c as `sub_table: None`, so it
+/// emitted a bogus raw `AFInfo3` leaf and decoded none of the AF tags.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_afinfo3_0x3c_dispatches_to_afinfo2_and_suppresses_primary() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+  use exifast::value::TagValue;
+  // Same non-EOS AFInfo2 layout used to oracle the non-EOS path: NumAFPoints=9,
+  // AFAreaMode=2, AFPointsInFocus word = 5 (bits 0,2), then the index-13 filler
+  // (2 words) and a trailing PrimaryAFPoint candidate (3) that must NOT emit.
+  let words: [i16; 48] = [
+    96, 2, 9, 9, 4000, 3000, 4000, 3000, // 0-7 (AFInfoSize=96 = byte length)
+    50, 50, 50, 50, 50, 50, 50, 50, 50, // AFAreaWidths[9]
+    60, 60, 60, 60, 60, 60, 60, 60, 60, // AFAreaHeights[9]
+    -400, -300, -200, -100, 0, 100, 200, 300, 400, // AFAreaXPositions[9]
+    -200, -150, -100, -50, 0, 50, 100, 150, 200, // AFAreaYPositions[9]
+    5,   // AFPointsInFocus[1] = 5 → DecodeBits "0,2"
+    7, 0, // Canon_AFInfo2_0x000d[2] filler (Unknown → not emitted)
+    3, // index 14 PrimaryAFPoint candidate — suppressed by AFInfo3
+  ];
+  let blob = canon_mn_one_int16u_array(0x3c, &words);
+  let (typed, em) = canon::parse_in_tiff(
+    &blob,
+    0,
+    blob.len(),
+    ByteOrder::Little,
+    true,
+    Some("Canon PowerShot G1 X Mark II"),
+  );
+  let find = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.value().clone());
+  assert_eq!(
+    find("AFAreaMode"),
+    Some(TagValue::Str("Single-point AF".into())),
+    "0x3c must decode AFAreaMode via the AFInfo2 table"
+  );
+  assert_eq!(find("NumAFPoints"), Some(TagValue::I64(9)));
+  assert_eq!(
+    find("AFAreaXPositions"),
+    Some(TagValue::Str(
+      "-400 -300 -200 -100 0 100 200 300 400".into()
+    ))
+  );
+  assert_eq!(find("AFPointsInFocus"), Some(TagValue::Str("0,2".into())));
+  // PrimaryAFPoint MUST be suppressed (AFInfo3 flag), even though non-EOS.
+  assert_eq!(
+    find("PrimaryAFPoint"),
+    None,
+    "AFInfo3 (0x3c) must suppress index-14 PrimaryAFPoint"
+  );
+  // The bogus raw `AFInfo3` leaf (the pre-fix deferred-arm output) is gone.
+  assert!(
+    !em.iter().any(|e| e.name() == "AFInfo3"),
+    "0x3c must be walked, not emitted as a raw AFInfo3 leaf"
+  );
+  // Typed surface populated and flagged as the v2 record shape.
+  let af = typed
+    .af_info()
+    .expect("AFInfo3 populates the typed surface");
+  assert!(af.is_v2());
+  assert_eq!(af.num_af_points(), Some(9));
+  assert_eq!(af.primary_af_point(), None);
+}
+
+/// FileInfo `-n` (ValueConv-only) fidelity (`Canon.pm:6842-7140`). The real
+/// 1D Mark III FileInfo record (extracted via `perl exiftool` FoundTag hook,
+/// byte order II) decodes — under `-n` — to raw ints for every PrintConv tag
+/// and `$val/100` FLOATS for FocusDistanceUpper/Lower (the only ValueConv
+/// positions). Oracle (`perl exiftool -n -j -G1 t/images/Canon1DmkIII.jpg`):
+/// BracketMode 0, RawJpgSize 0, FocusDistanceUpper 2.19, FocusDistanceLower
+/// 1.13, LiveViewShooting 0 (verified). RawJpgQuality(0) and FilterEffect/
+/// ToningEffect(-1) are dropped by their RawConvs in BOTH modes.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_fileinfo_n_mode_matches_1dmkiii_oracle() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon::file_info::parse_with_model;
+  use exifast::value::TagValue;
+  // FileInfo words[0..22]; word[0] is the length validator (not a tag).
+  let mut w = [0i16; 22];
+  w[0] = 44; // 22 words * 2 bytes
+  w[14] = -1; // FilterEffect = -1 → dropped
+  w[15] = -1; // ToningEffect = -1 → dropped
+  w[20] = 219; // FocusDistanceUpper raw → 2.19
+  w[21] = 113; // FocusDistanceLower raw → 1.13
+  let mut data = Vec::new();
+  for &x in &w {
+    data.extend_from_slice(&x.to_le_bytes());
+  }
+  let (em, _decoded) = parse_with_model(
+    &data,
+    ByteOrder::Little,
+    false, // -n: ValueConv only, no PrintConv
+    None,
+    Some("Canon EOS-1D Mark III"),
+  );
+  // `parse_with_model` returns `(SmolStr, TagValue)` tuples (not VendorEmission).
+  let find = |n: &str| {
+    em.iter()
+      .find(|(name, _)| name == n)
+      .map(|(_, v)| v.clone())
+  };
+  // PrintConv tags stay raw ints under `-n`.
+  assert_eq!(find("BracketMode"), Some(TagValue::I64(0)));
+  assert_eq!(find("RawJpgSize"), Some(TagValue::I64(0)));
+  assert_eq!(find("LongExposureNoiseReduction2"), Some(TagValue::I64(0)));
+  assert_eq!(find("WBBracketMode"), Some(TagValue::I64(0)));
+  assert_eq!(find("LiveViewShooting"), Some(TagValue::I64(0)));
+  // The ONLY ValueConv positions emit `$val/100` floats (NOT "X m" strings).
+  assert_eq!(find("FocusDistanceUpper"), Some(TagValue::F64(2.19)));
+  assert_eq!(find("FocusDistanceLower"), Some(TagValue::F64(1.13)));
+  // RawConv-dropped tags are absent in `-n` too.
+  assert_eq!(
+    find("RawJpgQuality"),
+    None,
+    "RawJpgQuality(0) dropped by $val<=0"
+  );
+  assert_eq!(
+    find("FilterEffect"),
+    None,
+    "FilterEffect(-1) dropped by $val==-1"
+  );
+  assert_eq!(
+    find("ToningEffect"),
+    None,
+    "ToningEffect(-1) dropped by $val==-1"
+  );
+}
+
+/// Unknown-flagged AFInfo emission (`AFInfoSize`, `Canon.pm:6515`,
+/// `Unknown => 1`). Bundled hides it without `-u`; the port consumes it for
+/// serial sync but never surfaces it in the default `-j`/`-n` output. Oracle:
+/// `perl exiftool -j -G1` on the 1DmkIII shows NO `Canon:AFInfoSize` (it only
+/// appears under `-u`, where it is 396). Verify the port's default emission
+/// list excludes AFInfoSize while still decoding the following tags.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_afinfo2_afinfosize_unknown_hidden_by_default() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon::af_info::parse_af_info2;
+  // Minimal valid EOS AFInfo2: AFInfoSize=N, AFAreaMode=2, NumAFPoints=1, …
+  let words: [i16; 16] = [
+    32, 2, 1, 1, 4000, 3000, 4000, 3000, // 0-7
+    50,   // AFAreaWidths[1]
+    60,   // AFAreaHeights[1]
+    10,   // AFAreaXPositions[1]
+    20,   // AFAreaYPositions[1]
+    0,    // AFPointsInFocus[1]
+    0,    // AFPointsSelected[1] (EOS)
+    0, 0, // padding
+  ];
+  let mut data = Vec::new();
+  for &x in &words {
+    data.extend_from_slice(&x.to_le_bytes());
+  }
+  // `parse_af_info2` returns `(SmolStr, TagValue)` tuples.
+  let (_typed, em) = parse_af_info2(&data, ByteOrder::Little, true, Some("Canon EOS 5D"));
+  assert!(
+    !em.iter().any(|(name, _)| name == "AFInfoSize"),
+    "AFInfoSize (Unknown => 1) must be hidden in default output; got {:?}",
+    em.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>()
+  );
+  // But the non-Unknown tags after it ARE present (serial sync intact).
+  assert!(em.iter().any(|(name, _)| name == "AFAreaMode"));
+  assert!(em.iter().any(|(name, _)| name == "NumAFPoints"));
+}
+
+/// #164 R3: AFInfo (v1, 0x12) array rendering on the REAL `MakerNotes_Canon.jpg`
+/// (7 AF points). Oracle (`perl exiftool 13.59 -G1 [-n] -j`):
+///   `AFAreaXPositions` "1014 608 0 0 0 -608 -1014" (7 signed `int16s`, space-joined)
+///   `AFAreaYPositions` "0 0 -506 0 506 0 0"
+///   `AFPointsInFocus`  `-j` "(none)" (DecodeBits 0)  /  `-n` `0` — the SCALAR
+///   number, NOT the string "0": ExifTool emits a single-element `int16s` list as
+///   a bare scalar. (The R1 oracle used a different model and missed this.)
+#[test]
+fn canon_af_info_real_fixture_array_rendering() {
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/MakerNotes_Canon.jpg")).expect("fixture");
+  // `-n` (ValueConv): signed arrays space-joined; AFPointsInFocus is the NUMBER 0.
+  let n = exifast::parser::extract_info("MakerNotes_Canon.jpg", &data, false);
+  assert!(
+    n.contains("\"Canon:AFAreaXPositions\":\"1014 608 0 0 0 -608 -1014\""),
+    "AFAreaXPositions (signed, space-joined): {n}",
+  );
+  assert!(
+    n.contains("\"Canon:AFAreaYPositions\":\"0 0 -506 0 506 0 0\""),
+    "AFAreaYPositions: {n}",
+  );
+  assert!(
+    n.contains("\"Canon:AFPointsInFocus\":0"),
+    "AFPointsInFocus -n must be the scalar number 0: {n}",
+  );
+  assert!(
+    !n.contains("\"Canon:AFPointsInFocus\":\"0\""),
+    "AFPointsInFocus -n must NOT be the string \"0\": {n}",
+  );
+  // `-j` (PrintConv): AFPointsInFocus DecodeBits(0) = "(none)".
+  let j = exifast::parser::extract_info("MakerNotes_Canon.jpg", &data, true);
+  assert!(
+    j.contains("\"Canon:AFPointsInFocus\":\"(none)\""),
+    "AFPointsInFocus -j must be DecodeBits \"(none)\": {j}",
+  );
+}
+
+/// #164: the newly-completed `Canon::ShotInfo` positions on the REAL
+/// `MakerNotes_Canon.jpg` (EOS 300D / "Canon EOS DIGITAL REBEL"). Oracle
+/// (`perl exiftool 13.59 -G1 [-n] -j`):
+///   `-j`  AutoISO 100, BaseISO 100, MeasuredEV -1.25, TargetAperture 14,
+///         ExposureCompensation 0, SlowShutter "None", OpticalZoomCode
+///         "n/a", FlashExposureComp 0, FNumber 14, ExposureTime 128,
+///         CameraType "EOS Mid-range", AutoRotate "None", SelfTimer2 0.
+///   `-n`  AutoISO 100, TargetAperture 14.2543794902454, SlowShutter 3,
+///         CameraType 252, AutoRotate 0 (the raw / ValueConv numbers).
+/// ExposureTime is the DEFAULT branch (model lacks the 20D/350D tokens).
+#[cfg(feature = "json")]
+#[test]
+fn canon_shot_info_real_fixture_new_positions() {
+  // -j (PrintConv): hash labels + the "n/a"/PrintFraction strings. Numeric
+  // PrintConv results (e.g. "14") serialize as JSON strings but the
+  // value-semantic conformance comparator coerces them to the bare number,
+  // so assert via the parsed map's value type rather than raw text.
+  let jmap = extract_info_map("MakerNotes_Canon.jpg", true);
+  let want_label = [
+    ("Canon:SlowShutter", "None"),
+    ("Canon:OpticalZoomCode", "n/a"),
+    ("Canon:CameraType", "EOS Mid-range"),
+    ("Canon:AutoRotate", "None"),
+  ];
+  for (k, v) in want_label {
+    assert_eq!(
+      jmap.get(k).and_then(|x| x.as_str()),
+      Some(v),
+      "{k} (-j) must be {v:?}; map: {jmap:?}"
+    );
+  }
+  // PrintFraction "0" for the two CanonEv comp tags (string token, value 0).
+  for k in ["Canon:ExposureCompensation", "Canon:FlashExposureComp"] {
+    let got = jmap.get(k).unwrap_or_else(|| panic!("{k} (-j) missing"));
+    // Either the bare number 0 or the string "0" is value-equal to the
+    // oracle's 0; assert it is one of those (PrintFraction emits "0").
+    assert!(
+      got.as_str() == Some("0") || got.as_i64() == Some(0),
+      "{k} (-j) must be PrintFraction 0; got {got:?}"
+    );
+  }
+
+  // -n (ValueConv): the raw / numeric values, as bare JSON numbers.
+  let nmap = extract_info_map("MakerNotes_Canon.jpg", false);
+  assert_eq!(
+    nmap.get("Canon:AutoISO").and_then(|v| v.as_f64()),
+    Some(100.0),
+    "AutoISO (-n)"
+  );
+  assert_eq!(
+    nmap.get("Canon:SlowShutter").and_then(|v| v.as_i64()),
+    Some(3),
+    "SlowShutter (-n) is the raw int 3"
+  );
+  assert_eq!(
+    nmap.get("Canon:CameraType").and_then(|v| v.as_i64()),
+    Some(252),
+    "CameraType (-n) is the raw int 252"
+  );
+  assert_eq!(
+    nmap.get("Canon:AutoRotate").and_then(|v| v.as_i64()),
+    Some(0),
+    "AutoRotate (-n) is the raw int 0"
+  );
+  assert_eq!(
+    nmap.get("Canon:ExposureTime").and_then(|v| v.as_i64()),
+    Some(128),
+    "ExposureTime (-n) default branch = 128"
+  );
+  // TargetAperture / FNumber -n: the aperture float, %.15g-rounded.
+  for k in ["Canon:TargetAperture", "Canon:FNumber"] {
+    let got = nmap.get(k).and_then(|v| v.as_f64());
+    assert!(
+      got.is_some_and(|f| (f - 14.2543794902454).abs() < 1e-9),
+      "{k} (-n) must be ~14.2543794902454; got {got:?}"
+    );
+  }
 }

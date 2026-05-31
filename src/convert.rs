@@ -722,7 +722,10 @@ fn perl_numeric_coerce(word: &str) -> u64 {
 /// `BitsPerWord` ≤ 64 here, so a `u64` accumulator is exact for every real
 /// table; shifts of ≥ 64 are treated as 0 (Perl's bit beyond the value is
 /// unset anyway), matching "no such bit".
-fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
+///
+/// `pub(crate)` so the Canon AFInfo/AFInfo2 sub-tables can reuse the exact
+/// `DecodeBits($val, undef, 16)` PrintConv (`Canon.pm:6479`/`:6583`).
+pub(crate) fn decode_bits(vals: &str, lookup: Option<&[(u8, &str)]>, bits: u8) -> String {
   // `$bits or $bits = 32;` — 0 ⇒ 32 (the `;$` default).
   let bits: u32 = if bits == 0 { 32 } else { u32::from(bits) };
   let mut bit_list: Vec<String> = Vec::new();

@@ -112,8 +112,12 @@ pub enum SubTable {
   FaceDetect2,
   /// `%Canon::AFInfo` (`Canon.pm:6432-6500`).
   AfInfo,
-  /// `%Canon::AFInfo2` (`Canon.pm:6503-6604`).
+  /// `%Canon::AFInfo2` (`Canon.pm:6503-6604`) — Main tag 0x26.
   AfInfo2,
+  /// `Canon::Main` tag 0x3c `AFInfo3` (`Canon.pm:1764-1770`): processed
+  /// with the SAME `%Canon::AFInfo2` table but with `$$self{AFInfo3} = 1`
+  /// set (which suppresses the index-14 PrimaryAFPoint).
+  AfInfo3,
   /// `%Canon::Processing` (`Canon.pm:7201-7264`).
   Processing,
   /// `%Canon::MovieInfo` (`Canon.pm:6358-6432`).
@@ -125,14 +129,22 @@ pub enum SubTable {
 }
 
 impl SubTable {
-  /// `true` when the port walks this sub-table natively (Phase 2).
+  /// `true` when the port walks this sub-table natively. Covers the
+  /// Phase-2 set (CameraSettings / FileInfo / FocalLength) plus the deep
+  /// sub-tables added for issues #86/#88 (ShotInfo / AFInfo / AFInfo2).
   /// `false` when it stays a raw-bytes blob for now (deferred).
   #[must_use]
   #[inline(always)]
-  pub const fn is_phase2_walked(self) -> bool {
+  pub const fn is_walked(self) -> bool {
     matches!(
       self,
-      SubTable::CameraSettings | SubTable::FileInfo | SubTable::FocalLength
+      SubTable::CameraSettings
+        | SubTable::FileInfo
+        | SubTable::FocalLength
+        | SubTable::ShotInfo
+        | SubTable::AfInfo
+        | SubTable::AfInfo2
+        | SubTable::AfInfo3
     )
   }
 }
@@ -409,12 +421,15 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x3c — AFInfo3 (`Canon.pm:1768-1770`)
+  // 0x3c — AFInfo3 (`Canon.pm:1764-1770`). `Condition => '$$self{AFInfo3}
+  // = 1'` (always-true assignment that sets the DataMember); SubDirectory
+  // `TagTable => Canon::AFInfo2`, i.e. processed with the SAME AFInfo2
+  // walker but with the AFInfo3 flag set.
   CanonTag {
     id: 0x3c,
     name: "AFInfo3",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::AfInfo3),
     unknown: false,
   },
   // 0x81 — RawDataOffset (`Canon.pm:1774-1779`)
@@ -912,13 +927,23 @@ mod tests {
   }
 
   #[test]
-  fn phase2_walked_subtables_are_marked() {
-    assert!(SubTable::CameraSettings.is_phase2_walked());
-    assert!(SubTable::FileInfo.is_phase2_walked());
-    assert!(SubTable::FocalLength.is_phase2_walked());
-    // Deferred sub-tables not walked.
-    assert!(!SubTable::ShotInfo.is_phase2_walked());
-    assert!(!SubTable::AfInfo.is_phase2_walked());
-    assert!(!SubTable::AfInfo2.is_phase2_walked());
+  fn walked_subtables_are_marked() {
+    assert!(SubTable::CameraSettings.is_walked());
+    assert!(SubTable::FileInfo.is_walked());
+    assert!(SubTable::FocalLength.is_walked());
+    // Deep sub-tables (issues #86/#88) are now walked too.
+    assert!(SubTable::ShotInfo.is_walked());
+    assert!(SubTable::AfInfo.is_walked());
+    assert!(SubTable::AfInfo2.is_walked());
+    assert!(SubTable::AfInfo3.is_walked());
+    // 0x3c (AFInfo3) dispatches to the AFInfo2 walker (`Canon.pm:1764-1770`).
+    assert_eq!(
+      lookup(0x3c).and_then(CanonTag::sub_table),
+      Some(SubTable::AfInfo3)
+    );
+    // Still-deferred sub-tables remain raw.
+    assert!(!SubTable::Panorama.is_walked());
+    assert!(!SubTable::MyColors.is_walked());
+    assert!(!SubTable::Processing.is_walked());
   }
 }

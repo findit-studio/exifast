@@ -5,7 +5,7 @@
 //!
 //! Binary-data sub-table — `FORMAT => 'int16s'`, `FIRST_ENTRY => 1`.
 //!
-//! Phase-2 scope: ports the model-agnostic tags (BracketMode=3,
+//! Scope: ports the model-agnostic tags (BracketMode=3,
 //! BracketValue=4, BracketShotNumber=5, RawJpgQuality=6, RawJpgSize=7,
 //! LongExposureNoiseReduction2=8, WBBracketMode=9, WBBracketValueAB=12,
 //! WBBracketValueGM=13, FilterEffect=14, ToningEffect=15,
@@ -23,16 +23,27 @@
 //! be a 40D/450D/REBEL XSi/Kiss X2, which report a bogus value). Both are
 //! threaded into [`parse`] by the Canon body walker (`super`).
 //!
-//! The model-conditional FileNumber/ShutterCount at position 1 is the
-//! ONLY position still DEFERRED (to PR #164): each model has its own
-//! bit-pattern interpretation; `Canon.pm:6848-6927` has six conditional
-//! `$$self{Model} =~ /…/` variants.
+//! The model-conditional FileNumber/ShutterCount at **position 1**
+//! (`Canon.pm:6848-6927`, issue #88) is a conditional list keyed on
+//! `$$self{Model}` + byte order — decoded into [`FileInfoDecoded`]:
+//!
+//! - `FileNumber` for `20D|350D|REBEL XT|Kiss Digital N`
+//!   (`Canon.pm:6849-6874`) — `int32u` with a bit-shuffled directory/
+//!   file decode.
+//! - `FileNumber` for `30D|400D|REBEL XTi|Kiss Digital X|K236`
+//!   (`Canon.pm:6875-6907`) — a different bit layout (upper dir bits lost).
+//! - `ShutterCount` for `GetByteOrder() eq "MM"` (1D/1Ds)
+//!   (`Canon.pm:6908-6912`) — raw `int32u`.
+//! - `ShutterCount` for `1Ds? Mark II` (`Canon.pm:6913-6924`) — `int32u`
+//!   with a 16-bit word swap.
+//! - 5D writes a single byte (unknown); 40D writes zeros → no match.
 //!
 //! The table `FORMAT => 'int16s'` applies to every position EXCEPT
 //! RFLensType (`0x3d`, `Canon.pm:7062`) and FocusDistanceUpper/Lower
 //! (20/21, `Canon.pm:7024`/`:7034`), each `Format => 'int16u'` — see
-//! [`FiFormat`].
+//! [`FiFormat`]. Position 1's conditional rows override to `int32u`.
 
+use crate::exif::ifd::ByteOrder;
 use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
@@ -582,25 +593,94 @@ fn rf_lens_name(key: u16) -> Option<&'static str> {
     .map(|i| RF_LENS_TYPES[i].name)
 }
 
-/// Parse a FileInfo blob.
+/// The model-conditional values decoded from `Canon::FileInfo` (issue
+/// #88) — returned alongside the emission list so the typed
+/// [`super::MakerNotesCanon`] surface can expose them.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct FileInfoDecoded {
+  /// Position 1 `FileNumber` (`directory*10000 + file`) for the 20D/350D
+  /// and 30D/400D bodies (`Canon.pm:6848-6907`). `None` for bodies whose
+  /// position-1 layout is unknown (5D/40D) or that emit ShutterCount.
+  file_number: Option<u32>,
+  /// Position 1 `ShutterCount` for 1D/1Ds (MM byte order) and 1Ds Mark II
+  /// (`Canon.pm:6908-6924`).
+  shutter_count: Option<u32>,
+  /// Position 20 `FocusDistanceUpper` in metres; `f64::INFINITY` encodes
+  /// the bundled `"inf"` (`Canon.pm:7020-7029`).
+  focus_distance_upper_m: Option<f64>,
+  /// Position 21 `FocusDistanceLower` in metres (`Canon.pm:7030-7038`).
+  focus_distance_lower_m: Option<f64>,
+}
+
+impl FileInfoDecoded {
+  /// Position 1 FileNumber (20D/350D/30D/400D).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_number(&self) -> Option<u32> {
+    self.file_number
+  }
+
+  /// Position 1 ShutterCount (1D/1Ds/1Ds Mark II).
+  #[must_use]
+  #[inline(always)]
+  pub const fn shutter_count(&self) -> Option<u32> {
+    self.shutter_count
+  }
+
+  /// Position 20 FocusDistanceUpper in metres.
+  #[must_use]
+  #[inline(always)]
+  pub const fn focus_distance_upper_m(&self) -> Option<f64> {
+    self.focus_distance_upper_m
+  }
+
+  /// Position 21 FocusDistanceLower in metres.
+  #[must_use]
+  #[inline(always)]
+  pub const fn focus_distance_lower_m(&self) -> Option<f64> {
+    self.focus_distance_lower_m
+  }
+}
+
+/// Parse a FileInfo blob (model-agnostic positions only). Thin wrapper
+/// over [`parse_with_model`] with no `$$self{LensType}` / `$$self{Model}`
+/// context — used by callers / tests that don't need the model-conditional
+/// position-1 decode or the MacroMagnification (16) gate. Discards the
+/// [`FileInfoDecoded`] typed surface.
+#[must_use]
+pub fn parse(data: &[u8], parent_order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+  parse_with_model(data, parent_order, print_conv, None, None).0
+}
+
+/// Parse a FileInfo blob including the model-conditional position 1
+/// (FileNumber/ShutterCount) and the model/lens-gated positions.
 ///
 /// `lens_type` is the CameraSettings `$$self{LensType}` DataMember
-/// (`Canon.pm:2503`) and `model` is the body `$$self{Model}`; both gate
-/// position 16 (`MacroMagnification`, `Canon.pm:7002-7005`). They are
+/// (`Canon.pm:2503`) and `model` is the body `$$self{Model}` (the resolved
+/// Canon model NAME from `%canonModelID`); both gate position 16
+/// (`MacroMagnification`, `Canon.pm:7002-7005`), and `model` additionally
+/// keys the position-1 conditional list (`Canon.pm:6848-6927`). Both are
 /// captured/threaded by the Canon body walker (`super`).
 #[must_use]
-pub fn parse(
+pub fn parse_with_model(
   data: &[u8],
-  parent_order: crate::exif::ifd::ByteOrder,
+  parent_order: ByteOrder,
   print_conv: bool,
   lens_type: Option<u16>,
   model: Option<&str>,
-) -> Vec<(SmolStr, TagValue)> {
+) -> (Vec<(SmolStr, TagValue)>, FileInfoDecoded) {
   let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
+  let mut decoded = FileInfoDecoded::default();
   if data.len() < 4 {
-    return out;
+    return (out, decoded);
   }
   let order = parent_order;
+
+  // Position 1 — model-conditional FileNumber / ShutterCount (int32u),
+  // evaluated in bundled source order (`Canon.pm:6848-6927`).
+  decode_position_1(data, order, model, print_conv, &mut out, &mut decoded);
+
   // `FocusDistanceUpper2` DataMember (`Canon.pm:7023`): set by position 20's
   // RawConv (`$$self{FocusDistanceUpper2} = $val`), then read by position
   // 21's `Condition => '$$self{FocusDistanceUpper2}'` (`Canon.pm:7033`).
@@ -617,12 +697,12 @@ pub fn parse(
     // FocusDistanceUpper/Lower (`Canon.pm:7024`/`:7034`).
     let val: i64 = match t.format {
       FiFormat::Int16s => match order {
-        crate::exif::ifd::ByteOrder::Little => i64::from(i16::from_le_bytes(arr)),
-        crate::exif::ifd::ByteOrder::Big => i64::from(i16::from_be_bytes(arr)),
+        ByteOrder::Little => i64::from(i16::from_le_bytes(arr)),
+        ByteOrder::Big => i64::from(i16::from_be_bytes(arr)),
       },
       FiFormat::Int16u => match order {
-        crate::exif::ifd::ByteOrder::Little => i64::from(u16::from_le_bytes(arr)),
-        crate::exif::ifd::ByteOrder::Big => i64::from(u16::from_be_bytes(arr)),
+        ByteOrder::Little => i64::from(u16::from_le_bytes(arr)),
+        ByteOrder::Big => i64::from(u16::from_be_bytes(arr)),
       },
     };
     // Position 20 `FocusDistanceUpper` RawConv (`Canon.pm:7025`):
@@ -663,10 +743,201 @@ pub fn parse(
     if skip {
       continue;
     }
+    // Capture the typed FocusDistance surface (issue #88). The bundled
+    // ValueConv is `$val / 100` (`Canon.pm:7026`/`:7035`); `> 655.345`
+    // (the `"inf"` PrintConv threshold) is stored as `f64::INFINITY`.
+    if t.position == 20 || t.position == 21 {
+      let metres = val as f64 / 100.0;
+      let m = if metres > 655.345 {
+        f64::INFINITY
+      } else {
+        metres
+      };
+      if t.position == 20 {
+        decoded.focus_distance_upper_m = Some(m);
+      } else {
+        decoded.focus_distance_lower_m = Some(m);
+      }
+    }
     let tag_value = apply_fi_print_conv(t.conv, val, print_conv);
     out.push((t.name.into(), tag_value));
   }
-  out
+
+  (out, decoded)
+}
+
+/// `int32u` read at word `position` (`int16s` table FORMAT overridden to
+/// `int32u` for the position-1 conditionals).
+fn read_u32_at(data: &[u8], position: usize, order: ByteOrder) -> Option<u32> {
+  let off = 2 * position;
+  let b = data.get(off..off + 4)?;
+  let arr = [b[0], b[1], b[2], b[3]];
+  Some(match order {
+    ByteOrder::Little => u32::from_le_bytes(arr),
+    ByteOrder::Big => u32::from_be_bytes(arr),
+  })
+}
+
+/// `$$self{Model} =~ /\b(20D|350D|REBEL XT|Kiss Digital N)\b/`
+/// (`Canon.pm:6851`). The `\b` word boundaries matter: `REBEL XT` must not
+/// match inside `REBEL XTi` (the 400D), and `Kiss Digital N` must not
+/// match `Kiss Digital X`.
+fn is_20d_350d(model: &str) -> bool {
+  word_match(model, "20D")
+    || word_match(model, "350D")
+    || word_match(model, "REBEL XT")
+    || word_match(model, "Kiss Digital N")
+}
+
+/// `$$self{Model} =~ /\b(30D|400D|REBEL XTi|Kiss Digital X|K236)\b/`
+/// (`Canon.pm:6877`).
+fn is_30d_400d(model: &str) -> bool {
+  word_match(model, "30D")
+    || word_match(model, "400D")
+    || word_match(model, "REBEL XTi")
+    || word_match(model, "Kiss Digital X")
+    || word_match(model, "K236")
+}
+
+/// `$$self{Model} =~ /\b1Ds? Mark II\b/` (`Canon.pm:6920`) — matches
+/// `1D Mark II` and `1Ds Mark II` (and `1Ds Mark II N`, whose `\b` after
+/// `II` is satisfied by the space).
+fn is_1ds_mark_ii(model: &str) -> bool {
+  word_match(model, "1D Mark II") || word_match(model, "1Ds Mark II")
+}
+
+/// Perl `\bNEEDLE\b` word-boundary containment. A boundary exists between
+/// a word char (`[A-Za-z0-9_]`) and a non-word char (or string edge). We
+/// check the char before/after the match are NOT word chars (when the
+/// needle's own edge char IS a word char — which it always is here).
+fn word_match(haystack: &str, needle: &str) -> bool {
+  let nbytes = needle.as_bytes();
+  if nbytes.is_empty() {
+    return false;
+  }
+  let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+  let first_word = is_word(nbytes[0]);
+  let last_word = is_word(nbytes[nbytes.len() - 1]);
+  let hay = haystack.as_bytes();
+  let mut start = 0;
+  while let Some(rel) = haystack[start..].find(needle) {
+    let i = start + rel;
+    let end = i + needle.len();
+    // `\b` before: boundary unless prev char and needle-first are both
+    // word chars / both non-word.
+    let before_ok = if first_word {
+      i == 0 || !is_word(hay[i - 1])
+    } else {
+      i == 0 || is_word(hay[i - 1])
+    };
+    let after_ok = if last_word {
+      end >= hay.len() || !is_word(hay[end])
+    } else {
+      end >= hay.len() || is_word(hay[end])
+    };
+    if before_ok && after_ok {
+      return true;
+    }
+    start = i + 1;
+  }
+  false
+}
+
+/// `FileNumber` PrintConv (`Canon.pm:6872`): `s/(\d+)(\d{4})/$1-$2/` —
+/// insert a dash before the last 4 digits (`1181861` → `118-1861`).
+fn file_number_dash(n: u32) -> SmolStr {
+  let s = std::format!("{n}");
+  if s.len() > 4 {
+    let split = s.len() - 4;
+    SmolStr::from(std::format!("{}-{}", &s[..split], &s[split..]))
+  } else {
+    SmolStr::from(s)
+  }
+}
+
+/// Decode position 1 — model-conditional FileNumber / ShutterCount.
+fn decode_position_1(
+  data: &[u8],
+  order: ByteOrder,
+  model: Option<&str>,
+  print_conv: bool,
+  out: &mut Vec<(SmolStr, TagValue)>,
+  decoded: &mut FileInfoDecoded,
+) {
+  let Some(raw32) = read_u32_at(data, 1, order) else {
+    return;
+  };
+  let val = raw32 as u64;
+
+  // Bundled evaluates the position-1 conditional list IN SOURCE ORDER and
+  // takes the FIRST match (`Canon.pm:6848-6924`):
+  //   1. FileNumber  — 20D/350D/REBEL XT/Kiss Digital N
+  //   2. FileNumber  — 30D/400D/REBEL XTi/Kiss Digital X/K236
+  //   3. ShutterCount — GetByteOrder() eq "MM"   (1D/1Ds)
+  //   4. ShutterCount — 1Ds? Mark II             (16-bit word swap)
+  // Order matters: a big-endian 1D body matches branch 3 before branch 4.
+  if let Some(m) = model {
+    if is_20d_350d(m) {
+      // `(($val&0xffc0)>>6)*10000+(($val>>16)&0xff)+(($val&0x3f)<<8)`.
+      let fnum =
+        (((val & 0xffc0) >> 6) * 10000 + ((val >> 16) & 0xff) + ((val & 0x3f) << 8)) as u32;
+      decoded.file_number = Some(fnum);
+      out.push((
+        "FileNumber".into(),
+        if print_conv {
+          // PrintConv (`Canon.pm:6872`): the dash format (`1181861` → `118-1861`).
+          TagValue::Str(file_number_dash(fnum))
+        } else {
+          // `-n` (ValueConv only): the raw computed integer, no dash.
+          TagValue::I64(i64::from(fnum))
+        },
+      ));
+      return;
+    }
+    if is_30d_400d(m) {
+      // `$d = ($val & 0xffc00) >> 10; $d += 0x40 while $d < 100;
+      //  return $d*10000 + (($val&0x3ff)<<4) + (($val>>20)&0x0f)`.
+      let mut d = (val & 0xffc00) >> 10;
+      while d < 100 {
+        d += 0x40;
+      }
+      let fnum = (d * 10000 + ((val & 0x3ff) << 4) + ((val >> 20) & 0x0f)) as u32;
+      decoded.file_number = Some(fnum);
+      out.push((
+        "FileNumber".into(),
+        if print_conv {
+          // PrintConv (`Canon.pm:6872`): the dash format (`1181861` → `118-1861`).
+          TagValue::Str(file_number_dash(fnum))
+        } else {
+          // `-n` (ValueConv only): the raw computed integer, no dash.
+          TagValue::I64(i64::from(fnum))
+        },
+      ));
+      return;
+    }
+  }
+
+  // Branch 3 — `ShutterCount` for `GetByteOrder() eq "MM"` (1D/1Ds),
+  // `Canon.pm:6908-6912`. Keyed on byte order, not model; comes BEFORE the
+  // 1Ds Mark II model branch in source order.
+  if order == ByteOrder::Big {
+    let sc = raw32;
+    decoded.shutter_count = Some(sc);
+    out.push(("ShutterCount".into(), TagValue::I64(i64::from(sc))));
+    return;
+  }
+
+  // Branch 4 — `ShutterCount` for `1Ds? Mark II` (`Canon.pm:6913-6924`),
+  // with a 16-bit word swap. Only reached when byte order is little-endian
+  // (a MM 1Ds Mark II would already have matched branch 3).
+  if let Some(m) = model
+    && is_1ds_mark_ii(m)
+  {
+    let sc = (((val >> 16) | ((val & 0xffff) << 16)) & 0xffff_ffff) as u32;
+    decoded.shutter_count = Some(sc);
+    out.push(("ShutterCount".into(), TagValue::I64(i64::from(sc))));
+  }
+  // Otherwise (5D single byte / 40D zeros / unknown LE body) → emit nothing.
 }
 
 /// `FocusDistanceUpper`/`FocusDistanceLower` Value/PrintConv
@@ -888,7 +1159,7 @@ mod tests {
     let order = ByteOrder::Little;
     data[2 * 3..2 * 3 + 2].copy_from_slice(&(1i16).to_le_bytes());
     data[2 * 4..2 * 4 + 2].copy_from_slice(&(-2i16).to_le_bytes());
-    let emissions = parse(&data, order, true, None, None);
+    let emissions = parse(&data, order, true);
     assert!(
       emissions
         .iter()
@@ -905,7 +1176,7 @@ mod tests {
   fn parse_print_conv_off_keeps_int() {
     let mut data = std::vec![0u8; 12];
     data[2 * 3..2 * 3 + 2].copy_from_slice(&(1i16).to_le_bytes());
-    let emissions = parse(&data, ByteOrder::Little, false, None, None);
+    let emissions = parse(&data, ByteOrder::Little, false);
     assert!(
       emissions
         .iter()
@@ -917,7 +1188,7 @@ mod tests {
   fn filter_effect_red_label() {
     let mut data = std::vec![0u8; 32];
     data[2 * 14..2 * 14 + 2].copy_from_slice(&(3i16).to_le_bytes());
-    let emissions = parse(&data, ByteOrder::Little, true, None, None);
+    let emissions = parse(&data, ByteOrder::Little, true);
     assert!(
       emissions
         .iter()
@@ -929,7 +1200,7 @@ mod tests {
   fn live_view_shooting_on_off() {
     let mut data = std::vec![0u8; 42];
     data[2 * 19..2 * 19 + 2].copy_from_slice(&(1i16).to_le_bytes());
-    let emissions = parse(&data, ByteOrder::Little, true, None, None);
+    let emissions = parse(&data, ByteOrder::Little, true);
     assert!(
       emissions
         .iter()
@@ -943,7 +1214,7 @@ mod tests {
     let mut data = std::vec![0u8; 20];
     data[2 * 6..2 * 6 + 2].copy_from_slice(&(4i16).to_le_bytes()); // RAW
     data[2 * 7..2 * 7 + 2].copy_from_slice(&(1i16).to_le_bytes()); // Medium
-    let v = parse(&data, ByteOrder::Little, true, None, None);
+    let v = parse(&data, ByteOrder::Little, true);
     assert!(
       v.iter()
         .any(|(n, val)| n == "RawJpgQuality" && *val == TagValue::Str("RAW".into()))
@@ -960,7 +1231,7 @@ mod tests {
   fn raw_jpg_quality_zero_skipped_but_size_zero_kept() {
     let mut data = std::vec![0u8; 20];
     // pos 6 = 0 ⇒ undef; pos 7 = 0 ⇒ "Large" (kept).
-    let v = parse(&data, ByteOrder::Little, true, None, None);
+    let v = parse(&data, ByteOrder::Little, true);
     assert!(!v.iter().any(|(n, _)| n == "RawJpgQuality"));
     assert!(
       v.iter()
@@ -970,7 +1241,7 @@ mod tests {
     // drops the tag BEFORE the `-1 => 'n/a'` PrintConv arm can fire, so
     // RawJpgSize is NOT emitted (the `-1` map entry is unreachable here).
     data[2 * 7..2 * 7 + 2].copy_from_slice(&(-1i16).to_le_bytes());
-    let v2 = parse(&data, ByteOrder::Little, true, None, None);
+    let v2 = parse(&data, ByteOrder::Little, true);
     assert!(!v2.iter().any(|(n, _)| n == "RawJpgSize"));
   }
 
@@ -980,7 +1251,7 @@ mod tests {
   fn bracket_mode_negative_not_skipped() {
     let mut data = std::vec![0u8; 12];
     data[2 * 3..2 * 3 + 2].copy_from_slice(&(-5i16).to_le_bytes());
-    let v = parse(&data, ByteOrder::Little, true, None, None);
+    let v = parse(&data, ByteOrder::Little, true);
     // -5 has no label ⇒ "Unknown (-5)", but it IS emitted.
     assert!(
       v.iter()
@@ -1003,7 +1274,7 @@ mod tests {
       (1, "Electronic First Curtain"),
       (2, "Electronic"),
     ] {
-      let v = parse(&blob_with(23, raw), ByteOrder::Little, true, None, None);
+      let v = parse(&blob_with(23, raw), ByteOrder::Little, true);
       assert!(
         v.iter()
           .any(|(n, val)| n == "ShutterMode" && *val == TagValue::Str(label.into())),
@@ -1011,7 +1282,7 @@ mod tests {
       );
     }
     // -n keeps the integer.
-    let vn = parse(&blob_with(23, 2), ByteOrder::Little, false, None, None);
+    let vn = parse(&blob_with(23, 2), ByteOrder::Little, false);
     assert!(
       vn.iter()
         .any(|(n, val)| n == "ShutterMode" && *val == TagValue::I64(2))
@@ -1025,7 +1296,7 @@ mod tests {
     let mut data = std::vec![0u8; 2 * 33];
     data[2 * 25..2 * 25 + 2].copy_from_slice(&(1i16).to_le_bytes());
     data[2 * 32..2 * 32 + 2].copy_from_slice(&(0i16).to_le_bytes());
-    let v = parse(&data, ByteOrder::Little, true, None, None);
+    let v = parse(&data, ByteOrder::Little, true);
     assert!(
       v.iter()
         .any(|(n, val)| n == "FlashExposureLock" && *val == TagValue::Str("On".into())),
@@ -1043,7 +1314,7 @@ mod tests {
   #[test]
   fn rf_lens_type_print_and_value_and_fallback() {
     // value-conv 280.
-    let v280 = parse(&blob_with(61, 280), ByteOrder::Little, true, None, None);
+    let v280 = parse(&blob_with(61, 280), ByteOrder::Little, true);
     assert!(
       v280.iter().any(
         |(n, val)| n == "RFLensType" && *val == TagValue::Str("Canon RF 50mm F1.8 STM".into())
@@ -1051,20 +1322,14 @@ mod tests {
       "got {v280:?}"
     );
     // -n keeps the raw integer.
-    let v280n = parse(&blob_with(61, 280), ByteOrder::Little, false, None, None);
+    let v280n = parse(&blob_with(61, 280), ByteOrder::Little, false);
     assert!(
       v280n
         .iter()
         .any(|(n, val)| n == "RFLensType" && *val == TagValue::I64(280))
     );
     // Unknown value ⇒ `Unknown (N)` (plain hash, no OTHER/BITMASK).
-    let vunk = parse(
-      &blob_with(61, 9999u16 as i16),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let vunk = parse(&blob_with(61, 9999u16 as i16), ByteOrder::Little, true);
     assert!(
       vunk
         .iter()
@@ -1077,19 +1342,13 @@ mod tests {
   /// must NOT be read as a negative `int16s`. 332 is the top known key.
   #[test]
   fn rf_lens_type_reads_unsigned() {
-    let v = parse(&blob_with(61, 332), ByteOrder::Little, true, None, None);
+    let v = parse(&blob_with(61, 332), ByteOrder::Little, true);
     assert!(v.iter().any(
       |(n, val)| n == "RFLensType" && *val == TagValue::Str("Canon RF 14mm F1.4 L VCM".into())
     ));
     // 0x8000 = 32768 as int16u; would be -32768 as int16s. The unsigned
     // read keeps it positive ⇒ `Unknown (32768)`, NOT `Unknown (-32768)`.
-    let vhi = parse(
-      &blob_with(61, 0x8000u16 as i16),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let vhi = parse(&blob_with(61, 0x8000u16 as i16), ByteOrder::Little, true);
     assert!(
       vhi
         .iter()
@@ -1134,26 +1393,14 @@ mod tests {
   #[test]
   fn focus_distance_upper_value_and_print() {
     // raw 12345 ⇒ 123.45 m (print).
-    let v = parse(
-      &blob_u16(&[(20, 12345)]),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let v = parse(&blob_u16(&[(20, 12345)]), ByteOrder::Little, true);
     assert!(
       v.iter()
         .any(|(n, val)| n == "FocusDistanceUpper" && *val == TagValue::Str("123.45 m".into())),
       "got {v:?}"
     );
     // `-n` (ValueConv): the raw/100 float.
-    let vn = parse(
-      &blob_u16(&[(20, 12345)]),
-      ByteOrder::Little,
-      false,
-      None,
-      None,
-    );
+    let vn = parse(&blob_u16(&[(20, 12345)]), ByteOrder::Little, false);
     assert!(
       vn.iter()
         .any(|(n, val)| n == "FocusDistanceUpper" && *val == TagValue::F64(123.45)),
@@ -1165,26 +1412,14 @@ mod tests {
   /// unsigned. raw 65535 ⇒ 655.35 > 655.345 ⇒ `"inf"` (`Canon.pm:7028`).
   #[test]
   fn focus_distance_upper_inf_and_unsigned() {
-    let v = parse(
-      &blob_u16(&[(20, 65535)]),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let v = parse(&blob_u16(&[(20, 65535)]), ByteOrder::Little, true);
     assert!(
       v.iter()
         .any(|(n, val)| n == "FocusDistanceUpper" && *val == TagValue::Str("inf".into())),
       "got {v:?}"
     );
     // value-conv: 655.35 (unsigned read, NOT a negative int16s).
-    let vn = parse(
-      &blob_u16(&[(20, 65535)]),
-      ByteOrder::Little,
-      false,
-      None,
-      None,
-    );
+    let vn = parse(&blob_u16(&[(20, 65535)]), ByteOrder::Little, false);
     assert!(
       vn.iter()
         .any(|(n, val)| n == "FocusDistanceUpper" && *val == TagValue::F64(655.35)),
@@ -1198,13 +1433,7 @@ mod tests {
   #[test]
   fn focus_distance_upper_zero_drops_both() {
     // pos 20 = 0, pos 21 = 5000 (would be 50 m if emitted).
-    let v = parse(
-      &blob_u16(&[(20, 0), (21, 5000)]),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let v = parse(&blob_u16(&[(20, 0), (21, 5000)]), ByteOrder::Little, true);
     assert!(
       !v.iter().any(|(n, _)| n == "FocusDistanceUpper"),
       "pos-20 raw 0 must be dropped; got {v:?}"
@@ -1224,8 +1453,6 @@ mod tests {
       &blob_u16(&[(20, 30000), (21, 5000)]),
       ByteOrder::Little,
       true,
-      None,
-      None,
     );
     assert!(
       v.iter()
@@ -1245,13 +1472,7 @@ mod tests {
   fn focus_distance_lower_skipped_when_upper_absent() {
     // Blob long enough for pos 21 but pos 20 word is 0 (so DataMember=0).
     // Distinguish "absent" by checking the gate: pos 20 = 0 ⇒ lower out.
-    let v = parse(
-      &blob_u16(&[(21, 5000)]),
-      ByteOrder::Little,
-      true,
-      None,
-      None,
-    );
+    let v = parse(&blob_u16(&[(21, 5000)]), ByteOrder::Little, true);
     assert!(
       !v.iter().any(|(n, _)| n == "FocusDistanceLower"),
       "FocusDistanceLower must be gated out; got {v:?}"
@@ -1265,13 +1486,14 @@ mod tests {
   #[test]
   fn macro_magnification_present_with_lens_124_print() {
     // pos 16 = 75 ⇒ ValueConv exp((75-75)*ln2*3/40)=1.0 ⇒ "1.0x".
-    let v = parse(
+    let v = parse_with_model(
       &blob_with(16, 75),
       ByteOrder::Little,
       true,
       Some(124),
       Some("Canon EOS 5D Mark II"),
-    );
+    )
+    .0;
     assert!(
       v.iter()
         .any(|(n, val)| n == "MacroMagnification" && *val == TagValue::Str("1.0x".into())),
@@ -1285,13 +1507,14 @@ mod tests {
   #[test]
   fn macro_magnification_value_conv_n_and_j() {
     // -j: raw 44 ⇒ "5.0x".
-    let vj = parse(
+    let vj = parse_with_model(
       &blob_with(16, 44),
       ByteOrder::Little,
       true,
       Some(124),
       Some("Canon EOS 5D Mark II"),
-    );
+    )
+    .0;
     assert!(
       vj.iter()
         .any(|(n, val)| n == "MacroMagnification" && *val == TagValue::Str("5.0x".into())),
@@ -1299,13 +1522,14 @@ mod tests {
     );
     // -n: the raw ValueConv f64 = exp((75-44)*ln2*3/40).
     let expected = ((75 - 44) as f64 * std::f64::consts::LN_2 * 3.0 / 40.0).exp();
-    let vn = parse(
+    let vn = parse_with_model(
       &blob_with(16, 44),
       ByteOrder::Little,
       false,
       Some(124),
       Some("Canon EOS 5D Mark II"),
-    );
+    )
+    .0;
     assert!(
       vn.iter()
         .any(|(n, val)| n == "MacroMagnification" && *val == TagValue::F64(expected)),
@@ -1316,31 +1540,58 @@ mod tests {
     assert!((expected - 5.0).abs() < 0.05 && expected != 5.0);
   }
 
+  /// #164 R2: position-1 `FileNumber` (20D/350D) — the dash `PrintConv`
+  /// (`Canon.pm:6872` `s/(\d+)(\d{4})/$1-$2/`) applies ONLY in print_conv mode;
+  /// `-n` emits the raw `ValueConv` integer. ValueConv
+  /// `(($v&0xffc0)>>6)*10000 + (($v>>16)&0xff) + (($v&0x3f)<<8)` with the
+  /// little-endian position-1 int32u `0x00451D87` →
+  /// `118*10000 + 69 + 1792 = 1181861` → `-j` "118-1861", `-n` `1181861`.
+  #[test]
+  fn file_number_dash_print_conv_only_raw_under_n() {
+    // word 0 = 0; position-1 int32u (byte offset 2, LE) = 0x00451D87.
+    let data = [0x00u8, 0x00, 0x87, 0x1D, 0x45, 0x00];
+    let model = Some("Canon EOS 20D");
+    let vj = parse_with_model(&data, ByteOrder::Little, true, None, model).0;
+    assert!(
+      vj.iter()
+        .any(|(n, v)| n == "FileNumber" && *v == TagValue::Str("118-1861".into())),
+      "-j FileNumber must be the dash string: {vj:?}",
+    );
+    let vn = parse_with_model(&data, ByteOrder::Little, false, None, model).0;
+    assert!(
+      vn.iter()
+        .any(|(n, v)| n == "FileNumber" && *v == TagValue::I64(1_181_861)),
+      "-n FileNumber must be the raw integer (no dash): {vn:?}",
+    );
+  }
+
   /// MacroMagnification is ABSENT when LensType is not 124 (e.g. None, or
   /// a different lens) — the `$$self{LensType} == 124` arm of the Condition
   /// (`Canon.pm:7003`) fails.
   #[test]
   fn macro_magnification_absent_when_lens_not_124() {
     // LensType = None ⇒ absent.
-    let v_none = parse(
+    let v_none = parse_with_model(
       &blob_with(16, 75),
       ByteOrder::Little,
       true,
       None,
       Some("Canon EOS 5D Mark II"),
-    );
+    )
+    .0;
     assert!(
       !v_none.iter().any(|(n, _)| n == "MacroMagnification"),
       "LensType None must suppress MacroMagnification; got {v_none:?}"
     );
     // LensType = 123 (not the MP-E 65mm) ⇒ absent.
-    let v_other = parse(
+    let v_other = parse_with_model(
       &blob_with(16, 75),
       ByteOrder::Little,
       true,
       Some(123),
       Some("Canon EOS 5D Mark II"),
-    );
+    )
+    .0;
     assert!(
       !v_other.iter().any(|(n, _)| n == "MacroMagnification"),
       "LensType 123 must suppress MacroMagnification; got {v_other:?}"
@@ -1358,13 +1609,14 @@ mod tests {
       "Canon EOS REBEL XSi",
       "Canon EOS Kiss X2",
     ] {
-      let v = parse(
+      let v = parse_with_model(
         &blob_with(16, 75),
         ByteOrder::Little,
         true,
         Some(124),
         Some(model),
-      );
+      )
+      .0;
       assert!(
         !v.iter().any(|(n, _)| n == "MacroMagnification"),
         "excluded model {model:?} must suppress MacroMagnification; got {v:?}"
@@ -1381,31 +1633,34 @@ mod tests {
   fn macro_magnification_model_word_boundary() {
     // "1240DX" embeds "40D" with word chars on both sides ⇒ NO boundary ⇒
     // NOT excluded ⇒ MacroMagnification present.
-    let v_embedded = parse(
+    let v_embedded = parse_with_model(
       &blob_with(16, 75),
       ByteOrder::Little,
       true,
       Some(124),
       Some("Canon EOS 1240DX"),
-    );
+    )
+    .0;
     assert!(
       v_embedded.iter().any(|(n, _)| n == "MacroMagnification"),
       "embedded '40D' (no word boundary) must NOT exclude; got {v_embedded:?}"
     );
     // None Model ⇒ not excluded (standalone-blob path) ⇒ present.
-    let v_no_model = parse(&blob_with(16, 75), ByteOrder::Little, true, Some(124), None);
+    let v_no_model =
+      parse_with_model(&blob_with(16, 75), ByteOrder::Little, true, Some(124), None).0;
     assert!(
       v_no_model.iter().any(|(n, _)| n == "MacroMagnification"),
       "None Model must NOT exclude; got {v_no_model:?}"
     );
     // Trailing "40D" at a boundary (end of string) IS excluded.
-    let v_trailing = parse(
+    let v_trailing = parse_with_model(
       &blob_with(16, 75),
       ByteOrder::Little,
       true,
       Some(124),
       Some("Canon EOS 40D"),
-    );
+    )
+    .0;
     assert!(
       !v_trailing.iter().any(|(n, _)| n == "MacroMagnification"),
       "trailing '40D' at a boundary must exclude; got {v_trailing:?}"
@@ -1425,5 +1680,208 @@ mod tests {
     assert!(!contains_word("40D_", "40D")); // '_' is a word char
     assert!(contains_word("REBEL XSi", "REBEL XSi")); // multi-word token
     assert!(!contains_word("REBEL XSiX", "REBEL XSi")); // trailing word char
+  }
+
+  // ---- model-conditional position 1 (issue #88) ----
+
+  /// Build a 44-byte blob (≥ position 21) with an `int32u` at position 1.
+  fn blob_with_pos1(raw32: u32, order: ByteOrder) -> Vec<u8> {
+    let mut data = std::vec![0u8; 44];
+    let bytes = match order {
+      ByteOrder::Little => raw32.to_le_bytes(),
+      ByteOrder::Big => raw32.to_be_bytes(),
+    };
+    data[2..6].copy_from_slice(&bytes);
+    data
+  }
+
+  fn find(em: &[(SmolStr, TagValue)], name: &str) -> Option<TagValue> {
+    em.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+  }
+
+  /// 20D FileNumber decode vs the Perl oracle:
+  /// raw 0x00010040 → 10001 → "1-0001".
+  #[test]
+  fn file_number_20d_decode() {
+    let data = blob_with_pos1(0x0001_0040, ByteOrder::Little);
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Little, true, None, Some("EOS 20D"));
+    assert_eq!(decoded.file_number(), Some(10001));
+    assert_eq!(
+      find(&em, "FileNumber"),
+      Some(TagValue::Str("1-0001".into()))
+    );
+    assert_eq!(decoded.shutter_count(), None);
+
+    // Larger value: 0x12345678 → 3464388 → "346-4388".
+    let data2 = blob_with_pos1(0x1234_5678, ByteOrder::Little);
+    let (em2, d2) = parse_with_model(&data2, ByteOrder::Little, true, None, Some("EOS 20D"));
+    assert_eq!(d2.file_number(), Some(3_464_388));
+    assert_eq!(
+      find(&em2, "FileNumber"),
+      Some(TagValue::Str("346-4388".into()))
+    );
+  }
+
+  /// The 350D / Kiss Digital N alias takes the same branch.
+  #[test]
+  fn file_number_350d_alias_takes_20d_branch() {
+    let data = blob_with_pos1(0x0001_0040, ByteOrder::Little);
+    let (_em, d) = parse_with_model(
+      &data,
+      ByteOrder::Little,
+      true,
+      None,
+      Some("EOS Digital Rebel XT / 350D / Kiss Digital N"),
+    );
+    assert_eq!(d.file_number(), Some(10001));
+  }
+
+  /// 30D FileNumber decode vs the Perl oracle:
+  /// raw 0x00010040 → 1281024 → "128-1024".
+  #[test]
+  fn file_number_30d_decode() {
+    let data = blob_with_pos1(0x0001_0040, ByteOrder::Little);
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Little, true, None, Some("EOS 30D"));
+    assert_eq!(decoded.file_number(), Some(1_281_024));
+    assert_eq!(
+      find(&em, "FileNumber"),
+      Some(TagValue::Str("128-1024".into()))
+    );
+  }
+
+  /// 400D / REBEL XTi alias takes the 30D branch — and must NOT be
+  /// misrouted to the 20D branch (the `REBEL XT` needle must not match
+  /// inside `REBEL XTi` thanks to the `\b` word boundary).
+  #[test]
+  fn file_number_400d_alias_takes_30d_branch_not_20d() {
+    let data = blob_with_pos1(0x0001_0040, ByteOrder::Little);
+    let (_em, d) = parse_with_model(
+      &data,
+      ByteOrder::Little,
+      true,
+      None,
+      Some("EOS Digital Rebel XTi / 400D / Kiss Digital X"),
+    );
+    // 30D formula → 1281024 (NOT the 20D 10001).
+    assert_eq!(d.file_number(), Some(1_281_024));
+  }
+
+  /// 1Ds Mark II ShutterCount: 16-bit word swap. raw 0x00010002 →
+  /// 0x00020001 = 131073 (little-endian body).
+  #[test]
+  fn shutter_count_1ds_mark_ii_word_swap() {
+    let data = blob_with_pos1(0x0001_0002, ByteOrder::Little);
+    let (em, decoded) = parse_with_model(
+      &data,
+      ByteOrder::Little,
+      true,
+      None,
+      Some("EOS-1Ds Mark II"),
+    );
+    assert_eq!(decoded.shutter_count(), Some(131_073));
+    assert_eq!(find(&em, "ShutterCount"), Some(TagValue::I64(131_073)));
+    assert_eq!(decoded.file_number(), None);
+  }
+
+  /// 1D/1Ds ShutterCount: raw int32u when byte order is MM (big-endian).
+  /// The MM branch comes BEFORE the 1Ds-Mark-II model branch, so a
+  /// big-endian "1Ds Mark II" body takes the raw branch (no word swap).
+  #[test]
+  fn shutter_count_mm_byte_order_raw() {
+    // Big-endian blob; raw32 = 100000.
+    let data = blob_with_pos1(100_000, ByteOrder::Big);
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Big, true, None, Some("EOS-1D"));
+    assert_eq!(decoded.shutter_count(), Some(100_000));
+    assert_eq!(find(&em, "ShutterCount"), Some(TagValue::I64(100_000)));
+
+    // A MM "1Ds Mark II" hits the MM branch FIRST → raw, not word-swapped.
+    let data2 = blob_with_pos1(0x0001_0002, ByteOrder::Big);
+    let (_em2, d2) = parse_with_model(&data2, ByteOrder::Big, true, None, Some("EOS-1Ds Mark II"));
+    assert_eq!(d2.shutter_count(), Some(0x0001_0002));
+  }
+
+  /// Unknown body (5D/40D/300D) with little-endian order → position 1
+  /// emits nothing (no FileNumber, no ShutterCount).
+  #[test]
+  fn position_1_unknown_body_emits_nothing() {
+    let data = blob_with_pos1(0x1234_5678, ByteOrder::Little);
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Little, true, None, Some("EOS 5D"));
+    assert_eq!(decoded.file_number(), None);
+    assert_eq!(decoded.shutter_count(), None);
+    assert_eq!(find(&em, "FileNumber"), None);
+    assert_eq!(find(&em, "ShutterCount"), None);
+
+    // No model at all → also nothing (LE order).
+    let (_em2, d2) = parse_with_model(&data, ByteOrder::Little, true, None, None);
+    assert_eq!(d2.file_number(), None);
+    assert_eq!(d2.shutter_count(), None);
+  }
+
+  // ---- positions 20/21 FocusDistance (issue #88) ----
+
+  /// FocusDistanceUpper/Lower decode: raw 65535 → "inf", raw 546 → "5.46 m".
+  #[test]
+  fn focus_distance_positions_20_21() {
+    let mut data = std::vec![0u8; 44];
+    data[2 * 20..2 * 20 + 2].copy_from_slice(&65535u16.to_le_bytes());
+    data[2 * 21..2 * 21 + 2].copy_from_slice(&546u16.to_le_bytes());
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Little, true, None, Some("EOS 5D"));
+    assert_eq!(decoded.focus_distance_upper_m(), Some(f64::INFINITY));
+    assert_eq!(decoded.focus_distance_lower_m(), Some(5.46));
+    assert_eq!(
+      find(&em, "FocusDistanceUpper"),
+      Some(TagValue::Str("inf".into()))
+    );
+    assert_eq!(
+      find(&em, "FocusDistanceLower"),
+      Some(TagValue::Str("5.46 m".into()))
+    );
+  }
+
+  /// Position 20 raw 0 → RawConv drops it AND gates off position 21.
+  #[test]
+  fn focus_distance_upper_zero_gates_lower() {
+    let mut data = std::vec![0u8; 44];
+    data[2 * 20..2 * 20 + 2].copy_from_slice(&0u16.to_le_bytes());
+    data[2 * 21..2 * 21 + 2].copy_from_slice(&546u16.to_le_bytes());
+    let (em, decoded) = parse_with_model(&data, ByteOrder::Little, true, None, None);
+    assert_eq!(decoded.focus_distance_upper_m(), None);
+    assert_eq!(decoded.focus_distance_lower_m(), None);
+    assert_eq!(find(&em, "FocusDistanceUpper"), None);
+    assert_eq!(find(&em, "FocusDistanceLower"), None);
+  }
+
+  /// `word_match` enforces Perl `\b` boundaries.
+  #[test]
+  fn word_boundary_matching() {
+    assert!(word_match("EOS 20D", "20D"));
+    assert!(word_match(
+      "EOS Digital Rebel XT / 350D / Kiss Digital N",
+      "350D"
+    ));
+    assert!(word_match(
+      "EOS Digital Rebel XT / 350D / Kiss Digital N",
+      "Kiss Digital N"
+    ));
+    // `REBEL XT` must NOT match inside `REBEL XTi`.
+    assert!(!word_match(
+      "EOS Digital Rebel XTi / 400D / Kiss Digital X",
+      "REBEL XT"
+    ));
+    // case-sensitive needle: the bundled regex is literal text.
+    assert!(word_match("EOS-1D Mark II", "1D Mark II"));
+    assert!(word_match("EOS-1Ds Mark II", "1Ds Mark II"));
+  }
+
+  /// The model-agnostic `parse` wrapper still works (position 3+).
+  #[test]
+  fn agnostic_parse_wrapper_unchanged() {
+    let mut data = std::vec![0u8; 12];
+    data[2 * 3..2 * 3 + 2].copy_from_slice(&(1i16).to_le_bytes());
+    let em = parse(&data, ByteOrder::Little, true);
+    assert!(
+      em.iter()
+        .any(|(n, v)| n == "BracketMode" && *v == TagValue::Str("AEB".into()))
+    );
   }
 }

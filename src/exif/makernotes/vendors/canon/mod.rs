@@ -22,30 +22,45 @@
 //!   (with FocalUnits scaling from CameraSettings).
 //! - `Canon::FileInfo` binary sub-table ([`file_info::FILE_INFO`]) —
 //!   BracketMode / BracketValue / BracketShotNumber / WBBracketMode /
-//!   FilterEffect / ToningEffect / LiveViewShooting (model-agnostic
-//!   subset; FileNumber/ShutterCount at position 1 are model-conditional
-//!   and deferred).
+//!   FilterEffect / ToningEffect / LiveViewShooting (model-agnostic) PLUS
+//!   the model-conditional FileNumber / ShutterCount (position 1) and
+//!   FocusDistanceUpper / Lower (positions 20/21) — issue #88.
+//! - `Canon::ShotInfo` binary sub-table ([`shot_info::CanonShotInfo`]) —
+//!   WhiteBalance / SequenceNumber / CameraTemperature / FlashGuideNumber /
+//!   AutoExposureBracketing / AEBBracketValue / ControlMode /
+//!   FocusDistanceUpper / Lower / MeasuredEV2 / BulbDuration / NDFilter /
+//!   FlashOutput (issue #86 part 1). AEBBracketValue uses the shared
+//!   [`camera_settings::canon_ev`] APEX decoder.
+//! - `Canon::AFInfo` + `Canon::AFInfo2` binary sub-tables
+//!   ([`af_info::CanonAFInfo`]) — the `ProcessSerialData` variable-length
+//!   reader: NumAFPoints / ValidAFPoints / CanonImage{Width,Height} /
+//!   AFImage{Width,Height} / AFArea{Width,Height}(s) / AFAreaXPositions /
+//!   AFAreaYPositions / AFPointsInFocus (DecodeBits) / AFAreaMode (v2) /
+//!   AFPointsSelected (v2 EOS) / PrimaryAFPoint (non-EOS) — issue #86
+//!   part 2.
 //!
-//! ## Deferred (Phase 2+1 follow-up)
+//! ## Deferred (follow-up issues off #84/#85/#87)
 //!
-//! - `Canon::ShotInfo` (~70 tags) — ISO encoding via `Canon::CanonEv`,
-//!   AF-info, sequence-number; file a follow-up issue.
-//! - `Canon::AFInfo` + `Canon::AFInfo2` — AF point geometry; file
-//!   follow-up.
-//! - `Canon::ColorData1..12` — raw-color-processing sensor data; file
-//!   the umbrella issue tagged from #62 (LOW indexing value).
+//! - `Canon::ColorData1..12` — raw-color-processing sensor data; #84
+//!   (LOW indexing value).
 //! - `Canon::CameraInfoXXX` per-model sub-tables (`Canon.pm:1307-1494`
-//!   conditional list, ~40 model-specific tables) — defer; the high-
-//!   value `CanonCameraSettings` already gives lens/focal/aperture.
+//!   conditional list, ~40 model-specific tables) — #85; the high-
+//!   value `CanonCameraSettings` already gives lens/focal/aperture. This
+//!   is where `ContinuousShootingSpeed` lives (NOT in ShotInfo).
 //! - `Canon::CustomFunctions1`..`Functions5DmkIII` — body-config
-//!   tables; defer.
-//! - The complex per-model `FileNumber`/`ShutterCount` decode at
-//!   `FileInfo[1]` (six conditional model variants) — defer.
+//!   tables; #87.
+//! - The model-conditional `FocalPlaneX/YSize` at FocalLength[2,3] —
+//!   defer (PowerShot+older-EOS-only).
+//!
+//! The full `Canon::ShotInfo` sub-table (every emitting position 1-33) and
+//! the AFInfo `Canon_AFInfo_0x000b` 8-word PowerShot layout (the
+//! `AFInfoCount == 36` branch at index 11) are now ported (#164).
 //!
 //! ## D8 compliance
 //!
 //! No public fields. Every accessor is `const fn` where possible.
 
+pub mod af_info;
 pub mod body;
 pub mod camera_settings;
 pub mod file_info;
@@ -53,6 +68,7 @@ pub mod focal_length;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
+pub mod shot_info;
 pub mod tags;
 
 use crate::exif::makernotes::VendorEmission;
@@ -60,12 +76,14 @@ use crate::value::{Group, Metadata, TagValue};
 use smol_str::SmolStr;
 use std::vec::Vec;
 
+pub use af_info::CanonAFInfo;
 pub use body::{CanonEntry, walk_canon_body, walk_canon_in_tiff};
 pub use camera_settings::CAMERA_SETTINGS;
-pub use file_info::FILE_INFO;
+pub use file_info::{FILE_INFO, FileInfoDecoded};
 pub use lens_types::{CANON_LENS_TYPES, CanonLensType};
 pub use model_ids::{CANON_MODEL_IDS, CanonModelEntry};
 pub use printconv::CanonPrintConv;
+pub use shot_info::CanonShotInfo;
 pub use tags::{CANON_TAGS, CanonTag, SubTable};
 
 use super::super::super::ifd::{ByteOrder, RawValue};
@@ -113,6 +131,15 @@ pub struct MakerNotesCanon {
   file_number: Option<u32>,
   /// Canon Main 0x28 (`ImageUniqueID`) — 16-byte hex-encoded unique ID.
   image_unique_id: Option<SmolStr>,
+  // ---- deep sub-tables (issue #86 / #88) ----
+  /// `Canon::ShotInfo` (Main 0x04) decoded surface.
+  shot_info: Option<CanonShotInfo>,
+  /// `Canon::AFInfo` (Main 0x12), `Canon::AFInfo2` (Main 0x26) or
+  /// `AFInfo3` (Main 0x3c, same AFInfo2 table) decoded surface.
+  af_info: Option<CanonAFInfo>,
+  /// `Canon::FileInfo` (Main 0x93) model-conditional decode (FileNumber /
+  /// ShutterCount / FocusDistance).
+  file_info: Option<FileInfoDecoded>,
 }
 
 impl MakerNotesCanon {
@@ -134,6 +161,9 @@ impl MakerNotesCanon {
       focal_range_mm: None,
       file_number: None,
       image_unique_id: None,
+      shot_info: None,
+      af_info: None,
+      file_info: None,
     }
   }
 
@@ -233,6 +263,64 @@ impl MakerNotesCanon {
   pub fn image_unique_id(&self) -> Option<&str> {
     self.image_unique_id.as_deref()
   }
+
+  /// `Canon::ShotInfo` (Main 0x04) decoded surface — `Canon.pm:2772-3051`
+  /// (issue #86). `None` when the body wrote no ShotInfo sub-directory.
+  #[must_use]
+  #[inline(always)]
+  pub const fn shot_info(&self) -> Option<&CanonShotInfo> {
+    self.shot_info.as_ref()
+  }
+
+  /// `Canon::AFInfo` (Main 0x12), `Canon::AFInfo2` (Main 0x26) or `AFInfo3`
+  /// (Main 0x3c, same AFInfo2 table) decoded surface — `Canon.pm:6432-6603`
+  /// (issue #86). Inspect [`CanonAFInfo::is_v2`] to tell which record
+  /// version was decoded (AFInfo3 reports `is_v2() == true`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn af_info(&self) -> Option<&CanonAFInfo> {
+    self.af_info.as_ref()
+  }
+
+  /// `Canon::FileInfo` (Main 0x93) model-conditional decode — FileNumber /
+  /// ShutterCount / FocusDistance (`Canon.pm:6842-7038`, issue #88).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_info(&self) -> Option<&FileInfoDecoded> {
+    self.file_info.as_ref()
+  }
+
+  /// Position-1 `FileNumber` from `Canon::FileInfo` (20D/350D/30D/400D).
+  /// Distinct from the Main-IFD 0x08 [`Self::file_number`].
+  #[must_use]
+  #[inline]
+  pub fn file_number_decoded(&self) -> Option<u32> {
+    self
+      .file_info
+      .as_ref()
+      .and_then(FileInfoDecoded::file_number)
+  }
+
+  /// Position-1 `ShutterCount` from `Canon::FileInfo` (1D/1Ds/1Ds Mk II).
+  #[must_use]
+  #[inline]
+  pub fn shutter_count_decoded(&self) -> Option<u32> {
+    self
+      .file_info
+      .as_ref()
+      .and_then(FileInfoDecoded::shutter_count)
+  }
+
+  /// `(upper_m, lower_m)` focus-distance pair from `Canon::FileInfo`
+  /// positions 20/21. `f64::INFINITY` encodes the bundled `"inf"`. Returns
+  /// `None` when position 20 was zero/absent.
+  #[must_use]
+  #[inline]
+  pub fn focus_distance_decoded(&self) -> Option<(f64, Option<f64>)> {
+    let fi = self.file_info.as_ref()?;
+    let upper = fi.focus_distance_upper_m()?;
+    Some((upper, fi.focus_distance_lower_m()))
+  }
 }
 
 /// Parse a Canon MakerNote blob into a [`MakerNotesCanon`] + the
@@ -283,7 +371,7 @@ pub fn parse_in_tiff(
   // (0x93) in IFD tag order; we capture it in this sub-pass so the
   // dependency holds regardless of IFD entry order.
   let mut lens_type: Option<u16> = None;
-  // Sub-pass: find CameraSettings + FocalLength sub-table data first.
+  // Sub-pass: find CameraSettings + FocalLength sub-table data.
   for entry in &entries {
     let Some(def) = tags::lookup(entry.tag_id) else {
       continue;
@@ -372,10 +460,78 @@ pub fn parse_in_tiff(
         SubTable::FileInfo => {
           let blob_bytes = reserialize_int_array(&entry.value, parent_order);
           // Thread the `$$self{LensType}` DataMember (captured from
-          // CameraSettings above) and `$$self{Model}` — both gate
-          // FileInfo position 16 (`MacroMagnification`, `Canon.pm:7002-7005`).
-          let fi = file_info::parse(&blob_bytes, parent_order, print_conv, lens_type, model);
+          // CameraSettings above) and `$$self{Model}` (the parent IFD0 Model,
+          // `$$self{Model}`): `lens_type` + `model` gate FileInfo position 16
+          // (`MacroMagnification`, `Canon.pm:7002-7005`), and `model`
+          // additionally keys the position-1 conditional list
+          // (FileNumber/ShutterCount, `Canon.pm:6848-6927`, issue #88). We use
+          // the IFD0 Model (not the resolved `%canonModelID` name) because
+          // bundled keys these Conditions on `$$self{Model}`.
+          let (fi, decoded) =
+            file_info::parse_with_model(&blob_bytes, parent_order, print_conv, lens_type, model);
+          if decoded != FileInfoDecoded::default() {
+            typed.file_info = Some(decoded);
+          }
+          // Sub-table position tags are never `Unknown` (they are explicit
+          // BinaryData positions), so each emits with `unknown = false`.
           for (name, value) in fi {
+            emissions.push(VendorEmission::new(name, value, false));
+          }
+        }
+        SubTable::ShotInfo => {
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          let (si, em) = shot_info::parse(&blob_bytes, parent_order, print_conv, model);
+          if !si.is_empty() {
+            typed.shot_info = Some(si);
+          }
+          // ShotInfo decodes explicit BinaryData positions; the `Unknown`
+          // ones are already excluded inside `shot_info::parse`, so each
+          // emitted leaf carries `unknown = false`.
+          for (name, value) in em {
+            emissions.push(VendorEmission::new(name, value, false));
+          }
+        }
+        SubTable::AfInfo => {
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          let (af, em) = af_info::parse_af_info(&blob_bytes, parent_order, print_conv, model);
+          if !af.is_empty() {
+            typed.af_info = Some(af);
+          }
+          // AFInfo's `Unknown` scalars (AFInfoSize, etc.) are excluded inside
+          // `parse_af_info` (bundled hides them without `-u`); the emitted
+          // leaves are explicit positions, so `unknown = false`.
+          for (name, value) in em {
+            emissions.push(VendorEmission::new(name, value, false));
+          }
+        }
+        SubTable::AfInfo2 => {
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          // `Canon::Main` 0x26 `Condition => '$$valPt !~ /^\0\0\0\0/'`
+          // (`Canon.pm:1713`): the AFInfo2 SubDirectory is NOT entered when
+          // the first four bytes are all zero (e.g. the all-zero 0x26 record
+          // in 60D MOV-video thumbnails). Bundled emits NOTHING for it;
+          // skipping the walk keeps the default `-j`/`-n` output faithful.
+          if !first4_all_zero(&blob_bytes) {
+            let (af, em) = af_info::parse_af_info2(&blob_bytes, parent_order, print_conv, model);
+            if !af.is_empty() {
+              typed.af_info = Some(af);
+            }
+            for (name, value) in em {
+              emissions.push(VendorEmission::new(name, value, false));
+            }
+          }
+        }
+        SubTable::AfInfo3 => {
+          // `Canon::Main` 0x3c `AFInfo3` (`Canon.pm:1764-1770`): the SAME
+          // `Canon::AFInfo2` walker, but `$$self{AFInfo3} = 1` is set (which
+          // suppresses the index-14 PrimaryAFPoint). Unlike 0x26 there is NO
+          // all-zero `Condition` on 0x3c, so the walk always runs.
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          let (af, em) = af_info::parse_af_info3(&blob_bytes, parent_order, print_conv, model);
+          if !af.is_empty() {
+            typed.af_info = Some(af);
+          }
+          for (name, value) in em {
             emissions.push(VendorEmission::new(name, value, false));
           }
         }
@@ -555,6 +711,15 @@ fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
   } else {
     Some(raw_int as u16)
   }
+}
+
+/// `$$valPt =~ /^\0\0\0\0/` test (`Canon.pm:1713`, the 0x26 CanonAFInfo2
+/// `Condition`): `true` when the blob's first four bytes are all zero.
+/// A blob shorter than four bytes cannot match `/^\0\0\0\0/`, so it is
+/// NOT treated as all-zero (bundled would still enter the SubDirectory and
+/// let `ProcessSerialData` decode whatever fits).
+fn first4_all_zero(blob: &[u8]) -> bool {
+  blob.len() >= 4 && blob[..4].iter().all(|&b| b == 0)
 }
 
 /// Reserialize a RawValue (int16s/int16u/Bytes) back into bytes in the
