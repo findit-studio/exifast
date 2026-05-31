@@ -479,6 +479,17 @@ pub struct MakerNote<'a> {
   /// Same as [`cached_emissions_print_conv`] but for `-n` (post-
   /// ValueConv raw) mode.
   cached_emissions_value_conv: std::vec::Vec<makernotes::VendorEmission>,
+  /// The FAMILY-1 group under which the cached emissions serialize. Almost
+  /// always [`Vendor::group1()`](makernotes::Vendor::group1) of
+  /// [`Self::vendor`] (`Apple`/`Canon`/`Sony`/`Panasonic`), but the
+  /// cross-table `MakerNoteLeica10` (`MakerNotes.pm:724-730`) is a
+  /// `Vendor::Leica` blob decoded with the PANASONIC Main table, so bundled
+  /// `exiftool -G1 -j` emits its tags under `Panasonic:*` (they ARE
+  /// `%Panasonic::Main` tags) — for that case this is `"Panasonic"` even
+  /// though `vendor()` is `Vendor::Leica`. Decoupling the EMISSION group
+  /// from the dispatched vendor keeps the faithful vendor classification
+  /// (`Vendor::Leica`) while matching bundled's `Panasonic:*` output.
+  emission_group1: &'static str,
 }
 
 impl<'a> MakerNote<'a> {
@@ -566,6 +577,19 @@ impl<'a> MakerNote<'a> {
   #[inline(always)]
   pub fn emissions_value_conv(&self) -> &[makernotes::VendorEmission] {
     &self.cached_emissions_value_conv
+  }
+
+  /// The FAMILY-1 group under which the cached emissions serialize. Equal to
+  /// [`Vendor::group1()`](makernotes::Vendor::group1) of [`Self::vendor`] for
+  /// every same-vendor case (`Apple`/`Canon`/`Sony`/`Panasonic`), but
+  /// `"Panasonic"` for the cross-table `MakerNoteLeica10`
+  /// (`MakerNotes.pm:724-730`): its tags are `%Panasonic::Main` tags so
+  /// bundled `exiftool -G1 -j` emits them as `Panasonic:*` even though the
+  /// dispatched vendor is `Vendor::Leica`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn emission_group1(&self) -> &'static str {
+    self.emission_group1
   }
 }
 
@@ -1753,6 +1777,12 @@ impl Walker<'_> {
             let mut meta = makernotes::MakerNotesMeta::from_detected(detected);
             let mut cached_pc = std::vec::Vec::<makernotes::VendorEmission>::new();
             let mut cached_vc = std::vec::Vec::<makernotes::VendorEmission>::new();
+            // The family-1 group for the cached emissions. Defaults to the
+            // dispatched vendor's `group1()`; the cross-table Leica10 arm
+            // below overrides it to `"Panasonic"` (its tags ARE
+            // `%Panasonic::Main` tags, so bundled emits them as `Panasonic:*`
+            // even though the vendor is `Vendor::Leica`).
+            let mut emission_group1 = detected.vendor().group1();
             match detected.vendor() {
               makernotes::Vendor::Apple => {
                 // Apple: parse using the body (after the 14-byte header).
@@ -1783,6 +1813,166 @@ impl Walker<'_> {
                 cached_pc = emi_pc;
                 cached_vc = emi_vc;
               }
+              // Sony: dispatcher gives us body_offset (12 for the
+              // SONY DSC/CAM/MOBILE/VHAB/TF1 variants, 0 for headerless
+              // Sony5). Both `Sony::Main` variants INHERIT the parent Base
+              // (no `Base =>` override on MakerNoteSony / Sony5,
+              // `MakerNotes.pm:1037-1041,1076-1080`), so out-of-line offsets
+              // are TIFF-relative — parse with parent-TIFF context (no base
+              // shift, unlike Panasonic3).
+              //
+              // The dispatcher collapses ALL seven Sony variants to
+              // `Vendor::Sony`, and only `MakerNoteSony`/`Sony5` use
+              // `%Sony::Main`. Sony2/Sony3 (`Olympus::Main`), Sony4
+              // (`Sony::PIC`), SonyEricsson (`Sony::Ericsson`,
+              // `Base => '$start - 8'`) and SonySRF (`Sony::SRF`) route
+              // ELSEWHERE — running the Main walker on them is unfaithful (it
+              // can decode a spurious tag on a coincidental tag-id collision).
+              // The variant gate lives in `sony::parse_main_gated` (it applies
+              // `routes_to_main`, mirroring `%Main` order): it runs the Main
+              // parser ONLY for the two Main-routed variants and returns `None`
+              // for the others, on which the Sony slot stays absent — blob
+              // captured, vendor identified, Main parser intentionally not run
+              // (deferred long-tail; their dedicated tables are unported — see
+              // the sony mod docs). This is the SAME gated entry the public
+              // `MakerNotesMeta::from_blob` constructor uses, so the gate
+              // cannot be bypassed by a parallel code path.
+              makernotes::Vendor::Sony => {
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let body_off = detected.body_offset() as usize;
+                // The captured IFD0 `$$self{Make}`/`$$self{Model}` feed the
+                // `routes_to_main` make-gate (headerless Sony5) and the
+                // model-conditional 0x201c/0x201e/0x2020/0x2022 AF-tag
+                // branches (Canon/Panasonic-style model threading).
+                let make = self.captured_make.as_deref();
+                let model = self.captured_model.as_deref();
+                if let Some((typed_pc, emi_pc)) = makernotes::vendors::sony::parse_main_gated(
+                  self.data, mn_offset, mn_len, body_off, self.order, true, make, model,
+                ) {
+                  let (_typed_vc, emi_vc) = makernotes::vendors::sony::parse_main_gated(
+                    self.data, mn_offset, mn_len, body_off, self.order, false, make, model,
+                  )
+                  .expect("routes_to_main is deterministic across print_conv");
+                  meta.set_sony(typed_pc);
+                  cached_pc = emi_pc;
+                  cached_vc = emi_vc;
+                }
+              }
+              // Panasonic has THREE dispatch variants (`MakerNotes.pm:
+              // 732-761`), but only the two whose blob starts with
+              // "Panasonic" use `%Panasonic::Main`:
+              //   - `MakerNotePanasonic` (`:733`) — no `Base` ⇒ INHERIT the
+              //     parent base (offsets TIFF-relative).
+              //   - `MakerNotePanasonic3` (`:752`, DC-FT7) — `Base => 12`
+              //     (`:758`) ⇒ out-of-line offsets shift +12 in buffer
+              //     coordinates (`Exif.pm:7003`/`:7040`).
+              // `MakerNotePanasonic2` (`:743`, "MKE") is a DIFFERENT structure
+              // — `Panasonic::Type2` is a `ProcessBinaryData` table
+              // (`Panasonic.pm:2259`), NOT an IFD over `%Panasonic::Main` — so
+              // the Main parser must NOT run on it. Both the `Panasonic`-prefix
+              // gate and the `base_rule` → out-of-line-offset-addend threading
+              // (`BaseRule::Inherit` ⇒ 0 vs `BaseRule::Literal(12)` ⇒ 12;
+              // a base-0 read of a DC-FT7 value lands 12 bytes early ⇒
+              // corruption) live in `panasonic::parse_main_gated`: it returns
+              // `None` for the `MKE`/Type2 blob (Panasonic slot stays absent;
+              // Type2 BinaryData is unported/deferred). This is the SAME gated
+              // entry the public `MakerNotesMeta::from_blob` constructor uses,
+              // so the gate cannot be bypassed by a parallel code path.
+              makernotes::Vendor::Panasonic => {
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let model = self.captured_model.as_deref();
+                let base_rule = detected.base_rule();
+                if let Some((typed_pc, emi_pc)) = makernotes::vendors::panasonic::parse_main_gated(
+                  self.data, mn_offset, mn_len, self.order, true, model, base_rule,
+                ) {
+                  let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_main_gated(
+                    self.data, mn_offset, mn_len, self.order, false, model, base_rule,
+                  )
+                  .expect("routes_to_main is deterministic across print_conv");
+                  meta.set_panasonic(typed_pc);
+                  cached_pc = emi_pc;
+                  cached_vc = emi_vc;
+                }
+              }
+              // Leica — cross-vendor routing. The dispatcher collapses all
+              // TEN Leica `MakerNotes.pm` variants (`:599-731`) to
+              // `Vendor::Leica`, but TWO route to `%Panasonic::Main` (`:727`/
+              // `:604`, the PANASONIC Main table):
+              //   - `MakerNoteLeica` (Leica1, `:599-608`) — make-only
+              //     `$$self{Make} eq "LEICA"` (`:602`), `Start =>
+              //     '$valuePtr + 8'` (`:606`). Older Leica (Digilux / early
+              //     D-Lux / V-Lux) that write a make-only `LEICA` MakerNote.
+              //   - `MakerNoteLeica10` (`:724-730`, D-Lux7) — signature
+              //     `$$valPt =~ /^LEICA CAMERA AG\0/` (`:725`), `Start =>
+              //     '$valuePtr + 18'` (`:728`).
+              // The other eight route to Leica-specific
+              // `Panasonic::Leica2..Leica9` tables (`:615`/`:633`/`:643`/
+              // `:659`/`:678`/`:696`/`:708`/`:718`), which are UNPORTED — so
+              // the Main parser must NOT run on them (a `LEICA\0\0\0` blob
+              // would coincidentally decode spurious Panasonic tags). The
+              // variant gates live in `panasonic::parse_leica1_gated` (make
+              // `== "LEICA"`) and `parse_leica10_gated` (`LEICA CAMERA AG\0`
+              // signature); a body matching NEITHER leaves the Panasonic slot
+              // absent — blob captured, vendor identified as Leica, Main
+              // parser intentionally not run (deferred Leica-table long-tail).
+              // Leica1 is tried FIRST, mirroring `%Main` order (Leica1 `:599`
+              // precedes Leica10 `:724`): a make-`"LEICA"` body is claimed by
+              // Leica1 (`Condition` has no blob term) regardless of its
+              // signature. Bundled `exiftool -G1 -j` emits both routes' tags
+              // as `Panasonic:*` (they ARE `%Panasonic::Main` tags), so the
+              // emission group1 is overridden to `"Panasonic"`. The body
+              // offset is the DISPATCHED `body_offset()` (8 for Leica1, 18 for
+              // Leica10) — threaded, not hardcoded, the cross-vendor
+              // generalization of the DC-FT7 base-threading. These are the
+              // SAME gated entries the public `MakerNotesMeta::from_blob`
+              // constructor uses, so the gates cannot be bypassed by a
+              // parallel code path.
+              makernotes::Vendor::Leica => {
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let body_off = detected.body_offset() as usize;
+                let make = self.captured_make.as_deref();
+                let model = self.captured_model.as_deref();
+                // Leica1 FIRST (make-only `eq "LEICA"`, `%Main` order
+                // `:599` < `:724`), then Leica10 (signature). The two are
+                // mutually exclusive for real bodies (Leica1 make is exactly
+                // "LEICA"; Leica10 bodies report "LEICA CAMERA AG"), and the
+                // make-`"LEICA"` body the dispatcher gave `body_off = 8`
+                // (Leica1 arm) never satisfies the Leica10 make either way.
+                let leica1 = makernotes::vendors::panasonic::parse_leica1_gated(
+                  self.data, mn_offset, mn_len, body_off, self.order, true, make, model,
+                );
+                let parsed = match leica1 {
+                  Some((typed_pc, emi_pc)) => {
+                    let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_leica1_gated(
+                      self.data, mn_offset, mn_len, body_off, self.order, false, make, model,
+                    )
+                    .expect("routes_to_leica1 is deterministic across print_conv");
+                    Some((typed_pc, emi_pc, emi_vc))
+                  }
+                  None => makernotes::vendors::panasonic::parse_leica10_gated(
+                    self.data, mn_offset, mn_len, body_off, self.order, true, model,
+                  )
+                  .map(|(typed_pc, emi_pc)| {
+                    let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_leica10_gated(
+                      self.data, mn_offset, mn_len, body_off, self.order, false, model,
+                    )
+                    .expect("routes_to_leica10 is deterministic across print_conv");
+                    (typed_pc, emi_pc, emi_vc)
+                  }),
+                };
+                if let Some((typed_pc, emi_pc, emi_vc)) = parsed {
+                  meta.set_panasonic(typed_pc);
+                  cached_pc = emi_pc;
+                  cached_vc = emi_vc;
+                  // Both the Leica1 and Leica10 tags ARE `%Panasonic::Main`
+                  // tags ⇒ bundled emits them under the `Panasonic` family-1
+                  // group.
+                  emission_group1 = makernotes::Vendor::Panasonic.group1();
+                }
+              }
               _ => {}
             }
             self.maker_note = Some(MakerNote {
@@ -1790,6 +1980,7 @@ impl Walker<'_> {
               meta,
               cached_emissions_print_conv: cached_pc,
               cached_emissions_value_conv: cached_vc,
+              emission_group1,
             });
           }
         }
@@ -2005,9 +2196,10 @@ impl ExifMeta<'_> {
     out: &mut std::vec::Vec<crate::emit::EmittedTag>,
   ) {
     let Some(mn) = &self.maker_note else { return };
-    // The vendor FAMILY-1 group (`Apple`/`Canon`); other vendors fall back to
-    // `"MakerNotes"` and emit nothing here yet (empty cached emissions).
-    let group1 = mn.vendor().group1();
+    // The emission FAMILY-1 group (`Apple`/`Canon`/`Sony`/`Panasonic`, and
+    // `Panasonic` for the cross-table Leica10 route); other vendors fall back
+    // to `"MakerNotes"` and emit nothing here yet (empty cached emissions).
+    let group1 = mn.emission_group1();
     let emissions = if print_conv {
       mn.emissions_print_conv()
     } else {
