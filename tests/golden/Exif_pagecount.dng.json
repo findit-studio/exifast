@@ -1,0 +1,14 @@
+[{
+  "SourceFile": "Exif_pagecount.dng",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DNG",
+  "File:FileTypeExtension": "dng",
+  "File:MIMEType": "image/x-adobe-dng",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "IFD0:SubfileType": "Full-resolution image",
+  "IFD0:Make": "Canon",
+  "IFD0:Orientation": "Horizontal (normal)",
+  "IFD1:SubfileType": "Single page of multi-page image",
+  "IFD1:Software": "exifast IFD1",
+  "IFD1:Orientation": "Mirror horizontal"
+}]

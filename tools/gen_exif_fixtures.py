@@ -267,6 +267,46 @@ def make_exif_multipage_tif():
     return b.build([ifd0, ifd1, ifd2])
 
 
+def make_exif_pagecount_tif():
+    """PR #68 (TIFF standalone container) — a two-page TIFF whose IFDs carry
+    `SubfileType` (0x00fe) values that trip the bundled `MultiPage` flag and
+    the synthesized `File:PageCount` tag (`ExifTool.pm:8756-8757`).
+
+    Bundled `Exif.pm:452-457` `RawConv` for SubfileType:
+      if ($val == ($val & 0x02)) {            # $val ∈ {0, 2}
+        $$self{PageCount} += 1;
+        $$self{MultiPage} = 1 if $val == 2 or $$self{PageCount} > 1;
+      }
+
+    IFD0 carries SubfileType=0 (Full-resolution image) → PageCount=1.
+    IFD1 carries SubfileType=2 (Single page of multi-page image) → PageCount=2
+    AND MultiPage=1 (since `$val == 2`).
+
+    The standalone-TIFF entry (`File:FileType == "TIFF"`) emits
+    `File:PageCount = 2`. Embedded TIFF blocks (PNG `eXIf`, JPEG `APP1`)
+    suppress the emit per `$$self{TIFF_TYPE} eq 'TIFF'`. Big-endian (MM)."""
+    bo = '>'
+    b = TiffBuilder(bo)
+    # IFD1 (index 1) — the multi-page page; SubfileType=2 (single page of multi-page).
+    ifd1 = {
+        'entries': [
+            (0x00fe, LONG, 1, 2),                          # SubfileType=2 (single page of multi-page)
+            (0x0131, ASCII, 16, b'exifast IFD1\x00\x00\x00'),  # Software
+            (0x0112, SHORT, 1, 2),                         # Orientation
+        ],
+    }
+    # IFD0 (index 0) — the main image; SubfileType=0 (full-resolution).
+    ifd0 = {
+        'entries': [
+            (0x00fe, LONG, 1, 0),                          # SubfileType=0 (full-resolution)
+            (0x010f, ASCII, 6, b'Canon\x00'),              # Make
+            (0x0112, SHORT, 1, 1),                         # Orientation
+        ],
+        'next': 1,
+    }
+    return b.build([ifd0, ifd1])
+
+
 def make_exif_manyifd_tif():
     """Codex R11/F1 — a multi-page TIFF whose next-IFD chain runs 66 IFDs
     deep: IFD0 -> IFD1 -> ... -> IFD65. ExifTool's `Multi` trailing-directory
@@ -1359,6 +1399,8 @@ if __name__ == '__main__':
         f.write(make_exif_gps_tif())
     with open(f'{out_dir}/Exif_multipage.tif', 'wb') as f:
         f.write(make_exif_multipage_tif())
+    with open(f'{out_dir}/Exif_pagecount.tif', 'wb') as f:
+        f.write(make_exif_pagecount_tif())
     with open(f'{out_dir}/Exif_manyifd.tif', 'wb') as f:
         f.write(make_exif_manyifd_tif())
     with open(f'{out_dir}/Exif_ifd65536.tif', 'wb') as f:
@@ -1419,6 +1461,7 @@ if __name__ == '__main__':
         f.write(make_jpeg_unknown_header())
     print(f'wrote {out_dir}/Exif.tif, {out_dir}/ExifGPS.tif, '
           f'{out_dir}/Exif_multipage.tif, '
+          f'{out_dir}/Exif_pagecount.tif, '
           f'{out_dir}/Exif_manyifd.tif, '
           f'{out_dir}/Exif_ifd65536.tif, '
           f'{out_dir}/Exif_gps_after_interop.tif, '

@@ -1703,6 +1703,14 @@ impl AnyParser {
   /// arms slice `bytes` at that offset before dispatch and rebase the embedded
   /// Exif `Base` by it, so an `IsOffset` tag stays a TRUE absolute file offset.
   ///
+  /// `tiff_parent_type` is the candidate's `Parent`
+  /// ([`crate::filetype::DetectionCandidate::parent_type`], `$$dirInfo{Parent}`)
+  /// — `"TIFF"` for a plain `.tif`/dotless/full-scan TIFF, the SUBTYPE
+  /// (`DNG`/`NEF`/`CR2`/…) for a TIFF-rooted RAW. The standalone-TIFF arm gates
+  /// the `File:PageCount` synthesis on `tiff_parent_type == Some("TIFF")`
+  /// (bundled's `TIFF_TYPE eq 'TIFF'`, `ExifTool.pm:8715`/`:8767`); every other
+  /// arm ignores it. `None` ⇒ gate off (no synthesized PageCount).
+  ///
   /// # Errors
   ///
   /// Returns [`AnyError`] when the dispatched per-format parser raises a
@@ -1724,6 +1732,7 @@ impl AnyParser {
     shared: &mut SharedFlags,
     ext: Option<&str>,
     header_skip: usize,
+    tiff_parent_type: Option<&str>,
   ) -> Result<Option<AnyMeta<'a>>, AnyError> {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` below is empty and the parameters are unused. Discard them
@@ -1753,13 +1762,13 @@ impl AnyParser {
       feature = "mxf",
       feature = "exif",
     )))]
-    let _ = (bytes, shared, ext, header_skip);
-    // `header_skip` is consumed ONLY by the `JPEG`/`TIFF` (`AnyParser::Exif`)
-    // arm; every other format starts at file offset 0 and the detector never
-    // produces a header-skip candidate for it. Discard it here so a
-    // single-format build whose one arm is not `Exif` stays warning-clean
-    // (the `Exif` arm's later use of the `Copy` `usize` is unaffected).
-    let _ = header_skip;
+    let _ = (bytes, shared, ext, header_skip, tiff_parent_type);
+    // `header_skip` and `tiff_parent_type` are consumed ONLY by the `JPEG`/`TIFF`
+    // (`AnyParser::Exif`) arm; every other format starts at file offset 0 and is
+    // not a TIFF subtype. Discard them here so a single-format build whose one
+    // arm is not `Exif` stays warning-clean (the `Exif` arm's later use of the
+    // `Copy` `usize` / `Option<&str>` is unaffected).
+    let _ = (header_skip, tiff_parent_type);
     match self {
       #[cfg(feature = "moi")]
       AnyParser::Moi(p) => {
@@ -2045,10 +2054,18 @@ impl AnyParser {
         // A standalone TIFF — at byte 0 normally, or at `bytes[header_skip..]`
         // for the detector's terminal TIFF-after-unknown-header candidate.
         // `base == header_skip` rebases its `IsOffset` tags to absolute file
-        // offsets; `base == 0` for the ordinary case is exactly `p.parse`
-        // (`ProcessExif::parse` → `parse_tiff` → `parse_tiff_with_base(_, 0)`).
+        // offsets. The `File:PageCount` gate follows bundled's
+        // `$$self{TIFF_TYPE} eq 'TIFF'` (`ExifTool.pm:8715`/`:8767`): ON for a
+        // plain `TIFF` candidate Parent, OFF for a TIFF-rooted SUBTYPE
+        // (`DNG`/`NEF`/`CR2`/…), which reaches this arm via its `TIFF` candidate
+        // (`file_type() == "TIFF"`) but carries the subtype as its `parent_type`
+        // — so a multi-page RAW does NOT gain a non-bundled `File:PageCount`.
         let base = u32::try_from(header_skip).unwrap_or(u32::MAX);
-        Ok(crate::exif::parse_exif_block_with_base(body, base).map(AnyMeta::Exif))
+        let tiff_type_is_tiff = tiff_parent_type == Some("TIFF");
+        Ok(
+          crate::exif::parse_standalone_tiff_with_base(body, base, tiff_type_is_tiff)
+            .map(AnyMeta::Exif),
+        )
       }
     }
   }
@@ -2236,7 +2253,7 @@ mod tests {
     let parser = any_parser_for("MOI").expect("MOI feature enabled");
     let mut shared = SharedFlags::new();
     // `header_skip == 0`: an ordinary (non-header-skip) candidate.
-    let result = parser.parse_any(bytes, &mut shared, None, 0);
+    let result = parser.parse_any(bytes, &mut shared, None, 0, None);
     // The exact `Some`/`None` outcome depends on the MOI parser's
     // acceptance rules for a 16-byte buffer; this test just verifies the
     // dispatch doesn't panic and produces an `Ok(_)` result.
@@ -2262,7 +2279,7 @@ mod tests {
       // `ext` is a short-lived String dropped at the end of this block.
       let ext: String = String::from("MP3");
       let m = parser
-        .parse_any(&bytes, &mut shared, Some(ext.as_str()), 0)
+        .parse_any(&bytes, &mut shared, Some(ext.as_str()), 0, None)
         .expect("ok");
       // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
       m
@@ -2299,7 +2316,7 @@ mod tests {
     let parser = any_parser_for("AAC").expect("AAC feature enabled");
     let mut shared = SharedFlags::new();
     let meta = parser
-      .parse_any(&data, &mut shared, Some("AAC"), 0)
+      .parse_any(&data, &mut shared, Some("AAC"), 0, None)
       .expect("parse ok")
       .expect("AAC recognized");
 

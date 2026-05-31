@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "Exif_pagecount.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "File:PageCount": 2,
+  "IFD0:SubfileType": "Full-resolution image",
+  "IFD0:Make": "Canon",
+  "IFD0:Orientation": "Horizontal (normal)",
+  "IFD1:SubfileType": "Single page of multi-page image",
+  "IFD1:Software": "exifast IFD1",
+  "IFD1:Orientation": "Mirror horizontal"
+}]
