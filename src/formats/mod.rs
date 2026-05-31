@@ -45,6 +45,8 @@ pub mod mxf;
 pub mod mpeg;
 #[cfg(feature = "ogg")]
 pub mod ogg;
+#[cfg(feature = "png")]
+pub mod png;
 #[cfg(feature = "quicktime")]
 pub mod quicktime;
 #[cfg(feature = "real")]

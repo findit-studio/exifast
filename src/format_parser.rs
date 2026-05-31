@@ -306,6 +306,9 @@ pub enum AnyParser {
   /// Ogg (Phase F4 — Ogg container + Vorbis comments + Opus + Theora delegation).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::ProcessOgg),
+  /// PNG (FORMATS.md row 11 — Portable Network Graphics container + eXIf).
+  #[cfg(feature = "png")]
+  Png(crate::formats::png::ProcessPng),
   /// Real (RM/RV/RMVB/RA/RAM/RPM — RealMedia + RealAudio container + Metafile).
   #[cfg(feature = "real")]
   Real(crate::formats::real::ProcessReal),
@@ -404,6 +407,13 @@ pub enum AnyMeta<'a> {
   /// AF2; `'a` is phantom there since `ogg::Meta` owns its data).
   #[cfg(feature = "ogg")]
   Ogg(crate::formats::ogg::Meta<'a>),
+  /// PNG (FORMATS.md row 11 — Portable Network Graphics with embedded
+  /// `eXIf` chunk). The typed [`crate::metadata::PngMeta`] carries the
+  /// IHDR/pHYs/iCCP-name/text-record state directly; the captured
+  /// `eXIf` TIFF block is dispatched to [`crate::exif::parse_exif_block`]
+  /// at serialize time.
+  #[cfg(feature = "png")]
+  Png(crate::metadata::PngMeta<'a>),
   /// Real (RM/RV/RMVB/RA/RAM/RPM). The typed
   /// [`crate::formats::real::ProcessReal`] handles both the RealMedia
   /// chunked container AND the RealAudio fixed-layout header, including
@@ -457,6 +467,7 @@ pub enum AnyMeta<'a> {
     feature = "h264",
     feature = "flash",
     feature = "ogg",
+    feature = "png",
     feature = "real",
     feature = "mpeg-audio",
     feature = "mpc",
@@ -526,6 +537,8 @@ impl AnyMeta<'_> {
       AnyMeta::Flv(m) => m.tags(mode).collect(),
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => m.tags(mode).collect(),
+      #[cfg(feature = "png")]
+      AnyMeta::Png(m) => m.tags(mode).collect(),
       #[cfg(feature = "real")]
       AnyMeta::Real(m) => m.tags(mode).collect(),
       #[cfg(feature = "mpeg-audio")]
@@ -563,6 +576,7 @@ impl AnyMeta<'_> {
         feature = "h264",
         feature = "flash",
         feature = "ogg",
+        feature = "png",
         feature = "real",
         feature = "mpeg-audio",
         feature = "mpc",
@@ -859,6 +873,61 @@ impl AnyMeta<'_> {
         }
         for w in m.warnings() {
           out.write_warning(w.as_str())?;
+        }
+        Ok(())
+      }
+      #[cfg(feature = "png")]
+      AnyMeta::Png(m) => {
+        // The retired `png::PngMeta::serialize_tags` emitted these in order:
+        // (a) the PNG walker's own accumulated warnings (`Truncated PNG image`
+        // PNG.pm:1486, `Text/EXIF chunk(s) found after PNG <chunk> …`
+        // PNG.pm:1598, the zlib inflate-error warnings `Error inflating
+        // <chunk>` PNG.pm:942 / `Unknown compression method <n> for <chunk>`
+        // PNG.pm:951, the `Invalid eXIf chunk` / `Improper "Exif00" header …`
+        // PNG.pm:1369-1384, …) BEFORE the eXIf dispatch; (b) the embedded eXIf
+        // Exif block's own
+        // `$et->Warn` warnings (drained INSIDE the retired
+        // `exif_meta.serialize_tags` call AFTER its tags). The PNG-level
+        // warnings always precede the Exif ones (PNG walks first), so the
+        // document-level `first_warning` (= `ExifTool:Warning`) is unchanged;
+        // we preserve the full order for completeness.
+        for w in m.warnings() {
+          out.write_warning(w)?;
+        }
+        // The eXIf / Raw-profile EXIF sub-Metas' diagnostics, IN CHUNK ORDER via
+        // the SAME shared-`$$et{PROCESSED}` event replay `tags()` / `project()`
+        // use (`replay_exif_events`, `ExifTool.pm:9061-9072` + `PNG.pm:1193`).
+        // For each EXIF event, in chunk order:
+        //   * its own EXIF `$et->Warn` corpus (Bad-directory, suspicious-offset,
+        //     …) via `ExifMeta::warnings()` (a blocked event skipped IFD0 so it
+        //     has none; a reset-only profile yields no `meta`);
+        //   * the cross-source cycle-guard warning(s) the walk raised
+        //     (`ExifTool.pm:9068`, "$dirName pointer references previous $prev
+        //     directory") — these are EMPTY unless the event's IFD0 `$addr`
+        //     collided with an already-processed directory (IFD0 OR a trailing
+        //     IFD; the `$prev` is the recorded name, e.g. `IFD1` for a
+        //     cross-source trailing-IFD collision).
+        // Draining in chunk order keeps the warning sequence faithful (the
+        // cycle-guard warning lands where bundled raises it, between the
+        // surrounding events' warnings).
+        //
+        // NOTE (documented, not chased): 3+ events sharing one `$addr` drive
+        // bundled into emergent C-buffer/offset GARBAGE values (e.g. `IFD0:Make
+        // = "\x1a"`) alongside the cycle-guard warning(s). That is beyond the
+        // DOCUMENTED cycle-guard (which just warns + skips); this port emits
+        // clean tags for the processed directories + one cycle-guard warning per
+        // blocked directory, matching `ExifTool.pm:9066-9072` rather than the
+        // garbage. See `replay_exif_events`.
+        #[cfg(feature = "exif")]
+        for replay in crate::formats::png::replay_exif_events(m.exif_events()) {
+          if let Some(exif_meta) = replay.meta() {
+            for w in exif_meta.warnings() {
+              out.write_warning(w)?;
+            }
+          }
+          for w in replay.cycle_guard_warnings() {
+            out.write_warning(w)?;
+          }
         }
         Ok(())
       }
@@ -1200,6 +1269,8 @@ impl AnyMeta<'_> {
       AnyMeta::Flv(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "ogg")]
       AnyMeta::Ogg(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "png")]
+      AnyMeta::Png(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "real")]
       AnyMeta::Real(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "mpeg-audio")]
@@ -1297,6 +1368,12 @@ impl AnyMeta<'_> {
         Some(target) => FileTypeFinalize::DetectedThenOverride(target),
         None => FileTypeFinalize::Detected,
       },
+      // PNG: `ProcessPNG` calls `$et->SetFileType($fileType)` with
+      // `$fileType` from `%pngLookup` (PNG.pm:1439-1440). For the PNG
+      // signature this is `"PNG"` — the detected candidate. Bundled does
+      // NOT apply post-walk overrides for PNG/MNG/JNG.
+      #[cfg(feature = "png")]
+      AnyMeta::Png(_) => FileTypeFinalize::Detected,
       // Real: SetFileType($type) where $type = 'RM' / 'RA' / 'RAM' / 'RPM'
       // (Real.pm:528-558). The candidate detected as "Real" is finalized
       // to whichever sub-type the magic prefix selected.
@@ -1356,6 +1433,7 @@ impl AnyMeta<'_> {
         feature = "h264",
         feature = "flash",
         feature = "ogg",
+        feature = "png",
         feature = "real",
         feature = "mpeg-audio",
         feature = "mpc",
@@ -1554,6 +1632,10 @@ pub enum AnyError {
   #[cfg(feature = "ogg")]
   #[error("OGG: {0}")]
   Ogg(#[from] crate::formats::ogg::Error),
+  /// PNG fatal-error wrapper.
+  #[cfg(feature = "png")]
+  #[error("PNG: {0}")]
+  Png(#[from] crate::formats::png::Error),
   /// Real (RM/RA/RAM/RPM) fatal-error wrapper.
   #[cfg(feature = "real")]
   #[error("Real: {0}")]
@@ -1661,6 +1743,7 @@ impl AnyParser {
       feature = "h264",
       feature = "flash",
       feature = "ogg",
+      feature = "png",
       feature = "real",
       feature = "mpeg-audio",
       feature = "mpc",
@@ -1813,6 +1896,20 @@ impl AnyParser {
           return Ok(Some(AnyMeta::Ogg(m)));
         }
         Ok(None)
+      }
+      #[cfg(feature = "png")]
+      AnyParser::Png(p) => {
+        // PNG is a leaf format with no cross-format chain state — `shared`
+        // and `ext` are unused. The chunk walker captures every ported
+        // chunk and an optional `eXIf` TIFF block; the embedded Exif IFD
+        // chain is decoded at `serialize_tags` time via the Exif sub-
+        // walker (sharing the same TagMap sink, faithful to bundled's
+        // `ProcessPNG → ProcessTIFF → ProcessExif` dispatch chain at
+        // PNG.pm:1391).
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Png))
+          .map_err(Into::into)
       }
       #[cfg(feature = "real")]
       AnyParser::Real(p) => {
@@ -2017,6 +2114,13 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "MXF" => Some(AnyParser::Mxf(crate::formats::mxf::ProcessMxf)),
     #[cfg(feature = "ogg")]
     "OGG" => Some(AnyParser::Ogg(crate::formats::ogg::ProcessOgg)),
+    // PNG (FORMATS.md row 11) — `%fileTypeLookup{PNG}` resolves the
+    // `.png`/`.apng`/`.mng`/`.jng` extension and the 8-byte signature to
+    // file type "PNG"; bundled `ProcessPNG` (PNG.pm:1410) dispatches the
+    // chunk walker. The eXIf chunk's TIFF block is handed to the Exif
+    // walker at serialize time (PNG.pm:1391 `$et->ProcessTIFF($dirInfo)`).
+    #[cfg(feature = "png")]
+    "PNG" => Some(AnyParser::Png(crate::formats::png::ProcessPng)),
     // ExifTool maps RM / RA / RMVB / RV / RAM / RPM extensions to base type
     // `"Real"` via the `%fileTypeLookup` aliases; detection_candidates
     // yields `"Real"` as the candidate file_type.

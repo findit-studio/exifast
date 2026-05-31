@@ -22,11 +22,17 @@
 //! deliberately extensible.
 
 mod domain;
+#[cfg(feature = "png")]
+pub(crate) mod png;
 pub mod project;
 mod quicktime;
 
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
+};
+#[cfg(feature = "png")]
+pub use png::{
+  PngColorType, PngDynamicProfileTag, PngExifEvent, PngMeta, PngTextKind, PngTextRecord,
 };
 pub use project::Project;
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
