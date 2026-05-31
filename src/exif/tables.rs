@@ -52,6 +52,30 @@ pub const TAG_INTEROP_IFD: u16 = 0xa005;
 /// [`crate::exif::SubDirKind::MakerNote`]).
 pub const TAG_MAKER_NOTE: u16 = 0x927c;
 
+/// `SubfileType` (0x00fe, `Exif.pm:444-461`) — the TIFF spec's
+/// `NewSubfileType` (bit field: 0x01 reduced-res, 0x02 single page of
+/// multi-page, 0x04 transparency mask). Bundled's `RawConv` increments
+/// `$$self{PageCount}` when `$val == ($val & 0x02)` (i.e. `$val` ∈ {0, 2})
+/// and sets `$$self{MultiPage} = 1` when `$val == 2` OR `PageCount > 1`.
+/// The standalone-TIFF entry [`crate::exif::parse_standalone_tiff`] consults
+/// the walker's tracked state to emit `File:PageCount` faithful to
+/// `ExifTool.pm:8756-8757`.
+pub const TAG_SUBFILE_TYPE: u16 = 0x00fe;
+
+/// `OldSubfileType` (0x00ff, `Exif.pm:462-482`) — the TIFF 5.0 era
+/// `SubfileType` (values 1/2/3 for full-res / reduced-res / single page of
+/// multi-page). Bundled's `RawConv` increments `$$self{PageCount}` when
+/// `$val == 1` OR `$val == 3` and sets `$$self{MultiPage} = 1` when
+/// `$val == 3` OR `PageCount > 1`. Tracked alongside [`TAG_SUBFILE_TYPE`]
+/// for the same `File:PageCount` synthesis.
+///
+/// NOTE: this tag is NOT in the port's leaf table (a deferred Exif-table
+/// item); it is intercepted by the walker for the PageCount RawConv side
+/// effect, then the unknown-tag `next` (`Exif.pm:6757`) drops it from the
+/// emitted entries. Bundled behaviour matches on this fixture set (none of
+/// the camera-relevant fixtures carry tag 0xff).
+pub const TAG_OLD_SUBFILE_TYPE: u16 = 0x00ff;
+
 // ===========================================================================
 // Conversion descriptor — `Conv`
 // ===========================================================================

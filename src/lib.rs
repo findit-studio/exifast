@@ -303,8 +303,15 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
     };
     // `cand.header_skip()` threads the unknown-leading-header byte count
     // (Perl `$skip`, `ExifTool.pm:3029`) for the terminal JPEG/TIFF candidate;
-    // `0` for every ordinary candidate.
-    if let Some(m) = parser.parse_any(bytes, &mut shared, None, cand.header_skip())? {
+    // `0` for every ordinary candidate. `cand.parent_type()` is the candidate's
+    // `Parent` — the standalone-TIFF arm gates `File:PageCount` on it == "TIFF".
+    if let Some(m) = parser.parse_any(
+      bytes,
+      &mut shared,
+      None,
+      cand.header_skip(),
+      Some(cand.parent_type()),
+    )? {
       return Ok(Some(m));
     }
     // Reset shared flags between rejected candidates so partial

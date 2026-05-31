@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "Exif_pagecount.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "File:PageCount": 2,
+  "IFD0:SubfileType": 0,
+  "IFD0:Make": "Canon",
+  "IFD0:Orientation": 1,
+  "IFD1:SubfileType": 2,
+  "IFD1:Software": "exifast IFD1",
+  "IFD1:Orientation": 2
+}]

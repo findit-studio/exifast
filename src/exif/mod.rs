@@ -633,6 +633,17 @@ pub struct ExifMeta<'a> {
   /// parsing is deferred to the MakerNotes wave. Borrows from the input
   /// TIFF block — the sole reason `ExifMeta` carries a lifetime.
   maker_note: Option<MakerNote<'a>>,
+  /// The synthesized `File:PageCount` value when this `ExifMeta` is the
+  /// outer result of a standalone-TIFF walk that triggered the multi-page
+  /// gate (`ExifTool.pm:8756-8757`). `Some(n)` ⇒ `serialize_tags` emits
+  /// `File:PageCount = n`; `None` ⇒ no PageCount tag. The standalone-TIFF
+  /// entries ([`parse_borrowed`] / [`parse_standalone_tiff_with_base`] /
+  /// [`ProcessExif::parse`]) populate it from the walker's tracked
+  /// SubfileType / OldSubfileType state; the embedded-block entries
+  /// ([`parse_exif_block`] / [`parse_exif_block_with_base`]) always set
+  /// `None`, faithful to bundled gating the emit on the OUTER file type
+  /// being "TIFF" (`Parent='TIFF'`, `ExifTool.pm:8704`).
+  multi_page_count: Option<u32>,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -671,6 +682,20 @@ impl<'a> ExifMeta<'a> {
     &self.warnings
   }
 
+  /// The synthesized `File:PageCount` value for a multi-page standalone
+  /// TIFF (`ExifTool.pm:8756-8757`). `Some(n)` when this `ExifMeta` is the
+  /// result of a standalone-TIFF walk (`TIFF_TYPE == 'TIFF'`) whose IFD
+  /// chain tripped the `MultiPage` flag — bundled emits the tag as
+  /// `File:PageCount = n` (the count of SubfileType ∈ {0, 2} and
+  /// OldSubfileType ∈ {1, 3} IFDs). `None` for an embedded TIFF block
+  /// (PNG `eXIf`, JPEG `APP1`, QuickTime EXIF, RIFF `exif`) — bundled
+  /// gates the emit on `Parent` so embedded blocks never produce it.
+  #[must_use]
+  #[inline(always)]
+  pub const fn multi_page_count(&self) -> Option<u32> {
+    self.multi_page_count
+  }
+
   /// The first entry whose resolved name matches `name` (a small ergonomic
   /// helper for the common "probe one tag" library use, e.g. `Make`).
   #[must_use]
@@ -700,11 +725,17 @@ impl<'a> ExifMeta<'a> {
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
   ) -> Self {
+    // JPEG `APP1` Exif blocks come through `ProcessTIFF` with
+    // `Parent='APP1'` (`ExifTool.pm:7779-7783`), so `TIFF_TYPE='APP1'` and
+    // the `ExifTool.pm:8757` PageCount synthesis is suppressed. A JPEG-
+    // embedded multi-page TIFF block is exotic (the JPEG container itself
+    // is single-page) but bundled behaviour is: no PageCount.
     ExifMeta {
       entries,
       warnings,
       byte_order,
       maker_note,
+      multi_page_count: None,
     }
   }
 
@@ -723,6 +754,10 @@ impl<'a> ExifMeta<'a> {
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
   ) {
+    // `multi_page_count` is dropped — the JPEG-merge path constructs the
+    // merged `ExifMeta` via `from_jpeg_parts`, which always sets
+    // `multi_page_count = None` (`Parent='APP1'`, not 'TIFF', so bundled
+    // suppresses the emit). Restoring it on merge would be incorrect.
     (
       self.entries,
       self.warnings,
@@ -753,37 +788,52 @@ impl FormatParser for ProcessExif {
   type Context<'a> = &'a [u8];
   type Error = Error;
 
+  /// Dispatched by [`crate::format_parser::any_parser_for`] when
+  /// `File:FileType == "TIFF"` — the standalone-TIFF entry. Sets
+  /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
+  /// synthesis (`ExifTool.pm:8756-8757`) is active.
   fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_tiff(data))
+    Ok(parse_tiff(data, /* tiff_type_is_tiff */ true))
   }
 }
 
-/// Lib-first direct entry — parse a whole standalone TIFF file.
+/// Lib-first direct entry — parse a whole standalone TIFF file. The outer
+/// `TIFF_TYPE` is "TIFF" (`ExifTool.pm:8704`), so a multi-page TIFF emits
+/// `File:PageCount` (`ExifTool.pm:8757`).
 ///
 /// # Errors
 ///
 /// Returns `Err` only for Rust-level fatal modes (none today — every bad
 /// input is `Ok(None)`, faithful to `DoProcessTIFF` `return 0`).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
-  Ok(parse_tiff(data))
+  Ok(parse_tiff(data, /* tiff_type_is_tiff */ true))
 }
 
 /// **Reusable entry — the QuickTime/RIFF/MakerNotes seam.** Parse a raw
 /// Exif/TIFF byte block (a complete TIFF: byte-order marker + magic + IFD0
 /// offset, with all IFD offsets relative to the START of `block`).
 ///
-/// This is the function a future QuickTime (`QuickTime.pm` `EXIF` atom) or
-/// RIFF (`RIFF.pm` `exif` chunk) port calls on the embedded Exif block —
-/// the IFD walker is deliberately NOT locked to file-level dispatch. It is
-/// identical to [`parse_borrowed`]: a JPEG `APP1` / QuickTime `EXIF` payload
-/// IS a standalone TIFF structure (`ExifTool.pm:8624` `DoProcessTIFF`
-/// processes the `$dataPt` block the same way regardless of container).
+/// This is the function a future QuickTime (`QuickTime.pm` `EXIF` atom),
+/// RIFF (`RIFF.pm` `exif` chunk), or PNG (`PNG.pm` `eXIf` chunk) port calls
+/// on the embedded Exif block — the IFD walker is deliberately NOT locked
+/// to file-level dispatch. A JPEG `APP1` / QuickTime `EXIF` payload IS a
+/// standalone TIFF structure (`ExifTool.pm:8624` `DoProcessTIFF` processes
+/// the `$dataPt` block the same way regardless of container).
+///
+/// **PageCount note:** bundled gates the synthesized `File:PageCount` tag
+/// (`ExifTool.pm:8757`) on `$$self{TIFF_TYPE} eq 'TIFF'`. The recursive
+/// `ProcessTIFF` calls from PNG/JPEG/QuickTime/RIFF do NOT overwrite that
+/// outer file type, so `PageCount` is NOT emitted from those container
+/// paths even if the embedded TIFF block has multi-page SubfileType tags —
+/// embedded TIFFs with multiple pages just emit per-page IFDx:* tags. This
+/// entry mirrors that: `PageCount` is suppressed. Use [`parse_borrowed`] /
+/// the `ProcessExif::parse` arm for standalone TIFFs that need it.
 ///
 /// Returns `None` when `block` is not a valid TIFF header (bad byte-order
 /// marker, IFD0 offset < 8 — `ExifTool.pm:8645`).
 #[must_use]
 pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
-  parse_tiff(block)
+  parse_tiff(block, /* tiff_type_is_tiff */ false)
 }
 
 /// Like [`parse_exif_block`], but for an Exif/TIFF block that does NOT start at
@@ -795,10 +845,34 @@ pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 /// offset here. `base` is added to `IsOffset` value tags (`ThumbnailOffset`,
 /// `StripOffsets`) to convert them to absolute file offsets, faithful to
 /// `Exif.pm:7156-7170`. All other tags are identical to [`parse_exif_block`].
-/// (`base == 0` is exactly [`parse_exif_block`].)
+/// (`base == 0` is exactly [`parse_exif_block`].) The `File:PageCount` gate
+/// is OFF — see [`parse_exif_block`].
 #[must_use]
 pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
-  parse_tiff_with_base(block, base)
+  parse_tiff_with_base(block, base, /* tiff_type_is_tiff */ false)
+}
+
+/// Like [`parse_exif_block_with_base`], but for the standalone-TIFF dispatch
+/// path, with the `File:PageCount` emission gate (`$$self{TIFF_TYPE} eq 'TIFF'`,
+/// `ExifTool.pm:8767`) supplied by the caller as `tiff_type_is_tiff`.
+///
+/// Bundled sets `$$self{TIFF_TYPE} = $$dirInfo{Parent} || ''` (`ExifTool.pm:8715`
+/// / `:8546`) — the candidate's `Parent`, which is the literal `"TIFF"` for a
+/// plain `.tif`/dotless/full-scan TIFF but the SUBTYPE (`DNG`/`NEF`/`CR2`/…) for
+/// a TIFF-rooted RAW. `File:PageCount` (`ExifTool.pm:8767-8768`) is emitted ONLY
+/// when `TIFF_TYPE eq 'TIFF'`, so a multi-page RAW must NOT gain it. The engine
+/// dispatch ([`crate::format_parser::AnyParser::Exif`]) therefore passes
+/// `tiff_type_is_tiff = (parent_type == "TIFF")`. The block may carry a non-zero
+/// `header_skip` `base` for the "scan past unknown header for TIFF" detector
+/// candidate (`ExifTool.pm:3026-3034`). The `MultiPage` flag itself comes from
+/// the SubfileType / OldSubfileType `RawConv` (`Exif.pm:456`/`:473`).
+#[must_use]
+pub fn parse_standalone_tiff_with_base(
+  block: &[u8],
+  base: u32,
+  tiff_type_is_tiff: bool,
+) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base(block, base, tiff_type_is_tiff)
 }
 
 // ===========================================================================
@@ -824,8 +898,8 @@ pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_
 /// classic walker would misdecode it. We cleanly skip it (return `None`) rather
 /// than emit garbage — see [`parse_tiff_with_base`]. A full BigTIFF walker is a
 /// deferred port.
-fn parse_tiff(data: &[u8]) -> Option<ExifMeta<'_>> {
-  parse_tiff_with_base(data, 0)
+fn parse_tiff(data: &[u8], tiff_type_is_tiff: bool) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base(data, 0, tiff_type_is_tiff)
 }
 
 /// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
@@ -834,7 +908,16 @@ fn parse_tiff(data: &[u8]) -> Option<ExifMeta<'_>> {
 /// them to absolute file offsets. The standalone-TIFF entries pass `base == 0`;
 /// the JPEG `APP1` Exif path passes the file offset of the embedded TIFF block.
 /// IFD offsets themselves are unchanged — they remain relative to `data`.
-fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
+///
+/// `tiff_type_is_tiff` controls the `File:PageCount` emission gate at
+/// `ExifTool.pm:8756-8757`: bundled emits the synthesized `PageCount` tag
+/// only when `$$self{TIFF_TYPE} eq 'TIFF'`, i.e. when the OUTER file type is
+/// "TIFF" (the standalone `.tif`/`.tiff` dispatch path). Embedded-block
+/// callers (`parse_exif_block` / `_with_base`) pass `false` — bundled gates
+/// the emission via `Parent` ('PNG' / 'APP1' / 'QuickTime' / 'RIFF'), which
+/// stays the outer container's name and never becomes "TIFF" in those
+/// recursive `ProcessTIFF` calls.
+fn parse_tiff_with_base(data: &[u8], base: u32, tiff_type_is_tiff: bool) -> Option<ExifMeta<'_>> {
   // `length $$dataPt < 8` — the TIFF header is 8 bytes.
   if data.len() < 8 {
     return None;
@@ -878,6 +961,8 @@ fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
     chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
     cycle_guard_warnings: Vec::new(),
     active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk.
@@ -889,11 +974,26 @@ fn parse_tiff_with_base(data: &[u8], base: u32) -> Option<ExifMeta<'_>> {
     "the common (Owned) path must never produce cross-source cycle-guard warnings"
   );
 
+  // `File:PageCount` synthesis (`ExifTool.pm:8756-8757`): emitted ONLY when
+  // the outer file type is "TIFF" (`$$self{TIFF_TYPE} eq 'TIFF'`), i.e. the
+  // standalone-TIFF entry. The embedded paths (PNG `eXIf`, JPEG `APP1`,
+  // QuickTime EXIF atom, RIFF `exif` chunk — for those `TIFF_TYPE` is
+  // 'PNG'/'APP1'/'QuickTime'/'RIFF') call [`parse_exif_block`] / the
+  // `_with_base` variant, which pass `tiff_type_is_tiff = false` and drop
+  // the synthesized tag. The standalone entry passes `true` and emits the
+  // count when `MultiPage` is set.
+  let multi_page_count = if tiff_type_is_tiff && w.multi_page {
+    Some(w.page_count)
+  } else {
+    None
+  };
+
   Some(ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    multi_page_count,
   })
 }
 
@@ -996,6 +1096,12 @@ fn parse_tiff_with_base_shared<'a>(
     chain_guard: ChainGuard::Shared(processed),
     cycle_guard_warnings: Vec::new(),
     active_ifd_offsets: Vec::new(),
+    // The multi-page walk-state still ticks via the `SubfileType` RawConv tap,
+    // but this SHARED path is only ever the embedded-block parse (PNG `eXIf`),
+    // so the resulting `ExifMeta` is `multi_page_count: None` — `File:PageCount`
+    // is gated to the standalone-TIFF dispatch (`tiff_type_is_tiff`).
+    page_count: 0,
+    multi_page: false,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -1005,6 +1111,9 @@ fn parse_tiff_with_base_shared<'a>(
     warnings: w.warnings,
     byte_order: Some(order),
     maker_note: w.maker_note,
+    // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
+    // synthesized `File:PageCount`.
+    multi_page_count: None,
   };
   (Some(meta), cycle_guard_warnings)
 }
@@ -1143,6 +1252,22 @@ struct Walker<'a, 'g> {
   /// of a standalone TIFF (`ExifTool.pm:9052`; `Exif.pm:7020-7026` resets
   /// `$size`/`DirLen` to 0 for an out-of-buffer subdirectory start).
   active_ifd_offsets: Vec<usize>,
+  /// `$$self{PageCount}` — incremented for every IFD whose `SubfileType`
+  /// (0x00fe) value is in `{0, 2}` (the `$val == ($val & 0x02)` mask at
+  /// `Exif.pm:453`) OR whose `OldSubfileType` (0x00ff) value is in `{1, 3}`
+  /// (`Exif.pm:470`). The `File:PageCount` tag at `ExifTool.pm:8757` reads
+  /// this counter. Standalone-TIFF entry only — embedded-block entries
+  /// (PNG `eXIf`, JPEG `APP1`, future QuickTime/RIFF) keep it at 0 because
+  /// bundled gates the emission on `TIFF_TYPE eq 'TIFF'` (an outer
+  /// `Parent='TIFF'`, `ExifTool.pm:8704`) which only the standalone walk
+  /// sets.
+  page_count: u32,
+  /// `$$self{MultiPage}` — sticky flag set when a `SubfileType` value is
+  /// exactly `2` (`Exif.pm:456` `$val == 2`) OR an `OldSubfileType` value
+  /// is exactly `3` (`Exif.pm:473`) OR a second SubfileType-counted IFD is
+  /// reached (`$$self{PageCount} > 1`). Gates the `File:PageCount`
+  /// emission at `ExifTool.pm:8757`.
+  multi_page: bool,
 }
 
 impl Walker<'_, '_> {
@@ -2221,6 +2346,48 @@ impl Walker<'_, '_> {
   /// verbose mode; the default `-j` output omits it). Documented
   /// incremental-completion item in `docs/tracking.md`.
   fn emit(&mut self, kind: IfdKind, tag_id: u16, raw: RawValue) {
+    // PR #68 — `SubfileType` (0x00fe) / `OldSubfileType` (0x00ff) `RawConv`
+    // taps (`Exif.pm:452-461` / `:469-475`). Bundled increments
+    // `$$self{PageCount}` and sets `$$self{MultiPage}` BEFORE the tag value
+    // reaches `FoundTag` — and the `RawConv` side effect runs even when the
+    // tag is itself absent from the port's leaf table (an unknown-tag
+    // `next` drops only the emit, not the table-level RawConv tracking
+    // ExifTool keeps in `$$self{*}`). `OldSubfileType` is NOT in the
+    // [`tables`] EXIF table (a deferred-table item), so its tracking MUST
+    // run before the unknown-tag `return` below; for symmetry the
+    // `SubfileType` tap also runs here (the order with respect to the leaf
+    // emission is irrelevant — they touch disjoint state). Embedded-block
+    // walks track the counter too, but `parse_tiff_with_base` only surfaces
+    // it as `multi_page_count` when `tiff_type_is_tiff == true` (the
+    // `TIFF_TYPE == 'TIFF'` gate at `ExifTool.pm:8757`), so this tracking
+    // is safe to always run.
+    //
+    // The `SubfileType` table uses `int32u` / `int16u` (LONG/SHORT), so the
+    // decoded value is the first element of an `RawValue::U64`. Read it via
+    // `first_uint` and ignore non-integer shapes (a malformed encoding
+    // matches bundled's silent `next` on the `Format::None` arm).
+    if tag_id == tables::TAG_SUBFILE_TYPE
+      && let Some(v) = first_uint(&raw)
+    {
+      // `$val == ($val & 0x02)` ⇔ `$val ∈ {0, 2}` (per Exif.pm:453).
+      if v == (v & 0x02) {
+        self.page_count = self.page_count.saturating_add(1);
+        if v == 2 || self.page_count > 1 {
+          self.multi_page = true;
+        }
+      }
+    } else if tag_id == tables::TAG_OLD_SUBFILE_TYPE
+      && let Some(v) = first_uint(&raw)
+    {
+      // `$val == 1 or $val == 3` (per Exif.pm:470).
+      if v == 1 || v == 3 {
+        self.page_count = self.page_count.saturating_add(1);
+        if v == 3 || self.page_count > 1 {
+          self.multi_page = true;
+        }
+      }
+    }
+
     // `#### eval IsOffset ($val, $et) … $val += $offsetBase` (Exif.pm:7156-
     // 7170): convert an `IsOffset` tag's value(s) to ABSOLUTE file offsets by
     // adding `$base + $$et{BASE}`. `$$et{BASE}` is 0 for the top-level Exif
@@ -2378,14 +2545,13 @@ impl ExifMeta<'_> {
   /// the [`TagMap`](crate::tagmap::TagMap). The result carries
   /// `Group{family0:"EXIF", family1:<IfdName>}`, `unknown:false`.
   ///
-  /// **EXIF entries only**: the `File:ExifByteOrder` tag is prepended by
-  /// [`tags`](crate::emit::Taggable::tags) (not here), and the
+  /// **EXIF entries only**: the `File:ExifByteOrder` and `File:PageCount` tags
+  /// are prepended by [`tags`](crate::emit::Taggable::tags) (not here), and the
   /// `ExifTool:Warning` messages stay a separate channel drained by
-  /// [`serialize_tags`](Self::serialize_tags). The MakerNote vendor emissions
-  /// are appended separately by [`tags`](crate::emit::Taggable::tags) via
+  /// `AnyMeta::drain_diagnostics`. The MakerNote vendor emissions are appended
+  /// separately by [`tags`](crate::emit::Taggable::tags) via
   /// [`push_maker_note_tags`](Self::push_maker_note_tags). So this is the
-  /// EXIF (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) tag stream, byte-identical in value
-  /// to the legacy `serialize_tags` entry loop.
+  /// EXIF (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) tag stream.
   #[must_use]
   fn emitted_exif_tags(&self, print_conv: bool) -> std::vec::Vec<crate::emit::EmittedTag> {
     let mut sink = EmittedTagSink::new();
@@ -2488,6 +2654,23 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         crate::value::Group::new("File", "File"),
         smol_str::SmolStr::new_static("ExifByteOrder"),
         crate::value::TagValue::Str(smol_str::SmolStr::new_static(value)),
+        false,
+      ));
+    }
+    // `File:PageCount` — bundled `FoundTag(PageCount => $$self{PageCount})`
+    // (`ExifTool.pm:8757`) runs AFTER the IFD walk, but its
+    // `%Image::ExifTool::Extra` entry has GROUPS `File,File,Image`
+    // (`ExifTool.pm:1285`/`:2017`) so the family-1 group is `File`; emit it
+    // right after `ExifByteOrder` to keep the typed path "File first" (matching
+    // bundled's JSON grouping). `Some(n)` only for a standalone-TIFF walk that
+    // tripped the `MultiPage` flag (the `tiff_type_is_tiff` gate); `None` for
+    // an embedded-block parse (PNG `eXIf`, JPEG `APP1`, QuickTime/RIFF). A bare
+    // integer in both `-j` and `-n` (no PrintConv), `unknown:false`.
+    if let Some(n) = self.multi_page_count {
+      tags.push(crate::emit::EmittedTag::new(
+        crate::value::Group::new("File", "File"),
+        smol_str::SmolStr::new_static("PageCount"),
+        crate::value::TagValue::U64(u64::from(n)),
         false,
       ));
     }
@@ -2994,6 +3177,23 @@ fn emit_exif_value<S: ExifSink>(
 #[cfg(feature = "alloc")]
 const fn is_perl_space(c: char) -> bool {
   matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b')
+}
+
+/// First unsigned integer of a [`RawValue`], or `None` for a non-integer
+/// shape. Used by the `SubfileType` / `OldSubfileType` `RawConv` taps
+/// (`Exif.pm:452-457` / `:469-475`) to read a scalar integer value
+/// regardless of whether the encoder used `int8u`/`int16u`/`int32u`/`int64u`
+/// (`RawValue::U64`) or one of the signed integer formats
+/// (`RawValue::I64`; a negative encoding is treated as `None` since the
+/// SubfileType RawConv branch comparing `$val == ($val & 0x02)` excludes
+/// negatives anyway — Perl's bitwise `&` on a negative is undefined and
+/// the gate effectively rejects them).
+fn first_uint(raw: &RawValue) -> Option<u64> {
+  match raw {
+    RawValue::U64(v) => v.first().copied(),
+    RawValue::I64(v) => v.first().and_then(|&n| u64::try_from(n).ok()),
+    _ => None,
+  }
 }
 
 // ===========================================================================
@@ -3914,6 +4114,100 @@ mod tests {
     assert!(meta.entries().is_empty());
   }
 
+  /// PR #68 — multi-page TIFF tracking via the `SubfileType` (0x00fe)
+  /// `RawConv` tap (`Exif.pm:452-457`). IFD0 SubfileType=0 increments
+  /// `PageCount` to 1 (val ∈ {0, 2}, MultiPage stays 0); IFD1 SubfileType=2
+  /// increments PageCount to 2 AND sets MultiPage=1 (`$val == 2`). The
+  /// standalone-TIFF entry [`parse_borrowed`] populates `multi_page_count`
+  /// from this state; embedded-block entries ([`parse_exif_block`]) hold it
+  /// at `None`.
+  #[test]
+  fn subfile_type_tracks_pagecount_on_standalone_tiff() {
+    // MM TIFF: IFD0 SubfileType=0 (full-res) next->IFD1; IFD1 SubfileType=2
+    // (single page of multi-page) next=0.
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0@8: 1 entry (SubfileType=0).
+    t.extend_from_slice(&[0x00, 0x01]); // count
+    t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]); // tag 0x00fe LONG count=1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // value = 0 (full-res)
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // next IFD = 26
+    debug_assert_eq!(t.len(), 26);
+    // IFD1@26: 1 entry (SubfileType=2).
+    t.extend_from_slice(&[0x00, 0x01]); // count
+    t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]); // tag 0x00fe LONG count=1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // value = 2 (single page of multi-page)
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
+    // Standalone entry: emits `multi_page_count = Some(2)`.
+    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    assert_eq!(meta.multi_page_count(), Some(2));
+    // Embedded entry on the same bytes: `multi_page_count = None` (the
+    // `TIFF_TYPE == 'TIFF'` gate at ExifTool.pm:8757 is off).
+    let embedded = parse_exif_block(&t).expect("valid TIFF");
+    assert_eq!(embedded.multi_page_count(), None);
+  }
+
+  /// PR #68 — a single-page TIFF (one IFD with SubfileType=0) does NOT
+  /// emit PageCount because `MultiPage` is never set: `val == 0` does not
+  /// trip `$val == 2`, and `PageCount` reaches 1 (not > 1). Faithful to
+  /// `ExifTool.pm:8757` `if $$self{MultiPage}` gate — bundled does NOT
+  /// emit `File:PageCount` for a single-page TIFF.
+  #[test]
+  fn subfile_type_single_page_does_not_emit_pagecount() {
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x01]); // IFD0: 1 entry
+    t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]); // SubfileType LONG count=1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // value = 0 (full-resolution)
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
+    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    assert_eq!(meta.multi_page_count(), None);
+  }
+
+  /// PR #68 — `OldSubfileType` (0x00ff) `RawConv` (`Exif.pm:469-475`): val
+  /// ∈ {1, 3} increments `PageCount`; val == 3 sets `MultiPage`. The tag
+  /// is NOT in the port's leaf table (an unknown-tag drop), but the
+  /// walker's RawConv tap still runs for the PageCount side effect. IFD0
+  /// OldSubfileType=1 ⇒ PageCount=1; IFD1 OldSubfileType=3 ⇒ PageCount=2
+  /// AND MultiPage=1. `multi_page_count = Some(2)` on the standalone walk.
+  #[test]
+  fn old_subfile_type_tracks_pagecount() {
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0@8: 1 entry — OldSubfileType=1 (full-resolution image).
+    t.extend_from_slice(&[0x00, 0x01]);
+    // 0x00ff SHORT count=1 value=1 — SHORT is left-justified in the 4-byte field.
+    t.extend_from_slice(&[0x00, 0xff, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]); // value SHORT=1
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // next IFD = 26
+    debug_assert_eq!(t.len(), 26);
+    // IFD1@26: 1 entry — OldSubfileType=3 (single page of multi-page).
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0xff, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]); // value SHORT=3
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
+    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    assert_eq!(meta.multi_page_count(), Some(2));
+  }
+
+  /// PR #68 — SubfileType=1 (reduced-resolution image) does NOT count
+  /// against PageCount: `$val == ($val & 0x02)` is false for val=1
+  /// (`1 != (1 & 0x02)` ⇒ `1 != 0`). Faithful to `Exif.pm:453`. Three
+  /// reduced-res IFDs in a row still emit no PageCount.
+  #[test]
+  fn subfile_type_reduced_res_does_not_count() {
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0@8: SubfileType=1 next->IFD1.
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x1a]); // next IFD = 26
+    // IFD1@26: SubfileType=1 next=0.
+    t.extend_from_slice(&[0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    assert_eq!(meta.multi_page_count(), None);
+  }
+
   /// Run one `Conv` over a `RawValue::Text` and read back the emitted string.
   #[cfg(feature = "alloc")]
   fn emit_text_conv(value: &str, conv: Conv) -> String {
@@ -4475,6 +4769,8 @@ mod tests {
       chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
       cycle_guard_warnings: Vec::new(),
       active_ifd_offsets: Vec::new(),
+      page_count: 0,
+      multi_page: false,
     }
   }
 

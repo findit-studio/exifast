@@ -6173,6 +6173,96 @@ fn exif_multipage_conformance() {
   check("Exif_multipage.tif", "Exif_multipage.tif.n.json", false);
 }
 #[test]
+fn exif_pagecount_conformance() {
+  // PR #68 (TIFF standalone container) — a two-page TIFF whose IFDs carry
+  // `SubfileType` (0x00fe) values that trip the bundled `MultiPage` flag
+  // and the synthesized `File:PageCount` tag (`ExifTool.pm:8756-8757`).
+  //
+  // Bundled `Exif.pm:452-457` `RawConv` for SubfileType:
+  //   if ($val == ($val & 0x02)) {            # $val ∈ {0, 2}
+  //     $$self{PageCount} += 1;
+  //     $$self{MultiPage} = 1 if $val == 2 or $$self{PageCount} > 1;
+  //   }
+  //
+  // Bundled `ExifTool.pm:8756-8757` (post-walk):
+  //   if ($$self{TIFF_TYPE} eq 'TIFF') {
+  //     $self->FoundTag(PageCount => $$self{PageCount}) if $$self{MultiPage};
+  //   }
+  //
+  // IFD0 SubfileType=0 ⇒ PageCount=1 (val ∈ {0,2}, MultiPage stays 0).
+  // IFD1 SubfileType=2 ⇒ PageCount=2 AND MultiPage=1 (val == 2).
+  // Standalone TIFF ⇒ `File:PageCount = 2`.
+  //
+  // The pre-PR #68 walker counted IFDs but did not synthesize the tag, so
+  // a real multi-page TIFF emitted IFD0..IFDn but no PageCount — silent
+  // metadata loss vs bundled. This fixture pins the regression: the typed
+  // walker tracks `pages`/`multi_page` via the SubfileType RawConv tap and
+  // the standalone-TIFF entry (`parse_standalone_tiff_with_base`, the only
+  // path that sets `TIFF_TYPE == 'TIFF'`) emits the synthesized
+  // `File:PageCount` from `ExifMeta::multi_page_count()`.
+  //
+  // Embedded TIFF blocks (PNG `eXIf`, JPEG `APP1`, future QuickTime/RIFF)
+  // do NOT emit PageCount — bundled gates on `TIFF_TYPE == 'TIFF'`. The
+  // `parse_exif_block` / `parse_exif_block_with_base` entries pass
+  // `tiff_type_is_tiff = false` and hold `multi_page_count = None`.
+  // Verified against bundled `perl exiftool` 2026-05-24.
+  check("Exif_pagecount.tif", "Exif_pagecount.tif.json", true);
+  check("Exif_pagecount.tif", "Exif_pagecount.tif.n.json", false);
+  // The SAME multi-page bytes under a TIFF-rooted SUBTYPE extension (`.dng`):
+  // bundled detects `File:FileType = DNG`, `TIFF_TYPE = DNG`, and emits NO
+  // `File:PageCount` (ExifTool.pm:8767) — every IFD tag is still extracted.
+  // Pins #162 Codex R1 (the standalone-TIFF arm gates PageCount on the
+  // candidate `Parent`, not a hard-coded `true`).
+  check("Exif_pagecount.dng", "Exif_pagecount.dng.json", true);
+  check("Exif_pagecount.dng", "Exif_pagecount.dng.n.json", false);
+}
+#[test]
+fn exif_pagecount_suppressed_for_tiff_subtypes() {
+  // #162 Codex R1: `File:PageCount` is synthesized ONLY when the outer file
+  // type is literally `TIFF` (`$$self{TIFF_TYPE} eq 'TIFF'`, ExifTool.pm:8767).
+  // A TIFF-rooted SUBTYPE (DNG/NEF/CR2/…) reaches the Exif arm through its
+  // `TIFF` candidate (`file_type() == "TIFF"`) but carries the subtype as its
+  // `Parent` (`$$dirInfo{Parent}`, ExifTool.pm:8546) ⇒ `TIFF_TYPE` is the
+  // subtype ⇒ bundled emits NO `File:PageCount` even though the IFD chain trips
+  // MultiPage. The walker still extracts every IFD tag. Oracle (`perl exiftool
+  // -j -G1`, the Exif_pagecount bytes renamed): `.dng`/`.nef`/`.cr2` → NO
+  // `File:PageCount`; `.tif` → `File:PageCount: 2`.
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data = std::fs::read(format!("{root}/tests/fixtures/Exif_pagecount.tif"))
+    .expect("read Exif_pagecount.tif");
+  // Plain-TIFF control: the synthesized PageCount IS emitted.
+  let tif = extract_info("Exif_pagecount.tif", &data, true);
+  assert!(
+    tif.contains("\"File:PageCount\""),
+    "plain .tif must emit File:PageCount: {tif}",
+  );
+  // Every TIFF-rooted subtype (detected by EXTENSION → candidate `Parent` is the
+  // subtype, not "TIFF") suppresses it, but the IFD tags are still extracted. (A
+  // DOTLESS/magic-only RAW header would need magic-based subtype detection, which
+  // the port does not do — tracked as a follow-up.)
+  for name in [
+    "Exif_pagecount.dng",
+    "Exif_pagecount.nef",
+    "Exif_pagecount.cr2",
+    "Exif_pagecount.orf",
+    "Exif_pagecount.rw2",
+    "Exif_pagecount.3fr",
+    "Exif_pagecount.arw",
+  ] {
+    for print_on in [true, false] {
+      let got = extract_info(name, &data, print_on);
+      assert!(
+        !got.contains("\"File:PageCount\""),
+        "{name} (print_conv={print_on}) must NOT emit File:PageCount: {got}",
+      );
+      assert!(
+        got.contains("\"IFD0:Make\":\"Canon\""),
+        "{name}: IFD0 tags must still be extracted: {got}",
+      );
+    }
+  }
+}
+#[test]
 fn exif_numeric_emission_json_token_type() {
   // PR #36 Codex R18/F1 — Exif/GPS numeric values must be emitted as bare
   // JSON NUMBER tokens, not quoted strings. The conformance `check`s above

@@ -435,7 +435,13 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     // `cand.header_skip()` is the unknown-leading-header byte count (Perl
     // `$skip`, `ExifTool.pm:3029`) for the terminal JPEG/TIFF candidate — `0`
     // for every ordinary candidate; the JPEG/TIFF arm slices `data` at it.
-    let meta = match parser.parse_any(data, &mut shared, ext_ref, cand.header_skip()) {
+    let meta = match parser.parse_any(
+      data,
+      &mut shared,
+      ext_ref,
+      cand.header_skip(),
+      Some(cand.parent_type()),
+    ) {
       Ok(Some(meta)) => meta,
       Ok(None) => {
         // Rejected candidate: reset shared so partial side effects don't leak.

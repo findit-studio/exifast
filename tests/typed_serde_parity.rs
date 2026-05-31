@@ -141,7 +141,13 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
     // `cand.header_skip()` threads the unknown-leading-header byte count for
     // the terminal JPEG/TIFF candidate (`0` for ordinary candidates) — same
     // dispatch the engine's `extract_info` runs.
-    match parser.parse_any(data, &mut shared, ext_ref, cand.header_skip()) {
+    match parser.parse_any(
+      data,
+      &mut shared,
+      ext_ref,
+      cand.header_skip(),
+      Some(cand.parent_type()),
+    ) {
       Ok(Some(meta)) => return Some(meta),
       Ok(None) => shared = SharedFlags::new(),
       Err(_) => shared = SharedFlags::new(),
@@ -201,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_265() {
+fn typed_serde_path_equals_writer_path_and_golden_all_267() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -866,12 +872,25 @@ fn typed_serde_path_equals_writer_path_and_golden_all_265() {
   // (`ExifTool.pm:3026-3034`); the Exif dispatch slices `bytes` at that offset
   // and rebases the embedded Exif `Base` by it. Pre-fix the candidate was
   // detected then mis-rejected into a finalization error.
+  // 265 → 266 after PR #68 (TIFF standalone container): `Exif_pagecount.tif`
+  // — a two-page TIFF whose IFDs carry `SubfileType` (0x00fe) values (IFD0=0
+  // full-resolution, IFD1=2 single page of multi-page) that trip the bundled
+  // `MultiPage` flag and the synthesized `File:PageCount` (ExifTool.pm:
+  // 8756-8757). Pins the PageCount `RawConv` tracker + the standalone-TIFF
+  // emit gate; embedded TIFF blocks (PNG `eXIf`, JPEG `APP1`) suppress the
+  // emit (`TIFF_TYPE == 'TIFF'`).
+  // 266 → 267 after #162 Codex R1 (TIFF subtype PageCount gate):
+  // `Exif_pagecount.dng` — the SAME multi-page bytes under a TIFF-rooted SUBTYPE
+  // extension. Bundled detects `FileType = DNG`, `TIFF_TYPE = DNG`, so it emits
+  // NO `File:PageCount` (ExifTool.pm:8767) while still extracting every IFD tag.
+  // Pins the standalone-TIFF arm gating PageCount on the candidate `Parent`
+  // (not a hard-coded `true`).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    265,
-    "expected exactly the 265 active conformance fixtures, found {}: {:?}",
+    267,
+    "expected exactly the 267 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

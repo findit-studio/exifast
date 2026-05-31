@@ -1,0 +1,14 @@
+[{
+  "SourceFile": "Exif_pagecount.dng",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "DNG",
+  "File:FileTypeExtension": "DNG",
+  "File:MIMEType": "image/x-adobe-dng",
+  "File:ExifByteOrder": "MM",
+  "IFD0:SubfileType": 0,
+  "IFD0:Make": "Canon",
+  "IFD0:Orientation": 1,
+  "IFD1:SubfileType": 2,
+  "IFD1:Software": "exifast IFD1",
+  "IFD1:Orientation": 2
+}]
