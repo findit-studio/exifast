@@ -300,17 +300,23 @@ impl Default for GpsSample {
 /// One Apple `mebx` timed-metadata key/value pair (QuickTimeStream.pl
 /// `Process_mebx`:2644-2680). `mebx` samples carry generic
 /// `[size][local-id][value]` records; the local-id is resolved through the
-/// `keys` table saved by `SaveMetaKeys` (QuickTimeStream.pl:876-962) to a
-/// tag NAME and a value. exifast keeps the name + the displayed value verbatim
-/// (no per-key PrintConv beyond the `qtFmt`-typed `ReadValue`).
+/// `keys` table saved by `SaveMetaKeys` (QuickTimeStream.pl:876-962) to a raw
+/// `TagID`, which `Process_mebx` then maps to a tag NAME via the
+/// `%QuickTime::Keys` table (the `mebx` SubDirectory's TagTable,
+/// QuickTimeStream.pl:177): a known TagID keeps that entry's `Name` (and
+/// value-tier `ValueConv`); any other reasonable TagID is camel-cased
+/// (`s/[-.](.)/\U$1/g` + `ucfirst`, QuickTimeStream.pl:2663-2664). exifast
+/// keeps the name + the post-`ValueConv` value (the display-tier `PrintConv` of
+/// a `%QuickTime::Keys` tag is not applied — the same convention the GPS
+/// samples follow).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MebxSample {
-  /// The resolved tag name — the `keys`-table `TagID` with the
-  /// `com.apple.quicktime.` namespace stripped and `-`/`.` segments
-  /// camel-cased (QuickTimeStream.pl:915, 2665).
+  /// The resolved tag name — the `%QuickTime::Keys` `Name` for a known TagID,
+  /// else the camel-cased TagID (QuickTimeStream.pl:2657-2666).
   name: String,
-  /// The decoded value, stringified via the `qtFmt`-typed `ReadValue`
-  /// (QuickTimeStream.pl:2668).
+  /// The decoded value: the `qtFmt`-typed `ReadValue` output
+  /// (QuickTimeStream.pl:2668) after the key's value-tier `ValueConv`. The
+  /// empty string for an empty/short value (ExifTool.pm:6299).
   value: String,
   /// `SampleTime` in seconds for the timed sample this pair came from
   /// (QuickTimeStream.pl `FoundSomething`:967-973).

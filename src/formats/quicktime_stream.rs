@@ -537,7 +537,11 @@ fn expand_samples(ee: &EeData, media_ts: u32) -> Option<Vec<Sample>> {
 /// `SaveMetaKeys`:876-962).
 #[derive(Debug, Clone)]
 struct MetaKey {
-  /// The resolved tag NAME (`keyd` value, namespace-stripped + camel-cased).
+  /// The raw `keyd` TagID — the `keyd` value with the `(mdta|fiel)com.apple.
+  /// quicktime.` namespace prefix stripped (QuickTimeStream.pl:915-916). This
+  /// is ExifTool's `$$info{TagID}`; the *displayed* tag name is derived from it
+  /// at emit time by [`resolve_mebx_tag`] (the `%QuickTime::Keys` lookup +
+  /// camel-case fallback of `Process_mebx`, QuickTimeStream.pl:2657-2666).
   tag_id: String,
   /// The `qtFmt`-resolved value format (`int32u`, `float`, …).
   format: MetaFormat,
@@ -690,6 +694,305 @@ fn decode_keyd(val: &[u8]) -> String {
   s.into_owned()
 }
 
+/// A `mebx` per-key value conversion — the value-tier `ValueConv` ExifTool's
+/// `HandleTag` applies after `ReadValue` (QuickTimeStream.pl:2669) for a known
+/// `%QuickTime::Keys` tag (QuickTime.pm:6651-...). Only the value-tier convs of
+/// keys that occur in `mebx` timed metadata are modelled; the (display-tier)
+/// `PrintConv` of those tags is NOT applied here — exifast's typed
+/// [`MebxSample`] keeps post-`ValueConv` values (the same convention the GPS
+/// samples follow: decimal degrees, not the DMS `PrintConv`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyValueConv {
+  /// No `ValueConv` — the `ReadValue` output is the value (most keys).
+  None,
+  /// `location.ISO6709` ⇒ `ConvertISO6709` (QuickTime.pm:8884-8908): an ISO
+  /// 6709 coordinate string → space-joined decimal `lat lon [alt]`.
+  Iso6709,
+  /// `scene-illuminance` ⇒ `unpack("N",$val)` (QuickTime.pm:6843): a
+  /// big-endian `int32u` decoded from the raw (undef-format) bytes.
+  SceneIlluminanceN,
+}
+
+/// Resolve a raw `mebx` TagID to the displayed `(Name, ValueConv)` exactly as
+/// `Process_mebx` does (QuickTimeStream.pl:2657-2666): the tag table is
+/// `%QuickTime::Keys` (QuickTimeStream.pl:177), so a TagID that is a key there
+/// keeps that entry's `Name` (and `ValueConv`); any *other* TagID is added
+/// dynamically with `Name => ucfirst($name)` where `$name` is the TagID with
+/// each `-`/`.` separator folded into the following char's upper-case
+/// (`s/[-.](.)/\U$1/g`).
+///
+/// Returns `None` for a TagID that fails ExifTool's reasonable-id guard
+/// (`next unless $tag =~ /^[-\w.]+$/`, QuickTimeStream.pl:2660) — such a sample
+/// is silently skipped (no tag emitted). The guard is applied ONLY on the
+/// dynamic-add path; a known `%QuickTime::Keys` TagID is always emitted.
+fn resolve_mebx_tag(tag_id: &str) -> Option<(smol_str::SmolStr, KeyValueConv)> {
+  // The subset of `%QuickTime::Keys` (QuickTime.pm:6651-...) whose TagIDs are
+  // documented as appearing in `mebx` timed metadata (the "seen in timed
+  // metadata (mebx)" block) plus `location.ISO6709` (the canonical Apple GPS
+  // key) and the reverse-DNS keys whose `Name` differs from the camel-cased
+  // TagID. Entries whose `Name` already equals the camel-case fallback AND
+  // carry no value-tier `ValueConv` are intentionally omitted: the fallback
+  // below reproduces them byte-for-byte. The (display-tier) `PrintConv` of
+  // these tags is not modelled here (see [`KeyValueConv`]).
+  let known: Option<(&str, KeyValueConv)> = match tag_id {
+    // GPS — ValueConv ConvertISO6709 (QuickTime.pm:6701-6711).
+    "location.ISO6709" => Some(("GPSCoordinates", KeyValueConv::Iso6709)),
+    // milli-lux — ValueConv unpack("N",$val) (QuickTime.pm:6840-6845).
+    "scene-illuminance" => Some(("SceneIlluminance", KeyValueConv::SceneIlluminanceN)),
+    // reverse-DNS keys whose Name ≠ camel-case (QuickTime.pm:6712-6735, 6808).
+    "location.accuracy.horizontal" => Some(("LocationAccuracyHorizontal", KeyValueConv::None)),
+    "direction.facing" => Some(("CameraDirection", KeyValueConv::None)),
+    "direction.motion" => Some(("CameraMotion", KeyValueConv::None)),
+    "rating.user" => Some(("UserRating", KeyValueConv::None)),
+    "collection.user" => Some(("UserCollection", KeyValueConv::None)),
+    "content.identifier" => Some(("ContentIdentifier", KeyValueConv::None)),
+    "detected-face" => Some(("FaceInfo", KeyValueConv::None)),
+    "detected-face.bounds" => Some(("DetectedFaceBounds", KeyValueConv::None)),
+    "detected-face.face-id" => Some(("DetectedFaceID", KeyValueConv::None)),
+    "detected-face.roll-angle" => Some(("DetectedFaceRollAngle", KeyValueConv::None)),
+    "detected-face.yaw-angle" => Some(("DetectedFaceYawAngle", KeyValueConv::None)),
+    // (`live-photo-info`'s native-endian `unpack` ValueConv,
+    // QuickTime.pm:6817-6824, is a niche Live-Photo blob outside the
+    // camera/GPS product scope — its Name is faithful via the camel-case
+    // fallback `LivePhotoInfo`; the binary unpack is deferred. Likewise the
+    // `video-orientation`/`detected-face.bounds` etc. PrintConvs are display
+    // tier, not applied to the stored value.)
+    _ => None,
+  };
+  if let Some((name, conv)) = known {
+    return Some((smol_str::SmolStr::from(name), conv));
+  }
+  // QuickTimeStream.pl:2660 `next unless $tag =~ /^[-\w.]+$/` — only the
+  // dynamic-add path is gated; a non-empty run of `[-A-Za-z0-9_.]`.
+  if tag_id.is_empty()
+    || !tag_id
+      .bytes()
+      .all(|b| b == b'-' || b == b'.' || b == b'_' || b.is_ascii_alphanumeric())
+  {
+    return None;
+  }
+  Some((camel_case_ucfirst(tag_id), KeyValueConv::None))
+}
+
+/// `Process_mebx`'s dynamic-tag name (QuickTimeStream.pl:2663-2664):
+/// `$name =~ s/[-.](.)/\U$1/g` then `ucfirst($name)` — fold each `-`/`.`
+/// separator into the following char's ASCII upper-case, then upper-case the
+/// first char. (The TagIDs are reverse-DNS ASCII; Perl `\U`/`ucfirst` match
+/// `to_ascii_uppercase` over this domain. `_` is a `\w` char, NOT a separator,
+/// so it is preserved verbatim — e.g. `Encoded_With` stays `Encoded_With`.)
+fn camel_case_ucfirst(tag_id: &str) -> smol_str::SmolStr {
+  let bytes = tag_id.as_bytes();
+  let mut out = String::with_capacity(bytes.len());
+  let mut i = 0usize;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if b == b'-' || b == b'.' {
+      // `s/[-.](.)/\U$1/`: drop the separator, upper-case the next char.
+      if let Some(&next) = bytes.get(i + 1) {
+        out.push(next.to_ascii_uppercase() as char);
+        i += 2;
+        continue;
+      }
+      // A trailing separator with no following char is unmatched by the regex
+      // and kept verbatim.
+      out.push(b as char);
+      i += 1;
+    } else {
+      out.push(b as char);
+      i += 1;
+    }
+  }
+  // ExifTool `ucfirst` upper-cases only the first character.
+  if let Some(first) = out.get_mut(0..1) {
+    first.make_ascii_uppercase();
+  }
+  smol_str::SmolStr::from(out)
+}
+
+/// Apply a `mebx` key's value-tier [`KeyValueConv`] to the `ReadValue` output
+/// (QuickTimeStream.pl:2669 `HandleTag` → the tag's `ValueConv`). `raw_bytes`
+/// is the value slice (needed by the byte-oriented `unpack` convs); `read_val`
+/// is the already-`ReadValue`-rendered string.
+fn apply_key_value_conv(conv: KeyValueConv, raw_bytes: &[u8], read_val: String) -> String {
+  match conv {
+    KeyValueConv::None => read_val,
+    // QuickTime.pm:6843 `unpack("N",$val)` — big-endian int32u over the raw
+    // (undef-format) bytes. Perl `unpack 'N'` on < 4 bytes zero-pads on the
+    // right; ExifTool only emits this for the 4-byte payload it documents.
+    KeyValueConv::SceneIlluminanceN => match be_u32(raw_bytes, 0) {
+      Some(v) => v.to_string(),
+      None => read_val,
+    },
+    // QuickTime.pm:6707 `ConvertISO6709` over the (undef-format) string value.
+    KeyValueConv::Iso6709 => convert_iso6709(&read_val),
+  }
+}
+
+/// `ConvertISO6709` (QuickTime.pm:8884-8908): parse an ISO 6709 coordinate
+/// string into a space-joined decimal `lat lon [alt]`, trying ExifTool's three
+/// shapes in order — (1) `±DD.D±DDD.D[±AA.A]` decimal degrees, (2)
+/// `±DDMM.M±DDDMM.M[±AA.A]` degrees + decimal minutes, (3)
+/// `±DDMMSS.S±DDDMMSS.S[±AA.A]` degrees + minutes + decimal seconds.
+///
+/// An unrecognised string is returned unchanged (QuickTime.pm:8907). Numbers
+/// stringify via Perl `$x + 0` ≈ `%.15g` ([`format_g`](crate::value::format_g)).
+fn convert_iso6709(val: &str) -> String {
+  let b = val.as_bytes();
+  let (lat, lon, alt) = match parse_iso_decimal(b)
+    .or_else(|| parse_iso_dm(b))
+    .or_else(|| parse_iso_dms(b))
+  {
+    Some(v) => v,
+    // QuickTime.pm:8907 `return $val` — unrecognised string unchanged.
+    None => return val.to_string(),
+  };
+  // Perl interpolates `"$lat $lon"` (+ optional alt) with default %.15g.
+  let g = |x: f64| crate::value::format_g(x, 15);
+  let mut s = alloc::format!("{} {}", g(lat), g(lon));
+  if let Some(a) = alt {
+    s.push(' ');
+    s.push_str(&g(a));
+  }
+  s
+}
+
+/// Read a `[-+]` sign at `b[i]` → `(is_negative, next_index)`.
+fn iso_sign(b: &[u8], i: usize) -> Option<(bool, usize)> {
+  match b.get(i) {
+    Some(b'+') => Some((false, i + 1)),
+    Some(b'-') => Some((true, i + 1)),
+    _ => None,
+  }
+}
+
+/// Read exactly `n` ASCII digits at `b[i..]` → `(value, next_index)`.
+fn iso_digits_n(b: &[u8], i: usize, n: usize) -> Option<(f64, usize)> {
+  let slice = b.get(i..i + n)?;
+  if !slice.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  let v = slice
+    .iter()
+    .fold(0f64, |a, &d| a * 10.0 + f64::from(d - b'0'));
+  Some((v, i + n))
+}
+
+/// Read an optional fractional tail `(?:\.\d*)?` at `b[i..]` (zero or more
+/// digits after a `.`) → `(fraction_added, next_index)`; `(0.0, i)` if there is
+/// no `.`.
+fn iso_frac(b: &[u8], i: usize) -> (f64, usize) {
+  if b.get(i) != Some(&b'.') {
+    return (0.0, i);
+  }
+  let mut j = i + 1;
+  let mut frac = 0.0f64;
+  let mut scale = 0.1f64;
+  while let Some(&d) = b.get(j) {
+    if !d.is_ascii_digit() {
+      break;
+    }
+    frac += f64::from(d - b'0') * scale;
+    scale *= 0.1;
+    j += 1;
+  }
+  (frac, j)
+}
+
+/// Optional altitude `[-+]\d+(?:\.\d*)?` at `b[i..]` (≥1 integer digit) → the
+/// signed altitude, or `None` when absent / malformed.
+fn iso_altitude(b: &[u8], i: usize) -> Option<f64> {
+  let (neg, mut j) = iso_sign(b, i)?;
+  let start = j;
+  let mut v = 0f64;
+  while let Some(&d) = b.get(j) {
+    if !d.is_ascii_digit() {
+      break;
+    }
+    v = v * 10.0 + f64::from(d - b'0');
+    j += 1;
+  }
+  if j == start {
+    return None; // need ≥1 integer digit
+  }
+  let (frac, _) = iso_frac(b, j);
+  Some(if neg { -(v + frac) } else { v + frac })
+}
+
+/// Shape 1 — `([-+]\d{1,2}(?:\.\d*)?)([-+]\d{1,3}(?:\.\d*)?)([-+]\d+...)?`:
+/// decimal degrees. `(lat, lon, alt?)` or `None`.
+fn parse_iso_decimal(b: &[u8]) -> Option<(f64, f64, Option<f64>)> {
+  // `[-+]` then 1..=max_int integer digits + optional `.frac`.
+  fn signed(b: &[u8], i: usize, max_int: usize) -> Option<(f64, usize)> {
+    let (neg, mut j) = iso_sign(b, i)?;
+    let start = j;
+    let mut v = 0f64;
+    while j - start < max_int {
+      match b.get(j) {
+        Some(&d) if d.is_ascii_digit() => {
+          v = v * 10.0 + f64::from(d - b'0');
+          j += 1;
+        }
+        _ => break,
+      }
+    }
+    if j == start {
+      return None; // need ≥1 integer digit
+    }
+    let (frac, j) = iso_frac(b, j);
+    Some((if neg { -(v + frac) } else { v + frac }, j))
+  }
+  let (lat, j) = signed(b, 0, 2)?;
+  let (lon, j) = signed(b, j, 3)?;
+  let alt = match b.get(j) {
+    Some(b'+') | Some(b'-') => signed(b, j, usize::MAX).map(|(a, _)| a),
+    _ => None,
+  };
+  Some((lat, lon, alt))
+}
+
+/// Shape 2 — `([-+])(\d{2})(\d{2}(?:\.\d*)?)([-+])(\d{3})(\d{2}(?:\.\d*)?)`
+/// `([-+]\d+...)?`: degrees + decimal minutes. `(lat, lon, alt?)` or `None`.
+fn parse_iso_dm(b: &[u8]) -> Option<(f64, f64, Option<f64>)> {
+  let (neg_lat, j) = iso_sign(b, 0)?;
+  let (deg_lat, j) = iso_digits_n(b, j, 2)?;
+  let (min_lat, j) = iso_digits_n(b, j, 2)?;
+  let (min_lat_frac, j) = iso_frac(b, j);
+  let (neg_lon, j) = iso_sign(b, j)?;
+  let (deg_lon, j) = iso_digits_n(b, j, 3)?;
+  let (min_lon, j) = iso_digits_n(b, j, 2)?;
+  let (min_lon_frac, j) = iso_frac(b, j);
+  let lat = deg_lat + (min_lat + min_lat_frac) / 60.0;
+  let lon = deg_lon + (min_lon + min_lon_frac) / 60.0;
+  Some((
+    if neg_lat { -lat } else { lat },
+    if neg_lon { -lon } else { lon },
+    iso_altitude(b, j),
+  ))
+}
+
+/// Shape 3 — `([-+])(\d{2})(\d{2})(\d{2}(?:\.\d*)?)([-+])(\d{3})(\d{2})`
+/// `(\d{2}(?:\.\d*)?)([-+]\d+...)?`: degrees + minutes + decimal seconds.
+/// `(lat, lon, alt?)` or `None`.
+fn parse_iso_dms(b: &[u8]) -> Option<(f64, f64, Option<f64>)> {
+  let (neg_lat, j) = iso_sign(b, 0)?;
+  let (deg_lat, j) = iso_digits_n(b, j, 2)?;
+  let (min_lat, j) = iso_digits_n(b, j, 2)?;
+  let (sec_lat, j) = iso_digits_n(b, j, 2)?;
+  let (sec_lat_frac, j) = iso_frac(b, j);
+  let (neg_lon, j) = iso_sign(b, j)?;
+  let (deg_lon, j) = iso_digits_n(b, j, 3)?;
+  let (min_lon, j) = iso_digits_n(b, j, 2)?;
+  let (sec_lon, j) = iso_digits_n(b, j, 2)?;
+  let (sec_lon_frac, j) = iso_frac(b, j);
+  let lat = deg_lat + min_lat / 60.0 + (sec_lat + sec_lat_frac) / 3600.0;
+  let lon = deg_lon + min_lon / 60.0 + (sec_lon + sec_lon_frac) / 3600.0;
+  Some((
+    if neg_lat { -lat } else { lat },
+    if neg_lon { -lon } else { lon },
+    iso_altitude(b, j),
+  ))
+}
+
 /// `Process_mebx` (QuickTimeStream.pl:2644-2680): decode one `mebx` timed
 /// sample — a sequence of `[size:4][local-id:4][value]` records — using the
 /// `keys` map from [`save_meta_keys`].
@@ -715,15 +1018,20 @@ fn process_mebx(
     }
     let id = be_u32(data, pos + 4).unwrap_or(0);
     if let Some((_, info)) = keys.iter().find(|(k, _)| *k == id) {
-      // QuickTimeStream.pl:2668 `ReadValue($dataPt, $pos+8, $format, .., $len-8)`.
-      let value_bytes = &data[pos + 8..pos + len];
-      if let Some(value) = read_meta_value(value_bytes, info.format) {
-        out.push_mebx_sample(MebxSample::new(
-          info.tag_id.clone(),
-          value,
-          sample_time,
-          sample_duration,
-        ));
+      // QuickTimeStream.pl:2657-2666 — resolve the TagID through the
+      // `%QuickTime::Keys` table (the `mebx` SubDirectory's TagTable,
+      // QuickTimeStream.pl:177) to its displayed Name + value-tier ValueConv,
+      // skipping a TagID that fails the reasonable-id guard.
+      if let Some((name, conv)) = resolve_mebx_tag(&info.tag_id) {
+        // QuickTimeStream.pl:2668 `ReadValue($dataPt, $pos+8, $format, undef,
+        // $len-8)`. A `mebx` record is ≥8 bytes; the value slice is `$len-8`
+        // bytes (possibly empty). ReadValue returns an empty STRING — never
+        // undef — for the empty/short case (ExifTool.pm:6298-6299), so the tag
+        // is ALWAYS emitted once the key resolves (it is never dropped here).
+        let value_bytes = &data[pos + 8..pos + len];
+        let read_val = read_meta_value(value_bytes, info.format);
+        let value = apply_key_value_conv(conv, value_bytes, read_val);
+        out.push_mebx_sample(MebxSample::new(name, value, sample_time, sample_duration));
       }
     }
     pos += len;
@@ -736,42 +1044,46 @@ fn process_mebx(
 ///
 /// **`count == undef` ⇒ read ALL elements that fit** (ExifTool.pm:6296-6331):
 /// with a defined `$size` (`$len-8`) but an undefined `$count`, `ReadValue`
-/// sets `$count = int($size / $formatSize{$format})` and loops, pushing one
-/// value per element, then `return join(' ', @vals) if @vals > 1`. So a
-/// `float[2]` / `float[4]` / `float[9]` matrix, a `double[3]` coordinate, an
-/// `int16s[3]` accelerometer triple, etc. are decoded in FULL and space-joined
-/// — NOT just the first element. Each element renders exactly as the
-/// single-element case did (numeric `$proc` → Perl default stringification:
-/// `%.15g` for float/double via [`format_g`](crate::value::format_g), plain
-/// decimal for ints). The `string`/`undef` formats have no `$readValueProc`,
-/// so ExifTool reads ONE value spanning all `$count*$len` bytes
-/// (ExifTool.pm:6307-6311) — kept as the single NUL-trimmed string.
-fn read_meta_value(bytes: &[u8], format: MetaFormat) -> Option<String> {
-  if bytes.is_empty() {
-    return None;
-  }
+/// first short-circuits — `return '' if defined $count or $size < $len` — so
+/// when the available size is SMALLER than one format unit (a short / empty
+/// value) it returns an **empty STRING**, NOT undef. Otherwise it sets
+/// `$count = int($size / $formatSize{$format})` and loops, pushing one value
+/// per element, then `return join(' ', @vals) if @vals > 1`. So a `float[2]` /
+/// `float[4]` / `float[9]` matrix, a `double[3]` coordinate, an `int16s[3]`
+/// accelerometer triple, etc. are decoded in FULL and space-joined — NOT just
+/// the first element. Each element renders exactly as the single-element case
+/// did (numeric `$proc` → Perl default stringification: `%.15g` for
+/// float/double via [`format_g`](crate::value::format_g), plain decimal for
+/// ints). The `string`/`undef` formats (`$formatSize == 1`) have no
+/// `$readValueProc`, so ExifTool reads ONE value spanning all `$count*$len`
+/// bytes (ExifTool.pm:6307-6311) — kept as the single NUL-trimmed string (and
+/// the empty string for an empty value, since `$size < 1` ⇒ `''`).
+///
+/// Returns a `String` (never an `Option`): for the `undef`-count call
+/// `ReadValue` cannot reach its `$count < 1 ⇒ return undef` branch (that branch
+/// is guarded by an initially-truthy `$count`), so the result is always a
+/// string — the empty string in the short/empty case.
+fn read_meta_value(bytes: &[u8], format: MetaFormat) -> String {
   match format {
-    // No `$readValueProc` (ExifTool.pm:6307): one value = the whole byte span
-    // (string truncates at the first NUL, ExifTool.pm:6311).
-    MetaFormat::Str => Some(
-      String::from_utf8_lossy(bytes)
-        .trim_end_matches('\0')
-        .to_string(),
-    ),
-    MetaFormat::Undef => {
-      // ExifTool renders an `undef` ReadValue as the raw byte string; for a
-      // printable run keep it, else hex — but `mebx` `undef` values are rare
-      // and not GPS-bearing, so the lossless UTF-8-lossy rendering suffices.
-      Some(
-        String::from_utf8_lossy(bytes)
-          .trim_end_matches('\0')
-          .to_string(),
-      )
+    // No `$readValueProc` (ExifTool.pm:6307): one value = the whole byte span.
+    // `$formatSize == 1` ⇒ the `$size < $len` short-circuit (→ `''`) only fires
+    // for an empty value, which naturally yields the empty string here.
+    //
+    // `string` truncates at the FIRST NUL — `s/\0.*//s` drops the NUL and
+    // everything after it (ExifTool.pm:6311) — whereas `undef` keeps the raw
+    // byte span verbatim (the `s/\0.*//s` is gated `if $format eq 'string'`).
+    MetaFormat::Str => {
+      let s = String::from_utf8_lossy(bytes);
+      match s.find('\0') {
+        Some(nul) => s[..nul].to_string(),
+        None => s.into_owned(),
+      }
     }
+    MetaFormat::Undef => String::from_utf8_lossy(bytes).into_owned(),
     // Numeric formats: a `$readValueProc` exists, so loop `int($size/$len)`
     // elements and space-join (ExifTool.pm:6322-6330). `read_numeric_array`
-    // returns `None` only when not even one element fits (`$count < 1` ⇒
-    // ExifTool's `return undef`, ExifTool.pm:6303).
+    // returns the EMPTY STRING when not even one element fits (`$size < $len`
+    // ⇒ ExifTool's `return ''`, ExifTool.pm:6299) — NOT undef.
     MetaFormat::Int8u => read_numeric_array(bytes, 1, |b, o| Some(u64::from(b[o]).to_string())),
     MetaFormat::Int8s => read_numeric_array(bytes, 1, |b, o| Some((b[o] as i8).to_string())),
     MetaFormat::Int16u => read_numeric_array(bytes, 2, |b, o| be_u16(b, o).map(|v| v.to_string())),
@@ -803,20 +1115,23 @@ fn read_meta_value(bytes: &[u8], format: MetaFormat) -> Option<String> {
 ///
 /// `render(bytes, offset)` decodes + stringifies ONE element at `offset` (a
 /// byte-bounded reader, so a partial trailing element yields `None` and stops
-/// the loop, matching the `int($size/$len)` count truncation). Returns `None`
-/// when not a single whole element fits (ExifTool's `$count < 1 ⇒ return
-/// undef`); a single element returns its bare string (no separator), `@vals >
-/// 1` returns the space-joined list.
+/// the loop, matching the `int($size/$len)` count truncation). Returns the
+/// EMPTY STRING when not a single whole element fits (ExifTool's
+/// `return '' if ... $size < $len`, ExifTool.pm:6299 — the `count == undef`
+/// call never reaches the later `$count < 1 ⇒ return undef`); a single element
+/// returns its bare string (no separator), `@vals > 1` returns the space-joined
+/// list.
 fn read_numeric_array(
   bytes: &[u8],
   elem_size: usize,
   render: impl Fn(&[u8], usize) -> Option<String>,
-) -> Option<String> {
-  // ExifTool.pm:6298 `$count = int($size / $len)`.
+) -> String {
+  // ExifTool.pm:6298 `$count = int($size / $len)`; a `$size < $len` short
+  // value short-circuits to `''` at ExifTool.pm:6299.
   let count = bytes.len() / elem_size;
   if count == 0 {
-    // ExifTool.pm:6303 `$count < 1 and return undef`.
-    return None;
+    // ExifTool.pm:6299 `return '' if ... $size < $len`.
+    return String::new();
   }
   let mut out = String::new();
   for i in 0..count {
@@ -829,7 +1144,9 @@ fn read_numeric_array(
     }
     out.push_str(&elem);
   }
-  if out.is_empty() { None } else { Some(out) }
+  // `count >= 1` and every element is in-bounds (`count = int(size/elem_size)`
+  // already bounds the loop), so `out` is the space-joined value here.
+  out
 }
 
 // ===========================================================================
@@ -1441,6 +1758,8 @@ mod tests {
     let keys = alloc::vec![(
       1u32,
       MetaKey {
+        // Not a `%QuickTime::Keys` TagID ⇒ dynamic-add: camel-case of
+        // `GPSCoordinates` (no separators) is itself.
         tag_id: "GPSCoordinates".into(),
         format: MetaFormat::Int32s,
       },
@@ -1456,6 +1775,137 @@ mod tests {
     assert_eq!(out.mebx_samples()[0].value(), "123456");
     assert_eq!(out.mebx_samples()[0].sample_duration(), Some(1.0));
     assert_eq!(out.mebx_samples()[0].sample_time(), Some(0.5));
+  }
+
+  #[test]
+  fn camel_case_ucfirst_matches_perl() {
+    // QuickTimeStream.pl:2663-2664 `s/[-.](.)/\U$1/g` + `ucfirst`.
+    assert_eq!(camel_case_ucfirst("test.foo-bar"), "TestFooBar");
+    assert_eq!(camel_case_ucfirst("video-orientation"), "VideoOrientation");
+    assert_eq!(camel_case_ucfirst("still-image-time"), "StillImageTime");
+    // `_` is a `\w` char, NOT a separator — preserved verbatim.
+    assert_eq!(camel_case_ucfirst("Encoded_With"), "Encoded_With");
+    // a trailing separator with no following char is unmatched (kept).
+    assert_eq!(camel_case_ucfirst("a."), "A.");
+    // ucfirst upper-cases only the first char.
+    assert_eq!(camel_case_ucfirst("foo"), "Foo");
+  }
+
+  #[test]
+  fn resolve_mebx_tag_keys_lookup_and_fallback() {
+    // `%QuickTime::Keys` lookup: Name ≠ camel-case (QuickTime.pm:6701).
+    let (name, conv) = resolve_mebx_tag("location.ISO6709").expect("known");
+    assert_eq!(name, "GPSCoordinates");
+    assert_eq!(conv, KeyValueConv::Iso6709);
+    // scene-illuminance ⇒ unpack("N",$val).
+    let (name, conv) = resolve_mebx_tag("scene-illuminance").expect("known");
+    assert_eq!(name, "SceneIlluminance");
+    assert_eq!(conv, KeyValueConv::SceneIlluminanceN);
+    // detected-face.face-id ⇒ Keys Name DetectedFaceID (≠ camel-case).
+    let (name, _) = resolve_mebx_tag("detected-face.face-id").expect("known");
+    assert_eq!(name, "DetectedFaceID");
+    // unknown reverse-DNS ⇒ camel-case fallback, no ValueConv.
+    let (name, conv) = resolve_mebx_tag("test.foo-bar").expect("valid id");
+    assert_eq!(name, "TestFooBar");
+    assert_eq!(conv, KeyValueConv::None);
+    // QuickTimeStream.pl:2660 `next unless $tag =~ /^[-\w.]+$/`: a TagID with
+    // a disallowed char (space) is SKIPPED (no tag).
+    assert!(resolve_mebx_tag("bad id").is_none());
+    assert!(resolve_mebx_tag("").is_none());
+  }
+
+  #[test]
+  fn read_meta_value_empty_and_short_yield_empty_string() {
+    // ReadValue's `return '' if ... $size < $len` (ExifTool.pm:6299): an empty
+    // value or a value shorter than one format unit yields "" — NOT dropped.
+    assert_eq!(read_meta_value(&[], MetaFormat::Int32u), "");
+    assert_eq!(read_meta_value(&[0x00, 0x01], MetaFormat::Int32u), ""); // 2 < 4
+    assert_eq!(read_meta_value(&[], MetaFormat::Str), "");
+    assert_eq!(read_meta_value(&[], MetaFormat::Undef), "");
+    // a full element still decodes.
+    assert_eq!(read_meta_value(&[0, 0, 0, 5], MetaFormat::Int32u), "5");
+    // `string` truncates at the first NUL (`s/\0.*//s`, ExifTool.pm:6311):
+    // the NUL and everything after it is dropped.
+    assert_eq!(read_meta_value(b"hi\0junk", MetaFormat::Str), "hi");
+    // `undef` keeps the raw byte span (no NUL handling).
+    assert_eq!(read_meta_value(b"ab", MetaFormat::Undef), "ab");
+  }
+
+  #[test]
+  fn process_mebx_empty_value_emits_empty_string_tag() {
+    // An 8-byte record ($len-8 == 0) ⇒ ReadValue returns '' and the tag is
+    // STILL emitted (not dropped). Key resolves via camel-case.
+    let keys = alloc::vec![(
+      7u32,
+      MetaKey {
+        tag_id: "still-image-time".into(),
+        format: MetaFormat::Int8s,
+      },
+    )];
+    let mut rec = 8u32.to_be_bytes().to_vec(); // len=8, no value bytes
+    rec.extend_from_slice(&7u32.to_be_bytes());
+    rec.extend_from_slice(&[0xFFu8; 4]); // trailing so pos+8 < len
+    let mut out = QuickTimeStreamMeta::new();
+    process_mebx(&rec, &keys, None, None, &mut out);
+    assert_eq!(out.mebx_samples().len(), 1, "empty value still emits a tag");
+    assert_eq!(out.mebx_samples()[0].name(), "StillImageTime");
+    assert_eq!(out.mebx_samples()[0].value(), "");
+  }
+
+  #[test]
+  fn process_mebx_scene_illuminance_applies_unpack_n() {
+    // scene-illuminance ⇒ ValueConv unpack("N",$val) over the raw undef bytes.
+    let keys = alloc::vec![(
+      1u32,
+      MetaKey {
+        tag_id: "scene-illuminance".into(),
+        format: MetaFormat::Undef, // dtyp ns=1 ⇒ undef format
+      },
+    )];
+    // [len=12][local-id=1][00 00 04 D2] = 1234.
+    let mut rec = 12u32.to_be_bytes().to_vec();
+    rec.extend_from_slice(&1u32.to_be_bytes());
+    rec.extend_from_slice(&[0x00, 0x00, 0x04, 0xD2]);
+    let mut out = QuickTimeStreamMeta::new();
+    process_mebx(&rec, &keys, None, None, &mut out);
+    assert_eq!(out.mebx_samples().len(), 1);
+    assert_eq!(out.mebx_samples()[0].name(), "SceneIlluminance");
+    assert_eq!(out.mebx_samples()[0].value(), "1234");
+  }
+
+  #[test]
+  fn convert_iso6709_shapes() {
+    // QuickTime.pm:8884-8908 ConvertISO6709.
+    // decimal degrees +DD.D+DDD.D[+AA.A].
+    assert_eq!(convert_iso6709("+47.6284+122.1650"), "47.6284 122.165");
+    assert_eq!(convert_iso6709("+47.6+122.2+10.5"), "47.6 122.2 10.5");
+    // negative lat/lon.
+    assert_eq!(convert_iso6709("-12.34-098.76"), "-12.34 -98.76");
+    // degrees+minutes +DDMM.M+DDDMM.M (Perl %.15g).
+    assert_eq!(
+      convert_iso6709("+4737.7+12209.9"),
+      "47.6283333333333 122.165"
+    );
+    // degrees+minutes+seconds +DDMMSS.S+DDDMMSS.S (Perl %.15g).
+    assert_eq!(
+      convert_iso6709("+473742.3+1220954.1"),
+      "47.6284166666667 122.165027777778"
+    );
+    // unrecognised ⇒ unchanged.
+    assert_eq!(convert_iso6709("not-a-coord"), "not-a-coord");
+    // negative DM with altitude; the `0` zero case (all verified vs perl).
+    assert_eq!(convert_iso6709("+0.0+0.0"), "0 0");
+    assert_eq!(
+      convert_iso6709("-4737.7-12209.9-50.5"),
+      "-47.6283333333333 -122.165 -50.5"
+    );
+    // DMS without a fractional second (shape-3 path, no `.`).
+    assert_eq!(
+      convert_iso6709("+473742-1220954"),
+      "47.6283333333333 -122.165"
+    );
+    // a value that matches no shape (lat run too long) ⇒ unchanged.
+    assert_eq!(convert_iso6709("+90123456"), "+90123456");
   }
 
   #[test]

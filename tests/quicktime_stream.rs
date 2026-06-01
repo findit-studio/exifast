@@ -119,6 +119,47 @@ fn quicktime_mebx_float_array_value_reads_all_elements() {
 }
 
 #[test]
+fn quicktime_mebx_keys_table_name_resolution_and_value_conv() {
+  // REGRESSION (mebx key resolution + per-key ValueConv): `Process_mebx`
+  // (QuickTimeStream.pl:2657-2669) resolves each TagID through the
+  // `%QuickTime::Keys` table (the `mebx` SubDirectory's TagTable,
+  // QuickTimeStream.pl:177). This fixture has TWO keys in one sample:
+  //   * `scene-illuminance` — a `%QuickTime::Keys` entry (QuickTime.pm:6840)
+  //     ⇒ Name `SceneIlluminance`, ValueConv `unpack("N",$val)`; the raw
+  //     undef bytes `00 00 04 D2` ⇒ `1234`.
+  //   * `test.foo-bar` — NOT in `%QuickTime::Keys` ⇒ the dynamic-add path
+  //     (QuickTimeStream.pl:2663-2664) camel-cases it to `TestFooBar`; the
+  //     value is the raw (undef) string `hi`.
+  // Oracle (`perl exiftool -ee`, `QuickTime_mebx_keys.mov.ee.json`) ⇒
+  //   Track1:SceneIlluminance = 1234, Track1:TestFooBar = "hi".
+  let data = fixture("QuickTime_mebx_keys.mov");
+  let golden = ee_golden("QuickTime_mebx_keys.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let pairs = meta.stream().mebx_samples();
+  assert_eq!(pairs.len(), 2, "two mebx key/value pairs");
+
+  // Keys-table lookup + ValueConv unpack("N",..).
+  assert_eq!(pairs[0].name(), "SceneIlluminance");
+  assert_eq!(pairs[0].value(), "1234");
+  let want_illum = golden
+    .get("Track1:SceneIlluminance")
+    .expect("golden SceneIlluminance")
+    .to_string();
+  assert_eq!(want_illum, "1234", "oracle SceneIlluminance");
+
+  // Dynamic-add camel-case of an unknown reverse-DNS TagID.
+  assert_eq!(pairs[1].name(), "TestFooBar");
+  assert_eq!(pairs[1].value(), "hi");
+  let want_foo = golden
+    .get("Track1:TestFooBar")
+    .and_then(|v| v.as_str())
+    .expect("golden TestFooBar");
+  assert_eq!(pairs[1].value(), want_foo, "oracle TestFooBar");
+}
+
+#[test]
 fn quicktime_kenwood_gps_box_decodes_le_records() {
   // QuickTimeStream.pl `ParseTag` `GPS ` (2557-2580): a moov-level Kenwood
   // `GPS ` box of 36-byte little-endian records. The fixture has two fixes;
