@@ -43,11 +43,10 @@
 //! **Conversions** ported:
 //! - [`convert_riff_date`] — RIFF.pm:1601-1619 `ConvertRIFFDate`
 //!   (`Mon Mar 10 15:04:43 2003` → `2003:03:10 15:04:43`).
-//! - `%audioEncoding` PrintConv subset (RIFF.pm:90-336) — table reduced to
-//!   the entries the bundled `RIFF.avi` fixture reaches (`0x01` Microsoft
-//!   PCM) plus a few sentinels; an unrecognized code falls back to the
-//!   `Unknown (0x%x)` rendering. The full ~250-entry codec table is a
-//!   follow-up (it's a flat lookup table with no semantic complexity).
+//! - `%audioEncoding` PrintConv (RIFF.pm:90-335) — the FULL "TwoCC" codec
+//!   table is transcribed in [`audio_encoding_label`]; an unrecognized code
+//!   falls back to the `Unknown (0x%x)` rendering (ExifTool's default hash
+//!   PrintConv miss).
 //!
 //! **Inline BMP-strf decoder** ([`emit_bmp_video_format`], BMP.pm:36-150):
 //! the AVI `strf` chunk for a `vids` stream hops into `%BMP::Main`, emitting
@@ -95,9 +94,6 @@
 //!   `RIFF.avi` fixture (it has no JUNK chunks with metadata).
 //! - **`LIST_ncdt` / `LIST_hydt` / `LIST_pntx`.** Nikon/Pentax AVI maker
 //!   notes; depend on Nikon/Pentax module ports (separate Phase-2 items).
-//! - **`%audioEncoding` full table.** The bundled fixture only exercises
-//!   `0x01 = Microsoft PCM`; the ~250-row codec table (RIFF.pm:90-336)
-//!   is mechanically completable in a follow-up.
 //! - **`StreamData` Camera AVIF/CASI.** RIFF.pm:1250-1276 — Canon AVIF
 //!   sub-IFD + Casio CASI sub-IFD inside `strd`. The `strd` chunk is read
 //!   into the typed stream record so it's reachable for a future Exif/
@@ -306,6 +302,11 @@ pub struct RiffMeta<'a> {
   /// `true` when the OUTER magic was `RF64` (RIFF.pm:2042 / 2054). The
   /// `(RF64)` `FileType` suffix is a follow-up — not emitted today.
   rf64: bool,
+  /// `true` when the walker hit a truncated chunk (a declared chunk length
+  /// extending past EOF). Surfaced by `drain_diagnostics` as the bundled
+  /// terminal warning `Error reading RIFF file (corrupted?)` (RIFF.pm:2216,
+  /// `$err and $et->Warn(...)`).
+  corrupted: bool,
   /// Phantom anchor for the GAT lifetime.
   _marker: core::marker::PhantomData<&'a ()>,
 }
@@ -318,6 +319,7 @@ impl Default for RiffMeta<'_> {
       file_type: "RIFF",
       mime: "application/octet-stream",
       rf64: false,
+      corrupted: false,
       _marker: core::marker::PhantomData,
     }
   }
@@ -360,6 +362,15 @@ impl RiffMeta<'_> {
   #[inline(always)]
   pub const fn is_rf64(&self) -> bool {
     self.rf64
+  }
+
+  /// `true` when a truncated chunk was encountered during the walk (a declared
+  /// chunk length running past EOF). The engine surfaces this as the bundled
+  /// `ExifTool:Warning` "Error reading RIFF file (corrupted?)" (RIFF.pm:2216).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_corrupted(&self) -> bool {
+    self.corrupted
   }
 }
 
@@ -440,6 +451,8 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     entries: Vec::new(),
     streams: Vec::new(),
     current_stream_type: None,
+    charset: Charset::Latin,
+    err: false,
   };
 
   // RIFF.pm:2058: `my $riffEnd = Get32u(\$buff, 4) + 8; $riffEnd += $riffEnd & 0x01;`
@@ -456,6 +469,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     file_type,
     mime,
     rf64,
+    corrupted: walker.err,
     _marker: core::marker::PhantomData,
   })
 }
@@ -473,6 +487,15 @@ struct Walker<'a> {
   /// Read by the next `strf` chunk to decide AudioFormat / VideoFormat.
   /// Faithful to RIFF.pm:1169 `RawConv => '$$self{RIFFStreamType} = $val'`.
   current_stream_type: Option<[u8; 4]>,
+  /// Active charset for `INFO`/`exif` string decoding (RIFF.pm:1782-1790).
+  /// Starts [`Charset::Latin`] (the default `'Latin'`/cp1252); a `CSET` chunk
+  /// switches it to [`Charset::Raw`] (`$$self{CodePage}` is numeric ⇒ the
+  /// `%csType` lookup misses ⇒ raw passthrough).
+  charset: Charset,
+  /// `$err` (RIFF.pm:2096/2150/2216) — set when a declared-length chunk could
+  /// not be fully read (truncated). Drives the terminal
+  /// `Error reading RIFF file (corrupted?)` warning.
+  err: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -481,6 +504,35 @@ impl<'a> Walker<'a> {
     while let Some((tag, len, pad_len)) = self.read_chunk() {
       let chunk_start = self.pos;
       let chunk_end = chunk_start + len;
+
+      // RIFF.pm:2122-2124: an empty `\0\0\0\0` chunk (len 0) stops the walk.
+      // Checked BEFORE the truncation guard (bundled's `$len<=0` block at
+      // 2118 precedes the read at 2150).
+      if len == 0 && &tag == b"\0\0\0\0" {
+        break;
+      }
+      // RIFF.pm:2173-2181: a mid-stream `RIFF` re-trigger only reads the
+      // 4-byte inner TYPE word and continues (concatenated video). It does
+      // NOT read the declared `$len2`, so the truncation guard must not apply.
+      // Sub-document (`DOC_NUM`) accumulation is deferred (single-document).
+      if &tag == b"RIFF" {
+        self.pos = chunk_start + 4; // skip the 4-byte inner TYPE
+        continue;
+      }
+
+      // Finding 4 (RIFF.pm:2150 `$raf->Read($buff,$len2) >= $len or $err=1,next`,
+      // and the symmetric `$raf->Seek($len2,1) or $err=1,next` at 2209): a
+      // chunk whose DECLARED length runs past EOF is NEVER dispatched —
+      // bundled's read/seek fails, sets `$err`, and `next`s WITHOUT calling
+      // `HandleTag` (so no partial-payload tags are emitted), then warns once
+      // at the end (RIFF.pm:2216 `$err and $et->Warn('Error reading RIFF file
+      // (corrupted?)')`). We replicate: mark `err`, skip the dispatch, and
+      // advance past EOF (the walk then ends — `read_chunk` finds < 8 bytes).
+      if chunk_end > self.data.len() {
+        self.err = true;
+        self.pos = chunk_end + pad_len;
+        continue;
+      }
 
       // RIFF.pm:2148-2150 — skip data/idx1/LIST_movi/RIFF/##(db|dc|wb).
       // We DO need to handle `LIST` specially (recurse based on TYPE).
@@ -495,7 +547,9 @@ impl<'a> Walker<'a> {
           None => break,
         };
         let list_payload_start = chunk_start + 4;
-        let list_payload_end = chunk_end.min(self.data.len());
+        // The declared body is fully present (guarded above), so the LIST
+        // payload end is the true chunk end.
+        let list_payload_end = chunk_end;
         if list_payload_end <= list_payload_start {
           // Empty LIST — skip past it (with padding).
           self.pos = chunk_end + pad_len;
@@ -504,9 +558,15 @@ impl<'a> Walker<'a> {
         let body = &self.data[list_payload_start..list_payload_end];
         match &list_type {
           b"INFO" | b"INF0" => {
-            process_chunks_info(body, &mut self.entries);
+            process_chunks_info(body, &mut self.entries, self.charset);
           }
           b"exif" => {
+            // NOTE: `%RIFF::Exif` (RIFF.pm:1013-1027) has NO `FORMAT =>
+            // 'string'`, so ProcessChunks does NOT charset-decode its values
+            // (the `$format eq 'string'` branch, RIFF.pm:1825-1830, is
+            // skipped). They pass through raw (verified vs bundled: an `ecor`
+            // with a high byte keeps the byte, JSON-escaped to `?`). So the
+            // CSET charset is intentionally NOT threaded here.
             process_chunks_exif(body, &mut self.entries);
           }
           b"hdrl" => {
@@ -545,27 +605,26 @@ impl<'a> Walker<'a> {
       }
 
       // Inline chunks at the OUTER level — most of these map through
-      // `%Main` (RIFF.pm:338-678).
-      let body_end = chunk_end.min(self.data.len());
-      let body = self.data.get(chunk_start..body_end).unwrap_or(&[]);
+      // `%Main` (RIFF.pm:338-678). The declared body is fully present here
+      // (guarded above), so the slice is exactly the chunk payload.
+      let body = &self.data[chunk_start..chunk_end];
       match &tag {
         b"fmt " => emit_audio_format(body, &mut self.entries),
         b"IDIT" => emit_idit(body, &mut self.entries),
         b"ISMP" => emit_ismp(body, &mut self.entries),
-        // Skip image-data / index / null chunks (RIFF.pm:2122-2124 +
-        // 2148-2150).
+        // CSET (RIFF.pm:533-536 → `%RIFF::CSET`): `CodePage` int16u at
+        // offset 0 sets `$$self{CodePage}` (RIFF.pm:1068-1069), which makes
+        // ProcessChunks decode subsequent INFO/exif strings through the
+        // NUMERIC code page. `Image::ExifTool::Decode` keys `%csType` by
+        // charset NAME, so a numeric code page misses ⇒ raw passthrough
+        // (verified vs bundled). We model that as `Charset::Raw`.
+        b"CSET" => {
+          if body.len() >= 2 {
+            self.charset = Charset::Raw;
+          }
+        }
+        // Skip image-data / index chunks (RIFF.pm:2148-2150).
         b"data" | b"idx1" => {}
-        b"\0\0\0\0" => {
-          // RIFF.pm:2122-2124: stop on empty null chunk.
-          break;
-        }
-        b"RIFF" => {
-          // Concatenated RIFF segment — bundled bumps DOC_NUM and continues
-          // (RIFF.pm:2173-2181). Deferred (single-document only); skip
-          // the inner RIFF type word and continue walking the next chunk.
-          self.pos = chunk_start + 4; // skip 4-byte inner TYPE
-          continue;
-        }
         // JUNK (vendor maker-note variants + TextJunk fallback) — all
         // deferred (see module doc).
         b"JUNK" | b"JUNQ" => {}
@@ -717,7 +776,11 @@ impl<'a> Walker<'a> {
 /// fixture's IART/IGNR/ICRD/INAM/ISFT/etc. set + the broader "EXIF 2.3"
 /// underlined-tag subset. Unrecognized FourCCs are silently skipped
 /// (faithful to bundled with no `-U`).
-fn process_chunks_info(body: &[u8], entries: &mut Vec<RiffEntry>) {
+///
+/// String values are decoded through the active [`Charset`] (RIFF.pm:1829)
+/// — the default is `'Latin'`/cp1252, NOT UTF-8 — and the per-tag ValueConvs
+/// for `ICRD` (RIFF.pm:853) and `ISFT` (RIFF.pm:873) are applied.
+fn process_chunks_info(body: &[u8], entries: &mut Vec<RiffEntry>, charset: Charset) {
   let mut p = 0;
   while p + 8 < body.len() {
     let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
@@ -727,25 +790,68 @@ fn process_chunks_info(body: &[u8], entries: &mut Vec<RiffEntry>) {
       return;
     }
     let payload = &body[p..p + len];
-    // RIFF.pm:838 FORMAT => 'string': trim trailing nulls.
-    let val_str = string_trim_nulls(payload);
     let pad = len & 1;
     p += len + pad;
     let Some(name) = info_tag_name(&tag) else {
       continue;
     };
-    // ISFT has a special trim (Casio "CASIO" suffix); apply faithfully.
-    // RIFF.pm:872-873: `s/(\s*\0)+$//; s/(\s*\0)/, /; s/\0+//g;`.
-    // The trailing-null trim is already done. The remaining replacement
-    // only changes things on Casio variants the fixture doesn't exercise,
-    // so we leave the simple trim — this is what bundled emits on
-    // RIFF.avi too (Software => "CanonMVI01" with no nulls).
+    // RIFF.pm:1826-1829 — trim trailing NULs from the raw bytes, THEN decode
+    // through the active charset (cp1252 by default). Per-tag ValueConvs run
+    // AFTER the decode (HandleTag stores the decoded `$val`, then ValueConv).
+    let decoded = charset.decode(trim_trailing_nulls(payload));
+    let value = match &tag {
+      // ICRD DateCreated — ValueConv `$_=$val; s/-/:/g; $_` (RIFF.pm:853).
+      b"ICRD" => decoded.replace('-', ":"),
+      // ISFT Software — ValueConv `s/(\s*\0)+$//; s/(\s*\0)/, /; s/\0+//g`
+      // (RIFF.pm:873): trim trailing space-runs-before-NUL, replace the first
+      // embedded `[\s]*\0` with ", ", drop any remaining NULs. (Casio writes
+      // "CASIO" after the first NUL.)
+      b"ISFT" => isft_value_conv(&decoded),
+      _ => decoded,
+    };
     entries.push(RiffEntry::new(
       "RIFF",
       name,
-      RiffValue::Str(SmolStr::new(&val_str)),
+      RiffValue::Str(SmolStr::new(&value)),
     ));
   }
+}
+
+/// `ISFT` Software ValueConv (RIFF.pm:873): `s/(\s*\0)+$//; s/(\s*\0)/, /;
+/// s/\0+//g`. Faithful transliteration:
+/// 1. strip a trailing run of `(\s*\0)+` (whitespace-then-NUL groups);
+/// 2. replace the FIRST remaining `\s*\0` with `", "`;
+/// 3. delete all remaining NULs.
+fn isft_value_conv(val: &str) -> String {
+  // (1) `s/(\s*\0)+$//` — repeatedly drop a trailing `\s*\0` group (a NUL
+  // preceded by 0+ ASCII-whitespace bytes). `\s` is matched as ASCII
+  // whitespace; UTF-8 continuation bytes (0x80-0xbf) are never ASCII
+  // whitespace, so the byte-level scan is safe on the decoded string.
+  let mut bytes: Vec<u8> = val.as_bytes().to_vec();
+  while bytes.last() == Some(&0) {
+    let mut ws_start = bytes.len() - 1; // index of the trailing NUL
+    while ws_start > 0 && (bytes[ws_start - 1] as char).is_ascii_whitespace() {
+      ws_start -= 1;
+    }
+    bytes.truncate(ws_start);
+  }
+  // (2) `s/(\s*\0)/, /` — replace the FIRST `\s*\0` group with ", ".
+  // Find the first NUL; back up over its leading ASCII whitespace.
+  if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+    let mut ws_start = nul;
+    while ws_start > 0 && (bytes[ws_start - 1] as char).is_ascii_whitespace() {
+      ws_start -= 1;
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.extend_from_slice(&bytes[..ws_start]);
+    out.extend_from_slice(b", ");
+    // (3) `s/\0+//g` on the remainder — copy the rest, dropping NULs.
+    out.extend(bytes[nul + 1..].iter().copied().filter(|&b| b != 0));
+    bytes = out;
+  }
+  // The decode already produced valid UTF-8; the surgery only removes NULs /
+  // splices ASCII ", ", so the bytes stay valid UTF-8.
+  String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Map an INFO chunk FourCC to its emitted tag name (RIFF.pm:835-1010).
@@ -1220,16 +1326,61 @@ fn emit_ismp(payload: &[u8], entries: &mut Vec<RiffEntry>) {
 // §6. Helpers — `ConvertRIFFDate`, byte readers, string trim
 // ===========================================================================
 
-/// Trim trailing NUL bytes from a UTF-8-ish payload and return the resulting
-/// `String`. Faithful to ProcessChunks RIFF.pm:1827
-/// `$val =~ s/\0+$//`. Non-UTF8 bytes are kept as best-effort via
-/// `from_utf8_lossy`.
-fn string_trim_nulls(bytes: &[u8]) -> String {
+/// Trim trailing NUL bytes from a payload, returning the raw byte slice.
+/// Faithful to ProcessChunks RIFF.pm:1827 `$val =~ s/\0+$//`. The CALLER
+/// then decodes through the active charset (see [`Charset::decode`]).
+fn trim_trailing_nulls(bytes: &[u8]) -> &[u8] {
   let mut end = bytes.len();
   while end > 0 && bytes[end - 1] == 0 {
     end -= 1;
   }
-  String::from_utf8_lossy(&bytes[..end]).into_owned()
+  &bytes[..end]
+}
+
+/// Trim trailing NUL bytes from a UTF-8-ish payload and return the resulting
+/// `String`. Faithful to ProcessChunks RIFF.pm:1827
+/// `$val =~ s/\0+$//`. Non-UTF8 bytes are kept as best-effort via
+/// `from_utf8_lossy`. Used for FourCC-style fields (`StreamType`, codec,
+/// `strn`) that bundled reads via `Format => 'string[4]'` — those do NOT pass
+/// through the CSET charset (only `INFO`/`exif` string chunks decoded by
+/// `ProcessChunks` do, RIFF.pm:1825-1829).
+fn string_trim_nulls(bytes: &[u8]) -> String {
+  String::from_utf8_lossy(trim_trailing_nulls(bytes)).into_owned()
+}
+
+/// Active RIFF string charset (RIFF.pm:1782-1790). `ProcessChunks` decodes
+/// `INFO`/`exif` string chunks through `$et->Decode($val, $charset)`.
+///
+/// - **Default** (no `CSET` chunk, no `CharsetRIFF` option): `$charset` is the
+///   NAME `'Latin'` (RIFF.pm:1788) ⇒ cp1252 → UTF-8 decode
+///   ([`crate::charset::decode_latin`]).
+/// - **`CSET` chunk present**: `$charset` is the NUMERIC code page
+///   (`$$self{CodePage}`, RIFF.pm:1786). `Image::ExifTool::Decode` keys its
+///   `%csType` table by NAME, so a numeric code page never matches ⇒ NO
+///   remapping (raw byte passthrough; `ExifTool.pm:6351-6353`). We model this
+///   as [`Charset::Raw`] (verified vs bundled: a `CSET CodePage=1252` file
+///   emits the literal input bytes, not a cp1252-decoded string). The dead
+///   `%code2charset` table (RIFF.pm:67-88) is NEVER referenced in bundled, so
+///   it does NOT translate the number to a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Charset {
+  /// Default `'Latin'` (cp1252) decoding.
+  Latin,
+  /// A `CSET` code page was declared — raw passthrough (`%csType` miss).
+  Raw,
+}
+
+impl Charset {
+  /// Decode raw (already trailing-NUL-trimmed) chunk bytes to a `String` per
+  /// the active charset. `Latin` ⇒ cp1252→UTF-8; `Raw` ⇒ `from_utf8_lossy`
+  /// (the crate's invalid-byte policy; bundled passes the raw bytes through
+  /// and its JSON writer later maps invalid bytes to `?`).
+  fn decode(self, bytes: &[u8]) -> String {
+    match self {
+      Charset::Latin => crate::charset::decode_latin(bytes),
+      Charset::Raw => String::from_utf8_lossy(bytes).into_owned(),
+    }
+  }
 }
 
 /// `Image::ExifTool::RIFF::ConvertRIFFDate` — RIFF.pm:1601-1619.
@@ -1669,28 +1820,263 @@ fn print_conv_f64_value(name: &str, val: f64) -> Option<f64> {
   Some(((val * scale) + 0.5).trunc() / scale)
 }
 
-/// `%audioEncoding` (RIFF.pm:90-336) — partial table covering the bundled
-/// fixtures + common entries. Unknown codes render as `Unknown (0xNN)`
-/// faithful to ExifTool's default Unknown PrintConv handling.
+/// `%audioEncoding` (RIFF.pm:90-335) — the FULL "TwoCC" audio-encoding
+/// PrintConv table, transcribed verbatim (codes + names) from bundled. An
+/// unrecognized code renders as `Unknown (0xNN)`, faithful to ExifTool's
+/// default hash-PrintConv miss handling (verified vs bundled: `0x9999` →
+/// `"Unknown (0x9999)"`). The lookup is a closed `match` over `'static`
+/// literals (no allocation for the matched arm — the caller owns the
+/// `to_string`; the `Unknown` arm is the only formatting path).
 #[cfg(feature = "alloc")]
 fn audio_encoding_label(val: u32) -> String {
-  match val {
-    0x01 => "Microsoft PCM".to_string(),
-    0x02 => "Microsoft ADPCM".to_string(),
-    0x03 => "Microsoft IEEE float".to_string(),
-    0x06 => "Microsoft a-Law".to_string(),
-    0x07 => "Microsoft u-Law".to_string(),
-    0x10 => "OKI-ADPCM".to_string(),
-    0x11 => "Intel IMA/DVI-ADPCM".to_string(),
-    0x31 => "Microsoft GSM610".to_string(),
-    0x50 => "Microsoft MPEG".to_string(),
-    0x55 => "MP3".to_string(),
-    0x161 => "Windows Media Audio V2 V7 V8 V9 / DivX audio (WMA) / Alex AC3 Audio".to_string(),
-    0x162 => "Windows Media Audio Professional V9".to_string(),
-    0x163 => "Windows Media Audio Lossless V9".to_string(),
-    0xff => "AAC".to_string(),
-    other => std::format!("Unknown (0x{other:x})"),
-  }
+  // RIFF.pm:92-334. Every entry below is byte-for-byte the bundled name.
+  let s: &'static str = match val {
+    0x01 => "Microsoft PCM",
+    0x02 => "Microsoft ADPCM",
+    0x03 => "Microsoft IEEE float",
+    0x04 => "Compaq VSELP",
+    0x05 => "IBM CVSD",
+    0x06 => "Microsoft a-Law",
+    0x07 => "Microsoft u-Law",
+    0x08 => "Microsoft DTS",
+    0x09 => "DRM",
+    0x0a => "WMA 9 Speech",
+    0x0b => "Microsoft Windows Media RT Voice",
+    0x10 => "OKI-ADPCM",
+    0x11 => "Intel IMA/DVI-ADPCM",
+    0x12 => "Videologic Mediaspace ADPCM",
+    0x13 => "Sierra ADPCM",
+    0x14 => "Antex G.723 ADPCM",
+    0x15 => "DSP Solutions DIGISTD",
+    0x16 => "DSP Solutions DIGIFIX",
+    0x17 => "Dialoic OKI ADPCM",
+    0x18 => "Media Vision ADPCM",
+    0x19 => "HP CU",
+    0x1a => "HP Dynamic Voice",
+    0x20 => "Yamaha ADPCM",
+    0x21 => "SONARC Speech Compression",
+    0x22 => "DSP Group True Speech",
+    0x23 => "Echo Speech Corp.",
+    0x24 => "Virtual Music Audiofile AF36",
+    0x25 => "Audio Processing Tech.",
+    0x26 => "Virtual Music Audiofile AF10",
+    0x27 => "Aculab Prosody 1612",
+    0x28 => "Merging Tech. LRC",
+    0x30 => "Dolby AC2",
+    0x31 => "Microsoft GSM610",
+    0x32 => "MSN Audio",
+    0x33 => "Antex ADPCME",
+    0x34 => "Control Resources VQLPC",
+    0x35 => "DSP Solutions DIGIREAL",
+    0x36 => "DSP Solutions DIGIADPCM",
+    0x37 => "Control Resources CR10",
+    0x38 => "Natural MicroSystems VBX ADPCM",
+    0x39 => "Crystal Semiconductor IMA ADPCM",
+    0x3a => "Echo Speech ECHOSC3",
+    0x3b => "Rockwell ADPCM",
+    0x3c => "Rockwell DIGITALK",
+    0x3d => "Xebec Multimedia",
+    0x40 => "Antex G.721 ADPCM",
+    0x41 => "Antex G.728 CELP",
+    0x42 => "Microsoft MSG723",
+    0x43 => "IBM AVC ADPCM",
+    0x45 => "ITU-T G.726",
+    0x50 => "Microsoft MPEG",
+    0x51 => "RT23 or PAC",
+    0x52 => "InSoft RT24",
+    0x53 => "InSoft PAC",
+    0x55 => "MP3",
+    0x59 => "Cirrus",
+    0x60 => "Cirrus Logic",
+    0x61 => "ESS Tech. PCM",
+    0x62 => "Voxware Inc.",
+    0x63 => "Canopus ATRAC",
+    0x64 => "APICOM G.726 ADPCM",
+    0x65 => "APICOM G.722 ADPCM",
+    0x66 => "Microsoft DSAT",
+    0x67 => "Microsoft DSAT DISPLAY",
+    0x69 => "Voxware Byte Aligned",
+    0x70 => "Voxware AC8",
+    0x71 => "Voxware AC10",
+    0x72 => "Voxware AC16",
+    0x73 => "Voxware AC20",
+    0x74 => "Voxware MetaVoice",
+    0x75 => "Voxware MetaSound",
+    0x76 => "Voxware RT29HW",
+    0x77 => "Voxware VR12",
+    0x78 => "Voxware VR18",
+    0x79 => "Voxware TQ40",
+    0x7a => "Voxware SC3",
+    0x7b => "Voxware SC3",
+    0x80 => "Soundsoft",
+    0x81 => "Voxware TQ60",
+    0x82 => "Microsoft MSRT24",
+    0x83 => "AT&T G.729A",
+    0x84 => "Motion Pixels MVI MV12",
+    0x85 => "DataFusion G.726",
+    0x86 => "DataFusion GSM610",
+    0x88 => "Iterated Systems Audio",
+    0x89 => "Onlive",
+    0x8a => "Multitude, Inc. FT SX20",
+    0x8b => "Infocom ITS A/S G.721 ADPCM",
+    0x8c => "Convedia G729",
+    0x8d => "Not specified congruency, Inc.",
+    0x91 => "Siemens SBC24",
+    0x92 => "Sonic Foundry Dolby AC3 APDIF",
+    0x93 => "MediaSonic G.723",
+    0x94 => "Aculab Prosody 8kbps",
+    0x97 => "ZyXEL ADPCM",
+    0x98 => "Philips LPCBB",
+    0x99 => "Studer Professional Audio Packed",
+    0xa0 => "Malden PhonyTalk",
+    0xa1 => "Racal Recorder GSM",
+    0xa2 => "Racal Recorder G720.a",
+    0xa3 => "Racal G723.1",
+    0xa4 => "Racal Tetra ACELP",
+    0xb0 => "NEC AAC NEC Corporation",
+    0xff => "AAC",
+    0x100 => "Rhetorex ADPCM",
+    0x101 => "IBM u-Law",
+    0x102 => "IBM a-Law",
+    0x103 => "IBM ADPCM",
+    0x111 => "Vivo G.723",
+    0x112 => "Vivo Siren",
+    0x120 => "Philips Speech Processing CELP",
+    0x121 => "Philips Speech Processing GRUNDIG",
+    0x123 => "Digital G.723",
+    0x125 => "Sanyo LD ADPCM",
+    0x130 => "Sipro Lab ACEPLNET",
+    0x131 => "Sipro Lab ACELP4800",
+    0x132 => "Sipro Lab ACELP8V3",
+    0x133 => "Sipro Lab G.729",
+    0x134 => "Sipro Lab G.729A",
+    0x135 => "Sipro Lab Kelvin",
+    0x136 => "VoiceAge AMR",
+    0x140 => "Dictaphone G.726 ADPCM",
+    0x150 => "Qualcomm PureVoice",
+    0x151 => "Qualcomm HalfRate",
+    0x155 => "Ring Zero Systems TUBGSM",
+    0x160 => "Microsoft Audio1",
+    0x161 => "Windows Media Audio V2 V7 V8 V9 / DivX audio (WMA) / Alex AC3 Audio",
+    0x162 => "Windows Media Audio Professional V9",
+    0x163 => "Windows Media Audio Lossless V9",
+    0x164 => "WMA Pro over S/PDIF",
+    0x170 => "UNISYS NAP ADPCM",
+    0x171 => "UNISYS NAP ULAW",
+    0x172 => "UNISYS NAP ALAW",
+    0x173 => "UNISYS NAP 16K",
+    0x174 => "MM SYCOM ACM SYC008 SyCom Technologies",
+    0x175 => "MM SYCOM ACM SYC701 G726L SyCom Technologies",
+    0x176 => "MM SYCOM ACM SYC701 CELP54 SyCom Technologies",
+    0x177 => "MM SYCOM ACM SYC701 CELP68 SyCom Technologies",
+    0x178 => "Knowledge Adventure ADPCM",
+    0x180 => "Fraunhofer IIS MPEG2AAC",
+    0x190 => "Digital Theater Systems DTS DS",
+    0x200 => "Creative Labs ADPCM",
+    0x202 => "Creative Labs FASTSPEECH8",
+    0x203 => "Creative Labs FASTSPEECH10",
+    0x210 => "UHER ADPCM",
+    0x215 => "Ulead DV ACM",
+    0x216 => "Ulead DV ACM",
+    0x220 => "Quarterdeck Corp.",
+    0x230 => "I-Link VC",
+    0x240 => "Aureal Semiconductor Raw Sport",
+    0x241 => "ESST AC3",
+    0x250 => "Interactive Products HSX",
+    0x251 => "Interactive Products RPELP",
+    0x260 => "Consistent CS2",
+    0x270 => "Sony SCX",
+    0x271 => "Sony SCY",
+    0x272 => "Sony ATRAC3",
+    0x273 => "Sony SPC",
+    0x280 => "TELUM Telum Inc.",
+    0x281 => "TELUMIA Telum Inc.",
+    0x285 => "Norcom Voice Systems ADPCM",
+    0x300 => "Fujitsu FM TOWNS SND",
+    0x301 => "Fujitsu (not specified)",
+    0x302 => "Fujitsu (not specified)",
+    0x303 => "Fujitsu (not specified)",
+    0x304 => "Fujitsu (not specified)",
+    0x305 => "Fujitsu (not specified)",
+    0x306 => "Fujitsu (not specified)",
+    0x307 => "Fujitsu (not specified)",
+    0x308 => "Fujitsu (not specified)",
+    0x350 => "Micronas Semiconductors, Inc. Development",
+    0x351 => "Micronas Semiconductors, Inc. CELP833",
+    0x400 => "Brooktree Digital",
+    0x401 => "Intel Music Coder (IMC)",
+    0x402 => "Ligos Indeo Audio",
+    0x450 => "QDesign Music",
+    0x500 => "On2 VP7 On2 Technologies",
+    0x501 => "On2 VP6 On2 Technologies",
+    0x680 => "AT&T VME VMPCM",
+    0x681 => "AT&T TCP",
+    0x700 => "YMPEG Alpha (dummy for MPEG-2 compressor)",
+    0x8ae => "ClearJump LiteWave (lossless)",
+    0x1000 => "Olivetti GSM",
+    0x1001 => "Olivetti ADPCM",
+    0x1002 => "Olivetti CELP",
+    0x1003 => "Olivetti SBC",
+    0x1004 => "Olivetti OPR",
+    0x1100 => "Lernout & Hauspie",
+    0x1101 => "Lernout & Hauspie CELP codec",
+    0x1102 => "Lernout & Hauspie SBC codec",
+    0x1103 => "Lernout & Hauspie SBC codec",
+    0x1104 => "Lernout & Hauspie SBC codec",
+    0x1400 => "Norris Comm. Inc.",
+    0x1401 => "ISIAudio",
+    0x1500 => "AT&T Soundspace Music Compression",
+    0x181c => "VoxWare RT24 speech codec",
+    0x181e => "Lucent elemedia AX24000P Music codec",
+    0x1971 => "Sonic Foundry LOSSLESS",
+    0x1979 => "Innings Telecom Inc. ADPCM",
+    0x1c07 => "Lucent SX8300P speech codec",
+    0x1c0c => "Lucent SX5363S G.723 compliant codec",
+    0x1f03 => "CUseeMe DigiTalk (ex-Rocwell)",
+    0x1fc4 => "NCT Soft ALF2CD ACM",
+    0x2000 => "FAST Multimedia DVM",
+    0x2001 => "Dolby DTS (Digital Theater System)",
+    0x2002 => "RealAudio 1 / 2 14.4",
+    0x2003 => "RealAudio 1 / 2 28.8",
+    0x2004 => "RealAudio G2 / 8 Cook (low bitrate)",
+    0x2005 => "RealAudio 3 / 4 / 5 Music (DNET)",
+    0x2006 => "RealAudio 10 AAC (RAAC)",
+    0x2007 => "RealAudio 10 AAC+ (RACP)",
+    0x2500 => "Reserved range to 0x2600 Microsoft",
+    0x3313 => "makeAVIS (ffvfw fake AVI sound from AviSynth scripts)",
+    0x4143 => "Divio MPEG-4 AAC audio",
+    0x4201 => "Nokia adaptive multirate",
+    0x4243 => "Divio G726 Divio, Inc.",
+    0x434c => "LEAD Speech",
+    0x564c => "LEAD Vorbis",
+    0x5756 => "WavPack Audio",
+    0x674f => "Ogg Vorbis (mode 1)",
+    0x6750 => "Ogg Vorbis (mode 2)",
+    0x6751 => "Ogg Vorbis (mode 3)",
+    0x676f => "Ogg Vorbis (mode 1+)",
+    0x6770 => "Ogg Vorbis (mode 2+)",
+    0x6771 => "Ogg Vorbis (mode 3+)",
+    0x7000 => "3COM NBX 3Com Corporation",
+    0x706d => "FAAD AAC",
+    0x7a21 => "GSM-AMR (CBR, no SID)",
+    0x7a22 => "GSM-AMR (VBR, including SID)",
+    0xa100 => "Comverse Infosys Ltd. G723 1",
+    0xa101 => "Comverse Infosys Ltd. AVQSBC",
+    0xa102 => "Comverse Infosys Ltd. OLDSBC",
+    0xa103 => "Symbol Technologies G729A",
+    0xa104 => "VoiceAge AMR WB VoiceAge Corporation",
+    0xa105 => "Ingenient Technologies Inc. G726",
+    0xa106 => "ISO/MPEG-4 advanced audio Coding",
+    0xa107 => "Encore Software Ltd G726",
+    0xa109 => "Speex ACM Codec xiph.org",
+    0xdfac => "DebugMode SonicFoundry Vegas FrameServer ACM Codec",
+    0xe708 => "Unknown -",
+    0xf1ac => "Free Lossless Audio Codec FLAC",
+    0xfffe => "Extensible",
+    0xffff => "Development",
+    other => return std::format!("Unknown (0x{other:x})"),
+  };
+  s.to_string()
 }
 
 /// `%AVIHeader` MaxDataRate PrintConv (RIFF.pm:1090-1098). With default
@@ -2185,6 +2571,162 @@ mod tests {
       .collect();
     assert!(names.contains(&"Title".to_string())); // INAM
     assert!(names.contains(&"Software".to_string())); // ISFT
+  }
+
+  #[test]
+  fn audio_encoding_full_table_spot_checks() {
+    // Codes OUTSIDE the previous partial table (RIFF.pm:90-335).
+    assert_eq!(audio_encoding_label(0xfffe), "Extensible"); // :333
+    assert_eq!(audio_encoding_label(0xffff), "Development"); // :334
+    assert_eq!(audio_encoding_label(0x2000), "FAST Multimedia DVM"); // :295
+    assert_eq!(audio_encoding_label(0x5756), "WavPack Audio"); // :310
+    assert_eq!(
+      audio_encoding_label(0xf1ac),
+      "Free Lossless Audio Codec FLAC"
+    ); // :332
+    assert_eq!(audio_encoding_label(0x0a), "WMA 9 Speech"); // :101
+    // Still-correct partial-table entries.
+    assert_eq!(audio_encoding_label(0x01), "Microsoft PCM");
+    assert_eq!(audio_encoding_label(0x55), "MP3");
+    // Unknown code → default hash-PrintConv miss rendering.
+    assert_eq!(audio_encoding_label(0x9999), "Unknown (0x9999)");
+  }
+
+  #[test]
+  fn isft_value_conv_casio_embedded_null() {
+    // RIFF.pm:873 — Casio "EXILIM\0CASIO" → "EXILIM, CASIO".
+    assert_eq!(isft_value_conv("EXILIM\u{0}CASIO"), "EXILIM, CASIO");
+    // No NULs → unchanged.
+    assert_eq!(isft_value_conv("CanonMVI01"), "CanonMVI01");
+    // Trailing `\s*\0` run stripped (`s/(\s*\0)+$//`).
+    assert_eq!(isft_value_conv("Foo \u{0} \u{0}"), "Foo");
+    // First embedded `\s*\0` → ", " (leading whitespace absorbed), remaining
+    // NULs dropped (`s/\0+//g`).
+    assert_eq!(isft_value_conv("A \u{0}B\u{0}C"), "A, BC");
+  }
+
+  #[test]
+  fn info_latin_cp1252_decode() {
+    // RIFF.pm:1788/1829 — default charset is 'Latin' (cp1252). An INFO IART
+    // with high bytes 0xe9/0x80 decodes to "Café €", NOT UTF-8-lossy.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    let iart = b"Caf\xe9 \x80\x00";
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IART");
+    info.extend_from_slice(&(iart.len() as u32).to_le_bytes());
+    info.extend_from_slice(iart);
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let artist = meta
+      .entries()
+      .iter()
+      .find(|e| e.name() == "Artist")
+      .and_then(|e| match e.value_ref() {
+        RiffValue::Str(s) => Some(s.as_str()),
+        _ => None,
+      })
+      .expect("Artist");
+    assert_eq!(artist, "Caf\u{00e9} \u{20ac}");
+  }
+
+  #[test]
+  fn cset_chunk_switches_to_raw_passthrough() {
+    // RIFF.pm:533/1786 — a CSET chunk sets a NUMERIC CodePage; `%csType` is
+    // keyed by NAME, so the lookup misses ⇒ raw passthrough (no cp1252 remap).
+    // A 0x80 byte then stays 0x80 (from_utf8_lossy → U+FFFD), NOT €.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    // CSET: int16u CodePage=1252, CountryCode, LanguageCode, Dialect.
+    buf.extend_from_slice(b"CSET");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&1252u16.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 6]);
+    let iart = b"x\x80\x00"; // odd len 3 → needs a pad byte
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IART");
+    info.extend_from_slice(&(iart.len() as u32).to_le_bytes());
+    info.extend_from_slice(iart);
+    info.push(0); // pad (odd payload)
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let artist = meta
+      .entries()
+      .iter()
+      .find(|e| e.name() == "Artist")
+      .and_then(|e| match e.value_ref() {
+        RiffValue::Str(s) => Some(s.as_str()),
+        _ => None,
+      })
+      .expect("Artist");
+    // Raw 0x80 is invalid UTF-8 → U+FFFD (NOT the cp1252 € it would be under
+    // the default 'Latin' charset).
+    assert_eq!(artist, "x\u{FFFD}");
+  }
+
+  #[test]
+  fn truncated_known_chunk_skipped_and_marks_corrupted() {
+    // RIFF.pm:2150/2216 — a `fmt ` declaring 16 bytes but with only 12 present
+    // is NOT dispatched (no Encoding/etc. tags) and sets the corruption flag.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // declares 16
+    buf.extend_from_slice(&1u16.to_le_bytes()); // Encoding (only 12 bytes follow)
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&44100u32.to_le_bytes());
+    buf.extend_from_slice(&176_400u32.to_le_bytes());
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    assert!(meta.is_corrupted(), "truncated fmt must mark corrupted");
+    assert!(
+      meta.entries().iter().all(|e| e.name() != "Encoding"),
+      "truncated fmt must NOT emit partial-payload tags"
+    );
+  }
+
+  #[test]
+  fn full_chunk_at_eof_not_marked_corrupted() {
+    // A `fmt ` whose declared length is exactly satisfied at EOF must parse
+    // (no false-positive corruption flag).
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // Encoding=PCM
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&8000u32.to_le_bytes());
+    buf.extend_from_slice(&8000u32.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 2]);
+    buf.extend_from_slice(&8u16.to_le_bytes());
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    assert!(!meta.is_corrupted());
+    assert!(meta.entries().iter().any(|e| e.name() == "Encoding"));
   }
 
   #[test]

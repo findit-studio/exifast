@@ -1129,13 +1129,21 @@ impl AnyMeta<'_> {
         }
         Ok(())
       }
-      // RIFF emits NO `$et->Warn`/`$et->Error` for the ported AVI sub-tables:
-      // the RIFF.pm/ProcessChunks warning paths (`Bad ... data`, truncated
-      // chunks) are not modeled in the typed `RiffMeta` (every bad input is
-      // `Ok(None)` / a silently-skipped chunk), so `RiffMeta` carries no
-      // warning channel. Nothing to drain.
+      // RIFF: the only ported `$et->Warn` is the terminal corruption notice.
+      // A declared-length chunk that runs past EOF (truncated) is skipped
+      // WITHOUT dispatching its emitter (`RiffMeta::is_corrupted`); bundled
+      // sets `$err` and warns once at the end (RIFF.pm:2216 `$err and
+      // $et->Warn('Error reading RIFF file (corrupted?)')`). The other
+      // ProcessChunks warning paths (`Bad ... data`) abort the sub-walk
+      // silently (no tags), matching bundled's `return 0` with no surfaced
+      // warning in the default JSON output.
       #[cfg(feature = "riff")]
-      AnyMeta::Riff(_) => Ok(()),
+      AnyMeta::Riff(m) => {
+        if m.is_corrupted() {
+          out.write_warning("Error reading RIFF file (corrupted?)")?;
+        }
+        Ok(())
+      }
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and drains nothing.

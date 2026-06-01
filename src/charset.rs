@@ -190,6 +190,81 @@ pub fn decode_macroman(bytes: &[u8]) -> String {
   out
 }
 
+/// `Latin` (cp1252) → Unicode high-byte mapping
+/// (`%Image::ExifTool::Charset::Latin`, `lib/Image/ExifTool/Charset/Latin.pm`).
+/// `Latin` is ExifTool's DEFAULT charset for RIFF `INFO`/`exif` string
+/// decoding (RIFF.pm:1788 `$charset eq '0'` ⇒ `'Latin'`); it is **cp1252**,
+/// NOT ISO-8859-1 — the two differ in the 0x80..=0x9F range (cp1252 maps the
+/// C1 region to printable glyphs like € and the smart quotes). The Perl table
+/// is sparse — "The table omits 1-byte characters with the same values as
+/// Unicode" (Latin.pm:9) — so every byte NOT listed below (incl. 0x81, 0x8d,
+/// 0x8f, 0x90, 0x9d in the C1 hole, and all of 0xa0..=0xff) is identity-mapped
+/// to its own codepoint (which for 0xa0..=0xff coincides with ISO-8859-1).
+const LATIN_HIGH: [u32; 256] = {
+  let mut t: [u32; 256] = [0; 256];
+  // Identity for every byte (low ASCII + the unlisted high bytes that map to
+  // their own codepoint per Latin.pm:9). The explicit cp1252 C1 glyphs below
+  // then OVERRIDE the 0x80..=0x9f slots that ARE listed.
+  let mut i = 0u32;
+  while i < 256 {
+    t[i as usize] = i;
+    i += 1;
+  }
+  // Explicit cp1252 mappings — verbatim from Latin.pm:14-20.
+  t[0x80] = 0x20ac;
+  t[0x82] = 0x201a;
+  t[0x83] = 0x0192;
+  t[0x84] = 0x201e;
+  t[0x85] = 0x2026;
+  t[0x86] = 0x2020;
+  t[0x87] = 0x2021;
+  t[0x88] = 0x02c6;
+  t[0x89] = 0x2030;
+  t[0x8a] = 0x0160;
+  t[0x8b] = 0x2039;
+  t[0x8c] = 0x0152;
+  t[0x8e] = 0x017d;
+  t[0x91] = 0x2018;
+  t[0x92] = 0x2019;
+  t[0x93] = 0x201c;
+  t[0x94] = 0x201d;
+  t[0x95] = 0x2022;
+  t[0x96] = 0x2013;
+  t[0x97] = 0x2014;
+  t[0x98] = 0x02dc;
+  t[0x99] = 0x2122;
+  t[0x9a] = 0x0161;
+  t[0x9b] = 0x203a;
+  t[0x9c] = 0x0153;
+  t[0x9e] = 0x017e;
+  t[0x9f] = 0x0178;
+  t
+};
+
+/// Faithful `Decode($val, "Latin")` (cp1252 → UTF-8). Each input byte maps to
+/// its Unicode codepoint via [`LATIN_HIGH`] (low ASCII + most high bytes are
+/// identity; the cp1252 C1 glyphs are remapped), then the codepoints are
+/// UTF-8-encoded (Perl `Decompose`/`Recompose` round-trip). Every codepoint in
+/// the static table is valid Unicode, so this is panic-free.
+///
+/// Used by the RIFF walker for `INFO`/`exif` string chunks when the active
+/// charset is the default `Latin` (RIFF.pm:1782-1790, 1829).
+#[must_use]
+pub fn decode_latin(bytes: &[u8]) -> String {
+  let mut out = String::with_capacity(bytes.len());
+  for &b in bytes {
+    let cp = if b < 0x80 {
+      u32::from(b)
+    } else {
+      LATIN_HIGH[b as usize]
+    };
+    // Defensive: every LATIN_HIGH codepoint is valid Unicode; an impossible
+    // mismatch falls back to U+FFFD, preserving the panic-free guarantee.
+    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+  }
+  out
+}
+
 // `fix_utf8` is shared in `crate::convert::fix_utf8` (the canonical port of
 // `Image::ExifTool::XMP::FixUTF8`, faithful to XMP.pm:2943-2974). Callers
 // inside this crate use `crate::convert::fix_utf8` directly so the AIFF and
@@ -240,4 +315,31 @@ mod tests {
   }
 
   // `fix_utf8` tests live in `crate::convert::tests` (the canonical port).
+
+  #[test]
+  fn latin_ascii_passes_through_identity() {
+    assert_eq!(decode_latin(b""), "");
+    assert_eq!(decode_latin(b"CanonMVI01"), "CanonMVI01");
+  }
+
+  #[test]
+  fn latin_cp1252_c1_glyphs() {
+    // cp1252 differs from ISO-8859-1 here: Latin.pm:14 `0x80 => 0x20ac` (€).
+    assert_eq!(decode_latin(&[0x80]), "\u{20ac}"); // EURO SIGN
+    assert_eq!(decode_latin(&[0x99]), "\u{2122}"); // TRADE MARK SIGN
+    assert_eq!(decode_latin(&[0x92]), "\u{2019}"); // RIGHT SINGLE QUOTE
+    // 0xe9 is identity (cp1252 == ISO-8859-1 here): é.
+    assert_eq!(decode_latin(&[0xe9]), "\u{00e9}");
+    // "Café €" — the exact bundled-oracle case (test_info_latin.wav).
+    assert_eq!(decode_latin(b"Caf\xe9 \x80"), "Caf\u{00e9} \u{20ac}");
+  }
+
+  #[test]
+  fn latin_unlisted_c1_holes_are_identity() {
+    // cp1252 leaves 0x81/0x8d/0x8f/0x90/0x9d undefined; Latin.pm omits them,
+    // so they identity-map (matching ExifTool, which passes them through).
+    assert_eq!(decode_latin(&[0x81]), "\u{0081}");
+    assert_eq!(decode_latin(&[0x8d]), "\u{008d}");
+    assert_eq!(decode_latin(&[0x9d]), "\u{009d}");
+  }
 }

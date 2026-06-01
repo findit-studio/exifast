@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "RIFF_wav_extensible.wav",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WAV",
+  "File:FileTypeExtension": "wav",
+  "File:MIMEType": "audio/x-wav",
+  "RIFF:Encoding": "Extensible",
+  "RIFF:NumChannels": 2,
+  "RIFF:SampleRate": 44100,
+  "RIFF:AvgBytesPerSec": 176400,
+  "RIFF:BitsPerSample": 16
+}]

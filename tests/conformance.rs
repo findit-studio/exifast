@@ -296,6 +296,63 @@ fn riff_avi_conformance() {
 }
 
 #[test]
+fn riff_wav_extensible_encoding_conformance() {
+  // Finding 1 (full `%audioEncoding`, RIFF.pm:90-335). A crafted WAV whose
+  // `fmt ` Encoding is `0xfffe` = `WAVE_FORMAT_EXTENSIBLE` (RIFF.pm:333) —
+  // a code OUTSIDE the previous partial table. PrintConv ⇒ "Extensible";
+  // `-n` ⇒ the raw `1`-style int (here `65534`). Oracle-verified.
+  check(
+    "RIFF_wav_extensible.wav",
+    "RIFF_wav_extensible.wav.json",
+    true,
+  );
+  check(
+    "RIFF_wav_extensible.wav",
+    "RIFF_wav_extensible.wav.n.json",
+    false,
+  );
+}
+
+#[test]
+fn riff_info_latin1_charset_conformance() {
+  // Finding 2 (CSET/charset). A WAV with `LIST_INFO` `IART` carrying cp1252
+  // high bytes (`0xe9`→é, `0x80`→€). The DEFAULT RIFF charset is `'Latin'`
+  // (cp1252), NOT UTF-8 (RIFF.pm:1782-1790, 1829), so bundled decodes the
+  // Artist to "Café €" — the previous UTF-8-lossy path would have produced
+  // U+FFFD. Oracle-verified.
+  check("RIFF_info_latin1.wav", "RIFF_info_latin1.wav.json", true);
+  check("RIFF_info_latin1.wav", "RIFF_info_latin1.wav.n.json", false);
+}
+
+#[test]
+fn riff_info_casio_valueconv_conformance() {
+  // Finding 2 (INFO ValueConvs). `ISFT` "EXILIM\0CASIO" → "EXILIM, CASIO"
+  // (the Casio embedded-NUL ValueConv, RIFF.pm:873); `ICRD` "2003-03-10" →
+  // "2003:03:10" (the hyphen→colon date ValueConv, RIFF.pm:853).
+  // Oracle-verified.
+  check("RIFF_info_casio.wav", "RIFF_info_casio.wav.json", true);
+  check("RIFF_info_casio.wav", "RIFF_info_casio.wav.n.json", false);
+}
+
+#[test]
+fn riff_truncated_fmt_conformance() {
+  // Finding 4 (truncated-chunk guard). A WAV whose `fmt ` chunk declares 16
+  // payload bytes but only 12 are present (runs past EOF). Bundled does NOT
+  // dispatch the partial chunk (no `RIFF:Encoding`/etc.) and warns once
+  // "Error reading RIFF file (corrupted?)" (RIFF.pm:2150/2216). Oracle-verified.
+  check(
+    "RIFF_truncated_fmt.wav",
+    "RIFF_truncated_fmt.wav.json",
+    true,
+  );
+  check(
+    "RIFF_truncated_fmt.wav",
+    "RIFF_truncated_fmt.wav.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

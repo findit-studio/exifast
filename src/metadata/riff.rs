@@ -46,6 +46,8 @@ pub fn from_riff(riff: &RiffMeta<'_>) -> MediaMetadata {
   // Walk the typed entries to fill the domain layer.
   let mut frame_rate: Option<f64> = None;
   let mut frame_count: Option<u32> = None;
+  let mut video_frame_rate: Option<f64> = None;
+  let mut video_frame_count: Option<u32> = None;
   for entry in riff.entries() {
     match (entry.group(), entry.name(), entry.value_ref()) {
       ("RIFF", "ImageWidth", &RiffValue::U32(w)) => {
@@ -56,6 +58,8 @@ pub fn from_riff(riff: &RiffMeta<'_>) -> MediaMetadata {
       }
       ("RIFF", "FrameRate", &RiffValue::F64(r)) => frame_rate = Some(r),
       ("RIFF", "FrameCount", &RiffValue::U32(c)) => frame_count = Some(c),
+      ("RIFF", "VideoFrameRate", &RiffValue::F64(r)) => video_frame_rate = Some(r),
+      ("RIFF", "VideoFrameCount", &RiffValue::U32(c)) => video_frame_count = Some(c),
       ("RIFF", "DateTimeOriginal", RiffValue::Str(s)) => {
         out.media_mut().update_created(Some(s.as_str().to_string()));
       }
@@ -72,20 +76,42 @@ pub fn from_riff(riff: &RiffMeta<'_>) -> MediaMetadata {
     }
   }
 
-  // Duration projection: frames / frame_rate seconds. ExifTool computes this
-  // through the Composite engine (RIFF.pm:1645-1693 CalcDuration); we
-  // reproduce the simple `FrameCount/FrameRate` arithmetic at projection
-  // time. The Composite synthesis with multi-stream fallback is deferred —
-  // see exifast-phase2-forward-items.md.
+  // Duration projection — faithful port of the Composite `Duration` /
+  // `CalcDuration` decision logic (RIFF.pm:1548-1560, 1645-1693):
+  //   `$dur1 = FrameCount / FrameRate` (Require'd: RIFF:FrameRate +
+  //   RIFF:FrameCount). When BOTH VideoFrameRate and VideoFrameCount are
+  //   present (Desire'd), `$dur2 = VideoFrameCount / VideoFrameRate` and
+  //   `$rat = $dur1 / $dur2`; if `1.9 < $rat < 3.1` the AVI-header duration
+  //   is 2-3x too long (multi-track FrameCount, e.g. FujiFilm REAL 3D), so
+  //   `$dur1 = $dur2` — switch to the video-stream value (RIFF.pm:1652-1663).
+  //
+  // The concatenated-RIFF accumulation (summing `$totalDuration` over
+  // `$$et{DOC_COUNT}` sub-documents, RIFF.pm:1665-1690) is OMITTED: this port
+  // is single-document — the mid-stream `RIFF` re-trigger does not increment
+  // `DOC_NUM` and no per-sub-document tag values are retained, so the extra
+  // terms cannot be represented. A missing-extra-term duration is faithful
+  // for the common single-segment AVI (which is `DOC_COUNT == 0` ⇒ the loop
+  // runs once anyway); a concatenated AVI would under-report (documented gap,
+  // exifast-phase2-forward-items.md), which is preferable to a wrong sum.
   if let (Some(fr), Some(fc)) = (frame_rate, frame_count)
     && fr > 0.0
-    && fc > 0
   {
-    let secs = fc as f64 / fr;
-    if secs.is_finite() && secs >= 0.0 {
+    let mut dur1 = fc as f64 / fr;
+    if let (Some(vfr), Some(vfc)) = (video_frame_rate, video_frame_count)
+      && vfr > 0.0
+    {
+      let dur2 = vfc as f64 / vfr;
+      if dur2 > 0.0 {
+        let rat = dur1 / dur2;
+        if rat > 1.9 && rat < 3.1 {
+          dur1 = dur2;
+        }
+      }
+    }
+    if dur1.is_finite() && dur1 >= 0.0 {
       out
         .media_mut()
-        .update_duration(Some(Duration::from_secs_f64(secs)));
+        .update_duration(Some(Duration::from_secs_f64(dur1)));
     }
   }
 
@@ -213,6 +239,93 @@ mod tests {
     let projected = MediaMetadata::from_riff(&meta);
     let cam = projected.camera().expect("camera");
     assert_eq!(cam.software(), Some("Acme"));
+  }
+
+  /// Build a synthetic AVI whose avih FrameCount is `header_fc` and whose
+  /// single `vids` stream has VideoFrameCount `vid_fc`. Both use the same
+  /// frame rate (avih us-per-frame `us` ⇒ `1e6/us` fps; strh rate `1/vid_den`
+  /// ⇒ `vid_den` fps), so the duration ratio is `header_fc / vid_fc`.
+  fn avi_with_video_stream(us: u32, header_fc: u32, vid_den: u32, vid_fc: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"AVI ");
+    buf.extend_from_slice(b"LIST");
+    let hdrl_size_off = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    let hdrl_start = buf.len();
+    buf.extend_from_slice(b"hdrl");
+    // avih (40 bytes).
+    buf.extend_from_slice(b"avih");
+    buf.extend_from_slice(&40u32.to_le_bytes());
+    buf.extend_from_slice(&us.to_le_bytes()); // 0: us per frame
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 1
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 2
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 3
+    buf.extend_from_slice(&header_fc.to_le_bytes()); // 4: FrameCount
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 5
+    buf.extend_from_slice(&1u32.to_le_bytes()); // 6: StreamCount
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 7
+    buf.extend_from_slice(&320u32.to_le_bytes()); // 8: ImageWidth
+    buf.extend_from_slice(&240u32.to_le_bytes()); // 9: ImageHeight
+    // LIST strl (vids) → strh (48 bytes).
+    buf.extend_from_slice(b"LIST");
+    let strl_size_off = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    let strl_start = buf.len();
+    buf.extend_from_slice(b"strl");
+    buf.extend_from_slice(b"strh");
+    buf.extend_from_slice(&48u32.to_le_bytes());
+    buf.extend_from_slice(b"vids"); // 0
+    buf.extend_from_slice(b"mjpg"); // 1
+    buf.extend_from_slice(&[0u8; 12]); // 2/3/4
+    buf.extend_from_slice(&1u32.to_le_bytes()); // 5 rate num (byte 20)
+    buf.extend_from_slice(&vid_den.to_le_bytes()); // 5 rate den (byte 24)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 7 Start (byte 28)
+    buf.extend_from_slice(&vid_fc.to_le_bytes()); // 8 VideoFrameCount (byte 32)
+    buf.extend_from_slice(&[0u8; 12]); // 9/10/11 (bytes 36..48)
+    let strl_size = (buf.len() - strl_start) as u32;
+    buf[strl_size_off..strl_size_off + 4].copy_from_slice(&strl_size.to_le_bytes());
+    let hdrl_size = (buf.len() - hdrl_start) as u32;
+    buf[hdrl_size_off..hdrl_size_off + 4].copy_from_slice(&hdrl_size.to_le_bytes());
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+    buf
+  }
+
+  #[test]
+  fn duration_uses_video_stream_when_header_2_to_3x_too_long() {
+    // FujiFilm-REAL-3D-style: avih FrameCount = 300 @25fps = 12s, but the
+    // vids stream is 100 @25fps = 4s; ratio 3.0 ∈ (1.9, 3.1) ⇒ use the video
+    // stream (RIFF.pm:1660-1663). Oracle: bundled Composite:Duration = 4.
+    let bytes = avi_with_video_stream(40_000, 300, 25, 100);
+    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let dur = MediaMetadata::from_riff(&meta)
+      .media()
+      .duration()
+      .expect("duration");
+    assert!(
+      (dur.as_secs_f64() - 4.0).abs() < 0.05,
+      "expected ~4s (video-stream fallback), got {}",
+      dur.as_secs_f64()
+    );
+  }
+
+  #[test]
+  fn duration_keeps_header_when_ratio_outside_window() {
+    // Ratio 1.0 (header == video): NOT in (1.9, 3.1) ⇒ keep the avih
+    // FrameCount/FrameRate duration. 100 @25fps = 4s.
+    let bytes = avi_with_video_stream(40_000, 100, 25, 100);
+    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let dur = MediaMetadata::from_riff(&meta)
+      .media()
+      .duration()
+      .expect("duration");
+    assert!(
+      (dur.as_secs_f64() - 4.0).abs() < 0.05,
+      "expected ~4s (header kept), got {}",
+      dur.as_secs_f64()
+    );
   }
 
   #[test]
