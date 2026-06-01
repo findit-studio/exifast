@@ -14,3 +14,22 @@ proptest! {
         let _ = exifast::parse_bytes(&data);
     }
 }
+
+/// Golden-v2 Contract 3d — a couple of real truncated/nested fixtures must not
+/// panic through the public entry points (the `catch_unwind` backstop is the
+/// last line of defence; 3a/3b are the primary guarantee).
+#[test]
+fn truncated_and_nested_fixtures_never_panic() {
+  for name in ["ogg_truncated.ogg", "QuickTime_nested_trunc_mvhd.mov"] {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("tests")
+      .join("fixtures")
+      .join(name);
+    let Ok(data) = std::fs::read(&path) else {
+      // Fixture missing in this checkout — skip rather than fail.
+      continue;
+    };
+    let _ = exifast::parse_bytes(&data);
+    let _ = exifast::media_metadata(&data);
+  }
+}

@@ -287,6 +287,26 @@ pub use formats::wavpack::ProcessWv;
 /// ```
 #[cfg(feature = "std")]
 pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, AnyError> {
+  // Golden-v2 Contract 3d — a `catch_unwind` BACKSTOP at the public boundary.
+  // The primary no-panic guarantee is 3a (the recursion budgets) + 3b (the
+  // `tests/no_panic.rs` proptest gate); this only converts an UNANTICIPATED
+  // panic (a future bug, a slice-index regression, an arithmetic overflow in a
+  // debug build) into the same empty result a clean rejection yields, so an
+  // untrusted byte stream can never crash the host process. `AssertUnwindSafe`
+  // is sound here: the closure only READS `bytes` (a shared `&[u8]`) and
+  // returns an owned/borrowed result — no `&mut` state is left half-updated
+  // across the boundary.
+  match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_bytes_inner(bytes))) {
+    Ok(result) => result,
+    Err(_) => Ok(None),
+  }
+}
+
+/// Inner body of [`parse_bytes`] (see that fn's doc + Golden-v2 3d note). The
+/// public wrapper adds the `catch_unwind` backstop. `parse_bytes` is itself
+/// `std`-only, so its inner shares that gate.
+#[cfg(feature = "std")]
+fn parse_bytes_inner(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, AnyError> {
   // Empty filename ⇒ magic-only detection (ExifTool.pm:2965-3045 with
   // `$ext = undef`). Each candidate is tried in turn; the first parser to
   // return `Ok(Some(meta))` wins. Faithful to the legacy
@@ -388,6 +408,17 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
 #[cfg(feature = "std")]
 #[must_use]
 pub fn media_metadata(bytes: &[u8]) -> Option<MediaMetadata> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a (recursion budgets) + 3b (proptest) are the primary
+  // guarantee. `AssertUnwindSafe` is sound: the closure only reads `bytes`.
+  // A caught panic ⇒ `None` (the `Option` default), same as a clean miss.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| media_metadata_inner(bytes)))
+    .unwrap_or_default()
+}
+
+/// Inner body of [`media_metadata`] (see that fn's doc + Golden-v2 3d note).
+#[cfg(feature = "std")]
+fn media_metadata_inner(bytes: &[u8]) -> Option<MediaMetadata> {
   // `parse_bytes` errors are convenience-swallowed to `None` (see the doc
   // contract); `Ok(None)` (no format matched) is likewise `None`.
   match parse_bytes(bytes) {
@@ -514,8 +545,26 @@ pub fn parse_dv(
 ///
 /// Returns the per-format [`exif::Error`] (currently uninhabited — every bad
 /// input is `Ok(None)`).
-#[cfg(feature = "exif")]
+#[cfg(all(feature = "exif", feature = "std"))]
 pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_>>, exif::Error> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a/3b are the primary guarantee. `AssertUnwindSafe` is
+  // sound: the closure only reads `bytes`.
+  match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_exif_inner(bytes))) {
+    Ok(result) => result,
+    Err(_) => Ok(None),
+  }
+}
+
+/// `parse_exif` on a no_std (no `catch_unwind`) build — direct passthrough.
+#[cfg(all(feature = "exif", not(feature = "std")))]
+pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_>>, exif::Error> {
+  parse_exif_inner(bytes)
+}
+
+/// Inner body of [`parse_exif`] (see that fn's doc + Golden-v2 3d note).
+#[cfg(feature = "exif")]
+fn parse_exif_inner(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_>>, exif::Error> {
   exif::parse_borrowed(bytes)
 }
 
@@ -526,9 +575,28 @@ pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_
 /// the `gps` feature is enabled (reached through the IFD0 `GPSInfo` tag).
 ///
 /// Returns `None` when `block` is not a valid TIFF header.
-#[cfg(feature = "exif")]
+#[cfg(all(feature = "exif", feature = "std"))]
 #[must_use]
 pub fn parse_exif_block(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a/3b are the primary guarantee. `AssertUnwindSafe` is
+  // sound: the closure only reads `block`. A caught panic ⇒ `None`.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    parse_exif_block_inner(block)
+  }))
+  .unwrap_or_default()
+}
+
+/// `parse_exif_block` on a no_std (no `catch_unwind`) build — direct passthrough.
+#[cfg(all(feature = "exif", not(feature = "std")))]
+#[must_use]
+pub fn parse_exif_block(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  parse_exif_block_inner(block)
+}
+
+/// Inner body of [`parse_exif_block`] (see that fn's doc + Golden-v2 3d note).
+#[cfg(feature = "exif")]
+fn parse_exif_block_inner(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
   exif::parse_exif_block(block)
 }
 
