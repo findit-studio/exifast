@@ -112,20 +112,37 @@ const FIXTURES: &[&str] = &[
   "Real.ra",
 ];
 
-/// Measure + report (and, once pinned, assert) the allocation count of a full
-/// `media_metadata` extraction per fixture. `media_metadata` runs the full
-/// detect → parse → project pipeline (the `-j`/`-n`-independent typed path), so
-/// it exercises the MakerNote single-mode decode + the `collect_emitted` /
-/// `run_emission` move-not-clone path. The `parse_bytes` count is reported too
-/// (project() adds the domain fold on top).
+/// Measure + report + assert the per-fixture allocation counts for both the
+/// `media_metadata`/`parse_bytes` typed path AND the `extract_info` `-j`/`-n`
+/// JSON render path.
+///
+/// **One** `#[test]` (not two) ON PURPOSE: the allocation counter is a
+/// PROCESS-GLOBAL `AtomicUsize`, and libtest runs a binary's tests on multiple
+/// threads, so a SECOND measuring test would increment the shared counter
+/// DURING this one's measurement window (cross-contamination — observed as
+/// inflated, non-deterministic counts when both ran in parallel). With a single
+/// test the measured regions are strictly sequential on one thread, so the
+/// counts are deterministic regardless of `--test-threads`. (This binary has no
+/// other test, and the criterion bench is a separate binary with its own
+/// allocator/counter.)
+///
+/// `media_metadata` runs detect → parse → project (the mode-independent typed
+/// path: P0 single-mode MakerNote decode + P2/P3 move-not-clone). `extract_info`
+/// runs the JSON render path (P1 O(1) dedup + P4 direct-serialize + P0). Each
+/// `extract_info` call renders in exactly ONE mode, so a MakerNote fixture's
+/// `-j` run decodes ONLY the PrintConv vendor body (and `-n` only ValueConv).
 #[test]
-fn alloc_budget_media_metadata() {
-  // Warm-up: trigger any one-time lazy static init OUTSIDE the measured region
+fn alloc_budget() {
+  use exifast::parser::extract_info;
+
+  // Warm-up: trigger any one-time lazy static init OUTSIDE the measured regions
   // so it isn't attributed to the first fixture.
   for name in FIXTURES {
     let bytes = fixture_bytes(name);
     let _ = exifast::media_metadata(&bytes);
     let _ = exifast::parse_bytes(&bytes);
+    let _ = extract_info(name, &bytes, true);
+    let _ = extract_info(name, &bytes, false);
   }
 
   println!("\n=== alloc_budget: media_metadata / parse_bytes ===");
@@ -139,9 +156,9 @@ fn alloc_budget_media_metadata() {
     assert!(mm, "{name}: media_metadata accepted the fixture");
     println!("  {name:34}  parse_bytes={pb_allocs:>6}  media_metadata={mm_allocs:>6}");
 
-    // PINNED REGRESSION BUDGETS (Golden-v2 C4). Set at the IMPROVED Phase-A.3
-    // counts with headroom — see the per-fixture comments. A future change that
-    // reintroduces a redundant decode / clone / O(n²) key build trips these.
+    // PINNED REGRESSION BUDGET (Golden-v2 C4) — the IMPROVED Phase-A.3 count
+    // plus headroom. A regression past it means a redundant decode / clone /
+    // per-tag key build crept back in.
     let budget = media_metadata_budget(name);
     assert!(
       mm_allocs <= budget,
@@ -150,24 +167,6 @@ fn alloc_budget_media_metadata() {
        per-tag key build crept back in). If this is an intentional new \
        allocation, re-baseline the budget with a justifying comment."
     );
-  }
-}
-
-/// Also exercise the `-j` (PrintConv) and `-n` (ValueConv) JSON render paths via
-/// `extract_info`, since the MakerNote single-mode decode + the `TagMap` O(1)
-/// dedup + the direct-serialize P4 win all live on the JSON path. Each
-/// `extract_info` call renders in exactly ONE mode, so a MakerNote fixture's
-/// `-j` run should decode ONLY the PrintConv vendor body (and `-n` only the
-/// ValueConv body), not both.
-#[test]
-fn alloc_budget_extract_info() {
-  use exifast::parser::extract_info;
-
-  // Warm-up.
-  for name in FIXTURES {
-    let bytes = fixture_bytes(name);
-    let _ = extract_info(name, &bytes, true);
-    let _ = extract_info(name, &bytes, false);
   }
 
   println!("\n=== alloc_budget: extract_info (-j / -n) ===");
@@ -197,19 +196,38 @@ fn alloc_budget_extract_info() {
 // (a reintroduced clone / double decode / O(n²) key build) does.
 // ---------------------------------------------------------------------------
 
-/// `media_metadata` per-fixture allocation budget.
+/// `media_metadata` per-fixture allocation budget. PINNED at the improved
+/// Phase-A.3 count + ~6-10% headroom (the comment shows the measured count). A
+/// regression past these means a redundant decode / clone / per-tag key build
+/// crept back in; an intentional new allocation should re-baseline WITH a
+/// justifying comment, not just bump the number.
 fn media_metadata_budget(name: &str) -> usize {
   match name {
-    // PLACEHOLDER budgets (Item 0 baseline run): set generously so the harness
-    // PRINTS without asserting-failing on the pre-optimization baseline. These
-    // are TIGHTENED to the improved counts in the final "pin" commit.
+    // Canon dominates (the MakerNote vendor decode). P0 (single-mode decode)
+    // took its `media_metadata` from 1391 → 756.
+    "MakerNotes_Canon.jpg" => 800, // measured 756
+    "MakerNotes_Apple.jpg" => 145, // measured 133 (P0: 176 → 133)
+    "ID3v2_4_big.mp3" => 210,      // measured 194
+    "QuickTime_frea_rexing17b.mov" => 40, // measured 31
+    "Real.ra" => 30,               // measured 21 (P8: 31 → 21)
+    // An unlisted fixture: no pinned budget (the harness still prints + checks
+    // parse acceptance, just no ceiling).
     _ => usize::MAX,
   }
 }
 
-/// `extract_info` `(-j, -n)` per-fixture allocation budget.
+/// `extract_info` `(-j, -n)` per-fixture allocation budget — the JSON render
+/// path that carries the P1 O(1) dedup + P4 direct-serialize + P0 single-mode
+/// MakerNote wins. PINNED at the improved Phase-A.3 counts + headroom.
 fn extract_info_budget(name: &str) -> (usize, usize) {
   match name {
+    // P1+P4 took -j 2085 → 1547; P0 then took it 1547 → 907. -n stays ~1632
+    // (one value-conv decode, now on demand).
+    "MakerNotes_Canon.jpg" => (960, 1720), // measured (907, 1632)
+    "MakerNotes_Apple.jpg" => (370, 490),  // measured (339, 456)
+    "ID3v2_4_big.mp3" => (125, 125),       // measured (110, 109)
+    "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
+    "Real.ra" => (100, 100),               // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
   }
 }
