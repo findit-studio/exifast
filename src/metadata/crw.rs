@@ -629,6 +629,59 @@ impl CrwRawJpgInfo {
 }
 
 // ===========================================================================
+// CrwRawArray — a NAMED `CanonRaw::Main` record with NO sub-tags / PrintConv,
+// whose whole value ExifTool extracts as a numeric array (`ReadValue`)
+// ===========================================================================
+
+/// A `%CanonRaw::Main` record that is NAMED but carries no `SubDirectory`, no
+/// `PrintConv`, and no `Format` override beyond the `tagType`-derived one —
+/// `NullRecord` (`0x0000`), `CanonColorInfo1` (`0x0032`) and `CanonColorInfo2`
+/// (`0x102c`). ExifTool reads the whole record value as an array of the
+/// `%crwTagFormat{tagType}` format (`int8u` for `0x0000`/`0x0032`, `int16u`
+/// for `0x102c`, `CanonRaw.pm:36-44`/`:685`) and emits it via `FoundTag` with
+/// NO conversion (`CanonRaw.pm:798-800`).
+///
+/// The element count is `int(size / formatSize)` (`CanonRaw.pm:735-740`), so an
+/// odd remnant byte is dropped (oracle-confirmed: a 5-byte `int16u` record
+/// emits 2 values). ExifTool's default rendering is a single bare scalar when
+/// the count is 1, else the values space-joined (`"1 2 3 4"`). No `PrintConv`
+/// ⇒ the `-j` and `-n` views are identical.
+///
+/// The decoded values fit `u32` (the widest format here is `int16u`), so they
+/// are widened to `u64`. D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrwRawArray {
+  /// The record's tag Name (`NullRecord` / `CanonColorInfo1` /
+  /// `CanonColorInfo2`).
+  name: SmolStr,
+  /// The decoded array elements (per the `tagType` format), in file order.
+  values: Vec<u64>,
+}
+
+impl CrwRawArray {
+  /// Construct from the tag Name and the decoded array elements.
+  #[must_use]
+  #[inline]
+  pub fn new(name: SmolStr, values: Vec<u64>) -> Self {
+    Self { name, values }
+  }
+
+  /// The record's tag Name.
+  #[must_use]
+  #[inline]
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+
+  /// The decoded array elements (per the `tagType` format), in file order.
+  #[must_use]
+  #[inline]
+  pub fn values(&self) -> &[u64] {
+    &self.values
+  }
+}
+
+// ===========================================================================
 // CrwMeta — the faithful CRW (CIFF) parse layer
 // ===========================================================================
 
@@ -699,6 +752,27 @@ pub struct CrwMeta<'a> {
   /// `0x100a TargetImageType` (`CanonRaw.pm:86-93`) — `int16u`, PrintConv
   /// (`0 => 'Real-world Subject', 1 => 'Written Document'`). Raw int kept.
   target_image_type: Option<u16>,
+  /// `0x1010 ShutterReleaseMethod` (`CanonRaw.pm:94-101`) — `int16u`, PrintConv
+  /// (`0 => 'Single Shot', 2 => 'Continuous Shooting'`). Raw int kept; the
+  /// PrintConv is applied at emission (a miss falls back to the raw int per
+  /// ExifTool's default PrintConv).
+  shutter_release_method: Option<u16>,
+  /// `0x1011 ShutterReleaseTiming` (`CanonRaw.pm:102-109`) — `int16u`, PrintConv
+  /// (`0 => 'Priority on shutter', 1 => 'Priority on focus'`). Raw int kept.
+  shutter_release_timing: Option<u16>,
+  /// `0x1016 ReleaseSetting` (`CanonRaw.pm:110`) — `int16u`, no PrintConv ⇒ the
+  /// bare int in both `-j` and `-n`.
+  release_setting: Option<u16>,
+  /// `0x1806 SelfTimerTime` (`CanonRaw.pm:234-241`) — `int32u`,
+  /// `ValueConv => '$val / 1000'`, `PrintConv => '"$val s"'`. Stored as the
+  /// POST-ValueConv `f64` (the `$val / 1000` value, FLOATING-POINT — a `10500`
+  /// raw yields `10.5`); the `-j` view appends `" s"` to that value, the `-n`
+  /// view emits the bare number.
+  self_timer_time: Option<f64>,
+  /// `0x1807 TargetDistanceSetting` (`CanonRaw.pm:242-247`) — `Format =>
+  /// 'float'`, `PrintConv => '"$val mm"'`. Stored as the raw `f64` float; the
+  /// `-j` view appends `" mm"`, the `-n` view emits the bare float.
+  target_distance_setting: Option<f64>,
   /// `0x1804 RecordID` (`CanonRaw.pm:233`) — `int32u`, no PrintConv.
   record_id: Option<u32>,
   /// `0x1817 FileNumber` (`CanonRaw.pm:303-309`) — `int32u`,
@@ -752,11 +826,17 @@ pub struct CrwMeta<'a> {
   /// order ([`CrwSubTableBlock`]). Re-decoded per [`ConvMode`] at emission.
   sub_table_blocks: Vec<CrwSubTableBlock>,
   // ----- binary image records (rendered as the placeholder) -------------
-  /// `RawData` (0x2005) / `JpgFromRaw` (0x2007) / `ThumbnailImage` (0x2008)
-  /// records — `(tag Name, byte length)` in walk order. Each renders as the
-  /// universal `(Binary data N bytes, use -b option to extract)` placeholder
-  /// (`CanonRaw.pm:319-330`, `Binary => 1`).
+  /// `RawData` (0x2005) / `JpgFromRaw` (0x2007) / `ThumbnailImage` (0x2008) /
+  /// `FreeBytes` (0x0001) records — `(tag Name, byte length)` in walk order.
+  /// Each renders as the universal `(Binary data N bytes, use -b option to
+  /// extract)` placeholder (`CanonRaw.pm:319-330` `Binary => 1`; `FreeBytes`
+  /// `CanonRaw.pm:56-60` `Format => 'undef', Binary => 1`).
   binary_records: Vec<(SmolStr, usize)>,
+  /// The NAMED no-conv array records (`NullRecord` 0x0000 / `CanonColorInfo1`
+  /// 0x0032 / `CanonColorInfo2` 0x102c) in walk order — each emits its whole
+  /// value as a `%crwTagFormat{tagType}` array (space-joined, or a bare scalar
+  /// for a single element). See [`CrwRawArray`].
+  raw_arrays: Vec<CrwRawArray>,
   /// Phantom carry of `'a` for GAT uniformity.
   _lifetime: core::marker::PhantomData<&'a ()>,
 }
@@ -784,6 +864,11 @@ impl CrwMeta<'_> {
       model_id: None,
       serial_number_format: None,
       target_image_type: None,
+      shutter_release_method: None,
+      shutter_release_timing: None,
+      release_setting: None,
+      self_timer_time: None,
+      target_distance_setting: None,
       record_id: None,
       file_number: None,
       measured_ev: None,
@@ -801,6 +886,7 @@ impl CrwMeta<'_> {
       white_sample: None,
       sub_table_blocks: Vec::new(),
       binary_records: Vec::new(),
+      raw_arrays: Vec::new(),
       _lifetime: core::marker::PhantomData,
     }
   }
@@ -922,6 +1008,42 @@ impl CrwMeta<'_> {
     self.target_image_type
   }
 
+  /// `0x1010 ShutterReleaseMethod` (`CanonRaw.pm:94-101`) — raw `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn shutter_release_method(&self) -> Option<u16> {
+    self.shutter_release_method
+  }
+
+  /// `0x1011 ShutterReleaseTiming` (`CanonRaw.pm:102-109`) — raw `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn shutter_release_timing(&self) -> Option<u16> {
+    self.shutter_release_timing
+  }
+
+  /// `0x1016 ReleaseSetting` (`CanonRaw.pm:110`) — raw `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn release_setting(&self) -> Option<u16> {
+    self.release_setting
+  }
+
+  /// `0x1806 SelfTimerTime` (`CanonRaw.pm:234-241`) — `int32u`, post-ValueConv
+  /// (`$val / 1000`).
+  #[must_use]
+  #[inline]
+  pub const fn self_timer_time(&self) -> Option<f64> {
+    self.self_timer_time
+  }
+
+  /// `0x1807 TargetDistanceSetting` (`CanonRaw.pm:242-247`) — `float`.
+  #[must_use]
+  #[inline]
+  pub const fn target_distance_setting(&self) -> Option<f64> {
+    self.target_distance_setting
+  }
+
   /// `0x1804 RecordID` (`CanonRaw.pm:233`) — `int32u`.
   #[must_use]
   #[inline]
@@ -1039,13 +1161,21 @@ impl CrwMeta<'_> {
     &self.sub_table_blocks
   }
 
-  /// The binary image records (`RawData`/`JpgFromRaw`/`ThumbnailImage`) as
-  /// `(tag Name, byte length)` in walk order — each renders as the
-  /// `(Binary data N bytes, …)` placeholder (`CanonRaw.pm:319-330`).
+  /// The binary image records (`RawData`/`JpgFromRaw`/`ThumbnailImage`/
+  /// `FreeBytes`) as `(tag Name, byte length)` in walk order — each renders as
+  /// the `(Binary data N bytes, …)` placeholder (`CanonRaw.pm:319-330`/`:56-60`).
   #[must_use]
   #[inline]
   pub fn binary_records(&self) -> &[(SmolStr, usize)] {
     &self.binary_records
+  }
+
+  /// The NAMED no-conv array records (`NullRecord`/`CanonColorInfo1`/
+  /// `CanonColorInfo2`) in walk order ([`CrwRawArray`]).
+  #[must_use]
+  #[inline]
+  pub fn raw_arrays(&self) -> &[CrwRawArray] {
+    &self.raw_arrays
   }
 
   // ===== setters (crate-private, used by the CIFF walker) ===============
@@ -1123,6 +1253,31 @@ impl CrwMeta<'_> {
   /// Set `0x100a TargetImageType` (raw `int16u`).
   pub(crate) fn set_target_image_type(&mut self, v: u16) {
     self.target_image_type = Some(v);
+  }
+
+  /// Set `0x1010 ShutterReleaseMethod` (raw `int16u`).
+  pub(crate) fn set_shutter_release_method(&mut self, v: u16) {
+    self.shutter_release_method = Some(v);
+  }
+
+  /// Set `0x1011 ShutterReleaseTiming` (raw `int16u`).
+  pub(crate) fn set_shutter_release_timing(&mut self, v: u16) {
+    self.shutter_release_timing = Some(v);
+  }
+
+  /// Set `0x1016 ReleaseSetting` (raw `int16u`).
+  pub(crate) fn set_release_setting(&mut self, v: u16) {
+    self.release_setting = Some(v);
+  }
+
+  /// Set `0x1806 SelfTimerTime` (post-ValueConv `$val / 1000` float).
+  pub(crate) fn set_self_timer_time(&mut self, v: f64) {
+    self.self_timer_time = Some(v);
+  }
+
+  /// Set `0x1807 TargetDistanceSetting` (raw `float`).
+  pub(crate) fn set_target_distance_setting(&mut self, v: f64) {
+    self.target_distance_setting = Some(v);
   }
 
   /// Set `0x1804 RecordID`.
@@ -1209,6 +1364,12 @@ impl CrwMeta<'_> {
   /// `(Binary data N bytes, …)` placeholder source. Used by the CIFF walker.
   pub(crate) fn push_binary_inner(&mut self, name: &'static str, len: usize) {
     self.binary_records.push((SmolStr::new_static(name), len));
+  }
+
+  /// Append a NAMED no-conv array record (`NullRecord`/`CanonColorInfo1`/
+  /// `CanonColorInfo2`). Used by the CIFF walker.
+  pub(crate) fn push_raw_array(&mut self, record: CrwRawArray) {
+    self.raw_arrays.push(record);
   }
 }
 

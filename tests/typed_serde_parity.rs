@@ -207,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_272() {
+fn typed_serde_path_equals_writer_path_and_golden_all_273() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -926,12 +926,23 @@ fn typed_serde_path_equals_writer_path_and_golden_all_272() {
   // WhiteSample* + `BlackLevels` tags, proving the >512 SubDirectory block was
   // read. Verified via `perl exiftool -G1 -j`/`-n` to carry only File:/
   // CanonRaw: keys.
+  // 272 → 273 after the FINAL CRW coverage gap (the remaining `CanonRaw::Main`
+  // scalar tags + the omitted NAMED no-conv records): `CanonRaw_scalars.crw` —
+  // a CRAFTED Composite-free CIFF heap carrying `ShutterReleaseMethod` (0x1010,
+  // PrintConv), `ShutterReleaseTiming` (0x1011, PrintConv), `ReleaseSetting`
+  // (0x1016, no conv), `SelfTimerTime` (0x1806, `$val/1000` ValueConv + `"$val
+  // s"` PrintConv), `TargetDistanceSetting` (0x1807, `Format => 'float'` +
+  // `"$val mm"` PrintConv), plus `NullRecord` (0x0000, int8u[]), `FreeBytes`
+  // (0x0001, `Binary => 1` placeholder), and `CanonColorInfo1`/`CanonColorInfo2`
+  // (0x0032/0x102c, the NAMED no-conv `%crwTagFormat{tagType}` arrays). Verified
+  // via `perl exiftool 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
+  // This completes the `%CanonRaw::Main` record coverage.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    272,
-    "expected exactly the 272 active conformance fixtures, found {}: {:?}",
+    273,
+    "expected exactly the 273 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

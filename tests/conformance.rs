@@ -114,6 +114,37 @@ fn crw_conformance() {
 }
 
 #[test]
+fn crw_scalars_conformance() {
+  // The LAST coverage gap in `%CanonRaw::Main` — the remaining scalar tags plus
+  // the previously-omitted NAMED no-conv records. `tests/fixtures/
+  // CanonRaw_scalars.crw` is a CRAFTED Composite-free CIFF heap (verified via
+  // `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys — no
+  // Composite/XMP) exercising:
+  //   - `ShutterReleaseMethod` (0x1010, int16u PrintConv ⇒ `"Single Shot"`/0),
+  //   - `ShutterReleaseTiming` (0x1011, int16u PrintConv ⇒ `"Priority on
+  //     focus"`/1),
+  //   - `ReleaseSetting` (0x1016, int16u, no conv ⇒ `3`),
+  //   - `SelfTimerTime` (0x1806, int32u, ValueConv `$val/1000` ⇒ `10` value,
+  //     PrintConv `"$val s"` ⇒ `"10 s"`),
+  //   - `TargetDistanceSetting` (0x1807, `Format => 'float'`, PrintConv
+  //     `"$val mm"` ⇒ `"1234 mm"`/1234),
+  //   - `NullRecord` (0x0000, int8u[4] ⇒ `"1 2 3 4"`),
+  //   - `FreeBytes` (0x0001, `Format => 'undef', Binary => 1` ⇒ the `(Binary
+  //     data 10 bytes …)` placeholder),
+  //   - `CanonColorInfo1` (0x0032, int8u[6] ⇒ `"10 20 30 40 50 60"`) and
+  //     `CanonColorInfo2` (0x102c, int16u[8] ⇒ `"1 2 3 4 5 6 7 8"`) — NAMED
+  //     records with no sub-tags/PrintConv, whose whole value ExifTool reads as
+  //     a `%crwTagFormat{tagType}` array (`CanonRaw.pm:798-800`).
+  // These records carry no Composite linkage, so the goldens are File:/
+  // CanonRaw: only. This completes the `%CanonRaw::Main` record coverage: every
+  // table entry is now handled (the only un-emitted entries are `CanonFlashInfo`
+  // 0x1028 `Unknown => 1`, suppressed by default, and `CustomFunctions` 0x1033,
+  // the #87 CanonCustom deferral).
+  check("CanonRaw_scalars.crw", "CanonRaw_scalars.crw.json", true);
+  check("CanonRaw_scalars.crw", "CanonRaw_scalars.crw.n.json", false);
+}
+
+#[test]
 fn crw_omitted_records_conformance() {
   // The three previously-omitted `CanonRaw::Main` binary sub-tables (the Codex
   // CRW finding) — `ExposureInfo` (0x1818), `FlashInfo` (0x1813), `WhiteSample`

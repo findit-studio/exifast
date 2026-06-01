@@ -53,8 +53,9 @@
 //!   `OwnerName`, `CanonImageType`, `OriginalFileName`, `ThumbnailFileName`,
 //!   `BaseISO`, `CanonModelID` (PrintHex + `%canonModelID`),
 //!   `SerialNumberFormat` (PrintHex), and the structural-info sub-tables
-//!   (`TimeStamp`/`ImageInfo`/`ExposureInfo`/…). `RawData` (0x2005) /
-//!   `JpgFromRaw` (0x2007) render as the binary placeholder.
+//!   (`TimeStamp`/`ImageInfo`/`ExposureInfo`/…). `FreeBytes` (0x0001) /
+//!   `RawData` (0x2005) / `JpgFromRaw` (0x2007) render as the binary
+//!   placeholder.
 //! - **Canon MakerNote sub-table dispatch** — `0x1029`→`Canon::FocalLength`,
 //!   `0x102a`→`Canon::ShotInfo`, `0x102d`→`Canon::CameraSettings`,
 //!   `0x1038`→`Canon::AFInfo`, `0x1093`→`Canon::FileInfo`. These REUSE the
@@ -86,6 +87,24 @@
 //!   ported as walked Canon sub-tables ([`crate::exif::makernotes::vendors::
 //!   canon::sensor_info`] / [`…::color_balance`]) so they emit for BOTH the
 //!   CRW dispatch and the normal EXIF MakerNote path.
+//! - The FINAL scalar tags — `ShutterReleaseMethod` (`0x1010`, PrintConv),
+//!   `ShutterReleaseTiming` (`0x1011`, PrintConv), `ReleaseSetting` (`0x1016`,
+//!   no conv), `SelfTimerTime` (`0x1806`, `$val/1000` ValueConv + `"$val s"`
+//!   PrintConv), `TargetDistanceSetting` (`0x1807`, `Format => 'float'` +
+//!   `"$val mm"` PrintConv) — plus the NAMED no-conv records `NullRecord`
+//!   (`0x0000`, int8u[]), `CanonColorInfo1` (`0x0032`, int8u[]) and
+//!   `CanonColorInfo2` (`0x102c`, int16u[]) emitted as the whole-value
+//!   `%crwTagFormat{tagType}` array, and `FreeBytes` (`0x0001`, `Format =>
+//!   'undef', Binary => 1`) as the `(Binary data N bytes …)` placeholder.
+//!
+//! ### Coverage status — EVERY `%CanonRaw::Main` entry is now handled
+//!
+//! The only entries NOT emitted by default are `CanonFlashInfo` (`0x1028`,
+//! `Unknown => 1`, suppressed unless `-u`) and `CustomFunctions` (`0x1033`,
+//! the `CanonCustom` deferral #87 — read-then-ignored, faithful to bundled
+//! when no consumer extracts it). Both are faithful to bundled's default
+//! output. A CRW carrying any other `%CanonRaw::Main` record produces
+//! byte-identical output to bundled 13.59.
 //!
 //! ## What is DEFERRED (port-wide)
 //!
@@ -509,10 +528,15 @@ fn emit_record(
 
   match tag_id {
     // ---- binary image records (placeholder) ------------------------------
-    // `0x2005 RawData` (`CanonRaw.pm:319`) / `0x2007 JpgFromRaw`
-    // (`:323`) / `0x2008 ThumbnailImage` (`:329`) — `Binary => 1`; render as
-    // the `(Binary data N bytes, …)` placeholder.
-    0x2005 | 0x2007 | 0x2008 => {
+    // `0x0001 FreeBytes` (`CanonRaw.pm:56-60`, `Format => 'undef', Binary =>
+    // 1`) / `0x2005 RawData` (`:319`) / `0x2007 JpgFromRaw` (`:323`) /
+    // `0x2008 ThumbnailImage` (`:329`) — all `Binary => 1`; render as the
+    // `(Binary data N bytes, …)` placeholder. `FreeBytes` is a binary LEAF at
+    // ANY size: `Binary => 1` renders the value as the placeholder even when
+    // the bytes were read inline (`size <= 512`), exactly like the image
+    // records (oracle-confirmed: a 10-byte FreeBytes ⇒ `(Binary data 10
+    // bytes)`).
+    0x0001 | 0x2005 | 0x2007 | 0x2008 => {
       let n = match value {
         RecordValue::Bytes(b) => b.len(),
         RecordValue::BinaryPlaceholder(n) => n,
@@ -520,6 +544,7 @@ fn emit_record(
       // Store the byte count via a zero-filled placeholder block: the
       // serializer renders `(Binary data N bytes …)` from the `Vec` length.
       let name = match tag_id {
+        0x0001 => CrwBinary::FreeBytes,
         0x2005 => CrwBinary::RawData,
         0x2007 => CrwBinary::JpgFromRaw,
         _ => CrwBinary::ThumbnailImage,
@@ -535,6 +560,8 @@ fn emit_record(
 /// …)` placeholder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrwBinary {
+  /// `0x0001 FreeBytes` (`CanonRaw.pm:56-60`, `Format => 'undef', Binary => 1`).
+  FreeBytes,
   /// `0x2005 RawData` (`CanonRaw.pm:319`).
   RawData,
   /// `0x2007 JpgFromRaw` (`CanonRaw.pm:323`).
@@ -547,6 +574,7 @@ impl CrwBinary {
   /// The emitted tag Name.
   pub(crate) const fn name(self) -> &'static str {
     match self {
+      Self::FreeBytes => "FreeBytes",
       Self::RawData => "RawData",
       Self::JpgFromRaw => "JpgFromRaw",
       Self::ThumbnailImage => "ThumbnailImage",
@@ -611,6 +639,30 @@ fn emit_scalar(
 
     // ---- `0x100a TargetImageType` (`CanonRaw.pm:86-93`) — int16u, PrintConv
     0x100a if bytes.len() >= 2 => meta.set_target_image_type(read_u16(&bytes, 0, order)),
+
+    // ---- `0x1010 ShutterReleaseMethod` (`CanonRaw.pm:94-101`) — int16u, PrintConv
+    0x1010 if bytes.len() >= 2 => meta.set_shutter_release_method(read_u16(&bytes, 0, order)),
+
+    // ---- `0x1011 ShutterReleaseTiming` (`CanonRaw.pm:102-109`) — int16u, PrintConv
+    0x1011 if bytes.len() >= 2 => meta.set_shutter_release_timing(read_u16(&bytes, 0, order)),
+
+    // ---- `0x1016 ReleaseSetting` (`CanonRaw.pm:110`) — int16u, no conv ----
+    0x1016 if bytes.len() >= 2 => meta.set_release_setting(read_u16(&bytes, 0, order)),
+
+    // ---- `0x1806 SelfTimerTime` (`CanonRaw.pm:234-241`) — int32u ----------
+    // `ValueConv => '$val / 1000'` (FLOAT division — a `10500` raw yields
+    // `10.5`); store the POST-ValueConv float. The `"$val s"` PrintConv runs
+    // at emission.
+    0x1806 if bytes.len() >= 4 => {
+      meta.set_self_timer_time(f64::from(read_u32(&bytes, 0, order)) / 1000.0);
+    }
+
+    // ---- `0x1807 TargetDistanceSetting` (`CanonRaw.pm:242-247`) — float ---
+    // `Format => 'float'` (overrides the int32u tagType); the `"$val mm"`
+    // PrintConv runs at emission.
+    0x1807 if bytes.len() >= 4 => {
+      meta.set_target_distance_setting(f64::from(read_f32(&bytes, 0, order)));
+    }
 
     // ---- `0x101c BaseISO` (`CanonRaw.pm:198`) — int16u -------------------
     0x101c if bytes.len() >= 2 => meta.set_base_iso(read_u16(&bytes, 0, order)),
@@ -898,15 +950,70 @@ fn emit_scalar(
     // ---- `0x183b SerialNumberFormat` (`CanonRaw.pm:332-341`) — int32u, PrintHex
     0x183b if bytes.len() >= 4 => meta.set_serial_number_format(read_u32(&bytes, 0, order)),
 
-    // Every other `CanonRaw::Main` record (the unnamed records
-    // `CanonColorInfo1`/`CanonColorInfo2`/`CanonFlashInfo` etc.) is not
-    // surfaced here: the unnamed ones have no `tagInfo` Name so bundled emits
-    // nothing for them (`next unless defined $tagInfo`). The structural binary
-    // sub-tables that DO carry named tags — `ExposureInfo` (`0x1818`),
-    // `FlashInfo` (`0x1813`), `WhiteSample` (`0x1030`) — are decoded in the
-    // arms above. The CIFF walker still RECURSED through every subdirectory.
+    // ---- NAMED no-conv array records (`CanonRaw.pm:55-61`/`:128-135`) -----
+    // `NullRecord` (0x0000) / `CanonColorInfo1` (0x0032) / `CanonColorInfo2`
+    // (0x102c) are NAMED but carry no `SubDirectory`, no `PrintConv` and no
+    // `Format` override, so ExifTool reads the whole record as a
+    // `%crwTagFormat{tagType}` array and emits it via `FoundTag` with no conv
+    // (`CanonRaw.pm:798-800`). The element count is `int(size / formatSize)`
+    // (`CanonRaw.pm:735-740`). The format is fixed by the tag_id's tagType
+    // bits: 0x0000/0x0032 ⇒ tagType 0x00 ⇒ int8u; 0x102c ⇒ tagType 0x10 ⇒
+    // int16u (`CanonRaw.pm:36-44`). (Verified vs `perl exiftool -G1`.)
+    0x0000 | 0x0032 | 0x102c => {
+      let name = match tag_id {
+        0x0000 => "NullRecord",
+        0x0032 => "CanonColorInfo1",
+        _ => "CanonColorInfo2",
+      };
+      // int16u for 0x102c (tagType 0x10), int8u for 0x0000/0x0032 (tagType 0x00).
+      let values = if tag_id == 0x102c {
+        decode_u16_array(&bytes, order)
+      } else {
+        decode_u8_array(&bytes)
+      };
+      if !values.is_empty() {
+        meta.push_raw_array(crate::metadata::CrwRawArray::new(
+          SmolStr::new_static(name),
+          values,
+        ));
+      }
+    }
+
+    // Every other `CanonRaw::Main` record is not surfaced here: the only
+    // remaining named scalar leaf is `CanonFlashInfo` (0x1028, `Unknown => 1`),
+    // SUPPRESSED by default (`next unless …` — it only appears with `-u`,
+    // oracle-confirmed). `CustomFunctions` (0x1033) dispatches to `CanonCustom`
+    // (a PORT-WIDE deferral, #87 — read-then-ignored, faithful to bundled when
+    // no consumer extracts it). The structural binary sub-tables that DO carry
+    // named tags — `ExposureInfo` (0x1818), `FlashInfo` (0x1813), `WhiteSample`
+    // (0x1030) — are decoded in the arms above. The CIFF walker still RECURSED
+    // through every subdirectory.
     _ => {}
   }
+}
+
+/// Decode a CIFF `int8u[N]` record value (`%crwTagFormat{0x00}`,
+/// `CanonRaw.pm:37`): one element per byte. `ReadValue` yields the count
+/// `int(size / 1)` = `size` elements.
+fn decode_u8_array(bytes: &[u8]) -> std::vec::Vec<u64> {
+  bytes.iter().map(|&b| u64::from(b)).collect()
+}
+
+/// Decode a CIFF `int16u[N]` record value (`%crwTagFormat{0x10}`,
+/// `CanonRaw.pm:39`) in `order`: the count is `int(size / 2)`, so a trailing
+/// odd byte is dropped (`CanonRaw.pm:735-740`, oracle-confirmed).
+fn decode_u16_array(bytes: &[u8], order: ByteOrder) -> std::vec::Vec<u64> {
+  bytes
+    .chunks_exact(2)
+    .map(|c| {
+      let arr = [c[0], c[1]];
+      let v = match order {
+        ByteOrder::Little => u16::from_le_bytes(arr),
+        ByteOrder::Big => u16::from_be_bytes(arr),
+      };
+      u64::from(v)
+    })
+    .collect()
 }
 
 /// `$$self{Model} =~ /EOS/` — the SerialNumber conditional gate
@@ -1105,6 +1212,76 @@ fn print_target_image_type(v: u16) -> TagValue {
   }
 }
 
+/// `ShutterReleaseMethod` PrintConv (`CanonRaw.pm:97-100`): `0 => 'Single
+/// Shot', 2 => 'Continuous Shooting'`; miss ⇒ `Unknown (N)` (no `PrintHex`, so
+/// decimal — oracle-confirmed `"Unknown (1)"`).
+fn print_shutter_release_method(v: u16) -> TagValue {
+  let label = match v {
+    0 => Some("Single Shot"),
+    2 => Some("Continuous Shooting"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// `ShutterReleaseTiming` PrintConv (`CanonRaw.pm:105-108`): `0 => 'Priority on
+/// shutter', 1 => 'Priority on focus'`; miss ⇒ `Unknown (N)` (decimal).
+fn print_shutter_release_timing(v: u16) -> TagValue {
+  let label = match v {
+    0 => Some("Priority on shutter"),
+    1 => Some("Priority on focus"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// Perl's default NV stringification (`%.15g`) for a PrintConv string
+/// interpolation like `"$val s"` / `"$val mm"`. ExifTool interpolates the
+/// post-ValueConv number into the PrintConv string via Perl's default scalar
+/// stringification, which is `%.15g` (`$Config{nvgformat}` ⇒ `g`, `$DIG = 15`).
+/// An integer-valued NV renders without a fraction (`10.0` ⇒ `"10"`); a
+/// fraction renders with its `%g` digits (`10.5` ⇒ `"10.5"`). The crate's
+/// shared [`crate::value::format_g`] is exactly this formatter.
+fn fmt_perl_num(v: f64) -> String {
+  if v.is_finite() {
+    crate::value::format_g(v, 15)
+  } else {
+    // A non-finite SelfTimerTime/TargetDistanceSetting cannot arise from a CRW
+    // (int32u/float reads are always finite); mirror Perl's casing defensively.
+    crate::value::perl_nonfinite_str(v).map_or_else(|| v.to_string(), str::to_owned)
+  }
+}
+
+/// Render a NAMED no-conv array record value (`NullRecord`/`CanonColorInfo1`/
+/// `CanonColorInfo2`) the way ExifTool's `ReadValue` + default rendering does:
+/// a single bare scalar when the count is 1, else the elements space-joined
+/// (`"1 2 3 4"`). A single element ⇒ [`TagValue::U64`] (the bare number the
+/// oracle emits); multiple ⇒ a [`TagValue::Str`] (non-numeric, compared
+/// exactly). An empty value yields an empty string (never reached — the walker
+/// drops empty arrays).
+fn render_raw_array(values: &[u64]) -> TagValue {
+  match values {
+    [single] => TagValue::U64(*single),
+    _ => {
+      use std::fmt::Write;
+      let mut s = String::new();
+      for (i, v) in values.iter().enumerate() {
+        if i != 0 {
+          s.push(' ');
+        }
+        let _ = write!(s, "{v}");
+      }
+      TagValue::Str(SmolStr::from(s))
+    }
+  }
+}
+
 /// `ColorSpace` PrintConv (`CanonRaw.pm:222-226`): `1 => 'sRGB', 2 => 'Adobe
 /// RGB', 0xffff => 'Uncalibrated'`; miss ⇒ `Unknown (N)` (decimal).
 fn print_color_space(v: u16) -> TagValue {
@@ -1229,12 +1406,23 @@ impl crate::emit::Taggable for CrwMeta<'_> {
     let mut tags: Vec<EmittedTag> = Vec::new();
 
     // ---- binary image records (placeholder) ------------------------------
-    // `RawData`/`JpgFromRaw`/`ThumbnailImage` render as `(Binary data N bytes,
-    // …)` via `TagValue::Bytes` (the serializer formats the byte count). We
-    // synthesize a zero-filled `Vec` of the recorded length — the bytes are
-    // never emitted (no `-b`), only their count.
+    // `FreeBytes`/`RawData`/`JpgFromRaw`/`ThumbnailImage` render as `(Binary
+    // data N bytes, …)` via `TagValue::Bytes` (the serializer formats the byte
+    // count). We synthesize a zero-filled `Vec` of the recorded length — the
+    // bytes are never emitted (no `-b`), only their count.
     for (name, len) in self.binary_records() {
       push_raw(&mut tags, name, TagValue::Bytes(std::vec![0u8; *len]));
+    }
+
+    // ---- NAMED no-conv array records (`NullRecord`/`CanonColorInfo1`/
+    // `CanonColorInfo2`) ---------------------------------------------------
+    // ExifTool emits the whole record value as a `%crwTagFormat{tagType}`
+    // array with NO conversion: a single bare scalar when the count is 1, else
+    // the elements space-joined (`"1 2 3 4"`). No `PrintConv` ⇒ identical in
+    // `-j`/`-n`.
+    for rec in self.raw_arrays() {
+      let value = render_raw_array(rec.values());
+      push_raw(&mut tags, rec.name(), value);
     }
 
     // ---- CanonRaw::Main scalar records -----------------------------------
@@ -1307,6 +1495,47 @@ impl crate::emit::Taggable for CrwMeta<'_> {
         TagValue::U64(u64::from(v))
       };
       push_raw(&mut tags, "TargetImageType", value);
+    }
+    if let Some(v) = self.shutter_release_method() {
+      // `int16u`, PrintConv (`CanonRaw.pm:97-100`).
+      let value = if print_conv {
+        print_shutter_release_method(v)
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "ShutterReleaseMethod", value);
+    }
+    if let Some(v) = self.shutter_release_timing() {
+      // `int16u`, PrintConv (`CanonRaw.pm:105-108`).
+      let value = if print_conv {
+        print_shutter_release_timing(v)
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "ShutterReleaseTiming", value);
+    }
+    if let Some(v) = self.release_setting() {
+      // `int16u`, no PrintConv (`CanonRaw.pm:110`) ⇒ bare int both modes.
+      push_raw(&mut tags, "ReleaseSetting", TagValue::U64(u64::from(v)));
+    }
+    if let Some(v) = self.self_timer_time() {
+      // `int32u`, ValueConv `$val / 1000` already applied; PrintConv `"$val s"`
+      // (`CanonRaw.pm:237-240`).
+      let value = if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{} s", fmt_perl_num(v))))
+      } else {
+        TagValue::F64(v)
+      };
+      push_raw(&mut tags, "SelfTimerTime", value);
+    }
+    if let Some(v) = self.target_distance_setting() {
+      // `float`, PrintConv `"$val mm"` (`CanonRaw.pm:245`).
+      let value = if print_conv {
+        TagValue::Str(SmolStr::from(std::format!("{} mm", fmt_perl_num(v))))
+      } else {
+        TagValue::F64(v)
+      };
+      push_raw(&mut tags, "TargetDistanceSetting", value);
     }
     if let Some(v) = self.record_id() {
       // `int32u`, no PrintConv (`CanonRaw.pm:233`).
@@ -2120,5 +2349,186 @@ mod tests {
         Some(TagValue::Str("2003:11:10 17:39:26".into()))
       );
     }
+  }
+
+  /// The five remaining `CanonRaw::Main` scalar tags (`CanonRaw.pm:94-247`):
+  /// `ShutterReleaseMethod` (0x1010, PrintConv), `ShutterReleaseTiming` (0x1011,
+  /// PrintConv), `ReleaseSetting` (0x1016, no conv), `SelfTimerTime` (0x1806,
+  /// `$val/1000` ValueConv + `"$val s"` PrintConv) and `TargetDistanceSetting`
+  /// (0x1807, `Format => 'float'` + `"$val mm"` PrintConv). Values verified vs
+  /// `perl exiftool 13.59 -G1 -j`/`-n` on a crafted heap.
+  #[test]
+  fn remaining_scalars_value_and_print_conv() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x1010, &0u16.to_le_bytes()); // ShutterReleaseMethod = Single Shot
+    root.add_value(0x1011, &1u16.to_le_bytes()); // ShutterReleaseTiming = Priority on focus
+    root.add_value(0x1016, &3u16.to_le_bytes()); // ReleaseSetting = 3
+    root.add_value(0x1806, &10_000u32.to_le_bytes()); // SelfTimerTime 10000/1000 = 10 -> "10 s"
+    root.add_value(0x1807, &1234.0f32.to_le_bytes()); // TargetDistanceSetting -> "1234 mm"
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+
+    // Typed-layer values (post-ValueConv where applicable).
+    assert_eq!(m.shutter_release_method(), Some(0));
+    assert_eq!(m.shutter_release_timing(), Some(1));
+    assert_eq!(m.release_setting(), Some(3));
+    assert_eq!(m.self_timer_time(), Some(10.0));
+    assert_eq!(m.target_distance_setting(), Some(1234.0));
+
+    // -j (PrintConv).
+    let j = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(
+      find_tag(&j, "ShutterReleaseMethod"),
+      Some(TagValue::Str("Single Shot".into()))
+    );
+    assert_eq!(
+      find_tag(&j, "ShutterReleaseTiming"),
+      Some(TagValue::Str("Priority on focus".into()))
+    );
+    assert_eq!(find_tag(&j, "ReleaseSetting"), Some(TagValue::U64(3)));
+    assert_eq!(
+      find_tag(&j, "SelfTimerTime"),
+      Some(TagValue::Str("10 s".into()))
+    );
+    assert_eq!(
+      find_tag(&j, "TargetDistanceSetting"),
+      Some(TagValue::Str("1234 mm".into()))
+    );
+
+    // -n (ValueConv): the bare post-ValueConv numbers.
+    let n = canonraw_tags(&m, ConvMode::ValueConv);
+    assert_eq!(find_tag(&n, "ShutterReleaseMethod"), Some(TagValue::U64(0)));
+    assert_eq!(find_tag(&n, "ShutterReleaseTiming"), Some(TagValue::U64(1)));
+    assert_eq!(find_tag(&n, "ReleaseSetting"), Some(TagValue::U64(3)));
+    assert_eq!(find_tag(&n, "SelfTimerTime"), Some(TagValue::F64(10.0)));
+    assert_eq!(
+      find_tag(&n, "TargetDistanceSetting"),
+      Some(TagValue::F64(1234.0))
+    );
+  }
+
+  /// The `ShutterReleaseMethod`/`ShutterReleaseTiming` PrintConv MISS renders
+  /// as `"Unknown (N)"` (no `PrintHex`, decimal) — the ExifTool default-PrintConv
+  /// fallback (oracle-confirmed `"Unknown (1)"`), and `SelfTimerTime`/
+  /// `TargetDistanceSetting` interpolate a FRACTIONAL value (`10500/1000 = 10.5`
+  /// ⇒ `"10.5 s"`; `2.5` ⇒ `"2.5 mm"`).
+  #[test]
+  fn remaining_scalars_miss_and_fractional() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x1010, &1u16.to_le_bytes()); // miss
+    root.add_value(0x1011, &5u16.to_le_bytes()); // miss
+    root.add_value(0x1806, &10_500u32.to_le_bytes()); // 10.5 s
+    root.add_value(0x1807, &2.5f32.to_le_bytes()); // 2.5 mm
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    let j = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(
+      find_tag(&j, "ShutterReleaseMethod"),
+      Some(TagValue::Str("Unknown (1)".into()))
+    );
+    assert_eq!(
+      find_tag(&j, "ShutterReleaseTiming"),
+      Some(TagValue::Str("Unknown (5)".into()))
+    );
+    assert_eq!(
+      find_tag(&j, "SelfTimerTime"),
+      Some(TagValue::Str("10.5 s".into()))
+    );
+    assert_eq!(
+      find_tag(&j, "TargetDistanceSetting"),
+      Some(TagValue::Str("2.5 mm".into()))
+    );
+    let n = canonraw_tags(&m, ConvMode::ValueConv);
+    assert_eq!(find_tag(&n, "SelfTimerTime"), Some(TagValue::F64(10.5)));
+    assert_eq!(
+      find_tag(&n, "TargetDistanceSetting"),
+      Some(TagValue::F64(2.5))
+    );
+  }
+
+  /// The NAMED no-conv array records (`CanonRaw.pm:55-61`/`:128-135`):
+  /// `NullRecord` (0x0000, int8u[4]), `CanonColorInfo1` (0x0032, int8u[6]) and
+  /// `CanonColorInfo2` (0x102c, int16u[8]) emit their whole value as a
+  /// `%crwTagFormat{tagType}` array — space-joined for >1 element, a bare scalar
+  /// for 1, identical in `-j`/`-n` (no PrintConv). Values verified vs `perl
+  /// exiftool 13.59 -G1 -j`/`-n`.
+  #[test]
+  fn raw_array_records_space_joined() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x0000, &[1u8, 2, 3, 4]); // NullRecord int8u[4]
+    root.add_value(0x0032, &[10u8, 20, 30, 40, 50, 60]); // CanonColorInfo1 int8u[6]
+    let mut ci2 = Vec::new();
+    for w in [1u16, 2, 3, 4, 5, 6, 7, 8] {
+      ci2.extend_from_slice(&w.to_le_bytes());
+    }
+    root.add_value(0x102c, &ci2); // CanonColorInfo2 int16u[8]
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.raw_arrays().len(), 3);
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let t = canonraw_tags(&m, mode);
+      assert_eq!(
+        find_tag(&t, "NullRecord"),
+        Some(TagValue::Str("1 2 3 4".into()))
+      );
+      assert_eq!(
+        find_tag(&t, "CanonColorInfo1"),
+        Some(TagValue::Str("10 20 30 40 50 60".into()))
+      );
+      assert_eq!(
+        find_tag(&t, "CanonColorInfo2"),
+        Some(TagValue::Str("1 2 3 4 5 6 7 8".into()))
+      );
+    }
+  }
+
+  /// A single-element array record renders as a BARE scalar (the oracle's bare
+  /// number), and an `int16u` record drops a trailing odd byte
+  /// (`int(size/2)` elements, `CanonRaw.pm:735-740`).
+  #[test]
+  fn raw_array_single_element_and_odd_remnant() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x0032, &[99u8]); // CanonColorInfo1 single int8u -> bare 99
+    // CanonColorInfo2: 5 bytes -> int(5/2)=2 elements, last byte dropped.
+    root.add_value(0x102c, &[1u8, 0, 2, 0, 0x99]);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(find_tag(&t, "CanonColorInfo1"), Some(TagValue::U64(99)));
+    assert_eq!(
+      find_tag(&t, "CanonColorInfo2"),
+      Some(TagValue::Str("1 2".into()))
+    );
+  }
+
+  /// `FreeBytes` (0x0001, `Format => 'undef', Binary => 1`) renders as the
+  /// `(Binary data N bytes, …)` placeholder at ANY size — exercising both the
+  /// small (read-inline) and large (>512 placeholder-only) paths. Verified vs
+  /// `perl exiftool 13.59 -G1` (`(Binary data 10 bytes …)`).
+  #[test]
+  fn free_bytes_binary_placeholder() {
+    // Small (read inline, size <= 512): still a placeholder via `Binary => 1`.
+    let mut root = HeapBuilder::new();
+    root.add_value(0x0001, &(0u8..10).collect::<Vec<u8>>());
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.binary_records().len(), 1);
+    assert_eq!(m.binary_records()[0].0.as_str(), "FreeBytes");
+    assert_eq!(m.binary_records()[0].1, 10);
+
+    // Large (> 512): the placeholder-only path keeps the byte count, no copy.
+    let mut root2 = HeapBuilder::new();
+    root2.add_value(0x0001, &std::vec![0u8; 768]);
+    let data2 = build_file(&root2);
+    let m2 = parse_inner(&data2).expect("valid CRW");
+    assert_eq!(m2.binary_records().len(), 1);
+    assert_eq!(m2.binary_records()[0].0.as_str(), "FreeBytes");
+    assert_eq!(m2.binary_records()[0].1, 768);
+    // FreeBytes is a binary LEAF, NOT a SubDirectory.
+    assert!(!is_subdirectory_tag(0x0001));
   }
 }
