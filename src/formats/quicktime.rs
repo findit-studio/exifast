@@ -55,7 +55,7 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   formats::{quicktime_freegps, quicktime_stream},
   metadata::{MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
-  value::format_g,
+  value::{binary_placeholder, format_g},
 };
 
 /// QuickTime epoch offset: seconds between 1904-01-01 (the Mac/QuickTime
@@ -1272,6 +1272,60 @@ fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option
   });
 }
 
+/// Decode the top-level `frea` atom — a `SubDirectory` dispatched to
+/// `Image::ExifTool::Kodak::frea` from the `%QuickTime::Main` `frea` entry
+/// (QuickTime.pm:610-613). The `frea` atom is a CONTAINER holding the four
+/// Kodak PixPro / Rexing sub-atoms (Kodak.pm:2977-2990):
+///
+///  - `tima` → **Duration** (`int32u` seconds; PrintConv `ConvertDuration`).
+///  - `'ver '` → **KodakVersion** (string; ExifTool also stashes it as the
+///    `$$self{KodakVersion}` global the freeGPS Type-17b scan reads).
+///  - `thma` → **ThumbnailImage** (`Binary => 1` ⇒ the `(Binary data N bytes…)`
+///    placeholder; group2 `Preview`).
+///  - `scra` → **PreviewImage** (`Binary => 1` ⇒ placeholder; group2 `Preview`).
+///
+/// ExifTool re-uses `ProcessMOV` to walk the `frea` SubDirectory, so each
+/// sub-atom is a standard `[size:4][type:4][payload]` box. The decoded values
+/// land on [`QuickTimeMeta::kodak_frea`]; the cross-module `KodakVersion`
+/// global is THIS [`KodakFrea::version`](crate::metadata::KodakFrea::version),
+/// threaded into the `mdat` freeGPS scan via [`parse_inner`].
+fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
+  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+    let frea = qt.kodak_frea_mut();
+    match &inner.atom_type {
+      // `tima` Duration — `int32u` (Kodak.pm:2980-2985). ExifTool's `int32u`
+      // default byte order is big-endian (`Get32u` without `SetByteOrder`).
+      b"tima" => {
+        if let Some(v) = be_u32(ibody, 0) {
+          frea.set_duration_secs(Some(v));
+        }
+      }
+      // `'ver '` KodakVersion — the raw string value (Kodak.pm:2987). ExifTool
+      // stores the bytes verbatim; trailing NULs (a NUL-padded box) are
+      // dropped so the global compares cleanly against `'3.01.054'`.
+      b"ver " => {
+        let s = core::str::from_utf8(ibody)
+          .unwrap_or("")
+          .trim_end_matches('\0');
+        if !s.is_empty() {
+          frea.set_version(Some(smol_str::SmolStr::new(s)));
+        }
+      }
+      // `thma` ThumbnailImage — `Binary => 1` (Kodak.pm:2988). Record only the
+      // payload byte length for the `(Binary data N bytes…)` placeholder; the
+      // bytes are never materialized.
+      b"thma" => {
+        frea.set_thumbnail_len(Some(ibody.len() as u64));
+      }
+      // `scra` PreviewImage — `Binary => 1` (Kodak.pm:2989).
+      b"scra" => {
+        frea.set_preview_len(Some(ibody.len() as u64));
+      }
+      _ => {}
+    }
+  });
+}
+
 /// Decode every `trak` inside one `moov` atom, converting `TrackDuration`
 /// against the FINAL global movie `TimeScale` (`movie_ts`) established by the
 /// first pass over ALL top-level moovs (see [`decode_moov_mvhd`] /
@@ -1634,6 +1688,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
         match &header.atom_type {
           b"ftyp" => decode_ftyp(body, &mut qt),
           b"moov" => decode_moov_mvhd(body, &mut qt, &mut warning),
+          // The top-level `frea` atom (Kodak PixPro / Rexing — QuickTime.pm:610
+          // `%QuickTime::Main` ⇒ `Image::ExifTool::Kodak::frea`). Decoded in
+          // Pass 1 so `KodakVersion` is populated BEFORE the `mdat` freeGPS
+          // scan (which reads it to apply the Type-17b lat/lon scaling).
+          b"frea" => decode_frea(body, &mut qt, &mut warning),
           b"mdat" => {
             // QuickTime.pm:10158-10160 — the synthetic `mdat-size`/`mdat-offset`
             // tags: payload byte count + absolute payload file offset.
@@ -1795,7 +1854,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // via `qt`'s stored Duration timescale-count is unrelated; instead the
   // stream walker is given the raw CreateDate it can recover from the file.
   let create_date_raw = first_moov_create_date_raw(data);
-  let mut stream = quicktime_stream::extract_stream(data, create_date_raw);
+  // The Kodak `frea`-atom `KodakVersion` global (set in Pass 1) is visible to
+  // EVERY `ProcessFreeGPS` call — including the `gps `-sample-table path
+  // inside `extract_stream` — so a Rexing dashcam that references its freeGPS
+  // blocks from a `gps ` track (rather than burying them in `mdat`) also gets
+  // the Type-17b scaling. Threaded as a `&str` borrow (mvhd/frea are already
+  // decoded into `qt` at this point).
+  let kodak_version = qt.kodak_frea().version();
+  let mut stream = quicktime_stream::extract_stream(data, create_date_raw, kodak_version);
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -1806,7 +1872,19 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // padding-buried GPS) — see `quicktime_freegps`.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = !stream.is_empty();
-    quicktime_freegps::scan_media_data(data, off, size, create_date_raw, already, &mut stream);
+    // The Kodak `frea`-atom `KodakVersion` (set in Pass 1, BEFORE this scan)
+    // is the cross-module global the Type-17b decoder reads to recognize a
+    // Rexing V1-4k dashcam (QuickTimeStream.pl:2323-2327).
+    let kodak_version = qt.kodak_frea().version();
+    quicktime_freegps::scan_media_data(
+      data,
+      off,
+      size,
+      create_date_raw,
+      kodak_version,
+      already,
+      &mut stream,
+    );
   }
 
   // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
@@ -2178,6 +2256,57 @@ impl crate::emit::Taggable for Meta<'_> {
         TagValue::U64(off),
         false,
       ));
+    }
+
+    // ── frea (Kodak PixPro / Rexing — Kodak.pm:2977-2990) ──────────────
+    // The top-level `frea` atom's `Image::ExifTool::Kodak::frea` SubDirectory
+    // (QuickTime.pm:610-613). Group: family-0 `MakerNotes`, family-1 `Kodak`
+    // (the table `GROUPS => { 0 => 'MakerNotes', 2 => 'Image' }`; family-1
+    // defaults to the table's family-0 name → `Kodak`; verified vs the bundled
+    // `-G0:1` oracle). Every tag is a known table key ⇒ `unknown: false`.
+    let frea = self.qt.kodak_frea();
+    if !frea.is_empty() {
+      let kodak = || Group::new("MakerNotes", "Kodak");
+      // `tima` Duration: PrintConv `ConvertDuration($val)` (Kodak.pm:2984), no
+      // ValueConv — so the raw `int32u` seconds IS the `-n` value and the
+      // `ConvertDuration` input (NOT the `%durationInfo` timescale divide).
+      if let Some(secs) = frea.duration_secs() {
+        let value = if print_conv {
+          TagValue::Str(convert_duration(f64::from(secs)).into())
+        } else {
+          TagValue::U64(u64::from(secs))
+        };
+        tags.push(EmittedTag::new(kodak(), "Duration".into(), value, false));
+      }
+      // `'ver '` KodakVersion: the raw string (Kodak.pm:2987), mode-invariant
+      // (no PrintConv/ValueConv beyond the RawConv stash).
+      if let Some(ver) = frea.version() {
+        tags.push(EmittedTag::new(
+          kodak(),
+          "KodakVersion".into(),
+          TagValue::Str(ver.into()),
+          false,
+        ));
+      }
+      // `thma` ThumbnailImage / `scra` PreviewImage: `Binary => 1` ⇒ the
+      // `(Binary data N bytes, use -b option to extract)` placeholder in BOTH
+      // modes (Kodak.pm:2988-2989).
+      if let Some(len) = frea.thumbnail_len() {
+        tags.push(EmittedTag::new(
+          kodak(),
+          "ThumbnailImage".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
+      if let Some(len) = frea.preview_len() {
+        tags.push(EmittedTag::new(
+          kodak(),
+          "PreviewImage".into(),
+          TagValue::Str(binary_placeholder(len)),
+          false,
+        ));
+      }
     }
 
     // ── per-track (tkhd / mdhd / hdlr) ─────────────────────────────────

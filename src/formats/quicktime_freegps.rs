@@ -43,7 +43,7 @@
 //! | 15      | Vantrue N4                             | 2240-2263   | Ported   |
 //! | 16      | IQS Novatek variant                    | 2298-2309   | Ported   |
 //! | 17      | Viofo A119S (Novatek/Kenwood binary)   | 2265-2352   | Ported   |
-//! | 17b     | Rexing V1-4k scaled lat/lon            | 2323-2327   | DEFERRED |
+//! | 17b     | Rexing V1-4k scaled lat/lon            | 2323-2327   | Ported   |
 //! | 17c     | Transcend Drive Body Camera 70         | 2328-2338   | Ported   |
 //! | 18      | XGODY 12" 4K (ASCII)                   | 2354-2384   | Ported   |
 //! | 19      | 70mai A810                             | 2386-2401   | Ported   |
@@ -69,18 +69,21 @@
 //!  - **EACHPAI** (GPSType 9) — bundled ExifTool emits
 //!    `Can't yet decrypt EACHPAI timed GPS` and stops; faithful (the
 //!    encryption isn't published).
-//!  - **Rexing V1-4k (GPSType 17b)** (QuickTimeStream.pl:2323-2327) — bundled
-//!    applies the 17b lat/lon scaling ONLY when `$$et{KodakVersion} eq
-//!    '3.01.054'`. That global is set EXCLUSIVELY by the `'ver '` tag inside
-//!    the `frea` atom of Kodak PixPro SP360 MP4 videos
-//!    (`Image::ExifTool::Kodak::frea`, Kodak.pm:2987 `RawConv =>
-//!    '$$self{KodakVersion} = $val'`). The port has no Kodak.pm port and no
-//!    `frea`-atom handler, so `KodakVersion` is unavailable in the
-//!    self-contained freeGPS scan: a real Rexing file therefore falls through
-//!    to the default Type-17 branch. Faithfully threading 17b would require
-//!    porting the Kodak `frea` table + a QuickTime `frea` atom walker + a
-//!    cross-module `$$et` global — DEFERRED (tracked); the existing fallthrough
-//!    matches ExifTool for every file that lacks the Kodak `ver ` tag.
+//!
+//! ## Type-17b — Rexing V1-4k (now ported, was a cross-module dependency)
+//!
+//! The Type-17b lat/lon scaling (QuickTimeStream.pl:2323-2327) applies ONLY
+//! when `$$et{KodakVersion} eq '3.01.054'`. That global is set EXCLUSIVELY by
+//! the `'ver '` tag inside the top-level `frea` atom of Kodak PixPro SP360 /
+//! Rexing MP4 videos (`Image::ExifTool::Kodak::frea`, Kodak.pm:2987 `RawConv =>
+//! '$$self{KodakVersion} = $val'`; dispatched from `%QuickTime::Main` `frea`,
+//! QuickTime.pm:610-613). The port now decodes that `frea` atom in the
+//! QuickTime atom walker ([`crate::formats::quicktime`]) — the `frea` atom is
+//! parsed in the FIRST top-level pass, BEFORE the `mdat` freeGPS scan, so
+//! `KodakVersion` is populated when Type-17 decodes — and threads the decoded
+//! `KodakVersion` into [`process_free_gps`] (and the `gps `-sample-table
+//! path). A file WITHOUT the Kodak `ver ` tag carries `kodak_version == None`
+//! and falls through to the default Type-17 branch, unchanged.
 //!
 //! Each variant cites QuickTimeStream.pl line numbers at the top of its
 //! decoder function. All record offsets/byte layouts are taken verbatim from
@@ -190,6 +193,7 @@ pub fn scan_media_data(
   mdat_offset: u64,
   mdat_size: u64,
   create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
   already_found_embedded: bool,
   out: &mut QuickTimeStreamMeta,
 ) {
@@ -254,7 +258,7 @@ pub fn scan_media_data(
           }
           let block = &mdat[block_abs..block_abs + len];
           // QuickTimeStream.pl:3777-3778: pass DataPt=&block, DirLen=len.
-          process_free_gps(block, create_date_raw, &mut state, out);
+          process_free_gps(block, create_date_raw, kodak_version, &mut state, out);
           found = true;
           if block_abs + len > chunk_end {
             // The block ran past the current chunk. ExifTool's `$pos += $len;
@@ -447,6 +451,7 @@ impl Default for FreeGpsState {
 pub fn process_free_gps(
   data: &[u8],
   _create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
   state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
@@ -597,7 +602,7 @@ pub fn process_free_gps(
     && matches!(data.get(74), Some(&b'E' | &b'W'))
     && data.get(75).copied() == Some(0)
   {
-    decode_type16_17_viofo(data, out);
+    decode_type16_17_viofo(data, kodak_version, out);
     return;
   }
 
@@ -1898,7 +1903,13 @@ fn decode_type15_vantrue_n4(data: &[u8], out: &mut QuickTimeStreamMeta) {
 // ────────────── GPSType 16/17/17b/17c: Viofo A119S binary ──────────────────
 
 /// `decode_type16_17_viofo` (QuickTimeStream.pl:2265-2352).
-fn decode_type16_17_viofo(data: &[u8], out: &mut QuickTimeStreamMeta) {
+///
+/// `kodak_version` is the cross-module `$$et{KodakVersion}` global set by the
+/// top-level Kodak `frea` atom (`'ver '` sub-atom, Kodak.pm:2987 — threaded
+/// from [`crate::formats::quicktime`]). It selects the **Type-17b** Rexing
+/// V1-4k lat/lon scaling (QuickTimeStream.pl:2323-2327) when it equals
+/// `'3.01.054'`.
+fn decode_type16_17_viofo(data: &[u8], kodak_version: Option<&str>, out: &mut QuickTimeStreamMeta) {
   let mut t = FreeGpsTags::new();
   // QuickTimeStream.pl:2296 — unpack 'x48V6a1a1a1x1V4'.
   let hr = le_u32(data, 0x30).unwrap_or(0);
@@ -1929,18 +1940,25 @@ fn decode_type16_17_viofo(data: &[u8], out: &mut QuickTimeStreamMeta) {
     t.alt = le_f32(data, 0x58).map(|v| v / 1000.0);
   } else {
     // ── Type 17 (Viofo A119S binary, QuickTimeStream.pl:2311-2342) ──
-    let lat = le_f32(data, 0x4c).unwrap_or(0.0);
-    let lon = le_f32(data, 0x50).unwrap_or(0.0);
+    let mut lat = le_f32(data, 0x4c).unwrap_or(0.0);
+    let mut lon = le_f32(data, 0x50).unwrap_or(0.0);
     let mut spd = le_f32(data, 0x54).unwrap_or(0.0) * KNOTS_TO_KPH;
     let trk = le_f32(data, 0x58).unwrap_or(0.0);
-    // 17b (Rexing V1-4k, QuickTimeStream.pl:2323-2327) keys off the Kodak
-    // maker-note `KodakVersion` global, which is not available in the
-    // self-contained freeGPS scan, so that scaling branch is not reachable
-    // here (DEFERRED with the cross-module KodakVersion dependency).
-    // 17c: Transcend Drive Body Camera 70 (QuickTimeStream.pl:2328-2338).
-    // `Get32u($dataPt, 0)` is read little-endian (SetByteOrder('II') is in
-    // effect): the dump `00 00 40 00` → LE 0x00400000.
-    if le_u32(data, 0) == Some(0x400000) && lat.abs() <= 90.0 && lon.abs() <= 180.0 {
+    // The bundled dispatch order is 17b → 17c → default-17
+    // (QuickTimeStream.pl:2323-2341).
+    if kodak_version == Some("3.01.054") {
+      // ── 17b (Rexing V1-4k, QuickTimeStream.pl:2323-2327) ──
+      // Recognized by the Kodak `frea`-atom `KodakVersion` global; the dashcam
+      // scales the raw lat/lon and the result is already decimal degrees
+      // (`$ddd = 1`). The speed is NOT divided by `knotsToKph` here (unlike
+      // 17c) — it stays the `GetFloat * knotsToKph` km/h value above.
+      lat = (lat - 187.982_162_849_635) / 3.0;
+      lon = (lon - 2199.198_737_154_95) / 2.0;
+      t.ddd = true;
+    } else if le_u32(data, 0) == Some(0x400000) && lat.abs() <= 90.0 && lon.abs() <= 180.0 {
+      // ── 17c: Transcend Drive Body Camera 70 (QuickTimeStream.pl:2328-2338).
+      // `Get32u($dataPt, 0)` is read little-endian (SetByteOrder('II') is in
+      // effect): the dump `00 00 40 00` → LE 0x00400000.
       t.ddd = true;
       spd /= KNOTS_TO_KPH; // already km/h.
     }
@@ -2160,7 +2178,14 @@ mod tests {
   /// test shape (`ProcessFreeGPS` with a clean `$$et{FreeGPS2}`).
   fn decode_block(block: &[u8], out: &mut QuickTimeStreamMeta) {
     let mut state = FreeGpsState::new();
-    process_free_gps(block, None, &mut state, out);
+    process_free_gps(block, None, None, &mut state, out);
+  }
+
+  /// Decode one freeGPS block with a `KodakVersion` global in effect — the
+  /// Rexing Type-17b test shape.
+  fn decode_block_kodak(block: &[u8], kodak_version: &str, out: &mut QuickTimeStreamMeta) {
+    let mut state = FreeGpsState::new();
+    process_free_gps(block, None, Some(kodak_version), &mut state, out);
   }
 
   /// Build a freeGPS block from a `inner` mut buffer that is treated as the
@@ -2408,7 +2433,7 @@ mod tests {
     file.extend_from_slice(&[0u8; 100]);
 
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat_size, None, false, &mut out);
+    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
   }
 
@@ -2416,7 +2441,7 @@ mod tests {
   fn scan_media_data_short_circuits_when_embedded_found() {
     let mut out = QuickTimeStreamMeta::new();
     let file = vec![0u8; 0x10000];
-    scan_media_data(&file, 0, file.len() as u64, None, true, &mut out);
+    scan_media_data(&file, 0, file.len() as u64, None, None, true, &mut out);
     assert!(out.is_empty());
   }
 
@@ -2674,7 +2699,15 @@ mod tests {
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&mdat);
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat.len() as u64, None, false, &mut out);
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat.len() as u64,
+      None,
+      None,
+      false,
+      &mut out,
+    );
     assert_eq!(
       out.gps_samples().len(),
       2,
@@ -2700,6 +2733,7 @@ mod tests {
       &file,
       mdat_offset,
       block.len() as u64,
+      None,
       None,
       false,
       &mut out,
@@ -2770,9 +2804,9 @@ mod tests {
 
     let mut state = FreeGpsState::new();
     let mut out = QuickTimeStreamMeta::new();
-    process_free_gps(&block1, None, &mut state, &mut out);
+    process_free_gps(&block1, None, None, &mut state, &mut out);
     assert_eq!(out.gps_samples().len(), 2, "block 1 emits both new records");
-    process_free_gps(&block2, None, &mut state, &mut out);
+    process_free_gps(&block2, None, None, &mut state, &mut out);
     assert_eq!(
       out.gps_samples().len(),
       3,
@@ -2857,5 +2891,95 @@ mod tests {
     );
     assert!(tv.lat.is_none(), "V status copies nothing");
     assert!(tv.yr.is_none());
+  }
+
+  /// Build a Type-17 (Viofo A119S binary) freeGPS block matching the bundled
+  /// Rexing dump (QuickTimeStream.pl:2317-2322): `A`/`N`/`W` at offset 72, the
+  /// `x48V6` date/time, and the lat/lon floats `e9 7e 90 43` / `48 76 17 45`
+  /// (≈ 288.99 / 2423.39). `word0` (offset 0) is NOT `0x00400000`, so the 17c
+  /// branch never fires — only the KodakVersion gate selects 17b.
+  fn make_type17_rexing_block() -> Vec<u8> {
+    let mut b = vec![0u8; 0x100];
+    b[0..4].copy_from_slice(&0x0100u32.to_be_bytes()); // box length (BE), LE != 0x400000
+    b[4..12].copy_from_slice(b"freeGPS ");
+    b[0x48] = b'A';
+    b[0x49] = b'N';
+    b[0x4a] = b'W';
+    b[0x4b] = 0;
+    b[0x30..0x34].copy_from_slice(&14u32.to_le_bytes()); // hr
+    b[0x34..0x38].copy_from_slice(&34u32.to_le_bytes()); // min
+    b[0x38..0x3c].copy_from_slice(&40u32.to_le_bytes()); // sec
+    b[0x3c..0x40].copy_from_slice(&2024u32.to_le_bytes()); // yr
+    b[0x40..0x44].copy_from_slice(&2u32.to_le_bytes()); // mon
+    b[0x44..0x48].copy_from_slice(&22u32.to_le_bytes()); // day
+    b[0x4c..0x50].copy_from_slice(&[0xe9, 0x7e, 0x90, 0x43]); // lat float 288.99
+    b[0x50..0x54].copy_from_slice(&[0x48, 0x76, 0x17, 0x45]); // lon float 2423.39
+    b[0x54..0x58].copy_from_slice(&50.0f32.to_le_bytes()); // spd (knots)
+    b[0x58..0x5c].copy_from_slice(&90.0f32.to_le_bytes()); // trk
+    b
+  }
+
+  /// GPSType 17b (Rexing V1-4k) — when `KodakVersion == "3.01.054"`, the raw
+  /// lat/lon floats are scaled `(lat-187.982162849635)/3` /
+  /// `(lon-2199.19873715495)/2` and treated as decimal degrees
+  /// (QuickTimeStream.pl:2323-2327). Oracle-verified vs bundled ExifTool 13.59
+  /// (`GPSLatitude 33.6697742486894`, `GPSLongitude -112.096920485025`).
+  #[test]
+  fn type17b_rexing_kodak_version_scales_lat_lon() {
+    let block = make_type17_rexing_block();
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block_kodak(&block, "3.01.054", &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one 17b sample");
+    let s = &out.gps_samples()[0];
+    let lat = s.latitude().expect("lat");
+    let lon = s.longitude().expect("lon");
+    // 17b is `$ddd = 1` ⇒ NO ConvertLatLon; `W` ref negates the longitude.
+    assert!(
+      (lat - 33.669_774_248_689_4).abs() < 1e-9,
+      "17b lat {lat} (want 33.6697742486894)"
+    );
+    assert!(
+      (lon - -112.096_920_485_025).abs() < 1e-9,
+      "17b lon {lon} (want -112.096920485025)"
+    );
+    // 17b does NOT divide speed by knotsToKph (unlike 17c): 50 knots * 1.852.
+    assert!(
+      (s.speed_kph().expect("spd") - 92.6).abs() < 1e-4,
+      "spd 92.6"
+    );
+    assert_eq!(s.track(), Some(90.0));
+    assert_eq!(s.date_time(), Some("2024:02:22 14:34:40Z"));
+  }
+
+  /// Control — the SAME Type-17 block WITHOUT a `KodakVersion` (or a
+  /// non-matching one) must take the DEFAULT Type-17 branch: lat/lon are raw
+  /// DDDMM.MMMM fed to ConvertLatLon, NOT the 17b scaling. Oracle-verified vs
+  /// bundled (`GPSLatitude 3.48319142659505`, `GPSLongitude -24.3898763020833`).
+  #[test]
+  fn type17_default_without_kodak_version_uses_convertlatlon() {
+    let block = make_type17_rexing_block();
+    // No KodakVersion ⇒ default-17.
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block(&block, &mut out);
+    let s = &out.gps_samples()[0];
+    let lat = s.latitude().expect("lat");
+    let lon = s.longitude().expect("lon");
+    assert!(
+      (lat - 3.483_191_426_595_05).abs() < 1e-9,
+      "default-17 lat {lat} (want 3.48319142659505)"
+    );
+    assert!(
+      (lon - -24.389_876_302_083_3).abs() < 1e-9,
+      "default-17 lon {lon} (want -24.3898763020833)"
+    );
+
+    // A NON-matching KodakVersion is also default-17 (only "3.01.054" gates 17b).
+    let mut out2 = QuickTimeStreamMeta::new();
+    decode_block_kodak(&block, "9.99.999", &mut out2);
+    let s2 = &out2.gps_samples()[0];
+    assert!(
+      (s2.latitude().expect("lat") - 3.483_191_426_595_05).abs() < 1e-9,
+      "non-matching KodakVersion stays default-17"
+    );
   }
 }

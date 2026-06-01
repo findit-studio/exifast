@@ -19,7 +19,7 @@
 //! the SP3 timed-metadata tags never pollute the non-`-ee` conformance set.
 #![cfg(all(feature = "quicktime", feature = "json"))]
 
-use exifast::parse_quicktime;
+use exifast::{AnyMeta, ConvMode, parse_bytes, parse_quicktime};
 
 /// Load `tests/golden/<name>.ee.json` and return the first (only) document.
 fn ee_golden(name: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -517,6 +517,96 @@ fn quicktime_freegps_brute_force_scan_finds_block_in_mdat() {
   // Type 6 lat 4737.7053 ⇒ ConvertLatLon ⇒ 47.628.
   assert!((s.latitude().unwrap() - 47.628_421).abs() < 1e-3);
   assert!(s.longitude().unwrap() < -120.0);
+}
+
+#[test]
+fn quicktime_frea_kodak_tags_decode_with_oracle_parity() {
+  // Part A — the top-level `frea` atom → `Image::ExifTool::Kodak::frea`
+  // (QuickTime.pm:610-613 ⇒ Kodak.pm:2977-2990). The fixture's `frea` carries
+  // `tima` (Duration 3725s), `'ver '` (KodakVersion "3.01.054"), `thma`
+  // (ThumbnailImage 40B) and `scra` (PreviewImage 60B). Bundled `-ee -G1` ⇒
+  // the four tags under family-0 `MakerNotes`, family-1 `Kodak`.
+  let data = fixture("QuickTime_frea_rexing17b.mov");
+  let golden = ee_golden("QuickTime_frea_rexing17b.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+
+  // Typed accessor: the decoded `frea` values.
+  let frea = meta.quicktime().kodak_frea();
+  assert!(!frea.is_empty(), "frea atom must be decoded");
+  assert_eq!(frea.duration_secs(), Some(3725), "tima raw int32u seconds");
+  assert_eq!(frea.version(), Some("3.01.054"), "KodakVersion string");
+  assert_eq!(frea.thumbnail_len(), Some(40), "thma payload byte count");
+  assert_eq!(frea.preview_len(), Some(60), "scra payload byte count");
+
+  // Rendered tag stream (the golden `Meta::tags()` path): the four tags emit
+  // under family-0 `MakerNotes`, family-1 `Kodak`, with the bundled-parity
+  // PrintConv values.
+  let any = parse_bytes(&data).expect("parse ok").expect("recognized");
+  assert!(matches!(any, AnyMeta::QuickTime(_)), "got {any:?}");
+  let tags: Vec<exifast::Tag> = any.iter_tags(ConvMode::PrintConv).collect();
+  let kodak: std::collections::HashMap<&str, &exifast::Tag> = tags
+    .iter()
+    .filter(|t| t.group_ref().family0() == "MakerNotes" && t.group_ref().family1() == "Kodak")
+    .map(|t| (t.name(), t))
+    .collect();
+  assert_eq!(kodak.len(), 4, "exactly the four Kodak frea tags");
+  for (name, want_key) in [
+    ("Duration", "Kodak:Duration"),
+    ("KodakVersion", "Kodak:KodakVersion"),
+    ("ThumbnailImage", "Kodak:ThumbnailImage"),
+    ("PreviewImage", "Kodak:PreviewImage"),
+  ] {
+    let tag = kodak
+      .get(name)
+      .unwrap_or_else(|| panic!("Kodak:{name} emitted"));
+    // Every frea PrintConv value is a `TagValue::Str` (Duration ⇒ ConvertDuration
+    // string, KodakVersion ⇒ raw string, thma/scra ⇒ binary placeholder).
+    let got = match tag.value_ref() {
+      exifast::TagValue::Str(s) => s.as_str(),
+      other => panic!("Kodak:{name} expected a string value, got {other:?}"),
+    };
+    let want = golden
+      .get(want_key)
+      .and_then(|v| v.as_str())
+      .unwrap_or_else(|| panic!("golden {want_key}"));
+    assert_eq!(got, want, "Kodak:{name} oracle parity ({got} vs {want})");
+  }
+}
+
+#[test]
+fn quicktime_frea_rexing_type17b_scales_gps_via_kodak_version() {
+  // Part B — the `frea`-atom KodakVersion ("3.01.054") is threaded into the
+  // `mdat` freeGPS scan; the Type-17 block then takes the 17b Rexing V1-4k
+  // scaling (QuickTimeStream.pl:2323-2327): `(lat-187.982162849635)/3` /
+  // `(lon-2199.19873715495)/2`, decimal degrees, `W` ref negating the lon.
+  // Bundled `-ee` ⇒ GPSLatitude 33.6697742486894, GPSLongitude
+  // -112.096920485025 (verified vs ExifTool 13.59).
+  let data = fixture("QuickTime_frea_rexing17b.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let fix = meta
+    .stream()
+    .first_fix()
+    .expect("17b GPS fix from the mdat freeGPS scan");
+  let lat = fix.latitude().expect("lat");
+  let lon = fix.longitude().expect("lon");
+  assert!(
+    (lat - 33.669_774_248_689_4).abs() < 1e-6,
+    "17b lat {lat} (want 33.6697742486894)"
+  );
+  assert!(
+    (lon - -112.096_920_485_025).abs() < 1e-6,
+    "17b lon {lon} (want -112.096920485025)"
+  );
+  assert!(
+    (fix.speed_kph().expect("spd") - 92.6).abs() < 1e-3,
+    "17b speed 92.6 km/h (knotsToKph, NOT divided)"
+  );
+  assert_eq!(fix.track(), Some(90.0), "17b track");
+  assert_eq!(fix.date_time(), Some("2024:02:22 14:34:40Z"));
 }
 
 /// Build a minimal but valid `.mov` containing:

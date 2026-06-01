@@ -1580,6 +1580,7 @@ fn process_samples(
   data: &[u8],
   track: &StreamTrack,
   create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
@@ -1598,7 +1599,15 @@ fn process_samples(
     if buff.is_empty() {
       continue;
     }
-    decode_one_sample(buff, track, sample, create_date_raw, free_gps_state, out);
+    decode_one_sample(
+      buff,
+      track,
+      sample,
+      create_date_raw,
+      kodak_version,
+      free_gps_state,
+      out,
+    );
   }
 }
 
@@ -1609,6 +1618,7 @@ fn decode_one_sample(
   track: &StreamTrack,
   sample: &Sample,
   create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
@@ -1638,7 +1648,13 @@ fn decode_one_sample(
       // gated on this path having produced nothing), so `FoundGPSByScan` is
       // never set here; the natural table-then-scan ordering provides the
       // same mutual exclusion.
-      quicktime_freegps::process_free_gps(buff, create_date_raw, free_gps_state, out);
+      quicktime_freegps::process_free_gps(
+        buff,
+        create_date_raw,
+        kodak_version,
+        free_gps_state,
+        out,
+      );
     }
     return;
   }
@@ -1647,7 +1663,7 @@ fn decode_one_sample(
   // Sony.pm, Canon.pm). See module docs + docs/tracking.md. An unrecognized
   // MetaFormat yields no samples, exactly as ExifTool's "Unknown $type
   // format" branch (QuickTimeStream.pl:1547).
-  let _ = (buff, create_date_raw);
+  let _ = (buff, create_date_raw, kodak_version);
 }
 
 // ===========================================================================
@@ -1825,10 +1841,19 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// `create_date_raw` is the `mvhd` CreateDate as raw 1904-epoch seconds
 /// (needed for `GPSDateTime` synthesis); `None` when no `mvhd` carried one.
 ///
+/// `kodak_version` is the cross-module `$$et{KodakVersion}` global (the Kodak
+/// `frea`-atom `'ver '` value, decoded BEFORE this call); it selects the
+/// freeGPS Type-17b Rexing scaling in [`quicktime_freegps::process_free_gps`]
+/// for the `gps `-sample-table path.
+///
 /// Returns an empty [`QuickTimeStreamMeta`] for the common case of a video
 /// with no timed metadata (or only deferred-format metadata).
 #[must_use]
-pub(crate) fn extract_stream(data: &[u8], create_date_raw: Option<u64>) -> QuickTimeStreamMeta {
+pub(crate) fn extract_stream(
+  data: &[u8],
+  create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
+) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by every
   // `gps ` sample-table track (QuickTimeStream.pl:2058). The brute-force
@@ -1851,6 +1876,7 @@ pub(crate) fn extract_stream(data: &[u8], create_date_raw: Option<u64>) -> Quick
         ps,
         body_end,
         create_date_raw,
+        kodak_version,
         &mut free_gps_state,
         &mut out,
       ),
@@ -1882,6 +1908,7 @@ fn walk_moov(
   start: usize,
   end: usize,
   create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
@@ -1895,7 +1922,14 @@ fn walk_moov(
         // `gps `-HandlerType track routes through here too (its samples are
         // dispatched to ProcessFreeGPS in `decode_one_sample`).
         if is_meta_handler(&track.handler) {
-          process_samples(data, &track, create_date_raw, free_gps_state, out);
+          process_samples(
+            data,
+            &track,
+            create_date_raw,
+            kodak_version,
+            free_gps_state,
+            out,
+          );
         }
       }
       // The `moov`-level Novatek `gps ` box — a DIRECT child atom of `moov`
@@ -2463,7 +2497,7 @@ mod tests {
     let moov = atom(b"moov", &mvhd);
     let mut data = ftyp;
     data.extend_from_slice(&moov);
-    let meta = extract_stream(&data, None);
+    let meta = extract_stream(&data, None, None);
     assert!(meta.is_empty());
   }
 
@@ -2558,7 +2592,7 @@ mod tests {
     data.extend_from_slice(&blk); // the freeGPS block at offset = block_offset
     data.extend_from_slice(&moov);
 
-    let meta = extract_stream(&data, None);
+    let meta = extract_stream(&data, None, None);
     assert_eq!(
       meta.gps_samples().len(),
       1,
