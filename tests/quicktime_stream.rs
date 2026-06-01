@@ -520,6 +520,56 @@ fn quicktime_freegps_brute_force_scan_finds_block_in_mdat() {
 }
 
 #[test]
+fn quicktime_moov_gps_box_decodes_block_outside_mdat() {
+  // Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box,
+  // `%eeBox{''}{'gps '} = 'moov'`, QuickTime.pm:523-533) is an offset TABLE
+  // whose `(start, size)` pairs point at `freeGPS ` blocks ANYWHERE in the
+  // file — `ParseTag` reads each block and runs ProcessSamples
+  // (QuickTimeStream.pl:2544-2556). This fixture is the XGODY 12" 4K Dashcam
+  // shape: a single Type-6 `freeGPS ` block lives OUTSIDE `mdat` (between
+  // `ftyp` and `moov`), reachable ONLY via the offset table. Oracle (`-ee`):
+  //   GPSLatitude 47 deg 37' 42.30" N, GPSLongitude 122 deg 9' 54.08" W,
+  //   GPSDateTime 2024:07:15 14:30:45Z.
+  let data = fixture("QuickTime_moov_gps.mov");
+  let golden = ee_golden("QuickTime_moov_gps.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  assert_eq!(
+    stream.gps_samples().len(),
+    1,
+    "the moov-level gps ' offset table must decode the out-of-mdat block"
+  );
+  let s = &stream.gps_samples()[0];
+  // Type-6 stores lat/lon as f32 (block-relative); 4737.7053 DDDMM.MMMM ⇒
+  // 47.6284..., 12209.901 (West) ⇒ -122.1650... — cross-checking the oracle's
+  // DMS PrintConv string (`47 deg 37' 42.30" N`, `122 deg 9' 54.08" W`). The
+  // f32 round-trip widens the tolerance, exactly as the brute-force-scan test.
+  let lat = s.latitude().expect("latitude");
+  let lon = s.longitude().expect("longitude");
+  assert!((lat - 47.628_421).abs() < 1e-3, "lat {lat}");
+  assert!((lon + 122.165_016).abs() < 1e-3, "lon {lon}");
+  let dms_lat = golden
+    .get("QuickTime:GPSLatitude")
+    .and_then(|v| v.as_str())
+    .expect("golden GPSLatitude");
+  assert!(dms_lat.ends_with('N'), "fix is North: {dms_lat}");
+  let dms_lon = golden
+    .get("QuickTime:GPSLongitude")
+    .and_then(|v| v.as_str())
+    .expect("golden GPSLongitude");
+  assert!(dms_lon.ends_with('W'), "fix is West: {dms_lon}");
+  // The block carries its OWN date (Type-6 parses yr/mon/day + hr/min/sec), so
+  // GPSDateTime matches the oracle exactly — independent of any SampleTime.
+  assert_eq!(
+    s.date_time(),
+    golden.get("QuickTime:GPSDateTime").and_then(|v| v.as_str()),
+    "GPSDateTime matches the oracle"
+  );
+}
+
+#[test]
 fn quicktime_frea_kodak_tags_decode_with_oracle_parity() {
   // Part A — the top-level `frea` atom → `Image::ExifTool::Kodak::frea`
   // (QuickTime.pm:610-613 ⇒ Kodak.pm:2977-2990). The fixture's `frea` carries

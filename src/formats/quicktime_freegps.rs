@@ -81,7 +81,7 @@
 //! QuickTime atom walker ([`crate::formats::quicktime`]) — the `frea` atom is
 //! parsed in the FIRST top-level pass, BEFORE the `mdat` freeGPS scan, so
 //! `KodakVersion` is populated when Type-17 decodes — and threads the decoded
-//! `KodakVersion` into [`process_free_gps`] (and the `gps `-sample-table
+//! `KodakVersion` into [`process_free_gps`] (and the `moov`-level `gps ` box
 //! path). A file WITHOUT the Kodak `ver ` tag carries `kodak_version == None`
 //! and falls through to the default Type-17 branch, unchanged.
 //!
@@ -456,13 +456,19 @@ impl Default for FreeGpsState {
 /// whose blocks carry NO embedded date use them (currently only Type-19, the
 /// 70mai A810 — QuickTimeStream.pl:2396 `SetGPSDateTime($et, $tagTbl,
 /// $$dirInfo{SampleTime})`); every other variant parses its own date from the
-/// block and ignores both. `sample_time` is `Some` only on the
-/// `gps `-sample-table dispatch path (where ExifTool sets `$$dirInfo{SampleTime}
-/// => $time[$i]`, QuickTimeStream.pl:1562) and `None` on the brute-force
-/// `ScanMediaData` path (whose `$dirInfo` carries no `SampleTime`,
-/// QuickTimeStream.pl:3777) — so a real 70mai file (whose freeGPS blocks come
-/// from the mdat scan, "no timestamps in the samples", QuickTimeStream.pl:2389)
-/// gets `None` and emits no GPSDateTime, byte-for-byte matching the oracle.
+/// block and ignores both.
+///
+/// In this port BOTH live callers pass `sample_time = None`: the brute-force
+/// `ScanMediaData` path carries no `SampleTime` (`$dirInfo` has none,
+/// QuickTimeStream.pl:3777), and the `moov`-level `gps ` offset box populates
+/// only `$$et{ee}{start}`/`{size}` (no `stts`), so its `$time[$i]` is `undef`
+/// (QuickTimeStream.pl:2548-2556 → :1562). A date-less GPSType (Type-19) thus
+/// emits no `GPSDateTime` — byte-for-byte matching a real 70mai file ("no
+/// timestamps in the samples", QuickTimeStream.pl:2389). The `Some` arm — the
+/// faithful 1:1 of the Perl that runs when a `gps `-dispatch sample DOES carry
+/// a decoding time (`$$dirInfo{SampleTime} => $time[$i]`, QuickTimeStream.pl:1562)
+/// — is exercised by the unit test
+/// `decode_type19_70mai_synthesizes_gps_date_time_from_sample_time`.
 ///
 /// QuickTimeStream.pl:1645 `return 0 if $dirLen < 82` — a block too short to
 /// carry any fingerprint is silently dropped.
@@ -2690,11 +2696,15 @@ mod tests {
     assert_eq!(out.gps_samples()[0].date_time(), None);
   }
 
-  /// GPSType 19 (70mai) on the `gps `-sample-table path threads the sample's
-  /// decoding time through `SetGPSDateTime` (QuickTimeStream.pl:2396): with a
-  /// CreateDate + SampleTime BOTH present, `GPSDateTime` = CreateDate +
-  /// SampleTime (QuickTimeStream.pl:984-1006). With no CreateDate it stays
-  /// empty (the `if defined $sampleTime and $$value{CreateDate}` guard).
+  /// GPSType 19 (70mai) threads a per-sample decoding time through
+  /// `SetGPSDateTime` (QuickTimeStream.pl:2396): with a CreateDate + SampleTime
+  /// BOTH present, `GPSDateTime` = CreateDate + SampleTime
+  /// (QuickTimeStream.pl:984-1006); with no CreateDate it stays empty (the `if
+  /// defined $sampleTime and $$value{CreateDate}` guard). This pins the
+  /// `process_free_gps` `sample_time` MECHANISM directly — the faithful 1:1 of
+  /// the Perl that runs when a `gps `-dispatch sample carries a `$time[$i]`.
+  /// (No live caller supplies a `Some` SampleTime today: the brute-force scan
+  /// has none, and the `moov`-level `gps ` box carries no `stts`.)
   #[test]
   fn decode_type19_70mai_synthesizes_gps_date_time_from_sample_time() {
     let mut block = make_block(0x100).0;

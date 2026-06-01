@@ -1569,21 +1569,13 @@ struct StreamTrack {
 /// `MetaFormat` / `MediaTimeScale`), expand the sample list and decode each
 /// sample by format.
 ///
-/// `data` is the WHOLE file slice (sample offsets are absolute file offsets);
-/// `create_date_raw` is the movie `mvhd` CreateDate (raw 1904-epoch seconds)
-/// for `GPSDateTime` synthesis.
+/// `data` is the WHOLE file slice (sample offsets are absolute file offsets).
 ///
-/// Only the self-contained sample formats are decoded here; an unrecognized
-/// or deferred `MetaFormat` simply yields no samples (faithful: ExifTool
-/// `VPrint`s "Unknown $type format" and moves on, QuickTimeStream.pl:1547).
-fn process_samples(
-  data: &[u8],
-  track: &StreamTrack,
-  create_date_raw: Option<u64>,
-  kodak_version: Option<&str>,
-  free_gps_state: &mut FreeGpsState,
-  out: &mut QuickTimeStreamMeta,
-) {
+/// Only the self-contained sample formats are decoded here (currently the
+/// Apple `mebx` timed-metadata format); an unrecognized or deferred
+/// `MetaFormat` simply yields no samples (faithful: ExifTool `VPrint`s
+/// "Unknown $type format" and moves on, QuickTimeStream.pl:1547).
+fn process_samples(data: &[u8], track: &StreamTrack, out: &mut QuickTimeStreamMeta) {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
     None => return,
@@ -1599,15 +1591,7 @@ fn process_samples(
     if buff.is_empty() {
       continue;
     }
-    decode_one_sample(
-      buff,
-      track,
-      sample,
-      create_date_raw,
-      kodak_version,
-      free_gps_state,
-      out,
-    );
+    decode_one_sample(buff, track, sample, out);
   }
 }
 
@@ -1617,9 +1601,6 @@ fn decode_one_sample(
   buff: &[u8],
   track: &StreamTrack,
   sample: &Sample,
-  create_date_raw: Option<u64>,
-  kodak_version: Option<&str>,
-  free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
@@ -1629,46 +1610,17 @@ fn decode_one_sample(
     process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
     return;
   }
-  // The `gps ` sample table (QuickTimeStream.pl:1551-1564): a metadata track
-  // whose HandlerType is `gps ` (ExifTool's `$type eq 'gps '`). Each sample
-  // that starts with `....freeGPS ` (a 4-byte size word + the magic) is
-  // dispatched into `ProcessFreeGPS` — covering dashcams that REFERENCE their
-  // freeGPS blocks from the `gps ` table rather than (or in addition to)
-  // burying them in `mdat` (the bundled comment notes XGODY 12" 4K videos
-  // store no `gps ` data in mdat at all, and INNOV videos don't reference all
-  // of it from the table). The freeGPS `$$et` ring-buffer state is shared with
-  // the brute-force scan via `free_gps_state` (QuickTimeStream.pl:2058).
-  if &track.handler == b"gps " {
-    // QuickTimeStream.pl:1553 `if ($buff =~ /^....freeGPS /s)` — 4 arbitrary
-    // bytes (the box size) then the literal magic.
-    if buff.len() >= 12 && &buff[4..12] == b"freeGPS " {
-      // QuickTimeStream.pl:1557 `last if $$et{FoundGPSByScan}` — the
-      // brute-force scan, when it ran first, already decoded these blocks. In
-      // the port the scan runs AFTER `extract_stream` (it is the fallback,
-      // gated on this path having produced nothing), so `FoundGPSByScan` is
-      // never set here; the natural table-then-scan ordering provides the
-      // same mutual exclusion.
-      // QuickTimeStream.pl:1559-1564 — the `gps `-sample-table dispatch sets
-      // `$$dirInfo{SampleTime} => $time[$i]`, the enclosing sample's decoding
-      // time. Threaded so a date-less GPSType (Type-19) can synthesize its
-      // `GPSDateTime` via `SetGPSDateTime` (QuickTimeStream.pl:2396).
-      quicktime_freegps::process_free_gps(
-        buff,
-        create_date_raw,
-        sample.time,
-        kodak_version,
-        free_gps_state,
-        out,
-      );
-    }
-    return;
-  }
+  // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
+  // reaches `process_samples` ([`is_meta_handler`] excludes `gps `, faithful
+  // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
+  // EMPTY-HandlerType `moov`-level box ([`process_moov_gps_box`]), not a track.
+  //
   // `gpmd` GoPro / Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
   // DEFERRED — these re-dispatch into other ExifTool modules (GoPro.pm,
   // Sony.pm, Canon.pm). See module docs + docs/tracking.md. An unrecognized
   // MetaFormat yields no samples, exactly as ExifTool's "Unknown $type
   // format" branch (QuickTimeStream.pl:1547).
-  let _ = (buff, create_date_raw, kodak_version);
+  let _ = buff;
 }
 
 // ===========================================================================
@@ -1849,7 +1801,7 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// `kodak_version` is the cross-module `$$et{KodakVersion}` global (the Kodak
 /// `frea`-atom `'ver '` value, decoded BEFORE this call); it selects the
 /// freeGPS Type-17b Rexing scaling in [`quicktime_freegps::process_free_gps`]
-/// for the `gps `-sample-table path.
+/// for the `moov`-level `gps ` offset-box path.
 ///
 /// Returns an empty [`QuickTimeStreamMeta`] for the common case of a video
 /// with no timed metadata (or only deferred-format metadata).
@@ -1860,10 +1812,10 @@ pub(crate) fn extract_stream(
   kodak_version: Option<&str>,
 ) -> QuickTimeStreamMeta {
   let mut out = QuickTimeStreamMeta::new();
-  // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by every
-  // `gps ` sample-table track (QuickTimeStream.pl:2058). The brute-force
+  // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
+  // `moov`-level `gps ` offset box (QuickTimeStream.pl:2058). The brute-force
   // `ScanMediaData` keeps its own instance (the two paths are mutually
-  // exclusive: a `gps `-table decode populates `out`, which gates the scan).
+  // exclusive: a `gps `-box decode populates `out`, which gates the scan).
   let mut free_gps_state = FreeGpsState::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
   // `moov`-level `gps ` box; the `gps0`/`gsen`/`GPS ` magic boxes are
@@ -1906,6 +1858,88 @@ pub(crate) fn extract_stream(
   out
 }
 
+/// Decode the `moov`-level Novatek `gps ` box — the offset TABLE that
+/// `ParseTag` parses at QuickTimeStream.pl:2544-2557 (the `$tag eq 'gps '`
+/// arm).
+///
+/// `payload` is the box VALUE (the bytes AFTER the 8-byte atom header — what
+/// ExifTool passes to `ParseTag` as `$$dataPt`, QuickTime.pm:10282). The
+/// table layout (read big-endian, the QuickTime `'MM'` order ExifTool sets in
+/// `ProcessMOV`, QuickTime.pm:10014):
+///   `[reserved:4][count:4]` then `count` × `[start:4][size:4]`
+/// where each `(start, size)` is an ABSOLUTE file offset/length of a sample
+/// block (NOT relative to `mdat` — the XGODY 12" 4K Dashcam stores its
+/// `freeGPS ` blocks OUTSIDE `mdat`, QuickTimeStream.pl:1555-1556). `data` is
+/// the WHOLE file slice, so the blocks are read directly from it.
+///
+/// For each block that begins with `....freeGPS ` (a 4-byte size word + the
+/// magic, QuickTimeStream.pl:1553) we call [`quicktime_freegps::process_free_gps`].
+/// ExifTool fakes `HandlerType='gps '` and runs `ProcessSamples`
+/// (QuickTimeStream.pl:2555-2556) which, for THIS box, sets only
+/// `$$et{ee}{start}`/`{size}` (no `stts`), so `$time[$i]` is `undef` and the
+/// dispatch passes `SampleTime => undef` (QuickTimeStream.pl:1562) — hence the
+/// `None` sample time here. (A date-less GPSType such as Type-19 therefore
+/// synthesizes NO `GPSDateTime` from this source, exactly as
+/// `SetGPSDateTime(..., undef)` is a no-op, QuickTimeStream.pl:984.)
+///
+/// `kodak_version` is the cross-module `$$et{KodakVersion}` global (selects the
+/// freeGPS Type-17b Rexing scaling); `create_date_raw` is the movie
+/// `mvhd` CreateDate (raw 1904-epoch seconds) — both forwarded unchanged.
+fn process_moov_gps_box(
+  data: &[u8],
+  payload: &[u8],
+  create_date_raw: Option<u64>,
+  kodak_version: Option<&str>,
+  free_gps_state: &mut FreeGpsState,
+  out: &mut QuickTimeStreamMeta,
+) {
+  // QuickTimeStream.pl:2544 `elsif ($tag eq 'gps ' and $dataLen > 8)`.
+  if payload.len() <= 8 {
+    return;
+  }
+  // QuickTimeStream.pl:2546 `my $num = Get32u($dataPt, 4)`. The 4 bytes at
+  // payload offset 0 are reserved/version (ExifTool reads the count at 4).
+  let Some(mut num) = be_u32(payload, 4).map(|n| n as usize) else {
+    return;
+  };
+  // QuickTimeStream.pl:2547 `$num = int(($dataLen - 8) / 8) if $num*8+8 > $dataLen`.
+  // (`num * 8 + 8` is computed in usize; saturate to avoid overflow on a
+  // hostile count.)
+  if num.saturating_mul(8).saturating_add(8) > payload.len() {
+    num = (payload.len() - 8) / 8;
+  }
+  // QuickTimeStream.pl:2550-2553 — read the `(start, size)` pairs, then
+  // QuickTimeStream.pl:2555-2556 `ProcessSamples` reads each block. Because
+  // these blocks may be ANYWHERE in the file (not just `mdat`), the per-sample
+  // `start`/`size` are absolute file offsets into `data`.
+  for i in 0..num {
+    let Some(start) = be_u32(payload, 8 + i * 8).map(|v| v as usize) else {
+      break;
+    };
+    let Some(size) = be_u32(payload, 12 + i * 8).map(|v| v as usize) else {
+      break;
+    };
+    // QuickTimeStream.pl:1435-1442 — a seek/read past EOF warns + `next`s.
+    let Some(buff) = data.get(start..start.saturating_add(size)) else {
+      continue;
+    };
+    // QuickTimeStream.pl:1553 `if ($buff =~ /^....freeGPS /s)` — 4 arbitrary
+    // bytes (the inner box size) then the literal magic.
+    if buff.len() >= 12 && &buff[4..12] == b"freeGPS " {
+      // QuickTimeStream.pl:1559-1564 — `ProcessFreeGPS` with `SampleTime =>
+      // $time[$i]`, which is `undef` for this box (no `stts`); see fn docs.
+      quicktime_freegps::process_free_gps(
+        buff,
+        create_date_raw,
+        None,
+        kodak_version,
+        free_gps_state,
+        out,
+      );
+    }
+  }
+}
+
 /// Walk one `moov`: process each `trak`'s timed metadata and the magic
 /// `moov`-level `gps `/`GPS ` boxes.
 fn walk_moov(
@@ -1924,30 +1958,32 @@ fn walk_moov(
         let track = walk_trak(data, base, base + body.len());
         // Only metadata-bearing handlers feed `ProcessSamples`
         // (QuickTimeStream.pl:1315-1331 — `vide`/`soun` are hash-only). A
-        // `gps `-HandlerType track routes through here too (its samples are
-        // dispatched to ProcessFreeGPS in `decode_one_sample`).
+        // real `gps `-HandlerType track is NOT one of them: ExifTool has no
+        // `$eeBox{'gps '}` (only `$eeBox{''}{'gps '}`, the no-handler box at
+        // the `moov` level — QuickTime.pm:523-533), so a `trak` whose `hdlr`
+        // HandlerType is `gps ` is ignored for embedded extraction. See
+        // [`is_meta_handler`].
         if is_meta_handler(&track.handler) {
-          process_samples(
-            data,
-            &track,
-            create_date_raw,
-            kodak_version,
-            free_gps_state,
-            out,
-          );
+          process_samples(data, &track, out);
         }
       }
       // The `moov`-level Novatek `gps ` box — a DIRECT child atom of `moov`
-      // named `gps ` (NOT a `trak`; `%eeBox` `'gps ' => 'moov'`,
-      // QuickTime.pm:533). It is a directory TABLE of offsets into `mdat`
-      // pointing at `freeGPS ` blocks (decoded by `ParseTag`'s `gps ` arm,
-      // QuickTimeStream.pl:2544). DEFERRED: the brute-force `ScanMediaData`
-      // already reaches those same `mdat` blocks, so the offset-table decode
-      // is redundant for the camera-metadata goal — see docs/tracking.md. (A
-      // `gps `-HANDLER metadata track, by contrast, IS decoded via the `trak`
-      // arm above + the `gps ` branch of `decode_one_sample`.)
+      // named `gps ` (NOT a `trak`) with the EMPTY HandlerType: `%eeBox`
+      // `'' => { 'gps ' => 'moov' }` gated by `$eeBox{$handlerType}{$tag} eq
+      // $dirID` with `$dirID eq 'moov'` (QuickTime.pm:523-533, 10110-10114).
+      // It is an offset TABLE pointing at `freeGPS ` blocks that may live
+      // ANYWHERE in the file (the XGODY 12" 4K Dashcam stores them OUTSIDE
+      // `mdat`), decoded by `ParseTag`'s `gps ` arm (QuickTimeStream.pl:2544).
+      // `body` here is the box VALUE (payload after the atom header).
       b"gps " => {
-        let _ = create_date_raw; // DEFERRED: moov-level gps offset-table.
+        process_moov_gps_box(
+          data,
+          body,
+          create_date_raw,
+          kodak_version,
+          free_gps_state,
+          out,
+        );
       }
       _ => {}
     }
@@ -1955,15 +1991,18 @@ fn walk_moov(
 }
 
 /// `true` when a `hdlr` HandlerType feeds the timed-metadata path — `meta`
-/// / `data` / `sbtl` / `text` / `camm` / `ctbx`, plus `gps ` (a metadata track
-/// whose samples are freeGPS blocks, dispatched to `ProcessFreeGPS`,
-/// QuickTimeStream.pl:1551-1564). `vide` / `soun` are excluded (those are the
-/// hash-only path, QuickTimeStream.pl:1316-1331).
+/// / `data` / `sbtl` / `text` / `camm` / `ctbx` (the `%eeBox` keys with a
+/// `%eeStd` directory, QuickTime.pm:524-532). `vide` / `soun` are excluded
+/// (those are the hash-only path, QuickTimeStream.pl:1316-1331).
+///
+/// `gps ` is deliberately NOT here: ExifTool has no `$eeBox{'gps '}` entry —
+/// only `$eeBox{''}{'gps '} = 'moov'` (the EMPTY-HandlerType `moov`-level box,
+/// handled in [`process_moov_gps_box`]). A real `trak` whose `hdlr`
+/// HandlerType is `gps ` is therefore IGNORED for embedded GPS extraction
+/// (which also keeps the brute-force `mdat` scan un-suppressed, since such a
+/// track populates no samples — QuickTimeStream.pl:3689).
 fn is_meta_handler(h: &[u8; 4]) -> bool {
-  matches!(
-    h,
-    b"meta" | b"data" | b"sbtl" | b"text" | b"camm" | b"ctbx" | b"gps "
-  )
+  matches!(h, b"meta" | b"data" | b"sbtl" | b"text" | b"camm" | b"ctbx")
 }
 
 // ===========================================================================
@@ -2506,15 +2545,16 @@ mod tests {
     assert!(meta.is_empty());
   }
 
-  /// FINDING 2 regression — a `gps `-HandlerType metadata track whose samples
-  /// are `freeGPS ` blocks must be dispatched into `ProcessFreeGPS`
-  /// (QuickTimeStream.pl:1551-1564), covering dashcams (e.g. XGODY 12" 4K) that
-  /// REFERENCE their freeGPS data from the `gps ` sample table rather than
-  /// burying it in `mdat`. The `gps `-table branch of `walk_moov` used to be a
-  /// no-op, so such videos extracted no GPS.
+  /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box
+  /// keyed by `%eeBox{''}{'gps '} = 'moov'`, QuickTime.pm:523-533, parsed by
+  /// `ParseTag` at QuickTimeStream.pl:2544) is an OFFSET TABLE whose
+  /// `(start, size)` pairs point at `freeGPS ` blocks ANYWHERE in the file.
+  /// This exercises the XGODY 12" 4K Dashcam shape: the block lives OUTSIDE
+  /// `mdat` (here there is no `mdat` at all — the block sits between `ftyp` and
+  /// `moov`) and is reachable ONLY via the offset table. The block must decode.
   #[test]
-  fn gps_handler_sample_table_dispatches_freegps() {
-    // A self-contained Type-6 (Akaso) freeGPS block (block-absolute offsets).
+  fn moov_gps_box_decodes_freegps_block_outside_mdat() {
+    // A self-contained Type-6 (Akaso) freeGPS block (block-relative offsets).
     let mut blk = alloc::vec![0u8; 0x100];
     blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
     blk[4..12].copy_from_slice(b"freeGPS ");
@@ -2530,24 +2570,70 @@ mod tests {
     blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
     blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
 
-    // Layout = ftyp || freeGPS-block || moov, so the block's ABSOLUTE offset is
-    // simply ftyp.len() — independent of the (later-built) moov size, which the
-    // `stco` entry must point at.
+    // Layout = ftyp || freeGPS-block || moov, so the block's ABSOLUTE file
+    // offset is simply ftyp.len() — the offset-table `start` must point there.
     let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
-    let block_offset = (ftyp.len()) as u32;
+    let block_offset = ftyp.len() as u32;
+
+    // The `gps ` box PAYLOAD: [reserved:4=0][count:4=1] then one
+    // (start, size) pair, all big-endian (QuickTime `'MM'` order).
+    let mut gps_body = alloc::vec![0u8; 8];
+    gps_body[4..8].copy_from_slice(&1u32.to_be_bytes()); // count = 1
+    gps_body.extend_from_slice(&block_offset.to_be_bytes()); // absolute start
+    gps_body.extend_from_slice(&(blk.len() as u32).to_be_bytes()); // size
+    let gps_box = atom(b"gps ", &gps_body);
+
+    // moov = mvhd + the DIRECT-child `gps ` box (NOT inside a trak).
+    let mvhd = atom(b"mvhd", &alloc::vec![0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&gps_box);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&blk); // freeGPS block at offset = block_offset
+    data.extend_from_slice(&moov);
+
+    let meta = extract_stream(&data, None, None);
+    assert_eq!(
+      meta.gps_samples().len(),
+      1,
+      "the moov-level gps ' offset table must decode the out-of-mdat block"
+    );
+    let s = &meta.gps_samples()[0];
+    assert!(s.has_coordinates());
+    assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
+  }
+
+  /// Codex R3 (negative) — a real `trak` whose `hdlr` HandlerType is `gps `
+  /// is IGNORED for embedded GPS: ExifTool has no `$eeBox{'gps '}` entry (only
+  /// the EMPTY-HandlerType `moov`-level box, QuickTime.pm:523-533). Even with a
+  /// fully-formed `gps `-handler sample table pointing at a real `freeGPS `
+  /// block, `extract_stream` must produce NO samples (the block is reached
+  /// only by the brute-force `mdat` scan, which runs separately — see the
+  /// pipeline-level test in `quicktime.rs`).
+  #[test]
+  fn gps_handler_track_is_ignored() {
+    let mut blk = alloc::vec![0u8; 0x100];
+    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    blk[4..12].copy_from_slice(b"freeGPS ");
+    blk[60] = b'A';
+    blk[68] = b'N';
+    blk[76] = b'W';
+    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
+    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let block_offset = ftyp.len() as u32;
 
     // hdlr: [version+flags:4][component-type:4][handler-subtype:4='gps ']…
     let mut hdlr_body = alloc::vec![0u8; 24];
     hdlr_body[8..12].copy_from_slice(b"gps ");
     let hdlr = atom(b"hdlr", &hdlr_body);
 
-    // mdhd version 0: timescale (int32u) at body byte 12.
     let mut mdhd_body = alloc::vec![0u8; 24];
     mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
     let mdhd = atom(b"mdhd", &mdhd_body);
 
-    // stsd: [ver+flags:4][count:4=1] then one entry [size:4][format:4]['gps '
-    // reserved+drefidx to fill 16].
     let mut stsd_body = alloc::vec![0u8; 8];
     stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
     let mut entry = alloc::vec![0u8; 16];
@@ -2556,13 +2642,11 @@ mod tests {
     stsd_body.extend_from_slice(&entry);
     let stsd = atom(b"stsd", &stsd_body);
 
-    // stco: [ver+flags:4][count:4=1][offset:4].
     let mut stco_body = alloc::vec![0u8; 8];
     stco_body[4..8].copy_from_slice(&1u32.to_be_bytes());
     stco_body.extend_from_slice(&block_offset.to_be_bytes());
     let stco = atom(b"stco", &stco_body);
 
-    // stsc: [ver+flags:4][count:4=1][first-chunk:4=1][spc:4=1][desc:4=1].
     let mut stsc_body = alloc::vec![0u8; 8];
     stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
@@ -2570,7 +2654,6 @@ mod tests {
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     let stsc = atom(b"stsc", &stsc_body);
 
-    // stsz: [ver+flags:4][sample-size:4=0][count:4=1][size:4=blk.len()].
     let mut stsz_body = alloc::vec![0u8; 8];
     stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
     stsz_body.extend_from_slice(&1u32.to_be_bytes());
@@ -2594,147 +2677,23 @@ mod tests {
     let moov = atom(b"moov", &moov_body);
 
     let mut data = ftyp;
-    data.extend_from_slice(&blk); // the freeGPS block at offset = block_offset
+    data.extend_from_slice(&blk);
     data.extend_from_slice(&moov);
 
     let meta = extract_stream(&data, None, None);
-    assert_eq!(
-      meta.gps_samples().len(),
-      1,
-      "the gps ' sample-table freeGPS block must decode one sample"
+    assert!(
+      meta.is_empty(),
+      "a gps '-HandlerType trak must yield no embedded GPS (ExifTool ignores it)"
     );
-    let s = &meta.gps_samples()[0];
-    assert!(s.has_coordinates());
-    assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
   }
 
-  /// Codex R2 — a Type-19 (70mai A810) freeGPS block referenced from a
-  /// `gps `-sample-table track carries NO embedded date, so its `GPSDateTime`
-  /// is synthesized from the enclosing sample's decoding time + the movie
-  /// `CreateDate` via `SetGPSDateTime` (QuickTimeStream.pl:1559-1564 →
-  /// :2396 → :980-1008). Two samples at `stts` delta 2000 / `MediaTS` 1000 ⇒
-  /// SampleTimes 0.0s and 2.0s; with `CreateDate` = 2024:02:22 14:34:40Z the
-  /// two fixes get 14:34:40Z and 14:34:42Z.
-  ///
-  /// NOTE: this exercises the port's `gps `-HandlerType sample-table extension
-  /// (FINDING 2). Bundled ExifTool does NOT process a `gps `-handler track
-  /// (`gps ` is absent from `%eeBox`, QuickTime.pm:523-533) so it never reaches
-  /// `SetGPSDateTime` for this layout — hence there is no `-ee` golden. The
-  /// SampleTime threading is the faithful 1:1 of the Perl that WOULD run on
-  /// that branch; the synthesized value itself is asserted byte-exact against
-  /// [`synth_gps_date_time`] (separately oracle-checked in its own unit test).
-  #[test]
-  fn gps_handler_type19_synthesizes_gps_date_time_from_sample_time() {
-    // A Type-19 (70mai) freeGPS block: 'A' at offset 30, 'VV' at offset 51,
-    // lat/lon int32s/1e5 at offsets 31/35, speed at 43.
-    let mut blk = alloc::vec![0u8; 0x80];
-    blk[0..4].copy_from_slice(&0x80u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[30] = b'A';
-    blk[51] = b'V';
-    blk[52] = b'V';
-    blk[31..35].copy_from_slice(&511_607_100i32.to_le_bytes()); // lat 5116.071
-    blk[35..39].copy_from_slice(&83_080_900i32.to_le_bytes()); // lon 830.809
-    blk[43..47].copy_from_slice(&42i32.to_le_bytes());
-
-    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
-    // Layout = ftyp || blk || blk || moov; two chunks at these absolute offsets.
-    let off1 = ftyp.len() as u32;
-    let off2 = off1 + blk.len() as u32;
-
-    let mut hdlr_body = alloc::vec![0u8; 24];
-    hdlr_body[8..12].copy_from_slice(b"gps ");
-    let hdlr = atom(b"hdlr", &hdlr_body);
-
-    // mdhd v0: MediaTimeScale 1000 at body byte 12.
-    let mut mdhd_body = alloc::vec![0u8; 24];
-    mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
-    let mdhd = atom(b"mdhd", &mdhd_body);
-
-    let mut stsd_body = alloc::vec![0u8; 8];
-    stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
-    let mut entry = alloc::vec![0u8; 16];
-    entry[0..4].copy_from_slice(&16u32.to_be_bytes());
-    entry[4..8].copy_from_slice(b"gps ");
-    stsd_body.extend_from_slice(&entry);
-    let stsd = atom(b"stsd", &stsd_body);
-
-    // stco: two chunks (one sample each).
-    let mut stco_body = alloc::vec![0u8; 8];
-    stco_body[4..8].copy_from_slice(&2u32.to_be_bytes());
-    stco_body.extend_from_slice(&off1.to_be_bytes());
-    stco_body.extend_from_slice(&off2.to_be_bytes());
-    let stco = atom(b"stco", &stco_body);
-
-    // stsc: one entry — first-chunk=1, samples-per-chunk=1, desc=1.
-    let mut stsc_body = alloc::vec![0u8; 8];
-    stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    stsc_body.extend_from_slice(&1u32.to_be_bytes());
-    let stsc = atom(b"stsc", &stsc_body);
-
-    // stsz: sample-size=0, count=2, the two block sizes.
-    let mut stsz_body = alloc::vec![0u8; 8];
-    stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
-    stsz_body.extend_from_slice(&2u32.to_be_bytes());
-    stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
-    stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
-    let stsz = atom(b"stsz", &stsz_body);
-
-    // stts: one entry (count=2, delta=2000) ⇒ 2.0s per sample. The decoder
-    // needs >1 stts value to assign times (QuickTimeStream.pl:1346).
-    let mut stts_body = alloc::vec![0u8; 8];
-    stts_body[4..8].copy_from_slice(&1u32.to_be_bytes());
-    stts_body.extend_from_slice(&2u32.to_be_bytes());
-    stts_body.extend_from_slice(&2000u32.to_be_bytes());
-    let stts = atom(b"stts", &stts_body);
-
-    let mut stbl_body = stsd;
-    stbl_body.extend_from_slice(&stco);
-    stbl_body.extend_from_slice(&stsc);
-    stbl_body.extend_from_slice(&stsz);
-    stbl_body.extend_from_slice(&stts);
-    let stbl = atom(b"stbl", &stbl_body);
-    let minf = atom(b"minf", &stbl);
-    let mut mdia_body = mdhd;
-    mdia_body.extend_from_slice(&hdlr);
-    mdia_body.extend_from_slice(&minf);
-    let mdia = atom(b"mdia", &mdia_body);
-    let trak = atom(b"trak", &mdia);
-    let mvhd = atom(b"mvhd", &alloc::vec![0u8; 100]);
-    let mut moov_body = mvhd;
-    moov_body.extend_from_slice(&trak);
-    let moov = atom(b"moov", &moov_body);
-
-    let mut data = ftyp;
-    data.extend_from_slice(&blk);
-    data.extend_from_slice(&blk);
-    data.extend_from_slice(&moov);
-
-    // CreateDate raw 1904-epoch 3_791_457_280 = 2024:02:22 14:34:40Z.
-    let meta = extract_stream(&data, Some(3_791_457_280), None);
-    assert_eq!(meta.gps_samples().len(), 2, "two Type-19 samples decode");
-    // Sample 0 ⇒ SampleTime 0.0s ⇒ GPSDateTime = CreateDate.
-    assert_eq!(
-      meta.gps_samples()[0].date_time(),
-      Some("2024:02:22 14:34:40Z"),
-      "sample 0: CreateDate + 0s"
-    );
-    // Sample 1 ⇒ SampleTime 2.0s ⇒ GPSDateTime = CreateDate + 2s.
-    assert_eq!(
-      meta.gps_samples()[1].date_time(),
-      Some("2024:02:22 14:34:42Z"),
-      "sample 1: CreateDate + 2s (SampleTime threaded)"
-    );
-    assert!(meta.gps_samples()[0].has_coordinates());
-
-    // Without a CreateDate, no GPSDateTime is synthesized (matching the
-    // brute-force mdat-scan path that a real 70mai file actually takes).
-    let meta2 = extract_stream(&data, None, None);
-    assert_eq!(meta2.gps_samples()[0].date_time(), None);
-    assert_eq!(meta2.gps_samples()[1].date_time(), None);
-  }
+  // NOTE: the Type-19 (70mai A810) SampleTime → `GPSDateTime` threading is
+  // unit-tested directly against `process_free_gps` in
+  // `quicktime_freegps::tests::decode_type19_70mai_synthesizes_gps_date_time_from_sample_time`.
+  // It is NOT reachable via a `moov`-level `gps ` box (that box carries no
+  // `stts`, so its `SampleTime` is `None` — see `process_moov_gps_box`) nor via
+  // a `gps `-HandlerType track (which ExifTool ignores — see
+  // `gps_handler_track_is_ignored`).
 
   #[test]
   fn process_gps0_skips_out_of_range_and_decodes() {

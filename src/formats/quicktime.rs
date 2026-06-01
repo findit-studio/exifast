@@ -1855,9 +1855,9 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // stream walker is given the raw CreateDate it can recover from the file.
   let create_date_raw = first_moov_create_date_raw(data);
   // The Kodak `frea`-atom `KodakVersion` global (set in Pass 1) is visible to
-  // EVERY `ProcessFreeGPS` call — including the `gps `-sample-table path
-  // inside `extract_stream` — so a Rexing dashcam that references its freeGPS
-  // blocks from a `gps ` track (rather than burying them in `mdat`) also gets
+  // EVERY `ProcessFreeGPS` call — including the `moov`-level `gps ` offset-box
+  // path inside `extract_stream` — so a Rexing dashcam that references its
+  // freeGPS blocks from that box (rather than burying them in `mdat`) also gets
   // the Type-17b scaling. Threaded as a `&str` borrow (mvhd/frea are already
   // decoded into `qt` at this point).
   let kodak_version = qt.kodak_frea().version();
@@ -3270,6 +3270,165 @@ mod tests {
     assert_eq!(meta.quicktime().minor_version(), Some("0.0.0"));
     // CompatibleBrands: "M4A " and "mp42" (no NULs ⇒ both kept).
     assert_eq!(meta.quicktime().compatible_brands(), &["M4A ", "mp42"]);
+  }
+
+  /// Codex R3 (pipeline negative) — a real `trak` whose `hdlr` HandlerType is
+  /// `gps ` must NOT suppress the brute-force `mdat` scan. ExifTool ignores
+  /// such a track (no `$eeBox{'gps '}`), so `extract_stream` leaves the stream
+  /// empty (`FoundEmbedded` unset), and `ScanMediaData` still decodes a real
+  /// `freeGPS ` block buried in `mdat` (QuickTimeStream.pl:3689). The single
+  /// decoded sample therefore comes from the SCAN, not the ignored track.
+  ///
+  /// VERIFIED against bundled 13.59 (`exiftool -ee` on this exact layout):
+  /// `Track1:HandlerType = Unknown (gps )` (the track is recognized but yields
+  /// no GPS) while the scan emits ONE fix — GPSLatitude `47 deg 37' 42.30" N`,
+  /// GPSLongitude `122 deg 9' 54.08" W`, GPSDateTime `2024:07:15 14:30:45Z`.
+  /// The `mdat` is padded past `0x8000` because `ScanMediaData` bails on a
+  /// chunk shorter than one GPS-block window (`last if length $buff <
+  /// $gpsBlockSize`, QuickTimeStream.pl:3756) — so a sub-`0x8000` `mdat` would
+  /// not be scanned by the oracle either.
+  #[test]
+  fn gps_handler_track_does_not_suppress_mdat_scan() {
+    // A Type-6 (Akaso) freeGPS block; the scan magic is `\0..\0freeGPS ` and a
+    // 0x100 BE size word (`00 00 01 00`) satisfies the byte-0/byte-3 = \0 mask.
+    let mut blk = vec![0u8; 0x100];
+    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    blk[4..12].copy_from_slice(b"freeGPS ");
+    blk[60] = b'A';
+    blk[68] = b'N';
+    blk[76] = b'W';
+    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
+    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
+    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
+    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
+    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
+    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
+    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+
+    // Layout = ftyp || mdat(freeGPS-block + >=0x8000 pad) || moov, so the
+    // block's ABSOLUTE file offset = ftyp.len() + 8 (the `mdat` payload start)
+    // is fixed up front. The padding makes the scan window a full GPS block
+    // (the oracle's `last if length $buff < $gpsBlockSize` guard, :3756).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = blk.clone();
+    mdat_payload.extend_from_slice(&[0u8; 0x8000]);
+    let mdat = atom(b"mdat", &mdat_payload);
+    let block_offset = (ftyp.len() + 8) as u32;
+
+    // A `gps `-HandlerType trak whose sample table REFERENCES the same block.
+    let mut hdlr_body = vec![0u8; 24];
+    hdlr_body[8..12].copy_from_slice(b"gps ");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut stsd_body = vec![0u8; 8];
+    stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    let mut entry = vec![0u8; 16];
+    entry[0..4].copy_from_slice(&16u32.to_be_bytes());
+    entry[4..8].copy_from_slice(b"gps ");
+    stsd_body.extend_from_slice(&entry);
+    let stsd = atom(b"stsd", &stsd_body);
+    let mut stco_body = vec![0u8; 8];
+    stco_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stco_body.extend_from_slice(&block_offset.to_be_bytes());
+    let stco = atom(b"stco", &stco_body);
+    let mut stsc_body = vec![0u8; 8];
+    stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = atom(b"stsc", &stsc_body);
+    let mut stsz_body = vec![0u8; 8];
+    stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&1u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
+    let stsz = atom(b"stsz", &stsz_body);
+    let mut stbl_body = stsd;
+    stbl_body.extend_from_slice(&stco);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    // The `gps `-handler track contributed nothing; the `mdat` scan decoded the
+    // buried block. Exactly one sample, from the scan.
+    assert_eq!(
+      meta.stream().gps_samples().len(),
+      1,
+      "the mdat scan must still decode the buried freeGPS block"
+    );
+    assert!(meta.stream().gps_samples()[0].has_coordinates());
+  }
+
+  /// Codex R3 (dedup) — finding step 3: a block referenced by the `moov`-level
+  /// `gps ` offset box must NOT be double-emitted by the `mdat` scan. The box
+  /// decode populates the stream (ExifTool's `FoundEmbedded`), which gates
+  /// `ScanMediaData` (QuickTimeStream.pl:1650, :3689); the port mirrors this
+  /// via `!stream.is_empty()`. VERIFIED against bundled 13.59 (`exiftool -ee`
+  /// on this exact layout: a `moov` `gps ` box pointing at a block that also
+  /// lies in a `>=0x8000` `mdat`) — ONE GPSLatitude key, not two.
+  #[test]
+  fn moov_gps_box_decode_suppresses_redundant_mdat_scan() {
+    let mut blk = vec![0u8; 0x100];
+    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    blk[4..12].copy_from_slice(b"freeGPS ");
+    blk[60] = b'A';
+    blk[68] = b'N';
+    blk[76] = b'W';
+    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
+    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
+    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
+    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
+    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
+    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
+    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+
+    // Layout = ftyp || mdat(block + >=0x8000 pad) || moov(gps-box → same block).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = blk.clone();
+    mdat_payload.extend_from_slice(&[0u8; 0x8000]);
+    let mdat = atom(b"mdat", &mdat_payload);
+    let block_offset = (ftyp.len() + 8) as u32;
+
+    // The `moov`-level `gps ` offset box pointing at the SAME block in `mdat`.
+    let mut gps_body = vec![0u8; 8];
+    gps_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    gps_body.extend_from_slice(&block_offset.to_be_bytes());
+    gps_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
+    let gps_box = atom(b"gps ", &gps_body);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&gps_box);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    // The box decoded the block once; the scan is suppressed — NOT doubled.
+    assert_eq!(
+      meta.stream().gps_samples().len(),
+      1,
+      "the moov gps ' box must decode once and suppress the redundant mdat scan"
+    );
   }
 
   #[test]
