@@ -495,3 +495,78 @@ fn quicktime_media_metadata_projects_first_gps_fix() {
   assert_eq!(gps.altitude_m(), Some(123.0));
   assert!(gps.timestamp().is_some(), "GPSDateTime projected");
 }
+
+#[test]
+fn quicktime_freegps_brute_force_scan_finds_block_in_mdat() {
+  // SP3.5 — ProcessFreeGPS + ScanMediaData (QuickTimeStream.pl:1637-2484,
+  // :3679-3789). Synthetic mov file with an `mdat` that contains a Type-6
+  // (Akaso) freeGPS block. The brute-force scanner must locate the block
+  // and dispatch into `decode_type6_akaso`, producing one GPS sample
+  // accessible via `Meta::stream`.
+  let data = build_mov_with_freegps_in_mdat();
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  assert_eq!(
+    stream.gps_samples().len(),
+    1,
+    "freeGPS scan must locate and decode the embedded block"
+  );
+  let s = &stream.gps_samples()[0];
+  // Type 6 lat 4737.7053 ⇒ ConvertLatLon ⇒ 47.628.
+  assert!((s.latitude().unwrap() - 47.628_421).abs() < 1e-3);
+  assert!(s.longitude().unwrap() < -120.0);
+}
+
+/// Build a minimal but valid `.mov` containing:
+///   - an 8-byte ftyp atom
+///   - a minimal moov+mvhd (no timed-metadata tracks)
+///   - an `mdat` payload containing a Type-6 freeGPS block
+fn build_mov_with_freegps_in_mdat() -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  // mvhd (v0, 108 bytes): version+flags + 7 × int32 zero + 1 dword timescale=1000 + ...
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mvhd.extend_from_slice(&[0u8; 8]); // create+modify date
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // duration (1s)
+  mvhd.extend_from_slice(&[0u8; 80]); // rest
+  let mut moov = (mvhd.len() as u32 + 16).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  moov.extend_from_slice(&mvhd_atom);
+  // Build the freeGPS block (Type 6, 256-byte block — alignment per the
+  // ExifTool scanner's `\0..\0` size pattern).
+  let mut block = vec![0u8; 0x100];
+  block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+  block[4..12].copy_from_slice(b"freeGPS ");
+  block[60] = b'A';
+  block[68] = b'N';
+  block[76] = b'W';
+  block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes()); // hr
+  block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes()); // min
+  block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes()); // sec
+  block[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes()); // yr
+  block[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes()); // mon
+  block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes()); // day
+  block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes()); // lat
+  block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes()); // lon
+  // mdat payload = 64 bytes pad + block + 64 bytes pad.
+  let mut mdat_payload = vec![0u8; 64];
+  mdat_payload.extend_from_slice(&block);
+  mdat_payload.extend_from_slice(&[0u8; 64]);
+  let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(&mdat_payload);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out.extend_from_slice(&mdat);
+  out
+}

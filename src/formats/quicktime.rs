@@ -53,7 +53,7 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::quicktime_stream,
+  formats::{quicktime_freegps, quicktime_stream},
   metadata::{MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
   value::format_g,
 };
@@ -1795,7 +1795,19 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // via `qt`'s stored Duration timescale-count is unrelated; instead the
   // stream walker is given the raw CreateDate it can recover from the file.
   let create_date_raw = first_moov_create_date_raw(data);
-  let stream = quicktime_stream::extract_stream(data, create_date_raw);
+  let mut stream = quicktime_stream::extract_stream(data, create_date_raw);
+
+  // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
+  // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
+  // scans mdat when no timed-metadata `FoundEmbedded` was set; mirror that
+  // (the scan otherwise blindly re-decodes the same blocks pointed to by the
+  // `moov`-level `gps ` table). The freeGPS scan also captures samples that
+  // live OUTSIDE timed-metadata tracks (action-cams, dashcams, drones with
+  // padding-buried GPS) — see `quicktime_freegps`.
+  if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
+    let already = !stream.is_empty();
+    quicktime_freegps::scan_media_data(data, off, size, create_date_raw, already, &mut stream);
+  }
 
   // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
   // (`QVMI` Casio, `MVTG` FujiFilm, `uuid`-Exif) to

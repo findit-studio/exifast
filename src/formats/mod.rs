@@ -59,6 +59,12 @@ pub mod quicktime;
 // sub-module of the QuickTime port; gated on the same `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod quicktime_stream;
+// QuickTime SP3.5 — ProcessFreeGPS + brute-force scan (QuickTimeStream.pl
+// :1637-2484, :3679-3789). Self-contained camera-variant decoders; vendor-
+// module dispatches (GoPro GPMF, Sony rtmd, Canon CTMD, LigoGPS, full camm)
+// are stubbed.
+#[cfg(feature = "quicktime")]
+pub mod quicktime_freegps;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]
