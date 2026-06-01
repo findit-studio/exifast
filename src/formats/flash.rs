@@ -107,6 +107,18 @@ const fn is_struct(code: u8) -> bool {
   matches!(code, 0x03 | 0x08 | 0x10)
 }
 
+/// Max recursion depth for the AMF (`onMetaData`/`onXMPData`) script-data
+/// walker (Golden-v2 Contract 3a). Bundled `ProcessMeta` recurses without a
+/// hard cap (it relies on the finite `$dirLen`), but a hostile FLV can nest
+/// AMF strict-arrays (`0x0a`) or objects (`0x03`/`0x08`/`0x10`) arbitrarily
+/// deep, recursing the mutually-recursive `walk_pairs`/`walk_array`/
+/// `collect_array_items` cluster until the stack overflows — a DoS. Real FLV
+/// `onMetaData` nests a couple of levels (the `keyframes` object holds two
+/// flat arrays), so this cap is a large superset that never trips on a real
+/// file; the output stays byte-identical. Exceeding it stops recursion,
+/// faithful to a truncated subtree contributing no further tags.
+const MAX_AMF_DEPTH: u32 = 100;
+
 /// `%processMetaPacket` (Flash.pm:34) — top-level script-data packet names
 /// that drive the meta walker. The first string of a top-level meta tag is
 /// the packet name; only `onMetaData` and `onXMPData` are walked
@@ -1366,6 +1378,7 @@ fn process_meta(
       // collapsed Perl's undef (top-level) vs defined-empty (empty-key
       // parent) — see R8/F1 fixture.
       let outcome = walk_pairs(
+        0, // top-level packet walk — depth 0
         data,
         &mut pos,
         r#type,
@@ -1418,6 +1431,7 @@ fn process_meta(
       // (`Flash:Name` last-wins for the
       // `flash_toplevel_array_objects.flv` fixture, R8/F2).
       match collect_array_items(
+        0, // top-level lone array — depth 0
         data,
         &mut pos,
         SubTable::Meta,
@@ -1533,6 +1547,7 @@ fn process_meta(
 ///   * Top-level strict-array struct children received spurious
 ///     `0Name`-style prefixes that bundled never appends (R8/F2).
 fn walk_pairs(
+  depth: u32,
   data: &[u8],
   pos: &mut usize,
   struct_type: u8,
@@ -1541,6 +1556,13 @@ fn walk_pairs(
   entries: &mut std::vec::Vec<Entry>,
   warnings: &mut std::vec::Vec<SmolStr>,
 ) -> WalkOutcome {
+  // Golden-v2 3a — recursion-depth guard for the AMF object/array cluster.
+  // Real `onMetaData` nests a couple of levels, far below `MAX_AMF_DEPTH`, so
+  // this never trips on a real file (byte-identical); it bounds stack growth
+  // on a maliciously deep AMF tree. Stop as a bundled `last Record`.
+  if depth >= MAX_AMF_DEPTH {
+    return WalkOutcome::Abort;
+  }
   loop {
     // Read key (u16-prefixed). Bundled Flash.pm:350 `last Record if $pos
     // + 2 > $dirLen` — no warning at this point ($val=''). Bundled DOES
@@ -1745,7 +1767,9 @@ fn walk_pairs(
           // continues (see the block comment above). Any warnings the
           // child pushed are preserved (shared `warnings` vec) and the
           // advanced cursor is preserved (shared `pos`).
+          // A nested object is one level deeper (Golden-v2 3a).
           let _ = walk_pairs(
+            depth + 1,
             data,
             pos,
             vtype,
@@ -1786,7 +1810,9 @@ fn walk_pairs(
       // $structName . $i if defined $structName` fires per element.
       // (Top-level strict-arrays don't reach this path — `process_meta`
       // dispatches them directly with `None` carrier.)
+      // A child array is one level deeper (Golden-v2 3a).
       if walk_array(
+        depth + 1,
         data,
         pos,
         sub_table_for_value,
@@ -1891,6 +1917,7 @@ fn walk_pairs(
 ///   element type, AND the half-collected list is DROPPED (faithful: Perl
 ///   never reaches the `\@vals` assignment).
 fn walk_array(
+  depth: u32,
   data: &[u8],
   pos: &mut usize,
   table: SubTable,
@@ -1899,6 +1926,10 @@ fn walk_array(
   entries: &mut std::vec::Vec<Entry>,
   warnings: &mut std::vec::Vec<SmolStr>,
 ) -> WalkOutcome {
+  // Golden-v2 3a — recursion-depth guard (same cluster as `walk_pairs`).
+  if depth >= MAX_AMF_DEPTH {
+    return WalkOutcome::Abort;
+  }
   // Delegate to `collect_array_items` so nested strict-arrays can reuse
   // the same body (Codex R2/F2 — the prior shape called `read_value` on
   // a nested 0x0a element, which returned `AmfValue::StrictArray`
@@ -1908,7 +1939,11 @@ fn walk_array(
   // top-level element of THIS strict array gets the bundled element-wise
   // conversion. R14/F1 (mul_1000) and R15/F1 (trim_trailing_ws) share this
   // carry; the nested-array recursion inside the helper resets to NEUTRAL.
+  //
+  // `walk_array` is a thin delegator over the SAME array frame, so it passes
+  // its own `depth` (not `depth + 1`) to `collect_array_items`.
   match collect_array_items(
+    depth,
     data,
     pos,
     table,
@@ -2028,6 +2063,7 @@ impl ArrayValueConv {
 /// producing bundled's `[[a,b,...],...]` JSON shape).
 #[allow(clippy::too_many_arguments)]
 fn collect_array_items(
+  depth: u32,
   data: &[u8],
   pos: &mut usize,
   table: SubTable,
@@ -2036,6 +2072,13 @@ fn collect_array_items(
   entries: &mut std::vec::Vec<Entry>,
   warnings: &mut std::vec::Vec<SmolStr>,
 ) -> ArrayOutcome {
+  // Golden-v2 3a — recursion-depth guard (same cluster as `walk_pairs`).
+  // Return an empty list (the "no further items" outcome) so the walk stops
+  // without pushing a spurious truncation warning; a real file never reaches
+  // this depth, so the output is unchanged.
+  if depth >= MAX_AMF_DEPTH {
+    return ArrayOutcome::Ok(std::vec::Vec::new());
+  }
   if *pos + 4 > data.len() {
     // Bundled Flash.pm:411 `last if $pos + 4 > $dirLen` — no warning at
     // this point. The post-loop line 455 (`not defined $val and defined
@@ -2208,7 +2251,9 @@ fn collect_array_items(
       // `collect_array_items` returning `None` on `Unsupported` /
       // `Truncated` leaf reads (the `ReadResult::Truncated` /
       // `Unsupported` arms below in this fn's scalar branch).
+      // A struct element nests one level deeper (Golden-v2 3a).
       let _ = walk_pairs(
+        depth + 1,
         data,
         pos,
         vtype,
@@ -2267,7 +2312,9 @@ fn collect_array_items(
       // Recursing `mul_1000` here produced the bogus `[[1500,61000]]` for a
       // `totaldatarate` nested array; recursing `trim_trailing_ws` would
       // wrongly trim inner-array strings. Bundled does neither.
+      // A nested strict-array is one level deeper (Golden-v2 3a).
       match collect_array_items(
+        depth + 1,
         data,
         pos,
         table,
@@ -3668,6 +3715,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -3734,6 +3782,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -3816,6 +3865,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -3887,6 +3937,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -3982,6 +4033,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -4025,6 +4077,7 @@ mod tests {
     let mut entries = std::vec::Vec::new();
     let mut warnings = std::vec::Vec::new();
     let result = collect_array_items(
+      0,
       &bytes,
       &mut pos,
       SubTable::Meta,
@@ -4206,5 +4259,40 @@ mod tests {
     assert!(projected.lens().is_none());
     assert!(projected.gps().is_none());
     assert!(projected.capture().is_none());
+  }
+
+  #[test]
+  fn deeply_nested_amf_arrays_do_not_overflow_the_stack() {
+    // Golden-v2 Contract 3a — a hostile FLV can nest AMF strict-arrays
+    // arbitrarily deep, recursing `collect_array_items` until the stack
+    // overflows (a DoS). With `MAX_AMF_DEPTH` the walk stops at the cap and
+    // returns. 100_000 is a superset of any real `onMetaData` nesting
+    // (single-digit), so the cap never trips on a real file (byte-identical
+    // output). Mirrors the well-formed `collect_array_items_handles_nested_
+    // strict_array` fixture, just nested far past the budget.
+    const N: usize = 100_000;
+    // Body for `collect_array_items` (the leading 0x0a marker already
+    // consumed by the caller): N nested strict-arrays, each `count=1` + a
+    // `0x0a` element marker, innermost `count=0`.
+    let mut bytes = std::vec::Vec::new();
+    for _ in 0..N {
+      bytes.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+      bytes.push(0x0a); // element[0] is a nested strict-array
+    }
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // innermost count = 0
+    let mut pos = 0;
+    let mut entries = std::vec::Vec::new();
+    let mut warnings = std::vec::Vec::new();
+    // The depth budget bounds the recursion; this returns without overflowing.
+    let _ = collect_array_items(
+      0,
+      &bytes,
+      &mut pos,
+      SubTable::Meta,
+      Some("a"),
+      ArrayValueConv::NEUTRAL,
+      &mut entries,
+      &mut warnings,
+    );
   }
 }
