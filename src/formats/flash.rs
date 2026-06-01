@@ -2969,6 +2969,20 @@ fn unix_to_civil_micro(secs: f64) -> ((i32, u32, u32, u32, u32), u32, u32) {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// The FLV `$et->Warn` accumulators (Flash.pm:353/437/456/504/511) as
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic) warnings, in occurrence
+  /// order.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self
+      .warnings()
+      .iter()
+      .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str()))
+      .collect()
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield Flash tags in Meta-walk order (faithful to bundled `FoundTag`
   /// call order — Flash.pm runs the audio/video bit-table emissions ALSO

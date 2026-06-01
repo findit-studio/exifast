@@ -1127,11 +1127,6 @@ impl Plan {
   pub(crate) const fn pending_slice(&self) -> &[(&'static str, String, TagValue)] {
     self.pending.as_slice()
   }
-  /// Whether the post-loop `Warn('Bad APE trailer')` should fire.
-  #[inline(always)]
-  pub(crate) const fn warn_bad_trailer(&self) -> bool {
-    self.warn_bad_trailer
-  }
 }
 
 // =============================================================================
@@ -1459,14 +1454,6 @@ impl Meta<'_> {
   #[inline(always)]
   pub const fn main_tags_slice(&self) -> &[MainTag] {
     self.main_tags.as_slice()
-  }
-
-  /// `true` iff the planner detected an invalid APETAGEX trailer
-  /// (APE.pm:194 `$count = -1`) ⇒ APE.pm:238 `Warn('Bad APE trailer')`.
-  #[must_use]
-  #[inline(always)]
-  pub const fn warn_bad_trailer(&self) -> bool {
-    self.warn_bad_trailer
   }
 
   /// Pre-computed intra-APE Composite:Duration value (post-PrintConv
@@ -2063,6 +2050,26 @@ fn emitted_tag_value(v: &TagValue) -> TagValue {
 }
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// APE's diagnostics in the retired drain order: (a) the chained ID3
+  /// sub-Meta's own warnings then errors (BEFORE the MAC/main body), then
+  /// (b) the APE.pm:238 `Warn('Bad APE trailer')`. The WavPack/MP3/MPC chained
+  /// consumers splice this via `ape.diagnostics()`; standalone APE dispatches
+  /// through it directly.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    #[cfg(feature = "id3")]
+    if let Some(id3) = &self.id3 {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    if self.warn_bad_trailer {
+      out.push(crate::diagnostics::Diagnostic::warn("Bad APE trailer"));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield APE tags in faithful APE.pm extraction order — the golden-pattern
   /// emission path for APE (the WavPack/MP3/MPC chained consumers splice these
@@ -2092,11 +2099,13 @@ impl crate::emit::Taggable for Meta<'_> {
   /// Every APE tag is a known tag ⇒ `unknown: false`.
   ///
   /// **What is NOT in this stream:** the APE.pm:238 `Warn('Bad APE trailer')`
-  /// ([`Meta::warn_bad_trailer`]) and the chained ID3 sub-Meta's
-  /// warnings/errors — [`run_emission`](crate::emit::run_emission) has no
-  /// warning/error channel, so the `AnyMeta::Ape` arm drains them after
-  /// `run_emission` (matching the retired order: ID3 tags emit first, then MAC
-  /// + main, then the `Bad APE trailer` warning). The net `TagMap` is identical.
+  /// and the chained ID3 sub-Meta's warnings/errors —
+  /// [`run_emission`](crate::emit::run_emission) has no warning/error channel,
+  /// so they flow through the [`Diagnose`](crate::diagnostics::Diagnose) channel
+  /// instead ([`Meta::diagnostics`]), drained after the tags by
+  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) (matching the
+  /// retired order: ID3 tags emit first, then MAC + main, then the
+  /// `Bad APE trailer` warning). The net `TagMap` is identical.
   ///
   /// `mode == PrintConv` (`-j`) ⇒ `Duration` (main + composite) gets
   /// `ConvertDuration`; `mode == ValueConv` (`-n`) ⇒ the raw scalar. Every
@@ -4138,7 +4147,13 @@ mod tests {
     // Main-tag stream carries the synthesized Artist.
     assert_eq!(meta.artist(), Some("Tester"));
     assert_eq!(meta.album(), None);
-    assert!(!meta.warn_bad_trailer());
+    // No `Bad APE trailer` warning in the diagnostics stream (the read-back
+    // that replaced the retired `warn_bad_trailer()` accessor).
+    assert!(
+      crate::diagnostics::Diagnose::diagnostics(&meta)
+        .iter()
+        .all(|d| d.message() != "Bad APE trailer")
+    );
   }
 
   #[test]

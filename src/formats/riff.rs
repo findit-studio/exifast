@@ -303,14 +303,15 @@ pub struct RiffMeta<'a> {
   /// `(RF64)` `FileType` suffix is a follow-up — not emitted today.
   rf64: bool,
   /// `true` when the walker hit a truncated chunk (a declared chunk length
-  /// extending past EOF). Surfaced by `drain_diagnostics` as the bundled
-  /// terminal warning `Error reading RIFF file (corrupted?)` (RIFF.pm:2216,
-  /// `$err and $et->Warn(...)`).
+  /// extending past EOF). Surfaced by [`RiffMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics)
+  /// as the bundled terminal warning `Error reading RIFF file (corrupted?)`
+  /// (RIFF.pm:2216, `$err and $et->Warn(...)`).
   corrupted: bool,
   /// `Some(code_page)` when a CSET-declared NUMERIC charset was used to decode
   /// at least one non-empty INFO string — ExifTool's `Decode` warns once
   /// `Unsupported character set (<N>)` (ExifTool.pm:6359-6363). Surfaced by
-  /// `drain_diagnostics` as an `ExifTool:Warning`.
+  /// [`RiffMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics) as an
+  /// `ExifTool:Warning`.
   unsupported_charset: Option<u16>,
   /// Phantom anchor for the GAT lifetime.
   _marker: core::marker::PhantomData<&'a ()>,
@@ -368,25 +369,6 @@ impl RiffMeta<'_> {
   #[inline(always)]
   pub const fn is_rf64(&self) -> bool {
     self.rf64
-  }
-
-  /// `true` when a truncated chunk was encountered during the walk (a declared
-  /// chunk length running past EOF). The engine surfaces this as the bundled
-  /// `ExifTool:Warning` "Error reading RIFF file (corrupted?)" (RIFF.pm:2216).
-  #[must_use]
-  #[inline(always)]
-  pub const fn is_corrupted(&self) -> bool {
-    self.corrupted
-  }
-
-  /// `Some(code_page)` when a CSET-declared NUMERIC charset decoded at least
-  /// one non-empty INFO string — the engine surfaces this as the bundled
-  /// `ExifTool:Warning` "Unsupported character set (<code_page>)"
-  /// (ExifTool.pm:6359-6363, RIFF.pm:1829). `None` otherwise.
-  #[must_use]
-  #[inline(always)]
-  pub const fn unsupported_charset(&self) -> Option<u16> {
-    self.unsupported_charset
   }
 }
 
@@ -1951,6 +1933,39 @@ fn le_i32(bytes: &[u8]) -> i32 {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for RiffMeta<'_> {
+  /// RIFF's two `$et->Warn` paths as [`Diagnostic`](crate::diagnostics::Diagnostic)
+  /// warnings, in occurrence order:
+  ///  1. `Unsupported character set (<N>)` — fired mid-walk by `Decode`
+  ///     (ExifTool.pm:6359-6363, RIFF.pm:1829) the first time a CSET-declared
+  ///     NUMERIC charset decodes a non-empty INFO string (the code page is
+  ///     recorded once in the `unsupported_charset` field).
+  ///  2. `Error reading RIFF file (corrupted?)` — the terminal corruption
+  ///     notice for a declared-length chunk that runs past EOF (RIFF.pm:2216
+  ///     `$err and $et->Warn(...)`; the `corrupted` field).
+  /// The charset warning precedes the corruption notice (mid-walk before
+  /// end-of-walk); the default `-j` output surfaces only the FIRST recorded
+  /// warning. The other `ProcessChunks` warning paths (`Bad ... data`) abort
+  /// the sub-walk silently (no tags), matching bundled's `return 0`. Both fire
+  /// OUTSIDE a RIFF `SET_GROUP1` scope ⇒ family-0 `ExifTool:Warning` (unlike
+  /// the MXF/Matroska group-scoped seam).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    if let Some(code_page) = self.unsupported_charset {
+      out.push(crate::diagnostics::Diagnostic::warn(std::format!(
+        "Unsupported character set ({code_page})"
+      )));
+    }
+    if self.corrupted {
+      out.push(crate::diagnostics::Diagnostic::warn(
+        "Error reading RIFF file (corrupted?)",
+      ));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for RiffMeta<'_> {
   /// Yield the RIFF (and BMP-strf-derived `File:*`) tags in file order, each
   /// value ALREADY rendered for `mode` — the golden-pattern **L3** stream the
@@ -2544,6 +2559,32 @@ fn bmp_compression_label(val: u32) -> &'static str {
 mod tests {
   use super::*;
 
+  /// Whether the terminal `Error reading RIFF file (corrupted?)` warning
+  /// (RIFF.pm:2216) is present in the Meta's
+  /// [`Diagnose`](crate::diagnostics::Diagnose) stream — the test read-back
+  /// that replaced the retired `is_corrupted()` accessor.
+  fn corrupted_warned(meta: &RiffMeta<'_>) -> bool {
+    crate::diagnostics::Diagnose::diagnostics(meta)
+      .iter()
+      .any(|d| d.message() == "Error reading RIFF file (corrupted?)")
+  }
+
+  /// The `Some(code_page)` carried by the `Unsupported character set (<N>)`
+  /// warning (ExifTool.pm:6359-6363), parsed back out of the Meta's
+  /// [`Diagnose`](crate::diagnostics::Diagnose) stream — the test read-back
+  /// that replaced the retired `unsupported_charset() -> Option<u16>` accessor.
+  /// `None` when no such warning was raised.
+  fn charset_warn_code(meta: &RiffMeta<'_>) -> Option<u16> {
+    crate::diagnostics::Diagnose::diagnostics(meta)
+      .iter()
+      .find_map(|d| {
+        d.message()
+          .strip_prefix("Unsupported character set (")
+          .and_then(|rest| rest.strip_suffix(')'))
+          .and_then(|n| n.parse::<u16>().ok())
+      })
+  }
+
   /// Build a minimal AVI: RIFF/AVI header + LIST_hdrl(avih + LIST_strl(strh +
   /// strf)) + LIST_INFO(ISFT) + IDIT.
   fn synth_avi() -> Vec<u8> {
@@ -3044,7 +3085,7 @@ mod tests {
     assert_eq!(find("Dialect"), Some(&RiffValue::U32(1)));
     // The numeric code page triggers the once `Unsupported character set`
     // warning (ExifTool.pm:6359-6363).
-    assert_eq!(meta.unsupported_charset(), Some(1252));
+    assert_eq!(charset_warn_code(&meta), Some(1252));
   }
 
   #[test]
@@ -3081,7 +3122,7 @@ mod tests {
       Some(&RiffValue::U32(1252))
     );
     // No warning: the decoded string was empty (length 0).
-    assert_eq!(meta.unsupported_charset(), None);
+    assert_eq!(charset_warn_code(&meta), None);
   }
 
   #[test]
@@ -3135,7 +3176,7 @@ mod tests {
       other => panic!("Artist: {other:?}"),
     }
     // NO unsupported-charset warning: 0 fell back to the supported 'Latin'.
-    assert_eq!(meta.unsupported_charset(), None);
+    assert_eq!(charset_warn_code(&meta), None);
   }
 
   #[test]
@@ -3231,7 +3272,7 @@ mod tests {
       other => panic!("Artist: {other:?}"),
     }
     // No spurious warning — the prior Raw(1252) was reset by the CodePage=0.
-    assert_eq!(meta.unsupported_charset(), None);
+    assert_eq!(charset_warn_code(&meta), None);
   }
 
   #[test]
@@ -3331,7 +3372,7 @@ mod tests {
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
     let meta = parse_borrowed(&buf).expect("some");
-    assert!(meta.is_corrupted(), "truncated fmt must mark corrupted");
+    assert!(corrupted_warned(&meta), "truncated fmt must mark corrupted");
     assert!(
       meta.entries().iter().all(|e| e.name() != "Encoding"),
       "truncated fmt must NOT emit partial-payload tags"
@@ -3358,7 +3399,7 @@ mod tests {
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
     let meta = parse_borrowed(&buf).expect("some");
-    assert!(!meta.is_corrupted());
+    assert!(!corrupted_warned(&meta));
     assert!(meta.entries().iter().any(|e| e.name() == "Encoding"));
   }
 

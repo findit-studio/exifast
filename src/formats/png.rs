@@ -1998,6 +1998,47 @@ impl crate::emit::Taggable for PngMeta<'_> {
   }
 }
 
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for PngMeta<'_> {
+  /// PNG's diagnostics in the retired drain order:
+  /// (a) the PNG walker's own accumulated warnings (`Truncated PNG image`
+  ///     PNG.pm:1486, `Text/EXIF chunk(s) found after …` PNG.pm:1598, the zlib
+  ///     inflate-error warnings, the `Invalid eXIf chunk` / `Improper "Exif00"
+  ///     header …` warnings, …) BEFORE the eXIf dispatch;
+  /// (b) the embedded eXIf / Raw-profile EXIF sub-Metas' diagnostics, IN CHUNK
+  ///     ORDER via the SAME shared-`$$et{PROCESSED}` event replay `tags()` /
+  ///     `project()` use ([`replay_exif_events`], `ExifTool.pm:9061-9072` +
+  ///     `PNG.pm:1193`). For each EXIF event: its own EXIF warnings (via the
+  ///     parsed [`ExifMeta`](crate::exif::ExifMeta)'s `Diagnose` impl), then the
+  ///     cross-source cycle-guard warning(s) the walk raised
+  ///     (`ExifTool.pm:9068`).
+  /// The PNG-level warnings always precede the EXIF ones (PNG walks first), so
+  /// the document-level `first_warning` is unchanged. Byte-identical net
+  /// `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    out.extend(
+      self
+        .warnings()
+        .iter()
+        .map(crate::diagnostics::Diagnostic::warn),
+    );
+    #[cfg(feature = "exif")]
+    for replay in replay_exif_events(self.exif_events()) {
+      if let Some(exif_meta) = replay.meta() {
+        out.extend(crate::diagnostics::Diagnose::diagnostics(exif_meta));
+      }
+      out.extend(
+        replay
+          .cycle_guard_warnings()
+          .iter()
+          .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+      );
+    }
+    out
+  }
+}
+
 /// The result of replaying ONE [`PngExifEvent`] through the shared
 /// `$$et{PROCESSED}` model ([`replay_exif_events`]): the parsed
 /// [`crate::exif::ExifMeta`] (whatever directories were NOT blocked by the
@@ -2049,8 +2090,8 @@ impl<'a> EventReplay<'a> {
 /// `$$et{PROCESSED}` set. This is the single shared decision used by tag
 /// emission ([`ProcessPng`]'s `tags()`), the domain projection
 /// ([`crate::metadata::Project`] for [`PngMeta`]), and the warning drain
-/// (`crate::format_parser`'s `drain_diagnostics`), so all three agree on exactly
-/// which directories win and which warn.
+/// ([`PngMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics)), so all
+/// three agree on exactly which directories win and which warn.
 ///
 /// **The coherent event model (bundled's object-level sequence).** A PNG's
 /// EXIF-bearing chunks form an ORDERED event stream (chunk/walk order). Bundled

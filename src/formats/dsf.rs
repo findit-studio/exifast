@@ -717,6 +717,25 @@ fn read_u64_le(b: &[u8]) -> u64 {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// DSF's diagnostics in the retired drain order: the DSF.pm:71 fmt-read
+  /// warning FIRST (it precedes the tags), then the chained ID3 sub-Meta's own
+  /// warnings then errors (its tags emit after DSF's, so its diagnostics drain
+  /// after). The net `TagMap` (and `first_warning`) stays byte-identical.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    if let Some(w) = self.fmt_warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    #[cfg(feature = "id3")]
+    if let Some(id3) = self.id3_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield DSF tags in `%DSF::Main` ascending-key order (DSF.pm has no
   /// `FIRST_ENTRY` hint, so ExifTool walks keys via `sort { $a <=> $b }` —

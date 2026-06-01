@@ -763,14 +763,6 @@ impl<'a> Meta<'a> {
   pub const fn id3_ref(&self) -> Option<&crate::formats::id3::Id3Meta<'_>> {
     self.id3.as_ref()
   }
-
-  /// True iff FLAC.pm:263 set `$err = 1` during the block-chain walk (a
-  /// truncated block read). Bundled emits the warning at FLAC.pm:278.
-  #[must_use]
-  #[inline(always)]
-  pub const fn has_format_error(&self) -> bool {
-    self.format_error
-  }
 }
 
 // ===========================================================================
@@ -1445,6 +1437,37 @@ fn decode_base64(s: &str) -> Vec<u8> {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// FLAC's diagnostics in the retired drain order: (a) the chained ID3
+  /// sub-Meta's own warnings then errors (BEFORE the FLAC body), (b) the
+  /// FLAC.pm:278 "Format error in FLAC file" warning (was `flac_format_error_warned()`,
+  /// now read from the inner `format_error` flag), (c) one "Picture pointer
+  /// references previous VorbisComment directory" warning per
+  /// METADATA_BLOCK_PICTURE Vorbis item (Vorbis.pm:122-135). Byte-identical net
+  /// `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    #[cfg(feature = "id3")]
+    if let Some(id3) = self.id3_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    if self.format_error {
+      out.push(crate::diagnostics::Diagnostic::warn(
+        "Format error in FLAC file",
+      ));
+    }
+    for item in self.vorbis_items() {
+      if item.is_picture_recursion_warning() {
+        out.push(crate::diagnostics::Diagnostic::warn(
+          "Picture pointer references previous VorbisComment directory",
+        ));
+      }
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield FLAC tags in bundled `perl exiftool -j -G1` order:
   /// (0) the chained ID3 sub-Meta (FLAC.pm:243-247 embedded `ProcessID3`) →
@@ -1899,23 +1922,16 @@ mod tests {
   /// `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
     crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
-    #[cfg(feature = "id3")]
-    if let Some(id3) = meta.id3_ref() {
-      for w in id3.warnings_slice() {
-        let _ = out.write_warning(w.as_str());
-      }
-      for e in id3.errors_slice() {
-        let _ = out.write_error(e.as_str());
-      }
-    }
-    if meta.has_format_error() {
-      let _ = out.write_warning("Format error in FLAC file");
-    }
-    for item in meta.vorbis_items() {
-      if item.is_picture_recursion_warning() {
-        let _ = out.write_warning("Picture pointer references previous VorbisComment directory");
-      }
-    }
+    crate::diagnostics::run_diagnostics(meta, out);
+  }
+
+  /// Whether the FLAC.pm:278 "Format error in FLAC file" warning is present in
+  /// the Meta's [`Diagnose`](crate::diagnostics::Diagnose) stream — the test
+  /// read-back that replaced the retired `flac_format_error_warned()` bool accessor.
+  fn flac_format_error_warned(meta: &Meta<'_>) -> bool {
+    crate::diagnostics::Diagnose::diagnostics(meta)
+      .iter()
+      .any(|d| d.message() == "Format error in FLAC file")
   }
 
   #[test]
@@ -2164,7 +2180,7 @@ mod tests {
     // No pictures in this fixture.
     assert!(meta.pictures().is_empty());
     // No format error.
-    assert!(!meta.has_format_error());
+    assert!(!flac_format_error_warned(&meta));
   }
 
   #[test]
@@ -2191,7 +2207,7 @@ mod tests {
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(b"fLaC", &mut shared).expect("flac");
     assert!(meta.stream_info.block_size_min.is_none());
-    assert!(!meta.has_format_error());
+    assert!(!flac_format_error_warned(&meta));
   }
 
   #[test]
@@ -2199,7 +2215,7 @@ mod tests {
     let data: &[u8] = &[b'f', b'L', b'a', b'C', 0x80, 0xff, 0xff, 0xff];
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(data, &mut shared).expect("flac");
-    assert!(meta.has_format_error());
+    assert!(flac_format_error_warned(&meta));
   }
 
   // ---------- Engine entry (`extract_info`) -------------------------------

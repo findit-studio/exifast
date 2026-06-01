@@ -827,6 +827,26 @@ pub(crate) fn parse_full_chained<'a>(
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// WavPack's diagnostics in the retired drain order: (a) the chained ID3
+  /// sub-Meta's own warnings then errors, (b) the chained APE sub-Meta's own
+  /// diagnostics (nested ID3 warnings then errors, then `Bad APE trailer`).
+  /// Byte-identical net `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    #[cfg(feature = "id3")]
+    if let Some(id3) = self.id3_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    #[cfg(feature = "ape")]
+    if let Some(ape) = self.ape_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(ape));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield WavPack tags in ExifTool numeric sort order (WavPack.pm:31-73 →
   /// ExifTool.pm:9907 sorted-key walk): 6.1 BytesPerSample, 6.2 AudioType,

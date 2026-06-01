@@ -1338,6 +1338,20 @@ fn tag_str_to_static(s: &str) -> &'static str {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// AIFF's `$et->Warn("Skipping large ... chunk")` (AIFF.pm) as
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic) warnings, in chunk-loop
+  /// order. AIFF emits no `$et->Error` (the short-header reject returns
+  /// `Ok(None)` ⇒ the engine's post-loop `ExifTool:Error` fires instead).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self
+      .warnings()
+      .map(crate::diagnostics::Diagnostic::warn)
+      .collect()
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield AIFF tags in faithful chunk-order plus the post-loop Composite
   /// `Duration`. The golden-pattern parallel to the retired

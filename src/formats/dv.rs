@@ -896,6 +896,23 @@ impl core::fmt::Display for ParseOutcome<'_> {
   }
 }
 
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for ParseOutcome<'_> {
+  /// DV.pm:188 — a recognized DIF header with no profile match yields
+  /// `Warn("Unrecognized DV profile")` and no DV:* tags. A successful parse
+  /// ([`ParseOutcome::Meta`]) raises no diagnostics.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    match self {
+      ParseOutcome::UnrecognizedProfile => {
+        std::vec![crate::diagnostics::Diagnostic::warn(
+          "Unrecognized DV profile"
+        )]
+      }
+      ParseOutcome::Meta(_) => std::vec::Vec::new(),
+    }
+  }
+}
+
 impl FormatParser for ProcessDv {
   /// Spec §8: leaf format with no shared state; reads a single byte slice.
   /// GAT: the Meta is parameterized by `'a`, though every string field

@@ -471,7 +471,7 @@ pub struct Meta<'a> {
   sv7_header: Option<Sv7Header>,
   /// Whether the non-SV7 warning (MPC.pm:108 `'Audio info currently not
   /// extracted from this version MPC file'`) should be emitted.
-  warn_unsupported_version: bool,
+  mpc_unsupported_version_warned: bool,
   /// Chained ID3 sub-Meta (MPC.pm:84-87 `ProcessID3` — runs BEFORE the
   /// MP+ magic check). `Some` when an ID3v2 PREFIX was detected and
   /// parsed via [`crate::formats::id3::process::parse_id3_with_hdr_end`];
@@ -501,13 +501,6 @@ impl Meta<'_> {
   #[inline(always)]
   pub const fn sv7_header(&self) -> Option<&Sv7Header> {
     self.sv7_header.as_ref()
-  }
-  /// `true` if the MPC.pm:108 warning (`'Audio info currently not extracted
-  /// from this version MPC file'`) should be emitted.
-  #[must_use]
-  #[inline(always)]
-  pub const fn warn_unsupported_version(&self) -> bool {
-    self.warn_unsupported_version
   }
   /// Chained ID3 sub-Meta (MPC.pm:84-87). `Some` when an ID3v2 prefix was
   /// detected by [`parse_full_chained`]. §3: non-`Copy` borrow ⇒ `_ref`
@@ -672,7 +665,7 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Option<Meta<'_>> {
   // MPC.pm:97-106 — SV7 path: ProcessDirectory(MPC::Main) over the 32-byte
   // header, byte order 'II' (MPC.pm:98). `Options('Verbose')` (MPC.pm:100)
   // is faithfully deferred (no Verbose option on the read path).
-  let (sv7_header, warn_unsupported_version) = if version == 0x07 {
+  let (sv7_header, mpc_unsupported_version_warned) = if version == 0x07 {
     (Some(extract_sv7_header(hdr)), false)
   } else {
     // MPC.pm:107-109 `$et->Warn('Audio info currently not extracted from
@@ -683,7 +676,7 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Option<Meta<'_>> {
   Some(Meta {
     version,
     sv7_header,
-    warn_unsupported_version,
+    mpc_unsupported_version_warned,
     #[cfg(feature = "id3")]
     id3: None,
     #[cfg(feature = "ape")]
@@ -827,6 +820,33 @@ fn extract_sv7_header(hdr: &[u8]) -> Sv7Header {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// MPC's diagnostics in the retired drain order: (a) the chained ID3
+  /// sub-Meta's own warnings then errors (BEFORE the MPC body), (b) the
+  /// MPC.pm:107-109 non-SV7 warning (was `mpc_unsupported_version_warned()`, now read
+  /// from the inner flag), (c) the chained APE sub-Meta's own diagnostics
+  /// (nested ID3 warnings then errors, then `Bad APE trailer`). Byte-identical
+  /// net `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    #[cfg(feature = "id3")]
+    if let Some(id3) = self.id3_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    if self.mpc_unsupported_version_warned {
+      out.push(crate::diagnostics::Diagnostic::warn(
+        "Audio info currently not extracted from this version MPC file",
+      ));
+    }
+    #[cfg(feature = "ape")]
+    if let Some(ape) = self.ape_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(ape));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield MPC tags: first the chained ID3 sub-Meta's tags (MPC.pm:84-87 —
   /// bundled runs `ProcessID3` BEFORE the MP+ body), then the `%MPC::Main`
@@ -858,7 +878,7 @@ impl crate::emit::Taggable for Meta<'_> {
   /// APE-side nested-ID3 warnings/errors are NOT in this stream (see below).
   ///
   /// **What is NOT in this stream:** (1) the MPC.pm:107-109 non-SV7 warning
-  /// (`Meta::warn_unsupported_version`); (2) the chained ID3 sub-Meta's
+  /// (`Meta::mpc_unsupported_version_warned`); (2) the chained ID3 sub-Meta's
   /// warnings/errors; (3) the chained APE sub-Meta's `Bad APE trailer`
   /// warning + any APE-side nested-ID3 warnings/errors.
   /// [`run_emission`](crate::emit::run_emission) has no warning/error
@@ -1087,36 +1107,16 @@ mod tests {
   /// else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
     crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
-    #[cfg(feature = "id3")]
-    if let Some(id3) = meta.id3_ref() {
-      for w in id3.warnings_slice() {
-        let _ = out.write_warning(w.as_str());
-      }
-      for e in id3.errors_slice() {
-        let _ = out.write_error(e.as_str());
-      }
-    }
-    if meta.warn_unsupported_version() {
-      let _ = out.write_warning("Audio info currently not extracted from this version MPC file");
-    }
-    // APE:* tags now flow through `run_emission` (ape::Meta is Taggable);
-    // the arm drains only the APE-side nested-ID3 warnings/errors + the
-    // `Bad APE trailer` warning.
-    #[cfg(feature = "ape")]
-    if let Some(ape) = meta.ape_ref() {
-      #[cfg(feature = "id3")]
-      if let Some(id3) = ape.id3_ref() {
-        for w in id3.warnings_slice() {
-          let _ = out.write_warning(w.as_str());
-        }
-        for e in id3.errors_slice() {
-          let _ = out.write_error(e.as_str());
-        }
-      }
-      if ape.warn_bad_trailer() {
-        let _ = out.write_warning("Bad APE trailer");
-      }
-    }
+    crate::diagnostics::run_diagnostics(meta, out);
+  }
+
+  /// Whether the MPC.pm:107-109 non-SV7 warning is present in the Meta's
+  /// [`Diagnose`](crate::diagnostics::Diagnose) stream — the test read-back
+  /// that replaced the retired `mpc_unsupported_version_warned()` bool accessor.
+  fn mpc_unsupported_version_warned(meta: &Meta<'_>) -> bool {
+    crate::diagnostics::Diagnose::diagnostics(meta)
+      .iter()
+      .any(|d| d.message() == "Audio info currently not extracted from this version MPC file")
   }
 
   // ---------- Tag table + bit-keys faithfulness --------------------------
@@ -1294,7 +1294,7 @@ mod tests {
     assert!(!h.fast_seek()); // 0 ⇒ No
     assert!(h.gapless()); // 1 ⇒ Yes
     assert_eq!(h.encoder_version(), 115);
-    assert!(!meta.warn_unsupported_version());
+    assert!(!mpc_unsupported_version_warned(&meta));
     // R5 (Codex adversarial): `parse_borrowed` now routes through
     // `parse_full_chained` (R4 fixed the crate-root `parse_mpc`; R5
     // propagates to the module-level + trait surfaces too). For a bare
@@ -1326,7 +1326,7 @@ mod tests {
     let meta = parse_borrowed(&bytes).expect("parsed");
     assert_eq!(meta.version(), 0x08);
     assert!(meta.sv7_header().is_none());
-    assert!(meta.warn_unsupported_version());
+    assert!(mpc_unsupported_version_warned(&meta));
   }
 
   #[test]
@@ -1365,7 +1365,7 @@ mod tests {
     let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
-      warn_unsupported_version: false,
+      mpc_unsupported_version_warned: false,
       #[cfg(feature = "id3")]
       id3: None,
       #[cfg(feature = "ape")]
@@ -1411,7 +1411,7 @@ mod tests {
     let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
-      warn_unsupported_version: false,
+      mpc_unsupported_version_warned: false,
       #[cfg(feature = "id3")]
       id3: None,
       #[cfg(feature = "ape")]
@@ -1433,11 +1433,11 @@ mod tests {
 
   #[test]
   fn meta_sinker_emits_warning_on_non_sv7() {
-    // sv8 path: sv7_header=None, warn_unsupported_version=true.
+    // sv8 path: sv7_header=None, mpc_unsupported_version_warned=true.
     let meta = Meta {
       version: 0x08,
       sv7_header: None,
-      warn_unsupported_version: true,
+      mpc_unsupported_version_warned: true,
       #[cfg(feature = "id3")]
       id3: None,
       #[cfg(feature = "ape")]
@@ -1484,7 +1484,7 @@ mod tests {
     let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
-      warn_unsupported_version: false,
+      mpc_unsupported_version_warned: false,
       #[cfg(feature = "id3")]
       id3: None,
       #[cfg(feature = "ape")]
@@ -1518,7 +1518,7 @@ mod tests {
     let meta = Meta {
       version: 0x07,
       sv7_header: Some(h),
-      warn_unsupported_version: false,
+      mpc_unsupported_version_warned: false,
       #[cfg(feature = "id3")]
       id3: None,
       #[cfg(feature = "ape")]

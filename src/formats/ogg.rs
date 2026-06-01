@@ -2256,6 +2256,29 @@ fn tag_to_comment(tag: &crate::value::Tag) -> Comment {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// OGG's diagnostics in the retired drain order: (a) the chained ID3
+  /// sub-Meta's own warnings then errors (BEFORE the OGG body), (b) OGG's own
+  /// accumulated warnings (`Lost synchronization` Ogg.pm:97, `Missing page(s)
+  /// in Ogg file` Ogg.pm:158, `Format error in Vorbis comments` Vorbis.pm:208)
+  /// in occurrence order. Byte-identical net `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    #[cfg(feature = "id3")]
+    if let Some(id3) = self.id3_ref() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    out.extend(
+      self
+        .warnings()
+        .iter()
+        .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+    );
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield OGG tags in bundled `perl exiftool -j -G1` emission order:
   ///   0. The chained ID3 sub-Meta (Ogg.pm:79-83 embedded `ProcessID3`),
@@ -2646,18 +2669,7 @@ mod tests {
   /// `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
     crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
-    #[cfg(feature = "id3")]
-    if let Some(id3) = meta.id3_ref() {
-      for w in id3.warnings_slice() {
-        let _ = out.write_warning(w.as_str());
-      }
-      for e in id3.errors_slice() {
-        let _ = out.write_error(e.as_str());
-      }
-    }
-    for w in meta.warnings() {
-      let _ = out.write_warning(w.as_str());
-    }
+    crate::diagnostics::run_diagnostics(meta, out);
   }
 
   // `convert_bitrate` unit-tests live next to the helper in `convert.rs`

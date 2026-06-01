@@ -92,6 +92,14 @@ pub mod datetime;
 // `serialize_tags`. `alloc`-gated to match `tagmap` (the engine's sink).
 #[cfg(feature = "alloc")]
 pub mod emit;
+// The format-agnostic DIAGNOSTIC framework (`Diagnose` + the `run_diagnostics`
+// engine + `Diagnostic`/`Severity`): the `$et->Warn` / `$et->Error` channel
+// parallel of `emit`, replacing the retired hand-written per-format
+// `drain_diagnostics` match (13 incompatible accessor shapes). `alloc`-gated to
+// match `emit`/`tagmap` (a `Diagnostic` owns a `SmolStr`; the engine drains
+// into the `alloc`-gated `TagMap`).
+#[cfg(feature = "alloc")]
+pub mod diagnostics;
 pub mod error;
 // The Exif/TIFF IFD infrastructure (`exif` feature) + the GPS sub-IFD tag
 // table (`gps` feature). `src/exif/` is a top-level module (not under
@@ -151,6 +159,12 @@ pub use metadata::{MediaMetadata, Project};
 // `emit` module.
 #[cfg(feature = "alloc")]
 pub use emit::{ConvMode, EmittedTag, Taggable};
+
+// The diagnostic-framework public surface (`run_diagnostics` stays `pub(crate)`
+// — it writes into the crate-private `TagMap` sink). `alloc`-gated to match the
+// `diagnostics` module.
+#[cfg(feature = "alloc")]
+pub use diagnostics::{Diagnose, Diagnostic, Severity};
 
 // ===========================================================================
 // Public lib-first API surface — Phase G

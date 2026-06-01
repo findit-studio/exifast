@@ -698,9 +698,12 @@ impl AnyMeta<'_> {
   /// [`Taggable`](crate::emit::Taggable) stream (the `collect_emitted`
   /// dispatch), so the Unknown-suppression + `write_value(family1, name,
   /// value)` + last-wins dedup are EXACTLY the engine's — then the per-format
-  /// diagnostics are drained. Because an `AnyMeta` is a SINGLE Meta (exactly
-  /// one arm fires), "all tags then all diagnostics" is identical to the prior
-  /// per-arm "run_emission then drain" — byte-identical JSON.
+  /// diagnostics are drained by the sibling engine
+  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) over this
+  /// `AnyMeta`'s [`Diagnose`](crate::diagnostics::Diagnose) stream (the
+  /// per-format `diagnostics()`). Because an `AnyMeta` is a SINGLE Meta
+  /// (exactly one arm fires), "all tags then all diagnostics" is identical to
+  /// the prior per-arm "run_emission then drain" — byte-identical JSON.
   pub(crate) fn serialize_tags(
     &self,
     print_conv: bool,
@@ -708,454 +711,119 @@ impl AnyMeta<'_> {
   ) -> Result<(), core::convert::Infallible> {
     let mode = crate::emit::ConvMode::from_print_conv(print_conv);
     crate::emit::run_emission(self, mode, out);
-    self.drain_diagnostics(out)
+    crate::diagnostics::run_diagnostics(self, out);
+    Ok(())
   }
+}
 
-  /// Drain this typed Meta's per-format diagnostic channel (the `$et->Warn` /
-  /// `$et->Error` accumulators) into the [`TagMap`](crate::tagmap::TagMap)
-  /// sink, in the exact order each format's retired inherent `serialize_tags`
-  /// emitted them. The TAG emission is done separately (via
-  /// [`collect_emitted`](Self::collect_emitted) / [`run_emission`]); this is
-  /// the diagnostics-only second half of [`serialize_tags`](Self::serialize_tags).
-  ///
-  /// `run_emission` has no warning/error channel, so the warnings/errors that
-  /// used to be drained after the per-arm `run_emission` call are relocated
-  /// here VERBATIM (same accessors, same order, same conditions). The net
-  /// `TagMap` (and `first_warning`/`first_error`) stays byte-identical.
-  fn drain_diagnostics(
-    &self,
-    out: &mut crate::tagmap::TagMap,
-  ) -> Result<(), core::convert::Infallible> {
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for AnyMeta<'_> {
+  /// Drain this `AnyMeta`'s per-format diagnostic channel (the `$et->Warn` /
+  /// `$et->Error` accumulators) into a `Vec<Diagnostic>` in the exact order
+  /// each format's retired inherent `serialize_tags` emitted them — the
+  /// sibling of the [`Taggable`](crate::emit::Taggable) tag stream
+  /// ([`run_emission`](crate::emit::run_emission) has no warning/error channel).
+  /// Closed-set dispatch over the one firing arm: each variant delegates to its
+  /// typed Meta's own [`Diagnose::diagnostics`](crate::diagnostics::Diagnose)
+  /// (sub-Meta diagnostics → own, per the documented `ProcessMP3`-style order),
+  /// so [`run_diagnostics`](crate::diagnostics::run_diagnostics) surfaces the
+  /// FIRST warning/error as the document `ExifTool:Warning`/`ExifTool:Error`.
+  /// The formats that never `Warn`/`Error` (MOI / AAC / CRW / Real /
+  /// MPEG-audio / ID3v1) yield the empty default.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     match self {
       #[cfg(feature = "moi")]
-      AnyMeta::Moi(_) => Ok(()),
+      AnyMeta::Moi(_) => std::vec::Vec::new(),
       #[cfg(feature = "aac")]
-      AnyMeta::Aac(_) => Ok(()),
+      AnyMeta::Aac(_) => std::vec::Vec::new(),
+      // DV.pm:188 — a recognized DIF header with no profile match warns
+      // `Unrecognized DV profile`; a successful parse warns nothing. Dispatched
+      // through `ParseOutcome`'s own `Diagnose` impl.
       #[cfg(feature = "dv")]
-      AnyMeta::Dv(o) => match o {
-        // DV.pm:188 — Warn + return 1 without DV:* tags. The typed path emits
-        // the warning and no tags (the document builder surfaces it as the
-        // ExifTool:Warning).
-        crate::formats::dv::ParseOutcome::UnrecognizedProfile => {
-          out.write_warning("Unrecognized DV profile")
-        }
-        crate::formats::dv::ParseOutcome::Meta(_) => Ok(()),
-      },
+      AnyMeta::Dv(o) => crate::diagnostics::Diagnose::diagnostics(o),
       #[cfg(feature = "audible")]
-      AnyMeta::Aa(m) => {
-        // Warnings/errors stay outside the `Taggable` stream (`run_emission`
-        // has no warning/error channel — Audible.pm `$et->Warn`/`$et->Error`
-        // accumulators surface through `TagMap::first_warning`/`first_error`).
-        for w in m.warnings() {
-          out.write_warning(w.as_str())?;
-        }
-        for e in m.errors() {
-          out.write_error(e.as_str())?;
-        }
-        Ok(())
-      }
+      AnyMeta::Aa(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // CRW emits NO `$et->Warn`/`$et->Error` for the ported records (the two
+      // `ProcessCanonRaw` stop-the-walk warnings + the `CRW file format error`
+      // warning are unreachable on a real/crafted CRW — a header/signature
+      // mismatch returns `Ok(None)` so the engine emits its own
+      // `ExifTool:Error`). Nothing to drain.
       #[cfg(feature = "crw")]
-      AnyMeta::Crw(_) => {
-        // CRW emits NO `$et->Warn`/`$et->Error` for the ported records: the
-        // two `ProcessCanonRaw` warnings (`Bad CRW directory entry`
-        // `CanonRaw.pm:652`, `Not processing double-referenced … directory`
-        // `CanonRaw.pm:636`) are stop-the-walk events that never fire on a
-        // real/crafted CRW (no `tagInfo`-less or self-referential directory),
-        // and the embedded Canon sub-table decoders raise none. The
-        // `CRW file format error` warning (`CanonRaw.pm:842`) is unreachable
-        // here too — a header/signature mismatch returns `Ok(None)` (the
-        // engine then emits its own `ExifTool:Error`), and a valid header with
-        // an unreadable root directory still produces `Some(meta)` with no
-        // records (bundled's `ProcessCanonRaw` `return 0` warns, but no real
-        // CRW reaches it). So nothing to drain.
-        Ok(())
-      }
+      AnyMeta::Crw(_) => std::vec::Vec::new(),
       #[cfg(feature = "red")]
-      AnyMeta::R3d(m) => {
-        // Red.pm `$et->Warn` accumulators surface through `TagMap::first_warning`.
-        for w in m.warnings() {
-          out.write_warning(w)?;
-        }
-        Ok(())
-      }
+      AnyMeta::R3d(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "id3")]
-      AnyMeta::Id3(m) => {
-        // The kept inherent `Id3Meta::serialize_tags` appended these after the
-        // tags; ID3 is a directory parser, never dispatched standalone, so this
-        // arm is inert today — kept consistent with the migration.
-        for w in m.warnings_slice() {
-          out.write_warning(w.as_str())?;
-        }
-        for e in m.errors_slice() {
-          out.write_error(e.as_str())?;
-        }
-        Ok(())
-      }
+      AnyMeta::Id3(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "mp3")]
-      AnyMeta::Mp3(m) => {
-        // Bundled `ProcessMP3` order (ID3.pm:1684-1728): (a) the ID3 sub-Meta's
-        // own warnings then errors; (b) MPEG-audio emits none; (c) the APE
-        // sub-Meta's own — APE first emits its nested ID3v1-trailer sub-Meta's
-        // warnings then errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
-        if let Some(id3) = m.id3() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        #[cfg(feature = "ape")]
-        if let Some(ape) = m.ape() {
-          if let Some(id3) = ape.id3_ref() {
-            for w in id3.warnings_slice() {
-              out.write_warning(w.as_str())?;
-            }
-            for e in id3.errors_slice() {
-              out.write_error(e.as_str())?;
-            }
-          }
-          if ape.warn_bad_trailer() {
-            out.write_warning("Bad APE trailer")?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Mp3(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "aiff")]
-      AnyMeta::Aiff(m) => {
-        // AIFF.pm's `$et->Warn("Skipping large ... chunk")` surfaces through
-        // `TagMap::first_warning`. AIFF emits no `$et->Error` (the short-header
-        // reject returns `Ok(None)` ⇒ the engine's post-loop `ExifTool:Error`
-        // block fires instead).
-        for w in m.warnings() {
-          out.write_warning(w)?;
-        }
-        Ok(())
-      }
+      AnyMeta::Aiff(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "ape")]
-      AnyMeta::Ape(m) => {
-        // The KEPT inherent `ape::Meta::serialize_tags` emitted these in order:
-        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
-        // MAC/main body); (b) the APE.pm:238 `Warn('Bad APE trailer')` (AFTER
-        // the main stream).
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        if m.warn_bad_trailer() {
-          out.write_warning("Bad APE trailer")?;
-        }
-        Ok(())
-      }
+      AnyMeta::Ape(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "dsf")]
-      AnyMeta::Dsf(m) => {
-        // The retired `dsf::Meta::serialize_tags` emitted the DSF.pm:71
-        // fmt-read warning BEFORE the tags, then `id3.serialize_tags` appended
-        // the ID3 sub-Meta's own warnings/errors AFTER its tags. Draining in
-        // that order (fmt warning, then ID3 warnings, then ID3 errors) keeps
-        // the net `TagMap` byte-identical.
-        if let Some(w) = m.fmt_warning() {
-          out.write_warning(w)?;
-        }
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Dsf(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "flac")]
-      AnyMeta::Flac(m) => {
-        // The retired `flac::Meta::serialize_tags` emitted these in order:
-        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
-        // FLAC body); (b) the FLAC.pm:278 "Format error in FLAC file" warning;
-        // (c) one "Picture pointer references previous VorbisComment directory"
-        // warning per METADATA_BLOCK_PICTURE Vorbis item (Vorbis.pm:122-135).
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        if m.has_format_error() {
-          out.write_warning("Format error in FLAC file")?;
-        }
-        for item in m.vorbis_items() {
-          if item.is_picture_recursion_warning() {
-            out.write_warning("Picture pointer references previous VorbisComment directory")?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Flac(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "h264")]
-      AnyMeta::H264(m) => {
-        // The `Warn('Entries in MDPM directory are out of sequence')` /
-        // forbidden-bit warnings (H264.pm:989/1058) surface through
-        // `TagMap::first_warning`.
-        for w in m.warnings() {
-          out.write_warning(w.as_str())?;
-        }
-        Ok(())
-      }
+      AnyMeta::H264(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "flash")]
-      AnyMeta::Flv(m) => {
-        // The FLV `$et->Warn` accumulators (Flash.pm:353/437/456/504/511)
-        // surface through `TagMap::first_warning`.
-        for w in m.warnings() {
-          out.write_warning(w.as_str())?;
-        }
-        Ok(())
-      }
+      AnyMeta::Flv(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "ogg")]
-      AnyMeta::Ogg(m) => {
-        // The retired `ogg::Meta::serialize_tags` emitted these in order:
-        // (a) the chained ID3 sub-Meta's own warnings then errors (BEFORE the
-        // OGG body); (b) OGG's own accumulated warnings (`Lost synchronization`
-        // Ogg.pm:97, `Missing page(s) in Ogg file` Ogg.pm:158, `Format error in
-        // Vorbis comments` Vorbis.pm:208) in occurrence order.
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        for w in m.warnings() {
-          out.write_warning(w.as_str())?;
-        }
-        Ok(())
-      }
+      AnyMeta::Ogg(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "png")]
-      AnyMeta::Png(m) => {
-        // The retired `png::PngMeta::serialize_tags` emitted these in order:
-        // (a) the PNG walker's own accumulated warnings (`Truncated PNG image`
-        // PNG.pm:1486, `Text/EXIF chunk(s) found after PNG <chunk> …`
-        // PNG.pm:1598, the zlib inflate-error warnings `Error inflating
-        // <chunk>` PNG.pm:942 / `Unknown compression method <n> for <chunk>`
-        // PNG.pm:951, the `Invalid eXIf chunk` / `Improper "Exif00" header …`
-        // PNG.pm:1369-1384, …) BEFORE the eXIf dispatch; (b) the embedded eXIf
-        // Exif block's own
-        // `$et->Warn` warnings (drained INSIDE the retired
-        // `exif_meta.serialize_tags` call AFTER its tags). The PNG-level
-        // warnings always precede the Exif ones (PNG walks first), so the
-        // document-level `first_warning` (= `ExifTool:Warning`) is unchanged;
-        // we preserve the full order for completeness.
-        for w in m.warnings() {
-          out.write_warning(w)?;
-        }
-        // The eXIf / Raw-profile EXIF sub-Metas' diagnostics, IN CHUNK ORDER via
-        // the SAME shared-`$$et{PROCESSED}` event replay `tags()` / `project()`
-        // use (`replay_exif_events`, `ExifTool.pm:9061-9072` + `PNG.pm:1193`).
-        // For each EXIF event, in chunk order:
-        //   * its own EXIF `$et->Warn` corpus (Bad-directory, suspicious-offset,
-        //     …) via `ExifMeta::warnings()` (a blocked event skipped IFD0 so it
-        //     has none; a reset-only profile yields no `meta`);
-        //   * the cross-source cycle-guard warning(s) the walk raised
-        //     (`ExifTool.pm:9068`, "$dirName pointer references previous $prev
-        //     directory") — these are EMPTY unless the event's IFD0 `$addr`
-        //     collided with an already-processed directory (IFD0 OR a trailing
-        //     IFD; the `$prev` is the recorded name, e.g. `IFD1` for a
-        //     cross-source trailing-IFD collision).
-        // Draining in chunk order keeps the warning sequence faithful (the
-        // cycle-guard warning lands where bundled raises it, between the
-        // surrounding events' warnings).
-        //
-        // NOTE (documented, not chased): 3+ events sharing one `$addr` drive
-        // bundled into emergent C-buffer/offset GARBAGE values (e.g. `IFD0:Make
-        // = "\x1a"`) alongside the cycle-guard warning(s). That is beyond the
-        // DOCUMENTED cycle-guard (which just warns + skips); this port emits
-        // clean tags for the processed directories + one cycle-guard warning per
-        // blocked directory, matching `ExifTool.pm:9066-9072` rather than the
-        // garbage. See `replay_exif_events`.
-        #[cfg(feature = "exif")]
-        for replay in crate::formats::png::replay_exif_events(m.exif_events()) {
-          if let Some(exif_meta) = replay.meta() {
-            for w in exif_meta.warnings() {
-              out.write_warning(w)?;
-            }
-          }
-          for w in replay.cycle_guard_warnings() {
-            out.write_warning(w)?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Png(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // Real emits NO warnings/errors (Real.pm `return 0` on bad input; the
+      // "Unsupported RealAudio version" `Warn` produces no tags AND no tagmap
+      // warning), and the chained `Id3v1Meta` carries none.
       #[cfg(feature = "real")]
-      AnyMeta::Real(_) => {
-        // Real emits NO warnings/errors (Real.pm `return 0` on bad input; the
-        // "Unsupported RealAudio version" `Warn` produces no tags AND no tagmap
-        // warning), and the chained `Id3v1Meta` likewise carries none.
-        Ok(())
-      }
+      AnyMeta::Real(_) => std::vec::Vec::new(),
       #[cfg(feature = "mpeg-audio")]
-      AnyMeta::MpegAudio(_) => Ok(()),
+      AnyMeta::MpegAudio(_) => std::vec::Vec::new(),
       #[cfg(feature = "mpc")]
-      AnyMeta::Mpc(m) => {
-        // The retired `mpc::Meta::serialize_tags` emitted these in order:
-        // (a) the ID3 sub-Meta's own warnings then errors (BEFORE the MPC
-        // body); (b) the MPC.pm:107-109 non-SV7 warning; (c) the APE sub-Meta's
-        // own — APE first emits its nested ID3v1-trailer sub-Meta's warnings
-        // then errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        if m.warn_unsupported_version() {
-          out.write_warning("Audio info currently not extracted from this version MPC file")?;
-        }
-        #[cfg(feature = "ape")]
-        if let Some(ape) = m.ape_ref() {
-          #[cfg(feature = "id3")]
-          if let Some(id3) = ape.id3_ref() {
-            for w in id3.warnings_slice() {
-              out.write_warning(w.as_str())?;
-            }
-            for e in id3.errors_slice() {
-              out.write_error(e.as_str())?;
-            }
-          }
-          if ape.warn_bad_trailer() {
-            out.write_warning("Bad APE trailer")?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Mpc(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "wavpack")]
-      AnyMeta::Wv(m) => {
-        // The retired `wavpack::Meta::serialize_tags` emitted these in order:
-        // (a) the chained ID3 sub-Meta's own warnings then errors (AFTER the WV
-        // header tags); (b) the chained APE sub-Meta's own warnings/errors —
-        // APE first emits its nested ID3v1-trailer sub-Meta's warnings then
-        // errors, then the APE.pm:238 `Warn('Bad APE trailer')`.
-        #[cfg(feature = "id3")]
-        if let Some(id3) = m.id3_ref() {
-          for w in id3.warnings_slice() {
-            out.write_warning(w.as_str())?;
-          }
-          for e in id3.errors_slice() {
-            out.write_error(e.as_str())?;
-          }
-        }
-        #[cfg(feature = "ape")]
-        if let Some(ape) = m.ape_ref() {
-          #[cfg(feature = "id3")]
-          if let Some(id3) = ape.id3_ref() {
-            for w in id3.warnings_slice() {
-              out.write_warning(w.as_str())?;
-            }
-            for e in id3.errors_slice() {
-              out.write_error(e.as_str())?;
-            }
-          }
-          if ape.warn_bad_trailer() {
-            out.write_warning("Bad APE trailer")?;
-          }
-        }
-        Ok(())
-      }
+      AnyMeta::Wv(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // Matroska's 4 bundled `$et->Warn` sites (Matroska.pm:1006/1075/1140/1179)
+      // are DROPPED here pending an architecture decision (Golden-v2 Phase B.1
+      // STOP-AND-REPORT): the oracle surfaces "Illegal float size" / "Invalid
+      // or corrupted master element" as GROUP-1-SCOPED `<group>:Warning` TAGS
+      // (the active `SET_GROUP1`, e.g. `Info:Warning`) — NOT the document-level
+      // `ExifTool:Warning` the `Diagnose` channel feeds — AND emits the
+      // illegal-float leaf as `0` (undef→ValueConv), while "Truncated Matroska
+      // header" warns `ExifTool:Warning` but SKIPS `SetFileType` (no `File:*`).
+      // None fit the `diagnostics()` (first-warning→`ExifTool:Warning`) model;
+      // a faithful port needs the QuickTime-style group-scoped `Warning` TAG
+      // path + value/finalization semantics. Left as the retired arm's `Ok(())`
+      // (no warning) so Matroska conformance is byte-identical. (`Processing
+      // large block`, Matroska.pm:1140, is `LargeFileSupport==2`-gated —
+      // unreachable in this port's default mode regardless.)
       #[cfg(feature = "matroska")]
-      AnyMeta::Matroska(_) => Ok(()),
+      AnyMeta::Matroska(_) => std::vec::Vec::new(),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => {
-        // The FIRST `ProcessMOV` warning (`Truncated '...' data` / `Invalid
-        // atom size`) stays OUTSIDE the `Taggable` stream — QuickTime.pm:
-        // 10242/10590 surfaces it as the document-level `ExifTool:Warning` via
-        // `TagMap::first_warning`. R6/F2: the per-track truncation warnings are
-        // emitted IN the tag stream under their `Track<N>:Warning` key, not here.
-        if let Some(w) = m.warning() {
-          out.write_warning(w)?;
-        }
-        // SP3: the embedded-Exif hop deferral. ExifTool dispatches certain
-        // atoms (`QVMI` Casio, `MVTG` FujiFilm, `uuid`-Exif) to
-        // `Image::ExifTool::Exif::ProcessExif` (QuickTime.pm:2058-2110);
-        // exifast's QuickTime-side detection ran (`embedded_exif_deferred`)
-        // but the IFD parse is DEFERRED. Surface the gap as a warning so it is
-        // visible (cf. docs/tracking.md). This is the golden-pattern home for
-        // the warning the retired SP3 `serialize_tags` emitted last.
-        if m.embedded_exif_deferred() {
-          out.write_warning(
-            "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
-          )?;
-        }
-        Ok(())
-      }
+      AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // MXF's 2 bundled `$et->Warn` sites are DROPPED here pending the same
+      // architecture decision as Matroska (Golden-v2 Phase B.1 STOP-AND-REPORT):
+      // `Bad array or batch size` (MXF.pm:2528) fires while `$$et{SET_GROUP1} =
+      // 'MXF'` is active (set MXF.pm:2838, cleared :2966), so the oracle
+      // surfaces it as a GROUP-1-SCOPED `MXF:Warning` TAG — NOT the
+      // `ExifTool:Warning` the `Diagnose` channel feeds; a faithful port needs
+      // the QuickTime-style group-scoped `Warning` TAG path. `Seek error`
+      // (MXF.pm:2822) is unreachable in this in-memory port (no fallible
+      // `RAF->Seek`). Left as the retired arm's `Ok(())` so MXF conformance is
+      // byte-identical. (Both warnings are also absent on every real/crafted
+      // MXF in the current corpus — oracle-confirmed — so this drives no
+      // golden either way.)
       #[cfg(feature = "mxf")]
-      AnyMeta::Mxf(_) => Ok(()),
+      AnyMeta::Mxf(_) => std::vec::Vec::new(),
       #[cfg(feature = "plist")]
-      AnyMeta::Plist(m) => {
-        // PLIST.pm:234 — the AAE `adjustmentData` raw-DEFLATE inflate failure
-        // `$et->Warn(...)`. The bundled `Warn` API does NOT honor the
-        // `SET_GROUP1 = 'PLIST'` scope, so it surfaces as the family-0
-        // `ExifTool:Warning` via `TagMap::first_warning` (the retired inherent
-        // `serialize_tags` drained it via `write_warning`, same here). The
-        // recognized-PLIST binary `PLIST:Error` is a family-1 TAG, NOT a
-        // diagnostic — it is emitted by `tags()` (via `collect_emitted`), so it
-        // is NOT drained here.
-        if let Some(msg) = m.warning() {
-          out.write_warning(msg)?;
-        }
-        Ok(())
-      }
+      AnyMeta::Plist(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => {
-        // EXIF's `$et->Warn(...)` (IFD-bounds checks, `Malformed APP1 EXIF
-        // segment`, …) → `ExifTool:Warning`. `File:ExifByteOrder` is a real
-        // tag now emitted by `tags()` (via `collect_emitted`), NOT a
-        // diagnostic — so only the warnings are drained here, matching the
-        // warning loop the inherent `ExifMeta::serialize_tags` runs after its
-        // `run_emission`.
-        for w in m.warnings() {
-          out.write_warning(w)?;
-        }
-        Ok(())
-      }
-      // RIFF: two ported `$et->Warn` paths, in occurrence order.
-      //  1. `Unsupported character set (<N>)` — fired mid-walk by `Decode`
-      //     (ExifTool.pm:6359-6363) the first time a CSET-declared NUMERIC
-      //     charset decodes a non-empty INFO string (RIFF.pm:1829). The port
-      //     records the code page once in `RiffMeta::unsupported_charset`.
-      //  2. The terminal corruption notice: a declared-length chunk that runs
-      //     past EOF (truncated) is skipped WITHOUT dispatching its emitter
-      //     (`RiffMeta::is_corrupted`); bundled sets `$err` and warns once at
-      //     the end (RIFF.pm:2216 `$err and $et->Warn('Error reading RIFF file
-      //     (corrupted?)')`).
-      // The charset warning precedes the corruption notice (mid-walk before
-      // end-of-walk); the default `-j` output surfaces only the FIRST recorded
-      // warning (TagMap::first_warning). The other ProcessChunks warning paths
-      // (`Bad ... data`) abort the sub-walk silently (no tags), matching
-      // bundled's `return 0` with no surfaced warning.
+      AnyMeta::Exif(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "riff")]
-      AnyMeta::Riff(m) => {
-        if let Some(code_page) = m.unsupported_charset() {
-          out.write_warning(&std::format!("Unsupported character set ({code_page})"))?;
-        }
-        if m.is_corrupted() {
-          out.write_warning("Error reading RIFF file (corrupted?)")?;
-        }
-        Ok(())
-      }
+      AnyMeta::Riff(m) => crate::diagnostics::Diagnose::diagnostics(m),
       // No-format build: the only variant is the uninhabitable phantom
-      // (Codex CF3). `PhantomData` carries no data; the arm exists purely
-      // for exhaustiveness and drains nothing.
+      // (Codex CF3). `PhantomData` carries no data; the arm exists purely for
+      // exhaustiveness and yields nothing.
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -1172,6 +840,7 @@ impl AnyMeta<'_> {
         feature = "h264",
         feature = "flash",
         feature = "ogg",
+        feature = "png",
         feature = "real",
         feature = "mpeg-audio",
         feature = "mpc",
@@ -1183,10 +852,7 @@ impl AnyMeta<'_> {
         feature = "exif",
         feature = "riff",
       )))]
-      AnyMeta::_Phantom(_) => {
-        let _ = out;
-        Ok(())
-      }
+      AnyMeta::_Phantom(_) => std::vec::Vec::new(),
     }
   }
 }

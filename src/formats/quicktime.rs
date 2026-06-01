@@ -2116,6 +2116,29 @@ fn is_known_top_level(t: &[u8; 4]) -> bool {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// QuickTime's diagnostics in the retired drain order: (a) the FIRST
+  /// `ProcessMOV` warning (`Truncated '...' data` / `Invalid atom size`,
+  /// QuickTime.pm:10242/10590) — the per-track truncation warnings ride the
+  /// TAG stream under `Track<N>:Warning`, not here (R6/F2); (b) the SP3
+  /// embedded-Exif-hop deferral notice when an Exif/TIFF block was detected
+  /// (`embedded_exif_deferred`, awaiting the Exif+GPS port). Byte-identical
+  /// net `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    if let Some(w) = self.warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    if self.embedded_exif_deferred() {
+      out.push(crate::diagnostics::Diagnostic::warn(
+        "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
+      ));
+    }
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield `QuickTime:*` / `Track<N>:*` tags in ExifTool's atom-walk order
   /// (mvhd fields, then per-track fields) — the golden-pattern parallel to the
@@ -2714,9 +2737,9 @@ impl crate::emit::Taggable for Meta<'_> {
     }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
-    // `Taggable` stream (`run_emission` has no warning channel). It is drained
-    // by the `AnyMeta::QuickTime` arm of `drain_diagnostics`
-    // (`format_parser.rs`) alongside the `ProcessMOV` warning.
+    // `Taggable` stream (`run_emission` has no warning channel). It flows
+    // through the sibling `Diagnose` channel ([`Meta::diagnostics`]) alongside
+    // the `ProcessMOV` warning.
     tags.into_iter()
   }
 }

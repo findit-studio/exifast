@@ -1598,6 +1598,19 @@ fn push_red(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, name: &str, value
 }
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// Red's `$et->Warn` accumulators as [`Diagnostic`](crate::diagnostics::Diagnostic)
+  /// warnings, in emission order. (`warnings()` is `&[&'static str]`.)
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self
+      .warnings()
+      .iter()
+      .map(|w| crate::diagnostics::Diagnostic::warn(*w))
+      .collect()
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield R3D tags in faithful Red.pm emission order:
   ///

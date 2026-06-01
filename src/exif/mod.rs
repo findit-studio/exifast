@@ -2883,7 +2883,8 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
 // (`File:ExifByteOrder` first, then the IFD-walk entries, then the MakerNote
 // vendor emissions) flows through the generic `Taggable`/`run_emission` engine,
 // single-sourced by `AnyMeta::serialize_tags` / `AnyMeta::iter_tags`. The
-// `$et->Warn(...)` channel is drained by `AnyMeta::drain_diagnostics`.
+// `$et->Warn(...)` channel flows through the sibling `Diagnose`/`run_diagnostics`
+// engine (`ExifMeta::diagnostics`).
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
@@ -2903,7 +2904,7 @@ impl ExifMeta<'_> {
   /// entries only**: the `File:ExifByteOrder`/`File:PageCount` prefix + the
   /// MakerNote vendor emissions are pushed by [`tags`](crate::emit::Taggable::tags)
   /// into the SAME `out`; the `ExifTool:Warning` messages stay a separate channel
-  /// drained by `AnyMeta::drain_diagnostics`.
+  /// yielded by [`ExifMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics).
   fn push_exif_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
     out.reserve(self.entries.len());
     let mut sink = EmittedTagSink::new(out);
@@ -3034,6 +3035,24 @@ impl crate::emit::Taggable for ExifMeta<'_> {
     self.push_exif_tags(print_conv, &mut tags);
     self.push_maker_note_tags(print_conv, &mut tags);
     tags.into_iter()
+  }
+}
+
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for ExifMeta<'_> {
+  /// The EXIF `$et->Warn(...)` corpus (IFD-bounds checks, `Malformed APP1 EXIF
+  /// segment`, suspicious-offset, …) as [`Diagnostic`](crate::diagnostics::Diagnostic)
+  /// warnings, in emission order. `File:ExifByteOrder` is a real TAG emitted by
+  /// [`tags`](crate::emit::Taggable::tags) (not a diagnostic), so only the
+  /// warnings appear here — the same loop the retired `AnyMeta::drain_diagnostics`
+  /// EXIF arm ran. EXIF raises no `$et->Error` (a rejected block returns
+  /// `Ok(None)` ⇒ the engine emits its own `ExifTool:Error`).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self
+      .warnings()
+      .iter()
+      .map(crate::diagnostics::Diagnostic::warn)
+      .collect()
   }
 }
 
