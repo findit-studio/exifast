@@ -1648,9 +1648,14 @@ fn decode_one_sample(
       // gated on this path having produced nothing), so `FoundGPSByScan` is
       // never set here; the natural table-then-scan ordering provides the
       // same mutual exclusion.
+      // QuickTimeStream.pl:1559-1564 — the `gps `-sample-table dispatch sets
+      // `$$dirInfo{SampleTime} => $time[$i]`, the enclosing sample's decoding
+      // time. Threaded so a date-less GPSType (Type-19) can synthesize its
+      // `GPSDateTime` via `SetGPSDateTime` (QuickTimeStream.pl:2396).
       quicktime_freegps::process_free_gps(
         buff,
         create_date_raw,
+        sample.time,
         kodak_version,
         free_gps_state,
         out,
@@ -2601,6 +2606,134 @@ mod tests {
     let s = &meta.gps_samples()[0];
     assert!(s.has_coordinates());
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
+  }
+
+  /// Codex R2 — a Type-19 (70mai A810) freeGPS block referenced from a
+  /// `gps `-sample-table track carries NO embedded date, so its `GPSDateTime`
+  /// is synthesized from the enclosing sample's decoding time + the movie
+  /// `CreateDate` via `SetGPSDateTime` (QuickTimeStream.pl:1559-1564 →
+  /// :2396 → :980-1008). Two samples at `stts` delta 2000 / `MediaTS` 1000 ⇒
+  /// SampleTimes 0.0s and 2.0s; with `CreateDate` = 2024:02:22 14:34:40Z the
+  /// two fixes get 14:34:40Z and 14:34:42Z.
+  ///
+  /// NOTE: this exercises the port's `gps `-HandlerType sample-table extension
+  /// (FINDING 2). Bundled ExifTool does NOT process a `gps `-handler track
+  /// (`gps ` is absent from `%eeBox`, QuickTime.pm:523-533) so it never reaches
+  /// `SetGPSDateTime` for this layout — hence there is no `-ee` golden. The
+  /// SampleTime threading is the faithful 1:1 of the Perl that WOULD run on
+  /// that branch; the synthesized value itself is asserted byte-exact against
+  /// [`synth_gps_date_time`] (separately oracle-checked in its own unit test).
+  #[test]
+  fn gps_handler_type19_synthesizes_gps_date_time_from_sample_time() {
+    // A Type-19 (70mai) freeGPS block: 'A' at offset 30, 'VV' at offset 51,
+    // lat/lon int32s/1e5 at offsets 31/35, speed at 43.
+    let mut blk = alloc::vec![0u8; 0x80];
+    blk[0..4].copy_from_slice(&0x80u32.to_be_bytes());
+    blk[4..12].copy_from_slice(b"freeGPS ");
+    blk[30] = b'A';
+    blk[51] = b'V';
+    blk[52] = b'V';
+    blk[31..35].copy_from_slice(&511_607_100i32.to_le_bytes()); // lat 5116.071
+    blk[35..39].copy_from_slice(&83_080_900i32.to_le_bytes()); // lon 830.809
+    blk[43..47].copy_from_slice(&42i32.to_le_bytes());
+
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    // Layout = ftyp || blk || blk || moov; two chunks at these absolute offsets.
+    let off1 = ftyp.len() as u32;
+    let off2 = off1 + blk.len() as u32;
+
+    let mut hdlr_body = alloc::vec![0u8; 24];
+    hdlr_body[8..12].copy_from_slice(b"gps ");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+
+    // mdhd v0: MediaTimeScale 1000 at body byte 12.
+    let mut mdhd_body = alloc::vec![0u8; 24];
+    mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+
+    let mut stsd_body = alloc::vec![0u8; 8];
+    stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    let mut entry = alloc::vec![0u8; 16];
+    entry[0..4].copy_from_slice(&16u32.to_be_bytes());
+    entry[4..8].copy_from_slice(b"gps ");
+    stsd_body.extend_from_slice(&entry);
+    let stsd = atom(b"stsd", &stsd_body);
+
+    // stco: two chunks (one sample each).
+    let mut stco_body = alloc::vec![0u8; 8];
+    stco_body[4..8].copy_from_slice(&2u32.to_be_bytes());
+    stco_body.extend_from_slice(&off1.to_be_bytes());
+    stco_body.extend_from_slice(&off2.to_be_bytes());
+    let stco = atom(b"stco", &stco_body);
+
+    // stsc: one entry — first-chunk=1, samples-per-chunk=1, desc=1.
+    let mut stsc_body = alloc::vec![0u8; 8];
+    stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = atom(b"stsc", &stsc_body);
+
+    // stsz: sample-size=0, count=2, the two block sizes.
+    let mut stsz_body = alloc::vec![0u8; 8];
+    stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&2u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
+    stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
+    let stsz = atom(b"stsz", &stsz_body);
+
+    // stts: one entry (count=2, delta=2000) ⇒ 2.0s per sample. The decoder
+    // needs >1 stts value to assign times (QuickTimeStream.pl:1346).
+    let mut stts_body = alloc::vec![0u8; 8];
+    stts_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    stts_body.extend_from_slice(&2u32.to_be_bytes());
+    stts_body.extend_from_slice(&2000u32.to_be_bytes());
+    let stts = atom(b"stts", &stts_body);
+
+    let mut stbl_body = stsd;
+    stbl_body.extend_from_slice(&stco);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    stbl_body.extend_from_slice(&stts);
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    let mvhd = atom(b"mvhd", &alloc::vec![0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&blk);
+    data.extend_from_slice(&blk);
+    data.extend_from_slice(&moov);
+
+    // CreateDate raw 1904-epoch 3_791_457_280 = 2024:02:22 14:34:40Z.
+    let meta = extract_stream(&data, Some(3_791_457_280), None);
+    assert_eq!(meta.gps_samples().len(), 2, "two Type-19 samples decode");
+    // Sample 0 ⇒ SampleTime 0.0s ⇒ GPSDateTime = CreateDate.
+    assert_eq!(
+      meta.gps_samples()[0].date_time(),
+      Some("2024:02:22 14:34:40Z"),
+      "sample 0: CreateDate + 0s"
+    );
+    // Sample 1 ⇒ SampleTime 2.0s ⇒ GPSDateTime = CreateDate + 2s.
+    assert_eq!(
+      meta.gps_samples()[1].date_time(),
+      Some("2024:02:22 14:34:42Z"),
+      "sample 1: CreateDate + 2s (SampleTime threaded)"
+    );
+    assert!(meta.gps_samples()[0].has_coordinates());
+
+    // Without a CreateDate, no GPSDateTime is synthesized (matching the
+    // brute-force mdat-scan path that a real 70mai file actually takes).
+    let meta2 = extract_stream(&data, None, None);
+    assert_eq!(meta2.gps_samples()[0].date_time(), None);
+    assert_eq!(meta2.gps_samples()[1].date_time(), None);
   }
 
   #[test]

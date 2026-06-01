@@ -108,7 +108,7 @@ use alloc::{
 use smol_str::SmolStr;
 
 use crate::{
-  formats::quicktime_stream::{convert_lat_lon, join3},
+  formats::quicktime_stream::{convert_lat_lon, join3, synth_gps_date_time},
   metadata::{GpsSample, QuickTimeStreamMeta},
 };
 
@@ -257,8 +257,11 @@ pub fn scan_media_data(
             return;
           }
           let block = &mdat[block_abs..block_abs + len];
-          // QuickTimeStream.pl:3777-3778: pass DataPt=&block, DirLen=len.
-          process_free_gps(block, create_date_raw, kodak_version, &mut state, out);
+          // QuickTimeStream.pl:3777 `$dirInfo = { DataPt, DataPos, DirLen }` —
+          // the brute-force scan's `$dirInfo` carries NO `SampleTime`, so
+          // `sample_time` is `None` here (a Type-19 block found by the scan
+          // gets no synthesized GPSDateTime, matching the oracle).
+          process_free_gps(block, create_date_raw, None, kodak_version, &mut state, out);
           found = true;
           if block_abs + len > chunk_end {
             // The block ran past the current chunk. ExifTool's `$pos += $len;
@@ -446,11 +449,27 @@ impl Default for FreeGpsState {
 /// `state` carries the cross-block ATC ring-buffer bookkeeping (the only
 /// stateful GPSType); see [`FreeGpsState`].
 ///
+/// `create_date_raw` / `sample_time` are ExifTool's `$$value{CreateDate}` (raw
+/// 1904-epoch seconds) and `$$dirInfo{SampleTime}` (the enclosing sample's
+/// decoding time, seconds) — the two inputs `SetGPSDateTime` needs to
+/// synthesize a `GPSDateTime` (QuickTimeStream.pl:980-1008). Only the GPSTypes
+/// whose blocks carry NO embedded date use them (currently only Type-19, the
+/// 70mai A810 — QuickTimeStream.pl:2396 `SetGPSDateTime($et, $tagTbl,
+/// $$dirInfo{SampleTime})`); every other variant parses its own date from the
+/// block and ignores both. `sample_time` is `Some` only on the
+/// `gps `-sample-table dispatch path (where ExifTool sets `$$dirInfo{SampleTime}
+/// => $time[$i]`, QuickTimeStream.pl:1562) and `None` on the brute-force
+/// `ScanMediaData` path (whose `$dirInfo` carries no `SampleTime`,
+/// QuickTimeStream.pl:3777) — so a real 70mai file (whose freeGPS blocks come
+/// from the mdat scan, "no timestamps in the samples", QuickTimeStream.pl:2389)
+/// gets `None` and emits no GPSDateTime, byte-for-byte matching the oracle.
+///
 /// QuickTimeStream.pl:1645 `return 0 if $dirLen < 82` — a block too short to
 /// carry any fingerprint is silently dropped.
 pub fn process_free_gps(
   data: &[u8],
-  _create_date_raw: Option<u64>,
+  create_date_raw: Option<u64>,
+  sample_time: Option<f64>,
   kodak_version: Option<&str>,
   state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
@@ -616,7 +635,7 @@ pub fn process_free_gps(
   // GPSType 19: 70mai A810 (QuickTimeStream.pl:2386-2401).
   // `A` at offset 30 and `VV` at offset 51.
   if data.len() >= 64 && data.get(30).copied() == Some(b'A') && data.get(51..53) == Some(b"VV") {
-    decode_type19_70mai(data, out);
+    decode_type19_70mai(data, create_date_raw, sample_time, out);
     return;
   }
 
@@ -654,6 +673,14 @@ struct FreeGpsTags {
   user_label: Option<String>,
   /// `true` ⇒ lat/lon are already in decimal degrees (skip ConvertLatLon).
   ddd: bool,
+  /// A `SetGPSDateTime`-synthesized `GPSDateTime` (CreateDate + SampleTime,
+  /// QuickTimeStream.pl:980-1008) for the date-less GPSTypes that call
+  /// `SetGPSDateTime` instead of parsing a date from the block (Type-19). It is
+  /// only consulted when the block carried NO embedded date (`yr`/`hr` unset),
+  /// faithfully matching ExifTool: `SetGPSDateTime` runs BEFORE the common tail
+  /// (QuickTimeStream.pl:2396) and the tail emits no `GPSDateTime` when `$yr`
+  /// is undef, so the synthesized value is the only `GPSDateTime` for Type-19.
+  synth_date_time: Option<SmolStr>,
 }
 
 impl FreeGpsTags {
@@ -675,6 +702,7 @@ impl FreeGpsTags {
       accel: None,
       user_label: None,
       ddd: false,
+      synth_date_time: None,
     }
   }
   /// Common-tail emission — QuickTimeStream.pl:2455-2483. Validates month +
@@ -718,7 +746,14 @@ impl FreeGpsTags {
     } else {
       None
     };
-    sample.set_date_time(date_time.map(SmolStr::from));
+    // QuickTimeStream.pl:2396 — when the block carried no embedded date, a
+    // `SetGPSDateTime`-synthesized `GPSDateTime` (Type-19) is the value. The
+    // parsed date (if any) always wins, mirroring ExifTool's last-`HandleTag`
+    // semantics (no GPSType both parses a date AND synthesizes one).
+    let date_time = date_time
+      .map(SmolStr::from)
+      .or_else(|| self.synth_date_time.clone());
+    sample.set_date_time(date_time);
 
     // Lat/lon emission (QuickTimeStream.pl:2469-2474). ConvertLatLon UNLESS
     // ddd is set — many GPSType variants pre-format lat/lon in decimal degrees.
@@ -2095,13 +2130,29 @@ fn decode_type18_xgody(data: &[u8], out: &mut QuickTimeStreamMeta) {
 
 // ──────────────────────── GPSType 19: 70mai A810 ───────────────────────────
 
-/// `decode_type19_70mai` (QuickTimeStream.pl:2386-2401). No timestamps in the
-/// sample data; lat/lon as int32s/1e5 at offsets 31/35.
-fn decode_type19_70mai(data: &[u8], out: &mut QuickTimeStreamMeta) {
+/// `decode_type19_70mai` (QuickTimeStream.pl:2386-2401). The block carries NO
+/// embedded date ("no timestamps in the samples I have", QuickTimeStream.pl:
+/// 2389); lat/lon as int32s/1e5 at offsets 31/35.
+///
+/// QuickTimeStream.pl:2396 calls `SetGPSDateTime($et, $tagTbl,
+/// $$dirInfo{SampleTime})` BEFORE reading lat/lon — synthesizing `GPSDateTime`
+/// from the enclosing sample's decoding time (`sample_time`) plus the movie
+/// `CreateDate` (`create_date_raw`) when BOTH exist (else no `GPSDateTime`).
+/// `sample_time` is `Some` only on the `gps `-sample-table path; the
+/// brute-force mdat scan passes `None`, so a real 70mai file (mdat-embedded,
+/// per the bundled note) emits no `GPSDateTime`, matching ExifTool exactly.
+fn decode_type19_70mai(
+  data: &[u8],
+  create_date_raw: Option<u64>,
+  sample_time: Option<f64>,
+  out: &mut QuickTimeStreamMeta,
+) {
   if data.len() < 47 {
     return;
   }
   let mut t = FreeGpsTags::new();
+  // QuickTimeStream.pl:2396 `SetGPSDateTime($et, $tagTbl, $$dirInfo{SampleTime})`.
+  t.synth_date_time = synth_gps_date_time(create_date_raw, sample_time).map(SmolStr::from);
   // QuickTimeStream.pl:2386-2401 does NOT set `$ddd`, so the common tail
   // applies ConvertLatLon: the int32s/1e5 values are DDDMM.MMMM, not decimal
   // degrees (e.g. 5116.071 → 51°16.071′ → 51.2679°).
@@ -2175,17 +2226,38 @@ mod tests {
   use super::*;
 
   /// Decode one freeGPS block with fresh cross-block state — the single-block
-  /// test shape (`ProcessFreeGPS` with a clean `$$et{FreeGPS2}`).
+  /// test shape (`ProcessFreeGPS` with a clean `$$et{FreeGPS2}`). No CreateDate
+  /// / SampleTime (the brute-force-scan shape).
   fn decode_block(block: &[u8], out: &mut QuickTimeStreamMeta) {
     let mut state = FreeGpsState::new();
-    process_free_gps(block, None, None, &mut state, out);
+    process_free_gps(block, None, None, None, &mut state, out);
+  }
+
+  /// Decode one freeGPS block with a `CreateDate` + `SampleTime` in effect —
+  /// the `gps `-sample-table shape that feeds `SetGPSDateTime`
+  /// (QuickTimeStream.pl:1562, 2396).
+  fn decode_block_with_time(
+    block: &[u8],
+    create_date_raw: u64,
+    sample_time: f64,
+    out: &mut QuickTimeStreamMeta,
+  ) {
+    let mut state = FreeGpsState::new();
+    process_free_gps(
+      block,
+      Some(create_date_raw),
+      Some(sample_time),
+      None,
+      &mut state,
+      out,
+    );
   }
 
   /// Decode one freeGPS block with a `KodakVersion` global in effect — the
   /// Rexing Type-17b test shape.
   fn decode_block_kodak(block: &[u8], kodak_version: &str, out: &mut QuickTimeStreamMeta) {
     let mut state = FreeGpsState::new();
-    process_free_gps(block, None, Some(kodak_version), &mut state, out);
+    process_free_gps(block, None, None, Some(kodak_version), &mut state, out);
   }
 
   /// Build a freeGPS block from a `inner` mut buffer that is treated as the
@@ -2612,6 +2684,46 @@ mod tests {
     assert_eq!(out.gps_samples().len(), 1);
     let lat = out.gps_samples()[0].latitude().expect("lat");
     assert!((lat - 51.267_85).abs() < 1e-3, "lat={lat}");
+    // The brute-force-scan shape (no SampleTime) emits NO GPSDateTime
+    // (QuickTimeStream.pl:2396 `SetGPSDateTime($et, $tagTbl, undef)` is a
+    // no-op), matching a real mdat-embedded 70mai file.
+    assert_eq!(out.gps_samples()[0].date_time(), None);
+  }
+
+  /// GPSType 19 (70mai) on the `gps `-sample-table path threads the sample's
+  /// decoding time through `SetGPSDateTime` (QuickTimeStream.pl:2396): with a
+  /// CreateDate + SampleTime BOTH present, `GPSDateTime` = CreateDate +
+  /// SampleTime (QuickTimeStream.pl:984-1006). With no CreateDate it stays
+  /// empty (the `if defined $sampleTime and $$value{CreateDate}` guard).
+  #[test]
+  fn decode_type19_70mai_synthesizes_gps_date_time_from_sample_time() {
+    let mut block = make_block(0x100).0;
+    block[30] = b'A';
+    block[51] = b'V';
+    block[52] = b'V';
+    block[31..35].copy_from_slice(&511_607_100i32.to_le_bytes());
+    block[35..39].copy_from_slice(&83_080_900i32.to_le_bytes());
+    block[43..47].copy_from_slice(&42i32.to_le_bytes());
+
+    // CreateDate raw 1904-epoch = 3_791_457_280 (= unix 1_708_612_480 =
+    // 2024:02:22 14:34:40Z); SampleTime 2.0s ⇒ GPSDateTime 14:34:42Z.
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block_with_time(&block, 3_791_457_280, 2.0, &mut out);
+    assert_eq!(out.gps_samples().len(), 1);
+    assert_eq!(
+      out.gps_samples()[0].date_time(),
+      Some("2024:02:22 14:34:42Z"),
+      "GPSDateTime = CreateDate + SampleTime"
+    );
+    // lat/lon still decode (ConvertLatLon applied).
+    let lat = out.gps_samples()[0].latitude().expect("lat");
+    assert!((lat - 51.267_85).abs() < 1e-3, "lat={lat}");
+
+    // No CreateDate ⇒ no GPSDateTime even with a SampleTime.
+    let mut out2 = QuickTimeStreamMeta::new();
+    let mut state = FreeGpsState::new();
+    process_free_gps(&block, None, Some(2.0), None, &mut state, &mut out2);
+    assert_eq!(out2.gps_samples()[0].date_time(), None);
   }
 
   /// GPSType 14 (XBHT) records are 36 bytes wide, so two consecutive records
@@ -2804,9 +2916,9 @@ mod tests {
 
     let mut state = FreeGpsState::new();
     let mut out = QuickTimeStreamMeta::new();
-    process_free_gps(&block1, None, None, &mut state, &mut out);
+    process_free_gps(&block1, None, None, None, &mut state, &mut out);
     assert_eq!(out.gps_samples().len(), 2, "block 1 emits both new records");
-    process_free_gps(&block2, None, None, &mut state, &mut out);
+    process_free_gps(&block2, None, None, None, &mut state, &mut out);
     assert_eq!(
       out.gps_samples().len(),
       3,
