@@ -23,3 +23,8 @@ rust_out
 
 # Internal planning docs (specs/plans) — kept local, not published
 /docs/
+
+# cargo-fuzz (Golden-v2 3b) — build artifacts, generated corpus, crash inputs
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
