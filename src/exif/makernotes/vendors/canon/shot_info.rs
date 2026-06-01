@@ -60,11 +60,15 @@
 //!   `$$self{Model} =~ /\b(20D|350D|REBEL XT|Kiss Digital N)\b/` and uses
 //!   `ValueConv => 'exp(-CanonEv*log2)*1000/32'`; the default branch uses
 //!   `'exp(-CanonEv*log2)'` (identical to TargetExposureTime). Both share
-//!   `PrintConv => PrintExposureTime` and `RawConv => '($val or FILE_TYPE eq
-//!   "CRW") ? $val : undef'`. **`$$self{FILE_TYPE}` is not threaded into the
-//!   Canon parser**, so the CRW-allows-0 clause is approximated as
-//!   "0 ⇒ undef" — faithful for every non-CRW container (JPG/CR2/TIFF/MOV);
-//!   a raw-0 ExposureTime in a `.crw` would be suppressed here (flagged).
+//!   `PrintConv => PrintExposureTime` and `RawConv => '($val or
+//!   $$self{FILE_TYPE} eq "CRW") ? $val : undef'`. The container
+//!   `$$self{FILE_TYPE}` IS threaded through ([`parse`]'s `file_type`), so the
+//!   CRW-allows-0 clause is a faithful transcription: a raw-0 ExposureTime is
+//!   kept only when `file_type == Some("CRW")` (`"0 is valid in a CRW image
+//!   (=1s, D60 sample)"`) and dropped for every non-CRW container
+//!   (JPG/CR2/TIFF/MOV). Because the port has no CIFF/CRW parser, every
+//!   reachable container is non-CRW today, so the emitted output is unchanged;
+//!   only the gate is now spelled faithfully.
 //!
 //! ## ValueConv that needs `CanonEv` / the aperture conv
 //!
@@ -644,12 +648,19 @@ fn matches_word(haystack: &str, token: &str) -> bool {
 /// `model` is the resolved Canon model NAME (from `%canonModelID`) — the
 /// bundled Conditions key on `$$self{Model}`, and the resolved name is
 /// the faithful stand-in (e.g. `"EOS 20D"`).
+///
+/// `file_type` is the container's detected `$$self{FILE_TYPE}` (`Some("CRW")`
+/// for a CIFF/CRW raw, `Some("JPEG")`/`Some("CR2")`/… otherwise, `None` when
+/// unknown). It is read ONLY by position 22's RawConv (`Canon.pm:2977`/`:2990`):
+/// a raw-0 ExposureTime is kept when the container is a CRW (`"0 is valid in a
+/// CRW image (=1s, D60 sample)"`).
 #[must_use]
 pub fn parse(
   data: &[u8],
   order: ByteOrder,
   print_conv: bool,
   model: Option<&str>,
+  file_type: Option<&str>,
 ) -> (CanonShotInfo, Vec<(SmolStr, TagValue)>) {
   let mut typed = CanonShotInfo::new();
   let mut out: Vec<(SmolStr, TagValue)> = Vec::new();
@@ -988,13 +999,16 @@ pub fn parse(
   }
 
   // Position 22 — ExposureTime (model-conditional list, `Canon.pm:2967-
-  // 2997`). RawConv `($val or FILE_TYPE eq "CRW") ? $val : undef`: 0 ⇒ undef
-  // for every non-CRW container (FILE_TYPE is not threaded here — see the
-  // module-doc faithfulness note). FIRST branch (20D/350D/REBEL XT/Kiss
-  // Digital N) ValueConv `exp(-CanonEv($val)*log(2))*1000/32`; default branch
-  // `exp(-CanonEv($val)*log(2))`. Both PrintConv `PrintExposureTime`.
+  // 2997`). RawConv `($val or $$self{FILE_TYPE} eq "CRW") ? $val : undef`:
+  // emit unless `$val == 0` AND the container is not a CRW (`"0 is valid in a
+  // CRW image (=1s, D60 sample)"`, `Canon.pm:2974-2976`). Both the FIRST
+  // branch (20D/350D/REBEL XT/Kiss Digital N, ValueConv
+  // `exp(-CanonEv($val)*log(2))*1000/32`) and the default branch
+  // (`exp(-CanonEv($val)*log(2))`) carry the SAME RawConv, so the single
+  // `raw != 0 || file_type == Some("CRW")` gate covers both. Both PrintConv
+  // `PrintExposureTime`.
   if let Some(raw) = read_i16(data, 22, order)
-    && raw != 0
+    && (raw != 0 || file_type == Some("CRW"))
   {
     let v = if is_20d_350d_family(model) {
       exposure_time_from_apex(raw) * 1000.0 / 32.0
@@ -1143,7 +1157,7 @@ mod tests {
     ];
     let data = blob(&words);
     let model = Some("EOS Digital Rebel / 300D / Kiss Digital");
-    let (typed, em) = parse(&data, ByteOrder::Little, true, model);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, model, None);
 
     // --- Newly-ported positions (oracled vs ExifTool 13.59 Perl) ---
     // pos1 AutoISO raw=0 → exp(0)*100 = 100 → "100".
@@ -1257,7 +1271,7 @@ mod tests {
       let mut words = [0i16; 18];
       words[17] = raw;
       let data = blob(&words);
-      let (_t, em) = parse(&data, ByteOrder::Little, true, None);
+      let (_t, em) = parse(&data, ByteOrder::Little, true, None, None);
       assert_eq!(
         find(&em, "AEBBracketValue"),
         Some(TagValue::Str(want.into())),
@@ -1273,7 +1287,7 @@ mod tests {
     words[19] = -1; // bytes 0xffff → as int16u = 65535.
     words[20] = 546;
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "FocusDistanceUpper"),
       Some(TagValue::Str("inf".into()))
@@ -1293,7 +1307,7 @@ mod tests {
     words[19] = 0; // upper = 0 → RawConv undef.
     words[20] = 546;
     let data = blob(&words);
-    let (_typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (_typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(find(&em, "FocusDistanceUpper"), None);
     assert_eq!(find(&em, "FocusDistanceLower"), None);
   }
@@ -1307,7 +1321,7 @@ mod tests {
     let data = blob(&words);
 
     // EOS 5D → emitted.
-    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"));
+    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&em, "CameraTemperature"),
       Some(TagValue::Str("22 C".into()))
@@ -1315,12 +1329,18 @@ mod tests {
     assert_eq!(typed.camera_temperature_c(), Some(22));
 
     // EOS-1D → excluded by `!~ /EOS-1DS?$/`.
-    let (typed2, em2) = parse(&data, ByteOrder::Little, true, Some("EOS-1D"));
+    let (typed2, em2) = parse(&data, ByteOrder::Little, true, Some("EOS-1D"), None);
     assert_eq!(find(&em2, "CameraTemperature"), None);
     assert_eq!(typed2.camera_temperature_c(), None);
 
     // Non-EOS (PowerShot) → excluded.
-    let (_t3, em3) = parse(&data, ByteOrder::Little, true, Some("PowerShot A570 IS"));
+    let (_t3, em3) = parse(
+      &data,
+      ByteOrder::Little,
+      true,
+      Some("PowerShot A570 IS"),
+      None,
+    );
     assert_eq!(find(&em3, "CameraTemperature"), None);
   }
 
@@ -1332,16 +1352,22 @@ mod tests {
     words[33] = 0;
     let data = blob(&words);
     // PowerShot → 0 kept.
-    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("PowerShot A570 IS"));
+    let (typed, em) = parse(
+      &data,
+      ByteOrder::Little,
+      true,
+      Some("PowerShot A570 IS"),
+      None,
+    );
     assert_eq!(find(&em, "FlashOutput"), Some(TagValue::I64(0)));
     assert_eq!(typed.flash_output(), Some(0));
     // EOS with 0 → dropped.
-    let (_t2, em2) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"));
+    let (_t2, em2) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(find(&em2, "FlashOutput"), None);
     // EOS with nonzero → kept.
     words[33] = 200;
     let data2 = blob(&words);
-    let (_t3, em3) = parse(&data2, ByteOrder::Little, true, Some("EOS 5D"));
+    let (_t3, em3) = parse(&data2, ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(find(&em3, "FlashOutput"), Some(TagValue::I64(200)));
   }
 
@@ -1352,14 +1378,14 @@ mod tests {
     words[7] = 1; // WhiteBalance = Daylight.
     words[28] = 1; // NDFilter = On.
     let data = blob(&words);
-    let (_typed, em) = parse(&data, ByteOrder::Little, false, None);
+    let (_typed, em) = parse(&data, ByteOrder::Little, false, None, None);
     assert_eq!(find(&em, "WhiteBalance"), Some(TagValue::I64(1)));
     assert_eq!(find(&em, "NDFilter"), Some(TagValue::I64(1)));
   }
 
   #[test]
   fn short_blob_yields_empty() {
-    let (typed, em) = parse(&[0, 0], ByteOrder::Little, true, None);
+    let (typed, em) = parse(&[0, 0], ByteOrder::Little, true, None, None);
     assert!(typed.is_empty());
     assert!(em.is_empty());
   }
@@ -1374,7 +1400,7 @@ mod tests {
     words[1] = 96; // AutoISO
     words[2] = 200; // BaseISO
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     // -j: Perl `%.0f` rounds the (799.999…) float to "800".
     assert_eq!(find(&em, "AutoISO"), Some(TagValue::Str("800".into())));
     assert_eq!(find(&em, "BaseISO"), Some(TagValue::Str("238".into())));
@@ -1386,7 +1412,7 @@ mod tests {
     // -n: post-ValueConv numbers (whole→I64, fractional→F64).
     words[1] = 200;
     let data2 = blob(&words);
-    let (_t, em2) = parse(&data2, ByteOrder::Little, false, None);
+    let (_t, em2) = parse(&data2, ByteOrder::Little, false, None, None);
     let auto_iso_200 = (200.0_f64 / 32.0 * std::f64::consts::LN_2).exp() * 100.0;
     assert_eq!(find(&em2, "AutoISO"), Some(TagValue::F64(auto_iso_200)));
 
@@ -1395,7 +1421,7 @@ mod tests {
     z[1] = 0;
     z[2] = 0;
     let dataz = blob(&z);
-    let (_tz, emz) = parse(&dataz, ByteOrder::Little, true, None);
+    let (_tz, emz) = parse(&dataz, ByteOrder::Little, true, None, None);
     assert_eq!(find(&emz, "AutoISO"), Some(TagValue::Str("100".into())));
     assert_eq!(find(&emz, "BaseISO"), None);
   }
@@ -1407,15 +1433,15 @@ mod tests {
     let mut words = [0i16; 4];
     words[3] = 32;
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(find(&em, "MeasuredEV"), Some(TagValue::Str("6.00".into())));
     assert_eq!(typed.measured_ev(), Some(6.0));
     // raw 0 → 5.00 (not dropped).
     let z = [0i16; 4];
-    let (_t, emz) = parse(&blob(&z), ByteOrder::Little, true, None);
+    let (_t, emz) = parse(&blob(&z), ByteOrder::Little, true, None, None);
     assert_eq!(find(&emz, "MeasuredEV"), Some(TagValue::Str("5.00".into())));
     // -n: 6 (whole).
-    let (_t2, emn) = parse(&data, ByteOrder::Little, false, None);
+    let (_t2, emn) = parse(&data, ByteOrder::Little, false, None, None);
     assert_eq!(find(&emn, "MeasuredEV"), Some(TagValue::I64(6)));
   }
 
@@ -1428,7 +1454,7 @@ mod tests {
     words[4] = 160; // TargetAperture
     words[21] = 96; // FNumber
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "TargetAperture"),
       Some(TagValue::Str("5.7".into()))
@@ -1439,7 +1465,7 @@ mod tests {
     assert_eq!(typed.target_aperture(), Some(aperture_160));
 
     // -n: ValueConv float.
-    let (_t, emn) = parse(&data, ByteOrder::Little, false, None);
+    let (_t, emn) = parse(&data, ByteOrder::Little, false, None, None);
     assert_eq!(
       find(&emn, "TargetAperture"),
       Some(TagValue::F64(aperture_160))
@@ -1447,13 +1473,13 @@ mod tests {
 
     // RawConv gates: TargetAperture raw 0 dropped, FNumber raw 0 dropped.
     let z = [0i16; 22];
-    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, None);
+    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, None, None);
     assert_eq!(find(&emz, "TargetAperture"), None);
     assert_eq!(find(&emz, "FNumber"), None);
     // TargetAperture raw -32 (<=0) dropped too.
     let mut neg = [0i16; 22];
     neg[4] = -32;
-    let (_tn, emneg) = parse(&blob(&neg), ByteOrder::Little, true, None);
+    let (_tn, emneg) = parse(&blob(&neg), ByteOrder::Little, true, None, None);
     assert_eq!(find(&emneg, "TargetAperture"), None);
   }
 
@@ -1465,14 +1491,14 @@ mod tests {
     let mut words = [0i16; 6];
     words[5] = 160;
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"));
+    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&em, "TargetExposureTime"),
       Some(TagValue::Str("1/32".into()))
     );
     assert_eq!(typed.target_exposure_time(), Some(0.03125));
     // -n: 0.03125.
-    let (_t, emn) = parse(&data, ByteOrder::Little, false, Some("EOS 5D"));
+    let (_t, emn) = parse(&data, ByteOrder::Little, false, Some("EOS 5D"), None);
     assert_eq!(
       find(&emn, "TargetExposureTime"),
       Some(TagValue::F64(0.03125))
@@ -1481,17 +1507,23 @@ mod tests {
     // raw <= -1000 → dropped regardless of model.
     let mut bad = [0i16; 6];
     bad[5] = -32768i16; // -32768 < -1000.
-    let (_tb, emb) = parse(&blob(&bad), ByteOrder::Little, true, Some("EOS 5D"));
+    let (_tb, emb) = parse(&blob(&bad), ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(find(&emb, "TargetExposureTime"), None);
 
     // raw 0: kept for EOS/PowerShot (→ exp(0)=1s → "1"), dropped otherwise.
     let z = [0i16; 6];
-    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, Some("EOS 5D"));
+    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&emz, "TargetExposureTime"),
       Some(TagValue::Str("1".into()))
     );
-    let (_tu, emu) = parse(&blob(&z), ByteOrder::Little, true, Some("Some Webcam"));
+    let (_tu, emu) = parse(
+      &blob(&z),
+      ByteOrder::Little,
+      true,
+      Some("Some Webcam"),
+      None,
+    );
     assert_eq!(find(&emu, "TargetExposureTime"), None);
   }
 
@@ -1503,7 +1535,7 @@ mod tests {
     words[6] = 16; // ExposureCompensation
     words[15] = -16; // FlashExposureComp
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "ExposureCompensation"),
       Some(TagValue::Str("+1/2".into()))
@@ -1515,7 +1547,7 @@ mod tests {
     assert_eq!(typed.exposure_compensation(), Some(0.5));
     assert_eq!(typed.flash_exposure_comp(), Some(-0.5));
     // -n: bare CanonEv values.
-    let (_t, emn) = parse(&data, ByteOrder::Little, false, None);
+    let (_t, emn) = parse(&data, ByteOrder::Little, false, None, None);
     assert_eq!(find(&emn, "ExposureCompensation"), Some(TagValue::F64(0.5)));
   }
 
@@ -1525,13 +1557,13 @@ mod tests {
     for (raw, want) in [(0i16, "Off"), (1, "Night Scene"), (2, "On"), (3, "None")] {
       let mut words = [0i16; 9];
       words[8] = raw;
-      let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None);
+      let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None, None);
       assert_eq!(find(&em, "SlowShutter"), Some(TagValue::Str(want.into())));
     }
     // unknown → "Unknown (9)".
     let mut words = [0i16; 9];
     words[8] = 9;
-    let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None);
+    let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "SlowShutter"),
       Some(TagValue::Str("Unknown (9)".into()))
@@ -1543,18 +1575,18 @@ mod tests {
   fn optical_zoom_code() {
     let mut words = [0i16; 11];
     words[10] = 8;
-    let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None);
+    let (_t, em) = parse(&blob(&words), ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "OpticalZoomCode"),
       Some(TagValue::Str("n/a".into()))
     );
     // raw 3 → 3 (int even in -j).
     words[10] = 3;
-    let (_t2, em2) = parse(&blob(&words), ByteOrder::Little, true, None);
+    let (_t2, em2) = parse(&blob(&words), ByteOrder::Little, true, None, None);
     assert_eq!(find(&em2, "OpticalZoomCode"), Some(TagValue::I64(3)));
     // -n raw 8 → 8.
     words[10] = 8;
-    let (_t3, em3) = parse(&blob(&words), ByteOrder::Little, false, None);
+    let (_t3, em3) = parse(&blob(&words), ByteOrder::Little, false, None, None);
     assert_eq!(find(&em3, "OpticalZoomCode"), Some(TagValue::I64(8)));
   }
 
@@ -1566,7 +1598,7 @@ mod tests {
   fn af_points_in_focus_print_hex() {
     let mut words = [0i16; 15];
     words[14] = 0x3002u16 as i16; // "Center"
-    let (typed, em) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"));
+    let (typed, em) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&em, "AFPointsInFocus"),
       Some(TagValue::Str("Center".into()))
@@ -1574,18 +1606,24 @@ mod tests {
     assert_eq!(typed.af_points_in_focus(), Some("Center"));
     // unmatched → "Unknown (0x1234)".
     words[14] = 0x1234;
-    let (_t, em2) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"));
+    let (_t, em2) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&em2, "AFPointsInFocus"),
       Some(TagValue::Str("Unknown (0x1234)".into()))
     );
     // RawConv drops 0.
     words[14] = 0;
-    let (_t2, em3) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"));
+    let (_t2, em3) = parse(&blob(&words), ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(find(&em3, "AFPointsInFocus"), None);
     // -n: raw decimal int (0x3002 = 12290).
     words[14] = 0x3002u16 as i16;
-    let (_t3, em4) = parse(&blob(&words), ByteOrder::Little, false, Some("EOS 5D"));
+    let (_t3, em4) = parse(
+      &blob(&words),
+      ByteOrder::Little,
+      false,
+      Some("EOS 5D"),
+      None,
+    );
     assert_eq!(find(&em4, "AFPointsInFocus"), Some(TagValue::I64(12290)));
   }
 
@@ -1599,7 +1637,7 @@ mod tests {
     let data = blob(&words);
 
     // 20D branch.
-    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 20D"));
+    let (typed, em) = parse(&data, ByteOrder::Little, true, Some("EOS 20D"), None);
     assert_eq!(find(&em, "ExposureTime"), Some(TagValue::Str("3.9".into())));
     assert_eq!(typed.exposure_time(), Some(3.90625));
     // Kiss Digital N branch (word-boundary token match).
@@ -1608,6 +1646,7 @@ mod tests {
       ByteOrder::Little,
       true,
       Some("EOS Digital Rebel XT / 350D / Kiss Digital N"),
+      None,
     );
     assert_eq!(
       find(&emk, "ExposureTime"),
@@ -1615,7 +1654,7 @@ mod tests {
     );
 
     // Default branch (5D is NOT in the 20D family).
-    let (_td, emd) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"));
+    let (_td, emd) = parse(&data, ByteOrder::Little, true, Some("EOS 5D"), None);
     assert_eq!(
       find(&emd, "ExposureTime"),
       Some(TagValue::Str("1/8".into()))
@@ -1623,16 +1662,118 @@ mod tests {
     // A "350D" substring inside a larger word must NOT match (\b). The
     // resolved names always delimit the token, so e.g. "X350DZ" stays
     // default — guards the word-boundary helper.
-    let (_tx, emx) = parse(&data, ByteOrder::Little, true, Some("PowerShot X350DZ"));
+    let (_tx, emx) = parse(
+      &data,
+      ByteOrder::Little,
+      true,
+      Some("PowerShot X350DZ"),
+      None,
+    );
     assert_eq!(
       find(&emx, "ExposureTime"),
       Some(TagValue::Str("1/8".into()))
     );
 
-    // RawConv drops 0 (non-CRW approximation).
+    // RawConv drops a raw-0 for a non-CRW container (`file_type = None`):
+    // `($val or FILE_TYPE eq "CRW")` is false.
     let z = [0i16; 23];
-    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, Some("EOS 20D"));
+    let (_tz, emz) = parse(&blob(&z), ByteOrder::Little, true, Some("EOS 20D"), None);
     assert_eq!(find(&emz, "ExposureTime"), None);
+  }
+
+  /// Position-22 ExposureTime RawConv `($val or $$self{FILE_TYPE} eq "CRW") ?
+  /// $val : undef` (`Canon.pm:2977`/`:2990`, BOTH branches): a raw-0
+  /// ExposureTime is EMITTED for a CRW container ("0 is valid in a CRW image
+  /// (=1s, D60 sample)") and DROPPED for every non-CRW container.
+  ///
+  /// Oracled against bundled 13.59 (`perl exiftool`): `CanonEv(0) = 0`, so the
+  /// DEFAULT branch ValueConv `exp(-CanonEv(0)*log(2)) = 1` → PrintExposureTime
+  /// "1"; the 20D branch ValueConv `…*1000/32 = 31.25` → PrintExposureTime
+  /// "31.2".
+  #[test]
+  fn exposure_time_pos22_crw_keeps_raw_zero() {
+    let z = [0i16; 23]; // pos-22 raw = 0.
+
+    // --- CRW container: raw-0 IS emitted (the `FILE_TYPE eq "CRW"` clause). ---
+    // Default branch (5D is not in the 20D family): exp(0) = 1.
+    let (typed_d, em_d) = parse(
+      &blob(&z),
+      ByteOrder::Little,
+      true,
+      Some("EOS 5D"),
+      Some("CRW"),
+    );
+    assert_eq!(find(&em_d, "ExposureTime"), Some(TagValue::Str("1".into())));
+    assert_eq!(typed_d.exposure_time(), Some(1.0));
+    // -n (ValueConv numeric): 1.0 is whole → I64(1).
+    let (_td_n, em_d_n) = parse(
+      &blob(&z),
+      ByteOrder::Little,
+      false,
+      Some("EOS 5D"),
+      Some("CRW"),
+    );
+    assert_eq!(find(&em_d_n, "ExposureTime"), Some(TagValue::I64(1)));
+
+    // 20D branch: exp(0)*1000/32 = 31.25 → PrintExposureTime "31.2".
+    let (typed_2, em_2) = parse(
+      &blob(&z),
+      ByteOrder::Little,
+      true,
+      Some("EOS 20D"),
+      Some("CRW"),
+    );
+    assert_eq!(
+      find(&em_2, "ExposureTime"),
+      Some(TagValue::Str("31.2".into()))
+    );
+    assert_eq!(typed_2.exposure_time(), Some(31.25));
+    // -n: 31.25 is fractional → F64(31.25).
+    let (_t2_n, em_2_n) = parse(
+      &blob(&z),
+      ByteOrder::Little,
+      false,
+      Some("EOS 20D"),
+      Some("CRW"),
+    );
+    assert_eq!(find(&em_2_n, "ExposureTime"), Some(TagValue::F64(31.25)));
+
+    // --- Non-CRW containers: raw-0 is DROPPED (both branches, -j and -n). ---
+    for ft in [Some("CR2"), Some("JPEG"), Some("TIFF"), None] {
+      for model in [Some("EOS 5D"), Some("EOS 20D")] {
+        for pc in [true, false] {
+          let (_t, em) = parse(&blob(&z), ByteOrder::Little, pc, model, ft);
+          assert_eq!(
+            find(&em, "ExposureTime"),
+            None,
+            "raw-0 ExposureTime must be dropped for file_type={ft:?} model={model:?} pc={pc}"
+          );
+        }
+      }
+    }
+
+    // A NONZERO raw is unaffected by file_type (CRW vs non-CRW identical).
+    let mut nz = [0i16; 23];
+    nz[22] = 96; // default branch → "1/8".
+    let (_tc, em_crw) = parse(
+      &blob(&nz),
+      ByteOrder::Little,
+      true,
+      Some("EOS 5D"),
+      Some("CRW"),
+    );
+    let (_tj, em_jpg) = parse(
+      &blob(&nz),
+      ByteOrder::Little,
+      true,
+      Some("EOS 5D"),
+      Some("JPEG"),
+    );
+    assert_eq!(
+      find(&em_crw, "ExposureTime"),
+      Some(TagValue::Str("1/8".into()))
+    );
+    assert_eq!(find(&em_crw, "ExposureTime"), find(&em_jpg, "ExposureTime"));
   }
 
   /// CameraType (pos 26) hash + AutoRotate (pos 27) hash with RawConv
@@ -1644,7 +1785,7 @@ mod tests {
     words[27] = 2; // AutoRotate → "Rotate 180"
     words[29] = 20; // SelfTimer2 → 2.0
     let data = blob(&words);
-    let (typed, em) = parse(&data, ByteOrder::Little, true, None);
+    let (typed, em) = parse(&data, ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&em, "CameraType"),
       Some(TagValue::Str("Compact".into()))
@@ -1662,14 +1803,14 @@ mod tests {
     let mut neg = [0i16; 30];
     neg[27] = -1;
     neg[29] = -5;
-    let (_tn, emn) = parse(&blob(&neg), ByteOrder::Little, true, None);
+    let (_tn, emn) = parse(&blob(&neg), ByteOrder::Little, true, None, None);
     assert_eq!(find(&emn, "AutoRotate"), None);
     assert_eq!(find(&emn, "SelfTimer2"), None);
 
     // CameraType unknown → "Unknown (7)".
     let mut u = [0i16; 30];
     u[26] = 7;
-    let (_tu, emu) = parse(&blob(&u), ByteOrder::Little, true, None);
+    let (_tu, emu) = parse(&blob(&u), ByteOrder::Little, true, None, None);
     assert_eq!(
       find(&emu, "CameraType"),
       Some(TagValue::Str("Unknown (7)".into()))

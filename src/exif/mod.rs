@@ -644,6 +644,18 @@ pub struct ExifMeta<'a> {
   /// `None`, faithful to bundled gating the emit on the OUTER file type
   /// being "TIFF" (`Parent='TIFF'`, `ExifTool.pm:8704`).
   multi_page_count: Option<u32>,
+  /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — `Some("CRW")`
+  /// for a CIFF/CRW raw, the standalone-TIFF candidate's `Parent`
+  /// (`"TIFF"`/`"DNG"`/`"NEF"`/`"CR2"`/…) for a standalone TIFF, `None` for an
+  /// embedded Exif block (JPEG `APP1`, PNG `eXIf`) or when unknown. WRITE-ONLY
+  /// inside the engine except for ONE faithful read: `Canon::ShotInfo`
+  /// position 22's RawConv (`Canon.pm:2977`/`:2990`) keeps a raw-0
+  /// ExposureTime only when the container is a CRW. It does NOT affect any
+  /// other tag — the Canon decoder threads it through to that single gate at
+  /// MakerNote-capture time. (Because the port has no CIFF/CRW parser, no
+  /// reachable input is a CRW, so the pos-22 behaviour — hence all output —
+  /// is unchanged; only the gate is now spelled faithfully.)
+  file_type: Option<smol_str::SmolStr>,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -696,6 +708,18 @@ impl<'a> ExifMeta<'a> {
     self.multi_page_count
   }
 
+  /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — see the field
+  /// docs. `Some("CRW")` for a CIFF/CRW raw, the candidate `Parent`
+  /// (`"TIFF"`/`"DNG"`/…) for a standalone TIFF, `None` for an embedded Exif
+  /// block (JPEG `APP1`, PNG `eXIf`) or when unknown. The sole faithful
+  /// consumer is `Canon::ShotInfo` position 22's CRW-allows-0 RawConv
+  /// (`Canon.pm:2977`/`:2990`); it does not influence any other output.
+  #[must_use]
+  #[inline]
+  pub fn file_type(&self) -> Option<&str> {
+    self.file_type.as_deref()
+  }
+
   /// The first entry whose resolved name matches `name` (a small ergonomic
   /// helper for the common "probe one tag" library use, e.g. `Make`).
   #[must_use]
@@ -736,6 +760,11 @@ impl<'a> ExifMeta<'a> {
       byte_order,
       maker_note,
       multi_page_count: None,
+      // A JPEG container's `APP1` Exif block is embedded — `$$self{FILE_TYPE}`
+      // is the JPEG ("JPEG"), never "CRW", so the ShotInfo pos-22 CRW clause is
+      // correctly off. We model that as `None` (no CRW), matching the embedded
+      // `parse_exif_block` path.
+      file_type: None,
     }
   }
 
@@ -793,7 +822,13 @@ impl FormatParser for ProcessExif {
   /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
   /// synthesis (`ExifTool.pm:8756-8757`) is active.
   fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_tiff(data, /* tiff_type_is_tiff */ true))
+    // Direct standalone-TIFF lib entry: no candidate `Parent` context (the
+    // engine path through `AnyParser::Exif` carries the real type via
+    // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
+    // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
+    Ok(parse_tiff(
+      data, /* tiff_type_is_tiff */ true, /* file_type */ None,
+    ))
   }
 }
 
@@ -806,7 +841,11 @@ impl FormatParser for ProcessExif {
 /// Returns `Err` only for Rust-level fatal modes (none today — every bad
 /// input is `Ok(None)`, faithful to `DoProcessTIFF` `return 0`).
 pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
-  Ok(parse_tiff(data, /* tiff_type_is_tiff */ true))
+  // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
+  // None` (see [`ProcessExif::parse`]).
+  Ok(parse_tiff(
+    data, /* tiff_type_is_tiff */ true, /* file_type */ None,
+  ))
 }
 
 /// **Reusable entry — the QuickTime/RIFF/MakerNotes seam.** Parse a raw
@@ -833,7 +872,12 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
 /// marker, IFD0 offset < 8 — `ExifTool.pm:8645`).
 #[must_use]
 pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
-  parse_tiff(block, /* tiff_type_is_tiff */ false)
+  // Embedded Exif block (QuickTime/RIFF/PNG/MakerNotes seam) — the container's
+  // `$$self{FILE_TYPE}` is the OUTER type, never "CRW", so `file_type = None`
+  // (the ShotInfo pos-22 CRW clause stays off).
+  parse_tiff(
+    block, /* tiff_type_is_tiff */ false, /* file_type */ None,
+  )
 }
 
 /// Like [`parse_exif_block`], but for an Exif/TIFF block that does NOT start at
@@ -849,7 +893,11 @@ pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 /// is OFF — see [`parse_exif_block`].
 #[must_use]
 pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
-  parse_tiff_with_base(block, base, /* tiff_type_is_tiff */ false)
+  // Embedded Exif block (JPEG `APP1`, etc.) — the OUTER container type is never
+  // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off).
+  parse_tiff_with_base(
+    block, base, /* tiff_type_is_tiff */ false, /* file_type */ None,
+  )
 }
 
 /// Like [`parse_exif_block_with_base`], but for the standalone-TIFF dispatch
@@ -866,13 +914,25 @@ pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_
 /// `header_skip` `base` for the "scan past unknown header for TIFF" detector
 /// candidate (`ExifTool.pm:3026-3034`). The `MultiPage` flag itself comes from
 /// the SubfileType / OldSubfileType `RawConv` (`Exif.pm:456`/`:473`).
+///
+/// `file_type` is that same candidate `Parent` (`$$self{FILE_TYPE}`,
+/// `ExifTool.pm:8715`) — stored on the resulting [`ExifMeta`] and threaded to
+/// the Canon MakerNote decoder for the `Canon::ShotInfo` pos-22 CRW-allows-0
+/// RawConv (`Canon.pm:2977`/`:2990`). The engine dispatch passes
+/// `Some(parent_type)`; it is WRITE-ONLY apart from that single pos-22 read.
+/// (A standalone TIFF/RAW is never a CRW — the CRW path is the unported CIFF
+/// front-end — so this changes no output today.)
 #[must_use]
-pub fn parse_standalone_tiff_with_base(
-  block: &[u8],
+pub fn parse_standalone_tiff_with_base<'a>(
+  block: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
-) -> Option<ExifMeta<'_>> {
-  parse_tiff_with_base(block, base, tiff_type_is_tiff)
+  file_type: Option<&str>,
+) -> Option<ExifMeta<'a>> {
+  // The returned `ExifMeta<'a>` borrows ONLY from `block` (the IFD bytes); the
+  // `file_type` is copied into an owned `SmolStr` inside `parse_tiff_with_base`,
+  // so its lifetime is independent and need not appear in the return type.
+  parse_tiff_with_base(block, base, tiff_type_is_tiff, file_type)
 }
 
 // ===========================================================================
@@ -898,8 +958,12 @@ pub fn parse_standalone_tiff_with_base(
 /// classic walker would misdecode it. We cleanly skip it (return `None`) rather
 /// than emit garbage — see [`parse_tiff_with_base`]. A full BigTIFF walker is a
 /// deferred port.
-fn parse_tiff(data: &[u8], tiff_type_is_tiff: bool) -> Option<ExifMeta<'_>> {
-  parse_tiff_with_base(data, 0, tiff_type_is_tiff)
+fn parse_tiff<'a>(
+  data: &'a [u8],
+  tiff_type_is_tiff: bool,
+  file_type: Option<&str>,
+) -> Option<ExifMeta<'a>> {
+  parse_tiff_with_base(data, 0, tiff_type_is_tiff, file_type)
 }
 
 /// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
@@ -917,7 +981,20 @@ fn parse_tiff(data: &[u8], tiff_type_is_tiff: bool) -> Option<ExifMeta<'_>> {
 /// the emission via `Parent` ('PNG' / 'APP1' / 'QuickTime' / 'RIFF'), which
 /// stays the outer container's name and never becomes "TIFF" in those
 /// recursive `ProcessTIFF` calls.
-fn parse_tiff_with_base(data: &[u8], base: u32, tiff_type_is_tiff: bool) -> Option<ExifMeta<'_>> {
+///
+/// `file_type` is the container's detected `$$self{FILE_TYPE}` — stored on the
+/// resulting [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
+/// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
+/// The standalone-TIFF dispatch passes the candidate `Parent`
+/// (`"TIFF"`/`"DNG"`/…); the embedded-block callers pass `None` (a JPEG/PNG
+/// container is never "CRW"). It is otherwise WRITE-ONLY — it changes no
+/// other tag, and no reachable input is a CRW today (no CIFF/CRW parser).
+fn parse_tiff_with_base<'a>(
+  data: &'a [u8],
+  base: u32,
+  tiff_type_is_tiff: bool,
+  file_type: Option<&str>,
+) -> Option<ExifMeta<'a>> {
   // `length $$dataPt < 8` — the TIFF header is 8 bytes.
   if data.len() < 8 {
     return None;
@@ -947,6 +1024,10 @@ fn parse_tiff_with_base(data: &[u8], base: u32, tiff_type_is_tiff: bool) -> Opti
     return None;
   }
 
+  // The container `$$self{FILE_TYPE}` — owned once so it can be both threaded
+  // to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk time)
+  // and stored on the resulting `ExifMeta`.
+  let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
   let mut w = Walker {
     data,
     order,
@@ -963,6 +1044,7 @@ fn parse_tiff_with_base(data: &[u8], base: u32, tiff_type_is_tiff: bool) -> Opti
     active_ifd_offsets: Vec::new(),
     page_count: 0,
     multi_page: false,
+    file_type: file_type.clone(),
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk.
@@ -994,6 +1076,7 @@ fn parse_tiff_with_base(data: &[u8], base: u32, tiff_type_is_tiff: bool) -> Opti
     byte_order: Some(order),
     maker_note: w.maker_note,
     multi_page_count,
+    file_type,
   })
 }
 
@@ -1102,6 +1185,9 @@ fn parse_tiff_with_base_shared<'a>(
     // is gated to the standalone-TIFF dispatch (`tiff_type_is_tiff`).
     page_count: 0,
     multi_page: false,
+    // Embedded block (PNG `eXIf`): `$$self{FILE_TYPE}` is "PNG", never "CRW",
+    // so the ShotInfo pos-22 CRW clause is off — model it as `None`.
+    file_type: None,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -1114,6 +1200,8 @@ fn parse_tiff_with_base_shared<'a>(
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
     // synthesized `File:PageCount`.
     multi_page_count: None,
+    // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
+    file_type: None,
   };
   (Some(meta), cycle_guard_warnings)
 }
@@ -1268,6 +1356,13 @@ struct Walker<'a, 'g> {
   /// reached (`$$self{PageCount} > 1`). Gates the `File:PageCount`
   /// emission at `ExifTool.pm:8757`.
   multi_page: bool,
+  /// The container's detected `$$self{FILE_TYPE}` (`ExifTool.pm:8715`).
+  /// Threaded into the Canon MakerNote decoder so `Canon::ShotInfo` position
+  /// 22's RawConv (`Canon.pm:2977`/`:2990`) can keep a raw-0 ExposureTime for
+  /// a CRW container. `None` for an embedded Exif block (PNG `eXIf`, JPEG
+  /// `APP1` — never "CRW") or when the type is unknown. WRITE-ONLY apart from
+  /// that single pos-22 read; it influences no other tag.
+  file_type: Option<smol_str::SmolStr>,
 }
 
 impl Walker<'_, '_> {
@@ -2131,15 +2226,18 @@ impl Walker<'_, '_> {
               }
               makernotes::Vendor::Canon => {
                 // Canon: parse using the parent TIFF context so
-                // out-of-line offsets resolve correctly.
+                // out-of-line offsets resolve correctly. Thread the container
+                // `$$self{FILE_TYPE}` for the `Canon::ShotInfo` pos-22
+                // CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
                 let mn_offset = value_offset;
                 let mn_len = read_len;
                 let model = self.captured_model.as_deref();
+                let file_type = self.file_type.as_deref();
                 let (typed_pc, emi_pc) = makernotes::vendors::canon::parse_in_tiff(
-                  self.data, mn_offset, mn_len, self.order, true, model,
+                  self.data, mn_offset, mn_len, self.order, true, model, file_type,
                 );
                 let (_typed_vc, emi_vc) = makernotes::vendors::canon::parse_in_tiff(
-                  self.data, mn_offset, mn_len, self.order, false, model,
+                  self.data, mn_offset, mn_len, self.order, false, model, file_type,
                 );
                 meta.set_canon(typed_pc);
                 cached_pc = emi_pc;
@@ -4771,6 +4869,7 @@ mod tests {
       active_ifd_offsets: Vec::new(),
       page_count: 0,
       multi_page: false,
+      file_type: None,
     }
   }
 

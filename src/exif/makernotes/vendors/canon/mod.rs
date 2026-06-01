@@ -332,7 +332,9 @@ impl MakerNotesCanon {
 /// behaviour, since Canon's MakerNotes inherit the parent's `Base`).
 #[must_use]
 pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesCanon, Vec<VendorEmission>) {
-  parse_in_tiff(blob, 0, blob.len(), parent_order, true, None)
+  // Standalone-blob convenience entry: no parent container context, so
+  // `model`/`file_type` are `None` (the FILE_TYPE-keyed CRW clause is off).
+  parse_in_tiff(blob, 0, blob.len(), parent_order, true, None, None)
 }
 
 /// Parse with the parent TIFF context.
@@ -343,6 +345,12 @@ pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesCanon, Vec<Vend
 /// inherits the parent `Base`). `model` is the parent body's
 /// `$$self{Model}` (from IFD0), used to evaluate the FocalLength
 /// FocalPlaneX/YSize `Condition` (`Canon.pm:2735-2739`).
+///
+/// `file_type` is the container's detected `$$self{FILE_TYPE}` — threaded
+/// into `Canon::ShotInfo` position 22's RawConv (`Canon.pm:2977`/`:2990`),
+/// which keeps a raw-0 ExposureTime only for a CRW container. `None` when the
+/// container type is unknown; the embedded JPEG/PNG callers pass `None` (a
+/// JPEG/PNG container is never "CRW", so the CRW clause is correctly false).
 #[must_use]
 pub fn parse_in_tiff(
   tiff_data: &[u8],
@@ -351,6 +359,7 @@ pub fn parse_in_tiff(
   parent_order: ByteOrder,
   print_conv: bool,
   model: Option<&str>,
+  file_type: Option<&str>,
 ) -> (MakerNotesCanon, Vec<VendorEmission>) {
   let mut typed = MakerNotesCanon::new();
   let mut emissions: Vec<VendorEmission> = Vec::new();
@@ -480,7 +489,9 @@ pub fn parse_in_tiff(
         }
         SubTable::ShotInfo => {
           let blob_bytes = reserialize_int_array(&entry.value, parent_order);
-          let (si, em) = shot_info::parse(&blob_bytes, parent_order, print_conv, model);
+          // Thread the container `$$self{FILE_TYPE}` into ShotInfo position
+          // 22's RawConv (CRW-allows-0, `Canon.pm:2977`/`:2990`).
+          let (si, em) = shot_info::parse(&blob_bytes, parent_order, print_conv, model, file_type);
           if !si.is_empty() {
             typed.shot_info = Some(si);
           }
@@ -602,9 +613,11 @@ pub fn parse_into_metadata(
   into: &mut Metadata,
 ) {
   let group = Group::new("MakerNotes", "MakerNotes");
-  // Standalone-blob entry point — no parent `$$self{Model}` context, so
-  // the FocalPlaneX/YSize `Condition` evaluates as for an undef Model.
-  let (_typed, emissions) = parse_in_tiff(blob, 0, blob.len(), parent_order, print_conv, None);
+  // Standalone-blob entry point — no parent `$$self{Model}` / `$$self{FILE_TYPE}`
+  // context, so the FocalPlaneX/YSize `Condition` and the ShotInfo pos-22
+  // CRW clause both evaluate as for an undef container.
+  let (_typed, emissions) =
+    parse_in_tiff(blob, 0, blob.len(), parent_order, print_conv, None, None);
   for e in emissions {
     // Unknown-suppression is the engine's job; this raw `Metadata`-sink
     // helper applies it inline so it matches the default-output contract.
@@ -852,6 +865,7 @@ mod tests {
       ByteOrder::Little,
       true,
       Some("Canon EOS-1D Mark IV"),
+      None,
     );
     let v = emissions
       .iter()
@@ -915,6 +929,7 @@ mod tests {
       ByteOrder::Little,
       true,
       Some("Canon EOS 5D Mark II"),
+      None,
     );
     // First arm: SerialInfo, raw (un-stripped) blob.
     assert!(
@@ -944,6 +959,7 @@ mod tests {
       ByteOrder::Little,
       true,
       Some("Canon EOS 5D"),
+      None,
     );
     assert!(emissions.iter().any(|e| e.name() == "SerialInfo"));
     assert!(!emissions.iter().any(|e| e.name() == "InternalSerialNumber"));
@@ -963,6 +979,7 @@ mod tests {
       ByteOrder::Little,
       true,
       Some("Canon EOS 50D"),
+      None,
     );
     assert!(!emissions.iter().any(|e| e.name() == "SerialInfo"));
     assert_eq!(typed.internal_serial_number(), Some("ABC123"));

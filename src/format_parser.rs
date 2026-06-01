@@ -2042,9 +2042,11 @@ impl AnyParser {
         // `IsOffset` tags absolute). Pre-fix this arm only matched a `SOI` at
         // byte 0, so a recoverable/edited JPEG with a small unknown header was
         // detected then mis-rejected into a `File format error`.
-        // Exif/TIFF is a leaf format — `shared` and `ext` are unused, and the
-        // `p` unit dispatcher is bypassed for the base-aware entry below.
-        let _ = (p, shared, ext);
+        // Exif/TIFF is a leaf format — `shared` is unused, and the `p` unit
+        // dispatcher is bypassed for the base-aware entry below. `ext` IS used
+        // by the standalone-TIFF arm: it feeds the finalized-`FILE_TYPE`
+        // computation (the sub-type-by-ext promotion).
+        let _ = (p, shared);
         let body = bytes.get(header_skip..).unwrap_or(&[]);
         if body.len() >= 2 && body[0] == 0xff && body[1] == 0xd8 {
           return Ok(
@@ -2062,9 +2064,35 @@ impl AnyParser {
         // — so a multi-page RAW does NOT gain a non-bundled `File:PageCount`.
         let base = u32::try_from(header_skip).unwrap_or(u32::MAX);
         let tiff_type_is_tiff = tiff_parent_type == Some("TIFF");
+        // Thread the FINALIZED `$$self{FILE_TYPE}` — the SAME string the engine
+        // emits as `File:FileType` — as the container file type, so the
+        // `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/
+        // `:2990`, which keys on `$$self{FILE_TYPE} eq "CRW"`) checks the RIGHT
+        // variable. It is the candidate `Parent` run through `DoProcessTIFF`'s
+        // `$t`/`SetFileType` rule (ExifTool.pm:8685-8694) + the sub-type-by-ext
+        // promotion — NOT the bare `Parent` (`tiff_parent_type`). The two
+        // diverge for a `.crw`-named TIFF-magic file: its `Parent` is `"CRW"`
+        // (the uppercased ext) but its finalized `FILE_TYPE` is `"TIFF"` (CRW's
+        // base module is `CanonRaw`, not TIFF, and `"CRW"` lacks a `RAW`
+        // substring, so `$t` is undef ⇒ stays `"TIFF"`). The standalone-TIFF
+        // base type is always `"TIFF"` (the only candidate `file_type()` that
+        // maps to `AnyParser::Exif`). The result is provably never `"CRW"` (no
+        // CIFF/CRW front-end; `CRW` is never a TIFF-base/RAW promotion), so the
+        // CRW branch stays correctly dead — but the gate now checks the right
+        // value, and the `.crw`-named-TIFF case matches bundled.
+        // `$$dirInfo{Parent} || ''` (ExifTool.pm:8685) — a missing candidate
+        // Parent (dotless / embedded TIFF) is the empty string ⇒ `$t` undef ⇒
+        // the finalized name stays the detected `"TIFF"`.
+        let file_type =
+          crate::parser::finalized_tiff_file_type("TIFF", tiff_parent_type.unwrap_or(""), ext);
         Ok(
-          crate::exif::parse_standalone_tiff_with_base(body, base, tiff_type_is_tiff)
-            .map(AnyMeta::Exif),
+          crate::exif::parse_standalone_tiff_with_base(
+            body,
+            base,
+            tiff_type_is_tiff,
+            Some(&file_type),
+          )
+          .map(AnyMeta::Exif),
         )
       }
     }
