@@ -63,6 +63,17 @@ use crate::{
 /// `(66 * 365 + 17) * 24 * 3600` — QuickTime.pm:1361.
 const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 
+/// Max container-atom recursion depth for the box/atom walk (Golden-v2
+/// Contract 3a). ExifTool's `ProcessMOV` has no hard cap (it relies on the
+/// finite atom sizes + EOF), but a maliciously deep box tree would recurse
+/// `walk_atoms`→`walk_trak`→`walk_atoms` (or the freeGPS/embedded-Exif
+/// `udta`/`meta` scans) until the stack overflows — a DoS. Real media nests
+/// single-digit deep (`moov`→`trak`→`mdia`→`minf`→`stbl`→…), so this cap is a
+/// large superset that never trips on a real file; the output stays
+/// byte-identical. Exceeding the cap simply stops recursion (no warning),
+/// faithful to a truncated/garbage subtree contributing no tags.
+const MAX_ATOM_DEPTH: u32 = 100;
+
 // ===========================================================================
 // Atom header reading (QuickTime.pm:9966-10078)
 // ===========================================================================
@@ -348,13 +359,28 @@ fn truncated_atom_warning(
 /// extended size ⇒ `Invalid atom size` etc.) inside moov/trak/mdia still set
 /// `$warnStr` and emit the warning before the `last`. The first such warning
 /// is recorded into `warning` (first-wins, threaded through nested walks).
+///
+/// `depth` is the recursion budget (Golden-v2 Contract 3a): a `walk_atoms`
+/// re-entered from inside another `walk_atoms`/`walk_trak` closure passes the
+/// enclosing `depth + 1`; the top-level/entry walks pass `0`. When `depth`
+/// reaches [`MAX_ATOM_DEPTH`] the walk stops, bounding stack use on a hostile
+/// file with no effect on real media (whose nesting is single-digit, far below
+/// the cap — so the output is byte-identical).
 fn walk_atoms(
+  depth: u32,
   data: &[u8],
   start: usize,
   end: usize,
   warning: &mut Option<String>,
   mut f: impl FnMut(&AtomHeader, &[u8], &mut Option<String>),
 ) {
+  // Golden-v2 3a — recursion-depth guard. Real QuickTime nesting is
+  // single-digit (`moov`→`trak`→`mdia`→`minf`→…); `MAX_ATOM_DEPTH` is a
+  // superset, so this never trips on a real file (byte-identical output) but
+  // caps stack growth on a maliciously deep box tree (a stack-overflow DoS).
+  if depth >= MAX_ATOM_DEPTH {
+    return;
+  }
   let mut pos = start;
   while pos < end {
     match read_atom_header(data, pos, false) {
@@ -1265,7 +1291,8 @@ fn decode_hdlr(payload: &[u8]) -> Option<String> {
 /// `$$self{MediaTS}` set by the SAME mdhd table — that one IS parse-order
 /// and is handled inside [`decode_mdhd`].)
 fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     if &inner.atom_type == b"mvhd" {
       decode_mvhd(ibody, qt);
     }
@@ -1290,7 +1317,8 @@ fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option
 /// global is THIS [`KodakFrea::version`](crate::metadata::KodakFrea::version),
 /// threaded into the `mdat` freeGPS scan via [`parse_inner`].
 fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     let frea = qt.kodak_frea_mut();
     match &inner.atom_type {
       // `tima` Duration — `int32u` (Kodak.pm:2980-2985). ExifTool's `int32u`
@@ -1344,10 +1372,12 @@ fn decode_moov_trak(
   // later same-group track (first-wins) so default JSON keeps the FIRST moov's
   // `Track1`.
   let mut track_num: u32 = 0;
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — this `moov` walk is depth
+  // 0; `walk_trak` re-enters `walk_atoms` so it starts one level deeper (1).
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     if &inner.atom_type == b"trak" {
       track_num += 1; // QuickTime.pm:10354 `++$track`
-      let mut track = walk_trak(ibody, movie_ts);
+      let mut track = walk_trak(1, ibody, movie_ts);
       track.set_track_group(track_num);
       qt.push_track(track);
     }
@@ -1362,10 +1392,11 @@ fn decode_moov_trak(
 /// attaches the `Truncated '...' data` / `Invalid atom size` warning to the
 /// *current* family-1 group, so the warning is recorded ON THE TRACK (surfaced
 /// as `Track#:Warning`), not the document-level `ExifTool:Warning`.
-fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
+fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
   let mut track = MediaTrack::new();
   let mut track_warning: Option<String> = None;
   walk_atoms(
+    depth,
     payload,
     0,
     payload.len(),
@@ -1377,9 +1408,16 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
           track.merge_track_header(decoded);
         }
         b"mdia" => {
-          // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237).
-          walk_atoms(body, 0, body.len(), w, |inner, ibody, _w| {
-            match &inner.atom_type {
+          // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237). This
+          // re-enters `walk_atoms` from inside the trak walk, so it runs one
+          // level deeper than the enclosing `walk_trak` (Golden-v2 3a).
+          walk_atoms(
+            depth + 1,
+            body,
+            0,
+            body.len(),
+            w,
+            |inner, ibody, _w| match &inner.atom_type {
               b"mdhd" => decode_mdhd(ibody, &mut track),
               b"hdlr" => {
                 if let Some(code) = decode_hdlr(ibody) {
@@ -1387,8 +1425,8 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
                 }
               }
               _ => {}
-            }
-          });
+            },
+          );
         }
         _ => {}
       }
@@ -1931,7 +1969,8 @@ fn first_moov_create_date_raw(data: &[u8]) -> Option<u64> {
     };
     if &header.atom_type == b"moov" {
       let body = &data[header.payload_start..header.payload_end.min(data.len())];
-      walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+      // Top-level scan (the file loop above) — depth 0.
+      walk_atoms(0, body, 0, body.len(), &mut None, |inner, ibody, _w| {
         if &inner.atom_type == b"mvhd"
           && let Some(&version) = ibody.first()
         {
@@ -1981,7 +2020,8 @@ fn detect_embedded_exif(data: &[u8]) -> bool {
     };
     let body = &data[header.payload_start..header.payload_end.min(data.len())];
     detected |= match &header.atom_type {
-      b"moov" => detect_embedded_exif_in_dir(body),
+      // Top-level entry into the directory scan — depth 0.
+      b"moov" => detect_embedded_exif_in_dir(0, body),
       // A top-level `uuid` carrying an `Exif` TIFF block.
       b"uuid" => is_uuid_exif_payload(body),
       _ => false,
@@ -1997,16 +2037,25 @@ fn detect_embedded_exif(data: &[u8]) -> bool {
 /// Recursively scan a `moov`/`udta`/`meta` directory for an embedded-Exif
 /// atom (`QVMI` / `MVTG` / `Exif` / `uuid`-Exif). QuickTime.pm nests these
 /// under `moov`→`udta` (QuickTime.pm:2058, 2070).
-fn detect_embedded_exif_in_dir(body: &[u8]) -> bool {
+///
+/// `depth` is the recursion budget (Golden-v2 3a): the `udta`/`meta`/`trak`
+/// self-recursion passes `depth + 1`, and the `walk_atoms` walk runs at the
+/// same `depth` — so a hostile deeply-nested `udta` chain is bounded by
+/// [`MAX_ATOM_DEPTH`] on both the self-recursion and the box walk.
+fn detect_embedded_exif_in_dir(depth: u32, body: &[u8]) -> bool {
+  if depth >= MAX_ATOM_DEPTH {
+    return false;
+  }
   let mut found = false;
-  walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+  walk_atoms(depth, body, 0, body.len(), &mut None, |inner, ibody, _w| {
     found |= match &inner.atom_type {
       // Casio `QVMI` / FujiFilm `MVTG` — standard Exif IFD blocks
       // (QuickTime.pm:2056-2080) — and a bare `Exif`-type atom (TIFF block).
       b"QVMI" | b"MVTG" | b"Exif" => true,
       b"uuid" => is_uuid_exif_payload(ibody),
-      // Recurse into nested containers (`udta`, `meta`, `trak`).
-      b"udta" | b"meta" | b"trak" => detect_embedded_exif_in_dir(ibody),
+      // Recurse into nested containers (`udta`, `meta`, `trak`) — one level
+      // deeper than the enclosing directory scan.
+      b"udta" | b"meta" | b"trak" => detect_embedded_exif_in_dir(depth + 1, ibody),
       _ => false,
     };
   });
@@ -3060,7 +3109,7 @@ mod tests {
     moov_body.extend_from_slice(&mvhd);
     let mut decoded_mvhd = false;
     let mut warn = None;
-    walk_atoms(&moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
+    walk_atoms(0, &moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
       if &a.atom_type == b"mvhd" {
         decoded_mvhd = true;
       }
@@ -3144,7 +3193,7 @@ mod tests {
     moov_body.extend_from_slice(b"mvhd");
     let mut warn: Option<String> = None;
     let mut decoded = false;
-    walk_atoms(&moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
+    walk_atoms(0, &moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
       if &a.atom_type == b"mvhd" {
         decoded = true;
       }
@@ -4416,5 +4465,45 @@ mod tests {
     assert!(projected.lens().is_none());
     assert!(projected.gps().is_none());
     assert!(projected.capture().is_none());
+  }
+
+  #[test]
+  fn deeply_nested_atoms_do_not_overflow_the_stack() {
+    // Golden-v2 Contract 3a — a hostile file can nest container atoms
+    // arbitrarily deep. The production walk recurses on `trak`/`mdia` (and
+    // the freeGPS / embedded-Exif scans recurse on `udta`/`meta`); a
+    // closure that re-enters `walk_atoms` per nested container is exactly
+    // that pattern. Without a recursion budget this blows the stack
+    // (a DoS); with `MAX_ATOM_DEPTH` the walk simply stops at the cap and
+    // returns. The nesting here (100_000) is a superset of any real file's
+    // single-digit nesting, so the cap never triggers on a real input.
+    const N: usize = 100_000;
+    // Build N nested `moov` containers: innermost is an 8-byte empty `moov`,
+    // each outer frame wraps the previous one's bytes.
+    let mut buf = atom(b"moov", &[]);
+    for _ in 1..N {
+      buf = atom(b"moov", &buf);
+    }
+
+    // A recursive walker mirroring the production `walk_trak`/`mdia` shape:
+    // each nested `moov` re-enters `walk_atoms` at `depth + 1`.
+    fn recurse(depth: u32, body: &[u8], count: &mut u64) {
+      walk_atoms(depth, body, 0, body.len(), &mut None, |inner, ibody, _w| {
+        if &inner.atom_type == b"moov" {
+          *count += 1;
+          recurse(depth + 1, ibody, count);
+        }
+      });
+    }
+
+    let mut count = 0u64;
+    recurse(0, &buf, &mut count);
+    // The budget bounds the walk; at least one container was visited and we
+    // returned without overflowing.
+    assert!(count >= 1, "expected to visit at least one nested moov");
+    assert!(
+      count <= u64::from(MAX_ATOM_DEPTH),
+      "the recursion budget must cap the walk at MAX_ATOM_DEPTH containers"
+    );
   }
 }
