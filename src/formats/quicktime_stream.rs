@@ -715,6 +715,18 @@ enum KeyValueConv {
   /// (QuickTime.pm:6789-6791): a fixed 80-byte LITTLE-ENDIAN blob unpacked
   /// into 27 scalars and space-joined. See [`unpack_live_photo_info`].
   LivePhotoInfo,
+  /// `detected-face.bounds` ⇒ the round-to-6-dp `PrintConv`
+  /// `my @a=split " ",$val;$_=int($_*1e6+.5)/1e6 foreach @a;join " ",@a`
+  /// (QuickTime.pm:6816-6822). This is the ONE modelled `mebx` key whose stored
+  /// value is its (display-tier) `PrintConv` output rather than its bare
+  /// `ValueConv`/`ReadValue` string: the `detected-face` leaves are reached only
+  /// through the nested `FaceInfo`→`FaceRec`→`cits` walk (see
+  /// [`process_face_info`]), and the `.ee.json` golden the SP3 harness compares
+  /// against carries the `PrintConv`-rounded coordinates (`0.123457`), NOT the
+  /// raw `%.15g` float (`0.123456791…`). The round is `int($_*1e6+.5)/1e6` —
+  /// Perl `int` truncates toward zero AFTER the `+.5`, so it is round-half-up
+  /// toward +infinity (`-3` ⇒ `-2.999999`). See [`round_face_bounds`].
+  DetectedFaceBounds,
 }
 
 /// Resolve a raw `mebx` TagID to the displayed `(Name, ValueConv)` exactly as
@@ -750,8 +762,17 @@ fn resolve_mebx_tag(tag_id: &str) -> Option<(smol_str::SmolStr, KeyValueConv)> {
     "rating.user" => Some(("UserRating", KeyValueConv::None)),
     "collection.user" => Some(("UserCollection", KeyValueConv::None)),
     "content.identifier" => Some(("ContentIdentifier", KeyValueConv::None)),
-    "detected-face" => Some(("FaceInfo", KeyValueConv::None)),
-    "detected-face.bounds" => Some(("DetectedFaceBounds", KeyValueConv::None)),
+    // `detected-face` (QuickTime.pm:6808-6811) is NOT a scalar — it is a
+    // `SubDirectory` whose value is a nested `FaceInfo`→`FaceRec`→`cits` MOV
+    // atom tree (see [`is_subdir_key`] / [`process_face_info`]). It is handled
+    // before this resolver runs, so it never reaches the scalar path. The leaf
+    // keys below ARE scalar `%QuickTime::Keys` entries — they are emitted by
+    // the nested `cits` `Process_mebx` call (QuickTime.pm:6816-6828).
+    "detected-face.bounds" => {
+      // The round-to-6-dp display `PrintConv` (QuickTime.pm:6820); see
+      // `KeyValueConv::DetectedFaceBounds`.
+      Some(("DetectedFaceBounds", KeyValueConv::DetectedFaceBounds))
+    }
     "detected-face.face-id" => Some(("DetectedFaceID", KeyValueConv::None)),
     "detected-face.roll-angle" => Some(("DetectedFaceRollAngle", KeyValueConv::None)),
     "detected-face.yaw-angle" => Some(("DetectedFaceYawAngle", KeyValueConv::None)),
@@ -837,7 +858,49 @@ fn apply_key_value_conv(conv: KeyValueConv, raw_bytes: &[u8], read_val: String) 
     // yield `undef`s / a warning; ExifTool only emits this for the documented
     // 80-byte payload).
     KeyValueConv::LivePhotoInfo => unpack_live_photo_info(raw_bytes).unwrap_or(read_val),
+    // QuickTime.pm:6820 `my @a=split " ",$val;$_=int($_*1e6+.5)/1e6 foreach
+    // @a;join " ",@a` — round each space-separated coordinate to 6 dp. Operates
+    // on the `ReadValue` string (the `float[8]` rendered `%.15g` and joined by
+    // [`read_meta_value`]); `raw_bytes` is unused for this display-tier conv.
+    KeyValueConv::DetectedFaceBounds => round_face_bounds(&read_val),
   }
+}
+
+/// `detected-face.bounds` `PrintConv` (QuickTime.pm:6820):
+/// `my @a=split " ",$val;$_=int($_*1e6+.5)/1e6 foreach @a;join " ",@a` — round
+/// each whitespace-separated number in `$val` to 6 decimal places and re-join
+/// with single spaces.
+///
+/// The round is `int($_*1e6+.5)/1e6`. Perl `int` truncates toward zero, but the
+/// `+.5` is added BEFORE the truncation, so the result is round-half-up toward
+/// +infinity, NOT round-half-away-from-zero: `0.123456789` ⇒ `0.123457`,
+/// `-3` ⇒ `int(-2999999.5)/1e6` ⇒ `-2.999999`. Each rounded value is rendered
+/// with Perl's default number stringification — `%.15g` via
+/// [`format_g`](crate::value::format_g) — which prints the (now ≤6-dp) value
+/// without trailing-zero noise (`0.11`, `2`, `-2.999999`).
+///
+/// `split " ",$val` (a single-space pattern in Perl) splits on runs of
+/// whitespace AND skips a leading empty field; `str::split_whitespace`
+/// reproduces both. A token that does not parse as a number is passed through
+/// verbatim (Perl's numeric coercion of a non-number yields `0` with a warning,
+/// but the only producer here is the `%.15g`-rendered `float[8]`, so every
+/// token parses).
+fn round_face_bounds(val: &str) -> String {
+  let mut out = String::with_capacity(val.len());
+  for tok in val.split_whitespace() {
+    if !out.is_empty() {
+      out.push(' ');
+    }
+    match tok.parse::<f64>() {
+      Ok(x) => {
+        // `int($_*1e6+.5)` — Perl `int` truncates toward zero (`f64::trunc`).
+        let rounded = (x * 1e6 + 0.5).trunc() / 1e6;
+        out.push_str(&crate::value::format_g(rounded, 15));
+      }
+      Err(_) => out.push_str(tok),
+    }
+  }
+  out
 }
 
 /// `live-photo-info` ValueConv (QuickTime.pm:6791): `join " ",unpack
@@ -1113,12 +1176,20 @@ fn process_mebx(
       let value_bytes = &data[pos + 8..pos + len];
       // QuickTimeStream.pl:2668-2674 `HandleTag(..., $val, DataPt=>..., Start=>
       // $pos+8, Size=>$len-8)`. A `%QuickTime::Keys` entry that is a
-      // `SubDirectory` (currently only `smartstyle-info`, QuickTime.pm:6847-
-      // 6852 → `PLIST::Main` / `PLIST::ProcessBinaryPLIST`) makes `HandleTag`
-      // recurse into the sub-processor over `[Start, Start+Size]` instead of
-      // storing the scalar `$val`. So a `smartstyle-info` value IS a binary
-      // plist; its decoded PLIST tags replace the (would-be) scalar.
-      if is_subdir_key(&info.tag_id) {
+      // `SubDirectory` makes `HandleTag` recurse into the sub-processor over
+      // `[Start, Start+Size]` instead of storing the scalar `$val`. Two such
+      // keys reach `mebx` timed metadata:
+      //   * `smartstyle-info` (QuickTime.pm:6847-6852 → `PLIST::Main` /
+      //     `PLIST::ProcessBinaryPLIST`): the value bytes are a binary plist.
+      //   * `detected-face` (QuickTime.pm:6808-6811 → `QuickTime::FaceInfo`,
+      //     `PROCESS_PROC => ProcessMOV`): the value bytes are a NESTED MOV
+      //     atom tree (`crec`→`FaceRec`→`cits`), re-entered through the box
+      //     walker; the `cits` content is itself `Process_mebx`-decoded against
+      //     `%QuickTime::Keys` (the SAME `keys` map) and yields the
+      //     `DetectedFace*` leaf samples (QuickTime.pm:6626-6648, 6816-6828).
+      if info.tag_id == "detected-face" {
+        process_face_info(value_bytes, keys, sample_time, sample_duration, out);
+      } else if is_subdir_key(&info.tag_id) {
         process_mebx_subdir(&info.tag_id, value_bytes, out);
       } else if let Some((name, conv)) = resolve_mebx_tag(&info.tag_id) {
         // QuickTimeStream.pl:2657-2666 — resolve the TagID through the
@@ -1140,8 +1211,55 @@ fn process_mebx(
   }
 }
 
+/// Process a `detected-face` `mebx` `SubDirectory` value — a nested MOV atom
+/// tree — by re-entering the box walker and re-running `Process_mebx` on its
+/// leaf `cits` content.
+///
+/// `detected-face` (QuickTime.pm:6808-6811) names `QuickTime::FaceInfo`, whose
+/// `PROCESS_PROC` is `ProcessMOV`. The value bytes are therefore a sequence of
+/// `crec` atoms (QuickTime.pm:6626-6635, `%QuickTime::FaceInfo`); each `crec`
+/// names `QuickTime::FaceRec` (also `ProcessMOV`, QuickTime.pm:6638-6648),
+/// whose single `cits` atom names `%QuickTime::Keys` with
+/// `ProcessProc => Process_mebx`. So a `cits` body is itself a `mebx` record
+/// stream, decoded against the SAME `keys` map (`Process_mebx` reads the shared
+/// `$$et{ee}{keys}`), resolving the `detected-face.bounds` / `.face-id` /
+/// `.roll-angle` / `.yaw-angle` leaf keys (QuickTime.pm:6816-6828).
+///
+/// The port's [`for_each_atom`] walks any `[size:4][type:4][payload]` atom
+/// sequence over a borrowed buffer (it is NOT bound to the file's top-level
+/// tree), so re-entering on the in-memory `value` slice scoped to the
+/// `FaceInfo`/`FaceRec` tables is a localized re-use of the existing walker —
+/// no structural change. `sample_time` / `sample_duration` thread through to
+/// the leaf [`MebxSample`]s exactly as the outer sample's would.
+fn process_face_info(
+  value: &[u8],
+  keys: &[(u32, MetaKey)],
+  sample_time: Option<f64>,
+  sample_duration: Option<f64>,
+  out: &mut QuickTimeStreamMeta,
+) {
+  // FaceInfo (ProcessMOV): walk the `crec` children. `for_each_atom` accepts a
+  // `(start, end)` byte range over `value`; the closure receives each atom's
+  // payload sub-slice, which is itself walkable with `for_each_atom(.., 0,
+  // len, ..)`.
+  for_each_atom(value, 0, value.len(), |t, crec_body| {
+    if t != b"crec" {
+      return;
+    }
+    // FaceRec (ProcessMOV): the single `cits` child.
+    for_each_atom(crec_body, 0, crec_body.len(), |t2, cits_body| {
+      if t2 != b"cits" {
+        return;
+      }
+      // cits → %QuickTime::Keys with Process_mebx (the SAME keys map).
+      process_mebx(cits_body, keys, sample_time, sample_duration, out);
+    });
+  });
+}
+
 /// `true` when a `mebx` TagID resolves (through `%QuickTime::Keys`) to a
-/// `SubDirectory` entry whose value must be re-processed by another module,
+/// `SubDirectory` entry whose value must be re-processed by ANOTHER module
+/// (vs. the nested-MOV `detected-face`, handled by [`process_face_info`]),
 /// rather than stored as a scalar. Currently the only such key is
 /// `smartstyle-info` (QuickTime.pm:6847-6852 → `PLIST::Main` /
 /// `PLIST::ProcessBinaryPLIST`). The other `%QuickTime::Keys` `SubDirectory`
@@ -1190,10 +1308,14 @@ fn process_mebx_subdir(tag_id: &str, value: &[u8], out: &mut QuickTimeStreamMeta
   }
 }
 
-/// When the `plist` feature is off, a `mebx` `SubDirectory` key cannot be
-/// dispatched (the only such key, `smartstyle-info`, needs the PLIST module);
-/// the value is silently dropped (no scalar fallback — its `%QuickTime::Keys`
-/// entry has no scalar form).
+/// Defensive stub for a hypothetical `quicktime`-without-`plist` build. The
+/// `quicktime` feature now chains `plist` (see `Cargo.toml`), so within any
+/// build where this module compiles `plist` is enabled and the
+/// `#[cfg(feature = "plist")]` definition above is the one selected — this arm
+/// is therefore unreachable in practice. It is retained only so the
+/// `smartstyle-info` dispatch site type-checks if the feature edge is ever
+/// manually severed; when active it drops the `SubDirectory` value (the only
+/// such key, `smartstyle-info`, has no scalar form).
 #[cfg(not(feature = "plist"))]
 fn process_mebx_subdir(_tag_id: &str, _value: &[u8], _out: &mut QuickTimeStreamMeta) {}
 
@@ -2004,6 +2126,10 @@ mod tests {
     // detected-face.face-id ⇒ Keys Name DetectedFaceID (≠ camel-case).
     let (name, _) = resolve_mebx_tag("detected-face.face-id").expect("known");
     assert_eq!(name, "DetectedFaceID");
+    // detected-face.bounds ⇒ DetectedFaceBounds with the round-to-6dp PrintConv.
+    let (name, conv) = resolve_mebx_tag("detected-face.bounds").expect("known");
+    assert_eq!(name, "DetectedFaceBounds");
+    assert_eq!(conv, KeyValueConv::DetectedFaceBounds);
     // unknown reverse-DNS ⇒ camel-case fallback, no ValueConv.
     let (name, conv) = resolve_mebx_tag("test.foo-bar").expect("valid id");
     assert_eq!(name, "TestFooBar");
@@ -2050,6 +2176,149 @@ mod tests {
     assert_eq!(out.mebx_samples().len(), 1, "empty value still emits a tag");
     assert_eq!(out.mebx_samples()[0].name(), "StillImageTime");
     assert_eq!(out.mebx_samples()[0].value(), "");
+  }
+
+  #[test]
+  fn round_face_bounds_matches_perl_printconv() {
+    // QuickTime.pm:6820 `int($_*1e6+.5)/1e6` per element. Perl `int` truncates
+    // toward zero AFTER the `+.5`, so it is round-half-up toward +infinity, NOT
+    // round-half-away-from-zero. The strings are the `%.15g` renders the
+    // `float[8]` decode produces (f32 round-trip), verified byte-identical
+    // against the bundled `exiftool` for the same inputs.
+    assert_eq!(
+      round_face_bounds("0.1 0.2 0.3 0.4 0.123456791043282 0.5 0.6 0.7"),
+      "0.1 0.2 0.3 0.4 0.123457 0.5 0.6 0.7"
+    );
+    // Negative round direction: toward +infinity (NOT away from zero).
+    assert_eq!(round_face_bounds("-3"), "-2.999999");
+    assert_eq!(round_face_bounds("-7.25"), "-7.249999");
+    assert_eq!(round_face_bounds("-2.34567856788635"), "-2.345678");
+    assert_eq!(round_face_bounds("-0.123456500470638"), "-0.123456");
+    // Rounds UP to an integer; trailing zeros stripped by `%g`.
+    assert_eq!(round_face_bounds("1.99999952316284"), "2");
+    assert_eq!(round_face_bounds("0.109999999403954"), "0.11");
+    // A tiny negative rounds to "0" (Perl `int(-0.4999)` is 0).
+    assert_eq!(round_face_bounds("-4.99999998737621e-07"), "0");
+    // Already short / exact values pass through unchanged.
+    assert_eq!(round_face_bounds("12.5"), "12.5");
+    assert_eq!(round_face_bounds(""), "");
+  }
+
+  #[test]
+  fn process_face_info_walks_nested_crec_cits_tree() {
+    // `detected-face` value = FaceInfo MOV tree: crec -> cits -> mebx records
+    // for the leaf keys, decoded against the SAME keys map. Two faces here.
+    fn atom(typ: &[u8; 4], payload: &[u8]) -> alloc::vec::Vec<u8> {
+      let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+      v.extend_from_slice(typ);
+      v.extend_from_slice(payload);
+      v
+    }
+    fn rec(id: u32, val: &[u8]) -> alloc::vec::Vec<u8> {
+      let mut v = ((8 + val.len()) as u32).to_be_bytes().to_vec();
+      v.extend_from_slice(&id.to_be_bytes());
+      v.extend_from_slice(val);
+      v
+    }
+    let keys = alloc::vec![
+      (
+        2u32,
+        MetaKey {
+          tag_id: "detected-face.bounds".into(),
+          format: MetaFormat::Float
+        }
+      ),
+      (
+        3u32,
+        MetaKey {
+          tag_id: "detected-face.face-id".into(),
+          format: MetaFormat::Int32u
+        }
+      ),
+      (
+        4u32,
+        MetaKey {
+          tag_id: "detected-face.roll-angle".into(),
+          format: MetaFormat::Float
+        }
+      ),
+    ];
+    // Build one face's cits content (bounds float[2] for brevity, face-id, roll).
+    // `0.123_456_79` is the f32-representable value (the same bits the on-wire
+    // `float[2]` carries); it still `%.15g`-renders to `0.123456791043282` and
+    // rounds to `0.123457` (see `round_face_bounds_matches_perl_printconv`).
+    let mut bounds = alloc::vec::Vec::new();
+    bounds.extend_from_slice(&0.123_456_79_f32.to_be_bytes());
+    bounds.extend_from_slice(&(-3.0_f32).to_be_bytes());
+    let mut cits_content = rec(2, &bounds);
+    cits_content.extend(rec(3, &1001u32.to_be_bytes()));
+    cits_content.extend(rec(4, &12.5_f32.to_be_bytes()));
+    let crec = atom(b"crec", &atom(b"cits", &cits_content));
+    let value = crec; // single face
+
+    let mut out = QuickTimeStreamMeta::new();
+    process_face_info(&value, &keys, Some(0.0), Some(1.0), &mut out);
+    let p = out.mebx_samples();
+    assert_eq!(p.len(), 3, "three leaf keys for the one face");
+    assert_eq!(p[0].name(), "DetectedFaceBounds");
+    // bounds: 0.123456789 rounds to 0.123457; -3 (float[2]) rounds to -2.999999.
+    assert_eq!(p[0].value(), "0.123457 -2.999999");
+    assert_eq!(p[1].name(), "DetectedFaceID");
+    assert_eq!(p[1].value(), "1001");
+    assert_eq!(p[2].name(), "DetectedFaceRollAngle");
+    assert_eq!(p[2].value(), "12.5"); // roll has no PrintConv
+  }
+
+  #[test]
+  fn process_mebx_intercepts_detected_face_parent_as_subdir() {
+    // A `detected-face` parent record (the nested FaceInfo tree) is routed
+    // through `process_face_info`, NOT stored as a scalar `MebxSample`. The
+    // outer key resolves to `detected-face`; its value is the crec/cits tree.
+    fn atom(typ: &[u8; 4], payload: &[u8]) -> alloc::vec::Vec<u8> {
+      let mut v = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+      v.extend_from_slice(typ);
+      v.extend_from_slice(payload);
+      v
+    }
+    fn rec(id: u32, val: &[u8]) -> alloc::vec::Vec<u8> {
+      let mut v = ((8 + val.len()) as u32).to_be_bytes().to_vec();
+      v.extend_from_slice(&id.to_be_bytes());
+      v.extend_from_slice(val);
+      v
+    }
+    let keys = alloc::vec![
+      (
+        1u32,
+        MetaKey {
+          tag_id: "detected-face".into(),
+          format: MetaFormat::Undef
+        }
+      ),
+      (
+        3u32,
+        MetaKey {
+          tag_id: "detected-face.face-id".into(),
+          format: MetaFormat::Int32u
+        }
+      ),
+    ];
+    let cits_content = rec(3, &7u32.to_be_bytes());
+    let face_tree = atom(b"crec", &atom(b"cits", &cits_content));
+    // Outer mebx record: [len][local-id=1][face_tree].
+    let outer = rec(1, &face_tree);
+    let mut out = QuickTimeStreamMeta::new();
+    process_mebx(&outer, &keys, Some(0.0), Some(1.0), &mut out);
+    let p = out.mebx_samples();
+    // ONLY the leaf is emitted — no `DetectedFace`/`FaceInfo` scalar for the
+    // parent (the pre-fix branch wrongly emitted the raw tree bytes as a scalar).
+    assert_eq!(p.len(), 1, "only the nested leaf, not the parent scalar");
+    assert_eq!(p[0].name(), "DetectedFaceID");
+    assert_eq!(p[0].value(), "7");
+    assert!(
+      p.iter()
+        .all(|s| s.name() != "FaceInfo" && s.name() != "DetectedFace"),
+      "the detected-face parent must not surface as a scalar"
+    );
   }
 
   #[test]

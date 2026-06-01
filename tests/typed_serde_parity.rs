@@ -55,7 +55,9 @@
 //!
 //! The QuickTime SP3 timed-metadata fixtures (`QuickTime_mebx_gps.mov`,
 //! `QuickTime_mebx_float.mov`, `QuickTime_mebx_keys.mov`,
-//! `QuickTime_gps_kenwood.mov`, `QuickTime_gps0.mov`, `QuickTime_gsen.mov`)
+//! `QuickTime_mebx_livephoto.mov`, `QuickTime_mebx_smartstyle.mov`,
+//! `QuickTime_mebx_detface.mov`, `QuickTime_gps_kenwood.mov`,
+//! `QuickTime_gps0.mov`, `QuickTime_gsen.mov`)
 //! are NOT in this set: `Image::ExifTool::QuickTime::Stream` is gated behind
 //! the bundled `ExtractEmbedded` (`-ee`) option, which `tools/gen_golden.sh`
 //! never passes — so those fixtures carry only an `-ee`-captured

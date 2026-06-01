@@ -263,6 +263,120 @@ fn quicktime_mebx_smartstyle_info_decodes_embedded_plist() {
 }
 
 #[test]
+fn quicktime_mebx_detected_face_decodes_nested_atom_tree() {
+  // `detected-face` (QuickTime.pm:6808-6811) is a `%QuickTime::Keys`
+  // SubDirectory entry naming `QuickTime::FaceInfo` (`PROCESS_PROC =>
+  // ProcessMOV`). So a `mebx` `detected-face` sample's value bytes are a NESTED
+  // MOV atom tree: `crec` (→ `FaceRec`, also `ProcessMOV`) → `cits` (→
+  // `%QuickTime::Keys` with `ProcessProc => Process_mebx`). The `cits` content
+  // is itself a `mebx` record stream decoded against the SAME `keys` map,
+  // resolving the four leaf keys (QuickTime.pm:6816-6828):
+  //   detected-face.bounds     (dtyp 80, float[8]) -> DetectedFaceBounds
+  //     PrintConv `int($_*1e6+.5)/1e6` per element (round to 6 dp).
+  //   detected-face.face-id    (dtyp 77, int32u)   -> DetectedFaceID
+  //   detected-face.roll-angle (dtyp 23, float)    -> DetectedFaceRollAngle
+  //   detected-face.yaw-angle  (dtyp 23, float)    -> DetectedFaceYawAngle
+  //
+  // Crafted fixture: one `mebx` track whose `keys` table maps local-id 1 ->
+  // `detected-face` (undef) and local-ids 2..5 -> the four leaf keys; the single
+  // timed sample carries TWO `crec` faces. The port re-enters its box walker on
+  // the sample value (FaceInfo -> FaceRec -> cits) and decodes BOTH faces into
+  // flat `mebx` samples (8 = 2 faces x 4 keys). ExifTool's flat `-G1` last-wins
+  // TagMap keeps only the SECOND face's values; the per-document `-G3:1` oracle
+  // shows BOTH and matches the port's full list.
+  //
+  // Face 1 bounds exercise the positive round (0.123456789 -> 0.123457); face 2
+  // (the last-wins golden) exercises the NEGATIVE round direction — Perl int()
+  // truncates toward zero after +.5, so -2.3456785 -> -2.345678 (round-half-up
+  // toward +inf, NOT away-from-zero -2.345679).
+  let data = fixture("QuickTime_mebx_detface.mov");
+  let golden = ee_golden("QuickTime_mebx_detface.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+
+  // `detected-face` is a SubDirectory: its scalar form is NEVER emitted (the
+  // pre-fix branch wrongly stored the raw nested-atom bytes as a `FaceInfo`
+  // scalar). The leaf keys land as flat `mebx` samples.
+  let pairs = stream.mebx_samples();
+  assert!(
+    pairs.iter().all(|p| p.name() != "FaceInfo"),
+    "the detected-face parent must NOT be emitted as a scalar"
+  );
+  assert_eq!(pairs.len(), 8, "two faces x four leaf keys");
+
+  // Face 1 (QuickTime.pm:6816-6828 order: bounds, face-id, roll, yaw).
+  assert_eq!(pairs[0].name(), "DetectedFaceBounds");
+  assert_eq!(
+    pairs[0].value(),
+    "0.1 0.2 0.3 0.4 0.123457 0.5 0.6 0.7",
+    "face 1 bounds rounded to 6 dp (0.123456789 -> 0.123457)"
+  );
+  assert_eq!(pairs[1].name(), "DetectedFaceID");
+  assert_eq!(pairs[1].value(), "1001");
+  assert_eq!(pairs[2].name(), "DetectedFaceRollAngle");
+  assert_eq!(pairs[2].value(), "12.5");
+  assert_eq!(pairs[3].name(), "DetectedFaceYawAngle");
+  assert_eq!(pairs[3].value(), "-7.25");
+
+  // Face 2 — the SampleTime/SampleDuration thread through to every leaf.
+  assert_eq!(pairs[4].name(), "DetectedFaceBounds");
+  assert_eq!(
+    pairs[4].value(),
+    "0.765432 -2.345678 0.33 0.44 0.55 0.66 0.77 0.88",
+    "face 2 bounds — negative round-half-up toward +inf (-2.3456785 -> -2.345678)"
+  );
+  assert_eq!(pairs[5].name(), "DetectedFaceID");
+  assert_eq!(pairs[5].value(), "1002");
+  assert_eq!(pairs[6].name(), "DetectedFaceRollAngle");
+  assert_eq!(
+    pairs[6].value(),
+    "-3",
+    "roll-angle has no PrintConv (unrounded)"
+  );
+  assert_eq!(pairs[7].name(), "DetectedFaceYawAngle");
+  assert_eq!(pairs[7].value(), "45");
+
+  // Every leaf carries the enclosing sample's time/duration.
+  for p in pairs {
+    assert_eq!(p.sample_time(), Some(0.0));
+    assert_eq!(p.sample_duration(), Some(1.0));
+  }
+
+  // Byte-for-byte equal to the bundled oracle's flat `-G1` last-wins values
+  // (the SECOND face — ExifTool's TagMap overwrites the first).
+  let want_bounds = golden
+    .get("Track1:DetectedFaceBounds")
+    .and_then(|v| v.as_str())
+    .expect("golden DetectedFaceBounds");
+  assert_eq!(
+    pairs[4].value(),
+    want_bounds,
+    "oracle parity for the rounded face bounds"
+  );
+  assert_eq!(
+    golden.get("Track1:DetectedFaceID").and_then(|v| v.as_i64()),
+    Some(1002),
+    "oracle DetectedFaceID"
+  );
+  assert_eq!(
+    golden
+      .get("Track1:DetectedFaceRollAngle")
+      .and_then(|v| v.as_i64()),
+    Some(-3),
+    "oracle DetectedFaceRollAngle"
+  );
+  assert_eq!(
+    golden
+      .get("Track1:DetectedFaceYawAngle")
+      .and_then(|v| v.as_i64()),
+    Some(45),
+    "oracle DetectedFaceYawAngle"
+  );
+}
+
+#[test]
 fn quicktime_kenwood_gps_box_decodes_le_records() {
   // QuickTimeStream.pl `ParseTag` `GPS ` (2557-2580): a moov-level Kenwood
   // `GPS ` box of 36-byte little-endian records. The fixture has two fixes;

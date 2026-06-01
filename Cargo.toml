@@ -176,9 +176,18 @@ plist      = ["dep:miniz_oxide"]
 # `seAl`, …) are deferred.
 png        = ["exif", "dep:miniz_oxide"]
 # `quicktime` — MOV / MP4 / M4A / M4V / 3GP / 3G2. SP1 (the box/atom
-# walker + core structural atoms) is a leaf format with no cross-format
-# chains. SP3 will add an `exif` edge for the embedded-Exif atom hop.
-quicktime  = []
+# walker + core structural atoms). SP3 chains `plist`: the `mebx`
+# `smartstyle-info` timed-metadata key (QuickTime.pm:6847-6852) is a
+# `SubDirectory` dispatched to `Image::ExifTool::PLIST::Main` /
+# `PLIST::ProcessBinaryPLIST` — `quicktime_stream` calls
+# `formats::plist::parse_borrowed` to decode the embedded binary plist. The
+# dependency makes that path ALWAYS available when `quicktime` is enabled
+# (rather than silently dropping smartstyle-info under `--features quicktime`
+# without `plist`). SP3 will additionally add an `exif` edge for the
+# embedded-Exif atom hop once #36 (Exif+GPS) merges. (The nested-atom
+# `detected-face` mebx SubDirectory, QuickTime.pm:6808-6811, needs NO plist —
+# it re-enters the MOV box walker over `FaceInfo`/`FaceRec`/`cits`.)
+quicktime  = ["plist"]
 # `real` chains ID3 (Real.pm:678-687: ID3v1 trailer scan on RM files;
 # the typed parser reuses `formats::id3::parse_id3v1_from_block` to
 # decode the 128-byte TAG block via the same path the ID3 engine
