@@ -160,6 +160,109 @@ fn quicktime_mebx_keys_table_name_resolution_and_value_conv() {
 }
 
 #[test]
+fn quicktime_mebx_live_photo_info_unpacks_le_blob() {
+  // `live-photo-info` (QuickTime.pm:6789-6791) is a `%QuickTime::Keys` entry
+  // whose ValueConv is `join " ",unpack "VfVVf6c4lCCcclf4Vvv",$val` — a fixed
+  // 80-byte LITTLE-ENDIAN blob unpacked into 27 scalars and space-joined. The
+  // bundled comment concedes the `f`/`l` codes are native-endian and the
+  // goldens are generated on a little-endian machine, so the port decodes LE.
+  //
+  // Crafted fixture: one `mebx` track whose `keys` table maps local-id 1 →
+  // TagID `live-photo-info` (undef format — the raw bytes feed the unpack); the
+  // single timed sample carries the 80-byte LE value
+  //   V=1 f=1.5 V=2 V=3 f6=[.25 .5 .75 1 1.25 1.5] c4=[1 -2 3 -4] l=-1000
+  //   C=200 C=250 c=-5 c=7 l=123456 f4=[2.5 -3.5 4 .125] V=99 v=1000 v=65535.
+  // Oracle (`perl exiftool -ee`, `QuickTime_mebx_livephoto.mov.ee.json`) ⇒
+  //   Track1:LivePhotoInfo = "1 1.5 2 3 0.25 0.5 0.75 1 1.25 1.5 1 -2 3 -4
+  //   -1000 200 250 -5 7 123456 2.5 -3.5 4 0.125 99 1000 65535".
+  let data = fixture("QuickTime_mebx_livephoto.mov");
+  let golden = ee_golden("QuickTime_mebx_livephoto.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let pairs = meta.stream().mebx_samples();
+  assert_eq!(pairs.len(), 1, "one mebx key/value pair");
+  assert_eq!(pairs[0].name(), "LivePhotoInfo");
+  // Byte-for-byte equal to the bundled oracle's Track1:LivePhotoInfo (the 27
+  // space-joined scalars; floats via Perl's default `%.15g`).
+  let want = golden
+    .get("Track1:LivePhotoInfo")
+    .and_then(|v| v.as_str())
+    .expect("golden LivePhotoInfo");
+  assert_eq!(
+    pairs[0].value(),
+    want,
+    "oracle parity for the unpacked live-photo-info blob"
+  );
+}
+
+#[cfg(feature = "plist")]
+#[test]
+fn quicktime_mebx_smartstyle_info_decodes_embedded_plist() {
+  // `smartstyle-info` (QuickTime.pm:6847-6852) is a `%QuickTime::Keys`
+  // SubDirectory entry whose value is a binary PLIST, processed through
+  // `Image::ExifTool::PLIST::Main` / `PLIST::ProcessBinaryPLIST`. So a `mebx`
+  // `smartstyle-info` sample's value bytes ARE a `bplist00` blob; ExifTool
+  // emits the resulting PLIST tags (camel-cased keys, family-0 group `PLIST`).
+  //
+  // Crafted fixture: one `mebx` track whose `keys` table maps local-id 1 →
+  // TagID `smartstyle-info`; the single timed sample carries a binary plist
+  // `{ styleIntensity = 80, styleName = "Vivid" }`. Oracle (`perl exiftool
+  // -ee -G1:0`, `QuickTime_mebx_smartstyle.mov.ee.json`) ⇒
+  //   Track1:PLIST StyleIntensity = 80, Track1:PLIST StyleName = "Vivid"
+  // (family-0 `PLIST`, family-1 re-scoped to the enclosing `Track1`).
+  //
+  // exifast wires the value through `PLIST::parse_borrowed` and stores the
+  // decoded PLIST tags (preserving the typed value + the PLIST family-0 group)
+  // in `QuickTimeStreamMeta::plist_subdir_tags`.
+  let data = fixture("QuickTime_mebx_smartstyle.mov");
+  let golden = ee_golden("QuickTime_mebx_smartstyle.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  // The embedded PLIST is NOT a scalar `mebx` pair (the SubDirectory replaces
+  // the scalar) — it lands in the nested-PLIST tag list.
+  assert!(
+    meta.stream().mebx_samples().is_empty(),
+    "smartstyle-info is a SubDirectory, not a scalar mebx pair"
+  );
+  let tags = meta.stream().plist_subdir_tags();
+  assert_eq!(tags.len(), 2, "two PLIST tags from the embedded bplist");
+
+  // The decoded PLIST tags carry the PLIST table's family-0 group, the
+  // camel-cased PLIST key name, and the TYPED value (int / string) — faithful
+  // to the standalone PLIST emission (`PLIST:StyleIntensity` = 80, etc.).
+  let intensity = &tags[0];
+  assert_eq!(intensity.group_ref().family0(), "PLIST");
+  assert_eq!(intensity.name(), "StyleIntensity");
+  let style_name = &tags[1];
+  assert_eq!(style_name.group_ref().family0(), "PLIST");
+  assert_eq!(style_name.name(), "StyleName");
+
+  // Value-equivalent to the bundled oracle's Track1:StyleIntensity (80, a bare
+  // JSON number) and Track1:StyleName ("Vivid").
+  let want_intensity = golden
+    .get("Track1:StyleIntensity")
+    .expect("golden StyleIntensity");
+  assert_eq!(want_intensity.as_i64(), Some(80), "oracle StyleIntensity");
+  // The typed value preserves the integer type the oracle emits as a bare
+  // number (NOT a stringified "80").
+  match intensity.value_ref() {
+    exifast::value::TagValue::I64(n) => assert_eq!(*n, 80),
+    other => panic!("StyleIntensity should be a typed integer, got {other:?}"),
+  }
+  let want_name = golden
+    .get("Track1:StyleName")
+    .and_then(|v| v.as_str())
+    .expect("golden StyleName");
+  assert_eq!(want_name, "Vivid", "oracle StyleName");
+  match style_name.value_ref() {
+    exifast::value::TagValue::Str(s) => assert_eq!(s.as_str(), "Vivid"),
+    other => panic!("StyleName should be a typed string, got {other:?}"),
+  }
+}
+
+#[test]
 fn quicktime_kenwood_gps_box_decodes_le_records() {
   // QuickTimeStream.pl `ParseTag` `GPS ` (2557-2580): a moov-level Kenwood
   // `GPS ` box of 36-byte little-endian records. The fixture has two fixes;

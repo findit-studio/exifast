@@ -29,6 +29,8 @@ use alloc::{string::String, vec::Vec};
 
 use smol_str::SmolStr;
 
+use crate::value::Tag;
+
 /// One timed GPS / sensor fix decoded from a video metadata sample — the
 /// typed mirror of the per-`Doc<N>` tag group ExifTool's `FoundSomething`
 /// opens for each sample (QuickTimeStream.pl:967-973). Every field is
@@ -390,6 +392,19 @@ pub struct QuickTimeStreamMeta {
   /// Apple `mebx` key/value pairs, in decode order (QuickTimeStream.pl
   /// `Process_mebx`).
   mebx_samples: Vec<MebxSample>,
+  /// Tags produced by a `mebx` key whose `%QuickTime::Keys` entry is a
+  /// `SubDirectory` dispatched to another module — currently only
+  /// `smartstyle-info` (QuickTime.pm:6847-6852), whose value is a binary PLIST
+  /// processed through `Image::ExifTool::PLIST::Main` /
+  /// `PLIST::ProcessBinaryPLIST`. The nested PLIST tags carry the PLIST table's
+  /// family-0 group (`PLIST`) and the PLIST tag name (camel-cased key); ExifTool
+  /// re-scopes their family-1 group to the enclosing `mebx` Track (verified via
+  /// `-G1:0` ⇒ `Track1:PLIST`). exifast stores them as fully-rendered [`Tag`]s
+  /// (the nested-module dispatch already converted each value through the PLIST
+  /// `Taggable` stream; the smartstyle keys never hit a mode-sensitive
+  /// `%PLIST::Main` static `PrintConv`, so the rendering is mode-invariant —
+  /// see `quicktime_stream::process_mebx`).
+  plist_subdir_tags: Vec<Tag>,
 }
 
 impl QuickTimeStreamMeta {
@@ -400,6 +415,7 @@ impl QuickTimeStreamMeta {
     Self {
       gps_samples: Vec::new(),
       mebx_samples: Vec::new(),
+      plist_subdir_tags: Vec::new(),
     }
   }
 
@@ -417,11 +433,21 @@ impl QuickTimeStreamMeta {
     self.mebx_samples.as_slice()
   }
 
+  /// The fully-rendered tags from a `mebx` `SubDirectory` key (currently only
+  /// `smartstyle-info`'s embedded binary PLIST — QuickTime.pm:6847-6852), in
+  /// decode order. Each [`Tag`] keeps the nested module's family-0 group
+  /// (`PLIST`) and tag name; see [`QuickTimeStreamMeta`]'s field docs.
+  #[inline(always)]
+  #[must_use]
+  pub fn plist_subdir_tags(&self) -> &[Tag] {
+    self.plist_subdir_tags.as_slice()
+  }
+
   /// `true` when no timed metadata was decoded.
   #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.gps_samples.is_empty() && self.mebx_samples.is_empty()
+    self.gps_samples.is_empty() && self.mebx_samples.is_empty() && self.plist_subdir_tags.is_empty()
   }
 
   /// Append a decoded GPS / sensor sample.
@@ -435,6 +461,14 @@ impl QuickTimeStreamMeta {
   #[inline(always)]
   pub fn push_mebx_sample(&mut self, sample: MebxSample) -> &mut Self {
     self.mebx_samples.push(sample);
+    self
+  }
+
+  /// Append a fully-rendered tag from a `mebx` `SubDirectory` key (the
+  /// `smartstyle-info` embedded-PLIST path).
+  #[inline(always)]
+  pub fn push_plist_subdir_tag(&mut self, tag: Tag) -> &mut Self {
+    self.plist_subdir_tags.push(tag);
     self
   }
 

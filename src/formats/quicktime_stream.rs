@@ -711,6 +711,10 @@ enum KeyValueConv {
   /// `scene-illuminance` ⇒ `unpack("N",$val)` (QuickTime.pm:6843): a
   /// big-endian `int32u` decoded from the raw (undef-format) bytes.
   SceneIlluminanceN,
+  /// `live-photo-info` ⇒ `join " ",unpack "VfVVf6c4lCCcclf4Vvv", $val`
+  /// (QuickTime.pm:6789-6791): a fixed 80-byte LITTLE-ENDIAN blob unpacked
+  /// into 27 scalars and space-joined. See [`unpack_live_photo_info`].
+  LivePhotoInfo,
 }
 
 /// Resolve a raw `mebx` TagID to the displayed `(Name, ValueConv)` exactly as
@@ -751,12 +755,14 @@ fn resolve_mebx_tag(tag_id: &str) -> Option<(smol_str::SmolStr, KeyValueConv)> {
     "detected-face.face-id" => Some(("DetectedFaceID", KeyValueConv::None)),
     "detected-face.roll-angle" => Some(("DetectedFaceRollAngle", KeyValueConv::None)),
     "detected-face.yaw-angle" => Some(("DetectedFaceYawAngle", KeyValueConv::None)),
-    // (`live-photo-info`'s native-endian `unpack` ValueConv,
-    // QuickTime.pm:6817-6824, is a niche Live-Photo blob outside the
-    // camera/GPS product scope — its Name is faithful via the camel-case
-    // fallback `LivePhotoInfo`; the binary unpack is deferred. Likewise the
+    // live-photo-info — ValueConv `join " ",unpack "VfVVf6c4lCCcclf4Vvv",$val`
+    // (QuickTime.pm:6789-6791): the raw 80-byte (undef-format) blob is unpacked
+    // little-endian into 27 scalars and space-joined. (The Name happens to
+    // equal the camel-case fallback `LivePhotoInfo`, but the explicit entry is
+    // required to attach the value-tier unpack ValueConv.) The
     // `video-orientation`/`detected-face.bounds` etc. PrintConvs are display
-    // tier, not applied to the stored value.)
+    // tier, not applied to the stored value.
+    "live-photo-info" => Some(("LivePhotoInfo", KeyValueConv::LivePhotoInfo)),
     _ => None,
   };
   if let Some((name, conv)) = known {
@@ -825,7 +831,93 @@ fn apply_key_value_conv(conv: KeyValueConv, raw_bytes: &[u8], read_val: String) 
     },
     // QuickTime.pm:6707 `ConvertISO6709` over the (undef-format) string value.
     KeyValueConv::Iso6709 => convert_iso6709(&read_val),
+    // QuickTime.pm:6791 `join " ",unpack "VfVVf6c4lCCcclf4Vvv",$val` over the
+    // raw (undef-format) bytes. A short value that the `unpack` cannot fully
+    // consume falls back to the `ReadValue` string (Perl's `unpack` would
+    // yield `undef`s / a warning; ExifTool only emits this for the documented
+    // 80-byte payload).
+    KeyValueConv::LivePhotoInfo => unpack_live_photo_info(raw_bytes).unwrap_or(read_val),
   }
+}
+
+/// `live-photo-info` ValueConv (QuickTime.pm:6791): `join " ",unpack
+/// "VfVVf6c4lCCcclf4Vvv",$val`. The 80-byte value is decoded LITTLE-ENDIAN
+/// (the bundled comment concedes the `f`/`l` codes are native-endian and the
+/// goldens are generated on a little-endian machine) into 27 scalars —
+/// `V`=u32, `f`=f32, `V`=u32, `V`=u32, `f`×6=f32, `c`×4=i8, `l`=i32, `C`=u8,
+/// `C`=u8, `c`=i8, `c`=i8, `l`=i32, `f`×4=f32, `V`=u32, `v`=u16, `v`=u16 — then
+/// space-joined with each scalar rendered via Perl's default number
+/// stringification (`%.15g` for the floats via [`format_g`](crate::value::format_g),
+/// plain decimal for the integers — the same join the GPS/accelerometer
+/// decoders use). Returns `None` when the value is shorter than the 80 bytes
+/// the template consumes (`unpack` cannot fill every field).
+fn unpack_live_photo_info(bytes: &[u8]) -> Option<String> {
+  // The template consumes exactly 80 bytes (4+4+4+4 + 6*4 + 4*1 + 4 + 4*1 +
+  // 4 + 4*4 + 4 + 2 + 2). A shorter value cannot satisfy the unpack.
+  if bytes.len() < 80 {
+    return None;
+  }
+  let f32_at = |o: usize| {
+    let s = &bytes[o..o + 4];
+    f32::from_le_bytes([s[0], s[1], s[2], s[3]])
+  };
+  let g = |x: f64| crate::value::format_g(x, 15);
+  let mut out = String::new();
+  // Push one rendered scalar, space-separated.
+  let push = |s: &str, out: &mut String| {
+    if !out.is_empty() {
+      out.push(' ');
+    }
+    out.push_str(s);
+  };
+  let mut o = 0usize;
+  // V f V V
+  push(&le_u32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  push(&g(f64::from(f32_at(o))), &mut out);
+  o += 4;
+  push(&le_u32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  push(&le_u32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  // f6
+  for _ in 0..6 {
+    push(&g(f64::from(f32_at(o))), &mut out);
+    o += 4;
+  }
+  // c4 (signed i8)
+  for _ in 0..4 {
+    push(&(bytes[o] as i8).to_string(), &mut out);
+    o += 1;
+  }
+  // l (i32)
+  push(&le_i32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  // C C (u8)
+  push(&bytes[o].to_string(), &mut out);
+  o += 1;
+  push(&bytes[o].to_string(), &mut out);
+  o += 1;
+  // c c (i8)
+  push(&(bytes[o] as i8).to_string(), &mut out);
+  o += 1;
+  push(&(bytes[o] as i8).to_string(), &mut out);
+  o += 1;
+  // l (i32)
+  push(&le_i32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  // f4
+  for _ in 0..4 {
+    push(&g(f64::from(f32_at(o))), &mut out);
+    o += 4;
+  }
+  // V v v
+  push(&le_u32(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 4;
+  push(&le_u16(bytes, o).unwrap_or(0).to_string(), &mut out);
+  o += 2;
+  push(&le_u16(bytes, o).unwrap_or(0).to_string(), &mut out);
+  Some(out)
 }
 
 /// `ConvertISO6709` (QuickTime.pm:8884-8908): parse an ISO 6709 coordinate
@@ -1018,17 +1110,27 @@ fn process_mebx(
     }
     let id = be_u32(data, pos + 4).unwrap_or(0);
     if let Some((_, info)) = keys.iter().find(|(k, _)| *k == id) {
-      // QuickTimeStream.pl:2657-2666 — resolve the TagID through the
-      // `%QuickTime::Keys` table (the `mebx` SubDirectory's TagTable,
-      // QuickTimeStream.pl:177) to its displayed Name + value-tier ValueConv,
-      // skipping a TagID that fails the reasonable-id guard.
-      if let Some((name, conv)) = resolve_mebx_tag(&info.tag_id) {
+      let value_bytes = &data[pos + 8..pos + len];
+      // QuickTimeStream.pl:2668-2674 `HandleTag(..., $val, DataPt=>..., Start=>
+      // $pos+8, Size=>$len-8)`. A `%QuickTime::Keys` entry that is a
+      // `SubDirectory` (currently only `smartstyle-info`, QuickTime.pm:6847-
+      // 6852 → `PLIST::Main` / `PLIST::ProcessBinaryPLIST`) makes `HandleTag`
+      // recurse into the sub-processor over `[Start, Start+Size]` instead of
+      // storing the scalar `$val`. So a `smartstyle-info` value IS a binary
+      // plist; its decoded PLIST tags replace the (would-be) scalar.
+      if is_subdir_key(&info.tag_id) {
+        process_mebx_subdir(&info.tag_id, value_bytes, out);
+      } else if let Some((name, conv)) = resolve_mebx_tag(&info.tag_id) {
+        // QuickTimeStream.pl:2657-2666 — resolve the TagID through the
+        // `%QuickTime::Keys` table (the `mebx` SubDirectory's TagTable,
+        // QuickTimeStream.pl:177) to its displayed Name + value-tier ValueConv,
+        // skipping a TagID that fails the reasonable-id guard.
+        //
         // QuickTimeStream.pl:2668 `ReadValue($dataPt, $pos+8, $format, undef,
         // $len-8)`. A `mebx` record is ≥8 bytes; the value slice is `$len-8`
         // bytes (possibly empty). ReadValue returns an empty STRING — never
         // undef — for the empty/short case (ExifTool.pm:6298-6299), so the tag
         // is ALWAYS emitted once the key resolves (it is never dropped here).
-        let value_bytes = &data[pos + 8..pos + len];
         let read_val = read_meta_value(value_bytes, info.format);
         let value = apply_key_value_conv(conv, value_bytes, read_val);
         out.push_mebx_sample(MebxSample::new(name, value, sample_time, sample_duration));
@@ -1037,6 +1139,63 @@ fn process_mebx(
     pos += len;
   }
 }
+
+/// `true` when a `mebx` TagID resolves (through `%QuickTime::Keys`) to a
+/// `SubDirectory` entry whose value must be re-processed by another module,
+/// rather than stored as a scalar. Currently the only such key is
+/// `smartstyle-info` (QuickTime.pm:6847-6852 → `PLIST::Main` /
+/// `PLIST::ProcessBinaryPLIST`). The other `%QuickTime::Keys` `SubDirectory`
+/// entries (e.g. `binary-plist`, the CMTime sub-structs) are not seen in
+/// SP3-decoded `mebx` timed metadata, so they are not modelled here.
+const fn is_subdir_key(tag_id: &str) -> bool {
+  matches!(tag_id.as_bytes(), b"smartstyle-info")
+}
+
+/// Process a `mebx` `SubDirectory` key's value through the nested module its
+/// `%QuickTime::Keys` entry names. `smartstyle-info` (QuickTime.pm:6847-6852)
+/// dispatches to `Image::ExifTool::PLIST::Main` via
+/// `PLIST::ProcessBinaryPLIST`: the value bytes ARE a binary plist, decoded
+/// into the PLIST tags ExifTool would emit. The decoded tags carry the PLIST
+/// table's family-0 group (`PLIST`) and the camel-cased PLIST key name
+/// (verified against the bundled `-ee -G1:0` oracle, which scopes them under
+/// `Track1:PLIST`); exifast stores them verbatim as rendered [`Tag`]s.
+///
+/// The `PlistMeta` returned by [`crate::formats::plist::parse_borrowed`] OWNS
+/// all its strings (its `'a` lifetime is a phantom), so its `Taggable` stream
+/// is collected into owned [`Tag`]s immediately and the borrow of `value` does
+/// not escape. A value that is not a recognized plist (or an empty/short
+/// value) yields no tags — faithful to `ProcessBinaryPLIST` returning without
+/// emitting (PLIST.pm:453-502 `return 0`).
+#[cfg(feature = "plist")]
+fn process_mebx_subdir(tag_id: &str, value: &[u8], out: &mut QuickTimeStreamMeta) {
+  // Only `smartstyle-info` reaches here (see `is_subdir_key`); its SubDirectory
+  // is `PLIST::Main` + `ProcessBinaryPLIST`.
+  debug_assert_eq!(tag_id, "smartstyle-info");
+  let _ = tag_id;
+  // PLIST.pm `ProcessBinaryPLIST` over the value bytes. The smartstyle PLIST
+  // keys never hit a mode-sensitive `%PLIST::Main` static `PrintConv`
+  // (Duration / GPSLatitude / GPSLongitude are keyed on full reverse-DNS
+  // paths), so the `PrintConv` render equals the `-n` render — collect once in
+  // the default print mode (the `-ee`/`-j` golden mode).
+  if let Ok(Some(meta)) = crate::formats::plist::parse_borrowed(value) {
+    for emitted in crate::emit::Taggable::tags(&meta, crate::emit::ConvMode::PrintConv) {
+      // `Unknown => 1` tags are dropped from default output (every PLIST tag is
+      // always-emitted, so this is a no-op in practice — kept for parity with
+      // the engine's `run_emission` gate).
+      if emitted.unknown() {
+        continue;
+      }
+      out.push_plist_subdir_tag(emitted.into_tag());
+    }
+  }
+}
+
+/// When the `plist` feature is off, a `mebx` `SubDirectory` key cannot be
+/// dispatched (the only such key, `smartstyle-info`, needs the PLIST module);
+/// the value is silently dropped (no scalar fallback — its `%QuickTime::Keys`
+/// entry has no scalar form).
+#[cfg(not(feature = "plist"))]
+fn process_mebx_subdir(_tag_id: &str, _value: &[u8], _out: &mut QuickTimeStreamMeta) {}
 
 /// `ReadValue` for a `mebx` value (QuickTimeStream.pl:2668 — `ReadValue(.., $
 /// format, undef, $len-8)`) — render the `qtFmt`-typed bytes to the displayed
@@ -1619,6 +1778,47 @@ mod tests {
     // negative coordinate works (Perl int truncates toward zero).
     let n = convert_lat_lon(-4737.7053);
     assert!((n + 47.628_421_666_666_67).abs() < 1e-9, "got {n}");
+  }
+
+  #[test]
+  fn live_photo_info_unpacks_le_template() {
+    // QuickTime.pm:6791 `join " ",unpack "VfVVf6c4lCCcclf4Vvv",$val` over a
+    // crafted 80-byte LE value. Mirrors the `QuickTime_mebx_livephoto.mov`
+    // fixture; the expected join matches the bundled `-ee` oracle exactly.
+    let mut v: Vec<u8> = Vec::new();
+    v.extend_from_slice(&1u32.to_le_bytes()); // V
+    v.extend_from_slice(&1.5f32.to_le_bytes()); // f
+    v.extend_from_slice(&2u32.to_le_bytes()); // V
+    v.extend_from_slice(&3u32.to_le_bytes()); // V
+    for x in [0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5] {
+      v.extend_from_slice(&x.to_le_bytes()); // f6
+    }
+    for c in [1i8, -2, 3, -4] {
+      v.push(c as u8); // c4
+    }
+    v.extend_from_slice(&(-1000i32).to_le_bytes()); // l
+    v.push(200); // C
+    v.push(250); // C
+    v.push((-5i8) as u8); // c
+    v.push(7u8); // c
+    v.extend_from_slice(&123_456i32.to_le_bytes()); // l
+    for x in [2.5f32, -3.5, 4.0, 0.125] {
+      v.extend_from_slice(&x.to_le_bytes()); // f4
+    }
+    v.extend_from_slice(&99u32.to_le_bytes()); // V
+    v.extend_from_slice(&1000u16.to_le_bytes()); // v
+    v.extend_from_slice(&65535u16.to_le_bytes()); // v
+    assert_eq!(v.len(), 80, "template consumes exactly 80 bytes");
+    assert_eq!(
+      unpack_live_photo_info(&v).as_deref(),
+      Some(
+        "1 1.5 2 3 0.25 0.5 0.75 1 1.25 1.5 1 -2 3 -4 -1000 200 250 -5 7 123456 2.5 -3.5 4 0.125 99 1000 65535"
+      )
+    );
+    // A value shorter than 80 bytes cannot satisfy the unpack ⇒ None (the
+    // caller falls back to the raw `ReadValue` string).
+    assert_eq!(unpack_live_photo_info(&v[..79]), None);
+    assert_eq!(unpack_live_photo_info(&[]), None);
   }
 
   #[test]

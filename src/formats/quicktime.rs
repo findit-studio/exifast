@@ -2498,6 +2498,23 @@ impl crate::emit::Taggable for Meta<'_> {
         false,
       ));
     }
+    // Tags from a `mebx` `SubDirectory` key (currently only `smartstyle-info`'s
+    // embedded binary PLIST, QuickTime.pm:6847-6852). These were rendered by
+    // the nested PLIST `Taggable` stream and stored as fully-typed [`Tag`]s —
+    // each KEEPS the PLIST table's family-0 group (`PLIST`) and the camel-cased
+    // PLIST key name, faithful to the bundled `-ee -G0`/`-G3` oracle (family-0
+    // `PLIST`, document `Doc<N>`). The family-1 group divergence (the oracle
+    // re-scopes these to the enclosing `Track<N>`, while exifast's flat TagMap
+    // cannot reproduce the per-sample `Doc<N>` shape) is the SAME accepted SP3
+    // limitation as the scalar `mebx` pairs above. Emitted verbatim.
+    for tag in self.stream.plist_subdir_tags() {
+      tags.push(EmittedTag::new(
+        tag.group_ref().clone(),
+        tag.name().into(),
+        tag.value_ref().clone(),
+        false,
+      ));
+    }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
     // `Taggable` stream (`run_emission` has no warning channel). It is drained
