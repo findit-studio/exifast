@@ -1701,7 +1701,16 @@ const _: () = {
       let warning = tm.first_warning();
       let extra = usize::from(warning.is_some());
       let mut map = s.serialize_map(Some(entries.len() + extra))?;
-      for (key, value) in entries {
+      // Build the `"<family1>:<name>"` JSON key ONCE per surviving entry (P1+P4:
+      // the `TagMap` no longer carries a per-insert combined key). A single
+      // reused `String` buffer (cleared each turn) avoids a per-entry alloc.
+      let mut key = std::string::String::new();
+      for (group, name, value) in entries {
+        key.clear();
+        key.reserve(group.len() + 1 + name.len());
+        key.push_str(group);
+        key.push(':');
+        key.push_str(name);
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {

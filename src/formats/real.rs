@@ -2955,7 +2955,10 @@ mod tests {
   /// emission order; `entries()` is first-occurrence order).
   #[cfg(feature = "alloc")]
   fn keys(tm: &crate::tagmap::TagMap) -> Vec<String> {
-    tm.entries().iter().map(|(k, _)| k.to_string()).collect()
+    tm.entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect()
   }
 
   #[cfg(feature = "alloc")]

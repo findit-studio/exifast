@@ -1827,7 +1827,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(k, _)| k.starts_with("ID3v2") || k == "File:ID3Size"),
+        .any(|(g, n, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 trailer tags present in the engine output"
     );
   }

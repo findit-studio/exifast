@@ -1449,7 +1449,7 @@ mod tests {
     // No MPC:* tags emitted (sv7_header is None). The format-tag entries
     // carry the `"<Group1>:<Name>"` keys; warnings live in their own
     // accumulator (`TagMap::warnings`).
-    assert!(w.entries().iter().all(|(k, _)| !k.starts_with("MPC:")));
+    assert!(w.entries().iter().all(|(g, _, _)| g != "MPC"));
     // The warning is pushed through write_warning ⇒ TagMap::warnings.
     assert_eq!(
       w.warnings(),
@@ -1653,9 +1653,9 @@ mod tests {
     // TagMap entries (which preserve first-occurrence position).
     let mut w = TagMap::new();
     emit_via_engine(&meta, true, &mut w);
-    let keys: std::vec::Vec<&str> = w.entries().iter().map(|(k, _)| k.as_str()).collect();
-    let mpc_pos = keys.iter().position(|k| k.starts_with("MPC:"));
-    let ape_pos = keys.iter().position(|k| k.starts_with("APE:"));
+    let keys: std::vec::Vec<&str> = w.entries().iter().map(|(g, _, _)| g.as_str()).collect();
+    let mpc_pos = keys.iter().position(|g| *g == "MPC");
+    let ape_pos = keys.iter().position(|g| *g == "APE");
     if let (Some(mp), Some(ap)) = (mpc_pos, ape_pos) {
       assert!(
         mp < ap,

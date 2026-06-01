@@ -1285,7 +1285,7 @@ mod tests {
     let format_names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("MOI:"))
+      .filter_map(|(g, n, _)| (g == "MOI").then_some(n.as_str()))
       .collect();
     assert_eq!(
       format_names,

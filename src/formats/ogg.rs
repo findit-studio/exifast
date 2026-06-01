@@ -3341,7 +3341,11 @@ mod tests {
     emit_via_engine(&meta, true, &mut tm);
     // The insertion order is exactly the declared-offset order: every key
     // present in the map appears, NOT including the dropped bitrate fields.
-    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    let keys: Vec<String> = tm
+      .entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect();
     assert_eq!(
       keys,
       vec![
@@ -3421,7 +3425,11 @@ mod tests {
     };
     let mut tm = TagMap::new();
     emit_via_engine(&meta, true, &mut tm);
-    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    let keys: Vec<String> = tm
+      .entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect();
     assert_eq!(
       keys,
       vec![
@@ -3456,7 +3464,11 @@ mod tests {
     };
     let mut tm = TagMap::new();
     emit_via_engine(&meta, true, &mut tm);
-    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    let keys: Vec<String> = tm
+      .entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect();
     assert_eq!(
       keys,
       vec![
@@ -3493,7 +3505,11 @@ mod tests {
     };
     let mut tm = TagMap::new();
     emit_via_engine(&meta, true, &mut tm);
-    let keys: Vec<String> = tm.entries().iter().map(|(k, _)| k.to_string()).collect();
+    let keys: Vec<String> = tm
+      .entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect();
     assert_eq!(
       keys,
       vec!["Opus:OpusVersion", "Opus:AudioChannels"],
@@ -3561,7 +3577,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(k, _)| k.starts_with("Vorbis:") && k != "Vorbis:Vendor"),
+        .any(|(g, n, _)| g == "Vorbis" && n != "Vendor"),
       "at least one Vorbis comment beyond vendor: {:?}",
       w.entries()
     );
@@ -3731,11 +3747,11 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(k, _)| k.starts_with("ID3v2") || k == "File:ID3Size"),
+        .any(|(g, n, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 tags present in the engine output"
     );
     assert!(
-      w.entries().iter().any(|(k, _)| k.starts_with("Vorbis:")),
+      w.entries().iter().any(|(g, _, _)| g == "Vorbis"),
       "OGG body tags present in the engine output"
     );
   }

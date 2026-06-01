@@ -1668,10 +1668,7 @@ mod tests {
     let tm = emit_into_tagmap(&meta, true);
     tm.entries()
       .iter()
-      .filter_map(|(k, v)| {
-        k.strip_prefix("Audible:")
-          .map(|n| (n.to_string(), v.clone()))
-      })
+      .filter_map(|(g, n, v)| (g == "Audible").then(|| (n.to_string(), v.clone())))
       .collect()
   }
 

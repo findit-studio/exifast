@@ -2875,7 +2875,7 @@ mod tests {
   fn emit_entries<T: crate::emit::Taggable>(
     meta: &T,
     mode: crate::emit::ConvMode,
-  ) -> Vec<(SmolStr, TagValue)> {
+  ) -> Vec<(SmolStr, SmolStr, TagValue)> {
     let mut tm = crate::tagmap::TagMap::new();
     crate::emit::run_emission(meta, mode, &mut tm);
     tm.entries().to_vec()
@@ -2891,7 +2891,7 @@ mod tests {
   #[test]
   fn id3v1_taggable_matches_reference_emission() {
     // Faithful transcription of `crate::formats::real::emit_id3v1`.
-    fn reference(id3: &Id3v1Meta<'_>, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+    fn reference(id3: &Id3v1Meta<'_>, print_conv: bool) -> Vec<(SmolStr, SmolStr, TagValue)> {
       let mut out = crate::tagmap::TagMap::new();
       let group = "ID3v1";
       if let Some(s) = id3.title() {

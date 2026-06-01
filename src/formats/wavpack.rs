@@ -1422,7 +1422,7 @@ mod tests {
     let names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("File:"))
+      .filter_map(|(g, n, _)| (g == "File").then_some(n.as_str()))
       .collect();
     assert_eq!(
       names,

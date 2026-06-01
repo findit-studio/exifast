@@ -484,6 +484,11 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   // Diagnostics: the FIRST warning + FIRST error reach the document.
   let mut warning: Option<String> = None;
   let mut error: Option<String> = None;
+  // The format-tag sink, filled by the accepted candidate's `serialize_tags`
+  // and serialized DIRECTLY into the document (P4). Declared here (outliving the
+  // candidate loop) so the post-loop `Document` can borrow it; empty until a
+  // candidate is accepted (an unfinalized parse renders just `obj`).
+  let mut tm = crate::tagmap::TagMap::new();
   // `$$self{FILE_TYPE}` bookkeeping (ExifTool.pm:3080): set once finalized.
   let mut finalized = false;
   // Fresh per-candidate cross-format state (mirrors `parse_bytes`).
@@ -752,17 +757,11 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
 
     // ----- Format tags + diagnostics via the typed tag emission ----------
     // Drive the typed Meta's inherent `serialize_tags` into a `TagMap` (the
-    // inline first-wins sink), then merge its entries into the document and
-    // lift its FIRST warning/error.
-    let mut tm = crate::tagmap::TagMap::new();
+    // inline first-wins sink). The FIRST warning/error is lifted into the
+    // document's diagnostics; the format tags are serialized DIRECTLY at the
+    // final step (P4 — no `serde_json::to_value` round-trip + no second key
+    // alloc), see the `Document` serializer below.
     let _ = meta.serialize_tags(print_conv_enabled, &mut tm);
-    for (key, value) in tm.entries() {
-      insert(
-        &mut obj,
-        key.to_string(),
-        serde_json::to_value(value).unwrap_or(Value::Null),
-      );
-    }
     if let Some(w) = tm.first_warning() {
       warning.get_or_insert_with(|| w.to_string());
     }
@@ -782,7 +781,9 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   }
 
   // Generated `ExifTool:Warning` / `ExifTool:Error` join the same dedup set
-  // (ExifTool.pm:2951; only the FIRST of each under default `-j`).
+  // (ExifTool.pm:2951; only the FIRST of each under default `-j`). These are
+  // orchestration keys (`ExifTool:*`), disjoint from the format-tag keyspace,
+  // so they go into `obj` like the `File:*` triplet.
   if let Some(w) = warning {
     insert(&mut obj, "ExifTool:Warning".into(), Value::String(w));
   }
@@ -790,7 +791,83 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     insert(&mut obj, "ExifTool:Error".into(), Value::String(e));
   }
 
-  Value::Array(vec![Value::Object(obj)]).to_string()
+  // Render the single-element `[{ … }]` document. P4: the FORMAT tags serialize
+  // straight through `TagValue`'s own `Serialize` (the `Document` impl below),
+  // dropping the per-tag `serde_json::to_value` intermediate `Value` + the
+  // second `"g:n"` key allocation the old `Map`-merge paid. The orchestration
+  // keys (`SourceFile`, the `File:*` triplet, `ExifTool:ExifToolVersion`,
+  // `ExifTool:Warning`/`Error`) stay in `obj` (a handful of entries; their
+  // `Value`s are already built). `%noDups` first-wins is preserved EXACTLY: a
+  // format tag whose `"<family1>:<name>"` key already exists in `obj` is
+  // skipped (the orchestration value wins), reproducing the old `or_insert`.
+  serde_json::to_string(&Document { obj: &obj, tags: &tm })
+    .unwrap_or_else(|_| Value::Array(vec![Value::Object(obj)]).to_string())
+}
+
+/// The `extract_info` document as a direct `serde::Serialize` (P4): a one-element
+/// array wrapping a flat object of `"<group>:<name>": value` entries. The
+/// orchestration keys (already `serde_json::Value`) come first, then the FORMAT
+/// tags rendered directly through [`TagValue`]'s `Serialize` — no intermediate
+/// `serde_json::Value` per tag. A format tag whose key already appears in `obj`
+/// is skipped, reproducing the old `Map::or_insert` first-wins against the
+/// orchestration keys (the two keyspaces are disjoint in practice, so this only
+/// guards against a future collision; it never fires today).
+#[cfg(feature = "json")]
+struct Document<'a> {
+  obj: &'a serde_json::Map<String, serde_json::Value>,
+  tags: &'a crate::tagmap::TagMap,
+}
+
+#[cfg(feature = "json")]
+impl serde::Serialize for Document<'_> {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(1))?;
+    seq.serialize_element(&DocObject {
+      obj: self.obj,
+      entries: self.tags.entries(),
+    })?;
+    seq.end()
+  }
+}
+
+/// The single per-file object inside the `extract_info` array — its own
+/// `Serialize` so [`Document`] can hand it to `serialize_element`. Emits the
+/// orchestration `obj` entries (already `Value`) then the format tags rendered
+/// directly through [`TagValue`]'s `Serialize` (P4 — no per-tag intermediate
+/// `Value`), with a first-wins skip against `obj`.
+#[cfg(feature = "json")]
+struct DocObject<'a> {
+  obj: &'a serde_json::Map<String, serde_json::Value>,
+  entries: &'a [(smol_str::SmolStr, smol_str::SmolStr, crate::value::TagValue)],
+}
+
+#[cfg(feature = "json")]
+impl serde::Serialize for DocObject<'_> {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = s.serialize_map(Some(self.obj.len() + self.entries.len()))?;
+    // Orchestration keys first (already `Value`).
+    for (k, v) in self.obj {
+      map.serialize_entry(k, v)?;
+    }
+    // Format tags: build the `"g:n"` key once per surviving entry (reusing a
+    // single buffer), skip any key already emitted by `obj` (first-wins), and
+    // serialize the value straight through `TagValue::Serialize`.
+    let mut key = String::new();
+    for (group, name, value) in self.entries {
+      key.clear();
+      key.reserve(group.len() + 1 + name.len());
+      key.push_str(group);
+      key.push(':');
+      key.push_str(name);
+      if self.obj.contains_key(key.as_str()) {
+        continue;
+      }
+      map.serialize_entry(key.as_str(), value)?;
+    }
+    map.end()
+  }
 }
 
 #[cfg(test)]

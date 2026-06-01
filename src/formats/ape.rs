@@ -3463,11 +3463,11 @@ mod tests {
     let desc_idx = tm
       .entries()
       .iter()
-      .position(|(k, _)| k == "APE:CoverArtFrontDesc");
+      .position(|(g, n, _)| g == "APE" && n == "CoverArtFrontDesc");
     let cover_idx = tm
       .entries()
       .iter()
-      .position(|(k, _)| k == "APE:CoverArtFront");
+      .position(|(g, n, _)| g == "APE" && n == "CoverArtFront");
     assert!(desc_idx < cover_idx);
   }
 
@@ -3596,7 +3596,7 @@ mod tests {
     let names: Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("APE:"))
+      .filter_map(|(g, n, _)| (g == "APE").then_some(n.as_str()))
       .collect();
     assert_eq!(names, &["Title", "Artist"]);
     assert_eq!(
