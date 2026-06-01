@@ -2634,6 +2634,7 @@ fn canon_afinfo2_0x26_all_zero_is_suppressed() {
     ByteOrder::Little,
     true,
     Some("Canon EOS 60D"),
+    None,
   );
   // No AFInfo2 leaves emitted, and the typed AF surface stays unset.
   assert!(
@@ -2671,6 +2672,7 @@ fn canon_afinfo2_0x26_only_first_word_zero_is_not_suppressed() {
     ByteOrder::Little,
     true,
     Some("Canon EOS 60D"),
+    None,
   );
   assert!(
     em.iter()
@@ -2718,6 +2720,7 @@ fn canon_afinfo3_0x3c_dispatches_to_afinfo2_and_suppresses_primary() {
     ByteOrder::Little,
     true,
     Some("Canon PowerShot G1 X Mark II"),
+    None,
   );
   let find = |n: &str| em.iter().find(|e| e.name() == n).map(|e| e.value().clone());
   assert_eq!(

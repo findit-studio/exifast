@@ -92,6 +92,40 @@ struct FileTypeTriplet {
   mime_type: String,
 }
 
+/// The resolved `$fileType` NAME — the string ExifTool ultimately stores as
+/// `File:FileType` (ExifTool.pm:9684-9692). It is the explicit `file_type` arg
+/// (the `SetFileType($ft)` argument) or `base_type` when none, AFTER the
+/// sub-type-by-ext promotion (ExifTool.pm:9686-9692). Borrows from its inputs
+/// (no allocation, no `apply`), so it can be reused both by [`resolve_file_type`]
+/// (which then resolves the MIME + extension triplet) and by
+/// [`finalized_tiff_file_type`] (which needs ONLY the name to thread the
+/// finalized `$$self{FILE_TYPE}` into the standalone-TIFF parse). This is the
+/// computation that makes `File:FileType` and the threaded container type ONE
+/// value — e.g. a `.crw`-named TIFF resolves to `"TIFF"` here (CRW's base module
+/// is `CanonRaw`, not TIFF, and `"CRW"` has no `RAW` substring — see
+/// [`finalized_tiff_file_type`]), never `"CRW"`.
+fn resolved_file_type_name<'a>(
+  base_type: &'a str,
+  file_type: Option<&'a str>,
+  ext: Option<&'a str>,
+) -> &'a str {
+  // ExifTool.pm:9684 `$fileType or $fileType = $baseType`.
+  let mut ft: &str = file_type.unwrap_or(base_type);
+  // ExifTool.pm:9686-9692 — handle sub-types identified by extension.
+  if let Some(ext) = ext {
+    if ext != ft {
+      let f = crate::filetype::file_type_lookup_root(ft);
+      let e = crate::filetype::file_type_lookup_root(ext);
+      if let (Some(fr), Some(er)) = (f, e) {
+        if fr == er && (fr == ft || !crate::filetype::file_type_lookup_defined(fr)) {
+          ft = ext;
+        }
+      }
+    }
+  }
+  ft
+}
+
 /// Pure `SetFileType` resolution (ExifTool.pm:9677-9706) — the COMPUTATION
 /// half of [`ParseContext::set_file_type`], factored out so both the writer
 /// path (legacy) and the typed serde path ([`extract_info`]) share ONE
@@ -110,20 +144,10 @@ fn resolve_file_type(
   ext: Option<&str>,
   print_conv: bool,
 ) -> FileTypeTriplet {
-  // ExifTool.pm:9684 `$fileType or $fileType = $baseType`.
-  let mut ft: &str = file_type.unwrap_or(base_type);
-  // ExifTool.pm:9686-9692 — handle sub-types identified by extension.
-  if let Some(ext) = ext {
-    if ext != ft {
-      let f = crate::filetype::file_type_lookup_root(ft);
-      let e = crate::filetype::file_type_lookup_root(ext);
-      if let (Some(fr), Some(er)) = (f, e) {
-        if fr == er && (fr == ft || !crate::filetype::file_type_lookup_defined(fr)) {
-          ft = ext;
-        }
-      }
-    }
-  }
+  // ExifTool.pm:9684-9692 — the resolved `$fileType` NAME (the explicit arg or
+  // base, then the sub-type-by-ext promotion). Shared with the standalone-TIFF
+  // dispatch so `File:FileType` and the threaded `$$self{FILE_TYPE}` agree.
+  let ft: &str = resolved_file_type_name(base_type, file_type, ext);
   // ExifTool.pm:9693 `$mimeType or $mimeType = $mimeType{$fileType}`.
   let mut mime = mime_type(ft);
   // ExifTool.pm:9695 base-type MIME fallback (TIFF excluded).
@@ -178,24 +202,67 @@ fn tiff_finalize_file_type(
   ext: Option<&str>,
   print_conv: bool,
 ) -> FileTypeTriplet {
-  // ExifTool.pm:8685 `if ($fileType and ...)` — an empty Parent (dotless /
-  // embedded TIFF) skips the re-finalization; bundled keeps the bare
-  // detected `"TIFF"` from the detection-time `SetFileType()`.
+  // ExifTool.pm:8685-8690 `$t = ($baseType eq 'TIFF' or $fileType =~ /RAW/) ?
+  // $fileType : undef` (the empty-Parent guard ⇒ `None`). ExifTool.pm:8693
+  // `$self->SetFileType($t)` — `$$self{FILE_TYPE}` stays the detection `$type`
+  // (`base_type`), the explicit arg is `$t`.
+  let t = tiff_finalized_type_arg(parent_type);
+  resolve_file_type(base_type, t, ext, print_conv)
+}
+
+/// The `$t` argument `DoProcessTIFF` feeds to `SetFileType` (ExifTool.pm:8685-
+/// 8690) — the COMPUTATION shared by [`tiff_finalize_file_type`] (which then
+/// resolves the full `File:*` triplet) and [`finalized_tiff_file_type`] (which
+/// composes it with the ext promotion to get the finalized `$$self{FILE_TYPE}`
+/// NAME). `None` for an empty `parent_type` (dotless / embedded TIFF — the
+/// `if ($fileType ...)` guard at ExifTool.pm:8685 is false, so bundled never
+/// re-finalizes, keeping the detection-time bare `"TIFF"`), or when the parent's
+/// base module is not `TIFF` AND `parent_type` has no `RAW` substring; otherwise
+/// `Some(parent_type)`. (Perl's `$baseType` here is the base MODULE of
+/// `$fileType`==`parent_type`, computed below — NOT the outer detection
+/// `$$self{FILE_TYPE}`.) Borrows `parent_type`.
+#[cfg(feature = "exif")]
+fn tiff_finalized_type_arg(parent_type: &str) -> Option<&str> {
+  // ExifTool.pm:8685 `if ($fileType and ...)` — an empty Parent skips the
+  // re-finalization (⇒ `$t` undef).
   if parent_type.is_empty() {
-    return resolve_file_type(base_type, None, ext, print_conv);
+    return None;
   }
   // ExifTool.pm:8687-8689 `$baseType` = first module of `$fileType`'s row.
   let base_module = crate::filetype::file_type_base_module(parent_type);
   // ExifTool.pm:8690 `$t = ($baseType eq 'TIFF' or $fileType =~ /RAW/) ?
   // $fileType : undef`.
-  let t: Option<&str> = if base_module == "TIFF" || parent_type.contains("RAW") {
+  if base_module == "TIFF" || parent_type.contains("RAW") {
     Some(parent_type)
   } else {
     None
-  };
-  // ExifTool.pm:8693 `$self->SetFileType($t)` — `$$self{FILE_TYPE}` stays
-  // the detection `$type` (`base_type`), the explicit arg is `$t`.
-  resolve_file_type(base_type, t, ext, print_conv)
+  }
+}
+
+/// The FINALIZED `$$self{FILE_TYPE}` NAME for a standalone-TIFF parse — the
+/// exact string [`extract_info`] emits as `File:FileType` (so the two never
+/// diverge). It is [`resolved_file_type_name`] applied to the
+/// [`tiff_finalized_type_arg`] `$t`: e.g. a plain `.tif` ⇒ `"TIFF"`, a TIFF-
+/// rooted RAW subtype (`.nef`/`.cr2`/…) ⇒ that subtype (`"NEF"`/`"CR2"`/…), and
+/// crucially a `.crw`-named TIFF ⇒ `"TIFF"` — because `CRW`'s base module is
+/// `CanonRaw` (NOT `TIFF`) and `"CRW"` has no `RAW` substring, so
+/// [`tiff_finalized_type_arg`] returns `None` ⇒ the name stays the detected
+/// `base_type` (`"TIFF"`), never `"CRW"`.
+///
+/// This is the value the engine threads into the standalone-TIFF parse as the
+/// container `$$self{FILE_TYPE}` (the `Canon::ShotInfo` pos-22 CRW-allows-0
+/// RawConv, Canon.pm:2977/:2990, keys on it) — provably never `"CRW"` in the
+/// port (there is no CIFF/CRW front-end, and `CRW` is never a TIFF-base/RAW
+/// promotion), so the CRW branch stays correctly dead while the gate now checks
+/// the RIGHT variable.
+#[cfg(feature = "exif")]
+pub(crate) fn finalized_tiff_file_type(
+  base_type: &str,
+  parent_type: &str,
+  ext: Option<&str>,
+) -> String {
+  let t = tiff_finalized_type_arg(parent_type);
+  resolved_file_type_name(base_type, t, ext).to_string()
 }
 
 /// Pure `OverrideFileType` resolution (ExifTool.pm:9712-9730) — the
@@ -1026,6 +1093,51 @@ mod tests {
     );
   }
 
+  /// The finalized `$$self{FILE_TYPE}` NAME ([`finalized_tiff_file_type`]) —
+  /// the value the standalone-TIFF dispatch threads as the container type for
+  /// the `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv — must EQUAL the
+  /// `File:FileType` ([`tiff_finalize_file_type`]`.file_type`) for every
+  /// candidate `Parent`, and is **provably never `"CRW"`**.
+  ///
+  /// The load-bearing case (Codex R6 bug): a `.crw`-named TIFF-magic file. Its
+  /// candidate `Parent` is `"CRW"` (the uppercased extension), but its finalized
+  /// `FILE_TYPE` is `"TIFF"` — `CRW`'s base module is `CanonRaw` (NOT `TIFF`)
+  /// and `"CRW"` has no `RAW` substring, so `DoProcessTIFF`'s `$t` is undef ⇒ the
+  /// name stays the detected `"TIFF"`. Threading the bare `Parent` (the bug) would
+  /// wrongly fire the CRW branch (keep a raw-0 ExposureTime); threading this
+  /// finalized type does NOT.
+  #[cfg(feature = "exif")]
+  #[test]
+  fn finalized_tiff_file_type_never_crw_and_matches_filetype() {
+    // (candidate Parent, ext) ⇒ finalized FILE_TYPE. Includes the .crw-named
+    // TIFF (Parent "CRW" ⇒ "TIFF"), a plain .tif, TIFF-rooted RAW subtypes
+    // (promote), a non-TIFF-root parent (X3F ⇒ stays TIFF), and the empty /
+    // dotless Parent.
+    for (parent, ext, want) in [
+      ("CRW", Some("CRW"), "TIFF"), // the bug: Parent "CRW" but FILE_TYPE "TIFF".
+      ("TIFF", Some("TIFF"), "TIFF"),
+      ("NEF", Some("NEF"), "NEF"),
+      ("CR2", Some("CR2"), "CR2"),
+      ("3FR", Some("3FR"), "3FR"),
+      ("RAW", Some("RAW"), "RAW"),
+      ("X3F", Some("X3F"), "TIFF"), // non-TIFF-root, no RAW substring ⇒ $t undef.
+      ("", None, "TIFF"),           // dotless / embedded ⇒ guard false ⇒ "TIFF".
+    ] {
+      let finalized = finalized_tiff_file_type("TIFF", parent, ext);
+      assert_eq!(
+        finalized, want,
+        "finalized FILE_TYPE for Parent={parent:?} ext={ext:?}"
+      );
+      assert_ne!(finalized, "CRW", "the finalized FILE_TYPE is never CRW");
+      // It MUST equal the `File:FileType` the engine emits (same computation).
+      let emitted = tiff_finalize_file_type("TIFF", parent, ext, true).file_type;
+      assert_eq!(
+        finalized, emitted,
+        "finalized FILE_TYPE must match File:FileType for Parent={parent:?}"
+      );
+    }
+  }
+
   #[test]
   fn set_file_type_base_mime_fallback_and_tiff_exclusion() {
     // ExifTool.pm:9695 `$mimeType = $mimeType{$baseType} unless $mimeType or
@@ -1042,6 +1154,95 @@ mod tests {
     // Sanity: base TIFF, no override ⇒ image/tiff directly.
     let t3 = resolve_file_type("TIFF", None, None, true);
     assert_eq!(t3.mime_type, "image/tiff");
+  }
+
+  /// END-TO-END regression for the Codex R6 bug: a `.crw`-named TIFF-magic
+  /// file must finalize to `File:FileType == "TIFF"` (NOT "CRW"), so the
+  /// container `$$self{FILE_TYPE}` threaded into `Canon::ShotInfo` position
+  /// 22's RawConv (`Canon.pm:2977`/`:2990`) is "TIFF" ⇒ a raw-0 ExposureTime is
+  /// DROPPED (the `FILE_TYPE eq "CRW"` clause is false), matching bundled.
+  ///
+  /// Before the fix, the engine threaded the candidate `Parent` ("CRW" for a
+  /// `.crw` name) instead of the finalized `FILE_TYPE` ("TIFF"), so the CRW
+  /// branch wrongly fired and KEPT the raw-0 ExposureTime — this test would
+  /// fail (an `…:ExposureTime` key would be present).
+  ///
+  /// The fixture is a minimal little-endian TIFF: IFD0 = Make "Canon\0" +
+  /// ExifIFD pointer; ExifIFD = a `0x927C` MakerNote; the MakerNote is a Canon
+  /// IFD with one `ShotInfo` (tag `0x0004`, int16[23], all zero ⇒ pos-22 raw 0,
+  /// stored out-of-line at an absolute file offset — Canon inherits base 0).
+  #[cfg(all(feature = "json", feature = "exif"))]
+  #[test]
+  fn crw_named_tiff_finalizes_to_tiff_and_drops_shotinfo_exposuretime() {
+    // Little-endian TIFF. Offsets (absolute, base 0):
+    //   0   header: "II" 0x2a 0x00, IFD0 = 8
+    //   8   IFD0 (2 entries): 8..38
+    //   38  Make string "Canon\0": 38..44
+    //   44  ExifIFD (1 entry): 44..62
+    //   62  MakerNote = Canon IFD (1 entry): 62..80
+    //   80  ShotInfo int16[23] = 46 bytes of zero: 80..126
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[b'I', b'I', 0x2a, 0x00]); // II, magic 42
+    t.extend_from_slice(&8u32.to_le_bytes()); // IFD0 @ 8
+    // --- IFD0 @ 8 (2 entries) ---
+    t.extend_from_slice(&2u16.to_le_bytes());
+    // Make (0x010f) ASCII(2) count=6 ⇒ out-of-line @ 38.
+    t.extend_from_slice(&0x010fu16.to_le_bytes());
+    t.extend_from_slice(&2u16.to_le_bytes());
+    t.extend_from_slice(&6u32.to_le_bytes());
+    t.extend_from_slice(&38u32.to_le_bytes());
+    // ExifIFD (0x8769) LONG(4) count=1 ⇒ value = 44.
+    t.extend_from_slice(&0x8769u16.to_le_bytes());
+    t.extend_from_slice(&4u16.to_le_bytes());
+    t.extend_from_slice(&1u32.to_le_bytes());
+    t.extend_from_slice(&44u32.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes()); // IFD0 next = 0
+    debug_assert_eq!(t.len(), 38);
+    // --- Make string @ 38 ---
+    t.extend_from_slice(b"Canon\x00");
+    debug_assert_eq!(t.len(), 44);
+    // --- ExifIFD @ 44 (1 entry: MakerNote) ---
+    t.extend_from_slice(&1u16.to_le_bytes());
+    // MakerNote (0x927c) UNDEF(7) count=64 ⇒ value @ 62 (the Canon IFD: 62..126).
+    t.extend_from_slice(&0x927cu16.to_le_bytes());
+    t.extend_from_slice(&7u16.to_le_bytes());
+    t.extend_from_slice(&64u32.to_le_bytes());
+    t.extend_from_slice(&62u32.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes()); // ExifIFD next = 0
+    debug_assert_eq!(t.len(), 62);
+    // --- MakerNote = Canon IFD @ 62 (1 entry: ShotInfo) ---
+    t.extend_from_slice(&1u16.to_le_bytes());
+    // ShotInfo (0x0004) int16(3) count=23 ⇒ out-of-line @ 80 (absolute).
+    t.extend_from_slice(&0x0004u16.to_le_bytes());
+    t.extend_from_slice(&3u16.to_le_bytes());
+    t.extend_from_slice(&23u32.to_le_bytes());
+    t.extend_from_slice(&80u32.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes()); // Canon IFD next = 0
+    debug_assert_eq!(t.len(), 80);
+    // --- ShotInfo int16[23] all zero @ 80 (pos-22 raw = 0) ---
+    t.extend_from_slice(&[0u8; 46]);
+    debug_assert_eq!(t.len(), 126);
+
+    let obj = engine_obj("x.crw", &t, true);
+    // The `.crw`-named TIFF-magic file finalizes to FileType "TIFF" (NOT "CRW").
+    assert_eq!(
+      obj.get("File:FileType").and_then(|v| v.as_str()),
+      Some("TIFF"),
+      "a .crw-named TIFF-magic file must finalize to FileType TIFF"
+    );
+    // The Make round-tripped (proves the Canon MakerNote dispatch ran).
+    assert_eq!(
+      obj.get("IFD0:Make").and_then(|v| v.as_str()),
+      Some("Canon"),
+      "IFD0:Make should be Canon (the Canon vendor dispatch keys on it)"
+    );
+    // The raw-0 ShotInfo ExposureTime is DROPPED (FILE_TYPE is "TIFF", not
+    // "CRW") — NO key bears an ExposureTime name.
+    let exposure_keys: Vec<&String> = obj.keys().filter(|k| k.contains("ExposureTime")).collect();
+    assert!(
+      exposure_keys.is_empty(),
+      "raw-0 ShotInfo ExposureTime must be DROPPED for a TIFF (non-CRW) container, got: {exposure_keys:?}"
+    );
   }
 
   #[cfg(feature = "json")]
