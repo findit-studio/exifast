@@ -26,6 +26,7 @@ mod domain;
 pub(crate) mod png;
 pub mod project;
 mod quicktime;
+mod quicktime_stream;
 
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
@@ -36,3 +37,4 @@ pub use png::{
 };
 pub use project::Project;
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
+pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};

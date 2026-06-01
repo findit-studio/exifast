@@ -1021,6 +1021,18 @@ impl AnyMeta<'_> {
         if let Some(w) = m.warning() {
           out.write_warning(w)?;
         }
+        // SP3: the embedded-Exif hop deferral. ExifTool dispatches certain
+        // atoms (`QVMI` Casio, `MVTG` FujiFilm, `uuid`-Exif) to
+        // `Image::ExifTool::Exif::ProcessExif` (QuickTime.pm:2058-2110);
+        // exifast's QuickTime-side detection ran (`embedded_exif_deferred`)
+        // but the IFD parse is DEFERRED. Surface the gap as a warning so it is
+        // visible (cf. docs/tracking.md). This is the golden-pattern home for
+        // the warning the retired SP3 `serialize_tags` emitted last.
+        if m.embedded_exif_deferred() {
+          out.write_warning(
+            "Embedded Exif/TIFF block detected; parse deferred (awaiting Exif+GPS port)",
+          )?;
+        }
         Ok(())
       }
       #[cfg(feature = "mxf")]

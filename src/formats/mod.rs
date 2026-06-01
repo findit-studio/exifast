@@ -49,6 +49,10 @@ pub mod ogg;
 pub mod png;
 #[cfg(feature = "quicktime")]
 pub mod quicktime;
+// QuickTime SP3 — embedded timed GPS metadata (QuickTimeStream.pl). A
+// sub-module of the QuickTime port; gated on the same `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod quicktime_stream;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]
