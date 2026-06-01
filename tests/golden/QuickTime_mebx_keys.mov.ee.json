@@ -1,5 +1,5 @@
 [{
-  "SourceFile": "QuickTime_mebx_gps.mov",
+  "SourceFile": "QuickTime_mebx_keys.mov",
   "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "MOV",
   "File:FileTypeExtension": "mov",
@@ -7,7 +7,7 @@
   "QuickTime:MajorBrand": "Apple QuickTime (.MOV/QT)",
   "QuickTime:MinorVersion": "0.0.0",
   "QuickTime:CompatibleBrands": ["qt  "],
-  "QuickTime:MediaDataSize": 12,
+  "QuickTime:MediaDataSize": 22,
   "QuickTime:MediaDataOffset": 28,
   "QuickTime:MovieHeaderVersion": 0,
   "QuickTime:CreateDate": "0000:00:00 00:00:00",
@@ -31,8 +31,7 @@
   "Track1:TrackDuration": "1.00 s",
   "Track1:TrackLayer": 0,
   "Track1:TrackVolume": "0.00%",
-  "Track1:MatrixStructure": "0 0 6.103515625e-05 0 0 0 1 0 0",
-  "Track1:ImageHeight": 16384,
+  "Track1:MatrixStructure": "1 0 0 0 1 0 0 0 1",
   "Track1:MediaHeaderVersion": 0,
   "Track1:MediaCreateDate": "0000:00:00 00:00:00",
   "Track1:MediaModifyDate": "0000:00:00 00:00:00",
@@ -43,5 +42,6 @@
   "Track1:MetaFormat": "mebx",
   "Track1:SampleTime": "0 s",
   "Track1:SampleDuration": "1.00 s",
-  "Track1:GPSCoordinates": 123456
+  "Track1:SceneIlluminance": 1234,
+  "Track1:TestFooBar": "hi"
 }]
