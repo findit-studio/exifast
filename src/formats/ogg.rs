@@ -1805,7 +1805,6 @@ impl FormatParser for ProcessOgg {
   /// GAT: the Meta borrows from the input `'a` directly (Codex AF2).
   type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
   /// Parse an Ogg file's bytes into a typed [`Meta`].
   ///
@@ -1830,7 +1829,7 @@ impl FormatParser for ProcessOgg {
   ///
   /// A fresh [`crate::format_parser::SharedFlags`] is constructed per
   /// call (the trait's `&[u8]` Context has no chain state to thread).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // `ogg = ["flac", "id3"]` per Cargo.toml ⇒ `parse_full_chained` is
     // always present here.
     let mut shared = crate::format_parser::SharedFlags::default();
@@ -1863,7 +1862,7 @@ impl FormatParser for ProcessOgg {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
   // `ogg = ["id3", "flac"]` per Cargo.toml ⇒ `id3` is always present here.
   let mut shared = crate::format_parser::SharedFlags::default();
   parse_full_chained(data, &mut shared, print_conv_enabled)
@@ -1901,14 +1900,13 @@ pub(crate) fn parse_full_chained<'a>(
   data: &'a [u8],
   shared: &mut crate::format_parser::SharedFlags,
   print_conv: bool,
-) -> Result<Option<Meta<'a>>, Error> {
+) -> Option<Meta<'a>> {
   // 1. Embedded ID3 (Ogg.pm:79-83). The recursion guard (ID3.pm:1435 `return
   //    0 if $$et{DoneID3}`) is honoured here via `shared.done_id3().is_none()`:
   //    only call when ID3 has not already run on this chain (a standalone
   //    OGG file-type entry always gets a fresh `SharedFlags`).
   let (id3, hdr_end) = if shared.done_id3().is_none() {
     crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
-      .unwrap_or((None, 0))
   } else {
     (None, shared.id3_hdr_end().unwrap_or(0))
   };
@@ -1918,16 +1916,16 @@ pub(crate) fn parse_full_chained<'a>(
   //    `ape::parse_full_chained` (the body parser sees the bytes starting at
   //    the post-ID3-header offset).
   let body_slice = data.get(hdr_end..).unwrap_or(&[]);
-  match parse_inner(body_slice, print_conv)? {
+  match parse_inner(body_slice, print_conv) {
     Some(mut meta) => {
       meta.id3 = id3;
-      Ok(Some(meta))
+      Some(meta)
     }
     // `parse_inner` always returns `Some` today (the typed Meta carries
     // `success` even for non-OGG input). The `None` arm is reachable only
     // if a future revision starts rejecting on Rust-level errors; treat as
     // "no Meta" so the candidate loop continues.
-    None => Ok(None),
+    None => None,
   }
 }
 
@@ -1936,7 +1934,7 @@ pub(crate) fn parse_full_chained<'a>(
 /// re: zero-alloc revisit). The [`FormatParser::Meta`] GAT (`type
 /// Meta<'a> = Meta<'a>`) returns this borrowed form directly into the
 /// closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
-fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
   // Stage the legacy push-style emissions into a side `Metadata` so the
   // bundled-faithful list-coalesce + name-synthesis paths stay byte-exact
   // (faithful to Vorbis.pm:154-210 + ExifTool.pm:9505-9520). The side
@@ -2147,7 +2145,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     .map(|w| staged_warning_to_owned(w.as_str()))
     .collect();
   let comments: Vec<Comment> = staging.tags_slice().iter().map(tag_to_comment).collect();
-  Ok(Some(Meta {
+  Some(Meta {
     #[cfg(feature = "id3")]
     id3: None,
     file_type_override,
@@ -2158,7 +2156,7 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Result<Option<Meta<'_>>
     warnings,
     success,
     _marker: core::marker::PhantomData,
-  }))
+  })
 }
 
 /// First-wins outcome reducer. Bundled `OverrideFileType`
@@ -2252,24 +2250,6 @@ fn tag_to_comment(tag: &crate::value::Tag) -> Comment {
     )),
   }
 }
-
-// ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for OGG parsing. Currently empty — every parse
-/// failure surfaces as `success == false` on the returned [`Meta`]
-/// (Perl `return 0`) so the bridge can emit the engine-level `ExifTool:
-/// Error => "File format error"`. Reserved for future I/O wrappers if
-/// streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
-/// `default-features = false` ⇒ `core::error::Error` in every feature
-/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
-/// without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
 
 // ===========================================================================
 // `Taggable` — the golden-pattern emission path
@@ -3014,7 +2994,7 @@ mod tests {
   fn parse_borrowed_rejects_short_buffer() {
     // 4-byte OggS magic only — ProcessOGG never accepts a page, so success
     // is false but the typed Meta still exists with empty comments/warnings.
-    let meta = parse_borrowed(b"OggS", true).expect("ok").expect("meta");
+    let meta = parse_borrowed(b"OggS", true).expect("meta");
     assert!(!meta.success());
     assert!(meta.comments().is_empty());
     assert!(meta.warnings().is_empty());
@@ -3124,9 +3104,7 @@ mod tests {
   fn format_parser_trait_returns_borrowed_meta() {
     // GAT path: `Meta<'a> = Meta<'a>` (phantom `'a`). Drive the trait
     // API with empty bytes and confirm the shape.
-    let meta: Meta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"")
-      .expect("ok")
-      .expect("meta");
+    let meta: Meta<'_> = <ProcessOgg as FormatParser>::parse(&ProcessOgg, b"").expect("meta");
     assert!(!meta.success());
   }
 
@@ -3573,7 +3551,7 @@ mod tests {
   #[test]
   fn taggable_emits_vorbis_comments() {
     let data = fixture("Vorbis.ogg");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     // Vendor is always emitted (Vorbis.pm:181-187).
@@ -3597,7 +3575,7 @@ mod tests {
   #[test]
   fn taggable_emits_vorbis_interleaved_list() {
     let data = fixture("ogg_vorbis_interleaved_list.ogg");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     // Find the coalesced list comment (ARTIST/PERFORMER/CONTACT) in the
     // typed Meta to learn its name + expected values.
     let list = meta
@@ -3636,7 +3614,7 @@ mod tests {
   #[test]
   fn taggable_emits_opus_header() {
     let data = fixture("synthetic_opus_minimal.opus");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     assert!(
       meta.opus_header().is_some(),
       "fixture carries an OpusHead packet"
@@ -3660,7 +3638,7 @@ mod tests {
   #[test]
   fn taggable_emits_metadata_block_picture() {
     let data = fixture("Opus.opus");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     assert!(
       !meta.pictures().is_empty(),
       "Opus.opus carries a METADATA_BLOCK_PICTURE"
@@ -3691,7 +3669,7 @@ mod tests {
     // Opus.opus exercises Opus:* header tags + FLAC:* Picture sub-fields +
     // Vorbis:* comments in one stream.
     let data = fixture("Opus.opus");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty());
     let mut saw_opus = false;
@@ -3729,7 +3707,7 @@ mod tests {
   #[cfg(feature = "id3")]
   fn taggable_chains_id3_before_ogg_body() {
     let data = fixture("ogg_id3_prefixed.ogg");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
     let names: Vec<String> = meta
       .tags(ConvMode::PrintConv)
@@ -3806,7 +3784,7 @@ mod tests {
   fn project_is_audio_only_no_duration() {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("Vorbis.ogg");
-    let meta = parse_borrowed(&data, true).unwrap().unwrap();
+    let meta = parse_borrowed(&data, true).unwrap();
     let md = Project::project(&meta);
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
     assert!(md.media().duration().is_none());

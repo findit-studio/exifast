@@ -1589,9 +1589,8 @@ fn plist_trunc_bin_conformance() {
 fn plist_trunc_bin_parse_bytes_recognized() {
   let trunc: &[u8] = b"bplist00";
   // Typed public dispatch must recognize it (not `Ok(None)`).
-  let meta = exifast::parse_bytes(trunc)
-    .expect("parse_bytes is infallible for PLIST")
-    .expect("truncated bplist00 is a RECOGNIZED PLIST, not Ok(None)");
+  let meta =
+    exifast::parse_bytes(trunc).expect("truncated bplist00 is a RECOGNIZED PLIST, not Ok(None)");
   match meta {
     exifast::format_parser::AnyMeta::Plist(p) => {
       assert!(p.format().is_binary(), "binary plist");
@@ -5677,9 +5676,7 @@ fn h264_conformance() {
       let golden_name = format!("{fixture}.h264.{suffix}");
       let want = std::fs::read_to_string(format!("{root}/tests/golden/h264/{golden_name}"))
         .unwrap_or_else(|e| panic!("read golden {golden_name}: {e}"));
-      let meta = exifast::parse_h264(&data)
-        .expect("parse_h264 must not error")
-        .expect("synthetic H264 stream must be accepted");
+      let meta = exifast::parse_h264(&data).expect("synthetic H264 stream must be accepted");
       let any = AnyMeta::H264(meta);
       let got = serde_json::to_string(&Rendered::new(&any, print_on)).expect("render H264 meta");
       if let Err(e) = json_equivalent(&got, &want) {
@@ -5707,9 +5704,7 @@ fn h264_oos_mdpm_n_emits_json_number() {
   let root = env!("CARGO_MANIFEST_DIR");
   let data = std::fs::read(format!("{root}/tests/golden/h264/h264_oos_mdpm.h264"))
     .expect("read h264_oos_mdpm fixture");
-  let meta = exifast::parse_h264(&data)
-    .expect("parse_h264 must not error")
-    .expect("h264_oos_mdpm must be accepted");
+  let meta = exifast::parse_h264(&data).expect("h264_oos_mdpm must be accepted");
   let any = AnyMeta::H264(meta);
 
   // `-n` (print_conv = false): WhiteBalance must be a bare JSON NUMBER.
@@ -5747,9 +5742,7 @@ fn h264_forbidden_bit_surfaces_warning() {
   use exifast::{AnyMeta, Rendered};
 
   let data: [u8; 5] = [0x00, 0x00, 0x00, 0x01, 0x86];
-  let meta = exifast::parse_h264(&data)
-    .expect("parse_h264 must not error")
-    .expect("a stream with a start code must be accepted");
+  let meta = exifast::parse_h264(&data).expect("a stream with a start code must be accepted");
   let any = AnyMeta::H264(meta);
 
   for print_on in [true, false] {

@@ -595,7 +595,6 @@ impl FormatParser for ProcessMpc {
   /// Chained-format Context: `data + SharedFlags`. See [`Context`].
   type Context<'a> = Context<'a>;
   /// Rust-level fatal error (currently none — every bad input is `Ok(None)`).
-  type Error = Error;
 
   /// Parse an MPC file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid MP+ stream (short read or wrong magic; MPC.pm:92).
@@ -614,10 +613,10 @@ impl FormatParser for ProcessMpc {
   /// `parse_mpc` was fixed in R4 — R5 propagates the chain down to ALL
   /// public surfaces). The Context's `shared` reference threads the
   /// `DoneID3`/`DoneAPE` cross-recursion state through the chain.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
     // present here.
-    Ok(parse_full_chained(ctx.data, ctx.shared))
+    parse_full_chained(ctx.data, ctx.shared)
   }
 }
 
@@ -638,11 +637,11 @@ impl FormatParser for ProcessMpc {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
   // present here.
   let mut shared = crate::format_parser::SharedFlags::default();
-  Ok(parse_full_chained(data, &mut shared))
+  parse_full_chained(data, &mut shared)
 }
 
 /// Inner parser — produces a borrow-from-input [`Meta`] from the MPC
@@ -657,15 +656,15 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 /// Takes an `offset` (the post-ID3-prefix offset, or 0) so a typed
 /// caller that already ran ID3 (e.g. `parse_full_chained`) can pass the
 /// body offset and avoid re-detecting the prefix.
-fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner_at(data: &[u8], offset: usize) -> Option<Meta<'_>> {
   let body = data.get(offset..).unwrap_or(&[]);
   // MPC.pm:92 `$raf->Read($buff,32) == 32 and $buff =~ /^MP\+(.)/s or return 0`.
   if body.len() < 32 {
-    return Ok(None); // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
+    return None; // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
   }
   let hdr = &body[..32];
   if &hdr[..3] != b"MP+" {
-    return Ok(None); // magic mismatch ⇒ Perl regex no-match ⇒ return 0
+    return None; // magic mismatch ⇒ Perl regex no-match ⇒ return 0
   }
   // MPC.pm:93 `my $vers = ord($1) & 0x0f` — low nibble of byte 3.
   let version = hdr[3] & 0x0f;
@@ -681,7 +680,7 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error>
     (None, true)
   };
 
-  Ok(Some(Meta {
+  Some(Meta {
     version,
     sv7_header,
     warn_unsupported_version,
@@ -689,7 +688,7 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Result<Option<Meta<'_>>, Error>
     id3: None,
     #[cfg(feature = "ape")]
     ape: None,
-  }))
+  })
 }
 
 /// Full MPC parse with the embedded ID3 prefix (MPC.pm:84-87) and APE
@@ -727,7 +726,6 @@ pub(crate) fn parse_full_chained<'a>(
   // recursion guard (ID3.pm:1435).
   let (id3, hdr_end) = if shared.done_id3().is_none() {
     crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
-      .unwrap_or((None, 0))
   } else {
     (None, shared.id3_hdr_end().unwrap_or(0))
   };
@@ -736,7 +734,7 @@ pub(crate) fn parse_full_chained<'a>(
   // magic-miss (MPC.pm:92), drop everything (including the ID3 prefix) so
   // the `parse_any` candidate loop tries the next type. Same semantics as
   // APE's body-magic gate.
-  let mut meta = parse_inner_at(data, hdr_end).ok()??;
+  let mut meta = parse_inner_at(data, hdr_end)?;
   meta.id3 = id3;
 
   // 3. APE trailer (MPC.pm:111-113 `require Image::ExifTool::APE;
@@ -1066,22 +1064,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for MPC parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
-/// `default-features = false` ⇒ `core::error::Error` in every feature
-/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
-/// without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -1275,14 +1257,14 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(b"MP+\x07").unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(b"MP+\x07").is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_non_mpc_magic() {
     let data = [0u8; 32];
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   #[test]
@@ -1296,7 +1278,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MPC.mpc"),
     )
     .expect("read MPC.mpc fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert_eq!(meta.version(), 0x07);
     let h = meta.sv7_header().expect("SV7 header present");
     assert_eq!(h.total_frames(), 102);
@@ -1341,7 +1323,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sv8.mpc"),
     )
     .expect("read sv8.mpc fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert_eq!(meta.version(), 0x08);
     assert!(meta.sv7_header().is_none());
     assert!(meta.warn_unsupported_version());
@@ -1356,9 +1338,7 @@ mod tests {
     .expect("read MPC.mpc fixture");
     let mut shared = SharedFlags::new();
     let ctx = Context::new(&bytes, &mut shared);
-    let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx).expect("parsed");
     let h = meta.sv7_header().expect("SV7 header");
     assert_eq!(h.total_frames(), 102);
     assert_eq!(h.encoder_version(), 115);
@@ -1565,7 +1545,7 @@ mod tests {
   #[test]
   fn taggable_emits_sv7_print_conv() {
     let bytes = fixture("MPC.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("MPC", "TotalFrames"), Some("102".to_string()));
@@ -1586,7 +1566,7 @@ mod tests {
   #[test]
   fn taggable_emits_raw_scalars_value_conv() {
     let bytes = fixture("MPC.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
     assert_eq!(w.get_str("MPC", "SampleRate"), Some("0".to_string()));
@@ -1600,7 +1580,7 @@ mod tests {
   #[test]
   fn taggable_group_is_mpc_family0_and_family1() {
     let bytes = fixture("MPC.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let tags: std::vec::Vec<_> = meta
       .tags(ConvMode::PrintConv)
       .filter(|t| t.tag().group_ref().family1() == "MPC")
@@ -1624,7 +1604,7 @@ mod tests {
   #[cfg(feature = "id3")]
   fn taggable_chains_id3_prefix_before_mpc_body() {
     let bytes = fixture("mpc_with_id3v2_prefix.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
 
     let names: std::vec::Vec<String> = meta
@@ -1652,7 +1632,7 @@ mod tests {
   #[cfg(feature = "ape")]
   fn taggable_arm_chains_ape_trailer_after_mpc_body() {
     let bytes = fixture("mpc_with_apev2_trailer.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     // The `tags()` stream now carries the APE:* tags (ape::Meta is Taggable);
     // they follow the MPC:* body in the same stream.
     let names: std::vec::Vec<String> = meta
@@ -1697,7 +1677,7 @@ mod tests {
   fn project_is_audio_only_no_duration() {
     use crate::metadata::{Project, TrackKind};
     let bytes = fixture("MPC.mpc");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let md = Project::project(&meta);
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
     assert!(

@@ -905,16 +905,15 @@ impl FormatParser for ProcessDv {
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; DV parsing has no I/O modes).
-  type Error = Error;
 
   /// Parse a DV file's bytes into a typed [`ParseOutcome`], or `None`
   /// if the buffer is not a valid DV file (short read, no DIF header,
   /// fewer than 6 blocks). Returns `Err` only for Rust-level fatal
   /// modes; the current port has none.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // `parse_outcome` yields a `ParseOutcome<'static>`; covariance widens
     // it to the caller's `'a`.
-    Ok(parse_outcome(data))
+    parse_outcome(data)
   }
 }
 
@@ -927,8 +926,8 @@ impl FormatParser for ProcessDv {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<ParseOutcome<'static>>, Error> {
-  Ok(parse_outcome(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<ParseOutcome<'static>> {
+  parse_outcome(data)
 }
 
 fn parse_outcome(data: &[u8]) -> Option<ParseOutcome<'static>> {
@@ -1149,39 +1148,12 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for DV parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
-/// `#[non_exhaustive]` lets the first real variant land without a breaking
-/// change. The derive expands `Display` to an empty `match *self {}`, so no
-/// `#[error(…)]` attribute is needed while the enum has no variants.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn dv_error_is_core_error() {
-    // §5: thiserror v2 (default-features=false) makes the empty error enum
-    // a real `core::error::Error` in every feature tier.
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   #[test]
   fn profiles_and_tag_order_are_faithful() {
     // DV.pm:21-113 → 10 entries; DV.pm:116-121 → 13 tags.
@@ -1444,7 +1416,7 @@ mod tests {
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]); // dsf=1
     data[451] = 0x00; // stype = 0 ⇒ profile[1] (PAL)
-    let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
+    let outcome = parse_borrowed(&data).expect("parsed");
     match outcome {
       ParseOutcome::Meta(m) => {
         assert_eq!(m.image_width(), 720);
@@ -1462,13 +1434,13 @@ mod tests {
     let mut data = vec![0u8; 480];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0x3f]);
     data[451] = 0x1f;
-    let outcome = parse_borrowed(&data).expect("ok").expect("parsed");
+    let outcome = parse_borrowed(&data).expect("parsed");
     assert!(matches!(outcome, ParseOutcome::UnrecognizedProfile));
   }
 
   #[test]
   fn parse_borrowed_rejects_empty() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
   }
 
   #[test]
@@ -1603,9 +1575,7 @@ mod tests {
     let mut data = vec![0u8; 8000];
     data[0..4].copy_from_slice(&[0x1f, 0x07, 0x00, 0xbf]);
     data[451] = 0x00;
-    let outcome = <ProcessDv as FormatParser>::parse(&ProcessDv, &data)
-      .expect("ok")
-      .expect("parsed");
+    let outcome = <ProcessDv as FormatParser>::parse(&ProcessDv, &data).expect("parsed");
     assert!(matches!(outcome, ParseOutcome::Meta(_)));
   }
 }

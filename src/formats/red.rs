@@ -1037,10 +1037,9 @@ impl FormatParser for ProcessR3D {
   type Meta<'a> = Meta<'a>;
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -1050,8 +1049,8 @@ impl FormatParser for ProcessR3D {
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
+  parse_inner(data)
 }
 
 fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
@@ -1964,21 +1963,6 @@ fn push_r3d_value(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, name: &str,
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for R3D parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`).
-///
-/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
-/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
-/// without a breaking change. Variant names are kept stable for
-/// [`crate::format_parser::AnyError`]'s `From`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -2372,9 +2356,7 @@ mod tests {
   fn parse_borrowed_returns_meta_for_real_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
-    let meta = parse_borrowed(&bytes)
-      .expect("ok")
-      .expect("real Red.r3d parses");
+    let meta = parse_borrowed(&bytes).expect("real Red.r3d parses");
     assert_eq!(meta.redcode_version(), Some(b'2'));
     assert_eq!(meta.image_width(), Some(5120));
     assert_eq!(meta.image_height(), Some(2560));
@@ -2397,9 +2379,8 @@ mod tests {
   fn format_parser_trait_returns_meta_static() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
-    let meta = <ProcessR3D as FormatParser>::parse(&ProcessR3D, &bytes)
-      .expect("ok")
-      .expect("real Red.r3d parses");
+    let meta =
+      <ProcessR3D as FormatParser>::parse(&ProcessR3D, &bytes).expect("real Red.r3d parses");
     assert_eq!(meta.image_width(), Some(5120));
     assert_eq!(meta.start_edge_code(), Some("01:49:54:11"));
   }
@@ -2420,9 +2401,7 @@ mod tests {
   fn taggable_emits_typed_tags() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
-    let meta = parse_borrowed(&bytes)
-      .expect("ok")
-      .expect("real Red.r3d parses");
+    let meta = parse_borrowed(&bytes).expect("real Red.r3d parses");
     // PrintConv ON.
     let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Red", "RedcodeVersion"), Some("2".to_string()));
@@ -2453,9 +2432,7 @@ mod tests {
     use crate::emit::{ConvMode, Taggable};
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
-    let meta = parse_borrowed(&bytes)
-      .expect("ok")
-      .expect("real Red.r3d parses");
+    let meta = parse_borrowed(&bytes).expect("real Red.r3d parses");
     let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty());
     for t in &tags {
@@ -2474,9 +2451,7 @@ mod tests {
     use crate::metadata::{Project, TrackKind};
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
-    let meta = parse_borrowed(&bytes)
-      .expect("ok")
-      .expect("real Red.r3d parses");
+    let meta = parse_borrowed(&bytes).expect("real Red.r3d parses");
     let projected = meta.project();
     // R3D is Redcode video: one video track kind + header pixel dimensions.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);

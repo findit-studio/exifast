@@ -412,11 +412,10 @@ impl FormatParser for ProcessDsf {
   /// SharedFlags`.
   type Context<'a> = Context<'a>;
   /// Rust-level fatal error (none today; DSF parsing has no I/O modes).
-  type Error = Error;
 
   /// Parse a DSF file's bytes into a typed [`Meta`] borrowing from
   /// `ctx.data` (`'a`).
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(ctx.data)
   }
 }
@@ -431,7 +430,7 @@ impl FormatParser for ProcessDsf {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data)
 }
 
@@ -447,10 +446,10 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 ///   but the fmt-chunk read failed (DSF.pm:71-72 Warn + return 1).
 /// - `Ok(Some({ fmt: Some(...), id3_trailer: Option<...> }))` — happy
 ///   path; optional ID3v2 trailer carried through.
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // DSF.pm:62 `$raf->Read($buff,40)==40 or return 0`.
   if data.len() < 40 {
-    return Ok(None);
+    return None;
   }
   // DSF.pm:63 `$buff =~ /^DSD \x1c\0{7}.{16}fmt /s`. The regex is
   // anchored (^) and the `{16}` middle is "any 16 bytes" (Perl `.` under
@@ -459,16 +458,16 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // unconstrained.
   let head = &data[..40];
   if &head[0..4] != b"DSD " {
-    return Ok(None);
+    return None;
   }
   if head[4] != 0x1c {
-    return Ok(None);
+    return None;
   }
   if !head[5..12].iter().all(|&b| b == 0) {
-    return Ok(None);
+    return None;
   }
   if &head[28..32] != b"fmt " {
-    return Ok(None);
+    return None;
   }
   // DSF.pm:66 `SetByteOrder('II')` — every Get* below is little-endian.
   // DSF.pm:67 `my $fmtLen = Get64u(\$buff,32)`.
@@ -505,13 +504,13 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     // Faithful to the bundled-Perl flow: the trailer's `metaPos`/`metaLen`
     // were already captured from the header.
     let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
-    return Ok(Some(Meta {
+    return Some(Meta {
       fmt: None,
       fmt_warning: Some("Error reading DSF fmt chunk"),
       id3_trailer,
       #[cfg(feature = "id3")]
       id3: id3_from_trailer(id3_trailer),
-    }));
+    });
   }
   // DSF.pm:76 `$buff = substr($buff,28) . $buf2` — the dirInfo buffer
   // is `'fmt '` + chunkSize (12 bytes from head[28..40]) + payload
@@ -623,13 +622,13 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     })
   };
   let id3_trailer = id3_trailer_slice(data, file_size, meta_pos);
-  Ok(Some(Meta {
+  Some(Meta {
     fmt,
     fmt_warning: None,
     id3_trailer,
     #[cfg(feature = "id3")]
     id3: id3_from_trailer(id3_trailer),
-  }))
+  })
 }
 
 /// Parse the optional ID3v2 trailer slice (DSF.pm:88-97) into a typed
@@ -643,8 +642,6 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 fn id3_from_trailer(trailer: Option<&[u8]>) -> Option<crate::formats::id3::Id3Meta<'_>> {
   let slice = trailer?;
   crate::formats::id3::process::parse_id3_borrowed(slice, None, /* print_conv */ true)
-    .ok()
-    .flatten()
 }
 
 /// Computes the present-mask bit per `DSF_KEYS` entry based on whether
@@ -906,26 +903,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for DSF parsing. Currently empty — every bad
-/// input produces either `Ok(None)` (`return 0` per DSF.pm:62-63) or
-/// `Ok(Some(Meta { fmt: None, fmt_warning: Some(...) }))` (`Warn +
-/// return 1` per DSF.pm:71-72). Reserved for future I/O wrappers if
-/// streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror`
-/// (v2, `default-features = false` ⇒ `core::error::Error` in every
-/// feature tier, not just `std`); the hand-written impls are gone.
-/// `#[non_exhaustive]` lets a real variant land later without a breaking
-/// change. The enum is currently uninhabited, so it carries no
-/// `#[error(...)]` arms and no variant predicates (nothing to predicate).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -1113,30 +1090,30 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0u8; 39]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0u8; 39]).is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_magic() {
     let mut bad = happy_path_dsf();
     bad[0..4].copy_from_slice(b"XXXX");
-    assert!(parse_borrowed(&bad).unwrap().is_none());
+    assert!(parse_borrowed(&bad).is_none());
     let mut bad = happy_path_dsf();
     bad[4] = 0x00; // not 0x1c
-    assert!(parse_borrowed(&bad).unwrap().is_none());
+    assert!(parse_borrowed(&bad).is_none());
     let mut bad = happy_path_dsf();
     bad[5] = 0xff; // not \0
-    assert!(parse_borrowed(&bad).unwrap().is_none());
+    assert!(parse_borrowed(&bad).is_none());
     let mut bad = happy_path_dsf();
     bad[28..32].copy_from_slice(b"FMTA");
-    assert!(parse_borrowed(&bad).unwrap().is_none());
+    assert!(parse_borrowed(&bad).is_none());
   }
 
   #[test]
   fn parse_borrowed_happy_path_populates_fmt_data() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert!(meta.fmt_warning().is_none());
     assert!(meta.id3_trailer().is_none());
     let fmt = meta.fmt().expect("fmt populated");
@@ -1162,7 +1139,7 @@ mod tests {
     v.extend_from_slice(&0u64.to_le_bytes());
     v.extend_from_slice(b"fmt ");
     v.extend_from_slice(&8u64.to_le_bytes()); // fmtLen = 8 (≤ 12 ⇒ guard fail)
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt().is_none());
     assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
     assert!(meta.id3_trailer().is_none());
@@ -1182,7 +1159,7 @@ mod tests {
     v.extend_from_slice(&0u64.to_le_bytes());
     v.extend_from_slice(b"fmt ");
     v.extend_from_slice(&12u64.to_le_bytes()); // fmtLen = 12 (NOT > 12)
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt().is_none());
     assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
   }
@@ -1197,7 +1174,7 @@ mod tests {
       v.extend_from_slice(&0u64.to_le_bytes());
       v.extend_from_slice(b"fmt ");
       v.extend_from_slice(&fmt_len.to_le_bytes());
-      let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+      let meta = parse_borrowed(&v).expect("parsed");
       assert!(meta.fmt().is_none(), "fmt_len={fmt_len}");
       assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
     }
@@ -1213,7 +1190,7 @@ mod tests {
     v.extend_from_slice(&0u64.to_le_bytes());
     v.extend_from_slice(b"fmt ");
     v.extend_from_slice(&1000u64.to_le_bytes());
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt().is_none());
     assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
   }
@@ -1241,7 +1218,7 @@ mod tests {
     v.extend_from_slice(&4096u32.to_le_bytes());
     // Pad to total payload of 987 bytes (951 zeros after the 36-byte head).
     v.extend(core::iter::repeat(0u8).take(987 - 36));
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt_warning().is_none());
     let fmt = meta.fmt().expect("populated");
     assert_eq!(fmt.format_version(), 1);
@@ -1258,7 +1235,7 @@ mod tests {
     v.extend_from_slice(&0u64.to_le_bytes());
     v.extend_from_slice(b"fmt ");
     v.extend_from_slice(&48u64.to_le_bytes()); // fmtLen = 48 ⇒ need 36 more
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt().is_none());
     assert_eq!(meta.fmt_warning(), Some("Error reading DSF fmt chunk"));
   }
@@ -1281,14 +1258,14 @@ mod tests {
   fn parse_borrowed_carries_id3_trailer_slice() {
     let id3_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x01\x00";
     let v = dsf_with_trailer(id3_bytes);
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert_eq!(meta.id3_trailer(), Some(&id3_bytes[..]));
   }
 
   #[test]
   fn parse_borrowed_no_id3_trailer_when_meta_pos_zero() {
     let bytes = happy_path_dsf(); // metaPos == 0
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert!(meta.id3_trailer().is_none());
   }
 
@@ -1300,7 +1277,7 @@ mod tests {
     let mut v = happy_path_dsf();
     v[12..20].copy_from_slice(&50u64.to_le_bytes()); // fileSize = 50
     v[20..28].copy_from_slice(&100u64.to_le_bytes()); // metaPos = 100
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.id3_trailer().is_none());
   }
 
@@ -1310,7 +1287,7 @@ mod tests {
     let mut v = happy_path_dsf();
     v[12..20].copy_from_slice(&76u64.to_le_bytes()); // fileSize = 76
     v[20..28].copy_from_slice(&76u64.to_le_bytes()); // metaPos = 76
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.id3_trailer().is_none());
   }
 
@@ -1326,7 +1303,7 @@ mod tests {
     // Note: we don't actually append 20MB — the bounds check on
     // `end > data.len()` rejects before the size guard. Equivalent
     // behavior (both guards reject).
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.id3_trailer().is_none());
   }
 
@@ -1337,7 +1314,7 @@ mod tests {
     v[12..20].copy_from_slice(&100u64.to_le_bytes()); // claim fileSize = 100
     v[20..28].copy_from_slice(&76u64.to_le_bytes()); // metaPos = 76
     // But the file is only 76 bytes — `end > data.len()` rejects.
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.id3_trailer().is_none());
   }
 
@@ -1346,7 +1323,7 @@ mod tests {
   #[test]
   fn sink_emits_full_fmt_set_in_key_order_print_conv() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     emit_via_engine(&meta, true, &mut w);
     // Spot-check: PrintConv-resolved names + numeric raw scalars.
@@ -1370,7 +1347,7 @@ mod tests {
   #[test]
   fn sink_emits_full_fmt_set_print_conv_off() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     emit_via_engine(&meta, false, &mut w);
     // -n: raw numeric for FormatID / ChannelType (hash NOT applied).
@@ -1445,7 +1422,7 @@ mod tests {
     v.extend_from_slice(&7u32.to_le_bytes()); // FormatVersion = 7
     v.extend_from_slice(&0u32.to_le_bytes()); // FormatID = 0 ⇒ "DSD Raw"
     assert_eq!(v.len(), 48);
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt_warning().is_none());
     let fmt = meta.fmt().expect("partial fmt");
     assert_eq!(fmt.present_mask, 0b0000_0011); // keys 3,4 only
@@ -1475,7 +1452,7 @@ mod tests {
     v.extend_from_slice(&13u64.to_le_bytes()); // fmtLen = 13
     v.extend_from_slice(&[0u8; 1]); // 1 byte payload
     assert_eq!(v.len(), 41);
-    let meta = parse_borrowed(&v).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&v).expect("parsed");
     assert!(meta.fmt_warning().is_none());
     assert!(
       meta.fmt().is_none(),
@@ -1569,9 +1546,7 @@ mod tests {
     let bytes = happy_path_dsf();
     let mut shared = SharedFlags::new();
     let ctx = Context::new(&bytes, &mut shared);
-    let meta = <ProcessDsf as FormatParser>::parse(&ProcessDsf, ctx)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessDsf as FormatParser>::parse(&ProcessDsf, ctx).expect("parsed");
     // GAT path borrows from the input; this fixture has metaPos=0 (no ID3
     // trailer), so the trailer slice is absent here.
     assert!(meta.id3_trailer().is_none());
@@ -1735,7 +1710,7 @@ mod tests {
     // §3: `FmtData` is Copy ⇒ `Meta::fmt()` returns `Option<T>` by
     // value (not `Option<&T>`), and the field getters are by-value too.
     let buf = happy_path_dsf();
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     let fmt: Option<FmtData> = meta.fmt();
     let fmt = fmt.expect("fmt present on happy path");
     assert_eq!(fmt.channel_count(), 2);
@@ -1753,20 +1728,9 @@ mod tests {
   fn dsf_id3_ref_accessor_absent_without_trailer() {
     // §3: the non-Copy nested-Meta getter is `id3_ref()`.
     let buf = happy_path_dsf();
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     assert!(meta.id3_ref().is_none(), "metaPos=0 ⇒ no ID3 trailer");
   }
-
-  #[test]
-  fn dsf_error_is_uninhabited_and_thiserror_derived() {
-    // §5: Error is uninhabited; this proves the thiserror-derived
-    // `Display`/`Error` impls exist (must compile).
-    fn _assert_error<E: core::error::Error>() {}
-    _assert_error::<Error>();
-    let none: Option<Error> = None;
-    assert!(none.is_none());
-  }
-
   // --- Golden-pattern `Taggable` / `Project` ------------------------------
 
   /// `Taggable::tags(-j)` yields the full fmt-chunk set in DSF_KEYS order
@@ -1775,7 +1739,7 @@ mod tests {
   #[test]
   fn taggable_emits_full_fmt_set_print_conv() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("File", "FormatVersion"), Some("1".to_string()));
@@ -1796,7 +1760,7 @@ mod tests {
   #[test]
   fn taggable_emits_raw_scalars_value_conv() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
     assert_eq!(w.get_str("File", "FormatID"), Some("0".to_string()));
@@ -1810,7 +1774,7 @@ mod tests {
   #[test]
   fn taggable_group_is_file_family0_and_family1() {
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty());
     for t in &tags {
@@ -1834,7 +1798,7 @@ mod tests {
         .join("tests/fixtures/dsf_with_id3v2_trailer.dsf"),
     )
     .expect("read dsf_with_id3v2_trailer.dsf fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 trailer");
 
     // The tag stream: fmt-chunk `File:*` tags, THEN the ID3 trailer tags.
@@ -1874,7 +1838,7 @@ mod tests {
   fn project_is_audio_only_no_duration() {
     use crate::metadata::{Project, TrackKind};
     let bytes = happy_path_dsf();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let md = Project::project(&meta);
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
     assert!(

@@ -35,9 +35,7 @@ fn fixture(name: &str) -> Vec<u8> {
 #[cfg(all(feature = "ogg", feature = "id3"))]
 fn parse_ogg_direct_routes_through_full_chained_for_id3_prefix() {
   let bytes = fixture("ogg_id3_prefixed.ogg");
-  let meta = exifast::parse_ogg(&bytes, /* print_conv */ true)
-    .expect("parse_ogg returns Ok")
-    .expect("parse_ogg returns Some");
+  let meta = exifast::parse_ogg(&bytes, /* print_conv */ true).expect("parse_ogg returns Some");
 
   // ID3 prefix detected and nested. The golden carries `File:ID3Size: 34`
   // and `ID3v2_3:Title: "IDPrefixTitle"`.
@@ -81,9 +79,7 @@ fn parse_ogg_direct_routes_through_full_chained_for_id3_prefix() {
 fn parse_ape_direct_routes_through_full_chained_for_id3_prefix() {
   let bytes = fixture("ape_id3_prefixed.ape");
   let mut shared = exifast::SharedFlags::new();
-  let meta = exifast::parse_ape(&bytes, &mut shared)
-    .expect("parse_ape returns Ok")
-    .expect("parse_ape returns Some");
+  let meta = exifast::parse_ape(&bytes, &mut shared).expect("parse_ape returns Some");
 
   // Golden: `File:ID3Size: 30`, `ID3v2_3:Title: "TestTitle"`.
   let id3 = meta.id3_ref().expect("id3 sub-Meta present");
@@ -110,9 +106,7 @@ fn parse_ape_direct_routes_through_full_chained_for_id3_prefix() {
 #[cfg(all(feature = "mpc", feature = "id3"))]
 fn parse_mpc_direct_routes_through_full_chained_for_id3_prefix() {
   let bytes = fixture("mpc_with_id3v2_prefix.mpc");
-  let meta = exifast::parse_mpc(&bytes)
-    .expect("parse_mpc returns Ok")
-    .expect("parse_mpc returns Some");
+  let meta = exifast::parse_mpc(&bytes).expect("parse_mpc returns Some");
 
   // Golden: `File:ID3Size: 34`, `ID3v2_3:Title: "MpcId3v2Title"`.
   let id3 = meta.id3_ref().expect("id3 sub-Meta present");
@@ -134,9 +128,7 @@ fn parse_mpc_direct_routes_through_full_chained_for_id3_prefix() {
 #[cfg(all(feature = "mpc", feature = "ape"))]
 fn parse_mpc_direct_routes_through_full_chained_for_ape_trailer() {
   let bytes = fixture("mpc_with_apev2_trailer.mpc");
-  let meta = exifast::parse_mpc(&bytes)
-    .expect("parse_mpc returns Ok")
-    .expect("parse_mpc returns Some");
+  let meta = exifast::parse_mpc(&bytes).expect("parse_mpc returns Some");
 
   // Golden: `APE:Artist: "MpcApeArtist"`.
   let ape = meta.ape_ref().expect("ape sub-Meta present");
@@ -156,9 +148,7 @@ fn parse_mpc_direct_routes_through_full_chained_for_ape_trailer() {
 #[cfg(all(feature = "wavpack", feature = "ape"))]
 fn parse_wavpack_direct_routes_through_full_chained_for_ape_trailer() {
   let bytes = fixture("wavpack_with_apev2_trailer.wv");
-  let meta = exifast::parse_wavpack(&bytes)
-    .expect("parse_wavpack returns Ok")
-    .expect("parse_wavpack returns Some");
+  let meta = exifast::parse_wavpack(&bytes).expect("parse_wavpack returns Some");
 
   // Golden: `APE:Artist: "WvApeArtist"`.
   let ape = meta.ape_ref().expect("ape sub-Meta present");
@@ -190,9 +180,7 @@ fn parse_wavpack_direct_routes_through_full_chained_for_ape_trailer() {
 #[cfg(all(feature = "mpc", feature = "id3"))]
 fn module_parse_borrowed_mpc_routes_chain_for_id3_prefix() {
   let bytes = fixture("mpc_with_id3v2_prefix.mpc");
-  let meta = exifast::formats::mpc::parse_borrowed(&bytes)
-    .expect("parse_borrowed returns Ok")
-    .expect("parse_borrowed returns Some");
+  let meta = exifast::formats::mpc::parse_borrowed(&bytes).expect("parse_borrowed returns Some");
   let id3 = meta
     .id3_ref()
     .expect("id3 sub-Meta present via module-level entry");
@@ -211,9 +199,7 @@ fn module_parse_borrowed_mpc_routes_chain_for_id3_prefix() {
 #[cfg(all(feature = "mpc", feature = "ape"))]
 fn module_parse_borrowed_mpc_routes_chain_for_ape_trailer() {
   let bytes = fixture("mpc_with_apev2_trailer.mpc");
-  let meta = exifast::formats::mpc::parse_borrowed(&bytes)
-    .expect("parse_borrowed returns Ok")
-    .expect("parse_borrowed returns Some");
+  let meta = exifast::formats::mpc::parse_borrowed(&bytes).expect("parse_borrowed returns Some");
   let ape = meta
     .ape_ref()
     .expect("ape sub-Meta present via module-level entry");
@@ -231,9 +217,8 @@ fn module_parse_borrowed_mpc_routes_chain_for_ape_trailer() {
 #[cfg(all(feature = "wavpack", feature = "ape"))]
 fn module_parse_borrowed_wavpack_routes_chain_for_ape_trailer() {
   let bytes = fixture("wavpack_with_apev2_trailer.wv");
-  let meta = exifast::formats::wavpack::parse_borrowed(&bytes)
-    .expect("parse_borrowed returns Ok")
-    .expect("parse_borrowed returns Some");
+  let meta =
+    exifast::formats::wavpack::parse_borrowed(&bytes).expect("parse_borrowed returns Some");
   let ape = meta
     .ape_ref()
     .expect("ape sub-Meta present via module-level entry");
@@ -258,7 +243,6 @@ fn module_parse_borrowed_wavpack_routes_chain_for_ape_trailer() {
 fn module_parse_borrowed_ogg_routes_chain_for_id3_prefix() {
   let bytes = fixture("ogg_id3_prefixed.ogg");
   let meta = exifast::formats::ogg::parse_borrowed(&bytes, /* print_conv */ true)
-    .expect("parse_borrowed returns Ok")
     .expect("parse_borrowed returns Some");
   let id3 = meta
     .id3_ref()
@@ -291,9 +275,8 @@ fn trait_parse_ape_routes_chain_for_id3_prefix() {
   let bytes = fixture("ape_id3_prefixed.ape");
   let mut shared = exifast::SharedFlags::new();
   let ctx = Context::new(&bytes, &mut shared);
-  let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, ctx)
-    .expect("trait parse returns Ok")
-    .expect("trait parse returns Some");
+  let meta =
+    <ProcessApe as FormatParser>::parse(&ProcessApe, ctx).expect("trait parse returns Some");
   let id3 = meta
     .id3_ref()
     .expect("id3 sub-Meta present via trait surface");
@@ -322,8 +305,7 @@ fn trait_parse_ape_trailer_only_skips_id3_chain() {
   let bytes = fixture("ape_id3_prefixed.ape");
   let mut shared = exifast::SharedFlags::new();
   let ctx = Context::new_trailer_only(&bytes, &mut shared);
-  let result =
-    <ProcessApe as FormatParser>::parse(&ProcessApe, ctx).expect("trait parse returns Ok");
+  let result = <ProcessApe as FormatParser>::parse(&ProcessApe, ctx);
   // Trailer-only: no full-buffer ID3 detection — the chain MUST stay
   // skipped (the bundled gate at APE.pm:118 is honored).
   if let Some(meta) = result {
@@ -343,9 +325,8 @@ fn trait_parse_mpc_routes_chain_for_id3_prefix() {
   let bytes = fixture("mpc_with_id3v2_prefix.mpc");
   let mut shared = exifast::SharedFlags::new();
   let ctx = Context::new(&bytes, &mut shared);
-  let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx)
-    .expect("trait parse returns Ok")
-    .expect("trait parse returns Some");
+  let meta =
+    <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx).expect("trait parse returns Some");
   let id3 = meta
     .id3_ref()
     .expect("id3 sub-Meta present via trait surface");
@@ -367,9 +348,8 @@ fn trait_parse_mpc_routes_chain_for_ape_trailer() {
   let bytes = fixture("mpc_with_apev2_trailer.mpc");
   let mut shared = exifast::SharedFlags::new();
   let ctx = Context::new(&bytes, &mut shared);
-  let meta = <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx)
-    .expect("trait parse returns Ok")
-    .expect("trait parse returns Some");
+  let meta =
+    <ProcessMpc as FormatParser>::parse(&ProcessMpc, ctx).expect("trait parse returns Some");
   let ape = meta
     .ape_ref()
     .expect("ape sub-Meta present via trait surface");
@@ -390,9 +370,7 @@ fn trait_parse_wavpack_routes_chain_for_ape_trailer() {
   let bytes = fixture("wavpack_with_apev2_trailer.wv");
   let mut shared = exifast::SharedFlags::new();
   let ctx = Context::new(&bytes, &mut shared);
-  let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
-    .expect("trait parse returns Ok")
-    .expect("trait parse returns Some");
+  let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx).expect("trait parse returns Some");
   let ape = meta
     .ape_ref()
     .expect("ape sub-Meta present via trait surface");
@@ -418,9 +396,8 @@ fn trait_parse_wavpack_routes_chain_for_ape_trailer() {
 fn trait_parse_ogg_routes_chain_for_id3_prefix() {
   use exifast::formats::ogg::ProcessOgg;
   let bytes = fixture("ogg_id3_prefixed.ogg");
-  let meta = <ProcessOgg as FormatParser>::parse(&ProcessOgg, &bytes)
-    .expect("trait parse returns Ok")
-    .expect("trait parse returns Some");
+  let meta =
+    <ProcessOgg as FormatParser>::parse(&ProcessOgg, &bytes).expect("trait parse returns Some");
   let id3 = meta
     .id3_ref()
     .expect("id3 sub-Meta present via trait surface");

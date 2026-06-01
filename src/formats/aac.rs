@@ -193,9 +193,8 @@ impl parser_sealed::Sealed for ProcessAac {}
 impl FormatParser for ProcessAac {
   type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data)
   }
 }
@@ -207,7 +206,7 @@ impl FormatParser for ProcessAac {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data)
 }
 
@@ -215,15 +214,15 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 /// [`FormatParser::Meta`] GAT (`type Meta<'a> = Meta<'a>`) returns this
 /// borrowed form directly into the closed [`crate::format_parser::AnyMeta`]
 /// enum — no `'static` upgrade (Codex AF2).
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // AAC.pm:99-105 header validation. A reject here returns `Ok(None)` —
   // Perl `return 0` BEFORE `$et->SetFileType()` (AAC.pm:107).
   if data.len() < 7 {
-    return Ok(None); // $raf->Read($buff,7)==7 or return 0  (AAC.pm:99)
+    return None; // $raf->Read($buff,7)==7 or return 0  (AAC.pm:99)
   }
   let buff = &data[..7];
   if buff[0] != 0xff || (buff[1] != 0xf0 && buff[1] != 0xf1) {
-    return Ok(None); // unless $buff =~ /^\xff[\xf0\xf1]/  (AAC.pm:100)
+    return None; // unless $buff =~ /^\xff[\xf0\xf1]/  (AAC.pm:100)
   }
   // my @t = unpack('NnC', $buff)  (AAC.pm:101)
   let t0 = u32::from_be_bytes([buff[0], buff[1], buff[2], buff[3]]); // $t[0] = 'N'
@@ -234,15 +233,15 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // ExifTool's own — they intentionally differ from the %AAC::Main bit
   // table's Bit016-017 / Bit018-021 extraction. Do NOT "correct" them.
   if (t0 >> 16) & 0x03 == 3 {
-    return Ok(None); // AAC.pm:102 (reserved profile type)
+    return None; // AAC.pm:102 (reserved profile type)
   }
   if (t0 >> 12) & 0x0f > 12 {
-    return Ok(None); // AAC.pm:103 (validate sampling frequency index)
+    return None; // AAC.pm:103 (validate sampling frequency index)
   }
   // my $len = (($t[0] << 11) & 0x1800) | (($t[1] >> 5) & 0x07ff)  (AAC.pm:104)
   let len = (((t0 << 11) & 0x1800) | ((t1 as u32 >> 5) & 0x07ff)) as usize;
   if len < 7 {
-    return Ok(None); // AAC.pm:105
+    return None; // AAC.pm:105
   }
 
   // Bit-stream walk to extract ProfileType / SampleRate / Channels via
@@ -293,12 +292,12 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // with an unconditional `last` (AAC.pm:136).
   let encoder: Option<&str> = encoder_from_filler(data, t0, t2, len);
 
-  Ok(Some(Meta {
+  Some(Meta {
     profile_type,
     sample_rate,
     channels,
     encoder,
-  }))
+  })
 }
 
 /// Extract the Encoder string from the first AAC frame's filler payload
@@ -478,24 +477,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for AAC parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
-/// `#[non_exhaustive]` lets the first real variant land without a breaking
-/// change. The derive expands `Display` to an empty `match *self {}`, so no
-/// `#[error(…)]` attribute is needed while the enum has no variants.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -506,15 +487,6 @@ pub enum Error {}
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn aac_error_is_core_error() {
-    // §5: thiserror v2 (default-features=false) makes the empty error enum
-    // a real `core::error::Error` in every feature tier.
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   #[test]
   fn table_and_keys_are_faithful() {
     let g = AAC_MAIN.get();
@@ -605,7 +577,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/AAC.aac"),
     )
     .expect("read AAC.aac fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     // ProfileType = (0x50>>6)&0x03 raw extracted by process_bit_stream
     // ⇒ 1 (low complexity). bit-stream emits I64; typed Meta lifts to u8.
     assert_eq!(meta.profile_type(), 1);
@@ -620,14 +592,14 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0xff, 0xf1]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0xff, 0xf1]).is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_sync() {
     let data = [0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   #[test]
@@ -636,7 +608,7 @@ mod tests {
     // Construct: ff f1 c0 00 ... ⇒ t0=ff_f1_c0_00; (t0>>16)&0x03 = 0xc0&3 = 0.
     // Try ff f1 ff 00 ⇒ t0 = ff_f1_ff_00; (t0>>16)&0x03 = 0xff&3 = 3 ⇒ reject.
     let data = [0xff, 0xf1, 0xff, 0x00, 0x00, 0x00, 0x00];
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   /// Drive the `Meta` through the golden-pattern engine
@@ -735,7 +707,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/AAC.aac"),
     )
     .expect("read AAC.aac fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let projected = meta.project();
     // The one faithful MediaInfo contribution: a single audio track kind.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
@@ -759,9 +731,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/AAC.aac"),
     )
     .expect("read AAC.aac fixture");
-    let meta = <ProcessAac as FormatParser>::parse(&ProcessAac, &bytes)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessAac as FormatParser>::parse(&ProcessAac, &bytes).expect("parsed");
     assert_eq!(meta.profile_type(), 1);
     assert_eq!(meta.sample_rate(), 44100);
     assert_eq!(meta.encoder(), Some("Lavc57.107.100"));

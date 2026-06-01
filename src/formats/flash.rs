@@ -559,10 +559,9 @@ impl parser_sealed::Sealed for ProcessFlv {}
 impl FormatParser for ProcessFlv {
   type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -573,8 +572,8 @@ impl FormatParser for ProcessFlv {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
+  parse_inner(data)
 }
 
 /// Inner parser. Faithful to `ProcessFLV` (Flash.pm:467-525):
@@ -3378,17 +3377,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for FLV parsing. Currently empty — every bad
-/// input either produces `Ok(None)` (Perl `return 0` at Flash.pm:474/475)
-/// or surfaces warnings inside the typed [`Meta`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {}
-
-// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -3398,14 +3386,14 @@ mod tests {
 
   #[test]
   fn flv_short_buffer_returns_none() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(b"FLV").unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(b"FLV").is_none());
   }
 
   #[test]
   fn flv_bad_magic_returns_none() {
     let bytes = [b'X', b'L', b'V', 0x01, 0x05, 0, 0, 0, 9];
-    assert!(parse_borrowed(&bytes).unwrap().is_none());
+    assert!(parse_borrowed(&bytes).is_none());
   }
 
   #[test]
@@ -4202,7 +4190,7 @@ mod tests {
       "/tests/fixtures/Flash.flv"
     ))
     .expect("read Flash.flv fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("FLV accepted");
+    let meta = parse_borrowed(&bytes).expect("FLV accepted");
     // -j: PrintConv strings + the per-tag conversions.
     let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("Flash", "AudioEncoding"), Some("MP3".into()));
@@ -4227,7 +4215,7 @@ mod tests {
       "/tests/fixtures/Flash.flv"
     ))
     .expect("read Flash.flv fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty(), "the onMetaData packet must yield tags");
     for t in &tags {
@@ -4246,7 +4234,7 @@ mod tests {
       "/tests/fixtures/Flash.flv"
     ))
     .expect("read Flash.flv fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let projected = meta.project();
     // FLV projects to a video container; the rest of MediaInfo is empty.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);

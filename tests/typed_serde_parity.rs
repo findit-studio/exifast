@@ -187,9 +187,8 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
       cand.header_skip(),
       Some(cand.parent_type()),
     ) {
-      Ok(Some(meta)) => return Some(meta),
-      Ok(None) => shared = SharedFlags::new(),
-      Err(_) => shared = SharedFlags::new(),
+      Some(meta) => return Some(meta),
+      None => shared = SharedFlags::new(),
     }
   }
   None

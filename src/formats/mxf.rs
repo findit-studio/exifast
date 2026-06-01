@@ -1924,10 +1924,9 @@ impl FormatParser for ProcessMxf {
   type Meta<'a> = MxfMeta<'a>;
   /// Leaf-format Context — `&'a [u8]` (Engine-only, no chained state).
   type Context<'a> = &'a [u8];
-  type Error = MxfError;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MxfError> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -1938,8 +1937,8 @@ impl FormatParser for ProcessMxf {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today — every bad input is
 /// `Ok(None)`, faithful to MXF.pm:2816-2817 `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<MxfMeta<'_>>, MxfError> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<MxfMeta<'_>> {
+  parse_inner(data)
 }
 
 // ===========================================================================
@@ -2937,34 +2936,12 @@ impl crate::metadata::Project for MxfMeta<'_> {
 }
 
 // ===========================================================================
-// §19. `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for MXF parsing. Currently empty — every bad input
-/// produces `Ok(None)` (faithful to MXF.pm:2816-2817 `return 0`).
-///
-/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
-/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
-/// without a breaking change. Variant names are kept stable for
-/// [`crate::format_parser::AnyError`]'s `From`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum MxfError {}
-
-// ===========================================================================
 // §20. Tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn mxf_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<MxfError>();
-  }
-
   #[test]
   fn ul_notation_renders_dotted_groups() {
     let key = [
@@ -3213,8 +3190,8 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_non_mxf() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(b"not an mxf file at all").unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(b"not an mxf file at all").is_none());
   }
 
   #[test]
@@ -3224,7 +3201,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read MXF.mxf fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("MXF accepted");
+    let meta = parse_borrowed(&bytes).expect("MXF accepted");
     assert_eq!(meta.header_type(), Some("OpenHeader"));
     // MXFVersion is the first emitted tag (from the header subtable).
     let names: Vec<&str> = meta.entries().iter().map(MxfEntry::name).collect();
@@ -3250,7 +3227,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(tm.get_str("MXF", "MXFVersion"), Some("1.2".into()));
     assert_eq!(
@@ -3294,7 +3271,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, ConvMode::ValueConv);
     // -n: ComponentDataDefinition is the raw UL string.
     assert_eq!(
@@ -3311,7 +3288,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     // Every production entry is visible (the walk pre-filters Unknown rows).
     assert!(tags.iter().all(|t| !t.unknown()));
@@ -3387,7 +3364,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let projected = meta.project();
     // MXF projects to a single video track; the rest of MediaInfo is empty.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);

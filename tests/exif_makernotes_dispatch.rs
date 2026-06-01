@@ -34,9 +34,7 @@ fn exif_makernote_fixture_dispatches_to_pentax() {
     "/tests/fixtures/Exif_makernote.tif"
   ))
   .unwrap();
-  let meta = exifast::parse_exif(&data)
-    .expect("Exif parse returns Ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(&data).expect("TIFF recognized");
 
   // The Make tag was emitted into the entry list (the walker passes it
   // through to the dispatcher AND surfaces it as a leaf tag).
@@ -688,9 +686,7 @@ fn panasonic3_dcft7_base12_out_of_line_lenstype() {
   use exifast::exif::makernotes::BaseRule;
   use exifast::value::TagValue;
 
-  let meta = exifast::parse_exif(DCFT7_BASE12_TIFF)
-    .expect("parse ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(DCFT7_BASE12_TIFF).expect("TIFF recognized");
 
   // Model selected the Panasonic3 (DC-FT7) variant: the dispatcher gave it
   // `Base => 12` (`MakerNotes.pm:758`) and the 12-byte header.
@@ -725,9 +721,7 @@ fn panasonic3_dcft7_base12_out_of_line_lenstype() {
 #[test]
 fn panasonic3_dcft7_base0_offset_is_corrupted() {
   use exifast::value::TagValue;
-  let meta = exifast::parse_exif(DCFT7_BASE0_TIFF)
-    .expect("parse ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(DCFT7_BASE0_TIFF).expect("TIFF recognized");
   let mn = meta.maker_note().expect("MakerNote captured");
   let lens = mn
     .emissions_print_conv()
@@ -847,7 +841,7 @@ fn panasonic2_mke_type2_does_not_run_main_parser() {
   assert_eq!(t.len(), 86);
   t.extend_from_slice(b"Panasonic\x00");
 
-  let meta = exifast::parse_exif(&t).expect("parse ok").expect("TIFF");
+  let meta = exifast::parse_exif(&t).expect("TIFF");
   let mn = meta.maker_note().expect("MakerNote captured");
   // Dispatched to Panasonic (MakerNotePanasonic2 — make=Panasonic + "MKE").
   assert!(
@@ -923,7 +917,7 @@ fn sony_ericsson_does_not_run_main_parser() {
   assert_eq!(t.len(), 94);
   t.extend_from_slice(b"Sony Ericsson\x00");
 
-  let meta = exifast::parse_exif(&t).expect("parse ok").expect("TIFF");
+  let meta = exifast::parse_exif(&t).expect("TIFF");
   let mn = meta.maker_note().expect("MakerNote captured");
   assert!(
     mn.vendor().is_sony(),
@@ -1695,9 +1689,7 @@ fn leica10_dispatches_to_panasonic_main_image_quality() {
   use exifast::exif::makernotes::BaseRule;
   use exifast::value::TagValue;
 
-  let meta = exifast::parse_exif(LEICA10_TIFF)
-    .expect("parse ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(LEICA10_TIFF).expect("TIFF recognized");
   let mn = meta.maker_note().expect("MakerNote captured");
 
   // Dispatched as Leica10: Vendor::Leica, body_offset 18, inherit base.
@@ -1975,9 +1967,7 @@ fn leica1_dispatches_to_panasonic_main_image_quality() {
   use exifast::exif::makernotes::BaseRule;
   use exifast::value::TagValue;
 
-  let meta = exifast::parse_exif(LEICA1_TIFF)
-    .expect("parse ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(LEICA1_TIFF).expect("TIFF recognized");
   let mn = meta.maker_note().expect("MakerNote captured");
 
   // Dispatched as Leica1: Vendor::Leica, body_offset 8, inherit base.
@@ -2083,9 +2073,7 @@ fn leica1_serialized_keys_use_panasonic_group1() {
 #[cfg(all(feature = "exif", feature = "std", feature = "json"))]
 #[test]
 fn leica5_signature_make_not_leica_emits_no_panasonic() {
-  let meta = exifast::parse_exif(LEICA5_NEG_TIFF)
-    .expect("parse ok")
-    .expect("TIFF recognized");
+  let meta = exifast::parse_exif(LEICA5_NEG_TIFF).expect("TIFF recognized");
   let mn = meta.maker_note().expect("MakerNote captured");
   // Dispatched as Leica (a Leica5-signature blob), body_offset 8.
   assert!(mn.vendor().is_leica(), "vendor = Leica (Leica5 signature)");

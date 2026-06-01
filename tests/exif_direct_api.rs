@@ -14,14 +14,12 @@ fn standalone_tiff_dispatches_to_exif_arm() {
     "/tests/fixtures/Exif.tif"
   ))
   .unwrap();
-  let meta = exifast::parse_bytes(&data)
-    .unwrap()
-    .expect("TIFF recognized");
+  let meta = exifast::parse_bytes(&data).expect("TIFF recognized");
   assert!(matches!(meta, AnyMeta::Exif(_)), "got {meta:?}");
   // The reusable entry returns the same typed ExifMeta.
   let block = exifast::parse_exif_block(&data).expect("parse_exif_block");
   assert_eq!(block.entry("Make").map(|e| e.name()), Some("Make"));
   // The direct `parse_exif` accessor too.
-  let direct = exifast::parse_exif(&data).unwrap().expect("parse_exif");
+  let direct = exifast::parse_exif(&data).expect("parse_exif");
   assert!(direct.entry("LensModel").is_some());
 }

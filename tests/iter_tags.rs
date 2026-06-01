@@ -19,9 +19,7 @@ fn exif_iter_tags_carries_both_group_families() {
     "/tests/fixtures/Exif.tif"
   ))
   .unwrap();
-  let meta = exifast::parse_bytes(&data)
-    .unwrap()
-    .expect("TIFF recognized");
+  let meta = exifast::parse_bytes(&data).expect("TIFF recognized");
   assert!(matches!(meta, AnyMeta::Exif(_)), "got {meta:?}");
 
   let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
@@ -105,9 +103,7 @@ fn quicktime_iter_tags_carries_quicktime_groups() {
     "/tests/fixtures/QuickTime_m4a.mov"
   ))
   .unwrap();
-  let meta = exifast::parse_bytes(&data)
-    .unwrap()
-    .expect("QuickTime recognized");
+  let meta = exifast::parse_bytes(&data).expect("QuickTime recognized");
   assert!(matches!(meta, AnyMeta::QuickTime(_)), "got {meta:?}");
 
   let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
@@ -160,9 +156,7 @@ fn id3_iter_tags_family0_is_id3_not_frame_group() {
     "/tests/fixtures/ID3v2_3.mp3"
   ))
   .unwrap();
-  let meta = exifast::parse_bytes(&data)
-    .unwrap()
-    .expect("MP3 recognized");
+  let meta = exifast::parse_bytes(&data).expect("MP3 recognized");
   let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
 
   // The ID3v2.3 frames carry family-0 `ID3`, family-1 `ID3v2_3`.
@@ -209,9 +203,7 @@ fn chained_id3v1_iter_tags_family0_is_id3() {
     "/tests/fixtures/Real.rm"
   ))
   .unwrap();
-  let meta = exifast::parse_bytes(&data)
-    .unwrap()
-    .expect("Real recognized");
+  let meta = exifast::parse_bytes(&data).expect("Real recognized");
   let tags: Vec<exifast::Tag> = meta.iter_tags(ConvMode::PrintConv).collect();
 
   // Container tags stay family-0 `Real`.

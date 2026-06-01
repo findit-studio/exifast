@@ -549,8 +549,8 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     let Some(parser) = any_parser_for(ft) else {
       continue;
     };
-    // Faithful closed-dispatch parse. A Rust-level fatal (unreachable for the
-    // ported formats — uninhabited error enums) maps to "not this candidate".
+    // Faithful closed-dispatch parse. The contract is `Option`: `Some(meta)`
+    // is an accepted candidate, `None` is a rejection ("not this candidate").
     // `cand.header_skip()` is the unknown-leading-header byte count (Perl
     // `$skip`, `ExifTool.pm:3029`) for the terminal JPEG/TIFF candidate — `0`
     // for every ordinary candidate; the JPEG/TIFF arm slices `data` at it.
@@ -561,13 +561,9 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
       cand.header_skip(),
       Some(cand.parent_type()),
     ) {
-      Ok(Some(meta)) => meta,
-      Ok(None) => {
+      Some(meta) => meta,
+      None => {
         // Rejected candidate: reset shared so partial side effects don't leak.
-        shared = crate::format_parser::SharedFlags::new();
-        continue;
-      }
-      Err(_) => {
         shared = crate::format_parser::SharedFlags::new();
         continue;
       }

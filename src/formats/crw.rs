@@ -154,20 +154,6 @@ const FILE_TYPE: &str = "CRW";
 const MAX_NESTING: u32 = 30;
 
 // ===========================================================================
-// Error — uninhabited (Perl `return 0` ⇒ `Ok(None)`)
-// ===========================================================================
-
-/// Rust-level fatal modes for CRW parsing. Currently empty — every bad input
-/// produces `Ok(None)` (Perl `return 0`) or accumulates warnings in the
-/// [`CrwMeta`]. Reserved for future streaming-reader wrappers.
-///
-/// §5: `Display` + `core::error::Error` via `thiserror`; `#[non_exhaustive]`
-/// keeps future variants additive.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // `ProcessCrw` — the lib-first parser
 // ===========================================================================
 
@@ -180,10 +166,9 @@ impl parser_sealed::Sealed for ProcessCrw {}
 impl FormatParser for ProcessCrw {
   type Meta<'a> = CrwMeta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -193,8 +178,8 @@ impl FormatParser for ProcessCrw {
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<CrwMeta<'_>>, Error> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<CrwMeta<'_>> {
+  parse_inner(data)
 }
 
 /// `ProcessCRW` (`CanonRaw.pm:812-833`): validate the CIFF header, then walk

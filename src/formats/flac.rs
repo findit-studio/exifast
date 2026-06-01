@@ -829,14 +829,13 @@ impl FormatParser for ProcessFlac {
   type Context<'a> = Context<'a>;
   /// Rust-level fatal error type (no variants today; reserved for future
   /// I/O wrappers).
-  type Error = Error;
 
   /// Run the typed parser. Returns:
   /// - `Ok(Some(meta))` — FLAC magic accepted; tags extracted (FLAC.pm:279
   ///   `return 1`).
   /// - `Ok(None)` — magic rejected (FLAC.pm:254 `or return 0`).
   /// - `Err(_)` — unreachable today.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(ctx.data, ctx.shared)
   }
 }
@@ -857,7 +856,7 @@ impl FormatParser for ProcessFlac {
 pub fn parse_borrowed<'a>(
   data: &'a [u8],
   shared: &mut crate::format_parser::SharedFlags,
-) -> Result<Option<Meta<'a>>, Error> {
+) -> Option<Meta<'a>> {
   parse_inner(data, shared)
 }
 
@@ -865,7 +864,7 @@ pub fn parse_borrowed<'a>(
 fn parse_inner<'a>(
   data: &'a [u8],
   shared: &mut crate::format_parser::SharedFlags,
-) -> Result<Option<Meta<'a>>, Error> {
+) -> Option<Meta<'a>> {
   // -- FLAC.pm:243-247 — embedded ID3 (`ProcessID3`) ----------------------
   //
   //    unless ($$et{DoneID3}) {
@@ -890,7 +889,6 @@ fn parse_inner<'a>(
       Some(&mut *shared),
       /* print_conv */ true,
     )
-    .unwrap_or((None, 0))
   } else {
     (None, shared.id3_hdr_end().unwrap_or(0))
   };
@@ -898,7 +896,7 @@ fn parse_inner<'a>(
   // -- FLAC.pm:254 — `fLaC` magic check -----------------------------------
   // `$raf->Read($buff, 4) == 4 and $buff eq 'fLaC' or return 0`
   if data.len() < offset + 4 || &data[offset..offset + 4] != b"fLaC" {
-    return Ok(None);
+    return None;
   }
 
   // -- FLAC.pm:256-280 — block chain walk ---------------------------------
@@ -964,7 +962,7 @@ fn parse_inner<'a>(
       break;
     }
   }
-  Ok(Some(meta))
+  Some(meta)
 }
 
 /// Compute the byte offset where the FLAC body starts after an optional
@@ -1847,21 +1845,6 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for FLAC parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`) or a tagged warning
-/// (Perl `Warn`). Reserved for future I/O wrappers.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror`
-/// (v2, `default-features = false` ⇒ `core::error::Error` for no-std);
-/// `#[non_exhaustive]` lets future variants land without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -2151,9 +2134,7 @@ mod tests {
   fn process_flac_typed_parser_extracts_real_fixture() {
     let data = fixture("FLAC.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared)
-      .expect("ok")
-      .expect("flac");
+    let meta = parse_borrowed(&data, &mut shared).expect("flac");
     assert_eq!(meta.block_size_min(), Some(4608));
     assert_eq!(meta.sample_rate(), Some(8000));
     assert_eq!(meta.channels(), Some(2));
@@ -2186,11 +2167,7 @@ mod tests {
   #[test]
   fn process_flac_typed_rejects_missing_magic() {
     let mut shared = crate::format_parser::SharedFlags::new();
-    assert!(
-      parse_borrowed(b"not-flac-data-here", &mut shared)
-        .unwrap()
-        .is_none()
-    );
+    assert!(parse_borrowed(b"not-flac-data-here", &mut shared).is_none());
   }
 
   #[test]
@@ -2200,9 +2177,7 @@ mod tests {
     data.extend_from_slice(&[b'I', b'D', b'3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     data.extend_from_slice(&body);
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared)
-      .expect("ok")
-      .expect("flac");
+    let meta = parse_borrowed(&data, &mut shared).expect("flac");
     assert_eq!(meta.sample_rate(), Some(8000));
   }
 
@@ -2211,9 +2186,7 @@ mod tests {
     // Just `fLaC` — magic OK, no blocks. format_error stays false (silent
     // exit on pos+4 > len, faithful).
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(b"fLaC", &mut shared)
-      .expect("ok")
-      .expect("flac");
+    let meta = parse_borrowed(b"fLaC", &mut shared).expect("flac");
     assert!(meta.stream_info.block_size_min.is_none());
     assert!(!meta.has_format_error());
   }
@@ -2222,9 +2195,7 @@ mod tests {
   fn process_flac_typed_oversized_block_sets_format_error() {
     let data: &[u8] = &[b'f', b'L', b'a', b'C', 0x80, 0xff, 0xff, 0xff];
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(data, &mut shared)
-      .expect("ok")
-      .expect("flac");
+    let meta = parse_borrowed(data, &mut shared).expect("flac");
     assert!(meta.has_format_error());
   }
 
@@ -2318,7 +2289,7 @@ mod tests {
     // object loses key order).
     let data = fixture("FLAC_picture.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut tm = TagMap::new();
     emit_via_engine(&meta, true, &mut tm);
     let names: Vec<&str> = tm
@@ -2400,7 +2371,7 @@ mod tests {
   fn sink_into_map_writer_emits_streaminfo_tags() {
     let data = fixture("FLAC.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut w = TagMap::new();
     emit_via_engine(&meta, true, &mut w);
     let g = |n: &str| w.get("FLAC", n).cloned();
@@ -2553,15 +2524,6 @@ mod tests {
     assert!(cover.is_cover_art());
     assert!(named.try_unwrap_cover_art_ref().is_err());
   }
-
-  #[test]
-  fn flac_error_is_thiserror_uninhabited() {
-    // §5: empty enum derives core::error::Error via thiserror — assert the
-    // trait bound holds without needing to construct a value.
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   // ---------- Golden-pattern `Taggable` / `Project` ----------------------
 
   /// `Taggable::tags(-j)` yields the StreamInfo set (no PrintConv) through
@@ -2571,7 +2533,7 @@ mod tests {
   fn taggable_emits_streaminfo_print_conv() {
     let data = fixture("FLAC.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("FLAC", "SampleRate"), Some("8000".to_string()));
@@ -2601,7 +2563,7 @@ mod tests {
   fn taggable_emits_vorbis_multi_artist_list() {
     let data = fixture("FLAC_multi_artist.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
       let mut w = TagMap::new();
       crate::emit::run_emission(&meta, mode, &mut w);
@@ -2623,7 +2585,7 @@ mod tests {
   fn taggable_emits_picture_tags() {
     let data = fixture("FLAC_picture.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     // -j: PrintConv name + binary bytes.
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
@@ -2645,7 +2607,7 @@ mod tests {
   fn taggable_group_family0_and_family1_per_subtable() {
     let data = fixture("FLAC_duration.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty());
     let mut saw_flac = false;
@@ -2674,7 +2636,7 @@ mod tests {
   fn taggable_emits_composite_duration() {
     let data = fixture("FLAC_duration.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
     assert_eq!(
@@ -2695,7 +2657,7 @@ mod tests {
   fn taggable_chains_id3_before_flac_body() {
     let data = fixture("FLAC_id3_prefix.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
     let names: Vec<String> = meta
       .tags(ConvMode::PrintConv)
@@ -2733,7 +2695,7 @@ mod tests {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("FLAC_duration.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     let md = Project::project(&meta);
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);
     assert_eq!(md.media().duration(), Some(Duration::from_secs(30)));
@@ -2753,7 +2715,7 @@ mod tests {
     // FLAC.flac has TotalSamples == 0 ⇒ duration() is None.
     let data = fixture("FLAC.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
-    let meta = parse_borrowed(&data, &mut shared).unwrap().unwrap();
+    let meta = parse_borrowed(&data, &mut shared).unwrap();
     assert!(meta.duration().is_none());
     let md = Project::project(&meta);
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);

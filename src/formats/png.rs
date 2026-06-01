@@ -208,20 +208,6 @@ fn std_case(chunk: &[u8; 4]) -> Option<&'static [u8; 4]> {
 }
 
 // ===========================================================================
-// Error — uninhabited (Perl `return 0` ⇒ `Ok(None)`)
-// ===========================================================================
-
-/// Rust-level fatal modes for PNG parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror`;
-/// `#[non_exhaustive]` keeps future variants additive.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // `ProcessPng` — the lib-first parser
 // ===========================================================================
 
@@ -234,10 +220,9 @@ impl parser_sealed::Sealed for ProcessPng {}
 impl FormatParser for ProcessPng {
   type Meta<'a> = PngMeta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -247,8 +232,8 @@ impl FormatParser for ProcessPng {
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<PngMeta<'_>>, Error> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<PngMeta<'_>> {
+  parse_inner(data)
 }
 
 /// The chunk walker proper. `PNG.pm:1424` `return 0 unless $raf->Read($sig,8)
@@ -2923,15 +2908,15 @@ mod tests {
 
   #[test]
   fn signature_rejects_non_png() {
-    assert!(parse_borrowed(b"NOTAPNG\0").unwrap().is_none());
-    assert!(parse_borrowed(b"\x89PNG\r\n\x1a").unwrap().is_none()); // 7 bytes
-    assert!(parse_borrowed(&[]).unwrap().is_none());
+    assert!(parse_borrowed(b"NOTAPNG\0").is_none());
+    assert!(parse_borrowed(b"\x89PNG\r\n\x1a").is_none()); // 7 bytes
+    assert!(parse_borrowed(&[]).is_none());
   }
 
   #[test]
   fn signature_accepts_canonical_png() {
     let bytes = minimal_png_bytes();
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.dimensions(), Some((16, 16)));
     assert_eq!(meta.bit_depth(), Some(1));
     assert!(meta.color_type().expect("ihdr").is_grayscale());
@@ -2947,7 +2932,7 @@ mod tests {
     bytes.extend_from_slice(PNG_SIGNATURE);
     bytes.extend_from_slice(&0x80000000u32.to_be_bytes());
     bytes.extend_from_slice(b"IHDR");
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(meta.warnings().iter().any(|w| w.contains("chunk size")));
   }
 
@@ -2955,7 +2940,7 @@ mod tests {
   fn truncated_after_signature_yields_warning() {
     // Only the signature.
     let bytes = PNG_SIGNATURE.to_vec();
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     // No IHDR seen; the walker tries to read the next 8-byte header,
     // sees zero remaining bytes, warns and exits.
     assert!(meta.warnings().iter().any(|w| w.contains("Truncated")));
@@ -2977,7 +2962,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"pHYs", &phys));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.pixels_per_unit_x(), Some(2834));
     assert_eq!(meta.pixels_per_unit_y(), Some(2834));
     assert_eq!(meta.pixel_units(), Some(1));
@@ -3001,7 +2986,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"tEXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.text_records().len(), 1);
     let r = &meta.text_records()[0];
     assert!(r.kind().is_text());
@@ -3029,7 +3014,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"iTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.text_records().len(), 1);
     let r = &meta.text_records()[0];
     assert!(r.kind().is_itxt());
@@ -3085,7 +3070,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"iTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     let r = &meta.text_records()[0];
     // After inflate the record is no longer flagged compressed and carries the
     // decoded UTF-8 value — emission is identical to a plain iTXt.
@@ -3113,7 +3098,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"iTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     let r = &meta.text_records()[0];
     assert!(r.is_compressed());
     assert_eq!(r.value(), "");
@@ -3147,7 +3132,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"zTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.text_records().len(), 1);
     let r = &meta.text_records()[0];
     // Stored through the tEXt path: kind = tEXt, value decoded, NOT compressed.
@@ -3173,7 +3158,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"zTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     let r = &meta.text_records()[0];
     assert!(r.kind().is_ztxt());
     assert!(r.is_compressed());
@@ -3202,7 +3187,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"zTXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(
       meta
         .warnings()
@@ -3229,7 +3214,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"iCCP", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.icc_profile_name(), Some("sRGB IEC61966-2.1"));
     // No warning on clean inflate; the ICC-tag decode is deferred silently.
     assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
@@ -3250,7 +3235,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"iCCP", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.icc_profile_name(), Some("sRGB"));
     assert!(meta.warnings().iter().any(|w| w == "Error inflating iCCP"));
   }
@@ -3277,7 +3262,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"eXIf", &body));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     // The captured block is the INFLATED TIFF, ready for parse_exif_block —
     // a single native (non-profile) source.
     assert_single_exif_event(&meta, false, &tiff);
@@ -3299,7 +3284,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"eXIf", &body));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(meta.exif_events().is_empty());
     assert!(meta.warnings().iter().any(|w| w == "Error inflating eXIf"));
   }
@@ -3322,7 +3307,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"eXIf", &tiff));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_single_exif_event(&meta, false, &tiff);
   }
 
@@ -3346,7 +3331,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"eXIf", &tiff));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_single_exif_event(&meta, false, &tiff[inner_start..]);
     assert!(meta.warnings().iter().any(|w| w.contains("Exif00")),);
   }
@@ -3363,7 +3348,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"eXIf", b"XX\0bad"));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(meta.exif_events().is_empty());
     assert!(meta.warnings().iter().any(|w| w == "Invalid eXIf chunk"));
   }
@@ -3379,7 +3364,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"bKGD", &[0]));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.background_color(), Some("0"));
   }
 
@@ -3398,7 +3383,7 @@ mod tests {
     bkgd.extend_from_slice(&3u16.to_be_bytes());
     bytes.extend_from_slice(&chunk(b"bKGD", &bkgd));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.background_color(), Some("1 2 3"));
   }
 
@@ -3416,7 +3401,7 @@ mod tests {
     t.extend_from_slice(&[5, 22, 9, 30, 15]); // month, day, hour, min, sec
     bytes.extend_from_slice(&chunk(b"tIME", &t));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert_eq!(meta.modify_date(), Some("2025:05:22 09:30:15"));
   }
 
@@ -3434,7 +3419,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IDAT", b"\x00")); // minimal IDAT
     bytes.extend_from_slice(&chunk(b"tEXt", b"Comment\0Hi"));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(
       meta
         .warnings()
@@ -3450,7 +3435,7 @@ mod tests {
     bytes.extend_from_slice(PNG_SIGNATURE);
     bytes.extend_from_slice(&chunk(b"bKGD", &[0]));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(
       meta
         .warnings()
@@ -3471,7 +3456,7 @@ mod tests {
     ihdr_data.extend_from_slice(&[8, 2, 0, 0, 0]);
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr_data));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(
       meta
         .warnings()
@@ -3882,7 +3867,7 @@ mod tests {
     bytes.extend_from_slice(&chunk(b"IHDR", &ihdr));
     bytes.extend_from_slice(&chunk(b"tEXt", &payload));
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     // The decoded TIFF lands as a single ExifProfile event (walk order),
     // surfaced by `exif_events` for the chained walk.
     assert_single_exif_event(&meta, true, &tiff);
@@ -3902,7 +3887,7 @@ mod tests {
     bytes.extend_from_slice(&100u32.to_be_bytes());
     bytes.extend_from_slice(b"IHDR");
     bytes.extend_from_slice(b"\x00\x00\x00\x00\x00");
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     assert!(meta.warnings().iter().any(|w| w == "Corrupted PNG image"),);
   }
 
@@ -3923,7 +3908,7 @@ mod tests {
     bytes.extend_from_slice(&ihdr_data);
     bytes.extend_from_slice(&0xdead_beef_u32.to_be_bytes()); // intentional bad CRC
     bytes.extend_from_slice(&chunk(b"IEND", &[]));
-    let meta = parse_borrowed(&bytes).unwrap().expect("png parses");
+    let meta = parse_borrowed(&bytes).expect("png parses");
     // The IHDR data should still have decoded; default mode does NOT warn
     // about bad CRC.
     assert_eq!(meta.dimensions(), Some((1, 1)));

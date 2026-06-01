@@ -1303,7 +1303,7 @@ fn process_mebx_subdir(tag_id: &str, value: &[u8], out: &mut QuickTimeStreamMeta
   // (Duration / GPSLatitude / GPSLongitude are keyed on full reverse-DNS
   // paths), so the `PrintConv` render equals the `-n` render — collect once in
   // the default print mode (the `-ee`/`-j` golden mode).
-  if let Ok(Some(meta)) = crate::formats::plist::parse_borrowed(value) {
+  if let Some(meta) = crate::formats::plist::parse_borrowed(value) {
     for emitted in crate::emit::Taggable::tags(&meta, crate::emit::ConvMode::PrintConv) {
       // `Unknown => 1` tags are dropped from default output (every PLIST tag is
       // always-emitted, so this is a no-op in practice — kept for parity with

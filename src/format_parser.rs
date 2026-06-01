@@ -40,12 +40,15 @@ pub(crate) mod parser_sealed {
 /// formats take a richer struct with shared mutable state), and `Error`.
 ///
 /// `parse` returns:
-/// - `Ok(Some(meta))` — this is the format; here are the tags. (Perl `return 1`)
-/// - `Ok(None)`       — not this format, try the next detection candidate.
+/// - `Some(meta)` — this is the format; here are the tags. (Perl `return 1`)
+/// - `None`       — not this format, try the next detection candidate.
 ///   (Perl `return 0`)
-/// - `Err(e)`         — Rust-level fatal (not Perl-modeled — Perl uses
-///   `$et->Warn`/`$et->Error` which are recorded as tags in `Meta` regardless
-///   of return).
+///
+/// There is no fallible variant: every ported format models a malformed
+/// input as either a rejected candidate (`None`) or a `Meta` carrying a
+/// `Warn`/`Error` tag (Perl `$et->Warn`/`$et->Error` are recorded as tags
+/// in `Meta` regardless of return) — never a Rust-level `Err`. The contract
+/// is therefore `Option`, not `Result` (Golden-v2 §4).
 ///
 /// IMPORTANT: side effects on the shared [`SharedFlags`] (held inside the
 /// per-format `Context`) PERSIST regardless of return value, faithful to
@@ -84,15 +87,11 @@ pub trait FormatParser: parser_sealed::Sealed {
   type Context<'a>
   where
     Self: 'a;
-  /// Rust-level fatal error (distinct from Perl `Warn`/`Error` tags, which
-  /// belong to `Meta` and surface through the typed `serialize_tags` emission
-  /// into [`crate::tagmap::TagMap`]).
-  type Error;
 
   /// Run the parser on a per-format `Context`. The returned `Meta<'a>`
   /// borrows from the same `'a` as the input `Context`. See trait docs for
   /// return value semantics.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error>;
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>>;
 }
 
 /// Cross-format shared state. Threaded through chained parsers
@@ -1713,151 +1712,6 @@ const _: () = {
   }
 };
 
-// ===========================================================================
-// AnyError — closed-set error from `AnyParser::parse_any` + `parse_bytes`
-// ===========================================================================
-
-/// Aggregate Rust-level fatal error from the closed [`AnyParser`] dispatch.
-///
-/// One variant wraps each format's [`FormatParser::Error`]; conversions
-/// from the per-format `XxxError` types are provided via `From` impls so
-/// the per-arm dispatch in [`AnyParser::parse_any`] can write
-/// `.map_err(Into::into)`.
-///
-/// Most format errors today are uninhabited (no variants — see e.g.
-/// [`crate::formats::moi::Error`]); the `From` impls for those formats
-/// translate into unreachable matches that `rustc` constant-folds out at
-/// monomorphization. The structure exists so future I/O-fallible parsers
-/// can add fatal modes without changing the public `AnyError` shape.
-///
-/// `#[non_exhaustive]` matches [`AnyParser`] / [`AnyMeta`]: consumers
-/// cannot exhaustively match on this enum across crate-feature combos —
-/// new format arms (or new variants on existing errors) are additive
-/// within the crate, but no caller can rely on a fixed set.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error`, no-std
-/// clean — was a `std`-only hand-written `impl std::error::Error`). Each
-/// wrapped source is `#[from]` (which implies `#[source]`): thiserror
-/// generates the per-arm `From<XxxError>` conversion AND threads the wrapped
-/// error through `source()`, so the dispatch in [`AnyParser::parse_any`] can
-/// write `.map_err(Into::into)` for free. This was a Wave-1 forward item: it
-/// became possible once the Wave-2 sweep gave every format error a
-/// `#[derive(thiserror::Error)]` `core::error::Error` impl in all feature
-/// tiers (the `#[from]`-implied `XxxError: core::error::Error` bound is now
-/// satisfied unconditionally, not just under `std`). `#[from]` works even on
-/// the uninhabited (empty-enum) format errors — thiserror emits a
-/// `From<Empty>` whose body is type-correct but never callable, which `rustc`
-/// constant-folds out at monomorphization.
-#[non_exhaustive]
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum AnyError {
-  /// MOI fatal-error wrapper.
-  #[cfg(feature = "moi")]
-  #[error("MOI: {0}")]
-  Moi(#[from] crate::formats::moi::Error),
-  /// AAC fatal-error wrapper.
-  #[cfg(feature = "aac")]
-  #[error("AAC: {0}")]
-  Aac(#[from] crate::formats::aac::Error),
-  /// DV fatal-error wrapper.
-  #[cfg(feature = "dv")]
-  #[error("DV: {0}")]
-  Dv(#[from] crate::formats::dv::Error),
-  /// Audible (AA) fatal-error wrapper.
-  #[cfg(feature = "audible")]
-  #[error("AA: {0}")]
-  Aa(#[from] crate::formats::audible::Error),
-  /// Canon CRW fatal-error wrapper.
-  #[cfg(feature = "crw")]
-  #[error("CRW: {0}")]
-  Crw(#[from] crate::formats::crw::Error),
-  /// Red R3D fatal-error wrapper.
-  #[cfg(feature = "red")]
-  #[error("R3D: {0}")]
-  R3d(#[from] crate::formats::red::Error),
-  /// ID3 fatal-error wrapper.
-  #[cfg(feature = "id3")]
-  #[error("ID3: {0}")]
-  Id3(#[from] crate::formats::id3::Id3Error),
-  /// MP3 fatal-error wrapper.
-  #[cfg(feature = "mp3")]
-  #[error("MP3: {0}")]
-  Mp3(#[from] crate::formats::id3::Mp3Error),
-  /// AIFF fatal-error wrapper.
-  #[cfg(feature = "aiff")]
-  #[error("AIFF: {0}")]
-  Aiff(#[from] crate::formats::aiff::Error),
-  /// APE fatal-error wrapper.
-  #[cfg(feature = "ape")]
-  #[error("APE: {0}")]
-  Ape(#[from] crate::formats::ape::Error),
-  /// DSF fatal-error wrapper.
-  #[cfg(feature = "dsf")]
-  #[error("DSF: {0}")]
-  Dsf(#[from] crate::formats::dsf::Error),
-  /// FLAC fatal-error wrapper.
-  #[cfg(feature = "flac")]
-  #[error("FLAC: {0}")]
-  Flac(#[from] crate::formats::flac::Error),
-  /// H264 fatal-error wrapper.
-  #[cfg(feature = "h264")]
-  #[error("H264: {0}")]
-  H264(#[from] crate::formats::h264::H264Error),
-  /// Flash FLV fatal-error wrapper.
-  #[cfg(feature = "flash")]
-  #[error("FLV: {0}")]
-  Flv(#[from] crate::formats::flash::Error),
-  /// Ogg fatal-error wrapper.
-  #[cfg(feature = "ogg")]
-  #[error("OGG: {0}")]
-  Ogg(#[from] crate::formats::ogg::Error),
-  /// PNG fatal-error wrapper.
-  #[cfg(feature = "png")]
-  #[error("PNG: {0}")]
-  Png(#[from] crate::formats::png::Error),
-  /// Real (RM/RA/RAM/RPM) fatal-error wrapper.
-  #[cfg(feature = "real")]
-  #[error("Real: {0}")]
-  Real(#[from] crate::formats::real::RealError),
-  /// MPEG audio fatal-error wrapper.
-  #[cfg(feature = "mpeg-audio")]
-  #[error("MPEG-audio: {0}")]
-  MpegAudio(#[from] crate::formats::mpeg::AudioError),
-  /// MPC fatal-error wrapper.
-  #[cfg(feature = "mpc")]
-  #[error("MPC: {0}")]
-  Mpc(#[from] crate::formats::mpc::Error),
-  /// WavPack fatal-error wrapper.
-  #[cfg(feature = "wavpack")]
-  #[error("WV: {0}")]
-  Wv(#[from] crate::formats::wavpack::Error),
-  /// Matroska fatal-error wrapper.
-  #[cfg(feature = "matroska")]
-  #[error("Matroska: {0}")]
-  Matroska(#[from] crate::formats::matroska::Error),
-  /// QuickTime fatal-error wrapper.
-  #[cfg(feature = "quicktime")]
-  #[error("QuickTime: {0}")]
-  QuickTime(#[from] crate::formats::quicktime::Error),
-  /// MXF fatal-error wrapper.
-  #[cfg(feature = "mxf")]
-  #[error("MXF: {0}")]
-  Mxf(#[from] crate::formats::mxf::MxfError),
-  /// PLIST fatal-error wrapper.
-  #[cfg(feature = "plist")]
-  #[error("PLIST: {0}")]
-  Plist(#[from] crate::formats::plist::Error),
-  /// Exif/TIFF fatal-error wrapper.
-  #[cfg(feature = "exif")]
-  #[error("Exif: {0}")]
-  Exif(#[from] crate::exif::Error),
-  /// RIFF fatal-error wrapper. Currently empty (every bad input is `Ok(None)`)
-  /// but kept for thiserror-`From` symmetry with the other formats.
-  #[cfg(feature = "riff")]
-  #[error("RIFF: {0}")]
-  Riff(#[from] crate::formats::riff::RiffError),
-}
-
 // R3 F1: the bespoke `id3v2_prefix_end` helper has been removed. The
 // previous dispatch arm computed an ID3v2-header offset, skipped past the
 // prefix, and reparsed the OGG body — but never emitted the ID3 directory
@@ -1899,13 +1753,11 @@ impl AnyParser {
   /// (bundled's `TIFF_TYPE eq 'TIFF'`, `ExifTool.pm:8715`/`:8767`); every other
   /// arm ignores it. `None` ⇒ gate off (no synthesized PageCount).
   ///
-  /// # Errors
-  ///
-  /// Returns [`AnyError`] when the dispatched per-format parser raises a
-  /// Rust-level fatal. Most ported formats today have no fatal modes
-  /// (uninhabited `XxxError` enums), so the `Err` branch is unreachable
-  /// in practice; the structure is in place for future I/O-fallible
-  /// parsers.
+  /// Returns `Some(meta)` for the first parser that accepts `bytes`, or
+  /// `None` to reject this candidate. No ported format has a Rust-level
+  /// fatal mode — a malformed input is either rejected (`None`) or accepted
+  /// with a `Warn`/`Error` tag recorded in the `Meta` — so the contract is
+  /// `Option`, not `Result` (Golden-v2 §4).
   ///
   /// `ext` borrows on an INDEPENDENT (elided) lifetime — distinct from
   /// `bytes`. Only `bytes` drives the returned `AnyMeta<'a>`; no dispatch arm
@@ -1921,7 +1773,7 @@ impl AnyParser {
     ext: Option<&str>,
     header_skip: usize,
     tiff_parent_type: Option<&str>,
-  ) -> Result<Option<AnyMeta<'a>>, AnyError> {
+  ) -> Option<AnyMeta<'a>> {
     // No-format build (Codex CF3): `AnyParser` has no variants, so the
     // `match` below is empty and the parameters are unused. Discard them
     // to keep the no-format tier warning-clean.
@@ -1964,30 +1816,22 @@ impl AnyParser {
       #[cfg(feature = "moi")]
       AnyParser::Moi(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Moi))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Moi)
       }
       #[cfg(feature = "aac")]
       AnyParser::Aac(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Aac))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Aac)
       }
       #[cfg(feature = "dv")]
       AnyParser::Dv(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Dv))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Dv)
       }
       #[cfg(feature = "audible")]
       AnyParser::Aa(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Aa))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Aa)
       }
       #[cfg(feature = "crw")]
       AnyParser::Crw(p) => {
@@ -1998,16 +1842,12 @@ impl AnyParser {
         // (faithful to `ProcessCanonRaw` dispatching `CanonRaw::Main`
         // SubDirectory records into `Image::ExifTool::Canon`).
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Crw))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Crw)
       }
       #[cfg(feature = "red")]
       AnyParser::R3D(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::R3d))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::R3d)
       }
       // Chained formats dispatch via their **decoupled** `*_borrowed` /
       // `*_owned` entries: `shared` borrows independently of `bytes`, so the
@@ -2020,22 +1860,17 @@ impl AnyParser {
         let _ = (p, ext);
         // ID3 typed Meta is mode-locked; the closed dispatch stages `-j`.
         crate::formats::id3::parse_id3_borrowed(bytes, Some(shared), /* print_conv */ true)
-          .map(|o| o.map(AnyMeta::Id3))
-          .map_err(Into::into)
+          .map(AnyMeta::Id3)
       }
       #[cfg(feature = "mp3")]
       AnyParser::Mp3(p) => {
         let _ = p;
-        crate::formats::id3::parse_mp3_borrowed(bytes, ext, shared)
-          .map(|o| o.map(AnyMeta::Mp3))
-          .map_err(Into::into)
+        crate::formats::id3::parse_mp3_borrowed(bytes, ext, shared).map(AnyMeta::Mp3)
       }
       #[cfg(feature = "aiff")]
       AnyParser::Aiff(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Aiff))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Aiff)
       }
       #[cfg(feature = "ape")]
       AnyParser::Ape(p) => {
@@ -2045,23 +1880,19 @@ impl AnyParser {
         // returned `ape::Meta`, so the typed `parse_any` path emits the complete
         // `File:ID3Size` + `ID3v2_*`/`ID3v1` + `MAC:*` + `APE:*` tag set —
         // matching the engine `ProcessApe::process`. (`ape` pulls `id3`.)
-        Ok(crate::formats::ape::parse_full_chained(bytes, shared).map(AnyMeta::Ape))
+        crate::formats::ape::parse_full_chained(bytes, shared).map(AnyMeta::Ape)
       }
       #[cfg(feature = "dsf")]
       AnyParser::Dsf(p) => {
         let _ = (p, ext, &mut *shared);
         // DSF's typed parse uses only `data`; the ID3v2 trailer scan range
         // is exposed on the Meta for the caller to dispatch.
-        crate::formats::dsf::parse_borrowed(bytes)
-          .map(|o| o.map(AnyMeta::Dsf))
-          .map_err(Into::into)
+        crate::formats::dsf::parse_borrowed(bytes).map(AnyMeta::Dsf)
       }
       #[cfg(feature = "flac")]
       AnyParser::Flac(p) => {
         let _ = (p, ext);
-        crate::formats::flac::parse_borrowed(bytes, shared)
-          .map(|o| o.map(AnyMeta::Flac))
-          .map_err(Into::into)
+        crate::formats::flac::parse_borrowed(bytes, shared).map(AnyMeta::Flac)
       }
       #[cfg(feature = "h264")]
       AnyParser::H264(p) => {
@@ -2069,18 +1900,14 @@ impl AnyParser {
         // dispatch is unreachable in practice. It is wired for a future
         // M2TS / MPEG port that resolves an `AnyParser::H264` directly.
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::H264))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::H264)
       }
       #[cfg(feature = "flash")]
       AnyParser::Flv(p) => {
         let _ = (p, shared, ext);
         // FLV is a leaf format (no cross-format chain): ignore `shared`
         // and `ext`. The typed `parse_borrowed` accepts only a byte slice.
-        crate::formats::flash::parse_borrowed(bytes)
-          .map(|o| o.map(AnyMeta::Flv))
-          .map_err(Into::into)
+        crate::formats::flash::parse_borrowed(bytes).map(AnyMeta::Flv)
       }
       #[cfg(feature = "ogg")]
       AnyParser::Ogg(p) => {
@@ -2102,13 +1929,9 @@ impl AnyParser {
         // the same `SharedFlags`'s `DoneID3` already set, mirroring
         // bundled `unless ($$et{DoneID3})` recursion guard).
         // (`ogg` requires `id3` in Cargo.toml.)
-        let chained =
-          crate::formats::ogg::parse_full_chained(bytes, shared, /* print_conv */ true)?
-            .filter(|m| m.success());
-        if let Some(m) = chained {
-          return Ok(Some(AnyMeta::Ogg(m)));
-        }
-        Ok(None)
+        crate::formats::ogg::parse_full_chained(bytes, shared, /* print_conv */ true)
+          .filter(|m| m.success())
+          .map(AnyMeta::Ogg)
       }
       #[cfg(feature = "png")]
       AnyParser::Png(p) => {
@@ -2120,9 +1943,7 @@ impl AnyParser {
         // `ProcessPNG → ProcessTIFF → ProcessExif` dispatch chain at
         // PNG.pm:1391).
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Png))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Png)
       }
       #[cfg(feature = "real")]
       AnyParser::Real(p) => {
@@ -2139,9 +1960,7 @@ impl AnyParser {
         // `FormatParser::parse` has no extension channel, so the dispatch
         // uses the extension-aware `parse_with_ext` entry instead.
         let _ = (p, shared);
-        crate::formats::real::parse_with_ext(bytes, ext)
-          .map(|o| o.map(AnyMeta::Real))
-          .map_err(Into::into)
+        crate::formats::real::parse_with_ext(bytes, ext).map(AnyMeta::Real)
       }
       #[cfg(feature = "mpeg-audio")]
       AnyParser::MpegAudio(p) => {
@@ -2156,9 +1975,7 @@ impl AnyParser {
         let _ = (p, &mut *shared);
         let ext = ext.unwrap_or("");
         let mp3 = !ext.eq_ignore_ascii_case("MUS");
-        crate::formats::mpeg::parse_borrowed(bytes, mp3, ext)
-          .map(|o| o.map(AnyMeta::MpegAudio))
-          .map_err(Into::into)
+        crate::formats::mpeg::parse_borrowed(bytes, mp3, ext).map(AnyMeta::MpegAudio)
       }
       #[cfg(feature = "mpc")]
       AnyParser::Mpc(p) => {
@@ -2169,7 +1986,7 @@ impl AnyParser {
         // `parse_borrowed` which dropped both chains.
         // (`mpc` requires `id3` + `ape` in Cargo.toml so this `cfg(all)`
         // arm is the only one — the bare `parse_borrowed` is gone.)
-        Ok(crate::formats::mpc::parse_full_chained(bytes, shared).map(AnyMeta::Mpc))
+        crate::formats::mpc::parse_full_chained(bytes, shared).map(AnyMeta::Mpc)
       }
       #[cfg(feature = "wavpack")]
       AnyParser::Wv(p) => {
@@ -2178,14 +1995,12 @@ impl AnyParser {
         // trailer chain (WavPack.pm:100-103 `APE::ProcessAPE`). The
         // pre-fix arm called `parse_borrowed` which dropped the chain.
         // (`wavpack` requires `id3` + `ape` in Cargo.toml.)
-        Ok(crate::formats::wavpack::parse_full_chained(bytes, shared).map(AnyMeta::Wv))
+        crate::formats::wavpack::parse_full_chained(bytes, shared).map(AnyMeta::Wv)
       }
       #[cfg(feature = "matroska")]
       AnyParser::Matroska(p) => {
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Matroska))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Matroska)
       }
       #[cfg(feature = "quicktime")]
       AnyParser::QuickTime(p) => {
@@ -2195,27 +2010,21 @@ impl AnyParser {
         // The leaf `FormatParser::parse` has no extension channel, so the
         // dispatch uses the extension-aware `parse_with_ext` entry instead.
         let _ = (p, shared);
-        crate::formats::quicktime::parse_with_ext(bytes, ext)
-          .map(|o| o.map(AnyMeta::QuickTime))
-          .map_err(Into::into)
+        crate::formats::quicktime::parse_with_ext(bytes, ext).map(AnyMeta::QuickTime)
       }
       #[cfg(feature = "mxf")]
       AnyParser::Mxf(p) => {
         // MXF is a leaf format (Engine-only, no chained state): `shared`
         // and `ext` are unused.
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Mxf))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Mxf)
       }
       #[cfg(feature = "plist")]
       AnyParser::Plist(p) => {
         // PLIST is a leaf format (no cross-format chains); `shared` / `ext`
         // are unused. The parser detects the binary vs XML encoding itself.
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Plist))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Plist)
       }
       #[cfg(feature = "exif")]
       AnyParser::Exif(p) => {
@@ -2262,9 +2071,8 @@ impl AnyParser {
         let _ = (p, shared);
         let body = bytes.get(header_skip..).unwrap_or(&[]);
         if body.len() >= 2 && body[0] == 0xff && body[1] == 0xd8 {
-          return Ok(
-            crate::exif::jpeg::parse_jpeg_exif_with_base(body, header_skip).map(AnyMeta::Exif),
-          );
+          return crate::exif::jpeg::parse_jpeg_exif_with_base(body, header_skip)
+            .map(AnyMeta::Exif);
         }
         // A standalone TIFF — at byte 0 normally, or at `bytes[header_skip..]`
         // for the detector's terminal TIFF-after-unknown-header candidate.
@@ -2298,24 +2106,20 @@ impl AnyParser {
         // the finalized name stays the detected `"TIFF"`.
         let file_type =
           crate::parser::finalized_tiff_file_type("TIFF", tiff_parent_type.unwrap_or(""), ext);
-        Ok(
-          crate::exif::parse_standalone_tiff_with_base(
-            body,
-            base,
-            tiff_type_is_tiff,
-            Some(&file_type),
-          )
-          .map(AnyMeta::Exif),
+        crate::exif::parse_standalone_tiff_with_base(
+          body,
+          base,
+          tiff_type_is_tiff,
+          Some(&file_type),
         )
+        .map(AnyMeta::Exif)
       }
       #[cfg(feature = "riff")]
       AnyParser::Riff(p) => {
         // RIFF is a leaf format (no chained state today): `shared` and
         // `ext` are unused.
         let _ = (shared, ext);
-        p.parse(bytes)
-          .map(|o| o.map(AnyMeta::Riff))
-          .map_err(Into::into)
+        p.parse(bytes).map(AnyMeta::Riff)
       }
     }
   }
@@ -2527,8 +2331,8 @@ mod tests {
     let result = parser.parse_any(bytes, &mut shared, None, 0, None);
     // The exact `Some`/`None` outcome depends on the MOI parser's
     // acceptance rules for a 16-byte buffer; this test just verifies the
-    // dispatch doesn't panic and produces an `Ok(_)` result.
-    assert!(result.is_ok());
+    // dispatch doesn't panic and routes through the closed `AnyMeta` enum.
+    let _ = result;
   }
 
   /// Codex C-R3-1: `parse_any` decouples the transient `ext` borrow from the
@@ -2549,25 +2353,12 @@ mod tests {
     let meta = {
       // `ext` is a short-lived String dropped at the end of this block.
       let ext: String = String::from("MP3");
-      let m = parser
-        .parse_any(&bytes, &mut shared, Some(ext.as_str()), 0, None)
-        .expect("ok");
+      let m = parser.parse_any(&bytes, &mut shared, Some(ext.as_str()), 0, None);
       // `ext` drops here; `m` must remain valid (it borrows only `bytes`).
       m
     };
     // Use the meta after `ext` is gone — proves the decoupling.
     let _ = meta.is_some();
-  }
-
-  /// `AnyError` formats nicely via `Display`. Most format errors are
-  /// uninhabited, so the variant constructors aren't constructible — but
-  /// the `Display` impl compiles, which is what matters.
-  #[test]
-  fn any_error_implements_display() {
-    fn _accepts_display<E: core::fmt::Display>(_: &E) {}
-    fn _check_any_error(e: &AnyError) {
-      _accepts_display(e);
-    }
   }
 
   /// `Rendered` serializes a typed `AnyMeta`'s FORMAT tags to a flat
@@ -2588,7 +2379,6 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parser
       .parse_any(&data, &mut shared, Some("AAC"), 0, None)
-      .expect("parse ok")
       .expect("AAC recognized");
 
     // -j (PrintConv): a flat object of AAC:* tags; no SourceFile / File:* /
@@ -2637,9 +2427,8 @@ mod tests {
 /// impl FormatParser for ForeignParser {
 ///   type Meta = ();
 ///   type Context<'a> = &'a [u8];
-///   type Error = ();
-///   fn parse<'a>(&self, _ctx: &'a [u8]) -> Result<Option<()>, ()> {
-///     Ok(None)
+///   fn parse<'a>(&self, _ctx: &'a [u8]) -> Option<()> {
+///     None
 ///   }
 /// }
 /// ```

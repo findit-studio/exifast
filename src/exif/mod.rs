@@ -815,20 +815,19 @@ impl parser_sealed::Sealed for ProcessExif {}
 impl FormatParser for ProcessExif {
   type Meta<'a> = ExifMeta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
   /// Dispatched by [`crate::format_parser::any_parser_for`] when
   /// `File:FileType == "TIFF"` — the standalone-TIFF entry. Sets
   /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
   /// synthesis (`ExifTool.pm:8756-8757`) is active.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // Direct standalone-TIFF lib entry: no candidate `Parent` context (the
     // engine path through `AnyParser::Exif` carries the real type via
     // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
     // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
-    Ok(parse_tiff(
+    parse_tiff(
       data, /* tiff_type_is_tiff */ true, /* file_type */ None,
-    ))
+    )
   }
 }
 
@@ -836,16 +835,16 @@ impl FormatParser for ProcessExif {
 /// `TIFF_TYPE` is "TIFF" (`ExifTool.pm:8704`), so a multi-page TIFF emits
 /// `File:PageCount` (`ExifTool.pm:8757`).
 ///
-/// # Errors
-///
-/// Returns `Err` only for Rust-level fatal modes (none today — every bad
-/// input is `Ok(None)`, faithful to `DoProcessTIFF` `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
+/// Returns `None` when `data` is not a valid TIFF header (`DoProcessTIFF`
+/// `return 0`); a malformed TIFF surfaces its diagnostics as `Warn`/`Error`
+/// tags on the returned [`ExifMeta`], never as a fatal error.
+#[must_use]
+pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
   // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
   // None` (see [`ProcessExif::parse`]).
-  Ok(parse_tiff(
+  parse_tiff(
     data, /* tiff_type_is_tiff */ true, /* file_type */ None,
-  ))
+  )
 }
 
 /// **Reusable entry — the QuickTime/RIFF/MakerNotes seam.** Parse a raw
@@ -3817,18 +3816,6 @@ fn join_floats(vals: &[f64]) -> String {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for Exif/TIFF parsing. Currently empty — every bad
-/// input produces `Ok(None)` (faithful to `DoProcessTIFF` `return 0`) or is
-/// walked past silently (an unknown tag / format / out-of-range offset).
-/// Reserved for future I/O-fallible wrappers.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Unit tests
 // ===========================================================================
 
@@ -3860,7 +3847,7 @@ mod tests {
   #[test]
   fn rejects_short_buffer() {
     assert!(parse_exif_block(b"MM\0").is_none());
-    assert!(parse_borrowed(b"").unwrap().is_none());
+    assert!(parse_borrowed(b"").is_none());
   }
 
   #[test]
@@ -4236,7 +4223,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // value = 2 (single page of multi-page)
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
     // Standalone entry: emits `multi_page_count = Some(2)`.
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), Some(2));
     // Embedded entry on the same bytes: `multi_page_count = None` (the
     // `TIFF_TYPE == 'TIFF'` gate at ExifTool.pm:8757 is off).
@@ -4256,7 +4243,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]); // SubfileType LONG count=1
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // value = 0 (full-resolution)
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), None);
   }
 
@@ -4281,7 +4268,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xff, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]); // value SHORT=3
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), Some(2));
   }
 
@@ -4302,7 +4289,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), None);
   }
 

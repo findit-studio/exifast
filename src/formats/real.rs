@@ -501,7 +501,6 @@ impl FormatParser for ProcessReal {
   /// Leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error.
-  type Error = RealError;
 
   /// Parse a Real file's bytes into a typed [`RealMeta`], or `None` if the
   /// buffer is not a Real file (no magic match — Real.pm:523).
@@ -511,7 +510,7 @@ impl FormatParser for ProcessReal {
   /// (Real.pm:536 `($ext and $ext eq 'RPM')` is false). Callers that
   /// need the RAM-vs-RPM distinction use [`parse_with_ext`] (the engine
   /// dispatch in `AnyParser::parse_any` does).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, RealError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data, None)
   }
 }
@@ -525,7 +524,7 @@ impl FormatParser for ProcessReal {
 ///
 /// Returns `Err` for Rust-level fatal modes (currently none — every bad
 /// input is `Ok(None)` per Perl `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
+pub fn parse_borrowed(data: &[u8]) -> Option<RealMeta<'_>> {
   parse_inner(data, None)
 }
 
@@ -542,32 +541,29 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
 ///
 /// Returns `Err` for Rust-level fatal modes (currently none — every bad
 /// input is `Ok(None)` per Perl `return 0`).
-pub fn parse_with_ext<'a>(
-  data: &'a [u8],
-  ext: Option<&str>,
-) -> Result<Option<RealMeta<'a>>, RealError> {
+pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
   parse_inner(data, ext)
 }
 
-fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<RealMeta<'a>>, RealError> {
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
   // Real.pm:522 — `$raf->Read($buff,8) == 8`.
   if data.len() < 8 {
-    return Ok(None);
+    return None;
   }
   // Real.pm:523 — magic dispatch.
   if data.starts_with(b".RMF") {
-    return Ok(Some(parse_rm(data)));
+    return Some(parse_rm(data));
   }
   if data.starts_with(b".ra\xfd") {
-    return Ok(Some(parse_ra(data)));
+    return Some(parse_ra(data));
   }
   if data.starts_with(b"pnm://") || data.starts_with(b"rtsp://") || data.starts_with(b"http://") {
     // Real.pm:533-555 — Metafile branch. `parse_metafile` itself decides
     // acceptance (Real.pm:546 http-URL gate); a rejected buffer returns
     // `Ok(None)` ⇒ `return 0` ⇒ the engine candidate loop continues.
-    return Ok(parse_metafile(data, ext));
+    return parse_metafile(data, ext);
   }
-  Ok(None)
+  None
 }
 
 // ===========================================================================
@@ -2479,21 +2475,6 @@ impl crate::metadata::Project for RealMeta<'_> {
 }
 
 // ===========================================================================
-// `RealError` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for Real parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`).
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`). `#[non_exhaustive]` lets the first real variant
-/// land without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RealError {}
-
-// ===========================================================================
 // Optional serde `Serialize` impl for `Rendered<'_, '_, RealMeta<'_>>`
 // ===========================================================================
 //
@@ -2508,13 +2489,6 @@ pub enum RealError {}
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn real_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<RealError>();
-  }
-
   #[test]
   fn real_audio_version_from_raw_round_trip() {
     assert_eq!(RealAudioVersion::from_raw(3), RealAudioVersion::Ra3);
@@ -2598,20 +2572,20 @@ mod tests {
 
   #[test]
   fn parse_inner_rejects_short_buffer() {
-    assert!(parse_inner(&[], None).unwrap().is_none());
-    assert!(parse_inner(&[0u8; 4], None).unwrap().is_none());
+    assert!(parse_inner(&[], None).is_none());
+    assert!(parse_inner(&[0u8; 4], None).is_none());
   }
 
   #[test]
   fn parse_inner_rejects_bad_magic() {
-    assert!(parse_inner(b"NOMAGIC1", None).unwrap().is_none());
+    assert!(parse_inner(b"NOMAGIC1", None).is_none());
   }
 
   #[test]
   fn parse_inner_accepts_rm_magic() {
     let mut buf = b".RMF\x00\x00\x00\x12".to_vec();
     buf.resize(64, 0);
-    let m = parse_inner(&buf, None).unwrap().expect("RM accepted");
+    let m = parse_inner(&buf, None).expect("RM accepted");
     assert_eq!(m.kind(), RealKind::Rm);
   }
 
@@ -2619,7 +2593,7 @@ mod tests {
   fn parse_inner_accepts_ra_magic() {
     let mut buf = b".ra\xfd\x00\x04\x00\x00".to_vec();
     buf.resize(520, 0);
-    let m = parse_inner(&buf, None).unwrap().expect("RA accepted");
+    let m = parse_inner(&buf, None).expect("RA accepted");
     assert_eq!(m.kind(), RealKind::Ra);
     assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
   }
@@ -2627,9 +2601,7 @@ mod tests {
   #[test]
   fn parse_inner_accepts_pnm_uri_metafile() {
     // RAM URL line.
-    let m = parse_inner(b"pnm://host/file.ra\n", None)
-      .unwrap()
-      .expect("metafile accepted");
+    let m = parse_inner(b"pnm://host/file.ra\n", None).expect("metafile accepted");
     assert_eq!(m.kind(), RealKind::Ram);
   }
 
@@ -2676,11 +2648,7 @@ mod tests {
     assert!(parse_metafile(b"http://host/page.html\nhttp://host/ok.rm\n", None).is_none());
     // `parse_inner` propagates the `None` (the magic prefix matched, but
     // the Metafile branch declined).
-    assert!(
-      parse_inner(b"http://host/page.html\n", None)
-        .unwrap()
-        .is_none()
-    );
+    assert!(parse_inner(b"http://host/page.html\n", None).is_none());
   }
 
   #[test]
@@ -2994,7 +2962,7 @@ mod tests {
   #[test]
   fn taggable_emits_rm_prop_mdpr_print_and_raw() {
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
 
     // -j (PrintConv): bitrate/duration/Flags render as strings.
     let pj = emit(&m, true);
@@ -3066,7 +3034,7 @@ mod tests {
   #[test]
   fn taggable_emits_ra_header_under_versioned_group() {
     let data = fixture("Real.ra");
-    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    let m = parse_borrowed(&data).expect("RA parses");
     assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
     // The RA fixture decodes as RA4 ⇒ codec fields live under `Real-RA4`.
     // (Identity table: -j and -n agree on the value.)
@@ -3095,7 +3063,7 @@ mod tests {
     // family-1), which the `TagMap` sink collapses to family-1 only.
     use crate::emit::{ConvMode, Taggable};
     let rm = fixture("Real.rm");
-    let m = parse_borrowed(&rm).unwrap().expect("RM parses");
+    let m = parse_borrowed(&rm).expect("RM parses");
     let tags: Vec<_> = m.tags(ConvMode::PrintConv).collect();
     // Every Real-* subgroup carries family-0 = the module name "Real"; the
     // chained ID3v1 carries family-0/1 both "ID3v1".
@@ -3141,7 +3109,7 @@ mod tests {
 
     // RA header subgroup: family-0 "Real", family-1 "Real-RA4".
     let ra = fixture("Real.ra");
-    let mra = parse_borrowed(&ra).unwrap().expect("RA parses");
+    let mra = parse_borrowed(&ra).expect("RA parses");
     let ra_tags: Vec<_> = mra.tags(ConvMode::PrintConv).collect();
     assert!(!ra_tags.is_empty());
     for t in &ra_tags {
@@ -3151,9 +3119,7 @@ mod tests {
 
     // Metafile subgroup: family-0/1 both "Real".
     let ram = fixture("real_synth_ram_pnm.ram");
-    let mram = parse_with_ext(&ram, Some("RAM"))
-      .unwrap()
-      .expect("RAM parses");
+    let mram = parse_with_ext(&ram, Some("RAM")).expect("RAM parses");
     let ram_tags: Vec<_> = mram.tags(ConvMode::PrintConv).collect();
     assert!(!ram_tags.is_empty());
     for t in &ram_tags {
@@ -3170,7 +3136,7 @@ mod tests {
     // tags follow ALL the Real-* tags (PROP→MDPR→CONT→RJMD), at the position
     // the retired `emit_id3v1` ran.
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
 
     let pj = emit(&m, true);
     assert_eq!(
@@ -3215,7 +3181,7 @@ mod tests {
     // edge branches: present-but-empty Title (`Some("")`) and a sparse genre
     // byte (no %genre entry ⇒ `Unknown (n)` in -j, raw byte in -n).
     let empty = fixture("real_synth_id3v1_empty_title.rm");
-    let me = parse_borrowed(&empty).unwrap().expect("RM parses");
+    let me = parse_borrowed(&empty).expect("RM parses");
     let ej = emit(&me, true);
     // Present-but-empty Title is emitted as the empty string (faithful).
     assert_eq!(
@@ -3224,7 +3190,7 @@ mod tests {
     );
 
     let sparse = fixture("real_synth_id3v1_sparse_genre.rm");
-    let ms = parse_borrowed(&sparse).unwrap().expect("RM parses");
+    let ms = parse_borrowed(&sparse).expect("RM parses");
     let sj = emit(&ms, true);
     // Sparse genre ⇒ `Unknown (n)` PrintConv string.
     let g = sj.get_str("ID3v1", "Genre").expect("Genre present");
@@ -3265,7 +3231,7 @@ mod tests {
   fn project_rm_audio_track_and_duration() {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
     let md = m.project();
     // Real.rm: stream 0 is audio/x-pn-realaudio ⇒ one Audio track; stream 1
     // is logical-fileinfo ⇒ no track.
@@ -3285,7 +3251,7 @@ mod tests {
   fn project_ra_is_single_audio_track() {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("Real.ra");
-    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    let m = parse_borrowed(&data).expect("RA parses");
     let md = m.project();
     // RA is a single RealAudio stream ⇒ one Audio track, no duration accessor.
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);

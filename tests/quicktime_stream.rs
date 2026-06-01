@@ -58,9 +58,7 @@ fn quicktime_mebx_timed_metadata_decodes_keys_table() {
   // value 123456. Bundled `-ee` ⇒ `Track1:GPSCoordinates = 123456`.
   let data = fixture("QuickTime_mebx_gps.mov");
   let golden = ee_golden("QuickTime_mebx_gps.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert!(!stream.is_empty(), "mebx timed metadata must be decoded");
   // The keys-table mebx pair.
@@ -97,9 +95,7 @@ fn quicktime_mebx_float_array_value_reads_all_elements() {
   // `QuickTime_mebx_float.mov.ee.json`) ⇒ `Track1:TestMatrix = "1 2.5 -3 4.25"`.
   let data = fixture("QuickTime_mebx_float.mov");
   let golden = ee_golden("QuickTime_mebx_float.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   let pairs = stream.mebx_samples();
   assert_eq!(pairs.len(), 1, "one mebx key/value pair");
@@ -134,9 +130,7 @@ fn quicktime_mebx_keys_table_name_resolution_and_value_conv() {
   //   Track1:SceneIlluminance = 1234, Track1:TestFooBar = "hi".
   let data = fixture("QuickTime_mebx_keys.mov");
   let golden = ee_golden("QuickTime_mebx_keys.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let pairs = meta.stream().mebx_samples();
   assert_eq!(pairs.len(), 2, "two mebx key/value pairs");
 
@@ -177,9 +171,7 @@ fn quicktime_mebx_live_photo_info_unpacks_le_blob() {
   //   -1000 200 250 -5 7 123456 2.5 -3.5 4 0.125 99 1000 65535".
   let data = fixture("QuickTime_mebx_livephoto.mov");
   let golden = ee_golden("QuickTime_mebx_livephoto.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let pairs = meta.stream().mebx_samples();
   assert_eq!(pairs.len(), 1, "one mebx key/value pair");
   assert_eq!(pairs[0].name(), "LivePhotoInfo");
@@ -217,9 +209,7 @@ fn quicktime_mebx_smartstyle_info_decodes_embedded_plist() {
   // in `QuickTimeStreamMeta::plist_subdir_tags`.
   let data = fixture("QuickTime_mebx_smartstyle.mov");
   let golden = ee_golden("QuickTime_mebx_smartstyle.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   // The embedded PLIST is NOT a scalar `mebx` pair (the SubDirectory replaces
   // the scalar) — it lands in the nested-PLIST tag list.
   assert!(
@@ -291,9 +281,7 @@ fn quicktime_mebx_detected_face_decodes_nested_atom_tree() {
   // toward +inf, NOT away-from-zero -2.345679).
   let data = fixture("QuickTime_mebx_detface.mov");
   let golden = ee_golden("QuickTime_mebx_detface.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
 
   // `detected-face` is a SubDirectory: its scalar form is NEVER emitted (the
@@ -384,9 +372,7 @@ fn quicktime_kenwood_gps_box_decodes_le_records() {
   // fix under `QuickTime:GPS*`.
   let data = fixture("QuickTime_gps_kenwood.mov");
   let golden = ee_golden("QuickTime_gps_kenwood.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert_eq!(stream.gps_samples().len(), 2, "two Kenwood GPS records");
   let first = stream.first_fix().expect("a GPS fix");
@@ -419,9 +405,7 @@ fn quicktime_gps0_dudubell_decodes_binary_records() {
   // VSYS `gps0` box of 32-byte little-endian binary GPS records.
   let data = fixture("QuickTime_gps0.mov");
   let golden = ee_golden("QuickTime_gps0.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert_eq!(stream.gps_samples().len(), 2, "two gps0 records");
   let first = stream.first_fix().expect("a GPS fix");
@@ -447,9 +431,7 @@ fn quicktime_gsen_dudubell_decodes_accelerometer() {
   // `gsen` box of 3-byte int8s accelerometer triples (scaled by 1/16).
   let data = fixture("QuickTime_gsen.mov");
   let golden = ee_golden("QuickTime_gsen.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert_eq!(stream.gps_samples().len(), 2, "two gsen records");
   // First record: 16/16, -32/16, 48/16 ⇒ "1 -2 3" — exact match to the
@@ -467,9 +449,7 @@ fn quicktime_stream_empty_for_plain_video() {
   // A QuickTime file with no timed-metadata track ⇒ empty stream meta and no
   // embedded-Exif deferral (the existing SP1 fixture has neither).
   let data = fixture("QuickTime_sp1.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   assert!(
     meta.stream().is_empty(),
     "plain video has no timed metadata"
@@ -485,9 +465,7 @@ fn quicktime_media_metadata_projects_first_gps_fix() {
   // The normalized MediaMetadata projection fills GpsLocation from the FIRST
   // embedded timed-metadata GPS fix (SP3).
   let data = fixture("QuickTime_gps0.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let md = meta.media_metadata();
   let gps = md.gps().expect("GpsLocation projected from timed metadata");
   let lat = gps.latitude().expect("latitude");
@@ -504,9 +482,7 @@ fn quicktime_freegps_brute_force_scan_finds_block_in_mdat() {
   // and dispatch into `decode_type6_akaso`, producing one GPS sample
   // accessible via `Meta::stream`.
   let data = build_mov_with_freegps_in_mdat();
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert_eq!(
     stream.gps_samples().len(),
@@ -532,9 +508,7 @@ fn quicktime_moov_gps_box_decodes_block_outside_mdat() {
   //   GPSDateTime 2024:07:15 14:30:45Z.
   let data = fixture("QuickTime_moov_gps.mov");
   let golden = ee_golden("QuickTime_moov_gps.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let stream = meta.stream();
   assert_eq!(
     stream.gps_samples().len(),
@@ -578,9 +552,7 @@ fn quicktime_frea_kodak_tags_decode_with_oracle_parity() {
   // the four tags under family-0 `MakerNotes`, family-1 `Kodak`.
   let data = fixture("QuickTime_frea_rexing17b.mov");
   let golden = ee_golden("QuickTime_frea_rexing17b.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
 
   // Typed accessor: the decoded `frea` values.
   let frea = meta.quicktime().kodak_frea();
@@ -593,7 +565,7 @@ fn quicktime_frea_kodak_tags_decode_with_oracle_parity() {
   // Rendered tag stream (the golden `Meta::tags()` path): the four tags emit
   // under family-0 `MakerNotes`, family-1 `Kodak`, with the bundled-parity
   // PrintConv values.
-  let any = parse_bytes(&data).expect("parse ok").expect("recognized");
+  let any = parse_bytes(&data).expect("recognized");
   assert!(matches!(any, AnyMeta::QuickTime(_)), "got {any:?}");
   let tags: Vec<exifast::Tag> = any.iter_tags(ConvMode::PrintConv).collect();
   let kodak: std::collections::HashMap<&str, &exifast::Tag> = tags
@@ -634,9 +606,7 @@ fn quicktime_frea_rexing_type17b_scales_gps_via_kodak_version() {
   // Bundled `-ee` ⇒ GPSLatitude 33.6697742486894, GPSLongitude
   // -112.096920485025 (verified vs ExifTool 13.59).
   let data = fixture("QuickTime_frea_rexing17b.mov");
-  let meta = parse_quicktime(&data)
-    .expect("parse ok")
-    .expect("recognized");
+  let meta = parse_quicktime(&data).expect("recognized");
   let fix = meta
     .stream()
     .first_fix()
