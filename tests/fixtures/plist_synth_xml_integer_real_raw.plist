@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>RealTrailZero</key><real>1.50</real>
+  <key>RealExp</key><real>1.4e2</real>
+  <key>RealWs</key><real> 3.0 </real>
+  <key>IntLeadZero</key><integer>007</integer>
+  <key>IntHex</key><integer>0x10</integer>
+</dict>
+</plist>

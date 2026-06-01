@@ -1,0 +1,8 @@
+[{
+  "SourceFile": "plist_synth_bin_halfeven_date_neghalf.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:Dat": "2000:12:31 23:59:59+00:00"
+}]

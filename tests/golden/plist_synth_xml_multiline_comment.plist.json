@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_xml_multiline_comment.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:Title": "foo<!--\nmultiline\n-->bar",
+  "XML:Comment": "aaabbb",
+  "XML:K--Mlkey--Ey": "keyval"
+}]

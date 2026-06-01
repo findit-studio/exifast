@@ -47,10 +47,18 @@ pub mod mxf;
 pub mod mpeg;
 #[cfg(feature = "ogg")]
 pub mod ogg;
+// PLIST — engine-only per FORMATS.md row 12b. Leaf format (no cross-format
+// chains); ports both the binary (`bplist0…`) and XML plist encodings.
+#[cfg(feature = "plist")]
+pub mod plist;
 #[cfg(feature = "png")]
 pub mod png;
 #[cfg(feature = "quicktime")]
 pub mod quicktime;
+// QuickTime SP3 — embedded timed GPS metadata (QuickTimeStream.pl). A
+// sub-module of the QuickTime port; gated on the same `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod quicktime_stream;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]

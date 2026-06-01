@@ -28,6 +28,7 @@ mod domain;
 pub(crate) mod png;
 pub mod project;
 mod quicktime;
+mod quicktime_stream;
 
 #[cfg(feature = "crw")]
 pub use crw::{
@@ -43,3 +44,4 @@ pub use png::{
 };
 pub use project::Project;
 pub use quicktime::{HandlerKind, MediaTrack, QuickTimeMeta};
+pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};

@@ -63,7 +63,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 all-formats = [
   "aac", "aiff", "ape", "audible", "crw", "dsf", "dv", "exif", "flac", "flash",
   "gps", "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
-  "png", "quicktime", "real", "red", "wavpack",
+  "plist", "png", "quicktime", "real", "red", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -153,6 +153,13 @@ mxf        = []
 # `--features std,ogg` fails to compile (Codex R4 F1: silent feature-graph
 # breakage from the R3 picture-parse + ID3-nest fixes).
 ogg        = ["flac", "id3"]
+# `plist` — engine-only per FORMATS.md row 12b. Leaf format (no cross-format
+# chains); ports both the binary (`bplist0…`) and XML Apple-Property-List
+# encodings. The `miniz_oxide` dep is needed for AAE `adjustmentData`'s
+# `CompressedPLIST` raw-DEFLATE sub-directory (PLIST.pm:142-146, 228-239 —
+# `IO::Uncompress::RawInflate`); a `bplist00`-prefixed payload skips inflate
+# (PLIST.pm:228 `$$val !~ /^bplist00/` short-circuit).
+plist      = ["dep:miniz_oxide"]
 # `png` — Portable Network Graphics (FORMATS.md row 11). PNG chains `exif`
 # because a real-world camera/phone PNG embeds Exif via the `eXIf` chunk
 # (PNG.pm:309-317, PNG-1.5 spec, 2017); the captured TIFF block is decoded
@@ -169,9 +176,18 @@ ogg        = ["flac", "id3"]
 # `seAl`, …) are deferred.
 png        = ["exif", "dep:miniz_oxide"]
 # `quicktime` — MOV / MP4 / M4A / M4V / 3GP / 3G2. SP1 (the box/atom
-# walker + core structural atoms) is a leaf format with no cross-format
-# chains. SP3 will add an `exif` edge for the embedded-Exif atom hop.
-quicktime  = []
+# walker + core structural atoms). SP3 chains `plist`: the `mebx`
+# `smartstyle-info` timed-metadata key (QuickTime.pm:6847-6852) is a
+# `SubDirectory` dispatched to `Image::ExifTool::PLIST::Main` /
+# `PLIST::ProcessBinaryPLIST` — `quicktime_stream` calls
+# `formats::plist::parse_borrowed` to decode the embedded binary plist. The
+# dependency makes that path ALWAYS available when `quicktime` is enabled
+# (rather than silently dropping smartstyle-info under `--features quicktime`
+# without `plist`). SP3 will additionally add an `exif` edge for the
+# embedded-Exif atom hop once #36 (Exif+GPS) merges. (The nested-atom
+# `detected-face` mebx SubDirectory, QuickTime.pm:6808-6811, needs NO plist —
+# it re-enters the MOV box walker over `FaceInfo`/`FaceRec`/`cits`.)
+quicktime  = ["plist"]
 # `real` chains ID3 (Real.pm:678-687: ID3v1 trailer scan on RM files;
 # the typed parser reuses `formats::id3::parse_id3v1_from_block` to
 # decode the 128-byte TAG block via the same path the ID3 engine
@@ -191,11 +207,15 @@ derive_more = { version = "2", default-features = false, features = ["display", 
 # Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
 # typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
 jiff        = { version = "0.2", default-features = false }
-# Pure-Rust zlib/DEFLATE inflater for PNG compressed chunks (`zTXt`,
-# compressed `iTXt`, `iCCP` body, `zXIf` EXIF). no_std-capable — `with-alloc`
-# pulls only `alloc`, matching the crate's no_std+alloc contract; gated to the
-# `png` feature via `dep:miniz_oxide`. PNG compressed payloads are ZLIB-wrapped
-# DEFLATE, so we use `inflate::decompress_to_vec_zlib`.
+# Pure-Rust zlib/DEFLATE inflater. Shared by two features (each pulls it via
+# `dep:miniz_oxide`):
+#   * `png` — PNG compressed chunks (`zTXt`, compressed `iTXt`, `iCCP` body,
+#     `zXIf` EXIF) are ZLIB-wrapped DEFLATE ⇒ `inflate::decompress_to_vec_zlib`.
+#   * `plist` — the AAE `adjustmentData` `CompressedPLIST` sub-directory
+#     (PLIST.pm:228-239 `IO::Uncompress::RawInflate`) is RAW DEFLATE (no zlib
+#     header) ⇒ `inflate::decompress_to_vec`.
+# no_std-capable — `with-alloc` pulls only `alloc`, matching the crate's
+# no_std+alloc contract.
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"], optional = true }
 serde       = { version = "1", default-features = false, features = ["derive"], optional = true }
 # `raw_value` exposes `serde_json::value::RawValue`, used by `jsondiff` to

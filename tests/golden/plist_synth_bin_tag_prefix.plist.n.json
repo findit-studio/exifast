@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "plist_synth_bin_tag_prefix.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "PLIST",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:TagX": 1,
+  "PLIST:Tag9Abc": 2,
+  "PLIST:Tag-Foo": 3,
+  "PLIST:Good": 4
+}]

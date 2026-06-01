@@ -1,0 +1,17 @@
+[{
+  "SourceFile": "PLIST-bin.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:TestReal": 1.4,
+  "PLIST:TestDictWhen": "2000:01:02 08:04:05+00:00",
+  "PLIST:TestDictAuthor": "Phil",
+  "PLIST:TestString": "ExifTool PLIST test",
+  "PLIST:TestArray": ["one","two","three"],
+  "PLIST:TestInteger": 256,
+  "PLIST:TestUnicode": "ExîfTöøl PLIST tést",
+  "PLIST:TestDate": "2013:02:22 12:49:10+00:00",
+  "PLIST:TestData": "(Binary data 12 bytes, use -b option to extract)",
+  "PLIST:TestBoolean": false
+}]

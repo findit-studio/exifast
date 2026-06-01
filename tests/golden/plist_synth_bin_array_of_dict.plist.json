@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "plist_synth_bin_array_of_dict.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/x-plist",
+  "PLIST:CastName": ["Alice","Bob"],
+  "PLIST:Cast": [],
+  "PLIST:Plain": "x"
+}]

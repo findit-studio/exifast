@@ -53,6 +53,19 @@
 //! cannot synthesize without the XMP parser. Pinned by the `#[ignore]`-d
 //! `flash_xmp_livexml_subdirectory_deferred_conformance` test. Codex PR #32 R6.
 //!
+//! The QuickTime SP3 timed-metadata fixtures (`QuickTime_mebx_gps.mov`,
+//! `QuickTime_mebx_float.mov`, `QuickTime_mebx_keys.mov`,
+//! `QuickTime_mebx_livephoto.mov`, `QuickTime_mebx_smartstyle.mov`,
+//! `QuickTime_mebx_detface.mov`, `QuickTime_gps_kenwood.mov`,
+//! `QuickTime_gps0.mov`, `QuickTime_gsen.mov`)
+//! are NOT in this set: `Image::ExifTool::QuickTime::Stream` is gated behind
+//! the bundled `ExtractEmbedded` (`-ee`) option, which `tools/gen_golden.sh`
+//! never passes — so those fixtures carry only an `-ee`-captured
+//! `<f>.ee.json` golden (no standard `<f>.json` / `<f>.n.json`) and are
+//! exercised by the dedicated `tests/quicktime_stream.rs` harness instead.
+//! The both-standard-goldens [`active_fixtures`] filter skips them
+//! automatically.
+//!
 //! Gated on `feature = "json"`: imports the `json`-gated `jsondiff` +
 //! `serde_json` rendering of `Rendered`.
 #![cfg(feature = "json")]
@@ -98,6 +111,18 @@ const NOT_ACTIVE: &[&str] = &[
   "Exif_makernote.tif",
 ];
 
+/// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
+/// with paired `.json` + `.n.json` goldens, minus [`NOT_ACTIVE`]). Bumped per
+/// Codex round; see the long comment block in
+/// [`typed_serde_path_equals_writer_path_and_golden_all_327`] for the history.
+///
+/// Post-rebase (lib/plist golden-migration onto main): main's 275 ACTIVE
+/// fixtures PLUS the 52 ACTIVE PLIST fixtures from this branch = 327. The
+/// PLIST chronology's running `… → 283` figure is relative to lib/plist's
+/// older fork base; the absolute total against the live golden directory is
+/// 327 (`275 + 52`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 327;
+
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
 /// deferred residuals — i.e. the active conformance fixtures.
@@ -135,6 +160,20 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
   let mut shared = SharedFlags::new();
   for cand in detection_candidates(fixture, data) {
     let ft = cand.file_type();
+    // Mirror the engine's XMP→PLIST content-sniff route (see
+    // `parser::extract_info_typed`): bundled reaches a UTF-8-BOM XML plist via
+    // `ProcessXMP`'s `<plist>` relabel (XMP.pm:4385); this port has no XMP
+    // parser, so the BOM-prefixed XML `<plist>` candidate (detected as XMP) is
+    // dispatched to `ProcessPlist`. Keeping this in sync keeps the independent
+    // parity loop value-equivalent to the engine writer path.
+    let ft = if ft == "XMP"
+      && any_parser_for("XMP").is_none()
+      && exifast::formats::plist::xml_content_is_plist(data)
+    {
+      "PLIST"
+    } else {
+      ft
+    };
     let Some(parser) = any_parser_for(ft) else {
       continue;
     };
@@ -207,7 +246,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_275() {
+fn typed_serde_path_equals_writer_path_and_golden_all_327() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -948,12 +987,197 @@ fn typed_serde_path_equals_writer_path_and_golden_all_275() {
   // and whose binary LEAVES (`RawData`/`FreeBytes`) are zero-length ⇒ the
   // `(Binary data 0 bytes …)` placeholder. Both verified via `perl exiftool
   // 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
+  //
+  // ----- FORMATS.md row 12b (PLIST, binary + XML) — lib/plist -----------
+  // The PLIST chronology below is from the lib/plist branch (forked before the
+  // Exif/PNG/MakerNotes waves landed in main); its running `149 → … → 283`
+  // counts are RELATIVE to that older base. The post-rebase ACTIVE total is
+  // main's 275 PLUS the PLIST ACTIVE fixtures (the absolute figure pinned by
+  // `EXPECTED_ACTIVE_FIXTURES` below, recomputed against the live golden dir).
+  // 149 → 151 after FORMATS.md row 12b lib/plist: added `PLIST-bin.plist`
+  // + `PLIST-xml.plist` (bundled t/images fixtures, 351 / 795 bytes) —
+  // the binary `bplist00` decoder and the XML-plist element scanner, both
+  // flattening nested `<dict>` keys into `parent/child` tags.
+  // 151 → 154 after Codex R1 (lib/plist): added 3 adversarial PLIST
+  // fixtures pinning F1 (XML array-of-dict recursion), F2 (binary array
+  // typed-value preservation), and F3 (binary Tag-prefix guard).
+  // 154 → 157 after Codex R2 (lib/plist): added 3 adversarial PLIST
+  // fixtures — `plist_synth_bin_date.plist` (R2 F1: the faithful binary
+  // `<date>` localtime branch, golden pinned `TZ=UTC`),
+  // `plist_synth_xml_short_keys.plist` (R2 F3: XML-path `AddTagToTable`
+  // Tag-prefix normalization), and `plist_synth_bin_array_of_dict.plist`
+  // (R2 F4: binary array-of-dict child-tag extraction). The 4th R2 fixture
+  // `plist_aae_compressed.aae` (R2 F2) is formally accept-deferred — listed
+  // in `NOT_ACTIVE`, NOT counted here.
+  // 157 → 162 after Codex R3 (lib/plist): added 5 adversarial PLIST
+  // fixtures — `plist_synth_xml_static_table.plist` +
+  // `plist_synth_xml_gps_longitude.plist` (R3 F1: the `%PLIST::Main` static
+  // table — fixed Name, DateTimeOriginal ValueConv, Duration/GPS ToDMS
+  // PrintConv), `plist_synth_bin_uint64.plist` (R3 F2: an unsigned `Get64u`
+  // integer above `i64::MAX`), `plist_synth_bin_nested_array_dict.plist`
+  // (R3 F3: dict child tags at every nested-array level), and
+  // `plist_synth_bin_frac_date.plist` (R3 F4: fractional binary-date
+  // rounding).
+  // 162 → 168 after Codex R4 (lib/plist): added 6 adversarial PLIST
+  // fixtures for the two ConvertUnixTime fractional-rounding fixes —
+  // R4 F1 (binary `<date>` half-to-EVEN rounding, ExifTool.pm:6783):
+  // `plist_synth_bin_halfeven_date_half.plist` (exact `.5` ⇒ no carry,
+  // the bug `f64::round()` got wrong), `…_halfup.plist` (just past the
+  // tie ⇒ carry) and `…_neghalf.plist` (negative half ⇒ floor); and
+  // R4 F2 (MODD `DateTimeOriginal` ValueConv passing the FLOAT into
+  // ConvertUnixTime, PLIST.pm:73): `plist_synth_xml_frac_dto_pos.plist`,
+  // `…_half.plist` and `…_neg.plist` (positive / half / negative
+  // fractional days — the prior port truncated to i64 before converting).
+  // 168 → 171 after Codex R5 (lib/plist): added 3 adversarial PLIST
+  // fixtures — `plist_synth_xml_modd_content.xml` (R5 F1: the
+  // `XMLFileType=ModdXML` content override → `OverrideFileType('MODD')`,
+  // gated on `FILE_TYPE eq 'XMP'` via the `.xml`-family extension), and
+  // `plist_synth_xml_nested_scalar_array.plist` +
+  // `plist_synth_xml_nested_array_of_dict.plist` (R5 F2: nested XML `<array>`
+  // recursion — scalars stored under the bare key, dicts accruing one empty
+  // key-slot per array level, ⇒ `XML:Outer` and `XML:TopInner`).
+  // 171 → 174 after Codex R6 (lib/plist event-stream rework): added 3
+  // adversarial PLIST fixtures — `plist_synth_xml_mixed_array.plist` (R6 F2:
+  // a heterogeneous XML `<array>` of dict + scalar members — the sticky
+  // `@keys` event state so a scalar after a dict inherits the dict's last key
+  // ⇒ `XML:TopFoo="B"` not `XML:Top="B"`), `plist_synth_xml_empty_containers
+  // .plist` (R6 F3: empty `<dict/>`/`<array/>` surface as `XML:<Tag>=""`), and
+  // `plist_synth_xml_modd_array.xml` (R6 F1: an array-emitted top-level
+  // `XMLFileType=ModdXML` still drives the MODD override).
+  // 174 → 179 after Codex R7 (lib/plist): added 5 adversarial PLIST
+  // fixtures — `plist_synth_bin_uid5.plist` / `…_uid9.plist` /
+  // `…_uid16.plist` (R7 F1: binary type-8 UID widths `%readProc` does NOT
+  // cover — 5/9 bytes ⇒ a `0x…` hex string, 16 bytes ⇒ an ASF GUID via
+  // `ASF::GetGUID`, PLIST.pm:286-290); and `plist_synth_xml_comment_fake
+  // _root.plist` + `plist_synth_xml_comment_in_container.plist` (R7 F2:
+  // token-aware XML tag scan — a commented fake `<plist>` does not shadow
+  // the real root, and a `<!-- <array> -->` inside a container does not
+  // mis-balance the nesting depth).
+  // 179 → 182 after Codex R8 (lib/plist): added 3 adversarial PLIST
+  // fixtures — `plist_synth_xml_scalar_comment.plist` (R8 F1: an XML
+  // comment inside a scalar value is stripped via the XMP.pm `wasComment`
+  // close-scan signal ⇒ `XML:Title="foobar"`), `plist_synth_xml_data_ws
+  // _hex.plist` (R8 F2: a whitespace-wrapped `<data>` payload fails the
+  // direct `/^[0-9a-f]+$/` hex test and decodes via Base64), and
+  // `plist_synth_xml_slowmotion_flags.plist` (R8 F3: the slowMotion
+  // `*Flags` BITMASK `PrintConv` — `DecodeBits` prints `Valid` / `Valid,
+  // Has been rounded`).
+  // 182 → 184 after Codex R9 (lib/plist): added 2 adversarial PLIST
+  // fixtures — `plist_synth_xml_multiline_comment.plist` (R9 F1: the
+  // XMP.pm:4181 `s/<!--.*?-->//g` has NO `/s` flag, so the regex `.` does
+  // not cross a newline — a MULTILINE `<!--…-->` run is preserved verbatim
+  // while a single-line one is stripped, in both a scalar value and a
+  // `<key>`), and `plist_synth_xml_slowmotion_flags_string.plist` (R9 F2:
+  // the slowMotion `*Flags` BITMASK `PrintConv` runs `DecodeBits` over a
+  // `<string>` leaf too — `"3"` ⇒ `Valid, Has been rounded`, `"abc"`
+  // numifies to 0 ⇒ `(none)`).
+  // 184 → 187 after Codex R10 (lib/plist): added 3 adversarial PLIST
+  // fixtures — `plist_synth_xml_comment_non_ascii.plist` (R10 F1: the
+  // XMP.pm:4181 `s/<!--.*?-->//g` byte-walk must not panic on a non-ASCII
+  // char inside an inline single-line comment — `<!-- café -->` in a
+  // `<key>` and `<!-- résumé -->` in a `<string>` are stripped ⇒
+  // `XML:Title="foobar"`); and `plist_synth_xml_slowmotion_flags_exponent
+  // .plist` + `…_overflow.plist` (R10 F2: the slowMotion `*Flags`
+  // `DecodeBits` numifies each word the Perl `&` way — `1e2`/`-1e2` honour
+  // the exponent ⇒ 100/-100, `18446744073709551615`/`9e99` stay exact /
+  // saturate ⇒ every low-32 bit set, where a digit-only `i64` scan got
+  // `1` / `0`).
+  // 187 → 189 after Codex R11 (lib/plist): added 2 adversarial PLIST fixtures
+  // for the content-override-keyed-on-EXACT-RAW-tag-ID fixes —
+  // `plist_synth_xml_xmlfiletype_collide.xml` (R11 F1: the colliding raw key
+  // `xMLFileType` generates the SAME emitted name `XMLFileType` but its raw ID
+  // differs ⇒ the `XMLFileType` RawConv is absent and NO `OverrideFileType`
+  // fires ⇒ `File:FileType=PLIST` with `XML:XMLFileType=ModdXML`), and
+  // `plist_synth_xml_aae_override.xml` (R11 F2: the `%plistType` AAE override
+  // `OverrideFileType($plistType{adjustmentBaseVersion})` = AAE, PLIST.pm:42/
+  // :225 — an ACTIVE non-compressed `.xml` plist ⇒ `File:FileType=AAE`,
+  // `File:MIMEType=application/vnd.apple.photos`; distinct from the
+  // extension-typed `plist_aae_compressed.aae` in `NOT_ACTIVE`).
+  // 189 → 190 after Codex R12 F1 (lib/plist): added
+  // `plist_synth_xml_utf8bom.plist` — a valid XML plist carrying a leading
+  // UTF-8 BOM (`EF BB BF`). Bundled reaches it via the XMP path (the XMP
+  // `%magicNumber` accepts the BOM that the PLIST `%magicNumber` does not,
+  // ExifTool.pm:1045 vs :1015; `ProcessXMP` then content-sniffs `<plist>`
+  // and routes to `PLIST::FoundTag`, XMP.pm:4349/4385). The port's `parse_inner`
+  // now skips the BOM at the XML gate and the engine routes a BOM-prefixed XML
+  // `<plist>` candidate (detected as XMP) to `ProcessPlist` ⇒ `File:FileType=
+  // PLIST`, `application/xml`, with nested-dict key flattening intact.
+  // 190 → 191 after Codex R14 F1 (lib/plist): added `plist_trunc_bin.plist` —
+  // a truncated `bplist00` (8-byte magic, no trailer). Bundled recognizes the
+  // magic (PLIST.pm:480) and emits the family-1 `PLIST:Error` (PLIST.pm:485-486
+  // inside `SET_GROUP1='PLIST'`, :484) while finalizing as PLIST
+  // (`application/x-plist`, :483/:489); the pre-fix port dropped it to
+  // `Ok(None)`. The whole binary-decode-failure class maps to this same error
+  // at the `decode_binary` chokepoint (oracle-verified for the trailer / topObj
+  // / intSize / offset-table modes).
+  // 191 → 193 after Codex R15 F1 (lib/plist): added 2 adversarial PLIST
+  // fixtures for the binary type-4 `data` size threshold — PLIST.pm:300
+  // (`if ($size < 1000000 or $et->Options('Binary'))`) reads a binary `data`
+  // payload only below 1 000 000 bytes; at or above it PLIST.pm:302-303 stores
+  // a length-only `"Binary data $size bytes"` placeholder WITHOUT a
+  // `$raf->Read` (the `else` branch — also not bounds-checked).
+  // `plist_synth_bin_data_boundary.plist` claims a data object AT exactly
+  // 1 000 000 bytes and `plist_synth_bin_data_oversize.plist` claims one at
+  // 2 000 000; both render `(Binary data N bytes...)` with the TRUE `N`. The
+  // port now stores a length-only `PlistLeaf::DataLen` instead of copying the
+  // multi-MB payload (the pre-fix `dec.data.get(..).to_vec()` both allocated
+  // and — for these truncated fixtures — dropped the tag on the out-of-range
+  // slice). The whole >= 1 000 000 class maps to this same length-only path.
+  // 193 → 196 after Codex R17 F1 (lib/plist): added 3 adversarial PLIST
+  // fixtures for the XML-leaf raw-scalar class-sweep — PLIST.pm's XML path
+  // (`FoundTag`, PLIST.pm:171-186) never type-parses NOR canonicalizes a leaf:
+  // it stores the UNESCAPED scalar text verbatim. `plist_synth_xml_real_
+  // nonfinite.plist` has `<real>inf</real>` / `<real>-inf</real>` / `<real>nan
+  // </real>` — the pre-fix port `parse::<f64>()`'d these to a NON-FINITE `f64`
+  // and later serialized the titlecase Perl-NV string (`Inf` / `-Inf` / `NaN`),
+  // a VALUE change vs the oracle's verbatim `"inf"` / `"-inf"` / `"nan"`.
+  // `plist_synth_xml_integer_real_raw.plist` covers `<real>`/`<integer>`
+  // raw-text preservation (`<real>1.50</real>` keeps its trailing zero,
+  // `<integer>007</integer>` keeps its leading zero, `0x10` / `1.4e2` /
+  // `" 3.0 "` stay verbatim). `plist_synth_xml_date_raw.plist` covers the
+  // `<date>` leaf: PLIST.pm:180-181 runs `ConvertXMPDate($val)` on the raw
+  // untrimmed scalar (XMP.pm:4178-4181 trims only an `rdf:Description` prop) —
+  // the pre-fix port's extra `.trim()` made a whitespace-wrapped `<date>` body
+  // match `ConvertXMPDate`'s anchored regex and get rewritten, changing the
+  // VALUE; the fix drops the trim so `<date> … </date>` passes through raw.
+  // The whole XML-leaf class now stores `PlistValue::Str`/`::Date` from the
+  // verbatim body and parses on demand ONLY for a `%PLIST::Main` static
+  // `ValueConv`/`PrintConv` (`leaf_numeric`, gated on Perl's `IsFloat`). The
+  // binary decoder is unaffected — a binary type-1/2 object IS genuinely typed
+  // (PLIST.pm:271-274).
+  // 278 → 283 after Codex R20 (lib/plist round 1) — 3 real-input value-parity
+  // findings each adding ACTIVE fixtures:
+  //   R20 F1: `plist_aae_compressed.aae` UN-ignored (CompressedPLIST sub-
+  //     directory, PLIST.pm:142-146/228-241): `adjustmentData` is now in
+  //     `PLIST_MAIN` (was deliberately ABSENT). XML walker intercepts
+  //     `<data>` under raw key `adjustmentData`, decodes Base64, then routes
+  //     through `process_compressed_plist`: `bplist00`-prefixed payloads
+  //     short-circuit inflate (PLIST.pm:228); otherwise `miniz_oxide::
+  //     inflate::decompress_to_vec` (RAW DEFLATE, matches `IO::Uncompress::
+  //     RawInflate`). Inflated bytes re-enter `decode_binary`; tags carry
+  //     `group_override = Some("PLIST")` so the family-1 group switches mid-
+  //     walk (PLIST.pm:484 `SET_GROUP1='PLIST'`).
+  //   R20 F2: `plist_synth_ucs2be_legacy.plist` ADDED — `\xfe\xff\x00`-magic
+  //     legacy plist (PLIST.pm:494-499). Bundled emits `ExifTool:Error:
+  //     "Old PLIST format currently not supported"` with NO `File:FileType`
+  //     triplet (the UCS-2BE branch never calls `SetFileType`). Port routes
+  //     at the `finalization_error` seam — `ProcessPlist::parse` rejects the
+  //     body, the engine candidate loop exhausts, and finalization short-
+  //     circuits the `File format error` arm.
+  //   R20 F3: 3 binary-dict consecutive-duplicate-key fixtures —
+  //     `plist_synth_bin_dup_consec.plist` (root dict `{a,a,b}` ⇒
+  //     `PLIST:TagA=[v1,v2], PLIST:TagB=v3`), `…_nested.plist` (nested dict
+  //     under dict, `{x:{a,a}, b}` ⇒ `PLIST:XA=[v1,v2], PLIST:TagB=v3`), and
+  //     `…_nonconsec.plist` (negative case `{a,b,a}` ⇒ TagMap last-wins,
+  //     `PLIST:TagA=v3, PLIST:TagB=v2`). `walk_tree`'s Dict branch now
+  //     routes pairs through a scratch buffer + `fold_consecutive_lists`,
+  //     faithful to PLIST.pm:362-378 `LastPListTag`/`LIST_TAGS`.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    275,
-    "expected exactly the 275 active conformance fixtures, found {}: {:?}",
+    EXPECTED_ACTIVE_FIXTURES,
+    "expected exactly the {EXPECTED_ACTIVE_FIXTURES} active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

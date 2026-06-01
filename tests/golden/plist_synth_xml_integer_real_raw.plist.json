@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "plist_synth_xml_integer_real_raw.plist",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "PLIST",
+  "File:FileTypeExtension": "plist",
+  "File:MIMEType": "application/xml",
+  "XML:RealTrailZero": 1.50,
+  "XML:RealExp": 1.4e2,
+  "XML:RealWs": " 3.0 ",
+  "XML:IntLeadZero": "007",
+  "XML:IntHex": "0x10"
+}]
