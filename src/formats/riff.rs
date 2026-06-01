@@ -643,13 +643,31 @@ impl<'a> Walker<'a> {
         // CSET (RIFF.pm:533-536 → `%RIFF::CSET`, ProcessBinaryData int16u):
         // emits `CodePage`/`CountryCode`/`LanguageCode`/`Dialect`
         // (RIFF.pm:1063-1073) AND sets `$$self{CodePage}` (RIFF.pm:1069
-        // RawConv), which makes the subsequent INFO ProcessChunks decode
-        // strings through the NUMERIC code page. `Image::ExifTool::Decode`
-        // keys `%csType` by charset NAME, so a numeric code page misses ⇒
-        // raw passthrough + an `Unsupported character set (<N>)` warning
-        // (verified vs bundled). We model that as `Charset::Raw(code_page)`.
+        // RawConv). The subsequent INFO ProcessChunks then resolves its
+        // `$charset` via the TRUTHINESS gate at RIFF.pm:1784-1789:
+        //
+        //   unless ($charset) {                 # CharsetRIFF default 0 → enter
+        //       if ($$et{CodePage}) {           # TRUTHY ⇒ NON-ZERO only
+        //           $charset = $$et{CodePage};  # numeric code page
+        //       } elsif (defined $charset and $charset eq '0') {
+        //           $charset = 'Latin';         # 0 / no-CSET ⇒ cp1252
+        //       }
+        //   }
+        //
+        // So a NON-ZERO `CodePage` makes `$charset` the NUMERIC code page;
+        // `Image::ExifTool::Decode` keys `%csType` by charset NAME, so the
+        // number misses ⇒ raw passthrough + an `Unsupported character set
+        // (<N>)` warning — modeled as `Charset::Raw(code_page)`. A `CodePage`
+        // of **0** is FALSY, so it falls through to the `'Latin'` branch
+        // (`CharsetRIFF` defaults to `0` ⇒ `defined && eq '0'`), exactly like
+        // having no CSET at all: cp1252 decode, NO warning. We therefore leave
+        // the active charset as the default `Charset::Latin` for `CodePage==0`
+        // (verified vs bundled 13.59: a CSET CodePage=0 + `IART=Caf\xe9` emits
+        // `RIFF:CodePage=0`, `RIFF:Artist="Café"`, and NO `ExifTool:Warning`).
         b"CSET" => {
-          if let Some(code_page) = emit_cset(body, &mut self.entries) {
+          if let Some(code_page) = emit_cset(body, &mut self.entries)
+            && code_page != 0
+          {
             self.charset = Charset::Raw(code_page);
           }
         }
@@ -1571,18 +1589,26 @@ fn string_trim_nulls(bytes: &[u8]) -> String {
 /// Active RIFF string charset (RIFF.pm:1782-1790). `ProcessChunks` decodes
 /// `INFO`/`exif` string chunks through `$et->Decode($val, $charset)`.
 ///
-/// - **Default** (no `CSET` chunk, no `CharsetRIFF` option): `$charset` is the
-///   NAME `'Latin'` (RIFF.pm:1788) ⇒ cp1252 → UTF-8 decode
-///   ([`crate::charset::decode_latin`]).
-/// - **`CSET` chunk present**: `$charset` is the NUMERIC code page
-///   (`$$self{CodePage}`, RIFF.pm:1786). `Image::ExifTool::Decode` keys its
-///   `%csType` table by NAME, so a numeric code page never matches ⇒ NO
-///   remapping (raw byte passthrough; `ExifTool.pm:6351-6363`). We model this
-///   as [`Charset::Raw`] carrying the numeric code page (verified vs bundled:
-///   a `CSET CodePage=1252` file emits the literal input bytes, not a
-///   cp1252-decoded string, and warns `Unsupported character set (1252)`).
-///   The dead `%code2charset` table (RIFF.pm:67-88) is NEVER referenced in
-///   bundled, so it does NOT translate the number to a name.
+/// The resolution follows the truthiness gate at RIFF.pm:1784-1789
+/// (`CharsetRIFF` defaults to `0`):
+///
+/// - **Default** (no `CSET` chunk, or a `CSET` with `CodePage==0`): `$charset`
+///   resolves to the NAME `'Latin'` (RIFF.pm:1788 — `$$et{CodePage}` is unset
+///   or `0` ⇒ FALSY, so the `elsif defined $charset and $charset eq '0'`
+///   branch fires) ⇒ cp1252 → UTF-8 decode ([`crate::charset::decode_latin`]),
+///   NO warning. A `CodePage==0` thus behaves EXACTLY like having no CSET at
+///   all (verified vs bundled 13.59: `CodePage=0` + `IART=Caf\xe9` →
+///   `RIFF:Artist="Café"`, no `ExifTool:Warning`).
+/// - **`CSET` chunk with a NON-ZERO `CodePage`**: `$$et{CodePage}` is TRUTHY,
+///   so `$charset` is the NUMERIC code page (RIFF.pm:1785-1786).
+///   `Image::ExifTool::Decode` keys its `%csType` table by NAME, so a numeric
+///   code page never matches ⇒ NO remapping (raw byte passthrough;
+///   `ExifTool.pm:6351-6363`). We model this as [`Charset::Raw`] carrying the
+///   numeric code page (verified vs bundled: a `CSET CodePage=1252` file emits
+///   the literal input bytes, not a cp1252-decoded string, and warns
+///   `Unsupported character set (1252)`). The dead `%code2charset` table
+///   (RIFF.pm:67-88) is NEVER referenced in bundled, so it does NOT translate
+///   the number to a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Charset {
   /// Default `'Latin'` (cp1252) decoding.
@@ -3052,6 +3078,60 @@ mod tests {
       Some(&RiffValue::U32(1252))
     );
     // No warning: the decoded string was empty (length 0).
+    assert_eq!(meta.unsupported_charset(), None);
+  }
+
+  #[test]
+  fn cset_code_page_zero_falls_back_to_latin() {
+    // RIFF.pm:1784-1789 truthiness gate — a CSET `CodePage` of 0 is FALSY, so
+    // `if ($$et{CodePage})` is false and the `elsif (defined $charset and
+    // $charset eq '0')` branch fires (`CharsetRIFF` defaults to `0`), making
+    // `$charset = 'Latin'`. The INFO string is then cp1252-decoded with NO
+    // `Unsupported character set` warning — EXACTLY like having no CSET at all.
+    // Verified vs bundled 13.59: `CodePage=0` + `IART=Caf\xe9` ⇒
+    // `RIFF:Artist="Café"`, NO `ExifTool:Warning` (whereas a non-zero
+    // unsupported code page raw-passes + warns — see
+    // `cset_chunk_switches_to_raw_passthrough`).
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    // CSET: int16u CodePage=0, CountryCode=1, LanguageCode=9, Dialect=1.
+    buf.extend_from_slice(b"CSET");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&9u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    let iart = b"Caf\xe9"; // cp1252 'é' (0xe9) — odd len 4 → no pad
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IART");
+    info.extend_from_slice(&(iart.len() as u32).to_le_bytes());
+    info.extend_from_slice(iart);
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let find = |name: &str| -> Option<&RiffValue> {
+      meta
+        .entries()
+        .iter()
+        .find(|e| e.name() == name)
+        .map(RiffEntry::value_ref)
+    };
+    // CodePage=0 IS emitted as a tag (the int16u SubDirectory field).
+    assert_eq!(find("CodePage"), Some(&RiffValue::U32(0)));
+    // 0xe9 decodes through cp1252 ('Latin') to 'é' (U+00E9) — NOT the raw `?`
+    // a numeric code page would produce.
+    match find("Artist") {
+      Some(RiffValue::Str(s)) => assert_eq!(s.as_str(), "Caf\u{00e9}"),
+      other => panic!("Artist: {other:?}"),
+    }
+    // NO unsupported-charset warning: 0 fell back to the supported 'Latin'.
     assert_eq!(meta.unsupported_charset(), None);
   }
 

@@ -121,7 +121,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// PLIST chronology's running `… → 283` figure is relative to lib/plist's
 /// older fork base; the absolute total against the live golden directory is
 /// 327 (`275 + 52`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 334;
+const EXPECTED_ACTIVE_FIXTURES: usize = 335;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -1199,6 +1199,13 @@ fn typed_serde_path_equals_writer_path_and_golden_all_334() {
   //     `"$val s"`), `TCOD`/`TCDO` (`$val*1e-7` + `ConvertTimecode`), `STAT`
   //     (list PrintConv), `DTIM` (FILETIME → `ConvertUnixTime`), `IAS1`/`IBSU`
   //     (Morgan), `DISP`/`TRCK` (Sound Forge) — RIFF.pm:897-1000.
+  // 334 → 335 after the Codex R3 audit fix (1 crafted WAV):
+  //   * `RIFF_cset0_info.wav` — CSET `CodePage=0` falls back to the default
+  //     `'Latin'` charset (RIFF.pm:1784-1789 truthiness gate: `$$et{CodePage}`
+  //     of `0` is FALSY ⇒ `$charset = 'Latin'`), so `IART=Caf\xe9` decodes
+  //     through cp1252 to `"Café"` with NO `ExifTool:Warning` — exactly like
+  //     no CSET at all. Distinguishes 0 (Latin) from a non-zero unsupported
+  //     code page (raw passthrough + warning, the `RIFF_cset_info.wav` case).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
