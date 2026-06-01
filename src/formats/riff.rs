@@ -307,6 +307,11 @@ pub struct RiffMeta<'a> {
   /// terminal warning `Error reading RIFF file (corrupted?)` (RIFF.pm:2216,
   /// `$err and $et->Warn(...)`).
   corrupted: bool,
+  /// `Some(code_page)` when a CSET-declared NUMERIC charset was used to decode
+  /// at least one non-empty INFO string — ExifTool's `Decode` warns once
+  /// `Unsupported character set (<N>)` (ExifTool.pm:6359-6363). Surfaced by
+  /// `drain_diagnostics` as an `ExifTool:Warning`.
+  unsupported_charset: Option<u16>,
   /// Phantom anchor for the GAT lifetime.
   _marker: core::marker::PhantomData<&'a ()>,
 }
@@ -320,6 +325,7 @@ impl Default for RiffMeta<'_> {
       mime: "application/octet-stream",
       rf64: false,
       corrupted: false,
+      unsupported_charset: None,
       _marker: core::marker::PhantomData,
     }
   }
@@ -371,6 +377,16 @@ impl RiffMeta<'_> {
   #[inline(always)]
   pub const fn is_corrupted(&self) -> bool {
     self.corrupted
+  }
+
+  /// `Some(code_page)` when a CSET-declared NUMERIC charset decoded at least
+  /// one non-empty INFO string — the engine surfaces this as the bundled
+  /// `ExifTool:Warning` "Unsupported character set (<code_page>)"
+  /// (ExifTool.pm:6359-6363, RIFF.pm:1829). `None` otherwise.
+  #[must_use]
+  #[inline(always)]
+  pub const fn unsupported_charset(&self) -> Option<u16> {
+    self.unsupported_charset
   }
 }
 
@@ -452,6 +468,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     streams: Vec::new(),
     current_stream_type: None,
     charset: Charset::Latin,
+    unsupported_charset: None,
     err: false,
   };
 
@@ -470,6 +487,7 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
     mime,
     rf64,
     corrupted: walker.err,
+    unsupported_charset: walker.unsupported_charset,
     _marker: core::marker::PhantomData,
   })
 }
@@ -492,6 +510,11 @@ struct Walker<'a> {
   /// switches it to [`Charset::Raw`] (`$$self{CodePage}` is numeric ⇒ the
   /// `%csType` lookup misses ⇒ raw passthrough).
   charset: Charset,
+  /// The numeric code page from the FIRST `Decode` that hit an unsupported
+  /// (numeric) charset with a non-empty string — surfaced ONCE as
+  /// `Unsupported character set (<N>)` (ExifTool.pm:6359-6363, the
+  /// `DecodeWarn$set` once-guard). `None` until such a decode happens.
+  unsupported_charset: Option<u16>,
   /// `$err` (RIFF.pm:2096/2150/2216) — set when a declared-length chunk could
   /// not be fully read (truncated). Drives the terminal
   /// `Error reading RIFF file (corrupted?)` warning.
@@ -558,7 +581,12 @@ impl<'a> Walker<'a> {
         let body = &self.data[list_payload_start..list_payload_end];
         match &list_type {
           b"INFO" | b"INF0" => {
-            process_chunks_info(body, &mut self.entries, self.charset);
+            process_chunks_info(
+              body,
+              &mut self.entries,
+              self.charset,
+              &mut self.unsupported_charset,
+            );
           }
           b"exif" => {
             // NOTE: `%RIFF::Exif` (RIFF.pm:1013-1027) has NO `FORMAT =>
@@ -612,15 +640,17 @@ impl<'a> Walker<'a> {
         b"fmt " => emit_audio_format(body, &mut self.entries),
         b"IDIT" => emit_idit(body, &mut self.entries),
         b"ISMP" => emit_ismp(body, &mut self.entries),
-        // CSET (RIFF.pm:533-536 → `%RIFF::CSET`): `CodePage` int16u at
-        // offset 0 sets `$$self{CodePage}` (RIFF.pm:1068-1069), which makes
-        // ProcessChunks decode subsequent INFO/exif strings through the
-        // NUMERIC code page. `Image::ExifTool::Decode` keys `%csType` by
-        // charset NAME, so a numeric code page misses ⇒ raw passthrough
-        // (verified vs bundled). We model that as `Charset::Raw`.
+        // CSET (RIFF.pm:533-536 → `%RIFF::CSET`, ProcessBinaryData int16u):
+        // emits `CodePage`/`CountryCode`/`LanguageCode`/`Dialect`
+        // (RIFF.pm:1063-1073) AND sets `$$self{CodePage}` (RIFF.pm:1069
+        // RawConv), which makes the subsequent INFO ProcessChunks decode
+        // strings through the NUMERIC code page. `Image::ExifTool::Decode`
+        // keys `%csType` by charset NAME, so a numeric code page misses ⇒
+        // raw passthrough + an `Unsupported character set (<N>)` warning
+        // (verified vs bundled). We model that as `Charset::Raw(code_page)`.
         b"CSET" => {
-          if body.len() >= 2 {
-            self.charset = Charset::Raw;
+          if let Some(code_page) = emit_cset(body, &mut self.entries) {
+            self.charset = Charset::Raw(code_page);
           }
         }
         // Skip image-data / index chunks (RIFF.pm:2148-2150).
@@ -771,16 +801,26 @@ impl<'a> Walker<'a> {
 // §5. Sub-chunk decoders (free functions; no walker state needed)
 // ===========================================================================
 
-/// `%Image::ExifTool::RIFF::Info` — RIFF.pm:835-1010. The full table has
-/// dozens of FourCC → tag-name rows; we port the bundled `RIFF.avi`
-/// fixture's IART/IGNR/ICRD/INAM/ISFT/etc. set + the broader "EXIF 2.3"
-/// underlined-tag subset. Unrecognized FourCCs are silently skipped
-/// (faithful to bundled with no `-U`).
+/// `%Image::ExifTool::RIFF::Info` — RIFF.pm:835-1010. Emits the COMPLETE
+/// table (all 87 FourCC → tag-name rows; see [`info_tag_name`]): the EXIF 2.3
+/// subset, the IMDb / MovieID / Morgan / GSpot / Sound Forge / Sony Vegas
+/// 3rd-party rows, and the INFO-level `IDIT`/`ISMP`. Unrecognized FourCCs are
+/// silently skipped (faithful to bundled with no `-U`).
 ///
 /// String values are decoded through the active [`Charset`] (RIFF.pm:1829)
-/// — the default is `'Latin'`/cp1252, NOT UTF-8 — and the per-tag ValueConvs
-/// for `ICRD` (RIFF.pm:853) and `ISFT` (RIFF.pm:873) are applied.
-fn process_chunks_info(body: &[u8], entries: &mut Vec<RiffEntry>, charset: Charset) {
+/// — the default is `'Latin'`/cp1252, NOT UTF-8. The per-tag ValueConvs are
+/// applied here (`ICRD` RIFF.pm:853, `ISFT` RIFF.pm:873, `TLEN` RIFF.pm:933,
+/// `TCOD`/`TCDO` RIFF.pm:948/954, `DTIM` RIFF.pm:988-998, `IDIT` RIFF.pm:1006);
+/// the PrintConvs run later at emit time. When the active charset is an
+/// unsupported (CSET numeric) code page, the first non-empty decode records
+/// the `Unsupported character set (<N>)` warning in `unsupported_charset`
+/// (ExifTool.pm:6349-6363).
+fn process_chunks_info(
+  body: &[u8],
+  entries: &mut Vec<RiffEntry>,
+  charset: Charset,
+  unsupported_charset: &mut Option<u16>,
+) {
   let mut p = 0;
   while p + 8 < body.len() {
     let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
@@ -793,27 +833,62 @@ fn process_chunks_info(body: &[u8], entries: &mut Vec<RiffEntry>, charset: Chars
     let pad = len & 1;
     p += len + pad;
     let Some(name) = info_tag_name(&tag) else {
+      // Unknown tag — no `$tagInfo`, so ExifTool never calls `Decode`
+      // (RIFF.pm:1810-1830): it neither emits nor triggers the
+      // unsupported-charset warning. Skip silently (no `-U`).
       continue;
     };
     // RIFF.pm:1826-1829 — trim trailing NULs from the raw bytes, THEN decode
     // through the active charset (cp1252 by default). Per-tag ValueConvs run
     // AFTER the decode (HandleTag stores the decoded `$val`, then ValueConv).
-    let decoded = charset.decode(trim_trailing_nulls(payload));
-    let value = match &tag {
+    let raw = trim_trailing_nulls(payload);
+    // ExifTool.pm:6349-6363 — `Decode($val, $charset)` warns once
+    // `Unsupported character set (<N>)` when the (numeric) `$from` charset is
+    // not in `%csType` AND `length $val` (post-NUL-trim) is non-zero. The
+    // `DecodeWarn$set` once-guard ⇒ record only the first occurrence.
+    if !raw.is_empty()
+      && let Some(cp) = charset.unsupported_code_page()
+      && unsupported_charset.is_none()
+    {
+      *unsupported_charset = Some(cp);
+    }
+    let decoded = charset.decode(raw);
+    // Per-tag ValueConv (RIFF.pm:835-1009). Numeric ValueConvs (`TLEN`,
+    // `TCOD`, `TCDO`) coerce the decoded string via Perl numeric semantics
+    // and store an `F64` (their PrintConv runs at emit time); the date
+    // ValueConvs (`DTIM`, `IDIT`) and `ICRD`/`ISFT` rewrite the string.
+    let value: Option<RiffValue> = match &tag {
       // ICRD DateCreated — ValueConv `$_=$val; s/-/:/g; $_` (RIFF.pm:853).
-      b"ICRD" => decoded.replace('-', ":"),
+      b"ICRD" => Some(RiffValue::Str(SmolStr::new(decoded.replace('-', ":")))),
       // ISFT Software — ValueConv `s/(\s*\0)+$//; s/(\s*\0)/, /; s/\0+//g`
       // (RIFF.pm:873): trim trailing space-runs-before-NUL, replace the first
       // embedded `[\s]*\0` with ", ", drop any remaining NULs. (Casio writes
       // "CASIO" after the first NUL.)
-      b"ISFT" => isft_value_conv(&decoded),
-      _ => decoded,
+      b"ISFT" => Some(RiffValue::Str(SmolStr::new(isft_value_conv(&decoded)))),
+      // TLEN Length — ValueConv `$val/1000` (RIFF.pm:933). PrintConv
+      // `"$val s"` runs at emit time.
+      b"TLEN" => Some(RiffValue::F64(
+        crate::convert::perl_str_to_f64(&decoded) / 1000.0,
+      )),
+      // TCOD StartTimecode / TCDO EndTimecode — ValueConv `$val * 1e-7`
+      // (RIFF.pm:948/954). PrintConv `ConvertTimecode` runs at emit time.
+      b"TCOD" | b"TCDO" => Some(RiffValue::F64(
+        crate::convert::perl_str_to_f64(&decoded) * 1e-7,
+      )),
+      // DTIM DateTimeOriginal — ValueConv (RIFF.pm:988-998); may return undef
+      // (when the value is not exactly two space-separated FILETIME halves),
+      // in which case the tag is dropped.
+      b"DTIM" => dtim_value_conv(&decoded).map(|s| RiffValue::Str(SmolStr::new(s))),
+      // IDIT DateTimeOriginal — ValueConv `ConvertRIFFDate($val)`
+      // (RIFF.pm:1006). PrintConv `ConvertDateTime` is identity here.
+      b"IDIT" => Some(RiffValue::Str(SmolStr::new(convert_riff_date(&decoded)))),
+      // STAT Statistics (RIFF.pm:973-983) — no ValueConv; the list PrintConv
+      // runs at emit time. All other entries pass the decoded string through.
+      _ => Some(RiffValue::Str(SmolStr::new(decoded))),
     };
-    entries.push(RiffEntry::new(
-      "RIFF",
-      name,
-      RiffValue::Str(SmolStr::new(&value)),
-    ));
+    if let Some(value) = value {
+      entries.push(RiffEntry::new("RIFF", name, value));
+    }
   }
 }
 
@@ -854,16 +929,16 @@ fn isft_value_conv(val: &str) -> String {
   String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// Map an INFO chunk FourCC to its emitted tag name (RIFF.pm:835-1010).
-/// Returns `None` for FourCCs the bundled table doesn't define — these are
-/// silently skipped (faithful with no `-U`).
+/// Map an INFO chunk FourCC to its emitted tag name — the COMPLETE
+/// `%Image::ExifTool::RIFF::Info` table (RIFF.pm:835-1010, all 87 entries).
+/// Returns `None` for FourCCs the bundled table doesn't define — those are
+/// silently skipped (faithful with no `-U`). The per-tag ValueConv/PrintConv
+/// (`ICRD`/`ISFT`/`TLEN`/`TCOD`/`TCDO`/`DTIM`/`STAT`/`IDIT`) are applied by
+/// the caller ([`process_chunks_info`] for the ValueConv, [`emit_one`]/
+/// [`print_conv_str`]/[`print_conv_f64_string`] for the PrintConv).
 const fn info_tag_name(tag: &[u8; 4]) -> Option<&'static str> {
-  // RIFF.pm:845-1009 (the EXIF 2.3 INFO subset that the fixture + most
-  // AVI files in scope reach). The 3rd-party tables (movie database,
-  // GSpot, Sound Forge, Sony Vegas) are below the EXIF subset; the bundled
-  // fixture only reaches IART/IGNR/ICRD/INAM/IPRD/IKEY/ICMT/IENG/ISFT
-  // typically. Cover the full EXIF subset here for product fidelity.
   match tag {
+    // ----- EXIF 2.3 INFO subset (RIFF.pm:845-878) -----------------------
     b"IARL" => Some("ArchivalLocation"),
     b"IART" => Some("Artist"),
     b"ICMS" => Some("Commissioned"),
@@ -888,10 +963,7 @@ const fn info_tag_name(tag: &[u8; 4]) -> Option<&'static str> {
     b"ISRC" => Some("Source"),
     b"ISRF" => Some("SourceForm"),
     b"ITCH" => Some("Technician"),
-    // 3rd-party (RIFF.pm:880-938) — these are common enough that ignoring
-    // them silently is the wrong product call for an indexer. Include the
-    // EXIF-style ones (IMDb / Vegas / Sound Forge) so a `.avi` carrying
-    // them surfaces real data.
+    // ----- Internet movie database (RIFF.pm:882-896, ref 12) ------------
     b"ISGN" => Some("SecondaryGenre"),
     b"IWRI" => Some("WrittenBy"),
     b"IPRO" => Some("ProducedBy"),
@@ -906,8 +978,61 @@ const fn info_tag_name(tag: &[u8; 4]) -> Option<&'static str> {
     b"ILNG" => Some("Language"),
     b"IRTD" => Some("Rating"),
     b"ISTR" => Some("Starring"),
+    // ----- MovieID (RIFF.pm:897-908, ref 12) ----------------------------
+    b"TITL" => Some("Title"),
+    b"DIRC" => Some("Directory"),
+    b"YEAR" => Some("Year"),
+    b"GENR" => Some("Genre"),
+    b"COMM" => Some("Comments"),
+    b"LANG" => Some("Language"),
+    b"AGES" => Some("Rated"),
+    b"STAR" => Some("Starring"),
+    b"CODE" => Some("EncodedBy"),
+    b"PRT1" => Some("Part"),
+    b"PRT2" => Some("NumberOfParts"),
+    // ----- Morgan Multimedia (RIFF.pm:909-927, ref 12) ------------------
+    b"IAS1" => Some("FirstLanguage"),
+    b"IAS2" => Some("SecondLanguage"),
+    b"IAS3" => Some("ThirdLanguage"),
+    b"IAS4" => Some("FourthLanguage"),
+    b"IAS5" => Some("FifthLanguage"),
+    b"IAS6" => Some("SixthLanguage"),
+    b"IAS7" => Some("SeventhLanguage"),
+    b"IAS8" => Some("EighthLanguage"),
+    b"IAS9" => Some("NinthLanguage"),
+    b"ICAS" => Some("DefaultAudioStream"),
+    b"IBSU" => Some("BaseURL"),
+    b"ILGU" => Some("LogoURL"),
+    b"ILIU" => Some("LogoIconURL"),
+    b"IWMU" => Some("WatermarkURL"),
+    b"IMIU" => Some("MoreInfoURL"),
+    b"IMBI" => Some("MoreInfoBannerImage"),
+    b"IMBU" => Some("MoreInfoBannerURL"),
+    b"IMIT" => Some("MoreInfoText"),
+    // ----- GSpot (RIFF.pm:928-930, ref 12) ------------------------------
     b"IENC" => Some("EncodedBy"),
     b"IRIP" => Some("RippedBy"),
+    // ----- Sound Forge Pro (RIFF.pm:931-938) ----------------------------
+    b"DISP" => Some("SoundSchemeTitle"),
+    b"TLEN" => Some("Length"),
+    b"TRCK" => Some("TrackNumber"),
+    b"TURL" => Some("URL"),
+    b"TVER" => Some("Version"),
+    b"LOCA" => Some("Location"),
+    b"TORG" => Some("Organization"),
+    // ----- Sony Vegas / SCLive / Adobe Premiere (RIFF.pm:939-1000, ref 11)
+    b"TAPE" => Some("TapeName"),
+    b"TCOD" => Some("StartTimecode"),
+    b"TCDO" => Some("EndTimecode"),
+    b"VMAJ" => Some("VegasVersionMajor"),
+    b"VMIN" => Some("VegasVersionMinor"),
+    b"CMNT" => Some("Comment"),
+    b"RATE" => Some("Rate"),
+    b"STAT" => Some("Statistics"),
+    b"DTIM" => Some("DateTimeOriginal"),
+    // ----- INFO-level IDIT / ISMP (RIFF.pm:1001-1009) -------------------
+    b"IDIT" => Some("DateTimeOriginal"),
+    b"ISMP" => Some("TimeCode"),
     _ => None,
   }
 }
@@ -1080,9 +1205,11 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
   if payload.len() < 48 {
     return None;
   }
-  // 0: StreamType — Format => 'string[4]' (RIFF.pm:1166-1177).
+  // 0: StreamType — Format => 'string[4]' (RIFF.pm:1166-1177). `string_trim_nulls`
+  // trims trailing NULs (the `string[4]` ReadValue trim) and renders any invalid
+  // UTF-8 byte as `?` (ExifTool's JSON FixUTF8), NOT U+FFFD.
   let stream_type_bytes: [u8; 4] = payload[0..4].try_into().expect("4 bytes");
-  let stream_type_str = String::from_utf8_lossy(&stream_type_bytes).into_owned();
+  let stream_type_str = string_trim_nulls(&stream_type_bytes);
   push_priority0(
     entries,
     "RIFF",
@@ -1322,6 +1449,92 @@ fn emit_ismp(payload: &[u8], entries: &mut Vec<RiffEntry>) {
   ));
 }
 
+/// `%Image::ExifTool::RIFF::CSET` (RIFF.pm:1063-1073) via `ProcessBinaryData`,
+/// `FORMAT => 'int16u'`: emits `CodePage`(0) / `CountryCode`(1) /
+/// `LanguageCode`(2) / `Dialect`(3), each an int16u read at its byte offset
+/// (0/2/4/6). `ProcessBinaryData` emits only the fields whose bytes are
+/// present (verified vs bundled: a 2-byte CSET emits just `CodePage`). The
+/// `CodePage` `RawConv => '$$self{CodePage} = $val'` (RIFF.pm:1069) is modeled
+/// by returning the numeric code page so the caller switches the INFO charset
+/// to [`Charset::Raw`]. Returns `None` when the chunk is too short to hold
+/// even `CodePage` (no charset switch, no fields).
+fn emit_cset(body: &[u8], entries: &mut Vec<RiffEntry>) -> Option<u16> {
+  // ProcessBinaryData reads int16u entries; a field at index `i` lives at byte
+  // offset `2*i` and is emitted only if `2*i + 2 <= len`.
+  const FIELDS: [(usize, &str); 4] = [
+    (0, "CodePage"),
+    (1, "CountryCode"),
+    (2, "LanguageCode"),
+    (3, "Dialect"),
+  ];
+  let mut code_page = None;
+  for (idx, name) in FIELDS {
+    let off = idx * 2;
+    if off + 2 > body.len() {
+      break;
+    }
+    let val = le_u16(&body[off..off + 2]);
+    if idx == 0 {
+      code_page = Some(val);
+    }
+    entries.push(RiffEntry::new("RIFF", name, RiffValue::U32(u32::from(val))));
+  }
+  code_page
+}
+
+/// `DTIM` DateTimeOriginal ValueConv (RIFF.pm:988-998). The raw value is two
+/// space-separated 64-bit FILETIME halves (`hi lo`, 100-ns ticks since
+/// 1601-01-01). Faithful transliteration:
+///
+/// - Split on whitespace; unless EXACTLY two parts, return `undef` (drop tag).
+/// - If the raw already matches `^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$`
+///   (the Kodak EASYSHARE Sport stores it pre-formatted), return it verbatim.
+/// - Else `$val = 1e-7 * (hi*4294967296 + lo)`; shift from the 1601 epoch to
+///   the Unix epoch (`-= 134774*24*3600`) unless `$val == 0`; then
+///   `ConvertUnixTime($val)`.
+fn dtim_value_conv(val: &str) -> Option<String> {
+  let parts: Vec<&str> = val.split_whitespace().collect();
+  // RIFF.pm:990 `return undef unless @v == 2;`. The split happens BEFORE the
+  // Kodak-string short-circuit, so the pre-formatted string (which has two
+  // whitespace-separated parts: "2021:06:15" and "12:30:45") survives.
+  if parts.len() != 2 {
+    return None;
+  }
+  // RIFF.pm:992 — Kodak EASYSHARE Sport pre-formatted passthrough.
+  if is_kodak_datetime(val) {
+    return Some(val.to_string());
+  }
+  // RIFF.pm:994 `$val = 1e-7 * ($v[0] * 4294967296 + $v[1]);` — Perl coerces
+  // each half through numeric context (leading-digit prefix).
+  let hi = crate::convert::perl_str_to_f64(parts[0]);
+  let lo = crate::convert::perl_str_to_f64(parts[1]);
+  let mut secs = 1e-7 * (hi * 4_294_967_296.0 + lo);
+  // RIFF.pm:996 `$val -= 134774 * 24 * 3600 if $val != 0;`.
+  if secs != 0.0 {
+    secs -= 134_774.0 * 24.0 * 3600.0;
+  }
+  // RIFF.pm:997 `return Image::ExifTool::ConvertUnixTime($val);` (float form).
+  Some(crate::datetime::convert_unix_time_f64(secs))
+}
+
+/// `true` when `val` matches the Perl regex `^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$`
+/// (RIFF.pm:992) — the Kodak pre-formatted DateTimeOriginal passthrough.
+fn is_kodak_datetime(val: &str) -> bool {
+  let b = val.as_bytes();
+  // `YYYY:MM:DD HH:MM:SS` — exactly 19 bytes with fixed digit/colon/space slots.
+  if b.len() != 19 {
+    return false;
+  }
+  // Digit positions: 0-3, 5-6, 8-9, 11-12, 14-15, 17-18.
+  let digit = |i: usize| b[i].is_ascii_digit();
+  let digits_ok = (0..=3).all(digit)
+    && [5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+      .iter()
+      .all(|&i| digit(i));
+  // Separators: ':' at 4,7,13,16 and ' ' at 10.
+  digits_ok && b[4] == b':' && b[7] == b':' && b[10] == b' ' && b[13] == b':' && b[16] == b':'
+}
+
 // ===========================================================================
 // §6. Helpers — `ConvertRIFFDate`, byte readers, string trim
 // ===========================================================================
@@ -1344,8 +1557,15 @@ fn trim_trailing_nulls(bytes: &[u8]) -> &[u8] {
 /// `strn`) that bundled reads via `Format => 'string[4]'` — those do NOT pass
 /// through the CSET charset (only `INFO`/`exif` string chunks decoded by
 /// `ProcessChunks` do, RIFF.pm:1825-1829).
+///
+/// **Invalid-byte rendering:** invalid UTF-8 bytes become a single ASCII `?`
+/// each (via [`crate::convert::fix_utf8`], the port of `XMP::FixUTF8` that
+/// ExifTool's JSON writer applies at `exiftool:3822`), NOT the
+/// `from_utf8_lossy` U+FFFD replacement char. Verified vs the bundled oracle:
+/// an `exif`-LIST `ecor` of `Mak\xe9\xff` emits `"Mak??"`, and a `strn`
+/// StreamName of `Strm\xe9\xff` emits `"Strm??"` (NOT `Mak\u{FFFD}…`).
 fn string_trim_nulls(bytes: &[u8]) -> String {
-  String::from_utf8_lossy(trim_trailing_nulls(bytes)).into_owned()
+  crate::convert::fix_utf8(trim_trailing_nulls(bytes))
 }
 
 /// Active RIFF string charset (RIFF.pm:1782-1790). `ProcessChunks` decodes
@@ -1357,28 +1577,44 @@ fn string_trim_nulls(bytes: &[u8]) -> String {
 /// - **`CSET` chunk present**: `$charset` is the NUMERIC code page
 ///   (`$$self{CodePage}`, RIFF.pm:1786). `Image::ExifTool::Decode` keys its
 ///   `%csType` table by NAME, so a numeric code page never matches ⇒ NO
-///   remapping (raw byte passthrough; `ExifTool.pm:6351-6353`). We model this
-///   as [`Charset::Raw`] (verified vs bundled: a `CSET CodePage=1252` file
-///   emits the literal input bytes, not a cp1252-decoded string). The dead
-///   `%code2charset` table (RIFF.pm:67-88) is NEVER referenced in bundled, so
-///   it does NOT translate the number to a name.
+///   remapping (raw byte passthrough; `ExifTool.pm:6351-6363`). We model this
+///   as [`Charset::Raw`] carrying the numeric code page (verified vs bundled:
+///   a `CSET CodePage=1252` file emits the literal input bytes, not a
+///   cp1252-decoded string, and warns `Unsupported character set (1252)`).
+///   The dead `%code2charset` table (RIFF.pm:67-88) is NEVER referenced in
+///   bundled, so it does NOT translate the number to a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Charset {
   /// Default `'Latin'` (cp1252) decoding.
   Latin,
-  /// A `CSET` code page was declared — raw passthrough (`%csType` miss).
-  Raw,
+  /// A `CSET` code page was declared — raw passthrough (`%csType` miss). The
+  /// `u16` is the declared numeric code page (`$$self{CodePage}`), surfaced
+  /// in the `Unsupported character set (<N>)` warning (ExifTool.pm:6359-6363).
+  Raw(u16),
 }
 
 impl Charset {
   /// Decode raw (already trailing-NUL-trimmed) chunk bytes to a `String` per
-  /// the active charset. `Latin` ⇒ cp1252→UTF-8; `Raw` ⇒ `from_utf8_lossy`
-  /// (the crate's invalid-byte policy; bundled passes the raw bytes through
-  /// and its JSON writer later maps invalid bytes to `?`).
+  /// the active charset. `Latin` ⇒ cp1252→UTF-8 ([`crate::charset::decode_latin`],
+  /// always valid UTF-8); `Raw` ⇒ the bytes pass through unremapped, with
+  /// invalid UTF-8 rendered as ASCII `?` per ExifTool's JSON `FixUTF8`
+  /// ([`crate::convert::fix_utf8`]) — NOT the `from_utf8_lossy` U+FFFD char
+  /// (verified vs bundled: a CSET file with an `IART` of `Caf\xe9\xff Test`
+  /// emits `"Caf?? Test"`, two `?` for the two invalid bytes).
   fn decode(self, bytes: &[u8]) -> String {
     match self {
       Charset::Latin => crate::charset::decode_latin(bytes),
-      Charset::Raw => String::from_utf8_lossy(bytes).into_owned(),
+      Charset::Raw(_) => crate::convert::fix_utf8(bytes),
+    }
+  }
+
+  /// `true` when this is an unsupported (numeric code page) charset, i.e. the
+  /// `Decode` path that warns `Unsupported character set (<N>)`. The numeric
+  /// code page is returned for the warning message.
+  const fn unsupported_code_page(self) -> Option<u16> {
+    match self {
+      Charset::Latin => None,
+      Charset::Raw(cp) => Some(cp),
     }
   }
 }
@@ -1415,6 +1651,37 @@ fn convert_riff_date(val: &str) -> String {
   }
 
   trimmed.to_string()
+}
+
+/// `Image::ExifTool::RIFF::ConvertTimecode($val)` — RIFF.pm:1625-1638. The
+/// `StartTimecode`/`EndTimecode` PrintConv: a duration in seconds (`f64`, the
+/// `$val * 1e-7` ValueConv result) rendered as `H:MM:SS.ss`.
+///
+/// Faithful transliteration: `int()` truncates toward zero (Perl `int` on an
+/// NV); the seconds field is `sprintf('%05.2f', $val)`; the round-off guard
+/// (`$ss >= 60`) compares the *numeric* string back to 60 and carries.
+fn convert_timecode(val: f64) -> String {
+  // RIFF.pm:1628-1631 — `int($val/3600)`, then `int(remainder/60)`.
+  let mut hr = (val / 3600.0).trunc();
+  let after_hr = val - hr * 3600.0;
+  let mut min = (after_hr / 60.0).trunc();
+  let sec = after_hr - min * 60.0;
+  // RIFF.pm:1632 `my $ss = sprintf('%05.2f', $val);` — 2-decimal, zero-padded
+  // to width 5 (e.g. `05.00`, `59.99`).
+  let mut ss = format!("{sec:05.2}");
+  // RIFF.pm:1633-1636 `if ($ss >= 60)` — Perl numifies the string for the
+  // comparison; the `%05.2f` rounding can produce "60.00" from e.g. 59.999.
+  if ss.parse::<f64>().unwrap_or(0.0) >= 60.0 {
+    ss = "00.00".to_string();
+    min += 1.0;
+    if min >= 60.0 {
+      min -= 60.0;
+      hr += 1.0;
+    }
+  }
+  // RIFF.pm:1637 `sprintf('%d:%.2d:%s', $hr, $min, $ss)` — `$hr`/`$min` are
+  // NV-typed; `%d` truncates toward zero. Cast the small h/m back to i64.
+  format!("{}:{:02}:{}", hr as i64, min as i64, ss)
 }
 
 /// Three-letter month name → 1..=12. `Jan`/`Feb`/… case-insensitive
@@ -1704,7 +1971,7 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
   let value = match entry.value_ref() {
     RiffValue::Str(s) => {
       // PrintConv dispatch for STRING values (StreamType maps `vids` →
-      // "Video" etc. in `-j` mode, RIFF.pm:1170-1176).
+      // "Video" etc.; STAT runs the list PrintConv) in `-j` mode.
       if print_conv && let Some(printed) = print_conv_str(group, name, s.as_str()) {
         TagValue::Str(printed.into())
       } else {
@@ -1721,7 +1988,13 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
       }
     }
     RiffValue::F64(f) => {
-      if print_conv && let Some(rounded) = print_conv_f64_value(name, *f) {
+      // PrintConv whose `-j` rendering is a STRING (TLEN `"$val s"`,
+      // TCOD/TCDO `ConvertTimecode`) — checked first; these names are NOT in
+      // `print_conv_f64_value` (no rounding) so the `-n` path emits the raw
+      // F64 below.
+      if print_conv && let Some(printed) = print_conv_f64_string(name, *f) {
+        TagValue::Str(printed.into())
+      } else if print_conv && let Some(rounded) = print_conv_f64_value(name, *f) {
         // Faithful to bundled: emit as INTEGER when the post-rounding
         // value has no fractional part (Perl `int($val * N + 0.5) / N`
         // produces an integer when the round divides evenly). bundled
@@ -1740,22 +2013,76 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
   EmittedTag::new(g(), name.into(), value, false)
 }
 
-/// PrintConv for `Str`-typed values. Currently only `RIFF:StreamType`
-/// has a PrintConv label table (RIFF.pm:1170-1176). Returns the static
-/// label, or `None` to pass through the raw FourCC.
+/// PrintConv for `Str`-typed values. `RIFF:StreamType` maps the FourCC to a
+/// label (RIFF.pm:1170-1176); `RIFF:Statistics` runs the Sony Vegas list
+/// PrintConv (RIFF.pm:977-982). Returns the rendered string, or `None` to pass
+/// the stored value through unchanged.
 #[cfg(feature = "alloc")]
-fn print_conv_str(group: &str, name: &str, val: &str) -> Option<&'static str> {
+fn print_conv_str(group: &str, name: &str, val: &str) -> Option<String> {
   match (group, name) {
     ("RIFF", "StreamType") => match val {
-      "auds" => Some("Audio"),
-      "mids" => Some("MIDI"),
-      "txts" => Some("Text"),
-      "vids" => Some("Video"),
-      "iavs" => Some("Interleaved Audio+Video"),
+      "auds" => Some("Audio".to_string()),
+      "mids" => Some("MIDI".to_string()),
+      "txts" => Some("Text".to_string()),
+      "vids" => Some("Video".to_string()),
+      "iavs" => Some("Interleaved Audio+Video".to_string()),
       _ => None,
     },
+    // STAT Statistics (RIFF.pm:977-982) — a Perl LIST PrintConv applied to the
+    // space-separated values: `"$val frames captured"`, `"$val dropped"`,
+    // `"Data rate $val"`, `{ 0 => 'Bad', 1 => 'OK' }`. Values BEYOND the four
+    // list slots are emitted verbatim (Perl's list-PrintConv passes the extra
+    // values through unchanged); a value SHORT of four leaves later slots
+    // absent. The rendered parts are joined with "; " (verified vs bundled:
+    // "7318 0 3.430307 1" ⇒ "7318 frames captured; 0 dropped; Data rate
+    // 3.430307; OK").
+    ("RIFF", "Statistics") => Some(stat_print_conv(val)),
     _ => None,
   }
+}
+
+/// PrintConv for f64 values whose `-j` rendering is a STRING. `RIFF:Length`
+/// (TLEN) is `"$val s"` (RIFF.pm:933); `RIFF:StartTimecode`/`RIFF:EndTimecode`
+/// (TCOD/TCDO) run [`convert_timecode`] (RIFF.pm:949/955). `$val` is the
+/// post-ValueConv f64; Perl interpolates it via `%.15g` (its default NV
+/// stringification), matched by [`crate::value::format_g`].
+#[cfg(feature = "alloc")]
+fn print_conv_f64_string(name: &str, val: f64) -> Option<String> {
+  match name {
+    "Length" => Some(std::format!("{} s", crate::value::format_g(val, 15))),
+    "StartTimecode" | "EndTimecode" => Some(convert_timecode(val)),
+    _ => None,
+  }
+}
+
+/// `STAT` Statistics list-PrintConv (RIFF.pm:977-982). ExifTool splits the
+/// value with `split ' ', $value` (ExifTool.pm:3553, awk-split: runs of
+/// whitespace collapsed, leading/trailing stripped), renders element `i` with
+/// the `i`-th PrintConv slot, and joins the rendered parts with `"; "` (the
+/// `$convType eq 'PrintConv' ? '; ' : ' '` join, ExifTool.pm:3697).
+#[cfg(feature = "alloc")]
+fn stat_print_conv(val: &str) -> String {
+  let parts: Vec<&str> = val.split_whitespace().collect();
+  let mut out: Vec<String> = Vec::with_capacity(parts.len());
+  for (i, p) in parts.iter().enumerate() {
+    let rendered = match i {
+      0 => std::format!("{p} frames captured"),
+      1 => std::format!("{p} dropped"),
+      2 => std::format!("Data rate {p}"),
+      3 => match *p {
+        // `{ 0 => 'Bad', 1 => 'OK' }` — a hash PrintConv. An unmatched value
+        // passes through unchanged (default hash-miss behavior, no `-U` here:
+        // ExifTool emits the raw value for an unlisted key).
+        "0" => "Bad".to_string(),
+        "1" => "OK".to_string(),
+        other => other.to_string(),
+      },
+      // Beyond the 4 list slots: passthrough (Perl emits extra values raw).
+      _ => (*p).to_string(),
+    };
+    out.push(rendered);
+  }
+  out.join("; ")
 }
 
 /// PrintConv for u32 values whose `-j` rendering is a string label rather
@@ -2642,16 +2969,19 @@ mod tests {
   fn cset_chunk_switches_to_raw_passthrough() {
     // RIFF.pm:533/1786 — a CSET chunk sets a NUMERIC CodePage; `%csType` is
     // keyed by NAME, so the lookup misses ⇒ raw passthrough (no cp1252 remap).
-    // A 0x80 byte then stays 0x80 (from_utf8_lossy → U+FFFD), NOT €.
+    // A 0x80 byte stays raw, rendered as `?` by ExifTool's JSON FixUTF8 (NOT
+    // U+FFFD, NOT the cp1252 € it would be under the default 'Latin' charset).
     let mut buf = Vec::new();
     buf.extend_from_slice(b"RIFF");
     buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(b"WAVE");
-    // CSET: int16u CodePage=1252, CountryCode, LanguageCode, Dialect.
+    // CSET: int16u CodePage=1252, CountryCode=1, LanguageCode=9, Dialect=1.
     buf.extend_from_slice(b"CSET");
     buf.extend_from_slice(&8u32.to_le_bytes());
     buf.extend_from_slice(&1252u16.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 6]);
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&9u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
     let iart = b"x\x80\x00"; // odd len 3 → needs a pad byte
     let mut info = Vec::new();
     info.extend_from_slice(b"INFO");
@@ -2666,18 +2996,142 @@ mod tests {
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
     let meta = parse_borrowed(&buf).expect("ok").expect("some");
-    let artist = meta
+    let find = |name: &str| -> Option<&RiffValue> {
+      meta
+        .entries()
+        .iter()
+        .find(|e| e.name() == name)
+        .map(RiffEntry::value_ref)
+    };
+    // Raw 0x80 is invalid UTF-8 → ASCII `?` (FixUTF8, RIFF.pm raw passthrough).
+    match find("Artist") {
+      Some(RiffValue::Str(s)) => assert_eq!(s.as_str(), "x?"),
+      other => panic!("Artist: {other:?}"),
+    }
+    // The CSET binary SubDirectory fields (RIFF.pm:1063-1073).
+    assert_eq!(find("CodePage"), Some(&RiffValue::U32(1252)));
+    assert_eq!(find("CountryCode"), Some(&RiffValue::U32(1)));
+    assert_eq!(find("LanguageCode"), Some(&RiffValue::U32(9)));
+    assert_eq!(find("Dialect"), Some(&RiffValue::U32(1)));
+    // The numeric code page triggers the once `Unsupported character set`
+    // warning (ExifTool.pm:6359-6363).
+    assert_eq!(meta.unsupported_charset(), Some(1252));
+  }
+
+  #[test]
+  fn cset_empty_string_does_not_warn() {
+    // ExifTool.pm:6349 `length $val` — an all-NUL INFO string (trimmed to
+    // empty) is decoded but does NOT trigger the unsupported-charset warning.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"CSET");
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&1252u16.to_le_bytes());
+    let iart = b"\x00\x00"; // all-NUL → trims to empty
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IART");
+    info.extend_from_slice(&(iart.len() as u32).to_le_bytes());
+    info.extend_from_slice(iart);
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    // Only CodePage emitted (2-byte CSET); empty IART → Artist == "".
+    assert_eq!(
+      meta
+        .entries()
+        .iter()
+        .find(|e| e.name() == "CodePage")
+        .map(RiffEntry::value_ref),
+      Some(&RiffValue::U32(1252))
+    );
+    // No warning: the decoded string was empty (length 0).
+    assert_eq!(meta.unsupported_charset(), None);
+  }
+
+  #[test]
+  fn info_level_idit_converts_riff_date() {
+    // RIFF.pm:1002-1008 — an INFO-level `IDIT` runs through `ConvertRIFFDate`.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    let idit = b"Mon Mar 10 15:04:43 2003\x00";
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IDIT");
+    info.extend_from_slice(&(idit.len() as u32).to_le_bytes());
+    info.extend_from_slice(idit);
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    match meta
       .entries()
       .iter()
-      .find(|e| e.name() == "Artist")
-      .and_then(|e| match e.value_ref() {
-        RiffValue::Str(s) => Some(s.as_str()),
-        _ => None,
-      })
-      .expect("Artist");
-    // Raw 0x80 is invalid UTF-8 → U+FFFD (NOT the cp1252 € it would be under
-    // the default 'Latin' charset).
-    assert_eq!(artist, "x\u{FFFD}");
+      .find(|e| e.name() == "DateTimeOriginal")
+      .map(RiffEntry::value_ref)
+    {
+      Some(RiffValue::Str(s)) => assert_eq!(s.as_str(), "2003:03:10 15:04:43"),
+      other => panic!("DateTimeOriginal: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn dtim_value_conv_drops_non_pair_and_passes_kodak_string() {
+    // RIFF.pm:990 `return undef unless @v == 2` — a single token drops.
+    assert_eq!(dtim_value_conv("123456"), None);
+    // RIFF.pm:992 — a pre-formatted Kodak string passes through verbatim.
+    assert_eq!(
+      dtim_value_conv("2021:06:15 12:30:45").as_deref(),
+      Some("2021:06:15 12:30:45")
+    );
+    // Not the Kodak shape (wrong separators) but two tokens → FILETIME math.
+    // `0 0` ⇒ secs 0 ⇒ ConvertUnixTime(0) ⇒ the 0000 sentinel.
+    assert_eq!(
+      dtim_value_conv("0 0").as_deref(),
+      Some("0000:00:00 00:00:00")
+    );
+  }
+
+  #[test]
+  fn convert_timecode_matches_bundled() {
+    // RIFF.pm:1625-1638. `36050000000 * 1e-7 = 3605` ⇒ "1:00:05.00".
+    assert_eq!(convert_timecode(3605.0), "1:00:05.00");
+    // `15500000 * 1e-7 = 1.55` ⇒ "0:00:01.55".
+    assert_eq!(convert_timecode(1.55), "0:00:01.55");
+    // Round-off guard: 59.999 → "%05.2f" rounds to "60.00" ⇒ carry to 1:00.
+    assert_eq!(convert_timecode(59.999), "0:01:00.00");
+    // Zero.
+    assert_eq!(convert_timecode(0.0), "0:00:00.00");
+  }
+
+  #[test]
+  fn stat_print_conv_list() {
+    // RIFF.pm:977-982 — the Sony Vegas list PrintConv, joined with "; ".
+    assert_eq!(
+      stat_print_conv("7318 0 3.430307 1"),
+      "7318 frames captured; 0 dropped; Data rate 3.430307; OK"
+    );
+    // capture flag 0 ⇒ "Bad".
+    assert_eq!(
+      stat_print_conv("0 5 1234.5 0"),
+      "0 frames captured; 5 dropped; Data rate 1234.5; Bad"
+    );
+    // An unlisted capture flag passes through; extra values pass through raw.
+    assert_eq!(
+      stat_print_conv("1 2 3 9 extra"),
+      "1 frames captured; 2 dropped; Data rate 3; 9; extra"
+    );
   }
 
   #[test]

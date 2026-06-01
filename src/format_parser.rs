@@ -1129,16 +1129,26 @@ impl AnyMeta<'_> {
         }
         Ok(())
       }
-      // RIFF: the only ported `$et->Warn` is the terminal corruption notice.
-      // A declared-length chunk that runs past EOF (truncated) is skipped
-      // WITHOUT dispatching its emitter (`RiffMeta::is_corrupted`); bundled
-      // sets `$err` and warns once at the end (RIFF.pm:2216 `$err and
-      // $et->Warn('Error reading RIFF file (corrupted?)')`). The other
-      // ProcessChunks warning paths (`Bad ... data`) abort the sub-walk
-      // silently (no tags), matching bundled's `return 0` with no surfaced
-      // warning in the default JSON output.
+      // RIFF: two ported `$et->Warn` paths, in occurrence order.
+      //  1. `Unsupported character set (<N>)` — fired mid-walk by `Decode`
+      //     (ExifTool.pm:6359-6363) the first time a CSET-declared NUMERIC
+      //     charset decodes a non-empty INFO string (RIFF.pm:1829). The port
+      //     records the code page once in `RiffMeta::unsupported_charset`.
+      //  2. The terminal corruption notice: a declared-length chunk that runs
+      //     past EOF (truncated) is skipped WITHOUT dispatching its emitter
+      //     (`RiffMeta::is_corrupted`); bundled sets `$err` and warns once at
+      //     the end (RIFF.pm:2216 `$err and $et->Warn('Error reading RIFF file
+      //     (corrupted?)')`).
+      // The charset warning precedes the corruption notice (mid-walk before
+      // end-of-walk); the default `-j` output surfaces only the FIRST recorded
+      // warning (TagMap::first_warning). The other ProcessChunks warning paths
+      // (`Bad ... data`) abort the sub-walk silently (no tags), matching
+      // bundled's `return 0` with no surfaced warning.
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => {
+        if let Some(code_page) = m.unsupported_charset() {
+          out.write_warning(&std::format!("Unsupported character set ({code_page})"))?;
+        }
         if m.is_corrupted() {
           out.write_warning("Error reading RIFF file (corrupted?)")?;
         }
