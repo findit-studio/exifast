@@ -31,8 +31,8 @@ mod quicktime;
 
 #[cfg(feature = "crw")]
 pub use crw::{
-  CrwDecoderTable, CrwImageInfo, CrwMeta, CrwRawJpgInfo, CrwSubTable, CrwSubTableBlock,
-  CrwTimeStamp,
+  CrwDecoderTable, CrwExposureInfo, CrwFlashInfo, CrwImageInfo, CrwMeta, CrwRawJpgInfo,
+  CrwSubTable, CrwSubTableBlock, CrwTimeStamp, CrwWhiteSample,
 };
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,

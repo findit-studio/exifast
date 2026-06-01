@@ -207,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_267() {
+fn typed_serde_path_equals_writer_path_and_golden_all_271() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -904,12 +904,23 @@ fn typed_serde_path_equals_writer_path_and_golden_all_267() {
   // `CanonRaw_colorbalance.crw` (the Canon::ColorBalance WB_RGGBLevels quads).
   // Both are CRAFTED Composite-free CIFF heaps (verified via `perl exiftool
   // -G1 -j` to carry only File:/CanonRaw:/Canon: keys).
+  // 270 → 271 after porting the omitted `CanonRaw::Main` binary sub-tables
+  // (the Codex CRW finding): `CanonRaw_omitted_records.crw` — a CRAFTED
+  // Composite-free CIFF heap exercising `ExposureInfo` (0x1818 →
+  // ExposureCompensation; ShutterSpeedValue/ApertureValue are unit-tested,
+  // omitted here as ANY emitted ApertureValue/ShutterSpeedValue would
+  // synthesize a `Composite:Aperture`/`Composite:ShutterSpeed`), `FlashInfo`
+  // (0x1813 → FlashGuideNumber/FlashThreshold), `WhiteSample` (0x1030 → the
+  // WhiteSample* positions + the `int16u[4]` `BlackLevels`, gated on the
+  // `Canon::Validate` length check), AND a `TimeStamp` (0x180e) with a
+  // FRACTIONAL `TimeZoneCode` (19800 ⇒ 5.5 via the FLOAT `$val/3600`). Verified
+  // via `perl exiftool -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    270,
-    "expected exactly the 270 active conformance fixtures, found {}: {:?}",
+    271,
+    "expected exactly the 271 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

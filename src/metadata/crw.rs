@@ -128,7 +128,7 @@ impl CrwSubTableBlock {
 /// 271-277`).
 ///
 /// D8: no public fields; accessors only.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CrwTimeStamp {
   /// Position 0 `DateTimeOriginal` (`CanonRaw.pm:435-443`) — `int32u` Unix
   /// time, `ValueConv => 'ConvertUnixTime($val)'` (the rendered
@@ -136,8 +136,10 @@ pub struct CrwTimeStamp {
   /// no-op without a custom date format, so `-j` and `-n` agree).
   date_time_original: Option<SmolStr>,
   /// Position 1 `TimeZoneCode` (`CanonRaw.pm:444-449`) — `int32s`,
-  /// `ValueConv => '$val / 3600'`.
-  time_zone_code: Option<i32>,
+  /// `ValueConv => '$val / 3600'`. Stored as the POST-ValueConv `f64`: Perl's
+  /// `/` is FLOATING-POINT division, so a `+5:30` zone (`19800`) yields `5.5`,
+  /// NOT `5` (oracle-confirmed). No `PrintConv` ⇒ `-j` and `-n` agree.
+  time_zone_code: Option<f64>,
   /// Position 2 `TimeZoneInfo` (`CanonRaw.pm:450-453`) — `int32u` (raw; set
   /// to `0x80000000` when `TimeZoneCode` is valid).
   time_zone_info: Option<u32>,
@@ -151,10 +153,10 @@ impl CrwTimeStamp {
     self.date_time_original.as_deref()
   }
 
-  /// `TimeZoneCode` (hours, after the `$val / 3600` ValueConv).
+  /// `TimeZoneCode` (hours, after the `$val / 3600` FLOATING-POINT ValueConv).
   #[must_use]
   #[inline]
-  pub const fn time_zone_code(&self) -> Option<i32> {
+  pub const fn time_zone_code(&self) -> Option<f64> {
     self.time_zone_code
   }
 
@@ -170,8 +172,8 @@ impl CrwTimeStamp {
     self.date_time_original = Some(v);
   }
 
-  /// Crate-private setter for `TimeZoneCode`.
-  pub(crate) fn set_time_zone_code(&mut self, v: i32) {
+  /// Crate-private setter for `TimeZoneCode` (post-ValueConv `f64`).
+  pub(crate) fn set_time_zone_code(&mut self, v: f64) {
     self.time_zone_code = Some(v);
   }
 
@@ -187,6 +189,218 @@ impl CrwTimeStamp {
     self.date_time_original.is_none()
       && self.time_zone_code.is_none()
       && self.time_zone_info.is_none()
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::ExposureInfo` (`CanonRaw.pm:522-545`). FORMAT
+/// `float`, FIRST_ENTRY 0, `GROUPS => { 0 => 'MakerNotes', 2 => 'Image' }`.
+/// Reached via the `0x1818 ExposureInfo` SubDirectory record (`CanonRaw.pm:
+/// 310-315`).
+///
+/// Each position is stored as its RAW `float` (pre-ValueConv); the
+/// per-position ValueConv + PrintConv is applied at emission so the `-j` and
+/// `-n` views diverge faithfully:
+/// - position 1 `ShutterSpeedValue` ValueConv `abs($val)<100 ? 1/(2**$val) : 0`
+///   then PrintConv `Exif::PrintExposureTime` (`CanonRaw.pm:531-537`);
+/// - position 2 `ApertureValue` ValueConv `2 ** ($val / 2)` then PrintConv
+///   `sprintf("%.1f")` (`CanonRaw.pm:538-544`).
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CrwExposureInfo {
+  /// Position 0 `ExposureCompensation` (`CanonRaw.pm:530`) — `float`, no conv.
+  exposure_compensation: Option<f64>,
+  /// Position 1 `ShutterSpeedValue` (`CanonRaw.pm:531-537`) — RAW `float`
+  /// apex value (pre-ValueConv). The ValueConv/PrintConv are applied at
+  /// emission.
+  shutter_speed_value: Option<f64>,
+  /// Position 2 `ApertureValue` (`CanonRaw.pm:538-544`) — RAW `float` apex
+  /// value (pre-ValueConv). The ValueConv/PrintConv are applied at emission.
+  aperture_value: Option<f64>,
+}
+
+impl CrwExposureInfo {
+  /// `ExposureCompensation` (`float`, no conv).
+  #[must_use]
+  #[inline]
+  pub const fn exposure_compensation(&self) -> Option<f64> {
+    self.exposure_compensation
+  }
+  /// `ShutterSpeedValue` RAW apex value (pre-ValueConv).
+  #[must_use]
+  #[inline]
+  pub const fn shutter_speed_value(&self) -> Option<f64> {
+    self.shutter_speed_value
+  }
+  /// `ApertureValue` RAW apex value (pre-ValueConv).
+  #[must_use]
+  #[inline]
+  pub const fn aperture_value(&self) -> Option<f64> {
+    self.aperture_value
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_exposure_compensation(&mut self, v: f64) {
+    self.exposure_compensation = Some(v);
+  }
+  pub(crate) fn set_shutter_speed_value(&mut self, v: f64) {
+    self.shutter_speed_value = Some(v);
+  }
+  pub(crate) fn set_aperture_value(&mut self, v: f64) {
+    self.aperture_value = Some(v);
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::FlashInfo` (`CanonRaw.pm:510-520`). FORMAT
+/// `float`, FIRST_ENTRY 0, `GROUPS => { 0 => 'MakerNotes', 2 => 'Image' }`.
+/// Reached via the `0x1813 FlashInfo` SubDirectory record (`CanonRaw.pm:
+/// 285-291`). Neither position has a `ValueConv`/`PrintConv`, so the `-j` and
+/// `-n` views are identical (the bare float).
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CrwFlashInfo {
+  /// Position 0 `FlashGuideNumber` (`CanonRaw.pm:518`) — `float`, no conv.
+  flash_guide_number: Option<f64>,
+  /// Position 1 `FlashThreshold` (`CanonRaw.pm:519`) — `float`, no conv.
+  flash_threshold: Option<f64>,
+}
+
+impl CrwFlashInfo {
+  /// `FlashGuideNumber` (`float`).
+  #[must_use]
+  #[inline]
+  pub const fn flash_guide_number(&self) -> Option<f64> {
+    self.flash_guide_number
+  }
+  /// `FlashThreshold` (`float`).
+  #[must_use]
+  #[inline]
+  pub const fn flash_threshold(&self) -> Option<f64> {
+    self.flash_threshold
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_flash_guide_number(&mut self, v: f64) {
+    self.flash_guide_number = Some(v);
+  }
+  pub(crate) fn set_flash_threshold(&mut self, v: f64) {
+    self.flash_threshold = Some(v);
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::WhiteSample` (`CanonRaw.pm:586-601`, ref 1/4).
+/// FORMAT `int16u`, FIRST_ENTRY 1, `GROUPS => { 0 => 'MakerNotes', 2 =>
+/// 'Camera' }`. Reached via the `0x1030 WhiteSample` SubDirectory record
+/// (`CanonRaw.pm:141-148`), which carries a
+/// `Validate => 'Canon::Validate($dirData,$subdirStart,$size)'` gate (the
+/// first `int16u` must equal the block byte length, `Canon.pm:10322-10333`).
+///
+/// Named positions (`CanonRaw.pm:593-600`): position 1 `WhiteSampleWidth`,
+/// 2 `WhiteSampleHeight`, 3 `WhiteSampleLeftBorder`, 4 `WhiteSampleTopBorder`,
+/// 5 `WhiteSampleBits`, then `0x37` (=55) `BlackLevels` (`Format =>
+/// 'int16u[4]'`). The byte offset of position N is `N * 2` (ExifTool's
+/// `ProcessBinaryData` indexes by `index * formatSize`; `FIRST_ENTRY` does NOT
+/// shift the offset, `ExifTool.pm:9933`). No `PrintConv` on any position ⇒ the
+/// `-j` and `-n` views are identical.
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrwWhiteSample {
+  /// Position 1 `WhiteSampleWidth` (`CanonRaw.pm:593`) — `int16u`.
+  white_sample_width: Option<u16>,
+  /// Position 2 `WhiteSampleHeight` (`CanonRaw.pm:594`) — `int16u`.
+  white_sample_height: Option<u16>,
+  /// Position 3 `WhiteSampleLeftBorder` (`CanonRaw.pm:595`) — `int16u`.
+  white_sample_left_border: Option<u16>,
+  /// Position 4 `WhiteSampleTopBorder` (`CanonRaw.pm:596`) — `int16u`.
+  white_sample_top_border: Option<u16>,
+  /// Position 5 `WhiteSampleBits` (`CanonRaw.pm:597`) — `int16u`.
+  white_sample_bits: Option<u16>,
+  /// Position `0x37` `BlackLevels` (`CanonRaw.pm:600`) — `int16u[4]`, the
+  /// available leading words (1..=4) rendered space-joined at emission. A
+  /// truncated block yields fewer than 4 words (bundled's `ReadValue` returns
+  /// only the words present, `CanonRaw_records` oracle).
+  black_levels: Vec<u16>,
+}
+
+impl CrwWhiteSample {
+  /// `WhiteSampleWidth`.
+  #[must_use]
+  #[inline]
+  pub const fn white_sample_width(&self) -> Option<u16> {
+    self.white_sample_width
+  }
+  /// `WhiteSampleHeight`.
+  #[must_use]
+  #[inline]
+  pub const fn white_sample_height(&self) -> Option<u16> {
+    self.white_sample_height
+  }
+  /// `WhiteSampleLeftBorder`.
+  #[must_use]
+  #[inline]
+  pub const fn white_sample_left_border(&self) -> Option<u16> {
+    self.white_sample_left_border
+  }
+  /// `WhiteSampleTopBorder`.
+  #[must_use]
+  #[inline]
+  pub const fn white_sample_top_border(&self) -> Option<u16> {
+    self.white_sample_top_border
+  }
+  /// `WhiteSampleBits`.
+  #[must_use]
+  #[inline]
+  pub const fn white_sample_bits(&self) -> Option<u16> {
+    self.white_sample_bits
+  }
+  /// `BlackLevels` — the available `int16u[4]` words (0..=4 present).
+  #[must_use]
+  #[inline]
+  pub fn black_levels(&self) -> &[u16] {
+    &self.black_levels
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_white_sample_width(&mut self, v: u16) {
+    self.white_sample_width = Some(v);
+  }
+  pub(crate) fn set_white_sample_height(&mut self, v: u16) {
+    self.white_sample_height = Some(v);
+  }
+  pub(crate) fn set_white_sample_left_border(&mut self, v: u16) {
+    self.white_sample_left_border = Some(v);
+  }
+  pub(crate) fn set_white_sample_top_border(&mut self, v: u16) {
+    self.white_sample_top_border = Some(v);
+  }
+  pub(crate) fn set_white_sample_bits(&mut self, v: u16) {
+    self.white_sample_bits = Some(v);
+  }
+  pub(crate) fn set_black_levels(&mut self, v: Vec<u16>) {
+    self.black_levels = v;
   }
 }
 
@@ -525,6 +739,14 @@ pub struct CrwMeta<'a> {
   decoder_table: Option<CrwDecoderTable>,
   /// `0x10b5 RawJpgInfo` → [`CrwRawJpgInfo`] (`CanonRaw.pm:208-214`/`:480-508`).
   raw_jpg_info: Option<CrwRawJpgInfo>,
+  /// `0x1818 ExposureInfo` → [`CrwExposureInfo`] (`CanonRaw.pm:310-315`/
+  /// `:522-545`).
+  exposure_info: Option<CrwExposureInfo>,
+  /// `0x1813 FlashInfo` → [`CrwFlashInfo`] (`CanonRaw.pm:285-291`/`:510-520`).
+  flash_info: Option<CrwFlashInfo>,
+  /// `0x1030 WhiteSample` → [`CrwWhiteSample`] (`CanonRaw.pm:141-148`/
+  /// `:586-601`).
+  white_sample: Option<CrwWhiteSample>,
   // ----- Canon::* MakerNote sub-table records ---------------------------
   /// Records dispatched to ported `Canon::*` MakerNote sub-tables, in walk
   /// order ([`CrwSubTableBlock`]). Re-decoded per [`ConvMode`] at emission.
@@ -574,6 +796,9 @@ impl CrwMeta<'_> {
       image_info: None,
       decoder_table: None,
       raw_jpg_info: None,
+      exposure_info: None,
+      flash_info: None,
+      white_sample: None,
       sub_table_blocks: Vec::new(),
       binary_records: Vec::new(),
       _lifetime: core::marker::PhantomData,
@@ -783,6 +1008,27 @@ impl CrwMeta<'_> {
     self.raw_jpg_info.as_ref()
   }
 
+  /// `0x1818 ExposureInfo` sub-table ([`CrwExposureInfo`]).
+  #[must_use]
+  #[inline]
+  pub const fn exposure_info(&self) -> Option<&CrwExposureInfo> {
+    self.exposure_info.as_ref()
+  }
+
+  /// `0x1813 FlashInfo` sub-table ([`CrwFlashInfo`]).
+  #[must_use]
+  #[inline]
+  pub const fn flash_info(&self) -> Option<&CrwFlashInfo> {
+    self.flash_info.as_ref()
+  }
+
+  /// `0x1030 WhiteSample` sub-table ([`CrwWhiteSample`]).
+  #[must_use]
+  #[inline]
+  pub const fn white_sample(&self) -> Option<&CrwWhiteSample> {
+    self.white_sample.as_ref()
+  }
+
   // ===== Canon sub-table blocks =========================================
 
   /// The records dispatched to ported `Canon::*` MakerNote sub-tables, in
@@ -937,6 +1183,21 @@ impl CrwMeta<'_> {
   /// Set the `0x10b5 RawJpgInfo` sub-table.
   pub(crate) fn set_raw_jpg_info(&mut self, v: CrwRawJpgInfo) {
     self.raw_jpg_info = Some(v);
+  }
+
+  /// Set the `0x1818 ExposureInfo` sub-table.
+  pub(crate) fn set_exposure_info(&mut self, v: CrwExposureInfo) {
+    self.exposure_info = Some(v);
+  }
+
+  /// Set the `0x1813 FlashInfo` sub-table.
+  pub(crate) fn set_flash_info(&mut self, v: CrwFlashInfo) {
+    self.flash_info = Some(v);
+  }
+
+  /// Set the `0x1030 WhiteSample` sub-table.
+  pub(crate) fn set_white_sample(&mut self, v: CrwWhiteSample) {
+    self.white_sample = Some(v);
   }
 
   /// Append a Canon-sub-table record block.

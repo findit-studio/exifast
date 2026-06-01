@@ -1,0 +1,21 @@
+[{
+  "SourceFile": "CanonRaw_omitted_records.crw",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "CRW",
+  "File:FileTypeExtension": "CRW",
+  "File:MIMEType": "image/x-canon-crw",
+  "CanonRaw:Make": "Canon",
+  "CanonRaw:Model": "Canon EOS D60",
+  "CanonRaw:ExposureCompensation": 0.5,
+  "CanonRaw:FlashGuideNumber": 12,
+  "CanonRaw:FlashThreshold": 0.5,
+  "CanonRaw:WhiteSampleWidth": 80,
+  "CanonRaw:WhiteSampleHeight": 5,
+  "CanonRaw:WhiteSampleLeftBorder": 7,
+  "CanonRaw:WhiteSampleTopBorder": 12,
+  "CanonRaw:WhiteSampleBits": 0,
+  "CanonRaw:BlackLevels": "129 130 131",
+  "CanonRaw:DateTimeOriginal": "2003:11:10 17:39:26",
+  "CanonRaw:TimeZoneCode": 5.5,
+  "CanonRaw:TimeZoneInfo": 2147483648
+}]

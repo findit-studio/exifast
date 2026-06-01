@@ -3120,7 +3120,15 @@ fn canon_crw_full_real_fixture_matches_oracle() {
   assert_eq!(ji("CanonRaw:CompressedDataLength"), Some(4_120_111));
   assert_eq!(ji("CanonRaw:RawJpgWidth"), Some(2048));
   assert_eq!(ji("CanonRaw:RawJpgHeight"), Some(1360));
-  assert_eq!(ji("CanonRaw:TimeZoneCode"), Some(0));
+  // TimeZoneCode is the FLOAT `$val/3600` ValueConv (a +5:30 zone ⇒ 5.5), so
+  // it serializes as a JSON float — here the real file's 0 ⇒ `0.0` (value-
+  // equivalent to the oracle's `0`).
+  assert!(
+    j.get("CanonRaw:TimeZoneCode")
+      .and_then(serde_json::Value::as_f64)
+      .is_some_and(|f| f == 0.0),
+    "CanonRaw:TimeZoneCode must be 0 (float)"
+  );
   assert_eq!(ji("CanonRaw:TimeZoneInfo"), Some(0));
   // MeasuredEV: float 4.625 (ValueConv $val + 5).
   assert!(

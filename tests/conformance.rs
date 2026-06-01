@@ -114,6 +114,45 @@ fn crw_conformance() {
 }
 
 #[test]
+fn crw_omitted_records_conformance() {
+  // The three previously-omitted `CanonRaw::Main` binary sub-tables (the Codex
+  // CRW finding) — `ExposureInfo` (0x1818), `FlashInfo` (0x1813), `WhiteSample`
+  // (0x1030) — plus a `TimeStamp` (0x180e) carrying a FRACTIONAL `TimeZoneCode`.
+  // `tests/fixtures/CanonRaw_omitted_records.crw` is a CRAFTED Composite-free
+  // CIFF heap (verified via `perl exiftool -G1 -j`/`-n` to carry ONLY File:/
+  // CanonRaw: keys) exercising:
+  //   - `ExposureInfo` pos0 `ExposureCompensation` (float). pos1
+  //     `ShutterSpeedValue` / pos2 `ApertureValue` are DELIBERATELY omitted
+  //     from the fixture: ANY emitted ApertureValue/ShutterSpeedValue
+  //     synthesizes a `Composite:Aperture`/`Composite:ShutterSpeed` (Exif.pm
+  //     %Composite), which the port has no Composite subsystem to produce —
+  //     so their ValueConv (`1/(2**$val)` / `2**($val/2)`) + PrintConv
+  //     (`PrintExposureTime` / `sprintf("%.1f")`) are covered by the `crw.rs`
+  //     unit tests instead.
+  //   - `FlashInfo` pos0 `FlashGuideNumber` + pos1 `FlashThreshold` (float, no
+  //     conv, no Composite).
+  //   - `WhiteSample` pos1..5 (`WhiteSampleWidth`/`Height`/`LeftBorder`/
+  //     `TopBorder`/`Bits`, int16u) + the pos-0x37 `BlackLevels` int16u[4]
+  //     (rendered space-joined; a 3-word remnant `"129 130 131"` here). The
+  //     fixture's first int16u equals the block byte length so the
+  //     `Canon::Validate` gate passes (an invalid block emits NOTHING + a
+  //     `Invalid WhiteSample data` warning, exercised by the `crw.rs` unit
+  //     test `white_sample_invalid_length_suppressed`).
+  //   - `TimeStamp` `TimeZoneCode` 19800 ⇒ `5.5` (the FLOAT `$val/3600`
+  //     ValueConv — a +5:30 zone must NOT truncate to `5`).
+  check(
+    "CanonRaw_omitted_records.crw",
+    "CanonRaw_omitted_records.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_omitted_records.crw",
+    "CanonRaw_omitted_records.crw.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

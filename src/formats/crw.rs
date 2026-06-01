@@ -76,7 +76,11 @@
 //!   `ImageInfo` (`0x1810` → ImageWidth/Height/PixelAspectRatio/Rotation/
 //!   Component+ColorBitDepth/ColorBW), `DecoderTable` (`0x1835` →
 //!   DecoderTableNumber/CompressedDataOffset/Length), `RawJpgInfo` (`0x10b5`
-//!   → RawJpgQuality/Size/Width/Height).
+//!   → RawJpgQuality/Size/Width/Height), `ExposureInfo` (`0x1818` →
+//!   ExposureCompensation/ShutterSpeedValue/ApertureValue), `FlashInfo`
+//!   (`0x1813` → FlashGuideNumber/FlashThreshold), `WhiteSample` (`0x1030` →
+//!   WhiteSample{Width,Height,LeftBorder,TopBorder,Bits}/BlackLevels, gated on
+//!   the `Canon::Validate` length check).
 //! - `Canon::SensorInfo` (`0x1031`) + `Canon::ColorBalance` (`0x10a9`) — the
 //!   NAMED tags (Sensor*/BlackMask*Border + WB_RGGBLevels{…}/BlackLevels),
 //!   ported as walked Canon sub-tables ([`crate::exif::makernotes::vendors::
@@ -90,9 +94,12 @@
 //!   (`0x1033`, #87) are PORT-WIDE deferrals (no format emits them yet).
 //! - The raw `Canon::ColorData` arrays (`0x10a8`/`0x10ad`/… and the
 //!   `Canon::Main` `0x4001`) stay deferred (#84) — only the NAMED ColorBalance
-//!   tags are surfaced. The `CanonRaw::ExposureInfo`/`FlashInfo`/`WhiteSample`
-//!   PowerShot-era sub-tables are not in the camera-metadata oracle for a real
-//!   EOS CRW (deferred).
+//!   tags are surfaced.
+//! - The `CanonRaw::ExposureInfo` (`0x1818`), `FlashInfo` (`0x1813`) and
+//!   `WhiteSample` (`0x1030`) binary sub-tables ARE ported (faithful 1:1 —
+//!   the named positions under the `CanonRaw` family-1 group, the
+//!   `ShutterSpeedValue`/`ApertureValue` ValueConv+PrintConv, and the
+//!   `WhiteSample` `Canon::Validate` length gate).
 //! - The `MakerNotes`-building writer path (`BuildMakerNotes` / `WriteCRW`) —
 //!   exifast is read-only.
 //! - CRW trailers (`ProcessCRW` `IdentifyTrailer`, `CanonRaw.pm:846`) — no
@@ -594,10 +601,10 @@ fn emit_scalar(
         ts.set_date_time_original(SmolStr::from(crate::datetime::convert_unix_time(unix)));
       }
       if bytes.len() >= 8 {
-        // `int32s`, `ValueConv => '$val / 3600'` (integer division —
-        // `ConvertUnixTime` aside, this is a plain Perl `/`; the only real
-        // values are exact multiples of 3600 or 0). We divide as i32.
-        let tz = read_i32(&bytes, 4, order) / 3600;
+        // `int32s`, `ValueConv => '$val / 3600'`. Perl's `/` is FLOATING-POINT
+        // division, so a `+5:30` zone (`19800`) MUST yield `5.5`, NOT a
+        // truncated `5` (oracle-confirmed). Divide as f64.
+        let tz = f64::from(read_i32(&bytes, 4, order)) / 3600.0;
         ts.set_time_zone_code(tz);
       }
       if bytes.len() >= 12 {
@@ -705,6 +712,118 @@ fn emit_scalar(
       }
     }
 
+    // ---- `0x1818 ExposureInfo` → `CanonRaw::ExposureInfo` ----------------
+    // (`CanonRaw.pm:310-315`, sub-table `:522-545`): FORMAT float, FIRST_ENTRY
+    // 0. pos0 `ExposureCompensation`, pos1 `ShutterSpeedValue` (raw apex;
+    // ValueConv/PrintConv at emission), pos2 `ApertureValue` (raw apex). Byte
+    // offset of position N = `4 * N` (`ExifTool.pm:9933`).
+    0x1818 => {
+      let mut ei = crate::metadata::CrwExposureInfo::default();
+      let mut ei_set = false;
+      if bytes.len() >= 4 {
+        ei.set_exposure_compensation(f64::from(read_f32(&bytes, 0, order)));
+        ei_set = true;
+      }
+      if bytes.len() >= 8 {
+        // Store the RAW apex value; the `abs($val)<100 ? 1/(2**$val) : 0`
+        // ValueConv + `PrintExposureTime` PrintConv run at emission.
+        ei.set_shutter_speed_value(f64::from(read_f32(&bytes, 4, order)));
+        ei_set = true;
+      }
+      if bytes.len() >= 12 {
+        // Store the RAW apex value; the `2 ** ($val / 2)` ValueConv +
+        // `sprintf("%.1f")` PrintConv run at emission.
+        ei.set_aperture_value(f64::from(read_f32(&bytes, 8, order)));
+        ei_set = true;
+      }
+      if ei_set {
+        meta.set_exposure_info(ei);
+      }
+    }
+
+    // ---- `0x1813 FlashInfo` → `CanonRaw::FlashInfo` ----------------------
+    // (`CanonRaw.pm:285-291`, sub-table `:510-520`): FORMAT float, FIRST_ENTRY
+    // 0. pos0 `FlashGuideNumber`, pos1 `FlashThreshold` (no conv either).
+    0x1813 => {
+      let mut fi = crate::metadata::CrwFlashInfo::default();
+      let mut fi_set = false;
+      if bytes.len() >= 4 {
+        fi.set_flash_guide_number(f64::from(read_f32(&bytes, 0, order)));
+        fi_set = true;
+      }
+      if bytes.len() >= 8 {
+        fi.set_flash_threshold(f64::from(read_f32(&bytes, 4, order)));
+        fi_set = true;
+      }
+      if fi_set {
+        meta.set_flash_info(fi);
+      }
+    }
+
+    // ---- `0x1030 WhiteSample` → `CanonRaw::WhiteSample` ------------------
+    // (`CanonRaw.pm:141-148`, sub-table `:586-601`): FORMAT int16u, FIRST_ENTRY
+    // 1. pos1 `WhiteSampleWidth`, 2 `WhiteSampleHeight`, 3
+    // `WhiteSampleLeftBorder`, 4 `WhiteSampleTopBorder`, 5 `WhiteSampleBits`,
+    // 0x37(=55) `BlackLevels` (int16u[4]). Byte offset of position N = `2 * N`
+    // (`ExifTool.pm:9933` — FIRST_ENTRY does NOT shift the offset). The
+    // SubDirectory carries a `Validate` gate (`Canon::Validate`,
+    // `Canon.pm:10322-10333`): the first int16u (offset 0) must equal the block
+    // byte length, else bundled warns `Invalid WhiteSample data` and emits
+    // NOTHING. We replicate the SUPPRESSION (the Warn has no Meta channel).
+    0x1030 => {
+      // `Validate($dirData, 0, $size)`: `Get16u(data, 0) == size`.
+      let valid = bytes
+        .len()
+        .try_into()
+        .ok()
+        .is_some_and(|size: u16| read_u16(&bytes, 0, order) == size);
+      if valid {
+        let mut ws = crate::metadata::CrwWhiteSample::default();
+        let mut ws_set = false;
+        // FORMAT int16u; byte offset = 2 * position (position 1..=5).
+        if let Some(v) = read_u16_at(&bytes, 2, order) {
+          ws.set_white_sample_width(v); // position 1
+          ws_set = true;
+        }
+        if let Some(v) = read_u16_at(&bytes, 4, order) {
+          ws.set_white_sample_height(v); // position 2
+          ws_set = true;
+        }
+        if let Some(v) = read_u16_at(&bytes, 6, order) {
+          ws.set_white_sample_left_border(v); // position 3
+          ws_set = true;
+        }
+        if let Some(v) = read_u16_at(&bytes, 8, order) {
+          ws.set_white_sample_top_border(v); // position 4
+          ws_set = true;
+        }
+        if let Some(v) = read_u16_at(&bytes, 10, order) {
+          ws.set_white_sample_bits(v); // position 5
+          ws_set = true;
+        }
+        // `BlackLevels` at position 0x37 (=55) ⇒ byte offset 110, `int16u[4]`.
+        // ExifTool's `ReadValue` returns ONLY the words present, so a block
+        // that runs out mid-quad yields fewer than 4 (the `CanonRaw_records`
+        // oracle shows `"129 130 131"` — 3 words). The whole entry is dropped
+        // only when no word is present (offset 110 past EOF).
+        const BLACK_LEVELS_OFFSET: usize = 2 * 0x37; // = 110
+        let mut black = Vec::new();
+        for i in 0..4usize {
+          match read_u16_at(&bytes, BLACK_LEVELS_OFFSET + 2 * i, order) {
+            Some(v) => black.push(v),
+            None => break,
+          }
+        }
+        if !black.is_empty() {
+          ws.set_black_levels(black);
+          ws_set = true;
+        }
+        if ws_set {
+          meta.set_white_sample(ws);
+        }
+      }
+    }
+
     // ---- `0x1834 CanonModelID` (`CanonRaw.pm:316-326`) — int32u, PrintHex,
     //      `%canonModelID` ---------------------------------------------------
     0x1834 if bytes.len() >= 4 => meta.set_model_id(read_u32(&bytes, 0, order)),
@@ -712,14 +831,13 @@ fn emit_scalar(
     // ---- `0x183b SerialNumberFormat` (`CanonRaw.pm:332-341`) — int32u, PrintHex
     0x183b if bytes.len() >= 4 => meta.set_serial_number_format(read_u32(&bytes, 0, order)),
 
-    // Every other `CanonRaw::Main` record (the still-deferred structural
-    // sub-tables — `ExposureInfo`/`FlashInfo`/`WhiteSample` — and the unnamed
-    // records `CanonColorInfo1`/`CanonColorInfo2`/`CanonFlashInfo` etc.) is not
+    // Every other `CanonRaw::Main` record (the unnamed records
+    // `CanonColorInfo1`/`CanonColorInfo2`/`CanonFlashInfo` etc.) is not
     // surfaced here: the unnamed ones have no `tagInfo` Name so bundled emits
-    // nothing for them (`next unless defined $tagInfo`), and `ExposureInfo`/
-    // `FlashInfo`/`WhiteSample` do not appear in the camera-metadata oracle for
-    // a real CRW (they are PowerShot-era extras). The CIFF walker still
-    // RECURSED through every subdirectory.
+    // nothing for them (`next unless defined $tagInfo`). The structural binary
+    // sub-tables that DO carry named tags — `ExposureInfo` (`0x1818`),
+    // `FlashInfo` (`0x1813`), `WhiteSample` (`0x1030`) — are decoded in the
+    // arms above. The CIFF walker still RECURSED through every subdirectory.
     _ => {}
   }
 }
@@ -750,6 +868,21 @@ fn read_u16(b: &[u8], off: usize, order: ByteOrder) -> u16 {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
   }
+}
+
+/// Read an `int16u` at `off` within `b` in `order`, returning `None` when the
+/// word is past the end of `b`. Used for the `WhiteSample` named positions,
+/// where ExifTool's `ReadValue` yields undef past the block (so a position
+/// beyond the data is simply not emitted) — distinct from [`read_u16`], whose
+/// 0-on-miss fallback would falsely emit a `0`.
+#[inline]
+fn read_u16_at(b: &[u8], off: usize, order: ByteOrder) -> Option<u16> {
+  let s = b.get(off..off + 2)?;
+  let arr = [s[0], s[1]];
+  Some(match order {
+    ByteOrder::Little => u16::from_le_bytes(arr),
+    ByteOrder::Big => u16::from_be_bytes(arr),
+  })
 }
 
 /// Read an `int32u` at `off` within `b` in `order`.
@@ -786,6 +919,20 @@ fn trim_string(bytes: &[u8]) -> SmolStr {
   let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
   let s: String = bytes[..end].iter().map(|&b| b as char).collect();
   SmolStr::from(s)
+}
+
+/// Render an `int16u[N]` array as ExifTool's default space-joined string
+/// (e.g. `"129 130 131"`) — the `WhiteSample` `BlackLevels` rendering.
+fn join_u16(words: &[u16]) -> String {
+  use std::fmt::Write;
+  let mut s = String::new();
+  for (i, w) in words.iter().enumerate() {
+    if i != 0 {
+      s.push(' ');
+    }
+    let _ = write!(s, "{w}");
+  }
+  s
 }
 
 // `CrwBinary` placeholder storage lives on `CrwMeta` via a crate-private
@@ -1153,8 +1300,10 @@ impl crate::emit::Taggable for CrwMeta<'_> {
         push_raw(&mut tags, "DateTimeOriginal", TagValue::Str(dt.into()));
       }
       if let Some(tz) = ts.time_zone_code() {
-        // `int32s`, ValueConv `$val/3600`; no PrintConv ⇒ same int in both.
-        push_raw(&mut tags, "TimeZoneCode", TagValue::I64(i64::from(tz)));
+        // `int32s`, FLOAT ValueConv `$val/3600` (e.g. `19800` ⇒ `5.5`); no
+        // PrintConv ⇒ same value in both modes. `TagValue::F64` renders an
+        // integral zone (`0` ⇒ `0.0`) value-equivalently to the golden `0`.
+        push_raw(&mut tags, "TimeZoneCode", TagValue::F64(tz));
       }
       if let Some(tzi) = ts.time_zone_info() {
         push_raw(&mut tags, "TimeZoneInfo", TagValue::U64(u64::from(tzi)));
@@ -1229,6 +1378,87 @@ impl crate::emit::Taggable for CrwMeta<'_> {
       }
       if let Some(v) = rj.raw_jpg_height() {
         push_raw(&mut tags, "RawJpgHeight", TagValue::U64(u64::from(v)));
+      }
+    }
+    // `ExposureInfo` (`CanonRaw.pm:522-545`).
+    if let Some(ei) = self.exposure_info() {
+      if let Some(v) = ei.exposure_compensation() {
+        // `float`, no conv ⇒ same value in `-j`/`-n`.
+        push_raw(&mut tags, "ExposureCompensation", TagValue::F64(v));
+      }
+      if let Some(raw) = ei.shutter_speed_value() {
+        // ValueConv `abs($val)<100 ? 1/(2**$val) : 0` (`CanonRaw.pm:533`).
+        let secs = if raw.abs() < 100.0 {
+          1.0 / 2.0_f64.powf(raw)
+        } else {
+          0.0
+        };
+        let value = if print_conv {
+          // PrintConv `Exif::PrintExposureTime` (`CanonRaw.pm:535`).
+          TagValue::Str(SmolStr::from(crate::exif::tables::print_exposure_time(
+            secs,
+          )))
+        } else {
+          TagValue::F64(secs)
+        };
+        push_raw(&mut tags, "ShutterSpeedValue", value);
+      }
+      if let Some(raw) = ei.aperture_value() {
+        // ValueConv `2 ** ($val / 2)` (`CanonRaw.pm:540`).
+        let fnum = 2.0_f64.powf(raw / 2.0);
+        let value = if print_conv {
+          // PrintConv `sprintf("%.1f", $val)` (`CanonRaw.pm:542`).
+          TagValue::Str(SmolStr::from(std::format!("{fnum:.1}")))
+        } else {
+          TagValue::F64(fnum)
+        };
+        push_raw(&mut tags, "ApertureValue", value);
+      }
+    }
+    // `FlashInfo` (`CanonRaw.pm:510-520`) — neither position has a conv.
+    if let Some(fi) = self.flash_info() {
+      if let Some(v) = fi.flash_guide_number() {
+        push_raw(&mut tags, "FlashGuideNumber", TagValue::F64(v));
+      }
+      if let Some(v) = fi.flash_threshold() {
+        push_raw(&mut tags, "FlashThreshold", TagValue::F64(v));
+      }
+    }
+    // `WhiteSample` (`CanonRaw.pm:586-601`) — int16u positions + the
+    // `BlackLevels` int16u[4] quad (space-joined). No PrintConv on any.
+    if let Some(ws) = self.white_sample() {
+      if let Some(v) = ws.white_sample_width() {
+        push_raw(&mut tags, "WhiteSampleWidth", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ws.white_sample_height() {
+        push_raw(&mut tags, "WhiteSampleHeight", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ws.white_sample_left_border() {
+        push_raw(
+          &mut tags,
+          "WhiteSampleLeftBorder",
+          TagValue::U64(u64::from(v)),
+        );
+      }
+      if let Some(v) = ws.white_sample_top_border() {
+        push_raw(
+          &mut tags,
+          "WhiteSampleTopBorder",
+          TagValue::U64(u64::from(v)),
+        );
+      }
+      if let Some(v) = ws.white_sample_bits() {
+        push_raw(&mut tags, "WhiteSampleBits", TagValue::U64(u64::from(v)));
+      }
+      let black = ws.black_levels();
+      if !black.is_empty() {
+        // `int16u[4]` rendered as ExifTool's default space-joined string
+        // (e.g. `"129 130 131"` for a 3-word remnant). No PrintConv.
+        push_raw(
+          &mut tags,
+          "BlackLevels",
+          TagValue::Str(SmolStr::from(join_u16(black))),
+        );
       }
     }
 
@@ -1543,5 +1773,197 @@ mod tests {
       has_exposure_time,
       "CRW ShotInfo must KEEP the raw-0 ExposureTime (#183 FILE_TYPE eq CRW branch)"
     );
+  }
+
+  /// Collect the `CanonRaw:` family-1 `(name, value)` pairs for a mode.
+  fn canonraw_tags(m: &CrwMeta<'_>, mode: crate::emit::ConvMode) -> Vec<(String, TagValue)> {
+    use crate::emit::Taggable as _;
+    m.tags(mode)
+      .filter(|t| t.tag().group_ref().family1() == "CanonRaw")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect()
+  }
+
+  fn find_tag(pairs: &[(String, TagValue)], name: &str) -> Option<TagValue> {
+    pairs
+      .iter()
+      .find(|(k, _)| k == name)
+      .map(|(_, v)| v.clone())
+  }
+
+  /// `ExposureInfo` (0x1818): pos0 `ExposureCompensation` (no conv), pos1
+  /// `ShutterSpeedValue` (ValueConv `1/(2**$val)` + `PrintExposureTime`), pos2
+  /// `ApertureValue` (ValueConv `2**($val/2)` + `sprintf("%.1f")`). Verified vs
+  /// `perl exiftool -G1` on a crafted heap (NOT a conformance fixture — these
+  /// positions synthesize `Composite:Aperture`/`ShutterSpeed`).
+  #[test]
+  fn exposure_info_value_and_print_conv() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    // floats: ExposureComp 0.5, ShutterSpeedValue apex 8.0, ApertureValue apex 5.0.
+    let mut blk = Vec::new();
+    blk.extend_from_slice(&0.5f32.to_le_bytes());
+    blk.extend_from_slice(&8.0f32.to_le_bytes());
+    blk.extend_from_slice(&5.0f32.to_le_bytes());
+    root.add_value(0x1818, &blk);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+
+    // -j (PrintConv).
+    let j = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(
+      find_tag(&j, "ExposureCompensation"),
+      Some(TagValue::F64(0.5))
+    );
+    // 1/(2**8) = 1/256 -> PrintExposureTime -> "1/256".
+    assert_eq!(
+      find_tag(&j, "ShutterSpeedValue"),
+      Some(TagValue::Str("1/256".into()))
+    );
+    // 2**(5/2) = 5.656854 -> sprintf("%.1f") -> "5.7".
+    assert_eq!(
+      find_tag(&j, "ApertureValue"),
+      Some(TagValue::Str("5.7".into()))
+    );
+
+    // -n (ValueConv): post-ValueConv floats.
+    let n = canonraw_tags(&m, ConvMode::ValueConv);
+    assert_eq!(
+      find_tag(&n, "ExposureCompensation"),
+      Some(TagValue::F64(0.5))
+    );
+    assert_eq!(
+      find_tag(&n, "ShutterSpeedValue"),
+      Some(TagValue::F64(0.003_906_25))
+    );
+    match find_tag(&n, "ApertureValue") {
+      Some(TagValue::F64(v)) => assert!((v - 5.656_854_249_492_38).abs() < 1e-9),
+      other => panic!("ApertureValue -n: {other:?}"),
+    }
+  }
+
+  /// `ShutterSpeedValue` ValueConv clamps `abs($val) >= 100` to 0
+  /// (`CanonRaw.pm:533`).
+  #[test]
+  fn shutter_speed_value_out_of_range_is_zero() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    let mut blk = Vec::new();
+    blk.extend_from_slice(&0.0f32.to_le_bytes()); // ExposureCompensation
+    blk.extend_from_slice(&150.0f32.to_le_bytes()); // ShutterSpeedValue apex (>=100)
+    root.add_value(0x1818, &blk);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    let n = canonraw_tags(&m, ConvMode::ValueConv);
+    assert_eq!(find_tag(&n, "ShutterSpeedValue"), Some(TagValue::F64(0.0)));
+  }
+
+  /// `FlashInfo` (0x1813): both positions are bare floats (no conv) ⇒ identical
+  /// in `-j`/`-n`.
+  #[test]
+  fn flash_info_floats() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    let mut blk = Vec::new();
+    blk.extend_from_slice(&12.0f32.to_le_bytes());
+    blk.extend_from_slice(&0.5f32.to_le_bytes());
+    root.add_value(0x1813, &blk);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let t = canonraw_tags(&m, mode);
+      assert_eq!(find_tag(&t, "FlashGuideNumber"), Some(TagValue::F64(12.0)));
+      assert_eq!(find_tag(&t, "FlashThreshold"), Some(TagValue::F64(0.5)));
+    }
+  }
+
+  /// `WhiteSample` (0x1030): named int16u positions read at byte offset
+  /// `2*position` (FIRST_ENTRY does NOT shift, `ExifTool.pm:9933`), the
+  /// pos-0x37 `BlackLevels` int16u[4] space-joined. A valid block has its first
+  /// int16u == block byte length (`Canon::Validate`).
+  #[test]
+  fn white_sample_positions_and_black_levels() {
+    use crate::emit::ConvMode;
+    const S: usize = 116;
+    let mut ws = std::vec![0u8; S];
+    let set =
+      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    set(&mut ws, 0, S as u16); // Validate: first u16 == size
+    set(&mut ws, 2, 80); // WhiteSampleWidth (pos1)
+    set(&mut ws, 4, 5); // WhiteSampleHeight (pos2)
+    set(&mut ws, 6, 7); // WhiteSampleLeftBorder (pos3)
+    set(&mut ws, 8, 12); // WhiteSampleTopBorder (pos4)
+    set(&mut ws, 10, 0); // WhiteSampleBits (pos5)
+    set(&mut ws, 110, 128); // BlackLevels[0] (pos0x37, offset 110)
+    set(&mut ws, 112, 129);
+    set(&mut ws, 114, 130); // [3] would be at 116 — past EOF ⇒ 3 words only.
+    let mut root = HeapBuilder::new();
+    root.add_value(0x1030, &ws);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(find_tag(&t, "WhiteSampleWidth"), Some(TagValue::U64(80)));
+    assert_eq!(find_tag(&t, "WhiteSampleHeight"), Some(TagValue::U64(5)));
+    assert_eq!(
+      find_tag(&t, "WhiteSampleLeftBorder"),
+      Some(TagValue::U64(7))
+    );
+    assert_eq!(
+      find_tag(&t, "WhiteSampleTopBorder"),
+      Some(TagValue::U64(12))
+    );
+    assert_eq!(find_tag(&t, "WhiteSampleBits"), Some(TagValue::U64(0)));
+    // 3-word remnant (offset 116 is past EOF) ⇒ "128 129 130".
+    assert_eq!(
+      find_tag(&t, "BlackLevels"),
+      Some(TagValue::Str("128 129 130".into()))
+    );
+  }
+
+  /// `WhiteSample` `Canon::Validate` gate (`Canon.pm:10322-10333`): a block
+  /// whose first int16u != the block byte length is INVALID — bundled warns
+  /// `Invalid WhiteSample data` and emits NOTHING. The port has no warning
+  /// channel, but must replicate the SUPPRESSION.
+  #[test]
+  fn white_sample_invalid_length_suppressed() {
+    use crate::emit::ConvMode;
+    const S: usize = 116;
+    let mut ws = std::vec![0u8; S];
+    let set =
+      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    set(&mut ws, 0, 100); // first u16 (100) != size (116) ⇒ INVALID
+    set(&mut ws, 2, 80);
+    let mut root = HeapBuilder::new();
+    root.add_value(0x1030, &ws);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert!(m.white_sample().is_none());
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert!(find_tag(&t, "WhiteSampleWidth").is_none());
+    assert!(find_tag(&t, "BlackLevels").is_none());
+  }
+
+  /// `TimeStamp` `TimeZoneCode` (0x180e pos1) is `$val/3600` FLOAT division: a
+  /// `+5:30` zone (19800) must yield `5.5`, NOT a truncated `5`.
+  #[test]
+  fn timestamp_fractional_timezone_code() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    let mut blk = Vec::new();
+    blk.extend_from_slice(&1_068_485_966u32.to_le_bytes()); // DateTimeOriginal
+    blk.extend_from_slice(&19_800i32.to_le_bytes()); // TimeZoneCode raw (=5.5h)
+    blk.extend_from_slice(&0x8000_0000u32.to_le_bytes()); // TimeZoneInfo
+    root.add_value(0x180e, &blk);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.time_stamp().and_then(|ts| ts.time_zone_code()), Some(5.5));
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let t = canonraw_tags(&m, mode);
+      assert_eq!(find_tag(&t, "TimeZoneCode"), Some(TagValue::F64(5.5)));
+      assert_eq!(
+        find_tag(&t, "DateTimeOriginal"),
+        Some(TagValue::Str("2003:11:10 17:39:26".into()))
+      );
+    }
   }
 }
