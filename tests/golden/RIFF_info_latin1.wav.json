@@ -1,0 +1,14 @@
+[{
+  "SourceFile": "RIFF_info_latin1.wav",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WAV",
+  "File:FileTypeExtension": "wav",
+  "File:MIMEType": "audio/x-wav",
+  "RIFF:Encoding": "Microsoft PCM",
+  "RIFF:NumChannels": 1,
+  "RIFF:SampleRate": 8000,
+  "RIFF:AvgBytesPerSec": 8000,
+  "RIFF:BitsPerSample": 8,
+  "RIFF:Artist": "Café €",
+  "RIFF:Title": "My Title"
+}]

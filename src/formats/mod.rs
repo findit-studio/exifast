@@ -63,5 +63,7 @@ pub mod quicktime_stream;
 pub mod real;
 #[cfg(feature = "red")]
 pub mod red;
+#[cfg(feature = "riff")]
+pub mod riff;
 #[cfg(feature = "wavpack")]
 pub mod wavpack;

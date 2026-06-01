@@ -114,14 +114,14 @@ const NOT_ACTIVE: &[&str] = &[
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
 /// with paired `.json` + `.n.json` goldens, minus [`NOT_ACTIVE`]). Bumped per
 /// Codex round; see the long comment block in
-/// [`typed_serde_path_equals_writer_path_and_golden_all_327`] for the history.
+/// [`typed_serde_path_equals_writer_path_and_golden_all_336`] for the history.
 ///
 /// Post-rebase (lib/plist golden-migration onto main): main's 275 ACTIVE
 /// fixtures PLUS the 52 ACTIVE PLIST fixtures from this branch = 327. The
 /// PLIST chronology's running `… → 283` figure is relative to lib/plist's
 /// older fork base; the absolute total against the live golden directory is
 /// 327 (`275 + 52`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 327;
+const EXPECTED_ACTIVE_FIXTURES: usize = 336;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -246,7 +246,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_327() {
+fn typed_serde_path_equals_writer_path_and_golden_all_336() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -1172,6 +1172,49 @@ fn typed_serde_path_equals_writer_path_and_golden_all_327() {
   //     `PLIST:TagA=v3, PLIST:TagB=v2`). `walk_tree`'s Dict branch now
   //     routes pairs through a scratch buffer + `fold_consecutive_lists`,
   //     faithful to PLIST.pm:362-378 `LastPListTag`/`LIST_TAGS`.
+  // ----- FORMATS.md row 26 (RIFF / AVI) ---------------------------------
+  // 327 → 328 after FORMATS.md row 26 lib/riff: added `RIFF.avi` (bundled
+  // t/images fixture, 1262 bytes, Canon MotionJPEG 2003 AVI) exercising
+  // the RIFF/AVI walker + sub-tables (Info / Hdrl / Stream / AVIHeader /
+  // StreamHeader / AudioFormat + inline BMP-strf VideoFormat) ported in
+  // `src/formats/riff.rs`. Golden-migrated onto the `Taggable`/`Project`
+  // engine during the rebase onto golden main.
+  // 328 → 332 after the Codex R1 audit fixes (4 crafted WAVs):
+  //   * `RIFF_wav_extensible.wav` — full `%audioEncoding` (`0xfffe`
+  //     "Extensible", RIFF.pm:333);
+  //   * `RIFF_info_latin1.wav` — default `'Latin'`/cp1252 INFO decode
+  //     (RIFF.pm:1788/1829);
+  //   * `RIFF_info_casio.wav` — `ISFT` Casio embedded-NUL + `ICRD` date
+  //     ValueConvs (RIFF.pm:853/873);
+  //   * `RIFF_truncated_fmt.wav` — truncated-chunk guard + corruption
+  //     warning (RIFF.pm:2150/2216).
+  // 332 → 334 after the Codex R2 audit fixes (2 crafted WAVs):
+  //   * `RIFF_cset_info.wav` — CSET binary SubDirectory (`CodePage`/
+  //     `CountryCode`/`LanguageCode`/`Dialect`, RIFF.pm:1063-1073) + the
+  //     `Unsupported character set (1252)` warning (ExifTool.pm:6359-6363) +
+  //     the raw-byte `?` rendering (`FixUTF8`, NOT U+FFFD): `IART`
+  //     `Caf\xe9\xff Test` ⇒ `"Caf?? Test"`;
+  //   * `RIFF_info_movieid.wav` — the remaining `%RIFF::Info` entries +
+  //     conversions: `TITL`/`YEAR`/`COMM` (MovieID), `TLEN` (`$val/1000` +
+  //     `"$val s"`), `TCOD`/`TCDO` (`$val*1e-7` + `ConvertTimecode`), `STAT`
+  //     (list PrintConv), `DTIM` (FILETIME → `ConvertUnixTime`), `IAS1`/`IBSU`
+  //     (Morgan), `DISP`/`TRCK` (Sound Forge) — RIFF.pm:897-1000.
+  // 334 → 335 after the Codex R3 audit fix (1 crafted WAV):
+  //   * `RIFF_cset0_info.wav` — CSET `CodePage=0` falls back to the default
+  //     `'Latin'` charset (RIFF.pm:1784-1789 truthiness gate: `$$et{CodePage}`
+  //     of `0` is FALSY ⇒ `$charset = 'Latin'`), so `IART=Caf\xe9` decodes
+  //     through cp1252 to `"Café"` with NO `ExifTool:Warning` — exactly like
+  //     no CSET at all. Distinguishes 0 (Latin) from a non-zero unsupported
+  //     code page (raw passthrough + warning, the `RIFF_cset_info.wav` case).
+  // 335 → 336 after the Codex R4 audit fix (1 crafted WAV):
+  //   * `RIFF_cset_reset_info.wav` — a REPEATED CSET: `CodePage=1252` THEN
+  //     `CodePage=0` THEN `IART=Caf\xe9`. The `CodePage` RawConv overwrites
+  //     `$$et{CodePage}` on EVERY CSET (RIFF.pm:1067-1069) and the gate uses
+  //     the LATEST value (RIFF.pm:1784-1789), so the trailing `0` RESETS the
+  //     prior `Raw(1252)` back to Latin: `IART` decodes through cp1252 to
+  //     `"Café"`, `RIFF:CodePage=0`, NO `ExifTool:Warning` (the R3 fix only
+  //     assigned on the non-zero CSET, leaving a stale `Raw(1252)` → `Caf?` +
+  //     warning; R4 assigns on EVERY CSET).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(

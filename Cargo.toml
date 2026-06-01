@@ -63,7 +63,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 all-formats = [
   "aac", "aiff", "ape", "audible", "crw", "dsf", "dv", "exif", "flac", "flash",
   "gps", "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
-  "plist", "png", "quicktime", "real", "red", "wavpack",
+  "plist", "png", "quicktime", "real", "red", "riff", "wavpack",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -195,6 +195,14 @@ quicktime  = ["plist"]
 # to compile.
 real       = ["id3"]
 red        = []
+# `riff` — RIFF/AVI container (FORMATS.md row 26). Faithful walker + AVI
+# sub-tables (Main / Info / Hdrl / Stream / StreamHeader / AVIHeader /
+# AudioFormat / Exif / OpenDML / ExtAVIHdr + inline BMP-strf decoder).
+# Leaf format; no cross-format chains today. A future sub-port can add an
+# `exif` edge for the `LIST_exif` MakerNotes hop (RIFF.pm:1022 `emnt`,
+# deferred). The same RIFF chunk-walker structurally hosts WAV/WEBP too
+# but those sub-tables are deferred — see `src/formats/riff.rs` module doc.
+riff       = []
 wavpack    = ["id3", "ape"]
 
 # Internal: MPEG audio frame parser (sub-dep of mp3). Maps to

@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "RIFF_cset_reset_info.wav",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "WAV",
+  "File:FileTypeExtension": "WAV",
+  "File:MIMEType": "audio/x-wav",
+  "RIFF:Encoding": 1,
+  "RIFF:NumChannels": 1,
+  "RIFF:SampleRate": 8000,
+  "RIFF:AvgBytesPerSec": 8000,
+  "RIFF:BitsPerSample": 8,
+  "RIFF:CodePage": 0,
+  "RIFF:CountryCode": 1,
+  "RIFF:LanguageCode": 9,
+  "RIFF:Dialect": 1,
+  "RIFF:Artist": "Café",
+  "RIFF:Title": "My Title"
+}]
