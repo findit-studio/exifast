@@ -2631,27 +2631,25 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
 
 #[cfg(feature = "alloc")]
 impl ExifMeta<'_> {
-  /// Render this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into a
-  /// [`Vec<EmittedTag>`](crate::emit::EmittedTag) for the requested
-  /// [`ConvMode`](crate::emit::ConvMode) — the golden-pattern parallel to the
-  /// `emit_entry` loop in [`serialize_tags`](Self::serialize_tags).
+  /// Push this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into `out` for the
+  /// requested [`ConvMode`](crate::emit::ConvMode) — the golden-pattern parallel
+  /// to the `emit_entry` loop in [`serialize_tags`](Self::serialize_tags).
   ///
   /// Each entry is converted by the SAME `emit_entry`/`emit_exif_value`/
   /// `emit_gps_value` logic the production path uses, but written into an
   /// [`EmittedTagSink`] (which produces the identical [`TagValue`]) instead of
-  /// the [`TagMap`](crate::tagmap::TagMap). The result carries
+  /// the [`TagMap`](crate::tagmap::TagMap). The pushed tags carry
   /// `Group{family0:"EXIF", family1:<IfdName>}`, `unknown:false`.
   ///
-  /// **EXIF entries only**: the `File:ExifByteOrder` and `File:PageCount` tags
-  /// are prepended by [`tags`](crate::emit::Taggable::tags) (not here), and the
-  /// `ExifTool:Warning` messages stay a separate channel drained by
-  /// `AnyMeta::drain_diagnostics`. The MakerNote vendor emissions are appended
-  /// separately by [`tags`](crate::emit::Taggable::tags) via
-  /// [`push_maker_note_tags`](Self::push_maker_note_tags). So this is the
-  /// EXIF (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) tag stream.
-  #[must_use]
-  fn emitted_exif_tags(&self, print_conv: bool) -> std::vec::Vec<crate::emit::EmittedTag> {
-    let mut sink = EmittedTagSink::new();
+  /// Writes DIRECTLY into the caller's `out` buffer (P2 — no per-call temp `Vec`
+  /// that [`tags`](crate::emit::Taggable::tags) then has to move). **EXIF
+  /// entries only**: the `File:ExifByteOrder`/`File:PageCount` prefix + the
+  /// MakerNote vendor emissions are pushed by [`tags`](crate::emit::Taggable::tags)
+  /// into the SAME `out`; the `ExifTool:Warning` messages stay a separate channel
+  /// drained by `AnyMeta::drain_diagnostics`.
+  fn push_exif_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    out.reserve(self.entries.len());
+    let mut sink = EmittedTagSink::new(out);
     // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
     // 'Unknown' guess — identical to `serialize_tags`'s `entry_order`. `None`
     // only for a JPEG accepted without a parsed Exif block, which then has NO
@@ -2662,7 +2660,6 @@ impl ExifMeta<'_> {
       // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
       let Ok(()) = emit_entry(entry, entry_order, print_conv, &mut sink);
     }
-    sink.tags
   }
 
   /// Append the captured MakerNote's cached vendor emissions to `out` as
@@ -2771,7 +2768,7 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
-    tags.append(&mut self.emitted_exif_tags(print_conv));
+    self.push_exif_tags(print_conv, &mut tags);
     self.push_maker_note_tags(print_conv, &mut tags);
     tags.into_iter()
   }
@@ -2907,19 +2904,21 @@ impl ExifSink for crate::tagmap::TagMap {
 /// Drives [`ExifMeta::tags`]; the engine ([`run_emission`](crate::emit::run_emission))
 /// then applies Unknown-suppression (a no-op here) + the sink dedup.
 #[cfg(feature = "alloc")]
-struct EmittedTagSink {
-  /// The collected EXIF [`EmittedTag`]s, in emission order.
-  tags: std::vec::Vec<crate::emit::EmittedTag>,
+struct EmittedTagSink<'v> {
+  /// The destination [`EmittedTag`] buffer (borrowed) — the EXIF emitters push
+  /// in emission order. Borrowing (rather than owning) lets [`ExifMeta::tags`]
+  /// fill ONE `Vec` in place (the `File:ExifByteOrder`/`PageCount` prefix, the
+  /// IFD entries via this sink, and the MakerNote vendor tags), eliminating the
+  /// per-call temp `Vec` the EXIF-entry pass used to allocate + move (P2).
+  tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>,
 }
 
 #[cfg(feature = "alloc")]
-impl EmittedTagSink {
-  /// An empty collector.
+impl<'v> EmittedTagSink<'v> {
+  /// Wrap a destination buffer.
   #[inline(always)]
-  const fn new() -> Self {
-    Self {
-      tags: std::vec::Vec::new(),
-    }
+  fn new(tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>) -> Self {
+    Self { tags }
   }
 
   /// Push one rendered [`EmittedTag`] — `Group{family0:"EXIF", family1:group}`,
@@ -2936,7 +2935,7 @@ impl EmittedTagSink {
 }
 
 #[cfg(feature = "alloc")]
-impl ExifSink for EmittedTagSink {
+impl ExifSink for EmittedTagSink<'_> {
   #[inline(always)]
   fn write_str(
     &mut self,

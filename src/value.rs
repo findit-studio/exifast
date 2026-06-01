@@ -332,6 +332,17 @@ impl Tag {
     &self.group
   }
 
+  /// Consume `self`, yielding its `(group, name, value)` parts — lets a consumer
+  /// MOVE the owned [`TagValue`] (and group/name) out instead of cloning
+  /// `value_ref()`. Used by [`crate::emit::run_emission`] to hand the value to
+  /// the sink without a clone (Golden-v2 P3). Crate-internal: the public read
+  /// path is the borrowing accessors.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) fn into_parts(self) -> (Group, SmolStr, TagValue) {
+    (self.group, self.name, self.value)
+  }
+
   /// The tag's name (e.g. `"Duration"`).
   #[must_use]
   #[inline(always)]

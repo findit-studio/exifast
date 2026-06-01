@@ -128,15 +128,13 @@ pub(crate) fn run_emission<T: Taggable>(meta: &T, mode: ConvMode, out: &mut crat
     if e.unknown() {
       continue;
     }
-    let tag = e.into_tag();
-    // `write_value` is infallible (`Result<(), Infallible>`); the sink keys on
-    // the family-1 group (`exiftool:2948` — only family-1 reaches the `-G1`
-    // key) and owns the dedup.
-    let _ = out.write_value(
-      tag.group_ref().family1(),
-      tag.name(),
-      tag.value_ref().clone(),
-    );
+    // MOVE the value out of the owned `Tag` (P3 — no `value_ref().clone()`); the
+    // group + name are borrowed from the moved-out parts for the `write_value`
+    // call. `write_value` is infallible (`Result<(), Infallible>`); the sink
+    // keys on the family-1 group (`exiftool:2948` — only family-1 reaches the
+    // `-G1` key) and owns the dedup.
+    let (group, name, value) = e.into_tag().into_parts();
+    let _ = out.write_value(group.family1(), name.as_str(), value);
   }
 }
 
