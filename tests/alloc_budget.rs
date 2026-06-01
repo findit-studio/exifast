@@ -24,7 +24,13 @@
 //! Run with `cargo test --test alloc_budget -- --nocapture` to see the printed
 //! counts.
 
-#![cfg(all(feature = "std", feature = "exif", feature = "id3", feature = "quicktime"))]
+#![cfg(all(
+  feature = "std",
+  feature = "exif",
+  feature = "id3",
+  feature = "quicktime",
+  feature = "real"
+))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,12 +100,16 @@ fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
 
 /// The representative fixtures: a camera JPEG with an Apple MakerNote, a camera
 /// JPEG with a Canon MakerNote (out-of-line offset resolution + many typed
-/// fields), a multi-frame ID3v2.4 MP3, and a tag-dense QuickTime MOV.
+/// fields — the heaviest decode, exercises P0 single-mode), a multi-frame
+/// ID3v2.4 MP3, a tag-dense QuickTime MOV (exercises P1's O(1) dedup), and a
+/// RealAudio file (its AudioV* codec fields exercise the P8 static-literal-name
+/// SmolStr sweep).
 const FIXTURES: &[&str] = &[
   "MakerNotes_Apple.jpg",
   "MakerNotes_Canon.jpg",
   "ID3v2_4_big.mp3",
   "QuickTime_frea_rexing17b.mov",
+  "Real.ra",
 ];
 
 /// Measure + report (and, once pinned, assert) the allocation count of a full

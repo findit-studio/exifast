@@ -481,8 +481,11 @@ impl<'a> VorbisNamed<'a> {
 /// fields, accessors only.
 #[derive(Debug, Clone)]
 pub struct VorbisAuto<'a> {
-  /// Auto-derived name (owned; synthesized, cannot borrow from input).
-  name: String,
+  /// Auto-derived name (owned; synthesized via the Vorbis.pm regex transform,
+  /// cannot borrow from input). A short tag identifier (stored, feeds the
+  /// emitted tag name) ⇒ `SmolStr`; the regex transform builds it in a
+  /// transient `String` (a builder — String per the rule), converted here.
+  name: smol_str::SmolStr,
   /// raw UTF-8 value.
   value: Cow<'a, str>,
 }
@@ -491,14 +494,14 @@ impl<'a> VorbisAuto<'a> {
   /// Construct an auto-named Vorbis comment payload.
   #[must_use]
   #[inline(always)]
-  pub const fn new(name: String, value: Cow<'a, str>) -> Self {
+  pub const fn new(name: smol_str::SmolStr, value: Cow<'a, str>) -> Self {
     Self { name, value }
   }
-  /// Auto-derived name (§3: `String` projected to `&str`).
+  /// Auto-derived name (§3: `SmolStr` projected to `&str`).
   #[must_use]
   #[inline(always)]
   pub fn name(&self) -> &str {
-    &self.name
+    self.name.as_str()
   }
   /// Raw UTF-8 value (§3: `Cow` projected to `&str`).
   #[must_use]
@@ -1186,7 +1189,7 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
           )));
         } else {
           out.push(VorbisItem::Auto(VorbisAuto::new(
-            vorbis_derive_name(&tag_upper),
+            vorbis_derive_name(&tag_upper).into(),
             val,
           )));
         }
@@ -2514,7 +2517,7 @@ mod tests {
     assert_eq!(n.value(), "Alice");
     assert!(n.is_listable());
 
-    let auto = VorbisItem::Auto(VorbisAuto::new("FooBar".to_string(), Cow::Borrowed("42")));
+    let auto = VorbisItem::Auto(VorbisAuto::new("FooBar".into(), Cow::Borrowed("42")));
     assert!(auto.is_auto());
     let a = auto.unwrap_auto_ref();
     assert_eq!(a.name(), "FooBar");

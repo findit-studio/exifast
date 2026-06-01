@@ -246,7 +246,8 @@ struct MdprStream {
 #[derive(Debug, Clone)]
 struct FileInfoProp {
   /// `Real-MDPR{N}:<Name>` — the dynamic-name as derived by Real.pm:196-220.
-  name: String,
+  /// A short tag identifier (stored, feeds the emitted tag name) ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   /// PrintConv form (`-j`); identical to `value_raw` for identity converters.
   value_print: String,
   /// Post-ValueConv form (`-n`); typically a bare integer string for the
@@ -273,8 +274,8 @@ struct ContTags {
 struct RjmdTag {
   /// Final tag name after `tr/A-Za-z0-9//dc` + `ucfirst` then the Perl
   /// `%Real::Metadata` static-rename table (`Album/Name → AlbumName`,
-  /// `Track/Category → TrackCategory`, …).
-  name: String,
+  /// `Track/Category → TrackCategory`, …). A short tag identifier ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   /// The post-ValueConv string (used for both `-j` and `-n`; the Real
   /// metadata table has no PrintConv toggles).
   value: String,
@@ -291,7 +292,8 @@ struct RjmdTag {
 /// — `value` is the single source of truth for both modes.
 #[derive(Debug, Clone)]
 struct RaCodecField {
-  name: String,
+  /// A static codec-field identifier (`"Channels"`, `"Title"`, …) ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   value: String,
   /// `true` when the bundled `-n`/`-j` output is a bare JSON number.
   emit_as_int: bool,
@@ -926,7 +928,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         if info_name == "ContentRating" {
           let print = content_rating_print(val_u32);
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: print.to_string(),
             value_raw: val_u32.to_string(),
             emit_raw_as_int: true,
@@ -938,7 +940,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
             _ => "",
           };
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: print.to_string(),
             value_raw: val_u32.to_string(),
             emit_raw_as_int: true,
@@ -946,7 +948,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         } else {
           let v = val_u32.to_string();
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: v.clone(),
             value_raw: v,
             emit_raw_as_int: true,
@@ -958,7 +960,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         let s = raw_bytes_to_json_string(null_truncate(raw_val));
         let (vc_print, _was_dated) = apply_file_info_value_conv(&info_name, &s, found_in_table);
         out.push(FileInfoProp {
-          name: info_name.to_string(),
+          name: info_name.as_str().into(),
           value_print: vc_print.clone(),
           value_raw: vc_print,
           emit_raw_as_int: false,
@@ -971,7 +973,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         // future-proofness.
         let s = raw_bytes_to_json_string(raw_val);
         out.push(FileInfoProp {
-          name: info_name.to_string(),
+          name: info_name.as_str().into(),
           value_print: s.clone(),
           value_raw: s,
           emit_raw_as_int: false,
@@ -1260,8 +1262,10 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
     //   5 => 'undef', 6 => 'string', 7 => 'string' (date), 8 => 'string',
     //   9 => undef (grouping), 10 => undef (reference).
     // Real.pm:457-466 — `GetTagInfo`/dynamic-name synthesis. Apply the
-    // RJMD-name remap (Real.pm:264-268).
-    let resolved_name = resolve_rjmd_tag(&full_tag);
+    // RJMD-name remap (Real.pm:264-268). `resolve_rjmd_tag` builds the name in
+    // a transient `String` (a builder — String per the project rule); the
+    // STORED field is a short tag identifier ⇒ `SmolStr`.
+    let resolved_name = smol_str::SmolStr::from(resolve_rjmd_tag(&full_tag));
     // Real.pm:468-490 — emit if `$valueLen && $format`.
     if value_len > 0 {
       let raw_value = &body[value_data_pos..value_data_pos + value_len];
@@ -1634,7 +1638,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 0 Channels (int16u).
   if let Some(v) = read_u16(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1645,7 +1649,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 2 BytesPerMinute (int16u).
   if let Some(v) = read_u16(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1654,7 +1658,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 3 AudioBytes (int32u).
   if let Some(v) = read_u32(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1714,7 +1718,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 6 AudioBytes int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1723,7 +1727,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 7 BytesPerMinute int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1736,7 +1740,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 10 AudioFrameSize int16u (default) — EMIT (no Unknown tag).
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioFrameSize".to_string(),
+      name: "AudioFrameSize".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1749,7 +1753,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 13 SampleRate int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "SampleRate".to_string(),
+      name: "SampleRate".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1760,7 +1764,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 15 BitsPerSample int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BitsPerSample".to_string(),
+      name: "BitsPerSample".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1769,7 +1773,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 16 Channels int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1841,7 +1845,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 6 AudioBytes int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1850,7 +1854,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 7 BytesPerMinute int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1867,7 +1871,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 12 SampleRate int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "SampleRate".to_string(),
+      name: "SampleRate".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1878,7 +1882,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 14 BitsPerSample int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BitsPerSample".to_string(),
+      name: "BitsPerSample".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1887,7 +1891,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 15 Channels int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1911,8 +1915,8 @@ fn ra_text_field(header: &[u8], cursor: usize, name: &str, meta: &mut RealMeta<'
   let s = raw_bytes_to_json_string(null_truncate(raw));
   if !s.is_empty() {
     meta.ra_fields.push(RaCodecField {
-      name: name.to_string(),
-      value: s.clone(),
+      name: name.into(),
+      value: s,
       emit_as_int: false,
     });
   }

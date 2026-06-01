@@ -704,8 +704,11 @@ impl PlistContentOverride {
 /// D8: no public fields; accessors only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlistTag {
-  /// Generated tag name (e.g. `"TestDictAuthor"`, `"TestReal"`).
-  name: String,
+  /// Generated tag name (e.g. `"TestDictAuthor"`, `"TestReal"`). A short tag
+  /// identifier (stored, feeds the emitted tag name) ⇒ `SmolStr`; the static
+  /// hit is a `&'static str` and the dynamic name is built in a transient
+  /// `String` (a builder — String per the rule), both converted here.
+  name: smol_str::SmolStr,
   /// The typed leaf value (already `ValueConv`-converted).
   value: PlistLeaf,
   /// The `%PLIST::Main` `PrintConv` to apply at serialize time, in print
@@ -2040,7 +2043,7 @@ fn decode_xml_leaf(name: &str, inner: &str, self_closing: bool) -> PlistValue {
 fn last_wins_by_name_xml_only(scratch: Vec<PlistTag>) -> Vec<PlistTag> {
   // Only XML-group tags actually engage the dedup. A PLIST-group sub-walk
   // tag (from `CompressedPLIST`) is always kept.
-  let mut seen_xml: Vec<String> = Vec::new();
+  let mut seen_xml: Vec<smol_str::SmolStr> = Vec::new();
   let mut keep: Vec<PlistTag> = Vec::new();
   for tag in scratch.iter().rev() {
     if tag.group_override.is_some() {
@@ -2694,16 +2697,17 @@ fn emit_tag(id: &str, format: PlistFormat, leaf: PlistLeaf) -> PlistTag {
       other => other,
     };
     PlistTag {
-      name: info.name.to_string(),
+      name: info.name.into(),
       value,
       print_conv,
       group_override: None,
     }
   } else {
-    let name = match format {
+    let name: smol_str::SmolStr = match format {
       PlistFormat::Binary => generate_binary_tag_name(id),
       PlistFormat::Xml => generate_xml_tag_name(id),
-    };
+    }
+    .into();
     PlistTag {
       name,
       value: leaf,

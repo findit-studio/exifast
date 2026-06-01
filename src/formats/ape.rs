@@ -1354,7 +1354,11 @@ impl Header {
 /// D8 — no public fields, accessors only.
 #[derive(Debug, Clone)]
 pub struct MainTag {
-  name: String,
+  /// Resolved tag name. A short identifier (stored, feeds the emitted tag
+  /// name) ⇒ `SmolStr`. `MakeTag` builds the dynamic name in a transient
+  /// `String` (a builder — String per the rule); it is converted to `SmolStr`
+  /// here at the store boundary.
+  name: smol_str::SmolStr,
   value: TagValue,
 }
 
@@ -1750,7 +1754,10 @@ fn meta_from_plan(plan: Plan) -> Meta<'static> {
   let main_tags: Vec<MainTag> = plan
     .pending
     .into_iter()
-    .map(|(_g1, name, value)| MainTag { name, value })
+    .map(|(_g1, name, value)| MainTag {
+      name: name.into(),
+      value,
+    })
     .collect();
   // 3) Intra-APE Composite:Duration. Resolve the 4 Require ingredients
   // against the header + main tags ALONE (not cross-format). Mirrors the
@@ -4290,7 +4297,7 @@ mod tests {
   fn ape_main_tag_value_ref_accessor() {
     // §3: MainTag::value_ref() is the non-Copy `_ref` getter.
     let t = MainTag {
-      name: "Artist".to_string(),
+      name: "Artist".into(),
       value: TagValue::Str("Tester".into()),
     };
     assert_eq!(t.name(), "Artist");

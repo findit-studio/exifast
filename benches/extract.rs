@@ -22,6 +22,7 @@ const FIXTURES: &[&str] = &[
   "MakerNotes_Canon.jpg",
   "ID3v2_4_big.mp3",
   "QuickTime_frea_rexing17b.mov",
+  "Real.ra",
 ];
 
 fn bench_extract(c: &mut Criterion) {
