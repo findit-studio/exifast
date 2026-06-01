@@ -565,6 +565,123 @@ impl Default for MediaTrack {
   }
 }
 
+/// The four tags decoded from the top-level `frea` atom of Kodak PixPro
+/// SP360 / 4KVR360 (and Rexing) MP4 videos — `Image::ExifTool::Kodak::frea`
+/// (Kodak.pm:2977-2990), dispatched from the `%QuickTime::Main` `frea` entry
+/// (QuickTime.pm:610-613). The table `GROUPS => { 0 => 'MakerNotes', 2 =>
+/// 'Image' }`; ExifTool renders these under family-0 `MakerNotes`, family-1
+/// `Kodak` (verified vs the bundled `-G0:1` oracle on a crafted `frea` MP4).
+///
+/// `KodakVersion` (the `'ver '` sub-atom) is the cross-module global ExifTool
+/// stashes in `$$self{KodakVersion}` (Kodak.pm:2987 `RawConv =>
+/// '$$self{KodakVersion} = $val'`) and reads back during the `mdat` freeGPS
+/// scan to recognize a Rexing V1-4k dashcam and apply the Type-17b lat/lon
+/// scaling (QuickTimeStream.pl:2323-2327) — see
+/// [`crate::formats::quicktime_freegps`].
+///
+/// **D8 — no public fields, accessors only.**
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KodakFrea {
+  /// `tima` Duration — raw `int32u` seconds (Kodak.pm:2980-2985). PrintConv is
+  /// `ConvertDuration($val)`; there is no ValueConv, so the raw count IS the
+  /// `-n` value and the seconds fed to `ConvertDuration`.
+  duration_secs: Option<u32>,
+  /// `'ver '` KodakVersion — the raw string value (Kodak.pm:2987). Also stashed
+  /// as the cross-module `KodakVersion` global for the freeGPS Type-17b scan.
+  version: Option<smol_str::SmolStr>,
+  /// `thma` ThumbnailImage — the byte length of the binary payload (Kodak.pm:
+  /// 2988, `Binary => 1`, group2 `Preview`). Rendered as the `(Binary data N
+  /// bytes, use -b option to extract)` placeholder; the bytes are not retained.
+  thumbnail_len: Option<u64>,
+  /// `scra` PreviewImage — the byte length of the binary payload (Kodak.pm:
+  /// 2989, `Binary => 1`, group2 `Preview`). Rendered as the placeholder.
+  preview_len: Option<u64>,
+}
+
+impl KodakFrea {
+  /// A fresh, empty `frea` decode (no sub-atoms seen yet).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      duration_secs: None,
+      version: None,
+      thumbnail_len: None,
+      preview_len: None,
+    }
+  }
+
+  /// `tima` Duration — raw `int32u` seconds (the `-n` value and the
+  /// `ConvertDuration` input).
+  #[inline(always)]
+  #[must_use]
+  pub const fn duration_secs(&self) -> Option<u32> {
+    self.duration_secs
+  }
+
+  /// `'ver '` KodakVersion — the raw string value.
+  #[inline(always)]
+  #[must_use]
+  pub fn version(&self) -> Option<&str> {
+    match &self.version {
+      Some(v) => Some(v.as_str()),
+      None => None,
+    }
+  }
+
+  /// `thma` ThumbnailImage — payload byte length (for the binary placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn thumbnail_len(&self) -> Option<u64> {
+    self.thumbnail_len
+  }
+
+  /// `scra` PreviewImage — payload byte length (for the binary placeholder).
+  #[inline(always)]
+  #[must_use]
+  pub const fn preview_len(&self) -> Option<u64> {
+    self.preview_len
+  }
+
+  /// `true` when no `frea` sub-atom was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    self.duration_secs.is_none()
+      && self.version.is_none()
+      && self.thumbnail_len.is_none()
+      && self.preview_len.is_none()
+  }
+
+  /// Record the `tima` Duration (raw `int32u` seconds).
+  #[inline(always)]
+  pub const fn set_duration_secs(&mut self, v: Option<u32>) -> &mut Self {
+    self.duration_secs = v;
+    self
+  }
+
+  /// Record the `'ver '` KodakVersion string.
+  #[inline(always)]
+  pub fn set_version(&mut self, v: Option<smol_str::SmolStr>) -> &mut Self {
+    self.version = v;
+    self
+  }
+
+  /// Record the `thma` ThumbnailImage payload byte length.
+  #[inline(always)]
+  pub const fn set_thumbnail_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.thumbnail_len = v;
+    self
+  }
+
+  /// Record the `scra` PreviewImage payload byte length.
+  #[inline(always)]
+  pub const fn set_preview_len(&mut self, v: Option<u64>) -> &mut Self {
+    self.preview_len = v;
+    self
+  }
+}
+
 /// The faithful typed result of parsing a QuickTime / ISO-BMFF file's core
 /// structural atoms — the SP1 mirror of `ProcessMOV`'s output for `ftyp`,
 /// `moov`/`mvhd` and the `trak` tree. All movie-level fields are optional;
@@ -627,6 +744,10 @@ pub struct QuickTimeMeta {
   /// `mdat-offset` MediaDataOffset — the absolute file offset of the `mdat`
   /// payload (QuickTime.pm:697-700 + 10160).
   media_data_offset: Option<u64>,
+  /// The top-level `frea` atom's `Image::ExifTool::Kodak::frea` tags
+  /// (Kodak PixPro / Rexing — Kodak.pm:2977-2990). Empty for the common case
+  /// (no `frea` atom). See [`KodakFrea`].
+  kodak_frea: KodakFrea,
   /// One [`MediaTrack`] per `trak` atom, in file order.
   tracks: Vec<MediaTrack>,
 }
@@ -657,6 +778,7 @@ impl QuickTimeMeta {
       next_track_id: None,
       media_data_size: None,
       media_data_offset: None,
+      kodak_frea: KodakFrea::new(),
       tracks: Vec::new(),
     }
   }
@@ -766,6 +888,14 @@ impl QuickTimeMeta {
   #[must_use]
   pub const fn media_data_offset(&self) -> Option<u64> {
     self.media_data_offset
+  }
+
+  /// The top-level `frea` atom's [`KodakFrea`] tags (Kodak PixPro / Rexing).
+  /// Empty (`KodakFrea::is_empty`) when no `frea` atom was decoded.
+  #[inline(always)]
+  #[must_use]
+  pub const fn kodak_frea(&self) -> &KodakFrea {
+    &self.kodak_frea
   }
 
   /// `mvhd` MovieHeaderVersion.
@@ -964,6 +1094,14 @@ impl QuickTimeMeta {
   pub const fn set_media_data_offset(&mut self, v: Option<u64>) -> &mut Self {
     self.media_data_offset = v;
     self
+  }
+
+  /// Mutable access to the [`KodakFrea`] tags — used by the `frea` atom
+  /// handler ([`crate::formats::quicktime`]) to record `tima`/`ver`/`thma`/
+  /// `scra` as they are decoded.
+  #[inline(always)]
+  pub const fn kodak_frea_mut(&mut self) -> &mut KodakFrea {
+    &mut self.kodak_frea
   }
 
   /// Set the `mvhd` MovieHeaderVersion.

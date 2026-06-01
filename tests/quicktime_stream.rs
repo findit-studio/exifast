@@ -19,7 +19,7 @@
 //! the SP3 timed-metadata tags never pollute the non-`-ee` conformance set.
 #![cfg(all(feature = "quicktime", feature = "json"))]
 
-use exifast::parse_quicktime;
+use exifast::{AnyMeta, ConvMode, parse_bytes, parse_quicktime};
 
 /// Load `tests/golden/<name>.ee.json` and return the first (only) document.
 fn ee_golden(name: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -494,4 +494,224 @@ fn quicktime_media_metadata_projects_first_gps_fix() {
   assert!((lat - 47.628_421_666_666_67).abs() < 1e-6, "lat {lat}");
   assert_eq!(gps.altitude_m(), Some(123.0));
   assert!(gps.timestamp().is_some(), "GPSDateTime projected");
+}
+
+#[test]
+fn quicktime_freegps_brute_force_scan_finds_block_in_mdat() {
+  // SP3.5 — ProcessFreeGPS + ScanMediaData (QuickTimeStream.pl:1637-2484,
+  // :3679-3789). Synthetic mov file with an `mdat` that contains a Type-6
+  // (Akaso) freeGPS block. The brute-force scanner must locate the block
+  // and dispatch into `decode_type6_akaso`, producing one GPS sample
+  // accessible via `Meta::stream`.
+  let data = build_mov_with_freegps_in_mdat();
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  assert_eq!(
+    stream.gps_samples().len(),
+    1,
+    "freeGPS scan must locate and decode the embedded block"
+  );
+  let s = &stream.gps_samples()[0];
+  // Type 6 lat 4737.7053 ⇒ ConvertLatLon ⇒ 47.628.
+  assert!((s.latitude().unwrap() - 47.628_421).abs() < 1e-3);
+  assert!(s.longitude().unwrap() < -120.0);
+}
+
+#[test]
+fn quicktime_moov_gps_box_decodes_block_outside_mdat() {
+  // Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box,
+  // `%eeBox{''}{'gps '} = 'moov'`, QuickTime.pm:523-533) is an offset TABLE
+  // whose `(start, size)` pairs point at `freeGPS ` blocks ANYWHERE in the
+  // file — `ParseTag` reads each block and runs ProcessSamples
+  // (QuickTimeStream.pl:2544-2556). This fixture is the XGODY 12" 4K Dashcam
+  // shape: a single Type-6 `freeGPS ` block lives OUTSIDE `mdat` (between
+  // `ftyp` and `moov`), reachable ONLY via the offset table. Oracle (`-ee`):
+  //   GPSLatitude 47 deg 37' 42.30" N, GPSLongitude 122 deg 9' 54.08" W,
+  //   GPSDateTime 2024:07:15 14:30:45Z.
+  let data = fixture("QuickTime_moov_gps.mov");
+  let golden = ee_golden("QuickTime_moov_gps.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let stream = meta.stream();
+  assert_eq!(
+    stream.gps_samples().len(),
+    1,
+    "the moov-level gps ' offset table must decode the out-of-mdat block"
+  );
+  let s = &stream.gps_samples()[0];
+  // Type-6 stores lat/lon as f32 (block-relative); 4737.7053 DDDMM.MMMM ⇒
+  // 47.6284..., 12209.901 (West) ⇒ -122.1650... — cross-checking the oracle's
+  // DMS PrintConv string (`47 deg 37' 42.30" N`, `122 deg 9' 54.08" W`). The
+  // f32 round-trip widens the tolerance, exactly as the brute-force-scan test.
+  let lat = s.latitude().expect("latitude");
+  let lon = s.longitude().expect("longitude");
+  assert!((lat - 47.628_421).abs() < 1e-3, "lat {lat}");
+  assert!((lon + 122.165_016).abs() < 1e-3, "lon {lon}");
+  let dms_lat = golden
+    .get("QuickTime:GPSLatitude")
+    .and_then(|v| v.as_str())
+    .expect("golden GPSLatitude");
+  assert!(dms_lat.ends_with('N'), "fix is North: {dms_lat}");
+  let dms_lon = golden
+    .get("QuickTime:GPSLongitude")
+    .and_then(|v| v.as_str())
+    .expect("golden GPSLongitude");
+  assert!(dms_lon.ends_with('W'), "fix is West: {dms_lon}");
+  // The block carries its OWN date (Type-6 parses yr/mon/day + hr/min/sec), so
+  // GPSDateTime matches the oracle exactly — independent of any SampleTime.
+  assert_eq!(
+    s.date_time(),
+    golden.get("QuickTime:GPSDateTime").and_then(|v| v.as_str()),
+    "GPSDateTime matches the oracle"
+  );
+}
+
+#[test]
+fn quicktime_frea_kodak_tags_decode_with_oracle_parity() {
+  // Part A — the top-level `frea` atom → `Image::ExifTool::Kodak::frea`
+  // (QuickTime.pm:610-613 ⇒ Kodak.pm:2977-2990). The fixture's `frea` carries
+  // `tima` (Duration 3725s), `'ver '` (KodakVersion "3.01.054"), `thma`
+  // (ThumbnailImage 40B) and `scra` (PreviewImage 60B). Bundled `-ee -G1` ⇒
+  // the four tags under family-0 `MakerNotes`, family-1 `Kodak`.
+  let data = fixture("QuickTime_frea_rexing17b.mov");
+  let golden = ee_golden("QuickTime_frea_rexing17b.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+
+  // Typed accessor: the decoded `frea` values.
+  let frea = meta.quicktime().kodak_frea();
+  assert!(!frea.is_empty(), "frea atom must be decoded");
+  assert_eq!(frea.duration_secs(), Some(3725), "tima raw int32u seconds");
+  assert_eq!(frea.version(), Some("3.01.054"), "KodakVersion string");
+  assert_eq!(frea.thumbnail_len(), Some(40), "thma payload byte count");
+  assert_eq!(frea.preview_len(), Some(60), "scra payload byte count");
+
+  // Rendered tag stream (the golden `Meta::tags()` path): the four tags emit
+  // under family-0 `MakerNotes`, family-1 `Kodak`, with the bundled-parity
+  // PrintConv values.
+  let any = parse_bytes(&data).expect("parse ok").expect("recognized");
+  assert!(matches!(any, AnyMeta::QuickTime(_)), "got {any:?}");
+  let tags: Vec<exifast::Tag> = any.iter_tags(ConvMode::PrintConv).collect();
+  let kodak: std::collections::HashMap<&str, &exifast::Tag> = tags
+    .iter()
+    .filter(|t| t.group_ref().family0() == "MakerNotes" && t.group_ref().family1() == "Kodak")
+    .map(|t| (t.name(), t))
+    .collect();
+  assert_eq!(kodak.len(), 4, "exactly the four Kodak frea tags");
+  for (name, want_key) in [
+    ("Duration", "Kodak:Duration"),
+    ("KodakVersion", "Kodak:KodakVersion"),
+    ("ThumbnailImage", "Kodak:ThumbnailImage"),
+    ("PreviewImage", "Kodak:PreviewImage"),
+  ] {
+    let tag = kodak
+      .get(name)
+      .unwrap_or_else(|| panic!("Kodak:{name} emitted"));
+    // Every frea PrintConv value is a `TagValue::Str` (Duration ⇒ ConvertDuration
+    // string, KodakVersion ⇒ raw string, thma/scra ⇒ binary placeholder).
+    let got = match tag.value_ref() {
+      exifast::TagValue::Str(s) => s.as_str(),
+      other => panic!("Kodak:{name} expected a string value, got {other:?}"),
+    };
+    let want = golden
+      .get(want_key)
+      .and_then(|v| v.as_str())
+      .unwrap_or_else(|| panic!("golden {want_key}"));
+    assert_eq!(got, want, "Kodak:{name} oracle parity ({got} vs {want})");
+  }
+}
+
+#[test]
+fn quicktime_frea_rexing_type17b_scales_gps_via_kodak_version() {
+  // Part B — the `frea`-atom KodakVersion ("3.01.054") is threaded into the
+  // `mdat` freeGPS scan; the Type-17 block then takes the 17b Rexing V1-4k
+  // scaling (QuickTimeStream.pl:2323-2327): `(lat-187.982162849635)/3` /
+  // `(lon-2199.19873715495)/2`, decimal degrees, `W` ref negating the lon.
+  // Bundled `-ee` ⇒ GPSLatitude 33.6697742486894, GPSLongitude
+  // -112.096920485025 (verified vs ExifTool 13.59).
+  let data = fixture("QuickTime_frea_rexing17b.mov");
+  let meta = parse_quicktime(&data)
+    .expect("parse ok")
+    .expect("recognized");
+  let fix = meta
+    .stream()
+    .first_fix()
+    .expect("17b GPS fix from the mdat freeGPS scan");
+  let lat = fix.latitude().expect("lat");
+  let lon = fix.longitude().expect("lon");
+  assert!(
+    (lat - 33.669_774_248_689_4).abs() < 1e-6,
+    "17b lat {lat} (want 33.6697742486894)"
+  );
+  assert!(
+    (lon - -112.096_920_485_025).abs() < 1e-6,
+    "17b lon {lon} (want -112.096920485025)"
+  );
+  assert!(
+    (fix.speed_kph().expect("spd") - 92.6).abs() < 1e-3,
+    "17b speed 92.6 km/h (knotsToKph, NOT divided)"
+  );
+  assert_eq!(fix.track(), Some(90.0), "17b track");
+  assert_eq!(fix.date_time(), Some("2024:02:22 14:34:40Z"));
+}
+
+/// Build a minimal but valid `.mov` containing:
+///   - an 8-byte ftyp atom
+///   - a minimal moov+mvhd (no timed-metadata tracks)
+///   - an `mdat` payload containing a Type-6 freeGPS block
+fn build_mov_with_freegps_in_mdat() -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  // mvhd (v0, 108 bytes): version+flags + 7 × int32 zero + 1 dword timescale=1000 + ...
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mvhd.extend_from_slice(&[0u8; 8]); // create+modify date
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // duration (1s)
+  mvhd.extend_from_slice(&[0u8; 80]); // rest
+  let mut moov = (mvhd.len() as u32 + 16).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  moov.extend_from_slice(&mvhd_atom);
+  // Build the freeGPS block (Type 6, 256-byte block — alignment per the
+  // ExifTool scanner's `\0..\0` size pattern).
+  let mut block = vec![0u8; 0x100];
+  block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+  block[4..12].copy_from_slice(b"freeGPS ");
+  block[60] = b'A';
+  block[68] = b'N';
+  block[76] = b'W';
+  block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes()); // hr
+  block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes()); // min
+  block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes()); // sec
+  block[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes()); // yr
+  block[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes()); // mon
+  block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes()); // day
+  block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes()); // lat
+  block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes()); // lon
+  // mdat payload = 64 bytes pad + block + padding past 0x8000.
+  // ExifTool bails a sub-0x8000 FINAL chunk WITHOUT decoding (`last if
+  // length $buff < $gpsBlockSize`, QuickTimeStream.pl:3750), so the block must
+  // be found in a full 0x8000-byte chunk — pad the `mdat` accordingly (this
+  // matches a real dashcam, whose first freeGPS block sits in an early full
+  // chunk; a sub-0x8000 mdat yields NO GPS, oracle-verified).
+  let mut mdat_payload = vec![0u8; 64];
+  mdat_payload.extend_from_slice(&block);
+  mdat_payload.extend_from_slice(&vec![0u8; 0x9000]);
+  let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(&mdat_payload);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out.extend_from_slice(&mdat);
+  out
 }
