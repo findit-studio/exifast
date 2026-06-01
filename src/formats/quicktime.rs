@@ -1861,17 +1861,25 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // the Type-17b scaling. Threaded as a `&str` borrow (mvhd/frea are already
   // decoded into `qt` at this point).
   let kodak_version = qt.kodak_frea().version();
-  let mut stream = quicktime_stream::extract_stream(data, create_date_raw, kodak_version);
+  // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
+  // set ONLY when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
+  // `ProcessFreeGPS`, NOT by the generic per-sample `FoundSomething` output
+  // (gps0/gsen/`GPS `/3gf/mebx — QuickTimeStream.pl:967-973). It is the sole gate
+  // for the `mdat` scan below.
+  let (mut stream, found_embedded) =
+    quicktime_stream::extract_stream(data, create_date_raw, kodak_version);
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
-  // scans mdat when no timed-metadata `FoundEmbedded` was set; mirror that
-  // (the scan otherwise blindly re-decodes the same blocks pointed to by the
-  // `moov`-level `gps ` table). The freeGPS scan also captures samples that
-  // live OUTSIDE timed-metadata tracks (action-cams, dashcams, drones with
-  // padding-buried GPS) — see `quicktime_freegps`.
+  // scans mdat when no `freeGPS ` block was already decoded — i.e. when
+  // `$$et{FoundEmbedded}` is unset (QuickTimeStream.pl:3689 `return if
+  // $$et{FoundEmbedded}`), which a `gps `-box decode sets (:1650). It is NOT
+  // gated on per-sample output: a movie with a `gsen`/`gps0`/`GPS `/`3gf`/`mebx`
+  // timed-metadata stream but NO decoded freeGPS still gets `mdat` scanned, so a
+  // `freeGPS ` block buried in padding alongside such a stream is recovered
+  // (action-cams, dashcams, drones) — see `quicktime_freegps`.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
-    let already = !stream.is_empty();
+    let already = found_embedded;
     // The Kodak `frea`-atom `KodakVersion` (set in Pass 1, BEFORE this scan)
     // is the cross-module global the Type-17b decoder reads to recognize a
     // Rexing V1-4k dashcam (QuickTimeStream.pl:2323-2327).
@@ -3274,10 +3282,11 @@ mod tests {
 
   /// Codex R3 (pipeline negative) — a real `trak` whose `hdlr` HandlerType is
   /// `gps ` must NOT suppress the brute-force `mdat` scan. ExifTool ignores
-  /// such a track (no `$eeBox{'gps '}`), so `extract_stream` leaves the stream
-  /// empty (`FoundEmbedded` unset), and `ScanMediaData` still decodes a real
-  /// `freeGPS ` block buried in `mdat` (QuickTimeStream.pl:3689). The single
-  /// decoded sample therefore comes from the SCAN, not the ignored track.
+  /// such a track (no `$eeBox{'gps '}`), so `extract_stream` runs no
+  /// `ProcessFreeGPS` and returns `FoundEmbedded = false`, and `ScanMediaData`
+  /// still decodes a real `freeGPS ` block buried in `mdat`
+  /// (QuickTimeStream.pl:3689). The single decoded sample therefore comes from
+  /// the SCAN, not the ignored track.
   ///
   /// VERIFIED against bundled 13.59 (`exiftool -ee` on this exact layout):
   /// `Track1:HandlerType = Unknown (gps )` (the track is recognized but yields
@@ -3378,11 +3387,12 @@ mod tests {
 
   /// Codex R3 (dedup) — finding step 3: a block referenced by the `moov`-level
   /// `gps ` offset box must NOT be double-emitted by the `mdat` scan. The box
-  /// decode populates the stream (ExifTool's `FoundEmbedded`), which gates
-  /// `ScanMediaData` (QuickTimeStream.pl:1650, :3689); the port mirrors this
-  /// via `!stream.is_empty()`. VERIFIED against bundled 13.59 (`exiftool -ee`
-  /// on this exact layout: a `moov` `gps ` box pointing at a block that also
-  /// lies in a `>=0x8000` `mdat`) — ONE GPSLatitude key, not two.
+  /// decode runs `ProcessFreeGPS`, which sets ExifTool's `FoundEmbedded`
+  /// (QuickTimeStream.pl:1650), and that flag — threaded out of
+  /// `extract_stream` — gates `ScanMediaData` (:3689). VERIFIED against bundled
+  /// 13.59 (`exiftool -ee` on this exact layout: a `moov` `gps ` box pointing at
+  /// a block that also lies in a `>=0x8000` `mdat`) — ONE GPSLatitude key, not
+  /// two.
   #[test]
   fn moov_gps_box_decode_suppresses_redundant_mdat_scan() {
     let mut blk = vec![0u8; 0x100];
@@ -3428,6 +3438,93 @@ mod tests {
       meta.stream().gps_samples().len(),
       1,
       "the moov gps ' box must decode once and suppress the redundant mdat scan"
+    );
+  }
+
+  /// Codex R6 (real-input) — the `mdat` scan must be gated on ExifTool's
+  /// `$$et{FoundEmbedded}` (set ONLY by `ProcessFreeGPS`, QuickTimeStream.pl:1650),
+  /// NOT on per-sample output. A real dashcam / action-cam can carry a timed
+  /// metadata stream (here a `gps0` box — DuDuBell M1 / VSYS M6L, decoded by
+  /// `Process_gps0` via the generic `FoundSomething`, QuickTimeStream.pl:967-973,
+  /// which never touches `FoundEmbedded`) AND a `freeGPS ` block buried in `mdat`
+  /// padding. ExifTool extracts BOTH: the `gps0` sample, and — because
+  /// `FoundEmbedded` is still unset after the `gps0` decode — the buried block
+  /// via `ScanMediaData` (:3689). The pre-fix port gated on `!stream.is_empty()`,
+  /// so the `gps0` sample alone suppressed the scan and the freeGPS fix was LOST;
+  /// gating on `FoundEmbedded` restores it.
+  #[test]
+  fn nonfreegps_stream_sample_does_not_suppress_mdat_scan() {
+    // A Type-6 (Akaso) freeGPS block buried in `mdat` (block-relative offsets;
+    // distinct coordinates from the `gps0` record so we can tell them apart).
+    let mut blk = vec![0u8; 0x100];
+    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    blk[4..12].copy_from_slice(b"freeGPS ");
+    blk[60] = b'A';
+    blk[68] = b'N';
+    blk[76] = b'W';
+    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
+    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
+    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
+    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
+    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
+    // freeGPS lat 4737.7053 ⇒ 47.628..., lon 12209.901 ⇒ -122.165... (W).
+    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
+    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+
+    // Layout = ftyp || mdat(freeGPS-block + >=0x8000 pad) || gps0 || moov(mvhd).
+    // The padding makes the scan window a full GPS block (the oracle's
+    // `last if length $buff < $gpsBlockSize` guard, QuickTimeStream.pl:3756).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = blk.clone();
+    mdat_payload.extend_from_slice(&[0u8; 0x8000]);
+    let mdat = atom(b"mdat", &mdat_payload);
+
+    // A top-level `gps0` box: one valid 32-byte LE record (Process_gps0). This
+    // populates `stream` via `FoundSomething` WITHOUT touching `FoundEmbedded`,
+    // so `stream.is_empty()` is false but `found_embedded` is false. Distinct
+    // coordinates from the buried freeGPS block: the `gps0` binary variant has
+    // no N/S/E/W sign bytes, so lat 3000.0 ⇒ +30.0, lon 10000.0 ⇒ +100.0.
+    let mut rec = vec![0u8; 32];
+    rec[0..8].copy_from_slice(&3000.0f64.to_le_bytes()); // lat 30deg00.0'
+    rec[8..16].copy_from_slice(&10000.0f64.to_le_bytes()); // lon 100deg00.0'
+    rec[0x10..0x14].copy_from_slice(&50i32.to_le_bytes()); // altitude
+    rec[0x14..0x16].copy_from_slice(&42u16.to_le_bytes()); // speed
+    rec[0x16..0x1c].copy_from_slice(&[24, 1, 7, 11, 19, 14]); // y m d H M S
+    rec[0x1c] = 10; // track/2
+    let gps0 = atom(b"gps0", &rec);
+
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let moov = atom(b"moov", &mvhd);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&gps0);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let samples = meta.stream().gps_samples();
+    // BOTH sources extracted: the `gps0` record AND the scanned freeGPS block.
+    // (Pre-fix: only the `gps0` sample — the scan was wrongly suppressed.)
+    assert_eq!(
+      samples.len(),
+      2,
+      "the gps0 sample must NOT suppress the mdat scan of the buried freeGPS block"
+    );
+    // The freeGPS block contributes its distinctive ~47.6N / ~122.2W fix.
+    assert!(
+      samples
+        .iter()
+        .any(|s| s.latitude().is_some_and(|v| (47.0..48.0).contains(&v))
+          && s.longitude().is_some_and(|v| (-123.0..-122.0).contains(&v))),
+      "the buried freeGPS fix (~47.6N, ~122.2W) must be present"
+    );
+    // The `gps0` record's own ~30N / ~100E fix is still there too.
+    assert!(
+      samples
+        .iter()
+        .any(|s| s.latitude().is_some_and(|v| (29.0..31.0).contains(&v))),
+      "the gps0 sample (~30N) must also be present"
     );
   }
 

@@ -430,17 +430,37 @@ pub struct FreeGpsState {
   /// record offset (within the previous block) of that most-recent record, so
   /// the next block can skip everything older than it.
   atc_recent_rec_pos: Option<usize>,
+  /// `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650) — set TRUE the moment
+  /// [`process_free_gps`] decodes a `freeGPS ` block (i.e. `ProcessFreeGPS` is
+  /// entered on a block long enough to clear the `dirLen < 82` guard). It is
+  /// the SOLE gate ExifTool uses to skip the brute-force `mdat` scan
+  /// (`ScanMediaData`, QuickTimeStream.pl:3689 `return if $$et{FoundEmbedded}`)
+  /// — NOT the per-sample `FoundSomething` output (QuickTimeStream.pl:967-973),
+  /// which emits the `gps0`/`gsen`/`GPS `/`3gf`/`mebx` samples WITHOUT touching
+  /// `FoundEmbedded`. So a file with such a timed-metadata stream PLUS a
+  /// `freeGPS ` block buried in `mdat` still gets the buried block scanned.
+  found_embedded: bool,
 }
 
 impl FreeGpsState {
-  /// Fresh state — no ATC record decoded yet.
+  /// Fresh state — no ATC record decoded yet, `FoundEmbedded` clear.
   #[inline]
   #[must_use]
   pub const fn new() -> Self {
     Self {
       atc_then: None,
       atc_recent_rec_pos: None,
+      found_embedded: false,
     }
+  }
+
+  /// `$$et{FoundEmbedded}` — `true` once a `freeGPS ` block was decoded by
+  /// [`process_free_gps`]. The caller threads this into [`scan_media_data`]'s
+  /// `already_found_embedded` to mirror QuickTimeStream.pl:3689.
+  #[inline]
+  #[must_use]
+  pub const fn found_embedded(&self) -> bool {
+    self.found_embedded
   }
 }
 
@@ -493,10 +513,18 @@ pub fn process_free_gps(
   state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
 ) {
-  // QuickTimeStream.pl:1645
+  // QuickTimeStream.pl:1645 `return 0 if $dirLen < 82` — too short to carry any
+  // fingerprint; bails BEFORE the FoundEmbedded flag is set (:1650), so such a
+  // runt does NOT suppress the `mdat` scan.
   if data.len() < 82 {
     return;
   }
+  // QuickTimeStream.pl:1650 `$$et{FoundEmbedded} = 1` — set the moment a
+  // freeGPS block reaches the decoder (whether or not THIS block yields a
+  // sample), exactly where the Perl sets it: after the `< 82` guard, before
+  // any variant dispatch. This — not per-sample `FoundSomething` output — is
+  // what gates `ScanMediaData` (:3689); see [`FreeGpsState::found_embedded`].
+  state.found_embedded = true;
   // QuickTimeStream.pl:1649 SetByteOrder('II') — every variant reads LE
   // unless it explicitly switches.
 

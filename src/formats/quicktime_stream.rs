@@ -1807,19 +1807,29 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// freeGPS Type-17b Rexing scaling in [`quicktime_freegps::process_free_gps`]
 /// for the `moov`-level `gps ` offset-box path.
 ///
-/// Returns an empty [`QuickTimeStreamMeta`] for the common case of a video
-/// with no timed metadata (or only deferred-format metadata).
+/// Returns the decoded [`QuickTimeStreamMeta`] (empty for the common case of a
+/// video with no timed metadata) plus the `FoundEmbedded` flag — `true` iff a
+/// `moov`-level `gps ` offset box actually dispatched a `freeGPS ` block into
+/// [`quicktime_freegps::process_free_gps`] (ExifTool's `$$et{FoundEmbedded}`,
+/// QuickTimeStream.pl:1650). The caller threads that flag into
+/// [`quicktime_freegps::scan_media_data`] so the brute-force `mdat` scan is
+/// suppressed ONLY by a real freeGPS decode — NOT by a `gps0`/`gsen`/`GPS `/
+/// `3gf`/`mebx` timed-metadata sample (those set no `FoundEmbedded`, so a file
+/// carrying one of them PLUS a buried `freeGPS ` block is still scanned;
+/// QuickTimeStream.pl:967-973 vs :3689).
 #[must_use]
 pub(crate) fn extract_stream(
   data: &[u8],
   create_date_raw: Option<u64>,
   kodak_version: Option<&str>,
-) -> QuickTimeStreamMeta {
+) -> (QuickTimeStreamMeta, bool) {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
-  // `moov`-level `gps ` offset box (QuickTimeStream.pl:2058). The brute-force
-  // `ScanMediaData` keeps its own instance (the two paths are mutually
-  // exclusive: a `gps `-box decode populates `out`, which gates the scan).
+  // `moov`-level `gps ` offset box (QuickTimeStream.pl:2058). It ALSO carries
+  // `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650), set iff a `gps `-box block
+  // is decoded — the gate returned to the caller for the `mdat` scan. The
+  // brute-force `ScanMediaData` keeps its own instance (its
+  // `process_free_gps` calls flip that throwaway flag inertly).
   let mut free_gps_state = FreeGpsState::new();
   // Walk the TOP-LEVEL atoms. `moov` carries the metadata `trak`s + the
   // `moov`-level `gps ` box; the `gps0`/`gsen`/`GPS ` magic boxes are
@@ -1859,7 +1869,11 @@ pub(crate) fn extract_stream(
     }
     pos = next;
   }
-  out
+  // `free_gps_state.found_embedded()` is `$$et{FoundEmbedded}` after the moov
+  // walk: `true` iff a `gps `-box block reached `process_free_gps`. This — not
+  // `out.is_empty()` — is what must gate the `mdat` scan (QuickTimeStream.pl:3689).
+  let found_embedded = free_gps_state.found_embedded();
+  (out, found_embedded)
 }
 
 /// Decode the `moov`-level Novatek `gps ` box — the offset TABLE that
@@ -2548,8 +2562,10 @@ mod tests {
     let moov = atom(b"moov", &mvhd);
     let mut data = ftyp;
     data.extend_from_slice(&moov);
-    let meta = extract_stream(&data, None, None);
+    let (meta, found_embedded) = extract_stream(&data, None, None);
     assert!(meta.is_empty());
+    // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
+    assert!(!found_embedded);
   }
 
   /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box
@@ -2600,12 +2616,15 @@ mod tests {
     data.extend_from_slice(&blk); // freeGPS block at offset = block_offset
     data.extend_from_slice(&moov);
 
-    let meta = extract_stream(&data, None, None);
+    let (meta, found_embedded) = extract_stream(&data, None, None);
     assert_eq!(
       meta.gps_samples().len(),
       1,
       "the moov-level gps ' offset table must decode the out-of-mdat block"
     );
+    // The `gps `-box decode dispatched a freeGPS block ⇒ FoundEmbedded set
+    // (this is exactly the signal that suppresses a redundant `mdat` scan).
+    assert!(found_embedded);
     let s = &meta.gps_samples()[0];
     assert!(s.has_coordinates());
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
@@ -2687,11 +2706,15 @@ mod tests {
     data.extend_from_slice(&blk);
     data.extend_from_slice(&moov);
 
-    let meta = extract_stream(&data, None, None);
+    let (meta, found_embedded) = extract_stream(&data, None, None);
     assert!(
       meta.is_empty(),
       "a gps '-HandlerType trak must yield no embedded GPS (ExifTool ignores it)"
     );
+    // The track is ignored ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays
+    // false ⇒ the brute-force `mdat` scan is NOT suppressed (it runs at the
+    // pipeline level — see `gps_handler_track_does_not_suppress_mdat_scan`).
+    assert!(!found_embedded);
   }
 
   // NOTE: the Type-19 (70mai A810) SampleTime → `GPSDateTime` threading is
