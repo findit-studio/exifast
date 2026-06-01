@@ -239,6 +239,9 @@ thiserror   = { version = "2", default-features = false }
 # `serde_json` is a normal (optional) dependency above; under the `json`
 # feature it is in scope for tests too. Not duplicated here.
 tempfile = "3"
+# Golden-v2 Contract 3b — randomized no-panic gate over the public parse
+# entry points (`tests/no_panic.rs`). Dev-only; no runtime/feature impact.
+proptest = "1"
 
 [profile.bench]
 opt-level = 3
