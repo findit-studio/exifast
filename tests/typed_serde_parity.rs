@@ -207,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_271() {
+fn typed_serde_path_equals_writer_path_and_golden_all_272() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -915,12 +915,23 @@ fn typed_serde_path_equals_writer_path_and_golden_all_271() {
   // `Canon::Validate` length check), AND a `TimeStamp` (0x180e) with a
   // FRACTIONAL `TimeZoneCode` (19800 ⇒ 5.5 via the FLOAT `$val/3600`). Verified
   // via `perl exiftool -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
+  // 271 → 272 after the CRW SubDirectory read-gate fix (`CanonRaw.pm:707-709`:
+  // a record whose tag has a `SubDirectory` is read REGARDLESS of size):
+  // `CanonRaw_whitesample_big.crw` — a CRAFTED Composite-free CIFF heap whose
+  // `WhiteSample` (0x1030) block is 600 bytes (> the 512 read threshold), with
+  // the named fields up front and a 482-byte arbitrary "encrypted" tail
+  // (`CanonRaw.pm:598`). Before the fix the 600-byte block was dropped to a
+  // `(Binary data 600 bytes)` placeholder, losing every WhiteSample named tag;
+  // the oracle (and now the port) read the full block. The golden CONTAINS the
+  // WhiteSample* + `BlackLevels` tags, proving the >512 SubDirectory block was
+  // read. Verified via `perl exiftool -G1 -j`/`-n` to carry only File:/
+  // CanonRaw: keys.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    271,
-    "expected exactly the 271 active conformance fixtures, found {}: {:?}",
+    272,
+    "expected exactly the 272 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

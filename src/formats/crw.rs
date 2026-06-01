@@ -357,26 +357,51 @@ fn process_canon_raw(
         .get(pt + 2..pt + 2 + 8)
         .map_or_else(Vec::new, <[u8]>::to_vec);
     } else {
-      // `$valueDataPos = $ptr` (`CanonRaw.pm:701`). Read the value when `size
-      // <= 512` OR it is a SubDirectory/requested (`CanonRaw.pm:706-731`). For
-      // a value LARGER than 512 with a tagInfo, bundled renders `"Binary data
-      // $size bytes"` (the placeholder). We mirror: small ⇒ read the bytes;
-      // large ⇒ keep the byte count for the placeholder. (`size` is the
-      // on-disk length here, NOT clamped to 8 — that clamp is the
-      // value-in-dir branch only, `CanonRaw.pm:695`.)
-      if size <= 512 {
+      // `$valueDataPos = $ptr` (`CanonRaw.pm:701`). The bundled read gate
+      // (`CanonRaw.pm:707-709`):
+      //
+      // ```perl
+      // if ($size <= 512 or ($verbose > 2 and $size <= 65536)
+      //     or ($tagInfo and ($$tagInfo{SubDirectory}
+      //     or grep(/^$$tagInfo{Name}$/i, $et->GetRequestedTags()) )))
+      // ```
+      //
+      // reads the value bytes when `size <= 512` OR the tag has a
+      // `SubDirectory` (the "or if this is a SubDirectory" clause) OR the tag
+      // was specifically requested. We have no `-verbose`/requested-tags
+      // surface (those only widen WHICH large binary LEAVES get read for `-b`),
+      // so the faithful gate is `size <= 512 || is_subdirectory_tag(tag_id)`.
+      //
+      // A SubDirectory record whose block exceeds 512 bytes (the concrete real
+      // case is `WhiteSample` 0x1030 — its named fields are "followed by the
+      // encrypted white sample values", `CanonRaw.pm:598`, so the block can run
+      // long while the named tags all live in the first ~118 bytes) MUST be
+      // read in full: the sub-table extracts its named tags from the front.
+      // Dropping it to the `(Binary data N bytes)` placeholder loses those tags.
+      //
+      // A NON-SubDirectory record larger than 512 (the binary LEAVES `RawData`
+      // 0x2005 / `JpgFromRaw` 0x2007 / `ThumbnailImage` 0x2008,
+      // `CanonRaw.pm:716-728`) keeps the placeholder. (`size` is the on-disk
+      // length here, NOT clamped to 8 — that clamp is the value-in-dir branch
+      // only, `CanonRaw.pm:695`.)
+      if size <= 512 || is_subdirectory_tag(tag_id) {
+        // ExifTool's read is file-bounded: `Read($value,$size) == $size` fails
+        // when the block runs past EOF, hitting `Warn("Error reading … bytes")`
+        // + `next` (`CanonRaw.pm:712-715`). We mirror with a bounded slice —
+        // the SubDirectory read is NOT capped below the real data (faithfulness
+        // = read the whole subdir value), only bounded by the bytes physically
+        // present.
         let Some(v) = data.get(ptr..ptr + size) else {
-          // `Warn("Error reading … bytes")` + `next` (`CanonRaw.pm:712`).
           continue;
         };
         value = v.to_vec();
       } else {
-        // Large value (`CanonRaw.pm:716-728`): bundled emits the
-        // `(Binary data N bytes, …)` placeholder. We synthesize a zero-filled
-        // `Vec` of length `size` so the [`crate::value::TagValue::Bytes`]
-        // placeholder reports the right byte count without copying the
-        // (potentially multi-MB) payload. The bytes themselves are never
-        // emitted (no `-b`), so their content is irrelevant.
+        // Large binary LEAF (`CanonRaw.pm:716-728`): bundled emits the
+        // `(Binary data N bytes, …)` placeholder. We carry only the byte count
+        // so the [`crate::value::TagValue::Bytes`] placeholder reports the
+        // right length without copying the (potentially multi-MB) payload. The
+        // bytes themselves are never emitted (no `-b`), so their content is
+        // irrelevant.
         emit_record(
           meta,
           tag_id,
@@ -390,6 +415,48 @@ fn process_canon_raw(
 
     emit_record(meta, tag_id, RecordValue::Bytes(value), order, dir_name);
   }
+}
+
+/// `$$tagInfo{SubDirectory}` for a `%CanonRaw::Main` VALUE record — the read
+/// gate's "or if this is a SubDirectory" clause (`CanonRaw.pm:707-709`,
+/// commented "or if this is a SubDirectory", `:711-712`). A record whose tag
+/// carries a `SubDirectory` is read REGARDLESS of size; its sub-table then
+/// extracts the named tags from the front of the (possibly long) block.
+///
+/// This is the SINGLE source of truth for the gate: it enumerates EVERY
+/// `%CanonRaw::Main` tag that reaches the value branch (i.e. NOT a `tagType`
+/// 0x28/0x30 raw-HEAP subdir — those `0x2804`/`0x2807`/`0x300a`/… containers
+/// take the recurse arm at `process_canon_raw` above, `CanonRaw.pm:659-682`,
+/// and never hit this gate) AND carries a `SubDirectory`. Cross-checked against
+/// `%Image::ExifTool::CanonRaw::Main` (`CanonRaw.pm:166-345`); see the bundled
+/// `grep` in the commit. Each entry below is also dispatched by [`emit_record`]
+/// (the `0x1029/0x102a/0x102d/0x1031/0x1038/0x1093/0x10a9` Canon sub-table map)
+/// or [`emit_scalar`] (the `0x080a` MakeModel + the `0x1803/0x180e/0x1810/
+/// 0x1813/0x1818/0x1835/0x10b5/0x1030` structural sub-tables); keep this list
+/// and those dispatch arms in lock-step.
+///
+/// `0x1033 CustomFunctions` is a `SubDirectory` in bundled (so it IS read
+/// regardless of size, `CanonRaw.pm:154-165`) but its sub-table (`CanonCustom`)
+/// is a PORT-WIDE deferral (#87) — the port does not dispatch it, so whether
+/// its block is read or placeholdered is OBSERVATIONALLY identical. We still
+/// list it so the gate stays a faithful mirror of `$$tagInfo{SubDirectory}`
+/// (reading-then-ignoring is exactly bundled's behavior when no consumer
+/// extracts the block), and so a future #87 port needs no gate change.
+#[inline]
+const fn is_subdirectory_tag(tag_id: u16) -> bool {
+  matches!(
+    tag_id,
+    // MakeModel (string sub-table → Make/Model).
+    0x080a
+      // Canon::* MakerNote sub-tables (the CRW_SUBDIR dispatch in emit_record).
+      | 0x1029 | 0x102a | 0x102d | 0x1031 | 0x1038 | 0x1093 | 0x10a9
+      // CanonCustom (deferred #87 — read-then-ignore, faithful to bundled).
+      | 0x1033
+      // Structural CanonRaw sub-tables (the emit_scalar arms).
+      | 0x1803 | 0x180e | 0x1810 | 0x1813 | 0x1818 | 0x1835 | 0x10b5
+      // WhiteSample (the >512 real case — named fields + encrypted tail).
+      | 0x1030
+  )
 }
 
 /// A decoded CIFF record value handed to [`emit_record`].
@@ -1918,6 +1985,94 @@ mod tests {
       find_tag(&t, "BlackLevels"),
       Some(TagValue::Str("128 129 130".into()))
     );
+  }
+
+  /// The SubDirectory read-gate fix (`CanonRaw.pm:707-709`): a record whose tag
+  /// has a `SubDirectory` is read REGARDLESS of size — so a `WhiteSample`
+  /// (0x1030) block LARGER than the 512-byte threshold keeps its named tags
+  /// (they live in the first ~118 bytes; the rest is the "encrypted white
+  /// sample values" tail, `CanonRaw.pm:598`). Before the fix the >512 block was
+  /// dropped to a `(Binary data N bytes)` placeholder and ALL named tags were
+  /// lost. This is the focused unit guard for the gap.
+  #[test]
+  fn white_sample_over_512_keeps_named_tags() {
+    use crate::emit::ConvMode;
+    // A 600-byte block (> the 512-byte read threshold): offset-0 length word =
+    // 600 (Canon::Validate), named fields up front, the rest an arbitrary
+    // non-zero "encrypted" tail.
+    const S: usize = 600;
+    let mut ws = std::vec![0u8; S];
+    let set =
+      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    set(&mut ws, 0, S as u16); // Validate: first u16 == block byte size
+    set(&mut ws, 2, 4096); // WhiteSampleWidth (pos1)
+    set(&mut ws, 4, 3072); // WhiteSampleHeight (pos2)
+    set(&mut ws, 6, 11); // WhiteSampleLeftBorder (pos3)
+    set(&mut ws, 8, 19); // WhiteSampleTopBorder (pos4)
+    set(&mut ws, 10, 14); // WhiteSampleBits (pos5)
+    set(&mut ws, 110, 128); // BlackLevels[0] (pos 0x37, offset 110)
+    set(&mut ws, 112, 129);
+    set(&mut ws, 114, 130);
+    set(&mut ws, 116, 131); // all 4 words present ⇒ "128 129 130 131"
+    for (i, b) in ws.iter_mut().enumerate().skip(118) {
+      *b = (i % 251) as u8; // arbitrary "encrypted" tail
+    }
+    let mut root = HeapBuilder::new();
+    root.add_value(0x1030, &ws);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+
+    // The >512 SubDirectory block was READ (not placeholdered) ⇒ the typed
+    // WhiteSample is populated and every named tag is emitted.
+    assert!(
+      m.white_sample().is_some(),
+      "the >512-byte WhiteSample block must be read, not dropped to a placeholder"
+    );
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(find_tag(&t, "WhiteSampleWidth"), Some(TagValue::U64(4096)));
+    assert_eq!(find_tag(&t, "WhiteSampleHeight"), Some(TagValue::U64(3072)));
+    assert_eq!(
+      find_tag(&t, "WhiteSampleLeftBorder"),
+      Some(TagValue::U64(11))
+    );
+    assert_eq!(
+      find_tag(&t, "WhiteSampleTopBorder"),
+      Some(TagValue::U64(19))
+    );
+    assert_eq!(find_tag(&t, "WhiteSampleBits"), Some(TagValue::U64(14)));
+    assert_eq!(
+      find_tag(&t, "BlackLevels"),
+      Some(TagValue::Str("128 129 130 131".into()))
+    );
+    // And the block must NOT have produced a `RawData`/binary placeholder.
+    assert!(m.binary_records().is_empty());
+  }
+
+  /// A LARGE NON-SubDirectory binary LEAF (`RawData` 0x2005) is still rendered
+  /// as the `(Binary data N bytes)` placeholder — the read-gate fix must NOT
+  /// widen the read to plain binary leaves (`CanonRaw.pm:716-728`). Confirms the
+  /// `is_subdirectory_tag` predicate excludes 0x2005/0x2007/thumbnail.
+  #[test]
+  fn large_binary_leaf_still_placeholdered() {
+    // A 4096-byte RawData block (> 512). It is NOT a SubDirectory, so it must
+    // keep the placeholder (only the byte count is retained).
+    let blk = std::vec![0xabu8; 4096];
+    let mut root = HeapBuilder::new();
+    root.add_value(0x2005, &blk); // RawData (binary leaf)
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    // No bytes copied — only the (name, len) placeholder record.
+    assert_eq!(m.binary_records().len(), 1);
+    assert_eq!(m.binary_records()[0].0.as_str(), "RawData");
+    assert_eq!(m.binary_records()[0].1, 4096);
+    // The predicate itself: leaves are NOT SubDirectory; the dispatched sub-
+    // tables ARE.
+    assert!(!is_subdirectory_tag(0x2005));
+    assert!(!is_subdirectory_tag(0x2007));
+    assert!(!is_subdirectory_tag(0x2008));
+    assert!(is_subdirectory_tag(0x1030)); // WhiteSample
+    assert!(is_subdirectory_tag(0x102d)); // CameraSettings
+    assert!(is_subdirectory_tag(0x080a)); // MakeModel
   }
 
   /// `WhiteSample` `Canon::Validate` gate (`Canon.pm:10322-10333`): a block

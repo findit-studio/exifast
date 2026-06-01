@@ -1,0 +1,15 @@
+[{
+  "SourceFile": "CanonRaw_whitesample_big.crw",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "CRW",
+  "File:FileTypeExtension": "crw",
+  "File:MIMEType": "image/x-canon-crw",
+  "CanonRaw:Make": "Canon",
+  "CanonRaw:Model": "Canon EOS D60",
+  "CanonRaw:WhiteSampleWidth": 4096,
+  "CanonRaw:WhiteSampleHeight": 3072,
+  "CanonRaw:WhiteSampleLeftBorder": 11,
+  "CanonRaw:WhiteSampleTopBorder": 19,
+  "CanonRaw:WhiteSampleBits": 14,
+  "CanonRaw:BlackLevels": "128 129 130 131"
+}]

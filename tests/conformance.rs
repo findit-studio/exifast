@@ -153,6 +153,36 @@ fn crw_omitted_records_conformance() {
 }
 
 #[test]
+fn crw_whitesample_big_conformance() {
+  // The SubDirectory read-gate fix (`CanonRaw.pm:707-709`: a record whose tag
+  // has a `SubDirectory` is read REGARDLESS of size). `WhiteSample` (0x1030) is
+  // the concrete real case — its named fields (`WhiteSampleWidth`/`Height`/
+  // `LeftBorder`/`TopBorder`/`Bits` + `BlackLevels`) are "followed by the
+  // encrypted white sample values" (`CanonRaw.pm:598`), so a real block can
+  // exceed 512 bytes while every named tag lives in the first ~118 bytes.
+  //
+  // `tests/fixtures/CanonRaw_whitesample_big.crw` is a CRAFTED Composite-free
+  // CIFF heap (verified via `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY
+  // File:/CanonRaw: keys — no Composite/XMP) whose WhiteSample block is 600
+  // bytes (offset-0 length word = 600 so the `Canon::Validate` gate passes),
+  // with the named fields up front and a 482-byte arbitrary "encrypted" tail.
+  // Before the fix the 600-byte block tripped `size > 512` and was dropped to a
+  // `(Binary data 600 bytes)` placeholder, losing the named tags; the oracle
+  // (and now the port) read the full block and extract them. The goldens
+  // CONTAIN the WhiteSample named tags, proving the >512 block was read.
+  check(
+    "CanonRaw_whitesample_big.crw",
+    "CanonRaw_whitesample_big.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_whitesample_big.crw",
+    "CanonRaw_whitesample_big.crw.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal
