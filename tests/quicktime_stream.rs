@@ -698,10 +698,15 @@ fn build_mov_with_freegps_in_mdat() -> Vec<u8> {
   block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes()); // day
   block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes()); // lat
   block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes()); // lon
-  // mdat payload = 64 bytes pad + block + 64 bytes pad.
+  // mdat payload = 64 bytes pad + block + padding past 0x8000.
+  // ExifTool bails a sub-0x8000 FINAL chunk WITHOUT decoding (`last if
+  // length $buff < $gpsBlockSize`, QuickTimeStream.pl:3750), so the block must
+  // be found in a full 0x8000-byte chunk — pad the `mdat` accordingly (this
+  // matches a real dashcam, whose first freeGPS block sits in an early full
+  // chunk; a sub-0x8000 mdat yields NO GPS, oracle-verified).
   let mut mdat_payload = vec![0u8; 64];
   mdat_payload.extend_from_slice(&block);
-  mdat_payload.extend_from_slice(&[0u8; 64]);
+  mdat_payload.extend_from_slice(&vec![0u8; 0x9000]);
   let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
   mdat.extend_from_slice(b"mdat");
   mdat.extend_from_slice(&mdat_payload);

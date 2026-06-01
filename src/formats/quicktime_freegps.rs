@@ -229,6 +229,17 @@ pub fn scan_media_data(
       let abs = search_off + hit.offset;
       match hit.kind {
         MagicKind::FreeGps => {
+          // QuickTimeStream.pl:3750 `last if length $buff < $gpsBlockSize` — a
+          // freeGPS magic found in a sub-0x8000-byte chunk (only possible in
+          // the FINAL partial chunk, since `chunk` already includes the 12-byte
+          // cross-chunk carry) is NOT decoded: ExifTool bails the whole scan
+          // here, BEFORE reading the block length or dispatching. Mirror that —
+          // but only for a partial final chunk; a block straddling two FULL
+          // 0x8000 chunks is found in a full chunk (`chunk.len()` == 0x8000) and
+          // handled by the buffer-extend path below (R1).
+          if chunk.len() < GPS_BLOCK_SIZE {
+            return;
+          }
           // The match's first byte (the `\0`) is 4 bytes BEFORE the literal
           // "freeGPS " — read the box length from the 4 BE bytes at the
           // match start. QuickTimeStream.pl:3764 `my $len = unpack('N', $buff)`.
@@ -303,11 +314,13 @@ pub fn scan_media_data(
     if chunk.len() <= 12 {
       break;
     }
-    // QuickTimeStream.pl:3715: in all samples, the first freeGPS block is
-    // within the first 2 MB of mdat — limit the scan to the first 20 MB
-    // when nothing has been found yet.
+    // QuickTimeStream.pl:3713-3715 `next if $found or $pos < 20e6 or $ee > 1;
+    // last`: in all samples the first freeGPS block is within ~2 MB of the start
+    // of mdat, so when nothing has been found yet the scan stops once `pos`
+    // reaches the first 20 MB. The cutoff is `20e6` (= 20_000_000 decimal), NOT
+    // `20 * 1024 * 1024`.
     let next = pos + chunk.len() - 12;
-    if !found && next >= 20 * 1024 * 1024 {
+    if !found && next >= 20_000_000 {
       break;
     }
     pos = next;
@@ -522,9 +535,12 @@ pub fn process_free_gps(
 
   // GPSType 6: Akaso dashcam (QuickTimeStream.pl:1906-1938).
   // Detected by `A\0\0\0....[NS]\0\0\0....[EW]\0\0\0` at offsets 60..79.
-  // Per QuickTimeStream.pl:1906 `^.{60}A\0{3}.{4}([NS])\0{3}.{4}([EW])\0{3}`.
-  if data.len() >= 88
-    && data.get(60).copied() == Some(b'A')
+  // Per QuickTimeStream.pl:1906 `^.{60}A\0{3}.{4}([NS])\0{3}.{4}([EW])\0{3}` —
+  // the regex references bytes only through offset 79, so 80 bytes is the true
+  // minimum (the global `< 82` gate already covers it). The previous explicit
+  // `>= 88` gate would mis-route an 80..87-byte Akaso block to a later arm; the
+  // bounded `.get()` detection + zero-filling `le_*` decode reads match Perl.
+  if data.get(60).copied() == Some(b'A')
     && data.get(61..64) == Some(&[0, 0, 0])
     && matches!(data.get(68), Some(&b'N' | &b'S'))
     && data.get(69..72) == Some(&[0, 0, 0])
@@ -544,22 +560,34 @@ pub fn process_free_gps(
 
   // GPSType 8: Akaso V1 / Redtiger F7N (QuickTimeStream.pl:1961-1996).
   // Encrypted lat/lon (NC); detected by a date+flag pattern at offset 64.
-  if data.len() >= 0x70 && detect_type8(data) {
+  // Detection is the bundled regex alone (QuickTimeStream.pl:1961, which
+  // references bytes through offset 79); the dispatch carries NO extra
+  // minimum-length gate — `detect_type8` bounds its own reads, and the
+  // decoder's `le_*` reads zero-fill the tail like Perl's `unpack`/`Get*`.
+  if detect_type8(data) {
     decode_type8_akaso_v1(data, out);
     return;
   }
 
   // GPSType 9: EACHPAI — DEFERRED (encryption unknown).
-  // (QuickTimeStream.pl:1998-2019). ExifTool emits a warning and stops.
-  if data.len() >= 0x10 && be_u32(data, 0x0c) == Some(0xac) {
+  // Bundled regex `/^.{12}\xac\0\0\0.{44}(.{72})/s` (QuickTimeStream.pl:1998):
+  // byte 0x0c == 0xac followed by THREE NUL bytes (a little-endian `ac 00 00
+  // 00`). The port previously read `be_u32(0x0c) == 0xac` (= big-endian
+  // 0xac000000, always false); compare the raw bytes instead.
+  if data.get(0x0c).copied() == Some(0xac) && data.get(0x0d..0x10) == Some(&[0, 0, 0]) {
     // Faithful: `Can't yet decrypt EACHPAI timed GPS` — skip silently.
     return;
   }
 
   // GPSType 10: Vantrue S1 / horsontech (QuickTimeStream.pl:2021-2045).
-  // `A[NS][EW]\0` at offset 64.
-  if data.len() >= 0x80
-    && data.get(64).copied() == Some(b'A')
+  // Bundled regex `/^.{64}A([NS])([EW])\0/s` (QuickTimeStream.pl:2021) — `A`@64,
+  // `[NS]`@65, `[EW]`@66, `\0`@67: it references bytes only through offset 67,
+  // so 68 bytes is the true minimum (the port previously gated on `>= 0x80`,
+  // mis-routing a 68..0x80-byte Vantrue block to the Type-20 catch-all). The
+  // decoder's `le_*` reads zero-fill the tail like Perl's `unpack`/`GetFloat`,
+  // and its own `mon` 1..12 / `day` 1..31 guard (matching :2035) drops a
+  // too-short block before emitting.
+  if data.get(64).copied() == Some(b'A')
     && matches!(data.get(65), Some(&b'N' | &b'S'))
     && matches!(data.get(66), Some(&b'E' | &b'W'))
     && data.get(67).copied() == Some(0)
@@ -576,14 +604,18 @@ pub fn process_free_gps(
   }
 
   // GPSType 12: Type 2 80-byte (double lat/lon) (QuickTimeStream.pl:2159-2188).
-  // `A\0...[NS]\0...[EW]\0` at offsets 60/71/86.
+  // Bundled regex (QuickTimeStream.pl:2159):
+  //   `/^.{60}A\0.{10}([NS])\0.{14}([EW])\0/s and $dirLen >= 0x88`.
+  // So: `A`@60, `\0`@61, then 10 filler bytes, `[NS]`@72 (= data-layout
+  // `0x48` latitude-ref), `\0`@73, 14 filler bytes, `[EW]`@88 (= `0x58`
+  // longitude-ref), `\0`@89.
   if data.len() >= 0x88
     && data.get(60).copied() == Some(b'A')
     && data.get(61).copied() == Some(0)
-    && matches!(data.get(71), Some(&b'N' | &b'S'))
-    && data.get(72).copied() == Some(0)
-    && matches!(data.get(86), Some(&b'E' | &b'W'))
-    && data.get(87).copied() == Some(0)
+    && matches!(data.get(72), Some(&b'N' | &b'S'))
+    && data.get(73).copied() == Some(0)
+    && matches!(data.get(88), Some(&b'E' | &b'W'))
+    && data.get(89).copied() == Some(0)
   {
     decode_type12_double(data, out);
     return;
@@ -609,9 +641,12 @@ pub fn process_free_gps(
   }
 
   // GPSType 15: Vantrue N4 (QuickTimeStream.pl:2240-2263).
-  // `A` at offset 28 + [NS] at 40 + [EW] at 56.
-  if data.len() >= 0x60
-    && data.get(28).copied() == Some(b'A')
+  // Bundled regex `/^.{28}A.{11}([NS]).{15}([EW])/s` (QuickTimeStream.pl:2240)
+  // — `A`@28, `[NS]`@40, `[EW]`@56: it references bytes only through offset 56,
+  // so the detection has no `>= 0x60` precondition (the bounded `.get()` reads
+  // suffice; the previous `>= 0x60` gate would mis-route a 57..0x60-byte Vantrue
+  // N4 block to Type-20). Decode `le_f64`/`le_u32` reads zero-fill the tail.
+  if data.get(28).copied() == Some(b'A')
     && matches!(data.get(40), Some(&b'N' | &b'S'))
     && matches!(data.get(56), Some(&b'E' | &b'W'))
   {
@@ -620,9 +655,12 @@ pub fn process_free_gps(
   }
 
   // GPSType 16/17/17b/17c: Viofo A119S / IQS / Rexing / Transcend
-  // (QuickTimeStream.pl:2265-2352). `A[NS][EW]\0` at offset 72.
-  if data.len() >= 0x60
-    && data.get(72).copied() == Some(b'A')
+  // (QuickTimeStream.pl:2265-2352). Bundled regex `/^.{72}A[NS][EW]\0/s`
+  // (QuickTimeStream.pl:2265) — `A`@72, `[NS]`@73, `[EW]`@74, `\0`@75: it
+  // references bytes only through offset 75, so 76 (0x4c) is the true minimum
+  // (the previous `>= 0x60` gate would mis-route a 76..0x60-byte Viofo/IQS
+  // block to Type-20). Decode `le_*` reads zero-fill the tail like Perl.
+  if data.get(72).copied() == Some(b'A')
     && matches!(data.get(73), Some(&b'N' | &b'S'))
     && matches!(data.get(74), Some(&b'E' | &b'W'))
     && data.get(75).copied() == Some(0)
@@ -657,6 +695,20 @@ pub fn process_free_gps(
 /// `\$buff =~ /\d{N}/` — N ASCII decimal digits starting at `pos`.
 fn is_ascii_digits(b: &[u8], n: usize) -> bool {
   b.len() >= n && b[..n].iter().all(|&c| c.is_ascii_digit())
+}
+
+/// `$sec = '0' . $sec if defined $sec and $sec !~ /^\d{2}/`
+/// (QuickTimeStream.pl:2460) — pad the seconds string with a leading `0` when
+/// it does NOT begin with two ASCII digits (so `"8.5"` → `"08.5"`, `"5"` →
+/// `"05"`, but `"45"`/`"08.5"` are left as-is). NOT a `len < 2` test.
+fn pad_seconds(sec: &str) -> String {
+  let b = sec.as_bytes();
+  let starts_two_digits = b.len() >= 2 && b[0].is_ascii_digit() && b[1].is_ascii_digit();
+  if starts_two_digits {
+    sec.to_string()
+  } else {
+    alloc::format!("0{sec}")
+  }
 }
 
 /// Common path used by every variant that gathers `yr/mon/.../lat/lon/...`
@@ -714,9 +766,12 @@ impl FreeGpsTags {
   /// Common-tail emission — QuickTimeStream.pl:2455-2483. Validates month +
   /// day ranges and synthesizes GPSDateTime + applies ConvertLatLon.
   fn emit(self, out: &mut QuickTimeStreamMeta) {
-    // QuickTimeStream.pl:2455 `return 0 if defined $yr and ($mon < 1 or $mon > 12)`.
-    if let (Some(_yr), Some(mon)) = (self.yr, self.mon)
-      && !(1..=12).contains(&mon)
+    // QuickTimeStream.pl:2455 `return 0 if defined $yr and ($mon < 1 or $mon >
+    // 12)`. In Perl an undef `$mon` numifies to 0 in `$mon < 1`, so when `$yr`
+    // is defined but `$mon` is NOT, the `$mon < 1` (0 < 1) is true → bail.
+    // Mirror that: `yr = Some` with `mon = None` (treated as 0) also bails.
+    if let Some(_yr) = self.yr
+      && !self.mon.is_some_and(|m| (1..=12).contains(&m))
     {
       return;
     }
@@ -733,21 +788,13 @@ impl FreeGpsTags {
       if yr < 2000 {
         yr += 2000;
       }
-      let s = if sec.len() < 2 {
-        alloc::format!("0{sec}")
-      } else {
-        sec.to_string()
-      };
+      let s = pad_seconds(sec);
       Some(alloc::format!(
         "{yr:04}:{mon:02}:{day:02} {hr:02}:{min:02}:{s}Z"
       ))
     } else if let (Some(hr), Some(min), Some(sec)) = (self.hr, self.min, self.sec.as_deref()) {
       // QuickTimeStream.pl:2465-2467 — time-only GPSTimeStamp.
-      let s = if sec.len() < 2 {
-        alloc::format!("0{sec}")
-      } else {
-        sec.to_string()
-      };
+      let s = pad_seconds(sec);
       Some(alloc::format!("{hr:02}:{min:02}:{s}Z"))
     } else {
       None
@@ -976,15 +1023,19 @@ fn decode_type2_nextbase_nmea(data: &[u8], out: &mut QuickTimeStreamMeta) {
   // QuickTimeStream.pl:1732 `CameraDateTime` (the YYYYMMDDhhmmss at off 52) is
   // a separate tag the typed `GpsSample` does not carry — skipped, like
   // UserLabel/GPSSatellites/GPSDOP.
-  let s = core::str::from_utf8(data).unwrap_or("");
+  // QuickTimeStream.pl:1733/1740 run the NMEA regexes over the RAW block bytes
+  // (`$$dataPt`), NOT a decoded UTF-8 string — a Type-2 block always carries
+  // binary fields (box header, accel int32s), so a strict `from_utf8` would
+  // blank the whole search. Search the bytes directly and decode only the
+  // matched (ASCII) sentence.
   // QuickTimeStream.pl:1733 — `\$[A-Z]{2}RMC,…`: any 2-letter talker.
-  if let Some(rmc) = find_nmea_sentence(s, b"RMC") {
+  if let Some(rmc) = find_nmea_sentence(data, b"RMC") {
     parse_nmea_rmc(rmc, &mut t);
   }
   // QuickTimeStream.pl:1740-1745 — `\$[A-Z]{2}GGA,…`: altitude (+ lat/lon/time
   // when RMC did not provide a year). GPSSatellites/GPSDOP are not GpsSample
   // fields, so only the altitude is carried.
-  if let Some(gga) = find_nmea_sentence(s, b"GGA") {
+  if let Some(gga) = find_nmea_sentence(data, b"GGA") {
     parse_nmea_gga(gga, &mut t);
   }
   // Accelerometer (QuickTimeStream.pl:1746-1750): if GPS valid, read 3 ×
@@ -1000,11 +1051,14 @@ fn decode_type2_nextbase_nmea(data: &[u8], out: &mut QuickTimeStreamMeta) {
   t.emit(out);
 }
 
-/// Find an NMEA sentence `$<2 uppercase letters><type>,` anywhere in `s` and
-/// return the substring starting at the leading `$` (mirroring the bundled
-/// `\$[A-Z]{2}<type>,` match, which accepts any talker prefix).
-fn find_nmea_sentence<'a>(s: &'a str, kind: &[u8; 3]) -> Option<&'a str> {
-  let b = s.as_bytes();
+/// Find an NMEA sentence `$<2 uppercase letters><type>,` anywhere in the RAW
+/// block bytes and return the slice starting at the leading `$` (mirroring the
+/// bundled `\$[A-Z]{2}<type>,` match, which runs over `$$dataPt` and accepts
+/// any talker prefix). Operating on bytes — not a decoded UTF-8 string — is
+/// faithful: the bundled regex never decodes the buffer, so a non-ASCII byte
+/// elsewhere in the block must not blank the search (QuickTimeStream.pl:1733,
+/// 1740).
+fn find_nmea_sentence<'a>(b: &'a [u8], kind: &[u8; 3]) -> Option<&'a [u8]> {
   let mut i = 0usize;
   while i + 7 <= b.len() {
     if b[i] == b'$'
@@ -1013,19 +1067,75 @@ fn find_nmea_sentence<'a>(s: &'a str, kind: &[u8; 3]) -> Option<&'a str> {
       && b[i + 3..i + 6] == *kind
       && b[i + 6] == b','
     {
-      return s.get(i..);
+      return b.get(i..);
     }
     i += 1;
   }
   None
 }
 
-/// Parse a `$XXRMC,…` NMEA sentence into the `FreeGpsTags` accumulator.
-/// QuickTimeStream.pl:1733 (Type 2) / :1952 (Type 7) pattern.
-fn parse_nmea_rmc(s: &str, t: &mut FreeGpsTags) {
+/// Split a raw NMEA sentence (`$`…, possibly with a `*CC` checksum tail) into
+/// comma-separated byte fields, dropping the checksum tail. Each field is a raw
+/// byte slice; the per-field shape gates below decode the ASCII subset.
+fn nmea_fields(s: &[u8]) -> Vec<&[u8]> {
   // Drop the `*` checksum tail to simplify field splitting.
-  let s = s.split('*').next().unwrap_or(s);
-  let fields: Vec<&str> = s.split(',').collect();
+  let body = s.split(|&c| c == b'*').next().unwrap_or(s);
+  body.split(|&c| c == b',').collect()
+}
+
+/// Validate a byte field against the bundled `(\d+\.\d+)` NMEA lat/lon shape
+/// (one-or-more digits, a dot, one-or-more digits) and parse it as `f64`. Used
+/// for RMC/GGA lat & lon (QuickTimeStream.pl:1733/1740) — the bundled regex
+/// rejects an empty or integer-only field, so a bare `.parse::<f64>()` (which
+/// accepts `"5"`, `"+1"`, `"inf"`, …) would be too loose.
+fn nmea_decimal(field: &[u8]) -> Option<f64> {
+  let dot = field.iter().position(|&c| c == b'.')?;
+  if dot == 0 || dot + 1 >= field.len() {
+    return None; // need ≥1 int digit and ≥1 frac digit
+  }
+  if !field[..dot].iter().all(u8::is_ascii_digit)
+    || !field[dot + 1..].iter().all(u8::is_ascii_digit)
+  {
+    return None;
+  }
+  core::str::from_utf8(field).ok()?.parse::<f64>().ok()
+}
+
+/// Validate a byte field against the bundled `(-?\d+\.?\d*)` GGA-altitude shape
+/// (optional sign, ≥1 int digit, optional dot, optional frac) and parse it as
+/// `f64` (QuickTimeStream.pl:1740, capture `$11`). A bare `.parse::<f64>()`
+/// would accept `"+1"`, `".5"`, `"inf"`, `"nan"` — none of which the regex
+/// matches.
+fn nmea_signed_decimal(field: &[u8]) -> Option<f64> {
+  let rest = match field.first() {
+    Some(b'-') => &field[1..],
+    _ => field,
+  };
+  // `\d+\.?\d*`: ≥1 leading digit, then optional `.` + optional digits.
+  let int_end = rest.iter().take_while(|&&c| c.is_ascii_digit()).count();
+  if int_end == 0 {
+    return None;
+  }
+  let tail = &rest[int_end..];
+  let ok = match tail.first() {
+    None => true,                                           // `\d+`
+    Some(b'.') => tail[1..].iter().all(u8::is_ascii_digit), // `\d+\.\d*`
+    Some(_) => false,
+  };
+  if !ok {
+    return None;
+  }
+  core::str::from_utf8(field).ok()?.parse::<f64>().ok()
+}
+
+/// Parse a `$XXRMC,…` NMEA sentence (RAW bytes) into the `FreeGpsTags`
+/// accumulator. QuickTimeStream.pl:1733 (Type 2) / :1952 (Type 7) pattern. Both
+/// bundled regexes share this field layout; their lat/lon captures
+/// (`(\d+\.\d+)` vs `(\d*?\d{1,2}\.\d+)`) both accept exactly "digits-dot-
+/// digits", and both end with the date `(\d{2})(\d{2})(\d+)` (DD, MM, year of
+/// ANY length ≥1 — NOT exactly 6).
+fn parse_nmea_rmc(s: &[u8], t: &mut FreeGpsTags) {
+  let fields = nmea_fields(s);
   // Fields: 0=$RMC, 1=HHMMSS.sss, 2=A, 3=lat, 4=N/S, 5=lon, 6=E/W,
   //         7=spd(knots), 8=trk, 9=DDMMYY, 10..=A
   if fields.len() < 10 {
@@ -1038,83 +1148,188 @@ fn parse_nmea_rmc(s: &str, t: &mut FreeGpsTags) {
   // by rejecting any non-empty status other than `A`.
   if let Some(status) = fields.get(2).copied()
     && !status.is_empty()
-    && status != "A"
+    && status != b"A"
   {
     return;
   }
+  // `(\d{2})(\d{2})(\d+(\.\d*)?)` time — ≥6 leading digits (HH MM), then the
+  // seconds (`\d+(\.\d*)?`).
   if let Some(tm) = fields.get(1).copied()
     && tm.len() >= 6
-    && tm[..6].chars().all(|c| c.is_ascii_digit())
+    && tm[..6].iter().all(u8::is_ascii_digit)
   {
-    t.hr = tm[0..2].parse().ok();
-    t.min = tm[2..4].parse().ok();
-    let sec = &tm[4..];
-    t.sec = Some(sec.to_string());
+    t.hr = ascii_u32(&tm[0..2]);
+    t.min = ascii_u32(&tm[2..4]);
+    t.sec = core::str::from_utf8(&tm[4..]).ok().map(ToString::to_string);
   }
-  if let Some(lat) = fields.get(3).copied()
-    && let Ok(v) = lat.parse::<f64>()
-  {
+  // `(\d+\.\d+)` lat / lon (QuickTimeStream.pl:1733; Type-7 `(\d*?\d{1,2}\.\d+)`
+  // has the same digits-dot-digits acceptance set, :1952).
+  if let Some(v) = fields.get(3).copied().and_then(nmea_decimal) {
     t.lat = Some(v);
   }
-  if let Some(ns) = fields.get(4).copied()
-    && let Some(c) = ns.chars().next()
-    && (c == 'N' || c == 'S')
-  {
+  if let Some(c) = fields.get(4).and_then(|f| ns_ref(f)) {
     t.lat_ref = Some(c);
   }
-  if let Some(lon) = fields.get(5).copied()
-    && let Ok(v) = lon.parse::<f64>()
-  {
+  if let Some(v) = fields.get(5).copied().and_then(nmea_decimal) {
     t.lon = Some(v);
   }
-  if let Some(ew) = fields.get(6).copied()
-    && let Some(c) = ew.chars().next()
-    && (c == 'E' || c == 'W')
-  {
+  if let Some(c) = fields.get(6).and_then(|f| ew_ref(f)) {
     t.lon_ref = Some(c);
   }
+  // `(\d*\.?\d*)` spd / trk — `length $9`/`length $10` gate (only set when the
+  // captured field is non-empty, QuickTimeStream.pl:1737-1738).
   if let Some(spd) = fields.get(7).copied()
     && !spd.is_empty()
-    && let Ok(v) = spd.parse::<f64>()
+    && let Some(v) = parse_ascii_f64(spd)
   {
     t.spd = Some(v * KNOTS_TO_KPH);
   }
   if let Some(trk) = fields.get(8).copied()
     && !trk.is_empty()
-    && let Ok(v) = trk.parse::<f64>()
+    && let Some(v) = parse_ascii_f64(trk)
   {
     t.trk = Some(v);
   }
+  // `(\d{2})(\d{2})(\d+)` date — DD, MM, then the year (`\d+`, any length ≥1).
   if let Some(date) = fields.get(9).copied()
-    && date.len() == 6
-    && date.chars().all(|c| c.is_ascii_digit())
+    && date.len() >= 5
+    && date.iter().all(u8::is_ascii_digit)
   {
-    t.day = date[0..2].parse().ok();
-    t.mon = date[2..4].parse().ok();
-    let yr_raw: i32 = date[4..6].parse().unwrap_or(0);
+    t.day = ascii_u32(&date[0..2]);
+    t.mon = ascii_u32(&date[2..4]);
+    let yr_raw: i32 = ascii_u32(&date[4..]).unwrap_or(0) as i32;
     // QuickTimeStream.pl:1735 `yr = $13 + ($13 >= 70 ? 1900 : 2000)`.
     t.yr = Some(yr_raw + if yr_raw >= 70 { 1900 } else { 2000 });
   }
 }
 
-/// Parse a `$XXGGA,…` NMEA sentence (QuickTimeStream.pl:1740-1745): extract
-/// altitude (field 9), and the time/lat/lon (fields 1-5) only when RMC did not
-/// already set a year. GPSSatellites/GPSDOP are not GpsSample fields.
-fn parse_nmea_gga(s: &str, t: &mut FreeGpsTags) {
-  let s = s.split('*').next().unwrap_or(s);
-  let fields: Vec<&str> = s.split(',').collect();
-  // 0=$GGA 1=time 2=lat 3=N/S 4=lon 5=E/W 6=fix 7=numSat 8=HDOP 9=alt 10=M
-  if fields.len() < 10 {
+/// Parse an all-ASCII-digit byte slice as `u32` (NMEA field helper).
+fn ascii_u32(b: &[u8]) -> Option<u32> {
+  core::str::from_utf8(b).ok()?.parse().ok()
+}
+
+/// Parse an ASCII byte slice as `i32` (Type-18 year, QuickTimeStream.pl:2366).
+fn ascii_i32(b: &[u8]) -> Option<i32> {
+  core::str::from_utf8(b).ok()?.parse().ok()
+}
+
+/// Trim trailing NUL bytes (`$$dataPt =~ s/\0+$//`, QuickTimeStream.pl:2367).
+fn trim_trailing_nuls(b: &[u8]) -> &[u8] {
+  let mut end = b.len();
+  while end > 0 && b[end - 1] == 0 {
+    end -= 1;
+  }
+  &b[..end]
+}
+
+/// Validate a string against `[-+]?\d+(\.\d+)?` (a signed-optional integer or
+/// `int.frac` decimal — NOT exponent / `inf` / `nan` / leading-dot) and parse
+/// it as `f64`. Used by the Type-18 KV value and as the basis for the bare
+/// speed gate (QuickTimeStream.pl:2371/2373).
+fn parse_signed_int_or_decimal(s: &str) -> Option<f64> {
+  let b = s.as_bytes();
+  let rest = match b.first() {
+    Some(b'+' | b'-') => &b[1..],
+    _ => b,
+  };
+  let int_end = rest.iter().take_while(|&&c| c.is_ascii_digit()).count();
+  if int_end == 0 {
+    return None; // `\d+` requires ≥1 int digit
+  }
+  let tail = &rest[int_end..];
+  let ok = match tail.first() {
+    None => true, // `\d+`
+    Some(b'.') => !tail[1..].is_empty() && tail[1..].iter().all(u8::is_ascii_digit), // `\.\d+`
+    Some(_) => false,
+  };
+  if !ok {
+    return None;
+  }
+  s.parse().ok()
+}
+
+/// QuickTimeStream.pl:2371 `^([A-Z]):([-+]?\d+(\.\d+)?)$/i` — a single
+/// ASCII-letter key (either case) and a signed-int-or-decimal value. Returns
+/// `(value, uppercase_key_char)` or `None` if the token does not match the
+/// whole pattern.
+fn parse_xgody_kv(tok: &str) -> Option<(f64, char)> {
+  let (k, v) = tok.split_once(':')?;
+  let mut kc = k.chars();
+  let ch = kc.next()?;
+  if kc.next().is_some() || !ch.is_ascii_alphabetic() {
+    return None; // key must be exactly one ASCII letter
+  }
+  let num = parse_signed_int_or_decimal(v)?;
+  // The Perl dispatch compares `$1` case-sensitively (`eq 'N'`, `eq 'x'`, …)
+  // against specific letters; `/i` only governs the regex MATCH, not the later
+  // `eq` tests. Preserve the original case so e.g. `n:..` matches none of the
+  // `eq 'N'`/`eq 'S'`/… arms (it becomes an Unknown_n tag in bundled).
+  Some((num, ch))
+}
+
+/// `^\d+\.\d+$` — unsigned digits-dot-digits only (the Type-18 bare-speed gate,
+/// QuickTimeStream.pl:2373).
+fn parse_plain_decimal(s: &str) -> Option<f64> {
+  let (int, frac) = s.split_once('.')?;
+  if int.is_empty() || frac.is_empty() {
+    return None;
+  }
+  if !int.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) {
+    return None;
+  }
+  s.parse().ok()
+}
+
+/// Parse an ASCII byte slice as `f64` (for `(\d*\.?\d*)` spd/trk fields, where
+/// the bundled `length $N` gate already excludes the empty case).
+fn parse_ascii_f64(b: &[u8]) -> Option<f64> {
+  core::str::from_utf8(b).ok()?.parse().ok()
+}
+
+/// `([NS])` — the field's first byte must be `N` or `S`.
+fn ns_ref(field: &[u8]) -> Option<char> {
+  match field.first() {
+    Some(&c @ (b'N' | b'S')) => Some(c as char),
+    _ => None,
+  }
+}
+
+/// `([EW])` — the field's first byte must be `E` or `W`.
+fn ew_ref(field: &[u8]) -> Option<char> {
+  match field.first() {
+    Some(&c @ (b'E' | b'W')) => Some(c as char),
+    _ => None,
+  }
+}
+
+/// Parse a `$XXGGA,…` NMEA sentence (RAW bytes, QuickTimeStream.pl:1740-1745):
+/// extract altitude (field 9), and the time/lat/lon (fields 1-5) only when RMC
+/// did not already set a year. GPSSatellites/GPSDOP are not GpsSample fields.
+fn parse_nmea_gga(s: &[u8], t: &mut FreeGpsTags) {
+  let fields = nmea_fields(s);
+  // 0=$GGA 1=time 2=lat 3=N/S 4=lon 5=E/W 6=fix 7=numSat 8=HDOP 9=alt 10=units.
+  // QuickTimeStream.pl:1740 — the bundled regex ends `…,(-?\d+\.?\d*)?,M?`: the
+  // altitude capture is followed by a LITERAL comma then an optional `M`. The
+  // regex is NOT anchored at the end, so the comma after the altitude must be
+  // present for ANY field to be captured — i.e. the units field (index 10) must
+  // EXIST. (A GGA whose altitude field is the last one, with no trailing comma,
+  // fails the whole regex → nothing copied; verified vs Perl.) So gate on ≥ 11
+  // fields. NOTE: `M?` is zero-width-optional, so the units field's CONTENT is
+  // unconstrained — `M`, ``, `F`, `ft` all match (also verified vs Perl); do
+  // NOT reject a non-`M` units field.
+  if fields.len() < 11 {
     return;
   }
   // QuickTimeStream.pl:1740 — the bundled regex gates the GGA fix-quality
-  // field (field 6) with `[1-6]?`: it matches ONLY a valid fix `1`..`6` or an
-  // empty field, so a no-fix `0` makes the whole GGA regex fail → nothing is
-  // copied (not even the otherwise-always-taken altitude in field 9). Mirror
-  // that by rejecting any other non-empty fix quality.
+  // field (field 6) with `[1-6]?` immediately followed by a literal comma: a
+  // no-fix `0` (or `7`) is not in `[1-6]`, so `[1-6]?` matches zero-width and
+  // the following `,` then fails against the digit → the whole GGA regex fails
+  // → nothing is copied (not even the altitude). Mirror that by rejecting any
+  // non-empty fix quality outside 1..6 (verified vs Perl: fix `0`/`7` → no
+  // match, `1`/empty → match).
   if let Some(fix) = fields.get(6).copied()
     && !fix.is_empty()
-    && !matches!(fix, "1" | "2" | "3" | "4" | "5" | "6")
+    && !matches!(fix, b"1" | b"2" | b"3" | b"4" | b"5" | b"6")
   {
     return;
   }
@@ -1122,41 +1337,34 @@ fn parse_nmea_gga(s: &str, t: &mut FreeGpsTags) {
   if t.yr.is_none() {
     if let Some(tm) = fields.get(1).copied()
       && tm.len() >= 6
-      && tm[..6].chars().all(|c| c.is_ascii_digit())
+      && tm[..6].iter().all(u8::is_ascii_digit)
     {
-      t.hr = tm[0..2].parse().ok();
-      t.min = tm[2..4].parse().ok();
-      t.sec = Some(tm[4..].to_string());
+      t.hr = ascii_u32(&tm[0..2]);
+      t.min = ascii_u32(&tm[2..4]);
+      t.sec = core::str::from_utf8(&tm[4..]).ok().map(ToString::to_string);
     }
-    if let Some(lat) = fields.get(2).copied()
-      && lat.contains('.')
-      && let Ok(v) = lat.parse::<f64>()
-    {
+    // `(\d+\.\d+)` lat / lon (QuickTimeStream.pl:1740).
+    if let Some(v) = fields.get(2).copied().and_then(nmea_decimal) {
       t.lat = Some(v);
     }
-    if let Some(ns) = fields.get(3).copied()
-      && let Some(c) = ns.chars().next()
-      && (c == 'N' || c == 'S')
-    {
+    if let Some(c) = fields.get(3).and_then(|f| ns_ref(f)) {
       t.lat_ref = Some(c);
     }
-    if let Some(lon) = fields.get(4).copied()
-      && lon.contains('.')
-      && let Ok(v) = lon.parse::<f64>()
-    {
+    if let Some(v) = fields.get(4).copied().and_then(nmea_decimal) {
       t.lon = Some(v);
     }
-    if let Some(ew) = fields.get(5).copied()
-      && let Some(c) = ew.chars().next()
-      && (c == 'E' || c == 'W')
-    {
+    if let Some(c) = fields.get(5).and_then(|f| ew_ref(f)) {
       t.lon_ref = Some(c);
     }
   }
-  // `$alt = $11` (field 9) — always taken when present.
-  if let Some(alt) = fields.get(9).copied()
-    && !alt.is_empty()
-    && let Ok(v) = alt.parse::<f64>()
+  // `$alt = $11` (field 9) — the `(-?\d+\.?\d*)` shape (always taken when the
+  // regex matched). Note: with field 9 empty the bundled capture is undef, so
+  // `$alt` is undef — skip when empty.
+  if let Some(v) = fields
+    .get(9)
+    .copied()
+    .filter(|f| !f.is_empty())
+    .and_then(nmea_signed_decimal)
   {
     t.alt = Some(v);
   }
@@ -1193,6 +1401,23 @@ fn detect_type3_4(data: &[u8]) -> Option<(Type34Match, &[u8])> {
     }
   }
   None
+}
+
+/// `^[A-Za-z0-9+\/]{8,20}={0,2}$` over a NUL-trimmed slice
+/// (QuickTimeStream.pl:1775) — an 8-to-20-char base64 alphabet prefix (alnum /
+/// `+` / `/`, NO `=`) optionally followed by a 0-to-2 char `=` pad SUFFIX. `=`
+/// must NOT appear inside the prefix, and the prefix is capped at 20 chars.
+fn is_base64_shape(s: &[u8]) -> bool {
+  // Strip a 0-2 char trailing `=` pad.
+  let pad = s.iter().rev().take_while(|&&c| c == b'=').count();
+  if pad > 2 {
+    return false;
+  }
+  let prefix = &s[..s.len() - pad];
+  (8..=20).contains(&prefix.len())
+    && prefix
+      .iter()
+      .all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
 }
 
 /// Decode GPSType 3 (ViofoA119v3, QuickTimeStream.pl:1781-1804) and GPSType 4
@@ -1232,11 +1457,11 @@ fn decode_type3_4(
     ln_window = &data[0x40..0x54];
     for w in [lt_window, ln_window] {
       let trimmed = w.split(|&b| b == 0).next().unwrap_or(&[]);
-      let is_b64 = trimmed.len() >= 8
-        && trimmed.len() <= 22
-        && trimmed
-          .iter()
-          .all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=');
+      // QuickTimeStream.pl:1775 `/^[A-Za-z0-9+\/]{8,20}={0,2}\0*$/`: an 8-20-char
+      // base64 prefix (alnum / `+` / `/` — NO `=`), then a 0-2 char `=` SUFFIX,
+      // then trailing NULs. The `=` may NOT appear mid-string, and the prefix is
+      // capped at 20 (so the NUL-trimmed slice is 8..=22 chars).
+      let is_b64 = is_base64_shape(trimmed);
       if !is_b64 {
         not_enc = true;
       }
@@ -1452,11 +1677,15 @@ fn base64_decode(s: &[u8]) -> Vec<u8> {
 // ─────────────────────────── GPSType 5: LigoGPS (DEFERRED) ─────────────────
 
 /// Detect the LigoGPSINFO fingerprint at offsets 16/48/80.
-/// QuickTimeStream.pl:1843. Returns the matched offset (`Some(16|48|80)`).
+/// QuickTimeStream.pl:1843 `/^(.{16}|.{48}|.{80})LIGOGPSINFO\0/s and
+/// length($$dataPt) >= length($1) + 0x84`. Returns the matched offset
+/// (`Some(16|48|80)`). The `length >= $1 + 0x84` guard is part of the bundled
+/// condition: a too-short LIGOGPSINFO block must FALL THROUGH (not shadow the
+/// later Type-6+ arms), so it is enforced here.
 fn detect_type5_ligogps(data: &[u8]) -> Option<usize> {
   for &off in &[16, 48, 80] {
     let end = off + b"LIGOGPSINFO\0".len();
-    if data.len() >= end && &data[off..end] == b"LIGOGPSINFO\0" {
+    if data.len() >= end && &data[off..end] == b"LIGOGPSINFO\0" && data.len() >= off + 0x84 {
       return Some(off);
     }
   }
@@ -1527,17 +1756,24 @@ fn decode_type7_cipher(data: &[u8], out: &mut QuickTimeStreamMeta) {
   for &b in &data[60..60 + 80] {
     decoded.push(if b >= 16 { b - 16 } else { b });
   }
-  let s = core::str::from_utf8(&decoded).unwrap_or("");
+  // QuickTimeStream.pl:1952 matches `/[A-Z]{2}RMC,…/` over the DECIPHERED RAW
+  // bytes (the `$_` buffer) — the decipher of the `4W`b]S<` signature yields a
+  // leading `$GPRMC,` (`0x34-0x10 = '$'` …), so the whole buffer is one RMC
+  // sentence. Parse the bytes directly (no UTF-8 round-trip, faithful to the
+  // bundled byte-level match) — field 0 is the `$GPRMC` talker, field 1+ the
+  // RMC fields.
   let mut t = FreeGpsTags::new();
-  parse_nmea_rmc(s, &mut t);
+  parse_nmea_rmc(&decoded, &mut t);
   t.emit(out);
 }
 
 // ────────────────── GPSType 8: Akaso V1 / Redtiger F7N (encrypted) ─────────
 
 fn detect_type8(data: &[u8]) -> bool {
-  // QuickTimeStream.pl:1961 `^.{64}[\x01-\x0c]\0{3}[\x01-\x1f]\0{3}A[NS][EW]\0{5}`.
-  if data.len() < 0x78 {
+  // QuickTimeStream.pl:1961 `^.{64}[\x01-\x0c]\0{3}[\x01-\x1f]\0{3}A[NS][EW]\0{5}`
+  // — the regex references bytes through offset 79, so 80 (0x50) bytes is the
+  // true minimum. (Decode reads further via zero-filling `le_*`, like Perl.)
+  if data.len() < 0x50 {
     return false;
   }
   data[64] >= 0x01
@@ -1769,8 +2005,11 @@ fn decode_type12_double(data: &[u8], out: &mut QuickTimeStreamMeta) {
     return;
   }
   let mut t = FreeGpsTags::new();
-  t.lat_ref = data.get(71).map(|&b| b as char);
-  t.lon_ref = data.get(86).map(|&b| b as char);
+  // QuickTimeStream.pl:2173/2175 data-layout: `0x48` = int32u latitude-ref
+  // ('N'/'S'), `0x58` = int32u longitude-ref ('E'/'W'). The detection regex
+  // (:2159) captures the same two bytes (`[NS]`@0x48, `[EW]`@0x58).
+  t.lat_ref = data.get(0x48).map(|&b| b as char);
+  t.lon_ref = data.get(0x58).map(|&b| b as char);
   // QuickTimeStream.pl:2183 — unpack 'x48V3x52V6'.
   let hr = le_u32(data, 0x30).unwrap_or(0);
   let min = le_u32(data, 0x34).unwrap_or(0);
@@ -2036,6 +2275,9 @@ fn decode_type16_17_viofo(data: &[u8], kodak_version: Option<&str>, out: &mut Qu
 
 fn detect_type18(data: &[u8]) -> bool {
   // QuickTimeStream.pl:2354 — `^.{23}(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2}) [N|S]`.
+  // NOTE: the bundled char-class `[N|S]` is LITERAL — it accepts `N`, `|` AND
+  // `S` (the `|` inside a `[...]` is just a member, not alternation), so the
+  // 21st byte may be any of those three.
   let needed = 23 + 4 + 1 + 2 + 1 + 2 + 1 + 2 + 1 + 2 + 1 + 2 + 1 + 1;
   if data.len() < needed {
     return false;
@@ -2048,7 +2290,7 @@ fn detect_type18(data: &[u8]) -> bool {
     10 => c == b' ',
     13 | 16 => c == b':',
     19 => c == b' ',
-    20 => c == b'N' || c == b'S',
+    20 => c == b'N' || c == b'|' || c == b'S',
     _ => true,
   })
 }
@@ -2059,70 +2301,68 @@ fn detect_type18(data: &[u8]) -> bool {
 fn decode_type18_xgody(data: &[u8], out: &mut QuickTimeStreamMeta) {
   let mut t = FreeGpsTags::new();
   t.ddd = true;
-  let s_full = core::str::from_utf8(data).unwrap_or("");
-  // Trim trailing NULs.
-  let s = s_full.trim_end_matches('\0');
-  // Date/time at offset 23.
+  // QuickTimeStream.pl:2354/2367/2368 index `$$dataPt` by BYTE offset (the
+  // regex `^.{23}…` + `substr($$dataPt,43)`), NOT a decoded string. A real
+  // Type-18 block has a non-ASCII box header (`00 00 00 a8 …`, :2358), so a
+  // strict `from_utf8` of the whole block would blank the decode. Trim trailing
+  // NULs on the bytes (`$$dataPt =~ s/\0+$//`) and index the ASCII regions
+  // directly.
+  let s = trim_trailing_nuls(data);
+  // Date/time at offset 23 (QuickTimeStream.pl:2366 captures `$1..$6`).
   if s.len() >= 23 + 19 {
     let dt = &s[23..23 + 19];
-    let yr: i32 = dt[0..4].parse().unwrap_or(0);
-    let mon: u32 = dt[5..7].parse().unwrap_or(0);
-    let day: u32 = dt[8..10].parse().unwrap_or(0);
-    let hr: u32 = dt[11..13].parse().unwrap_or(0);
-    let min: u32 = dt[14..16].parse().unwrap_or(0);
-    let sec_s = &dt[17..19];
-    t.yr = Some(yr);
-    t.mon = Some(mon);
-    t.day = Some(day);
-    t.hr = Some(hr);
-    t.min = Some(min);
-    t.sec = Some(sec_s.to_string());
+    t.yr = ascii_i32(&dt[0..4]);
+    t.mon = ascii_u32(&dt[5..7]);
+    t.day = ascii_u32(&dt[8..10]);
+    t.hr = ascii_u32(&dt[11..13]);
+    t.min = ascii_u32(&dt[14..16]);
+    t.sec = core::str::from_utf8(&dt[17..19])
+      .ok()
+      .map(ToString::to_string);
   }
-  // Field stream at offset 43.
+  // Field stream at offset 43 (`split ' ', substr($$dataPt,43)`).
   if s.len() > 43 {
     let mut acc: [Option<f64>; 3] = [None, None, None];
     let mut acc_idx = 0usize;
-    for tok in s[43..].split_ascii_whitespace() {
-      if let Some((k, v)) = tok.split_once(':') {
-        if k.len() != 1 {
-          continue;
-        }
-        let ch = k.chars().next().unwrap();
-        if let Ok(num) = v.parse::<f64>() {
-          match ch {
-            'N' => {
-              t.lat = Some(num);
-              t.lat_ref = Some('N');
-            }
-            'S' => {
-              t.lat = Some(num);
-              t.lat_ref = Some('S');
-            }
-            'E' => {
-              t.lon = Some(num);
-              t.lon_ref = Some('E');
-            }
-            'W' => {
-              t.lon = Some(num);
-              t.lon_ref = Some('W');
-            }
-            'x' | 'y' | 'z' if acc_idx < 3 => {
-              acc[acc_idx] = Some(num);
-              acc_idx += 1;
-            }
-            'A' => {
-              t.trk = Some(num);
-            }
-            _ => {
-              // 'H' / 'Unknown_X' — stored in ExifTool as Unknown_X.
-              // Typed domain doesn't carry these; skip silently.
-            }
+    for tok_b in s[43..]
+      .split(|&c| c.is_ascii_whitespace())
+      .filter(|t| !t.is_empty())
+    {
+      let Ok(tok) = core::str::from_utf8(tok_b) else {
+        continue;
+      };
+      // QuickTimeStream.pl:2371 — `^([A-Z]):([-+]?\d+(\.\d+)?)$/i`: the key is a
+      // SINGLE ASCII letter (the `/i` lets it be either case) and the value is a
+      // signed-optional integer-or-decimal (NOT exponent/inf/nan/leading-dot).
+      // A token failing this whole match falls through to the bare-speed gate.
+      if let Some((num, ch)) = parse_xgody_kv(tok) {
+        match ch {
+          'N' | 'S' => {
+            t.lat = Some(num);
+            t.lat_ref = Some(ch);
+          }
+          'E' | 'W' => {
+            t.lon = Some(num);
+            t.lon_ref = Some(ch);
+          }
+          'x' | 'y' | 'z' if acc_idx < 3 => {
+            acc[acc_idx] = Some(num);
+            acc_idx += 1;
+          }
+          'A' => {
+            t.trk = Some(num);
+          }
+          _ => {
+            // 'H' / 'Unknown_X' — stored in ExifTool as Unknown_X.
+            // Typed domain doesn't carry these; skip silently.
           }
         }
       } else if t.lon.is_some() && t.spd.is_none() {
-        // QuickTimeStream.pl:2373 — spd is the first bare number after lon,
-        // displayed in km/h but raw is knots (multiply by knotsToKph).
-        if let Ok(n) = tok.parse::<f64>() {
+        // QuickTimeStream.pl:2373 — `defined $lon and not defined $spd and
+        // /^\d+\.\d+$/`: spd is the first bare DIGITS.DIGITS number after lon
+        // (display km/h but raw knots; an int-only/exponent/sign token must NOT
+        // match). Multiply by knotsToKph.
+        if let Some(n) = parse_plain_decimal(tok) {
           t.spd = Some(n * KNOTS_TO_KPH);
         }
       }
@@ -2456,6 +2696,105 @@ mod tests {
     assert!(s.altitude_m().is_some());
   }
 
+  /// GPSType 12 — 80-byte double-lat/lon dashcam (QuickTimeStream.pl:2159-2188).
+  /// The bundled regex `/^.{60}A\0.{10}([NS])\0.{14}([EW])\0/s` puts the
+  /// latitude-ref at offset 72 (data-layout `0x48`) and the longitude-ref at
+  /// offset 88 (`0x58`); the decoder reads those same offsets. Oracle-verified
+  /// against bundled ExifTool 13.59 (`-ee -api QuickTimeUTC=1`):
+  ///   GPSDateTime 2024:07:15 14:30:45Z, GPSLatitude 47.6284216666667,
+  ///   GPSLongitude 122.165016666667, GPSSpeed 18.52 (10 knots × 1.852),
+  ///   GPSTrack 90, Accelerometer "1 2 -3".
+  /// (The old port checked refs at 71/86 — off by 1/2 — so a real Type-12 block
+  /// failed detection and fell through to the Type-20 catch-all.)
+  #[test]
+  fn type12_double_lat_lon_ref_offsets_0x48_0x58() {
+    let (mut block, _) = make_block(0x100);
+    // A@60, [NS]@72 (0x48), [EW]@88 (0x58); the intervening bytes stay NUL.
+    block[60] = b'A';
+    block[72] = b'N';
+    block[88] = b'E';
+    // hr/min/sec (V) @ 0x30/0x34/0x38.
+    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
+    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
+    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    // lat double @0x40 (DDMM.MMMM 4737.7053 → 47°37.7053′), lon @0x50 (12209.901).
+    block[0x40..0x48].copy_from_slice(&4737.7053f64.to_le_bytes());
+    block[0x50..0x58].copy_from_slice(&12209.901f64.to_le_bytes());
+    // spd double @0x60 (10 knots), trk @0x68 (90°).
+    block[0x60..0x68].copy_from_slice(&10.0f64.to_le_bytes());
+    block[0x68..0x70].copy_from_slice(&90.0f64.to_le_bytes());
+    // yr-2000/mon/day (V) @ 0x70/0x74/0x78.
+    block[0x70..0x74].copy_from_slice(&24u32.to_le_bytes());
+    block[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
+    block[0x78..0x7c].copy_from_slice(&15u32.to_le_bytes());
+    // accel int32s/1000 @ 0x7c (1.0, 2.0, -3.0).
+    block[0x7c..0x80].copy_from_slice(&1000i32.to_le_bytes());
+    block[0x80..0x84].copy_from_slice(&2000i32.to_le_bytes());
+    block[0x84..0x88].copy_from_slice(&(-3000i32).to_le_bytes());
+
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block(&block, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Type-12 sample");
+    let s = &out.gps_samples()[0];
+    assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
+    let lat = s.latitude().expect("lat");
+    assert!(
+      (lat - 47.628_421_666_666_67).abs() < 1e-9,
+      "lat {lat} (want 47.6284216666667, N positive)"
+    );
+    let lon = s.longitude().expect("lon");
+    assert!(
+      (lon - 122.165_016_666_667).abs() < 1e-9,
+      "lon {lon} (want 122.165016666667, E positive)"
+    );
+    assert!(
+      (s.speed_kph().expect("spd") - 18.52).abs() < 1e-9,
+      "spd {:?} (want 18.52 = 10 knots × 1.852)",
+      s.speed_kph()
+    );
+    assert_eq!(s.track(), Some(90.0));
+    assert_eq!(s.accelerometer(), Some("1 2 -3"));
+  }
+
+  /// GPSType 12 detection is ALSO reachable through the brute-force scanner —
+  /// the same oracle-verified block, found in a full 0x8000 chunk, decodes to
+  /// the identical sample (the scan path passes no SampleTime, but Type-12
+  /// carries its own embedded date).
+  #[test]
+  fn type12_via_scan_media_data() {
+    let mut block = vec![0u8; 0x100];
+    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    block[4..12].copy_from_slice(b"freeGPS ");
+    block[60] = b'A';
+    block[72] = b'N';
+    block[88] = b'E';
+    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
+    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
+    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    block[0x40..0x48].copy_from_slice(&4737.7053f64.to_le_bytes());
+    block[0x50..0x58].copy_from_slice(&12209.901f64.to_le_bytes());
+    block[0x60..0x68].copy_from_slice(&10.0f64.to_le_bytes());
+    block[0x68..0x70].copy_from_slice(&90.0f64.to_le_bytes());
+    block[0x70..0x74].copy_from_slice(&24u32.to_le_bytes());
+    block[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
+    block[0x78..0x7c].copy_from_slice(&15u32.to_le_bytes());
+    block[0x7c..0x80].copy_from_slice(&1000i32.to_le_bytes());
+    block[0x80..0x84].copy_from_slice(&2000i32.to_le_bytes());
+    block[0x84..0x88].copy_from_slice(&(-3000i32).to_le_bytes());
+    let mut file = vec![0u8; 64];
+    let mdat_offset = file.len() as u64;
+    file.extend_from_slice(&block);
+    file.extend_from_slice(&vec![0u8; 0x9000]); // full-chunk padding
+    let mdat_size = file.len() as u64 - mdat_offset;
+    let mut out = QuickTimeStreamMeta::new();
+    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
+    assert_eq!(out.gps_samples().len(), 1);
+    assert_eq!(
+      out.gps_samples()[0].date_time(),
+      Some("2024:07:15 14:30:45Z")
+    );
+  }
+
   #[test]
   fn type20_nextbase_be_decodes_one_record() {
     // Type 20 is the catch-all: an `mdat` block that doesn't match any other
@@ -2481,14 +2820,120 @@ mod tests {
     assert!(s.date_time().is_some());
   }
 
+  /// GPSType 7 — the `4W`b]S<` cipher deciphers (subtract 16) to a `$GPRMC`
+  /// sentence parsed over RAW bytes (QuickTimeStream.pl:1940-1959). The decode
+  /// runs on the deciphered `&[u8]` (NOT a UTF-8 string); the cipher signature
+  /// `4W`b]S<` itself is the `+16` encoding of `$GPRMC,`.
+  #[test]
+  fn type7_cipher_decodes_gprmc_over_bytes() {
+    // Encode a plaintext RMC by adding 16 to each byte (inverse of the decode).
+    let plain = b"$GPRMC,132230.00,A,4721.35,N,00830.80,E,22.5,199.8,141222,,,A";
+    let mut enc = [0u8; 80];
+    for (i, slot) in enc.iter_mut().enumerate() {
+      *slot = plain.get(i).map_or(0u8, |&c| c.wrapping_add(16));
+    }
+    // 60-byte pad/header + the 80-byte ciphered region (= 140 bytes total).
+    let mut block = vec![0u8; 60];
+    block.extend_from_slice(&enc);
+    // The detection signature `4W`b]S<` must be the first 7 ciphered bytes.
+    assert_eq!(&block[60..67], b"4W\x60b]S<");
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block(&block, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Type-7 sample");
+    let s = &out.gps_samples()[0];
+    assert_eq!(s.date_time(), Some("2022:12:14 13:22:30.00Z"));
+    // 4721.35 DDMM.MMMM ⇒ ConvertLatLon ⇒ 47 + 21.35/60 ≈ 47.3558°, N positive.
+    let lat = s.latitude().expect("lat");
+    assert!((lat - 47.355_833).abs() < 1e-4, "lat={lat}");
+    // 00830.80 ⇒ 8 + 30.80/60 ≈ 8.5133°, E positive.
+    let lon = s.longitude().expect("lon");
+    assert!((lon - 8.513_333).abs() < 1e-4, "lon={lon}");
+    assert!((s.speed_kph().expect("spd") - 22.5 * 1.852).abs() < 1e-6);
+  }
+
+  /// GPSType 18 — XGODY 4K ASCII (QuickTimeStream.pl:2354-2384). The decode
+  /// indexes `$$dataPt` by BYTE offset, NOT a decoded string: a real Type-18
+  /// block has a non-ASCII box header (`00 00 00 a8 …`, :2358) so a strict
+  /// `from_utf8` of the whole block would blank it. Oracle-verified vs bundled
+  /// ExifTool 13.59: GPSDateTime 2024:05:22 02:54:29Z, GPSLatitude 42.38247,
+  /// GPSLongitude -83.38957, GPSSpeed 99.2672 (53.6 knots × 1.852), GPSTrack
+  /// 269.2. (Bundled's Accelerometer is the raw captured strings "-0.02 0.99
+  /// 0.10"; the typed `GpsSample` stores 3 f64s rendered via `%.15g`, so the
+  /// trailing-zero `0.10` → `0.1` — a pre-existing typed-domain rounding shared
+  /// by every accel-emitting GPSType, not affected by this change.)
+  #[test]
+  fn type18_xgody_decodes_over_bytes_with_nonascii_header() {
+    let text = b"normal:2024/05/22 02:54:29 N:42.382470 W:83.389570 53.6 km/h x:-0.02 y:0.99 z:0.10 A:269.2 H:245.5";
+    let mut block = vec![0u8; 0x100];
+    // A non-ASCII box header (byte 3 = 0xa8) — like a real XGODY block (:2358).
+    block[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0xa8]);
+    block[4..12].copy_from_slice(b"freeGPS ");
+    block[16..16 + text.len()].copy_from_slice(text);
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block(&block, &mut out);
+    assert_eq!(out.gps_samples().len(), 1, "one Type-18 sample");
+    let s = &out.gps_samples()[0];
+    assert_eq!(s.date_time(), Some("2024:05:22 02:54:29Z"));
+    assert!((s.latitude().expect("lat") - 42.382_47).abs() < 1e-6);
+    assert!((s.longitude().expect("lon") - -83.389_57).abs() < 1e-6);
+    assert!(
+      (s.speed_kph().expect("spd") - 53.6 * 1.852).abs() < 1e-4,
+      "spd {:?}",
+      s.speed_kph()
+    );
+    assert_eq!(s.track(), Some(269.2));
+    assert_eq!(s.accelerometer(), Some("-0.02 0.99 0.1"));
+  }
+
+  /// GPSType 18 bare-speed gate `/^\d+\.\d+$/` (QuickTimeStream.pl:2373): only a
+  /// DIGITS.DIGITS bare token after lon is taken as speed (int-only / signed /
+  /// exponent tokens do NOT match), and the KV value matches
+  /// `([-+]?\d+(\.\d+)?)` with a single-ASCII-letter key.
+  #[test]
+  fn type18_bare_speed_and_kv_shape_gates() {
+    // An int-only bare token `53` (no dot) must NOT be taken as speed; the
+    // following `53.6` (digits.digits) is.
+    let text = b"normal:2024/05/22 02:54:29 N:42.382470 W:83.389570 53 53.6 km/h";
+    let mut block = vec![0u8; 0x100];
+    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    block[4..12].copy_from_slice(b"freeGPS ");
+    block[16..16 + text.len()].copy_from_slice(text);
+    let mut out = QuickTimeStreamMeta::new();
+    decode_block(&block, &mut out);
+    let s = &out.gps_samples()[0];
+    assert!(
+      (s.speed_kph().expect("spd") - 53.6 * 1.852).abs() < 1e-4,
+      "bare int `53` skipped; `53.6` taken: {:?}",
+      s.speed_kph()
+    );
+  }
+
+  /// GPSType 18 — the `[N|S]` detection char-class is LITERAL: the 21st byte of
+  /// the date/time region (`^.{23}…/…/… …:…:… [N|S]`) accepts `N`, `|` OR `S`
+  /// (QuickTimeStream.pl:2354). A `|` there still matches the detector.
+  #[test]
+  fn type18_detection_accepts_pipe_in_char_class() {
+    // After the date/time, byte 43 is `|` (the literal `[N|S]` member).
+    let text = b"normal:2024/05/22 02:54:29 |:00.000000 N:42.382470 W:83.389570";
+    let mut block = vec![0u8; 0x100];
+    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
+    block[4..12].copy_from_slice(b"freeGPS ");
+    block[16..16 + text.len()].copy_from_slice(text);
+    assert!(detect_type18(block.as_slice()), "`|` at offset 43 detects");
+  }
+
   #[test]
   fn scan_media_data_finds_block_in_mdat() {
     // Build a Type-6 freeGPS block (block-absolute offsets), put it inside an
     // `mdat` payload, then scan. ExifTool's scanner regex
     // (`\0..\0freeGPS `, QuickTimeStream.pl:3710) requires bytes 0 and 3 of
     // the 4-byte BE size header to be NUL — so the block size must be ≤
-    // 0xffff00 AND a multiple of 256. We size to exactly 0x0100 here, then
-    // pad the inner buffer to fit.
+    // 0xffff00 AND a multiple of 256. We size to exactly 0x0100 here.
+    // The block must also be found in a FULL 0x8000-byte chunk: ExifTool bails
+    // a sub-0x8000 final chunk WITHOUT decoding (`last if length $buff <
+    // $gpsBlockSize`, :3750), so the `mdat` here is padded past 0x8000 (this
+    // matches a real dashcam file, whose first freeGPS block sits in an early
+    // full chunk — oracle-verified: a sub-0x8000 mdat yields NO GPS).
     let mut block = vec![0u8; 0x100];
     block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
     block[4..12].copy_from_slice(b"freeGPS ");
@@ -2503,16 +2948,37 @@ mod tests {
     block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
     block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
     block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
-    // Place inside a synthetic file: 100 bytes header + block + 100 bytes tail.
+    // Place inside a synthetic file: 100 bytes header + block + padding so the
+    // total `mdat` exceeds 0x8000 (the block is then found in a full chunk).
     let mut file = vec![0u8; 100];
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&block);
+    file.extend_from_slice(&vec![0u8; 0x9000]);
     let mdat_size = file.len() as u64 - mdat_offset;
-    file.extend_from_slice(&[0u8; 100]);
 
     let mut out = QuickTimeStreamMeta::new();
     scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
+  }
+
+  /// QuickTimeStream.pl:3750 `last if length $buff < $gpsBlockSize` — a freeGPS
+  /// block whose magic is first seen inside the FINAL sub-0x8000 chunk is NOT
+  /// decoded (the scan bails). A whole `mdat` smaller than 0x8000 therefore
+  /// yields NO samples even though the block is structurally valid (oracle-
+  /// verified: a 256-byte `mdat` with one freeGPS block produces no GPS).
+  #[test]
+  fn scan_media_data_bails_on_sub_0x8000_final_chunk() {
+    let block = make_type6_block(0x100);
+    let mut file = vec![0u8; 100];
+    let mdat_offset = file.len() as u64;
+    file.extend_from_slice(&block);
+    let mdat_size = file.len() as u64 - mdat_offset; // < 0x8000
+    let mut out = QuickTimeStreamMeta::new();
+    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
+    assert!(
+      out.gps_samples().is_empty(),
+      "a freeGPS block in a sub-0x8000 mdat must not be decoded"
+    );
   }
 
   #[test]
@@ -2534,7 +3000,7 @@ mod tests {
 
   #[test]
   fn parse_nmea_rmc_full_sentence() {
-    let s = "$GPRMC,132230.000,A,4721.35197,N,00830.80859,E,22.519,199.88,141222,,,A";
+    let s = b"$GPRMC,132230.000,A,4721.35197,N,00830.80859,E,22.519,199.88,141222,,,A";
     let mut t = FreeGpsTags::new();
     parse_nmea_rmc(s, &mut t);
     assert_eq!(t.hr, Some(13));
@@ -2552,13 +3018,32 @@ mod tests {
   }
 
   /// Bundled RMC accepts any `[A-Z]{2}` talker, not just GP/GN (e.g. `$GA`).
+  /// `find_nmea_sentence` runs over RAW bytes (QuickTimeStream.pl:1733).
   #[test]
   fn find_nmea_sentence_accepts_any_talker() {
-    let s = "junk$GARMC,010203.0,A,1.0,N,2.0,E,,,010100,,,A more junk";
+    let s = b"junk$GARMC,010203.0,A,1.0,N,2.0,E,,,010100,,,A more junk";
     let rmc = find_nmea_sentence(s, b"RMC").expect("any talker matches");
-    assert!(rmc.starts_with("$GARMC,"));
+    assert!(rmc.starts_with(b"$GARMC,"));
     // A `GGA` request must not match the `RMC` sentence.
     assert!(find_nmea_sentence(s, b"GGA").is_none());
+  }
+
+  /// A non-UTF-8 byte BEFORE the NMEA sentence must NOT blank the search —
+  /// the bundled regex runs over raw `$$dataPt` bytes (QuickTimeStream.pl:1733),
+  /// so `find_nmea_sentence` + `parse_nmea_rmc` operate on `&[u8]`. (A real
+  /// Type-2 block carries binary fields — box header, accel int32s — so a
+  /// strict `from_utf8` would have failed.)
+  #[test]
+  fn parse_nmea_rmc_over_raw_bytes_with_binary_prefix() {
+    let mut buf = vec![0x00u8, 0x80, 0xff, 0xfe]; // non-UTF-8 binary prefix
+    buf.extend_from_slice(
+      b"$GPRMC,132230.000,A,4721.35197,N,00830.80859,E,22.519,199.88,141222,,,A",
+    );
+    let rmc = find_nmea_sentence(&buf, b"RMC").expect("found over raw bytes");
+    let mut t = FreeGpsTags::new();
+    parse_nmea_rmc(rmc, &mut t);
+    assert_eq!(t.yr, Some(2022));
+    assert!(t.lat.unwrap() > 4721.0);
   }
 
   /// GPSType 2: the `$xxGGA` sentence supplies the altitude that RMC lacks.
@@ -2567,7 +3052,7 @@ mod tests {
     let mut t = FreeGpsTags::new();
     t.yr = Some(2022); // pretend RMC already set the date.
     parse_nmea_gga(
-      "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,,,,",
+      b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,,,,",
       &mut t,
     );
     assert_eq!(t.alt, Some(545.4));
@@ -3001,18 +3486,65 @@ mod tests {
   fn parse_nmea_rmc_status_gate() {
     let mut t = FreeGpsTags::new();
     parse_nmea_rmc(
-      "$GPRMC,132230.000,,4721.35197,N,00830.80859,E,22.5,199.8,141222,,,A",
+      b"$GPRMC,132230.000,,4721.35197,N,00830.80859,E,22.5,199.8,141222,,,A",
       &mut t,
     );
     assert!(t.lat.is_some(), "empty status (A?) is accepted");
 
     let mut tv = FreeGpsTags::new();
     parse_nmea_rmc(
-      "$GPRMC,132230.000,V,4721.35197,N,00830.80859,E,22.5,199.8,141222,,,A",
+      b"$GPRMC,132230.000,V,4721.35197,N,00830.80859,E,22.5,199.8,141222,,,A",
       &mut tv,
     );
     assert!(tv.lat.is_none(), "V status copies nothing");
     assert!(tv.yr.is_none());
+  }
+
+  /// RMC lat/lon must match `(\d+\.\d+)` (digits-dot-digits) —
+  /// QuickTimeStream.pl:1733. An integer-only or empty lat field is rejected by
+  /// the bundled regex (the whole RMC match fails → nothing copied).
+  #[test]
+  fn parse_nmea_rmc_lat_lon_shape_gate() {
+    // Integer-only lat field `4721` (no dot) — the regex would not match.
+    let mut t = FreeGpsTags::new();
+    parse_nmea_rmc(
+      b"$GPRMC,132230.000,A,4721,N,00830.80859,E,22.5,199.8,141222,,,A",
+      &mut t,
+    );
+    assert!(t.lat.is_none(), "integer-only lat must be rejected");
+  }
+
+  /// GGA altitude `(-?\d+\.?\d*)?` is followed by `,M?` (QuickTimeStream.pl:1740):
+  /// the comma after the altitude MUST be present (field 10 must exist), but the
+  /// units field's CONTENT is unconstrained because `M?` is zero-width-optional.
+  /// Verified vs Perl: `M`/``/`F`/`ft` all match; a GGA whose altitude is the
+  /// last field (no trailing comma) does NOT match.
+  #[test]
+  fn parse_nmea_gga_unit_field_gate() {
+    // Units field `F` (feet) is ACCEPTED — `M?` does not constrain it.
+    let mut t = FreeGpsTags::new();
+    parse_nmea_gga(
+      b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,F,,,,",
+      &mut t,
+    );
+    assert_eq!(t.alt, Some(545.4), "non-M units field is still accepted");
+
+    // Empty units field (trailing comma present) is accepted.
+    let mut t2 = FreeGpsTags::new();
+    parse_nmea_gga(
+      b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,,,,,",
+      &mut t2,
+    );
+    assert_eq!(t2.alt, Some(545.4), "empty units field is accepted");
+
+    // NO comma after the altitude (altitude is the last field) ⇒ the whole GGA
+    // regex fails ⇒ nothing copied (the `,M?` comma is mandatory).
+    let mut t3 = FreeGpsTags::new();
+    parse_nmea_gga(
+      b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4",
+      &mut t3,
+    );
+    assert_eq!(t3.alt, None, "altitude with no trailing comma is rejected");
   }
 
   /// Build a Type-17 (Viofo A119S binary) freeGPS block matching the bundled

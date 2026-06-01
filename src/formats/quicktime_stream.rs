@@ -166,7 +166,11 @@ pub(crate) fn synth_gps_date_time(
   create_date_raw: Option<u64>,
   sample_time: Option<f64>,
 ) -> Option<String> {
-  let create = create_date_raw?;
+  // QuickTimeStream.pl:984 `if defined $sampleTime and $$value{CreateDate}` —
+  // `$$value{CreateDate}` is truthiness-checked, so a raw CreateDate of 0 (the
+  // QuickTime 1904-epoch zero-date sentinel) is FALSY and yields NO synthesized
+  // GPSDateTime. Treat `Some(0)` like the missing case.
+  let create = create_date_raw.filter(|&c| c != 0)?;
   let st = sample_time?;
   // $sampleTime += CreateDate (1904-epoch seconds), then to Unix epoch.
   let unix = create as f64 - QT_EPOCH_OFFSET as f64 + st;
@@ -2163,6 +2167,9 @@ mod tests {
   fn synth_gps_date_time_needs_create_date() {
     assert_eq!(synth_gps_date_time(None, Some(1.0)), None);
     assert_eq!(synth_gps_date_time(Some(123), None), None);
+    // QuickTimeStream.pl:984 — a raw CreateDate of 0 is FALSY ⇒ no synth (even
+    // with a sample time present).
+    assert_eq!(synth_gps_date_time(Some(0), Some(1.0)), None);
     // create_date = QT_EPOCH_OFFSET + 1s ⇒ unix 1 ⇒ 1970-01-01 00:00:01
     // (unix 0 hits ExifTool's `0000:00:00 00:00:00` zero sentinel,
     // ExifTool.pm:6776 — so anchor 1s past the epoch).
