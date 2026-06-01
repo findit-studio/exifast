@@ -885,12 +885,22 @@ fn typed_serde_path_equals_writer_path_and_golden_all_267() {
   // NO `File:PageCount` (ExifTool.pm:8767) while still extracting every IFD tag.
   // Pins the standalone-TIFF arm gating PageCount on the candidate `Parent`
   // (not a hard-coded `true`).
+  // 267 → 268 after the Canon CRW (CIFF) container — Phase 1:
+  // `CanonRaw_min.crw` — a HAND-CRAFTED minimal CIFF heap (the real
+  // `t/images/CanonRaw.crw` emits ~25 camera `Composite:*` tags + XMP this
+  // port cannot emit, so it cannot be a byte-exact fixture). The crafted heap
+  // exercises the `ProcessCRW` header validate + the recursive
+  // `ProcessCanonRaw` HEAP walker (nested auto-subdirectory + value-in-dir
+  // record) + the `CanonRaw::Main` scalar records (`Make`/`Model`/`FileFormat`
+  // PrintHex/`CanonModelID` `%canonModelID`/…), DELIBERATELY excluding every
+  // Composite-trigger combo so the bundled `-G1 -j`/`-n` goldens carry ONLY
+  // File:/CanonRaw: keys.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    267,
-    "expected exactly the 267 active conformance fixtures, found {}: {:?}",
+    268,
+    "expected exactly the 268 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

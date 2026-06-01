@@ -50,6 +50,35 @@ fn aac_conformance() {
 }
 
 #[test]
+fn crw_conformance() {
+  // Canon CRW (CIFF) container — Phase 1. `tests/fixtures/CanonRaw_min.crw` is
+  // a HAND-CRAFTED minimal CIFF heap (the REAL bundled `t/images/CanonRaw.crw`
+  // emits ~25 camera `Composite:*` tags + embedded XMP that this port cannot
+  // emit, so it cannot be a byte-exact fixture). The crafted heap exercises:
+  //   - the `ProcessCRW` header validate + the recursive `ProcessCanonRaw`
+  //     HEAP walker (incl. a nested auto-subdirectory `0x2807 CameraObject`,
+  //     tagType 0x28, whose `CanonImageType`/`ROMOperationMode` records prove
+  //     recursion reaches nested leaves);
+  //   - the value-in-directory path (`BaseISO` via tag|0x4000);
+  //   - several `CanonRaw::Main` scalar records — `Make`/`Model` (the
+  //     `MakeModel` binary sub-table), `FileFormat`+`TargetCompressionRatio`
+  //     (the `ImageFormat` sub-table, PrintHex), `CanonFirmwareVersion`,
+  //     `OwnerName`, `OriginalFileName`, `ThumbnailFileName`,
+  //     `CanonModelID` (PrintHex + `%canonModelID` ⇒ "EOS D30"),
+  //     `CanonImageType`, `ROMOperationMode`.
+  // It DELIBERATELY excludes every Composite-trigger combo (no
+  // CameraSettings/ShotInfo/FocalLength → no `Composite:Lens`/`DriveMode`/
+  // `ShutterSpeed`/…), so the bundled `-G1 -j` output carries ONLY File:/
+  // CanonRaw: keys (oracle-confirmed: NO Composite/XMP). The reused
+  // `Canon::*` MakerNote sub-table dispatch (incl. the #183 ShotInfo
+  // `FILE_TYPE eq "CRW"` raw-0 ExposureTime branch) is covered by the
+  // `crw.rs` unit tests + the `vendors/canon` suite, since exercising it in
+  // the conformance fixture would emit a `Composite:ShutterSpeed`.
+  check("CanonRaw_min.crw", "CanonRaw_min.crw.json", true);
+  check("CanonRaw_min.crw", "CanonRaw_min.crw.n.json", false);
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

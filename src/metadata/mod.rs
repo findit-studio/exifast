@@ -21,12 +21,16 @@
 //! `None` for later sub-ports and other formats to fill — the layer is
 //! deliberately extensible.
 
+#[cfg(feature = "crw")]
+pub(crate) mod crw;
 mod domain;
 #[cfg(feature = "png")]
 pub(crate) mod png;
 pub mod project;
 mod quicktime;
 
+#[cfg(feature = "crw")]
+pub use crw::{CrwMeta, CrwSubTable, CrwSubTableBlock};
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
 };
