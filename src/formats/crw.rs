@@ -427,12 +427,20 @@ fn process_canon_raw(
           RecordValue::BinaryPlaceholder(size),
           order,
           dir_name,
+          false, // a large binary LEAF is only reached on the out-of-line path
         );
         continue;
       }
     }
 
-    emit_record(meta, tag_id, RecordValue::Bytes(value), order, dir_name);
+    emit_record(
+      meta,
+      tag_id,
+      RecordValue::Bytes(value),
+      order,
+      dir_name,
+      value_in_dir,
+    );
   }
 }
 
@@ -492,7 +500,12 @@ enum RecordValue {
 /// `ImageFormat` binary sub-tables) populate typed fields; the Canon MakerNote
 /// records (`0x1029`/`0x102a`/`0x102d`/`0x1031`/`0x1038`/`0x1093`/`0x10a9`) are
 /// retained as raw blocks. `dir_name` is `$$self{DIR_NAME}` (only the `0x0805`
-/// record reads it). Records not ported are ignored (faithful to bundled's
+/// record reads it). `value_in_dir` is `$valueInDir` (`CanonRaw.pm:692`) — when
+/// set, the value lived inline in the entry's 8-byte size+ptr fields and
+/// bundled forces `$count = 1` for a non-string/non-subdir value
+/// (`CanonRaw.pm:698-699`), so a NAMED ARRAY record (`NullRecord`/
+/// `CanonColorInfo1`/`CanonColorInfo2`) reads exactly ONE element rather than
+/// `int(8/formatSize)`. Records not ported are ignored (faithful to bundled's
 /// table-miss `next unless defined $tagInfo`, `CanonRaw.pm:760`).
 fn emit_record(
   meta: &mut CrwMeta<'_>,
@@ -500,6 +513,7 @@ fn emit_record(
   value: RecordValue,
   order: ByteOrder,
   dir_name: CrwDir,
+  value_in_dir: bool,
 ) {
   // The Canon sub-table records keep their raw bytes for the per-`ConvMode`
   // re-decode in `Taggable` (these are never value-in-dir / large in real
@@ -541,8 +555,10 @@ fn emit_record(
         RecordValue::Bytes(b) => b.len(),
         RecordValue::BinaryPlaceholder(n) => n,
       };
-      // Store the byte count via a zero-filled placeholder block: the
-      // serializer renders `(Binary data N bytes …)` from the `Vec` length.
+      // Store ONLY the byte count (`usize`): `tags()` renders the
+      // `(Binary data N bytes …)` placeholder string directly from it
+      // (`crate::value::binary_placeholder`) — never materializing the
+      // (potentially multi-MB) payload.
       let name = match tag_id {
         0x0001 => CrwBinary::FreeBytes,
         0x2005 => CrwBinary::RawData,
@@ -552,7 +568,7 @@ fn emit_record(
       meta.push_binary(name, n);
     }
     // ---- the rest are scalar / structural records ------------------------
-    other => emit_scalar(meta, other, value, order, dir_name),
+    other => emit_scalar(meta, other, value, order, dir_name, value_in_dir),
   }
 }
 
@@ -588,13 +604,17 @@ impl CrwBinary {
 /// that are read as a VALUE then re-dispatched as a ProcessBinaryData
 /// sub-table on `\$value` (`TimeStamp`/`ImageInfo`/`DecoderTable`/
 /// `RawJpgInfo`, `CanonRaw.pm:762-796`) are unpacked here from their block.
-/// `dir_name` is `$$self{DIR_NAME}` (only `0x0805` reads it).
+/// `dir_name` is `$$self{DIR_NAME}` (only `0x0805` reads it). `value_in_dir`
+/// (`$valueInDir`, `CanonRaw.pm:692`) only affects the NAMED no-conv ARRAY
+/// records: inline values force `$count = 1` (`CanonRaw.pm:698-699`), so they
+/// read a single element.
 fn emit_scalar(
   meta: &mut CrwMeta<'_>,
   tag_id: u16,
   value: RecordValue,
   order: ByteOrder,
   dir_name: CrwDir,
+  value_in_dir: bool,
 ) {
   // A large (placeholder-only) value cannot be one of these scalar records in
   // real CRW; ignore it (bundled's `undef $format` arm only applies to
@@ -602,6 +622,18 @@ fn emit_scalar(
   let RecordValue::Bytes(bytes) = value else {
     return;
   };
+
+  // ZERO-LENGTH residual (crafted/malformed input only — no camera-written CRW
+  // emits a zero-length record). The STRING records below NUL-trim to `""` and
+  // the NAMED ARRAY records (in `emit_record`'s array arm) already emit `""`,
+  // matching the oracle. The NUMERIC scalars (int16u/int32u/float, each guarded
+  // by a `bytes.len() >= N` arm) are OMITTED on a zero-length value, whereas
+  // bundled emits a per-type ValueConv-of-empty render (`-n`: `""`; `-j`:
+  // `"Unknown ()"` / `"0 s"` / `" mm"` etc. from interpolating Perl's empty
+  // string through each conv). Emulating that loose-typing for input that never
+  // occurs in a real CRW is out of scope (tracked residual); the conformance
+  // fixture `CanonRaw_zerolen.crw` therefore covers only the array + binary
+  // kinds the port matches byte-for-byte.
 
   match tag_id {
     // ---- string records (`CanonRaw.pm:200-211`) --------------------------
@@ -955,10 +987,21 @@ fn emit_scalar(
     // (0x102c) are NAMED but carry no `SubDirectory`, no `PrintConv` and no
     // `Format` override, so ExifTool reads the whole record as a
     // `%crwTagFormat{tagType}` array and emits it via `FoundTag` with no conv
-    // (`CanonRaw.pm:798-800`). The element count is `int(size / formatSize)`
-    // (`CanonRaw.pm:735-740`). The format is fixed by the tag_id's tagType
+    // (`CanonRaw.pm:798-800`). The format is fixed by the tag_id's tagType
     // bits: 0x0000/0x0032 ⇒ tagType 0x00 ⇒ int8u; 0x102c ⇒ tagType 0x10 ⇒
     // int16u (`CanonRaw.pm:36-44`). (Verified vs `perl exiftool -G1`.)
+    //
+    // Element count (`CanonRaw.pm:734-740` + the `valueInDir` clause `:698`):
+    //   - VALUE-IN-DIR ⇒ `$count = 1` is FORCED for a non-string/non-subdir
+    //     value (these records have no `Count`, no `SubDirectory`), so
+    //     `ReadValue` reads exactly ONE element from the 8 inline bytes — NOT
+    //     `int(8/formatSize)` (oracle-confirmed: an inline `CanonColorInfo2`
+    //     emits the bare FIRST word, e.g. `11`, not `"11 22 33 44"`).
+    //   - OUT-OF-LINE ⇒ `$count = int(size / formatSize)`; a zero-length record
+    //     yields `$count = 0`, and `ReadValue(…, 0, …)` returns the EMPTY STRING
+    //     `''` (`ExifTool.pm:6296-6298`), so the tag is still emitted — as `""`
+    //     (oracle-confirmed). We push an EMPTY [`CrwRawArray`] for that case,
+    //     which `render_raw_array` renders as the empty string in both modes.
     0x0000 | 0x0032 | 0x102c => {
       let name = match tag_id {
         0x0000 => "NullRecord",
@@ -966,17 +1009,22 @@ fn emit_scalar(
         _ => "CanonColorInfo2",
       };
       // int16u for 0x102c (tagType 0x10), int8u for 0x0000/0x0032 (tagType 0x00).
-      let values = if tag_id == 0x102c {
+      let mut values = if tag_id == 0x102c {
         decode_u16_array(&bytes, order)
       } else {
         decode_u8_array(&bytes)
       };
-      if !values.is_empty() {
-        meta.push_raw_array(crate::metadata::CrwRawArray::new(
-          SmolStr::new_static(name),
-          values,
-        ));
+      // VALUE-IN-DIR forces `$count = 1` (`CanonRaw.pm:698-699`): keep only the
+      // FIRST decoded element. (The 8 inline bytes always yield ≥1 element for
+      // int8u/int16u; a defensive empty stays empty ⇒ `""`.)
+      if value_in_dir {
+        values.truncate(1);
       }
+      // Emit even when empty (a zero-length OUT-OF-LINE record ⇒ `""`).
+      meta.push_raw_array(crate::metadata::CrwRawArray::new(
+        SmolStr::new_static(name),
+        values,
+      ));
     }
 
     // Every other `CanonRaw::Main` record is not surfaced here: the only
@@ -1263,8 +1311,9 @@ fn fmt_perl_num(v: f64) -> String {
 /// a single bare scalar when the count is 1, else the elements space-joined
 /// (`"1 2 3 4"`). A single element ⇒ [`TagValue::U64`] (the bare number the
 /// oracle emits); multiple ⇒ a [`TagValue::Str`] (non-numeric, compared
-/// exactly). An empty value yields an empty string (never reached — the walker
-/// drops empty arrays).
+/// exactly). An empty value yields the empty string `""` — reached for a
+/// ZERO-LENGTH out-of-line record (`ReadValue` returns `''` for `$count == 0`,
+/// `ExifTool.pm:6296-6298`; oracle-confirmed `CanonColorInfo2: ""`).
 fn render_raw_array(values: &[u64]) -> TagValue {
   match values {
     [single] => TagValue::U64(*single),
@@ -1407,11 +1456,18 @@ impl crate::emit::Taggable for CrwMeta<'_> {
 
     // ---- binary image records (placeholder) ------------------------------
     // `FreeBytes`/`RawData`/`JpgFromRaw`/`ThumbnailImage` render as `(Binary
-    // data N bytes, …)` via `TagValue::Bytes` (the serializer formats the byte
-    // count). We synthesize a zero-filled `Vec` of the recorded length — the
-    // bytes are never emitted (no `-b`), only their count.
+    // data N bytes, …)`. Only the byte LENGTH is stored (a real `RawData` is
+    // multi-megabyte raw sensor data); we render the placeholder string DIRECTLY
+    // from that length via [`crate::value::binary_placeholder`] — allocating
+    // only the ~50-byte result string, NOT an N-byte buffer. The text is
+    // byte-identical to the `TagValue::Bytes` serializer (both share the same
+    // helper), so the goldens are unchanged. `*len` is `usize`; widen to `u64`.
     for (name, len) in self.binary_records() {
-      push_raw(&mut tags, name, TagValue::Bytes(std::vec![0u8; *len]));
+      push_raw(
+        &mut tags,
+        name,
+        TagValue::Str(crate::value::binary_placeholder(*len as u64)),
+      );
     }
 
     // ---- NAMED no-conv array records (`NullRecord`/`CanonColorInfo1`/
@@ -2530,5 +2586,154 @@ mod tests {
     assert_eq!(m2.binary_records()[0].1, 768);
     // FreeBytes is a binary LEAF, NOT a SubDirectory.
     assert!(!is_subdirectory_tag(0x0001));
+  }
+
+  /// FINDING 1: a binary leaf stores ONLY a byte LENGTH (a `usize`), never an
+  /// N-byte buffer — and `tags()` renders the `(Binary data N bytes …)`
+  /// placeholder string DIRECTLY from that length (a `TagValue::Str`, NOT a
+  /// `TagValue::Bytes` holding N zero bytes). Proves a multi-megabyte `RawData`
+  /// allocates nothing for its payload.
+  #[test]
+  fn binary_placeholder_stores_length_not_buffer() {
+    use crate::emit::ConvMode;
+    // A RawData (0x2005) leaf larger than the 512-byte read threshold takes the
+    // placeholder-only path: the walker keeps only the byte COUNT, copying no
+    // payload. (A 4096-byte fixture exercises the same storage shape a
+    // multi-megabyte real `RawData` would.)
+    const TEN_MB: usize = 10 * 1024 * 1024;
+    let mut root = HeapBuilder::new();
+    let blk = std::vec![0xCDu8; 4096];
+    root.add_value(0x2005, &blk);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+
+    // Typed storage is a (name, LENGTH) pair — a `usize`, not a buffer.
+    assert_eq!(m.binary_records().len(), 1);
+    let (name, len): &(SmolStr, usize) = &m.binary_records()[0];
+    assert_eq!(name.as_str(), "RawData");
+    assert_eq!(*len, 4096usize);
+
+    // The rendered value is the placeholder STRING (no `TagValue::Bytes`).
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    match find_tag(&t, "RawData") {
+      Some(TagValue::Str(s)) => assert_eq!(
+        s.as_str(),
+        "(Binary data 4096 bytes, use -b option to extract)"
+      ),
+      other => panic!("RawData should render as a placeholder Str, got {other:?}"),
+    }
+    // The placeholder helper renders from a LENGTH alone (the FINDING-1 path),
+    // byte-identical to the legacy `TagValue::Bytes` serializer.
+    assert_eq!(
+      crate::value::binary_placeholder(TEN_MB as u64).as_str(),
+      "(Binary data 10485760 bytes, use -b option to extract)"
+    );
+  }
+
+  /// FINDING 2 (value-in-directory): each new R3 SCALAR decodes from the inline
+  /// 8-byte size+ptr field identically to the out-of-line path
+  /// (`CanonRaw.pm:692-699`, oracle-confirmed). int16u reads the first 2 bytes,
+  /// int32u/float the first 4.
+  #[test]
+  fn value_in_directory_scalars_decode_inline() {
+    let mut root = HeapBuilder::new();
+    root.add_value_indir(0x1010, &0u16.to_le_bytes()); // ShutterReleaseMethod
+    root.add_value_indir(0x1011, &1u16.to_le_bytes()); // ShutterReleaseTiming
+    root.add_value_indir(0x1016, &3u16.to_le_bytes()); // ReleaseSetting
+    root.add_value_indir(0x1806, &10_000u32.to_le_bytes()); // SelfTimerTime -> 10
+    root.add_value_indir(0x1807, &1234.0f32.to_le_bytes()); // TargetDistanceSetting
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.shutter_release_method(), Some(0));
+    assert_eq!(m.shutter_release_timing(), Some(1));
+    assert_eq!(m.release_setting(), Some(3));
+    assert_eq!(m.self_timer_time(), Some(10.0));
+    assert_eq!(m.target_distance_setting(), Some(1234.0));
+  }
+
+  /// FINDING 2 (value-in-directory ARRAY): a NAMED no-conv array record stored
+  /// inline forces `$count = 1` (`CanonRaw.pm:698-699`), so it reads ONLY the
+  /// FIRST element from the 8 inline bytes — NOT `int(8/formatSize)`
+  /// (oracle-confirmed: `CanonColorInfo2: 11`, not `"11 22 33 44"`). A single
+  /// element renders as the BARE number.
+  #[test]
+  fn value_in_directory_array_forces_count_one() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    // int16u inline: 4 words present, but valueInDir ⇒ count 1 ⇒ first word only.
+    root.add_value_indir(
+      0x102c,
+      &[11u16, 22, 33, 44]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<u8>>(),
+    );
+    // int8u inline: 8 bytes present ⇒ count 1 ⇒ first byte only.
+    root.add_value_indir(0x0000, &[7u8, 8, 9, 10, 11, 12, 13, 14]);
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.raw_arrays().len(), 2);
+    // The typed record carries exactly one element each.
+    for r in m.raw_arrays() {
+      assert_eq!(r.values().len(), 1, "{} should be count 1", r.name());
+    }
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(find_tag(&t, "CanonColorInfo2"), Some(TagValue::U64(11)));
+    assert_eq!(find_tag(&t, "NullRecord"), Some(TagValue::U64(7)));
+  }
+
+  /// FINDING 2 (zero-length): a NAMED no-conv ARRAY record with `size == 0`
+  /// yields `$count = 0`, and `ReadValue` returns the EMPTY STRING `''`
+  /// (`ExifTool.pm:6296-6298`), so the tag is STILL emitted — as `""`
+  /// (oracle-confirmed), in both `-j` and `-n`. (The port previously dropped
+  /// empty arrays entirely.)
+  #[test]
+  fn zero_length_array_emits_empty_string() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x0000, b""); // NullRecord int8u[] zero-length
+    root.add_value(0x102c, b""); // CanonColorInfo2 int16u[] zero-length
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.raw_arrays().len(), 2);
+    for r in m.raw_arrays() {
+      assert!(r.values().is_empty());
+    }
+    for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
+      let t = canonraw_tags(&m, mode);
+      assert_eq!(find_tag(&t, "NullRecord"), Some(TagValue::Str("".into())));
+      assert_eq!(
+        find_tag(&t, "CanonColorInfo2"),
+        Some(TagValue::Str("".into()))
+      );
+    }
+  }
+
+  /// FINDING 2 (zero-length binary): a zero-length binary LEAF (`RawData`/
+  /// `FreeBytes`) renders the `(Binary data 0 bytes …)` placeholder and never
+  /// panics / over-reads (oracle-confirmed).
+  #[test]
+  fn zero_length_binary_leaf_placeholder() {
+    use crate::emit::ConvMode;
+    let mut root = HeapBuilder::new();
+    root.add_value(0x2005, b""); // RawData zero-length
+    root.add_value(0x0001, b""); // FreeBytes zero-length
+    let data = build_file(&root);
+    let m = parse_inner(&data).expect("valid CRW");
+    assert_eq!(m.binary_records().len(), 2);
+    assert!(m.binary_records().iter().all(|(_, len)| *len == 0));
+    let t = canonraw_tags(&m, ConvMode::PrintConv);
+    assert_eq!(
+      find_tag(&t, "RawData"),
+      Some(TagValue::Str(
+        "(Binary data 0 bytes, use -b option to extract)".into()
+      ))
+    );
+    assert_eq!(
+      find_tag(&t, "FreeBytes"),
+      Some(TagValue::Str(
+        "(Binary data 0 bytes, use -b option to extract)".into()
+      ))
+    );
   }
 }

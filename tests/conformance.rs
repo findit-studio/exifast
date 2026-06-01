@@ -214,6 +214,51 @@ fn crw_whitesample_big_conformance() {
 }
 
 #[test]
+fn crw_value_in_directory_conformance() {
+  // The `valueInDir` branch (`CanonRaw.pm:692-699`): a record's value lives in
+  // the entry's 8-byte size+ptr fields (`$size = 8`, `$value = substr($buff,
+  // $pt+2, 8)`), and for a non-string/non-subdir value bundled FORCES
+  // `$count = 1` (`CanonRaw.pm:698-699`). `tests/fixtures/CanonRaw_valueindir.crw`
+  // is a CRAFTED Composite-free CIFF heap (verified via `perl exiftool 13.59
+  // -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys) whose 5 R3 scalars
+  // (`ShutterReleaseMethod`/`Timing`, `ReleaseSetting`, `SelfTimerTime`,
+  // `TargetDistanceSetting`) PLUS `BaseISO` are all stored inline via
+  // `valueInDir`, and an inline `CanonColorInfo2` (0x102c) array record —
+  // whose `valueInDir` `$count = 1` makes it emit the BARE FIRST word (`11`),
+  // NOT the 4-word `int(8/2)` array. Confirms every new scalar decodes from the
+  // inline field identically to the out-of-line path, and the array record
+  // honours the forced count.
+  check(
+    "CanonRaw_valueindir.crw",
+    "CanonRaw_valueindir.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_valueindir.crw",
+    "CanonRaw_valueindir.crw.n.json",
+    false,
+  );
+}
+
+#[test]
+fn crw_zero_length_records_conformance() {
+  // The ZERO-LENGTH (`size == 0`) record edge (`ReadValue` `$count == 0` ⇒ the
+  // EMPTY STRING `''`, `ExifTool.pm:6296-6298`). `tests/fixtures/
+  // CanonRaw_zerolen.crw` is a CRAFTED Composite-free CIFF heap (verified via
+  // `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys) whose
+  // NAMED no-conv ARRAY records (`NullRecord` 0x0000, `CanonColorInfo1` 0x0032,
+  // `CanonColorInfo2` 0x102c) are each zero-length ⇒ emitted as `""`, and whose
+  // binary LEAVES (`RawData` 0x2005, `FreeBytes` 0x0001) are zero-length ⇒
+  // `(Binary data 0 bytes, use -b option to extract)`. (Zero-length numeric
+  // SCALAR records — whose per-type ValueConv-of-empty rendering, e.g.
+  // `"Unknown ()"`/`"0 s"`/`" mm"`, only arises on this MALFORMED input that no
+  // camera-written CRW produces — stay a documented crafted-input residual; see
+  // the `emit_scalar` note in `src/formats/crw.rs`.)
+  check("CanonRaw_zerolen.crw", "CanonRaw_zerolen.crw.json", true);
+  check("CanonRaw_zerolen.crw", "CanonRaw_zerolen.crw.n.json", false);
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

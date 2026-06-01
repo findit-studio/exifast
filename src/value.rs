@@ -192,6 +192,23 @@ pub fn perl_nonfinite_str(val: f64) -> Option<&'static str> {
   }
 }
 
+/// ExifTool's universal no-`-b` binary placeholder string for a value of `len`
+/// bytes: `"(Binary data <len> bytes, use -b option to extract)"`
+/// (`ExifTool.pm` `ConvertBinary` / the writer's `Binary data` rendering, and
+/// `CanonRaw.pm:717` `"Binary data $size bytes"` for the over-512 leaf). The
+/// SINGLE source of truth for this text — used both by the [`TagValue::Bytes`]
+/// serializer (which derives `len` from the buffer it holds) and by callers
+/// that know only the byte LENGTH of a binary leaf (e.g. the CRW
+/// `RawData`/`JpgFromRaw`/`ThumbnailImage`/`FreeBytes` records, whose
+/// multi-megabyte payload is never materialized). Renders from the length
+/// alone — it allocates only the (~50-byte) result string, never the payload.
+#[must_use]
+pub fn binary_placeholder(len: u64) -> SmolStr {
+  SmolStr::from(std::format!(
+    "(Binary data {len} bytes, use -b option to extract)"
+  ))
+}
+
 /// A metadata value. The variants cover what Stage-1 video/audio tags need;
 /// `Bytes`/`Rational` JSON encoding is wired in the first format plan (AAC).
 ///
@@ -709,11 +726,9 @@ const _: () = {
         TagValue::Str(text) => s.serialize_str(text),
         TagValue::Bool(b) => s.serialize_bool(*b),
         // ExifTool universal no-`-b` placeholder (a plain string, never
-        // numeric). N = byte length.
-        TagValue::Bytes(b) => s.serialize_str(&std::format!(
-          "(Binary data {} bytes, use -b option to extract)",
-          b.len()
-        )),
+        // numeric). N = byte length. Shares `binary_placeholder` with the
+        // length-only callers (CRW binary leaves) so the text stays identical.
+        TagValue::Bytes(b) => s.serialize_str(&binary_placeholder(b.len() as u64)),
         TagValue::Rational(r) => r.serialize(s),
         TagValue::List(items) => {
           let mut seq = s.serialize_seq(Some(items.len()))?;

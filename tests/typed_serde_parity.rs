@@ -207,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_273() {
+fn typed_serde_path_equals_writer_path_and_golden_all_275() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -937,12 +937,23 @@ fn typed_serde_path_equals_writer_path_and_golden_all_273() {
   // (0x0032/0x102c, the NAMED no-conv `%crwTagFormat{tagType}` arrays). Verified
   // via `perl exiftool 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
   // This completes the `%CanonRaw::Main` record coverage.
+  // 273 → 275 after the CRW value-in-directory + zero-length edge-case coverage
+  // (Codex CRW R4): `CanonRaw_valueindir.crw` — a CRAFTED Composite-free CIFF
+  // heap whose 5 R3 scalars + `BaseISO` are stored inline via `valueInDir`
+  // (`CanonRaw.pm:692-699`) plus an inline `CanonColorInfo2` array record (the
+  // `valueInDir` forced `$count = 1` ⇒ the bare first word `11`, not the 4-word
+  // array). `CanonRaw_zerolen.crw` — a CRAFTED Composite-free CIFF heap whose
+  // NAMED no-conv ARRAY records (`NullRecord`/`CanonColorInfo1`/`CanonColorInfo2`)
+  // are each zero-length ⇒ `""` (`ReadValue` `$count == 0`, `ExifTool.pm:6296`)
+  // and whose binary LEAVES (`RawData`/`FreeBytes`) are zero-length ⇒ the
+  // `(Binary data 0 bytes …)` placeholder. Both verified via `perl exiftool
+  // 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    273,
-    "expected exactly the 273 active conformance fixtures, found {}: {:?}",
+    275,
+    "expected exactly the 275 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "CanonRaw_zerolen.crw",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "CRW",
+  "File:FileTypeExtension": "CRW",
+  "File:MIMEType": "image/x-canon-crw",
+  "CanonRaw:NullRecord": "",
+  "CanonRaw:CanonColorInfo1": "",
+  "CanonRaw:CanonColorInfo2": "",
+  "CanonRaw:RawData": "(Binary data 0 bytes, use -b option to extract)",
+  "CanonRaw:FreeBytes": "(Binary data 0 bytes, use -b option to extract)"
+}]

@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "CanonRaw_valueindir.crw",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "CRW",
+  "File:FileTypeExtension": "CRW",
+  "File:MIMEType": "image/x-canon-crw",
+  "CanonRaw:Make": "Canon",
+  "CanonRaw:Model": "Canon EOS DIGITAL REBEL",
+  "CanonRaw:ShutterReleaseMethod": 0,
+  "CanonRaw:ShutterReleaseTiming": 1,
+  "CanonRaw:ReleaseSetting": 3,
+  "CanonRaw:SelfTimerTime": 10,
+  "CanonRaw:TargetDistanceSetting": 1234,
+  "CanonRaw:BaseISO": 100,
+  "CanonRaw:CanonColorInfo2": 11
+}]
