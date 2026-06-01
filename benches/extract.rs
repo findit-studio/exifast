@@ -5,7 +5,7 @@
 //! tracks wall-clock so a CPU regression (an extra parse pass, an O(n²) scan)
 //! shows up in `cargo bench` too. Not wired into CI — a developer aid.
 
-use criterion::{criterion_group, Criterion};
+use criterion::{Criterion, criterion_group};
 use std::hint::black_box;
 
 /// Read a fixture's bytes.
@@ -42,11 +42,21 @@ fn bench_extract(c: &mut Criterion) {
   for &name in FIXTURES {
     let bytes = fixture_bytes(name);
     ei.bench_function(format!("{name}/-j"), |b| {
-      b.iter(|| black_box(exifast::parser::extract_info(black_box(name), black_box(&bytes), true)));
+      b.iter(|| {
+        black_box(exifast::parser::extract_info(
+          black_box(name),
+          black_box(&bytes),
+          true,
+        ))
+      });
     });
     ei.bench_function(format!("{name}/-n"), |b| {
       b.iter(|| {
-        black_box(exifast::parser::extract_info(black_box(name), black_box(&bytes), false))
+        black_box(exifast::parser::extract_info(
+          black_box(name),
+          black_box(&bytes),
+          false,
+        ))
       });
     });
   }

@@ -800,8 +800,11 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   // `Value`s are already built). `%noDups` first-wins is preserved EXACTLY: a
   // format tag whose `"<family1>:<name>"` key already exists in `obj` is
   // skipped (the orchestration value wins), reproducing the old `or_insert`.
-  serde_json::to_string(&Document { obj: &obj, tags: &tm })
-    .unwrap_or_else(|_| Value::Array(vec![Value::Object(obj)]).to_string())
+  serde_json::to_string(&Document {
+    obj: &obj,
+    tags: &tm,
+  })
+  .unwrap_or_else(|_| Value::Array(vec![Value::Object(obj)]).to_string())
 }
 
 /// The `extract_info` document as a direct `serde::Serialize` (P4): a one-element

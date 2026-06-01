@@ -97,7 +97,6 @@ impl TagMap {
     }
   }
 
-
   /// Insert `value` under the `"<group>:<name>"` key with faithful `FoundTag`
   /// LAST-wins (a later emission of the same key REPLACES the earlier value in
   /// place, preserving first-occurrence POSITION — ExifTool.pm:9437-9519). This
@@ -245,7 +244,6 @@ impl TagMap {
   pub(crate) const fn entries(&self) -> &[(SmolStr, SmolStr, TagValue)] {
     self.entries.as_slice()
   }
-
 
   /// The FIRST recorded warning, if any (`ExifTool:Warning` under default `-j`).
   #[inline(always)]

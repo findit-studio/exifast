@@ -205,11 +205,11 @@ fn media_metadata_budget(name: &str) -> usize {
   match name {
     // Canon dominates (the MakerNote vendor decode). P0 (single-mode decode)
     // took its `media_metadata` from 1391 → 756.
-    "MakerNotes_Canon.jpg" => 800, // measured 756
-    "MakerNotes_Apple.jpg" => 145, // measured 133 (P0: 176 → 133)
-    "ID3v2_4_big.mp3" => 210,      // measured 194
+    "MakerNotes_Canon.jpg" => 800,        // measured 756
+    "MakerNotes_Apple.jpg" => 145,        // measured 133 (P0: 176 → 133)
+    "ID3v2_4_big.mp3" => 210,             // measured 194
     "QuickTime_frea_rexing17b.mov" => 40, // measured 31
-    "Real.ra" => 30,               // measured 21 (P8: 31 → 21)
+    "Real.ra" => 30,                      // measured 21 (P8: 31 → 21)
     // An unlisted fixture: no pinned budget (the harness still prints + checks
     // parse acceptance, just no ceiling).
     _ => usize::MAX,

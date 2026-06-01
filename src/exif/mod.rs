@@ -466,10 +466,7 @@ enum MakerNoteValueConvDecode<'a> {
   /// `%Main` route did not match — its PrintConv decode produced none either).
   None,
   /// Apple — `parse_with_print_conv(blob, order, ·)`.
-  Apple {
-    blob: &'a [u8],
-    order: ByteOrder,
-  },
+  Apple { blob: &'a [u8], order: ByteOrder },
   /// Canon — `parse_in_tiff(data, mn_offset, mn_len, order, ·, model, file_type)`.
   Canon {
     data: &'a [u8],
