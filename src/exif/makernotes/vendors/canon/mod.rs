@@ -63,11 +63,13 @@
 pub mod af_info;
 pub mod body;
 pub mod camera_settings;
+pub mod color_balance;
 pub mod file_info;
 pub mod focal_length;
 pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
+pub mod sensor_info;
 pub mod shot_info;
 pub mod tags;
 
@@ -552,6 +554,28 @@ pub fn parse_in_tiff(
             for (name, value) in fl {
               emissions.push(VendorEmission::new(name, value, false));
             }
+          }
+        }
+        SubTable::SensorInfo => {
+          // `Canon::SensorInfo` (`Canon.pm:7411-7434`): FORMAT int16s,
+          // FIRST_ENTRY 1. Sensor + black-mask border coordinates. No
+          // `PrintConv` on any position ⇒ `-j` and `-n` agree.
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          let si = sensor_info::parse(&blob_bytes, parent_order, print_conv);
+          // Explicit BinaryData positions are never `Unknown`.
+          for (name, value) in si {
+            emissions.push(VendorEmission::new(name, value, false));
+          }
+        }
+        SubTable::ColorBalance => {
+          // `Canon::ColorBalance` (`Canon.pm:7268-7293`): FORMAT int16s,
+          // FIRST_ENTRY 0. The WB_RGGBLevels quads. `model` selects the
+          // position-29 name (WB_RGGBLevelsCustom vs the D60 BlackLevels,
+          // `Canon.pm:7282-7290`). No `PrintConv` ⇒ `-j` and `-n` agree.
+          let blob_bytes = reserialize_int_array(&entry.value, parent_order);
+          let cb = color_balance::parse(&blob_bytes, parent_order, print_conv, model);
+          for (name, value) in cb {
+            emissions.push(VendorEmission::new(name, value, false));
           }
         }
         _ => {

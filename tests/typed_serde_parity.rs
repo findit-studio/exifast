@@ -207,7 +207,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_267() {
+fn typed_serde_path_equals_writer_path_and_golden_all_275() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -885,12 +885,75 @@ fn typed_serde_path_equals_writer_path_and_golden_all_267() {
   // NO `File:PageCount` (ExifTool.pm:8767) while still extracting every IFD tag.
   // Pins the standalone-TIFF arm gating PageCount on the candidate `Parent`
   // (not a hard-coded `true`).
+  // 267 → 268 after the Canon CRW (CIFF) container — Phase 1:
+  // `CanonRaw_min.crw` — a HAND-CRAFTED minimal CIFF heap (the real
+  // `t/images/CanonRaw.crw` emits ~25 camera `Composite:*` tags + XMP this
+  // port cannot emit, so it cannot be a byte-exact fixture). The crafted heap
+  // exercises the `ProcessCRW` header validate + the recursive
+  // `ProcessCanonRaw` HEAP walker (nested auto-subdirectory + value-in-dir
+  // record) + the `CanonRaw::Main` scalar records (`Make`/`Model`/`FileFormat`
+  // PrintHex/`CanonModelID` `%canonModelID`/…), DELIBERATELY excluding every
+  // Composite-trigger combo so the bundled `-G1 -j`/`-n` goldens carry ONLY
+  // File:/CanonRaw: keys.
+  // 268 → 270 after the Canon CRW completion (`CanonRaw::Main` remaining scalar
+  // + structural records, `Canon::SensorInfo` + `Canon::ColorBalance`):
+  // `CanonRaw_records.crw` (the rest of the scalar table — TargetImageType/
+  // RecordID/FileNumber/UserComment/CanonFileDescription/MeasuredEV/
+  // SerialNumber/ColorTemperature/ColorSpace — plus the TimeStamp/DecoderTable/
+  // RawJpgInfo structural sub-tables + a Canon::SensorInfo sub-table) and
+  // `CanonRaw_colorbalance.crw` (the Canon::ColorBalance WB_RGGBLevels quads).
+  // Both are CRAFTED Composite-free CIFF heaps (verified via `perl exiftool
+  // -G1 -j` to carry only File:/CanonRaw:/Canon: keys).
+  // 270 → 271 after porting the omitted `CanonRaw::Main` binary sub-tables
+  // (the Codex CRW finding): `CanonRaw_omitted_records.crw` — a CRAFTED
+  // Composite-free CIFF heap exercising `ExposureInfo` (0x1818 →
+  // ExposureCompensation; ShutterSpeedValue/ApertureValue are unit-tested,
+  // omitted here as ANY emitted ApertureValue/ShutterSpeedValue would
+  // synthesize a `Composite:Aperture`/`Composite:ShutterSpeed`), `FlashInfo`
+  // (0x1813 → FlashGuideNumber/FlashThreshold), `WhiteSample` (0x1030 → the
+  // WhiteSample* positions + the `int16u[4]` `BlackLevels`, gated on the
+  // `Canon::Validate` length check), AND a `TimeStamp` (0x180e) with a
+  // FRACTIONAL `TimeZoneCode` (19800 ⇒ 5.5 via the FLOAT `$val/3600`). Verified
+  // via `perl exiftool -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
+  // 271 → 272 after the CRW SubDirectory read-gate fix (`CanonRaw.pm:707-709`:
+  // a record whose tag has a `SubDirectory` is read REGARDLESS of size):
+  // `CanonRaw_whitesample_big.crw` — a CRAFTED Composite-free CIFF heap whose
+  // `WhiteSample` (0x1030) block is 600 bytes (> the 512 read threshold), with
+  // the named fields up front and a 482-byte arbitrary "encrypted" tail
+  // (`CanonRaw.pm:598`). Before the fix the 600-byte block was dropped to a
+  // `(Binary data 600 bytes)` placeholder, losing every WhiteSample named tag;
+  // the oracle (and now the port) read the full block. The golden CONTAINS the
+  // WhiteSample* + `BlackLevels` tags, proving the >512 SubDirectory block was
+  // read. Verified via `perl exiftool -G1 -j`/`-n` to carry only File:/
+  // CanonRaw: keys.
+  // 272 → 273 after the FINAL CRW coverage gap (the remaining `CanonRaw::Main`
+  // scalar tags + the omitted NAMED no-conv records): `CanonRaw_scalars.crw` —
+  // a CRAFTED Composite-free CIFF heap carrying `ShutterReleaseMethod` (0x1010,
+  // PrintConv), `ShutterReleaseTiming` (0x1011, PrintConv), `ReleaseSetting`
+  // (0x1016, no conv), `SelfTimerTime` (0x1806, `$val/1000` ValueConv + `"$val
+  // s"` PrintConv), `TargetDistanceSetting` (0x1807, `Format => 'float'` +
+  // `"$val mm"` PrintConv), plus `NullRecord` (0x0000, int8u[]), `FreeBytes`
+  // (0x0001, `Binary => 1` placeholder), and `CanonColorInfo1`/`CanonColorInfo2`
+  // (0x0032/0x102c, the NAMED no-conv `%crwTagFormat{tagType}` arrays). Verified
+  // via `perl exiftool 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
+  // This completes the `%CanonRaw::Main` record coverage.
+  // 273 → 275 after the CRW value-in-directory + zero-length edge-case coverage
+  // (Codex CRW R4): `CanonRaw_valueindir.crw` — a CRAFTED Composite-free CIFF
+  // heap whose 5 R3 scalars + `BaseISO` are stored inline via `valueInDir`
+  // (`CanonRaw.pm:692-699`) plus an inline `CanonColorInfo2` array record (the
+  // `valueInDir` forced `$count = 1` ⇒ the bare first word `11`, not the 4-word
+  // array). `CanonRaw_zerolen.crw` — a CRAFTED Composite-free CIFF heap whose
+  // NAMED no-conv ARRAY records (`NullRecord`/`CanonColorInfo1`/`CanonColorInfo2`)
+  // are each zero-length ⇒ `""` (`ReadValue` `$count == 0`, `ExifTool.pm:6296`)
+  // and whose binary LEAVES (`RawData`/`FreeBytes`) are zero-length ⇒ the
+  // `(Binary data 0 bytes …)` placeholder. Both verified via `perl exiftool
+  // 13.59 -G1 -j`/`-n` to carry only File:/CanonRaw: keys.
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    267,
-    "expected exactly the 267 active conformance fixtures, found {}: {:?}",
+    275,
+    "expected exactly the 275 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );

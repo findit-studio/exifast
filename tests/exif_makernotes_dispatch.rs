@@ -2974,3 +2974,187 @@ fn canon_shot_info_real_fixture_new_positions() {
     );
   }
 }
+
+/// Canon CRW completion — `MakerNotes_Canon.jpg` now emits the `ColorBalance`
+/// (`Canon::Main` 0xa9 → `Canon::ColorBalance`) WB_RGGBLevels tags. The real
+/// JPEG carries a ColorBalance sub-directory; before the port walked it the
+/// `Canon:WB_RGGBLevels*` tags were silently dropped (a faithfulness gap).
+/// Oracle (`perl exiftool 13.59 -G1 -j t/images/Canon.jpg`):
+/// `Canon:WB_RGGBLevelsAuto "1719 832 831 990"`, …, `WB_RGGBBlackLevels
+/// "124 123 124 123"` (the int16s[4] quads, space-joined). The 300D is NOT a
+/// D60, so position 29 is `WB_RGGBLevelsCustom` (not `BlackLevels`).
+#[cfg(feature = "json")]
+#[test]
+fn canon_color_balance_jpeg_emits_wb_rggb_levels() {
+  let jmap = extract_info_map("MakerNotes_Canon.jpg", true);
+  // The ColorBalance quads are space-joined strings, identical in -j/-n
+  // (no PrintConv). Spot-check the camera-facing ones from the oracle.
+  let want = [
+    ("Canon:WB_RGGBLevelsAuto", "1719 832 831 990"),
+    ("Canon:WB_RGGBLevelsDaylight", "1722 832 831 989"),
+    ("Canon:WB_RGGBLevelsShade", "2035 832 831 839"),
+    ("Canon:WB_RGGBLevelsTungsten", "1228 913 912 1668"),
+    ("Canon:WB_RGGBLevelsFlash", "1933 832 831 895"),
+    ("Canon:WB_RGGBLevelsCustom", "1722 832 831 989"),
+    ("Canon:WB_RGGBLevelsKelvin", "1722 832 831 988"),
+    ("Canon:WB_RGGBBlackLevels", "124 123 124 123"),
+  ];
+  for (k, v) in want {
+    assert_eq!(
+      jmap.get(k).and_then(|x| x.as_str()),
+      Some(v),
+      "{k} (-j) must be {v:?}; map keys: {:?}",
+      jmap
+        .keys()
+        .filter(|k| k.contains("WB_RGGB"))
+        .collect::<Vec<_>>()
+    );
+  }
+  // Non-D60 ⇒ no BlackLevels (that is the D60-only position-29 name).
+  assert!(
+    !jmap.contains_key("Canon:BlackLevels"),
+    "300D (not D60) must NOT emit Canon:BlackLevels"
+  );
+  // MaxAperture / MinAperture -n now apply the ValueConv (the float), NOT the
+  // raw APEX int (the CanonApex ValueConv fix). Oracle `perl exiftool 13.59 -n
+  // -j` on Canon.jpg: MaxAperture 4 (an integer-valued float), MinAperture
+  // 26.9086852881189 (`exp(CanonEv($val)*log(2)/2)`).
+  let nmap = extract_info_map("MakerNotes_Canon.jpg", false);
+  for (k, want) in [
+    ("Canon:MaxAperture", 4.0_f64),
+    ("Canon:MinAperture", 26.908_685_288_118_9),
+  ] {
+    let got = nmap.get(k).and_then(|v| v.as_f64());
+    assert!(
+      got.is_some_and(|f| (f - want).abs() < 1e-9),
+      "{k} (-n) must be the ValueConv float ~{want}; got {got:?}"
+    );
+  }
+}
+
+/// Canon CRW completion — full real-input fidelity on the REAL bundled
+/// `CanonRaw.crw` (EOS 300D / "Canon EOS DIGITAL REBEL"), copied verbatim to
+/// `tests/fixtures/CanonRaw_full.crw`. This file carries embedded XMP + ~25
+/// camera `Composite:*` tags the port cannot emit, so it is NOT a byte-golden
+/// conformance fixture; instead we assert the port emits ALL the
+/// `CanonRaw:*` + `Canon:*` tags the bundled oracle does, byte-identical
+/// (value-equivalent), and NOTHING under `Composite:`/`XMP*` (the legit
+/// port-wide omissions). Oracle: `perl exiftool 13.59 -G1 -j` ⇒ 41 `CanonRaw:`
+/// + 91 `Canon:` = 132 tags.
+#[cfg(feature = "json")]
+#[test]
+fn canon_crw_full_real_fixture_matches_oracle() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("CanonRaw_full.crw", print_on);
+
+    // (a) The legit OMISSIONS — no camera Composite subsystem, no XMP (#37),
+    // no CanonCustom (#87). These are PORT-WIDE deferrals.
+    let composite_or_xmp: Vec<&String> = map
+      .keys()
+      .filter(|k| k.starts_with("Composite:") || k.starts_with("XMP"))
+      .collect();
+    assert!(
+      composite_or_xmp.is_empty(),
+      "({mode}) port must emit NO Composite:/XMP tags (deferred); got {composite_or_xmp:?}"
+    );
+
+    // (b) The CanonRaw:/Canon: tag COUNT matches the oracle exactly:
+    // 41 CanonRaw: + 91 Canon: = 132.
+    let canonraw = map.keys().filter(|k| k.starts_with("CanonRaw:")).count();
+    let canon = map.keys().filter(|k| k.starts_with("Canon:")).count();
+    assert_eq!(
+      canonraw,
+      41,
+      "({mode}) expected 41 CanonRaw: tags, got {canonraw}; keys: {:?}",
+      map
+        .keys()
+        .filter(|k| k.starts_with("CanonRaw:"))
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+      canon,
+      91,
+      "({mode}) expected 91 Canon: tags, got {canon}; keys: {:?}",
+      map
+        .keys()
+        .filter(|k| k.starts_with("Canon:"))
+        .collect::<Vec<_>>()
+    );
+  }
+
+  // (c) Value spot-checks (-j): the NEWLY-completed CanonRaw scalar +
+  // structural records, the SensorInfo + ColorBalance sub-tables — the camera
+  // metadata an indexer cares about. (Oracle values, byte-identical.)
+  let j = extract_info_map("CanonRaw_full.crw", true);
+  let js = |k: &str| j.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+  let ji = |k: &str| j.get(k).and_then(serde_json::Value::as_i64);
+  // CanonRaw scalar / structural records.
+  assert_eq!(js("CanonRaw:FileNumber").as_deref(), Some("116-1602"));
+  assert_eq!(js("CanonRaw:SerialNumber").as_deref(), Some("0560018150"));
+  assert_eq!(
+    js("CanonRaw:DateTimeOriginal").as_deref(),
+    Some("2003:11:10 17:39:26")
+  );
+  assert_eq!(
+    js("CanonRaw:TargetImageType").as_deref(),
+    Some("Real-world Subject")
+  );
+  assert_eq!(js("CanonRaw:ColorSpace").as_deref(), Some("sRGB"));
+  assert_eq!(js("CanonRaw:RawJpgQuality").as_deref(), Some("Fine"));
+  assert_eq!(js("CanonRaw:RawJpgSize").as_deref(), Some("Medium"));
+  assert_eq!(
+    js("CanonRaw:CanonFileDescription").as_deref(),
+    Some("EOS DIGITAL REBEL CMOS RAW")
+  );
+  assert_eq!(js("CanonRaw:UserComment").as_deref(), Some(""));
+  assert_eq!(ji("CanonRaw:ColorTemperature"), Some(5200));
+  assert_eq!(ji("CanonRaw:RecordID"), Some(0));
+  assert_eq!(ji("CanonRaw:ImageWidth"), Some(3072));
+  assert_eq!(ji("CanonRaw:ImageHeight"), Some(2048));
+  assert_eq!(ji("CanonRaw:ComponentBitDepth"), Some(8));
+  assert_eq!(ji("CanonRaw:ColorBitDepth"), Some(24));
+  assert_eq!(ji("CanonRaw:ColorBW"), Some(257));
+  assert_eq!(ji("CanonRaw:DecoderTableNumber"), Some(1));
+  assert_eq!(ji("CanonRaw:CompressedDataOffset"), Some(514));
+  assert_eq!(ji("CanonRaw:CompressedDataLength"), Some(4_120_111));
+  assert_eq!(ji("CanonRaw:RawJpgWidth"), Some(2048));
+  assert_eq!(ji("CanonRaw:RawJpgHeight"), Some(1360));
+  // TimeZoneCode is the FLOAT `$val/3600` ValueConv (a +5:30 zone ⇒ 5.5), so
+  // it serializes as a JSON float — here the real file's 0 ⇒ `0.0` (value-
+  // equivalent to the oracle's `0`).
+  assert!(
+    j.get("CanonRaw:TimeZoneCode")
+      .and_then(serde_json::Value::as_f64)
+      .is_some_and(|f| f == 0.0),
+    "CanonRaw:TimeZoneCode must be 0 (float)"
+  );
+  assert_eq!(ji("CanonRaw:TimeZoneInfo"), Some(0));
+  // MeasuredEV: float 4.625 (ValueConv $val + 5).
+  assert!(
+    j.get("CanonRaw:MeasuredEV")
+      .and_then(serde_json::Value::as_f64)
+      .is_some_and(|f| (f - 4.625).abs() < 1e-6),
+    "CanonRaw:MeasuredEV must be 4.625"
+  );
+  // Canon::SensorInfo sub-table (border coordinates).
+  assert_eq!(ji("Canon:SensorWidth"), Some(3152));
+  assert_eq!(ji("Canon:SensorHeight"), Some(2068));
+  assert_eq!(ji("Canon:SensorLeftBorder"), Some(72));
+  assert_eq!(ji("Canon:SensorRightBorder"), Some(3143));
+  assert_eq!(ji("Canon:BlackMaskLeftBorder"), Some(24));
+  assert_eq!(ji("Canon:BlackMaskBottomBorder"), Some(1856));
+  // Canon::ColorBalance sub-table (WB_RGGBLevels quads).
+  assert_eq!(
+    js("Canon:WB_RGGBLevelsAuto").as_deref(),
+    Some("1740 832 831 931")
+  );
+  assert_eq!(
+    js("Canon:WB_RGGBLevelsCustom").as_deref(),
+    Some("1722 832 831 989")
+  );
+  assert_eq!(
+    js("Canon:WB_RGGBBlackLevels").as_deref(),
+    Some("125 124 125 124")
+  );
+}

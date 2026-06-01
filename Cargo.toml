@@ -61,7 +61,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 
 # Umbrella — enables every per-format gate.
 all-formats = [
-  "aac", "aiff", "ape", "audible", "dsf", "dv", "exif", "flac", "flash",
+  "aac", "aiff", "ape", "audible", "crw", "dsf", "dv", "exif", "flac", "flash",
   "gps", "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
   "png", "quicktime", "real", "red", "wavpack",
 ]
@@ -87,6 +87,17 @@ aac        = []
 aiff       = ["id3"]
 ape        = ["id3"]
 audible    = []
+# `crw` — Canon CRW (CIFF) raw container (`CanonRaw.pm`). CRW chains `exif`
+# because it REUSES the already-ported `Image::ExifTool::Canon` MakerNote
+# sub-tables (`Canon::CameraSettings`/`ShotInfo`/`FocalLength`/`AFInfo`/
+# `FileInfo`, which live under `src/exif/makernotes/vendors/canon`) for the
+# records `%CanonRaw::Main` dispatches into them — emitting `Canon:*` tags
+# exactly as a Canon JPEG does. Without the `exif` edge those decoders + the
+# IFD `ByteOrder`/`RawValue` vocabulary are absent. The CIFF HEAP walker +
+# the `CanonRaw::Main` scalar records are CRW-native (no other chain). The
+# `Canon::SensorInfo`/`ColorBalance` sub-tables + the camera Composite
+# subsystem + CanonCustom are Phase-2 / port-wide deferrals.
+crw        = ["exif"]
 dsf        = ["id3"]
 dv         = []
 # `exif` — the Exif/TIFF IFD infrastructure (FORMATS.md row 13). A standalone

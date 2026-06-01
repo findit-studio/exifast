@@ -126,12 +126,19 @@ pub enum SubTable {
   WbInfo,
   /// `%Canon::LensInfo` (`Canon.pm:9130-9148`).
   LensInfo,
+  /// `%Canon::SensorInfo` (`Canon.pm:7411-7434`) — Main tag 0xe0. FORMAT
+  /// int16s, FIRST_ENTRY 1. Sensor + black-mask border coordinates.
+  SensorInfo,
+  /// `%Canon::ColorBalance` (`Canon.pm:7268-7293`) — Main tag 0xa9. FORMAT
+  /// int16s, FIRST_ENTRY 0. The `WB_RGGBLevels{Auto,Daylight,…}` quads.
+  ColorBalance,
 }
 
 impl SubTable {
   /// `true` when the port walks this sub-table natively. Covers the
   /// Phase-2 set (CameraSettings / FileInfo / FocalLength) plus the deep
-  /// sub-tables added for issues #86/#88 (ShotInfo / AFInfo / AFInfo2).
+  /// sub-tables added for issues #86/#88 (ShotInfo / AFInfo / AFInfo2) and
+  /// the SensorInfo / ColorBalance border + WB-levels tables (the CRW port).
   /// `false` when it stays a raw-bytes blob for now (deferred).
   #[must_use]
   #[inline(always)]
@@ -145,6 +152,8 @@ impl SubTable {
         | SubTable::AfInfo
         | SubTable::AfInfo2
         | SubTable::AfInfo3
+        | SubTable::SensorInfo
+        | SubTable::ColorBalance
     )
   }
 }
@@ -593,12 +602,13 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0xa9 — ColorBalance (`Canon.pm:1907-1912`)
+  // 0xa9 — ColorBalance (`Canon.pm:1907-1912`) — SubDirectory to
+  // `Canon::ColorBalance` (the WB_RGGBLevels quads).
   CanonTag {
     id: 0xa9,
     name: "ColorBalance",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::ColorBalance),
     unknown: false,
   },
   // 0xaa — MeasuredColor (`Canon.pm:1914-1919`)
@@ -673,12 +683,13 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0xe0 — SensorInfo (`Canon.pm:1967-1973`)
+  // 0xe0 — SensorInfo (`Canon.pm:1967-1973`) — SubDirectory to
+  // `Canon::SensorInfo` (sensor + black-mask border coordinates).
   CanonTag {
     id: 0xe0,
     name: "SensorInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::SensorInfo),
     unknown: false,
   },
   // 0x4001 — ColorData (`Canon.pm:1974-2046`) — model-specific ColorDataN.

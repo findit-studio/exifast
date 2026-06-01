@@ -1,0 +1,21 @@
+[
+  {
+    "SourceFile": "CanonRaw_colorbalance.crw",
+    "ExifTool:ExifToolVersion": 13.58,
+    "File:FileType": "CRW",
+    "File:FileTypeExtension": "CRW",
+    "File:MIMEType": "image/x-canon-crw",
+    "CanonRaw:Make": "Canon",
+    "CanonRaw:Model": "Canon EOS DIGITAL REBEL",
+    "Canon:WB_RGGBLevelsAuto": "1740 832 831 931",
+    "Canon:WB_RGGBLevelsDaylight": "1722 832 831 989",
+    "Canon:WB_RGGBLevelsShade": "2035 832 831 839",
+    "Canon:WB_RGGBLevelsCloudy": "1878 832 831 903",
+    "Canon:WB_RGGBLevelsTungsten": "1228 913 912 1668",
+    "Canon:WB_RGGBLevelsFluorescent": "1506 842 841 1381",
+    "Canon:WB_RGGBLevelsFlash": "1964 832 831 877",
+    "Canon:WB_RGGBLevelsCustom": "1722 832 831 989",
+    "Canon:WB_RGGBLevelsKelvin": "1722 832 831 988",
+    "Canon:WB_RGGBBlackLevels": "125 124 125 124"
+  }
+]

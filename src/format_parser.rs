@@ -276,6 +276,9 @@ pub enum AnyParser {
   /// Audible (AA) (Phase F1 — DRM'd audiobook).
   #[cfg(feature = "audible")]
   Aa(crate::formats::audible::ProcessAa),
+  /// Canon CRW (CIFF) raw container.
+  #[cfg(feature = "crw")]
+  Crw(crate::formats::crw::ProcessCrw),
   /// Red R3D (Phase F1 — Redcode video).
   #[cfg(feature = "red")]
   R3D(crate::formats::red::ProcessR3D),
@@ -366,6 +369,13 @@ pub enum AnyMeta<'a> {
   /// Audible (AA) (Phase F1).
   #[cfg(feature = "audible")]
   Aa(crate::formats::audible::Meta<'a>),
+  /// Canon CRW (CIFF) raw container. The typed [`crate::metadata::CrwMeta`]
+  /// carries the `%CanonRaw::Main` scalar records + the raw blocks of the
+  /// records dispatched to the ported `Canon::*` MakerNote sub-tables (decoded
+  /// to `Canon:*` tags at serialize time). `'a` is a phantom (`CrwMeta` owns
+  /// its data — every value is transformed during the CIFF walk).
+  #[cfg(feature = "crw")]
+  Crw(crate::metadata::CrwMeta<'a>),
   /// Red R3D (Phase F1).
   #[cfg(feature = "red")]
   R3d(crate::formats::red::Meta<'a>),
@@ -457,6 +467,7 @@ pub enum AnyMeta<'a> {
     feature = "aac",
     feature = "dv",
     feature = "audible",
+    feature = "crw",
     feature = "red",
     feature = "id3",
     feature = "mp3",
@@ -517,6 +528,8 @@ impl AnyMeta<'_> {
       },
       #[cfg(feature = "audible")]
       AnyMeta::Aa(m) => m.tags(mode).collect(),
+      #[cfg(feature = "crw")]
+      AnyMeta::Crw(m) => m.tags(mode).collect(),
       #[cfg(feature = "red")]
       AnyMeta::R3d(m) => m.tags(mode).collect(),
       #[cfg(feature = "id3")]
@@ -566,6 +579,7 @@ impl AnyMeta<'_> {
         feature = "aac",
         feature = "dv",
         feature = "audible",
+        feature = "crw",
         feature = "red",
         feature = "id3",
         feature = "mp3",
@@ -705,6 +719,22 @@ impl AnyMeta<'_> {
         for e in m.errors() {
           out.write_error(e.as_str())?;
         }
+        Ok(())
+      }
+      #[cfg(feature = "crw")]
+      AnyMeta::Crw(_) => {
+        // CRW emits NO `$et->Warn`/`$et->Error` for the ported records: the
+        // two `ProcessCanonRaw` warnings (`Bad CRW directory entry`
+        // `CanonRaw.pm:652`, `Not processing double-referenced … directory`
+        // `CanonRaw.pm:636`) are stop-the-walk events that never fire on a
+        // real/crafted CRW (no `tagInfo`-less or self-referential directory),
+        // and the embedded Canon sub-table decoders raise none. The
+        // `CRW file format error` warning (`CanonRaw.pm:842`) is unreachable
+        // here too — a header/signature mismatch returns `Ok(None)` (the
+        // engine then emits its own `ExifTool:Error`), and a valid header with
+        // an unreadable root directory still produces `Some(meta)` with no
+        // records (bundled's `ProcessCanonRaw` `return 0` warns, but no real
+        // CRW reaches it). So nothing to drain.
         Ok(())
       }
       #[cfg(feature = "red")]
@@ -1046,6 +1076,7 @@ impl AnyMeta<'_> {
         feature = "aac",
         feature = "dv",
         feature = "audible",
+        feature = "crw",
         feature = "red",
         feature = "id3",
         feature = "mp3",
@@ -1249,6 +1280,8 @@ impl AnyMeta<'_> {
       },
       #[cfg(feature = "audible")]
       AnyMeta::Aa(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "crw")]
+      AnyMeta::Crw(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "red")]
       AnyMeta::R3d(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "id3")]
@@ -1292,6 +1325,7 @@ impl AnyMeta<'_> {
         feature = "aac",
         feature = "dv",
         feature = "audible",
+        feature = "crw",
         feature = "red",
         feature = "id3",
         feature = "mp3",
@@ -1330,6 +1364,10 @@ impl AnyMeta<'_> {
       AnyMeta::Dv(_) => FileTypeFinalize::Detected,
       #[cfg(feature = "audible")]
       AnyMeta::Aa(_) => FileTypeFinalize::Detected,
+      // CRW: `ProcessCRW` calls `$et->SetFileType()` with no argument
+      // (`CanonRaw.pm:825`) ⇒ finalize to the DETECTED candidate type ("CRW").
+      #[cfg(feature = "crw")]
+      AnyMeta::Crw(_) => FileTypeFinalize::Detected,
       #[cfg(feature = "red")]
       AnyMeta::R3d(_) => FileTypeFinalize::Detected,
       // ID3 is a directory parser (no top-level file type); it has no engine
@@ -1423,6 +1461,7 @@ impl AnyMeta<'_> {
         feature = "aac",
         feature = "dv",
         feature = "audible",
+        feature = "crw",
         feature = "red",
         feature = "id3",
         feature = "mp3",
@@ -1592,6 +1631,10 @@ pub enum AnyError {
   #[cfg(feature = "audible")]
   #[error("AA: {0}")]
   Aa(#[from] crate::formats::audible::Error),
+  /// Canon CRW fatal-error wrapper.
+  #[cfg(feature = "crw")]
+  #[error("CRW: {0}")]
+  Crw(#[from] crate::formats::crw::Error),
   /// Red R3D fatal-error wrapper.
   #[cfg(feature = "red")]
   #[error("R3D: {0}")]
@@ -1742,6 +1785,7 @@ impl AnyParser {
       feature = "aac",
       feature = "dv",
       feature = "audible",
+      feature = "crw",
       feature = "red",
       feature = "id3",
       feature = "mp3",
@@ -1796,6 +1840,19 @@ impl AnyParser {
         let _ = (shared, ext);
         p.parse(bytes)
           .map(|o| o.map(AnyMeta::Aa))
+          .map_err(Into::into)
+      }
+      #[cfg(feature = "crw")]
+      AnyParser::Crw(p) => {
+        // CRW is a leaf format (no cross-format chain): `shared` and `ext` are
+        // unused. The CIFF walker decodes the whole HEAP tree from the byte
+        // slice; the records dispatched to the ported Canon MakerNote
+        // sub-tables are re-decoded to `Canon:*` tags at `serialize_tags` time
+        // (faithful to `ProcessCanonRaw` dispatching `CanonRaw::Main`
+        // SubDirectory records into `Image::ExifTool::Canon`).
+        let _ = (shared, ext);
+        p.parse(bytes)
+          .map(|o| o.map(AnyMeta::Crw))
           .map_err(Into::into)
       }
       #[cfg(feature = "red")]
@@ -2116,6 +2173,15 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "AIFF" => Some(AnyParser::Aiff(crate::formats::aiff::ProcessAiff)),
     #[cfg(feature = "ape")]
     "APE" => Some(AnyParser::Ape(crate::formats::ape::ProcessApe)),
+    // Canon CRW (CIFF) raw container. `%fileTypeLookup{CRW}` resolves the
+    // `.crw` extension + the `HEAP(CCDR|JPGM)` CIFF signature to file type
+    // "CRW" (base module `CanonRaw`, MIME `image/x-canon-crw`); bundled
+    // `ProcessCRW` (CanonRaw.pm:812) validates the header + walks the HEAP
+    // tree. (NOTE: a TIFF-magic file merely NAMED `.crw` is detected as TIFF,
+    // not CRW — handled by the standalone-TIFF `AnyParser::Exif` arm; this arm
+    // is only reached for a genuine CIFF-signature CRW.)
+    #[cfg(feature = "crw")]
+    "CRW" => Some(AnyParser::Crw(crate::formats::crw::ProcessCrw)),
     #[cfg(feature = "dsf")]
     "DSF" => Some(AnyParser::Dsf(crate::formats::dsf::ProcessDsf)),
     #[cfg(feature = "dv")]

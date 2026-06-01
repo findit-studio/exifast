@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "CanonRaw_min.crw",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "CRW",
+  "File:FileTypeExtension": "CRW",
+  "File:MIMEType": "image/x-canon-crw",
+  "CanonRaw:Make": "Canon",
+  "CanonRaw:Model": "Canon EOS DIGITAL REBEL",
+  "CanonRaw:FileFormat": 131073,
+  "CanonRaw:TargetCompressionRatio": 10,
+  "CanonRaw:CanonFirmwareVersion": "Firmware Version 1.1.1",
+  "CanonRaw:OwnerName": "Phil Harvey",
+  "CanonRaw:OriginalFileName": "CRW_1602.CRW",
+  "CanonRaw:ThumbnailFileName": "CRW_1602.THM",
+  "CanonRaw:CanonModelID": 18087936,
+  "CanonRaw:BaseISO": 100,
+  "CanonRaw:CanonImageType": "CRW:EOS DIGITAL REBEL CMOS RAW",
+  "CanonRaw:ROMOperationMode": "USA"
+}]

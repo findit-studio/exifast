@@ -50,6 +50,215 @@ fn aac_conformance() {
 }
 
 #[test]
+fn crw_conformance() {
+  // Canon CRW (CIFF) container — Phase 1. `tests/fixtures/CanonRaw_min.crw` is
+  // a HAND-CRAFTED minimal CIFF heap (the REAL bundled `t/images/CanonRaw.crw`
+  // emits ~25 camera `Composite:*` tags + embedded XMP that this port cannot
+  // emit, so it cannot be a byte-exact fixture). The crafted heap exercises:
+  //   - the `ProcessCRW` header validate + the recursive `ProcessCanonRaw`
+  //     HEAP walker (incl. a nested auto-subdirectory `0x2807 CameraObject`,
+  //     tagType 0x28, whose `CanonImageType`/`ROMOperationMode` records prove
+  //     recursion reaches nested leaves);
+  //   - the value-in-directory path (`BaseISO` via tag|0x4000);
+  //   - several `CanonRaw::Main` scalar records — `Make`/`Model` (the
+  //     `MakeModel` binary sub-table), `FileFormat`+`TargetCompressionRatio`
+  //     (the `ImageFormat` sub-table, PrintHex), `CanonFirmwareVersion`,
+  //     `OwnerName`, `OriginalFileName`, `ThumbnailFileName`,
+  //     `CanonModelID` (PrintHex + `%canonModelID` ⇒ "EOS D30"),
+  //     `CanonImageType`, `ROMOperationMode`.
+  // It DELIBERATELY excludes every Composite-trigger combo (no
+  // CameraSettings/ShotInfo/FocalLength → no `Composite:Lens`/`DriveMode`/
+  // `ShutterSpeed`/…), so the bundled `-G1 -j` output carries ONLY File:/
+  // CanonRaw: keys (oracle-confirmed: NO Composite/XMP). The reused
+  // `Canon::*` MakerNote sub-table dispatch (incl. the #183 ShotInfo
+  // `FILE_TYPE eq "CRW"` raw-0 ExposureTime branch) is covered by the
+  // `crw.rs` unit tests + the `vendors/canon` suite, since exercising it in
+  // the conformance fixture would emit a `Composite:ShutterSpeed`.
+  check("CanonRaw_min.crw", "CanonRaw_min.crw.json", true);
+  check("CanonRaw_min.crw", "CanonRaw_min.crw.n.json", false);
+
+  // EXTENDED coverage — the rest of the `CanonRaw::Main` scalar table plus a
+  // Canon sub-table, in two CRAFTED Composite-free CIFF heaps (each verified
+  // with `perl exiftool -G1 -j` to carry ONLY File:/CanonRaw:/Canon: keys):
+  //
+  // `CanonRaw_records.crw` exercises the NEWLY-PORTED scalar + structural
+  // records — `TargetImageType`/`RecordID`/`FileNumber` (the `116-1602` dash
+  // PrintConv)/`UserComment` (the `0x0805` non-`ImageDescription` arm)/
+  // `CanonFileDescription` (the `0x0805` `ImageDescription` arm)/`MeasuredEV`
+  // (`$val+5`)/`SerialNumber` (`%.10d` EOS PrintConv)/`ColorTemperature`/
+  // `ColorSpace` (PrintConv) — plus the structural sub-tables `TimeStamp`
+  // (DateTimeOriginal via `ConvertUnixTime`)/`DecoderTable`/`RawJpgInfo`
+  // (PrintConv), and a `Canon::SensorInfo` sub-table (the sensor + black-mask
+  // border coordinates). It DELIBERATELY omits `ImageInfo` (whose
+  // ImageWidth/Height would synthesize `Composite:ImageSize`/`Megapixels`) and
+  // `CameraSettings` (lens/shoot Composites).
+  check("CanonRaw_records.crw", "CanonRaw_records.crw.json", true);
+  check("CanonRaw_records.crw", "CanonRaw_records.crw.n.json", false);
+
+  // `CanonRaw_colorbalance.crw` exercises the `Canon::ColorBalance` sub-table
+  // (the `WB_RGGBLevels{Auto,Daylight,Shade,Cloudy,Tungsten,Fluorescent,Flash,
+  // Custom,Kelvin}` + `WB_RGGBBlackLevels` int16s[4] quads, rendered
+  // space-joined). ColorBalance alone does NOT trigger the WB Composites
+  // (those need `WB_RGGBLevelsAsShot`/`Measured` from the deferred ColorData),
+  // so the bundled `-G1 -j`/`-n` goldens carry only File:/CanonRaw:/Canon:.
+  check(
+    "CanonRaw_colorbalance.crw",
+    "CanonRaw_colorbalance.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_colorbalance.crw",
+    "CanonRaw_colorbalance.crw.n.json",
+    false,
+  );
+}
+
+#[test]
+fn crw_scalars_conformance() {
+  // The LAST coverage gap in `%CanonRaw::Main` — the remaining scalar tags plus
+  // the previously-omitted NAMED no-conv records. `tests/fixtures/
+  // CanonRaw_scalars.crw` is a CRAFTED Composite-free CIFF heap (verified via
+  // `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys — no
+  // Composite/XMP) exercising:
+  //   - `ShutterReleaseMethod` (0x1010, int16u PrintConv ⇒ `"Single Shot"`/0),
+  //   - `ShutterReleaseTiming` (0x1011, int16u PrintConv ⇒ `"Priority on
+  //     focus"`/1),
+  //   - `ReleaseSetting` (0x1016, int16u, no conv ⇒ `3`),
+  //   - `SelfTimerTime` (0x1806, int32u, ValueConv `$val/1000` ⇒ `10` value,
+  //     PrintConv `"$val s"` ⇒ `"10 s"`),
+  //   - `TargetDistanceSetting` (0x1807, `Format => 'float'`, PrintConv
+  //     `"$val mm"` ⇒ `"1234 mm"`/1234),
+  //   - `NullRecord` (0x0000, int8u[4] ⇒ `"1 2 3 4"`),
+  //   - `FreeBytes` (0x0001, `Format => 'undef', Binary => 1` ⇒ the `(Binary
+  //     data 10 bytes …)` placeholder),
+  //   - `CanonColorInfo1` (0x0032, int8u[6] ⇒ `"10 20 30 40 50 60"`) and
+  //     `CanonColorInfo2` (0x102c, int16u[8] ⇒ `"1 2 3 4 5 6 7 8"`) — NAMED
+  //     records with no sub-tags/PrintConv, whose whole value ExifTool reads as
+  //     a `%crwTagFormat{tagType}` array (`CanonRaw.pm:798-800`).
+  // These records carry no Composite linkage, so the goldens are File:/
+  // CanonRaw: only. This completes the `%CanonRaw::Main` record coverage: every
+  // table entry is now handled (the only un-emitted entries are `CanonFlashInfo`
+  // 0x1028 `Unknown => 1`, suppressed by default, and `CustomFunctions` 0x1033,
+  // the #87 CanonCustom deferral).
+  check("CanonRaw_scalars.crw", "CanonRaw_scalars.crw.json", true);
+  check("CanonRaw_scalars.crw", "CanonRaw_scalars.crw.n.json", false);
+}
+
+#[test]
+fn crw_omitted_records_conformance() {
+  // The three previously-omitted `CanonRaw::Main` binary sub-tables (the Codex
+  // CRW finding) — `ExposureInfo` (0x1818), `FlashInfo` (0x1813), `WhiteSample`
+  // (0x1030) — plus a `TimeStamp` (0x180e) carrying a FRACTIONAL `TimeZoneCode`.
+  // `tests/fixtures/CanonRaw_omitted_records.crw` is a CRAFTED Composite-free
+  // CIFF heap (verified via `perl exiftool -G1 -j`/`-n` to carry ONLY File:/
+  // CanonRaw: keys) exercising:
+  //   - `ExposureInfo` pos0 `ExposureCompensation` (float). pos1
+  //     `ShutterSpeedValue` / pos2 `ApertureValue` are DELIBERATELY omitted
+  //     from the fixture: ANY emitted ApertureValue/ShutterSpeedValue
+  //     synthesizes a `Composite:Aperture`/`Composite:ShutterSpeed` (Exif.pm
+  //     %Composite), which the port has no Composite subsystem to produce —
+  //     so their ValueConv (`1/(2**$val)` / `2**($val/2)`) + PrintConv
+  //     (`PrintExposureTime` / `sprintf("%.1f")`) are covered by the `crw.rs`
+  //     unit tests instead.
+  //   - `FlashInfo` pos0 `FlashGuideNumber` + pos1 `FlashThreshold` (float, no
+  //     conv, no Composite).
+  //   - `WhiteSample` pos1..5 (`WhiteSampleWidth`/`Height`/`LeftBorder`/
+  //     `TopBorder`/`Bits`, int16u) + the pos-0x37 `BlackLevels` int16u[4]
+  //     (rendered space-joined; a 3-word remnant `"129 130 131"` here). The
+  //     fixture's first int16u equals the block byte length so the
+  //     `Canon::Validate` gate passes (an invalid block emits NOTHING + a
+  //     `Invalid WhiteSample data` warning, exercised by the `crw.rs` unit
+  //     test `white_sample_invalid_length_suppressed`).
+  //   - `TimeStamp` `TimeZoneCode` 19800 ⇒ `5.5` (the FLOAT `$val/3600`
+  //     ValueConv — a +5:30 zone must NOT truncate to `5`).
+  check(
+    "CanonRaw_omitted_records.crw",
+    "CanonRaw_omitted_records.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_omitted_records.crw",
+    "CanonRaw_omitted_records.crw.n.json",
+    false,
+  );
+}
+
+#[test]
+fn crw_whitesample_big_conformance() {
+  // The SubDirectory read-gate fix (`CanonRaw.pm:707-709`: a record whose tag
+  // has a `SubDirectory` is read REGARDLESS of size). `WhiteSample` (0x1030) is
+  // the concrete real case — its named fields (`WhiteSampleWidth`/`Height`/
+  // `LeftBorder`/`TopBorder`/`Bits` + `BlackLevels`) are "followed by the
+  // encrypted white sample values" (`CanonRaw.pm:598`), so a real block can
+  // exceed 512 bytes while every named tag lives in the first ~118 bytes.
+  //
+  // `tests/fixtures/CanonRaw_whitesample_big.crw` is a CRAFTED Composite-free
+  // CIFF heap (verified via `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY
+  // File:/CanonRaw: keys — no Composite/XMP) whose WhiteSample block is 600
+  // bytes (offset-0 length word = 600 so the `Canon::Validate` gate passes),
+  // with the named fields up front and a 482-byte arbitrary "encrypted" tail.
+  // Before the fix the 600-byte block tripped `size > 512` and was dropped to a
+  // `(Binary data 600 bytes)` placeholder, losing the named tags; the oracle
+  // (and now the port) read the full block and extract them. The goldens
+  // CONTAIN the WhiteSample named tags, proving the >512 block was read.
+  check(
+    "CanonRaw_whitesample_big.crw",
+    "CanonRaw_whitesample_big.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_whitesample_big.crw",
+    "CanonRaw_whitesample_big.crw.n.json",
+    false,
+  );
+}
+
+#[test]
+fn crw_value_in_directory_conformance() {
+  // The `valueInDir` branch (`CanonRaw.pm:692-699`): a record's value lives in
+  // the entry's 8-byte size+ptr fields (`$size = 8`, `$value = substr($buff,
+  // $pt+2, 8)`), and for a non-string/non-subdir value bundled FORCES
+  // `$count = 1` (`CanonRaw.pm:698-699`). `tests/fixtures/CanonRaw_valueindir.crw`
+  // is a CRAFTED Composite-free CIFF heap (verified via `perl exiftool 13.59
+  // -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys) whose 5 R3 scalars
+  // (`ShutterReleaseMethod`/`Timing`, `ReleaseSetting`, `SelfTimerTime`,
+  // `TargetDistanceSetting`) PLUS `BaseISO` are all stored inline via
+  // `valueInDir`, and an inline `CanonColorInfo2` (0x102c) array record —
+  // whose `valueInDir` `$count = 1` makes it emit the BARE FIRST word (`11`),
+  // NOT the 4-word `int(8/2)` array. Confirms every new scalar decodes from the
+  // inline field identically to the out-of-line path, and the array record
+  // honours the forced count.
+  check(
+    "CanonRaw_valueindir.crw",
+    "CanonRaw_valueindir.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_valueindir.crw",
+    "CanonRaw_valueindir.crw.n.json",
+    false,
+  );
+}
+
+#[test]
+fn crw_zero_length_records_conformance() {
+  // The ZERO-LENGTH (`size == 0`) record edge (`ReadValue` `$count == 0` ⇒ the
+  // EMPTY STRING `''`, `ExifTool.pm:6296-6298`). `tests/fixtures/
+  // CanonRaw_zerolen.crw` is a CRAFTED Composite-free CIFF heap (verified via
+  // `perl exiftool 13.59 -G1 -j`/`-n` to carry ONLY File:/CanonRaw: keys) whose
+  // NAMED no-conv ARRAY records (`NullRecord` 0x0000, `CanonColorInfo1` 0x0032,
+  // `CanonColorInfo2` 0x102c) are each zero-length ⇒ emitted as `""`, and whose
+  // binary LEAVES (`RawData` 0x2005, `FreeBytes` 0x0001) are zero-length ⇒
+  // `(Binary data 0 bytes, use -b option to extract)`. (Zero-length numeric
+  // SCALAR records — whose per-type ValueConv-of-empty rendering, e.g.
+  // `"Unknown ()"`/`"0 s"`/`" mm"`, only arises on this MALFORMED input that no
+  // camera-written CRW produces — stay a documented crafted-input residual; see
+  // the `emit_scalar` note in `src/formats/crw.rs`.)
+  check("CanonRaw_zerolen.crw", "CanonRaw_zerolen.crw.json", true);
+  check("CanonRaw_zerolen.crw", "CanonRaw_zerolen.crw.n.json", false);
+}
+
+#[test]
 fn quicktime_sp1_conformance() {
   // QuickTime port Sub-Port 1 (the box/atom walker + core structural
   // atoms). `tests/fixtures/QuickTime_sp1.mov` is a SYNTHETIC minimal

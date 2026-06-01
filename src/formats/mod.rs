@@ -15,6 +15,8 @@ pub mod aiff;
 pub mod ape;
 #[cfg(feature = "audible")]
 pub mod audible;
+#[cfg(feature = "crw")]
+pub mod crw;
 #[cfg(feature = "dsf")]
 pub mod dsf;
 #[cfg(feature = "dv")]
