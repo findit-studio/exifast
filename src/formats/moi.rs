@@ -453,7 +453,6 @@ impl FormatParser for ProcessMoi {
   /// Spec §8: leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; MOI parsing has no I/O modes).
-  type Error = Error;
 
   /// Parse a MOI file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid MOI sidecar (short read, wrong magic, or
@@ -461,7 +460,7 @@ impl FormatParser for ProcessMoi {
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data)
   }
 }
@@ -471,23 +470,23 @@ impl FormatParser for ProcessMoi {
 /// method returns this borrowed form directly — no `'static` upgrade. Both
 /// the trait `parse` and the lib-first direct call ([`parse_borrowed`])
 /// share this body (Codex AF2).
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // MOI.pm:110 — `$raf->Read($buff,256) == 256 and $buff =~ /^V6/ or
   // return 0`. The 256-byte read AND the `V6` prefix are BOTH required.
   let total_len = data.len();
   if total_len < 256 {
-    return Ok(None);
+    return None;
   }
   let head: &[u8; 256] = data[..256]
     .try_into()
     .expect("256-byte head is exactly 256 bytes");
   if &head[..2] != b"V6" {
-    return Ok(None);
+    return None;
   }
   // MOI.pm:111-114 — embedded BE u32 filesize at offset 0x02 must match.
   let embedded_size = u32::from_be_bytes([head[2], head[3], head[4], head[5]]) as u64;
   if embedded_size != total_len as u64 {
-    return Ok(None);
+    return None;
   }
   // MOI.pm:116 `SetByteOrder('MM')` — every subsequent int16u / int32u
   // read uses `from_be_bytes`.
@@ -498,7 +497,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   let audio_codec = Some(u16::from_be_bytes([head[0x84], head[0x85]]));
   let audio_bitrate = Some(audio_bitrate_value_conv(head[0x86]));
   let video_bitrate = Some(parse_video_bitrate(&head[0xda..0xdc]));
-  Ok(Some(Meta {
+  Some(Meta {
     version,
     datetime_original,
     duration,
@@ -506,7 +505,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     audio_codec,
     audio_bitrate,
     video_bitrate,
-  }))
+  })
 }
 
 /// Lib-first direct entry. Identical to [`FormatParser::parse`] now that
@@ -518,7 +517,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data)
 }
 
@@ -855,24 +854,6 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for MOI parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`, so `Error` is a real `Error` even on no-std).
-/// `#[non_exhaustive]` lets the first real variant land without a breaking
-/// change. The derive expands `Display` to an empty `match *self {}`, so no
-/// `#[error(…)]` attribute is needed while the enum has no variants.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -884,15 +865,6 @@ pub enum Error {}
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;
-
-  #[test]
-  fn moi_error_is_core_error() {
-    // §5: thiserror v2 (default-features=false) makes the empty error enum
-    // a real `core::error::Error` in every feature tier.
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   // ---------- ValueConv helpers ------------------------------------------
 
   #[test]
@@ -1099,7 +1071,7 @@ mod tests {
   #[test]
   fn parse_borrowed_extracts_every_field() {
     let buf = fixture_buffer();
-    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&buf).expect("parsed");
     assert_eq!(meta.version(), "V6");
     let dt = meta.datetime_original().expect("dt");
     assert_eq!((dt.year(), dt.month(), dt.day()), (2011, 5, 15));
@@ -1117,22 +1089,22 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0u8; 100]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0u8; 100]).is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_magic() {
     let mut buf = fixture_buffer();
     buf[0] = b'X';
-    assert!(parse_borrowed(&buf).unwrap().is_none());
+    assert!(parse_borrowed(&buf).is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_filesize_mismatch() {
     let mut buf = fixture_buffer();
     buf[2..6].copy_from_slice(&999u32.to_be_bytes()); // claims 999 ≠ 320
-    assert!(parse_borrowed(&buf).unwrap().is_none());
+    assert!(parse_borrowed(&buf).is_none());
   }
 
   // ---------- Taggable emission (print_conv on / off) ------------------------
@@ -1151,7 +1123,7 @@ mod tests {
   }
 
   fn collect(buf: &[u8], print_conv: bool) -> TagMap {
-    let meta = parse_borrowed(buf).expect("ok").expect("parsed");
+    let meta = parse_borrowed(buf).expect("parsed");
     emit_into_tagmap(&meta, print_conv)
   }
 
@@ -1308,12 +1280,12 @@ mod tests {
     // Faithful to ExifTool.pm:9907 sorted-key walk. Order is preserved by the
     // `Taggable` emission order -> `TagMap` entry order (the JSON object loses it).
     let buf = fixture_buffer();
-    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&buf).expect("parsed");
     let tm = emit_into_tagmap(&meta, true);
     let format_names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("MOI:"))
+      .filter_map(|(g, n, _)| (g == "MOI").then_some(n.as_str()))
       .collect();
     assert_eq!(
       format_names,
@@ -1333,7 +1305,7 @@ mod tests {
   fn taggable_group_is_moi_family0_and_family1() {
     use crate::emit::{ConvMode, Taggable};
     let buf = fixture_buffer();
-    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&buf).expect("parsed");
     let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     // MOIVersion, DateTimeOriginal, Duration, AspectRatio, AudioCodec,
     // AudioBitrate, VideoBitrate — 7 tags, none Unknown.
@@ -1353,7 +1325,7 @@ mod tests {
   fn project_populates_video_track_duration_and_created() {
     use crate::metadata::{Project, TrackKind};
     let buf = fixture_buffer();
-    let meta = parse_borrowed(&buf).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&buf).expect("parsed");
     let projected = meta.project();
     // MOI is a camcorder video sidecar: one video track kind.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
@@ -1383,9 +1355,7 @@ mod tests {
     // returns `Meta<'static>`) produces the same fields as the
     // borrow-from-input `parse_borrowed`.
     let buf = fixture_buffer();
-    let meta = <ProcessMoi as FormatParser>::parse(&ProcessMoi, &buf)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessMoi as FormatParser>::parse(&ProcessMoi, &buf).expect("parsed");
     assert_eq!(meta.version(), "V6");
     assert_eq!(meta.aspect_ratio(), Some(AspectRatio::R4x3Pal));
     assert_eq!(meta.video_bitrate(), Some(VideoBitrate::Known(8_500_000)));

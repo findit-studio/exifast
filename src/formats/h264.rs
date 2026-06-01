@@ -1179,10 +1179,9 @@ impl parser_sealed::Sealed for ProcessH264 {}
 impl FormatParser for ProcessH264 {
   type Meta<'a> = H264Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = H264Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, H264Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -1190,17 +1189,12 @@ impl FormatParser for ProcessH264 {
 /// PES payload an M2TS demuxer would hand us) and returns a typed
 /// [`H264Meta`].
 ///
-/// Returns `Ok(None)` when the buffer contains no NAL start code at all
-/// (not an H.264 stream); `Ok(Some(meta))` otherwise — `meta` may be
+/// Returns `None` when the buffer contains no NAL start code at all
+/// (not an H.264 stream); `Some(meta)` otherwise — `meta` may be
 /// [`H264Meta::is_empty`] when the stream had no SPS size and no MDPM block.
-///
-/// # Errors
-///
-/// Returns `Err` only for Rust-level fatal modes — there are none today
-/// ([`H264Error`] is uninhabited), so this is always `Ok`. The signature
-/// matches the other format ports for a uniform call shape.
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<H264Meta<'_>>, H264Error> {
-  Ok(parse_inner(data))
+#[must_use]
+pub fn parse_borrowed(data: &[u8]) -> Option<H264Meta<'_>> {
+  parse_inner(data)
 }
 
 /// Inner parser body. `None` ⇒ no NAL start code anywhere (reject); else
@@ -2994,18 +2988,6 @@ impl crate::metadata::Project for H264Meta<'_> {
   }
 }
 
-// ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for H.264 parsing. Currently uninhabited — every
-/// bad input produces `Ok(None)` (no NAL start code) or `Ok(Some(empty))`
-/// (no SPS / no MDPM), faithful to `ParseH264Video`, which never dies.
-/// Reserved for a future I/O-fallible demuxer wrapper.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum H264Error {}
-
 // NOTE on serde (rust-type-conventions §8): the typed `H264Meta` does NOT
 // implement `Serialize` directly — like every other format port in this
 // crate, the `-j`/`-n` JSON view is produced by the shared
@@ -3094,30 +3076,17 @@ mod tests {
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
     stream
   }
-
-  #[test]
-  fn h264_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<H264Error>();
-  }
-
   #[test]
   fn parse_borrowed_rejects_non_h264() {
     // No NAL start code anywhere ⇒ `Ok(None)`.
-    assert!(
-      parse_borrowed(b"not an h264 stream at all")
-        .unwrap()
-        .is_none()
-    );
-    assert!(parse_borrowed(&[]).unwrap().is_none());
+    assert!(parse_borrowed(b"not an h264 stream at all").is_none());
+    assert!(parse_borrowed(&[]).is_none());
   }
 
   #[test]
   fn parse_borrowed_accepts_avchd_fixture() {
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data)
-      .expect("ok")
-      .expect("has a NAL start code");
+    let meta = parse_borrowed(&data).expect("has a NAL start code");
     assert!(!meta.is_empty(), "the MDPM block must yield tags");
     assert_eq!(meta.make(), Some("Canon"));
   }
@@ -3125,7 +3094,7 @@ mod tests {
   #[test]
   fn avchd_fixture_print_conv_tags() {
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let tm = emit_into_tagmap(&meta, true);
     // -j mode — PrintConv labels.
     assert_eq!(
@@ -3152,7 +3121,7 @@ mod tests {
   #[test]
   fn avchd_fixture_numeric_tags() {
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let tm = emit_into_tagmap(&meta, false);
     // -n mode — raw post-ValueConv scalars.
     assert_eq!(
@@ -3189,7 +3158,7 @@ mod tests {
     stream.extend_from_slice(&escape_rbsp(&sei));
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
 
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     let names: Vec<&str> = meta.entries().iter().map(super::H264Entry::name).collect();
     assert_eq!(names, ["WhiteBalance"], "must stop before the 0xa2 record");
 
@@ -3243,7 +3212,7 @@ mod tests {
       0x70, 0xff, 0x00, 0x20, 0x00, // Camera1 ⇒ WhiteBalance "Hold"
       0xa8, 0x00, 0x00, 0x00, 0x00, // top-level WhiteBalance "Auto" (Priority=>0)
     ]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
 
     // Both WhiteBalance entries are parsed (the Camera1 one and the 0xa8 one),
     // each carrying its `FoundTag` priority — the relegation happens at
@@ -3287,7 +3256,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(k, _)| k.as_str().contains("WhiteBalance"))
+      .filter(|(_, n, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the priority winner is emitted");
   }
@@ -3338,7 +3307,7 @@ mod tests {
     // `ParseH264Video` reports them under `GPS:`, not `H264:` (Codex R5 F1).
     // 0xb1 GPSLatitudeRef="N" is a simple single-record GPS tag.
     let s1 = mdpm_stream(&[0xb1, b'N', 0x00, 0x00, 0x00]);
-    let meta = parse_borrowed(&s1).unwrap().unwrap();
+    let meta = parse_borrowed(&s1).unwrap();
     let e = meta
       .entries()
       .iter()
@@ -3347,7 +3316,7 @@ mod tests {
     assert!(e.group().is_gps(), "GPS block ⇒ family-1 GPS");
     // Non-GPS MDPM tag stays in H264 (0xa8 WhiteBalance).
     let s2 = mdpm_stream(&[0xa8, 0x00, 0x00, 0x00, 0x01]);
-    let meta2 = parse_borrowed(&s2).unwrap().unwrap();
+    let meta2 = parse_borrowed(&s2).unwrap();
     let wb = meta2
       .entries()
       .iter()
@@ -3375,7 +3344,7 @@ mod tests {
       0xa6, 0x00, 0x00, 0x00, 0x99, // Flash=0x99
       0xbe, b'Z', 0x00, 0x00, 0x00, // GPSStatus="Z" (string-enum miss)
     ]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "ExposureProgram").as_deref(),
@@ -3401,7 +3370,7 @@ mod tests {
     // with `PrintHex => 1` (H264.pm:529) ⇒ `Unknown (0x9999)` in -j, raw
     // `39321` in -n — NOT the `RawConv` "Unknown" string (Codex R5 F2).
     let stream = mdpm_stream(&[0xe0, 0x99, 0x99, 0x00, 0x00]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "Make").as_deref(),
@@ -3417,7 +3386,7 @@ mod tests {
     // WhiteBalance (mask 0xe0 ⇒ 5, off-map) ⇒ `Unknown (5)` in -j, `5` in -n
     // (Codex R5 F2). b1=0x50 ⇒ ep=5; b2=0xa0 ⇒ wb=5; b3=0xff ⇒ no Focus.
     let stream = mdpm_stream(&[0x70, 0x00, 0x50, 0xa0, 0xff]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     let j = emit_into_tagmap(&meta, true);
     assert_eq!(
       j.get_str("H264", "ExposureProgram").as_deref(),
@@ -3489,7 +3458,7 @@ mod tests {
     let mut stream: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x67];
     stream.extend_from_slice(sps_rbsp);
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("H264", "ImageWidth").as_deref(), Some("1280"));
     assert_eq!(tm.get_str("H264", "ImageHeight").as_deref(), Some("720"));
@@ -3498,10 +3467,8 @@ mod tests {
   #[test]
   fn format_parser_trait_matches_parse_borrowed() {
     let data = avchd_fixture();
-    let via_trait = <ProcessH264 as FormatParser>::parse(&ProcessH264, &data)
-      .expect("ok")
-      .expect("some");
-    let via_direct = parse_borrowed(&data).unwrap().unwrap();
+    let via_trait = <ProcessH264 as FormatParser>::parse(&ProcessH264, &data).expect("some");
+    let via_direct = parse_borrowed(&data).unwrap();
     assert_eq!(via_trait.entries().len(), via_direct.entries().len());
     assert_eq!(via_trait.make(), via_direct.make());
   }
@@ -3684,7 +3651,7 @@ mod tests {
     let mut stream: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x67];
     stream.extend_from_slice(&[0x42, 0xc0, 0x1f]);
     stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
-    let meta = parse_borrowed(&stream).unwrap().unwrap();
+    let meta = parse_borrowed(&stream).unwrap();
     assert!(
       meta
         .entries()
@@ -3701,9 +3668,7 @@ mod tests {
     // (`0b1000_0110`) sets the forbidden_zero_bit; the warning must be pushed
     // into `H264Meta.warnings` BEFORE the scan stops.
     let stream: [u8; 5] = [0x00, 0x00, 0x00, 0x01, 0x86];
-    let meta = parse_borrowed(&stream)
-      .unwrap()
-      .expect("start code present");
+    let meta = parse_borrowed(&stream).expect("start code present");
     assert!(
       meta.entries().is_empty(),
       "a forbidden-bit NAL parses no tags",
@@ -3917,9 +3882,7 @@ mod tests {
 
     // Must not panic (overflow-checked builds) and must emit no tags: the
     // huge real type is not 5, so the MDPM payload is never decoded.
-    let meta = parse_borrowed(&stream)
-      .expect("parse must succeed")
-      .expect("stream has a NAL start code");
+    let meta = parse_borrowed(&stream).expect("stream has a NAL start code");
     assert!(
       meta.is_empty(),
       "an overflowing SEI payload type must not fabricate MDPM tags, got {:?}",
@@ -3936,7 +3899,7 @@ mod tests {
     let mut ok_stream: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x06];
     ok_stream.extend_from_slice(&escape_rbsp(&ok_sei));
     ok_stream.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
-    let ok = parse_borrowed(&ok_stream).unwrap().unwrap();
+    let ok = parse_borrowed(&ok_stream).unwrap();
     assert_eq!(
       ok.entries()
         .iter()
@@ -3992,9 +3955,7 @@ mod tests {
 
     // Must not panic on any build and must not emit the out-of-sequence
     // warning (the ids are strictly ascending).
-    let meta = parse_borrowed(&stream)
-      .expect("parse must succeed")
-      .expect("has a NAL start code");
+    let meta = parse_borrowed(&stream).expect("has a NAL start code");
     assert!(
       meta.warnings().is_empty(),
       "strictly-ascending records ⇒ no out-of-sequence warning",
@@ -4013,7 +3974,7 @@ mod tests {
   fn taggable_group_is_h264_family0_and_entry_family1() {
     use crate::emit::{ConvMode, Taggable};
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert!(!tags.is_empty(), "the MDPM block must yield tags");
     // No H264 table row is `Unknown => 1`.
@@ -4037,7 +3998,7 @@ mod tests {
     // avchd fixture (single WhiteBalance) and assert the filter yields exactly
     // one WhiteBalance — the engine's one-per-`group:name` default render.
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let wb_count = meta
       .tags(ConvMode::PrintConv)
       .filter(|t| t.tag().name() == "WhiteBalance")
@@ -4049,7 +4010,7 @@ mod tests {
   fn project_populates_video_track() {
     use crate::metadata::{Project, TrackKind};
     let data = avchd_fixture();
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let projected = meta.project();
     // H.264 is a video elementary stream ⇒ a single video track kind.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);

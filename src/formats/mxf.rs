@@ -1924,10 +1924,9 @@ impl FormatParser for ProcessMxf {
   type Meta<'a> = MxfMeta<'a>;
   /// Leaf-format Context — `&'a [u8]` (Engine-only, no chained state).
   type Context<'a> = &'a [u8];
-  type Error = MxfError;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, MxfError> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -1938,8 +1937,8 @@ impl FormatParser for ProcessMxf {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today — every bad input is
 /// `Ok(None)`, faithful to MXF.pm:2816-2817 `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<MxfMeta<'_>>, MxfError> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<MxfMeta<'_>> {
+  parse_inner(data)
 }
 
 // ===========================================================================
@@ -2287,6 +2286,13 @@ fn process_primer(w: &mut Walker, buf: &[u8]) {
 /// `(int16u local-tag, int16u length, value)` triplets; each local-tag is
 /// resolved to a global UL through the Primer, the UL looked up in
 /// [`TAG_TABLE`], and the value decoded + emitted.
+///
+/// Golden-v2 3a — this walk is **structurally bounded, not recursive**: it is
+/// a flat `while pos + 4 < end` loop over the triplets in one KLV value, with
+/// no self-call. A nested object is NOT walked inline; it is referenced by an
+/// InstanceUID (a `strong_refs` string) and resolved later by the SEPARATE
+/// recursive [`set_groups`] tree walk, which carries the recursion budget.
+/// So no depth cap is needed here.
 fn process_local_set(w: &mut Walker, dir_name: &'static str, buf: &[u8]) {
   let end = buf.len();
   // Per-set book-keeping (MXF.pm:2612).
@@ -2559,6 +2565,21 @@ fn duration_or_drop(raw: i64) -> Option<MxfValue> {
 // §14. SetGroups tree walk (MXF.pm:2731-2778)
 // ===========================================================================
 
+/// Max recursion depth for the `SetGroups` strong-reference object-tree walk
+/// (Golden-v2 Contract 3a). Bundled `SetGroups` (MXF.pm:2731-2778) recurses
+/// the file-declared strong-reference graph with only a `DidGroups` cycle
+/// guard (mirrored by [`set_groups`]'s `visited` set). The cycle guard stops a
+/// *cyclic* graph, but a hostile file can declare a long ACYCLIC chain of
+/// distinct objects (`Preface`→A→B→C→…), one per top-level KLV local set, so
+/// the recursion would grow to the chain length and overflow the stack — a
+/// DoS reachable from a crafted (large) real file. Real MXF object trees are
+/// shallow (`Preface`→`ContentStorage`→`Package`→`Track`→`Sequence`→
+/// `Component`, ≈6-8 deep), so this cap is a large superset that never trips
+/// on a real file (byte-identical output). Exceeding it stops descending that
+/// branch (the deeper objects keep their default `MXF` family-1 group — they
+/// are unreachable garbage in any real file).
+const MAX_OBJECT_TREE_DEPTH: u32 = 1000;
+
 /// Walk the MXF object tree from each `Preface` root to assign `Track<N>`
 /// family-1 groups (MXF.pm:2731-2778 `SetGroups`). When an object carries a
 /// `TrackID`, that ID's `Track<N>` group is propagated down its entire
@@ -2570,7 +2591,8 @@ fn fix_groups(w: &mut Walker) {
   let prefaces: Vec<SmolStr> = w.prefaces.clone();
   let mut visited: std::collections::HashSet<SmolStr> = std::collections::HashSet::new();
   for root in prefaces {
-    set_groups(w, &root, None, false, &mut visited);
+    // Each `Preface` root starts the tree walk at depth 0.
+    set_groups(w, 0, &root, None, false, &mut visited);
   }
 }
 
@@ -2579,11 +2601,19 @@ fn fix_groups(w: &mut Walker) {
 /// inside a `SourcePackage` sub-tree.
 fn set_groups(
   w: &mut Walker,
+  depth: u32,
   instance: &SmolStr,
   inherited_track_id: Option<i64>,
   in_source: bool,
   visited: &mut std::collections::HashSet<SmolStr>,
 ) {
+  // Golden-v2 3a — recursion-depth guard for the strong-reference tree. Real
+  // object trees are ≈6-8 deep, far below `MAX_OBJECT_TREE_DEPTH`, so this
+  // never trips on a real file (byte-identical); it bounds stack growth on a
+  // maliciously long strong-ref chain.
+  if depth >= MAX_OBJECT_TREE_DEPTH {
+    return;
+  }
   // MXF.pm:2735-2736 — `return unless $objInfo and not $$objInfo{DidGroups}`.
   if !visited.insert(instance.clone()) {
     return;
@@ -2635,9 +2665,10 @@ fn set_groups(
     }
   }
 
-  // MXF.pm:2770-2772 — recurse into the strong-reference children.
+  // MXF.pm:2770-2772 — recurse into the strong-reference children (one level
+  // deeper, Golden-v2 3a).
   for child in &strong_refs {
-    set_groups(w, child, track_id, child_in_source, visited);
+    set_groups(w, depth + 1, child, track_id, child_in_source, visited);
   }
 }
 
@@ -2905,34 +2936,12 @@ impl crate::metadata::Project for MxfMeta<'_> {
 }
 
 // ===========================================================================
-// §19. `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for MXF parsing. Currently empty — every bad input
-/// produces `Ok(None)` (faithful to MXF.pm:2816-2817 `return 0`).
-///
-/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
-/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
-/// without a breaking change. Variant names are kept stable for
-/// [`crate::format_parser::AnyError`]'s `From`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum MxfError {}
-
-// ===========================================================================
 // §20. Tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn mxf_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<MxfError>();
-  }
-
   #[test]
   fn ul_notation_renders_dotted_groups() {
     let key = [
@@ -3181,8 +3190,8 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_non_mxf() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(b"not an mxf file at all").unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(b"not an mxf file at all").is_none());
   }
 
   #[test]
@@ -3192,7 +3201,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read MXF.mxf fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("MXF accepted");
+    let meta = parse_borrowed(&bytes).expect("MXF accepted");
     assert_eq!(meta.header_type(), Some("OpenHeader"));
     // MXFVersion is the first emitted tag (from the header subtable).
     let names: Vec<&str> = meta.entries().iter().map(MxfEntry::name).collect();
@@ -3218,7 +3227,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, ConvMode::PrintConv);
     assert_eq!(tm.get_str("MXF", "MXFVersion"), Some("1.2".into()));
     assert_eq!(
@@ -3262,7 +3271,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, ConvMode::ValueConv);
     // -n: ComponentDataDefinition is the raw UL string.
     assert_eq!(
@@ -3279,7 +3288,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     // Every production entry is visible (the walk pre-filters Unknown rows).
     assert!(tags.iter().all(|t| !t.unknown()));
@@ -3355,7 +3364,7 @@ mod tests {
       "/tests/fixtures/MXF.mxf"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let projected = meta.project();
     // MXF projects to a single video track; the rest of MediaInfo is empty.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);
@@ -3368,5 +3377,36 @@ mod tests {
     assert!(projected.lens().is_none());
     assert!(projected.gps().is_none());
     assert!(projected.capture().is_none());
+  }
+
+  #[test]
+  fn deeply_chained_strong_refs_do_not_overflow_the_stack() {
+    // Golden-v2 Contract 3a — `set_groups` recurses the file-declared
+    // strong-reference graph. The `visited` cycle guard stops a cyclic graph,
+    // but a hostile MXF can declare a long ACYCLIC chain of distinct objects
+    // (`Preface`→obj1→obj2→…), one per top-level KLV local set, which would
+    // recurse to the chain length and overflow the stack (a DoS reachable
+    // from a crafted large file: the KLV walk populates `objects`/`prefaces`
+    // then `fix_groups` runs). With `MAX_OBJECT_TREE_DEPTH` the descent stops
+    // at the cap. 200_000 is far past any real tree (≈6-8 deep), so the cap
+    // never trips on a real file (byte-identical output).
+    const N: usize = 200_000;
+    let mut w = Walker::new();
+    for i in 0..N {
+      let inst = SmolStr::new(std::format!("obj{i}"));
+      let mut obj = ObjInfo {
+        name: SmolStr::new("Preface"),
+        ..ObjInfo::default()
+      };
+      if i + 1 < N {
+        obj
+          .strong_refs
+          .push(SmolStr::new(std::format!("obj{}", i + 1)));
+      }
+      w.objects.insert(inst, obj);
+    }
+    w.prefaces.push(SmolStr::new("obj0"));
+    // The depth budget bounds the recursion; this returns without overflowing.
+    fix_groups(&mut w);
   }
 }

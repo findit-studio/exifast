@@ -29,9 +29,7 @@ fn read_fixture() -> Vec<u8> {
 #[test]
 fn bundled_png_parses_ihdr_dimensions_and_color_type() {
   let data = read_fixture();
-  let meta = parse_borrowed(&data)
-    .expect("parse_borrowed Ok")
-    .expect("PNG signature accepted");
+  let meta = parse_borrowed(&data).expect("PNG signature accepted");
   // PNG.png is 16x16, 1-bit grayscale (bundled `t/images/PNG.png`).
   assert_eq!(meta.dimensions(), Some((16, 16)));
   assert_eq!(meta.bit_depth(), Some(1));
@@ -44,7 +42,7 @@ fn bundled_png_parses_ihdr_dimensions_and_color_type() {
 #[test]
 fn bundled_png_captures_text_chunk_comment() {
   let data = read_fixture();
-  let meta = parse_borrowed(&data).expect("ok").expect("png");
+  let meta = parse_borrowed(&data).expect("png");
   // Bundled `perl exiftool -j t/images/PNG.png` emits `"Comment": "test
   // comment"` (tEXt chunk, PNG.pm:258-261). The on-disk keyword in this
   // fixture is lowercase `comment`; bundled's `ucfirst()` fallback
@@ -63,7 +61,7 @@ fn bundled_png_captures_text_chunk_comment() {
 #[test]
 fn bundled_png_captures_xmp_itxt_with_keyword() {
   let data = read_fixture();
-  let meta = parse_borrowed(&data).expect("ok").expect("png");
+  let meta = parse_borrowed(&data).expect("png");
   // iTXt with keyword `XML:com.adobe.xmp` — the XMP payload (bundled
   // PNG.pm:680-688 routes it to XMP::Main). Our port captures the
   // keyword + the UTF-8 body but DEFERS XMP dispatch.
@@ -79,7 +77,7 @@ fn bundled_png_captures_xmp_itxt_with_keyword() {
 #[test]
 fn bundled_png_warns_about_text_after_idat() {
   let data = read_fixture();
-  let meta = parse_borrowed(&data).expect("ok").expect("png");
+  let meta = parse_borrowed(&data).expect("png");
   // Bundled emits `Text/EXIF chunk(s) found after PNG IDAT (may be
   // ignored by some readers) [x2]` (PNG.pm:1595-1605) because the file
   // carries tEXt + iTXt AFTER the IDAT chunk.
@@ -2360,7 +2358,7 @@ fn engine_trailing_exif_typed_meta_records_trailer_boundary() {
     &[ihdr_gray_1x1(), chunk(b"IDAT", &zlib_store(&[0, 0]))],
     &chunk(b"eXIf", &exif),
   );
-  let meta = parse_borrowed(&bytes).expect("ok").expect("png");
+  let meta = parse_borrowed(&bytes).expect("png");
   // One EXIF event captured (the trailing eXIf).
   assert_eq!(meta.exif_events().len(), 1);
   // The first warning is the trailer warning (drives ExifTool:Warning).

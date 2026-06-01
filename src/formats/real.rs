@@ -246,7 +246,8 @@ struct MdprStream {
 #[derive(Debug, Clone)]
 struct FileInfoProp {
   /// `Real-MDPR{N}:<Name>` — the dynamic-name as derived by Real.pm:196-220.
-  name: String,
+  /// A short tag identifier (stored, feeds the emitted tag name) ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   /// PrintConv form (`-j`); identical to `value_raw` for identity converters.
   value_print: String,
   /// Post-ValueConv form (`-n`); typically a bare integer string for the
@@ -273,8 +274,8 @@ struct ContTags {
 struct RjmdTag {
   /// Final tag name after `tr/A-Za-z0-9//dc` + `ucfirst` then the Perl
   /// `%Real::Metadata` static-rename table (`Album/Name → AlbumName`,
-  /// `Track/Category → TrackCategory`, …).
-  name: String,
+  /// `Track/Category → TrackCategory`, …). A short tag identifier ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   /// The post-ValueConv string (used for both `-j` and `-n`; the Real
   /// metadata table has no PrintConv toggles).
   value: String,
@@ -291,7 +292,8 @@ struct RjmdTag {
 /// — `value` is the single source of truth for both modes.
 #[derive(Debug, Clone)]
 struct RaCodecField {
-  name: String,
+  /// A static codec-field identifier (`"Channels"`, `"Title"`, …) ⇒ `SmolStr`.
+  name: smol_str::SmolStr,
   value: String,
   /// `true` when the bundled `-n`/`-j` output is a bare JSON number.
   emit_as_int: bool,
@@ -501,7 +503,6 @@ impl FormatParser for ProcessReal {
   /// Leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error.
-  type Error = RealError;
 
   /// Parse a Real file's bytes into a typed [`RealMeta`], or `None` if the
   /// buffer is not a Real file (no magic match — Real.pm:523).
@@ -511,7 +512,7 @@ impl FormatParser for ProcessReal {
   /// (Real.pm:536 `($ext and $ext eq 'RPM')` is false). Callers that
   /// need the RAM-vs-RPM distinction use [`parse_with_ext`] (the engine
   /// dispatch in `AnyParser::parse_any` does).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, RealError> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data, None)
   }
 }
@@ -525,7 +526,7 @@ impl FormatParser for ProcessReal {
 ///
 /// Returns `Err` for Rust-level fatal modes (currently none — every bad
 /// input is `Ok(None)` per Perl `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
+pub fn parse_borrowed(data: &[u8]) -> Option<RealMeta<'_>> {
   parse_inner(data, None)
 }
 
@@ -542,32 +543,29 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<RealMeta<'_>>, RealError> {
 ///
 /// Returns `Err` for Rust-level fatal modes (currently none — every bad
 /// input is `Ok(None)` per Perl `return 0`).
-pub fn parse_with_ext<'a>(
-  data: &'a [u8],
-  ext: Option<&str>,
-) -> Result<Option<RealMeta<'a>>, RealError> {
+pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
   parse_inner(data, ext)
 }
 
-fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<RealMeta<'a>>, RealError> {
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
   // Real.pm:522 — `$raf->Read($buff,8) == 8`.
   if data.len() < 8 {
-    return Ok(None);
+    return None;
   }
   // Real.pm:523 — magic dispatch.
   if data.starts_with(b".RMF") {
-    return Ok(Some(parse_rm(data)));
+    return Some(parse_rm(data));
   }
   if data.starts_with(b".ra\xfd") {
-    return Ok(Some(parse_ra(data)));
+    return Some(parse_ra(data));
   }
   if data.starts_with(b"pnm://") || data.starts_with(b"rtsp://") || data.starts_with(b"http://") {
     // Real.pm:533-555 — Metafile branch. `parse_metafile` itself decides
     // acceptance (Real.pm:546 http-URL gate); a rejected buffer returns
     // `Ok(None)` ⇒ `return 0` ⇒ the engine candidate loop continues.
-    return Ok(parse_metafile(data, ext));
+    return parse_metafile(data, ext);
   }
-  Ok(None)
+  None
 }
 
 // ===========================================================================
@@ -930,7 +928,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         if info_name == "ContentRating" {
           let print = content_rating_print(val_u32);
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: print.to_string(),
             value_raw: val_u32.to_string(),
             emit_raw_as_int: true,
@@ -942,7 +940,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
             _ => "",
           };
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: print.to_string(),
             value_raw: val_u32.to_string(),
             emit_raw_as_int: true,
@@ -950,7 +948,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         } else {
           let v = val_u32.to_string();
           out.push(FileInfoProp {
-            name: info_name.to_string(),
+            name: info_name.as_str().into(),
             value_print: v.clone(),
             value_raw: v,
             emit_raw_as_int: true,
@@ -962,7 +960,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         let s = raw_bytes_to_json_string(null_truncate(raw_val));
         let (vc_print, _was_dated) = apply_file_info_value_conv(&info_name, &s, found_in_table);
         out.push(FileInfoProp {
-          name: info_name.to_string(),
+          name: info_name.as_str().into(),
           value_print: vc_print.clone(),
           value_raw: vc_print,
           emit_raw_as_int: false,
@@ -975,7 +973,7 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
         // future-proofness.
         let s = raw_bytes_to_json_string(raw_val);
         out.push(FileInfoProp {
-          name: info_name.to_string(),
+          name: info_name.as_str().into(),
           value_print: s.clone(),
           value_raw: s,
           emit_raw_as_int: false,
@@ -1264,8 +1262,10 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
     //   5 => 'undef', 6 => 'string', 7 => 'string' (date), 8 => 'string',
     //   9 => undef (grouping), 10 => undef (reference).
     // Real.pm:457-466 — `GetTagInfo`/dynamic-name synthesis. Apply the
-    // RJMD-name remap (Real.pm:264-268).
-    let resolved_name = resolve_rjmd_tag(&full_tag);
+    // RJMD-name remap (Real.pm:264-268). `resolve_rjmd_tag` builds the name in
+    // a transient `String` (a builder — String per the project rule); the
+    // STORED field is a short tag identifier ⇒ `SmolStr`.
+    let resolved_name = smol_str::SmolStr::from(resolve_rjmd_tag(&full_tag));
     // Real.pm:468-490 — emit if `$valueLen && $format`.
     if value_len > 0 {
       let raw_value = &body[value_data_pos..value_data_pos + value_len];
@@ -1638,7 +1638,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 0 Channels (int16u).
   if let Some(v) = read_u16(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1649,7 +1649,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 2 BytesPerMinute (int16u).
   if let Some(v) = read_u16(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1658,7 +1658,7 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 3 AudioBytes (int32u).
   if let Some(v) = read_u32(cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1718,7 +1718,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 6 AudioBytes int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1727,7 +1727,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 7 BytesPerMinute int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1740,7 +1740,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 10 AudioFrameSize int16u (default) — EMIT (no Unknown tag).
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioFrameSize".to_string(),
+      name: "AudioFrameSize".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1753,7 +1753,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 13 SampleRate int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "SampleRate".to_string(),
+      name: "SampleRate".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1764,7 +1764,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 15 BitsPerSample int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BitsPerSample".to_string(),
+      name: "BitsPerSample".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1773,7 +1773,7 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 16 Channels int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1845,7 +1845,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 6 AudioBytes int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "AudioBytes".to_string(),
+      name: "AudioBytes".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1854,7 +1854,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 7 BytesPerMinute int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BytesPerMinute".to_string(),
+      name: "BytesPerMinute".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1871,7 +1871,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 12 SampleRate int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "SampleRate".to_string(),
+      name: "SampleRate".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1882,7 +1882,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 14 BitsPerSample int32u — EMIT.
   if let Some(v) = read_u32(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "BitsPerSample".to_string(),
+      name: "BitsPerSample".into(),
       value: fmt_u32(v),
       emit_as_int: true,
     });
@@ -1891,7 +1891,7 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
   // Field 15 Channels int16u — EMIT.
   if let Some(v) = read_u16(header, cursor) {
     meta.ra_fields.push(RaCodecField {
-      name: "Channels".to_string(),
+      name: "Channels".into(),
       value: u32::from(v).to_string(),
       emit_as_int: true,
     });
@@ -1915,8 +1915,8 @@ fn ra_text_field(header: &[u8], cursor: usize, name: &str, meta: &mut RealMeta<'
   let s = raw_bytes_to_json_string(null_truncate(raw));
   if !s.is_empty() {
     meta.ra_fields.push(RaCodecField {
-      name: name.to_string(),
-      value: s.clone(),
+      name: name.into(),
+      value: s,
       emit_as_int: false,
     });
   }
@@ -2479,21 +2479,6 @@ impl crate::metadata::Project for RealMeta<'_> {
 }
 
 // ===========================================================================
-// `RealError` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for Real parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`).
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier — `thiserror` v2 with `default-features = false` emits
-/// `core::error::Error`). `#[non_exhaustive]` lets the first real variant
-/// land without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RealError {}
-
-// ===========================================================================
 // Optional serde `Serialize` impl for `Rendered<'_, '_, RealMeta<'_>>`
 // ===========================================================================
 //
@@ -2508,13 +2493,6 @@ pub enum RealError {}
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn real_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<RealError>();
-  }
-
   #[test]
   fn real_audio_version_from_raw_round_trip() {
     assert_eq!(RealAudioVersion::from_raw(3), RealAudioVersion::Ra3);
@@ -2598,20 +2576,20 @@ mod tests {
 
   #[test]
   fn parse_inner_rejects_short_buffer() {
-    assert!(parse_inner(&[], None).unwrap().is_none());
-    assert!(parse_inner(&[0u8; 4], None).unwrap().is_none());
+    assert!(parse_inner(&[], None).is_none());
+    assert!(parse_inner(&[0u8; 4], None).is_none());
   }
 
   #[test]
   fn parse_inner_rejects_bad_magic() {
-    assert!(parse_inner(b"NOMAGIC1", None).unwrap().is_none());
+    assert!(parse_inner(b"NOMAGIC1", None).is_none());
   }
 
   #[test]
   fn parse_inner_accepts_rm_magic() {
     let mut buf = b".RMF\x00\x00\x00\x12".to_vec();
     buf.resize(64, 0);
-    let m = parse_inner(&buf, None).unwrap().expect("RM accepted");
+    let m = parse_inner(&buf, None).expect("RM accepted");
     assert_eq!(m.kind(), RealKind::Rm);
   }
 
@@ -2619,7 +2597,7 @@ mod tests {
   fn parse_inner_accepts_ra_magic() {
     let mut buf = b".ra\xfd\x00\x04\x00\x00".to_vec();
     buf.resize(520, 0);
-    let m = parse_inner(&buf, None).unwrap().expect("RA accepted");
+    let m = parse_inner(&buf, None).expect("RA accepted");
     assert_eq!(m.kind(), RealKind::Ra);
     assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
   }
@@ -2627,9 +2605,7 @@ mod tests {
   #[test]
   fn parse_inner_accepts_pnm_uri_metafile() {
     // RAM URL line.
-    let m = parse_inner(b"pnm://host/file.ra\n", None)
-      .unwrap()
-      .expect("metafile accepted");
+    let m = parse_inner(b"pnm://host/file.ra\n", None).expect("metafile accepted");
     assert_eq!(m.kind(), RealKind::Ram);
   }
 
@@ -2676,11 +2652,7 @@ mod tests {
     assert!(parse_metafile(b"http://host/page.html\nhttp://host/ok.rm\n", None).is_none());
     // `parse_inner` propagates the `None` (the magic prefix matched, but
     // the Metafile branch declined).
-    assert!(
-      parse_inner(b"http://host/page.html\n", None)
-        .unwrap()
-        .is_none()
-    );
+    assert!(parse_inner(b"http://host/page.html\n", None).is_none());
   }
 
   #[test]
@@ -2987,14 +2959,17 @@ mod tests {
   /// emission order; `entries()` is first-occurrence order).
   #[cfg(feature = "alloc")]
   fn keys(tm: &crate::tagmap::TagMap) -> Vec<String> {
-    tm.entries().iter().map(|(k, _)| k.to_string()).collect()
+    tm.entries()
+      .iter()
+      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .collect()
   }
 
   #[cfg(feature = "alloc")]
   #[test]
   fn taggable_emits_rm_prop_mdpr_print_and_raw() {
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
 
     // -j (PrintConv): bitrate/duration/Flags render as strings.
     let pj = emit(&m, true);
@@ -3066,7 +3041,7 @@ mod tests {
   #[test]
   fn taggable_emits_ra_header_under_versioned_group() {
     let data = fixture("Real.ra");
-    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    let m = parse_borrowed(&data).expect("RA parses");
     assert_eq!(m.ra_version(), Some(RealAudioVersion::Ra4));
     // The RA fixture decodes as RA4 ⇒ codec fields live under `Real-RA4`.
     // (Identity table: -j and -n agree on the value.)
@@ -3095,7 +3070,7 @@ mod tests {
     // family-1), which the `TagMap` sink collapses to family-1 only.
     use crate::emit::{ConvMode, Taggable};
     let rm = fixture("Real.rm");
-    let m = parse_borrowed(&rm).unwrap().expect("RM parses");
+    let m = parse_borrowed(&rm).expect("RM parses");
     let tags: Vec<_> = m.tags(ConvMode::PrintConv).collect();
     // Every Real-* subgroup carries family-0 = the module name "Real"; the
     // chained ID3v1 carries family-0/1 both "ID3v1".
@@ -3141,7 +3116,7 @@ mod tests {
 
     // RA header subgroup: family-0 "Real", family-1 "Real-RA4".
     let ra = fixture("Real.ra");
-    let mra = parse_borrowed(&ra).unwrap().expect("RA parses");
+    let mra = parse_borrowed(&ra).expect("RA parses");
     let ra_tags: Vec<_> = mra.tags(ConvMode::PrintConv).collect();
     assert!(!ra_tags.is_empty());
     for t in &ra_tags {
@@ -3151,9 +3126,7 @@ mod tests {
 
     // Metafile subgroup: family-0/1 both "Real".
     let ram = fixture("real_synth_ram_pnm.ram");
-    let mram = parse_with_ext(&ram, Some("RAM"))
-      .unwrap()
-      .expect("RAM parses");
+    let mram = parse_with_ext(&ram, Some("RAM")).expect("RAM parses");
     let ram_tags: Vec<_> = mram.tags(ConvMode::PrintConv).collect();
     assert!(!ram_tags.is_empty());
     for t in &ram_tags {
@@ -3170,7 +3143,7 @@ mod tests {
     // tags follow ALL the Real-* tags (PROP→MDPR→CONT→RJMD), at the position
     // the retired `emit_id3v1` ran.
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
 
     let pj = emit(&m, true);
     assert_eq!(
@@ -3215,7 +3188,7 @@ mod tests {
     // edge branches: present-but-empty Title (`Some("")`) and a sparse genre
     // byte (no %genre entry ⇒ `Unknown (n)` in -j, raw byte in -n).
     let empty = fixture("real_synth_id3v1_empty_title.rm");
-    let me = parse_borrowed(&empty).unwrap().expect("RM parses");
+    let me = parse_borrowed(&empty).expect("RM parses");
     let ej = emit(&me, true);
     // Present-but-empty Title is emitted as the empty string (faithful).
     assert_eq!(
@@ -3224,7 +3197,7 @@ mod tests {
     );
 
     let sparse = fixture("real_synth_id3v1_sparse_genre.rm");
-    let ms = parse_borrowed(&sparse).unwrap().expect("RM parses");
+    let ms = parse_borrowed(&sparse).expect("RM parses");
     let sj = emit(&ms, true);
     // Sparse genre ⇒ `Unknown (n)` PrintConv string.
     let g = sj.get_str("ID3v1", "Genre").expect("Genre present");
@@ -3265,7 +3238,7 @@ mod tests {
   fn project_rm_audio_track_and_duration() {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("Real.rm");
-    let m = parse_borrowed(&data).unwrap().expect("RM parses");
+    let m = parse_borrowed(&data).expect("RM parses");
     let md = m.project();
     // Real.rm: stream 0 is audio/x-pn-realaudio ⇒ one Audio track; stream 1
     // is logical-fileinfo ⇒ no track.
@@ -3285,7 +3258,7 @@ mod tests {
   fn project_ra_is_single_audio_track() {
     use crate::metadata::{Project, TrackKind};
     let data = fixture("Real.ra");
-    let m = parse_borrowed(&data).unwrap().expect("RA parses");
+    let m = parse_borrowed(&data).expect("RA parses");
     let md = m.project();
     // RA is a single RealAudio stream ⇒ one Audio track, no duration accessor.
     assert_eq!(md.media().track_kinds(), &[TrackKind::Audio]);

@@ -704,8 +704,11 @@ impl PlistContentOverride {
 /// D8: no public fields; accessors only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlistTag {
-  /// Generated tag name (e.g. `"TestDictAuthor"`, `"TestReal"`).
-  name: String,
+  /// Generated tag name (e.g. `"TestDictAuthor"`, `"TestReal"`). A short tag
+  /// identifier (stored, feeds the emitted tag name) ⇒ `SmolStr`; the static
+  /// hit is a `&'static str` and the dynamic name is built in a transient
+  /// `String` (a builder — String per the rule), both converted here.
+  name: smol_str::SmolStr,
   /// The typed leaf value (already `ValueConv`-converted).
   value: PlistLeaf,
   /// The `%PLIST::Main` `PrintConv` to apply at serialize time, in print
@@ -927,9 +930,8 @@ impl FormatParser for ProcessPlist {
   /// Leaf format: reads a single byte slice.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error — none today (every bad input is `Ok(None)`).
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data)
   }
 }
@@ -941,7 +943,7 @@ impl FormatParser for ProcessPlist {
 ///
 /// Returns `Err` only for Rust-level fatal modes (none today — every bad
 /// input is `Ok(None)`, faithful to bundled `ProcessPLIST` `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<PlistMeta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<PlistMeta<'_>> {
   parse_inner(data)
 }
 
@@ -1022,7 +1024,7 @@ fn plist_element_present(head: &[u8]) -> bool {
 /// (PLIST.pm:453-502): an XML plist (leading `<`, after optional whitespace)
 /// goes to the XML decoder; a `bplist0`-prefixed file to the binary decoder;
 /// anything else is `None` (not a plist).
-fn parse_inner(data: &[u8]) -> Result<Option<PlistMeta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<PlistMeta<'_>> {
   // PLIST.pm:461-463 — `$$dataPt =~ /\G</` decides XML vs not. The `\G`
   // anchor is at `$start` (0 here); a plist XML file begins with `<?xml`
   // possibly after leading whitespace (the XMP entry tolerates leading
@@ -1047,7 +1049,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<PlistMeta<'_>>, Error> {
   let first_non_ws = xml_view.iter().position(|b| !b.is_ascii_whitespace());
   if first_non_ws.is_some_and(|idx| xml_view[idx] == b'<') {
     // XML plist (PLIST.pm:464-469 — the XMP-machinery branch).
-    return Ok(parse_xml(data));
+    return parse_xml(data);
   }
   // PLIST.pm:480 — `$$dataPt =~ /\Gbplist0/` ⇒ binary PLIST. Once the magic
   // matches, the file is RECOGNIZED as PLIST (PLIST.pm:483 `SetFileType` +
@@ -1055,7 +1057,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<PlistMeta<'_>>, Error> {
   // a decode failure carries `PLIST:Error` rather than dropping the file
   // (Codex R14 F1). So this is `Ok(Some(...))`, never `Ok(None)`.
   if data.starts_with(BPLIST_MAGIC) {
-    return Ok(Some(parse_binary(data)));
+    return Some(parse_binary(data));
   }
   // Not an XML plist, not a binary plist. PLIST.pm:490-493 covers JSON-plist
   // (`{"`-prefixed, out of scope per module docs). PLIST.pm:494-499 covers the
@@ -1063,7 +1065,7 @@ fn parse_inner(data: &[u8]) -> Result<Option<PlistMeta<'_>>, Error> {
   // port routes that at the [`crate::parser::finalization_error`] seam — `Ok(
   // None)` here lets the engine candidate loop exhaust, then the finalization
   // path returns bundled's exact `ExifTool:Error` text (Codex R20 F2).
-  Ok(None)
+  None
 }
 
 // ===========================================================================
@@ -2041,7 +2043,7 @@ fn decode_xml_leaf(name: &str, inner: &str, self_closing: bool) -> PlistValue {
 fn last_wins_by_name_xml_only(scratch: Vec<PlistTag>) -> Vec<PlistTag> {
   // Only XML-group tags actually engage the dedup. A PLIST-group sub-walk
   // tag (from `CompressedPLIST`) is always kept.
-  let mut seen_xml: Vec<String> = Vec::new();
+  let mut seen_xml: Vec<smol_str::SmolStr> = Vec::new();
   let mut keep: Vec<PlistTag> = Vec::new();
   for tag in scratch.iter().rev() {
     if tag.group_override.is_some() {
@@ -2695,16 +2697,17 @@ fn emit_tag(id: &str, format: PlistFormat, leaf: PlistLeaf) -> PlistTag {
       other => other,
     };
     PlistTag {
-      name: info.name.to_string(),
+      name: info.name.into(),
       value,
       print_conv,
       group_override: None,
     }
   } else {
-    let name = match format {
+    let name: smol_str::SmolStr = match format {
       PlistFormat::Binary => generate_binary_tag_name(id),
       PlistFormat::Xml => generate_xml_tag_name(id),
-    };
+    }
+    .into();
     PlistTag {
       name,
       value: leaf,
@@ -3567,21 +3570,6 @@ const _: () = {
 };
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for PLIST parsing. Currently empty — every bad
-/// input produces `Ok(None)` (faithful to bundled `ProcessPLIST` `return 0`).
-/// `#[non_exhaustive]` lets the first real variant land without a breaking
-/// change.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -3632,27 +3620,16 @@ mod tests {
       && b[22] == b':'
       && b[23..25].iter().all(u8::is_ascii_digit)
   }
-
-  #[test]
-  fn plist_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   #[test]
   fn detects_binary_plist() {
-    let meta = parse_borrowed(BIN_FIXTURE)
-      .expect("no fatal")
-      .expect("binary plist recognized");
+    let meta = parse_borrowed(BIN_FIXTURE).expect("binary plist recognized");
     assert!(meta.format().is_binary());
     assert_eq!(meta.format().group(), "PLIST");
   }
 
   #[test]
   fn detects_xml_plist() {
-    let meta = parse_borrowed(XML_FIXTURE)
-      .expect("no fatal")
-      .expect("xml plist recognized");
+    let meta = parse_borrowed(XML_FIXTURE).expect("xml plist recognized");
     assert!(meta.format().is_xml());
     assert_eq!(meta.format().group(), "XML");
   }
@@ -3660,13 +3637,9 @@ mod tests {
   #[test]
   fn rejects_non_plist() {
     // Neither a `bplist0` prefix nor a leading `<` ⇒ not a plist (`Ok(None)`).
-    assert!(
-      parse_borrowed(b"not a plist at all")
-        .expect("no fatal")
-        .is_none()
-    );
+    assert!(parse_borrowed(b"not a plist at all").is_none());
     // Empty buffer ⇒ not a plist.
-    assert!(parse_borrowed(b"").expect("no fatal").is_none());
+    assert!(parse_borrowed(b"").is_none());
     // NOTE: a `bplist00` magic with no trailer is NOT rejected — once the magic
     // matches it is a RECOGNIZED PLIST carrying the error (PLIST.pm:483-489);
     // see `truncated_binary_is_recognized_with_error` (Codex R14 F1).
@@ -3681,9 +3654,7 @@ mod tests {
   #[test]
   fn truncated_binary_is_recognized_with_error() {
     // The 8-byte magic only (no 32-byte trailer ⇒ PLIST.pm:419 `return 0`).
-    let meta = parse_borrowed(b"bplist00")
-      .expect("no fatal")
-      .expect("truncated bplist00 is RECOGNIZED, not Ok(None)");
+    let meta = parse_borrowed(b"bplist00").expect("truncated bplist00 is RECOGNIZED, not Ok(None)");
     assert!(meta.format().is_binary());
     assert_eq!(meta.error(), Some("Error reading binary PLIST file"));
     assert!(
@@ -3729,7 +3700,6 @@ mod tests {
     ];
     for (label, data) in cases {
       let meta = parse_borrowed(&data)
-        .expect("no fatal")
         .unwrap_or_else(|| panic!("{label}: must be RECOGNIZED, not Ok(None)"));
       assert!(meta.format().is_binary(), "{label}: binary");
       assert_eq!(
@@ -3744,7 +3714,7 @@ mod tests {
   /// binary fixture still decodes to its tags with NO error.
   #[test]
   fn binary_success_has_no_error() {
-    let meta = parse_borrowed(BIN_FIXTURE).unwrap().unwrap();
+    let meta = parse_borrowed(BIN_FIXTURE).unwrap();
     assert!(meta.format().is_binary());
     assert_eq!(meta.error(), None);
     assert!(!meta.tags_slice().is_empty());
@@ -3754,7 +3724,7 @@ mod tests {
   /// bundled-oracle values.
   #[test]
   fn binary_fixture_tag_values() {
-    let meta = parse_borrowed(BIN_FIXTURE).unwrap().unwrap();
+    let meta = parse_borrowed(BIN_FIXTURE).unwrap();
     let tm = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
     assert_eq!(
       tm.get_str("PLIST", "TestString").as_deref(),
@@ -3848,9 +3818,7 @@ mod tests {
   fn binary_oversized_data_is_length_only_placeholder() {
     for size in [1_000_000_u32, 2_000_000, u32::MAX] {
       let bytes = truncated_data_bplist(size);
-      let meta = parse_borrowed(&bytes)
-        .expect("no fatal")
-        .expect("recognized binary plist");
+      let meta = parse_borrowed(&bytes).expect("recognized binary plist");
       let tag = meta
         .tags_slice()
         .iter()
@@ -3900,9 +3868,7 @@ mod tests {
     trailer[31] = table_off;
     out.extend_from_slice(&trailer);
 
-    let meta = parse_borrowed(&out)
-      .expect("no fatal")
-      .expect("recognized binary plist");
+    let meta = parse_borrowed(&out).expect("recognized binary plist");
     let tag = meta
       .tags_slice()
       .iter()
@@ -3918,7 +3884,7 @@ mod tests {
   /// The XML fixture decodes to the same value set under the `"XML"` group.
   #[test]
   fn xml_fixture_tag_values() {
-    let meta = parse_borrowed(XML_FIXTURE).unwrap().unwrap();
+    let meta = parse_borrowed(XML_FIXTURE).unwrap();
     let tm = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
     assert_eq!(
       tm.get_str("XML", "TestString").as_deref(),
@@ -4325,7 +4291,7 @@ mod tests {
     body.extend_from_slice(&0u64.to_be_bytes()); // topObj
     body.extend_from_slice(&table_off.to_be_bytes());
 
-    let meta = parse_borrowed(&body).unwrap().unwrap();
+    let meta = parse_borrowed(&body).unwrap();
     let tm = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
     // Bundled emits the unsigned scalar `9223372036854775808`.
     assert_eq!(

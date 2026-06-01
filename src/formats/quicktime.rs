@@ -63,6 +63,17 @@ use crate::{
 /// `(66 * 365 + 17) * 24 * 3600` — QuickTime.pm:1361.
 const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 
+/// Max container-atom recursion depth for the box/atom walk (Golden-v2
+/// Contract 3a). ExifTool's `ProcessMOV` has no hard cap (it relies on the
+/// finite atom sizes + EOF), but a maliciously deep box tree would recurse
+/// `walk_atoms`→`walk_trak`→`walk_atoms` (or the freeGPS/embedded-Exif
+/// `udta`/`meta` scans) until the stack overflows — a DoS. Real media nests
+/// single-digit deep (`moov`→`trak`→`mdia`→`minf`→`stbl`→…), so this cap is a
+/// large superset that never trips on a real file; the output stays
+/// byte-identical. Exceeding the cap simply stops recursion (no warning),
+/// faithful to a truncated/garbage subtree contributing no tags.
+const MAX_ATOM_DEPTH: u32 = 100;
+
 // ===========================================================================
 // Atom header reading (QuickTime.pm:9966-10078)
 // ===========================================================================
@@ -348,13 +359,28 @@ fn truncated_atom_warning(
 /// extended size ⇒ `Invalid atom size` etc.) inside moov/trak/mdia still set
 /// `$warnStr` and emit the warning before the `last`. The first such warning
 /// is recorded into `warning` (first-wins, threaded through nested walks).
+///
+/// `depth` is the recursion budget (Golden-v2 Contract 3a): a `walk_atoms`
+/// re-entered from inside another `walk_atoms`/`walk_trak` closure passes the
+/// enclosing `depth + 1`; the top-level/entry walks pass `0`. When `depth`
+/// reaches [`MAX_ATOM_DEPTH`] the walk stops, bounding stack use on a hostile
+/// file with no effect on real media (whose nesting is single-digit, far below
+/// the cap — so the output is byte-identical).
 fn walk_atoms(
+  depth: u32,
   data: &[u8],
   start: usize,
   end: usize,
   warning: &mut Option<String>,
   mut f: impl FnMut(&AtomHeader, &[u8], &mut Option<String>),
 ) {
+  // Golden-v2 3a — recursion-depth guard. Real QuickTime nesting is
+  // single-digit (`moov`→`trak`→`mdia`→`minf`→…); `MAX_ATOM_DEPTH` is a
+  // superset, so this never trips on a real file (byte-identical output) but
+  // caps stack growth on a maliciously deep box tree (a stack-overflow DoS).
+  if depth >= MAX_ATOM_DEPTH {
+    return;
+  }
   let mut pos = start;
   while pos < end {
     match read_atom_header(data, pos, false) {
@@ -1265,7 +1291,8 @@ fn decode_hdlr(payload: &[u8]) -> Option<String> {
 /// `$$self{MediaTS}` set by the SAME mdhd table — that one IS parse-order
 /// and is handled inside [`decode_mdhd`].)
 fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     if &inner.atom_type == b"mvhd" {
       decode_mvhd(ibody, qt);
     }
@@ -1290,7 +1317,8 @@ fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option
 /// global is THIS [`KodakFrea::version`](crate::metadata::KodakFrea::version),
 /// threaded into the `mdat` freeGPS scan via [`parse_inner`].
 fn decode_frea(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — depth 0.
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     let frea = qt.kodak_frea_mut();
     match &inner.atom_type {
       // `tima` Duration — `int32u` (Kodak.pm:2980-2985). ExifTool's `int32u`
@@ -1344,10 +1372,12 @@ fn decode_moov_trak(
   // later same-group track (first-wins) so default JSON keeps the FIRST moov's
   // `Track1`.
   let mut track_num: u32 = 0;
-  walk_atoms(payload, 0, payload.len(), warning, |inner, ibody, _w| {
+  // Top-level entry (the `parse_inner` file loop) — this `moov` walk is depth
+  // 0; `walk_trak` re-enters `walk_atoms` so it starts one level deeper (1).
+  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
     if &inner.atom_type == b"trak" {
       track_num += 1; // QuickTime.pm:10354 `++$track`
-      let mut track = walk_trak(ibody, movie_ts);
+      let mut track = walk_trak(1, ibody, movie_ts);
       track.set_track_group(track_num);
       qt.push_track(track);
     }
@@ -1362,10 +1392,11 @@ fn decode_moov_trak(
 /// attaches the `Truncated '...' data` / `Invalid atom size` warning to the
 /// *current* family-1 group, so the warning is recorded ON THE TRACK (surfaced
 /// as `Track#:Warning`), not the document-level `ExifTool:Warning`.
-fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
+fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
   let mut track = MediaTrack::new();
   let mut track_warning: Option<String> = None;
   walk_atoms(
+    depth,
     payload,
     0,
     payload.len(),
@@ -1377,9 +1408,16 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
           track.merge_track_header(decoded);
         }
         b"mdia" => {
-          // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237).
-          walk_atoms(body, 0, body.len(), w, |inner, ibody, _w| {
-            match &inner.atom_type {
+          // mdia contains mdhd + hdlr + minf (QuickTime.pm:7218-7237). This
+          // re-enters `walk_atoms` from inside the trak walk, so it runs one
+          // level deeper than the enclosing `walk_trak` (Golden-v2 3a).
+          walk_atoms(
+            depth + 1,
+            body,
+            0,
+            body.len(),
+            w,
+            |inner, ibody, _w| match &inner.atom_type {
               b"mdhd" => decode_mdhd(ibody, &mut track),
               b"hdlr" => {
                 if let Some(code) = decode_hdlr(ibody) {
@@ -1387,8 +1425,8 @@ fn walk_trak(payload: &[u8], movie_timescale: Option<u32>) -> MediaTrack {
                 }
               }
               _ => {}
-            }
-          });
+            },
+          );
         }
         _ => {}
       }
@@ -1536,9 +1574,8 @@ impl FormatParser for ProcessMov {
   /// Leaf format Context is `&'a [u8]`.
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; QuickTime parsing has no I/O modes).
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // The leaf `FormatParser::parse` carries no extension channel; the
     // closed dispatch in `format_parser.rs` routes the `%useExt` rule
     // through the extension-aware [`parse_with_ext`] entry instead.
@@ -1554,7 +1591,7 @@ impl FormatParser for ProcessMov {
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data, None)
 }
 
@@ -1570,7 +1607,7 @@ pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
 /// # Errors
 ///
 /// Returns `Err` for Rust-level fatal modes (none today).
-pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>, Error> {
+pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   parse_inner(data, ext)
 }
 
@@ -1580,7 +1617,7 @@ pub fn parse_with_ext<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Me
 ///
 /// `ext` is the uppercased `$$et{FILE_EXT}` (ExifTool.pm:2966), used only for
 /// the `%useExt` rule (QuickTime.pm:10006-10007).
-fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>, Error> {
+fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // QuickTime.pm:9966 `$raf->Read($buff,8) == 8 or return 0` — the FIRST step
   // is a plain 8-byte read; QuickTime.pm:9973 `($size, $tag) = unpack('Na4',
   // $buff)` then yields the RAW 32-bit `$size` and the 4-byte `$tag`.
@@ -1596,7 +1633,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // then does the size check set `$warnStr` and `last`. So such a file is
   // accepted as QuickTime with the bundled warning, never `Ok(None)`.
   if data.len() < 8 {
-    return Ok(None); // QuickTime.pm:9966 `$raf->Read($buff,8) == 8 or return 0`.
+    return None; // QuickTime.pm:9966 `$raf->Read($buff,8) == 8 or return 0`.
   }
   let raw_size32 = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
   let mut first = [0u8; 4];
@@ -1607,7 +1644,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // ALONE, never on `$size` (so an invalid/size-0/truncated size still
   // passes if the type is recognized).
   if !is_known_top_level(&first) {
-    return Ok(None);
+    return None;
   }
 
   // QuickTime.pm:9986-10012: resolve the file type from the RAW first
@@ -1903,7 +1940,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
   // DEFERRED: wire exif::parse_exif_block once #36 (Exif+GPS) merges.
   let embedded_exif_deferred = detect_embedded_exif(data);
 
-  Ok(Some(Meta {
+  Some(Meta {
     qt,
     stream,
     embedded_exif_deferred,
@@ -1911,7 +1948,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Result<Option<Meta<'a>>
     mime,
     warning,
     _marker: core::marker::PhantomData,
-  }))
+  })
 }
 
 /// Recover the FIRST `moov`/`mvhd` CreateDate as the RAW 1904-epoch second
@@ -1931,7 +1968,8 @@ fn first_moov_create_date_raw(data: &[u8]) -> Option<u64> {
     };
     if &header.atom_type == b"moov" {
       let body = &data[header.payload_start..header.payload_end.min(data.len())];
-      walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+      // Top-level scan (the file loop above) — depth 0.
+      walk_atoms(0, body, 0, body.len(), &mut None, |inner, ibody, _w| {
         if &inner.atom_type == b"mvhd"
           && let Some(&version) = ibody.first()
         {
@@ -1981,7 +2019,8 @@ fn detect_embedded_exif(data: &[u8]) -> bool {
     };
     let body = &data[header.payload_start..header.payload_end.min(data.len())];
     detected |= match &header.atom_type {
-      b"moov" => detect_embedded_exif_in_dir(body),
+      // Top-level entry into the directory scan — depth 0.
+      b"moov" => detect_embedded_exif_in_dir(0, body),
       // A top-level `uuid` carrying an `Exif` TIFF block.
       b"uuid" => is_uuid_exif_payload(body),
       _ => false,
@@ -1997,16 +2036,25 @@ fn detect_embedded_exif(data: &[u8]) -> bool {
 /// Recursively scan a `moov`/`udta`/`meta` directory for an embedded-Exif
 /// atom (`QVMI` / `MVTG` / `Exif` / `uuid`-Exif). QuickTime.pm nests these
 /// under `moov`→`udta` (QuickTime.pm:2058, 2070).
-fn detect_embedded_exif_in_dir(body: &[u8]) -> bool {
+///
+/// `depth` is the recursion budget (Golden-v2 3a): the `udta`/`meta`/`trak`
+/// self-recursion passes `depth + 1`, and the `walk_atoms` walk runs at the
+/// same `depth` — so a hostile deeply-nested `udta` chain is bounded by
+/// [`MAX_ATOM_DEPTH`] on both the self-recursion and the box walk.
+fn detect_embedded_exif_in_dir(depth: u32, body: &[u8]) -> bool {
+  if depth >= MAX_ATOM_DEPTH {
+    return false;
+  }
   let mut found = false;
-  walk_atoms(body, 0, body.len(), &mut None, |inner, ibody, _w| {
+  walk_atoms(depth, body, 0, body.len(), &mut None, |inner, ibody, _w| {
     found |= match &inner.atom_type {
       // Casio `QVMI` / FujiFilm `MVTG` — standard Exif IFD blocks
       // (QuickTime.pm:2056-2080) — and a bare `Exif`-type atom (TIFF block).
       b"QVMI" | b"MVTG" | b"Exif" => true,
       b"uuid" => is_uuid_exif_payload(ibody),
-      // Recurse into nested containers (`udta`, `meta`, `trak`).
-      b"udta" | b"meta" | b"trak" => detect_embedded_exif_in_dir(ibody),
+      // Recurse into nested containers (`udta`, `meta`, `trak`) — one level
+      // deeper than the enclosing directory scan.
+      b"udta" | b"meta" | b"trak" => detect_embedded_exif_in_dir(depth + 1, ibody),
       _ => false,
     };
   });
@@ -2739,21 +2787,6 @@ fn alloc_track_group(n: usize) -> String {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for QuickTime parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers.
-///
-/// §5: derived via `thiserror` (`Display` + `core::error::Error` in every
-/// feature tier). `#[non_exhaustive]` lets the first real variant land
-/// without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2791,13 +2824,6 @@ mod tests {
       HeaderOutcome::Malformed { .. } => panic!("unexpected malformed header"),
     }
   }
-
-  #[test]
-  fn quicktime_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   #[test]
   fn reads_simple_atom_header() {
     let data = atom(b"ftyp", b"qt  \0\0\0\0");
@@ -2923,7 +2949,7 @@ mod tests {
     data.extend_from_slice(&mdat);
     data.extend_from_slice(&moov);
 
-    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("meta");
     // Walker reached the trailing moov ⇒ mvhd state present.
     assert_eq!(meta.qt.time_scale(), Some(1000));
     assert_eq!(meta.qt.movie_header_version(), Some(0));
@@ -2945,7 +2971,7 @@ mod tests {
     let mut data = ftyp;
     data.extend_from_slice(&mdat);
 
-    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("meta");
     assert_eq!(meta.qt.media_data_size(), Some(2_147_483_648));
     assert_eq!(meta.qt.media_data_offset(), Some((mdat_offset + 16) as u64));
     assert_eq!(meta.file_type, "MOV");
@@ -2998,7 +3024,7 @@ mod tests {
     let mut data = ftyp;
     data.extend_from_slice(&moov_zero);
 
-    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("meta");
     // ftyp tags ARE present.
     assert_eq!(meta.qt.major_brand(), Some("qt  "));
     // The size-0 moov payload was NOT decoded: no mvhd-derived state.
@@ -3024,7 +3050,7 @@ mod tests {
     let payload_start = data.len() + 8; // after ftyp + the mdat 8-byte header
     data.extend_from_slice(&mdat_zero);
 
-    let meta = parse_inner(&data, None).expect("parse ok").expect("meta");
+    let meta = parse_inner(&data, None).expect("meta");
     assert_eq!(meta.qt.media_data_offset(), Some(payload_start as u64));
     assert_eq!(
       meta.qt.media_data_size(),
@@ -3060,7 +3086,7 @@ mod tests {
     moov_body.extend_from_slice(&mvhd);
     let mut decoded_mvhd = false;
     let mut warn = None;
-    walk_atoms(&moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
+    walk_atoms(0, &moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
       if &a.atom_type == b"mvhd" {
         decoded_mvhd = true;
       }
@@ -3144,7 +3170,7 @@ mod tests {
     moov_body.extend_from_slice(b"mvhd");
     let mut warn: Option<String> = None;
     let mut decoded = false;
-    walk_atoms(&moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
+    walk_atoms(0, &moov_body, 0, moov_body.len(), &mut warn, |a, _, _| {
       if &a.atom_type == b"mvhd" {
         decoded = true;
       }
@@ -3264,13 +3290,13 @@ mod tests {
   #[test]
   fn parse_inner_rejects_unknown_first_atom() {
     let data = atom(b"XXXX", b"\0\0\0\0");
-    assert!(parse_inner(&data, None).expect("ok").is_none());
+    assert!(parse_inner(&data, None).is_none());
   }
 
   #[test]
   fn parse_inner_accepts_ftyp_and_resolves_type() {
     let data = atom(b"ftyp", b"M4A \0\0\0\0M4A mp42");
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "M4A");
     // MajorBrand keeps the trailing space (the %ftypLookup PrintConv key).
     assert_eq!(meta.quicktime().major_brand(), Some("M4A "));
@@ -3374,7 +3400,7 @@ mod tests {
     data.extend_from_slice(&mdat);
     data.extend_from_slice(&moov);
 
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     // The `gps `-handler track contributed nothing; the `mdat` scan decoded the
     // buried block. Exactly one sample, from the scan.
     assert_eq!(
@@ -3432,7 +3458,7 @@ mod tests {
     data.extend_from_slice(&mdat);
     data.extend_from_slice(&moov);
 
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     // The box decoded the block once; the scan is suppressed — NOT doubled.
     assert_eq!(
       meta.stream().gps_samples().len(),
@@ -3502,7 +3528,7 @@ mod tests {
     data.extend_from_slice(&gps0);
     data.extend_from_slice(&moov);
 
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     let samples = meta.stream().gps_samples();
     // BOTH sources extracted: the `gps0` record AND the scanned freeGPS block.
     // (Pre-fix: only the `gps0` sample — the scan was wrongly suppressed.)
@@ -3552,7 +3578,7 @@ mod tests {
     };
     let ft = |major: &[u8; 4], handlers: &[&[u8; 4]]| {
       let data = build(major, handlers);
-      let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+      let meta = parse_inner(&data, None).expect("accepted");
       (meta.file_type(), meta.mime())
     };
 
@@ -3623,16 +3649,14 @@ mod tests {
     let data = [ftyp, moov].concat();
 
     // `.glv` extension ⇒ `%useExt` promotes MP4→GLV (override skipped).
-    let glv = parse_inner(&data, Some("GLV"))
-      .expect("ok")
-      .expect("accepted");
+    let glv = parse_inner(&data, Some("GLV")).expect("accepted");
     assert_eq!(glv.file_type(), "GLV");
     // `%mimeLookup{GLV}` is undef ⇒ the `'video/mp4'` fallback (QuickTime.pm:10008).
     assert_eq!(glv.mime(), "video/mp4");
 
     // Same bytes, NO `.glv` ext ⇒ MP4 not promoted ⇒ the audio-only MP4→M4A
     // override fires (QuickTime.pm:10619-10624).
-    let m4a = parse_inner(&data, None).expect("ok").expect("accepted");
+    let m4a = parse_inner(&data, None).expect("accepted");
     assert_eq!(m4a.file_type(), "M4A");
     assert_eq!(m4a.mime(), "audio/mp4");
 
@@ -3654,9 +3678,7 @@ mod tests {
       ),
     ]
     .concat();
-    let qt = parse_inner(&qt_data, Some("GLV"))
-      .expect("ok")
-      .expect("accepted");
+    let qt = parse_inner(&qt_data, Some("GLV")).expect("accepted");
     assert_eq!(qt.file_type(), "MOV");
     assert_eq!(qt.mime(), "video/quicktime");
   }
@@ -3697,7 +3719,7 @@ mod tests {
     let data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     let mut full = data;
     full.extend_from_slice(&atom(b"moov", &moov_body));
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     let track = &meta.quicktime().tracks()[0];
     // 1200 / 600 = 2.0 — the final movie TimeScale is used regardless of the
     // trak-before-mvhd file order (faithful durationInfo ValueConv).
@@ -3739,7 +3761,7 @@ mod tests {
     full.extend_from_slice(&moov1);
     full.extend_from_slice(&moov2);
 
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     // Final global TimeScale is the SECOND moov's (last-wins).
     assert_eq!(meta.quicktime().time_scale(), Some(300));
     let track = &meta.quicktime().tracks()[0];
@@ -3773,7 +3795,7 @@ mod tests {
     full.extend_from_slice(&moov1);
     full.extend_from_slice(&moov2);
 
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     let qt = meta.quicktime();
     // The raw Duration COUNT survives moov2's short mvhd (absent ⇒ no erase).
     assert_eq!(qt.duration_count(), Some(3000));
@@ -3796,7 +3818,7 @@ mod tests {
     let mut data = 100u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"ftyp");
     data.extend_from_slice(b"mp42"); // 12 bytes total
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "MP4");
     assert_eq!(meta.mime(), "video/mp4");
     // Truncated payload ⇒ no ftyp tags decoded.
@@ -3818,7 +3840,7 @@ mod tests {
     let mut data = 100u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"mdat");
     data.extend_from_slice(b"XXXX"); // 12 bytes total
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     // mdat-size/offset from the DECLARED size (100 - 8 = 92), offset = 8.
     assert_eq!(meta.quicktime().media_data_size(), Some(92));
@@ -3838,7 +3860,7 @@ mod tests {
     let mut data = 10u32.to_be_bytes().to_vec(); // declared size 10 (< 12)
     data.extend_from_slice(b"ftyp");
     data.push(b'm'); // 9 bytes total, declared 2-byte payload overruns
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -3854,7 +3876,7 @@ mod tests {
     for size in 2u32..=7 {
       let mut data = size.to_be_bytes().to_vec();
       data.extend_from_slice(b"ftyp");
-      let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+      let meta = parse_inner(&data, None).expect("accepted");
       assert_eq!(meta.file_type(), "MOV", "size {size}: file type");
       assert_eq!(
         meta.warning.as_deref(),
@@ -3865,7 +3887,7 @@ mod tests {
     // The same for a `moov`/`mdat` first atom — any magic type is accepted.
     let mut moov4 = 4u32.to_be_bytes().to_vec();
     moov4.extend_from_slice(b"moov");
-    let meta = parse_inner(&moov4, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&moov4, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Invalid atom size"));
   }
@@ -3881,7 +3903,7 @@ mod tests {
     let mut data = 1u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"ftyp");
     data.extend_from_slice(&[0u8; 4]); // only 4 of the 8 ext-size bytes
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Truncated atom header"));
 
@@ -3889,7 +3911,7 @@ mod tests {
     let mut mdat = 1u32.to_be_bytes().to_vec();
     mdat.extend_from_slice(b"mdat");
     mdat.extend_from_slice(&[0u8; 3]);
-    let meta = parse_inner(&mdat, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&mdat, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.warning.as_deref(), Some("Truncated atom header"));
   }
@@ -3907,7 +3929,7 @@ mod tests {
       .chain(b"ftyp")
       .copied()
       .collect::<Vec<u8>>();
-    let meta = parse_inner(&size8, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&size8, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
     assert_eq!(meta.mime(), "video/quicktime");
 
@@ -3915,7 +3937,7 @@ mod tests {
     let mut size11 = 11u32.to_be_bytes().to_vec();
     size11.extend_from_slice(b"ftyp");
     size11.extend_from_slice(b"qt ");
-    let meta = parse_inner(&size11, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&size11, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -3932,7 +3954,7 @@ mod tests {
     data.extend_from_slice(&24u64.to_be_bytes()); // 64-bit size = 24
     data.extend_from_slice(b"isom"); // major brand
     data.extend_from_slice(&[0u8; 4]); // minor version
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     // MOV via SetFileType(), NOT MP4 from the `isom` brand.
     assert_eq!(meta.file_type(), "MOV");
     // The brand is still decoded from the (valid) extended-size atom walk.
@@ -3949,7 +3971,7 @@ mod tests {
     let mut data = 16u32.to_be_bytes().to_vec();
     data.extend_from_slice(b"pict");
     data.extend_from_slice(&[0u8; 8]);
-    let meta = parse_inner(&data, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&data, None).expect("accepted");
     assert_eq!(meta.file_type(), "MOV");
   }
 
@@ -3963,7 +3985,7 @@ mod tests {
     data.extend_from_slice(b"meta");
     data.extend_from_slice(&[0u8; 8]);
     assert!(
-      parse_inner(&data, None).expect("ok").is_none(),
+      parse_inner(&data, None).is_none(),
       "`meta` is not a magic-regex first atom — must be rejected"
     );
     // `moof` / `udta` likewise: Main keys but not magic atoms.
@@ -3971,7 +3993,7 @@ mod tests {
       let mut d = 16u32.to_be_bytes().to_vec();
       d.extend_from_slice(tag);
       d.extend_from_slice(&[0u8; 8]);
-      assert!(parse_inner(&d, None).expect("ok").is_none());
+      assert!(parse_inner(&d, None).is_none());
     }
   }
 
@@ -4007,7 +4029,7 @@ mod tests {
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full.extend_from_slice(&moov);
 
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     let track = &meta.quicktime().tracks()[0];
     // MediaTimeScale is last-wins (the field IS present in the short mdhd).
     assert_eq!(track.media_time_scale(), Some(300));
@@ -4031,7 +4053,7 @@ mod tests {
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full.extend_from_slice(&moov);
 
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     assert_eq!(
       meta.warning.as_deref(),
       Some("Truncated 'mvhd' data (missing 88 bytes)")
@@ -4052,9 +4074,7 @@ mod tests {
     let moov_tkhd = atom(b"moov", &atom(b"trak", &trak_body));
     let mut full_tkhd = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full_tkhd.extend_from_slice(&moov_tkhd);
-    let meta = parse_inner(&full_tkhd, None)
-      .expect("ok")
-      .expect("accepted");
+    let meta = parse_inner(&full_tkhd, None).expect("accepted");
     // The truncation is per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
@@ -4071,9 +4091,7 @@ mod tests {
     let moov_mdhd = atom(b"moov", &atom(b"trak", &atom(b"mdia", &mdia_body)));
     let mut full_mdhd = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     full_mdhd.extend_from_slice(&moov_mdhd);
-    let meta = parse_inner(&full_mdhd, None)
-      .expect("ok")
-      .expect("accepted");
+    let meta = parse_inner(&full_mdhd, None).expect("accepted");
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
     assert_eq!(
@@ -4096,7 +4114,7 @@ mod tests {
     moov_body.extend_from_slice(b"mvhd");
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0");
     full.extend_from_slice(&atom(b"moov", &moov_body));
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     assert_eq!(meta.warning.as_deref(), Some("Invalid atom size"));
     // The invalid-size mvhd is never decoded.
     assert_eq!(meta.quicktime().time_scale(), None);
@@ -4113,7 +4131,7 @@ mod tests {
     trak_body.extend_from_slice(b"tkhd");
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0");
     full.extend_from_slice(&atom(b"moov", &atom(b"trak", &trak_body)));
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     // Per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
     let track = &meta.quicktime().tracks()[0];
@@ -4149,7 +4167,7 @@ mod tests {
     full.extend_from_slice(&mk_moov(600, &mk_trak(1, 600))); // Track1 (first)
     full.extend_from_slice(&mk_moov(600, &mk_trak(2, 1200))); // Track1 again
 
-    let meta = parse_inner(&full, None).expect("ok").expect("accepted");
+    let meta = parse_inner(&full, None).expect("accepted");
     let tracks = meta.quicktime().tracks();
     assert_eq!(tracks.len(), 2, "both traks are decoded into the list");
     // BOTH tracks carry family-1 group Track1 (per-moov reset).
@@ -4237,7 +4255,7 @@ mod tests {
     // `Meta` owns its data (phantom `'a`); leak the buffer so the returned
     // `Meta` is `'static` for the test helper (the process exits after tests).
     let leaked: &'static [u8] = std::boxed::Box::leak(bytes.into_boxed_slice());
-    parse_borrowed(leaked).expect("ok").expect("parsed")
+    parse_borrowed(leaked).expect("parsed")
   }
 
   #[test]
@@ -4416,5 +4434,45 @@ mod tests {
     assert!(projected.lens().is_none());
     assert!(projected.gps().is_none());
     assert!(projected.capture().is_none());
+  }
+
+  #[test]
+  fn deeply_nested_atoms_do_not_overflow_the_stack() {
+    // Golden-v2 Contract 3a — a hostile file can nest container atoms
+    // arbitrarily deep. The production walk recurses on `trak`/`mdia` (and
+    // the freeGPS / embedded-Exif scans recurse on `udta`/`meta`); a
+    // closure that re-enters `walk_atoms` per nested container is exactly
+    // that pattern. Without a recursion budget this blows the stack
+    // (a DoS); with `MAX_ATOM_DEPTH` the walk simply stops at the cap and
+    // returns. The nesting here (100_000) is a superset of any real file's
+    // single-digit nesting, so the cap never triggers on a real input.
+    const N: usize = 100_000;
+    // Build N nested `moov` containers: innermost is an 8-byte empty `moov`,
+    // each outer frame wraps the previous one's bytes.
+    let mut buf = atom(b"moov", &[]);
+    for _ in 1..N {
+      buf = atom(b"moov", &buf);
+    }
+
+    // A recursive walker mirroring the production `walk_trak`/`mdia` shape:
+    // each nested `moov` re-enters `walk_atoms` at `depth + 1`.
+    fn recurse(depth: u32, body: &[u8], count: &mut u64) {
+      walk_atoms(depth, body, 0, body.len(), &mut None, |inner, ibody, _w| {
+        if &inner.atom_type == b"moov" {
+          *count += 1;
+          recurse(depth + 1, ibody, count);
+        }
+      });
+    }
+
+    let mut count = 0u64;
+    recurse(0, &buf, &mut count);
+    // The budget bounds the walk; at least one container was visited and we
+    // returned without overflowing.
+    assert!(count >= 1, "expected to visit at least one nested moov");
+    assert!(
+      count <= u64::from(MAX_ATOM_DEPTH),
+      "the recursion budget must cap the walk at MAX_ATOM_DEPTH containers"
+    );
   }
 }

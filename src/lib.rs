@@ -20,7 +20,7 @@
 //! use exifast::{parse_bytes, AnyMeta};
 //!
 //! let bytes = std::fs::read("file.moi").unwrap();
-//! if let Some(meta) = parse_bytes(&bytes).unwrap() {
+//! if let Some(meta) = parse_bytes(&bytes) {
 //!   match meta {
 //!     AnyMeta::Moi(moi) => {
 //!       println!("MOI version: {}", moi.version());
@@ -46,7 +46,7 @@
 //!
 //! let bytes = std::fs::read("song.flac").unwrap();
 //! let mut shared = SharedFlags::new();
-//! if let Some(flac) = exifast::parse_flac(&bytes, &mut shared).unwrap() {
+//! if let Some(flac) = exifast::parse_flac(&bytes, &mut shared) {
 //!   if let Some(rate) = flac.sample_rate() {
 //!     println!("Sample rate: {} Hz", rate);
 //!   }
@@ -159,31 +159,28 @@ pub use emit::{ConvMode, EmittedTag, Taggable};
 // The public top-level `parse_bytes` + per-format `parse_<fmt>` entry points
 // land here so callers don't need to traverse into `formats::<fmt>` for the
 // happy path. Per skill §6 (no module-name stutter), each format's typed
-// `Meta`/`Error`/`Context` types now use the bare names — so they CANNOT all
+// `Meta`/`Context` types now use the bare names — so they CANNOT all
 // be re-exported at the crate root unaliased (`formats::moi::Meta` and
 // `formats::aac::Meta` would collide). The per-format typed surface is
 // therefore reached through the public [`formats`] module
 // (`exifast::formats::<fmt>::Meta`); only the parser-handle unit-structs
 // (`ProcessXxx`) are re-exported here (their names are unique). The universal
-// [`parse_bytes`] / [`AnyMeta`] / [`AnyError`] surface and every
-// `parse_<fmt>` fn stay at the crate root.
+// [`parse_bytes`] / [`AnyMeta`] surface and every `parse_<fmt>` fn stay at the
+// crate root.
 
 /// The optional serde [`Serialize`](serde::Serialize) view of a typed
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use format_parser::Rendered;
-pub use format_parser::{
-  AnyError, AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags,
-};
+pub use format_parser::{AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags};
 
 // Per-format parser-handle re-exports. The `ProcessXxx` unit-struct is the
 // parser handle (carried in `AnyParser`). The typed `Meta<'a>` (+ accessor
-// methods) and the fatal-error `Error` (carried in `AnyError`) are reached via
-// `exifast::formats::<fmt>::{Meta, Error}` — they are NOT re-exported at the
-// crate root because their bare §6 names would collide across formats.
-// (id3 keeps its `Id3*`/`Mp3*` axis prefixes and mpeg uses `Audio*`, but for a
-// uniform surface those per-format Meta/Error/Context types are also reached
-// only via the `formats` module, not the crate root.)
+// methods) are reached via `exifast::formats::<fmt>::Meta` — they are NOT
+// re-exported at the crate root because their bare §6 names would collide
+// across formats. (id3 keeps its `Id3*`/`Mp3*` axis prefixes and mpeg uses
+// `Audio*`, but for a uniform surface those per-format Meta/Context types are
+// also reached only via the `formats` module, not the crate root.)
 #[cfg(feature = "aac")]
 pub use formats::aac::ProcessAac;
 #[cfg(feature = "aiff")]
@@ -246,13 +243,12 @@ pub use formats::wavpack::ProcessWv;
 /// and route through the closed [`AnyParser`] / [`AnyMeta`] enums.
 ///
 /// Returns:
-/// - `Ok(Some(meta))` — the first parser to accept the data, wrapped in
+/// - `Some(meta)` — the first parser to accept the data, wrapped in
 ///   the appropriate [`AnyMeta`] variant.
-/// - `Ok(None)` — no parser accepted the data (no detected format in the
-///   compiled feature set matched).
-/// - `Err(AnyError)` — a per-format parser surfaced a Rust-level fatal
-///   error. Most format ports today have no fatal modes (uninhabited
-///   `XxxError` enums), so the `Err` branch is unreachable in practice.
+/// - `None` — no parser accepted the data (no detected format in the
+///   compiled feature set matched). No ported format has a Rust-level fatal
+///   mode, so a malformed input is either a rejected candidate (`None`) or an
+///   accepted `AnyMeta` carrying a `Warn`/`Error` tag — never an error here.
 ///
 /// The returned [`AnyMeta`] borrows from the input `bytes` for zero
 /// allocation on the happy path. To store a Meta beyond the lifetime of
@@ -268,28 +264,30 @@ pub use formats::wavpack::ProcessWv;
 /// can fall back to the legacy [`parser::extract_info`] for byte-exact CLI
 /// JSON output, or build their own `AnyParser` resolution via
 /// [`format_parser::any_parser_for`].
-///
-/// # Errors
-///
-/// See [`AnyError`].
-///
-/// # Examples
-///
-/// ```no_run
-/// # #[cfg(feature = "moi")] {
-/// use exifast::{parse_bytes, AnyMeta};
-///
-/// let bytes = std::fs::read("file.moi").unwrap();
-/// if let Some(AnyMeta::Moi(moi)) = parse_bytes(&bytes).unwrap() {
-///   println!("MOI version: {}", moi.version());
-/// }
-/// # }
-/// ```
 #[cfg(feature = "std")]
-pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, AnyError> {
+#[must_use]
+pub fn parse_bytes(bytes: &[u8]) -> Option<AnyMeta<'_>> {
+  // Golden-v2 Contract 3d — a `catch_unwind` BACKSTOP at the public boundary.
+  // The primary no-panic guarantee is 3a (the recursion budgets) + 3b (the
+  // `tests/no_panic.rs` proptest gate); this only converts an UNANTICIPATED
+  // panic (a future bug, a slice-index regression, an arithmetic overflow in a
+  // debug build) into the same empty result a clean rejection yields, so an
+  // untrusted byte stream can never crash the host process. `AssertUnwindSafe`
+  // is sound here: the closure only READS `bytes` (a shared `&[u8]`) and
+  // returns an owned/borrowed result — no `&mut` state is left half-updated
+  // across the boundary.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_bytes_inner(bytes)))
+    .unwrap_or(None)
+}
+
+/// Inner body of [`parse_bytes`] (see that fn's doc + Golden-v2 3d note). The
+/// public wrapper adds the `catch_unwind` backstop. `parse_bytes` is itself
+/// `std`-only, so its inner shares that gate.
+#[cfg(feature = "std")]
+fn parse_bytes_inner(bytes: &[u8]) -> Option<AnyMeta<'_>> {
   // Empty filename ⇒ magic-only detection (ExifTool.pm:2965-3045 with
   // `$ext = undef`). Each candidate is tried in turn; the first parser to
-  // return `Ok(Some(meta))` wins. Faithful to the legacy
+  // return `Some(meta)` wins. Faithful to the legacy
   // `parser::extract_info` loop, minus the candidate-rejection side
   // effects on `Metadata` (the typed `AnyMeta` carries everything).
   //
@@ -309,7 +307,7 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
     // `SetFileType('PLIST', 'application/xml')` and hands the body to
     // `PLIST::FoundTag`. This port has no standalone XMP parser, so replicate that
     // hop here — exactly as `parser::extract_info_typed` does — and dispatch as
-    // `PLIST` so the typed API yields `AnyMeta::Plist` (not silently `Ok(None)`).
+    // `PLIST` so the typed API yields `AnyMeta::Plist` (not silently `None`).
     // `magic()` stays a faithful 1:1 of `%magicNumber` (the PLIST gate is
     // unchanged); the BOM tolerance lives only in this XMP→PLIST route, and
     // `ProcessPlist` itself skips a leading UTF-8 BOM at its XML gate.
@@ -335,14 +333,14 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
       None,
       cand.header_skip(),
       Some(cand.parent_type()),
-    )? {
-      return Ok(Some(m));
+    ) {
+      return Some(m);
     }
     // Reset shared flags between rejected candidates so partial
     // side-effects (e.g. a probe that touched `done_id3`) don't leak.
     shared = SharedFlags::new();
   }
-  Ok(None)
+  None
 }
 
 // ===========================================================================
@@ -366,12 +364,10 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
 ///   until its Phase-2 projection lands. So a recognized non-EXIF file yields
 ///   `Some(MediaMetadata)` whose [`camera`](MediaMetadata::camera) etc. are
 ///   `None`.
-/// - `None` — no parser accepted the bytes (unknown/empty input), OR a
-///   per-format parser raised a Rust-level fatal. **Parse errors are
-///   intentionally swallowed as `None`** for this convenience entry; a caller
-///   that needs to distinguish "unrecognized" from "fatal parser error"
-///   should use [`parse_bytes`] (which returns `Result<Option<_>, AnyError>`)
-///   and call [`AnyMeta::project`](crate::AnyMeta::project) itself.
+/// - `None` — no parser accepted the bytes (unknown/empty input). A caller
+///   that wants the typed `AnyMeta` (e.g. to inspect a non-EXIF format's tags
+///   directly) should use [`parse_bytes`] and call
+///   [`AnyMeta::project`](crate::AnyMeta::project) itself.
 ///
 /// # Examples
 ///
@@ -388,12 +384,19 @@ pub fn parse_bytes(bytes: &[u8]) -> core::result::Result<Option<AnyMeta<'_>>, An
 #[cfg(feature = "std")]
 #[must_use]
 pub fn media_metadata(bytes: &[u8]) -> Option<MediaMetadata> {
-  // `parse_bytes` errors are convenience-swallowed to `None` (see the doc
-  // contract); `Ok(None)` (no format matched) is likewise `None`.
-  match parse_bytes(bytes) {
-    Ok(Some(any)) => Some(any.project()),
-    Ok(None) | Err(_) => None,
-  }
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a (recursion budgets) + 3b (proptest) are the primary
+  // guarantee. `AssertUnwindSafe` is sound: the closure only reads `bytes`.
+  // A caught panic ⇒ `None` (the `Option` default), same as a clean miss.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| media_metadata_inner(bytes)))
+    .unwrap_or_default()
+}
+
+/// Inner body of [`media_metadata`] (see that fn's doc + Golden-v2 3d note).
+#[cfg(feature = "std")]
+fn media_metadata_inner(bytes: &[u8]) -> Option<MediaMetadata> {
+  // `None` from `parse_bytes` (no format matched) maps straight through.
+  parse_bytes(bytes).map(|any| any.project())
 }
 
 // ===========================================================================
@@ -411,94 +414,57 @@ pub fn media_metadata(bytes: &[u8]) -> Option<MediaMetadata> {
 // MP3 / MPEG-audio entries also take an extension string.
 
 /// Parse a MOI buffer directly. See [`formats::moi::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::moi::Error`] (currently uninhabited).
 #[cfg(feature = "moi")]
-pub fn parse_moi(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::moi::Meta<'_>>, formats::moi::Error> {
+#[must_use]
+pub fn parse_moi(bytes: &[u8]) -> Option<formats::moi::Meta<'_>> {
   formats::moi::parse_borrowed(bytes)
 }
 
 /// Parse a Matroska/MKV/MKA/MKS/WebM buffer directly. See
 /// [`formats::matroska::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::matroska::Error`] (currently
-/// uninhabited).
 #[cfg(feature = "matroska")]
-pub fn parse_matroska(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::matroska::Meta<'_>>, formats::matroska::Error> {
+#[must_use]
+pub fn parse_matroska(bytes: &[u8]) -> Option<formats::matroska::Meta<'_>> {
   formats::matroska::parse_borrowed(bytes)
 }
 
 /// Parse a QuickTime / MP4 / MOV / M4A / M4V / 3GP / 3G2 buffer directly.
 /// See [`formats::quicktime::parse_borrowed`]. **SP1**: the box/atom walker
 /// plus the core structural atoms only (see the module docs).
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::quicktime::Error`] (currently
-/// uninhabited).
 #[cfg(feature = "quicktime")]
-pub fn parse_quicktime(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::quicktime::Meta<'_>>, formats::quicktime::Error> {
+#[must_use]
+pub fn parse_quicktime(bytes: &[u8]) -> Option<formats::quicktime::Meta<'_>> {
   formats::quicktime::parse_borrowed(bytes)
 }
 
 /// Parse an MXF (Material Exchange Format) buffer directly. See
 /// [`formats::mxf::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::mxf::MxfError`] (currently uninhabited).
 #[cfg(feature = "mxf")]
-pub fn parse_mxf(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::mxf::MxfMeta<'_>>, formats::mxf::MxfError> {
+#[must_use]
+pub fn parse_mxf(bytes: &[u8]) -> Option<formats::mxf::MxfMeta<'_>> {
   formats::mxf::parse_borrowed(bytes)
 }
 
 /// Parse an Apple Property List buffer directly — decodes both the binary
 /// (`bplist0…`) and XML (`<?xml …?>`) encodings. See
 /// [`formats::plist::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::plist::Error`] (currently uninhabited).
 #[cfg(feature = "plist")]
-pub fn parse_plist(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::plist::PlistMeta<'_>>, formats::plist::Error> {
+#[must_use]
+pub fn parse_plist(bytes: &[u8]) -> Option<formats::plist::PlistMeta<'_>> {
   formats::plist::parse_borrowed(bytes)
 }
 
 /// Parse an AAC (ADTS) buffer directly. See [`formats::aac::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::aac::Error`] (currently uninhabited).
 #[cfg(feature = "aac")]
-pub fn parse_aac(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::aac::Meta<'_>>, formats::aac::Error> {
+#[must_use]
+pub fn parse_aac(bytes: &[u8]) -> Option<formats::aac::Meta<'_>> {
   formats::aac::parse_borrowed(bytes)
 }
 
 /// Parse a DV stream buffer directly. See [`formats::dv::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::dv::Error`] (currently uninhabited).
 #[cfg(feature = "dv")]
-pub fn parse_dv(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::dv::ParseOutcome<'static>>, formats::dv::Error> {
+#[must_use]
+pub fn parse_dv(bytes: &[u8]) -> Option<formats::dv::ParseOutcome<'static>> {
   formats::dv::parse_borrowed(bytes)
 }
 
@@ -510,12 +476,28 @@ pub fn parse_dv(
 /// SubDirectory — those container ports call [`exif::parse_exif_block`]
 /// directly on the embedded block.
 ///
-/// # Errors
-///
-/// Returns the per-format [`exif::Error`] (currently uninhabited — every bad
-/// input is `Ok(None)`).
+/// Returns `None` when `bytes` is not a valid TIFF header (a malformed
+/// standalone TIFF surfaces its diagnostics as `Warn`/`Error` tags on the
+/// returned [`exif::ExifMeta`], never as a fatal error).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[must_use]
+pub fn parse_exif(bytes: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a/3b are the primary guarantee. `AssertUnwindSafe` is
+  // sound: the closure only reads `bytes`.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_exif_inner(bytes))).unwrap_or(None)
+}
+
+/// `parse_exif` on a no_std (no `catch_unwind`) build — direct passthrough.
+#[cfg(all(feature = "exif", not(feature = "std")))]
+#[must_use]
+pub fn parse_exif(bytes: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  parse_exif_inner(bytes)
+}
+
+/// Inner body of [`parse_exif`] (see that fn's doc + Golden-v2 3d note).
 #[cfg(feature = "exif")]
-pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_>>, exif::Error> {
+fn parse_exif_inner(bytes: &[u8]) -> Option<exif::ExifMeta<'_>> {
   exif::parse_borrowed(bytes)
 }
 
@@ -526,33 +508,42 @@ pub fn parse_exif(bytes: &[u8]) -> core::result::Result<Option<exif::ExifMeta<'_
 /// the `gps` feature is enabled (reached through the IFD0 `GPSInfo` tag).
 ///
 /// Returns `None` when `block` is not a valid TIFF header.
-#[cfg(feature = "exif")]
+#[cfg(all(feature = "exif", feature = "std"))]
 #[must_use]
 pub fn parse_exif_block(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  // Golden-v2 Contract 3d — `catch_unwind` backstop (see [`parse_bytes`]).
+  // Backstop only; 3a/3b are the primary guarantee. `AssertUnwindSafe` is
+  // sound: the closure only reads `block`. A caught panic ⇒ `None`.
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    parse_exif_block_inner(block)
+  }))
+  .unwrap_or_default()
+}
+
+/// `parse_exif_block` on a no_std (no `catch_unwind`) build — direct passthrough.
+#[cfg(all(feature = "exif", not(feature = "std")))]
+#[must_use]
+pub fn parse_exif_block(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
+  parse_exif_block_inner(block)
+}
+
+/// Inner body of [`parse_exif_block`] (see that fn's doc + Golden-v2 3d note).
+#[cfg(feature = "exif")]
+fn parse_exif_block_inner(block: &[u8]) -> Option<exif::ExifMeta<'_>> {
   exif::parse_exif_block(block)
 }
 
 /// Parse an Audible (AA) buffer directly. See [`formats::audible::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::audible::Error`] (currently uninhabited).
 #[cfg(feature = "audible")]
-pub fn parse_audible(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::audible::Meta<'_>>, formats::audible::Error> {
+#[must_use]
+pub fn parse_audible(bytes: &[u8]) -> Option<formats::audible::Meta<'_>> {
   formats::audible::parse_borrowed(bytes)
 }
 
 /// Parse a Red R3D buffer directly. See [`formats::red::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::red::Error`] (currently uninhabited).
 #[cfg(feature = "red")]
-pub fn parse_r3d(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::red::Meta<'_>>, formats::red::Error> {
+#[must_use]
+pub fn parse_r3d(bytes: &[u8]) -> Option<formats::red::Meta<'_>> {
   formats::red::parse_borrowed(bytes)
 }
 
@@ -566,16 +557,13 @@ pub fn parse_r3d(
 /// `print_conv = true` stages the tags in `-j` PrintConv mode (e.g. ID3v1
 /// Genre `"Hip-Hop"`); `false` stages in `-n` post-ValueConv raw mode
 /// (e.g. Genre `7`). One parse stages BOTH lists; the renderer picks by mode.
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::id3::Id3Error`] (currently uninhabited).
 #[cfg(feature = "id3")]
+#[must_use]
 pub fn parse_id3<'a>(
   bytes: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
-) -> core::result::Result<Option<formats::id3::Id3Meta<'a>>, formats::id3::Id3Error> {
+) -> Option<formats::id3::Id3Meta<'a>> {
   formats::id3::parse_id3_borrowed(bytes, shared, print_conv)
 }
 
@@ -593,15 +581,9 @@ pub fn parse_id3<'a>(
 ///
 /// The ID3 sub-Meta is staged in `-j` (PrintConv) mode; sink the result
 /// with `sink(true, ...)`.
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::id3::Mp3Error`].
 #[cfg(feature = "mp3")]
-pub fn parse_mp3<'a>(
-  bytes: &'a [u8],
-  ext: Option<&str>,
-) -> core::result::Result<Option<formats::id3::Mp3Meta<'a>>, formats::id3::Mp3Error> {
+#[must_use]
+pub fn parse_mp3<'a>(bytes: &'a [u8], ext: Option<&str>) -> Option<formats::id3::Mp3Meta<'a>> {
   // `parse_mp3_borrowed` decouples the transient `shared` AND `ext` borrows
   // from the returned `id3::Mp3Meta<'a>` (which borrows only from `bytes`), so a
   // local `SharedFlags` and a transient `ext` are both valid here.
@@ -611,14 +593,9 @@ pub fn parse_mp3<'a>(
 
 /// Parse an AIFF (or AIFC) buffer directly. See
 /// [`formats::aiff::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::aiff::Error`] (currently uninhabited).
 #[cfg(feature = "aiff")]
-pub fn parse_aiff(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::aiff::Meta<'_>>, formats::aiff::Error> {
+#[must_use]
+pub fn parse_aiff(bytes: &[u8]) -> Option<formats::aiff::Meta<'_>> {
   formats::aiff::parse_borrowed(bytes)
 }
 
@@ -639,59 +616,40 @@ pub fn parse_aiff(
 /// (`parse_full_owned`) skipped the ID3 chain — silent metadata loss on
 /// `ape_id3_prefixed.ape` / `ape_with_id3v1_trailer.ape` / etc. through
 /// this path.
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::ape::Error`] (currently uninhabited).
 #[cfg(feature = "ape")]
-pub fn parse_ape<'a>(
-  bytes: &'a [u8],
-  shared: &mut SharedFlags,
-) -> core::result::Result<Option<formats::ape::Meta<'a>>, formats::ape::Error> {
+#[must_use]
+pub fn parse_ape<'a>(bytes: &'a [u8], shared: &mut SharedFlags) -> Option<formats::ape::Meta<'a>> {
   // `ape = ["id3"]` per Cargo.toml ⇒ `parse_full_chained` is always present
   // here. Returns `Option<Meta<'a>>` where `'a` is tied to `bytes` (the
   // nested `Id3Meta` borrows from `bytes`); `shared` is transient.
-  Ok(formats::ape::parse_full_chained(bytes, shared))
+  formats::ape::parse_full_chained(bytes, shared)
 }
 
 /// Parse a DSF (DSD Stream File) buffer directly. See
 /// [`formats::dsf::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::dsf::Error`] (currently uninhabited).
 #[cfg(feature = "dsf")]
-pub fn parse_dsf(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::dsf::Meta<'_>>, formats::dsf::Error> {
+#[must_use]
+pub fn parse_dsf(bytes: &[u8]) -> Option<formats::dsf::Meta<'_>> {
   formats::dsf::parse_borrowed(bytes)
 }
 
 /// Parse a FLAC buffer directly. See [`formats::flac::parse_borrowed`].
 ///
 /// `shared` carries cross-format state (`DoneID3` flag, etc.).
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::flac::Error`] (currently uninhabited).
 #[cfg(feature = "flac")]
+#[must_use]
 pub fn parse_flac<'a>(
   bytes: &'a [u8],
   shared: &mut SharedFlags,
-) -> core::result::Result<Option<formats::flac::Meta<'a>>, formats::flac::Error> {
+) -> Option<formats::flac::Meta<'a>> {
   formats::flac::parse_borrowed(bytes, shared)
 }
 
 /// Parse a Real (RM / RA / RAM / RPM) buffer directly. See
 /// [`formats::real::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::real::RealError`] (currently uninhabited).
 #[cfg(feature = "real")]
-pub fn parse_real(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::real::RealMeta<'_>>, formats::real::RealError> {
+#[must_use]
+pub fn parse_real(bytes: &[u8]) -> Option<formats::real::RealMeta<'_>> {
   formats::real::parse_borrowed(bytes)
 }
 
@@ -703,27 +661,17 @@ pub fn parse_real(
 /// that extracted the PES payload) and want the typed [`formats::h264::H264Meta`].
 ///
 /// Returns `Ok(None)` when `bytes` contains no NAL start code at all.
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::h264::H264Error`] (currently uninhabited).
 #[cfg(feature = "h264")]
-pub fn parse_h264(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::h264::H264Meta<'_>>, formats::h264::H264Error> {
+#[must_use]
+pub fn parse_h264(bytes: &[u8]) -> Option<formats::h264::H264Meta<'_>> {
   formats::h264::parse_borrowed(bytes)
 }
 
 /// Parse a Flash Video (FLV) buffer directly. See
 /// [`formats::flash::parse_borrowed`].
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::flash::Error`] (currently uninhabited).
 #[cfg(feature = "flash")]
-pub fn parse_flv(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::flash::Meta<'_>>, formats::flash::Error> {
+#[must_use]
+pub fn parse_flv(bytes: &[u8]) -> Option<formats::flash::Meta<'_>> {
   formats::flash::parse_borrowed(bytes)
 }
 
@@ -732,15 +680,9 @@ pub fn parse_flv(
 ///
 /// `print_conv_enabled = true` matches bundled `perl exiftool -j`;
 /// `false` matches `-j -n`.
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::ogg::Error`] (currently uninhabited).
 #[cfg(feature = "ogg")]
-pub fn parse_ogg(
-  bytes: &[u8],
-  print_conv_enabled: bool,
-) -> core::result::Result<Option<formats::ogg::Meta<'_>>, formats::ogg::Error> {
+#[must_use]
+pub fn parse_ogg(bytes: &[u8], print_conv_enabled: bool) -> Option<formats::ogg::Meta<'_>> {
   formats::ogg::parse_borrowed(bytes, print_conv_enabled)
 }
 
@@ -750,16 +692,13 @@ pub fn parse_ogg(
 /// `mp3 = true` enforces Layer III (MPEG.pm:466). `ext` is the file
 /// extension (uppercased, no leading dot — e.g. `"MP3"`, `"MUS"`); the
 /// empty string disables the validation-reject retry (MPEG.pm:488).
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::mpeg::AudioError`] (currently uninhabited).
 #[cfg(feature = "mpeg-audio")]
+#[must_use]
 pub fn parse_mpeg_audio<'a>(
   bytes: &'a [u8],
   mp3: bool,
   ext: &str,
-) -> core::result::Result<Option<formats::mpeg::AudioMeta<'a>>, formats::mpeg::AudioError> {
+) -> Option<formats::mpeg::AudioMeta<'a>> {
   formats::mpeg::parse_borrowed(bytes, mp3, ext)
 }
 
@@ -775,18 +714,13 @@ pub fn parse_mpeg_audio<'a>(
 /// A fresh [`SharedFlags`] is constructed per call (the public entry has
 /// no chain state to thread). The returned `Meta<'a>` is tied to `bytes`
 /// (the nested ID3 / APE sub-Metas borrow from `bytes`).
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::mpc::Error`] (currently uninhabited).
 #[cfg(feature = "mpc")]
-pub fn parse_mpc(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::mpc::Meta<'_>>, formats::mpc::Error> {
+#[must_use]
+pub fn parse_mpc(bytes: &[u8]) -> Option<formats::mpc::Meta<'_>> {
   // `mpc = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
   // present here.
   let mut shared = SharedFlags::default();
-  Ok(formats::mpc::parse_full_chained(bytes, &mut shared))
+  formats::mpc::parse_full_chained(bytes, &mut shared)
 }
 
 /// Parse a WavPack `.wv` buffer directly, including the embedded ID3
@@ -801,18 +735,13 @@ pub fn parse_mpc(
 /// A fresh [`SharedFlags`] is constructed per call. The returned
 /// `Meta<'a>` is tied to `bytes` (the nested ID3 / APE sub-Metas borrow
 /// from `bytes`).
-///
-/// # Errors
-///
-/// Returns the per-format [`formats::wavpack::Error`] (currently uninhabited).
 #[cfg(feature = "wavpack")]
-pub fn parse_wavpack(
-  bytes: &[u8],
-) -> core::result::Result<Option<formats::wavpack::Meta<'_>>, formats::wavpack::Error> {
+#[must_use]
+pub fn parse_wavpack(bytes: &[u8]) -> Option<formats::wavpack::Meta<'_>> {
   // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is
   // always present here.
   let mut shared = SharedFlags::default();
-  Ok(formats::wavpack::parse_full_chained(bytes, &mut shared))
+  formats::wavpack::parse_full_chained(bytes, &mut shared)
 }
 
 // ===========================================================================
@@ -823,13 +752,13 @@ pub fn parse_wavpack(
 mod tests {
   use super::*;
 
-  /// `parse_bytes` returns `Ok(None)` for an empty input — no parser
+  /// `parse_bytes` returns `None` for an empty input — no parser
   /// accepts an empty buffer, which matches ExifTool's
-  /// `File is empty` Error-only path (here surfaced as `Ok(None)`).
+  /// `File is empty` Error-only path (here surfaced as `None`).
   #[test]
   #[cfg(feature = "std")]
   fn parse_bytes_empty_input_returns_none() {
-    let result = parse_bytes(b"").unwrap();
+    let result = parse_bytes(b"");
     assert!(result.is_none());
   }
 
@@ -853,8 +782,7 @@ mod tests {
   }
 
   /// `media_metadata` returns `None` for empty input (no parser accepts an
-  /// empty buffer) — the convenience entry's `Ok(None) | Err(_) => None`
-  /// contract.
+  /// empty buffer) — `parse_bytes(..) == None` maps straight through.
   #[test]
   #[cfg(feature = "std")]
   fn media_metadata_empty_input_is_none() {
@@ -862,12 +790,12 @@ mod tests {
     assert!(media_metadata(b"\x00\x00\x00\x00not-a-format").is_none());
   }
 
-  /// `parse_bytes` returns `Ok(None)` for a buffer that no parser
+  /// `parse_bytes` returns `None` for a buffer that no parser
   /// accepts (random bytes with no magic-number match).
   #[test]
   #[cfg(feature = "std")]
   fn parse_bytes_unknown_format_returns_none() {
-    let result = parse_bytes(b"\x00\x00\x00\x00not-a-format").unwrap();
+    let result = parse_bytes(b"\x00\x00\x00\x00not-a-format");
     assert!(result.is_none());
   }
 
@@ -887,10 +815,10 @@ mod tests {
     // Pad to 64 bytes so the MOI parser doesn't reject on too-short.
     let mut padded = bytes.to_vec();
     padded.resize(64, 0);
-    let result = parse_bytes(&padded).unwrap();
+    let result = parse_bytes(&padded);
     // The MOI parser may accept or reject this minimal buffer depending on
     // its internal validation; we don't pin the exact outcome here, just
-    // that the dispatch produces an `Ok(_)` (no panic, no `Err`).
+    // that the dispatch doesn't panic.
     let _ = result;
   }
 
@@ -914,9 +842,7 @@ mod tests {
     .expect("read ogg_id3_prefixed.ogg fixture");
     // Sanity: the fixture really does start with an ID3v2 prefix (NOT OggS).
     assert!(data.starts_with(b"ID3"), "fixture must be ID3-prefixed");
-    let meta = parse_bytes(&data)
-      .expect("parse_bytes must not error")
-      .expect("ID3-prefixed Ogg must be recognized");
+    let meta = parse_bytes(&data).expect("ID3-prefixed Ogg must be recognized");
     // Core C-R4-1 assertion: dispatch to Ogg, NOT the mis-routed Mp3.
     assert!(
       matches!(meta, AnyMeta::Ogg(_)),
@@ -942,7 +868,7 @@ mod tests {
 
   /// Codex R13/F1 [REAL-INPUT]: a UTF-8-BOM XML plist with NO filename must
   /// dispatch to [`AnyMeta::Plist`] through the public typed `parse_bytes` API —
-  /// NOT silently return `Ok(None)`. With an empty filename, magic-only detection
+  /// NOT silently return `None`. With an empty filename, magic-only detection
   /// yields `XMP` first (XMP `%magicNumber` accepts the `\xef\xbb\xbf` BOM,
   /// ExifTool.pm:1045) while the PLIST `%magicNumber` (ExifTool.pm:1015) does NOT,
   /// so the later PLIST candidate never matches. Bundled ExifTool reaches this
@@ -966,9 +892,8 @@ mod tests {
       data.starts_with(&[0xEF, 0xBB, 0xBF]),
       "fixture must be UTF-8-BOM-prefixed"
     );
-    let meta = parse_bytes(&data)
-      .expect("parse_bytes must not error")
-      .expect("BOM XML plist must be recognized via XMP→PLIST relabel, not Ok(None)");
+    let meta =
+      parse_bytes(&data).expect("BOM XML plist must be recognized via XMP→PLIST relabel, not None");
     // Core R13/F1 assertion: the typed API dispatches to the PLIST arm.
     assert!(
       matches!(meta, AnyMeta::Plist(_)),
@@ -1053,7 +978,7 @@ mod tests {
     let meta = {
       // `ext` is a short-lived String dropped at the end of this block.
       let ext: String = String::from("MP3");
-      let m = parse_mp3(&bytes, Some(ext.as_str())).expect("ok");
+      let m = parse_mp3(&bytes, Some(ext.as_str()));
       // `ext` drops here; `m` must remain valid (borrows only `bytes`).
       m
     };
@@ -1071,7 +996,7 @@ mod tests {
     let bytes: Vec<u8> = vec![0u8; 64];
     let meta = {
       let mut shared = SharedFlags::new();
-      let m = parse_ape(&bytes, &mut shared).expect("ok");
+      let m = parse_ape(&bytes, &mut shared);
       // `shared` drops here; `m` must remain valid (ape::Meta is owned).
       m
     };
@@ -1079,6 +1004,6 @@ mod tests {
     // `shared` can also be reused for a second parse without aliasing the
     // first meta — exercise that path too.
     let mut shared2 = SharedFlags::new();
-    let _ = parse_ape(&bytes, &mut shared2).expect("ok");
+    let _ = parse_ape(&bytes, &mut shared2);
   }
 }

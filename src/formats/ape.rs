@@ -1354,7 +1354,11 @@ impl Header {
 /// D8 — no public fields, accessors only.
 #[derive(Debug, Clone)]
 pub struct MainTag {
-  name: String,
+  /// Resolved tag name. A short identifier (stored, feeds the emitted tag
+  /// name) ⇒ `SmolStr`. `MakeTag` builds the dynamic name in a transient
+  /// `String` (a builder — String per the rule); it is converted to `SmolStr`
+  /// here at the store boundary.
+  name: smol_str::SmolStr,
   value: TagValue,
 }
 
@@ -1549,24 +1553,6 @@ impl Meta<'_> {
   }
 }
 
-// =============================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// =============================================================================
-
-/// Rust-level fatal modes for APE parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror`
-/// (v2, `default-features = false` ⇒ `core::error::Error` in every
-/// feature tier); the hand-written impls are gone. `#[non_exhaustive]`
-/// lets a real variant land later without a breaking change. The enum is
-/// currently uninhabited, so it carries no `#[error(...)]` arms and no
-/// variant predicates (nothing to predicate).
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
 impl FormatParser for ProcessApe {
   /// GAT: `Meta<'a>`. APE's typed Meta already owns its resolved
   /// tag-name strings and `TagValue` payloads, so `'a` is phantom; the
@@ -1576,7 +1562,6 @@ impl FormatParser for ProcessApe {
   /// Chained format (spec §6.4): `&'a [u8]` + `&'a mut SharedFlags` for
   /// the `done_id3`/`done_ape` cross-recursion plumbing.
   type Context<'a> = Context<'a>;
-  type Error = Error;
 
   /// Run the APE planner and produce a typed [`Meta`]. Returns:
   ///   * `Ok(Some(meta))` — APE header / trailer was detected and a
@@ -1602,16 +1587,16 @@ impl FormatParser for ProcessApe {
   /// bundled `APE::ProcessAPE` from a `$$et{FileType}`-already-set chain
   /// (ID3.pm:1722-1727) only runs the trailer scan, faithful to that
   /// gate.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // Trailer-only: bundled APE.pm:118 (`Just looks for APE trailer if
     // FileType is already set`) — never re-runs the embedded ID3 dispatch
     // (the chaining parent did it). Body-only is the faithful path.
     if ctx.trailer_only {
-      return Ok(parse_body_only(ctx));
+      return parse_body_only(ctx);
     }
     // Full-parse: run the embedded ID3 chain alongside the MAC/APE body.
     // `ape = ["id3"]` per Cargo.toml ⇒ `parse_full_chained` is always present.
-    Ok(parse_full_chained(ctx.data, ctx.shared))
+    parse_full_chained(ctx.data, ctx.shared)
   }
 }
 
@@ -1723,7 +1708,6 @@ pub(crate) fn parse_full_chained<'a>(data: &'a [u8], shared: &mut SharedFlags) -
   // pass sets `DoneID3` (trailer size for APE.pm:169) and returns `$hdrEnd`.
   let (id3, hdr_end) = if shared.done_id3().is_none() {
     crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
-      .unwrap_or((None, 0))
   } else {
     (None, shared.id3_hdr_end().unwrap_or(0))
   };
@@ -1770,7 +1754,10 @@ fn meta_from_plan(plan: Plan) -> Meta<'static> {
   let main_tags: Vec<MainTag> = plan
     .pending
     .into_iter()
-    .map(|(_g1, name, value)| MainTag { name, value })
+    .map(|(_g1, name, value)| MainTag {
+      name: name.into(),
+      value,
+    })
     .collect();
   // 3) Intra-APE Composite:Duration. Resolve the 4 Require ingredients
   // against the header + main tags ALONE (not cross-format). Mirrors the
@@ -3483,11 +3470,11 @@ mod tests {
     let desc_idx = tm
       .entries()
       .iter()
-      .position(|(k, _)| k == "APE:CoverArtFrontDesc");
+      .position(|(g, n, _)| g == "APE" && n == "CoverArtFrontDesc");
     let cover_idx = tm
       .entries()
       .iter()
-      .position(|(k, _)| k == "APE:CoverArtFront");
+      .position(|(g, n, _)| g == "APE" && n == "CoverArtFront");
     assert!(desc_idx < cover_idx);
   }
 
@@ -3616,7 +3603,7 @@ mod tests {
     let names: Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("APE:"))
+      .filter_map(|(g, n, _)| (g == "APE").then_some(n.as_str()))
       .collect();
     assert_eq!(names, &["Title", "Artist"]);
     assert_eq!(
@@ -4145,7 +4132,6 @@ mod tests {
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok")
       .expect("parsed");
     // Header is NewHeader (MAC vers >= 3980 ⇒ NewHeader table).
     assert!(matches!(meta.header_ref(), Some(Header::New(_))));
@@ -4159,8 +4145,7 @@ mod tests {
   fn typed_parse_returns_none_for_short_input() {
     let data = vec![0u8; 5];
     let mut shared = SharedFlags::new();
-    let r = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok");
+    let r = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared));
     assert!(r.is_none());
   }
 
@@ -4205,7 +4190,6 @@ mod tests {
       &ProcessApe,
       Context::new_trailer_only(&data, &mut shared),
     )
-    .expect("ok")
     .expect("trailer-only meta");
     // Trailer-only ⇒ no header.
     assert!(meta.header_ref().is_none());
@@ -4219,7 +4203,6 @@ mod tests {
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok")
       .expect("parsed");
     let mut w = TagMap::new();
     crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
@@ -4236,7 +4219,6 @@ mod tests {
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok")
       .expect("parsed");
     assert_eq!(meta.artist(), Some("Tester"));
   }
@@ -4258,7 +4240,6 @@ mod tests {
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok")
       .expect("parsed");
     let mains = meta.main_tags_slice();
     assert!(!mains.is_empty(), "fixture has an Artist tag");
@@ -4274,7 +4255,6 @@ mod tests {
     let data = build_minimal_ape_input();
     let mut shared = SharedFlags::new();
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
-      .expect("ok")
       .expect("parsed");
     let header = meta.header_ref().expect("MAC NewHeader present");
     assert!(header.is_new());
@@ -4317,7 +4297,7 @@ mod tests {
   fn ape_main_tag_value_ref_accessor() {
     // §3: MainTag::value_ref() is the non-Copy `_ref` getter.
     let t = MainTag {
-      name: "Artist".to_string(),
+      name: "Artist".into(),
       value: TagValue::Str("Tester".into()),
     };
     assert_eq!(t.name(), "Artist");
@@ -4339,18 +4319,6 @@ mod tests {
       &[1, 2, 3]
     );
   }
-
-  #[test]
-  fn ape_error_is_uninhabited_and_thiserror_derived() {
-    // §5: Error is uninhabited; this only needs to compile to prove the
-    // thiserror-derived `Display`/`Error` impls exist. `Option<Error>`
-    // is always None.
-    fn _assert_error<E: core::error::Error>() {}
-    _assert_error::<Error>();
-    let none: Option<Error> = None;
-    assert!(none.is_none());
-  }
-
   // --- Golden-pattern `Taggable` / `Project` tests ------------------------
 
   use crate::emit::{ConvMode, Taggable};

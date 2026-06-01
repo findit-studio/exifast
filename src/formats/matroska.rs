@@ -2238,9 +2238,8 @@ impl parser_sealed::Sealed for ProcessMatroska {}
 impl FormatParser for ProcessMatroska {
   type Meta<'a> = Meta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data)
   }
 }
@@ -2252,7 +2251,7 @@ impl FormatParser for ProcessMatroska {
 ///
 /// Returns `Err` only for Rust-level fatal modes (none today — every bad
 /// input is `Ok(None)` per Matroska.pm `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data)
 }
 
@@ -2384,9 +2383,9 @@ const DEFAULT_GROUP: &str = "Matroska";
 /// pre-validation. We walk from offset 0; the walker re-reads the
 /// (already-validated) magic-as-ID and the EBMLHeader body size, then
 /// descends into the EBML header sub-elements.
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   if data.len() < 4 || data[..4] != EBML_MAGIC {
-    return Ok(None); // Matroska.pm:996 — magic gate
+    return None; // Matroska.pm:996 — magic gate
   }
   let mut w = Walker {
     data,
@@ -2404,11 +2403,11 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
     track_uid_to_group: std::collections::HashMap::new(),
   };
   walk(&mut w);
-  Ok(Some(Meta {
+  Some(Meta {
     entries: w.entries,
     doc_type: w.doc_type,
     timecode_scale_ns: w.timecode_scale_ns,
-  }))
+  })
 }
 
 /// Main EBML walk. Faithful loop port of Matroska.pm:1022-1236. Stops on
@@ -3622,17 +3621,6 @@ fn maybe_handle_conditional<'a>(w: &mut Walker<'a>, id: i64, body: &'a [u8]) -> 
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for Matroska parsing. Currently empty — every
-/// bad input produces `Ok(None)` (Perl `return 0`) or walks past silently
-/// (unknown EBML IDs). Reserved for future I/O wrappers.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Unit tests
 // ===========================================================================
 
@@ -3654,13 +3642,6 @@ mod tests {
     );
     w
   }
-
-  #[test]
-  fn matroska_error_is_core_error() {
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   #[test]
   fn get_vint_single_byte_id() {
     // 0x82 ⇒ length-marker bit at 0x80, value = 0x02 (the DocType ID's
@@ -3839,13 +3820,13 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0x1a, 0x45, 0xdf]).unwrap().is_none()); // 3-byte
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0x1a, 0x45, 0xdf]).is_none()); // 3-byte
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_magic() {
-    assert!(parse_borrowed(&[0x00, 0x00, 0x00, 0x00]).unwrap().is_none());
+    assert!(parse_borrowed(&[0x00, 0x00, 0x00, 0x00]).is_none());
   }
 
   #[test]
@@ -3855,9 +3836,7 @@ mod tests {
       "/tests/fixtures/Matroska.mkv"
     ))
     .expect("read Matroska.mkv fixture");
-    let meta = parse_borrowed(&bytes)
-      .expect("ok")
-      .expect("matroska accepted");
+    let meta = parse_borrowed(&bytes).expect("matroska accepted");
     assert_eq!(meta.doc_type(), Some("matroska"));
     assert!(!meta.is_webm());
     assert_eq!(meta.timecode_scale_ns(), Some(1_000_000));
@@ -3880,7 +3859,7 @@ mod tests {
       "/tests/fixtures/Matroska_unknown_segment.mkv"
     ))
     .expect("read F4 fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, true);
     // Info emitted under `Info:`
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
@@ -3902,7 +3881,7 @@ mod tests {
       "/tests/fixtures/Matroska_cluster_skip.mkv"
     ))
     .expect("read F3 fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, true);
     // Info BEFORE cluster: emitted
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
@@ -3925,7 +3904,7 @@ mod tests {
       "/tests/fixtures/Matroska_attachment.mkv"
     ))
     .expect("read F5 fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     for print_conv in [true, false] {
       let tm = emit_into_tagmap(&meta, print_conv);
       // The raw `TagValue::Bytes` storage stringifies as lower-hex via
@@ -3952,7 +3931,7 @@ mod tests {
       "/tests/fixtures/Matroska_simpletag.mkv"
     ))
     .expect("read F1 fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, true);
     // TITLE → Title, ARTIST → Artist (Matroska.pm:764, 777).
     assert_eq!(tm.get_str("Matroska", "Title"), Some("Hello World".into()));
@@ -4034,7 +4013,7 @@ mod tests {
       "/tests/fixtures/Matroska_duration_zero_scale.mkv"
     ))
     .expect("read R3 zero-scale fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     // Sanity: TimecodeScale captured as 0.
     assert_eq!(meta.timecode_scale_ns(), Some(0));
     // -j mode: both Duration and TimecodeScale render as bare numeric
@@ -4064,7 +4043,7 @@ mod tests {
       "/tests/fixtures/Matroska_duration_before_scale.mkv"
     ))
     .expect("read R3 order-skewed fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     assert_eq!(meta.timecode_scale_ns(), Some(1_000_000));
     let tm_j = emit_into_tagmap(&meta, true);
     assert_eq!(tm_j.get_str("Info", "Duration"), Some("0:01:00".into()));
@@ -4079,7 +4058,7 @@ mod tests {
       "/tests/fixtures/Matroska_unknown_segment.mkv"
     ))
     .expect("read F2 fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     // Pre-F2: walker breaks on the unknown-size VINT → Info/Tracks lost.
     // Post-F2: Info+Tracks descended.
     let tm = emit_into_tagmap(&meta, true);
@@ -4095,7 +4074,7 @@ mod tests {
       "/tests/fixtures/Matroska.mkv"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tm = emit_into_tagmap(&meta, true);
     assert_eq!(tm.get_str("Matroska", "DocType"), Some("matroska".into()));
     assert_eq!(tm.get_str("Info", "TimecodeScale"), Some("1 ms".into()));
@@ -4130,7 +4109,7 @@ mod tests {
       "/tests/fixtures/Matroska.mkv"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     // No Matroska tag carries `Unknown => 1`.
     assert!(tags.iter().all(|t| !t.unknown()));
@@ -4166,7 +4145,7 @@ mod tests {
       "/tests/fixtures/Matroska.mkv"
     ))
     .expect("read fixture");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("accepted");
+    let meta = parse_borrowed(&bytes).expect("accepted");
     let projected = meta.project();
     // Matroska projects to a video container; the rest of MediaInfo is empty.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Video]);

@@ -406,10 +406,9 @@ impl FormatParser for ProcessRiff {
   type Meta<'a> = RiffMeta<'a>;
   /// Leaf-format Context — `&'a [u8]` (no chained state).
   type Context<'a> = &'a [u8];
-  type Error = RiffError;
 
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, RiffError> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -419,8 +418,8 @@ impl FormatParser for ProcessRiff {
 ///
 /// Returns `Err` only for Rust-level fatal modes (none today — every bad
 /// input is `Ok(None)`, faithful to RIFF.pm:2039 `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<RiffMeta<'_>>, RiffError> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<RiffMeta<'_>> {
+  parse_inner(data)
 }
 
 // ===========================================================================
@@ -2538,17 +2537,6 @@ fn bmp_compression_label(val: u32) -> &'static str {
 }
 
 // ===========================================================================
-// §8. `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for RIFF parsing. Currently empty — every bad
-/// input produces `Ok(None)`, faithful to RIFF.pm:2039 / 2045 / 2096
-/// (`return 0` / soft-fail on truncation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum RiffError {}
-
-// ===========================================================================
 // §9. Tests
 // ===========================================================================
 
@@ -2684,7 +2672,7 @@ mod tests {
   #[test]
   fn synth_avi_round_trip() {
     let bytes = synth_avi();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     assert_eq!(meta.file_type(), "AVI");
     assert_eq!(meta.mime(), "video/x-msvideo");
     assert!(!meta.is_rf64());
@@ -2785,9 +2773,9 @@ mod tests {
 
   #[test]
   fn rejects_non_riff() {
-    assert!(parse_borrowed(b"NOPE\0\0\0\0WAVE").expect("ok").is_none());
-    assert!(parse_borrowed(b"").expect("ok").is_none());
-    assert!(parse_borrowed(b"RIFF").expect("ok").is_none()); // < 12 bytes
+    assert!(parse_borrowed(b"NOPE\0\0\0\0WAVE").is_none());
+    assert!(parse_borrowed(b"").is_none());
+    assert!(parse_borrowed(b"RIFF").is_none()); // < 12 bytes
   }
 
   #[test]
@@ -2796,7 +2784,7 @@ mod tests {
     bytes.extend_from_slice(b"RF64");
     bytes.extend_from_slice(&8u32.to_le_bytes());
     bytes.extend_from_slice(b"WAVE");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     assert_eq!(meta.file_type(), "WAV");
     assert!(meta.is_rf64());
   }
@@ -2876,7 +2864,7 @@ mod tests {
     bytes.extend_from_slice(b"avih");
     bytes.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
     // No payload — read_chunk should detect EOF on the next iteration.
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     assert_eq!(meta.file_type(), "AVI");
     // No entries — the avih's payload was unreachable.
     assert!(meta.entries().is_empty());
@@ -2895,7 +2883,7 @@ mod tests {
     let idit = b"Mon Mar 10 15:04:43 2003";
     bytes.extend_from_slice(&(idit.len() as u32).to_le_bytes());
     bytes.extend_from_slice(idit);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     // No IDIT emission.
     assert!(
       meta
@@ -2931,7 +2919,7 @@ mod tests {
     let outer = (bytes.len() - 8) as u32;
     bytes[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let names: Vec<_> = meta
       .entries()
       .iter()
@@ -2993,7 +2981,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     let artist = meta
       .entries()
       .iter()
@@ -3036,7 +3024,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     let find = |name: &str| -> Option<&RiffValue> {
       meta
         .entries()
@@ -3082,7 +3070,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     // Only CodePage emitted (2-byte CSET); empty IART → Artist == "".
     assert_eq!(
       meta
@@ -3130,7 +3118,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     let find = |name: &str| -> Option<&RiffValue> {
       meta
         .entries()
@@ -3217,7 +3205,7 @@ mod tests {
 
     // End-to-end: the INFO IART decodes through cp1252 (Latin), and there is
     // NO unsupported-charset warning (the Raw(1252) was reset).
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     let find = |name: &str| -> Option<&RiffValue> {
       meta
         .entries()
@@ -3265,7 +3253,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     match meta
       .entries()
       .iter()
@@ -3342,7 +3330,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     assert!(meta.is_corrupted(), "truncated fmt must mark corrupted");
     assert!(
       meta.entries().iter().all(|e| e.name() != "Encoding"),
@@ -3369,7 +3357,7 @@ mod tests {
     let outer = (buf.len() - 8) as u32;
     buf[4..8].copy_from_slice(&outer.to_le_bytes());
 
-    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let meta = parse_borrowed(&buf).expect("some");
     assert!(!meta.is_corrupted());
     assert!(meta.entries().iter().any(|e| e.name() == "Encoding"));
   }

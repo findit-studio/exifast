@@ -446,6 +446,210 @@ enum ResolvedConv {
 // MakerNote capture — the deferred-vendor-parsing seam
 // ===========================================================================
 
+/// How to recompute a captured MakerNote's `-n` (ValueConv) vendor emissions on
+/// demand — Golden-v2 P0 single-mode decode. The eager walk decodes each vendor
+/// body ONCE (PrintConv), keeping the typed slot + the PrintConv emissions; this
+/// captures the per-vendor decode INPUTS so the (rarely-needed) `-n` emissions
+/// can be re-derived only when asked, instead of eagerly decoding the body a
+/// second time and caching a result the `-j`/typed path never reads.
+///
+/// All inputs are `Copy` (the borrowed parent slice `&'a [u8]`, offsets, byte
+/// order, `BaseRule`) or cheap owned `SmolStr` (the captured Make/Model/FileType,
+/// which the walker owns and drops — so they must be retained here). Each
+/// variant mirrors the eager PrintConv decode's call at the walk site; the
+/// vendor decoders are deterministic across the PrintConv flag (the gated ones
+/// route identically), so [`Self::recompute`] yields the SAME emissions the old
+/// eager `-n` cache held.
+#[derive(Debug, Clone)]
+enum MakerNoteValueConvDecode<'a> {
+  /// No `-n` emissions (vendor has no body parser yet, or a gated vendor whose
+  /// `%Main` route did not match — its PrintConv decode produced none either).
+  None,
+  /// Apple — `parse_with_print_conv(blob, order, ·)`.
+  Apple { blob: &'a [u8], order: ByteOrder },
+  /// Canon — `parse_in_tiff(data, mn_offset, mn_len, order, ·, model, file_type)`.
+  Canon {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+    model: Option<smol_str::SmolStr>,
+    file_type: Option<smol_str::SmolStr>,
+  },
+  /// Sony — `parse_main_gated(data, mn_offset, mn_len, body_off, order, ·, make, model)`.
+  Sony {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_off: usize,
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Panasonic — `parse_main_gated(data, mn_offset, mn_len, order, ·, model, base_rule)`.
+  Panasonic {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+    model: Option<smol_str::SmolStr>,
+    base_rule: makernotes::BaseRule,
+  },
+  /// Leica1 — `parse_leica1_gated(data, mn_offset, mn_len, body_off, order, ·, make, model)`.
+  Leica1 {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_off: usize,
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// Leica10 — `parse_leica10_gated(data, mn_offset, mn_len, body_off, order, ·, model)`.
+  Leica10 {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_off: usize,
+    order: ByteOrder,
+    model: Option<smol_str::SmolStr>,
+  },
+  /// DJI — `parse_in_tiff(data, mn_offset, mn_len, order, ·)`.
+  Dji {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+  },
+}
+
+#[cfg(feature = "alloc")]
+impl MakerNoteValueConvDecode<'_> {
+  /// Re-run the vendor decoder for `-n` (ValueConv) and return its emissions.
+  /// The gated variants `.expect(...)` a `Some` result — faithful to the eager
+  /// walk's invariant that a route which matched in PrintConv matches in
+  /// ValueConv too (same gate, PrintConv-independent).
+  #[must_use]
+  fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission> {
+    use makernotes::vendors::{apple, canon, dji, panasonic, sony};
+    match self {
+      MakerNoteValueConvDecode::None => std::vec::Vec::new(),
+      MakerNoteValueConvDecode::Apple { blob, order } => {
+        apple::parse_with_print_conv(blob, *order, false).1
+      }
+      MakerNoteValueConvDecode::Canon {
+        data,
+        mn_offset,
+        mn_len,
+        order,
+        model,
+        file_type,
+      } => {
+        canon::parse_in_tiff(
+          data,
+          *mn_offset,
+          *mn_len,
+          *order,
+          false,
+          model.as_deref(),
+          file_type.as_deref(),
+        )
+        .1
+      }
+      MakerNoteValueConvDecode::Sony {
+        data,
+        mn_offset,
+        mn_len,
+        body_off,
+        order,
+        make,
+        model,
+      } => {
+        sony::parse_main_gated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *body_off,
+          *order,
+          false,
+          make.as_deref(),
+          model.as_deref(),
+        )
+        .expect("routes_to_main is deterministic across print_conv")
+        .1
+      }
+      MakerNoteValueConvDecode::Panasonic {
+        data,
+        mn_offset,
+        mn_len,
+        order,
+        model,
+        base_rule,
+      } => {
+        panasonic::parse_main_gated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *order,
+          false,
+          model.as_deref(),
+          *base_rule,
+        )
+        .expect("routes_to_main is deterministic across print_conv")
+        .1
+      }
+      MakerNoteValueConvDecode::Leica1 {
+        data,
+        mn_offset,
+        mn_len,
+        body_off,
+        order,
+        make,
+        model,
+      } => {
+        panasonic::parse_leica1_gated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *body_off,
+          *order,
+          false,
+          make.as_deref(),
+          model.as_deref(),
+        )
+        .expect("routes_to_leica1 is deterministic across print_conv")
+        .1
+      }
+      MakerNoteValueConvDecode::Leica10 {
+        data,
+        mn_offset,
+        mn_len,
+        body_off,
+        order,
+        model,
+      } => {
+        panasonic::parse_leica10_gated(
+          data,
+          *mn_offset,
+          *mn_len,
+          *body_off,
+          *order,
+          false,
+          model.as_deref(),
+        )
+        .expect("routes_to_leica10 is deterministic across print_conv")
+        .1
+      }
+      MakerNoteValueConvDecode::Dji {
+        data,
+        mn_offset,
+        mn_len,
+        order,
+      } => dji::parse_in_tiff(data, *mn_offset, *mn_len, *order, false).1,
+    }
+  }
+}
+
 /// The raw MakerNote (0x927c) blob captured by the Exif walker, together
 /// with the Phase-1 dispatch outcome (vendor identification +
 /// `SubDirectory` directives — see [`makernotes::dispatch`]).
@@ -474,11 +678,22 @@ pub struct MakerNote<'a> {
   /// plus the `Unknown => 1` flag (the emission engine suppresses the
   /// Unknown ones; the legacy `serialize_tags` path filters them on read).
   /// Computed once at walk time so the serializer doesn't need to
-  /// re-resolve out-of-line offsets against the TIFF block.
+  /// re-resolve out-of-line offsets against the TIFF block. The PrintConv
+  /// decode ALSO yields the typed vendor [`MakerNotesMeta`] slot, which the
+  /// domain projection / dispatch tests read, so it stays EAGER.
   cached_emissions_print_conv: std::vec::Vec<makernotes::VendorEmission>,
-  /// Same as [`cached_emissions_print_conv`] but for `-n` (post-
-  /// ValueConv raw) mode.
-  cached_emissions_value_conv: std::vec::Vec<makernotes::VendorEmission>,
+  /// How to recompute the `-n` (post-ValueConv raw) emissions ON DEMAND —
+  /// Golden-v2 P0 single-mode decode. The eager walk decodes the vendor body
+  /// ONCE (PrintConv, above); the ValueConv emissions are needed only by the
+  /// `-n` serialize path, so instead of eagerly decoding the body a SECOND
+  /// time and caching the result (one wasted decode per parse — `-j`/the typed
+  /// API never reads it), this captures the decode INPUTS (the borrowed parent
+  /// slice + offsets/order/model/… — all `Copy` or cheap owned `SmolStr`s) and
+  /// re-runs the vendor decoder for `-n` only when [`emissions_value_conv`] is
+  /// actually called. The vendor decoders are deterministic across the
+  /// PrintConv flag (the gated ones route identically), so the recomputed `-n`
+  /// emissions are byte-identical to the old eager cache.
+  value_conv_decode: MakerNoteValueConvDecode<'a>,
   /// The FAMILY-1 group under which the cached emissions serialize. Almost
   /// always [`Vendor::group1()`](makernotes::Vendor::group1) of
   /// [`Self::vendor`] (`Apple`/`Canon`/`Sony`/`Panasonic`), but the
@@ -572,11 +787,19 @@ impl<'a> MakerNote<'a> {
     &self.cached_emissions_print_conv
   }
 
-  /// `-n` mode emissions.
+  /// The Phase-2 vendor emissions in `-n` (post-ValueConv raw) mode, decoded ON
+  /// DEMAND (Golden-v2 P0). Unlike [`Self::emissions_print_conv`] (eagerly
+  /// cached because the PrintConv decode also yields the typed vendor slot),
+  /// the `-n` emissions are re-derived from the stored decode inputs only when
+  /// this is called — so a `-j`/typed-only consumer never pays the second
+  /// vendor-body decode. Returns an OWNED `Vec` (the result is freshly built).
+  /// Byte-identical to the old eager `-n` cache (the vendor decoders are
+  /// deterministic across the PrintConv flag). Empty for vendors with no body
+  /// parser yet (Phase 3/4) and for a gated vendor whose `%Main` route did not
+  /// match (its PrintConv decode produced no emissions either).
   #[must_use]
-  #[inline(always)]
-  pub fn emissions_value_conv(&self) -> &[makernotes::VendorEmission] {
-    &self.cached_emissions_value_conv
+  pub fn emissions_value_conv(&self) -> std::vec::Vec<makernotes::VendorEmission> {
+    self.value_conv_decode.recompute()
   }
 
   /// The FAMILY-1 group under which the cached emissions serialize. Equal to
@@ -815,20 +1038,19 @@ impl parser_sealed::Sealed for ProcessExif {}
 impl FormatParser for ProcessExif {
   type Meta<'a> = ExifMeta<'a>;
   type Context<'a> = &'a [u8];
-  type Error = Error;
 
   /// Dispatched by [`crate::format_parser::any_parser_for`] when
   /// `File:FileType == "TIFF"` — the standalone-TIFF entry. Sets
   /// `tiff_type_is_tiff = true` so the multi-page `File:PageCount`
   /// synthesis (`ExifTool.pm:8756-8757`) is active.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // Direct standalone-TIFF lib entry: no candidate `Parent` context (the
     // engine path through `AnyParser::Exif` carries the real type via
     // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
     // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
-    Ok(parse_tiff(
+    parse_tiff(
       data, /* tiff_type_is_tiff */ true, /* file_type */ None,
-    ))
+    )
   }
 }
 
@@ -836,16 +1058,16 @@ impl FormatParser for ProcessExif {
 /// `TIFF_TYPE` is "TIFF" (`ExifTool.pm:8704`), so a multi-page TIFF emits
 /// `File:PageCount` (`ExifTool.pm:8757`).
 ///
-/// # Errors
-///
-/// Returns `Err` only for Rust-level fatal modes (none today — every bad
-/// input is `Ok(None)`, faithful to `DoProcessTIFF` `return 0`).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<ExifMeta<'_>>, Error> {
+/// Returns `None` when `data` is not a valid TIFF header (`DoProcessTIFF`
+/// `return 0`); a malformed TIFF surfaces its diagnostics as `Warn`/`Error`
+/// tags on the returned [`ExifMeta`], never as a fatal error.
+#[must_use]
+pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
   // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
   // None` (see [`ProcessExif::parse`]).
-  Ok(parse_tiff(
+  parse_tiff(
     data, /* tiff_type_is_tiff */ true, /* file_type */ None,
-  ))
+  )
 }
 
 /// **Reusable entry — the QuickTime/RIFF/MakerNotes seam.** Parse a raw
@@ -2196,14 +2418,17 @@ impl Walker<'_, '_> {
               self.captured_model.as_deref(),
               None,
             );
-            // Phase 2: parse Apple/Canon vendor bodies here. The walker
-            // pre-computes BOTH PrintConv (-j) and ValueConv (-n)
-            // emissions while it still has access to the parent TIFF
-            // block (Canon's out-of-line value offsets resolve against
-            // the parent TIFF block, not the captured blob).
+            // Phase 2: parse the Apple/Canon/Sony/Panasonic/Leica/DJI vendor
+            // body here. P0 single-mode decode: the walker decodes the body
+            // ONCE for PrintConv (-j) — yielding the typed slot + the cached
+            // PrintConv emissions — and records the decode INPUTS needed to
+            // re-derive the ValueConv (-n) emissions on demand (instead of
+            // eagerly decoding the body a second time). The decode runs here so
+            // out-of-line value offsets resolve against the parent TIFF block
+            // (Canon/Sony/Panasonic), not the captured blob.
             let mut meta = makernotes::MakerNotesMeta::from_detected(detected);
             let mut cached_pc = std::vec::Vec::<makernotes::VendorEmission>::new();
-            let mut cached_vc = std::vec::Vec::<makernotes::VendorEmission>::new();
+            let mut value_conv_decode = MakerNoteValueConvDecode::None;
             // The family-1 group for the cached emissions. Defaults to the
             // dispatched vendor's `group1()`; the cross-table Leica10 arm
             // below overrides it to `"Panasonic"` (its tags ARE
@@ -2218,11 +2443,12 @@ impl Walker<'_, '_> {
                 // faithful here.
                 let (typed_pc, emi_pc) =
                   makernotes::vendors::apple::parse_with_print_conv(bytes, self.order, true);
-                let (_typed_vc, emi_vc) =
-                  makernotes::vendors::apple::parse_with_print_conv(bytes, self.order, false);
                 meta.set_apple(typed_pc);
                 cached_pc = emi_pc;
-                cached_vc = emi_vc;
+                value_conv_decode = MakerNoteValueConvDecode::Apple {
+                  blob: bytes,
+                  order: self.order,
+                };
               }
               makernotes::Vendor::Canon => {
                 // Canon: parse using the parent TIFF context so
@@ -2236,12 +2462,16 @@ impl Walker<'_, '_> {
                 let (typed_pc, emi_pc) = makernotes::vendors::canon::parse_in_tiff(
                   self.data, mn_offset, mn_len, self.order, true, model, file_type,
                 );
-                let (_typed_vc, emi_vc) = makernotes::vendors::canon::parse_in_tiff(
-                  self.data, mn_offset, mn_len, self.order, false, model, file_type,
-                );
                 meta.set_canon(typed_pc);
                 cached_pc = emi_pc;
-                cached_vc = emi_vc;
+                value_conv_decode = MakerNoteValueConvDecode::Canon {
+                  data: self.data,
+                  mn_offset,
+                  mn_len,
+                  order: self.order,
+                  model: model.map(smol_str::SmolStr::new),
+                  file_type: file_type.map(smol_str::SmolStr::new),
+                };
               }
               // Sony: dispatcher gives us body_offset (12 for the
               // SONY DSC/CAM/MOBILE/VHAB/TF1 variants, 0 for headerless
@@ -2280,13 +2510,17 @@ impl Walker<'_, '_> {
                 if let Some((typed_pc, emi_pc)) = makernotes::vendors::sony::parse_main_gated(
                   self.data, mn_offset, mn_len, body_off, self.order, true, make, model,
                 ) {
-                  let (_typed_vc, emi_vc) = makernotes::vendors::sony::parse_main_gated(
-                    self.data, mn_offset, mn_len, body_off, self.order, false, make, model,
-                  )
-                  .expect("routes_to_main is deterministic across print_conv");
                   meta.set_sony(typed_pc);
                   cached_pc = emi_pc;
-                  cached_vc = emi_vc;
+                  value_conv_decode = MakerNoteValueConvDecode::Sony {
+                    data: self.data,
+                    mn_offset,
+                    mn_len,
+                    body_off,
+                    order: self.order,
+                    make: make.map(smol_str::SmolStr::new),
+                    model: model.map(smol_str::SmolStr::new),
+                  };
                 }
               }
               // Panasonic has THREE dispatch variants (`MakerNotes.pm:
@@ -2317,13 +2551,16 @@ impl Walker<'_, '_> {
                 if let Some((typed_pc, emi_pc)) = makernotes::vendors::panasonic::parse_main_gated(
                   self.data, mn_offset, mn_len, self.order, true, model, base_rule,
                 ) {
-                  let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_main_gated(
-                    self.data, mn_offset, mn_len, self.order, false, model, base_rule,
-                  )
-                  .expect("routes_to_main is deterministic across print_conv");
                   meta.set_panasonic(typed_pc);
                   cached_pc = emi_pc;
-                  cached_vc = emi_vc;
+                  value_conv_decode = MakerNoteValueConvDecode::Panasonic {
+                    data: self.data,
+                    mn_offset,
+                    mn_len,
+                    order: self.order,
+                    model: model.map(smol_str::SmolStr::new),
+                    base_rule,
+                  };
                 }
               }
               // Leica — cross-vendor routing. The dispatcher collapses all
@@ -2374,29 +2611,46 @@ impl Walker<'_, '_> {
                 let leica1 = makernotes::vendors::panasonic::parse_leica1_gated(
                   self.data, mn_offset, mn_len, body_off, self.order, true, make, model,
                 );
+                // P0: capture which Leica route matched (Leica1 vs Leica10) so
+                // the `-n` emissions are re-derived through the SAME gated
+                // parser. The PrintConv decode determines the route; ValueConv
+                // is deferred to that route's `recompute`.
                 let parsed = match leica1 {
-                  Some((typed_pc, emi_pc)) => {
-                    let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_leica1_gated(
-                      self.data, mn_offset, mn_len, body_off, self.order, false, make, model,
-                    )
-                    .expect("routes_to_leica1 is deterministic across print_conv");
-                    Some((typed_pc, emi_pc, emi_vc))
-                  }
+                  Some((typed_pc, emi_pc)) => Some((
+                    typed_pc,
+                    emi_pc,
+                    MakerNoteValueConvDecode::Leica1 {
+                      data: self.data,
+                      mn_offset,
+                      mn_len,
+                      body_off,
+                      order: self.order,
+                      make: make.map(smol_str::SmolStr::new),
+                      model: model.map(smol_str::SmolStr::new),
+                    },
+                  )),
                   None => makernotes::vendors::panasonic::parse_leica10_gated(
                     self.data, mn_offset, mn_len, body_off, self.order, true, model,
                   )
                   .map(|(typed_pc, emi_pc)| {
-                    let (_typed_vc, emi_vc) = makernotes::vendors::panasonic::parse_leica10_gated(
-                      self.data, mn_offset, mn_len, body_off, self.order, false, model,
+                    (
+                      typed_pc,
+                      emi_pc,
+                      MakerNoteValueConvDecode::Leica10 {
+                        data: self.data,
+                        mn_offset,
+                        mn_len,
+                        body_off,
+                        order: self.order,
+                        model: model.map(smol_str::SmolStr::new),
+                      },
                     )
-                    .expect("routes_to_leica10 is deterministic across print_conv");
-                    (typed_pc, emi_pc, emi_vc)
                   }),
                 };
-                if let Some((typed_pc, emi_pc, emi_vc)) = parsed {
+                if let Some((typed_pc, emi_pc, vc_decode)) = parsed {
                   meta.set_panasonic(typed_pc);
                   cached_pc = emi_pc;
-                  cached_vc = emi_vc;
+                  value_conv_decode = vc_decode;
                   // Both the Leica1 and Leica10 tags ARE `%Panasonic::Main`
                   // tags ⇒ bundled emits them under the `Panasonic` family-1
                   // group.
@@ -2413,12 +2667,14 @@ impl Walker<'_, '_> {
                 let (typed_pc, emi_pc) = makernotes::vendors::dji::parse_in_tiff(
                   self.data, mn_offset, mn_len, self.order, true,
                 );
-                let (_typed_vc, emi_vc) = makernotes::vendors::dji::parse_in_tiff(
-                  self.data, mn_offset, mn_len, self.order, false,
-                );
                 meta.set_dji(typed_pc);
                 cached_pc = emi_pc;
-                cached_vc = emi_vc;
+                value_conv_decode = MakerNoteValueConvDecode::Dji {
+                  data: self.data,
+                  mn_offset,
+                  mn_len,
+                  order: self.order,
+                };
               }
               _ => {}
             }
@@ -2426,7 +2682,7 @@ impl Walker<'_, '_> {
               bytes,
               meta,
               cached_emissions_print_conv: cached_pc,
-              cached_emissions_value_conv: cached_vc,
+              value_conv_decode,
               emission_group1,
             });
           }
@@ -2632,27 +2888,25 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
 
 #[cfg(feature = "alloc")]
 impl ExifMeta<'_> {
-  /// Render this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into a
-  /// [`Vec<EmittedTag>`](crate::emit::EmittedTag) for the requested
-  /// [`ConvMode`](crate::emit::ConvMode) — the golden-pattern parallel to the
-  /// `emit_entry` loop in [`serialize_tags`](Self::serialize_tags).
+  /// Push this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into `out` for the
+  /// requested [`ConvMode`](crate::emit::ConvMode) — the golden-pattern parallel
+  /// to the `emit_entry` loop in [`serialize_tags`](Self::serialize_tags).
   ///
   /// Each entry is converted by the SAME `emit_entry`/`emit_exif_value`/
   /// `emit_gps_value` logic the production path uses, but written into an
   /// [`EmittedTagSink`] (which produces the identical [`TagValue`]) instead of
-  /// the [`TagMap`](crate::tagmap::TagMap). The result carries
+  /// the [`TagMap`](crate::tagmap::TagMap). The pushed tags carry
   /// `Group{family0:"EXIF", family1:<IfdName>}`, `unknown:false`.
   ///
-  /// **EXIF entries only**: the `File:ExifByteOrder` and `File:PageCount` tags
-  /// are prepended by [`tags`](crate::emit::Taggable::tags) (not here), and the
-  /// `ExifTool:Warning` messages stay a separate channel drained by
-  /// `AnyMeta::drain_diagnostics`. The MakerNote vendor emissions are appended
-  /// separately by [`tags`](crate::emit::Taggable::tags) via
-  /// [`push_maker_note_tags`](Self::push_maker_note_tags). So this is the
-  /// EXIF (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) tag stream.
-  #[must_use]
-  fn emitted_exif_tags(&self, print_conv: bool) -> std::vec::Vec<crate::emit::EmittedTag> {
-    let mut sink = EmittedTagSink::new();
+  /// Writes DIRECTLY into the caller's `out` buffer (P2 — no per-call temp `Vec`
+  /// that [`tags`](crate::emit::Taggable::tags) then has to move). **EXIF
+  /// entries only**: the `File:ExifByteOrder`/`File:PageCount` prefix + the
+  /// MakerNote vendor emissions are pushed by [`tags`](crate::emit::Taggable::tags)
+  /// into the SAME `out`; the `ExifTool:Warning` messages stay a separate channel
+  /// drained by `AnyMeta::drain_diagnostics`.
+  fn push_exif_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    out.reserve(self.entries.len());
+    let mut sink = EmittedTagSink::new(out);
     // The byte order threaded to `emit_entry` for `ConvertExifText`'s UTF-16
     // 'Unknown' guess — identical to `serialize_tags`'s `entry_order`. `None`
     // only for a JPEG accepted without a parsed Exif block, which then has NO
@@ -2663,7 +2917,6 @@ impl ExifMeta<'_> {
       // `emit_entry` into the `EmittedTagSink` is infallible (`Infallible`).
       let Ok(()) = emit_entry(entry, entry_order, print_conv, &mut sink);
     }
-    sink.tags
   }
 
   /// Append the captured MakerNote's cached vendor emissions to `out` as
@@ -2688,19 +2941,25 @@ impl ExifMeta<'_> {
     // `Panasonic` for the cross-table Leica10 route); other vendors fall back
     // to `"MakerNotes"` and emit nothing here yet (empty cached emissions).
     let group1 = mn.emission_group1();
-    let emissions = if print_conv {
-      mn.emissions_print_conv()
-    } else {
-      mn.emissions_value_conv()
+    // `-j` reads the eagerly-cached PrintConv emissions (borrowed); `-n` decodes
+    // the vendor body ONCE on demand (P0 — owned `Vec`). A shared push folds
+    // either slice into `out`.
+    let push = |out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+                emissions: &[makernotes::VendorEmission]| {
+      out.reserve(emissions.len());
+      for e in emissions {
+        out.push(crate::emit::EmittedTag::new(
+          crate::value::Group::new("MakerNotes", group1),
+          smol_str::SmolStr::new(e.name()),
+          e.value().clone(),
+          e.unknown(),
+        ));
+      }
     };
-    out.reserve(emissions.len());
-    for e in emissions {
-      out.push(crate::emit::EmittedTag::new(
-        crate::value::Group::new("MakerNotes", group1),
-        smol_str::SmolStr::new(e.name()),
-        e.value().clone(),
-        e.unknown(),
-      ));
+    if print_conv {
+      push(out, mn.emissions_print_conv());
+    } else {
+      push(out, &mn.emissions_value_conv());
     }
   }
 }
@@ -2772,7 +3031,7 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
-    tags.append(&mut self.emitted_exif_tags(print_conv));
+    self.push_exif_tags(print_conv, &mut tags);
     self.push_maker_note_tags(print_conv, &mut tags);
     tags.into_iter()
   }
@@ -2908,19 +3167,21 @@ impl ExifSink for crate::tagmap::TagMap {
 /// Drives [`ExifMeta::tags`]; the engine ([`run_emission`](crate::emit::run_emission))
 /// then applies Unknown-suppression (a no-op here) + the sink dedup.
 #[cfg(feature = "alloc")]
-struct EmittedTagSink {
-  /// The collected EXIF [`EmittedTag`]s, in emission order.
-  tags: std::vec::Vec<crate::emit::EmittedTag>,
+struct EmittedTagSink<'v> {
+  /// The destination [`EmittedTag`] buffer (borrowed) — the EXIF emitters push
+  /// in emission order. Borrowing (rather than owning) lets [`ExifMeta::tags`]
+  /// fill ONE `Vec` in place (the `File:ExifByteOrder`/`PageCount` prefix, the
+  /// IFD entries via this sink, and the MakerNote vendor tags), eliminating the
+  /// per-call temp `Vec` the EXIF-entry pass used to allocate + move (P2).
+  tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>,
 }
 
 #[cfg(feature = "alloc")]
-impl EmittedTagSink {
-  /// An empty collector.
+impl<'v> EmittedTagSink<'v> {
+  /// Wrap a destination buffer.
   #[inline(always)]
-  const fn new() -> Self {
-    Self {
-      tags: std::vec::Vec::new(),
-    }
+  fn new(tags: &'v mut std::vec::Vec<crate::emit::EmittedTag>) -> Self {
+    Self { tags }
   }
 
   /// Push one rendered [`EmittedTag`] — `Group{family0:"EXIF", family1:group}`,
@@ -2937,7 +3198,7 @@ impl EmittedTagSink {
 }
 
 #[cfg(feature = "alloc")]
-impl ExifSink for EmittedTagSink {
+impl ExifSink for EmittedTagSink<'_> {
   #[inline(always)]
   fn write_str(
     &mut self,
@@ -3817,18 +4078,6 @@ fn join_floats(vals: &[f64]) -> String {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for Exif/TIFF parsing. Currently empty — every bad
-/// input produces `Ok(None)` (faithful to `DoProcessTIFF` `return 0`) or is
-/// walked past silently (an unknown tag / format / out-of-range offset).
-/// Reserved for future I/O-fallible wrappers.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Unit tests
 // ===========================================================================
 
@@ -3860,7 +4109,7 @@ mod tests {
   #[test]
   fn rejects_short_buffer() {
     assert!(parse_exif_block(b"MM\0").is_none());
-    assert!(parse_borrowed(b"").unwrap().is_none());
+    assert!(parse_borrowed(b"").is_none());
   }
 
   #[test]
@@ -4236,7 +4485,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // value = 2 (single page of multi-page)
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
     // Standalone entry: emits `multi_page_count = Some(2)`.
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), Some(2));
     // Embedded entry on the same bytes: `multi_page_count = None` (the
     // `TIFF_TYPE == 'TIFF'` gate at ExifTool.pm:8757 is off).
@@ -4256,7 +4505,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]); // SubfileType LONG count=1
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // value = 0 (full-resolution)
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), None);
   }
 
@@ -4281,7 +4530,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xff, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x03, 0x00, 0x00]); // value SHORT=3
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD = 0
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), Some(2));
   }
 
@@ -4302,7 +4551,7 @@ mod tests {
     t.extend_from_slice(&[0x00, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    let meta = parse_borrowed(&t).unwrap().expect("valid TIFF");
+    let meta = parse_borrowed(&t).expect("valid TIFF");
     assert_eq!(meta.multi_page_count(), None);
   }
 

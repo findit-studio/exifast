@@ -45,6 +45,7 @@ use crate::value::TagValue;
 use core::convert::Infallible;
 use smol_str::SmolStr;
 use std::{
+  collections::HashMap,
   string::{String, ToString},
   vec::Vec,
 };
@@ -57,9 +58,30 @@ use std::{
 ///
 /// Private to the crate (constructed by [`crate::Rendered`]'s `Serialize` and
 /// [`crate::parser::extract_info`]). NOT a public API surface.
+///
+/// ## Storage (Golden-v2 P1 — O(1) dedup, key built once at serialize)
+///
+/// Entries are stored as the `(family1, name, value)` TRIPLE in
+/// first-occurrence order, with a side index `HashMap<(family1, name) → idx>`
+/// for O(1) last-wins dedup. The previous design keyed dedup on a per-insert
+/// `format!("{group}:{name}")` `SmolStr` and resolved duplicates via an O(n)
+/// linear scan (O(n²) over a walk); this builds NO `"g:n"` string at insert
+/// time — the two short `SmolStr`s (`family1`, `name`, both usually inline so
+/// the clone is a memcpy, not a heap alloc) ARE the key. The combined
+/// `"<family1>:<name>"` JSON key is materialized ONCE per surviving entry at
+/// serialization (the two consumers — [`crate::parser::extract_info`] and
+/// [`crate::Rendered`] — build it from [`entries`](Self::entries)), not per
+/// emission. Net per-insert: one `HashMap` probe + (on a new key) two inline
+/// `SmolStr` clones, vs the old heap `format!` + a growing linear scan.
 pub(crate) struct TagMap {
-  /// `("<Group1>:<Name>", value)` in first-occurrence order, first-wins.
-  entries: Vec<(SmolStr, TagValue)>,
+  /// `(family1, name, value)` in first-occurrence order; the latest value for a
+  /// repeated `(family1, name)` replaces in place (faithful `FoundTag`
+  /// last-wins, keeping first-occurrence POSITION — `ExifTool.pm:9437-9519`).
+  entries: Vec<(SmolStr, SmolStr, TagValue)>,
+  /// `(family1, name) → index into `entries`` for O(1) dedup. The key clones
+  /// the two short `SmolStr`s (inline for ≤23 bytes — no heap), so the dedup
+  /// probe never builds the `"g:n"` string the old design allocated per insert.
+  index: HashMap<(SmolStr, SmolStr), usize>,
   warnings: Vec<String>,
   errors: Vec<String>,
 }
@@ -69,6 +91,7 @@ impl TagMap {
   pub(crate) fn new() -> Self {
     Self {
       entries: Vec::new(),
+      index: HashMap::new(),
       warnings: Vec::new(),
       errors: Vec::new(),
     }
@@ -87,12 +110,22 @@ impl TagMap {
   /// last COMM). No typed sink emits two DIFFERENT family-0 under one
   /// `family1:name`, so the render-stage first-wins never applies here.
   fn insert(&mut self, group: &str, name: &str, value: TagValue) {
-    let key = SmolStr::new(std::format!("{group}:{name}"));
-    if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
-      slot.1 = value; // last-wins, in place (keeps first-occurrence position)
+    // O(1) dedup on the `(family1, name)` PAIR — no `"g:n"` string is built here
+    // (it is materialized once per surviving entry at serialization). The probe
+    // key clones the two `SmolStr`s; tag groups + names are short identifiers
+    // (`"EXIF"`/`"IFD0"`/`"Canon"`, `"MakerNoteVersion"` — all ≤23 bytes), so
+    // `SmolStr::new` stores them INLINE (a memcpy, NO heap allocation). On a
+    // MISS the freshly-built key is moved straight into the index + entries (no
+    // re-clone); on a HIT the latest value replaces in place, keeping
+    // first-occurrence POSITION (faithful `FoundTag` last-wins).
+    let key = (SmolStr::new(group), SmolStr::new(name));
+    if let Some(&idx) = self.index.get(&key) {
+      self.entries[idx].2 = value;
       return;
     }
-    self.entries.push((key, value));
+    let idx = self.entries.len();
+    self.entries.push((key.0.clone(), key.1.clone(), value));
+    self.index.insert(key, idx);
   }
 
   // The `write_*` surface returns `Result<(), Infallible>` so the typed
@@ -203,11 +236,12 @@ impl TagMap {
     Ok(())
   }
 
-  /// The collected format-tag entries (`"<Group1>:<Name>"`, value) in
-  /// first-occurrence order (first-wins already applied). Slice view of the
-  /// backing `Vec` (§3: never expose `&Vec<T>`).
+  /// The collected format-tag entries `(family1, name, value)` in
+  /// first-occurrence order (last-wins dedup already applied). The consumer
+  /// builds the `"<family1>:<name>"` JSON key ONCE per entry here (not per
+  /// emission). Slice view of the backing `Vec` (§3: never expose `&Vec<T>`).
   #[inline(always)]
-  pub(crate) const fn entries(&self) -> &[(SmolStr, TagValue)] {
+  pub(crate) const fn entries(&self) -> &[(SmolStr, SmolStr, TagValue)] {
     self.entries.as_slice()
   }
 
@@ -229,17 +263,13 @@ impl TagMap {
     &self.warnings
   }
 
-  /// Look up an emitted tag's [`TagValue`] by `(group, name)` — the
-  /// `"<group>:<name>"` key (test-only read-back, mirrors the retired
-  /// `MapTagWriter::get`). `None` if never emitted.
+  /// Look up an emitted tag's [`TagValue`] by `(family1, name)` (test-only
+  /// read-back, mirrors the retired `MapTagWriter::get`). `None` if never
+  /// emitted. Uses the O(1) dedup index.
   #[cfg(test)]
   pub(crate) fn get(&self, group: &str, name: &str) -> Option<&TagValue> {
-    let key = std::format!("{group}:{name}");
-    self
-      .entries
-      .iter()
-      .find(|(k, _)| k.as_str() == key)
-      .map(|(_, v)| v)
+    let key = (SmolStr::new(group), SmolStr::new(name));
+    self.index.get(&key).map(|&idx| &self.entries[idx].2)
   }
 
   /// `true` if no tags / warnings / errors were emitted (test-only).

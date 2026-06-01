@@ -859,12 +859,11 @@ impl FormatParser for ProcessAiff {
   type Context<'a> = &'a [u8];
   /// Rust-level fatal error (none today; AIFF parsing has no I/O modes —
   /// every bad input is `Ok(None)` per Perl `return 0`).
-  type Error = Error;
 
   /// Parse an AIFF/AIFC/DJVU file's bytes into a typed [`Meta`], or
   /// `None` if the buffer is not a recognized FORM container (AIFF.pm:191
   /// short read, :209 magic mismatch, :199 AT&TFORM tail mismatch).
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(data)
   }
 }
@@ -877,14 +876,14 @@ impl FormatParser for ProcessAiff {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   parse_inner(data)
 }
 
-fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // AIFF.pm:191 `return 0 unless $raf->Read($buff, 12) == 12`.
   if data.len() < 12 {
-    return Ok(None);
+    return None;
   }
   // AIFF.pm:194-207 DjVu arm. `AT&TFORM` magic + (`DJVU`|`DJVM`) at
   // bytes 12..16. Bundled reads 4 EXTRA bytes (`return 0 unless
@@ -894,23 +893,23 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   let mut djvm_multi_page = false;
   let magic: Magic = if data.starts_with(b"AT&TFORM") {
     if data.len() < 16 {
-      return Ok(None);
+      return None;
     }
     match &data[12..16] {
       b"DJVU" => {}
       b"DJVM" => djvm_multi_page = true,
-      _ => return Ok(None),
+      _ => return None,
     }
     Magic::Djvu
   } else {
     // AIFF.pm:209 `return 0 unless $buff =~ /^FORM....(AIF(F|C))/s`.
     if &data[0..4] != b"FORM" {
-      return Ok(None);
+      return None;
     }
     match &data[8..12] {
       b"AIFF" => Magic::Aiff,
       b"AIFC" => Magic::Aifc,
-      _ => return Ok(None),
+      _ => return None,
     }
   };
 
@@ -920,13 +919,13 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   // loop is skipped. This is identical to AIFF.pm's `fast3` mode
   // (AIFF.pm:203 `return 1 if $fast3`).
   if magic == Magic::Djvu {
-    return Ok(Some(Meta {
+    return Some(Meta {
       magic,
       djvm_multi_page,
       events: Vec::new(),
       composite_duration: None,
       _lifetime: core::marker::PhantomData,
-    }));
+    });
   }
 
   // AIFF.pm:215 `SetByteOrder('MM')` — AIFF is big-endian throughout.
@@ -1078,13 +1077,13 @@ fn parse_inner(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
   //   `PrintConv => 'ConvertDuration($val)'`
   let composite_duration = compute_composite_duration(&events);
 
-  Ok(Some(Meta {
+  Some(Meta {
     magic,
     djvm_multi_page,
     events,
     composite_duration,
     _lifetime: core::marker::PhantomData,
-  }))
+  })
 }
 
 /// AIFF.pm:136-145 composite Duration. `RawConv = $val[1] / $val[0]`
@@ -1671,21 +1670,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for AIFF parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`). Reserved for future I/O
-/// wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror`
-/// (v2, `default-features = false` ⇒ `core::error::Error` for no-std);
-/// `#[non_exhaustive]` lets future variants land without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -1972,7 +1956,7 @@ mod tests {
     data.extend_from_slice(&(body.len() as u32).to_be_bytes());
     data.extend_from_slice(&body);
 
-    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
     assert_eq!(meta.magic(), Magic::Aiff);
     assert_eq!(meta.name(), Some("Hello"));
     let common = meta.common().expect("COMM extracted");
@@ -2032,14 +2016,6 @@ mod tests {
     assert_eq!(c.raw_text(), b"NONE");
     assert_eq!(c.unwrap_raw_text_ref().as_slice(), b"NONE");
   }
-
-  #[test]
-  fn aiff_error_is_thiserror_uninhabited() {
-    // §5: empty enum derives core::error::Error via thiserror.
-    fn assert_error<E: core::error::Error>() {}
-    assert_error::<Error>();
-  }
-
   // ---------- golden-pattern `Taggable` / `Project` surface --------------
 
   /// Drive the `Meta` through the golden-pattern engine
@@ -2063,7 +2039,7 @@ mod tests {
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFC.aifc fixture");
-    let meta = parse_borrowed(&data).unwrap().expect("AIFC parsed");
+    let meta = parse_borrowed(&data).expect("AIFC parsed");
 
     // -j (PrintConv).
     let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
@@ -2114,7 +2090,7 @@ mod tests {
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFF_duration.aif fixture");
-    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
 
     // -j: ConvertDuration string, under the Composite (-G1) group.
     let w = emit_into_tagmap(&meta, ConvMode::PrintConv);
@@ -2140,7 +2116,7 @@ mod tests {
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFF_duration.aif fixture");
-    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
     let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
 
     let mut saw_aiff = false;
@@ -2176,7 +2152,7 @@ mod tests {
     data.extend_from_slice(b"AT&TFORM");
     data.extend_from_slice(&0u32.to_be_bytes()); // FORM length (unused here)
     data.extend_from_slice(b"DJVU");
-    let meta = parse_borrowed(&data).unwrap().expect("DjVu parsed");
+    let meta = parse_borrowed(&data).expect("DjVu parsed");
     assert_eq!(meta.magic(), Magic::Djvu);
     assert_eq!(meta.tags(ConvMode::PrintConv).count(), 0);
   }
@@ -2192,7 +2168,7 @@ mod tests {
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFF_duration.aif fixture");
-    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
     let projected = meta.project();
 
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
@@ -2225,7 +2201,7 @@ mod tests {
       env!("CARGO_MANIFEST_DIR")
     ))
     .expect("read AIFF.aif fixture");
-    let meta = parse_borrowed(&data).unwrap().expect("AIFF parsed");
+    let meta = parse_borrowed(&data).expect("AIFF parsed");
     let projected = meta.project();
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);
     assert!(projected.media().duration().is_none());

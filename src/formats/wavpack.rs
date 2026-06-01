@@ -634,7 +634,6 @@ impl FormatParser for ProcessWv {
   /// `&mut SharedFlags`.
   type Context<'a> = Context<'a>;
   /// Rust-level fatal error (none today; WavPack parsing has no I/O modes).
-  type Error = Error;
 
   /// Parse a WavPack file's bytes into a typed [`Meta`], or `None` if
   /// the buffer is not a valid WavPack file (short read, bad magic, or
@@ -652,10 +651,10 @@ impl FormatParser for ProcessWv {
   ///
   /// Returns `Err` only for Rust-level fatal modes; the current port
   /// has none (every bad input is `Ok(None)` per Perl's `return 0`).
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is
     // always present here.
-    Ok(parse_full_chained(ctx.data, ctx.shared))
+    parse_full_chained(ctx.data, ctx.shared)
   }
 }
 
@@ -674,11 +673,11 @@ impl FormatParser for ProcessWv {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
   // `wavpack = ["id3", "ape"]` per Cargo.toml ⇒ `parse_full_chained` is always
   // present here.
   let mut shared = crate::format_parser::SharedFlags::default();
-  Ok(parse_full_chained(data, &mut shared))
+  parse_full_chained(data, &mut shared)
 }
 
 /// Inner parser — produces a borrow-from-input [`Meta`]. The
@@ -810,9 +809,8 @@ pub(crate) fn parse_full_chained<'a>(
   // recursion guard. Only the v1-trailer scan is meaningful for WV (the
   // wvpk magic must be at offset 0, so the v2-prefix branch can't fire).
   if shared.done_id3().is_none() {
-    meta.id3 = crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true)
-      .ok()
-      .and_then(|(m, _hdr_end)| m);
+    meta.id3 =
+      crate::formats::id3::process::parse_id3_with_hdr_end(data, Some(&mut *shared), true).0;
   }
 
   // 3. APE trailer (WavPack.pm:101-103). `parse_trailer_only_owned`
@@ -994,22 +992,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for WavPack parsing. Currently empty — every
-/// bad input produces `Ok(None)` (Perl `return 0`). Reserved for future
-/// I/O wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` derived via `thiserror` (v2,
-/// `default-features = false` ⇒ `core::error::Error` in every feature
-/// tier, not just `std`). `#[non_exhaustive]` lets I/O variants land
-/// without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -1147,7 +1129,7 @@ mod tests {
     //   DataFormat raw=0 → Integer
     //   SampleRate raw=10 → Hz(48000)
     let data = header_with_flags(0x0480_008d);
-    let meta = parse_borrowed(&data).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&data).expect("parsed");
     assert_eq!(meta.bytes_per_sample(), 1);
     assert_eq!(meta.audio_type(), AudioType::Mono);
     assert_eq!(meta.compression(), Compression::Lossless);
@@ -1168,7 +1150,7 @@ mod tests {
     //   DataFormat raw=1 → FloatingPoint
     //   SampleRate raw=15 → Custom
     let data = header_with_flags(0xFFFF_FFFF);
-    let meta = parse_borrowed(&data).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&data).expect("parsed");
     assert_eq!(meta.bytes_per_sample(), 4);
     assert_eq!(meta.audio_type(), AudioType::Mono);
     assert_eq!(meta.compression(), Compression::Hybrid);
@@ -1180,16 +1162,16 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0u8; 16]).unwrap().is_none());
-    assert!(parse_borrowed(&[0u8; 31]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0u8; 16]).is_none());
+    assert!(parse_borrowed(&[0u8; 31]).is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_magic() {
     let mut data = vec![0u8; 32];
     data[..4].copy_from_slice(b"WVPK");
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   #[test]
@@ -1198,7 +1180,7 @@ mod tests {
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x05; // out of {0x02, 0x10}
     data[9] = 0x04;
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   #[test]
@@ -1207,7 +1189,7 @@ mod tests {
     data[..4].copy_from_slice(b"wvpk");
     data[8] = 0x10;
     data[9] = 0x05; // not 0x04
-    assert!(parse_borrowed(&data).unwrap().is_none());
+    assert!(parse_borrowed(&data).is_none());
   }
 
   #[test]
@@ -1215,7 +1197,7 @@ mod tests {
     // Byte 8 == 0x02 is the other allowed version (WavPack.pm:88).
     let mut data = header_with_flags(0);
     data[8] = 0x02; // 0x0402
-    let meta = parse_borrowed(&data).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&data).expect("parsed");
     assert_eq!(meta.bytes_per_sample(), 1); // raw=0 +1
   }
 
@@ -1228,9 +1210,7 @@ mod tests {
     let data = header_with_flags(0x0480_008d);
     let mut shared = SharedFlags::new();
     let ctx = Context::new(&data, &mut shared);
-    let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx).expect("parsed");
     // Identical extraction to `parse_borrowed`: the GAT path now threads
     // the input borrow through, so the chained-trailer scan range survives
     // (previously dropped by the removed `into_static`; Codex AF2).
@@ -1248,7 +1228,7 @@ mod tests {
     data[..4].copy_from_slice(b"WVPK");
     let mut shared = SharedFlags::new();
     let ctx = Context::new(&data, &mut shared);
-    let result = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx).unwrap();
+    let result = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx);
     assert!(result.is_none());
   }
 
@@ -1276,9 +1256,7 @@ mod tests {
     let data = header_with_flags(flags_le);
     let mut shared = SharedFlags::new();
     let ctx = Context::new(&data, &mut shared);
-    let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx)
-      .unwrap()
-      .unwrap();
+    let meta = <ProcessWv as FormatParser>::parse(&ProcessWv, ctx).unwrap();
     let mut w = TagMap::new();
     crate::emit::run_emission(
       &meta,
@@ -1436,7 +1414,7 @@ mod tests {
     // ExifTool.pm:9907 numeric sort ⇒ 6.1..6.5. Order is preserved by the
     // golden `run_emission` -> `TagMap` entries (the JSON object loses it).
     let data = header_with_flags(0x0480_008d);
-    let meta = parse_borrowed(&data).unwrap().unwrap();
+    let meta = parse_borrowed(&data).unwrap();
     let mut tm = TagMap::new();
     crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut tm);
     // WavPack tags use family-1 group "File" (WavPack.pm GROUPS{1}); the
@@ -1444,7 +1422,7 @@ mod tests {
     let names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(k, _)| k.strip_prefix("File:"))
+      .filter_map(|(g, n, _)| (g == "File").then_some(n.as_str()))
       .collect();
     assert_eq!(
       names,

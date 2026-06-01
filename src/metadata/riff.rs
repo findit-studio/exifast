@@ -221,7 +221,7 @@ mod tests {
   #[test]
   fn from_riff_fills_media_info() {
     let bytes = minimal_avi_bytes();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let projected = MediaMetadata::from_riff(&meta);
     assert_eq!(projected.media().width(), Some(320));
     assert_eq!(projected.media().height(), Some(240));
@@ -235,7 +235,7 @@ mod tests {
   #[test]
   fn from_riff_fills_camera_software() {
     let bytes = minimal_avi_bytes();
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let projected = MediaMetadata::from_riff(&meta);
     let cam = projected.camera().expect("camera");
     assert_eq!(cam.software(), Some("Acme"));
@@ -299,7 +299,7 @@ mod tests {
     // vids stream is 100 @25fps = 4s; ratio 3.0 ∈ (1.9, 3.1) ⇒ use the video
     // stream (RIFF.pm:1660-1663). Oracle: bundled Composite:Duration = 4.
     let bytes = avi_with_video_stream(40_000, 300, 25, 100);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let dur = MediaMetadata::from_riff(&meta)
       .media()
       .duration()
@@ -316,7 +316,7 @@ mod tests {
     // Ratio 1.0 (header == video): NOT in (1.9, 3.1) ⇒ keep the avih
     // FrameCount/FrameRate duration. 100 @25fps = 4s.
     let bytes = avi_with_video_stream(40_000, 100, 25, 100);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let dur = MediaMetadata::from_riff(&meta)
       .media()
       .duration()
@@ -335,7 +335,7 @@ mod tests {
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&4u32.to_le_bytes());
     bytes.extend_from_slice(b"AVI ");
-    let meta = parse_borrowed(&bytes).expect("ok").expect("some");
+    let meta = parse_borrowed(&bytes).expect("some");
     let projected = MediaMetadata::from_riff(&meta);
     assert!(projected.camera().is_none());
     assert!(projected.media().width().is_none());

@@ -783,14 +783,13 @@ impl FormatParser for ProcessAa {
   /// Rust-level fatal error (none today; AA parsing has no I/O modes —
   /// every bad input either returns `Ok(None)` or accumulates warnings/
   /// errors into the typed Meta and returns `Ok(Some)`).
-  type Error = Error;
 
   /// Parse an AA file's bytes into a typed [`Meta`], or `None` if the
   /// buffer is not a valid AA (short read, wrong magic, or embedded
   /// filesize mismatch — Audible.pm:201-205). Returns `Err` only for
   /// Rust-level fatal modes; the current port has none.
-  fn parse<'a>(&self, data: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Error> {
-    Ok(parse_inner(data))
+  fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_inner(data)
   }
 }
 
@@ -802,8 +801,8 @@ impl FormatParser for ProcessAa {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed(data: &[u8]) -> Result<Option<Meta<'_>>, Error> {
-  Ok(parse_inner(data))
+pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
+  parse_inner(data)
 }
 
 /// Inner parser — produces a borrow-from-input [`Meta`] (chunk-11 cover
@@ -1373,24 +1372,6 @@ impl crate::metadata::Project for Meta<'_> {
 }
 
 // ===========================================================================
-// `Error` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for AA parsing. Currently empty — every bad
-/// input either produces `Ok(None)` (Perl `return 0`) or surfaces
-/// warnings/errors inside the typed [`Meta`] (Perl `$et->Warn` /
-/// `$et->Error`). Reserved for future I/O wrappers if streaming readers
-/// are added.
-///
-/// §5: derived via `thiserror` (v2, `default-features = false` ⇒
-/// `core::error::Error`), `#[non_exhaustive]` so variants can be added
-/// without a breaking change. Variant names are kept stable for
-/// [`crate::format_parser::AnyError`]'s `From`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {}
-
-// ===========================================================================
 // Engine entry — typed parse + File:* + sink into `Metadata`
 // ===========================================================================
 
@@ -1683,14 +1664,11 @@ mod tests {
   /// Typed parse + TagMap, returning the `Audible:*` entries in order
   /// (key without the prefix, value). Order is preserved by the typed sink.
   fn audible_entries(bytes: &[u8]) -> Vec<(String, TagValue)> {
-    let meta = parse_borrowed(bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(bytes).expect("parsed");
     let tm = emit_into_tagmap(&meta, true);
     tm.entries()
       .iter()
-      .filter_map(|(k, v)| {
-        k.strip_prefix("Audible:")
-          .map(|n| (n.to_string(), v.clone()))
-      })
+      .filter_map(|(g, n, v)| (g == "Audible").then(|| (n.to_string(), v.clone())))
       .collect()
   }
 
@@ -1766,7 +1744,7 @@ mod tests {
   fn dict_cover_art_uses_binary_placeholder() {
     // Raw bytes preserved via the typed parse + TagMap.
     let bytes = build_aa_with_dict(&[("_cover_art", "ABCDE")]);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let tm = emit_into_tagmap(&meta, true);
     match tm.get("Audible", "CoverArt").expect("CoverArt") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"ABCDE"),
@@ -1923,7 +1901,7 @@ mod tests {
   #[test]
   fn parse_borrowed_returns_typed_meta() {
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let names: Vec<&str> = meta.entries().iter().map(|e| e.name()).collect();
     assert_eq!(names, vec!["Author", "Title"]);
     match meta.entries()[0].value_ref() {
@@ -1935,7 +1913,7 @@ mod tests {
   #[test]
   fn parse_borrowed_returns_chapter_count_accessor() {
     let bytes = build_aa_with_two_chap_chunks(1, 42);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     assert_eq!(meta.chapter_count(), Some(42));
   }
 
@@ -1960,16 +1938,14 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[]).unwrap().is_none());
-    assert!(parse_borrowed(&[0u8; 8]).unwrap().is_none());
+    assert!(parse_borrowed(&[]).is_none());
+    assert!(parse_borrowed(&[0u8; 8]).is_none());
   }
 
   #[test]
   fn format_parser_trait_returns_meta_static() {
     let bytes = build_aa_with_dict(&[("author", "Alice")]);
-    let meta = <ProcessAa as FormatParser>::parse(&ProcessAa, &bytes)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessAa as FormatParser>::parse(&ProcessAa, &bytes).expect("parsed");
     assert_eq!(meta.entries().len(), 1);
     assert_eq!(meta.entries()[0].name(), "Author");
   }
@@ -1977,7 +1953,7 @@ mod tests {
   #[test]
   fn taggable_emits_typed_tags() {
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Audible", "Author"), Some("Alice".to_string()));
     assert_eq!(w.get_str("Audible", "Title"), Some("Book".to_string()));
@@ -1986,7 +1962,7 @@ mod tests {
   #[test]
   fn taggable_emits_chapter_count_as_i64() {
     let bytes = build_aa_with_two_chap_chunks(1, 7);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let w = emit_into_tagmap(&meta, true);
     assert_eq!(w.get_str("Audible", "ChapterCount"), Some("7".to_string()));
   }
@@ -1995,7 +1971,7 @@ mod tests {
   fn taggable_group_is_audible_family0_and_family1() {
     use crate::emit::{ConvMode, Taggable};
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
     assert_eq!(tags.len(), 2);
     for t in &tags {
@@ -2022,7 +1998,7 @@ mod tests {
     );
 
     // The typed Meta carries the warning on its `warnings()` accessor.
-    let meta = parse_borrowed(&data).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&data).expect("parsed");
     assert!(meta.warnings().iter().any(|s| s == "Invalid TOC"));
   }
 
@@ -2030,7 +2006,7 @@ mod tests {
   fn project_populates_audio_track_only() {
     use crate::metadata::{Project, TrackKind};
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
-    let meta = parse_borrowed(&bytes).expect("ok").expect("parsed");
+    let meta = parse_borrowed(&bytes).expect("parsed");
     let projected = meta.project();
     // AA is an audiobook: one audio track kind, nothing else decoded.
     assert_eq!(projected.media().track_kinds(), &[TrackKind::Audio]);

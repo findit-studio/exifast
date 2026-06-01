@@ -78,7 +78,7 @@ pub mod v2_common;
 pub mod v2_process;
 
 pub use process::{
-  Id3Context, Id3Error, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
+  Id3Context, Id3Meta, Id3Picture, Id3v1Meta, Id3v2Frame, Id3v2Version, ProcessId3,
   parse_id3_borrowed, parse_id3v1_from_block,
 };
 
@@ -86,4 +86,4 @@ pub use process::{
 // `mpeg-audio` + `ape`. The plain `id3` feature (pulled by flac/aiff/dsf/ape
 // for the ID3-prefix chain) does NOT compile these.
 #[cfg(feature = "mp3")]
-pub use process::{Mp3Context, Mp3Error, Mp3Meta, ProcessMp3, parse_mp3_borrowed};
+pub use process::{Mp3Context, Mp3Meta, ProcessMp3, parse_mp3_borrowed};

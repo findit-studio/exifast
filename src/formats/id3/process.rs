@@ -983,7 +983,6 @@ impl FormatParser for ProcessId3 {
   /// `SmolStr`, so `'a` is phantom; Codex AF2).
   type Meta<'a> = Id3Meta<'a>;
   type Context<'a> = Id3Context<'a>;
-  type Error = Id3Error;
 
   /// Parse the ID3 directory at the start of `ctx.data()`. Returns
   /// `Ok(Some(meta))` when an ID3v1 OR ID3v2 was detected, `Ok(None)`
@@ -993,8 +992,9 @@ impl FormatParser for ProcessId3 {
   /// Stages in `-j` PrintConv mode (the closed-dispatch convention; the
   /// Meta is mode-locked, Codex BF2 — sink with `sink(true, ...)`). For
   /// `-n` access use [`parse_id3_borrowed`] with `print_conv = false`.
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
-    parse_id3_inner(ctx.data, Some(ctx.shared), /* print_conv */ true).map(|(meta, _hdr_end)| meta)
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    let (meta, _hdr_end) = parse_id3_inner(ctx.data, Some(ctx.shared), /* print_conv */ true);
+    meta
   }
 }
 
@@ -1061,7 +1061,6 @@ impl FormatParser for ProcessMp3 {
   /// sub-Meta borrows its `encoder` field; Codex AF2).
   type Meta<'a> = Mp3Meta<'a>;
   type Context<'a> = Mp3Context<'a>;
-  type Error = Mp3Error;
 
   /// Parse a candidate MP3 file. Returns `Ok(Some(meta))` if ID3 OR
   /// MPEG audio sync was detected, `Ok(None)` otherwise. Faithful to
@@ -1072,8 +1071,8 @@ impl FormatParser for ProcessMp3 {
   /// already run. The typed sub-Metas are populated so the `serialize_tags`
   /// emits ID3 + MPEG + APE tags without the legacy bridge (Codex
   /// BF1/CF1).
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, Self::Error> {
-    parse_mp3_typed(ctx.data, ctx.ext, ctx.shared).map_err(Mp3Error::Id3)
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
+    parse_mp3_typed(ctx.data, ctx.ext, ctx.shared)
   }
 }
 
@@ -1111,7 +1110,7 @@ fn parse_mp3_typed<'a>(
   data: &'a [u8],
   ext: Option<&str>,
   shared: &mut SharedFlags,
-) -> Result<Option<Mp3Meta<'a>>, Id3Error> {
+) -> Option<Mp3Meta<'a>> {
   // -- 1. ID3 (ID3.pm:1691-1693) ------------------------------------------
   // `unless ($$et{DoneID3}) { $rtnVal = ProcessID3(...) }` (ID3.pm:1691-1693).
   // When a prior parser in the chain (e.g. APE/DSF/FLAC) already ran
@@ -1126,7 +1125,7 @@ fn parse_mp3_typed<'a>(
     // `$hdrEnd`) on `shared` so a subsequent chained parser / recursive MP3
     // dispatch observes them (Codex B-R3-1/B-R3-2). No manual marker patch
     // is needed here.
-    parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)?
+    parse_id3_inner(data, Some(&mut *shared), /* print_conv */ true)
   } else {
     // DoneID3 already set ⇒ bundled `ProcessID3` returns 0 and the `unless`
     // skips it (ID3.pm:1691-1693). No ID3 sub-Meta. The bundled flow only
@@ -1150,16 +1149,14 @@ fn parse_mp3_typed<'a>(
   let post_id3 = data.get(hdr_end..).unwrap_or(&[]);
   let bounded = &post_id3[..scan_len.min(post_id3.len())];
   // `mpeg::AudioError` is uninhabited; the `Ok(None)` path covers "no sync".
-  let mpeg = crate::formats::mpeg::parse_borrowed(bounded, mp3_flag, ext_str)
-    .ok()
-    .flatten();
+  let mpeg = crate::formats::mpeg::parse_borrowed(bounded, mp3_flag, ext_str);
 
   // -- rtnVal (ID3.pm:1722 `if ($rtnVal ...)`) ----------------------------
   let rtn_val = id3.is_some() || mpeg.is_some();
   if !rtn_val {
     // Perl returns 0 ⇒ no File:* promotion; the engine emits the
     // file-format error. The typed entry returns `Ok(None)`.
-    return Ok(None);
+    return None;
   }
 
   // -- 3. APE trailer fallback (ID3.pm:1722-1727) -------------------------
@@ -1175,12 +1172,12 @@ fn parse_mp3_typed<'a>(
     crate::formats::ape::parse_trailer_only_owned(data, shared)
   };
 
-  Ok(Some(Mp3Meta {
+  Some(Mp3Meta {
     id3,
     mpeg,
     ape,
     found: rtn_val,
-  }))
+  })
 }
 
 /// Lib-first direct entry for the MP3 wrapper with **decoupled `shared`
@@ -1192,43 +1189,14 @@ fn parse_mp3_typed<'a>(
 ///
 /// The ID3 sub-Meta is staged in `-j` PrintConv mode (sink with
 /// `sink(true, ...)`); MPEG / APE sub-Metas apply PrintConv at sink time.
-///
-/// # Errors
-///
-/// Returns the per-format [`Mp3Error`].
 #[cfg(feature = "mp3")]
+#[must_use]
 pub fn parse_mp3_borrowed<'a>(
   data: &'a [u8],
   ext: Option<&str>,
   shared: &mut SharedFlags,
-) -> Result<Option<Mp3Meta<'a>>, Mp3Error> {
-  parse_mp3_typed(data, ext, shared).map_err(Mp3Error::Id3)
-}
-
-/// Rust-level fatal modes for ID3 parsing. Currently empty — every bad
-/// input produces `Ok(None)` (Perl `return 0`) or a non-fatal Warn that
-/// lands as an [`Id3Meta::warnings_slice`] entry. Reserved for future I/O
-/// wrappers.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror` (v2,
-/// `default-features = false`) so the trait is present in every feature tier.
-/// `#[non_exhaustive]` lets variants land later without a breaking change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Id3Error {}
-
-/// Rust-level fatal modes for MP3 parsing. Wraps [`Id3Error`] for the
-/// nested ID3 dispatch.
-///
-/// §5: derived via `thiserror`; `#[from]` on the wrapped [`Id3Error`] gives a
-/// free `From<Id3Error>` + `source()`. `#[non_exhaustive]` for additive growth.
-#[cfg(feature = "mp3")]
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum Mp3Error {
-  /// An ID3 parsing error bubbled up from the nested directory parser.
-  #[error("MP3: ID3 parsing failed: {0}")]
-  Id3(#[from] Id3Error),
+) -> Option<Mp3Meta<'a>> {
+  parse_mp3_typed(data, ext, shared)
 }
 
 // ===========================================================================
@@ -1280,7 +1248,7 @@ fn parse_id3_inner<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
-) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
+) -> (Option<Id3Meta<'a>>, usize) {
   let _ = print_conv; // no longer mode-locks (Codex B-R2-1); see fn docs.
 
   // ID3.pm:1435 `return 0 if $$et{DoneID3}` — the `ProcessID3` recursion
@@ -1293,7 +1261,7 @@ fn parse_id3_inner<'a>(
   // has no cross-format state to guard on — the legacy scratch `Metadata`
   // owns its own `DoneID3` for internal recursion.
   if shared.as_ref().is_some_and(|sf| sf.done_id3().is_some()) {
-    return Ok((None, 0));
+    return (None, 0);
   }
 
   // PrintConv (`-j`) pass — the accessor + `sink(true)` source.
@@ -1319,7 +1287,7 @@ fn parse_id3_inner<'a>(
   }
 
   if !found {
-    return Ok((None, hdr_end));
+    return (None, hdr_end);
   }
   // Raw (`-n`) pass — the `sink(false)` source. Same input, same engine,
   // PrintConv disabled (ID3v1 Genre %genre ID3.pm:371-375; TLEN
@@ -1352,7 +1320,7 @@ fn parse_id3_inner<'a>(
   }
   let warnings: Vec<SmolStr> = staging.warnings_slice().iter().map(SmolStr::new).collect();
   let errors: Vec<SmolStr> = staging.errors_slice().iter().map(SmolStr::new).collect();
-  Ok((
+  (
     Some(Id3Meta {
       v2_version,
       id3v1,
@@ -1364,7 +1332,7 @@ fn parse_id3_inner<'a>(
       _phantom: core::marker::PhantomData,
     }),
     hdr_end,
-  ))
+  )
 }
 
 /// Lift a single ID3v1-group tag into the typed [`Id3v1Meta`] subframe.
@@ -1890,17 +1858,14 @@ fn reverse_unsync_inplace(v: &[u8]) -> Vec<u8> {
 /// Genre `"Hip-Hop"`); `print_conv = false` stages in `-n` post-ValueConv
 /// raw mode (e.g. Genre `7`). The returned Meta must be sinked in the same
 /// mode (see `serialize_tags` for [`Id3Meta`]; Codex BF2).
-///
-/// # Errors
-///
-/// Returns `Err` for Rust-level fatal modes (none today; reserved for
-/// future I/O wrappers).
+#[must_use]
 pub fn parse_id3_borrowed<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
-) -> Result<Option<Id3Meta<'a>>, Id3Error> {
-  parse_id3_inner(data, shared, print_conv).map(|(meta, _hdr_end)| meta)
+) -> Option<Id3Meta<'a>> {
+  let (meta, _hdr_end) = parse_id3_inner(data, shared, print_conv);
+  meta
 }
 
 /// As [`parse_id3_borrowed`], but ALSO returns the bundled `$hdrEnd`
@@ -1912,15 +1877,12 @@ pub fn parse_id3_borrowed<'a>(
 /// 0). The `DoneID3` "ran" marker + trailer size are recorded on `shared`
 /// exactly as [`parse_id3_borrowed`] does (so APE.pm:169's footer shift sees
 /// the v1-trailer size).
-///
-/// # Errors
-///
-/// Returns `Err` for Rust-level fatal modes (none today).
+#[must_use]
 pub(crate) fn parse_id3_with_hdr_end<'a>(
   data: &'a [u8],
   shared: Option<&mut SharedFlags>,
   print_conv: bool,
-) -> Result<(Option<Id3Meta<'a>>, usize), Id3Error> {
+) -> (Option<Id3Meta<'a>>, usize) {
   parse_id3_inner(data, shared, print_conv)
 }
 
@@ -2044,7 +2006,6 @@ mod tests {
     .expect("read MP3.mp3 fixture");
     let mut shared = SharedFlags::new();
     let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
       .expect("MPEG-only MP3 must be Some(Mp3Meta), not None (Codex BF1/CF1)");
     assert!(meta.found());
     assert!(meta.id3().is_none(), "MP3.mp3 has no ID3");
@@ -2072,7 +2033,6 @@ mod tests {
     )
     .expect("read MP3.mp3 fixture");
     let meta = crate::parse_mp3(&bytes, Some("MP3"))
-      .expect("ok")
       .expect("public parse_mp3 must be Some for MPEG-only MP3");
     assert!(meta.mpeg().is_some());
   }
@@ -2086,9 +2046,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
     )
     .expect("read MP3.mp3 fixture");
-    let meta = crate::parse_bytes(&bytes)
-      .expect("ok")
-      .expect("parse_bytes must accept MPEG-only MP3");
+    let meta = crate::parse_bytes(&bytes).expect("parse_bytes must accept MPEG-only MP3");
     match meta {
       crate::AnyMeta::Mp3(m) => {
         assert!(
@@ -2112,9 +2070,7 @@ mod tests {
     )
     .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
     let mut shared = SharedFlags::new();
-    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared).expect("found");
     let id3 = meta.id3().expect("ID3 sub-Meta present");
     assert_eq!(id3.title(), Some("Test"));
     assert!(
@@ -2146,9 +2102,7 @@ mod tests {
         .join("tests/fixtures/ID3v2_with_mpeg_audio.mp3"),
     )
     .expect("read ID3v2_with_mpeg_audio.mp3 fixture");
-    let meta = crate::parse_bytes(&bytes)
-      .expect("ok")
-      .expect("parse_bytes must accept ID3v2+MPEG MP3");
+    let meta = crate::parse_bytes(&bytes).expect("parse_bytes must accept ID3v2+MPEG MP3");
     match meta {
       crate::AnyMeta::Mp3(m) => {
         assert_eq!(
@@ -2183,7 +2137,6 @@ mod tests {
     // Simulate a prior parser having already processed ID3 (ID3.pm:1436).
     shared.set_done_id3(0);
     let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
       .expect("MPEG sync alone still accepts the file");
     assert!(
       meta.id3().is_none(),
@@ -2216,7 +2169,6 @@ mod tests {
     // both `DoneID3` and the carried `id3_hdr_end` (the post-ID3v2 offset).
     let mut shared = SharedFlags::new();
     let id3 = parse_id3_borrowed(&bytes, Some(&mut shared), /* print_conv */ true)
-      .expect("ok")
       .expect("large-ID3 artwork file has an ID3v2 directory");
     assert!(id3.v2_version().is_some(), "ID3v2 directory parsed");
     assert!(shared.done_id3().is_some(), "DoneID3 set by typed ID3 pass");
@@ -2232,7 +2184,6 @@ mod tests {
     // bundled recursion-after-Seek path). It must scan from the carried
     // hdr_end and STILL emit MPEG tags.
     let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
       .expect("MPEG frame after the large ID3v2 body still accepts the file");
     assert!(
       meta.id3().is_none(),
@@ -2261,7 +2212,6 @@ mod tests {
     shared.set_done_id3(0); // injected; no typed ID3 pass ran.
     assert_eq!(shared.id3_hdr_end(), None, "no carried hdr_end");
     let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
       .expect("MPEG sync within first 8192 bytes still accepts via offset-0 fallback");
     assert!(
       meta.mpeg().is_some(),
@@ -2283,9 +2233,8 @@ mod tests {
     .expect("read MP3.mp3 fixture");
     let mut shared = SharedFlags::new();
     assert_eq!(shared.done_id3(), None, "precondition: DoneID3 unset");
-    let meta = parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared)
-      .expect("ok")
-      .expect("MPEG-only MP3 accepted");
+    let meta =
+      parse_mp3_borrowed(&bytes, Some("MP3"), &mut shared).expect("MPEG-only MP3 accepted");
     assert!(meta.id3().is_none(), "MP3.mp3 has no ID3");
     assert_eq!(
       shared.done_id3(),
@@ -2540,9 +2489,7 @@ mod tests {
   fn parse_id3_borrowed_returns_some_for_id3v1_trailer() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_id3_borrowed(&data, None, true).expect("found");
     assert_eq!(meta.id3_size(), 128);
     assert_eq!(meta.title(), Some("Hello"));
     assert_eq!(meta.artist(), Some("Phil"));
@@ -2556,9 +2503,7 @@ mod tests {
   fn parse_id3_borrowed_id3v1_subframe_populated() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_id3_borrowed(&data, None, true).expect("found");
     let v1 = meta.id3v1().expect("v1 present");
     assert_eq!(v1.title(), Some("Hello"));
     assert_eq!(v1.artist(), Some("Phil"));
@@ -2571,7 +2516,7 @@ mod tests {
   #[test]
   fn parse_id3_borrowed_returns_none_when_no_id3() {
     let data = vec![0u8; 64];
-    assert!(parse_id3_borrowed(&data, None, true).expect("ok").is_none());
+    assert!(parse_id3_borrowed(&data, None, true).is_none());
   }
 
   #[test]
@@ -2595,9 +2540,7 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&(title_frame.len() as u32).to_be_bytes());
     data.extend_from_slice(&title_frame);
-    let meta = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_id3_borrowed(&data, None, true).expect("found");
     assert_eq!(meta.v2_version(), Some(Id3v2Version::V2_2));
     assert_eq!(meta.title(), Some("Hello"));
     // The ID3v2.2 frame iterator should contain Title.
@@ -2627,7 +2570,7 @@ mod tests {
     let mut shared = SharedFlags::new();
     // A prior parser already ran ID3 and consumed a 128-byte v1 trailer.
     shared.set_done_id3(128);
-    let meta = parse_id3_borrowed(&data, Some(&mut shared), true).expect("ok");
+    let meta = parse_id3_borrowed(&data, Some(&mut shared), true);
     assert!(
       meta.is_none(),
       "guard returns Ok(None) without re-running (ID3.pm:1435)"
@@ -2654,7 +2597,7 @@ mod tests {
     .expect("read MP3.mp3 fixture");
     let mut shared = SharedFlags::new();
     assert_eq!(shared.done_id3(), None, "precondition: DoneID3 unset");
-    let meta = parse_id3_borrowed(&bytes, Some(&mut shared), true).expect("ok");
+    let meta = parse_id3_borrowed(&bytes, Some(&mut shared), true);
     assert!(meta.is_none(), "MP3.mp3 has no ID3 directory");
     assert_eq!(
       shared.done_id3(),
@@ -2669,9 +2612,7 @@ mod tests {
     data.extend_from_slice(&build_id3v1_block());
     let mut shared = SharedFlags::new();
     let ctx = Id3Context::new(&data, &mut shared);
-    let meta = <ProcessId3 as FormatParser>::parse(&ProcessId3, ctx)
-      .expect("ok")
-      .expect("found");
+    let meta = <ProcessId3 as FormatParser>::parse(&ProcessId3, ctx).expect("found");
     assert_eq!(meta.title(), Some("Hello"));
     assert_eq!(meta.id3_size(), 128);
   }
@@ -2683,9 +2624,7 @@ mod tests {
     data.extend_from_slice(&build_id3v1_block());
     let mut shared = SharedFlags::new();
     let ctx = Mp3Context::new(&data, &mut shared, Some("MP3"));
-    let meta = <ProcessMp3 as FormatParser>::parse(&ProcessMp3, ctx)
-      .expect("ok")
-      .expect("found");
+    let meta = <ProcessMp3 as FormatParser>::parse(&ProcessMp3, ctx).expect("found");
     let id3 = meta.id3().expect("id3 sub-meta present");
     assert_eq!(id3.title(), Some("Hello"));
     assert!(meta.found());
@@ -2695,9 +2634,7 @@ mod tests {
   fn id3_meta_sinker_replays_into_writer() {
     let mut data: Vec<u8> = vec![0; 256];
     data.extend_from_slice(&build_id3v1_block());
-    let meta = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_id3_borrowed(&data, None, true).expect("found");
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
     assert_eq!(w.get_str("ID3v1", "Title"), Some("Hello".into()));
@@ -2722,18 +2659,14 @@ mod tests {
     data.extend_from_slice(&build_id3v1_block()); // genre byte = 7 (Hip-Hop)
 
     // -j mode: parse + sink in PrintConv mode → "Hip-Hop".
-    let meta_j = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta_j = parse_id3_borrowed(&data, None, true).expect("found");
     let mut wj = crate::tagmap::TagMap::new();
     crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
     assert_eq!(wj.get_str("ID3v1", "Genre"), Some("Hip-Hop".into()));
 
     // -n mode: parse + sink in raw mode → "7" (the raw genre byte),
     // matching bundled `exiftool -j -n`.
-    let meta_n = parse_id3_borrowed(&data, None, false)
-      .expect("ok")
-      .expect("found");
+    let meta_n = parse_id3_borrowed(&data, None, false).expect("found");
     let mut wn = crate::tagmap::TagMap::new();
     crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
     assert_eq!(
@@ -2769,17 +2702,13 @@ mod tests {
     data.extend_from_slice(&frame);
 
     // -j: "7 s" (PrintConv).
-    let meta_j = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta_j = parse_id3_borrowed(&data, None, true).expect("found");
     let mut wj = crate::tagmap::TagMap::new();
     crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
     assert_eq!(wj.get_str("ID3v2_3", "Length"), Some("7 s".into()));
 
     // -n: 7 (raw ValueConv seconds), matching bundled `exiftool -j -n`.
-    let meta_n = parse_id3_borrowed(&data, None, false)
-      .expect("ok")
-      .expect("found");
+    let meta_n = parse_id3_borrowed(&data, None, false).expect("found");
     let mut wn = crate::tagmap::TagMap::new();
     crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
     assert_eq!(
@@ -2823,9 +2752,7 @@ mod tests {
     // ONE parse via the typed `FormatParser` entry (stages BOTH lists).
     let mut shared = SharedFlags::new();
     let ctx = Id3Context::new(&data, &mut shared);
-    let meta = <ProcessId3 as FormatParser>::parse(&ProcessId3, ctx)
-      .expect("ok")
-      .expect("ID3 found");
+    let meta = <ProcessId3 as FormatParser>::parse(&ProcessId3, ctx).expect("ID3 found");
 
     // sink(true) — PrintConv `-j`.
     let mut wj = crate::tagmap::TagMap::new();
@@ -2882,9 +2809,7 @@ mod tests {
     data.push(0x00);
     data.extend_from_slice(&size.to_be_bytes());
     data.extend_from_slice(&body);
-    let meta = parse_id3_borrowed(&data, None, true)
-      .expect("ok")
-      .expect("found");
+    let meta = parse_id3_borrowed(&data, None, true).expect("found");
     let pic = meta.picture().expect("picture present");
     assert_eq!(pic.mime(), "image/jpeg");
     assert_eq!(pic.picture_type(), 3);
@@ -2950,7 +2875,7 @@ mod tests {
   fn emit_entries<T: crate::emit::Taggable>(
     meta: &T,
     mode: crate::emit::ConvMode,
-  ) -> Vec<(SmolStr, TagValue)> {
+  ) -> Vec<(SmolStr, SmolStr, TagValue)> {
     let mut tm = crate::tagmap::TagMap::new();
     crate::emit::run_emission(meta, mode, &mut tm);
     tm.entries().to_vec()
@@ -2966,7 +2891,7 @@ mod tests {
   #[test]
   fn id3v1_taggable_matches_reference_emission() {
     // Faithful transcription of `crate::formats::real::emit_id3v1`.
-    fn reference(id3: &Id3v1Meta<'_>, print_conv: bool) -> Vec<(SmolStr, TagValue)> {
+    fn reference(id3: &Id3v1Meta<'_>, print_conv: bool) -> Vec<(SmolStr, SmolStr, TagValue)> {
       let mut out = crate::tagmap::TagMap::new();
       let group = "ID3v1";
       if let Some(s) = id3.title() {

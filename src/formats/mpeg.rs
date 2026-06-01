@@ -1711,9 +1711,8 @@ impl FormatParser for ProcessMpegAudio {
   /// AF2).
   type Meta<'a> = AudioMeta<'a>;
   type Context<'a> = AudioContext<'a>;
-  type Error = AudioError;
 
-  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Result<Option<Self::Meta<'a>>, AudioError> {
+  fn parse<'a>(&self, ctx: Self::Context<'a>) -> Option<Self::Meta<'a>> {
     parse_inner(ctx.data, ctx.mp3, ctx.ext)
   }
 }
@@ -1725,11 +1724,7 @@ impl FormatParser for ProcessMpegAudio {
 ///
 /// Returns `Err` for Rust-level fatal modes (none today; reserved for
 /// future I/O wrappers).
-pub fn parse_borrowed<'a>(
-  data: &'a [u8],
-  mp3: bool,
-  ext: &str,
-) -> Result<Option<AudioMeta<'a>>, AudioError> {
+pub fn parse_borrowed<'a>(data: &'a [u8], mp3: bool, ext: &str) -> Option<AudioMeta<'a>> {
   parse_inner(data, mp3, ext)
 }
 
@@ -1737,16 +1732,12 @@ pub fn parse_borrowed<'a>(
 /// `encoder` field borrows from `data`). The [`FormatParser::Meta`] GAT
 /// (`type Meta<'a> = AudioMeta<'a>`) returns this borrowed form
 /// directly into the closed [`crate::format_parser::AnyMeta`] enum (Codex AF2).
-fn parse_inner<'a>(
-  data: &'a [u8],
-  mp3: bool,
-  ext: &str,
-) -> Result<Option<AudioMeta<'a>>, AudioError> {
+fn parse_inner<'a>(data: &'a [u8], mp3: bool, ext: &str) -> Option<AudioMeta<'a>> {
   // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Returns `None` ⇒ Ok(None)
   // (Perl `return 0` BEFORE `$et->SetFileType()` at MPEG.pm:496).
   let (word, pos_after_header) = match scan_for_header(data, mp3, ext) {
     Some(pair) => pair,
-    None => return Ok(None),
+    None => return None,
   };
   // MPEG.pm:498-499 — `ProcessFrameHeader($et, $tagTablePtr, $word)`. The
   // validated header word is bit-extracted into typed fields.
@@ -1755,14 +1746,14 @@ fn parse_inner<'a>(
     // Defensive: `extract_header_fields` returns None only when the
     // version/layer raw values are reserved. `check_header` already
     // rejected those; treat as unreachable but defensive.
-    None => return Ok(None),
+    None => return None,
   };
   // MPEG.pm:501-578 — Xing/Info VBR + LAME tail. Reads relative to
   // `pos_after_header`. The tail's `last` exits leave whatever was already
   // emitted in `meta` in place; the call always returns to the caller
   // (no fatal modes).
   parse_xing_lame_into(data, pos_after_header, &mut meta);
-  Ok(Some(meta))
+  Some(meta)
 }
 
 // ===========================================================================
@@ -2035,22 +2026,6 @@ impl crate::metadata::Project for AudioMeta<'_> {
 }
 
 // ===========================================================================
-// `AudioError` — Rust-level fatal modes (currently none)
-// ===========================================================================
-
-/// Rust-level fatal modes for MPEG audio parsing. Currently empty — every
-/// bad input produces `Ok(None)` (Perl `return 0`). Reserved for future
-/// I/O wrappers if streaming readers are added.
-///
-/// §5: `Display` + `core::error::Error` are derived via `thiserror` (v2,
-/// `default-features = false`), so the trait is implemented in every feature
-/// tier. `#[non_exhaustive]` lets variants land later without a breaking
-/// change.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AudioError {}
-
-// ===========================================================================
 // `ProcessMp3` — raw MPEG-audio entry preserving R5 fix API
 // ===========================================================================
 
@@ -2188,9 +2163,7 @@ mod tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/MP3.mp3"),
     )
     .expect("read MP3.mp3 fixture");
-    let meta = parse_borrowed(&bytes, true, "MP3")
-      .expect("ok")
-      .expect("parsed");
+    let meta = parse_borrowed(&bytes, true, "MP3").expect("parsed");
     assert_eq!(meta.mpeg_audio_version(), AudioVersion::V1);
     assert_eq!(meta.audio_layer(), AudioLayer::L3);
     assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
@@ -2201,18 +2174,14 @@ mod tests {
 
   #[test]
   fn parse_borrowed_rejects_short_buffer() {
-    assert!(parse_borrowed(&[], true, "MP3").unwrap().is_none());
-    assert!(
-      parse_borrowed(&[0xff, 0xfb], true, "MP3")
-        .unwrap()
-        .is_none()
-    );
+    assert!(parse_borrowed(&[], true, "MP3").is_none());
+    assert!(parse_borrowed(&[0xff, 0xfb], true, "MP3").is_none());
   }
 
   #[test]
   fn parse_borrowed_rejects_bad_sync() {
     let data = [0x00; 32];
-    assert!(parse_borrowed(&data, true, "MP3").unwrap().is_none());
+    assert!(parse_borrowed(&data, true, "MP3").is_none());
   }
 
   // ───────────────────────── ConvertBitrate ─────────────────────────
@@ -2253,9 +2222,7 @@ mod tests {
 
   fn collect(buf: &[u8], print_conv: bool) -> TagMap {
     let mut w = TagMap::new();
-    let meta = parse_borrowed(buf, true, "MP3")
-      .expect("ok")
-      .expect("parsed");
+    let meta = parse_borrowed(buf, true, "MP3").expect("parsed");
     crate::emit::run_emission(
       &meta,
       crate::emit::ConvMode::from_print_conv(print_conv),
@@ -2590,9 +2557,7 @@ mod tests {
     .expect("read MP3.mp3 fixture");
     let mut shared = SharedFlags::new();
     let ctx = AudioContext::new(&bytes, "MP3", true, &mut shared);
-    let meta = <ProcessMpegAudio as FormatParser>::parse(&ProcessMpegAudio, ctx)
-      .expect("ok")
-      .expect("parsed");
+    let meta = <ProcessMpegAudio as FormatParser>::parse(&ProcessMpegAudio, ctx).expect("parsed");
     assert_eq!(meta.mpeg_audio_version(), AudioVersion::V1);
     assert_eq!(meta.audio_layer(), AudioLayer::L3);
     assert_eq!(meta.audio_bitrate(), AudioBitrate::Known(128_000));
