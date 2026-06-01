@@ -76,6 +76,41 @@ fn crw_conformance() {
   // the conformance fixture would emit a `Composite:ShutterSpeed`.
   check("CanonRaw_min.crw", "CanonRaw_min.crw.json", true);
   check("CanonRaw_min.crw", "CanonRaw_min.crw.n.json", false);
+
+  // EXTENDED coverage — the rest of the `CanonRaw::Main` scalar table plus a
+  // Canon sub-table, in two CRAFTED Composite-free CIFF heaps (each verified
+  // with `perl exiftool -G1 -j` to carry ONLY File:/CanonRaw:/Canon: keys):
+  //
+  // `CanonRaw_records.crw` exercises the NEWLY-PORTED scalar + structural
+  // records — `TargetImageType`/`RecordID`/`FileNumber` (the `116-1602` dash
+  // PrintConv)/`UserComment` (the `0x0805` non-`ImageDescription` arm)/
+  // `CanonFileDescription` (the `0x0805` `ImageDescription` arm)/`MeasuredEV`
+  // (`$val+5`)/`SerialNumber` (`%.10d` EOS PrintConv)/`ColorTemperature`/
+  // `ColorSpace` (PrintConv) — plus the structural sub-tables `TimeStamp`
+  // (DateTimeOriginal via `ConvertUnixTime`)/`DecoderTable`/`RawJpgInfo`
+  // (PrintConv), and a `Canon::SensorInfo` sub-table (the sensor + black-mask
+  // border coordinates). It DELIBERATELY omits `ImageInfo` (whose
+  // ImageWidth/Height would synthesize `Composite:ImageSize`/`Megapixels`) and
+  // `CameraSettings` (lens/shoot Composites).
+  check("CanonRaw_records.crw", "CanonRaw_records.crw.json", true);
+  check("CanonRaw_records.crw", "CanonRaw_records.crw.n.json", false);
+
+  // `CanonRaw_colorbalance.crw` exercises the `Canon::ColorBalance` sub-table
+  // (the `WB_RGGBLevels{Auto,Daylight,Shade,Cloudy,Tungsten,Fluorescent,Flash,
+  // Custom,Kelvin}` + `WB_RGGBBlackLevels` int16s[4] quads, rendered
+  // space-joined). ColorBalance alone does NOT trigger the WB Composites
+  // (those need `WB_RGGBLevelsAsShot`/`Measured` from the deferred ColorData),
+  // so the bundled `-G1 -j`/`-n` goldens carry only File:/CanonRaw:/Canon:.
+  check(
+    "CanonRaw_colorbalance.crw",
+    "CanonRaw_colorbalance.crw.json",
+    true,
+  );
+  check(
+    "CanonRaw_colorbalance.crw",
+    "CanonRaw_colorbalance.crw.n.json",
+    false,
+  );
 }
 
 #[test]

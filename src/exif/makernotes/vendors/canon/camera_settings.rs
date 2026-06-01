@@ -508,6 +508,20 @@ fn apply_print_conv(
       // `ValueConv => '$val / 10'` (`Canon.pm:2619`). No PrintConv.
       return TagValue::F64(val as f64 / 10.0);
     }
+    CsPrintConv::CanonApex => {
+      // `MaxAperture`/`MinAperture` (`Canon.pm:2539-2553`) BOTH have a
+      // `ValueConv => 'exp(CanonEv($val)*log(2)/2)'` and a `PrintConv =>
+      // 'sprintf("%.2g",$val)'`. So `-n` (ValueConv) emits the converted
+      // FLOAT (e.g. 3.5636), and `-j` (PrintConv) the `%.2g` of that float
+      // (3.6) — NOT the raw int. This must be computed BEFORE the
+      // `!print_conv` early-return below.
+      let f_val = canon_ev_to_aperture(val);
+      return if print_conv {
+        TagValue::Str(format_g_two(f_val).into())
+      } else {
+        TagValue::F64(f_val)
+      };
+    }
     _ => {}
   }
   if !print_conv {
@@ -817,15 +831,9 @@ fn apply_print_conv(
       TagValue::Str(s.into())
     }
     CsPrintConv::FocalUnitsMm => TagValue::Str(SmolStr::from(std::format!("{val}/mm"))),
-    CsPrintConv::CanonApex => {
-      // `exp(CanonEv($val)*log(2)/2)` then `sprintf("%.2g", $val)`.
-      // CanonEv: a piecewise APEX-to-float mapping (Canon.pm:9943-9962
-      // `sub CanonEv`). For typical aperture values (0-50) the mapping
-      // is a simple `val/32` ⇒ APEX value, then `2 ** (APEX/2)`.
-      let f_val = canon_ev_to_aperture(val);
-      let s = format_g_two(f_val);
-      TagValue::Str(s.into())
-    }
+    // `CsPrintConv::CanonApex` is handled in the ValueConv-aware block above
+    // (it has a ValueConv that applies in BOTH `-j` and `-n`), so it cannot
+    // reach this PrintConv-only match — fall through to the catch-all.
     CsPrintConv::FocusContinuous => label_or_default(match val {
       0 => Some("Single"),
       1 => Some("Continuous"),
@@ -915,9 +923,12 @@ fn apply_print_conv(
       }
       TagValue::Str(SmolStr::from(out))
     }
-    // CameraIso + DisplayAperture are ValueConv-only and handled in the
-    // pre-`print_conv` match at the top of this fn (they return early).
-    CsPrintConv::CameraIso | CsPrintConv::DisplayAperture => unreachable!(),
+    // CameraIso + DisplayAperture + CanonApex have a ValueConv and are
+    // handled in the pre-`print_conv` match at the top of this fn (they
+    // return early in BOTH modes).
+    CsPrintConv::CameraIso | CsPrintConv::DisplayAperture | CsPrintConv::CanonApex => {
+      unreachable!()
+    }
     CsPrintConv::FocusBracketing => label_or_default(match val {
       0 => Some("Disable"),
       1 => Some("Enable"),

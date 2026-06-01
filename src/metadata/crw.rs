@@ -52,6 +52,12 @@ pub enum CrwSubTable {
   AfInfo,
   /// `0x1093` `CanonFileInfo` → `Canon::FileInfo` (`CanonRaw.pm:294`).
   FileInfo,
+  /// `0x1031` `SensorInfo` → `Canon::SensorInfo` (`CanonRaw.pm:149-153`).
+  /// Sensor + black-mask border coordinates.
+  SensorInfo,
+  /// `0x10a9` `ColorBalance` → `Canon::ColorBalance` (`CanonRaw.pm:203-207`).
+  /// The `WB_RGGBLevels{Auto,Daylight,…}` quads.
+  ColorBalance,
 }
 
 impl CrwSubTable {
@@ -65,6 +71,8 @@ impl CrwSubTable {
       Self::CameraSettings => "Canon::CameraSettings",
       Self::AfInfo => "Canon::AFInfo",
       Self::FileInfo => "Canon::FileInfo",
+      Self::SensorInfo => "Canon::SensorInfo",
+      Self::ColorBalance => "Canon::ColorBalance",
     }
   }
 }
@@ -107,6 +115,302 @@ impl CrwSubTableBlock {
   #[inline]
   pub fn bytes(&self) -> &[u8] {
     &self.bytes
+  }
+}
+
+// ===========================================================================
+// Structural CanonRaw sub-table records (the SubDirectory-record tables)
+// ===========================================================================
+
+/// `%Image::ExifTool::CanonRaw::TimeStamp` (`CanonRaw.pm:427-454`). FORMAT
+/// `int32u`, FIRST_ENTRY 0, `GROUPS => { 0 => 'MakerNotes', 2 => 'Time' }`.
+/// Reached via the `0x180e TimeStamp` SubDirectory record (`CanonRaw.pm:
+/// 271-277`).
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrwTimeStamp {
+  /// Position 0 `DateTimeOriginal` (`CanonRaw.pm:435-443`) — `int32u` Unix
+  /// time, `ValueConv => 'ConvertUnixTime($val)'` (the rendered
+  /// `"YYYY:MM:DD HH:MM:SS"` GMT string; the `ConvertDateTime` PrintConv is a
+  /// no-op without a custom date format, so `-j` and `-n` agree).
+  date_time_original: Option<SmolStr>,
+  /// Position 1 `TimeZoneCode` (`CanonRaw.pm:444-449`) — `int32s`,
+  /// `ValueConv => '$val / 3600'`.
+  time_zone_code: Option<i32>,
+  /// Position 2 `TimeZoneInfo` (`CanonRaw.pm:450-453`) — `int32u` (raw; set
+  /// to `0x80000000` when `TimeZoneCode` is valid).
+  time_zone_info: Option<u32>,
+}
+
+impl CrwTimeStamp {
+  /// `DateTimeOriginal` as the rendered `ConvertUnixTime` string.
+  #[must_use]
+  #[inline]
+  pub fn date_time_original(&self) -> Option<&str> {
+    self.date_time_original.as_deref()
+  }
+
+  /// `TimeZoneCode` (hours, after the `$val / 3600` ValueConv).
+  #[must_use]
+  #[inline]
+  pub const fn time_zone_code(&self) -> Option<i32> {
+    self.time_zone_code
+  }
+
+  /// `TimeZoneInfo` (raw int32u).
+  #[must_use]
+  #[inline]
+  pub const fn time_zone_info(&self) -> Option<u32> {
+    self.time_zone_info
+  }
+
+  /// Crate-private setter for `DateTimeOriginal`.
+  pub(crate) fn set_date_time_original(&mut self, v: SmolStr) {
+    self.date_time_original = Some(v);
+  }
+
+  /// Crate-private setter for `TimeZoneCode`.
+  pub(crate) fn set_time_zone_code(&mut self, v: i32) {
+    self.time_zone_code = Some(v);
+  }
+
+  /// Crate-private setter for `TimeZoneInfo`.
+  pub(crate) fn set_time_zone_info(&mut self, v: u32) {
+    self.time_zone_info = Some(v);
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    self.date_time_original.is_none()
+      && self.time_zone_code.is_none()
+      && self.time_zone_info.is_none()
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::ImageInfo` (`CanonRaw.pm:547-570`). FORMAT
+/// `int32u`, FIRST_ENTRY 0, `GROUPS => { 0 => 'MakerNotes', 2 => 'Image' }`.
+/// Reached via the `0x1810 ImageInfo` SubDirectory record (`CanonRaw.pm:
+/// 278-284`).
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CrwImageInfo {
+  /// Position 0 `ImageWidth` (`CanonRaw.pm:556`) — `int32u`.
+  image_width: Option<u32>,
+  /// Position 1 `ImageHeight` (`CanonRaw.pm:557`) — `int32u`.
+  image_height: Option<u32>,
+  /// Position 2 `PixelAspectRatio` (`CanonRaw.pm:558-561`) — `float`.
+  pixel_aspect_ratio: Option<f64>,
+  /// Position 3 `Rotation` (`CanonRaw.pm:562-566`) — `int32s`.
+  rotation: Option<i32>,
+  /// Position 4 `ComponentBitDepth` (`CanonRaw.pm:567`) — `int32u`.
+  component_bit_depth: Option<u32>,
+  /// Position 5 `ColorBitDepth` (`CanonRaw.pm:568`) — `int32u`.
+  color_bit_depth: Option<u32>,
+  /// Position 6 `ColorBW` (`CanonRaw.pm:569`) — `int32u`.
+  color_bw: Option<u32>,
+}
+
+impl CrwImageInfo {
+  /// `ImageWidth`.
+  #[must_use]
+  #[inline]
+  pub const fn image_width(&self) -> Option<u32> {
+    self.image_width
+  }
+  /// `ImageHeight`.
+  #[must_use]
+  #[inline]
+  pub const fn image_height(&self) -> Option<u32> {
+    self.image_height
+  }
+  /// `PixelAspectRatio` (float).
+  #[must_use]
+  #[inline]
+  pub const fn pixel_aspect_ratio(&self) -> Option<f64> {
+    self.pixel_aspect_ratio
+  }
+  /// `Rotation` (int32s).
+  #[must_use]
+  #[inline]
+  pub const fn rotation(&self) -> Option<i32> {
+    self.rotation
+  }
+  /// `ComponentBitDepth`.
+  #[must_use]
+  #[inline]
+  pub const fn component_bit_depth(&self) -> Option<u32> {
+    self.component_bit_depth
+  }
+  /// `ColorBitDepth`.
+  #[must_use]
+  #[inline]
+  pub const fn color_bit_depth(&self) -> Option<u32> {
+    self.color_bit_depth
+  }
+  /// `ColorBW`.
+  #[must_use]
+  #[inline]
+  pub const fn color_bw(&self) -> Option<u32> {
+    self.color_bw
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_image_width(&mut self, v: u32) {
+    self.image_width = Some(v);
+  }
+  pub(crate) fn set_image_height(&mut self, v: u32) {
+    self.image_height = Some(v);
+  }
+  pub(crate) fn set_pixel_aspect_ratio(&mut self, v: f64) {
+    self.pixel_aspect_ratio = Some(v);
+  }
+  pub(crate) fn set_rotation(&mut self, v: i32) {
+    self.rotation = Some(v);
+  }
+  pub(crate) fn set_component_bit_depth(&mut self, v: u32) {
+    self.component_bit_depth = Some(v);
+  }
+  pub(crate) fn set_color_bit_depth(&mut self, v: u32) {
+    self.color_bit_depth = Some(v);
+  }
+  pub(crate) fn set_color_bw(&mut self, v: u32) {
+    self.color_bw = Some(v);
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::DecoderTable` (`CanonRaw.pm:572-583`, ref 4).
+/// FORMAT `int32u`, FIRST_ENTRY 0, `GROUPS => { 0 => 'MakerNotes', 2 =>
+/// 'Camera' }`. Reached via the `0x1835 DecoderTable` SubDirectory record
+/// (`CanonRaw.pm:327-331`). Positions 0/2/3 are named; position 1 is unnamed.
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrwDecoderTable {
+  /// Position 0 `DecoderTableNumber` (`CanonRaw.pm:580`) — `int32u`.
+  decoder_table_number: Option<u32>,
+  /// Position 2 `CompressedDataOffset` (`CanonRaw.pm:581`) — `int32u`.
+  compressed_data_offset: Option<u32>,
+  /// Position 3 `CompressedDataLength` (`CanonRaw.pm:582`) — `int32u`.
+  compressed_data_length: Option<u32>,
+}
+
+impl CrwDecoderTable {
+  /// `DecoderTableNumber`.
+  #[must_use]
+  #[inline]
+  pub const fn decoder_table_number(&self) -> Option<u32> {
+    self.decoder_table_number
+  }
+  /// `CompressedDataOffset`.
+  #[must_use]
+  #[inline]
+  pub const fn compressed_data_offset(&self) -> Option<u32> {
+    self.compressed_data_offset
+  }
+  /// `CompressedDataLength`.
+  #[must_use]
+  #[inline]
+  pub const fn compressed_data_length(&self) -> Option<u32> {
+    self.compressed_data_length
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_decoder_table_number(&mut self, v: u32) {
+    self.decoder_table_number = Some(v);
+  }
+  pub(crate) fn set_compressed_data_offset(&mut self, v: u32) {
+    self.compressed_data_offset = Some(v);
+  }
+  pub(crate) fn set_compressed_data_length(&mut self, v: u32) {
+    self.compressed_data_length = Some(v);
+  }
+}
+
+/// `%Image::ExifTool::CanonRaw::RawJpgInfo` (`CanonRaw.pm:480-508`). FORMAT
+/// `int16u`, FIRST_ENTRY 1, `GROUPS => { 0 => 'MakerNotes', 2 => 'Image' }`.
+/// Reached via the `0x10b5 RawJpgInfo` SubDirectory record (`CanonRaw.pm:
+/// 208-214`). Position 0 (`RawJpgInfoSize`) is commented out in bundled, so
+/// it is not emitted.
+///
+/// D8: no public fields; accessors only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrwRawJpgInfo {
+  /// Position 1 `RawJpgQuality` (`CanonRaw.pm:489-497`) — `int16u`, PrintConv
+  /// (`1 => Economy, 2 => Normal, 3 => Fine, 5 => Superfine`). Raw int kept;
+  /// the PrintConv is applied at emission.
+  raw_jpg_quality: Option<u16>,
+  /// Position 2 `RawJpgSize` (`CanonRaw.pm:498-505`) — `int16u`, PrintConv
+  /// (`0 => Large, 1 => Medium, 2 => Small`). Raw int kept.
+  raw_jpg_size: Option<u16>,
+  /// Position 3 `RawJpgWidth` (`CanonRaw.pm:506`) — `int16u`.
+  raw_jpg_width: Option<u16>,
+  /// Position 4 `RawJpgHeight` (`CanonRaw.pm:507`) — `int16u`.
+  raw_jpg_height: Option<u16>,
+}
+
+impl CrwRawJpgInfo {
+  /// `RawJpgQuality` (raw int; PrintConv applied at emission).
+  #[must_use]
+  #[inline]
+  pub const fn raw_jpg_quality(&self) -> Option<u16> {
+    self.raw_jpg_quality
+  }
+  /// `RawJpgSize` (raw int; PrintConv applied at emission).
+  #[must_use]
+  #[inline]
+  pub const fn raw_jpg_size(&self) -> Option<u16> {
+    self.raw_jpg_size
+  }
+  /// `RawJpgWidth`.
+  #[must_use]
+  #[inline]
+  pub const fn raw_jpg_width(&self) -> Option<u16> {
+    self.raw_jpg_width
+  }
+  /// `RawJpgHeight`.
+  #[must_use]
+  #[inline]
+  pub const fn raw_jpg_height(&self) -> Option<u16> {
+    self.raw_jpg_height
+  }
+
+  /// `true` when no position was decoded.
+  #[must_use]
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    *self == Self::default()
+  }
+
+  // ---- crate-private setters (used by the CIFF walker) ----
+  pub(crate) fn set_raw_jpg_quality(&mut self, v: u16) {
+    self.raw_jpg_quality = Some(v);
+  }
+  pub(crate) fn set_raw_jpg_size(&mut self, v: u16) {
+    self.raw_jpg_size = Some(v);
+  }
+  pub(crate) fn set_raw_jpg_width(&mut self, v: u16) {
+    self.raw_jpg_width = Some(v);
+  }
+  pub(crate) fn set_raw_jpg_height(&mut self, v: u16) {
+    self.raw_jpg_height = Some(v);
   }
 }
 
@@ -178,6 +482,49 @@ pub struct CrwMeta<'a> {
   /// `0x183b SerialNumberFormat` (`CanonRaw.pm:316`) — raw `int32u`; PrintHex
   /// PrintConv (`0x90000000` ⇒ `"Format 1"`, `0xa0000000` ⇒ `"Format 2"`).
   serial_number_format: Option<u32>,
+  /// `0x100a TargetImageType` (`CanonRaw.pm:86-93`) — `int16u`, PrintConv
+  /// (`0 => 'Real-world Subject', 1 => 'Written Document'`). Raw int kept.
+  target_image_type: Option<u16>,
+  /// `0x1804 RecordID` (`CanonRaw.pm:233`) — `int32u`, no PrintConv.
+  record_id: Option<u32>,
+  /// `0x1817 FileNumber` (`CanonRaw.pm:303-309`) — `int32u`,
+  /// `PrintConv => '$_=$val;s/(\d+)(\d{4})/$1-$2/;$_'` (`116-1602`). Raw kept.
+  file_number: Option<u32>,
+  /// `0x1814 MeasuredEV` (`CanonRaw.pm:292-302`) — `float`,
+  /// `ValueConv => '$val + 5'`. Stored POST-ValueConv (the `+ 5` value); no
+  /// PrintConv ⇒ `-j` and `-n` agree.
+  measured_ev: Option<f64>,
+  /// `0x180b SerialNumber` (`CanonRaw.pm:248-270`) — `int32u`, model-
+  /// conditional PrintConv. Raw `int32u` kept; the conv is applied at
+  /// emission keyed on `$$self{Model}` (`sprintf("%x-%.5d",…)` for an
+  /// `EOS D30`, else `sprintf("%.10d",$val)` for any `EOS`). For a non-EOS
+  /// PowerShot body bundled's third arm is `UnknownNumber` (`Unknown => 1`),
+  /// so this typed field is set ONLY for an EOS body.
+  serial_number: Option<u32>,
+  /// `0x0805 UserComment` (`CanonRaw.pm:65-69`) — `string[256]`. The second
+  /// arm of the `0x0805` conditional list (the `$$self{DIR_NAME} ne
+  /// "ImageDescription"` case).
+  user_comment: Option<SmolStr>,
+  /// `0x0805 CanonFileDescription` (`CanonRaw.pm:60-64`) — `string[32]`. The
+  /// first arm of the `0x0805` conditional list (`$$self{DIR_NAME} eq
+  /// "ImageDescription"`).
+  canon_file_description: Option<SmolStr>,
+  /// `0x10ae ColorTemperature` (`CanonRaw.pm:215-218`) — `int16u`, no
+  /// PrintConv.
+  color_temperature: Option<u16>,
+  /// `0x10b4 ColorSpace` (`CanonRaw.pm:219-227`) — `int16u`, PrintConv
+  /// (`1 => sRGB, 2 => Adobe RGB, 0xffff => Uncalibrated`). Raw int kept.
+  color_space: Option<u16>,
+  // ----- structural sub-table records (the SubDirectory-record tables) --
+  /// `0x180e TimeStamp` → [`CrwTimeStamp`] (`CanonRaw.pm:271-277`/`:427-454`).
+  time_stamp: Option<CrwTimeStamp>,
+  /// `0x1810 ImageInfo` → [`CrwImageInfo`] (`CanonRaw.pm:278-284`/`:547-570`).
+  image_info: Option<CrwImageInfo>,
+  /// `0x1835 DecoderTable` → [`CrwDecoderTable`] (`CanonRaw.pm:327-331`/
+  /// `:572-583`).
+  decoder_table: Option<CrwDecoderTable>,
+  /// `0x10b5 RawJpgInfo` → [`CrwRawJpgInfo`] (`CanonRaw.pm:208-214`/`:480-508`).
+  raw_jpg_info: Option<CrwRawJpgInfo>,
   // ----- Canon::* MakerNote sub-table records ---------------------------
   /// Records dispatched to ported `Canon::*` MakerNote sub-tables, in walk
   /// order ([`CrwSubTableBlock`]). Re-decoded per [`ConvMode`] at emission.
@@ -214,6 +561,19 @@ impl CrwMeta<'_> {
       base_iso: None,
       model_id: None,
       serial_number_format: None,
+      target_image_type: None,
+      record_id: None,
+      file_number: None,
+      measured_ev: None,
+      serial_number: None,
+      user_comment: None,
+      canon_file_description: None,
+      color_temperature: None,
+      color_space: None,
+      time_stamp: None,
+      image_info: None,
+      decoder_table: None,
+      raw_jpg_info: None,
       sub_table_blocks: Vec::new(),
       binary_records: Vec::new(),
       _lifetime: core::marker::PhantomData,
@@ -330,6 +690,99 @@ impl CrwMeta<'_> {
     self.serial_number_format
   }
 
+  /// `0x100a TargetImageType` (`CanonRaw.pm:86-93`) — raw `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn target_image_type(&self) -> Option<u16> {
+    self.target_image_type
+  }
+
+  /// `0x1804 RecordID` (`CanonRaw.pm:233`) — `int32u`.
+  #[must_use]
+  #[inline]
+  pub const fn record_id(&self) -> Option<u32> {
+    self.record_id
+  }
+
+  /// `0x1817 FileNumber` (`CanonRaw.pm:303-309`) — raw `int32u`.
+  #[must_use]
+  #[inline]
+  pub const fn file_number(&self) -> Option<u32> {
+    self.file_number
+  }
+
+  /// `0x1814 MeasuredEV` (`CanonRaw.pm:292-302`) — `float`, post-ValueConv
+  /// (the `$val + 5` value).
+  #[must_use]
+  #[inline]
+  pub const fn measured_ev(&self) -> Option<f64> {
+    self.measured_ev
+  }
+
+  /// `0x180b SerialNumber` (`CanonRaw.pm:248-270`) — raw `int32u` (EOS body
+  /// only).
+  #[must_use]
+  #[inline]
+  pub const fn serial_number(&self) -> Option<u32> {
+    self.serial_number
+  }
+
+  /// `0x0805 UserComment` (`CanonRaw.pm:65-69`).
+  #[must_use]
+  #[inline]
+  pub fn user_comment(&self) -> Option<&str> {
+    self.user_comment.as_deref()
+  }
+
+  /// `0x0805 CanonFileDescription` (`CanonRaw.pm:60-64`).
+  #[must_use]
+  #[inline]
+  pub fn canon_file_description(&self) -> Option<&str> {
+    self.canon_file_description.as_deref()
+  }
+
+  /// `0x10ae ColorTemperature` (`CanonRaw.pm:215-218`) — `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn color_temperature(&self) -> Option<u16> {
+    self.color_temperature
+  }
+
+  /// `0x10b4 ColorSpace` (`CanonRaw.pm:219-227`) — raw `int16u`.
+  #[must_use]
+  #[inline]
+  pub const fn color_space(&self) -> Option<u16> {
+    self.color_space
+  }
+
+  /// `0x180e TimeStamp` sub-table ([`CrwTimeStamp`]).
+  #[must_use]
+  #[inline]
+  pub const fn time_stamp(&self) -> Option<&CrwTimeStamp> {
+    self.time_stamp.as_ref()
+  }
+
+  /// `0x1810 ImageInfo` sub-table ([`CrwImageInfo`]).
+  #[must_use]
+  #[inline]
+  pub const fn image_info(&self) -> Option<&CrwImageInfo> {
+    self.image_info.as_ref()
+  }
+
+  /// `0x1835 DecoderTable` sub-table ([`CrwDecoderTable`]).
+  #[must_use]
+  #[inline]
+  pub const fn decoder_table(&self) -> Option<&CrwDecoderTable> {
+    self.decoder_table.as_ref()
+  }
+
+  /// `0x10b5 RawJpgInfo` sub-table ([`CrwRawJpgInfo`]).
+  #[must_use]
+  #[inline]
+  pub const fn raw_jpg_info(&self) -> Option<&CrwRawJpgInfo> {
+    self.raw_jpg_info.as_ref()
+  }
+
   // ===== Canon sub-table blocks =========================================
 
   /// The records dispatched to ported `Canon::*` MakerNote sub-tables, in
@@ -419,6 +872,71 @@ impl CrwMeta<'_> {
   /// Set `0x183b SerialNumberFormat` (raw `int32u`).
   pub(crate) fn set_serial_number_format(&mut self, v: u32) {
     self.serial_number_format = Some(v);
+  }
+
+  /// Set `0x100a TargetImageType` (raw `int16u`).
+  pub(crate) fn set_target_image_type(&mut self, v: u16) {
+    self.target_image_type = Some(v);
+  }
+
+  /// Set `0x1804 RecordID`.
+  pub(crate) fn set_record_id(&mut self, v: u32) {
+    self.record_id = Some(v);
+  }
+
+  /// Set `0x1817 FileNumber` (raw `int32u`).
+  pub(crate) fn set_file_number(&mut self, v: u32) {
+    self.file_number = Some(v);
+  }
+
+  /// Set `0x1814 MeasuredEV` (post-ValueConv float).
+  pub(crate) fn set_measured_ev(&mut self, v: f64) {
+    self.measured_ev = Some(v);
+  }
+
+  /// Set `0x180b SerialNumber` (raw `int32u`; EOS body only).
+  pub(crate) fn set_serial_number(&mut self, v: u32) {
+    self.serial_number = Some(v);
+  }
+
+  /// Set `0x0805 UserComment`.
+  pub(crate) fn set_user_comment(&mut self, v: SmolStr) {
+    self.user_comment = Some(v);
+  }
+
+  /// Set `0x0805 CanonFileDescription`.
+  pub(crate) fn set_canon_file_description(&mut self, v: SmolStr) {
+    self.canon_file_description = Some(v);
+  }
+
+  /// Set `0x10ae ColorTemperature` (`int16u`).
+  pub(crate) fn set_color_temperature(&mut self, v: u16) {
+    self.color_temperature = Some(v);
+  }
+
+  /// Set `0x10b4 ColorSpace` (raw `int16u`).
+  pub(crate) fn set_color_space(&mut self, v: u16) {
+    self.color_space = Some(v);
+  }
+
+  /// Set the `0x180e TimeStamp` sub-table.
+  pub(crate) fn set_time_stamp(&mut self, v: CrwTimeStamp) {
+    self.time_stamp = Some(v);
+  }
+
+  /// Set the `0x1810 ImageInfo` sub-table.
+  pub(crate) fn set_image_info(&mut self, v: CrwImageInfo) {
+    self.image_info = Some(v);
+  }
+
+  /// Set the `0x1835 DecoderTable` sub-table.
+  pub(crate) fn set_decoder_table(&mut self, v: CrwDecoderTable) {
+    self.decoder_table = Some(v);
+  }
+
+  /// Set the `0x10b5 RawJpgInfo` sub-table.
+  pub(crate) fn set_raw_jpg_info(&mut self, v: CrwRawJpgInfo) {
+    self.raw_jpg_info = Some(v);
   }
 
   /// Append a Canon-sub-table record block.

@@ -63,13 +63,36 @@
 //!   `Canon::ShotInfo` position 22's RawConv (`Canon.pm:2977`/`:2990` — keeps a
 //!   raw-0 ExposureTime only for a CRW, ported in #183).
 //!
-//! ## What is DEFERRED (Phase 2 / port-wide)
+//! ## Records ported (continued — the CRW completion)
 //!
-//! - `Canon::SensorInfo` (`0x1031`) + `Canon::ColorBalance` (`0x10a9`,
-//!   WB_RGGBLevels) sub-tables — Phase 2.
+//! - The rest of the `%CanonRaw::Main` SCALAR table — `TargetImageType`
+//!   (`0x100a`), `RecordID` (`0x1804`), `FileNumber` (`0x1817`, dash
+//!   PrintConv), `MeasuredEV` (`0x1814`, `$val+5`), `SerialNumber` (`0x180b`,
+//!   model-conditional PrintConv), `UserComment`/`CanonFileDescription`
+//!   (`0x0805`, DIR_NAME-conditional), `ColorTemperature` (`0x10ae`),
+//!   `ColorSpace` (`0x10b4`, PrintConv) — plus the structural SubDirectory
+//!   records read-as-a-value then re-dispatched as ProcessBinaryData:
+//!   `TimeStamp` (`0x180e` → DateTimeOriginal/TimeZoneCode/TimeZoneInfo),
+//!   `ImageInfo` (`0x1810` → ImageWidth/Height/PixelAspectRatio/Rotation/
+//!   Component+ColorBitDepth/ColorBW), `DecoderTable` (`0x1835` →
+//!   DecoderTableNumber/CompressedDataOffset/Length), `RawJpgInfo` (`0x10b5`
+//!   → RawJpgQuality/Size/Width/Height).
+//! - `Canon::SensorInfo` (`0x1031`) + `Canon::ColorBalance` (`0x10a9`) — the
+//!   NAMED tags (Sensor*/BlackMask*Border + WB_RGGBLevels{…}/BlackLevels),
+//!   ported as walked Canon sub-tables ([`crate::exif::makernotes::vendors::
+//!   canon::sensor_info`] / [`…::color_balance`]) so they emit for BOTH the
+//!   CRW dispatch and the normal EXIF MakerNote path.
+//!
+//! ## What is DEFERRED (port-wide)
+//!
 //! - The camera **Composite** subsystem (ScaleFactor35efl / Lens / Aperture /
 //!   DOF / ImageSize / Megapixels / …), **XMP** (#37), and **CanonCustom**
 //!   (`0x1033`, #87) are PORT-WIDE deferrals (no format emits them yet).
+//! - The raw `Canon::ColorData` arrays (`0x10a8`/`0x10ad`/… and the
+//!   `Canon::Main` `0x4001`) stay deferred (#84) — only the NAMED ColorBalance
+//!   tags are surfaced. The `CanonRaw::ExposureInfo`/`FlashInfo`/`WhiteSample`
+//!   PowerShot-era sub-tables are not in the camera-metadata oracle for a real
+//!   EOS CRW (deferred).
 //! - The `MakerNotes`-building writer path (`BuildMakerNotes` / `WriteCRW`) —
 //!   exifast is read-only.
 //! - CRW trailers (`ProcessCRW` `IdentifyTrailer`, `CanonRaw.pm:846`) — no
@@ -176,16 +199,46 @@ fn parse_inner(data: &[u8]) -> Option<CrwMeta<'_>> {
   // (the CRW was accepted by signature but the dir is unreadable).
   if hlen <= filesize {
     let mut guard: Vec<usize> = Vec::new();
-    process_canon_raw(data, hlen, filesize, 0, order, &mut meta, &mut guard);
+    // The root heap's `$$self{DIR_NAME}` is the file-level dir (not
+    // `ImageDescription`), so `0x0805` would resolve as `UserComment` there
+    // (it never appears at the root in practice).
+    process_canon_raw(
+      data,
+      hlen,
+      filesize,
+      0,
+      order,
+      &mut meta,
+      &mut guard,
+      CrwDir::Other,
+    );
   }
   Some(meta)
+}
+
+/// `$$self{DIR_NAME}` for the directory currently being walked — the ONLY
+/// bundled CanonRaw record whose decode depends on it is `0x0805` (the
+/// `CanonFileDescription`/`UserComment` conditional list, `CanonRaw.pm:60-69`,
+/// `Condition => '$self->{DIR_NAME} eq "ImageDescription"'`). We track just
+/// that distinction; every other directory is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrwDir {
+  /// Inside the `0x2804 ImageDescription` subdirectory (`CanonRaw.pm:364-368`).
+  ImageDescription,
+  /// Any other directory (root / `ImageProps` / `ExifInformation` / …).
+  Other,
 }
 
 /// `ProcessCanonRaw` (`CanonRaw.pm:625-812`): walk one CIFF heap block,
 /// recursing into sub-directories. `block_start` / `block_end` bound the
 /// block within `data` (absolute offsets); `nesting` is the recursion depth;
 /// `guard` is the `ProcessedCanonRaw{dirOffset}` double-reference set
-/// (`CanonRaw.pm:633-639`).
+/// (`CanonRaw.pm:633-639`); `dir_name` is `$$self{DIR_NAME}` (the only
+/// DIR_NAME-sensitive record is `0x0805`, `CanonRaw.pm:60-69`).
+// The arg list mirrors the bundled `ProcessCanonRaw` dirInfo fields (block
+// bounds + nesting + byte order + the Meta sink + the double-ref guard +
+// DIR_NAME); bundling them into a struct would obscure the 1:1 transcription.
+#[allow(clippy::too_many_arguments)]
 fn process_canon_raw(
   data: &[u8],
   block_start: usize,
@@ -194,6 +247,7 @@ fn process_canon_raw(
   order: ByteOrder,
   meta: &mut CrwMeta<'_>,
   guard: &mut Vec<usize>,
+  dir_name: CrwDir,
 ) {
   // `$raf->Seek($blockStart+$blockSize-4, 0)` + `Read($buff,4)`
   // (`CanonRaw.pm:628-630`): the LAST 4 bytes of the block hold the directory
@@ -255,7 +309,26 @@ fn process_canon_raw(
     // (`CanonRaw.pm:659`): a raw SUBDIRECTORY ⇒ recurse over `[ptr .. ptr+size]`.
     if (tag_type == 0x28 || tag_type == 0x30) && !value_in_dir {
       if nesting < MAX_NESTING && ptr + size <= data.len() && ptr >= block_start {
-        process_canon_raw(data, ptr, ptr + size, nesting + 1, order, meta, guard);
+        // The child `$$self{DIR_NAME}` = the SubDirectory record's `Name`
+        // (`ProcessCanonRaw` sets `DirName => $name`, `CanonRaw.pm:665`). The
+        // only DIR_NAME-sensitive record is `0x0805`, gated on
+        // `"ImageDescription"` (`0x2804`, `CanonRaw.pm:364`); every other
+        // subdir name is irrelevant ⇒ `Other`.
+        let child_dir = if tag_id == 0x2804 {
+          CrwDir::ImageDescription
+        } else {
+          CrwDir::Other
+        };
+        process_canon_raw(
+          data,
+          ptr,
+          ptr + size,
+          nesting + 1,
+          order,
+          meta,
+          guard,
+          child_dir,
+        );
       }
       continue; // `CanonRaw.pm:682`
     }
@@ -297,12 +370,18 @@ fn process_canon_raw(
         // placeholder reports the right byte count without copying the
         // (potentially multi-MB) payload. The bytes themselves are never
         // emitted (no `-b`), so their content is irrelevant.
-        emit_record(meta, tag_id, RecordValue::BinaryPlaceholder(size), order);
+        emit_record(
+          meta,
+          tag_id,
+          RecordValue::BinaryPlaceholder(size),
+          order,
+          dir_name,
+        );
         continue;
       }
     }
 
-    emit_record(meta, tag_id, RecordValue::Bytes(value), order);
+    emit_record(meta, tag_id, RecordValue::Bytes(value), order, dir_name);
   }
 }
 
@@ -318,10 +397,17 @@ enum RecordValue {
 /// Dispatch one `%CanonRaw::Main` record (`tag_id`) into the typed
 /// [`CrwMeta`]. The SCALAR records (strings / ints / the `MakeModel` /
 /// `ImageFormat` binary sub-tables) populate typed fields; the Canon MakerNote
-/// records (`0x1029`/`0x102a`/`0x102d`/`0x1038`/`0x1093`) are retained as raw
-/// blocks. Records not (yet) ported are ignored (faithful to bundled's
-/// table-miss `next unless defined $tagInfo`, `CanonRaw.pm:768`).
-fn emit_record(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: ByteOrder) {
+/// records (`0x1029`/`0x102a`/`0x102d`/`0x1031`/`0x1038`/`0x1093`/`0x10a9`) are
+/// retained as raw blocks. `dir_name` is `$$self{DIR_NAME}` (only the `0x0805`
+/// record reads it). Records not ported are ignored (faithful to bundled's
+/// table-miss `next unless defined $tagInfo`, `CanonRaw.pm:760`).
+fn emit_record(
+  meta: &mut CrwMeta<'_>,
+  tag_id: u16,
+  value: RecordValue,
+  order: ByteOrder,
+  dir_name: CrwDir,
+) {
   // The Canon sub-table records keep their raw bytes for the per-`ConvMode`
   // re-decode in `Taggable` (these are never value-in-dir / large in real
   // CRW, but we handle both representations).
@@ -329,8 +415,10 @@ fn emit_record(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: B
     0x1029 => Some(CrwSubTable::FocalLength),
     0x102a => Some(CrwSubTable::ShotInfo),
     0x102d => Some(CrwSubTable::CameraSettings),
+    0x1031 => Some(CrwSubTable::SensorInfo),
     0x1038 => Some(CrwSubTable::AfInfo),
     0x1093 => Some(CrwSubTable::FileInfo),
+    0x10a9 => Some(CrwSubTable::ColorBalance),
     _ => None,
   };
   if let Some(kind) = sub_kind {
@@ -365,7 +453,7 @@ fn emit_record(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: B
       meta.push_binary(name, n);
     }
     // ---- the rest are scalar / structural records ------------------------
-    other => emit_scalar(meta, other, value, order),
+    other => emit_scalar(meta, other, value, order, dir_name),
   }
 }
 
@@ -394,10 +482,18 @@ impl CrwBinary {
 
 /// Decode a SCALAR / structural `CanonRaw::Main` record into the typed
 /// [`CrwMeta`]. Strings are NUL-trimmed (`ExifTool.pm` string ValueConv);
-/// integers/floats read in the header byte order. Sub-table records that
-/// expand into MULTIPLE CanonRaw tags (`MakeModel`, `ImageFormat`,
-/// `TimeStamp`, …) are unpacked here from their binary block.
-fn emit_scalar(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: ByteOrder) {
+/// integers/floats read in the header byte order. The SubDirectory records
+/// that are read as a VALUE then re-dispatched as a ProcessBinaryData
+/// sub-table on `\$value` (`TimeStamp`/`ImageInfo`/`DecoderTable`/
+/// `RawJpgInfo`, `CanonRaw.pm:762-796`) are unpacked here from their block.
+/// `dir_name` is `$$self{DIR_NAME}` (only `0x0805` reads it).
+fn emit_scalar(
+  meta: &mut CrwMeta<'_>,
+  tag_id: u16,
+  value: RecordValue,
+  order: ByteOrder,
+  dir_name: CrwDir,
+) {
   // A large (placeholder-only) value cannot be one of these scalar records in
   // real CRW; ignore it (bundled's `undef $format` arm only applies to
   // tagInfo'd binaries, handled above).
@@ -415,6 +511,15 @@ fn emit_scalar(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: B
     0x0816 => meta.set_original_file_name(trim_string(&bytes)), // OriginalFileName
     0x0817 => meta.set_thumbnail_file_name(trim_string(&bytes)), // ThumbnailFileName
 
+    // ---- `0x0805` conditional list (`CanonRaw.pm:60-72`) -----------------
+    // First arm `CanonFileDescription` (`string[32]`) when `$$self{DIR_NAME}
+    // eq "ImageDescription"`; else second arm `UserComment` (`string[256]`).
+    // (The third arm is unreachable — both arms here are string records.)
+    0x0805 => match dir_name {
+      CrwDir::ImageDescription => meta.set_canon_file_description(trim_string(&bytes)),
+      CrwDir::Other => meta.set_user_comment(trim_string(&bytes)),
+    },
+
     // ---- `0x080a CanonRawMakeModel` → `CanonRaw::MakeModel` --------------
     // (`CanonRaw.pm:212-216`, sub-table `:405-424`): `Make` = string[6]
     // ("Canon\0"), `Model` = string to the end of the data. ProcessBinaryData
@@ -430,8 +535,43 @@ fn emit_scalar(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: B
       }
     }
 
+    // ---- `0x100a TargetImageType` (`CanonRaw.pm:86-93`) — int16u, PrintConv
+    0x100a if bytes.len() >= 2 => meta.set_target_image_type(read_u16(&bytes, 0, order)),
+
+    // ---- `0x101c BaseISO` (`CanonRaw.pm:198`) — int16u -------------------
+    0x101c if bytes.len() >= 2 => meta.set_base_iso(read_u16(&bytes, 0, order)),
+
+    // ---- `0x10ae ColorTemperature` (`CanonRaw.pm:215-218`) — int16u ------
+    0x10ae if bytes.len() >= 2 => meta.set_color_temperature(read_u16(&bytes, 0, order)),
+
+    // ---- `0x10b4 ColorSpace` (`CanonRaw.pm:219-227`) — int16u, PrintConv -
+    0x10b4 if bytes.len() >= 2 => meta.set_color_space(read_u16(&bytes, 0, order)),
+
+    // ---- `0x1804 RecordID` (`CanonRaw.pm:233`) — int32u ------------------
+    0x1804 if bytes.len() >= 4 => meta.set_record_id(read_u32(&bytes, 0, order)),
+
+    // ---- `0x1817 FileNumber` (`CanonRaw.pm:303-309`) — int32u, dash conv -
+    0x1817 if bytes.len() >= 4 => meta.set_file_number(read_u32(&bytes, 0, order)),
+
+    // ---- `0x1814 MeasuredEV` (`CanonRaw.pm:292-302`) — float, +5 ValueConv
+    0x1814 if bytes.len() >= 4 => {
+      // `ValueConv => '$val + 5'`: store the POST-ValueConv float.
+      meta.set_measured_ev(f64::from(read_f32(&bytes, 0, order)) + 5.0);
+    }
+
+    // ---- `0x180b SerialNumber` (`CanonRaw.pm:248-270`) — int32u ----------
+    // Conditional list: `EOS D30` → `%x-%.5d`; any `EOS` → `%.10d`; else
+    // `UnknownNumber` (`Unknown => 1`). We store the raw int32u for an EOS
+    // body only (the Model is captured by `0x080a`, which precedes this in
+    // the CIFF walk — CameraSpecification follows CanonRawMakeModel,
+    // `CanonRaw.pm` real-CRW ordering); for a non-EOS PowerShot body the
+    // record is `UnknownNumber` and SUPPRESSED by default, so we skip it.
+    0x180b if bytes.len() >= 4 && model_is_eos(meta.model()) => {
+      meta.set_serial_number(read_u32(&bytes, 0, order));
+    }
+
     // ---- `0x1803 ImageFormat` → `CanonRaw::ImageFormat` ------------------
-    // (`CanonRaw.pm:262-266`, sub-table `:456-478`): FORMAT int32u,
+    // (`CanonRaw.pm:228-232`, sub-table `:456-478`): FORMAT int32u,
     // FIRST_ENTRY 0. pos0 `FileFormat` (int32u, PrintHex), pos1
     // `TargetCompressionRatio` (float).
     0x1803 => {
@@ -443,26 +583,154 @@ fn emit_scalar(meta: &mut CrwMeta<'_>, tag_id: u16, value: RecordValue, order: B
       }
     }
 
-    // ---- `0x101c BaseISO` (`CanonRaw.pm:198`) — int16u -------------------
-    0x101c if bytes.len() >= 2 => meta.set_base_iso(read_u16(&bytes, 0, order)),
+    // ---- `0x180e TimeStamp` → `CanonRaw::TimeStamp` ----------------------
+    // (`CanonRaw.pm:271-277`, sub-table `:427-454`): FORMAT int32u,
+    // FIRST_ENTRY 0. pos0 `DateTimeOriginal` (Unix→ConvertUnixTime), pos1
+    // `TimeZoneCode` (int32s, `$val/3600`), pos2 `TimeZoneInfo` (int32u).
+    0x180e => {
+      let mut ts = crate::metadata::CrwTimeStamp::default();
+      if bytes.len() >= 4 {
+        let unix = i64::from(read_u32(&bytes, 0, order));
+        ts.set_date_time_original(SmolStr::from(crate::datetime::convert_unix_time(unix)));
+      }
+      if bytes.len() >= 8 {
+        // `int32s`, `ValueConv => '$val / 3600'` (integer division —
+        // `ConvertUnixTime` aside, this is a plain Perl `/`; the only real
+        // values are exact multiples of 3600 or 0). We divide as i32.
+        let tz = read_i32(&bytes, 4, order) / 3600;
+        ts.set_time_zone_code(tz);
+      }
+      if bytes.len() >= 12 {
+        ts.set_time_zone_info(read_u32(&bytes, 8, order));
+      }
+      if !ts.is_empty() {
+        meta.set_time_stamp(ts);
+      }
+    }
 
-    // ---- `0x1834 CanonModelID` (`CanonRaw.pm:303-313`) — int32u, PrintHex,
+    // ---- `0x1810 ImageInfo` → `CanonRaw::ImageInfo` ----------------------
+    // (`CanonRaw.pm:278-284`, sub-table `:547-570`): FORMAT int32u,
+    // FIRST_ENTRY 0. pos0 ImageWidth, 1 ImageHeight, 2 PixelAspectRatio
+    // (float), 3 Rotation (int32s), 4 ComponentBitDepth, 5 ColorBitDepth,
+    // 6 ColorBW.
+    0x1810 => {
+      let mut ii = crate::metadata::CrwImageInfo::default();
+      let mut ii_set = false;
+      // Decode each position (PixelAspectRatio is a float, Rotation an int32s,
+      // the rest int32u). FIRST_ENTRY 0 ⇒ position N at byte offset 4*N.
+      if bytes.len() >= 4 {
+        ii.set_image_width(read_u32(&bytes, 0, order));
+        ii_set = true;
+      }
+      if bytes.len() >= 8 {
+        ii.set_image_height(read_u32(&bytes, 4, order));
+        ii_set = true;
+      }
+      if bytes.len() >= 12 {
+        ii.set_pixel_aspect_ratio(f64::from(read_f32(&bytes, 8, order)));
+        ii_set = true;
+      }
+      if bytes.len() >= 16 {
+        ii.set_rotation(read_i32(&bytes, 12, order));
+        ii_set = true;
+      }
+      if bytes.len() >= 20 {
+        ii.set_component_bit_depth(read_u32(&bytes, 16, order));
+        ii_set = true;
+      }
+      if bytes.len() >= 24 {
+        ii.set_color_bit_depth(read_u32(&bytes, 20, order));
+        ii_set = true;
+      }
+      if bytes.len() >= 28 {
+        ii.set_color_bw(read_u32(&bytes, 24, order));
+        ii_set = true;
+      }
+      if ii_set {
+        meta.set_image_info(ii);
+      }
+    }
+
+    // ---- `0x1835 DecoderTable` → `CanonRaw::DecoderTable` ----------------
+    // (`CanonRaw.pm:327-331`, sub-table `:572-583`): FORMAT int32u,
+    // FIRST_ENTRY 0. pos0 DecoderTableNumber, pos2 CompressedDataOffset,
+    // pos3 CompressedDataLength (pos1 unnamed).
+    0x1835 => {
+      let mut dt = crate::metadata::CrwDecoderTable::default();
+      let mut dt_set = false;
+      if bytes.len() >= 4 {
+        dt.set_decoder_table_number(read_u32(&bytes, 0, order));
+        dt_set = true;
+      }
+      // pos1 (byte offset 4) is unnamed — skipped.
+      if bytes.len() >= 12 {
+        dt.set_compressed_data_offset(read_u32(&bytes, 8, order));
+        dt_set = true;
+      }
+      if bytes.len() >= 16 {
+        dt.set_compressed_data_length(read_u32(&bytes, 12, order));
+        dt_set = true;
+      }
+      if dt_set {
+        meta.set_decoder_table(dt);
+      }
+    }
+
+    // ---- `0x10b5 RawJpgInfo` → `CanonRaw::RawJpgInfo` --------------------
+    // (`CanonRaw.pm:208-214`, sub-table `:480-508`): FORMAT int16u,
+    // FIRST_ENTRY 1. pos1 RawJpgQuality (PrintConv), pos2 RawJpgSize
+    // (PrintConv), pos3 RawJpgWidth, pos4 RawJpgHeight. pos0 is commented out.
+    0x10b5 => {
+      let mut rj = crate::metadata::CrwRawJpgInfo::default();
+      let mut rj_set = false;
+      // FIRST_ENTRY 1 ⇒ position N is at byte offset 2*N. pos1 ⇒ offset 2.
+      if bytes.len() >= 4 {
+        rj.set_raw_jpg_quality(read_u16(&bytes, 2, order));
+        rj_set = true;
+      }
+      if bytes.len() >= 6 {
+        rj.set_raw_jpg_size(read_u16(&bytes, 4, order));
+        rj_set = true;
+      }
+      if bytes.len() >= 8 {
+        rj.set_raw_jpg_width(read_u16(&bytes, 6, order));
+        rj_set = true;
+      }
+      if bytes.len() >= 10 {
+        rj.set_raw_jpg_height(read_u16(&bytes, 8, order));
+        rj_set = true;
+      }
+      if rj_set {
+        meta.set_raw_jpg_info(rj);
+      }
+    }
+
+    // ---- `0x1834 CanonModelID` (`CanonRaw.pm:316-326`) — int32u, PrintHex,
     //      `%canonModelID` ---------------------------------------------------
     0x1834 if bytes.len() >= 4 => meta.set_model_id(read_u32(&bytes, 0, order)),
 
-    // ---- `0x183b SerialNumberFormat` (`CanonRaw.pm:316`) — int32u, PrintHex
+    // ---- `0x183b SerialNumberFormat` (`CanonRaw.pm:332-341`) — int32u, PrintHex
     0x183b if bytes.len() >= 4 => meta.set_serial_number_format(read_u32(&bytes, 0, order)),
 
-    // Every other `CanonRaw::Main` record (the deferred structural
-    // sub-tables — `TimeStamp`/`ImageInfo`/`ExposureInfo`/`FlashInfo`/
-    // `DecoderTable`/`RawJpgInfo`/… — plus `SerialNumber`/`FileNumber`/
-    // `MeasuredEV`/etc.) is NOT yet surfaced by this Phase-1 typed layer. The
-    // CIFF walker still RECURSED through every subdirectory; these leaves are
-    // simply not projected to typed fields (Phase-2 expands the table). This
-    // is faithful for the CRAFTED conformance fixture, which contains only the
-    // records decoded above.
+    // Every other `CanonRaw::Main` record (the still-deferred structural
+    // sub-tables — `ExposureInfo`/`FlashInfo`/`WhiteSample` — and the unnamed
+    // records `CanonColorInfo1`/`CanonColorInfo2`/`CanonFlashInfo` etc.) is not
+    // surfaced here: the unnamed ones have no `tagInfo` Name so bundled emits
+    // nothing for them (`next unless defined $tagInfo`), and `ExposureInfo`/
+    // `FlashInfo`/`WhiteSample` do not appear in the camera-metadata oracle for
+    // a real CRW (they are PowerShot-era extras). The CIFF walker still
+    // RECURSED through every subdirectory.
     _ => {}
   }
+}
+
+/// `$$self{Model} =~ /EOS/` — the SerialNumber conditional gate
+/// (`CanonRaw.pm:259`). The `EOS D30\b` first arm differs only in the
+/// PrintConv (`%x-%.5d` vs `%.10d`), applied at emission; here we only need
+/// "is this an EOS body" to decide whether the record is `SerialNumber`
+/// (vs the PowerShot `UnknownNumber`, suppressed by default).
+fn model_is_eos(model: Option<&str>) -> bool {
+  model.is_some_and(|m| m.contains("EOS"))
 }
 
 // ===========================================================================
@@ -495,6 +763,13 @@ fn read_u32(b: &[u8], off: usize, order: ByteOrder) -> u32 {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
   }
+}
+
+/// Read an `int32s` at `off` within `b` in `order` (for `Rotation` /
+/// `TimeZoneCode`).
+#[inline]
+fn read_i32(b: &[u8], off: usize, order: ByteOrder) -> i32 {
+  read_u32(b, off, order) as i32
 }
 
 /// Read a `float` at `off` within `b` in `order`.
@@ -601,6 +876,123 @@ fn print_serial_number_format(v: u32) -> TagValue {
   }
 }
 
+/// `TargetImageType` PrintConv (`CanonRaw.pm:89-92`): `0 => 'Real-world
+/// Subject', 1 => 'Written Document'`; miss ⇒ the generic `Unknown (N)`
+/// (no `PrintHex`, so decimal).
+fn print_target_image_type(v: u16) -> TagValue {
+  let label = match v {
+    0 => Some("Real-world Subject"),
+    1 => Some("Written Document"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// `ColorSpace` PrintConv (`CanonRaw.pm:222-226`): `1 => 'sRGB', 2 => 'Adobe
+/// RGB', 0xffff => 'Uncalibrated'`; miss ⇒ `Unknown (N)` (decimal).
+fn print_color_space(v: u16) -> TagValue {
+  let label = match v {
+    1 => Some("sRGB"),
+    2 => Some("Adobe RGB"),
+    0xffff => Some("Uncalibrated"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// `RawJpgQuality` PrintConv (`CanonRaw.pm:491-496`): `1 => 'Economy', 2 =>
+/// 'Normal', 3 => 'Fine', 5 => 'Superfine'`; miss ⇒ `Unknown (N)`.
+fn print_raw_jpg_quality(v: u16) -> TagValue {
+  let label = match v {
+    1 => Some("Economy"),
+    2 => Some("Normal"),
+    3 => Some("Fine"),
+    5 => Some("Superfine"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// `RawJpgSize` PrintConv (`CanonRaw.pm:500-504`): `0 => 'Large', 1 =>
+/// 'Medium', 2 => 'Small'`; miss ⇒ `Unknown (N)`.
+fn print_raw_jpg_size(v: u16) -> TagValue {
+  let label = match v {
+    0 => Some("Large"),
+    1 => Some("Medium"),
+    2 => Some("Small"),
+    _ => None,
+  };
+  match label {
+    Some(s) => TagValue::Str(SmolStr::new_static(s)),
+    None => TagValue::Str(SmolStr::from(std::format!("Unknown ({v})"))),
+  }
+}
+
+/// `FileNumber` PrintConv (`CanonRaw.pm:307`): `$_=$val;s/(\d+)(\d{4})/$1-$2/`.
+/// Render `$val` as its decimal string, then insert a dash before the LAST
+/// four digits (the greedy `\d+` keeps exactly 4 for `\d{4}`). When the
+/// decimal has fewer than 5 digits the regex does not match and the bare
+/// decimal string is returned (faithful to the no-substitution case).
+fn print_file_number(v: u32) -> String {
+  let s = std::format!("{v}");
+  // `(\d+)(\d{4})` — match only when there are at least 5 digits (need ≥1 for
+  // `\d+` plus 4 for `\d{4}`). The substitution splits 4 digits off the end.
+  if s.len() >= 5 {
+    let split = s.len() - 4;
+    std::format!("{}-{}", &s[..split], &s[split..])
+  } else {
+    s
+  }
+}
+
+/// `SerialNumber` PrintConv (`CanonRaw.pm:248-264`), model-conditional:
+/// - `$$self{Model} =~ /EOS D30\b/` ⇒ `sprintf("%x-%.5d", $val>>16,
+///   $val&0xffff)` (hex high word, dash, zero-padded-5 low word).
+/// - any other `EOS` ⇒ `sprintf("%.10d", $val)` (zero-padded-10 decimal).
+///
+/// (A non-EOS body never reaches here — the record is `UnknownNumber`, never
+/// stored as `SerialNumber`.)
+fn print_serial_number(v: u32, model: Option<&str>) -> String {
+  if model_is_eos_d30(model) {
+    std::format!("{:x}-{:05}", v >> 16, v & 0xffff)
+  } else {
+    std::format!("{v:010}")
+  }
+}
+
+/// `$$self{Model} =~ /EOS D30\b/` (`CanonRaw.pm:252`) — exact `EOS D30` word
+/// boundary (so `EOS D30` / `Canon EOS D30` match; `EOS D300`/`EOS D3000` do
+/// NOT). Selects the `SerialNumber` D30 PrintConv variant.
+fn model_is_eos_d30(model: Option<&str>) -> bool {
+  let Some(m) = model else { return false };
+  let nb = b"EOS D30";
+  let bytes = m.as_bytes();
+  let mut i = 0;
+  while i + nb.len() <= bytes.len() {
+    if &bytes[i..i + nb.len()] == nb {
+      match bytes.get(i + nb.len()) {
+        None => return true,
+        Some(&c) => {
+          if !(c.is_ascii_alphanumeric() || c == b'_') {
+            return true;
+          }
+        }
+      }
+    }
+    i += 1;
+  }
+  false
+}
+
 impl crate::emit::Taggable for CrwMeta<'_> {
   /// Yield the CRW tag stream for `mode`. The CIFF scalar records emit under
   /// `MakerNotes:CanonRaw:*`; the records dispatched to ported `Canon::*`
@@ -692,6 +1084,154 @@ impl crate::emit::Taggable for CrwMeta<'_> {
       push_raw(&mut tags, "SerialNumberFormat", value);
     }
 
+    // ---- newly-ported scalar records -------------------------------------
+    if let Some(v) = self.target_image_type() {
+      // `int16u`, PrintConv (`CanonRaw.pm:87-92`).
+      let value = if print_conv {
+        print_target_image_type(v)
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "TargetImageType", value);
+    }
+    if let Some(v) = self.record_id() {
+      // `int32u`, no PrintConv (`CanonRaw.pm:233`).
+      push_raw(&mut tags, "RecordID", TagValue::U64(u64::from(v)));
+    }
+    if let Some(v) = self.file_number() {
+      // `int32u`, dash PrintConv (`CanonRaw.pm:307`).
+      let value = if print_conv {
+        TagValue::Str(SmolStr::from(print_file_number(v)))
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "FileNumber", value);
+    }
+    if let Some(v) = self.serial_number() {
+      // `int32u`, model-conditional PrintConv (`CanonRaw.pm:248-264`).
+      let value = if print_conv {
+        TagValue::Str(SmolStr::from(print_serial_number(v, self.model())))
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "SerialNumber", value);
+    }
+    if let Some(v) = self.user_comment() {
+      // `string[256]`, no PrintConv (`CanonRaw.pm:65-69`).
+      push_raw(&mut tags, "UserComment", TagValue::Str(v.into()));
+    }
+    if let Some(v) = self.canon_file_description() {
+      // `string[32]`, no PrintConv (`CanonRaw.pm:60-64`).
+      push_raw(&mut tags, "CanonFileDescription", TagValue::Str(v.into()));
+    }
+    if let Some(v) = self.measured_ev() {
+      // `float`, ValueConv `$val + 5` already applied; no PrintConv
+      // (`CanonRaw.pm:292-302`) ⇒ same float in `-j`/`-n`.
+      push_raw(&mut tags, "MeasuredEV", TagValue::F64(v));
+    }
+    if let Some(v) = self.color_temperature() {
+      // `int16u`, no PrintConv (`CanonRaw.pm:215-218`).
+      push_raw(&mut tags, "ColorTemperature", TagValue::U64(u64::from(v)));
+    }
+    if let Some(v) = self.color_space() {
+      // `int16u`, PrintConv (`CanonRaw.pm:222-226`).
+      let value = if print_conv {
+        print_color_space(v)
+      } else {
+        TagValue::U64(u64::from(v))
+      };
+      push_raw(&mut tags, "ColorSpace", value);
+    }
+
+    // ---- structural sub-table records ------------------------------------
+    // `TimeStamp` (`CanonRaw.pm:427-454`): DateTimeOriginal / TimeZoneCode /
+    // TimeZoneInfo.
+    if let Some(ts) = self.time_stamp() {
+      if let Some(dt) = ts.date_time_original() {
+        // `ConvertUnixTime` ValueConv + `ConvertDateTime` PrintConv (a no-op
+        // without a custom date format) ⇒ same string in `-j`/`-n`.
+        push_raw(&mut tags, "DateTimeOriginal", TagValue::Str(dt.into()));
+      }
+      if let Some(tz) = ts.time_zone_code() {
+        // `int32s`, ValueConv `$val/3600`; no PrintConv ⇒ same int in both.
+        push_raw(&mut tags, "TimeZoneCode", TagValue::I64(i64::from(tz)));
+      }
+      if let Some(tzi) = ts.time_zone_info() {
+        push_raw(&mut tags, "TimeZoneInfo", TagValue::U64(u64::from(tzi)));
+      }
+    }
+    // `ImageInfo` (`CanonRaw.pm:547-570`).
+    if let Some(ii) = self.image_info() {
+      if let Some(v) = ii.image_width() {
+        push_raw(&mut tags, "ImageWidth", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ii.image_height() {
+        push_raw(&mut tags, "ImageHeight", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ii.pixel_aspect_ratio() {
+        // `float`, no PrintConv ⇒ same in both modes.
+        push_raw(&mut tags, "PixelAspectRatio", TagValue::F64(v));
+      }
+      if let Some(v) = ii.rotation() {
+        // `int32s`, no PrintConv.
+        push_raw(&mut tags, "Rotation", TagValue::I64(i64::from(v)));
+      }
+      if let Some(v) = ii.component_bit_depth() {
+        push_raw(&mut tags, "ComponentBitDepth", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ii.color_bit_depth() {
+        push_raw(&mut tags, "ColorBitDepth", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = ii.color_bw() {
+        push_raw(&mut tags, "ColorBW", TagValue::U64(u64::from(v)));
+      }
+    }
+    // `DecoderTable` (`CanonRaw.pm:572-583`).
+    if let Some(dt) = self.decoder_table() {
+      if let Some(v) = dt.decoder_table_number() {
+        push_raw(&mut tags, "DecoderTableNumber", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = dt.compressed_data_offset() {
+        push_raw(
+          &mut tags,
+          "CompressedDataOffset",
+          TagValue::U64(u64::from(v)),
+        );
+      }
+      if let Some(v) = dt.compressed_data_length() {
+        push_raw(
+          &mut tags,
+          "CompressedDataLength",
+          TagValue::U64(u64::from(v)),
+        );
+      }
+    }
+    // `RawJpgInfo` (`CanonRaw.pm:480-508`).
+    if let Some(rj) = self.raw_jpg_info() {
+      if let Some(v) = rj.raw_jpg_quality() {
+        let value = if print_conv {
+          print_raw_jpg_quality(v)
+        } else {
+          TagValue::U64(u64::from(v))
+        };
+        push_raw(&mut tags, "RawJpgQuality", value);
+      }
+      if let Some(v) = rj.raw_jpg_size() {
+        let value = if print_conv {
+          print_raw_jpg_size(v)
+        } else {
+          TagValue::U64(u64::from(v))
+        };
+        push_raw(&mut tags, "RawJpgSize", value);
+      }
+      if let Some(v) = rj.raw_jpg_width() {
+        push_raw(&mut tags, "RawJpgWidth", TagValue::U64(u64::from(v)));
+      }
+      if let Some(v) = rj.raw_jpg_height() {
+        push_raw(&mut tags, "RawJpgHeight", TagValue::U64(u64::from(v)));
+      }
+    }
+
     // ---- Canon::* MakerNote sub-table records ----------------------------
     // Re-run the ALREADY-PORTED Canon decoders for the requested `mode`,
     // threading the IFD0-equivalent `$$self{Model}` and the container
@@ -764,6 +1304,8 @@ fn emit_canon_sub_table(
         canon::file_info::parse_with_model(bytes, order, print_conv, None, model);
       em
     }
+    CrwSubTable::SensorInfo => canon::sensor_info::parse(bytes, order, print_conv),
+    CrwSubTable::ColorBalance => canon::color_balance::parse(bytes, order, print_conv, model),
   };
   for (name, value) in emissions {
     // Canon sub-table positions are explicit BinaryData (never `Unknown`); the
@@ -782,13 +1324,13 @@ impl crate::metadata::Project for CrwMeta<'_> {
   /// CRW is a Canon RAW STILL image. The faithful
   /// [`CameraInfo`](crate::metadata::CameraInfo) contributions are the
   /// `MakeModel` sub-table `Make`/`Model` (`CanonRaw.pm:411`/`:421`), the
-  /// `OwnerName` mapped to the software/owner slot, and the
-  /// `CanonFirmwareVersion`. CRW has no single canonical capture timestamp the
-  /// `MediaInfo` models (the `TimeStamp` sub-table is deferred), no GPS, and
-  /// the lens identity lives in the deferred `CameraSettings` projection — so
-  /// those domains stay `None`. Serial number is the deferred
-  /// `CanonRaw::Main` `SerialNumber` record (model-conditional), so the
-  /// `serial` slot stays `None` in Phase 1.
+  /// `CanonFirmwareVersion` (the software slot), and the body
+  /// `SerialNumber` (the `0x180b` record, EOS-only) mapped to the `serial`
+  /// slot. We use the bare decimal serial string (`SerialNumber.to_string()`)
+  /// — the SAME normalized form the Canon-JPEG `MakerNote` projection uses
+  /// (`project.rs` `canon.serial_number()`), NOT the zero-padded `%.10d`
+  /// PrintConv. The lens identity lives in the `CameraSettings` projection
+  /// (not modeled here), and CRW has no GPS, so those domains stay `None`.
   fn project(&self) -> crate::metadata::MediaMetadata {
     use crate::metadata::{CameraInfo, MediaMetadata};
     use std::string::ToString;
@@ -797,6 +1339,7 @@ impl crate::metadata::Project for CrwMeta<'_> {
     cam
       .update_make(self.make().map(ToString::to_string))
       .update_model(self.model().map(ToString::to_string))
+      .update_serial(self.serial_number().map(|n| n.to_string()))
       .update_software(self.firmware_version().map(ToString::to_string));
     if !cam.is_empty() {
       media.set_camera(cam);

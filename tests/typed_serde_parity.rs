@@ -895,12 +895,21 @@ fn typed_serde_path_equals_writer_path_and_golden_all_267() {
   // PrintHex/`CanonModelID` `%canonModelID`/…), DELIBERATELY excluding every
   // Composite-trigger combo so the bundled `-G1 -j`/`-n` goldens carry ONLY
   // File:/CanonRaw: keys.
+  // 268 → 270 after the Canon CRW completion (`CanonRaw::Main` remaining scalar
+  // + structural records, `Canon::SensorInfo` + `Canon::ColorBalance`):
+  // `CanonRaw_records.crw` (the rest of the scalar table — TargetImageType/
+  // RecordID/FileNumber/UserComment/CanonFileDescription/MeasuredEV/
+  // SerialNumber/ColorTemperature/ColorSpace — plus the TimeStamp/DecoderTable/
+  // RawJpgInfo structural sub-tables + a Canon::SensorInfo sub-table) and
+  // `CanonRaw_colorbalance.crw` (the Canon::ColorBalance WB_RGGBLevels quads).
+  // Both are CRAFTED Composite-free CIFF heaps (verified via `perl exiftool
+  // -G1 -j` to carry only File:/CanonRaw:/Canon: keys).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(
     fixtures.len(),
-    268,
-    "expected exactly the 268 active conformance fixtures, found {}: {:?}",
+    270,
+    "expected exactly the 270 active conformance fixtures, found {}: {:?}",
     fixtures.len(),
     fixtures
   );
