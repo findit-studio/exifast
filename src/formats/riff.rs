@@ -507,8 +507,11 @@ struct Walker<'a> {
   current_stream_type: Option<[u8; 4]>,
   /// Active charset for `INFO`/`exif` string decoding (RIFF.pm:1782-1790).
   /// Starts [`Charset::Latin`] (the default `'Latin'`/cp1252); a `CSET` chunk
-  /// switches it to [`Charset::Raw`] (`$$self{CodePage}` is numeric ⇒ the
-  /// `%csType` lookup misses ⇒ raw passthrough).
+  /// with a non-zero `CodePage` switches it to [`Charset::Raw`]
+  /// (`$$self{CodePage}` is numeric ⇒ the `%csType` lookup misses ⇒ raw
+  /// passthrough), while a `CodePage=0` CSET resets it back to
+  /// [`Charset::Latin`]. The RawConv overwrites `$$self{CodePage}` on every
+  /// CSET and the gate uses the LATEST value, so the most recent CSET wins.
   charset: Charset,
   /// The numeric code page from the FIRST `Decode` that hit an unsupported
   /// (numeric) charset with a non-empty string — surfaced ONCE as
@@ -642,9 +645,10 @@ impl<'a> Walker<'a> {
         b"ISMP" => emit_ismp(body, &mut self.entries),
         // CSET (RIFF.pm:533-536 → `%RIFF::CSET`, ProcessBinaryData int16u):
         // emits `CodePage`/`CountryCode`/`LanguageCode`/`Dialect`
-        // (RIFF.pm:1063-1073) AND sets `$$self{CodePage}` (RIFF.pm:1069
-        // RawConv). The subsequent INFO ProcessChunks then resolves its
-        // `$charset` via the TRUTHINESS gate at RIFF.pm:1784-1789:
+        // (RIFF.pm:1063-1073) AND sets `$$self{CodePage}` (RIFF.pm:1067-1069
+        // RawConv `$$self{CodePage} = $val`). The subsequent INFO ProcessChunks
+        // then resolves its `$charset` via the TRUTHINESS gate at
+        // RIFF.pm:1784-1789:
         //
         //   unless ($charset) {                 # CharsetRIFF default 0 → enter
         //       if ($$et{CodePage}) {           # TRUTHY ⇒ NON-ZERO only
@@ -660,15 +664,23 @@ impl<'a> Walker<'a> {
         // (<N>)` warning — modeled as `Charset::Raw(code_page)`. A `CodePage`
         // of **0** is FALSY, so it falls through to the `'Latin'` branch
         // (`CharsetRIFF` defaults to `0` ⇒ `defined && eq '0'`), exactly like
-        // having no CSET at all: cp1252 decode, NO warning. We therefore leave
-        // the active charset as the default `Charset::Latin` for `CodePage==0`
-        // (verified vs bundled 13.59: a CSET CodePage=0 + `IART=Caf\xe9` emits
+        // having no CSET at all: cp1252 decode, NO warning
+        // (`Charset::Latin`, the initial default).
+        //
+        // The RawConv overwrites `$$self{CodePage}` on EVERY CSET, and the gate
+        // resolves the LATEST value — so the most recent CSET is AUTHORITATIVE:
+        // a `CodePage=1252` followed by a `CodePage=0` ends up Latin (the 0
+        // RESETS the prior Raw, no warning). We therefore assign `self.charset`
+        // for EVERY parsed CSET, not just the non-zero ones (verified vs bundled
+        // 13.59: `CSET CodePage=1252` → `CSET CodePage=0` → `IART=Caf\xe9` emits
         // `RIFF:CodePage=0`, `RIFF:Artist="Café"`, and NO `ExifTool:Warning`).
         b"CSET" => {
-          if let Some(code_page) = emit_cset(body, &mut self.entries)
-            && code_page != 0
-          {
-            self.charset = Charset::Raw(code_page);
+          if let Some(code_page) = emit_cset(body, &mut self.entries) {
+            self.charset = if code_page == 0 {
+              Charset::Latin
+            } else {
+              Charset::Raw(code_page)
+            };
           }
         }
         // Skip image-data / index chunks (RIFF.pm:2148-2150).
@@ -1592,12 +1604,15 @@ fn string_trim_nulls(bytes: &[u8]) -> String {
 /// The resolution follows the truthiness gate at RIFF.pm:1784-1789
 /// (`CharsetRIFF` defaults to `0`):
 ///
-/// - **Default** (no `CSET` chunk, or a `CSET` with `CodePage==0`): `$charset`
-///   resolves to the NAME `'Latin'` (RIFF.pm:1788 — `$$et{CodePage}` is unset
-///   or `0` ⇒ FALSY, so the `elsif defined $charset and $charset eq '0'`
-///   branch fires) ⇒ cp1252 → UTF-8 decode ([`crate::charset::decode_latin`]),
-///   NO warning. A `CodePage==0` thus behaves EXACTLY like having no CSET at
-///   all (verified vs bundled 13.59: `CodePage=0` + `IART=Caf\xe9` →
+/// - **Default** (no `CSET` chunk, or the LATEST `CSET` has `CodePage==0`):
+///   `$charset` resolves to the NAME `'Latin'` (RIFF.pm:1788 — `$$et{CodePage}`
+///   is unset or `0` ⇒ FALSY, so the `elsif defined $charset and $charset eq
+///   '0'` branch fires) ⇒ cp1252 → UTF-8 decode
+///   ([`crate::charset::decode_latin`]), NO warning. Because the `CodePage`
+///   RawConv (RIFF.pm:1067-1069) overwrites `$$et{CodePage}` on EVERY CSET and
+///   the gate reads the LATEST value, a `CodePage==0` CSET RESETS a prior
+///   non-zero `Raw` back to Latin — it is not merely a no-op (verified vs
+///   bundled 13.59: `CSET CodePage=1252` → `CSET CodePage=0` → `IART=Caf\xe9` →
 ///   `RIFF:Artist="Café"`, no `ExifTool:Warning`).
 /// - **`CSET` chunk with a NON-ZERO `CodePage`**: `$$et{CodePage}` is TRUTHY,
 ///   so `$charset` is the NUMERIC code page (RIFF.pm:1785-1786).
@@ -3132,6 +3147,102 @@ mod tests {
       other => panic!("Artist: {other:?}"),
     }
     // NO unsupported-charset warning: 0 fell back to the supported 'Latin'.
+    assert_eq!(meta.unsupported_charset(), None);
+  }
+
+  #[test]
+  fn repeated_cset_code_page_zero_resets_prior_raw_to_latin() {
+    // RIFF.pm:1067-1069 — the `CodePage` RawConv (`$$self{CodePage} = $val`)
+    // overwrites `$$self{CodePage}` on EVERY CSET, and the truthiness gate
+    // (RIFF.pm:1784-1789) resolves the LATEST value. So a `CodePage=1252`
+    // followed by a `CodePage=0` ends up Latin: the trailing 0 RESETS the
+    // prior `Raw(1252)`. Verified vs bundled 13.59 (`CSET 1252` → `CSET 0` →
+    // `IART=Caf\xe9`): `RIFF:CodePage=0`, `RIFF:Artist="Café"`, NO
+    // `ExifTool:Warning`. The pre-R4 code only assigned on the non-zero CSET,
+    // so it stayed `Raw(1252)` → `Caf?` + a spurious unsupported-charset warn.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    // First CSET: CodePage=1252 (would set Raw(1252)).
+    buf.extend_from_slice(b"CSET");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&1252u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&9u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    // Second CSET: CodePage=0 (resets back to Latin).
+    buf.extend_from_slice(b"CSET");
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&9u16.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    let iart = b"Caf\xe9"; // cp1252 'é' (0xe9) — even len 4 → no pad
+    let mut info = Vec::new();
+    info.extend_from_slice(b"INFO");
+    info.extend_from_slice(b"IART");
+    info.extend_from_slice(&(iart.len() as u32).to_le_bytes());
+    info.extend_from_slice(iart);
+    buf.extend_from_slice(b"LIST");
+    buf.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&info);
+    let outer = (buf.len() - 8) as u32;
+    buf[4..8].copy_from_slice(&outer.to_le_bytes());
+
+    // Drive the walker directly to inspect the resolved active charset: the
+    // SECOND CSET (`CodePage=0`) must leave it `Charset::Latin`, not the
+    // `Charset::Raw(1252)` the first CSET set.
+    let mut walker = Walker {
+      data: &buf,
+      pos: 12,
+      entries: Vec::new(),
+      streams: Vec::new(),
+      current_stream_type: None,
+      charset: Charset::Latin,
+      unsupported_charset: None,
+      err: false,
+    };
+    walker.walk_top();
+    assert_eq!(
+      walker.charset,
+      Charset::Latin,
+      "the trailing CodePage=0 CSET must reset the active charset to Latin"
+    );
+    assert_eq!(
+      walker.charset.unsupported_code_page(),
+      None,
+      "Latin is a supported charset (no unsupported-charset code page)"
+    );
+
+    // End-to-end: the INFO IART decodes through cp1252 (Latin), and there is
+    // NO unsupported-charset warning (the Raw(1252) was reset).
+    let meta = parse_borrowed(&buf).expect("ok").expect("some");
+    let find = |name: &str| -> Option<&RiffValue> {
+      meta
+        .entries()
+        .iter()
+        .find(|e| e.name() == name)
+        .map(RiffEntry::value_ref)
+    };
+    // Both CSETs emit a `CodePage` entry (faithful to bundled's per-CSET
+    // ProcessBinaryData); the engine's TagMap dedup keeps the LAST (0) — see
+    // the `RIFF_cset_reset_info.wav` golden (`RIFF:CodePage=0`). Assert the
+    // last-wins value here.
+    let last_code_page = meta
+      .entries()
+      .iter()
+      .rev()
+      .find(|e| e.name() == "CodePage")
+      .map(RiffEntry::value_ref);
+    assert_eq!(last_code_page, Some(&RiffValue::U32(0)));
+    // 0xe9 decodes through cp1252 ('Latin') to 'é' — NOT the raw `?` a numeric
+    // code page would produce.
+    match find("Artist") {
+      Some(RiffValue::Str(s)) => assert_eq!(s.as_str(), "Caf\u{00e9}"),
+      other => panic!("Artist: {other:?}"),
+    }
+    // No spurious warning — the prior Raw(1252) was reset by the CodePage=0.
     assert_eq!(meta.unsupported_charset(), None);
   }
 
