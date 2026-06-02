@@ -105,6 +105,10 @@
 //! Filed at: `https://github.com/Findit-AI/exifast/issues` (see issue body
 //! cross-linking the corresponding `RIFF.pm:LLLL` for each).
 
+// Golden-v2 Contract 3c (Phase C, slice S2): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 use std::{string::String, vec::Vec};
 
@@ -423,15 +427,15 @@ fn parse_inner(data: &[u8]) -> Option<RiffMeta<'_>> {
   // RIFF.pm:2040: `if ($buff =~ /^(RIFF|RF64)....(.{4})/s) { ... }`. The
   // minimal-support `LA0[234]|OFR |LPAC|wvpk` branch (RIFF.pm:2045) is a
   // documented deferral — see module doc.
-  let magic = &data[0..4];
-  let (rf64, _outer_size) = if magic == MAGIC_RIFF {
-    (false, le_u32(&data[4..8]))
-  } else if magic == MAGIC_RF64 {
-    (true, le_u32(&data[4..8]))
+  let magic = data.get(0..4);
+  let (rf64, _outer_size) = if magic == Some(MAGIC_RIFF.as_slice()) {
+    (false, le_u32_at(data, 4))
+  } else if magic == Some(MAGIC_RF64.as_slice()) {
+    (true, le_u32_at(data, 4))
   } else {
     return None;
   };
-  let form: [u8; 4] = data[8..12].try_into().expect("4 bytes");
+  let form: [u8; 4] = fourcc_at(data, 8);
 
   // RIFF.pm:2041 `$type = $riffType{$2}` → file_type + MIME.
   // Bundled passes `undef` MIME when `$type` is undef; we surface the inert
@@ -562,7 +566,9 @@ impl<'a> Walker<'a> {
           self.pos = chunk_end + pad_len;
           continue;
         }
-        let body = &self.data[list_payload_start..list_payload_end];
+        let Some(body) = self.data.get(list_payload_start..list_payload_end) else {
+          break;
+        };
         match &list_type {
           b"INFO" | b"INF0" => {
             process_chunks_info(
@@ -619,7 +625,9 @@ impl<'a> Walker<'a> {
       // Inline chunks at the OUTER level — most of these map through
       // `%Main` (RIFF.pm:338-678). The declared body is fully present here
       // (guarded above), so the slice is exactly the chunk payload.
-      let body = &self.data[chunk_start..chunk_end];
+      let Some(body) = self.data.get(chunk_start..chunk_end) else {
+        break;
+      };
       match &tag {
         b"fmt " => emit_audio_format(body, &mut self.entries),
         b"IDIT" => emit_idit(body, &mut self.entries),
@@ -687,10 +695,8 @@ impl<'a> Walker<'a> {
     if self.data.len().saturating_sub(self.pos) < 8 {
       return None;
     }
-    let tag: [u8; 4] = self.data[self.pos..self.pos + 4]
-      .try_into()
-      .expect("4 bytes");
-    let len = le_u32(&self.data[self.pos + 4..self.pos + 8]) as usize;
+    let tag: [u8; 4] = fourcc_at(self.data, self.pos);
+    let len = le_u32_at(self.data, self.pos + 4) as usize;
     self.pos += 8;
     // RIFF.pm:2118-2128: skip empty chunk (warn + next, or stop on null).
     // We let the dispatch handle len==0 itself (most chunks become no-ops).
@@ -706,23 +712,27 @@ impl<'a> Walker<'a> {
   fn process_chunks_hdrl(&mut self, body: &'a [u8]) {
     let mut p = 0;
     while p + 8 < body.len() {
-      let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-      let len = le_u32(&body[p + 4..p + 8]) as usize;
+      let tag: [u8; 4] = fourcc_at(body, p);
+      let len = le_u32_at(body, p + 4) as usize;
       p += 8;
       if p + len > body.len() {
         // RIFF.pm:1798-1801: `Bad $tag chunk` and abort.
         return;
       }
       if &tag == b"LIST" && len >= 4 {
-        let list_type: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-        let inner = &body[p + 4..p + len];
+        let list_type: [u8; 4] = fourcc_at(body, p);
+        let Some(inner) = body.get(p + 4..p + len) else {
+          return;
+        };
         match &list_type {
           b"strl" => self.process_chunks_strl(inner),
           b"odml" => process_chunks_odml(inner, &mut self.entries),
           _ => {}
         }
       } else {
-        let payload = &body[p..p + len];
+        let Some(payload) = body.get(p..p + len) else {
+          return;
+        };
         match &tag {
           b"avih" => emit_avi_header(payload, &mut self.entries),
           b"IDIT" => emit_idit(payload, &mut self.entries),
@@ -746,30 +756,35 @@ impl<'a> Walker<'a> {
 
     let mut p = 0;
     while p + 8 < body.len() {
-      let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-      let len = le_u32(&body[p + 4..p + 8]) as usize;
+      let tag: [u8; 4] = fourcc_at(body, p);
+      let len = le_u32_at(body, p + 4) as usize;
       p += 8;
       if p + len > body.len() {
         return;
       }
-      let payload = &body[p..p + len];
+      let Some(payload) = body.get(p..p + len) else {
+        return;
+      };
       match &tag {
         b"strh" => {
           // Emit + capture the resulting StreamType into both the stream
           // record and `current_stream_type`.
           let stype = emit_stream_header(payload, &mut self.entries);
           self.current_stream_type = stype;
-          if let Some(sty) = stype {
+          if let Some(sty) = stype
+            && let Some(stream) = self.streams.get_mut(stream_idx)
+          {
             let sty_str = SmolStr::new(core::str::from_utf8(&sty).unwrap_or(""));
-            self.streams[stream_idx].stream_type = Some(sty_str);
+            stream.stream_type = Some(sty_str);
           }
           // The codec FourCC at offset 4 is captured by `emit_stream_header`
           // and emitted; record it here too (with the same trailing-null
           // trim bundled's `Format => 'string[4]'` applies).
-          if payload.len() >= 8 {
-            let codec_bytes = &payload[4..8];
+          if let Some(codec_bytes) = payload.get(4..8)
+            && let Some(stream) = self.streams.get_mut(stream_idx)
+          {
             let codec = string_trim_nulls(codec_bytes);
-            self.streams[stream_idx].codec = Some(SmolStr::new(&codec));
+            stream.codec = Some(SmolStr::new(&codec));
           }
         }
         b"strf" => {
@@ -793,7 +808,9 @@ impl<'a> Walker<'a> {
               "StreamName",
               RiffValue::Str(SmolStr::new(&name)),
             ));
-            self.streams[stream_idx].name = Some(SmolStr::new(&name));
+            if let Some(stream) = self.streams.get_mut(stream_idx) {
+              stream.name = Some(SmolStr::new(&name));
+            }
           }
         }
         // `strd` StreamData — bundled hops into `%StreamData` (RIFF.pm:
@@ -834,13 +851,15 @@ fn process_chunks_info(
 ) {
   let mut p = 0;
   while p + 8 < body.len() {
-    let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-    let len = le_u32(&body[p + 4..p + 8]) as usize;
+    let tag: [u8; 4] = fourcc_at(body, p);
+    let len = le_u32_at(body, p + 4) as usize;
     p += 8;
     if p + len > body.len() {
       return;
     }
-    let payload = &body[p..p + len];
+    let Some(payload) = body.get(p..p + len) else {
+      return;
+    };
     let pad = len & 1;
     p += len + pad;
     let Some(name) = info_tag_name(&tag) else {
@@ -916,7 +935,11 @@ fn isft_value_conv(val: &str) -> String {
   let mut bytes: Vec<u8> = val.as_bytes().to_vec();
   while bytes.last() == Some(&0) {
     let mut ws_start = bytes.len() - 1; // index of the trailing NUL
-    while ws_start > 0 && (bytes[ws_start - 1] as char).is_ascii_whitespace() {
+    while ws_start > 0
+      && bytes
+        .get(ws_start - 1)
+        .is_some_and(|&b| (b as char).is_ascii_whitespace())
+    {
       ws_start -= 1;
     }
     bytes.truncate(ws_start);
@@ -925,14 +948,25 @@ fn isft_value_conv(val: &str) -> String {
   // Find the first NUL; back up over its leading ASCII whitespace.
   if let Some(nul) = bytes.iter().position(|&b| b == 0) {
     let mut ws_start = nul;
-    while ws_start > 0 && (bytes[ws_start - 1] as char).is_ascii_whitespace() {
+    while ws_start > 0
+      && bytes
+        .get(ws_start - 1)
+        .is_some_and(|&b| (b as char).is_ascii_whitespace())
+    {
       ws_start -= 1;
     }
     let mut out = Vec::with_capacity(bytes.len() + 2);
-    out.extend_from_slice(&bytes[..ws_start]);
+    out.extend_from_slice(bytes.get(..ws_start).unwrap_or(&bytes));
     out.extend_from_slice(b", ");
     // (3) `s/\0+//g` on the remainder — copy the rest, dropping NULs.
-    out.extend(bytes[nul + 1..].iter().copied().filter(|&b| b != 0));
+    out.extend(
+      bytes
+        .get(nul + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .filter(|&b| b != 0),
+    );
     bytes = out;
   }
   // The decode already produced valid UTF-8; the surgery only removes NULs /
@@ -1053,13 +1087,15 @@ const fn info_tag_name(tag: &[u8; 4]) -> Option<&'static str> {
 fn process_chunks_exif(body: &[u8], entries: &mut Vec<RiffEntry>) {
   let mut p = 0;
   while p + 8 < body.len() {
-    let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-    let len = le_u32(&body[p + 4..p + 8]) as usize;
+    let tag: [u8; 4] = fourcc_at(body, p);
+    let len = le_u32_at(body, p + 4) as usize;
     p += 8;
     if p + len > body.len() {
       return;
     }
-    let payload = &body[p..p + len];
+    let Some(payload) = body.get(p..p + len) else {
+      return;
+    };
     let pad = len & 1;
     p += len + pad;
     let name = match &tag {
@@ -1093,17 +1129,19 @@ fn process_chunks_exif(body: &[u8], entries: &mut Vec<RiffEntry>) {
 fn process_chunks_odml(body: &[u8], entries: &mut Vec<RiffEntry>) {
   let mut p = 0;
   while p + 8 < body.len() {
-    let tag: [u8; 4] = body[p..p + 4].try_into().expect("4 bytes");
-    let len = le_u32(&body[p + 4..p + 8]) as usize;
+    let tag: [u8; 4] = fourcc_at(body, p);
+    let len = le_u32_at(body, p + 4) as usize;
     p += 8;
     if p + len > body.len() {
       return;
     }
-    let payload = &body[p..p + len];
+    let Some(payload) = body.get(p..p + len) else {
+      return;
+    };
     let pad = len & 1;
     p += len + pad;
     if &tag == b"dmlh" && payload.len() >= 4 {
-      let total = le_u32(&payload[0..4]);
+      let total = le_u32_at(payload, 0);
       entries.push(RiffEntry::new(
         "RIFF",
         "TotalFrameCount",
@@ -1121,32 +1159,32 @@ fn emit_audio_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
     return;
   }
   // 0: Encoding — int16u, RIFF.pm:691-696.
-  let enc = le_u16(&payload[0..2]) as u32;
+  let enc = le_u16_at(payload, 0) as u32;
   entries.push(RiffEntry::new("RIFF", "Encoding", RiffValue::U32(enc)));
   // 1: NumChannels — int16u, RIFF.pm:697.
   entries.push(RiffEntry::new(
     "RIFF",
     "NumChannels",
-    RiffValue::U32(le_u16(&payload[2..4]) as u32),
+    RiffValue::U32(le_u16_at(payload, 2) as u32),
   ));
   // 2: SampleRate — int32u, RIFF.pm:698-701.
   entries.push(RiffEntry::new(
     "RIFF",
     "SampleRate",
-    RiffValue::U32(le_u32(&payload[4..8])),
+    RiffValue::U32(le_u32_at(payload, 4)),
   ));
   // 4: AvgBytesPerSec — int32u, RIFF.pm:702-705.
   entries.push(RiffEntry::new(
     "RIFF",
     "AvgBytesPerSec",
-    RiffValue::U32(le_u32(&payload[8..12])),
+    RiffValue::U32(le_u32_at(payload, 8)),
   ));
   // 7: BitsPerSample — int16u (offset 7 in int16u-element units = byte
   // offset 14), RIFF.pm:708.
   entries.push(RiffEntry::new(
     "RIFF",
     "BitsPerSample",
-    RiffValue::U32(le_u16(&payload[14..16]) as u32),
+    RiffValue::U32(le_u16_at(payload, 14) as u32),
   ));
 }
 
@@ -1157,7 +1195,7 @@ fn emit_avi_header(payload: &[u8], entries: &mut Vec<RiffEntry>) {
     return;
   }
   // 0: FrameRate — RawConv `$val ? 1e6 / $val : undef` (RIFF.pm:1081-1086).
-  let frame_rate_raw = le_u32(&payload[0..4]);
+  let frame_rate_raw = le_u32_at(payload, 0);
   if frame_rate_raw != 0 {
     let fr = 1.0e6_f64 / frame_rate_raw as f64;
     entries.push(RiffEntry::new("RIFF", "FrameRate", RiffValue::F64(fr)));
@@ -1167,31 +1205,31 @@ fn emit_avi_header(payload: &[u8], entries: &mut Vec<RiffEntry>) {
   entries.push(RiffEntry::new(
     "RIFF",
     "MaxDataRate",
-    RiffValue::U32(le_u32(&payload[4..8])),
+    RiffValue::U32(le_u32_at(payload, 4)),
   ));
   // 4: FrameCount (RIFF.pm:1102).
   entries.push(RiffEntry::new(
     "RIFF",
     "FrameCount",
-    RiffValue::U32(le_u32(&payload[16..20])),
+    RiffValue::U32(le_u32_at(payload, 16)),
   ));
   // 6: StreamCount (RIFF.pm:1104).
   entries.push(RiffEntry::new(
     "RIFF",
     "StreamCount",
-    RiffValue::U32(le_u32(&payload[24..28])),
+    RiffValue::U32(le_u32_at(payload, 24)),
   ));
   // 8: ImageWidth (RIFF.pm:1106).
   entries.push(RiffEntry::new(
     "RIFF",
     "ImageWidth",
-    RiffValue::U32(le_u32(&payload[32..36])),
+    RiffValue::U32(le_u32_at(payload, 32)),
   ));
   // 9: ImageHeight (RIFF.pm:1107).
   entries.push(RiffEntry::new(
     "RIFF",
     "ImageHeight",
-    RiffValue::U32(le_u32(&payload[36..40])),
+    RiffValue::U32(le_u32_at(payload, 36)),
   ));
 }
 
@@ -1219,7 +1257,7 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
   // 0: StreamType — Format => 'string[4]' (RIFF.pm:1166-1177). `string_trim_nulls`
   // trims trailing NULs (the `string[4]` ReadValue trim) and renders any invalid
   // UTF-8 byte as `?` (ExifTool's JSON FixUTF8), NOT U+FFFD.
-  let stream_type_bytes: [u8; 4] = payload[0..4].try_into().expect("4 bytes");
+  let stream_type_bytes: [u8; 4] = fourcc_at(payload, 0);
   let stream_type_str = string_trim_nulls(&stream_type_bytes);
   push_priority0(
     entries,
@@ -1232,7 +1270,7 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
   // ReadValue's trailing-null trim (`$val =~ s/\0+$//`), so a codec like
   // `\0\0\0\0` becomes `""` (faithful to bundled emitting empty
   // `RIFF:AudioCodec` for PCM-only AVIs).
-  let codec_bytes: [u8; 4] = payload[4..8].try_into().expect("4 bytes");
+  let codec_bytes: [u8; 4] = fourcc_at(payload, 4);
   let codec_str = string_trim_nulls(&codec_bytes);
   let codec_name = match &stream_type_bytes {
     b"auds" => "AudioCodec",
@@ -1252,8 +1290,8 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
   // exactly `den/num` due to the 10-significant-digit RoundFloat step:
   // a fixture with `num=1, den=11024` becomes `1/0.00009071124819 =
   // 11023.99999961...` not `11024`, faithful to bundled).
-  let r_num = le_u32(&payload[20..24]);
-  let r_den = le_u32(&payload[24..28]);
+  let r_num = le_u32_at(payload, 20);
+  let r_den = le_u32_at(payload, 24);
   if r_num != 0 && r_den != 0 {
     let val = read_rational_round10(r_num, r_den);
     let rate = if val == 0.0 { 0.0 } else { 1.0 / val };
@@ -1265,7 +1303,7 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
     push_priority0(entries, "RIFF", rate_name, RiffValue::F64(rate));
   }
   // 8: Sample/Frame count — int32u at offset 32 (RIFF.pm:1225-1237).
-  let count = le_u32(&payload[32..36]);
+  let count = le_u32_at(payload, 32);
   let count_name = match &stream_type_bytes {
     b"auds" => "AudioSampleCount",
     b"vids" => "VideoFrameCount",
@@ -1279,7 +1317,7 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
     entries,
     "RIFF",
     "Quality",
-    RiffValue::U32(le_u32(&payload[40..44])),
+    RiffValue::U32(le_u32_at(payload, 40)),
   );
   // 11: SampleSize — int32u at offset 44 (RIFF.pm:1243-1246). PrintConv:
   // `0 -> "Variable"`, else `"$val byte"`/`"s"`.
@@ -1287,7 +1325,7 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
     entries,
     "RIFF",
     "SampleSize",
-    RiffValue::U32(le_u32(&payload[44..48])),
+    RiffValue::U32(le_u32_at(payload, 44)),
   );
   Some(stream_type_bytes)
 }
@@ -1330,34 +1368,34 @@ fn emit_bmp_video_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
   entries.push(RiffEntry::new(
     "File",
     "BMPVersion",
-    RiffValue::U32(le_u32(&payload[0..4])),
+    RiffValue::U32(le_u32_at(payload, 0)),
   ));
   // 4: ImageWidth — int32u (BMP.pm:58-61).
   entries.push(RiffEntry::new(
     "File",
     "ImageWidth",
-    RiffValue::U32(le_u32(&payload[4..8])),
+    RiffValue::U32(le_u32_at(payload, 4)),
   ));
   // 8: ImageHeight — int32s with ValueConv abs() (BMP.pm:62-66).
-  let raw_h = le_i32(&payload[8..12]);
+  let raw_h = le_i32_at(payload, 8);
   let abs_h = raw_h.unsigned_abs();
   entries.push(RiffEntry::new("File", "ImageHeight", RiffValue::U32(abs_h)));
   // 12: Planes — int16u (BMP.pm:67-71).
   entries.push(RiffEntry::new(
     "File",
     "Planes",
-    RiffValue::U32(le_u16(&payload[12..14]) as u32),
+    RiffValue::U32(le_u16_at(payload, 12) as u32),
   ));
   // 14: BitDepth — int16u (BMP.pm:72-75).
   entries.push(RiffEntry::new(
     "File",
     "BitDepth",
-    RiffValue::U32(le_u16(&payload[14..16]) as u32),
+    RiffValue::U32(le_u16_at(payload, 14) as u32),
   ));
   // 16: Compression — int32u (BMP.pm:76-97). > 256 ⇒ FourCC string;
   // bundled emits `0/1/2/3/4/5` as numeric codes (PrintConv hash) and
   // anything else as ASCII-only via `unpack("A4", pack("V", $val))`.
-  let comp_raw = le_u32(&payload[16..20]);
+  let comp_raw = le_u32_at(payload, 16);
   if comp_raw > 256 {
     // pack("V", $val) = little-endian 4-byte; unpack("A4", ...) trims
     // trailing spaces but preserves bytes. Just emit the four bytes as
@@ -1381,31 +1419,31 @@ fn emit_bmp_video_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
   entries.push(RiffEntry::new(
     "File",
     "ImageLength",
-    RiffValue::U32(le_u32(&payload[20..24])),
+    RiffValue::U32(le_u32_at(payload, 20)),
   ));
   // 24: PixelsPerMeterX — int32u (BMP.pm:103-106).
   entries.push(RiffEntry::new(
     "File",
     "PixelsPerMeterX",
-    RiffValue::U32(le_u32(&payload[24..28])),
+    RiffValue::U32(le_u32_at(payload, 24)),
   ));
   // 28: PixelsPerMeterY — int32u (BMP.pm:107-110).
   entries.push(RiffEntry::new(
     "File",
     "PixelsPerMeterY",
-    RiffValue::U32(le_u32(&payload[28..32])),
+    RiffValue::U32(le_u32_at(payload, 28)),
   ));
   // 32: NumColors — int32u (BMP.pm:111-115). PrintConv `0 -> "Use BitDepth"`.
   entries.push(RiffEntry::new(
     "File",
     "NumColors",
-    RiffValue::U32(le_u32(&payload[32..36])),
+    RiffValue::U32(le_u32_at(payload, 32)),
   ));
   // 36: NumImportantColors — int32u (BMP.pm:116-121). PrintConv `0 -> "All"`.
   entries.push(RiffEntry::new(
     "File",
     "NumImportantColors",
-    RiffValue::U32(le_u32(&payload[36..40])),
+    RiffValue::U32(le_u32_at(payload, 36)),
   ));
   // BMP V4 / V5 carries more fields after offset 40; the bundled `strf`
   // for AVI virtually always uses V3 (40-byte header) — V4/V5 fields are
@@ -1484,7 +1522,7 @@ fn emit_cset(body: &[u8], entries: &mut Vec<RiffEntry>) -> Option<u16> {
     if off + 2 > body.len() {
       break;
     }
-    let val = le_u16(&body[off..off + 2]);
+    let val = le_u16_at(body, off);
     if idx == 0 {
       code_page = Some(val);
     }
@@ -1516,9 +1554,10 @@ fn dtim_value_conv(val: &str) -> Option<String> {
     return Some(val.to_string());
   }
   // RIFF.pm:994 `$val = 1e-7 * ($v[0] * 4294967296 + $v[1]);` — Perl coerces
-  // each half through numeric context (leading-digit prefix).
-  let hi = crate::convert::perl_str_to_f64(parts[0]);
-  let lo = crate::convert::perl_str_to_f64(parts[1]);
+  // each half through numeric context (leading-digit prefix). `.get()` is
+  // checked; the `parts.len() != 2` guard above makes both indices present.
+  let hi = crate::convert::perl_str_to_f64(parts.first().copied().unwrap_or(""));
+  let lo = crate::convert::perl_str_to_f64(parts.get(1).copied().unwrap_or(""));
   let mut secs = 1e-7 * (hi * 4_294_967_296.0 + lo);
   // RIFF.pm:996 `$val -= 134774 * 24 * 3600 if $val != 0;`.
   if secs != 0.0 {
@@ -1536,14 +1575,16 @@ fn is_kodak_datetime(val: &str) -> bool {
   if b.len() != 19 {
     return false;
   }
-  // Digit positions: 0-3, 5-6, 8-9, 11-12, 14-15, 17-18.
-  let digit = |i: usize| b[i].is_ascii_digit();
+  // Digit positions: 0-3, 5-6, 8-9, 11-12, 14-15, 17-18. (Checked `.get()` —
+  // the `len() == 19` guard above makes every index in-range ⇒ byte-identical.)
+  let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+  let sep = |i: usize, c: u8| b.get(i) == Some(&c);
   let digits_ok = (0..=3).all(digit)
     && [5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
       .iter()
       .all(|&i| digit(i));
   // Separators: ':' at 4,7,13,16 and ' ' at 10.
-  digits_ok && b[4] == b':' && b[7] == b':' && b[10] == b' ' && b[13] == b':' && b[16] == b':'
+  digits_ok && sep(4, b':') && sep(7, b':') && sep(10, b' ') && sep(13, b':') && sep(16, b':')
 }
 
 // ===========================================================================
@@ -1555,10 +1596,10 @@ fn is_kodak_datetime(val: &str) -> bool {
 /// then decodes through the active charset (see [`Charset::decode`]).
 fn trim_trailing_nulls(bytes: &[u8]) -> &[u8] {
   let mut end = bytes.len();
-  while end > 0 && bytes[end - 1] == 0 {
+  while end > 0 && bytes.get(end - 1) == Some(&0) {
     end -= 1;
   }
-  &bytes[..end]
+  bytes.get(..end).unwrap_or(bytes)
 }
 
 /// Trim trailing NUL bytes from a UTF-8-ish payload and return the resulting
@@ -1653,13 +1694,17 @@ fn convert_riff_date(val: &str) -> String {
   let trimmed = val.trim_end_matches('\0');
   let parts: Vec<&str> = trimmed.split_whitespace().collect();
 
-  // Standard form: "Mon Mar 10 15:04:43 2003".
+  // Standard form: "Mon Mar 10 15:04:43 2003". `.get()` is checked; the
+  // `parts.len() >= 5` guard makes indices 1..=4 present ⇒ byte-identical.
   if parts.len() >= 5
-    && let Some(mon) = month_num(parts[1])
-    && let (Ok(day), year_str) = (parts[2].parse::<u32>(), parts[4])
+    && let Some(mon) = parts.get(1).and_then(|p| month_num(p))
+    && let (Some(Ok(day)), Some(year_str)) = (parts.get(2).map(|p| p.parse::<u32>()), parts.get(4))
     && let Ok(year) = year_str.parse::<u32>()
   {
-    return std::format!("{year:04}:{mon:02}:{day:02} {}", parts[3]);
+    return std::format!(
+      "{year:04}:{mon:02}:{day:02} {}",
+      parts.get(3).copied().unwrap_or("")
+    );
   }
 
   // Casio QV-3EX / EX-Z30: `2001/ 1/27  1:42PM` / `2005/11/28/ 09:19`.
@@ -1830,7 +1875,10 @@ fn parse_digits(bytes: &[u8], i: &mut usize) -> Option<u32> {
   if *i == start {
     return None;
   }
-  core::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
+  core::str::from_utf8(bytes.get(start..*i)?)
+    .ok()?
+    .parse()
+    .ok()
 }
 
 fn parse_n_digits(bytes: &[u8], i: &mut usize, n: usize) -> Option<u32> {
@@ -1843,7 +1891,10 @@ fn parse_n_digits(bytes: &[u8], i: &mut usize, n: usize) -> Option<u32> {
   if count != n {
     return None;
   }
-  core::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
+  core::str::from_utf8(bytes.get(start..*i)?)
+    .ok()?
+    .parse()
+    .ok()
 }
 
 /// `Image::ExifTool::ReadValue` for a `rational64u` (8 bytes = 2 int32u):
@@ -1915,17 +1966,59 @@ fn format_n_sig(val: f64, n: usize) -> String {
 
 #[inline(always)]
 fn le_u16(bytes: &[u8]) -> u16 {
-  u16::from_le_bytes([bytes[0], bytes[1]])
+  // Slice-pattern (NOT indexing — checked-indexing retrofit, Phase C S2): for
+  // every caller `bytes` is a slice of length ≥ 2 (the `le_u16_at` window / a
+  // guarded `&buf[a..a+2]`), so this binds the same two bytes `bytes[0..2]` did;
+  // the `else` is the unreachable no-panic arm.
+  let [a, b, ..] = *bytes else { return 0 };
+  u16::from_le_bytes([a, b])
 }
 
 #[inline(always)]
 fn le_u32(bytes: &[u8]) -> u32 {
-  u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+  let [a, b, c, d, ..] = *bytes else { return 0 };
+  u32::from_le_bytes([a, b, c, d])
 }
 
 #[inline(always)]
 fn le_i32(bytes: &[u8]) -> i32 {
-  i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+  let [a, b, c, d, ..] = *bytes else { return 0 };
+  i32::from_le_bytes([a, b, c, d])
+}
+
+/// Read a little-endian `u16` at byte offset `off` — the checked-indexing form
+/// of `le_u16(&buf[off..off + 2])` (Phase C S2). `buf.get(off..off + 2)` early-
+/// returns `0` for an out-of-range window (which every CALLER's preceding
+/// length guard already excludes ⇒ byte-identical), so no raw slice is taken.
+#[inline(always)]
+fn le_u16_at(buf: &[u8], off: usize) -> u16 {
+  buf.get(off..off.saturating_add(2)).map_or(0, le_u16)
+}
+
+/// Read a little-endian `u32` at byte offset `off` — the checked form of
+/// `le_u32(&buf[off..off + 4])` (Phase C S2; see [`le_u16_at`]).
+#[inline(always)]
+fn le_u32_at(buf: &[u8], off: usize) -> u32 {
+  buf.get(off..off.saturating_add(4)).map_or(0, le_u32)
+}
+
+/// Read a little-endian `i32` at byte offset `off` — the checked form of
+/// `le_i32(&buf[off..off + 4])` (Phase C S2; see [`le_u16_at`]).
+#[inline(always)]
+fn le_i32_at(buf: &[u8], off: usize) -> i32 {
+  buf.get(off..off.saturating_add(4)).map_or(0, le_i32)
+}
+
+/// Read a 4-byte FourCC at byte offset `off` — the checked form of
+/// `buf[off..off + 4].try_into().expect("4 bytes")` (Phase C S2). The window
+/// `buf.get(off..off + 4)` is `Some` for every CALLER (a preceding length
+/// guard), so `[0; 4]` is the unreachable no-panic fallback ⇒ byte-identical.
+#[inline(always)]
+fn fourcc_at(buf: &[u8], off: usize) -> [u8; 4] {
+  buf
+    .get(off..off.saturating_add(4))
+    .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    .unwrap_or([0; 4])
 }
 
 // ===========================================================================
@@ -2556,6 +2649,11 @@ fn bmp_compression_label(val: u32) -> &'static str {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

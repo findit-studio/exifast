@@ -43,6 +43,10 @@
 //! - Verbose VerboseDir/VerboseDump (APE.pm:184-189): no Verbose option in
 //!   this engine.
 
+// Golden-v2 Contract 3c (Phase C, slice S2): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   format_parser::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -241,8 +245,11 @@ fn as_perl_float(v: &TagValue) -> Option<f64> {
 fn is_perl_float(s: &str) -> bool {
   let b = s.as_bytes();
   let mut i = 0;
+  // Checked-indexing (Phase C S2): every `b[i]` had a preceding `i < b.len()`
+  // guard, so `b.get(i)` is `Some` exactly when the old index was in-range ⇒
+  // byte-identical; the `matches!`/`is_some_and` forms fold the guard in.
   // [+-]?
-  if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+  if matches!(b.get(i), Some(b'+' | b'-')) {
     i += 1;
   }
   // Lookahead: \d or .\d
@@ -255,24 +262,24 @@ fn is_perl_float(s: &str) -> bool {
     return false;
   }
   // \d*
-  while i < b.len() && b[i].is_ascii_digit() {
+  while b.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   // (\.\d*)?
-  if i < b.len() && b[i] == b'.' {
+  if b.get(i) == Some(&b'.') {
     i += 1;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
   }
   // ([Ee][+-]?\d+)?
-  if i < b.len() && (b[i] == b'E' || b[i] == b'e') {
+  if matches!(b.get(i), Some(b'E' | b'e')) {
     i += 1;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+    if matches!(b.get(i), Some(b'+' | b'-')) {
       i += 1;
     }
     let exp_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     if i == exp_start {
@@ -316,19 +323,20 @@ fn make_tag(tag: &str) -> String {
     out.push(c.to_ascii_lowercase());
   }
   // s/[^\w-]+(.?)/\U$1/sg
+  // Checked-indexing (Phase C S2): every `bytes[i]` had a preceding
+  // `i < bytes.len()` guard, so `bytes.get(i)` is `Some` exactly when the old
+  // index was in-range ⇒ byte-identical.
   let bytes = out.as_bytes();
   let mut out2 = String::with_capacity(out.len());
   let mut i = 0;
-  while i < bytes.len() {
-    let b = bytes[i];
+  while let Some(&b) = bytes.get(i) {
     let is_word_or_dash = b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     if is_word_or_dash {
       out2.push(b as char);
       i += 1;
     } else {
       // Consume the run of [^\w-].
-      while i < bytes.len() {
-        let bb = bytes[i];
+      while let Some(&bb) = bytes.get(i) {
         let kw = bb.is_ascii_alphanumeric() || bb == b'_' || bb == b'-';
         if kw {
           break;
@@ -336,9 +344,8 @@ fn make_tag(tag: &str) -> String {
         i += 1;
       }
       // (.?) — optionally consume one more char (any) and uppercase it.
-      if i < bytes.len() {
-        let nxt = bytes[i] as char;
-        out2.push(nxt.to_ascii_uppercase());
+      if let Some(&nb) = bytes.get(i) {
+        out2.push((nb as char).to_ascii_uppercase());
         i += 1;
       }
       // If end-of-string here, the empty (.?) matched ε — nothing appended.
@@ -356,14 +363,14 @@ fn make_tag(tag: &str) -> String {
   // Match-driven walk: at each position j, check whether the THREE
   // bytes at j..j+3 form `[a-z0-9]_[a-z]`. If so, consume them and
   // emit `<bs[j]><uppercase(bs[j+2])>`. Else emit bs[j] and advance 1.
+  // Checked-indexing (Phase C S2): the `bs[j]` after `while j < bs.len()` and
+  // the `bs[j+1]`/`bs[j+2]` inside `if j + 2 < bs.len()` are all in-range; the
+  // `while let`/`get` forms preserve the same accesses ⇒ byte-identical.
   let bs = out2.as_bytes();
   let mut out3 = String::with_capacity(out2.len());
   let mut j = 0;
-  while j < bs.len() {
-    if j + 2 < bs.len() {
-      let a = bs[j];
-      let u = bs[j + 1];
-      let b = bs[j + 2];
+  while let Some(&a) = bs.get(j) {
+    if let (Some(&u), Some(&b)) = (bs.get(j + 1), bs.get(j + 2)) {
       let a_ok = a.is_ascii_lowercase() || a.is_ascii_digit();
       if a_ok && u == b'_' && b.is_ascii_lowercase() {
         out3.push(a as char);
@@ -372,7 +379,7 @@ fn make_tag(tag: &str) -> String {
         continue;
       }
     }
-    out3.push(bs[j] as char);
+    out3.push(a as char);
     j += 1;
   }
   // === ExifTool.pm:9243-9255 `AddTagToTable` post-processing ===========
@@ -607,13 +614,45 @@ fn read_le_uint(data: &[u8], offset: usize, width: usize) -> Option<u64> {
   if end > data.len() {
     return None;
   }
-  let bytes = &data[offset..end];
+  // Checked-indexing (Phase C S2): `.get(offset..end)?` is `Some` here (the
+  // `end > len` guard above), and the slice-patterns bind the same bytes the
+  // raw `bytes[0..width]` did ⇒ byte-identical.
+  let bytes = data.get(offset..end)?;
   Some(match width {
-    2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
-    4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+    2 => {
+      let [b0, b1, ..] = *bytes else { return None };
+      u16::from_le_bytes([b0, b1]) as u64
+    }
+    4 => {
+      let [b0, b1, b2, b3, ..] = *bytes else {
+        return None;
+      };
+      u32::from_le_bytes([b0, b1, b2, b3]) as u64
+    }
     // Unreachable for current APE tables; safe default so this fn never panics.
     _ => return None,
   })
+}
+
+/// Read a little-endian `u16` at byte offset `off` — the checked-indexing form
+/// of `u16::from_le_bytes([buf[off], buf[off + 1]])` (Phase C S2). `buf.get(..)`
+/// early-returns `0` for an out-of-range window (which every CALLER's preceding
+/// guard already excludes ⇒ byte-identical), so no raw index is taken.
+fn le_u16_at(buf: &[u8], off: usize) -> u16 {
+  match buf.get(off..off.saturating_add(2)) {
+    Some(&[b0, b1, ..]) => u16::from_le_bytes([b0, b1]),
+    _ => 0,
+  }
+}
+
+/// Read a little-endian `u32` at byte offset `off` — the checked form of
+/// `u32::from_le_bytes([buf[off], …, buf[off + 3]])` (Phase C S2; see
+/// [`le_u16_at`]).
+fn le_u32_at(buf: &[u8], off: usize) -> u32 {
+  match buf.get(off..off.saturating_add(4)) {
+    Some(&[b0, b1, b2, b3, ..]) => u32::from_le_bytes([b0, b1, b2, b3]),
+    _ => 0,
+  }
 }
 
 /// Resolve a header field's static TagDef. APE header tags share the SAME
@@ -792,11 +831,15 @@ fn ape_duration_value_conv(v: &TagValue) -> TagValue {
 /// (Engine-tier promotion is the right move once a second format consumer
 /// arrives.)
 fn perl_numeric_coerce_f64(s: &str) -> f64 {
+  // Checked-indexing (Phase C S2): every `bytes[i]` had a preceding
+  // `i < bytes.len()` guard and `&bytes[i..]` always has `i <= len` (i only
+  // advances past a `.get`-checked byte), so the `.get()` forms below read the
+  // same bytes and take the same branches ⇒ byte-identical.
   let bytes = s.as_bytes();
   let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
   let mut i = 0;
   // 1. Leading ASCII whitespace.
-  while i < bytes.len() && is_ws(bytes[i]) {
+  while bytes.get(i).copied().is_some_and(is_ws) {
     i += 1;
   }
   // 2. Optional dual-sign parsing (Codex r7 finding). Perl's numeric
@@ -821,19 +864,23 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
   let mut neg = false;
   let mut sign_count = 0u8;
   // Sign 1.
-  if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-    if bytes[i] == b'-' {
+  if let Some(&sign1) = bytes.get(i)
+    && (sign1 == b'+' || sign1 == b'-')
+  {
+    if sign1 == b'-' {
       neg = !neg;
     }
     i += 1;
     sign_count = 1;
     // Optional whitespace between sign 1 and sign 2 / digits.
-    while i < bytes.len() && is_ws(bytes[i]) {
+    while bytes.get(i).copied().is_some_and(is_ws) {
       i += 1;
     }
     // Sign 2 (no whitespace after this sign).
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-      if bytes[i] == b'-' {
+    if let Some(&sign2) = bytes.get(i)
+      && (sign2 == b'+' || sign2 == b'-')
+    {
+      if sign2 == b'-' {
         neg = !neg;
       }
       i += 1;
@@ -843,28 +890,33 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
   // After sign 2, if there's another sign character OR whitespace, Perl
   // rejects the whole prefix. (Empirically: "+--20" / "-+ 20" / "+- 20"
   // all return 0.)
-  if sign_count == 2 && i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-' || is_ws(bytes[i]))
+  if sign_count == 2
+    && bytes
+      .get(i)
+      .is_some_and(|&b| b == b'+' || b == b'-' || is_ws(b))
   {
     return 0.0;
   }
   // 3. Special tokens Inf/Infinity/NaN (Codex r6 + r7). Case-insensitive
   // ASCII; PREFIX scan — `"InfX" + 0` is still Inf.
   let starts_with_ci = |rest: &[u8], lit: &[u8]| -> bool {
-    rest.len() >= lit.len()
-      && rest[..lit.len()]
+    rest.get(..lit.len()).is_some_and(|head| {
+      head
         .iter()
         .zip(lit.iter())
         .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
   };
+  let tail = bytes.get(i..).unwrap_or(&[]);
   // Match "Infinity" first (longest), then "Inf", then "NaN".
-  if starts_with_ci(&bytes[i..], b"Infinity") || starts_with_ci(&bytes[i..], b"Inf") {
+  if starts_with_ci(tail, b"Infinity") || starts_with_ci(tail, b"Inf") {
     return if neg {
       f64::NEG_INFINITY
     } else {
       f64::INFINITY
     };
   }
-  if starts_with_ci(&bytes[i..], b"NaN") {
+  if starts_with_ci(tail, b"NaN") {
     // Perl NaN has no sign distinction in stringification ("NaN" not
     // "-NaN"), so we ignore `neg` here.
     return f64::NAN;
@@ -874,14 +926,14 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
   // only, manually wrapping the sign into the parsed value.
   let num_start = i;
   let digits_before_dot_start = i;
-  while i < bytes.len() && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   let had_int_digits = i > digits_before_dot_start;
-  if i < bytes.len() && bytes[i] == b'.' {
+  if bytes.get(i) == Some(&b'.') {
     i += 1;
     let frac_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     let had_frac_digits = i > frac_start;
@@ -895,13 +947,13 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
   }
   // Optional exponent.
   let pre_exp = i;
-  if i < bytes.len() && (bytes[i] == b'E' || bytes[i] == b'e') {
+  if matches!(bytes.get(i), Some(b'E' | b'e')) {
     i += 1;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
       i += 1;
     }
     let exp_digits_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     if i == exp_digits_start {
@@ -912,7 +964,11 @@ fn perl_numeric_coerce_f64(s: &str) -> f64 {
     }
   }
   // Parse the matched numeric prefix as positive, then apply the sign.
-  let mag = s[num_start..i].parse::<f64>().unwrap_or(0.0);
+  // `s.get(num_start..i)` is `Some` (num_start <= i <= len) ⇒ byte-identical.
+  let mag = s
+    .get(num_start..i)
+    .and_then(|t| t.parse::<f64>().ok())
+    .unwrap_or(0.0);
   if neg { -mag } else { mag }
 }
 
@@ -2388,13 +2444,16 @@ fn plan_apetagex_trailer_only(data: &[u8], print_conv_enabled: bool, done_id3: u
     None => return plan,
   };
   // APE.pm:171 `$raf->Read($buff, 32) == 32 or return 1` — slice must
-  // be 32 bytes; guaranteed by `data.len() >= 32 + id3_shift`.
-  let footer = &data[trailer_off..trailer_off + 32];
+  // be 32 bytes; guaranteed by `data.len() >= 32 + id3_shift`. Checked
+  // `.get()`: `Some` here (the `checked_sub` above), so byte-identical.
+  let Some(footer) = data.get(trailer_off..trailer_off + 32) else {
+    return plan;
+  };
   // APE.pm:172 `$buff =~ /^APETAGEX/ or return 1` — silent if absent.
   if !footer.starts_with(b"APETAGEX") {
     return plan;
   }
-  let size_raw = u32::from_le_bytes([footer[12], footer[13], footer[14], footer[15]]);
+  let size_raw = le_u32_at(footer, 12);
   match decode_apetagex_body_size(size_raw) {
     None => {
       // APE.pm:194 `$count = -1` ⇒ Warn.
@@ -2403,9 +2462,10 @@ fn plan_apetagex_trailer_only(data: &[u8], print_conv_enabled: bool, done_id3: u
     Some(body_size) => match trailer_off.checked_sub(body_size) {
       None => plan.warn_bad_trailer = true, // seek-back would underflow
       Some(body_start) => {
-        let body = &data[body_start..trailer_off];
-        let count = u32::from_le_bytes([footer[16], footer[17], footer[18], footer[19]]) as usize;
-        consume_apetagex_tag_stream(body, count, print_conv_enabled, &mut plan);
+        if let Some(body) = data.get(body_start..trailer_off) {
+          let count = le_u32_at(footer, 16) as usize;
+          consume_apetagex_tag_stream(body, count, print_conv_enabled, &mut plan);
+        }
       }
     },
   }
@@ -2435,9 +2495,10 @@ fn plan_ape_inner(
   if data.len() < 32 {
     return None;
   }
-  // APE.pm:138 `$buff =~ /^(MAC |APETAGEX)/ or return 0;`
-  let is_mac = data[..4] == *b"MAC ";
-  let is_apetagex = data[..8] == *b"APETAGEX";
+  // APE.pm:138 `$buff =~ /^(MAC |APETAGEX)/ or return 0;`. Checked `.get()`:
+  // `data.len() >= 32` (guarded above) ⇒ both windows present ⇒ byte-identical.
+  let is_mac = data.get(..4) == Some(b"MAC ".as_slice());
+  let is_apetagex = data.get(..8) == Some(b"APETAGEX".as_slice());
   if !is_mac && !is_apetagex {
     return None;
   }
@@ -2449,8 +2510,9 @@ fn plan_ape_inner(
 
   // ----- MAC header processing (APE.pm:146-160) --------------------------
   let header_job: HeaderJob = if is_mac {
-    // APE.pm:147 `$vers = Get16u(\$buff, 4)` (LE).
-    let vers = u16::from_le_bytes([data[4], data[5]]);
+    // APE.pm:147 `$vers = Get16u(\$buff, 4)` (LE). Checked `le_u16_at`: the
+    // `data.len() >= 32` guard makes the read in-range ⇒ byte-identical.
+    let vers = le_u16_at(data, 4);
     if vers <= 3970 {
       // APE.pm:149-151: `$buff = substr($buff, 4)` ⇒ OldHeader payload
       // starts at byte 4 of the file (after the `MAC ` magic).
@@ -2461,20 +2523,27 @@ fn plan_ape_inner(
       // (many KB) shouldn't pay a whole-file copy here.
       const OLD_HEADER_MAX_BYTES: usize = 28;
       let take = (data.len() - 4).min(OLD_HEADER_MAX_BYTES);
-      HeaderJob::Old(data[4..4 + take].to_vec())
+      // Checked `.get()`: `4 + take <= data.len()` (take <= data.len() - 4) ⇒
+      // `Some` ⇒ byte-identical; the empty fallback is unreachable.
+      HeaderJob::Old(data.get(4..4 + take).unwrap_or(&[]).to_vec())
     } else {
       // APE.pm:153-159: $dlen=Get32u(8), $hlen=Get32u(12); if neither
       // has bit 31 set, the NewHeader body is at $dlen..$dlen+$hlen.
-      let dlen = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-      let hlen = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+      let dlen = le_u32_at(data, 8) as usize;
+      let hlen = le_u32_at(data, 12) as usize;
       let high_bit = 0x8000_0000usize;
       let mut job = HeaderJob::None;
       if (dlen & high_bit) == 0 && (hlen & high_bit) == 0 {
         // APE.pm:156 `$raf->Seek($dlen,0) and $raf->Read($buff,$hlen)
         // == $hlen` — only proceed if BOTH seek and read succeed.
         let end = dlen.saturating_add(hlen);
-        if dlen <= data.len() && end <= data.len() {
-          job = HeaderJob::New(data[dlen..end].to_vec());
+        // Checked `.get()`: the `dlen <= len && end <= len` guard makes the
+        // window present ⇒ `Some` ⇒ byte-identical.
+        if dlen <= data.len()
+          && end <= data.len()
+          && let Some(body) = data.get(dlen..end)
+        {
+          job = HeaderJob::New(body.to_vec());
         }
       }
       job
@@ -2504,18 +2573,20 @@ fn plan_ape_inner(
   // `plan_ape` so the boundary semantics can be unit-tested directly,
   // Codex r15 finding.)
   let header_state: HeaderState<'_> = if header_at_start {
-    let header = &data[..32];
-    let size_raw = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+    // Checked `.get()`: `data.len() >= 32` (guarded above) ⇒ `Some`.
+    let header = data.get(..32).unwrap_or(&[]);
+    let size_raw = le_u32_at(header, 12);
     match decode_apetagex_body_size(size_raw) {
       None => HeaderState::HeaderInvalid,
       Some(body_size) => {
         let end = 32usize.saturating_add(body_size);
-        // APE.pm:183 `$raf->Read($buff, $size) == $size` — strictly equal,
-        // so a short read (`end > data.len()`) also fails ⇒ `$count = -1`.
-        if end <= data.len() {
-          HeaderState::HeaderAndBody(header, &data[32..end])
-        } else {
-          HeaderState::HeaderInvalid
+        // APE.pm:183 `$raf->Read($buff, $size) == $size` — strictly equal, so a
+        // short read (`end > data.len()`) fails ⇒ `$count = -1`. `data.get(32..
+        // end)` is `Some` iff `end <= data.len()` (32 <= end always), exactly the
+        // old `end <= data.len()` guard ⇒ byte-identical.
+        match data.get(32..end) {
+          Some(body) => HeaderState::HeaderAndBody(header, body),
+          None => HeaderState::HeaderInvalid,
         }
       }
     }
@@ -2536,12 +2607,14 @@ fn plan_ape_inner(
         warn_bad_trailer: false,
       });
     };
-    let footer = &data[trailer_off..trailer_off + 32];
+    // Checked `.get()`: `Some` here (the `checked_sub(32 + id3_shift)` above) ⇒
+    // byte-identical; the empty fallback is unreachable.
+    let footer = data.get(trailer_off..trailer_off + 32).unwrap_or(&[]);
     if !footer.starts_with(b"APETAGEX") {
       // APE.pm:172 `$buff =~ /^APETAGEX/ or return 1` — no trailer, no Warn.
       HeaderState::NoHeader
     } else {
-      let size_raw = u32::from_le_bytes([footer[12], footer[13], footer[14], footer[15]]);
+      let size_raw = le_u32_at(footer, 12);
       match decode_apetagex_body_size(size_raw) {
         None => HeaderState::HeaderInvalid,
         Some(body_size) => {
@@ -2552,7 +2625,10 @@ fn plan_ape_inner(
           // between body_start and trailer_off, which is `body_size`
           // bytes).
           match trailer_off.checked_sub(body_size) {
-            Some(body_start) => HeaderState::HeaderAndBody(footer, &data[body_start..trailer_off]),
+            Some(body_start) => match data.get(body_start..trailer_off) {
+              Some(body) => HeaderState::HeaderAndBody(footer, body),
+              None => HeaderState::HeaderInvalid,
+            },
             None => HeaderState::HeaderInvalid,
           }
         }
@@ -2572,7 +2648,7 @@ fn plan_ape_inner(
 
   if let HeaderState::HeaderAndBody(header, body) = header_state {
     // APE.pm:178 `($version, $size, $count, $flags) = unpack('x8V4', $buff)`.
-    let count = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+    let count = le_u32_at(header, 16) as usize;
     consume_apetagex_tag_stream(body, count, print_conv_enabled, &mut plan);
   }
 
@@ -2600,19 +2676,23 @@ fn consume_apetagex_tag_stream(
     if pos + 8 > actual_size {
       break;
     }
-    // APE.pm:203 `Get32u(buff, pos)`.
-    let tag_len =
-      u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
-    // APE.pm:204 `Get32u(buff, pos+4)`.
-    let tag_flags =
-      u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]);
+    // APE.pm:203/204 `Get32u(buff, pos)` / `Get32u(buff, pos+4)`. Checked
+    // `le_u32_at`: the `pos + 8 > actual_size` guard above makes both reads
+    // in-range ⇒ byte-identical.
+    let tag_len = le_u32_at(body, pos) as usize;
+    let tag_flags = le_u32_at(body, pos + 4);
     // APE.pm:205-206 NUL-terminated key starting at pos+8.
     let key_start = pos + 8;
-    let Some(nul_off) = body[key_start..actual_size].iter().position(|&b| b == 0) else {
+    // `body.get(key_start..actual_size)` is `Some` (key_start = pos + 8 <=
+    // actual_size from the guard; actual_size == body.len()) ⇒ byte-identical.
+    let Some(nul_off) = body
+      .get(key_start..actual_size)
+      .and_then(|s| s.iter().position(|&b| b == 0))
+    else {
       // Perl regex /\G(.*?)\0/sg fails ⇒ `last`.
       break;
     };
-    let key_bytes = &body[key_start..key_start + nul_off];
+    let key_bytes = body.get(key_start..key_start + nul_off).unwrap_or(&[]);
     // APE keys are ASCII per APE spec; lossy-utf8 the worst case so we
     // never panic. (Faithful: Perl strings carry raw bytes.)
     let key_str_owned = String::from_utf8_lossy(key_bytes).to_string();
@@ -2624,8 +2704,9 @@ fn consume_apetagex_tag_stream(
     if pos + tag_len > actual_size {
       break;
     }
-    // APE.pm:212 `$val = substr($buff, $pos, $len);`.
-    let val_bytes = &body[pos..pos + tag_len];
+    // APE.pm:212 `$val = substr($buff, $pos, $len);`. Checked `.get()`: `Some`
+    // here (the `pos + tag_len > actual_size` guard) ⇒ byte-identical.
+    let val_bytes = body.get(pos..pos + tag_len).unwrap_or(&[]);
     // APE.pm:214 `if (($flags & 0x06) == 0x02) { ... binary ... }`.
     let is_binary = (tag_flags & 0x06) == 0x02;
 
@@ -2647,15 +2728,22 @@ fn consume_apetagex_tag_stream(
         // ZERO-length leading run (just `\0` at offset 0 matches with
         // $1 == "").
         let mut n_prefix = 0usize;
-        while n_prefix < val_bytes.len() && (0x20..=0x7e).contains(&val_bytes[n_prefix]) {
+        // Checked `.get()`: the loop only advances while the byte is present,
+        // and the `n_prefix < len` guard makes `val_bytes[n_prefix]` /
+        // `val_bytes[..n_prefix]` / `val_bytes[n_prefix + 1..]` in-range ⇒
+        // byte-identical.
+        while val_bytes
+          .get(n_prefix)
+          .is_some_and(|&b| (0x20..=0x7e).contains(&b))
+        {
           n_prefix += 1;
         }
-        if n_prefix < val_bytes.len() && val_bytes[n_prefix] == 0 {
+        if val_bytes.get(n_prefix) == Some(&0) {
           // Regex matched: ALWAYS strip $&. The remainder is the
           // binary value the parent HandleTag receives.
-          let desc = &val_bytes[..n_prefix];
+          let desc = val_bytes.get(..n_prefix).unwrap_or(&[]);
           let desc_str = String::from_utf8_lossy(desc).to_string();
-          let rest = &val_bytes[n_prefix + 1..];
+          let rest = val_bytes.get(n_prefix + 1..).unwrap_or(&[]);
           // APE.pm:221 `if ($1)` — Perl truthy: non-empty AND not "0".
           let truthy = !desc.is_empty() && desc_str != "0";
           if truthy {
@@ -2749,6 +2837,11 @@ fn key_to_static_lookup(key: &str) -> &'static str {
 // =============================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;

@@ -113,6 +113,10 @@
 //!   names (bounded-short); `String` for the unbounded text-record values.
 //! - Cite `PNG.pm:LLLL` for every non-trivial decode branch.
 
+// Golden-v2 Contract 3c (Phase C, slice S2): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::format_parser::{FormatParser, parser_sealed};
 use crate::metadata::PngExifEvent;
 use crate::metadata::png::IhdrFields;
@@ -241,8 +245,10 @@ pub fn parse_borrowed(data: &[u8]) -> Option<PngMeta<'_>> {
 /// `None`. Otherwise this ALWAYS returns `Some(meta)` (truncations and CRC
 /// failures land as warnings in the [`PngMeta`]).
 fn parse_inner(data: &[u8]) -> Option<PngMeta<'_>> {
-  // `PNG.pm:1424` signature gate.
-  if data.len() < PNG_SIGNATURE.len() || &data[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
+  // `PNG.pm:1424` signature gate. Checked `.get()`: a too-short buffer makes
+  // `.get(..N)` `None` (≠ `Some(sig)`) ⇒ same early-return as the old
+  // `data.len() < N` guard ⇒ byte-identical.
+  if data.get(..PNG_SIGNATURE.len()) != Some(PNG_SIGNATURE.as_slice()) {
     return None;
   }
 
@@ -304,9 +310,16 @@ fn parse_inner(data: &[u8]) -> Option<PngMeta<'_>> {
       meta.begin_trailer();
     }
 
-    let len_be = [header[0], header[1], header[2], header[3]];
+    // `header` is `data.get(pos..pos + 8)` (length exactly 8). Checked-indexing
+    // (Phase C S2): the slice-pattern binds the same 8 bytes `header[0..8]` did;
+    // the `else` is unreachable (the `.get(pos..pos + 8)` above succeeded) ⇒
+    // byte-identical.
+    let &[h0, h1, h2, h3, h4, h5, h6, h7, ..] = header else {
+      return Some(meta);
+    };
+    let len_be = [h0, h1, h2, h3];
     let len = u32::from_be_bytes(len_be) as usize;
-    let chunk_type: [u8; 4] = [header[4], header[5], header[6], header[7]];
+    let chunk_type: [u8; 4] = [h4, h5, h6, h7];
 
     // `PNG.pm:1490-1492`: `if ($len > 0x7fffffff)`. The warning is gated
     // `unless ($wasEnd)` (`PNG.pm:1491`) — in a trailer, bundled stops without
@@ -483,17 +496,20 @@ fn decode_ihdr(meta: &mut PngMeta<'_>, data: &[u8]) {
   // A short/oversized IHDR is corrupt; bundled silently ignores the
   // missing tags through `ProcessBinaryData`'s out-of-range checks. We
   // require all 13 bytes — anything shorter ⇒ skip.
-  if data.len() < 13 {
+  // Checked-indexing (Phase C S2): the slice-pattern binds the same 13 bytes
+  // `data[0..13]` did; a shorter buffer takes the same skip path as the old
+  // `data.len() < 13` guard ⇒ byte-identical.
+  let &[d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, ..] = data else {
     return;
-  }
+  };
   meta.set_ihdr(IhdrFields {
-    width: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
-    height: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
-    bit_depth: data[8],
-    color_type: data[9],
-    compression: data[10],
-    filter: data[11],
-    interlace: data[12],
+    width: u32::from_be_bytes([d0, d1, d2, d3]),
+    height: u32::from_be_bytes([d4, d5, d6, d7]),
+    bit_depth: d8,
+    color_type: d9,
+    compression: d10,
+    filter: d11,
+    interlace: d12,
   });
 }
 
@@ -509,12 +525,13 @@ fn decode_ihdr(meta: &mut PngMeta<'_>, data: &[u8]) {
 /// | 4      | 4      | PixelsPerUnitY | int32u |
 /// | 8      | 1      | PixelUnits     | int8u  |
 fn decode_phys(meta: &mut PngMeta<'_>, data: &[u8]) {
-  if data.len() < 9 {
+  // Checked-indexing (Phase C S2): the slice-pattern binds the same 9 bytes
+  // `data[0..9]` did; a shorter buffer skips like the old guard ⇒ byte-identical.
+  let &[d0, d1, d2, d3, d4, d5, d6, d7, units, ..] = data else {
     return;
-  }
-  let ppu_x = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-  let ppu_y = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-  let units = data[8];
+  };
+  let ppu_x = u32::from_be_bytes([d0, d1, d2, d3]);
+  let ppu_y = u32::from_be_bytes([d4, d5, d6, d7]);
   meta.set_phys(ppu_x, ppu_y, units);
 }
 
@@ -779,17 +796,21 @@ fn process_profile(body: &[u8], name: &str) -> Option<DecodedProfile> {
   // not USE the profile type for routing (we key on content like bundled's
   // EXIF arm), but the `Unknown raw profile '<type>'` warning needs it, so
   // capture it.
+  // Checked-indexing (Phase C S2): `type_end` is a `position()` result (so
+  // `rest[..type_end]` / `rest[type_end + 1..]` are in-range); every
+  // `after_type[i]` had an `i < after_type.len()` guard; `digit_start..i` and
+  // `i + 1..` are in-range after the digit scan + `\n` check ⇒ byte-identical.
   let type_end = rest.iter().position(|&b| b == b'\n')?;
-  let profile_type = &rest[..type_end];
-  let after_type = &rest[type_end + 1..];
+  let profile_type = rest.get(..type_end).unwrap_or(&[]);
+  let after_type = rest.get(type_end + 1..).unwrap_or(&[]);
   // `\s*(\d+)\n` — optional leading ASCII whitespace, then a decimal length,
   // then a newline. Perl `\s` is `[ \t\n\r\f\v]`; `\d` is `[0-9]`.
   let mut i = 0;
-  while i < after_type.len() && after_type[i].is_ascii_whitespace() {
+  while after_type.get(i).is_some_and(u8::is_ascii_whitespace) {
     i += 1;
   }
   let digit_start = i;
-  while i < after_type.len() && after_type[i].is_ascii_digit() {
+  while after_type.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   // Need at least one digit and a terminating `\n` (`PNG.pm:1166` `(\d+)\n`).
@@ -799,11 +820,12 @@ fn process_profile(body: &[u8], name: &str) -> Option<DecodedProfile> {
   // `$2` is ASCII digits — parse as the declared length. A value that overflows
   // `usize` cannot equal any real decoded length, so the wrong-size branch
   // fires; saturate to keep the comparison well-defined.
-  let declared_len: usize = core::str::from_utf8(&after_type[digit_start..i])
-    .ok()
+  let declared_len: usize = after_type
+    .get(digit_start..i)
+    .and_then(|d| core::str::from_utf8(d).ok())
     .and_then(|s| s.parse::<usize>().ok())
     .unwrap_or(usize::MAX);
-  let hex_region = &after_type[i + 1..];
+  let hex_region = after_type.get(i + 1..).unwrap_or(&[]);
 
   // `pack('H*', join('',split(' ',$3)))` — strip ALL ASCII whitespace, then
   // hex-decode. Perl's `pack('H*', …)` ignores a trailing nibble (an odd-length
@@ -1015,9 +1037,10 @@ fn decode_iccp(meta: &mut PngMeta<'_>, data: &[u8]) {
   }
   meta.set_icc_profile_name(SmolStr::new(&keyword));
   // `compressed = 2 + method` (`PNG.pm:1294`); the compression-method byte is
-  // `after[1]`, the compressed profile starts at `after[2]`.
-  let method = after[1];
-  let payload = &after[2..];
+  // `after[1]`, the compressed profile starts at `after[2]`. Checked-indexing
+  // (Phase C S2): the `after.len() < 2` guard makes both `Some` ⇒ byte-identical.
+  let method = after.get(1).copied().unwrap_or(0);
+  let payload = after.get(2..).unwrap_or(&[]);
   match inflate_chunk(method, payload) {
     // Inflated cleanly: the ICC profile is available but we do NOT decode it
     // into `ICC_Profile:*` tags (no ICC_Profile sub-port — deferred). Bundled
@@ -1055,7 +1078,9 @@ fn decode_text(meta: &mut PngMeta<'_>, data: &[u8]) {
   // Skip the NUL. The remaining bytes are the Latin-1 value (which, for a
   // `Raw profile type X` chunk, is the ImageMagick hex-profile body — pure
   // ASCII, so the raw bytes ARE the body bundled hands to `ProcessProfile`).
-  let value_bytes = &after[1..];
+  // Checked-indexing (Phase C S2): `after` always holds the NUL at index 0, so
+  // `after.get(1..)` is `Some` ⇒ byte-identical to `&after[1..]`.
+  let value_bytes = after.get(1..).unwrap_or(&[]);
   let keyword = decode_latin1(keyword_bytes);
   if keyword.is_empty() {
     return;
@@ -1116,9 +1141,10 @@ fn decode_ztxt(meta: &mut PngMeta<'_>, data: &[u8]) {
     return;
   }
   // `compressed = 2 + method` (`PNG.pm:1294`); method byte = `after[1]`, the
-  // compressed value starts at `after[2]`.
-  let method = after[1];
-  let payload = &after[2..];
+  // compressed value starts at `after[2]`. Checked-indexing (Phase C S2): the
+  // `after.len() < 2` guard makes both `Some` ⇒ byte-identical.
+  let method = after.get(1).copied().unwrap_or(0);
+  let payload = after.get(2..).unwrap_or(&[]);
   match inflate_chunk(method, payload) {
     Inflate::Ok(inflated) => {
       // A REGISTERED `Raw profile type X` zTXt routes the INFLATED bytes to
@@ -1196,29 +1222,32 @@ fn decode_itxt(meta: &mut PngMeta<'_>, data: &[u8]) {
     return;
   };
   let (keyword_bytes, after) = data.split_at(nul);
-  let dat = &after[1..]; // skip NUL
+  // Checked-indexing (Phase C S2): `after`/`after_l`/`after_t` each hold a NUL
+  // at index 0, so `.get(1..)` is `Some`; `dat[0]`/`dat[1]`/`dat[2..]` are
+  // bounded by the `dat.len() < 4` guard ⇒ byte-identical.
+  let dat = after.get(1..).unwrap_or(&[]); // skip NUL
   // `PNG.pm:1343`: `length($dat) >= 4` — compressed + method + 2 NULs.
   if dat.len() < 4 {
     return;
   }
-  let compressed = dat[0] != 0;
-  let method = dat[1];
+  let compressed = dat.first().copied().unwrap_or(0) != 0;
+  let method = dat.get(1).copied().unwrap_or(0);
   // `PNG.pm:1345`: `split /\0/, substr($dat, 2), 3` — language, translated
   // keyword, then the value (which may contain raw NULs in compressed
   // payloads — but `split /\0/, …, 3` keeps the third field as the rest
   // of the string). We replicate that semantics: find the first NUL
   // (language end), the second NUL (translated-keyword end), then value
   // is the remainder.
-  let rest = &dat[2..];
+  let rest = dat.get(2..).unwrap_or(&[]);
   let nul1 = rest.iter().position(|&b| b == 0);
   let Some(n1) = nul1 else { return };
   let (language_bytes, after_l) = rest.split_at(n1);
-  let rest2 = &after_l[1..]; // skip NUL
+  let rest2 = after_l.get(1..).unwrap_or(&[]); // skip NUL
   let Some(n2) = rest2.iter().position(|&b| b == 0) else {
     return;
   };
   let (translated_bytes, after_t) = rest2.split_at(n2);
-  let value_bytes = &after_t[1..]; // skip NUL
+  let value_bytes = after_t.get(1..).unwrap_or(&[]); // skip NUL
 
   let keyword = decode_latin1(keyword_bytes);
   if keyword.is_empty() {
@@ -1359,10 +1388,12 @@ fn decode_exif(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
   // type, interpolated into the `Invalid $tag chunk` (`PNG.pm:1382`) and
   // `Error inflating $tag` (`PNG.pm:943`) warnings. `chunk` is `eXIf`/`zxIf`.
   let tag = core::str::from_utf8(chunk).unwrap_or("eXIf");
-  // `PNG.pm:1368-1373`: improper `Exif\0\0` prefix.
+  // `PNG.pm:1368-1373`: improper `Exif\0\0` prefix. Checked `.get(6..)`: `Some`
+  // because the `starts_with(b"Exif\0\0")` arm guarantees len ≥ 6 ⇒
+  // byte-identical to `&data[6..]`.
   let block: &[u8] = if data.starts_with(b"Exif\0\0") {
     meta.push_warning(String::from("Improper \"Exif00\" header in EXIF chunk"));
-    &data[6..]
+    data.get(6..).unwrap_or(&[])
   } else {
     data
   };
@@ -1371,11 +1402,12 @@ fn decode_exif(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
   // (`parse_exif_block`) does, returning `None` on a bad block. But the
   // BUNDLED warning fires from inside `ProcessPNG_eXIf` before
   // `ProcessTIFF` runs, so we emit it here too.
-  if block.is_empty() {
+  // Checked `.get(0)`: `None` only when empty, but the `is_empty` guard already
+  // returned ⇒ byte-identical to `block[0]`.
+  let Some(&first) = block.first() else {
     meta.push_warning(format!("Invalid {tag} chunk"));
     return;
-  }
-  let first = block[0];
+  };
   if first != 0 && !block.starts_with(b"II") && !block.starts_with(b"MM") {
     meta.push_warning(format!("Invalid {tag} chunk"));
     return;
@@ -1404,7 +1436,9 @@ fn decode_exif(meta: &mut PngMeta<'_>, chunk: &[u8; 4], data: &[u8]) {
         // reset, `PNG.pm:1358`).
         let inner: &[u8] = if tiff.starts_with(b"Exif\0\0") {
           meta.push_warning(String::from("Improper \"Exif00\" header in EXIF chunk"));
-          &tiff[6..]
+          // Checked `.get(6..)`: `Some` (the `starts_with` arm ⇒ len ≥ 6) ⇒
+          // byte-identical to `&tiff[6..]`.
+          tiff.get(6..).unwrap_or(&[])
         } else {
           &tiff
         };
@@ -1439,16 +1473,23 @@ fn decode_bkgd(meta: &mut PngMeta<'_>, data: &[u8]) {
   if data.is_empty() {
     return;
   }
+  // Checked-indexing (Phase C S2): `data[0]` runs in the `len < 2` arm after
+  // the non-empty guard (len == 1); the `data[i]`/`data[i + 1]` reads sit under
+  // `while i + 2 <= data.len()` so `data.get(i..i + 2)` is `Some` ⇒
+  // byte-identical.
   let value = if data.len() < 2 {
     // Single int8u (palette index).
-    std::format!("{}", data[0])
+    std::format!("{}", data.first().copied().unwrap_or(0))
   } else {
     // Series of int16u BE values.
     let mut s = String::new();
     let mut first = true;
     let mut i = 0;
     while i + 2 <= data.len() {
-      let v = u16::from_be_bytes([data[i], data[i + 1]]);
+      let v = match data.get(i..i + 2) {
+        Some(&[hi, lo, ..]) => u16::from_be_bytes([hi, lo]),
+        _ => break,
+      };
       if !first {
         s.push(' ');
       }
@@ -1471,19 +1512,14 @@ fn decode_bkgd(meta: &mut PngMeta<'_>, data: &[u8]) {
 /// $val))'`. The payload is `year:u16 BE, month:u8, day:u8, hour:u8,
 /// minute:u8, second:u8` — 7 bytes.
 fn decode_time(meta: &mut PngMeta<'_>, data: &[u8]) {
-  if data.len() < 7 {
+  // Checked-indexing (Phase C S2): the slice-pattern binds the same 7 bytes
+  // `data[0..7]` did; a shorter buffer skips like the old `data.len() < 7`
+  // guard ⇒ byte-identical.
+  let &[d0, d1, mon, day, hour, min, sec, ..] = data else {
     return;
-  }
-  let year = u16::from_be_bytes([data[0], data[1]]);
-  let s = std::format!(
-    "{:04}:{:02}:{:02} {:02}:{:02}:{:02}",
-    year,
-    data[2],
-    data[3],
-    data[4],
-    data[5],
-    data[6],
-  );
+  };
+  let year = u16::from_be_bytes([d0, d1]);
+  let s = std::format!("{year:04}:{mon:02}:{day:02} {hour:02}:{min:02}:{sec:02}");
   meta.set_modify_date(s);
 }
 
@@ -2362,9 +2398,13 @@ fn try_convert_png_date(val: &str) -> Option<String> {
   // for the first byte offset at which the pattern matches. We replicate the
   // search by trying each candidate start of group 1 (a run of ASCII digits).
   let mut start = 0;
+  // Checked-indexing (Phase C S2): every `bytes[i]` below had a preceding
+  // `i < bytes.len()` guard and the `bytes[i..i + N]` windows had an
+  // `i + N <= bytes.len()` guard, so the `.get()` forms read the same bytes and
+  // take the same branches ⇒ byte-identical.
   while start < bytes.len() {
     // Group 1 `(\d+)` — day. Must begin with a digit.
-    if !bytes[start].is_ascii_digit() {
+    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
       start += 1;
       continue;
     }
@@ -2390,9 +2430,12 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
   let bytes = val.as_bytes();
   let mut i = start;
 
-  // `(\d+)` — day (group 1). Greedy run of ASCII digits.
+  // `(\d+)` — day (group 1). Greedy run of ASCII digits. Checked-indexing
+  // (Phase C S2): the `i < bytes.len()` guards become `.get(i)` and the
+  // `i + N <= bytes.len()` window guards become `.get(i..i + N)` ⇒
+  // byte-identical (the `val[a..b]` slices are `&str`, unaffected by the lint).
   let day_start = i;
-  while i < bytes.len() && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   let day: u32 = val[day_start..i].parse().ok()?;
@@ -2407,7 +2450,10 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
   // The 3 month bytes must be ASCII letters before we treat them as a str
   // token (keeps the slice on a UTF-8 boundary and matches the regex's
   // `[A-Za-z]`-only month alternation).
-  if !bytes[i..i + 3].iter().all(u8::is_ascii_alphabetic) {
+  if !bytes
+    .get(i..i + 3)
+    .is_some_and(|m| m.iter().all(u8::is_ascii_alphabetic))
+  {
     return None;
   }
   let mon = &val[i..i + 3];
@@ -2419,7 +2465,7 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
 
   // `(\d+)` — year (group 3).
   let yr_start = i;
-  while i < bytes.len() && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   if i == yr_start {
@@ -2441,7 +2487,7 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
 
   // `(\d+)` — hour (group 4).
   let hr_start = i;
-  while i < bytes.len() && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   if i == hr_start {
@@ -2456,7 +2502,10 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
   i += 1;
 
   // `(\d{2})` — minute (group 5), EXACTLY two digits.
-  if i + 2 > bytes.len() || !bytes[i].is_ascii_digit() || !bytes[i + 1].is_ascii_digit() {
+  if !bytes
+    .get(i..i + 2)
+    .is_some_and(|m| m.iter().all(u8::is_ascii_digit))
+  {
     return None;
   }
   let min = &val[i..i + 2];
@@ -2465,9 +2514,9 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
   // `(:\d{2})?` — optional seconds (group 6), INCLUDING the leading colon.
   let mut sec = "";
   if bytes.get(i) == Some(&b':')
-    && i + 3 <= bytes.len()
-    && bytes[i + 1].is_ascii_digit()
-    && bytes[i + 2].is_ascii_digit()
+    && bytes
+      .get(i + 1..i + 3)
+      .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
   {
     sec = &val[i..i + 3]; // e.g. ":22" (colon included, matching `$sec`)
     i += 3;
@@ -2478,7 +2527,7 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
 
   // `(\S*)` — time zone (group 7): a run of non-whitespace (possibly empty).
   let tz_start = i;
-  while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+  while bytes.get(i).is_some_and(|b| !b.is_ascii_whitespace()) {
     i += 1;
   }
   let tz_raw = &val[tz_start..i];
@@ -2513,7 +2562,9 @@ fn match_png_date_at(val: &str, start: usize) -> Option<Option<String>> {
 /// Mirrors Perl `\s` (`[ \t\n\r\f\x0b]`); [`u8::is_ascii_whitespace`] is the
 /// same set minus vertical-tab `\x0b`, which never appears in PNG dates.
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-  while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+  // Checked `.get()` (Phase C S2): folds the `i < bytes.len()` guard ⇒
+  // byte-identical.
+  while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
     i += 1;
   }
   i
@@ -2537,22 +2588,23 @@ fn parse_numeric_tz(tz: &str) -> Option<String> {
   // two that group 2 claims". Perl's greedy `\d+` then backtracks two digits for
   // `(\d{2})`; replicate by locating the maximal digit run, then splitting off
   // the trailing two.
+  // Checked-indexing (Phase C S2): the `j < bytes.len()` guard becomes
+  // `.get(j)`; the `bytes.len() >= j + 3` window guard becomes `.get(j + 1..
+  // j + 3)` ⇒ byte-identical (the `tz[..]` slices are `&str`, unaffected).
   let mut j = 1;
-  while j < bytes.len() && bytes[j].is_ascii_digit() {
+  while bytes.get(j).is_some_and(u8::is_ascii_digit) {
     j += 1;
   }
   let digit_run = &tz[1..j];
   // Optional literal `:` between the two `\d` groups (`:?`). If present, group 1
   // is the digits before it and group 2 the two after it.
-  if let Some(&c) = bytes.get(j)
-    && c == b':'
-  {
+  if bytes.get(j) == Some(&b':') {
     // `[-+]\d+ : \d{2}` — colon form. Group 1 = sign+digit_run (≥1 digit),
     // group 2 = exactly the next two digits.
     if !digit_run.is_empty()
-      && bytes.len() >= j + 3
-      && bytes[j + 1].is_ascii_digit()
-      && bytes[j + 2].is_ascii_digit()
+      && bytes
+        .get(j + 1..j + 3)
+        .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
     {
       let hours = &tz[..j]; // sign + hour digits
       let mins = &tz[j + 1..j + 3];
@@ -2607,7 +2659,9 @@ fn convert_xmp_date(val: &str) -> String {
   // first four bytes are ASCII digits (`^(\d{4})`; the `(-\d{2}){0,2}` group is
   // optional) → `tr/-/:/` over the WHOLE string.
   let b = val.as_bytes();
-  if b.len() >= 4 && b[..4].iter().all(u8::is_ascii_digit) {
+  // Checked `.get()` (Phase C S2): `b.get(..4)` is `Some` iff `b.len() >= 4` ⇒
+  // byte-identical.
+  if b.get(..4).is_some_and(|h| h.iter().all(u8::is_ascii_digit)) {
     return val.replace('-', ":");
   }
   String::from(val)
@@ -2623,21 +2677,30 @@ fn try_xmp_full_datetime(val: &str) -> Option<String> {
   if b.len() < 16 {
     return None;
   }
-  let digits = |r: &[u8]| r.iter().all(u8::is_ascii_digit);
-  if !digits(&b[0..4]) || b[4] != b'-' || !digits(&b[5..7]) || b[7] != b'-' || !digits(&b[8..10]) {
+  // Checked `.get()` (Phase C S2): `digits(a, b)` is `Some-and-all-digit` iff
+  // the old `b[a..b].iter().all(..)` ran in-range and matched; `at(i, c)`
+  // matches the old `b[i] == c`; the `b.len() < 16` guard already makes the
+  // bytes 0..16 windows present, and `i + 3 <= b.len()` guards the seconds
+  // window ⇒ byte-identical.
+  let digits = |a: usize, c: usize| {
+    b.get(a..c)
+      .is_some_and(|r| r.iter().all(u8::is_ascii_digit))
+  };
+  let at = |i: usize, c: u8| b.get(i) == Some(&c);
+  if !digits(0, 4) || !at(4, b'-') || !digits(5, 7) || !at(7, b'-') || !digits(8, 10) {
     return None;
   }
   // `[T ]`
-  if b[10] != b'T' && b[10] != b' ' {
+  if !at(10, b'T') && !at(10, b' ') {
     return None;
   }
   // `(\d{2}:\d{2})` — HH:MM at bytes 11..16 (group 4).
-  if !digits(&b[11..13]) || b[13] != b':' || !digits(&b[14..16]) {
+  if !digits(11, 13) || !at(13, b':') || !digits(14, 16) {
     return None;
   }
   let mut i = 16;
   // `(:\d{2})?` — optional seconds; the leading colon is part of `$5`.
-  let secs: &str = if i + 3 <= b.len() && b[i] == b':' && digits(&b[i + 1..i + 3]) {
+  let secs: &str = if at(i, b':') && digits(i + 1, i + 3) {
     let s = &val[i..i + 3];
     i += 3;
     s
@@ -2724,9 +2787,14 @@ fn standard_lang_case(lang: &str) -> String {
   // engine backtracks `[a-z]{2,3}` from 3 down to 2; emulate by preferring 3,
   // then 2, then the single `[xi]` branch.
   let mut matched: Option<(usize, usize)> = None; // (primary_len, region_start)
-  // `[a-z]{2,3}` branch: try length 3 then 2.
+  // `[a-z]{2,3}` branch: try length 3 then 2. Checked `.get()` (Phase C S2):
+  // `bytes.get(..plen)` is `Some` iff `bytes.len() >= plen` ⇒ byte-identical.
   for plen in [3usize, 2usize] {
-    if bytes.len() >= plen && bytes[..plen].iter().all(|&b| is_ascii_alpha(b)) && region_ok(plen) {
+    if bytes
+      .get(..plen)
+      .is_some_and(|h| h.iter().all(|&b| is_ascii_alpha(b)))
+      && region_ok(plen)
+    {
       matched = Some((plen, plen));
       break;
     }
@@ -2858,6 +2926,11 @@ impl crate::metadata::Project for PngMeta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
