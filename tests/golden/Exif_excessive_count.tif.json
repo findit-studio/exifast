@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_excessive_count.tif",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[Minor] Ignoring IFD0 Orientation with excessive count",
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)"
+}]

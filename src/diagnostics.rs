@@ -30,6 +30,7 @@
 #![cfg(feature = "alloc")]
 
 use smol_str::SmolStr;
+use std::string::String;
 use std::vec::Vec;
 
 /// The severity of a [`Diagnostic`] — whether it lands in the
@@ -62,16 +63,30 @@ impl Severity {
 }
 
 /// One typed diagnostic from a format `Meta` — the unified replacement for the
-/// 13 bespoke per-format warning/error accessor shapes. Carries the rendered
-/// `$et->Warn` / `$et->Error` message, its [`Severity`], an optional
-/// family-1 `group` (the active `$$et{SET_GROUP1}` at `Warn`/`Error` time —
-/// `ExifTool.pm:9475` `$grps[1] or $grps[1] = $$self{SET_GROUP1}`), and two
-/// forward-compat flags (`ignorable` / `no_count`) that Phase C's faithful
-/// multi-warning / `[minor]` / `[x$n]` accounting will read
-/// (`ExifTool.pm` `Warn`/`WarnOnce` `$ignore` + `$$et{WARNED}` count). This
-/// sub-phase sets the flags to the inert default (`ignorable == 0`,
-/// `no_count == false`) and surfaces only the FIRST DOCUMENT-level
-/// warning/error (unchanged document output) — see the module docs.
+/// 13 bespoke per-format warning/error accessor shapes. Carries the BARE
+/// `$et->Warn` / `$et->Error` message (NO `[minor]`/`[x$n]` baked in — those
+/// are applied centrally by [`run_diagnostics`], the port's `sub Warn`
+/// analogue), its [`Severity`], an optional family-1 `group` (the active
+/// `$$et{SET_GROUP1}` at `Warn`/`Error` time — `ExifTool.pm:9475`
+/// `$grps[1] or $grps[1] = $$self{SET_GROUP1}`), and two flags
+/// (`ignorable` / `no_count`) that drive that accounting:
+///
+/// - **`ignorable`** is `sub Warn`'s 3rd argument (`ExifTool.pm:5616-5618`):
+///   `0` = normal, `1` = minor (→ `[minor] ` prefix), `2` = minor with a
+///   behavioural change when ignored (→ `[Minor] ` prefix), `3` = a warning
+///   suppressed only under the `Validate` option (still `[minor] `-prefixed in
+///   normal mode — the `'3' ne '2'` else-branch at `ExifTool.pm:5630`).
+///   `ignorable >= 1` is also what the `IgnoreMinorErrors` (`-m`) option would
+///   suppress (`ExifTool.pm:5627`) — see [`run_diagnostics`] for why that gate
+///   is a documented-deferred reading option, not present here.
+/// - **`no_count`** is `sub Warn`'s `0x04` bit (`ExifTool.pm:5621-5623`): when
+///   set, a REPEAT of an identical message does NOT increment the occurrence
+///   count, so it never grows a ` [x$n]` suffix.
+///
+/// Construct the common cases with [`Diagnostic::warn`] / [`Diagnostic::error`]
+/// (`ignorable == 0`), the minor cases with [`Diagnostic::warn_minor`]
+/// (`ignorable == 1`) / [`Diagnostic::warn_minor_behavioral`]
+/// (`ignorable == 2`), or the full [`Diagnostic::new`].
 ///
 /// **Group scoping (Phase B.1.5).** Every `$et->Warn(msg)` is the FoundTag
 /// `Warning` (`ExifTool.pm:5638`); its family-1 group is whatever
@@ -137,6 +152,29 @@ impl Diagnostic {
     Self::new(message.into(), Severity::Warn, None, 0, false)
   }
 
+  /// A DOCUMENT-level MINOR `$et->Warn(msg, 1)` — `ignorable == 1`, so
+  /// [`run_diagnostics`] renders it `"[minor] <msg>"` (`ExifTool.pm:5630`).
+  /// The message stored here is BARE; the prefix is mechanism-applied (single
+  /// source of truth). E.g. ID3's `Missing ID3 terminating frame`
+  /// (ID3.pm:1148 `$et->Warn(..., 1)`) and `Frame '...' is not valid for this
+  /// ID3 version` (ID3.pm:1172).
+  #[must_use]
+  #[inline(always)]
+  pub fn warn_minor(message: impl Into<SmolStr>) -> Self {
+    Self::new(message.into(), Severity::Warn, None, 1, false)
+  }
+
+  /// A DOCUMENT-level MINOR-WITH-BEHAVIOURAL-CHANGE `$et->Warn(msg, 2)` —
+  /// `ignorable == 2`, so [`run_diagnostics`] renders it `"[Minor] <msg>"`
+  /// (the `'2'` arm of `ExifTool.pm:5630`). The message stored is BARE. E.g.
+  /// EXIF's `Ignoring <dir> <tag> with excessive count` when the count is in
+  /// `(100000, 2000000]` (`$minor = $count > 2000000 ? 0 : 2`, Exif.pm:6767).
+  #[must_use]
+  #[inline(always)]
+  pub fn warn_minor_behavioral(message: impl Into<SmolStr>) -> Self {
+    Self::new(message.into(), Severity::Warn, None, 2, false)
+  }
+
   /// A plain DOCUMENT-level `$et->Error(msg)` — [`Severity::Error`],
   /// `group == None` (→ `ExifTool:Error`), `ignorable == 0`,
   /// `no_count == false`.
@@ -194,17 +232,19 @@ impl Diagnostic {
     self.group.as_deref()
   }
 
-  /// The `$ignore` level (`ExifTool.pm` `Warn`/`WarnOnce`) — forward-compat
-  /// for Phase C's `[minor]` accounting. `0` in this sub-phase.
+  /// The `$ignorable` level (`sub Warn`'s 3rd arg, `ExifTool.pm:5616-5630`):
+  /// `0` = normal, `1` = `[minor] `, `2` = `[Minor] `, `3` = Validate-only
+  /// (still `[minor] ` in normal mode). [`run_diagnostics`] reads it to apply
+  /// the prefix.
   #[must_use]
   #[inline(always)]
   pub const fn ignorable(&self) -> u8 {
     self.ignorable
   }
 
-  /// Whether this diagnostic is excluded from the `WarnOnce` count
-  /// (`ExifTool.pm` `$noCount`) — forward-compat for Phase C's `[x$n]`
-  /// accounting. `false` in this sub-phase.
+  /// Whether a REPEAT of this exact message is excluded from the occurrence
+  /// count (`sub Warn`'s `0x04` bit → `$noCount`, `ExifTool.pm:5621-5623`); a
+  /// `no_count` message never grows a ` [x$n]` suffix.
   #[must_use]
   #[inline(always)]
   pub const fn no_count(&self) -> bool {
@@ -273,38 +313,131 @@ pub trait Diagnose {
 ///   tests); the [`Diagnose`] impls of the ported formats yield only
 ///   `group == None` diagnostics.
 ///
-/// Faithful multi-warning accumulation / `[x$n]` / `[minor]` prefixing is
-/// DEFERRED to Phase C (the `ignorable`/`no_count` flags are carried for it).
+/// **`[minor]`/`[Minor]` prefixing + `[x$n]` count (Phase C, live).** This is
+/// the port's faithful analogue of `sub Warn` (`ExifTool.pm:5616-5643`) plus
+/// the end-of-extraction count pass (`ExifTool.pm:3196-3204`), applied to the
+/// DOCUMENT-level (`group == None`) warning/error stream:
+///
+/// 1. **Prefix** (`ExifTool.pm:5630`): the stored message is BARE; this applies
+///    `[minor] ` for `ignorable == 1` (and `== 3`, the Validate-only level
+///    which is still `[minor] ` in normal mode) and `[Minor] ` for
+///    `ignorable == 2`. Errors get the same prefix (`ExifTool.pm:5658`).
+/// 2. **Dedup + count** (`ExifTool.pm:5632-5639`, `WAS_WARNED`): identical
+///    PREFIXED messages are emitted as the `Warning` tag ONCE (first
+///    occurrence); a repeat increments an occurrence count (unless the
+///    diagnostic carries `no_count`, the `0x04` bit). At the end the surviving
+///    distinct message gains a ` [x$n]` suffix when `n > 1`
+///    (`ExifTool.pm:3199-3201`). This is warnings-only — `sub Error` is a plain
+///    `FoundTag` with no `WAS_WARNED` (`ExifTool.pm:5648-5660`), so errors are
+///    written in occurrence order with NO dedup/count (only the prefix).
+///
+/// `run_diagnostics` is the SOLE writer of the [`TagMap`](crate::tagmap::TagMap)
+/// document warning/error accumulators (`run_emission` has no warning channel
+/// and runs first), so the dedup/count is computed wholly here over this single
+/// pass — exactly the per-file `$$self{WAS_WARNED}` scope. Group-scoped
+/// `<g>:Warning`/`<g>:Error` (the `Some(group)` arm) ride the TAG path and are
+/// NOT part of this `Warning`-tag count loop (`ExifTool.pm:3197` iterates only
+/// the `ExifTool`-group `Warning`/`Warning (n)` tags) — and production formats
+/// emit those in-stream anyway (see above), so the arm is API-surface-only.
+///
+/// **`IgnoreMinorErrors` (`-m`) is NOT gated here.** It is a READING option
+/// (`$$self{OPTIONS}{IgnoreMinorErrors}`, `ExifTool.pm:5627`) that would SUPPRESS
+/// every `ignorable >= 1` warning. The port has no options/flags channel to
+/// thread such a reading option through, and the spec scoped it as "possible,
+/// not present"; building a net-new options API is out of scope for this
+/// cosmetic-completeness phase. The `ignorable` bit is carried + prefixed
+/// faithfully, so the gate is a localized follow-up: a single
+/// `if ignore_minor && d.ignorable() >= 1 { continue }` here once an options
+/// surface exists. Default behaviour (option off) is unchanged + faithful.
 pub(crate) fn run_diagnostics<D: Diagnose + ?Sized>(meta: &D, out: &mut crate::tagmap::TagMap) {
+  // Document-level `WAS_WARNED` (`ExifTool.pm:5632`): the PREFIXED message in
+  // first-occurrence order + its occurrence count. A `Vec` keeps the order
+  // (the document surfaces the FIRST distinct message); the count drives the
+  // ` [x$n]` suffix. Warning corpora are tiny (≤ a handful per file), so the
+  // linear find is cheaper than a map + a side order list.
+  let mut warned: Vec<WasWarned> = Vec::new();
   for d in meta.diagnostics() {
-    // `write_*` are infallible (`Result<(), Infallible>`); the sink keeps
-    // occurrence order, the document serializer takes only the first of the
-    // document-level accumulators.
     match (d.group(), d.severity()) {
       // Document-level (`SET_GROUP1` unset ⇒ `ExifTool:Warning`/`:Error`).
       (None, Severity::Warn) => {
-        let _ = out.write_warning(d.message());
+        let msg = apply_minor_prefix(d.ignorable(), d.message());
+        // `WAS_WARNED` dedup: bump an existing identical message's count
+        // (unless `no_count`), else record it as a new first occurrence.
+        if let Some(w) = warned.iter_mut().find(|w| w.message == msg) {
+          if !d.no_count() {
+            w.count += 1;
+          }
+        } else {
+          warned.push(WasWarned {
+            message: msg,
+            count: 1,
+          });
+        }
       }
       (None, Severity::Error) => {
-        let _ = out.write_error(d.message());
+        // `sub Error` (`ExifTool.pm:5648`): plain `FoundTag('Error', $str)` —
+        // no `WAS_WARNED`, so each error is written in order (the prefix still
+        // applies to an ignorable error, `ExifTool.pm:5658`).
+        let _ = out.write_error(&apply_minor_prefix(d.ignorable(), d.message()));
       }
       // Group-scoped `<group>:Warning`/`<group>:Error` TAG — the active
       // `SET_GROUP1` is the family-1 group; the name is the FoundTag tag name
       // (`Warning`/`Error`, ExifTool.pm:5638/5659), the value is the message.
+      // (Production formats route these in-stream; this arm is API-surface +
+      // unit tests. The `[x$n]` count loop is `ExifTool`-group only, so a
+      // group-scoped warning carries only the `[minor]`/`[Minor]` prefix.)
       (Some(group), Severity::Warn) => {
         let _ = out.write_value(
           group,
           "Warning",
-          crate::value::TagValue::Str(d.message().into()),
+          crate::value::TagValue::Str(apply_minor_prefix(d.ignorable(), d.message()).into()),
         );
       }
       (Some(group), Severity::Error) => {
         let _ = out.write_value(
           group,
           "Error",
-          crate::value::TagValue::Str(d.message().into()),
+          crate::value::TagValue::Str(apply_minor_prefix(d.ignorable(), d.message()).into()),
         );
       }
+    }
+  }
+  // End-of-extraction `[x$n]` pass (`ExifTool.pm:3196-3204`): append ` [x$n]`
+  // to each distinct document-level warning that fired more than once, then
+  // write the survivors into the sink in first-occurrence order.
+  for mut w in warned {
+    if w.count > 1 {
+      let _ = core::fmt::write(&mut w.message, core::format_args!(" [x{}]", w.count));
+    }
+    let _ = out.write_warning(&w.message);
+  }
+}
+
+/// One distinct document-level warning message (already `[minor]`/`[Minor]`-
+/// prefixed) + its `WAS_WARNED` occurrence count, for the `[x$n]` pass.
+struct WasWarned {
+  message: String,
+  count: u32,
+}
+
+/// Apply `sub Warn`'s `[minor]`/`[Minor]` prefix (`ExifTool.pm:5630`) to a bare
+/// message, keyed on `ignorable`: `2` ⇒ `"[Minor] …"`; `1` or `3` ⇒
+/// `"[minor] …"` (the `'3' ne '2'` else-branch — a Validate-only warning is
+/// still `[minor] `-prefixed in normal mode); `0` ⇒ unchanged.
+fn apply_minor_prefix(ignorable: u8, message: &str) -> String {
+  match ignorable {
+    0 => String::from(message),
+    2 => {
+      let mut s = String::with_capacity(8 + message.len());
+      s.push_str("[Minor] ");
+      s.push_str(message);
+      s
+    }
+    _ => {
+      let mut s = String::with_capacity(8 + message.len());
+      s.push_str("[minor] ");
+      s.push_str(message);
+      s
     }
   }
 }
@@ -349,6 +482,19 @@ mod tests {
     let ge = Diagnostic::error_in_group("MXF", "boom");
     assert_eq!(ge.group(), Some("MXF"));
     assert_eq!(ge.severity(), Severity::Error);
+
+    // The minor constructors set `ignorable` (1 / 2) but store the BARE
+    // message — the prefix is applied by `run_diagnostics`, not baked in.
+    let m1 = Diagnostic::warn_minor("Missing ID3 terminating frame");
+    assert_eq!(m1.message(), "Missing ID3 terminating frame");
+    assert_eq!(m1.ignorable(), 1);
+    assert!(!m1.no_count());
+    let m2 = Diagnostic::warn_minor_behavioral("Ignoring IFD0 tag 0x0001 with excessive count");
+    assert_eq!(m2.ignorable(), 2);
+    assert_eq!(
+      m2.message(),
+      "Ignoring IFD0 tag 0x0001 with excessive count"
+    );
   }
 
   /// [`run_diagnostics`] drains DOCUMENT-level [`Diagnostic`]s into the sink's
@@ -428,5 +574,128 @@ mod tests {
       tm.get("Info", "Warning"),
       Some(&TagValue::Str("Illegal float size (3)".into()))
     );
+  }
+
+  /// [`apply_minor_prefix`] reproduces `sub Warn`'s `[minor]`/`[Minor]` rule
+  /// (`ExifTool.pm:5630`): `2` ⇒ `[Minor] `; `1` and `3` ⇒ `[minor] `; `0` ⇒
+  /// unchanged.
+  #[test]
+  fn minor_prefix_matches_warn() {
+    assert_eq!(apply_minor_prefix(0, "msg"), "msg");
+    assert_eq!(apply_minor_prefix(1, "msg"), "[minor] msg");
+    assert_eq!(apply_minor_prefix(2, "msg"), "[Minor] msg");
+    // Validate-only (level 3) is still `[minor] `-prefixed in normal mode
+    // (the `'3' ne '2'` else-branch).
+    assert_eq!(apply_minor_prefix(3, "msg"), "[minor] msg");
+  }
+
+  /// A MINOR `$et->Warn(msg, 1)` surfaces the `[minor] ` prefix from the
+  /// mechanism (the stored message stays bare).
+  #[test]
+  fn run_diagnostics_applies_minor_prefix() {
+    struct Src;
+    impl Diagnose for Src {
+      fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::vec![
+          Diagnostic::warn_minor("Missing ID3 terminating frame"),
+          Diagnostic::warn_minor_behavioral("Ignoring IFD0 tag 0x0001 with excessive count"),
+        ]
+      }
+    }
+    let mut tm = crate::tagmap::TagMap::new();
+    run_diagnostics(&Src, &mut tm);
+    assert_eq!(
+      tm.first_warning(),
+      Some("[minor] Missing ID3 terminating frame")
+    );
+    assert_eq!(
+      tm.warnings(),
+      [
+        "[minor] Missing ID3 terminating frame",
+        "[Minor] Ignoring IFD0 tag 0x0001 with excessive count",
+      ]
+    );
+  }
+
+  /// `WAS_WARNED` dedup + the end-of-extraction `[x$n]` pass
+  /// (`ExifTool.pm:3199-3201`, `:5632-5639`): identical messages collapse to a
+  /// single `Warning` tag whose value gains ` [x$n]` (n = occurrences).
+  #[test]
+  fn run_diagnostics_counts_duplicate_warnings() {
+    struct Src;
+    impl Diagnose for Src {
+      fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::vec![
+          Diagnostic::warn("Short TIT2 frame"),
+          Diagnostic::warn("Short TIT2 frame"),
+          Diagnostic::warn("Short TIT2 frame"),
+          Diagnostic::warn("Unique warning"),
+        ]
+      }
+    }
+    let mut tm = crate::tagmap::TagMap::new();
+    run_diagnostics(&Src, &mut tm);
+    // The dup collapses to ONE tag with ` [x3]`; first-occurrence order kept.
+    assert_eq!(tm.warnings(), ["Short TIT2 frame [x3]", "Unique warning"]);
+    assert_eq!(tm.first_warning(), Some("Short TIT2 frame [x3]"));
+  }
+
+  /// The count keys on the PREFIXED message: a minor + a non-minor copy of the
+  /// same bare text are DISTINCT warnings (ExifTool keys `WAS_WARNED` on the
+  /// post-prefix `$str`), and each minor repeat still counts.
+  #[test]
+  fn run_diagnostics_counts_keyed_on_prefixed_message() {
+    struct Src;
+    impl Diagnose for Src {
+      fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::vec![
+          Diagnostic::warn_minor("dup"),
+          Diagnostic::warn_minor("dup"),
+          Diagnostic::warn("dup"),
+        ]
+      }
+    }
+    let mut tm = crate::tagmap::TagMap::new();
+    run_diagnostics(&Src, &mut tm);
+    // `[minor] dup` fired twice (→ ` [x2]`); bare `dup` once (distinct key).
+    assert_eq!(tm.warnings(), ["[minor] dup [x2]", "dup"]);
+  }
+
+  /// A `no_count` diagnostic (`sub Warn` `0x04`) never grows a ` [x$n]` suffix
+  /// even when its identical message repeats.
+  #[test]
+  fn run_diagnostics_no_count_suppresses_suffix() {
+    struct Src;
+    impl Diagnose for Src {
+      fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::vec![
+          Diagnostic::new("noisy".into(), Severity::Warn, None, 0, true),
+          Diagnostic::new("noisy".into(), Severity::Warn, None, 0, true),
+        ]
+      }
+    }
+    let mut tm = crate::tagmap::TagMap::new();
+    run_diagnostics(&Src, &mut tm);
+    assert_eq!(tm.warnings(), ["noisy"]);
+  }
+
+  /// Errors are NOT deduped/counted (`sub Error` is a plain `FoundTag`), but an
+  /// ignorable error still gets the `[minor]`/`[Minor]` prefix
+  /// (`ExifTool.pm:5658`). The document surfaces the FIRST.
+  #[test]
+  fn run_diagnostics_errors_prefixed_not_counted() {
+    struct Src;
+    impl Diagnose for Src {
+      fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::vec![
+          Diagnostic::new("boom".into(), Severity::Error, None, 1, false),
+          Diagnostic::new("boom".into(), Severity::Error, None, 0, false),
+        ]
+      }
+    }
+    let mut tm = crate::tagmap::TagMap::new();
+    run_diagnostics(&Src, &mut tm);
+    // First error prefixed `[minor]`; the second (bare) is kept too — no dedup.
+    assert_eq!(tm.first_error(), Some("[minor] boom"));
   }
 }

@@ -92,7 +92,10 @@ pub fn process_id3v2(
           // and KEEP the sync-safe value (outer break will fire below
           // on `offset+frame_len > data.len()`).
           if offset + ss_usize == data.len() {
-            meta.push_warning("[minor] Missing ID3 terminating frame");
+            // ID3.pm:1148 `$et->Warn('Missing ID3 terminating frame', 1)` —
+            // a MINOR warning. The `[minor] ` prefix is applied centrally by
+            // `run_diagnostics` (single source of truth), not baked in here.
+            meta.push_warning_with_level("Missing ID3 terminating frame", 1);
           } else {
             meta.push_warning("Invalid ID3 frame size");
           }
@@ -408,9 +411,10 @@ fn dispatch_frame(
       None
     };
     if alt_def.is_some() {
-      meta.push_warning(format!(
-        "[minor] Frame '{id}' is not valid for this ID3 version"
-      ));
+      // ID3.pm:1172 `$et->Warn("Frame '${id}' is not valid for this ID3
+      // version", 1)` — a MINOR warning; the `[minor] ` prefix is applied by
+      // `run_diagnostics`, not baked into the stored message.
+      meta.push_warning_with_level(format!("Frame '{id}' is not valid for this ID3 version"), 1);
       tag_def = alt_def;
     }
   }
@@ -1723,12 +1727,15 @@ mod tests {
     assert_eq!(t.group_ref().family1(), "ID3v2_4");
     // dateTimeConv: XMP → EXIF date.
     assert_eq!(t.value_ref(), &TagValue::Str("2024:05:19".into()));
-    // Bundled minor Warn fires.
-    assert!(
-      m.warnings_slice()
-        .iter()
-        .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version"))
-    );
+    // Bundled minor Warn fires. The stored message is BARE (no `[minor] `
+    // baked in) and carries ignorable level 1 (ID3.pm:1172 `..., 1`); the
+    // `[minor] ` prefix is applied centrally by `run_diagnostics`.
+    let idx = m
+      .warnings_slice()
+      .iter()
+      .position(|w| w.as_str() == "Frame 'TDRC' is not valid for this ID3 version")
+      .expect("bundled minor Warn must fire");
+    assert_eq!(m.warning_ignorable(idx), 1);
   }
 
   #[test]

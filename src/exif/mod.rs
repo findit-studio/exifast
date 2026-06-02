@@ -848,6 +848,11 @@ pub struct ExifMeta<'a> {
   /// `$et->Warn(...)` messages raised by the IFD-bounds checks, in emission
   /// order. The engine surfaces these as `ExifTool:Warning` tags.
   warnings: Vec<String>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings) (Phase C). `2` ⇒ `[Minor]` (the
+  /// excessive-count warning), `0` ⇒ normal. The prefix is applied by
+  /// [`Diagnose`](crate::diagnostics::Diagnose) → `run_diagnostics`.
+  warnings_ignorable: Vec<u8>,
   /// The TIFF header byte order (`ExifTool.pm:8628`). The engine emits it as
   /// `File:ExifByteOrder` (`ExifTool.pm:8691`). `None` only for a JPEG
   /// container accepted without a parsed `APP1` Exif TIFF block (see the type
@@ -970,6 +975,7 @@ impl<'a> ExifMeta<'a> {
   pub(crate) fn from_jpeg_parts(
     entries: Vec<ExifEntry>,
     warnings: Vec<String>,
+    warnings_ignorable: Vec<u8>,
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
   ) -> Self {
@@ -981,6 +987,7 @@ impl<'a> ExifMeta<'a> {
     ExifMeta {
       entries,
       warnings,
+      warnings_ignorable,
       byte_order,
       maker_note,
       multi_page_count: None,
@@ -1004,6 +1011,7 @@ impl<'a> ExifMeta<'a> {
   ) -> (
     Vec<ExifEntry>,
     Vec<String>,
+    Vec<u8>,
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
   ) {
@@ -1014,6 +1022,7 @@ impl<'a> ExifMeta<'a> {
     (
       self.entries,
       self.warnings,
+      self.warnings_ignorable,
       self.byte_order,
       self.maker_note,
     )
@@ -1257,6 +1266,7 @@ fn parse_tiff_with_base<'a>(
     base,
     entries: Vec::new(),
     warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
     maker_note: None,
     captured_make: None,
     captured_model: None,
@@ -1296,6 +1306,7 @@ fn parse_tiff_with_base<'a>(
   Some(ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
+    warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
     multi_page_count,
@@ -1394,6 +1405,7 @@ fn parse_tiff_with_base_shared<'a>(
     base,
     entries: Vec::new(),
     warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
     maker_note: None,
     captured_make: None,
     captured_model: None,
@@ -1418,6 +1430,7 @@ fn parse_tiff_with_base_shared<'a>(
   let meta = ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
+    warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
@@ -1500,6 +1513,12 @@ struct Walker<'a, 'g> {
   /// (`Bad … directory`, `Suspicious … offset`, `Error reading value …`);
   /// the full ExifTool warning corpus is a Phase-2 forward-item.
   warnings: Vec<String>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings) (Phase C). `2` for the `[Minor]` excessive-
+  /// count warning when the count is in `(100000, 2000000]`
+  /// (`$minor = $count > 2000000 ? 0 : 2`, Exif.pm:6767); `0` otherwise. The
+  /// `[Minor] ` prefix is applied by `run_diagnostics`, not stored.
+  warnings_ignorable: Vec<u8>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
   /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
@@ -1589,6 +1608,22 @@ struct Walker<'a, 'g> {
 }
 
 impl Walker<'_, '_> {
+  /// Record a NORMAL `$et->Warn(msg)` (ignorable `0`), keeping
+  /// [`warnings`](Self::warnings) and [`warnings_ignorable`](Self::warnings_ignorable)
+  /// index-aligned (the single push funnel for the structural warnings).
+  fn warn(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(0);
+  }
+
+  /// Record a MINOR-WITH-BEHAVIOURAL-CHANGE `$et->Warn(msg, 2)` (ignorable
+  /// `2` ⇒ `[Minor]`, applied by `run_diagnostics`). Used for the
+  /// excessive-count warning at the `$minor == 2` threshold (Exif.pm:6767).
+  fn warn_minor_behavioral(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(2);
+  }
+
   /// Walk an IFD and then follow its next-IFD pointer chain (IFD0 → IFD1 →
   /// …) — faithful to `ProcessExif`'s `$$dirInfo{Multi}` trailing-IFD scan
   /// (`Exif.pm:7202-7228`). `Multi` is set for IFD0 (`Exif.pm:6339`).
@@ -1823,7 +1858,7 @@ impl Walker<'_, '_> {
     // above, so the subtraction cannot underflow.
     let bytes_from_end = data.len() - dir_end;
     if bytes_from_end == 1 || bytes_from_end == 3 {
-      self.warnings.push(std::format!(
+      self.warn(std::format!(
         "Illegal {} directory size ({num_entries} entries)",
         kind.as_str()
       ));
@@ -2039,7 +2074,7 @@ impl Walker<'_, '_> {
       // code is silent padding; any other bad code warns.
       if format_code != 0 {
         let dir = kind.as_str();
-        self.warnings.push(std::format!(
+        self.warn(std::format!(
           "Bad format ({format_code}) for {dir} entry {index}"
         ));
       }
@@ -2158,7 +2193,7 @@ impl Walker<'_, '_> {
             Some(name) => std::format!(" {name}"),
             None => String::new(),
           };
-          self.warnings.push(std::format!(
+          self.warn(std::format!(
             "Error reading value for {dir} entry {index}, ID 0x{tag_id:04x}{tag}"
           ));
           // `return 0 unless $inMakerNotes or $htmlDump or $truncOK`
@@ -2179,7 +2214,7 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("Suspicious {dir} offset for {name}"),
           None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
         };
-        self.warnings.push(warning);
+        self.warn(warning);
         // `next unless $verbose` (Exif.pm:6675) — skip this entry, CONTINUE
         // the IFD: [`Step::Skip`].
         return Step::Skip;
@@ -2223,7 +2258,7 @@ impl Walker<'_, '_> {
         let dir = kind.as_str();
         let fmt = format.name();
         let name = sub.tag_name();
-        self.warnings.push(std::format!(
+        self.warn(std::format!(
           "Wrong format ({fmt}) for {dir} 0x{tag_id:04x} {name}"
         ));
         // `next unless $verbose` (Exif.pm:6754) — skip the entry, the sub-IFD
@@ -2312,22 +2347,28 @@ impl Walker<'_, '_> {
         // faithfully for when 0x012d is added.)
         let transfer_function_carveout = known == Some("TransferFunction") && count == 196_608;
         if !transfer_function_carveout {
-          // `$et->Warn("Ignoring $dirName $tagName with excessive count")`
-          // (Exif.pm:6767), with `$tagName = $tagInfo ? Name : 'tag 0x%.4x'`.
-          // In the default (non-HtmlDump) path `Warn` returns true and Perl
-          // does `next` (Exif.pm:6768) — SKIP this entry, do NOT decode.
-          // (`$warned` is set only in the HtmlDump branch, which this port
-          // does not model, so it never reaches guard (b) for the same entry;
-          // the `$count > 2000000 ? 0 : 2` minor-level only affects the
-          // suppressed-by-options case, not the warning text or the skip.)
+          // `my $minor = $count > 2000000 ? 0 : 2;`
+          // `$et->Warn("Ignoring $dirName $tagName with excessive count", $minor)`
+          // (Exif.pm:6766-6767), with `$tagName = $tagInfo ? Name : 'tag
+          // 0x%.4x'`. In the default (non-HtmlDump) path `Warn` returns true
+          // and Perl does `next` (Exif.pm:6768) — SKIP this entry, do NOT
+          // decode. `$minor == 2` means `sub Warn` PREFIXES the message
+          // `[Minor] ` even in normal mode (the `'2'` arm of ExifTool.pm:5630
+          // — NOT only the `IgnoreMinorErrors`-suppressed case; oracle-verified
+          // against `perl exiftool 13.59`: a known SHORT tag with count 150000
+          // emits `"[Minor] Ignoring IFD0 Orientation with excessive count"`).
+          // The `[Minor] ` prefix is applied centrally by `run_diagnostics`
+          // from the ignorable level, not baked in here. `$warned` is set only
+          // in the HtmlDump branch, which this port does not model.
           let dir = kind.as_str();
-          match known {
-            Some(name) => self
-              .warnings
-              .push(std::format!("Ignoring {dir} {name} with excessive count")),
-            None => self.warnings.push(std::format!(
-              "Ignoring {dir} tag 0x{tag_id:04x} with excessive count"
-            )),
+          let msg = match known {
+            Some(name) => std::format!("Ignoring {dir} {name} with excessive count"),
+            None => std::format!("Ignoring {dir} tag 0x{tag_id:04x} with excessive count"),
+          };
+          if count > 2_000_000 {
+            self.warn(msg); // `$minor == 0` — no prefix
+          } else {
+            self.warn_minor_behavioral(msg); // `$minor == 2` ⇒ `[Minor] `
           }
           return Step::Skip; // `next` (Exif.pm:6768)
         }
@@ -3107,10 +3148,21 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
   /// EXIF arm ran. EXIF raises no `$et->Error` (a rejected block returns
   /// `Ok(None)` ⇒ the engine emits its own `ExifTool:Error`).
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    use crate::diagnostics::Diagnostic;
+    // Carry each warning's `sub Warn` ignorable level (index-aligned) so the
+    // `[Minor] ` prefix on the excessive-count warning comes from
+    // `run_diagnostics`, not a baked literal.
     self
       .warnings()
       .iter()
-      .map(crate::diagnostics::Diagnostic::warn)
+      .enumerate()
+      .map(
+        |(i, w)| match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+          1 => Diagnostic::warn_minor(w.as_str()),
+          2 => Diagnostic::warn_minor_behavioral(w.as_str()),
+          _ => Diagnostic::warn(w.as_str()),
+        },
+      )
       .collect()
   }
 }
@@ -5188,6 +5240,7 @@ mod tests {
       base: 0,
       entries: Vec::new(),
       warnings: Vec::new(),
+      warnings_ignorable: Vec::new(),
       maker_note: None,
       captured_make: None,
       captured_model: None,
