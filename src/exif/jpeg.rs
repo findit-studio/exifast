@@ -164,6 +164,11 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // `DoProcessTIFF`, `ExifTool.pm:8691`).
   let mut entries: Vec<ExifEntry> = Vec::new();
   let mut warnings: Vec<String> = Vec::new();
+  // Per-warning `sub Warn` ignorable level, index-aligned with `warnings`
+  // (Phase C). The JPEG-level `Malformed APP1 EXIF segment` is a normal
+  // warning (level 0); each merged block's own ignorable levels (e.g. the
+  // excessive-count `[Minor]`) thread through `merge_exif_block`.
+  let mut warnings_ignorable: Vec<u8> = Vec::new();
   let mut byte_order = None;
   // The FIRST captured `MakerNote` (0x927c) across the merged `APP1` Exif
   // blocks. A normal camera JPEG carries its MakerNote in the ExifIFD of its
@@ -245,6 +250,7 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
       Some(exif) => merge_exif_block(
         &mut entries,
         &mut warnings,
+        &mut warnings_ignorable,
         &mut byte_order,
         &mut maker_note,
         exif,
@@ -255,7 +261,10 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
       // malformed CLASSIC (0x2a) header is what bundled warns on. So map only
       // a non-BigTIFF `None` to the warning; a BigTIFF block is skipped
       // silently (no warning, no Exif), matching the standalone-TIFF path.
-      None if !is_bigtiff_block(block) => warnings.push(String::from(MALFORMED_APP1_WARNING)),
+      None if !is_bigtiff_block(block) => {
+        warnings.push(String::from(MALFORMED_APP1_WARNING));
+        warnings_ignorable.push(0); // normal warning (ExifTool.pm:7783)
+      }
       None => {}
     }
   }
@@ -263,7 +272,11 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // A valid JPEG ALWAYS yields an `ExifMeta` (the container is accepted);
   // `entries`/`byte_order` are empty/`None` when no `APP1` Exif block parsed.
   Some(ExifMeta::from_jpeg_parts(
-    entries, warnings, byte_order, maker_note,
+    entries,
+    warnings,
+    warnings_ignorable,
+    byte_order,
+    maker_note,
   ))
 }
 
@@ -420,11 +433,13 @@ fn is_multisegment_chain(data: &[u8], segments: &[Segment], i: usize) -> bool {
 fn merge_exif_block<'a>(
   entries: &mut Vec<ExifEntry>,
   warnings: &mut Vec<String>,
+  warnings_ignorable: &mut Vec<u8>,
   byte_order: &mut Option<ByteOrder>,
   maker_note: &mut Option<MakerNote<'a>>,
   block: ExifMeta<'a>,
 ) {
-  let (block_entries, block_warnings, block_order, block_maker_note) = block.into_jpeg_parts();
+  let (block_entries, block_warnings, block_warnings_ignorable, block_order, block_maker_note) =
+    block.into_jpeg_parts();
   if byte_order.is_none() {
     *byte_order = block_order;
   }
@@ -435,6 +450,8 @@ fn merge_exif_block<'a>(
   }
   entries.extend(block_entries);
   warnings.extend(block_warnings);
+  // Keep the parallel ignorable levels index-aligned with `warnings`.
+  warnings_ignorable.extend(block_warnings_ignorable);
 }
 
 /// `true` when `block` begins with a BigTIFF header — a valid TIFF byte-order

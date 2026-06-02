@@ -631,8 +631,15 @@ pub struct Id3Meta<'a> {
   /// `7`). Storing BOTH lets ONE `parse` serve BOTH `sink(true)` and
   /// `sink(false)` (Codex B-R2-1) — no mode-lock, no debug-assert.
   staged_tags_raw: Vec<StagedTag>,
-  /// All warnings the engine emitted while parsing this ID3 directory.
+  /// All warnings the engine emitted while parsing this ID3 directory (BARE
+  /// messages — the `[minor] ` prefix for a minor warning is applied by
+  /// `run_diagnostics`, not stored).
   warnings: Vec<SmolStr>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings). `1` for ID3's two MINOR warnings
+  /// (`Missing ID3 terminating frame` ID3.pm:1148; `Frame '...' is not valid
+  /// for this ID3 version` ID3.pm:1172), `0` otherwise.
+  warnings_ignorable: Vec<u8>,
   /// All errors the engine emitted (rare; faithful to ExifTool's
   /// `$self->Error`). Today the ID3 engine only emits warnings.
   errors: Vec<SmolStr>,
@@ -1319,6 +1326,11 @@ fn parse_id3_inner<'a>(
     }
   }
   let warnings: Vec<SmolStr> = staging.warnings_slice().iter().map(SmolStr::new).collect();
+  // Index-aligned ignorable levels (carried from `push_warning_with_level`),
+  // so `Diagnose` can apply the `[minor] ` prefix centrally.
+  let warnings_ignorable: Vec<u8> = (0..warnings.len())
+    .map(|i| staging.warning_ignorable(i))
+    .collect();
   let errors: Vec<SmolStr> = staging.errors_slice().iter().map(SmolStr::new).collect();
   (
     Some(Id3Meta {
@@ -1328,6 +1340,7 @@ fn parse_id3_inner<'a>(
       staged_tags,
       staged_tags_raw,
       warnings,
+      warnings_ignorable,
       errors,
       _phantom: core::marker::PhantomData,
     }),
@@ -1396,19 +1409,23 @@ impl crate::diagnostics::Diagnose for Id3Meta<'_> {
   /// [`warnings_slice`](Self::warnings_slice) / [`errors_slice`](Self::errors_slice)
   /// stores (those also feed construction, so they stay).
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    use crate::diagnostics::Diagnostic;
     let mut out =
       std::vec::Vec::with_capacity(self.warnings_slice().len() + self.errors_slice().len());
-    out.extend(
-      self
-        .warnings_slice()
-        .iter()
-        .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
-    );
+    // Carry each warning's `sub Warn` ignorable level (index-aligned) so the
+    // `[minor] ` prefix comes from `run_diagnostics`, not a baked literal.
+    out.extend(self.warnings_slice().iter().enumerate().map(|(i, w)| {
+      match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+        1 => Diagnostic::warn_minor(w.as_str()),
+        2 => Diagnostic::warn_minor_behavioral(w.as_str()),
+        _ => Diagnostic::warn(w.as_str()),
+      }
+    }));
     out.extend(
       self
         .errors_slice()
         .iter()
-        .map(|e| crate::diagnostics::Diagnostic::error(e.as_str())),
+        .map(|e| Diagnostic::error(e.as_str())),
     );
     out
   }

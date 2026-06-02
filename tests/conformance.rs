@@ -4630,6 +4630,30 @@ fn id3v2_4_with_v2_3_frame_conformance() {
 }
 
 #[test]
+fn id3_dup_short_frame_conformance() {
+  // Golden-v2 Phase C — the `[x$n]` multi-warning count (ExifTool.pm:3199-3201
+  // + the `WAS_WARNED` dedup at :5632-5639). A crafted ID3v2.3 + minimal MP3
+  // with TWO short `COMM` frames (1-byte body each) both trip
+  // `$valLen > 4 or $et->Warn("Short COMM frame")` (ID3.pm:1300); ExifTool
+  // emits the `Warning` tag ONCE and appends ` [x2]`. Oracle-verified vs
+  // `perl exiftool 13.59` (version stamp normalized to 13.58): the SOLE delta
+  // vs a single-COMM file is `ExifTool:Warning = "Short COMM frame [x2]"`.
+  // Goldens EXCLUDE `Composite:*` (the `%MPEG::Composite` forward item, like
+  // every MP3 golden). The `-j`/`-n` warning text is identical (the count is
+  // not a PrintConv-toggled value).
+  check(
+    "ID3_dup_short_frame.mp3",
+    "ID3_dup_short_frame.mp3.json",
+    true,
+  );
+  check(
+    "ID3_dup_short_frame.mp3",
+    "ID3_dup_short_frame.mp3.n.json",
+    false,
+  );
+}
+
+#[test]
 fn id3v2_3_invalid_apic_conformance() {
   // R8-F3 regression (APIC Latin). A v2.3 file with a malformed APIC
   // frame: MIME + 0 + picType + description WITHOUT the description's
@@ -7290,6 +7314,29 @@ fn exif_badformat_entry0_conformance() {
   check(
     "Exif_badformat_entry0.tif",
     "Exif_badformat_entry0.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_excessive_count_conformance() {
+  // Golden-v2 Phase C — the `[Minor]` (ignorable == 2) prefix path. A crafted
+  // big-endian TIFF whose IFD0 carries ONE KNOWN tag (Orientation 0x0112) with
+  // on-disk format int8u and count 100001 — in the (100000, 2000000] band, so
+  // `$minor = $count > 2000000 ? 0 : 2 = 2` (Exif.pm:6766). The full value is
+  // present (the count guard at Exif.pm:6764 fires only after a successful
+  // read), so ExifTool warns + skips the entry with the `[Minor] ` prefix (the
+  // `'2'` arm of ExifTool.pm:5630). Oracle-verified vs `perl exiftool 13.59`
+  // (version stamp normalized to 13.58): `ExifTool:Warning = "[Minor] Ignoring
+  // IFD0 Orientation with excessive count"`. The prefix now comes from
+  // `run_diagnostics` (was previously absent — a pre-Phase-C fidelity gap).
+  check(
+    "Exif_excessive_count.tif",
+    "Exif_excessive_count.tif.json",
+    true,
+  );
+  check(
+    "Exif_excessive_count.tif",
+    "Exif_excessive_count.tif.n.json",
     false,
   );
 }

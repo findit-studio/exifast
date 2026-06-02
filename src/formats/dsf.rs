@@ -996,18 +996,11 @@ mod tests {
   /// net `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
     crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
-    if let Some(w) = meta.fmt_warning() {
-      let _ = out.write_warning(w);
-    }
-    #[cfg(feature = "id3")]
-    if let Some(id3) = meta.id3_ref() {
-      for w in id3.warnings_slice() {
-        let _ = out.write_warning(w.as_str());
-      }
-      for e in id3.errors_slice() {
-        let _ = out.write_error(e.as_str());
-      }
-    }
+    // Drain diagnostics through the SAME `run_diagnostics` path the
+    // `format_parser.rs` arm uses, so the `[minor]`/`[x$n]` prefixing matches
+    // production (the chained ID3 sub-Meta's ignorable levels flow through
+    // DSF's `Diagnose` impl).
+    crate::diagnostics::run_diagnostics(meta, out);
   }
 
   // --- Table + dispatch ---------------------------------------------------
