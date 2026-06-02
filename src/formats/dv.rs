@@ -10,6 +10,10 @@
 //! `tagmap::TagMap` so the serialized JSON stays
 //! byte-exact with bundled `perl exiftool`.
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   format_parser::{FormatParser, parser_sealed},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -404,7 +408,10 @@ fn convert_bitrate_str(v: &TagValue) -> String {
   } else {
     format!("{b:.0}") // ExifTool.pm:6899 %.0f
   };
-  format!("{formatted} {}", units[idx])
+  // The `idx + 1 < units.len()` loop bound caps `idx` at `units.len()-1` (3),
+  // so `.get(idx)` always hits; the `"Gbps"` fallback is `units[3]` (the cap
+  // the guard guarantees) — byte-identical to the raw `units[idx]`.
+  format!("{formatted} {}", units.get(idx).copied().unwrap_or("Gbps"))
 }
 
 /// Locate the first DIF header in the 12 KiB buffer.
@@ -428,11 +435,17 @@ fn convert_bitrate_str(v: &TagValue) -> String {
 /// returns `start = 0`, accepting a buffer ExifTool rejects.
 fn find_dif_start(buff: &[u8]) -> Option<usize> {
   // Primary: 4-byte window. (No skip path; the only outcome is return.)
+  // The `i + 4 <= buff.len()` loop bound proves the 4-byte window exists, so
+  // the `Some([..])` destructure always matches (byte-identical to `&buff[i..i+4]`).
   if buff.len() >= 4 {
     let mut i = 0usize;
     while i + 4 <= buff.len() {
-      let w = &buff[i..i + 4];
-      if w[0] == 0x1f && w[1] == 0x07 && w[2] == 0x00 && (w[3] == 0x3f || w[3] == 0xbf) {
+      if let Some(&[w0, w1, w2, w3]) = buff.get(i..i + 4)
+        && w0 == 0x1f
+        && w1 == 0x07
+        && w2 == 0x00
+        && (w3 == 0x3f || w3 == 0xbf)
+      {
         // pos == i + 4, $start == pos - 4 == i.
         return Some(i);
       }
@@ -442,16 +455,14 @@ fn find_dif_start(buff: &[u8]) -> Option<usize> {
   // Fallback: 84-byte window (4 head + 76 wildcard + 4 tail). On a
   // guarded-out match Perl `/g` advances `pos` to the END of the match
   // (`i + 84`), so resume there — non-overlapping — NOT at `i + 1`.
+  // The `i + 84 <= buff.len()` loop bound proves both 4-byte windows exist.
   if buff.len() >= 84 {
     let mut i = 0usize;
     while i + 84 <= buff.len() {
-      let head = &buff[i..i + 4];
-      let tail = &buff[i + 80..i + 84];
-      let head_ok = (head[0] == 0x00 || head[0] == 0xff)
-        && head[1] == 0x3f
-        && head[2] == 0x07
-        && head[3] == 0x00;
-      let tail_ok = tail[0] == 0xff && tail[1] == 0x3f && tail[2] == 0x07 && tail[3] == 0x01;
+      let head_ok = matches!(buff.get(i..i + 4), Some(&[h0, h1, h2, h3])
+        if (h0 == 0x00 || h0 == 0xff) && h1 == 0x3f && h2 == 0x07 && h3 == 0x00);
+      let tail_ok = matches!(buff.get(i + 80..i + 84), Some(&[t0, t1, t2, t3])
+        if t0 == 0xff && t1 == 0x3f && t2 == 0x07 && t3 == 0x01);
       if head_ok && tail_ok {
         // pos = i + 84; $start = pos - 163 = i - 79; require i >= 79.
         if i >= 79 {
@@ -485,10 +496,12 @@ fn extract_vaux_meta(
   // DV.pm:203 `for ($i=1; $i<6; ++$i)` ⇒ 5 iterations.
   for _ in 1..6 {
     vaux_pos += 80; // DV.pm:204
-    if vaux_pos >= buff.len() {
+    // DV.pm:205 — `Get8u(\$buff, $vauxPos)`. The `.get()` failing is the same
+    // `$vauxPos >= length` condition the original guard tested (byte-identical
+    // recovery: return the accumulated tuple).
+    let Some(&block_type) = buff.get(vaux_pos) else {
       return (date_str, time_str, is_16_9, interlace_set);
-    }
-    let block_type = buff[vaux_pos];
+    };
     if (block_type & 0xf0) != 0x50 {
       continue; // DV.pm:206
     }
@@ -496,26 +509,33 @@ fn extract_vaux_meta(
     for j in 0..15usize {
       let p = vaux_pos + j * 5 + 3; // DV.pm:208
       // Guard against running past the buffer: every Get8u must be in
-      // range (`p+0` through `p+4` for the 4-byte date/time fields).
-      if p + 4 >= buff.len() {
+      // range (`p+0` through `p+4` for the 4-byte date/time fields). The
+      // `p+4 >= len` break is preserved as a `[w0..w4]` window destructure
+      // (byte-identical: the same out-of-range case breaks the inner loop).
+      let Some(&[w0, w1, w2, w3, w4]) = buff.get(p..p + 5) else {
         break;
-      }
-      let pack_type = buff[p]; // DV.pm:209
+      };
+      let pack_type = w0; // DV.pm:209
       if pack_type == 0x61 {
-        // DV.pm:210 video control.
-        let apt = buff[start + 4] & 0x07; // DV.pm:211
-        let t = buff[p + 2]; // DV.pm:212
+        // DV.pm:210 video control. `start + 4` is provably < `p < buff.len()`
+        // here (`p >= vauxPos + 3 >= start + 83`), so this `.get()` always
+        // hits; the `break` mirrors the inner-loop out-of-range recovery.
+        let Some(&apt_byte) = buff.get(start + 4) else {
+          break;
+        };
+        let apt = apt_byte & 0x07; // DV.pm:211
+        let t = w2; // DV.pm:212 (buff[p + 2])
         let aspect_bits = t & 0x07;
         // DV.pm:213
         is_16_9 = Some(aspect_bits == 0x02 || (apt == 0 && aspect_bits == 0x07));
         // DV.pm:214
-        interlace_set = Some((buff[p + 3] & 0x10) != 0);
+        interlace_set = Some((w3 & 0x10) != 0); // buff[p + 3]
       } else if pack_type == 0x62 {
         // DV.pm:215 date.
         // DV.pm:217 unpack 4 bytes at $p+1; byte 0 = timezone (ignored).
-        let d1 = buff[p + 2];
-        let d2 = buff[p + 3];
-        let d3 = buff[p + 4];
+        let d1 = w2; // buff[p + 2]
+        let d2 = w3; // buff[p + 3]
+        let d3 = w4; // buff[p + 4]
         // DV.pm:219 `sprintf('%.2x:%.2x:%.2x', $d[3], $d[2] & 0x1f,
         // $d[1] & 0x3f)`.
         let s = format!("{:02x}:{:02x}:{:02x}", d3, d2 & 0x1f, d1 & 0x3f);
@@ -526,9 +546,13 @@ fn extract_vaux_meta(
           // DV.pm:223-224 century: `($date lt '9') ? '20' : '19'`. Perl
           // string-`lt` of the 8-char `NN:MM:DD` against the 1-char `'9'`
           // compares byte-by-byte to the shorter length: true iff first
-          // byte of $date < '9'.
-          let first = s.as_bytes()[0];
-          let century = if first < b'9' { "20" } else { "19" };
+          // byte of $date < '9'. `s` is always the 8-char hex form, so
+          // `.first()` is `Some` (byte-identical to the raw `s.as_bytes()[0]`).
+          let century = if s.as_bytes().first().is_some_and(|&b| b < b'9') {
+            "20"
+          } else {
+            "19"
+          };
           date_str = Some(format!("{century}{s}"));
         }
         time_str = None; // DV.pm:226
@@ -536,11 +560,10 @@ fn extract_vaux_meta(
         // DV.pm:227 time (only after a successful date in this block).
         // DV.pm:229 `Get32u(\$buff, $p+1) & 0x007f7f3f` — computed then
         // discarded; preserved as a faithful no-op.
-        let _val =
-          u32::from_be_bytes([buff[p + 1], buff[p + 2], buff[p + 3], buff[p + 4]]) & 0x007f_7f3f;
-        let t1 = buff[p + 2];
-        let t2 = buff[p + 3];
-        let t3 = buff[p + 4];
+        let _val = u32::from_be_bytes([w1, w2, w3, w4]) & 0x007f_7f3f;
+        let t1 = w2; // buff[p + 2]
+        let t2 = w3; // buff[p + 3]
+        let t3 = w4; // buff[p + 4]
         // DV.pm:231.
         time_str = Some(format!(
           "{:02x}:{:02x}:{:02x}",
@@ -742,8 +765,17 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
   if need > buff.len() {
     return Parsed::RejectShortDif;
   }
-  let dsf: u8 = (buff[start + 3] & 0x80) >> 7; // DV.pm:176
-  let stype: u8 = buff[start + 80 * 5 + 48 + 3] & 0x1f; // DV.pm:177
+  // The `start + 480 <= buff.len()` guard above proves offsets `start + 3` and
+  // `start + 451` are in range, so these `.get()`s always hit; the
+  // `RejectShortDif` fallback is the same recovery the length guard uses.
+  let Some(&dsf_byte) = buff.get(start + 3) else {
+    return Parsed::RejectShortDif;
+  };
+  let dsf: u8 = (dsf_byte & 0x80) >> 7; // DV.pm:176
+  let Some(&stype_byte) = buff.get(start + 80 * 5 + 48 + 3) else {
+    return Parsed::RejectShortDif;
+  };
+  let stype: u8 = stype_byte & 0x1f; // DV.pm:177
 
   // DV.pm:180 special-case probe uses `Get8u(\$buff, 4)` — ABSOLUTE offset 4,
   // NOT `$pos + 4` / `$start + 4`. The two preceding probes (DV.pm:176-177)
@@ -753,7 +785,13 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
   // parser's `$start` landed. We mirror it faithfully as `buff[4]`. If this
   // ever turns out to be a bug in the oracle, the fix must come from
   // upstream ExifTool first.
-  let profile_idx: Option<usize> = if dsf == 1 && stype == 0 && (buff[4] & 0x07) != 0 {
+  // `buff[4]`: the `start + 480 <= buff.len()` guard (with `start >= 0`)
+  // proves `buff.len() >= 480 > 4`, so `.get(4)` always hits; `RejectShortDif`
+  // is the same recovery the length guard uses (byte-identical).
+  let Some(&byte4) = buff.get(4) else {
+    return Parsed::RejectShortDif;
+  };
+  let profile_idx: Option<usize> = if dsf == 1 && stype == 0 && (byte4 & 0x07) != 0 {
     Some(2) // DV.pm:180-181 special case ⇒ @dvProfiles[2]
   } else {
     DV_PROFILES
@@ -763,7 +801,12 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
   let Some(profile_idx) = profile_idx else {
     return Parsed::UnrecognizedProfile; // DV.pm:188
   };
-  let profile = &DV_PROFILES[profile_idx];
+  // `profile_idx` is always a valid `DV_PROFILES` index (`Some(2)` or a
+  // `position(...)` result), so `.get()` always hits; `UnrecognizedProfile`
+  // (the no-profile recovery) is the byte-identical fallback.
+  let Some(profile) = DV_PROFILES.get(profile_idx) else {
+    return Parsed::UnrecognizedProfile;
+  };
   // DV.pm:193-196.
   let byte_rate: f64 = f64::from(profile.frame_size()) * profile.frame_rate_f64();
   let total_bitrate: f64 = 8.0 * byte_rate;
@@ -795,11 +838,16 @@ fn compute(buff: &[u8], total_len: usize) -> Parsed<'static> {
   let mut audio_sample_rate: Option<i64> = None;
   let mut audio_bits_per_sample: Option<i64> = None;
   let audio_pos = start + 80 * 6 + 80 * 16 * 3 + 3; // DV.pm:250
-  if audio_pos + 4 < buff.len() && buff[audio_pos] == 0x50 {
-    let _smpls = buff[audio_pos + 1]; // DV.pm:252 (Perl never uses $smpls — faithful no-op)
-    let freq = (buff[audio_pos + 4] >> 3) & 0x07; // DV.pm:253
-    let mut a_stype = buff[audio_pos + 3] & 0x1f; // DV.pm:254
-    let quant = buff[audio_pos + 4] & 0x07; // DV.pm:255
+  // `buff.get(audio_pos..audio_pos + 5).is_some()` is the same condition as the
+  // original `audio_pos + 4 < buff.len()` (for usize, `+4 < len` ⟺ `+5 <= len`);
+  // the `[a0, a1, _, a3, a4]` window reads the exact same bytes (byte-identical).
+  if let Some(&[a0, a1, _a2, a3, a4]) = buff.get(audio_pos..audio_pos + 5)
+    && a0 == 0x50
+  {
+    let _smpls = a1; // DV.pm:252 (Perl never uses $smpls — faithful no-op)
+    let freq = (a4 >> 3) & 0x07; // DV.pm:253 (buff[audio_pos + 4])
+    let mut a_stype = a3 & 0x1f; // DV.pm:254 (buff[audio_pos + 3])
+    let quant = a4 & 0x07; // DV.pm:255 (buff[audio_pos + 4])
     if freq < 3 {
       audio_sample_rate = Some(match freq {
         0 => 48_000,
@@ -950,7 +998,9 @@ pub fn parse_borrowed(data: &[u8]) -> Option<ParseOutcome<'static>> {
 fn parse_outcome(data: &[u8]) -> Option<ParseOutcome<'static>> {
   let total_len = data.len();
   let cap = total_len.min(12_000);
-  match compute(&data[..cap], total_len) {
+  // `cap = total_len.min(12_000)` and `total_len == data.len()`, so `cap <=
+  // data.len()` and `data.get(..cap)` always hits (byte-identical to `&data[..cap]`).
+  match compute(data.get(..cap)?, total_len) {
     Parsed::RejectEmpty | Parsed::RejectNoDif | Parsed::RejectShortDif => None,
     Parsed::UnrecognizedProfile => Some(ParseOutcome::UnrecognizedProfile),
     Parsed::Found(meta) => Some(ParseOutcome::Meta(meta)),
@@ -1169,6 +1219,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   #[test]

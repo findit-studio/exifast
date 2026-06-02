@@ -51,6 +51,10 @@
 //! `h264_conformance` + the unit tests below) rather than through the
 //! file-type-dispatched `extract_info` path.
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 use std::{borrow::Cow, vec::Vec};
 
@@ -153,7 +157,10 @@ impl<'a> BitStream<'a> {
         break;
       }
       val <<= 1;
-      let byte = self.data[self.bit_pos >> 3];
+      // The `bit_pos >= total` guard above (`total == data.len()*8`) proves
+      // `bit_pos >> 3 < data.len()`, so `.get()` always hits; the `0` fallback
+      // is unreachable (byte-identical to the raw index).
+      let byte = self.data.get(self.bit_pos >> 3).copied().unwrap_or(0);
       let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
       val |= u64::from(bit);
       self.bit_pos += 1;
@@ -210,7 +217,9 @@ impl<'a> BitStream<'a> {
     // last`). `count` is `usize` (bounded by `total`); it cannot overflow.
     let mut count: usize = 0;
     while self.bit_pos < total {
-      let byte = self.data[self.bit_pos >> 3];
+      // `bit_pos < total` (`total == data.len()*8`) ⇒ `bit_pos >> 3 <
+      // data.len()`, so `.get()` always hits; `0` fallback is unreachable.
+      let byte = self.data.get(self.bit_pos >> 3).copied().unwrap_or(0);
       let bit = (byte >> (7 - (self.bit_pos & 7))) & 1;
       if bit == 1 {
         break; // 1-bit found — leave the cursor ON it (Perl peeks).
@@ -1228,7 +1237,11 @@ fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
     };
     search_from = body_end;
 
-    let header = data[nal_start];
+    // `nal_start >= data.len()` guard above ≡ `.get(nal_start)` returning
+    // `None` (byte-identical; same `break` recovery).
+    let Some(&header) = data.get(nal_start) else {
+      break;
+    };
     // H264.pm:1058 — forbidden_zero_bit must be clear. Perl:
     // `$nal_unit_type & 0x80 and $et->Warn('H264 forbidden bit error'), last`
     // — emit the warning (surfaced as `ExifTool:Warning`) BEFORE stopping the
@@ -1246,7 +1259,13 @@ fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
 
     // H264.pm:1063-1070 — de-escape the RBSP (strip `00 00 03` → `00 00`).
     // The NAL body is `data[nal_start + 1 .. body_end]` (past the header).
-    let nal_body = &data[nal_start.saturating_add(1)..body_end];
+    // Here `nal_start < data.len()` (guard above) and `body_end > nal_start`
+    // (the NAL header is a non-`00` SPS/SEI byte, so the next start code cannot
+    // sit AT `nal_start`), so `nal_start+1 <= body_end` and `.get()` always hits
+    // (byte-identical; the `continue` skips this NAL on the unreachable miss).
+    let Some(nal_body) = data.get(nal_start.saturating_add(1)..body_end) else {
+      continue;
+    };
     let rbsp = unescape_rbsp(nal_body);
 
     match nal_type {
@@ -1303,12 +1322,19 @@ struct StartCode {
 /// is greedy, so a 4-byte `00 00 00 01` is matched as the 4-byte form.
 fn find_start_code(data: &[u8], from: usize) -> Option<StartCode> {
   let mut i = from;
+  // The `i + 3 <= data.len()` loop bound proves the 3-byte window exists, and
+  // the `i > 0` guard proves `i - 1` exists, so every `.get()` here hits
+  // (byte-identical to the raw indices).
   while i + 3 <= data.len() {
-    if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+    if let Some(&[b0, b1, b2]) = data.get(i..i + 3)
+      && b0 == 0
+      && b1 == 0
+      && b2 == 1
+    {
       // 3-byte form. If preceded by another 0 within range, the Perl
       // greedy `\0{2,3}` would have consumed it — treat the leading 0 as
       // part of the code (code_start points one byte earlier).
-      let code_start = if i > from && i > 0 && data[i - 1] == 0 {
+      let code_start = if i > from && i > 0 && data.get(i - 1) == Some(&0) {
         i - 1
       } else {
         i
@@ -1356,7 +1382,11 @@ fn unescape_rbsp(body: &[u8]) -> Cow<'_, [u8]> {
   let mut zeros = 0u32;
   let mut i = 0usize;
   while i < body.len() {
-    let b = body[i];
+    // `i < body.len()` (loop bound) ⇒ `.get(i)` always hits; `break` is the
+    // unreachable recovery (byte-identical to the raw `body[i]`).
+    let Some(&b) = body.get(i) else {
+      break;
+    };
     if i >= 3 && zeros >= 2 && b == 0x03 {
       // Drop this emulation-prevention byte. Per the H.264 spec the byte
       // AFTER an inserted 03 is always ≤ 0x03; Perl simply removes the 03
@@ -1400,10 +1430,11 @@ fn process_sei(
     // fabricating MDPM tags in release builds).
     let mut payload_type: u64 = 0;
     loop {
-      if pos >= end {
+      // The `pos >= end` guard ≡ `.get(pos)` returning `None` (byte-identical;
+      // same `return false` recovery).
+      let Some(&t) = rbsp.get(pos) else {
         return false;
-      }
-      let t = rbsp[pos];
+      };
       pos += 1;
       payload_type = payload_type.saturating_add(u64::from(t));
       if t != 255 {
@@ -1421,10 +1452,11 @@ fn process_sei(
     // narrow-type/overflow path can ever exist here.
     let mut payload_size = 0usize;
     loop {
-      if pos >= end {
+      // The `pos >= end` guard ≡ `.get(pos)` returning `None` (byte-identical;
+      // same `return false` recovery).
+      let Some(&t) = rbsp.get(pos) else {
         return false;
-      }
-      let t = rbsp[pos];
+      };
       pos += 1;
       payload_size = payload_size.saturating_add(usize::from(t));
       if t != 255 {
@@ -1442,18 +1474,22 @@ fn process_sei(
     pos += payload_size;
   };
 
-  // H264.pm:971-972 — require the 16-byte UUID + "MDPM".
-  if size <= 20 || pos + 20 > end || rbsp[pos..pos + 20] != MDPM_UUID_TAG {
+  // H264.pm:971-972 — require the 16-byte UUID + "MDPM". The `pos + 20 > end`
+  // short-circuit guards the slice, so `.get(pos..pos+20)` matches the raw
+  // `rbsp[pos..pos+20]` comparison (byte-identical).
+  if size <= 20 || pos + 20 > end || rbsp.get(pos..pos + 20) != Some(MDPM_UUID_TAG.as_slice()) {
     return false;
   }
 
   // H264.pm:977-1024 — walk the MDPM records.
   let payload_end = pos + size; // H264.pm:980
   pos += 20; // skip UUID + "MDPM" (H264.pm:981)
-  if pos >= end {
+  // The `pos >= end` guard ≡ `.get(pos)` returning `None` (byte-identical;
+  // same `return false` recovery).
+  let Some(&num) = rbsp.get(pos) else {
     return false;
-  }
-  let num = rbsp[pos]; // entry count (H264.pm:982)
+  };
+  // entry count (H264.pm:982)
   pos += 1;
 
   let mut last_tag: i32 = 0; // H264.pm:983 `$lastTag = 0`
@@ -1466,10 +1502,12 @@ fn process_sei(
   // class-sweep — audited, not overflowable).
   let mut index = 0u8;
   while index < num && pos < payload_end {
-    if pos >= end {
+    // The `pos >= end` guard ≡ `.get(pos)` returning `None` (byte-identical;
+    // same `break` recovery).
+    let Some(&tag) = rbsp.get(pos) else {
       break;
-    }
-    let tag = rbsp[pos]; // H264.pm:987
+    };
+    // H264.pm:987
     // H264.pm:988-991 — records must be strictly ascending.
     if i32::from(tag) <= last_tag {
       // Perl `Warn('Entries in MDPM directory are out of sequence'); last`
@@ -1491,14 +1529,13 @@ fn process_sei(
     // instead of breaking (Codex R9 F2).
     let buff_start = pos + 1;
     let buff_end = (pos + 5).min(end);
-    let mut buff: Vec<u8> = if buff_start <= buff_end {
-      rbsp[buff_start..buff_end].to_vec()
-    } else {
-      // `$pos + 1` is itself past the data — nothing to read; `substr`
-      // returns the empty string. (`$pos < $end` already held, so this
-      // only triggers when `$pos == $end - 1`.)
-      Vec::new()
-    };
+    // `buff_end <= end == rbsp.len()`, so `.get(buff_start..buff_end)` is
+    // `Some` on exactly the `buff_start <= buff_end` condition and `None`
+    // otherwise — `map_or_else` reproduces the original if/else (byte-identical).
+    // (Per Perl `substr`, `$pos+1` past the data ⇒ the empty string.)
+    let mut buff: Vec<u8> = rbsp
+      .get(buff_start..buff_end)
+      .map_or_else(Vec::new, <[u8]>::to_vec);
 
     // H264.pm:995 — `GetTagInfo` evaluates the tag's `Condition`. A tag
     // whose `Condition => '$$self{Make} eq "…"'` fails yields `$tagInfo ==
@@ -1519,7 +1556,11 @@ fn process_sei(
         if pos + 5 >= payload_end {
           break;
         }
-        let next_tag = rbsp[pos + 5];
+        // `pos + 5 < payload_end <= end == rbsp.len()`, so `.get()` always hits;
+        // `break` is the unreachable recovery (byte-identical).
+        let Some(&next_tag) = rbsp.get(pos + 5) else {
+          break;
+        };
         // H264.pm:1007 — must be the consecutive id.
         if i32::from(next_tag) != last_tag + 1 {
           break;
@@ -1532,8 +1573,10 @@ fn process_sei(
         // `WGS8` followed by a truncated `0xc8` whose sole data byte is
         // `4` yields the combined string `WGS84` (Codex R10 F2).
         let append_end = (pos + 5).min(end);
-        if pos + 1 < append_end {
-          buff.extend_from_slice(&rbsp[pos + 1..append_end]);
+        // `pos + 1 < append_end <= end == rbsp.len()` ⇒ `.get()` is `Some`
+        // (byte-identical to the raw `&rbsp[pos+1..append_end]`).
+        if let Some(append) = rbsp.get(pos + 1..append_end) {
+          buff.extend_from_slice(append);
         }
         index += 1;
         last_tag += 1;
@@ -1596,11 +1639,11 @@ fn emit_mdpm(def: &MdpmTag, buff: &[u8], entries: &mut Vec<H264Entry>, make: &mu
       // and `HandleTag` still emits the tag. The empty value misses the
       // PrintConv hash, so `-j` renders `Unknown ()` and `-n` renders `""`
       // (Codex R10 F1).
-      let value = if buff.len() >= 4 {
-        let n = u32::from_be_bytes([buff[0], buff[1], buff[2], buff[3]]);
-        int32u_enum_value(n, map)
-      } else {
-        int32u_enum_empty()
+      // `buff.get(0..4)` is `Some` on exactly the original `buff.len() >= 4`
+      // condition, `None` otherwise — `match` reproduces the if/else (byte-identical).
+      let value = match buff.get(0..4) {
+        Some(&[b0, b1, b2, b3]) => int32u_enum_value(u32::from_be_bytes([b0, b1, b2, b3]), map),
+        _ => int32u_enum_empty(),
       };
       entries.push(H264Entry::with_group_priority(
         def.group,
@@ -1616,10 +1659,11 @@ fn emit_mdpm(def: &MdpmTag, buff: &[u8], entries: &mut Vec<H264Entry>, make: &mu
       // (`ExifTool.pm:6285`); the ValueConv `'' ? 1 : 0` evaluates the empty
       // string as Perl-falsy, so `$val` collapses to `0` — bundled emits
       // `-n` `0` / `-j` `Above Sea Level`, NOT a dropped tag (Codex R10 F1).
-      let raw = if buff.len() >= 4 {
-        u32::from_be_bytes([buff[0], buff[1], buff[2], buff[3]])
-      } else {
-        0
+      // `buff.get(0..4)` is `Some` iff `buff.len() >= 4` (byte-identical to the
+      // original if/else; the `0` fallback matches the short-buffer branch).
+      let raw = match buff.get(0..4) {
+        Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]),
+        _ => 0,
       };
       let vc: u32 = u32::from(raw != 0);
       entries.push(H264Entry::with_group_priority(
@@ -1639,11 +1683,11 @@ fn emit_mdpm(def: &MdpmTag, buff: &[u8], entries: &mut Vec<H264Entry>, make: &mu
       // fallback prints the value verbatim — an empty value renders
       // `Unknown ()` (NOT `Unknown (0x0)`), and `-n` renders `""` (Codex
       // R10 F1).
-      let value = if buff.len() >= 4 {
-        let n = u32::from_be_bytes([buff[0], buff[1], buff[2], buff[3]]);
-        flash_value(n)
-      } else {
-        TextValue::new(SmolStr::new_static("Unknown ()"), SmolStr::default())
+      // `buff.get(0..4)` is `Some` iff `buff.len() >= 4` (byte-identical to the
+      // original if/else; the `Unknown ()` fallback matches the short branch).
+      let value = match buff.get(0..4) {
+        Some(&[b0, b1, b2, b3]) => flash_value(u32::from_be_bytes([b0, b1, b2, b3])),
+        _ => TextValue::new(SmolStr::new_static("Unknown ()"), SmolStr::default()),
       };
       entries.push(H264Entry::with_group_priority(
         def.group,
@@ -1663,16 +1707,11 @@ fn emit_mdpm(def: &MdpmTag, buff: &[u8], entries: &mut Vec<H264Entry>, make: &mu
       // `0 < 1` ⇒ `ReadValue` returns `undef` and the tag is dropped.
       let n = buff.len().min(4);
       if n >= 1 {
-        let numeric = buff[..n]
-          .iter()
-          .map(u8::to_string)
-          .collect::<Vec<_>>()
-          .join(" ");
-        let print_conv = buff[..n]
-          .iter()
-          .map(u8::to_string)
-          .collect::<Vec<_>>()
-          .join(".");
+        // `n = buff.len().min(4) <= buff.len()`, so `.get(..n)` always hits;
+        // `unwrap_or(&[])` is the unreachable fallback (byte-identical).
+        let head = buff.get(..n).unwrap_or(&[]);
+        let numeric = head.iter().map(u8::to_string).collect::<Vec<_>>().join(" ");
+        let print_conv = head.iter().map(u8::to_string).collect::<Vec<_>>().join(".");
         entries.push(H264Entry::with_group_priority(
           def.group,
           def.priority,
@@ -1813,8 +1852,13 @@ fn render_rational(buff: &[u8], signed: bool, conv: RationalConv) -> Option<Text
   let mut rats: Vec<crate::value::Rational> = Vec::new();
   let mut i = 0usize;
   while i + 4 <= buff.len() {
-    let num = i16::from_be_bytes([buff[i], buff[i + 1]]);
-    let den = i16::from_be_bytes([buff[i + 2], buff[i + 3]]);
+    // The `i + 4 <= buff.len()` loop bound proves this 4-byte window exists,
+    // so the destructure always binds (byte-identical; `break` ≡ the loop exit).
+    let Some(&[b0, b1, b2, b3]) = buff.get(i..i + 4) else {
+      break;
+    };
+    let num = i16::from_be_bytes([b0, b1]);
+    let den = i16::from_be_bytes([b2, b3]);
     let r = if signed {
       // rational32s — `Get16s` num/den.
       crate::value::Rational::rational32(i64::from(num), i64::from(den))
@@ -2004,7 +2048,14 @@ fn render_rational(buff: &[u8], signed: bool, conv: RationalConv) -> Option<Text
 fn render_string(buff: &[u8], conv: StringConv) -> Option<TextValue> {
   // Truncate at the first NUL, then interpret as Latin-1/ASCII bytes.
   let end = buff.iter().position(|&b| b == 0).unwrap_or(buff.len());
-  let raw: std::string::String = buff[..end].iter().map(|&b| b as char).collect();
+  // `end <= buff.len()` (a `position` index or `buff.len()`), so `.get(..end)`
+  // always hits; `unwrap_or(&[])` is the unreachable fallback (byte-identical).
+  let raw: std::string::String = buff
+    .get(..end)
+    .unwrap_or(&[])
+    .iter()
+    .map(|&b| b as char)
+    .collect();
 
   match conv {
     StringConv::Plain => {
@@ -2103,16 +2154,23 @@ fn exif_date(date: &str) -> std::string::String {
   let take_digits = |i: &mut usize, n: usize| -> Option<std::string::String> {
     let mut got = std::string::String::new();
     for _ in 0..n {
-      if *i == 0 || !is_d(chars[*i - 1]) {
+      // The `*i == 0` guard prevents the `*i - 1` underflow; `.get(*i-1)` then
+      // returns `Some` for a valid index (byte-identical to `chars[*i-1]`).
+      let Some(&prev) = i.checked_sub(1).and_then(|p| chars.get(p)) else {
+        return None;
+      };
+      if !is_d(prev) {
         return None;
       }
       *i -= 1;
-      got.push(chars[*i]);
+      got.push(prev);
     }
     Some(got.chars().rev().collect())
   };
   let skip_nondigits = |i: &mut usize| {
-    while *i > 0 && !is_d(chars[*i - 1]) {
+    // The `*i > 0` guard prevents the `*i - 1` underflow; `.get()` then hits
+    // for a valid index (byte-identical to `chars[*i-1]`).
+    while *i > 0 && !chars.get(*i - 1).copied().is_some_and(is_d) {
       *i -= 1;
     }
   };
@@ -2124,8 +2182,9 @@ fn exif_date(date: &str) -> std::string::String {
   match (yyyy, mm, dd) {
     (Some(y), Some(m), Some(d)) => {
       // Keep any prefix before the matched `YYYY` (the regex only rewrites
-      // the trailing run).
-      let prefix: std::string::String = chars[..i].iter().collect();
+      // the trailing run). `i <= chars.len()` (only ever decremented), so
+      // `.get(..i)` always hits; `unwrap_or(&[])` is unreachable (byte-identical).
+      let prefix: std::string::String = chars.get(..i).unwrap_or(&[]).iter().collect();
       std::format!("{prefix}{y}:{m}:{d}")
     }
     // No `YYYY..MM..DD` suffix ⇒ the regex does not match; return as-is.
@@ -2230,8 +2289,15 @@ fn gps_print_time_stamp(val: &str) -> std::string::String {
     return val.to_string();
   };
   let secs_part = &val[colon + 1..];
-  // Must be exactly two integer digits then a fractional part.
-  if secs_part.len() < 4 || !secs_part.as_bytes()[..2].iter().all(u8::is_ascii_digit) {
+  // Must be exactly two integer digits then a fractional part. The
+  // `secs_part.len() < 4` short-circuit guards the 2-byte prefix, so
+  // `.get(..2)` matches the raw `as_bytes()[..2]` (byte-identical).
+  if secs_part.len() < 4
+    || !secs_part
+      .as_bytes()
+      .get(..2)
+      .is_some_and(|b| b.iter().all(u8::is_ascii_digit))
+  {
     return val.to_string();
   }
   let Ok(secs) = secs_part.parse::<f64>() else {
@@ -2473,8 +2539,9 @@ fn process_subdir(
   match kind {
     SubDirKind::MakeModel => {
       // H264.pm:521-550 — `FORMAT => 'int16u'`, big-endian. Word 0 = Make.
-      if buff.len() >= 2 {
-        let raw = u16::from_be_bytes([buff[0], buff[1]]);
+      // `buff.get(0..2)` is `Some` iff `buff.len() >= 2` (byte-identical guard).
+      if let Some(&[b0, b1]) = buff.get(0..2) {
+        let raw = u16::from_be_bytes([b0, b1]);
         // H264.pm:530 — `RawConv` sets `$$self{Make} = convMake{$val} ||
         // "Unknown"` (used for later `Condition`s), passing the raw `$val`
         // through unchanged.
@@ -2497,8 +2564,9 @@ fn process_subdir(
     SubDirKind::Shutter => {
       // H264.pm:504-519 — `FORMAT => 'int16u'`, LITTLE-endian (H264.pm:150).
       // Tag `1.1 ExposureTime`: word 1 (byte offset 2), mask 0x7fff.
-      if buff.len() >= 4 {
-        let word1 = u16::from_le_bytes([buff[2], buff[3]]);
+      // `buff.get(2..4)` is `Some` iff `buff.len() >= 4` (byte-identical guard).
+      if let Some(&[b2, b3]) = buff.get(2..4) {
+        let word1 = u16::from_le_bytes([b2, b3]);
         let masked = u32::from(word1) & 0x7fff;
         // H264.pm:516 — `RawConv => '$val == 0x7fff ? undef : $val'`.
         if masked != 0x7fff {
@@ -2788,7 +2856,9 @@ fn escape_json_is_number(s: &str) -> bool {
   // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
   // leading zero).
   let int_start = i;
-  while i < b.len() && b[i].is_ascii_digit() {
+  // Every `b[i]` below is guarded by `i < b.len()`, so the `.get(i)` form is
+  // byte-identical (it collapses to the same predicate when in range).
+  while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   let int_len = i - int_start;
@@ -2798,16 +2868,17 @@ fn escape_json_is_number(s: &str) -> bool {
   if int_len == 1 {
     // a single digit `\d` — any 0..=9 is fine.
   } else {
-    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`).
-    if int_len > 15 || b[int_start] == b'0' {
+    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`). `int_len >= 2`
+    // ⇒ `int_start < i <= b.len()`, so `.get(int_start)` hits (byte-identical).
+    if int_len > 15 || b.get(int_start) == Some(&b'0') {
       return false;
     }
   }
   // optional fraction `\.\d{1,16}`.
-  if i < b.len() && b[i] == b'.' {
+  if i < b.len() && b.get(i) == Some(&b'.') {
     i += 1;
     let frac_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     let frac_len = i - frac_start;
@@ -2815,14 +2886,15 @@ fn escape_json_is_number(s: &str) -> bool {
       return false;
     }
   }
-  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`).
-  if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`). The `i < b.len()`
+  // guards make the `.get(i)` forms byte-identical to the raw `b[i]` checks.
+  if i < b.len() && matches!(b.get(i), Some(&b'e' | &b'E')) {
     i += 1;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+    if i < b.len() && matches!(b.get(i), Some(&b'+' | &b'-')) {
       i += 1;
     }
     let exp_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     let exp_len = i - exp_start;
@@ -3015,6 +3087,11 @@ impl crate::metadata::Project for H264Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

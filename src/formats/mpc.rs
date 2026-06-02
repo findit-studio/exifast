@@ -53,6 +53,10 @@
 //! | 191       | Gapless              | hash (0/1 ⇒ No/Yes)          |
 //! | 216-223   | EncoderVersion       | func (`$val =~ s/(\d)(\d)(\d)$/$1.$2.$3/`) |
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
   format_parser::{FormatParser, SharedFlags, parser_sealed},
@@ -203,7 +207,11 @@ fn encoder_version_print(val: &TagValue) -> TagValue {
     _ => return val.clone(),
   };
   let bytes = s.as_bytes();
-  if bytes.len() < 3 || !bytes[bytes.len() - 3..].iter().all(u8::is_ascii_digit) {
+  if bytes.len() < 3
+    || !bytes
+      .get(bytes.len() - 3..)
+      .is_some_and(|t| t.iter().all(u8::is_ascii_digit))
+  {
     // No-match: Perl's `s///` leaves `$val` unchanged ⇒ return the ORIGINAL
     // (preserving I64 vs Str typing). Forcing `TagValue::Str(s)` here would
     // turn a 2-digit version like `15` into JSON `"15"` instead of `15`,
@@ -214,14 +222,18 @@ fn encoder_version_print(val: &TagValue) -> TagValue {
   // Tail is exactly 3 ASCII digits; insert dots: "abc" -> "a.b.c". The
   // substitution always produces a string in Perl (the `$1.$2.$3` replacement
   // contains non-digit chars), so the match-path return is `TagValue::Str`.
+  // The guard above proved `tail` is exactly 3 bytes, so this destructure
+  // always binds; the `else` recovers on the same no-match path for safety.
+  let [t0, t1, t2] = *tail.as_bytes() else {
+    return val.clone();
+  };
   let mut out = String::with_capacity(head.len() + 5);
   out.push_str(head);
-  let tb = tail.as_bytes();
-  out.push(tb[0] as char);
+  out.push(t0 as char);
   out.push('.');
-  out.push(tb[1] as char);
+  out.push(t1 as char);
   out.push('.');
-  out.push(tb[2] as char);
+  out.push(t2 as char);
   TagValue::Str(out.into())
 }
 
@@ -655,12 +667,12 @@ fn parse_inner_at(data: &[u8], offset: usize) -> Option<Meta<'_>> {
   if body.len() < 32 {
     return None; // short read ⇒ Perl `$raf->Read != 32` ⇒ return 0
   }
-  let hdr = &body[..32];
-  if &hdr[..3] != b"MP+" {
+  let hdr = body.get(..32)?;
+  if hdr.get(..3) != Some(&b"MP+"[..]) {
     return None; // magic mismatch ⇒ Perl regex no-match ⇒ return 0
   }
   // MPC.pm:93 `my $vers = ord($1) & 0x0f` — low nibble of byte 3.
-  let version = hdr[3] & 0x0f;
+  let version = hdr.get(3).copied()? & 0x0f;
 
   // MPC.pm:97-106 — SV7 path: ProcessDirectory(MPC::Main) over the 32-byte
   // header, byte order 'II' (MPC.pm:98). `Options('Verbose')` (MPC.pm:100)
@@ -1013,19 +1025,33 @@ impl crate::emit::Taggable for Meta<'_> {
       let encoder_version = if print_conv {
         let s = u32::from(h.encoder_version()).to_string();
         let b = s.as_bytes();
-        if b.len() >= 3 && b[b.len() - 3..].iter().all(u8::is_ascii_digit) {
+        let last3_all_digits = b
+          .get(b.len().saturating_sub(3)..)
+          .is_some_and(|t| t.iter().all(u8::is_ascii_digit));
+        // When the guard holds, `tail` is exactly 3 bytes so the `[t0,t1,t2]`
+        // arm always matches; the wildcard recovers on the same raw-integer
+        // path the non-match branch uses (byte-identical, never taken here).
+        let dotted = if b.len() >= 3 && last3_all_digits {
           let (head, tail) = s.split_at(s.len() - 3);
-          let tb = tail.as_bytes();
-          let mut out = std::string::String::with_capacity(head.len() + 5);
-          out.push_str(head);
-          out.push(tb[0] as char);
-          out.push('.');
-          out.push(tb[1] as char);
-          out.push('.');
-          out.push(tb[2] as char);
-          TagValue::Str(out.into())
+          match *tail.as_bytes() {
+            [t0, t1, t2] => {
+              let mut out = std::string::String::with_capacity(head.len() + 5);
+              out.push_str(head);
+              out.push(t0 as char);
+              out.push('.');
+              out.push(t1 as char);
+              out.push('.');
+              out.push(t2 as char);
+              Some(out)
+            }
+            _ => None,
+          }
         } else {
-          TagValue::U64(u64::from(h.encoder_version()))
+          None
+        };
+        match dotted {
+          Some(out) => TagValue::Str(out.into()),
+          None => TagValue::U64(u64::from(h.encoder_version())),
         }
       } else {
         TagValue::U64(u64::from(h.encoder_version()))
@@ -1092,6 +1118,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::emit::{ConvMode, Taggable};
