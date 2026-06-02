@@ -110,8 +110,11 @@ use alloc::{
 use smol_str::SmolStr;
 
 use crate::{
-  formats::quicktime_stream::{convert_lat_lon, join3, synth_gps_date_time},
-  metadata::{GpsSample, QuickTimeStreamMeta},
+  formats::{
+    gopro,
+    quicktime_stream::{convert_lat_lon, join3, synth_gps_date_time},
+  },
+  metadata::{GoProMeta, GpsSample, QuickTimeStreamMeta},
 };
 
 // ── conversion factors (QuickTimeStream.pl:73-75) ──────────────────────────
@@ -193,22 +196,32 @@ pub fn scan_media_data(
   kodak_version: Option<&str>,
   already_found_embedded: bool,
   out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut GoProMeta,
 ) {
   // QuickTimeStream.pl:3689 `return if $$et{FoundEmbedded} or not $dataPos`.
   if already_found_embedded || mdat_offset == 0 {
     return;
   }
   let start = mdat_offset.min(data.len() as u64) as usize;
-  let end = mdat_offset.saturating_add(mdat_size).min(data.len() as u64) as usize;
-  if end <= start {
-    return;
-  }
-  // `start`/`end` are both clamped to `data.len()` and `end > start`, so this
-  // `.get` is always `Some`; the `else` return is unreachable and matches the
-  // `end <= start` guard's recovery (byte-identical).
-  let Some(mdat) = data.get(start..end) else {
+  // ExifTool scans through `$raf` from `$$et{MediaDataOffset}` for an
+  // initially `$$et{MediaDataSize}`-byte window (QuickTimeStream.pl:3688/3697).
+  // The port holds the WHOLE file, so the scan base is `data[start..]` (the
+  // file tail from the mdat payload) and the window is a MUTABLE `limit` over
+  // that base. `limit` starts at `mdat_size` (the declared payload) and, on
+  // the FIRST-EVER find that is a GoPro GP6 record, EXPANDS to the end of the
+  // file (QuickTimeStream.pl:3732-3736 `unless ($found) { Seek(0,2) and
+  // $dataLen = Tell - MediaDataOffset }`) because later GP6 records may live in
+  // a trailer AFTER the declared `mdat`. The expansion is GUARDED by `unless
+  // ($found)`: the freeGPS path sets `$found = 1` (no expansion), and a GP6
+  // sets `$found = 2`, so a GP6 that follows ANY earlier find (freeGPS or GP6)
+  // does NOT expand — only a first-ever GP6 grows the window.
+  let Some(tail) = data.get(start..) else {
     return;
   };
+  let mut limit = (mdat_size.min(tail.len() as u64)) as usize;
+  if limit == 0 {
+    return;
+  }
 
   // QuickTimeStream.pl:2050 `$$et{FreeGPS2}` — the cross-block ATC ring-buffer
   // state (`Then` + `RecentRecPos`) persists for the whole scan, exactly as
@@ -217,11 +230,11 @@ pub fn scan_media_data(
   let mut pos = 0usize;
   let mut found = false;
   // QuickTimeStream.pl:3702 `while ($dataLen)` — read 0x8000-byte chunks.
-  while pos < mdat.len() {
-    let chunk_end = (pos + GPS_BLOCK_SIZE).min(mdat.len());
-    // `chunk_end <= mdat.len()` and `pos < mdat.len() <= chunk_end`, so this
-    // `.get` is always `Some`; the `else` break matches the `while` guard.
-    let Some(chunk) = mdat.get(pos..chunk_end) else {
+  while pos < limit {
+    let chunk_end = (pos + GPS_BLOCK_SIZE).min(limit);
+    // `chunk_end <= limit <= tail.len()` and `pos < limit <= chunk_end`, so
+    // this `.get` is always `Some`; the `else` break matches the `while` guard.
+    let Some(chunk) = tail.get(pos..chunk_end) else {
       break;
     };
     // QuickTimeStream.pl:3710 `if ($buff !~ /(\0..\0freeGPS |GP\x06\0\0)/sg)`.
@@ -262,24 +275,24 @@ pub fn scan_media_data(
           // QuickTimeStream.pl:3768-3772 — `$more = $len - length($buff); …
           // $raf->Read($buf2, $more)`: ExifTool EXTENDS the buffer when the
           // declared box overruns the current 0x8000-byte chunk. We hold the
-          // whole `mdat` in memory, so the faithful equivalent is to slice the
-          // block from `mdat` using its ABSOLUTE offset (`pos + abs`) rather
+          // whole file in memory, so the faithful equivalent is to slice the
+          // block from `tail` using its ABSOLUTE offset (`pos + abs`) rather
           // than from the bounded `chunk` window — slicing `chunk[abs..
           // abs+len]` panics whenever `abs + len` exceeds the window, which is
           // the COMMON case for real 0x8000-byte freeGPS blocks: the 12-byte
           // cross-chunk overlap (the `substr($buff,-12)` carry below) lands the
           // next adjacent 0x8000 block straddling the window boundary.
           let block_abs = pos + abs;
-          if block_abs + len > mdat.len() {
+          if block_abs + len > limit {
             // QuickTimeStream.pl:3770 `last unless $raf->Read == $more` — a
-            // short final read: the declared box runs past the end of media
-            // data, so stop scanning entirely.
+            // short final read: the declared box runs past the end of the
+            // (current) scan window, so stop scanning entirely.
             return;
           }
-          // The guard above proves `block_abs + len <= mdat.len()`, so this
-          // `.get` is always `Some`; the `else` return matches that guard's
-          // recovery (byte-identical).
-          let Some(block) = mdat.get(block_abs..block_abs + len) else {
+          // The guard above proves `block_abs + len <= limit <= tail.len()`,
+          // so this `.get` is always `Some`; the `else` return matches that
+          // guard's recovery (byte-identical).
+          let Some(block) = tail.get(block_abs..block_abs + len) else {
             return;
           };
           // QuickTimeStream.pl:3777 `$dirInfo = { DataPt, DataPos, DirLen }` —
@@ -305,11 +318,62 @@ pub fn scan_media_data(
         }
         MagicKind::GoPro => {
           // QuickTimeStream.pl:3717-3748: a GoPro `GP\x06\0\0` record
-          // re-dispatches into Image::ExifTool::GoPro::ProcessGP6.
-          // DEFERRED: port the GoPro GPMF module separately.
-          // We must still advance past this byte to avoid an infinite
-          // re-match.
-          search_off = abs + 5;
+          // re-dispatches into Image::ExifTool::GoPro::ProcessGP6 (GoPro.pm:
+          // 783-803). exifast's port is in [`crate::formats::gopro`]: the
+          // contained record (a GPMF KLV starting `DEVC`) goes through the
+          // recursive KLV walker.
+          //
+          // QuickTimeStream.pl:3731 calls `ProcessGP6($et, { RAF => $raf,
+          // DirLen => $maxLen })` with the REST of the media-data slice from
+          // this magic onward, and the function returns the byte count it
+          // consumed. Mirror that — pass `tail[pos+abs..]` so `process_gp6`
+          // can walk consecutive `GP\x06\0\0` records as a sequence. The magic
+          // was just located within `tail`, so `pos + abs` is in range; use
+          // the checked accessor (file-level `deny(indexing_slicing)`). The
+          // `DirLen => $maxLen` cap (QuickTimeStream.pl:3728) is `$dataLen -
+          // ($start - MediaDataOffset)`, i.e. from the record to the END of
+          // the (possibly trailer-expanded) scan window — bound by `limit`.
+          let rec_start = pos + abs;
+          let consumed = tail
+            .get(rec_start..limit)
+            .map_or(0, |rest| gopro::process_gp6(rest, gopro_out));
+          if consumed > 0 {
+            // QuickTimeStream.pl:3732-3737 — the EOF window expansion is
+            // guarded by `unless ($found)`: it fires ONLY when NOTHING was
+            // located before this GoPro record. Snapshot `$found` BEFORE
+            // setting it for this record, so a prior freeGPS block (which set
+            // `$found = 1`, line 3753) or a prior GP6 (which set `$found = 2`)
+            // does NOT let a later GP6 expand past the declared `mdat` into the
+            // trailer. Only a first-ever find expands.
+            if !found {
+              // QuickTimeStream.pl:3734 `$raf->Seek(0,2) and $dataLen = Tell -
+              // MediaDataOffset` — grow the window to the end of the file.
+              limit = tail.len();
+            }
+            found = true;
+            // QuickTimeStream.pl:3739-3741 `Seek($start + $size); $pos = …;
+            // $buf2 = ''`: ALWAYS advance to the ABSOLUTE consumed end and
+            // CLEAR the 12-byte carry (unconditional in ExifTool). `process_gp6`
+            // already walked the whole consecutive `GP\x06` sequence, so there
+            // is no remaining GP6 to find inside the consumed span; re-window
+            // via `pos_override` (resumes with no carry — exactly `$buf2 = ''`)
+            // rather than an in-chunk `search_off`. Doing this unconditionally
+            // (not just when the span crosses `chunk_end`) also covers a record
+            // ending EXACTLY at the 0x8000 boundary, which the outer loop's
+            // 12-byte carry would otherwise re-scan from inside consumed bytes.
+            let abs_end = rec_start + consumed;
+            pos_override = Some(abs_end);
+            break;
+          } else {
+            // consumed == 0 — the record didn't validate; ExifTool's fallback
+            // is to continue with the search (QuickTimeStream.pl:3743-3745
+            // `Seek($filePos); $buf2 = substr($buff, $buffPos)`). Advance past
+            // the 5-byte magic to avoid an infinite re-match.
+            search_off = abs + 5;
+          }
+          if search_off >= chunk.len() {
+            break;
+          }
         }
       }
     }
@@ -3040,7 +3104,17 @@ mod tests {
     file.extend_from_slice(&vec![0u8; 0x9000]); // full-chunk padding
     let mdat_size = file.len() as u64 - mdat_offset;
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
     assert_eq!(out.gps_samples().len(), 1);
     assert_eq!(
       out.gps_samples().first().unwrap().date_time(),
@@ -3210,8 +3284,19 @@ mod tests {
     let mdat_size = file.len() as u64 - mdat_offset;
 
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
     assert_eq!(out.gps_samples().len(), 1);
+    assert!(gp.is_empty());
   }
 
   /// QuickTimeStream.pl:3750 `last if length $buff < $gpsBlockSize` — a freeGPS
@@ -3227,7 +3312,17 @@ mod tests {
     file.extend_from_slice(&block);
     let mdat_size = file.len() as u64 - mdat_offset; // < 0x8000
     let mut out = QuickTimeStreamMeta::new();
-    scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
     assert!(
       out.gps_samples().is_empty(),
       "a freeGPS block in a sub-0x8000 mdat must not be decoded"
@@ -3237,9 +3332,20 @@ mod tests {
   #[test]
   fn scan_media_data_short_circuits_when_embedded_found() {
     let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
     let file = vec![0u8; 0x10000];
-    scan_media_data(&file, 0, file.len() as u64, None, None, true, &mut out);
+    scan_media_data(
+      &file,
+      0,
+      file.len() as u64,
+      None,
+      None,
+      true,
+      &mut out,
+      &mut gp,
+    );
     assert!(out.is_empty());
+    assert!(gp.is_empty());
   }
 
   #[test]
@@ -3559,6 +3665,7 @@ mod tests {
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&mdat);
     let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
     scan_media_data(
       &file,
       mdat_offset,
@@ -3567,11 +3674,275 @@ mod tests {
       None,
       false,
       &mut out,
+      &mut gp,
     );
     assert_eq!(
       out.gps_samples().len(),
       2,
       "both adjacent 0x8000 freeGPS blocks must decode"
+    );
+  }
+
+  // ── GoPro GP6 scan regressions (findings #2 + #3) ──────────────────────
+
+  /// Build one 8-byte GPMF KLV record (4-byte tag + fmt + sample_size +
+  /// 2-byte BE count), payload, then 4-byte NUL pad.
+  fn gp_klv(tag: &[u8; 4], fmt: u8, sample_size: u8, count: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(tag);
+    v.push(fmt);
+    v.push(sample_size);
+    v.extend_from_slice(&count.to_be_bytes());
+    v.extend_from_slice(payload);
+    while v.len() % 4 != 0 {
+      v.push(0);
+    }
+    v
+  }
+
+  /// Build a complete GoPro `GP\x06\0\0` record carrying a DEVC→STRM→{SCAL,
+  /// GPS5} with a single fix at `lat_deg` degrees (so one sample per record).
+  /// The STRM carries the canonical SCAL vector ahead of GPS5 (GPS5 stays the
+  /// LAST record so the GoPro.pm:884 last-in-container guard fires), matching
+  /// real GoPro data where every GPS STRM begins with SCAL. The 16-byte GP6
+  /// header is `GP\x06\0` + BE size + 8 reserved bytes (GoPro.pm:783-803).
+  fn gp6_record_with_gps5(lat_deg: f64) -> Vec<u8> {
+    // One GPS5 row: lat encoded as lat_deg * 10_000_000 (the SCAL[0] below
+    // divides it back to `lat_deg`), the rest zero.
+    let lat_e7 = (lat_deg * 10_000_000.0) as i32;
+    let mut row = Vec::new();
+    row.extend_from_slice(&lat_e7.to_be_bytes());
+    row.extend_from_slice(&0i32.to_be_bytes());
+    row.extend_from_slice(&0i32.to_be_bytes());
+    row.extend_from_slice(&0i32.to_be_bytes());
+    row.extend_from_slice(&0i32.to_be_bytes());
+    let scal_payload: Vec<u8> = [10_000_000u32, 10_000_000, 1_000, 1_000, 100]
+      .iter()
+      .flat_map(|v| v.to_be_bytes())
+      .collect();
+    let scal = gp_klv(b"SCAL", 0x4c, 4, 5, &scal_payload);
+    let gps5 = gp_klv(b"GPS5", 0x6c, 20, 1, &row);
+    let mut strm_body = Vec::new();
+    strm_body.extend_from_slice(&scal);
+    strm_body.extend_from_slice(&gps5);
+    let strm = gp_klv(b"STRM", 0, 1, strm_body.len() as u16, &strm_body);
+    let devc = gp_klv(b"DEVC", 0, 1, strm.len() as u16, &strm);
+    let mut rec = Vec::with_capacity(16 + devc.len());
+    rec.extend_from_slice(b"GP\x06\0"); // 4-byte tag (GP, 0x06, NUL)
+    rec.extend_from_slice(&(devc.len() as u32).to_be_bytes()); // size BE (hi byte 0)
+    rec.extend_from_slice(&[0u8; 8]); // 8 reserved header bytes
+    rec.extend_from_slice(&devc);
+    rec
+  }
+
+  /// FINDING #2 regression — a GoPro GP6 record in a TRAILER (past the declared
+  /// `mdat` payload) must still be scanned. QuickTimeStream.pl:3733-3736
+  /// expands the scan window to EOF on the first valid GP6 record (`Seek(0,2)
+  /// and $dataLen = Tell - MediaDataOffset`) because later records may live in
+  /// a trailer. The pre-fix port clamped the scan to `mdat_offset + mdat_size`
+  /// and dropped the trailer record.
+  #[test]
+  fn scan_media_data_gp6_trailer_record_is_scanned() {
+    let rec_a = gp6_record_with_gps5(4.2); // inside the declared mdat
+    let rec_b = gp6_record_with_gps5(8.4); // in the trailer (past mdat_size)
+    let mut file = vec![0u8; 32];
+    let mdat_offset = file.len() as u64;
+    file.extend_from_slice(&rec_a);
+    // mdat_size covers ONLY rec_a; rec_b sits AFTER the declared payload.
+    let mdat_size = rec_a.len() as u64;
+    file.extend_from_slice(&rec_b);
+    let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
+    // BOTH records must be scanned ⇒ 2 GPS samples (one per record). The
+    // pre-fix code produced only 1 (the trailer record was never reached).
+    assert_eq!(
+      gp.gps_samples().len(),
+      2,
+      "the trailer GP6 record must be scanned after the first valid GP6 expands the window to EOF"
+    );
+  }
+
+  /// FINDING A regression (R3) — the EOF window expansion is guarded by
+  /// `unless ($found)` (QuickTimeStream.pl:3732-3737). When a freeGPS block is
+  /// found FIRST it sets `$found = 1` (QuickTimeStream.pl:3753) WITHOUT
+  /// expanding the window; a GP6 record that follows then sees `$found` already
+  /// truthy, so it must NOT expand the scan past the declared `mdat` into a
+  /// trailer. Layout: a full-0x8000 freeGPS block + an in-`mdat` GP6 record,
+  /// with a SECOND GP6 record sitting in a trailer PAST `mdat_size`. The
+  /// trailer record must NOT be scanned (the window stays clamped to `mdat`).
+  /// The pre-fix port expanded unconditionally on any GP6 with `consumed > 0`,
+  /// so it wrongly reached the trailer.
+  #[test]
+  fn scan_media_data_freegps_then_gp6_does_not_expand_to_trailer() {
+    // Block 0: a full 0x8000-byte freeGPS block (found in chunk 0; sets
+    // `found`, NO expansion — the freeGPS path is `$found = 1`).
+    let free = make_type6_block(GPS_BLOCK_SIZE);
+    // An in-`mdat` GP6 record immediately after the freeGPS block (at absolute
+    // 0x8000); reached via the 12-byte cross-chunk carry. With `found` already
+    // set, this GP6 must NOT expand the window.
+    let gp6_in = gp6_record_with_gps5(4.2);
+    // A trailer GP6 record PAST the declared `mdat` — must stay unscanned.
+    let gp6_trailer = gp6_record_with_gps5(8.4);
+
+    let mut mdat = Vec::new();
+    mdat.extend_from_slice(&free);
+    mdat.extend_from_slice(&gp6_in);
+    let mut file = vec![0u8; 32];
+    let mdat_offset = file.len() as u64;
+    // `mdat_size` covers ONLY the freeGPS block + the in-mdat GP6 record.
+    let mdat_size = mdat.len() as u64;
+    file.extend_from_slice(&mdat);
+    file.extend_from_slice(&gp6_trailer); // trailer, past the declared mdat
+
+    let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
+    // The freeGPS block yields exactly one QuickTime-stream GPS sample.
+    assert_eq!(
+      out.gps_samples().len(),
+      1,
+      "the leading freeGPS block must produce one sample"
+    );
+    // Exactly ONE GoPro sample — from the in-`mdat` GP6 only. The trailer GP6
+    // must NOT be scanned because the freeGPS find already set `found`, so the
+    // GP6 does not expand the window to EOF. (Pre-fix: 2 GoPro samples.)
+    assert_eq!(
+      gp.gps_samples().len(),
+      1,
+      "the trailer GP6 record must NOT be scanned: a prior freeGPS find blocks the EOF expansion (QuickTimeStream.pl:3732 `unless ($found)`)"
+    );
+    // The single GoPro sample is the in-mdat record (lat 4.2), not the trailer.
+    let lat = gp.gps_samples().first().unwrap().latitude().expect("lat");
+    assert!(
+      (lat - 4.2).abs() < 1e-6,
+      "the scanned GoPro sample is the in-mdat record (4.2), not the trailer (8.4): {lat}"
+    );
+  }
+
+  /// FINDING #3 regression — a GoPro GP6 record whose consumed span crosses a
+  /// 0x8000 scanner-chunk boundary must NOT be re-scanned, and the next record
+  /// after the span must be found exactly once. QuickTimeStream.pl:3739-3741
+  /// seeks to the ABSOLUTE consumed end (`Seek($start+$size); $pos = …; $buf2
+  /// = ''`). The pre-fix port advanced only inside the current chunk, so the
+  /// loop tail (`pos += chunk.len() - 12`) re-windowed INSIDE the consumed
+  /// span and could duplicate the records that followed it.
+  #[test]
+  fn scan_media_data_gp6_span_crossing_chunk_boundary_no_duplicate() {
+    // Pad rec_a so its consumed span ends a few bytes PAST the first 0x8000
+    // chunk boundary. The GP6 record's body size is bounded (`<= 0xFFFF`), so
+    // we lead with NUL filler inside `mdat` to push the magic close to the
+    // boundary, with the record body straddling it.
+    let rec_a = gp6_record_with_gps5(4.2);
+    let rec_b = gp6_record_with_gps5(8.4);
+    // Place rec_a's magic so the 16-byte header + body end ~8 bytes past
+    // GPS_BLOCK_SIZE (0x8000). The scanner finds the magic in the first full
+    // chunk (the chunk includes the 12-byte cross-window carry, so the magic
+    // is visible) and `process_gp6` consumes the whole record from `tail`.
+    let lead = GPS_BLOCK_SIZE - rec_a.len() + 8;
+    let mut mdat = vec![0u8; lead];
+    mdat.extend_from_slice(&rec_a); // ends at lead + rec_a.len() = 0x8000 + 8
+    mdat.extend_from_slice(&rec_b); // immediately after the consumed span
+    let mut file = vec![0u8; 16];
+    let mdat_offset = file.len() as u64;
+    let mdat_size = mdat.len() as u64;
+    file.extend_from_slice(&mdat);
+    let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
+    // Exactly 2 samples — one per record, no duplication from re-scanning the
+    // cross-boundary consumed span.
+    assert_eq!(
+      gp.gps_samples().len(),
+      2,
+      "a GP6 record spanning the 0x8000 boundary plus the following record must each be scanned exactly once"
+    );
+    // The two distinct latitudes confirm both records (not one record twice).
+    let lats: Vec<i64> = gp
+      .gps_samples()
+      .iter()
+      .filter_map(|s| s.latitude().map(|v| (v * 10.0).round() as i64))
+      .collect();
+    assert!(
+      lats.contains(&42) && lats.contains(&84),
+      "both records' fixes present: {lats:?}"
+    );
+  }
+
+  /// R2 finding regression — a GP6 consumed span ending EXACTLY at the 0x8000
+  /// chunk boundary (`abs_end == chunk_end`) must also re-window to the
+  /// absolute end and clear the carry. The R1 fix only re-windowed on `abs_end
+  /// > chunk_end`, so the exact-boundary case fell through to the in-chunk
+  /// `search_off` and the outer 12-byte carry could re-scan the consumed span.
+  /// QuickTimeStream.pl:3739-3741 seeks unconditionally; the fixed port mirrors
+  /// that. Each record must be scanned exactly once.
+  #[test]
+  fn scan_media_data_gp6_span_ending_exactly_at_chunk_boundary() {
+    let rec_a = gp6_record_with_gps5(4.2);
+    let rec_b = gp6_record_with_gps5(8.4);
+    // `process_gp6` walks the consecutive rec_a+rec_b sequence, so the consumed
+    // span is both records. Place the magic so the span ends EXACTLY at the
+    // first 0x8000 boundary: lead = GPS_BLOCK_SIZE - (rec_a + rec_b).
+    let lead = GPS_BLOCK_SIZE - rec_a.len() - rec_b.len();
+    let mut mdat = vec![0u8; lead];
+    mdat.extend_from_slice(&rec_a);
+    mdat.extend_from_slice(&rec_b); // consumed span ends at exactly GPS_BLOCK_SIZE
+    let mut file = vec![0u8; 16];
+    let mdat_offset = file.len() as u64;
+    let mdat_size = mdat.len() as u64;
+    file.extend_from_slice(&mdat);
+    let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
+    scan_media_data(
+      &file,
+      mdat_offset,
+      mdat_size,
+      None,
+      None,
+      false,
+      &mut out,
+      &mut gp,
+    );
+    assert_eq!(
+      gp.gps_samples().len(),
+      2,
+      "a GP6 span ending exactly at the 0x8000 boundary must not be re-scanned"
+    );
+    let lats: Vec<i64> = gp
+      .gps_samples()
+      .iter()
+      .filter_map(|s| s.latitude().map(|v| (v * 10.0).round() as i64))
+      .collect();
+    assert!(
+      lats.contains(&42) && lats.contains(&84),
+      "both records present exactly once: {lats:?}"
     );
   }
 
@@ -3588,6 +3959,7 @@ mod tests {
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&block);
     let mut out = QuickTimeStreamMeta::new();
+    let mut gp = GoProMeta::new();
     // Must not panic; the over-long block is not dispatched.
     scan_media_data(
       &file,
@@ -3597,6 +3969,7 @@ mod tests {
       None,
       false,
       &mut out,
+      &mut gp,
     );
     assert!(out.gps_samples().is_empty());
   }

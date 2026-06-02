@@ -832,6 +832,96 @@ fn quicktime_multimoov_movdur_conformance() {
 }
 
 #[test]
+fn quicktime_multimoov_gpmf_conformance() {
+  // GoPro Codex R7/F1: a SYNTHETIC `.mov` with TWO top-level `moov` atoms where
+  // ONLY the LATER `moov` carries `udta/GPMF` (a GoPro DEVC container holding
+  // DVNM/FMWR/CASN). ExifTool's `for(;;)` atom-list walk (QuickTime.pm:10032)
+  // descends EVERY top-level `moov` (Movie SubDirectory, QuickTime.pm:678-681)
+  // and EVERY `udta` (QuickTime.pm:1214-1217), dispatching EVERY `GPMF` to
+  // `GoPro::ProcessGoPro` (QuickTime.pm:2132-2135) and accumulating tags — so
+  // the GPMF in the second `moov` IS extracted. Verified vs bundled ExifTool
+  // 13.59: `GoPro:DeviceName = "Hero8 Black"`,
+  // `GoPro:FirmwareVersion = "HD8.01.02.51.00"`,
+  // `GoPro:CameraSerialNumber = "C3221324545448"` (plus the moov1 track/movie
+  // tags). The port's static GPMF discovery previously inspected ONLY the FIRST
+  // top-level `moov` (`find_top_level_box(data, "moov")` → first match), so a
+  // first-`moov`-without-GPMF / later-`moov`-with-GPMF file dropped EVERY GoPro
+  // tag; `for_each_moov_gpmf` now visits every `moov`/`udta`/`GPMF` in order.
+  check(
+    "QuickTime_multimoov_gpmf.mov",
+    "QuickTime_multimoov_gpmf.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_multimoov_gpmf.mov",
+    "QuickTime_multimoov_gpmf.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_gopro_gpmf_conformance() {
+  // GoPro Codex R12-A: the FULL default-visible `%GoPro::GPMF` tag set. A
+  // SYNTHETIC `.mov` whose `moov/udta/GPMF` (QuickTime.pm:2132-2135 →
+  // `GoPro::ProcessGoPro`, processed WITHOUT `-ee` since it is a moov atom)
+  // carries a DEVC exercising a broad slice of the ~95 newly-emitted tags
+  // across every conv family:
+  //   - identity (typed): DVNM/FMWR/CASN;
+  //   - hash PrintConv: Protune (Y→On), AutoRotation (U→Up), DigitalZoomOn
+  //     (N→No, %noYes), FieldOfView (W→Wide);
+  //   - regex/suffix PrintConv: MetadataVersion (7.1.2), CameraTemperature
+  //     ("42.5 C"), TimeZone (+01:00), VideoFrameRate (30000/1001),
+  //     VideoFrameSize (1920x1080);
+  //   - plain string/numeric: WhiteBalance/ExposureType/ExposureCompensation,
+  //     ChapterNumber, AccelerometerMatrix, ISOSpeeds, Magnetometer (scaled);
+  //   - ValueConv-folded: CreationDate (ConvertUnixTime);
+  //   - `Binary => 1`: Accelerometer/Gyroscope/CameraOrientation +
+  //     ExposureTimes (`PrintExposureTime` per element) — the placeholder N =
+  //     byte length of the post-`ScaleValues` value string (exiftool:3987).
+  // Goldens are the bundled `perl exiftool 13.59 -j -G1 -struct
+  // -api QuickTimeUTC=1` output (`tools/gen_golden.sh`, `-x System/Composite`),
+  // so the `-j` (PrintConv) and `-n` (ValueConv) renderings are oracle-pinned.
+  check(
+    "QuickTime_gopro_gpmf.mov",
+    "QuickTime_gopro_gpmf.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_gopro_gpmf.mov",
+    "QuickTime_gopro_gpmf.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_gopro_scen_conformance() {
+  // GoPro Codex R13: a complex `?` record (`SCEN` SceneClassification,
+  // GoPro.pm:482) whose preceding `TYPE` is `Ff` — a 4-char FourCC scene code
+  // (`F`, `undef`) followed by a float probability (`f`). ExifTool's
+  // ProcessGoPro (GoPro.pm:848-863) reads EACH column via `ReadValue`: the
+  // `undef` `F` column returns the raw 4 bytes (a printable FourCC like `SNOW`)
+  // and the float renders via `%.15g`, joined per row with a space
+  // (`join ' ', @s`). The synthetic `moov/udta/GPMF` carries six rows
+  // (SNOW/URBA/INDO/WATR/VEGE/BEAC, GoPro.pm:482) with exactly-representable f32
+  // probabilities. The pre-R13 numeric-only decoder DROPPED these rows (the
+  // leading column is non-numeric); the fix keeps the FourCC column. SCEN has
+  // no PrintConv, so the `-j` and `-n` renderings are identical: a JSON ARRAY
+  // (`$val = \@rows`, GoPro.pm:863) of per-row strings. Goldens are the bundled
+  // `perl exiftool 13.59 -j -G1 -api QuickTimeUTC=1` output
+  // (`tools/gen_golden.sh`, `-x System/Composite`).
+  check(
+    "QuickTime_gopro_scen.mov",
+    "QuickTime_gopro_scen.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_gopro_scen.mov",
+    "QuickTime_gopro_scen.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn quicktime_trunc_ftyp_conformance() {
   // PR #38 Codex R6/F2: a 12-byte file whose first atom is `ftyp` with a
   // DECLARED size of 100 — the header is intact but the brand payload

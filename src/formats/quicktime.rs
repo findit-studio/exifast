@@ -56,7 +56,9 @@ use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
   formats::{quicktime_freegps, quicktime_stream},
-  metadata::{MediaTrack, QuickTimeMeta, QuickTimeStreamMeta},
+  metadata::{
+    GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta,
+  },
   value::{binary_placeholder, format_g},
 };
 
@@ -1475,6 +1477,11 @@ pub struct Meta<'a> {
   /// (`Image::ExifTool::QuickTime::Stream`, QuickTimeStream.pl). Empty for a
   /// video with no timed metadata (the common case).
   stream: QuickTimeStreamMeta,
+  /// **SP4** — the decoded GoPro GPMF metadata. Reached either through the
+  /// `gpmd` timed-metadata sample dispatch or the brute-force `GP\x06\0\0`
+  /// scan in `mdat` (see [`crate::formats::gopro`]). Empty
+  /// ([`GoProMeta::is_empty`]) for a non-GoPro video.
+  gopro: GoProMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -1539,6 +1546,16 @@ impl Meta<'_> {
     &self.stream
   }
 
+  /// **SP4** — the decoded GoPro GPMF metadata. [`GoProMeta::is_empty`] for
+  /// a non-GoPro video (or one whose GoPro records were not located by
+  /// either the timed-metadata `gpmd` dispatch or the brute-force
+  /// `GP\x06\0\0` `mdat` scan).
+  #[must_use]
+  #[inline(always)]
+  pub const fn gopro(&self) -> &GoProMeta {
+    &self.gopro
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -1550,16 +1567,26 @@ impl Meta<'_> {
   /// Build the normalized [`crate::metadata::MediaMetadata`] projection from
   /// this faithful-parse layer. SP1 populates the `MediaInfo` basics
   /// (duration / dimensions / created / track kinds); **SP3** fills
-  /// [`crate::metadata::GpsLocation`] from the FIRST embedded
-  /// timed-metadata GPS fix. Camera / lens / capture stay `None` for SP2+
-  /// and the embedded-Exif hop to fill.
+  /// [`crate::metadata::GpsLocation`] from the FIRST embedded timed-metadata
+  /// GPS fix; **SP4** fills [`crate::metadata::CameraInfo`] AND
+  /// [`crate::metadata::GpsLocation`] from the decoded GoPro GPMF (model,
+  /// serial, firmware, GPS samples). Lens / capture stay `None` for SP2+ and
+  /// the embedded-Exif hop to fill.
   #[must_use]
   #[inline(always)]
   pub fn media_metadata(&self) -> crate::metadata::MediaMetadata {
     let mut md = crate::metadata::MediaMetadata::from_quicktime(&self.qt);
-    // SP3: project the first GPS fix from the embedded timed metadata into
-    // the normalized GpsLocation domain.
-    if let Some(fix) = self.stream.first_fix() {
+    // The per-port projection seam: each `XxxMeta` writes its own Camera /
+    // Lens / GPS / Capture contribution into `md`. Order ENCODES the
+    // cross-format priority chain (highest-priority FIRST — each port no-ops
+    // if a higher-priority source already populated the domain it would
+    // write). GoPro on-device GNSS is the HIGHEST GPS tier.
+    self.gopro.project_into(&mut md);
+    // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
+    // populates when no higher-priority source set `md.gps()`.
+    if md.gps().is_none()
+      && let Some(fix) = self.stream.first_fix()
+    {
       let mut gps = crate::metadata::GpsLocation::new();
       gps
         .update_latitude(fix.latitude())
@@ -1923,13 +1950,44 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // the Type-17b scaling. Threaded as a `&str` borrow (mvhd/frea are already
   // decoded into `qt` at this point).
   let kodak_version = qt.kodak_frea().version();
+  // **SP4** — the GoPro `gpmd` MetaFormat dispatch in [`quicktime_stream`]
+  // fills `gopro_meta` for each GoPro-style timed-metadata sample. The
+  // same meta is then ALSO populated by the `moov/udta/GPMF` atom walk and
+  // by the brute-force `GP\x06\0\0` scan (some GoPro firmware writes
+  // unreferenced GPMF records in `mdat` outside of a metadata track).
+  let mut gopro_meta = GoProMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
-  // set ONLY when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
-  // `ProcessFreeGPS`, NOT by the generic per-sample `FoundSomething` output
-  // (gps0/gsen/`GPS `/3gf/mebx — QuickTimeStream.pl:967-973). It is the sole gate
-  // for the `mdat` scan below.
+  // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
+  // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
+  // (GoPro.pm:822) — a `gpmd` GoPro timed-metadata sample OR a `moov/udta/GPMF`
+  // atom. It is NOT set by the generic per-sample `FoundSomething` output
+  // (gps0/gsen/`GPS `/3gf/mebx — QuickTimeStream.pl:967-973). It is the sole
+  // gate for the `mdat` scan below.
+  //
+  // **SP4 (R9).** BOTH GoPro sources — the `gpmd` timed-metadata samples AND
+  // the `moov/udta/GPMF` atoms (QuickTime.pm:2132-2135) — are now processed by
+  // [`quicktime_stream::extract_stream`] inside ONE ordered moov-child walk
+  // ([`quicktime_stream::walk_moov`]), each at its atom position, populating
+  // this single `gopro_meta`. ExifTool's `for(;;)` walk (QuickTime.pm:10032)
+  // reaches a `udta/GPMF` when it descends that `udta` child
+  // (`ProcessDirectory`, QuickTime.pm:10359) and a `trak`'s `gpmd` samples when
+  // that `trak`'s `stbl` box exits (QuickTime.pm:10369-10371) — so they
+  // interleave by atom layout, and the flat `gopro_meta` accumulates in walk
+  // order instead of the prior fixed "all `gpmd` then all `udta/GPMF`" post-
+  // pass. NOTE (oracle-verified, ExifTool 13.59): when a `moov` carries BOTH
+  // sources ExifTool keeps them in DIFFERENT groups (`Track<N>:` for `gpmd`
+  // vs `GoPro:` for `udta/GPMF`), so there is no single cross-source last-wins
+  // to match — the flat `GoProMeta` collapses both, a divergence this ordered
+  // walk does not by itself resolve (see `walk_moov` doc). The walk completes
+  // BEFORE the `mdat` scan, and a visited `udta/GPMF` (like a
+  // `gpmd` sample) folds into `found_embedded`, so the `mdat` scan is still
+  // suppressed by the mere PRESENCE of any dispatched GoPro source
+  // (`return if $$et{FoundEmbedded}`, QuickTimeStream.pl:3689). A direct
+  // `moov/GPMF` child stays IGNORED (GPMF is reached only via `udta` — R8);
+  // the R7 multi-moov order is preserved (the walk runs per top-level `moov`
+  // in file order).
   let (mut stream, found_embedded) =
-    quicktime_stream::extract_stream(data, create_date_raw, kodak_version);
+    quicktime_stream::extract_stream(data, create_date_raw, kodak_version, &mut gopro_meta);
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -1940,12 +1998,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // timed-metadata stream but NO decoded freeGPS still gets `mdat` scanned, so a
   // `freeGPS ` block buried in padding alongside such a stream is recovered
   // (action-cams, dashcams, drones) — see `quicktime_freegps`.
+  //
+  // **SP4** — the brute-force scanner ALSO reports GoPro `GP\x06\0\0`
+  // records (QuickTimeStream.pl:3717-3748); each one re-dispatches into
+  // `Image::ExifTool::GoPro::ProcessGP6` which parses the contained GPMF
+  // KLV. exifast routes both through this single call: `scan_media_data`
+  // now appends to the freeGPS-style stream samples AND fills `gopro`.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = found_embedded;
-    // The Kodak `frea`-atom `KodakVersion` (set in Pass 1, BEFORE this scan)
-    // is the cross-module global the Type-17b decoder reads to recognize a
-    // Rexing V1-4k dashcam (QuickTimeStream.pl:2323-2327).
-    let kodak_version = qt.kodak_frea().version();
     quicktime_freegps::scan_media_data(
       data,
       off,
@@ -1954,6 +2014,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       kodak_version,
       already,
       &mut stream,
+      &mut gopro_meta,
     );
   }
 
@@ -1968,6 +2029,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   Some(Meta {
     qt,
     stream,
+    gopro: gopro_meta,
     embedded_exif_deferred,
     file_type,
     mime,
@@ -2169,9 +2231,10 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
 
 #[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
-  /// Yield `QuickTime:*` / `Track<N>:*` tags in ExifTool's atom-walk order
-  /// (mvhd fields, then per-track fields) — the golden-pattern parallel to the
-  /// retired inherent `serialize_tags`: the SINK changes (an
+  /// Yield `QuickTime:*` / `Track<N>:*` (+ SP4 `GoPro:*`) tags in ExifTool's
+  /// atom-walk order (mvhd fields, then per-track fields, then the embedded
+  /// SP3 stream + SP4 GoPro GPMF) — the golden-pattern parallel to the retired
+  /// inherent `serialize_tags`: the SINK changes (an
   /// [`EmittedTag`](crate::emit::EmittedTag) per value instead of `out.write_*`),
   /// but the per-tag PrintConv/ValueConv branches, the emission ORDER, the
   /// per-track iteration, the first-wins `Track<N>` dedup, and the
@@ -2181,10 +2244,15 @@ impl crate::emit::Taggable for Meta<'_> {
   /// (`-n`) ⇒ post-ValueConv raw scalars.
   ///
   /// Group: family0 = `"QuickTime"` (the `%QuickTime::Main` table group,
-  /// QuickTime.pm:1424) for every emitted tag; family1 is `"QuickTime"` for the
-  /// main/ftyp/mvhd/mdat atoms and the per-`moov` `Track<N>` string for the
+  /// QuickTime.pm:1424) for every emitted SP1 tag; family1 is `"QuickTime"` for
+  /// the main/ftyp/mvhd/mdat atoms and the per-`moov` `Track<N>` string for the
   /// track atoms (QuickTime.pm:1427 `1 => 'Track#'`). Every QuickTime SP1 tag
-  /// is a known table key (no `Unknown => 1`) ⇒ `unknown: false`.
+  /// is a known table key (no `Unknown => 1`) ⇒ `unknown: false`. The SP4 GoPro
+  /// GPMF tags carry their own family-0/family-1 `GoPro` group (the
+  /// `%GoPro::GPMF` / `GPS5` / `GPS9` tables, GoPro.pm:67-69/489-490/518-519),
+  /// summarizing the FIRST GPS fix + the block-level identity/GPS scalars (the
+  /// per-sample `Doc<N>` list is on [`Meta::gopro`]); like the PLIST subdir
+  /// tags above, these ride QuickTime's `tags()` under a foreign group.
   ///
   /// The `ProcessMOV` warning (`Meta::warning`) is NOT part of this stream —
   /// `run_emission` has no warning channel; the `AnyMeta::QuickTime` arm drains
@@ -2765,11 +2833,679 @@ impl crate::emit::Taggable for Meta<'_> {
       ));
     }
 
+    // ── SP4: GoPro GPMF (Image::ExifTool::GoPro) ───────────────────────
+    // The `%GoPro::GPMF` / `%GoPro::GPS5` / `%GoPro::GPS9` tables emit under
+    // family-0 `GoPro` (the module group) and family-1 `GoPro`
+    // (GoPro.pm:67-69, 489-490/518-519 `GROUPS => { 1 => 'GoPro' }`). Like the
+    // SP3 stream above, ExifTool emits one `Doc<N>` sub-document per GPS row;
+    // exifast's flat TagMap cannot reproduce that shape, so the FIRST GPS fix
+    // is summarized here (the typed [`Meta::gopro`] accessor exposes the full
+    // per-sample list). The block-level camera-identity + GPSU/GPSF/GPSP/GPSA
+    // scalars are one-per-file. Emitted under `GoPro`:`GoPro`.
+    {
+      let gp = &self.gopro;
+      // family0 = family1 = "GoPro" for every GoPro GPMF tag.
+      let gpg = || Group::new("GoPro", "GoPro");
+      // ── camera identity (block-level, `c` ASCII; no conv) ──────────────
+      // DVNM/MINF/CASN/FMWR (GoPro.pm:57/286-290/121/195). Plain ASCII strings
+      // with no ValueConv/PrintConv — emit verbatim in both modes.
+      for (val, name) in [
+        (gp.device_name(), "DeviceName"),
+        (gp.model(), "Model"),
+        (gp.camera_serial_number(), "CameraSerialNumber"),
+        (gp.firmware_version(), "FirmwareVersion"),
+      ] {
+        if let Some(s) = val {
+          tags.push(EmittedTag::new(
+            gpg(),
+            name.into(),
+            TagValue::Str(s.into()),
+            false,
+          ));
+        }
+      }
+      // MUID `MediaUniqueID` (GoPro.pm:456-462): the typed layer stores the
+      // RAW space-joined `u32` list (ExifTool's ValueConv). `-n` emits that
+      // raw value; `-j` (PrintConv) hex-renders each element and concatenates.
+      if let Some(raw) = gp.media_uid() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "MediaUniqueID".into(),
+          media_uid_value(raw, print_conv),
+          false,
+        ));
+      }
+      // ── block-level GPS scalars ────────────────────────────────────────
+      // GPSU `GPSDateTime` (GoPro.pm:242-248): the typed layer stores the
+      // post-ValueConv `20YY:MM:DD HH:MM:SS[.fff]` (NO timezone suffix — the
+      // `ConvertDateTime` PrintConv adds none by default); it is a no-op
+      // cosmetic on that shape (emit in both modes).
+      if let Some(dt) = gp.gps_date_time() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "GPSDateTime".into(),
+          TagValue::Str(dt.into()),
+          false,
+        ));
+      }
+      // GPSF `GPSMeasureMode` (GoPro.pm:230-236): PrintConv 2/3 →
+      // "<n>-Dimensional Measurement"; `-n` emits the raw code.
+      if let Some(mode) = gp.gps_measure_mode() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "GPSMeasureMode".into(),
+          gps_measure_mode_value(mode, print_conv),
+          false,
+        ));
+      }
+      // GPSP `GPSHPositioningError` (GoPro.pm:237-241): ValueConv `$val / 100`
+      // (cm→m) already applied in the typed layer; no PrintConv. F64 metres.
+      if let Some(err_m) = gp.gps_h_positioning_error_m() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "GPSHPositioningError".into(),
+          TagValue::F64(err_m),
+          false,
+        ));
+      }
+      // GPSA `GPSAltitudeSystem` (GoPro.pm:472): 4-char ID, no conv.
+      if let Some(sys) = gp.gps_altitude_system() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "GPSAltitudeSystem".into(),
+          TagValue::Str(sys.into()),
+          false,
+        ));
+      }
+      // SYST `SystemTime` (GoPro.pm:390-405): a DEFAULT tag (no
+      // `Unknown`/`Hidden`), emitted by `exiftool -ee`. The typed layer stores
+      // the post-`SCAL` space-joined display string of the FIRST `SYST` record
+      // (the calibration side-effect lives on the `SystemTimeList`). No
+      // ValueConv/PrintConv beyond the `RawConv` pass-through ⇒ emit verbatim in
+      // both modes.
+      if let Some(st) = gp.system_time() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          "SystemTime".into(),
+          TagValue::Str(st.into()),
+          false,
+        ));
+      }
+      // ── first GPS5/GPS9 fix (summarized; full list via `Meta::gopro`) ──
+      if let Some(fix) = gp.first_fix() {
+        // GPSLatitude/GPSLongitude: the `GPS::ToDMS` PrintConv
+        // (GoPro.pm:493-499) is a GPS-port dependency (same deferral as the
+        // SP3 stream above); emit post-ValueConv decimal degrees in BOTH
+        // modes.
+        if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSLatitude".into(),
+            TagValue::F64(lat),
+            false,
+          ));
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSLongitude".into(),
+            TagValue::F64(lon),
+            false,
+          ));
+        }
+        // GPSAltitude (GoPro.pm:500-503): typed layer stores metres; the
+        // `"$val m"` PrintConv is deferred (consistent with the SP3 stream's
+        // raw-F64 altitude). Emit F64 metres in both modes.
+        if let Some(alt) = fix.altitude_m() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSAltitude".into(),
+            TagValue::F64(alt),
+            false,
+          ));
+        }
+        // GPSSpeed / GPSSpeed3D (GoPro.pm:504-513): ValueConv `$val * 3.6`
+        // converts the stored m/s to KM/H — applied HERE on emission (the
+        // typed [`GoProGpsSample`] keeps m/s). No PrintConv ⇒ faithful in both
+        // `-j`/`-n`.
+        if let Some(spd) = fix.speed_2d_mps() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSSpeed".into(),
+            TagValue::F64(spd * 3.6),
+            false,
+          ));
+        }
+        if let Some(s3d) = fix.speed_3d_mps() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSSpeed3D".into(),
+            TagValue::F64(s3d * 3.6),
+            false,
+          ));
+        }
+        // GPS9-only per-sample columns (GoPro.pm:543-562). `GPSDateTime` here
+        // is the per-sample value (derived from the GPS-days/seconds columns);
+        // it overrides the block-level GPSU above under the sink's last-wins
+        // when a GPS9 file also carried a GPSU (a GPS9 file normally does not).
+        if let Some(dt) = fix.date_time() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSDateTime".into(),
+            TagValue::Str(dt.into()),
+            false,
+          ));
+        }
+        if let Some(dop) = fix.dop() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSDOP".into(),
+            TagValue::F64(dop),
+            false,
+          ));
+        }
+        if let Some(mode) = fix.measure_mode() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSMeasureMode".into(),
+            gps_measure_mode_value(mode, print_conv),
+            false,
+          ));
+        }
+      }
+      // ── Karma GLPI (`GPSPos`, GoPro.pm:197-204/598-626) ────────────────
+      // Like the GPS5/GPS9 fix above, ExifTool emits one `Doc<N>` per GLPI
+      // row; the FIRST sample is summarized here (the full per-sample list is
+      // on [`Meta::gopro`]'s `glpi_samples()`). Column order = table order
+      // (GoPro.pm:602-625): GPSDateTime, GPSLatitude, GPSLongitude,
+      // GPSAltitude, GPSSpeedX/Y/Z, GPSTrack. The `Unknown`/`Hidden` col 4 is
+      // not emitted. Lat/lon defer the `GPS::ToDMS` PrintConv (raw decimal
+      // degrees, like GPS5/GPS9); altitude defers its `"$val m"` PrintConv (raw
+      // F64). The speeds (cols 5-7) DO apply their `'"$val m/s"'` PrintConv in
+      // `-j` mode (R6-C) — GLPI speeds carry NO `*3.6` km/h `ValueConv` (the
+      // table has only the suffix PrintConv), so they stay m/s; `-n` emits the
+      // raw F64. `GPSTrack` (col 8) has no PrintConv (raw both modes).
+      // `GPSDateTime` is the `ConvertSystemTime` string emitted verbatim (incl.
+      // the `<uncalibrated>` / `0000:00:00 00:00:00` literals).
+      if let Some(g) = gp.first_glpi_fix() {
+        if let Some(dt) = g.date_time() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSDateTime".into(),
+            TagValue::Str(dt.into()),
+            false,
+          ));
+        }
+        if let (Some(lat), Some(lon)) = (g.latitude(), g.longitude()) {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSLatitude".into(),
+            TagValue::F64(lat),
+            false,
+          ));
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSLongitude".into(),
+            TagValue::F64(lon),
+            false,
+          ));
+        }
+        if let Some(alt) = g.altitude_m() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSAltitude".into(),
+            TagValue::F64(alt),
+            false,
+          ));
+        }
+        // GPSSpeedX/Y/Z (GoPro.pm:622-624): PrintConv `'"$val m/s"'`. `-j`
+        // renders the scaled m/s value with the ` m/s` suffix
+        // ([`unit_suffix_value`]); `-n` (ValueConv) emits the raw F64.
+        for (val, name) in [
+          (g.speed_x_mps(), "GPSSpeedX"),
+          (g.speed_y_mps(), "GPSSpeedY"),
+          (g.speed_z_mps(), "GPSSpeedZ"),
+        ] {
+          if let Some(v) = val {
+            tags.push(EmittedTag::new(
+              gpg(),
+              name.into(),
+              unit_suffix_value(v, " m/s", print_conv),
+              false,
+            ));
+          }
+        }
+        if let Some(tr) = g.track_deg() {
+          tags.push(EmittedTag::new(
+            gpg(),
+            "GPSTrack".into(),
+            TagValue::F64(tr),
+            false,
+          ));
+        }
+      }
+      // ── Karma KBAT (`BatteryStatus`, GoPro.pm:264-270/628-649) ─────────
+      // The FIRST battery record is summarized (full list on
+      // [`Meta::gopro`]'s `kbat_records()`). Column order = table order
+      // (GoPro.pm:634-648): BatteryCurrent, BatteryCapacity,
+      // BatteryTemperature, BatteryVoltage1..4, BatteryTime, BatteryLevel.
+      // The `Unknown`/`Hidden` cols (2/9/10-13) are not emitted. Each named
+      // column carries a unit-suffix PrintConv (GoPro.pm:634-648) applied in
+      // `-j` (PrintConv) mode via [`unit_suffix_value`]; `-n` (ValueConv) emits
+      // the raw scaled F64. `BatteryTime` (col 8) instead uses
+      // `ConvertDuration(int($val + 0.5))` — emitted in column order, before
+      // `BatteryLevel`.
+      if let Some(k) = gp.kbat_records().first() {
+        // (value, name, PrintConv): `Suffix` = `'"$val <unit>"'`; `Duration` =
+        // `ConvertDuration(int($val + 0.5))`.
+        enum KbatConv {
+          Suffix(&'static str),
+          Duration,
+        }
+        for (val, name, conv) in [
+          (k.current_a(), "BatteryCurrent", KbatConv::Suffix(" A")),
+          (k.capacity_ah(), "BatteryCapacity", KbatConv::Suffix(" Ah")),
+          (
+            k.temperature_c(),
+            "BatteryTemperature",
+            KbatConv::Suffix(" C"),
+          ),
+          (k.voltage1_v(), "BatteryVoltage1", KbatConv::Suffix(" V")),
+          (k.voltage2_v(), "BatteryVoltage2", KbatConv::Suffix(" V")),
+          (k.voltage3_v(), "BatteryVoltage3", KbatConv::Suffix(" V")),
+          (k.voltage4_v(), "BatteryVoltage4", KbatConv::Suffix(" V")),
+          (k.time_s(), "BatteryTime", KbatConv::Duration),
+          (k.level_pct(), "BatteryLevel", KbatConv::Suffix(" %")),
+        ] {
+          if let Some(v) = val {
+            let value = match conv {
+              KbatConv::Suffix(unit) => unit_suffix_value(v, unit, print_conv),
+              // `int($val + 0.5)` rounds the scaled seconds to the nearest
+              // second (Perl `int()` truncates toward zero; battery time is a
+              // non-negative duration) before `ConvertDuration` ([`convert_duration`]);
+              // `-n` emits the raw scaled F64 seconds.
+              KbatConv::Duration if print_conv => {
+                TagValue::Str(convert_duration((v + 0.5).trunc()).into())
+              }
+              KbatConv::Duration => TagValue::F64(v),
+            };
+            tags.push(EmittedTag::new(gpg(), name.into(), value, false));
+          }
+        }
+      }
+      // ── every OTHER default-visible %GoPro::GPMF tag (table-driven) ────
+      // ExifTool's `ProcessGoPro` `HandleTag`s every default-visible tag
+      // (GoPro.pm:885); the typed surface above models the GPS/Karma/camera-id
+      // subset, and [`GoProMeta::generic_tags`] carries the remaining ~95
+      // (sensor streams + Protune/codec settings + calibrations) decoded in
+      // walk order. Each is rendered to its `-n`/`-j` value here by conv family
+      // ([`gopro_generic_value`]) under the same `GoPro`:`GoPro` group. A
+      // `Binary => 1` tag renders as the `(Binary data N bytes…)` placeholder
+      // in BOTH modes (GoPro.pm `Binary` → ValueConv `'\$val'`), N = byte length
+      // of the post-`ScaleValues` value string (exiftool:3987).
+      for gt in gp.generic_tags() {
+        tags.push(EmittedTag::new(
+          gpg(),
+          gt.name().into(),
+          gopro_generic_value(gt, print_conv),
+          false,
+        ));
+      }
+    }
+
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
     // `Taggable` stream (`run_emission` has no warning channel). It flows
     // through the sibling `Diagnose` channel ([`Meta::diagnostics`]) alongside
     // the `ProcessMOV` warning.
     tags.into_iter()
+  }
+}
+
+/// Build a GoPro unit-suffix tag value — the `'"$val <unit>"'` PrintConv shared
+/// by the Karma GLPI speeds (`" m/s"`, GoPro.pm:622-624) and the KBAT
+/// current/capacity/temperature/voltage/level columns (GoPro.pm:634-648). `-j`
+/// (PrintConv) stringifies the scaled F64 with Perl's default `%.15g` NV
+/// stringification ([`format_g`]) and appends `unit` (which carries its own
+/// leading space, e.g. `" m/s"`, matching the literal Perl interpolation);
+/// `-n` (ValueConv) emits the raw [`TagValue::F64`].
+#[cfg(feature = "alloc")]
+fn unit_suffix_value(val: f64, unit: &str, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    let mut s = format_g(val, 15);
+    s.push_str(unit);
+    TagValue::Str(s.into())
+  } else {
+    TagValue::F64(val)
+  }
+}
+
+/// Build a GoPro `GPSMeasureMode` tag value: the `%GoPro::GPMF` `GPSF` /
+/// `%GoPro::GPS9` col-8 PrintConv (`2 => '2-Dimensional Measurement'`,
+/// `3 => '3-Dimensional Measurement'`, GoPro.pm:230-236 / 560-562). `-j`
+/// (PrintConv) yields the description (an out-of-table code falls through to
+/// the bare number via `ExifTool.pm:3622` `Unknown ($val)` — but GoPro only
+/// ever writes 2/3, so the unknown arm renders the raw code as a string);
+/// `-n` (ValueConv) yields the raw [`TagValue::U64`].
+#[cfg(feature = "alloc")]
+fn gps_measure_mode_value(mode: u32, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    match mode {
+      2 => TagValue::Str("2-Dimensional Measurement".into()),
+      3 => TagValue::Str("3-Dimensional Measurement".into()),
+      other => TagValue::Str(std::format!("Unknown ({other})").into()),
+    }
+  } else {
+    TagValue::U64(u64::from(mode))
+  }
+}
+
+/// Build a GoPro `MediaUniqueID` tag value (`%GoPro::GPMF` `MUID`,
+/// GoPro.pm:456-462). The stored `raw` is ExifTool's ValueConv — the
+/// space-joined `u32` list. `-j` (PrintConv) hex-renders each element with
+/// `%.8x` and concatenates (`my @a = split ' ', $val; $_ = sprintf('%.8x',$_)
+/// foreach @a; join('', @a)`); `-n` (ValueConv) emits the raw space-joined
+/// value verbatim.
+#[cfg(feature = "alloc")]
+fn media_uid_value(raw: &str, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    // Hex-concatenate the parsed u32s. A non-numeric element falls back to a
+    // bare `0` slot only if `parse` fails — but the parser always emits
+    // decimal u32s, so every element parses. Faithful `sprintf('%.8x',$_)`.
+    let mut hex = std::string::String::new();
+    for tok in raw.split(' ') {
+      if tok.is_empty() {
+        continue;
+      }
+      let v: u32 = tok.parse().unwrap_or(0);
+      hex.push_str(&std::format!("{v:08x}"));
+    }
+    TagValue::Str(hex.into())
+  } else {
+    TagValue::Str(raw.into())
+  }
+}
+
+/// Render a table-driven generic `%GoPro::GPMF` tag ([`GoProTag`]) to its
+/// `-n`/`-j` [`TagValue`]. The decode already produced the post-`ScaleValues` /
+/// post-`ValueConv` value ([`GoProTagValue`]); this applies the per-tag
+/// `PrintConv` (the `conv` family) for `-j` and leaves the value verbatim for
+/// `-n` (except `Binary`/`AddUnits`, which transform the value identically in
+/// both modes / only in `-j` respectively).
+///
+/// Faithful to GoPro.pm:
+///  - `Binary` → `(Binary data N bytes, use -b option to extract)` in BOTH
+///    modes (`Binary => 1` ⇒ ValueConv `'\$val'` scalar ref), `N = length` of
+///    the would-be value string (exiftool:3987 `length($$obj)`).
+///  - the `%noYes` / `AutoRotation` / `Protune` / `FieldOfView` / `MeasureMode`
+///    hashes map the raw token in `-j` (a miss → `Unknown (val)`, ExifTool.pm
+///    :3622), the raw token in `-n`.
+///  - `Version` (`tr/ /./`), `FrameRate` (first space → `/`),
+///    `FrameSize` (first space → `x`), `TempC` (`"$val C"`),
+///    `TimeZone` (`TimeZoneString`), `ExposureTimes` (`PrintExposureTime` per
+///    element), `MediaUid` (`%.8x` hex join), `AddUnits` (interleave units) —
+///    each is a `-j`-only transform of the verbatim `-n` value.
+#[cfg(feature = "alloc")]
+fn gopro_generic_value(tag: &GoProTag, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  let value = tag.value();
+  // `Binary => 1`: the placeholder in BOTH modes, length = the value string.
+  if matches!(tag.conv(), GoProConv::Binary) {
+    // The scalar-ref `\$val` renders `length($$obj)` (exiftool:3987). A complex
+    // `?` MULTI-ROW Binary tag (CSEN/CYTS) has `$val = \@rows`, so ExifTool
+    // emits a JSON ARRAY with ONE placeholder per row, each N = that row's value
+    // string length (oracle-verified). A single row / flat list is ONE
+    // placeholder over the whole value string.
+    if let GoProTagValue::Rows(rows) = value
+      && rows.len() > 1
+    {
+      return TagValue::List(
+        rows
+          .iter()
+          .map(|r| TagValue::Str(binary_placeholder(r.len() as u64)))
+          .collect(),
+      );
+    }
+    let n = gopro_value_string(value).len() as u64;
+    return TagValue::Str(binary_placeholder(n));
+  }
+  // `-n` (ValueConv): the verbatim decoded value (the AddUnits/PrintConv
+  // transforms are `-j`-only; the value-affecting ValueConvs were folded at
+  // decode). For a complex `?` multi-row value this is the JSON array.
+  if !print_conv {
+    return gopro_value_tagvalue(value);
+  }
+  // `-j` (PrintConv) by conv family.
+  match tag.conv() {
+    // Hash PrintConvs operate on the raw scalar token (the value string).
+    GoProConv::NoYes => gopro_hash_pc(value, |t| match t {
+      "N" => Some("No"),
+      "Y" => Some("Yes"),
+      _ => None,
+    }),
+    GoProConv::AutoRotation => gopro_hash_pc(value, |t| match t {
+      "U" => Some("Up"),
+      "D" => Some("Down"),
+      "A" => Some("Auto"),
+      _ => None,
+    }),
+    GoProConv::Protune => gopro_hash_pc(value, |t| match t {
+      "N" => Some("Off"),
+      "Y" => Some("On"),
+      _ => None,
+    }),
+    GoProConv::FieldOfView => gopro_hash_pc(value, |t| match t {
+      "W" => Some("Wide"),
+      "S" => Some("Super View"),
+      "L" => Some("Linear"),
+      _ => None,
+    }),
+    // Regex / suffix string PrintConvs operate on the value string.
+    GoProConv::Version => {
+      // `$val =~ tr/ /./` — replace ALL spaces with dots.
+      TagValue::Str(gopro_value_string(value).replace(' ', ".").into())
+    }
+    GoProConv::FrameRate => {
+      // `$val =~ s( )(/)` — replace the FIRST space with `/`.
+      TagValue::Str(replace_first(&gopro_value_string(value), ' ', '/').into())
+    }
+    GoProConv::FrameSize => {
+      // `$val =~ s/ /x/` — replace the FIRST space with `x`.
+      TagValue::Str(replace_first(&gopro_value_string(value), ' ', 'x').into())
+    }
+    GoProConv::TempC => {
+      // `"$val C"` — append a space + `C`.
+      let mut s = gopro_value_string(value);
+      s.push_str(" C");
+      TagValue::Str(s.into())
+    }
+    GoProConv::TimeZone => {
+      // `TimeZoneString($val)` — minutes → `±HH:MM`.
+      match value {
+        GoProTagValue::Num(v) => TagValue::Str(time_zone_string(*v).into()),
+        // A non-numeric TZON never occurs (fmt `s`); fall back to the value.
+        _ => gopro_value_tagvalue(value),
+      }
+    }
+    GoProConv::ExposureTimes => {
+      // `PrintExposureTime` per space-separated element (GoPro.pm:356-360).
+      let mapped: Vec<String> = gopro_value_string(value)
+        .split(' ')
+        .filter(|t| !t.is_empty())
+        .map(print_exposure_time)
+        .collect();
+      TagValue::Str(mapped.join(" ").into())
+    }
+    GoProConv::AddUnits => gopro_add_units(value, tag.units()),
+    // `Plain` (and the value-folded ValueConv tags) — verbatim.
+    GoProConv::Plain | GoProConv::Binary => gopro_value_tagvalue(value),
+  }
+}
+
+/// The `-n` (verbatim) [`TagValue`] for a [`GoProTagValue`]: a string stays a
+/// string; a single number is an `F64`; a flat numeric list is the
+/// space-joined string ([`crate::formats::gopro`] already produced the scaled
+/// values); a complex `?` record is a scalar string for one row or a
+/// [`TagValue::List`] of per-row strings for several (`$val = @v>1 ? \@v :
+/// $v[0]`, GoPro.pm:863 → the JSON array).
+#[cfg(feature = "alloc")]
+fn gopro_value_tagvalue(value: &GoProTagValue) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  match value {
+    GoProTagValue::Str(s) => TagValue::Str(s.clone()),
+    GoProTagValue::Num(v) => TagValue::F64(*v),
+    GoProTagValue::NumList(vs) => TagValue::Str(join_g_q(vs).into()),
+    GoProTagValue::Rows(rows) => match rows.as_slice() {
+      [one] => TagValue::Str(one.clone()),
+      _ => TagValue::List(rows.iter().map(|r| TagValue::Str(r.clone())).collect()),
+    },
+  }
+}
+
+/// The flat value STRING of a [`GoProTagValue`] — used to compute the `Binary`
+/// placeholder length and as the input to the regex/suffix PrintConvs. A
+/// multi-row complex value joins its rows with a space (the Binary sensor tags
+/// are never multi-row complex, so this only affects the length of an
+/// edge-case; ExifTool's scalar-ref length is over the single-row string).
+#[cfg(feature = "alloc")]
+fn gopro_value_string(value: &GoProTagValue) -> String {
+  match value {
+    GoProTagValue::Str(s) => s.as_str().to_string(),
+    GoProTagValue::Num(v) => format_g(*v, 15),
+    GoProTagValue::NumList(vs) => join_g_q(vs),
+    GoProTagValue::Rows(rows) => rows.join(" "),
+  }
+}
+
+/// Join scaled `f64`s with single spaces via Perl `%.15g` ([`format_g`]) — the
+/// emission-side mirror of `crate::formats::gopro`'s `join_g` (kept local to the
+/// emission layer, which owns the value→string rendering).
+#[cfg(feature = "alloc")]
+fn join_g_q(vals: &[f64]) -> String {
+  let mut s = String::new();
+  for (i, &v) in vals.iter().enumerate() {
+    if i > 0 {
+      s.push(' ');
+    }
+    s.push_str(&format_g(v, 15));
+  }
+  s
+}
+
+/// Apply a hash `PrintConv` to a generic tag's scalar token: `-j` maps the raw
+/// value string through `lookup`; a miss renders `Unknown ($val)`
+/// (ExifTool.pm:3622). The token is the whole value string (these PrintConv-hash
+/// tags are always single-value `c`/numeric records).
+#[cfg(feature = "alloc")]
+fn gopro_hash_pc(
+  value: &GoProTagValue,
+  lookup: impl Fn(&str) -> Option<&'static str>,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  let token = gopro_value_string(value);
+  match lookup(&token) {
+    Some(desc) => TagValue::Str(desc.into()),
+    None => TagValue::Str(std::format!("Unknown ({token})").into()),
+  }
+}
+
+/// `%addUnits` PrintConv (GoPro.pm:727-743). ExifTool's `AddUnits` runs once
+/// per element of `$val`: a SCALAR `$val` (single row) yields one string; an
+/// ARRAYREF `$val` (a complex `?` MULTI-row record, `$val = \@rows`) yields a
+/// JSON ARRAY with `AddUnits` applied to EACH row (oracle-verified). Each row
+/// interleaves its space-separated values with the matching unit, but ONLY when
+/// the unit count equals that row's value count (`if (@$u == @a)`); empty units
+/// are not appended (`if $$u[$i]`).
+#[cfg(feature = "alloc")]
+fn gopro_add_units(value: &GoProTagValue, units: &[smol_str::SmolStr]) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  match value {
+    // Multi-row complex `?`: one AddUnits string per row → a JSON array.
+    GoProTagValue::Rows(rows) if rows.len() > 1 => TagValue::List(
+      rows
+        .iter()
+        .map(|r| TagValue::Str(add_units_to_row(r, units).into()))
+        .collect(),
+    ),
+    // Single row / flat list / scalar: one AddUnits string.
+    _ => TagValue::Str(add_units_to_row(&gopro_value_string(value), units).into()),
+  }
+}
+
+/// Apply `%addUnits` to ONE row string (GoPro.pm:733-739): interleave each
+/// space-separated value with the matching unit when the counts agree;
+/// otherwise return the row unchanged.
+#[cfg(feature = "alloc")]
+fn add_units_to_row(row: &str, units: &[smol_str::SmolStr]) -> String {
+  let vals: Vec<&str> = row.split(' ').filter(|t| !t.is_empty()).collect();
+  if units.is_empty() || units.len() != vals.len() {
+    // `@$u != @a` (or no units) — the PrintConv returns the row unchanged.
+    return row.to_string();
+  }
+  let mut out = String::new();
+  for (i, v) in vals.iter().enumerate() {
+    if i > 0 {
+      out.push(' ');
+    }
+    out.push_str(v);
+    // `$a[$i] .= ' ' . $$u[$i] if $$u[$i]` — append non-empty unit.
+    if let Some(u) = units.get(i)
+      && !u.is_empty()
+    {
+      out.push(' ');
+      out.push_str(u.as_str());
+    }
+  }
+  out
+}
+
+/// `TimeZoneString($min)` (ExifTool.pm:6764-6776): minutes east of UTC →
+/// `±HH:MM`, rounded to the nearest minute.
+#[cfg(feature = "alloc")]
+fn time_zone_string(min: f64) -> String {
+  let (sign, mut m) = if min < 0.0 { ('-', -min) } else { ('+', min) };
+  // `int($min + 0.5)` — round to the nearest minute.
+  let total = (m + 0.5).trunc();
+  m = total;
+  let h = (m / 60.0).trunc();
+  let mins = m - h * 60.0;
+  std::format!("{sign}{:02}:{:02}", h as i64, mins as i64)
+}
+
+/// `PrintExposureTime($secs)` (Exif.pm:5701-5711): `1/N` for a short exposure
+/// (`0 < secs < 0.25001`), else `%.1f` with a trailing `.0` stripped. A
+/// non-float token is returned unchanged (`unless IsFloat`).
+#[cfg(feature = "alloc")]
+fn print_exposure_time(tok: &str) -> String {
+  let Ok(secs) = tok.parse::<f64>() else {
+    return tok.to_string();
+  };
+  if !secs.is_finite() {
+    return tok.to_string();
+  }
+  if secs > 0.0 && secs < 0.250_01 {
+    // `sprintf("1/%d", int(0.5 + 1/$secs))`.
+    let denom = (0.5 + 1.0 / secs).trunc();
+    return std::format!("1/{}", denom as i64);
+  }
+  // `sprintf("%.1f", $secs)` then `s/\.0$//`.
+  let s = std::format!("{secs:.1}");
+  s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// Replace the FIRST occurrence of `from` with `to` in `s` (Perl `s/from/to/`
+/// without `/g`).
+#[cfg(feature = "alloc")]
+fn replace_first(s: &str, from: char, to: char) -> String {
+  match s.find(from) {
+    Some(idx) => {
+      let mut out = String::with_capacity(s.len());
+      out.push_str(&s[..idx]);
+      out.push(to);
+      out.push_str(&s[idx + from.len_utf8()..]);
+      out
+    }
+    None => s.to_string(),
   }
 }
 
@@ -3541,6 +4277,75 @@ mod tests {
     );
   }
 
+  /// **R8-B class-sweep** — a `moov/udta/GPMF` atom sets ExifTool's
+  /// `$$et{FoundEmbedded}` (it routes through `GoPro::ProcessGoPro`, which sets
+  /// the flag on ENTRY, GoPro.pm:822), and in ExifTool the `moov` walk runs
+  /// BEFORE `ScanMediaData` — so the mere PRESENCE of a `moov/udta/GPMF` atom
+  /// SUPPRESSES the brute-force `mdat` freeGPS scan (QuickTimeStream.pl:3689).
+  /// The port therefore processes `moov/udta/GPMF` inside the single ordered
+  /// `walk_moov` pass (run by `extract_stream` BEFORE the scan) and folds its
+  /// "entered ProcessGoPro" result into the `FoundEmbedded` gate (consistent
+  /// FoundEmbedded semantics with the `gpmd`-sample path).
+  ///
+  /// Oracle-verified vs ExifTool 13.59 (`exiftool -ee` on this exact layout: a
+  /// `moov/udta/GPMF` carrying `DVNM=Hero8 Black` plus a `freeGPS ` block buried
+  /// in a `>=0x8000` `mdat`): DeviceName is extracted and NO GPSLatitude/
+  /// GPSLongitude is emitted (the scan is suppressed). The matching control
+  /// without the `udta/GPMF` DOES emit the GPS fix (see
+  /// [`nonfreegps_stream_sample_does_not_suppress_mdat_scan`] for the un-gated
+  /// shape). Pre-fix (moov-GPMF walked AFTER the scan) the port emitted the GPS
+  /// fix here — a real divergence.
+  #[test]
+  fn moov_udta_gpmf_suppresses_mdat_scan() {
+    // A Type-6 (Akaso) freeGPS block buried in `mdat`.
+    let mut blk = vec![0u8; 0x100];
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x30, &14u32.to_le_bytes());
+    wr(&mut blk, 0x34, &30u32.to_le_bytes());
+    wr(&mut blk, 0x38, &45u32.to_le_bytes());
+    wr(&mut blk, 0x58, &2024u32.to_le_bytes());
+    wr(&mut blk, 0x5c, &7u32.to_le_bytes());
+    wr(&mut blk, 0x60, &15u32.to_le_bytes());
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
+
+    // Layout = ftyp || mdat(block + >=0x8000 pad) || moov(mvhd + udta/GPMF).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = blk.clone();
+    mdat_payload.extend_from_slice(&[0u8; 0x8000]);
+    let mdat = atom(b"mdat", &mdat_payload);
+
+    // A real GoPro `moov/udta/GPMF` carrying a DEVC/DVNM (DeviceName).
+    let gpmf = devc_dvnm(b"Hero8 Black");
+    let udta = atom(b"udta", &atom(b"GPMF", &gpmf));
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&udta);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    // The `moov/udta/GPMF` was processed (DeviceName extracted) AND it set
+    // FoundEmbedded, so the buried freeGPS block is NOT scanned: zero samples.
+    assert_eq!(
+      meta.gopro().device_name(),
+      Some("Hero8 Black"),
+      "the moov/udta/GPMF DeviceName is extracted"
+    );
+    assert_eq!(
+      meta.stream().gps_samples().len(),
+      0,
+      "a moov/udta/GPMF must suppress the brute-force mdat freeGPS scan (FoundEmbedded on ProcessGoPro entry)"
+    );
+  }
+
   /// Codex R6 (real-input) — the `mdat` scan must be gated on ExifTool's
   /// `$$et{FoundEmbedded}` (set ONLY by `ProcessFreeGPS`, QuickTimeStream.pl:1650),
   /// NOT on per-sample output. A real dashcam / action-cam can carry a timed
@@ -4304,6 +5109,300 @@ mod tests {
   }
 
   #[test]
+  fn media_uid_value_splits_printconv_hex_from_raw() {
+    // GoPro MUID (GoPro.pm:456-462): the stored RAW is the space-joined u32
+    // list (ExifTool ValueConv). `-j` (PrintConv) hex-renders each `%.8x` and
+    // concatenates; `-n` (ValueConv) emits the raw value verbatim. This is
+    // the bug fix — bundled `-n` cannot match a pre-hex'd string.
+    use crate::value::TagValue;
+    // 0x491b313c 0xa89d1416 0xa556fce1 0xd0cc7e5a.
+    let raw = "1226518844 2828866582 2773941473 3503062618";
+    // `-j` → 32-char concatenated hex.
+    assert_eq!(
+      media_uid_value(raw, true),
+      TagValue::Str("491b313ca89d1416a556fce1d0cc7e5a".into())
+    );
+    // `-n` → raw space-joined decimal list (NOT hex).
+    assert_eq!(media_uid_value(raw, false), TagValue::Str(raw.into()));
+  }
+
+  #[test]
+  fn unit_suffix_value_matches_perl_string_interpolation() {
+    // R6-C: the shared `'"$val <unit>"'` PrintConv (GLPI speeds GoPro.pm:622-624;
+    // KBAT A/Ah/C/V/% GoPro.pm:634-648). Oracle (`perl` string-eval): `$val`
+    // stringifies via `%.15g` (4.0 → "4", -1.0 → "-1"); `-n` is the raw F64.
+    use crate::value::TagValue;
+    assert_eq!(
+      unit_suffix_value(1.5, " m/s", true),
+      TagValue::Str("1.5 m/s".into())
+    );
+    assert_eq!(
+      unit_suffix_value(-1.0, " m/s", true),
+      TagValue::Str("-1 m/s".into())
+    );
+    assert_eq!(
+      unit_suffix_value(1.5, " A", true),
+      TagValue::Str("1.5 A".into())
+    );
+    assert_eq!(
+      unit_suffix_value(2.0, " Ah", true),
+      TagValue::Str("2 Ah".into())
+    );
+    assert_eq!(
+      unit_suffix_value(35.0, " C", true),
+      TagValue::Str("35 C".into())
+    );
+    assert_eq!(
+      unit_suffix_value(4.1, " V", true),
+      TagValue::Str("4.1 V".into())
+    );
+    assert_eq!(
+      unit_suffix_value(95.0, " %", true),
+      TagValue::Str("95 %".into())
+    );
+    // `-n` (ValueConv) is the raw numeric in every case.
+    assert_eq!(unit_suffix_value(1.5, " m/s", false), TagValue::F64(1.5));
+    assert_eq!(unit_suffix_value(95.0, " %", false), TagValue::F64(95.0));
+  }
+
+  #[test]
+  fn battery_time_print_conv_uses_convert_duration_rounded() {
+    // R6-C: KBAT BatteryTime PrintConv `ConvertDuration(int($val + 0.5))`
+    // (GoPro.pm:642). Oracle (`perl` 13.59): int(36000.5)=36000 → "10:00:00";
+    // int(5.5)=5 (<30) → "5.00 s"; int(0.5)=0 → "0 s"; int(90061.5)=90061 →
+    // "1 days 1:01:01". The `-j` value is the duration string; `-n` is the raw
+    // scaled seconds. (Composition mirrors the in-tags() BatteryTime branch.)
+    let pc = |secs: f64| convert_duration((secs + 0.5).trunc());
+    assert_eq!(pc(36000.0), "10:00:00");
+    assert_eq!(pc(35_999.998_122), "10:00:00");
+    assert_eq!(pc(5.0), "5.00 s");
+    assert_eq!(pc(0.0), "0 s");
+    assert_eq!(pc(90_061.0), "1 days 1:01:01");
+  }
+
+  /// Build one GoPro GPMF KLV record (4-byte tag, 1-byte fmt, 1-byte sample
+  /// size, big-endian u16 count, payload padded to a 4-byte boundary — the
+  /// `ProcessGoPro` header shape, GoPro.pm:831-837).
+  fn gpmf_klv(tag: &[u8; 4], fmt: u8, sample_size: u8, count: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(tag);
+    out.push(fmt);
+    out.push(sample_size);
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() % 4 != 0 {
+      out.push(0);
+    }
+    out
+  }
+
+  /// Parse a `moov > udta > GPMF` MP4 whose GPMF body is `gpmf_stream`, via the
+  /// production entry point. exifast decodes the GLPI/KBAT/SYST complex `?`
+  /// records inline from this static-atom path (unlike ExifTool, whose
+  /// `ProcessString` pointer cannot reach them through a static `udta` atom —
+  /// a pre-existing extraction-path difference, orthogonal to the conversions
+  /// under test; SystemTime emits identically through both paths). Leaks the
+  /// buffer so the borrowed `Meta` is `'static` for the test.
+  fn gpmf_meta(gpmf_stream: &[u8]) -> Meta<'static> {
+    let gpmf = atom(b"GPMF", gpmf_stream);
+    let udta = atom(b"udta", &gpmf);
+    let moov = atom(b"moov", &udta);
+    let mut full = atom(b"ftyp", b"mp41\0\0\0\0mp41");
+    full.extend_from_slice(&moov);
+    let leaked: &'static [u8] = std::boxed::Box::leak(full.into_boxed_slice());
+    parse_borrowed(leaked).expect("parsed GPMF fixture")
+  }
+
+  /// A `DEVC { STRM { TYPE=LllllsssS, SCAL, GLPI } }` with one GLPI row that
+  /// scales to lat 4.2, lon -10.5, alt 1500, spdX 1.5, spdY 2.5, spdZ -1.0,
+  /// track 180 (matches the `gopro.rs` GLPI oracle row).
+  fn glpi_devc() -> Vec<u8> {
+    let type_rec = gpmf_klv(b"TYPE", 0x63, 1, 9, b"LllllsssS");
+    let scal_p: Vec<u8> = [
+      1000u32, 10_000_000, 10_000_000, 1000, 1000, 100, 100, 100, 100,
+    ]
+    .iter()
+    .flat_map(|v| v.to_be_bytes())
+    .collect();
+    let scal = gpmf_klv(b"SCAL", 0x4c, 4, 9, &scal_p);
+    let mut row = Vec::new();
+    row.extend_from_slice(&5000u32.to_be_bytes()); // systime
+    row.extend_from_slice(&42_000_000i32.to_be_bytes()); // lat → 4.2
+    row.extend_from_slice(&(-105_000_000i32).to_be_bytes()); // lon → -10.5
+    row.extend_from_slice(&1_500_000i32.to_be_bytes()); // alt → 1500
+    row.extend_from_slice(&2000i32.to_be_bytes()); // unk4
+    row.extend_from_slice(&150i16.to_be_bytes()); // spdX → 1.5
+    row.extend_from_slice(&250i16.to_be_bytes()); // spdY → 2.5
+    row.extend_from_slice(&(-100i16).to_be_bytes()); // spdZ → -1.0
+    row.extend_from_slice(&18000u16.to_be_bytes()); // track → 180
+    let glpi = gpmf_klv(b"GLPI", 0x3f, 28, 1, &row);
+    let mut body = Vec::new();
+    body.extend_from_slice(&type_rec);
+    body.extend_from_slice(&scal);
+    body.extend_from_slice(&glpi);
+    let strm = gpmf_klv(b"STRM", 0, 1, body.len() as u16, &body);
+    gpmf_klv(b"DEVC", 0, 1, strm.len() as u16, &strm)
+  }
+
+  #[test]
+  fn gopro_glpi_speeds_honour_conv_mode() {
+    // R6-C: GLPI GPSSpeedX/Y/Z PrintConv `'"$val m/s"'` (GoPro.pm:622-624).
+    // `-j` → "<v> m/s"; `-n` → raw F64. GPSTrack (col 8) has no PrintConv (raw
+    // both modes). Oracle (`perl` ProcessGoPro ValueConv + the `"$val m/s"`
+    // string-eval): spd 1.5/2.5/-1 → "1.5 m/s"/"2.5 m/s"/"-1 m/s"; track 180.
+    let meta = gpmf_meta(&glpi_devc());
+    let pj = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(pj.get_str("GoPro", "GPSSpeedX").as_deref(), Some("1.5 m/s"));
+    assert_eq!(pj.get_str("GoPro", "GPSSpeedY").as_deref(), Some("2.5 m/s"));
+    assert_eq!(pj.get_str("GoPro", "GPSSpeedZ").as_deref(), Some("-1 m/s"));
+    assert_eq!(pj.get_str("GoPro", "GPSTrack").as_deref(), Some("180"));
+    let pn = emit_into_tagmap(&meta, crate::emit::ConvMode::ValueConv);
+    assert_eq!(pn.get_str("GoPro", "GPSSpeedX").as_deref(), Some("1.5"));
+    assert_eq!(pn.get_str("GoPro", "GPSSpeedY").as_deref(), Some("2.5"));
+    assert_eq!(pn.get_str("GoPro", "GPSSpeedZ").as_deref(), Some("-1"));
+    assert_eq!(pn.get_str("GoPro", "GPSTrack").as_deref(), Some("180"));
+  }
+
+  /// A `DEVC { STRM { TYPE=lLlsSSSSSSSBBBb, SCAL(f32), KBAT } }` whose one row
+  /// scales to current 1.5 A, capacity 2 Ah, temp 35 C, V1-4 4/4.1/4.2/4.3,
+  /// time 36000 s, level 95 % (matches the `gopro.rs` KBAT oracle row).
+  fn kbat_devc() -> Vec<u8> {
+    let type_rec = gpmf_klv(b"TYPE", 0x63, 1, 15, b"lLlsSSSSSSSBBBb");
+    let ks = [
+      1000.0f32,
+      1000.0,
+      0.01,
+      100.0,
+      1000.0,
+      1000.0,
+      1000.0,
+      1000.0,
+      0.016_666_668,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+    ];
+    let scal_p: Vec<u8> = ks.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let scal = gpmf_klv(b"SCAL", 0x66, 4, 15, &scal_p);
+    let mut row = Vec::new();
+    row.extend_from_slice(&1500i32.to_be_bytes()); // current → 1.5
+    row.extend_from_slice(&2000u32.to_be_bytes()); // capacity → 2
+    row.extend_from_slice(&100i32.to_be_bytes()); // unk2 (dropped)
+    row.extend_from_slice(&3500i16.to_be_bytes()); // temp → 35
+    row.extend_from_slice(&4000u16.to_be_bytes()); // V1 → 4
+    row.extend_from_slice(&4100u16.to_be_bytes()); // V2 → 4.1
+    row.extend_from_slice(&4200u16.to_be_bytes()); // V3 → 4.2
+    row.extend_from_slice(&4300u16.to_be_bytes()); // V4 → 4.3
+    row.extend_from_slice(&600u16.to_be_bytes()); // time → 36000 s
+    row.extend_from_slice(&88u16.to_be_bytes()); // unk9 (dropped)
+    row.extend_from_slice(&7u16.to_be_bytes()); // unk10 (dropped)
+    row.push(11); // unk11
+    row.push(12); // unk12
+    row.push(13); // unk13
+    row.extend_from_slice(&95i8.to_be_bytes()); // level → 95
+    let kbat = gpmf_klv(b"KBAT", 0x3f, 32, 1, &row);
+    let mut body = Vec::new();
+    body.extend_from_slice(&type_rec);
+    body.extend_from_slice(&scal);
+    body.extend_from_slice(&kbat);
+    let strm = gpmf_klv(b"STRM", 0, 1, body.len() as u16, &body);
+    gpmf_klv(b"DEVC", 0, 1, strm.len() as u16, &strm)
+  }
+
+  #[test]
+  fn gopro_kbat_units_and_duration_honour_conv_mode() {
+    // R6-C: KBAT unit-suffix PrintConvs (A/Ah/C/V/%, GoPro.pm:634-648) and
+    // BatteryTime `ConvertDuration(int($val + 0.5))` (GoPro.pm:642). `-j` →
+    // "<v> <unit>" / "10:00:00"; `-n` → raw F64. Oracle: current 1.5 A,
+    // capacity 2 Ah, temp 35 C, V1 4 V, V2 4.1 V, level 95 %, time 36000 s →
+    // ConvertDuration(36000) = "10:00:00".
+    let meta = gpmf_meta(&kbat_devc());
+    let pj = emit_into_tagmap(&meta, crate::emit::ConvMode::PrintConv);
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryCurrent").as_deref(),
+      Some("1.5 A")
+    );
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryCapacity").as_deref(),
+      Some("2 Ah")
+    );
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryTemperature").as_deref(),
+      Some("35 C")
+    );
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryVoltage1").as_deref(),
+      Some("4 V")
+    );
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryVoltage2").as_deref(),
+      Some("4.1 V")
+    );
+    assert_eq!(pj.get_str("GoPro", "BatteryLevel").as_deref(), Some("95 %"));
+    assert_eq!(
+      pj.get_str("GoPro", "BatteryTime").as_deref(),
+      Some("10:00:00")
+    );
+    let pn = emit_into_tagmap(&meta, crate::emit::ConvMode::ValueConv);
+    assert_eq!(
+      pn.get_str("GoPro", "BatteryCurrent").as_deref(),
+      Some("1.5")
+    );
+    assert_eq!(pn.get_str("GoPro", "BatteryLevel").as_deref(), Some("95"));
+    // BatteryTime `-n` is the raw scaled seconds (≈ 36000), NOT the duration.
+    let bt: f64 = pn
+      .get_str("GoPro", "BatteryTime")
+      .as_deref()
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert!((bt - 36000.0).abs() < 1.0, "raw scaled seconds, got {bt}");
+  }
+
+  /// A `DEVC { STRM { TYPE=JJ, SCAL=1000000 1000, SYST } }` single-row record.
+  fn syst_devc_single() -> Vec<u8> {
+    let type_rec = gpmf_klv(b"TYPE", 0x63, 1, 2, b"JJ");
+    let scal_p: Vec<u8> = [1_000_000u32, 1000]
+      .iter()
+      .flat_map(|v| v.to_be_bytes())
+      .collect();
+    let scal = gpmf_klv(b"SCAL", 0x4c, 4, 2, &scal_p);
+    let mut row = Vec::new();
+    row.extend_from_slice(&5_000_000u64.to_be_bytes());
+    row.extend_from_slice(&1_551_484_800_000u64.to_be_bytes());
+    let syst = gpmf_klv(b"SYST", 0x3f, 16, 1, &row);
+    let mut body = Vec::new();
+    body.extend_from_slice(&type_rec);
+    body.extend_from_slice(&scal);
+    body.extend_from_slice(&syst);
+    let strm = gpmf_klv(b"STRM", 0, 1, body.len() as u16, &body);
+    gpmf_klv(b"DEVC", 0, 1, strm.len() as u16, &strm)
+  }
+
+  #[test]
+  fn gopro_system_time_emitted_both_modes() {
+    // R6-B: `SystemTime` is a DEFAULT tag (no Unknown/Hidden) emitted by
+    // `exiftool -ee`. Oracle (real `exiftool -ee -G1` on a moov>udta>GPMF MP4):
+    // `GoPro:SystemTime = "5 1551484800"` (the post-SCAL 2-column join) in BOTH
+    // `-j` and `-n` (no ValueConv/PrintConv beyond the RawConv pass-through).
+    let meta = gpmf_meta(&syst_devc_single());
+    for mode in [
+      crate::emit::ConvMode::PrintConv,
+      crate::emit::ConvMode::ValueConv,
+    ] {
+      let w = emit_into_tagmap(&meta, mode);
+      assert_eq!(
+        w.get_str("GoPro", "SystemTime").as_deref(),
+        Some("5 1551484800"),
+        "SystemTime ({mode:?}) = post-SCAL 2-column join"
+      );
+    }
+  }
+
+  #[test]
   fn handler_type_raw_code_preserved() {
     // F3: distinct hdlr codes are preserved verbatim (not collapsed). A
     // 'mdta' handler keeps its raw code (not normalized to 'meta').
@@ -4551,5 +5650,169 @@ mod tests {
       count <= u64::from(MAX_ATOM_DEPTH),
       "the recursion budget must cap the walk at MAX_ATOM_DEPTH containers"
     );
+  }
+
+  /// Build a GPMF KLV record (8-byte header + value, 4-byte-aligned).
+  fn klv(tag: &[u8; 4], fmt: u8, len: u8, count: u16, value: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(tag);
+    v.push(fmt);
+    v.push(len);
+    v.extend_from_slice(&count.to_be_bytes());
+    v.extend_from_slice(value);
+    while v.len() % 4 != 0 {
+      v.push(0);
+    }
+    v
+  }
+
+  /// A GPMF payload = one `DEVC` (fmt-0) container holding a single `DVNM`
+  /// (DeviceName, ASCII) record with `name`.
+  fn devc_dvnm(name: &[u8]) -> Vec<u8> {
+    let dvnm = klv(b"DVNM", 0x63, 1, name.len() as u16, name);
+    klv(b"DEVC", 0x00, 1, dvnm.len() as u16, &dvnm)
+  }
+
+  /// **R7/F1 (now via the integrated `walk_moov`)** — a `udta/GPMF` carried by
+  /// a LATER top-level `moov` (the FIRST `moov` has none) is still extracted.
+  /// `extract_stream`'s top-level loop runs `walk_moov` per `moov` in file
+  /// order, and `walk_moov`'s `udta` arm dispatches the GPMF — so the GoPro
+  /// `DeviceName` decodes end-to-end and `FoundEmbedded` is set.
+  #[test]
+  fn moov_udta_gpmf_visits_a_later_moov() {
+    let gpmf = devc_dvnm(b"Hero8 Black");
+    let udta = atom(b"udta", &atom(b"GPMF", &gpmf));
+    // moov1: an `mvhd`-only movie with NO udta/GPMF.
+    let moov1 = atom(b"moov", &atom(b"mvhd", &[0u8; 4]));
+    // moov2: carries the GoPro udta/GPMF.
+    let moov2 = atom(b"moov", &udta);
+    let mut data = atom(b"ftyp", b"qt  ");
+    data.extend_from_slice(&moov1);
+    data.extend_from_slice(&moov2);
+
+    let mut meta = GoProMeta::new();
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    assert_eq!(meta.device_name(), Some("Hero8 Black"));
+    assert!(
+      found_embedded,
+      "a dispatched udta/GPMF sets FoundEmbedded (GoPro.pm:822)"
+    );
+  }
+
+  /// The integrated `walk_moov` accumulates EVERY `moov/udta/GPMF` across
+  /// MULTIPLE `moov` in atom-list ORDER (first moov before later moov), so the
+  /// scalar `DeviceName` is last-wins on the LATER moov — mirroring ExifTool's
+  /// per-atom `HandleTag` accumulation (default same-priority overwrite).
+  #[test]
+  fn moov_udta_gpmf_accumulates_in_order() {
+    let moov1 = atom(
+      b"moov",
+      &atom(b"udta", &atom(b"GPMF", &devc_dvnm(b"First"))),
+    );
+    let moov2 = atom(
+      b"moov",
+      &atom(b"udta", &atom(b"GPMF", &devc_dvnm(b"Second"))),
+    );
+    let mut data = atom(b"ftyp", b"qt  ");
+    data.extend_from_slice(&moov1);
+    data.extend_from_slice(&moov2);
+
+    let mut meta = GoProMeta::new();
+    let _ = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    assert_eq!(
+      meta.device_name(),
+      Some("Second"),
+      "last GPMF (later moov, file order) wins the scalar DeviceName"
+    );
+  }
+
+  /// **R8-A** — `GPMF` is dispatched ONLY through `moov/udta/GPMF` (the
+  /// UserData table, QuickTime.pm:1585/2132); a *direct* `moov/GPMF` child is
+  /// NEVER processed by ExifTool's `for(;;)` walk (the top-level Movie table
+  /// has no `GPMF` entry). The integrated `walk_moov` only fires its GPMF
+  /// dispatch from the `udta` arm, so in a single `moov` carrying BOTH a
+  /// `udta/GPMF` and a direct `moov/GPMF`, the `udta` device-name wins
+  /// REGARDLESS of which child comes first. Oracle-verified vs ExifTool 13.59
+  /// (`-ee -DeviceName`): both layouts report the `udta` name.
+  #[test]
+  fn moov_udta_gpmf_ignores_direct_moov_gpmf() {
+    let g_udta = devc_dvnm(b"XfromUDTA");
+    let g_direct = devc_dvnm(b"YfromDIRECT");
+
+    // Layout 1: udta/GPMF FIRST, then direct moov/GPMF.
+    let moov_a = atom(
+      b"moov",
+      &[
+        atom(b"mvhd", &[0u8; 4]),
+        atom(b"udta", &atom(b"GPMF", &g_udta)),
+        atom(b"GPMF", &g_direct),
+      ]
+      .concat(),
+    );
+    let mut data_a = atom(b"ftyp", b"qt  ");
+    data_a.extend_from_slice(&moov_a);
+    let mut meta_a = GoProMeta::new();
+    let _ = quicktime_stream::extract_stream(&data_a, None, None, &mut meta_a);
+    assert_eq!(
+      meta_a.device_name(),
+      Some("XfromUDTA"),
+      "udta wins; direct moov/GPMF ignored (oracle: exiftool 13.59 -ee -DeviceName)"
+    );
+
+    // Layout 2: direct moov/GPMF FIRST, then udta/GPMF — same result.
+    let moov_b = atom(
+      b"moov",
+      &[
+        atom(b"mvhd", &[0u8; 4]),
+        atom(b"GPMF", &g_direct),
+        atom(b"udta", &atom(b"GPMF", &g_udta)),
+      ]
+      .concat(),
+    );
+    let mut data_b = atom(b"ftyp", b"qt  ");
+    data_b.extend_from_slice(&moov_b);
+    let mut meta_b = GoProMeta::new();
+    let _ = quicktime_stream::extract_stream(&data_b, None, None, &mut meta_b);
+    assert_eq!(
+      meta_b.device_name(),
+      Some("XfromUDTA"),
+      "udta wins regardless of atom order (oracle: exiftool 13.59)"
+    );
+  }
+
+  /// The single-moov `udta/GPMF` path is unchanged (no regression).
+  #[test]
+  fn moov_udta_gpmf_single_moov() {
+    let moov = atom(
+      b"moov",
+      &atom(b"udta", &atom(b"GPMF", &devc_dvnm(b"Hero6 Black"))),
+    );
+    let mut data = atom(b"ftyp", b"qt  ");
+    data.extend_from_slice(&moov);
+    let mut meta = GoProMeta::new();
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    assert_eq!(meta.device_name(), Some("Hero6 Black"));
+    assert!(found_embedded);
+  }
+
+  /// A file with no `moov`/`GPMF` yields nothing (and does not panic on a
+  /// truncated tail). `FoundEmbedded` stays false (no GoPro source dispatched).
+  #[test]
+  fn moov_udta_gpmf_none_and_truncation_safe() {
+    let data = atom(b"ftyp", b"qt  ");
+    let mut meta = GoProMeta::new();
+    let (_stream, found_embedded) = quicktime_stream::extract_stream(&data, None, None, &mut meta);
+    assert!(meta.is_empty());
+    assert!(!found_embedded);
+
+    // A `moov` whose declared size overruns the buffer must stop the walk
+    // without panicking (checked `.get()`).
+    let mut trunc = Vec::new();
+    trunc.extend_from_slice(&1000u32.to_be_bytes());
+    trunc.extend_from_slice(b"moov");
+    trunc.extend_from_slice(b"\x00\x00\x00\x10udta"); // truncated body
+    let mut meta2 = GoProMeta::new();
+    let _ = quicktime_stream::extract_stream(&trunc, None, None, &mut meta2);
+    assert!(meta2.is_empty());
   }
 }

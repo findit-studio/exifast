@@ -685,3 +685,1014 @@ fn build_mov_with_freegps_in_mdat() -> Vec<u8> {
   out.extend_from_slice(&mdat);
   out
 }
+
+// ===========================================================================
+// SP4 — GoPro GPMF
+// ===========================================================================
+
+#[test]
+fn quicktime_gopro_gpmf_in_mdat_brute_force_dispatch() {
+  // SP4 — the brute-force `mdat` scan locates a GoPro `GP\x06\0\0` record;
+  // its DEVC payload feeds the GPMF KLV walker. The synthetic record
+  // carries enough tags to populate the typed GoPro identity + a single
+  // GPS5 fix.
+  let data = build_mov_with_gpro6_in_mdat();
+  let meta = exifast::parse_quicktime(&data).expect("recognized");
+  let gp = meta.gopro();
+  assert!(
+    !gp.is_empty(),
+    "the brute-force scan must populate the GoPro meta"
+  );
+  assert_eq!(gp.device_name(), Some("Camera"));
+  assert_eq!(gp.model(), Some("HERO6 Black"));
+  assert_eq!(gp.camera_serial_number(), Some("C3221324657219"));
+  assert_eq!(gp.firmware_version(), Some("HD6.01.01.51.00"));
+  let samples = gp.gps_samples();
+  assert_eq!(samples.len(), 1, "one GPS5 row");
+  let s = &samples[0];
+  assert!((s.latitude().unwrap() - 4.2).abs() < 1e-6);
+  assert!((s.longitude().unwrap() + 10.5).abs() < 1e-6);
+}
+
+#[test]
+fn quicktime_gopro_gpmf_projects_camera_and_gps_into_media_metadata() {
+  // The MediaMetadata projection picks up CameraInfo (make=GoPro,
+  // model=HERO6 Black, serial, software) and GpsLocation (first fix).
+  let data = build_mov_with_gpro6_in_mdat();
+  let meta = exifast::parse_quicktime(&data).expect("recognized");
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("GoPro CameraInfo projected");
+  assert_eq!(cam.make(), Some("GoPro"));
+  assert_eq!(cam.model(), Some("HERO6 Black"));
+  assert_eq!(cam.serial(), Some("C3221324657219"));
+  assert_eq!(cam.software(), Some("HD6.01.01.51.00"));
+  let gps = md.gps().expect("GpsLocation projected from GPS5");
+  assert!((gps.latitude().unwrap() - 4.2).abs() < 1e-6);
+  assert!((gps.longitude().unwrap() + 10.5).abs() < 1e-6);
+}
+
+#[test]
+fn quicktime_gopro_gpmf_emits_gopro_group_tags_speed_in_kph() {
+  // SP4 — the golden `Meta::tags()` path emits the GoPro GPMF tags under
+  // family-0/family-1 `GoPro` (the `%GoPro::GPMF`/`GPS5` tables,
+  // GoPro.pm:67-69/489-490). The GPS5 fix is summarized (first row); the
+  // identity scalars are one-per-file. KEY: `GPSSpeed`/`GPSSpeed3D` apply the
+  // ValueConv `$val * 3.6` (m/s → km/h, GoPro.pm:504-513) on emission — the
+  // fixture stores 12 m/s / 15 m/s, so the emitted tags are 43.2 / 54.0 km/h.
+  let data = build_mov_with_gpro6_in_mdat();
+  let any = parse_bytes(&data).expect("recognized");
+  assert!(matches!(any, AnyMeta::QuickTime(_)), "got {any:?}");
+  let tags: Vec<exifast::Tag> = any.iter_tags(ConvMode::PrintConv).collect();
+  let gp: std::collections::HashMap<&str, &exifast::Tag> = tags
+    .iter()
+    .filter(|t| t.group_ref().family0() == "GoPro" && t.group_ref().family1() == "GoPro")
+    .map(|t| (t.name(), t))
+    .collect();
+  // Identity strings.
+  let want_str = |name: &str| match gp.get(name).map(|t| t.value_ref()) {
+    Some(exifast::TagValue::Str(s)) => s.as_str().to_string(),
+    other => panic!("GoPro:{name} expected a string, got {other:?}"),
+  };
+  assert_eq!(want_str("DeviceName"), "Camera");
+  assert_eq!(want_str("Model"), "HERO6 Black");
+  assert_eq!(want_str("CameraSerialNumber"), "C3221324657219");
+  assert_eq!(want_str("FirmwareVersion"), "HD6.01.01.51.00");
+  // GPS fix: decimal lat/lon (DMS PrintConv deferred, like the SP3 stream),
+  // metres altitude, and km/h speeds.
+  let want_f64 = |name: &str| match gp.get(name).map(|t| t.value_ref()) {
+    Some(&exifast::TagValue::F64(v)) => v,
+    other => panic!("GoPro:{name} expected an f64, got {other:?}"),
+  };
+  assert!((want_f64("GPSLatitude") - 4.2).abs() < 1e-6);
+  assert!((want_f64("GPSLongitude") + 10.5).abs() < 1e-6);
+  assert!((want_f64("GPSAltitude") - 1500.0).abs() < 1e-6);
+  // 12 m/s × 3.6 = 43.2 km/h; 15 m/s × 3.6 = 54.0 km/h.
+  assert!(
+    (want_f64("GPSSpeed") - 43.2).abs() < 1e-6,
+    "GPSSpeed must be km/h"
+  );
+  assert!(
+    (want_f64("GPSSpeed3D") - 54.0).abs() < 1e-6,
+    "GPSSpeed3D must be km/h"
+  );
+}
+
+#[test]
+fn quicktime_gopro_gpmf_in_udta_atom() {
+  // SP4 — a moov/udta/GPMF atom (the path of QuickTime.pm:2132-2135).
+  // Build a movie with a moov-level GPMF atom carrying a DEVC record.
+  let data = build_mov_with_gpmf_in_udta();
+  let meta = exifast::parse_quicktime(&data).expect("recognized");
+  let gp = meta.gopro();
+  assert_eq!(gp.device_name(), Some("Hero"));
+  assert_eq!(gp.firmware_version(), Some("HD6.01.01.51.00"));
+}
+
+#[test]
+fn quicktime_gopro_karma_glpi_kbat_decode_and_emit() {
+  // R5 — a Karma-drone GPMF (moov/udta/GPMF) carrying TYPE+SCAL+GLPI (GPSPos)
+  // and TYPE+SCAL+KBAT (BatteryStatus) in separate STRMs, plus a SYST
+  // calibration. Asserts: (1) the typed GLPI/KBAT collections decode; (2) the
+  // golden `tags()` path emits the Karma tags under family-0/1 `GoPro`;
+  // (3) the GLPI GPS fix projects into MediaMetadata (no GPS5/GPS9 present).
+  let data = build_mov_with_karma_gpmf_in_udta();
+  let meta = exifast::parse_quicktime(&data).expect("recognized");
+  let gp = meta.gopro();
+  // Typed GLPI sample.
+  let g = gp.glpi_samples().first().expect("one GLPI sample");
+  assert!((g.latitude().unwrap() - 4.2).abs() < 1e-6);
+  assert!((g.longitude().unwrap() + 10.5).abs() < 1e-6);
+  assert!((g.altitude_m().unwrap() - 1500.0).abs() < 1e-6);
+  assert!((g.track_deg().unwrap() - 180.0).abs() < 1e-6);
+  // Typed KBAT record.
+  let k = gp.kbat_records().first().expect("one KBAT record");
+  assert!((k.current_a().unwrap() - 1.5).abs() < 1e-4);
+  assert!((k.level_pct().unwrap() - 95.0).abs() < 1e-4);
+  assert!((k.voltage1_v().unwrap() - 4.0).abs() < 1e-4);
+
+  // Golden emission — GoPro:GoPro family tags.
+  let any = parse_bytes(&data).expect("recognized");
+  let tags: Vec<exifast::Tag> = any.iter_tags(ConvMode::PrintConv).collect();
+  let gpm: std::collections::HashMap<&str, &exifast::Tag> = tags
+    .iter()
+    .filter(|t| t.group_ref().family0() == "GoPro" && t.group_ref().family1() == "GoPro")
+    .map(|t| (t.name(), t))
+    .collect();
+  let want_f64 = |name: &str| match gpm.get(name).map(|t| t.value_ref()) {
+    Some(&exifast::TagValue::F64(v)) => v,
+    other => panic!("GoPro:{name} expected an f64, got {other:?}"),
+  };
+  let want_str = |name: &str| match gpm.get(name).map(|t| t.value_ref()) {
+    Some(exifast::TagValue::Str(s)) => s.as_str().to_string(),
+    other => panic!("GoPro:{name} expected a string, got {other:?}"),
+  };
+  // GLPI lat/lon/alt: DMS / `"$val m"` PrintConv deferred (raw F64), the
+  // accepted GPS5/GPS9/GLPI deferral.
+  assert!((want_f64("GPSLatitude") - 4.2).abs() < 1e-6);
+  assert!((want_f64("GPSLongitude") + 10.5).abs() < 1e-6);
+  assert!((want_f64("GPSAltitude") - 1500.0).abs() < 1e-6);
+  // R6-C: GLPI speeds DO apply `'"$val m/s"'` in PrintConv mode (stay m/s —
+  // GLPI has no *3.6 km/h ValueConv). GPSTrack (col 8) has no PrintConv (raw).
+  assert_eq!(want_str("GPSSpeedX"), "1.5 m/s");
+  assert!((want_f64("GPSTrack") - 180.0).abs() < 1e-6);
+  // R6-C: KBAT unit-suffix PrintConvs apply in PrintConv mode.
+  assert_eq!(want_str("BatteryCurrent"), "1.5 A");
+  assert_eq!(want_str("BatteryVoltage1"), "4 V");
+  assert_eq!(want_str("BatteryLevel"), "95 %");
+  // R6-C: BatteryTime PrintConv `ConvertDuration(int($val + 0.5))` — 36000 s →
+  // "10:00:00".
+  assert_eq!(want_str("BatteryTime"), "10:00:00");
+  // R6-B: SystemTime is a default tag emitted by `-ee` — the post-SCAL 2-column
+  // join of the FIRST (single-row) SYST record (first-wins). The fixture's
+  // first SYST is (sys=0, unix_ms=1551484800000) → "0 1551484800".
+  assert_eq!(want_str("SystemTime"), "0 1551484800");
+  // GPSDateTime: with the SYST calibration the systime 5.0 interpolates to a
+  // whole-number epoch ⇒ the faithful ExifTool all-zero quirk literal.
+  match gpm.get("GPSDateTime").map(|t| t.value_ref()) {
+    Some(exifast::TagValue::Str(s)) => assert_eq!(s.as_str(), "0000:00:00 00:00:00"),
+    other => panic!("GPSDateTime expected a string, got {other:?}"),
+  }
+
+  // GLPI GPS projects into MediaMetadata (no GPS5/GPS9 present).
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GLPI fix projected into GpsLocation");
+  assert!((gps.latitude().unwrap() - 4.2).abs() < 1e-6);
+  assert!((gps.longitude().unwrap() + 10.5).abs() < 1e-6);
+  assert!((gps.altitude_m().unwrap() - 1500.0).abs() < 1e-6);
+  // The all-zero GPSDateTime quirk is NOT used as the projection timestamp
+  // (usable_glpi_time filters the `0000:` sentinel).
+  assert_eq!(gps.timestamp(), None);
+  // CameraInfo still projects (DVNM → model fallback).
+  let cam = md.camera().expect("GoPro CameraInfo");
+  assert_eq!(cam.make(), Some("GoPro"));
+}
+
+/// Real-fixture conformance stub for GoPro GPMF.
+///
+/// Bundled exiftool has no GoPro `.mp4` fixture (only `t/images/GoPro.jpg`,
+/// an APP6 still photo); the synthetic-buffer unit tests carry the
+/// algorithmic coverage. When a small GoPro `.mp4` fixture lands (per
+/// follow-up issue #127), unignore this test and add the round-trip
+/// assertions against `perl /Users/user/Develop/findit-studio/exiftool/
+/// exiftool -j -G -ee <fixture>`.
+#[test]
+#[ignore = "needs real GoPro .mp4 fixture; see #127"]
+fn gopro_real_fixture_conformance() {
+  // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
+}
+
+/// Build a minimal but valid `.mov` whose `mdat` contains one GoPro
+/// `GP\x06\0\0` record. The contained payload is a DEVC GPMF container
+/// holding DVNM/MINF/CASN/FMWR + the canonical SCAL vector + a one-row GPS5
+/// (GPS5 kept last so the GoPro.pm:884 last-in-container SCAL guard fires).
+fn build_mov_with_gpro6_in_mdat() -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  // mvhd (v0, 108 bytes): version+flags + 7 × int32 zero + 1 dword timescale=1000 + ...
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut moov = (mvhd.len() as u32 + 16).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  moov.extend_from_slice(&mvhd_atom);
+  // Build the GPMF DEVC container.
+  let mut inner = Vec::new();
+  inner.extend_from_slice(&klv(b"DVNM", 0x63, 6, 1, b"Camera"));
+  inner.extend_from_slice(&klv(b"MINF", 0x63, 11, 1, b"HERO6 Black"));
+  inner.extend_from_slice(&klv(b"CASN", 0x63, 14, 1, b"C3221324657219"));
+  inner.extend_from_slice(&klv(b"FMWR", 0x63, 15, 1, b"HD6.01.01.51.00"));
+  // The canonical SCAL vector ahead of GPS5 (GoPro.pm:218). ExifTool scales
+  // GPS5 only when a SCAL record was seen AND GPS5 is the LAST record in its
+  // container (GoPro.pm:884 `if $scal and $tag ne 'SCAL' and
+  // $pos+$size+3>=$dirEnd`); a real GoPro STRM always begins with SCAL, so
+  // emit it here with GPS5 kept last. SCAL = [1e7, 1e7, 1000, 1000, 100].
+  let scal_payload: Vec<u8> = [10_000_000u32, 10_000_000, 1_000, 1_000, 100]
+    .iter()
+    .flat_map(|v| v.to_be_bytes())
+    .collect();
+  inner.extend_from_slice(&klv(b"SCAL", 0x4c, 4, 5, &scal_payload));
+  // One GPS5 row — raw int32s; SCAL above divides them to 4.2° / -10.5° /
+  // 1500 m / 12 m/s / 15 m/s. GPS5 is the LAST record so scaling fires.
+  let mut gps5_payload = Vec::new();
+  gps5_payload.extend_from_slice(&42_000_000i32.to_be_bytes()); // 4.2°
+  gps5_payload.extend_from_slice(&(-105_000_000i32).to_be_bytes()); // -10.5°
+  gps5_payload.extend_from_slice(&1_500_000i32.to_be_bytes()); // alt 1500 m
+  gps5_payload.extend_from_slice(&12_000i32.to_be_bytes()); // spd 12 m/s
+  gps5_payload.extend_from_slice(&1_500i32.to_be_bytes()); // spd3d 15 m/s
+  inner.extend_from_slice(&klv(b"GPS5", 0x6c, 20, 1, &gps5_payload));
+  let devc = klv(b"DEVC", 0, 1, inner.len() as u16, &inner);
+  // GP\x06\0\0 record header.
+  let mut gp6 = Vec::with_capacity(16);
+  gp6.extend_from_slice(b"GP\x06\0"); // tag
+  gp6.extend_from_slice(&(devc.len() as u32).to_be_bytes()); // size BE
+  gp6.extend_from_slice(&[0u8; 8]); // 8 reserved
+  let mut gp6_record = gp6;
+  gp6_record.extend_from_slice(&devc);
+  // mdat payload = 64 bytes pad + record + 64 bytes pad.
+  let mut mdat_payload = vec![0u8; 64];
+  mdat_payload.extend_from_slice(&gp6_record);
+  mdat_payload.extend_from_slice(&[0u8; 64]);
+  let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(&mdat_payload);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out.extend_from_slice(&mdat);
+  out
+}
+
+/// Build a minimal but valid `.mov` whose moov/udta carries a `GPMF` atom
+/// with a one-DVNM-record DEVC payload.
+fn build_mov_with_gpmf_in_udta() -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  // Build a minimal GPMF payload (DEVC{DVNM,FMWR}).
+  let mut inner = Vec::new();
+  inner.extend_from_slice(&klv(b"DVNM", 0x63, 4, 1, b"Hero"));
+  inner.extend_from_slice(&klv(b"FMWR", 0x63, 15, 1, b"HD6.01.01.51.00"));
+  let devc = klv(b"DEVC", 0, 1, inner.len() as u16, &inner);
+  let mut gpmf_atom = ((devc.len() as u32) + 8).to_be_bytes().to_vec();
+  gpmf_atom.extend_from_slice(b"GPMF");
+  gpmf_atom.extend_from_slice(&devc);
+  let mut udta_body = Vec::new();
+  udta_body.extend_from_slice(&gpmf_atom);
+  let mut udta = ((udta_body.len() as u32) + 8).to_be_bytes().to_vec();
+  udta.extend_from_slice(b"udta");
+  udta.extend_from_slice(&udta_body);
+  let mut moov_body = Vec::new();
+  moov_body.extend_from_slice(&mvhd_atom);
+  moov_body.extend_from_slice(&udta);
+  let mut moov = ((moov_body.len() as u32) + 8).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  moov.extend_from_slice(&moov_body);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out
+}
+
+/// Build one GPMF KLV record header + payload, padded to 4-byte boundary.
+fn klv(tag: &[u8; 4], fmt: u8, sample_size: u8, count: u16, payload: &[u8]) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(tag);
+  out.push(fmt);
+  out.push(sample_size);
+  out.extend_from_slice(&count.to_be_bytes());
+  out.extend_from_slice(payload);
+  while out.len() % 4 != 0 {
+    out.push(0);
+  }
+  out
+}
+
+/// Wrap a GPMF KLV body in one `STRM` container.
+fn strm(body: &[u8]) -> Vec<u8> {
+  klv(b"STRM", 0, 1, body.len() as u16, body)
+}
+
+/// Build a minimal `.mov` whose moov/udta carries a `GPMF` atom holding a
+/// Karma-drone DEVC: DVNM + two single-row SYST calibration STRMs + a GLPI
+/// (`GPSPos`) STRM + a KBAT (`BatteryStatus`) STRM. The TYPE/SCAL records use
+/// the canonical Karma layouts (GoPro.pm:200-201 / 267-268); the values mirror
+/// the PR oracle pinned against `perl exiftool` 13.59.
+fn build_mov_with_karma_gpmf_in_udta() -> Vec<u8> {
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+
+  // ── SYST calibration STRMs (TYPE=JJ, SCAL=1000000 1000) ──────────────
+  let syst_type = klv(b"TYPE", 0x63, 2, 1, &[0x4a, 0x4a]); // 'JJ'
+  let syst_scal_p: Vec<u8> = [1_000_000u32, 1000]
+    .iter()
+    .flat_map(|v| v.to_be_bytes())
+    .collect();
+  let syst_scal = klv(b"SCAL", 0x4c, 4, 2, &syst_scal_p);
+  let mk_syst_strm = |sys: u64, unix_ms: u64| {
+    let mut r = Vec::new();
+    r.extend_from_slice(&sys.to_be_bytes());
+    r.extend_from_slice(&unix_ms.to_be_bytes());
+    let syst = klv(b"SYST", 0x3f, 16, 1, &r);
+    let mut b = Vec::new();
+    b.extend_from_slice(&syst_type);
+    b.extend_from_slice(&syst_scal);
+    b.extend_from_slice(&syst);
+    strm(&b)
+  };
+
+  // ── GLPI STRM (TYPE=LllllsssS, SCAL per GoPro.pm:201) ────────────────
+  let glpi_type = klv(
+    b"TYPE",
+    0x63,
+    9,
+    1,
+    &[0x4c, 0x6c, 0x6c, 0x6c, 0x6c, 0x73, 0x73, 0x73, 0x53],
+  );
+  let glpi_scal_p: Vec<u8> = [
+    1000u32, 10_000_000, 10_000_000, 1000, 1000, 100, 100, 100, 100,
+  ]
+  .iter()
+  .flat_map(|v| v.to_be_bytes())
+  .collect();
+  let glpi_scal = klv(b"SCAL", 0x4c, 4, 9, &glpi_scal_p);
+  let mut glpi_row = Vec::new();
+  glpi_row.extend_from_slice(&5000u32.to_be_bytes()); // systime →5.0
+  glpi_row.extend_from_slice(&42_000_000i32.to_be_bytes()); // lat →4.2
+  glpi_row.extend_from_slice(&(-105_000_000i32).to_be_bytes()); // lon →-10.5
+  glpi_row.extend_from_slice(&1_500_000i32.to_be_bytes()); // alt →1500
+  glpi_row.extend_from_slice(&2000i32.to_be_bytes()); // unk4 (dropped)
+  glpi_row.extend_from_slice(&150i16.to_be_bytes()); // spdX →1.5
+  glpi_row.extend_from_slice(&250i16.to_be_bytes()); // spdY →2.5
+  glpi_row.extend_from_slice(&(-100i16).to_be_bytes()); // spdZ →-1.0
+  glpi_row.extend_from_slice(&18000u16.to_be_bytes()); // track →180
+  let mut glpi_body = Vec::new();
+  glpi_body.extend_from_slice(&glpi_type);
+  glpi_body.extend_from_slice(&glpi_scal);
+  glpi_body.extend_from_slice(&klv(b"GLPI", 0x3f, 28, 1, &glpi_row));
+  let glpi_strm = strm(&glpi_body);
+
+  // ── KBAT STRM (TYPE=lLlsSSSSSSSBBBb, SCAL per GoPro.pm:268) ───────────
+  let kbat_type = klv(
+    b"TYPE",
+    0x63,
+    15,
+    1,
+    &[
+      0x6c, 0x4c, 0x6c, 0x73, 0x53, 0x53, 0x53, 0x53, 0x53, 0x53, 0x53, 0x42, 0x42, 0x42, 0x62,
+    ],
+  );
+  // 0.01f32 / 0.016_666_668f32 = the exact f32 round-trips of ExifTool's
+  // 0.00999999977648258 / 0.0166666675359011 SCAL factors (GoPro.pm:268).
+  let ks = [
+    1000.0f32,
+    1000.0,
+    0.01,
+    100.0,
+    1000.0,
+    1000.0,
+    1000.0,
+    1000.0,
+    0.016_666_668,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+  ];
+  let kbat_scal_p: Vec<u8> = ks.iter().flat_map(|v| v.to_be_bytes()).collect();
+  let kbat_scal = klv(b"SCAL", 0x66, 4, 15, &kbat_scal_p);
+  let mut kbat_row = Vec::new();
+  kbat_row.extend_from_slice(&1500i32.to_be_bytes()); // current →1.5
+  kbat_row.extend_from_slice(&2000u32.to_be_bytes()); // capacity →2
+  kbat_row.extend_from_slice(&100i32.to_be_bytes()); // unk2 (dropped)
+  kbat_row.extend_from_slice(&3500i16.to_be_bytes()); // temp →35
+  kbat_row.extend_from_slice(&4000u16.to_be_bytes()); // V1 →4
+  kbat_row.extend_from_slice(&4100u16.to_be_bytes()); // V2 →4.1
+  kbat_row.extend_from_slice(&4200u16.to_be_bytes()); // V3 →4.2
+  kbat_row.extend_from_slice(&4300u16.to_be_bytes()); // V4 →4.3
+  kbat_row.extend_from_slice(&600u16.to_be_bytes()); // time →10s scaled→36000s? (0.0166→36000)
+  kbat_row.extend_from_slice(&88u16.to_be_bytes()); // unk9 (dropped)
+  kbat_row.extend_from_slice(&7u16.to_be_bytes()); // unk10 (dropped)
+  kbat_row.push(11); // unk11 (dropped)
+  kbat_row.push(12); // unk12 (dropped)
+  kbat_row.push(13); // unk13 (dropped)
+  kbat_row.extend_from_slice(&95i8.to_be_bytes()); // level →95
+  let mut kbat_body = Vec::new();
+  kbat_body.extend_from_slice(&kbat_type);
+  kbat_body.extend_from_slice(&kbat_scal);
+  kbat_body.extend_from_slice(&klv(b"KBAT", 0x3f, 32, 1, &kbat_row));
+  let kbat_strm = strm(&kbat_body);
+
+  // ── DEVC container ───────────────────────────────────────────────────
+  let mut devc_body = Vec::new();
+  devc_body.extend_from_slice(&klv(b"DVNM", 0x63, 5, 1, b"Karma"));
+  devc_body.extend_from_slice(&mk_syst_strm(0, 1_551_484_800_000));
+  devc_body.extend_from_slice(&mk_syst_strm(10_000_000, 1_551_484_810_000));
+  devc_body.extend_from_slice(&glpi_strm);
+  devc_body.extend_from_slice(&kbat_strm);
+  let devc = klv(b"DEVC", 0, 1, devc_body.len() as u16, &devc_body);
+
+  let mut gpmf_atom = ((devc.len() as u32) + 8).to_be_bytes().to_vec();
+  gpmf_atom.extend_from_slice(b"GPMF");
+  gpmf_atom.extend_from_slice(&devc);
+  let mut udta = ((gpmf_atom.len() as u32) + 8).to_be_bytes().to_vec();
+  udta.extend_from_slice(b"udta");
+  udta.extend_from_slice(&gpmf_atom);
+  let mut moov_body = Vec::new();
+  moov_body.extend_from_slice(&mvhd_atom);
+  moov_body.extend_from_slice(&udta);
+  let mut moov = ((moov_body.len() as u32) + 8).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  moov.extend_from_slice(&moov_body);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out
+}
+
+// ===========================================================================
+// SP4 — R12-A: the FULL default-visible %GoPro::GPMF tag set (sensor streams +
+// scalar settings + calibrations). Per-tag values oracle-pinned vs
+// `perl exiftool 13.59 -ee` (see also the byte-exact end-to-end conformance
+// fixture QuickTime_gopro_gpmf.mov in tests/conformance.rs).
+// ===========================================================================
+
+/// Build a `.mov` whose `moov/udta/GPMF` carries a DEVC with sensor STRMs
+/// (`Binary` ACCL), a `SHUT` exposure stream, a standalone `STMP`, a `TMPC`
+/// scalar, and a plain-multi `MAGN`. The moov/udta/GPMF path is processed
+/// WITHOUT `-ee` (it is a moov atom), so the full emission path is exercised.
+fn build_mov_with_sensor_gpmf_in_udta() -> Vec<u8> {
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+
+  // ACCL STRM: SCAL=418 (s int16s), 2 rows ⇒ "2 3 -0.5 1 2 4" (14 chars).
+  let accl_strm = {
+    let scal = klv(b"SCAL", 0x73, 2, 1, &418i16.to_be_bytes());
+    let mut data = Vec::new();
+    let rows: [(i16, i16, i16); 2] = [(836, 1254, -209), (418, 836, 1672)];
+    for &(x, y, z) in &rows {
+      data.extend_from_slice(&x.to_be_bytes());
+      data.extend_from_slice(&y.to_be_bytes());
+      data.extend_from_slice(&z.to_be_bytes());
+    }
+    let mut b = Vec::new();
+    b.extend_from_slice(&scal);
+    b.extend_from_slice(&klv(b"ACCL", 0x73, 6, 2, &data));
+    strm(&b)
+  };
+  // SHUT exposure stream: floats 0.005, 0.008 ⇒ PrintConv "1/200 1/125".
+  let shut_strm = {
+    let mut data = Vec::new();
+    data.extend_from_slice(&0.005f32.to_be_bytes());
+    data.extend_from_slice(&0.008f32.to_be_bytes());
+    strm(&klv(b"SHUT", 0x66, 4, 2, &data))
+  };
+  // Standalone STMP (TimeStamp, J int64u, /1e6).
+  let stmp_strm = strm(&klv(b"STMP", 0x4a, 8, 1, &12_345_678u64.to_be_bytes()));
+  // MAGN plain multi (scaled /100): single row (10,20,30) ⇒ "0.1 0.2 0.3".
+  let magn_strm = {
+    let scal = klv(b"SCAL", 0x73, 2, 1, &100i16.to_be_bytes());
+    let mut data = Vec::new();
+    for v in [10i16, 20, 30] {
+      data.extend_from_slice(&v.to_be_bytes());
+    }
+    let mut b = Vec::new();
+    b.extend_from_slice(&scal);
+    b.extend_from_slice(&klv(b"MAGN", 0x73, 6, 1, &data));
+    strm(&b)
+  };
+
+  let mut devc_body = Vec::new();
+  devc_body.extend_from_slice(&klv(b"DVNM", 0x63, 6, 1, b"Camera"));
+  devc_body.extend_from_slice(&klv(b"TMPC", 0x66, 4, 1, &42.5f32.to_be_bytes()));
+  devc_body.extend_from_slice(&accl_strm);
+  devc_body.extend_from_slice(&shut_strm);
+  devc_body.extend_from_slice(&stmp_strm);
+  devc_body.extend_from_slice(&magn_strm);
+  let devc = klv(b"DEVC", 0, 1, devc_body.len() as u16, &devc_body);
+
+  let mut gpmf_atom = ((devc.len() as u32) + 8).to_be_bytes().to_vec();
+  gpmf_atom.extend_from_slice(b"GPMF");
+  gpmf_atom.extend_from_slice(&devc);
+  let mut udta = ((gpmf_atom.len() as u32) + 8).to_be_bytes().to_vec();
+  udta.extend_from_slice(b"udta");
+  udta.extend_from_slice(&gpmf_atom);
+  let mut moov_body = Vec::new();
+  moov_body.extend_from_slice(&mvhd_atom);
+  moov_body.extend_from_slice(&udta);
+  let mut moov = ((moov_body.len() as u32) + 8).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  moov.extend_from_slice(&moov_body);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out
+}
+
+#[test]
+fn quicktime_gopro_sensor_streams_emit_binary_and_scaled_values() {
+  // R12-A — sensor streams + scalar conv families through the golden `tags()`
+  // path. Oracle (`perl exiftool 13.59 -ee`):
+  //   Accelerometer = "(Binary data 14 bytes, use -b option to extract)" (both)
+  //   ExposureTimes = "1/200 1/125" (PrintConv) / raw float list (ValueConv)
+  //   TimeStamp = 12.345678; CameraTemperature = "42.5 C" / 42.5;
+  //   Magnetometer = "0.1 0.2 0.3".
+  let data = build_mov_with_sensor_gpmf_in_udta();
+  let any = parse_bytes(&data).expect("recognized");
+
+  let collect = |mode| -> std::collections::HashMap<String, exifast::TagValue> {
+    any
+      .iter_tags(mode)
+      .filter(|t| t.group_ref().family0() == "GoPro")
+      .map(|t| (t.name().to_string(), t.value_ref().clone()))
+      .collect()
+  };
+  let pc = collect(ConvMode::PrintConv);
+  let nc = collect(ConvMode::ValueConv);
+  let s = |m: &std::collections::HashMap<String, exifast::TagValue>, k: &str| match m.get(k) {
+    Some(exifast::TagValue::Str(v)) => v.as_str().to_string(),
+    other => panic!("GoPro:{k} expected Str, got {other:?}"),
+  };
+
+  // `Binary => 1` placeholder in BOTH modes, N = 14 (the scaled "2 3 -0.5 1 2 4").
+  assert_eq!(
+    s(&pc, "Accelerometer"),
+    "(Binary data 14 bytes, use -b option to extract)"
+  );
+  assert_eq!(
+    s(&nc, "Accelerometer"),
+    "(Binary data 14 bytes, use -b option to extract)"
+  );
+  // SHUT: PrintExposureTime per element in `-j`; raw float list in `-n`.
+  assert_eq!(s(&pc, "ExposureTimes"), "1/200 1/125");
+  assert!(
+    s(&nc, "ExposureTimes").starts_with("0.0049999"),
+    "ValueConv ExposureTimes is the raw float list: {}",
+    s(&nc, "ExposureTimes")
+  );
+  // STMP `/1e6` (folded at decode): same in both modes.
+  match pc.get("TimeStamp") {
+    Some(&exifast::TagValue::F64(v)) => assert!((v - 12.345678).abs() < 1e-9),
+    other => panic!("TimeStamp {other:?}"),
+  }
+  // TMPC `"$val C"` in `-j`, raw F64 in `-n`.
+  assert_eq!(s(&pc, "CameraTemperature"), "42.5 C");
+  match nc.get("CameraTemperature") {
+    Some(&exifast::TagValue::F64(v)) => assert!((v - 42.5).abs() < 1e-9),
+    other => panic!("CameraTemperature -n {other:?}"),
+  }
+  // MAGN plain multi (scaled), same in both modes.
+  assert_eq!(s(&pc, "Magnetometer"), "0.1 0.2 0.3");
+  assert_eq!(s(&nc, "Magnetometer"), "0.1 0.2 0.3");
+}
+
+#[test]
+fn quicktime_gopro_multirow_binary_complex_emits_placeholder_per_row() {
+  // R12-A — a MULTI-ROW complex-`?` `Binary => 1` tag (CSEN, TYPE=LffffffLLLL,
+  // no SCAL). ExifTool's `\$val` is `\@rows`, so it emits a JSON ARRAY with ONE
+  // `(Binary data N bytes…)` per row, each N = that row's value-string length.
+  // Oracle (`perl exiftool 13.59 -ee`): two rows ⇒
+  // ["(Binary data 110 bytes, use -b option to extract)", <same>] (each raw row
+  // = "1000 0.100000001490116 … 10 20 30 40", 110 chars).
+  let data = build_mov_with_csen_two_rows_in_udta();
+  let any = parse_bytes(&data).expect("recognized");
+  let tag = any
+    .iter_tags(ConvMode::PrintConv)
+    .find(|t| t.group_ref().family0() == "GoPro" && t.name() == "CoyoteSense")
+    .expect("CoyoteSense emitted");
+  match tag.value_ref() {
+    exifast::TagValue::List(items) => {
+      assert_eq!(items.len(), 2, "one placeholder per row");
+      for it in items {
+        match it {
+          exifast::TagValue::Str(s) => {
+            assert_eq!(
+              s.as_str(),
+              "(Binary data 110 bytes, use -b option to extract)"
+            );
+          }
+          other => panic!("row placeholder expected Str, got {other:?}"),
+        }
+      }
+    }
+    other => panic!("multi-row Binary CSEN expected a List, got {other:?}"),
+  }
+}
+
+/// Build a `moov/udta/GPMF` `.mov` with a 2-row CSEN (`Binary` + complex `?`,
+/// TYPE=LffffffLLLL, no SCAL) for the multi-row-Binary placeholder test.
+fn build_mov_with_csen_two_rows_in_udta() -> Vec<u8> {
+  let csen_type = klv(b"TYPE", 0x63, 11, 1, b"LffffffLLLL");
+  let csen_row = || {
+    let mut r = 1000u32.to_be_bytes().to_vec();
+    for f in [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6] {
+      r.extend_from_slice(&f.to_be_bytes());
+    }
+    for v in [10u32, 20, 30, 40] {
+      r.extend_from_slice(&v.to_be_bytes());
+    }
+    r
+  };
+  let mut rows = csen_row();
+  rows.extend_from_slice(&csen_row());
+  let mut body = Vec::new();
+  body.extend_from_slice(&csen_type);
+  body.extend_from_slice(&klv(b"CSEN", 0x3f, 44, 2, &rows));
+  let csen_strm = strm(&body);
+
+  let mut devc_body = Vec::new();
+  devc_body.extend_from_slice(&klv(b"DVNM", 0x63, 6, 1, b"Camera"));
+  devc_body.extend_from_slice(&csen_strm);
+  let devc = klv(b"DEVC", 0, 1, devc_body.len() as u16, &devc_body);
+
+  let mut mvhd = vec![0u8; 4];
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let moov = mov_atom(
+    b"moov",
+    &[
+      mov_atom(b"mvhd", &mvhd),
+      mov_atom(b"udta", &mov_atom(b"GPMF", &devc)),
+    ]
+    .concat(),
+  );
+  let ftyp = mov_atom(b"ftyp", &{
+    let mut b = b"qt  ".to_vec();
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+  });
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out
+}
+
+#[test]
+fn quicktime_gopro_multirow_addunits_emits_array_with_units() {
+  // R12-A — a MULTI-ROW `%addUnits` complex-`?` tag (SIMU, TYPE=Lsssssssss,
+  // SCAL all 1000, SIUN=s,g,g,g,rad/s×3,T,T,T). ExifTool runs `AddUnits` per row
+  // (`$val = \@rows`): `-j` ⇒ a JSON array of per-row unit-interleaved strings,
+  // `-n` ⇒ a JSON array of bare per-row scaled strings (oracle-verified vs
+  // `perl exiftool 13.59 -ee`).
+  let data = build_mov_with_simu_two_rows_in_udta();
+  let any = parse_bytes(&data).expect("recognized");
+  let get = |mode| -> exifast::TagValue {
+    any
+      .iter_tags(mode)
+      .find(|t| t.group_ref().family0() == "GoPro" && t.name() == "ScaledIMU")
+      .map(|t| t.value_ref().clone())
+      .expect("ScaledIMU emitted")
+  };
+  let want_list = |v: exifast::TagValue, expect: &str| match v {
+    exifast::TagValue::List(items) => {
+      assert_eq!(items.len(), 2, "one entry per row");
+      for it in &items {
+        match it {
+          exifast::TagValue::Str(s) => assert_eq!(s.as_str(), expect),
+          other => panic!("row expected Str, got {other:?}"),
+        }
+      }
+    }
+    other => panic!("multi-row SIMU expected a List, got {other:?}"),
+  };
+  want_list(
+    get(ConvMode::PrintConv),
+    "1 s 0.1 g 0.2 g 0.3 g 0.4 rad/s 0.5 rad/s 0.6 rad/s 0.7 T 0.8 T 0.9 T",
+  );
+  want_list(
+    get(ConvMode::ValueConv),
+    "1 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9",
+  );
+}
+
+/// Build a `moov/udta/GPMF` `.mov` with a 2-row SIMU (`%addUnits` complex `?`,
+/// TYPE=Lsssssssss, SCAL all 1000, SIUN=s,g,g,g,rad/s,rad/s,rad/s,T,T,T) for the
+/// multi-row AddUnits test.
+fn build_mov_with_simu_two_rows_in_udta() -> Vec<u8> {
+  let units: [&[u8]; 10] = [
+    b"s", b"g", b"g", b"g", b"rad/s", b"rad/s", b"rad/s", b"T", b"T", b"T",
+  ];
+  let unit_payload: Vec<u8> = units
+    .iter()
+    .flat_map(|u| {
+      let mut c = u.to_vec();
+      c.resize(5, 0);
+      c
+    })
+    .collect();
+  let siun = klv(b"SIUN", 0x63, 5, 10, &unit_payload);
+  let simu_type = klv(b"TYPE", 0x63, 10, 1, b"Lsssssssss");
+  let scal_p: Vec<u8> = core::iter::repeat_n(1000u32, 10)
+    .flat_map(u32::to_be_bytes)
+    .collect();
+  let simu_scal = klv(b"SCAL", 0x4c, 4, 10, &scal_p);
+  let row = || {
+    let mut r = 1000u32.to_be_bytes().to_vec();
+    for v in [100i16, 200, 300, 400, 500, 600, 700, 800, 900] {
+      r.extend_from_slice(&v.to_be_bytes());
+    }
+    r
+  };
+  let mut rows = row();
+  rows.extend_from_slice(&row());
+  let mut body = Vec::new();
+  body.extend_from_slice(&siun);
+  body.extend_from_slice(&simu_type);
+  body.extend_from_slice(&simu_scal);
+  body.extend_from_slice(&klv(b"SIMU", 0x3f, 22, 2, &rows));
+  let simu_strm = strm(&body);
+
+  let mut devc_body = Vec::new();
+  devc_body.extend_from_slice(&klv(b"DVNM", 0x63, 6, 1, b"Camera"));
+  devc_body.extend_from_slice(&simu_strm);
+  let devc = klv(b"DEVC", 0, 1, devc_body.len() as u16, &devc_body);
+  let mut mvhd = vec![0u8; 4];
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let moov = mov_atom(
+    b"moov",
+    &[
+      mov_atom(b"mvhd", &mvhd),
+      mov_atom(b"udta", &mov_atom(b"GPMF", &devc)),
+    ]
+    .concat(),
+  );
+  let ftyp = mov_atom(b"ftyp", &{
+    let mut b = b"qt  ".to_vec();
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+  });
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out
+}
+
+/// Build a `.mov` with a `gpmd` metadata TRACK whose single sample has SIZE 0
+/// (stsz sz-table entry = 0), plus an `mdat` containing a buried GoPro
+/// `GP\x06\0\0` record. ExifTool reads the size-0 `gpmd` sample, enters
+/// `ProcessGoPro` (sets `FoundEmbedded`), and so SUPPRESSES the brute-force
+/// `mdat` scan — the buried GP6 is NOT extracted. (R12-B.)
+fn build_mov_with_empty_gpmd_sample_and_buried_gp6() -> Vec<u8> {
+  let ftyp = mov_atom(b"ftyp", &{
+    let mut b = b"qt  ".to_vec();
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+  });
+
+  // ── the buried GP6 record in mdat (a DEVC{DVNM} — would emit if scanned) ──
+  let gp6_devc = {
+    let inner = klv(b"DVNM", 0x63, 8, 1, b"BuriedGP");
+    klv(b"DEVC", 0, 1, inner.len() as u16, &inner)
+  };
+  let mut gp6 = b"GP\x06\0".to_vec();
+  gp6.extend_from_slice(&(gp6_devc.len() as u32).to_be_bytes());
+  gp6.extend_from_slice(&[0u8; 8]);
+  gp6.extend_from_slice(&gp6_devc);
+  let mut mdat_payload = vec![0u8; 64];
+  mdat_payload.extend_from_slice(&gp6);
+  mdat_payload.extend_from_slice(&[0u8; 64]);
+
+  let mvhd = mov_full(b"mvhd", &{
+    let mut b = vec![0u8; 8];
+    b.extend_from_slice(&1000u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&[0u8; 80]);
+    b
+  });
+  // mdhd (timescale 1000).
+  let mdhd = mov_full(b"mdhd", &{
+    let mut b = vec![0u8; 8];
+    b.extend_from_slice(&1000u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&[0u8; 4]);
+    b
+  });
+  // hdlr HandlerType='meta' (the walker reads byte 8 of the body).
+  let hdlr = mov_full(b"hdlr", &{
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(b"meta");
+    b.extend_from_slice(&[0u8; 12]);
+    b
+  });
+  // stsd, one entry, MetaFormat='gpmd'.
+  let stsd = {
+    let entry = {
+      let body = {
+        let mut bd = vec![0u8; 6];
+        bd.extend_from_slice(&1u16.to_be_bytes());
+        bd
+      };
+      let mut e = ((body.len() as u32) + 8).to_be_bytes().to_vec();
+      e.extend_from_slice(b"gpmd");
+      e.extend_from_slice(&body);
+      e
+    };
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&entry);
+    mov_atom(b"stsd", &b)
+  };
+  // stsz: sz=0 table, num=1, the one entry = 0 (the empty sample).
+  let stsz = {
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    mov_atom(b"stsz", &b)
+  };
+  let stsc = {
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&1u32.to_be_bytes());
+    mov_atom(b"stsc", &b)
+  };
+  let stco = {
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes()); // patched below
+    mov_atom(b"stco", &b)
+  };
+  let mut stbl_body = Vec::new();
+  stbl_body.extend_from_slice(&stsd);
+  stbl_body.extend_from_slice(&stsz);
+  stbl_body.extend_from_slice(&stsc);
+  stbl_body.extend_from_slice(&stco);
+  let stbl = mov_atom(b"stbl", &stbl_body);
+  let minf = mov_atom(b"minf", &stbl);
+  let mut mdia_body = Vec::new();
+  mdia_body.extend_from_slice(&mdhd);
+  mdia_body.extend_from_slice(&hdlr);
+  mdia_body.extend_from_slice(&minf);
+  let trak = mov_atom(b"trak", &mov_atom(b"mdia", &mdia_body));
+
+  let mut moov_body = Vec::new();
+  moov_body.extend_from_slice(&mvhd);
+  moov_body.extend_from_slice(&trak);
+  let moov = mov_atom(b"moov", &moov_body);
+  let mdat = mov_atom(b"mdat", &mdat_payload);
+
+  let mut out = Vec::new();
+  out.extend_from_slice(&ftyp);
+  out.extend_from_slice(&moov);
+  let mdat_payload_start = (out.len() + 8) as u32;
+  out.extend_from_slice(&mdat);
+  patch_stco_offset(&mut out, mdat_payload_start);
+  out
+}
+
+/// `[size:4][type:4][body]`.
+fn mov_atom(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+  let mut a = ((body.len() as u32) + 8).to_be_bytes().to_vec();
+  a.extend_from_slice(typ);
+  a.extend_from_slice(body);
+  a
+}
+
+/// A FullBox: `[size:4][type:4][version+flags:4][body]`.
+fn mov_full(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+  let mut b = vec![0u8; 4];
+  b.extend_from_slice(body);
+  mov_atom(typ, &b)
+}
+
+/// Patch the (single) `stco` chunk offset in an assembled `.mov` to `offset`.
+fn patch_stco_offset(out: &mut [u8], offset: u32) {
+  if let Some(pos) = out.windows(4).position(|w| w == b"stco") {
+    // stco layout after the 'stco' tag: [ver+flags:4][count:4][entry:4].
+    let entry = pos + 4 + 4 + 4;
+    if let Some(slot) = out.get_mut(entry..entry + 4) {
+      slot.copy_from_slice(&offset.to_be_bytes());
+    }
+  }
+}
+
+#[test]
+fn quicktime_empty_gpmd_sample_suppresses_mdat_scan() {
+  // R12-B — an EMPTY (size-0) `gpmd` GoPro sample must still set `FoundEmbedded`
+  // on `ProcessGoPro` ENTRY (GoPro.pm:822), so the brute-force `mdat` scan is
+  // SUPPRESSED (QuickTimeStream.pl:3689) and the buried GP6 `DVNM=BuriedGP`
+  // record is NOT extracted. Pre-fix, the port skipped the empty sample, left
+  // `FoundEmbedded` false, ran the scan, and emitted the buried record's tags.
+  let data = build_mov_with_empty_gpmd_sample_and_buried_gp6();
+  let meta = parse_quicktime(&data).expect("recognized");
+  let gp = meta.gopro();
+  assert_eq!(
+    gp.device_name(),
+    None,
+    "the buried GP6 record must NOT be scanned (empty gpmd set FoundEmbedded)"
+  );
+  assert!(
+    gp.is_empty(),
+    "no GoPro tags: the empty sample yielded none and the scan was suppressed"
+  );
+}
+
+#[test]
+fn quicktime_buried_gp6_is_scanned_without_a_gpmd_track() {
+  // Control for R12-B: the SAME buried GP6 record, but with NO gpmd track to
+  // set `FoundEmbedded` — here the brute-force `mdat` scan DOES run and extracts
+  // the record (proving the suppression above is caused by the empty sample,
+  // not by the GP6 being unreachable).
+  let data = build_mov_with_buried_gp6_no_track();
+  let meta = parse_quicktime(&data).expect("recognized");
+  assert_eq!(
+    meta.gopro().device_name(),
+    Some("BuriedGP"),
+    "without a gpmd track the buried GP6 is scanned and extracted"
+  );
+}
+
+/// The R12-B control fixture: the buried GP6 record in `mdat` with a plain
+/// (non-metadata) `moov` — no `gpmd` track, so the scan is not suppressed.
+fn build_mov_with_buried_gp6_no_track() -> Vec<u8> {
+  let ftyp = mov_atom(b"ftyp", &{
+    let mut b = b"qt  ".to_vec();
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+  });
+  let mut mvhd = vec![0u8; 4];
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&0u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let moov = mov_atom(b"moov", &mov_atom(b"mvhd", &mvhd));
+  let gp6_devc = {
+    let inner = klv(b"DVNM", 0x63, 8, 1, b"BuriedGP");
+    klv(b"DEVC", 0, 1, inner.len() as u16, &inner)
+  };
+  let mut gp6 = b"GP\x06\0".to_vec();
+  gp6.extend_from_slice(&(gp6_devc.len() as u32).to_be_bytes());
+  gp6.extend_from_slice(&[0u8; 8]);
+  gp6.extend_from_slice(&gp6_devc);
+  let mut mdat_payload = vec![0u8; 64];
+  mdat_payload.extend_from_slice(&gp6);
+  mdat_payload.extend_from_slice(&[0u8; 64]);
+  let mut out = ftyp;
+  out.extend_from_slice(&moov);
+  out.extend_from_slice(&mov_atom(b"mdat", &mdat_payload));
+  out
+}
