@@ -38,6 +38,10 @@
 //!   `"YYYY:MM:DD HH:MM:SS"` form with a trailing `"Z"` via
 //!   [`crate::datetime::convert_unix_time`] (Matroska.pm:1193-1198).
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use core::time::Duration;
 use smol_str::SmolStr;
 use std::{borrow::Cow, vec::Vec};
@@ -108,14 +112,18 @@ pub fn get_vint(buf: &[u8], pos: usize) -> Option<VInt> {
   if pos >= buf.len() {
     return None; // Matroska.pm:958 `return undef if $_[1] >= length $_[0]`
   }
-  let first = buf[pos];
+  // Checked-indexing (Phase C w2b): the `pos >= buf.len()` / `pos + 1 >=
+  // buf.len()` guards and the later `pos + first_consumed + num > buf.len()`
+  // guard make every `buf.get(..)` below `Some` ⇒ the fallbacks are
+  // unreachable and the reads are byte-identical.
+  let first = buf.get(pos).copied().unwrap_or(0);
   let mut num: usize = 0; // additional bytes to read
   let val_first = if first == 0 {
     // Matroska.pm:961-966 — leading zero byte ⇒ jump 7 ahead.
     if pos + 1 >= buf.len() {
       return None;
     }
-    let second = buf[pos + 1];
+    let second = buf.get(pos + 1).copied().unwrap_or(0);
     if second == 0 {
       return None; // Matroska.pm:964 `return undef unless $val` (too large)
     }
@@ -150,7 +158,7 @@ pub fn get_vint(buf: &[u8], pos: usize) -> Option<VInt> {
   let mut acc: i64 = i64::from(v);
   let mut i = 0usize;
   while i < num {
-    let b = buf[pos + first_consumed + i];
+    let b = buf.get(pos + first_consumed + i).copied().unwrap_or(0);
     if b != 0xff {
       unknown = false;
     }
@@ -2465,7 +2473,10 @@ const DEFAULT_GROUP: &str = "Matroska";
 /// (already-validated) magic-as-ID and the EBMLHeader body size, then
 /// descends into the EBML header sub-elements.
 fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
-  if data.len() < 4 || data[..4] != EBML_MAGIC {
+  // Checked-indexing (Phase C w2b): `data.get(..4) != Some(&EBML_MAGIC)` folds
+  // the old `data.len() < 4 || data[..4] != EBML_MAGIC` (the `Some` arm
+  // requires 4 bytes present) ⇒ byte-identical.
+  if data.get(..4) != Some(&EBML_MAGIC[..]) {
     return None; // Matroska.pm:996 — magic gate
   }
   // Matroska.pm:1003-1006 — verify the EBML header length BEFORE `SetFileType`.
@@ -2686,6 +2697,10 @@ fn walk(w: &mut Walker<'_>) {
     // a short / partial result (matches bundled Perl's behaviour when the
     // streaming-read shortens itself).
     let elem_end = elem_end_declared.min(data.len());
+    // Checked-indexing (Phase C w2b): `elem_end <= data.len()` (the `.min`
+    // above) and `w.pos <= elem_end` (elem_end derives from `w.pos + size`),
+    // so every `data.get(w.pos..elem_end)` body read below is `Some` ⇒
+    // `.unwrap_or(&[])` is byte-identical to the previous `data.get(w.pos..elem_end).unwrap_or(&[])`.
 
     // ---- Conditional IDs (Matroska.pm:294-307, 314-327, 329-342) -------
     // Three IDs map to different tag names based on `$$self{TrackType}`.
@@ -2693,7 +2708,7 @@ fn walk(w: &mut Walker<'_>) {
     // carries only the canonical placeholder rows for documentation).
     let id = id_v.value();
     if matches!(id, 0x3e383 | 0x06 | 0x58688) {
-      let body = &data[w.pos..elem_end];
+      let body = data.get(w.pos..elem_end).unwrap_or(&[]);
       if maybe_handle_conditional(w, id, body) {
         w.pos = elem_end;
         continue;
@@ -2764,7 +2779,7 @@ fn walk(w: &mut Walker<'_>) {
         // `Format => 'binary'` / `Binary => 1`. ExifTool emits these as
         // the no-`-b` placeholder `(Binary data <N> bytes, use -b option
         // to extract)` in both `-j` and `-n` modes.
-        let body = &data[w.pos..elem_end];
+        let body = data.get(w.pos..elem_end).unwrap_or(&[]);
         // Matroska.pm:1224-1226 — if a SimpleTag struct is active, route
         // ALL leaf-kind children into the struct (or silently drop if no
         // modeled slot) instead of emitting a top-level tag. Last-wins
@@ -2787,7 +2802,7 @@ fn walk(w: &mut Walker<'_>) {
         // PrintConv is resolved at emit time via the tag-name lookup
         // (`kind_for_name` in `emit_one`), so the `pc` payload here is
         // discarded.
-        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        let raw = decode_unsigned(data.get(w.pos..elem_end).unwrap_or(&[]));
         // ----- TrackType bookkeeping (Matroska.pm:267-282) ---------------
         // Order: bookkeeping FIRST, absorb-or-emit decision SECOND. This
         // mirrors Matroska.pm:1203-1217 (bookkeeping inside `if
@@ -2819,7 +2834,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::Signed(_pc) => {
-        let raw = decode_signed(&data[w.pos..elem_end]);
+        let raw = decode_signed(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
         // for ANY leaf child of an active SimpleTag.
         if w.simple_tag.is_some() {
@@ -2834,7 +2849,7 @@ fn walk(w: &mut Walker<'_>) {
         // FrameRate / SampleRate / Gamma / etc. (`Format => 'float'`,
         // Matroska.pm:1173-1180). A non-4/8-byte size is the
         // `Illegal float size` branch: `$val` stays UNDEF and bundled warns.
-        let body = &data[w.pos..elem_end];
+        let body = data.get(w.pos..elem_end).unwrap_or(&[]);
         let raw = decode_float(body);
         // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
         // for ANY leaf child of an active SimpleTag. (An illegal-size float
@@ -2867,7 +2882,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::AsciiString => {
-        let s = decode_ascii(&data[w.pos..elem_end]);
+        let s = decode_ascii(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
         // for ANY leaf child of an active SimpleTag. TagLanguage (0x47a,
         // Matroska.pm:688, `Format => 'string'`) is the concrete ascii-
@@ -2884,7 +2899,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::Utf8String => {
-        let s = decode_utf8(&data[w.pos..elem_end]);
+        let s = decode_utf8(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 `$$struct{$tagName} = $val if $struct`:
         // when an open SimpleTag struct is active, TagName / TagString
         // children populate the struct instead of being emitted as
@@ -2914,7 +2929,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::Date => {
-        let raw = decode_signed(&data[w.pos..elem_end]);
+        let raw = decode_signed(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
         // for ANY leaf child of an active SimpleTag.
         if w.simple_tag.is_some() {
@@ -2929,7 +2944,7 @@ fn walk(w: &mut Walker<'_>) {
         // Matroska.pm:33-36 — `Format => 'string'` + `ValueConv =>
         // 'unpack("H*",$val)'`. The bytes are the raw element body; we
         // store the lowercase-hex synthesis directly into a SmolStr.
-        let body = &data[w.pos..elem_end];
+        let body = data.get(w.pos..elem_end).unwrap_or(&[]);
         let hex = hex_lower(body);
 
         // Matroska.pm:1207-1209 — `TrackUID` inside a TrackEntry with
@@ -2996,7 +3011,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::TimecodeScale => {
-        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        let raw = decode_unsigned(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Bookkeeping FIRST (faithful to Perl `DataMember`/`RawConv`,
         // Matroska.pm:160-166), absorb-or-emit SECOND.
         w.timecode_scale_ns = Some(raw);
@@ -3015,7 +3030,7 @@ fn walk(w: &mut Walker<'_>) {
         // are deferred to output time and read the FINAL `$$self{
         // TimecodeScale}` (verified empirically with adversarial
         // fixtures — see `Value::DurationRawF64`).
-        let body = &data[w.pos..elem_end];
+        let body = data.get(w.pos..elem_end).unwrap_or(&[]);
         let raw = decode_float(body);
         let illegal = raw.is_none();
         if illegal {
@@ -3046,7 +3061,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::DefaultDuration => {
-        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        let raw = decode_unsigned(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
         // an active SimpleTag.
         if w.simple_tag.is_some() {
@@ -3058,7 +3073,7 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::VideoFrameRate => {
-        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        let raw = decode_unsigned(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
         // an active SimpleTag.
         if w.simple_tag.is_some() {
@@ -3074,7 +3089,7 @@ fn walk(w: &mut Walker<'_>) {
         // defer ValueConv (`$val / 1e9`) + PrintConv (`ConvertDuration`) to
         // emit time. The `Chapter<n>` family-1 group is already in
         // `w.current_group` from the enclosing ChapterAtom enter.
-        let raw = decode_unsigned(&data[w.pos..elem_end]);
+        let raw = decode_unsigned(data.get(w.pos..elem_end).unwrap_or(&[]));
         // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
         // an active SimpleTag.
         if w.simple_tag.is_some() {
@@ -3237,18 +3252,21 @@ fn flush_simple_tag(w: &mut Walker<'_>) {
 /// `2010:12:31T00:00:00-05:00`).
 fn date_separator_convert(s: &str) -> String {
   let bytes = s.as_bytes();
+  // Checked-indexing (Phase C w2b): the `bytes.len() >= 8` guard makes every
+  // `bytes.get(..)` / `s.get(..)` window below `Some` (all indices < 8 or
+  // open-ended) ⇒ byte-identical to the previous raw indexing.
   if bytes.len() >= 8 // YYYY-MM-D…
-    && bytes[..4].iter().all(|b| b.is_ascii_digit())
-    && bytes[4] == b'-'
-    && bytes[5..7].iter().all(|b| b.is_ascii_digit())
-    && bytes[7] == b'-'
+    && bytes.get(..4).is_some_and(|w| w.iter().all(|b| b.is_ascii_digit()))
+    && bytes.get(4) == Some(&b'-')
+    && bytes.get(5..7).is_some_and(|w| w.iter().all(|b| b.is_ascii_digit()))
+    && bytes.get(7) == Some(&b'-')
   {
     let mut out = String::with_capacity(s.len());
-    out.push_str(&s[..4]);
+    out.push_str(s.get(..4).unwrap_or(""));
     out.push(':');
-    out.push_str(&s[5..7]);
+    out.push_str(s.get(5..7).unwrap_or(""));
     out.push(':');
-    out.push_str(&s[8..]);
+    out.push_str(s.get(8..).unwrap_or(""));
     return out;
   }
   s.to_owned()
@@ -3283,7 +3301,9 @@ fn decode_signed(b: &[u8]) -> i64 {
     v = v.wrapping_mul(256).wrapping_add(i64::from(byte));
     over = over.wrapping_mul(256);
   }
-  if b[0] & 0x80 != 0 {
+  // Checked-indexing (Phase C w2b): the `b.is_empty()` early-return above means
+  // `b.first()` is `Some` ⇒ `.unwrap_or(&0)` is byte-identical to `b[0]`.
+  if b.first().copied().unwrap_or(0) & 0x80 != 0 {
     v = v.wrapping_sub(over);
   }
   v
@@ -3297,13 +3317,16 @@ fn decode_signed(b: &[u8]) -> i64 {
 /// undef→ValueConv leaf (`0` for `Duration`, `""` for a plain float — see the
 /// `Kind::Float` / `Kind::Duration` arms).
 fn decode_float(b: &[u8]) -> Option<f64> {
+  // Checked-indexing (Phase C w2b): the `match b.len()` arms guarantee the
+  // slice is exactly 4 / 8 bytes, so `try_into()` always succeeds ⇒
+  // byte-identical to the previous `[b[0], …]` array literals.
   match b.len() {
     4 => {
-      let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
+      let arr: [u8; 4] = b.try_into().ok()?;
       Some(f64::from(f32::from_be_bytes(arr)))
     }
     8 => {
-      let arr: [u8; 8] = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+      let arr: [u8; 8] = b.try_into().ok()?;
       Some(f64::from_be_bytes(arr))
     }
     _ => None,
@@ -3317,18 +3340,25 @@ fn decode_ascii(b: &[u8]) -> Cow<'_, str> {
   // ASCII is a UTF-8 subset; non-ASCII bytes here would be Latin-1 in Perl.
   // The fixture's `string`-format tags ("V_MPEG4/ISO/AVC", "und", etc.) are
   // pure ASCII. For non-ASCII bytes, lossy-convert to keep the &str shape.
-  match core::str::from_utf8(&b[..end]) {
+  //
+  // Checked-indexing (Phase C w2b): `end = position(0).unwrap_or(b.len())` so
+  // `end <= b.len()` ⇒ `b.get(..end)` is `Some` ⇒ byte-identical to `&b[..end]`.
+  let head = b.get(..end).unwrap_or(b);
+  match core::str::from_utf8(head) {
     Ok(s) => Cow::Borrowed(s),
-    Err(_) => Cow::Owned(String::from_utf8_lossy(&b[..end]).into_owned()),
+    Err(_) => Cow::Owned(String::from_utf8_lossy(head).into_owned()),
   }
 }
 
 /// Matroska.pm:1171-1172 — `utf8`: NUL-trimmed, decoded as UTF-8.
 fn decode_utf8(b: &[u8]) -> Cow<'_, str> {
   let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-  match core::str::from_utf8(&b[..end]) {
+  // Checked-indexing (Phase C w2b): `end <= b.len()` ⇒ `b.get(..end)` is
+  // `Some` ⇒ byte-identical to `&b[..end]`.
+  let head = b.get(..end).unwrap_or(b);
+  match core::str::from_utf8(head) {
     Ok(s) => Cow::Borrowed(s),
-    Err(_) => Cow::Owned(String::from_utf8_lossy(&b[..end]).into_owned()),
+    Err(_) => Cow::Owned(String::from_utf8_lossy(head).into_owned()),
   }
 }
 
@@ -3859,6 +3889,11 @@ fn maybe_handle_conditional<'a>(w: &mut Walker<'a>, id: i64, body: &'a [u8]) -> 
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

@@ -31,6 +31,10 @@
 //! triple whose type ∈ {2, 6, 11}, dispatch chunk 6 (chapter count),
 //! chunk 11 (cover art) or chunk 2 (UTF-8 dictionary).
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{fix_utf8, pack_c0u},
   format_parser::{FormatParser, parser_sealed},
@@ -266,11 +270,14 @@ fn unescape_html_bytes(bytes: &[u8]) -> Result<Vec<u8>, FatalEntityError> {
   }
   let mut out = Vec::with_capacity(bytes.len());
   let mut i = 0;
-  while i < bytes.len() {
-    if bytes[i] != b'&' {
+  // Checked-indexing (Phase C w2b): the `i < bytes.len()` guard makes
+  // `bytes.get(i)` `Some` exactly when the old `bytes[i]` was in range, so the
+  // `let Some(&cur) = …` binding lands on the identical byte ⇒ byte-identical.
+  while let Some(&cur) = bytes.get(i) {
+    if cur != b'&' {
       // Copy one byte verbatim — invalid UTF-8 lead/continuation bytes
       // survive untouched here and are later mapped to `?` by fix_utf8.
-      out.push(bytes[i]);
+      out.push(cur);
       i += 1;
       continue;
     }
@@ -281,8 +288,10 @@ fn unescape_html_bytes(bytes: &[u8]) -> Result<Vec<u8>, FatalEntityError> {
     let body_start = i + 1;
     let mut j = body_start;
     let mut allow_hash = true;
-    while j < bytes.len() {
-      let b = bytes[j];
+    // Checked-indexing (Phase C w2b): `bytes.get(j)` is `Some` exactly when
+    // the old `j < bytes.len()` + `bytes[j]` pair was in range; the loop exits
+    // on the same `;` / non-`\w` / end-of-input conditions ⇒ byte-identical.
+    while let Some(&b) = bytes.get(j) {
       if b == b';' {
         break;
       }
@@ -295,7 +304,9 @@ fn unescape_html_bytes(bytes: &[u8]) -> Result<Vec<u8>, FatalEntityError> {
       allow_hash = false;
       j += 1;
     }
-    if j == bytes.len() || bytes[j] != b';' || j == body_start {
+    // `bytes.get(j) != Some(&b';')` covers BOTH the old `j == bytes.len()`
+    // (out-of-range ⇒ `None`) and `bytes[j] != b';'` arms in one check.
+    if bytes.get(j) != Some(&b';') || j == body_start {
       // No `;`, OR the body is empty (`&;` doesn't match `\w+`) ⇒
       // literal `&`.
       out.push(b'&');
@@ -304,8 +315,11 @@ fn unescape_html_bytes(bytes: &[u8]) -> Result<Vec<u8>, FatalEntityError> {
     }
     // `entity` body is guaranteed `\w+` ASCII (we just enforced that
     // every byte in `body_start..j` is `[A-Za-z0-9_#]`), so the slice
-    // is valid UTF-8.
-    let entity = std::str::from_utf8(&bytes[body_start..j])
+    // is valid UTF-8. `body_start <= j <= len` ⇒ `.get()` is `Some`
+    // (byte-identical to the previous `&bytes[body_start..j]`).
+    let entity = bytes
+      .get(body_start..j)
+      .and_then(|s| std::str::from_utf8(s).ok())
       .expect("entity body is restricted to ASCII `\\w` chars");
     match resolve_html_entity_codepoint(entity) {
       EntityResolution::Resolved(code) => {
@@ -763,7 +777,13 @@ impl<'a> Meta<'a> {
 /// caller below guards that explicitly).
 fn get32u_be(bytes: &[u8], off: usize) -> u32 {
   debug_assert!(off + 4 <= bytes.len(), "Get32u out of range: off={off}");
-  u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+  // Checked-indexing (Phase C w2b): `.get(off..off+4)` early-returns `0` for an
+  // out-of-range window, which every CALLER's preceding bounds guard already
+  // excludes ⇒ byte-identical to the previous raw `bytes[off..]` reads.
+  match bytes.get(off..off.saturating_add(4)) {
+    Some(&[b0, b1, b2, b3, ..]) => u32::from_be_bytes([b0, b1, b2, b3]),
+    _ => 0,
+  }
 }
 
 /// AA parser (faithful `ProcessAA`, Audible.pm:194-273).
@@ -827,7 +847,10 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   if data_len < 16 {
     return None; // short read ⇒ Perl `return 0`
   }
-  if data[4..8] != [0x57, 0x90, 0x75, 0x36] {
+  // Checked-indexing (Phase C w2b): the `data_len < 16` guard above means
+  // `data.get(4..8)` is always `Some`; the magic-mismatch / out-of-range arms
+  // both land on the same `return None` (Perl `return 0`) ⇒ byte-identical.
+  if data.get(4..8) != Some(&[0x57, 0x90, 0x75, 0x36][..]) {
     return None; // magic mismatch ⇒ Perl `return 0`
   }
   // Audible.pm:203-206 — `defined $$et{VALUE}{FileSize}` AND
@@ -895,7 +918,11 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // Borrow the TOC slice from input (≤ 0xc00 = 3072 bytes). The labels
   // below need both the TOC view and the chunk-payload view; both
   // ultimately borrow from `data`, lifetimes coincide.
-  let toc: &[u8] = &data[toc_start..toc_end];
+  //
+  // Checked-indexing (Phase C w2b): the `toc_end > data_len` guard above
+  // makes `data.get(toc_start..toc_end)` always `Some` ⇒ `.unwrap_or(&[])`
+  // is byte-identical (the empty-slice arm is unreachable).
+  let toc: &[u8] = data.get(toc_start..toc_end).unwrap_or(&[]);
 
   // Audible.pm:215-271 — TOC walk. ExifTool processes chunks in TOC
   // order (entry index ascending); output tag order follows.
@@ -996,7 +1023,10 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     }
     // Borrow the chunk bytes directly from `data`. The borrow outlives
     // every push below (the accumulators are local).
-    let buf: &[u8] = &data[offset..chunk_end];
+    //
+    // Checked-indexing (Phase C w2b): the `chunk_end > data_len` guard above
+    // makes `data.get(offset..chunk_end)` always `Some` ⇒ byte-identical.
+    let buf: &[u8] = data.get(offset..chunk_end).unwrap_or(&[]);
 
     if chunk_type == 11 {
       // Audible.pm:229-235 — cover art. `length < 8` is implicit (we
@@ -1042,7 +1072,11 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
       // Audible.pm:234 — `HandleTag('_cover_art', substr($buff,
       // $off-$offset, $len))`. Borrow the cover bytes from input
       // (zero-copy via Cow::Borrowed).
-      let cover_bytes: &[u8] = &buf[cover_rel..cover_rel_end];
+      //
+      // Checked-indexing (Phase C w2b): `buf.len() == length` (buf is
+      // `data[offset..offset+length]`) and the `cover_rel_end > length` guard
+      // above makes `buf.get(cover_rel..cover_rel_end)` always `Some`.
+      let cover_bytes: &[u8] = buf.get(cover_rel..cover_rel_end).unwrap_or(&[]);
       handle_static_entry(
         &mut entries,
         "CoverArt",
@@ -1111,12 +1145,16 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
       // NOT decode it as UTF-8 (it's an opaque ASCII-ish identifier
       // like "product_id"). Treat as Latin-1 / ASCII (lossy_utf8 is
       // safe because every tag id encountered is ASCII).
-      let tag = String::from_utf8_lossy(&buf[tag_pos..val_pos]).into_owned();
+      // Checked-indexing (Phase C w2b): `buf.len() == length`, and the
+      // `tag_pos > length` / `nxt_pos > length` guards above with
+      // `tag_pos <= val_pos <= nxt_pos` make both `buf.get(..)` windows
+      // always `Some` ⇒ `.unwrap_or(&[])` is byte-identical.
+      let tag = String::from_utf8_lossy(buf.get(tag_pos..val_pos).unwrap_or(&[])).into_owned();
       // Audible.pm:261 — `$val = $et->Decode(UnescapeHTML($val),
       // 'UTF8')`. The Perl pipeline operates on raw bytes (see
       // unescape_html_bytes docs); R9: a numeric entity above Perl's
       // pack('C0U') i64::MAX cap is fatal.
-      let unescaped_bytes = match unescape_html_bytes(&buf[val_pos..nxt_pos]) {
+      let unescaped_bytes = match unescape_html_bytes(buf.get(val_pos..nxt_pos).unwrap_or(&[])) {
         Ok(b) => b,
         Err(FatalEntityError) => {
           errors.push(SmolStr::new_static(
@@ -1404,6 +1442,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;

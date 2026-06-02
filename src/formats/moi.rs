@@ -37,6 +37,10 @@
 //! second-stage validation that follows the `V6` magic number gate
 //! registered in `filetype_data::magic` (ExifTool.pm:998).
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use core::time::Duration;
 use jiff::civil::DateTime;
 
@@ -474,10 +478,14 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // MOI.pm:110 — `$raf->Read($buff,256) == 256 and $buff =~ /^V6/ or
   // return 0`. The 256-byte read AND the `V6` prefix are BOTH required.
   let total_len = data.len();
-  if total_len < 256 {
+  // Checked-indexing (Phase C w2b): take the 256-byte head via `.get(..256)`;
+  // the `Some` arm is the same in-bounds slice the old `data[..256]` produced,
+  // the `None` arm replaces the old `total_len < 256 { return None }` guard ⇒
+  // byte-identical (a `< 256` buffer still returns `None`).
+  let Some(head_slice) = data.get(..256) else {
     return None;
-  }
-  let head: &[u8; 256] = data[..256]
+  };
+  let head: &[u8; 256] = head_slice
     .try_into()
     .expect("256-byte head is exactly 256 bytes");
   if &head[..2] != b"V6" {
@@ -530,7 +538,13 @@ fn parse_version(b: &[u8]) -> &str {
   // Trimmed slice is ASCII in every real file; from_utf8 is safe to attempt.
   // We accept any byte sequence and pass through invalid UTF-8 as the empty
   // string (defensive — never happens for camcorder-emitted files).
-  core::str::from_utf8(&b[..end]).unwrap_or("")
+  //
+  // Checked-indexing (Phase C w2b): `end` is a `rposition`-derived index into
+  // `b` (`0 <= end <= b.len()`), so `b.get(..end)` is always `Some` ⇒
+  // byte-identical to the previous `&b[..end]`.
+  b.get(..end)
+    .and_then(|s| core::str::from_utf8(s).ok())
+    .unwrap_or("")
 }
 
 /// MOI.pm:32-40 — DateTimeOriginal ValueConv.
@@ -544,12 +558,20 @@ fn parse_version(b: &[u8]) -> &str {
 /// return `None`. In practice every camcorder-generated MOI file has
 /// well-formed components; the `None` arm is defensive.
 fn parse_datetime_original(b: &[u8]) -> Option<DateTime> {
-  let year = u16::from_be_bytes([b[0], b[1]]);
-  let month = b[2];
-  let day = b[3];
-  let hour = b[4];
-  let minute = b[5];
-  let ms = u16::from_be_bytes([b[6], b[7]]);
+  // Checked-indexing (Phase C w2b): the caller passes the fixed 8-byte
+  // `head[0x06..0x0e]` window, so `b.get(..8)` is always `Some` and the
+  // destructure binds the same bytes the old `b[0]`..`b[7]` reads did ⇒
+  // byte-identical. The `None` arm (unreachable for the fixed-width caller)
+  // drops the tag, matching the function's existing out-of-range behaviour.
+  let &[b0, b1, b2, b3, b4, b5, b6, b7] = b.get(..8)? else {
+    return None;
+  };
+  let year = u16::from_be_bytes([b0, b1]);
+  let month = b2;
+  let day = b3;
+  let hour = b4;
+  let minute = b5;
+  let ms = u16::from_be_bytes([b6, b7]);
   // Decompose ms into integer seconds + remainder ms; the jiff DateTime
   // constructor takes second (i8, 0..=59) and subsec_nanosecond (i32).
   let second_int = (ms / 1000) as u32;
@@ -579,7 +601,13 @@ fn parse_datetime_original(b: &[u8]) -> Option<DateTime> {
 /// bit-exactly. The emit path divides by 1000.0 to produce the JSON
 /// float (Perl's float division semantics).
 fn parse_duration(b: &[u8]) -> Option<Duration> {
-  let ms = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+  // Checked-indexing (Phase C w2b): caller passes the fixed 4-byte
+  // `head[0x0e..0x12]` window ⇒ `b.get(..4)` is always `Some`; byte-identical
+  // to the previous `u32::from_be_bytes([b[0]..b[3]])`.
+  let &[b0, b1, b2, b3] = b.get(..4)? else {
+    return None;
+  };
+  let ms = u32::from_be_bytes([b0, b1, b2, b3]);
   Some(Duration::from_millis(u64::from(ms)))
 }
 
@@ -596,7 +624,14 @@ fn audio_bitrate_value_conv(raw: u8) -> u32 {
 /// Maps two on-disk codes to known bitrates; everything else returns the
 /// raw u16 for PrintHex fallback rendering.
 fn parse_video_bitrate(b: &[u8]) -> VideoBitrate {
-  let code = u16::from_be_bytes([b[0], b[1]]);
+  // Checked-indexing (Phase C w2b): caller passes the fixed 2-byte
+  // `head[0xda..0xdc]` window, so `b.first()`/`b.get(1)` are always `Some`;
+  // `.copied().unwrap_or(0)` is byte-identical (the `0` default is
+  // unreachable for the fixed-width caller).
+  let code = u16::from_be_bytes([
+    b.first().copied().unwrap_or(0),
+    b.get(1).copied().unwrap_or(0),
+  ]);
   match code {
     0x5896 => VideoBitrate::Known(8_500_000), // MOI.pm:93
     0x813d => VideoBitrate::Known(5_500_000), // MOI.pm:94
@@ -862,6 +897,11 @@ fn aspect_ratio_raw(ar: AspectRatio) -> u8 {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;
