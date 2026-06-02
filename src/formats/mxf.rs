@@ -94,6 +94,10 @@
 //!   set is `#[non_exhaustive]` so they can be added without a breaking
 //!   change when a fixture needs them.
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 use std::{borrow::Cow, string::String, vec::Vec};
 
@@ -130,16 +134,19 @@ fn ul_notation(key: &[u8]) -> SmolStr {
   if key.len() < 16 {
     return SmolStr::default();
   }
+  // The `key.len() < 16` guard above proves every group below is in range, so
+  // each `.get(..)` hits; `unwrap_or(&[])` is the unreachable fallback
+  // (byte-identical to the raw `&key[a..b]`).
   let mut s = String::with_capacity(36);
-  push_hex(&mut s, &key[0..4]);
+  push_hex(&mut s, key.get(0..4).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &key[4..6]);
+  push_hex(&mut s, key.get(4..6).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &key[6..8]);
+  push_hex(&mut s, key.get(6..8).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &key[8..12]);
+  push_hex(&mut s, key.get(8..12).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &key[12..16]);
+  push_hex(&mut s, key.get(12..16).unwrap_or(&[]));
   SmolStr::new(&s)
 }
 
@@ -166,16 +173,19 @@ fn guid_notation(key: &[u8]) -> String {
   if key.len() < 16 {
     return hex_all(key);
   }
+  // The `key.len() < 16` guard above proves every group below is in range, so
+  // each `.get(..)` hits; `unwrap_or(&[])` is the unreachable fallback
+  // (byte-identical to the raw `&key[a..b]`).
   let mut s = String::with_capacity(36);
-  push_hex(&mut s, &key[0..4]);
+  push_hex(&mut s, key.get(0..4).unwrap_or(&[]));
   s.push('-');
-  push_hex(&mut s, &key[4..6]);
+  push_hex(&mut s, key.get(4..6).unwrap_or(&[]));
   s.push('-');
-  push_hex(&mut s, &key[6..8]);
+  push_hex(&mut s, key.get(6..8).unwrap_or(&[]));
   s.push('-');
-  push_hex(&mut s, &key[8..10]);
+  push_hex(&mut s, key.get(8..10).unwrap_or(&[]));
   s.push('-');
-  push_hex(&mut s, &key[10..16]);
+  push_hex(&mut s, key.get(10..16).unwrap_or(&[]));
   s
 }
 
@@ -1403,8 +1413,10 @@ fn read_ber_length(buf: &[u8], pos: usize) -> Option<BerLength> {
   }
   // MXF.pm:2863-2865 `$len = $len * 256 + $b`. Reject (None) any length
   // that overflows `u64` — a wrapped length would misalign the walker.
+  // The `pos + 1 + n > buf.len()` guard above ≡ `.get()` returning `None`
+  // (byte-identical; the `?` early-return matches the guard's `return None`).
   let mut len: u64 = 0;
-  for &b in &buf[pos + 1..pos + 1 + n] {
+  for &b in buf.get(pos + 1..pos + 1 + n)? {
     len = len.checked_mul(256)?.checked_add(u64::from(b))?;
   }
   Some(BerLength {
@@ -1460,7 +1472,12 @@ fn decode_utf16(bytes: &[u8]) -> String {
   let mut out = String::with_capacity(bytes.len() / 2);
   let mut i = 0;
   while i + 1 < bytes.len() {
-    let pair = [bytes[i], bytes[i + 1]];
+    // The `i + 1 < bytes.len()` loop bound proves this 2-byte window exists,
+    // so the destructure always binds (byte-identical; `break` ≡ the loop exit).
+    let Some(&[hi, lo]) = bytes.get(i..i + 2) else {
+      break;
+    };
+    let pair = [hi, lo];
     let unit = if little_endian {
       u16::from_le_bytes(pair)
     } else {
@@ -1474,9 +1491,10 @@ fn decode_utf16(bytes: &[u8]) -> String {
       break;
     }
     if (0xd800..0xdc00).contains(&unit) {
-      // High surrogate — pair with the following low surrogate.
-      if i + 1 < bytes.len() {
-        let lo_pair = [bytes[i], bytes[i + 1]];
+      // High surrogate — pair with the following low surrogate. `i + 1 <
+      // bytes.len()` ⇒ `.get(i..i+2)` is `Some` (byte-identical to `bytes[i..]`).
+      if let Some(&[lh, ll]) = bytes.get(i..i + 2) {
+        let lo_pair = [lh, ll];
         let lo = if little_endian {
           u16::from_le_bytes(lo_pair)
         } else {
@@ -1511,9 +1529,12 @@ fn decode_utf16(bytes: &[u8]) -> String {
 /// a `String` shape.
 fn decode_ascii(bytes: &[u8]) -> String {
   let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
-  match core::str::from_utf8(&bytes[..end]) {
+  // `end <= bytes.len()` (a `position` index or `bytes.len()`), so `.get(..end)`
+  // always hits; `unwrap_or(&[])` is the unreachable fallback (byte-identical).
+  let head = bytes.get(..end).unwrap_or(&[]);
+  match core::str::from_utf8(head) {
     Ok(s) => s.to_owned(),
-    Err(_) => bytes[..end].iter().map(|&b| b as char).collect(),
+    Err(_) => head.iter().map(|&b| b as char).collect(),
   }
 }
 
@@ -1538,7 +1559,9 @@ fn decode_int(bytes: &[u8]) -> i64 {
     v = v.wrapping_mul(256).wrapping_add(i64::from(b));
     over = over.wrapping_mul(256);
   }
-  if bytes[0] & 0x80 != 0 {
+  // The `bytes.is_empty()` guard above proves byte 0 exists, so `.first()`
+  // hits; the `0` fallback is unreachable (byte-identical to `bytes[0]`).
+  if bytes.first().copied().unwrap_or(0) & 0x80 != 0 {
     v = v.wrapping_sub(over);
   }
   v
@@ -1555,8 +1578,17 @@ fn decode_timestamp(bytes: &[u8]) -> String {
   if bytes.len() < 2 {
     return format!("Invalid (0x{})", hex_all(bytes));
   }
-  let year = u32::from(u16::from_be_bytes([bytes[0], bytes[1]]));
-  let rest: Vec<u32> = bytes[2..].iter().map(|&b| u32::from(b)).collect();
+  // The `bytes.len() < 2` guard above proves bytes 0..2 exist; `.get(2..)` is
+  // then also `Some` (byte-identical; the `unwrap_or` fallbacks are unreachable).
+  let year = bytes.get(0..2).map_or(0, |b| {
+    u32::from(u16::from_be_bytes(b.try_into().unwrap_or_default()))
+  });
+  let rest: Vec<u32> = bytes
+    .get(2..)
+    .unwrap_or(&[])
+    .iter()
+    .map(|&b| u32::from(b))
+    .collect();
   // MXF.pm:2495-2499 — walk fields against `@max`, shifting on each valid
   // field; if `@max` is non-empty at the end (a field exceeded its max OR
   // a field was missing) the value is `Invalid`.
@@ -1566,7 +1598,9 @@ fn decode_timestamp(bytes: &[u8]) -> String {
   fields.extend_from_slice(&rest);
   let mut max_idx = 0usize;
   for &f in &fields {
-    if max_idx >= max.len() || f > max[max_idx] {
+    // The `max_idx >= max.len()` short-circuit guards the index, so
+    // `.get(max_idx)` matches the raw `max[max_idx]` (byte-identical).
+    if max_idx >= max.len() || max.get(max_idx).is_some_and(|&m| f > m) {
       break;
     }
     max_idx += 1;
@@ -1574,15 +1608,14 @@ fn decode_timestamp(bytes: &[u8]) -> String {
   if max_idx < max.len() {
     return format!("Invalid (0x{})", hex_all(bytes));
   }
-  // MXF.pm:2503-2504 — `$a[6] *= 4` then the sprintf. All seven fields are
-  // present and in range here.
-  let y = fields[0];
-  let mo = fields[1];
-  let d = fields[2];
-  let h = fields[3];
-  let mi = fields[4];
-  let s = fields[5];
-  let ms = fields[6] * 4;
+  // MXF.pm:2503-2504 — `$a[6] *= 4` then the sprintf. The loop above advanced
+  // `max_idx` to `max.len()` (== 7) only by passing 7 in-range fields, so
+  // `fields.len() >= 7` and `first_chunk` always hits; the `Invalid` fallback
+  // mirrors the out-of-range recovery (byte-identical, unreachable here).
+  let Some(&[y, mo, d, h, mi, s, ms_raw]) = fields.first_chunk::<7>() else {
+    return format!("Invalid (0x{})", hex_all(bytes));
+  };
+  let ms = ms_raw * 4;
   format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
 }
 
@@ -1602,14 +1635,18 @@ fn decode_version_type(bytes: &[u8]) -> String {
 /// a release-type code mapped to a word; output `a.b.c.d <release>`.
 fn decode_product_version(bytes: &[u8]) -> String {
   // MXF.pm:2486 `unpack('n*', $val)` then pad to 5 entries with 0.
+  // `chunks_exact(2)` yields exactly-2-byte slices, so `try_into::<[u8;2]>`
+  // never fails (byte-identical to the raw `[c[0], c[1]]`).
   let mut a: Vec<u32> = bytes
     .chunks_exact(2)
-    .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+    .map(|c| u32::from(u16::from_be_bytes(c.try_into().unwrap_or_default())))
     .collect();
   while a.len() < 5 {
     a.push(0);
   }
-  let release = match a[4] {
+  // The pad loop guarantees `a.len() >= 5`, so `.get(4)` / `.get(..4)` hit;
+  // the fallbacks are unreachable (byte-identical to `a[4]` / `a[..4]`).
+  let release = match a.get(4).copied().unwrap_or(0) {
     0 => Cow::Borrowed("unknown"),
     1 => Cow::Borrowed("released"),
     2 => Cow::Borrowed("debug"),
@@ -1619,7 +1656,7 @@ fn decode_product_version(bytes: &[u8]) -> String {
     n => Cow::Owned(format!("unknown {n}")),
   };
   let mut s = String::new();
-  for (i, v) in a[..4].iter().enumerate() {
+  for (i, v) in a.get(..4).unwrap_or(&[]).iter().enumerate() {
     if i > 0 {
       s.push('.');
     }
@@ -1646,14 +1683,16 @@ fn decode_ul_type(bytes: &[u8]) -> String {
     // 2557-2561 `unpack('H*', $val)`).
     return hex_all(bytes);
   }
-  // MXF.pm:2553 — `return UL($val) unless unpack('C',$val) & 0x80`.
-  if bytes[0] & 0x80 == 0 {
+  // MXF.pm:2553 — `return UL($val) unless unpack('C',$val) & 0x80`. The
+  // `bytes.len() != 16` guard above proves byte 0 and both halves exist, so
+  // every `.get()` here hits; the fallbacks are unreachable (byte-identical).
+  if bytes.first().copied().unwrap_or(0) & 0x80 == 0 {
     return ul_notation(bytes).to_string();
   }
   // MXF.pm:2554 — reversed: `substr($val,8) . substr($val,0,8)`.
   let mut reordered = Vec::with_capacity(16);
-  reordered.extend_from_slice(&bytes[8..16]);
-  reordered.extend_from_slice(&bytes[0..8]);
+  reordered.extend_from_slice(bytes.get(8..16).unwrap_or(&[]));
+  reordered.extend_from_slice(bytes.get(0..8).unwrap_or(&[]));
   guid_notation(&reordered)
 }
 
@@ -1664,23 +1703,26 @@ fn decode_package_id(bytes: &[u8]) -> String {
   if bytes.len() != 32 {
     return hex_all(bytes);
   }
+  // The `bytes.len() != 32` guard above proves every group below is in range,
+  // so each `.get()` hits; `unwrap_or(&[])` is the unreachable fallback
+  // (byte-identical to the raw `&bytes[a..b]`).
   let mut s = String::with_capacity(70);
   // First group: H8 H4 H4 H8 dotted (bytes 0..12).
-  push_hex(&mut s, &bytes[0..4]);
+  push_hex(&mut s, bytes.get(0..4).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &bytes[4..6]);
+  push_hex(&mut s, bytes.get(4..6).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &bytes[6..8]);
+  push_hex(&mut s, bytes.get(6..8).unwrap_or(&[]));
   s.push('.');
-  push_hex(&mut s, &bytes[8..12]);
+  push_hex(&mut s, bytes.get(8..12).unwrap_or(&[]));
   s.push(' ');
   // Second group: x12 H2 H6 (bytes 12, 13..16) space-joined.
-  push_hex(&mut s, &bytes[12..13]);
+  push_hex(&mut s, bytes.get(12..13).unwrap_or(&[]));
   s.push(' ');
-  push_hex(&mut s, &bytes[13..16]);
+  push_hex(&mut s, bytes.get(13..16).unwrap_or(&[]));
   s.push(' ');
   // Third group: x16 H8H4H4H4H12 dashed (bytes 16..32).
-  s.push_str(&guid_notation(&bytes[16..32]));
+  s.push_str(&guid_notation(bytes.get(16..32).unwrap_or(&[])));
   s
 }
 
@@ -1706,9 +1748,15 @@ fn decode_ref_list(bytes: &[u8], guid_entries: bool) -> (RefList, bool) {
   if bytes.len() <= 16 {
     return (out, false);
   }
-  // MXF.pm:2526 `unpack('NN', $val)`.
-  let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-  let size = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+  // MXF.pm:2526 `unpack('NN', $val)`. The `bytes.len() <= 16` guard above
+  // proves bytes 0..8 exist, so these `.get()`s hit; the `0` fallbacks are
+  // unreachable and the 4-byte `try_into` never fails (byte-identical).
+  let count = bytes
+    .get(0..4)
+    .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default())) as usize;
+  let size = bytes
+    .get(4..8)
+    .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default())) as usize;
   // MXF.pm:2528 `$len == 8 + $count * $size or $et->Warn(...)`. Use
   // `checked_mul`/`checked_add` so a hostile count/size cannot overflow the
   // comparison (an overflowing product is `!= len`, i.e. ALSO bad).
@@ -1727,7 +1775,11 @@ fn decode_ref_list(bytes: &[u8], guid_entries: bool) -> (RefList, bool) {
     if size == 0 || entry_end > bytes.len() {
       break; // MXF.pm:2532 `last if $pos + $size > $len`.
     }
-    let entry = &bytes[pos..entry_end];
+    // `pos < entry_end <= bytes.len()` (the guard above + `size > 0`), so
+    // `.get()` always hits (byte-identical; `break` ≡ the overrun recovery).
+    let Some(entry) = bytes.get(pos..entry_end) else {
+      break;
+    };
     if guid_entries {
       out.push(guid_notation(entry));
     } else {
@@ -2082,7 +2134,9 @@ impl Walker {
 fn parse_inner(data: &[u8]) -> Option<MxfMeta<'_>> {
   // MXF.pm:2816-2818 — scan the first 65547 bytes for the run-in marker; the
   // KLV walk starts 11 bytes before the marker (the partition-pack UL).
-  let scan = &data[..data.len().min(RUN_IN_SCAN_LIMIT)];
+  // `data.len().min(RUN_IN_SCAN_LIMIT) <= data.len()`, so `.get(..n)` always
+  // hits (byte-identical to `&data[..n]`; the `?` reject is unreachable).
+  let scan = data.get(..data.len().min(RUN_IN_SCAN_LIMIT))?;
   let marker_at = find_subslice(scan, &MXF_RUN_IN_MARKER)?;
   let start = marker_at; // marker IS bytes 0..11 of the partition-pack UL.
 
@@ -2132,7 +2186,11 @@ fn parse_inner(data: &[u8]) -> Option<MxfMeta<'_>> {
     // `klv_start` is the offset of THIS KLV triplet — `$pos = $raf->Tell()`
     // at MXF.pm:2841, captured BEFORE the 17-byte read.
     let klv_start = pos;
-    let key = &data[pos..pos + 16];
+    // The `pos + 17 > data.len()` guard above proves bytes `pos..pos+16` exist,
+    // so `.get()` always hits (byte-identical; `break` ≡ the failed-read `last`).
+    let Some(key) = data.get(pos..pos + 16) else {
+      break;
+    };
     let ul = ul_notation(key);
     // BER length starts at pos+16; `read_ber_length` rejects (None) any
     // length too large to fit `u64`.
@@ -2155,7 +2213,11 @@ fn parse_inner(data: &[u8]) -> Option<MxfMeta<'_>> {
       // MXF.pm:2892/2914 — a truncated value ends the walk.
       break;
     }
-    let value = &data[value_start..value_end];
+    // `value_start <= value_end <= data.len()` (the `checked_add` + the guard
+    // above), so `.get()` always hits (byte-identical; `break` ≡ truncated `last`).
+    let Some(value) = data.get(value_start..value_end) else {
+      break;
+    };
 
     // Classify the top-level key (MXF.pm:2870-2879).
     let class = classify_top_level(&ul).or_else(|| {
@@ -2252,9 +2314,10 @@ fn process_header(w: &mut Walker, htype: &'static str, buf: &[u8]) {
   // `ValueConv => '$val =~ tr/ /./; $val'`. ProcessBinaryData renders an
   // `int16u[2]` as two space-joined integers; the ValueConv replaces the
   // space with a dot. The fixture's bytes are `00 01 00 02` ⇒ "1 2" ⇒ "1.2".
-  if buf.len() >= 4 {
-    let major = u16::from_be_bytes([buf[0], buf[1]]);
-    let minor = u16::from_be_bytes([buf[2], buf[3]]);
+  // `buf.get(0..4)` is `Some` iff `buf.len() >= 4` (byte-identical guard).
+  if let Some(&[b0, b1, b2, b3]) = buf.get(0..4) {
+    let major = u16::from_be_bytes([b0, b1]);
+    let minor = u16::from_be_bytes([b2, b3]);
     let mut s = String::new();
     push_dec(&mut s, u32::from(major));
     s.push('.');
@@ -2269,20 +2332,20 @@ fn process_header(w: &mut Walker, htype: &'static str, buf: &[u8]) {
   }
   // MXF.pm:2430-2434 — `FooterPosition`, offset 24, `int64u`,
   // `RawConv => '$$self{MXFInfo}{FooterPos} = $val; undef'`.
-  if buf.len() >= 32 {
-    w.footer_position = u64::from_be_bytes([
-      buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-    ]);
+  // `buf.get(24..32)` is `Some` iff `buf.len() >= 32`; the 8-byte `try_into`
+  // never fails (byte-identical to the raw `buf[24..32]` read).
+  if let Some(fp) = buf.get(24..32) {
+    w.footer_position = u64::from_be_bytes(fp.try_into().unwrap_or_default());
   }
   // MXF.pm:2435-2444 — `HeaderSize`, offset 32, `int64u`. The same `RawConv`
   // sets BOTH `$$self{MXFInfo}{HeaderType} = $$self{DIR_NAME}` (MXF.pm:2440)
   // AND `$$self{MXFInfo}{HeaderSize}` — so `HeaderType` is recorded ONLY
   // when the offset-32 field is present (the FIRST header pack wins, like
   // Perl's `$$self{DIR_NAME}` at the moment ProcessBinaryData runs).
-  if buf.len() >= 40 {
-    w.header_size = Some(u64::from_be_bytes([
-      buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
-    ]));
+  // `buf.get(32..40)` is `Some` iff `buf.len() >= 40`; the 8-byte `try_into`
+  // never fails (byte-identical to the raw `buf[32..40]` read).
+  if let Some(hs) = buf.get(32..40) {
+    w.header_size = Some(u64::from_be_bytes(hs.try_into().unwrap_or_default()));
     if w.header_type.is_none() {
       w.header_type = Some(SmolStr::new_static(htype));
     }
@@ -2302,20 +2365,34 @@ fn process_primer(w: &mut Walker, buf: &[u8]) {
   if buf.len() <= 8 {
     return;
   }
-  let count = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-  let size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+  // The `buf.len() <= 8` guard above proves bytes 0..8 exist; `.get()` then
+  // hits and the 4-byte `try_into` never fails (byte-identical).
+  let count = buf
+    .get(0..4)
+    .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default())) as usize;
+  let size = buf
+    .get(4..8)
+    .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default())) as usize;
   // MXF.pm:2577 `return 0 unless $size >= 18`.
   if size < 18 {
     return;
   }
   let mut pos = 8usize;
   for _ in 0..count {
-    // MXF.pm:2584 `last if $pos + $size > $end`.
+    // MXF.pm:2584 `last if $pos + $size > $end`. The guard + `size >= 18` prove
+    // `pos..pos+2` and `pos+2..pos+18` exist, so the `.get()`s hit (byte-identical;
+    // `break` ≡ the overrun `last`).
     if pos + size > buf.len() {
       break;
     }
-    let local = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-    let global = ul_notation(&buf[pos + 2..pos + 18]);
+    let Some(&[l0, l1]) = buf.get(pos..pos + 2) else {
+      break;
+    };
+    let local = u16::from_be_bytes([l0, l1]);
+    let Some(global_bytes) = buf.get(pos + 2..pos + 18) else {
+      break;
+    };
+    let global = ul_notation(global_bytes);
     w.primer.insert(local, global);
     pos += size;
   }
@@ -2349,14 +2426,19 @@ fn process_local_set(w: &mut Walker, dir_name: &'static str, buf: &[u8]) {
   // MXF.pm:2617-2618 — `while ($pos + 4 < $end)`.
   let mut pos = 0usize;
   while pos + 4 < end {
-    let loc = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-    let len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
-    pos += 4;
-    // MXF.pm:2622 `last if $pos + $len > $end`.
-    if pos + len > end {
+    // `pos + 4 < end == buf.len()` ⇒ bytes `pos..pos+4` exist, so the
+    // destructure binds (byte-identical; `break` ≡ the loop exit).
+    let Some(&[k0, k1, n0, n1]) = buf.get(pos..pos + 4) else {
       break;
-    }
-    let value_bytes = &buf[pos..pos + len];
+    };
+    let loc = u16::from_be_bytes([k0, k1]);
+    let len = u16::from_be_bytes([n0, n1]) as usize;
+    pos += 4;
+    // MXF.pm:2622 `last if $pos + $len > $end` ≡ `.get(pos..pos+len)` returning
+    // `None` (byte-identical; same `break` recovery).
+    let Some(value_bytes) = buf.get(pos..pos + len) else {
+      break;
+    };
     pos += len;
 
     // MXF.pm:2623 — resolve the local id to a global UL via the Primer.
@@ -2468,8 +2550,12 @@ fn process_local_set(w: &mut Walker, dir_name: &'static str, buf: &[u8]) {
   if let Some(inst) = instance {
     // Stamp every entry this set emitted with the owning InstanceUID
     // (MXF.pm:2701 `$$_{UID} = $instance foreach @groups`).
+    // Each `idx` was recorded from a just-pushed `w.entries` element, so it is
+    // always in range; `.get_mut()` hits (byte-identical to `w.entries[idx]`).
     for &idx in &entry_indices {
-      w.entries[idx].instance_uid = Some(inst.clone());
+      if let Some(e) = w.entries.get_mut(idx) {
+        e.instance_uid = Some(inst.clone());
+      }
     }
     let obj = w.objects.entry(inst.clone()).or_default();
     obj.name = SmolStr::new_static(dir_name);
@@ -2551,10 +2637,11 @@ fn decode_tag_value(def: &TagDef, bytes: &[u8], bad_array: &mut bool) -> Option<
       }
     }
     Kind::Rational64s => {
-      // `rational64s` = int32s numerator / int32s denominator.
-      if bytes.len() >= 8 {
-        let num = i64::from(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-        let den = i64::from(i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
+      // `rational64s` = int32s numerator / int32s denominator. `bytes.get(0..8)`
+      // is `Some` iff `bytes.len() >= 8` (byte-identical to the if/else).
+      if let Some(&[n0, n1, n2, n3, d0, d1, d2, d3]) = bytes.get(0..8) {
+        let num = i64::from(i32::from_be_bytes([n0, n1, n2, n3]));
+        let den = i64::from(i32::from_be_bytes([d0, d1, d2, d3]));
         MxfValue::Rational(num, den)
       } else {
         MxfValue::Rational(0, 1)
@@ -2793,7 +2880,12 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
   let mut best_duration_value: Option<(usize, MxfValue)> = None;
 
   for idx in (0..w.entries.len()).rev() {
-    let e = &w.entries[idx];
+    // `idx` ranges over `0..w.entries.len()`, so `.get(idx)` / `.get_mut(idx)`
+    // (`kept.len() == w.entries.len()`) always hit; the `continue` recovery
+    // matches the no-UID skip (byte-identical to `w.entries[idx]` / `kept[idx]`).
+    let Some(e) = w.entries.get(idx) else {
+      continue;
+    };
     let Some(uid) = &e.instance_uid else {
       continue; // MXF.pm:2949 `next` — no UID ⇒ never deduplicated.
     };
@@ -2801,7 +2893,9 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
     let utag = format!("{} {}", e.name, uid);
     if seen.contains(&utag) {
       // MXF.pm:2954 — duplicate ⇒ delete.
-      kept[idx] = false;
+      if let Some(k) = kept.get_mut(idx) {
+        *k = false;
+      }
     } else {
       seen.insert(utag);
       // MXF.pm:2957-2961 — best-duration synthesis.
@@ -2816,7 +2910,9 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
   // Assemble the surviving entries in file order.
   let mut out: Vec<MxfEntry> = Vec::new();
   for (idx, e) in w.entries.iter().enumerate() {
-    if !kept[idx] {
+    // `idx < w.entries.len() == kept.len()`, so `.get(idx)` always hits; the
+    // `true` fallback (keep) is unreachable (byte-identical to `!kept[idx]`).
+    if !kept.get(idx).copied().unwrap_or(true) {
       continue;
     }
     out.push(MxfEntry {
@@ -3018,6 +3114,11 @@ impl crate::metadata::Project for MxfMeta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   #[test]
