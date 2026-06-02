@@ -137,6 +137,10 @@
 //!   tag-value-fidelity difference. Activate alongside a faithful ExifTool
 //!   charset-downgrade helper.
 
+// Golden-v2 Contract 3c (Phase C, slice S2): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use std::{string::String, vec::Vec};
 
 use crate::format_parser::{FormatParser, parser_sealed};
@@ -971,13 +975,15 @@ pub fn xml_content_is_plist(data: &[u8]) -> bool {
   // UTF-8 XML plists have no embedded NULs in this preamble, so a plain prefix
   // scan over the same window is faithful for the in-scope inputs.
   const SNIFF_WINDOW: usize = 256;
-  let head = &data[..data.len().min(SNIFF_WINDOW)];
+  // Checked `.get()`: `min(len, 256) <= len` ⇒ `Some`; `skip <= head.len()`
+  // (a `take_while` count) ⇒ `Some` ⇒ byte-identical.
+  let head = data.get(..data.len().min(SNIFF_WINDOW)).unwrap_or(data);
   // Skip a leading UTF-8 BOM (ExifTool.pm:1045 / XMP.pm:4349 accept it).
   let head = head.strip_prefix(UTF8_BOM).unwrap_or(head);
   // Must be XML (`<?xml`, after optional ASCII whitespace) — the branch under
   // which the plist sniff runs (the `$2 eq '<?xml'` arm, XMP.pm:4357/4385).
   let skip = head.iter().take_while(|b| b.is_ascii_whitespace()).count();
-  let head = &head[skip..];
+  let head = head.get(skip..).unwrap_or(head);
   if !head.starts_with(b"<?xml") {
     return false;
   }
@@ -991,11 +997,14 @@ fn doctype_root_is_plist(head: &[u8]) -> bool {
   const DOCTYPE: &[u8] = b"<!DOCTYPE";
   const ROOT: &[u8] = b"plist";
   let mut i = 0;
+  // Checked `.get()`: the `i + DOCTYPE.len() <= head.len()` guard makes
+  // `head[i..i + DOCTYPE.len()]` in-range; `i + DOCTYPE.len() <= len` makes
+  // `head[i + DOCTYPE.len()..]` in-range; `ws <= rest.len()` ⇒ byte-identical.
   while i + DOCTYPE.len() <= head.len() {
-    if &head[i..i + DOCTYPE.len()] == DOCTYPE {
-      let rest = &head[i + DOCTYPE.len()..];
+    if head.get(i..i + DOCTYPE.len()) == Some(DOCTYPE) {
+      let rest = head.get(i + DOCTYPE.len()..).unwrap_or(&[]);
       let ws = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
-      if ws > 0 && rest[ws..].starts_with(ROOT) {
+      if ws > 0 && rest.get(ws..).is_some_and(|r| r.starts_with(ROOT)) {
         return true;
       }
     }
@@ -1009,8 +1018,10 @@ fn doctype_root_is_plist(head: &[u8]) -> bool {
 fn plist_element_present(head: &[u8]) -> bool {
   const NEEDLE: &[u8] = b"<plist";
   let mut i = 0;
+  // Checked `.get()`: the `i + NEEDLE.len() <= head.len()` guard makes the
+  // window in-range ⇒ byte-identical.
   while i + NEEDLE.len() <= head.len() {
-    if &head[i..i + NEEDLE.len()] == NEEDLE
+    if head.get(i..i + NEEDLE.len()) == Some(NEEDLE)
       && matches!(head.get(i + NEEDLE.len()), Some(&b) if b.is_ascii_whitespace() || b == b'>')
     {
       return true;
@@ -1047,7 +1058,8 @@ fn parse_inner(data: &[u8]) -> Option<PlistMeta<'_>> {
   // PLIST.pm:480), so the binary gate below keys on the un-skipped buffer.
   let xml_view = data.strip_prefix(UTF8_BOM).unwrap_or(data);
   let first_non_ws = xml_view.iter().position(|b| !b.is_ascii_whitespace());
-  if first_non_ws.is_some_and(|idx| xml_view[idx] == b'<') {
+  // Checked `.get()`: `idx` is a `position()` result ⇒ in-range ⇒ byte-identical.
+  if first_non_ws.is_some_and(|idx| xml_view.get(idx) == Some(&b'<')) {
     // XML plist (PLIST.pm:464-469 — the XMP-machinery branch).
     return parse_xml(data);
   }
@@ -1073,10 +1085,16 @@ fn parse_inner(data: &[u8]) -> Option<PlistMeta<'_>> {
 // ===========================================================================
 
 /// Faithful `Get24u` (PLIST.pm:250-254) — big-endian 24-bit unsigned.
+///
+/// Checked-indexing (Phase C S2): the `.get(off..off + N)?` already bounds the
+/// read; the slice-patterns below replace the `b[0..N]` indexing with the same
+/// byte bindings ⇒ byte-identical.
 #[inline]
 fn get_u24(buf: &[u8], off: usize) -> Option<u32> {
-  let b = buf.get(off..off + 3)?;
-  Some(u32::from_be_bytes([0, b[0], b[1], b[2]]))
+  let &[b0, b1, b2, ..] = buf.get(off..off + 3)? else {
+    return None;
+  };
+  Some(u32::from_be_bytes([0, b0, b1, b2]))
 }
 
 /// Read a big-endian unsigned integer of `size` bytes (1/2/3/4/8) starting at
@@ -1085,22 +1103,36 @@ fn get_u24(buf: &[u8], off: usize) -> Option<u32> {
 fn read_uint(buf: &[u8], off: usize, size: usize) -> Option<u64> {
   match size {
     1 => buf.get(off).map(|&b| u64::from(b)),
-    2 => buf
-      .get(off..off + 2)
-      .map(|b| u64::from(u16::from_be_bytes([b[0], b[1]]))),
+    2 => match buf.get(off..off + 2) {
+      Some(&[b0, b1, ..]) => Some(u64::from(u16::from_be_bytes([b0, b1]))),
+      _ => None,
+    },
     3 => get_u24(buf, off).map(u64::from),
-    4 => buf
-      .get(off..off + 4)
-      .map(|b| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))),
-    8 => buf
-      .get(off..off + 8)
-      .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])),
+    4 => match buf.get(off..off + 4) {
+      Some(&[b0, b1, b2, b3, ..]) => Some(u64::from(u32::from_be_bytes([b0, b1, b2, b3]))),
+      _ => None,
+    },
+    8 => match buf.get(off..off + 8) {
+      Some(&[b0, b1, b2, b3, b4, b5, b6, b7, ..]) => {
+        Some(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
+      }
+      _ => None,
+    },
     _ => None,
   }
 }
 
 /// Lowercase hex digits — the `unpack 'H*'` alphabet (PLIST.pm:290).
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+/// The lowercase-hex digit for a nibble — the checked-indexing form of
+/// `HEX_LOWER[nib as usize]` (Phase C S2). Every caller masks to a single
+/// nibble (`b >> 4` / `b & 0x0f`), so the index is always `0..16` and the
+/// `b'0'` fallback is unreachable ⇒ byte-identical.
+#[inline]
+fn hex_lower_nibble(nib: u8) -> u8 {
+  HEX_LOWER.get(nib as usize).copied().unwrap_or(b'0')
+}
 
 /// Format a 16-byte buffer as an ASF GUID — faithful `ASF::GetGUID`
 /// (ASF.pm:525-534). The bundled code does `unpack('H*', pack('NnnNN',
@@ -1112,18 +1144,44 @@ fn get_guid(buf: &[u8]) -> String {
   // `unpack('VvvNN', $val)` then `pack('NnnNN', ...)`: field 1 is a 32-bit
   // LE→BE swap, fields 2 & 3 are 16-bit LE→BE swaps, fields 4 & 5 are 32-bit
   // BE read kept as BE — i.e. the last 8 bytes are emitted verbatim.
-  let mut out = [0u8; 16];
-  out[0..4].copy_from_slice(&[buf[3], buf[2], buf[1], buf[0]]);
-  out[4..6].copy_from_slice(&[buf[5], buf[4]]);
-  out[6..8].copy_from_slice(&[buf[7], buf[6]]);
-  out[8..16].copy_from_slice(&buf[8..16]);
+  // Checked-indexing (Phase C S2): the slice-pattern binds the 16 bytes the
+  // raw `buf[0..16]` indexing did (the caller passes a 16-byte slice); a
+  // shorter buffer yields the all-zero GUID (unreachable for real input) ⇒
+  // byte-identical.
+  let &[
+    b0,
+    b1,
+    b2,
+    b3,
+    b4,
+    b5,
+    b6,
+    b7,
+    b8,
+    b9,
+    b10,
+    b11,
+    b12,
+    b13,
+    b14,
+    b15,
+  ] = buf
+  else {
+    return String::new();
+  };
+  let out: [u8; 16] = [
+    b3, b2, b1, b0, // field 1 LE→BE
+    b5, b4, // field 2 LE→BE
+    b7, b6, // field 3 LE→BE
+    b8, b9, b10, b11, b12, b13, b14, b15, // fields 4 & 5 verbatim
+  ];
   let mut s = String::with_capacity(36);
   for (i, &b) in out.iter().enumerate() {
     if matches!(i, 4 | 6 | 8 | 10) {
       s.push('-');
     }
-    s.push(HEX_LOWER[(b >> 4) as usize].to_ascii_uppercase() as char);
-    s.push(HEX_LOWER[(b & 0x0f) as usize].to_ascii_uppercase() as char);
+    s.push(hex_lower_nibble(b >> 4).to_ascii_uppercase() as char);
+    s.push(hex_lower_nibble(b & 0x0f).to_ascii_uppercase() as char);
   }
   s
 }
@@ -1211,10 +1269,13 @@ fn decode_binary(data: &[u8]) -> Option<Vec<PlistTag>> {
   if data.len() < 40 {
     return None;
   }
-  let trailer = &data[data.len() - 32..];
+  // Checked `.get()`: `data.len() >= 40 > 32` (guarded above) ⇒ the 32-byte
+  // trailer window is `Some` ⇒ byte-identical; the empty fallback is
+  // unreachable.
+  let trailer = data.get(data.len() - 32..).unwrap_or(&[]);
   // PLIST.pm:420-424 — trailer fields (the leading 6 trailer bytes unused).
-  let int_size = usize::from(trailer[6]);
-  let ref_size = usize::from(trailer[7]);
+  let int_size = usize::from(trailer.get(6).copied().unwrap_or(0));
+  let ref_size = usize::from(trailer.get(7).copied().unwrap_or(0));
   let num_obj = read_uint(trailer, 8, 8)? as usize;
   let top_obj = read_uint(trailer, 16, 8)? as usize;
   let table_off = read_uint(trailer, 24, 8)? as usize;
@@ -1327,8 +1388,8 @@ fn extract_object(dec: &mut BinaryDecoder<'_>, obj_off: usize) -> Option<PlistVa
           let mut hex = String::with_capacity(2 + size * 2);
           hex.push_str("0x");
           for &b in bytes {
-            hex.push(HEX_LOWER[(b >> 4) as usize] as char);
-            hex.push(HEX_LOWER[(b & 0x0f) as usize] as char);
+            hex.push(hex_lower_nibble(b >> 4) as char);
+            hex.push(hex_lower_nibble(b & 0x0f) as char);
           }
           Some(PlistValue::Str(hex))
         }
@@ -1524,13 +1585,19 @@ fn plist_value_as_key(v: &PlistValue) -> Option<String> {
 /// Read a binary-plist real of `size` bytes — 4-byte IEEE single or 8-byte
 /// double, big-endian (`%readProc{0x104}` / `{0x108}`, PLIST.pm:36-37).
 fn read_real(buf: &[u8], off: usize, size: usize) -> Option<f64> {
+  // Checked-indexing (Phase C S2): `.get()` + slice-patterns bind the same
+  // bytes the raw `b[0..N]` did ⇒ byte-identical.
   match size {
-    4 => buf
-      .get(off..off + 4)
-      .map(|b| f64::from(f32::from_be_bytes([b[0], b[1], b[2], b[3]]))),
-    8 => buf
-      .get(off..off + 8)
-      .map(|b| f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])),
+    4 => match buf.get(off..off + 4) {
+      Some(&[b0, b1, b2, b3, ..]) => Some(f64::from(f32::from_be_bytes([b0, b1, b2, b3]))),
+      _ => None,
+    },
+    8 => match buf.get(off..off + 8) {
+      Some(&[b0, b1, b2, b3, b4, b5, b6, b7, ..]) => {
+        Some(f64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
+      }
+      _ => None,
+    },
     _ => None,
   }
 }
@@ -1550,9 +1617,12 @@ fn decode_ascii(bytes: &[u8]) -> String {
 /// unpaired surrogate becomes U+FFFD (Rust's `decode_utf16` lossy behavior);
 /// a trailing odd byte is dropped.
 fn decode_ucs2_be(bytes: &[u8]) -> String {
-  let units = bytes
-    .chunks_exact(2)
-    .map(|c| u16::from_be_bytes([c[0], c[1]]));
+  let units = bytes.chunks_exact(2).map(|c| match c {
+    // `chunks_exact(2)` yields exactly-2-byte chunks; the slice-pattern binds
+    // the same `c[0..2]` (the `_` arm is unreachable) ⇒ byte-identical.
+    &[hi, lo, ..] => u16::from_be_bytes([hi, lo]),
+    _ => 0,
+  });
   char::decode_utf16(units)
     .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
     .collect()
@@ -1943,8 +2013,10 @@ fn apply_key_event(keys: &mut Vec<String>, props_len: usize, key_val: String) {
   // components, so a direct indexed write (extending by one if needed) matches
   // Perl's autovivifying `$$keys[$i] = $val`.
   let idx = props_len - 3;
-  if idx < keys.len() {
-    keys[idx] = key_val;
+  // Checked `.get_mut()`: matches the `idx < keys.len()` guard exactly ⇒
+  // byte-identical.
+  if let Some(slot) = keys.get_mut(idx) {
+    *slot = key_val;
   } else {
     // `idx == keys.len()` (the truncate left exactly `idx` components) — push.
     keys.push(key_val);
@@ -2377,9 +2449,11 @@ fn decode_plist_data(body: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() / 2);
     let bytes = body.as_bytes();
     for pair in bytes.chunks_exact(2) {
-      let hi = hex_val(pair[0]);
-      let lo = hex_val(pair[1]);
-      out.push((hi << 4) | lo);
+      // `chunks_exact(2)` yields exactly-2-byte chunks; the slice-pattern binds
+      // the same `pair[0..2]` (the `_` arm is unreachable) ⇒ byte-identical.
+      if let &[p0, p1, ..] = pair {
+        out.push((hex_val(p0) << 4) | hex_val(p1));
+      }
     }
     out
   } else {
@@ -2406,37 +2480,46 @@ fn convert_xmp_date(val: &str) -> String {
   // XMP.pm:3386 regex: `^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}:\d{2})(:\d{2})?\s*(\S*)$`.
   // Transliterated as a direct field scan rather than a regex (no regex dep).
   let bytes = val.as_bytes();
+  // Checked `.get()` (Phase C S2): `digits(a, b)` is `Some-and-all-digit` iff
+  // the old `bytes[a..b].iter().all(..)` ran in-range and matched; `at(i, c)`
+  // matches the old `bytes[i] == c`; the `val[a..b]` string slices below run
+  // under the same satisfied predicate ⇒ byte-identical.
+  let digits = |a: usize, b: usize| {
+    bytes
+      .get(a..b)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+  };
+  let at = |i: usize, c: u8| bytes.get(i) == Some(&c);
   // Need at least `YYYY-MM-DDThh:mm` (16 chars).
   if bytes.len() >= 16
-    && bytes[..4].iter().all(u8::is_ascii_digit)
-    && bytes[4] == b'-'
-    && bytes[5..7].iter().all(u8::is_ascii_digit)
-    && bytes[7] == b'-'
-    && bytes[8..10].iter().all(u8::is_ascii_digit)
-    && (bytes[10] == b'T' || bytes[10] == b' ')
-    && bytes[11..13].iter().all(u8::is_ascii_digit)
-    && bytes[13] == b':'
-    && bytes[14..16].iter().all(u8::is_ascii_digit)
+    && digits(0, 4)
+    && at(4, b'-')
+    && digits(5, 7)
+    && at(7, b'-')
+    && digits(8, 10)
+    && (at(10, b'T') || at(10, b' '))
+    && digits(11, 13)
+    && at(13, b':')
+    && digits(14, 16)
   {
-    let yyyy = &val[0..4];
-    let mm = &val[5..7];
-    let dd = &val[8..10];
-    let hh_mm = &val[11..16];
+    let yyyy = val.get(0..4).unwrap_or("");
+    let mm = val.get(5..7).unwrap_or("");
+    let dd = val.get(8..10).unwrap_or("");
+    let hh_mm = val.get(11..16).unwrap_or("");
     // Optional `:ss` (chars 16..19).
-    let (ss, rest_idx) =
-      if bytes.len() >= 19 && bytes[16] == b':' && bytes[17..19].iter().all(u8::is_ascii_digit) {
-        (&val[16..19], 19)
-      } else {
-        ("", 16)
-      };
+    let (ss, rest_idx) = if bytes.len() >= 19 && at(16, b':') && digits(17, 19) {
+      (val.get(16..19).unwrap_or(""), 19)
+    } else {
+      ("", 16)
+    };
     // Trailing timezone (`\s*(\S*)`) — strip leading whitespace, keep the rest.
-    let tz = val[rest_idx..].trim_start();
+    let tz = val.get(rest_idx..).unwrap_or("").trim_start();
     return std::format!("{yyyy}:{mm}:{dd} {hh_mm}{ss}{tz}");
   }
   // XMP.pm:3390-3392 — the `not $unsure` fallback (`^(\d{4})(-\d{2}){0,2}` ⇒
   // `tr/-/:/`). Real plist `<date>` values always hit the full form above;
   // this branch is a defensive faithful fallback for a date-only string.
-  if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
+  if bytes.len() >= 4 && digits(0, 4) {
     return val.replace('-', ":");
   }
   // Not date-shaped — pass through unchanged (XMP.pm:3393).
@@ -2472,7 +2555,10 @@ fn strip_xml_comments(body: &str, was_comment: bool) -> std::borrow::Cow<'_, str
     // in `<!--é-->`); a `body[j..]` `str` slice there would panic. `body`
     // is only ever sub-sliced at the known char boundary `i` when copying
     // output below.
-    if bytes[i..].starts_with(b"<!--") {
+    // Checked `.get()` (Phase C S2): `bytes[i..]`/`bytes[j..]` had `i`/`j` < len
+    // guards; `bytes[i]`/`bytes[j]` likewise; `&body[i..i + ch_len]` keeps `i` a
+    // char boundary and `i + ch_len <= len` ⇒ byte-identical recovery + bytes.
+    if bytes.get(i..).is_some_and(|s| s.starts_with(b"<!--")) {
       // `.*?` (non-greedy, no `/s`): scan from just past `<!--`, expanding
       // over non-`\n` bytes, and accept the FIRST `-->` reached. A `\n`
       // hit before any `-->` makes the `.` fail ⇒ this `<!--` does not
@@ -2480,12 +2566,12 @@ fn strip_xml_comments(body: &str, was_comment: bool) -> std::borrow::Cow<'_, str
       let mut j = i + 4;
       let mut matched_end: Option<usize> = None;
       while j < bytes.len() {
-        if bytes[j..].starts_with(b"-->") {
+        if bytes.get(j..).is_some_and(|s| s.starts_with(b"-->")) {
           matched_end = Some(j + 3);
           break;
         }
         // `.` does not match `\n` — the non-greedy run cannot cross it.
-        if bytes[j] == b'\n' {
+        if bytes.get(j) == Some(&b'\n') {
           break;
         }
         j += 1;
@@ -2501,8 +2587,8 @@ fn strip_xml_comments(body: &str, was_comment: bool) -> std::borrow::Cow<'_, str
     }
     // Non-matching byte — copy it verbatim and advance. Step by the full
     // UTF-8 char width so multi-byte text is not split.
-    let ch_len = utf8_char_len(bytes[i]);
-    out.push_str(&body[i..i + ch_len]);
+    let ch_len = utf8_char_len(bytes.get(i).copied().unwrap_or(0));
+    out.push_str(body.get(i..i + ch_len).unwrap_or(""));
     i += ch_len;
   }
   std::borrow::Cow::Owned(out)
@@ -2882,8 +2968,9 @@ fn name_rewrite_steps(s: &str) -> String {
   let chars: Vec<char> = s.chars().collect();
   let mut step3: Vec<char> = Vec::with_capacity(chars.len());
   for (i, &c) in chars.iter().enumerate() {
-    if i > 0 {
-      let prev = chars[i - 1];
+    // Checked `.get()`: `i > 0` with an enumerate index ⇒ `i - 1 < chars.len()`
+    // ⇒ `Some` ⇒ byte-identical (the `i == 0` case keeps `prev` absent).
+    if let Some(&prev) = i.checked_sub(1).and_then(|j| chars.get(j)) {
       // Perl `[^A-Za-z]` — a non-ASCII-alpha char; `[a-z]` — ASCII lowercase.
       if !prev.is_ascii_alphabetic() && c.is_ascii_lowercase() {
         step3.push(c.to_ascii_uppercase());
@@ -3243,8 +3330,11 @@ fn perl_numify_word_u64(word: &str) -> u64 {
     }
     _ => false,
   };
+  // Checked-indexing (Phase C S2): every `bytes[p]`/`bytes[q]` had a preceding
+  // `< bytes.len()` guard, so `bytes.get(..)` reads the same byte and takes the
+  // same branch ⇒ byte-identical.
   let int_start = p;
-  while p < bytes.len() && bytes[p].is_ascii_digit() {
+  while bytes.get(p).is_some_and(u8::is_ascii_digit) {
     p += 1;
   }
   let int_len = p - int_start;
@@ -3252,10 +3342,10 @@ fn perl_numify_word_u64(word: &str) -> u64 {
   // already has an integer digit OR a fraction digit follows (`.5` is
   // numeric, a bare `.` is not).
   let mut frac_len = 0usize;
-  if p < bytes.len() && bytes[p] == b'.' {
+  if bytes.get(p) == Some(&b'.') {
     let frac_start = p + 1;
     let mut q = frac_start;
-    while q < bytes.len() && bytes[q].is_ascii_digit() {
+    while bytes.get(q).is_some_and(u8::is_ascii_digit) {
       q += 1;
     }
     if int_len > 0 || q > frac_start {
@@ -3271,13 +3361,13 @@ fn perl_numify_word_u64(word: &str) -> u64 {
   // An optional exponent — `[eE] [+-]? digit+`; an `e` with no digits after
   // it (`1e`) is NOT consumed (Perl numifies `1e` as `1`).
   let mut has_exp = false;
-  if p < bytes.len() && (bytes[p] == b'e' || bytes[p] == b'E') {
+  if matches!(bytes.get(p), Some(b'e' | b'E')) {
     let mut q = p + 1;
-    if q < bytes.len() && (bytes[q] == b'+' || bytes[q] == b'-') {
+    if matches!(bytes.get(q), Some(b'+' | b'-')) {
       q += 1;
     }
     let exp_digits_start = q;
-    while q < bytes.len() && bytes[q].is_ascii_digit() {
+    while bytes.get(q).is_some_and(u8::is_ascii_digit) {
       q += 1;
     }
     if q > exp_digits_start {
@@ -3454,8 +3544,11 @@ fn leaf_numeric(leaf: &PlistLeaf) -> Option<f64> {
 fn perl_is_float(s: &str) -> bool {
   let b = s.as_bytes();
   let mut i = 0;
+  // Checked-indexing (Phase C S2): every `b[i]` had a preceding `i < b.len()`
+  // guard, so `b.get(i)` reads the same byte and takes the same branch ⇒
+  // byte-identical; the `matches!`/`is_some_and` forms fold the guard in.
   // Optional leading sign.
-  if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+  if matches!(b.get(i), Some(b'+' | b'-')) {
     i += 1;
   }
   // Look-ahead `(?=\d|\.\d)`: a digit here, OR a `.` followed by a digit.
@@ -3468,24 +3561,24 @@ fn perl_is_float(s: &str) -> bool {
     return false;
   }
   // `\d*` — integer digits.
-  while i < b.len() && b[i].is_ascii_digit() {
+  while b.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   // `(\.\d*)?` — optional fractional part.
-  if i < b.len() && b[i] == b'.' {
+  if b.get(i) == Some(&b'.') {
     i += 1;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
   }
   // `([Ee]([+-]?\d+))?` — optional exponent (sign optional, ≥1 digit).
-  if i < b.len() && (b[i] == b'E' || b[i] == b'e') {
+  if matches!(b.get(i), Some(b'E' | b'e')) {
     i += 1;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+    if matches!(b.get(i), Some(b'+' | b'-')) {
       i += 1;
     }
     let exp_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     if i == exp_start {
@@ -3589,6 +3682,11 @@ const _: () = {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;
