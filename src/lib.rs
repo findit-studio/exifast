@@ -124,6 +124,14 @@ pub mod metadata;
 #[cfg(feature = "json")]
 pub mod jsondiff;
 pub mod parser;
+// The unified error-recovery vocabulary (`Step`) — golden pattern Contract 1.
+// The typed name for "what bundled ExifTool does at this malformed-input point"
+// (`next` / `last` / detect-level `return 0`), replacing a bare
+// `break` / `continue` / `return None` whose abort-vs-skip decision was enforced
+// only by per-site review. The EXIF IFD walker is the reference impl. NOT
+// feature-gated — a 1-byte control-flow value with no heap, usable from every
+// build (incl. the `no_std` EXIF walker).
+pub mod recovery;
 // The lib-first `FormatParser` trait scaffold + closed-set `AnyParser` /
 // `AnyMeta` dispatch — the SOLE parser architecture. The engine entry
 // `parser::extract_info` routes through `any_parser_for(ft) ->

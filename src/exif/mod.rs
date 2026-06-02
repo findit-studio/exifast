@@ -86,6 +86,7 @@ pub mod jpeg;
 use std::{string::String, vec::Vec};
 
 use crate::format_parser::{FormatParser, parser_sealed};
+use crate::recovery::Step;
 use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, read_value};
 use tables::Conv;
 
@@ -1865,6 +1866,11 @@ impl Walker<'_, '_> {
   /// the IFD's end offset (`$dirStart + $dirSize`) — the out-of-line value
   /// bounds checks need it to detect a value that overlaps the directory.
   ///
+  /// The loop driver — the single Contract-1 recovery boundary that interprets
+  /// the [`Step`] each `walk_entry` returns. A continuing step
+  /// ([`Step::continues`], i.e. `Keep`/`Skip`) advances the entry loop, whereas
+  /// an `AbortDir` ([`Step::AbortDir`]) stops it.
+  ///
   /// Returns `false` to ABORT the whole directory (and its trailing-IFD
   /// chain) — the faithful `return 0` ExifTool takes either when entry 0
   /// carries a bad format code (`Exif.pm:6475-6477`) OR when an out-of-line
@@ -1903,13 +1909,25 @@ impl Walker<'_, '_> {
       {
         break;
       }
-      // `walk_entry` returns `false` to abort the WHOLE directory — the
-      // faithful `return 0` ExifTool takes when entry 0 has a bad format
-      // code (`Exif.pm:6475`) or an out-of-line value's RAF read overruns
-      // EOF (`Exif.pm:6602`). Propagate it to the caller so the next-IFD
-      // pointer is NOT followed.
-      if !self.walk_entry(entry, index, ifd_start, dir_end, kind) {
-        return false;
+      // `walk_entries` is the loop driver — the single recovery boundary that
+      // interprets the [`Step`] `walk_entry` returns (golden pattern Contract
+      // 1). `Keep`/`Skip` advance the entry loop (a normal entry, or a Perl
+      // `next` single-entry skip); `AbortDir` stops the WHOLE directory — the
+      // faithful `return 0` ExifTool takes when entry 0 has a bad format code
+      // (`Exif.pm:6475`) or an out-of-line value's RAF read overruns EOF
+      // (`Exif.pm:6602`) — which propagates to the caller (`return false`) so
+      // the next-IFD pointer is NOT followed. `Reject` (a detect/file-level
+      // `return 0`) is not produced inside the IFD entry loop; it stops the
+      // directory identically here. This reproduces the prior `bool` control
+      // flow exactly: old `true` == `Step::continues()`, old `false` ==
+      // `Step::AbortDir`.
+      match self.walk_entry(entry, index, ifd_start, dir_end, kind) {
+        step if step.continues() => {}
+        Step::AbortDir | Step::Reject => return false,
+        // `continues()` already covered `Keep`/`Skip`; this arm is unreachable
+        // but keeps the match exhaustive without a wildcard that could mask a
+        // future variant.
+        Step::Keep | Step::Skip => {}
       }
     }
     true
@@ -1955,12 +1973,25 @@ impl Walker<'_, '_> {
   /// value …` warning) and `ifd_start` / `dir_end` bound the IFD (used by
   /// the out-of-line value checks — see the `$size > 4` branch).
   ///
-  /// Returns `false` to ABORT the whole directory — the faithful `return 0`
-  /// ExifTool takes when entry 0 carries a bad format code (`Exif.pm:6475`)
-  /// OR when an out-of-line value's RAF read overruns EOF (`Error reading
-  /// value …`, `Exif.pm:6602`); `true` otherwise (a normal entry, or a
-  /// `next`-skip such as a `Suspicious offset` / `Wrong format` / undecodable
-  /// value, all of which CONTINUE in bundled).
+  /// Returns a [`Step`] (golden pattern Contract 1) naming what bundled
+  /// ExifTool does at the point this entry reached, which the loop driver
+  /// ([`walk_entries`](Self::walk_entries)) interprets:
+  ///
+  /// * [`Step::AbortDir`] — the faithful mid-walk `return 0` ExifTool takes
+  ///   when entry 0 carries a bad format code (`Exif.pm:6475`) OR when an
+  ///   out-of-line value's RAF read overruns EOF (`Error reading value …`,
+  ///   `Exif.pm:6602`): stop the WHOLE directory.
+  /// * [`Step::Skip`] — a Perl `next`: drop THIS entry and continue the IFD
+  ///   (a `Suspicious offset` / `Wrong format` / oversized / excessive-count /
+  ///   undecodable value, or an unreadable entry header).
+  /// * [`Step::Keep`] — a normal entry processed (leaf emitted, or a
+  ///   SubDirectory dispatched).
+  ///
+  /// (This walker never yields [`Step::Reject`] — that is the detect/file-level
+  /// `return 0`, raised by format detection, not inside the IFD entry loop.)
+  /// The mapping reproduces the prior `bool` return exactly: old `false` ==
+  /// [`Step::AbortDir`], old `true` == a [`Step::continues`] variant
+  /// ([`Step::Keep`]/[`Step::Skip`]).
   fn walk_entry(
     &mut self,
     entry: usize,
@@ -1968,18 +1999,20 @@ impl Walker<'_, '_> {
     ifd_start: usize,
     dir_end: usize,
     kind: IfdKind,
-  ) -> bool {
+  ) -> Step {
     let data = self.data;
     let order = self.order;
-    // `my $tagID = Get16u($dataPt, $entry)` etc.
+    // `my $tagID = Get16u($dataPt, $entry)` etc. An unreadable entry header
+    // (the caller's bounds guard already proved `entry+12 <= len`, so this is
+    // unreachable for an in-range entry) is a `next`-skip: [`Step::Skip`].
     let Some(tag_id) = get_u16(data, entry, order) else {
-      return true;
+      return Step::Skip;
     };
     let Some(format_code) = get_u16(data, entry + 2, order) else {
-      return true;
+      return Step::Skip;
     };
     let Some(count) = get_u32(data, entry + 4, order) else {
-      return true;
+      return Step::Skip;
     };
     let count = count as usize;
 
@@ -2010,8 +2043,17 @@ impl Walker<'_, '_> {
           "Bad format ({format_code}) for {dir} entry {index}"
         ));
       }
-      // `next if $index` — skip this entry; entry 0 ⇒ `return 0` (abort).
-      return index != 0;
+      // `next if $index` — skip this entry; ELSE (`$index == 0`) `return 0`
+      // (abort the directory). The single `.pm` site is BOTH control words:
+      // `next` (`Exif.pm:6476`) for entry index ≠ 0 ⇒ [`Step::Skip`], and the
+      // first-entry `return 0` (`Exif.pm:6475`/6477) ⇒ [`Step::AbortDir`].
+      // (The prior `bool` `index != 0` encoded exactly this: `true`==skip,
+      // `false`==abort — now the two control words are named.)
+      return if index != 0 {
+        Step::Skip
+      } else {
+        Step::AbortDir
+      };
     }
 
     // `my $size = $count * $formatSize[$format]` (Exif.pm:6502).
@@ -2045,11 +2087,13 @@ impl Walker<'_, '_> {
         self
           .warnings
           .push(std::format!("Invalid size ({size}) for {dir} {tag}"));
-        return true; // `next` — skip this entry, continue the IFD.
+        return Step::Skip; // `next` — skip this entry, continue the IFD.
       }
       let off = match get_u32(data, entry + 8, order) {
         Some(o) => o as usize,
-        None => return true,
+        // Unreadable offset bytes (unreachable given the caller's `entry+12`
+        // bounds guard) — a `next`-skip.
+        None => return Step::Skip,
       };
       // `$valuePtr -= $dataPos` — `$dataPos == 0` here (the whole block IS
       // the EXIF data). An out-of-line value pointer is subject to two
@@ -2120,7 +2164,8 @@ impl Walker<'_, '_> {
           // `return 0 unless $inMakerNotes or $htmlDump or $truncOK`
           // (Exif.pm:6602) — abort the directory (see the precedence note
           // above for why the exception never applies to this walker).
-          return false;
+          // [`Step::AbortDir`] = this mid-walk `return 0`.
+          return Step::AbortDir;
         }
       };
       // `$valuePtr < $dirEnd and $valuePtr+$size > $dirStart` (Exif.pm:6549):
@@ -2135,7 +2180,9 @@ impl Walker<'_, '_> {
           None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
         };
         self.warnings.push(warning);
-        return true;
+        // `next unless $verbose` (Exif.pm:6675) — skip this entry, CONTINUE
+        // the IFD: [`Step::Skip`].
+        return Step::Skip;
       }
       (off, size)
     } else {
@@ -2143,9 +2190,10 @@ impl Walker<'_, '_> {
       // (`$size <= 4`). The caller (`walk_entries`) already proved
       // `entry + 12 <= data.len()` with `checked_add`, so `entry + 8` cannot
       // overflow; `checked_add` keeps that explicit across the call boundary.
-      // An overflow (impossible given the caller's guard) skips the entry.
+      // An overflow (impossible given the caller's guard) skips the entry
+      // ([`Step::Skip`]).
       let Some(value_offset) = entry.checked_add(8) else {
-        return true;
+        return Step::Skip;
       };
       (value_offset, size)
     };
@@ -2178,10 +2226,14 @@ impl Walker<'_, '_> {
         self.warnings.push(std::format!(
           "Wrong format ({fmt}) for {dir} 0x{tag_id:04x} {name}"
         ));
-        return true;
+        // `next unless $verbose` (Exif.pm:6754) — skip the entry, the sub-IFD
+        // is NOT walked: [`Step::Skip`].
+        return Step::Skip;
       }
       self.dispatch_subdir(sub, value_offset, read_len, format, count);
-      return true;
+      // The SubDirectory was dispatched (recursed/captured) — a normal entry:
+      // [`Step::Keep`].
+      return Step::Keep;
     }
 
     // ---- Tag-table READ-side `Format` override --------------------------
@@ -2277,7 +2329,7 @@ impl Walker<'_, '_> {
               "Ignoring {dir} tag 0x{tag_id:04x} with excessive count"
             )),
           }
-          return true; // `next`
+          return Step::Skip; // `next` (Exif.pm:6768)
         }
       }
 
@@ -2300,7 +2352,11 @@ impl Walker<'_, '_> {
       if count > 500 && known.is_none() {
         let placeholder = large_array_placeholder(count, format);
         self.emit(kind, tag_id, RawValue::Text(placeholder));
-        return true;
+        // ExifTool sets `$val` to the placeholder and FALLS THROUGH to
+        // FoundTag (Exif.pm:6778-6779) — it does NOT `next` (the lone `next`
+        // is the `TAGS_FROM_FILE` copy-mode, not modelled). The placeholder
+        // tag IS emitted, so this is a processed entry: [`Step::Keep`].
+        return Step::Keep;
       }
     }
 
@@ -2322,11 +2378,14 @@ impl Walker<'_, '_> {
       format
     };
     let Some(raw) = read_value(data, value_offset, decode_format, count, read_len, order) else {
-      return true; // `next unless defined $val` (Exif.pm:7016).
+      // `next unless defined $val` (Exif.pm:7016) — [`Step::Skip`].
+      return Step::Skip;
     };
 
     self.emit(kind, tag_id, raw);
-    true
+    // The leaf value was decoded + emitted (FoundTag) — a normal entry:
+    // [`Step::Keep`].
+    Step::Keep
   }
 
   /// Dispatch a SubDirectory pointer tag.
