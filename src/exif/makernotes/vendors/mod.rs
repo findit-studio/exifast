@@ -21,6 +21,14 @@
 //! canonical names per the [[exifast-api-conventions]] memory ("no
 //! module-name stutter" naming).
 
+// NOTE: no file-level `#![deny(clippy::indexing_slicing)]` here. This is a
+// PARENT module (it declares `pub mod canon;` etc.), and an inner `#![deny]`
+// lint attribute cascades into ALL descendant modules — including
+// `canon`, owned by wave-2 slice D and not yet checked-indexing-clean.
+// Matching the established Phase-C pattern (`src/formats/mod.rs` carries no
+// such deny), the deny lives on the LEAF vendor files only; this parent has
+// no raw indexing of its own.
+
 pub mod apple;
 pub mod canon;
 pub mod dji;

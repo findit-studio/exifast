@@ -34,6 +34,8 @@
 //!   through to the standard `"Unknown (N)"` PrintConv default, which the
 //!   [`lookup_name`] miss-path reproduces.
 
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 
 /// One row of the A-mount `%sonyLensTypes` (Minolta-backed) table.
@@ -1023,12 +1025,19 @@ pub const SONY_LENS_TYPES_AMOUNT: &[SonyLensType] = &[
 #[must_use]
 pub fn lookup_name(id: u32) -> Option<SmolStr> {
   match SONY_LENS_TYPES_AMOUNT.binary_search_by_key(&id, |t| t.id) {
-    Ok(i) => Some(SmolStr::from(SONY_LENS_TYPES_AMOUNT[i].name)),
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => SONY_LENS_TYPES_AMOUNT.get(i).map(|t| SmolStr::from(t.name)),
     Err(_) => None,
   }
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

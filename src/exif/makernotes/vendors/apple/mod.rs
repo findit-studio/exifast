@@ -31,6 +31,8 @@
 //! `#[non_exhaustive]` so a future Phase 2-bis can add fields without a
 //! breaking change to downstream `match` arms.
 
+#![deny(clippy::indexing_slicing)]
+
 pub mod body;
 pub mod printconv;
 pub mod tags;
@@ -315,23 +317,27 @@ fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
       }
     }
     0x0008 => {
+      // `[r0, r1, r2, ..]` matches len ≥ 3 and binds the first three — the
+      // checked form is byte-identical to the `rs.len() >= 3` guard + `rs[0..2]`.
       if let RawValue::Rational(rs) = entry.value.raw()
-        && rs.len() >= 3
+        && let [r0, r1, r2, ..] = rs.as_slice()
       {
-        let x = rational_f64(&rs[0]);
-        let y = rational_f64(&rs[1]);
-        let z = rational_f64(&rs[2]);
+        let x = rational_f64(r0);
+        let y = rational_f64(r1);
+        let z = rational_f64(r2);
         if let (Some(x), Some(y), Some(z)) = (x, y, z) {
           typed.acceleration_vector = Some((x, y, z));
         }
       }
     }
     0x000c => {
+      // `[r0, r1, ..]` matches len ≥ 2 and binds the first two — the checked
+      // form is byte-identical to the `rs.len() >= 2` guard + `rs[0..1]`.
       if let RawValue::Rational(rs) = entry.value.raw()
-        && rs.len() >= 2
+        && let [r0, r1, ..] = rs.as_slice()
       {
-        let a = rational_f64(&rs[0]);
-        let b = rational_f64(&rs[1]);
+        let a = rational_f64(r0);
+        let b = rational_f64(r1);
         if let (Some(a), Some(b)) = (a, b) {
           let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
           typed.focus_distance_range = Some((lo, hi));
@@ -363,6 +369,11 @@ fn rational_f64(r: &crate::value::Rational) -> Option<f64> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::value::TagValue;

@@ -10,6 +10,8 @@
 //! citation. Bundled-PrintConv values are kept in the exact text bundled
 //! emits.
 
+#![deny(clippy::indexing_slicing)]
+
 use super::amount_lens_types;
 use super::model_ids;
 use crate::exif::ifd::RawValue;
@@ -956,7 +958,12 @@ fn serial_number_2031(raw: &RawValue, print_conv: bool) -> TagValue {
     RawValue::Text(s) => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-      core::str::from_utf8(&b[..end]).unwrap_or("").to_string()
+      // `end <= b.len()` by construction, so `.get(..end)` is `Some` — the
+      // checked slice is byte-identical to `&b[..end]`.
+      b.get(..end)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .unwrap_or("")
+        .to_string()
     }
     _ => return raw_to_tag_value(raw),
   };
@@ -967,9 +974,13 @@ fn serial_number_2031(raw: &RawValue, print_conv: bool) -> TagValue {
   let bytes = src.as_bytes();
   let mut value = src.clone();
   if bytes.len() >= 8 {
-    if let Some(start) =
-      (0..=bytes.len() - 8).find(|&i| bytes[i..i + 8].iter().all(u8::is_ascii_digit))
-    {
+    // `i` ranges over `0..=bytes.len()-8`, so `i + 8 <= bytes.len()` and
+    // `.get(i..i+8)` is always `Some` — byte-identical to `bytes[i..i+8]`.
+    if let Some(start) = (0..=bytes.len() - 8).find(|&i| {
+      bytes
+        .get(i..i + 8)
+        .is_some_and(|w| w.iter().all(u8::is_ascii_digit))
+    }) {
       let d = &src[start..start + 8];
       // $4$3$2$1 — swap the four 2-char groups.
       let reordered = std::format!("{}{}{}{}", &d[6..8], &d[4..6], &d[2..4], &d[0..2]);
@@ -1188,7 +1199,9 @@ fn model_is_dslr_a100(model: &str) -> bool {
     return false;
   }
   (0..=bytes.len() - needle.len()).any(|i| {
-    &bytes[i..i + needle.len()] == needle
+    // `i + needle.len() <= bytes.len()` over this range, so `.get(..)` is
+    // `Some` — byte-identical to `&bytes[i..i + needle.len()] == needle`.
+    bytes.get(i..i + needle.len()) == Some(&needle[..])
       && match bytes.get(i + needle.len()) {
         None => true,
         Some(&c) => !(c.is_ascii_alphanumeric() || c == b'_'),
@@ -1698,10 +1711,12 @@ fn lens_spec(raw: &RawValue, print_conv: bool) -> TagValue {
     _ => return raw_to_tag_value(raw),
   };
   // `return \$val unless length($val) == 8;` — non-8-byte ⇒ ValueConv returns
-  // a scalar ref (left unconverted); render the raw bytes unchanged.
-  if bytes.len() != 8 {
+  // a scalar ref (left unconverted); render the raw bytes unchanged. The
+  // exact-length slice pattern below is byte-identical to the `len != 8`
+  // guard + `bytes[0..7]` indexing.
+  let [b0, b1, b2, b3, b4, b5, b6, b7] = *bytes.as_slice() else {
     return raw_to_tag_value(raw);
-  }
+  };
   // unpack("H2H4H4H2H2H2") — each field is the lowercase HEX STRING of its
   // bytes (a0 = byte0; a1 = bytes1-2; a2 = bytes3-4; a3 = byte5; a4 = byte6;
   // a5 = byte7). The `H4` focal-length strings and `H2` aperture strings are
@@ -1709,12 +1724,12 @@ fn lens_spec(raw: &RawValue, print_conv: bool) -> TagValue {
   //   `$a[1] += 0; $a[2] += 0;` (e.g. "0018" → 18, "0055" → 55), and
   //   `s/([a-f])/hex($1)/e; $_ /= 10;` for the apertures (e.g. "35" → 3.5,
   //   "b0" → "110" → 11). Flags `a0`/`a5` stay as their 2-char hex strings.
-  let a0 = std::format!("{:02x}", bytes[0]);
-  let sf = h4_to_decimal(bytes[1], bytes[2]); // a1
-  let lf = h4_to_decimal(bytes[3], bytes[4]); // a2
-  let sa = h2_aperture(bytes[5]); // a3
-  let la = h2_aperture(bytes[6]); // a4
-  let a5 = std::format!("{:02x}", bytes[7]);
+  let a0 = std::format!("{b0:02x}");
+  let sf = h4_to_decimal(b1, b2); // a1
+  let lf = h4_to_decimal(b3, b4); // a2
+  let sa = h2_aperture(b5); // a3
+  let la = h2_aperture(b6); // a4
+  let a5 = std::format!("{b7:02x}");
   // ValueConv string `join ' ', @a` (the `-n` value).
   let value_str = std::format!("{a0} {sf} {lf} {} {} {a5}", fmt_f(sa), fmt_f(la),);
   if !print_conv {
@@ -1737,26 +1752,28 @@ fn lens_spec(raw: &RawValue, print_conv: bool) -> TagValue {
 fn perl_num(s: &str) -> f64 {
   let bytes = s.as_bytes();
   let mut i = 0;
-  let n = bytes.len();
+  // `bytes.get(i).is_some_and(pred)` is byte-identical to the prior
+  // `i < n && bytes[i] <pred>`: out of range ⇒ `None` ⇒ `false` (same as the
+  // failed `i < n`), in range ⇒ the predicate on `bytes[i]`.
   // Optional leading whitespace (Perl skips it before the number).
-  while i < n && bytes[i].is_ascii_whitespace() {
+  while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
     i += 1;
   }
   let start = i;
   // Optional sign.
-  if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+  if bytes.get(i).is_some_and(|&b| b == b'+' || b == b'-') {
     i += 1;
   }
   let mut saw_digit = false;
   // Integer part.
-  while i < n && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
     saw_digit = true;
   }
   // Fractional part: a single `.` followed by optional digits.
-  if i < n && bytes[i] == b'.' {
+  if bytes.get(i).is_some_and(|&b| b == b'.') {
     i += 1;
-    while i < n && bytes[i].is_ascii_digit() {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
       saw_digit = true;
     }
@@ -1766,13 +1783,13 @@ fn perl_num(s: &str) -> f64 {
   }
   // Optional exponent `e`/`E` [+/-] digits — only consumed if at least one
   // exponent digit follows (otherwise the `e` is trailing non-numeric).
-  if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+  if bytes.get(i).is_some_and(|&b| b == b'e' || b == b'E') {
     let mut j = i + 1;
-    if j < n && (bytes[j] == b'+' || bytes[j] == b'-') {
+    if bytes.get(j).is_some_and(|&b| b == b'+' || b == b'-') {
       j += 1;
     }
     let exp_start = j;
-    while j < n && bytes[j].is_ascii_digit() {
+    while bytes.get(j).is_some_and(u8::is_ascii_digit) {
       j += 1;
     }
     if j > exp_start {
@@ -1804,10 +1821,15 @@ fn h4_to_decimal(b1: u8, b2: u8) -> u32 {
 /// "ff" → (sub first `f`) → "15f" → coerce 15 → 1.5 (parse() would yield 0.0).
 fn h2_aperture(b: u8) -> f64 {
   let s = std::format!("{b:02x}");
-  // Perl `s///` (no /g) substitutes only the FIRST `a-f` letter.
-  let replaced = match s.bytes().position(|c| (b'a'..=b'f').contains(&c)) {
-    Some(idx) => {
-      let letter = s.as_bytes()[idx];
+  // Perl `s///` (no /g) substitutes only the FIRST `a-f` letter. Capturing the
+  // byte via `find` (instead of `position` + re-indexing `s.as_bytes()[idx]`)
+  // is byte-identical and avoids the raw index.
+  let replaced = match s
+    .bytes()
+    .enumerate()
+    .find(|&(_, c)| (b'a'..=b'f').contains(&c))
+  {
+    Some((idx, letter)) => {
       let val = (letter - b'a' + 10) as u32; // hex('a')..hex('f') = 10..15
       std::format!("{}{}{}", &s[..idx], val, &s[idx + 1..])
     }
@@ -1870,18 +1892,21 @@ fn print_lens_spec(val: &str) -> std::string::String {
   let mut rtn: Option<std::string::String> = None;
   let mut f1 = "";
   let mut f2 = "";
-  if a.len() == 2 {
+  // Slice patterns replace the `a.len() == 2` / `>= 6` guards + `a[i]`
+  // indexing — byte-identical (each pattern matches the same length class and
+  // binds the same elements).
+  if let [g1, g2] = *a.as_slice() {
     // LensSpecFeatures patch: ($f1,$f2)=@a; $rtnVal=''.
-    f1 = a[0];
-    f2 = a[1];
+    f1 = g1;
+    f2 = g2;
     rtn = Some(std::string::String::new());
-  } else if a.len() >= 6 {
-    f1 = a[0];
-    f2 = a[5];
-    let sf: f64 = a[1].parse().unwrap_or(0.0);
-    let lf: f64 = a[2].parse().unwrap_or(0.0);
-    let sa: f64 = a[3].parse().unwrap_or(0.0);
-    let la: f64 = a[4].parse().unwrap_or(0.0);
+  } else if let [g1, sf_s, lf_s, sa_s, la_s, g2, ..] = *a.as_slice() {
+    f1 = g1;
+    f2 = g2;
+    let sf: f64 = sf_s.parse().unwrap_or(0.0);
+    let lf: f64 = lf_s.parse().unwrap_or(0.0);
+    let sa: f64 = sa_s.parse().unwrap_or(0.0);
+    let la: f64 = la_s.parse().unwrap_or(0.0);
     // Crude validation (`Sony.pm:11192`): sf!=0 && sa!=0 && (lf==0||lf>=sf) &&
     // (la==0||la>=sa).
     if sf != 0.0 && sa != 0.0 && (lf == 0.0 || lf >= sf) && (la == 0.0 || la >= sa) {
@@ -2055,16 +2080,17 @@ fn pixel_shift_info(raw: &RawValue, print_conv: bool) -> TagValue {
     RawValue::Bytes(b) => b.clone(),
     _ => return raw_to_tag_value(raw),
   };
-  if bytes.len() < 6 {
+  // The `len >= 6` guard makes `first_chunk::<4>()` / `get(4)` / `get(5)`
+  // all `Some`; the checked reads are byte-identical to the prior indexing.
+  let (Some(a4), Some(&b), Some(&c)) = (bytes.first_chunk::<4>(), bytes.get(4), bytes.get(5))
+  else {
     return raw_to_tag_value(raw);
-  }
+  };
   // ExifTool `Get32u(\$val,0)` defaults to the current byte order. The
   // GroupID is documented as int32u; the body materialises `undef` bytes in
   // file order, so read little-endian to match the on-disk layout ExifTool
   // sees after honouring the IFD order (Sony MakerNotes are little-endian).
-  let a = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-  let b = bytes[4];
-  let c = bytes[5];
+  let a = u32::from_le_bytes(*a4);
   let raw_str = std::format!(
     "{:02}{:02}{:02}{:02} {} {} 0x{:x}",
     (a >> 17) & 0x1f,
@@ -2096,10 +2122,11 @@ fn pixel_shift_other(val: &str) -> Option<String> {
   // The RawConv output is always exactly "GROUP B C 0xW" (4 ws-separated
   // tokens: digits, digits, digits, word). Parse those four tokens.
   let toks: Vec<&str> = val.split(' ').collect();
-  if toks.len() != 4 {
+  // `[g, b, c, w]` matches exactly four tokens — byte-identical to the prior
+  // `toks.len() != 4` guard + `toks[0..3]` indexing, without raw indexing.
+  let [g, b, c, w] = toks.as_slice() else {
     return None;
-  }
-  let (g, b, c, w) = (toks[0], toks[1], toks[2], toks[3]);
+  };
   // `(\d+) (\d+) (\d+) (\w+)` — first three are digit runs, last is \w+.
   if !g.bytes().all(|x| x.is_ascii_digit())
     || !b.bytes().all(|x| x.is_ascii_digit())
@@ -2227,10 +2254,12 @@ fn first_f64(raw: &RawValue) -> Option<f64> {
 
 /// First two scalar values (for int16u[2]/int16s[2] string-keyed PrintConvs).
 fn first_pair(raw: &RawValue) -> Option<(i64, i64)> {
+  // `[a, b, ..]` matches len ≥ 2 and binds the first two — byte-identical to
+  // the `if v.len() >= 2 => (v[0], v[1])` index pair, without raw indexing.
   match raw {
-    RawValue::I64(v) if v.len() >= 2 => Some((v[0], v[1])),
-    RawValue::U64(v) if v.len() >= 2 => {
-      Some((i64::try_from(v[0]).ok()?, i64::try_from(v[1]).ok()?))
+    RawValue::I64(v) if let [a, b, ..] = v.as_slice() => Some((*a, *b)),
+    RawValue::U64(v) if let [a, b, ..] = v.as_slice() => {
+      Some((i64::try_from(*a).ok()?, i64::try_from(*b).ok()?))
     }
     _ => None,
   }
@@ -2297,8 +2326,11 @@ fn pair_label<F: Fn(i64, i64) -> Option<&'static str>>(
 /// the Apple/Canon/Panasonic helpers.
 pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
   use std::string::ToString;
+  // Single-element arms use a slice pattern (`[x]`) instead of `v[0]` behind
+  // an `if v.len() == 1` guard — byte-identical (the pattern matches exactly
+  // when there is one element) and free of raw indexing.
   match raw {
-    RawValue::I64(v) if v.len() == 1 => TagValue::I64(v[0]),
+    RawValue::I64(v) if let [n] = v.as_slice() => TagValue::I64(*n),
     RawValue::I64(v) => TagValue::Str(
       v.iter()
         .map(|n| n.to_string())
@@ -2306,9 +2338,9 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::U64(v) if v.len() == 1 => match i64::try_from(v[0]) {
+    RawValue::U64(v) if let [n] = v.as_slice() => match i64::try_from(*n) {
       Ok(n) => TagValue::I64(n),
-      Err(_) => TagValue::U64(v[0]),
+      Err(_) => TagValue::U64(*n),
     },
     RawValue::U64(v) => TagValue::Str(
       v.iter()
@@ -2317,7 +2349,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::F64(v) if v.len() == 1 => TagValue::F64(v[0]),
+    RawValue::F64(v) if let [n] = v.as_slice() => TagValue::F64(*n),
     RawValue::F64(v) => TagValue::Str(
       v.iter()
         .map(|f| f.to_string())
@@ -2325,7 +2357,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Rational(rs) if rs.len() == 1 => TagValue::Rational(rs[0]),
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => TagValue::Rational(*r),
     // Multi-element rational with NO conv: ExifTool's default ValueConv
     // renders EACH rational to its `RoundFloat(n/d, sig)` DECIMAL
     // (`ExifTool.pm:6107-6119`) and space-joins them (e.g. `[1/2, 3/4] → "0.5
@@ -2343,6 +2375,11 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

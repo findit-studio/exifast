@@ -6,6 +6,8 @@
 //! expressions in `Apple.pm`. The IFD walker calls
 //! [`ApplePrintConv::apply`] at emit time with the decoded raw value.
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::string::String;

@@ -40,6 +40,15 @@
 //! Enums are unit-variant or carry only newtype payloads. See
 //! `exifast-api-conventions`.
 
+// NOTE: no file-level `#![deny(clippy::indexing_slicing)]` here. This is a
+// PARENT module (it declares `pub mod dispatcher;` + `pub mod vendors;`), and
+// an inner `#![deny]` lint attribute cascades into ALL descendant modules —
+// including `dispatcher` and `vendors::canon`, which are owned by wave-2
+// slice D and are NOT yet checked-indexing-clean. Matching the established
+// Phase-C pattern (`src/formats/mod.rs` carries no such deny either), the
+// deny lives on the LEAF files only (`byte_order`/`detected`/`offset`/
+// `vendor` + each vendor leaf); this parent has no raw indexing of its own.
+
 pub mod byte_order;
 pub mod detected;
 pub mod dispatcher;

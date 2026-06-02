@@ -13,6 +13,8 @@
 //!   undecoded; the port skips it (the body walker decodes it into raw
 //!   bytes but no tag-table entry consumes it, which mirrors bundled).
 
+#![deny(clippy::indexing_slicing)]
+
 use super::printconv::DjiPrintConv;
 
 /// One DJI Main IFD tag.
@@ -107,6 +109,11 @@ pub fn lookup(id: u16) -> Option<&'static DjiTag> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

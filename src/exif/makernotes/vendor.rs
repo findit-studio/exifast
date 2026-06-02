@@ -33,6 +33,8 @@
 //!   Olympus, Casio, Kyocera, Leica, Minolta, Ricoh, Samsung, Sanyo,
 //!   Sigma) — kept under the dispatcher umbrella issue.
 
+#![deny(clippy::indexing_slicing)]
+
 /// Implementation status of a vendor's MakerNote parser.
 ///
 /// Phase 1 lands the dispatcher (every variant identifies); per-vendor

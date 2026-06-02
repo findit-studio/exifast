@@ -16,6 +16,8 @@
 //! against the parent TIFF block when given parent-TIFF context, or
 //! against the blob itself when the caller has only the captured BLOB.
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
 use std::vec::Vec;
 
@@ -126,8 +128,9 @@ pub fn walk_dji_body(blob: &[u8], parent_order: ByteOrder) -> Vec<DjiEntry> {
 }
 
 fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
-  let b = data.get(pos..pos + 2)?;
-  let arr: [u8; 2] = [b[0], b[1]];
+  // The `.get(pos..pos+2)?` slice has length 2, so `try_into::<[u8;2]>` always
+  // succeeds; this is byte-identical to `[b[0], b[1]]` without raw indexing.
+  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -135,8 +138,9 @@ fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
 }
 
 fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
-  let b = data.get(pos..pos + 4)?;
-  let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
+  // The `.get(pos..pos+4)?` slice has length 4, so `try_into::<[u8;4]>` always
+  // succeeds; this is byte-identical to `[b[0]..b[3]]` without raw indexing.
+  let arr: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
@@ -144,6 +148,11 @@ fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

@@ -6,6 +6,8 @@
 //!
 //! 112 model-ID rows ported as a binary-search-sorted const array.
 
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 
 /// One row of the Sony Model-ID lookup.
@@ -478,12 +480,19 @@ pub const SONY_MODEL_IDS: &[SonyModelEntry] = &[
 #[must_use]
 pub fn lookup_name(id: u16) -> Option<SmolStr> {
   match SONY_MODEL_IDS.binary_search_by_key(&id, |e| e.id) {
-    Ok(i) => Some(SmolStr::from(SONY_MODEL_IDS[i].name)),
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => SONY_MODEL_IDS.get(i).map(|e| SmolStr::from(e.name)),
     Err(_) => None,
   }
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
