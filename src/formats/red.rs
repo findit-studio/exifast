@@ -42,6 +42,10 @@
 //! accordingly (the surrounding JSON stays valid). See also the
 //! `exifast-phase2-forward-items` memory entry.
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{ByteOrder, read_value},
   format_parser::{FormatParser, parser_sealed},
@@ -74,24 +78,30 @@ use crate::{
 /// 3-byte string slice like `&s[..3]` PANICS when the 3-byte mark
 /// splits a multi-byte UTF-8 codepoint.
 fn perl_arithmetic_to_f64(s: &str) -> f64 {
+  // Checked-indexing (Phase C w2b): every `bytes[i]` had a preceding
+  // `i < bytes.len()` guard, `i` only advances past a `.get`-checked byte, and
+  // `bytes[start]` is only read when a sign was consumed (`start < i <= len`),
+  // so the `.get()` forms below read the same bytes and take the same branches
+  // ⇒ byte-identical. `s.get(start..i)` likewise has `start <= i <= len`.
   let bytes = s.as_bytes();
   let mut i = 0;
-  while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+  while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
     i += 1;
   }
   let start = i;
-  if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+  if matches!(bytes.get(i), Some(b'+' | b'-')) {
     i += 1;
   }
   let after_sign = i;
-  let is_neg = i > start && bytes[start] == b'-';
-  let after_sign_bytes = &bytes[after_sign..];
+  let is_neg = i > start && bytes.get(start) == Some(&b'-');
+  let after_sign_bytes = bytes.get(after_sign..).unwrap_or(&[]);
   let starts_with_ci = |needle: &[u8]| -> bool {
-    after_sign_bytes.len() >= needle.len()
-      && after_sign_bytes[..needle.len()]
+    after_sign_bytes.get(..needle.len()).is_some_and(|head| {
+      head
         .iter()
         .zip(needle.iter())
         .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
   };
   if starts_with_ci(b"inf") {
     return if is_neg {
@@ -104,14 +114,14 @@ fn perl_arithmetic_to_f64(s: &str) -> f64 {
     return f64::NAN;
   }
   let digits_start = i;
-  while i < bytes.len() && bytes[i].is_ascii_digit() {
+  while bytes.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   let had_int_digits = i > digits_start;
-  if i < bytes.len() && bytes[i] == b'.' {
+  if bytes.get(i) == Some(&b'.') {
     i += 1;
     let frac_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     if !had_int_digits && i == frac_start {
@@ -120,21 +130,23 @@ fn perl_arithmetic_to_f64(s: &str) -> f64 {
   } else if !had_int_digits {
     return 0.0;
   }
-  if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+  if matches!(bytes.get(i), Some(b'e' | b'E')) {
     let exp_word_start = i;
     i += 1;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
       i += 1;
     }
     let exp_digits_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     if i == exp_digits_start {
       i = exp_word_start;
     }
   }
-  s[start..i].parse::<f64>().unwrap_or(0.0)
+  s.get(start..i)
+    .and_then(|t| t.parse::<f64>().ok())
+    .unwrap_or(0.0)
 }
 
 /// Red.pm:56 / :61 / :66 OtherDate1/2/3 ValueConv:
@@ -147,20 +159,26 @@ fn other_date_value_conv(s: &str) -> String {
 /// Helper: replace first `<4 digits>_<2 digits>_` with `<4 digits>:<2 digits>:`.
 fn replace_yyyy_mm_underscore(s: &str) -> String {
   let b = s.as_bytes();
+  // Checked-indexing (Phase C w2b): the `0..b.len().saturating_sub(7)` loop
+  // bound guarantees `i + 8 <= b.len()`, so `b.get(i..i + 8)` is always `Some`
+  // (and the `s.get(..)` substrings have `i + 8 <= len`) ⇒ byte-identical.
   for i in 0..b.len().saturating_sub(7) {
-    if b[i..i + 4].iter().all(u8::is_ascii_digit)
-      && b[i + 4] == b'_'
-      && b[i + 5].is_ascii_digit()
-      && b[i + 6].is_ascii_digit()
-      && b[i + 7] == b'_'
+    let Some(&[d0, d1, d2, d3, u4, m5, m6, u7]) = b.get(i..i + 8) else {
+      break;
+    };
+    if [d0, d1, d2, d3].iter().all(u8::is_ascii_digit)
+      && u4 == b'_'
+      && m5.is_ascii_digit()
+      && m6.is_ascii_digit()
+      && u7 == b'_'
     {
       let mut out = String::with_capacity(s.len());
-      out.push_str(&s[..i]);
-      out.push_str(&s[i..i + 4]);
+      out.push_str(s.get(..i).unwrap_or(""));
+      out.push_str(s.get(i..i + 4).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 5..i + 7]);
+      out.push_str(s.get(i + 5..i + 7).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 8..]);
+      out.push_str(s.get(i + 8..).unwrap_or(""));
       return out;
     }
   }
@@ -171,21 +189,27 @@ fn replace_yyyy_mm_underscore(s: &str) -> String {
 /// `$val =~ s/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})/$1:$2:$3 $4:$5:/`.
 fn datetime_original_value_conv(s: &str) -> String {
   let b = s.as_bytes();
+  // Checked-indexing (Phase C w2b): the `0..b.len().saturating_sub(11)` loop
+  // bound guarantees `i + 12 <= b.len()`, so `b.get(i..i + 12)` is always
+  // `Some` (and each `s.get(..)` substring has its end <= len) ⇒ byte-identical.
   for i in 0..b.len().saturating_sub(11) {
-    if b[i..i + 12].iter().all(u8::is_ascii_digit) {
+    if b
+      .get(i..i + 12)
+      .is_some_and(|w| w.iter().all(u8::is_ascii_digit))
+    {
       let mut out = String::with_capacity(s.len() + 4);
-      out.push_str(&s[..i]);
-      out.push_str(&s[i..i + 4]);
+      out.push_str(s.get(..i).unwrap_or(""));
+      out.push_str(s.get(i..i + 4).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 4..i + 6]);
+      out.push_str(s.get(i + 4..i + 6).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 6..i + 8]);
+      out.push_str(s.get(i + 6..i + 8).unwrap_or(""));
       out.push(' ');
-      out.push_str(&s[i + 8..i + 10]);
+      out.push_str(s.get(i + 8..i + 10).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 10..i + 12]);
+      out.push_str(s.get(i + 10..i + 12).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 12..]);
+      out.push_str(s.get(i + 12..).unwrap_or(""));
       return out;
     }
   }
@@ -195,15 +219,21 @@ fn datetime_original_value_conv(s: &str) -> String {
 /// Red.pm:82 / :95 — `s/(\d{4})(\d{2})/$1:$2:/` on `YYYYMMDD`.
 fn date_created_value_conv(s: &str) -> String {
   let b = s.as_bytes();
+  // Checked-indexing (Phase C w2b): `0..b.len().saturating_sub(5)` guarantees
+  // `i + 6 <= b.len()` ⇒ `b.get(i..i + 6)` is `Some` and each `s.get(..)`
+  // substring is in range ⇒ byte-identical.
   for i in 0..b.len().saturating_sub(5) {
-    if b[i..i + 6].iter().all(u8::is_ascii_digit) {
+    if b
+      .get(i..i + 6)
+      .is_some_and(|w| w.iter().all(u8::is_ascii_digit))
+    {
       let mut out = String::with_capacity(s.len() + 2);
-      out.push_str(&s[..i]);
-      out.push_str(&s[i..i + 4]);
+      out.push_str(s.get(..i).unwrap_or(""));
+      out.push_str(s.get(i..i + 4).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 4..i + 6]);
+      out.push_str(s.get(i + 4..i + 6).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 6..]);
+      out.push_str(s.get(i + 6..).unwrap_or(""));
       return out;
     }
   }
@@ -213,15 +243,21 @@ fn date_created_value_conv(s: &str) -> String {
 /// Red.pm:87 / :100 — `s/(\d{2})(\d{2})/$1:$2:/` on `HHMMSS`.
 fn time_created_value_conv(s: &str) -> String {
   let b = s.as_bytes();
+  // Checked-indexing (Phase C w2b): `0..b.len().saturating_sub(3)` guarantees
+  // `i + 4 <= b.len()` ⇒ `b.get(i..i + 4)` is `Some` and each `s.get(..)`
+  // substring is in range ⇒ byte-identical.
   for i in 0..b.len().saturating_sub(3) {
-    if b[i..i + 4].iter().all(u8::is_ascii_digit) {
+    if b
+      .get(i..i + 4)
+      .is_some_and(|w| w.iter().all(u8::is_ascii_digit))
+    {
       let mut out = String::with_capacity(s.len() + 2);
-      out.push_str(&s[..i]);
-      out.push_str(&s[i..i + 2]);
+      out.push_str(s.get(..i).unwrap_or(""));
+      out.push_str(s.get(i..i + 2).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 2..i + 4]);
+      out.push_str(s.get(i + 2..i + 4).unwrap_or(""));
       out.push(':');
-      out.push_str(&s[i + 4..]);
+      out.push_str(s.get(i + 4..).unwrap_or(""));
       return out;
     }
   }
@@ -1055,22 +1091,29 @@ pub fn parse_borrowed(data: &[u8]) -> Option<Meta<'_>> {
 
 fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
   // Red.pm:225 magic.
+  // Checked-indexing (Phase C w2b): the `data.len() < 8` guard makes
+  // `data.get(0)`/`data.get(1)`/`data.get(4..7)`/`data.get(7)` and the 4-byte
+  // size window all `Some` ⇒ the fallbacks are unreachable and every read is
+  // byte-identical to the previous raw indexing.
   if data.len() < 8 {
     return None;
   }
-  if data[0] != 0 || data[1] != 0 {
+  if data.first() != Some(&0) || data.get(1) != Some(&0) {
     return None;
   }
-  if &data[4..7] != b"RED" {
+  if data.get(4..7) != Some(&b"RED"[..]) {
     return None;
   }
-  let ver: u8 = match data[7] {
-    b'1' => 1,
-    b'2' => 2,
+  let ver: u8 = match data.get(7) {
+    Some(b'1') => 1,
+    Some(b'2') => 2,
     _ => return None,
   };
   // Red.pm:227 size.
-  let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+  let size = match data.get(0..4) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]) as usize,
+    _ => return None,
+  };
   // Red.pm:228.
   if size < 8 {
     return None;
@@ -1103,17 +1146,23 @@ fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
       return Some(meta);
     }
     let take = (data.len() - size).min(0x10000);
-    (&data[size..size + take], 0x22usize)
+    // Checked-indexing (Phase C w2b): the `data.len() <= size` guard above
+    // makes `size + take <= data.len()` ⇒ `data.get(size..size + take)` is
+    // `Some` ⇒ byte-identical.
+    (data.get(size..size + take).unwrap_or(&[]), 0x22usize)
   } else {
     // Red.pm:251-252.
     if size < 0x44 {
       meta.warnings.push("Truncated R3D file");
       return Some(meta);
     }
-    let first_block = &data[..size];
-    let rdi = first_block[0x40] as usize;
-    let rda = first_block[0x41] as usize;
-    let rdx = first_block[0x42] as usize;
+    // Checked-indexing (Phase C w2b): `data.len() < size` was rejected above,
+    // so `data.get(..size)` is `Some`; `size >= 0x44 > 0x42` makes the three
+    // `first_block.get(0x40..0x42)` byte reads `Some` ⇒ byte-identical.
+    let first_block = data.get(..size).unwrap_or(&[]);
+    let rdi = first_block.get(0x40).copied().unwrap_or(0) as usize;
+    let rda = first_block.get(0x41).copied().unwrap_or(0) as usize;
+    let rdx = first_block.get(0x42).copied().unwrap_or(0) as usize;
     let p = 0x44usize + 0x18 * rdi + 0x14 * rda + 0x10 * rdx;
     (first_block, p)
   };
@@ -1139,7 +1188,13 @@ fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
       }
     }
   } else {
-    let len = u16::from_be_bytes([buff[pos], buff[pos + 1]]) as usize;
+    // Checked-indexing (Phase C w2b): this `else` of `pos + 8 > buff.len()`
+    // means `pos + 8 <= buff.len()`, so `buff.get(pos..pos + 2)` is `Some` ⇒
+    // byte-identical.
+    let len = match buff.get(pos..pos + 2) {
+      Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+      _ => 0,
+    };
     pos += 2;
     if !(300..2048).contains(&len) || pos + len > buff.len() {
       match scan_for_red_directory(buff) {
@@ -1171,18 +1226,23 @@ fn parse_inner<'a>(data: &'a [u8]) -> Option<Meta<'a>> {
 
 /// Red.pm:266 fallback regex: `$buff =~ /\0\x0f\x10[\0\x06]/g`.
 fn scan_for_red_directory(buf: &[u8]) -> Option<usize> {
+  // Checked-indexing (Phase C w2b): the `0..buf.len().saturating_sub(3)` bound
+  // guarantees `i + 4 <= buf.len()`, so the 4-byte `buf.get(i..i + 4)` window
+  // is always `Some` ⇒ byte-identical to the previous `buf[i]`..`buf[i + 3]`.
   (0..buf.len().saturating_sub(3)).find(|&i| {
-    buf[i] == 0x00
-      && buf[i + 1] == 0x0f
-      && buf[i + 2] == 0x10
-      && (buf[i + 3] == 0x00 || buf[i + 3] == 0x06)
+    matches!(
+      buf.get(i..i + 4),
+      Some(&[0x00, 0x0f, 0x10, b3]) if b3 == 0x00 || b3 == 0x06
+    )
   })
 }
 
 /// RED1 header subtable read (Red.pm:154-172).
 fn extract_red1_header<'a>(meta: &mut Meta<'a>, data: &'a [u8], size: usize) {
   let cap = size.min(data.len());
-  let buf = &data[..cap];
+  // Checked-indexing (Phase C w2b): `cap = size.min(data.len()) <= data.len()`
+  // ⇒ `data.get(..cap)` is always `Some` ⇒ byte-identical.
+  let buf = data.get(..cap).unwrap_or(&[]);
 
   if let Some(TagValue::Str(s)) = read_value(buf, 0x07, "string", 1, ByteOrder::Mm) {
     if let Some(b) = s.as_bytes().first() {
@@ -1206,7 +1266,9 @@ fn extract_red1_header<'a>(meta: &mut Meta<'a>, data: &'a [u8], size: usize) {
 /// RED2 header subtable read (Red.pm:175-206).
 fn extract_red2_header<'a>(meta: &mut Meta<'a>, data: &'a [u8], size: usize) {
   let cap = size.min(data.len());
-  let buf = &data[..cap];
+  // Checked-indexing (Phase C w2b): `cap <= data.len()` ⇒ `data.get(..cap)`
+  // is always `Some` ⇒ byte-identical.
+  let buf = data.get(..cap).unwrap_or(&[]);
 
   if let Some(TagValue::Str(s)) = read_value(buf, 0x07, "string", 1, ByteOrder::Mm) {
     if let Some(b) = s.as_bytes().first() {
@@ -1234,12 +1296,17 @@ fn borrowed_string(data: &[u8], offset: usize, max_len: usize) -> Option<&str> {
   if offset >= end {
     return None;
   }
-  let slice = &data[offset..end];
+  // Checked-indexing (Phase C w2b): `end <= data.len()` and `offset < end`
+  // (guard above) ⇒ `data.get(offset..end)` is `Some`; `trimmed_len <=
+  // slice.len()` ⇒ `slice.get(..trimmed_len)` is `Some` ⇒ byte-identical.
+  let slice = data.get(offset..end).unwrap_or(&[]);
   let trimmed_len = slice.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
   if trimmed_len == 0 {
     return None;
   }
-  core::str::from_utf8(&slice[..trimmed_len]).ok()
+  slice
+    .get(..trimmed_len)
+    .and_then(|s| core::str::from_utf8(s).ok())
 }
 
 /// Red.pm:277-291 directory walk.
@@ -1251,12 +1318,22 @@ fn walk_red_directory<'a>(
   dir_len: Option<usize>,
 ) {
   let dir_len_truthy = dir_len.is_some();
+  // Checked-indexing (Phase C w2b): `dir_end <= buff.len()` (set to `buff.len()`
+  // or a `pos + len <= buff.len()` value), and `pos + 4 <= dir_end` (loop guard)
+  // / `pos + len <= dir_end` with `len >= 4` (break guard) make every
+  // `buff.get(pos..pos + 4)` window `Some` ⇒ byte-identical.
   while pos + 4 <= dir_end {
-    let len = u16::from_be_bytes([buff[pos], buff[pos + 1]]) as usize;
+    let len = match buff.get(pos..pos + 2) {
+      Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+      _ => 0,
+    };
     if len < 4 || pos + len > dir_end {
       break;
     }
-    let tag = u16::from_be_bytes([buff[pos + 2], buff[pos + 3]]);
+    let tag = match buff.get(pos + 2..pos + 4) {
+      Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]),
+      _ => 0,
+    };
     let fmt_idx = (tag >> 12) as u8;
     let fmt = match red_format(fmt_idx) {
       Some(f) => f,
@@ -1302,12 +1379,17 @@ fn dispatch_directory_tag<'a>(
     if off >= end {
       return None;
     }
-    let slice = &buff[off..end];
+    // Checked-indexing (Phase C w2b): `end <= buff.len()` and `off < end`
+    // (guard above) ⇒ `buff.get(off..end)` is `Some`; `trimmed <= slice.len()`
+    // ⇒ `slice.get(..trimmed)` is `Some` ⇒ byte-identical.
+    let slice = buff.get(off..end).unwrap_or(&[]);
     let trimmed = slice.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     if trimmed == 0 {
       return None;
     }
-    core::str::from_utf8(&slice[..trimmed]).ok()
+    slice
+      .get(..trimmed)
+      .and_then(|s| core::str::from_utf8(s).ok())
   };
 
   let to_value = |v: TagValue| -> Value<'a> {
@@ -1984,6 +2066,11 @@ fn push_r3d_value(tags: &mut std::vec::Vec<crate::emit::EmittedTag>, name: &str,
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
