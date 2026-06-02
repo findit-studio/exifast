@@ -15,6 +15,8 @@
 //! vendors so future expansions (DJI thermal hashes etc.) can land
 //! cleanly here.
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::RawValue;
 use crate::value::TagValue;
 use smol_str::SmolStr;
@@ -77,8 +79,10 @@ fn first_f64(raw: &RawValue) -> Option<f64> {
 /// the Apple/Canon/Panasonic helpers.
 pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
   use std::string::ToString;
+  // Single-element arms use a slice pattern (`[x]`) instead of `v[0]` behind
+  // an `if v.len() == 1` guard — byte-identical and free of raw indexing.
   match raw {
-    RawValue::I64(v) if v.len() == 1 => TagValue::I64(v[0]),
+    RawValue::I64(v) if let [n] = v.as_slice() => TagValue::I64(*n),
     RawValue::I64(v) => TagValue::Str(
       v.iter()
         .map(|n| n.to_string())
@@ -86,9 +90,9 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::U64(v) if v.len() == 1 => match i64::try_from(v[0]) {
+    RawValue::U64(v) if let [n] = v.as_slice() => match i64::try_from(*n) {
       Ok(n) => TagValue::I64(n),
-      Err(_) => TagValue::U64(v[0]),
+      Err(_) => TagValue::U64(*n),
     },
     RawValue::U64(v) => TagValue::Str(
       v.iter()
@@ -97,7 +101,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::F64(v) if v.len() == 1 => TagValue::F64(v[0]),
+    RawValue::F64(v) if let [n] = v.as_slice() => TagValue::F64(*n),
     RawValue::F64(v) => TagValue::Str(
       v.iter()
         .map(|f| f.to_string())
@@ -105,7 +109,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Rational(rs) if rs.len() == 1 => TagValue::Rational(rs[0]),
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => TagValue::Rational(*r),
     RawValue::Rational(rs) => TagValue::Str(
       rs.iter()
         .map(|r| std::format!("{}/{}", r.numerator(), r.denominator()))
@@ -124,6 +128,11 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

@@ -37,6 +37,8 @@
 //! oracle (which records `$info->[0]{Name}` as the representative). The
 //! per-branch model dispatch is deferred with the sub-table walker.
 
+#![deny(clippy::indexing_slicing)]
+
 use super::printconv::SonyPrintConv;
 use crate::exif::ifd::Format;
 use crate::exif::makernotes::vendors::FormatOverride;
@@ -1198,12 +1200,19 @@ pub const SONY_TAGS: &[SonyTag] = &[
 #[must_use]
 pub fn lookup(tag_id: u16) -> Option<&'static SonyTag> {
   match SONY_TAGS.binary_search_by_key(&tag_id, |t| t.id) {
-    Ok(i) => Some(&SONY_TAGS[i]),
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => SONY_TAGS.get(i),
     Err(_) => None,
   }
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

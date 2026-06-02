@@ -40,17 +40,14 @@
 //! Enums are unit-variant or carry only newtype payloads. See
 //! `exifast-api-conventions`.
 
-// Golden-v2 Contract 3c (Phase C) — slice-D/E boundary shim. The parent module
-// `crate::exif` (`exif/mod.rs`) carries `#![deny(clippy::indexing_slicing)]`,
-// which an inner attribute propagates into THIS descendant subtree. Slice D
-// (w2d) owns only the Canon vendor subtree + `dispatcher.rs` within makernotes;
-// those files re-assert the file-level `#![deny]` (a file-level lint level
-// overrides an inherited one). The remaining makernotes infra + the other
-// vendors (sony/panasonic/apple/dji/leica/…) are wave-2 slice E's scope, so
-// this `#![allow]` neutralizes the inherited deny for the not-yet-converted
-// subtree — preserving the pre-Phase-C behaviour until slice E retrofits it and
-// removes this shim. Touches no logic: a lint-level boundary only.
-#![allow(clippy::indexing_slicing)]
+// NOTE: no file-level `#![deny(clippy::indexing_slicing)]` here. This is a
+// PARENT module (it declares `pub mod dispatcher;` + `pub mod vendors;`), and
+// an inner `#![deny]` lint attribute cascades into ALL descendant modules —
+// including `dispatcher` and `vendors::canon`, which are owned by wave-2
+// slice D and are NOT yet checked-indexing-clean. Matching the established
+// Phase-C pattern (`src/formats/mod.rs` carries no such deny either), the
+// deny lives on the LEAF files only (`byte_order`/`detected`/`offset`/
+// `vendor` + each vendor leaf); this parent has no raw indexing of its own.
 
 pub mod byte_order;
 pub mod detected;

@@ -41,6 +41,8 @@
 //! enum lets diagnostics tell whether the resolution came from an
 //! explicit directive, a body marker, or a (provisional) parent fallback.
 
+#![deny(clippy::indexing_slicing)]
+
 use super::detected::ChildByteOrder;
 use crate::exif::ifd::ByteOrder;
 

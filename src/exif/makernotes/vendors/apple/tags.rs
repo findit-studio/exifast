@@ -19,6 +19,8 @@
 //! - The `0x0003 → RunTime` sub-table (`Apple.pm:42`) emits raw bytes —
 //!   the PLIST CMTime sub-parser is deferred (file follow-up issue).
 
+#![deny(clippy::indexing_slicing)]
+
 use super::printconv::ApplePrintConv;
 
 /// Apple MakerNote leaf tag — `(id, name, print_conv, unknown)`.
@@ -385,6 +387,11 @@ pub fn lookup(id: u16) -> Option<&'static AppleTag> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
