@@ -669,12 +669,16 @@ impl AnyMeta<'_> {
       // Faithful last-wins-IN-PLACE dedup on the (family1, name) key — the
       // same identity the `TagMap` sink dedups on (keeps first-occurrence
       // POSITION, latest value wins). Linear scan (no_std + alloc clean; tag
-      // counts are small).
+      // counts are small). EXCEPTION: the priority-0 `Warning`/`Error`
+      // pseudo-tags are FIRST-wins (a duplicate never overrides — ExifTool
+      // .pm:9544-9560 / 5404-5417), mirroring [`crate::tagmap::TagMap::insert`].
       if let Some(slot) = out
         .iter_mut()
         .find(|t| t.group_ref().family1() == tag.group_ref().family1() && t.name() == tag.name())
       {
-        *slot = tag;
+        if tag.name() != "Warning" && tag.name() != "Error" {
+          *slot = tag;
+        }
       } else {
         out.push(tag);
       }
@@ -783,27 +787,27 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       AnyMeta::Mpc(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "wavpack")]
       AnyMeta::Wv(m) => crate::diagnostics::Diagnose::diagnostics(m),
-      // Matroska's bundled `$et->Warn` sites (Matroska.pm:1006/1075/1179),
-      // now modeled by the group-scoped diagnostics channel (Phase B.1.5).
-      // Each `Diagnostic` carries the active `SET_GROUP1` so `run_diagnostics`
-      // routes "Illegal float size" / "Invalid or corrupted … master element"
-      // to the group-scoped `<group>:Warning` TAG (e.g. `Info:Warning`) and
-      // "Truncated Matroska header" to the document `ExifTool:Warning`. (The
-      // illegal-float leaf value fix + the truncated-header `File:*`
-      // suppression live in `formats::matroska` / `finalize_file_type`.)
-      // `Processing large block` (Matroska.pm:1140) is `LargeFileSupport==2`-
-      // gated — unreachable here, never queued.
+      // Matroska's bundled `$et->Warn` sites (Matroska.pm:1006/1075/1179). Only
+      // the DOCUMENT-level ones reach this channel (Phase B R1): "Truncated
+      // Matroska header" (no `SET_GROUP1`) and an ungrouped "Invalid or
+      // corrupted … master element" → `ExifTool:Warning`. The GROUP-SCOPED
+      // ones ("Illegal float size", a grouped corruption warning) are emitted
+      // IN-STREAM as `<group>:Warning` TAGs by `Meta::tags()` at the walk
+      // position (like QuickTime's `Track<N>:Warning`), so a collision with a
+      // real same-group SimpleTag `Warning` is resolved by FoundTag order
+      // (priority-0 first-wins). `Processing large block` (Matroska.pm:1140) is
+      // `LargeFileSupport==2`-gated — unreachable here, never queued.
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(m),
-      // MXF's bundled `$et->Warn` site `Bad array or batch size` (MXF.pm:2528),
-      // now modeled by the group-scoped diagnostics channel (Phase B.1.5).
-      // MXF runs under `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared :2966),
-      // so the `Diagnostic` carries `group = "MXF"` and `run_diagnostics`
-      // routes it to the `MXF:Warning` TAG (not the document `ExifTool:Warning`).
-      // `Seek error` (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory
-      // port lacks — unreachable, never queued.
+      // MXF runs entirely under `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared
+      // :2966), so EVERY `$et->Warn` (the lone reachable site is `Bad array or
+      // batch size`, MXF.pm:2528) is the group-scoped `MXF:Warning` TAG, emitted
+      // IN-STREAM by `MxfMeta::tags()` (Phase B R1) — NOT this channel. MXF has
+      // no document-level diagnostic, so this yields the empty default. `Seek
+      // error` (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory port
+      // lacks — unreachable, never queued.
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "plist")]

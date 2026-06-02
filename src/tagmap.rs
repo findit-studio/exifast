@@ -50,6 +50,21 @@ use std::{
   vec::Vec,
 };
 
+/// The pseudo-tag names whose duplicate-handling is FIRST-wins (priority-0)
+/// rather than the default last-wins. `Warning` and `Error` are defined in
+/// `Image::ExifTool::Extra` with `Priority => 0` (ExifTool.pm:1290/1299), and
+/// every other place a `Warning`/`Error` tag is produced (e.g. the Matroska
+/// `StdTag` SimpleTag table, `PRIORITY => 0`, Matroska.pm:752) is likewise
+/// priority-0. ExifTool's duplicate handler never lets a priority-0 tag
+/// override an existing same-`family1:name` tag (ExifTool.pm:9544-9560 — the
+/// new value is shunted to a numbered `Warning (n)` key) and the default
+/// (`%noDups`) output keeps the FIRST-extracted one by file order
+/// (ExifTool.pm:5404-5417). See [`TagMap::insert`].
+#[inline]
+fn is_priority_zero_pseudo_tag(name: &str) -> bool {
+  name == "Warning" || name == "Error"
+}
+
 /// The inline tag-collection sink a typed `Meta` emits its tags into. `%noDups`
 /// first-wins on the `"<Group1>:<Name>"` key (`exiftool:2950-2951`): a later
 /// emission of an already-present key is dropped. Warnings/errors accumulate in
@@ -107,8 +122,25 @@ impl TagMap {
   /// `family1:name`, so a repeated `family1:name` is ALWAYS the same-identity
   /// duplicate FoundTag would replace (e.g. AIFF duplicate `NAME` chunks →
   /// `AIFF:Name` keeps the LAST value, `AIFF_dup_name.aif`; multi-COMM →
-  /// last COMM). No typed sink emits two DIFFERENT family-0 under one
-  /// `family1:name`, so the render-stage first-wins never applies here.
+  /// last COMM).
+  ///
+  /// **`Warning`/`Error` exception — FIRST-wins (faithful priority-0).** The
+  /// only documented case where two DIFFERENT family-0 tags collide on one
+  /// `family1:name` token is the pseudo-tags `Warning` / `Error`: a group-scoped
+  /// `$et->Warn`/`$et->Error` (family-0 `ExifTool`, ExifTool.pm:1290/1299
+  /// `Priority => 0`) and a real same-family-1 `Warning`/`Error` TAG (e.g. a
+  /// Matroska SimpleTag `TagName=Warning`, whose `StdTag` table is
+  /// `PRIORITY => 0`, Matroska.pm:752). BOTH are priority-0, and ExifTool's
+  /// duplicate handler NEVER lets a priority-0 duplicate override an existing
+  /// tag (`$priority(0) >= $oldPriority(forced 1)` is false → the new value is
+  /// shunted to `Warning (1)`, ExifTool.pm:9544-9560), and the render `%noDups`
+  /// then keeps the FIRST-extracted by file order (ExifTool.pm:5404-5417). The
+  /// comment at ExifTool.pm:9542 spells it out: "never override a Warning tag".
+  /// So for these two names a HIT is a NO-OP (the first-extracted value stays) —
+  /// the group-scoped diagnostic and the real same-group `Warning`/`Error` must
+  /// therefore both ride the in-stream `tags()` path so their FoundTag order is
+  /// faithful (the survivor is whichever the walk reached FIRST). Pinned by the
+  /// `Matroska_warning_collision*.mkv` goldens.
   fn insert(&mut self, group: &str, name: &str, value: TagValue) {
     // O(1) dedup on the `(family1, name)` PAIR — no `"g:n"` string is built here
     // (it is materialized once per surviving entry at serialization). The probe
@@ -117,10 +149,15 @@ impl TagMap {
     // `SmolStr::new` stores them INLINE (a memcpy, NO heap allocation). On a
     // MISS the freshly-built key is moved straight into the index + entries (no
     // re-clone); on a HIT the latest value replaces in place, keeping
-    // first-occurrence POSITION (faithful `FoundTag` last-wins).
+    // first-occurrence POSITION (faithful `FoundTag` last-wins) — EXCEPT for the
+    // priority-0 `Warning`/`Error` pseudo-tags, where a HIT keeps the
+    // FIRST-extracted value (see the doc comment).
     let key = (SmolStr::new(group), SmolStr::new(name));
     if let Some(&idx) = self.index.get(&key) {
-      self.entries[idx].2 = value;
+      // `Warning`/`Error` are priority-0 ⇒ first-extracted wins (no override).
+      if !is_priority_zero_pseudo_tag(name) {
+        self.entries[idx].2 = value;
+      }
       return;
     }
     let idx = self.entries.len();

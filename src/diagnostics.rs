@@ -79,11 +79,16 @@ impl Severity {
 /// `ExifTool` group (the document-level `ExifTool:Warning`) when none is set.
 /// So a diagnostic with `group == None` is the document-level warning/error
 /// (drained into the [`TagMap`](crate::tagmap::TagMap)'s warning/error
-/// accumulator); a diagnostic with `group == Some("Info")` /
-/// `Some("MXF")` / `Some("Track1")` is the group-scoped `<group>:Warning` /
-/// `<group>:Error` TAG (emitted into the same `TagMap` via the normal tag
-/// path, exactly as QuickTime's `Track<N>:Warning` rides its `Taggable`
-/// stream). See [`run_diagnostics`].
+/// accumulator). A diagnostic with `group == Some(...)` is GROUP-SCOPED —
+/// the `<group>:Warning`/`<group>:Error` TAG. NOTE (Phase B R1): the ported
+/// formats do NOT raise group-scoped diagnostics through this channel; a
+/// `<group>:Warning`/`<group>:Error` is emitted IN-STREAM as an ordinary tag
+/// in the format's [`Taggable`](crate::emit::Taggable) `tags()` at the walk
+/// position (like QuickTime's `Track<N>:Warning`), so a collision with a real
+/// same-group `Warning`/`Error` is resolved by faithful FoundTag order
+/// (priority-0 first-wins, [`crate::tagmap::TagMap`]). The group-scoped
+/// constructors + the `run_diagnostics` group arm are retained for the general
+/// API surface — see [`run_diagnostics`] for why production routes in-stream.
 ///
 /// Encapsulated per the crate accessor convention (no public fields): build
 /// with [`Diagnostic::warn`] / [`Diagnostic::error`] (the document-level
@@ -242,16 +247,31 @@ pub trait Diagnose {
 ///   surfaces only the FIRST of each
 ///   ([`TagMap::first_warning`](crate::tagmap::TagMap::first_warning) /
 ///   [`first_error`](crate::tagmap::TagMap::first_error)) as
-///   `ExifTool:Warning` / `ExifTool:Error`. UNCHANGED from B.1.
+///   `ExifTool:Warning` / `ExifTool:Error`. This is the path EVERY ported
+///   format uses for its document-level diagnostics.
 /// - **`group == Some(g)` ⇒ group-scoped** (a `SET_GROUP1` was active). Emitted
 ///   as a `Warning` / `Error` TAG in family-1 group `g` via the normal tag path
-///   ([`TagMap::write_value`](crate::tagmap::TagMap::write_value)), so it
-///   surfaces as `<g>:Warning` / `<g>:Error` in the `-G1` document — byte-for-
-///   byte how QuickTime's `Track<N>:Warning` rides its `Taggable` stream
-///   (`formats/quicktime.rs`), and how the bundled `FoundTag('Warning', $str)`
-///   (`ExifTool.pm:5638`) places it. Because the group-scoped key is unique
-///   (`Info:Warning`, `MXF:Warning`, …), running AFTER `run_emission` is
-///   value-equivalent (the `%noDups`/last-wins key set is unchanged).
+///   ([`TagMap::write_value`](crate::tagmap::TagMap::write_value)), surfacing as
+///   `<g>:Warning` / `<g>:Error`.
+///
+///   **IMPORTANT — production formats do NOT use this arm.** A group-scoped
+///   `<g>:Warning`/`<g>:Error` can COLLIDE on its `-G1` token with a real
+///   same-family-1 `Warning`/`Error` TAG (e.g. a Matroska SimpleTag
+///   `TagName=Warning`). Both are priority-0 (`Extra`/`StdTag`
+///   `Priority => 0`), so ExifTool keeps whichever the WALK reached FIRST
+///   (ExifTool.pm:9544-9560 / 5404-5417). `run_diagnostics` runs AFTER
+///   `run_emission` (the whole tag stream), so draining a group-scoped warning
+///   HERE would place it after every real tag in FoundTag order — inverting the
+///   walk order vs a real same-group `Warning` and (pre-fix) clobbering it under
+///   last-wins. The fix: group-scoped `<g>:Warning`/`<g>:Error` are emitted
+///   IN-STREAM as ordinary tags by the format's [`Taggable`](crate::emit::Taggable)
+///   `tags()` AT THE WALK POSITION — exactly how QuickTime rides
+///   `Track<N>:Warning`, and how Matroska / MXF now emit their group-scoped
+///   warnings — so the [`TagMap`](crate::tagmap::TagMap)'s priority-0 first-wins
+///   (`Warning`/`Error`) resolves the collision by faithful FoundTag order. This
+///   arm is therefore retained ONLY for the general API surface (and the unit
+///   tests); the [`Diagnose`] impls of the ported formats yield only
+///   `group == None` diagnostics.
 ///
 /// Faithful multi-warning accumulation / `[x$n]` / `[minor]` prefixing is
 /// DEFERRED to Phase C (the `ignorable`/`no_count` flags are carried for it).

@@ -1584,6 +1584,71 @@ fn matroska_illegal_float_size_conformance() {
 }
 
 #[test]
+fn matroska_warning_collision_conformance() {
+  // Golden-v2 Phase B R1 — a group-scoped `$et->Warn` `Warning` TAG colliding
+  // with a REAL same-group SimpleTag `Warning` on the `-G1` output key
+  // `Info:Warning`. Both are the pseudo-tag `Warning`: the diagnostic is the
+  // `Extra` table `Warning` (`Priority => 0`, ExifTool.pm:1299), the SimpleTag
+  // is the `StdTag` table `Warning` (table `PRIORITY => 0`, Matroska.pm:752).
+  // ExifTool NEVER lets a priority-0 duplicate override (the new value is
+  // shunted to `Warning (1)`, ExifTool.pm:9544-9560) and the default `%noDups`
+  // output keeps the FIRST-extracted by file order (ExifTool.pm:5404-5417) —
+  // i.e. whichever the walk reached FIRST wins.
+  //
+  // FORWARD fixture: Info[MuxingApp, WritingApp, Duration(size 3 — illegal
+  // float, raises `Info:Warning` AT the Duration walk position),
+  // SimpleTag[TagName=Warning, TagString="from-simpletag"]]. The illegal-float
+  // diagnostic is walk-FIRST, so the oracle survivor is `Info:Warning =
+  // "Illegal float size (3)"` (NOT the later SimpleTag). This pins that the
+  // diagnostic — now emitted IN-STREAM at its walk position (not drained last)
+  // — correctly wins when it is the first FoundTag. (The old run_diagnostics-
+  // last path also produced this value, by accident of last-wins; the reverse
+  // fixture is the one that exercised the bug.) Goldens are `gen_golden.sh`
+  // 13.59 output, version stamp normalized to 13.58.
+  check(
+    "Matroska_warning_collision.mkv",
+    "Matroska_warning_collision.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_warning_collision.mkv",
+    "Matroska_warning_collision.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_warning_collision_rev_conformance() {
+  // Golden-v2 Phase B R1 (the bug-exercising direction) — same `Info:Warning`
+  // collision as `matroska_warning_collision`, but the REAL SimpleTag
+  // `Warning` is walk-FIRST and the illegal-float diagnostic is walk-LATER:
+  // Info[MuxingApp, WritingApp, SimpleTag[TagName=Warning,
+  // TagString="from-simpletag"], Duration(size 3)]. The SimpleTag is the first
+  // FoundTag, so the oracle survivor is `Info:Warning = "from-simpletag"` (the
+  // priority-0 diagnostic raised later does NOT override it).
+  //
+  // This is the case the pre-fix port got WRONG: it drained the group-scoped
+  // diagnostic through `run_diagnostics` AFTER `run_emission` (which had
+  // already written the SimpleTag `Info:Warning`), and TagMap's last-wins
+  // clobbered the SimpleTag with the diagnostic → `"Illegal float size (3)"`,
+  // diverging from the oracle. The fix emits the group-scoped warning
+  // IN-STREAM at its walk position (mirroring QuickTime's `Track<N>:Warning`)
+  // and makes `Warning`/`Error` FIRST-wins in TagMap (the faithful priority-0
+  // dedup), so the first-walked SimpleTag survives. Goldens normalized to
+  // 13.58.
+  check(
+    "Matroska_warning_collision_rev.mkv",
+    "Matroska_warning_collision_rev.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_warning_collision_rev.mkv",
+    "Matroska_warning_collision_rev.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
 fn matroska_truncated_header_conformance() {
   // Golden-v2 Phase B.1.5 — the `Truncated Matroska header` warning + NO
   // `File:*` (Matroska.pm:1003-1006). When the EBML header's declared body

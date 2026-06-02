@@ -121,7 +121,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// PLIST chronology's running `… → 283` figure is relative to lib/plist's
 /// older fork base; the absolute total against the live golden directory is
 /// 327 (`275 + 52`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 339;
+const EXPECTED_ACTIVE_FIXTURES: usize = 341;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -1225,9 +1225,19 @@ fn typed_serde_path_equals_writer_path_and_golden_all_336() {
   //     triplet (`return 1` before `SetFileType`);
   //   * `MXF_bad_array.mxf` — the group-scoped `MXF:Warning`
   //     `Bad array or batch size` (MXF.pm:2528, under `SET_GROUP1 = 'MXF'`).
-  // (The group-scoped `<group>:Warning` tags ride the typed `Rendered` path
-  // via `serialize_tags`'s `run_diagnostics`, so the typed-serde path matches
-  // the writer + golden without lifting them as orchestration keys.)
+  // 339 → 341 after Golden-v2 Phase B R1 (group-scoped `<group>:Warning` tags
+  // moved IN-STREAM + the priority-0 `Warning`/`Error` first-wins dedup):
+  // added 2 crafted MKV fixtures pinning a `$et->Warn` `Info:Warning` colliding
+  // with a real same-group SimpleTag `Warning` —
+  //   * `Matroska_warning_collision.mkv` — illegal-float Duration (diagnostic)
+  //     WALK-FIRST, then the SimpleTag ⇒ survivor `"Illegal float size (3)"`;
+  //   * `Matroska_warning_collision_rev.mkv` — SimpleTag WALK-FIRST, then the
+  //     illegal-float Duration ⇒ survivor `"from-simpletag"` (the case the
+  //     pre-fix run_diagnostics-last path got wrong).
+  // (Group-scoped `<group>:Warning`/`<group>:Error` are now emitted IN-STREAM
+  // as ordinary TAGs by each format's `tags()` — like QuickTime's
+  // `Track<N>:Warning` — so the typed-serde path matches the writer + golden;
+  // only DOCUMENT-level `ExifTool:Warning`/`:Error` still ride `run_diagnostics`.)
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(

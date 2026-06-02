@@ -1912,15 +1912,6 @@ pub struct MxfMeta<'a> {
   /// …) if a header pack was seen — bundled `$$et{MXFInfo}{HeaderType}`
   /// (MXF.pm:2440).
   header_type: Option<SmolStr>,
-  /// The `$et->Warn` channel (Phase B.1.5). MXF runs entirely under
-  /// `$$et{SET_GROUP1} = 'MXF'` (set MXF.pm:2838, cleared :2966), so EVERY
-  /// `$et->Warn` raised during the walk is the group-scoped `MXF:Warning`
-  /// TAG (`ExifTool.pm:5638`/`:9475`), NOT the document `ExifTool:Warning`.
-  /// The lone reachable site is `Bad array or batch size` (MXF.pm:2528); the
-  /// `Seek error` (MXF.pm:2822) is unreachable in this in-memory port (no
-  /// fallible `RAF->Seek`). Drained by the
-  /// [`Diagnose`](crate::diagnostics::Diagnose) impl.
-  warnings: Vec<crate::diagnostics::Diagnostic>,
   /// Phantom anchor for the `'a` GAT lifetime (the Meta is fully owned).
   _marker: core::marker::PhantomData<&'a ()>,
 }
@@ -2044,11 +2035,6 @@ struct Walker {
   /// `HeaderSize` field (offset 32): header bytes counted from the start of
   /// the Primer. `None` until a header pack carrying the field is parsed.
   header_size: Option<u64>,
-  /// The `$et->Warn` channel accumulated during the walk (Phase B.1.5). MXF
-  /// runs under `SET_GROUP1 = 'MXF'`, so every warning is group-scoped
-  /// `MXF:Warning` (see [`MxfMeta::warnings`]). Moved into [`MxfMeta`] at
-  /// parse end.
-  warnings: Vec<crate::diagnostics::Diagnostic>,
 }
 
 impl Walker {
@@ -2066,19 +2052,28 @@ impl Walker {
       edit_rate_by_group: std::collections::HashMap::new(),
       footer_position: 0,
       header_size: None,
-      warnings: Vec::new(),
     }
   }
 
-  /// Raise a faithful group-scoped `$et->Warn(msg)` — MXF runs under
-  /// `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838), so the warning is always the
-  /// `MXF:Warning` TAG (`ExifTool.pm:9475`).
+  /// Raise a faithful group-scoped `$et->Warn(msg)` — MXF runs entirely under
+  /// `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared :2966), so EVERY warning
+  /// is the `MXF:Warning` TAG (`ExifTool.pm:9475`), never the document-level
+  /// `ExifTool:Warning`. It is pushed AS AN IN-STREAM [`WalkEntry`] at this walk
+  /// position (mirroring QuickTime's `Track<N>:Warning` and Matroska's
+  /// group-scoped warnings) rather than routed through the later-running
+  /// diagnostics channel, so a same-key collision would be resolved by FoundTag
+  /// order (priority-0 first-wins, `TagMap::insert`). The `Warning` entry
+  /// carries `instance_uid = None` (so `finalize_entries`' reverse-order dedup
+  /// `next`s past it — never deduplicated) and is NOT recorded in any object's
+  /// `entry_indices`, so `set_groups` leaves its `MXF` family-1 group intact.
   fn push_mxf_warning(&mut self, message: impl Into<SmolStr>) {
-    self
-      .warnings
-      .push(crate::diagnostics::Diagnostic::warn_in_group(
-        GROUP_MXF, message,
-      ));
+    self.entries.push(WalkEntry {
+      group: SmolStr::new_static(GROUP_MXF),
+      name: SmolStr::new_static("Warning"),
+      value: MxfValue::Str(message.into()),
+      is_duration: false,
+      instance_uid: None,
+    });
   }
 }
 
@@ -2223,7 +2218,6 @@ fn parse_inner(data: &[u8]) -> Option<MxfMeta<'_>> {
   Some(MxfMeta {
     entries,
     header_type: w.header_type,
-    warnings: w.warnings,
     _marker: core::marker::PhantomData,
   })
 }
@@ -2864,16 +2858,15 @@ const GROUP_MXF: &str = "MXF";
 
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for MxfMeta<'_> {
-  /// MXF's `$et->Warn` channel, in walk (FoundTag) order. MXF runs under
-  /// `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838), so each
-  /// [`Diagnostic`](crate::diagnostics::Diagnostic) is group-scoped to `MXF`
-  /// (→ `MXF:Warning` TAG, NOT the document `ExifTool:Warning`). The lone
-  /// reachable site is `Bad array or batch size` (MXF.pm:2528); `Seek error`
-  /// (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory port lacks, so
-  /// it is unreachable and never queued.
-  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
-    self.warnings.clone()
-  }
+  // MXF has NO document-level diagnostics — it runs entirely under
+  // `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared :2966), so EVERY
+  // `$et->Warn` raised during the walk is the group-scoped `MXF:Warning` TAG
+  // (`ExifTool.pm:5638`/`:9475`), emitted IN-STREAM via the `Taggable` impl
+  // (see [`Walker::push_mxf_warning`]), not the document `ExifTool:Warning`.
+  // The lone reachable warning is `Bad array or batch size` (MXF.pm:2528);
+  // `Seek error` (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory port
+  // lacks, so it is unreachable. The trait default (no diagnostics) therefore
+  // applies.
 }
 
 // ===========================================================================
@@ -3420,7 +3413,6 @@ mod tests {
         },
       ],
       header_type: None,
-      warnings: std::vec::Vec::new(),
       _marker: core::marker::PhantomData,
     };
 

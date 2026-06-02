@@ -2187,18 +2187,22 @@ pub struct Meta<'a> {
   /// Cached `TimecodeScale` raw nanoseconds (Matroska.pm:160-166). Drives
   /// the Duration / DefaultDuration / etc. ValueConv at emit time.
   timecode_scale_ns: Option<u64>,
-  /// The `$et->Warn` channel (Phase B.1.5). Each entry is a faithful
-  /// `$et->Warn(msg)` raised during the walk, carrying the family-1 group
-  /// active at `Warn` time (the port's `current_group`, mapped to `None`
-  /// when no `SET_GROUP1` was active — see [`Walker::push_warning`]):
-  /// `Some("Info")`/`Some("Track1")` ⇒ a `<group>:Warning` TAG;
-  /// `None` ⇒ the document-level `ExifTool:Warning`. Drained by the
-  /// [`Diagnose`](crate::diagnostics::Diagnose) impl.
+  /// The DOCUMENT-level `$et->Warn` channel (Phase B.1.5). Each entry is a
+  /// faithful `$et->Warn(msg)` raised during the walk while NO `SET_GROUP1` was
+  /// active (the port's `current_group == DEFAULT_GROUP`) — so it is the
+  /// document-level `ExifTool:Warning` (`ExifTool.pm:9475`), drained by the
+  /// [`Diagnose`](crate::diagnostics::Diagnose) impl. GROUP-SCOPED warnings
+  /// (`Info` / `Track<N>` / `Chapter<n>`) are NOT here — they are emitted as
+  /// in-stream `<group>:Warning` TAGs (an [`Entry`] in [`Self::entries`] at the
+  /// walk position, mirroring QuickTime's `Track<N>:Warning`), see
+  /// [`Walker::push_warning`].
   ///
-  /// Sites (Matroska.pm): `Illegal float size` (1179, group-scoped),
-  /// `Invalid or corrupted … master element` (1075, group-scoped when a
-  /// `SET_GROUP1` is active else document), `Truncated Matroska header`
-  /// (1006, document-level — see [`Meta::suppress_file_type`]).
+  /// Sites (Matroska.pm): `Truncated Matroska header` (1006, document-level —
+  /// see [`Meta::suppress_file_type`]); `Invalid or corrupted … master element`
+  /// (1075) lands here ONLY when raised directly inside Segment with no
+  /// `SET_GROUP1` active (group-scoped occurrences go in-stream). `Illegal float
+  /// size` (1179) is always raised inside a group (`Info`/`Track<N>`), so it is
+  /// always an in-stream tag.
   warnings: Vec<crate::diagnostics::Diagnostic>,
   /// `true` when the EBML header was truncated (Matroska.pm:1006 `return 1`
   /// WITHOUT a preceding `SetFileType`) — the engine must then emit NO
@@ -2372,27 +2376,46 @@ struct Walker<'a> {
   /// (Matroska.pm:1210-1216) to override `SET_GROUP1` for the duration of
   /// the surrounding `Tag` master.
   track_uid_to_group: std::collections::HashMap<Vec<u8>, SmolStr>,
-  /// The `$et->Warn` channel accumulated during the walk (Phase B.1.5). Each
-  /// is pushed via [`Walker::push_warning`], which captures the family-1 group
-  /// active at `Warn` time. Moved into [`Meta::warnings`] at parse end.
+  /// The DOCUMENT-level `$et->Warn` channel accumulated during the walk (Phase
+  /// B.1.5). Pushed via [`Walker::push_warning`] ONLY when no `SET_GROUP1` is
+  /// active; group-scoped warnings go in-stream as `<group>:Warning` tags in
+  /// [`Self::entries`] instead. Moved into [`Meta::warnings`] at parse end.
   warnings: Vec<crate::diagnostics::Diagnostic>,
 }
 
 impl Walker<'_> {
   /// Raise a faithful `$et->Warn(msg)` (Matroska.pm). The family-1 group is the
-  /// active `SET_GROUP1`: the port models that as `current_group` while a
-  /// group is locked, and `DEFAULT_GROUP` ("Matroska") when none is — which is
-  /// exactly when bundled's `$$et{SET_GROUP1}` is unset, so the warning is
-  /// DOCUMENT-level (`ExifTool:Warning`, `ExifTool.pm:9475`). When a group IS
-  /// active (`Info` / `Track<N>` / `Chapter<n>`) the warning is the group-
-  /// scoped `<group>:Warning` TAG.
+  /// active `SET_GROUP1`: the port models that as `current_group` while a group
+  /// is locked, and `DEFAULT_GROUP` ("Matroska") when none is — which is exactly
+  /// when bundled's `$$et{SET_GROUP1}` is unset.
+  ///
+  /// - **No group active** (`current_group == DEFAULT_GROUP`): the warning is
+  ///   DOCUMENT-level (`ExifTool:Warning`, `ExifTool.pm:9475`) and rides the
+  ///   [`Diagnose`](crate::diagnostics::Diagnose) channel ([`Meta::warnings`]).
+  /// - **A group IS active** (`Info` / `Track<N>` / `Chapter<n>`): the warning
+  ///   is the group-scoped `<group>:Warning` TAG. It is pushed AS AN
+  ///   [`Entry`] into the tag stream AT THIS WALK POSITION (mirroring
+  ///   QuickTime's in-stream `Track<N>:Warning`), so the normal `tags()`
+  ///   emission + first-occurrence dedup resolves a collision with a real
+  ///   same-group `Warning` (e.g. a SimpleTag `TagName=Warning`) by FoundTag
+  ///   order — the priority-0 `Warning` first-extracted wins
+  ///   (`TagMap::insert`, ExifTool.pm:9544-9560 / 5404-5417). Routing it through
+  ///   the LATER-running diagnostics channel instead would clobber an
+  ///   earlier-walked SimpleTag `Warning` (the Phase-B collision bug).
   fn push_warning(&mut self, message: impl Into<SmolStr>) {
-    let d = if self.current_group.as_str() == DEFAULT_GROUP {
-      crate::diagnostics::Diagnostic::warn(message)
+    if self.current_group.as_str() == DEFAULT_GROUP {
+      self
+        .warnings
+        .push(crate::diagnostics::Diagnostic::warn(message));
     } else {
-      crate::diagnostics::Diagnostic::warn_in_group(self.current_group.clone(), message)
-    };
-    self.warnings.push(d);
+      // Group-scoped ⇒ a `<group>:Warning` TAG, emitted in walk order.
+      let msg: SmolStr = message.into();
+      self.entries.push(Entry {
+        group: self.current_group.clone(),
+        name: SmolStr::new_static("Warning"),
+        value: Value::Str(Cow::Owned(msg.as_str().to_owned())),
+      });
+    }
   }
 }
 
@@ -3326,22 +3349,25 @@ fn hex_lower(b: &[u8]) -> SmolStr {
 
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for Meta<'_> {
-  /// Matroska's `$et->Warn` channel, in walk (FoundTag) order. Each
-  /// [`Diagnostic`](crate::diagnostics::Diagnostic) already carries its
-  /// family-1 group (the active `$$et{SET_GROUP1}` at `Warn` time —
-  /// [`Walker::push_warning`]): a group-scoped one (`Info` / `Track<N>` /
-  /// `Chapter<n>`) surfaces as the `<group>:Warning` TAG, an ungrouped one as
-  /// the document `ExifTool:Warning`. Sites:
-  /// - `Illegal float size (N)` (Matroska.pm:1179) — group-scoped to the
-  ///   active group (e.g. `Info:Warning` for a bad-size `Duration`,
-  ///   `Track<N>:Warning` for a bad-size `AudioSampleRate`).
-  /// - `Invalid or corrupted <name> master element` (Matroska.pm:1075) —
-  ///   group-scoped when a `SET_GROUP1` is active, else document.
+  /// Matroska's DOCUMENT-level `$et->Warn` channel, in walk (FoundTag) order.
+  /// Only the warnings raised with NO `SET_GROUP1` active live here (they
+  /// surface as the document `ExifTool:Warning`); GROUP-SCOPED warnings
+  /// (`Info` / `Track<N>` / `Chapter<n>`) are emitted as in-stream
+  /// `<group>:Warning` TAGs by [`Walker::push_warning`] (see [`Meta::warnings`]
+  /// and the [`Taggable`](crate::emit::Taggable) impl) — exactly how QuickTime
+  /// rides `Track<N>:Warning` on its tag stream — so a collision with a real
+  /// same-group `Warning` (a SimpleTag `TagName=Warning`) is resolved by
+  /// FoundTag order (priority-0 first-wins, `TagMap::insert`). Sites that can
+  /// reach this channel:
   /// - `Truncated Matroska header` (Matroska.pm:1006) — document-level (the
   ///   `Meta` then also reports [`Meta::suppress_file_type`]).
+  /// - `Invalid or corrupted <name> master element` (Matroska.pm:1075) — ONLY
+  ///   when raised directly inside Segment with no `SET_GROUP1` (the
+  ///   group-scoped occurrences are in-stream tags).
   ///
-  /// (`Processing large block`, Matroska.pm:1140, is `LargeFileSupport==2`-
-  /// gated — this port exposes no such option, so it is unreachable and never
+  /// (`Illegal float size (N)`, Matroska.pm:1179, is always raised inside a
+  /// group, so it is always an in-stream tag. `Processing large block`,
+  /// Matroska.pm:1140, is `LargeFileSupport==2`-gated — unreachable, never
   /// queued.)
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     self.warnings.clone()
