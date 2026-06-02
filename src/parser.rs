@@ -512,18 +512,19 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     // (ExifTool.pm:1045 `…(\xef\xbb\xbf)?…\s*<`) accepts the BOM that the PLIST
     // `%magicNumber` (ExifTool.pm:1015 `(bplist0|\s*<|…)`) does not, so XMP is the
     // first/only candidate; `ProcessXMP` then `SetFileType('PLIST',
-    // 'application/xml')` and hands the body to `PLIST::FoundTag`. This port has
-    // no standalone XMP parser, so replicate that hop here: when the candidate is
-    // `XMP` and the content is an XML `<plist>`, finalize as `PLIST` and dispatch
-    // to `ProcessPlist`. `magic()` stays a faithful 1:1 of `%magicNumber` (the
+    // 'application/xml')` and hands the body to `PLIST::FoundTag`. The ported
+    // standalone XMP parser ([`crate::formats::xmp::ProcessXmp`]) REJECTS a
+    // `<plist>`-rooted document (`Ok(None)` — PLIST is a separate module, not an
+    // XMP sidecar), so the relabel MUST happen here: when the candidate is `XMP`
+    // and the content is an XML `<plist>`, finalize as `PLIST` and dispatch to
+    // `ProcessPlist`. A genuine XMP sidecar (xpacket/xmpmeta/`<rdf:RDF>` root)
+    // does NOT satisfy `xml_content_is_plist`, so it stays `XMP` and dispatches
+    // to the XMP parser. `magic()` stays a faithful 1:1 of `%magicNumber` (the
     // PLIST gate is unchanged); the BOM tolerance lives only in this XMP→PLIST
     // route, exactly where bundled's lives. (A non-BOM XML plist is unaffected:
     // `ProcessPlist` accepts it here just as it did at the later PLIST candidate.)
     #[cfg(feature = "plist")]
-    let ft = if ft == "XMP"
-      && any_parser_for("XMP").is_none()
-      && crate::formats::plist::xml_content_is_plist(data)
-    {
+    let ft = if ft == "XMP" && crate::formats::plist::xml_content_is_plist(data) {
       "PLIST"
     } else {
       ft
@@ -708,6 +709,59 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
             "File:MIMEType".into(),
             Value::String(mime.to_string()),
           );
+        }
+        FileTypeFinalize::DetectedThenOverrideWithMime(payload) => {
+          // SetFileType() (detected) then OverrideFileType($file_type,$mime) with
+          // an EXPLICIT MIME (XMP Nikon NX-D, XMP.pm:3916).
+          //
+          // `OverrideFileType` is GUARDED by `$fileType ne $$self{VALUE}{FileType}`
+          // (ExifTool.pm:9715): it fires ONLY when the override type DIFFERS from
+          // the type `SetFileType` already produced. For a `.xmp` Nikon NX-D
+          // sidecar `SetFileType` resolves `XMP`, so `NXD ne XMP` ⇒ the override
+          // fires: FileType + FileTypeExtension are replaced (from the override
+          // type) and the MIME is taken VERBATIM from the explicit argument
+          // (ExifTool.pm:9723 — the passed `$mimeType` wins over `%mimeType`,
+          // which has NO `NXD` entry). When the detected type is ALREADY the
+          // override type (e.g. a `.nxd`-extension input whose `SetFileType`
+          // resolves `NXD`), the guard is FALSE ⇒ the override is a no-op and the
+          // base triplet (incl. its table MIME) stands — verified vs bundled 13.58
+          // (a `.nxd` file keeps `application/rdf+xml`, NOT the explicit MIME).
+          let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
+          if base.file_type == payload.file_type() {
+            // `$fileType ne $$self{VALUE}{FileType}` FALSE ⇒ no override.
+            insert(
+              &mut obj,
+              "File:FileType".into(),
+              Value::String(base.file_type),
+            );
+            insert(
+              &mut obj,
+              "File:FileTypeExtension".into(),
+              serde_json::to_value(&base.file_type_extension).unwrap_or(Value::Null),
+            );
+            insert(
+              &mut obj,
+              "File:MIMEType".into(),
+              Value::String(base.mime_type),
+            );
+          } else {
+            // Override fires: FileType + extension from the override type; MIME
+            // verbatim from the explicit argument (`resolve_override_file_type`'s
+            // table-derived MIME is `None` for `NXD`, so it is discarded).
+            let (ov_ft, ov_ext, _ov_mime) =
+              resolve_override_file_type(payload.file_type(), print_conv_enabled);
+            insert(&mut obj, "File:FileType".into(), Value::String(ov_ft));
+            insert(
+              &mut obj,
+              "File:FileTypeExtension".into(),
+              serde_json::to_value(&ov_ext).unwrap_or(Value::Null),
+            );
+            insert(
+              &mut obj,
+              "File:MIMEType".into(),
+              Value::String(payload.mime().to_string()),
+            );
+          }
         }
         FileTypeFinalize::None => {
           // No `SetFileType` (accepted-but-no-finalize): emit NO `File:*`

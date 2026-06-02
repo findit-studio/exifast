@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "XMP_uri_fixed.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[minor] Fixed incorrect URI for xmlns:dc",
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "XMP",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-dc:Title": "hello"
+}]

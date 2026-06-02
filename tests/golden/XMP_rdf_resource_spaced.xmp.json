@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "XMP_rdf_resource_spaced.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:Link": "",
+  "XMP-foo:LinkTight": "http://example.com/tight",
+  "XMP-foo:ValSpaced": "",
+  "XMP-foo:ValTight": "tightValue"
+}]

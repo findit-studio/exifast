@@ -250,7 +250,10 @@ impl TagMap {
   /// Emit a pre-built [`TagValue`] directly (no per-type conversion). The
   /// MakerNotes typed-vendor parsers ([`crate::exif::makernotes::vendors`])
   /// produce already-typed values (the per-tag PrintConv has run), so
-  /// `write_value` is the right sink for them.
+  /// `write_value` is the right sink for them. XMP also routes through it: its
+  /// typed `Meta` already produces a finished value tree — a nested
+  /// [`TagValue::Map`]/[`TagValue::List`] assembled by the parser's own
+  /// struct-rebuild pass (`RestoreStruct`, XMPStruct.pl:708).
   pub(crate) fn write_value(
     &mut self,
     group: &str,
@@ -345,7 +348,7 @@ impl TagMap {
         let _ = write!(&mut s, "{}/{}", r.numerator(), r.denominator());
         s
       }
-      TagValue::List(_) => std::format!("{v:?}"),
+      TagValue::List(_) | TagValue::Map(_) => std::format!("{v:?}"),
     })
   }
 }

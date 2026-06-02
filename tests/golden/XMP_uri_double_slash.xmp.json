@@ -1,0 +1,10 @@
+[{
+  "SourceFile": "XMP_uri_double_slash.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "[minor] Fixed incorrect URI for xmlns:exif",
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-exif:GPSLatitude": "45 deg 30' 0.00\" N",
+  "XMP-exif:GPSLongitude": "122 deg 30' 30.00\" W"
+}]

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "XMP_base64_escaped.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:EscTruncate": "hel",
+  "XMP-foo:EscAmp": "a&b"
+}]

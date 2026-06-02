@@ -1,0 +1,18 @@
+[{
+  "SourceFile": "XMP8.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "XMP",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-x:XMPToolkit": "Image::ExifTool 11.58",
+  "XMP-iptcExt:AboutCvTerm": [{
+    "CvId": 1,
+    "CvTermName": "one"
+  },{
+    "CvId": 2,
+    "CvTermName": "two"
+  },{
+    "CvId": 3,
+    "CvTermName": "three"
+  }]
+}]

@@ -1,0 +1,20 @@
+[{
+  "SourceFile": "XMP_thumbnail.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-xmp:Thumbnails": [{
+    "Format": "JPEG",
+    "Height": 120,
+    "Image": "(Binary data 33 bytes, use -b option to extract)",
+    "Width": 160
+  }],
+  "XMP-xmp:PageInfo": [{
+    "Format": "JPEG",
+    "Height": 80,
+    "Image": "(Binary data 5 bytes, use -b option to extract)",
+    "PageNumber": 1,
+    "Width": 120
+  }]
+}]

@@ -267,6 +267,12 @@ pub enum TagValue {
   Rational(Rational),
   /// An ordered list of values.
   List(Vec<TagValue>),
+  /// An ordered key/value object. Used for ExifTool's structured-value
+  /// (`-struct`) output — e.g. an XMP `rdf:parseType="Resource"` structure
+  /// or a flattened struct rebuilt by `RestoreStruct` (XMPStruct.pl:708).
+  /// Keys preserve first-occurrence order; the value-semantic JSON
+  /// comparator (`jsondiff`) makes that order non-load-bearing.
+  Map(Vec<(SmolStr, TagValue)>),
 }
 
 /// ExifTool group identity. `family0` is the broad category (e.g. `"QuickTime"`,
@@ -717,7 +723,7 @@ impl Metadata {
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 const _: () = {
-  use serde::ser::{Serialize, SerializeSeq, Serializer};
+  use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
   impl Serialize for Rational {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -802,6 +808,14 @@ const _: () = {
             seq.serialize_element(item)?;
           }
           seq.end()
+        }
+        // Structured ExifTool `-struct` value: an ordered JSON object.
+        TagValue::Map(pairs) => {
+          let mut map = s.serialize_map(Some(pairs.len()))?;
+          for (k, v) in pairs {
+            map.serialize_entry(k.as_str(), v)?;
+          }
+          map.end()
         }
       }
     }

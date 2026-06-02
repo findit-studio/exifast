@@ -1,0 +1,40 @@
+[{
+  "SourceFile": "XMP4.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "XMP",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-x:XMPToolkit": "Image::ExifTool 7.77",
+  "XMP-iptcExt:LocationCreated": [{
+    "City": "one",
+    "CountryCode": 1
+  },{
+    "City": "two",
+    "CountryCode": 2
+  },{
+    "City": "three"
+  },{
+    "CountryCode": 4
+  }],
+  "XMP-dc:Contributor": ["me"],
+  "XMP-dc:Subject": ["one","two"],
+  "XMP-test:StructList2": [{
+    "Item1": "c1-1",
+    "Item2": "c2-1"
+  },{
+    "Item1": "c1-2",
+    "Item2": "c2-2",
+    "TestList1": ["x1"],
+    "TestList2": ["y1","y2"]
+  }],
+  "XMP-test:StructList1": [{
+    "Item1": "b1",
+    "Item2": "b2"
+  }],
+  "XMP-test:BareStruct": {
+    "Item1": "a1",
+    "Item2": "a2"
+  },
+  "XMP-test:BareList2": ["b1","b2"],
+  "XMP-test:BareList1": ["a1"]
+}]

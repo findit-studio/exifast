@@ -147,7 +147,86 @@ const NOT_ACTIVE: &[&str] = &[
 /// `QuickTime_gopro_scen.mov`, a synthetic `moov/udta/GPMF` whose `SCEN`
 /// (SceneClassification, `TYPE=Ff`) complex record carries an embedded `F`
 /// FourCC column the pre-R13 numeric-only decoder dropped. 346 → 347.
-const EXPECTED_ACTIVE_FIXTURES: usize = 347;
+///
+/// Post-rebase (lib/xmp onto the gopro-merged main, 347 ACTIVE): the XMP
+/// fixtures (chronicled below) stack on top of gopro's 3. The XMP figures
+/// below are relative to the pre-gopro 344 base; the XMP branch adds 49 active
+/// fixtures, so the absolute live total is `347 + 49 = 396`.
+///
+/// Post-rebase (lib/xmp golden-migration onto main): main's 344 ACTIVE
+/// fixtures PLUS the 31 ACTIVE XMP fixtures from this branch = 375. The XMP
+/// chronology's running `… → 180` figure is relative to lib/xmp's older fork
+/// base (952a3fe, pre-golden-v2); the absolute total against the live golden
+/// directory is 375 (`344 + 31`).
+///
+/// XMP Codex R1 fidelity fixes: +2 — `XMP_comment_multiline.xmp` (the
+/// non-dotall `s/<!--.*?-->//g` leaf comment-strip: multiline comments
+/// PRESERVED, single-line stripped, on BOTH the rdf:Description and
+/// `$wasComment` scalar paths) + `XMP_cdata_unclosed.xmp` (the CDATA un-escape
+/// requires a COMPLETE `<![CDATA[ … ]]>` pair; an unclosed marker falls back to
+/// whole-value `UnescapeXML`). 375 → 377.
+///
+/// 377 → 378 after Codex R2 (XMP attribute-scan recovery): added
+/// `XMP_attr_junk.xmp` — a junk token (`junk`) sits between `xmlns:dc="…"` and
+/// the shorthand `dc:title="Lost"` attribute. ExifTool's COMMON-branch
+/// attribute regex `/(\S+?)\s*=\s*(['"])/g` (XMP.pm:3887) is UNANCHORED + `/g`,
+/// so the junk is SKIPPED and `dc:title`/`dc:format` still extract; the
+/// pre-fix `iter_attrs` `break`-on-malformed dropped both. Pins the unanchored
+/// left-to-right recovery scan.
+///
+/// 381 → 383 after Codex R4: `XMP_exif_printconv.xmp` (R4-A — cross-module
+/// `PrintConv => \%Image::ExifTool::Exif::{compression,
+/// photometricInterpretation,lightSource}` now render the label, not the raw
+/// int) + `XMP_et_qual.xmp` (R4-B — `et:desc`/`prt`/`val` qualifier
+/// suppression, XMP.pm:4202, emits the `et:prt` value).
+///
+/// 383 → 385 after Codex R5 (two value-divergence fixes; the broad
+/// non-camera XMP table tail is deferred to issue #190): added
+/// `XMP_aux_neutraldensity.xmp` (R5-1 — the Lightroom AUX tags after
+/// `LensDistortInfo`, XMP.pm:2641-2658; `aux:NeutralDensityFactor="1/2"` now
+/// stays verbatim instead of `ConvertRational`'d to `0.5`) +
+/// `XMP_thumbnail.xmp` (R5-2 — the `xmp:Thumbnails`/`xmp:PageInfo` structs,
+/// XMP.pm:1062/1068; the `xmpGImg:image` base64 field decodes to the
+/// `(Binary data N bytes, …)` placeholder instead of the literal base64).
+///
+/// 385 → 387 after Codex R6 (two `DecodeBase64` refinements): added
+/// `XMP_thumbnail_partial.xmp` (R6-A — the `xmpGImg:image` PARTIAL base64
+/// `aGVsb` decodes via ExifTool's uuencode `unpack('u')` chunk math to 30
+/// bytes, NOT the 3-byte standard-base64 prefix `hel`) +
+/// `XMP_thumbnail_datatype.xmp` (R6-B — a `xmpGImg:image rdf:datatype="base64"`
+/// is DOUBLE-decoded: the datatype `DecodeBase64` yields `"hello"`, then the
+/// field `ValueConv => DecodeBase64` runs on it ⇒ 43 bytes, XMP.pm:3645-3647 +
+/// 367-371).
+///
+/// 387 → 390 after Codex R8 (two verified findings): the F1 GPS-altitude-sign
+/// projection fix adds `XMP_gps_belowsea.xmp` (`GPSAltitudeRef=1` ⇒ the domain
+/// projects `-35`, the JSON tag stays the unsigned `35`) +
+/// `XMP_gps_abovesea.xmp` (the `ref=0` positive control); the F2 parse-error
+/// `$et->Warn` fix adds `XMP_no_closing_tag.xmp` (`XMP format error (no closing
+/// tag for dc:title)` — the one error class whose oracle carries no ` [x$n]`
+/// count, so it is byte-identical). The F2 CDATA/comment fixtures
+/// (`XMP_missing_cdata_term.xmp`, `XMP_missing_comment_term.xmp`) are
+/// deliberately golden-LESS — their oracle appends ` [x2]` (an XMP+PLIST
+/// dual-process artifact the single-parse port does not reproduce) — so they
+/// are covered by the `xmp_parse_error_warnings_emitted` unit test instead and
+/// do NOT count as active conformance fixtures.
+///
+/// 390 → 391: the R8 adjacent Warn-site fix (XMP.pm:3914-3915) adds
+/// `XMP_uri_fixed.xmp` — a `dc` URI missing its trailing slash trips the
+/// trailing-slash patch, raising `[minor] Fixed incorrect URI for xmlns:dc`
+/// while still extracting `XMP-dc:Title`. Default-reachable + single warning, so
+/// byte-identical.
+///
+/// 391 → 392: R9 (XMP.pm:3911 one-slash repair) adds `XMP_uri_double_slash.xmp`
+/// — `xmlns:exif=…/exif/1.0//` drops ONE slash to the known `exif` URI, raising
+/// `[minor] Fixed incorrect URI for xmlns:exif` + extracting `XMP-exif:GPS*`.
+///
+/// 392 → 393: R10 (single-item `List` domain projection) adds `XMP_iso_seq.xmp`
+/// — a one-item `exif:ISOSpeedRatings` `rdf:Seq`; the JSON stays the faithful
+/// `XMP-exif:ISO: [100]` (ExifTool keeps the list) while `domain_numeric` now
+/// descends the single-element list so `capture.iso() == Some(100)`.
+/// (Absolute live total against the gopro-merged base: `347 + 49 = 396`.)
+const EXPECTED_ACTIVE_FIXTURES: usize = 396;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -187,15 +266,15 @@ fn typed_parse<'a>(fixture: &str, data: &'a [u8]) -> Option<exifast::AnyMeta<'a>
   for cand in detection_candidates(fixture, data) {
     let ft = cand.file_type();
     // Mirror the engine's XMP→PLIST content-sniff route (see
-    // `parser::extract_info_typed`): bundled reaches a UTF-8-BOM XML plist via
-    // `ProcessXMP`'s `<plist>` relabel (XMP.pm:4385); this port has no XMP
-    // parser, so the BOM-prefixed XML `<plist>` candidate (detected as XMP) is
-    // dispatched to `ProcessPlist`. Keeping this in sync keeps the independent
-    // parity loop value-equivalent to the engine writer path.
-    let ft = if ft == "XMP"
-      && any_parser_for("XMP").is_none()
-      && exifast::formats::plist::xml_content_is_plist(data)
-    {
+    // `parser::extract_info`): bundled reaches a UTF-8-BOM XML plist via
+    // `ProcessXMP`'s `<plist>` relabel (XMP.pm:4385). The ported standalone XMP
+    // parser REJECTS a `<plist>`-rooted document (`Ok(None)`), so the
+    // BOM-prefixed XML `<plist>` candidate (detected as XMP) is relabeled to
+    // `PLIST` and dispatched to `ProcessPlist`. A genuine XMP sidecar does NOT
+    // satisfy `xml_content_is_plist`, so it stays `XMP`. Keeping this in sync
+    // keeps the independent parity loop value-equivalent to the engine writer
+    // path.
+    let ft = if ft == "XMP" && exifast::formats::plist::xml_content_is_plist(data) {
       "PLIST"
     } else {
       ft

@@ -1077,7 +1077,8 @@ fn exiftool_val_string(v: &TagValue) -> Option<String> {
     TagValue::Bytes(b) => Some(fix_utf8(b)),
     // Lists are stripped element-wise by `apply` before any hash-conv path
     // (and `apply_print_conv`'s list-arm defends the same on direct calls).
-    TagValue::List(_) => None,
+    // `Map` (XMP structured value) likewise never reaches a scalar hash-conv.
+    TagValue::List(_) | TagValue::Map(_) => None,
   }
 }
 
@@ -1550,7 +1551,7 @@ fn scalar_text(v: &TagValue) -> String {
     TagValue::Rational(r) => r.exiftool_val_str(),
     TagValue::Str(s) => s.to_string(),
     TagValue::Bool(b) => b.to_string(),
-    TagValue::Bytes(_) | TagValue::List(_) => String::new(),
+    TagValue::Bytes(_) | TagValue::List(_) | TagValue::Map(_) => String::new(),
   }
 }
 

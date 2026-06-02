@@ -63,7 +63,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 all-formats = [
   "aac", "aiff", "ape", "audible", "crw", "dsf", "dv", "exif", "flac", "flash",
   "gps", "h264", "id3", "m2ts", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
-  "plist", "png", "quicktime", "real", "red", "riff", "wavpack",
+  "plist", "png", "quicktime", "real", "red", "riff", "wavpack", "xmp",
 ]
 
 # Per-format gates with cross-format dependency chains.
@@ -213,6 +213,10 @@ red        = []
 # but those sub-tables are deferred — see `src/formats/riff.rs` module doc.
 riff       = []
 wavpack    = ["id3", "ape"]
+# `xmp` — sidecar/standalone XMP (`.xmp`). Leaf format: ports the RDF/XML
+# element walker (`ParseXMPElement`, XMP.pm) + the `%nsURI` namespace
+# table. No cross-format chains.
+xmp        = []
 
 # Internal: MPEG audio frame parser (sub-dep of mp3). Maps to
 # `src/formats/mpeg.rs` (the audio side). The video side of MPEG is a

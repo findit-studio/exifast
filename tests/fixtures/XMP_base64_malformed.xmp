@@ -1,0 +1,12 @@
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="http://example.com/foo/">
+   <foo:trailingJunk rdf:datatype="base64">aGVsbG8=#junk</foo:trailingJunk>
+   <foo:vtabTruncate rdf:datatype="base64">aGVs&#x0b;bG8=</foo:vtabTruncate>
+   <foo:noPadding rdf:datatype="base64">aGVsbG8</foo:noPadding>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

@@ -1520,7 +1520,11 @@ impl crate::emit::Taggable for Id3Meta<'_> {
       // stores the byte-identical variant.
       let value = match &tag.value {
         TagValue::Bool(b) => TagValue::U64(u64::from(*b)),
-        TagValue::Rational(_) | TagValue::List(_) => {
+        // ID3 today never produces Rational / List / Map values (the `Map`
+        // arm exists only since XMP introduced the variant); if a future
+        // frame type does, extend this match. For now render via the
+        // debug form, byte-identical to the retired serializer's path.
+        TagValue::Rational(_) | TagValue::List(_) | TagValue::Map(_) => {
           TagValue::Str(std::format!("{:?}", tag.value).into())
         }
         // Str / I64 / U64 / F64 / Bytes replay unchanged.

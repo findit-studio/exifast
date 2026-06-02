@@ -1,0 +1,14 @@
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="http://example.com/foo/">
+   <foo:ctrlNul rdf:datatype="base64">AA==</foo:ctrlNul>
+   <foo:ctrlVtab rdf:datatype="base64">Cw==</foo:ctrlVtab>
+   <foo:ctrlShiftOut rdf:datatype="base64">Dg==</foo:ctrlShiftOut>
+   <foo:textTabNlCr rdf:datatype="base64">CQoN</foo:textTabNlCr>
+   <foo:textHello rdf:datatype="base64">aGVsbG8=</foo:textHello>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

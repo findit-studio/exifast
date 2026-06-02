@@ -1,0 +1,15 @@
+<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="http://ns.example.com/foo/1.0/"
+    xmlns:et="http://ns.exiftool.org/1.0/">
+   <foo:Tag>
+    <et:desc>D</et:desc>
+    <et:prt>Print</et:prt>
+    <et:val>Value</et:val>
+   </foo:Tag>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="r"?>
