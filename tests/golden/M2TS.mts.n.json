@@ -1,0 +1,26 @@
+[
+  {
+    "SourceFile": "M2TS.mts",
+    "ExifTool:ExifToolVersion": 13.58,
+    "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
+    "File:FileType": "M2TS",
+    "File:FileTypeExtension": "MTS",
+    "File:MIMEType": "video/m2ts",
+    "M2TS:VideoStreamType": 27,
+    "M2TS:AudioStreamType": 129,
+    "M2TS:Duration": 0,
+    "AC3:AudioBitrate": 256000,
+    "AC3:SurroundMode": 0,
+    "AC3:AudioChannels": 2,
+    "AC3:AudioSampleRate": 0,
+    "H264:ImageWidth": 1920,
+    "H264:ImageHeight": 1080,
+    "H264:DateTimeOriginal": "2008:12:31 23:16:24+01:00",
+    "H264:ApertureSetting": 202,
+    "H264:Gain": 9,
+    "H264:ImageStabilization": 255,
+    "H264:ExposureTime": 0.04,
+    "H264:Make": 4113,
+    "H264:RecordingMode": 6
+  }
+]

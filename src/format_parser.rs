@@ -284,6 +284,9 @@ pub enum AnyParser {
   /// ID3 directory parser (Phase F2 — ID3v1 + ID3v2 unified).
   #[cfg(feature = "id3")]
   Id3(crate::formats::id3::ProcessId3),
+  /// M2TS (MPEG-2 Transport Stream / AVCHD camcorder container).
+  #[cfg(feature = "m2ts")]
+  M2ts(crate::formats::m2ts::ProcessM2ts),
   /// MP3 wrapper parser (Phase F2 — ID3 + audio-frame chain).
   #[cfg(feature = "mp3")]
   Mp3(crate::formats::id3::ProcessMp3),
@@ -394,6 +397,11 @@ pub enum AnyMeta<'a> {
   /// `Id3Meta` owns its strings).
   #[cfg(feature = "id3")]
   Id3(crate::formats::id3::Id3Meta<'a>),
+  /// M2TS (MPEG-2 Transport Stream / AVCHD camcorder container). Wraps a
+  /// nested [`crate::formats::h264::H264Meta`] for the H.264 video PES;
+  /// emits its own `M2TS:*` / `AC3:*` tags.
+  #[cfg(feature = "m2ts")]
+  M2ts(crate::formats::m2ts::Meta<'a>),
   /// MP3 wrapper metadata (Phase F2). Wraps [`crate::formats::id3::Id3Meta`]
   /// plus the typed MPEG-audio + APE-trailer sub-Metas (Codex BF1/CF1);
   /// the MPEG-audio sub-Meta borrows its `encoder` field from the input.
@@ -487,6 +495,7 @@ pub enum AnyMeta<'a> {
     feature = "crw",
     feature = "red",
     feature = "id3",
+    feature = "m2ts",
     feature = "mp3",
     feature = "aiff",
     feature = "ape",
@@ -553,6 +562,8 @@ impl AnyMeta<'_> {
       AnyMeta::R3d(m) => m.tags(mode).collect(),
       #[cfg(feature = "id3")]
       AnyMeta::Id3(m) => m.tags(mode).collect(),
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(m) => m.tags(mode).collect(),
       #[cfg(feature = "mp3")]
       AnyMeta::Mp3(m) => m.tags(mode).collect(),
       #[cfg(feature = "aiff")]
@@ -758,6 +769,12 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       AnyMeta::R3d(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "id3")]
       AnyMeta::Id3(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // M2TS chains the nested H.264 sub-Meta's OWN diagnostics (the M2TS Meta
+      // owns the `H264Meta`, never standalone-dispatched) BEFORE its own minor
+      // warning (M2TS.pm:349-351). Both live in `m2ts::Meta`'s `Diagnose`
+      // impl, which yields them in that faithful order.
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "mp3")]
       AnyMeta::Mp3(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "aiff")]
@@ -1053,6 +1070,8 @@ impl AnyMeta<'_> {
       AnyMeta::R3d(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "id3")]
       AnyMeta::Id3(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "mp3")]
       AnyMeta::Mp3(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "aiff")]
@@ -1156,6 +1175,11 @@ impl AnyMeta<'_> {
       // `extract_info`, which never dispatches ID3 as a file type).
       #[cfg(feature = "id3")]
       AnyMeta::Id3(_) => FileTypeFinalize::Detected,
+      // M2TS: SetFileType(M2TS or M2T) (M2TS.pm:617). The detected
+      // candidate type is always "M2TS"; the parser overrides to "M2T"
+      // when the 188-byte (no-timecode) variant is observed.
+      #[cfg(feature = "m2ts")]
+      AnyMeta::M2ts(m) => FileTypeFinalize::Explicit(m.file_type().as_file_type()),
       #[cfg(feature = "mp3")]
       AnyMeta::Mp3(_) => FileTypeFinalize::Detected,
       // AIFF: explicit magic-derived type, with the DjVu multi-page literal.
@@ -1469,6 +1493,7 @@ impl AnyParser {
       feature = "crw",
       feature = "red",
       feature = "id3",
+      feature = "m2ts",
       feature = "mp3",
       feature = "aiff",
       feature = "ape",
@@ -1545,6 +1570,14 @@ impl AnyParser {
         // ID3 typed Meta is mode-locked; the closed dispatch stages `-j`.
         crate::formats::id3::parse_id3_borrowed(bytes, Some(shared), /* print_conv */ true)
           .map(AnyMeta::Id3)
+      }
+      #[cfg(feature = "m2ts")]
+      AnyParser::M2ts(p) => {
+        // M2TS is a leaf format (Engine-only; the H.264 sub-Meta is owned
+        // by the M2TS Meta, not shared state): `shared` and `ext` are
+        // unused.
+        let _ = (shared, ext);
+        p.parse(bytes).map(AnyMeta::M2ts)
       }
       #[cfg(feature = "mp3")]
       AnyParser::Mp3(p) => {
@@ -1860,6 +1893,14 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     )),
     #[cfg(feature = "flash")]
     "FLV" => Some(AnyParser::Flv(crate::formats::flash::ProcessFlv)),
+    // ExifTool maps `MTS` / `M2T` / `TS` extensions to base type `"M2TS"`
+    // via `%fileTypeLookup` (ExifTool.pm:188/219/332, already wired in
+    // `src/filetype_data.rs`); the magic regex (M2TS.pm:594) confirms the
+    // candidate from the body. The M2T-vs-M2TS distinction (no timecode
+    // vs 4-byte BDAV prefix) is finalized via the parser's
+    // `FileTypeFinalize::Explicit` arm.
+    #[cfg(feature = "m2ts")]
+    "M2TS" => Some(AnyParser::M2ts(crate::formats::m2ts::ProcessM2ts)),
     #[cfg(feature = "mp3")]
     "MP3" => Some(AnyParser::Mp3(crate::formats::id3::ProcessMp3)),
     #[cfg(feature = "moi")]
@@ -1969,6 +2010,8 @@ mod tests {
     assert!(any_parser_for("FLAC").is_some());
     #[cfg(feature = "flash")]
     assert!(any_parser_for("FLV").is_some());
+    #[cfg(feature = "m2ts")]
+    assert!(any_parser_for("M2TS").is_some());
     #[cfg(feature = "moi")]
     assert!(any_parser_for("MOI").is_some());
     #[cfg(feature = "mp3")]

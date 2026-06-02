@@ -1135,6 +1135,13 @@ pub struct H264Meta<'a> {
   /// `Warn` reachable inside `ParseH264Video`/`ProcessSEI` is the MDPM
   /// out-of-sequence one at H264.pm:989). Surfaced as `ExifTool:Warning`.
   warnings: Vec<SmolStr>,
+  /// `$foundUserData` (H264.pm:1039/1084/1102) — set once an SEI message
+  /// carrying user data (the MDPM block) was decoded by `ProcessSEI`. The
+  /// M2TS demuxer reads this to honour `ParseH264Video`'s extra-frame
+  /// contract (H264.pm:1100-1104): when no SEI/MDPM was found in the first
+  /// frame, the demuxer parses one MORE frame (Panasonic cameras don't put
+  /// the SEI in the first frame). NOT emitted as a tag.
+  found_user_data: bool,
   _marker: core::marker::PhantomData<&'a ()>,
 }
 
@@ -1169,6 +1176,70 @@ impl H264Meta<'_> {
   pub fn is_empty(&self) -> bool {
     self.entries.is_empty()
   }
+  /// `$foundUserData` (H264.pm:1039/1102) — `true` once an SEI message
+  /// carrying the AVCHD MDPM user-data block was decoded. The M2TS demuxer
+  /// uses this to implement `ParseH264Video`'s return contract
+  /// (H264.pm:1100-1104): a stream whose first frame carried NO SEI/MDPM
+  /// signals the caller to parse one more frame (Panasonic cameras don't put
+  /// the SEI in the first frame). A non-empty stream with only an SPS size
+  /// (no MDPM) therefore still reports `false` here.
+  #[must_use]
+  #[inline(always)]
+  pub const fn found_user_data(&self) -> bool {
+    self.found_user_data
+  }
+  /// Re-stamp the phantom lifetime to any lifetime `'b`. `H264Meta` is
+  /// FULLY OWNED — every field (`entries: Vec<H264Entry>`, `make:
+  /// Option<SmolStr>`, `warnings: Vec<SmolStr>`) carries no reference into
+  /// the original input buffer, and the only lifetime-bearing field is a
+  /// `PhantomData<&'a ()>` marker that exists solely for the
+  /// `FormatParser::Meta<'a>` GAT shape.
+  ///
+  /// This helper exists for the M2TS / future MPEG-2 demuxers, which
+  /// accumulate PES payload bytes into an owned `Vec<u8>` whose lifetime
+  /// does NOT match the M2TS input buffer's `'a`. After parsing the H.264
+  /// payload (which transforms every byte through the SPS / MDPM decoders),
+  /// the demuxer needs to store the result on the M2TS [`Meta<'a>`]; the
+  /// rebind is sound because no field actually borrows from `'a` ⇒ `'b`.
+  #[must_use]
+  #[inline(always)]
+  pub fn into_rebound<'b>(self) -> H264Meta<'b> {
+    H264Meta {
+      entries: self.entries,
+      make: self.make,
+      warnings: self.warnings,
+      found_user_data: self.found_user_data,
+      _marker: core::marker::PhantomData,
+    }
+  }
+
+  /// Fold a LATER frame's parse (`self`) into an EARLIER frame's (`earlier`),
+  /// for the M2TS multi-frame H.264 accumulation (H264.pm:1100-1104).
+  ///
+  /// Bundled `ParseH264Video` runs against a single ExifTool object whose
+  /// state persists across the (up to two) frames it parses: an SPS is
+  /// processed once (`$$et{GotNAL07}`, H264.pm:1093) and every frame's MDPM
+  /// user data is appended via `HandleTag`. exifast's parser is per-call
+  /// (each `parse_borrowed` resets that state), so this combines the two
+  /// results the way the shared `$$et` would have: the EARLIER frame's
+  /// entries come first (so its SPS `ImageWidth`/`ImageHeight` survive even
+  /// when the later frame carries only the MDPM block — the Panasonic case),
+  /// then the later frame's entries (the downstream last-wins `TagMap` dedup
+  /// then resolves any same-name collision exactly as `HandleTag` overwrite
+  /// would). `Make` is sticky to the first frame that decoded it
+  /// (H264.pm:530 sets `$$self{Make}` once); `found_user_data` is the union.
+  #[must_use]
+  pub fn merge_frame<'b>(mut self, mut earlier: H264Meta<'b>) -> H264Meta<'b> {
+    earlier.entries.append(&mut self.entries);
+    earlier.warnings.extend(self.warnings);
+    H264Meta {
+      entries: earlier.entries,
+      make: earlier.make.or(self.make),
+      warnings: earlier.warnings,
+      found_user_data: earlier.found_user_data || self.found_user_data,
+      _marker: core::marker::PhantomData,
+    }
+  }
 }
 
 // ===========================================================================
@@ -1190,7 +1261,7 @@ impl FormatParser for ProcessH264 {
   type Context<'a> = &'a [u8];
 
   fn parse<'a>(&self, data: Self::Context<'a>) -> Option<Self::Meta<'a>> {
-    parse_inner(data)
+    parse_inner(data, &mut H264FrameState::new())
   }
 }
 
@@ -1201,14 +1272,71 @@ impl FormatParser for ProcessH264 {
 /// Returns `None` when the buffer contains no NAL start code at all
 /// (not an H.264 stream); `Some(meta)` otherwise — `meta` may be
 /// [`H264Meta::is_empty`] when the stream had no SPS size and no MDPM block.
+///
+/// This is the SINGLE-FRAME entry (a fresh [`H264FrameState`] each call) used
+/// by the standalone H.264 conformance path. The M2TS demuxer, which calls
+/// `ParseH264Video` repeatedly on ONE ExifTool object whose `GotNAL06`/
+/// `GotNAL07` latches persist (H264.pm:1079/1093), uses
+/// [`parse_borrowed_stateful`] instead.
 #[must_use]
 pub fn parse_borrowed(data: &[u8]) -> Option<H264Meta<'_>> {
-  parse_inner(data)
+  parse_inner(data, &mut H264FrameState::new())
+}
+
+/// `$$et`-resident H.264 NAL latches that persist across the (up to two)
+/// `ParseH264Video` calls a single MPEG-2 demuxer makes on one ExifTool
+/// object (H264.pm:1079/1093). The per-call `%parseNalUnit = (0x06,0x07)` is
+/// LOCAL (reset every call), but `GotNAL06`/`GotNAL07` are stored on `$$et`,
+/// so a later H.264 frame/PID does NOT re-emit an SPS already parsed, and (no
+/// `ExtractEmbedded`) does NOT re-process an SEI once one carried user data.
+///
+/// The M2TS walker owns one of these for the whole file and threads it through
+/// every [`parse_borrowed_stateful`] call, so the extra-frame scan
+/// (H264.pm:1100-1104) faithfully suppresses the second frame's duplicate SPS
+/// (Codex M2TS finding #6) instead of letting a stateless re-parse overwrite
+/// the first frame's `ImageWidth`/`ImageHeight`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct H264FrameState {
+  /// `$$et{GotNAL07}` (H264.pm:1093) — an SPS (0x07) has been parsed once;
+  /// every later SPS NAL is skipped (`next if $$et{GotNAL07}`).
+  got_nal07: bool,
+  /// `$$et{GotNAL06}` (H264.pm:1079/1088) — an SEI (0x06) carrying user data
+  /// has been processed; without `ExtractEmbedded` every later SEI is skipped
+  /// (`next unless $et->Options('ExtractEmbedded')`).
+  got_nal06: bool,
+}
+
+impl H264FrameState {
+  /// A pristine `$$et` (no NAL seen yet) — the start-of-file latch state.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new() -> Self {
+    Self {
+      got_nal07: false,
+      got_nal06: false,
+    }
+  }
+}
+
+/// Stateful entry for the MPEG-2 demuxers: parse ONE H.264 frame while
+/// carrying the `$$et`-resident `GotNAL06`/`GotNAL07` latches in `state`
+/// across calls (H264.pm:1032-1104). Returns `None` on a buffer with no NAL
+/// start code (reject), else `Some(meta)` for that frame. See
+/// [`H264FrameState`].
+#[must_use]
+pub fn parse_borrowed_stateful<'a>(
+  data: &'a [u8],
+  state: &mut H264FrameState,
+) -> Option<H264Meta<'a>> {
+  parse_inner(data, state)
 }
 
 /// Inner parser body. `None` ⇒ no NAL start code anywhere (reject); else
-/// `Some(meta)` (possibly with zero entries).
-fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
+/// `Some(meta)` (possibly with zero entries). `state` carries the
+/// `GotNAL06`/`GotNAL07` latches (H264.pm:1079/1093) IN and OUT so a caller
+/// parsing successive frames on one `$$et` (the M2TS demuxer) suppresses a
+/// duplicate SPS / already-consumed SEI exactly as bundled does.
+fn parse_inner<'a>(data: &'a [u8], state: &mut H264FrameState) -> Option<H264Meta<'a>> {
   // Reject buffers with no NAL start code at all — they are not an H.264
   // stream. (`ParseH264Video` would just walk off the end producing
   // nothing; we surface that as `Ok(None)` so a dispatcher can move on.)
@@ -1219,8 +1347,15 @@ fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
   let mut entries: Vec<H264Entry> = Vec::new();
   let mut make: Option<SmolStr> = None;
   let mut warnings: Vec<SmolStr> = Vec::new();
-  let mut got_sps = false; // H264.pm:1093 `$$et{GotNAL07}`
-  let mut got_user_data = false; // mirrors H264.pm `$foundUserData`
+  // `got_sps`/`got_nal06` are seeded from the persistent `$$et` latches and
+  // written back at the end, so a second frame on the same `$$et` skips an SPS
+  // already parsed (H264.pm:1093) / an SEI already consumed (H264.pm:1079).
+  // `found_user_data` is the PER-CALL `my $foundUserData` (H264.pm:1039) — the
+  // value `ParseH264Video` returns and the M2TS extra-frame contract reads — so
+  // it is a fresh local, distinct from the persistent `GotNAL06` skip gate.
+  let mut got_sps = state.got_nal07; // H264.pm:1093 `$$et{GotNAL07}`
+  let mut got_nal06 = state.got_nal06; // H264.pm:1079/1088 `$$et{GotNAL06}`
+  let mut found_user_data = false; // H264.pm:1039 `my $foundUserData`
 
   // H264.pm:1042-1099 — walk NAL units. `cursor` is the offset of the byte
   // just past the start code (i.e. the NAL header byte).
@@ -1270,13 +1405,19 @@ fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
 
     match nal_type {
       0x06 => {
-        // H264.pm:1077-1088 — SEI. Only the FIRST SEI carrying user data is
-        // extracted (no `-ee` here ⇒ Perl `next unless $foundUserData`).
-        if got_user_data {
+        // H264.pm:1077-1088 — SEI. Without `ExtractEmbedded`, once an SEI has
+        // carried user data (`$$et{GotNAL06}`, persistent) every later SEI is
+        // skipped (`if ($$et{GotNAL06}) { next unless ExtractEmbedded }`) — this
+        // gate is per-FILE, so a second frame on the same `$$et` whose first
+        // frame already found the MDPM never re-processes its SEI.
+        if got_nal06 {
           continue;
         }
+        // `$foundUserData = ProcessSEI(...)`; `next unless $foundUserData`; then
+        // `$$et{GotNAL06} = ($$et{GotNAL06}||0)+1` (H264.pm:1084-1088).
         if process_sei(&rbsp, &mut entries, &mut make, &mut warnings) {
-          got_user_data = true;
+          found_user_data = true;
+          got_nal06 = true;
         }
       }
       0x07 => {
@@ -1300,10 +1441,16 @@ fn parse_inner(data: &[u8]) -> Option<H264Meta<'_>> {
     }
   }
 
+  // Write the persistent latches back to `$$et` (H264.pm:1088/1094) so the
+  // NEXT frame on this object suppresses a duplicate SPS / consumed SEI.
+  state.got_nal07 = got_sps;
+  state.got_nal06 = got_nal06;
+
   Some(H264Meta {
     entries,
     make,
     warnings,
+    found_user_data,
     _marker: core::marker::PhantomData,
   })
 }
@@ -3183,6 +3330,35 @@ mod tests {
   }
 
   #[test]
+  fn found_user_data_tracks_sei_mdpm_presence() {
+    // H264.pm:1039/1102 — `$foundUserData` is set once `ProcessSEI`
+    // decoded the MDPM user-data block. The AVCHD fixture carries it, so
+    // `found_user_data()` is true (⇒ `ParseH264Video` would return 0 = no
+    // more frames wanted).
+    let with_mdpm = avchd_fixture();
+    let meta = parse_borrowed(&with_mdpm).unwrap();
+    assert!(
+      meta.found_user_data(),
+      "a frame carrying SEI/MDPM user data must report found_user_data"
+    );
+
+    // A stream with only an SPS NAL (image size) and NO SEI carries no user
+    // data — `found_user_data()` is false even though the stream is non-empty
+    // (H264.pm:1100-1104 ⇒ `ParseH264Video` returns 1 = parse one more frame,
+    // matching Panasonic cameras that omit the SEI from the first frame).
+    let mut sps_only: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01, 0x07];
+    // Minimal SPS RBSP — `parse_seq_param_set` need not succeed for the
+    // user-data flag (it only flips on an SEI). A trailing AUD NAL bounds it.
+    sps_only.extend_from_slice(&[0x42, 0x00, 0x1f, 0x00]);
+    sps_only.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x09, 0x10]);
+    let meta = parse_borrowed(&sps_only).unwrap();
+    assert!(
+      !meta.found_user_data(),
+      "an SPS-only frame carries no SEI/MDPM user data"
+    );
+  }
+
+  #[test]
   fn avchd_fixture_print_conv_tags() {
     let data = avchd_fixture();
     let meta = parse_borrowed(&data).unwrap();
@@ -3380,6 +3556,7 @@ mod tests {
       ],
       make: None,
       warnings: Vec::new(),
+      found_user_data: false,
       _marker: core::marker::PhantomData,
     };
     let j = emit_into_tagmap(&meta, true);

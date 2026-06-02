@@ -39,6 +39,11 @@ pub mod flash;
 pub mod h264;
 #[cfg(feature = "id3")]
 pub mod id3;
+// M2TS (MPEG-2 Transport Stream / AVCHD camcorder container, FORMATS.md
+// row 25 / 26). Depends on `h264` for the PES-payload H.264 demux that
+// AVCHD-encoded video carries (`H264::ParseH264Video`, M2TS.pm:343-345).
+#[cfg(feature = "m2ts")]
+pub mod m2ts;
 #[cfg(feature = "matroska")]
 pub mod matroska;
 #[cfg(feature = "moi")]
