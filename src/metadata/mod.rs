@@ -24,6 +24,7 @@
 #[cfg(feature = "crw")]
 pub(crate) mod crw;
 mod domain;
+mod gopro;
 #[cfg(feature = "png")]
 pub(crate) mod png;
 pub mod project;
@@ -42,6 +43,9 @@ pub use crw::{
 };
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
+};
+pub use gopro::{
+  GoProConv, GoProGlpiSample, GoProGpsSample, GoProKbat, GoProMeta, GoProTag, GoProTagValue,
 };
 #[cfg(feature = "png")]
 pub use png::{

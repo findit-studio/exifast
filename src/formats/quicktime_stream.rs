@@ -1621,15 +1621,27 @@ struct StreamTrack {
 ///
 /// `data` is the WHOLE file slice (sample offsets are absolute file offsets).
 ///
-/// Only the self-contained sample formats are decoded here (currently the
-/// Apple `mebx` timed-metadata format); an unrecognized or deferred
-/// `MetaFormat` simply yields no samples (faithful: ExifTool `VPrint`s
-/// "Unknown $type format" and moves on, QuickTimeStream.pl:1547).
-fn process_samples(data: &[u8], track: &StreamTrack, out: &mut QuickTimeStreamMeta) {
+/// Only the self-contained sample formats are decoded here (the Apple `mebx`
+/// timed-metadata format and the GoPro `gpmd` GPMF format); an unrecognized
+/// or deferred `MetaFormat` simply yields no samples (faithful: ExifTool
+/// `VPrint`s "Unknown $type format" and moves on, QuickTimeStream.pl:1547).
+///
+/// Returns `true` iff any sample ENTERED the GoPro GPMF processor — i.e. any
+/// non-deferred `gpmd` sample (ExifTool's `$$et{FoundEmbedded}`, set on
+/// `ProcessGoPro` entry, GoPro.pm:822), regardless of whether the KLV parse
+/// extracted anything.
+#[must_use]
+fn process_samples(
+  data: &[u8],
+  track: &StreamTrack,
+  out: &mut QuickTimeStreamMeta,
+  gopro_out: &mut crate::metadata::GoProMeta,
+) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
-    None => return,
+    None => return false,
   };
+  let mut found_embedded = false;
   // QuickTimeStream.pl:1418 `for ($i=0; $i<@$start and $i<@$size; ++$i)`.
   for sample in &samples {
     let start = sample.start as usize;
@@ -1638,39 +1650,129 @@ fn process_samples(data: &[u8], track: &StreamTrack, out: &mut QuickTimeStreamMe
       // QuickTimeStream.pl:1436-1443 — a seek/read past EOF warns + `next`s.
       continue;
     };
-    if buff.is_empty() {
-      continue;
-    }
-    decode_one_sample(buff, track, sample, out);
+    // R12-B: do NOT skip a size-0 sample. ExifTool reads a 0-byte sample
+    // (`$raf->Read($buff, 0) == 0 == $size`, QuickTimeStream.pl:1438-1443, no
+    // warn) and STILL dispatches it: for a `gpmd` track the no-`Condition`
+    // `gpmd_GoPro` SubDirectory resolves (QuickTimeStream.pl:1518-1529) and
+    // `ProcessGoPro` sets `$$et{FoundEmbedded} = 1` on ENTRY (GoPro.pm:822) —
+    // BEFORE its record loop — so an EMPTY non-deferred `gpmd` sample marks the
+    // file embedded and suppresses the brute-force `mdat` scan. The pre-fix
+    // skip left `FoundEmbedded` false on an empty-then-buried-GP6 file, so the
+    // scan ran and emitted GP6/freeGPS tags ExifTool suppresses. The `gpmd` arm
+    // of `decode_one_sample` returns `true` unconditionally (even for an empty
+    // buffer); `process_mebx` and the other arms are no-ops on empty bytes
+    // (their `pos + 8 < len` loop never runs), so removing the skip is faithful
+    // across formats.
+    //
+    // `FoundEmbedded` is sticky — once any GoPro sample is recognized it
+    // stays set (ExifTool only ever assigns `= 1`, GoPro.pm:822).
+    found_embedded |= decode_one_sample(buff, track, sample, out, gopro_out);
   }
+  found_embedded
 }
 
 /// Decode a single timed sample's bytes by `HandlerType` / `MetaFormat` —
 /// the dispatch arms of QuickTimeStream.pl:1467-1578.
+///
+/// Returns `true` iff the sample ENTERED the GoPro GPMF processor — i.e. a
+/// non-deferred `gpmd` sample — mirroring ExifTool's `$$et{FoundEmbedded} = 1`
+/// set on `ProcessGoPro` entry (GoPro.pm:822), which fires before the KLV loop
+/// and so is independent of extraction success. A deferred `gpmd` variant
+/// (Kingslim/Rove/FMAS/Wolfbox) and the `mebx`/other paths set no
+/// `FoundEmbedded`.
+#[must_use]
+/// The non-GoPro `gpmd` MetaFormat variants (QuickTimeStream.pl:181-208):
+/// Kingslim / Rove / FMAS / Wolfbox. Each matches a leading-byte `Condition`
+/// and routes to a processor this port DEFERS (the brute-force `mdat` scan
+/// recovers them instead), so a matching `gpmd` sample must not be dispatched
+/// to the GoPro KLV walker nor set `FoundEmbedded`. Byte-checks use the
+/// checked `.get` form (file-level `deny(indexing_slicing)`).
+fn is_deferred_gpmd_variant(buff: &[u8]) -> bool {
+  // gpmd_Kingslim: `/^.{21}\0\0\0A[NS][EW]/s` (QuickTimeStream.pl:182-184).
+  let kingslim = buff.get(21..24) == Some(&[0, 0, 0][..])
+    && buff.get(24) == Some(&b'A')
+    && matches!(buff.get(25), Some(b'N' | b'S'))
+    && matches!(buff.get(26), Some(b'E' | b'W'));
+  // gpmd_Rove: `/^\0\0\xf2\xe1\xf0\xeeTT/` (QuickTimeStream.pl:189-191).
+  let rove = buff.get(0..8) == Some(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, b'T', b'T'][..]);
+  // gpmd_FMAS: `/^FMAS\0\0\0\0/` (QuickTimeStream.pl:196-198).
+  let fmas = buff.get(0..8) == Some(b"FMAS\0\0\0\0".as_slice());
+  // gpmd_Wolfbox: `/^.{136}(0{16}[A-Z]{4}|https:\/\/www.redtiger\0)/s`
+  // (QuickTimeStream.pl:203-205).
+  let wolfbox = (buff
+    .get(136..152)
+    .is_some_and(|s| s.iter().all(|&b| b == b'0'))
+    && buff
+      .get(152..156)
+      .is_some_and(|s| s.iter().all(|&b| b.is_ascii_uppercase())))
+    || buff.get(136..157) == Some(b"https://www.redtiger\0".as_slice());
+  kingslim || rove || fmas || wolfbox
+}
+
 fn decode_one_sample(
   buff: &[u8],
   track: &StreamTrack,
   sample: &Sample,
   out: &mut QuickTimeStreamMeta,
-) {
+  gopro_out: &mut crate::metadata::GoProMeta,
+) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
   // SampleTime/SampleDuration; the decoded `mebx` pairs carry both.
   if &track.meta_format == b"mebx" {
     process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
-    return;
+    return false;
+  }
+  // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
+  // dispatched variants. The fallback (no other Condition matches) is
+  // `gpmd_GoPro`, whose SubDirectory routes the sample bytes into
+  // `Image::ExifTool::GoPro::GPMF`. exifast's GoPro KLV parser is
+  // [`crate::formats::gopro::process_gopro`]. The Kingslim / Rove / FMAS /
+  // Wolfbox variants re-dispatch into ProcessFreeGPS / Process_text /
+  // ProcessFMAS / ProcessWolfbox — DEFERRED at the `gpmd` dispatch level
+  // (the brute-force `mdat` scan already locates Kingslim/Rove/FMAS records
+  // when they're stored in `free`/`mdat` rather than as `gpmd` samples).
+  if &track.meta_format == b"gpmd" {
+    // QuickTimeStream.pl:181-212 is an ORDERED `Condition` list: Kingslim /
+    // Rove / FMAS / Wolfbox each match a leading-byte signature and route to a
+    // deferred non-GoPro processor (ProcessFreeGPS / Process_text / ProcessFMAS
+    // / ProcessWolfbox); only the no-`Condition` `gpmd_GoPro` fallback reaches
+    // `GoPro::GPMF`. A deferred variant must NOT be parsed as GoPro and must
+    // NOT set `FoundEmbedded` — otherwise its printable FourCC (e.g. `FMAS`)
+    // would be mistaken for a GoPro record and suppress the brute-force `mdat`
+    // scan that actually recovers these records. Mirror the ordered dispatch:
+    // skip a deferred signature, fall through to GoPro only otherwise.
+    if is_deferred_gpmd_variant(buff) {
+      return false;
+    }
+    // The `gpmd_GoPro` fallback — the KLV walker. Run it for EXTRACTION, but
+    // the `FoundEmbedded` side-effect is decoupled from extraction success:
+    // ExifTool sets `$$et{FoundEmbedded} = 1` on ENTRY to `ProcessGoPro`
+    // (GoPro.pm:822), BEFORE the KLV record loop (:831), so it fires for EVERY
+    // non-deferred `gpmd` sample — even one whose payload is zero-filled,
+    // truncated, or otherwise extracts nothing. Because `gpmd_GoPro` is the
+    // no-`Condition` fallback (QuickTimeStream.pl:209-212), a non-deferred
+    // `gpmd` sample ALWAYS enters `ProcessGoPro`, so `FoundEmbedded` is always
+    // set ⇒ `ScanMediaData` returns early (QuickTimeStream.pl:3689). Returning
+    // the walker's recognition bool instead would let a corrupt-but-
+    // non-deferred `gpmd` sample leave `FoundEmbedded` unset, and the later
+    // brute-force `mdat` scan would emit extra GP6/freeGPS tags ExifTool skips.
+    // So: extract via the walker, but report `true` UNCONDITIONALLY.
+    let _extracted = crate::formats::gopro::process_gopro(buff, gopro_out);
+    return true;
   }
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
   // reaches `process_samples` ([`is_meta_handler`] excludes `gps `, faithful
   // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
   // EMPTY-HandlerType `moov`-level box ([`process_moov_gps_box`]), not a track.
   //
-  // `gpmd` GoPro / Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
-  // DEFERRED — these re-dispatch into other ExifTool modules (GoPro.pm,
-  // Sony.pm, Canon.pm). See module docs + docs/tracking.md. An unrecognized
-  // MetaFormat yields no samples, exactly as ExifTool's "Unknown $type
-  // format" branch (QuickTimeStream.pl:1547).
-  let _ = buff;
+  // Sony `rtmd` / Canon `CTMD` / full `camm` / `tx3g` / …:
+  // DEFERRED — these re-dispatch into other ExifTool modules (Sony.pm,
+  // Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
+  // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
+  // as ExifTool's "Unknown $type format" branch (QuickTimeStream.pl:1547).
+  let _ = (buff, &track.handler);
+  false
 }
 
 // ===========================================================================
@@ -1844,10 +1946,17 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// SP3 entry point — extract QuickTimeStream timed metadata from a whole
 /// QuickTime file slice.
 ///
-/// Walks `moov`→`trak` collecting each metadata track's sample tables, then
-/// runs [`process_samples`] per track. Also handles the magic `moov`-level
-/// `gps `/`GPS ` boxes (QuickTimeStream.pl `ParseTag`, the
-/// no-handler `''` entry of `%eeBox`).
+/// For EVERY top-level `moov`, walks its DIRECT children in file order via
+/// [`walk_moov`], processing each GoPro / GPS source at its atom position:
+/// each metadata `trak`'s timed samples (`gpmd` GoPro → `gopro_out`), each
+/// `moov/udta/GPMF` atom (GoPro → `gopro_out`), and the magic `moov`-level
+/// Novatek `gps ` offset box (`ParseTag`, the no-handler `''` entry of
+/// `%eeBox`). The `gps0`/`gsen`/`GPS `/`3gf` magic boxes are TOP-LEVEL
+/// siblings handled here directly. Because `gpmd` samples and `udta/GPMF`
+/// atoms both accumulate into the ONE `gopro_out` (scalar tags last-wins, GPS
+/// rows append), interleaving them by atom position — rather than draining
+/// all `gpmd` then all `udta/GPMF` — is what makes the final last-wins scalar
+/// + GPS-sample order match ExifTool when a `moov` carries both (R9).
 ///
 /// `create_date_raw` is the `mvhd` CreateDate as raw 1904-epoch seconds
 /// (needed for `GPSDateTime` synthesis); `None` when no `mvhd` carried one.
@@ -1858,20 +1967,24 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// for the `moov`-level `gps ` offset-box path.
 ///
 /// Returns the decoded [`QuickTimeStreamMeta`] (empty for the common case of a
-/// video with no timed metadata) plus the `FoundEmbedded` flag — `true` iff a
-/// `moov`-level `gps ` offset box actually dispatched a `freeGPS ` block into
-/// [`quicktime_freegps::process_free_gps`] (ExifTool's `$$et{FoundEmbedded}`,
-/// QuickTimeStream.pl:1650). The caller threads that flag into
-/// [`quicktime_freegps::scan_media_data`] so the brute-force `mdat` scan is
-/// suppressed ONLY by a real freeGPS decode — NOT by a `gps0`/`gsen`/`GPS `/
-/// `3gf`/`mebx` timed-metadata sample (those set no `FoundEmbedded`, so a file
-/// carrying one of them PLUS a buried `freeGPS ` block is still scanned;
+/// video with no timed metadata) plus the `FoundEmbedded` flag. `FoundEmbedded`
+/// is `true` iff EITHER a `moov`-level `gps ` offset box dispatched a `freeGPS `
+/// block into [`quicktime_freegps::process_free_gps`] (ExifTool's
+/// `$$et{FoundEmbedded}`, QuickTimeStream.pl:1650) OR a GoPro source entered
+/// `ProcessGoPro` — a `gpmd` GoPro timed-metadata sample OR a `moov/udta/GPMF`
+/// atom (GoPro.pm:822 sets `$$et{FoundEmbedded} = 1` on entry, for both paths).
+/// The caller threads that flag into [`quicktime_freegps::scan_media_data`] so
+/// the brute-force `mdat` scan is suppressed by a real freeGPS decode or a
+/// dispatched GoPro source — NOT by a bare `gps0`/`gsen`/`GPS `/`3gf`/`mebx`
+/// timed-metadata sample (those set no `FoundEmbedded`, so a file carrying one
+/// of them PLUS a buried `freeGPS ` block is still scanned;
 /// QuickTimeStream.pl:967-973 vs :3689).
 #[must_use]
 pub(crate) fn extract_stream(
   data: &[u8],
   create_date_raw: Option<u64>,
   kodak_version: Option<&str>,
+  gopro_out: &mut crate::metadata::GoProMeta,
 ) -> (QuickTimeStreamMeta, bool) {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
@@ -1885,6 +1998,10 @@ pub(crate) fn extract_stream(
   // `moov`-level `gps ` box; the `gps0`/`gsen`/`GPS ` magic boxes are
   // TOP-LEVEL siblings (`%QuickTime::Main` table / `%eeBox` `'GPS ' =>
   // 'main'`, QuickTime.pm:524-533, 932-943).
+  // ExifTool's `$$et{FoundEmbedded}` for the GoPro `gpmd` timed-metadata path
+  // (GoPro.pm:822) — distinct from the `moov`-level `gps `-box `FoundEmbedded`
+  // tracked in `free_gps_state`. OR'd into the gate returned to the caller.
+  let mut gopro_found_embedded = false;
   let mut pos = 0usize;
   while pos < data.len() {
     let Some((t, ps, pe, next)) = atom_at(data, pos) else {
@@ -1892,15 +2009,18 @@ pub(crate) fn extract_stream(
     };
     let body_end = pe.min(data.len());
     match &t {
-      b"moov" => walk_moov(
-        data,
-        ps,
-        body_end,
-        create_date_raw,
-        kodak_version,
-        &mut free_gps_state,
-        &mut out,
-      ),
+      b"moov" => {
+        gopro_found_embedded |= walk_moov(
+          data,
+          ps,
+          body_end,
+          create_date_raw,
+          kodak_version,
+          &mut free_gps_state,
+          &mut out,
+          gopro_out,
+        );
+      }
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       // `atom_at` guarantees `ps <= body_end <= data.len()`, so `.get` is
       // always `Some`; `unwrap_or_default()` (an empty slice) is unreachable.
@@ -1925,10 +2045,17 @@ pub(crate) fn extract_stream(
     }
     pos = next;
   }
-  // `free_gps_state.found_embedded()` is `$$et{FoundEmbedded}` after the moov
-  // walk: `true` iff a `gps `-box block reached `process_free_gps`. This — not
-  // `out.is_empty()` — is what must gate the `mdat` scan (QuickTimeStream.pl:3689).
-  let found_embedded = free_gps_state.found_embedded();
+  // `$$et{FoundEmbedded}` after the moov walk — set by EITHER a `moov`-level
+  // `gps `-box block reaching `process_free_gps` (`free_gps_state`) OR a
+  // dispatched GoPro source (`gopro_found_embedded`, GoPro.pm:822): a `gpmd`
+  // timed-metadata sample in a `trak` OR a `moov/udta/GPMF` atom — both run
+  // through [`walk_moov`], so its returned flag already folds in the
+  // `udta/GPMF` path (no separate post-pass). This — not `out.is_empty()` —
+  // gates the brute-force `mdat` scan (QuickTimeStream.pl:3689). A GoPro file
+  // that also carries unreferenced GP6 trailer records is correctly NOT
+  // re-scanned (already extracted via the sample / `udta/GPMF` path),
+  // matching ExifTool.
+  let found_embedded = free_gps_state.found_embedded() || gopro_found_embedded;
   (out, found_embedded)
 }
 
@@ -2014,8 +2141,54 @@ fn process_moov_gps_box(
   }
 }
 
-/// Walk one `moov`: process each `trak`'s timed metadata and the magic
-/// `moov`-level `gps `/`GPS ` boxes.
+/// Walk one `moov`'s DIRECT children in file (atom-list) order, processing
+/// each GoPro / GPS source AT its child position — exactly as ExifTool's
+/// `ProcessMOV` `for(;;)` loop (QuickTime.pm:10032) reaches them:
+///
+///   - `trak` — the timed-metadata samples (a `gpmd` GoPro track dispatches
+///     into [`crate::formats::gopro::process_gopro`]). ExifTool runs
+///     `ProcessSamples` when the track's `stbl` box EXITS (QuickTime.pm:10369-
+///     10371), i.e. at that `trak`'s position in the walk.
+///   - `udta/GPMF` — the GoPro GPMF atom (QuickTime.pm:2132-2135). ExifTool
+///     dispatches it via `$et->ProcessDirectory` (QuickTime.pm:10359) the
+///     instant the walk descends the `udta` child, i.e. at that `udta`'s
+///     position. `GPMF` is reached ONLY through the `udta`/UserData table
+///     (`%QuickTime::UserData`, QuickTime.pm:1214-1217); a *direct* `moov/GPMF`
+///     child is NOT an ExifTool dispatch target (the Movie table has no `GPMF`
+///     entry) and is deliberately ignored here (R8 — oracle-verified vs
+///     ExifTool 13.59: a `moov` carrying both a `udta/GPMF` and a direct
+///     `moov/GPMF` reports only the `udta` device-name regardless of order).
+///   - the magic `moov`-level Novatek `gps ` offset box (`ParseTag` →
+///     `ProcessSamples`, QuickTime.pm:10282 / QuickTimeStream.pl:2544), at its
+///     own child position (its freeGPS rows land in the SEPARATE `out`
+///     accumulator, so they never interleave with GoPro's `gopro_out`).
+///
+/// Processing each source AT its atom position (rather than draining all
+/// `gpmd` samples then all `udta/GPMF` in a fixed post-pass) makes the
+/// accumulation into the single flat `gopro_out` follow ExifTool's `for(;;)`
+/// walk ORDER — so GoPro scalar tags (last-wins `set_*`) and GPS rows (append
+/// `push_*`) land in walk order. This holds across EVERY top-level `moov`
+/// (the caller invokes `walk_moov` per `moov` in file order, R7 multi-moov).
+///
+/// NOTE (oracle-verified, ExifTool 13.59): a file carrying BOTH a `gpmd` trak
+/// AND a `udta/GPMF` is NOT a clean last-wins collision in ExifTool — the
+/// `gpmd` GoPro tags inherit the track's `SET_GROUP1 = Track<N>` group
+/// (GoPro.pm:826 leaves `SET_GROUP0` alone when `SET_GROUP1` is set) while the
+/// `udta/GPMF` tags emit at the moov level (`GoPro:`/`QuickTime:`), so the two
+/// sources occupy DIFFERENT groups and BOTH survive regardless of sibling
+/// order. exifast's flat [`crate::metadata::GoProMeta`] cannot represent that
+/// per-track grouping, so it collapses both into one `GoPro:` namespace; this
+/// ordered walk only controls WHICH source wins that single flat slot. The
+/// group-faithful behaviour (per-track GoPro tags) is a separate, larger
+/// change tracked outside this walk — see the module-level note.
+///
+/// Returns `true` iff ANY GoPro source was DISPATCHED — a `gpmd` GoPro sample
+/// in a `trak` OR a `udta/GPMF` atom — mirroring ExifTool's
+/// `$$et{FoundEmbedded} = 1` set on ENTRY to `ProcessGoPro` (GoPro.pm:822),
+/// the gate for the brute-force `mdat` scan (QuickTimeStream.pl:3689). The
+/// `moov`-level `gps ` box's own `FoundEmbedded` is tracked separately via
+/// `free_gps_state`.
+#[must_use]
 fn walk_moov(
   data: &[u8],
   start: usize,
@@ -2024,7 +2197,9 @@ fn walk_moov(
   kodak_version: Option<&str>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
-) {
+  gopro_out: &mut crate::metadata::GoProMeta,
+) -> bool {
+  let mut gopro_found_embedded = false;
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
     match t {
@@ -2038,7 +2213,7 @@ fn walk_moov(
         // HandlerType is `gps ` is ignored for embedded extraction. See
         // [`is_meta_handler`].
         if is_meta_handler(&track.handler) {
-          process_samples(data, &track, out);
+          gopro_found_embedded |= process_samples(data, &track, out, gopro_out);
         }
       }
       // The `moov`-level Novatek `gps ` box — a DIRECT child atom of `moov`
@@ -2059,9 +2234,38 @@ fn walk_moov(
           out,
         );
       }
+      // The GoPro `moov/udta/GPMF` atom (QuickTime.pm:2132-2135). ExifTool
+      // dispatches it via `$et->ProcessDirectory` (QuickTime.pm:10359) the
+      // instant the `for(;;)` walk descends this `udta` child — i.e. at THIS
+      // child's atom position, INTERLEAVED with the `trak`/`gpmd` samples
+      // (processed at the `trak` position) and the `gps ` box above. Running
+      // it here (rather than in a fixed post-pass after every `trak`) makes
+      // the accumulation into the flat `gopro_out` follow ExifTool's walk
+      // ORDER. (See the fn doc: in ExifTool the two sources land in different
+      // GROUPS — `Track<N>:` vs `GoPro:` — so this ordering only decides which
+      // wins exifast's single flat slot; full group fidelity is a separate
+      // change.)
+      //
+      // `GPMF` lives ONLY in the `udta`/UserData table, so it is reached as a
+      // DIRECT child of `udta`; a direct `moov/GPMF` child is NOT an ExifTool
+      // dispatch target and is intentionally not visited (R8). `process_gopro`
+      // sets ExifTool's `$$et{FoundEmbedded} = 1` on ENTRY (GoPro.pm:822), so
+      // the mere PRESENCE of a dispatched `udta/GPMF` suppresses the
+      // brute-force `mdat` scan — independent of whether the body parsed any
+      // record. Mirror that: flip `gopro_found_embedded` for every `GPMF`
+      // atom visited, consistent with the `gpmd`-sample side-effect.
+      b"udta" => {
+        for_each_atom(data, base, base + body.len(), |t2, gpmf_body| {
+          if t2 == b"GPMF" {
+            gopro_found_embedded = true;
+            let _extracted = crate::formats::gopro::process_gopro(gpmf_body, gopro_out);
+          }
+        });
+      }
       _ => {}
     }
   });
+  gopro_found_embedded
 }
 
 /// `true` when a `hdlr` HandlerType feeds the timed-metadata path — `meta`
@@ -2086,6 +2290,115 @@ fn is_meta_handler(h: &[u8; 4]) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// R2 finding regression — the deferred non-GoPro `gpmd` variants
+  /// (QuickTimeStream.pl:181-208) must be recognized so they are NOT
+  /// dispatched to the GoPro KLV walker (and so they do not set
+  /// `FoundEmbedded`, which would suppress the brute-force `mdat` scan that
+  /// recovers them). The GoPro fallback (no signature match) must NOT be
+  /// classified as deferred.
+  #[test]
+  fn deferred_gpmd_variants_are_classified() {
+    // gpmd_FMAS: `/^FMAS\0\0\0\0/` (Vantrue N2S). A printable FourCC the
+    // GoPro KLV walker would otherwise mistake for a record.
+    assert!(is_deferred_gpmd_variant(b"FMAS\0\0\0\0\xde\xad\xbe\xef"));
+    // gpmd_Rove: `/^\0\0\xf2\xe1\xf0\xeeTT/`.
+    assert!(is_deferred_gpmd_variant(&[
+      0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, b'T', b'T', 0x01, 0x02
+    ]));
+    // gpmd_Kingslim: `/^.{21}\0\0\0A[NS][EW]/s`.
+    let mut kingslim = vec![0xaau8; 21];
+    kingslim.extend_from_slice(&[0, 0, 0, b'A', b'N', b'E']);
+    assert!(is_deferred_gpmd_variant(&kingslim));
+    // gpmd_Wolfbox: `/^.{136}(0{16}[A-Z]{4}|...)/s`.
+    let mut wolfbox = vec![0x11u8; 136];
+    wolfbox.extend_from_slice(b"0000000000000000ABCD");
+    assert!(is_deferred_gpmd_variant(&wolfbox));
+    // gpmd_GoPro fallback — a real GoPro `DEVC` sample is NOT deferred.
+    assert!(!is_deferred_gpmd_variant(
+      b"DEVC\0\x01\x00\x01\x00\x00\x00\x00"
+    ));
+    // Too-short buffers never match (no panic — checked `.get`).
+    assert!(!is_deferred_gpmd_variant(b"FMA"));
+    assert!(!is_deferred_gpmd_variant(&[]));
+  }
+
+  /// **R8-B** — `decode_one_sample` sets `FoundEmbedded` (returns `true`) for
+  /// ANY non-deferred `gpmd` sample, regardless of whether the GoPro KLV parse
+  /// extracted a record. ExifTool sets `$$et{FoundEmbedded} = 1` on ENTRY to
+  /// `ProcessGoPro` (GoPro.pm:822), BEFORE the KLV loop, and `gpmd_GoPro` is
+  /// the no-`Condition` fallback (QuickTimeStream.pl:209-212) — so every
+  /// non-deferred `gpmd` sample enters `ProcessGoPro` ⇒ `FoundEmbedded` ⇒
+  /// `ScanMediaData` returns early. A corrupt/zero-filled `gpmd` must therefore
+  /// NOT fall through to the brute-force `mdat` scan. The deferred variants
+  /// (R2/R6) must still return `false` (NOT GoPro, no `FoundEmbedded`).
+  #[test]
+  fn gpmd_sets_found_embedded_on_entry_even_when_parse_finds_nothing() {
+    let gpmd_track = StreamTrack {
+      meta_format: *b"gpmd",
+      ..StreamTrack::default()
+    };
+    let sample = Sample {
+      start: 0,
+      size: 0,
+      time: None,
+      dur: None,
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+
+    // A zero-filled `gpmd` sample: `process_gopro` extracts nothing (the KLV
+    // walker bails on the four-NUL tag, GoPro.pm:844) — but it is NOT a
+    // deferred variant, so it IS the `gpmd_GoPro` fallback and `FoundEmbedded`
+    // is set on entry. Pre-fix this returned the walker's `false`; now `true`.
+    let zero = [0u8; 64];
+    assert!(
+      decode_one_sample(&zero, &gpmd_track, &sample, &mut out, &mut gopro),
+      "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
+    );
+
+    // A `gpmd` sample whose leading tag bytes are non-printable: the walker
+    // bails on the tag-char guard (GoPro.pm:833), extracting nothing — but it
+    // is still the non-deferred `gpmd_GoPro` fallback, so `FoundEmbedded` is
+    // set. (All-`\xff` matches none of Kingslim/Rove/FMAS/Wolfbox: Wolfbox
+    // needs `0` bytes at offsets 136-151, which `\xff` fails.)
+    let nonprintable = vec![0xffu8; 64];
+    assert!(
+      !is_deferred_gpmd_variant(&nonprintable),
+      "the non-printable sample is NOT a deferred variant"
+    );
+    assert!(
+      decode_one_sample(&nonprintable, &gpmd_track, &sample, &mut out, &mut gopro),
+      "non-printable non-deferred gpmd still sets FoundEmbedded"
+    );
+
+    // No-regression: a DEFERRED variant (FMAS) returns false (NOT GoPro, must
+    // not set FoundEmbedded — preserves the R2/R6 fix).
+    let fmas = b"FMAS\0\0\0\0\xde\xad\xbe\xef";
+    assert!(is_deferred_gpmd_variant(fmas));
+    assert!(
+      !decode_one_sample(fmas, &gpmd_track, &sample, &mut out, &mut gopro),
+      "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
+    );
+
+    // And a real GoPro `DEVC` sample (valid record) of course returns true.
+    let devc = b"DEVC\0\x01\x00\x01\x00\x00\x00\x00";
+    assert!(
+      decode_one_sample(devc, &gpmd_track, &sample, &mut out, &mut gopro),
+      "a valid GoPro DEVC sample sets FoundEmbedded"
+    );
+
+    // A non-`gpmd`, non-`mebx` track sets nothing (the default arm).
+    let other_track = StreamTrack {
+      meta_format: *b"camm",
+      handler: *b"camm",
+      ..StreamTrack::default()
+    };
+    assert!(
+      !decode_one_sample(&zero, &other_track, &sample, &mut out, &mut gopro),
+      "a non-gpmd/non-mebx track sets no FoundEmbedded"
+    );
+  }
 
   fn atom(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
@@ -2645,10 +2958,12 @@ mod tests {
     let moov = atom(b"moov", &mvhd);
     let mut data = ftyp;
     data.extend_from_slice(&moov);
-    let (meta, found_embedded) = extract_stream(&data, None, None);
+    let mut gp = crate::metadata::GoProMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
     assert!(!found_embedded);
+    assert!(gp.is_empty());
   }
 
   /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box
@@ -2699,7 +3014,8 @@ mod tests {
     data.extend_from_slice(&blk); // freeGPS block at offset = block_offset
     data.extend_from_slice(&moov);
 
-    let (meta, found_embedded) = extract_stream(&data, None, None);
+    let mut gp = crate::metadata::GoProMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
     assert_eq!(
       meta.gps_samples().len(),
       1,
@@ -2789,7 +3105,8 @@ mod tests {
     data.extend_from_slice(&blk);
     data.extend_from_slice(&moov);
 
-    let (meta, found_embedded) = extract_stream(&data, None, None);
+    let mut gp = crate::metadata::GoProMeta::new();
+    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp);
     assert!(
       meta.is_empty(),
       "a gps '-HandlerType trak must yield no embedded GPS (ExifTool ignores it)"

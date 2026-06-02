@@ -129,7 +129,25 @@ const NOT_ACTIVE: &[&str] = &[
 /// Post-rebase (lib/m2ts golden-migration onto golden-v2 main): main's 343
 /// ACTIVE fixtures PLUS the single ACTIVE M2TS fixture (`M2TS.mts`) from this
 /// branch = 344.
-const EXPECTED_ACTIVE_FIXTURES: usize = 344;
+///
+/// GoPro Codex R7/F1 (multi-moov GPMF walk): +1 —
+/// `QuickTime_multimoov_gpmf.mov`, a synthetic two-`moov` `.mov` whose GoPro
+/// `udta/GPMF` lives ONLY in the LATER `moov` (the first-match
+/// `find_top_level_box` dropped it; `for_each_moov_gpmf` now walks every
+/// `moov`). 344 → 345.
+///
+/// GoPro Codex R12-A (full %GoPro::GPMF default-visible set): +1 —
+/// `QuickTime_gopro_gpmf.mov`, a synthetic `moov/udta/GPMF` exercising a broad
+/// slice of the ~95 newly-emitted GoPro tags (sensor-stream `Binary`
+/// placeholders, hash/regex/suffix PrintConvs, AddUnits, ValueConv-folded). The
+/// moov/udta/GPMF path emits WITHOUT `-ee`, so it carries standard `.json` /
+/// `.n.json` goldens. 345 → 346.
+///
+/// GoPro Codex R13 (generic complex-`?` non-numeric columns): +1 —
+/// `QuickTime_gopro_scen.mov`, a synthetic `moov/udta/GPMF` whose `SCEN`
+/// (SceneClassification, `TYPE=Ff`) complex record carries an embedded `F`
+/// FourCC column the pre-R13 numeric-only decoder dropped. 346 → 347.
+const EXPECTED_ACTIVE_FIXTURES: usize = 347;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
