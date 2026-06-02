@@ -17,6 +17,8 @@
 //! (i.e. `body_offset - 14` from the body), so we resolve every
 //! out-of-line offset against the BLOB (not just the body).
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
 use crate::exif::makernotes::detected::ChildByteOrder;
 use crate::value::TagValue;
@@ -58,11 +60,13 @@ impl ParsedValue {
   /// `int32s[2]`).
   #[must_use]
   pub fn first_two_i64(&self) -> Option<(i64, i64)> {
+    // `[a, b, ..]` matches len ≥ 2 and binds the first two — byte-identical to
+    // the `if v.len() >= 2 => (v[0], v[1])` index pair, without raw indexing.
     match &self.raw {
-      RawValue::I64(v) if v.len() >= 2 => Some((v[0], v[1])),
-      RawValue::U64(v) if v.len() >= 2 => {
-        let a = i64::try_from(v[0]).ok()?;
-        let b = i64::try_from(v[1]).ok()?;
+      RawValue::I64(v) if let [a, b, ..] = v.as_slice() => Some((*a, *b)),
+      RawValue::U64(v) if let [a, b, ..] = v.as_slice() => {
+        let a = i64::try_from(*a).ok()?;
+        let b = i64::try_from(*b).ok()?;
         Some((a, b))
       }
       _ => None,
@@ -72,10 +76,12 @@ impl ParsedValue {
   /// The first two rational64 values as f64 — for `FocusDistanceRange`.
   #[must_use]
   pub fn rational_pair(&self) -> Option<(f64, f64)> {
+    // `[r0, r1, ..]` matches len ≥ 2 and binds the first two — byte-identical to
+    // the `rs.len() >= 2` guard + `rs[0]`/`rs[1]`, without raw indexing.
     match &self.raw {
-      RawValue::Rational(rs) if rs.len() >= 2 => {
-        let a = ratio_f64(rs[0].numerator(), rs[0].denominator())?;
-        let b = ratio_f64(rs[1].numerator(), rs[1].denominator())?;
+      RawValue::Rational(rs) if let [r0, r1, ..] = rs.as_slice() => {
+        let a = ratio_f64(r0.numerator(), r0.denominator())?;
+        let b = ratio_f64(r1.numerator(), r1.denominator())?;
         Some((a, b))
       }
       _ => None,
@@ -141,7 +147,11 @@ pub fn walk_apple_body(
   if body_offset >= blob.len() {
     return out;
   }
-  let body = &blob[body_offset..];
+  // The guard above ⇒ `body_offset < blob.len()`, so `.get(body_offset..)` is
+  // `Some`; the checked slice is byte-identical to `&blob[body_offset..]`.
+  let Some(body) = blob.get(body_offset..) else {
+    return out;
+  };
   // Resolve byte order. `MakerNotes.pm:44` is `ByteOrder => 'Unknown'`,
   // so the body marker (II/MM at offset 0-1) decides; fall back to the
   // parent walk's order if the body has no marker (degenerate — every
@@ -232,8 +242,9 @@ pub fn walk_apple_body(
 }
 
 fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
-  let b = data.get(pos..pos + 2)?;
-  let arr: [u8; 2] = [b[0], b[1]];
+  // The `.get(pos..pos+2)?` slice has length 2, so `try_into::<[u8;2]>` always
+  // succeeds; this is byte-identical to `[b[0], b[1]]` without raw indexing.
+  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -241,8 +252,9 @@ fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
 }
 
 fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
-  let b = data.get(pos..pos + 4)?;
-  let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
+  // The `.get(pos..pos+4)?` slice has length 4, so `try_into::<[u8;4]>` always
+  // succeeds; this is byte-identical to `[b[0]..b[3]]` without raw indexing.
+  let arr: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
@@ -252,6 +264,11 @@ fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
 use std::vec::Vec;
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

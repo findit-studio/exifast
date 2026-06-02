@@ -78,6 +78,10 @@
 //! `tests/golden/Real.rm.{json,n.json}` strips that one Composite line per
 //! established precedent.
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{fix_utf8, write_convert_bitrate},
   datetime::convert_duration as convert_duration_string,
@@ -576,24 +580,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>> {
 /// Field 9 uses `Format => 'int16u'` (Real.pm:102) and field 10 ditto
 /// (Real.pm:104-112). All fields are MM (big-endian).
 fn parse_prop(body: &[u8]) -> PropTags {
+  // `body.get(off..off + N)?` returns `Some` on exactly the same `off + N <=
+  // body.len()` condition as the original explicit guard, and `None`
+  // otherwise (byte-identical) — the `try_into` over an N-byte slice never fails.
   let read_u32 = |off: usize| -> Option<u32> {
-    if off + 4 <= body.len() {
-      Some(u32::from_be_bytes([
-        body[off],
-        body[off + 1],
-        body[off + 2],
-        body[off + 3],
-      ]))
-    } else {
-      None
-    }
+    Some(u32::from_be_bytes(body.get(off..off + 4)?.try_into().ok()?))
   };
   let read_u16 = |off: usize| -> Option<u16> {
-    if off + 2 <= body.len() {
-      Some(u16::from_be_bytes([body[off], body[off + 1]]))
-    } else {
-      None
-    }
+    Some(u16::from_be_bytes(body.get(off..off + 2)?.try_into().ok()?))
   };
   // Real.pm:93-105 sequence: 9 × int32u at offsets 0, 4, 8, 12, 16, 20, 24,
   // 28, 32; then int16u NumStreams at 36; then int16u Flags at 38.
@@ -674,61 +668,77 @@ fn parse_mdpr(body: &[u8]) -> MdprStream {
   if body.len() < 36 {
     return s;
   }
-  // Real.pm:121 — `StreamNumber Format => 'int16u'` at offset 0.
-  s.stream_number = Some(u16::from_be_bytes([body[0], body[1]]));
+  // Real.pm:121 — `StreamNumber Format => 'int16u'` at offset 0. The
+  // `body.len() < 36` guard above proves offset 0..2 exists, so `.get(0..2)`
+  // always hits (byte-identical); the `try_into` over the 2-byte slice never fails.
+  s.stream_number = body
+    .get(0..2)
+    .map(|b| u16::from_be_bytes(b.try_into().unwrap_or_default()));
   // Real.pm:122-127 — five int32u fields. Bundled FORMAT='int32u' applies
   // starting at offset 2 (after the int16u override at field 0). Wait —
   // Perl ProcessSerialData with FORMAT='int32u' but field 0 has
   // `Format => 'int16u'`. So fields 1..7 are int32u starting at offset 2.
-  let read_u32 = |off: usize| -> u32 {
-    u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
+  // The closure now returns `Option`: `body.get(off..off + 4)?` yields `Some`
+  // on exactly the caller-guaranteed in-bounds offsets (all < 30 ≤ body.len()),
+  // and the result feeds the already-`Option` fields unchanged (byte-identical).
+  let read_u32 = |off: usize| -> Option<u32> {
+    Some(u32::from_be_bytes(body.get(off..off + 4)?.try_into().ok()?))
   };
-  s.stream_max_bitrate = Some(read_u32(2));
-  s.stream_avg_bitrate = Some(read_u32(6));
-  s.stream_max_packet_size = Some(read_u32(10));
-  s.stream_avg_packet_size = Some(read_u32(14));
-  s.stream_start_time = Some(read_u32(18));
-  s.stream_preroll_ms = Some(read_u32(22));
-  s.stream_duration_ms = Some(read_u32(26));
-  // Real.pm:129 — StreamNameLen int8u at offset 30.
-  let stream_name_len = body[30] as usize;
+  s.stream_max_bitrate = read_u32(2);
+  s.stream_avg_bitrate = read_u32(6);
+  s.stream_max_packet_size = read_u32(10);
+  s.stream_avg_packet_size = read_u32(14);
+  s.stream_start_time = read_u32(18);
+  s.stream_preroll_ms = read_u32(22);
+  s.stream_duration_ms = read_u32(26);
+  // Real.pm:129 — StreamNameLen int8u at offset 30 (in range per the len≥36
+  // guard; the `.get()` failing recovers on the same `return s` path).
+  let Some(&stream_name_len_byte) = body.get(30) else {
+    return s;
+  };
+  let stream_name_len = stream_name_len_byte as usize;
   // Real.pm:130 — StreamName string[$val{8}] at offset 31..31+nameLen.
   let mut cursor = 31;
-  if cursor + stream_name_len <= body.len() {
-    let name_slice = &body[cursor..cursor + stream_name_len];
-    // Real.pm:130 — `Format => 'string[$val{8}]'` ⇒ ReadValue's `s/\0.*//s`
-    // first-NUL truncation (ExifTool.pm:6300) applies; see [`null_truncate`].
-    s.stream_name = Some(raw_bytes_to_json_string(null_truncate(name_slice)));
-    cursor += stream_name_len;
-  } else {
+  // `body.get(cursor..cursor + stream_name_len)` is `Some` on exactly the
+  // original `cursor + stream_name_len <= body.len()` condition, `None`
+  // otherwise (byte-identical: the `else` keeps the same `return s` recovery).
+  let Some(name_slice) = body.get(cursor..cursor + stream_name_len) else {
     return s;
-  }
-  // Real.pm:131 — StreamMimeLen int8u at next offset.
-  if cursor >= body.len() {
+  };
+  // Real.pm:130 — `Format => 'string[$val{8}]'` ⇒ ReadValue's `s/\0.*//s`
+  // first-NUL truncation (ExifTool.pm:6300) applies; see [`null_truncate`].
+  s.stream_name = Some(raw_bytes_to_json_string(null_truncate(name_slice)));
+  cursor += stream_name_len;
+  // Real.pm:131 — StreamMimeLen int8u at next offset (the original
+  // `cursor >= body.len()` guard ≡ `.get(cursor)` returning `None`).
+  let Some(&stream_mime_len_byte) = body.get(cursor) else {
     return s;
-  }
-  let stream_mime_len = body[cursor] as usize;
+  };
+  let stream_mime_len = stream_mime_len_byte as usize;
   cursor += 1;
   // Real.pm:132-136 — StreamMimeType string[$val{10}].
-  if cursor + stream_mime_len <= body.len() {
-    let mime_slice = &body[cursor..cursor + stream_mime_len];
-    // Real.pm:132-136 — `Format => 'string[$val{10}]'` ⇒ ReadValue's
-    // first-NUL truncation (ExifTool.pm:6300) applies BEFORE storage.
-    // Bundled then runs `$mime =~ s/\0.*//s` AGAIN at Real.pm:643 before
-    // pushing to `@mimeTypes`; since both truncations are at the FIRST NUL,
-    // applying it once here yields the same value (mime_override sees the
-    // truncated form). Codex R2 finding — without this, embedded NULs leak
-    // through `Real-MDPR:StreamMimeType` AND `File:MIMEType`.
-    s.stream_mime_type = Some(raw_bytes_to_json_string(null_truncate(mime_slice)));
-    cursor += stream_mime_len;
-  } else {
+  let Some(mime_slice) = body.get(cursor..cursor + stream_mime_len) else {
     return s;
-  }
+  };
+  // Real.pm:132-136 — `Format => 'string[$val{10}]'` ⇒ ReadValue's
+  // first-NUL truncation (ExifTool.pm:6300) applies BEFORE storage.
+  // Bundled then runs `$mime =~ s/\0.*//s` AGAIN at Real.pm:643 before
+  // pushing to `@mimeTypes`; since both truncations are at the FIRST NUL,
+  // applying it once here yields the same value (mime_override sees the
+  // truncated form). Codex R2 finding — without this, embedded NULs leak
+  // through `Real-MDPR:StreamMimeType` AND `File:MIMEType`.
+  s.stream_mime_type = Some(raw_bytes_to_json_string(null_truncate(mime_slice)));
+  cursor += stream_mime_len;
   // Real.pm:137 — FileInfoLen int32u (the BE u32 size of the trailing payload).
   if cursor + 4 > body.len() {
     return s;
   }
-  let file_info_len = read_u32(cursor) as usize;
+  // In range per the guard above ⇒ `read_u32` is `Some`; the `else` keeps the
+  // same `return s` recovery (byte-identical).
+  let Some(file_info_len) = read_u32(cursor) else {
+    return s;
+  };
+  let file_info_len = file_info_len as usize;
   cursor += 4;
   // Real.pm:138-143 — FileInfoLen2 (gates the logical-fileinfo path).
   // Condition: `$self->{RealStreamMime} eq "logical-fileinfo"`. Faithful
@@ -747,30 +757,35 @@ fn parse_mdpr(body: &[u8]) -> MdprStream {
   if cursor + 4 > body.len() {
     return s;
   }
-  let file_info_len2 = read_u32(cursor) as usize;
-  cursor += 4;
-  // Real.pm:144-147 — FileInfoVersion int16u.
-  if cursor + 2 > body.len() {
+  let Some(file_info_len2) = read_u32(cursor) else {
     return s;
-  }
-  s.file_info_version = Some(u16::from_be_bytes([body[cursor], body[cursor + 1]]));
+  };
+  let file_info_len2 = file_info_len2 as usize;
+  cursor += 4;
+  // Real.pm:144-147 — FileInfoVersion int16u. The `cursor + 2 > body.len()`
+  // guard ≡ `.get(cursor..cursor + 2)` returning `None`; the 2-byte `try_into`
+  // never fails (byte-identical; same `return s` recovery).
+  let Some(fiv) = body.get(cursor..cursor + 2) else {
+    return s;
+  };
+  s.file_info_version = Some(u16::from_be_bytes(fiv.try_into().unwrap_or_default()));
   cursor += 2;
   // Real.pm:148-152 — PhysicalStreams int16u (`Unknown => 1` ⇒ stored only
   // for sizing the next two tags).
-  if cursor + 2 > body.len() {
+  let Some(ps) = body.get(cursor..cursor + 2) else {
     return s;
-  }
-  let physical_streams = u16::from_be_bytes([body[cursor], body[cursor + 1]]) as usize;
+  };
+  let physical_streams = u16::from_be_bytes(ps.try_into().unwrap_or_default()) as usize;
   cursor += 2;
   // Real.pm:153-157 — PhysicalStreamNumbers int16u[$val{15}].
   cursor += physical_streams * 2;
   // Real.pm:158-162 — DataOffsets int32u[$val{15}].
   cursor += physical_streams * 4;
   // Real.pm:163-167 — NumRules int16u.
-  if cursor + 2 > body.len() {
+  let Some(nr) = body.get(cursor..cursor + 2) else {
     return s;
-  }
-  let num_rules = u16::from_be_bytes([body[cursor], body[cursor + 1]]) as usize;
+  };
+  let num_rules = u16::from_be_bytes(nr.try_into().unwrap_or_default()) as usize;
   cursor += 2;
   // Real.pm:168-172 — PhysicalStreamNumberMap int16u[$val{18}].
   cursor += num_rules * 2;
@@ -793,7 +808,13 @@ fn parse_mdpr(body: &[u8]) -> MdprStream {
   // remaining at `cursor` is `body.len() - cursor` bytes — must contain
   // the FileInfoProperties.)
   let end = cursor.saturating_add(prop_len).min(body.len());
-  let props = &body[cursor..end];
+  // `cursor <= body.len()` (the NumProperties guard above proved `cursor + 2 <=
+  // body.len()` before `cursor += 2`) and `end = min(cursor + prop_len,
+  // body.len()) >= cursor`, so `cursor..end` is a valid in-bounds range and
+  // `.get()` always hits (byte-identical; the `else` keeps the `return s` recovery).
+  let Some(props) = body.get(cursor..end) else {
+    return s;
+  };
   s.file_info_props = parse_real_properties(props);
   s
 }
@@ -848,7 +869,10 @@ fn raw_bytes_to_json_string(bytes: &[u8]) -> String {
 /// where `ReadValue` returns raw bytes WITHOUT truncating at NULs.
 fn null_truncate(bytes: &[u8]) -> &[u8] {
   let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-  &bytes[..end]
+  // `end <= bytes.len()` (it is a `position` index or `bytes.len()`), so
+  // `.get(..end)` always hits; `unwrap_or(bytes)` is the unreachable fallback
+  // (byte-identical to the raw `&bytes[..end]`).
+  bytes.get(..end).unwrap_or(bytes)
 }
 
 // ===========================================================================
@@ -865,10 +889,14 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
   let mut out: Vec<FileInfoProp> = Vec::new();
   let mut pos: usize = 0;
   while pos + 6 <= body.len() {
-    // Real.pm:369 — `($size, $vers) = unpack("x${pos}Nn", $$dataPt)`.
-    let size =
-      u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
-    let vers = u16::from_be_bytes([body[pos + 4], body[pos + 5]]);
+    // Real.pm:369 — `($size, $vers) = unpack("x${pos}Nn", $$dataPt)`. The
+    // `pos + 6 <= body.len()` loop bound proves this 6-byte window exists, so
+    // the destructure always binds (byte-identical; `break` ≡ the loop exit).
+    let Some(&[h0, h1, h2, h3, h4, h5]) = body.get(pos..pos + 6) else {
+      break;
+    };
+    let size = u32::from_be_bytes([h0, h1, h2, h3]) as usize;
+    let vers = u16::from_be_bytes([h4, h5]);
     // Real.pm:370 — `last if $size < 6`.
     if size < 6 {
       break;
@@ -879,32 +907,34 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
       continue;
     }
     pos += 6;
-    // Real.pm:377 — `tagLen = unpack("x${pos}C", $$dataPt)`.
-    if pos >= body.len() {
+    // Real.pm:377 — `tagLen = unpack("x${pos}C", $$dataPt)`. The original
+    // `pos >= body.len()` guard ≡ `.get(pos)` returning `None` (same `break`).
+    let Some(&tag_len_byte) = body.get(pos) else {
       break;
-    }
-    let tag_len = body[pos] as usize;
+    };
+    let tag_len = tag_len_byte as usize;
     pos += 1;
-    // Real.pm:380 — `last if $pos + $tagLen > $dirLen`.
-    if pos + tag_len > body.len() {
+    // Real.pm:380 — `last if $pos + $tagLen > $dirLen` ≡ `.get(pos..pos+tagLen)`
+    // returning `None` (byte-identical; same `break`).
+    let Some(tag_raw) = body.get(pos..pos + tag_len) else {
       break;
-    }
-    let tag_raw = &body[pos..pos + tag_len];
+    };
     let tag_str = raw_bytes_to_json_string(null_truncate(tag_raw));
     pos += tag_len;
-    // Real.pm:384 — `last if $pos + 6 > $dirLen`.
-    if pos + 6 > body.len() {
+    // Real.pm:384 — `last if $pos + 6 > $dirLen`. The 6-byte window destructure
+    // recovers on the same `break` (byte-identical).
+    let Some(&[p0, p1, p2, p3, p4, p5]) = body.get(pos..pos + 6) else {
       break;
-    }
+    };
     // Real.pm:385 — `($type, $valLen) = unpack("x${pos}Nn", $$dataPt)`.
-    let prop_type = u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
-    let val_len = u16::from_be_bytes([body[pos + 4], body[pos + 5]]) as usize;
+    let prop_type = u32::from_be_bytes([p0, p1, p2, p3]);
+    let val_len = u16::from_be_bytes([p4, p5]) as usize;
     pos += 6;
-    // Real.pm:388 — `last if $pos + $valLen > $dirLen`.
-    if pos + val_len > body.len() {
+    // Real.pm:388 — `last if $pos + $valLen > $dirLen` ≡ `.get(pos..pos+valLen)`
+    // returning `None` (byte-identical; same `break`).
+    let Some(raw_val) = body.get(pos..pos + val_len) else {
       break;
-    }
-    let raw_val = &body[pos..pos + val_len];
+    };
     pos += val_len;
     // Real.pm:389-391 — `format = $propertyType{$type} || 'undef'`;
     // Real::propertyType = ( 0 => 'int32u', 2 => 'string' ).
@@ -920,11 +950,12 @@ fn parse_real_properties(body: &[u8]) -> Vec<FileInfoProp> {
     // bare tags (no conv).
     match prop_type {
       0 => {
-        // int32u
-        if raw_val.len() < 4 {
+        // int32u. The `raw_val.len() < 4` guard ≡ `.get(0..4)` returning
+        // `None`; the `continue` recovery is byte-identical.
+        let Some(&[r0, r1, r2, r3]) = raw_val.get(0..4) else {
           continue;
-        }
-        let val_u32 = u32::from_be_bytes([raw_val[0], raw_val[1], raw_val[2], raw_val[3]]);
+        };
+        let val_u32 = u32::from_be_bytes([r0, r1, r2, r3]);
         if info_name == "ContentRating" {
           let print = content_rating_print(val_u32);
           out.push(FileInfoProp {
@@ -1062,32 +1093,37 @@ fn rewrite_date_mm_dd_yyyy(s: &str) -> (String, bool) {
   // ASCII-only `(\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+)`. We do a simple
   // left-to-right scan.
   let bytes = s.as_bytes();
+  // Every `bytes[X]` below sits behind a `X < bytes.len()` (loop) or
+  // `X >= bytes.len() || …` (short-circuit) guard, so the `.get(X)` form
+  // returns `Some` on exactly the same in-range condition and `None`
+  // otherwise — byte-identical (`is_some_and` / `== Some(&b'…')` collapse to
+  // the original predicate when in range, and to `false`/`!=` when not).
   // Try every starting position (Perl `m{…}` without anchors is `.*?`-prefixed).
   for start in 0..bytes.len() {
-    if !bytes[start].is_ascii_digit() {
+    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
       continue;
     }
     // Greedy digits.
     let mut i = start;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
+    while i < bytes.len() && bytes.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
-    if i >= bytes.len() || bytes[i] != b'/' || i == start {
+    if i >= bytes.len() || bytes.get(i) != Some(&b'/') || i == start {
       continue;
     }
     let g1 = &s[start..i];
     let m_start = i + 1;
     let mut j = m_start;
-    while j < bytes.len() && bytes[j].is_ascii_digit() {
+    while j < bytes.len() && bytes.get(j).is_some_and(u8::is_ascii_digit) {
       j += 1;
     }
-    if j >= bytes.len() || bytes[j] != b'/' || j == m_start {
+    if j >= bytes.len() || bytes.get(j) != Some(&b'/') || j == m_start {
       continue;
     }
     let g2 = &s[m_start..j];
     let d_start = j + 1;
     let mut k = d_start;
-    while k < bytes.len() && bytes[k].is_ascii_digit() {
+    while k < bytes.len() && bytes.get(k).is_some_and(u8::is_ascii_digit) {
       k += 1;
     }
     if k == d_start {
@@ -1096,7 +1132,7 @@ fn rewrite_date_mm_dd_yyyy(s: &str) -> (String, bool) {
     let g3 = &s[d_start..k];
     // Require \s+ then H:M:S.
     let mut ws = k;
-    while ws < bytes.len() && bytes[ws].is_ascii_whitespace() {
+    while ws < bytes.len() && bytes.get(ws).is_some_and(u8::is_ascii_whitespace) {
       ws += 1;
     }
     if ws == k {
@@ -1104,25 +1140,25 @@ fn rewrite_date_mm_dd_yyyy(s: &str) -> (String, bool) {
     }
     let h_start = ws;
     let mut l = h_start;
-    while l < bytes.len() && bytes[l].is_ascii_digit() {
+    while l < bytes.len() && bytes.get(l).is_some_and(u8::is_ascii_digit) {
       l += 1;
     }
-    if l >= bytes.len() || bytes[l] != b':' || l == h_start {
+    if l >= bytes.len() || bytes.get(l) != Some(&b':') || l == h_start {
       continue;
     }
     let g4 = &s[h_start..l];
     let mi_start = l + 1;
     let mut m_idx = mi_start;
-    while m_idx < bytes.len() && bytes[m_idx].is_ascii_digit() {
+    while m_idx < bytes.len() && bytes.get(m_idx).is_some_and(u8::is_ascii_digit) {
       m_idx += 1;
     }
-    if m_idx >= bytes.len() || bytes[m_idx] != b':' || m_idx == mi_start {
+    if m_idx >= bytes.len() || bytes.get(m_idx) != Some(&b':') || m_idx == mi_start {
       continue;
     }
     let g5 = &s[mi_start..m_idx];
     let sec_start = m_idx + 1;
     let mut p = sec_start;
-    while p < bytes.len() && bytes[p].is_ascii_digit() {
+    while p < bytes.len() && bytes.get(p).is_some_and(u8::is_ascii_digit) {
       p += 1;
     }
     if p == sec_start {
@@ -1166,12 +1202,11 @@ fn apply_file_info_value_conv(name: &str, raw: &str, _found_in_table: bool) -> (
 fn parse_cont(body: &[u8]) -> ContTags {
   let mut c = ContTags::default();
   let mut cursor: usize = 0;
+  // `b.get(pos..pos + 2)?` is `Some` on exactly the original `pos + 2 <=
+  // b.len()` condition and `None` otherwise (byte-identical); the 2-byte
+  // `try_into` never fails.
   let read_len = |b: &[u8], pos: usize| -> Option<usize> {
-    if pos + 2 <= b.len() {
-      Some(u16::from_be_bytes([b[pos], b[pos + 1]]) as usize)
-    } else {
-      None
-    }
+    Some(u16::from_be_bytes(b.get(pos..pos + 2)?.try_into().ok()?) as usize)
   };
   for (i, field) in [
     &mut c.title,
@@ -1187,15 +1222,18 @@ fn parse_cont(body: &[u8]) -> ContTags {
       None => return c,
     };
     cursor += 2;
-    if cursor + len > body.len() {
+    // `body.get(cursor..cursor + len)` is `Some` on exactly the original
+    // `cursor + len <= body.len()` condition; `None` ⇒ the same `return c`
+    // truncation recovery (byte-identical).
+    let Some(field_slice) = body.get(cursor..cursor + len) else {
       // Bundled `ReadValue` returns truncated; we drop to None.
       let _ = i;
       return c;
-    }
+    };
     // Real.pm:242/244/246/248 — each CONT field is `Format => 'string[…]'`,
     // so ReadValue's first-NUL truncation (ExifTool.pm:6300) applies; see
     // [`null_truncate`].
-    let s = raw_bytes_to_json_string(null_truncate(&body[cursor..cursor + len]));
+    let s = raw_bytes_to_json_string(null_truncate(field_slice));
     **field = Some(s);
     cursor += len;
   }
@@ -1212,8 +1250,15 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
   let dir_len = body.len();
   let mut pos: usize = 0;
   while pos + 28 <= dir_len {
+    // Every `read_u32` call site is in range: the 7 header reads sit behind
+    // the `pos + 28 <= dir_len` loop bound (`pos..pos+28`), and the
+    // value-length read behind the `value_pos + 4 > dir_len` guard below — so
+    // `body.get(off..off + 4)` always hits and the `0` fallback is unreachable
+    // (byte-identical to the raw 4-byte index).
     let read_u32 = |off: usize| -> u32 {
-      u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]])
+      body
+        .get(off..off + 4)
+        .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or([0; 4])))
     };
     // Real.pm:439-440 — 7 × N (u32 BE).
     let size = read_u32(pos) as usize;
@@ -1243,8 +1288,12 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
     if value_pos + 4 > dir_len {
       break;
     }
-    // Real.pm:449-451 — name read + truncate at first NUL + prefix join.
-    let name_raw = &body[pos + 28..pos + 28 + name_len];
+    // Real.pm:449-451 — name read + truncate at first NUL + prefix join. The
+    // `pos + 28 + name_len > dir_len` guard above ≡ `.get()` returning `None`
+    // (byte-identical; the `else` keeps the same `break` recovery).
+    let Some(name_raw) = body.get(pos + 28..pos + 28 + name_len) else {
+      break;
+    };
     let name_str = raw_bytes_to_json_string(null_truncate(name_raw));
     let full_tag = if prefix.is_empty() {
       name_str
@@ -1268,7 +1317,11 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
     let resolved_name = smol_str::SmolStr::from(resolve_rjmd_tag(&full_tag));
     // Real.pm:468-490 — emit if `$valueLen && $format`.
     if value_len > 0 {
-      let raw_value = &body[value_data_pos..value_data_pos + value_len];
+      // The `value_data_pos + value_len > dir_len` guard above ≡ `.get()`
+      // returning `None` (byte-identical; same `break` recovery).
+      let Some(raw_value) = body.get(value_data_pos..value_data_pos + value_len) else {
+        break;
+      };
       match typ {
         1 | 2 | 6 | 8 => {
           // string-shaped formats — Latin-1 decode, NUL-trim.
@@ -1282,10 +1335,15 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
         }
         3 => {
           // flag: 1 byte (int8u) or 4 bytes (int32u) per Real.pm:470-471.
+          // `value_len == 4` ⇒ `raw_value` is 4 bytes (so `.get(0..4)` hits);
+          // else `value_len > 0` ⇒ `raw_value` is non-empty (so `.first()`
+          // hits). Both `.unwrap_or(0)` fallbacks are unreachable (byte-identical).
           let v: u32 = if value_len == 4 {
-            u32::from_be_bytes([raw_value[0], raw_value[1], raw_value[2], raw_value[3]])
+            raw_value
+              .get(0..4)
+              .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or([0; 4])))
           } else {
-            raw_value[0] as u32
+            raw_value.first().copied().unwrap_or(0) as u32
           };
           out.push(RjmdTag {
             name: resolved_name,
@@ -1295,9 +1353,12 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
           });
         }
         4 => {
-          // int32u.
+          // int32u. The `value_len >= 4` guard ⇒ `raw_value` is ≥ 4 bytes, so
+          // `.get(0..4)` hits and the `0` fallback is unreachable (byte-identical).
           if value_len >= 4 {
-            let v = u32::from_be_bytes([raw_value[0], raw_value[1], raw_value[2], raw_value[3]]);
+            let v = raw_value
+              .get(0..4)
+              .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or([0; 4])));
             out.push(RjmdTag {
               name: resolved_name,
               value: v.to_string(),
@@ -1339,25 +1400,28 @@ fn parse_real_meta(body: &[u8], prefix: &str, out: &mut Vec<RjmdTag>) {
       let dir_start = value_pos + 4 + value_len + num_sub_props * 8;
       let _ = sub_prop_pos;
       if dir_start <= pos + size {
-        // dirLen = pos + size - dirStart.
+        // dirLen = pos + size - dirStart. `dir_start <= pos+size <= dir_len`
+        // and `sub_end >= dir_start`, so `.get(dir_start..sub_end)` always hits
+        // (byte-identical; the `else` recovery skips the sub-dispatch, matching
+        // the bundled `last`-style bail on an out-of-range sub-directory).
         let sub_dir_len = (pos + size).saturating_sub(dir_start);
         let sub_end = dir_start.saturating_add(sub_dir_len).min(dir_len);
-        let sub_body = &body[dir_start..sub_end];
-        // Recurse with the FULL tag as new prefix (Real.pm:499 `Prefix => $tag`).
-        // Real.pm:451 path stores `$tag = $prefix . $tag` ⇒ already
-        // prefix-joined; passing `full_tag` (the assembled prefix-and-self)
-        // matches bundled.
-        let new_prefix_full = if prefix.is_empty() {
-          // Re-read the body's name from the raw bytes to avoid the
-          // dynamic-rename remap (the recursion prefix is the literal
-          // on-disk name, not the post-Real::Metadata rename).
-          let raw = &body[pos + 28..pos + 28 + name_len];
-          raw_bytes_to_json_string(null_truncate(raw))
-        } else {
-          let raw = &body[pos + 28..pos + 28 + name_len];
-          format!("{prefix}/{}", raw_bytes_to_json_string(null_truncate(raw)))
-        };
-        parse_real_meta(sub_body, &new_prefix_full, out);
+        if let Some(sub_body) = body.get(dir_start..sub_end) {
+          // Recurse with the FULL tag as new prefix (Real.pm:499 `Prefix =>
+          // $tag`). Real.pm:451 path stores `$tag = $prefix . $tag` ⇒ already
+          // prefix-joined; passing `full_tag` (the assembled prefix-and-self)
+          // matches bundled. `name_raw` is the SAME `pos+28..pos+28+name_len`
+          // slice already bound above (the literal on-disk name, pre-rename).
+          let new_prefix_full = if prefix.is_empty() {
+            raw_bytes_to_json_string(null_truncate(name_raw))
+          } else {
+            format!(
+              "{prefix}/{}",
+              raw_bytes_to_json_string(null_truncate(name_raw))
+            )
+          };
+          parse_real_meta(sub_body, &new_prefix_full, out);
+        }
       }
     }
     // Real.pm:503 — `$pos += $size`.
@@ -1404,8 +1468,13 @@ fn date_value_conv_yyyymmddhhmmss(s: &str) -> String {
     return s.to_string();
   }
   // Faithful regex anchor: matches at position 0 (no leading `^?` in the
-  // Perl). The bundled regex is `/^(\d{4})(\d{2})…/`.
-  if !bytes[..14].iter().all(u8::is_ascii_digit) {
+  // Perl). The bundled regex is `/^(\d{4})(\d{2})…/`. The `bytes.len() < 14`
+  // guard above proves the 14-byte prefix exists, so `.get(..14)` always hits
+  // (byte-identical to the raw `bytes[..14]`).
+  if !bytes
+    .get(..14)
+    .is_some_and(|b| b.iter().all(u8::is_ascii_digit))
+  {
     return s.to_string();
   }
   let y = &s[0..4];
@@ -1441,7 +1510,12 @@ fn parse_rm(data: &[u8]) -> RealMeta<'_> {
   if data.len() < 8 {
     return meta;
   }
-  let size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+  // The `data.len() < 8` guard proves bytes 4..8 exist (byte-identical);
+  // the 4-byte `try_into` never fails.
+  let Some(size_bytes) = data.get(4..8) else {
+    return meta;
+  };
+  let size = u32::from_be_bytes(size_bytes.try_into().unwrap_or_default()) as usize;
   if size < 8 {
     return meta;
   }
@@ -1451,19 +1525,20 @@ fn parse_rm(data: &[u8]) -> RealMeta<'_> {
   }
   // Real.pm:602-651 — chunk walk. `last if $tag eq 'DATA'` (Real.pm:609).
   while cursor + 10 <= data.len() {
-    let tag = &data[cursor..cursor + 4];
-    let chunk_size = u32::from_be_bytes([
-      data[cursor + 4],
-      data[cursor + 5],
-      data[cursor + 6],
-      data[cursor + 7],
-    ]) as usize;
+    // The `cursor + 10 <= data.len()` loop bound proves the 8-byte chunk
+    // header exists, so the destructure always binds (byte-identical; `break`
+    // ≡ the loop exit). `tag` is a `[u8; 4]` array (const indexing, not flagged).
+    let Some(&[t0, t1, t2, t3, s0, s1, s2, s3]) = data.get(cursor..cursor + 8) else {
+      break;
+    };
+    let tag = [t0, t1, t2, t3];
+    let chunk_size = u32::from_be_bytes([s0, s1, s2, s3]) as usize;
     // Real.pm:606 — null-tag terminator.
     if tag == [0, 0, 0, 0] {
       break;
     }
     // Real.pm:609 — bundled stops at DATA under default verbose.
-    if tag == b"DATA" {
+    if &tag == b"DATA" {
       break;
     }
     // Real.pm:611-614 — bad chunk size guards.
@@ -1476,8 +1551,12 @@ fn parse_rm(data: &[u8]) -> RealMeta<'_> {
     if body_start > body_end {
       break;
     }
-    let body = &data[body_start..body_end];
-    match tag {
+    // `body_start <= body_end <= data.len()` (the guard above + the `min`),
+    // so `.get()` always hits (byte-identical; the `else` keeps the `break`).
+    let Some(body) = data.get(body_start..body_end) else {
+      break;
+    };
+    match &tag {
       b"PROP" => {
         meta.prop = parse_prop(body);
       }
@@ -1493,8 +1572,9 @@ fn parse_rm(data: &[u8]) -> RealMeta<'_> {
         // Bundled `RJMD` chunk has identical inner layout; first 4 bytes
         // are version, then the metadata records. The footer-RJMD has 4
         // version bytes of `0000 0001` followed by the records.
-        if body.len() > 4 {
-          parse_real_meta(&body[4..], "", &mut meta.rjmd_tags);
+        // `body.len() > 4` ⇒ `.get(4..)` is `Some` (byte-identical).
+        if let Some(rjmd_body) = body.get(4..) {
+          parse_real_meta(rjmd_body, "", &mut meta.rjmd_tags);
         }
       }
       _ => {}
@@ -1519,28 +1599,43 @@ fn parse_rm_footer<'a>(data: &'a [u8], meta: &mut RealMeta<'a>) {
   if n < 140 {
     return;
   }
-  // RMJE marker at offset n-140; read 12 bytes there.
+  // RMJE marker at offset n-140; read 12 bytes there. The `n < 140` guard
+  // proves `rmje_off..rmje_off + 12` (= `n-140 .. n-128`) is in range, so
+  // `.get()` always hits (byte-identical; the `else` skips the RMJE scan).
   let rmje_off = n - 140;
-  let rmje_buf = &data[rmje_off..rmje_off + 12];
-  if rmje_buf.starts_with(b"RMJE") {
-    // metaSize = unpack('x8N') ⇒ u32 BE at byte 8 within the 12-byte buf.
-    let meta_size =
-      u32::from_be_bytes([rmje_buf[8], rmje_buf[9], rmje_buf[10], rmje_buf[11]]) as usize;
+  if let Some(rmje_buf) = data.get(rmje_off..rmje_off + 12)
+    && rmje_buf.starts_with(b"RMJE")
+  {
+    // metaSize = unpack('x8N') ⇒ u32 BE at byte 8 within the 12-byte buf;
+    // `rmje_buf` is exactly 12 bytes so `.get(8..12)` always hits.
+    let meta_size = rmje_buf
+      .get(8..12)
+      .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default()))
+      as usize;
     // Current file pos after reading 12 bytes = n-140+12 = n-128. Seek
     // back -metaSize-12 ⇒ n-128 - meta_size - 12 = n - 140 - meta_size.
     if meta_size > 0 && rmje_off >= meta_size {
       let rjmd_off = rmje_off - meta_size;
-      let rjmd_buf = &data[rjmd_off..rjmd_off + meta_size];
-      // Real.pm:665 — `$buff =~ /^RJMD/`. Real.pm:670 — DirStart=8.
-      if rjmd_buf.starts_with(b"RJMD") && meta_size > 8 {
-        parse_real_meta(&rjmd_buf[8..], "", &mut meta.rjmd_tags);
+      // `rjmd_off + meta_size == rmje_off <= n`, so this range is in bounds;
+      // `.get()` always hits (byte-identical; the `if let` keeps ID3v1 running).
+      if let Some(rjmd_buf) = data.get(rjmd_off..rjmd_off + meta_size) {
+        // Real.pm:665 — `$buff =~ /^RJMD/`. Real.pm:670 — DirStart=8.
+        if rjmd_buf.starts_with(b"RJMD")
+          && meta_size > 8
+          && let Some(rjmd_body) = rjmd_buf.get(8..)
+        {
+          parse_real_meta(rjmd_body, "", &mut meta.rjmd_tags);
+        }
       }
     }
   }
   // ID3v1 trailer.
   if n >= 128 {
     let id3_off = n - 128;
-    let id3_buf = &data[id3_off..];
+    // `id3_off == n-128 <= n`, so `.get(id3_off..)` always hits (byte-identical).
+    let Some(id3_buf) = data.get(id3_off..) else {
+      return;
+    };
     if id3_buf.starts_with(b"TAG") {
       // Parse via the ID3v1 module. We construct a fresh `Metadata` sink
       // and pluck the per-tag values out. The Id3v1Meta type lives in
@@ -1573,14 +1668,23 @@ fn parse_ra(data: &[u8]) -> RealMeta<'_> {
   if data.len() < 8 {
     return meta;
   }
-  let vers = u16::from_be_bytes([data[4], data[5]]);
-  let _extra = u16::from_be_bytes([data[6], data[7]]);
+  // The `data.len() < 8` guard proves bytes 4..8 exist, so the destructure
+  // always binds (byte-identical; `else` keeps the `return meta` recovery).
+  let Some(&[_, _, _, _, v0, v1, e0, e1]) = data.get(0..8) else {
+    return meta;
+  };
+  let vers = u16::from_be_bytes([v0, v1]);
+  let _extra = u16::from_be_bytes([e0, e1]);
   let raver = RealAudioVersion::from_raw(vers);
   meta.ra_version = Some(raver);
   // Real.pm:569 — read up to 512 bytes starting at position 8 (after the
-  // 8-byte preamble: magic+vers+extra).
+  // 8-byte preamble: magic+vers+extra). `data.len() > 8` ⇒ `8 <=
+  // data.len().min(520) <= data.len()`, so `.get()` always hits (byte-identical).
   let header = if data.len() > 8 {
-    &data[8..data.len().min(8 + 512)]
+    match data.get(8..data.len().min(8 + 512)) {
+      Some(h) => h,
+      None => return meta,
+    }
   } else {
     return meta;
   };
@@ -1613,24 +1717,17 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
   // int8u, Field 11 Comment string[len].
   //
   // Field 1 (Unknown int16u[3]) is `Unknown => 1` ⇒ default suppressed.
+  // `header.get(off..off + N)?` returns `Some` on exactly the original
+  // `off + N <= header.len()` condition, `None` otherwise (byte-identical).
   let read_u16 = |off: usize| -> Option<u16> {
-    if off + 2 <= header.len() {
-      Some(u16::from_be_bytes([header[off], header[off + 1]]))
-    } else {
-      None
-    }
+    Some(u16::from_be_bytes(
+      header.get(off..off + 2)?.try_into().ok()?,
+    ))
   };
   let read_u32 = |off: usize| -> Option<u32> {
-    if off + 4 <= header.len() {
-      Some(u32::from_be_bytes([
-        header[off],
-        header[off + 1],
-        header[off + 2],
-        header[off + 3],
-      ]))
-    } else {
-      None
-    }
+    Some(u32::from_be_bytes(
+      header.get(off..off + 4)?.try_into().ok()?,
+    ))
   };
   // The ProcessSerialData walk for V3 starts at offset 0 of the header
   // (post-preamble), reading the int16u/int32u/string-fields sequentially.
@@ -1681,24 +1778,14 @@ fn parse_ra3(header: &[u8], meta: &mut RealMeta<'_>) {
 // string), Copyright (#27 int8u len + string), Comment (#29 int8u len +
 // string).
 fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
+  // `b.get(off..off + N)?` returns `Some` on exactly the original `off + N <=
+  // b.len()` condition, `None` otherwise (byte-identical); the N-byte
+  // `try_into` never fails.
   let read_u16 = |b: &[u8], off: usize| -> Option<u16> {
-    if off + 2 <= b.len() {
-      Some(u16::from_be_bytes([b[off], b[off + 1]]))
-    } else {
-      None
-    }
+    Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
   };
   let read_u32 = |b: &[u8], off: usize| -> Option<u32> {
-    if off + 4 <= b.len() {
-      Some(u32::from_be_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-      ]))
-    } else {
-      None
-    }
+    Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
   };
   // Cursor walk; default FORMAT='int16u' means each int16u field is 2 bytes;
   // explicit `Format => 'int32u'` is 4. Reset.
@@ -1781,13 +1868,13 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
   cursor += 2;
   // Field 17 FourCC2Len int8u + Field 18 FourCC2 undef[4] (Unknown).
   if cursor < header.len() {
-    let four_cc_len = header[cursor] as usize;
+    let four_cc_len = header.get(cursor).copied().unwrap_or(0) as usize;
     cursor += 1;
     cursor += four_cc_len;
   }
   // Field 19 FourCC3Len int8u + Field 20 FourCC3 undef[4] (Unknown).
   if cursor < header.len() {
-    let four_cc_len = header[cursor] as usize;
+    let four_cc_len = header.get(cursor).copied().unwrap_or(0) as usize;
     cursor += 1;
     cursor += four_cc_len;
   }
@@ -1810,24 +1897,14 @@ fn parse_ra4(header: &[u8], meta: &mut RealMeta<'_>) {
 // the table); emits SampleRate / BitsPerSample / Channels / AudioBytes /
 // BytesPerMinute (every other field is Unknown).
 fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
+  // `b.get(off..off + N)?` returns `Some` on exactly the original `off + N <=
+  // b.len()` condition, `None` otherwise (byte-identical); the N-byte
+  // `try_into` never fails.
   let read_u16 = |b: &[u8], off: usize| -> Option<u16> {
-    if off + 2 <= b.len() {
-      Some(u16::from_be_bytes([b[off], b[off + 1]]))
-    } else {
-      None
-    }
+    Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
   };
   let read_u32 = |b: &[u8], off: usize| -> Option<u32> {
-    if off + 4 <= b.len() {
-      Some(u32::from_be_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-      ]))
-    } else {
-      None
-    }
+    Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
   };
   let mut cursor: usize = 0;
   // Field 0 FourCC1 undef[4] Unknown.
@@ -1902,16 +1979,20 @@ fn parse_ra5(header: &[u8], meta: &mut RealMeta<'_>) {
 /// Helper: read an int8u length followed by a Latin-1 string of that length,
 /// emit as a RA text codec field. Returns the cursor after the field.
 fn ra_text_field(header: &[u8], cursor: usize, name: &str, meta: &mut RealMeta<'_>) -> usize {
-  if cursor >= header.len() {
+  // The original `cursor >= header.len()` guard ≡ `.get(cursor)` returning
+  // `None` (byte-identical; same `return cursor` recovery).
+  let Some(&len_byte) = header.get(cursor) else {
     return cursor;
-  }
-  let len = header[cursor] as usize;
+  };
+  let len = len_byte as usize;
   let start = cursor + 1;
-  if start + len > header.len() {
+  // `header.get(start..start + len)` is `Some` on exactly the original
+  // `start + len <= header.len()` condition; `None` ⇒ the same
+  // `return header.len()` overflow recovery (byte-identical).
+  let Some(raw) = header.get(start..start + len) else {
     // Bundled would emit a partial; we drop on overflow (no value).
     return header.len();
-  }
-  let raw = &header[start..start + len];
+  };
   let s = raw_bytes_to_json_string(null_truncate(raw));
   if !s.is_empty() {
     meta.ra_fields.push(RaCodecField {
@@ -1935,7 +2016,9 @@ fn ra_text_field(header: &[u8], cursor: usize, name: &str, meta: &mut RealMeta<'
 /// appears the Perl returns `undef` and Real.pm:538's `|| "\n"` falls
 /// back to LF — we return `b"\n"` directly for the same net result.
 fn input_record_separator(data: &[u8]) -> &'static [u8] {
-  let window = &data[..data.len().min(256)];
+  // `data.len().min(256) <= data.len()`, so `.get(..n)` always hits;
+  // `unwrap_or(data)` is the unreachable fallback (byte-identical).
+  let window = data.get(..data.len().min(256)).unwrap_or(data);
   // Perl `pos()` after a `/g` match is the offset of the byte AFTER the
   // match; we mirror that with `position(..) + 1`.
   let lf = window.iter().position(|&b| b == 0x0a).map(|i| i + 1);
@@ -1994,9 +2077,15 @@ fn parse_metafile<'a>(data: &'a [u8], ext: Option<&str>) -> Option<RealMeta<'a>>
   // no trailing separator. We replicate that by splitting INCLUSIVELY.
   let mut rest = data;
   while !rest.is_empty() {
+    // `idx` is a `find_subslice` match offset ⇒ `idx + sep.len() <= rest.len()`,
+    // and `rest.len()..` is the always-valid trailing empty slice, so every
+    // `.get()` here hits; the fallbacks are unreachable (byte-identical).
     let (raw_line, tail) = match find_subslice(rest, sep) {
-      Some(idx) => (&rest[..idx + sep.len()], &rest[idx + sep.len()..]),
-      None => (rest, &rest[rest.len()..]),
+      Some(idx) => (
+        rest.get(..idx + sep.len()).unwrap_or(rest),
+        rest.get(idx + sep.len()..).unwrap_or(&[]),
+      ),
+      None => (rest, rest.get(rest.len()..).unwrap_or(&[])),
     };
     rest = tail;
     // Real.pm:541 — `last if length $buff > 256` (length is of the
@@ -2057,7 +2146,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// most one separator and only when the string actually ends with it.
 fn chomp<'a>(line: &'a [u8], sep: &[u8]) -> &'a [u8] {
   if line.ends_with(sep) {
-    &line[..line.len() - sep.len()]
+    // `ends_with(sep)` ⇒ `line.len() >= sep.len()`, so `.get(..n)` always
+    // hits; `unwrap_or(line)` is the unreachable fallback (byte-identical).
+    line.get(..line.len() - sep.len()).unwrap_or(line)
   } else {
     line
   }
@@ -2076,10 +2167,12 @@ fn uri_scheme_prefix(line: &[u8]) -> bool {
 fn has_real_metafile_extension(line: &[u8]) -> bool {
   const EXTS: [&[u8]; 5] = [b".ra", b".rm", b".rv", b".rmvb", b".smil"];
   EXTS.iter().any(|ext| {
-    line.len() >= ext.len() && {
-      let tail = &line[line.len() - ext.len()..];
-      tail.eq_ignore_ascii_case(ext)
-    }
+    // The `line.len() >= ext.len()` guard ⇒ `.get(line.len()-ext.len()..)`
+    // always hits (byte-identical to the raw trailing slice).
+    line.len() >= ext.len()
+      && line
+        .get(line.len() - ext.len()..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(ext))
   })
 }
 
@@ -2491,6 +2584,11 @@ impl crate::metadata::Project for RealMeta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   #[test]

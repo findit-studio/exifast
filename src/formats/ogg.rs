@@ -45,6 +45,10 @@
 //!   use -b option to extract)` placeholder, identical to `COVERART`
 //!   downstream.
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{apply, base64_decode},
   format_parser::{FormatParser, parser_sealed},
@@ -359,8 +363,9 @@ fn underscore_camelcase(s: &str) -> String {
   let bytes: Vec<char> = s.chars().collect();
   let mut out: Vec<char> = Vec::with_capacity(bytes.len());
   let mut i = 0usize;
-  while i < bytes.len() {
-    let c = bytes[i];
+  // Checked-indexing (Phase C w2b): `bytes.get(i)` is `Some` exactly when the
+  // old `i < bytes.len()` + `bytes[i]` pair was in range ⇒ byte-identical.
+  while let Some(&c) = bytes.get(i) {
     // The predicate uses `out.last()` — the most-recently-pushed char,
     // which reflects the mutated-output state (so a just-uppercased `B`
     // does NOT satisfy the `[a-z0-9]` precondition for the next `_`).
@@ -368,14 +373,18 @@ fn underscore_camelcase(s: &str) -> String {
       .last()
       .map(|&p| p.is_ascii_lowercase() || p.is_ascii_digit())
       .unwrap_or(false);
-    let next_lower = bytes
-      .get(i + 1)
-      .map(|&n| n.is_ascii_lowercase())
-      .unwrap_or(false);
+    // `next` is the `bytes[i + 1]` char (if any); `next_lower` reuses it so
+    // the uppercase-into-output step below needs no second raw index.
+    let next = bytes.get(i + 1).copied();
+    let next_lower = next.is_some_and(|n| n.is_ascii_lowercase());
     if c == '_' && prev_lower_or_digit && next_lower {
       // Drop the underscore and uppercase the next char into the output.
-      for u in bytes[i + 1].to_uppercase() {
-        out.push(u);
+      // `next_lower` guarantees `next` is `Some` here ⇒ byte-identical to the
+      // previous `bytes[i + 1].to_uppercase()`.
+      if let Some(n) = next {
+        for u in n.to_uppercase() {
+          out.push(u);
+        }
       }
       i += 2;
     } else {
@@ -566,27 +575,23 @@ fn parse_vorbis_identification(payload: &[u8]) -> Option<VorbisIdentification> {
   // payload. Bundled does NOT all-or-nothing; an 9-byte payload emits
   // VorbisVersion / AudioChannels / SampleRate, then skips the three
   // bitrate fields (offset 9 + 4 = 13 > 9, etc.).
-  let len = payload.len();
-  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` — the eager form
-  // would index into `payload[4]` etc. even when the bounds check fails
-  // (causing a panic before the result is discarded).
-  let vorbis_version =
-    (len >= 4).then(|| u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]));
-  let audio_channels = (len >= 5).then(|| payload[4]);
-  let sample_rate =
-    (len >= 9).then(|| u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]));
-  let read_bitrate = |offset: usize| -> Option<u32> {
-    if len < offset + 4 {
-      return None;
+  // Checked-indexing (Phase C w2b): `payload.get(a..b)` is `Some` iff
+  // `payload.len() >= b`, which is EXACTLY the old `len >= N` guard for each
+  // field, and the 4-byte windows destructure to the same `from_le_bytes`
+  // input ⇒ byte-identical. `.get(off..off+4)` likewise mirrors the
+  // `len < offset + 4` bitrate guard.
+  let le_u32 = |a: usize| -> Option<u32> {
+    match payload.get(a..a + 4) {
+      Some(&[b0, b1, b2, b3]) => Some(u32::from_le_bytes([b0, b1, b2, b3])),
+      _ => None,
     }
-    let raw = u32::from_le_bytes([
-      payload[offset],
-      payload[offset + 1],
-      payload[offset + 2],
-      payload[offset + 3],
-    ]);
+  };
+  let vorbis_version = le_u32(0);
+  let audio_channels = payload.get(4).copied();
+  let sample_rate = le_u32(5);
+  let read_bitrate = |offset: usize| -> Option<u32> {
     // RawConv `'$val || undef'` — drop zero. Vorbis.pm:55,61,67.
-    (raw != 0).then_some(raw)
+    le_u32(offset).filter(|&raw| raw != 0)
   };
   let id = VorbisIdentification {
     vorbis_version,
@@ -693,23 +698,28 @@ fn parse_opus_header(payload: &[u8]) -> Option<OpusHeader> {
   // Opus header fields are LE (RFC 7845 §5.1; ProcessBinaryData inherits
   // `II` from Ogg.pm:101).
   //
-  // Use `.then(closure)` (lazy) NOT `.then_some(eager)` for the indexed
-  // arms — the eager form would index even when the bounds check fails.
-  let len = payload.len();
-  let opus_version = (len >= 1).then(|| payload[0]);
-  let audio_channels = (len >= 2).then(|| payload[1]);
+  // Checked-indexing (Phase C w2b): `payload.get(i)` / `payload.get(a..b)` are
+  // `Some` iff the old `len >= N` guard held, and the windows destructure to
+  // the same `from_le_bytes` inputs ⇒ byte-identical.
+  let opus_version = payload.first().copied();
+  let audio_channels = payload.get(1).copied();
   // Note: offset 2 is `PreSkip` (int16u), commented out in Opus.pm:41
   // — INTENTIONALLY not ported (commented in bundled ⇒ deliberately not
   // emitted).
-  let sample_rate =
-    (len >= 8).then(|| u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]));
-  let output_gain = (len >= 10).then(|| {
-    let raw_gain = u16::from_le_bytes([payload[8], payload[9]]);
-    // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
-    // table; the post-ValueConv value is what bundled emits in both `-j`
-    // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
-    10.0_f64.powf(f64::from(raw_gain) / 5120.0)
-  });
+  let sample_rate = match payload.get(4..8) {
+    Some(&[b0, b1, b2, b3]) => Some(u32::from_le_bytes([b0, b1, b2, b3])),
+    _ => None,
+  };
+  let output_gain = match payload.get(8..10) {
+    Some(&[b0, b1]) => {
+      let raw_gain = u16::from_le_bytes([b0, b1]);
+      // Opus.pm:49 `ValueConv => '10 ** ($val/5120)'`. Raw is int16u in this
+      // table; the post-ValueConv value is what bundled emits in both `-j`
+      // and `-j -n` (-n shows the post-ValueConv value pre-PrintConv).
+      Some(10.0_f64.powf(f64::from(raw_gain) / 5120.0))
+    }
+    _ => None,
+  };
   let header = OpusHeader {
     opus_version,
     audio_channels,
@@ -883,8 +893,13 @@ fn parse_metadata_block_picture(payload: &[u8]) -> Option<OggPicture> {
 /// (NOT a cursor); the caller is responsible for advancing it after a
 /// successful read. Returns `None` if `pos + 4 > data.len()`.
 fn read_u32_le(data: &[u8], pos: usize) -> Option<u32> {
-  let bytes = data.get(pos..pos + 4)?;
-  Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+  // Checked-indexing (Phase C w2b): destructure the `.get(pos..pos+4)?` window
+  // (already `Some` with exactly 4 bytes) instead of raw `bytes[0..3]` ⇒
+  // byte-identical.
+  let &[b0, b1, b2, b3] = data.get(pos..pos + 4)? else {
+    return None;
+  };
+  Some(u32::from_le_bytes([b0, b1, b2, b3]))
 }
 
 /// Process a Vorbis-comment block. `data` is the comment-packet payload
@@ -912,7 +927,10 @@ fn process_vorbis_comments(
     meta.push_warning("Format error in Vorbis comments");
     return false;
   }
-  let vendor_bytes = &data[pos..pos + vendor_len];
+  // Checked-indexing (Phase C w2b): the `pos + vendor_len > end` guard above
+  // (`end == data.len()`) makes `data.get(pos..pos + vendor_len)` always
+  // `Some` ⇒ `.unwrap_or(&[])` is byte-identical.
+  let vendor_bytes = data.get(pos..pos + vendor_len).unwrap_or(&[]);
   pos += vendor_len;
   // Vorbis.pm:184 `$num = ($pos + 4 < $end) ? Get32u($dataPt,$pos) : 0`.
   let num: u32 = if pos + 4 < end {
@@ -955,7 +973,9 @@ fn process_vorbis_comments(
       meta.push_warning("Format error in Vorbis comments");
       return false;
     }
-    let comment_bytes = &data[pos..pos + comment_len];
+    // Checked-indexing (Phase C w2b): the `pos + comment_len > end` guard above
+    // makes `data.get(pos..pos + comment_len)` always `Some` ⇒ byte-identical.
+    let comment_bytes = data.get(pos..pos + comment_len).unwrap_or(&[]);
     pos += comment_len;
     // Split on first `=` (Vorbis.pm:176-177 `m/(.*?)=(.*)/s`).
     let Some(eq_idx) = comment_bytes.iter().position(|&b| b == b'=') else {
@@ -963,8 +983,11 @@ fn process_vorbis_comments(
       meta.push_warning("Format error in Vorbis comments");
       return false;
     };
-    let raw_key = String::from_utf8_lossy(&comment_bytes[..eq_idx]).into_owned();
-    let raw_val = String::from_utf8_lossy(&comment_bytes[eq_idx + 1..]).into_owned();
+    // `eq_idx` is a `position` index into `comment_bytes`, so `..eq_idx` and
+    // `eq_idx + 1..` are always in range ⇒ `.get(..)` is `Some`; byte-identical.
+    let raw_key = String::from_utf8_lossy(comment_bytes.get(..eq_idx).unwrap_or(&[])).into_owned();
+    let raw_val =
+      String::from_utf8_lossy(comment_bytes.get(eq_idx + 1..).unwrap_or(&[])).into_owned();
     // Vorbis.pm:177 `$tag = uc $1`. Perl `uc` on a UTF-8 string upper-cases
     // ASCII letters in-place; non-ASCII is left alone (Perl, without locale
     // pragma, uppercases ASCII only). Vorbis comment keys are ASCII by
@@ -1140,31 +1163,35 @@ fn is_special_tag(key: &str) -> bool {
 /// `\x01vorbis` (id), `\x03vorbis` (comments), `\x05vorbis` (setup).
 /// Returns the packet-type byte + the codec subtable to dispatch into.
 fn classify_packet(buff: &[u8]) -> Option<PacketKind> {
-  if buff.len() >= 7 && &buff[1..7] == b"vorbis" {
+  // Checked-indexing (Phase C w2b): `buff.get(range) == Some(b"…")` folds the
+  // old `buff.len() >= N && &buff[range] == …` pairs (the `Some` arm requires
+  // the range in bounds, exactly matching the length guard) ⇒ byte-identical.
+  // `buff.get(0)` (packet_type) is `Some` whenever the 7-byte magic matched.
+  if buff.get(1..7) == Some(&b"vorbis"[..]) {
     return Some(PacketKind::Vorbis {
-      packet_type: buff[0],
+      packet_type: buff.first().copied().unwrap_or(0),
       payload_start: 7,
     });
   }
-  if buff.len() >= 7 && &buff[1..7] == b"theora" {
+  if buff.get(1..7) == Some(&b"theora"[..]) {
     return Some(PacketKind::Theora {
-      packet_type: buff[0],
+      packet_type: buff.first().copied().unwrap_or(0),
       payload_start: 7,
     });
   }
-  if buff.len() >= 8 && &buff[..8] == b"OpusHead" {
+  if buff.get(..8) == Some(&b"OpusHead"[..]) {
     return Some(PacketKind::Opus {
       kind: OpusKind::Head,
       payload_start: 8,
     });
   }
-  if buff.len() >= 8 && &buff[..8] == b"OpusTags" {
+  if buff.get(..8) == Some(&b"OpusTags"[..]) {
     return Some(PacketKind::Opus {
       kind: OpusKind::Tags,
       payload_start: 8,
     });
   }
-  if buff.len() >= 5 && &buff[..5] == b"\x7fFLAC" {
+  if buff.get(..5) == Some(&b"\x7fFLAC"[..]) {
     // Ogg.pm:176-179. DEFERRED (ogg-flac transport awaits the FLAC port).
     return Some(PacketKind::Flac);
   }
@@ -1275,7 +1302,10 @@ fn process_packet(
           // semantics; in that case the outcome is `None` so the
           // identification fields are silently absent (bundled behaviour
           // exactly).
-          match parse_vorbis_identification(&buff[payload_start..]) {
+          // Checked-indexing (Phase C w2b): `classify_packet` validated the
+          // magic at `payload_start` bytes, so `buff.get(payload_start..)` is
+          // always `Some` ⇒ `.unwrap_or(&[])` is byte-identical.
+          match parse_vorbis_identification(buff.get(payload_start..).unwrap_or(&[])) {
             Some(id) => PacketOutcome::VorbisId(id),
             None => PacketOutcome::None,
           }
@@ -1286,7 +1316,9 @@ fn process_packet(
           // `picture_sink` carries any `METADATA_BLOCK_PICTURE` payloads
           // back to the caller for emission as `FLAC:Picture*` fields.
           process_vorbis_comments(
-            &buff[payload_start..],
+            // Checked-indexing (Phase C w2b): `classify_packet` validated the
+            // magic at `payload_start` bytes ⇒ `.get(payload_start..)` is `Some`.
+            buff.get(payload_start..).unwrap_or(&[]),
             staging,
             picture_sink,
             print_conv_enabled,
@@ -1324,7 +1356,9 @@ fn process_packet(
           // Ogg.pm:62 sets group1 to 'Theora' for Vorbis::Comments tags
           // when running under Theora.
           process_vorbis_comments_with_group1(
-            &buff[payload_start..],
+            // Checked-indexing (Phase C w2b): `classify_packet` validated the
+            // magic at `payload_start` bytes ⇒ `.get(payload_start..)` is `Some`.
+            buff.get(payload_start..).unwrap_or(&[]),
             staging,
             picture_sink,
             print_conv_enabled,
@@ -1354,7 +1388,9 @@ fn process_packet(
           // fixed-offset binary table. A short payload returns `None`
           // from `parse_opus_header` (mirroring bundled out-of-bounds
           // skip); in that case fall back to override-only.
-          match parse_opus_header(&buff[payload_start..]) {
+          // Checked-indexing (Phase C w2b): `payload_start`-bytes magic was
+          // validated by `classify_packet` ⇒ `.get(payload_start..)` is `Some`.
+          match parse_opus_header(buff.get(payload_start..).unwrap_or(&[])) {
             Some(header) => PacketOutcome::OpusHeader(header),
             None => PacketOutcome::Override { file_type: "OPUS" },
           }
@@ -1363,7 +1399,9 @@ fn process_packet(
           // Opus.pm:32 delegates to Vorbis::Comments with the default
           // group1 (Vorbis).
           process_vorbis_comments(
-            &buff[payload_start..],
+            // Checked-indexing (Phase C w2b): `classify_packet` validated the
+            // magic at `payload_start` bytes ⇒ `.get(payload_start..)` is `Some`.
+            buff.get(payload_start..).unwrap_or(&[]),
             staging,
             picture_sink,
             print_conv_enabled,
@@ -1989,7 +2027,12 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
     // emits `'File format error'` (ExifTool.pm:3093). See conformance
     // pin `ogg_truncated_error_conformance` (R1 F1 regression).
     let header_in_bounds = !raf_done && data.len() >= cursor + 28;
-    let header_magic_ok = header_in_bounds && &data[cursor..cursor + 4] == b"OggS";
+    // Checked-indexing (Phase C w2b): `data.get(cursor..cursor + 4) ==
+    // Some(b"OggS")` is `true` under exactly the same conditions as the old
+    // `header_in_bounds && &data[cursor..cursor + 4] == b"OggS"` (the `Some`
+    // arm requires the window in bounds, which `header_in_bounds`'s
+    // `len >= cursor + 28` guarantees) ⇒ byte-identical.
+    let header_magic_ok = header_in_bounds && data.get(cursor..cursor + 4) == Some(&b"OggS"[..]);
     let read_ok = if header_in_bounds {
       if !header_magic_ok {
         // Ogg.pm:97 `$success and $et->Warn('Lost synchronization')`.
@@ -2012,14 +2055,16 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
         success = true;
       }
       // Ogg.pm:106 `$flag = Get8u(\$buff, 5)` — page-header byte 5.
-      current_flag = data[cursor + 5];
+      // Checked-indexing (Phase C w2b): reached only inside `if read_ok`, which
+      // requires `header_in_bounds` (`data.len() >= cursor + 28`), so every
+      // `cursor + k` (k <= 27) byte is in range ⇒ the `.get(...)` fallbacks
+      // (`0`) are unreachable and the reads are byte-identical.
+      current_flag = data.get(cursor + 5).copied().unwrap_or(0);
       // Ogg.pm:107 `$stream = Get32u(\$buff, 14)`.
-      current_stream = u32::from_le_bytes([
-        data[cursor + 14],
-        data[cursor + 15],
-        data[cursor + 16],
-        data[cursor + 17],
-      ]);
+      current_stream = match data.get(cursor + 14..cursor + 18) {
+        Some(&[b0, b1, b2, b3]) => u32::from_le_bytes([b0, b1, b2, b3]),
+        _ => 0,
+      };
       if current_flag & 0x02 != 0 {
         // Ogg.pm:108-110 — BOS bit set.
         stream_count = stream_count.saturating_add(1);
@@ -2039,7 +2084,10 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
       // keys %val`).
       let mut keys: Vec<u32> = val.keys().copied().collect();
       keys.sort();
-      current_stream = keys[0];
+      // Checked-indexing (Phase C w2b): reached only after the `val.is_empty()`
+      // break above, so `keys` is non-empty ⇒ `keys.first()` is `Some` and
+      // `.unwrap_or(0)` is byte-identical to the previous `keys[0]`.
+      current_stream = keys.first().copied().unwrap_or(0);
       current_flag = 0;
       raf_done = true;
     }
@@ -2074,18 +2122,25 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
     }
 
     // Ogg.pm:142-153 — sequence number, segment table, data length.
-    let page_num = u32::from_le_bytes([
-      data[cursor + 18],
-      data[cursor + 19],
-      data[cursor + 20],
-      data[cursor + 21],
-    ]);
-    let nseg = data[cursor + 26] as usize;
+    // Checked-indexing (Phase C w2b): control only reaches here when the
+    // `if read_ok` branch ran this iteration (the `else` branch sets
+    // `raf_done` and the `if raf_done { break }` above would have exited),
+    // and `read_ok` required `header_in_bounds` (`data.len() >= cursor + 28`),
+    // so every `cursor + k` (k <= 27) is in range ⇒ the `.get(...)` fallbacks
+    // are unreachable and the reads are byte-identical.
+    let page_num = match data.get(cursor + 18..cursor + 22) {
+      Some(&[b0, b1, b2, b3]) => u32::from_le_bytes([b0, b1, b2, b3]),
+      _ => 0,
+    };
+    let nseg = data.get(cursor + 26).copied().unwrap_or(0) as usize;
     // We need `27 + nseg` bytes to cover the header + segment table.
     if data.len() < cursor + 27 + nseg {
       break;
     }
-    let seg_table = &data[cursor + 27..cursor + 27 + nseg];
+    // Checked-indexing (Phase C w2b): the `data.len() < cursor + 27 + nseg`
+    // guard above makes `data.get(cursor + 27..cursor + 27 + nseg)` always
+    // `Some` ⇒ byte-identical.
+    let seg_table = data.get(cursor + 27..cursor + 27 + nseg).unwrap_or(&[]);
     let data_len: usize = seg_table.iter().map(|&b| b as usize).sum();
     // Ogg.pm:154-162 — sequence-number check.
     let expected_opt = stream_page.get(&current_stream).copied().flatten();
@@ -2106,7 +2161,11 @@ fn parse_inner(data: &[u8], print_conv_enabled: bool) -> Option<Meta<'_>> {
     // Page bytes as a borrowed slice (no copy yet — the `val` HashMap
     // owns its own `Vec<u8>` per stream; we move the bytes into it only
     // when we actually start a new packet).
-    let page_bytes: &[u8] = &data[page_data_start..page_data_end];
+    //
+    // Checked-indexing (Phase C w2b): the `data.len() < page_data_end` guard
+    // above makes `data.get(page_data_start..page_data_end)` always `Some` ⇒
+    // byte-identical.
+    let page_bytes: &[u8] = data.get(page_data_start..page_data_end).unwrap_or(&[]);
 
     // Ogg.pm:170-179 — accumulate or start new packet.
     if let Some(existing) = val.get_mut(&current_stream) {
@@ -2656,6 +2715,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::emit::{ConvMode, Taggable};

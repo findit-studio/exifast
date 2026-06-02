@@ -387,6 +387,16 @@ pub struct Metadata {
   source_file: SmolStr,
   tags: Vec<Tag>,
   warnings: Vec<SmolStr>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings) (Phase C, Contract 2). `0` = normal,
+  /// `1` = `[minor]`, `2` = `[Minor]` (`ExifTool.pm:5616-5630`). The message
+  /// in `warnings` stays BARE — the `[minor]`/`[Minor]` prefix is applied
+  /// centrally by [`run_diagnostics`](crate::diagnostics::run_diagnostics).
+  /// A parallel `Vec<u8>` (rather than widening `warnings`) keeps every
+  /// existing `warnings_slice() -> &[SmolStr]` consumer (OGG, the
+  /// `Metadata`-staging serializer) untouched; the single push funnel keeps
+  /// the two vectors lock-step.
+  warnings_ignorable: Vec<u8>,
   errors: Vec<SmolStr>,
   /// Faithful `$$et{DoneID3}` flag (ID3.pm:1435-1436, APE.pm:124, etc.).
   /// `None` ⇒ ProcessID3 has not run on this `$self`; `Some(n)` ⇒ run, with
@@ -416,6 +426,7 @@ impl Metadata {
       source_file: source_file.into(),
       tags: Vec::new(),
       warnings: Vec::new(),
+      warnings_ignorable: Vec::new(),
       errors: Vec::new(),
       done_id3: None,
       done_ape: false,
@@ -548,12 +559,33 @@ impl Metadata {
     self.tags.push(Tag::new(group, name, value));
   }
 
-  /// Record a non-fatal warning, in occurrence order. ExifTool accumulates
-  /// these via `$self->Warn(...)` and surfaces them as its generated
-  /// `Warning` tag (`ExifTool.pm:1297`); the serializer emits the first as
-  /// `ExifTool:Warning` under `-j -G1` (`ExifTool.pm:1225`).
+  /// Record a non-fatal NORMAL warning (`$et->Warn(msg)`, ignorable `0`), in
+  /// occurrence order. ExifTool accumulates these via `$self->Warn(...)` and
+  /// surfaces them as its generated `Warning` tag (`ExifTool.pm:1297`); the
+  /// serializer emits the first as `ExifTool:Warning` under `-j -G1`
+  /// (`ExifTool.pm:1225`).
   pub fn push_warning(&mut self, warning: impl Into<SmolStr>) {
+    self.push_warning_with_level(warning, 0);
+  }
+
+  /// Record a MINOR warning (`$et->Warn(msg, ignorable)`, `ExifTool.pm:5616`)
+  /// — the BARE message plus its ignorable level (`1` ⇒ `[minor]`, `2` ⇒
+  /// `[Minor]`). The prefix is NOT baked in here: it is applied centrally by
+  /// [`run_diagnostics`](crate::diagnostics::run_diagnostics) (the port's
+  /// `sub Warn` analogue), so the literal lives in exactly one place. Pair the
+  /// level with [`warning_ignorable`](Self::warning_ignorable).
+  pub fn push_warning_with_level(&mut self, warning: impl Into<SmolStr>, ignorable: u8) {
     self.warnings.push(warning.into());
+    self.warnings_ignorable.push(ignorable);
+  }
+
+  /// The `sub Warn` ignorable level for the warning at `index` (index-aligned
+  /// with [`warnings_slice`](Self::warnings_slice)); `0` for an out-of-range
+  /// index or a normal warning.
+  #[must_use]
+  #[inline(always)]
+  pub fn warning_ignorable(&self, index: usize) -> u8 {
+    self.warnings_ignorable.get(index).copied().unwrap_or(0)
   }
 
   /// Record an error, in occurrence order — the faithful analogue of

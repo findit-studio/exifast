@@ -4,6 +4,11 @@
 //! (`UnSyncSafe`), but ProcessID3v2 has an iTunes-bug heuristic that
 //! falls back to a normal int32 if sync-safe doesn't match the next ID.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction.
+// This module is a tag-table definition (no runtime buffer indexing); the deny
+// is the file-level panic-safety contract for the slice.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   formats::id3::{text::convert_xmp_date, v2_common::common_v2_4},
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -122,6 +127,11 @@ fn v2_4_get(id: TagId) -> Option<&'static TagDef> {
 pub static ID3V2_4_MAIN: TagTable = TagTable::new("ID3", v2_4_get);
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the tests index fixed-layout data freely (an
+// out-of-range index is a test-assertion failure, not a shipped panic), so the
+// deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

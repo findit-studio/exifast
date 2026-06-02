@@ -43,6 +43,12 @@
 //! (20/21, `Canon.pm:7024`/`:7034`), each `Format => 'int16u'` — see
 //! [`FiFormat`]. Position 1's conditional rows override to `int32u`.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::ByteOrder;
 use crate::value::TagValue;
 use smol_str::SmolStr;
@@ -587,10 +593,13 @@ const RF_LENS_TYPES: &[RfLens] = &[
 
 /// Look up an RFLensType name by its `int16u` key (`Canon.pm:7063-7141`).
 fn rf_lens_name(key: u16) -> Option<&'static str> {
+  // `binary_search` yields an in-bounds index on `Ok`, so `.get(i)` is `Some` —
+  // the checked, byte-identical form of `RF_LENS_TYPES[i].name`.
   RF_LENS_TYPES
     .binary_search_by(|e| e.key.cmp(&key))
     .ok()
-    .map(|i| RF_LENS_TYPES[i].name)
+    .and_then(|i| RF_LENS_TYPES.get(i))
+    .map(|e| e.name)
 }
 
 /// The model-conditional values decoded from `Canon::FileInfo` (issue
@@ -691,7 +700,13 @@ pub fn parse_with_model(
     if byte_off + 2 > data.len() {
       break;
     }
-    let arr: [u8; 2] = [data[byte_off], data[byte_off + 1]];
+    // The `byte_off + 2 > data.len()` guard makes `data.get(byte_off..byte_off+2)`
+    // `Some` and its `try_into()` to `[u8; 2]` succeed — the checked,
+    // byte-identical form of `[data[byte_off], data[byte_off+1]]`.
+    let arr: [u8; 2] = data
+      .get(byte_off..byte_off + 2)
+      .and_then(|s| s.try_into().ok())
+      .unwrap_or([0, 0]);
     // Read with the per-position format: the table default `int16s`
     // (`Canon.pm:6845`), or `int16u` for RFLensType (`Canon.pm:7062`) and
     // FocusDistanceUpper/Lower (`Canon.pm:7024`/`:7034`).
@@ -770,8 +785,9 @@ pub fn parse_with_model(
 /// `int32u` for the position-1 conditionals).
 fn read_u32_at(data: &[u8], position: usize, order: ByteOrder) -> Option<u32> {
   let off = 2 * position;
-  let b = data.get(off..off + 4)?;
-  let arr = [b[0], b[1], b[2], b[3]];
+  // `get(off..off+4)` yields exactly 4 bytes, so `try_into()` to `[u8; 4]`
+  // always succeeds — the checked, byte-identical form of `[b[0],b[1],b[2],b[3]]`.
+  let arr: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
@@ -816,24 +832,29 @@ fn word_match(haystack: &str, needle: &str) -> bool {
     return false;
   }
   let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-  let first_word = is_word(nbytes[0]);
-  let last_word = is_word(nbytes[nbytes.len() - 1]);
+  // `nbytes` is non-empty (guard above), so `.first()`/`.last()` are `Some` —
+  // checked, byte-identical to `nbytes[0]` / `nbytes[nbytes.len()-1]`.
+  let first_word = nbytes.first().is_some_and(|&c| is_word(c));
+  let last_word = nbytes.last().is_some_and(|&c| is_word(c));
   let hay = haystack.as_bytes();
   let mut start = 0;
   while let Some(rel) = haystack[start..].find(needle) {
     let i = start + rel;
     let end = i + needle.len();
     // `\b` before: boundary unless prev char and needle-first are both
-    // word chars / both non-word.
+    // word chars / both non-word. `i > 0` ⇒ `hay.get(i-1)` is `Some`; `end <
+    // hay.len()` ⇒ `hay.get(end)` is `Some` — checked, byte-identical to the
+    // `hay[i-1]` / `hay[end]` reads under the `i == 0` / `end >= hay.len()`
+    // guards.
     let before_ok = if first_word {
-      i == 0 || !is_word(hay[i - 1])
+      i == 0 || hay.get(i - 1).is_some_and(|&c| !is_word(c))
     } else {
-      i == 0 || is_word(hay[i - 1])
+      i == 0 || hay.get(i - 1).is_some_and(|&c| is_word(c))
     };
     let after_ok = if last_word {
-      end >= hay.len() || !is_word(hay[end])
+      end >= hay.len() || hay.get(end).is_some_and(|&c| !is_word(c))
     } else {
-      end >= hay.len() || is_word(hay[end])
+      end >= hay.len() || hay.get(end).is_some_and(|&c| is_word(c))
     };
     if before_ok && after_ok {
       return true;
@@ -1133,10 +1154,15 @@ fn contains_word(haystack: &str, token: &str) -> bool {
   // chars we inspect are single ASCII bytes when present).
   let mut i = 0;
   while i + tb.len() <= hb.len() {
-    if &hb[i..i + tb.len()] == tb {
-      let before_ok = i == 0 || !is_word(hb[i - 1] as char);
+    // The `i + tb.len() <= hb.len()` loop bound makes `hb.get(i..i+tb.len())`
+    // `Some`; the `i == 0` / `after_idx == hb.len()` guards make `hb.get(i-1)` /
+    // `hb.get(after_idx)` `Some` when reached — all checked, byte-identical to
+    // the `&hb[i..i+tb.len()]` / `hb[i-1]` / `hb[after_idx]` reads.
+    if hb.get(i..i + tb.len()) == Some(tb) {
+      let before_ok = i == 0 || hb.get(i - 1).is_some_and(|&c| !is_word(c as char));
       let after_idx = i + tb.len();
-      let after_ok = after_idx == hb.len() || !is_word(hb[after_idx] as char);
+      let after_ok =
+        after_idx == hb.len() || hb.get(after_idx).is_some_and(|&c| !is_word(c as char));
       if before_ok && after_ok {
         return true;
       }
@@ -1147,6 +1173,11 @@ fn contains_word(haystack: &str, token: &str) -> bool {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::exif::ifd::ByteOrder;

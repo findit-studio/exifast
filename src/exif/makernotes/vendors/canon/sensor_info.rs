@@ -21,6 +21,12 @@
 //! `(Name, TagValue)` emission pairs the dispatch site wraps in the
 //! `Canon` family-1 group.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::ByteOrder;
 use crate::value::TagValue;
 use smol_str::SmolStr;
@@ -103,8 +109,9 @@ pub fn parse(data: &[u8], order: ByteOrder, print_conv: bool) -> Vec<(SmolStr, T
 /// Read one signed 16-bit word at word `position` (byte offset `2*position`).
 fn read_i16(data: &[u8], position: usize, order: ByteOrder) -> Option<i64> {
   let off = 2 * position;
-  let b = data.get(off..off + 2)?;
-  let arr = [b[0], b[1]];
+  // `get(off..off+2)` yields exactly 2 bytes, so `try_into()` to `[u8; 2]`
+  // always succeeds — the checked, byte-identical form of `[b[0], b[1]]`.
+  let arr: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => i16::from_le_bytes(arr),
     ByteOrder::Big => i16::from_be_bytes(arr),
@@ -112,6 +119,11 @@ fn read_i16(data: &[u8], position: usize, order: ByteOrder) -> Option<i64> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

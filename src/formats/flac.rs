@@ -41,6 +41,10 @@
 //! bundled `perl exiftool` byte-for-byte on ID3-prefixed FLAC fixtures (no
 //! hand-trimming required).
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use core::time::Duration;
 use std::borrow::Cow;
 use std::string::String;
@@ -890,7 +894,10 @@ fn parse_inner<'a>(
 
   // -- FLAC.pm:254 — `fLaC` magic check -----------------------------------
   // `$raf->Read($buff, 4) == 4 and $buff eq 'fLaC' or return 0`
-  if data.len() < offset + 4 || &data[offset..offset + 4] != b"fLaC" {
+  // Checked-indexing (Phase C w2b): `data.get(offset..offset + 4) !=
+  // Some(b"fLaC")` folds the old `data.len() < offset + 4 || &data[..] != …`
+  // (the `Some` arm requires the window in bounds) ⇒ byte-identical.
+  if data.get(offset..offset + 4) != Some(&b"fLaC"[..]) {
     return None;
   }
 
@@ -904,7 +911,12 @@ fn parse_inner<'a>(
     if pos + 4 > data.len() {
       break;
     }
-    let header = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+    // Checked-indexing (Phase C w2b): the `pos + 4 > data.len()` guard makes
+    // `data.get(pos..pos + 4)` `Some` (a 4-byte window) ⇒ byte-identical.
+    let header: [u8; 4] = match data.get(pos..pos + 4) {
+      Some(&[b0, b1, b2, b3]) => [b0, b1, b2, b3],
+      _ => [0; 4],
+    };
     pos += 4;
     // FLAC.pm:261 — `my $flag = unpack('C', $buff)`.
     let flag = header[0];
@@ -921,7 +933,10 @@ fn parse_inner<'a>(
       meta.format_error = true;
       break;
     }
-    let payload = &data[pos..pos + size];
+    // Checked-indexing (Phase C w2b): the `size > data.len() - pos` guard makes
+    // `pos + size <= data.len()` ⇒ `data.get(pos..pos + size)` is `Some` ⇒
+    // byte-identical.
+    let payload = data.get(pos..pos + size).unwrap_or(&[]);
     pos += size;
     match block_type {
       // FLAC.pm:27-30 — `0 => StreamInfo` (SubDirectory → %FLAC::StreamInfo,
@@ -1012,24 +1027,16 @@ fn id3v2_prefix_offset(data: &[u8]) -> usize {
 ///   Bit144-271  MD5Signature    128 bits → bytes 18..34
 /// ```
 fn parse_streaminfo(payload: &[u8]) -> StreamInfo {
-  // Helper: read N big-endian bytes as u64; returns 0 if any byte missing.
-  let read_be_u16 = |s: usize| {
-    if payload.len() < s + 2 {
-      None
-    } else {
-      Some(u16::from_be_bytes([payload[s], payload[s + 1]]) as u32)
-    }
+  // Helper: read N big-endian bytes as u64; returns None if any byte missing.
+  // Checked-indexing (Phase C w2b): `payload.get(s..s + N)` is `Some` iff the
+  // old `payload.len() < s + N` guard was false ⇒ byte-identical.
+  let read_be_u16 = |s: usize| match payload.get(s..s + 2) {
+    Some(&[b0, b1]) => Some(u16::from_be_bytes([b0, b1]) as u32),
+    _ => None,
   };
-  let read_be_u24 = |s: usize| {
-    if payload.len() < s + 3 {
-      None
-    } else {
-      Some(
-        (u32::from(payload[s]) << 16)
-          | (u32::from(payload[s + 1]) << 8)
-          | u32::from(payload[s + 2]),
-      )
-    }
+  let read_be_u24 = |s: usize| match payload.get(s..s + 3) {
+    Some(&[b0, b1, b2]) => Some((u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2)),
+    _ => None,
   };
   let mut si = StreamInfo {
     block_size_min: read_be_u16(0),
@@ -1042,28 +1049,30 @@ fn parse_streaminfo(payload: &[u8]) -> StreamInfo {
   // bits of byte 12 belonging to SampleRate. The Perl bit-stream walker
   // (FLAC.pm:158-233) handles this as a multi-byte unsigned-integer
   // accumulation with high/low byte masking; we open-code the equivalent.
+  // Checked-indexing (Phase C w2b): each `payload[k]` below sits inside a
+  // `payload.len() >= N` guard (k < N), so `.get(k).copied().unwrap_or(0)` and
+  // the MD5 `.get(18..34)` window are byte-identical (fallbacks unreachable).
+  let at = |k: usize| payload.get(k).copied().unwrap_or(0);
   if payload.len() >= 13 {
-    let sr = (u32::from(payload[10]) << 12)
-      | (u32::from(payload[11]) << 4)
-      | (u32::from(payload[12]) >> 4);
+    let sr = (u32::from(at(10)) << 12) | (u32::from(at(11)) << 4) | (u32::from(at(12)) >> 4);
     si.sample_rate = Some(sr);
     // Channels (3 bits) at bits 100..103 = byte 12 bits 3..1 = (byte12 >> 1)
     // & 0x07. ValueConv `$val + 1` (FLAC.pm:70).
-    let raw_channels = (payload[12] >> 1) & 0x07;
+    let raw_channels = (at(12) >> 1) & 0x07;
     si.channels = Some(raw_channels.saturating_add(1));
     if payload.len() >= 14 {
       // BitsPerSample (5 bits) at bits 103..108 = (byte12 & 0x01) << 4 |
       // (byte13 >> 4). ValueConv `$val + 1` (FLAC.pm:74).
-      let raw_bps = ((payload[12] & 0x01) << 4) | (payload[13] >> 4);
+      let raw_bps = ((at(12) & 0x01) << 4) | (at(13) >> 4);
       si.bits_per_sample = Some(raw_bps.saturating_add(1));
       // TotalSamples (36 bits) at bits 108..144 = (byte13 & 0x0f) << 32 |
       // bytes 14..18.
       if payload.len() >= 18 {
-        let ts: u64 = (u64::from(payload[13] & 0x0f) << 32)
-          | (u64::from(payload[14]) << 24)
-          | (u64::from(payload[15]) << 16)
-          | (u64::from(payload[16]) << 8)
-          | u64::from(payload[17]);
+        let ts: u64 = (u64::from(at(13) & 0x0f) << 32)
+          | (u64::from(at(14)) << 24)
+          | (u64::from(at(15)) << 16)
+          | (u64::from(at(16)) << 8)
+          | u64::from(at(17));
         si.total_samples = Some(ts);
       }
     }
@@ -1071,7 +1080,9 @@ fn parse_streaminfo(payload: &[u8]) -> StreamInfo {
   // MD5Signature (128 bits) at bits 144..272 = bytes 18..34.
   if payload.len() >= 34 {
     let mut md5 = [0u8; 16];
-    md5.copy_from_slice(&payload[18..34]);
+    if let Some(slice) = payload.get(18..34) {
+      md5.copy_from_slice(slice);
+    }
     si.md5_signature = Some(md5);
   }
   si
@@ -1100,22 +1111,28 @@ fn parse_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>) {
 fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>) -> bool {
   let end = payload.len();
   let mut pos: usize = 0;
+  // Checked-indexing (Phase C w2b): every `payload[pos..]` u32 read below sits
+  // behind a `pos + 4 > end` guard and every byte-range slice behind a
+  // `len > end - pos` guard, so `payload.get(pos..pos + 4)` / `.get(pos..pos +
+  // len)` are `Some` exactly where the old raw indexing was in range ⇒
+  // byte-identical. `le_u32_at` folds the 4-byte read.
+  let le_u32_at = |p: usize| -> u32 {
+    match payload.get(p..p + 4) {
+      Some(&[b0, b1, b2, b3]) => u32::from_le_bytes([b0, b1, b2, b3]),
+      _ => 0,
+    }
+  };
 
   // -- Vendor (Vorbis.pm:181-187) -----------------------------------------
   if pos + 4 > end {
     return false; // Format error — bridge surfaces the warning.
   }
-  let vendor_len = u32::from_le_bytes([
-    payload[pos],
-    payload[pos + 1],
-    payload[pos + 2],
-    payload[pos + 3],
-  ]) as usize;
+  let vendor_len = le_u32_at(pos) as usize;
   pos += 4;
   if vendor_len > end.saturating_sub(pos) {
     return false;
   }
-  let vendor_bytes = &payload[pos..pos + vendor_len];
+  let vendor_bytes = payload.get(pos..pos + vendor_len).unwrap_or(&[]);
   pos += vendor_len;
   out.push(VorbisItem::Vendor(bytes_to_cow_utf8(vendor_bytes)));
 
@@ -1123,12 +1140,7 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
   // `$num = ($pos + 4 < $end) ? Get32u : 0;` — STRICT `<`. Exact 4 trailing
   // bytes after vendor satisfies `pos+4 == end` and stays out of the loop.
   let num: usize = if 4 < end.saturating_sub(pos) {
-    let n = u32::from_le_bytes([
-      payload[pos],
-      payload[pos + 1],
-      payload[pos + 2],
-      payload[pos + 3],
-    ]) as usize;
+    let n = le_u32_at(pos) as usize;
     pos += 4;
     n
   } else {
@@ -1140,23 +1152,23 @@ fn process_vorbis_comments<'a>(payload: &'a [u8], out: &mut Vec<VorbisItem<'a>>)
     if pos + 4 > end {
       return false; // Vorbis.pm:168 truncated mid-header.
     }
-    let len = u32::from_le_bytes([
-      payload[pos],
-      payload[pos + 1],
-      payload[pos + 2],
-      payload[pos + 3],
-    ]) as usize;
+    let len = le_u32_at(pos) as usize;
     pos += 4;
     if len > end.saturating_sub(pos) {
       return false; // Vorbis.pm:170 truncated mid-value.
     }
-    let comment = &payload[pos..pos + len];
+    let comment = payload.get(pos..pos + len).unwrap_or(&[]);
     pos += len;
     // Vorbis.pm:176 `(.*?)=(.*)` — split on FIRST `=`.
     let Some(eq) = comment.iter().position(|&b| b == b'=') else {
       return false; // Vorbis.pm:208-209.
     };
-    let (key_bytes, val_bytes) = (&comment[..eq], &comment[eq + 1..]);
+    // `eq` is a `position` index into `comment` ⇒ `..eq` / `eq + 1..` are in
+    // range ⇒ `.get(..)` is `Some` ⇒ byte-identical.
+    let (key_bytes, val_bytes) = (
+      comment.get(..eq).unwrap_or(&[]),
+      comment.get(eq + 1..).unwrap_or(&[]),
+    );
     // Vorbis.pm:177 — `uc $1` (ASCII uppercase the key).
     let tag_upper = ascii_uppercase(key_bytes);
     let val = bytes_to_cow_utf8(val_bytes);
@@ -1206,12 +1218,12 @@ pub(crate) fn parse_flac_picture(payload: &[u8]) -> Option<Picture<'_>> {
   if payload.len() < pos + 4 {
     return None;
   }
-  let picture_type = u32::from_be_bytes([
-    payload[pos],
-    payload[pos + 1],
-    payload[pos + 2],
-    payload[pos + 3],
-  ]);
+  // Checked-indexing (Phase C w2b): the `payload.len() < pos + 4` guard makes
+  // `payload.get(pos..pos + 4)` `Some` ⇒ byte-identical.
+  let picture_type = match payload.get(pos..pos + 4) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]),
+    _ => 0,
+  };
   pos += 4;
   // -- index 1: PictureMIMEType (var_pstr32) ------------------------------
   let mime = read_var_pstr32_cow(payload, &mut pos)?;
@@ -1250,7 +1262,10 @@ pub(crate) fn parse_flac_picture(payload: &[u8]) -> Option<Picture<'_>> {
     // the Perl path. The bridge skips emission of the Picture sub-field
     // by checking `length > 0 && data.is_empty()`.
   } else {
-    &payload[pos..pos + actual]
+    // Checked-indexing (Phase C w2b): `actual = (length).min(remaining)` with
+    // `remaining = payload.len() - pos` ⇒ `pos + actual <= payload.len()` ⇒
+    // `payload.get(pos..pos + actual)` is `Some` ⇒ byte-identical.
+    payload.get(pos..pos + actual).unwrap_or(&[])
   };
   Some(Picture {
     picture_type,
@@ -1272,17 +1287,18 @@ fn read_var_pstr32_cow<'a>(payload: &'a [u8], pos: &mut usize) -> Option<Cow<'a,
   if end < *pos + 4 {
     return None;
   }
-  let len = u32::from_be_bytes([
-    payload[*pos],
-    payload[*pos + 1],
-    payload[*pos + 2],
-    payload[*pos + 3],
-  ]) as usize;
+  // Checked-indexing (Phase C w2b): the `end < *pos + 4` then `len > end -
+  // *pos` guards make `payload.get(*pos..*pos + 4)` / `.get(*pos..*pos + len)`
+  // `Some` ⇒ byte-identical.
+  let len = match payload.get(*pos..*pos + 4) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]) as usize,
+    _ => 0,
+  };
   *pos += 4;
   if len > end.saturating_sub(*pos) {
     return None;
   }
-  let bytes = &payload[*pos..*pos + len];
+  let bytes = payload.get(*pos..*pos + len).unwrap_or(&[]);
   *pos += len;
   Some(bytes_to_cow_utf8(bytes))
 }
@@ -1293,12 +1309,12 @@ fn read_be_u32(payload: &[u8], pos: &mut usize) -> Option<u32> {
   if payload.len() < *pos + 4 {
     return None;
   }
-  let n = u32::from_be_bytes([
-    payload[*pos],
-    payload[*pos + 1],
-    payload[*pos + 2],
-    payload[*pos + 3],
-  ]);
+  // Checked-indexing (Phase C w2b): the `payload.len() < *pos + 4` guard makes
+  // `payload.get(*pos..*pos + 4)` `Some` ⇒ byte-identical.
+  let n = match payload.get(*pos..*pos + 4) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]),
+    _ => 0,
+  };
   *pos += 4;
   Some(n)
 }
@@ -1349,17 +1365,19 @@ fn vorbis_derive_name(tag: &str) -> String {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     let mut out = String::with_capacity(chars.len());
     let mut i = 0;
-    while i < chars.len() {
-      if is_word(chars[i]) {
-        out.push(chars[i]);
+    // Checked-indexing (Phase C w2b): `chars.get(i)` is `Some` exactly where the
+    // old `i < chars.len()` + `chars[i]` pair was in range ⇒ byte-identical.
+    while let Some(&c) = chars.get(i) {
+      if is_word(c) {
+        out.push(c);
         i += 1;
       } else {
-        while i < chars.len() && !is_word(chars[i]) {
+        while chars.get(i).is_some_and(|&c| !is_word(c)) {
           i += 1;
         }
-        if i < chars.len() {
-          for c in chars[i].to_uppercase() {
-            out.push(c);
+        if let Some(&c) = chars.get(i) {
+          for u in c.to_uppercase() {
+            out.push(u);
           }
           i += 1;
         }
@@ -1371,19 +1389,27 @@ fn vorbis_derive_name(tag: &str) -> String {
   let chars: Vec<char> = after_step2.chars().collect();
   let mut out = String::with_capacity(chars.len());
   let mut i = 0;
-  while i < chars.len() {
+  // Checked-indexing (Phase C w2b): `chars.get(i)` is `Some` while the old
+  // `i < chars.len()` held; the triple-match arm previously gated on
+  // `i + 2 < chars.len()` so `chars.get(i + 1)`/`chars.get(i + 2)` are `Some`
+  // exactly on that branch ⇒ byte-identical.
+  while let Some(&c0) = chars.get(i) {
+    let c1 = chars.get(i + 1).copied();
+    let c2 = chars.get(i + 2).copied();
     if i + 2 < chars.len()
-      && (chars[i].is_ascii_lowercase() || chars[i].is_ascii_digit())
-      && chars[i + 1] == '_'
-      && chars[i + 2].is_ascii_lowercase()
+      && (c0.is_ascii_lowercase() || c0.is_ascii_digit())
+      && c1 == Some('_')
+      && c2.is_some_and(|c| c.is_ascii_lowercase())
     {
-      out.push(chars[i]);
-      for c in chars[i + 2].to_uppercase() {
-        out.push(c);
+      out.push(c0);
+      if let Some(c) = c2 {
+        for u in c.to_uppercase() {
+          out.push(u);
+        }
       }
       i += 3;
     } else {
-      out.push(chars[i]);
+      out.push(c0);
       i += 1;
     }
   }
@@ -1414,7 +1440,12 @@ fn decode_base64(s: &str) -> Vec<u8> {
     let Some(v) = val(b) else {
       break;
     };
-    quartet[q_len] = v;
+    // Checked-indexing (Phase C w2b): `q_len` is reset to 0 whenever it reaches
+    // 4, so it is always in `0..4` here ⇒ `quartet.get_mut(q_len)` is `Some` ⇒
+    // byte-identical to the previous `quartet[q_len] = v`.
+    if let Some(slot) = quartet.get_mut(q_len) {
+      *slot = v;
+    }
     q_len += 1;
     if q_len == 4 {
       out.push((quartet[0] << 2) | (quartet[1] >> 4));
@@ -1900,6 +1931,11 @@ pub fn write_convert_duration<W: core::fmt::Write + ?Sized>(
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::emit::{ConvMode, Taggable};

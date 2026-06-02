@@ -50,6 +50,8 @@
 //! [`crate::metadata::GpsLocation`] from the first embedded GPS fix — is
 //! built from it via [`Meta::media_metadata`].
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
@@ -183,10 +185,11 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
   if pos + 8 > data.len() {
     return None;
   }
-  // QuickTime.pm:9973 `($size, $tag) = unpack('Na4', $buff)`.
-  let size32 = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-  let mut atom_type = [0u8; 4];
-  atom_type.copy_from_slice(&data[pos + 4..pos + 8]);
+  // QuickTime.pm:9973 `($size, $tag) = unpack('Na4', $buff)`. The `pos + 8 >
+  // len` guard proves both reads succeed (the bounds-checking `be_u32` returns
+  // `Some` here); `?` on the impossible miss returns `None`, matching the guard.
+  let size32 = be_u32(data, pos)?;
+  let atom_type: [u8; 4] = data.get(pos + 4..pos + 8)?.try_into().ok()?;
 
   // QuickTime.pm:10035-10078: resolve the three special-size cases.
   let (payload_start, payload_end): (usize, usize) = if size32 == 0 {
@@ -218,13 +221,10 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
         warning: "Truncated atom header",
       });
     }
-    let hi = u32::from_be_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]]);
-    let lo = u32::from_be_bytes([
-      data[pos + 12],
-      data[pos + 13],
-      data[pos + 14],
-      data[pos + 15],
-    ]);
+    // The `pos + 16 > len` guard above proves both 32-bit reads are in range;
+    // `be_u32` returns `Some` here, so `?` is byte-identical to the raw read.
+    let hi = be_u32(data, pos + 8)?;
+    let lo = be_u32(data, pos + 12)?;
     // QuickTime.pm:10062-10071. **R12/F1.** ExifTool guards a `size == 1`
     // 64-bit size as:
     //
@@ -388,12 +388,21 @@ fn walk_atoms(
         // Clamp the payload to the parent's declared end (a child must not
         // overrun its container).
         if header.payload_end > end {
-          f(&header, &data[header.payload_start..end], warning);
+          // For a well-formed tree `payload_start <= end <= data.len()`, so
+          // `.get` is `Some` and this is byte-identical; a hostile header that
+          // overruns its parent yields an empty payload here (no-panic).
+          f(
+            &header,
+            data.get(header.payload_start..end).unwrap_or_default(),
+            warning,
+          );
           break;
         }
         f(
           &header,
-          &data[header.payload_start..header.payload_end],
+          data
+            .get(header.payload_start..header.payload_end)
+            .unwrap_or_default(),
           warning,
         );
         if next <= pos {
@@ -449,18 +458,15 @@ fn walk_atoms(
 // ── Big-endian field readers ─────────────────────────────────────────────
 
 fn be_u16(b: &[u8], off: usize) -> Option<u16> {
-  b.get(off..off + 2)
-    .map(|s| u16::from_be_bytes([s[0], s[1]]))
+  Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
-  b.get(off..off + 4)
-    .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+  Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 fn be_u64(b: &[u8], off: usize) -> Option<u64> {
-  b.get(off..off + 8)
-    .map(|s| u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+  Some(u64::from_be_bytes(b.get(off..off + 8)?.try_into().ok()?))
 }
 
 // ===========================================================================
@@ -541,12 +547,10 @@ fn matrix_structure_string(payload: &[u8], off: usize) -> Option<String> {
   let slice = payload.get(off..off + 36)?;
   let mut out = String::with_capacity(24);
   for i in 0..9 {
-    let raw = i32::from_be_bytes([
-      slice[i * 4],
-      slice[i * 4 + 1],
-      slice[i * 4 + 2],
-      slice[i * 4 + 3],
-    ]);
+    // `slice` is 36 bytes and `i < 9`, so each 4-byte window `i*4..i*4+4`
+    // is in range; `?` on the impossible miss is byte-identical.
+    let arr: [u8; 4] = slice.get(i * 4..i * 4 + 4)?.try_into().ok()?;
+    let raw = i32::from_be_bytes(arr);
     // Format 'fixed32s[9]' ⇒ GetFixed32s (divide by 0x10000 + 5-dp round).
     let mut v = get_fixed32s(raw);
     // ValueConv: the right column (2,5,8) is 2.30 ⇒ an extra / 0x4000,
@@ -685,8 +689,10 @@ fn ftyp_lookup(brand: &str) -> Option<&'static str> {
 /// big-endian `int16u` (high) + two `int8u`. Returns `None` if short.
 fn minor_version_string(val: &[u8]) -> Option<String> {
   let b = val.get(0..4)?;
-  let n = u16::from_be_bytes([b[0], b[1]]);
-  Some(format!("{n:x}.{:x}.{:x}", b[2], b[3]))
+  // `b` is exactly 4 bytes, so `be_u16(b, 0)` and `b.get(2)`/`b.get(3)`
+  // always succeed; `?` is byte-identical to the raw indexing.
+  let n = be_u16(b, 0)?;
+  Some(format!("{n:x}.{:x}.{:x}", b.get(2)?, b.get(3)?))
 }
 
 /// `hdlr` HandlerType PrintConv table (QuickTime.pm:8418-8444).
@@ -929,8 +935,8 @@ fn duration_seconds(raw: Option<u64>, timescale: Option<u32>) -> Option<f64> {
 /// compatible-brand list drops any 4-byte group containing a NUL
 /// (QuickTime.pm:1050).
 fn decode_ftyp(payload: &[u8], qt: &mut QuickTimeMeta) {
-  if payload.len() >= 4 {
-    qt.set_major_brand(String::from_utf8_lossy(&payload[0..4]).into_owned());
+  if let Some(brand) = payload.get(0..4) {
+    qt.set_major_brand(String::from_utf8_lossy(brand).into_owned());
   }
   // MinorVersion: undef[4] at int32u index 1 ⇒ byte offset 4.
   if let Some(mv) = payload.get(4..8).and_then(minor_version_string) {
@@ -941,7 +947,11 @@ fn decode_ftyp(payload: &[u8], qt: &mut QuickTimeMeta) {
   let mut brands = Vec::new();
   let mut i = 8;
   while i + 4 <= payload.len() {
-    let g = &payload[i..i + 4];
+    // The `while` guard proves `i + 4 <= len`, so `.get` is always `Some`;
+    // the `else` break matches the guard turning false (byte-identical).
+    let Some(g) = payload.get(i..i + 4) else {
+      break;
+    };
     if !g.contains(&0) {
       brands.push(String::from_utf8_lossy(g).into_owned());
     }
@@ -954,10 +964,11 @@ fn decode_ftyp(payload: &[u8], qt: &mut QuickTimeMeta) {
 /// is the first 4 bytes; compatible brands follow at offset 8 in 4-byte
 /// groups (QuickTime.pm:9993-10002). Returns `(file_type, mime)`.
 fn file_type_from_ftyp(payload: &[u8]) -> (&'static str, &'static str) {
-  if payload.len() >= 4 {
-    // QuickTime.pm:9993 `$ftypLookup{$type}` — SP1 covers the common
-    // brands; the full %ftypLookup table is an SP4 item.
-    match &payload[0..4] {
+  // QuickTime.pm:9993 `$ftypLookup{$type}` — SP1 covers the common
+  // brands; the full %ftypLookup table is an SP4 item. `payload.get(0..4)`
+  // is `None` exactly when `payload.len() < 4`, byte-identical to the guard.
+  if let Some(brand) = payload.get(0..4) {
+    match brand {
       b"qt  " => return ("MOV", "video/quicktime"),
       b"M4A " => return ("M4A", "audio/mp4"),
       b"M4V " => return ("M4V", "video/x-m4v"),
@@ -980,7 +991,12 @@ fn file_type_from_ftyp(payload: &[u8]) -> (&'static str, &'static str) {
   let non_first_slot = |needles: &[&[u8; 4]]| -> bool {
     let mut i = 12; // skip major+minor (offset 8) AND the first compat slot.
     while i + 4 <= payload.len() {
-      if needles.iter().any(|n| payload[i..i + 4] == n[..]) {
+      // The `while` guard proves `i + 4 <= len`, so `.get` is always `Some`;
+      // the comparison is byte-identical to the raw slice.
+      let Some(slot) = payload.get(i..i + 4) else {
+        break;
+      };
+      if needles.iter().any(|n| slot == &n[..]) {
         return true;
       }
       i += 4;
@@ -1635,9 +1651,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   if data.len() < 8 {
     return None; // QuickTime.pm:9966 `$raf->Read($buff,8) == 8 or return 0`.
   }
-  let raw_size32 = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-  let mut first = [0u8; 4];
-  first.copy_from_slice(&data[4..8]);
+  // The `data.len() < 8` guard proves both reads succeed; `?` on the
+  // impossible miss returns `None`, matching that guard (byte-identical).
+  let raw_size32 = be_u32(data, 0)?;
+  let first: [u8; 4] = data.get(4..8)?.try_into().ok()?;
 
   // QuickTime.pm:9984 `$$tagTablePtr{$tag} or return 0` — the first top-level
   // atom's 4-byte TYPE must be a recognized Main-table key. Keyed on `$tag`
@@ -1667,9 +1684,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       // nothing readable ⇒ `file_type_from_ftyp` of an empty/short slice
       // defaults to MP4, matching the bundled short-read default.
       match read_atom_header(data, 0, true) {
-        Some(HeaderOutcome::Atom(header, _)) => {
-          file_type_from_ftyp(&data[header.payload_start..header.payload_end])
-        }
+        Some(HeaderOutcome::Atom(header, _)) => file_type_from_ftyp(
+          data
+            .get(header.payload_start..header.payload_end)
+            .unwrap_or_default(),
+        ),
         // A truncated `ftyp` with `size32 >= 12`: brand read fails ⇒ MP4
         // (QuickTime.pm:10004). `read_atom_header` cannot surface a
         // size-0/Malformed `ftyp` here (`size32 >= 12` excludes both).
@@ -1721,7 +1740,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     match read_atom_header(data, pos, true) {
       Some(HeaderOutcome::Atom(header, next)) => {
         let body_end = header.payload_end.min(data.len());
-        let body = &data[header.payload_start..body_end];
+        // `body_end <= data.len()` and a well-formed `payload_start <=
+        // body_end`, so `.get` is `Some` (byte-identical); a hostile overrun
+        // yields an empty body (no-panic).
+        let body = data.get(header.payload_start..body_end).unwrap_or_default();
         match &header.atom_type {
           b"ftyp" => decode_ftyp(body, &mut qt),
           b"moov" => decode_moov_mvhd(body, &mut qt, &mut warning),
@@ -1835,7 +1857,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       break;
     };
     let body_end = header.payload_end.min(data.len());
-    let body = &data[header.payload_start..body_end];
+    // `body_end <= data.len()` and a well-formed `payload_start <= body_end`,
+    // so `.get` is `Some` (byte-identical); a hostile header that overruns
+    // its declared end yields an empty body (no-panic).
+    let body = data.get(header.payload_start..body_end).unwrap_or_default();
     if &header.atom_type == b"moov" {
       decode_moov_trak(body, movie_ts, &mut qt, &mut warning);
     }
@@ -1967,7 +1992,9 @@ fn first_moov_create_date_raw(data: &[u8]) -> Option<u64> {
       break;
     };
     if &header.atom_type == b"moov" {
-      let body = &data[header.payload_start..header.payload_end.min(data.len())];
+      let body = data
+        .get(header.payload_start..header.payload_end.min(data.len()))
+        .unwrap_or_default();
       // Top-level scan (the file loop above) — depth 0.
       walk_atoms(0, body, 0, body.len(), &mut None, |inner, ibody, _w| {
         if &inner.atom_type == b"mvhd"
@@ -2017,7 +2044,9 @@ fn detect_embedded_exif(data: &[u8]) -> bool {
     let Some(HeaderOutcome::Atom(header, next)) = read_atom_header(data, pos, true) else {
       break;
     };
-    let body = &data[header.payload_start..header.payload_end.min(data.len())];
+    let body = data
+      .get(header.payload_start..header.payload_end.min(data.len()))
+      .unwrap_or_default();
     detected |= match &header.atom_type {
       // Top-level entry into the directory scan — depth 0.
       b"moov" => detect_embedded_exif_in_dir(0, body),
@@ -2837,6 +2866,21 @@ mod tests {
     v
   }
 
+  /// Write `src` at `off` (the test-fixture builders' `buf[off..off+N] =`
+  /// shape) without raw slice-indexing; panics on an out-of-range fixture,
+  /// matching the previous `[..]` write.
+  fn wr(buf: &mut [u8], off: usize, src: &[u8]) {
+    buf
+      .get_mut(off..off + src.len())
+      .unwrap()
+      .copy_from_slice(src);
+  }
+
+  /// Write a single byte at `i` (the `buf[i] = b` fixture shape).
+  fn wb(buf: &mut [u8], i: usize, b: u8) {
+    *buf.get_mut(i).unwrap() = b;
+  }
+
   /// Unwrap a [`HeaderOutcome::Atom`] in tests.
   fn read_atom(data: &[u8], pos: usize, top_level: bool) -> (AtomHeader, usize) {
     match read_atom_header(data, pos, top_level).expect("header") {
@@ -2963,8 +3007,8 @@ mod tests {
     let ftyp = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     // mvhd v0: TimeScale=1000 (offset 12), Duration=5000 (offset 16).
     let mut mvhd_payload = vec![0u8; 100];
-    mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
-    mvhd_payload[16..20].copy_from_slice(&5000u32.to_be_bytes());
+    wr(&mut mvhd_payload, 12, &1000u32.to_be_bytes());
+    wr(&mut mvhd_payload, 16, &5000u32.to_be_bytes());
     let moov = atom(b"moov", &atom(b"mvhd", &mvhd_payload));
     // 64-bit mdat: size==1, total = 16 + 32 (fits).
     let mdat = ext_atom64(b"mdat", 16 + 32, &[0xABu8; 32]);
@@ -3034,11 +3078,11 @@ mod tests {
     let ftyp = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     // A real-looking mvhd payload (version 0, TimeScale=600 at offset 12).
     let mut mvhd_payload = vec![0u8; 100];
-    mvhd_payload[15] = 0; // ts high bytes 0
-    mvhd_payload[12] = 0;
-    mvhd_payload[13] = 0;
-    mvhd_payload[14] = 2;
-    mvhd_payload[15] = 88; // TimeScale = 600
+    wb(&mut mvhd_payload, 15, 0); // ts high bytes 0
+    wb(&mut mvhd_payload, 12, 0);
+    wb(&mut mvhd_payload, 13, 0);
+    wb(&mut mvhd_payload, 14, 2);
+    wb(&mut mvhd_payload, 15, 88); // TimeScale = 600
     let mvhd = atom(b"mvhd", &mvhd_payload);
     // size-0 moov: 4-byte size 0, type, then payload extends to EOF.
     let mut moov_zero = 0u32.to_be_bytes().to_vec();
@@ -3104,7 +3148,7 @@ mod tests {
     moov_body.extend_from_slice(b"free");
     // a would-be mvhd after the terminator (must be ignored)
     let mut mvhd_payload = vec![0u8; 100];
-    mvhd_payload[0] = 0; // version 0
+    wb(&mut mvhd_payload, 0, 0); // version 0
     let mvhd = atom(b"mvhd", &mvhd_payload);
     moov_body.extend_from_slice(&mvhd);
     let mut decoded_mvhd = false;
@@ -3242,9 +3286,9 @@ mod tests {
     // Identity matrix: a=1.0 (0x10000), the rest 0; right column (2,5,8) is
     // u=0/v=0/w=1.0 (0x40000000 / 0x4000 = 1.0).
     let mut buf = vec![0u8; 36];
-    buf[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // a = 1.0
-    buf[16..20].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // d = 1.0
-    buf[32..36].copy_from_slice(&0x4000_0000u32.to_be_bytes()); // w = 1.0 (2.30)
+    wr(&mut buf, 0, &0x0001_0000u32.to_be_bytes()); // a = 1.0
+    wr(&mut buf, 16, &0x0001_0000u32.to_be_bytes()); // d = 1.0
+    wr(&mut buf, 32, &0x4000_0000u32.to_be_bytes()); // w = 1.0 (2.30)
     assert_eq!(
       matrix_structure_string(&buf, 0),
       Some("1 0 0 0 1 0 0 0 1".to_string())
@@ -3260,9 +3304,9 @@ mod tests {
     // value / 0x4000 = 1.220703125e-09. Verified against bundled GetFixed32s:
     // `2e-05 0 0 0 2e-05 0 0 0 1.220703125e-09`.
     let mut buf = vec![0u8; 36];
-    buf[0..4].copy_from_slice(&1u32.to_be_bytes()); // a (entry 0) = raw 1
-    buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // d (entry 4) = raw 1
-    buf[32..36].copy_from_slice(&1u32.to_be_bytes()); // w (entry 8) = raw 1
+    wr(&mut buf, 0, &1u32.to_be_bytes()); // a (entry 0) = raw 1
+    wr(&mut buf, 16, &1u32.to_be_bytes()); // d (entry 4) = raw 1
+    wr(&mut buf, 32, &1u32.to_be_bytes()); // w (entry 8) = raw 1
     assert_eq!(
       matrix_structure_string(&buf, 0),
       Some("2e-05 0 0 0 2e-05 0 0 0 1.220703125e-09".to_string())
@@ -3270,9 +3314,9 @@ mod tests {
 
     // A 0.5 (0x8000) entry rounds exactly (0.5), and a 1.5 (0x18000) too.
     let mut buf2 = vec![0u8; 36];
-    buf2[0..4].copy_from_slice(&0x0000_8000u32.to_be_bytes()); // a = 0.5
-    buf2[16..20].copy_from_slice(&0x0001_8000u32.to_be_bytes()); // d = 1.5
-    buf2[32..36].copy_from_slice(&0x4000_0000u32.to_be_bytes()); // w = 1.0
+    wr(&mut buf2, 0, &0x0000_8000u32.to_be_bytes()); // a = 0.5
+    wr(&mut buf2, 16, &0x0001_8000u32.to_be_bytes()); // d = 1.5
+    wr(&mut buf2, 32, &0x4000_0000u32.to_be_bytes()); // w = 1.0
     assert_eq!(
       matrix_structure_string(&buf2, 0),
       Some("0.5 0 0 0 1.5 0 0 0 1".to_string())
@@ -3350,19 +3394,19 @@ mod tests {
     // A Type-6 (Akaso) freeGPS block; the scan magic is `\0..\0freeGPS ` and a
     // 0x100 BE size word (`00 00 01 00`) satisfies the byte-0/byte-3 = \0 mask.
     let mut blk = vec![0u8; 0x100];
-    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[60] = b'A';
-    blk[68] = b'N';
-    blk[76] = b'W';
-    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
-    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x30, &14u32.to_le_bytes());
+    wr(&mut blk, 0x34, &30u32.to_le_bytes());
+    wr(&mut blk, 0x38, &45u32.to_le_bytes());
+    wr(&mut blk, 0x58, &2024u32.to_le_bytes());
+    wr(&mut blk, 0x5c, &7u32.to_le_bytes());
+    wr(&mut blk, 0x60, &15u32.to_le_bytes());
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
 
     // Layout = ftyp || mdat(freeGPS-block + >=0x8000 pad) || moov, so the
     // block's ABSOLUTE file offset = ftyp.len() + 8 (the `mdat` payload start)
@@ -3376,30 +3420,30 @@ mod tests {
 
     // A `gps `-HandlerType trak whose sample table REFERENCES the same block.
     let mut hdlr_body = vec![0u8; 24];
-    hdlr_body[8..12].copy_from_slice(b"gps ");
+    wr(&mut hdlr_body, 8, b"gps ");
     let hdlr = atom(b"hdlr", &hdlr_body);
     let mut mdhd_body = vec![0u8; 24];
-    mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    wr(&mut mdhd_body, 12, &1000u32.to_be_bytes());
     let mdhd = atom(b"mdhd", &mdhd_body);
     let mut stsd_body = vec![0u8; 8];
-    stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stsd_body, 4, &1u32.to_be_bytes());
     let mut entry = vec![0u8; 16];
-    entry[0..4].copy_from_slice(&16u32.to_be_bytes());
-    entry[4..8].copy_from_slice(b"gps ");
+    wr(&mut entry, 0, &16u32.to_be_bytes());
+    wr(&mut entry, 4, b"gps ");
     stsd_body.extend_from_slice(&entry);
     let stsd = atom(b"stsd", &stsd_body);
     let mut stco_body = vec![0u8; 8];
-    stco_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stco_body, 4, &1u32.to_be_bytes());
     stco_body.extend_from_slice(&block_offset.to_be_bytes());
     let stco = atom(b"stco", &stco_body);
     let mut stsc_body = vec![0u8; 8];
-    stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stsc_body, 4, &1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     let stsc = atom(b"stsc", &stsc_body);
     let mut stsz_body = vec![0u8; 8];
-    stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
+    wr(&mut stsz_body, 4, &0u32.to_be_bytes());
     stsz_body.extend_from_slice(&1u32.to_be_bytes());
     stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
     let stsz = atom(b"stsz", &stsz_body);
@@ -3431,7 +3475,14 @@ mod tests {
       1,
       "the mdat scan must still decode the buried freeGPS block"
     );
-    assert!(meta.stream().gps_samples()[0].has_coordinates());
+    assert!(
+      meta
+        .stream()
+        .gps_samples()
+        .first()
+        .unwrap()
+        .has_coordinates()
+    );
   }
 
   /// Codex R3 (dedup) — finding step 3: a block referenced by the `moov`-level
@@ -3445,19 +3496,19 @@ mod tests {
   #[test]
   fn moov_gps_box_decode_suppresses_redundant_mdat_scan() {
     let mut blk = vec![0u8; 0x100];
-    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[60] = b'A';
-    blk[68] = b'N';
-    blk[76] = b'W';
-    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
-    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x30, &14u32.to_le_bytes());
+    wr(&mut blk, 0x34, &30u32.to_le_bytes());
+    wr(&mut blk, 0x38, &45u32.to_le_bytes());
+    wr(&mut blk, 0x58, &2024u32.to_le_bytes());
+    wr(&mut blk, 0x5c, &7u32.to_le_bytes());
+    wr(&mut blk, 0x60, &15u32.to_le_bytes());
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
 
     // Layout = ftyp || mdat(block + >=0x8000 pad) || moov(gps-box → same block).
     let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
@@ -3468,7 +3519,7 @@ mod tests {
 
     // The `moov`-level `gps ` offset box pointing at the SAME block in `mdat`.
     let mut gps_body = vec![0u8; 8];
-    gps_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut gps_body, 4, &1u32.to_be_bytes());
     gps_body.extend_from_slice(&block_offset.to_be_bytes());
     gps_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
     let gps_box = atom(b"gps ", &gps_body);
@@ -3506,20 +3557,20 @@ mod tests {
     // A Type-6 (Akaso) freeGPS block buried in `mdat` (block-relative offsets;
     // distinct coordinates from the `gps0` record so we can tell them apart).
     let mut blk = vec![0u8; 0x100];
-    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[60] = b'A';
-    blk[68] = b'N';
-    blk[76] = b'W';
-    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x30, &14u32.to_le_bytes());
+    wr(&mut blk, 0x34, &30u32.to_le_bytes());
+    wr(&mut blk, 0x38, &45u32.to_le_bytes());
+    wr(&mut blk, 0x58, &2024u32.to_le_bytes());
+    wr(&mut blk, 0x5c, &7u32.to_le_bytes());
+    wr(&mut blk, 0x60, &15u32.to_le_bytes());
     // freeGPS lat 4737.7053 ⇒ 47.628..., lon 12209.901 ⇒ -122.165... (W).
-    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
 
     // Layout = ftyp || mdat(freeGPS-block + >=0x8000 pad) || gps0 || moov(mvhd).
     // The padding makes the scan window a full GPS block (the oracle's
@@ -3535,12 +3586,12 @@ mod tests {
     // coordinates from the buried freeGPS block: the `gps0` binary variant has
     // no N/S/E/W sign bytes, so lat 3000.0 ⇒ +30.0, lon 10000.0 ⇒ +100.0.
     let mut rec = vec![0u8; 32];
-    rec[0..8].copy_from_slice(&3000.0f64.to_le_bytes()); // lat 30deg00.0'
-    rec[8..16].copy_from_slice(&10000.0f64.to_le_bytes()); // lon 100deg00.0'
-    rec[0x10..0x14].copy_from_slice(&50i32.to_le_bytes()); // altitude
-    rec[0x14..0x16].copy_from_slice(&42u16.to_le_bytes()); // speed
-    rec[0x16..0x1c].copy_from_slice(&[24, 1, 7, 11, 19, 14]); // y m d H M S
-    rec[0x1c] = 10; // track/2
+    wr(&mut rec, 0, &3000.0f64.to_le_bytes()); // lat 30deg00.0'
+    wr(&mut rec, 8, &10000.0f64.to_le_bytes()); // lon 100deg00.0'
+    wr(&mut rec, 0x10, &50i32.to_le_bytes()); // altitude
+    wr(&mut rec, 0x14, &42u16.to_le_bytes()); // speed
+    wr(&mut rec, 0x16, &[24, 1, 7, 11, 19, 14]); // y m d H M S
+    wb(&mut rec, 0x1c, 10); // track/2
     let gps0 = atom(b"gps0", &rec);
 
     let mvhd = atom(b"mvhd", &[0u8; 100]);
@@ -3712,10 +3763,10 @@ mod tests {
     // int64u where the Hook widens, then place ImageWidth/Height at byte
     // offsets 88/92. Verify the decoder reads 1280x720 there (NOT 96/100).
     let mut p = vec![0u8; 104];
-    p[0] = 1; // version 1
+    wb(&mut p, 0, 1); // version 1
     // width 1280 (16.16) at offset 88, height 720 at 92.
-    p[88..92].copy_from_slice(&(1280u32 << 16).to_be_bytes());
-    p[92..96].copy_from_slice(&(720u32 << 16).to_be_bytes());
+    wr(&mut p, 88, &(1280u32 << 16).to_be_bytes());
+    wr(&mut p, 92, &(720u32 << 16).to_be_bytes());
     let track = decode_tkhd(&p, Some(600));
     assert_eq!(track.image_width(), Some(1280));
     assert_eq!(track.image_height(), Some(720));
@@ -3730,20 +3781,20 @@ mod tests {
     // TrackDuration is converted with mvhd's TimeScale=600 ⇒ 1200/600 = 2.0
     // (verified against bundled ExifTool). NOT the raw 1200.
     let mut tkhd = vec![0u8; 84];
-    tkhd[0] = 0; // version 0
-    tkhd[20..24].copy_from_slice(&1200u32.to_be_bytes()); // duration idx5
+    wb(&mut tkhd, 0, 0); // version 0
+    wr(&mut tkhd, 20, &1200u32.to_be_bytes()); // duration idx5
     let trak = atom(b"trak", &atom(b"tkhd", &tkhd));
     let mut mvhd = vec![0u8; 100];
-    mvhd[0] = 0;
-    mvhd[12..16].copy_from_slice(&600u32.to_be_bytes()); // TimeScale idx3
-    mvhd[16..20].copy_from_slice(&3000u32.to_be_bytes()); // Duration idx4
+    wb(&mut mvhd, 0, 0);
+    wr(&mut mvhd, 12, &600u32.to_be_bytes()); // TimeScale idx3
+    wr(&mut mvhd, 16, &3000u32.to_be_bytes()); // Duration idx4
     let mut moov_body = trak.clone();
     moov_body.extend_from_slice(&atom(b"mvhd", &mvhd));
     let data = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
     let mut full = data;
     full.extend_from_slice(&atom(b"moov", &moov_body));
     let meta = parse_inner(&full, None).expect("accepted");
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     // 1200 / 600 = 2.0 — the final movie TimeScale is used regardless of the
     // trak-before-mvhd file order (faithful durationInfo ValueConv).
     assert_eq!(track.duration_seconds(), Some(2.0));
@@ -3761,14 +3812,14 @@ mod tests {
     // 1200/300 = 4 (verified against bundled ExifTool: `Track1:TrackDuration =
     // 4`), NOT 1200/600 = 2.
     let mut tkhd = vec![0u8; 84];
-    tkhd[0] = 0; // version 0
-    tkhd[12..16].copy_from_slice(&1u32.to_be_bytes()); // TrackID idx3 = 1
-    tkhd[20..24].copy_from_slice(&1200u32.to_be_bytes()); // duration idx5
+    wb(&mut tkhd, 0, 0); // version 0
+    wr(&mut tkhd, 12, &1u32.to_be_bytes()); // TrackID idx3 = 1
+    wr(&mut tkhd, 20, &1200u32.to_be_bytes()); // duration idx5
     let trak = atom(b"trak", &atom(b"tkhd", &tkhd));
 
     let mut mvhd1 = vec![0u8; 100];
-    mvhd1[0] = 0;
-    mvhd1[12..16].copy_from_slice(&600u32.to_be_bytes()); // TimeScale idx3
+    wb(&mut mvhd1, 0, 0);
+    wr(&mut mvhd1, 12, &600u32.to_be_bytes()); // TimeScale idx3
     let moov1 = atom(b"moov", &{
       let mut b = atom(b"mvhd", &mvhd1);
       b.extend_from_slice(&trak);
@@ -3776,8 +3827,8 @@ mod tests {
     });
 
     let mut mvhd2 = vec![0u8; 100];
-    mvhd2[0] = 0;
-    mvhd2[12..16].copy_from_slice(&300u32.to_be_bytes()); // TimeScale idx3
+    wb(&mut mvhd2, 0, 0);
+    wr(&mut mvhd2, 12, &300u32.to_be_bytes()); // TimeScale idx3
     let moov2 = atom(b"moov", &atom(b"mvhd", &mvhd2));
 
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
@@ -3787,7 +3838,7 @@ mod tests {
     let meta = parse_inner(&full, None).expect("accepted");
     // Final global TimeScale is the SECOND moov's (last-wins).
     assert_eq!(meta.quicktime().time_scale(), Some(300));
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     assert_eq!(track.track_id(), Some(1));
     // 1200 / 300 = 4.0 — converted against the FINAL global TimeScale.
     assert_eq!(track.duration_seconds(), Some(4.0));
@@ -3803,15 +3854,15 @@ mod tests {
     // Duration in the later short `mvhd` must NOT erase moov1's found count.
     // Verified vs bundled: `QuickTime:Duration = 10` (3000/300).
     let mut mvhd1 = vec![0u8; 100];
-    mvhd1[0] = 0; // version 0
-    mvhd1[12..16].copy_from_slice(&600u32.to_be_bytes()); // TimeScale idx3
-    mvhd1[16..20].copy_from_slice(&3000u32.to_be_bytes()); // Duration idx4
+    wb(&mut mvhd1, 0, 0); // version 0
+    wr(&mut mvhd1, 12, &600u32.to_be_bytes()); // TimeScale idx3
+    wr(&mut mvhd1, 16, &3000u32.to_be_bytes()); // Duration idx4
     let moov1 = atom(b"moov", &atom(b"mvhd", &mvhd1));
     // A SHORT mvhd: only 16 bytes (version + flags + create + modify + ts),
     // no Duration field present.
     let mut mvhd2 = vec![0u8; 16];
-    mvhd2[0] = 0;
-    mvhd2[12..16].copy_from_slice(&300u32.to_be_bytes()); // TimeScale idx3
+    wb(&mut mvhd2, 0, 0);
+    wr(&mut mvhd2, 12, &300u32.to_be_bytes()); // TimeScale idx3
     let moov2 = atom(b"moov", &atom(b"mvhd", &mvhd2));
 
     let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
@@ -4034,14 +4085,14 @@ mod tests {
     // mdhd v0 layout: 4 (ver+flags) 4 (create) 4 (modify) 4 (TimeScale)
     // 4 (Duration) 2 (Language) 2 (Quality).
     let mut mdhd_full = vec![0u8; 24];
-    mdhd_full[0] = 0; // version 0
-    mdhd_full[12..16].copy_from_slice(&600u32.to_be_bytes()); // TimeScale
-    mdhd_full[16..20].copy_from_slice(&1200u32.to_be_bytes()); // Duration
+    wb(&mut mdhd_full, 0, 0); // version 0
+    wr(&mut mdhd_full, 12, &600u32.to_be_bytes()); // TimeScale
+    wr(&mut mdhd_full, 16, &1200u32.to_be_bytes()); // Duration
     // Short mdhd: only 16 bytes (ver+flags + create + modify + TimeScale),
     // no Duration field present.
     let mut mdhd_short = vec![0u8; 16];
-    mdhd_short[0] = 0;
-    mdhd_short[12..16].copy_from_slice(&300u32.to_be_bytes()); // TimeScale
+    wb(&mut mdhd_short, 0, 0);
+    wr(&mut mdhd_short, 12, &300u32.to_be_bytes()); // TimeScale
 
     let mdia = atom(b"mdia", &{
       let mut b = atom(b"mdhd", &mdhd_full);
@@ -4053,7 +4104,7 @@ mod tests {
     full.extend_from_slice(&moov);
 
     let meta = parse_inner(&full, None).expect("accepted");
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     // MediaTimeScale is last-wins (the field IS present in the short mdhd).
     assert_eq!(track.media_time_scale(), Some(300));
     // MediaDuration is the MediaDuration RawConv (raw / MediaTS), parse-order:
@@ -4100,7 +4151,7 @@ mod tests {
     let meta = parse_inner(&full_tkhd, None).expect("accepted");
     // The truncation is per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     assert_eq!(track.track_group(), Some(1));
     assert_eq!(
       track.warning(),
@@ -4116,7 +4167,7 @@ mod tests {
     full_mdhd.extend_from_slice(&moov_mdhd);
     let meta = parse_inner(&full_mdhd, None).expect("accepted");
     assert_eq!(meta.warning, None);
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     assert_eq!(
       track.warning(),
       Some("Truncated 'mdhd' data (missing 36 bytes)")
@@ -4157,7 +4208,7 @@ mod tests {
     let meta = parse_inner(&full, None).expect("accepted");
     // Per-track, NOT a document-level warning.
     assert_eq!(meta.warning, None);
-    let track = &meta.quicktime().tracks()[0];
+    let track = meta.quicktime().tracks().first().unwrap();
     assert_eq!(track.track_group(), Some(1));
     assert_eq!(track.warning(), Some("Invalid atom size"));
   }
@@ -4171,15 +4222,15 @@ mod tests {
     // family-1 collision in default JSON).
     let mk_trak = |track_id: u32, dur: u32| {
       let mut tkhd = vec![0u8; 84];
-      tkhd[0] = 0; // version 0
-      tkhd[12..16].copy_from_slice(&track_id.to_be_bytes()); // TrackID idx3
-      tkhd[20..24].copy_from_slice(&dur.to_be_bytes()); // duration idx5
+      wb(&mut tkhd, 0, 0); // version 0
+      wr(&mut tkhd, 12, &track_id.to_be_bytes()); // TrackID idx3
+      wr(&mut tkhd, 20, &dur.to_be_bytes()); // duration idx5
       atom(b"trak", &atom(b"tkhd", &tkhd))
     };
     let mk_moov = |ts: u32, trak: &[u8]| {
       let mut mvhd = vec![0u8; 100];
-      mvhd[0] = 0;
-      mvhd[12..16].copy_from_slice(&ts.to_be_bytes()); // TimeScale idx3
+      wb(&mut mvhd, 0, 0);
+      wr(&mut mvhd, 12, &ts.to_be_bytes()); // TimeScale idx3
       atom(b"moov", &{
         let mut b = atom(b"mvhd", &mvhd);
         b.extend_from_slice(trak);
@@ -4194,10 +4245,10 @@ mod tests {
     let tracks = meta.quicktime().tracks();
     assert_eq!(tracks.len(), 2, "both traks are decoded into the list");
     // BOTH tracks carry family-1 group Track1 (per-moov reset).
-    assert_eq!(tracks[0].track_group(), Some(1));
-    assert_eq!(tracks[1].track_group(), Some(1));
-    assert_eq!(tracks[0].track_id(), Some(1));
-    assert_eq!(tracks[1].track_id(), Some(2));
+    assert_eq!(tracks.first().unwrap().track_group(), Some(1));
+    assert_eq!(tracks.get(1).unwrap().track_group(), Some(1));
+    assert_eq!(tracks.first().unwrap().track_id(), Some(1));
+    assert_eq!(tracks.get(1).unwrap().track_id(), Some(2));
 
     // Default JSON: drive the golden engine into the TagMap. BOTH traks emit
     // `Track1:*`; the FIRST moov's `Track1:TrackID` survives at its
@@ -4257,7 +4308,7 @@ mod tests {
     // F3: distinct hdlr codes are preserved verbatim (not collapsed). A
     // 'mdta' handler keeps its raw code (not normalized to 'meta').
     let mut hdlr = vec![0u8; 24];
-    hdlr[8..12].copy_from_slice(b"mdta");
+    wr(&mut hdlr, 8, b"mdta");
     let mut track = MediaTrack::new();
     track.set_handler_code(decode_hdlr(&hdlr).expect("code"));
     assert_eq!(track.handler_code(), Some("mdta"));
@@ -4405,8 +4456,11 @@ mod tests {
       );
     }
     // The main atoms (first ones emitted) carry family1 "QuickTime".
-    assert_eq!(tags[0].tag().name(), "MajorBrand");
-    assert_eq!(tags[0].tag().group_ref().family1(), "QuickTime");
+    assert_eq!(tags.first().unwrap().tag().name(), "MajorBrand");
+    assert_eq!(
+      tags.first().unwrap().tag().group_ref().family1(),
+      "QuickTime"
+    );
     // At least one Track1 tag exists with family1 "Track1".
     assert!(
       tags

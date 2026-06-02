@@ -53,6 +53,10 @@
 //! test sample`); the port mirrors that — unsupported codes accumulate an
 //! `AMF <name> record not yet supported` warning and abort the meta packet.
 
+// Golden-v2 Contract 3c (Phase C, slice B / w2b): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{
     fix_utf8, perl_str_to_f64, write_convert_bitrate, write_convert_duration,
@@ -589,12 +593,18 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     return None;
   }
   // Flash.pm:475 `$buff =~ /^FLV\x01/ or return 0`.
-  if data[..4] != *b"FLV\x01" {
+  // Checked-indexing (Phase C w2b): the `data.len() < 9` guard above makes
+  // `data.get(..4)` / `data.get(4)` / `data.get(5..9)` all `Some`, so the
+  // fallbacks are unreachable and every read is byte-identical.
+  if data.get(..4) != Some(&b"FLV\x01"[..]) {
     return None;
   }
   // Flash.pm:478 `($flags, $offset) = unpack('x4CN', $buff)`.
-  let mut flags = data[4];
-  let offset = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
+  let mut flags = data.get(4).copied().unwrap_or(0);
+  let offset = match data.get(5..9) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]) as usize,
+    _ => 0,
+  };
   // Flash.pm:480 `$flags &= 0x05`.
   flags &= 0x05;
 
@@ -613,11 +623,17 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     if pos + 15 > data.len() {
       break; // short read ⇒ Perl `last`
     }
-    let head = &data[pos..pos + 15];
+    // Checked-indexing (Phase C w2b): the `pos + 15 > data.len()` guard makes
+    // `data.get(pos..pos + 15)` always `Some` (a 15-byte window), so `head[4]`
+    // ..`head[7]` destructure cleanly ⇒ byte-identical.
+    let head = data.get(pos..pos + 15).unwrap_or(&[]);
     // Flash.pm:485-487 — the 4-byte prev-tag-size precedes the 11-byte tag
     // header. `$len = unpack('x4N', $buff)` extracts the BE u32 from
     // offset 4 of the 15-byte window: `(type << 24) | dataSize24`.
-    let pack = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+    let pack = match head.get(4..8) {
+      Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]),
+      _ => 0,
+    };
     let r#type = (pack >> 24) as u8;
     let len = (pack & 0x00ff_ffff) as usize;
     pos += 15; // advance past the prev-tag-size + tag-header
@@ -656,8 +672,11 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
           found |= mask;
           flags &= !mask;
           // Flash.pm:500 `if ($len>=1 and $raf->Read($buff,1)==1)`.
+          // Checked-indexing (Phase C w2b): `avail >= 1`
+          // (`avail = data.len() - body_start`) ⇒ `data.get(body_start)` is
+          // `Some` ⇒ `.unwrap_or(0)` is byte-identical.
           if len >= 1 && avail >= 1 {
-            process_audio_octet(&mut entries, data[body_start]);
+            process_audio_octet(&mut entries, data.get(body_start).copied().unwrap_or(0));
             consumed = 1;
           } else {
             // Flash.pm:503-504 — short read of the config byte.
@@ -677,7 +696,9 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
           found |= mask;
           flags &= !mask;
           if len >= 1 && avail >= 1 {
-            process_video_octet(&mut entries, data[body_start]);
+            // Checked-indexing (Phase C w2b): `avail >= 1` ⇒ `data.get(body_start)`
+            // is `Some` ⇒ byte-identical.
+            process_video_octet(&mut entries, data.get(body_start).copied().unwrap_or(0));
             consumed = 1;
           } else {
             warnings.push(SmolStr::new_static("Bad Video packet"));
@@ -693,7 +714,10 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
         // `Truncated Meta packet` and `last`s (Flash.pm:511). On success
         // `$len` is set to 0 (Flash.pm:509), so nothing is seeked after.
         if avail >= len {
-          let body = &data[body_start..body_start + len];
+          // Checked-indexing (Phase C w2b): `avail >= len`
+          // (`avail = data.len() - body_start`) ⇒
+          // `data.get(body_start..body_start + len)` is `Some` ⇒ byte-identical.
+          let body = data.get(body_start..body_start + len).unwrap_or(&[]);
           process_meta(body, &mut entries, &mut warnings);
           consumed = len;
         } else {
@@ -1328,7 +1352,9 @@ fn process_meta(
     if pos >= data.len() {
       break;
     }
-    let r#type = data[pos];
+    // Checked-indexing (Phase C w2b): the `pos >= data.len()` guard makes
+    // `data.get(pos)` `Some` ⇒ `.unwrap_or(0)` is byte-identical.
+    let r#type = data.get(pos).copied().unwrap_or(0);
     pos += 1;
     // Flash.pm:442-453 — top-level handling per record.
     if is_struct(r#type) {
@@ -1572,7 +1598,12 @@ fn walk_pairs(
     if *pos + 2 > data.len() {
       return WalkOutcome::Abort;
     }
-    let key_len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+    // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` guard makes
+    // `data.get(*pos..*pos + 2)` `Some` ⇒ byte-identical.
+    let key_len = match data.get(*pos..*pos + 2) {
+      Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+      _ => 0,
+    };
     if *pos + 2 + key_len > data.len() {
       // Flash.pm:352-354 — key payload truncation: emit
       // `Truncated <amfTypeName> record` where amfTypeName depends on the
@@ -1582,7 +1613,10 @@ fn walk_pairs(
       warnings.push(SmolStr::from(std::format!("Truncated {name} record")));
       return WalkOutcome::Abort;
     }
-    let raw_key = &data[*pos + 2..*pos + 2 + key_len];
+    // Checked-indexing (Phase C w2b): the `*pos + 2 + key_len > data.len()`
+    // guard makes `data.get(*pos + 2..*pos + 2 + key_len)` `Some` ⇒
+    // byte-identical.
+    let raw_key = data.get(*pos + 2..*pos + 2 + key_len).unwrap_or(&[]);
     // Flash.pm:357 `$tag = substr($$dataPt, $pos + 2, $len)` keeps the RAW
     // key bytes. The key reaches output as a tag NAME only through the
     // `/^\w+$/` auto-add gate (Flash.pm:390, our `is_word_key`), which
@@ -1606,7 +1640,9 @@ fn walk_pairs(
     if *pos >= data.len() {
       return WalkOutcome::Abort;
     }
-    let vtype = data[*pos];
+    // Checked-indexing (Phase C w2b): the `*pos >= data.len()` guard makes
+    // `data.get(*pos)` `Some` ⇒ byte-identical.
+    let vtype = data.get(*pos).copied().unwrap_or(0);
     *pos += 1;
 
     // Object-end sentinel: 0-length key + type 0x09. Bundled `last if
@@ -2099,8 +2135,12 @@ fn collect_array_items(
     // `flash_keyed_array_truncated_count_conformance` (R9/F1).
     return ArrayOutcome::TruncatedCount;
   }
-  let count =
-    u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+  // Checked-indexing (Phase C w2b): the `*pos + 4 > data.len()` guard makes
+  // `data.get(*pos..*pos + 4)` `Some` ⇒ byte-identical.
+  let count = match data.get(*pos..*pos + 4) {
+    Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]) as usize,
+    _ => 0,
+  };
   *pos += 4;
   let mut collected: std::vec::Vec<FlashListItem> = std::vec::Vec::with_capacity(count.min(1024));
   for i in 0..count {
@@ -2112,7 +2152,9 @@ fn collect_array_items(
       warnings.push(SmolStr::new_static("Truncated AMF record 0xa"));
       return ArrayOutcome::Abort;
     }
-    let vtype = data[*pos];
+    // Checked-indexing (Phase C w2b): the `*pos >= data.len()` guard makes
+    // `data.get(*pos)` `Some` ⇒ byte-identical.
+    let vtype = data.get(*pos).copied().unwrap_or(0);
     *pos += 1;
     if is_struct(vtype) {
       // Sub-struct: recurse with per-element struct name (Flash.pm:418).
@@ -2530,7 +2572,12 @@ fn consume_struct_intro(
       if *pos + 2 > data.len() {
         return IntroOutcome::Truncated(IntroTruncReason::NameLength);
       }
-      let name_len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+      // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` guard makes
+      // `data.get(*pos..*pos + 2)` `Some` ⇒ byte-identical.
+      let name_len = match data.get(*pos..*pos + 2) {
+        Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+        _ => 0,
+      };
       // Lines 352-354 `if ($pos + 2 + $len > $dirLen) {
       //   $et->Warn("Truncated $amfType[$type] record"); last Record; }`
       // — `$type` here is the OUTER struct type (0x10 = typed-object,
@@ -2691,16 +2738,14 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let raw = f64::from_be_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-        data[*pos + 4],
-        data[*pos + 5],
-        data[*pos + 6],
-        data[*pos + 7],
-      ]);
+      // Checked-indexing (Phase C w2b): the `*pos + 8 > data.len()` guard makes
+      // `data.get(*pos..*pos + 8)` `Some` (an 8-byte window) ⇒ byte-identical.
+      let raw = match data.get(*pos..*pos + 8) {
+        Some(&[b0, b1, b2, b3, b4, b5, b6, b7]) => {
+          f64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
+        }
+        _ => 0.0,
+      };
       *pos += 8;
       if r#type == 0x00 {
         ReadResult::Ok(AmfValue::Double(raw))
@@ -2721,7 +2766,12 @@ fn read_value(
           let secs = raw / 1000.0;
           return ReadResult::Ok(AmfValue::Double(secs));
         }
-        let tz = i16::from_be_bytes([data[*pos], data[*pos + 1]]);
+        // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` guard
+        // above makes `data.get(*pos..*pos + 2)` `Some` ⇒ byte-identical.
+        let tz = match data.get(*pos..*pos + 2) {
+          Some(&[b0, b1]) => i16::from_be_bytes([b0, b1]),
+          _ => 0,
+        };
         *pos += 2;
         let secs = raw / 1000.0;
         let s = convert_unix_time(secs, tz);
@@ -2735,7 +2785,9 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let v = data[*pos];
+      // Checked-indexing (Phase C w2b): the `*pos + 1 > data.len()` guard makes
+      // `data.get(*pos)` `Some` ⇒ byte-identical.
+      let v = data.get(*pos).copied().unwrap_or(0);
       *pos += 1;
       ReadResult::Ok(AmfValue::Boolean(v))
     }
@@ -2745,12 +2797,18 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+      // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` then
+      // `*pos + 2 + len > data.len()` guards make `data.get(*pos..*pos + 2)`
+      // and `data.get(*pos + 2..*pos + 2 + len)` `Some` ⇒ byte-identical.
+      let len = match data.get(*pos..*pos + 2) {
+        Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+        _ => 0,
+      };
       if *pos + 2 + len > data.len() {
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let raw = &data[*pos + 2..*pos + 2 + len];
+      let raw = data.get(*pos + 2..*pos + 2 + len).unwrap_or(&[]);
       *pos += 2 + len;
       // Flash.pm:333 `$val = substr($$dataPt, $pos + 2, $len)` keeps the
       // RAW bytes; the bundled `exiftool` JSON emitter applies
@@ -2784,7 +2842,12 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let v = u16::from_be_bytes([data[*pos], data[*pos + 1]]);
+      // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` guard makes
+      // `data.get(*pos..*pos + 2)` `Some` ⇒ byte-identical.
+      let v = match data.get(*pos..*pos + 2) {
+        Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]),
+        _ => 0,
+      };
       *pos += 2;
       ReadResult::Ok(AmfValue::Reference(v))
     }
@@ -2812,13 +2875,18 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let len =
-        u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+      // Checked-indexing (Phase C w2b): the `*pos + 4 > data.len()` then
+      // `*pos + 4 + len > data.len()` guards make `data.get(*pos..*pos + 4)`
+      // and `data.get(*pos + 4..*pos + 4 + len)` `Some` ⇒ byte-identical.
+      let len = match data.get(*pos..*pos + 4) {
+        Some(&[b0, b1, b2, b3]) => u32::from_be_bytes([b0, b1, b2, b3]) as usize,
+        _ => 0,
+      };
       if *pos + 4 + len > data.len() {
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let raw = &data[*pos + 4..*pos + 4 + len];
+      let raw = data.get(*pos + 4..*pos + 4 + len).unwrap_or(&[]);
       *pos += 4 + len;
       // Flash.pm:430 `$val = substr($$dataPt, $pos + 4, $len)` (long string
       // 0x0c / XML doc 0x0f) keeps RAW bytes too; same FixUTF8-at-JSON
@@ -2833,7 +2901,12 @@ fn read_value(
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
       }
-      let name_len = u16::from_be_bytes([data[*pos], data[*pos + 1]]) as usize;
+      // Checked-indexing (Phase C w2b): the `*pos + 2 > data.len()` guard makes
+      // `data.get(*pos..*pos + 2)` `Some` ⇒ byte-identical.
+      let name_len = match data.get(*pos..*pos + 2) {
+        Some(&[b0, b1]) => u16::from_be_bytes([b0, b1]) as usize,
+        _ => 0,
+      };
       if *pos + 2 + name_len > data.len() {
         push_truncated_amf_record(warnings, r#type);
         return ReadResult::Truncated(r#type);
@@ -3395,6 +3468,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2b); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

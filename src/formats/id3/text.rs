@@ -6,6 +6,15 @@
 //! - `print_length` — TLEN PrintConv (`"$val s"`, ID3.pm:595).
 //! - `value_length` — TLEN ValueConv (`$val / 1000`, ID3.pm:594).
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw `&[u8]` index/slice (from `str::as_bytes()`) is converted to a
+// checked `.get()` form below. Each conversion is byte-identical: every read
+// is inside a `while i < bytes.len()` / `i + N < bytes.len()` loop bound or a
+// preceding `bytes.len() < N` length guard, so the `.get()` always yields the
+// same byte and the comparison/parse result is unchanged. (`&str` range slices
+// like `&s[a..b]` are not flagged by this lint and stay as-is.)
+#![deny(clippy::indexing_slicing)]
+
 use crate::{convert::ConvContext, formats::id3::genre, value::TagValue};
 use smol_str::SmolStr;
 
@@ -127,14 +136,18 @@ pub fn print_genre(raw: &TagValue) -> TagValue {
   let mut i = 0;
   let mut copy_from = 0;
   while i < bytes.len() {
-    if bytes[i] == b'(' {
+    // `i < bytes.len()` ⇒ `.get(i)` is `Some`; the inner `.get(j)` scans are
+    // `Some` exactly while `j < bytes.len()` (the `.get` returns `None` past
+    // the end, replacing the explicit `j < bytes.len()` bound) — byte-
+    // identical to the prior `bytes[i]` / `bytes[j]`.
+    if bytes.get(i) == Some(&b'(') {
       // Try to parse `(<digits>)`.
       let start = i + 1;
       let mut j = start;
-      while j < bytes.len() && bytes[j].is_ascii_digit() {
+      while bytes.get(j).is_some_and(u8::is_ascii_digit) {
         j += 1;
       }
-      if j > start && j < bytes.len() && bytes[j] == b')' {
+      if j > start && bytes.get(j) == Some(&b')') {
         // Flush the pending UTF-8 chunk before this `(`.
         out.push_str(&s[copy_from..i]);
         // R14-F3: Perl `%genre{$1}` uses the CAPTURED STRING as key.
@@ -171,14 +184,19 @@ pub fn print_genre(raw: &TagValue) -> TagValue {
   let mut i = 0;
   let mut copy_from = 0;
   while i < bytes2.len() {
-    let at_boundary = i == 0 || bytes2[i - 1] == b'/';
-    if at_boundary && bytes2[i].is_ascii_digit() {
+    // `i < bytes2.len()` ⇒ `.get(i)` is `Some`; `i == 0 || .get(i - 1) ==
+    // Some(&b'/')` is byte-identical to `i == 0 || bytes2[i - 1] == b'/'`
+    // (when `i > 0`, `i - 1 < len`). The inner `.get(k)` scan is `Some` exactly
+    // while `k < bytes2.len()`. `.get(k) == Some(&b'/')` (else clause) covers
+    // the `k < len && bytes2[k] == b'/'` case; `k == len` is the `None` side.
+    let at_boundary = i == 0 || bytes2.get(i - 1) == Some(&b'/');
+    if at_boundary && bytes2.get(i).is_some_and(u8::is_ascii_digit) {
       let start = i;
       let mut k = i;
-      while k < bytes2.len() && bytes2[k].is_ascii_digit() {
+      while bytes2.get(k).is_some_and(u8::is_ascii_digit) {
         k += 1;
       }
-      let at_end = k == bytes2.len() || bytes2[k] == b'/';
+      let at_end = k == bytes2.len() || bytes2.get(k) == Some(&b'/');
       if at_end {
         // Flush the pending UTF-8 chunk.
         out2.push_str(&after_parens[copy_from..start]);
@@ -227,7 +245,9 @@ fn lookup_genre_by_decimal_string(captured: &str) -> Option<&'static str> {
     return None;
   }
   let bytes = captured.as_bytes();
-  if bytes.len() > 1 && bytes[0] == b'0' {
+  // `.first()` is the checked form of `bytes[0]`; with `bytes.len() > 1` it is
+  // always `Some` (byte-identical to the prior `bytes[0] == b'0'`).
+  if bytes.len() > 1 && bytes.first() == Some(&b'0') {
     return None;
   }
   // Parse to i64; the table covers 0..=255 + a sparse upper range,
@@ -240,7 +260,10 @@ fn lookup_genre_by_decimal_string(captured: &str) -> Option<&'static str> {
 /// whole string is `(X)` or `(X)X`, replace with `X`. Otherwise unchanged.
 fn clean_parens_duplicates(s: &str) -> String {
   let b = s.as_bytes();
-  if b.len() < 2 || b[0] != b'(' {
+  // `.first()` is the checked form of `b[0]`; with `b.len() >= 2` it is always
+  // `Some` (byte-identical to the prior `b[0] != b'('`). (`&s[1..close]` /
+  // `&s[close + 1..]` below are `&str` range slices, not flagged.)
+  if b.len() < 2 || b.first() != Some(&b'(') {
     return s.to_string();
   }
   // Find matching `)` — `[^)]+` so no nested parens, just one run.
@@ -281,20 +304,24 @@ pub fn print_popularimeter(raw: &TagValue) -> TagValue {
   // Strip trailing digits → $3.
   let end3 = bytes.len();
   let mut start3 = end3;
-  while start3 > 0 && bytes[start3 - 1].is_ascii_digit() {
+  // Each `start*` walks down from `bytes.len()` and stays `> 0` when the read
+  // happens, so `start* - 1 < bytes.len()` and `.get(start* - 1)` is always
+  // `Some` (byte-identical to the prior `bytes[start* - 1]`); the `|| start*
+  // == 0` short-circuit still guards the subtraction.
+  while start3 > 0 && bytes.get(start3 - 1).is_some_and(u8::is_ascii_digit) {
     start3 -= 1;
   }
-  if start3 == end3 || start3 == 0 || bytes[start3 - 1] != b' ' {
+  if start3 == end3 || start3 == 0 || bytes.get(start3 - 1) != Some(&b' ') {
     return TagValue::Str(s.clone());
   }
   // Strip $2 digits. `end2` is the index of the ' ' before $3, i.e. the
   // upper bound for the $2 scan; `start2` walks backward over digits.
   let end2 = start3 - 1;
   let mut start2 = end2;
-  while start2 > 0 && bytes[start2 - 1].is_ascii_digit() {
+  while start2 > 0 && bytes.get(start2 - 1).is_some_and(u8::is_ascii_digit) {
     start2 -= 1;
   }
-  if start2 == end2 || start2 == 0 || bytes[start2 - 1] != b' ' {
+  if start2 == end2 || start2 == 0 || bytes.get(start2 - 1) != Some(&b' ') {
     return TagValue::Str(s.clone());
   }
   // $1 is the minimal-match prefix — everything BEFORE the space before $2.
@@ -346,16 +373,20 @@ pub fn make_tag_name(name: &str) -> String {
   let mut out = String::with_capacity(bytes.len());
   let mut i = 0;
   while i < bytes.len() {
+    // `i + 2 < bytes.len()` ⇒ all three reads are in range; in the `else`,
+    // `i < bytes.len()` ⇒ `.get(i)` is `Some`. The `0` fallbacks are
+    // unreachable (byte-identical to the prior `bytes[i]` / `bytes[i+1]` /
+    // `bytes[i+2]`).
     if i + 2 < bytes.len()
-      && bytes[i].is_ascii_lowercase()
-      && (bytes[i + 1] == b'_' || bytes[i + 1] == b' ')
-      && bytes[i + 2].is_ascii_lowercase()
+      && bytes.get(i).is_some_and(u8::is_ascii_lowercase)
+      && (bytes.get(i + 1) == Some(&b'_') || bytes.get(i + 1) == Some(&b' '))
+      && bytes.get(i + 2).is_some_and(u8::is_ascii_lowercase)
     {
-      out.push(bytes[i] as char);
-      out.push((bytes[i + 2] as char).to_ascii_uppercase());
+      out.push(bytes.get(i).copied().unwrap_or(0) as char);
+      out.push((bytes.get(i + 2).copied().unwrap_or(0) as char).to_ascii_uppercase());
       i += 3;
     } else {
-      out.push(bytes[i] as char);
+      out.push(bytes.get(i).copied().unwrap_or(0) as char);
       i += 1;
     }
   }
@@ -437,45 +468,54 @@ fn try_xmp_datetime(s: &str) -> Option<String> {
   if bytes.len() < 16 {
     return None;
   }
-  // YYYY-MM-DD[T| ]HH:MM[:SS][TZ]
-  let year = std::str::from_utf8(&bytes[..4]).ok()?;
-  if !year.bytes().all(|b| b.is_ascii_digit()) || bytes[4] != b'-' {
+  // YYYY-MM-DD[T| ]HH:MM[:SS][TZ]. `bytes.len() >= 16` ⇒ every fixed read in
+  // `0..16` is in range, so the `.get(..)?` always yields `Some` (the `?`
+  // `None` recovery is the function's existing no-match path) — byte-identical
+  // to the prior `&bytes[..4]` / `bytes[4]` etc.
+  let year = std::str::from_utf8(bytes.get(..4)?).ok()?;
+  if !year.bytes().all(|b| b.is_ascii_digit()) || bytes.get(4) != Some(&b'-') {
     return None;
   }
-  let mon = std::str::from_utf8(&bytes[5..7]).ok()?;
-  if !mon.bytes().all(|b| b.is_ascii_digit()) || bytes[7] != b'-' {
+  let mon = std::str::from_utf8(bytes.get(5..7)?).ok()?;
+  if !mon.bytes().all(|b| b.is_ascii_digit()) || bytes.get(7) != Some(&b'-') {
     return None;
   }
-  let day = std::str::from_utf8(&bytes[8..10]).ok()?;
-  if !day.bytes().all(|b| b.is_ascii_digit()) || (bytes[10] != b'T' && bytes[10] != b' ') {
+  let day = std::str::from_utf8(bytes.get(8..10)?).ok()?;
+  if !day.bytes().all(|b| b.is_ascii_digit())
+    || (bytes.get(10) != Some(&b'T') && bytes.get(10) != Some(&b' '))
+  {
     return None;
   }
-  let hhmm = std::str::from_utf8(&bytes[11..16]).ok()?;
+  let hhmm = std::str::from_utf8(bytes.get(11..16)?).ok()?;
   let hhmm_bytes = hhmm.as_bytes();
-  if !hhmm_bytes[0].is_ascii_digit()
-    || !hhmm_bytes[1].is_ascii_digit()
-    || hhmm_bytes[2] != b':'
-    || !hhmm_bytes[3].is_ascii_digit()
-    || !hhmm_bytes[4].is_ascii_digit()
+  if !hhmm_bytes.first().is_some_and(u8::is_ascii_digit)
+    || !hhmm_bytes.get(1).is_some_and(u8::is_ascii_digit)
+    || hhmm_bytes.get(2) != Some(&b':')
+    || !hhmm_bytes.get(3).is_some_and(u8::is_ascii_digit)
+    || !hhmm_bytes.get(4).is_some_and(u8::is_ascii_digit)
   {
     return None;
   }
   let mut pos = 16;
   let mut sec = String::new();
-  if pos + 3 <= bytes.len() && bytes[pos] == b':' {
-    let tail = std::str::from_utf8(&bytes[pos + 1..pos + 3]).ok()?;
+  // `pos + 3 <= bytes.len()` ⇒ `pos < bytes.len()`, so `.get(pos)` is `Some`
+  // and `.get(pos + 1..pos + 3)` is `Some` — byte-identical.
+  if pos + 3 <= bytes.len() && bytes.get(pos) == Some(&b':') {
+    let tail = std::str::from_utf8(bytes.get(pos + 1..pos + 3)?).ok()?;
     if !tail.bytes().all(|b| b.is_ascii_digit()) {
       return None;
     }
     sec = format!(":{tail}");
     pos += 3;
   }
-  // Skip whitespace then capture trailing tz (\S*$).
-  while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+  // Skip whitespace then capture trailing tz (\S*$). `.get(pos)` is `Some`
+  // exactly while `pos < bytes.len()` (replacing the explicit bound).
+  while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
     pos += 1;
   }
   let tz = if pos < bytes.len() {
-    std::str::from_utf8(&bytes[pos..]).ok()?
+    // `pos <= bytes.len()` always ⇒ `.get(pos..)` is `Some` (byte-identical).
+    std::str::from_utf8(bytes.get(pos..)?).ok()?
   } else {
     ""
   };
@@ -495,21 +535,27 @@ fn try_xmp_date_only(s: &str) -> Option<String> {
   if bytes.len() < 4 {
     return None;
   }
-  let year_ok = bytes[..4].iter().all(|b| b.is_ascii_digit());
+  // `bytes.len() >= 4` ⇒ `.get(..4)` is always `Some` (the `false` fallback is
+  // unreachable) — byte-identical to the prior `bytes[..4]`.
+  let year_ok = bytes
+    .get(..4)
+    .is_some_and(|b| b.iter().all(u8::is_ascii_digit));
   if !year_ok {
     return None;
   }
-  // Optional `-MM` and `-DD`.
+  // Optional `-MM` and `-DD`. `i + 3 <= bytes.len()` ⇒ the three reads are in
+  // range; the `else if` `.get(i) == Some(&b'-')` covers `i < len && bytes[i]
+  // == b'-'` (the `None` side is `i == len`) — byte-identical.
   let mut i = 4;
   let mut groups_ok = true;
   for _ in 0..2 {
     if i + 3 <= bytes.len()
-      && bytes[i] == b'-'
-      && bytes[i + 1].is_ascii_digit()
-      && bytes[i + 2].is_ascii_digit()
+      && bytes.get(i) == Some(&b'-')
+      && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+      && bytes.get(i + 2).is_some_and(u8::is_ascii_digit)
     {
       i += 3;
-    } else if i < bytes.len() && bytes[i] == b'-' {
+    } else if bytes.get(i) == Some(&b'-') {
       // `-` without two digits ⇒ regex doesn't match (`{0,2}` allows 0
       // matches here, so prefix `^(\d{4})` alone matches, then no `-MM`).
       groups_ok = false;
@@ -552,6 +598,11 @@ pub fn print_length(raw: &TagValue) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the tests index fixed-layout data freely (an
+// out-of-range index is a test-assertion failure, not a shipped panic), so the
+// deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

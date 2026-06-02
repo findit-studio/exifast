@@ -12,6 +12,12 @@
 //! 2739`/`:2754-2758`) selects the `FocalPlaneXSize`/`FocalPlaneYSize`
 //! arm rather than the `Unknown` arm; see [`focal_plane_size_valid`].
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::vec::Vec;
@@ -149,8 +155,9 @@ fn ends_with_word_boundary(s: &str, token: &str) -> bool {
 }
 
 fn read_u16(data: &[u8], pos: usize, order: crate::exif::ifd::ByteOrder) -> Option<u16> {
-  let b = data.get(pos..pos + 2)?;
-  let arr: [u8; 2] = [b[0], b[1]];
+  // `get(pos..pos+2)` yields exactly 2 bytes, so `try_into()` to `[u8; 2]`
+  // always succeeds — the checked, byte-identical form of `[b[0], b[1]]`.
+  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
   Some(match order {
     crate::exif::ifd::ByteOrder::Little => u16::from_le_bytes(arr),
     crate::exif::ifd::ByteOrder::Big => u16::from_be_bytes(arr),
@@ -158,6 +165,11 @@ fn read_u16(data: &[u8], pos: usize, order: crate::exif::ifd::ByteOrder) -> Opti
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::exif::ifd::ByteOrder;

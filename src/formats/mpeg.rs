@@ -2,6 +2,10 @@
 // exifast — a 1:1 Rust port of ExifTool (Phil Harvey). See THIRD_PARTY.md.
 
 #![cfg(feature = "mpeg-audio")]
+// Golden-v2 Contract 3c (Phase C): parser-panic-safety by construction —
+// every raw index/slice on input bytes is converted to a checked `.get()`
+// form below. (`src/formats/mod.rs` also cascades this deny across all leaves.)
+#![deny(clippy::indexing_slicing)]
 //! Faithful port of `Image::ExifTool::MPEG` (lib/Image/ExifTool/MPEG.pm) —
 //! AUDIO side only.
 //!
@@ -1185,6 +1189,11 @@ impl AudioMeta<'_> {
 /// MPEG.pm:44-164 — AudioBitrate ValueConv hash chooser. Returns the bps
 /// for raw 1..14, `AudioBitrate::Free` for raw 0; raw 15 is rejected
 /// upstream by `check_header`.
+// `idx` is clamped to `[0, table.len()-1]` by the `if base < last` saturate
+// below, so `table[idx]` is panic-free by construction. `<[T]>::get` is not
+// usable here (`const fn`; the hand-written clamp keeps it const). Narrow,
+// const-fn-only exception to the file-level deny (cf. dsf.rs).
+#[allow(clippy::indexing_slicing)]
 const fn audio_bitrate_lookup(version: AudioVersion, layer: AudioLayer, raw: u8) -> AudioBitrate {
   // raw==0 ⇒ Free; raw==15 cannot reach this function (header validation rejects).
   if raw == 0 {
@@ -1231,6 +1240,10 @@ const fn audio_bitrate_lookup(version: AudioVersion, layer: AudioLayer, raw: u8)
 
 /// MPEG.pm:166-196 — SampleRate PrintConv hash chooser. Raw 0..2 only;
 /// raw==3 (reserved) rejected upstream by `check_header`.
+// `raw` is matched to `0..=2` against a 3-entry `table`, so `table[raw]` is
+// panic-free by construction. Narrow, const-fn-only exception to the
+// file-level deny (cf. dsf.rs).
+#[allow(clippy::indexing_slicing)]
 const fn sample_rate_lookup(version: AudioVersion, raw: u8) -> Option<u32> {
   // MPEG.pm:166-176 / :177-186 / :187-196 tables (3 entries each).
   let table: [u32; 3] = match version {
@@ -1292,17 +1305,13 @@ fn scan_for_header(data: &[u8], mp3: bool, ext: &str) -> Option<(u32, usize)> {
   let mut p = 0usize;
   loop {
     // MPEG.pm:472 — `$$buffPt =~ m{(\xff.{3})}sg`. Find next `\xff`.
-    let ff = data[p..].iter().position(|&b| b == 0xff)?;
+    let ff = data.get(p..)?.iter().position(|&b| b == 0xff)?;
     let start = p + ff;
-    if start + 4 > data.len() {
-      return None;
-    }
-    let word = u32::from_be_bytes([
-      data[start],
-      data[start + 1],
-      data[start + 2],
-      data[start + 3],
-    ]);
+    // MPEG.pm:472 reads a 4-byte big-endian header word. `get(..)?` is the
+    // bounds check (replaces the explicit `start + 4 > len` guard) and keeps
+    // the read free of raw indexing (clippy::indexing_slicing); `try_into`
+    // on the exact-length slice never fails.
+    let word = u32::from_be_bytes(data.get(start..start + 4)?.try_into().ok()?);
     let next_pos = start + 4;
     match check_header(word, mp3) {
       HeaderCheck::Ok => return Some((word, next_pos)),
@@ -1430,12 +1439,15 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
     Some(n) => n,
     None => return,
   };
-  // MPEG.pm:505 `last if $pos + 8 > $len`.
-  if pos.checked_add(8).is_none_or(|end| end > len) {
+  // MPEG.pm:505 `last if $pos + 8 > $len`; MPEG.pm:506 `my $buff =
+  // substr($$buffPt, $pos, 8)`. `get(..)` is the bounds check; the fixed-size
+  // array keeps the field reads below panic-free.
+  let Some(head8) = buff
+    .get(pos..pos + 8)
+    .and_then(|s| <&[u8; 8]>::try_from(s).ok())
+  else {
     return;
-  }
-  // MPEG.pm:506 `my $buff = substr($$buffPt, $pos, 8)`.
-  let head8 = &buff[pos..pos + 8];
+  };
   // MPEG.pm:508 `last unless $buff =~ /^(Xing|Info)/`.
   let magic_is_xing = head8.starts_with(b"Xing");
   let magic_is_info = head8.starts_with(b"Info");
@@ -1452,23 +1464,29 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
   // MPEG.pm:513-517 — VBRFrames (key 1).
   let mut vbr_scale_inner: Option<u32> = None;
   if flags & 0x01 != 0 {
-    if pos.checked_add(4).is_none_or(|end| end > len) {
+    // MPEG.pm:513-514 — `get(..)` is the bounds check (`last if $pos+4>$len`).
+    let Some(word) = buff
+      .get(pos..pos + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    else {
       return;
-    }
+    };
     if is_vbr {
-      let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
-      meta.vbr_frames = Some(n);
+      meta.vbr_frames = Some(u32::from_be_bytes(word));
     }
     pos += 4;
   }
   // MPEG.pm:518-522 — VBRBytes (key 2).
   if flags & 0x02 != 0 {
-    if pos.checked_add(4).is_none_or(|end| end > len) {
+    // MPEG.pm:518-519 — `get(..)` is the bounds check (`last if $pos+4>$len`).
+    let Some(word) = buff
+      .get(pos..pos + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    else {
       return;
-    }
+    };
     if is_vbr {
-      let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
-      meta.vbr_bytes = Some(n);
+      meta.vbr_bytes = Some(u32::from_be_bytes(word));
     }
     pos += 4;
   }
@@ -1482,10 +1500,14 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
   // MPEG.pm:528-533 — VBRScale (key 3) AND captured for LameVBRQuality /
   // LameQuality at MPEG.pm:564-565.
   if flags & 0x08 != 0 {
-    if pos.checked_add(4).is_none_or(|end| end > len) {
+    // MPEG.pm:528-529 — `get(..)` is the bounds check (`last if $pos+4>$len`).
+    let Some(word) = buff
+      .get(pos..pos + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    else {
       return;
-    }
-    let n = u32::from_be_bytes([buff[pos], buff[pos + 1], buff[pos + 2], buff[pos + 3]]);
+    };
+    let n = u32::from_be_bytes(word);
     vbr_scale_inner = Some(n);
     if is_vbr {
       meta.vbr_scale = Some(n);
@@ -1498,9 +1520,9 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
     if pos.checked_add(348).is_none_or(|end| end > len) {
       return;
     }
-  } else if pos.checked_add(4).is_some_and(|end| end <= len) {
+  } else if let Some(lib) = buff.get(pos..pos + 4) {
     // MPEG.pm:538-557 — non-LAME-flag branch: identify alternate encoders.
-    let lib = &buff[pos..pos + 4];
+    // `get(..)` Some ⟺ `pos + 4 <= len` (the prior bounds guard).
     if lib != b"LAME" && lib != b"GOGO" {
       // MPEG.pm:541-555 — fallback string matches across the whole buffer.
       let encoder_str: Option<Cow<'a, str>> = if find_subseq(buff, b"RCA mp3PRO Encoder").is_some()
@@ -1513,11 +1535,11 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
         // $$buffPt) - $n >= 6`.
         let mut s = String::from("Thomson mp3PRO");
         let n2 = n + 22;
-        if n2 <= len && len - n2 >= 6 {
+        // `n2 <= len && len - n2 >= 6` ⟺ `buff.get(n2..n2+6)` is Some.
+        if let Some(suffix) = buff.get(n2..n2 + 6) {
           s.push(' ');
           // Use lossy UTF-8 conversion for the 6-byte suffix (defensive;
           // real files emit ASCII version tags).
-          let suffix = &buff[n2..n2 + 6];
           s.push_str(&std::string::String::from_utf8_lossy(suffix));
         }
         Some(Cow::Owned(s))
@@ -1542,7 +1564,10 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
   if lame_len < 9 {
     return; // MPEG.pm:560 `last if $lameLen < 9`.
   }
-  let enc = &buff[pos..pos + 9];
+  // `lame_len >= 9` ⟺ `pos + 9 <= len`, so `get(..)` is always Some here.
+  let Some(enc) = buff.get(pos..pos + 9) else {
+    return;
+  };
   // MPEG.pm:562 `if ($enc ge 'LAME3.90')` — Perl `ge` is bytewise ASCII.
   if enc >= b"LAME3.90" as &[u8] {
     // MPEG.pm:563 emit Encoder as the 9-byte version string. Borrow from
@@ -1571,7 +1596,10 @@ fn parse_xing_lame_into<'a>(buff: &'a [u8], mut pos: usize, meta: &mut AudioMeta
     // substring (cropped to remaining bytes).
     let want = pos + 20;
     let end = want.min(len);
-    let slice = &buff[pos..end];
+    // `pos <= end <= len` here, so `get(..)` is always Some.
+    let Some(slice) = buff.get(pos..end) else {
+      return;
+    };
     let enc_cow = match core::str::from_utf8(slice) {
       Ok(s) => Cow::Borrowed(s),
       Err(_) => Cow::Owned(std::string::String::from_utf8_lossy(slice).into_owned()),
@@ -1597,11 +1625,7 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn parse_lame_into<'a>(buff: &'a [u8], pos: usize, meta: &mut AudioMeta<'a>) {
   let read_byte = |offset: usize| -> Option<u8> {
     let abs = pos.checked_add(offset)?;
-    if abs < buff.len() {
-      Some(buff[abs])
-    } else {
-      None
-    }
+    buff.get(abs).copied()
   };
   // Offset 9: LameMethod, Mask 0x0f.
   if let Some(b) = read_byte(9) {
@@ -2050,6 +2074,11 @@ pub(crate) const fn id3_process_mp3_scan_len(ext_is_mp3: bool) -> usize {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;

@@ -121,7 +121,11 @@ const NOT_ACTIVE: &[&str] = &[
 /// PLIST chronology's running `… → 283` figure is relative to lib/plist's
 /// older fork base; the absolute total against the live golden directory is
 /// 327 (`275 + 52`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 341;
+///
+/// Golden-v2 Phase C (`[minor]`/`[x$n]` diagnostics): +2 — `ID3_dup_short_frame.mp3`
+/// (the ` [x2]` multi-warning count) + `Exif_excessive_count.tif` (the `[Minor]`
+/// ignorable-2 prefix). 341 → 343.
+const EXPECTED_ACTIVE_FIXTURES: usize = 343;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -7,6 +7,12 @@
 //!
 //! Sorted by ID for binary-search lookup.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// this is the Canon model-ID lookup table; any raw index/slice is dominated by
+// a length/count guard and becomes a checked `.get()` form (re-asserts the
+// parent `exif` deny over the makernotes `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 
 /// One model-ID entry.
@@ -1454,7 +1460,9 @@ pub const CANON_MODEL_IDS: &[CanonModelEntry] = &[
 #[must_use]
 pub fn lookup(id: u32) -> Option<&'static CanonModelEntry> {
   let idx = CANON_MODEL_IDS.binary_search_by_key(&id, |e| e.id).ok()?;
-  Some(&CANON_MODEL_IDS[idx])
+  // `binary_search` returns an in-bounds index on `Ok`, so `.get(idx)` is
+  // `Some` — the checked, byte-identical form of `Some(&CANON_MODEL_IDS[idx])`.
+  CANON_MODEL_IDS.get(idx)
 }
 
 /// Resolve a model ID into a [`SmolStr`] for storage.
@@ -1464,6 +1472,11 @@ pub fn lookup_name(id: u32) -> Option<SmolStr> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

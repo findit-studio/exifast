@@ -26,6 +26,12 @@
 //! deferred crate-wide (`[[exifast-phase2-forward-items]]`), so the GPS IFD
 //! port emits the unsigned `GPS:*` tags exactly as bundled does under `-j`.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// the `PrintTimeStamp` / `ExifDate` string scanners below index only behind a
+// preceding length/position guard; each raw index/slice becomes a checked
+// `.get()` form (the fallback is the guard-guaranteed value).
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::tables::Conv;
 
 // ===========================================================================
@@ -482,16 +488,27 @@ pub fn print_time_stamp(val: &str) -> std::string::String {
   let Some(colon) = val.rfind(':') else {
     return val.to_string();
   };
-  let (head, sec_part) = (&val[..colon], &val[colon + 1..]);
-  // The captured group must be exactly `\d{2}\.\d+`.
-  let is_ss_frac = {
-    let bytes = sec_part.as_bytes();
-    bytes.len() > 3
-      && bytes[0].is_ascii_digit()
-      && bytes[1].is_ascii_digit()
-      && bytes[2] == b'.'
-      && bytes[3..].iter().all(u8::is_ascii_digit)
-  };
+  // `colon` is the byte index of an ASCII `:` (a char boundary) returned by
+  // `rfind`, so `colon < val.len()`: `val.get(..colon)` / `val.get(colon+1..)`
+  // are both `Some` — the checked, byte-identical form of `&val[..colon]` /
+  // `&val[colon+1..]` (the `.unwrap_or(val)` / `.unwrap_or("")` fallbacks are
+  // unreachable).
+  let (head, sec_part) = (
+    val.get(..colon).unwrap_or(val),
+    val.get(colon + 1..).unwrap_or(""),
+  );
+  // The captured group must be exactly `\d{2}\.\d+`. The `[d0, d1, b'.', f0,
+  // rest @ ..]` slice pattern requires ≥ 4 bytes (the old `len > 3` guard PLUS
+  // the `\d+`'s ≥ 1 fractional digit `f0`) and binds them — the checked,
+  // byte-identical form of `bytes[0]`/`bytes[1]`/`bytes[2]`/`bytes[3..]`.
+  let is_ss_frac = matches!(
+    sec_part.as_bytes(),
+    [d0, d1, b'.', f0, rest @ ..]
+      if d0.is_ascii_digit()
+        && d1.is_ascii_digit()
+        && f0.is_ascii_digit()
+        && rest.iter().all(u8::is_ascii_digit)
+  );
   if !is_ss_frac {
     return val.to_string();
   }
@@ -558,10 +575,12 @@ pub fn exif_date(val: &str) -> std::string::String {
 /// UTF-8.
 fn reseparate_date(val: &str) -> Option<std::string::String> {
   let b = val.as_bytes();
-  let is_digit = |i: usize| i < b.len() && b[i].is_ascii_digit();
+  // `b.get(i).is_some_and(..)` folds the explicit `i < b.len()` bound into the
+  // checked access — byte-identical to `i < b.len() && b[i].is_ascii_digit()`.
+  let is_digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
   // Maximal `[^\d]*` run starting at `i` (greedy; matches non-digit bytes).
   let skip_non_digits = |mut i: usize| {
-    while i < b.len() && !b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(|c| !c.is_ascii_digit()) {
       i += 1;
     }
     i
@@ -582,14 +601,18 @@ fn reseparate_date(val: &str) -> Option<std::string::String> {
     if is_digit(p2) && is_digit(p2 + 1) && p2 + 2 == b.len() {
       // Rewrite the matched span `[s, len)` to `$1:$2:$3`, preserving the
       // `[0, s)` prefix verbatim (Perl's substitution replaces only the
-      // matched portion).
+      // matched portion). Every span boundary here was just proven by the
+      // `is_digit(..)` checks above (`s+4`/`p1+2`/`p2+2 <= b.len()`) and lands
+      // on an ASCII-digit char boundary, so each `val.get(range)` is `Some` —
+      // the checked, byte-identical form of the `&val[range]` reads (the `""`
+      // fallbacks are unreachable).
       let mut out = std::string::String::with_capacity(s + 10);
-      out.push_str(&val[..s]);
-      out.push_str(&val[s..s + 4]); // $1 (year)
+      out.push_str(val.get(..s).unwrap_or(""));
+      out.push_str(val.get(s..s + 4).unwrap_or("")); // $1 (year)
       out.push(':');
-      out.push_str(&val[p1..p1 + 2]); // $2 (month)
+      out.push_str(val.get(p1..p1 + 2).unwrap_or("")); // $2 (month)
       out.push(':');
-      out.push_str(&val[p2..p2 + 2]); // $3 (day)
+      out.push_str(val.get(p2..p2 + 2).unwrap_or("")); // $3 (day)
       return Some(out);
     }
   }
@@ -607,6 +630,10 @@ fn compact_num(v: f64) -> std::string::String {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); relaxed for the test module (test indexing is an
+// assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

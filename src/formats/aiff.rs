@@ -52,6 +52,16 @@
 //!   `AIFF_zero_sig_max_exp.aif`, `AIFF_first_overflow_zero_sig.aif`)
 //! - exact integers above 2^53 but routed via NV (`AIFF_r10_exp53_fits_i64.aif`)
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the input buffer is converted to a checked `.get()`
+// form below. Each conversion is byte-identical: the preceding length guard
+// (`data.len() < 12`/`< 16`, the chunk-loop `pos + 8 > data.len()` /
+// `pos + len > data.len()` breaks, the comment `pos + size > data.len()`
+// break, the `body.len() < 4` / `data.len() <= 2` guards) already proves the
+// read in range, so the `.get()` always yields the same bytes via the same
+// recovery (reject / break / short-read) it had before.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   charset::decode_macroman,
   datetime::{AIFF_EPOCH_OFFSET, convert_datetime, convert_duration, convert_unix_time},
@@ -895,20 +905,25 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     if data.len() < 16 {
       return None;
     }
-    match &data[12..16] {
-      b"DJVU" => {}
-      b"DJVM" => djvm_multi_page = true,
+    // `data.len() >= 16` ⇒ `.get(12..16)` is always `Some(&data[12..16])`;
+    // the byte-string match arms and the `_` reject are byte-identical to the
+    // prior `match &data[12..16]`.
+    match data.get(12..16) {
+      Some(b"DJVU") => {}
+      Some(b"DJVM") => djvm_multi_page = true,
       _ => return None,
     }
     Magic::Djvu
   } else {
     // AIFF.pm:209 `return 0 unless $buff =~ /^FORM....(AIF(F|C))/s`.
-    if &data[0..4] != b"FORM" {
+    // `data.len() >= 12` (top guard) ⇒ `starts_with` ≡ `&data[0..4] == b"FORM"`
+    // and `.get(8..12)` is always `Some(&data[8..12])` — both byte-identical.
+    if !data.starts_with(b"FORM") {
       return None;
     }
-    match &data[8..12] {
-      b"AIFF" => Magic::Aiff,
-      b"AIFC" => Magic::Aifc,
+    match data.get(8..12) {
+      Some(b"AIFF") => Magic::Aiff,
+      Some(b"AIFC") => Magic::Aifc,
       _ => return None,
     }
   };
@@ -942,10 +957,23 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     if pos.checked_add(8).map_or(true, |n| n > data.len()) {
       break;
     }
-    // AIFF.pm:223 `my ($tag, $len) = unpack('a4N', $buff)`.
-    let tag_bytes: [u8; 4] = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-    let len =
-      u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+    // AIFF.pm:223 `my ($tag, $len) = unpack('a4N', $buff)`. The
+    // `pos + 8 > data.len()` break above guarantees both 4-byte reads are in
+    // range, so `.get(..)` + `[u8; 4]` `try_into` always succeed; the `break`
+    // fallback reuses the same short-read exit (byte-identical).
+    let Some(tag_bytes) = data
+      .get(pos..pos + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    else {
+      break;
+    };
+    let Some(len) = data
+      .get(pos + 4..pos + 8)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+      .map(|a| u32::from_be_bytes(a) as usize)
+    else {
+      break;
+    };
     pos += 8; // AIFF.pm:222 `$pos += 8`.
     // AIFF.pm:227 `my $len2 = $len + ($len & 0x01)` — chunks padded to
     // an even number of bytes. Perl scalars are 64-bit; on a 32-bit
@@ -994,7 +1022,13 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
         )));
         break;
       }
-      let body: &[u8] = &data[pos..pos + len];
+      // `need = pos + len <= data.len()` (the guard just above breaks
+      // otherwise), so `.get(pos..pos + len)` is always `Some` here; the
+      // `break` fallback is unreachable and matches that short-read exit
+      // (byte-identical to the prior `&data[pos..pos + len]`).
+      let Some(body) = data.get(pos..pos + len) else {
+        break;
+      };
       // Dispatch by chunk:
       //   COMM  → process_binary_data(AIFF_COMMON, FORMAT=int16u)  → Common
       //   FVER  → process_binary_data(AIFF_FORMAT_VERS, FORMAT=int32u) → str
@@ -1121,17 +1155,43 @@ fn stage_comments(data: &[u8], events: &mut Vec<AiffEvent>) {
   if data.len() <= 2 {
     return;
   }
-  // AIFF.pm:162 `my $numComments = unpack('n', $$dataPt)`.
-  let num_comments = u16::from_be_bytes([data[0], data[1]]) as usize;
+  // AIFF.pm:162 `my $numComments = unpack('n', $$dataPt)`. `data.len() > 2`
+  // (guard above) ⇒ `first_chunk::<2>` is always `Some` (the `0` fallback is
+  // unreachable) — byte-identical to the prior `[data[0], data[1]]` read.
+  let num_comments = data
+    .first_chunk::<2>()
+    .copied()
+    .map_or(0, u16::from_be_bytes) as usize;
   let mut pos: usize = 2;
   for _ in 0..num_comments {
     // AIFF.pm:167 `last if $pos + 8 > $dirLen`.
     if pos + 8 > data.len() {
       break;
     }
-    let time = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    let marker_id = u16::from_be_bytes([data[pos + 4], data[pos + 5]]);
-    let size = u16::from_be_bytes([data[pos + 6], data[pos + 7]]) as usize;
+    // `pos + 8 <= data.len()` (guard above) ⇒ each `.get(..)` + `try_into`
+    // always succeeds; the `break` fallback is unreachable and reuses the same
+    // short-read exit (byte-identical to the prior fixed-offset reads).
+    let Some(time) = data
+      .get(pos..pos + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+      .map(u32::from_be_bytes)
+    else {
+      break;
+    };
+    let Some(marker_id) = data
+      .get(pos + 4..pos + 6)
+      .and_then(|s| <[u8; 2]>::try_from(s).ok())
+      .map(u16::from_be_bytes)
+    else {
+      break;
+    };
+    let Some(size) = data
+      .get(pos + 6..pos + 8)
+      .and_then(|s| <[u8; 2]>::try_from(s).ok())
+      .map(|a| u16::from_be_bytes(a) as usize)
+    else {
+      break;
+    };
     // AIFF.pm:169 `$et->HandleTag($tagTablePtr, 0, $time);`. ValueConv
     // is ConvertUnixTime (post-AIFF_EPOCH_OFFSET).
     let comment_time = convert_unix_time(i64::from(time) - AIFF_EPOCH_OFFSET);
@@ -1165,8 +1225,12 @@ fn stage_comments(data: &[u8], events: &mut Vec<AiffEvent>) {
       break;
     }
     // AIFF.pm:173-174 `my $val = substr($$dataPt, $pos, $size);
-    // $et->HandleTag($tagTablePtr, 2, $val)`.
-    let raw_bytes = &data[pos..pos + size];
+    // $et->HandleTag($tagTablePtr, 2, $val)`. `pos + size <= data.len()` (the
+    // guard just above breaks otherwise), so `.get(pos..pos + size)` is always
+    // `Some`; the `break` fallback is unreachable (byte-identical).
+    let Some(raw_bytes) = data.get(pos..pos + size) else {
+      break;
+    };
     // ValueConv = Decode(MacRoman).
     let comment = decode_macroman(raw_bytes);
     events.push(AiffEvent::Comment(Comment {
@@ -1287,7 +1351,12 @@ fn stage_format_version_time(body: &[u8]) -> Option<String> {
   if body.len() < 4 {
     return None;
   }
-  let raw = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+  // `body.len() >= 4` ⇒ `first_chunk::<4>` is always `Some` (the `0` fallback
+  // is unreachable) — byte-identical to the prior `[body[0]..body[3]]` read.
+  let raw = body
+    .first_chunk::<4>()
+    .copied()
+    .map_or(0, u32::from_be_bytes);
   // ValueConv: ConvertUnixTime(raw - AIFF_EPOCH_OFFSET).
   Some(convert_unix_time(i64::from(raw) - AIFF_EPOCH_OFFSET))
 }
@@ -1310,10 +1379,14 @@ fn stage_scalar(tag_str: &str, stripped: &[u8], events: &mut Vec<AiffEvent>) {
 /// Applied to non-SubDirectory, non-Binary chunks before HandleTag.
 fn strip_trailing_nuls(b: &[u8]) -> &[u8] {
   let mut end = b.len();
-  while end > 0 && b[end - 1] == 0 {
+  // `end > 0` (and `end <= b.len()` always) ⇒ `end - 1 < b.len()`, so
+  // `.get(end - 1)` is always `Some`; `.get(..end)` is likewise always `Some`
+  // (`end <= b.len()`). Both are byte-identical to the prior `b[end - 1]` /
+  // `&b[..end]` (the `unwrap_or(b)` fallback is unreachable).
+  while end > 0 && b.get(end - 1) == Some(&0) {
     end -= 1;
   }
-  &b[..end]
+  b.get(..end).unwrap_or(b)
 }
 
 /// Convert a runtime `&str` chunk tag into a `'static` reference that
@@ -1692,6 +1765,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

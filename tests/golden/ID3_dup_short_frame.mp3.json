@@ -1,0 +1,19 @@
+[{
+  "SourceFile": "ID3_dup_short_frame.mp3",
+  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:Warning": "Short COMM frame [x2]",
+  "File:FileType": "MP3",
+  "File:FileTypeExtension": "mp3",
+  "File:MIMEType": "audio/mpeg",
+  "File:ID3Size": 32,
+  "MPEG:MPEGAudioVersion": 1,
+  "MPEG:AudioLayer": 3,
+  "MPEG:AudioBitrate": "128 kbps",
+  "MPEG:SampleRate": 44100,
+  "MPEG:ChannelMode": "Stereo",
+  "MPEG:MSStereo": "Off",
+  "MPEG:IntensityStereo": "Off",
+  "MPEG:CopyrightFlag": false,
+  "MPEG:OriginalMedia": false,
+  "MPEG:Emphasis": "None"
+}]

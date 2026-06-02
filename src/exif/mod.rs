@@ -47,6 +47,14 @@
 //! MakerNotes. The SubDirectory-dispatch seam ([`SubDirKind::MakerNote`]) is
 //! designed so a MakerNotes port plugs in. See `docs/tracking.md`.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// the IFD walker (`walk_entry`, `walk_ifd`, the SubDirectory rebasers) is
+// heavily guarded (entry-offset / value-window bounds checks); every raw
+// index/slice below is converted to a checked `.get()` (or routed through the
+// `ifd::get_u16/get_u32/read_value` bounds-checked helpers), landing on the
+// same Step/Option recovery so the output stays byte-identical.
+#![deny(clippy::indexing_slicing)]
+
 pub mod ifd;
 pub mod makernotes;
 // `tables` / `gps` hold the const `%Exif::Main` / `%GPS::Main` tag-table
@@ -156,20 +164,30 @@ impl IfdName {
     buf[1] = b'F';
     buf[2] = b'D';
     // Decimal-render `n` (max `4294967295`, ten digits) after the `IFD`
-    // prefix.
+    // prefix. `digits.iter_mut()` (least-significant first) is panic-safe by
+    // construction — it visits at most 10 slots, so `ndigits` cannot exceed
+    // `digits.len()`; the loop stops at `value == 0`, identical to the
+    // index-write version.
     let mut digits = [0u8; 10];
     let mut value = n;
     let mut ndigits = 0usize;
-    loop {
-      digits[ndigits] = b'0' + (value % 10) as u8;
+    for slot in &mut digits {
+      *slot = b'0' + (value % 10) as u8;
       value /= 10;
       ndigits += 1;
       if value == 0 {
         break;
       }
     }
-    for i in 0..ndigits {
-      buf[3 + i] = digits[ndigits - 1 - i];
+    // Copy the `ndigits` digits MOST-significant first into `buf[3..]`. Both
+    // `digits.get(..ndigits)` (ndigits ≤ 10) and `buf.get_mut(3..3+ndigits)`
+    // (3+ndigits ≤ 13) are `Some` — the checked, byte-identical form of the
+    // `buf[3 + i] = digits[ndigits - 1 - i]` reverse copy (the unreachable
+    // `None` arm leaves `buf` zeroed, never taken).
+    if let (Some(src), Some(dst)) = (digits.get(..ndigits), buf.get_mut(3..3 + ndigits)) {
+      for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+        *d = *s;
+      }
     }
     Self {
       buf,
@@ -177,20 +195,23 @@ impl IfdName {
     }
   }
 
-  /// Wrap a `&'static str` literal (the fixed sub-IFD names).
+  /// Wrap a `&'static str` literal (the fixed sub-IFD names). The callers pass
+  /// only `"IFD0"` / `"ExifIFD"` / `"GPS"` / `"InteropIFD"` (≤ 10 bytes), which
+  /// fit the 13-byte buffer.
   #[must_use]
-  const fn literal(s: &str) -> Self {
+  fn literal(s: &str) -> Self {
     let bytes = s.as_bytes();
     let mut buf = [0u8; 13];
-    let mut i = 0;
-    while i < bytes.len() {
-      buf[i] = bytes[i];
-      i += 1;
+    // Copy `bytes` into the buffer prefix. `min(buf.len())` clamps the copy to
+    // the 13-byte capacity so `buf.get_mut(..n)` / `bytes.get(..n)` are both
+    // `Some` — the checked, panic-safe form of the `while i < bytes.len() {
+    // buf[i] = bytes[i] }` copy; for the ≤ 10-byte sub-IFD literals the clamp
+    // never trims, so the rendered name is byte-identical.
+    let n = bytes.len().min(buf.len());
+    if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
+      dst.copy_from_slice(src);
     }
-    Self {
-      buf,
-      len: bytes.len() as u8,
-    }
+    Self { buf, len: n as u8 }
   }
 
   /// The rendered name as a `&str`.
@@ -198,8 +219,12 @@ impl IfdName {
   #[inline]
   pub fn as_str(&self) -> &str {
     // SAFETY-free: `buf[..len]` is always ASCII (`IFD`, digits, or an
-    // ASCII literal), so it is valid UTF-8 by construction.
-    core::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("IFD?")
+    // ASCII literal), so it is valid UTF-8 by construction. `len` is set to
+    // `3+ndigits` / the clamped literal length — both ≤ 13 = `buf.len()` — so
+    // `buf.get(..len)` is `Some` (the `.unwrap_or(&self.buf)` fallback is
+    // unreachable): the checked, byte-identical form of `&self.buf[..len]`.
+    let bytes = self.buf.get(..self.len as usize).unwrap_or(&self.buf);
+    core::str::from_utf8(bytes).unwrap_or("IFD?")
   }
 }
 
@@ -767,11 +792,10 @@ impl<'a> MakerNote<'a> {
   #[inline]
   pub fn body(&self) -> &'a [u8] {
     let off = self.meta.detected().body_offset() as usize;
-    if off >= self.bytes.len() {
-      &[]
-    } else {
-      &self.bytes[off..]
-    }
+    // `bytes.get(off..)` folds the `off >= len` guard into the slice: it is
+    // `None` (→ `&[]`) for an out-of-range `off` and otherwise the suffix —
+    // byte-identical to the explicit `if off >= len { &[] } else { &bytes[off..] }`.
+    self.bytes.get(off..).unwrap_or(&[])
   }
 
   /// The Phase-2 cached vendor emissions in `-j` (print-conv) mode —
@@ -848,6 +872,11 @@ pub struct ExifMeta<'a> {
   /// `$et->Warn(...)` messages raised by the IFD-bounds checks, in emission
   /// order. The engine surfaces these as `ExifTool:Warning` tags.
   warnings: Vec<String>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings) (Phase C). `2` ⇒ `[Minor]` (the
+  /// excessive-count warning), `0` ⇒ normal. The prefix is applied by
+  /// [`Diagnose`](crate::diagnostics::Diagnose) → `run_diagnostics`.
+  warnings_ignorable: Vec<u8>,
   /// The TIFF header byte order (`ExifTool.pm:8628`). The engine emits it as
   /// `File:ExifByteOrder` (`ExifTool.pm:8691`). `None` only for a JPEG
   /// container accepted without a parsed `APP1` Exif TIFF block (see the type
@@ -970,6 +999,7 @@ impl<'a> ExifMeta<'a> {
   pub(crate) fn from_jpeg_parts(
     entries: Vec<ExifEntry>,
     warnings: Vec<String>,
+    warnings_ignorable: Vec<u8>,
     byte_order: Option<ByteOrder>,
     maker_note: Option<MakerNote<'a>>,
   ) -> Self {
@@ -981,6 +1011,7 @@ impl<'a> ExifMeta<'a> {
     ExifMeta {
       entries,
       warnings,
+      warnings_ignorable,
       byte_order,
       maker_note,
       multi_page_count: None,
@@ -1004,6 +1035,7 @@ impl<'a> ExifMeta<'a> {
   ) -> (
     Vec<ExifEntry>,
     Vec<String>,
+    Vec<u8>,
     Option<ByteOrder>,
     Option<MakerNote<'a>>,
   ) {
@@ -1014,6 +1046,7 @@ impl<'a> ExifMeta<'a> {
     (
       self.entries,
       self.warnings,
+      self.warnings_ignorable,
       self.byte_order,
       self.maker_note,
     )
@@ -1222,8 +1255,10 @@ fn parse_tiff_with_base<'a>(
   if data.len() < 8 {
     return None;
   }
-  // `my $byteOrder = substr($$dataPt,0,2); SetByteOrder(...) or return 0`.
-  let order = ByteOrder::from_marker(&data[..2])?;
+  // `my $byteOrder = substr($$dataPt,0,2); SetByteOrder(...) or return 0`. The
+  // `len < 8` guard above makes `data.get(..2)` `Some` — the checked,
+  // byte-identical form of `&data[..2]` (the `?` short-circuit is unreachable).
+  let order = ByteOrder::from_marker(data.get(..2)?)?;
   // `my $identifier = Get16u($dataPt, 2)` — the TIFF magic in `order`: classic
   // TIFF is 0x2a (42), BigTIFF is 0x2b (43). Classic TIFF stores the IFD0
   // pointer as a 32-bit offset at byte 4 and walks 16-bit entry counts /
@@ -1257,6 +1292,7 @@ fn parse_tiff_with_base<'a>(
     base,
     entries: Vec::new(),
     warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
     maker_note: None,
     captured_make: None,
     captured_model: None,
@@ -1296,6 +1332,7 @@ fn parse_tiff_with_base<'a>(
   Some(ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
+    warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
     multi_page_count,
@@ -1371,7 +1408,9 @@ fn parse_tiff_with_base_shared<'a>(
   if data.len() < 8 {
     return (None, Vec::new());
   }
-  let Some(order) = ByteOrder::from_marker(&data[..2]) else {
+  // `data.get(..2)` is `Some` under the `len < 8` guard — the checked,
+  // byte-identical form of `&data[..2]`.
+  let Some(order) = data.get(..2).and_then(ByteOrder::from_marker) else {
     return (None, Vec::new());
   };
   let Some(magic) = get_u16(data, 2, order) else {
@@ -1394,6 +1433,7 @@ fn parse_tiff_with_base_shared<'a>(
     base,
     entries: Vec::new(),
     warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
     maker_note: None,
     captured_make: None,
     captured_model: None,
@@ -1418,6 +1458,7 @@ fn parse_tiff_with_base_shared<'a>(
   let meta = ExifMeta {
     entries: w.entries,
     warnings: w.warnings,
+    warnings_ignorable: w.warnings_ignorable,
     byte_order: Some(order),
     maker_note: w.maker_note,
     // Embedded block (PNG `eXIf`): never the standalone-TIFF dispatch, so no
@@ -1500,6 +1541,12 @@ struct Walker<'a, 'g> {
   /// (`Bad … directory`, `Suspicious … offset`, `Error reading value …`);
   /// the full ExifTool warning corpus is a Phase-2 forward-item.
   warnings: Vec<String>,
+  /// Per-warning `sub Warn` ignorable level, index-aligned with
+  /// [`warnings`](Self::warnings) (Phase C). `2` for the `[Minor]` excessive-
+  /// count warning when the count is in `(100000, 2000000]`
+  /// (`$minor = $count > 2000000 ? 0 : 2`, Exif.pm:6767); `0` otherwise. The
+  /// `[Minor] ` prefix is applied by `run_diagnostics`, not stored.
+  warnings_ignorable: Vec<u8>,
   /// The captured MakerNote (0x927c) blob, if seen.
   maker_note: Option<MakerNote<'a>>,
   /// IFD0's `Make` tag value (`Exif.pm:585`) — captured at emit time so
@@ -1589,6 +1636,22 @@ struct Walker<'a, 'g> {
 }
 
 impl Walker<'_, '_> {
+  /// Record a NORMAL `$et->Warn(msg)` (ignorable `0`), keeping
+  /// [`warnings`](Self::warnings) and [`warnings_ignorable`](Self::warnings_ignorable)
+  /// index-aligned (the single push funnel for the structural warnings).
+  fn warn(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(0);
+  }
+
+  /// Record a MINOR-WITH-BEHAVIOURAL-CHANGE `$et->Warn(msg, 2)` (ignorable
+  /// `2` ⇒ `[Minor]`, applied by `run_diagnostics`). Used for the
+  /// excessive-count warning at the `$minor == 2` threshold (Exif.pm:6767).
+  fn warn_minor_behavioral(&mut self, message: String) {
+    self.warnings.push(message);
+    self.warnings_ignorable.push(2);
+  }
+
   /// Walk an IFD and then follow its next-IFD pointer chain (IFD0 → IFD1 →
   /// …) — faithful to `ProcessExif`'s `$$dirInfo{Multi}` trailing-IFD scan
   /// (`Exif.pm:7202-7228`). `Multi` is set for IFD0 (`Exif.pm:6339`).
@@ -1768,9 +1831,7 @@ impl Walker<'_, '_> {
     // 64-bit these checks never trip for an in-range value, so behavior is
     // unchanged there.
     if ifd_start.checked_add(2).is_none_or(|end| end > data.len()) {
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
     let num_entries = get_u16(data, ifd_start, self.order)? as usize;
@@ -1782,9 +1843,7 @@ impl Walker<'_, '_> {
       .and_then(|body| body.checked_add(2))
       .and_then(|dir_size| ifd_start.checked_add(dir_size))
     else {
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     };
     // `$bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) { unless
@@ -1804,9 +1863,7 @@ impl Walker<'_, '_> {
       // (vendor parsing is deferred — see [`SubDirKind::MakerNote`]), so
       // every directory kind it handles takes the abort branch.
       // `$et->Warn("Bad $dir directory")` — Exif.pm:6381.
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
 
@@ -1823,7 +1880,7 @@ impl Walker<'_, '_> {
     // above, so the subtraction cannot underflow.
     let bytes_from_end = data.len() - dir_end;
     if bytes_from_end == 1 || bytes_from_end == 3 {
-      self.warnings.push(std::format!(
+      self.warn(std::format!(
         "Illegal {} directory size ({num_entries} entries)",
         kind.as_str()
       ));
@@ -2039,7 +2096,7 @@ impl Walker<'_, '_> {
       // code is silent padding; any other bad code warns.
       if format_code != 0 {
         let dir = kind.as_str();
-        self.warnings.push(std::format!(
+        self.warn(std::format!(
           "Bad format ({format_code}) for {dir} entry {index}"
         ));
       }
@@ -2084,9 +2141,7 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
           None => std::format!("tag 0x{tag_id:04x}"),
         };
-        self
-          .warnings
-          .push(std::format!("Invalid size ({size}) for {dir} {tag}"));
+        self.warn(std::format!("Invalid size ({size}) for {dir} {tag}"));
         return Step::Skip; // `next` — skip this entry, continue the IFD.
       }
       let off = match get_u32(data, entry + 8, order) {
@@ -2158,7 +2213,7 @@ impl Walker<'_, '_> {
             Some(name) => std::format!(" {name}"),
             None => String::new(),
           };
-          self.warnings.push(std::format!(
+          self.warn(std::format!(
             "Error reading value for {dir} entry {index}, ID 0x{tag_id:04x}{tag}"
           ));
           // `return 0 unless $inMakerNotes or $htmlDump or $truncOK`
@@ -2179,7 +2234,7 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("Suspicious {dir} offset for {name}"),
           None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
         };
-        self.warnings.push(warning);
+        self.warn(warning);
         // `next unless $verbose` (Exif.pm:6675) — skip this entry, CONTINUE
         // the IFD: [`Step::Skip`].
         return Step::Skip;
@@ -2223,7 +2278,7 @@ impl Walker<'_, '_> {
         let dir = kind.as_str();
         let fmt = format.name();
         let name = sub.tag_name();
-        self.warnings.push(std::format!(
+        self.warn(std::format!(
           "Wrong format ({fmt}) for {dir} 0x{tag_id:04x} {name}"
         ));
         // `next unless $verbose` (Exif.pm:6754) — skip the entry, the sub-IFD
@@ -2312,22 +2367,28 @@ impl Walker<'_, '_> {
         // faithfully for when 0x012d is added.)
         let transfer_function_carveout = known == Some("TransferFunction") && count == 196_608;
         if !transfer_function_carveout {
-          // `$et->Warn("Ignoring $dirName $tagName with excessive count")`
-          // (Exif.pm:6767), with `$tagName = $tagInfo ? Name : 'tag 0x%.4x'`.
-          // In the default (non-HtmlDump) path `Warn` returns true and Perl
-          // does `next` (Exif.pm:6768) — SKIP this entry, do NOT decode.
-          // (`$warned` is set only in the HtmlDump branch, which this port
-          // does not model, so it never reaches guard (b) for the same entry;
-          // the `$count > 2000000 ? 0 : 2` minor-level only affects the
-          // suppressed-by-options case, not the warning text or the skip.)
+          // `my $minor = $count > 2000000 ? 0 : 2;`
+          // `$et->Warn("Ignoring $dirName $tagName with excessive count", $minor)`
+          // (Exif.pm:6766-6767), with `$tagName = $tagInfo ? Name : 'tag
+          // 0x%.4x'`. In the default (non-HtmlDump) path `Warn` returns true
+          // and Perl does `next` (Exif.pm:6768) — SKIP this entry, do NOT
+          // decode. `$minor == 2` means `sub Warn` PREFIXES the message
+          // `[Minor] ` even in normal mode (the `'2'` arm of ExifTool.pm:5630
+          // — NOT only the `IgnoreMinorErrors`-suppressed case; oracle-verified
+          // against `perl exiftool 13.59`: a known SHORT tag with count 150000
+          // emits `"[Minor] Ignoring IFD0 Orientation with excessive count"`).
+          // The `[Minor] ` prefix is applied centrally by `run_diagnostics`
+          // from the ignorable level, not baked in here. `$warned` is set only
+          // in the HtmlDump branch, which this port does not model.
           let dir = kind.as_str();
-          match known {
-            Some(name) => self
-              .warnings
-              .push(std::format!("Ignoring {dir} {name} with excessive count")),
-            None => self.warnings.push(std::format!(
-              "Ignoring {dir} tag 0x{tag_id:04x} with excessive count"
-            )),
+          let msg = match known {
+            Some(name) => std::format!("Ignoring {dir} {name} with excessive count"),
+            None => std::format!("Ignoring {dir} tag 0x{tag_id:04x} with excessive count"),
+          };
+          if count > 2_000_000 {
+            self.warn(msg); // `$minor == 0` — no prefix
+          } else {
+            self.warn_minor_behavioral(msg); // `$minor == 2` ⇒ `[Minor] `
           }
           return Step::Skip; // `next` (Exif.pm:6768)
         }
@@ -2434,9 +2495,7 @@ impl Walker<'_, '_> {
         // `walk_one_ifd` raises for an offset it cannot read. Route the
         // negative pointer through that path instead of walking it.
         let Ok(sub_offset) = usize::try_from(sub_offset) else {
-          self
-            .warnings
-            .push(std::format!("Bad {} directory", kind.as_str()));
+          self.warn(std::format!("Bad {} directory", kind.as_str()));
           return;
         };
         // `$offset >= 8` is not enforced for sub-IFD `Start => '$val'`, but
@@ -3107,10 +3166,30 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
   /// EXIF arm ran. EXIF raises no `$et->Error` (a rejected block returns
   /// `Ok(None)` ⇒ the engine emits its own `ExifTool:Error`).
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    use crate::diagnostics::Diagnostic;
+    // Carry each warning's `sub Warn` ignorable level (index-aligned) so the
+    // `[Minor] ` prefix on the excessive-count warning comes from
+    // `run_diagnostics`, not a baked literal. INVARIANT: every warning is
+    // recorded through `warn()` / `warn_minor_behavioral()`, which append to
+    // BOTH vectors in lock-step, so `warnings_ignorable[i]` is the level of
+    // `warnings[i]`. A bare `warnings.push` would desync them and shift a
+    // `[Minor]` flag onto the wrong message (Phase-C regression fix).
+    debug_assert_eq!(
+      self.warnings().len(),
+      self.warnings_ignorable.len(),
+      "warnings/warnings_ignorable must stay index-aligned",
+    );
     self
       .warnings()
       .iter()
-      .map(crate::diagnostics::Diagnostic::warn)
+      .enumerate()
+      .map(
+        |(i, w)| match self.warnings_ignorable.get(i).copied().unwrap_or(0) {
+          1 => Diagnostic::warn_minor(w.as_str()),
+          2 => Diagnostic::warn_minor_behavioral(w.as_str()),
+          _ => Diagnostic::warn(w.as_str()),
+        },
+      )
       .collect()
   }
 }
@@ -3513,8 +3592,10 @@ fn emit_exif_value<S: ExifSink>(
       // strips ONLY TRAILING NULs — an INTERIOR NUL keeps the tail (e.g.
       // `b"02\x0010"` → `"02\x0010"`, not `"02"`). Same under -j and -n.
       if let RawValue::Bytes(b) = raw {
+        // `end` is `rposition + 1` (≤ `b.len()`) or 0, so `b.get(..end)` is
+        // always `Some` — the checked, byte-identical form of `&b[..end]`.
         let end = b.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
-        let s = String::from_utf8_lossy(&b[..end]);
+        let s = String::from_utf8_lossy(b.get(..end).unwrap_or(b.as_slice()));
         out.write_str(group, name, &s)?;
         return Ok(());
       }
@@ -3793,6 +3874,11 @@ fn emit_gps_value<S: ExifSink>(
 /// logic to `h264::escape_json_is_number`.
 #[cfg(feature = "alloc")]
 fn escape_json_is_number(s: &str) -> bool {
+  // Every `b[i]` read below was gated by `i < b.len() && …`; `b.get(i)` folds
+  // that bound into the access (`b.get(i) == Some(&c)` ⟺ `i < len && b[i] == c`;
+  // `b.get(i).is_some_and(pred)` ⟺ `i < len && pred(b[i])`), and `b.get(int_start)`
+  // is dominated by the `int_len > 0` proof — all byte-identical to the index
+  // form, panic-safe by construction.
   let b = s.as_bytes();
   let mut i = 0usize;
   // optional leading `-`
@@ -3802,22 +3888,22 @@ fn escape_json_is_number(s: &str) -> bool {
   // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
   // leading zero).
   let int_start = i;
-  while i < b.len() && b[i].is_ascii_digit() {
+  while b.get(i).is_some_and(u8::is_ascii_digit) {
     i += 1;
   }
   let int_len = i - int_start;
   if int_len == 0 {
     return false;
   }
-  if int_len > 1 && (int_len > 15 || b[int_start] == b'0') {
+  if int_len > 1 && (int_len > 15 || b.get(int_start) == Some(&b'0')) {
     // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`).
     return false;
   }
   // optional fraction `\.\d{1,16}`.
-  if i < b.len() && b[i] == b'.' {
+  if b.get(i) == Some(&b'.') {
     i += 1;
     let frac_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     let frac_len = i - frac_start;
@@ -3826,13 +3912,13 @@ fn escape_json_is_number(s: &str) -> bool {
     }
   }
   // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`).
-  if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+  if matches!(b.get(i), Some(&b'e' | &b'E')) {
     i += 1;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+    if matches!(b.get(i), Some(&b'+' | &b'-')) {
       i += 1;
     }
     let exp_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
       i += 1;
     }
     let exp_len = i - exp_start;
@@ -3933,42 +4019,45 @@ fn emit_raw<S: ExifSink>(
   raw: &RawValue,
   out: &mut S,
 ) -> Result<(), core::convert::Infallible> {
+  // Each singleton arm matches a one-element slice (`[v]`) on the Vec's
+  // `as_slice()` rather than `len()==1` + `vals[0]`: the binding `v` IS the sole
+  // element, so the read is checked by the pattern and stays byte-identical.
   match raw {
     RawValue::U64(vals) => {
-      if vals.len() == 1 {
+      if let [v] = vals.as_slice() {
         // A scalar integer through the `EscapeJSON` number gate: an Exif
         // `int8u`/`int16u`/`int32u` (≤32-bit) is always in-gate ⇒ a bare JSON
         // number, but routing it keeps every numeric path uniform and quotes a
         // pathological `>15`-digit value exactly as bundled would.
-        emit_gated_number(group, name, &std::format!("{}", vals[0]), out)
+        emit_gated_number(group, name, &std::format!("{v}"), out)
       } else {
         // A multi-element array space-joins (out of gate ⇒ a quoted string).
         out.write_str(group, name, &join_nums(vals))
       }
     }
     RawValue::I64(vals) => {
-      if vals.len() == 1 {
-        emit_gated_number(group, name, &std::format!("{}", vals[0]), out)
+      if let [v] = vals.as_slice() {
+        emit_gated_number(group, name, &std::format!("{v}"), out)
       } else {
         out.write_str(group, name, &join_nums(vals))
       }
     }
     RawValue::F64(vals) => {
-      if vals.len() == 1 {
-        emit_gated_f64(group, name, vals[0], out)
+      if let [v] = vals.as_slice() {
+        emit_gated_f64(group, name, *v, out)
       } else {
         out.write_str(group, name, &join_floats(vals))
       }
     }
     RawValue::Rational(rs) => {
-      if rs.len() == 1 {
+      if let [r] = rs.as_slice() {
         // A single rational — emit its ExifTool-rounded scalar
         // (`exiftool_val_str`) through the `EscapeJSON` number gate: a
         // non-zero-denominator quotient is always in-gate ⇒ a bare JSON number
         // (`IFD0:XResolution` → `300`), while a `0`-denominator yields the word
         // `inf`/`undef` ⇒ a quoted string. (Before R18 this used a bare
         // `write_str`, emitting an in-gate scalar rational as a JSON string.)
-        emit_gated_number(group, name, &rs[0].exiftool_val_str(), out)
+        emit_gated_number(group, name, &r.exiftool_val_str(), out)
       } else {
         let parts: Vec<String> = rs
           .iter()
@@ -4003,9 +4092,11 @@ fn emit_int_label<S: ExifSink>(
   hex: bool,
 ) -> Result<(), core::convert::Infallible> {
   // The integer for the PrintConv lookup — works for U64 or I64 singletons.
+  // The `if let [n] = v.as_slice()` guard binds the sole element (checked by the
+  // slice pattern), byte-identical to `v.len() == 1` + `v[0]`.
   let code: Option<i64> = match raw {
-    RawValue::U64(v) if v.len() == 1 => i64::try_from(v[0]).ok(),
-    RawValue::I64(v) if v.len() == 1 => Some(v[0]),
+    RawValue::U64(v) if let [n] = v.as_slice() => i64::try_from(*n).ok(),
+    RawValue::I64(v) if let [n] = v.as_slice() => Some(*n),
     _ => None,
   };
   match code {
@@ -4105,17 +4196,23 @@ fn print_lens_info(rs: &[crate::value::Rational]) -> Option<String> {
     .collect();
   // `$val = $vals[0]; $val .= "-$vals[1]" if $vals[1] and $vals[1] ne
   // $vals[0]; $val .= "mm f/$vals[2]"; $val .= "-$vals[3]" if $vals[3] and
-  // $vals[3] ne $vals[2];`
-  let mut out = vals[0].clone();
-  if vals[1] != "0" && vals[1] != vals[0] {
+  // $vals[3] ne $vals[2];`. `vals` has exactly 4 entries (one per the 4
+  // rationals the `rs.len() != 4` guard required), so the `[v0, v1, v2, v3]`
+  // slice pattern is total — the checked, byte-identical form of the
+  // `vals[0..3]` index reads (the unreachable `_` arm returns `None`).
+  let [v0, v1, v2, v3] = vals.as_slice() else {
+    return None;
+  };
+  let mut out = v0.clone();
+  if v1 != "0" && v1 != v0 {
     out.push('-');
-    out.push_str(&vals[1]);
+    out.push_str(v1);
   }
   out.push_str("mm f/");
-  out.push_str(&vals[2]);
-  if vals[3] != "0" && vals[3] != vals[2] {
+  out.push_str(v2);
+  if v3 != "0" && v3 != v2 {
     out.push('-');
-    out.push_str(&vals[3]);
+    out.push_str(v3);
   }
   Some(out)
 }
@@ -4160,6 +4257,11 @@ fn join_floats(vals: &[f64]) -> String {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test TIFF/IFD builders index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
@@ -5188,6 +5290,7 @@ mod tests {
       base: 0,
       entries: Vec::new(),
       warnings: Vec::new(),
+      warnings_ignorable: Vec::new(),
       maker_note: None,
       captured_make: None,
       captured_model: None,
@@ -5251,6 +5354,42 @@ mod tests {
       dir_end, None,
       "dir-end arithmetic must detect usize overflow"
     );
+  }
+
+  /// Regression (Golden-v2 Phase C): every EXIF warning push keeps `warnings`
+  /// and `warnings_ignorable` index-aligned. The "Bad <dir> directory" abort
+  /// (Exif.pm:6383) is a NORMAL warning — `$inMakerNotes` is structurally
+  /// always 0 in this walker (MakerNote IFDs are never recursed), so its
+  /// ignorable level is 0; a later excessive-count warning (Exif.pm:6767) is
+  /// `[Minor]` (ignorable 2). `diagnostics()` pairs the two vectors BY INDEX,
+  /// so if the normal push skipped `warnings_ignorable` the `2` would shift
+  /// onto the "Bad directory" message and the excessive-count warning would
+  /// render unprefixed. Assert the levels stay aligned.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn warning_ignorable_levels_stay_index_aligned() {
+    let data = minimal_tiff_with_make();
+    let mut w = test_walker(&data);
+    // A real bare-push site: an overflowing `ifd_start` aborts with
+    // "Bad IFD0 directory" — a NORMAL (ignorable 0) warning.
+    let next = w.walk_one_ifd_body(usize::MAX, IfdKind::Ifd0);
+    assert_eq!(next, None);
+    // A later minor-with-behavioural-change warning (the excessive-count arm).
+    w.warn_minor_behavioral(String::from(
+      "Ignoring IFD0 Orientation with excessive count",
+    ));
+    assert_eq!(
+      w.warnings,
+      std::vec![
+        String::from("Bad IFD0 directory"),
+        String::from("Ignoring IFD0 Orientation with excessive count"),
+      ],
+    );
+    // The crux: ignorable levels are index-aligned — `0` for the normal
+    // Bad-directory warning, `2` for the minor excessive-count warning. Before
+    // the fix the normal push skipped this vector, yielding `[2]` and shifting
+    // the `[Minor]` prefix onto the wrong message.
+    assert_eq!(w.warnings_ignorable, std::vec![0u8, 2u8]);
   }
 
   /// CLASS SWEEP — the low-level byte readers (`get_u16`/`get_u32`/`get_u64`

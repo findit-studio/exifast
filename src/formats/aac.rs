@@ -13,6 +13,10 @@
 //! `perl exiftool`. It also implements [`crate::metadata::Project`] for the
 //! normalized cross-format domain layer.
 
+// Golden-v2 Contract 3c (Phase C, slice w2a): panic-safety by construction —
+// every raw index/slice is converted to a checked `.get()` form below.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   bitstream::{BitOrder, process_bit_stream},
   format_parser::{FormatParser, parser_sealed},
@@ -220,7 +224,10 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   if data.len() < 7 {
     return None; // $raf->Read($buff,7)==7 or return 0  (AAC.pm:99)
   }
-  let buff = &data[..7];
+  // The `data.len() < 7` guard above proves the 7-byte prefix exists, so the
+  // `get(..7)? + try_into` always succeeds (byte-identical); the fixed-size
+  // `[u8; 7]` makes the constant indexing below in-bounds by construction.
+  let buff: [u8; 7] = data.get(..7)?.try_into().ok()?;
   if buff[0] != 0xff || (buff[1] != 0xf0 && buff[1] != 0xf1) {
     return None; // unless $buff =~ /^\xff[\xf0\xf1]/  (AAC.pm:100)
   }
@@ -253,7 +260,7 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // print_conv_enabled=false: we want the post-ValueConv raw scalars —
   // PrintConv is applied at sink time per Meta's design.
   process_bit_stream(
-    buff,
+    &buff,
     BitOrder::Mm,
     AAC_BIT_KEYS,
     &AAC_MAIN,
@@ -309,7 +316,8 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
   if len <= 8 || data.len() < 7 + (len - 7) {
     return None;
   }
-  let frame = &data[7..7 + (len - 7)]; // $buff (re-read), length == $len-7
+  // The `data.len() < 7 + (len - 7)` guard above proves this range exists.
+  let frame = data.get(7..7 + (len - 7))?; // $buff (re-read), length == $len-7
   let no_crc = (t0 & 0x0001_0000) != 0; // my $noCRC = ($t[0] & 0x00010000)  (AAC.pm:114)
   let blocks = (t2 & 0x03) as usize; // my $blocks = ($t[2] & 0x03)  (AAC.pm:115)
   let mut pos = 0usize; // my $pos = 0  (AAC.pm:116)
@@ -319,7 +327,8 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
   if pos + 2 > frame.len() {
     return None; // last if $pos + 2 > length($buff)  (AAC.pm:118)
   }
-  let tmp = u16::from_be_bytes([frame[pos], frame[pos + 1]]); // unpack "x${pos}n" (AAC.pm:119)
+  // The `pos + 2 > frame.len()` guard above proves these two bytes exist.
+  let tmp = u16::from_be_bytes(frame.get(pos..pos + 2)?.try_into().ok()?); // unpack "x${pos}n" (AAC.pm:119)
   let id = tmp >> 13; // my $id = $tmp >> 13  (AAC.pm:120)
   if id != 6 {
     return None; // AAC.pm:122 — not a filler element
@@ -337,11 +346,14 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
   if pos + cnt > frame.len() {
     return None; // AAC.pm:129 condition false
   }
-  let dat = &frame[pos..pos + cnt]; // my $dat = substr($buff,$pos,$cnt)  (AAC.pm:130)
+  // The `pos + cnt > frame.len()` guard above proves this range exists.
+  let dat = frame.get(pos..pos + cnt)?; // my $dat = substr($buff,$pos,$cnt)  (AAC.pm:130)
   // $dat =~ s/^\0+// ; $dat =~ s/\0+$//  (AAC.pm:131-132)
   let s = dat.iter().position(|&b| b != 0).unwrap_or(dat.len());
   let e = dat.iter().rposition(|&b| b != 0).map_or(s, |i| i + 1);
-  let trimmed = &dat[s..e];
+  // `s <= e <= dat.len()` by construction (position/rposition bounds), so
+  // this sub-slice always exists (byte-identical to the raw `dat[s..e]`).
+  let trimmed = dat.get(s..e)?;
   if trimmed.is_empty() {
     return None;
   }
@@ -357,7 +369,9 @@ fn encoder_from_filler(data: &[u8], t0: u32, t2: u8, len: usize) -> Option<&str>
   let frame_offset = trimmed.as_ptr() as usize - frame.as_ptr() as usize;
   let abs_start = frame_start + frame_offset;
   let abs_end = abs_start + trimmed.len();
-  core::str::from_utf8(&data[abs_start..abs_end]).ok()
+  // `abs_start..abs_end` indexes the same bytes as `trimmed` (a sub-slice of
+  // `data`), so the range is in-bounds by construction (byte-identical).
+  core::str::from_utf8(data.get(abs_start..abs_end)?).ok()
 }
 
 // ===========================================================================
@@ -485,6 +499,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2a); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   #[test]

@@ -13,6 +13,12 @@
 //! ValueConv conversions happen LATER, at serialize time, in
 //! [`crate::exif::tables`].
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is converted to a checked `.get()` form. Each
+// `read_value` window read is dominated by the preceding `count`/`size`
+// shorten guards, so the `.get()` fallback is the unreachable no-panic value.
+#![deny(clippy::indexing_slicing)]
+
 use core::convert::TryInto;
 use std::vec::Vec;
 
@@ -42,12 +48,14 @@ impl ByteOrder {
   #[must_use]
   #[inline]
   pub const fn from_marker(marker: &[u8]) -> Option<Self> {
-    if marker.len() < 2 {
-      return None;
-    }
-    match (marker[0], marker[1]) {
-      (b'I', b'I') => Some(ByteOrder::Little),
-      (b'M', b'M') => Some(ByteOrder::Big),
+    // A leading-two-byte slice pattern is the checked equivalent of the
+    // `marker.len() < 2` guard + `(marker[0], marker[1])` index pair: it
+    // matches only when ≥ 2 bytes are present, so a short marker falls to the
+    // `_` arm (`None`) exactly as the explicit length guard did. `const`-fn
+    // compatible (no `<[u8]>::get`, which is not yet const).
+    match marker {
+      [b'I', b'I', ..] => Some(ByteOrder::Little),
+      [b'M', b'M', ..] => Some(ByteOrder::Big),
       _ => None,
     }
   }
@@ -484,13 +492,18 @@ pub fn read_value(
     return None;
   }
 
+  // `count` is now `count.min(window.len() / len)` with `count >= 1`, so
+  // `count * len <= window.len()`: every `window` access below is dominated by
+  // this shorten and the checked `.get(..)?` recovers the same slice (its
+  // `None` arm is unreachable). For the 1-byte string/undef formats `len == 1`,
+  // so `count <= window.len()`.
   Some(match format {
     // ---- string types (no readValueProc — ExifTool.pm:6296-6302) ----------
     Format::Ascii => {
       // `substr` then `s/\0.*//s` — trim at the FIRST NUL.
-      let raw = &window[..count];
+      let raw = window.get(..count)?;
       let trimmed = match raw.iter().position(|&b| b == 0) {
-        Some(nul) => &raw[..nul],
+        Some(nul) => raw.get(..nul).unwrap_or(raw),
         None => raw,
       };
       // ExifTool's `string` is Latin-1-ish bytes; for byte-equivalence with
@@ -500,9 +513,9 @@ pub fn read_value(
     }
     Format::Utf8 => {
       // Exif 3.0 `utf8` — decoded as UTF-8 (`Exif.pm:6786` `Decode(.., 'UTF8')`).
-      let raw = &window[..count];
+      let raw = window.get(..count)?;
       let trimmed = match raw.iter().position(|&b| b == 0) {
-        Some(nul) => &raw[..nul],
+        Some(nul) => raw.get(..nul).unwrap_or(raw),
         None => raw,
       };
       RawValue::Text(lossy_string(trimmed))
@@ -511,11 +524,19 @@ pub fn read_value(
       // `undef`/`binary` — raw bytes, NOT NUL-trimmed. (`Unicode`/`Complex`
       // are unreachable here: the IFD walker rejects codes 14/15 as `Bad
       // format` before `read_value`; the arm is folded in only for the match.)
-      RawValue::Bytes(window[..count * len].to_vec())
+      RawValue::Bytes(window.get(..count * len)?.to_vec())
     }
     // ---- integer types ----------------------------------------------------
-    Format::Int8u => RawValue::U64((0..count).map(|i| u64::from(window[i])).collect()),
-    Format::Int8s => RawValue::I64((0..count).map(|i| i64::from(window[i] as i8)).collect()),
+    Format::Int8u => RawValue::U64(
+      (0..count)
+        .map(|i| u64::from(window.get(i).copied().unwrap_or(0)))
+        .collect(),
+    ),
+    Format::Int8s => RawValue::I64(
+      (0..count)
+        .map(|i| i64::from(window.get(i).copied().unwrap_or(0) as i8))
+        .collect(),
+    ),
     Format::Int16u => RawValue::U64(
       (0..count)
         .map(|i| u64::from(get_u16(window, i * 2, order).unwrap_or(0)))
@@ -613,6 +634,11 @@ fn lossy_string(raw: &[u8]) -> std::string::String {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

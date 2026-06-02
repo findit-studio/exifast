@@ -53,6 +53,8 @@
 //! Per `exifast-api-conventions`: every field is private; every accessor
 //! is `const fn` where possible.
 
+#![deny(clippy::indexing_slicing)]
+
 use super::vendor::Vendor;
 use crate::exif::ifd::ByteOrder;
 
@@ -414,6 +416,11 @@ impl DetectedMakerNote {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

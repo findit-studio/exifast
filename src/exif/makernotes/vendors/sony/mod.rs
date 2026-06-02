@@ -66,6 +66,8 @@
 //! `#[non_exhaustive]` so a future Phase 3-bis can add fields without a
 //! breaking change.
 
+#![deny(clippy::indexing_slicing)]
+
 pub mod amount_lens_types;
 pub mod body;
 pub mod lens_types;
@@ -434,9 +436,13 @@ pub fn parse_in_tiff(
 /// blobs to the Main walker.
 #[must_use]
 pub fn routes_to_main(blob: &[u8], make: Option<&str>, model: Option<&str>) -> bool {
-  // MakerNoteSony — the offset-12 prefixed group (`:1036`).
-  let is_tf1 =
-    blob.len() >= 11 && &blob[..2] == b"\x00\x00" && &blob[2..10] == b"SONY PIC" && blob[10] == 0;
+  // MakerNoteSony — the offset-12 prefixed group (`:1036`). The
+  // `blob.len() >= 11` guard makes each `.get(..)` below `Some`; the checked
+  // forms preserve the exact short-circuit boolean — byte-identical.
+  let is_tf1 = blob.len() >= 11
+    && blob.get(..2) == Some(b"\x00\x00".as_slice())
+    && blob.get(2..10) == Some(b"SONY PIC".as_slice())
+    && blob.get(10) == Some(&0);
   if blob.starts_with(b"SONY DSC")
     || blob.starts_with(b"SONY CAM")
     || blob.starts_with(b"SONY MOBILE")
@@ -670,6 +676,11 @@ fn def_format(entry: &SonyEntry) -> &'static str {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

@@ -9,6 +9,8 @@
 //! are reproduced key-for-key; the rendered label text is byte-identical to
 //! what bundled emits.
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::RawValue;
 use crate::value::{TagValue, format_g};
 use smol_str::SmolStr;
@@ -1296,7 +1298,11 @@ fn baby_age(raw: &RawValue, print_conv: bool) -> TagValue {
     RawValue::Text(s) => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-      core::str::from_utf8(&b[..end]).unwrap_or("").to_string()
+      // `end <= b.len()`, so `.get(..end)` is `Some` — byte-identical.
+      b.get(..end)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .unwrap_or("")
+        .to_string()
     }
     _ => return raw_to_tag_value(raw),
   };
@@ -1316,7 +1322,11 @@ fn time_stamp(raw: &RawValue, print_conv: bool) -> TagValue {
     RawValue::Text(s) => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-      core::str::from_utf8(&b[..end]).unwrap_or("").to_string()
+      // `end <= b.len()`, so `.get(..end)` is `Some` — byte-identical.
+      b.get(..end)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .unwrap_or("")
+        .to_string()
     }
     _ => return raw_to_tag_value(raw),
   };
@@ -1382,11 +1392,14 @@ fn internal_serial_number(raw: &RawValue, print_conv: bool) -> TagValue {
     _ => return raw_to_tag_value(raw),
   };
   let mut end = bytes.len();
-  while end > 0 && (bytes[end - 1] == 0 || bytes[end - 1] == b' ') {
+  // `end > 0` ⇒ `end - 1 < len`, so `.get(end-1)` is `Some`; `.get(..end)` is
+  // `Some` for `end <= len` — both byte-identical to the prior indexing.
+  while end > 0 && bytes.get(end - 1).is_some_and(|&b| b == 0 || b == b' ') {
     end -= 1;
   }
-  let raw_str = core::str::from_utf8(&bytes[..end])
-    .ok()
+  let raw_str = bytes
+    .get(..end)
+    .and_then(|s| core::str::from_utf8(s).ok())
     .map(|s| s.to_string())
     .unwrap_or_default();
   if !print_conv {
@@ -1402,18 +1415,20 @@ fn internal_serial_number(raw: &RawValue, print_conv: bool) -> TagValue {
 /// (`Panasonic.pm:458`).
 fn parse_internal_sn(s: &str) -> Option<String> {
   let bytes = s.as_bytes();
+  // The `len < 13` guard makes every `.get(..)` below `Some`; the checked
+  // forms are byte-identical to `bytes[0]` / `bytes[1..3]` / `bytes[3..13]`.
   if bytes.len() < 13 {
     return None;
   }
-  if !bytes[0].is_ascii_uppercase() {
+  if !bytes.first().is_some_and(u8::is_ascii_uppercase) {
     return None;
   }
-  for &b in &bytes[1..3] {
+  for &b in bytes.get(1..3).unwrap_or_default() {
     if !(b.is_ascii_uppercase() || b.is_ascii_digit()) {
       return None;
     }
   }
-  for &b in &bytes[3..13] {
+  for &b in bytes.get(3..13).unwrap_or_default() {
     if !b.is_ascii_digit() {
       return None;
     }
@@ -1738,14 +1753,19 @@ fn lens_type_model(raw: &RawValue, print_conv: bool) -> Option<TagValue> {
   // single `s/(..)(..)/$2 $1/` (no /g) swaps only the FIRST two byte-pairs,
   // matching Perl.
   let hex = std::format!("{:04x}", n as u64);
-  let bytes = hex.as_bytes();
+  // `{:04x}` always yields ≥ 4 bytes, so `first_chunk::<4>()` is `Some` and
+  // the binding is byte-identical to `hex.as_bytes()[0..3]`; the `else` is
+  // unreachable (kept only to stay panic-free).
+  let Some(&[b0, b1, b2, b3]) = hex.as_bytes().first_chunk::<4>() else {
+    return Some(TagValue::Str(SmolStr::from(hex)));
+  };
   // Swap the first two 2-char groups: "abcd…" → "cd ab…".
   let swapped = std::format!(
     "{}{} {}{}{}",
-    bytes[2] as char,
-    bytes[3] as char,
-    bytes[0] as char,
-    bytes[1] as char,
+    b2 as char,
+    b3 as char,
+    b0 as char,
+    b1 as char,
     &hex[4..],
   );
   Some(TagValue::Str(SmolStr::from(swapped)))
@@ -1827,8 +1847,10 @@ fn af_area_size(raw: &RawValue, print_conv: bool) -> TagValue {
 /// the Apple/Canon helpers.
 pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
   use std::string::ToString;
+  // Single-element arms use a slice pattern (`[x]`) instead of `v[0]` behind
+  // an `if v.len() == 1` guard — byte-identical and free of raw indexing.
   match raw {
-    RawValue::I64(v) if v.len() == 1 => TagValue::I64(v[0]),
+    RawValue::I64(v) if let [n] = v.as_slice() => TagValue::I64(*n),
     RawValue::I64(v) => TagValue::Str(
       v.iter()
         .map(|n| n.to_string())
@@ -1836,9 +1858,9 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::U64(v) if v.len() == 1 => match i64::try_from(v[0]) {
+    RawValue::U64(v) if let [n] = v.as_slice() => match i64::try_from(*n) {
       Ok(n) => TagValue::I64(n),
-      Err(_) => TagValue::U64(v[0]),
+      Err(_) => TagValue::U64(*n),
     },
     RawValue::U64(v) => TagValue::Str(
       v.iter()
@@ -1847,7 +1869,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::F64(v) if v.len() == 1 => TagValue::F64(v[0]),
+    RawValue::F64(v) if let [n] = v.as_slice() => TagValue::F64(*n),
     RawValue::F64(v) => TagValue::Str(
       v.iter()
         .map(|f| f.to_string())
@@ -1855,7 +1877,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Rational(rs) if rs.len() == 1 => TagValue::Rational(rs[0]),
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => TagValue::Rational(*r),
     // A multi-element rational with NO conv: ExifTool's default ValueConv
     // renders EACH rational to its `RoundFloat(n/d, sig)` DECIMAL
     // (`ExifTool.pm:6107-6119`) and space-joins them — e.g. the pair
@@ -1876,6 +1898,11 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

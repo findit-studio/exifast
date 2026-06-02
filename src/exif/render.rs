@@ -24,6 +24,10 @@
 //! a [`TagValue`] carries owned `SmolStr`/`Vec` data.
 
 #![cfg(feature = "alloc")]
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// the single-element `v[0]` reads below are each dominated by a `v.len() == 1`
+// match guard, so the checked `.first()` form recovers the same scalar.
+#![deny(clippy::indexing_slicing)]
 
 use crate::emit::ConvMode;
 use crate::exif::ifd::RawValue;
@@ -53,25 +57,29 @@ pub(crate) fn render_value(raw: &RawValue, mode: ConvMode) -> TagValue {
   // vs ValueConv split); bind `mode` to document that and keep the signature
   // uniform with the conversion-bearing paths.
   let _ = mode;
+  // The single-element arms below use an `if let [x] = v.as_slice()` guard
+  // rather than `len()==1` + `v[0]`: the binding `x` IS the sole element, so
+  // the read is checked by the slice pattern and stays byte-identical (no panic
+  // site, no fallback value).
   match raw {
     // ---- integers ---------------------------------------------------------
-    RawValue::I64(v) if v.len() == 1 => TagValue::I64(v[0]),
+    RawValue::I64(v) if let [x] = v.as_slice() => TagValue::I64(*x),
     RawValue::I64(v) => TagValue::Str(join_signed(v).into()),
-    RawValue::U64(v) if v.len() == 1 => match i64::try_from(v[0]) {
+    RawValue::U64(v) if let [x] = v.as_slice() => match i64::try_from(*x) {
       Ok(n) => TagValue::I64(n),
       // Above `i64::MAX` — keep the exact unsigned value (no saturation).
-      Err(_) => TagValue::U64(v[0]),
+      Err(_) => TagValue::U64(*x),
     },
     RawValue::U64(v) => TagValue::Str(join_unsigned(v).into()),
     // ---- floats -----------------------------------------------------------
-    RawValue::F64(v) if v.len() == 1 => TagValue::F64(v[0]),
+    RawValue::F64(v) if let [x] = v.as_slice() => TagValue::F64(*x),
     RawValue::F64(v) => TagValue::Str(join_floats(v).into()),
     // ---- rationals --------------------------------------------------------
     // A single rational keeps its `Rational` shape (its serializer renders the
     // ExifTool-rounded decimal). A multi-rational space-joins each element's
     // `exiftool_val_str` DECIMAL (e.g. AccelerationVector → "-0.01 0.02 -0.7";
     // `Apple.pm:62`, `rational64s` Count 3, no PrintConv), NOT `n/d` fractions.
-    RawValue::Rational(rs) if rs.len() == 1 => TagValue::Rational(rs[0]),
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => TagValue::Rational(*r),
     RawValue::Rational(rs) => TagValue::Str(
       rs.iter()
         .map(crate::value::Rational::exiftool_val_str)
@@ -114,6 +122,11 @@ fn join_floats(v: &[f64]) -> std::string::String {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test assertions index fixed-shape values freely
+// (an out-of-range index is a test failure, not a shipped panic), so the deny
+// is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::value::Rational;

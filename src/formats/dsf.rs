@@ -31,6 +31,14 @@
 //! as a lib-first convenience; [`Meta::id3_ref`] is the typed sub-Meta
 //! parsed from those same bytes, which the sink emits.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the input buffer is converted to a checked `.get()`
+// form below. Each conversion is byte-identical: the preceding length guard
+// (`data.len() < 40`, the `dir_end > dir_total` break, the `end > data.len()`
+// trailer guard) already proves the read in range, so the `.get()` always
+// yields the same bytes via the same recovery path it had before.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   format_parser::{FormatParser, SharedFlags, parser_sealed},
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
@@ -456,27 +464,35 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // `/s` matches any byte including \n). Translated literally as four
   // byte-equality checks; the 16-byte middle (fileSize+metaPos) is
   // unconstrained.
-  let head = &data[..40];
-  if &head[0..4] != b"DSD " {
+  // `data.len() >= 40` (guard above) ⇒ every fixed-offset read below is in
+  // range; `head.get(..)` always yields `Some`, so each check is byte-
+  // identical. `head[i]` == `data[i]` (head is `data[..40]`), so reading off
+  // `head` keeps the same offsets and bytes; `starts_with` is the equivalent
+  // of the `head[0..4] == b"DSD "` magic test. The `?` is always `Some` here
+  // (len >= 40) and reuses the same early-`None` reject as the length guard.
+  let head = data.get(..40)?;
+  if !head.starts_with(b"DSD ") {
     return None;
   }
-  if head[4] != 0x1c {
+  if head.get(4) != Some(&0x1c) {
     return None;
   }
-  if !head[5..12].iter().all(|&b| b == 0) {
+  if !head.get(5..12).is_some_and(|s| s.iter().all(|&b| b == 0)) {
     return None;
   }
-  if &head[28..32] != b"fmt " {
+  if head.get(28..32) != Some(b"fmt ".as_slice()) {
     return None;
   }
   // DSF.pm:66 `SetByteOrder('II')` — every Get* below is little-endian.
-  // DSF.pm:67 `my $fmtLen = Get64u(\$buff,32)`.
-  let fmt_len = read_u64_le(&head[32..40]);
+  // DSF.pm:67 `my $fmtLen = Get64u(\$buff,32)`. `head.get(..)` is always
+  // `Some` (len == 40), so `read_u64_le` reads the same bytes as before; the
+  // `0` fallback is unreachable.
+  let fmt_len = head.get(32..40).map_or(0, read_u64_le);
   // DSF.pm:74-75 `$fileSize = Get64u(\$buff,12); $metaPos = Get64u(
   // \$buff,20)` — local-only, NOT emitted as DSF tags. Read here for
   // use by the ID3v2 trailer arm at DSF.pm:88-97.
-  let file_size = read_u64_le(&head[12..20]);
-  let meta_pos = read_u64_le(&head[20..28]);
+  let file_size = head.get(12..20).map_or(0, read_u64_le);
+  let meta_pos = head.get(20..28).map_or(0, read_u64_le);
   // DSF.pm:68-72 `unless ($fmtLen > 12 and $fmtLen < 1000 and $raf->Read(
   //   $buf2, $fmtLen - 12) == $fmtLen - 12) { Warn; return 1 }`.
   //
@@ -563,14 +579,18 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     // shift). Verified: dir_off 12 ⇒ file_off 40 (payload start),
     // dir_off 36 ⇒ file_off 64 (SampleCount start). ✓
     let file_off = dir_off + 28;
+    // `dir_end <= dir_total` (the `break` guard above) ⇒
+    // `file_off + width = dir_end + 28 <= dir_total + 28 = 40 + payload_len
+    // <= data.len()` (the `fmt_ok` guard), so each `.get(file_off..)` always
+    // yields `Some` (the `0` fallback is unreachable) — byte-identical.
     if is_int64 {
-      let v = read_u64_le(&data[file_off..file_off + 8]);
+      let v = data.get(file_off..file_off + 8).map_or(0, read_u64_le);
       sample_count = v;
       if v > i64::MAX as u64 {
         sample_count_is_decimal_string = true;
       }
     } else {
-      let v = read_u32_le(&data[file_off..file_off + 4]);
+      let v = data.get(file_off..file_off + 4).map_or(0, read_u32_le);
       match key {
         3 => format_version = v,
         4 => format_id = v,
@@ -649,6 +669,11 @@ fn id3_from_trailer(trailer: Option<&[u8]>) -> Option<crate::formats::id3::Id3Me
 /// `last if $more <= 0` — returns the bitmask of present fields in
 /// `DSF_KEYS` order (bit 0 = key 3, bit 1 = key 4, …, bit 7 = key 11).
 /// Returns `0xFF` when every field fits.
+// `slice::get` is not yet const-stable (E0658), so this `const fn` cannot use
+// the checked form; the `while i < DSF_KEYS.len()` bound proves `DSF_KEYS[i]`
+// is in range, so the indexing is panic-free by construction. Narrow,
+// const-fn-only exception to the file-level deny.
+#[allow(clippy::indexing_slicing)]
 const fn emitted_mask(dir_total: usize) -> u8 {
   let mut mask: u8 = 0;
   let mut i: usize = 0;
@@ -693,23 +718,26 @@ fn id3_trailer_slice(data: &[u8], file_size: u64, meta_pos: u64) -> Option<&[u8]
   if end > data.len() {
     return None;
   }
-  Some(&data[mp..end])
+  // `end = mp + ml <= data.len()` (guards above), so `.get(mp..end)` is always
+  // `Some` — byte-identical to the prior `&data[mp..end]`; the `?` reuses the
+  // same `None` (no-trailer) recovery the `end > data.len()` guard returns.
+  data.get(mp..end)
 }
 
 /// Little-endian u32 reader (DSF.pm:66 `SetByteOrder('II')`).
-/// Panic-free: caller bounds-checks `b` to at least 4 bytes.
+/// Panic-free: caller bounds-checks `b` to at least 4 bytes, so
+/// `first_chunk::<4>` always yields `Some` here (the `0` fallback is
+/// unreachable) — byte-identical to the prior `b[..4]` copy.
 fn read_u32_le(b: &[u8]) -> u32 {
-  let mut le = [0u8; 4];
-  le.copy_from_slice(&b[..4]);
-  u32::from_le_bytes(le)
+  b.first_chunk::<4>().copied().map_or(0, u32::from_le_bytes)
 }
 
 /// Little-endian u64 reader (DSF.pm:66 `SetByteOrder('II')`).
-/// Panic-free: caller bounds-checks `b` to at least 8 bytes.
+/// Panic-free: caller bounds-checks `b` to at least 8 bytes, so
+/// `first_chunk::<8>` always yields `Some` here (the `0` fallback is
+/// unreachable) — byte-identical to the prior `b[..8]` copy.
 fn read_u64_le(b: &[u8]) -> u64 {
-  let mut le = [0u8; 8];
-  le.copy_from_slice(&b[..8]);
-  u64::from_le_bytes(le)
+  b.first_chunk::<8>().copied().map_or(0, u64::from_le_bytes)
 }
 
 // ===========================================================================
@@ -957,10 +985,12 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
       // ExifTool.pm:9953 `last if $more <= 0`.
       break;
     }
+    // `off + width <= buf.len()` (the `end > buf.len()` break above) ⇒ each
+    // `.get(off..off + width)` is always `Some`; the panic-free `read_*_le`
+    // helpers (which bounds-check internally) read the same bytes as the prior
+    // `copy_from_slice(&buf[off..off + width])` — byte-identical.
     let raw = if width == 8 {
-      let mut le = [0u8; 8];
-      le.copy_from_slice(&buf[off..off + 8]);
-      let v = u64::from_le_bytes(le);
+      let v = read_u64_le(buf.get(off..off + 8).unwrap_or(&[]));
       if v <= i64::MAX as u64 {
         TagValue::I64(v as i64)
       } else {
@@ -970,9 +1000,7 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
         TagValue::Str(v.to_string().into())
       }
     } else {
-      let mut le = [0u8; 4];
-      le.copy_from_slice(&buf[off..off + 4]);
-      TagValue::I64(u32::from_le_bytes(le) as i64)
+      TagValue::I64(read_u32_le(buf.get(off..off + 4).unwrap_or(&[])) as i64)
     };
     let out = crate::convert::apply(def, &raw, print_conv_enabled);
     m.push(Group::new("File", "File"), def.name(), out);
@@ -984,6 +1012,11 @@ fn walk_binary_data(buf: &[u8], m: &mut Metadata, print_conv_enabled: bool) {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::emit::{ConvMode, Taggable};
@@ -996,18 +1029,11 @@ mod tests {
   /// net `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
     crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
-    if let Some(w) = meta.fmt_warning() {
-      let _ = out.write_warning(w);
-    }
-    #[cfg(feature = "id3")]
-    if let Some(id3) = meta.id3_ref() {
-      for w in id3.warnings_slice() {
-        let _ = out.write_warning(w.as_str());
-      }
-      for e in id3.errors_slice() {
-        let _ = out.write_error(e.as_str());
-      }
-    }
+    // Drain diagnostics through the SAME `run_diagnostics` path the
+    // `format_parser.rs` arm uses, so the `[minor]`/`[x$n]` prefixing matches
+    // production (the chained ID3 sub-Meta's ignorable levels flow through
+    // DSF's `Diagnose` impl).
+    crate::diagnostics::run_diagnostics(meta, out);
   }
 
   // --- Table + dispatch ---------------------------------------------------

@@ -42,6 +42,8 @@
 //! consumes. The unit tests assert each formula matches the bundled
 //! expression exactly.
 
+#![deny(clippy::indexing_slicing)]
+
 use super::detected::BaseRule;
 
 /// Compute the child IFD walk's `$$dirInfo{Base}` per the bundled

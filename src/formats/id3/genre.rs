@@ -7,6 +7,11 @@
 //! Perl hash but are looked up by string in `PrintGenre`; they are
 //! intentionally NOT in this i64-keyed table — see [`genre_short_form`].
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction.
+// This module is a pure i64-keyed lookup table (no runtime buffer indexing);
+// the deny is the file-level panic-safety contract for the slice.
+#![deny(clippy::indexing_slicing)]
+
 /// Faithful port of `%genre` (ID3.pm:131-332). Indexed by genre number;
 /// returns the canonical name. `None` for unknown numbers (PrintGenre
 /// then synthesizes `"Unknown ($n)"`, ID3.pm:1026).
@@ -225,6 +230,11 @@ pub const fn genre_short_form(s: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the tests index fixed-layout data freely (an
+// out-of-range index is a test-assertion failure, not a shipped panic), so the
+// deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

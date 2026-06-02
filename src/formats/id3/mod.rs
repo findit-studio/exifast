@@ -64,6 +64,11 @@
 //!   their [`crate::format_parser::FormatParser`] / `serialize_tags`
 //!   impls.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction.
+// This module is only `pub mod` declarations + re-exports (no runtime buffer
+// indexing); the deny is the file-level panic-safety contract for the slice.
+#![deny(clippy::indexing_slicing)]
+
 pub mod decode;
 pub mod genre;
 pub mod picture_type;

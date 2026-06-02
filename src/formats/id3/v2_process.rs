@@ -22,6 +22,18 @@
 //! - Other tags with `Binary => 1`: pass through.
 //! - Unhandled: faithful Warn "Don't know how to handle $id frame".
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the frame buffers (`data` / `value` / `rest` /
+// `dat`) is converted to a checked `.get()` form below. Each conversion is
+// byte-identical: the preceding guard (the `offset + N > data.len()` /
+// `offset + frame_len > data.len()` frame-loop breaks, the `value.len() < N`
+// / `rest.len() < N` short-frame returns, the `i + 1 < .len()` loop bounds,
+// the `pos + 4 <= value.len()` RVA2 bound) already proves each read in range,
+// so the `.get()` yields the same bytes via the same recovery (break / return
+// / skip). Only converts raw INDEXING — the C.2 `ignorable` warning-level
+// changes are untouched.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{ConvContext, apply_ctx},
   formats::id3::decode::{decode_string, decode_string_joined, unsync_safe},
@@ -92,7 +104,10 @@ pub fn process_id3v2(
           // and KEEP the sync-safe value (outer break will fire below
           // on `offset+frame_len > data.len()`).
           if offset + ss_usize == data.len() {
-            meta.push_warning("[minor] Missing ID3 terminating frame");
+            // ID3.pm:1148 `$et->Warn('Missing ID3 terminating frame', 1)` —
+            // a MINOR warning. The `[minor] ` prefix is applied centrally by
+            // `run_diagnostics` (single source of truth), not baked in here.
+            meta.push_warning_with_level("Missing ID3 terminating frame", 1);
           } else {
             meta.push_warning("Invalid ID3 frame size");
           }
@@ -104,7 +119,12 @@ pub fn process_id3v2(
     if offset + frame_len > data.len() {
       break;
     }
-    let frame_data = &data[offset..offset + frame_len];
+    // `offset + frame_len <= data.len()` (guard just above), so
+    // `.get(offset..offset + frame_len)` is always `Some`; the `break` is
+    // unreachable and matches that short-read exit (byte-identical).
+    let Some(frame_data) = data.get(offset..offset + frame_len) else {
+      break;
+    };
     let next_offset = offset + frame_len;
     offset = next_offset;
 
@@ -159,7 +179,9 @@ pub fn process_id3v2(
         meta.push_warning(format!("Short {id} frame"));
         continue;
       }
-      value = value[1..].to_vec();
+      // `!value.is_empty()` ⇒ `.get(1..)` is always `Some` (the `&[]` fallback
+      // is unreachable) — byte-identical to the prior `value[1..]`.
+      value = value.get(1..).unwrap_or(&[]).to_vec();
     }
     // DataLen / Compress: strip 4 bytes; Compress = no zlib in scope.
     // ID3.pm:1217-1244: if DataLen or Compress flag is set, the first 4
@@ -175,8 +197,16 @@ pub fn process_id3v2(
         meta.push_warning(format!("Short {id} frame"));
         continue;
       }
-      declared_data_len = Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
-      value = value[4..].to_vec();
+      // `value.len() >= 4` ⇒ `.get(..4)` + `[u8; 4]` `try_into` and `.get(4..)`
+      // always succeed (the `0` / `&[]` fallbacks are unreachable) — byte-
+      // identical to the prior `[value[0]..value[3]]` / `value[4..]`.
+      declared_data_len = Some(
+        value
+          .get(..4)
+          .and_then(|s| <[u8; 4]>::try_from(s).ok())
+          .map_or(0, u32::from_be_bytes),
+      );
+      value = value.get(4..).unwrap_or(&[]).to_vec();
     }
     if compress {
       meta.push_warning("Install Compress::Zlib to decode compressed frames");
@@ -221,12 +251,19 @@ fn parse_frame_header(data: &[u8], offset: usize, vers: u16) -> Option<(String, 
     if offset + 6 > data.len() {
       return None;
     }
-    let id = &data[offset..offset + 3];
+    // `offset + 6 <= data.len()` ⇒ every fixed read in `offset..offset + 6` is
+    // in range; the `.get(..)?` always yields `Some` (the `?` `None` is the
+    // same "end of frames" recovery the bounds check returns) — byte-identical
+    // to the prior `&data[offset..offset + 3]` / `data[offset + 3]` etc.
+    let id = data.get(offset..offset + 3)?;
     if id == [0, 0, 0] {
       return None;
     }
-    let hi = data[offset + 3];
-    let lo = u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
+    let hi = data.get(offset + 3).copied().unwrap_or(0);
+    let lo = u16::from_be_bytes([
+      data.get(offset + 4).copied().unwrap_or(0),
+      data.get(offset + 5).copied().unwrap_or(0),
+    ]);
     let len = (u32::from(hi) << 16) | u32::from(lo);
     // R10-F1: bundled `unpack("x${offset}a3Cn", ...)` keeps the raw
     // bytes; an unknown non-ASCII frame ID does NOT terminate the
@@ -245,17 +282,21 @@ fn parse_frame_header(data: &[u8], offset: usize, vers: u16) -> Option<(String, 
     if offset + 10 > data.len() {
       return None;
     }
-    let id = &data[offset..offset + 4];
+    // `offset + 10 <= data.len()` ⇒ every fixed read in `offset..offset + 10`
+    // is in range; the `.get(..)?` always yields `Some` (the `?` `None` is the
+    // same "end of frames" recovery) — byte-identical to the prior fixed reads.
+    let id = data.get(offset..offset + 4)?;
     if id == [0, 0, 0, 0] {
       return None;
     }
-    let len = u32::from_be_bytes([
-      data[offset + 4],
-      data[offset + 5],
-      data[offset + 6],
-      data[offset + 7],
+    let len = data
+      .get(offset + 4..offset + 8)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+      .map_or(0, u32::from_be_bytes);
+    let flags = u16::from_be_bytes([
+      data.get(offset + 8).copied().unwrap_or(0),
+      data.get(offset + 9).copied().unwrap_or(0),
     ]);
-    let flags = u16::from_be_bytes([data[offset + 8], data[offset + 9]]);
     // R10-F1: same lossy-UTF-8 treatment (see v2.2 arm above).
     Some((String::from_utf8_lossy(id).into_owned(), len, flags, 10))
   }
@@ -271,12 +312,15 @@ fn reverse_unsync(v: &[u8]) -> Vec<u8> {
   // `s/\xff\x00/\xff/g`.
   let mut out = Vec::with_capacity(v.len());
   let mut i = 0;
+  // `i < v.len()` ⇒ `.get(i)` is `Some`; the `i + 1 < v.len()` guard keeps the
+  // `.get(i + 1)` read in range. The `0` fallbacks are unreachable (byte-
+  // identical to the prior `v[i]` / `v[i + 1]`).
   while i < v.len() {
-    if v[i] == 0xff && i + 1 < v.len() && v[i + 1] == 0x00 {
+    if v.get(i) == Some(&0xff) && i + 1 < v.len() && v.get(i + 1) == Some(&0x00) {
       out.push(0xff);
       i += 2;
     } else {
-      out.push(v[i]);
+      out.push(v.get(i).copied().unwrap_or(0));
       i += 1;
     }
   }
@@ -337,7 +381,10 @@ fn bytes_to_decimal_string(bytes: &[u8]) -> String {
   // Strip leading zero bytes (faithful: Perl `0 << 8 = 0`, so leading
   // zeros are no-op; this just keeps the limb vector small).
   let mut start = 0;
-  while start < bytes.len() && bytes[start] == 0 {
+  // `.get(start)` is `Some(&0)` exactly while `start < bytes.len()` and the
+  // byte is zero (replacing the explicit `start < bytes.len()` bound) — byte-
+  // identical to the prior `bytes[start] == 0`.
+  while bytes.get(start) == Some(&0) {
     start += 1;
   }
   if start == bytes.len() {
@@ -346,7 +393,9 @@ fn bytes_to_decimal_string(bytes: &[u8]) -> String {
   // Base-10^9 limbs, little-endian (limb[0] = least-significant).
   let mut limbs: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
   const BASE: u64 = 1_000_000_000;
-  for &b in &bytes[start..] {
+  // `start <= bytes.len()` (loop exit) ⇒ `.get(start..)` is always `Some`
+  // (the `&[]` fallback is unreachable) — byte-identical to `&bytes[start..]`.
+  for &b in bytes.get(start..).unwrap_or(&[]) {
     // limbs = limbs * 256 + b
     let mut carry: u64 = u64::from(b);
     for limb in limbs.iter_mut() {
@@ -408,9 +457,10 @@ fn dispatch_frame(
       None
     };
     if alt_def.is_some() {
-      meta.push_warning(format!(
-        "[minor] Frame '{id}' is not valid for this ID3 version"
-      ));
+      // ID3.pm:1172 `$et->Warn("Frame '${id}' is not valid for this ID3
+      // version", 1)` — a MINOR warning; the `[minor] ` prefix is applied by
+      // `run_diagnostics`, not baked into the stored message.
+      meta.push_warning_with_level(format!("Frame '{id}' is not valid for this ID3 version"), 1);
       tag_def = alt_def;
     }
   }
@@ -479,8 +529,11 @@ fn dispatch_frame(
       meta.push_warning(format!("Invalid {id} frame value"));
       return;
     }
-    let enc = value[0];
-    let rest = &value[1..];
+    // `!value.is_empty()` ⇒ `.first()` and `.get(1..)` are always `Some` (the
+    // fallbacks are unreachable) — byte-identical to the prior `value[0]` /
+    // `&value[1..]`.
+    let enc = value.first().copied().unwrap_or(0);
+    let rest = value.get(1..).unwrap_or(&[]);
     let (tag, url) = if enc == 1 || enc == 2 {
       // UTF-16: split on `\0\0` aligned.
       split_utf16_at_double_null(rest)
@@ -541,9 +594,12 @@ fn dispatch_frame(
       meta.push_warning(format!("Short {id} frame"));
       return;
     }
-    let enc = value[0];
-    let lang = &value[1..4];
-    let body = &value[4..];
+    // `value.len() > 4` ⇒ `.first()`, `.get(1..4)`, `.get(4..)` are always
+    // `Some` (the fallbacks are unreachable) — byte-identical to the prior
+    // `value[0]` / `&value[1..4]` / `&value[4..]`.
+    let enc = value.first().copied().unwrap_or(0);
+    let lang = value.get(1..4).unwrap_or(&[]);
+    let body = value.get(4..).unwrap_or(&[]);
     let parts = decode_string(body, Some(enc));
     let desc = parts.first().cloned().unwrap_or_default();
     let text = parts.get(1).cloned().unwrap_or_default();
@@ -572,9 +628,12 @@ fn dispatch_frame(
       meta.push_warning(format!("Short {id} frame"));
       return;
     }
-    let enc = value[0];
-    let lang = &value[1..4];
-    let body = &value[4..];
+    // `value.len() > 4` ⇒ `.first()`, `.get(1..4)`, `.get(4..)` are always
+    // `Some` (the fallbacks are unreachable) — byte-identical to the prior
+    // `value[0]` / `&value[1..4]` / `&value[4..]`.
+    let enc = value.first().copied().unwrap_or(0);
+    let lang = value.get(1..4).unwrap_or(&[]);
+    let body = value.get(4..).unwrap_or(&[]);
     let text = decode_string_joined(body, Some(enc));
     if let Some(def) = tag_def {
       let name = apply_lang_suffix(def.name(), lang);
@@ -622,8 +681,15 @@ fn dispatch_frame(
   if matches!(id, "POP" | "POPM") {
     // email + 0 + rating(1) + counter(4..)
     let nul = value.iter().position(|&b| b == 0);
+    // `p` from `position` (so `p < value.len()`) and the `p + 1 < value.len()`
+    // guard ⇒ `.get(..p)` and `.get(p + 1..)` are always `Some` (the `&[]`
+    // fallbacks are unreachable) — byte-identical to `&value[..p]` /
+    // `&value[p + 1..]`.
     let (email_bytes, dat) = match nul {
-      Some(p) if p + 1 < value.len() => (&value[..p], &value[p + 1..]),
+      Some(p) if p + 1 < value.len() => (
+        value.get(..p).unwrap_or(&[]),
+        value.get(p + 1..).unwrap_or(&[]),
+      ),
       _ => {
         meta.push_warning(format!("Invalid {id} frame"));
         return;
@@ -633,11 +699,13 @@ fn dispatch_frame(
       meta.push_warning(format!("Invalid {id} frame"));
       return;
     }
-    let rating = dat[0];
+    // `!dat.is_empty()` ⇒ `.first()` / `.get(1..)` are always `Some` (the
+    // fallbacks are unreachable) — byte-identical to `dat[0]` / `&dat[1..]`.
+    let rating = dat.first().copied().unwrap_or(0);
     // R12-F2: POPM counter is also "counter(4-N)" — bundled Perl
     // accumulates without loss via bigint promotion. Use the same
     // arbitrary-precision decimal-string accumulator as CNT/PCNT.
-    let cnt_str = bytes_to_decimal_string(&dat[1..]);
+    let cnt_str = bytes_to_decimal_string(dat.get(1..).unwrap_or(&[]));
     let email = decode_one_latin(email_bytes);
     let combined = format!("{email} {rating} {cnt_str}");
     if let Some(def) = tag_def {
@@ -656,10 +724,14 @@ fn dispatch_frame(
       p.push(String::new());
     }
     // Format date: $strs[1] =~ s/^(\d{4})(\d{2})(\d{2})/$1:$2:$3 / (ID3.pm:1347).
-    let date_str = format_owne_date(&p[1]);
+    // The `while p.len() < 2` pad guarantees `p.get(1)` is `Some` (the `""`
+    // fallback is unreachable); the `formatted.get_mut(1)` write only happens
+    // under the `formatted.len() >= 2` guard — byte-identical to the prior
+    // `&p[1]` / `formatted[1] = ...`.
+    let date_str = format_owne_date(p.get(1).map_or("", String::as_str));
     let mut formatted = parts.clone();
-    if formatted.len() >= 2 {
-      formatted[1] = date_str;
+    if let Some(slot) = formatted.get_mut(1) {
+      *slot = date_str;
     }
     let joined = formatted.join(" ");
     if let Some(def) = tag_def {
@@ -700,9 +772,12 @@ fn dispatch_frame(
     // the tag NAME (faithful Perl: `AddTagToTable` synthesizes `Name =>
     // ucfirst($tag), Binary => 1`).
     let null_pos = value.iter().position(|&b| b == 0);
+    // `p` from `position` (so `p < value.len()`) ⇒ `.get(..p)` is `Some`; the
+    // `None` arm's `..0` is the always-`Some` empty slice — byte-identical to
+    // the prior `&value[..p]` / `&value[..0]`.
     let (tag_bytes, start) = match null_pos {
-      Some(p) => (&value[..p], p + 1),
-      None => (&value[..0], 0),
+      Some(p) => (value.get(..p).unwrap_or(&[]), p + 1),
+      None => (value.get(..0).unwrap_or(&[]), 0),
     };
     let _ = start;
     let mut tag_name: String = tag_bytes.iter().map(|&b| b as char).collect();
@@ -730,7 +805,10 @@ fn dispatch_frame(
     }
     let payload: Vec<u8> = if let Some(p) = null_pos {
       if p < value.len() {
-        value[p + 1..].to_vec()
+        // `p < value.len()` ⇒ `p + 1 <= value.len()`, so `.get(p + 1..)` is
+        // always `Some` (the `&[]` fallback is unreachable) — byte-identical
+        // to the prior `value[p + 1..]`.
+        value.get(p + 1..).unwrap_or(&[]).to_vec()
       } else {
         Vec::new()
       }
@@ -759,7 +837,10 @@ fn dispatch_frame(
       .iter()
       .rposition(|&b| b != 0)
       .map_or(trimmed_left, |i| i + 1);
-    let payload = &value[trimmed_left..trimmed_right];
+    // `trimmed_left <= trimmed_right <= value.len()` by construction, so
+    // `.get(trimmed_left..trimmed_right)` is always `Some` (the `&[]` fallback
+    // is unreachable) — byte-identical to the prior slice.
+    let payload = value.get(trimmed_left..trimmed_right).unwrap_or(&[]);
     let s = decode_one_latin(payload);
     if let Some(def) = tag_def {
       let raw = TagValue::Str(SmolStr::new(s));
@@ -879,17 +960,22 @@ fn handle_picture(
     meta.push_warning(format!("Short {id} frame"));
     return;
   }
-  let enc = value[0];
-  let mut rest = &value[1..];
+  // `value.len() >= 4` ⇒ `.first()` / `.get(1..)` are always `Some` (the
+  // fallbacks are unreachable) — byte-identical to `value[0]` / `&value[1..]`.
+  let enc = value.first().copied().unwrap_or(0);
+  let mut rest = value.get(1..).unwrap_or(&[]);
   let (fmt_or_mime, picture_type, description, image_bytes) = if id == "PIC" {
     // PIC: 3-byte image format + 1-byte picture type + description-null + image.
     if rest.len() < 4 {
       meta.push_warning(format!("Invalid {id} frame"));
       return;
     }
-    let fmt = rest[..3].to_vec();
-    let pic_type = rest[3];
-    rest = &rest[4..];
+    // `rest.len() >= 4` ⇒ `.get(..3)`, `.get(3)`, `.get(4..)` are always
+    // `Some` (the fallbacks are unreachable) — byte-identical to the prior
+    // `rest[..3]` / `rest[3]` / `&rest[4..]`.
+    let fmt = rest.get(..3).unwrap_or(&[]).to_vec();
+    let pic_type = rest.get(3).copied().unwrap_or(0);
+    rest = rest.get(4..).unwrap_or(&[]);
     // R8-F3 — description MUST have its enc-terminator (bundled ID3.pm:
     // 1324 `$val =~ s/^$hdr//s or $et->Warn("Invalid $id frame"), next`).
     // `read_enc_str` returns None when the terminator is missing.
@@ -898,11 +984,14 @@ fn handle_picture(
       return;
     };
     let desc = decode_string_joined(&prepend_enc(enc, &desc_bytes), None);
+    // `read_enc_str` returns `image_offset <= rest.len()` (the terminator was
+    // found within `rest`), so `.get(image_offset..)` is always `Some` (the
+    // `&[]` fallback is unreachable) — byte-identical to `&rest[image_offset..]`.
     (
       String::from_utf8_lossy(&fmt).into_owned(),
       pic_type,
       desc,
-      &rest[image_offset..],
+      rest.get(image_offset..).unwrap_or(&[]),
     )
   } else {
     // APIC: MIME-null + 1-byte picture type + description-null + image.
@@ -913,25 +1002,32 @@ fn handle_picture(
         return;
       }
     };
-    let mime = rest[..mime_end].to_vec();
-    rest = &rest[mime_end + 1..];
+    // `mime_end` from `position` (so `mime_end < rest.len()`) ⇒ `.get(..
+    // mime_end)` and `.get(mime_end + 1..)` are always `Some` — byte-identical
+    // to the prior `rest[..mime_end]` / `&rest[mime_end + 1..]`.
+    let mime = rest.get(..mime_end).unwrap_or(&[]).to_vec();
+    rest = rest.get(mime_end + 1..).unwrap_or(&[]);
     if rest.is_empty() {
       meta.push_warning(format!("Invalid {id} frame"));
       return;
     }
-    let pic_type = rest[0];
-    rest = &rest[1..];
+    // `!rest.is_empty()` ⇒ `.first()` / `.get(1..)` are always `Some` (the
+    // fallbacks are unreachable) — byte-identical to `rest[0]` / `&rest[1..]`.
+    let pic_type = rest.first().copied().unwrap_or(0);
+    rest = rest.get(1..).unwrap_or(&[]);
     // R8-F3 — see comment above.
     let Some((desc_bytes, image_offset)) = read_enc_str(rest, enc) else {
       meta.push_warning(format!("Invalid {id} frame"));
       return;
     };
     let desc = decode_string_joined(&prepend_enc(enc, &desc_bytes), None);
+    // `read_enc_str` returns `image_offset <= rest.len()`, so `.get(
+    // image_offset..)` is always `Some` (byte-identical to `&rest[image_offset..]`).
     (
       String::from_utf8_lossy(&mime).into_owned(),
       pic_type,
       desc,
-      &rest[image_offset..],
+      rest.get(image_offset..).unwrap_or(&[]),
     )
   };
 
@@ -977,26 +1073,34 @@ fn handle_picture(
 fn read_enc_str(rest: &[u8], enc: u8) -> Option<(Vec<u8>, usize)> {
   if enc == 1 || enc == 2 {
     let mut i = 0;
+    // `i + 1 < rest.len()` ⇒ both `.get(i)` / `.get(i + 1)` are `Some`; at the
+    // match `i < rest.len()` so `.get(..i)` is `Some` — byte-identical to the
+    // prior `rest[i]` / `rest[i + 1]` / `rest[..i]`.
     while i + 1 < rest.len() {
-      if rest[i] == 0 && rest[i + 1] == 0 {
-        return Some((rest[..i].to_vec(), i + 2));
+      if rest.get(i) == Some(&0) && rest.get(i + 1) == Some(&0) {
+        return Some((rest.get(..i).unwrap_or(&[]).to_vec(), i + 2));
       }
       i += 2;
     }
     None
   } else {
+    // `p` from `position` ⇒ `p < rest.len()`, so `.get(..p)` is always `Some`
+    // (byte-identical to the prior `rest[..p]`).
     rest
       .iter()
       .position(|&b| b == 0)
-      .map(|p| (rest[..p].to_vec(), p + 1))
+      .map(|p| (rest.get(..p).unwrap_or(&[]).to_vec(), p + 1))
   }
 }
 
 fn split_utf16_at_double_null(rest: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) {
   let mut i = 0;
+  // `i + 1 < rest.len()` ⇒ both `.get(i)` / `.get(i + 1)` are `Some`; at the
+  // match `i + 1 < rest.len()` so `i + 2 <= rest.len()` and `.get(..i)` /
+  // `.get(i + 2..)` are `Some` — byte-identical to the prior slices.
   while i + 1 < rest.len() {
-    if rest[i] == 0 && rest[i + 1] == 0 {
-      return (Some(&rest[..i]), Some(&rest[i + 2..]));
+    if rest.get(i) == Some(&0) && rest.get(i + 1) == Some(&0) {
+      return (rest.get(..i), rest.get(i + 2..));
     }
     i += 2;
   }
@@ -1005,7 +1109,10 @@ fn split_utf16_at_double_null(rest: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) {
 
 fn split_at_first_null(rest: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) {
   match rest.iter().position(|&b| b == 0) {
-    Some(p) => (Some(&rest[..p]), Some(&rest[p + 1..])),
+    // `p` from `position` ⇒ `p < rest.len()`, so `.get(..p)` / `.get(p + 1..)`
+    // are always `Some` — byte-identical to the prior `&rest[..p]` /
+    // `&rest[p + 1..]`.
+    Some(p) => (rest.get(..p), rest.get(p + 1..)),
     None => (None, None),
   }
 }
@@ -1047,14 +1154,17 @@ fn parse_rva(value: &[u8]) -> String {
   if value.len() < 2 {
     return String::new();
   }
-  let flag = value[0] as u32;
-  let bits = value[1] as u32;
+  // `value.len() >= 2` ⇒ `.first()` / `.get(1)` / `.get(2..)` are always
+  // `Some` (the fallbacks are unreachable) — byte-identical to `value[0]` /
+  // `value[1]` / `&value[2..]`.
+  let flag = value.first().copied().unwrap_or(0) as u32;
+  let bits = value.get(1).copied().unwrap_or(0) as u32;
   if bits == 0 {
     return String::new();
   }
   let bytes_per = bits.div_ceil(8);
   let bytes_per_usize = bytes_per as usize;
-  let dat = &value[2..];
+  let dat = value.get(2..).unwrap_or(&[]);
   // (label, rel-channel, peak-channel, flag-bit)
   let parse: &[(&str, u32, u32, u32)] = &[
     ("Right", 0, 2, 0x01),
@@ -1085,8 +1195,12 @@ fn parse_rva(value: &[u8]) -> String {
     // the u128 width limit (rg., bits=130 yields bytes_per=17 bytes per
     // channel, which exceeds u128).
     let mut rel: f64 = 0.0;
+    // The `dat.len() < j + bytes_per_usize` break above (with `peak_i > rel_i`
+    // for every table entry, so `j >= i`) guarantees `i + b < dat.len()` for
+    // every `b < bytes_per_usize`, so `.get(i + b)` is always `Some` (the `0`
+    // fallback is unreachable) — byte-identical to the prior `dat[i + b]`.
     for b in 0..bytes_per_usize {
-      rel = rel * 256.0 + f64::from(dat[i + b]);
+      rel = rel * 256.0 + f64::from(dat.get(i + b).copied().unwrap_or(0));
     }
     let sign = if (flag & flag_bit) == 0 { -1.0 } else { 1.0 };
     let v = if denom == 0.0 || !denom.is_finite() {
@@ -1102,12 +1216,17 @@ fn parse_rva(value: &[u8]) -> String {
 fn parse_rva2(value: &[u8]) -> String {
   // ID3.pm:1371-1395.
   let (id_str, mut pos) = match value.iter().position(|&b| b == 0) {
-    Some(p) => (decode_one_latin(&value[..p]), p + 1),
+    // `p` from `position` ⇒ `p < value.len()`, so `.get(..p)` is always `Some`
+    // (byte-identical to the prior `&value[..p]`).
+    Some(p) => (decode_one_latin(value.get(..p).unwrap_or(&[])), p + 1),
     None => (String::new(), 1),
   };
   let mut vals: Vec<String> = Vec::new();
+  // `pos + 4 <= value.len()` ⇒ reads at `pos`, `pos + 1`, `pos + 2`, `pos + 3`
+  // are all in range, so the `.get(..)` calls are always `Some` (the fallbacks
+  // are unreachable) — byte-identical to the prior fixed reads.
   while pos + 4 <= value.len() {
-    let type_byte = value[pos];
+    let type_byte = value.get(pos).copied().unwrap_or(0);
     let str_label = match type_byte {
       0 => "Other".to_string(),
       1 => "Master".to_string(),
@@ -1120,12 +1239,15 @@ fn parse_rva2(value: &[u8]) -> String {
       8 => "Subwoofer".to_string(),
       n => format!("Unknown({n})"),
     };
-    let db_i16 = i16::from_be_bytes([value[pos + 1], value[pos + 2]]);
+    let db_i16 = i16::from_be_bytes([
+      value.get(pos + 1).copied().unwrap_or(0),
+      value.get(pos + 2).copied().unwrap_or(0),
+    ]);
     let db = (db_i16 as f64) / 512.0;
     // ID3.pm:1390 — `10**($db/20+2)-100`; emit `sprintf '%+.1f%% %s'`.
     let pct = 10f64.powf(db / 20.0 + 2.0) - 100.0;
     vals.push(format!("{pct:+.1}% {str_label}"));
-    let peak_bits = value[pos + 3];
+    let peak_bits = value.get(pos + 3).copied().unwrap_or(0);
     let peak_bytes = (peak_bits as usize).div_ceil(8);
     pos += 4 + peak_bytes;
   }
@@ -1138,7 +1260,14 @@ fn parse_rva2(value: &[u8]) -> String {
 
 fn format_owne_date(s: &str) -> String {
   let bytes = s.as_bytes();
-  if bytes.len() < 8 || !bytes[..8].iter().all(|b| b.is_ascii_digit()) {
+  // `bytes.len() >= 8` ⇒ `.get(..8)` is always `Some` (the `false` fallback is
+  // unreachable) — byte-identical to the prior `bytes[..8]`. (`&s[..4]` etc.
+  // below are `&str` range slices, not flagged by the lint.)
+  if bytes.len() < 8
+    || !bytes
+      .get(..8)
+      .is_some_and(|b| b.iter().all(u8::is_ascii_digit))
+  {
     return s.to_string();
   }
   let y = &s[..4];
@@ -1335,6 +1464,11 @@ fn intern_id(id: &str) -> &'static str {
 // without bound. R5-F3 regression.
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::formats::id3::{v2_2::ID3V2_2_MAIN, v2_3::ID3V2_3_MAIN, v2_4::ID3V2_4_MAIN};
@@ -1723,12 +1857,15 @@ mod tests {
     assert_eq!(t.group_ref().family1(), "ID3v2_4");
     // dateTimeConv: XMP → EXIF date.
     assert_eq!(t.value_ref(), &TagValue::Str("2024:05:19".into()));
-    // Bundled minor Warn fires.
-    assert!(
-      m.warnings_slice()
-        .iter()
-        .any(|w| w.contains("[minor] Frame 'TDRC' is not valid for this ID3 version"))
-    );
+    // Bundled minor Warn fires. The stored message is BARE (no `[minor] `
+    // baked in) and carries ignorable level 1 (ID3.pm:1172 `..., 1`); the
+    // `[minor] ` prefix is applied centrally by `run_diagnostics`.
+    let idx = m
+      .warnings_slice()
+      .iter()
+      .position(|w| w.as_str() == "Frame 'TDRC' is not valid for this ID3 version")
+      .expect("bundled minor Warn must fire");
+    assert_eq!(m.warning_ignorable(idx), 1);
   }
 
   #[test]

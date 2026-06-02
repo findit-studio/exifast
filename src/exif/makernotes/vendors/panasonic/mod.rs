@@ -51,6 +51,8 @@
 //! `#[non_exhaustive]` so a future Phase 3-bis can add fields without a
 //! breaking change.
 
+#![deny(clippy::indexing_slicing)]
+
 pub mod body;
 pub mod printconv;
 pub mod tags;
@@ -866,6 +868,11 @@ fn first_i64(raw: &RawValue) -> Option<i64> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C S2); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use std::vec::Vec;
