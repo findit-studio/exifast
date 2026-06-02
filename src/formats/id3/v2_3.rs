@@ -2,6 +2,11 @@
 //! v2.3-only frames plus the `%id3v2_common` inclusion. 10-byte frame
 //! header (`a4Nn`); length is a normal big-endian 32-bit integer.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction.
+// This module is a tag-table definition (no runtime buffer indexing); the deny
+// is the file-level panic-safety contract for the slice.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   formats::id3::v2_common::common_v2_3,
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
@@ -54,6 +59,11 @@ fn v2_3_get(id: TagId) -> Option<&'static TagDef> {
 pub static ID3V2_3_MAIN: TagTable = TagTable::new("ID3", v2_3_get);
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the tests index fixed-layout data freely (an
+// out-of-range index is a test-assertion failure, not a shipped panic), so the
+// deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

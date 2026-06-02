@@ -67,6 +67,14 @@
 //! yet; FORMATS.md row 22 will wire it. On the committed fixtures the
 //! deferral is observably no-op (no RIFF wrapper present).
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the input buffer is converted to a checked `.get()`
+// form below. Each conversion is byte-identical: the `data.len() < 32` guard
+// at the top of `parse_inner` already proves the fixed-offset header reads in
+// range, so the `.get()` always yields the same bytes (and the magic check is
+// the equivalent `starts_with`).
+#![deny(clippy::indexing_slicing)]
+
 use crate::format_parser::{FormatParser, SharedFlags, parser_sealed};
 
 // ===========================================================================
@@ -694,13 +702,16 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   //   bytes 4..8 = ckSize  (any value, `.{4}` consumes them)
   //   byte 8 ∈ {0x02, 0x10}
   //   byte 9 == 0x04
-  if &data[..4] != b"wvpk" {
+  // `data.len() >= 32` (guard above) ⇒ every fixed-offset read below is in
+  // range; `starts_with` is the equivalent of `&data[..4] == b"wvpk"` and the
+  // `.get(n)` reads always yield `Some`, so all checks are byte-identical.
+  if !data.starts_with(b"wvpk") {
     return None;
   }
-  if data[8] != 0x02 && data[8] != 0x10 {
+  if data.get(8) != Some(&0x02) && data.get(8) != Some(&0x10) {
     return None;
   }
-  if data[9] != 0x04 {
+  if data.get(9) != Some(&0x04) {
     return None;
   }
 
@@ -728,7 +739,13 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   // calls, so the Perl batch-mode leak is structurally invisible
   // here. Threading byte-order state through `ParseContext` would be
   // dead code today and is intentionally not done.
-  let flags = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
+  // `data.len() >= 32` ⇒ `.get(24..28)` and the `[u8; 4]` `try_into` always
+  // succeed, so `flags` is the same big-endian word the prior
+  // `[data[24]..data[27]]` read produced (the `0` fallback is unreachable).
+  let flags = data
+    .get(24..28)
+    .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    .map_or(0, u32::from_be_bytes);
 
   // Mask + shift, faithful to ExifTool.pm:10067-10068
   // `val = (val & mask) >> shift`.
@@ -1020,6 +1037,11 @@ impl crate::metadata::Project for Meta<'_> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagmap::TagMap;

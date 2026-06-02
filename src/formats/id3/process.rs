@@ -65,6 +65,16 @@
 //! ID3.pm port, which is well beyond the F2 scope and risks the byte-
 //! exact contract on the 60+ existing conformance fixtures.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the input buffer (`data` / `post_id3` / `h_buff` /
+// `v`) is converted to a checked `.get()` form below. Each conversion is byte-
+// identical: the preceding guard (`data.len() < 10` / `>= 128` / `>= 128+227`,
+// the `10 + size > data.len()` / `h_buff.len() < 4` / `ext_len > h_buff.len()`
+// returns, the `scan_len.min(post_id3.len())` clamp, the `i + 1 < v.len()`
+// loop bound) already proves the read in range, so the `.get()` yields the
+// same bytes via the same recovery path it had before.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::ConvContext,
   format_parser::{FormatParser, SharedFlags, parser_sealed},
@@ -1154,7 +1164,11 @@ fn parse_mp3_typed<'a>(
   let mp3_flag = !ext.is_some_and(|e| e.eq_ignore_ascii_case("MUS"));
   let ext_str = ext.unwrap_or("");
   let post_id3 = data.get(hdr_end..).unwrap_or(&[]);
-  let bounded = &post_id3[..scan_len.min(post_id3.len())];
+  // The slice end `scan_len.min(post_id3.len())` is `<= post_id3.len()`, so
+  // `.get(..end)` is always `Some` (the `post_id3` fallback is unreachable) —
+  // byte-identical to the prior `&post_id3[..end]`.
+  let end = scan_len.min(post_id3.len());
+  let bounded = post_id3.get(..end).unwrap_or(post_id3);
   // `mpeg::AudioError` is uninhabited; the `Ok(None)` path covers "no sync".
   let mpeg = crate::formats::mpeg::parse_borrowed(bounded, mp3_flag, ext_str);
 
@@ -1742,7 +1756,10 @@ fn process_id3_inner_legacy(
   let mut enh_data: Option<Vec<u8>> = None;
   let mut trail_size_for_done_id3: usize = 0;
   if data.len() >= 128 {
-    let tail = &data[data.len() - 128..];
+    // `data.len() >= 128` ⇒ `data.len() - 128 <= data.len()`, so
+    // `.get(data.len() - 128..)` is always `Some` (the `&[]` fallback is
+    // unreachable) — byte-identical to the prior `&data[data.len() - 128..]`.
+    let tail = data.get(data.len() - 128..).unwrap_or(&[]);
     if tail.starts_with(b"TAG") {
       trailer_data = Some(tail.to_vec());
       id3_len += 128;
@@ -1761,7 +1778,11 @@ fn process_id3_inner_legacy(
       // pins this.
       if data.len() >= 128 + 227 {
         let e_start = data.len() - 128 - 227;
-        let e_buf = &data[e_start..data.len() - 128];
+        // `data.len() >= 128 + 227` ⇒ `e_start <= data.len() - 128 <=
+        // data.len()`, so `.get(e_start..data.len() - 128)` is always `Some`
+        // (the `&[]` fallback is unreachable) — byte-identical to the prior
+        // `&data[e_start..data.len() - 128]`.
+        let e_buf = data.get(e_start..data.len() - 128).unwrap_or(&[]);
         if e_buf.starts_with(b"TAG") {
           trail_size_for_done_id3 += 227;
           enh_data = Some(e_buf.to_vec());
@@ -1797,7 +1818,11 @@ fn parse_v2_header(data: &[u8], meta: &mut Metadata) -> Option<ParsedV2Header> {
     meta.push_warning("Short ID3 header");
     return None;
   }
-  let h = &data[3..10];
+  // `data.len() >= 10` ⇒ `.get(3..10)?` always yields a 7-byte slice, so the
+  // `[u8; 7]` `try_into` succeeds and every `h[..]` const read is in range;
+  // the `?` / `0` fallbacks are unreachable — byte-identical to the prior
+  // `&data[3..10]` + `h[0..6]` reads.
+  let h: [u8; 7] = data.get(3..10).and_then(|s| <[u8; 7]>::try_from(s).ok())?;
   let vers = u16::from_be_bytes([h[0], h[1]]);
   let flags = h[2];
   let size_raw = u32::from_be_bytes([h[3], h[4], h[5], h[6]]);
@@ -1817,7 +1842,10 @@ fn parse_v2_header(data: &[u8], meta: &mut Metadata) -> Option<ParsedV2Header> {
     meta.push_warning("Truncated ID3 data");
     return None;
   }
-  let mut h_buff: Vec<u8> = data[10..10 + size].to_vec();
+  // `10 + size <= data.len()` (guard above) ⇒ `.get(10..10 + size)` is always
+  // `Some` (the `&[]` fallback is unreachable) — byte-identical to the prior
+  // `data[10..10 + size]`.
+  let mut h_buff: Vec<u8> = data.get(10..10 + size).unwrap_or(&[]).to_vec();
   if flags & 0x80 != 0 && vers < 0x0400 {
     h_buff = reverse_unsync_inplace(&h_buff);
   }
@@ -1826,7 +1854,13 @@ fn parse_v2_header(data: &[u8], meta: &mut Metadata) -> Option<ParsedV2Header> {
       meta.push_warning("Bad ID3 extended header");
       return None;
     }
-    let ext_len_raw = u32::from_be_bytes([h_buff[0], h_buff[1], h_buff[2], h_buff[3]]);
+    // `h_buff.len() >= 4` ⇒ `.get(..4)` + `[u8; 4]` `try_into` always succeed;
+    // the `ext_len > h_buff.len()` guard makes `.get(ext_len..)` always `Some`
+    // — byte-identical to the prior `[h_buff[0]..h_buff[3]]` / `h_buff[ext_len..]`.
+    let ext_len_raw = h_buff
+      .get(..4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+      .map_or(0, u32::from_be_bytes);
     let ext_len = match unsync_safe(ext_len_raw) {
       Some(s) => s as usize,
       None => ext_len_raw as usize,
@@ -1835,7 +1869,7 @@ fn parse_v2_header(data: &[u8], meta: &mut Metadata) -> Option<ParsedV2Header> {
       meta.push_warning("Truncated ID3 extended header");
       return None;
     }
-    h_buff = h_buff[ext_len..].to_vec();
+    h_buff = h_buff.get(ext_len..).unwrap_or(&[]).to_vec();
   }
   Some(ParsedV2Header {
     h_buff,
@@ -1899,12 +1933,15 @@ fn finalize(
 fn reverse_unsync_inplace(v: &[u8]) -> Vec<u8> {
   let mut out = Vec::with_capacity(v.len());
   let mut i = 0;
+  // `i < v.len()` ⇒ `.get(i)` is `Some`; the `i + 1 < v.len()` guard keeps the
+  // `.get(i + 1)` read in range. The `0` fallbacks are unreachable (byte-
+  // identical to the prior `v[i]` / `v[i + 1]`).
   while i < v.len() {
-    if v[i] == 0xff && i + 1 < v.len() && v[i + 1] == 0x00 {
+    if v.get(i) == Some(&0xff) && i + 1 < v.len() && v.get(i + 1) == Some(&0x00) {
       out.push(0xff);
       i += 2;
     } else {
-      out.push(v[i]);
+      out.push(v.get(i).copied().unwrap_or(0));
       i += 1;
     }
   }
@@ -1986,6 +2023,11 @@ pub fn parse_id3v1_from_block(data: &[u8]) -> Option<Id3v1Meta<'static>> {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

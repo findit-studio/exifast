@@ -140,7 +140,6 @@ pub mod recovery;
 // validates the typed path directly.
 pub mod format_parser;
 pub mod processbinarydata;
-pub mod reader;
 #[cfg(feature = "json")]
 pub mod serialize;
 // The single inline tag-collection sink the typed-Meta rendering path emits

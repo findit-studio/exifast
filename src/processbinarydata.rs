@@ -12,6 +12,14 @@
 //! - `%AIFF::FormatVers` (AIFF.pm:119-123) — `PROCESS_PROC =
 //!   ProcessBinaryData`, `FORMAT = 'int32u'`. Single tag 0 (no overrides).
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on a runtime-length buffer is converted to a checked
+// `.get()` form below. Each conversion is byte-identical: the preceding length
+// guard (e.g. `more < N`, `data.len() < 10`, `base >= size`) already proves
+// the read in range, so the `.get()` always yields the same bytes via the same
+// recovery (skip/continue/short-read) it had before.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::apply,
   tagtable::{TagId, TagTable},
@@ -124,13 +132,15 @@ fn parse_format(s: &str) -> BinaryFormat<'_> {
 ///   quoting path).
 fn get_extended(data: &[u8]) -> TagValue {
   // Writer.pl:4501-4506. AIFF is MM, so $pt=0 (exponent at +0), sig at +2.
-  if data.len() < 10 {
+  // The `first_chunk::<10>` returns `None` on exactly the `< 10` short-read
+  // the explicit guard caught before; the `I64(0)` recovery is byte-identical.
+  // Const-index reads into the fixed `&[u8; 10]` are in-bounds by construction
+  // (not lint-flagged) and read the same bytes the old `data[0..10]` did.
+  let Some(b) = data.first_chunk::<10>() else {
     return TagValue::I64(0); // out-of-bounds ⇒ Perl would short-read; defensive 0.
-  }
-  let exp_raw = u16::from_be_bytes([data[0], data[1]]);
-  let sig = u64::from_be_bytes([
-    data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9],
-  ]);
+  };
+  let exp_raw = u16::from_be_bytes([b[0], b[1]]);
+  let sig = u64::from_be_bytes([b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9]]);
   // Writer.pl:4504-4505 `$sign = ($exp & 0x8000) ? -1 : 1; $exp = ($exp &
   // 0x7fff) - 16383 - 63`. The all-zero case (0x0000 exp, 0 sig) ⇒
   // value = 0.0, faithful to Perl's `1 * 0 * 2^(-16446) == 0`.
@@ -244,7 +254,10 @@ fn int_or_str(sign_neg: bool, mag: u128) -> TagValue {
 /// subset does not exercise that path.)
 fn strip_at_first_null(bytes: &[u8]) -> &[u8] {
   match bytes.iter().position(|&b| b == 0) {
-    Some(i) => &bytes[..i],
+    // `position` yields `i < bytes.len()`, so `..i` is always in range and
+    // `.get(..i)` always returns `Some(&bytes[..i])` (the `unwrap_or` fallback
+    // is unreachable) — byte-identical to the prior `&bytes[..i]`.
+    Some(i) => bytes.get(..i).unwrap_or(bytes),
     None => bytes,
   }
 }
@@ -315,29 +328,35 @@ pub fn process_binary_data(
         if more < 1 {
           None
         } else {
-          Some(TagValue::I64(i64::from(data[base])))
+          // `more >= 1` ⇒ `base < size`, so `.get(base)` is always `Some`
+          // here (byte-identical to the prior `data[base]`).
+          data.get(base).map(|&b| TagValue::I64(i64::from(b)))
         }
       }
       BinaryFormat::Int16u => {
         if more < 2 {
           None
         } else {
-          Some(TagValue::I64(i64::from(u16::from_be_bytes([
-            data[base],
-            data[base + 1],
-          ]))))
+          // `more >= 2` ⇒ `base + 2 <= size`, so `.get(base..base + 2)` and the
+          // `[u8; 2]` `try_into` both always succeed (byte-identical to the
+          // prior `data[base], data[base + 1]` big-endian read).
+          data
+            .get(base..base + 2)
+            .and_then(|s| <[u8; 2]>::try_from(s).ok())
+            .map(|a| TagValue::I64(i64::from(u16::from_be_bytes(a))))
         }
       }
       BinaryFormat::Int32u => {
         if more < 4 {
           None
         } else {
-          Some(TagValue::I64(i64::from(u32::from_be_bytes([
-            data[base],
-            data[base + 1],
-            data[base + 2],
-            data[base + 3],
-          ]))))
+          // `more >= 4` ⇒ `base + 4 <= size`, so `.get(base..base + 4)` and the
+          // `[u8; 4]` `try_into` both always succeed (byte-identical to the
+          // prior four-byte big-endian read).
+          data
+            .get(base..base + 4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map(|a| TagValue::I64(i64::from(u32::from_be_bytes(a))))
         }
       }
       BinaryFormat::StringFixed(n) => {
@@ -350,8 +369,9 @@ pub fn process_binary_data(
         if avail == 0 {
           None
         } else {
-          let bytes = &data[base..base + avail];
-          let stripped = strip_at_first_null(bytes); // :10027
+          // `avail = more.min(n)` and `more = size - base` with `base < size`,
+          // so `base + avail <= size` and `.get(base..base + avail)` is always
+          // `Some` here (byte-identical to the prior `&data[base..base+avail]`).
           // Emit raw bytes (faithful to Perl `$val = substr(...)`, which is
           // a BYTE STRING — no UTF-8 reinterpretation, no `from_utf8_lossy`).
           // The convert layer is responsible for any MacRoman/UTF-16
@@ -360,7 +380,9 @@ pub fn process_binary_data(
           // preserved, invalid high bytes replaced with `?`, matching Perl
           // EscapeJSON's behavior). Codex R3 verified the divergence on
           // CompressionType `\x80ABC` (Perl: "?ABC"; pre-fix: "U+0080ABC").
-          Some(TagValue::Bytes(stripped.to_vec()))
+          data
+            .get(base..base + avail)
+            .map(|bytes| TagValue::Bytes(strip_at_first_null(bytes).to_vec())) // :10027
         }
       }
       BinaryFormat::Pstring => {
@@ -369,10 +391,13 @@ pub fn process_binary_data(
         // ReadValue (ExifTool.pm:6290-6293) shortens count when requested
         // bytes exceed remaining data. Faithful clamp: emit a truncated
         // pstring rather than silently drop. Codex R3 fix.
+        // `more >= 1` ⇒ `base < size`, so `.get(base)` is always `Some` in the
+        // `else`; the `unwrap_or(0)` is unreachable. The `more < 1` arm keeps
+        // the faithful `$more` short-read skip (byte-identical to `data[base]`).
         if more < 1 {
           None
         } else {
-          let declared = data[base] as usize;
+          let declared = data.get(base).copied().unwrap_or(0) as usize;
           let body_start = base + 1; // post-increment of $entry
           let body_remaining = size.saturating_sub(body_start);
           let count = declared.min(body_remaining);
@@ -382,12 +407,15 @@ pub fn process_binary_data(
             // (no value); mirror that as a silent skip.
             None
           } else {
-            let bytes = &data[body_start..body_start + count];
-            let stripped = strip_at_first_null(bytes); // :10027
+            // `count = declared.min(size - body_start)` ⇒
+            // `body_start + count <= size`, so `.get(body_start..body_start +
+            // count)` is always `Some` (byte-identical to the prior slice).
             // Emit raw bytes — see the StringFixed branch above. ValueConv
             // (e.g. AIFC `CompressorName`'s MacRoman decode) reads the raw
             // bytes; Codex R1 fix.
-            Some(TagValue::Bytes(stripped.to_vec()))
+            data
+              .get(body_start..body_start + count)
+              .map(|bytes| TagValue::Bytes(strip_at_first_null(bytes).to_vec())) // :10027
           }
         }
       }
@@ -395,7 +423,10 @@ pub fn process_binary_data(
         if more < 10 {
           None
         } else {
-          Some(get_extended(&data[base..base + 10]))
+          // `more >= 10` ⇒ `base + 10 <= size`, so `.get(base..base + 10)` is
+          // always `Some` (byte-identical to the prior `&data[base..base+10]`);
+          // `get_extended` re-checks the length and short-reads to `I64(0)`.
+          data.get(base..base + 10).map(get_extended)
         }
       }
       BinaryFormat::Unsupported(_) => None,
@@ -429,6 +460,11 @@ pub fn process_binary_data(
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagtable::{PrintConv, TagDef, ValueConv};
