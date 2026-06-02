@@ -65,6 +65,12 @@
 //! - The FlashPix / MPF trailer scans and the preview-image trailer
 //!   (`ExifTool.pm:7797-7815`).
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// the marker walk already reads ahead through `data.get(..)`; the few remaining
+// raw index/slice sites (the SOI check, the `0xff` fill-run scan, the Exif-arm
+// signature) each sit behind a length guard and become checked `.get()` forms.
+#![deny(clippy::indexing_slicing)]
+
 use std::{string::String, vec::Vec};
 
 use super::ifd::{ByteOrder, get_u16};
@@ -146,8 +152,10 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // ProcessJPEG via other detection and carry no `APP1` Exif arm of interest
   // here — the camera-JPEG path needs `\xff\xd8`. A non-JPEG is the ONLY
   // `None`: a real TIFF never begins `\xff\xd8`, so the engine's JPEG branch
-  // stays unambiguous.
-  if data.len() < 2 || data[0] != 0xff || data[1] != 0xd8 {
+  // stays unambiguous. The checked `.first()`/`.get(1)` fold the `data.len() < 2`
+  // guard into the byte comparison (a too-short slice yields `None != Some(_)`),
+  // byte-identical to `data[0] != 0xff || data[1] != 0xd8`.
+  if data.first() != Some(&0xff) || data.get(1) != Some(&0xd8) {
     return None;
   }
 
@@ -305,8 +313,11 @@ fn scan_jpeg_segments(data: &[u8]) -> Vec<Segment> {
       return segments;
     };
     pos += ff;
-    // Consume the run of `0xff` fill bytes (`ExifTool.pm:7351-7356`).
-    while pos < data.len() && data[pos] == 0xff {
+    // Consume the run of `0xff` fill bytes (`ExifTool.pm:7351-7356`). The
+    // checked `data.get(pos) == Some(&0xff)` folds the `pos < data.len()` bound
+    // into the comparison — byte-identical to `pos < data.len() && data[pos] ==
+    // 0xff`.
+    while data.get(pos) == Some(&0xff) {
       pos += 1;
     }
     // `$raf->Read($ch, 1) or last Marker` — need the marker byte.
@@ -372,8 +383,14 @@ fn exif_arm_garbage(payload: &[u8]) -> Option<usize> {
   for garbage in 0..=4usize {
     let sig = payload.get(garbage..)?;
     // `Exif` (case-insensitive, `/i`) + `\0` (5 bytes) then `.` (≥ 1 more
-    // byte) must be present.
-    if sig.len() > 5 && sig[..4].eq_ignore_ascii_case(b"Exif") && sig[4] == 0 {
+    // byte) must be present. With `sig.len() > 5`, `sig.get(..4)` / `sig.get(4)`
+    // are `Some` — the checked, byte-identical form of `sig[..4]` / `sig[4]`.
+    if sig.len() > 5
+      && sig
+        .get(..4)
+        .is_some_and(|name| name.eq_ignore_ascii_case(b"Exif"))
+      && sig.get(4) == Some(&0)
+    {
       return Some(garbage);
     }
   }
@@ -499,6 +516,11 @@ const fn is_standalone_marker(marker: u8) -> bool {
 // ===========================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test JPEG/TIFF builders index fixed-layout
+// buffers freely (an out-of-range index is a test failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::exif::parse_exif_block;

@@ -17,6 +17,11 @@
 //! module is gated on `feature = "exif"` (NOT `gps`) and the GPS table
 //! (`feature = "gps"`) re-uses it.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length guard (the
+// 8-byte charset-ID prefix split) and converted to a checked `.get()` form.
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::ByteOrder;
 use std::string::String;
 
@@ -60,20 +65,24 @@ use std::string::String;
 #[must_use]
 pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
   // `return $val if length($val) < 8` — no prefix; treat the whole blob as
-  // the (lossy-UTF-8) value.
-  if val.len() < 8 {
+  // the (lossy-UTF-8) value. `split_at_checked(8)` fuses the `length < 8` guard
+  // with the `$id = substr($val,0,8); $str = substr($val,8)` split: it returns
+  // `None` for a < 8-byte value (the `return $val` arm) and otherwise the two
+  // sub-slices — the checked, byte-identical form of `(&val[0..8], &val[8..])`.
+  let Some((id, payload)) = val.split_at_checked(8) else {
     return String::from_utf8_lossy(val).into_owned();
-  }
-  let id = &val[0..8];
-  let payload = &val[8..];
+  };
 
   // `/^(ASCII)?(\0|[\0 ]+$)/` — an "ASCII" prefix (NUL- or space-padded),
   // or an all-NUL/space prefix with no name (the "undefined → ASCII"
   // default). The regex's first alternative matches a leading `\0`, the
   // second an all-`[\0 ]` 8-byte field.
   let is_ascii = {
+    // `id.starts_with(b"ASCII")` guarantees `id.len() >= 5`, so `id.get(5..)`
+    // is `Some` — the checked, byte-identical form of `&id[5..]` (the
+    // `.unwrap_or(id)` fallback is unreachable on this branch).
     let after_name: &[u8] = if id.starts_with(b"ASCII") {
-      &id[5..]
+      id.get(5..).unwrap_or(id)
     } else {
       id
     };
@@ -83,18 +92,22 @@ pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
       || (!after_name.is_empty() && after_name.iter().all(|&b| b == 0 || b == b' '))
   };
   if is_ascii {
-    // `$str =~ s/\0.*//s` — truncate at the first NUL terminator.
+    // `$str =~ s/\0.*//s` — truncate at the first NUL terminator. `end` is
+    // either a NUL position (`< len`) or `payload.len()`, so `payload.get(..end)`
+    // is always `Some` — the checked form of `&payload[..end]`.
     let end = payload
       .iter()
       .position(|&b| b == 0)
       .unwrap_or(payload.len());
-    let mut s = String::from_utf8_lossy(&payload[..end]).into_owned();
+    let mut s = String::from_utf8_lossy(payload.get(..end).unwrap_or(payload)).into_owned();
     trim_trailing_spaces(&mut s);
     return s;
   }
 
-  // `/^(UNICODE)[\0 ]$/` — the 7-letter name plus one NUL/space byte.
-  if id.starts_with(b"UNICODE") && matches!(id[7], 0 | b' ') {
+  // `/^(UNICODE)[\0 ]$/` — the 7-letter name plus one NUL/space byte. `id` is
+  // exactly 8 bytes (`split_at_checked(8)`), so `id.get(7)` is the checked,
+  // byte-identical form of `id[7]`.
+  if id.starts_with(b"UNICODE") && matches!(id.get(7), Some(0 | b' ')) {
     // `Decode($str, 'UTF16', 'Unknown')` — byte order is guessed starting
     // from `GetByteOrder()` (the EXIF block's order), overridden by a BOM,
     // then flipped if the byte-distribution heuristic shows the guess was
@@ -103,8 +116,13 @@ pub fn convert_exif_text(val: &[u8], order: ByteOrder) -> String {
     return decode_utf16_unknown(payload, order);
   }
 
-  // `/^(JIS)[\0 ]{5}$/` — "JIS" plus five NUL/space bytes.
-  if id.starts_with(b"JIS") && id[3..8].iter().all(|&b| b == 0 || b == b' ') {
+  // `/^(JIS)[\0 ]{5}$/` — "JIS" plus five NUL/space bytes. `id` is exactly 8
+  // bytes, so `id.get(3..8)` is `Some` — the checked form of `id[3..8]`.
+  if id.starts_with(b"JIS")
+    && id
+      .get(3..8)
+      .is_some_and(|tail| tail.iter().all(|&b| b == 0 || b == b' '))
+  {
     // JIS codec not ported (see doc comment). Drop the prefix, keep the
     // payload as a lossy string so the value is at least not a binary blob.
     let mut s = String::from_utf8_lossy(payload).into_owned();
@@ -168,16 +186,17 @@ fn decode_utf16_unknown(bytes: &[u8], order: ByteOrder) -> String {
     _ => bytes,
   };
 
-  // Step 3: unpack to u16 code units in the current order.
+  // Step 3: unpack to u16 code units in the current order. `chunks_exact(2)`
+  // yields only full 2-byte chunks, so the `[a, b]` slice pattern is total here
+  // (it skips the trailing odd byte exactly as `c[0]`/`c[1]` did); a non-2 chunk
+  // is impossible and falls to `0` (unreachable).
   let unpack = |be: bool| -> std::vec::Vec<u16> {
     body
       .chunks_exact(2)
-      .map(|c| {
-        if be {
-          u16::from_be_bytes([c[0], c[1]])
-        } else {
-          u16::from_le_bytes([c[0], c[1]])
-        }
+      .map(|c| match *c {
+        [a, b] if be => u16::from_be_bytes([a, b]),
+        [a, b] => u16::from_le_bytes([a, b]),
+        _ => 0,
       })
       .collect()
   };
@@ -210,14 +229,20 @@ fn decode_utf16_unknown(bytes: &[u8], order: ByteOrder) -> String {
 
   // Step 5: NUL-terminate (caller payloads are NUL-terminated) then collapse
   // UTF-16 surrogate pairs. `String::from_utf16_lossy` handles the pairing and
-  // maps any unpaired surrogate to U+FFFD.
+  // maps any unpaired surrogate to U+FFFD. `end` is a NUL position (`< len`) or
+  // `units.len()`, so `units.get(..end)` is always `Some` — the checked form of
+  // `&units[..end]`.
   let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-  let mut s = String::from_utf16_lossy(&units[..end]);
+  let mut s = String::from_utf16_lossy(units.get(..end).unwrap_or(&units));
   trim_trailing_spaces(&mut s);
   s
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); relaxed for the test module (test indexing is an
+// assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

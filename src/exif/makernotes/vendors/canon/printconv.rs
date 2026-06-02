@@ -5,6 +5,12 @@
 //! and inline sprintf expressions in `Canon.pm` for Main + CameraSettings
 //! + FileInfo + FocalLength.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice in these Canon PrintConv helpers is dominated by a
+// preceding length/count guard and converted to a checked `.get()` form
+// (re-asserts the parent `exif` deny over the makernotes `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use super::lens_types;
 use super::model_ids;
 use crate::exif::ifd::RawValue;
@@ -240,18 +246,31 @@ fn file_number_dash(n: u64) -> String {
 /// `sprintf("%.8x", $val)` then split into prefix + groups.
 fn firmware_revision_text(val: u64) -> String {
   let rev = std::format!("{:08x}", val);
-  // Pattern: ^(.)(.)(..)0?(.+)(..)$
+  // Pattern: ^(.)(.)(..)0?(.+)(..)$. `rev` is `{:08x}` ⇒ always ≥ 8 bytes; the
+  // `bytes.len() < 6` guard further dominates every read below, so each
+  // `bytes.get(..)` is `Some` — the checked, byte-identical form of the
+  // `bytes[0]`/`bytes[1]`/`bytes[2..4]`/`bytes[4..len-2]`/`bytes[len-2..]`
+  // reads (the `'-'` / `"--"` fallbacks are unreachable).
   let bytes = rev.as_bytes();
   if bytes.len() < 6 {
     return rev;
   }
-  let rel = bytes[0] as char;
-  let v1 = bytes[1] as char;
-  let v2 = core::str::from_utf8(&bytes[2..4]).unwrap_or("--");
+  let rel = bytes.first().map_or('-', |&b| b as char);
+  let v1 = bytes.get(1).map_or('-', |&b| b as char);
+  let v2 = bytes
+    .get(2..4)
+    .and_then(|s| core::str::from_utf8(s).ok())
+    .unwrap_or("--");
   // 0?(.+)(..) — strip optional leading 0 from the r1 group
-  let mid = core::str::from_utf8(&bytes[4..bytes.len() - 2]).unwrap_or("--");
+  let mid = bytes
+    .get(4..bytes.len() - 2)
+    .and_then(|s| core::str::from_utf8(s).ok())
+    .unwrap_or("--");
   let r1 = mid.strip_prefix('0').unwrap_or(mid);
-  let r2 = core::str::from_utf8(&bytes[bytes.len() - 2..]).unwrap_or("--");
+  let r2 = bytes
+    .get(bytes.len() - 2..)
+    .and_then(|s| core::str::from_utf8(s).ok())
+    .unwrap_or("--");
   let prefix = match rel {
     'a' => "Alpha ",
     'b' => "Beta ",
@@ -388,8 +407,11 @@ fn simple_label<F: Fn(i64) -> Option<&'static str>>(
 /// Render a raw value as a default [`TagValue`] (no PrintConv).
 pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
   use std::string::ToString;
+  // Each singleton arm matches a one-element slice (`[x]`) on the Vec's
+  // `as_slice()` rather than `len()==1` + `v[0]`: the binding IS the sole
+  // element, so the read is checked by the pattern and stays byte-identical.
   match raw {
-    RawValue::I64(v) if v.len() == 1 => TagValue::I64(v[0]),
+    RawValue::I64(v) if let [x] = v.as_slice() => TagValue::I64(*x),
     RawValue::I64(v) => TagValue::Str(
       v.iter()
         .map(|n| n.to_string())
@@ -397,9 +419,9 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::U64(v) if v.len() == 1 => match i64::try_from(v[0]) {
+    RawValue::U64(v) if let [x] = v.as_slice() => match i64::try_from(*x) {
       Ok(n) => TagValue::I64(n),
-      Err(_) => TagValue::U64(v[0]),
+      Err(_) => TagValue::U64(*x),
     },
     RawValue::U64(v) => TagValue::Str(
       v.iter()
@@ -408,7 +430,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::F64(v) if v.len() == 1 => TagValue::F64(v[0]),
+    RawValue::F64(v) if let [x] = v.as_slice() => TagValue::F64(*x),
     RawValue::F64(v) => TagValue::Str(
       v.iter()
         .map(|f| f.to_string())
@@ -416,7 +438,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Rational(rs) if rs.len() == 1 => TagValue::Rational(rs[0]),
+    RawValue::Rational(rs) if let [r] = rs.as_slice() => TagValue::Rational(*r),
     RawValue::Rational(rs) => TagValue::Str(
       rs.iter()
         .map(|r| std::format!("{}/{}", r.numerator(), r.denominator()))
@@ -430,6 +452,11 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

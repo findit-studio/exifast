@@ -17,6 +17,12 @@
 //! data is stored INSIDE the blob, and bundled's `Base` inheritance
 //! makes those offsets resolvable against the captured byte range).
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use super::printconv;
 use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
 use std::vec::Vec;
@@ -155,7 +161,9 @@ pub fn walk_canon_in_tiff(
         // `s/\0.*//s` — trim at the first NUL (matches `Format::Ascii`
         // decode in `read_value`).
         let nul_trimmed = match window.iter().position(|&b| b == 0) {
-          Some(nul) => &window[..nul],
+          // `nul` is a NUL position (`< window.len()`), so `window.get(..nul)`
+          // is `Some` — the checked, byte-identical form of `&window[..nul]`.
+          Some(nul) => window.get(..nul).unwrap_or(window),
           None => window,
         };
         // `s/\xff+$//` — strip one-or-more trailing `0xff` bytes.
@@ -163,8 +171,12 @@ pub fn walk_canon_in_tiff(
           .iter()
           .rposition(|&b| b != 0xff)
           .map_or(0, |i| i + 1);
-        raw =
-          RawValue::Text(std::string::String::from_utf8_lossy(&nul_trimmed[..end]).into_owned());
+        // `end` is `rposition + 1` (≤ len) or 0, so `nul_trimmed.get(..end)` is
+        // `Some` — the checked, byte-identical form of `&nul_trimmed[..end]`.
+        raw = RawValue::Text(
+          std::string::String::from_utf8_lossy(nul_trimmed.get(..end).unwrap_or(nul_trimmed))
+            .into_owned(),
+        );
       }
     }
     out.push(CanonEntry {
@@ -194,8 +206,9 @@ pub fn walk_canon_body(
 }
 
 fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
-  let b = data.get(pos..pos + 2)?;
-  let arr: [u8; 2] = [b[0], b[1]];
+  // `get(pos..pos+2)` yields exactly 2 bytes, so `try_into()` to `[u8; 2]`
+  // always succeeds — the checked, byte-identical form of `[b[0], b[1]]`.
+  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -203,8 +216,9 @@ fn read_u16(data: &[u8], pos: usize, order: ByteOrder) -> Option<u16> {
 }
 
 fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
-  let b = data.get(pos..pos + 4)?;
-  let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
+  // `get(pos..pos+4)` yields exactly 4 bytes, so `try_into()` to `[u8; 4]`
+  // always succeeds — the checked, byte-identical form of `[b[0], b[1], b[2], b[3]]`.
+  let arr: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
@@ -212,6 +226,11 @@ fn read_u32(data: &[u8], pos: usize, order: ByteOrder) -> Option<u32> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

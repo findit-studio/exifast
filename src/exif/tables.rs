@@ -27,6 +27,11 @@
 //! fallback, but the default `-j` output simply omits unknown tags, faithful
 //! to `Exif.pm:6757` `next unless $verbose`).
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction.
+// This module is tag tables + scalar `sprintf`-style formatters — it carries
+// no raw slice/index sites; the deny-lint pins that property for the future.
+#![deny(clippy::indexing_slicing)]
+
 // ===========================================================================
 // SubDirectory pointer tags — the IFD-chain seam (Exif.pm:2006/2130/2496/2720)
 // ===========================================================================
@@ -1072,6 +1077,10 @@ pub fn print_fraction(val: f64) -> std::string::String {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); relaxed for the test module (test indexing is an
+// assertion failure, not a shipped panic).
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

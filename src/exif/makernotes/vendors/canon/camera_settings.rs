@@ -17,6 +17,12 @@
 //! Per-tag PrintConv: the bundled `PrintConv => { … }` hashes are
 //! ported as inline match arms in [`apply_print_conv`].
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use crate::value::TagValue;
 use smol_str::SmolStr;
 use std::string::String;
@@ -452,7 +458,14 @@ pub fn parse_with_lens_id_capture(
     if byte_off + 2 > data.len() {
       break;
     }
-    let arr: [u8; 2] = [data[byte_off], data[byte_off + 1]];
+    // The `byte_off + 2 > data.len()` guard above makes `data.get(byte_off..
+    // byte_off+2)` `Some` and its `try_into()` to `[u8; 2]` succeed — the
+    // checked, byte-identical form of `[data[byte_off], data[byte_off+1]]`
+    // (the `[0, 0]` fallback is unreachable).
+    let arr: [u8; 2] = data
+      .get(byte_off..byte_off + 2)
+      .and_then(|s| s.try_into().ok())
+      .unwrap_or([0, 0]);
     let raw_word = match order {
       crate::exif::ifd::ByteOrder::Little => i16::from_le_bytes(arr),
       crate::exif::ifd::ByteOrder::Big => i16::from_be_bytes(arr),
@@ -1176,10 +1189,10 @@ fn format_g_two(v: f64) -> String {
 /// `.max(1)`), or `None` if the blob doesn't reach position 25.
 fn read_focal_units_word(data: &[u8], order: crate::exif::ifd::ByteOrder) -> Option<i16> {
   let byte_off = 2 * 25;
-  if byte_off + 2 > data.len() {
-    return None;
-  }
-  let arr: [u8; 2] = [data[byte_off], data[byte_off + 1]];
+  // `data.get(byte_off..byte_off+2)?` folds the `byte_off + 2 > data.len()`
+  // guard into the read and its `try_into()` to `[u8; 2]` always succeeds — the
+  // checked, byte-identical form of `[data[byte_off], data[byte_off+1]]`.
+  let arr: [u8; 2] = data.get(byte_off..byte_off + 2)?.try_into().ok()?;
   Some(match order {
     crate::exif::ifd::ByteOrder::Little => i16::from_le_bytes(arr),
     crate::exif::ifd::ByteOrder::Big => i16::from_be_bytes(arr),
@@ -1220,6 +1233,11 @@ fn should_skip(t: &CameraSettingsTag, raw_int: i16) -> bool {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::exif::ifd::ByteOrder;
