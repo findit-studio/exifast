@@ -99,6 +99,8 @@
 //! a fallback; it lights up dashcam-only files that have no first-party
 //! timed-metadata track.
 
+#![deny(clippy::indexing_slicing)]
+
 extern crate alloc;
 use alloc::{
   string::{String, ToString},
@@ -130,13 +132,11 @@ const DATE_MAX: [u32; 6] = [24, 59, 59, 2200, 12, 31];
 //    SetByteOrder('II') at the top of ProcessFreeGPS, QuickTimeStream.pl:1649)
 
 fn le_u16(b: &[u8], off: usize) -> Option<u16> {
-  b.get(off..off + 2)
-    .map(|s| u16::from_le_bytes([s[0], s[1]]))
+  Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn le_u32(b: &[u8], off: usize) -> Option<u32> {
-  b.get(off..off + 4)
-    .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+  Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 fn le_i32(b: &[u8], off: usize) -> Option<i32> {
@@ -144,26 +144,23 @@ fn le_i32(b: &[u8], off: usize) -> Option<i32> {
 }
 
 fn le_f32(b: &[u8], off: usize) -> Option<f64> {
-  b.get(off..off + 4)
-    .map(|s| f64::from(f32::from_le_bytes([s[0], s[1], s[2], s[3]])))
+  let arr: [u8; 4] = b.get(off..off + 4)?.try_into().ok()?;
+  Some(f64::from(f32::from_le_bytes(arr)))
 }
 
 fn le_f64(b: &[u8], off: usize) -> Option<f64> {
-  b.get(off..off + 8)
-    .map(|s| f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+  Some(f64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
 }
 
 // ── big-endian readers (a couple of variants override the byte order;
 //    most prominent is GPSType 20 / Nextbase 512G) ──────────────────────────
 
 fn be_u16(b: &[u8], off: usize) -> Option<u16> {
-  b.get(off..off + 2)
-    .map(|s| u16::from_be_bytes([s[0], s[1]]))
+  Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
-  b.get(off..off + 4)
-    .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+  Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 // ===========================================================================
@@ -206,7 +203,12 @@ pub fn scan_media_data(
   if end <= start {
     return;
   }
-  let mdat = &data[start..end];
+  // `start`/`end` are both clamped to `data.len()` and `end > start`, so this
+  // `.get` is always `Some`; the `else` return is unreachable and matches the
+  // `end <= start` guard's recovery (byte-identical).
+  let Some(mdat) = data.get(start..end) else {
+    return;
+  };
 
   // QuickTimeStream.pl:2050 `$$et{FreeGPS2}` — the cross-block ATC ring-buffer
   // state (`Then` + `RecentRecPos`) persists for the whole scan, exactly as
@@ -217,7 +219,11 @@ pub fn scan_media_data(
   // QuickTimeStream.pl:3702 `while ($dataLen)` — read 0x8000-byte chunks.
   while pos < mdat.len() {
     let chunk_end = (pos + GPS_BLOCK_SIZE).min(mdat.len());
-    let chunk = &mdat[pos..chunk_end];
+    // `chunk_end <= mdat.len()` and `pos < mdat.len() <= chunk_end`, so this
+    // `.get` is always `Some`; the `else` break matches the `while` guard.
+    let Some(chunk) = mdat.get(pos..chunk_end) else {
+      break;
+    };
     // QuickTimeStream.pl:3710 `if ($buff !~ /(\0..\0freeGPS |GP\x06\0\0)/sg)`.
     // Search ALL non-overlapping matches in this chunk and dispatch.
     let mut search_off = 0usize;
@@ -225,7 +231,10 @@ pub fn scan_media_data(
     // `$pos += $len` (QuickTimeStream.pl:3781) so the next iteration re-windows
     // at the byte AFTER the whole block. We mirror that by overriding `pos`.
     let mut pos_override: Option<usize> = None;
-    while let Some(hit) = find_magic(&chunk[search_off..]) {
+    // `search_off` is kept `< chunk.len()` by the guards that set it, so
+    // `chunk.get(search_off..)` is `Some`; on the impossible miss `and_then`
+    // short-circuits and the loop ends (as if no further magic) — byte-identical.
+    while let Some(hit) = chunk.get(search_off..).and_then(find_magic) {
       let abs = search_off + hit.offset;
       match hit.kind {
         MagicKind::FreeGps => {
@@ -267,7 +276,12 @@ pub fn scan_media_data(
             // data, so stop scanning entirely.
             return;
           }
-          let block = &mdat[block_abs..block_abs + len];
+          // The guard above proves `block_abs + len <= mdat.len()`, so this
+          // `.get` is always `Some`; the `else` return matches that guard's
+          // recovery (byte-identical).
+          let Some(block) = mdat.get(block_abs..block_abs + len) else {
+            return;
+          };
           // QuickTimeStream.pl:3777 `$dirInfo = { DataPt, DataPos, DirLen }` —
           // the brute-force scan's `$dirInfo` carries NO `SampleTime`, so
           // `sample_time` is `None` here (a Type-19 block found by the scan
@@ -352,14 +366,19 @@ fn find_magic(buf: &[u8]) -> Option<MagicHit> {
   // the box size is at most 24-bit, and the 4th byte is also 0 in every
   // real sample).
   let mut start = 0usize;
-  while let Some(pos) = memmem(&buf[start..], needle) {
+  // `start` stays `<= buf.len()` (the matched needle always fits), so
+  // `buf.get(start..)` is `Some`; an impossible miss ends the loop as if no
+  // further match — byte-identical to `memmem(&buf[start..], needle)`.
+  while let Some(pos) = buf.get(start..).and_then(|s| memmem(s, needle)) {
     let abs = start + pos;
     if abs >= 4 {
       // The match offset is `abs`, the magic starts here, the 4 BE bytes
       // BEFORE this position are the box length. QuickTimeStream.pl:3710's
       // pattern requires bytes -4 and -1 to be NUL.
       let pre = abs - 4;
-      if buf[pre] == 0 && buf[pre + 3] == 0 {
+      // `abs >= 4` ⇒ `pre >= 0` and (since the needle fits) `pre + 3 < len`,
+      // so both `.get`s are `Some` — byte-identical to the raw indexing.
+      if buf.get(pre) == Some(&0) && buf.get(pre + 3) == Some(&0) {
         // The MATCH starts at the NUL (i.e. at `abs - 4`).
         let offset = abs - 4;
         best = Some(MagicHit {
@@ -395,7 +414,9 @@ fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
   }
   let last = hay.len() - needle.len();
   for i in 0..=last {
-    if &hay[i..i + needle.len()] == needle {
+    // `i <= last = hay.len() - needle.len()`, so `i + needle.len() <=
+    // hay.len()` and `.get` is always `Some` — byte-identical to the slice.
+    if hay.get(i..i + needle.len()) == Some(needle) {
       return Some(i);
     }
   }
@@ -531,7 +552,7 @@ pub fn process_free_gps(
   // GPSType 1: Azdome GS63H / EEEkit encrypted ASCII GPS
   // (QuickTimeStream.pl:1652-1715). Detected by the 8-byte XOR-0xAA-prefix
   // signature at offset 18.
-  if data.len() >= 26 && data[18..26] == [0xaa, 0xaa, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54] {
+  if data.get(18..26) == Some([0xaa, 0xaa, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54].as_slice()) {
     decode_type1_azdome(data, out);
     return;
   }
@@ -539,7 +560,7 @@ pub fn process_free_gps(
   // GPSType 2: Nextbase 512GW NMEA dashcam
   // (QuickTimeStream.pl:1717-1750). Detected by an ASCII timestamp at offset
   // 52: 14 digits in YYYYMMDDhhmmss.
-  if data.len() >= 66 && is_ascii_digits(&data[52..66], 14) {
+  if data.get(52..66).is_some_and(|s| is_ascii_digits(s, 14)) {
     decode_type2_nextbase_nmea(data, out);
     return;
   }
@@ -722,7 +743,10 @@ pub fn process_free_gps(
 
 /// `\$buff =~ /\d{N}/` — N ASCII decimal digits starting at `pos`.
 fn is_ascii_digits(b: &[u8], n: usize) -> bool {
-  b.len() >= n && b[..n].iter().all(|&c| c.is_ascii_digit())
+  // `.get(..n)` is `Some` exactly when `b.len() >= n`, byte-identical to the
+  // length guard; then every one of the first `n` bytes must be a digit.
+  b.get(..n)
+    .is_some_and(|s| s.iter().all(|&c| c.is_ascii_digit()))
 }
 
 /// `$sec = '0' . $sec if defined $sec and $sec !~ /^\d{2}/`
@@ -731,7 +755,10 @@ fn is_ascii_digits(b: &[u8], n: usize) -> bool {
 /// `"05"`, but `"45"`/`"08.5"` are left as-is). NOT a `len < 2` test.
 fn pad_seconds(sec: &str) -> String {
   let b = sec.as_bytes();
-  let starts_two_digits = b.len() >= 2 && b[0].is_ascii_digit() && b[1].is_ascii_digit();
+  // Both `.get`s are `Some` only when `b.len() >= 2`, so this is byte-identical
+  // to the original `b.len() >= 2 && b[0]… && b[1]…`.
+  let starts_two_digits =
+    b.first().is_some_and(|c| c.is_ascii_digit()) && b.get(1).is_some_and(|c| c.is_ascii_digit());
   if starts_two_digits {
     sec.to_string()
   } else {
@@ -896,15 +923,20 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
   // QuickTimeStream.pl:1682 — n = min(dirLen-18, 0x101).
   let n = (data.len() - 18).min(0x101);
   let mut buf2 = Vec::with_capacity(n);
-  for &b in &data[18..18 + n] {
+  // `data.iter().skip(18).take(n)` reads exactly `data[18..18 + n]` (the guard
+  // `data.len() >= 82` and `n = min(len-18, 0x101)` keep that window in range).
+  for &b in data.iter().skip(18).take(n) {
     buf2.push(b ^ 0xaa);
   }
 
   // Parse: `^.{8}(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2}).(.{15})([NS])(\d{8})([EW])(\d{9})(\d{8})?`.
   if buf2.len() >= 8 + 14 + 1 + 15 + 1 + 8 + 1 + 9 {
     let off = 8;
-    if is_ascii_digits(&buf2[off..], 14) {
-      let s = core::str::from_utf8(&buf2[off..off + 14]).unwrap_or("");
+    if buf2.get(off..).is_some_and(|s| is_ascii_digits(s, 14)) {
+      let s = buf2
+        .get(off..off + 14)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .unwrap_or("");
       t.yr = s[0..4].parse().ok();
       t.mon = s[4..6].parse().ok();
       t.day = s[6..8].parse().ok();
@@ -914,7 +946,7 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
       let lbl_off = off + 14 + 1; // skip the 14 digits + the `.` separator.
       let lbl_end = lbl_off + 15;
       if buf2.len() > lbl_end {
-        let lbl = String::from_utf8_lossy(&buf2[lbl_off..lbl_end]);
+        let lbl = String::from_utf8_lossy(buf2.get(lbl_off..lbl_end).unwrap_or(&[]));
         let lbl = lbl.split('\0').next().unwrap_or("").trim().to_string();
         if !lbl.is_empty() {
           t.user_label = Some(lbl);
@@ -925,8 +957,11 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
         if matches!(lat_ref, Some(b'N' | b'S')) {
           t.lat_ref = Some(lat_ref.unwrap() as char);
           let pos_lat = pos_lat_ref + 1;
-          if is_ascii_digits(&buf2[pos_lat..], 8) {
-            let lat_s = core::str::from_utf8(&buf2[pos_lat..pos_lat + 8]).unwrap_or("0");
+          if buf2.get(pos_lat..).is_some_and(|s| is_ascii_digits(s, 8)) {
+            let lat_s = buf2
+              .get(pos_lat..pos_lat + 8)
+              .and_then(|s| core::str::from_utf8(s).ok())
+              .unwrap_or("0");
             t.lat = lat_s.parse::<f64>().ok().map(|v| v / 1e4);
           }
           let pos_lon_ref = pos_lat + 8;
@@ -934,15 +969,21 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
           if matches!(lon_ref, Some(b'E' | b'W')) {
             t.lon_ref = Some(lon_ref.unwrap() as char);
             let pos_lon = pos_lon_ref + 1;
-            if is_ascii_digits(&buf2[pos_lon..], 9) {
-              let lon_s = core::str::from_utf8(&buf2[pos_lon..pos_lon + 9]).unwrap_or("0");
+            if buf2.get(pos_lon..).is_some_and(|s| is_ascii_digits(s, 9)) {
+              let lon_s = buf2
+                .get(pos_lon..pos_lon + 9)
+                .and_then(|s| core::str::from_utf8(s).ok())
+                .unwrap_or("0");
               t.lon = lon_s.parse::<f64>().ok().map(|v| v / 1e4);
             }
             let pos_spd = pos_lon + 9;
-            if is_ascii_digits(&buf2[pos_spd..], 8) {
+            if buf2.get(pos_spd..).is_some_and(|s| is_ascii_digits(s, 8)) {
               // Azdome: spd is the optional `(\d{8})?` group at offset 57
               // (QuickTimeStream.pl:1690-1693, `$spd += 0` strips leading 0s).
-              let spd_s = core::str::from_utf8(&buf2[pos_spd..pos_spd + 8]).unwrap_or("0");
+              let spd_s = buf2
+                .get(pos_spd..pos_spd + 8)
+                .and_then(|s| core::str::from_utf8(s).ok())
+                .unwrap_or("0");
               t.spd = spd_s.parse().ok();
             } else {
               // EEEkit: QuickTimeStream.pl:1694 `/^.{57}([-+]\d{4})(\d{3})/s`
@@ -969,8 +1010,14 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
     t.accel = Some(acc);
     // QuickTimeStream.pl:1708-1710 — Azdome may carry date/time/label even
     // when GPS is absent. Back-fill only if no year was parsed above.
-    if t.yr.is_none() && buf2.len() >= 8 + 14 + 1 + 15 && is_ascii_digits(&buf2[8..], 14) {
-      let s = core::str::from_utf8(&buf2[8..8 + 14]).unwrap_or("");
+    if t.yr.is_none()
+      && buf2.len() >= 8 + 14 + 1 + 15
+      && buf2.get(8..).is_some_and(|s| is_ascii_digits(s, 14))
+    {
+      let s = buf2
+        .get(8..8 + 14)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .unwrap_or("");
       t.yr = s[0..4].parse().ok();
       t.mon = s[4..6].parse().ok();
       t.day = s[6..8].parse().ok();
@@ -978,7 +1025,7 @@ fn decode_type1_azdome(data: &[u8], out: &mut QuickTimeStreamMeta) {
       t.min = s[10..12].parse().ok();
       t.sec = Some(s[12..14].to_string());
       let lbl_off = 8 + 14 + 1; // skip the 14 digits + the `.` separator.
-      let lbl = String::from_utf8_lossy(&buf2[lbl_off..lbl_off + 15]);
+      let lbl = String::from_utf8_lossy(buf2.get(lbl_off..lbl_off + 15).unwrap_or(&[]));
       let lbl = lbl.split('\0').next().unwrap_or("").trim().to_string();
       if !lbl.is_empty() {
         t.user_label = Some(lbl);
@@ -996,15 +1043,18 @@ fn parse_signed_3digit(b: &[u8]) -> Option<i32> {
   if b.len() < 4 {
     return None;
   }
-  let sign = match b[0] {
-    b'+' => 1,
-    b'-' => -1,
+  // The `b.len() < 4` guard proves `b.first()` and `b.get(1..4)` are `Some`;
+  // the `_`/`?` recovery is the same `return None` as the guard.
+  let sign = match b.first() {
+    Some(b'+') => 1,
+    Some(b'-') => -1,
     _ => return None,
   };
-  if !b[1..4].iter().all(|&c| c.is_ascii_digit()) {
+  let digits = b.get(1..4)?;
+  if !digits.iter().all(|&c| c.is_ascii_digit()) {
     return None;
   }
-  let v = core::str::from_utf8(&b[1..4]).ok()?.parse::<i32>().ok()?;
+  let v = core::str::from_utf8(digits).ok()?.parse::<i32>().ok()?;
   Some(sign * v)
 }
 
@@ -1015,9 +1065,11 @@ fn parse_accel_3(buf: &[u8], off: usize) -> Option<(f64, f64, f64)> {
   if buf.len() < off + 12 {
     return None;
   }
-  let x = parse_signed_3digit(&buf[off..off + 4])?;
-  let y = parse_signed_3digit(&buf[off + 4..off + 8])?;
-  let z = parse_signed_3digit(&buf[off + 8..off + 12])?;
+  // The `buf.len() < off + 12` guard proves these 4-byte windows are in range;
+  // `?` on the impossible miss returns `None`, matching that guard.
+  let x = parse_signed_3digit(buf.get(off..off + 4)?)?;
+  let y = parse_signed_3digit(buf.get(off + 4..off + 8)?)?;
+  let z = parse_signed_3digit(buf.get(off + 8..off + 12)?)?;
   Some((
     f64::from(x) / 100.0,
     f64::from(y) / 100.0,
@@ -1031,16 +1083,23 @@ fn parse_eeekit_spd(buf: &[u8]) -> Option<f64> {
   if buf.len() < 65 {
     return None;
   }
+  // The `buf.len() < 65` guard proves every fixed read below is in range; the
+  // `?`/`is_some_and` recovery is the same `return None`/false as the guard.
   // `[-+]` at 57, then `\d{4}` at 58..62 (the gate).
-  if !matches!(buf[57], b'+' | b'-') || !buf[58..62].iter().all(u8::is_ascii_digit) {
+  if !matches!(buf.get(57), Some(b'+' | b'-'))
+    || !buf
+      .get(58..62)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+  {
     return None;
   }
   // `(\d{3})` at 62..65.
-  if !buf[62..65].iter().all(u8::is_ascii_digit) {
+  let spd = buf.get(62..65)?;
+  if !spd.iter().all(u8::is_ascii_digit) {
     return None;
   }
   // `$2 + 0` — leading zeros stripped by numeric coercion.
-  core::str::from_utf8(&buf[62..65]).ok()?.parse::<f64>().ok()
+  core::str::from_utf8(spd).ok()?.parse::<f64>().ok()
 }
 
 // ─────────────────────────── GPSType 2: Nextbase 512GW NMEA ────────────────
@@ -1073,7 +1132,11 @@ fn decode_type2_nextbase_nmea(data: &[u8], out: &mut QuickTimeStreamMeta) {
     let raw: Vec<u32> = (0..3).filter_map(|i| le_u32(data, p + i * 4)).collect();
     if raw.len() == 3 {
       let vs = signed_div(&raw, 256.0);
-      t.accel = Some((vs[0], vs[1], vs[2]));
+      // `vs` has exactly 3 elements here (guarded above), so the slice
+      // pattern always matches — byte-identical to `vs[0/1/2]`.
+      if let [a, b, c] = vs.as_slice() {
+        t.accel = Some((*a, *b, *c));
+      }
     }
   }
   t.emit(out);
@@ -1089,11 +1152,14 @@ fn decode_type2_nextbase_nmea(data: &[u8], out: &mut QuickTimeStreamMeta) {
 fn find_nmea_sentence<'a>(b: &'a [u8], kind: &[u8; 3]) -> Option<&'a [u8]> {
   let mut i = 0usize;
   while i + 7 <= b.len() {
-    if b[i] == b'$'
-      && b[i + 1].is_ascii_uppercase()
-      && b[i + 2].is_ascii_uppercase()
-      && b[i + 3..i + 6] == *kind
-      && b[i + 6] == b','
+    // The `while` guard proves the 7-byte window exists; matching it as a
+    // slice pattern is byte-identical to the per-byte `b[i..i+7]` reads.
+    if let Some(&[d, c1, c2, k0, k1, k2, comma]) = b.get(i..i + 7)
+      && d == b'$'
+      && c1.is_ascii_uppercase()
+      && c2.is_ascii_uppercase()
+      && [k0, k1, k2] == *kind
+      && comma == b','
     {
       return b.get(i..);
     }
@@ -1121,8 +1187,11 @@ fn nmea_decimal(field: &[u8]) -> Option<f64> {
   if dot == 0 || dot + 1 >= field.len() {
     return None; // need ≥1 int digit and ≥1 frac digit
   }
-  if !field[..dot].iter().all(u8::is_ascii_digit)
-    || !field[dot + 1..].iter().all(u8::is_ascii_digit)
+  // `dot < field.len()` (from `position`) and the guard above gives
+  // `1 <= dot` and `dot + 1 < field.len()`, so both `.get`s are `Some`;
+  // `?` on the impossible miss is byte-identical to `return None`.
+  if !field.get(..dot)?.iter().all(u8::is_ascii_digit)
+    || !field.get(dot + 1..)?.iter().all(u8::is_ascii_digit)
   {
     return None;
   }
@@ -1135,8 +1204,10 @@ fn nmea_decimal(field: &[u8]) -> Option<f64> {
 /// would accept `"+1"`, `".5"`, `"inf"`, `"nan"` — none of which the regex
 /// matches.
 fn nmea_signed_decimal(field: &[u8]) -> Option<f64> {
+  // After a `-` the slice is non-empty, so `.get(1..)` is `Some` (byte-
+  // identical to `&field[1..]`).
   let rest = match field.first() {
-    Some(b'-') => &field[1..],
+    Some(b'-') => field.get(1..).unwrap_or_default(),
     _ => field,
   };
   // `\d+\.?\d*`: ≥1 leading digit, then optional `.` + optional digits.
@@ -1144,10 +1215,14 @@ fn nmea_signed_decimal(field: &[u8]) -> Option<f64> {
   if int_end == 0 {
     return None;
   }
-  let tail = &rest[int_end..];
+  // `int_end <= rest.len()`, so `.get(int_end..)` is always `Some`.
+  let tail = rest.get(int_end..).unwrap_or_default();
   let ok = match tail.first() {
-    None => true,                                           // `\d+`
-    Some(b'.') => tail[1..].iter().all(u8::is_ascii_digit), // `\d+\.\d*`
+    None => true, // `\d+`
+    // `tail` starts with `.`, so `.get(1..)` is `Some` — `\d+\.\d*`.
+    Some(b'.') => tail
+      .get(1..)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit)),
     Some(_) => false,
   };
   if !ok {
@@ -1184,11 +1259,18 @@ fn parse_nmea_rmc(s: &[u8], t: &mut FreeGpsTags) {
   // seconds (`\d+(\.\d*)?`).
   if let Some(tm) = fields.get(1).copied()
     && tm.len() >= 6
-    && tm[..6].iter().all(u8::is_ascii_digit)
+    && tm
+      .get(..6)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
   {
-    t.hr = ascii_u32(&tm[0..2]);
-    t.min = ascii_u32(&tm[2..4]);
-    t.sec = core::str::from_utf8(&tm[4..]).ok().map(ToString::to_string);
+    // `tm.len() >= 6` guarantees these windows; `.get(..).unwrap_or_default()`
+    // is byte-identical (the empty fallback is unreachable).
+    t.hr = ascii_u32(tm.get(0..2).unwrap_or_default());
+    t.min = ascii_u32(tm.get(2..4).unwrap_or_default());
+    t.sec = tm
+      .get(4..)
+      .and_then(|s| core::str::from_utf8(s).ok())
+      .map(ToString::to_string);
   }
   // `(\d+\.\d+)` lat / lon (QuickTimeStream.pl:1733; Type-7 `(\d*?\d{1,2}\.\d+)`
   // has the same digits-dot-digits acceptance set, :1952).
@@ -1223,9 +1305,11 @@ fn parse_nmea_rmc(s: &[u8], t: &mut FreeGpsTags) {
     && date.len() >= 5
     && date.iter().all(u8::is_ascii_digit)
   {
-    t.day = ascii_u32(&date[0..2]);
-    t.mon = ascii_u32(&date[2..4]);
-    let yr_raw: i32 = ascii_u32(&date[4..]).unwrap_or(0) as i32;
+    // `date.len() >= 5` guarantees these windows; the empty fallback is
+    // unreachable (byte-identical to `date[0..2]`/`[2..4]`/`[4..]`).
+    t.day = ascii_u32(date.get(0..2).unwrap_or_default());
+    t.mon = ascii_u32(date.get(2..4).unwrap_or_default());
+    let yr_raw: i32 = ascii_u32(date.get(4..).unwrap_or_default()).unwrap_or(0) as i32;
     // QuickTimeStream.pl:1735 `yr = $13 + ($13 >= 70 ? 1900 : 2000)`.
     t.yr = Some(yr_raw + if yr_raw >= 70 { 1900 } else { 2000 });
   }
@@ -1244,10 +1328,13 @@ fn ascii_i32(b: &[u8]) -> Option<i32> {
 /// Trim trailing NUL bytes (`$$dataPt =~ s/\0+$//`, QuickTimeStream.pl:2367).
 fn trim_trailing_nuls(b: &[u8]) -> &[u8] {
   let mut end = b.len();
-  while end > 0 && b[end - 1] == 0 {
+  // `end > 0` ⇒ `end - 1 < b.len()`, so `.get(end - 1)` is `Some` (byte-
+  // identical to `b[end - 1]`).
+  while end > 0 && b.get(end - 1) == Some(&0) {
     end -= 1;
   }
-  &b[..end]
+  // `end <= b.len()`, so `.get(..end)` is always `Some`.
+  b.get(..end).unwrap_or(b)
 }
 
 /// Validate a string against `[-+]?\d+(\.\d+)?` (a signed-optional integer or
@@ -1256,18 +1343,23 @@ fn trim_trailing_nuls(b: &[u8]) -> &[u8] {
 /// speed gate (QuickTimeStream.pl:2371/2373).
 fn parse_signed_int_or_decimal(s: &str) -> Option<f64> {
   let b = s.as_bytes();
+  // After a leading sign the slice is non-empty, so `.get(1..)` is `Some`.
   let rest = match b.first() {
-    Some(b'+' | b'-') => &b[1..],
+    Some(b'+' | b'-') => b.get(1..).unwrap_or_default(),
     _ => b,
   };
   let int_end = rest.iter().take_while(|&&c| c.is_ascii_digit()).count();
   if int_end == 0 {
     return None; // `\d+` requires ≥1 int digit
   }
-  let tail = &rest[int_end..];
+  // `int_end <= rest.len()`, so `.get(int_end..)` is always `Some`.
+  let tail = rest.get(int_end..).unwrap_or_default();
   let ok = match tail.first() {
     None => true, // `\d+`
-    Some(b'.') => !tail[1..].is_empty() && tail[1..].iter().all(u8::is_ascii_digit), // `\.\d+`
+    // `tail` starts with `.`, so `.get(1..)` is `Some` — `\.\d+`.
+    Some(b'.') => tail
+      .get(1..)
+      .is_some_and(|f| !f.is_empty() && f.iter().all(u8::is_ascii_digit)),
     Some(_) => false,
   };
   if !ok {
@@ -1365,11 +1457,17 @@ fn parse_nmea_gga(s: &[u8], t: &mut FreeGpsTags) {
   if t.yr.is_none() {
     if let Some(tm) = fields.get(1).copied()
       && tm.len() >= 6
-      && tm[..6].iter().all(u8::is_ascii_digit)
+      && tm
+        .get(..6)
+        .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
     {
-      t.hr = ascii_u32(&tm[0..2]);
-      t.min = ascii_u32(&tm[2..4]);
-      t.sec = core::str::from_utf8(&tm[4..]).ok().map(ToString::to_string);
+      // `tm.len() >= 6` guarantees these windows (empty fallback unreachable).
+      t.hr = ascii_u32(tm.get(0..2).unwrap_or_default());
+      t.min = ascii_u32(tm.get(2..4).unwrap_or_default());
+      t.sec = tm
+        .get(4..)
+        .and_then(|s| core::str::from_utf8(s).ok())
+        .map(ToString::to_string);
     }
     // `(\d+\.\d+)` lat / lon (QuickTimeStream.pl:1740).
     if let Some(v) = fields.get(2).copied().and_then(nmea_decimal) {
@@ -1417,11 +1515,14 @@ fn detect_type3_4(data: &[u8]) -> Option<(Type34Match, &[u8])> {
       && matches!(data.get(candidate + 5), Some(&b'E' | &b'W'))
       && data.get(candidate + 6) == Some(&0)
     {
-      let lat_ref = data[candidate + 4] as char;
-      let lon_ref = data[candidate + 5] as char;
+      // The `matches!` arms above already proved these two bytes exist, so
+      // the `unwrap_or(0)` fallback is unreachable (byte-identical).
+      let lat_ref = data.get(candidate + 4).copied().unwrap_or(0) as char;
+      let lon_ref = data.get(candidate + 5).copied().unwrap_or(0) as char;
       let payload = if candidate == 85 {
-        // QuickTimeStream.pl:1764 `$$dataPt = substr($$dataPt, 48)`.
-        &data[48..]
+        // QuickTimeStream.pl:1764 `$$dataPt = substr($$dataPt, 48)`. The
+        // `candidate + 8` length guard (candidate == 85) proves `len > 48`.
+        data.get(48..).unwrap_or_default()
       } else {
         data
       };
@@ -1441,7 +1542,8 @@ fn is_base64_shape(s: &[u8]) -> bool {
   if pad > 2 {
     return false;
   }
-  let prefix = &s[..s.len() - pad];
+  // `pad <= s.len()`, so `s.len() - pad <= s.len()` and `.get(..)` is `Some`.
+  let prefix = s.get(..s.len() - pad).unwrap_or(s);
   (8..=20).contains(&prefix.len())
     && prefix
       .iter()
@@ -1481,8 +1583,10 @@ fn decode_type3_4(
   let mut lt_window: &[u8] = &[];
   let mut ln_window: &[u8] = &[];
   if len_ok {
-    lt_window = &data[0x2c..0x40];
-    ln_window = &data[0x40..0x54];
+    // `len_ok` is `data.len() >= 0x78`, and `0x54 <= 0x78`, so these windows
+    // are in range (the empty fallback is unreachable, byte-identical).
+    lt_window = data.get(0x2c..0x40).unwrap_or_default();
+    ln_window = data.get(0x40..0x54).unwrap_or_default();
     for w in [lt_window, ln_window] {
       let trimmed = w.split(|&b| b == 0).next().unwrap_or(&[]);
       // QuickTimeStream.pl:1775 `/^[A-Za-z0-9+\/]{8,20}={0,2}\0*$/`: an 8-20-char
@@ -1521,14 +1625,19 @@ fn decode_type3_4(
     t.trk = le_f32(data, 0x38);
     // Accelerometer (QuickTimeStream.pl:1800-1804) at offset 60 (12 bytes).
     if data.len() >= 72 {
-      let tmp = &data[60..72];
+      // `data.len() >= 72` proves `data[60..72]` is in range (byte-identical).
+      let tmp = data.get(60..72).unwrap_or_default();
       let all_zero = tmp.iter().all(|&b| b == 0);
       let counter = tmp == [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0];
       if !all_zero && !counter {
         let raw: Vec<u32> = (0..3).filter_map(|i| le_u32(data, 60 + i * 4)).collect();
         if raw.len() == 3 {
           let vs = signed_div(&raw, 256.0);
-          t.accel = Some((vs[0], vs[1], vs[2]));
+          // `vs` has exactly 3 elements here (guarded above), so the slice
+          // pattern always matches — byte-identical to `vs[0/1/2]`.
+          if let [a, b, c] = vs.as_slice() {
+            t.accel = Some((*a, *b, *c));
+          }
         }
       }
     }
@@ -1547,7 +1656,11 @@ fn decode_type3_4(
       let raw: Vec<u32> = (0..3).filter_map(|i| le_u32(data, 92 + i * 4)).collect();
       if raw.len() == 3 {
         let acc: Vec<f64> = raw.iter().map(|&v| f64::from(v as i32)).collect();
-        t.accel = Some((acc[0], acc[1], acc[2]));
+        // `acc` has exactly 3 elements here (guarded above), so the slice
+        // pattern always matches — byte-identical to `acc[0/1/2]`.
+        if let [a, b, c] = acc.as_slice() {
+          t.accel = Some((*a, *b, *c));
+        }
       }
     }
     if not_enc {
@@ -1588,17 +1701,25 @@ fn decrypt_lucky(input: &[u8], key: &[u8]) -> Vec<u8> {
   }
   let mut s: [u32; 256] = core::array::from_fn(|i| i as u32);
   let mut j: u32 = 0;
+  // Every index below is `< 256` (`i in 0..256`, `& 0xff` masks, `% key.len()`
+  // with a non-empty key), so each `.get(..).copied().unwrap_or(0)` is
+  // byte-identical to the raw RC4 indexing — the fallback never fires.
   for i in 0..256u32 {
-    j = (j + s[i as usize] + u32::from(key[(i as usize) % key.len()])) & 0xff;
+    let si = s.get(i as usize).copied().unwrap_or(0);
+    let ki = key.get((i as usize) % key.len()).copied().unwrap_or(0);
+    j = (j + si + u32::from(ki)) & 0xff;
     s.swap(i as usize, j as usize);
   }
   let mut out = Vec::with_capacity(input.len());
   let (mut i, mut j) = (0u32, 0u32);
   for &b in input {
     i = i.wrapping_add(1) & 0xff;
-    j = (j + s[i as usize]) & 0xff;
+    let si = s.get(i as usize).copied().unwrap_or(0);
+    j = (j + si) & 0xff;
     s.swap(i as usize, j as usize);
-    let k = s[((s[i as usize] + s[j as usize]) & 0xff) as usize] as u8;
+    let si2 = s.get(i as usize).copied().unwrap_or(0);
+    let sj2 = s.get(j as usize).copied().unwrap_or(0);
+    let k = s.get(((si2 + sj2) & 0xff) as usize).copied().unwrap_or(0) as u8;
     out.push(b ^ k);
   }
   out
@@ -1713,7 +1834,9 @@ fn base64_decode(s: &[u8]) -> Vec<u8> {
 fn detect_type5_ligogps(data: &[u8]) -> Option<usize> {
   for &off in &[16, 48, 80] {
     let end = off + b"LIGOGPSINFO\0".len();
-    if data.len() >= end && &data[off..end] == b"LIGOGPSINFO\0" && data.len() >= off + 0x84 {
+    // `data.get(off..end)` is `Some` exactly when `data.len() >= end`, so this
+    // is byte-identical to the `data.len() >= end && &data[off..end] == …` pair.
+    if data.get(off..end) == Some(b"LIGOGPSINFO\0".as_slice()) && data.len() >= off + 0x84 {
       return Some(off);
     }
   }
@@ -1766,7 +1889,11 @@ fn decode_type6_akaso(data: &[u8], out: &mut QuickTimeStreamMeta) {
     t.accel = None;
   } else if acc_raw.len() == 3 {
     let vs = signed_div(&acc_raw, 1000.0);
-    t.accel = Some((vs[0], vs[1], vs[2]));
+    // `vs` has exactly 3 elements here (guarded above), so the slice
+    // pattern always matches — byte-identical to `vs[0/1/2]`.
+    if let [a, b, c] = vs.as_slice() {
+      t.accel = Some((*a, *b, *c));
+    }
   }
   t.emit(out);
 }
@@ -1781,7 +1908,9 @@ fn decode_type7_cipher(data: &[u8], out: &mut QuickTimeStreamMeta) {
     return;
   }
   let mut decoded = Vec::with_capacity(80);
-  for &b in &data[60..60 + 80] {
+  // `skip(60).take(80)` reads exactly `data[60..60 + 80]` (the `data.len() <
+  // 60 + 80` guard keeps that window in range) — byte-identical.
+  for &b in data.iter().skip(60).take(80) {
     decoded.push(if b >= 16 { b - 16 } else { b });
   }
   // QuickTimeStream.pl:1952 matches `/[A-Z]{2}RMC,…/` over the DECIPHERED RAW
@@ -1804,16 +1933,40 @@ fn detect_type8(data: &[u8]) -> bool {
   if data.len() < 0x50 {
     return false;
   }
-  data[64] >= 0x01
-    && data[64] <= 0x0c
-    && data[65..68] == [0, 0, 0]
-    && data[68] >= 0x01
-    && data[68] <= 0x1f
-    && data[69..72] == [0, 0, 0]
-    && data[72] == b'A'
-    && (data[73] == b'N' || data[73] == b'S')
-    && (data[74] == b'E' || data[74] == b'W')
-    && data[75..80] == [0, 0, 0, 0, 0]
+  // The `data.len() < 0x50` guard proves bytes 64..80 exist, so this 16-byte
+  // window match is byte-identical to the per-byte `data[64..80]` reads; the
+  // `else` returns the same `false` as the guard.
+  let Some(
+    &[
+      m0,
+      z0,
+      z1,
+      z2,
+      m1,
+      z3,
+      z4,
+      z5,
+      lit_a,
+      ns,
+      ew,
+      n0,
+      n1,
+      n2,
+      n3,
+      n4,
+    ],
+  ) = data.get(64..80)
+  else {
+    return false;
+  };
+  (0x01..=0x0c).contains(&m0)
+    && [z0, z1, z2] == [0, 0, 0]
+    && (0x01..=0x1f).contains(&m1)
+    && [z3, z4, z5] == [0, 0, 0]
+    && lit_a == b'A'
+    && (ns == b'N' || ns == b'S')
+    && (ew == b'E' || ew == b'W')
+    && [n0, n1, n2, n3, n4] == [0, 0, 0, 0, 0]
 }
 
 /// `decode_type8_akaso_v1` (QuickTimeStream.pl:1961-1996).
@@ -1869,7 +2022,11 @@ fn decode_type10_vantrue_s1(data: &[u8], out: &mut QuickTimeStreamMeta) {
   if (1..=12).contains(&mon) && (1..=31).contains(&day) {
     let vs = signed_div(&acc_raw, 1000.0);
     if vs.len() == 3 {
-      t.accel = Some((vs[0], vs[1], vs[2]));
+      // `vs` has exactly 3 elements here (guarded above), so the slice
+      // pattern always matches — byte-identical to `vs[0/1/2]`.
+      if let [a, b, c] = vs.as_slice() {
+        t.accel = Some((*a, *b, *c));
+      }
     }
     t.lon = le_f32(data, 0x5c);
     t.lat = le_f32(data, 0x60);
@@ -1917,7 +2074,12 @@ fn decode_type11_atc(data: &[u8], state: &mut FreeGpsState, out: &mut QuickTimeS
   let mut rec_pos = 0x30usize;
   while rec_pos + 52 < data.len() {
     let mut a = [0u8; 52];
-    a.copy_from_slice(&data[rec_pos..rec_pos + 52]);
+    // The `while` guard proves `rec_pos + 52 <= data.len()`, so this `.get`
+    // is always `Some`; the `else` break matches the guard turning false.
+    let Some(rec_src) = data.get(rec_pos..rec_pos + 52) else {
+      break;
+    };
+    a.copy_from_slice(rec_src);
     // QuickTimeStream.pl:2080-2082: two key bytes at 0x14 and 0x1c.
     let key1 = a[0x14];
     let key2 = a[0x1c];
@@ -1959,14 +2121,16 @@ fn decode_type11_atc(data: &[u8], state: &mut FreeGpsState, out: &mut QuickTimeS
     let mut newer = false;
     let mut older = false;
     for &i in &[3usize, 4, 5, 0, 1, 2] {
-      if now[i] < then[i] {
+      // `i < 6` and `now`/`then` are `[u32; 6]`, so both `.get`s are `Some`;
+      // comparing the `Option`s is byte-identical to comparing `now[i]`/`then[i]`.
+      if now.get(i) < then.get(i) {
         // QuickTimeStream.pl:2096-2097 — an OLDER record. If we already
         // emitted a newer record this block, stop the whole loop; otherwise
         // just skip this record.
         older = true;
         break;
       }
-      if now[i] == then[i] {
+      if now.get(i) == then.get(i) {
         continue;
       }
       // QuickTimeStream.pl:2099 — a strictly NEWER record.
@@ -2048,7 +2212,11 @@ fn decode_type12_double(data: &[u8], out: &mut QuickTimeStreamMeta) {
   let acc_raw: Vec<u32> = (0..3).filter_map(|i| le_u32(data, 0x7c + i * 4)).collect();
   let vs = signed_div(&acc_raw, 1000.0);
   if vs.len() == 3 {
-    t.accel = Some((vs[0], vs[1], vs[2]));
+    // `vs` has exactly 3 elements here (guarded above), so the slice
+    // pattern always matches — byte-identical to `vs[0/1/2]`.
+    if let [a, b, c] = vs.as_slice() {
+      t.accel = Some((*a, *b, *c));
+    }
   }
   t.yr = Some(yr as i32);
   t.mon = Some(mon);
@@ -2070,11 +2238,13 @@ fn decode_type12_double(data: &[u8], out: &mut QuickTimeStreamMeta) {
 fn decode_type13_innovv(data: &[u8], out: &mut QuickTimeStreamMeta) {
   let mut pos = 0usize;
   while pos + 32 <= data.len() {
-    if data[pos] == b'A'
-      && (data[pos + 1] == b'N' || data[pos + 1] == b'S')
-      && (data[pos + 2] == b'E' || data[pos + 2] == b'W')
-      && data[pos + 3] == 0
-    {
+    // The `while` guard proves `pos + 4 <= pos + 32 <= data.len()`, so this
+    // 4-byte window always matches; binding it avoids re-reading `data[pos+1]`
+    // / `data[pos+2]` below (byte-identical).
+    let Some(&[a, ns, ew, z]) = data.get(pos..pos + 4) else {
+      break;
+    };
+    if a == b'A' && (ns == b'N' || ns == b'S') && (ew == b'E' || ew == b'W') && z == 0 {
       let lat = le_f32(data, pos + 4).map(f64::abs).unwrap_or(0.0);
       let lon = le_f32(data, pos + 8).map(f64::abs).unwrap_or(0.0);
       let spd = le_f32(data, pos + 12).unwrap_or(0.0) * KNOTS_TO_KPH;
@@ -2085,15 +2255,17 @@ fn decode_type13_innovv(data: &[u8], out: &mut QuickTimeStreamMeta) {
       let acc: Vec<f64> = acc_raw.iter().map(|&v| f64::from(v as i32)).collect();
       let lat_c = convert_lat_lon(lat);
       let lon_c = convert_lat_lon(lon);
-      let lat_signed = if data[pos + 1] == b'S' { -lat_c } else { lat_c };
-      let lon_signed = if data[pos + 2] == b'W' { -lon_c } else { lon_c };
+      let lat_signed = if ns == b'S' { -lat_c } else { lat_c };
+      let lon_signed = if ew == b'W' { -lon_c } else { lon_c };
       let mut sample = GpsSample::new();
       sample.set_latitude(Some(lat_signed));
       sample.set_longitude(Some(lon_signed));
       sample.set_speed_kph(Some(spd));
       sample.set_track(Some(trk));
       if acc.len() == 3 {
-        sample.set_accelerometer(Some(SmolStr::from(join3(acc[0], acc[1], acc[2]))));
+        if let [a, b, c] = acc.as_slice() {
+          sample.set_accelerometer(Some(SmolStr::from(join3(*a, *b, *c))));
+        }
       }
       out.push_gps_sample(sample);
       pos += 32;
@@ -2110,13 +2282,18 @@ fn detect_type14(data: &[u8]) -> bool {
   if data.len() < 27 {
     return false;
   }
-  data[20] <= 0x18
-    && data[21] <= 0x3b
-    && data[22] <= 0x3b
-    && data[23] <= 0x09
-    && data[24] == b'A'
-    && (data[25] == b'N' || data[25] == b'S')
-    && (data[26] == b'E' || data[26] == b'W')
+  // The `data.len() < 27` guard proves bytes 20..27 exist; matching that
+  // 7-byte window is byte-identical to the per-byte `data[20..27]` reads.
+  let Some(&[b20, b21, b22, b23, lit_a, ns, ew]) = data.get(20..27) else {
+    return false;
+  };
+  b20 <= 0x18
+    && b21 <= 0x3b
+    && b22 <= 0x3b
+    && b23 <= 0x09
+    && lit_a == b'A'
+    && (ns == b'N' || ns == b'S')
+    && (ew == b'E' || ew == b'W')
 }
 
 /// `decode_type14_xbht` (QuickTimeStream.pl:2216-2238). Records match
@@ -2131,7 +2308,15 @@ fn decode_type14_xbht(data: &[u8], out: &mut QuickTimeStreamMeta) {
     // QuickTimeStream.pl:2225 — `(.{7}[\0-\x09]A[NS][EW].{25})`. The record
     // starts 8 bytes before `A`.
     let rec_start = pos;
-    let rec = &data[rec_start..rec_start + REC_LEN];
+    // The `while` guard proves `rec_start + REC_LEN <= data.len()`, so this
+    // window is always a full 36-byte array; binding it as `&[u8; 36]` lets the
+    // constant indices below stay (in-bounds const array indexing isn't linted).
+    let Some(rec) = data
+      .get(rec_start..rec_start + REC_LEN)
+      .and_then(|s| <&[u8; REC_LEN]>::try_from(s).ok())
+    else {
+      break;
+    };
     if rec[7] <= 0x09
       && rec[8] == b'A'
       && (rec[9] == b'N' || rec[9] == b'S')
@@ -2193,7 +2378,11 @@ fn decode_type15_vantrue_n4(data: &[u8], out: &mut QuickTimeStreamMeta) {
   let acc_raw: Vec<u32> = (0..3).filter_map(|i| le_u32(data, 0x5c + i * 4)).collect();
   let vs = signed_div(&acc_raw, 1000.0);
   if vs.len() == 3 {
-    t.accel = Some((vs[0], vs[1], vs[2]));
+    // `vs` has exactly 3 elements here (guarded above), so the slice
+    // pattern always matches — byte-identical to `vs[0/1/2]`.
+    if let [a, b, c] = vs.as_slice() {
+      t.accel = Some((*a, *b, *c));
+    }
   }
   t.yr = Some(yr as i32);
   t.mon = Some(mon);
@@ -2310,7 +2499,11 @@ fn detect_type18(data: &[u8]) -> bool {
   if data.len() < needed {
     return false;
   }
-  let s = &data[23..23 + needed - 23];
+  // `data.get(23..needed)` is `Some` exactly when `data.len() >= needed` (the
+  // guard above), byte-identical to `&data[23..23 + needed - 23]`.
+  let Some(s) = data.get(23..needed) else {
+    return false;
+  };
   // Verify shape.
   s.iter().enumerate().all(|(i, &c)| match i {
     0..=3 | 5..=6 | 8..=9 | 11..=12 | 14..=15 | 17..=18 => c.is_ascii_digit(),
@@ -2337,22 +2530,27 @@ fn decode_type18_xgody(data: &[u8], out: &mut QuickTimeStreamMeta) {
   // directly.
   let s = trim_trailing_nuls(data);
   // Date/time at offset 23 (QuickTimeStream.pl:2366 captures `$1..$6`).
-  if s.len() >= 23 + 19 {
-    let dt = &s[23..23 + 19];
-    t.yr = ascii_i32(&dt[0..4]);
-    t.mon = ascii_u32(&dt[5..7]);
-    t.day = ascii_u32(&dt[8..10]);
-    t.hr = ascii_u32(&dt[11..13]);
-    t.min = ascii_u32(&dt[14..16]);
-    t.sec = core::str::from_utf8(&dt[17..19])
-      .ok()
+  if let Some(dt) = s.get(23..23 + 19) {
+    // `dt` is exactly 19 bytes here, so each `.get(..).unwrap_or_default()`
+    // window is in range (byte-identical to `dt[0..4]` etc.).
+    t.yr = ascii_i32(dt.get(0..4).unwrap_or_default());
+    t.mon = ascii_u32(dt.get(5..7).unwrap_or_default());
+    t.day = ascii_u32(dt.get(8..10).unwrap_or_default());
+    t.hr = ascii_u32(dt.get(11..13).unwrap_or_default());
+    t.min = ascii_u32(dt.get(14..16).unwrap_or_default());
+    t.sec = dt
+      .get(17..19)
+      .and_then(|x| core::str::from_utf8(x).ok())
       .map(ToString::to_string);
   }
   // Field stream at offset 43 (`split ' ', substr($$dataPt,43)`).
   if s.len() > 43 {
     let mut acc: [Option<f64>; 3] = [None, None, None];
     let mut acc_idx = 0usize;
-    for tok_b in s[43..]
+    // `s.len() > 43`, so `.get(43..)` is `Some` (byte-identical to `s[43..]`).
+    for tok_b in s
+      .get(43..)
+      .unwrap_or_default()
       .split(|&c| c.is_ascii_whitespace())
       .filter(|t| !t.is_empty())
     {
@@ -2374,7 +2572,11 @@ fn decode_type18_xgody(data: &[u8], out: &mut QuickTimeStreamMeta) {
             t.lon_ref = Some(ch);
           }
           'x' | 'y' | 'z' if acc_idx < 3 => {
-            acc[acc_idx] = Some(num);
+            // The `acc_idx < 3` guard proves the index is in range, so this
+            // `.get_mut` is always `Some` (byte-identical to `acc[acc_idx]`).
+            if let Some(slot) = acc.get_mut(acc_idx) {
+              *slot = Some(num);
+            }
             acc_idx += 1;
           }
           'A' => {
@@ -2430,9 +2632,11 @@ fn decode_type19_70mai(
   // QuickTimeStream.pl:2386-2401 does NOT set `$ddd`, so the common tail
   // applies ConvertLatLon: the int32s/1e5 values are DDDMM.MMMM, not decimal
   // degrees (e.g. 5116.071 → 51°16.071′ → 51.2679°).
-  let lat = i32::from_le_bytes([data[31], data[32], data[33], data[34]]);
-  let lon = i32::from_le_bytes([data[35], data[36], data[37], data[38]]);
-  let spd_raw = i32::from_le_bytes([data[43], data[44], data[45], data[46]]);
+  // The `data.len() < 47` guard proves these reads are in range; the
+  // bounds-checking `le_i32` returns `Some` here (`unwrap_or(0)` unreachable).
+  let lat = le_i32(data, 31).unwrap_or(0);
+  let lon = le_i32(data, 35).unwrap_or(0);
+  let spd_raw = le_i32(data, 43).unwrap_or(0);
   t.lat = Some(f64::from(lat) / 1e5);
   t.lon = Some(f64::from(lon) / 1e5);
   t.spd = Some(f64::from(spd_raw)); // QuickTimeStream.pl:2399 — "seems to be km/h but NC".
@@ -2458,10 +2662,12 @@ fn decode_type20_nextbase512(data: &[u8], out: &mut QuickTimeStreamMeta) {
   let spd = be_u16(data, pos).unwrap_or(0);
   let trk_raw = be_u16(data, pos + 2).unwrap_or(0);
   let yr = u32::from(be_u16(data, pos + 4).unwrap_or(0));
-  let mon = u32::from(data[pos + 6]);
-  let day = u32::from(data[pos + 7]);
-  let hr = u32::from(data[pos + 8]);
-  let min = u32::from(data[pos + 9]);
+  // `pos + 30 <= data.len()` proves these single-byte reads are in range; the
+  // `unwrap_or(0)` fallback mirrors the adjacent `be_*(..).unwrap_or(0)` reads.
+  let mon = u32::from(data.get(pos + 6).copied().unwrap_or(0));
+  let day = u32::from(data.get(pos + 7).copied().unwrap_or(0));
+  let hr = u32::from(data.get(pos + 8).copied().unwrap_or(0));
+  let min = u32::from(data.get(pos + 9).copied().unwrap_or(0));
   let sec_raw = be_u16(data, pos + 10).unwrap_or(0);
   let lat_raw = be_u32(data, pos + 13).unwrap_or(0);
   let lon_raw = be_u32(data, pos + 17).unwrap_or(0);
@@ -2540,9 +2746,24 @@ mod tests {
     // BLOCK = 12-byte header + payload_size payload bytes.
     let mut v = vec![0u8; 12 + payload_size];
     let total = v.len() as u32;
-    v[0..4].copy_from_slice(&total.to_be_bytes());
-    v[4..12].copy_from_slice(b"freeGPS ");
+    wr(&mut v, 0, &total.to_be_bytes());
+    wr(&mut v, 4, b"freeGPS ");
     (v, 12)
+  }
+
+  /// Write `src` at `off` (the test-fixture builders' `buf[off..off+N] =`
+  /// shape) without raw slice-indexing; panics on an out-of-range fixture,
+  /// matching the previous `[..]` write.
+  fn wr(buf: &mut [u8], off: usize, src: &[u8]) {
+    buf
+      .get_mut(off..off + src.len())
+      .unwrap()
+      .copy_from_slice(src);
+  }
+
+  /// Write a single byte at `i` (the `buf[i] = b` fixture shape).
+  fn wb(buf: &mut [u8], i: usize, b: u8) {
+    *buf.get_mut(i).unwrap() = b;
   }
 
   #[test]
@@ -2614,13 +2835,13 @@ mod tests {
     // XOR with 0xaa and write at block offset 18.
     for (i, &b) in decrypted.iter().enumerate() {
       if 18 + i < block.len() {
-        block[18 + i] = b ^ 0xaa;
+        wb(&mut block, 18 + i, b ^ 0xaa);
       }
     }
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.date_time(), Some("2024:01:07 11:19:14Z"));
     // lat 4746.2813 ⇒ ConvertLatLon ⇒ 47 + 46.2813/60 ≈ 47.7713555 ⇒ N positive.
     let lat = s.latitude().expect("lat");
@@ -2635,30 +2856,30 @@ mod tests {
     // Type 6: A at BLOCK offset 60, NS at 68, EW at 76; time/lat/lon at 0x30/0x40.
     // QuickTimeStream.pl byte offsets are block-absolute (include 12-byte header).
     let (mut block, _) = make_block(0x100);
-    block[60] = b'A';
-    block[68] = b'N';
-    block[76] = b'W';
+    wb(&mut block, 60, b'A');
+    wb(&mut block, 68, b'N');
+    wb(&mut block, 76, b'W');
     // hr/min/sec at 0x30..0x3c (3×u32 LE).
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
     // yr/mon/day at 0x30+12+28 = 0x58..0x64 (3×u32 LE).
-    block[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    block[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
+    wr(&mut block, 0x58, &2024u32.to_le_bytes());
+    wr(&mut block, 0x5c, &7u32.to_le_bytes());
+    wr(&mut block, 0x60, &15u32.to_le_bytes());
     // accel: 3×u32 LE at 0x64.
-    block[0x64..0x68].copy_from_slice(&1000u32.to_le_bytes());
-    block[0x68..0x6c].copy_from_slice(&2000u32.to_le_bytes());
-    block[0x6c..0x70].copy_from_slice(&3000u32.to_le_bytes());
+    wr(&mut block, 0x64, &1000u32.to_le_bytes());
+    wr(&mut block, 0x68, &2000u32.to_le_bytes());
+    wr(&mut block, 0x6c, &3000u32.to_le_bytes());
     // lat/lon/spd/trk floats at 0x40..0x58.
-    block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
-    block[0x50..0x54].copy_from_slice(&60.0f32.to_le_bytes());
-    block[0x54..0x58].copy_from_slice(&90.0f32.to_le_bytes());
+    wr(&mut block, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut block, 0x48, &12209.901f32.to_le_bytes());
+    wr(&mut block, 0x50, &60.0f32.to_le_bytes());
+    wr(&mut block, 0x54, &90.0f32.to_le_bytes());
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert!((s.latitude().unwrap() - 47.628_421).abs() < 1e-3);
     assert!(s.longitude().unwrap() < -120.0);
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
@@ -2691,7 +2912,7 @@ mod tests {
     // record at BLOCK offset 0x30 (skipping the 0x10..0x30 header bytes).
     let (mut block, _) = make_block(0x100);
     // Place "ATC" at offset 0x45 (the detection marker is BLOCK offset 0x45-0x48).
-    block[0x45..0x48].copy_from_slice(b"ATC");
+    wr(&mut block, 0x45, b"ATC");
     let rec_off = 0x30usize;
     // Record-local offsets:
     //   0x0d hour-1, 0x0e min, 0x0f sec
@@ -2701,23 +2922,27 @@ mod tests {
     //   0x20..0x23 int32s speed*100, 0x24..0x25 int16s heading*100
     //   0x28..0x2b int32s altitude*1000, 0x2c..0x2d int16u year
     //   0x2e mon, 0x2f day
-    block[rec_off + 0x0d] = 13; // hr+1 ⇒ hr=14
-    block[rec_off + 0x0e] = 30; // min
-    block[rec_off + 0x0f] = 45; // sec
-    block[rec_off + 0x10..rec_off + 0x14].copy_from_slice(&476_284_215i32.to_le_bytes());
-    block[rec_off + 0x15..rec_off + 0x18].copy_from_slice(b"ATC");
-    block[rec_off + 0x18..rec_off + 0x1c].copy_from_slice(&(-1_221_650_167i32).to_le_bytes());
-    block[rec_off + 0x20..rec_off + 0x24].copy_from_slice(&2000i32.to_le_bytes());
-    block[rec_off + 0x24..rec_off + 0x26].copy_from_slice(&18000i16.to_le_bytes());
-    block[rec_off + 0x28..rec_off + 0x2c].copy_from_slice(&100_000i32.to_le_bytes());
-    block[rec_off + 0x2c..rec_off + 0x2e].copy_from_slice(&2024u16.to_le_bytes());
-    block[rec_off + 0x2e] = 7;
-    block[rec_off + 0x2f] = 15;
+    wb(&mut block, rec_off + 0x0d, 13); // hr+1 ⇒ hr=14
+    wb(&mut block, rec_off + 0x0e, 30); // min
+    wb(&mut block, rec_off + 0x0f, 45); // sec
+    wr(&mut block, rec_off + 0x10, &476_284_215i32.to_le_bytes());
+    wr(&mut block, rec_off + 0x15, b"ATC");
+    wr(
+      &mut block,
+      rec_off + 0x18,
+      &(-1_221_650_167i32).to_le_bytes(),
+    );
+    wr(&mut block, rec_off + 0x20, &2000i32.to_le_bytes());
+    wr(&mut block, rec_off + 0x24, &18000i16.to_le_bytes());
+    wr(&mut block, rec_off + 0x28, &100_000i32.to_le_bytes());
+    wr(&mut block, rec_off + 0x2c, &2024u16.to_le_bytes());
+    wb(&mut block, rec_off + 0x2e, 7);
+    wb(&mut block, rec_off + 0x2f, 15);
     // Keys 0x14/0x1c are both already 0 ⇒ XOR is identity.
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert!((s.latitude().unwrap() - 47.6_284_215).abs() < 1e-6);
     assert!((s.longitude().unwrap() + 122.1_650_167).abs() < 1e-6);
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
@@ -2738,32 +2963,32 @@ mod tests {
   fn type12_double_lat_lon_ref_offsets_0x48_0x58() {
     let (mut block, _) = make_block(0x100);
     // A@60, [NS]@72 (0x48), [EW]@88 (0x58); the intervening bytes stay NUL.
-    block[60] = b'A';
-    block[72] = b'N';
-    block[88] = b'E';
+    wb(&mut block, 60, b'A');
+    wb(&mut block, 72, b'N');
+    wb(&mut block, 88, b'E');
     // hr/min/sec (V) @ 0x30/0x34/0x38.
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
     // lat double @0x40 (DDMM.MMMM 4737.7053 → 47°37.7053′), lon @0x50 (12209.901).
-    block[0x40..0x48].copy_from_slice(&4737.7053f64.to_le_bytes());
-    block[0x50..0x58].copy_from_slice(&12209.901f64.to_le_bytes());
+    wr(&mut block, 0x40, &4737.7053f64.to_le_bytes());
+    wr(&mut block, 0x50, &12209.901f64.to_le_bytes());
     // spd double @0x60 (10 knots), trk @0x68 (90°).
-    block[0x60..0x68].copy_from_slice(&10.0f64.to_le_bytes());
-    block[0x68..0x70].copy_from_slice(&90.0f64.to_le_bytes());
+    wr(&mut block, 0x60, &10.0f64.to_le_bytes());
+    wr(&mut block, 0x68, &90.0f64.to_le_bytes());
     // yr-2000/mon/day (V) @ 0x70/0x74/0x78.
-    block[0x70..0x74].copy_from_slice(&24u32.to_le_bytes());
-    block[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
-    block[0x78..0x7c].copy_from_slice(&15u32.to_le_bytes());
+    wr(&mut block, 0x70, &24u32.to_le_bytes());
+    wr(&mut block, 0x74, &7u32.to_le_bytes());
+    wr(&mut block, 0x78, &15u32.to_le_bytes());
     // accel int32s/1000 @ 0x7c (1.0, 2.0, -3.0).
-    block[0x7c..0x80].copy_from_slice(&1000i32.to_le_bytes());
-    block[0x80..0x84].copy_from_slice(&2000i32.to_le_bytes());
-    block[0x84..0x88].copy_from_slice(&(-3000i32).to_le_bytes());
+    wr(&mut block, 0x7c, &1000i32.to_le_bytes());
+    wr(&mut block, 0x80, &2000i32.to_le_bytes());
+    wr(&mut block, 0x84, &(-3000i32).to_le_bytes());
 
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1, "one Type-12 sample");
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
     let lat = s.latitude().expect("lat");
     assert!(
@@ -2791,24 +3016,24 @@ mod tests {
   #[test]
   fn type12_via_scan_media_data() {
     let mut block = vec![0u8; 0x100];
-    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    block[4..12].copy_from_slice(b"freeGPS ");
-    block[60] = b'A';
-    block[72] = b'N';
-    block[88] = b'E';
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    block[0x40..0x48].copy_from_slice(&4737.7053f64.to_le_bytes());
-    block[0x50..0x58].copy_from_slice(&12209.901f64.to_le_bytes());
-    block[0x60..0x68].copy_from_slice(&10.0f64.to_le_bytes());
-    block[0x68..0x70].copy_from_slice(&90.0f64.to_le_bytes());
-    block[0x70..0x74].copy_from_slice(&24u32.to_le_bytes());
-    block[0x74..0x78].copy_from_slice(&7u32.to_le_bytes());
-    block[0x78..0x7c].copy_from_slice(&15u32.to_le_bytes());
-    block[0x7c..0x80].copy_from_slice(&1000i32.to_le_bytes());
-    block[0x80..0x84].copy_from_slice(&2000i32.to_le_bytes());
-    block[0x84..0x88].copy_from_slice(&(-3000i32).to_le_bytes());
+    wr(&mut block, 0, &0x0100u32.to_be_bytes());
+    wr(&mut block, 4, b"freeGPS ");
+    wb(&mut block, 60, b'A');
+    wb(&mut block, 72, b'N');
+    wb(&mut block, 88, b'E');
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
+    wr(&mut block, 0x40, &4737.7053f64.to_le_bytes());
+    wr(&mut block, 0x50, &12209.901f64.to_le_bytes());
+    wr(&mut block, 0x60, &10.0f64.to_le_bytes());
+    wr(&mut block, 0x68, &90.0f64.to_le_bytes());
+    wr(&mut block, 0x70, &24u32.to_le_bytes());
+    wr(&mut block, 0x74, &7u32.to_le_bytes());
+    wr(&mut block, 0x78, &15u32.to_le_bytes());
+    wr(&mut block, 0x7c, &1000i32.to_le_bytes());
+    wr(&mut block, 0x80, &2000i32.to_le_bytes());
+    wr(&mut block, 0x84, &(-3000i32).to_le_bytes());
     let mut file = vec![0u8; 64];
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&block);
@@ -2818,7 +3043,7 @@ mod tests {
     scan_media_data(&file, mdat_offset, mdat_size, None, None, false, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     assert_eq!(
-      out.gps_samples()[0].date_time(),
+      out.gps_samples().first().unwrap().date_time(),
       Some("2024:07:15 14:30:45Z")
     );
   }
@@ -2829,20 +3054,20 @@ mod tests {
     // fingerprint. The 32-byte BE record starts at BLOCK offset 0x32.
     let (mut block, _) = make_block(0x100);
     let rec_off = 0x32usize;
-    block[rec_off..rec_off + 2].copy_from_slice(&1000u16.to_be_bytes());
-    block[rec_off + 2..rec_off + 4].copy_from_slice(&12000u16.to_be_bytes());
-    block[rec_off + 4..rec_off + 6].copy_from_slice(&2024u16.to_be_bytes());
-    block[rec_off + 6] = 7;
-    block[rec_off + 7] = 15;
-    block[rec_off + 8] = 14;
-    block[rec_off + 9] = 30;
-    block[rec_off + 10..rec_off + 12].copy_from_slice(&455u16.to_be_bytes());
-    block[rec_off + 13..rec_off + 17].copy_from_slice(&476_284_215i32.to_be_bytes());
-    block[rec_off + 17..rec_off + 21].copy_from_slice(&(-1_221_650_167i32).to_be_bytes());
+    wr(&mut block, rec_off, &1000u16.to_be_bytes());
+    wr(&mut block, rec_off + 2, &12000u16.to_be_bytes());
+    wr(&mut block, rec_off + 4, &2024u16.to_be_bytes());
+    wb(&mut block, rec_off + 6, 7);
+    wb(&mut block, rec_off + 7, 15);
+    wb(&mut block, rec_off + 8, 14);
+    wb(&mut block, rec_off + 9, 30);
+    wr(&mut block, rec_off + 10, &455u16.to_be_bytes());
+    wr(&mut block, rec_off + 13, &476_284_215i32.to_be_bytes());
+    wr(&mut block, rec_off + 17, &(-1_221_650_167i32).to_be_bytes());
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert!(!out.gps_samples().is_empty());
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert!((s.latitude().unwrap() - 47.6_284_215).abs() < 1e-6);
     assert!((s.longitude().unwrap() + 122.1_650_167).abs() < 1e-6);
     assert!(s.date_time().is_some());
@@ -2864,11 +3089,11 @@ mod tests {
     let mut block = vec![0u8; 60];
     block.extend_from_slice(&enc);
     // The detection signature `4W`b]S<` must be the first 7 ciphered bytes.
-    assert_eq!(&block[60..67], b"4W\x60b]S<");
+    assert_eq!(block.get(60..67).unwrap(), b"4W\x60b]S<");
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1, "one Type-7 sample");
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.date_time(), Some("2022:12:14 13:22:30.00Z"));
     // 4721.35 DDMM.MMMM ⇒ ConvertLatLon ⇒ 47 + 21.35/60 ≈ 47.3558°, N positive.
     let lat = s.latitude().expect("lat");
@@ -2894,13 +3119,13 @@ mod tests {
     let text = b"normal:2024/05/22 02:54:29 N:42.382470 W:83.389570 53.6 km/h x:-0.02 y:0.99 z:0.10 A:269.2 H:245.5";
     let mut block = vec![0u8; 0x100];
     // A non-ASCII box header (byte 3 = 0xa8) — like a real XGODY block (:2358).
-    block[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0xa8]);
-    block[4..12].copy_from_slice(b"freeGPS ");
-    block[16..16 + text.len()].copy_from_slice(text);
+    wr(&mut block, 0, &[0x00, 0x00, 0x00, 0xa8]);
+    wr(&mut block, 4, b"freeGPS ");
+    wr(&mut block, 16, text);
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1, "one Type-18 sample");
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.date_time(), Some("2024:05:22 02:54:29Z"));
     assert!((s.latitude().expect("lat") - 42.382_47).abs() < 1e-6);
     assert!((s.longitude().expect("lon") - -83.389_57).abs() < 1e-6);
@@ -2923,12 +3148,12 @@ mod tests {
     // following `53.6` (digits.digits) is.
     let text = b"normal:2024/05/22 02:54:29 N:42.382470 W:83.389570 53 53.6 km/h";
     let mut block = vec![0u8; 0x100];
-    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    block[4..12].copy_from_slice(b"freeGPS ");
-    block[16..16 + text.len()].copy_from_slice(text);
+    wr(&mut block, 0, &0x0100u32.to_be_bytes());
+    wr(&mut block, 4, b"freeGPS ");
+    wr(&mut block, 16, text);
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert!(
       (s.speed_kph().expect("spd") - 53.6 * 1.852).abs() < 1e-4,
       "bare int `53` skipped; `53.6` taken: {:?}",
@@ -2944,9 +3169,9 @@ mod tests {
     // After the date/time, byte 43 is `|` (the literal `[N|S]` member).
     let text = b"normal:2024/05/22 02:54:29 |:00.000000 N:42.382470 W:83.389570";
     let mut block = vec![0u8; 0x100];
-    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    block[4..12].copy_from_slice(b"freeGPS ");
-    block[16..16 + text.len()].copy_from_slice(text);
+    wr(&mut block, 0, &0x0100u32.to_be_bytes());
+    wr(&mut block, 4, b"freeGPS ");
+    wr(&mut block, 16, text);
     assert!(detect_type18(block.as_slice()), "`|` at offset 43 detects");
   }
 
@@ -2963,19 +3188,19 @@ mod tests {
     // matches a real dashcam file, whose first freeGPS block sits in an early
     // full chunk — oracle-verified: a sub-0x8000 mdat yields NO GPS).
     let mut block = vec![0u8; 0x100];
-    block[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    block[4..12].copy_from_slice(b"freeGPS ");
-    block[60] = b'A';
-    block[68] = b'N';
-    block[76] = b'W';
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    block[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    block[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
-    block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut block, 0, &0x0100u32.to_be_bytes());
+    wr(&mut block, 4, b"freeGPS ");
+    wb(&mut block, 60, b'A');
+    wb(&mut block, 68, b'N');
+    wb(&mut block, 76, b'W');
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
+    wr(&mut block, 0x58, &2024u32.to_le_bytes());
+    wr(&mut block, 0x5c, &7u32.to_le_bytes());
+    wr(&mut block, 0x60, &15u32.to_le_bytes());
+    wr(&mut block, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut block, 0x48, &12209.901f32.to_le_bytes());
     // Place inside a synthetic file: 100 bytes header + block + padding so the
     // total `mdat` exceeds 0x8000 (the block is then found in a full chunk).
     let mut file = vec![0u8; 100];
@@ -3113,13 +3338,13 @@ mod tests {
     }
     for (i, &b) in decrypted.iter().enumerate() {
       if 18 + i < block.len() {
-        block[18 + i] = b ^ 0xaa;
+        wb(&mut block, 18 + i, b ^ 0xaa);
       }
     }
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(
       s.speed_kph(),
       Some(11.0),
@@ -3135,24 +3360,24 @@ mod tests {
     let (mut block, _) = make_block(0x200);
     let mut decrypted = vec![0u8; 0x101];
     // The 8-byte detection preamble (XOR-0xaa of the GPSType-1 signature).
-    decrypted[0..8].copy_from_slice(b"\x00\x00XKZD\xfe\xfe");
+    wr(&mut decrypted, 0, b"\x00\x00XKZD\xfe\xfe");
     // No GPS coordinates (offset 38 stays NUL), but a valid date/time at
     // offset 8 + label.
-    decrypted[8..22].copy_from_slice(b"20180924224928");
-    decrypted[22] = b'.';
-    decrypted[23..38].copy_from_slice(b"5567GP000000000");
+    wr(&mut decrypted, 8, b"20180924224928");
+    wb(&mut decrypted, 22, b'.');
+    wr(&mut decrypted, 23, b"5567GP000000000");
     // Offset 65 is left as NULs (no `[-+]\d{3}` triple ⇒ branch A fails).
     // Offset 173: three signed-3-digit accel groups.
-    decrypted[173..185].copy_from_slice(b"+012-034+056");
+    wr(&mut decrypted, 173, b"+012-034+056");
     for (i, &b) in decrypted.iter().enumerate() {
       if 18 + i < block.len() {
-        block[18 + i] = b ^ 0xaa;
+        wb(&mut block, 18 + i, b ^ 0xaa);
       }
     }
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     // Date/time back-filled from offset 8 even though GPS is absent.
     assert_eq!(s.date_time(), Some("2018:09:24 22:49:28Z"));
     // Accelerometer from offset 173 (0.12 -0.34 0.56).
@@ -3165,24 +3390,24 @@ mod tests {
   fn decode_type8_track_plus_180_no_wrap() {
     let (mut block, _) = make_block(0x100);
     // Detection: [\x01-\x0c] at 64, [\x01-\x1f] at 68, A NS EW at 72-74.
-    block[64] = 0x05;
-    block[68] = 0x10;
-    block[72] = b'A';
-    block[73] = b'N';
-    block[74] = b'E';
+    wb(&mut block, 64, 0x05);
+    wb(&mut block, 68, 0x10);
+    wb(&mut block, 72, b'A');
+    wb(&mut block, 73, b'N');
+    wb(&mut block, 74, b'E');
     // date at 0x3c..0x48 (yr,mon,day) and hr/min/sec at 0x30.
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    block[0x3c..0x40].copy_from_slice(&2024u32.to_le_bytes());
-    block[0x40..0x44].copy_from_slice(&7u32.to_le_bytes());
-    block[0x44..0x48].copy_from_slice(&15u32.to_le_bytes());
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
+    wr(&mut block, 0x3c, &2024u32.to_le_bytes());
+    wr(&mut block, 0x40, &7u32.to_le_bytes());
+    wr(&mut block, 0x44, &15u32.to_le_bytes());
     // track raw = 200.0 ⇒ +180 = 380.0 (must NOT wrap to 20.0).
-    block[0x64..0x68].copy_from_slice(&200.0f32.to_le_bytes());
+    wr(&mut block, 0x64, &200.0f32.to_le_bytes());
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    assert_eq!(out.gps_samples()[0].track(), Some(380.0));
+    assert_eq!(out.gps_samples().first().unwrap().track(), Some(380.0));
   }
 
   /// GPSType 19 (70mai) does NOT set `$ddd`, so ConvertLatLon IS applied: the
@@ -3190,23 +3415,23 @@ mod tests {
   #[test]
   fn decode_type19_70mai_applies_convert_lat_lon() {
     let (mut block, _) = make_block(0x100);
-    block[30] = b'A';
-    block[51] = b'V';
-    block[52] = b'V';
+    wb(&mut block, 30, b'A');
+    wb(&mut block, 51, b'V');
+    wb(&mut block, 52, b'V');
     // lat int32s at 31 = 511_607_100 ⇒ /1e5 = 5116.071 (DDDMM.MMMM) ⇒
     // ConvertLatLon ⇒ 51 + 16.071/60 = 51.2679°.
-    block[31..35].copy_from_slice(&511_607_100i32.to_le_bytes());
-    block[35..39].copy_from_slice(&83_080_900i32.to_le_bytes()); // lon 830.809 ⇒ 8°30.8'
-    block[43..47].copy_from_slice(&42i32.to_le_bytes());
+    wr(&mut block, 31, &511_607_100i32.to_le_bytes());
+    wr(&mut block, 35, &83_080_900i32.to_le_bytes()); // lon 830.809 ⇒ 8°30.8'
+    wr(&mut block, 43, &42i32.to_le_bytes());
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let lat = out.gps_samples()[0].latitude().expect("lat");
+    let lat = out.gps_samples().first().unwrap().latitude().expect("lat");
     assert!((lat - 51.267_85).abs() < 1e-3, "lat={lat}");
     // The brute-force-scan shape (no SampleTime) emits NO GPSDateTime
     // (QuickTimeStream.pl:2396 `SetGPSDateTime($et, $tagTbl, undef)` is a
     // no-op), matching a real mdat-embedded 70mai file.
-    assert_eq!(out.gps_samples()[0].date_time(), None);
+    assert_eq!(out.gps_samples().first().unwrap().date_time(), None);
   }
 
   /// GPSType 19 (70mai) threads a per-sample decoding time through
@@ -3221,12 +3446,12 @@ mod tests {
   #[test]
   fn decode_type19_70mai_synthesizes_gps_date_time_from_sample_time() {
     let mut block = make_block(0x100).0;
-    block[30] = b'A';
-    block[51] = b'V';
-    block[52] = b'V';
-    block[31..35].copy_from_slice(&511_607_100i32.to_le_bytes());
-    block[35..39].copy_from_slice(&83_080_900i32.to_le_bytes());
-    block[43..47].copy_from_slice(&42i32.to_le_bytes());
+    wb(&mut block, 30, b'A');
+    wb(&mut block, 51, b'V');
+    wb(&mut block, 52, b'V');
+    wr(&mut block, 31, &511_607_100i32.to_le_bytes());
+    wr(&mut block, 35, &83_080_900i32.to_le_bytes());
+    wr(&mut block, 43, &42i32.to_le_bytes());
 
     // CreateDate raw 1904-epoch = 3_791_457_280 (= unix 1_708_612_480 =
     // 2024:02:22 14:34:40Z); SampleTime 2.0s ⇒ GPSDateTime 14:34:42Z.
@@ -3234,19 +3459,19 @@ mod tests {
     decode_block_with_time(&block, 3_791_457_280, 2.0, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     assert_eq!(
-      out.gps_samples()[0].date_time(),
+      out.gps_samples().first().unwrap().date_time(),
       Some("2024:02:22 14:34:42Z"),
       "GPSDateTime = CreateDate + SampleTime"
     );
     // lat/lon still decode (ConvertLatLon applied).
-    let lat = out.gps_samples()[0].latitude().expect("lat");
+    let lat = out.gps_samples().first().unwrap().latitude().expect("lat");
     assert!((lat - 51.267_85).abs() < 1e-3, "lat={lat}");
 
     // No CreateDate ⇒ no GPSDateTime even with a SampleTime.
     let mut out2 = QuickTimeStreamMeta::new();
     let mut state = FreeGpsState::new();
     process_free_gps(&block, None, Some(2.0), None, &mut state, &mut out2);
-    assert_eq!(out2.gps_samples()[0].date_time(), None);
+    assert_eq!(out2.gps_samples().first().unwrap().date_time(), None);
   }
 
   /// GPSType 14 (XBHT) records are 36 bytes wide, so two consecutive records
@@ -3256,19 +3481,19 @@ mod tests {
     let (mut block, _) = make_block(0x100);
     let write_rec = |b: &mut [u8], start: usize, day: u8| {
       // rec[1..7] = yr,mon,day,hr,min,sec ; rec[7]=ss(<=9) ; rec[8]='A'.
-      b[start + 1] = 24; // yr ⇒ 2024
-      b[start + 2] = 7;
-      b[start + 3] = day;
-      b[start + 4] = 12;
-      b[start + 5] = 30;
-      b[start + 6] = 45;
-      b[start + 7] = 0;
-      b[start + 8] = b'A';
-      b[start + 9] = b'N';
-      b[start + 10] = b'E';
-      b[start + 16..start + 20].copy_from_slice(&476_284u32.to_le_bytes()); // lat*1e4
-      b[start + 20..start + 24].copy_from_slice(&83_080u32.to_le_bytes()); // lon*1e4
-      b[start + 28..start + 30].copy_from_slice(&55u16.to_le_bytes()); // spd
+      wb(b, start + 1, 24); // yr ⇒ 2024
+      wb(b, start + 2, 7);
+      wb(b, start + 3, day);
+      wb(b, start + 4, 12);
+      wb(b, start + 5, 30);
+      wb(b, start + 6, 45);
+      wb(b, start + 7, 0);
+      wb(b, start + 8, b'A');
+      wb(b, start + 9, b'N');
+      wb(b, start + 10, b'E');
+      wr(b, start + 16, &476_284u32.to_le_bytes()); // lat*1e4
+      wr(b, start + 20, &83_080u32.to_le_bytes()); // lon*1e4
+      wr(b, start + 28, &55u16.to_le_bytes()); // spd
     };
     // Detection marker for dispatch: hr/min/sec/A at 20-24 (first record at
     // rec_start=16 ⇒ A at 24).
@@ -3282,11 +3507,11 @@ mod tests {
       "two 36-byte XBHT records must both decode"
     );
     assert_eq!(
-      out.gps_samples()[0].date_time(),
+      out.gps_samples().first().unwrap().date_time(),
       Some("2024:07:15 12:30:45.0")
     );
     assert_eq!(
-      out.gps_samples()[1].date_time(),
+      out.gps_samples().get(1).unwrap().date_time(),
       Some("2024:07:16 12:30:45.0")
     );
   }
@@ -3298,21 +3523,21 @@ mod tests {
   fn make_type6_block(size: usize) -> Vec<u8> {
     assert!(size >= 0x80 && size % 256 == 0 && size <= 0xff_ff00);
     let mut block = vec![0u8; size];
-    block[0..4].copy_from_slice(&(size as u32).to_be_bytes());
-    block[4..12].copy_from_slice(b"freeGPS ");
+    wr(&mut block, 0, &(size as u32).to_be_bytes());
+    wr(&mut block, 4, b"freeGPS ");
     // Type-6 markers (QuickTimeStream.pl:1906): A@60, [NS]@68, [EW]@76.
-    block[60] = b'A';
-    block[68] = b'N';
-    block[76] = b'W';
+    wb(&mut block, 60, b'A');
+    wb(&mut block, 68, b'N');
+    wb(&mut block, 76, b'W');
     // hr/min/sec @ 0x30, yr/mon/day @ 0x58, lat/lon floats @ 0x40/0x48.
-    block[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    block[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    block[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    block[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    block[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    block[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
-    block[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    block[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut block, 0x30, &14u32.to_le_bytes());
+    wr(&mut block, 0x34, &30u32.to_le_bytes());
+    wr(&mut block, 0x38, &45u32.to_le_bytes());
+    wr(&mut block, 0x58, &2024u32.to_le_bytes());
+    wr(&mut block, 0x5c, &7u32.to_le_bytes());
+    wr(&mut block, 0x60, &15u32.to_le_bytes());
+    wr(&mut block, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut block, 0x48, &12209.901f32.to_le_bytes());
     block
   }
 
@@ -3358,7 +3583,7 @@ mod tests {
   fn scan_media_data_block_overrunning_mdat_is_safe() {
     let mut block = make_type6_block(0x200);
     // Lie about the size: claim 0x10000 bytes but the buffer is only 0x200.
-    block[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    wr(&mut block, 0, &0x0001_0000u32.to_be_bytes());
     let mut file = vec![0u8; 32];
     let mdat_offset = file.len() as u64;
     file.extend_from_slice(&block);
@@ -3385,18 +3610,18 @@ mod tests {
     hms: (u8, u8, u8),
     lat_e7: i32,
   ) {
-    block[rec_off + 0x0d] = hms.0.wrapping_sub(1); // stored hour is H-1
-    block[rec_off + 0x0e] = hms.1;
-    block[rec_off + 0x0f] = hms.2;
-    block[rec_off + 0x10..rec_off + 0x14].copy_from_slice(&lat_e7.to_le_bytes());
-    block[rec_off + 0x15..rec_off + 0x18].copy_from_slice(b"ATC");
-    block[rec_off + 0x18..rec_off + 0x1c].copy_from_slice(&(-1_221_650_167i32).to_le_bytes());
-    block[rec_off + 0x20..rec_off + 0x24].copy_from_slice(&2000i32.to_le_bytes());
-    block[rec_off + 0x24..rec_off + 0x26].copy_from_slice(&0i16.to_le_bytes());
-    block[rec_off + 0x28..rec_off + 0x2c].copy_from_slice(&100_000i32.to_le_bytes());
-    block[rec_off + 0x2c..rec_off + 0x2e].copy_from_slice(&ymd.0.to_le_bytes());
-    block[rec_off + 0x2e] = ymd.1;
-    block[rec_off + 0x2f] = ymd.2;
+    wb(block, rec_off + 0x0d, hms.0.wrapping_sub(1)); // stored hour is H-1
+    wb(block, rec_off + 0x0e, hms.1);
+    wb(block, rec_off + 0x0f, hms.2);
+    wr(block, rec_off + 0x10, &lat_e7.to_le_bytes());
+    wr(block, rec_off + 0x15, b"ATC");
+    wr(block, rec_off + 0x18, &(-1_221_650_167i32).to_le_bytes());
+    wr(block, rec_off + 0x20, &2000i32.to_le_bytes());
+    wr(block, rec_off + 0x24, &0i16.to_le_bytes());
+    wr(block, rec_off + 0x28, &100_000i32.to_le_bytes());
+    wr(block, rec_off + 0x2c, &ymd.0.to_le_bytes());
+    wb(block, rec_off + 0x2e, ymd.1);
+    wb(block, rec_off + 0x2f, ymd.2);
   }
 
   /// FINDING 4 regression — the ATC ring buffer is rewritten WHOLE into every
@@ -3409,7 +3634,7 @@ mod tests {
   fn type11_atc_cross_block_suppresses_stale_records() {
     // Block 1: two records at 14:30:45 and 14:30:46 (both new on first sight).
     let mut block1 = make_block(0x100).0;
-    block1[0x45..0x48].copy_from_slice(b"ATC");
+    wr(&mut block1, 0x45, b"ATC");
     write_atc_record(&mut block1, 0x30, (2024, 7, 15), (14, 30, 45), 476_284_215);
     write_atc_record(
       &mut block1,
@@ -3420,7 +3645,7 @@ mod tests {
     );
     // Block 2: REPEATS both old records, then adds a NEWER one at 14:30:47.
     let mut block2 = make_block(0x100).0;
-    block2[0x45..0x48].copy_from_slice(b"ATC");
+    wr(&mut block2, 0x45, b"ATC");
     write_atc_record(&mut block2, 0x30, (2024, 7, 15), (14, 30, 45), 476_284_215);
     write_atc_record(
       &mut block2,
@@ -3448,7 +3673,7 @@ mod tests {
       "block 2 must emit ONLY the one newer record, not the two repeats"
     );
     assert_eq!(
-      out.gps_samples()[2].date_time(),
+      out.gps_samples().get(2).unwrap().date_time(),
       Some("2024:07:15 14:30:47Z"),
       "the third sample is the new 14:30:47 record"
     );
@@ -3462,9 +3687,9 @@ mod tests {
   fn type2_nmea_rmc_void_status_yields_no_sample() {
     // A Type-2 block: 14 ASCII digits at offset 52, then an RMC with status V.
     let mut block = make_block(0x100).0;
-    block[52..66].copy_from_slice(b"20180919100959");
+    wr(&mut block, 52, b"20180919100959");
     let rmc = b"$GPRMC,080951.000,V,,,,,000.0,,190918,,,N";
-    block[0x50..0x50 + rmc.len()].copy_from_slice(rmc);
+    wr(&mut block, 0x50, rmc);
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert!(
@@ -3479,10 +3704,10 @@ mod tests {
   #[test]
   fn type2_nmea_gga_zero_fix_yields_no_sample() {
     let mut block = make_block(0x100).0;
-    block[52..66].copy_from_slice(b"20180919100959");
+    wr(&mut block, 52, b"20180919100959");
     // Only a GGA (no RMC) with fix quality 0 — must copy nothing.
     let gga = b"$GPGGA,123519,4807.038,N,01131.000,E,0,08,0.9,545.4,M,,,";
-    block[0x50..0x50 + gga.len()].copy_from_slice(gga);
+    wr(&mut block, 0x50, gga);
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert!(
@@ -3497,13 +3722,13 @@ mod tests {
   #[test]
   fn type2_nmea_active_gga_still_decodes_when_rmc_void() {
     let mut block = make_block(0x100).0;
-    block[52..66].copy_from_slice(b"20180919100959");
+    wr(&mut block, 52, b"20180919100959");
     let payload = b"$GPRMC,080951.000,V,,,,,,,190918,,,N\r\n$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,,,";
-    block[0x50..0x50 + payload.len()].copy_from_slice(payload);
+    wr(&mut block, 0x50, payload);
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert!(s.has_coordinates(), "the active GGA supplies a coordinate");
     assert_eq!(s.altitude_m(), Some(545.4));
   }
@@ -3582,22 +3807,22 @@ mod tests {
   /// branch never fires — only the KodakVersion gate selects 17b.
   fn make_type17_rexing_block() -> Vec<u8> {
     let mut b = vec![0u8; 0x100];
-    b[0..4].copy_from_slice(&0x0100u32.to_be_bytes()); // box length (BE), LE != 0x400000
-    b[4..12].copy_from_slice(b"freeGPS ");
-    b[0x48] = b'A';
-    b[0x49] = b'N';
-    b[0x4a] = b'W';
-    b[0x4b] = 0;
-    b[0x30..0x34].copy_from_slice(&14u32.to_le_bytes()); // hr
-    b[0x34..0x38].copy_from_slice(&34u32.to_le_bytes()); // min
-    b[0x38..0x3c].copy_from_slice(&40u32.to_le_bytes()); // sec
-    b[0x3c..0x40].copy_from_slice(&2024u32.to_le_bytes()); // yr
-    b[0x40..0x44].copy_from_slice(&2u32.to_le_bytes()); // mon
-    b[0x44..0x48].copy_from_slice(&22u32.to_le_bytes()); // day
-    b[0x4c..0x50].copy_from_slice(&[0xe9, 0x7e, 0x90, 0x43]); // lat float 288.99
-    b[0x50..0x54].copy_from_slice(&[0x48, 0x76, 0x17, 0x45]); // lon float 2423.39
-    b[0x54..0x58].copy_from_slice(&50.0f32.to_le_bytes()); // spd (knots)
-    b[0x58..0x5c].copy_from_slice(&90.0f32.to_le_bytes()); // trk
+    wr(&mut b, 0, &0x0100u32.to_be_bytes()); // box length (BE), LE != 0x400000
+    wr(&mut b, 4, b"freeGPS ");
+    wb(&mut b, 0x48, b'A');
+    wb(&mut b, 0x49, b'N');
+    wb(&mut b, 0x4a, b'W');
+    wb(&mut b, 0x4b, 0);
+    wr(&mut b, 0x30, &14u32.to_le_bytes()); // hr
+    wr(&mut b, 0x34, &34u32.to_le_bytes()); // min
+    wr(&mut b, 0x38, &40u32.to_le_bytes()); // sec
+    wr(&mut b, 0x3c, &2024u32.to_le_bytes()); // yr
+    wr(&mut b, 0x40, &2u32.to_le_bytes()); // mon
+    wr(&mut b, 0x44, &22u32.to_le_bytes()); // day
+    wr(&mut b, 0x4c, &[0xe9, 0x7e, 0x90, 0x43]); // lat float 288.99
+    wr(&mut b, 0x50, &[0x48, 0x76, 0x17, 0x45]); // lon float 2423.39
+    wr(&mut b, 0x54, &50.0f32.to_le_bytes()); // spd (knots)
+    wr(&mut b, 0x58, &90.0f32.to_le_bytes()); // trk
     b
   }
 
@@ -3612,7 +3837,7 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     decode_block_kodak(&block, "3.01.054", &mut out);
     assert_eq!(out.gps_samples().len(), 1, "one 17b sample");
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     let lat = s.latitude().expect("lat");
     let lon = s.longitude().expect("lon");
     // 17b is `$ddd = 1` ⇒ NO ConvertLatLon; `W` ref negates the longitude.
@@ -3643,7 +3868,7 @@ mod tests {
     // No KodakVersion ⇒ default-17.
     let mut out = QuickTimeStreamMeta::new();
     decode_block(&block, &mut out);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     let lat = s.latitude().expect("lat");
     let lon = s.longitude().expect("lon");
     assert!(
@@ -3658,7 +3883,7 @@ mod tests {
     // A NON-matching KodakVersion is also default-17 (only "3.01.054" gates 17b).
     let mut out2 = QuickTimeStreamMeta::new();
     decode_block_kodak(&block, "9.99.999", &mut out2);
-    let s2 = &out2.gps_samples()[0];
+    let s2 = out2.gps_samples().first().unwrap();
     assert!(
       (s2.latitude().expect("lat") - 3.483_191_426_595_05).abs() < 1e-9,
       "non-matching KodakVersion stays default-17"
