@@ -2838,6 +2838,20 @@ fn escape_json_is_number(s: &str) -> bool {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for H264Meta<'_> {
+  /// The H.264 `$et->Warn` corpus (MDPM out-of-sequence H264.pm:989 /
+  /// forbidden-bit H264.pm:1058) as [`Diagnostic`](crate::diagnostics::Diagnostic)
+  /// warnings, in occurrence order.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self
+      .warnings()
+      .iter()
+      .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str()))
+      .collect()
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for H264Meta<'_> {
   /// Yield the H.264 tags in extraction order (Perl `HandleTag` call
   /// sequence) — the golden-pattern parallel to the retired `serialize_tags`:

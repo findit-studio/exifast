@@ -1388,6 +1388,33 @@ fn id3v1_genre_byte_for_name(name: &str) -> Option<(u8, &'static str)> {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Id3Meta<'_> {
+  /// This ID3 directory's own `$et->Warn` then `$et->Error` corpus as
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic)s — warnings BEFORE errors,
+  /// the order every wrapper format (MP3/DSF/FLAC/MPC/OGG/WavPack/APE) drained
+  /// the nested ID3 sub-Meta. Sourced from the kept
+  /// [`warnings_slice`](Self::warnings_slice) / [`errors_slice`](Self::errors_slice)
+  /// stores (those also feed construction, so they stay).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out =
+      std::vec::Vec::with_capacity(self.warnings_slice().len() + self.errors_slice().len());
+    out.extend(
+      self
+        .warnings_slice()
+        .iter()
+        .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+    );
+    out.extend(
+      self
+        .errors_slice()
+        .iter()
+        .map(|e| crate::diagnostics::Diagnostic::error(e.as_str())),
+    );
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Id3Meta<'_> {
   /// Yield every staged ID3 tag in the order the legacy engine produced
   /// them — the golden-pattern emission path for ID3 (every wrapper format —
@@ -1518,6 +1545,27 @@ impl crate::metadata::Project for Id3Meta<'_> {
     }
 
     media
+  }
+}
+
+#[cfg(feature = "mp3")]
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Mp3Meta<'_> {
+  /// MP3's diagnostics in bundled `ProcessMP3` order (ID3.pm:1684-1728):
+  /// (a) the ID3 sub-Meta's own warnings then errors; (b) MPEG-audio emits
+  /// none; (c) the APE sub-Meta's own diagnostics (its nested ID3v1-trailer
+  /// sub-Meta's warnings then errors, then the APE.pm:238 `Bad APE trailer`).
+  /// Byte-identical net `TagMap`.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::new();
+    if let Some(id3) = self.id3() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(id3));
+    }
+    #[cfg(feature = "ape")]
+    if let Some(ape) = self.ape() {
+      out.extend(crate::diagnostics::Diagnose::diagnostics(ape));
+    }
+    out
   }
 }
 

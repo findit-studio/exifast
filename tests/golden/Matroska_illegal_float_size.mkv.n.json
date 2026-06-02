@@ -1,0 +1,16 @@
+[{
+  "SourceFile": "Matroska_illegal_float_size.mkv",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "MKV",
+  "File:FileTypeExtension": "MKV",
+  "File:MIMEType": "video/x-matroska",
+  "Matroska:EBMLVersion": 1,
+  "Matroska:EBMLReadVersion": 1,
+  "Matroska:DocType": "matroska",
+  "Matroska:DocTypeVersion": 1,
+  "Matroska:DocTypeReadVersion": 1,
+  "Info:MuxingApp": "synth",
+  "Info:WritingApp": "synth",
+  "Info:Warning": "Illegal float size (3)",
+  "Info:Duration": 0
+}]

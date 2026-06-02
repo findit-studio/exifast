@@ -429,6 +429,26 @@ fn mxf_conformance() {
 }
 
 #[test]
+fn mxf_bad_array_conformance() {
+  // Golden-v2 Phase B.1.5 — the `Bad array or batch size` warning
+  // (MXF.pm:2525-2528). An `(Array|Batch)` value with `len > 16` whose
+  // header `(count, size)` fails `$len == 8 + $count * $size` raises
+  // `$et->Warn("Bad array or batch size")` while `$$et{SET_GROUP1} = 'MXF'`
+  // (MXF.pm:2838) ⇒ the group-scoped `MXF:Warning` TAG. The entry read loop
+  // is independent of the size check, so the warning is the ONLY output delta.
+  //
+  // Crafted fixture: the bundled `MXF.mxf` with the Preface `Identifications`
+  // StrongReferenceBatch (local tag 0x3b06) `count` bumped 1→2 (so `8 + 2*16
+  // = 40 != 24`); the loop still reads the 1 present GUID then `last`s
+  // (MXF.pm:2532), so the tree walk / every other tag is byte-identical.
+  // Goldens are `tools/gen_golden.sh` 13.59 output (version stamp normalized
+  // to 13.58) — `diff` vs `MXF.mxf.json` is exactly the one added
+  // `MXF:Warning` line.
+  check("MXF_bad_array.mxf", "MXF_bad_array.mxf.json", true);
+  check("MXF_bad_array.mxf", "MXF_bad_array.mxf.n.json", false);
+}
+
+#[test]
 fn mxf_multidescriptor_conformance() {
   // Codex R1/F1 regression: a multi-essence MXF whose audio descriptors are
   // reachable from the `Preface` root ONLY through the HIDDEN structural
@@ -1530,6 +1550,125 @@ fn matroska_duration_zero_scale_conformance() {
   check(
     "Matroska_duration_zero_scale.mkv",
     "Matroska_duration_zero_scale.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_illegal_float_size_conformance() {
+  // Golden-v2 Phase B.1.5 — the `Illegal float size` warning + the
+  // undef→ValueConv leaf VALUE fix (Matroska.pm:1178-1180). A `Format =>
+  // 'float'` element (here `Duration`, 0x4489) with a non-4/8-byte size
+  // (3) is the `else { $et->Warn("Illegal float size ($size)") }` branch:
+  // `$val` is left UNDEF, the warning is raised under the active
+  // `SET_GROUP1 = 'Info'` (Matroska.pm:1121) ⇒ the group-scoped
+  // `Info:Warning` TAG, and the Duration leaf is its undef→ValueConv result
+  // = `0` (`undef / 1000`, no TimecodeScale present). NOT `NaN`.
+  //
+  // Crafted fixture: minimal EBMLHeader + Segment[Info[MuxingApp, WritingApp,
+  // Duration(size 3)]]; the Info/Segment container sizes are widened so the
+  // bad-size Duration fits its container (otherwise the :1074 corruption check
+  // fires first). Goldens are `tools/gen_golden.sh` 13.59 output (version
+  // stamp normalized to 13.58); the ONLY delta vs a valid Duration is the
+  // added `Info:Warning` + `Info:Duration: 0`.
+  check(
+    "Matroska_illegal_float_size.mkv",
+    "Matroska_illegal_float_size.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_illegal_float_size.mkv",
+    "Matroska_illegal_float_size.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_warning_collision_conformance() {
+  // Golden-v2 Phase B R1 — a group-scoped `$et->Warn` `Warning` TAG colliding
+  // with a REAL same-group SimpleTag `Warning` on the `-G1` output key
+  // `Info:Warning`. Both are the pseudo-tag `Warning`: the diagnostic is the
+  // `Extra` table `Warning` (`Priority => 0`, ExifTool.pm:1299), the SimpleTag
+  // is the `StdTag` table `Warning` (table `PRIORITY => 0`, Matroska.pm:752).
+  // ExifTool NEVER lets a priority-0 duplicate override (the new value is
+  // shunted to `Warning (1)`, ExifTool.pm:9544-9560) and the default `%noDups`
+  // output keeps the FIRST-extracted by file order (ExifTool.pm:5404-5417) —
+  // i.e. whichever the walk reached FIRST wins.
+  //
+  // FORWARD fixture: Info[MuxingApp, WritingApp, Duration(size 3 — illegal
+  // float, raises `Info:Warning` AT the Duration walk position),
+  // SimpleTag[TagName=Warning, TagString="from-simpletag"]]. The illegal-float
+  // diagnostic is walk-FIRST, so the oracle survivor is `Info:Warning =
+  // "Illegal float size (3)"` (NOT the later SimpleTag). This pins that the
+  // diagnostic — now emitted IN-STREAM at its walk position (not drained last)
+  // — correctly wins when it is the first FoundTag. (The old run_diagnostics-
+  // last path also produced this value, by accident of last-wins; the reverse
+  // fixture is the one that exercised the bug.) Goldens are `gen_golden.sh`
+  // 13.59 output, version stamp normalized to 13.58.
+  check(
+    "Matroska_warning_collision.mkv",
+    "Matroska_warning_collision.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_warning_collision.mkv",
+    "Matroska_warning_collision.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_warning_collision_rev_conformance() {
+  // Golden-v2 Phase B R1 (the bug-exercising direction) — same `Info:Warning`
+  // collision as `matroska_warning_collision`, but the REAL SimpleTag
+  // `Warning` is walk-FIRST and the illegal-float diagnostic is walk-LATER:
+  // Info[MuxingApp, WritingApp, SimpleTag[TagName=Warning,
+  // TagString="from-simpletag"], Duration(size 3)]. The SimpleTag is the first
+  // FoundTag, so the oracle survivor is `Info:Warning = "from-simpletag"` (the
+  // priority-0 diagnostic raised later does NOT override it).
+  //
+  // This is the case the pre-fix port got WRONG: it drained the group-scoped
+  // diagnostic through `run_diagnostics` AFTER `run_emission` (which had
+  // already written the SimpleTag `Info:Warning`), and TagMap's last-wins
+  // clobbered the SimpleTag with the diagnostic → `"Illegal float size (3)"`,
+  // diverging from the oracle. The fix emits the group-scoped warning
+  // IN-STREAM at its walk position (mirroring QuickTime's `Track<N>:Warning`)
+  // and makes `Warning`/`Error` FIRST-wins in TagMap (the faithful priority-0
+  // dedup), so the first-walked SimpleTag survives. Goldens normalized to
+  // 13.58.
+  check(
+    "Matroska_warning_collision_rev.mkv",
+    "Matroska_warning_collision_rev.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_warning_collision_rev.mkv",
+    "Matroska_warning_collision_rev.mkv.n.json",
+    false,
+  );
+}
+
+#[test]
+fn matroska_truncated_header_conformance() {
+  // Golden-v2 Phase B.1.5 — the `Truncated Matroska header` warning + NO
+  // `File:*` (Matroska.pm:1003-1006). When the EBML header's declared body
+  // overruns the file (`$pos + $hlen > $dataLen`), bundled `$et->Warn(
+  // 'Truncated Matroska header'), return 1` — BEFORE `SetFileType()` at
+  // :1007 — so the document carries ONLY `ExifTool:Warning` (document-level,
+  // no `SET_GROUP1` active) and NO `File:FileType`/`FileTypeExtension`/
+  // `MIMEType` triplet and NO `Matroska:*` tags.
+  //
+  // Crafted fixture: the 4-byte EBML magic + a header declaring a 35-byte
+  // body, truncated to 20 bytes total (16 < 36 ⇒ truncated). Goldens are
+  // `tools/gen_golden.sh` 13.59 output (version stamp normalized to 13.58).
+  check(
+    "Matroska_truncated_header.mkv",
+    "Matroska_truncated_header.mkv.json",
+    true,
+  );
+  check(
+    "Matroska_truncated_header.mkv",
+    "Matroska_truncated_header.mkv.n.json",
     false,
   );
 }

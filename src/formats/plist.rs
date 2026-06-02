@@ -3043,6 +3043,21 @@ fn leaf_to_tag_value(leaf: &PlistLeaf) -> crate::value::TagValue {
 }
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for PlistMeta<'_> {
+  /// The PLIST.pm:234 AAE `adjustmentData` raw-DEFLATE inflate-failure
+  /// `$et->Warn(...)` as a [`Diagnostic`](crate::diagnostics::Diagnostic)
+  /// warning. The bundled `Warn` API does NOT honor `SET_GROUP1 = 'PLIST'`, so
+  /// it surfaces as the family-0 `ExifTool:Warning` (the recognized-PLIST
+  /// binary `PLIST:Error` is a family-1 TAG emitted by `tags()`, NOT a
+  /// diagnostic, so it is not here).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    match self.warning() {
+      Some(msg) => std::vec![crate::diagnostics::Diagnostic::warn(msg)],
+      None => std::vec::Vec::new(),
+    }
+  }
+}
+
 #[cfg(feature = "alloc")]
 impl crate::emit::Taggable for PlistMeta<'_> {
   /// The golden-pattern tag stream — the parallel to the retired inherent
@@ -3070,8 +3085,8 @@ impl crate::emit::Taggable for PlistMeta<'_> {
   ///
   /// NOTE: every PLIST tag is always-emitted (no `Unknown => 1` gate), so
   /// `unknown` is `false` throughout. The recoverable `$et->Warn` (AAE
-  /// inflate) is NOT in this stream — it is a diagnostic, drained by
-  /// `AnyMeta::Plist`'s `drain_diagnostics` arm. The recognized-PLIST binary
+  /// inflate) is NOT in this stream — it is a diagnostic, yielded by
+  /// [`PlistMeta::diagnostics`](crate::diagnostics::Diagnose::diagnostics). The recognized-PLIST binary
   /// `PLIST:Error` IS a family-1 tag (PLIST.pm:484-486 inside the
   /// `SET_GROUP1 = 'PLIST'` scope) and IS emitted here.
   fn tags(

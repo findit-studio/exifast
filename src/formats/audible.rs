@@ -1287,6 +1287,30 @@ fn collides_with_priority2_engine_tag(name: &str) -> bool {
 // ===========================================================================
 
 #[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// Audible's `$et->Warn` corpus then `$et->Error` corpus as
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic)s — the exact order the
+  /// retired `AnyMeta::drain_diagnostics` AA arm drained (all warnings, then
+  /// all errors).
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    let mut out = std::vec::Vec::with_capacity(self.warnings().len() + self.errors().len());
+    out.extend(
+      self
+        .warnings()
+        .iter()
+        .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
+    );
+    out.extend(
+      self
+        .errors()
+        .iter()
+        .map(|e| crate::diagnostics::Diagnostic::error(e.as_str())),
+    );
+    out
+  }
+}
+
+#[cfg(feature = "alloc")]
 impl crate::emit::Taggable for Meta<'_> {
   /// Yield AA tags in `ProcessAA` extraction order (Audible.pm:215-271):
   /// TOC-walk order of (chunk_type ∈ {2, 6, 11}) emissions, post-last-wins/
