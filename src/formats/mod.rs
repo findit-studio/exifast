@@ -7,6 +7,14 @@
 //! ExifTool's "Process<Type> not loaded → `next` in candidate loop" —
 //! ExifTool.pm:3060-3077).
 
+// Golden-v2 Contract 3c (Phase C): parser-panic-safety by construction. This
+// inner attribute CASCADES into every `pub mod <fmt>;` submodule below, so a
+// newly added parser is checked even if it forgets its own file-level deny —
+// it cannot silently ship raw `buf[i]` indexing on input bytes. Per-file
+// `#![deny(...)]` stays on each leaf for local visibility; test modules opt
+// out locally with `#[allow(clippy::indexing_slicing)]`.
+#![deny(clippy::indexing_slicing)]
+
 #[cfg(feature = "aac")]
 pub mod aac;
 #[cfg(feature = "aiff")]

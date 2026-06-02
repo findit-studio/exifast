@@ -1831,9 +1831,7 @@ impl Walker<'_, '_> {
     // 64-bit these checks never trip for an in-range value, so behavior is
     // unchanged there.
     if ifd_start.checked_add(2).is_none_or(|end| end > data.len()) {
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
     let num_entries = get_u16(data, ifd_start, self.order)? as usize;
@@ -1845,9 +1843,7 @@ impl Walker<'_, '_> {
       .and_then(|body| body.checked_add(2))
       .and_then(|dir_size| ifd_start.checked_add(dir_size))
     else {
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     };
     // `$bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) { unless
@@ -1867,9 +1863,7 @@ impl Walker<'_, '_> {
       // (vendor parsing is deferred — see [`SubDirKind::MakerNote`]), so
       // every directory kind it handles takes the abort branch.
       // `$et->Warn("Bad $dir directory")` — Exif.pm:6381.
-      self
-        .warnings
-        .push(std::format!("Bad {} directory", kind.as_str()));
+      self.warn(std::format!("Bad {} directory", kind.as_str()));
       return None;
     }
 
@@ -2147,9 +2141,7 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
           None => std::format!("tag 0x{tag_id:04x}"),
         };
-        self
-          .warnings
-          .push(std::format!("Invalid size ({size}) for {dir} {tag}"));
+        self.warn(std::format!("Invalid size ({size}) for {dir} {tag}"));
         return Step::Skip; // `next` — skip this entry, continue the IFD.
       }
       let off = match get_u32(data, entry + 8, order) {
@@ -2503,9 +2495,7 @@ impl Walker<'_, '_> {
         // `walk_one_ifd` raises for an offset it cannot read. Route the
         // negative pointer through that path instead of walking it.
         let Ok(sub_offset) = usize::try_from(sub_offset) else {
-          self
-            .warnings
-            .push(std::format!("Bad {} directory", kind.as_str()));
+          self.warn(std::format!("Bad {} directory", kind.as_str()));
           return;
         };
         // `$offset >= 8` is not enforced for sub-IFD `Start => '$val'`, but
@@ -3179,7 +3169,16 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
     use crate::diagnostics::Diagnostic;
     // Carry each warning's `sub Warn` ignorable level (index-aligned) so the
     // `[Minor] ` prefix on the excessive-count warning comes from
-    // `run_diagnostics`, not a baked literal.
+    // `run_diagnostics`, not a baked literal. INVARIANT: every warning is
+    // recorded through `warn()` / `warn_minor_behavioral()`, which append to
+    // BOTH vectors in lock-step, so `warnings_ignorable[i]` is the level of
+    // `warnings[i]`. A bare `warnings.push` would desync them and shift a
+    // `[Minor]` flag onto the wrong message (Phase-C regression fix).
+    debug_assert_eq!(
+      self.warnings().len(),
+      self.warnings_ignorable.len(),
+      "warnings/warnings_ignorable must stay index-aligned",
+    );
     self
       .warnings()
       .iter()
@@ -5355,6 +5354,42 @@ mod tests {
       dir_end, None,
       "dir-end arithmetic must detect usize overflow"
     );
+  }
+
+  /// Regression (Golden-v2 Phase C): every EXIF warning push keeps `warnings`
+  /// and `warnings_ignorable` index-aligned. The "Bad <dir> directory" abort
+  /// (Exif.pm:6383) is a NORMAL warning — `$inMakerNotes` is structurally
+  /// always 0 in this walker (MakerNote IFDs are never recursed), so its
+  /// ignorable level is 0; a later excessive-count warning (Exif.pm:6767) is
+  /// `[Minor]` (ignorable 2). `diagnostics()` pairs the two vectors BY INDEX,
+  /// so if the normal push skipped `warnings_ignorable` the `2` would shift
+  /// onto the "Bad directory" message and the excessive-count warning would
+  /// render unprefixed. Assert the levels stay aligned.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn warning_ignorable_levels_stay_index_aligned() {
+    let data = minimal_tiff_with_make();
+    let mut w = test_walker(&data);
+    // A real bare-push site: an overflowing `ifd_start` aborts with
+    // "Bad IFD0 directory" — a NORMAL (ignorable 0) warning.
+    let next = w.walk_one_ifd_body(usize::MAX, IfdKind::Ifd0);
+    assert_eq!(next, None);
+    // A later minor-with-behavioural-change warning (the excessive-count arm).
+    w.warn_minor_behavioral(String::from(
+      "Ignoring IFD0 Orientation with excessive count",
+    ));
+    assert_eq!(
+      w.warnings,
+      std::vec![
+        String::from("Bad IFD0 directory"),
+        String::from("Ignoring IFD0 Orientation with excessive count"),
+      ],
+    );
+    // The crux: ignorable levels are index-aligned — `0` for the normal
+    // Bad-directory warning, `2` for the minor excessive-count warning. Before
+    // the fix the normal push skipped this vector, yielding `[2]` and shifting
+    // the `[Minor]` prefix onto the wrong message.
+    assert_eq!(w.warnings_ignorable, std::vec![0u8, 2u8]);
   }
 
   /// CLASS SWEEP — the low-level byte readers (`get_u16`/`get_u32`/`get_u64`
