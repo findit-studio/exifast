@@ -1691,27 +1691,50 @@ type RefList = Vec<String>;
 /// `(int32u count, int32u size)` header then `count` entries of `size`
 /// bytes. `StrongReference*` entries render as GUIDs; `BatchOfUL` /
 /// `WeakReference` entries render as ULs (recursive `read_mxf_value(_, 'UL')`).
-fn decode_ref_list(bytes: &[u8], guid_entries: bool) -> RefList {
+///
+/// Returns the rendered entries plus `bad_size`: the faithful
+/// `$len == 8 + $count * $size or $et->Warn("Bad array or batch size")`
+/// validation (MXF.pm:2528). `bad_size == true` ⇒ the caller raises the
+/// group-scoped `MXF:Warning`. The entry loop is UNAFFECTED by `bad_size` —
+/// it still reads `count` entries, `last`ing when one would overrun
+/// (MXF.pm:2530-2533) — so a bad size changes ONLY the warning, never the
+/// emitted list (faithful: the warning and the read loop are independent).
+fn decode_ref_list(bytes: &[u8], guid_entries: bool) -> (RefList, bool) {
   let mut out = Vec::new();
+  // MXF.pm:2525 — `$len > 16` is the precondition for the whole Array/Batch
+  // branch; a `<= 16` byte value never reaches the count/size validation.
   if bytes.len() <= 16 {
-    return out;
+    return (out, false);
   }
   // MXF.pm:2526 `unpack('NN', $val)`.
   let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
   let size = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+  // MXF.pm:2528 `$len == 8 + $count * $size or $et->Warn(...)`. Use
+  // `checked_mul`/`checked_add` so a hostile count/size cannot overflow the
+  // comparison (an overflowing product is `!= len`, i.e. ALSO bad).
+  let expected = count.checked_mul(size).and_then(|p| p.checked_add(8));
+  let bad_size = expected != Some(bytes.len());
   for i in 0..count {
-    let pos = 8 + i * size;
-    if size == 0 || pos + size > bytes.len() {
+    // `8 + i * size` with overflow-safe arithmetic (a hostile count/size must
+    // not panic/wrap on a 32-bit `usize`); an overflow means the entry is
+    // out of range ⇒ `last`, faithful to MXF.pm:2532.
+    let Some(pos) = i.checked_mul(size).and_then(|o| o.checked_add(8)) else {
+      break;
+    };
+    let Some(entry_end) = pos.checked_add(size) else {
+      break;
+    };
+    if size == 0 || entry_end > bytes.len() {
       break; // MXF.pm:2532 `last if $pos + $size > $len`.
     }
-    let entry = &bytes[pos..pos + size];
+    let entry = &bytes[pos..entry_end];
     if guid_entries {
       out.push(guid_notation(entry));
     } else {
       out.push(decode_ul_type(entry));
     }
   }
-  out
+  (out, bad_size)
 }
 
 // ===========================================================================
@@ -1889,6 +1912,15 @@ pub struct MxfMeta<'a> {
   /// …) if a header pack was seen — bundled `$$et{MXFInfo}{HeaderType}`
   /// (MXF.pm:2440).
   header_type: Option<SmolStr>,
+  /// The `$et->Warn` channel (Phase B.1.5). MXF runs entirely under
+  /// `$$et{SET_GROUP1} = 'MXF'` (set MXF.pm:2838, cleared :2966), so EVERY
+  /// `$et->Warn` raised during the walk is the group-scoped `MXF:Warning`
+  /// TAG (`ExifTool.pm:5638`/`:9475`), NOT the document `ExifTool:Warning`.
+  /// The lone reachable site is `Bad array or batch size` (MXF.pm:2528); the
+  /// `Seek error` (MXF.pm:2822) is unreachable in this in-memory port (no
+  /// fallible `RAF->Seek`). Drained by the
+  /// [`Diagnose`](crate::diagnostics::Diagnose) impl.
+  warnings: Vec<crate::diagnostics::Diagnostic>,
   /// Phantom anchor for the `'a` GAT lifetime (the Meta is fully owned).
   _marker: core::marker::PhantomData<&'a ()>,
 }
@@ -2012,6 +2044,11 @@ struct Walker {
   /// `HeaderSize` field (offset 32): header bytes counted from the start of
   /// the Primer. `None` until a header pack carrying the field is parsed.
   header_size: Option<u64>,
+  /// The `$et->Warn` channel accumulated during the walk (Phase B.1.5). MXF
+  /// runs under `SET_GROUP1 = 'MXF'`, so every warning is group-scoped
+  /// `MXF:Warning` (see [`MxfMeta::warnings`]). Moved into [`MxfMeta`] at
+  /// parse end.
+  warnings: Vec<crate::diagnostics::Diagnostic>,
 }
 
 impl Walker {
@@ -2029,7 +2066,19 @@ impl Walker {
       edit_rate_by_group: std::collections::HashMap::new(),
       footer_position: 0,
       header_size: None,
+      warnings: Vec::new(),
     }
+  }
+
+  /// Raise a faithful group-scoped `$et->Warn(msg)` — MXF runs under
+  /// `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838), so the warning is always the
+  /// `MXF:Warning` TAG (`ExifTool.pm:9475`).
+  fn push_mxf_warning(&mut self, message: impl Into<SmolStr>) {
+    self
+      .warnings
+      .push(crate::diagnostics::Diagnostic::warn_in_group(
+        GROUP_MXF, message,
+      ));
   }
 }
 
@@ -2174,6 +2223,7 @@ fn parse_inner(data: &[u8]) -> Option<MxfMeta<'_>> {
   Some(MxfMeta {
     entries,
     header_type: w.header_type,
+    warnings: w.warnings,
     _marker: core::marker::PhantomData,
   })
 }
@@ -2340,9 +2390,18 @@ fn process_local_set(w: &mut Walker, dir_name: &'static str, buf: &[u8]) {
     // `RawConv => undef` row is `%duration`, which is a `Format` row with no
     // `Type`, so MXF.pm:2636's `ReadMXFValue`/InstanceUID/strong-ref/EditRate
     // book-keeping never runs for it either — `continue` is faithful.)
-    let Some(decoded) = decode_tag_value(def, value_bytes) else {
+    let mut bad_array = false;
+    let Some(decoded) = decode_tag_value(def, value_bytes, &mut bad_array) else {
       continue;
     };
+    // MXF.pm:2528 — `$len == 8 + $count * $size or $et->Warn("Bad array or
+    // batch size")`. Raised while `$$et{SET_GROUP1} = 'MXF'`, so it surfaces
+    // as the `MXF:Warning` TAG. Raised in walk order (before the tag emit),
+    // matching bundled (the `Warn` fires INSIDE `ReadMXFValue`, before
+    // `HandleTag` stores the value).
+    if bad_array {
+      w.push_mxf_warning("Bad array or batch size");
+    }
 
     // Per-object book-keeping (MXF.pm:2640-2685).
     match def.name {
@@ -2459,7 +2518,13 @@ fn emit_tag_default(def: &TagDef) -> bool {
 /// runs `next unless $key` (MXF.pm:2666) so the value is NEVER pushed onto
 /// `@groups` — i.e. it does not participate in the duplicate-removal pass,
 /// the `FixDuration` set, or the best-`Duration` synthesis.
-fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> Option<MxfValue> {
+/// Decode one MXF tag value (MXF.pm:2634-2648 `ReadMXFValue`). `bad_array` is
+/// set to `true` by the Array/Batch arms when the faithful
+/// `$len == 8 + $count * $size` check fails (MXF.pm:2528) — the caller then
+/// raises the group-scoped `MXF:Warning`. (Threaded as an out-param rather
+/// than folded into the return so the `RawConv => undef` drop — `None` — and
+/// the bad-array signal stay orthogonal.)
+fn decode_tag_value(def: &TagDef, bytes: &[u8], bad_array: &mut bool) -> Option<MxfValue> {
   let value = match def.kind {
     Kind::Int8u | Kind::Int16u | Kind::Int32u => {
       let n = decode_uint(bytes);
@@ -2534,11 +2599,13 @@ fn decode_tag_value(def: &TagDef, bytes: &[u8]) -> Option<MxfValue> {
     }
     Kind::PackageId => MxfValue::Str(SmolStr::new(decode_package_id(bytes))),
     Kind::StrongReferenceArray | Kind::StrongReferenceBatch => {
-      let list = decode_ref_list(bytes, /* guid_entries */ true);
+      let (list, bad) = decode_ref_list(bytes, /* guid_entries */ true);
+      *bad_array = bad;
       MxfValue::List(list.iter().map(SmolStr::new).collect())
     }
     Kind::BatchOfUl => {
-      let list = decode_ref_list(bytes, /* guid_entries */ false);
+      let (list, bad) = decode_ref_list(bytes, /* guid_entries */ false);
+      *bad_array = bad;
       MxfValue::List(list.iter().map(SmolStr::new).collect())
     }
     Kind::Binary => MxfValue::Bytes(bytes.to_vec()),
@@ -2790,6 +2857,24 @@ fn finalize_entries(w: &mut Walker) -> Vec<MxfEntry> {
 /// The default family-1 group for every MXF tag (MXF.pm:2838
 /// `$$et{SET_GROUP1} = 'MXF'`).
 const GROUP_MXF: &str = "MXF";
+
+// ===========================================================================
+// §18. `Diagnose` — the golden-pattern diagnostics path (Phase B.1.5)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for MxfMeta<'_> {
+  /// MXF's `$et->Warn` channel, in walk (FoundTag) order. MXF runs under
+  /// `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838), so each
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic) is group-scoped to `MXF`
+  /// (→ `MXF:Warning` TAG, NOT the document `ExifTool:Warning`). The lone
+  /// reachable site is `Bad array or batch size` (MXF.pm:2528); `Seek error`
+  /// (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory port lacks, so
+  /// it is unreachable and never queued.
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.warnings.clone()
+  }
+}
 
 // ===========================================================================
 // §18. `Taggable` — the golden-pattern emission path
@@ -3335,6 +3420,7 @@ mod tests {
         },
       ],
       header_type: None,
+      warnings: std::vec::Vec::new(),
       _marker: core::marker::PhantomData,
     };
 

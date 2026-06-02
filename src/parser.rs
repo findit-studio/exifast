@@ -709,6 +709,12 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
             Value::String(mime.to_string()),
           );
         }
+        FileTypeFinalize::None => {
+          // No `SetFileType` (accepted-but-no-finalize): emit NO `File:*`
+          // triplet. Matroska's `Truncated Matroska header` (Matroska.pm:1006
+          // `return 1` before :1007 `SetFileType()`) is the lone case — the
+          // document `ExifTool:Warning` rides the `Diagnose` channel below.
+        }
       }
 
       // ----- PLIST content file-type override (PLIST.pm:41-43, :133-141, :225) -

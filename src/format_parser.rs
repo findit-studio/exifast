@@ -783,38 +783,29 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       AnyMeta::Mpc(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "wavpack")]
       AnyMeta::Wv(m) => crate::diagnostics::Diagnose::diagnostics(m),
-      // Matroska's 4 bundled `$et->Warn` sites (Matroska.pm:1006/1075/1140/1179)
-      // are DROPPED here pending an architecture decision (Golden-v2 Phase B.1
-      // STOP-AND-REPORT): the oracle surfaces "Illegal float size" / "Invalid
-      // or corrupted master element" as GROUP-1-SCOPED `<group>:Warning` TAGS
-      // (the active `SET_GROUP1`, e.g. `Info:Warning`) — NOT the document-level
-      // `ExifTool:Warning` the `Diagnose` channel feeds — AND emits the
-      // illegal-float leaf as `0` (undef→ValueConv), while "Truncated Matroska
-      // header" warns `ExifTool:Warning` but SKIPS `SetFileType` (no `File:*`).
-      // None fit the `diagnostics()` (first-warning→`ExifTool:Warning`) model;
-      // a faithful port needs the QuickTime-style group-scoped `Warning` TAG
-      // path + value/finalization semantics. Left as the retired arm's `Ok(())`
-      // (no warning) so Matroska conformance is byte-identical. (`Processing
-      // large block`, Matroska.pm:1140, is `LargeFileSupport==2`-gated —
-      // unreachable in this port's default mode regardless.)
+      // Matroska's bundled `$et->Warn` sites (Matroska.pm:1006/1075/1179),
+      // now modeled by the group-scoped diagnostics channel (Phase B.1.5).
+      // Each `Diagnostic` carries the active `SET_GROUP1` so `run_diagnostics`
+      // routes "Illegal float size" / "Invalid or corrupted … master element"
+      // to the group-scoped `<group>:Warning` TAG (e.g. `Info:Warning`) and
+      // "Truncated Matroska header" to the document `ExifTool:Warning`. (The
+      // illegal-float leaf value fix + the truncated-header `File:*`
+      // suppression live in `formats::matroska` / `finalize_file_type`.)
+      // `Processing large block` (Matroska.pm:1140) is `LargeFileSupport==2`-
+      // gated — unreachable here, never queued.
       #[cfg(feature = "matroska")]
-      AnyMeta::Matroska(_) => std::vec::Vec::new(),
+      AnyMeta::Matroska(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(m),
-      // MXF's 2 bundled `$et->Warn` sites are DROPPED here pending the same
-      // architecture decision as Matroska (Golden-v2 Phase B.1 STOP-AND-REPORT):
-      // `Bad array or batch size` (MXF.pm:2528) fires while `$$et{SET_GROUP1} =
-      // 'MXF'` is active (set MXF.pm:2838, cleared :2966), so the oracle
-      // surfaces it as a GROUP-1-SCOPED `MXF:Warning` TAG — NOT the
-      // `ExifTool:Warning` the `Diagnose` channel feeds; a faithful port needs
-      // the QuickTime-style group-scoped `Warning` TAG path. `Seek error`
-      // (MXF.pm:2822) is unreachable in this in-memory port (no fallible
-      // `RAF->Seek`). Left as the retired arm's `Ok(())` so MXF conformance is
-      // byte-identical. (Both warnings are also absent on every real/crafted
-      // MXF in the current corpus — oracle-confirmed — so this drives no
-      // golden either way.)
+      // MXF's bundled `$et->Warn` site `Bad array or batch size` (MXF.pm:2528),
+      // now modeled by the group-scoped diagnostics channel (Phase B.1.5).
+      // MXF runs under `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared :2966),
+      // so the `Diagnostic` carries `group = "MXF"` and `run_diagnostics`
+      // routes it to the `MXF:Warning` TAG (not the document `ExifTool:Warning`).
+      // `Seek error` (MXF.pm:2822) needs a fallible `RAF->Seek` this in-memory
+      // port lacks — unreachable, never queued.
       #[cfg(feature = "mxf")]
-      AnyMeta::Mxf(_) => std::vec::Vec::new(),
+      AnyMeta::Mxf(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "plist")]
       AnyMeta::Plist(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "exif")]
@@ -1003,6 +994,16 @@ pub enum FileTypeFinalize {
   /// which are absent from `%mimeType`, QuickTime.pm:10008). The payload (see
   /// [`ExplicitWithMime`]) carries the `set` + `mime`.
   ExplicitWithMime(ExplicitWithMime),
+  /// **No `SetFileType` at all** — the parser accepted the input (returned a
+  /// `Meta`, NOT `Ok(None)`) but bundled `return 1`s WITHOUT calling
+  /// `SetFileType`, so NO `File:FileType` / `File:FileTypeExtension` /
+  /// `File:MIMEType` triplet is emitted. The lone faithful case is Matroska's
+  /// `Truncated Matroska header` (Matroska.pm:1006 `$et->Warn(...), return 1`
+  /// BEFORE the `SetFileType()` at :1007) — a document `ExifTool:Warning` and
+  /// no `File:*`. (This is the accepted-but-no-`SetFileType` analogue of the
+  /// rejected-candidate `finalization_error` path, which also emits no
+  /// triplet but lands a finalization `ExifTool:Error`.)
+  None,
 }
 
 impl AnyMeta<'_> {
@@ -1205,7 +1206,11 @@ impl AnyMeta<'_> {
       // track types (Matroska.pm:1240-1245) — Phase-2 forward item.
       #[cfg(feature = "matroska")]
       AnyMeta::Matroska(m) => {
-        if m.is_webm() {
+        if m.suppress_file_type() {
+          // Matroska.pm:1006 `Truncated Matroska header` — `return 1` BEFORE
+          // `SetFileType`, so NO `File:*` triplet.
+          FileTypeFinalize::None
+        } else if m.is_webm() {
           FileTypeFinalize::DetectedThenOverride("WEBM")
         } else {
           FileTypeFinalize::Detected

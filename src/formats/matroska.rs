@@ -2187,6 +2187,24 @@ pub struct Meta<'a> {
   /// Cached `TimecodeScale` raw nanoseconds (Matroska.pm:160-166). Drives
   /// the Duration / DefaultDuration / etc. ValueConv at emit time.
   timecode_scale_ns: Option<u64>,
+  /// The `$et->Warn` channel (Phase B.1.5). Each entry is a faithful
+  /// `$et->Warn(msg)` raised during the walk, carrying the family-1 group
+  /// active at `Warn` time (the port's `current_group`, mapped to `None`
+  /// when no `SET_GROUP1` was active — see [`Walker::push_warning`]):
+  /// `Some("Info")`/`Some("Track1")` ⇒ a `<group>:Warning` TAG;
+  /// `None` ⇒ the document-level `ExifTool:Warning`. Drained by the
+  /// [`Diagnose`](crate::diagnostics::Diagnose) impl.
+  ///
+  /// Sites (Matroska.pm): `Illegal float size` (1179, group-scoped),
+  /// `Invalid or corrupted … master element` (1075, group-scoped when a
+  /// `SET_GROUP1` is active else document), `Truncated Matroska header`
+  /// (1006, document-level — see [`Meta::suppress_file_type`]).
+  warnings: Vec<crate::diagnostics::Diagnostic>,
+  /// `true` when the EBML header was truncated (Matroska.pm:1006 `return 1`
+  /// WITHOUT a preceding `SetFileType`) — the engine must then emit NO
+  /// `File:*` triplet. The walk produced no `entries` and a single
+  /// document-level `Truncated Matroska header` warning.
+  suppress_file_type: bool,
 }
 
 impl<'a> Meta<'a> {
@@ -2221,6 +2239,17 @@ impl<'a> Meta<'a> {
   #[must_use]
   pub fn timecode_scale(&self) -> Option<Duration> {
     self.timecode_scale_ns.map(Duration::from_nanos)
+  }
+  /// `true` when the EBML header was truncated (Matroska.pm:1006 `$et->Warn(
+  /// 'Truncated Matroska header'), return 1` — emitted BEFORE `SetFileType`).
+  /// The engine then emits NO `File:*` triplet (the bundled `return 1`
+  /// short-circuits before any `SetFileType`); `entries()` is empty and the
+  /// lone `Truncated Matroska header` document warning rides the
+  /// [`Diagnose`](crate::diagnostics::Diagnose) channel.
+  #[must_use]
+  #[inline(always)]
+  pub const fn suppress_file_type(&self) -> bool {
+    self.suppress_file_type
   }
 }
 
@@ -2260,9 +2289,16 @@ struct Walker<'a> {
   data: &'a [u8],
   /// Current cursor.
   pos: usize,
-  /// Stack of (end_offset, container_name) for nested `SubDir`s. The walker
-  /// pops as soon as the cursor crosses an entry's end (Matroska.pm:1023-1051).
-  ends: Vec<(usize, &'static str)>,
+  /// Stack of `(traversal_end, declared_end, container_name)` for nested
+  /// `SubDir`s. The walker pops as soon as the cursor crosses an entry's
+  /// `traversal_end` (Matroska.pm:1023-1051). `traversal_end` is the
+  /// `data.len()`-CLAMPED end (drives the pop + leaf-read capping — preserving
+  /// the "oversized Segment traversed to EOF" behavior); `declared_end` is the
+  /// UNCLAMPED declared end (`usize::MAX` for an unknown-size master — the
+  /// `$size = 1e20` sentinel, Matroska.pm:1073), used ONLY by the
+  /// "Invalid or corrupted … master element" overrun check
+  /// (Matroska.pm:1074, `$pos + $dataPos + $size > $dirEnd[-1][0]`).
+  ends: Vec<(usize, usize, &'static str)>,
   entries: Vec<Entry<'a>>,
   doc_type: Option<SmolStr>,
   /// `$$self{TimecodeScale}` (Matroska.pm:163 `RawConv => '$$self{
@@ -2336,6 +2372,28 @@ struct Walker<'a> {
   /// (Matroska.pm:1210-1216) to override `SET_GROUP1` for the duration of
   /// the surrounding `Tag` master.
   track_uid_to_group: std::collections::HashMap<Vec<u8>, SmolStr>,
+  /// The `$et->Warn` channel accumulated during the walk (Phase B.1.5). Each
+  /// is pushed via [`Walker::push_warning`], which captures the family-1 group
+  /// active at `Warn` time. Moved into [`Meta::warnings`] at parse end.
+  warnings: Vec<crate::diagnostics::Diagnostic>,
+}
+
+impl Walker<'_> {
+  /// Raise a faithful `$et->Warn(msg)` (Matroska.pm). The family-1 group is the
+  /// active `SET_GROUP1`: the port models that as `current_group` while a
+  /// group is locked, and `DEFAULT_GROUP` ("Matroska") when none is — which is
+  /// exactly when bundled's `$$et{SET_GROUP1}` is unset, so the warning is
+  /// DOCUMENT-level (`ExifTool:Warning`, `ExifTool.pm:9475`). When a group IS
+  /// active (`Info` / `Track<N>` / `Chapter<n>`) the warning is the group-
+  /// scoped `<group>:Warning` TAG.
+  fn push_warning(&mut self, message: impl Into<SmolStr>) {
+    let d = if self.current_group.as_str() == DEFAULT_GROUP {
+      crate::diagnostics::Diagnostic::warn(message)
+    } else {
+      crate::diagnostics::Diagnostic::warn_in_group(self.current_group.clone(), message)
+    };
+    self.warnings.push(d);
+  }
 }
 
 /// One in-flight SimpleTag struct (Matroska.pm `HandleStruct` inputs).
@@ -2387,6 +2445,42 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
   if data.len() < 4 || data[..4] != EBML_MAGIC {
     return None; // Matroska.pm:996 — magic gate
   }
+  // Matroska.pm:1003-1006 — verify the EBML header length BEFORE `SetFileType`.
+  // Bundled reads the 4-byte magic, then `$hlen = GetVInt($buff, $pos)` over
+  // the post-magic buffer (`$dataPos = 4`), and `return 1` WITHOUT
+  // `SetFileType` when `$pos + $hlen > $dataLen` (i.e. the header body
+  // overruns the file). Over the whole `data` slice that is: the EBMLHeader's
+  // declared body END (magic(4) + size-VINT length + `hlen`) exceeds
+  // `data.len()`. A missing / zero / unknown-sentinel header length is the
+  // `return 0 unless $hlen and $hlen > 0` rejection (`Ok(None)`).
+  match get_vint(data, 4) {
+    None => return None, // header-size VINT unreadable ⇒ `GetVInt` undef ⇒ return 0
+    Some(hlen_v) => {
+      // `return 0 unless $hlen and $hlen > 0` (Matroska.pm:1005): the unknown
+      // sentinel or a non-positive length rejects the file.
+      if hlen_v.is_unknown() || hlen_v.value() <= 0 {
+        return None;
+      }
+      let header_body_end = 4usize
+        .checked_add(hlen_v.consumed())
+        .and_then(|p| p.checked_add(hlen_v.value() as usize));
+      // `$pos + $hlen > $dataLen` ⇒ truncated header: warn + `return 1` with
+      // NO `SetFileType` (no `File:*`) and NO further parsing.
+      if header_body_end.is_none_or(|end| end > data.len()) {
+        let mut warnings = Vec::new();
+        warnings.push(crate::diagnostics::Diagnostic::warn(
+          "Truncated Matroska header",
+        ));
+        return Some(Meta {
+          entries: Vec::new(),
+          doc_type: None,
+          timecode_scale_ns: None,
+          warnings,
+          suppress_file_type: true,
+        });
+      }
+    }
+  }
   let mut w = Walker {
     data,
     pos: 0, // start at first VINT (the 4-byte EBML magic IS the EBMLHeader id)
@@ -2401,12 +2495,15 @@ fn parse_inner(data: &[u8]) -> Option<Meta<'_>> {
     simple_tag: None,
     simple_tag_depth: None,
     track_uid_to_group: std::collections::HashMap::new(),
+    warnings: Vec::new(),
   };
   walk(&mut w);
   Some(Meta {
     entries: w.entries,
     doc_type: w.doc_type,
     timecode_scale_ns: w.timecode_scale_ns,
+    warnings: w.warnings,
+    suppress_file_type: false,
   })
 }
 
@@ -2416,7 +2513,7 @@ fn walk(w: &mut Walker<'_>) {
   let data = w.data;
   loop {
     // ---- Pop ended containers (Matroska.pm:1023-1057) -------------------
-    while let Some(&(end, _)) = w.ends.last() {
+    while let Some(&(end, _, _)) = w.ends.last() {
       if w.pos >= end {
         // The locked depth records the INDEX at which the locking container
         // was pushed — i.e. `w.ends.len() - 1` at push time. The locking
@@ -2486,7 +2583,16 @@ fn walk(w: &mut Walker<'_>) {
     //     children, which is exactly what SkipBody is avoiding).
     let unknown_size = size_v.is_unknown();
     let elem_end_declared: usize;
+    // The UNCLAMPED declared end (`$pos + $dataPos + $size`, Matroska.pm:1074)
+    // for the corruption-overrun check below + the `w.ends` push. For an
+    // unknown-size element this is the `$size = 1e20` sentinel
+    // (Matroska.pm:1073) ⇒ `usize::MAX` (never `<= any finite container end`,
+    // so an unknown-size element inside a finite container IS "corrupted" —
+    // faithful — and an unknown-size container's children compare against
+    // `usize::MAX` and never trip it).
+    let declared_end_unclamped: usize;
     if unknown_size {
+      declared_end_unclamped = usize::MAX;
       // Peek at the tag def to decide whether this is a master we can
       // descend OR a leaf where we must stop. The conditional IDs
       // (`0x3e383`, `0x06`, `0x58688`) are always leaves.
@@ -2504,7 +2610,7 @@ fn walk(w: &mut Walker<'_>) {
         elem_end_declared = w
           .ends
           .last()
-          .map(|&(e, _)| e)
+          .map(|&(e, _, _)| e)
           .unwrap_or(data.len())
           .min(data.len());
       } else {
@@ -2524,7 +2630,32 @@ fn walk(w: &mut Walker<'_>) {
       // separately: SubDir uses the clamped end; leaves either fit the
       // declared end (we use that as `elem_end`) or bail (Matroska.pm:
       // 1130-1161 `last` after the failed streaming read).
-      elem_end_declared = w.pos.checked_add(size).unwrap_or(data.len());
+      declared_end_unclamped = w.pos.checked_add(size).unwrap_or(usize::MAX);
+      elem_end_declared = declared_end_unclamped.min(data.len());
+    }
+    // ---- Invalid/corrupted master element (Matroska.pm:1074-1085) ------
+    // `if (@dirEnd and $pos + $dataPos + $size > $dirEnd[-1][0])`: the current
+    // element's declared body END exceeds the INNERMOST open container's
+    // declared end ⇒ `$et->Warn("Invalid or corrupted <name> master element")`,
+    // then `$pos = $dirEnd[-1][0] - $dataPos; next` — recover by jumping the
+    // cursor to the container's (traversal-capped) end and re-running the pop
+    // loop. The warning's family-1 group is the active `SET_GROUP1`
+    // (`push_warning`: group-scoped when one is locked, else document — e.g.
+    // `Info:Warning` inside Info, `ExifTool:Warning` directly inside Segment).
+    if let Some(&(cont_traversal_end, cont_declared_end, cont_name)) = w.ends.last() {
+      if declared_end_unclamped > cont_declared_end {
+        let mut msg = std::string::String::with_capacity(48);
+        let _ = core::fmt::Write::write_fmt(
+          &mut msg,
+          format_args!("Invalid or corrupted {cont_name} master element"),
+        );
+        w.push_warning(msg);
+        // Matroska.pm:1076 `$pos = $dirEnd[-1][0] - $dataPos`. The container's
+        // traversal end is already `data.len()`-capped, so the jump lands at
+        // most at EOF; the pop loop at the top then closes the container.
+        w.pos = cont_traversal_end;
+        continue;
+      }
     }
     // The unified `elem_end` used by every leaf arm below — defaults to
     // declared but capped at data.len() so reads don't slice past EOF; if
@@ -2558,8 +2689,10 @@ fn walk(w: &mut Walker<'_>) {
     match def.kind {
       Kind::SubDir => {
         // Matroska.pm:1109-1124 — "just fall through into the contained
-        // EBML elements" + group bookkeeping.
-        w.ends.push((elem_end, def.name));
+        // EBML elements" + group bookkeeping. Push BOTH the `data.len()`-
+        // clamped traversal end (pop + leaf-read capping) and the unclamped
+        // declared end (the overrun check for this container's children).
+        w.ends.push((elem_end, declared_end_unclamped, def.name));
         // Group switches (family-1 SET_GROUP1).
         if def.name == "Info" && w.group_locked_at_depth.is_none() {
           w.current_group = SmolStr::new_static("Info");
@@ -2675,15 +2808,38 @@ fn walk(w: &mut Walker<'_>) {
         continue;
       }
       Kind::Float(_fc) => {
-        let raw = decode_float(&data[w.pos..elem_end]);
-        // FrameRate / SampleRate / etc.
+        // FrameRate / SampleRate / Gamma / etc. (`Format => 'float'`,
+        // Matroska.pm:1173-1180). A non-4/8-byte size is the
+        // `Illegal float size` branch: `$val` stays UNDEF and bundled warns.
+        let body = &data[w.pos..elem_end];
+        let raw = decode_float(body);
         // Matroska.pm:1224-1226 — absorb-into-struct (no top-level emit)
-        // for ANY leaf child of an active SimpleTag.
+        // for ANY leaf child of an active SimpleTag. (An illegal-size float
+        // inside a SimpleTag is still warned by bundled BEFORE the struct
+        // absorb — Matroska.pm:1179 runs in the `Format` block, the struct
+        // assignment at :1226 then stores the undef — so the warning fires
+        // even when the leaf is absorbed.)
+        let illegal = raw.is_none();
+        if illegal {
+          // Matroska.pm:1179 `$et->Warn("Illegal float size ($size)")`.
+          let mut msg = std::string::String::with_capacity(24);
+          let _ = core::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!("Illegal float size ({})", body.len()),
+          );
+          w.push_warning(msg);
+        }
         if w.simple_tag.is_some() {
           w.pos = elem_end;
           continue;
         }
-        push_entry(w, def.name, Value::F64(raw));
+        match raw {
+          Some(v) => push_entry(w, def.name, Value::F64(v)),
+          // Undef leaf (no ValueConv on a plain `Format => 'float'` row) ⇒
+          // the stored undef stringifies to the empty string under `-j`/`-n`
+          // (oracle: `Track1:AudioSampleRate: ""`). Emit an empty string.
+          None => push_entry(w, def.name, Value::Str(Cow::Borrowed(""))),
+        }
         w.pos = elem_end;
         continue;
       }
@@ -2836,14 +2992,33 @@ fn walk(w: &mut Walker<'_>) {
         // are deferred to output time and read the FINAL `$$self{
         // TimecodeScale}` (verified empirically with adversarial
         // fixtures — see `Value::DurationRawF64`).
-        let raw = decode_float(&data[w.pos..elem_end]);
+        let body = &data[w.pos..elem_end];
+        let raw = decode_float(body);
+        let illegal = raw.is_none();
+        if illegal {
+          // Matroska.pm:1179 `$et->Warn("Illegal float size ($size)")` — the
+          // Duration `Format => 'float'` decode is the SAME code path.
+          let mut msg = std::string::String::with_capacity(24);
+          let _ = core::fmt::Write::write_fmt(
+            &mut msg,
+            format_args!("Illegal float size ({})", body.len()),
+          );
+          w.push_warning(msg);
+        }
         // Matroska.pm:1224-1226 — absorb-into-struct for ANY leaf child of
         // an active SimpleTag.
         if w.simple_tag.is_some() {
           w.pos = elem_end;
           continue;
         }
-        push_entry(w, def.name, Value::DurationRawF64(raw));
+        // Undef leaf (illegal float size) ⇒ Duration's ValueConv on undef:
+        // `undef * scale / 1e9` or `undef / 1000`, both `0` in Perl's numeric
+        // context (oracle: `Info:Duration: 0` with no scale, `"0 s"` /`0`
+        // with scale). `DurationRawF64(0.0)` reproduces that exactly via the
+        // shared emit path (`ConvertDuration(0.0) == "0 s"`,
+        // `0.0 / 1000 == 0`).
+        let stored = raw.unwrap_or(0.0);
+        push_entry(w, def.name, Value::DurationRawF64(stored));
         w.pos = elem_end;
         continue;
       }
@@ -3092,18 +3267,23 @@ fn decode_signed(b: &[u8]) -> i64 {
 }
 
 /// Matroska.pm:1173-1180 — `float`: 4-byte single OR 8-byte double, BE.
-/// Other sizes return `f64::NAN` (Perl warns `Illegal float size`).
-fn decode_float(b: &[u8]) -> f64 {
+/// Any OTHER size is the `else { $et->Warn("Illegal float size ($size)") }`
+/// branch (Matroska.pm:1178-1180): `$val` is left UNDEF (the assignment is
+/// skipped) and a warning is raised. We model that undef as `None`; the call
+/// site raises the `Illegal float size (N)` warning and emits the
+/// undef→ValueConv leaf (`0` for `Duration`, `""` for a plain float — see the
+/// `Kind::Float` / `Kind::Duration` arms).
+fn decode_float(b: &[u8]) -> Option<f64> {
   match b.len() {
     4 => {
       let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
-      f64::from(f32::from_be_bytes(arr))
+      Some(f64::from(f32::from_be_bytes(arr)))
     }
     8 => {
       let arr: [u8; 8] = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-      f64::from_be_bytes(arr)
+      Some(f64::from_be_bytes(arr))
     }
-    _ => f64::NAN,
+    _ => None,
   }
 }
 
@@ -3138,6 +3318,34 @@ fn hex_lower(b: &[u8]) -> SmolStr {
     let _ = write!(&mut s, "{byte:02x}");
   }
   SmolStr::new(&s)
+}
+
+// ===========================================================================
+// `Diagnose` — the golden-pattern diagnostics path (Phase B.1.5)
+// ===========================================================================
+
+#[cfg(feature = "alloc")]
+impl crate::diagnostics::Diagnose for Meta<'_> {
+  /// Matroska's `$et->Warn` channel, in walk (FoundTag) order. Each
+  /// [`Diagnostic`](crate::diagnostics::Diagnostic) already carries its
+  /// family-1 group (the active `$$et{SET_GROUP1}` at `Warn` time —
+  /// [`Walker::push_warning`]): a group-scoped one (`Info` / `Track<N>` /
+  /// `Chapter<n>`) surfaces as the `<group>:Warning` TAG, an ungrouped one as
+  /// the document `ExifTool:Warning`. Sites:
+  /// - `Illegal float size (N)` (Matroska.pm:1179) — group-scoped to the
+  ///   active group (e.g. `Info:Warning` for a bad-size `Duration`,
+  ///   `Track<N>:Warning` for a bad-size `AudioSampleRate`).
+  /// - `Invalid or corrupted <name> master element` (Matroska.pm:1075) —
+  ///   group-scoped when a `SET_GROUP1` is active, else document.
+  /// - `Truncated Matroska header` (Matroska.pm:1006) — document-level (the
+  ///   `Meta` then also reports [`Meta::suppress_file_type`]).
+  ///
+  /// (`Processing large block`, Matroska.pm:1140, is `LargeFileSupport==2`-
+  /// gated — this port exposes no such option, so it is unreachable and never
+  /// queued.)
+  fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
+    self.warnings.clone()
+  }
 }
 
 // ===========================================================================
@@ -3700,9 +3908,11 @@ mod tests {
 
   #[test]
   fn decode_float_handles_4_and_8_byte() {
-    assert_eq!(decode_float(&1.5f32.to_be_bytes()), 1.5_f64);
-    assert_eq!(decode_float(&2.5f64.to_be_bytes()), 2.5_f64);
-    assert!(decode_float(&[0x00, 0x01]).is_nan()); // illegal size
+    assert_eq!(decode_float(&1.5f32.to_be_bytes()), Some(1.5_f64));
+    assert_eq!(decode_float(&2.5f64.to_be_bytes()), Some(2.5_f64));
+    // Illegal size ⇒ `None` (the `else { $et->Warn(...) }` undef branch).
+    assert_eq!(decode_float(&[0x00, 0x01]), None);
+    assert_eq!(decode_float(&[0x00, 0x01, 0x02]), None);
   }
 
   #[test]
