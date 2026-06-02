@@ -63,6 +63,8 @@
 //! reflects on-device-GPS-hardware fidelity (the action/drone cameras carry
 //! their own GNSS) above phone-paired / dashcam-NMEA sources.
 
+#![deny(clippy::indexing_slicing)]
+
 extern crate alloc;
 use alloc::{
   string::{String, ToString},
@@ -87,18 +89,15 @@ const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 // ── big-endian / little-endian field readers ────────────────────────────
 
 fn be_u16(b: &[u8], off: usize) -> Option<u16> {
-  b.get(off..off + 2)
-    .map(|s| u16::from_be_bytes([s[0], s[1]]))
+  Some(u16::from_be_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
-  b.get(off..off + 4)
-    .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+  Some(u32::from_be_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 fn be_u64(b: &[u8], off: usize) -> Option<u64> {
-  b.get(off..off + 8)
-    .map(|s| u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+  Some(u64::from_be_bytes(b.get(off..off + 8)?.try_into().ok()?))
 }
 
 fn be_i16(b: &[u8], off: usize) -> Option<i16> {
@@ -110,13 +109,11 @@ fn be_i32(b: &[u8], off: usize) -> Option<i32> {
 }
 
 fn le_u16(b: &[u8], off: usize) -> Option<u16> {
-  b.get(off..off + 2)
-    .map(|s| u16::from_le_bytes([s[0], s[1]]))
+  Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
 }
 
 fn le_u32(b: &[u8], off: usize) -> Option<u32> {
-  b.get(off..off + 4)
-    .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+  Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
 }
 
 fn le_i32(b: &[u8], off: usize) -> Option<i32> {
@@ -126,8 +123,7 @@ fn le_i32(b: &[u8], off: usize) -> Option<i32> {
 /// Read a big-endian IEEE-754 `double` (used by `gps0` lat/lon, which is a
 /// little-endian record — see [`process_gps0`]).
 fn le_f64(b: &[u8], off: usize) -> Option<f64> {
-  b.get(off..off + 8)
-    .map(|s| f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+  Some(f64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
 }
 
 // ===========================================================================
@@ -359,7 +355,12 @@ fn parse_kenwood_gps(data: &[u8], create_date_raw: Option<u64>, out: &mut QuickT
   let mut pos = 0usize;
   // QuickTimeStream.pl:2561 `while ($pos + 36 < $dataLen)`.
   while pos + 36 < data.len() {
-    let rec = &data[pos..pos + 36];
+    // The `while` guard proves `pos + 36 <= data.len()`, so this `.get`
+    // is always `Some`; the `else` is unreachable and lands on the same
+    // loop-exit as the guard turning false.
+    let Some(rec) = data.get(pos..pos + 36) else {
+      break;
+    };
     // QuickTimeStream.pl:2563 `last if $dat eq "\x0" x 36`.
     if rec.iter().all(|&b| b == 0) {
       break;
@@ -368,9 +369,12 @@ fn parse_kenwood_gps(data: &[u8], create_date_raw: Option<u64>, out: &mut QuickT
     // a[6]=char, a[7]=int32u.
     let secs = le_u32(rec, 8).unwrap_or(0);
     let speed = le_u32(rec, 12).unwrap_or(0);
-    let ns = rec[16];
+    // `rec` is exactly 36 bytes, so indices 16/21 are always in range;
+    // the `unwrap_or(0)` mirrors the adjacent `le_u32(..).unwrap_or(0)`
+    // misses (a `0` byte is "not S/W" ⇒ no sign flip — the benign default).
+    let ns = rec.get(16).copied().unwrap_or(0);
     let lat_raw = le_u32(rec, 17).unwrap_or(0);
-    let ew = rec[21];
+    let ew = rec.get(21).copied().unwrap_or(0);
     let lon_raw = le_u32(rec, 22).unwrap_or(0);
 
     let mut lat = convert_lat_lon(f64::from(lat_raw) / 1e3);
@@ -443,10 +447,12 @@ fn expand_samples(ee: &EeData, media_ts: u32) -> Option<Vec<Sample>> {
   let mut time: Option<u64> = None;
   let mut time_count: u32 = 0;
   let mut time_delta: u32 = 0;
-  if ee.stts.len() > 1 {
+  // `[c, d, ..]` matches exactly when `stts.len() > 1` (the bundled guard),
+  // binding `stts[0]`/`stts[1]` without raw indexing — byte-identical.
+  if let [c, d, ..] = *ee.stts.as_slice() {
     time = Some(0);
-    time_count = ee.stts[0];
-    time_delta = ee.stts[1];
+    time_count = c;
+    time_delta = d;
     stts_idx = 2;
   }
 
@@ -465,8 +471,9 @@ fn expand_samples(ee: &EeData, media_ts: u32) -> Option<Vec<Sample>> {
     let i_chunk = (chunk_idx + 1) as u32;
     // QuickTimeStream.pl:1354 — advance the stsc entry when we reach a new
     // first-chunk boundary.
-    if i_chunk >= next_chunk && stsc_idx < ee.stsc.len() {
-      let (_first, spc, _desc) = ee.stsc[stsc_idx];
+    if i_chunk >= next_chunk
+      && let Some(&(_first, spc, _desc)) = ee.stsc.get(stsc_idx)
+    {
       samples_per_chunk = spc;
       stsc_idx += 1;
       next_chunk = ee.stsc.get(stsc_idx).map_or(0, |e| e.0);
@@ -489,14 +496,17 @@ fn expand_samples(ee: &EeData, media_ts: u32) -> Option<Vec<Sample>> {
         let mut cur_time = t;
         let mut stopped = false;
         while time_count == 0 {
-          if ee.stts.len() < stts_idx + 2 {
+          // `.get(stts_idx..stts_idx + 2)` is `None` exactly when
+          // `stts.len() < stts_idx + 2` — the same guard — and the
+          // `else` runs the identical `undef $time; last Sample` recovery.
+          let Some(&[c, d]) = ee.stts.get(stts_idx..stts_idx + 2) else {
             // QuickTimeStream.pl:1367-1369 `undef $time; last Sample`.
             time = None;
             stopped = true;
             break;
-          }
-          time_count = ee.stts[stts_idx];
-          time_delta = ee.stts[stts_idx + 1];
+          };
+          time_count = c;
+          time_delta = d;
           stts_idx += 2;
         }
         if stopped {
@@ -646,8 +656,13 @@ fn save_meta_keys(data: &[u8]) -> Vec<(u32, MetaKey)> {
       if len < 8 || pos + len > end {
         break;
       }
-      let tag = &data[pos + 4..pos + 8];
-      let val = &data[pos + 8..pos + len];
+      // The guards above prove `pos + 8 <= pos + len <= end <= data.len()`,
+      // so both `.get`s always succeed; the `else` breaks the loop just as
+      // the `pos + len > end` guard would — byte-identical.
+      let (Some(tag), Some(val)) = (data.get(pos + 4..pos + 8), data.get(pos + 8..pos + len))
+      else {
+        break;
+      };
       pos += len;
       if tag == b"keyd" {
         // QuickTimeStream.pl:915 `s/^(mdta|fiel)com\.apple\.quicktime\.//`.
@@ -820,7 +835,9 @@ fn camel_case_ucfirst(tag_id: &str) -> smol_str::SmolStr {
   let mut out = String::with_capacity(bytes.len());
   let mut i = 0usize;
   while i < bytes.len() {
-    let b = bytes[i];
+    // The `while` guard proves `i < bytes.len()`, so this `.get` is always
+    // `Some`; the `else` break matches the guard turning false.
+    let Some(&b) = bytes.get(i) else { break };
     if b == b'-' || b == b'.' {
       // `s/[-.](.)/\U$1/`: drop the separator, upper-case the next char.
       if let Some(&next) = bytes.get(i + 1) {
@@ -928,9 +945,15 @@ fn unpack_live_photo_info(bytes: &[u8]) -> Option<String> {
   if bytes.len() < 80 {
     return None;
   }
+  // The `bytes.len() < 80` guard above proves every fixed offset below is in
+  // range, so these `.get`s never miss; the `unwrap_or` defaults mirror the
+  // `le_u32(..).unwrap_or(0)` reads in the same function and are unreachable.
   let f32_at = |o: usize| {
-    let s = &bytes[o..o + 4];
-    f32::from_le_bytes([s[0], s[1], s[2], s[3]])
+    bytes
+      .get(o..o + 4)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+      .map(f32::from_le_bytes)
+      .unwrap_or(0.0)
   };
   let g = |x: f64| crate::value::format_g(x, 15);
   let mut out = String::new();
@@ -958,21 +981,30 @@ fn unpack_live_photo_info(bytes: &[u8]) -> Option<String> {
   }
   // c4 (signed i8)
   for _ in 0..4 {
-    push(&(bytes[o] as i8).to_string(), &mut out);
+    push(
+      &(bytes.get(o).copied().unwrap_or(0) as i8).to_string(),
+      &mut out,
+    );
     o += 1;
   }
   // l (i32)
   push(&le_i32(bytes, o).unwrap_or(0).to_string(), &mut out);
   o += 4;
   // C C (u8)
-  push(&bytes[o].to_string(), &mut out);
+  push(&bytes.get(o).copied().unwrap_or(0).to_string(), &mut out);
   o += 1;
-  push(&bytes[o].to_string(), &mut out);
+  push(&bytes.get(o).copied().unwrap_or(0).to_string(), &mut out);
   o += 1;
   // c c (i8)
-  push(&(bytes[o] as i8).to_string(), &mut out);
+  push(
+    &(bytes.get(o).copied().unwrap_or(0) as i8).to_string(),
+    &mut out,
+  );
   o += 1;
-  push(&(bytes[o] as i8).to_string(), &mut out);
+  push(
+    &(bytes.get(o).copied().unwrap_or(0) as i8).to_string(),
+    &mut out,
+  );
   o += 1;
   // l (i32)
   push(&le_i32(bytes, o).unwrap_or(0).to_string(), &mut out);
@@ -1180,8 +1212,13 @@ fn process_mebx(
       break;
     }
     let id = be_u32(data, pos + 4).unwrap_or(0);
-    if let Some((_, info)) = keys.iter().find(|(k, _)| *k == id) {
-      let value_bytes = &data[pos + 8..pos + len];
+    // The guards prove `pos + 8 <= pos + len <= data.len()`, so this `.get`
+    // is always `Some`; the `&&`-bound chain keeps the body byte-identical
+    // (an impossible miss simply skips to `pos += len`, as a non-matching
+    // key would).
+    if let Some((_, info)) = keys.iter().find(|(k, _)| *k == id)
+      && let Some(value_bytes) = data.get(pos + 8..pos + len)
+    {
       // QuickTimeStream.pl:2668-2674 `HandleTag(..., $val, DataPt=>..., Start=>
       // $pos+8, Size=>$len-8)`. A `%QuickTime::Keys` entry that is a
       // `SubDirectory` makes `HandleTag` recurse into the sub-processor over
@@ -1373,8 +1410,10 @@ fn read_meta_value(bytes: &[u8], format: MetaFormat) -> String {
     // elements and space-join (ExifTool.pm:6322-6330). `read_numeric_array`
     // returns the EMPTY STRING when not even one element fits (`$size < $len`
     // ⇒ ExifTool's `return ''`, ExifTool.pm:6299) — NOT undef.
-    MetaFormat::Int8u => read_numeric_array(bytes, 1, |b, o| Some(u64::from(b[o]).to_string())),
-    MetaFormat::Int8s => read_numeric_array(bytes, 1, |b, o| Some((b[o] as i8).to_string())),
+    MetaFormat::Int8u => {
+      read_numeric_array(bytes, 1, |b, o| Some(u64::from(*b.get(o)?).to_string()))
+    }
+    MetaFormat::Int8s => read_numeric_array(bytes, 1, |b, o| Some((*b.get(o)? as i8).to_string())),
     MetaFormat::Int16u => read_numeric_array(bytes, 2, |b, o| be_u16(b, o).map(|v| v.to_string())),
     MetaFormat::Int16s => read_numeric_array(bytes, 2, |b, o| be_i16(b, o).map(|v| v.to_string())),
     MetaFormat::Int32u => read_numeric_array(bytes, 4, |b, o| be_u32(b, o).map(|v| v.to_string())),
@@ -1384,16 +1423,14 @@ fn read_meta_value(bytes: &[u8], format: MetaFormat) -> String {
       be_u64(b, o).map(|v| (v as i64).to_string())
     }),
     MetaFormat::Float => read_numeric_array(bytes, 4, |b, o| {
-      b.get(o..o + 4).map(|s| {
-        let f = f32::from_be_bytes([s[0], s[1], s[2], s[3]]);
-        crate::value::format_g(f64::from(f), 15)
-      })
+      let arr: [u8; 4] = b.get(o..o + 4)?.try_into().ok()?;
+      let f = f32::from_be_bytes(arr);
+      Some(crate::value::format_g(f64::from(f), 15))
     }),
     MetaFormat::Double => read_numeric_array(bytes, 8, |b, o| {
-      b.get(o..o + 8).map(|s| {
-        let f = f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
-        crate::value::format_g(f, 15)
-      })
+      let arr: [u8; 8] = b.get(o..o + 8)?.try_into().ok()?;
+      let f = f64::from_be_bytes(arr);
+      Some(crate::value::format_g(f, 15))
     }),
   }
 }
@@ -1478,7 +1515,7 @@ fn process_3gf(data: &[u8], out: &mut QuickTimeStreamMeta) {
 fn process_gps0(data: &[u8], out: &mut QuickTimeStreamMeta) {
   // QuickTimeStream.pl:2724 — the encrypted Lamax variant is detected by a
   // signature and deferred (it needs the `Process_text` NMEA decoder).
-  if data.len() >= 8 && &data[2..8] == b"\xf2\xe1\xf0\xeeTT" {
+  if data.get(2..8) == Some(b"\xf2\xe1\xf0\xeeTT".as_slice()) {
     return; // DEFERRED: Lamax encrypted-text gps0 (Process_text NMEA path).
   }
   const REC: usize = 32;
@@ -1494,18 +1531,22 @@ fn process_gps0(data: &[u8], out: &mut QuickTimeStreamMeta) {
     let lat = convert_lat_lon(lat_raw);
     let lon = convert_lat_lon(lon_raw);
     // date/time: int8u[6] at 0x16 = year-2000, month, day, hour, min, sec.
+    // `0x1c - 0x16 == 6`, so `first_chunk::<6>` always matches the slice and
+    // destructures it without raw indexing — byte-identical to `d[0..6]`.
     let dt = data.get(pos + 0x16..pos + 0x1c);
-    let date_time = dt.map(|d| {
-      alloc::format!(
-        "{:04}:{:02}:{:02} {:02}:{:02}:{:02}Z",
-        u32::from(d[0]) + 2000,
-        d[1],
-        d[2],
-        d[3],
-        d[4],
-        d[5]
-      )
-    });
+    let date_time = dt
+      .and_then(|d| d.first_chunk::<6>())
+      .map(|&[d0, d1, d2, d3, d4, d5]| {
+        alloc::format!(
+          "{:04}:{:02}:{:02} {:02}:{:02}:{:02}Z",
+          u32::from(d0) + 2000,
+          d1,
+          d2,
+          d3,
+          d4,
+          d5
+        )
+      });
     let mut sample = GpsSample::new();
     sample.set_date_time(date_time.map(smol_str::SmolStr::from));
     sample.set_latitude(Some(lat));
@@ -1526,9 +1567,14 @@ fn process_gsen(data: &[u8], out: &mut QuickTimeStreamMeta) {
   const REC: usize = 3;
   let mut pos = 0usize;
   while pos + REC <= data.len() {
-    let x = f64::from(data[pos] as i8) / 16.0;
-    let y = f64::from(data[pos + 1] as i8) / 16.0;
-    let z = f64::from(data[pos + 2] as i8) / 16.0;
+    // The `while` guard proves `pos + 3 <= data.len()`, so this `.get`
+    // always yields a 3-slice; the `else` break matches the guard failing.
+    let Some(&[rx, ry, rz]) = data.get(pos..pos + REC) else {
+      break;
+    };
+    let x = f64::from(rx as i8) / 16.0;
+    let y = f64::from(ry as i8) / 16.0;
+    let z = f64::from(rz as i8) / 16.0;
     let mut sample = GpsSample::new();
     sample.set_accelerometer(Some(smol_str::SmolStr::from(join3(x, y, z))));
     out.push_gps_sample(sample);
@@ -1641,23 +1687,17 @@ fn atom_at(data: &[u8], pos: usize) -> Option<([u8; 4], usize, usize, usize)> {
   if pos + 8 > data.len() {
     return None;
   }
-  let size32 = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-  let mut t = [0u8; 4];
-  t.copy_from_slice(&data[pos + 4..pos + 8]);
+  // The guard proves `pos + 8 <= data.len()`, so these reads always succeed
+  // (the bounds-checking `be_*` helpers return `Some` here); `?` on the
+  // impossible miss returns `None`, the same as the `pos + 8 > len` guard.
+  let size32 = be_u32(data, pos)?;
+  let t: [u8; 4] = data.get(pos + 4..pos + 8)?.try_into().ok()?;
   let (start, end, next) = if size32 == 1 {
     if pos + 16 > data.len() {
       return None;
     }
-    let ext = u64::from_be_bytes([
-      data[pos + 8],
-      data[pos + 9],
-      data[pos + 10],
-      data[pos + 11],
-      data[pos + 12],
-      data[pos + 13],
-      data[pos + 14],
-      data[pos + 15],
-    ]);
+    // Likewise the `pos + 16 > len` guard proves this 8-byte read is in range.
+    let ext = be_u64(data, pos + 8)?;
     let payload = usize::try_from(ext.checked_sub(16)?).ok()?;
     let start = pos + 16;
     let end = start.checked_add(payload)?.min(data.len());
@@ -1686,8 +1726,12 @@ fn for_each_atom(data: &[u8], start: usize, end: usize, mut f: impl FnMut(&[u8; 
       break;
     };
     let pe = pe.min(end);
-    if ps <= pe {
-      f(&t, &data[ps..pe]);
+    // `atom_at` clamps `pe <= data.len()`, and the `ps <= pe` guard makes
+    // `.get(ps..pe)` always `Some` here — byte-identical to `data[ps..pe]`.
+    if ps <= pe
+      && let Some(payload) = data.get(ps..pe)
+    {
+      f(&t, payload);
     }
     if next <= pos {
       break;
@@ -1731,8 +1775,12 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
     return;
   }
   // bytes 4..8 of the entry = the 4-byte format code.
-  let mut fmt = [0u8; 4];
-  fmt.copy_from_slice(&data[pos + 4..pos + 8]);
+  // The `pos + 8 > len` guard proves this 4-byte read is in range; the
+  // `else` return is unreachable and matches that guard's recovery.
+  let Some(fmt): Option<[u8; 4]> = data.get(pos + 4..pos + 8).and_then(|s| s.try_into().ok())
+  else {
+    return;
+  };
   track.meta_format = fmt;
   // Child atoms follow the 16-byte SampleDescription header. Scan for
   // `keys` (the `mebx` metadata-key table).
@@ -1741,8 +1789,10 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
     if t == b"keys" {
       // The `keys` box body is itself `[version+flags:4][count:4]` then the
       // key-entry table — `SaveMetaKeys` skips the 8-byte header.
-      if body.len() > 8 {
-        track.meta_keys = save_meta_keys(&body[8..]);
+      if body.len() > 8
+        && let Some(rest) = body.get(8..)
+      {
+        track.meta_keys = save_meta_keys(rest);
       }
     }
   });
@@ -1852,16 +1902,22 @@ pub(crate) fn extract_stream(
         &mut out,
       ),
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
-      b"gps0" => process_gps0(&data[ps..body_end], &mut out),
+      // `atom_at` guarantees `ps <= body_end <= data.len()`, so `.get` is
+      // always `Some`; `unwrap_or_default()` (an empty slice) is unreachable.
+      b"gps0" => process_gps0(data.get(ps..body_end).unwrap_or_default(), &mut out),
       // Top-level DuDuBell / VSYS `gsen` (3-byte accelerometer triples).
-      b"gsen" => process_gsen(&data[ps..body_end], &mut out),
+      b"gsen" => process_gsen(data.get(ps..body_end).unwrap_or_default(), &mut out),
       // Top-level Kenwood `GPS ` (36-byte LE inline GPS records).
-      b"GPS " => parse_kenwood_gps(&data[ps..body_end], create_date_raw, &mut out),
+      b"GPS " => parse_kenwood_gps(
+        data.get(ps..body_end).unwrap_or_default(),
+        create_date_raw,
+        &mut out,
+      ),
       // Pittasoft BlackVue `3gf ` accelerometer (QuickTimeStream.pl
       // `Process_3gf`:2686-2708). ExifTool routes this via the
       // `%QuickTime::Pittasoft` parent table (an SP4 brand-variant); SP3
       // decodes a `3gf ` box wherever it appears in the atoms it walks.
-      b"3gf " => process_3gf(&data[ps..body_end], &mut out),
+      b"3gf " => process_3gf(data.get(ps..body_end).unwrap_or_default(), &mut out),
       _ => {}
     }
     if next <= pos {
@@ -1943,7 +1999,7 @@ fn process_moov_gps_box(
     };
     // QuickTimeStream.pl:1553 `if ($buff =~ /^....freeGPS /s)` — 4 arbitrary
     // bytes (the inner box size) then the literal magic.
-    if buff.len() >= 12 && &buff[4..12] == b"freeGPS " {
+    if buff.get(4..12) == Some(b"freeGPS ".as_slice()) {
       // QuickTimeStream.pl:1559-1564 — `ProcessFreeGPS` with `SampleTime =>
       // $time[$i]`, which is `undef` for this box (no `stts`); see fn docs.
       quicktime_freegps::process_free_gps(
@@ -2038,6 +2094,21 @@ mod tests {
     v
   }
 
+  /// Write `src` at `off` (the test-fixture builders' `buf[off..off+N] =`
+  /// shape) without raw slice-indexing; panics on an out-of-range fixture,
+  /// matching the previous `[..]` write.
+  fn wr(buf: &mut [u8], off: usize, src: &[u8]) {
+    buf
+      .get_mut(off..off + src.len())
+      .unwrap()
+      .copy_from_slice(src);
+  }
+
+  /// Write a single byte at `i` (the `buf[i] = b` fixture shape).
+  fn wb(buf: &mut [u8], i: usize, b: u8) {
+    *buf.get_mut(i).unwrap() = b;
+  }
+
   #[test]
   fn convert_lat_lon_dddmm() {
     // 4737.7053 (DDDMM.MMMM) = 47 deg + 37.7053 min = 47.628421667 deg.
@@ -2085,7 +2156,7 @@ mod tests {
     );
     // A value shorter than 80 bytes cannot satisfy the unpack ⇒ None (the
     // caller falls back to the raw `ReadValue` string).
-    assert_eq!(unpack_live_photo_info(&v[..79]), None);
+    assert_eq!(unpack_live_photo_info(v.get(..79).unwrap()), None);
     assert_eq!(unpack_live_photo_info(&[]), None);
   }
 
@@ -2093,7 +2164,7 @@ mod tests {
   fn stsz_uniform_and_explicit() {
     // explicit (sz==0): version/flags + sz=0 + count=2 + two int32u sizes.
     let mut d = alloc::vec![0u8; 12];
-    d[8..12].copy_from_slice(&2u32.to_be_bytes());
+    wr(&mut d, 8, &2u32.to_be_bytes());
     d.extend_from_slice(&100u32.to_be_bytes());
     d.extend_from_slice(&200u32.to_be_bytes());
     let mut ee = EeData::default();
@@ -2101,8 +2172,8 @@ mod tests {
     assert_eq!(ee.size, alloc::vec![100, 200]);
     // uniform (sz!=0): sz=64, count=3 ⇒ [64,64,64].
     let mut u = alloc::vec![0u8; 12];
-    u[4..8].copy_from_slice(&64u32.to_be_bytes());
-    u[8..12].copy_from_slice(&3u32.to_be_bytes());
+    wr(&mut u, 4, &64u32.to_be_bytes());
+    wr(&mut u, 8, &3u32.to_be_bytes());
     u.push(0); // need length > 12
     let mut ee2 = EeData::default();
     parse_stsz(b"stsz", &u, &mut ee2);
@@ -2113,14 +2184,14 @@ mod tests {
   fn stsc_requires_full_table() {
     // count=1 but no entry bytes ⇒ rejected (faithful: 8 + num*12 check).
     let mut short = alloc::vec![0u8; 8];
-    short[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut short, 4, &1u32.to_be_bytes());
     short.push(0); // length > 8
     let mut ee = EeData::default();
     parse_stsc(&short, &mut ee);
     assert!(ee.stsc.is_empty());
     // a complete entry decodes.
     let mut full = alloc::vec![0u8; 8];
-    full[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut full, 4, &1u32.to_be_bytes());
     full.extend_from_slice(&1u32.to_be_bytes()); // first chunk
     full.extend_from_slice(&5u32.to_be_bytes()); // samples per chunk
     full.extend_from_slice(&1u32.to_be_bytes()); // desc index
@@ -2139,11 +2210,11 @@ mod tests {
     };
     let samples = expand_samples(&ee, 600).expect("samples");
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].start, 1000);
-    assert_eq!(samples[0].size, 42);
+    assert_eq!(samples.first().unwrap().start, 1000);
+    assert_eq!(samples.first().unwrap().size, 42);
     // time 0, dur 600/600 = 1.0s.
-    assert_eq!(samples[0].time, Some(0.0));
-    assert_eq!(samples[0].dur, Some(1.0));
+    assert_eq!(samples.first().unwrap().time, Some(0.0));
+    assert_eq!(samples.first().unwrap().dur, Some(1.0));
   }
 
   #[test]
@@ -2160,7 +2231,7 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     process_3gf(&body, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.time_code(), Some(1.0));
     assert_eq!(s.accelerometer(), Some("1 -2 3"));
   }
@@ -2173,8 +2244,14 @@ mod tests {
     process_gsen(&body, &mut out);
     assert_eq!(out.gps_samples().len(), 2);
     // 16/16=1, -32/16=-2, 48/16=3.
-    assert_eq!(out.gps_samples()[0].accelerometer(), Some("1 -2 3"));
-    assert_eq!(out.gps_samples()[1].accelerometer(), Some("0.5 0 0"));
+    assert_eq!(
+      out.gps_samples().first().unwrap().accelerometer(),
+      Some("1 -2 3")
+    );
+    assert_eq!(
+      out.gps_samples().get(1).unwrap().accelerometer(),
+      Some("0.5 0 0")
+    );
   }
 
   #[test]
@@ -2219,9 +2296,9 @@ mod tests {
     entry.extend_from_slice(&dtyp);
     let keys = save_meta_keys(&entry);
     assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].0, 1);
-    assert_eq!(keys[0].1.tag_id, "Foo");
-    assert_eq!(keys[0].1.format, MetaFormat::Int32u);
+    assert_eq!(keys.first().unwrap().0, 1);
+    assert_eq!(keys.first().unwrap().1.tag_id, "Foo");
+    assert_eq!(keys.first().unwrap().1.format, MetaFormat::Int32u);
   }
 
   #[test]
@@ -2242,10 +2319,13 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     process_mebx(&rec, &keys, Some(0.5), Some(1.0), &mut out);
     assert_eq!(out.mebx_samples().len(), 1);
-    assert_eq!(out.mebx_samples()[0].name(), "GPSCoordinates");
-    assert_eq!(out.mebx_samples()[0].value(), "123456");
-    assert_eq!(out.mebx_samples()[0].sample_duration(), Some(1.0));
-    assert_eq!(out.mebx_samples()[0].sample_time(), Some(0.5));
+    assert_eq!(out.mebx_samples().first().unwrap().name(), "GPSCoordinates");
+    assert_eq!(out.mebx_samples().first().unwrap().value(), "123456");
+    assert_eq!(
+      out.mebx_samples().first().unwrap().sample_duration(),
+      Some(1.0)
+    );
+    assert_eq!(out.mebx_samples().first().unwrap().sample_time(), Some(0.5));
   }
 
   #[test]
@@ -2323,8 +2403,8 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     process_mebx(&rec, &keys, None, None, &mut out);
     assert_eq!(out.mebx_samples().len(), 1, "empty value still emits a tag");
-    assert_eq!(out.mebx_samples()[0].name(), "StillImageTime");
-    assert_eq!(out.mebx_samples()[0].value(), "");
+    assert_eq!(out.mebx_samples().first().unwrap().name(), "StillImageTime");
+    assert_eq!(out.mebx_samples().first().unwrap().value(), "");
   }
 
   #[test]
@@ -2409,13 +2489,13 @@ mod tests {
     process_face_info(&value, &keys, Some(0.0), Some(1.0), &mut out);
     let p = out.mebx_samples();
     assert_eq!(p.len(), 3, "three leaf keys for the one face");
-    assert_eq!(p[0].name(), "DetectedFaceBounds");
+    assert_eq!(p.first().unwrap().name(), "DetectedFaceBounds");
     // bounds: 0.123456789 rounds to 0.123457; -3 (float[2]) rounds to -2.999999.
-    assert_eq!(p[0].value(), "0.123457 -2.999999");
-    assert_eq!(p[1].name(), "DetectedFaceID");
-    assert_eq!(p[1].value(), "1001");
-    assert_eq!(p[2].name(), "DetectedFaceRollAngle");
-    assert_eq!(p[2].value(), "12.5"); // roll has no PrintConv
+    assert_eq!(p.first().unwrap().value(), "0.123457 -2.999999");
+    assert_eq!(p.get(1).unwrap().name(), "DetectedFaceID");
+    assert_eq!(p.get(1).unwrap().value(), "1001");
+    assert_eq!(p.get(2).unwrap().name(), "DetectedFaceRollAngle");
+    assert_eq!(p.get(2).unwrap().value(), "12.5"); // roll has no PrintConv
   }
 
   #[test]
@@ -2461,8 +2541,8 @@ mod tests {
     // ONLY the leaf is emitted — no `DetectedFace`/`FaceInfo` scalar for the
     // parent (the pre-fix branch wrongly emitted the raw tree bytes as a scalar).
     assert_eq!(p.len(), 1, "only the nested leaf, not the parent scalar");
-    assert_eq!(p[0].name(), "DetectedFaceID");
-    assert_eq!(p[0].value(), "7");
+    assert_eq!(p.first().unwrap().name(), "DetectedFaceID");
+    assert_eq!(p.first().unwrap().value(), "7");
     assert!(
       p.iter()
         .all(|s| s.name() != "FaceInfo" && s.name() != "DetectedFace"),
@@ -2487,8 +2567,11 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     process_mebx(&rec, &keys, None, None, &mut out);
     assert_eq!(out.mebx_samples().len(), 1);
-    assert_eq!(out.mebx_samples()[0].name(), "SceneIlluminance");
-    assert_eq!(out.mebx_samples()[0].value(), "1234");
+    assert_eq!(
+      out.mebx_samples().first().unwrap().name(),
+      "SceneIlluminance"
+    );
+    assert_eq!(out.mebx_samples().first().unwrap().value(), "1234");
   }
 
   #[test]
@@ -2546,7 +2629,7 @@ mod tests {
     let mut out = QuickTimeStreamMeta::new();
     parse_kenwood_gps(&data, Some(QT_EPOCH_OFFSET as u64), &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     // lat 4737.705 ⇒ 47.628..., positive (N).
     assert!(s.latitude().expect("lat") > 47.0 && s.latitude().expect("lat") < 48.0);
     // lon 12209.901 ⇒ 122.165..., negative (W).
@@ -2579,19 +2662,19 @@ mod tests {
   fn moov_gps_box_decodes_freegps_block_outside_mdat() {
     // A self-contained Type-6 (Akaso) freeGPS block (block-relative offsets).
     let mut blk = alloc::vec![0u8; 0x100];
-    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[60] = b'A';
-    blk[68] = b'N';
-    blk[76] = b'W';
-    blk[0x30..0x34].copy_from_slice(&14u32.to_le_bytes());
-    blk[0x34..0x38].copy_from_slice(&30u32.to_le_bytes());
-    blk[0x38..0x3c].copy_from_slice(&45u32.to_le_bytes());
-    blk[0x58..0x5c].copy_from_slice(&2024u32.to_le_bytes());
-    blk[0x5c..0x60].copy_from_slice(&7u32.to_le_bytes());
-    blk[0x60..0x64].copy_from_slice(&15u32.to_le_bytes());
-    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x30, &14u32.to_le_bytes());
+    wr(&mut blk, 0x34, &30u32.to_le_bytes());
+    wr(&mut blk, 0x38, &45u32.to_le_bytes());
+    wr(&mut blk, 0x58, &2024u32.to_le_bytes());
+    wr(&mut blk, 0x5c, &7u32.to_le_bytes());
+    wr(&mut blk, 0x60, &15u32.to_le_bytes());
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
 
     // Layout = ftyp || freeGPS-block || moov, so the block's ABSOLUTE file
     // offset is simply ftyp.len() — the offset-table `start` must point there.
@@ -2601,7 +2684,7 @@ mod tests {
     // The `gps ` box PAYLOAD: [reserved:4=0][count:4=1] then one
     // (start, size) pair, all big-endian (QuickTime `'MM'` order).
     let mut gps_body = alloc::vec![0u8; 8];
-    gps_body[4..8].copy_from_slice(&1u32.to_be_bytes()); // count = 1
+    wr(&mut gps_body, 4, &1u32.to_be_bytes()); // count = 1
     gps_body.extend_from_slice(&block_offset.to_be_bytes()); // absolute start
     gps_body.extend_from_slice(&(blk.len() as u32).to_be_bytes()); // size
     let gps_box = atom(b"gps ", &gps_body);
@@ -2625,7 +2708,7 @@ mod tests {
     // The `gps `-box decode dispatched a freeGPS block ⇒ FoundEmbedded set
     // (this is exactly the signal that suppresses a redundant `mdat` scan).
     assert!(found_embedded);
-    let s = &meta.gps_samples()[0];
+    let s = meta.gps_samples().first().unwrap();
     assert!(s.has_coordinates());
     assert_eq!(s.date_time(), Some("2024:07:15 14:30:45Z"));
   }
@@ -2640,48 +2723,48 @@ mod tests {
   #[test]
   fn gps_handler_track_is_ignored() {
     let mut blk = alloc::vec![0u8; 0x100];
-    blk[0..4].copy_from_slice(&0x0100u32.to_be_bytes());
-    blk[4..12].copy_from_slice(b"freeGPS ");
-    blk[60] = b'A';
-    blk[68] = b'N';
-    blk[76] = b'W';
-    blk[0x40..0x44].copy_from_slice(&4737.7053f32.to_le_bytes());
-    blk[0x48..0x4c].copy_from_slice(&12209.901f32.to_le_bytes());
+    wr(&mut blk, 0, &0x0100u32.to_be_bytes());
+    wr(&mut blk, 4, b"freeGPS ");
+    wb(&mut blk, 60, b'A');
+    wb(&mut blk, 68, b'N');
+    wb(&mut blk, 76, b'W');
+    wr(&mut blk, 0x40, &4737.7053f32.to_le_bytes());
+    wr(&mut blk, 0x48, &12209.901f32.to_le_bytes());
 
     let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
     let block_offset = ftyp.len() as u32;
 
     // hdlr: [version+flags:4][component-type:4][handler-subtype:4='gps ']…
     let mut hdlr_body = alloc::vec![0u8; 24];
-    hdlr_body[8..12].copy_from_slice(b"gps ");
+    wr(&mut hdlr_body, 8, b"gps ");
     let hdlr = atom(b"hdlr", &hdlr_body);
 
     let mut mdhd_body = alloc::vec![0u8; 24];
-    mdhd_body[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    wr(&mut mdhd_body, 12, &1000u32.to_be_bytes());
     let mdhd = atom(b"mdhd", &mdhd_body);
 
     let mut stsd_body = alloc::vec![0u8; 8];
-    stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stsd_body, 4, &1u32.to_be_bytes());
     let mut entry = alloc::vec![0u8; 16];
-    entry[0..4].copy_from_slice(&16u32.to_be_bytes());
-    entry[4..8].copy_from_slice(b"gps ");
+    wr(&mut entry, 0, &16u32.to_be_bytes());
+    wr(&mut entry, 4, b"gps ");
     stsd_body.extend_from_slice(&entry);
     let stsd = atom(b"stsd", &stsd_body);
 
     let mut stco_body = alloc::vec![0u8; 8];
-    stco_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stco_body, 4, &1u32.to_be_bytes());
     stco_body.extend_from_slice(&block_offset.to_be_bytes());
     let stco = atom(b"stco", &stco_body);
 
     let mut stsc_body = alloc::vec![0u8; 8];
-    stsc_body[4..8].copy_from_slice(&1u32.to_be_bytes());
+    wr(&mut stsc_body, 4, &1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     stsc_body.extend_from_slice(&1u32.to_be_bytes());
     let stsc = atom(b"stsc", &stsc_body);
 
     let mut stsz_body = alloc::vec![0u8; 8];
-    stsz_body[4..8].copy_from_slice(&0u32.to_be_bytes());
+    wr(&mut stsz_body, 4, &0u32.to_be_bytes());
     stsz_body.extend_from_slice(&1u32.to_be_bytes());
     stsz_body.extend_from_slice(&(blk.len() as u32).to_be_bytes());
     let stsz = atom(b"stsz", &stsz_body);
@@ -2729,16 +2812,16 @@ mod tests {
   fn process_gps0_skips_out_of_range_and_decodes() {
     // one valid 32-byte LE record.
     let mut rec = alloc::vec![0u8; 32];
-    rec[0..8].copy_from_slice(&4737.7053f64.to_le_bytes()); // lat DDDMM.MMMM
-    rec[8..16].copy_from_slice(&12209.901f64.to_le_bytes()); // lon
-    rec[0x10..0x14].copy_from_slice(&123i32.to_le_bytes()); // altitude
-    rec[0x14..0x16].copy_from_slice(&60u16.to_le_bytes()); // speed
-    rec[0x16..0x1c].copy_from_slice(&[24, 1, 7, 11, 19, 14]); // y m d H M S
-    rec[0x1c] = 30; // track/2
+    wr(&mut rec, 0, &4737.7053f64.to_le_bytes()); // lat DDDMM.MMMM
+    wr(&mut rec, 8, &12209.901f64.to_le_bytes()); // lon
+    wr(&mut rec, 0x10, &123i32.to_le_bytes()); // altitude
+    wr(&mut rec, 0x14, &60u16.to_le_bytes()); // speed
+    wr(&mut rec, 0x16, &[24, 1, 7, 11, 19, 14]); // y m d H M S
+    wb(&mut rec, 0x1c, 30); // track/2
     let mut out = QuickTimeStreamMeta::new();
     process_gps0(&rec, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
-    let s = &out.gps_samples()[0];
+    let s = out.gps_samples().first().unwrap();
     assert_eq!(s.altitude_m(), Some(123.0));
     assert_eq!(s.speed_kph(), Some(60.0));
     assert_eq!(s.track(), Some(60.0)); // 30 * 2

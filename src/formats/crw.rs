@@ -131,6 +131,8 @@
 //! - SmolStr for stored short strings; `String` for transient builders.
 //! - Cite `CanonRaw.pm:LLLL` for every non-trivial decode branch.
 
+#![deny(clippy::indexing_slicing)]
+
 use crate::exif::ifd::ByteOrder;
 use crate::format_parser::{FormatParser, parser_sealed};
 use crate::metadata::CrwMeta;
@@ -267,7 +269,12 @@ fn process_canon_raw(
   if block_end < block_start + 4 || block_end > data.len() {
     return;
   }
-  let dir_pos_field = &data[block_end - 4..block_end];
+  // The guard above proves `block_start <= block_end - 4` and
+  // `block_end <= data.len()`, so this `.get` always succeeds; the `else`
+  // is unreachable and lands on the same `return` (no tags) as the guard.
+  let Some(dir_pos_field) = data.get(block_end - 4..block_end) else {
+    return;
+  };
   // `$dirOffset = Get32u(\$buff,0) + $blockStart` (`CanonRaw.pm:631`).
   let dir_offset = (read_u32(dir_pos_field, 0, order) as usize).wrapping_add(block_start);
 
@@ -1038,13 +1045,16 @@ fn decode_u8_array(bytes: &[u8]) -> std::vec::Vec<u64> {
 fn decode_u16_array(bytes: &[u8], order: ByteOrder) -> std::vec::Vec<u64> {
   bytes
     .chunks_exact(2)
-    .map(|c| {
-      let arr = [c[0], c[1]];
+    .filter_map(|c| {
+      // `chunks_exact(2)` yields only length-2 slices, so `first_chunk`
+      // never returns `None` here; the `?` is a lint-clean, byte-identical
+      // stand-in for the previous `[c[0], c[1]]`.
+      let &arr = c.first_chunk::<2>()?;
       let v = match order {
         ByteOrder::Little => u16::from_le_bytes(arr),
         ByteOrder::Big => u16::from_be_bytes(arr),
       };
-      u64::from(v)
+      Some(u64::from(v))
     })
     .collect()
 }
@@ -1070,7 +1080,9 @@ fn read_u16(b: &[u8], off: usize, order: ByteOrder) -> u16 {
   let Some(s) = b.get(off..off + 2) else {
     return 0;
   };
-  let arr = [s[0], s[1]];
+  let Ok(arr): Result<[u8; 2], _> = s.try_into() else {
+    return 0;
+  };
   match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -1084,8 +1096,7 @@ fn read_u16(b: &[u8], off: usize, order: ByteOrder) -> u16 {
 /// 0-on-miss fallback would falsely emit a `0`.
 #[inline]
 fn read_u16_at(b: &[u8], off: usize, order: ByteOrder) -> Option<u16> {
-  let s = b.get(off..off + 2)?;
-  let arr = [s[0], s[1]];
+  let arr: [u8; 2] = b.get(off..off + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -1098,7 +1109,9 @@ fn read_u32(b: &[u8], off: usize, order: ByteOrder) -> u32 {
   let Some(s) = b.get(off..off + 4) else {
     return 0;
   };
-  let arr = [s[0], s[1], s[2], s[3]];
+  let Ok(arr): Result<[u8; 4], _> = s.try_into() else {
+    return 0;
+  };
   match order {
     ByteOrder::Little => u32::from_le_bytes(arr),
     ByteOrder::Big => u32::from_be_bytes(arr),
@@ -1124,7 +1137,8 @@ fn read_f32(b: &[u8], off: usize, order: ByteOrder) -> f32 {
 /// preserved rather than producing U+FFFD.
 fn trim_string(bytes: &[u8]) -> SmolStr {
   let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-  let s: String = bytes[..end].iter().map(|&b| b as char).collect();
+  // `end <= bytes.len()`, so `take(end)` reads exactly `bytes[..end]`.
+  let s: String = bytes.iter().take(end).map(|&b| b as char).collect();
   SmolStr::from(s)
 }
 
@@ -1403,7 +1417,9 @@ fn model_is_eos_d30(model: Option<&str>) -> bool {
   let bytes = m.as_bytes();
   let mut i = 0;
   while i + nb.len() <= bytes.len() {
-    if &bytes[i..i + nb.len()] == nb {
+    // The loop guard proves `i + nb.len() <= bytes.len()`, so this `.get`
+    // is always `Some`; the comparison is byte-identical to the slice form.
+    if bytes.get(i..i + nb.len()) == Some(&nb[..]) {
       match bytes.get(i + nb.len()) {
         None => return true,
         Some(&c) => {
@@ -1829,10 +1845,10 @@ impl crate::emit::Taggable for CrwMeta<'_> {
 /// block is too short or the word is `<= 0`.
 fn read_camera_settings_focal_units(data: &[u8], order: ByteOrder) -> Option<u16> {
   let pos = 2 * 25;
-  let s = data.get(pos..pos + 2)?;
+  let arr: [u8; 2] = data.get(pos..pos + 2)?.try_into().ok()?;
   let raw = match order {
-    ByteOrder::Little => i16::from_le_bytes([s[0], s[1]]),
-    ByteOrder::Big => i16::from_be_bytes([s[0], s[1]]),
+    ByteOrder::Little => i16::from_le_bytes(arr),
+    ByteOrder::Big => i16::from_be_bytes(arr),
   };
   if raw <= 0 { None } else { Some(raw as u16) }
 }
@@ -1955,7 +1971,9 @@ mod tests {
 
     fn add_value_indir(&mut self, tag_id: u16, data: &[u8]) {
       let mut inline = [0u8; 8];
-      inline[..data.len()].copy_from_slice(data);
+      if let Some(dst) = inline.get_mut(..data.len()) {
+        dst.copy_from_slice(data);
+      }
       self.entries.push(TestEntry::InDir {
         tag: tag_id | 0x4000,
         inline,
@@ -2067,7 +2085,7 @@ mod tests {
     let m = parse_inner(&data).expect("valid CRW");
     assert_eq!(m.sub_table_blocks().len(), 1);
     assert_eq!(
-      m.sub_table_blocks()[0].kind(),
+      m.sub_table_blocks().first().unwrap().kind(),
       crate::metadata::CrwSubTable::CameraSettings
     );
   }
@@ -2086,7 +2104,9 @@ mod tests {
     // also 0 (their raw-0 ValueConvs are harmless here — we only assert pos22).
     let nwords = 34usize;
     let mut words = std::vec![0i16; nwords];
-    words[0] = (nwords * 2) as i16;
+    if let Some(w0) = words.get_mut(0) {
+      *w0 = (nwords * 2) as i16;
+    }
     let mut blk = Vec::new();
     for w in &words {
       blk.extend_from_slice(&w.to_le_bytes());
@@ -2223,8 +2243,11 @@ mod tests {
     use crate::emit::ConvMode;
     const S: usize = 116;
     let mut ws = std::vec![0u8; S];
-    let set =
-      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    let set = |buf: &mut [u8], off: usize, v: u16| {
+      if let Some(d) = buf.get_mut(off..off + 2) {
+        d.copy_from_slice(&v.to_le_bytes());
+      }
+    };
     set(&mut ws, 0, S as u16); // Validate: first u16 == size
     set(&mut ws, 2, 80); // WhiteSampleWidth (pos1)
     set(&mut ws, 4, 5); // WhiteSampleHeight (pos2)
@@ -2272,8 +2295,11 @@ mod tests {
     // non-zero "encrypted" tail.
     const S: usize = 600;
     let mut ws = std::vec![0u8; S];
-    let set =
-      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    let set = |buf: &mut [u8], off: usize, v: u16| {
+      if let Some(d) = buf.get_mut(off..off + 2) {
+        d.copy_from_slice(&v.to_le_bytes());
+      }
+    };
     set(&mut ws, 0, S as u16); // Validate: first u16 == block byte size
     set(&mut ws, 2, 4096); // WhiteSampleWidth (pos1)
     set(&mut ws, 4, 3072); // WhiteSampleHeight (pos2)
@@ -2333,8 +2359,9 @@ mod tests {
     let m = parse_inner(&data).expect("valid CRW");
     // No bytes copied — only the (name, len) placeholder record.
     assert_eq!(m.binary_records().len(), 1);
-    assert_eq!(m.binary_records()[0].0.as_str(), "RawData");
-    assert_eq!(m.binary_records()[0].1, 4096);
+    let rec = m.binary_records().first().unwrap();
+    assert_eq!(rec.0.as_str(), "RawData");
+    assert_eq!(rec.1, 4096);
     // The predicate itself: leaves are NOT SubDirectory; the dispatched sub-
     // tables ARE.
     assert!(!is_subdirectory_tag(0x2005));
@@ -2354,8 +2381,11 @@ mod tests {
     use crate::emit::ConvMode;
     const S: usize = 116;
     let mut ws = std::vec![0u8; S];
-    let set =
-      |buf: &mut [u8], off: usize, v: u16| buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    let set = |buf: &mut [u8], off: usize, v: u16| {
+      if let Some(d) = buf.get_mut(off..off + 2) {
+        d.copy_from_slice(&v.to_le_bytes());
+      }
+    };
     set(&mut ws, 0, 100); // first u16 (100) != size (116) ⇒ INVALID
     set(&mut ws, 2, 80);
     let mut root = HeapBuilder::new();
@@ -2558,8 +2588,9 @@ mod tests {
     let data = build_file(&root);
     let m = parse_inner(&data).expect("valid CRW");
     assert_eq!(m.binary_records().len(), 1);
-    assert_eq!(m.binary_records()[0].0.as_str(), "FreeBytes");
-    assert_eq!(m.binary_records()[0].1, 10);
+    let rec = m.binary_records().first().unwrap();
+    assert_eq!(rec.0.as_str(), "FreeBytes");
+    assert_eq!(rec.1, 10);
 
     // Large (> 512): the placeholder-only path keeps the byte count, no copy.
     let mut root2 = HeapBuilder::new();
@@ -2567,8 +2598,9 @@ mod tests {
     let data2 = build_file(&root2);
     let m2 = parse_inner(&data2).expect("valid CRW");
     assert_eq!(m2.binary_records().len(), 1);
-    assert_eq!(m2.binary_records()[0].0.as_str(), "FreeBytes");
-    assert_eq!(m2.binary_records()[0].1, 768);
+    let rec2 = m2.binary_records().first().unwrap();
+    assert_eq!(rec2.0.as_str(), "FreeBytes");
+    assert_eq!(rec2.1, 768);
     // FreeBytes is a binary LEAF, NOT a SubDirectory.
     assert!(!is_subdirectory_tag(0x0001));
   }
@@ -2594,7 +2626,7 @@ mod tests {
 
     // Typed storage is a (name, LENGTH) pair — a `usize`, not a buffer.
     assert_eq!(m.binary_records().len(), 1);
-    let (name, len): &(SmolStr, usize) = &m.binary_records()[0];
+    let (name, len): &(SmolStr, usize) = m.binary_records().first().unwrap();
     assert_eq!(name.as_str(), "RawData");
     assert_eq!(*len, 4096usize);
 
