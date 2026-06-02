@@ -1,6 +1,14 @@
 //! Faithful port of `DecodeString` (ID3.pm:1054-1092) and `UnSyncSafe`
 //! (ID3.pm:1098-1106).
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on a runtime-length buffer is converted to a checked
+// `.get()` form below. Each conversion is byte-identical: the surrounding guard
+// (`val.is_empty()`, the `i + 1 < rest.len()` / `i + 1 < v.len()` loop bounds,
+// the `v.len() >= 2` BOM check, the `!bytes.is_empty()` trim) already proves
+// the read in range, so the `.get()` yields the same bytes / same recovery.
+#![deny(clippy::indexing_slicing)]
+
 /// Convert a sync-safe 28-bit integer encoded as a 32-bit big-endian value
 /// (every 8th bit forced to zero) into the actual number. Faithful port of
 /// `UnSyncSafe` (ID3.pm:1098-1106):
@@ -49,13 +57,23 @@ pub fn decode_string(val: &[u8], enc: Option<u8>) -> Vec<String> {
   }
   let (enc, mut bytes): (u8, &[u8]) = match enc {
     Some(e) => (e, val),
-    None => (val[0], &val[1..]),
+    // `val.is_empty()` was rejected above, so `val.len() >= 1`: `.first()` is
+    // always `Some` and `.get(1..)` is always `Some` (the fallbacks are
+    // unreachable) — byte-identical to the prior `(val[0], &val[1..])`.
+    None => (
+      val.first().copied().unwrap_or(0),
+      val.get(1..).unwrap_or(&[]),
+    ),
   };
   match enc {
     0 | 3 => {
       // Strip trailing null padding (ID3.pm:1064 `$val =~ s/\0+$//`).
-      while !bytes.is_empty() && *bytes.last().unwrap() == 0 {
-        bytes = &bytes[..bytes.len() - 1];
+      // `bytes.last() == Some(&0)` ⇒ `bytes.len() >= 1`, so `bytes.len() - 1 <
+      // bytes.len()` and `.get(..bytes.len() - 1)` is always `Some` (the
+      // `&[]` fallback is unreachable) — byte-identical to the prior slice +
+      // `last().unwrap()` (which also only ran on non-empty `bytes`).
+      while bytes.last() == Some(&0) {
+        bytes = bytes.get(..bytes.len() - 1).unwrap_or(&[]);
       }
       // Split on remaining \0 (ID3.pm:1066 `split "\0", $val`); each part
       // is decoded per `enc` (Latin1 vs UTF8). `split "\0"` in Perl drops
@@ -89,15 +107,23 @@ pub fn decode_string(val: &[u8], enc: Option<u8>) -> Vec<String> {
         // Find first word-aligned `\0\0`.
         let mut split_at: Option<usize> = None;
         let mut i = 0usize;
+        // `i + 1 < rest.len()` ⇒ both `.get(i)` and `.get(i + 1)` are `Some`
+        // (byte-identical to the prior `rest[i] == 0 && rest[i + 1] == 0`).
         while i + 1 < rest.len() {
-          if rest[i] == 0 && rest[i + 1] == 0 {
+          if rest.get(i) == Some(&0) && rest.get(i + 1) == Some(&0) {
             split_at = Some(i);
             break;
           }
           i += 2;
         }
         let (v, next) = match split_at {
-          Some(p) => (&rest[..p], &rest[p + 2..]),
+          // The split position `p` came from `p + 1 < rest.len()` above, so
+          // `p + 2 <= rest.len()`: `.get(..p)` and `.get(p + 2..)` are always
+          // `Some` (the `&[]` fallbacks are unreachable) — byte-identical.
+          Some(p) => (
+            rest.get(..p).unwrap_or(&[]),
+            rest.get(p + 2..).unwrap_or(&[]),
+          ),
           None => {
             if rest.len() < 2 {
               break;
@@ -108,15 +134,21 @@ pub fn decode_string(val: &[u8], enc: Option<u8>) -> Vec<String> {
             (v, rest)
           }
         };
-        // BOM detection (only for enc==1).
+        // BOM detection (only for enc==1). `v.len() >= 2` here, so the two
+        // leading-byte reads and `.get(2..)` are always `Some` (the fallbacks
+        // are unreachable) — byte-identical to the prior `[v[0], v[1]]` /
+        // `&v[2..]`.
         let (be, payload) = if !force_be && v.len() >= 2 {
-          let mark = [v[0], v[1]];
+          let mark = [
+            v.first().copied().unwrap_or(0),
+            v.get(1).copied().unwrap_or(0),
+          ];
           if mark == [0xfe, 0xff] {
             bom_be = true;
-            (true, &v[2..])
+            (true, v.get(2..).unwrap_or(&[]))
           } else if mark == [0xff, 0xfe] {
             bom_be = false;
-            (false, &v[2..])
+            (false, v.get(2..).unwrap_or(&[]))
           } else {
             (bom_be, v)
           }
@@ -181,11 +213,17 @@ fn decode_one(v: &[u8], enc: u8) -> String {
 fn decode_utf16(v: &[u8], be: bool) -> String {
   let mut units: Vec<u16> = Vec::with_capacity(v.len() / 2);
   let mut i = 0;
+  // `i + 1 < v.len()` ⇒ both `.get(i)` and `.get(i + 1)` are `Some` (the `0`
+  // fallbacks are unreachable) — byte-identical to the prior `[v[i], v[i+1]]`.
   while i + 1 < v.len() {
+    let pair = [
+      v.get(i).copied().unwrap_or(0),
+      v.get(i + 1).copied().unwrap_or(0),
+    ];
     let u = if be {
-      u16::from_be_bytes([v[i], v[i + 1]])
+      u16::from_be_bytes(pair)
     } else {
-      u16::from_le_bytes([v[i], v[i + 1]])
+      u16::from_le_bytes(pair)
     };
     units.push(u);
     i += 2;
@@ -198,6 +236,11 @@ fn decode_utf16(v: &[u8], be: bool) -> String {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

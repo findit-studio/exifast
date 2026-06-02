@@ -19,6 +19,14 @@
 //! `Composite:DateTimeOriginal`, which lives in the Composite engine and
 //! is part of the broader accepted-deferral set.
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the 227-byte Enhanced-TAG buffer is converted to a
+// checked `.get()` form below. Each conversion is byte-identical: the
+// `data.len() != 227` guard at the top of `process_id3v1_enh` proves every
+// fixed-offset read in range (the highest is 221+6=227), so the `.get()`
+// always yields the same bytes.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{ConvContext, apply_ctx},
   formats::id3::text::convert_id3v1_text,
@@ -105,7 +113,10 @@ pub static ID3V1_ENH_MAIN: TagTable = TagTable::new("ID3", v1_enh_get);
 /// reaching across modules; the two callers are independent.)
 fn truncate_at_first_null(b: &[u8]) -> &[u8] {
   match b.iter().position(|&c| c == 0) {
-    Some(p) => &b[..p],
+    // `position` yields `p < b.len()`, so `.get(..p)` always returns
+    // `Some(&b[..p])` (the `unwrap_or` fallback is unreachable) — byte-
+    // identical to the prior `&b[..p]`.
+    Some(p) => b.get(..p).unwrap_or(b),
     None => b,
   }
 }
@@ -140,7 +151,12 @@ pub fn process_id3v1_enh(data: &[u8], meta: &mut Metadata, print_conv_on: bool, 
   // ProcessBinaryData lift for `Format => 'string'` (ExifTool.pm:6299-6300:
   // `$vals[0] =~ s/\0.*//s if $format eq 'string';`).
   let push_text = |off: usize, len: usize, def: &'static TagDef, meta: &mut Metadata| {
-    let raw = &data[off..off + len];
+    // `data.len() == 227` (guard above) and every call site below passes an
+    // `off + len <= 227` range, so `.get(off..off + len)` is always `Some`;
+    // the early `return` is unreachable (byte-identical to the prior slice).
+    let Some(raw) = data.get(off..off + len) else {
+      return;
+    };
     let raw = truncate_at_first_null(raw);
     if raw.is_empty() {
       // Empty (all-NUL) field: bundled-Perl still emits the tag with an
@@ -172,7 +188,9 @@ pub fn process_id3v1_enh(data: &[u8], meta: &mut Metadata, print_conv_on: bool, 
   // as `Unknown ($n)` via the `PrintConvHash` fallback (same contract as
   // ID3v1's Genre byte).
   {
-    let b = data[184] as i64;
+    // `data.len() == 227` ⇒ `.get(184)` is always `Some` (the `0` fallback is
+    // unreachable) — byte-identical to the prior `data[184]`.
+    let b = data.get(184).copied().unwrap_or(0) as i64;
     let out = apply_ctx(&SPEED, &TagValue::I64(b), print_conv_on, ctx);
     meta.push(
       Group::new(ID3V1_ENH_MAIN.group0(), SPEED.group1()),
@@ -189,7 +207,9 @@ pub fn process_id3v1_enh(data: &[u8], meta: &mut Metadata, print_conv_on: bool, 
   // Year-style emission keeps the raw 6-char prefix (with trailing space
   // or NUL truncation), matching bundled (`"00:00 "` style).
   {
-    let raw = truncate_at_first_null(&data[215..221]);
+    // `data.len() == 227` ⇒ `.get(215..221)` is always `Some` (the `&[]`
+    // fallback is unreachable) — byte-identical to the prior `&data[215..221]`.
+    let raw = truncate_at_first_null(data.get(215..221).unwrap_or(&[]));
     let s: String = raw.iter().map(|&b| b as char).collect();
     meta.push(
       Group::new(ID3V1_ENH_MAIN.group0(), START_TIME.group1()),
@@ -199,7 +219,9 @@ pub fn process_id3v1_enh(data: &[u8], meta: &mut Metadata, print_conv_on: bool, 
   }
   // ID3.pm:421-424 — EndTime (221..227, string[6]).
   {
-    let raw = truncate_at_first_null(&data[221..227]);
+    // `data.len() == 227` ⇒ `.get(221..227)` is always `Some` (the `&[]`
+    // fallback is unreachable) — byte-identical to the prior `&data[221..227]`.
+    let raw = truncate_at_first_null(data.get(221..227).unwrap_or(&[]));
     let s: String = raw.iter().map(|&b| b as char).collect();
     meta.push(
       Group::new(ID3V1_ENH_MAIN.group0(), END_TIME.group1()),
@@ -210,6 +232,11 @@ pub fn process_id3v1_enh(data: &[u8], meta: &mut Metadata, print_conv_on: bool, 
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

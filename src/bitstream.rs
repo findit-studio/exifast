@@ -4,6 +4,13 @@
 //! Bit numbering is MSB-first: in 'MM' order bit 0 is the high-order bit of
 //! byte 0 (FLAC.pm:61 "bit 0 is the high-order bit").
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on a runtime-length buffer is converted to a checked
+// `.get()` form below. The bit-reader keeps its existing bounds checks (the
+// `i2 >= dir_len` / `b1 > b2` guards) — they already prove the slice in range,
+// so the conversion is byte-identical.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::apply,
   tagtable::{RawConv, TagDef, TagId, TagTable},
@@ -188,8 +195,11 @@ fn extract_field(
     // FLAC.pm:224-229: `Start => $dirStart + $i1`, `Size => $i2 - $i1 + 1`
     // (dirStart=0, Start=i1, inclusive end=i2). The `i2 >= dir_len` break
     // above guarantees i2 < data.len() and the `b1 > b2` continue above
-    // guarantees i1 <= i2, so this inclusive slice is always in-bounds.
-    TagValue::Bytes(data[i1..=i2].to_vec())
+    // guarantees i1 <= i2, so this inclusive slice is always in-bounds; the
+    // checked `.get` therefore always yields `Some`, and the `?` (early
+    // `return None`) reuses the same `last`-in-caller recovery as the
+    // `i2 >= dir_len` guard above.
+    TagValue::Bytes(data.get(i1..=i2)?.to_vec())
   } else {
     // Format NOT set: unsigned-integer accumulation (FLAC.pm:182-222).
     // Faithful Perl scalar: `$val` starts as UV (here: u64) and
@@ -219,7 +229,11 @@ fn extract_field(
     }
     let mut acc = Acc::U(0);
     let mut last_mask: u32 = 0;
-    let byte = |i: usize| data[i] as u32; // Get8u($dataPt,$i+$dirStart), dirStart=0
+    // Get8u($dataPt,$i+$dirStart), dirStart=0. Both loops below iterate only
+    // `i1..=i2` and `i2 < dir_len` (the `i2 >= dir_len` break above), so `i`
+    // is always in-bounds; the checked `.get` therefore always yields `Some`
+    // and the `unwrap_or(0)` fallback is never taken (byte-identical).
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0) as u32;
     match order {
       BitOrder::Mm => {
         // FLAC.pm:185-199: `if ($byteOrder eq 'MM')` — loop ascending i1..=i2
@@ -408,6 +422,11 @@ pub fn process_bit_stream_cond(
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, ValueConv};

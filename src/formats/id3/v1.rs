@@ -6,6 +6,14 @@
 //! Group convention (ID3.pm:337): family-1 `"ID3v1"`, family-0 `"ID3"`
 //! (the parent `%Image::ExifTool::ID3::Main` table's group, ID3.pm:78).
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction —
+// every raw index/slice on the 128-byte ID3v1 buffer is converted to a checked
+// `.get()` form below. Each conversion is byte-identical: the `data.len() !=
+// 128` guard at the top of `process_id3v1` (and the parallel `parse_id3v1_from_
+// block` 128-byte check) proves every fixed-offset read (max 127) in range, so
+// the `.get()` always yields the same byte.
+#![deny(clippy::indexing_slicing)]
+
 use crate::{
   convert::{ConvContext, apply_ctx},
   formats::id3::text::convert_id3v1_text,
@@ -293,7 +301,10 @@ pub static ID3V1_MAIN: TagTable = TagTable::new("ID3", v1_get);
 /// `process_id3v1_v1_1_comment_truncates_at_first_null`.
 fn truncate_at_first_null(b: &[u8]) -> &[u8] {
   match b.iter().position(|&c| c == 0) {
-    Some(p) => &b[..p],
+    // `position` yields `p < b.len()`, so `.get(..p)` always returns
+    // `Some(&b[..p])` (the `unwrap_or` fallback is unreachable) — byte-
+    // identical to the prior `&b[..p]`.
+    Some(p) => b.get(..p).unwrap_or(b),
     None => b,
   }
 }
@@ -325,7 +336,12 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
   // serializer.
 
   let push_text = |off: usize, len: usize, def: &'static TagDef, meta: &mut Metadata| {
-    let raw = &data[off..off + len];
+    // `data.len() == 128` (guard above) and every call site passes an
+    // `off + len <= 93` range, so `.get(off..off + len)` is always `Some`;
+    // the early `return` is unreachable (byte-identical to the prior slice).
+    let Some(raw) = data.get(off..off + len) else {
+      return;
+    };
     let raw = truncate_at_first_null(raw);
     if raw.is_empty() {
       // Bundled-Perl: an all-null field emits an empty string. Observed
@@ -358,7 +374,9 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
   // which kept post-NUL bytes — fixed by routing Year through
   // `truncate_at_first_null` then Latin-1 decoding the prefix.
   {
-    let raw = truncate_at_first_null(&data[93..97]);
+    // `data.len() == 128` ⇒ `.get(93..97)` is always `Some` (the `&[]`
+    // fallback is unreachable) — byte-identical to the prior `&data[93..97]`.
+    let raw = truncate_at_first_null(data.get(93..97).unwrap_or(&[]));
     let s: String = raw.iter().map(|&b| b as char).collect();
     // Year may parse as numeric (e.g. "2003"); ExifTool keeps it as a
     // string per its `Format => 'string[4]'`, but the serializer's
@@ -372,7 +390,9 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
   }
   // Comment + Track (ID3v1.1).
   {
-    let raw_comment = &data[97..127];
+    // `data.len() == 128` ⇒ `.get(97..127)` is always `Some` (byte-identical
+    // to the prior `&data[97..127]`).
+    let raw_comment = data.get(97..127).unwrap_or(&[]);
     // ID3v1.1 Track lives at the last 2 bytes of the v1.0 Comment field
     // (ID3.pm:365-370): `Format => 'int8u[2]', RawConv => '($val =~ s/^0
     //  // and $val) ? $val : undef'`. ExifTool's ProcessBinaryData
@@ -399,8 +419,11 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
     // val is e.g. `"0 3"` for track 3 in v1.1. The RawConv strips the
     // leading `"0 "` and returns the remaining string `"3"`; if the
     // first byte is NOT 0, the regex misses and returns undef → no tag.
-    if data[125] == 0 && data[126] != 0 {
-      let track_n = data[126] as i64;
+    // `data.len() == 128` ⇒ `.get(125)` / `.get(126)` are always `Some`;
+    // `data.get(125) == Some(&0) && data.get(126) != Some(&0)` is byte-
+    // identical to the prior `data[125] == 0 && data[126] != 0`.
+    if data.get(125) == Some(&0) && data.get(126) != Some(&0) {
+      let track_n = data.get(126).copied().unwrap_or(0) as i64;
       meta.push(
         Group::new(ID3V1_MAIN.group0(), TRACK.group1()),
         TRACK.name(),
@@ -410,7 +433,9 @@ pub fn process_id3v1(data: &[u8], meta: &mut Metadata, print_conv_on: bool, ctx:
   }
   // Genre.
   {
-    let g = data[127] as i64;
+    // `data.len() == 128` ⇒ `.get(127)` is always `Some` (byte-identical to
+    // the prior `data[127]`).
+    let g = data.get(127).copied().unwrap_or(0) as i64;
     // Faithful: ProcessBinaryData pushes the raw integer; PrintConv looks
     // it up in `%genre` (our PrintConvHash). For `255 => 'None'` and
     // sparse misses (192..=254) the hash fallback yields `"Unknown ($n)"`.
@@ -472,7 +497,10 @@ pub fn parse_id3v1_typed(data: &[u8]) -> Option<super::process::Id3v1Meta<'stati
   // was literally absent", which never happens for a fixed-width
   // ID3v1 byte slot.
   let decode = |off: usize, len: usize| -> Option<SmolStr> {
-    let raw = &data[off..off + len];
+    // `data.len() == 128` (guard above) and every call site passes an
+    // `off + len <= 127` range, so `.get(off..off + len)` is always `Some`;
+    // the `None` short-circuit is unreachable (byte-identical to the slice).
+    let raw = data.get(off..off + len)?;
     let raw = truncate_at_first_null(raw);
     // Latin-1 → UTF-8: each byte = Unicode code point. Empty input
     // yields an empty SmolStr (cheap inline buffer).
@@ -491,8 +519,11 @@ pub fn parse_id3v1_typed(data: &[u8]) -> Option<super::process::Id3v1Meta<'stati
   // separator; the truncate-at-first-NUL behavior already handles that
   // since `decode(97, 30)` will see the NUL at offset 125-97=28.
   let comment = decode(97, 30);
-  let track = if data[125] == 0 && data[126] != 0 {
-    Some(data[126])
+  // `data.len() == 128` ⇒ `.get(125)` / `.get(126)` are always `Some`;
+  // `data.get(125) == Some(&0) && data.get(126) != Some(&0)` is byte-identical
+  // to the prior `data[125] == 0 && data[126] != 0`.
+  let track = if data.get(125) == Some(&0) && data.get(126) != Some(&0) {
+    data.get(126).copied()
   } else {
     None
   };
@@ -501,7 +532,9 @@ pub fn parse_id3v1_typed(data: &[u8]) -> Option<super::process::Id3v1Meta<'stati
   // sparse range 192..=254 except 255). The Real `emit_id3v1` then renders
   // `Unknown ({byte})` for sparse genres in `-j` mode and the raw byte
   // in `-n` mode (faithful to bundled).
-  let genre_byte = data[127];
+  // `data.len() == 128` ⇒ `.get(127)` is always `Some` (the `0` fallback is
+  // unreachable) — byte-identical to the prior `data[127]`.
+  let genre_byte = data.get(127).copied().unwrap_or(0);
   let genre_name_lookup = crate::formats::id3::genre::genre_name(i64::from(genre_byte));
 
   Some(Id3v1Meta::__internal_from_bytes(
@@ -517,6 +550,11 @@ pub fn parse_id3v1_typed(data: &[u8]) -> Option<super::process::Id3v1Meta<'stati
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the test-builder helpers index fixed-layout buffers
+// freely (an out-of-range index is a test-assertion failure, not a shipped
+// panic), so the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

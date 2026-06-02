@@ -4,6 +4,11 @@
 //! land they re-cite this same table; we expose it here as the shared
 //! source so the duplication stays in sync.)
 
+// Golden-v2 Contract 3c (Phase C, slice w2c): panic-safety by construction.
+// This module is a pure const PrintConv table (no runtime buffer indexing);
+// the deny is the file-level panic-safety contract for the slice.
+#![deny(clippy::indexing_slicing)]
+
 use crate::tagtable::{PrintConvHash, PrintValue};
 
 /// `%pictureType` (ID3.pm:42-64) as a hash PrintConv direct-entries slice.
@@ -35,6 +40,11 @@ pub const PICTURE_TYPE: &[(&str, PrintValue)] = &[
 pub const PICTURE_TYPE_HASH: PrintConvHash = PrintConvHash::direct(PICTURE_TYPE);
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2c); the tests index the fixed-length const table freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
