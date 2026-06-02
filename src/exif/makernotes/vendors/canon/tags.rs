@@ -20,6 +20,12 @@
 //!   DEFERRED — each model has its own micro-table.
 //! - `ColorData1..12` (`Canon.pm:7435-8941`) are DEFERRED.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// this is the Canon Main tag table + dispatch; any raw index/slice is
+// dominated by a length/count guard and becomes a checked `.get()` form
+// (re-asserts the parent `exif` deny over the makernotes `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use super::printconv::CanonPrintConv;
 
 /// One Canon Main IFD tag.
@@ -873,6 +879,11 @@ pub fn lookup(id: u16) -> Option<&'static CanonTag> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

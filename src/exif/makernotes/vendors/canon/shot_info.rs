@@ -78,6 +78,12 @@
 //! 6/15/17 use `CanonEv($val)` then `PrintFraction`. `CanonEv` is the APEX
 //! decoder shared with [`super::camera_settings`].
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice below is dominated by a preceding length/count guard
+// and converted to a checked `.get()` form (re-asserts the parent `exif`
+// deny over the makernotes subtree's slice-D/E `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use super::camera_settings::canon_ev;
 use crate::exif::ifd::ByteOrder;
 use crate::exif::tables::{print_exposure_time, print_fraction};
@@ -557,8 +563,9 @@ fn format_distance_m(metres: f64) -> std::string::String {
 /// `2*position`). Default `FORMAT => 'int16s'`.
 fn read_i16(data: &[u8], position: usize, order: ByteOrder) -> Option<i64> {
   let off = 2 * position;
-  let b = data.get(off..off + 2)?;
-  let arr = [b[0], b[1]];
+  // `get(off..off+2)` yields exactly 2 bytes, so `try_into()` to `[u8; 2]`
+  // always succeeds — the checked, byte-identical form of `[b[0], b[1]]`.
+  let arr: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => i16::from_le_bytes(arr),
     ByteOrder::Big => i16::from_be_bytes(arr),
@@ -569,8 +576,7 @@ fn read_i16(data: &[u8], position: usize, order: ByteOrder) -> Option<i64> {
 /// 'int16u'` overrides).
 fn read_u16(data: &[u8], position: usize, order: ByteOrder) -> Option<i64> {
   let off = 2 * position;
-  let b = data.get(off..off + 2)?;
-  let arr = [b[0], b[1]];
+  let arr: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
   Some(match order {
     ByteOrder::Little => u16::from_le_bytes(arr),
     ByteOrder::Big => u16::from_be_bytes(arr),
@@ -631,9 +637,12 @@ fn matches_word(haystack: &str, token: &str) -> bool {
   let mut start = 0usize;
   while let Some(rel) = haystack[start..].find(token) {
     let i = start + rel;
-    let before_ok = i == 0 || !is_word(hb[i - 1]);
+    // `i > 0` ⇒ `hb.get(i-1)` is `Some` (the match start is in-bounds); `end <
+    // hb.len()` ⇒ `hb.get(end)` is `Some` — checked, byte-identical to the
+    // `hb[i-1]` / `hb[end]` reads under the `i == 0` / `end >= hb.len()` guards.
+    let before_ok = i == 0 || hb.get(i - 1).is_some_and(|&b| !is_word(b));
     let end = i + tb.len();
-    let after_ok = end >= hb.len() || !is_word(hb[end]);
+    let after_ok = end >= hb.len() || hb.get(end).is_some_and(|&b| !is_word(b));
     if before_ok && after_ok {
       return true;
     }
@@ -1125,6 +1134,11 @@ fn num_value(v: f64) -> TagValue {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
   use crate::exif::ifd::ByteOrder;

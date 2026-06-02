@@ -14,6 +14,12 @@
 //! the integer-only entry (the FIRST one with that integer prefix); for
 //! "tell me all candidates" the full set is iterable.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// this is the Canon LensType lookup table + helpers; any raw index/slice is
+// dominated by a length/count guard and becomes a checked `.get()` form
+// (re-asserts the parent `exif` deny over the makernotes `#![allow]` shim).
+#![deny(clippy::indexing_slicing)]
+
 use smol_str::SmolStr;
 
 /// One lens-type entry — the encoded key + the human-readable lens name.
@@ -2726,7 +2732,9 @@ pub fn lookup(key_int: u16) -> Option<&'static CanonLensType> {
   let idx = CANON_LENS_TYPES
     .binary_search_by(|t| (t.key_int, t.key_frac).cmp(&(key_int, 0)))
     .ok()?;
-  Some(&CANON_LENS_TYPES[idx])
+  // `binary_search` returns an in-bounds index on `Ok`, so `.get(idx)` is
+  // `Some` — the checked, byte-identical form of `Some(&CANON_LENS_TYPES[idx])`.
+  CANON_LENS_TYPES.get(idx)
 }
 
 /// Resolve a lens-type ID into a [`SmolStr`] for storage in
@@ -2738,6 +2746,11 @@ pub fn lookup_name(key_int: u16) -> Option<SmolStr> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

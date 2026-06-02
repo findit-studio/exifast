@@ -59,6 +59,14 @@
 //! them to the IFD walker. So [`dispatch`] is a SIGNATURE classifier, not
 //! a walker; it does NOT recurse into the body.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice in the vendor-signature matcher is dominated by a
+// preceding length/`starts_with` guard and converted to a checked `.get()`
+// form. The parent `exif` deny propagates here; this file-level deny re-asserts
+// it over the makernotes subtree's slice-D/E `#![allow]` shim (dispatcher is in
+// slice D's scope alongside the Canon vendor subtree).
+#![deny(clippy::indexing_slicing)]
+
 use super::detected::{BaseRule, ChildByteOrder, DetectedMakerNote};
 use super::vendor::Vendor;
 use crate::exif::ifd::ByteOrder;
@@ -261,7 +269,7 @@ pub fn dispatch(
 
   // ----- Google HDR+ — `MakerNoteGoogle` (`MakerNotes.pm:161-167`).
   // `$$valPt =~ /^HDRP[\x02\x03]/` ; `NotIFD => 1`.
-  if blob.len() >= 5 && &blob[..4] == b"HDRP" && (blob[4] == 0x02 || blob[4] == 0x03) {
+  if blob.starts_with(b"HDRP") && matches!(blob.get(4), Some(0x02 | 0x03)) {
     return DetectedMakerNote::new(
       Vendor::Google,
       0,
@@ -307,7 +315,7 @@ pub fn dispatch(
 
   // ----- HP2 — `MakerNoteHP2` (`MakerNotes.pm:194-204`).
   // `$$valPt =~ /^610[\0-\4]/` ; `NotIFD => 1`.
-  if blob.len() >= 4 && &blob[..3] == b"610" && blob[3] <= 0x04 {
+  if blob.starts_with(b"610") && blob.get(3).is_some_and(|&b| b <= 0x04) {
     return DetectedMakerNote::new(
       Vendor::Hp,
       0, // `Start => '$valuePtr'` (`MakerNotes.pm:201`)
@@ -321,10 +329,9 @@ pub fn dispatch(
   // `$$valPt =~ /^IIII[\x04|\x05]\0/`. (Bundled has a Perl typo
   // `[\x04|\x05]` — a CHARACTER class that includes `|`, `\x04`,
   // `\x05` — the port matches the same set faithfully.)
-  if blob.len() >= 6
-    && &blob[..4] == b"IIII"
-    && (blob[4] == 0x04 || blob[4] == 0x05 || blob[4] == b'|')
-    && blob[5] == 0x00
+  if blob.starts_with(b"IIII")
+    && matches!(blob.get(4), Some(0x04 | 0x05 | b'|'))
+    && blob.get(5) == Some(&0x00)
   {
     return DetectedMakerNote::new(
       Vendor::Hp,
@@ -337,7 +344,7 @@ pub fn dispatch(
 
   // ----- HP6 — `MakerNoteHP6` (`MakerNotes.pm:215-224`).
   // `$$valPt =~ /^IIII\x06\0/`.
-  if blob.len() >= 6 && &blob[..4] == b"IIII" && blob[4] == 0x06 && blob[5] == 0x00 {
+  if blob.starts_with(b"IIII") && blob.get(4) == Some(&0x06) && blob.get(5) == Some(&0x00) {
     return DetectedMakerNote::new(
       Vendor::Hp,
       0,
@@ -1059,9 +1066,11 @@ pub fn dispatch(
 
   // ----- PhaseOne — `MakerNotePhaseOne` (`MakerNotes.pm:840-852`).
   // `$$valPt =~ /^(IIII.waR|MMMMRaw.)/s` ; `NotIFD => 1`.
+  // The `blob.len() >= 8` guard dominates every window below, so each
+  // `blob.get(a..b)` is `Some` — the checked, byte-identical form of `&blob[a..b]`.
   if blob.len() >= 8
-    && ((&blob[..4] == b"IIII" && &blob[5..8] == b"waR")
-      || (&blob[..4] == b"MMMM" && &blob[4..7] == b"Raw"))
+    && ((blob.get(..4) == Some(b"IIII") && blob.get(5..8) == Some(b"waR"))
+      || (blob.get(..4) == Some(b"MMMM") && blob.get(4..7) == Some(b"Raw")))
   {
     return DetectedMakerNote::new(
       Vendor::PhaseOne,
@@ -1098,7 +1107,9 @@ pub fn dispatch(
 
   // ----- Ricoh + Pentax (RICOH GR III etc.) — `MakerNoteRicohPentax`
   // (`MakerNotes.pm:897-906`). `$$valPt=~/^RICOH\0(II|MM)/`.
-  if blob.len() >= 8 && &blob[..6] == b"RICOH\x00" && (&blob[6..8] == b"II" || &blob[6..8] == b"MM")
+  if blob.len() >= 8
+    && blob.get(..6) == Some(b"RICOH\x00")
+    && matches!(blob.get(6..8), Some(b"II" | b"MM"))
   {
     return DetectedMakerNote::new(
       Vendor::Ricoh,
@@ -1178,10 +1189,17 @@ pub fn dispatch(
   // `STMN` without digits matches NEITHER and must fall through). The two
   // share `Vendor::Samsung` + no `Start`/`Base`/`ByteOrder`; only the
   // `not_ifd` flag differs.
-  if starts_with(blob, b"STMN") && blob.len() >= 7 && blob[4..7].iter().all(u8::is_ascii_digit) {
+  if starts_with(blob, b"STMN")
+    && blob
+      .get(4..7)
+      .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
+  {
     // Samsung1a: `STMN \d{3} . \0{4}` — byte 7 is the `.` (any), bytes
     // 8..12 are four NULs (`/s` makes `.` match NUL too). 12 bytes.
-    let is_1a = blob.len() >= 12 && blob[8..12].iter().all(|&b| b == 0x00);
+    // `blob.get(8..12)` folds the `blob.len() >= 12` guard into the read.
+    let is_1a = blob
+      .get(8..12)
+      .is_some_and(|q| q.iter().all(|&b| b == 0x00));
     return DetectedMakerNote::new(
       Vendor::Samsung,
       0,
@@ -1397,7 +1415,9 @@ pub fn dispatch(
 /// `$$valPt =~ /^bytes/` — `true` if `blob` starts with `prefix`.
 #[inline]
 fn starts_with(blob: &[u8], prefix: &[u8]) -> bool {
-  blob.len() >= prefix.len() && &blob[..prefix.len()] == prefix
+  // `blob.get(..prefix.len())` folds the `blob.len() >= prefix.len()` guard into
+  // the read — the checked, byte-identical form of `&blob[..prefix.len()] == prefix`.
+  blob.get(..prefix.len()) == Some(prefix)
 }
 
 /// `$$valPt =~ /^bytes/i` — case-INSENSITIVE byte-prefix match, the faithful
@@ -1408,7 +1428,9 @@ fn starts_with(blob: &[u8], prefix: &[u8]) -> bool {
 /// are pure ASCII); `eq_ignore_ascii_case` is the exact, panic-free mirror.
 #[inline]
 fn starts_with_ci(blob: &[u8], prefix: &[u8]) -> bool {
-  blob.len() >= prefix.len() && blob[..prefix.len()].eq_ignore_ascii_case(prefix)
+  blob
+    .get(..prefix.len())
+    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// `$$valPt =~ /^...\@AMBA/` — the Ambarella signature (`MakerNotes.pm:101`
@@ -1416,7 +1438,9 @@ fn starts_with_ci(blob: &[u8], prefix: &[u8]) -> bool {
 /// by `@AMBA`.
 #[inline]
 fn ambarella_at_amba(blob: &[u8]) -> bool {
-  blob.len() >= 8 && &blob[3..8] == b"@AMBA"
+  // `blob.get(3..8)` folds the `blob.len() >= 8` guard — checked, byte-identical
+  // to `&blob[3..8] == b"@AMBA"`.
+  blob.get(3..8) == Some(b"@AMBA")
 }
 
 /// `$$valPt =~ /^(MINOL|CAMER|MLY0|KC|\+M\+M|\xd7)/` — the negative-lookahead
@@ -1438,13 +1462,23 @@ fn minolta_excluded_prefix(blob: &[u8]) -> bool {
 /// comment).
 #[inline]
 fn sony_tf1_prefix(blob: &[u8]) -> bool {
-  blob.len() >= 11 && &blob[..2] == b"\x00\x00" && &blob[2..10] == b"SONY PIC" && blob[10] == 0
+  // The `blob.len() >= 11` guard dominates each window; `blob.get(..)` is the
+  // checked, byte-identical form of the `&blob[..2]` / `&blob[2..10]` / `blob[10]`
+  // reads.
+  blob.len() >= 11
+    && blob.get(..2) == Some(b"\x00\x00")
+    && blob.get(2..10) == Some(b"SONY PIC")
+    && blob.get(10) == Some(&0)
 }
 
 /// `$$valPt =~ /^\d{3}/` — three ASCII digits at the start (Pentax4).
 #[inline]
 fn starts_with_digits(blob: &[u8], n: usize) -> bool {
-  blob.len() >= n && blob[..n].iter().all(|b| b.is_ascii_digit())
+  // `blob.get(..n)` folds the `blob.len() >= n` guard — checked, byte-identical
+  // to `blob[..n].iter().all(...)`.
+  blob
+    .get(..n)
+    .is_some_and(|head| head.iter().all(|b| b.is_ascii_digit()))
 }
 
 /// `$$self{Make} =~ /^prefix/` — `true` if `make` is `Some` and starts
@@ -1469,7 +1503,10 @@ fn make_starts_with_ci(make: Option<&str>, prefix: &str) -> bool {
     Some(m) => {
       let mb = m.as_bytes();
       let pb = prefix.as_bytes();
-      mb.len() >= pb.len() && mb[..pb.len()].eq_ignore_ascii_case(pb)
+      // `mb.get(..pb.len())` folds the `mb.len() >= pb.len()` guard — checked,
+      // byte-identical to `mb[..pb.len()].eq_ignore_ascii_case(pb)`.
+      mb.get(..pb.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(pb))
     }
     None => false,
   }
@@ -1510,20 +1547,27 @@ fn is_pentax_optio_rs(model: Option<&str>) -> bool {
   // `4`, then `30RS`, then trailing whitespace.
   let bytes = stripped.as_bytes();
   // Strip the single optional leading space (the `Optio ?` of the regex).
+  // `bytes.first() == Some(&b' ')` ⇒ `bytes.get(1..)` is `Some` — checked,
+  // byte-identical to `&bytes[1..]`.
   let head = if bytes.first() == Some(&b' ') {
-    &bytes[1..]
+    bytes.get(1..).unwrap_or(bytes)
   } else {
     bytes
   };
   if head.len() < 5 {
     return false;
   }
-  let is_first = matches!(head[0], b'3' | b'4');
-  if !is_first || &head[1..5] != b"30RS" {
+  // The `head.len() < 5` guard makes `head.get(0)` / `head.get(1..5)` /
+  // `head.get(5..)` all `Some` — checked, byte-identical to the `head[0]` /
+  // `&head[1..5]` / `head[5..]` reads.
+  let is_first = matches!(head.first(), Some(b'3' | b'4'));
+  if !is_first || head.get(1..5) != Some(b"30RS") {
     return false;
   }
   // Trailing `\s*` — any/no whitespace.
-  head[5..].iter().all(|b| b.is_ascii_whitespace())
+  head
+    .get(5..)
+    .is_some_and(|tail| tail.iter().all(|b| b.is_ascii_whitespace()))
 }
 
 /// `$$self{Make} =~ /Kodak/i` — the case-insensitive Make test used by the
@@ -1563,17 +1607,20 @@ fn make_eastman_kodak_tc(make: Option<&str>) -> bool {
 /// `\x01\0[\0\x01]\0\0\0\x04\0` then 4 ASCII letters.
 #[inline]
 fn is_kodak2_sig(blob: &[u8]) -> bool {
+  // Every read below is dominated by its branch's `blob.len() >= N` guard, so
+  // each `blob.get(..)` is `Some` — checked, byte-identical to the index forms.
   // Branch A: `^.{8}Eastman Kodak`.
-  let branch_a = blob.len() >= 21 && &blob[8..21] == b"Eastman Kodak";
+  let branch_a = blob.get(8..21) == Some(b"Eastman Kodak");
   // Branch B: `^\x01\0[\0\x01]\0\0\0\x04\0[a-zA-Z]{4}` — byte0=\x01, byte1=\0,
   // byte2 in {\0,\x01}, bytes 3..8 = \0\0\0\x04\0, then 4 ASCII letters
   // (bytes 8..12). 12 bytes total.
-  let branch_b = blob.len() >= 12
-    && blob[0] == 0x01
-    && blob[1] == 0x00
-    && (blob[2] == 0x00 || blob[2] == 0x01)
-    && &blob[3..8] == b"\x00\x00\x00\x04\x00"
-    && blob[8..12].iter().all(u8::is_ascii_alphabetic);
+  let branch_b = blob.get(0) == Some(&0x01)
+    && blob.get(1) == Some(&0x00)
+    && matches!(blob.get(2), Some(0x00 | 0x01))
+    && blob.get(3..8) == Some(b"\x00\x00\x00\x04\x00")
+    && blob
+      .get(8..12)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_alphabetic));
   branch_a || branch_b
 }
 
@@ -1586,7 +1633,8 @@ fn is_kodak3_sig(blob: &[u8]) -> bool {
   if starts_with(blob, b"MM") || starts_with(blob, b"II") || starts_with(blob, b"AOC") {
     return false;
   }
-  blob.len() >= 13 && blob[12] == 0x07
+  // `blob.get(12)` folds the `blob.len() >= 13` guard — byte-identical to `blob[12] == 0x07`.
+  blob.get(12) == Some(&0x07)
 }
 
 /// `MakerNoteKodak4` signature (`MakerNotes.pm:305-306`):
@@ -1598,7 +1646,9 @@ fn is_kodak4_sig(blob: &[u8]) -> bool {
   if starts_with(blob, b"MM") || starts_with(blob, b"II") || starts_with(blob, b"AOC") {
     return false;
   }
-  blob.len() >= 44 && &blob[41..44] == b"JPG"
+  // `blob.get(41..44)` folds the `blob.len() >= 44` guard — byte-identical to
+  // `&blob[41..44] == b"JPG"`.
+  blob.get(41..44) == Some(b"JPG")
 }
 
 /// `MakerNoteKodak5` MODEL test (`MakerNotes.pm:318`):
@@ -1610,13 +1660,15 @@ fn model_matches_kodak5(model: Option<&str>) -> bool {
   const SUFFIXES: [&str; 6] = ["4200", "4230", "4300", "4310", "6200", "6230"];
   let hb = m.as_bytes();
   // Find each "CX" occurrence; check the following 4 bytes against the set.
+  // The `i + 6 <= hb.len()` loop bound makes `hb.get(i..i+2)` / `hb.get(i+2..i+6)`
+  // `Some` — checked, byte-identical to the `&hb[i..i+2]` / `&hb[i+2..i+6]` reads.
   let mut i = 0usize;
   while i + 6 <= hb.len() {
-    if &hb[i..i + 2] == b"CX" {
-      let tail = &hb[i + 2..i + 6];
-      if SUFFIXES.iter().any(|s| s.as_bytes() == tail) {
-        return true;
-      }
+    if hb.get(i..i + 2) == Some(b"CX")
+      && let Some(tail) = hb.get(i + 2..i + 6)
+      && SUFFIXES.iter().any(|s| s.as_bytes() == tail)
+    {
+      return true;
     }
     i += 1;
   }
@@ -1628,12 +1680,14 @@ fn model_matches_kodak5(model: Option<&str>) -> bool {
 /// a two-byte tag at offset 1, then a NUL at offset 3.
 #[inline]
 fn is_kodak5_sig(blob: &[u8]) -> bool {
-  if blob.len() < 4 || blob[0] != 0x00 || blob[3] != 0x00 {
+  // The `blob.len() < 4` guard makes `blob.get(0)` / `blob.get(3)` / `blob.get(1..3)`
+  // all `Some` — checked, byte-identical to the `blob[0]`/`blob[3]`/`&blob[1..3]` reads.
+  if blob.get(0) != Some(&0x00) || blob.get(3) != Some(&0x00) {
     return false;
   }
   matches!(
-    &blob[1..3],
-    b"\x1a\x18" | b"\x3a\x08" | b"\x59\xf8" | b"\x14\x80"
+    blob.get(1..3),
+    Some(b"\x1a\x18" | b"\x3a\x08" | b"\x59\xf8" | b"\x14\x80")
   )
 }
 
@@ -1648,8 +1702,13 @@ fn is_kodak7_sig(blob: &[u8]) -> bool {
     return false;
   }
   let upper_or_digit = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
-  // `[A-Z\d]{3}` at offset 1..4.
-  if blob.len() < 4 || !blob[1..4].iter().all(|&b| upper_or_digit(b)) {
+  // `[A-Z\d]{3}` at offset 1..4. `blob.get(1..4)` folds the `blob.len() < 4`
+  // guard; every `blob.get(..)` below is the checked, byte-identical form of the
+  // corresponding `blob[..]` read under its preceding `blob.len()` bound.
+  if !blob
+    .get(1..4)
+    .is_some_and(|s| s.iter().all(|&b| upper_or_digit(b)))
+  {
     return false;
   }
   // ` ?` then `[A-Z\d]{1,2}\d{2}[A-Z\d]\d{4}[ \0]`. Try with/without the
@@ -1660,31 +1719,40 @@ fn is_kodak7_sig(blob: &[u8]) -> bool {
       // Offsets after the `[CK][A-Z\d]{3}` head (4 bytes):
       let mut p = 4 + space;
       // Optional-space byte must be a space when present.
-      if space == 1 && (blob.len() <= 4 || blob[4] != b' ') {
+      if space == 1 && blob.get(4) != Some(&b' ') {
         continue;
       }
       // `[A-Z\d]{group}`
-      if blob.len() < p + group || !blob[p..p + group].iter().all(|&b| upper_or_digit(b)) {
+      if !blob
+        .get(p..p + group)
+        .is_some_and(|s| s.iter().all(|&b| upper_or_digit(b)))
+      {
         continue;
       }
       p += group;
       // `\d{2}`
-      if blob.len() < p + 2 || !blob[p..p + 2].iter().all(u8::is_ascii_digit) {
+      if !blob
+        .get(p..p + 2)
+        .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+      {
         continue;
       }
       p += 2;
       // `[A-Z\d]`
-      if blob.len() <= p || !upper_or_digit(blob[p]) {
+      if !blob.get(p).is_some_and(|&b| upper_or_digit(b)) {
         continue;
       }
       p += 1;
       // `\d{4}`
-      if blob.len() < p + 4 || !blob[p..p + 4].iter().all(u8::is_ascii_digit) {
+      if !blob
+        .get(p..p + 4)
+        .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+      {
         continue;
       }
       p += 4;
       // `[ \0]`
-      if blob.len() > p && (blob[p] == b' ' || blob[p] == 0x00) {
+      if matches!(blob.get(p), Some(b' ' | 0x00)) {
         return true;
       }
     }
@@ -1698,22 +1766,23 @@ fn is_kodak7_sig(blob: &[u8]) -> bool {
 /// headers (a plausible entry count + first-entry format/count probe).
 #[inline]
 fn is_kodak8a_sig(blob: &[u8]) -> bool {
+  // Each `blob.get(i)` below is the checked, byte-identical form of `blob[i]`
+  // under its branch's `blob.len() >= N` guard (a `None` short-circuits the
+  // `&&`/`is_some_and` to `false`, exactly as the explicit length check did).
   // Branch 1: `\0 [\x02-\x7f] . . \0 [\x01-\x0c] \0 \0` (8 bytes).
-  let b1 = blob.len() >= 8
-    && blob[0] == 0x00
-    && (0x02..=0x7f).contains(&blob[1])
-    && blob[4] == 0x00
-    && (0x01..=0x0c).contains(&blob[5])
-    && blob[6] == 0x00
-    && blob[7] == 0x00;
+  let b1 = blob.get(0) == Some(&0x00)
+    && blob.get(1).is_some_and(|&b| (0x02..=0x7f).contains(&b))
+    && blob.get(4) == Some(&0x00)
+    && blob.get(5).is_some_and(|&b| (0x01..=0x0c).contains(&b))
+    && blob.get(6) == Some(&0x00)
+    && blob.get(7) == Some(&0x00);
   // Branch 2: `[\x02-\x7f] \0 . . [\x01-\x0c] \0 . . \0 \0` (10 bytes).
-  let b2 = blob.len() >= 10
-    && (0x02..=0x7f).contains(&blob[0])
-    && blob[1] == 0x00
-    && (0x01..=0x0c).contains(&blob[4])
-    && blob[5] == 0x00
-    && blob[8] == 0x00
-    && blob[9] == 0x00;
+  let b2 = blob.get(0).is_some_and(|&b| (0x02..=0x7f).contains(&b))
+    && blob.get(1) == Some(&0x00)
+    && blob.get(4).is_some_and(|&b| (0x01..=0x0c).contains(&b))
+    && blob.get(5) == Some(&0x00)
+    && blob.get(8) == Some(&0x00)
+    && blob.get(9) == Some(&0x00);
   b1 || b2
 }
 
@@ -1722,11 +1791,14 @@ fn is_kodak8a_sig(blob: &[u8]) -> bool {
 /// (byte 8 = NUL, byte 9 = any, bytes 10-11 = NUL). 12 bytes.
 #[inline]
 fn is_kodak8b_sig(blob: &[u8]) -> bool {
+  // The `blob.len() >= 12` guard dominates each read; `blob.get(..)` is the
+  // checked, byte-identical form of the `&blob[..8]`/`blob[8]`/`blob[10]`/`blob[11]`
+  // reads.
   blob.len() >= 12
-    && &blob[..8] == b"MM\x00\x2a\x00\x00\x00\x08"
-    && blob[8] == 0x00
-    && blob[10] == 0x00
-    && blob[11] == 0x00
+    && blob.get(..8) == Some(b"MM\x00\x2a\x00\x00\x00\x08")
+    && blob.get(8) == Some(&0x00)
+    && blob.get(10) == Some(&0x00)
+    && blob.get(11) == Some(&0x00)
 }
 
 /// `MakerNoteKodak8c` signature (`MakerNotes.pm:405`):
@@ -1745,19 +1817,27 @@ fn is_kodak8c_sig(blob: &[u8]) -> bool {
 /// digits, a trailing space). 31 bytes total.
 #[inline]
 fn is_kodak9_sig(blob: &[u8]) -> bool {
-  if blob.len() < 31 || &blob[..4] != b"IIII" {
+  // The `blob.len() < 31` guard makes every `blob.get(..)` below `Some` —
+  // checked, byte-identical to the index forms.
+  if blob.len() < 31 || blob.get(..4) != Some(b"IIII") {
     return false;
   }
-  if (blob[4] != 0x02 && blob[4] != 0x03) || blob[5] != 0x00 {
+  if !matches!(blob.get(4), Some(0x02 | 0x03)) || blob.get(5) != Some(&0x00) {
     return false;
   }
   // bytes 6..20 are the `.{14}` wildcard run (any bytes). The date field:
-  blob[20..24].iter().all(u8::is_ascii_digit)
-    && blob[24] == b'/'
-    && blob[25..27].iter().all(u8::is_ascii_digit)
-    && blob[27] == b'/'
-    && blob[28..30].iter().all(u8::is_ascii_digit)
-    && blob[30] == b' '
+  blob
+    .get(20..24)
+    .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+    && blob.get(24) == Some(&b'/')
+    && blob
+      .get(25..27)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+    && blob.get(27) == Some(&b'/')
+    && blob
+      .get(28..30)
+      .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+    && blob.get(30) == Some(&b' ')
 }
 
 /// `MakerNoteKodak10` signature (`MakerNotes.pm:432`):
@@ -1765,13 +1845,19 @@ fn is_kodak9_sig(blob: &[u8]) -> bool {
 /// (`MM`/`II`) immediately followed by the IFD entry count. 4 bytes.
 #[inline]
 fn is_kodak10_sig(blob: &[u8]) -> bool {
+  // The `blob.len() < 4` guard makes every `blob.get(..)` below `Some` —
+  // checked, byte-identical to the `&blob[..3]`/`blob[3]`/`&blob[..2]`/`blob[2]`
+  // reads.
   if blob.len() < 4 {
     return false;
   }
   // BE: `MM \0 [\x02-\x7f]`.
-  let be = &blob[..3] == b"MM\x00" && (0x02..=0x7f).contains(&blob[3]);
+  let be =
+    blob.get(..3) == Some(b"MM\x00") && blob.get(3).is_some_and(|&b| (0x02..=0x7f).contains(&b));
   // LE: `II [\x02-\x7f] \0`.
-  let le = &blob[..2] == b"II" && (0x02..=0x7f).contains(&blob[2]) && blob[3] == 0x00;
+  let le = blob.get(..2) == Some(b"II")
+    && blob.get(2).is_some_and(|&b| (0x02..=0x7f).contains(&b))
+    && blob.get(3) == Some(&0x00);
   be || le
 }
 
@@ -1800,7 +1886,11 @@ fn model_matches_kodak(model: Option<&str>) -> bool {
 /// via `/s`). 12 bytes total.
 #[inline]
 fn is_kodak11_le_ifd(blob: &[u8]) -> bool {
-  blob.len() >= 12 && &blob[..8] == b"II\x2a\x00\x08\x00\x00\x00" && &blob[9..12] == b"\x00\x00\x00"
+  // The `blob.len() >= 12` guard makes both windows `Some` — checked,
+  // byte-identical to the `&blob[..8]` / `&blob[9..12]` reads.
+  blob.len() >= 12
+    && blob.get(..8) == Some(b"II\x2a\x00\x08\x00\x00\x00")
+    && blob.get(9..12) == Some(b"\x00\x00\x00")
 }
 
 /// `MakerNoteKodak12` blob signature (`MakerNotes.pm:463`):
@@ -1809,7 +1899,9 @@ fn is_kodak11_le_ifd(blob: &[u8]) -> bool {
 /// via `/s`). 12 bytes total.
 #[inline]
 fn is_kodak12_be_ifd(blob: &[u8]) -> bool {
-  blob.len() >= 12 && &blob[..11] == b"MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00"
+  // `blob.get(..11)` folds the `blob.len() >= 12` guard — checked, byte-identical
+  // to `&blob[..11] == b"MM\x00\x2a..."`.
+  blob.len() >= 12 && blob.get(..11) == Some(b"MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00")
 }
 
 /// `$$self{Make} =~ /^(PENTAX )?RICOH/`.
@@ -1860,24 +1952,26 @@ fn model_matches_sanyo_c4(model: Option<&str>) -> bool {
 /// byte of the entry's tag id.
 #[inline]
 fn is_samsung2_sig(blob: &[u8]) -> bool {
-  if blob.len() < 14 || &blob[10..14] != b"0100" {
+  // The `blob.len() < 14` guard makes every `blob.get(..)` below `Some` —
+  // checked, byte-identical to the index forms.
+  if blob.len() < 14 || blob.get(10..14) != Some(b"0100") {
     return false;
   }
   // Branch A (BE): `\0 . \0 \x01 \0 \x07 \0 \0 \0 \x04`.
-  let branch_a = blob[0] == 0x00
-    && blob[2] == 0x00
-    && blob[3] == 0x01
-    && blob[4] == 0x00
-    && blob[5] == 0x07
-    && &blob[6..10] == b"\x00\x00\x00\x04";
+  let branch_a = blob.get(0) == Some(&0x00)
+    && blob.get(2) == Some(&0x00)
+    && blob.get(3) == Some(&0x01)
+    && blob.get(4) == Some(&0x00)
+    && blob.get(5) == Some(&0x07)
+    && blob.get(6..10) == Some(b"\x00\x00\x00\x04");
   // Branch B (LE): `. \0 \x01 \0 \x07 \0 \x04 \0 \0 \0`.
-  let branch_b = blob[1] == 0x00
-    && blob[2] == 0x01
-    && blob[3] == 0x00
-    && blob[4] == 0x07
-    && blob[5] == 0x00
-    && blob[6] == 0x04
-    && &blob[7..10] == b"\x00\x00\x00";
+  let branch_b = blob.get(1) == Some(&0x00)
+    && blob.get(2) == Some(&0x01)
+    && blob.get(3) == Some(&0x00)
+    && blob.get(4) == Some(&0x07)
+    && blob.get(5) == Some(&0x00)
+    && blob.get(6) == Some(&0x04)
+    && blob.get(7..10) == Some(b"\x00\x00\x00");
   branch_a || branch_b
 }
 
@@ -1892,7 +1986,9 @@ fn is_reconyx_hyperfire(blob: &[u8], make: Option<&str>) -> bool {
     return false;
   }
   // The optional `([\x02\x03]\x00)` group — `$1` is set iff it matched.
-  let group_matched = blob.len() >= 4 && (blob[2] == 0x02 || blob[2] == 0x03) && blob[3] == 0x00;
+  // `blob.get(2)`/`blob.get(3)` fold the `blob.len() >= 4` guard — checked,
+  // byte-identical to `(blob[2] == 0x02 || blob[2] == 0x03) && blob[3] == 0x00`.
+  let group_matched = matches!(blob.get(2), Some(0x02 | 0x03)) && blob.get(3) == Some(&0x00);
   group_matched || make_eq(make, "RECONYX")
 }
 
@@ -1905,13 +2001,17 @@ fn is_ricoh2_padded_ifd(blob: &[u8]) -> bool {
   if blob.len() < 12 {
     return false;
   }
+  // The `blob.len() < 12` guard makes every window `Some` — checked,
+  // byte-identical to the `&blob[..8]`/`blob[8]`/`&blob[10..12]`/`&blob[9..12]` reads.
   // BE `MM\0\x2a\0\0\0\x08\0.\0\0`: bytes 0..8 = `MM\0\x2a\0\0\0\x08`,
   // byte 8 = `\0`, byte 9 = wildcard (`.`), bytes 10..12 = `\0\0`.
-  let be =
-    &blob[..8] == b"MM\x00\x2a\x00\x00\x00\x08" && blob[8] == 0x00 && &blob[10..12] == b"\x00\x00";
+  let be = blob.get(..8) == Some(b"MM\x00\x2a\x00\x00\x00\x08")
+    && blob.get(8) == Some(&0x00)
+    && blob.get(10..12) == Some(b"\x00\x00");
   // LE `II\x2a\0\x08\0\0\0.\0\0\0`: bytes 0..8 = `II\x2a\0\x08\0\0\0`,
   // byte 8 = wildcard (`.`), bytes 9..12 = `\0\0\0`.
-  let le = &blob[..8] == b"II\x2a\x00\x08\x00\x00\x00" && &blob[9..12] == b"\x00\x00\x00";
+  let le = blob.get(..8) == Some(b"II\x2a\x00\x08\x00\x00\x00")
+    && blob.get(9..12) == Some(b"\x00\x00\x00");
   be || le
 }
 
@@ -1952,10 +2052,16 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
     return false;
   }
   for window_start in 0..=(hb.len() - nb.len()) {
-    if hb[window_start..window_start + nb.len()]
-      .iter()
-      .zip(nb.iter())
-      .all(|(h, n)| h.to_ascii_lowercase() == *n)
+    // The loop bound `window_start <= hb.len() - nb.len()` makes
+    // `hb.get(window_start..window_start + nb.len())` `Some` — checked,
+    // byte-identical to the `hb[window_start..window_start + nb.len()]` window.
+    if hb
+      .get(window_start..window_start + nb.len())
+      .is_some_and(|w| {
+        w.iter()
+          .zip(nb.iter())
+          .all(|(h, n)| h.to_ascii_lowercase() == *n)
+      })
     {
       return true;
     }
@@ -1968,6 +2074,11 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 // =============================================================================
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 

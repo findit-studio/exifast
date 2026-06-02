@@ -60,6 +60,14 @@
 //!
 //! No public fields. Every accessor is `const fn` where possible.
 
+// Golden-v2 Contract 3c (Phase C, slice w2d): panic-safety by construction —
+// every raw index/slice in this Canon MakerNote dispatcher is dominated by a
+// preceding length/offset guard and converted to a checked `.get()` form. The
+// parent `exif` deny propagates here; this file-level deny re-asserts it (the
+// sibling Canon submodules + this `mod.rs` re-assert over the makernotes
+// `#![allow]` shim while the rest of the subtree stays slice E's scope).
+#![deny(clippy::indexing_slicing)]
+
 pub mod af_info;
 pub mod body;
 pub mod camera_settings;
@@ -738,7 +746,10 @@ fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
     return None;
   }
   let pos = 2 * 25;
-  let arr: [u8; 2] = [bytes[pos], bytes[pos + 1]];
+  // The `bytes.len() < 52` guard makes `bytes.get(pos..pos+2)` (`pos == 50`)
+  // `Some` and its `try_into()` to `[u8; 2]` succeed — the checked,
+  // byte-identical form of `[bytes[pos], bytes[pos+1]]`.
+  let arr: [u8; 2] = bytes.get(pos..pos + 2)?.try_into().ok()?;
   let raw_int = match parent_order {
     ByteOrder::Little => i16::from_le_bytes(arr),
     ByteOrder::Big => i16::from_be_bytes(arr),
@@ -756,7 +767,11 @@ fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
 /// NOT treated as all-zero (bundled would still enter the SubDirectory and
 /// let `ProcessSerialData` decode whatever fits).
 fn first4_all_zero(blob: &[u8]) -> bool {
-  blob.len() >= 4 && blob[..4].iter().all(|&b| b == 0)
+  // `blob.get(..4)` folds the `blob.len() >= 4` guard into the access — the
+  // checked, byte-identical form of `blob.len() >= 4 && blob[..4].iter()...`.
+  blob
+    .get(..4)
+    .is_some_and(|head| head.iter().all(|&b| b == 0))
 }
 
 /// Reserialize a RawValue (int16s/int16u/Bytes) back into bytes in the
@@ -795,6 +810,11 @@ fn reserialize_int_array(raw: &RawValue, order: ByteOrder) -> Vec<u8> {
 }
 
 #[cfg(test)]
+// The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
+// contract (Phase C w2d); the test fixtures index fixed-layout buffers freely
+// (an out-of-range index is a test-assertion failure, not a shipped panic), so
+// the deny is relaxed here.
+#[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
 
