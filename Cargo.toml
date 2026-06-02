@@ -254,7 +254,7 @@ proptest = "1"
 # Golden-v2 C4 — `benches/extract.rs` throughput baselines for the perf
 # contract. `default-features = false` drops criterion's `rayon`/`plotters`
 # pull-in (we only need the timing loop); dev-only, no runtime/feature impact.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "extract"
