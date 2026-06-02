@@ -114,7 +114,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
 /// with paired `.json` + `.n.json` goldens, minus [`NOT_ACTIVE`]). Bumped per
 /// Codex round; see the long comment block in
-/// [`typed_serde_path_equals_writer_path_and_golden_all_336`] for the history.
+/// [`typed_serde_path_equals_writer_path_and_golden_all_337`] for the history.
 ///
 /// Post-rebase (lib/plist golden-migration onto main): main's 275 ACTIVE
 /// fixtures PLUS the 52 ACTIVE PLIST fixtures from this branch = 327. The
@@ -125,7 +125,11 @@ const NOT_ACTIVE: &[&str] = &[
 /// Golden-v2 Phase C (`[minor]`/`[x$n]` diagnostics): +2 — `ID3_dup_short_frame.mp3`
 /// (the ` [x2]` multi-warning count) + `Exif_excessive_count.tif` (the `[Minor]`
 /// ignorable-2 prefix). 341 → 343.
-const EXPECTED_ACTIVE_FIXTURES: usize = 343;
+///
+/// Post-rebase (lib/m2ts golden-migration onto golden-v2 main): main's 343
+/// ACTIVE fixtures PLUS the single ACTIVE M2TS fixture (`M2TS.mts`) from this
+/// branch = 344.
+const EXPECTED_ACTIVE_FIXTURES: usize = 344;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
@@ -249,7 +253,7 @@ fn typed_serde_document(fixture: &str, data: &[u8], print_on: bool) -> String {
 }
 
 #[test]
-fn typed_serde_path_equals_writer_path_and_golden_all_336() {
+fn typed_serde_path_equals_writer_path_and_golden_all_337() {
   // 121 → 124 after F2 (Codex adversarial): added MPC + WavPack chain
   // fixtures (mpc_with_id3v2_prefix.mpc, mpc_with_apev2_trailer.mpc,
   // wavpack_with_apev2_trailer.wv). These exercise the ID3-prefix /
@@ -1242,6 +1246,15 @@ fn typed_serde_path_equals_writer_path_and_golden_all_336() {
   // as ordinary TAGs by each format's `tags()` — like QuickTime's
   // `Track<N>:Warning` — so the typed-serde path matches the writer + golden;
   // only DOCUMENT-level `ExifTool:Warning`/`:Error` still ride `run_diagnostics`.)
+  // ----- FORMATS.md row 25 (M2TS / AVCHD) -------------------------------
+  // 343 → 344 after FORMATS.md row 25 lib/m2ts (rebased onto golden-v2 main):
+  // added `M2TS.mts` (bundled `t/images/M2TS.mts`, a Canon AVCHD camcorder
+  // file). Exercises the MPEG-2 TS / BDAV packet walker (probe + PAT/PMT/PES
+  // demux), the AC-3 descriptor + PES sample-rate decode, and the M2TS → H.264
+  // PES-payload forward into the existing `H264::ParseH264Video` port
+  // (M2TS.pm:343-345). Golden-migrated onto the `Taggable`/`Project` engine
+  // (the M2TS Meta emits its own `M2TS:*` / `AC3:*` tags and chains the nested
+  // H.264 sub-Meta's `tags()` stream).
   let root = env!("CARGO_MANIFEST_DIR");
   let fixtures = active_fixtures();
   assert_eq!(

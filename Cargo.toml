@@ -62,7 +62,7 @@ json = ["serde", "alloc", "dep:serde_json", "dep:serde"]
 # Umbrella — enables every per-format gate.
 all-formats = [
   "aac", "aiff", "ape", "audible", "crw", "dsf", "dv", "exif", "flac", "flash",
-  "gps", "h264", "id3", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
+  "gps", "h264", "id3", "m2ts", "matroska", "mp3", "mpc", "moi", "mxf", "ogg",
   "plist", "png", "quicktime", "real", "red", "riff", "wavpack",
 ]
 
@@ -128,6 +128,15 @@ gps        = ["exif"]
 # cross-format chains; ports the NAL/SEI/MDPM walker + Exp-Golomb SPS parser.
 h264       = []
 id3        = []
+# `m2ts` — MPEG-2 Transport Stream / AVCHD (FORMATS.md row 25). Reuses the
+# `h264` engine module to decode H.264 PES payloads for AVCHD camera
+# metadata (M2TS.pm:343-351 `H264::ParseH264Video`); without that edge a
+# `--features std,m2ts` build fails to compile. AC-3 / MPEG-1/2 audio is
+# decoded inline (faithful to the small `%M2TS::AC3` ProcessBinaryData and
+# the AC-3 PES sample-rate scan, M2TS.pm:251-280); the MPEG-1/2 video/audio
+# arm is a deferred forward item (`mpeg-audio` is the AUDIO frame parser,
+# not the video).
+m2ts       = ["h264"]
 # `matroska` — engine-only per FORMATS.md row 23. Leaf format (no
 # cross-format chains); ports the entire EBML walker + tag table.
 matroska   = []

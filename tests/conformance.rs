@@ -478,6 +478,40 @@ fn mxf_multidescriptor_conformance() {
 }
 
 #[test]
+fn m2ts_conformance() {
+  // FORMATS.md row 25 (M2TS / AVCHD camcorder container).
+  // `tests/fixtures/M2TS.mts` is the bundled `lib/Image/ExifTool/t/images/
+  // M2TS.mts` (1344 bytes — a Canon AVCHD camcorder file: PAT @ PID 0x0
+  // → PMT @ PID 0x0100 → H.264 video @ PID 0x1011 + AC-3 audio @ PID
+  // 0x1100 with 192-byte BDAV-prefixed packets). Exercises:
+  //
+  // - 192-byte (BDAV) vs 188-byte (raw) packet stride detection
+  //   (M2TS.pm:594-615);
+  // - PAT (table id 0) → PMT (table id 2) walker (M2TS.pm:817-894);
+  // - AC-3 stream-descriptor decode in the PMT ES-loop (M2TS.pm:887-890
+  //   `ParseAC3Descriptor`) ⇒ `AC3:AudioBitrate` / `SurroundMode` /
+  //   `AudioChannels`;
+  // - AC-3 PES payload sample-rate scan (M2TS.pm:253-261 `ParseAC3Audio`)
+  //   ⇒ `AC3:AudioSampleRate`;
+  // - H.264 PES payload forward to the existing `H264::ParseH264Video`
+  //   port (M2TS.pm:343-345);
+  // - Final flush of partial PID streams at EOF (M2TS.pm:1009-1013);
+  // - The bundled minor warning when an H.264 stream was seen and
+  //   `ExtractEmbedded` is off (M2TS.pm:349-351);
+  // - `SetFileType(M2TS)` for a 4-byte timecode prefix (M2TS.pm:617),
+  //   driven via `FileTypeFinalize::Explicit`.
+  //
+  // Goldens are bundled `perl exiftool -j -G1 -struct` output with
+  // `System:*` stripped (the engine emits no `System:*`) AND
+  // `Composite:*` stripped (the Composite engine isn't yet ported; the
+  // bundled M2TS output has `Composite:ImageSize` / `Composite:Megapixels`
+  // / `Composite:ShutterSpeed` synthesized from `H264:*` — a follow-up
+  // deferral).
+  check("M2TS.mts", "M2TS.mts.json", true);
+  check("M2TS.mts", "M2TS.mts.n.json", false);
+}
+
+#[test]
 fn quicktime_nested_size0_conformance() {
   // PR #38 Codex R1/F5: a SYNTHETIC `.mov` whose `moov` contains a size-0
   // `free` atom (a CONTAINED zero-size = terminator, QuickTime.pm:10036-
