@@ -64,6 +64,21 @@ use crate::{
   value::{Metadata, TagValue},
 };
 
+/// The xtask-GENERATED `%MPC::Main` table (`cargo xtask gen-tables --kind
+/// tagdef --module MPC::Main`), transcribed from `exiftool -listx`. Consulted
+/// by [`mpc_get`] ONLY as the ADDITIVE fallback — the hand-written `static`s
+/// below shadow every key they define (hand wins on collision). This is
+/// load-bearing in two places `-listx` cannot express: (1) `EncoderVersion`'s
+/// `PrintConv::Func` substitution (the generated twin is `PrintConv::None`),
+/// and (2) `Quality`, where Perl's quoted-string labels (`5 => '0'`, `14 =>
+/// '9'`, …) are STRINGS — the generated `-listx` path mis-types them as
+/// `PrintValue::I64`, so the hand `QUALITY` (all `PrintValue::Str`) must win to
+/// keep `-j` byte-identical. The generated table contributes 0 new tags and
+/// exists as the drift guard (`tests/xtask_check.rs`) against a future
+/// ExifTool-version change.
+#[path = "mpc_generated.rs"]
+mod generated;
+
 // ===========================================================================
 // `%MPC::Main` tag table (MPC.pm:21-72)
 //
@@ -246,7 +261,14 @@ static ENCODER_VERSION: TagDef = TagDef::new(
 );
 
 fn mpc_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (the additive-codegen invariant, mirroring XMP `lookup_field`):
+  // the hand `static`s WIN on every key they define, so no existing golden can
+  // shift. `QUALITY` (string labels vs the generated `-listx` int mis-typing)
+  // and `ENCODER_VERSION` (`PrintConv::Func` vs the generated `None`) are the
+  // load-bearing collisions. The hand layer is complete for the 11 `%MPC::Main`
+  // ids, so the generated [`generated::get`] arm never fires — it is the drift
+  // guard, not new coverage.
+  let hand = match id {
     TagId::Str("Bit032-063") => Some(&TOTAL_FRAMES),
     TagId::Str("Bit080-081") => Some(&SAMPLE_RATE),
     TagId::Str("Bit084-087") => Some(&QUALITY),
@@ -259,7 +281,8 @@ fn mpc_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Str("Bit191") => Some(&GAPLESS),
     TagId::Str("Bit216-223") => Some(&ENCODER_VERSION),
     _ => None,
-  }
+  };
+  hand.or_else(|| generated::get(id))
 }
 
 /// `%MPC::Main` (MPC.pm:21-72). family-0 group "MPC"; family-1 "MPC".

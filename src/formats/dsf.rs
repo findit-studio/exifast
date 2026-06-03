@@ -45,6 +45,17 @@ use crate::{
   value::{Group, Metadata, TagValue},
 };
 
+/// The xtask-GENERATED `%DSF::Main` table (`cargo xtask gen-tables --kind
+/// tagdef --module DSF::Main`), transcribed from `exiftool -listx`. Consulted
+/// by [`dsf_get`] ONLY as the ADDITIVE fallback — the hand-written `static`s
+/// below shadow every key they define (hand wins on collision). The two layers
+/// are byte-identical for the 8 declarative `%DSF::Main` tags, so the generated
+/// fallback never actually fires here; it exists as the drift guard
+/// (`tests/xtask_check.rs`) against a future ExifTool-version change, NOT as new
+/// coverage (it contributes 0 new tags).
+#[path = "dsf_generated.rs"]
+mod generated;
+
 // ===========================================================================
 // Static tag table — `%DSF::Main` (DSF.pm:20-49)
 // ===========================================================================
@@ -106,7 +117,12 @@ static BLOCK_SIZE: TagDef = TagDef::new("BlockSize", "File", ValueConv::None, Pr
 /// family-2 'Audio' is not emitted under `-G1`). Keyed by integer
 /// (`TagId::Int`) — contrast AAC which is string-keyed.
 fn dsf_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (the additive-codegen invariant, mirroring XMP `lookup_field`):
+  // the hand `static`s WIN on every key they define, so no existing golden can
+  // shift. The xtask-generated [`generated::get`] is consulted ONLY as the
+  // fallback. For `%DSF::Main` the hand layer is complete (all 8 ids), so the
+  // generated arm never fires — it is the drift guard, not new coverage.
+  let hand = match id {
     TagId::Int(3) => Some(&FORMAT_VERSION),
     TagId::Int(4) => Some(&FORMAT_ID),
     TagId::Int(5) => Some(&CHANNEL_TYPE),
@@ -116,7 +132,8 @@ fn dsf_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Int(9) => Some(&SAMPLE_COUNT),
     TagId::Int(11) => Some(&BLOCK_SIZE),
     _ => None,
-  }
+  };
+  hand.or_else(|| generated::get(id))
 }
 
 /// `%Image::ExifTool::DSF::Main` (DSF.pm:20). Family-0 group `"File"`

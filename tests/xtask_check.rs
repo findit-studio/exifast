@@ -55,12 +55,15 @@ fn have_cargo() -> bool {
     .unwrap_or(false)
 }
 
-#[test]
-#[cfg_attr(
-  miri,
-  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
-)]
-fn committed_xmp_table_matches_generator() {
+/// Shared body for every `--check` drift assertion: regenerate `module` (in the
+/// `kind` vocabulary) IN MEMORY and fail if it differs from the committed `out`.
+/// Skips *gracefully* (returns) when the generator's toolchain (bundled
+/// ExifTool / perl / cargo) is absent, so a clean checkout / a CI runner without
+/// it never breaks. The nested `cargo run -p xtask` uses a SEPARATE, stable
+/// target dir so it cannot deadlock on the outer test's build lock, and
+/// `RUSTFLAGS` is cleared so the lib's #55/FU-15 dead-code baseline does not
+/// turn a `-Dwarnings` build into a false drift report.
+fn assert_no_drift(module: &str, kind: &str, out: &str) {
   let root = env!("CARGO_MANIFEST_DIR");
 
   let Some(exiftool) = exiftool_script(root) else {
@@ -91,9 +94,11 @@ fn committed_xmp_table_matches_generator() {
       "--",
       "gen-tables",
       "--module",
-      "XMP",
+      module,
+      "--kind",
+      kind,
       "--out",
-      "src/formats/xmp/tables_generated.rs",
+      out,
       "--check",
     ])
     .current_dir(root)
@@ -110,8 +115,51 @@ fn committed_xmp_table_matches_generator() {
 
   assert!(
     status.success(),
-    "committed src/formats/xmp/tables_generated.rs has DRIFTED from the generator \
-     (exiftool -listx 13.59). Regenerate with `EXIFTOOL=… cargo xtask gen-tables \
-     --module XMP --out src/formats/xmp/tables_generated.rs` and commit the result."
+    "committed {out} has DRIFTED from the generator (exiftool -listx 13.59). \
+     Regenerate with `EXIFTOOL=… cargo xtask gen-tables --module {module} \
+     --kind {kind} --out {out}` and commit the result."
   );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_xmp_table_matches_generator() {
+  // The XMP table is the `field` vocabulary (the `--module XMP` whole-group
+  // path); kind defaults to `field`, passed explicitly here for symmetry.
+  assert_no_drift("XMP", "field", "src/formats/xmp/tables_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_dsf_table_matches_generator() {
+  // `%DSF::Main` in the generic `tagdef` vocabulary (the audio/container tag
+  // tables). Drift here means a 13.x ExifTool bump changed `DSF::Main`'s tags /
+  // value-maps; the hand table in `src/formats/dsf.rs` must then be re-reviewed.
+  assert_no_drift("DSF::Main", "tagdef", "src/formats/dsf_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_aac_table_matches_generator() {
+  // `%AAC::Main` in the generic `tagdef` vocabulary.
+  assert_no_drift("AAC::Main", "tagdef", "src/formats/aac_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_mpc_table_matches_generator() {
+  // `%MPC::Main` in the generic `tagdef` vocabulary.
+  assert_no_drift("MPC::Main", "tagdef", "src/formats/mpc_generated.rs");
 }
