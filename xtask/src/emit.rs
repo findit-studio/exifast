@@ -311,15 +311,34 @@ pub fn emit_tagdef_table(model: &TableModel) -> String {
   // a `<values>` map; emitting them unconditionally would be an `unused_imports`
   // warning (the `-Dwarnings` gate) for a map-less table (e.g. FLAC StreamInfo).
   let mut needs_hash_imports = false;
+  // The `static <IDENT>` name derives from the tag NAME ([`static_ident`]), but
+  // ExifTool aliases distinct frame ids to one name (e.g. ID3v2.2 `GP1` AND
+  // `TT1` → `Grouping`; v2.4 `TSOT`/`XSOT` → `TitleSortOrder`). Those aliases
+  // share an IDENTICAL `TagDef` body, so emit each `static` ONCE (keyed by its
+  // ident) and point every alias's `get` arm at the single static — a faithful,
+  // lossless collapse (the alternative, duplicate `static` decls, is an `E0428`
+  // "defined multiple times"). If two ids ever produced the same ident with a
+  // DIFFERENT body, the generator would be unsound, so assert that never holds.
+  let mut emitted: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
   for t in &model.tags {
     let sname = static_ident(leaf, &t.name);
     let pc = tagdef_print_conv(group0, leaf, t, &mut map_consts, &mut needs_hash_imports);
-    let _ = writeln!(
-      statics,
-      "static {sname}: TagDef =\n  TagDef::new({:?}, {:?}, ValueConv::None, {});",
+    let decl = format!(
+      "static {sname}: TagDef =\n  TagDef::new({:?}, {:?}, ValueConv::None, {});\n",
       t.name, group1, pc
     );
+    match emitted.get(&sname) {
+      None => {
+        statics.push_str(&decl);
+        emitted.insert(sname.clone(), decl);
+      }
+      Some(prev) => assert_eq!(
+        prev, &decl,
+        "static ident `{sname}` would be emitted with two DIFFERENT bodies \
+         (aliased ids must share an identical TagDef); generator is unsound"
+      ),
+    }
     let key = tagid_key(&t.id);
     let _ = writeln!(arms, "    {key} => Some(&{sname}),");
   }

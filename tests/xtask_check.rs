@@ -276,3 +276,85 @@ fn committed_ogg_vorbis_table_matches_generator() {
   // re-review the hand `vorbis_comment_known` in `src/formats/ogg.rs`.
   assert_no_drift("Vorbis::Comments", "tagdef", "src/formats/ogg_generated.rs");
 }
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_dv_table_matches_generator() {
+  // `%DV::Main` — drift guard ONLY (DV emits via the typed `Meta`/`Taggable`
+  // path that iterates the fixed `DV_TAGS` order; the `dv_get` lookup is never
+  // on the emission path). Drift means a 13.x ExifTool bump changed `DV::Main`;
+  // re-review the hand table in `src/formats/dv.rs` (which carries the
+  // `ConvertDuration`/`ConvertBitrate`/FrameRate/`ConvertDateTime` PrintConvs
+  // `-listx` cannot express).
+  assert_no_drift("DV::Main", "tagdef", "src/formats/dv_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_id3_v1_table_matches_generator() {
+  // `%ID3::v1` — drift guard ONLY (ID3v1 emits via the hand binary-table walk
+  // keyed by byte offset, not a flat `TagId` lookup). Drift means the ID3v1
+  // field set / Genre map shifted; re-review `src/formats/id3/v1.rs`.
+  assert_no_drift("ID3::v1", "tagdef", "src/formats/id3/v1_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_id3_v1_enh_table_matches_generator() {
+  // `%ID3::v1_Enh` — drift guard ONLY (the Enhanced-TAG trailer emits via the
+  // hand binary-table walk keyed by byte offset). Drift means the v1_Enh field
+  // set / Speed map shifted; re-review `src/formats/id3/v1_enh.rs`.
+  assert_no_drift(
+    "ID3::v1_Enh",
+    "tagdef",
+    "src/formats/id3/v1_enh_generated.rs",
+  );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_id3_v2_2_table_matches_generator() {
+  // `%ID3::v2_2` — drift guard ONLY (v2.2 frames emit via the hand `v2_2_get`
+  // lookup + `make_tag_name`/SubDirectory routing, of which the generated `get`
+  // is a parallel copy). Drift means the v2.2 frame-id set / a PrintConv map
+  // shifted; re-review `src/formats/id3/v2_2.rs`.
+  assert_no_drift("ID3::v2_2", "tagdef", "src/formats/id3/v2_2_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_id3_v2_3_table_matches_generator() {
+  // `%ID3::v2_3` — drift guard ONLY (v2.3 frames emit via the hand `v2_3_get`
+  // lookup = `%id3v2_common` + the v2.3-only frames). Drift means the v2.3
+  // frame-id set shifted; re-review `src/formats/id3/v2_3.rs` +
+  // `src/formats/id3/v2_common.rs`.
+  assert_no_drift("ID3::v2_3", "tagdef", "src/formats/id3/v2_3_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_id3_v2_4_table_matches_generator() {
+  // `%ID3::v2_4` — drift guard ONLY (v2.4 frames emit via the hand `v2_4_get`
+  // lookup = `%id3v2_common` + the v2.4-only frames). Drift means the v2.4
+  // frame-id set shifted; re-review `src/formats/id3/v2_4.rs` +
+  // `src/formats/id3/v2_common.rs`.
+  assert_no_drift("ID3::v2_4", "tagdef", "src/formats/id3/v2_4_generated.rs");
+}

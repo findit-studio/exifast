@@ -12,6 +12,18 @@ use crate::{
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
 };
 
+/// xtask-GENERATED `%ID3::v2_3` table (`cargo xtask gen-tables --kind tagdef
+/// --module ID3::v2_3`) — DRIFT-GUARD ONLY (no wire). v2.3 frames emit through
+/// the hand [`v2_3_get`] lookup (`%id3v2_common` + the v2.3-only frames) +
+/// `text::make_tag_name` / SubDirectory routing; the generated `get` is a
+/// parallel copy with no caller — `#[allow(dead_code)]`. The committed table
+/// exists solely so `tests/xtask_check.rs` fails if a future ExifTool version
+/// shifts `%v2_3`. (The hand layer is a SUPERSET — it also routes the
+/// SubDirectory `GEOB`/`PRIV`/`SYLT` + `XOLY` frames `-listx` omits/flattens.)
+#[path = "v2_3_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // v2.3-only frames (ID3.pm:681-690).
 static IPLS: TagDef = TagDef::new(
   "InvolvedPeople",

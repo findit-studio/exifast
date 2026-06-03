@@ -22,6 +22,16 @@ use crate::{
 };
 use smol_str::SmolStr;
 
+/// xtask-GENERATED `%ID3::v1` table (`cargo xtask gen-tables --kind tagdef
+/// --module ID3::v1`) — DRIFT-GUARD ONLY (no wire). ID3v1 emits through the
+/// hand binary-table walk in [`process_id3v1`] (the `%v1` field set keyed by
+/// byte offset), not a flat [`TagId`] lookup, so the generated `get` has no
+/// emission caller — `#[allow(dead_code)]`. The committed table exists solely
+/// so `tests/xtask_check.rs` fails if a future ExifTool version shifts `%v1`.
+#[path = "v1_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // PrintConv for the Genre byte. Built by mapping every numbered entry in
 // `super::genre::genre_name` to a `PrintValue::Str`. ID3v1 numeric range is
 // 0..=255 but the table is sparse (192..=254 absent → `Unknown ($n)`).

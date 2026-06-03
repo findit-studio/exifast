@@ -14,6 +14,18 @@ use crate::{
   tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv},
 };
 
+/// xtask-GENERATED `%ID3::v2_4` table (`cargo xtask gen-tables --kind tagdef
+/// --module ID3::v2_4`) — DRIFT-GUARD ONLY (no wire). v2.4 frames emit through
+/// the hand [`v2_4_get`] lookup (`%id3v2_common` + the v2.4-only frames) +
+/// `text::make_tag_name` / SubDirectory routing; the generated `get` is a
+/// parallel copy with no caller — `#[allow(dead_code)]`. The committed table
+/// exists solely so `tests/xtask_check.rs` fails if a future ExifTool version
+/// shifts `%v2_4`. (The hand layer is a SUPERSET — it also routes the
+/// SubDirectory `GEOB`/`PRIV`/`SYLT` + `XOLY` frames `-listx` omits/flattens.)
+#[path = "v2_4_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // v2.4-only frames (ID3.pm:702-717).
 static RVA2: TagDef = TagDef::new(
   "RelativeVolumeAdjustment",
