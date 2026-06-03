@@ -163,3 +163,116 @@ fn committed_mpc_table_matches_generator() {
   // `%MPC::Main` in the generic `tagdef` vocabulary.
   assert_no_drift("MPC::Main", "tagdef", "src/formats/mpc_generated.rs");
 }
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_ape_table_matches_generator() {
+  // `%APE::Main` (string-keyed). Drift means a 13.x ExifTool bump changed the
+  // APE tag set; the hand table in `src/formats/ape.rs` must then be reviewed.
+  assert_no_drift("APE::Main", "tagdef", "src/formats/ape_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_aiff_main_table_matches_generator() {
+  // `%AIFF::Main` (4-char chunk-id keys). `-listx` lists only the 5 leaf tags
+  // (the SubDirectory chunk keys are absent), so the hand table in
+  // `src/formats/aiff.rs` remains authoritative; this guards the leaf set.
+  assert_no_drift("AIFF::Main", "tagdef", "src/formats/aiff_main_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_aiff_common_table_matches_generator() {
+  // `%AIFF::Common` (int-keyed binary-data table). Drift means the COMM field
+  // set / CompressionType map shifted; re-review `src/formats/aiff.rs`.
+  assert_no_drift(
+    "AIFF::Common",
+    "tagdef",
+    "src/formats/aiff_common_generated.rs",
+  );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_flac_streaminfo_table_matches_generator() {
+  // `%FLAC::StreamInfo` (Bit-range string keys). Drift means a StreamInfo
+  // field shifted; the hand table in `src/formats/flac.rs` (which carries the
+  // `$val + 1` / hex-unpack ValueConvs `-listx` cannot express) must then be
+  // re-reviewed.
+  assert_no_drift(
+    "FLAC::StreamInfo",
+    "tagdef",
+    "src/formats/flac_streaminfo_generated.rs",
+  );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_flac_picture_table_matches_generator() {
+  // `%FLAC::Picture` — drift guard ONLY (the table is struct-emitted via the
+  // typed `Picture`, not wired into a `TagId` lookup). Drift means the
+  // PictureType PrintConv map / field set shifted; re-review `flac.rs` +
+  // `src/formats/ogg.rs` (which reuses `picture_type_name`).
+  assert_no_drift(
+    "FLAC::Picture",
+    "tagdef",
+    "src/formats/flac_picture_generated.rs",
+  );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_flac_main_table_matches_generator() {
+  // `%FLAC::Main` — drift guard ONLY (block-type dispatch is a `match`, not a
+  // `TagId` lookup; every tag is an Unknown/Binary skip-block). Drift means a
+  // new metadata-block type appeared; re-review the dispatch in `flac.rs`.
+  assert_no_drift("FLAC::Main", "tagdef", "src/formats/flac_main_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_flac_vorbis_table_matches_generator() {
+  // `%Vorbis::Comments` as consulted by FLAC's `vorbis_comments_get`. Drift
+  // means the Vorbis comment key set shifted; re-review the hand
+  // `VORBIS_NAMED_TAGS` in `src/formats/flac.rs` (which carries the list flags
+  // `-listx` cannot express).
+  assert_no_drift(
+    "Vorbis::Comments",
+    "tagdef",
+    "src/formats/flac_vorbis_generated.rs",
+  );
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_ogg_vorbis_table_matches_generator() {
+  // `%Vorbis::Comments` as consulted (drift-guard only) by OGG. Same source
+  // table as the FLAC guard, generated into OGG's own checkpoint; drift means
+  // re-review the hand `vorbis_comment_known` in `src/formats/ogg.rs`.
+  assert_no_drift("Vorbis::Comments", "tagdef", "src/formats/ogg_generated.rs");
+}

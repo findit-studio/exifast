@@ -53,6 +53,21 @@ use crate::{
   value::{Group, TagValue},
 };
 
+/// The xtask-GENERATED `%APE::Main` table (`cargo xtask gen-tables --kind
+/// tagdef --module APE::Main`), transcribed from `exiftool -listx`. Consulted
+/// by [`ape_main_get`] ONLY as the ADDITIVE fallback — the hand-written
+/// `static`s below shadow every key they define (hand wins on collision). This
+/// is load-bearing for `DURATION`: `-listx` carries no `<values>`/expression
+/// for its code-valued *ValueConv* (`$val += 4294967296 …; $val * 1e-7`, the
+/// signed-i32 unsigned-wrap scale) NOR its `ConvertDuration` *PrintConv*, so
+/// the generated twin has `ValueConv::None`/`PrintConv::None` and would DROP
+/// both conversions; the hand `MAIN_DURATION` wins, so output stays
+/// byte-identical. The generated table contributes 0 new tags (the hand layer
+/// covers every `%APE::Main` key) and exists as the drift guard
+/// (`tests/xtask_check.rs`) against a future ExifTool-version change.
+#[path = "ape_generated.rs"]
+mod generated;
+
 // =============================================================================
 // Family-0 group: APE
 // =============================================================================
@@ -1001,8 +1016,14 @@ static MAIN_DURATION: TagDef = TagDef::new(
 );
 
 fn ape_main_get(id: TagId) -> Option<&'static TagDef> {
-  // ExifTool indexes %Main by the runtime APE tag KEY (string).
-  match id {
+  // Hand-first (the additive-codegen invariant, mirroring XMP `lookup_field`):
+  // the hand `static`s WIN on every key they define, so no existing golden can
+  // shift. `MAIN_DURATION` (`ValueConv::Func` + `PrintConv::Func` vs the
+  // generated `None`/`None`) is the load-bearing collision. The hand layer is
+  // complete for the 9 `%APE::Main` keys, so [`generated::get`] never fires —
+  // it is the drift guard, not new coverage. ExifTool indexes %Main by the
+  // runtime APE tag KEY (string).
+  let hand = match id {
     TagId::Str("Album") => Some(&MAIN_ALBUM),
     TagId::Str("Artist") => Some(&MAIN_ARTIST),
     TagId::Str("Genre") => Some(&MAIN_GENRE),
@@ -1013,7 +1034,8 @@ fn ape_main_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Str("Tool Name") => Some(&MAIN_TOOLNAME),
     TagId::Str("DURATION") => Some(&MAIN_DURATION),
     _ => None,
-  }
+  };
+  hand.or_else(|| generated::get(id))
 }
 
 /// `%APE::Main` (APE.pm:21-42). String-keyed (TagId::Str) by the runtime APE

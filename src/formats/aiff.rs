@@ -75,6 +75,30 @@ use std::{
   vec::Vec,
 };
 
+/// The xtask-GENERATED `%AIFF::Main` table (`cargo xtask gen-tables --kind
+/// tagdef --module AIFF::Main`), transcribed from `exiftool -listx`. Consulted
+/// by [`aiff_main_get`] ONLY as the ADDITIVE fallback — the hand `static`s
+/// shadow every key they define (hand wins on collision). Load-bearing in two
+/// ways `-listx` cannot express: (1) NAME/AUTH/`(c) `/ANNO carry a MacRoman
+/// `decode_macroman_tagvalue` *ValueConv* that the generated twin lacks
+/// (`ValueConv::None`), and (2) the four SubDirectory chunk keys (`FVER`,
+/// `COMM`, `COMT`, `ID3 `) are NOT in `-listx` at all (it omits the
+/// subdirectory dispatch rows), so the hand layer is the ONLY source for them.
+/// The generated table therefore contributes 0 new tags and exists as the
+/// drift guard (`tests/xtask_check.rs`).
+#[path = "aiff_main_generated.rs"]
+mod main_generated;
+
+/// The xtask-GENERATED `%AIFF::Common` table (`cargo xtask gen-tables --kind
+/// tagdef --module AIFF::Common`). Consulted by [`aiff_common_get`] ONLY as
+/// the ADDITIVE fallback. Load-bearing for `CompressorName` (MacRoman
+/// `decode_macroman_tagvalue` *ValueConv* + `pstring` Format) and the
+/// `with_format` overrides on NumSampleFrames/SampleRate that `-listx` cannot
+/// express — the hand `static`s shadow each one. Contributes 0 new tags; it is
+/// the drift guard (`tests/xtask_check.rs`).
+#[path = "aiff_common_generated.rs"]
+mod common_generated;
+
 // =============================================================================
 // %AIFF::Main (AIFF.pm:31-82)
 //
@@ -157,7 +181,12 @@ static APPLICATION_DATA_TAG: TagDef =
 
 /// `%AIFF::Main` lookup (AIFF.pm:31-82). Keys are 4-character chunk IDs.
 fn aiff_main_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (additive-codegen invariant): the hand `static`s WIN on every
+  // key they define. The MacRoman ValueConvs (NAME/AUTH/`(c) `/ANNO) and the
+  // SubDirectory keys (FVER/COMM/COMT/ID3 — absent from `-listx`) make the
+  // hand layer authoritative, so [`main_generated::get`] never fires at
+  // runtime — it is the drift guard.
+  let hand = match id {
     TagId::Str("FVER") => Some(&FORMAT_VERSION_TAG),
     TagId::Str("COMM") => Some(&COMMON_TAG),
     TagId::Str("COMT") => Some(&COMMENT_TAG),
@@ -168,7 +197,8 @@ fn aiff_main_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Str("ID3 ") => Some(&ID3_TAG),
     TagId::Str("APPL") => Some(&APPLICATION_DATA_TAG),
     _ => None,
-  }
+  };
+  hand.or_else(|| main_generated::get(id))
 }
 
 /// `%AIFF::Main` (AIFF.pm:31-82). family-0 group "AIFF".
@@ -232,7 +262,11 @@ static COMPRESSOR_NAME_TAG: TagDef = TagDef::new(
 .with_format("pstring");
 
 fn aiff_common_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (additive-codegen invariant): the hand `static`s WIN on every
+  // key they define. `CompressorName` (MacRoman ValueConv + `pstring` Format)
+  // and the `with_format` overrides are the load-bearing collisions, so
+  // [`common_generated::get`] never fires — it is the drift guard.
+  let hand = match id {
     TagId::Int(0) => Some(&NUM_CHANNELS_TAG),
     TagId::Int(1) => Some(&NUM_SAMPLE_FRAMES_TAG),
     TagId::Int(3) => Some(&SAMPLE_SIZE_TAG),
@@ -240,7 +274,8 @@ fn aiff_common_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Int(9) => Some(&COMPRESSION_TYPE_TAG),
     TagId::Int(11) => Some(&COMPRESSOR_NAME_TAG),
     _ => None,
-  }
+  };
+  hand.or_else(|| common_generated::get(id))
 }
 
 /// `%AIFF::Common` (AIFF.pm:84-117). family-0 group "AIFF".

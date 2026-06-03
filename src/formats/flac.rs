@@ -54,6 +54,50 @@ use crate::format_parser::{FormatParser, parser_sealed};
 use crate::tagtable::{PrintConv, TagDef, TagId, TagTable, ValueConv};
 use crate::value::TagValue;
 
+/// xtask-GENERATED `%FLAC::StreamInfo` table (`cargo xtask gen-tables --kind
+/// tagdef --module FLAC::StreamInfo`). Consulted by [`flac_streaminfo_get`]
+/// ONLY as the ADDITIVE fallback — the hand `static`s shadow every `Bit*` key
+/// (hand wins on collision). LOAD-BEARING: `-listx` carries no ValueConv
+/// expression, so the generated twins of `Channels` / `BitsPerSample`
+/// (`$val + 1`) and `MD5Signature` (`unpack("H*",$val)` hex) are
+/// `ValueConv::None` and WOULD REGRESS those fields if they won. The hand
+/// entries (with their `ValueConv::Func`) win, so output is byte-identical;
+/// the generated layer is the drift guard, contributing 0 new tags.
+#[path = "flac_streaminfo_generated.rs"]
+mod streaminfo_generated;
+
+/// xtask-GENERATED `%Vorbis::Comments` table (`cargo xtask gen-tables --kind
+/// tagdef --module Vorbis::Comments`). Consulted by [`vorbis_comments_get`]
+/// ONLY as the ADDITIVE fallback. LOAD-BEARING: the hand list-tags
+/// (Artist/Performer/Contact carry `.with_list(true)`) and the
+/// auto-name/dynamic-add behaviour are not expressible via `-listx`, so the
+/// hand layer must win. The drift guard regenerates from the same
+/// `Vorbis::Comments` table OGG checks (`ogg_generated.rs`); 0 new tags.
+#[path = "flac_vorbis_generated.rs"]
+mod vorbis_generated;
+
+/// xtask-GENERATED `%FLAC::Picture` table — DRIFT-GUARD ONLY (no wire). FLAC
+/// Picture tags are emitted via the typed [`Picture`] struct (the golden
+/// `FLAC_picture.flac` proves byte-identical), NOT through a `TagId`-keyed
+/// `fn get` lookup — there is no hand `flac_picture_get` to fall through into.
+/// The committed table exists solely so `tests/xtask_check.rs` fails if a
+/// future ExifTool version shifts `%FLAC::Picture` (PictureType PrintConv map,
+/// field set); it is never consulted at runtime. `#[allow(dead_code)]` because
+/// `get` has no caller by design.
+#[path = "flac_picture_generated.rs"]
+#[allow(dead_code)]
+mod picture_generated;
+
+/// xtask-GENERATED `%FLAC::Main` table — DRIFT-GUARD ONLY (no wire). FLAC
+/// metadata-block dispatch is a `match block_type` in [`parse_inner`] (the
+/// block-type integer is NOT a `TagId` lookup), and every `%FLAC::Main` tag is
+/// an `Unknown`/`Binary` skip-block (Padding/SeekTable/CueSheet/
+/// ApplicationUnknown) that is never emitted. The committed table is the drift
+/// guard only; `#[allow(dead_code)]` because `get` has no caller by design.
+#[path = "flac_main_generated.rs"]
+#[allow(dead_code)]
+mod main_generated;
+
 // ===========================================================================
 // Static %FLAC::StreamInfo + %FLAC::Picture + %Vorbis::Comments tables
 //
@@ -144,7 +188,13 @@ static FLAC_MD5_SIGNATURE: TagDef = TagDef::new(
 .with_format("undef"); // FLAC.pm:79
 
 fn flac_streaminfo_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (additive-codegen invariant): the hand `static`s WIN on every
+  // `Bit*` key. `FLAC_CHANNELS` / `FLAC_BITS_PER_SAMPLE` (`ValueConv::Func`
+  // `$val + 1`) and `FLAC_MD5_SIGNATURE` (`ValueConv::Func` hex unpack) are the
+  // load-bearing collisions — the generated twins carry `ValueConv::None` and
+  // would regress them. The hand layer is complete for all 9 keys, so
+  // [`streaminfo_generated::get`] never fires — it is the drift guard.
+  let hand = match id {
     TagId::Str("Bit000-015") => Some(&FLAC_BLOCK_SIZE_MIN),
     TagId::Str("Bit016-031") => Some(&FLAC_BLOCK_SIZE_MAX),
     TagId::Str("Bit032-055") => Some(&FLAC_FRAME_SIZE_MIN),
@@ -155,7 +205,8 @@ fn flac_streaminfo_get(id: TagId) -> Option<&'static TagDef> {
     TagId::Str("Bit108-143") => Some(&FLAC_TOTAL_SAMPLES),
     TagId::Str("Bit144-271") => Some(&FLAC_MD5_SIGNATURE),
     _ => None,
-  }
+  };
+  hand.or_else(|| streaminfo_generated::get(id))
 }
 
 /// Faithful `%Image::ExifTool::FLAC::StreamInfo` (FLAC.pm:59-82). Kept public
@@ -336,13 +387,20 @@ const VORBIS_NAMED_TAGS: &[(&str, &TagDef)] = &[
 ];
 
 fn vorbis_comments_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (additive-codegen invariant): the hand `VORBIS_NAMED_TAGS`
+  // slice WINS on every key it defines. The list-tags
+  // (Artist/Performer/Contact, `.with_list(true)`) are not expressible via
+  // `-listx`, so the hand layer must win. The hand layer covers every
+  // `%Vorbis::Comments` key, so [`vorbis_generated::get`] never fires — it is
+  // the drift guard, not new coverage.
+  let hand = match id {
     TagId::Str(key) => VORBIS_NAMED_TAGS
       .iter()
       .find(|(k, _)| *k == key)
       .map(|(_, def)| *def),
     _ => None,
-  }
+  };
+  hand.or_else(|| vorbis_generated::get(id))
 }
 
 /// Faithful `%Image::ExifTool::Vorbis::Comments` (Vorbis.pm:72-135), subset.
