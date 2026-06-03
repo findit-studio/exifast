@@ -26,6 +26,14 @@ pub enum ValueConv {
   /// `$convType eq 'ValueConv'`, ExifTool.pm conv loop). Same faithful
   /// model as a hash `PrintConv` (`AAC.pm:46` `ValueConv => \%convSampleRate`).
   Hash(PrintConvHash),
+  /// A code-valued ExifTool `ValueConv` (a Perl `sub { … }` / `'$val …'`
+  /// expression / `\&Func`) that the `xtask gen-tables` TagDef emitter found
+  /// but has NOT hand-ported. The `&'static str` is the faithful provenance
+  /// `"<Module>:<Tag>"`. Apply semantics = **faithful raw passthrough** (the
+  /// raw value is forwarded unchanged, identical to [`ValueConv::None`]), so a
+  /// generated table flags an un-ported value conv compile-visibly instead of
+  /// guessing. Additive sibling of the other variants; existing defs unchanged.
+  Unported(&'static str),
 }
 
 /// A single value in an ExifTool hash `PrintConv` (the right-hand side of a
@@ -202,6 +210,21 @@ pub enum PrintConv {
   /// or any `$$self{…}` deref. Strictly additive sibling of
   /// [`PrintConv::Func`]: existing tag defs continue unchanged.
   FuncCtx(fn(&TagValue, &ConvContext) -> TagValue),
+  /// A code-valued ExifTool `PrintConv` (a Perl `sub { … }` / `'$val …'`
+  /// expression / `\&Func`) that the `xtask gen-tables` TagDef emitter
+  /// encountered in a module but has NOT hand-ported yet. It carries the
+  /// faithful provenance string `"<Module>:<Tag>"` (e.g. `"AIFF:SampleRate"`)
+  /// purely for compile-visible traceability.
+  ///
+  /// Apply semantics = **faithful raw passthrough**: [`crate::convert`] renders
+  /// the post-ValueConv value unchanged (identical to [`PrintConv::None`]),
+  /// never a guessed conversion. This mirrors the XMP `P::Unported` marker
+  /// (`src/formats/xmp/tables.rs`) so the same generator can flag a code-valued
+  /// conv in EITHER vocabulary instead of silently mis-converting (cf. the
+  /// `NeutralDensityFactor` class of bug). Strictly additive: existing tag defs
+  /// are unaffected, and a passthrough is observably correct whenever the Perl
+  /// `sub` would have returned `$val` for the values a real file carries.
+  Unported(&'static str),
 }
 
 /// Definition of one tag within a table.
@@ -663,6 +686,43 @@ mod tests {
       *SET_VERS.raw_conv().unwrap_set_frame_state_ref(),
       "MPEG_Vers"
     );
+  }
+
+  #[test]
+  fn unported_conv_variants_carry_provenance_and_are_distinct() {
+    // The `xtask gen-tables` TagDef emitter flags a code-valued conv it has
+    // not hand-ported as `Unported("<Module>:<Tag>")` in EITHER vocabulary.
+    // Faithful apply semantics (raw passthrough) are covered in `convert.rs`;
+    // here we pin the marker's provenance + D9 variant predicates.
+    static PC_UNPORTED: TagDef = TagDef::new(
+      "SampleRate",
+      "AIFF",
+      ValueConv::None,
+      PrintConv::Unported("AIFF:SampleRate"),
+    );
+    match PC_UNPORTED.print_conv() {
+      PrintConv::Unported(src) => assert_eq!(src, "AIFF:SampleRate"),
+      _ => panic!("expected Unported print_conv"),
+    }
+    assert!(PC_UNPORTED.print_conv().is_unported());
+    assert!(!PC_UNPORTED.print_conv().is_none());
+    assert_eq!(
+      *PC_UNPORTED.print_conv().unwrap_unported_ref(),
+      "AIFF:SampleRate"
+    );
+
+    static VC_UNPORTED: TagDef = TagDef::new(
+      "MD5Signature",
+      "FLAC",
+      ValueConv::Unported("FLAC:MD5Signature"),
+      PrintConv::None,
+    );
+    match VC_UNPORTED.value_conv() {
+      ValueConv::Unported(src) => assert_eq!(src, "FLAC:MD5Signature"),
+      _ => panic!("expected Unported value_conv"),
+    }
+    assert!(VC_UNPORTED.value_conv().is_unported());
+    assert!(VC_UNPORTED.print_conv().is_none());
   }
 
   #[test]
