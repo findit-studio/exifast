@@ -73,11 +73,35 @@ impl Mismatch {
 /// still escape-exact, so the literal `"A"` ≠ the escaped `"A"`). Returns
 /// the first `Mismatch`.
 pub fn json_equivalent(actual: &str, golden: &str) -> Result<(), Mismatch> {
+  json_equivalent_with(actual, golden, false)
+}
+
+/// TOKEN-EXACT (strict) variant of [`json_equivalent`]: identical structure
+/// rules (object key order insensitive but multiset-significant, array order
+/// significant), and numeric VALUE-style insensitivity is still kept *within
+/// one JSON type* (`2 == 2.0`, `0.50 == 0.5`, `3.4e+38 == 3.4e38`), BUT a
+/// quoted numeric string and the bare number of the same value are NO LONGER
+/// equal — the JSON *type* must match (Contract B / #197). So `"2"` ≠ `2` and
+/// `"0.0"` ≠ `0.0`, reproducing ExifTool's exact `EscapeJSON` number-vs-string
+/// typing. Non-numeric strings stay escape-exact exactly as in value mode.
+///
+/// Opt-in: callers that want the documented value-semantic behaviour keep using
+/// [`json_equivalent`]; this is the comparator the token-exact conformance pass
+/// uses. Returns the first [`Mismatch`].
+pub fn json_equivalent_strict(actual: &str, golden: &str) -> Result<(), Mismatch> {
+  json_equivalent_with(actual, golden, true)
+}
+
+/// Shared entry point for [`json_equivalent`] (value-semantic, `strict=false`)
+/// and [`json_equivalent_strict`] (token-exact, `strict=true`). The only
+/// behavioural difference is in the scalar arm: `strict` rejects a quoted-vs-
+/// bare type mismatch even when the numeric values coincide.
+fn json_equivalent_with(actual: &str, golden: &str, strict: bool) -> Result<(), Mismatch> {
   let a: &RawValue = serde_json::from_str(actual)
     .map_err(|e| Mismatch::new(format!("actual is invalid JSON: {e}")))?;
   let g: &RawValue = serde_json::from_str(golden)
     .map_err(|e| Mismatch::new(format!("golden is invalid JSON: {e}")))?;
-  cmp(a, g, "$")
+  cmp(a, g, "$", strict)
 }
 
 /// An object parsed as ORDERED `(key, value)` pairs, preserving duplicate
@@ -323,10 +347,18 @@ fn f_as_exact_u128(f: f64) -> Option<u128> {
 /// 2. Otherwise compare the scalars' raw lexeme text byte-for-byte — so
 ///    non-numeric strings stay escape-exact, and `true`/`null`/`"NaN"` match
 ///    only their identical spelling.
-fn scalar_value_eq(a: &RawValue, g: &RawValue) -> bool {
-  let (at, _) = scalar_payload(a);
-  let (gt, _) = scalar_payload(g);
+fn scalar_value_eq(a: &RawValue, g: &RawValue, strict: bool) -> bool {
+  let (at, a_quoted) = scalar_payload(a);
+  let (gt, g_quoted) = scalar_payload(g);
   if let (Some(an), Some(gn)) = (parse_number(at), parse_number(gt)) {
+    // TOKEN-EXACT (strict): the two scalars must share the same JSON *type* —
+    // a quoted numeric string (`"2"`, `a_quoted == true`) is NOT the bare
+    // number `2` (`g_quoted == false`), even though their numeric VALUES
+    // coincide (Contract B). VALUE-style insensitivity WITHIN one type is
+    // still preserved by the `value_eq` below (`2.0` == `2`, both bare).
+    if strict && a_quoted != g_quoted {
+      return false;
+    }
     return an.value_eq(gn);
   }
   // Non-numeric (or only-one-side-numeric): exact lexeme compare. Using the
@@ -407,7 +439,7 @@ fn canonical(r: &RawValue) -> String {
   }
 }
 
-fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
+fn cmp(a: &RawValue, g: &RawValue, path: &str, strict: bool) -> Result<(), Mismatch> {
   match (kind_of(a), kind_of(g)) {
     (Kind::Object, Kind::Object) => {
       // Parse as ORDERED (key, value) pairs preserving duplicate keys.
@@ -447,7 +479,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
         }
         // Same key (and same rank after the (key,value) sort): recurse
         // so the precise first scalar-mismatch path is still reported.
-        cmp(av, gv, &format!("{path}.{ak}"))?;
+        cmp(av, gv, &format!("{path}.{ak}"), strict)?;
       }
       Ok(())
     }
@@ -464,7 +496,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
         )));
       }
       for (i, (x, y)) in aa.iter().zip(&ga).enumerate() {
-        cmp(x, y, &format!("{path}[{i}]"))?;
+        cmp(x, y, &format!("{path}[{i}]"), strict)?;
       }
       Ok(())
     }
@@ -474,7 +506,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
     // For a shape mismatch (e.g. object vs array) neither side parses as a
     // number and the raw texts differ, so this still reports correctly.
     _ => {
-      if scalar_value_eq(a, g) {
+      if scalar_value_eq(a, g, strict) {
         Ok(())
       } else {
         Err(Mismatch::new(format!(
@@ -494,6 +526,18 @@ mod tests {
   #[test]
   fn identical_is_ok() {
     assert!(json_equivalent(r#"[{"a":1,"b":2}]"#, r#"[{"a":1,"b":2}]"#).is_ok());
+  }
+
+  #[test]
+  fn strict_mode_distinguishes_number_from_string() {
+    // TOKEN-EXACT (strict) mode: a quoted numeric string is NOT the bare number
+    // of the same value — the JSON *type* differs (Contract B).
+    assert!(json_equivalent_strict(r#"{"X":"2"}"#, r#"{"X":2}"#).is_err());
+    // Same type (both bare numbers) still matches — and numeric VALUE-style
+    // insensitivity inside one type is preserved (`2` == `2.0`).
+    assert!(json_equivalent_strict(r#"{"X":2}"#, r#"{"X":2}"#).is_ok());
+    // value-semantic mode still coerces (unchanged):
+    assert!(json_equivalent(r#"{"X":"2"}"#, r#"{"X":2}"#).is_ok());
   }
 
   #[test]
