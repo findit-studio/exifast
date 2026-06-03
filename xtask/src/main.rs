@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 
+mod conv_registry;
 mod listx;
 
 fn main() -> Result<()> {
