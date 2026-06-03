@@ -1,6 +1,6 @@
 [{
   "SourceFile": "JPEG_malformed_app1_exif.jpg",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Malformed APP1 EXIF segment",
   "File:FileType": "JPEG",
   "File:FileTypeExtension": "jpg",

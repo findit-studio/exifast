@@ -1,6 +1,6 @@
 [{
   "SourceFile": "QuickTime_mdat64_large.mov",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Truncated 'mdat' data at offset 0x14",
   "File:FileType": "MOV",
   "File:FileTypeExtension": "MOV",

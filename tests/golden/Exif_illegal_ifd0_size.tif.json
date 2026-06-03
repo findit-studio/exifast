@@ -1,6 +1,6 @@
 [{
   "SourceFile": "Exif_illegal_ifd0_size.tif",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Illegal IFD0 directory size (1 entries)",
   "File:FileType": "TIFF",
   "File:FileTypeExtension": "tif",

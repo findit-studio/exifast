@@ -1,6 +1,6 @@
 [{
   "SourceFile": "Exif_eofoverrun_chain.tif",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Error reading value for IFD0 entry 1, ID 0x0131 Software",
   "File:FileType": "TIFF",
   "File:FileTypeExtension": "TIF",

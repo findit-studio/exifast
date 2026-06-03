@@ -1,6 +1,6 @@
 [{
   "SourceFile": "Exif_badformat_ifd1.tif",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Bad format (99) for IFD0 entry 0",
   "File:FileType": "TIFF",
   "File:FileTypeExtension": "tif",

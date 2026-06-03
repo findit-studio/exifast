@@ -1,6 +1,6 @@
 [{
   "SourceFile": "ID3v2_3_invalid_APIC_utf16.mp3",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Invalid APIC frame",
   "File:FileType": "MP3",
   "File:FileTypeExtension": "mp3",

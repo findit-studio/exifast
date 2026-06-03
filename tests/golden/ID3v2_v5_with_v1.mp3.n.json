@@ -1,6 +1,6 @@
 [{
   "SourceFile": "ID3v2_v5_with_v1.mp3",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Unsupported ID3 version: 2.5.0",
   "File:FileType": "MP3",
   "File:FileTypeExtension": "MP3",

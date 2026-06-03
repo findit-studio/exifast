@@ -1,6 +1,6 @@
 [{
   "SourceFile": "dv_unknown_profile.dv",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Unrecognized DV profile",
   "File:FileType": "DV",
   "File:FileTypeExtension": "dv",

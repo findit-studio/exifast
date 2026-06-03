@@ -1,6 +1,6 @@
 [{
   "SourceFile": "ID3_dup_short_frame.mp3",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Short COMM frame [x2]",
   "File:FileType": "MP3",
   "File:FileTypeExtension": "MP3",

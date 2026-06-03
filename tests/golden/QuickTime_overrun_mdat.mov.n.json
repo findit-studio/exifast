@@ -1,6 +1,6 @@
 [{
   "SourceFile": "QuickTime_overrun_mdat.mov",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Truncated 'mdat' data at offset 0x0",
   "File:FileType": "MOV",
   "File:FileTypeExtension": "MOV",

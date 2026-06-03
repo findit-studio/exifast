@@ -1,6 +1,6 @@
 [{
   "SourceFile": "ID3v2_4_big.mp3",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "[minor] Missing ID3 terminating frame",
   "File:FileType": "MP3",
   "File:FileTypeExtension": "mp3",

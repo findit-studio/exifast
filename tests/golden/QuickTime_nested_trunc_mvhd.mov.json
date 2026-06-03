@@ -1,6 +1,6 @@
 [{
   "SourceFile": "QuickTime_nested_trunc_mvhd.mov",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Truncated 'mvhd' data (missing 88 bytes)",
   "File:FileType": "MOV",
   "File:FileTypeExtension": "mov",

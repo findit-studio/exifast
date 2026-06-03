@@ -1,6 +1,6 @@
 [{
   "SourceFile": "plist_synth_bin_data_oversize.plist",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "PLIST",
   "File:FileTypeExtension": "PLIST",
   "File:MIMEType": "application/x-plist",

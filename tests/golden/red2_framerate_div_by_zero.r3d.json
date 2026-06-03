@@ -1,6 +1,6 @@
 [{
   "SourceFile": "red2_framerate_div_by_zero.r3d",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Can't find Red directory. Please submit sample for testing",
   "File:FileType": "R3D",
   "File:FileTypeExtension": "r3d",

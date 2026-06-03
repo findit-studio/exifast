@@ -1,6 +1,6 @@
 [{
   "SourceFile": "JPEG_unknown_header.jpg",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Processing JPEG-like data after unknown 4-byte header",
   "File:ExifByteOrder": "II",
   "IFD0:Make": "Canon",
