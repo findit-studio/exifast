@@ -3640,6 +3640,94 @@ fn emit_exif_value<S: ExifSink>(
       }
       emit_raw(group, name, raw, out)
     }
+    Conv::CelsiusSuffix => {
+      // `AmbientTemperature` (0x9400) — `PrintConv => '"$val C"'`
+      // (Exif.pm:2590). A `rational64s`; `$val` is the WHOLE post-ValueConv
+      // value (0x9400 has no ValueConv) stringified by `ReadValue`. The string
+      // interpolation `"$val C"` appends ` C` to the ENTIRE value, which for a
+      // malformed count>1 rational is the space-joined element list (bundled
+      // `exiftool 13.59` on a 2-element `235/10 -50/10` → `"23.5 -5 C"`), NOT
+      // just the first element. The suffix is appended UNCONDITIONALLY (no
+      // `inf`/`undef` guard, unlike `Conv::MetersSuffix`); a sign is preserved
+      // (`-5.5` → `"-5.5 C"`).
+      //
+      // Like the 0xa462 RawConv, `"$val C"` is NOT gated on the on-disk format:
+      // it interpolates whatever post-`ReadValue` scalar STRING `$val` it got.
+      // A wrong-format value is therefore still suffixed (bundled `exiftool
+      // 13.59`: ASCII-typed `"23.5\0"` → `ReadValue` NUL-trims to `"23.5"` →
+      // `"23.5 C"`; `int16u`-typed `1234` → `"1234 C"`; AND an `undef`-typed
+      // `-5.5` → `ReadValue` returns the raw byte string `"-5.5"` → `"-5.5 C"`).
+      // The `undef`/`Bytes` shape is the one `value_space_joined` does NOT cover
+      // (it never carries a numeric `ReadValue` form) — render those bytes as
+      // their Perl-byte-string interpolation (`String::from_utf8_lossy`, the
+      // realistic numeric-ASCII case is exact), so `-n` shows the bare string
+      // and `-j` appends ` C` rather than falling to the binary `write_bytes`.
+      if let RawValue::Bytes(b) = raw {
+        let v = String::from_utf8_lossy(b);
+        if print_conv {
+          // `"$val C"` always yields a string (space + `C`) ⇒ quoted in `-j`.
+          out.write_str(group, name, &std::format!("{v} C"))?;
+        } else {
+          // `-n` shows the post-`ReadValue` `$val` byte string verbatim, through
+          // the `EscapeJSON` number gate: a numeric byte string (`-5.5`) emits
+          // as a bare JSON number (matching bundled `-n -j`), a non-numeric one
+          // stays a quoted string.
+          emit_gated_number(group, name, &v, out)?;
+        }
+        return Ok(());
+      }
+      // Numeric / `string`-typed shapes: `-j` interpolates `"$val C"` over the
+      // space-joined `ReadValue` string; `-n` shows the bare value via the
+      // shared `emit_raw` (which keeps a single scalar as a bare JSON number —
+      // NOT a quoted string — so the normal real-camera `-n` stays identical).
+      if print_conv && let Some(v) = value_space_joined(raw) {
+        out.write_str(group, name, &std::format!("{v} C"))?;
+        return Ok(());
+      }
+      emit_raw(group, name, raw, out)
+    }
+    Conv::CompositeImageExposureTimes => {
+      // `CompositeImageExposureTimes` (0xa462, Exif.pm:3068-3119). The on-disk
+      // `undef` blob is decoded by a bespoke `RawConv` (`Exif.pm:3079-3098`)
+      // that byte-walks `$val` then a `PrintConv` (`Exif.pm:3104-3115`).
+      //
+      // Only the verified real-camera `undef` path is decoded here: a
+      // `RawValue::Bytes` blob is byte-walked by `composite_image_exposure_times`.
+      // Any other on-disk shape (a camera that wrote the WRONG format —
+      // `string`/numeric) falls through to `emit_raw`; faithfully byte-walking
+      // the post-`ReadValue` string for those mis-formatted values is deferred to
+      // issue #198.
+      //
+      // `composite_image_exposure_times` returns ONE token per decoded element.
+      // ExifTool's JSON typing is element-count dependent (the `RawConv`/
+      // `PrintConv` result is a single Perl scalar that `EscapeJSON`,
+      // `exiftool:3809`, then number-gates):
+      //   - EXACTLY ONE element ⇒ the lone token IS the whole `$val`, so a
+      //     numeric token lands as a BARE JSON NUMBER and a non-numeric token
+      //     (`undef`, a `1/N` `PrintExposureTime` fraction) stays a quoted
+      //     STRING. Bundled `exiftool 13.59` on a short `undef` blob: `1/2` →
+      //     `-j`/`-n` `0.5` (a number); `0/0` → `-j`/`-n` `"undef"`; `1/250` →
+      //     `-j "1/250"` (a string) / `-n 0.004` (a number).
+      //   - ZERO or 2+ elements ⇒ the space-joined string (a `0`-element walk
+      //     yields the empty string `""`, bundled emits `""`; a 2+-element join
+      //     has a space ⇒ out of the number gate ⇒ always a quoted STRING).
+      // Route the SINGLE-token case through the shared `emit_gated_number`
+      // (the same `EscapeJSON` number gate the rest of EXIF emission uses) so a
+      // one-element numeric result is a bare number, not a type-wrong string;
+      // keep `write_str` for the 0-/multi-token space-joined case.
+      let RawValue::Bytes(b) = raw else {
+        return emit_raw(group, name, raw, out);
+      };
+      let parts = composite_image_exposure_times(b, order, print_conv);
+      if let [token] = parts.as_slice() {
+        // One element: the lone token is the entire scalar — gate it so a
+        // numeric token is a bare JSON number and `undef`/`1/N` stays a string.
+        emit_gated_number(group, name, token, out)
+      } else {
+        // Zero (empty `""`) or multiple (space-joined) elements: always a string.
+        out.write_str(group, name, &parts.join(" "))
+      }
+    }
     Conv::ExifText => {
       // `UserComment` (0x9286) — `RawConv => ConvertExifText($self,$val,1,$tag)`
       // (Exif.pm:2502). A RawConv runs BEFORE Value/PrintConv and applies in
@@ -4139,6 +4227,29 @@ fn first_rational_str(raw: &RawValue) -> Option<String> {
   }
 }
 
+/// The COMPLETE value of a [`RawValue`] as the single string ExifTool's
+/// `ReadValue` would hand a string-interpolating `PrintConv` (`"$val …"`):
+/// every element rendered exactly as [`emit_raw`] renders it, space-joined.
+/// A single element yields its bare scalar form; a multi-element value is the
+/// space-joined list (e.g. a malformed 2-element `AmbientTemperature` `235/10
+/// -50/10` → `"23.5 -5"`, matching bundled `exiftool`). `None` for a non-scalar
+/// value (`Bytes`) — those tags never carry a `"$val …"` PrintConv.
+fn value_space_joined(raw: &RawValue) -> Option<String> {
+  match raw {
+    RawValue::U64(v) => Some(join_nums(v)),
+    RawValue::I64(v) => Some(join_nums(v)),
+    RawValue::F64(v) => Some(join_floats(v)),
+    RawValue::Rational(rs) => Some(
+      rs.iter()
+        .map(crate::value::Rational::exiftool_val_str)
+        .collect::<Vec<_>>()
+        .join(" "),
+    ),
+    RawValue::Text(t) => Some(t.to_string()),
+    RawValue::Bytes(_) => None,
+  }
+}
+
 /// The first three rationals of a [`RawValue`] as `(D, M, S)` quotients —
 /// for the GPS coordinate / timestamp conversions. A degenerate `inf`/`undef`
 /// rational yields a non-finite `f64` so the conv's guard fires.
@@ -4217,6 +4328,82 @@ fn print_lens_info(rs: &[crate::value::Rational]) -> Option<String> {
   Some(out)
 }
 
+/// `CompositeImageExposureTimes` (0xa462) `RawConv` + `PrintConv`
+/// (`Exif.pm:3079-3115`). Decode the `undef` blob and return the per-element
+/// rendered strings to space-join.
+///
+/// The `RawConv` (`Exif.pm:3079-3098`) walks the blob by BYTE OFFSET, reading
+/// a `GetRational64u` (8 bytes) at every offset EXCEPT 56 and 58, where it
+/// reads a `Get16u` (2 bytes); it stops as soon as the next field would run
+/// past the end. The two `int16u` land at element indices 7 and 8 (the first
+/// seven 8-byte rationals consume bytes 0..56). With `print_conv` ON the
+/// `PrintConv` (`Exif.pm:3104-3115`) maps every element EXCEPT indices 7 and 8
+/// through [`tables::print_exposure_time`]; with it OFF the `RawConv` join is
+/// shown — each rational as its `GetRational64u` decimal (`RoundFloat(n/d, 10)`,
+/// [`crate::value::Rational::rational64`]) and each count as a bare integer.
+#[cfg(feature = "alloc")]
+fn composite_image_exposure_times(blob: &[u8], order: ByteOrder, print_conv: bool) -> Vec<String> {
+  let mut out: Vec<String> = Vec::new();
+  let mut i: usize = 0;
+  // `idx` is the ELEMENT index (0-based), distinct from the BYTE offset `i`;
+  // the PrintConv carve-out (`unless $i == 7 or $i == 8`) is keyed on the
+  // element index in Perl (`for ($i=0; ...; ++$i)`), which equals 7/8 exactly
+  // when the byte offset is 56/58.
+  let mut idx: usize = 0;
+  loop {
+    if i == 56 || i == 58 {
+      // `Get16u` — an `int16u` count (number of sequences / source images).
+      let Some(v) = ifd::get_u16(blob, i, order) else {
+        break;
+      };
+      // Indices 7 and 8 are NEVER PrintExposureTime'd; the count is the bare
+      // integer in both `-j` and `-n`.
+      out.push(std::format!("{v}"));
+      i += 2;
+    } else {
+      // `GetRational64u` — an exposure-time quotient.
+      let (Some(num), Some(den)) = (
+        ifd::get_u32(blob, i, order),
+        ifd::get_u32(blob, i.wrapping_add(4), order),
+      ) else {
+        break;
+      };
+      let r = crate::value::Rational::rational64(i64::from(num), i64::from(den));
+      // The `RawConv` (`Exif.pm:3079-3094`) stringifies each rational via
+      // `GetRational64u` = `RoundFloat(n/d, 10)` (= `%.10g`, or the bare word
+      // `inf`/`undef` for a zero denominator), then space-joins. The
+      // `PrintConv` (`Exif.pm:3106-3115`) re-`split`s that joined string and
+      // feeds each TOKEN to `PrintExposureTime`. So the print value is keyed on
+      // the ALREADY-ROUNDED token, NOT the unrounded quotient — compute the
+      // token FIRST for BOTH modes.
+      let token = r.exiftool_val_str();
+      if print_conv && idx != 7 && idx != 8 {
+        // `PrintExposureTime($v[$i])` on the rounded token. ExifTool's
+        // `PrintExposureTime` first checks `IsFloat($secs)` and returns the
+        // value unchanged when it is not a float (`Exif.pm:5704`): the words
+        // `inf`/`undef` (a degenerate rational) pass through verbatim — and so
+        // do they here, since they never parse as a finite `f64`. A finite
+        // token is re-parsed and `PrintExposureTime`'d on the ROUNDED value
+        // (e.g. `2/19` → token `0.1052631579` → `1/9`, NOT the unrounded
+        // `0.10526315789…` → `1/10`).
+        match token.parse::<f64>() {
+          Ok(secs) if secs.is_finite() => out.push(tables::print_exposure_time(secs)),
+          _ => out.push(token),
+        }
+      } else {
+        // `-n` (RawConv join) — the `GetRational64u` decimal token (`inf`/
+        // `undef` for a zero denominator). (Indices 7/8 are the `int16u`
+        // byte-offsets 56/58, never reached on this rational arm, so the
+        // `idx != 7 && idx != 8` print-conv guard is the only carve-out.)
+        out.push(token);
+      }
+      i += 8;
+    }
+    idx += 1;
+  }
+  out
+}
+
 /// `ShutterSpeedValue` ValueConv — `IsFloat($val) && abs($val)<100 ?
 /// 2**(-$val) : 0` (`Exif.pm:2346`).
 fn shutter_speed_value_conv(apex: f64) -> f64 {
@@ -4256,18 +4443,65 @@ fn join_floats(vals: &[f64]) -> String {
 // Table-codegen allowlist accessors (`cargo xtask gen-tables --kind exif`)
 // ===========================================================================
 
-/// The on-disk ids of the ported `%Exif::Main` subset ([`tables::EXIF_TAGS`]),
-/// in table order. The `--kind exif` generator (`xtask`) restricts its
-/// `-listx → ExifTag` shadow to exactly this allowlist (Step A is a
-/// byte-identical shadow of the hand table, adding NO new ids), so the
-/// generated `tables_generated.rs` is a strict subset of the hand table and the
-/// hand-first runtime lookup fallback never fires. `#[doc(hidden)]`: this is the
-/// generator's allowlist source, NOT public API — the hand table itself
-/// (`ExifTag`, with its `const`-init public fields) stays `pub(crate)` per D8.
+/// The Step-B binary-EXIF coverage-gap ids — genuine `%Exif::Main` leaf tags
+/// (`Exif.pm`) that the camera-relevant hand subset ([`tables::EXIF_TAGS`]) does
+/// NOT carry, so they were silently dropped on the binary IFD path (reachable
+/// only via XMP before). The `--kind exif` generator adds these to its emitted
+/// table (in ADDITION to the hand ids); since none is in [`tables::EXIF_TAGS`],
+/// the hand-first [`tables::lookup`] falls through to the generated shadow and
+/// they now emit, byte-identically to bundled ExifTool 13.59 (a crafted
+/// conformance fixture is the gate). Each was verified against `Exif.pm` for its
+/// `Writable`/`Format` + ValueConv/PrintConv:
+///
+/// * plain (`Conv::None`) — `ProcessingSoftware` (0x0b), `HostComputer` (0x13c
+///   — the source assessment's "0x010c" was WRONG; `HostComputer` is `0x13c` /
+///   316 in `Exif.pm:927`, and `0x010c` is not a `%Exif::Main` tag),
+///   `TimeZoneOffset` (0x882a), `StandardOutputSensitivity` (0x8831),
+///   `ISOSpeed` (0x8833), `ISOSpeedLatitudeyyy` (0x8834),
+///   `ISOSpeedLatitudezzz` (0x8835), `ImageNumber` (0x9211),
+///   `ImageHistory` (0x9213), `SubjectArea` (0x9214), `SubjectLocation`
+///   (0xa214), `Humidity` (0x9401), `Pressure` (0x9402), `WaterDepth`
+///   (0x9403), `Acceleration` (0x9404), `CameraElevationAngle` (0x9405),
+///   `CompositeImageCount` (0xa461);
+/// * `Opto-ElectricConvFactor` (0x8828, `Binary => 1`) — `Conv::None`; the
+///   `undef` blob is `RawValue::Bytes`, so `emit_raw` renders the
+///   `(Binary data N bytes, use -b option to extract)` placeholder bundled
+///   emits for a `Binary` tag in both `-j` and `-n`;
+/// * declarative HASH PrintConv (from `-listx <values>`) — `SecurityClassification`
+///   (0x9212, string-keyed → `Conv::StrLabel`) and `CompositeImage` (0xa460,
+///   int-keyed → `Conv::IntLabel`);
+/// * code-valued (`EXIF_HANDPORTED` in `xtask/src/exif_conv.rs`) —
+///   `AmbientTemperature` (0x9400, `Conv::CelsiusSuffix` for `'"$val C"'`) and
+///   `CompositeImageExposureTimes` (0xa462, `Conv::CompositeImageExposureTimes`
+///   for the bespoke undef-decode + per-element `PrintExposureTime`).
+///
+/// `0x0103` (the source assessment's "RenderingIntent") was REJECTED — it is
+/// `Compression`, already a hand tag, NOT a gap.
+const EXIF_MAIN_GAP_IDS: &[u16] = &[
+  0x000b, 0x013c, 0x8828, 0x882a, 0x8831, 0x8833, 0x8834, 0x8835, 0x9211, 0x9212, 0x9213, 0x9214,
+  0x9400, 0x9401, 0x9402, 0x9403, 0x9404, 0x9405, 0xa214, 0xa460, 0xa461, 0xa462,
+];
+
+/// The on-disk ids the `--kind exif` generator emits for `%Exif::Main`: the
+/// ported camera-relevant hand subset ([`tables::EXIF_TAGS`]) PLUS the Step-B
+/// binary-coverage-gap ids ([`EXIF_MAIN_GAP_IDS`]).
+///
+/// Step A was a byte-identical SHADOW (hand ids only); Step B turns on the gap
+/// ids — these are NOT in the hand [`tables::EXIF_TAGS`], so the hand-first
+/// [`tables::lookup`] falls through to the generated shadow and they emit. The
+/// generated table therefore stays a SUPERSET of the hand table (the
+/// `generated_shadow_matches_hand_table` parity test asserts hand ⊆ generated,
+/// which the extra gap ids preserve). `#[doc(hidden)]`: this is the generator's
+/// allowlist source, NOT public API — the hand table itself (`ExifTag`, with
+/// its `const`-init public fields) stays `pub(crate)` per D8.
 #[doc(hidden)]
 #[must_use]
 pub fn exif_main_tag_ids() -> Vec<u16> {
-  tables::EXIF_TAGS.iter().map(|t| t.id).collect()
+  tables::EXIF_TAGS
+    .iter()
+    .map(|t| t.id)
+    .chain(EXIF_MAIN_GAP_IDS.iter().copied())
+    .collect()
 }
 
 /// The on-disk ids of the ported `%GPS::Main` table ([`gps::GPS_TAGS`]), in

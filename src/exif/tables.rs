@@ -32,14 +32,18 @@
 // no raw slice/index sites; the deny-lint pins that property for the future.
 #![deny(clippy::indexing_slicing)]
 
-// The `--kind exif` generator's Step-A shadow of this table (`cargo xtask
-// gen-tables --module Exif::Main --kind exif`): a strict subset of
-// [`EXIF_TAGS`] re-rendered into the same `ExifTag` rows, each resolved to the
-// SAME [`Conv`] (a per-id differential parity test below is the gate). It is a
-// CHILD module so its HANDPORTED `super::COMPRESSION` / `super::FLASH` / …
-// const references resolve against this module's curated label slices, reusing
-// them byte-for-byte. [`lookup`] consults the hand table FIRST and falls back
-// here; since the shadow is a subset, that fallback only ever AGREES.
+// The `--kind exif` generator's shadow of this table (`cargo xtask gen-tables
+// --module Exif::Main --kind exif`): every [`EXIF_TAGS`] row re-rendered into
+// the same `ExifTag` row, each resolved to the SAME [`Conv`] (a per-id
+// differential parity test below is the gate), PLUS the binary-EXIF
+// coverage-gap ids ([`crate::exif::EXIF_MAIN_GAP_IDS`]) — `%Exif::Main` leaf
+// tags this hand subset does NOT carry. It is a CHILD module so its HANDPORTED
+// `super::COMPRESSION` / `super::FLASH` / … const references resolve against
+// this module's curated label slices, reusing them byte-for-byte. [`lookup`]
+// consults the hand table FIRST and falls back here: a SHARED id always AGREES
+// with the hand entry, and a gap id (absent from [`EXIF_TAGS`]) is the only one
+// this fallback actually returns — i.e. the hand table is a strict SUBSET of
+// the generated shadow.
 #[path = "tables_generated.rs"]
 mod generated;
 
@@ -163,6 +167,23 @@ pub enum Conv {
   /// `GPSAltitude`-style — PrintConv `"$val m"` unless the value is
   /// `inf`/`undef` (`Exif.pm:2388-2389`, `GPS.pm:119`).
   MetersSuffix,
+  /// `AmbientTemperature` (0x9400) PrintConv — `'"$val C"'` (`Exif.pm:2590`).
+  /// A `rational64s`; the post-ValueConv scalar (0x9400 has no ValueConv) is
+  /// interpolated verbatim with a trailing ` C` (e.g. `23.5` → `"23.5 C"`,
+  /// `-5.5` → `"-5.5 C"`). Unlike [`Conv::MetersSuffix`] there is NO
+  /// `inf`/`undef` guard in `Exif.pm`, so the suffix is appended
+  /// unconditionally. With print_conv OFF the bare raw scalar is emitted.
+  CelsiusSuffix,
+  /// `CompositeImageExposureTimes` (0xa462) — `Writable => 'undef'` with a
+  /// bespoke `RawConv`/`PrintConv` pair (`Exif.pm:3068-3119`). The `undef`
+  /// blob is decoded as a sequence of `rational64u` quotients EXCEPT at byte
+  /// offsets 56 and 58 (the 8th and 9th values, indices 7 and 8) which are
+  /// `int16u` counts — `RawConv` (`Exif.pm:3079-3098`) reads each in turn
+  /// until the bytes run out and space-joins them (so `-n` shows the joined
+  /// decimals). The `PrintConv` (`Exif.pm:3104-3115`) then applies
+  /// [`print_exposure_time`] to every element EXCEPT indices 7 and 8 (the
+  /// counts), space-joined (so `-j` shows e.g. `"1/160 1/200 … 3 2 …"`).
+  CompositeImageExposureTimes,
   /// `UserComment` (0x9286) `RawConv` — `ConvertExifText($self,$val,1,$tag)`
   /// (`Exif.pm:2502`, impl `Exif.pm:5554-5601`). The `undef`-format value
   /// carries an 8-byte charset-ID prefix (`ASCII`/`UNICODE`/`JIS`/all-NUL)
@@ -954,10 +975,12 @@ const INTEROP_INDEX: &[(&str, &str)] = &[
 /// Resolve a tag ID against [`EXIF_TAGS`]. `None` for an unknown tag.
 ///
 /// The hand [`EXIF_TAGS`] is consulted FIRST; on a miss the `--kind exif`
-/// generated shadow ([`generated::lookup`]) is the fallback. Step A's shadow is
-/// a strict subset of the hand table, so this fallback is currently inert (it
-/// can only ever return an entry the hand table already has) — the wiring is in
-/// place for Step B, when the generator adds tags BEYOND the hand set.
+/// generated shadow ([`generated::lookup`]) is the fallback. A SHARED id
+/// resolves identically in both (the differential parity test pins that), so
+/// the fallback only matters for the Step-B binary-EXIF coverage-gap ids
+/// ([`crate::exif::EXIF_MAIN_GAP_IDS`]) — `%Exif::Main` leaf tags absent from
+/// the hand subset, which the generator emits and this fallback returns so they
+/// are no longer dropped on the binary IFD path.
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static ExifTag> {
   EXIF_TAGS

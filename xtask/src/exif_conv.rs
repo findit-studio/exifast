@@ -17,9 +17,16 @@
 //! label maps whose `<values>` already MATCH the hand slice, set-for-set →
 //! `Conv::IntLabel`/`StrLabel` from `-listx`) derives declaratively.
 //!
-//! Step A is a BYTE-IDENTICAL shadow restricted to the current hand id set, so
-//! the resolver's only job is to reproduce the hand `Conv`/`GpsConv` for each
-//! shared id; the per-id differential parity test in the lib is the gate.
+//! Step A was a BYTE-IDENTICAL shadow restricted to the current hand id set, so
+//! the resolver reproduced the hand `Conv`/`GpsConv` for each shared id (the
+//! per-id differential parity test in the lib is that gate). Step B ADDS the
+//! binary-EXIF coverage-gap ids ([`crate::EXIF_MAIN_GAP_IDS`] via the lib's
+//! `exif_main_tag_ids` allowlist) — `%Exif::Main` leaf tags the hand subset
+//! drops; the resolver derives their `Conv` the same way (declarative
+//! `<values>` map or `Conv::None`, with the two code-valued ones —
+//! `AmbientTemperature`'s `'"$val C"'` and `CompositeImageExposureTimes`'
+//! undef-decode — pinned in [`EXIF_HANDPORTED`]), and a crafted conformance
+//! fixture is their gate.
 
 use crate::listx::TagModel;
 
@@ -135,6 +142,15 @@ static EXIF_HANDPORTED: &[ExifHandported] = &[
   hp(0xa405, "Conv::FocalLength35mm"),
   hp(0xa432, "Conv::LensInfo"),
   hp(0x0002, "Conv::Version"), // InteropVersion
+  // ---- Step-B binary-coverage-gap code-valued convs (Exif.pm) --------------
+  // `AmbientTemperature` (0x9400) — `PrintConv => '"$val C"'` (Exif.pm:2590).
+  // `-listx` carries no map for this (it is a code-valued PrintConv), so pin
+  // the bespoke degrees-Celsius-suffix conv.
+  hp(0x9400, "Conv::CelsiusSuffix"),
+  // `CompositeImageExposureTimes` (0xa462) — `Writable => 'undef'` with a
+  // bespoke `RawConv`/`PrintConv` pair (Exif.pm:3068-3119) `-listx` cannot
+  // express; pin the dedicated decode-and-PrintExposureTime conv.
+  hp(0xa462, "Conv::CompositeImageExposureTimes"),
   // ---- name-only overrides (conditional ids; conv auto-derives `None`) -----
   hp_name(0x0111, "StripOffsets"),
   hp_name(0x0117, "StripByteCounts"),

@@ -7615,6 +7615,240 @@ fn exif_focallength35_conformance() {
   );
 }
 #[test]
+fn exif_gap_tags_conformance() {
+  // Table-codegen Step B — the binary-EXIF coverage-gap `%Exif::Main` leaf
+  // tags the camera-relevant hand subset (`src/exif/tables.rs` `EXIF_TAGS`)
+  // dropped on the binary IFD path, now emitted via the `--kind exif`
+  // generated shadow (they fall through the hand-first `tables::lookup` to
+  // the generated table). The fixture exercises the plain (`Conv::None`)
+  // tags (ProcessingSoftware/HostComputer/TimeZoneOffset/
+  // StandardOutputSensitivity/ISOSpeed*/ImageNumber/ImageHistory/
+  // SubjectArea/SubjectLocation/Humidity/Pressure/WaterDepth/Acceleration/
+  // CameraElevationAngle/CompositeImageCount), the `Binary => 1` placeholder
+  // (Opto-ElectricConvFactor → `(Binary data 8 bytes, …)`), the two
+  // declarative HASH PrintConvs (SecurityClassification `"C"`→`"Confidential"`
+  // / `Conv::StrLabel`; CompositeImage `2`→`"General Composite Image"` /
+  // `Conv::IntLabel`), and the code-valued `AmbientTemperature` (0x9400,
+  // `Conv::CelsiusSuffix` → `"23.5 C"`). No Make/Model/IFD1 and no
+  // FNumber+FocalLength combo, so bundled emits NO `Composite:*` tags.
+  // Verified byte-identical to bundled `perl exiftool` 13.59.
+  check("Exif_gap_tags.tif", "Exif_gap_tags.tif.json", true);
+  check("Exif_gap_tags.tif", "Exif_gap_tags.tif.n.json", false);
+}
+#[test]
+fn exif_ambient_multi_conformance() {
+  // Codex follow-up to Step B — `AmbientTemperature` (0x9400) `Conv::CelsiusSuffix`
+  // with a MALFORMED count>1 `rational64s` value (`235/10`, `-50/10`). The
+  // PrintConv `'"$val C"'` (Exif.pm:2590) interpolates the WHOLE post-`ReadValue`
+  // value — the space-joined element list — with ` C` appended ONCE, NOT the
+  // first element only. Pre-fix the conv used `first_rational_str` and wrongly
+  // emitted `"23.5 C"`; the fix renders the full value (`value_space_joined`) ⇒
+  // `-j` → `"23.5 -5 C"`, `-n` → `"23.5 -5"` (`-50/10` rounds to `-5` via the
+  // `GetRational64s` `%.10g`). Verified byte-identical to bundled `perl
+  // exiftool` 13.59.
+  check(
+    "Exif_ambient_multi.tif",
+    "Exif_ambient_multi.tif.json",
+    true,
+  );
+  check(
+    "Exif_ambient_multi.tif",
+    "Exif_ambient_multi.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_composite_exposure_conformance() {
+  // Table-codegen Step B — `CompositeImageExposureTimes` (0xa462), the
+  // bespoke `undef`-format `RawConv`/`PrintConv` pair (Exif.pm:3068-3119)
+  // ported as `Conv::CompositeImageExposureTimes`. The blob is decoded as a
+  // sequence of `rational64u` quotients EXCEPT at byte offsets 56/58 (element
+  // indices 7/8) which are `int16u` counts; the PrintConv maps every element
+  // EXCEPT those two through `PrintExposureTime`. The fixture lays 11 values
+  // (7 rationals, the 2 int16u counts `3`/`2`, 2 more rationals) so the
+  // carve-out is exercised: `-j` → `"1/160 … 1/640 3 2 1/160 1/200"`, `-n` →
+  // `"0.00625 … 0.0015625 3 2 0.00625 0.005"`. Verified byte-identical to
+  // bundled `perl exiftool` 13.59.
+  check(
+    "Exif_composite_exposure.tif",
+    "Exif_composite_exposure.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure.tif",
+    "Exif_composite_exposure.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_composite_exposure_edge_conformance() {
+  // Codex follow-up to Step B — `CompositeImageExposureTimes` (0xa462) edge
+  // cases for the `RawConv`→`PrintConv` token pipeline (Exif.pm:3068-3119).
+  // ExifTool's `RawConv` stringifies each rational via `GetRational64u` =
+  // `RoundFloat(n/d, 10)` (`%.10g`, or `undef`/`inf` for a zero denominator)
+  // and the `PrintConv` re-`split`s + `PrintExposureTime`'s each TOKEN — so the
+  // print value is keyed on the ROUNDED token, NOT the unrounded quotient.
+  //   idx0 `2/19` → token `0.1052631579` → `int(0.5 + 1/0.1052631579) =
+  //        int(9.999…) = 9` ⇒ `"1/9"` (the unrounded `0.10526…` has `1/secs =
+  //        9.5` exactly ⇒ `int(10.0) = 10` ⇒ the WRONG `"1/10"`).
+  //   idx1 `0/0` → `GetRational64u` word `undef`; not a float ⇒ passes through
+  //        unchanged (the unrounded path would divide `0/0 = NaN` ⇒ `"NaN"`).
+  // The pre-fix decoder fed the unrounded `f64` quotient to PrintExposureTime
+  // and diverged on BOTH. `-j` → `"1/9 undef …"`, `-n` → `"0.1052631579 undef
+  // …"`. Verified byte-identical to bundled `perl exiftool` 13.59.
+  check(
+    "Exif_composite_exposure_edge.tif",
+    "Exif_composite_exposure_edge.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure_edge.tif",
+    "Exif_composite_exposure_edge.tif.n.json",
+    false,
+  );
+}
+// `Exif_composite_exposure_wrongfmt.tif` (WRONG on-disk format, ASCII not
+// `undef`) and its conformance were REMOVED: faithful wrong-format
+// `CompositeImageExposureTimes` (0xa462) decode is deferred to issue #198. The
+// dispatch now decodes only the verified real-camera `undef`/`RawValue::Bytes`
+// path; any other on-disk shape falls back to `emit_raw`.
+#[test]
+fn exif_composite_exposure_single_conformance() {
+  // Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY ONE
+  // element, pinning the single-element JSON TYPE per ExifTool. The lone token
+  // IS the whole `$val`, so `EscapeJSON` (exiftool:3809) number-gates it: a
+  // numeric token (`single_number` 1/2 → `0.5`; `single_fraction` `-n` token
+  // `0.004`) is a BARE JSON NUMBER, while a non-numeric token (`single_undef`
+  // 0/0 → `undef`; `single_fraction` `-j` PrintExposureTime `1/250`) stays a
+  // quoted STRING. Pre-R3 the conv space-`join`-ed the single token through
+  // `write_str`, emitting a one-element numeric result as a JSON STRING — a
+  // type error the value-semantic harness MASKS; the targeted JSON-type
+  // assertion below (`exif_composite_exposure_single_number_is_json_number`)
+  // catches it. All values verified byte-identical to bundled `exiftool 13.59`.
+  for (fixture, golden, print_on) in [
+    (
+      "Exif_composite_exposure_single_number.tif",
+      "Exif_composite_exposure_single_number.tif.json",
+      true,
+    ),
+    (
+      "Exif_composite_exposure_single_number.tif",
+      "Exif_composite_exposure_single_number.tif.n.json",
+      false,
+    ),
+    (
+      "Exif_composite_exposure_single_undef.tif",
+      "Exif_composite_exposure_single_undef.tif.json",
+      true,
+    ),
+    (
+      "Exif_composite_exposure_single_undef.tif",
+      "Exif_composite_exposure_single_undef.tif.n.json",
+      false,
+    ),
+    (
+      "Exif_composite_exposure_single_fraction.tif",
+      "Exif_composite_exposure_single_fraction.tif.json",
+      true,
+    ),
+    (
+      "Exif_composite_exposure_single_fraction.tif",
+      "Exif_composite_exposure_single_fraction.tif.n.json",
+      false,
+    ),
+  ] {
+    check(fixture, golden, print_on);
+  }
+}
+#[test]
+fn exif_composite_exposure_single_number_is_json_number() {
+  // Codex R3 type-masking guard — the §4 conformance `check` uses the
+  // value-semantic `json_equivalent`, which treats `"0.5" == 0.5` (string vs
+  // number) as equal, so it CANNOT catch a `CompositeImageExposureTimes`
+  // single-element result emitted as a quoted JSON string instead of a bare
+  // number (the R3 finding). Assert the JSON TYPE directly: parse exifast's
+  // `-j` AND `-n` output and require the field be a serde_json NUMBER (not a
+  // String) for the single-NUMERIC-element shapes. Targeted to this tag — the
+  // global harness semantics are unchanged.
+  for fixture in [
+    // correctly-`undef`-typed one-rational blob 1/2 → 0.5 (both modes) — the
+    // real-camera path. (The wrong-format ASCII blob fixture was removed; its
+    // faithful decode is deferred to issue #198.)
+    "Exif_composite_exposure_single_number.tif",
+  ] {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+      .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
+    for print_on in [true, false] {
+      let json = extract_info(fixture, &data, print_on);
+      let v: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("{fixture} ({print_on}): invalid JSON: {e}"));
+      let field = v.as_array().unwrap()[0]
+        .as_object()
+        .unwrap()
+        .get("ExifIFD:CompositeImageExposureTimes")
+        .unwrap_or_else(|| panic!("{fixture} ({print_on}): missing CompositeImageExposureTimes"));
+      assert!(
+        field.is_number(),
+        "{fixture} (print_conv={print_on}): CompositeImageExposureTimes must be a \
+         JSON NUMBER (bundled exiftool emits a bare number), got {field:?} \
+         (a quoted string here = the R3 type regression the value-semantic \
+         conformance check masks)"
+      );
+    }
+  }
+  // The complementary NON-numeric single-element shape stays a STRING: a single
+  // `undef` (0/0) and a `-j` `1/250` fraction MUST remain quoted. Asserting
+  // BOTH directions guards against an over-broad fix that numbers everything.
+  for (fixture, print_on) in [
+    ("Exif_composite_exposure_single_undef.tif", true),
+    ("Exif_composite_exposure_single_undef.tif", false),
+    ("Exif_composite_exposure_single_fraction.tif", true),
+  ] {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+      .unwrap_or_else(|e| panic!("read fixture {fixture}: {e}"));
+    let json = extract_info(fixture, &data, print_on);
+    let v: serde_json::Value = serde_json::from_str(&json)
+      .unwrap_or_else(|e| panic!("{fixture} ({print_on}): invalid JSON: {e}"));
+    let field = v.as_array().unwrap()[0]
+      .as_object()
+      .unwrap()
+      .get("ExifIFD:CompositeImageExposureTimes")
+      .unwrap_or_else(|| panic!("{fixture} ({print_on}): missing CompositeImageExposureTimes"));
+    assert!(
+      field.is_string(),
+      "{fixture} (print_conv={print_on}): a single NON-numeric token \
+       (undef / a `1/N` PrintExposureTime fraction) must stay a quoted JSON \
+       STRING, got {field:?}"
+    );
+  }
+}
+#[test]
+fn exif_ambient_wrongfmt_conformance() {
+  // Codex R2 class-sweep — `AmbientTemperature` (0x9400) `Conv::CelsiusSuffix`
+  // written with the WRONG on-disk format (`undef`, not `rational64s`). Like
+  // the 0xa462 RawConv, `PrintConv => '"$val C"'` (Exif.pm:2590) is NOT
+  // format-gated: it interpolates whatever post-`ReadValue` scalar STRING it
+  // got. For an `undef`-typed value `ReadValue` returns the raw byte string
+  // VERBATIM (no NUL-trim — only `string` trims, ExifTool.pm:6312), so the
+  // 4-byte `b"-5.5"` → `$val` = `"-5.5"`: `-j` → `"-5.5 C"` (quoted), `-n` →
+  // `-5.5` (a bare JSON number via the EscapeJSON gate). This `undef`/`Bytes`
+  // shape is the one `value_space_joined` does NOT render; pre-fix the conv fell
+  // to the binary `write_bytes` path instead of `"-5.5 C"`. Verified
+  // byte-identical to bundled `perl exiftool` 13.59.
+  check(
+    "Exif_ambient_wrongfmt.tif",
+    "Exif_ambient_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_ambient_wrongfmt.tif",
+    "Exif_ambient_wrongfmt.tif.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_gps_after_interop_conformance() {
   // PR #36 Codex R12 F2 — the Windows Phone 7.5 InteropIFD/GPS pointer
   // collision. IFD0's GPSInfo (0x8825) and ExifIFD's InteropOffset

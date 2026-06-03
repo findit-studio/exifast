@@ -3,9 +3,12 @@
 //    --out <path>`)
 // source table: GPS::Main
 //
-// Step-A BYTE-IDENTICAL shadow of the hand table — emits ONLY the ported
-// hand id set, each resolved to the SAME conv the hand table carries. A
-// child module of the hand table (`super::*` const refs resolve there).
+// Generated shadow of the hand table — the ported camera-relevant hand id
+// set PLUS the binary-EXIF coverage-gap ids (Step B). Every SHARED id
+// resolves to the SAME conv the hand table carries; the gap ids are NOT in
+// the hand table, so the hand-first `lookup` falls through here and they
+// emit. A child module of the hand table (`super::*` const refs resolve
+// there); the hand table stays a strict SUBSET of the generated table.
 
 use super::{Conv, GpsConv, GpsTag};
 
@@ -178,9 +181,10 @@ static EXIF_GPSHPOSITIONINGERROR: GpsTag = GpsTag {
   conv: GpsConv::Plain(Conv::MetersSuffix),
 };
 
-/// `GPS::Main` — the Step-A generated shadow (32 ported ids). Consulted by the
-/// hand `lookup` AFTER its own table (this is a strict subset, so a hit
-/// here always AGREES with the hand entry).
+/// `GPS::Main` — the generated shadow (32 ids: the ported hand subset + the
+/// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
+/// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
+/// in the hand table) is the only one this fallback actually returns.
 pub fn lookup(id: u16) -> Option<&'static GpsTag> {
   match id {
     0x0000 => Some(&EXIF_GPSVERSIONID),

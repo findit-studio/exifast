@@ -25,6 +25,8 @@ SHORT = 3
 LONG = 4
 RATIONAL = 5
 UNDEF = 7
+SSHORT = 8
+SRATIONAL = 10
 
 
 class TiffBuilder:
@@ -1391,6 +1393,321 @@ def make_jpeg_unknown_header():
     return b'JUNK' + b'\xff\xd8' + app1 + b'\xff\xda\x00\x02' + b'\xff\xd9'
 
 
+# ===========================================================================
+# Step-B binary-EXIF coverage-gap tags (table-codegen) — Exif.pm leaf tags the
+# camera-relevant hand subset dropped, now emitted via the generated table.
+# ===========================================================================
+
+
+def _exififd_tif(bo, exif_entries):
+    """A minimal standalone TIFF: IFD0 (ExifOffset only) -> ExifIFD carrying
+    `exif_entries`. Each entry is `(tag, fmt, count, payload)` where payload is
+    an int (inline scalar, packed into the 4-byte value word, hi-justified for
+    SHORT) or bytes (<=4 inline left-justified, else out-of-line in a pool).
+
+    Hand-laid (not via TiffBuilder) so the SubjectArea / CompositeImageExposureTimes
+    rational / undef / multi-int payloads encode exactly. No Make/Model/IFD1 and
+    no FNumber+FocalLength combo, so bundled emits NO Composite:* tags (mirrors
+    `Exif_focallength35.tif`)."""
+    marker = b'II' if bo == '<' else b'MM'
+    ifd0_off = 8
+    ifd0_len = 2 + 1 * 12 + 4
+    exif_off = ifd0_off + ifd0_len
+    n = len(exif_entries)
+    exif_len = 2 + n * 12 + 4
+    pool_start = exif_off + exif_len
+    pool = bytearray()
+    # Resolve each entry's 4-byte value word (inline) or pool offset.
+    words = []
+    for (tag, fmt, count, payload) in exif_entries:
+        if isinstance(payload, int):
+            if fmt == SHORT:
+                words.append(struct.pack(bo + 'H', payload) + b'\x00\x00')
+            else:
+                words.append(struct.pack(bo + 'I', payload))
+        else:
+            blob = payload
+            if len(blob) <= 4:
+                words.append(blob + b'\x00' * (4 - len(blob)))
+            else:
+                off = pool_start + len(pool)
+                pool += blob
+                if len(pool) % 2:
+                    pool += b'\x00'
+                words.append(struct.pack(bo + 'I', off))
+    out = bytearray()
+    out += marker + struct.pack(bo + 'H', 0x002a) + struct.pack(bo + 'I', ifd0_off)
+    # IFD0: ExifOffset pointer only.
+    out += struct.pack(bo + 'H', 1)
+    out += _raw_entry(bo, 0x8769, LONG, 1, exif_off)
+    out += struct.pack(bo + 'I', 0)
+    # ExifIFD.
+    out += struct.pack(bo + 'H', n)
+    for (tag, fmt, count, _payload), word in zip(exif_entries, words):
+        out += struct.pack(bo + 'HHI', tag, fmt, count) + word
+    out += struct.pack(bo + 'I', 0)
+    out += pool
+    return bytes(out)
+
+
+def make_exif_gap_tags_tif():
+    r"""Step-B binary-EXIF coverage gap — `%Exif::Main` leaf tags the
+    camera-relevant hand subset (`src/exif/tables.rs` `EXIF_TAGS`) did NOT
+    carry, so they were silently dropped on the binary IFD path. The
+    `--kind exif` generator now emits them (they fall through the hand-first
+    `lookup` to the generated shadow). This fixture exercises the
+    declarative/plain ones + the two simple code-valued PrintConvs in ONE
+    ExifIFD; the multi-element `CompositeImageExposureTimes` int16u carve-out
+    is in the separate `Exif_composite_exposure.tif`.
+
+    Tags + the bundled-ExifTool 13.59 rendering each pins (verified):
+      - ProcessingSoftware (0x0b, IFD0 string)      "ACME RAW 2.1"
+      - HostComputer       (0x13c, IFD0 string)     "studio-mac"
+      - Opto-ElectricConvFactor (0x8828, Binary=>1) "(Binary data 8 bytes, ...)"
+      - TimeZoneOffset     (0x882a, int16s[2])       "1 2"
+      - StandardOutputSensitivity (0x8831, int32u)   400
+      - ISOSpeed           (0x8833, int32u)          800
+      - ISOSpeedLatitudeyyy (0x8834, int32u)         100
+      - ISOSpeedLatitudezzz (0x8835, int32u)         200
+      - ImageNumber        (0x9211, int32u)          42
+      - SecurityClassification (0x9212, string PrintConv) "C" -> "Confidential"
+      - ImageHistory       (0x9213, string)          "edit log"
+      - SubjectArea        (0x9214, int16u[3])        "320 240 100"
+      - AmbientTemperature (0x9400, srational PrintConv '"$val C"')  "23.5 C"
+      - Humidity           (0x9401, rational64u)      "60"
+      - Pressure           (0x9402, rational64u)      "1013"
+      - WaterDepth         (0x9403, rational64s)      "-5.5"
+      - Acceleration       (0x9404, rational64u)      "9800"
+      - CameraElevationAngle (0x9405, rational64s)    "-12.5"
+      - SubjectLocation    (0xa214, int16u[2])        "320 240"
+      - CompositeImage     (0xa460, int16u PrintConv) 2 -> "General Composite Image"
+      - CompositeImageCount (0xa461, int16u[2])       "4 3"
+
+    Big-endian (MM). Note 0x0b/0x13c carry `WriteGroup => 'IFD0'` but are
+    placed in the ExifIFD here purely to keep one directory; the family-1
+    group is whatever IFD they are FOUND in (bundled resolves them by id in
+    whatever table the directory uses — `%Exif::Main` covers both IFD0 and
+    ExifIFD), so they emit under `ExifIFD:` here, matching bundled run on
+    THIS file."""
+    bo = '>'
+
+    def srat64(num, den):
+        return struct.pack(bo + 'iI', num, den)
+
+    def rat64(num, den):
+        return struct.pack(bo + 'II', num, den)
+
+    entries = [
+        (0x000b, ASCII, 13, b'ACME RAW 2.1\x00'),
+        (0x013c, ASCII, 11, b'studio-mac\x00'),
+        (0x8828, UNDEF, 8, bytes([1, 2, 3, 4, 5, 6, 7, 8])),  # OECF binary
+        (0x882a, SSHORT, 2, struct.pack(bo + 'hh', 1, 2)),    # int16s[2] -> inline
+        (0x8831, LONG, 1, 400),
+        (0x8833, LONG, 1, 800),
+        (0x8834, LONG, 1, 100),
+        (0x8835, LONG, 1, 200),
+        (0x9211, LONG, 1, 42),
+        (0x9212, ASCII, 2, b'C\x00'),                          # SecurityClassification
+        (0x9213, ASCII, 9, b'edit log\x00'),
+        (0x9214, SHORT, 3, struct.pack(bo + 'HHH', 320, 240, 100)),  # SubjectArea
+        (0x9400, SRATIONAL, 1, srat64(235, 10)),               # AmbientTemperature 23.5
+        (0x9401, RATIONAL, 1, rat64(60, 1)),                   # Humidity
+        (0x9402, RATIONAL, 1, rat64(1013, 1)),                 # Pressure
+        (0x9403, SRATIONAL, 1, srat64(-55, 10)),               # WaterDepth -5.5
+        (0x9404, RATIONAL, 1, rat64(9800, 1)),                 # Acceleration
+        (0x9405, SRATIONAL, 1, srat64(-125, 10)),              # CameraElevationAngle -12.5
+        (0xa214, SHORT, 2, struct.pack(bo + 'HH', 320, 240)),  # SubjectLocation -> inline
+        (0xa460, SHORT, 1, 2),                                 # CompositeImage
+        (0xa461, SHORT, 2, struct.pack(bo + 'HH', 4, 3)),      # CompositeImageCount -> inline
+    ]
+    return _exififd_tif(bo, entries)
+
+
+def make_exif_composite_exposure_tif():
+    r"""Step-B — `CompositeImageExposureTimes` (0xa462) only, exercising the
+    bespoke `RawConv`/`PrintConv` (Exif.pm:3068-3119). The `undef` blob is a
+    sequence of `rational64u` quotients EXCEPT at byte offsets 56 and 58 (the
+    8th and 9th values, element indices 7 and 8) which are `int16u` counts;
+    `PrintConv` applies `PrintExposureTime` to every element EXCEPT those two.
+
+    11 values laid out to hit the carve-out (verified against bundled 13.59):
+      idx 0..6  rational64u 1/160 1/200 1/250 1/320 1/400 1/500 1/640
+      idx 7,8   int16u      3 2                 (counts — NOT PrintExposureTime'd)
+      idx 9,10  rational64u 1/160 1/200
+    -j  -> "1/160 1/200 1/250 1/320 1/400 1/500 1/640 3 2 1/160 1/200"
+    -n  -> "0.00625 0.005 0.004 0.003125 0.0025 0.002 0.0015625 3 2 0.00625 0.005"
+
+    Big-endian (MM)."""
+    bo = '>'
+    blob = bytearray()
+    for (num, den) in [(1, 160), (1, 200), (1, 250), (1, 320), (1, 400), (1, 500), (1, 640)]:
+        blob += struct.pack(bo + 'II', num, den)   # 7 rational64u -> bytes 0..56
+    blob += struct.pack(bo + 'H', 3)               # idx7 int16u at offset 56
+    blob += struct.pack(bo + 'H', 2)               # idx8 int16u at offset 58
+    for (num, den) in [(1, 160), (1, 200)]:
+        blob += struct.pack(bo + 'II', num, den)   # idx9,10 rational64u from offset 60
+    return _exififd_tif(bo, [(0xa462, UNDEF, len(blob), bytes(blob))])
+
+
+def make_exif_composite_exposure_edge_tif():
+    r"""Step-B Codex follow-up — `CompositeImageExposureTimes` (0xa462) edge
+    cases for the `RawConv`→`PrintConv` token pipeline (Exif.pm:3068-3119).
+
+    ExifTool's `RawConv` stringifies each rational via `GetRational64u` =
+    `RoundFloat(n/d, 10)` (= `%.10g`, or the bare word `undef`/`inf` for a zero
+    denominator) and space-joins; the `PrintConv` then re-`split`s and feeds
+    each TOKEN to `PrintExposureTime` (except element indices 7/8). So the print
+    value is keyed on the ALREADY-ROUNDED token, not the unrounded quotient.
+
+    Two cases that diverge if the unrounded `f64` quotient is used instead:
+      idx 0  rational64u  2/19  — the rounded token `0.1052631579` feeds
+             `PrintExposureTime` ⇒ `int(0.5 + 1/0.1052631579) = int(9.999…)
+             = 9` ⇒ `"1/9"`. The UNROUNDED quotient `0.10526315789…` has
+             `1/secs = 9.5` exactly ⇒ `int(10.0) = 10` ⇒ the WRONG `"1/10"`.
+      idx 1  rational64u  0/0   — `GetRational64u` returns the word `undef`
+             (zero denominator, zero numerator); `PrintExposureTime` is NOT a
+             float ⇒ passes `undef` through unchanged. The unrounded path would
+             divide `0/0 = NaN` ⇒ the WRONG `"NaN"`.
+      idx 2..6 rational64u 1/250 1/320 1/400 1/500 1/640  (filler to byte 56)
+      idx 7,8  int16u      3 2                 (counts — NOT PrintExposureTime'd)
+      idx 9,10 rational64u 1/160 1/200
+    -j -> "1/9 undef 1/250 1/320 1/400 1/500 1/640 3 2 1/160 1/200"
+    -n -> "0.1052631579 undef 0.004 0.003125 0.0025 0.002 0.0015625 3 2 0.00625 0.005"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Big-endian (MM)."""
+    bo = '>'
+    blob = bytearray()
+    for (num, den) in [(2, 19), (0, 0), (1, 250), (1, 320), (1, 400), (1, 500), (1, 640)]:
+        blob += struct.pack(bo + 'II', num, den)   # 7 rational64u -> bytes 0..56
+    blob += struct.pack(bo + 'H', 3)               # idx7 int16u at offset 56
+    blob += struct.pack(bo + 'H', 2)               # idx8 int16u at offset 58
+    for (num, den) in [(1, 160), (1, 200)]:
+        blob += struct.pack(bo + 'II', num, den)   # idx9,10 rational64u from offset 60
+    return _exififd_tif(bo, [(0xa462, UNDEF, len(blob), bytes(blob))])
+
+
+def make_exif_ambient_multi_tif():
+    r"""Step-B Codex follow-up — `AmbientTemperature` (0x9400) with a MALFORMED
+    count>1 `rational64s` value, pinning the `PrintConv => '"$val C"'`
+    string-interpolation over the WHOLE (space-joined) value (Exif.pm:2590).
+
+    0x9400 is normally a single `rational64s`, but `"$val C"` interpolates the
+    entire post-`ReadValue` `$val`; for count>1 that is the space-joined element
+    list, with the ` C` suffix appended ONCE to the whole string (NOT per
+    element, and NOT only the first element).
+
+      0x9400 SRATIONAL count=2: 235/10, -50/10
+    -j -> "23.5 -5 C"   (the joined value `23.5 -5` + one ` C`; `-50/10`
+                         rounds via `GetRational64s` `%.10g` to `-5`, not `-5.0`)
+    -n -> "23.5 -5"
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Big-endian (MM)."""
+    bo = '>'
+
+    def srat64(num, den):
+        return struct.pack(bo + 'iI', num, den)
+
+    blob = srat64(235, 10) + srat64(-50, 10)       # 16 bytes -> out-of-line pool
+    return _exififd_tif(bo, [(0x9400, SRATIONAL, 2, blob)])
+
+
+# `make_exif_composite_exposure_wrongfmt_tif` (WRONG on-disk format, ASCII not
+# `undef`) was removed: faithful wrong-format `CompositeImageExposureTimes`
+# (0xa462) decode is deferred to issue #198. Only the verified real-camera
+# `undef` 0xa462 path is decoded, so only `undef`-typed 0xa462 fixtures remain.
+def make_exif_composite_exposure_single_number_tif():
+    r"""Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY
+    ONE numeric element, pinning the single-element JSON TYPE (a BARE NUMBER,
+    not a quoted string).
+
+    ExifTool's bespoke `RawConv`/`PrintConv` (Exif.pm:3068-3119) produce a
+    SINGLE Perl scalar; with one element that scalar IS the lone token, so
+    `EscapeJSON` (exiftool:3809) number-gates it to a bare JSON number. A
+    correctly `undef`-typed 8-byte blob = ONE `rational64u` 1/2 (the walk stops
+    at offset 8: 8 + 8 > len 8):
+      idx 0  rational64u 1/2  -> RawConv token `0.5`; PrintExposureTime(0.5):
+             0.5 > 0.25001 -> sprintf("%.1f") = `0.5`.
+    -j -> 0.5            (a BARE JSON number)
+    -n -> 0.5            (the RawConv token; a BARE JSON number)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    Pre-R3 the conv space-`join`-ed the single token through `write_str`, so a
+    one-element NUMERIC result was emitted as a JSON STRING (`"0.5"`); the
+    value-semantic conformance harness MASKED the type error. Big-endian (MM)."""
+    bo = '>'
+    blob = struct.pack(bo + 'II', 1, 2)             # one rational64u 1/2 = 0.5
+    return _exififd_tif(bo, [(0xa462, UNDEF, len(blob), bytes(blob))])
+
+
+def make_exif_composite_exposure_single_undef_tif():
+    r"""Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY
+    ONE `undef` element, pinning that a single NON-numeric token stays a quoted
+    JSON STRING (NOT a number, NOT NaN).
+
+    A correctly `undef`-typed 8-byte blob = ONE `rational64u` 0/0 (zero
+    denominator). `GetRational64u` returns the bare word `undef`; the
+    `PrintConv` `PrintExposureTime` is NOT a float (Exif.pm:5704) so it passes
+    `undef` through unchanged.
+      idx 0  rational64u 0/0  -> token `undef` (both modes).
+    -j -> "undef"        (a quoted JSON string — out of the number gate)
+    -n -> "undef"        (a quoted JSON string)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    `emit_gated_number` keeps this a string (the word `undef` fails the
+    `EscapeJSON` number regex). Big-endian (MM)."""
+    bo = '>'
+    blob = struct.pack(bo + 'II', 0, 0)             # one rational64u 0/0 = undef
+    return _exififd_tif(bo, [(0xa462, UNDEF, len(blob), bytes(blob))])
+
+
+def make_exif_composite_exposure_single_fraction_tif():
+    r"""Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY
+    ONE element whose PrintConv renders a `1/N` fraction, pinning the
+    PER-TOKEN, PER-MODE JSON typing (the discriminating case): a single
+    `PrintExposureTime` fraction is a STRING in `-j` but the SAME element's
+    RawConv decimal is a NUMBER in `-n`.
+
+    A correctly `undef`-typed 8-byte blob = ONE `rational64u` 1/250:
+      -j: PrintExposureTime(0.004) = `1/250` (a string; 0.004 <= 0.25001 ->
+          int(0.5 + 1/0.004) = 250 -> "1/250").
+      -n: the RawConv token `0.004` (a bare number).
+    -j -> "1/250"        (a quoted JSON string)
+    -n -> 0.004          (a BARE JSON number)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    This is the case that proves the single-element fix gates PER TOKEN (reusing
+    `emit_gated_number`), NOT per element-count: the `-j` token `1/250` fails the
+    number regex (the `/`) -> string, while the `-n` token `0.004` matches ->
+    number. Big-endian (MM)."""
+    bo = '>'
+    blob = struct.pack(bo + 'II', 1, 250)           # one rational64u 1/250
+    return _exififd_tif(bo, [(0xa462, UNDEF, len(blob), bytes(blob))])
+
+
+def make_exif_ambient_wrongfmt_tif():
+    r"""Codex R2/F class-sweep — `AmbientTemperature` (0x9400) written with the
+    WRONG on-disk format (`undef` instead of `rational64s`), pinning that the
+    `PrintConv => '"$val C"'` (Exif.pm:2590) is likewise NOT format-gated.
+
+    ExifTool reads the value per the on-disk format first; for an `undef`-typed
+    value `ReadValue` returns the raw byte string VERBATIM (no NUL-trim — only a
+    `string` format trims, ExifTool.pm:6312). So the 4-byte `undef` blob `b"-5.5"`
+    becomes the post-`ReadValue` `$val` = `"-5.5"`, and `"$val C"` appends ` C`:
+      -j -> "-5.5 C"   (a quoted string — `"$val C"` has a space + letter)
+      -n -> -5.5       (the bare `$val`; a BARE JSON number via the EscapeJSON gate)
+    (both verified byte-identical against bundled `perl exiftool` 13.59.)
+
+    This is the `undef`/`Bytes` shape that `value_space_joined` does NOT render
+    (it carries no numeric `ReadValue` form); without the fix exifast would emit
+    the value via the binary `write_bytes` path instead of `"-5.5 C"`.
+    Big-endian (MM)."""
+    bo = '>'
+    payload = b'-5.5'                               # undef, 4 bytes -> inline word
+    return _exififd_tif(bo, [(0x9400, UNDEF, len(payload), payload)])
+
+
 if __name__ == '__main__':
     out_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
     with open(f'{out_dir}/Exif.tif', 'wb') as f:
@@ -1457,6 +1774,22 @@ if __name__ == '__main__':
         f.write(make_exif_usercomment_int8u_tif())
     with open(f'{out_dir}/Exif_trailing_space.tif', 'wb') as f:
         f.write(make_exif_trailing_space_tif())
+    with open(f'{out_dir}/Exif_gap_tags.tif', 'wb') as f:
+        f.write(make_exif_gap_tags_tif())
+    with open(f'{out_dir}/Exif_composite_exposure.tif', 'wb') as f:
+        f.write(make_exif_composite_exposure_tif())
+    with open(f'{out_dir}/Exif_composite_exposure_edge.tif', 'wb') as f:
+        f.write(make_exif_composite_exposure_edge_tif())
+    with open(f'{out_dir}/Exif_ambient_multi.tif', 'wb') as f:
+        f.write(make_exif_ambient_multi_tif())
+    with open(f'{out_dir}/Exif_composite_exposure_single_number.tif', 'wb') as f:
+        f.write(make_exif_composite_exposure_single_number_tif())
+    with open(f'{out_dir}/Exif_composite_exposure_single_undef.tif', 'wb') as f:
+        f.write(make_exif_composite_exposure_single_undef_tif())
+    with open(f'{out_dir}/Exif_composite_exposure_single_fraction.tif', 'wb') as f:
+        f.write(make_exif_composite_exposure_single_fraction_tif())
+    with open(f'{out_dir}/Exif_ambient_wrongfmt.tif', 'wb') as f:
+        f.write(make_exif_ambient_wrongfmt_tif())
     with open(f'{out_dir}/JPEG_unknown_header.jpg', 'wb') as f:
         f.write(make_jpeg_unknown_header())
     print(f'wrote {out_dir}/Exif.tif, {out_dir}/ExifGPS.tif, '

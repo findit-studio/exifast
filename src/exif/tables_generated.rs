@@ -3,9 +3,12 @@
 //    --out <path>`)
 // source table: Exif::Main
 //
-// Step-A BYTE-IDENTICAL shadow of the hand table — emits ONLY the ported
-// hand id set, each resolved to the SAME conv the hand table carries. A
-// child module of the hand table (`super::*` const refs resolve there).
+// Generated shadow of the hand table — the ported camera-relevant hand id
+// set PLUS the binary-EXIF coverage-gap ids (Step B). Every SHARED id
+// resolves to the SAME conv the hand table carries; the gap ids are NOT in
+// the hand table, so the hand-first `lookup` falls through here and they
+// emit. A child module of the hand table (`super::*` const refs resolve
+// there); the hand table stays a strict SUBSET of the generated table.
 
 use super::{Conv, ExifTag};
 
@@ -18,6 +21,11 @@ static EXIF_INTEROPVERSION: ExifTag = ExifTag {
   id: 0x0002,
   name: "InteropVersion",
   conv: Conv::Version,
+};
+static EXIF_PROCESSINGSOFTWARE: ExifTag = ExifTag {
+  id: 0x000b,
+  name: "ProcessingSoftware",
+  conv: Conv::None,
 };
 static EXIF_SUBFILETYPE: ExifTag = ExifTag {
   id: 0x00fe,
@@ -138,6 +146,11 @@ static EXIF_ARTIST: ExifTag = ExifTag {
   name: "Artist",
   conv: Conv::TrimTrailingWhitespace,
 };
+static EXIF_HOSTCOMPUTER: ExifTag = ExifTag {
+  id: 0x013c,
+  name: "HostComputer",
+  conv: Conv::None,
+};
 static EXIF_PREDICTOR: ExifTag = ExifTag {
   id: 0x013d,
   name: "Predictor",
@@ -219,14 +232,44 @@ static EXIF_ISO: ExifTag = ExifTag {
   name: "ISO",
   conv: Conv::None,
 };
+static EXIF_OPTO_ELECTRICCONVFACTOR: ExifTag = ExifTag {
+  id: 0x8828,
+  name: "Opto-ElectricConvFactor",
+  conv: Conv::None,
+};
+static EXIF_TIMEZONEOFFSET: ExifTag = ExifTag {
+  id: 0x882a,
+  name: "TimeZoneOffset",
+  conv: Conv::None,
+};
 static EXIF_SENSITIVITYTYPE: ExifTag = ExifTag {
   id: 0x8830,
   name: "SensitivityType",
   conv: Conv::None,
 };
+static EXIF_STANDARDOUTPUTSENSITIVITY: ExifTag = ExifTag {
+  id: 0x8831,
+  name: "StandardOutputSensitivity",
+  conv: Conv::None,
+};
 static EXIF_RECOMMENDEDEXPOSUREINDEX: ExifTag = ExifTag {
   id: 0x8832,
   name: "RecommendedExposureIndex",
+  conv: Conv::None,
+};
+static EXIF_ISOSPEED: ExifTag = ExifTag {
+  id: 0x8833,
+  name: "ISOSpeed",
+  conv: Conv::None,
+};
+static EXIF_ISOSPEEDLATITUDEYYY: ExifTag = ExifTag {
+  id: 0x8834,
+  name: "ISOSpeedLatitudeyyy",
+  conv: Conv::None,
+};
+static EXIF_ISOSPEEDLATITUDEZZZ: ExifTag = ExifTag {
+  id: 0x8835,
+  name: "ISOSpeedLatitudezzz",
   conv: Conv::None,
 };
 static EXIF_EXIFVERSION: ExifTag = ExifTag {
@@ -328,6 +371,32 @@ static EXIF_FOCALLENGTH: ExifTag = ExifTag {
   name: "FocalLength",
   conv: Conv::FocalLengthMm,
 };
+static EXIF_IMAGENUMBER: ExifTag = ExifTag {
+  id: 0x9211,
+  name: "ImageNumber",
+  conv: Conv::None,
+};
+static EXIF_SECURITYCLASSIFICATION: ExifTag = ExifTag {
+  id: 0x9212,
+  name: "SecurityClassification",
+  conv: Conv::StrLabel(&[
+    ("C", "Confidential"),
+    ("R", "Restricted"),
+    ("S", "Secret"),
+    ("T", "Top Secret"),
+    ("U", "Unclassified"),
+  ]),
+};
+static EXIF_IMAGEHISTORY: ExifTag = ExifTag {
+  id: 0x9213,
+  name: "ImageHistory",
+  conv: Conv::None,
+};
+static EXIF_SUBJECTAREA: ExifTag = ExifTag {
+  id: 0x9214,
+  name: "SubjectArea",
+  conv: Conv::None,
+};
 static EXIF_USERCOMMENT: ExifTag = ExifTag {
   id: 0x9286,
   name: "UserComment",
@@ -347,6 +416,36 @@ static EXIF_SUBSECTIMEDIGITIZED: ExifTag = ExifTag {
   id: 0x9292,
   name: "SubSecTimeDigitized",
   conv: Conv::TrimTrailingSpaces,
+};
+static EXIF_AMBIENTTEMPERATURE: ExifTag = ExifTag {
+  id: 0x9400,
+  name: "AmbientTemperature",
+  conv: Conv::CelsiusSuffix,
+};
+static EXIF_HUMIDITY: ExifTag = ExifTag {
+  id: 0x9401,
+  name: "Humidity",
+  conv: Conv::None,
+};
+static EXIF_PRESSURE: ExifTag = ExifTag {
+  id: 0x9402,
+  name: "Pressure",
+  conv: Conv::None,
+};
+static EXIF_WATERDEPTH: ExifTag = ExifTag {
+  id: 0x9403,
+  name: "WaterDepth",
+  conv: Conv::None,
+};
+static EXIF_ACCELERATION: ExifTag = ExifTag {
+  id: 0x9404,
+  name: "Acceleration",
+  conv: Conv::None,
+};
+static EXIF_CAMERAELEVATIONANGLE: ExifTag = ExifTag {
+  id: 0x9405,
+  name: "CameraElevationAngle",
+  conv: Conv::None,
 };
 static EXIF_FLASHPIXVERSION: ExifTag = ExifTag {
   id: 0xa000,
@@ -392,6 +491,11 @@ static EXIF_FOCALPLANERESOLUTIONUNIT: ExifTag = ExifTag {
   id: 0xa210,
   name: "FocalPlaneResolutionUnit",
   conv: Conv::IntLabel(super::RESOLUTION_UNIT),
+};
+static EXIF_SUBJECTLOCATION: ExifTag = ExifTag {
+  id: 0xa214,
+  name: "SubjectLocation",
+  conv: Conv::None,
 };
 static EXIF_EXPOSUREINDEX: ExifTag = ExifTag {
   id: 0xa215,
@@ -524,14 +628,36 @@ static EXIF_LENSSERIALNUMBER: ExifTag = ExifTag {
   name: "LensSerialNumber",
   conv: Conv::None,
 };
+static EXIF_COMPOSITEIMAGE: ExifTag = ExifTag {
+  id: 0xa460,
+  name: "CompositeImage",
+  conv: Conv::IntLabel(&[
+    (0, "Unknown"),
+    (1, "Not a Composite Image"),
+    (2, "General Composite Image"),
+    (3, "Composite Image Captured While Shooting"),
+  ]),
+};
+static EXIF_COMPOSITEIMAGECOUNT: ExifTag = ExifTag {
+  id: 0xa461,
+  name: "CompositeImageCount",
+  conv: Conv::None,
+};
+static EXIF_COMPOSITEIMAGEEXPOSURETIMES: ExifTag = ExifTag {
+  id: 0xa462,
+  name: "CompositeImageExposureTimes",
+  conv: Conv::CompositeImageExposureTimes,
+};
 
-/// `Exif::Main` — the Step-A generated shadow (93 ported ids). Consulted by the
-/// hand `lookup` AFTER its own table (this is a strict subset, so a hit
-/// here always AGREES with the hand entry).
+/// `Exif::Main` — the generated shadow (115 ids: the ported hand subset + the
+/// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own
+/// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT
+/// in the hand table) is the only one this fallback actually returns.
 pub fn lookup(id: u16) -> Option<&'static ExifTag> {
   match id {
     0x0001 => Some(&EXIF_INTEROPINDEX),
     0x0002 => Some(&EXIF_INTEROPVERSION),
+    0x000b => Some(&EXIF_PROCESSINGSOFTWARE),
     0x00fe => Some(&EXIF_SUBFILETYPE),
     0x0100 => Some(&EXIF_IMAGEWIDTH),
     0x0101 => Some(&EXIF_IMAGEHEIGHT),
@@ -554,6 +680,7 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x0131 => Some(&EXIF_SOFTWARE),
     0x0132 => Some(&EXIF_MODIFYDATE),
     0x013b => Some(&EXIF_ARTIST),
+    0x013c => Some(&EXIF_HOSTCOMPUTER),
     0x013d => Some(&EXIF_PREDICTOR),
     0x013e => Some(&EXIF_WHITEPOINT),
     0x013f => Some(&EXIF_PRIMARYCHROMATICITIES),
@@ -568,8 +695,14 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x8822 => Some(&EXIF_EXPOSUREPROGRAM),
     0x8824 => Some(&EXIF_SPECTRALSENSITIVITY),
     0x8827 => Some(&EXIF_ISO),
+    0x8828 => Some(&EXIF_OPTO_ELECTRICCONVFACTOR),
+    0x882a => Some(&EXIF_TIMEZONEOFFSET),
     0x8830 => Some(&EXIF_SENSITIVITYTYPE),
+    0x8831 => Some(&EXIF_STANDARDOUTPUTSENSITIVITY),
     0x8832 => Some(&EXIF_RECOMMENDEDEXPOSUREINDEX),
+    0x8833 => Some(&EXIF_ISOSPEED),
+    0x8834 => Some(&EXIF_ISOSPEEDLATITUDEYYY),
+    0x8835 => Some(&EXIF_ISOSPEEDLATITUDEZZZ),
     0x9000 => Some(&EXIF_EXIFVERSION),
     0x9003 => Some(&EXIF_DATETIMEORIGINAL),
     0x9004 => Some(&EXIF_CREATEDATE),
@@ -588,10 +721,20 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0x9208 => Some(&EXIF_LIGHTSOURCE),
     0x9209 => Some(&EXIF_FLASH),
     0x920a => Some(&EXIF_FOCALLENGTH),
+    0x9211 => Some(&EXIF_IMAGENUMBER),
+    0x9212 => Some(&EXIF_SECURITYCLASSIFICATION),
+    0x9213 => Some(&EXIF_IMAGEHISTORY),
+    0x9214 => Some(&EXIF_SUBJECTAREA),
     0x9286 => Some(&EXIF_USERCOMMENT),
     0x9290 => Some(&EXIF_SUBSECTIME),
     0x9291 => Some(&EXIF_SUBSECTIMEORIGINAL),
     0x9292 => Some(&EXIF_SUBSECTIMEDIGITIZED),
+    0x9400 => Some(&EXIF_AMBIENTTEMPERATURE),
+    0x9401 => Some(&EXIF_HUMIDITY),
+    0x9402 => Some(&EXIF_PRESSURE),
+    0x9403 => Some(&EXIF_WATERDEPTH),
+    0x9404 => Some(&EXIF_ACCELERATION),
+    0x9405 => Some(&EXIF_CAMERAELEVATIONANGLE),
     0xa000 => Some(&EXIF_FLASHPIXVERSION),
     0xa001 => Some(&EXIF_COLORSPACE),
     0xa002 => Some(&EXIF_EXIFIMAGEWIDTH),
@@ -601,6 +744,7 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0xa20e => Some(&EXIF_FOCALPLANEXRESOLUTION),
     0xa20f => Some(&EXIF_FOCALPLANEYRESOLUTION),
     0xa210 => Some(&EXIF_FOCALPLANERESOLUTIONUNIT),
+    0xa214 => Some(&EXIF_SUBJECTLOCATION),
     0xa215 => Some(&EXIF_EXPOSUREINDEX),
     0xa217 => Some(&EXIF_SENSINGMETHOD),
     0xa300 => Some(&EXIF_FILESOURCE),
@@ -623,6 +767,9 @@ pub fn lookup(id: u16) -> Option<&'static ExifTag> {
     0xa433 => Some(&EXIF_LENSMAKE),
     0xa434 => Some(&EXIF_LENSMODEL),
     0xa435 => Some(&EXIF_LENSSERIALNUMBER),
+    0xa460 => Some(&EXIF_COMPOSITEIMAGE),
+    0xa461 => Some(&EXIF_COMPOSITEIMAGECOUNT),
+    0xa462 => Some(&EXIF_COMPOSITEIMAGEEXPOSURETIMES),
     _ => None,
   }
 }

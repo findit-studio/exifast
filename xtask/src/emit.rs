@@ -534,16 +534,20 @@ pub enum ExifKind {
 
 /// Render `model` (`Exif::Main` or `GPS::Main`) as committed Rust source in the
 /// EXIF module's hand `ExifTag` / `GpsTag` vocabulary — the `--kind exif` emit
-/// target — RESTRICTED to `allow_ids` (the ported hand id set,
+/// target — RESTRICTED to `allow_ids` (the generator's allowlist,
 /// `exifast::exif::exif_main_tag_ids` / `gps_main_tag_ids`).
 ///
-/// Step A is a BYTE-IDENTICAL shadow of the existing hand table: it emits ONLY
-/// the hand ids (NO new tags), each resolved by [`crate::exif_conv`] to the SAME
-/// `Conv` / `GpsConv` the hand table carries (a per-id differential parity test
-/// in the lib is the gate). The emitted file is a child module of
+/// Step A was a BYTE-IDENTICAL shadow of the hand table (hand ids only); Step B
+/// extends the `Exif::Main` allowlist with the binary-coverage-gap ids
+/// (`exif_main_tag_ids` = hand ids + `EXIF_MAIN_GAP_IDS`) so the generated table
+/// is a SUPERSET — every SHARED id resolves by [`crate::exif_conv`] to the SAME
+/// `Conv` the hand table carries (a per-id differential parity test in the lib
+/// is that gate), and the gap ids (absent from the hand table) emit through the
+/// hand-first `lookup`'s fallback. The emitted file is a child module of
 /// `src/exif/tables.rs` (resp. `gps.rs`), so the HANDPORTED `super::COMPRESSION`
 /// / `super::GPS_MEASURE_MODE` const references resolve against the parent's
-/// curated label slices and the shadow reuses them byte-for-byte.
+/// curated label slices and the shadow reuses them byte-for-byte. (`GPS::Main`
+/// has no gap ids, so its shadow stays the Step-A byte-identical subset.)
 ///
 /// Shape (mirrors [`emit_tagdef_table`]): one `static <IDENT>: ExifTag = …;`
 /// per tag (keyed by the resolved NAME, deduped-by-ident with a soundness
@@ -575,9 +579,12 @@ pub fn emit_exif_table(model: &TableModel, kind: ExifKind, allow_ids: &[u16]) ->
   out.push('\n');
   out.push_str(
     "//\n\
-     // Step-A BYTE-IDENTICAL shadow of the hand table — emits ONLY the ported\n\
-     // hand id set, each resolved to the SAME conv the hand table carries. A\n\
-     // child module of the hand table (`super::*` const refs resolve there).\n",
+     // Generated shadow of the hand table — the ported camera-relevant hand id\n\
+     // set PLUS the binary-EXIF coverage-gap ids (Step B). Every SHARED id\n\
+     // resolves to the SAME conv the hand table carries; the gap ids are NOT in\n\
+     // the hand table, so the hand-first `lookup` falls through here and they\n\
+     // emit. A child module of the hand table (`super::*` const refs resolve\n\
+     // there); the hand table stays a strict SUBSET of the generated table.\n",
   );
 
   // `Conv` is always referenced; `GpsConv` only in the GPS file. Imports come
@@ -635,9 +642,10 @@ pub fn emit_exif_table(model: &TableModel, kind: ExifKind, allow_ids: &[u16]) ->
   out.push('\n');
   let _ = writeln!(
     out,
-    "/// `{}` — the Step-A generated shadow ({} ported ids). Consulted by the\n\
-     /// hand `lookup` AFTER its own table (this is a strict subset, so a hit\n\
-     /// here always AGREES with the hand entry).\n\
+    "/// `{}` — the generated shadow ({} ids: the ported hand subset + the\n\
+     /// binary-coverage-gap ids). Consulted by the hand `lookup` AFTER its own\n\
+     /// table: a SHARED id always AGREES with the hand entry, and a gap id (NOT\n\
+     /// in the hand table) is the only one this fallback actually returns.\n\
      pub fn lookup(id: u16) -> Option<&'static {lookup_ty}> {{\n  \
        match id {{\n{}    _ => None,\n  }}\n}}",
     model.name,
