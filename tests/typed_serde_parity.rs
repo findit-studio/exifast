@@ -226,7 +226,17 @@ const NOT_ACTIVE: &[&str] = &[
 /// `XMP-exif:ISO: [100]` (ExifTool keeps the list) while `domain_numeric` now
 /// descends the single-element list so `capture.iso() == Some(100)`.
 /// (Absolute live total against the gopro-merged base: `347 + 49 = 396`.)
-const EXPECTED_ACTIVE_FIXTURES: usize = 396;
+///
+/// 396 → 402: the xtask-generated full XMP table (Phase-1 Task 7) adds 6
+/// representative new-tag fixtures exercising namespaces / tags the hand XMP
+/// table did not cover (`XMP_gen_crs` camera-raw-settings + a generated
+/// value-MAP label, `XMP_gen_lr` Lightroom, `XMP_gen_xmpmm` media-management,
+/// `XMP_gen_covered_extra` exif/exifEX fallback + Name remaps,
+/// `XMP_gen_phf_map` the 2143-row phf value-map, `XMP_gen_unported` the
+/// `P::Unported` faithful raw passthrough). Every PRE-EXISTING golden stays
+/// byte-identical (the additive invariant); exhaustive per-tag coverage of all
+/// ~4262 generated tags is a tracked follow-up.
+const EXPECTED_ACTIVE_FIXTURES: usize = 402;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

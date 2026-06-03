@@ -68,7 +68,21 @@ pub fn resolve_printconv(
 ///
 /// Hand-maintained; the generator emits exactly what this says. The leading
 /// `__xtask_unported_probe__` row is a test fixture (no such ExifTool tag).
-static HANDPORTED: &[(&str, Conv)] = &[("__xtask_unported_probe__", Conv::Unported("XMP"))];
+///
+/// `HDRGainMapVersion` (XMP2.pl:1791, `%XMP::HDRGainMap`) carries a CODE
+/// `PrintConv` — `IsInt($val) ? join(".",unpack("C*", pack "N", $val)) : $val`
+/// — that is NOT in `-listx` (no `<values>` map): for an INTEGER value it
+/// formats the packed 32-bit version as `N.N.N.N`, otherwise it returns the
+/// value verbatim. We have not ported the `IsInt`/`unpack` formatting, so it is
+/// marked [`Conv::Unported`] → the generated table emits `P::Unported(...)` and
+/// the value passes through RAW (faithful for a non-integer value; an integer
+/// value is a tracked follow-up rather than a guessed/wrong conversion). This
+/// is the live `P::Unported` constructor that lets the lib drop the temporary
+/// `dead_code` allow on the variant.
+static HANDPORTED: &[(&str, Conv)] = &[
+  ("__xtask_unported_probe__", Conv::Unported("XMP")),
+  ("HDRGainMapVersion", Conv::Unported("XMP")),
+];
 
 #[cfg(test)]
 mod tests {

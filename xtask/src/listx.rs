@@ -84,6 +84,42 @@ pub fn parse_listx(xml: &str, table_name: &str) -> Result<TableModel> {
   })
 }
 
+/// Parse `-listx` XML and return EVERY `<table>` whose group-0 is `XMP`, in
+/// document order. This is the all-namespaces mode used by the full XMP table
+/// generation (Task 7): one `-listx` run dumps all ~78 XMP namespace tables
+/// (`XMP::dc`, `XMP::crs`, `Google::GImage`, `DJI::XMP`, …), each routed by the
+/// `XMP-<ns>` family-1 group. Tables are returned even when they carry no tags
+/// (none do today, but the filter is structural, not tag-count based).
+pub fn parse_all_xmp_listx(xml: &str) -> Result<Vec<TableModel>> {
+  let doc = roxmltree::Document::parse(xml).context("parse -listx xml")?;
+  let mut tables = Vec::new();
+  for table in doc
+    .descendants()
+    .filter(|n| n.has_tag_name("table") && n.attribute("g0") == Some("XMP"))
+  {
+    let groups = (
+      table.attribute("g0").unwrap_or_default().to_string(),
+      table.attribute("g1").unwrap_or_default().to_string(),
+    );
+    let mut tags = Vec::new();
+    for tag in table.children().filter(|n| n.has_tag_name("tag")) {
+      tags.push(TagModel {
+        id: tag.attribute("id").unwrap_or_default().to_string(),
+        name: tag.attribute("name").unwrap_or_default().to_string(),
+        ty: tag.attribute("type").map(str::to_string),
+        writable: tag.attribute("writable").map(str::to_string),
+        values: parse_values(tag),
+      });
+    }
+    tables.push(TableModel {
+      name: table.attribute("name").unwrap_or_default().to_string(),
+      groups,
+      tags,
+    });
+  }
+  Ok(tables)
+}
+
 /// Collect a tag's `<values>` PrintConv map as `(key-id, en-label)` pairs,
 /// keeping only the `lang='en'` `<val>` of each `<key>`. Returns `None` when
 /// there is no `<values>` block (a tag with no PrintConv map).

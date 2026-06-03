@@ -59,6 +59,11 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 mod tables;
+/// The xtask-GENERATED full XMP table (`cargo xtask gen-tables --module XMP`):
+/// a `pub static GEN_<NS>: &[Field]` per namespace + a `GEN_NS_TABLES` index,
+/// transcribed from `exiftool -listx`. Consulted by `tables.rs` as the additive
+/// fallback layer (the hand-written tables shadow any tag they already define).
+mod tables_generated;
 use tables::{NsTable, Writable, lookup_field, lookup_ns_table, std_xlat_ns, uri_to_ns};
 
 // ===========================================================================
@@ -3422,7 +3427,7 @@ fn ucfirst(s: &str) -> String {
 /// by the all-uppercase de-uglify guard (XMP.pm:3042-3047). Most names
 /// pass through de-uglify; the exact-key case is rare.
 fn struct_table_has_key(ns: &str, key: &str) -> bool {
-  lookup_ns_table(ns).is_some_and(|t| lookup_field(t, key).is_some())
+  lookup_ns_table(ns).is_some_and(|t| lookup_field(&t, key).is_some())
 }
 
 // ===========================================================================
@@ -3676,11 +3681,7 @@ fn apply_li_indices(
 // `end` to `len`, breaking byte-identity. The file-level `#![deny]` still
 // catches any NEW unchecked indexing added outside these proven helpers.
 #[allow(clippy::indexing_slicing)]
-fn resolve_field<'t>(
-  table: Option<&'t NsTable>,
-  id: &TagId,
-  ns: &str,
-) -> Option<&'t tables::Field> {
+fn resolve_field(table: Option<NsTable>, id: &TagId, ns: &str) -> Option<&'static tables::Field> {
   // The innermost structure-prop name is the field key; for a plain tag the
   // whole id IS the key. ExifTool looks up the un-CamelCased property name.
   let key = id
@@ -3700,7 +3701,7 @@ fn resolve_field<'t>(
     }
   }
 
-  lookup_field(table?, key)
+  lookup_field(&table?, key)
 }
 
 /// Result of the XMPAutoConv + ValueConv pass — carries the post-ValueConv
@@ -3803,11 +3804,11 @@ fn apply_print_conv(numeric: &str, field: &tables::Field) -> String {
       // by the EXACT scalar STRING, with NO integer coercion (ExifTool.pm:3604).
       // A miss returns `Unknown ($val)` (ExifTool.pm:3622). So `"05"` keys the
       // string `05` (not the int 5 → it does NOT collapse to `Multi-segment`)
-      // and `"99"` (no key) ⇒ `Unknown (99)` (Codex R1/F3). The integer keys
-      // are stringified to compare against the raw scalar.
-      map
-        .iter()
-        .find_map(|&(k, v)| (k.to_string() == numeric).then(|| v.to_string()))
+      // and `"99"` (no key) ⇒ `Unknown (99)` (Codex R1/F3). The shared
+      // `value_map_get` stringifies the integer keys to compare against the raw
+      // scalar (the same exact-string semantics as before).
+      tables::value_map_get(&tables::ValueMap::IntSlice(map), numeric)
+        .map(str::to_string)
         .unwrap_or_else(|| std::format!("Unknown ({numeric})"))
     }
     PrintConv::IntMapPassthrough(map) => {
@@ -3819,14 +3820,19 @@ fn apply_print_conv(numeric: &str, field: &tables::Field) -> String {
       // Writable), so e.g. `4294967295/1` arrives here as `4294967295` and
       // keys the `4294967295 => 'infinity'` row; `53/10` arrives as `5.3`
       // (a hash miss) and the OTHER sub returns it unchanged.
-      map
-        .iter()
-        .find_map(|&(k, v)| (k.to_string() == numeric).then(|| v.to_string()))
+      tables::value_map_get(&tables::ValueMap::IntSlice(map), numeric)
+        .map(str::to_string)
         .unwrap_or_else(|| numeric.to_string())
     }
-    PrintConv::StrMap(map) => map
-      .iter()
-      .find_map(|&(k, v)| (k == numeric).then(|| v.to_string()))
+    PrintConv::StrMap(map) => tables::value_map_get(&tables::ValueMap::StrSlice(map), numeric)
+      .map(str::to_string)
+      .unwrap_or_else(|| std::format!("Unknown ({numeric})")),
+    // The generated phf-backed value-map (large maps over the codegen
+    // threshold, e.g. PLUS `MediaSummaryCode`). Same faithful `$$conv{$val}`
+    // exact-string lookup + `Unknown ($val)` miss as `IntMap`/`StrMap`, just
+    // resolved through the perfect hash.
+    PrintConv::MapPhf(map) => tables::value_map_get(&tables::ValueMap::Phf(map), numeric)
+      .map(str::to_string)
       .unwrap_or_else(|| std::format!("Unknown ({numeric})")),
     // `\&Image::ExifTool::Exif::PrintLensInfo` (XMP.pm:2615 — `aux:LensInfo`).
     PrintConv::LensInfo => print_lens_info(numeric),
@@ -5441,11 +5447,48 @@ mod tests {
     use crate::formats::xmp::tables::{lookup_field, lookup_ns_table};
     // `exif:MeteringMode` IntMap: "5" ⇒ Multi-segment, "99"/"05" ⇒ Unknown.
     let table = lookup_ns_table("exif").expect("exif ns table");
-    let f = lookup_field(table, "MeteringMode").expect("MeteringMode field");
+    let f = lookup_field(&table, "MeteringMode").expect("MeteringMode field");
     assert_eq!(apply_print_conv("5", f), "Multi-segment");
     assert_eq!(apply_print_conv("99", f), "Unknown (99)");
     // "05" must NOT collapse to int 5 ⇒ exact string miss.
     assert_eq!(apply_print_conv("05", f), "Unknown (05)");
+  }
+
+  /// The generated table's `P::Unported` marker renders the raw value VERBATIM
+  /// (no guessed conversion) — proven directly on `apply_print_conv`, so the
+  /// faithful-passthrough contract holds regardless of any oracle coincidence.
+  /// `HDRGainMap:HDRGainMapVersion` (XMP2.pl:1791) is the live `Unported` tag
+  /// (an un-ported `IsInt`/`unpack` code `PrintConv`).
+  #[test]
+  fn unported_printconv_is_faithful_raw_passthrough() {
+    use super::apply_print_conv;
+    use crate::formats::xmp::tables::{PrintConv, lookup_field, lookup_ns_table};
+    let hdr = lookup_ns_table("HDRGainMap").expect("generated HDRGainMap ns table");
+    let f = lookup_field(&hdr, "HDRGainMapVersion").expect("HDRGainMapVersion field");
+    assert!(
+      matches!(f.print_conv(), PrintConv::Unported(_)),
+      "the generated table marks this tag Unported"
+    );
+    // Raw passthrough for BOTH a non-integer and an integer value (the marker
+    // never guesses the un-ported IsInt/unpack formatting).
+    assert_eq!(apply_print_conv("1.2.3.4", f), "1.2.3.4");
+    assert_eq!(apply_print_conv("65536", f), "65536");
+  }
+
+  /// The phf-backed generated value-map resolves through the shared
+  /// `value_map_get` exact-string lookup (a hit returns the label, a miss is
+  /// `Unknown ($val)`), proving `P::MapPhf` is wired identically to the slice
+  /// maps. PLUS `MediaSummaryCode` is the live phf map (2143 rows).
+  #[test]
+  fn phf_value_map_lookup_matches_slice_semantics() {
+    use super::apply_print_conv;
+    use crate::formats::xmp::tables::{PrintConv, lookup_field, lookup_ns_table};
+    let plus = lookup_ns_table("plus").expect("generated plus ns table");
+    let f = lookup_field(&plus, "MediaSummaryCode").expect("MediaSummaryCode field");
+    assert!(matches!(f.print_conv(), PrintConv::MapPhf(_)));
+    assert_eq!(apply_print_conv("8ISH", f), "Shipping");
+    // A miss is `Unknown ($val)` (the bundled hash has no OTHER sub).
+    assert_eq!(apply_print_conv("ZZZZ", f), "Unknown (ZZZZ)");
   }
 
   // ----- Codex R8/F2: only FileType-`XMP` inputs are accepted -------------

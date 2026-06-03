@@ -91,10 +91,9 @@ pub enum PrintConv {
   /// Renders FAITHFULLY (the raw post-extraction string — no guessed conv) so
   /// an un-ported tag is never MIS-converted (cf. the R5 `NeutralDensityFactor`
   /// bug class); it is compile-visible + oracle-flagged for follow-up.
-  // Constructed by the xtask-GENERATED table (Phase-1 Task 7); no hand-written
-  // entry uses it until that lands, so this `dead_code` allow is temporary —
-  // remove it once `tables_generated.rs` emits a `P::Unported(...)`.
-  #[allow(dead_code)]
+  /// Constructed by the xtask-GENERATED table (`tables_generated.rs`), e.g.
+  /// `HDRGainMap:HDRGainMapVersion` (XMP2.pl:1791 — an un-ported `IsInt`/`unpack`
+  /// version-number `PrintConv`).
   Unported(&'static str),
   /// A `key => label` lookup hash (integer keys). A value with no matching
   /// key prints as `Unknown ($val)` (ExifTool.pm:3622 — the default
@@ -109,6 +108,15 @@ pub enum PrintConv {
   IntMapPassthrough(&'static [(i64, &'static str)]),
   /// A `key => label` lookup hash (string keys — e.g. GPS ref letters).
   StrMap(&'static [(&'static str, &'static str)]),
+  /// A LARGE `key => label` lookup hash backed by a `phf::Map` for O(1)
+  /// lookup, keyed by the RAW scalar STRING (an integer key is stored as its
+  /// decimal text). Used by the xtask-GENERATED tables for value-maps over the
+  /// emitter's phf threshold (e.g. PLUS `MediaSummaryCode` = 2143 entries); the
+  /// lookup is the same faithful `$$conv{$val}` exact-string match as
+  /// [`PrintConv::IntMap`]/[`PrintConv::StrMap`] (a miss ⇒ `Unknown ($val)`),
+  /// just resolved through the perfect hash instead of a linear scan. The two
+  /// representations share one lookup behind [`value_map_get`].
+  MapPhf(&'static phf::Map<&'static str, &'static str>),
   /// `true`/`false` (case-insensitive) → `True`/`False` (`%boolConv`).
   Bool,
   /// `Image::ExifTool::Exif::PrintExposureTime`.
@@ -254,13 +262,33 @@ impl Field {
 }
 
 /// A per-namespace tag table.
+///
+/// Two layers (the ADDITIVE table-codegen invariant, Task 7): `fields` is the
+/// hand-written, Codex-tuned table (it WINS on every key it defines); `gen` is
+/// the xtask-generated fallback from `exiftool -listx` (it only ever supplies a
+/// key the hand table lacks, and is the SOLE source for the ~71 namespaces the
+/// hand table does not list). `lookup_field` consults `fields` first, then
+/// `gen` — so an existing golden can never change (the hand `Field` shadows its
+/// generated twin), while the generator purely ADDS coverage.
 #[derive(Debug, Clone, Copy)]
 pub struct NsTable {
   fields: &'static [Field],
+  generated: &'static [Field],
 }
 
 impl NsTable {
-  /// The fields of this table.
+  /// A hand-written-only table (no generated fallback) — used by the struct
+  /// sub-tables and any table built before the generated layer is consulted.
+  #[allow(dead_code)]
+  const fn hand(fields: &'static [Field]) -> Self {
+    Self {
+      fields,
+      generated: &[],
+    }
+  }
+
+  /// The hand-written fields of this table (the tuned layer; excludes the
+  /// generated fallback).
   #[must_use]
   #[inline(always)]
   #[allow(dead_code)] // public table-introspection accessor (D8)
@@ -269,10 +297,56 @@ impl NsTable {
   }
 }
 
-/// Look a field up in a namespace table by its XMP property key.
+/// Look a field up in a namespace table by its XMP property key. The
+/// hand-written `fields` are consulted FIRST (they win on any collision); only
+/// if the key is absent there does the generated fallback (`gen`) supply it.
+/// This is the additive guarantee — a hand-tuned `Field` always shadows its
+/// `-listx`-generated twin, so no existing golden can shift.
 #[must_use]
-pub fn lookup_field<'t>(table: &'t NsTable, key: &str) -> Option<&'t Field> {
-  table.fields.iter().find(|f| f.key == key)
+pub fn lookup_field(table: &NsTable, key: &str) -> Option<&'static Field> {
+  // Both layers are `&'static [Field]`, so an element reference is `&'static`
+  // regardless of the (possibly by-value, on-the-fly) `table` it came from —
+  // which is what lets `lookup_ns_table` return an `NsTable` by value.
+  table
+    .fields
+    .iter()
+    .find(|f| f.key == key)
+    .or_else(|| table.generated.iter().find(|f| f.key == key))
+}
+
+/// One value-map lookup API shared by the hand-written sorted slices and the
+/// generated `phf::Map`s (the `value_map!`/`lookup_map!` helper of the codegen
+/// plan). Every representation keys by the RAW scalar STRING — the faithful
+/// `$$conv{$val}` exact-string match (ExifTool.pm:3604, NO integer coercion:
+/// `"05"` misses the `5` key) — so an `i64`-keyed slice stringifies its key,
+/// while the phf map (whose keys are already the decimal/string text) does an
+/// O(1) `get`. A hit returns the mapped label; a miss returns `None` (the
+/// caller decides between `Unknown ($val)` and a passthrough). This unifies the
+/// two map shapes behind one call so the generated + hand-written tables look
+/// up identically.
+#[must_use]
+pub fn value_map_get(map: &ValueMap, key: &str) -> Option<&'static str> {
+  match map {
+    ValueMap::IntSlice(s) => s
+      .iter()
+      .find_map(|&(k, v)| (k.to_string() == key).then_some(v)),
+    ValueMap::StrSlice(s) => s.iter().find_map(|&(k, v)| (k == key).then_some(v)),
+    ValueMap::Phf(m) => m.get(key).copied(),
+  }
+}
+
+/// The three concrete value-map representations [`value_map_get`] unifies: a
+/// small int-keyed slice (stringified lookup), a small string-keyed slice, and
+/// a large `phf::Map` (string-keyed, O(1)). The hand-written tables carry the
+/// slices directly on their `PrintConv` variants; the generator emits a `phf`
+/// map only above its size threshold.
+pub enum ValueMap {
+  /// `&[(i64, &str)]` — the hand-written [`PrintConv::IntMap`] representation.
+  IntSlice(&'static [(i64, &'static str)]),
+  /// `&[(&str, &str)]` — the hand-written [`PrintConv::StrMap`] representation.
+  StrSlice(&'static [(&'static str, &'static str)]),
+  /// A generated `phf::Map<&str, &str>` ([`PrintConv::MapPhf`]).
+  Phf(&'static phf::Map<&'static str, &'static str>),
 }
 
 // ===========================================================================
@@ -1188,22 +1262,89 @@ static EXIF: &[Field] = &[
   Field::make("NativeDigest", None, W::Str, P::Identity),
 ];
 
+use super::tables_generated as g;
+
+/// The hand-written camera-metadata namespace tables, each paired with its
+/// xtask-generated `GEN_<NS>` fallback slice (the additive layer — hand `fields`
+/// win, `gen` only ADDS tags the hand table lacks). Namespaces NOT listed here
+/// (crs, lr, xmpMM, xmpDM, pdf, iptcExt, …) have no hand table and are resolved
+/// generated-only via [`lookup_ns_table`]'s fallback into `g::GEN_NS_TABLES`.
 static NS_TABLES: &[(&str, NsTable)] = &[
-  ("dc", NsTable { fields: DC }),
-  ("xmp", NsTable { fields: XMP }),
-  ("xmpRights", NsTable { fields: XMP_RIGHTS }),
-  ("photoshop", NsTable { fields: PHOTOSHOP }),
-  ("tiff", NsTable { fields: TIFF }),
-  ("aux", NsTable { fields: AUX }),
-  ("exif", NsTable { fields: EXIF }),
+  (
+    "dc",
+    NsTable {
+      fields: DC,
+      generated: g::GEN_DC,
+    },
+  ),
+  (
+    "xmp",
+    NsTable {
+      fields: XMP,
+      generated: g::GEN_XMP,
+    },
+  ),
+  (
+    "xmpRights",
+    NsTable {
+      fields: XMP_RIGHTS,
+      generated: g::GEN_XMPRIGHTS,
+    },
+  ),
+  (
+    "photoshop",
+    NsTable {
+      fields: PHOTOSHOP,
+      generated: g::GEN_PHOTOSHOP,
+    },
+  ),
+  (
+    "tiff",
+    NsTable {
+      fields: TIFF,
+      generated: g::GEN_TIFF,
+    },
+  ),
+  (
+    "aux",
+    NsTable {
+      fields: AUX,
+      generated: g::GEN_AUX,
+    },
+  ),
+  (
+    "exif",
+    NsTable {
+      fields: EXIF,
+      generated: g::GEN_EXIF,
+    },
+  ),
 ];
 
-/// Resolve a (already `%stdXlatNS`-translated) namespace to its ported tag
-/// table, or `None` if the namespace has no ported table (its tags route
-/// through `FoundXMP`'s faithful default-tagInfo path).
+/// Resolve a (already `%stdXlatNS`-translated) namespace to its tag table.
+///
+/// The hand-written `NS_TABLES` are checked FIRST (so the 7 tuned namespaces
+/// keep their hand `fields` + generated fallback); if the namespace has no hand
+/// table, the generated `g::GEN_NS_TABLES` index is consulted and the namespace
+/// is surfaced as a generated-only [`NsTable`] (empty hand `fields`, the
+/// generated slice as `gen`). Returns `None` only for a namespace neither layer
+/// defines — its tags route through `FoundXMP`'s faithful default-tagInfo path.
+///
+/// Returns by VALUE ([`NsTable`] is `Copy` — two slice pointers): the
+/// generated-only case constructs the table on the fly, so a `&'static`
+/// signature is not possible. Every consumer immediately reads `.fields()` or
+/// calls [`lookup_field`], so by-value is transparent.
 #[must_use]
-pub fn lookup_ns_table(ns: &str) -> Option<&'static NsTable> {
-  NS_TABLES.iter().find_map(|(n, t)| (*n == ns).then_some(t))
+pub fn lookup_ns_table(ns: &str) -> Option<NsTable> {
+  if let Some(t) = NS_TABLES.iter().find_map(|(n, t)| (*n == ns).then_some(*t)) {
+    return Some(t);
+  }
+  g::GEN_NS_TABLES.iter().find_map(|&(n, generated)| {
+    (n == ns).then_some(NsTable {
+      fields: &[],
+      generated,
+    })
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,10 +1437,28 @@ mod tests {
   #[test]
   fn camera_tables_resolve() {
     let exif = lookup_ns_table("exif").expect("exif table ported");
-    let metering = lookup_field(exif, "MeteringMode").expect("MeteringMode");
+    let metering = lookup_field(&exif, "MeteringMode").expect("MeteringMode");
     assert!(matches!(metering.print_conv(), PrintConv::IntMap(_)));
-    let tiff = lookup_field(lookup_ns_table("tiff").expect("tiff table"), "ImageLength")
-      .expect("tiff ImageLength");
+    let tiff_tbl = lookup_ns_table("tiff").expect("tiff table");
+    let tiff = lookup_field(&tiff_tbl, "ImageLength").expect("tiff ImageLength");
     assert_eq!(tiff.name(), Some("ImageHeight"));
+  }
+
+  /// The additive layer resolves a generated-only namespace (no hand table)
+  /// AND the hand `Field` still wins on a collision in a shared namespace.
+  #[test]
+  fn generated_namespaces_resolve_additively() {
+    // `crs` (Lightroom camera-raw-settings) has NO hand table — generated-only.
+    let crs = lookup_ns_table("crs").expect("crs resolves via the generated layer");
+    assert!(crs.fields().is_empty(), "crs has no hand fields");
+    assert!(
+      lookup_field(&crs, "RawFileName").is_some(),
+      "a generated crs tag resolves"
+    );
+    // In a SHARED namespace the hand field shadows its generated twin: the hand
+    // `exif:MeteringMode` carries an `IntMap`, never the generated default.
+    let exif = lookup_ns_table("exif").expect("exif table");
+    let metering = lookup_field(&exif, "MeteringMode").expect("MeteringMode");
+    assert!(matches!(metering.print_conv(), PrintConv::IntMap(_)));
   }
 }
