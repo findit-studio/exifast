@@ -1,6 +1,6 @@
 [{
   "SourceFile": "FLAC_id3_prefix.flac",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "FLAC",
   "File:FileTypeExtension": "FLAC",
   "File:MIMEType": "audio/flac",

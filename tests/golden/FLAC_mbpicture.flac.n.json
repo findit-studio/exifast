@@ -1,6 +1,6 @@
 [{
   "SourceFile": "FLAC_mbpicture.flac",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Picture pointer references previous VorbisComment directory",
   "File:FileType": "FLAC",
   "File:FileTypeExtension": "FLAC",

@@ -1,6 +1,6 @@
 [{
   "SourceFile": "Audible_warn.aa",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Bad dictionary count",
   "File:FileType": "AA",
   "File:FileTypeExtension": "aa",

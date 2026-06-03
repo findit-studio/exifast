@@ -1,6 +1,6 @@
 [{
   "SourceFile": "RIFF_truncated_fmt.wav",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Error reading RIFF file (corrupted?)",
   "File:FileType": "WAV",
   "File:FileTypeExtension": "WAV",

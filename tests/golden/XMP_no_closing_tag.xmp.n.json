@@ -1,6 +1,6 @@
 [{
   "SourceFile": "XMP_no_closing_tag.xmp",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "XMP format error (no closing tag for dc:title)",
   "File:FileType": "XMP",
   "File:FileTypeExtension": "XMP",

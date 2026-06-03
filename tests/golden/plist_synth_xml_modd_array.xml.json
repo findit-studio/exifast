@@ -1,6 +1,6 @@
 [{
   "SourceFile": "plist_synth_xml_modd_array.xml",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "MODD",
   "File:FileTypeExtension": "modd",
   "File:MIMEType": "application/xml",

@@ -1,6 +1,6 @@
 [{
   "SourceFile": "XMP_uri_fixed.xmp",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "[minor] Fixed incorrect URI for xmlns:dc",
   "File:FileType": "XMP",
   "File:FileTypeExtension": "XMP",

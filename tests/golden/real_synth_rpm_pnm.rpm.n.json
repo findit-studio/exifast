@@ -1,6 +1,6 @@
 [{
   "SourceFile": "real_synth_rpm_pnm.rpm",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "File:FileType": "RPM",
   "File:FileTypeExtension": "RPM",
   "File:MIMEType": "audio/x-pn-realaudio-plugin",

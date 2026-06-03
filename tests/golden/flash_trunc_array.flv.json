@@ -1,6 +1,6 @@
 [{
   "SourceFile": "flash_trunc_array.flv",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Truncated AMF record 0xa",
   "File:FileType": "FLV",
   "File:FileTypeExtension": "flv",

@@ -1,7 +1,7 @@
 [
   {
     "SourceFile": "M2TS.mts",
-    "ExifTool:ExifToolVersion": 13.58,
+    "ExifTool:ExifToolVersion": 13.59,
     "ExifTool:Warning": "[minor] The ExtractEmbedded option may find more tags in the video data",
     "File:FileType": "M2TS",
     "File:FileTypeExtension": "MTS",

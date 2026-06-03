@@ -1,6 +1,6 @@
 [{
   "SourceFile": "DSF_short.dsf",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Error reading DSF fmt chunk",
   "File:FileType": "DSF",
   "File:FileTypeExtension": "DSF",

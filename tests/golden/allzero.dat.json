@@ -1,5 +1,5 @@
 [{
   "SourceFile": "allzero.dat",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Error": "Entire file is binary zeros"
 }]

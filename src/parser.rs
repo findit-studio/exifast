@@ -23,8 +23,8 @@ use crate::{
 };
 
 /// ExifTool `$VERSION` (ExifTool.pm:32). The serializer's number gate
-/// renders this string as the bare JSON number `13.58`.
-const EXIFTOOL_VERSION: &str = "13.58";
+/// renders this string as the bare JSON number `13.59`.
+const EXIFTOOL_VERSION: &str = "13.59";
 
 /// `FileTypeExtension` has `PrintConv => 'lc $val'` (ExifTool.pm:1433):
 /// lowercase with PrintConv on, raw (uppercase) under `-n`.
@@ -470,7 +470,7 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
   };
   // `SourceFile` first (ExifTool emits it before the per-tag loop; never deduped).
   obj.insert("SourceFile".into(), Value::String(name.to_string()));
-  // Orchestration: `ExifTool:ExifToolVersion` (the number gate renders 13.58).
+  // Orchestration: `ExifTool:ExifToolVersion` (the number gate renders 13.59).
   insert(
     &mut obj,
     "ExifTool:ExifToolVersion".into(),
@@ -724,7 +724,7 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
           // which has NO `NXD` entry). When the detected type is ALREADY the
           // override type (e.g. a `.nxd`-extension input whose `SetFileType`
           // resolves `NXD`), the guard is FALSE ⇒ the override is a no-op and the
-          // base triplet (incl. its table MIME) stands — verified vs bundled 13.58
+          // base triplet (incl. its table MIME) stands — verified vs bundled 13.59
           // (a `.nxd` file keeps `application/rdf+xml`, NOT the explicit MIME).
           let base = resolve_file_type(ft, None, ext_ref, print_conv_enabled);
           if base.file_type == payload.file_type() {

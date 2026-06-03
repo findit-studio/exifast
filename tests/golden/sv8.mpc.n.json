@@ -1,6 +1,6 @@
 [{
   "SourceFile": "sv8.mpc",
-  "ExifTool:ExifToolVersion": 13.58,
+  "ExifTool:ExifToolVersion": 13.59,
   "ExifTool:Warning": "Audio info currently not extracted from this version MPC file",
   "File:FileType": "MPC",
   "File:FileTypeExtension": "MPC",
