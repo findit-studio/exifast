@@ -8041,6 +8041,35 @@ fn exif_gps_proctext_conformance() {
   );
 }
 #[test]
+fn exif_gps_proctext_wrongfmt_conformance() {
+  // Golden-value Contract A (#198 byte-walk class, GPS sibling) — a GPS
+  // sub-IFD with GPSProcessingMethod (0x001b) declared `string` (format code
+  // 2) instead of `undef` (the documented mis-writer, Exif.pm:2499). UNLIKE
+  // UserComment 0x9286 the GPS text tags have NO `Format => 'undef'` override
+  // (`gps::format_override` is GPSDateStamp-only; GPS.pm:296/304 set only
+  // `Writable => 'undef'`), so the value is decoded as a STRING and reaches
+  // the `GpsConv::ExifText` `ConvertExifText` RawConv as `RawValue::Text`
+  // (NOT `RawValue::Bytes`). That arm now reads the bytes via
+  // `RawValue::val_bytes()` — the pre-FixUTF8 `raw` of the on-disk `$val`,
+  // not the lossy FixUTF8 display text the old `text.as_bytes()` arm used —
+  // mirroring the UserComment 0x9286 sibling in `Conv::ExifText`. The payload
+  // is a VALID all-ASCII, NUL-free, space-padded `ASCII   ` prefix + "Manual"
+  // (so the output is oracle-matchable and avoids the from_utf8_lossy-vs-
+  // FixUTF8 charset gap #200, which is observable only on invalid UTF-8).
+  // Bundled `exiftool 13.59` strips the 8-byte prefix ⇒ `GPS:
+  // GPSProcessingMethod` = "Manual" in BOTH -j and -n.
+  check(
+    "Exif_gps_proctext_wrongfmt.tif",
+    "Exif_gps_proctext_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_proctext_wrongfmt.tif",
+    "Exif_gps_proctext_wrongfmt.tif.n.json",
+    false,
+  );
+}
+#[test]
 fn exif_gps_shared_pointer_conformance() {
   // PR #36 Codex R13 F1 — the GENERAL IFD-pointer collision. IFD0's
   // ExifOffset (0x8769) AND GPSInfo (0x8825) BOTH point at one shared

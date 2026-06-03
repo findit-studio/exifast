@@ -872,6 +872,66 @@ def make_exif_gps_int32s_tif():
     return bytes(out)
 
 
+def make_exif_gps_proctext_wrongfmt_tif():
+    r"""Golden-value Contract A (#198 byte-walk class, GPS sibling) — a GPS
+    sub-IFD whose GPSProcessingMethod (0x001b) is declared `string`
+    (format code 2) instead of `undef` (7), the documented mis-writer
+    (the same camera-vendor bug Exif.pm:2499 notes for UserComment).
+
+    UNLIKE UserComment 0x9286, the GPS text tags have NO `Format => 'undef'`
+    read-side override (`gps::format_override` covers only GPSDateStamp 0x001d;
+    GPS.pm:296/304 give 0x001b/0x001c `Writable => 'undef'` but leave `Format`
+    unset). So a `string`-on-disk GPSProcessingMethod is decoded as a STRING:
+    ExifTool's `ReadValue` NUL-trims at the first interior NUL and the value
+    reaches `ConvertExifText` as ordinary text (port: `RawValue::Text`, NOT
+    `RawValue::Bytes`). This is the shape the `GpsConv::ExifText` arm must
+    route through `RawValue::val_bytes()` — exercising the #198 reroute on a
+    non-`Bytes` shape (mirroring the UserComment 0x9286 sibling fixed in the
+    EXIF `Conv::ExifText` arm).
+
+    To stay oracle-matchable AND avoid the `from_utf8_lossy`-vs-FixUTF8 charset
+    gap (#200 — observable ONLY on invalid-UTF-8 bytes), the payload is a
+    VALID, all-ASCII, NUL-free value: the 8-byte ASCII charset prefix is
+    SPACE-padded (`ASCII   `, no NULs — `ConvertExifText`'s `/^(ASCII)?[\0 ]+$/`
+    tolerates spaces for NULs, Exif.pm:5570) followed by printable "Manual".
+    With no interior NUL the `string` decode keeps the whole value, then
+    `ConvertExifText` strips the 8-byte prefix and trims trailing blanks ⇒
+    bundled `exiftool 13.59` (`-G1`) emits `GPS:GPSProcessingMethod` = "Manual"
+    in BOTH -j and -n. Because the payload is valid ASCII, the FixUTF8 display
+    text and the pre-FixUTF8 `raw` bytes are byte-identical here, so the output
+    matches the oracle exactly while the reroute itself is what carries the
+    `Text`-shape bytes into `convert_exif_text`.
+
+    Layout: II header, IFD0 (GPSInfo pointer), GPS IFD (one out-of-line
+    GPSProcessingMethod), value pool."""
+    bo = '<'
+    out = bytearray()
+    out += b'II' + struct.pack(bo + 'H', 0x002a) + struct.pack(bo + 'I', 8)
+    ifd0_off = 8
+    ifd0_len = 2 + 1 * 12 + 4
+    gps_off = ifd0_off + ifd0_len
+    gps_len = 2 + 1 * 12 + 4
+    pool_start = gps_off + gps_len
+    pool = bytearray()
+    # GPSProcessingMethod: space-padded "ASCII   " prefix (8 bytes, NO NULs)
+    # + "Manual" (no interior NUL ⇒ the `string` decode keeps it all).
+    proc_off = pool_start + len(pool)
+    proc_val = b'ASCII   ' + b'Manual'
+    pool += proc_val
+    if len(pool) % 2:
+        pool += b'\x00'
+    # IFD0: GPSInfo pointer only.
+    out += struct.pack(bo + 'H', 1)
+    out += _raw_entry(bo, 0x8825, LONG, 1, gps_off)     # GPSInfo -> GPS IFD
+    out += struct.pack(bo + 'I', 0)
+    # GPS IFD: GPSProcessingMethod declared `string` (ASCII=2), out-of-line.
+    out += struct.pack(bo + 'H', 1)
+    out += _raw_entry(bo, 0x001b, ASCII, len(proc_val), proc_off)
+    out += struct.pack(bo + 'I', 0)
+    out += pool
+    return bytes(out)
+
+
 def make_exif_gps_eofoverrun_tif():
     """R2/F3 — GPS sub-IFD with a GPSLatitude (0x0002) whose out-of-line
     offset is inside the block but `offset + size` runs past EOF.
@@ -1796,6 +1856,8 @@ if __name__ == '__main__':
         f.write(make_exif_gps_wrongfmt_tif())
     with open(f'{out_dir}/Exif_gps_int32s.tif', 'wb') as f:
         f.write(make_exif_gps_int32s_tif())
+    with open(f'{out_dir}/Exif_gps_proctext_wrongfmt.tif', 'wb') as f:
+        f.write(make_exif_gps_proctext_wrongfmt_tif())
     with open(f'{out_dir}/Exif_gps_eofoverrun.tif', 'wb') as f:
         f.write(make_exif_gps_eofoverrun_tif())
     with open(f'{out_dir}/Exif_eofoverrun_chain.tif', 'wb') as f:
@@ -1856,6 +1918,7 @@ if __name__ == '__main__':
           f'{out_dir}/Exif_gps_badoffset.tif, '
           f'{out_dir}/Exif_gps_wrongfmt.tif, '
           f'{out_dir}/Exif_gps_int32s.tif, '
+          f'{out_dir}/Exif_gps_proctext_wrongfmt.tif, '
           f'{out_dir}/Exif_gps_eofoverrun.tif, '
           f'{out_dir}/Exif_eofoverrun_chain.tif, '
           f'{out_dir}/Exif_usercomment_ascii.tif, '

@@ -3912,18 +3912,30 @@ fn emit_gps_value<S: ExifSink>(
       Ok(())
     }
     GpsConv::ExifText => {
-      // GPSProcessingMethod / GPSAreaInformation: `ConvertExifText` RawConv
-      // (Exif.pm:5554-5601) strips the 8-byte charset-ID prefix and decodes
-      // the payload. A RawConv runs BEFORE Value/PrintConv and applies in
-      // both -n and -j modes; these tags have no further conversion.
-      let bytes: &[u8] = match raw {
-        RawValue::Bytes(b) => b,
-        // A `string`-typed value (camera wrote the wrong format) — apply
-        // the same prefix logic to its bytes.
-        RawValue::Text { text, .. } => text.as_bytes(),
-        _ => return emit_raw(group, name, raw, out),
-      };
-      out.write_str(group, name, &exiftext::convert_exif_text(bytes, order))?;
+      // GPSProcessingMethod (0x001b) / GPSAreaInformation (0x001c):
+      // `ConvertExifText` RawConv (Exif.pm:5554-5601) strips the 8-byte
+      // charset-ID prefix and decodes the payload. A RawConv runs BEFORE
+      // Value/PrintConv and applies in both -n and -j modes; these tags have
+      // no further conversion.
+      //
+      // `ConvertExifText` byte-walks `$val` REGARDLESS of the on-disk
+      // `Format`, so read the bytes via `val_bytes()` (#198 class, mirroring
+      // the EXIF `Conv::ExifText` sibling for UserComment 0x9286). UNLIKE
+      // 0x9286 these GPS tags have NO `Format => 'undef'` override
+      // (`gps::format_override` covers only GPSDateStamp 0x001d; GPS.pm:296/304
+      // give them `Writable => 'undef'` but leave `Format` unset), so a
+      // wrong-format `string`-on-disk GPS value DOES reach here as
+      // `RawValue::Text` — and `val_bytes()` returns its pre-FixUTF8 `raw`
+      // bytes (the original on-disk `$val`), NOT the lossy FixUTF8 display
+      // text the prior `text.as_bytes()` arm read. The real-camera path is
+      // `undef` → `RawValue::Bytes`, which `val_bytes()` borrows verbatim, so
+      // every real GPS path stays byte-identical. NOTE: `convert_exif_text`'s
+      // ASCII branch renders an invalid-UTF-8 payload byte via
+      // `from_utf8_lossy` (U+FFFD) whereas bundled ExifTool's JSON writer
+      // emits `?` — a separate, pre-existing charset-rendering gap (#200), NOT
+      // a byte-walk loss, out of #198 scope.
+      let bytes = raw.val_bytes();
+      out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
     }
     GpsConv::StrLabel(slice) => {

@@ -291,7 +291,7 @@ const NOT_ACTIVE: &[&str] = &[
 ///     (A1's `RawValue::Text.raw`), one rational64u ≈ 0.9697 → `-j` `1` / `-n`
 ///     `0.9696978699`).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 413;
+const EXPECTED_ACTIVE_FIXTURES: usize = 414;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
