@@ -3794,6 +3794,10 @@ fn apply_print_conv(numeric: &str, field: &tables::Field) -> String {
   use tables::PrintConv;
   match field.print_conv() {
     PrintConv::Identity => numeric.to_string(),
+    // Faithful raw passthrough: an un-ported code-valued conv renders the raw
+    // post-extraction value (never a guessed/wrong conversion); the `&str` is
+    // the source ref, kept for compile-visibility + oracle follow-up.
+    PrintConv::Unported(_src) => numeric.to_string(),
     PrintConv::IntMap(map) => {
       // ExifTool's PrintConv hash lookup is `$$conv{$val}` — a Perl hash keyed
       // by the EXACT scalar STRING, with NO integer coercion (ExifTool.pm:3604).

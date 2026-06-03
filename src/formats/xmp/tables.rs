@@ -85,6 +85,17 @@ pub enum Writable {
 pub enum PrintConv {
   /// No PrintConv — the print form equals the numeric form.
   Identity,
+  /// A code-valued ExifTool PrintConv/ValueConv that the generator could not
+  /// transcribe (it is not present in `-listx`) and that has no hand-written
+  /// Rust counterpart yet. Carries the source ref (e.g. `"XMP.pm:2648"`).
+  /// Renders FAITHFULLY (the raw post-extraction string — no guessed conv) so
+  /// an un-ported tag is never MIS-converted (cf. the R5 `NeutralDensityFactor`
+  /// bug class); it is compile-visible + oracle-flagged for follow-up.
+  // Constructed by the xtask-GENERATED table (Phase-1 Task 7); no hand-written
+  // entry uses it until that lands, so this `dead_code` allow is temporary —
+  // remove it once `tables_generated.rs` emits a `P::Unported(...)`.
+  #[allow(dead_code)]
+  Unported(&'static str),
   /// A `key => label` lookup hash (integer keys). A value with no matching
   /// key prints as `Unknown ($val)` (ExifTool.pm:3622 — the default
   /// hash-miss behavior of a PrintConv hash with no `OTHER` sub).
