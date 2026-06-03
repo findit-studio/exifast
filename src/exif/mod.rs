@@ -3688,6 +3688,17 @@ fn emit_exif_value<S: ExifSink>(
       // space-joined `ReadValue` string; `-n` shows the bare value via the
       // shared `emit_raw` (which keeps a single scalar as a bare JSON number —
       // NOT a quoted string — so the normal real-camera `-n` stays identical).
+      //
+      // #198 A4 audit: 0x9400 has NO `Format => 'undef'` override, so a
+      // wrong-format `string` value DOES reach here as `RawValue::Text` (unlike
+      // 0x9286). But `val_bytes()` is NOT needed: `"$val C"` interpolates a
+      // STRING, and the JSON output is a Rust `String` either way, so the only
+      // residual divergence on a high-bit `string` `$val` is the U+FFFD-vs-`?`
+      // rendering of an INVALID byte (`value_space_joined`/`lossy_string` emit
+      // U+FFFD; bundled ExifTool's JSON writer emits `?`) — the SAME pre-existing
+      // charset-rendering gap `Conv::ExifText` has, NOT a byte-walk loss. The
+      // byte-walk itself is already faithful (it reads `$val`'s exact value);
+      // rerouting through `val_bytes()` would change nothing. So: no change here.
       if print_conv && let Some(v) = value_space_joined(raw) {
         out.write_str(group, name, &std::format!("{v} C"))?;
         return Ok(());
@@ -3739,21 +3750,26 @@ fn emit_exif_value<S: ExifSink>(
     Conv::ExifText => {
       // `UserComment` (0x9286) — `RawConv => ConvertExifText($self,$val,1,$tag)`
       // (Exif.pm:2502). A RawConv runs BEFORE Value/PrintConv and applies in
-      // BOTH -n and -j modes; UserComment has no further conversion. The
-      // `undef` format makes the on-disk value `RawValue::Bytes`; a camera
-      // that wrote the wrong format (`string`/`int8u` — Exif.pm:2499) is
-      // forced back to bytes (`Format => 'undef'`) so the charset-ID prefix
-      // logic still applies.
-      let bytes: Vec<u8> = match raw {
-        RawValue::Bytes(b) => b.clone(),
-        // A `string`-typed value (camera wrote the wrong format) — re-read
-        // its bytes per `Format => 'undef'`.
-        RawValue::Text { text, .. } => text.as_bytes().to_vec(),
-        // An `int8u`-typed value (the other documented mis-format) — the
-        // `undef` re-read is the raw 1-byte-per-element octet stream.
-        RawValue::U64(vals) => vals.iter().map(|&v| v as u8).collect(),
-        _ => return emit_raw(group, name, raw, out),
-      };
+      // BOTH -n and -j modes; UserComment has no further conversion. Like the
+      // 0xa462 RawConv, `ConvertExifText` byte-walks `$val` REGARDLESS of the
+      // on-disk `Format`, so read the bytes via `val_bytes()` (A2) — unifying on
+      // the same format-agnostic byte view 0xa462 uses (#198 class).
+      //
+      // For 0x9286 specifically the `Format => 'undef'` override
+      // (`tables::format_override`) forces the value through `undef` BEFORE
+      // `ReadValue` (count != 1 ⇒ `RawValue::Bytes`; the degenerate 1-byte case
+      // ⇒ `RawValue::U64` via the int8u carve-out), so the value never reaches
+      // here as `RawValue::Text` — the prior per-shape `match` had a `Text` arm
+      // that was unreachable for the only tag using this conv. `val_bytes()`
+      // borrows the `Bytes` verbatim (byte-identical to the old `b.clone()`),
+      // so every real-camera path is unchanged; the unification just removes the
+      // dead/lossy `Text` arm and keeps the conv robust if a future `ExifText`
+      // tag lacks the override (it would then byte-walk `Text.raw`, not the
+      // lossy FixUTF8 text). NOTE: `convert_exif_text`'s ASCII branch renders an
+      // invalid-UTF-8 payload byte via `from_utf8_lossy` (U+FFFD), whereas
+      // bundled ExifTool's JSON writer emits `?` for it — a separate, pre-
+      // existing charset-rendering gap (NOT a byte-walk loss), out of #198 scope.
+      let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
     }
