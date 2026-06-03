@@ -9403,6 +9403,116 @@ fn xmp_parse_error_warnings_emitted() {
   }
 }
 
+// ===========================================================================
+// xtask-GENERATED full XMP table (Phase-1 Task 7) — representative new-tag
+// oracle. These exercise namespaces / tags the hand-written XMP table did NOT
+// cover, now supplied by the xtask-generated `tables_generated.rs` (additive
+// fallback). The byte-identity of EVERY pre-existing golden (the additive
+// invariant) is proven by the rest of this suite + the `git diff --stat
+// origin/main -- tests/golden/` showing only ADDITIONS. Exhaustive per-tag
+// coverage of all ~4262 generated tags is a tracked FOLLOW-UP, not this PR.
+// ===========================================================================
+
+#[test]
+fn xmp_generated_crs_camera_raw_settings_conformance() {
+  // `crs` (Lightroom camera-raw-settings) is a GENERATED-ONLY namespace (no
+  // hand table). Exercises a plain string (`RawFileName`), a `real` autoconv
+  // (`Version` → 15.4), an as-is string (`Exposure2012` → "+0.55", W::Str so
+  // no ConvertRational), and — the key case — a GENERATED value-MAP label:
+  // `crs:CropUnit=1` → "inches" (`CRS_CROPUNIT` IntMap, generated from -listx).
+  // Oracle (bundled `perl exiftool` 13.59, `-x Composite:all`).
+  check("XMP_gen_crs.xmp", "XMP_gen_crs.xmp.json", true);
+  check("XMP_gen_crs.xmp", "XMP_gen_crs.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_generated_lightroom_namespace_conformance() {
+  // `lr` (Lightroom) GENERATED-ONLY namespace, incl. an ExifTool `Name` remap
+  // carried in `-listx` (`lr:hierarchicalSubject` → `HierarchicalSubject`, a
+  // Bag list) + a plain `lr:privateRTKInfo` → `PrivateRTKInfo`.
+  check("XMP_gen_lr.xmp", "XMP_gen_lr.xmp.json", true);
+  check("XMP_gen_lr.xmp", "XMP_gen_lr.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_generated_xmpmm_media_management_conformance() {
+  // `xmpMM` (XMP Media Management) GENERATED-ONLY namespace — a top-level tag
+  // (`DocumentID`/`OriginalDocumentID`/`RenditionClass`) plus a `-listx`
+  // pre-flattened struct field (`DerivedFromDocumentID`), all plain strings.
+  check("XMP_gen_xmpmm.xmp", "XMP_gen_xmpmm.xmp.json", true);
+  check("XMP_gen_xmpmm.xmp", "XMP_gen_xmpmm.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_generated_nested_struct_field_conformance() {
+  // Codex R1 [high]: a NESTED structured `xmpMM:DerivedFrom/stRef:maskMarkers`
+  // (vs the flat `DerivedFromMaskMarkers` spelling) must reach the GENERATED
+  // flattened field's PrintConv. ExifTool flattens to `DerivedFromMaskMarkers`
+  // (XMP.pm:3495-3516) and applies its `%sResourceRef` `maskMarkers` PrintConv
+  // (XMP.pm:321 `{All,None}`); an unmapped value renders `Unknown (Frobnicate)`
+  // (ExifTool.pm:3622). Pre-fix `resolve_field` looked up the innermost
+  // `maskMarkers` and missed the flattened generated field → raw passthrough;
+  // the fix looks up the flattened `id.tag` first. Pins the structured-form
+  // PrintConv-miss so the generated layer works for nested (not just flat) XMP.
+  check(
+    "XMP_gen_nested_struct.xmp",
+    "XMP_gen_nested_struct.xmp.json",
+    true,
+  );
+  check(
+    "XMP_gen_nested_struct.xmp",
+    "XMP_gen_nested_struct.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_generated_covered_namespace_extra_tags_conformance() {
+  // The ADDITIVE fallback in a HAND-COVERED namespace + Name remaps in a new
+  // one: `exif:OECFColumns` / `exif:SpatialFrequencyResponseRows` are flattened
+  // EXIF struct children the hand `exif` table omits — now supplied by
+  // `GEN_EXIF` (W::Integer). `exifEX:BodySerialNumber` / `CameraOwnerName` are
+  // the generated-only `exifEX` namespace, emitting via their `-listx` `Name`
+  // remaps `SerialNumber` / `OwnerName` (and `0123456789` stays a STRING — no
+  // numeric coercion under W::Str). Oracle (bundled `perl exiftool` 13.59).
+  check(
+    "XMP_gen_covered_extra.xmp",
+    "XMP_gen_covered_extra.xmp.json",
+    true,
+  );
+  check(
+    "XMP_gen_covered_extra.xmp",
+    "XMP_gen_covered_extra.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_generated_phf_backed_value_map_conformance() {
+  // The phf-backed large value-map path (the codegen `PHF_THRESHOLD`): PLUS
+  // `MediaSummaryCode` has 2143 string-keyed rows → a `phf::Map`, looked up via
+  // the shared `value_map_get` exact-string API. `8ISH` → "Shipping".
+  // Oracle (bundled `perl exiftool` 13.59).
+  check("XMP_gen_phf_map.xmp", "XMP_gen_phf_map.xmp.json", true);
+  check("XMP_gen_phf_map.xmp", "XMP_gen_phf_map.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_generated_unported_conv_passes_through_raw_conformance() {
+  // `P::Unported` faithful raw passthrough: `HDRGainMap:HDRGainMapVersion`
+  // (XMP2.pl:1791) carries a CODE `PrintConv`
+  // (`IsInt($val) ? join(".",unpack("C*",pack "N",$val)) : $val`) NOT in
+  // `-listx`; the conv_registry marks it `Unported`, so the generated table
+  // emits `P::Unported("XMP:HDRGainMapVersion")` and the value is passed through
+  // RAW. For the chosen NON-integer value `1.2.3.4`, the bundled `IsInt` branch
+  // also returns `$val` verbatim, so the oracle matches byte-for-byte (an
+  // INTEGER value would diverge — the un-ported formatting is a tracked
+  // follow-up, never a guessed conversion). Oracle (bundled `perl exiftool`
+  // 13.59).
+  check("XMP_gen_unported.xmp", "XMP_gen_unported.xmp.json", true);
+  check("XMP_gen_unported.xmp", "XMP_gen_unported.xmp.n.json", false);
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

@@ -1,7 +1,7 @@
 # Golden-v2 Contract 3b — cargo-fuzz (libFuzzer) targets for the public parse
-# entry points. This is a SEPARATE crate (not a workspace member of the root
-# `exifast` Cargo.toml, which declares no `[workspace]`), so the ordinary
-# `cargo build`/`cargo test` never compiles it. Run with a nightly toolchain:
+# entry points. This is a SEPARATE crate, EXCLUDED from the root `exifast`
+# workspace (`[workspace] exclude = ["fuzz"]` in the root Cargo.toml), so the
+# ordinary `cargo build`/`cargo test` never compiles it. Run with a nightly toolchain:
 #   cargo +nightly fuzz run parse_bytes
 [package]
 name = "exifast-fuzz"

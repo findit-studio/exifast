@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "XMP_gen_nested_struct.xmp",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-xmpMM:DerivedFrom": {
+    "DocumentID": "xmp.did:abc123",
+    "MaskMarkers": "Unknown (Frobnicate)"
+  }
+}]

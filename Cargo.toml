@@ -224,6 +224,9 @@ xmp        = []
 mpeg-audio = []
 
 [dependencies]
+# Static maps for the xtask-generated tag tables (string-keyed + large int
+# maps). `default-features = false` keeps it no_std-clean (drops `std`/`unicase`).
+phf = { version = "0.11", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
 # Reserved for Phase D's `MetaSinker`/`TagWriter` scaffold and Phase E's
 # typed-Meta migration (datetimes via `jiff::civil::DateTime`). Not yet used.
@@ -281,3 +284,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
+
+# The root `exifast` package doubles as the workspace root so the build-tooling
+# crate `xtask/` (which depends on `exifast` itself) shares one lockfile and
+# target dir. `fuzz/` is EXCLUDED: it is a cargo-fuzz crate with its own
+# `[package]` but NO `[workspace]` of its own, so without this exclude cargo
+# would pull it in as a workspace member and the ordinary build would try to
+# compile the libFuzzer targets (which need a nightly toolchain).
+[workspace]
+members = ["xtask"]
+exclude = ["fuzz"]
