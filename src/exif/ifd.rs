@@ -445,6 +445,70 @@ impl RawValue {
       _ => None,
     }
   }
+
+  /// ExifTool's post-`ReadValue` `$val` AS BYTES — what a byte-walking
+  /// `RawConv` consumes. Defined for EVERY shape so a conv never has to gate on
+  /// `Format`: `Text` → the pre-FixUTF8 `raw` (the original on-disk bytes);
+  /// `Bytes` → the bytes verbatim; numeric → the space-joined ExifTool `$val`
+  /// rendering (`ReadValue`'s `join(' ', @vals)`, [`Self::numeric_val_string`]).
+  ///
+  /// Borrows for `Text`/`Bytes` (zero-copy); allocates only for the numeric
+  /// shapes, which have no stored byte form.
+  #[must_use]
+  pub fn val_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    match self {
+      RawValue::Text { raw, .. } => Cow::Borrowed(raw),
+      RawValue::Bytes(b) => Cow::Borrowed(b),
+      _ => Cow::Owned(self.numeric_val_string().into_bytes()),
+    }
+  }
+
+  /// The numeric shapes as the single space-joined string ExifTool's
+  /// `ReadValue` produces for `$val` (`join(' ', @vals)`): each element via the
+  /// SAME per-element token form [`emit_raw`](crate::exif)/`value_space_joined`
+  /// render — `U64`/`I64` decimal, `F64` via `%.15g` ([`crate::value::format_g`]
+  /// `(_, 15)`), `Rational` via [`Rational::exiftool_val_str`]. A non-numeric
+  /// shape (`Text`/`Bytes`) returns the empty string (callers reach those via
+  /// [`Self::val_bytes`]'s borrowing arms, never here).
+  #[must_use]
+  fn numeric_val_string(&self) -> std::string::String {
+    use std::fmt::Write as _;
+    let mut s = std::string::String::new();
+    match self {
+      RawValue::U64(v) => join_display(&mut s, v),
+      RawValue::I64(v) => join_display(&mut s, v),
+      RawValue::F64(v) => {
+        for (i, val) in v.iter().enumerate() {
+          if i > 0 {
+            s.push(' ');
+          }
+          s.push_str(&crate::value::format_g(*val, 15));
+        }
+      }
+      RawValue::Rational(rs) => {
+        for (i, r) in rs.iter().enumerate() {
+          if i > 0 {
+            s.push(' ');
+          }
+          let _ = write!(s, "{}", r.exiftool_val_str());
+        }
+      }
+      RawValue::Text { .. } | RawValue::Bytes(_) => {}
+    }
+    s
+  }
+}
+
+/// Space-join `Display` elements into `s` (the `ReadValue` integer-array join).
+fn join_display<T: core::fmt::Display>(s: &mut std::string::String, vals: &[T]) {
+  use std::fmt::Write as _;
+  for (i, v) in vals.iter().enumerate() {
+    if i > 0 {
+      s.push(' ');
+    }
+    let _ = write!(s, "{v}");
+  }
 }
 
 // ===========================================================================
@@ -710,6 +774,34 @@ mod tests {
         text: "Canon".to_string(),
         raw: b"Canon"[..].into(),
       }
+    );
+  }
+
+  #[test]
+  fn val_bytes_returns_original_for_every_shape() {
+    use std::borrow::Cow;
+    // Text → the pre-FixUTF8 raw bytes (NOT the lossy text).
+    let t = RawValue::Text {
+      text: "A\u{fffd}".into(),
+      raw: b"A\xff"[..].into(),
+    };
+    assert_eq!(&*t.val_bytes(), b"A\xff");
+    assert!(matches!(t.val_bytes(), Cow::Borrowed(_)));
+    // Bytes → the bytes verbatim.
+    let b = RawValue::Bytes(vec![1, 2, 3]);
+    assert_eq!(&*b.val_bytes(), &[1, 2, 3]);
+    assert!(matches!(b.val_bytes(), Cow::Borrowed(_)));
+    // numeric → ExifTool's space-joined `$val` rendering, as bytes.
+    let n = RawValue::U64(vec![16706, 17220]);
+    assert_eq!(&*n.val_bytes(), b"16706 17220");
+    assert!(matches!(n.val_bytes(), Cow::Owned(_)));
+    // signed + float + rational shapes render via the same token form
+    // `value_space_joined`/`emit_raw` use.
+    assert_eq!(&*RawValue::I64(vec![-5, 7]).val_bytes(), b"-5 7");
+    assert_eq!(&*RawValue::F64(vec![1.5, -0.25]).val_bytes(), b"1.5 -0.25");
+    assert_eq!(
+      &*RawValue::Rational(vec![Rational::new(1, 2, 7), Rational::new(3, 1, 7)]).val_bytes(),
+      b"0.5 3"
     );
   }
 
