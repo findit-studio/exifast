@@ -7707,11 +7707,51 @@ fn exif_composite_exposure_edge_conformance() {
     false,
   );
 }
-// `Exif_composite_exposure_wrongfmt.tif` (WRONG on-disk format, ASCII not
-// `undef`) and its conformance were REMOVED: faithful wrong-format
-// `CompositeImageExposureTimes` (0xa462) decode is deferred to issue #198. The
-// dispatch now decodes only the verified real-camera `undef`/`RawValue::Bytes`
-// path; any other on-disk shape falls back to `emit_raw`.
+#[test]
+fn exif_composite_exposure_wrongfmt_conformance() {
+  // #198 — `CompositeImageExposureTimes` (0xa462) written with the WRONG
+  // on-disk format (`string`/ASCII, not `undef`). The bespoke `RawConv`
+  // (Exif.pm:3079) byte-walks `$val` REGARDLESS of `Format`, so the dispatch
+  // reads the bytes via `RawValue::val_bytes()` (A2) — for a `string` value
+  // that is the pre-FixUTF8 original bytes (A1's `RawValue::Text.raw`). The
+  // 8-byte ASCII `"ABCDEFGH"` decodes as ONE rational64u 0x41424344/0x45464748
+  // ≈ 0.9420: `-j` → `0.9` (PrintExposureTime `%.1f`, a BARE number), `-n` →
+  // `0.9420322801` (the RawConv token). Pre-fix this `RawValue::Text` shape
+  // fell to `emit_raw` (the raw string "ABCDEFGH") — the #198 deferral, now
+  // closed. Verified byte-identical to bundled `perl exiftool 13.59`.
+  check(
+    "Exif_composite_exposure_wrongfmt.tif",
+    "Exif_composite_exposure_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure_wrongfmt.tif",
+    "Exif_composite_exposure_wrongfmt.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_composite_exposure_wrongfmt_highbit_conformance() {
+  // #198 R4 — the LOSSY-BYTES case proving A1/A2 retain `$val`'s ORIGINAL
+  // bytes. A `string`-typed 0xa462 with INVALID-UTF-8 high-bit bytes
+  // (`\x80..\x87`): the byte-walk must see the original bytes, NOT the lossy
+  // FixUTF8 display text (where each high byte → U+FFFD, corrupting the
+  // rational decode). The 8 bytes decode as ONE rational64u
+  // 0x80818283/0x84858687 ≈ 0.9697: `-j` → `1` (PrintExposureTime `%.1f` =
+  // "1.0", `s/\.0$//`), `-n` → `0.9696978699`. Bundled `perl exiftool 13.59`
+  // byte-walks the same original bytes (this is the oracle of record); a
+  // pre-A1 lossy re-encode would have diverged. Verified byte-identical.
+  check(
+    "Exif_composite_exposure_wrongfmt_highbit.tif",
+    "Exif_composite_exposure_wrongfmt_highbit.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure_wrongfmt_highbit.tif",
+    "Exif_composite_exposure_wrongfmt_highbit.tif.n.json",
+    false,
+  );
+}
 #[test]
 fn exif_composite_exposure_single_conformance() {
   // Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY ONE

@@ -3699,12 +3699,14 @@ fn emit_exif_value<S: ExifSink>(
       // `undef` blob is decoded by a bespoke `RawConv` (`Exif.pm:3079-3098`)
       // that byte-walks `$val` then a `PrintConv` (`Exif.pm:3104-3115`).
       //
-      // Only the verified real-camera `undef` path is decoded here: a
-      // `RawValue::Bytes` blob is byte-walked by `composite_image_exposure_times`.
-      // Any other on-disk shape (a camera that wrote the WRONG format —
-      // `string`/numeric) falls through to `emit_raw`; faithfully byte-walking
-      // the post-`ReadValue` string for those mis-formatted values is deferred to
-      // issue #198.
+      // The RawConv byte-walks `$val` REGARDLESS of the on-disk `Format`
+      // (ExifTool applies it to whatever `ReadValue` returned), so read the
+      // bytes via `val_bytes()`: a real-camera `undef` blob borrows its bytes;
+      // a camera that mis-wrote the format (`string`/numeric) byte-walks the
+      // post-`ReadValue` `$val` rendering — `string`'s original bytes (not the
+      // lossy display text — A1/A2) or the space-joined numeric `$val`. The
+      // decoder bounds-checks every read, so a short/mis-formatted `$val` is
+      // safe (closes #198).
       //
       // `composite_image_exposure_times` returns ONE token per decoded element.
       // ExifTool's JSON typing is element-count dependent (the `RawConv`/
@@ -3723,10 +3725,8 @@ fn emit_exif_value<S: ExifSink>(
       // (the same `EscapeJSON` number gate the rest of EXIF emission uses) so a
       // one-element numeric result is a bare number, not a type-wrong string;
       // keep `write_str` for the 0-/multi-token space-joined case.
-      let RawValue::Bytes(b) = raw else {
-        return emit_raw(group, name, raw, out);
-      };
-      let parts = composite_image_exposure_times(b, order, print_conv);
+      let bytes = raw.val_bytes();
+      let parts = composite_image_exposure_times(&bytes, order, print_conv);
       if let [token] = parts.as_slice() {
         // One element: the lone token is the entire scalar — gate it so a
         // numeric token is a bare JSON number and `undef`/`1/N` stays a string.
