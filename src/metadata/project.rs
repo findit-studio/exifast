@@ -199,7 +199,7 @@ mod exif_impl {
     /// Perl `\s` = ASCII whitespace.
     fn entry_text(&self, name: &str) -> Option<String> {
       match self.entry(name)?.value_ref().raw() {
-        RawValue::Text(s) => {
+        RawValue::Text { text: s, .. } => {
           let trimmed = s.trim_end_matches(|c: char| c.is_ascii_whitespace());
           (!trimmed.is_empty()).then(|| trimmed.to_owned())
         }

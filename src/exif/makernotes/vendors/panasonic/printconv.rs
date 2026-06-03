@@ -1063,7 +1063,7 @@ fn firmware_version(raw: &RawValue, print_conv: bool) -> TagValue {
   use std::string::ToString;
   let bytes = match raw {
     RawValue::Bytes(b) => b.clone(),
-    RawValue::Text(s) => s.as_bytes().to_vec(),
+    RawValue::Text { text: s, .. } => s.as_bytes().to_vec(),
     RawValue::U64(v) => v.iter().map(|&n| n as u8).collect(),
     _ => return raw_to_tag_value(raw),
   };
@@ -1295,7 +1295,7 @@ fn print_parameter(raw: &RawValue, print_conv: bool) -> TagValue {
 /// `"9999:99:99 00:00:00" => "(not set)"`, else passthrough.
 fn baby_age(raw: &RawValue, print_conv: bool) -> TagValue {
   let s = match raw {
-    RawValue::Text(s) => s.as_str().to_string(),
+    RawValue::Text { text: s, .. } => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
       // `end <= b.len()`, so `.get(..end)` is `Some` — byte-identical.
@@ -1319,7 +1319,7 @@ fn baby_age(raw: &RawValue, print_conv: bool) -> TagValue {
 /// the shared `ConvertDateTime` port (identity under default options).
 fn time_stamp(raw: &RawValue, print_conv: bool) -> TagValue {
   let s = match raw {
-    RawValue::Text(s) => s.as_str().to_string(),
+    RawValue::Text { text: s, .. } => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
       // `end <= b.len()`, so `.get(..end)` is `Some` — byte-identical.
@@ -1388,7 +1388,7 @@ fn scaled_tenths(raw: &RawValue, print_conv: bool, negate: bool) -> TagValue {
 fn internal_serial_number(raw: &RawValue, print_conv: bool) -> TagValue {
   let bytes = match raw {
     RawValue::Bytes(b) => b.clone(),
-    RawValue::Text(s) => s.as_bytes().to_vec(),
+    RawValue::Text { text: s, .. } => s.as_bytes().to_vec(),
     _ => return raw_to_tag_value(raw),
   };
   let mut end = bytes.len();
@@ -1452,7 +1452,7 @@ fn panasonic_exif_version(raw: &RawValue) -> TagValue {
         TagValue::Bytes(b.clone())
       }
     }
-    RawValue::Text(s) => TagValue::Str(s.as_str().into()),
+    RawValue::Text { text: s, .. } => TagValue::Str(s.as_str().into()),
     _ => raw_to_tag_value(raw),
   }
 }
@@ -1720,7 +1720,7 @@ fn first_u64(raw: &RawValue) -> Option<u64> {
 /// default rendering.
 fn trim_trailing_spaces(raw: &RawValue) -> TagValue {
   let s = match raw {
-    RawValue::Text(s) => s.as_str(),
+    RawValue::Text { text: s, .. } => s.as_str(),
     RawValue::Bytes(b) => match core::str::from_utf8(b) {
       Ok(t) => t.trim_end_matches('\0'),
       Err(_) => return raw_to_tag_value(raw),
@@ -1892,7 +1892,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Text(s) => TagValue::Str(s.as_str().into()),
+    RawValue::Text { text: s, .. } => TagValue::Str(s.as_str().into()),
     RawValue::Bytes(b) => TagValue::Bytes(b.clone()),
   }
 }
@@ -1953,7 +1953,10 @@ mod tests {
   /// spaces are preserved; only trailing spaces go.
   #[test]
   fn trim_trailing_spaces_strips_only_trailing() {
-    let raw = RawValue::Text("LUMIX G 14/F2.5   ".into());
+    let raw = RawValue::Text {
+      text: "LUMIX G 14/F2.5   ".into(),
+      raw: b"LUMIX G 14/F2.5   "[..].into(),
+    };
     assert_eq!(
       PanasonicPrintConv::TrimTrailingSpaces.apply(&raw, true),
       TagValue::Str("LUMIX G 14/F2.5".into())
@@ -1964,7 +1967,10 @@ mod tests {
       TagValue::Str("LUMIX G 14/F2.5".into())
     );
     // Interior spaces kept; no trailing → unchanged.
-    let raw2 = RawValue::Text("A B C".into());
+    let raw2 = RawValue::Text {
+      text: "A B C".into(),
+      raw: b"A B C"[..].into(),
+    };
     assert_eq!(
       PanasonicPrintConv::TrimTrailingSpaces.apply(&raw2, true),
       TagValue::Str("A B C".into())
@@ -2200,7 +2206,10 @@ mod tests {
   /// 12:34:56")` returns the input unchanged.
   #[test]
   fn time_stamp_convert_datetime_identity() {
-    let raw = RawValue::Text("2021:05:30 12:34:56".into());
+    let raw = RawValue::Text {
+      text: "2021:05:30 12:34:56".into(),
+      raw: b"2021:05:30 12:34:56"[..].into(),
+    };
     assert_eq!(
       PanasonicPrintConv::TimeStamp.apply(&raw, true),
       TagValue::Str("2021:05:30 12:34:56".into())

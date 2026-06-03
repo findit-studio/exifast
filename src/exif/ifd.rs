@@ -398,7 +398,18 @@ pub enum RawValue {
   Rational(Vec<Rational>),
   /// A `string` (ASCII / Exif-3.0 UTF-8). NUL-terminator trimmed
   /// (`ExifTool.pm:6301` `$vals[0] =~ s/\0.*//s`).
-  Text(std::string::String),
+  ///
+  /// Carries BOTH the FixUTF8 display text (`text`) AND the pre-FixUTF8,
+  /// NUL-trimmed original bytes (`raw`). A normal text conv reads `text`; a
+  /// byte-walking `RawConv` (`CompositeImageExposureTimes`, `UserComment`)
+  /// reads `raw` — ExifTool's post-`ReadValue` `$val` bytes, not a lossy
+  /// re-encoding (see [`RawValue::val_bytes`]).
+  Text {
+    /// The FixUTF8 display string (`lossy_string` of `raw`).
+    text: std::string::String,
+    /// The pre-FixUTF8, NUL-trimmed original bytes — `$val`'s bytes.
+    raw: Box<[u8]>,
+  },
   /// `undef`/`binary`/`unicode`/`complex` — raw bytes, not NUL-trimmed.
   Bytes(Vec<u8>),
 }
@@ -412,7 +423,7 @@ impl RawValue {
       RawValue::I64(v) => v.len(),
       RawValue::F64(v) => v.len(),
       RawValue::Rational(v) => v.len(),
-      RawValue::Text(_) => 1,
+      RawValue::Text { .. } => 1,
       RawValue::Bytes(v) => v.len(),
     }
   }
@@ -508,8 +519,13 @@ pub fn read_value(
       };
       // ExifTool's `string` is Latin-1-ish bytes; for byte-equivalence with
       // the JSON oracle we keep valid UTF-8 verbatim and lossy-replace the
-      // rare non-UTF-8 byte (the bundled camera fixtures are all ASCII).
-      RawValue::Text(lossy_string(trimmed))
+      // rare non-UTF-8 byte (the bundled camera fixtures are all ASCII). The
+      // pre-FixUTF8 `trimmed` bytes are retained as `raw` so a byte-walking
+      // RawConv reads `$val`'s ORIGINAL bytes, not the lossy re-encoding.
+      RawValue::Text {
+        text: lossy_string(trimmed),
+        raw: trimmed.into(),
+      }
     }
     Format::Utf8 => {
       // Exif 3.0 `utf8` — decoded as UTF-8 (`Exif.pm:6786` `Decode(.., 'UTF8')`).
@@ -518,7 +534,10 @@ pub fn read_value(
         Some(nul) => raw.get(..nul).unwrap_or(raw),
         None => raw,
       };
-      RawValue::Text(lossy_string(trimmed))
+      RawValue::Text {
+        text: lossy_string(trimmed),
+        raw: trimmed.into(),
+      }
     }
     Format::Undef | Format::Unicode | Format::Complex => {
       // `undef`/`binary` — raw bytes, NOT NUL-trimmed. (`Unicode`/`Complex`
@@ -612,7 +631,10 @@ pub fn read_value(
 /// is the empty string; for the others an empty list.
 fn empty_value(format: Format) -> RawValue {
   match format {
-    Format::Ascii | Format::Utf8 => RawValue::Text(std::string::String::new()),
+    Format::Ascii | Format::Utf8 => RawValue::Text {
+      text: std::string::String::new(),
+      raw: Box::default(),
+    },
     Format::Undef | Format::Unicode | Format::Complex => RawValue::Bytes(Vec::new()),
     Format::Int8s | Format::Int16s | Format::Int32s | Format::Int64s => RawValue::I64(Vec::new()),
     Format::Float | Format::Double => RawValue::F64(Vec::new()),
@@ -682,7 +704,13 @@ mod tests {
     // "Canon\0..." — string trims at the first NUL (ExifTool.pm:6301).
     let data = b"Canon\0junk";
     let v = read_value(data, 0, Format::Ascii, 10, 10, ByteOrder::Big).unwrap();
-    assert_eq!(v, RawValue::Text("Canon".to_string()));
+    assert_eq!(
+      v,
+      RawValue::Text {
+        text: "Canon".to_string(),
+        raw: b"Canon"[..].into(),
+      }
+    );
   }
 
   #[test]

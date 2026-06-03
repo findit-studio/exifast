@@ -40,7 +40,7 @@ fn exif_makernote_fixture_dispatches_to_pentax() {
   // through to the dispatcher AND surfaces it as a leaf tag).
   let make_entry = meta.entry("Make").expect("Make tag in IFD0");
   let make = match make_entry.value_ref().raw() {
-    exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+    exifast::exif::ifd::RawValue::Text { text: s, .. } => s.as_str(),
     other => panic!("Make is not a Text RawValue: {other:?}"),
   };
   assert!(make.starts_with("PENTAX"), "Make = {make:?}");
@@ -166,7 +166,7 @@ fn synthetic_canon_makernote_dispatches() {
   // Make captured.
   assert_eq!(
     meta.entry("Make").map(|e| match e.value_ref().raw() {
-      exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+      exifast::exif::ifd::RawValue::Text { text: s, .. } => s.as_str(),
       _ => "<not-text>",
     }),
     Some("Canon")
@@ -454,7 +454,7 @@ fn sony_dsc_real_fixture_dispatches_with_no_recognized_tags() {
   // IFD0 Make = "SONY"
   let make_entry = meta.entry("Make").expect("Make tag in IFD0");
   let make = match make_entry.value_ref().raw() {
-    exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+    exifast::exif::ifd::RawValue::Text { text: s, .. } => s.as_str(),
     other => panic!("Make is not a Text RawValue: {other:?}"),
   };
   assert_eq!(make, "SONY");
@@ -2367,7 +2367,7 @@ fn synthetic_dji_makernote_dispatches_and_decodes_pose() {
   // Sanity: Make was extracted.
   let make_entry = meta.entry("Make").expect("Make in IFD0");
   let make = match make_entry.value_ref().raw() {
-    exifast::exif::ifd::RawValue::Text(s) => s.as_str(),
+    exifast::exif::ifd::RawValue::Text { text: s, .. } => s.as_str(),
     other => panic!("Make not Text, got {other:?}"),
   };
   assert!(make.starts_with("DJI"), "Make = {make:?}");

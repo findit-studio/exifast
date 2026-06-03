@@ -664,12 +664,12 @@ pub fn parse_into_metadata(
 fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry, val: &TagValue) {
   match entry.tag_id {
     0x06 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.image_type = Some(s.as_str().into());
       }
     }
     0x07 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.firmware_version = Some(s.as_str().into());
       }
     }
@@ -681,7 +681,7 @@ fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry, val: &TagValu
       }
     }
     0x09 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.owner_name = Some(s.as_str().into());
       }
     }
@@ -708,12 +708,12 @@ fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry, val: &TagValu
       }
     }
     0x95 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.lens_model_string = Some(s.as_str().into());
       }
     }
     0x96 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.internal_serial_number = Some(s.as_str().into());
       }
     }
