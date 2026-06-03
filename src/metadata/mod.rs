@@ -52,5 +52,7 @@ pub use png::{
   PngColorType, PngDynamicProfileTag, PngExifEvent, PngMeta, PngTextKind, PngTextRecord,
 };
 pub use project::Project;
-pub use quicktime::{HandlerKind, KodakFrea, MediaTrack, QuickTimeMeta};
+pub use quicktime::{
+  HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeKeys, QuickTimeMeta, QuickTimeUserData,
+};
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};

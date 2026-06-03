@@ -57,7 +57,8 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   formats::{quicktime_freegps, quicktime_stream},
   metadata::{
-    GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeMeta, QuickTimeStreamMeta,
+    GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeGps, QuickTimeMeta,
+    QuickTimeStreamMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -729,6 +730,17 @@ fn handler_type_print(code: &str) -> &'static str {
   }
 }
 
+/// `hdlr` HandlerClass / ComponentType PrintConv (QuickTime.pm:8398-8401).
+/// `mhlr`→Media Handler / `dhlr`→Data Handler; any other code is a hash miss
+/// (empty ⇒ the caller renders `Unknown ($val)`).
+fn handler_class_print(code: &str) -> &'static str {
+  match code {
+    "mhlr" => "Media Handler",
+    "dhlr" => "Data Handler",
+    _ => "",
+  }
+}
+
 /// `MediaLanguageCode` ValueConv (QuickTime.pm:7280): a 16-bit code that is
 /// either a Macintosh language id (`< 0x400` or `0x7fff`) or a packed ISO
 /// 639-2 three-letter code (three 5-bit groups, each offset by `0x60`).
@@ -1281,6 +1293,18 @@ fn decode_hdlr(payload: &[u8]) -> Option<String> {
   Some(String::from_utf8_lossy(raw).into_owned())
 }
 
+/// Read the `hdlr` atom's raw 4-byte HandlerClass / ComponentType
+/// (QuickTime.pm:8395-8402 — `undef[4]` at body offset 4). `RawConv => '$val eq
+/// "\0\0\0\0" ? undef : $val'` ⇒ an all-zero ComponentType is `None` (ExifTool
+/// omits the tag). Returns the lossless 4-char string otherwise.
+fn decode_hdlr_class(payload: &[u8]) -> Option<String> {
+  let raw = payload.get(4..8)?;
+  if raw == [0, 0, 0, 0] {
+    return None;
+  }
+  Some(String::from_utf8_lossy(raw).into_owned())
+}
+
 /// Decode every `mvhd` inside one `moov` atom into `qt` (QuickTime.pm:660-
 /// 700, 1343-1421). This is the FIRST of the two top-level passes (see
 /// [`parse_inner`]): it establishes the movie `TimeScale` (and the movie
@@ -1441,6 +1465,7 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
                 if let Some(code) = decode_hdlr(ibody) {
                   track.set_handler_code(code);
                 }
+                track.set_handler_class(decode_hdlr_class(ibody));
               }
               _ => {}
             },
@@ -1452,6 +1477,920 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
   );
   track.set_warning(track_warning);
   track
+}
+
+// ===========================================================================
+// SP2 — udta camera atoms + moov/meta Keys/ItemList (QuickTime.pm:1585-1900,
+// 2809-2900, 6651-6760, 9779-9878)
+// ===========================================================================
+
+/// Walk one `moov` atom's DIRECT children for the **SP2** `udta` camera atoms
+/// and the `moov/meta` Keys/ItemList metadata, decoding into `qt`
+/// (QuickTime.pm:2058/2070 — `udta`/`meta` are `%QuickTime::Movie` keys). The
+/// box walk runs at `depth` (the enclosing Pass-1 moov walk passes its child
+/// depth); a contained malformed atom surfaces a warning through `warning`
+/// (first-wins, like `decode_moov_mvhd`). A second top-level `moov` re-enters
+/// here, last-wins per field (TagMap semantics) — matching the GoPro/multimoov
+/// flat-accumulation pattern.
+fn decode_moov_udta_meta(
+  depth: u32,
+  payload: &[u8],
+  qt: &mut QuickTimeMeta,
+  warning: &mut Option<String>,
+) {
+  walk_atoms(
+    depth,
+    payload,
+    0,
+    payload.len(),
+    warning,
+    |atom, body, w| match &atom.atom_type {
+      b"udta" => walk_udta(depth + 1, body, w, qt.user_data_mut()),
+      b"meta" => walk_meta(depth + 1, body, w, qt),
+      _ => {}
+    },
+  );
+}
+
+/// Walk one `udta` atom payload, decoding the camera/GPS/capture-identity
+/// atoms into `ud` (QuickTime.pm:1585-1900). Two atom families are handled:
+///
+///   - **International-text atoms** (4-cc beginning with the copyright symbol
+///     0xA9): Make / Model / SoftwareVersion / Title / Comment / Copyright /
+///     ContentCreateDate / GPSCoordinates. Decoded via [`decode_itext_first`].
+///   - **Plain 4-cc atoms** (`manu` / `modl` / `cmnm` / `CNMN` / DJI copyright
+///     `mdl` / `slno` / `SNum` / `CNCV` / `CNFV` / `FIRM` / `info` / `cmid` /
+///     `date`). These carry their value as a table-`FORMAT => 'string'` value
+///     (NUL-terminated) — except `manu` / `modl`, which apply the Canon/Samsung
+///     RawConv `s/^\0{4}..//s; s/\0.*//`.
+///
+/// Make / Model / SerialNumber / FirmwareVersion are MULTI-SOURCE: their setters
+/// take the source's ExifTool priority (1 = normal, 0 = `Avoid`) and the typed
+/// layer resolves duplicates (see
+/// [`crate::metadata::QuickTimeUserData`]). A contained malformed atom surfaces
+/// a warning through `w`.
+fn walk_udta(
+  depth: u32,
+  payload: &[u8],
+  w: &mut Option<String>,
+  ud: &mut crate::metadata::QuickTimeUserData,
+) {
+  const CR: u8 = 0xA9; // the copyright-symbol prefix.
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, _w| {
+    let t = atom.atom_type;
+    // ── International-text (copyright-symbol-prefixed) atoms ───────────────
+    if t.first() == Some(&CR) {
+      let Some(text) = decode_itext_first(body) else {
+        return;
+      };
+      match t.get(1..4) {
+        // `©mak` Make (no Avoid ⇒ priority 1).
+        Some(b"mak") => {
+          ud.set_make(text, 1);
+        }
+        // `©mod` Model (no Avoid ⇒ priority 1).
+        Some(b"mod") => {
+          ud.set_model(text, 1);
+        }
+        Some(b"swr") => {
+          ud.set_software(Some(text));
+        }
+        Some(b"nam") => {
+          ud.set_title(Some(text));
+        }
+        Some(b"cmt") => {
+          ud.set_comment(Some(text));
+        }
+        Some(b"cpy") => {
+          ud.set_copyright(Some(text));
+        }
+        Some(b"day") => {
+          ud.set_content_create_date(Some(convert_iso8601_date(&text)));
+        }
+        Some(b"xyz") => {
+          // The `xyz` GPS atom is PRESENT, so the GPS tag is always emitted (the
+          // raw string when undecodable — `ConvertISO6709` returns `$val`
+          // unchanged).
+          ud.set_gps(Some(parse_iso6709(&text)));
+        }
+        Some(b"mdl") => {
+          // The DJI non-standard `©mdl` Model atom (QuickTime.pm:2156, Avoid ⇒
+          // priority 0, Format => 'string'). It still arrives as a
+          // copyright-symbol atom but its value is a plain NUL-terminated
+          // string, so re-decode the body as a string (NOT international text).
+          ud.set_model(decode_qt_string(body), 0);
+        }
+        _ => {}
+      }
+      return;
+    }
+    // ── Plain 4-cc camera/GPS/capture-identity atoms ───────────────────────
+    match &t {
+      // `manu` Make / `modl` Model (Canon SX280 / Samsung GT-S8530): Avoid ⇒
+      // priority 0; RawConv `s/^\0{4}..//s; s/\0.*//` strips the optional Canon
+      // 6-byte prefix then truncates at the first NUL (QuickTime.pm:1879-1891).
+      b"manu" => {
+        ud.set_make(decode_manu_modl(body), 0);
+      }
+      b"modl" => {
+        ud.set_model(decode_manu_modl(body), 0);
+      }
+      // `cmnm` / `CNMN` Model (Format => 'string', Avoid ⇒ priority 0).
+      b"cmnm" | b"CNMN" => {
+        ud.set_model(decode_qt_string(body), 0);
+      }
+      // `slno` SerialNumber (Format => 'string', no Avoid ⇒ priority 1).
+      b"slno" => {
+        ud.set_serial_number(decode_qt_string(body), 1);
+      }
+      // `SNum` SerialNumber (Kodak, Avoid ⇒ priority 0).
+      b"SNum" => {
+        ud.set_serial_number(decode_qt_string(body), 0);
+      }
+      // `CNFV` FirmwareVersion (Canon, Format => 'string', no Avoid ⇒ 1).
+      b"CNFV" => {
+        ud.set_firmware_version(decode_qt_string(body), 1);
+      }
+      // `info` FirmwareVersion (Nextbase, no Avoid ⇒ priority 1).
+      b"info" => {
+        ud.set_firmware_version(decode_qt_string(body), 1);
+      }
+      // `FIRM` FirmwareVersion (GoPro Hero4, Avoid ⇒ priority 0).
+      b"FIRM" => {
+        ud.set_firmware_version(decode_qt_string(body), 0);
+      }
+      // `CNCV` CompressorVersion (Canon, Format => 'string', single-source).
+      b"CNCV" => {
+        ud.set_compressor_version(Some(decode_qt_string(body)));
+      }
+      // `cmid` CameraID (Apple, Format => 'string', single-source).
+      b"cmid" => {
+        ud.set_camera_id(Some(decode_qt_string(body)));
+      }
+      // `date` DateTimeOriginal (Apple, %iso8601Date over the string value).
+      b"date" => {
+        ud.set_date_time_original(Some(convert_iso8601_date(&decode_qt_string(body))));
+      }
+      _ => {}
+    }
+  });
+}
+
+/// Decode a plain (non-international-text) `udta` string-atom value, faithful to
+/// the table `FORMAT => 'string'` reading of `%QuickTime::UserData` — a
+/// NUL-terminated string (`ReadValue` with the `string` format reads up to the
+/// first NUL, QuickTime.pm:1592). The bytes are otherwise interpreted as UTF-8
+/// (lossy); trailing data after the first NUL is dropped.
+fn decode_qt_string(body: &[u8]) -> String {
+  let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+  let s = body.get(..end).unwrap_or_default();
+  String::from_utf8_lossy(s).into_owned()
+}
+
+/// The `manu` Make / `modl` Model RawConv `$val=~s/^\0{4}..//s; $val=~s/\0.*//`
+/// (QuickTime.pm:1883/1890). Canon prepends 6 unknown bytes (`\0\0\0\0` then 2
+/// more) before the value; the first substitution drops exactly those 6 bytes
+/// WHEN the value starts with 4 NULs, then the value is truncated at the next
+/// NUL. A value not starting with 4 NULs (e.g. Samsung `SAMSUNG\0`) keeps its
+/// leading bytes and is just NUL-truncated. An all-stripped value yields the
+/// empty string (still emitted by ExifTool).
+fn decode_manu_modl(body: &[u8]) -> String {
+  // `s/^\0{4}..//s` — only when the value begins with 4 NUL bytes, drop those
+  // 4 plus the following 2 bytes (6 total). Perl's `.` matches any byte under
+  // `/s`, so the 2 trailing bytes are unconditional once the 4 NULs match.
+  let rest = if body.len() >= 6 && body.get(..4) == Some(&[0u8, 0, 0, 0]) {
+    body.get(6..).unwrap_or_default()
+  } else {
+    body
+  };
+  // `s/\0.*//` — truncate at the first NUL.
+  let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+  let s = rest.get(..end).unwrap_or_default();
+  String::from_utf8_lossy(s).into_owned()
+}
+
+/// One `data` value decoded from an `ilst` item, with its format flags.
+struct IlstData {
+  /// The `data`-atom flags `int32u` (the high byte selects the value format —
+  /// `%stringEncoding`, QuickTime.pm:357-363).
+  flags: u32,
+  /// The value bytes (after the 8-byte flags+locale header).
+  bytes: std::vec::Vec<u8>,
+}
+
+/// Parse the first `data` child of an `ilst` item atom (QuickTime.pm:10378-
+/// 10417): `int32u flags`, `int32u reserved` (country/language), then the
+/// value. A contained malformed atom surfaces a warning through `w`.
+fn decode_ilst_data(depth: u32, payload: &[u8], w: &mut Option<String>) -> Option<IlstData> {
+  let mut result: Option<IlstData> = None;
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, _w| {
+    if &atom.atom_type == b"data"
+      && result.is_none()
+      && let Some(flag_bytes) = body.get(0..4)
+      && let Some(value) = body.get(8..)
+    {
+      let flags = u32::from_be_bytes(flag_bytes.try_into().unwrap_or([0; 4]));
+      result = Some(IlstData {
+        flags,
+        bytes: value.to_vec(),
+      });
+    }
+  });
+  result
+}
+
+/// Render an `ilst` `data` value as a string, faithful to the `%stringEncoding`
+/// branch of the `data`-atom handler (QuickTime.pm:357-363, 10393-10398). The
+/// flag's low byte selects the encoding: `1`/`4` = UTF-8, `2`/`5` = UTF-16BE;
+/// any other flag is treated as raw bytes interpreted as UTF-8 (the
+/// camera-metadata keys all carry text values). Trailing NULs are stripped.
+fn ilst_data_string(data: &IlstData) -> String {
+  let mut s = match data.flags {
+    2 | 5 => decode_utf16be(&data.bytes),
+    _ => String::from_utf8_lossy(&data.bytes).into_owned(),
+  };
+  while s.ends_with('\0') {
+    s.pop();
+  }
+  s
+}
+
+/// One `keys`-box entry: the `mdta`-stripped key plus the FULL (un-stripped)
+/// key. ExifTool's `ProcessKeys` resolves a key by trying the stripped form
+/// first, then falling back to the FULL form (QuickTime.pm:9807-9824 `for(;;)`
+/// loop). Carrying both lets [`apply_key`] reproduce that fallback so keys NOT
+/// in the `com.apple.quicktime` namespace — e.g. `com.android.manufacturer`,
+/// whose table id keeps the `com.` prefix — still resolve.
+struct KeyName {
+  /// The key after the `mdta` `s/^com\.(apple\.quicktime\.)?//` strip.
+  stripped: String,
+  /// The key as written (before stripping).
+  full: String,
+}
+
+/// Parse the `keys` box payload into the ordered list of key names
+/// (QuickTime.pm:9779-9824 `ProcessKeys`). Layout: `int32u version/flags`,
+/// `int32u entry-count`, then each entry `int32u size`, `char[4] namespace`,
+/// `char[size-8]` key. The `com.apple.quicktime.` / `com.` prefix is stripped
+/// for `mdta`-namespace keys (QuickTime.pm:9803), but the FULL key is retained
+/// alongside so [`apply_key`] can reproduce the stripped-then-full fallback.
+fn parse_keys_box(payload: &[u8]) -> std::vec::Vec<KeyName> {
+  let mut keys = std::vec::Vec::new();
+  // QuickTime.pm:9790 `$pos = 8` — skip the 4-byte version/flags AND the
+  // 4-byte entry-count (the loop is bounded by `$dirLen`, not the count).
+  let mut pos = 8usize;
+  while let Some(len) = be_u32(payload, pos).map(|v| v as usize) {
+    // QuickTime.pm:9797 `last if $len < 8 or $pos + $len > $dirLen`.
+    if len < 8 || pos.checked_add(len).is_none_or(|e| e > payload.len()) {
+      break;
+    }
+    let ns = payload.get(pos + 4..pos + 8).unwrap_or_default();
+    let raw = payload.get(pos + 8..pos + len).unwrap_or_default();
+    // QuickTime.pm:9801 `$tag =~ s/\0.*//s` — truncate at the first NUL.
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let truncated = raw.get(..end).unwrap_or_default();
+    let full = String::from_utf8_lossy(truncated).into_owned();
+    // QuickTime.pm:9803 — strip the apple quicktime domain for mdta keys.
+    let stripped = if ns == b"mdta" {
+      strip_apple_quicktime_prefix(&full)
+    } else {
+      full.clone()
+    };
+    keys.push(KeyName { stripped, full });
+    pos += len;
+  }
+  keys
+}
+
+/// QuickTime.pm:9803 `$tag =~ s/^com\.(apple\.quicktime\.)?//` — strip a
+/// leading `com.apple.quicktime.` (or bare `com.`) domain prefix.
+fn strip_apple_quicktime_prefix(tag: &str) -> String {
+  if let Some(rest) = tag.strip_prefix("com.apple.quicktime.") {
+    rest.to_string()
+  } else if let Some(rest) = tag.strip_prefix("com.") {
+    rest.to_string()
+  } else {
+    tag.to_string()
+  }
+}
+
+/// Walk one `moov/meta` atom payload in a **single, file-order pass**, decoding
+/// the `hdlr` HandlerType / HandlerClass, the `keys` box(es) and the `ilst`
+/// camera-metadata into `qt` (QuickTime.pm:2809-2900 `%Meta` table).
+///
+/// **Single-pass faithfulness (file order).** ExifTool's `ProcessMOV` walks the
+/// `meta` children in order with NO look-ahead: `ProcessKeys` registers the
+/// ItemList key tags as ids `"$KeysCount.$index"` ONLY when a `keys` atom is
+/// reached (QuickTime.pm:9857 `AddTagToTable($itemList, "$KeysCount.$index")`),
+/// and an `ilst` item resolves its id `"$KeysCount.unpack('N')"` against the
+/// table built SO FAR (QuickTime.pm:10132). Consequences this loop reproduces:
+///   - an `ilst` appearing BEFORE any `keys` finds no registered id ⇒ it is
+///     dropped (the prior two-pass design wrongly resolved it against a future
+///     `keys` table);
+///   - `$$et{KeysCount}` is bumped per `keys` directory and an `ilst` item id is
+///     always `currentKeysCount.N`, so with multiple `keys` boxes each `ilst`
+///     resolves only against the MOST-RECENT `keys` box (a later box's count
+///     shadows the earlier one's ids) — hence `key_names` is REPLACED, not
+///     appended, when a new `keys` box is seen.
+///
+/// The `keys` box supplies the ordered key names; each `ilst` item is an atom
+/// whose 4-byte type is the 1-based index into that list. A contained malformed
+/// atom surfaces a warning through `w`.
+fn walk_meta(depth: u32, payload: &[u8], w: &mut Option<String>, qt: &mut QuickTimeMeta) {
+  // The key list of the most-recent `keys` box seen so far (file order). An
+  // `ilst` reached before any `keys` box resolves against an empty list ⇒ drops
+  // every item, matching ExifTool's single-pass `KeysCount.index` lookup.
+  let mut key_names: std::vec::Vec<KeyName> = std::vec::Vec::new();
+  walk_atoms(depth, payload, 0, payload.len(), w, |atom, body, w| {
+    match &atom.atom_type {
+      // The `moov/meta` Metadata-handler `hdlr`: the SAME `%QuickTime::Handler`
+      // table as the trak hdlr (QuickTime.pm:2824 / 8391-8444). HandlerClass =
+      // body offset-4 ComponentType (all-zero ⇒ None via the RawConv); the
+      // HandlerType = subtype at body offset 8.
+      b"hdlr" => {
+        qt.set_meta_handler_class(decode_hdlr_class(body));
+        if let Some(code) = decode_hdlr(body) {
+          qt.set_meta_handler_type(Some(code));
+        }
+      }
+      // A `keys` box REPLACES the active key list (see the multi-box note above).
+      b"keys" => key_names = parse_keys_box(body),
+      // An `ilst` resolves each item against the keys seen SO FAR.
+      b"ilst" => {
+        walk_atoms(depth + 1, body, 0, body.len(), w, |item, item_body, iw| {
+          // The item atom's 4-byte type is a big-endian 1-based key index.
+          let index = u32::from_be_bytes(item.atom_type) as usize;
+          let Some(key) = index.checked_sub(1).and_then(|i| key_names.get(i)) else {
+            return;
+          };
+          let Some(data) = decode_ilst_data(depth + 2, item_body, iw) else {
+            return;
+          };
+          apply_key(key, &data, qt.keys_mut());
+        });
+      }
+      _ => {}
+    }
+  });
+}
+
+/// Project one resolved `keys` entry onto [`crate::metadata::QuickTimeKeys`],
+/// faithful to the `%QuickTime::Keys` table (QuickTime.pm:6651-6770). Only the
+/// camera/GPS/capture-identity keys are decoded.
+///
+/// **Stripped-then-full key fallback (QuickTime.pm:9807-9824).** ExifTool tries
+/// the `mdta`-stripped key first, then the FULL (un-stripped) key. So the
+/// `com.apple.quicktime.*` keys match their stripped names (`make`, `model`,
+/// …), while the keys that are NOT in the `com.apple.quicktime` namespace
+/// (`com.android.version` / `com.android.manufacturer` / `com.android.model`,
+/// whose table ids keep the `com.` prefix) match only the FULL key — the bare
+/// `com.` strip yields `android.*`, which is not a table id.
+fn apply_key(key: &KeyName, data: &IlstData, keys_out: &mut crate::metadata::QuickTimeKeys) {
+  if apply_key_name(&key.stripped, data, keys_out) {
+    return;
+  }
+  // Stripped key did not match a modeled tag — fall back to the FULL key
+  // (skip the redundant retry when stripping was a no-op).
+  if key.full != key.stripped {
+    apply_key_name(&key.full, data, keys_out);
+  }
+}
+
+/// Resolve a single key NAME against the modeled `%QuickTime::Keys` identity
+/// set. Returns `true` when the name matched a modeled tag (so the caller does
+/// not retry the alternate form).
+fn apply_key_name(
+  name: &str,
+  data: &IlstData,
+  keys_out: &mut crate::metadata::QuickTimeKeys,
+) -> bool {
+  match name {
+    "make" => {
+      keys_out.set_make(Some(ilst_data_string(data)));
+    }
+    "model" => {
+      keys_out.set_model(Some(ilst_data_string(data)));
+    }
+    "software" => {
+      keys_out.set_software(Some(ilst_data_string(data)));
+    }
+    "creationdate" => {
+      keys_out.set_creation_date(Some(convert_iso8601_date(&ilst_data_string(data))));
+    }
+    "location.ISO6709" => {
+      // Key PRESENT ⇒ GPS tag always emitted (raw string when undecodable).
+      keys_out.set_gps(Some(parse_iso6709(&ilst_data_string(data))));
+    }
+    // Keys NOT in the com.apple.quicktime namespace (full-key fallback).
+    "com.android.manufacturer" => {
+      keys_out.set_android_make(Some(ilst_data_string(data)));
+    }
+    "com.android.model" => {
+      keys_out.set_android_model(Some(ilst_data_string(data)));
+    }
+    "com.android.version" => {
+      keys_out.set_android_version(Some(ilst_data_string(data)));
+    }
+    _ => return false,
+  }
+  true
+}
+
+// ── SP2 text decode (international text + UTF-16BE) ───────────────────────
+
+/// Decode the FIRST international-text entry of a `©`-prefixed `udta` atom
+/// payload, faithful to the `$tag =~ /^\xa9/` loop of `ProcessMOV`
+/// (QuickTime.pm:10454-10516). Each entry is `int16u len`, `int16u lang`, then
+/// `len` bytes of text. ExifTool tolerates a `len` that does or does not
+/// include the 4-byte header (QuickTime.pm:10470-10478); SP2 decodes the first
+/// entry, which is what the camera-metadata atoms carry. Returns the decoded,
+/// NUL-trimmed text.
+fn decode_itext_first(payload: &[u8]) -> Option<String> {
+  // QuickTime.pm:10468 `($len,$lang) = unpack("x${pos}nn",$val)`.
+  let len = be_u16(payload, 0)? as usize;
+  let lang = be_u16(payload, 2)?;
+  let body_start = 4usize;
+  // QuickTime.pm:10474-10477: if `pos+len` overruns, retry with `len-4`.
+  let text_slice = if let Some(end) = body_start.checked_add(len).filter(|&e| e <= payload.len()) {
+    payload.get(body_start..end)?
+  } else if len >= 4
+    && let Some(end) = body_start
+      .checked_add(len - 4)
+      .filter(|&e| e <= payload.len())
+  {
+    payload.get(body_start..end)?
+  } else {
+    return None;
+  };
+  Some(decode_qt_text(text_slice, lang))
+}
+
+/// Decode a `udta` international-text byte slice, faithful to the
+/// language/charset branch of `ProcessMOV` (QuickTime.pm:10485-10516).
+///
+/// The branch hinges on the language code (`$lang < 0x400 or $lang == 0x7fff`,
+/// and no leading UTF-16BE BOM ⇒ "Macintosh language code"):
+///   - **Mac language (non-zero `lang < 0x400`, or `0x7fff`):** the bytes are
+///     the QuickTime charset, which defaults to MacRoman
+///     (`CharsetQuickTime => 'MacRoman'`, ExifTool.pm:1122). QuickTime.pm:10506
+///     `$enc = $charsetQuickTime unless $enc`.
+///   - **Default language `0x0000`:** QuickTime.pm:10499-10502 — "use UTF-8
+///     instead of the CharsetQuickTime setting if obviously UTF8", i.e.
+///     `$enc = 'UTF8' if IsUTF8(\$str) > 0`, ELSE fall through to MacRoman.
+///     `IsUTF8 > 0` means the bytes contain at least one high byte AND form
+///     valid UTF-8 (ExifTool.pm:4673); equivalently `str::from_utf8` succeeds
+///     with a non-ASCII byte. A pure-ASCII string is `IsUTF8 == 0` ⇒ MacRoman,
+///     but MacRoman is byte-identical to ASCII for `< 0x80`, so the result
+///     matches UTF-8 either way (keeping ASCII `udta` text unchanged). This
+///     fixes the prior bug where `lang 0` was unconditionally UTF-8, corrupting
+///     genuine MacRoman bytes (e.g. `Caf\x8e Clip` ⇒ `Café Clip`, not U+FFFD).
+///   - **Otherwise (a non-Mac language code, or a UTF-16BE BOM is present):**
+///     QuickTime.pm:10508-10511 — a leading `\xfe\xff` BOM selects UTF-16BE,
+///     else UTF-8.
+///
+/// Trailing NULs are stripped (QuickTime.pm:10515 `$str =~ s/\0+$//`).
+fn decode_qt_text(bytes: &[u8], lang: u16) -> String {
+  let has_bom = bytes.starts_with(&[0xFE, 0xFF]);
+  let mut s = if (lang < 0x400 || lang == 0x7fff) && !has_bom {
+    // Macintosh language code (QuickTime.pm:10485). For the default language 0,
+    // prefer UTF-8 only when the bytes are "obviously UTF8" (IsUTF8 > 0); every
+    // other Mac-language case — and the non-UTF8 default case — is MacRoman
+    // (CharsetQuickTime). `from_utf8` succeeding is the IsUTF8>0 test (a
+    // pure-ASCII string decodes identically under MacRoman, so routing it
+    // through MacRoman here is byte-identical).
+    if lang == 0
+      && let Ok(utf8) = std::str::from_utf8(bytes)
+    {
+      utf8.to_owned()
+    } else {
+      crate::charset::decode_macroman(bytes)
+    }
+  } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+    // QuickTime.pm:10510 — a UTF-16BE BOM.
+    decode_utf16be(rest)
+  } else {
+    // A non-Mac language code with no BOM ⇒ UTF-8 (QuickTime.pm:10511).
+    String::from_utf8_lossy(bytes).into_owned()
+  };
+  // QuickTime.pm:10515 `$str =~ s/\0+$//` — strip trailing NULs.
+  while s.ends_with('\0') {
+    s.pop();
+  }
+  s
+}
+
+/// Decode a UTF-16BE byte slice (lossy — an odd trailing byte / unpaired
+/// surrogate is replaced, matching `Encode`'s tolerance).
+fn decode_utf16be(bytes: &[u8]) -> String {
+  // `chunks_exact(2)` yields exactly-2-byte slices, so `try_into` is infallible
+  // — but stay on the checked path (`#![deny(clippy::indexing_slicing)]`).
+  let units = bytes
+    .chunks_exact(2)
+    .map(|c| u16::from_be_bytes(c.try_into().unwrap_or([0, 0])));
+  char::decode_utf16(units)
+    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect()
+}
+
+// ── SP2 ISO-8601 date conversion (%iso8601Date, QuickTime.pm:289-311) ─────
+
+/// Normalize an ISO 8601 date string to the ExifTool EXIF date form — a
+/// faithful port of `XMP::ConvertXMPDate` followed by the `%iso8601Date`
+/// ValueConv's timezone-colon insertion (QuickTime.pm:289-311).
+/// `"2024-01-02T03:04:05+0000"` ⇒ `"2024:01:02 03:04:05+00:00"`.
+fn convert_iso8601_date(val: &str) -> String {
+  // ConvertXMPDate: `^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}:\d{2})(:\d{2})?\s*(\S*)$`.
+  if let Some(converted) = xmp_date_full(val) {
+    // %iso8601Date ValueConv: `s/([-+]\d{2})(\d{2})$/$1:$2/` — colon the TZ.
+    return insert_tz_colon(&converted);
+  }
+  // ConvertXMPDate fallback: a bare `^(\d{4})(-\d{2}){0,2}` ⇒ `tr/-/:/`.
+  if all_ascii_digits(val.as_bytes().get(0..4)) {
+    return val.replace('-', ":");
+  }
+  val.to_string()
+}
+
+/// `ConvertXMPDate`'s full-form branch: `YYYY-MM-DD[T ]HH:MM[:SS] [TZ]` ⇒
+/// `YYYY:MM:DD HH:MM[:SS][TZ]`. Returns `None` if the string does not match.
+fn xmp_date_full(val: &str) -> Option<String> {
+  let b = val.as_bytes();
+  // `\d{4}-\d{2}-\d{2}` then `[T ]` then `\d{2}:\d{2}`.
+  if !(all_ascii_digits(b.get(0..4))
+    && b.get(4) == Some(&b'-')
+    && all_ascii_digits(b.get(5..7))
+    && b.get(7) == Some(&b'-')
+    && all_ascii_digits(b.get(8..10))
+    && matches!(b.get(10), Some(&b'T') | Some(&b' '))
+    && all_ascii_digits(b.get(11..13))
+    && b.get(13) == Some(&b':')
+    && all_ascii_digits(b.get(14..16)))
+  {
+    return None;
+  }
+  // Slices are bounds-checked above (each `all_ascii_digits`/byte-eq guards
+  // the same range), so these `.get(..).?` are `Some`.
+  let mut date = String::with_capacity(val.len() + 1);
+  date.push_str(val.get(0..4)?);
+  date.push(':');
+  date.push_str(val.get(5..7)?);
+  date.push(':');
+  date.push_str(val.get(8..10)?);
+  date.push(' ');
+  date.push_str(val.get(11..13)?);
+  date.push(':');
+  date.push_str(val.get(14..16)?);
+  let mut rest = val.get(16..)?;
+  // optional `(:\d{2})` seconds.
+  if rest.as_bytes().first() == Some(&b':') && all_ascii_digits(rest.as_bytes().get(1..3)) {
+    date.push_str(rest.get(0..3)?);
+    rest = rest.get(3..)?;
+  }
+  // `\s*(\S*)$` — trailing whitespace then a no-space tail (the timezone).
+  let tz = rest.trim_start();
+  if tz.contains(char::is_whitespace) {
+    return None; // `\S*$` would not match an interior space.
+  }
+  date.push_str(tz);
+  Some(date)
+}
+
+/// `%iso8601Date` ValueConv's `s/([-+]\d{2})(\d{2})$/$1:$2/` — insert a colon
+/// into a trailing `±HHMM` timezone offset.
+fn insert_tz_colon(val: &str) -> String {
+  let b = val.as_bytes();
+  let n = b.len();
+  if let Some(tail) = b.get(n.wrapping_sub(5)..n).filter(|_| n >= 5)
+    && matches!(tail.first(), Some(&b'+') | Some(&b'-'))
+    && tail
+      .get(1..)
+      .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
+  {
+    // `val[..n-2] : val[n-2..]` — both bounds are ASCII byte offsets.
+    if let (Some(head), Some(off)) = (val.get(..n - 2), val.get(n - 2..)) {
+      return std::format!("{head}:{off}");
+    }
+  }
+  val.to_string()
+}
+
+/// `true` when `s` is `Some` non-empty slice of all ASCII digits.
+fn all_ascii_digits(s: Option<&[u8]>) -> bool {
+  s.is_some_and(|b| !b.is_empty() && b.iter().all(u8::is_ascii_digit))
+}
+
+// ── SP2 ISO 6709 GPS coordinate conversion (QuickTime.pm:8884-8909) ───────
+
+/// Decode an ISO 6709 string into a [`QuickTimeGps`]. ExifTool's
+/// `ConvertISO6709` (QuickTime.pm:8884-8909) has NO `else` branch — on a string
+/// matching none of the three forms it `return $val` UNCHANGED, so the tag is
+/// STILL emitted (the raw string under `-n`; `PrintGPSCoordinates`-of-it under
+/// `-j`). So a successful decode returns a coordinate-bearing GPS (its
+/// `value_conv` = the ValueConv string + numeric lat/lon/alt), while an
+/// undecodable-but-PRESENT value returns a [`QuickTimeGps::raw`] carrying the
+/// verbatim input and NO numeric coords (faithful: emit the tag, project no
+/// `GpsLocation`). Returns `Some` for any present value; an absent atom/key
+/// passes its own `None` through (no tag).
+fn parse_iso6709(val: &str) -> QuickTimeGps {
+  match convert_iso6709(val) {
+    Some((lat, lon, alt, value_conv)) => QuickTimeGps::new(value_conv, lat, lon, alt),
+    // No form matched: `ConvertISO6709` returns the raw string unchanged.
+    None => QuickTimeGps::raw(val.to_string()),
+  }
+}
+
+/// `ConvertISO6709` (QuickTime.pm:8884-8909) — decode an ISO 6709 coordinate
+/// string into `(latitude, longitude, altitude, value_conv_string)`. The three
+/// forms are tried in source order. Returns `None` when no form matches.
+#[allow(clippy::type_complexity)]
+fn convert_iso6709(val: &str) -> Option<(f64, f64, Option<f64>, String)> {
+  iso6709_decimal(val)
+    .or_else(|| iso6709_dm(val))
+    .or_else(|| iso6709_dms(val))
+}
+
+/// `+DD.DDD+DDD.DDD+AA.AAA` decimal-degree form (QuickTime.pm:8887). The
+/// ValueConv string is `($1+0) . ' ' . ($2+0) [. ' ' . ($3+0)]` — Perl
+/// NUMIFIES each matched substring to a double then stringifies it (default
+/// ~15 significant digits, `Inf`/`NaN` for non-finite). It is NOT a verbatim
+/// string normalization: a token carrying more than ~15 significant fractional
+/// digits (e.g. `+12.123456789012345678901`) is f64-rounded by Perl
+/// (`12.1234567890123`), so build the ValueConv from the PARSED f64 via
+/// [`perl_num`] (consistent with the computed DM/DMS branches) rather than a
+/// digit-preserving string transform. For normal coordinates this is identical
+/// to Perl (`(+37.3318+0)` = `37.3318` = `perl_num(37.3318)`).
+#[allow(clippy::type_complexity)]
+fn iso6709_decimal(val: &str) -> Option<(f64, f64, Option<f64>, String)> {
+  let (lat_s, rest) = take_signed_decimal(val, 2)?;
+  let (lon_s, rest) = take_signed_decimal(rest, 3)?;
+  let alt_s = take_signed_decimal(rest, usize::MAX).map(|(a, _)| a);
+  let lat = lat_s.parse::<f64>().ok()?;
+  let lon = lon_s.parse::<f64>().ok()?;
+  let alt = match alt_s.as_deref() {
+    Some(a) => Some(a.parse::<f64>().ok()?),
+    None => None,
+  };
+  // ValueConv: `($1+0) . ' ' . ($2+0) [. ' ' . ($3+0)]` — numify-then-stringify.
+  let mut vc = std::format!("{} {}", perl_num(lat), perl_num(lon));
+  if let Some(a) = alt {
+    vc.push(' ');
+    vc.push_str(&perl_num(a));
+  }
+  Some((lat, lon, alt, vc))
+}
+
+/// `+DDMM.MMM+DDDMM.MMM+AA.AAA` degree-minute form (QuickTime.pm:8892). The
+/// lat/lon are COMPUTED (`$d + $m/60`), so the ValueConv string stringifies the
+/// computed float (`"$lat $lon"`) — Perl default-precision numification.
+#[allow(clippy::type_complexity)]
+fn iso6709_dm(val: &str) -> Option<(f64, f64, Option<f64>, String)> {
+  let b = val.as_bytes();
+  let (lat_neg, p) = take_sign(b, 0)?;
+  let lat_deg = take_fixed_digits(b, p, 2)?;
+  let (lat_min, p) = take_minutes(b, p + 2)?;
+  let mut lat = lat_deg as f64 + lat_min / 60.0;
+  if lat_neg {
+    lat = -lat;
+  }
+  let (lon_neg, p) = take_sign(b, p)?;
+  let lon_deg = take_fixed_digits(b, p, 3)?;
+  let (lon_min, p) = take_minutes(b, p + 3)?;
+  let mut lon = lon_deg as f64 + lon_min / 60.0;
+  if lon_neg {
+    lon = -lon;
+  }
+  let alt_s = val
+    .get(p..)
+    .and_then(|t| take_signed_decimal(t, usize::MAX).map(|(a, _)| a));
+  let alt = match alt_s.as_deref() {
+    Some(a) => Some(a.parse::<f64>().ok()?),
+    None => None,
+  };
+  let mut vc = std::format!("{} {}", perl_num(lat), perl_num(lon));
+  if let Some(a) = alt {
+    // `($7+0)` — numify-then-stringify (same f64-rounding as the lat/lon).
+    vc.push(' ');
+    vc.push_str(&perl_num(a));
+  }
+  Some((lat, lon, alt, vc))
+}
+
+/// `+DDMMSS.SSS+DDDMMSS.SSS+AA.AAA` DMS form (QuickTime.pm:8900).
+#[allow(clippy::type_complexity)]
+fn iso6709_dms(val: &str) -> Option<(f64, f64, Option<f64>, String)> {
+  let b = val.as_bytes();
+  let (lat_neg, p) = take_sign(b, 0)?;
+  let lat_deg = take_fixed_digits(b, p, 2)?;
+  let lat_min = take_fixed_digits(b, p + 2, 2)?;
+  let (lat_sec, p) = take_minutes(b, p + 4)?;
+  let mut lat = lat_deg as f64 + lat_min as f64 / 60.0 + lat_sec / 3600.0;
+  if lat_neg {
+    lat = -lat;
+  }
+  let (lon_neg, p) = take_sign(b, p)?;
+  let lon_deg = take_fixed_digits(b, p, 3)?;
+  let lon_min = take_fixed_digits(b, p + 3, 2)?;
+  let (lon_sec, p) = take_minutes(b, p + 5)?;
+  let mut lon = lon_deg as f64 + lon_min as f64 / 60.0 + lon_sec / 3600.0;
+  if lon_neg {
+    lon = -lon;
+  }
+  let alt_s = val
+    .get(p..)
+    .and_then(|t| take_signed_decimal(t, usize::MAX).map(|(a, _)| a));
+  let alt = match alt_s.as_deref() {
+    Some(a) => Some(a.parse::<f64>().ok()?),
+    None => None,
+  };
+  let mut vc = std::format!("{} {}", perl_num(lat), perl_num(lon));
+  if let Some(a) = alt {
+    // `($9+0)` — numify-then-stringify (same f64-rounding as the lat/lon).
+    vc.push(' ');
+    vc.push_str(&perl_num(a));
+  }
+  Some((lat, lon, alt, vc))
+}
+
+/// Parse a leading `[-+]` sign at `b[off]`; returns `(is_negative, off+1)`.
+fn take_sign(b: &[u8], off: usize) -> Option<(bool, usize)> {
+  match b.get(off)? {
+    b'+' => Some((false, off + 1)),
+    b'-' => Some((true, off + 1)),
+    _ => None,
+  }
+}
+
+/// Parse exactly `n` ASCII digits at `b[off..off+n]` as a `u32`.
+fn take_fixed_digits(b: &[u8], off: usize, n: usize) -> Option<u32> {
+  let slice = b.get(off..off.checked_add(n)?)?;
+  if slice.is_empty() || !slice.iter().all(u8::is_ascii_digit) {
+    return None;
+  }
+  let mut v = 0u32;
+  for &d in slice {
+    v = v.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+  }
+  Some(v)
+}
+
+/// Parse a `DD(.DDD)?` minutes/seconds component at `b[off..]` — exactly two
+/// integer digits then an optional fractional part. Returns the value and the
+/// offset just past it.
+fn take_minutes(b: &[u8], off: usize) -> Option<(f64, usize)> {
+  let int = take_fixed_digits(b, off, 2)?;
+  let mut value = int as f64;
+  let mut pos = off + 2;
+  if b.get(pos) == Some(&b'.') {
+    let mut frac = 0.0f64;
+    let mut scale = 0.1f64;
+    let mut any = false;
+    pos += 1;
+    while let Some(&d) = b.get(pos) {
+      if !d.is_ascii_digit() {
+        break;
+      }
+      frac += f64::from(d - b'0') * scale;
+      scale /= 10.0;
+      pos += 1;
+      any = true;
+    }
+    if !any {
+      return None; // a trailing '.' with no digits is not the minutes form.
+    }
+    value += frac;
+  }
+  Some((value, pos))
+}
+
+/// Parse a leading `[-+]\d{1,max}(\.\d*)?` signed decimal at the start of `s`,
+/// returning the matched substring (verbatim, including sign) and the unparsed
+/// tail. `max` caps the integer-digit count (Perl `\d{1,2}`/`\d{1,3}`;
+/// `usize::MAX` for the altitude's `\d+`).
+fn take_signed_decimal(s: &str, max: usize) -> Option<(String, &str)> {
+  let b = s.as_bytes();
+  let (_, mut pos) = take_sign(b, 0)?;
+  let int_start = pos;
+  while pos < b.len() && b.get(pos).is_some_and(u8::is_ascii_digit) && pos - int_start < max {
+    pos += 1;
+  }
+  if pos == int_start {
+    return None; // need at least one integer digit.
+  }
+  // optional `\.\d*`
+  if b.get(pos) == Some(&b'.') {
+    pos += 1;
+    while pos < b.len() && b.get(pos).is_some_and(u8::is_ascii_digit) {
+      pos += 1;
+    }
+  }
+  let matched = s.get(..pos)?.to_string();
+  Some((matched, s.get(pos..)?))
+}
+
+/// Perl default float→string for a COMPUTED coordinate — the `ConvertISO6709`
+/// `"$lat $lon"` (DM/DMS branches) and the now-numified decimal branch
+/// (`($1+0)` per [`iso6709_decimal`]), plus `PrintGPSCoordinates`'s Below-Sea-
+/// Level `-$v[2]`. Perl stringifies a double with up to 15 significant digits
+/// then trims — `%.15g` with trailing-zero stripping ([`format_g`]) — but Perl's
+/// DEFAULT NV→string differs from C `sprintf("%g")` (which `format_g` models) in
+/// two cases that ARE reachable here:
+///
+/// * **Non-finite** (`±Inf`/`NaN`): Perl prints `Inf` / `-Inf` / `NaN`
+///   (titlecase), whereas `format_g` falls through to Rust's lowercase
+///   `inf`/`-inf`. Reached on the raw-passthrough path when a malformed `©xyz`
+///   carries `inf`/`-inf`/`nan` tokens (`ToDMS(Inf,"N")` → `Inf deg NaN' NaN"`;
+///   the `-inf` altitude → `-(-Inf)` = `Inf` in the Below branch).
+/// * **Negative zero**: Perl's default stringify normalizes `-0.0` to `0`
+///   (e.g. `-($lat=0.0)` prints `0`, and `("-00"+0)` is `0`), whereas
+///   `sprintf("%g",-0.0)` (and thus `format_g`) preserves the sign as `-0`.
+///   Reached for an all-zero negative coordinate like `-00-000/` (decimal) or
+///   `-0000.0-00000.0/` (DM), which Perl renders `0 0`, never `-0 0`.
+fn perl_num(val: f64) -> String {
+  if let Some(s) = crate::value::perl_nonfinite_str(val) {
+    return s.to_string();
+  }
+  let out = format_g(val, 15);
+  // Perl default NV→string has no negative zero (`-0.0` ⇒ `0`); `format_g`
+  // models C `%g`, which keeps `-0`. Collapse it to match Perl.
+  if out == "-0" {
+    return "0".to_string();
+  }
+  out
+}
+
+/// Build the `GPSCoordinates` tag value for a [`QuickTimeGps`]: `-n` (ValueConv)
+/// is the `ConvertISO6709` string verbatim; `-j` (PrintConv) is
+/// [`print_gps_coordinates`].
+fn gps_coordinates_value(gps: &QuickTimeGps, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    TagValue::Str(print_gps_coordinates(gps.value_conv()).into())
+  } else {
+    TagValue::Str(gps.value_conv().into())
+  }
+}
+
+/// `PrintGPSCoordinates` (QuickTime.pm:8957-8971) — the `GPSCoordinates`
+/// PrintConv. Input is the `ConvertISO6709` ValueConv string: usually the
+/// space-separated numeric `lat lon [alt]`, but ALSO (faithfully) a RAW
+/// undecodable string passed through by `ConvertISO6709`. ExifTool does
+/// `@v = split ' ', $val` then `ToDMS($v[0],"N") . ', ' . ToDMS($v[1],"E")`
+/// [`. ', ' . ($v[2]…) . ' Sea Level'` when `defined $v[2]`]. `split ' '`
+/// collapses runs of whitespace and drops the leading/trailing empties
+/// ([`str::split_whitespace`]); a MISSING field is `undef` and a non-numeric
+/// field NUMIFIES to `0` inside `ToDMS` — so e.g. `"hello"` →
+/// `"0 deg 0' 0.00\" N, "` (a defined-but-non-numeric latitude, an `undef`
+/// longitude rendering as the empty string). Output is `"<lat-DMS> N/S,
+/// <lon-DMS> E/W[, <alt> m Above/Below Sea Level]"` via `GPS::ToDMS`
+/// ([`crate::exif::gps::to_dms`]).
+fn print_gps_coordinates(value_conv: &str) -> String {
+  let mut parts = value_conv.split_whitespace();
+  let lat = parts.next();
+  let lon = parts.next();
+  // `$v[2]` — the ValueConv altitude token (already Perl-numified on the decoded
+  // path; a raw token on the pass-through path).
+  let alt = parts.next();
+  // `ToDMS($et, $v[0], 1, "N") . ', ' . ToDMS($et, $v[1], 1, "E")`.
+  let mut out = std::format!(
+    "{}, {}",
+    to_dms_with_ref(lat, 'N', 'S'),
+    to_dms_with_ref(lon, 'E', 'W'),
+  );
+  if let Some(alt_s) = alt {
+    // `$prt .= ', ' . ($v[2] < 0 ? -$v[2]." m Below" : $v[2]." m Above") . ' Sea
+    // Level'` — emitted whenever `defined $v[2]`. The Above case prints `$v[2]`
+    // VERBATIM (its raw/already-numified string); the Below case prints
+    // `-$v[2]` — Perl unary negation, which NUMIFIES the token THEN negates
+    // THEN stringifies (NOT a string-strip of the leading `-`). For a decimal
+    // token this equals sign-stripping, but a non-decimal/exponent token (only
+    // reachable on the raw-passthrough path, e.g. `-1e3`) must yield `1000`,
+    // not `1e3`. Mirror it via the numeric negate + Perl stringification.
+    let alt_n = crate::convert::perl_str_to_f64(alt_s);
+    if alt_n < 0.0 {
+      out.push_str(&std::format!(", {} m Below Sea Level", perl_num(-alt_n)));
+    } else {
+      out.push_str(&std::format!(", {alt_s} m Above Sea Level"));
+    }
+  }
+  out
+}
+
+/// `GPS::ToDMS($et, $val, 1, $ref)` for the `PrintGPSCoordinates` lat/lon
+/// (QuickTime.pm:8961-8962). A MISSING field (`undef` — Perl's `split ' '` left
+/// no token) renders as the EMPTY string (`ToDMS` returns `$val` for a zero-
+/// length value under `$doPrintConv eq '1'`, GPS.pm:500-503). Otherwise the
+/// token is Perl-numified (a non-numeric string → `0`; [`crate::convert::perl_str_to_f64`]) and
+/// formatted `q{%d deg %d' %.2f"} . " <ref>"`, where `<ref>` is `ref_pos` for a
+/// non-negative value or `ref_neg` for a negative one (`{N=>'S', E=>'W'}`);
+/// [`crate::exif::gps::to_dms`] formats the magnitude.
+fn to_dms_with_ref(val: Option<&str>, ref_pos: char, ref_neg: char) -> String {
+  // `unless (length $val)` — a missing (`undef`) field yields the empty string.
+  let Some(s) = val else {
+    return String::new();
+  };
+  let n = crate::convert::perl_str_to_f64(s);
+  let r = if n < 0.0 { ref_neg } else { ref_pos };
+  std::format!("{} {}", crate::exif::gps::to_dms(n), r)
 }
 
 // ===========================================================================
@@ -1582,6 +2521,12 @@ impl Meta<'_> {
     // if a higher-priority source already populated the domain it would
     // write). GoPro on-device GNSS is the HIGHEST GPS tier.
     self.gopro.project_into(&mut md);
+    // **SP2** — the `udta` / Keys camera identity, capture date and GPS. Sits
+    // BELOW GoPro on-device telemetry but ABOVE the SP3 timed-metadata scan: it
+    // is explicit container camera metadata. Keys (the iOS `mdta` ItemList) is
+    // preferred over `udta` per ExifTool's ItemList-over-UserData rule
+    // (QuickTime.pm:1601).
+    self.project_sp2_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -1596,6 +2541,60 @@ impl Meta<'_> {
       md.set_gps(gps);
     }
     md
+  }
+
+  /// **SP2** projection — fold the `udta` / Keys camera identity, capture date
+  /// and GPS into `md`. Keys (the iOS `mdta` ItemList) is preferred over `udta`
+  /// (QuickTime.pm:1601). Set-once per domain (a higher-priority source already
+  /// in `md` is not overwritten); does nothing when neither block decoded.
+  fn project_sp2_into(&self, md: &mut crate::metadata::MediaMetadata) {
+    use crate::metadata::{CameraInfo, GpsLocation};
+    let ud = self.qt.user_data();
+    let keys = self.qt.keys();
+
+    // ── CameraInfo (make / model / software) — Keys over UserData ──────
+    if md.camera().is_none() {
+      let mut cam = CameraInfo::new();
+      cam
+        .update_make(keys.make().or_else(|| ud.make()).map(str::to_string))
+        .update_model(keys.model().or_else(|| ud.model()).map(str::to_string))
+        .update_serial(ud.serial_number().map(str::to_string))
+        .update_software(
+          keys
+            .software()
+            .or_else(|| ud.software())
+            .map(str::to_string),
+        );
+      if !cam.is_empty() {
+        md.set_camera(cam);
+      }
+    }
+
+    // ── Capture date (CreationDate / ContentCreateDate) ────────────────
+    // `MediaInfo::created` is set by `from_quicktime` from the `mvhd`
+    // CreateDate; the explicit camera capture date (the iOS `creationdate`,
+    // else `©day`) is a higher-quality signal, so override it here.
+    if let Some(date) = keys.creation_date().or_else(|| ud.content_create_date()) {
+      md.media_mut().update_created(Some(date.to_string()));
+    }
+
+    // ── GpsLocation — Keys `location.ISO6709` over `©xyz` ──────────────
+    // Only a DECODED coordinate (numeric lat/lon) projects a `GpsLocation`; a
+    // present-but-undecodable value still emits the `GPSCoordinates` tag (the
+    // raw string) but carries no usable lat/lon, so it is skipped here.
+    if md.gps().is_none()
+      && let Some((lat, lon, alt)) = keys
+        .gps()
+        .or_else(|| ud.gps())
+        .and_then(QuickTimeGps::coords)
+    {
+      let mut loc = GpsLocation::new();
+      loc
+        .update_latitude(Some(lat))
+        .update_longitude(Some(lon))
+        .update_altitude_m(alt);
+      md.set_gps(loc);
+    }
   }
 }
 
@@ -1773,7 +2772,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
         let body = data.get(header.payload_start..body_end).unwrap_or_default();
         match &header.atom_type {
           b"ftyp" => decode_ftyp(body, &mut qt),
-          b"moov" => decode_moov_mvhd(body, &mut qt, &mut warning),
+          b"moov" => {
+            decode_moov_mvhd(body, &mut qt, &mut warning);
+            // **SP2** — the `moov/udta` camera atoms + `moov/meta` Keys/ItemList
+            // metadata. Decoded in Pass 1 (alongside `mvhd`) so the typed
+            // UserData/Keys are populated before emission; the box walk runs at
+            // the moov child depth (1, one level below the top-level walk).
+            decode_moov_udta_meta(1, body, &mut qt, &mut warning);
+          }
           // The top-level `frea` atom (Kodak PixPro / Rexing — QuickTime.pm:610
           // `%QuickTime::Main` ⇒ `Image::ExifTool::Kodak::frea`). Decoded in
           // Pass 1 so `KodakVersion` is populated BEFORE the `mdat` freeGPS
@@ -2717,6 +3723,30 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      if let Some(class) = track.handler_class()
+        && first_seen(grp, "HandlerClass")
+      {
+        // HandlerClass / ComponentType (QuickTime.pm:8395-8402); emitted only
+        // for a non-zero ComponentType (the RawConv undef branch is applied at
+        // decode). PrintConv `mhlr`→Media Handler / `dhlr`→Data Handler; a hash
+        // miss yields `Unknown ($val)`. `-n` emits the raw 4-char code.
+        let value = if print_conv {
+          let printed = handler_class_print(class);
+          if printed.is_empty() {
+            TagValue::Str(std::format!("Unknown ({class})").into())
+          } else {
+            TagValue::Str(printed.into())
+          }
+        } else {
+          TagValue::Str(class.into())
+        };
+        tags.push(EmittedTag::new(
+          track_group(),
+          "HandlerClass".into(),
+          value,
+          false,
+        ));
+      }
       if let Some(code) = track.handler_code()
         && first_seen(grp, "HandlerType")
       {
@@ -3146,6 +4176,134 @@ impl crate::emit::Taggable for Meta<'_> {
           gpg(),
           gt.name().into(),
           gopro_generic_value(gt, print_conv),
+          false,
+        ));
+      }
+    }
+
+    // ── SP2: moov/meta HandlerClass + HandlerType (QuickTime.pm:8391-8444) ─
+    // The `moov/meta` `hdlr` uses the SAME `%QuickTime::Handler` table as the
+    // trak hdlr, so it emits BOTH HandlerClass (offset-4 ComponentType, dropped
+    // when all-zero) and HandlerType (offset-8 subtype) — group `QuickTime`
+    // (family-0/1), NOT a `Track<N>` (the track hdlr above is per-`trak`). The
+    // ComponentType (`HandlerClass`) is emitted BEFORE the subtype
+    // (`HandlerType`), matching the `%Handler` binary-table field order (offset
+    // 4 before 8). `-j` applies the PrintConv; `-n` emits the raw 4-char code.
+    if let Some(class) = self.qt.meta_handler_class() {
+      // HandlerClass / ComponentType (QuickTime.pm:8395-8402): PrintConv
+      // `mhlr`→Media Handler / `dhlr`→Data Handler; a hash miss yields
+      // `Unknown ($val)`. The all-zero RawConv-undef branch is applied at decode
+      // (`decode_hdlr_class` returns `None`), so a present value is non-zero.
+      let value = if print_conv {
+        let printed = handler_class_print(class);
+        if printed.is_empty() {
+          TagValue::Str(std::format!("Unknown ({class})").into())
+        } else {
+          TagValue::Str(printed.into())
+        }
+      } else {
+        TagValue::Str(class.into())
+      };
+      tags.push(EmittedTag::new(main(), "HandlerClass".into(), value, false));
+    }
+    if let Some(code) = self.qt.meta_handler_type() {
+      let value = if print_conv {
+        let printed = handler_type_print(code);
+        if printed.is_empty() {
+          TagValue::Str(std::format!("Unknown ({code})").into())
+        } else {
+          TagValue::Str(printed.into())
+        }
+      } else {
+        TagValue::Str(code.into())
+      };
+      tags.push(EmittedTag::new(main(), "HandlerType".into(), value, false));
+    }
+
+    // ── SP2: udta camera atoms (QuickTime.pm:1585-1900) ────────────────
+    // Group `QuickTime:UserData` (family-0 `QuickTime`, family-1 `UserData` —
+    // the `%QuickTime::UserData` table `GROUPS => { 1 => 'UserData' }`, verified
+    // vs the `-G1` oracle). All are known table keys ⇒ `unknown: false`. The
+    // text fields are mode-invariant (no PrintConv/ValueConv beyond the charset
+    // decode); ContentCreateDate is a ValueConv-only date (same in both modes);
+    // GPSCoordinates carries the ValueConv string (`-n`) / DMS PrintConv (`-j`).
+    let ud = self.qt.user_data();
+    if !ud.is_empty() {
+      let user_data = || Group::new("QuickTime", "UserData");
+      for (val, name) in [
+        (ud.make(), "Make"),
+        (ud.model(), "Model"),
+        (ud.serial_number(), "SerialNumber"),
+        (ud.software(), "SoftwareVersion"),
+        (ud.firmware_version(), "FirmwareVersion"),
+        (ud.compressor_version(), "CompressorVersion"),
+        (ud.camera_id(), "CameraID"),
+        (ud.title(), "Title"),
+        (ud.copyright(), "Copyright"),
+        (ud.content_create_date(), "ContentCreateDate"),
+        (ud.date_time_original(), "DateTimeOriginal"),
+      ] {
+        if let Some(v) = val {
+          tags.push(EmittedTag::new(
+            user_data(),
+            name.into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+      }
+      if let Some(gps) = ud.gps() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
+      // `©cmt` Comment — emitted after GPSCoordinates to match the `©`-atom
+      // file order (cosmetic; the conformance gate is key-order-insensitive).
+      if let Some(v) = ud.comment() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "Comment".into(),
+          TagValue::Str(v.into()),
+          false,
+        ));
+      }
+    }
+
+    // ── SP2: moov/meta Keys/ItemList (QuickTime.pm:6651-6760) ──────────
+    // Group `QuickTime:Keys` (family-0 `QuickTime`, family-1 `Keys`). Software
+    // is emitted as the raw text value — a numeric-looking value (`"17.3"`)
+    // value-equals the bundled JSON number under the conformance gate. The date
+    // and GPSCoordinates follow the same conversions as UserData.
+    let keys = self.qt.keys();
+    if !keys.is_empty() {
+      let keys_group = || Group::new("QuickTime", "Keys");
+      for (val, name) in [
+        (keys.make(), "Make"),
+        (keys.model(), "Model"),
+        (keys.software(), "Software"),
+        (keys.creation_date(), "CreationDate"),
+        // Keys NOT in the com.apple.quicktime namespace (full-key fallback).
+        (keys.android_make(), "AndroidMake"),
+        (keys.android_model(), "AndroidModel"),
+        (keys.android_version(), "AndroidVersion"),
+      ] {
+        if let Some(v) = val {
+          tags.push(EmittedTag::new(
+            keys_group(),
+            name.into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+      }
+      if let Some(gps) = keys.gps() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "GPSCoordinates".into(),
+          gps_coordinates_value(gps, print_conv),
           false,
         ));
       }
@@ -3591,6 +4749,220 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(meta, mode, &mut w);
     w
+  }
+
+  /// `ConvertISO6709` has NO `else` branch: an undecodable string is returned
+  /// UNCHANGED, so the GPS tag is still emitted. `parse_iso6709` must surface
+  /// this as a raw [`QuickTimeGps`] (verbatim `value_conv`, no numeric coords),
+  /// and `print_gps_coordinates` must faithfully numify the tokens to `0` —
+  /// matching the bundled-13.59 oracle for `©xyz = "hello"`:
+  ///   `-n` GPSCoordinates = `hello`;
+  ///   `-j` GPSCoordinates = `0 deg 0' 0.00" N, `.
+  #[test]
+  fn parse_iso6709_passes_through_undecodable_string() {
+    // RAW pass-through: the tag is still produced, but with no numeric coords.
+    let gps = parse_iso6709("hello");
+    assert_eq!(gps.value_conv(), "hello");
+    assert_eq!(gps.coords(), None);
+    assert_eq!(gps.latitude(), None);
+    assert_eq!(gps.longitude(), None);
+    assert_eq!(gps.altitude_m(), None);
+
+    // `-n` (ValueConv) = the raw string verbatim.
+    assert_eq!(
+      gps_coordinates_value(&gps, false),
+      crate::value::TagValue::Str("hello".into())
+    );
+    // `-j` (PrintConv) = `PrintGPSCoordinates("hello")` = ToDMS-of-0 latitude
+    // (non-numeric token numifies to 0) + an EMPTY longitude (the missing
+    // `$v[1]` is `undef`, which `ToDMS` returns unchanged → empty string),
+    // joined by the literal `, ` — EXACT bundled-13.59 oracle output.
+    assert_eq!(print_gps_coordinates("hello"), "0 deg 0' 0.00\" N, ");
+    assert_eq!(
+      gps_coordinates_value(&gps, true),
+      crate::value::TagValue::Str("0 deg 0' 0.00\" N, ".into())
+    );
+
+    // The decoded happy path is unchanged: a real ISO 6709 string still yields
+    // numeric coords and the full DMS PrintConv (the existing fixture golden).
+    let ok = parse_iso6709("+37.3318-122.0312+010.500/");
+    assert_eq!(ok.value_conv(), "37.3318 -122.0312 10.5");
+    assert_eq!(ok.coords(), Some((37.3318, -122.0312, Some(10.5))));
+    assert_eq!(
+      print_gps_coordinates(ok.value_conv()),
+      "37 deg 19' 54.48\" N, 122 deg 1' 52.32\" W, 10.5 m Above Sea Level"
+    );
+  }
+
+  #[test]
+  fn print_gps_below_sea_altitude_uses_perl_numeric_negation() {
+    // R2 [medium]: Perl `-$v[2]` (the below-sea branch, QuickTime.pm:8957-8971)
+    // NUMIFIES the token then negates then stringifies — NOT a string-strip of
+    // the leading `-`. For a decimal token both agree, but a non-decimal /
+    // exponent-form token (reachable only on the raw-passthrough path) must
+    // yield the numified value: `-1e3` → `1000`, not `1e3`. The lat/lon tokens
+    // (`foo`/`bar`) numify to 0 (ToDMS-of-0, as the badgps fixture pins).
+    assert_eq!(
+      print_gps_coordinates("foo bar -1e3"),
+      "0 deg 0' 0.00\" N, 0 deg 0' 0.00\" E, 1000 m Below Sea Level"
+    );
+    assert!(!print_gps_coordinates("foo bar -1e3").contains("1e3"));
+    // Decimal below-sea is unchanged (numify+negate == sign-strip there).
+    assert!(print_gps_coordinates("12.5 13.5 -35.5").ends_with("35.5 m Below Sea Level"));
+  }
+
+  /// Codex [medium] #1: the `ConvertISO6709` DECIMAL form builds its ValueConv
+  /// from `($1+0)`/`($2+0)`/`($3+0)` — Perl NUMIFIES each matched token to an
+  /// f64 then stringifies (~15 significant digits), so a token carrying more
+  /// fractional digits than a double holds is ROUNDED, not preserved verbatim.
+  /// Oracle (bundled 13.59, `©xyz` = the long-fractional decimal, `-n`):
+  ///   `12.1234567890123 -34.9876543210988 10.1234567890123`.
+  /// Mirrors `QuickTime_sp2_iso6709long.mov`.
+  #[test]
+  fn iso6709_decimal_numifies_long_fraction_to_f64() {
+    let gps =
+      parse_iso6709("+12.123456789012345678901-034.9876543210987654321+010.123456789012345/");
+    // The ValueConv (`-n`) is the f64-rounded numification, NOT the 21-digit
+    // verbatim string the pre-fix string-normalizer would have kept.
+    assert_eq!(
+      gps.value_conv(),
+      "12.1234567890123 -34.9876543210988 10.1234567890123"
+    );
+    assert!(!gps.value_conv().contains("123456789012345678901"));
+    // Numeric coords still decode (full-precision f64 from the raw substrings).
+    let (lat, lon, alt) = gps.coords().expect("decimal form decodes");
+    assert!((lat - 12.123_456_789_012_345_678_901).abs() < 1e-9);
+    assert!((lon + 34.987_654_321_098_765_432_1).abs() < 1e-9);
+    assert!((alt.expect("alt") - 10.123_456_789_012_345).abs() < 1e-9);
+    // The `-j` PrintConv matches the bundled oracle exactly.
+    assert_eq!(
+      print_gps_coordinates(gps.value_conv()),
+      "12 deg 7' 24.44\" N, 34 deg 59' 15.56\" W, 10.1234567890123 m Above Sea Level"
+    );
+
+    // Negative-zero faithfulness: Perl `($1+0)` / `"$lat"` normalize `-0.0` to
+    // `0` (default NV stringify has no negative zero), e.g. `-00-000/` → `0 0`
+    // (bundled oracle), NOT `-0 0`. `perl_num` collapses the `format_g` `-0`.
+    assert_eq!(parse_iso6709("-00-000/").value_conv(), "0 0");
+    assert_eq!(parse_iso6709("-0.0-0.0/").value_conv(), "0 0");
+  }
+
+  /// Codex [medium] #2: a malformed `©xyz` whose tokens are non-finite
+  /// (`inf inf -inf`) reaches `ConvertISO6709`, which returns it UNCHANGED (no
+  /// form matches). Under `-n` the raw lowercase string passes through verbatim;
+  /// under `-j` `PrintGPSCoordinates`/`GPS::ToDMS` + Perl numeric stringify
+  /// produce Perl's TITLECASE `Inf`/`-Inf`/`NaN`. Oracle (bundled 13.59):
+  ///   `-n`: `inf inf -inf`;
+  ///   `-j`: `Inf deg NaN' NaN" N, Inf deg NaN' NaN" E, Inf m Below Sea Level`.
+  /// Mirrors `QuickTime_sp2_infgps.mov`.
+  #[test]
+  fn print_gps_non_finite_tokens_use_perl_inf_nan_casing() {
+    // Raw pass-through: no numeric coords, verbatim (lowercase) ValueConv.
+    let gps = parse_iso6709("inf inf -inf");
+    assert_eq!(gps.value_conv(), "inf inf -inf");
+    assert_eq!(gps.coords(), None);
+    assert_eq!(
+      gps_coordinates_value(&gps, false),
+      crate::value::TagValue::Str("inf inf -inf".into())
+    );
+    // PrintConv: titlecase Inf/NaN; the `-inf` altitude is `-(-Inf)` = `Inf` in
+    // the Below-Sea-Level branch.
+    assert_eq!(
+      print_gps_coordinates("inf inf -inf"),
+      "Inf deg NaN' NaN\" N, Inf deg NaN' NaN\" E, Inf m Below Sea Level"
+    );
+    assert_eq!(
+      gps_coordinates_value(&gps, true),
+      crate::value::TagValue::Str(
+        "Inf deg NaN' NaN\" N, Inf deg NaN' NaN\" E, Inf m Below Sea Level".into()
+      )
+    );
+    // `nan` latitude/longitude → `NaN deg NaN' NaN"`; a `nan` altitude is NOT
+    // numified in the Above branch (it prints `$v[2]` verbatim → lowercase
+    // `nan`), and `nan < 0` is false so it never enters the Below branch.
+    assert_eq!(
+      print_gps_coordinates("nan nan nan"),
+      "NaN deg NaN' NaN\" N, NaN deg NaN' NaN\" E, nan m Above Sea Level"
+    );
+    // A signed mix: `-inf` lat keeps magnitude `Inf` with the S ref; `-inf` lon
+    // → `Inf … W`.
+    assert_eq!(
+      print_gps_coordinates("-inf -inf nan"),
+      "Inf deg NaN' NaN\" S, Inf deg NaN' NaN\" W, nan m Above Sea Level"
+    );
+    // `perl_num` titlecases a bare non-finite (the Below-altitude `-$v[2]`
+    // path and the DM/DMS computed-coord path both route through it).
+    assert_eq!(perl_num(f64::INFINITY), "Inf");
+    assert_eq!(perl_num(f64::NEG_INFINITY), "-Inf");
+    assert_eq!(perl_num(f64::NAN), "NaN");
+  }
+
+  /// The `manu`/`modl` RawConv `s/^\0{4}..//s; s/\0.*//`: a value starting
+  /// with 4 NUL bytes drops those 4 plus the next 2 (the Canon 6-byte prefix),
+  /// then truncates at the first NUL. A value NOT starting with 4 NULs keeps its
+  /// leading bytes (Samsung `SAMSUNG\0` → `SAMSUNG`). An all-stripped value is
+  /// the empty string (still emitted by ExifTool). Verified vs bundled 13.59.
+  #[test]
+  fn decode_manu_modl_strips_canon_prefix_then_truncates() {
+    // Canon SX280: 6-byte prefix `00 00 00 00 15 c7` then the value + NUL.
+    assert_eq!(decode_manu_modl(b"\0\0\0\0\x15\xc7Canon\0"), "Canon");
+    assert_eq!(
+      decode_manu_modl(b"\0\0\0\0\x15\xc7Canon PowerShot SX280 HS\0junk"),
+      "Canon PowerShot SX280 HS"
+    );
+    // Samsung GT-S8530: no 4-NUL prefix, just the NUL-terminated value.
+    assert_eq!(decode_manu_modl(b"SAMSUNG\0"), "SAMSUNG");
+    // Exactly the 6-byte prefix, nothing after ⇒ empty string (still a value).
+    assert_eq!(decode_manu_modl(b"\0\0\0\0XY"), "");
+    // Fewer than 6 bytes with a leading-NUL run is NOT stripped (the `..` needs
+    // 2 more bytes); the `s/\0.*//` then truncates at the first NUL ⇒ empty.
+    assert_eq!(decode_manu_modl(b"\0\0\0\0"), "");
+  }
+
+  /// The plain (non-international-text) `udta` string atoms use the table
+  /// `FORMAT => 'string'` reading — NUL-terminated, truncating any trailing
+  /// data after the first NUL (verified vs bundled for `slno`/`CNCV`/etc.).
+  #[test]
+  fn decode_qt_string_truncates_at_first_nul() {
+    assert_eq!(decode_qt_string(b"SN123\0GARBAGE"), "SN123");
+    assert_eq!(decode_qt_string(b"CCV1\0\0\0"), "CCV1");
+    assert_eq!(decode_qt_string(b"NoNul"), "NoNul");
+  }
+
+  /// ExifTool's duplicate-tag priority rule for the multi-source `udta` identity
+  /// fields (verified vs bundled 13.59): a priority-1 (normal) source ALWAYS
+  /// overrides; a priority-0 (`Avoid`) source only fills an empty slot — so
+  /// among `Avoid` atoms the FIRST wins, among normal atoms the LAST wins, and a
+  /// normal atom beats an `Avoid` one regardless of file order.
+  #[test]
+  fn user_data_priority_resolution_matches_exiftool() {
+    use crate::metadata::QuickTimeUserData;
+
+    // Two Avoid Model atoms (cmnm then CNMN, both priority 0): FIRST wins.
+    let mut ud = QuickTimeUserData::new();
+    ud.set_model("cmnm_val".into(), 0);
+    ud.set_model("CNMN_val".into(), 0);
+    assert_eq!(ud.model(), Some("cmnm_val"));
+
+    // A later non-Avoid model (the copyright-symbol `mod`, priority 1) WINS over
+    // the earlier Avoid one.
+    ud.set_model("CR_mod".into(), 1);
+    assert_eq!(ud.model(), Some("CR_mod"));
+
+    // A non-Avoid source set FIRST is still kept when a later Avoid arrives.
+    let mut ud2 = QuickTimeUserData::new();
+    ud2.set_make("CR_mak".into(), 1); // copyright-symbol `mak`
+    ud2.set_make("manu_val".into(), 0); // Avoid `manu`
+    assert_eq!(ud2.make(), Some("CR_mak"));
+
+    // Two normal (priority-1) FirmwareVersion sources (CNFV then info): LAST.
+    let mut ud3 = QuickTimeUserData::new();
+    ud3.set_firmware_version("CNFV_val".into(), 1);
+    ud3.set_firmware_version("info_val".into(), 1);
+    assert_eq!(ud3.firmware_version(), Some("info_val"));
+    // A trailing Avoid FIRM does not displace the priority-1 winner.
+    ud3.set_firmware_version("FIRM_val".into(), 0);
+    assert_eq!(ud3.firmware_version(), Some("info_val"));
   }
 
   /// Build a 4-byte-size + type atom around `body`.

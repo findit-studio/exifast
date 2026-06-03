@@ -1696,3 +1696,60 @@ fn build_mov_with_buried_gp6_no_track() -> Vec<u8> {
   out.extend_from_slice(&mov_atom(b"mdat", &mdat_payload));
   out
 }
+
+/// **SP2** — the normalized [`exifast::metadata::MediaMetadata`] projection of
+/// the `udta` / Keys camera atoms. The synthetic `QuickTime_sp2.mov` carries a
+/// `moov/udta` (Make=`Apple`, Model=`iPhone 15 Pro`, SoftwareVersion=`17.2.1`,
+/// ContentCreateDate, `©xyz` GPS) AND a `moov/meta` Keys/ItemList (Make=`Apple
+/// Computer`, Model=`iPhone 15 Pro Max`, Software=`17.3`, CreationDate,
+/// `location.ISO6709`). The domain prefers Keys over UserData (ExifTool's
+/// ItemList-over-UserData rule), so `CameraInfo` reflects the Keys identity, the
+/// capture date is the Keys `creationdate`, and `GpsLocation` is the Keys
+/// `location.ISO6709` (Paris: 48.8584, 2.2945, 35 m).
+#[test]
+fn quicktime_sp2_projects_camera_capture_date_and_gps() {
+  let data = fixture("QuickTime_sp2.mov");
+  let meta = parse_quicktime(&data).expect("recognized");
+
+  // ── typed SP2 layer (both UserData and Keys decoded) ───────────────
+  let qt = meta.quicktime();
+  assert_eq!(qt.user_data().make(), Some("Apple"));
+  assert_eq!(qt.user_data().model(), Some("iPhone 15 Pro"));
+  assert_eq!(qt.user_data().software(), Some("17.2.1"));
+  assert_eq!(
+    qt.user_data().content_create_date(),
+    Some("2024:01:02 03:04:05+00:00")
+  );
+  assert_eq!(qt.keys().make(), Some("Apple Computer"));
+  assert_eq!(qt.keys().model(), Some("iPhone 15 Pro Max"));
+  assert_eq!(qt.keys().software(), Some("17.3"));
+  assert_eq!(qt.keys().creation_date(), Some("2024:06:07 08:09:10+00:00"));
+  // The `moov/meta` HandlerType (mdta).
+  assert_eq!(qt.meta_handler_type(), Some("mdta"));
+
+  // ── normalized domain projection (Keys preferred over UserData) ────
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("SP2 populates CameraInfo");
+  assert_eq!(cam.make(), Some("Apple Computer"));
+  assert_eq!(cam.model(), Some("iPhone 15 Pro Max"));
+  assert_eq!(cam.software(), Some("17.3"));
+  // Capture date = the Keys `creationdate` (overrides the mvhd CreateDate).
+  assert_eq!(md.media().created(), Some("2024:06:07 08:09:10+00:00"));
+  // GPS = the Keys `location.ISO6709` (Paris).
+  let gps = md.gps().expect("SP2 populates GpsLocation");
+  assert!(
+    (gps.latitude().expect("lat") - 48.8584).abs() < 1e-9,
+    "lat {:?}",
+    gps.latitude()
+  );
+  assert!(
+    (gps.longitude().expect("lon") - 2.2945).abs() < 1e-9,
+    "lon {:?}",
+    gps.longitude()
+  );
+  assert!(
+    (gps.altitude_m().expect("alt") - 35.0).abs() < 1e-9,
+    "alt {:?}",
+    gps.altitude_m()
+  );
+}

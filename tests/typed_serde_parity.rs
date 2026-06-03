@@ -308,7 +308,25 @@ const NOT_ACTIVE: &[&str] = &[
 ///     byte after the XMP packet end, declared length set to match ⇒ same XMP
 ///     tags, NO wrong-size warning — `PNG.pm:1169`).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 416;
+///
+/// 416 → 425: QuickTime SP2 (rebased onto main) adds 9 `QuickTime_sp2*`
+/// fixtures exercising the `moov/udta` camera atoms + `moov/meta` Keys/ItemList
+/// + meta `hdlr` walk. `QuickTime_sp2.mov` is the happy-path baseline (the
+/// `©mak`/`©mod`/`©swr`/`©nam`/`©day`/`©xyz`/`©cmt` `udta` atoms, the
+/// `make`/`model`/`software`/`creationdate`/`location.ISO6709` Keys, and the
+/// `moov/meta` HandlerType); `_badgps` (non-coordinate `©xyz` → faithful
+/// `ConvertISO6709` pass-through), `_iso6709long` (long-fractional decimal ISO
+/// 6709 → `($n+0)` f64 num­ification), `_infgps` (non-finite `inf inf -inf` →
+/// titlecase `Inf`/`NaN` DMS) cover the GPS-string convs; `_ilst_before_keys`
+/// (`ilst` ahead of `keys` ⇒ ZERO `Keys:*`, single-pass `ProcessKeys`),
+/// `_macroman` (lang-0 MacRoman `©nam` → `Café Clip`), `_meta_handlerclass`
+/// (`moov/meta/hdlr` ComponentType `mhlr` → `HandlerClass`), `_udta_camid` (the
+/// non-`©` camera-identity sweep + duplicate-tag `Avoid` priority), and
+/// `_android` (`com.android.*` full-key Keys fallback) cover the verified Codex
+/// `moov/meta` findings. Every PRE-EXISTING golden stays byte-identical (only
+/// the GoPro `moov/udta` fixtures carry a direct `moov/udta`, holding only
+/// `GPMF` — no `©`-atom/Keys — so SP2 emits nothing there).
+const EXPECTED_ACTIVE_FIXTURES: usize = 425;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
