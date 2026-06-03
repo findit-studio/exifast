@@ -1,0 +1,21 @@
+[{
+  "SourceFile": "XMP_aux_neutraldensity.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "xmp",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-aux:NeutralDensityFactor": "1/2",
+  "XMP-aux:LensDistortInfo": "1/100 2/100 3/100 4/100",
+  "XMP-aux:EnhanceSuperResolutionScale": 2,
+  "XMP-aux:EnhanceSuperResolutionVersion": 1,
+  "XMP-aux:EnhanceDetailsVersion": 2,
+  "XMP-aux:EnhanceDenoiseVersion": 3,
+  "XMP-aux:EnhanceDenoiseLumaAmount": 40,
+  "XMP-aux:DistortionCorrectionAlreadyApplied": true,
+  "XMP-aux:VignetteCorrectionAlreadyApplied": false,
+  "XMP-aux:LateralChromaticAberrationCorrectionAlreadyApplied": true,
+  "XMP-aux:EnhanceDetailsAlreadyApplied": true,
+  "XMP-aux:EnhanceSuperResolutionAlreadyApplied": true,
+  "XMP-aux:EnhanceDenoiseAlreadyApplied": true,
+  "XMP-aux:FujiRatingAlreadyApplied": true
+}]

@@ -349,6 +349,9 @@ pub enum AnyParser {
   /// sub-tables are deferred (see `src/formats/riff.rs` module doc).
   #[cfg(feature = "riff")]
   Riff(crate::formats::riff::ProcessRiff),
+  /// XMP (`.xmp` sidecar — RDF/XML metadata, FORMATS.md XMP).
+  #[cfg(feature = "xmp")]
+  Xmp(crate::formats::xmp::ProcessXmp),
 }
 
 /// Closed-set enum of every format's `Meta` output. Mirrors [`AnyParser`].
@@ -481,6 +484,11 @@ pub enum AnyMeta<'a> {
   /// a phantom kept for GAT uniformity.
   #[cfg(feature = "riff")]
   Riff(crate::formats::riff::RiffMeta<'a>),
+  /// XMP (`.xmp` sidecar — RDF/XML metadata, FORMATS.md XMP). `XmpMeta` owns
+  /// its decoded strings (the input is transcoded UTF-8/16/32 → owned
+  /// `String`), so `'a` is a phantom kept for GAT uniformity.
+  #[cfg(feature = "xmp")]
+  Xmp(crate::formats::xmp::XmpMeta<'a>),
   /// Lifetime anchor for a no-format build (Codex CF3). When at least one
   /// format feature is enabled this variant is `cfg`'d OUT (the real arms
   /// anchor `'a`); it exists only so a `--features std` build with no
@@ -515,6 +523,7 @@ pub enum AnyMeta<'a> {
     feature = "plist",
     feature = "exif",
     feature = "riff",
+    feature = "xmp",
   )))]
   #[doc(hidden)]
   _Phantom(core::marker::PhantomData<&'a ()>),
@@ -613,6 +622,12 @@ impl AnyMeta<'_> {
       // every other format.
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => m.tags(mode).collect(),
+      // XMP: `tags()` yields the extracted XMP tags in `FoundTag` order
+      // (family-0 "XMP", family-1 the namespace group `XMP-exif` / `XMP-dc`
+      // / …), each leaf already rendered for the mode. The decode/walk
+      // `$et->Warn` is a diagnostic (drained in `Diagnose`), NOT a tag.
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => m.tags(mode).collect(),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and yields no tags.
@@ -643,6 +658,7 @@ impl AnyMeta<'_> {
         feature = "plist",
         feature = "exif",
         feature = "riff",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => {
         let _ = mode;
@@ -833,6 +849,13 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       AnyMeta::Exif(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      // XMP: the lone reachable `$et->Warn` sites (`XMP is double UTF-encoded`
+      // XMP.pm:4491; the decode/walk warnings) are DOCUMENT-level (XMP sets no
+      // `SET_GROUP1`), surfaced as `ExifTool:Warning`. `XmpMeta::diagnostics`
+      // yields the first recorded warning (faithful `FoundTag('Warning')`
+      // first-wins).
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => crate::diagnostics::Diagnose::diagnostics(m),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely for
       // exhaustiveness and yields nothing.
@@ -863,6 +886,7 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
         feature = "plist",
         feature = "exif",
         feature = "riff",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => std::vec::Vec::new(),
     }
@@ -961,6 +985,44 @@ impl ExplicitWithMime {
   }
 }
 
+/// Payload for [`FileTypeFinalize::DetectedThenOverrideWithMime`]: a
+/// `SetFileType()` (detected) followed by `OverrideFileType($file_type,$mime)`
+/// where the override carries an EXPLICIT MIME (ExifTool.pm:9723 — the explicit
+/// `$mimeType` argument wins, so `%mimeType` is NOT consulted). XMP's Nikon
+/// NX-D path is the lone case: `OverrideFileType('NXD','application/x-nikon-nxd')`
+/// (XMP.pm:3916), where `NXD` has NO `%mimeType` entry so the explicit MIME is
+/// the only source. Extracted into a named struct so the enum stays
+/// unit-or-newtype only (§2). The `FileTypeExtension` is still derived from
+/// `file_type` (ExifTool.pm:9718-9722); only the MIME is taken verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverrideWithMime {
+  file_type: &'static str,
+  mime: &'static str,
+}
+
+impl OverrideWithMime {
+  /// Construct from the `OverrideFileType` type + explicit MIME arguments.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(file_type: &'static str, mime: &'static str) -> Self {
+    Self { file_type, mime }
+  }
+
+  /// The override `FileType` (drives `File:FileType` + `FileTypeExtension`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn file_type(&self) -> &'static str {
+    self.file_type
+  }
+
+  /// The EXPLICIT `MIMEType` argument (verbatim, NOT a `%mimeType` lookup).
+  #[must_use]
+  #[inline(always)]
+  pub const fn mime(&self) -> &'static str {
+    self.mime
+  }
+}
+
 /// How the engine ([`crate::parser::extract_info`]) should finalize the
 /// `File:*` triplet for an accepted typed [`AnyMeta`] — the typed-path
 /// counterpart of the `SetFileType` / `OverrideFileType` calls each format's
@@ -1015,6 +1077,14 @@ pub enum FileTypeFinalize {
   /// which are absent from `%mimeType`, QuickTime.pm:10008). The payload (see
   /// [`ExplicitWithMime`]) carries the `set` + `mime`.
   ExplicitWithMime(ExplicitWithMime),
+  /// `SetFileType()` then `OverrideFileType($file_type,$mime)` with an
+  /// EXPLICIT MIME argument (XMP Nikon NX-D: `OverrideFileType('NXD',
+  /// 'application/x-nikon-nxd')`, XMP.pm:3916). Distinct from
+  /// [`DetectedThenOverride`](Self::DetectedThenOverride) because the override
+  /// type (`NXD`) has NO `%mimeType` entry, so the MIME MUST come from the
+  /// explicit argument rather than a table lookup. The payload (see
+  /// [`OverrideWithMime`]) carries the `file_type` + `mime`.
+  DetectedThenOverrideWithMime(OverrideWithMime),
   /// **No `SetFileType` at all** — the parser accepted the input (returned a
   /// `Meta`, NOT `Ok(None)`) but bundled `return 1`s WITHOUT calling
   /// `SetFileType`, so NO `File:FileType` / `File:FileTypeExtension` /
@@ -1116,6 +1186,12 @@ impl AnyMeta<'_> {
       // `MediaMetadata::from_riff`).
       #[cfg(feature = "riff")]
       AnyMeta::Riff(m) => crate::metadata::Project::project(m),
+      // XMP: an `.xmp` sidecar carries camera/lens/GPS/capture facts (the
+      // `XMP-exif` / `XMP-tiff` / `XMP-aux` namespaces — Make/Model, GPS,
+      // LensInfo, DateTimeOriginal). Projected via the `Project` trait, like
+      // every other arm.
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => crate::metadata::Project::project(m),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3); it projects to the empty aggregate for exhaustiveness.
       #[cfg(not(any(
@@ -1144,6 +1220,7 @@ impl AnyMeta<'_> {
         feature = "plist",
         feature = "exif",
         feature = "riff",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => crate::metadata::MediaMetadata::new(),
     }
@@ -1288,6 +1365,26 @@ impl AnyMeta<'_> {
       AnyMeta::Riff(m) => {
         FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
       }
+      // XMP: `SetFileType()` finalizes to the detected `XMP` candidate.
+      // `ProcessXMP` also `SetFileType`s SVG/PLIST/XML for those XML flavours
+      // (XMP.pm:4420-4427), but `XmpMeta` is only ever produced for genuine
+      // FileType-`XMP` input (the `<svg`-rooted / non-XMP XML sub-ports are
+      // deferred — `ProcessXmp::parse` returns `None` for them). The one
+      // in-walk exception is a Nikon NX-D sidecar: an `xmlns` URI beginning
+      // `http://ns.nikon.com/BASIC_PARAM` triggers `OverrideFileType('NXD',
+      // 'application/x-nikon-nxd')` (XMP.pm:3916), so finalize to `NXD` with
+      // that explicit MIME (Codex R11/F1). Otherwise `Detected` ⇒ `XMP`.
+      #[cfg(feature = "xmp")]
+      AnyMeta::Xmp(m) => {
+        if m.is_nikon_nxd() {
+          FileTypeFinalize::DetectedThenOverrideWithMime(OverrideWithMime::new(
+            "NXD",
+            "application/x-nikon-nxd",
+          ))
+        } else {
+          FileTypeFinalize::Detected
+        }
+      }
       #[cfg(not(any(
         feature = "moi",
         feature = "aac",
@@ -1315,6 +1412,7 @@ impl AnyMeta<'_> {
         feature = "plist",
         feature = "exif",
         feature = "riff",
+        feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => FileTypeFinalize::Detected,
     }
@@ -1513,6 +1611,7 @@ impl AnyParser {
       feature = "plist",
       feature = "exif",
       feature = "riff",
+      feature = "xmp",
     )))]
     let _ = (bytes, shared, ext, header_skip, tiff_parent_type);
     // `header_skip` and `tiff_parent_type` are consumed ONLY by the `JPEG`/`TIFF`
@@ -1838,6 +1937,13 @@ impl AnyParser {
         let _ = (shared, ext);
         p.parse(bytes).map(AnyMeta::Riff)
       }
+      #[cfg(feature = "xmp")]
+      AnyParser::Xmp(p) => {
+        // XMP is a leaf format (a standalone `.xmp` sidecar — no chained
+        // state): `shared` and `ext` are unused.
+        let _ = (shared, ext);
+        p.parse(bytes).map(AnyMeta::Xmp)
+      }
     }
   }
 }
@@ -1955,6 +2061,14 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "RIFF" => Some(AnyParser::Riff(crate::formats::riff::ProcessRiff)),
     #[cfg(feature = "wavpack")]
     "WV" => Some(AnyParser::Wv(crate::formats::wavpack::ProcessWv)),
+    // XMP (FORMATS.md XMP) — `%fileTypeLookup{XMP}` resolves the `.xmp`
+    // extension + the RDF/XML magic to file type "XMP" (base module `XMP`,
+    // MIME `application/rdf+xml`); bundled `ProcessXMP` (XMP.pm:4262) walks the
+    // RDF/XML element tree. SVG/PLIST/XML-flavoured XML inputs are deferred
+    // (`ProcessXmp::parse` returns `None`), so only a genuine XMP sidecar
+    // reaches this arm.
+    #[cfg(feature = "xmp")]
+    "XMP" => Some(AnyParser::Xmp(crate::formats::xmp::ProcessXmp)),
     _ => None,
   }
 }
@@ -2028,6 +2142,8 @@ mod tests {
     assert!(any_parser_for("R3D").is_some());
     #[cfg(feature = "wavpack")]
     assert!(any_parser_for("WV").is_some());
+    #[cfg(feature = "xmp")]
+    assert!(any_parser_for("XMP").is_some());
     // Exif/TIFF: a standalone TIFF AND a camera JPEG both route to the Exif
     // walker (the JPEG dispatch branches on SOI magic in `parse_any`). Codex
     // R16/F1: the JPEG arm is the core product capability — without it a

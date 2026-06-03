@@ -94,3 +94,5 @@ pub mod red;
 pub mod riff;
 #[cfg(feature = "wavpack")]
 pub mod wavpack;
+#[cfg(feature = "xmp")]
+pub mod xmp;

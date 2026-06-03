@@ -8468,6 +8468,941 @@ fn jpeg_unknown_header_conformance() {
   );
 }
 
+#[test]
+fn xmp_base64_control_byte_split_conformance() {
+  // Codex R3 F1 regression: `rdf:datatype="base64"` decoded payloads keep
+  // ExifTool's binary/text split (XMP.pm:3646-3647 —
+  // `$val = $$val unless length $$val > 100 or
+  // $$val =~ /[\0-\x08\x0b\x0e-\x1f]/`). Single control bytes NUL (0x00),
+  // vertical-tab (0x0b) and shift-out (0x0e) stay BINARY ⇒ the
+  // `(Binary data 1 bytes, …)` placeholder; tab/LF/CR (not in the control
+  // class — `\x0c` is excluded too, the Perl `\0x0c` token being `\0` +
+  // literal `x0c`) and "hello" stay TEXT. Oracle (bundled `perl exiftool`
+  // 13.58, captured 2026-05-22).
+  check("XMP_base64_ctrl.xmp", "XMP_base64_ctrl.xmp.json", true);
+  check("XMP_base64_ctrl.xmp", "XMP_base64_ctrl.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_base64_binary_payload_conformance() {
+  // Codex R3 F1 regression: a `<=100`-byte non-UTF-8 JPEG header
+  // (`FF D8 FF E0`) decodes to LOSSY TEXT `"????"` (no control bytes, length
+  // <= 100, so `$$val` is a string; the invalid UTF-8 is replaced with `?`
+  // by `EscapeJSON`/`FixUTF8` at JSON time), while a `>100`-byte payload
+  // stays BINARY regardless of contents. Before the fix the bytes were forced
+  // through `String::from_utf8` and either coerced to a NUL string or, on
+  // failure, left as un-decoded base64 text. Oracle (bundled `perl exiftool`
+  // 13.58, captured 2026-05-22).
+  check("XMP_base64_binary.xmp", "XMP_base64_binary.xmp.json", true);
+  check(
+    "XMP_base64_binary.xmp",
+    "XMP_base64_binary.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_base64_malformed_payload_conformance() {
+  // Codex R4 F1 regression: `DecodeBase64` (XMP.pm:2981) NEVER fails — it
+  // truncates the input at the first byte outside the allow-list
+  // `[A-Za-z0-9+/= \t\n\r\f]` (XMP.pm:2988) and decodes the surviving prefix
+  // (XMP.pm:2990, partial groups included), so malformed payloads are decoded
+  // rather than emitted as the literal undecoded base64 text. Cases:
+  //   trailingJunk  `aGVsbG8=#junk` → "hello" (`#` and the rest dropped),
+  //   vtabTruncate  `aGVs<VT>bG8=`  → "hel"   (VT 0x0b is NOT in the
+  //                 allow-list, so it truncates; only `aGVs` survives),
+  //   noPadding     `aGVsbG8`       → "hello" (partial trailing group decode).
+  // Before the fix the decoder returned `None` on the first invalid byte and
+  // the caller fell back to the raw base64 string. Oracle (bundled
+  // `perl exiftool` 13.58, captured 2026-05-22).
+  check(
+    "XMP_base64_malformed.xmp",
+    "XMP_base64_malformed.xmp.json",
+    true,
+  );
+  check(
+    "XMP_base64_malformed.xmp",
+    "XMP_base64_malformed.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_base64_escaped_payload_conformance() {
+  // Codex R5 F1 regression: Perl decodes the RAW (still XML-escaped) value
+  // FIRST — `$val = DecodeBase64($val)` (XMP.pm:3645) — and only THEN
+  // un-escapes the decoded text (XMP.pm:3655-3669). Un-escaping before the
+  // base64 decode is wrong:
+  //   escTruncate `aGVs&#x62;G8=` → "hel"  (the `&` is outside the base64
+  //               allow-list, so DecodeBase64 truncates at `aGVs`; un-escaping
+  //               `&#x62;`→`b` first would wrongly rebuild `aGVsbG8=` → "hello"),
+  //   escAmp      `YSZhbXA7Yg==`  → "a&b"  (decodes to the bytes `a&amp;b`,
+  //               which the post-decode UnescapeXML turns into `a&b`; the buggy
+  //               pre-decode order stored the raw `a&amp;b`).
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check(
+    "XMP_base64_escaped.xmp",
+    "XMP_base64_escaped.xmp.json",
+    true,
+  );
+  check(
+    "XMP_base64_escaped.xmp",
+    "XMP_base64_escaped.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_multiline_comment_preserved_conformance() {
+  // Codex R1 F1: both leaf comment-strip sites run `s/<!--.*?-->//g` with NO
+  // `/s` flag (XMP.pm:4180 rdf:Description, :4182 `$wasComment` scalar), so a
+  // `<!--…-->` whose minimal body up to the first `-->` crosses an LF is left
+  // VERBATIM; only single-line comments are removed (per-comment, leftmost
+  // resume). The fixture exercises BOTH paths:
+  //   scalar (`$wasComment`):  dc:Title `aaa<!-- one line -->bbb` → `aaabbb`;
+  //                            dc:Source `ccc<!--\nML\n-->ddd` preserved;
+  //                            dc:Coverage `x<!-- a -->y<!--\nz\n-->w` →
+  //                            `xy<!--\nz\n-->w` (single stripped, multi kept);
+  //   rdf:Description literal: a nested `<rdf:Description>` value
+  //                            `  pre<!-- gone -->mid<!--\nkept\n-->post  `
+  //                            → `premid<!--\nkept\n-->post` (single stripped,
+  //                            multi kept, surrounding whitespace trimmed).
+  // Oracle: bundled `perl exiftool` 13.59 (version pinned 13.58 to match the
+  // engine's hard-coded ExifToolVersion, like every committed XMP golden).
+  check(
+    "XMP_comment_multiline.xmp",
+    "XMP_comment_multiline.xmp.json",
+    true,
+  );
+  check(
+    "XMP_comment_multiline.xmp",
+    "XMP_comment_multiline.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_cdata_unclosed_falls_back_to_unescape_conformance() {
+  // Codex R1 F2: the CDATA-special un-escape path activates ONLY when a
+  // COMPLETE `<![CDATA[ … ]]>` pair exists (XMP.pm:3657
+  // `if ($val =~ /<!\[CDATA\[(.*?)\]\]>/sg)` — `]]>` is mandatory). An opening
+  // marker with NO close is NOT special: the WHOLE value (literal `<![CDATA[`
+  // text included) goes through `UnescapeXML` (XMP.pm:3669). Both values are
+  // `rdf:datatype="base64"` text payloads (no control bytes / no `x`,`0`,`c` →
+  // the binary guard keeps them text):
+  //   cdataUnclosed `pre<![CDATA[a&amp;b`            → `pre<![CDATA[a&b`
+  //                 (marker kept literal, `&amp;`→`&` over the whole value);
+  //   cdataComplete `A<![CDATA[in&amp;side]]>out&amp;Y` → `Ain&amp;sideout&Y`
+  //                 (CDATA body verbatim, surrounding text un-escaped).
+  // Oracle: bundled `perl exiftool` 13.59 (version pinned 13.58 as above).
+  check(
+    "XMP_cdata_unclosed.xmp",
+    "XMP_cdata_unclosed.xmp.json",
+    true,
+  );
+  check(
+    "XMP_cdata_unclosed.xmp",
+    "XMP_cdata_unclosed.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_stray_lt_in_text_conformance() {
+  // Codex R3-A: the close-scan regex (XMP.pm:3836
+  // `<(?:(/?)\Q$prop\E([-\w:.\x80-\xff]*)(.*?(/?))>|(!\[CDATA\[|!--))`/sg) is
+  // UNANCHORED — a `<` that does NOT begin `[/]?\Q$prop\E…>` (here the stray
+  // `<` in `dc:title` text `bad < text`) is skipped ONE byte by the `/g`
+  // engine, NOT consumed through the next `>`. The previous port skipped any
+  // irrelevant `<…>` THROUGH its `>`, swallowing the real `</dc:title>` and
+  // dropping Title AND the following `dc:format` sibling. Both must survive:
+  //   Title="bad < text", Format="image/jpeg".
+  // Oracle: bundled `perl exiftool` 13.59 (version pinned 13.58).
+  check("XMP_stray_lt.xmp", "XMP_stray_lt.xmp.json", true);
+  check("XMP_stray_lt.xmp", "XMP_stray_lt.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_close_extra_name_conformance() {
+  // Codex R3-A: `$2` = the name-EXTENSION chars after the exact prop name;
+  // `next if $2` (XMP.pm:3853) ignores a token whose name merely STARTS with
+  // the prop — `</dc:titleExtra>` does NOT close `dc:title`. So the close is
+  // the LATER `</dc:title>` and the literal value keeps the verbatim text
+  // INCLUDING the ignored `</dc:titleExtra>`:
+  //   Title="real</dc:titleExtra> still", Format="image/png".
+  // (The previous port treated any `</dc:title…>` prefix-match as the close,
+  // ending the element early at `</dc:titleExtra>`.)
+  // Oracle: bundled `perl exiftool` 13.59 (version pinned 13.58).
+  check("XMP_close_extra.xmp", "XMP_close_extra.xmp.json", true);
+  check("XMP_close_extra.xmp", "XMP_close_extra.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_nodeid_blank_node_conformance() {
+  // Codex R3-B: `rdf:nodeID` blank-node resolution (SaveBlankInfo /
+  // ProcessBlankInfo, WriteXMP.pl:433/465). A subject element
+  // `<exif:Flash rdf:nodeID="n1"/>` + a blank node
+  // `<rdf:Description rdf:nodeID="n1"><exif:Fired>…<exif:Mode>…` must
+  // RECOMBINE into the structured `XMP-exif:Flash = {Fired, Mode}` — the
+  // subject's `…/rdf:Description/exif:Flash` PREFIX (kept by the
+  // `unless $prop eq rdf:Description` rule + selected by the
+  // `$pre =~ m{/rdf:Description/}` filter) joined with the `/exif:Fired`,
+  // `/exif:Mode` SUFFIXES. The previous port dropped the `exif:Flash` level,
+  // emitting a flat `Fired`/`Mode` (and `Mode` missed its `On` PrintConv for
+  // lack of the `Flash` struct parent). ExifTool also derives `Composite:Flash`
+  // and System:* tags, which this XMP-only port does not emit (so the trimmed
+  // golden omits them, as every XMP golden omits System:*).
+  // Oracle structure: bundled `perl exiftool` 13.59 (version pinned 13.58).
+  check("XMP_nodeid_flash.xmp", "XMP_nodeid_flash.xmp.json", true);
+  check("XMP_nodeid_flash.xmp", "XMP_nodeid_flash.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_noncanonical_prefix_conformance() {
+  // Codex R6 F1 regression: `FoundXMP` reads `rdf:datatype`/`et:encoding`
+  // (XMP.pm:3644) and `xml:lang` (XMP.pm:3497) from the `%attrs` HASH —
+  // whose keys are namespace-NORMALIZED by the attribute loop's
+  // `$attr = $$xlatNS{$1} . substr(...)` (XMP.pm:3976). So a noncanonical
+  // RDF prefix still hits the base64 decode path:
+  //   `xmlns:r="…22-rdf-syntax-ns#"` + `r:datatype="base64"`
+  //     `aGVsbG8=` → "hello",  `/9j/4A==` → binary JPEG header "????",
+  //   canonical `rdf:datatype="base64"` → `d29ybGQ=` → "world".
+  // Before the fix the lookup scanned the RAW attribute text for a literal
+  // `rdf:datatype`, missed it, and emitted the undecoded base64 string.
+  // The `rdf:value`/`resource`/`about` fallback (XMP.pm:4186) is the
+  // OPPOSITE — it matches the RAW `$attrs` string with a literal `\brdf:`,
+  // so a noncanonical `r:resource` does NOT trigger it (Link stays "").
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check("XMP_ncprefix.xmp", "XMP_ncprefix.xmp.json", true);
+  check("XMP_ncprefix.xmp", "XMP_ncprefix.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_rdf_resource_spaced_conformance() {
+  // Codex R7 F1 regression: the empty-value fallback (XMP.pm:4185-4186)
+  // matches the RAW `$attrs` string with the literal Perl regexes
+  // `\brdf:(?:value|resource)=(['"])(.*?)\1` and `\brdf:about=(['"])...`.
+  // Those regexes have NO `\s*` around the `=`, so an attribute written
+  // with spaces — `rdf:resource = "…"` — does NOT match and the element
+  // value stays empty. Reparsing via the general attribute scanner
+  // (XMP.pm:3886 `(\S+?)\s*=\s*(['"])`) would wrongly tolerate the spaces
+  // and emit the resource. `Link`/`ValSpaced` → "" (spaced `=`),
+  // `LinkTight`/`ValTight` → their values (tight `=`).
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check(
+    "XMP_rdf_resource_spaced.xmp",
+    "XMP_rdf_resource_spaced.xmp.json",
+    true,
+  );
+  check(
+    "XMP_rdf_resource_spaced.xmp",
+    "XMP_rdf_resource_spaced.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_attr_junk_conformance() {
+  // Codex R2 finding: the COMMON-branch attribute scanner (XMP.pm:3884-3900,
+  // `length($attrs) < 2000`) reads attributes with an UNANCHORED `/g` regex in
+  // a `for(;;)` loop: `$attrs =~ /(\S+?)\s*=\s*(['"])/g`. Because it is
+  // unanchored, a junk token with no `=quote` after it is simply SKIPPED — the
+  // engine advances to the next `name\s*=\s*quote` match. So in
+  //   `rdf:about="" xmlns:dc="…" junk dc:title="Lost" dc:format="image/jpeg"`
+  // the bare `junk` does NOT terminate the scan: `dc:title=Lost` and
+  // `dc:format=image/jpeg` STILL extract. The pre-fix `iter_attrs` parsed
+  // strictly left-to-right and `break`ed on the first malformed token, silently
+  // dropping `dc:title` and every later attribute. The fix mirrors Perl's
+  // left-to-right unanchored scan (advance past a malformed candidate, resume
+  // searching for the next `\S+?\s*=\s*['"]` pair).
+  // Oracle: bundled `perl exiftool` 13.59 (gen_golden.sh COMMON args).
+  check("XMP_attr_junk.xmp", "XMP_attr_junk.xmp.json", true);
+  check("XMP_attr_junk.xmp", "XMP_attr_junk.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_et_encoding_conformance() {
+  // Codex R7 F2 regression: a NON-ignored shorthand attribute is removed
+  // from `%attrs` (`delete $attrs{$shortName}`, XMP.pm:4133) once it has
+  // been extracted as its own property, so the later
+  // `FoundXMP(..., \%attrs)` (XMP.pm:4206) no longer sees it. `et:encoding`
+  // (ns `et` — not in `%ignoreNamespace`, not in `%ignoreEtProp`, not in
+  // `%recognizedAttrs`) IS extracted+deleted: it surfaces as its own tag
+  // (`PayloadEncoding`) and the parent value stays RAW (`aGVsbG8=`, NOT
+  // base64-decoded to "hello"). `rdf:datatype` (ns `rdf`) is caught by
+  // `$ignoreNamespace{rdf}` (XMP.pm:4123) and never deleted, so it still
+  // survives and drives the parent decode (`d29ybGQ=` → "world").
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check("XMP_et_encoding.xmp", "XMP_et_encoding.xmp.json", true);
+  check("XMP_et_encoding.xmp", "XMP_et_encoding.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_li_1000_item_cap_conformance() {
+  // Codex R8 F1 regression: `ParseXMPElement` imposes a reasonable maximum
+  // on the number of items in a list (XMP.pm:3991-3999). At the 1001st
+  // `rdf:li` (`$nItems == 1000`), the default read path — `exifast` has no
+  // `IgnoreMinorErrors` option, so it is always the default path — raises a
+  // minor warning `Warn("Extracted only 1000 $ns:$tg items. ...", 2)` and
+  // `last`s out of the element loop, so exactly the first 1000 items are
+  // extracted. `Warn(..., 2)` prepends the literal `[Minor] ` marker
+  // (ExifTool.pm:5619). `$ns:$tg` is the namespace + raw tag id of the
+  // enclosing path from `GetXMPTagID` BEFORE the `rdf:li` is pushed
+  // (XMP.pm:3992-3994) — `dc:subject` for a `dc:subject`/`rdf:Bag` list.
+  // Fixture `XMP_li_cap.xmp` has 1001 `<rdf:li>` keywords; oracle (bundled
+  // `perl exiftool` 13.58, captured 2026-05-22) extracts `Subject` =
+  // [kw1 .. kw1000] (1000 items, kw1001 dropped) and emits
+  // `Warning: "[Minor] Extracted only 1000 dc:subject items. ..."`.
+  check("XMP_li_cap.xmp", "XMP_li_cap.xmp.json", true);
+  check("XMP_li_cap.xmp", "XMP_li_cap.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_svg_and_xml_inputs_are_not_misfinalized_as_xmp() {
+  // Codex R8 F2 regression: `ProcessXMP` recognizes several XML flavours
+  // and `SetFileType`s each separately — `<svg`-rooted / `<?xml`+`<svg`
+  // ⇒ `SetFileType('SVG')` (image/svg+xml, the `SVG` tag table),
+  // `<?xml`+`<plist` ⇒ the `PLIST` module, other `<?xml` ⇒
+  // `SetFileType('XML')` (application/xml) — XMP.pm:4420-4427. The SVG /
+  // PLIST / XML sub-ports are deferred (`docs/tracking.md`), so the XMP
+  // parser REJECTS those inputs (`Ok(None)`) instead of mis-finalizing
+  // them as FileType `XMP` / `application/rdf+xml`. An `.svg` file (the
+  // extension dispatches to the `XMP` candidate) must therefore NOT come
+  // out tagged `XMP`. Verified vs bundled `perl exiftool` 13.58
+  // (2026-05-22): `test.svg` ⇒ `File:FileType` = `SVG`.
+  let svg = br#"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+  <title>Deferred SVG</title>
+</svg>"#;
+  for print_on in [true, false] {
+    let out = extract_info("deferred.svg", svg, print_on);
+    assert!(
+      !out.contains("\"XMP\""),
+      "SVG must not be mis-finalized as FileType XMP (R8/F2), got: {out}"
+    );
+    assert!(
+      !out.contains("application/rdf+xml"),
+      "SVG must not get the XMP MIME type (R8/F2), got: {out}"
+    );
+  }
+  // A `<?xml`-rooted XMP sidecar (carrying `<x:xmpmeta>`) is still XMP.
+  let xmp = br#"<?xml version="1.0"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">
+   <dc:format>image/jpeg</dc:format>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+  let out = extract_info("sidecar.xmp", xmp, true);
+  assert!(
+    out.contains("\"File:FileType\":\"XMP\""),
+    "a <?xml-rooted XMP sidecar must still finalize to XMP, got: {out}"
+  );
+}
+
+#[test]
+fn xmp_numeric_entity_overflow_and_surrogate_conformance() {
+  // Codex R9/F2 regression: `UnescapeChar` (XMP.pm:2919-2936) resolves a
+  // numeric reference, then emits it via `pack('C0U', $val)` (XMP.pm:2933) —
+  // variable-length UTF-8 WITHOUT validity checks. For a code point above
+  // U+10FFFF or in the surrogate range that yields malformed bytes, which the
+  // downstream `Decode`/`FixUTF8` (XMP.pm:2943-2972) — reached at JSON-escape
+  // time — replaces with ONE `?` per bad byte (NOT a single `?`, and NOT the
+  // literal entity text). Bundled `perl exiftool` 13.58 (captured 2026-05-22):
+  //   `A&#x100000000;B` → 7-byte loose-UTF-8 `FE 84 80 80 80 80 80` ⇒ "A???????B"
+  //   `S&#xD800;E`      → 3-byte loose-UTF-8 `ED A0 80`            ⇒ "S???E"
+  //   `over&#x110000;flow` → 4-byte `F4 90 80 80`                 ⇒ "over????flow"
+  //   `good&#x100;point`   → `Ā` (U+0100, in range, valid)
+  // The old port returned `None` from the overflow/surrogate parse and left
+  // the literal `&#x…;` text. The fixture ALSO pins the class-sweep edge
+  // cases `UnescapeChar` leaves LITERAL (XMP.pm:2924-2929 anchors lowercase
+  // `^#x([0-9a-fA-F]+)$` / `^#(\d+)$`, and `s/&(#?\w+);/.../` needs a `#?\w+`
+  // body): `&#X41;` (uppercase X) and `&#x+41;` (sign breaks `\w+`) stay
+  // verbatim — the old code wrongly resolved both to `A`.
+  check("XMP_numentity.xmp", "XMP_numentity.xmp.json", true);
+  check("XMP_numentity.xmp", "XMP_numentity.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_leading_whitespace_recognition_anchoring() {
+  // Codex R9/F1 regression: `ProcessXMP` recognition is a TWO-TIER match.
+  // Tier 1 (XMP.pm:4341 `^\s*(<\?xpacket begin=|<x(mp)?:x[ma]pmeta)`) tolerates
+  // leading whitespace; Tier 2 (the `else` block, XMP.pm:4345-4354 — BOM /
+  // `<?xml` / `<rdf:RDF` / `<svg`) is anchored at byte 0 with an OPTIONAL
+  // byte-0 BOM but NO leading whitespace. So leading whitespace before
+  // `<rdf:RDF` or `<?xml` makes ExifTool finalize the file to TXT, NOT XMP.
+  // The old port trimmed whitespace before EVERY branch, wrongly accepting
+  // these as XMP. Bundled `perl exiftool` 13.58 (captured 2026-05-22):
+  //   `   <rdf:RDF …`               ⇒ FileType TXT (NOT XMP)
+  //   `   <?xml …<x:xmpmeta …`      ⇒ FileType TXT (NOT XMP)
+  //   `   <?xpacket begin=…`        ⇒ FileType XMP  (Tier-1 `^\s*`)
+  //   `   <x:xmpmeta …`             ⇒ FileType XMP  (Tier-1 `^\s*`)
+  let rdf = b"   <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" dc:title=\"WS\"/></rdf:RDF>";
+  let xml = b"   <?xml version=\"1.0\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" dc:title=\"WS\"/></rdf:RDF></x:xmpmeta>";
+  for print_on in [true, false] {
+    // Leading whitespace before <rdf:RDF / <?xml: REJECTED as XMP (would be
+    // TXT in ExifTool — a deferred FileType the XMP candidate must not claim).
+    let out = extract_info("ws_rdf.xmp", rdf, print_on);
+    assert!(
+      !out.contains("\"XMP\"") && !out.contains("application/rdf+xml"),
+      "leading whitespace before <rdf:RDF must NOT finalize as XMP (R9/F1), got: {out}"
+    );
+    let out = extract_info("ws_xml.xmp", xml, print_on);
+    assert!(
+      !out.contains("\"XMP\"") && !out.contains("application/rdf+xml"),
+      "leading whitespace before <?xml must NOT finalize as XMP (R9/F1), got: {out}"
+    );
+  }
+  // Tier-1 `^\s*`: leading whitespace before <?xpacket / <x:xmpmeta IS XMP.
+  let xpacket = b"   <?xpacket begin=\"\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:format>image/jpeg</dc:format>\
+</rdf:Description></rdf:RDF></x:xmpmeta>";
+  let xmpmeta = b"   <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+<rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:format>image/jpeg</dc:format>\
+</rdf:Description></rdf:RDF></x:xmpmeta>";
+  let out = extract_info("ws_xpacket.xmp", xpacket, true);
+  assert!(
+    out.contains("\"File:FileType\":\"XMP\""),
+    "leading whitespace before <?xpacket must still be XMP (Tier-1 ^\\s*), got: {out}"
+  );
+  let out = extract_info("ws_xmpmeta.xmp", xmpmeta, true);
+  assert!(
+    out.contains("\"File:FileType\":\"XMP\""),
+    "leading whitespace before <x:xmpmeta must still be XMP (Tier-1 ^\\s*), got: {out}"
+  );
+}
+
+#[test]
+fn xmp_double_utf8_encoded_conformance() {
+  // Codex R10/F1 regression: a UTF-8-BOM + `<?xpacket begin=` sidecar is the
+  // `$double` capture (XMP.pm:4351 `^(\xfe\xff|\xff\xfe|\xef\xbb\xbf)(<\?xpacket
+  // begin=)`). ProcessXMP enters the `if ($double)` block (XMP.pm:4467-4498),
+  // strips the BOM from the ORIGINAL data, and re-packs as characters: for the
+  // UTF-8 BOM, `Charset::Decompose(_,_,'UTF8')` (= `unpack('C0U*')`,
+  // Charset.pm:165-181) decodes the buffer to code points, then `pack('C*')`
+  // truncates each to its low byte (XMP.pm:4478-4480). When that succeeds (no
+  // malformed-UTF-8 warning) ExifTool emits `XMP is double UTF-encoded`
+  // (XMP.pm:4494) and parses the re-packed bytes; here `dc:title = é` (U+00E9,
+  // UTF-8 `c3 a9`) → byte `0xE9` → `FixUTF8` (XMP.pm:2943-2972) → `?`. The old
+  // port stripped the BOM, accepted `<?xpacket` as ordinary XMP, and kept `é`
+  // with no warning. Bundled `perl exiftool` 13.58 (captured 2026-05-22):
+  //   `ExifTool:Warning` = "XMP is double UTF-encoded", `XMP-dc:Title` = "?".
+  check("XMP_double_utf8.xmp", "XMP_double_utf8.xmp.json", true);
+  check("XMP_double_utf8.xmp", "XMP_double_utf8.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_utf16le_non_bmp_conformance() {
+  // Codex R10/F2 regression: ProcessXMP transcodes UTF-16 via `pack('C0U*',
+  // unpack('v*'/'n*', $$dataPt))` (XMP.pm:4571-4587) — each 16-bit unit is
+  // decoded INDEPENDENTLY (surrogate pairs are NOT combined) and emitted as
+  // `pack('C0U')` loose UTF-8. For `dc:title = A😀B` (U+1F600), the UTF-16LE
+  // surrogate PAIR `D83D DE00` is two units → 6 loose-UTF-8 bytes
+  // (`ed a0 bd ed b8 80`) → `FixUTF8` (XMP.pm:2943-2972) → six `?`. No warning
+  // (the leading `\xff\xfe` BOM validates the encoding marker, XMP.pm:4567).
+  // The old port `String::from_utf16_lossy` combined the pair into the real
+  // scalar and indexed `A😀B`. Bundled `perl exiftool` 13.58 (captured
+  // 2026-05-22): `XMP-dc:Title` = "A??????B", no warning.
+  check(
+    "XMP_utf16le_nonbmp.xmp",
+    "XMP_utf16le_nonbmp.xmp.json",
+    true,
+  );
+  check(
+    "XMP_utf16le_nonbmp.xmp",
+    "XMP_utf16le_nonbmp.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_nikon_basic_param_nxd_override_conformance() {
+  // Codex R11/F1 regression: an `xmlns` URI beginning
+  // `http://ns.nikon.com/BASIC_PARAM` (a Nikon NX-D settings sidecar) triggers
+  // `OverrideFileType('NXD','application/x-nikon-nxd')` (XMP.pm:3915-3916), so
+  // ExifTool finalizes `File:FileType=NXD`, `File:FileTypeExtension=nxd` (the
+  // `-n` form keeps the uppercase `NXD`), and the EXPLICIT
+  // `File:MIMEType=application/x-nikon-nxd` (NXD has NO `%mimeType` entry, so
+  // the override's explicit MIME argument is the sole source) instead of
+  // generic `XMP` + `application/rdf+xml`. The `XMP-nbp:*` settings tags still
+  // come through the normal namespace path. Before the fix the port had no
+  // override state and indexed this sidecar as plain XMP with the wrong MIME.
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check("XMP_nikon_nxd.xmp", "XMP_nikon_nxd.xmp.json", true);
+  check("XMP_nikon_nxd.xmp", "XMP_nikon_nxd.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_nikon_nxd_extension_override_guard_conformance() {
+  // Codex R11/F1 class-sweep: the SAME Nikon NX-D content as
+  // `XMP_nikon_nxd.xmp` but under a `.nxd` EXTENSION. `OverrideFileType` is
+  // guarded by `$fileType ne $$self{VALUE}{FileType}` (ExifTool.pm:9715), and
+  // for a `.nxd` file `SetFileType` already resolves `NXD` (the `NXD => XMP`
+  // sub-type-by-ext promotion, ExifTool.pm:9686-9690), so `'NXD' ne 'NXD'` is
+  // FALSE: the namespace override is a NO-OP. FileType stays `NXD` but the MIME
+  // is the BASE `application/rdf+xml` (NOT the explicit `application/x-nikon-nxd`
+  // the `.xmp` sidecar gets). Pins the override GUARD so a `.nxd`-named file is
+  // not given the explicit MIME by mistake. Oracle (bundled `perl exiftool`
+  // 13.58, captured 2026-05-22).
+  check("XMP_nikon_nxd_ext.nxd", "XMP_nikon_nxd_ext.nxd.json", true);
+  check(
+    "XMP_nikon_nxd_ext.nxd",
+    "XMP_nikon_nxd_ext.nxd.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_base64_literal_x0c_typo_conformance() {
+  // Codex R11/F2 regression: the base64 binary-guard regex (XMP.pm:3647 `… or
+  // $$val =~ /[\0-\x08\x0b\0x0c\x0e-\x1f]/`) ships a TYPO that ExifTool 13.58
+  // keeps verbatim — `\0x0c` is parsed as `\0` (NUL) FOLLOWED BY the LITERAL
+  // characters `x` (0x78), `0` (0x30), `c` (0x63), NOT as `\x0c` (FF). So a
+  // short `rdf:datatype="base64"` payload that decodes to `cat`/`x`/`0`/`c`
+  // (each contains an x/0/c byte) is treated as a binary placeholder, while a
+  // payload WITHOUT any control/x/0/c byte stays text (`dog` → "dog"; `9` → 9
+  // — only the digit `0` is special, not all digits). Before the fix the port
+  // modeled only the control ranges and emitted `cat`/`x`/`0`/`c` as text.
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22).
+  check("XMP_base64_x0c.xmp", "XMP_base64_x0c.xmp.json", true);
+  check("XMP_base64_x0c.xmp", "XMP_base64_x0c.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_plus_signed_rational_not_converted_conformance() {
+  // Codex R12/F1 + class-sweep regression: `ConvertRational` (XMP.pm:3400-
+  // 3411) gates the value with the Perl regex `^(-?\d+)/(-?\d+)$` — exactly
+  // one `/`, an OPTIONAL `-` (NEVER a `+`) then digits on each side. So a
+  // leading-`+` rational does NOT match and is NOT converted. Rust's
+  // `i64::parse` is looser (it accepts `+`), so the port wrongly converted
+  // `+1/3` to a `0.333...` quotient. The class sweep also covers the
+  // downstream numeric `ValueConv`/`PrintConv`s, which model raw Perl
+  // arithmetic / `sprintf` with NO `IsFloat` gate — Perl coerces `$val`
+  // (`"+1/3" + 0 == 1`), whereas the port's `f64::parse` rejects the `/3`.
+  // Oracle (bundled `perl exiftool` 13.58, captured 2026-05-22):
+  //   `exif:ExposureBiasValue=+1/3` → `-n` "+1/3"  (ConvertRational rejects)
+  //                                   `-j` "+1"    (PrintFraction coerces 1)
+  //   `exif:FocalLength=+50/1`       → `-n` "+50/1" `-j` "50.0 mm" (FocalMm)
+  //   `exif:ApertureValue=+2/1`      → `-n` 2  `-j` 2.0 (sqrt(2)**2, Fixed1)
+  //   `exif:BrightnessValue=-1/3`    → -0.333333333333333 (valid: converts)
+  check("XMP_rational_plus.xmp", "XMP_rational_plus.xmp.json", true);
+  check(
+    "XMP_rational_plus.xmp",
+    "XMP_rational_plus.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_exif_colorspace_value_conv_conformance() {
+  // Codex R14/F1 regression: `exif:ColorSpace` (XMP.pm:2000) carries
+  // `ValueConv => '$val == 0xffffffff ? 0xffff : $val'` (XMP.pm:2003) — some
+  // applications incorrectly write `-1` as a 32-bit unsigned long, so a
+  // written `4294967295` (0xffffffff) collapses NUMERICALLY to the EXIF
+  // `0xffff` "Uncalibrated" sentinel. The port previously declared the tag
+  // raw (PrintConv hash only, no ValueConv), so `4294967295` passed straight
+  // to the `{1,2,0xffff}` PrintConv hash and MISSED — emitting
+  // `Unknown (4294967295)`. Oracle (bundled `perl exiftool` 13.58):
+  //   `exif:ColorSpace=4294967295` → `-n` 65535  `-j` "Uncalibrated"
+  check("XMP_colorspace.xmp", "XMP_colorspace.xmp.json", true);
+  check("XMP_colorspace.xmp", "XMP_colorspace.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_exif_cross_module_printconv_conformance() {
+  // Codex R4-A: XMP tags whose bundled `PrintConv` is a REFERENCE to another
+  // module's hash (`\%Image::ExifTool::Exif::compression` / `…::
+  // photometricInterpretation` / `…::lightSource`, XMP.pm:1913/1917/2132) must
+  // render the LABEL, not the raw integer. They are now wired to LOCAL ports
+  // of those bundled hashes (the `xmp` feature is independent of `exif`, so a
+  // cross-module `use` can't be used — same local-const pattern as
+  // `TIFF_ORIENTATION`). `exif:MeteringMode` (inline hash, already correct)
+  // guards the no-regression case, and `exif:Flash` guards that the bare
+  // integer stays RAW (its `\%flash` PrintConv is the deferred
+  // `Composite:Flash` tag's, NOT `XMP-exif:Flash` — bundled emits `5`).
+  // Oracle (bundled `perl exiftool` 13.59, `-x Composite:all`):
+  //   tiff:Compression=6                 -j "JPEG (old-style)"  -n 6
+  //   tiff:PhotometricInterpretation=6   -j "YCbCr"             -n 6
+  //   exif:LightSource=10                -j "Cloudy"            -n 10
+  //   exif:MeteringMode=5                -j "Multi-segment"     -n 5
+  //   exif:Flash=5                       -j 5                   -n 5
+  check(
+    "XMP_exif_printconv.xmp",
+    "XMP_exif_printconv.xmp.json",
+    true,
+  );
+  check(
+    "XMP_exif_printconv.xmp",
+    "XMP_exif_printconv.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_et_qualifier_suppression_conformance() {
+  // Codex R4-B: `ParseXMPElement` IGNORES `et:desc` always, and `et:val` when
+  // preceded by `et:prt` (XMP.pm:4202 `/^et:(desc|prt|val)$/ and ($count or
+  // $1 eq 'desc')`, with a `--$count` sibling-count adjustment). Since
+  // `GetXMPTagID` strips the `et:*` suffix, all three would otherwise collapse
+  // to the parent `foo:Tag` and the LAST (`et:val`) would win. The suppression
+  // makes the `et:prt` value the emitted one. Oracle: `XMP-foo:Tag=Print`.
+  check("XMP_et_qual.xmp", "XMP_et_qual.xmp.json", true);
+  check("XMP_et_qual.xmp", "XMP_et_qual.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_aux_lensinfo_rational_list_conformance() {
+  // Codex R14/F1 regression: `aux:LensInfo` (XMP.pm:2596) carries
+  // `ValueConv => \&ConvertRationalList` (XMP.pm:2600) +
+  // `PrintConv => \&Image::ExifTool::Exif::PrintLensInfo` (XMP.pm:2615). The
+  // tag has NO explicit `Writable` (plain-string default) so XMPAutoConv's
+  // `ConvertRational` does NOT pre-convert it — `ConvertRationalList`
+  // (XMP.pm:3418) converts the raw `N/D N/D N/D N/D` string field-by-field,
+  // then `PrintLensInfo` (Exif.pm:5800) renders the focal/aperture form. The
+  // port previously declared the tag raw/identity, emitting the literal
+  // `24/1 70/1 28/10 40/10` in BOTH modes. Oracle (bundled `perl exiftool`
+  // 13.58):
+  //   `aux:LensInfo=24/1 70/1 28/10 40/10`
+  //       → `-n` "24 70 2.8 4"  `-j` "24-70mm f/2.8-4"
+  check("XMP_lensinfo.xmp", "XMP_lensinfo.xmp.json", true);
+  check("XMP_lensinfo.xmp", "XMP_lensinfo.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_aux_lensinfo_prime_zero_upper_focal_conformance() {
+  // Codex R14/F1 class-sweep: `PrintLensInfo` (Exif.pm:5800) appends the
+  // upper focal/aperture only when it is Perl-truthy AND differs from the
+  // lower value — `$val .= "-$vals[1]" if $vals[1] and $vals[1] ne $vals[0]`
+  // (Exif.pm:5814). A fixed-focal-length ("prime") lens writes `0` for the
+  // upper focal (the Pentax Q does this); Perl `"0"` is falsy, so the `-0`
+  // is dropped and the form is `50mm f/1.4`. Oracle (bundled `perl exiftool`
+  // 13.58):
+  //   `aux:LensInfo=50/1 0/1 14/10 14/10`
+  //       → `-n` "50 0 1.4 1.4"  `-j` "50mm f/1.4"
+  check(
+    "XMP_lensinfo_prime.xmp",
+    "XMP_lensinfo_prime.xmp.json",
+    true,
+  );
+  check(
+    "XMP_lensinfo_prime.xmp",
+    "XMP_lensinfo_prime.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_aux_approximate_focus_distance_conformance() {
+  // Codex R14/F1 regression: `aux:ApproximateFocusDistance` (XMP.pm:2630)
+  // carries `Writable => 'rational'` and a PrintConv hash whose only mapped
+  // row is `4294967295 => 'infinity'` (XMP.pm:2633), paired with an
+  // `OTHER => sub` (XMP.pm:2634-2638) whose READ branch returns the value
+  // UNCHANGED on a miss (NOT `Unknown ($val)`). The `rational` Writable means
+  // XMPAutoConv's `ConvertRational` runs first: a finite `53/10` → `5.3`
+  // (a hash miss → OTHER passes `5.3` through), and the sentinel
+  // `4294967295/1` → `4294967295` keys the `infinity` row. The port
+  // previously declared the tag with a plain hash PrintConv, so the finite
+  // `5.3` MISSED → `Unknown (5.3)`. Oracle (bundled `perl exiftool` 13.58):
+  //   `aux:ApproximateFocusDistance=53/10`        → `-n` 5.3  `-j` 5.3
+  //   `aux:ApproximateFocusDistance=4294967295/1` → `-n` 4294967295
+  //                                                 `-j` "infinity"
+  check("XMP_aux_focusdist.xmp", "XMP_aux_focusdist.xmp.json", true);
+  check(
+    "XMP_aux_focusdist.xmp",
+    "XMP_aux_focusdist.xmp.n.json",
+    false,
+  );
+  check(
+    "XMP_aux_focusdist_inf.xmp",
+    "XMP_aux_focusdist_inf.xmp.json",
+    true,
+  );
+  check(
+    "XMP_aux_focusdist_inf.xmp",
+    "XMP_aux_focusdist_inf.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_aux_neutral_density_and_lightroom_tags_conformance() {
+  // Codex R5/F1 value-divergence fix: the AUX table stopped at
+  // `LensDistortInfo`; the Lightroom LR6+/LR7+/LR11+ tags (XMP.pm:2641-2658)
+  // were absent, so the missing-from-table DEFAULT path ran XMPAutoConv's
+  // `ConvertRational` on them. The headline bug: `aux:NeutralDensityFactor`
+  // (XMP.pm:2648, a `{}` no-Writable string whose DENOMINATOR is significant)
+  // was mis-converted `"1/2"` → `0.5`. With the explicit table rows it stays
+  // `"1/2"` VERBATIM (a table-present no-Writable tag has `IsDefault` FALSE ⇒
+  // XMP.pm:3676 skips the AutoConv block). Oracle (bundled `perl exiftool`
+  // 13.59):
+  //   `aux:NeutralDensityFactor=1/2`            → "1/2" (NOT 0.5)
+  //   `aux:LensDistortInfo=1/100 2/100 …`       → kept verbatim
+  //   `aux:EnhanceSuperResolutionScale=2/1`     → 2 (Writable=>'rational')
+  //   `aux:Enhance{Details,SuperResolution,Denoise}Version`, `…LumaAmount`
+  //                                             → plain ints (no AutoConv)
+  //   `aux:*AlreadyApplied=True|False`          → boolean true/false
+  check(
+    "XMP_aux_neutraldensity.xmp",
+    "XMP_aux_neutraldensity.xmp.json",
+    true,
+  );
+  check(
+    "XMP_aux_neutraldensity.xmp",
+    "XMP_aux_neutraldensity.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_thumbnails_struct_base64_image_is_binary_conformance() {
+  // Codex R5/F2 value-divergence fix: `xmp:Thumbnails` (XMP.pm:1062,
+  // `Struct => \%sThumbnail`) and `xmp:PageInfo` (XMP.pm:1068,
+  // `Struct => \%sPageInfo`) were un-ported, so a `<xmpGImg:image>` thumbnail
+  // emitted the LITERAL base64 scalar. Per `%sThumbnail`/`%sPageInfo`
+  // (XMP.pm:361-386) the `image` field carries `ValueConv => DecodeBase64`,
+  // which returns a scalar REF ⇒ the value is BINARY and renders as
+  // `(Binary data N bytes, use -b option to extract)` REGARDLESS of length
+  // (unlike the `rdf:datatype="base64"` attribute path, which derefs ≤100-byte
+  // control-free payloads to text). Oracle (bundled `perl exiftool` 13.59,
+  // `-struct`): each struct emits `{Format, Height, Image, Width[, PageNumber]}`
+  // with `Image` the binary placeholder (33 bytes / 5 bytes here).
+  check("XMP_thumbnail.xmp", "XMP_thumbnail.xmp.json", true);
+  check("XMP_thumbnail.xmp", "XMP_thumbnail.xmp.n.json", false);
+}
+
+/// Golden-pattern **L2** projection: an `.xmp` sidecar feeds the normalized
+/// cross-format [`MediaMetadata`](exifast::metadata::MediaMetadata) domain
+/// (XMP is a camera-metadata source per the product scope). Reads the
+/// post-ValueConv (`-n`) form, so values are already machine-ready. Verified
+/// against the `XMP.xmp` / `XMP_gps.xmp` fixtures' `-n` goldens:
+///   * `XMP-tiff:Make` "Canon", `XMP-tiff:Model` "Canon DIGITAL IXUS 40",
+///     `XMP-xmp:CreatorTool` software; `XMP-exif:FocalLength` 5.8,
+///     `XMP-exif:FNumber` 2.8 (lens + capture); `XMP-exif:ExposureTime` 0.4.
+///   * `XMP_gps.xmp`: `XMP-exif:GPSLatitude` 45.5, `GPSLongitude` -122.508…
+///     (already signed decimal degrees in `-n`).
+#[test]
+#[cfg(all(feature = "xmp", feature = "gps"))]
+fn xmp_projects_camera_lens_capture_and_gps_domain() {
+  use exifast::metadata::Project;
+
+  let root = env!("CARGO_MANIFEST_DIR");
+  // --- XMP.xmp: camera / lens / capture ---
+  let data = std::fs::read(format!("{root}/tests/fixtures/XMP.xmp")).expect("read XMP.xmp");
+  let meta = exifast::parse_xmp(&data).expect("XMP.xmp parses");
+  let md = Project::project(&meta);
+
+  let camera = md.camera().expect("camera domain populated");
+  assert_eq!(camera.make(), Some("Canon"));
+  assert_eq!(camera.model(), Some("Canon DIGITAL IXUS 40"));
+  assert_eq!(camera.software(), Some("Adobe Photoshop CS2 Windows"));
+
+  let lens = md.lens().expect("lens domain populated");
+  assert_eq!(lens.focal_length_mm(), Some(5.8));
+  assert_eq!(lens.aperture(), Some(2.8));
+
+  let capture = md.capture().expect("capture domain populated");
+  assert_eq!(capture.exposure_time_s(), Some(0.4));
+  assert_eq!(capture.f_number(), Some(2.8));
+
+  // --- XMP_gps.xmp: GPS (signed decimal degrees from the `-n` ValueConv) ---
+  let gdata =
+    std::fs::read(format!("{root}/tests/fixtures/XMP_gps.xmp")).expect("read XMP_gps.xmp");
+  let gmeta = exifast::parse_xmp(&gdata).expect("XMP_gps.xmp parses");
+  let gmd = Project::project(&gmeta);
+  let gps = gmd.gps().expect("gps domain populated");
+  assert_eq!(gps.latitude(), Some(45.5));
+  // -122.508333…; compare with a tolerance (the `-n` text is full-precision).
+  let lon = gps.longitude().expect("longitude present");
+  assert!(
+    (lon - (-122.508_333_333_333_3)).abs() < 1e-9,
+    "longitude {lon}"
+  );
+}
+
+/// Golden-pattern **L2** projection — GPS altitude SIGN. `XMP-exif:GPSAltitude`
+/// is the UNSIGNED magnitude; `XMP-exif:GPSAltitudeRef` carries the sign
+/// (`0` above / `1` below sea level, XMP.pm:2329-2348). Mirrors the EXIF
+/// projector (`project.rs` `gps_altitude`), which the JSON-level tag value
+/// does NOT (the `-n` tag stays the unsigned `35`); only the domain
+/// projection negates. Oracle (`-n`, both fixtures): `GPSAltitude` 35,
+/// `GPSAltitudeRef` 1 (below) / 0 (above).
+#[test]
+#[cfg(all(feature = "xmp", feature = "gps"))]
+fn xmp_projects_gps_altitude_signed_by_ref() {
+  use exifast::metadata::Project;
+  let root = env!("CARGO_MANIFEST_DIR");
+
+  // Below sea level (ref == 1) ⇒ NEGATIVE magnitude.
+  let below = std::fs::read(format!("{root}/tests/fixtures/XMP_gps_belowsea.xmp"))
+    .expect("read XMP_gps_belowsea.xmp");
+  let bmeta = exifast::parse_xmp(&below).expect("XMP_gps_belowsea.xmp parses");
+  let bmd = Project::project(&bmeta);
+  let bgps = bmd.gps().expect("gps domain populated");
+  assert_eq!(bgps.altitude_m(), Some(-35.0));
+
+  // Above sea level (ref == 0) ⇒ POSITIVE magnitude (positive control).
+  let above = std::fs::read(format!("{root}/tests/fixtures/XMP_gps_abovesea.xmp"))
+    .expect("read XMP_gps_abovesea.xmp");
+  let ameta = exifast::parse_xmp(&above).expect("XMP_gps_abovesea.xmp parses");
+  let amd = Project::project(&ameta);
+  let agps = amd.gps().expect("gps domain populated");
+  assert_eq!(agps.altitude_m(), Some(35.0));
+}
+
+#[test]
+fn xmp_gps_belowsea_conformance() {
+  check("XMP_gps_belowsea.xmp", "XMP_gps_belowsea.xmp.json", true);
+  check("XMP_gps_belowsea.xmp", "XMP_gps_belowsea.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_gps_abovesea_conformance() {
+  check("XMP_gps_abovesea.xmp", "XMP_gps_abovesea.xmp.json", true);
+  check("XMP_gps_abovesea.xmp", "XMP_gps_abovesea.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_no_closing_tag_conformance() {
+  // F2 — the close-scan finds no `</dc:title>` before end-of-data, so
+  // `find_close` returns `CloseErr::NoClosingTag` and the walker raises
+  // `XMP format error (no closing tag for dc:title)` (XMP.pm:3839, emitted via
+  // `$et->Warn` at XMP.pm:4237 on the read path) before `last Element`. The
+  // top-level `rdf:Description` still closes, so this is the ONE parse-error
+  // class whose oracle warning carries NO ` [x$n]` count — the port's single
+  // first-wins warning matches it byte-for-byte. (The unterminated-CDATA /
+  // -comment classes are covered by `xmp_parse_error_warnings_emitted` below:
+  // their bundled oracle appends ` [x2]` because ExifTool re-runs the packet
+  // through the PLIST module after the failed XMP parse — a dual-module
+  // artifact the single-parse port does not and should not reproduce.)
+  check(
+    "XMP_no_closing_tag.xmp",
+    "XMP_no_closing_tag.xmp.json",
+    true,
+  );
+  check(
+    "XMP_no_closing_tag.xmp",
+    "XMP_no_closing_tag.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_uri_fixed_conformance() {
+  // F2 adjacent Warn-site (XMP.pm:3914-3915): the `dc` URI is given WITHOUT its
+  // trailing slash (`…/1.1` vs the canonical `…/1.1/`); the trailing-slash
+  // patch matches the known dc namespace, so the port raises the MINOR warning
+  // `[minor] Fixed incorrect URI for xmlns:dc` (`$et->Warn($_, 1)`) and still
+  // extracts `XMP-dc:Title`. Reachable in DEFAULT extraction (NOT validate-
+  // gated), single warning (no ` [x$n]`), so byte-identical to the oracle.
+  check("XMP_uri_fixed.xmp", "XMP_uri_fixed.xmp.json", true);
+  check("XMP_uri_fixed.xmp", "XMP_uri_fixed.xmp.n.json", false);
+}
+
+#[test]
+fn xmp_uri_double_slash_conformance() {
+  // R9 [medium]: XMP.pm:3911 `$try =~ s{/$}{} or $try .= '/'` toggles EXACTLY
+  // ONE trailing slash. A repairable camera namespace `xmlns:exif=…/exif/1.0//`
+  // (double slash) must drop ONE slash → `…/exif/1.0/` (the known `exif` URI),
+  // raising `[minor] Fixed incorrect URI for xmlns:exif` and still extracting
+  // `XMP-exif:GPSLatitude`/`GPSLongitude`. The earlier `trim_end_matches('/')`
+  // stripped BOTH slashes → `…/exif/1.0` → known-URI lookup miss → the exif/GPS
+  // namespace mis-translated to a temp prefix (camera GPS under the wrong group).
+  check(
+    "XMP_uri_double_slash.xmp",
+    "XMP_uri_double_slash.xmp.json",
+    true,
+  );
+  check(
+    "XMP_uri_double_slash.xmp",
+    "XMP_uri_double_slash.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
+fn xmp_iso_seq_conformance() {
+  // R10 [medium] (premise corrected): bundled ExifTool 13.59 emits a single-item
+  // `exif:ISOSpeedRatings` RDF `Seq` as the ARRAY `XMP-exif:ISO: [100]`
+  // (XMP.pm:2068-2072 `List => 'Seq'` keeps it a list even with one item), NOT
+  // the scalar `100`. The port preserves that faithful shape — this pins the
+  // JSON so the domain-projection fix below does not regress it.
+  check("XMP_iso_seq.xmp", "XMP_iso_seq.xmp.json", true);
+  check("XMP_iso_seq.xmp", "XMP_iso_seq.xmp.n.json", false);
+}
+
+#[test]
+#[cfg(feature = "xmp")]
+fn xmp_projects_iso_from_single_item_seq() {
+  // R10 fix: XMP `ISO` (`List => 'Seq'`) is ALWAYS a list, so the JSON tag is
+  // `[100]`; the normalized `capture.iso` projection must descend the
+  // single-element `rdf:Seq` to the scalar `100` (`domain_numeric`), else every
+  // XMP sidecar loses its ISO in the domain layer.
+  use exifast::metadata::Project;
+  let root = env!("CARGO_MANIFEST_DIR");
+  let data =
+    std::fs::read(format!("{root}/tests/fixtures/XMP_iso_seq.xmp")).expect("read XMP_iso_seq.xmp");
+  let meta = exifast::parse_xmp(&data).expect("XMP_iso_seq.xmp parses");
+  let md = Project::project(&meta);
+  let capture = md.capture().expect("capture settings populated");
+  assert_eq!(capture.iso(), Some(100));
+}
+
+/// F2 — each malformed-XMP parse-error path now raises the matching
+/// `$et->Warn($err)` (XMP.pm:3839/3845/3849, emitted once at XMP.pm:4237 on the
+/// read path) instead of silently `break`ing. Asserts the port surfaces the
+/// EXACT bare warning string as `ExifTool:Warning` for all three close-scan /
+/// scan-level error classes.
+///
+/// `XMP_no_closing_tag.xmp` ALSO has a byte-identical conformance golden
+/// (`xmp_no_closing_tag_conformance`); the other two do NOT, by design: their
+/// bundled oracle appends ` [x2]` because ExifTool, after the failed XMP parse
+/// returns 0 elements, re-runs the SAME packet through the PLIST module
+/// (`PLIST::ProcessPLIST` → `XMP::ProcessXMP`, PLIST.pm:467), so `$et->Warn`
+/// fires twice and the `WAS_WARNED` count loop (ExifTool.pm:3199) emits ` [x2]`.
+/// An unterminated CDATA/comment consumes every following byte (incl. the
+/// ancestor close tags), so NO top-level element can complete ⇒ the first parse
+/// always returns 0 ⇒ the PLIST re-run always fires; the ` [x2]` is therefore
+/// intrinsic to these two classes. The port performs a SINGLE XMP parse and
+/// records ONE first-wins warning (`Walker::warn`, the documented-faithful
+/// analogue of the LAST `$et->Warn` at 4237), so it emits the bare string with
+/// no count. Matching ` [x2]` would require the port to double-process the
+/// packet through PLIST — unfaithful to the single-parse design — so the
+/// emission (the actual fix) is pinned here while the cosmetic count delta is
+/// left as a deliberate, documented divergence.
+#[test]
+#[cfg(feature = "xmp")]
+fn xmp_parse_error_warnings_emitted() {
+  let root = env!("CARGO_MANIFEST_DIR");
+  for (fixture, want) in [
+    (
+      "XMP_no_closing_tag.xmp",
+      "XMP format error (no closing tag for dc:title)",
+    ),
+    ("XMP_missing_cdata_term.xmp", "Missing CDATA terminator"),
+    ("XMP_missing_comment_term.xmp", "Missing comment terminator"),
+  ] {
+    let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))
+      .unwrap_or_else(|e| panic!("read {fixture}: {e}"));
+    let meta = exifast::parse_xmp(&data).unwrap_or_else(|| panic!("{fixture} parses as XMP"));
+    let diags = exifast::diagnostics::Diagnose::diagnostics(&meta);
+    let got: Vec<&str> = diags
+      .iter()
+      .map(exifast::diagnostics::Diagnostic::message)
+      .collect();
+    assert_eq!(
+      got,
+      vec![want],
+      "{fixture}: expected exactly the bare parse-error warning"
+    );
+  }
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

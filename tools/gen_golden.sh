@@ -34,6 +34,12 @@ EXIFTOOL="$(cd "$(dirname "$EXIFTOOL")" && pwd)/$(basename "$EXIFTOOL")"
 mkdir -p "$OUTDIR"
 
 # Stable output: drop filesystem-dependent tags, force C locale & UTC.
+# NOTE: `Composite:*` is NOT excluded globally here — several formats (FLAC,
+# APE, AIFF) legitimately emit ported Composite tags (e.g. Composite:Duration)
+# that their goldens MUST retain. Composite is excluded only per-fixture, via
+# the `EXCLUDE` mechanism below (for QuickTime/Matroska/MPEG, whose Composite
+# tables are a deferred Phase-2 forward item) and auto-applied for the XMP
+# fixtures (which synthesize Composite:* this XMP-only port does not emit).
 COMMON=(-j -G1 -struct -api QuickTimeUTC=1 \
         --FileName --Directory --FileSize --FileModifyDate \
         --FileAccessDate --FileInodeChangeDate --FilePermissions)
@@ -48,10 +54,22 @@ COMMON=(-j -G1 -struct -api QuickTimeUTC=1 \
 # shellcheck disable=SC2206  # intentional word-splitting of the exclusion list
 EXCLUDE_ARR=(${EXCLUDE:-})
 
+# XMP fixtures synthesize `Composite:*` tags (Composite:GPSPosition, …) that
+# the XMP-only port does not emit, so their goldens must drop Composite. Auto-
+# apply the exclusion for any XMP fixture (name starts with `XMP`) so it cannot
+# be forgotten on regen; non-XMP fixtures are unaffected and keep their ported
+# Composite tags. (Idempotent if the caller already passed it via EXCLUDE.)
+case "$FIX" in
+  XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
+esac
+
 # Run from the fixtures dir and pass only the basename so the embedded
 # `SourceFile` is a stable, environment-independent relative path
 # (e.g. "AAC.aac") instead of a machine-specific absolute path that
 # would make the committed goldens non-portable.
-( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" "${EXCLUDE_ARR[@]}"    "$FIX" ) > "$OUT"
-( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" "${EXCLUDE_ARR[@]}" -n "$FIX" ) > "$OUT_N"
+# `${EXCLUDE_ARR[@]+...}` guards the expansion so an EMPTY exclusion array
+# (the common case — e.g. FLAC has no exclusions) does not trip `set -u`
+# "unbound variable" on the bash 3.2 shipped with macOS.
+( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"}    "$FIX" ) > "$OUT"
+( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -n "$FIX" ) > "$OUT_N"
 echo "wrote $OUT and $OUT_N"

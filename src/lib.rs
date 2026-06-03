@@ -193,7 +193,9 @@ pub use diagnostics::{Diagnose, Diagnostic, Severity};
 /// [`AnyMeta`] (`-j`/`-n` mode wrapper) — available with `--features serde`.
 #[cfg(all(feature = "serde", feature = "alloc"))]
 pub use format_parser::Rendered;
-pub use format_parser::{AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, SharedFlags};
+pub use format_parser::{
+  AnyMeta, AnyParser, ExplicitThenLiteral, FileTypeFinalize, OverrideWithMime, SharedFlags,
+};
 
 // Per-format parser-handle re-exports. The `ProcessXxx` unit-struct is the
 // parser handle (carried in `AnyParser`). The typed `Meta<'a>` (+ accessor
@@ -253,6 +255,8 @@ pub use formats::real::ProcessReal;
 pub use formats::red::ProcessR3D;
 #[cfg(feature = "wavpack")]
 pub use formats::wavpack::ProcessWv;
+#[cfg(feature = "xmp")]
+pub use formats::xmp::ProcessXmp;
 
 // ===========================================================================
 // `parse_bytes` — universal dispatch entry
@@ -326,17 +330,20 @@ fn parse_bytes_inner(bytes: &[u8]) -> Option<AnyMeta<'_>> {
     // the BOM that the PLIST `%magicNumber` (ExifTool.pm:1015 `(bplist0|\s*<|…)`)
     // does not, so `XMP` is the first/only candidate; `ProcessXMP` then
     // `SetFileType('PLIST', 'application/xml')` and hands the body to
-    // `PLIST::FoundTag`. This port has no standalone XMP parser, so replicate that
-    // hop here — exactly as `parser::extract_info_typed` does — and dispatch as
-    // `PLIST` so the typed API yields `AnyMeta::Plist` (not silently `None`).
-    // `magic()` stays a faithful 1:1 of `%magicNumber` (the PLIST gate is
-    // unchanged); the BOM tolerance lives only in this XMP→PLIST route, and
-    // `ProcessPlist` itself skips a leading UTF-8 BOM at its XML gate.
+    // `PLIST::FoundTag`. The ported standalone XMP parser
+    // ([`formats::xmp::ProcessXmp`]) REJECTS a `<plist>`-rooted document
+    // (`Ok(None)` — PLIST is a separate module, not an XMP sidecar), so the
+    // relabel MUST happen here at the dispatch layer (exactly as
+    // `parser::extract_info` does): when the candidate is `XMP` and the content
+    // is an XML `<plist>`, dispatch as `PLIST` so the typed API yields
+    // `AnyMeta::Plist` (not silently `None`). A genuine XMP sidecar
+    // (xpacket/xmpmeta/`<rdf:RDF>` root) does NOT satisfy `xml_content_is_plist`,
+    // so it stays `XMP` and dispatches to the XMP parser. `magic()` stays a
+    // faithful 1:1 of `%magicNumber` (the PLIST gate is unchanged); the BOM
+    // tolerance lives only in this XMP→PLIST route, and `ProcessPlist` itself
+    // skips a leading UTF-8 BOM at its XML gate.
     #[cfg(feature = "plist")]
-    let ft = if ft == "XMP"
-      && format_parser::any_parser_for("XMP").is_none()
-      && formats::plist::xml_content_is_plist(bytes)
-    {
+    let ft = if ft == "XMP" && formats::plist::xml_content_is_plist(bytes) {
       "PLIST"
     } else {
       ft
@@ -763,6 +770,19 @@ pub fn parse_wavpack(bytes: &[u8]) -> Option<formats::wavpack::Meta<'_>> {
   // always present here.
   let mut shared = SharedFlags::default();
   formats::wavpack::parse_full_chained(bytes, &mut shared)
+}
+
+/// Parse a standalone XMP / RDF-XML sidecar (`.xmp`) — the lib-direct entry
+/// for [`formats::xmp::parse_borrowed`]. Faithful port of
+/// `Image::ExifTool::XMP::ProcessXMP` (XMP.pm:4262). Returns `None` for any
+/// input bundled `ProcessXMP` rejects with `return 0` (a non-XMP root, a
+/// `<svg`-rooted document, …); a malformed-but-recognized XMP is accepted
+/// with a recorded warning. The returned `XmpMeta<'a>` owns its decoded
+/// strings (the input is transcoded UTF-8/16/32), so `'a` is a phantom.
+#[cfg(feature = "xmp")]
+#[must_use]
+pub fn parse_xmp(bytes: &[u8]) -> Option<formats::xmp::XmpMeta<'_>> {
+  formats::xmp::parse_borrowed(bytes)
 }
 
 // ===========================================================================

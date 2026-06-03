@@ -1,0 +1,12 @@
+[{
+  "SourceFile": "XMP_base64_ctrl.xmp",
+  "ExifTool:ExifToolVersion": 13.58,
+  "File:FileType": "XMP",
+  "File:FileTypeExtension": "XMP",
+  "File:MIMEType": "application/rdf+xml",
+  "XMP-foo:CtrlNul": "(Binary data 1 bytes, use -b option to extract)",
+  "XMP-foo:CtrlVtab": "(Binary data 1 bytes, use -b option to extract)",
+  "XMP-foo:CtrlShiftOut": "(Binary data 1 bytes, use -b option to extract)",
+  "XMP-foo:TextTabNlCr": "\t\n\r",
+  "XMP-foo:TextHello": "hello"
+}]
