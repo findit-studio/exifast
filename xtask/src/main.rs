@@ -2,6 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 
 mod conv_registry;
 mod emit;
+mod exif_conv;
 mod listx;
 
 fn main() -> Result<()> {
@@ -10,7 +11,7 @@ fn main() -> Result<()> {
     Some("gen-tables") => gen_tables(&args[1..]),
     _ => {
       eprintln!(
-        "usage: cargo xtask gen-tables --module <M> --out <path> [--kind field|tagdef] [--check]"
+        "usage: cargo xtask gen-tables --module <M> --out <path> [--kind field|tagdef|exif] [--check]"
       );
       bail!("unknown command");
     }
@@ -47,12 +48,24 @@ fn gen_tables(rest: &[String]) -> Result<()> {
   );
   let xml = String::from_utf8(dump.stdout).context("exiftool -listx emitted non-UTF8")?;
 
-  // `--kind tagdef` → the generic `src/tagtable.rs` `TagDef::new` vocabulary
-  // (single table; `--module` is the `Mod::Table` / `Mod-Table` name, e.g.
+  // `--kind exif` → the EXIF module's hand `ExifTag` / `GpsTag` vocabulary
+  // (`src/exif/tables.rs` / `gps.rs`), RESTRICTED to the ported hand id set
+  // (a Step-A byte-identical shadow — NO new ids). `--module Exif::Main` or
+  // `GPS::Main`. `--kind tagdef` → the generic `src/tagtable.rs` `TagDef::new`
+  // vocabulary (single table; `--module` is `Mod::Table` / `Mod-Table`, e.g.
   // `FLAC::StreamInfo`). Otherwise the XMP `Field` vocabulary: `--module XMP`
   // (the whole group) emits the FULL XMP surface (every `g0='XMP'` table) into
   // one file; any other `--module` (e.g. `XMP-tiff`) is the single-table path.
-  let raw = if kind == "tagdef" {
+  let raw = if kind == "exif" {
+    let table_name = table_name_for_module(module);
+    let model = listx::parse_listx(&xml, &table_name)?;
+    let (exif_kind, allow) = match table_name.as_str() {
+      "Exif::Main" => (emit::ExifKind::Exif, exifast::exif::exif_main_tag_ids()),
+      "GPS::Main" => (emit::ExifKind::Gps, exifast::exif::gps_main_tag_ids()),
+      other => bail!("--kind exif supports only --module Exif::Main / GPS::Main, got `{other}`"),
+    };
+    emit::emit_exif_table(&model, exif_kind, &allow)
+  } else if kind == "tagdef" {
     let table_name = table_name_for_module(module);
     let model = listx::parse_listx(&xml, &table_name)?;
     emit::emit_tagdef_table(&model)

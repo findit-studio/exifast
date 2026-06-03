@@ -137,6 +137,32 @@ fn committed_xmp_table_matches_generator() {
   miri,
   ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
 )]
+fn committed_exif_main_table_matches_generator() {
+  // `%Exif::Main` in the `exif` vocabulary (the Step-A byte-identical shadow,
+  // `src/exif/tables.rs` `ExifTag`). Drift means a 13.x ExifTool bump changed a
+  // ported `Exif::Main` tag NAME or `<values>` map, OR the resolver / HANDPORTED
+  // list in `xtask/src/exif_conv.rs` was edited without regenerating; the hand
+  // table in `src/exif/tables.rs` must then be re-reviewed against bundled.
+  assert_no_drift("Exif::Main", "exif", "src/exif/tables_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_gps_main_table_matches_generator() {
+  // `%GPS::Main` in the `exif` vocabulary (`src/exif/gps.rs` `GpsTag`). Drift
+  // means a 13.x bump changed a GPS tag NAME / map, or `exif_conv.rs` drifted;
+  // re-review `src/exif/gps.rs`.
+  assert_no_drift("GPS::Main", "exif", "src/exif/gps_generated.rs");
+}
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
 fn committed_dsf_table_matches_generator() {
   // `%DSF::Main` in the generic `tagdef` vocabulary (the audio/container tag
   // tables). Drift here means a 13.x ExifTool bump changed `DSF::Main`'s tags /

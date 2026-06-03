@@ -4253,6 +4253,34 @@ fn join_floats(vals: &[f64]) -> String {
 }
 
 // ===========================================================================
+// Table-codegen allowlist accessors (`cargo xtask gen-tables --kind exif`)
+// ===========================================================================
+
+/// The on-disk ids of the ported `%Exif::Main` subset ([`tables::EXIF_TAGS`]),
+/// in table order. The `--kind exif` generator (`xtask`) restricts its
+/// `-listx → ExifTag` shadow to exactly this allowlist (Step A is a
+/// byte-identical shadow of the hand table, adding NO new ids), so the
+/// generated `tables_generated.rs` is a strict subset of the hand table and the
+/// hand-first runtime lookup fallback never fires. `#[doc(hidden)]`: this is the
+/// generator's allowlist source, NOT public API — the hand table itself
+/// (`ExifTag`, with its `const`-init public fields) stays `pub(crate)` per D8.
+#[doc(hidden)]
+#[must_use]
+pub fn exif_main_tag_ids() -> Vec<u16> {
+  tables::EXIF_TAGS.iter().map(|t| t.id).collect()
+}
+
+/// The on-disk ids of the ported `%GPS::Main` table ([`gps::GPS_TAGS`]), in
+/// table order — the `--kind exif` generator's allowlist for `GPS::Main` (see
+/// [`exif_main_tag_ids`]). Gated on `feature = "gps"` (the GPS table is).
+#[cfg(feature = "gps")]
+#[doc(hidden)]
+#[must_use]
+pub fn gps_main_tag_ids() -> Vec<u16> {
+  gps::GPS_TAGS.iter().map(|t| t.id).collect()
+}
+
+// ===========================================================================
 // Unit tests
 // ===========================================================================
 

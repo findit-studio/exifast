@@ -32,6 +32,17 @@
 // no raw slice/index sites; the deny-lint pins that property for the future.
 #![deny(clippy::indexing_slicing)]
 
+// The `--kind exif` generator's Step-A shadow of this table (`cargo xtask
+// gen-tables --module Exif::Main --kind exif`): a strict subset of
+// [`EXIF_TAGS`] re-rendered into the same `ExifTag` rows, each resolved to the
+// SAME [`Conv`] (a per-id differential parity test below is the gate). It is a
+// CHILD module so its HANDPORTED `super::COMPRESSION` / `super::FLASH` / …
+// const references resolve against this module's curated label slices, reusing
+// them byte-for-byte. [`lookup`] consults the hand table FIRST and falls back
+// here; since the shadow is a subset, that fallback only ever AGREES.
+#[path = "tables_generated.rs"]
+mod generated;
+
 // ===========================================================================
 // SubDirectory pointer tags — the IFD-chain seam (Exif.pm:2006/2130/2496/2720)
 // ===========================================================================
@@ -941,9 +952,18 @@ const INTEROP_INDEX: &[(&str, &str)] = &[
 ];
 
 /// Resolve a tag ID against [`EXIF_TAGS`]. `None` for an unknown tag.
+///
+/// The hand [`EXIF_TAGS`] is consulted FIRST; on a miss the `--kind exif`
+/// generated shadow ([`generated::lookup`]) is the fallback. Step A's shadow is
+/// a strict subset of the hand table, so this fallback is currently inert (it
+/// can only ever return an entry the hand table already has) — the wiring is in
+/// place for Step B, when the generator adds tags BEYOND the hand set.
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static ExifTag> {
-  EXIF_TAGS.iter().find(|t| t.id == id)
+  EXIF_TAGS
+    .iter()
+    .find(|t| t.id == id)
+    .or_else(|| generated::lookup(id))
 }
 
 /// The tag-table READ-side `Format` override (`$$tagInfo{Format}`,
@@ -1134,5 +1154,32 @@ mod tests {
     assert_eq!(label_for(ORIENTATION, 1), Some("Horizontal (normal)"));
     assert_eq!(label_for(COMPRESSION, 5), Some("LZW"));
     assert_eq!(label_for(COMPRESSION, 99999), None);
+  }
+
+  /// THE PARITY PROOF (table-codegen Step A): the `--kind exif` generated shadow
+  /// (`tables_generated.rs`) must reproduce EVERY hand [`EXIF_TAGS`] row
+  /// byte-identically — same NAME and same [`Conv`] (slice contents and all).
+  /// This is what de-risks the emitter: the generated table is a verified
+  /// shadow of the hand table, so a future Step B can extend it with confidence.
+  #[test]
+  fn generated_shadow_matches_hand_table() {
+    for hand in EXIF_TAGS {
+      let shadow = generated::lookup(hand.id).unwrap_or_else(|| {
+        panic!(
+          "generated shadow is MISSING hand id {:#06x} ({})",
+          hand.id, hand.name
+        )
+      });
+      assert_eq!(
+        shadow.name, hand.name,
+        "name mismatch at id {:#06x}: generated={:?} hand={:?}",
+        hand.id, shadow.name, hand.name
+      );
+      assert_eq!(
+        shadow.conv, hand.conv,
+        "conv mismatch at id {:#06x} ({}): generated={:?} hand={:?}",
+        hand.id, hand.name, shadow.conv, hand.conv
+      );
+    }
   }
 }
