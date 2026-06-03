@@ -3701,7 +3701,17 @@ fn resolve_field(table: Option<NsTable>, id: &TagId, ns: &str) -> Option<&'stati
     }
   }
 
-  lookup_field(&table?, key)
+  let table = table?;
+  // The xtask-GENERATED table keys a struct field by its FLATTENED `FoundXMP`
+  // id (XMP.pm:3495-3516 — e.g. `DerivedFromMaskMarkers` for the nested
+  // `xmpMM:DerivedFrom/stRef:maskMarkers`), NOT the innermost child name. So a
+  // nested structured input must look up `id.tag` (the flattened id, = the
+  // emitted tag id) to reach the generated `Field`'s PrintConv/Writable;
+  // otherwise the generated layer is effective only for the FLAT spelling and
+  // the structured form falls back to raw. Fall back to the innermost `key`
+  // (for a plain tag `id.tag == key`, so the `.or_else` is a no-op, and it
+  // preserves any innermost-name match the hand path relied on).
+  lookup_field(&table, id.tag.as_str()).or_else(|| lookup_field(&table, key))
 }
 
 /// Result of the XMPAutoConv + ValueConv pass — carries the post-ValueConv

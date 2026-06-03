@@ -9444,6 +9444,29 @@ fn xmp_generated_xmpmm_media_management_conformance() {
 }
 
 #[test]
+fn xmp_generated_nested_struct_field_conformance() {
+  // Codex R1 [high]: a NESTED structured `xmpMM:DerivedFrom/stRef:maskMarkers`
+  // (vs the flat `DerivedFromMaskMarkers` spelling) must reach the GENERATED
+  // flattened field's PrintConv. ExifTool flattens to `DerivedFromMaskMarkers`
+  // (XMP.pm:3495-3516) and applies its `%sResourceRef` `maskMarkers` PrintConv
+  // (XMP.pm:321 `{All,None}`); an unmapped value renders `Unknown (Frobnicate)`
+  // (ExifTool.pm:3622). Pre-fix `resolve_field` looked up the innermost
+  // `maskMarkers` and missed the flattened generated field → raw passthrough;
+  // the fix looks up the flattened `id.tag` first. Pins the structured-form
+  // PrintConv-miss so the generated layer works for nested (not just flat) XMP.
+  check(
+    "XMP_gen_nested_struct.xmp",
+    "XMP_gen_nested_struct.xmp.json",
+    true,
+  );
+  check(
+    "XMP_gen_nested_struct.xmp",
+    "XMP_gen_nested_struct.xmp.n.json",
+    false,
+  );
+}
+
+#[test]
 fn xmp_generated_covered_namespace_extra_tags_conformance() {
   // The ADDITIVE fallback in a HAND-COVERED namespace + Name remaps in a new
   // one: `exif:OECFColumns` / `exif:SpatialFrequencyResponseRows` are flattened

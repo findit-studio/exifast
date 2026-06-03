@@ -236,7 +236,7 @@ const NOT_ACTIVE: &[&str] = &[
 /// `P::Unported` faithful raw passthrough). Every PRE-EXISTING golden stays
 /// byte-identical (the additive invariant); exhaustive per-tag coverage of all
 /// ~4262 generated tags is a tracked follow-up.
-const EXPECTED_ACTIVE_FIXTURES: usize = 402;
+const EXPECTED_ACTIVE_FIXTURES: usize = 403;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
