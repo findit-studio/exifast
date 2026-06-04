@@ -24,6 +24,19 @@ use crate::{
   value::{Metadata, TagValue},
 };
 
+/// The xtask-GENERATED `%AAC::Main` table (`cargo xtask gen-tables --kind
+/// tagdef --module AAC::Main`), transcribed from `exiftool -listx`. Consulted
+/// by [`aac_get`] ONLY as the ADDITIVE fallback — the hand-written `static`s
+/// below shadow every key they define (hand wins on collision). This is
+/// load-bearing for `SampleRate`: `-listx` carries no `<values>` for a
+/// code-valued *ValueConv*, so the generated twin has `ValueConv::None` and
+/// would DROP the `%convSampleRate` index→Hz map; the hand `SAMPLE_RATE` (with
+/// its `ValueConv::Hash`) wins, so output is byte-identical. The generated
+/// table contributes 0 new tags and exists as the drift guard
+/// (`tests/xtask_check.rs`) against a future ExifTool-version change.
+#[path = "aac_generated.rs"]
+mod generated;
+
 /// `%convSampleRate` (AAC.pm:18-26) as a hash ValueConv (string keys —
 /// ExifTool indexes the conv hash with the stringified `$val`).
 const CONV_SAMPLE_RATE: &[(&str, PrintValue)] = &[
@@ -80,13 +93,20 @@ static CHANNELS: TagDef = TagDef::new(
 static ENCODER: TagDef = TagDef::new("Encoder", "AAC", ValueConv::None, PrintConv::None);
 
 fn aac_get(id: TagId) -> Option<&'static TagDef> {
-  match id {
+  // Hand-first (the additive-codegen invariant, mirroring XMP `lookup_field`):
+  // the hand `static`s WIN on every key they define. Critically `SAMPLE_RATE`
+  // carries a `ValueConv::Hash` (`%convSampleRate`) that `-listx` cannot
+  // express, so the hand entry must shadow its `ValueConv::None` generated twin
+  // — guaranteeing no byte change. The generated layer is complete for the 4
+  // `%AAC::Main` ids, so [`generated::get`] never fires; it is the drift guard.
+  let hand = match id {
     TagId::Str("Bit016-017") => Some(&PROFILE_TYPE),
     TagId::Str("Bit018-021") => Some(&SAMPLE_RATE),
     TagId::Str("Bit023-025") => Some(&CHANNELS),
     TagId::Str("Encoder") => Some(&ENCODER),
     _ => None,
-  }
+  };
+  hand.or_else(|| generated::get(id))
 }
 
 /// `%AAC::Main` (AAC.pm:28). family-0 group "AAC"; family-1 "AAC" (`-G1` ⇒

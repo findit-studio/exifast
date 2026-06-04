@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_composite_exposure_edge.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "ExifIFD:CompositeImageExposureTimes": "1/9 undef 1/250 1/320 1/400 1/500 1/640 3 2 1/160 1/200"
+}]

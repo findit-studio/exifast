@@ -58,6 +58,24 @@ use crate::{
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
+/// xtask-GENERATED `%Vorbis::Comments` table (`cargo xtask gen-tables --kind
+/// tagdef --module Vorbis::Comments`) — DRIFT-GUARD ONLY (no wire). OGG's hand
+/// lookup [`vorbis_comment_known`] is keyed by a RUNTIME `&str` (the parsed,
+/// uppercased Vorbis comment key — a transient borrow), whereas the generated
+/// `get` is keyed by `TagId::Str(&'static str)`; the two key shapes do not
+/// compose without an owned-string bridge, so wiring a fallback is not clean.
+/// It would also be inert: the hand `vorbis_comment_known` already covers a
+/// SUPERSET of the generated keys (32 ⊇ the 31 `-listx` rows — the hand layer
+/// additionally resolves `COVERART` via a base64 ValueConv and carries the
+/// `.with_list(true)` flags `-listx` cannot express), so a fallback would never
+/// fire. The committed table therefore exists solely as the drift guard
+/// (`tests/xtask_check.rs`), failing if a future ExifTool version shifts
+/// `%Vorbis::Comments`. `#[allow(dead_code)]` because `get` has no caller by
+/// design.
+#[path = "ogg_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // ===========================================================================
 // Constants from Ogg.pm
 // ===========================================================================

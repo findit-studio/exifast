@@ -32,6 +32,21 @@
 // no raw slice/index sites; the deny-lint pins that property for the future.
 #![deny(clippy::indexing_slicing)]
 
+// The `--kind exif` generator's shadow of this table (`cargo xtask gen-tables
+// --module Exif::Main --kind exif`): every [`EXIF_TAGS`] row re-rendered into
+// the same `ExifTag` row, each resolved to the SAME [`Conv`] (a per-id
+// differential parity test below is the gate), PLUS the binary-EXIF
+// coverage-gap ids ([`crate::exif::EXIF_MAIN_GAP_IDS`]) — `%Exif::Main` leaf
+// tags this hand subset does NOT carry. It is a CHILD module so its HANDPORTED
+// `super::COMPRESSION` / `super::FLASH` / … const references resolve against
+// this module's curated label slices, reusing them byte-for-byte. [`lookup`]
+// consults the hand table FIRST and falls back here: a SHARED id always AGREES
+// with the hand entry, and a gap id (absent from [`EXIF_TAGS`]) is the only one
+// this fallback actually returns — i.e. the hand table is a strict SUBSET of
+// the generated shadow.
+#[path = "tables_generated.rs"]
+mod generated;
+
 // ===========================================================================
 // SubDirectory pointer tags — the IFD-chain seam (Exif.pm:2006/2130/2496/2720)
 // ===========================================================================
@@ -152,6 +167,23 @@ pub enum Conv {
   /// `GPSAltitude`-style — PrintConv `"$val m"` unless the value is
   /// `inf`/`undef` (`Exif.pm:2388-2389`, `GPS.pm:119`).
   MetersSuffix,
+  /// `AmbientTemperature` (0x9400) PrintConv — `'"$val C"'` (`Exif.pm:2590`).
+  /// A `rational64s`; the post-ValueConv scalar (0x9400 has no ValueConv) is
+  /// interpolated verbatim with a trailing ` C` (e.g. `23.5` → `"23.5 C"`,
+  /// `-5.5` → `"-5.5 C"`). Unlike [`Conv::MetersSuffix`] there is NO
+  /// `inf`/`undef` guard in `Exif.pm`, so the suffix is appended
+  /// unconditionally. With print_conv OFF the bare raw scalar is emitted.
+  CelsiusSuffix,
+  /// `CompositeImageExposureTimes` (0xa462) — `Writable => 'undef'` with a
+  /// bespoke `RawConv`/`PrintConv` pair (`Exif.pm:3068-3119`). The `undef`
+  /// blob is decoded as a sequence of `rational64u` quotients EXCEPT at byte
+  /// offsets 56 and 58 (the 8th and 9th values, indices 7 and 8) which are
+  /// `int16u` counts — `RawConv` (`Exif.pm:3079-3098`) reads each in turn
+  /// until the bytes run out and space-joins them (so `-n` shows the joined
+  /// decimals). The `PrintConv` (`Exif.pm:3104-3115`) then applies
+  /// [`print_exposure_time`] to every element EXCEPT indices 7 and 8 (the
+  /// counts), space-joined (so `-j` shows e.g. `"1/160 1/200 … 3 2 …"`).
+  CompositeImageExposureTimes,
   /// `UserComment` (0x9286) `RawConv` — `ConvertExifText($self,$val,1,$tag)`
   /// (`Exif.pm:2502`, impl `Exif.pm:5554-5601`). The `undef`-format value
   /// carries an 8-byte charset-ID prefix (`ASCII`/`UNICODE`/`JIS`/all-NUL)
@@ -941,9 +973,20 @@ const INTEROP_INDEX: &[(&str, &str)] = &[
 ];
 
 /// Resolve a tag ID against [`EXIF_TAGS`]. `None` for an unknown tag.
+///
+/// The hand [`EXIF_TAGS`] is consulted FIRST; on a miss the `--kind exif`
+/// generated shadow ([`generated::lookup`]) is the fallback. A SHARED id
+/// resolves identically in both (the differential parity test pins that), so
+/// the fallback only matters for the Step-B binary-EXIF coverage-gap ids
+/// ([`crate::exif::EXIF_MAIN_GAP_IDS`]) — `%Exif::Main` leaf tags absent from
+/// the hand subset, which the generator emits and this fallback returns so they
+/// are no longer dropped on the binary IFD path.
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static ExifTag> {
-  EXIF_TAGS.iter().find(|t| t.id == id)
+  EXIF_TAGS
+    .iter()
+    .find(|t| t.id == id)
+    .or_else(|| generated::lookup(id))
 }
 
 /// The tag-table READ-side `Format` override (`$$tagInfo{Format}`,
@@ -1134,5 +1177,32 @@ mod tests {
     assert_eq!(label_for(ORIENTATION, 1), Some("Horizontal (normal)"));
     assert_eq!(label_for(COMPRESSION, 5), Some("LZW"));
     assert_eq!(label_for(COMPRESSION, 99999), None);
+  }
+
+  /// THE PARITY PROOF (table-codegen Step A): the `--kind exif` generated shadow
+  /// (`tables_generated.rs`) must reproduce EVERY hand [`EXIF_TAGS`] row
+  /// byte-identically — same NAME and same [`Conv`] (slice contents and all).
+  /// This is what de-risks the emitter: the generated table is a verified
+  /// shadow of the hand table, so a future Step B can extend it with confidence.
+  #[test]
+  fn generated_shadow_matches_hand_table() {
+    for hand in EXIF_TAGS {
+      let shadow = generated::lookup(hand.id).unwrap_or_else(|| {
+        panic!(
+          "generated shadow is MISSING hand id {:#06x} ({})",
+          hand.id, hand.name
+        )
+      });
+      assert_eq!(
+        shadow.name, hand.name,
+        "name mismatch at id {:#06x}: generated={:?} hand={:?}",
+        hand.id, shadow.name, hand.name
+      );
+      assert_eq!(
+        shadow.conv, hand.conv,
+        "conv mismatch at id {:#06x} ({}): generated={:?} hand={:?}",
+        hand.id, hand.name, shadow.conv, hand.conv
+      );
+    }
   }
 }

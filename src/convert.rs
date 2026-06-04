@@ -152,7 +152,10 @@ pub fn apply_ctx(
     );
   }
   let valued = match def.value_conv() {
-    ValueConv::None => raw.clone(),
+    // `Unported` = faithful raw passthrough for a code-valued ValueConv the
+    // `xtask` TagDef emitter flagged but we have not hand-ported (identical to
+    // `None`); never a guessed conversion.
+    ValueConv::None | ValueConv::Unported(_) => raw.clone(),
     ValueConv::Func(f) => f(raw),
     ValueConv::FuncCtx(f) => f(raw, ctx),
     ValueConv::Hash(h) => apply_hash_conv(def, &h, raw, ConvType::ValueConv),
@@ -186,7 +189,10 @@ fn apply_print_conv(
     );
   }
   match conv {
-    PrintConv::None => valued.clone(),
+    // `Unported` = faithful raw passthrough for a code-valued PrintConv the
+    // `xtask` TagDef emitter flagged but we have not hand-ported (identical to
+    // `None`); renders the value verbatim rather than guessing.
+    PrintConv::None | PrintConv::Unported(_) => valued.clone(),
     PrintConv::Func(f) => f(valued),
     PrintConv::FuncCtx(f) => f(valued, ctx),
     PrintConv::Hash(h) => apply_hash_conv(def, &h, valued, conv_type),
@@ -1761,6 +1767,34 @@ mod tests {
       apply(&FUNC_DEF, &list, true),
       TagValue::List(vec![TagValue::Str("A".into()), TagValue::Str("B".into()),])
     );
+  }
+
+  #[test]
+  fn unported_conv_is_raw_passthrough_in_both_stages() {
+    // `PrintConv::Unported` / `ValueConv::Unported` (the `xtask` TagDef-mode
+    // marker for a code-valued conv we have not hand-ported) MUST render the
+    // raw value verbatim — identical to `None`, never a guessed conversion.
+    static PC: TagDef = TagDef::new("T", "X", ValueConv::None, PrintConv::Unported("Mod:T"));
+    // PrintConv stage passthrough (print enabled): value unchanged.
+    assert_eq!(
+      apply(&PC, &TagValue::Str("verbatim".into()), true),
+      TagValue::Str("verbatim".into())
+    );
+    assert_eq!(apply(&PC, &TagValue::I64(42), true), TagValue::I64(42));
+
+    // ValueConv stage passthrough: with print DISABLED (`-n`) the raw value is
+    // forwarded unchanged through the unported value conv.
+    static VC: TagDef = TagDef::new("U", "X", ValueConv::Unported("Mod:U"), PrintConv::None);
+    assert_eq!(apply(&VC, &TagValue::I64(7), false), TagValue::I64(7));
+    // And combined with print enabled (both stages passthrough).
+    assert_eq!(
+      apply(&VC, &TagValue::Str("raw".into()), true),
+      TagValue::Str("raw".into())
+    );
+
+    // Passthrough is element-wise over a list, like every other conv kind.
+    let list = TagValue::List(vec![TagValue::I64(1), TagValue::I64(2)]);
+    assert_eq!(apply(&PC, &list, true), list);
   }
 
   #[test]

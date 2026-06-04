@@ -20,6 +20,25 @@ use crate::{
   value::{TagValue, format_g},
 };
 
+/// xtask-GENERATED `%DV::Main` table (`cargo xtask gen-tables --kind tagdef
+/// --module DV::Main`) — DRIFT-GUARD ONLY (no wire). DV emits through the typed
+/// [`Meta`] / [`crate::emit::Taggable`] path, which iterates the fixed
+/// [`DV_TAGS`] order and pulls each value straight from the matched
+/// [`Profile`]; the [`DV_MAIN`] / [`dv_get`] lookup is consulted ONLY by a
+/// self-consistency test, never on the emission path. Even though `dv_get` is a
+/// flat `TagId::Str` map a generated `get` could syntactically fall through
+/// into, a wire would be inert (the lookup is never called when emitting), and
+/// LOAD-BEARING: `-listx` carries no ValueConv/PrintConv expression, so the
+/// generated twins of `Duration` (`ConvertDuration`), `TotalBitrate`
+/// (`ConvertBitrate`), `FrameRate` (`int($val*1000+0.5)/1000`) and
+/// `DateTimeOriginal` (`ConvertDateTime`) are bare `PrintConv::None` and would
+/// REGRESS those fields if they won. The committed table exists solely so
+/// `tests/xtask_check.rs` fails if a future ExifTool version shifts `%DV::Main`;
+/// `#[allow(dead_code)]` because `get` has no caller by design.
+#[path = "dv_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 /// One row of `@dvProfiles` (DV.pm:21-113). All fields are derived
 /// directly from the Perl table; `frame_rate_num`/`frame_rate_den` carry
 /// the Perl rational so the post-`int($val*1000+0.5)/1000` PrintConv lands

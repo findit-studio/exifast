@@ -88,7 +88,7 @@ pub(crate) fn render_value(raw: &RawValue, mode: ConvMode) -> TagValue {
         .into(),
     ),
     // ---- string / bytes ---------------------------------------------------
-    RawValue::Text(s) => TagValue::Str(s.as_str().into()),
+    RawValue::Text { text, .. } => TagValue::Str(text.as_str().into()),
     RawValue::Bytes(b) => TagValue::Bytes(b.clone()),
   }
 }
@@ -199,7 +199,13 @@ mod tests {
   #[test]
   fn render_string_and_bytes_passthrough() {
     assert_eq!(
-      render_value(&RawValue::Text("Canon".to_string()), ConvMode::PrintConv),
+      render_value(
+        &RawValue::Text {
+          text: "Canon".to_string(),
+          raw: b"Canon"[..].into(),
+        },
+        ConvMode::PrintConv
+      ),
       TagValue::Str("Canon".into())
     );
     assert_eq!(

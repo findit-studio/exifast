@@ -2,6 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 
 mod conv_registry;
 mod emit;
+mod exif_conv;
 mod listx;
 
 fn main() -> Result<()> {
@@ -9,7 +10,9 @@ fn main() -> Result<()> {
   match args.first().map(String::as_str) {
     Some("gen-tables") => gen_tables(&args[1..]),
     _ => {
-      eprintln!("usage: cargo xtask gen-tables --module <M> --out <path> [--check]");
+      eprintln!(
+        "usage: cargo xtask gen-tables --module <M> --out <path> [--kind field|tagdef|exif] [--check]"
+      );
       bail!("unknown command");
     }
   }
@@ -28,6 +31,10 @@ fn gen_tables(rest: &[String]) -> Result<()> {
   let module = flag(rest, "--module").context("--module required")?;
   let out = flag(rest, "--out").context("--out required")?;
   let check = rest.iter().any(|a| a == "--check");
+  // `--kind` selects the emit VOCABULARY: `field` (default) → the XMP
+  // `Field::make` surface; `tagdef` → the generic `src/tagtable.rs`
+  // `TagDef::new` surface used by the audio/container tag-table formats.
+  let kind = flag(rest, "--kind").unwrap_or("field");
 
   let exiftool = std::env::var("EXIFTOOL").unwrap_or_else(|_| "exiftool".into());
   let dump = std::process::Command::new(&exiftool)
@@ -41,10 +48,28 @@ fn gen_tables(rest: &[String]) -> Result<()> {
   );
   let xml = String::from_utf8(dump.stdout).context("exiftool -listx emitted non-UTF8")?;
 
-  // `--module XMP` (the whole group) → emit the FULL XMP surface (every
-  // `g0='XMP'` table) into one file; any other `--module` (e.g. `XMP-tiff`) →
-  // the single-table path.
-  let raw = if module == "XMP" {
+  // `--kind exif` → the EXIF module's hand `ExifTag` / `GpsTag` vocabulary
+  // (`src/exif/tables.rs` / `gps.rs`), RESTRICTED to the ported hand id set
+  // (a Step-A byte-identical shadow — NO new ids). `--module Exif::Main` or
+  // `GPS::Main`. `--kind tagdef` → the generic `src/tagtable.rs` `TagDef::new`
+  // vocabulary (single table; `--module` is `Mod::Table` / `Mod-Table`, e.g.
+  // `FLAC::StreamInfo`). Otherwise the XMP `Field` vocabulary: `--module XMP`
+  // (the whole group) emits the FULL XMP surface (every `g0='XMP'` table) into
+  // one file; any other `--module` (e.g. `XMP-tiff`) is the single-table path.
+  let raw = if kind == "exif" {
+    let table_name = table_name_for_module(module);
+    let model = listx::parse_listx(&xml, &table_name)?;
+    let (exif_kind, allow) = match table_name.as_str() {
+      "Exif::Main" => (emit::ExifKind::Exif, exifast::exif::exif_main_tag_ids()),
+      "GPS::Main" => (emit::ExifKind::Gps, exifast::exif::gps_main_tag_ids()),
+      other => bail!("--kind exif supports only --module Exif::Main / GPS::Main, got `{other}`"),
+    };
+    emit::emit_exif_table(&model, exif_kind, &allow)
+  } else if kind == "tagdef" {
+    let table_name = table_name_for_module(module);
+    let model = listx::parse_listx(&xml, &table_name)?;
+    emit::emit_tagdef_table(&model)
+  } else if module == "XMP" {
     let tables = listx::parse_all_xmp_listx(&xml)?;
     ensure!(
       !tables.is_empty(),

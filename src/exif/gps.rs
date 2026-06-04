@@ -34,6 +34,17 @@
 
 use crate::exif::tables::Conv;
 
+// The `--kind exif` generator's Step-A shadow of this table (`cargo xtask
+// gen-tables --module GPS::Main --kind exif`): a strict subset of [`GPS_TAGS`]
+// re-rendered into the same `GpsTag` rows, each resolved to the SAME
+// [`GpsConv`] (a per-id differential parity test below is the gate). It is a
+// CHILD module so its HANDPORTED `super::GPS_MEASURE_MODE` const reference (and
+// the `super::Conv` / `super::GpsConv` imports) resolve against THIS module.
+// [`lookup`] consults the hand table FIRST and falls back here; the shadow is a
+// subset, so that fallback only ever AGREES.
+#[path = "gps_generated.rs"]
+mod generated;
+
 // ===========================================================================
 // GPS-specific PrintConv hashes (GPS.pm)
 // ===========================================================================
@@ -293,9 +304,17 @@ pub const GPS_TAGS: &[GpsTag] = &[
 ];
 
 /// Resolve a GPS tag ID against [`GPS_TAGS`]. `None` for an unknown ID.
+///
+/// The hand [`GPS_TAGS`] is consulted FIRST; on a miss the `--kind exif`
+/// generated shadow ([`generated::lookup`]) is the fallback. Step A's shadow is
+/// a strict subset of the hand table, so this fallback is currently inert — the
+/// wiring is in place for a future Step B that adds GPS tags beyond the hand set.
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static GpsTag> {
-  GPS_TAGS.iter().find(|t| t.id == id)
+  GPS_TAGS
+    .iter()
+    .find(|t| t.id == id)
+    .or_else(|| generated::lookup(id))
 }
 
 /// The READ-side `Format` override (`$$tagInfo{Format}`, `Exif.pm:6729`)
@@ -740,5 +759,30 @@ mod tests {
     assert_eq!(exif_date("justtext"), "justtext");
     // Trailing non-digits after a date ⇒ no end-anchored match ⇒ unchanged.
     assert_eq!(exif_date("20031022extra"), "20031022extra");
+  }
+
+  /// THE PARITY PROOF (table-codegen Step A): the `--kind exif` generated GPS
+  /// shadow (`gps_generated.rs`) must reproduce EVERY hand [`GPS_TAGS`] row
+  /// byte-identically — same NAME and same [`GpsConv`] (slice contents and all).
+  #[test]
+  fn generated_shadow_matches_hand_table() {
+    for hand in GPS_TAGS {
+      let shadow = generated::lookup(hand.id).unwrap_or_else(|| {
+        panic!(
+          "generated GPS shadow is MISSING hand id {:#06x} ({})",
+          hand.id, hand.name
+        )
+      });
+      assert_eq!(
+        shadow.name, hand.name,
+        "name mismatch at id {:#06x}: generated={:?} hand={:?}",
+        hand.id, shadow.name, hand.name
+      );
+      assert_eq!(
+        shadow.conv, hand.conv,
+        "conv mismatch at id {:#06x} ({}): generated={:?} hand={:?}",
+        hand.id, hand.name, shadow.conv, hand.conv
+      );
+    }
   }
 }

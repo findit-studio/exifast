@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_ambient_wrongfmt.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "ExifIFD:AmbientTemperature": -5.5
+}]

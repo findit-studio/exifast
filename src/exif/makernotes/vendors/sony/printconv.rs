@@ -543,7 +543,7 @@ impl SonyPrintConv {
         // passthrough — Sony writes these as English codes regardless of UI
         // language. Map the known short codes; pass anything else through.
         let s = match raw {
-          RawValue::Text(s) => s.as_str(),
+          RawValue::Text { text: s, .. } => s.as_str(),
           _ => return raw_to_tag_value(raw),
         };
         if !print_conv {
@@ -955,7 +955,7 @@ fn serial_number_2031(raw: &RawValue, print_conv: bool) -> TagValue {
   // Source `$val` is the raw `string`-tag text (NUL-trimmed, as ExifTool
   // stores the string value).
   let src: String = match raw {
-    RawValue::Text(s) => s.as_str().to_string(),
+    RawValue::Text { text: s, .. } => s.as_str().to_string(),
     RawValue::Bytes(b) => {
       let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
       // `end <= b.len()` by construction, so `.get(..end)` is `Some` — the
@@ -2369,7 +2369,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Text(s) => TagValue::Str(s.as_str().into()),
+    RawValue::Text { text: s, .. } => TagValue::Str(s.as_str().into()),
     RawValue::Bytes(b) => TagValue::Bytes(b.clone()),
   }
 }
@@ -2589,7 +2589,10 @@ mod tests {
   #[test]
   fn serial_number_2031_reverses_and_pads() {
     // raw "12345678" → reverse pairs → "78563412" (no leading 0 to strip).
-    let raw = RawValue::Text("12345678".into());
+    let raw = RawValue::Text {
+      text: "12345678".into(),
+      raw: b"12345678"[..].into(),
+    };
     assert_eq!(
       SonyPrintConv::SerialNumber2031.apply(&raw, false),
       TagValue::Str("78563412".into()),
@@ -2607,7 +2610,10 @@ mod tests {
   /// `sprintf("%.8d")` re-pads → "03020100" (`-j`).
   #[test]
   fn serial_number_2031_strips_leading_zero_then_repads() {
-    let raw = RawValue::Text("00010203".into());
+    let raw = RawValue::Text {
+      text: "00010203".into(),
+      raw: b"00010203"[..].into(),
+    };
     assert_eq!(
       SonyPrintConv::SerialNumber2031.apply(&raw, false),
       TagValue::Str("3020100".into()),

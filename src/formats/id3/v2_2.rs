@@ -13,6 +13,18 @@ use crate::{
   tagtable::{PrintConv, PrintConvHash, PrintValue, TagDef, TagId, TagTable, ValueConv},
 };
 
+/// xtask-GENERATED `%ID3::v2_2` table (`cargo xtask gen-tables --kind tagdef
+/// --module ID3::v2_2`) — DRIFT-GUARD ONLY (no wire). v2.2 frames emit through
+/// the hand [`v2_2_get`] lookup + `text::make_tag_name` / SubDirectory routing,
+/// the authoritative frame-id table this file already defines; the generated
+/// `get` is a parallel copy with no caller — `#[allow(dead_code)]`. The
+/// committed table exists solely so `tests/xtask_check.rs` fails if a future
+/// ExifTool version shifts `%v2_2`. (The hand layer is a SUPERSET — it also
+/// routes the SubDirectory `SLT` frame `-listx` flattens differently.)
+#[path = "v2_2_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // Every TagDef in this module shares family-0 "ID3" / family-1 "ID3v2_2".
 
 macro_rules! text_tag {

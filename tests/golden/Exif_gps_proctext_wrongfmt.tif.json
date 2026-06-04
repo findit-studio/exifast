@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_gps_proctext_wrongfmt.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Little-endian (Intel, II)",
+  "GPS:GPSProcessingMethod": "Manual"
+}]

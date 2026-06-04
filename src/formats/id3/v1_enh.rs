@@ -35,6 +35,17 @@ use crate::{
 };
 use smol_str::SmolStr;
 
+/// xtask-GENERATED `%ID3::v1_Enh` table (`cargo xtask gen-tables --kind tagdef
+/// --module ID3::v1_Enh`) — DRIFT-GUARD ONLY (no wire). The Enhanced-TAG
+/// trailer emits through the hand binary-table walk in [`process_id3v1_enh`]
+/// (the `%v1_Enh` field set keyed by byte offset), not a flat [`TagId`] lookup,
+/// so the generated `get` has no emission caller — `#[allow(dead_code)]`. The
+/// committed table exists solely so `tests/xtask_check.rs` fails if a future
+/// ExifTool version shifts `%v1_Enh`.
+#[path = "v1_enh_generated.rs"]
+#[allow(dead_code)]
+mod generated;
+
 // ID3.pm:402-411 — `Speed` PrintConv map.
 const SPEED_ENTRIES: &[(&str, PrintValue)] = &[
   ("1", PrintValue::Str("Slow")),

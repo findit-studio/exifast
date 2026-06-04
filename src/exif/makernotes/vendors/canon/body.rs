@@ -173,10 +173,13 @@ pub fn walk_canon_in_tiff(
           .map_or(0, |i| i + 1);
         // `end` is `rposition + 1` (≤ len) or 0, so `nul_trimmed.get(..end)` is
         // `Some` — the checked, byte-identical form of `&nul_trimmed[..end]`.
-        raw = RawValue::Text(
-          std::string::String::from_utf8_lossy(nul_trimmed.get(..end).unwrap_or(nul_trimmed))
-            .into_owned(),
-        );
+        let stripped = nul_trimmed.get(..end).unwrap_or(nul_trimmed);
+        // `stripped` is ExifTool's post-RawConv `$val` bytes; retain them so a
+        // byte-walking conv reads the original bytes, not the lossy decode.
+        raw = RawValue::Text {
+          text: std::string::String::from_utf8_lossy(stripped).into_owned(),
+          raw: stripped.into(),
+        };
       }
     }
     out.push(CanonEntry {
@@ -252,7 +255,7 @@ mod tests {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tag_id, 0x0006);
     match &entries[0].value {
-      RawValue::Text(s) => assert_eq!(s, "Canon EOS X"),
+      RawValue::Text { text: s, .. } => assert_eq!(s, "Canon EOS X"),
       other => panic!("expected Text, got {other:?}"),
     }
   }
@@ -286,7 +289,7 @@ mod tests {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tag_id, 0x96);
     match &entries[0].value {
-      RawValue::Text(s) => {
+      RawValue::Text { text: s, .. } => {
         assert_eq!(s, "ABC123");
         assert!(!s.contains('\u{fffd}'), "must not contain U+FFFD: {s:?}");
         assert!(!s.ends_with('\u{00ff}'));
@@ -339,7 +342,7 @@ mod tests {
   fn internal_serial_number_clean_value_unchanged() {
     let entries = walk_canon_body(&body_with_0x96(b"H1234567"), ByteOrder::Little, None);
     match &entries[0].value {
-      RawValue::Text(s) => assert_eq!(s, "H1234567"),
+      RawValue::Text { text: s, .. } => assert_eq!(s, "H1234567"),
       other => panic!("expected Text, got {other:?}"),
     }
   }

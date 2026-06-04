@@ -190,7 +190,7 @@ mod tests {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tag_id, 0x01);
     match &entries[0].value {
-      RawValue::Text(s) => assert_eq!(s.trim_end_matches('\0'), "DJI"),
+      RawValue::Text { text: s, .. } => assert_eq!(s.trim_end_matches('\0'), "DJI"),
       other => panic!("expected Text, got {other:?}"),
     }
   }

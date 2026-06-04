@@ -306,7 +306,7 @@ mod tests {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tag_id, 0x51);
     match &entries[0].value {
-      RawValue::Text(s) => assert_eq!(s.as_str(), "ABCDE"),
+      RawValue::Text { text: s, .. } => assert_eq!(s.as_str(), "ABCDE"),
       other => panic!("expected Text(\"ABCDE\"), got {other:?}"),
     }
 
@@ -317,7 +317,7 @@ mod tests {
     assert_eq!(bad.len(), 1);
     // A non-Text decode is also acceptable evidence of corruption; only a
     // Text("ABCDE") would mean the base-0 read wrongly recovered the string.
-    if let RawValue::Text(s) = &bad[0].value {
+    if let RawValue::Text { text: s, .. } = &bad[0].value {
       assert_ne!(
         s.as_str(),
         "ABCDE",
@@ -347,7 +347,7 @@ mod tests {
     let entries = walk_panasonic_in_tiff(&blob, 0, blob.len(), HEADER_LEN, ByteOrder::Little, 0);
     assert_eq!(entries.len(), 1);
     match &entries[0].value {
-      RawValue::Text(s) => assert_eq!(s.as_str(), "ABCDE"),
+      RawValue::Text { text: s, .. } => assert_eq!(s.as_str(), "ABCDE"),
       other => panic!("expected Text(\"ABCDE\"), got {other:?}"),
     }
   }

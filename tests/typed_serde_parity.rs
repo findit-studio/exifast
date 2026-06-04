@@ -236,7 +236,62 @@ const NOT_ACTIVE: &[&str] = &[
 /// `P::Unported` faithful raw passthrough). Every PRE-EXISTING golden stays
 /// byte-identical (the additive invariant); exhaustive per-tag coverage of all
 /// ~4262 generated tags is a tracked follow-up.
-const EXPECTED_ACTIVE_FIXTURES: usize = 403;
+///
+/// 403 → 405: the `--kind exif` table-codegen Step B turns on the binary-EXIF
+/// coverage gap — `%Exif::Main` leaf tags the camera-relevant hand subset
+/// dropped, now emitted via the generated shadow. Two crafted standalone-TIFF
+/// fixtures pin the new tags byte-identically to bundled 13.59:
+/// `Exif_gap_tags.tif` (the plain / `Binary => 1` / declarative-HASH-PrintConv
+/// tags + `AmbientTemperature`'s `"$val C"`) and `Exif_composite_exposure.tif`
+/// (`CompositeImageExposureTimes`' bespoke undef-decode with the int16u-count
+/// carve-out at element indices 7/8). Unlike the prior additive chunks these
+/// LEGITIMATELY change output where the gap tags appear — but only NEW fixtures
+/// carry them, so every PRE-EXISTING golden stays byte-identical.
+///
+/// 405 → 407: a Codex follow-up to Step B adds two edge-case fixtures for the
+/// two NEW code-valued convs. `Exif_composite_exposure_edge.tif` pins
+/// `CompositeImageExposureTimes`' `RawConv`→`PrintConv` TOKEN pipeline — a
+/// `2/19` rational (the `%.10g`-rounded token `0.1052631579` → `"1/9"`, not the
+/// unrounded `"1/10"`) and a `0/0` rational (the word `undef`, not `NaN`).
+/// `Exif_ambient_multi.tif` pins `AmbientTemperature`'s `"$val C"` over a
+/// MALFORMED count>1 value (`"23.5 -5 C"`, the full space-joined value, not the
+/// first element). Both additive — every PRE-EXISTING golden stays
+/// byte-identical.
+///
+/// 407 → 408: a Codex R2 follow-up adds a WRONG-on-disk-format fixture pinning
+/// that the 0x9400 `"$val C"` PrintConv is not gated on the declared format — it
+/// runs on the post-`ReadValue` string. `Exif_ambient_wrongfmt.tif` (`undef`-
+/// typed 0x9400 `-5.5` → `"-5.5 C"` / `-5.5`, the `Bytes` shape
+/// `value_space_joined` omits). Additive — every PRE-EXISTING golden stays
+/// byte-identical. (The companion WRONG-format 0xa462
+/// `Exif_composite_exposure_wrongfmt.tif` was re-added at 411 → 413 once #198
+/// closed; see below.)
+///
+/// 408 → 411: a Codex R3 follow-up adds three SINGLE-element `0xa462`
+/// `CompositeImageExposureTimes` fixtures — all `undef`-typed (the real-camera
+/// path) — pinning the single-element JSON TYPE (the R3 fix routes a one-token
+/// decode through `emit_gated_number`, so a numeric token is a BARE NUMBER, not
+/// a quoted string):
+///   * `Exif_composite_exposure_single_number.tif` (`undef` 1/2 → `0.5`, a
+///     bare JSON number in BOTH modes);
+///   * `Exif_composite_exposure_single_undef.tif` (`undef` 0/0 → the word
+///     `undef`, a quoted STRING in both modes — out of the number gate);
+///   * `Exif_composite_exposure_single_fraction.tif` (`undef` 1/250 → `-j`
+///     PrintExposureTime `"1/250"` a string, `-n` token `0.004` a number — the
+///     PER-TOKEN, PER-MODE gating case).
+/// All additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 411 → 413: Contract A (#198) re-adds the two WRONG-on-disk-format 0xa462
+/// fixtures — now that the conv byte-walks `$val` for ANY shape via
+/// `RawValue::val_bytes()` (no longer `Format`-gated):
+///   * `Exif_composite_exposure_wrongfmt.tif` (`string` "ABCDEFGH" → one
+///     rational64u ≈ 0.9420 → `-j` `0.9` / `-n` `0.9420322801`);
+///   * `Exif_composite_exposure_wrongfmt_highbit.tif` (the R4 lossy-bytes case:
+///     `string` `\x80..\x87` invalid-UTF-8 → byte-walks the ORIGINAL bytes
+///     (A1's `RawValue::Text.raw`), one rational64u ≈ 0.9697 → `-j` `1` / `-n`
+///     `0.9696978699`).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 414;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_composite_exposure_edge.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "TIF",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "MM",
+  "ExifIFD:CompositeImageExposureTimes": "0.1052631579 undef 0.004 0.003125 0.0025 0.002 0.0015625 3 2 0.00625 0.005"
+}]

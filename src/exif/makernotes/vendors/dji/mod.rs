@@ -348,7 +348,7 @@ fn populate_typed(typed: &mut MakerNotesDji, entry: &DjiEntry, val: &TagValue) {
         if !s.is_empty() {
           typed.make = Some(s.clone());
         }
-      } else if let RawValue::Text(s) = &entry.value {
+      } else if let RawValue::Text { text: s, .. } = &entry.value {
         let trimmed = s.trim_end_matches(['\0', ' ']);
         if !trimmed.is_empty() {
           typed.make = Some(trimmed.into());
