@@ -672,6 +672,70 @@ fn quicktime_sp2_android_conformance() {
 }
 
 #[test]
+fn quicktime_sp2_gopro_conformance() {
+  // QuickTime SP2 Part-2 — the conv-less `%QuickTime::UserData` camera atoms
+  // (the xtask `--kind quicktime` generated `4cc → Name` map) PLUS the two
+  // code-valued atoms hand-ported in the walker. `tests/fixtures/
+  // QuickTime_sp2_gopro.mov` is a SYNTHETIC `.mov` whose `moov/udta` carries:
+  //   - international-text (©-prefixed) atoms `©mal` MakerURL / `©gpt`
+  //     CameraPitch / `©gyw` CameraYaw / `©grl` CameraRoll (QuickTime.pm:1639,
+  //     2148-2150 — bare `'Name'`, conv-less);
+  //   - plain-string atoms `GoPr` GoProType / `LENS` LensSerialNumber / `FOV\0`
+  //     FieldOfView (QuickTime.pm:2117/2119/2131 — bare `'Name'`, conv-less);
+  //   - code-valued `CAME` SerialNumberHash / `MUID` MediaUID
+  //     (QuickTime.pm:2120-2127 — `ValueConv => 'unpack("H*",$val)'`), whose
+  //     raw bytes `00 11 de ad be ef` / `ca fe f0 0d 12 34` HASH to the
+  //     lower-case hex `0011deadbeef` / `cafef00d1234`.
+  // The conv-less atoms emit verbatim under `QuickTime:UserData`; the numeric-
+  // looking `©gpt`/`©gyw`/`©grl` strings (`12.5` / `-3.0` / `0.0`) render as
+  // JSON NUMBERS via the token-exact JSON typing (Contract B), exactly as
+  // ExifTool's `-j` numifies them. Goldens via the bundled `perl exiftool -j
+  // -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded per the
+  // Phase-2 forward item).
+  check(
+    "QuickTime_sp2_gopro.mov",
+    "QuickTime_sp2_gopro.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_gopro.mov",
+    "QuickTime_sp2_gopro.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_keys_direction_conformance() {
+  // QuickTime SP2 Part-2 — the conv-less `%QuickTime::Keys` atoms (generated
+  // `key → Name` map) PLUS the two code-valued Keys atoms hand-ported in the
+  // walker. `tests/fixtures/QuickTime_sp2_keys_direction.mov` is a SYNTHETIC
+  // `.mov` whose `moov/meta` keys box holds:
+  //   - `com.apple.quicktime.direction.facing` CameraDirection /
+  //     `…direction.motion` CameraMotion (QuickTime.pm:6735-6736 — bare `Name`
+  //     + a family-2-only `Groups => { 2 => 'Location' }`, conv-less), each a
+  //     plain UTF-8 `data` value (`front` / `walking`);
+  //   - `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
+  //     `Writable => 'float'`), a `data` atom with the float flag `0x17` and
+  //     the IEEE big-endian `f32` `29.97` — decoded numerically (the f32→f64
+  //     widening renders `%.15g` as `29.9699993133545` in BOTH modes);
+  //   - `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769), a
+  //     full-key-fallback plain string (`+09:00`).
+  // Exercises the float `data`-atom decode (`QuickTimeFormat` flag path) and
+  // the generated conv-less Keys map. Goldens via the bundled `perl exiftool -j
+  // -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_keys_direction.mov",
+    "QuickTime_sp2_keys_direction.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_keys_direction.mov",
+    "QuickTime_sp2_keys_direction.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn mxf_conformance() {
   // FORMATS.md row 24 (Engine-only). `tests/fixtures/MXF.mxf` is the
   // bundled `lib/Image/ExifTool/t/images/MXF.mxf` (7510 bytes — header

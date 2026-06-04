@@ -384,3 +384,25 @@ fn committed_id3_v2_4_table_matches_generator() {
   // `src/formats/id3/v2_common.rs`.
   assert_no_drift("ID3::v2_4", "tagdef", "src/formats/id3/v2_4_generated.rs");
 }
+
+#[test]
+#[cfg_attr(
+  miri,
+  ignore = "spawns cargo/perl/exiftool; Miri cannot spawn processes"
+)]
+fn committed_quicktime_map_matches_generator() {
+  // The SP2 supplementary conv-less camera-atom map (`%QuickTime::UserData` 4cc
+  // keys + `%QuickTime::Keys` string keys) in the `quicktime` vocabulary. The
+  // `--kind quicktime` generator ignores `--module` (it always reads BOTH
+  // tables), but `--module` is still required by the CLI, so pass
+  // `QuickTime::UserData`. Drift means a 13.x ExifTool bump changed a conv-less
+  // candidate atom's 4cc/key/Name OR added/removed one from the allowlist
+  // (`QUICKTIME_USERDATA_CONVLESS_ALLOW` / `QUICKTIME_KEYS_CONVLESS_ALLOW` in
+  // `src/formats/quicktime.rs`) — re-verify the candidate against QuickTime.pm
+  // (still conv-less? still in the table?) and re-review the walker wiring.
+  assert_no_drift(
+    "QuickTime::UserData",
+    "quicktime",
+    "src/formats/quicktime_generated.rs",
+  );
+}

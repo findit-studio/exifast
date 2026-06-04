@@ -80,6 +80,136 @@ const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 const MAX_ATOM_DEPTH: u32 = 100;
 
 // ===========================================================================
+// SP2 supplementary conv-less camera-atom map (xtask `--kind quicktime`)
+// ===========================================================================
+
+/// One entry of the generated SP2 conv-less camera-atom map: a `udta` 4-cc
+/// (`K = &[u8]`) or `Keys` key string (`K = &str`) and the ExifTool tag NAME it
+/// emits. The map covers ONLY atoms that are GENUINELY conv-less in
+/// `QuickTime.pm` — plain `string`/text with no RawConv/ValueConv/PrintConv-sub
+/// and no `Avoid`/`Priority` — so the walker can emit a `QuickTime:UserData` /
+/// `QuickTime:Keys` tag by Name with the verbatim text value (no conversion).
+/// Atoms that carry a conv/priority stay HAND-ported in the typed walker (see
+/// [`quicktime_generated::UNPORTED`]).
+///
+/// **D8 — no public fields, accessors only.**
+pub struct ConvlessAtom<K: 'static> {
+  key: K,
+  name: &'static str,
+}
+
+impl<K: 'static> ConvlessAtom<K> {
+  /// Construct a map entry (the generated table is a `const` slice of these).
+  #[inline(always)]
+  #[must_use]
+  pub const fn new(key: K, name: &'static str) -> Self {
+    Self { key, name }
+  }
+
+  /// The emitted ExifTool tag NAME (e.g. `"GoProType"`).
+  #[inline(always)]
+  #[must_use]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+}
+
+impl ConvlessAtom<&'static [u8]> {
+  /// The raw 4-character-code key bytes (the `udta` atom type).
+  #[inline(always)]
+  #[must_use]
+  pub const fn key(&self) -> &'static [u8] {
+    self.key
+  }
+}
+
+impl ConvlessAtom<&'static str> {
+  /// The `Keys` key string (after the `com.apple.quicktime.` strip).
+  #[inline(always)]
+  #[must_use]
+  pub const fn key(&self) -> &'static str {
+    self.key
+  }
+}
+
+/// The generated conv-less camera-atom map (`xtask gen-tables --kind quicktime`,
+/// from `exiftool -listx` 13.59). Consulted by [`walk_udta`] / [`apply_key`].
+pub mod quicktime_generated {
+  include!("quicktime_generated.rs");
+}
+
+/// Look up a `udta` 4-cc in the generated conv-less UserData map, returning the
+/// tag NAME to emit (or `None` if the atom is not a verified-conv-less one).
+#[inline]
+#[must_use]
+fn userdata_convless_name(four_cc: &[u8]) -> Option<&'static str> {
+  quicktime_generated::QUICKTIME_USERDATA_CONVLESS
+    .iter()
+    .find(|a| a.key() == four_cc)
+    .map(ConvlessAtom::name)
+}
+
+/// Look up a `Keys` key string in the generated conv-less Keys map, returning
+/// the tag NAME to emit (or `None`). The lookup is over the key as written in
+/// the table (the candidate keys — `direction.facing` / `direction.motion` —
+/// are in the `com.apple.quicktime` namespace, so they match the stripped key).
+#[inline]
+#[must_use]
+fn keys_convless_name(key: &str) -> Option<&'static str> {
+  quicktime_generated::QUICKTIME_KEYS_CONVLESS
+    .iter()
+    .find(|a| a.key() == key)
+    .map(ConvlessAtom::name)
+}
+
+/// The `xtask --kind quicktime` allowlist of `%QuickTime::UserData` atoms
+/// hand-verified CONV-LESS against `QuickTime.pm` (plain `'Name'` mappings, no
+/// RawConv/ValueConv/PrintConv-sub, no `Avoid`/`Priority`) — by emitted NAME.
+/// The emitter generates a `4cc → Name` map entry for each (cross-referencing
+/// the bundled `-listx` for the on-disk bytes); a NAME here that is absent from
+/// the table is a generator error. KEEP IN SYNC with [`USERDATA_UNPORTED`].
+///
+/// Verified at QuickTime.pm 13.59:
+///  - `GoPr` GoProType (2117), `LENS` LensSerialNumber (2119), `FOV\0`
+///    FieldOfView (2131) — bare `'Name'`, plain `string`/text.
+///  - `©mal` MakerURL (1639), `©gpt` CameraPitch (2148), `©gyw` CameraYaw
+///    (2149), `©grl` CameraRoll (2150) — bare `'Name'`, international-text.
+pub const QUICKTIME_USERDATA_CONVLESS_ALLOW: &[&str] = &[
+  "GoProType",
+  "LensSerialNumber",
+  "FieldOfView",
+  "MakerURL",
+  "CameraPitch",
+  "CameraYaw",
+  "CameraRoll",
+];
+
+/// The `xtask --kind quicktime` allowlist of `%QuickTime::Keys` atoms verified
+/// CONV-LESS against `QuickTime.pm` — `direction.facing` CameraDirection (6735)
+/// / `direction.motion` CameraMotion (6736): bare `Name` + only a family-2
+/// `Groups => { 2 => 'Location' }` (irrelevant to the family-0/1 emission), no
+/// conv/`Avoid`/`Priority`, plain-string value. KEEP IN SYNC with
+/// [`KEYS_UNPORTED`].
+pub const QUICKTIME_KEYS_CONVLESS_ALLOW: &[&str] = &["CameraDirection", "CameraMotion"];
+
+/// `%QuickTime::UserData` candidate atoms that LOOK conv-less in `-listx`
+/// (`type='string'`) but carry a `ValueConv` in `QuickTime.pm`, so they are NOT
+/// codegen'd — they stay HAND-ported in [`walk_udta`] (faithful to the conv):
+///  - `CAME` SerialNumberHash (2120-2125): `ValueConv => 'unpack("H*",$val)'`.
+///  - `MUID` MediaUID (2127): `ValueConv => 'unpack("H*", $val)'`.
+pub const USERDATA_UNPORTED: &[&str] = &["SerialNumberHash", "MediaUID"];
+
+/// `%QuickTime::Keys` candidate atoms NOT codegen'd — HAND-ported in
+/// [`apply_key_name`]:
+///  - `com.android.capture.fps` AndroidCaptureFPS (6763): `Writable => 'float'`
+///    ⇒ the data-atom value is an IEEE float/double (`QuickTimeFormat`), not a
+///    string — needs a typed numeric decode.
+///  - `samsung.android.utc_offset` AndroidTimeZone (6769): a non-
+///    `com.apple.quicktime` (full-key-fallback) key, decoded as a typed Keys
+///    field alongside the other Android keys.
+pub const KEYS_UNPORTED: &[&str] = &["AndroidCaptureFPS", "AndroidTimeZone"];
+
+// ===========================================================================
 // Atom header reading (QuickTime.pm:9966-10078)
 // ===========================================================================
 
@@ -1580,7 +1710,16 @@ fn walk_udta(
           // string, so re-decode the body as a string (NOT international text).
           ud.set_model(decode_qt_string(body), 0);
         }
-        _ => {}
+        _ => {
+          // A copyright-symbol atom NOT special-cased above (`©mal` MakerURL,
+          // `©gpt` CameraPitch, `©gyw` CameraYaw, `©grl` CameraRoll): consult
+          // the generated conv-less map by the FULL 4-cc. These are bare
+          // `'Name'` international-text atoms (QuickTime.pm:1639/2148-2150),
+          // emitted verbatim under `QuickTime:UserData`.
+          if let Some(name) = userdata_convless_name(&t) {
+            ud.push_convless(name, text);
+          }
+        }
       }
       return;
     }
@@ -1631,9 +1770,42 @@ fn walk_udta(
       b"date" => {
         ud.set_date_time_original(Some(convert_iso8601_date(&decode_qt_string(body))));
       }
-      _ => {}
+      // `CAME` SerialNumberHash (QuickTime.pm:2120-2125, GoPro Hero4):
+      // `ValueConv => 'unpack("H*",$val)'` — the lower-case hex of the RAW
+      // bytes (NO `string` NUL-truncation; the whole body is hashed). HAND-
+      // ported (code-valued, kept out of the generated conv-less map).
+      b"CAME" => {
+        ud.set_serial_number_hash(Some(unpack_h_star(body)));
+      }
+      // `MUID` MediaUID (QuickTime.pm:2127, GoPro Hero4): `ValueConv =>
+      // 'unpack("H*", $val)'` — the lower-case hex of the raw bytes. HAND-
+      // ported.
+      b"MUID" => {
+        ud.set_media_uid(Some(unpack_h_star(body)));
+      }
+      // Any OTHER plain 4-cc atom: consult the generated conv-less map (`GoPr`
+      // GoProType, `LENS` LensSerialNumber, `FOV\0` FieldOfView — bare `'Name'`
+      // plain-string atoms, QuickTime.pm:2117/2119/2131). Emitted verbatim
+      // under `QuickTime:UserData` via the `string`-format NUL-terminated read.
+      other => {
+        if let Some(name) = userdata_convless_name(other) {
+          ud.push_convless(name, decode_qt_string(body));
+        }
+      }
     }
   });
+}
+
+/// Perl `unpack("H*", $val)` — render every byte of `bytes` as two lower-case
+/// hex digits, high-nibble first, concatenated (QuickTime.pm `CAME` / `MUID`
+/// ValueConv). An empty input yields the empty string (still emitted).
+fn unpack_h_star(bytes: &[u8]) -> String {
+  let mut s = String::with_capacity(bytes.len() * 2);
+  for b in bytes {
+    s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+    s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+  }
+  s
 }
 
 /// Decode a plain (non-international-text) `udta` string-atom value, faithful to
@@ -1891,9 +2063,54 @@ fn apply_key_name(
     "com.android.version" => {
       keys_out.set_android_version(Some(ilst_data_string(data)));
     }
-    _ => return false,
+    // `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
+    // `Writable => 'float'`): the value is NOT a string — with no `Format`,
+    // `QuickTimeFormat($flags,$len)` decodes the data-atom bytes as an IEEE
+    // float (flag 0x17) / double (flag 0x18) (QuickTime.pm:10402-10410 +
+    // 9555-9569). HAND-ported (code-valued numeric).
+    "com.android.capture.fps" => {
+      let Some(fps) = ilst_data_float(data) else {
+        return false;
+      };
+      keys_out.set_android_capture_fps(Some(fps));
+    }
+    // `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769): a non-
+    // `com.apple.quicktime` (full-key fallback) plain-string key.
+    "samsung.android.utc_offset" => {
+      keys_out.set_android_time_zone(Some(ilst_data_string(data)));
+    }
+    // Any OTHER key: consult the generated conv-less Keys map (`direction.facing`
+    // CameraDirection, `direction.motion` CameraMotion — bare `Name`
+    // plain-string keys, QuickTime.pm:6735-6736). Emitted verbatim under
+    // `QuickTime:Keys`.
+    other => match keys_convless_name(other) {
+      Some(name) => {
+        keys_out.push_convless(name, ilst_data_string(data));
+      }
+      None => return false,
+    },
   }
   true
+}
+
+/// Decode a `Keys`/`ItemList` `data`-atom value as an IEEE float/double per its
+/// format flag, faithful to the `not $format ⇒ QuickTimeFormat($flags,$len)`
+/// path (QuickTime.pm:10402-10410 + 9555-9569): flag `0x17` = `float` (4-byte
+/// big-endian), `0x18` = `double` (8-byte big-endian). Returns `None` for any
+/// other flag or a short payload (the tag is then dropped — ExifTool would
+/// `ReadValue` an undef and skip it). The value is the IEEE bits as an `f64`.
+fn ilst_data_float(data: &IlstData) -> Option<f64> {
+  match data.flags & 0xff {
+    0x17 => {
+      let b: [u8; 4] = data.bytes.get(..4)?.try_into().ok()?;
+      Some(f64::from(f32::from_be_bytes(b)))
+    }
+    0x18 => {
+      let b: [u8; 8] = data.bytes.get(..8)?.try_into().ok()?;
+      Some(f64::from_be_bytes(b))
+    }
+    _ => None,
+  }
 }
 
 // ── SP2 text decode (international text + UTF-16BE) ───────────────────────
@@ -4270,6 +4487,37 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // HAND-ported code-valued atoms: `CAME` SerialNumberHash / `MUID`
+      // MediaUID (both the `unpack("H*")` hex string, mode-invariant).
+      if let Some(v) = ud.serial_number_hash() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "SerialNumberHash".into(),
+          TagValue::Str(v.into()),
+          false,
+        ));
+      }
+      if let Some(v) = ud.media_uid() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          "MediaUID".into(),
+          TagValue::Str(v.into()),
+          false,
+        ));
+      }
+      // The generated conv-less plain-string atoms (`GoProType` /
+      // `LensSerialNumber` / `FieldOfView` / `MakerURL` / `CameraPitch` /
+      // `CameraYaw` / `CameraRoll`), emitted by Name in walk order. Conv-less ⇒
+      // the value is mode-invariant; all are known table keys ⇒ `unknown:
+      // false`.
+      for (name, value) in ud.convless() {
+        tags.push(EmittedTag::new(
+          user_data(),
+          name.clone(),
+          TagValue::Str(value.as_str().into()),
+          false,
+        ));
+      }
     }
 
     // ── SP2: moov/meta Keys/ItemList (QuickTime.pm:6651-6760) ──────────
@@ -4304,6 +4552,37 @@ impl crate::emit::Taggable for Meta<'_> {
           keys_group(),
           "GPSCoordinates".into(),
           gps_coordinates_value(gps, print_conv),
+          false,
+        ));
+      }
+      // `com.android.capture.fps` AndroidCaptureFPS — the IEEE float value
+      // (`Writable => 'float'`, no PrintConv ⇒ the numeric value is emitted in
+      // BOTH modes; the F32→F64 widening is exact, so `%.15g` renders the float
+      // verbatim, e.g. `29.97`).
+      if let Some(fps) = keys.android_capture_fps() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "AndroidCaptureFPS".into(),
+          TagValue::F64(fps),
+          false,
+        ));
+      }
+      // `samsung.android.utc_offset` AndroidTimeZone — plain string.
+      if let Some(v) = keys.android_time_zone() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "AndroidTimeZone".into(),
+          TagValue::Str(v.into()),
+          false,
+        ));
+      }
+      // The generated conv-less plain-string Keys atoms (`CameraDirection` /
+      // `CameraMotion`), emitted by Name in walk order (mode-invariant).
+      for (name, value) in keys.convless() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          name.clone(),
+          TagValue::Str(value.as_str().into()),
           false,
         ));
       }
@@ -4749,6 +5028,79 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(meta, mode, &mut w);
     w
+  }
+
+  /// `unpack("H*",$val)` (CAME/MUID ValueConv) → lower-case hex of every byte,
+  /// high-nibble first; empty input → empty string.
+  #[test]
+  fn unpack_h_star_lowercase_hex() {
+    assert_eq!(
+      unpack_h_star(&[0x00, 0x11, 0xde, 0xad, 0xbe, 0xef]),
+      "0011deadbeef"
+    );
+    assert_eq!(unpack_h_star(&[0xca, 0xfe, 0xf0, 0x0d]), "cafef00d");
+    assert_eq!(unpack_h_star(&[]), "");
+  }
+
+  /// The generated conv-less maps resolve the verified atoms (by 4cc / key) and
+  /// reject everything else — incl. the conv-bearing `CAME`/`MUID` (UNPORTED),
+  /// which must NOT leak into the UserData map.
+  #[test]
+  fn convless_lookup_covers_only_verified_atoms() {
+    assert_eq!(userdata_convless_name(b"GoPr"), Some("GoProType"));
+    assert_eq!(userdata_convless_name(b"LENS"), Some("LensSerialNumber"));
+    assert_eq!(userdata_convless_name(b"FOV\0"), Some("FieldOfView"));
+    assert_eq!(userdata_convless_name(b"\xa9mal"), Some("MakerURL"));
+    assert_eq!(userdata_convless_name(b"\xa9gpt"), Some("CameraPitch"));
+    assert_eq!(userdata_convless_name(b"\xa9gyw"), Some("CameraYaw"));
+    assert_eq!(userdata_convless_name(b"\xa9grl"), Some("CameraRoll"));
+    // The code-valued atoms are HAND-ported, NEVER in the conv-less map.
+    assert_eq!(userdata_convless_name(b"CAME"), None);
+    assert_eq!(userdata_convless_name(b"MUID"), None);
+    assert_eq!(userdata_convless_name(b"manu"), None);
+
+    assert_eq!(
+      keys_convless_name("direction.facing"),
+      Some("CameraDirection")
+    );
+    assert_eq!(keys_convless_name("direction.motion"), Some("CameraMotion"));
+    // The hand-ported / unmodeled keys are NOT in the conv-less map.
+    assert_eq!(keys_convless_name("com.android.capture.fps"), None);
+    assert_eq!(keys_convless_name("samsung.android.utc_offset"), None);
+    assert_eq!(keys_convless_name("make"), None);
+  }
+
+  /// `ilst_data_float` decodes the data-atom value by its format flag (the
+  /// `QuickTimeFormat` path): `0x17` = big-endian IEEE `float`, `0x18` =
+  /// `double`; any other flag or a short payload → `None`.
+  #[test]
+  fn ilst_data_float_by_format_flag() {
+    let f32_data = IlstData {
+      flags: 0x17,
+      bytes: 29.97_f32.to_be_bytes().to_vec(),
+    };
+    // f32→f64 widening is exact; compare against the same widening.
+    assert_eq!(ilst_data_float(&f32_data), Some(f64::from(29.97_f32)));
+
+    let f64_data = IlstData {
+      flags: 0x18,
+      bytes: 1.5_f64.to_be_bytes().to_vec(),
+    };
+    assert_eq!(ilst_data_float(&f64_data), Some(1.5));
+
+    // A string flag (UTF-8) is NOT a float → None (the caller keeps the tag out).
+    let str_data = IlstData {
+      flags: 0x01,
+      bytes: b"29.97".to_vec(),
+    };
+    assert_eq!(ilst_data_float(&str_data), None);
+
+    // A short float payload → None.
+    let short = IlstData {
+      flags: 0x17,
+      bytes: vec![0x41, 0xef],
+    };
+    assert_eq!(ilst_data_float(&short), None);
   }
 
   /// `ConvertISO6709` has NO `else` branch: an undecodable string is returned

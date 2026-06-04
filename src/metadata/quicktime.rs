@@ -885,6 +885,21 @@ pub struct QuickTimeUserData {
   /// GPSCoordinates — the copyright-symbol `xyz`, decoded from ISO 6709
   /// (QuickTime.pm:1657-1664).
   gps: Option<QuickTimeGps>,
+  /// `CAME` SerialNumberHash (QuickTime.pm:2120-2125, GoPro Hero4): the
+  /// `ValueConv => 'unpack("H*",$val)'` result — the lower-case hex of the raw
+  /// bytes. Code-valued, so HAND-ported (not in the generated conv-less map).
+  serial_number_hash: Option<String>,
+  /// `MUID` MediaUID (QuickTime.pm:2127, GoPro Hero4): the `ValueConv =>
+  /// 'unpack("H*", $val)'` result — the lower-case hex of the raw bytes.
+  /// Code-valued, HAND-ported.
+  media_uid: Option<String>,
+  /// The conv-less plain-string camera atoms decoded via the generated
+  /// `4cc → Name` map ([`crate::formats::quicktime::quicktime_generated`]) —
+  /// `(Name, value)` in walk order. These carry NO conversion and NO priority,
+  /// so they are emitted verbatim under `QuickTime:UserData`; modeling them in
+  /// one ordered sink (vs a typed field each) keeps the supplementary map the
+  /// single source of truth (a new conv-less atom = regenerate, no Rust edit).
+  convless: Vec<(smol_str::SmolStr, String)>,
 }
 
 impl QuickTimeUserData {
@@ -906,6 +921,9 @@ impl QuickTimeUserData {
       content_create_date: None,
       date_time_original: None,
       gps: None,
+      serial_number_hash: None,
+      media_uid: None,
+      convless: Vec::new(),
     }
   }
 
@@ -1001,6 +1019,28 @@ impl QuickTimeUserData {
     self.gps.as_ref()
   }
 
+  /// `CAME` SerialNumberHash (the `unpack("H*")` hex of the raw bytes).
+  #[inline(always)]
+  #[must_use]
+  pub fn serial_number_hash(&self) -> Option<&str> {
+    self.serial_number_hash.as_deref()
+  }
+
+  /// `MUID` MediaUID (the `unpack("H*")` hex of the raw bytes).
+  #[inline(always)]
+  #[must_use]
+  pub fn media_uid(&self) -> Option<&str> {
+    self.media_uid.as_deref()
+  }
+
+  /// The conv-less plain-string atoms decoded via the generated map, as
+  /// `(Name, value)` in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn convless(&self) -> &[(smol_str::SmolStr, String)] {
+    &self.convless
+  }
+
   /// `true` when no atom was decoded.
   #[inline(always)]
   #[must_use]
@@ -1018,6 +1058,9 @@ impl QuickTimeUserData {
       && self.content_create_date.is_none()
       && self.date_time_original.is_none()
       && self.gps.is_none()
+      && self.serial_number_hash.is_none()
+      && self.media_uid.is_none()
+      && self.convless.is_empty()
   }
 
   /// Merge a value into a multi-source [`PriorityValue`] slot per ExifTool's
@@ -1128,6 +1171,28 @@ impl QuickTimeUserData {
     self.gps = v;
     self
   }
+
+  /// Set `CAME` SerialNumberHash (the `unpack("H*")` hex string).
+  #[inline(always)]
+  pub fn set_serial_number_hash(&mut self, v: Option<String>) -> &mut Self {
+    self.serial_number_hash = v;
+    self
+  }
+
+  /// Set `MUID` MediaUID (the `unpack("H*")` hex string).
+  #[inline(always)]
+  pub fn set_media_uid(&mut self, v: Option<String>) -> &mut Self {
+    self.media_uid = v;
+    self
+  }
+
+  /// Record a conv-less plain-string atom (from the generated map) by its tag
+  /// NAME and verbatim text value, preserving walk order.
+  #[inline(always)]
+  pub fn push_convless(&mut self, name: impl Into<smol_str::SmolStr>, value: String) -> &mut Self {
+    self.convless.push((name.into(), value));
+    self
+  }
 }
 
 impl Default for QuickTimeUserData {
@@ -1166,6 +1231,21 @@ pub struct QuickTimeKeys {
   /// `com.android.version` AndroidVersion (QuickTime.pm:6762, full-key
   /// fallback).
   android_version: Option<String>,
+  /// `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
+  /// `Writable => 'float'`). The `data`-atom value is an IEEE float/double
+  /// (decoded by the flag-driven `QuickTimeFormat`, QuickTime.pm:9555-9569),
+  /// NOT a string — so it is HAND-ported (not in the conv-less string map) and
+  /// stored numerically.
+  android_capture_fps: Option<f64>,
+  /// `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769): a non-
+  /// `com.apple.quicktime` (full-key-fallback) key whose value is a plain
+  /// string (e.g. `"+09:00"`). HAND-ported as a typed Keys field alongside the
+  /// other Android keys (`Groups => { 2 => 'Time' }` is family-2 only).
+  android_time_zone: Option<String>,
+  /// The conv-less plain-string Keys atoms decoded via the generated
+  /// `key → Name` map ([`crate::formats::quicktime::quicktime_generated`]) —
+  /// `(Name, value)` in walk order. Emitted verbatim under `QuickTime:Keys`.
+  convless: Vec<(smol_str::SmolStr, String)>,
 }
 
 impl QuickTimeKeys {
@@ -1182,6 +1262,9 @@ impl QuickTimeKeys {
       android_make: None,
       android_model: None,
       android_version: None,
+      android_capture_fps: None,
+      android_time_zone: None,
+      convless: Vec::new(),
     }
   }
 
@@ -1241,6 +1324,28 @@ impl QuickTimeKeys {
     self.android_version.as_deref()
   }
 
+  /// `com.android.capture.fps` AndroidCaptureFPS (the IEEE float/double value).
+  #[inline(always)]
+  #[must_use]
+  pub const fn android_capture_fps(&self) -> Option<f64> {
+    self.android_capture_fps
+  }
+
+  /// `samsung.android.utc_offset` AndroidTimeZone (the plain-string value).
+  #[inline(always)]
+  #[must_use]
+  pub fn android_time_zone(&self) -> Option<&str> {
+    self.android_time_zone.as_deref()
+  }
+
+  /// The conv-less plain-string Keys atoms decoded via the generated map, as
+  /// `(Name, value)` in walk order.
+  #[inline(always)]
+  #[must_use]
+  pub fn convless(&self) -> &[(smol_str::SmolStr, String)] {
+    &self.convless
+  }
+
   /// `true` when no key was decoded.
   #[inline(always)]
   #[must_use]
@@ -1253,6 +1358,9 @@ impl QuickTimeKeys {
       && self.android_make.is_none()
       && self.android_model.is_none()
       && self.android_version.is_none()
+      && self.android_capture_fps.is_none()
+      && self.android_time_zone.is_none()
+      && self.convless.is_empty()
   }
 
   /// Set `make` Make.
@@ -1308,6 +1416,28 @@ impl QuickTimeKeys {
   #[inline(always)]
   pub fn set_android_version(&mut self, v: Option<String>) -> &mut Self {
     self.android_version = v;
+    self
+  }
+
+  /// Set `com.android.capture.fps` AndroidCaptureFPS (the IEEE float/double).
+  #[inline(always)]
+  pub const fn set_android_capture_fps(&mut self, v: Option<f64>) -> &mut Self {
+    self.android_capture_fps = v;
+    self
+  }
+
+  /// Set `samsung.android.utc_offset` AndroidTimeZone (plain string).
+  #[inline(always)]
+  pub fn set_android_time_zone(&mut self, v: Option<String>) -> &mut Self {
+    self.android_time_zone = v;
+    self
+  }
+
+  /// Record a conv-less plain-string Keys atom (from the generated map) by its
+  /// tag NAME and verbatim text value, preserving walk order.
+  #[inline(always)]
+  pub fn push_convless(&mut self, name: impl Into<smol_str::SmolStr>, value: String) -> &mut Self {
+    self.convless.push((name.into(), value));
     self
   }
 }

@@ -326,7 +326,15 @@ const NOT_ACTIVE: &[&str] = &[
 /// `moov/meta` findings. Every PRE-EXISTING golden stays byte-identical (only
 /// the GoPro `moov/udta` fixtures carry a direct `moov/udta`, holding only
 /// `GPMF` — no `©`-atom/Keys — so SP2 emits nothing there).
-const EXPECTED_ACTIVE_FIXTURES: usize = 425;
+///
+/// 425 → 427: QuickTime SP2 Part-2 (the conv-less camera-atom codegen +
+/// hand-ported code-valued atoms) adds 2 fixtures. `QuickTime_sp2_gopro.mov`
+/// exercises the `udta` conv-less map (`GoPr`/`LENS`/`FOV\0`/`©mal`/`©gpt`/
+/// `©gyw`/`©grl`) + the code-valued `CAME`/`MUID` (`unpack("H*")` hex);
+/// `QuickTime_sp2_keys_direction.mov` exercises the Keys conv-less map
+/// (`direction.facing`/`direction.motion`) + the code-valued
+/// `com.android.capture.fps` (float `data` atom) / `samsung.android.utc_offset`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 427;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-
