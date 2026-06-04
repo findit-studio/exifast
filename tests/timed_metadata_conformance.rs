@@ -50,6 +50,32 @@ fn golden(name: &str) -> String {
     .unwrap_or_else(|e| panic!("read golden {name}: {e}"))
 }
 
+/// Render `fixture` at the DEFAULT `-j` (NO `-ee`, `-G1`) and compare
+/// TOKEN-EXACT to `golden_name` with `excluded` name-tails dropped from BOTH
+/// sides. This is the faithful no-`ee` path: ExifTool emits the `[minor]
+/// ExtractEmbedded` warning where an embedded timed-metadata stream exists, but
+/// surfaces NO per-sample GPS without `-ee`. The `excluded` tails cover the
+/// structural `MetaFormat` gap (the `stsd` 4-char code is not captured by the
+/// structural trak parse — same gap as the `-ee` tests).
+fn check_noee_excluding(fixture_name: &str, golden_name: &str, excluded: &[&str]) {
+  let data = fixture(fixture_name);
+  // The default: `-ee` OFF. `extract_info` already defaults `extract_embedded`
+  // to false; spell it out via the options entry for symmetry with `check_ee`.
+  let opts = ParseOptions::default().with_extract_embedded(false);
+  let got = drop_keys(
+    &extract_info_with_options(fixture_name, &data, true, opts),
+    excluded,
+  );
+  let want = drop_keys(&golden(golden_name), excluded);
+  if let Err(e) = json_equivalent_strict(&got, &want) {
+    panic!(
+      "{fixture_name} (no-ee) vs {golden_name} [excluding {excluded:?}]: {}\n\
+       --- got ---\n{got}\n--- want ---\n{want}",
+      e.message()
+    );
+  }
+}
+
 /// Render `fixture` at `-ee -j` in the given group mode and compare TOKEN-EXACT
 /// to `golden_name`. `g3 = true` ⇒ `-G3:1` (`Doc<N>:` prefixes); `false` ⇒
 /// `-G1` (doc axis collapsed).
@@ -203,4 +229,58 @@ fn mebx_gps_ee_byte_exact_except_metaformat() {
     true,
     &excl,
   );
+}
+
+// ── No-`ee` faithfulness: the `[minor] ExtractEmbedded` warning ──────────────
+//
+// Without `-ee`, ExifTool's Handler-box RawConv (QuickTime.pm:8407-8411) raises
+// `[minor] The ExtractEmbedded option may find more tags in the media data` —
+// scoped to the family-1 group of the FIRST `trak` whose handler type is an
+// `%eeBox` member (`meta`/`text`/`sbtl`/`data`/`camm`/`ctbx`; `vide` excluded)
+// — and emits NO per-sample GPS. Both `mebx` and `camm` tracks carry the `meta`
+// handler, so the oracle shows `Track1:Warning` (between `HandlerClass` and
+// `HandlerType`) and no GPS columns. exifast reproduces the warning; the
+// structural `MetaFormat` (stsd 4-char code) remains the only unmodeled gap, so
+// it is excluded from the comparison (same gap as the `-ee` tests above).
+
+#[test]
+fn mebx_gps_noee_warning_byte_exact_except_metaformat() {
+  check_noee_excluding(
+    "QuickTime_mebx_gps.mov",
+    "QuickTime_mebx_gps.mov.json",
+    &["MetaFormat"],
+  );
+}
+
+#[test]
+fn camm_noee_warning_byte_exact_except_metaformat() {
+  check_noee_excluding(
+    "QuickTime_camm.mov",
+    "QuickTime_camm.mov.json",
+    &["MetaFormat"],
+  );
+}
+
+// moov-level / scan / Kenwood GPS sources surface NO no-`ee` warning and NO
+// no-`ee` GPS (their decoders run only under `ProcessSamples`/`ScanMediaData`,
+// QuickTimeStream.pl:2544-2580/3689 — fully `-ee` gated, and no `eeBox` track
+// handler is present). exifast already matches; the byte-exact no-`ee` check is
+// the standard `.json`/`.n.json` active-conformance pair (see
+// `tests/typed_serde_parity.rs`). A redundant assertion here keeps the no-`ee`
+// truth co-located with the timed-metadata suite.
+#[test]
+fn moov_gps_kenwood_frea_noee_no_warning_no_gps() {
+  for (fix, gold) in [
+    ("QuickTime_moov_gps.mov", "QuickTime_moov_gps.mov.json"),
+    (
+      "QuickTime_gps_kenwood.mov",
+      "QuickTime_gps_kenwood.mov.json",
+    ),
+    (
+      "QuickTime_frea_rexing17b.mov",
+      "QuickTime_frea_rexing17b.mov.json",
+    ),
+  ] {
+    check_noee_excluding(fix, gold, &[]);
+  }
 }

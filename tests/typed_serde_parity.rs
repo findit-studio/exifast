@@ -104,11 +104,31 @@ use exifast::{
 ///   accept-defer (see `tests/conformance.rs::
 ///   exif_makernote_subdirectory_deferred_conformance`, the
 ///   `SubDirKind::MakerNote` code comment, and docs/tracking.md).
+/// - `QuickTime_mebx_gps.mov` / `QuickTime_camm.mov` — the no-`ee` `.json`
+///   goldens carry the structural `Track1:MetaFormat` (`mebx`/`camm`, the
+///   `stsd` 4-char sample-description code) that the structural trak parse does
+///   not capture. The no-`ee` `[minor] ExtractEmbedded` warning + all other
+///   tags ARE byte-exact (proven, with `MetaFormat` excluded, by
+///   `tests/timed_metadata_conformance.rs::{mebx_gps,camm}_noee_warning_*`); the
+///   lone `MetaFormat` gap keeps them accept-deferred here (same gap as their
+///   `-ee` byte-exact tests).
+/// - `QuickTime_gps0.mov` — BLOCKED on per-source-origin tracking. The no-`ee`
+///   `.json` golden carries the FIRST `gps0` fix (a top-level DuDuBell/VSYS box
+///   that `Process_gps0` decodes regardless of `-ee`, truncated to record 1,
+///   QuickTimeStream.pl:2738-2741) PLUS a file-level `ExifTool:Warning`. exifast
+///   stores every timed fix (gps0, the moov-`gps `-box / `GPS `-Kenwood / freeGPS
+///   `mdat`-scan) UNDIFFERENTIATED in one `gps_samples()` vec with no box-of-
+///   origin marker, so it cannot emit the gps0 fix at no-`ee` while keeping the
+///   `-ee`-only sources gated. Adding a per-sample origin is a controller scope
+///   decision (Task 10 SCOPE FENCE) — accept-deferred until then.
 const NOT_ACTIVE: &[&str] = &[
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
+  "QuickTime_mebx_gps.mov",
+  "QuickTime_camm.mov",
+  "QuickTime_gps0.mov",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
@@ -409,7 +429,17 @@ const NOT_ACTIVE: &[&str] = &[
 ///     (`0x16` 300) ⇒ `Keys:GPSCoordinates` = `"300 deg 0' 0.00\" N, "`;
 ///   - `QuickTime_sp2_keys_loc_binary.mov` — `location.ISO6709` BINARY flag
 ///     (`0x00`) with raw ISO6709 bytes ⇒ parsed `Keys:GPSCoordinates` coordinates.
-const EXPECTED_ACTIVE_FIXTURES: usize = 444;
+///
+/// 444 → 447: the no-`ee` faithfulness path (Task 10) adds `.json`/`.n.json`
+/// goldens for the QuickTime timed-metadata fixtures. Three enter the active set
+/// — `QuickTime_moov_gps.mov`, `QuickTime_gps_kenwood.mov`,
+/// `QuickTime_frea_rexing17b.mov` — whose moov-`gps `-box / `GPS `-Kenwood /
+/// freeGPS-scan sources are fully `-ee`-gated (no no-`ee` warning, no no-`ee`
+/// GPS) and which exifast already matches byte-for-byte. The other three timed
+/// fixtures (`QuickTime_mebx_gps.mov`, `QuickTime_camm.mov` — `MetaFormat` gap;
+/// `QuickTime_gps0.mov` — per-source-origin SCOPE FENCE) are accept-deferred in
+/// [`NOT_ACTIVE`].
+const EXPECTED_ACTIVE_FIXTURES: usize = 447;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

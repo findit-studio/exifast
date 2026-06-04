@@ -909,6 +909,24 @@ fn minor_version_string(val: &[u8]) -> Option<String> {
   Some(format!("{n:x}.{:x}.{:x}", b.get(2)?, b.get(3)?))
 }
 
+/// The no-`ee` `EEWarn` string (QuickTime.pm:9548, `Warn(msg, 3)`). The `3`rd
+/// `Warn` argument is `ignorable = 1` ⇒ the rendered Warning value carries the
+/// `[minor] ` prefix (Extra.pm `[minor]` convention). The group-scoped
+/// `Track<N>:Warning` is emitted IN-STREAM as a verbatim tag value (the
+/// structural `trak`-walk warning channel, unlike the doc-level `Diagnostic`
+/// pipeline), so the prefix is part of the literal here.
+const EE_WARNING: &str = "[minor] The ExtractEmbedded option may find more tags in the media data";
+
+/// `true` iff `code` is a `trak` handler type that triggers the no-`ee`
+/// `EEWarn` — a member of `%eeBox` (QuickTime.pm:523-533) EXCEPT the `vide`
+/// handler (which is gated on the `stsd` sample-description, not the handler
+/// type, QuickTime.pm:8407 `$val eq 'vide'`) and the empty-key `''` /`gps `
+/// top-level (no-handler) entry. `meta` covers the `mebx`/`camm` NRT-metadata
+/// tracks (their `stsd` `MetaFormat` differs but the `hdlr` type is `meta`).
+fn is_ee_handler(code: &str) -> bool {
+  matches!(code, "text" | "meta" | "sbtl" | "data" | "camm" | "ctbx")
+}
+
 /// `hdlr` HandlerType PrintConv table (QuickTime.pm:8418-8444).
 fn handler_type_print(code: &str) -> &'static str {
   match code {
@@ -4134,6 +4152,13 @@ impl crate::emit::Taggable for Meta<'_> {
     // `emitted_keys` so a later same-group track contributes only its novel
     // tags. `Vec<SmolStr>` of `"Track<N>:Name"` keys (counts are tiny).
     let mut emitted_keys: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+    // ExifTool's `$$self{HasHandler}{$val}` dedup for the no-`ee` EEWarn
+    // (QuickTime.pm:8407,8414): the warning fires once per DISTINCT handler type
+    // — for the FIRST `trak` carrying each `%eeBox` code — and `HasHandler{$val}`
+    // is set when that code is first SEEN (independent of whether the Warning
+    // itself survives the `%noDups` first-wins). This file-level set of already-
+    // seen eeBox codes mirrors that (the realistic file has one such track).
+    let mut ee_warned: std::vec::Vec<&str> = std::vec::Vec::new();
     // First-wins gate: `true` (and records the key) only the FIRST time a
     // `(grp, name)` pair is seen; a repeat returns `false` so the caller skips
     // the push, leaving the earlier value in place (ExifTool.pm:2950-2951).
@@ -4368,6 +4393,34 @@ impl crate::emit::Taggable for Meta<'_> {
           value,
           false,
         ));
+      }
+      // No-`ee` EEWarn (QuickTime.pm:8407-8411, `HandlerType` RawConv): without
+      // `-ee`, the FIRST `trak` carrying each `%eeBox` handler type
+      // (`text`/`meta`/`sbtl`/`data`/`camm`/`ctbx`; `vide` is excluded — it is
+      // gated on the `stsd` sample-description, not the handler) raises `[minor]
+      // The ExtractEmbedded option may find more tags in the media data`, scoped
+      // to this track's family-1 group, just BEFORE `HandlerType` is emitted.
+      // The `mebx`/`camm` timed-metadata tracks carry the `meta` handler, so the
+      // oracle shows `Track<N>:Warning` between `HandlerClass` and `HandlerType`.
+      // The code is latched as SEEN here (the `HasHandler{$val}` set, independent
+      // of the Warning surviving); `first_seen` then keeps the priority-0
+      // first-wins `Warning` (a truncation warning raised earlier in THIS track's
+      // walk takes precedence). The per-sample GPS stays `-ee` gated (see
+      // `emit_timed_samples`).
+      if !opts.extract_embedded
+        && let Some(code) = track.handler_code()
+        && is_ee_handler(code)
+        && !ee_warned.contains(&code)
+      {
+        ee_warned.push(code);
+        if first_seen(grp, "Warning") {
+          tags.push(EmittedTag::new(
+            track_group(),
+            "Warning".into(),
+            TagValue::Str(EE_WARNING.into()),
+            false,
+          ));
+        }
       }
       if let Some(code) = track.handler_code()
         && first_seen(grp, "HandlerType")
