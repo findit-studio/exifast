@@ -52,9 +52,10 @@ impl ConvMode {
 }
 
 /// Options that shape a [`Taggable::tags`] emission: the conv mode (`-j`/`-n`),
-/// ExifTool `-ee` (gates per-sample timed-metadata emission, landed in a later
-/// task), and the `-G1`/`-G3` group rendering. Non-timed formats read only
-/// [`mode`](Self::mode).
+/// ExifTool `-ee` (gates per-sample timed-metadata emission), and the
+/// `-G1`/`-G3` group rendering. Non-timed formats read only
+/// [`mode`](Self::mode); the timed-metadata emitter
+/// ([`emit_timed_samples`](crate::formats::quicktime)) consults all three.
 ///
 /// Built by external callers via [`EmitOptions::g1`] and handed to
 /// [`Taggable::tags`]; the fields are crate-internal (the D8 no-public-fields
@@ -65,12 +66,8 @@ pub struct EmitOptions {
   /// The `-j`/`-n` conversion mode every [`Taggable`] renders its values for.
   pub(crate) mode: ConvMode,
   /// ExifTool `-ee`: gates per-sample timed-metadata emission.
-  // read by the timed-metadata emission task
-  #[allow(dead_code)]
   pub(crate) extract_embedded: bool,
   /// `-G1` (doc axis collapsed) vs `-G3` (`Doc<N>:` prefixed) group rendering.
-  // read by the timed-metadata emission task
-  #[allow(dead_code)]
   pub(crate) group_mode: crate::serialize_key::GroupMode,
 }
 
@@ -82,6 +79,23 @@ impl EmitOptions {
       mode,
       extract_embedded,
       group_mode: crate::serialize_key::GroupMode::G1,
+    }
+  }
+
+  /// An emission for a given conv mode + `-ee` flag + explicit group rendering
+  /// (`-G1` vs `-G3`). The `-G3` form is what the timed-metadata emitter needs
+  /// to open a `Doc<N>` per sample; `-G1` collapses the doc axis (first-fix
+  /// wins).
+  #[must_use]
+  pub(crate) const fn with_group_mode(
+    mode: ConvMode,
+    extract_embedded: bool,
+    group_mode: crate::serialize_key::GroupMode,
+  ) -> Self {
+    Self {
+      mode,
+      extract_embedded,
+      group_mode,
     }
   }
 }

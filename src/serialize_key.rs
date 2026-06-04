@@ -12,10 +12,9 @@ use std::string::String;
 pub(crate) enum GroupMode {
   /// `-G1`: collapse the doc axis (the conformance golden form).
   G1,
-  /// `-G3`: `Doc<N>:` prefix for sub-documents. Constructed by the timed-metadata
-  /// emission path (`EmitOptions`/`emit_timed_samples`) landed in a later task;
-  /// staged here as the second render mode the shared `group_key` already serves.
-  #[allow(dead_code)]
+  /// `-G3`: `Doc<N>:` prefix for sub-documents — the render mode the
+  /// timed-metadata emission path (`EmitOptions`/`emit_timed_samples`) selects
+  /// to emit one row per `Doc<N>` sample (`-ee -G3:1`).
   G3,
 }
 

@@ -749,11 +749,13 @@ impl AnyMeta<'_> {
     &self,
     print_conv: bool,
     extract_embedded: bool,
+    group_mode: crate::serialize_key::GroupMode,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    let opts = crate::emit::EmitOptions::g1(
+    let opts = crate::emit::EmitOptions::with_group_mode(
       crate::emit::ConvMode::from_print_conv(print_conv),
       extract_embedded,
+      group_mode,
     );
     crate::emit::run_emission(self, opts, out);
     crate::diagnostics::run_diagnostics(self, out);
@@ -1543,9 +1545,12 @@ const _: () = {
       // typed-path tag emission). `Rendered` emits only the format tags, not
       // the orchestration triplet. `serialize_tags` is infallible.
       let mut tm = TagMap::new();
-      let _ = self
-        .meta
-        .serialize_tags(self.print_conv, self.extract_embedded, &mut tm);
+      let _ = self.meta.serialize_tags(
+        self.print_conv,
+        self.extract_embedded,
+        self.group_mode,
+        &mut tm,
+      );
       let entries = tm.entries();
       // The FIRST `$et->Warn` surfaces as `ExifTool:Warning`, faithful to
       // the full document serializer (`serialize.rs:134-138`). `Rendered`

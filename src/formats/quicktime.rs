@@ -4396,93 +4396,130 @@ impl crate::emit::Taggable for Meta<'_> {
     }
 
     // ── SP3: embedded timed-metadata (QuickTimeStream) ─────────────────
-    // Golden-pattern parallel to the retired `serialize_tags` SP3 block: the
-    // SINK changes (an `EmittedTag` per value rather than `out.write_*`), but
-    // the per-tag values and the `QuickTime` family-1 group are preserved
-    // VERBATIM. ExifTool emits one `Doc<N>` sub-document per timed sample;
-    // exifast's flat TagMap cannot reproduce that JSON shape, so the FIRST GPS
-    // fix is summarized under the `QuickTime` group (the typed [`Meta::stream`]
-    // accessor exposes the full per-sample list). Faithful to the
-    // `%QuickTime::Stream` PrintConv/ValueConv (QuickTimeStream.pl:116-162).
-    if let Some(fix) = self.stream.first_fix() {
-      // GPSLatitude/GPSLongitude: the `%QuickTime::Stream` PrintConv is
-      // `GPS::ToDMS` (QuickTimeStream.pl:116-117) — a GPS-port dependency.
-      // The typed layer keeps post-ValueConv decimal degrees; emit those in
-      // both modes (the DMS PrintConv is wired with the Exif+GPS port).
-      let _ = print_conv;
-      if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSLatitude".into(),
-          TagValue::F64(lat),
+    // ExifTool surfaces these per-sample tags ONLY under `-ee` (ExtractEmbedded)
+    // and opens one `Doc<N>` sub-document per GPS fix (`$$et{DOC_NUM} =
+    // ++$$et{DOC_COUNT}`, QuickTimeStream.pl:967-973). The shared
+    // [`emit_timed_samples`] reproduces both: gated on `opts.extract_embedded`,
+    // it emits every fix as a `Doc<N>` row at `-G3` and the first-fix-wins
+    // collapse at `-G1`. The SP3 stream is MOOV-level / freeGPS-scanned, so its
+    // family-1 group is `QuickTime` for every fix (oracle: `QuickTime:GPSLatitude`
+    // / `Doc1:QuickTime:GPSLatitude`). lat/lon → `GPS::ToDMS` at `-j`
+    // (QuickTimeStream.pl:116-117), altitude → the `+ 0` `%.4f` `" m"` PrintConv
+    // (:120), both raw `F64` at `-n`. GPSSpeed (km/h, the typed layer's
+    // post-ValueConv value) and GPSTrack are the per-source columns; GPSDateTime
+    // is the common ConvertDateTime string.
+    emit_timed_samples(
+      self.stream.gps_samples(),
+      |_s| Group::new("QuickTime", "QuickTime"),
+      opts,
+      print_conv,
+      // The SP3 stream carries no GPSMeasureMode column — never invoked.
+      |m, _pc| TagValue::U64(u64::from(m)),
+      |_s, _a, pc| gps_altitude_stream_value(_a, pc),
+      |s, group, scratch| {
+        // GPSSpeed (`%QuickTime::Stream`, QuickTimeStream.pl:121): the typed
+        // layer already holds km/h (post-ValueConv); the `sprintf("%.4f")+0`
+        // PrintConv only rounds/strips, value-identical for the camera-clean
+        // speeds — emit the raw `F64` (a bare JSON number) in both modes.
+        if let Some(spd) = s.speed_kph() {
+          scratch.push(EmittedTag::new(
+            group.clone(),
+            "GPSSpeed".into(),
+            TagValue::F64(spd),
+            false,
+          ));
+        }
+        // Accelerometer (QuickTimeStream.pl:149): the space-joined 3-axis
+        // string, NO PrintConv (a `Notes`-only tag) — emit verbatim in both
+        // modes (oracle `moov_gps`: `Accelerometer "0 0 0"`).
+        if let Some(acc) = s.accelerometer() {
+          scratch.push(EmittedTag::new(
+            group.clone(),
+            "Accelerometer".into(),
+            TagValue::Str(acc.into()),
+            false,
+          ));
+        }
+      },
+      &mut tags,
+    );
+    // The Apple `mebx` key/value pairs — ExifTool emits these per timed sample
+    // under the enclosing `Track<N>` (family-1) at its `Doc<N>` (oracle:
+    // `Track1:GPSCoordinates` / `Doc1:Track1:GPSCoordinates`), preceded by the
+    // sample-table `SampleTime`/`SampleDuration` (`ConvertDuration` PrintConv,
+    // QuickTimeStream.pl:161-162). Gated on `-ee`; `-G1` collapses to the FIRST
+    // sample per `(Track<N>, name)`. The per-sample `track_index` is the moov
+    // track number stamped by the walker (default `Track1`).
+    if opts.extract_embedded {
+      let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+      let mut doc: u32 = 0;
+      let mut mebx_scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+      let mut mebx_seen: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
+        std::vec::Vec::new();
+      for sample in self.stream.mebx_samples() {
+        doc += 1;
+        let track = std::format!("Track{}", sample.track_index().unwrap_or(1));
+        let group = if g3 {
+          Group::with_doc("QuickTime", track.as_str(), doc)
+        } else {
+          Group::new("QuickTime", track.as_str())
+        };
+        mebx_scratch.clear();
+        // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds
+        // at `-n`) — the sample-table timing ExifTool's `ProcessSamples` emits
+        // ahead of the decoded value.
+        for (val, name) in [
+          (sample.sample_time(), "SampleTime"),
+          (sample.sample_duration(), "SampleDuration"),
+        ] {
+          if let Some(secs) = val {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            mebx_scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+        mebx_scratch.push(EmittedTag::new(
+          group.clone(),
+          sample.name().into(),
+          TagValue::Str(sample.value().into()),
           false,
         ));
+        if g3 {
+          tags.append(&mut mebx_scratch);
+        } else {
+          for tag in mebx_scratch.drain(..) {
+            let key = (
+              smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+              smol_str::SmolStr::new(tag.tag().name()),
+            );
+            if mebx_seen.contains(&key) {
+              continue;
+            }
+            mebx_seen.push(key);
+            tags.push(tag);
+          }
+        }
+      }
+      // Tags from a `mebx` `SubDirectory` key (currently only `smartstyle-info`'s
+      // embedded binary PLIST, QuickTime.pm:6847-6852). These were rendered by
+      // the nested PLIST `Taggable` stream and stored as fully-typed [`Tag`]s —
+      // each KEEPS the PLIST table's family-0 group (`PLIST`) and the camel-cased
+      // PLIST key name, faithful to the bundled `-ee -G0`/`-G3` oracle (family-0
+      // `PLIST`, document `Doc<N>`). The family-1 group divergence (the oracle
+      // re-scopes these to the enclosing `Track<N>`, while exifast's flat TagMap
+      // cannot reproduce the per-sample `Doc<N>` shape) is an accepted SP3
+      // limitation. Emitted verbatim, gated on `-ee`.
+      for tag in self.stream.plist_subdir_tags() {
         tags.push(EmittedTag::new(
-          main(),
-          "GPSLongitude".into(),
-          TagValue::F64(lon),
+          tag.group_ref().clone(),
+          tag.name().into(),
+          tag.value_ref().clone(),
           false,
         ));
       }
-      if let Some(alt) = fix.altitude_m() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSAltitude".into(),
-          TagValue::F64(alt),
-          false,
-        ));
-      }
-      if let Some(spd) = fix.speed_kph() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSSpeed".into(),
-          TagValue::F64(spd),
-          false,
-        ));
-      }
-      if let Some(trk) = fix.track() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSTrack".into(),
-          TagValue::F64(trk),
-          false,
-        ));
-      }
-      if let Some(dt) = fix.date_time() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSDateTime".into(),
-          TagValue::Str(dt.into()),
-          false,
-        ));
-      }
-    }
-    // The Apple `mebx` key/value pairs — emitted under the `QuickTime`
-    // group by their resolved key name (QuickTimeStream.pl Process_mebx).
-    for sample in self.stream.mebx_samples() {
-      tags.push(EmittedTag::new(
-        main(),
-        sample.name().into(),
-        TagValue::Str(sample.value().into()),
-        false,
-      ));
-    }
-    // Tags from a `mebx` `SubDirectory` key (currently only `smartstyle-info`'s
-    // embedded binary PLIST, QuickTime.pm:6847-6852). These were rendered by
-    // the nested PLIST `Taggable` stream and stored as fully-typed [`Tag`]s —
-    // each KEEPS the PLIST table's family-0 group (`PLIST`) and the camel-cased
-    // PLIST key name, faithful to the bundled `-ee -G0`/`-G3` oracle (family-0
-    // `PLIST`, document `Doc<N>`). The family-1 group divergence (the oracle
-    // re-scopes these to the enclosing `Track<N>`, while exifast's flat TagMap
-    // cannot reproduce the per-sample `Doc<N>` shape) is the SAME accepted SP3
-    // limitation as the scalar `mebx` pairs above. Emitted verbatim.
-    for tag in self.stream.plist_subdir_tags() {
-      tags.push(EmittedTag::new(
-        tag.group_ref().clone(),
-        tag.name().into(),
-        tag.value_ref().clone(),
-        false,
-      ));
     }
 
     // ── SP4: GoPro GPMF (Image::ExifTool::GoPro) ───────────────────────
@@ -4805,67 +4842,57 @@ impl crate::emit::Taggable for Meta<'_> {
 
     // ── SP4: Android CAMM (Image::ExifTool::QuickTime::camm5/camm6) ─────
     // The `%QuickTime::camm5`/`camm6` GPS tables (QuickTimeStream.pl:479-560)
-    // emit under family-2 `Location`/`Time`; ExifTool yields one `Doc<N>`
-    // sub-document per CAMM packet, which exifast's flat TagMap cannot
-    // reproduce — so, like the SP3 stream and GoPro GPMF first-fix summaries
-    // above, the FIRST GPS fix is summarized here (the full per-sample list is
-    // on [`Meta::android_camm`]). Emitted under the `QuickTime` group (the
-    // family-2 `Location`/`Time` re-scope is the same accepted flat-TagMap
-    // limitation as the SP3 `mebx`/stream tags). The per-sample motion records
-    // (camm1-4/7 exposure/gyro/accel/position/magnetic) stay on the typed
-    // accessor — not emitted, matching the gps0/gsen/3gf sensor precedent.
-    if let Some(fix) = self.android_camm.first_fix() {
-      // GPSLatitude/GPSLongitude: the `camm5`/`camm6` PrintConv is `GPS::ToDMS`
-      // (QuickTimeStream.pl:488/494/541/547) — a GPS-port dependency. The typed
-      // layer keeps post-ValueConv decimal degrees; emit those in both modes
-      // (the DMS PrintConv is wired with the Exif+GPS port), matching the SP3
-      // stream first-fix emission above.
-      let _ = print_conv;
-      if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSLatitude".into(),
-          TagValue::F64(lat),
-          false,
-        ));
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSLongitude".into(),
-          TagValue::F64(lon),
-          false,
-        ));
-      }
-      if let Some(alt) = fix.altitude_m() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSAltitude".into(),
-          TagValue::F64(alt),
-          false,
-        ));
-      }
-      // GPSDateTime — camm6 only (the typed layer stores the post-ValueConv
-      // `YYYY:MM:DD HH:MM:SS[.sss]Z` string; the `ConvertDateTime` PrintConv is
-      // a no-op cosmetic on that shape — emit in both modes).
-      if let Some(dt) = fix.date_time() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSDateTime".into(),
-          TagValue::Str(dt.into()),
-          false,
-        ));
-      }
-      // GPSMeasureMode — camm6 only. PrintConv (QuickTimeStream.pl:530-534):
-      // 0 → "No Measurement", 2/3 → "<n>-Dimensional Measurement"; `-n` emits
-      // the raw code.
-      if let Some(mode) = fix.measure_mode() {
-        tags.push(EmittedTag::new(
-          main(),
-          "GPSMeasureMode".into(),
-          camm_gps_measure_mode_value(mode, print_conv),
-          false,
-        ));
-      }
-    }
+    // emit one `Doc<N>` sub-document per CAMM packet, family-1 `Track<N>` (the
+    // moov track number `ProcessCAMM` runs under; oracle: `Track1:GPSLatitude` /
+    // `Doc1:Track1:GPSLatitude`). The shared [`emit_timed_samples`] reproduces
+    // that, gated on `-ee`: every fix as a `Doc<N>` row at `-G3`, the
+    // first-fix-wins collapse at `-G1` (so a camm6-only column following two
+    // camm5 fixes still surfaces). The per-sample track is the `track_index`
+    // the walker stamped (default `Track1`); the altitude PrintConv differs by
+    // packet type (camm5 `%.6f`, camm6 `%.3f`). The camm6 accuracy / velocity
+    // columns (no PrintConv) ride `emit_extra` as raw `F64` (the f32→f64
+    // widening the oracle prints, e.g. `0.100000001490116`). The per-sample
+    // motion records (camm1-4/7) stay on the typed accessor — not emitted,
+    // matching the gps0/gsen/3gf sensor precedent. `SampleTime`/`SampleDuration`
+    // (ExifTool's sample-table timing) are NOT modeled by the typed
+    // `CammGpsSample` — an accepted gap (the GPS payload is complete).
+    emit_timed_samples(
+      self.android_camm.gps_samples(),
+      |s| {
+        Group::new(
+          "QuickTime",
+          std::format!("Track{}", s.track_index().unwrap_or(1)),
+        )
+      },
+      opts,
+      print_conv,
+      camm_gps_measure_mode_value,
+      |s, alt, pc| gps_altitude_camm_value(alt, s.packet_type(), pc),
+      |s, group, scratch| {
+        // camm6 GPSHorizontalAccuracy / GPSVerticalAccuracy / GPSVelocity{East,
+        // North,Up} / GPSSpeedAccuracy (QuickTimeStream.pl:554-559): `float`
+        // columns with NO PrintConv — emit the raw value (f32 widened to f64,
+        // matching the oracle's `%.15g` of the widened float) in both modes.
+        for (val, name) in [
+          (s.horizontal_accuracy_m(), "GPSHorizontalAccuracy"),
+          (s.vertical_accuracy_m(), "GPSVerticalAccuracy"),
+          (s.velocity_east_mps(), "GPSVelocityEast"),
+          (s.velocity_north_mps(), "GPSVelocityNorth"),
+          (s.velocity_up_mps(), "GPSVelocityUp"),
+          (s.speed_accuracy_mps(), "GPSSpeedAccuracy"),
+        ] {
+          if let Some(v) = val {
+            scratch.push(EmittedTag::new(
+              group.clone(),
+              name.into(),
+              TagValue::F64(f64::from(v)),
+              false,
+            ));
+          }
+        }
+      },
+      &mut tags,
+    );
 
     // ── SP2: moov/meta HandlerClass + HandlerType (QuickTime.pm:8391-8444) ─
     // The `moov/meta` `hdlr` uses the SAME `%QuickTime::Handler` table as the
@@ -5040,26 +5067,37 @@ impl crate::emit::Taggable for Meta<'_> {
   }
 }
 
-/// Emit a timed-metadata GPS sample series faithfully. `-G1` (the default) emits
-/// only the FIRST coordinate fix (collapsed, Main group); `-G3` emits every fix
-/// as a `Doc<N>` row (Doc1 = first fix). `extract_embedded=false` ⇒ emit nothing
-/// (the caller emits the `[minor] ExtractEmbedded` warning instead, a later task).
-/// `emit_common` (this body) writes lat/lon/alt/track/dop/measure-mode/date_time;
-/// the `emit_extra` closure writes the per-source speed/extra columns (it has the
-/// quicktime PrintConv helpers). Both receive the per-fix `Group` + a push fn.
+/// Emit a timed-metadata GPS sample series faithfully. `extract_embedded=false`
+/// ⇒ emit nothing (without `-ee` ExifTool surfaces no per-sample stream — the
+/// `[minor] ExtractEmbedded` warning is emitted elsewhere). `-G3` emits EVERY
+/// coordinate fix as its own `Doc<N>`
+/// row (Doc1 = first fix); `-G1` collapses the family-3 doc axis to ONE row per
+/// `(family1, name)`, FIRST-wins — exactly ExifTool's `%noDups` collapse of the
+/// `Doc<N>` sub-documents (so a column carried only by a LATER fix, e.g. a camm6
+/// `GPSMeasureMode` that follows two camm5 fixes, still surfaces; the COMMON
+/// columns keep the FIRST fix's value).
+///
+/// `group_for` yields each sample's BASE (doc-0) [`Group`] — fixed
+/// (`QuickTime:QuickTime`) for the moov-level stream, or per-sample
+/// `QuickTime:Track<N>` for a track-scoped camm packet (the family-1 group can
+/// differ per sample). The common columns (lat/lon/alt/track/dop/measure-mode/
+/// date_time) render mode-dependently here; the per-source speed/extra columns
+/// are written by `emit_extra` (it has the quicktime PrintConv helpers). At `-j`
+/// (`print_conv`) lat/lon become the `GPS::ToDMS` DMS string with the N/S · E/W
+/// hemisphere and altitude gets its per-source `" m"` PrintConv (`alt_render`);
+/// at `-n` both are the raw post-ValueConv [`TagValue::F64`].
 ///
 /// Doc numbering mirrors ExifTool `$$et{DOC_NUM} = ++$$et{DOC_COUNT}`
 /// (QuickTimeStream.pl:967-973): `++doc` ONLY for a coordinate-bearing fix, so a
 /// no-coordinate sample neither emits nor consumes a `Doc<N>` slot.
 #[cfg(feature = "alloc")]
-#[allow(dead_code)] // wired into Meta::tags by the next task
 fn emit_timed_samples<S: crate::metadata::TimedSample>(
   samples: &[S],
-  family0: &str,
-  family1: &str,
+  group_for: impl Fn(&S) -> crate::value::Group,
   opts: crate::emit::EmitOptions,
   print_conv: bool,
   measure_mode_render: impl Fn(u32, bool) -> crate::value::TagValue,
+  alt_render: impl Fn(&S, f64, bool) -> crate::value::TagValue,
   mut emit_extra: impl FnMut(&S, &crate::value::Group, &mut std::vec::Vec<crate::emit::EmittedTag>),
   out: &mut std::vec::Vec<crate::emit::EmittedTag>,
 ) {
@@ -5070,41 +5108,61 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
     return;
   }
   let g3 = matches!(opts.group_mode, GroupMode::G3);
+  // `-G1` collapses every `Doc<N>` to one `(family1, name)` row, FIRST-wins
+  // (the TagMap sink is last-wins, so the dedup must happen HERE before the
+  // value reaches it). `scratch` buffers one sample's emissions so the
+  // `emit_extra` columns participate in the same name-collapse as the common
+  // ones; `seen` records the `(family1, name)` pairs already emitted. Both are
+  // paid only under `-ee` (this fn returns early otherwise), so the doc-0 hot
+  // path stays untouched.
   let mut doc: u32 = 0;
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  let mut seen: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
   for s in samples.iter().filter(|s| s.has_coordinates()) {
     doc += 1;
-    if !g3 && doc > 1 {
-      break;
-    }
+    let base = group_for(s);
     let group = if g3 {
-      Group::with_doc(family0, family1, doc)
+      Group::with_doc(base.family0(), base.family1(), doc)
     } else {
-      Group::new(family0, family1)
+      base
     };
+    scratch.clear();
     if let (Some(lat), Some(lon)) = (s.latitude(), s.longitude()) {
-      out.push(EmittedTag::new(
+      // `GPS::ToDMS($val, 1, "N"/"E")` at `-j` (with the hemisphere suffix);
+      // the raw decimal-degree `F64` at `-n`.
+      let lat_v = if print_conv {
+        TagValue::Str(dms_signed(lat, 'N', 'S').into())
+      } else {
+        TagValue::F64(lat)
+      };
+      let lon_v = if print_conv {
+        TagValue::Str(dms_signed(lon, 'E', 'W').into())
+      } else {
+        TagValue::F64(lon)
+      };
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSLatitude".into(),
-        TagValue::F64(lat),
+        lat_v,
         false,
       ));
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSLongitude".into(),
-        TagValue::F64(lon),
+        lon_v,
         false,
       ));
     }
     if let Some(a) = s.altitude_m() {
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSAltitude".into(),
-        TagValue::F64(a),
+        alt_render(s, a, print_conv),
         false,
       ));
     }
     if let Some(t) = s.track_deg() {
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSTrack".into(),
         TagValue::F64(t),
@@ -5112,7 +5170,7 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       ));
     }
     if let Some(d) = s.dop() {
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSDOP".into(),
         TagValue::F64(d),
@@ -5120,7 +5178,7 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       ));
     }
     if let Some(m) = s.measure_mode() {
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSMeasureMode".into(),
         measure_mode_render(m, print_conv),
@@ -5128,15 +5186,110 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       ));
     }
     if let Some(dt) = s.date_time() {
-      out.push(EmittedTag::new(
+      scratch.push(EmittedTag::new(
         group.clone(),
         "GPSDateTime".into(),
         TagValue::Str(dt.into()),
         false,
       ));
     }
-    emit_extra(s, &group, out);
+    emit_extra(s, &group, &mut scratch);
+    if g3 {
+      out.append(&mut scratch);
+    } else {
+      // `-G1`: collapse to one row per `(family1, name)`, keeping the FIRST.
+      for tag in scratch.drain(..) {
+        let key = (
+          smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+          smol_str::SmolStr::new(tag.tag().name()),
+        );
+        if seen.contains(&key) {
+          continue;
+        }
+        seen.push(key);
+        out.push(tag);
+      }
+    }
   }
+}
+
+/// `GPS::ToDMS($self, $val, 1, $ref)` for a timed-GPS lat/lon (the
+/// `%QuickTime::Stream` / `camm5` / `camm6` PrintConv,
+/// QuickTimeStream.pl:116/494/541): the magnitude formatted
+/// `q{%d deg %d' %.2f"}` ([`crate::exif::gps::to_dms`]) plus a space and the
+/// hemisphere char — `ref_pos` for a non-negative value, `ref_neg` for a
+/// negative one (`{N=>'S', E=>'W'}`). The f64 form (no Perl-numify round-trip)
+/// of [`to_dms_with_ref`].
+#[cfg(feature = "alloc")]
+fn dms_signed(val: f64, ref_pos: char, ref_neg: char) -> std::string::String {
+  let r = if val < 0.0 { ref_neg } else { ref_pos };
+  std::format!("{} {}", crate::exif::gps::to_dms(val), r)
+}
+
+/// `GPSAltitude` value for the `%QuickTime::Stream` SP3 source. PrintConv
+/// `(sprintf("%.4f", $val) + 0) . " m"` (QuickTimeStream.pl:120) — round to 4
+/// decimals, drop the trailing zeros via Perl's numeric `+0` (its default
+/// `%.15g` NV stringification, [`format_g`]), then append `" m"`. `-n` emits the
+/// raw metres [`TagValue::F64`].
+#[cfg(feature = "alloc")]
+fn gps_altitude_stream_value(val: f64, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    // `sprintf("%.4f", $val)` then `+ 0` (numify) ⇒ Perl re-stringifies the
+    // rounded NV with `%.15g`. Round the f64 to 4 decimals first, then render
+    // with `format_g` — the `%.15g` of a 4-decimal value never re-expands.
+    let rounded = round_to_decimals(val, 4);
+    let mut s = format_g(rounded, 15);
+    s.push_str(" m");
+    TagValue::Str(s.into())
+  } else {
+    TagValue::F64(val)
+  }
+}
+
+/// `GPSAltitude` value for the Android `camm5`/`camm6` sources. PrintConv
+/// `$_ = sprintf("%.Nf", $val); s/\.?0+$//; "$_ m"` — N = 6 for camm5
+/// (QuickTimeStream.pl:499), 3 for camm6 (:552) — i.e. format to N decimals,
+/// STRING-strip the trailing zeros (and a now-bare dot), then append `" m"`.
+/// `-n` emits the raw metres [`TagValue::F64`]. Distinct from the Stream
+/// `+ 0` numeric strip ([`gps_altitude_stream_value`]) both in precision and in
+/// the strip mechanism (a regex on the fixed-notation string, never exponent
+/// notation).
+#[cfg(feature = "alloc")]
+fn gps_altitude_camm_value(val: f64, packet_type: u8, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    let prec = if packet_type == 6 { 3 } else { 6 };
+    // `sprintf("%.{prec}f", $val)` — fixed-point, matching Perl's `sprintf`.
+    let mut s = std::format!("{val:.prec$}");
+    // `s/\.?0+$//` — strip a trailing run of zeros, plus a `.` it leaves bare.
+    if s.contains('.') {
+      while s.ends_with('0') {
+        s.pop();
+      }
+      if s.ends_with('.') {
+        s.pop();
+      }
+    }
+    s.push_str(" m");
+    TagValue::Str(s.into())
+  } else {
+    TagValue::F64(val)
+  }
+}
+
+/// Round `val` to `decimals` fractional digits the way Perl `sprintf("%.Nf")`
+/// does (round half away from zero), returning the rounded f64. Used by the
+/// Stream `GPSAltitude` `+ 0` numeric strip (the value is then re-rendered by
+/// `format_g`).
+#[cfg(feature = "alloc")]
+fn round_to_decimals(val: f64, decimals: u32) -> f64 {
+  if !val.is_finite() {
+    return val;
+  }
+  let factor = 10f64.powi(decimals as i32);
+  // `sprintf` rounds half away from zero; `f64::round` does the same.
+  (val * factor).round() / factor
 }
 
 /// Build a GoPro unit-suffix tag value — the `'"$val <unit>"'` PrintConv shared
@@ -8845,7 +8998,7 @@ mod tests {
     }
   }
 
-  // ── emit_timed_samples (shared `-ee` Doc<N> emitter, Task 7+8) ─────────────
+  // ── emit_timed_samples (shared `-ee` Doc<N> emitter) ──────────────────────
   mod emit_timed_samples_tests {
     use super::*;
     use crate::emit::{ConvMode, EmitOptions, EmittedTag};
@@ -8895,38 +9048,52 @@ mod tests {
       unreachable!("T samples carry no measure-mode")
     }
 
-    /// `extract_embedded=false` ⇒ the emitter writes NOTHING (the caller emits
-    /// the `[minor] ExtractEmbedded` warning instead, a later task).
+    /// The default per-sample altitude renderer for the structural `T` tests
+    /// (no altitude column → never invoked). Returns the raw `F64`.
+    fn raw_alt<S>(_s: &S, val: f64, _pc: bool) -> TagValue {
+      TagValue::F64(val)
+    }
+
+    /// A fixed `QuickTime:QuickTime` base group (the moov-level stream form).
+    fn group_qt<S>(_s: &S) -> crate::value::Group {
+      crate::value::Group::new("QuickTime", "QuickTime")
+    }
+
+    /// `extract_embedded=false` ⇒ the emitter writes NOTHING (without `-ee`
+    /// ExifTool surfaces no per-sample stream).
     #[test]
     fn ee_disabled_emits_nothing() {
       let samples = series();
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "QuickTime",
-        "QuickTime",
+        group_qt,
         EmitOptions::g1(ConvMode::PrintConv, false),
         true,
         no_measure,
+        raw_alt,
         |_s, _g, _o| {},
         &mut out,
       );
       assert!(out.is_empty(), "ee-disabled ⇒ no tags");
     }
 
-    /// `-G1` (the default) ⇒ ONLY the first coordinate fix, collapsed to the
-    /// Main group (`doc == 0`): exactly one GPSLatitude carrying the first fix.
+    /// `-G1` (the default) ⇒ the doc axis collapses to ONE row per
+    /// `(family1, name)`, FIRST-wins: with two fixes, exactly one GPSLatitude
+    /// carrying the FIRST fix, at the Main group (`doc == 0`). Rendered in
+    /// ValueConv so the value stays the raw `F64` (PrintConv would be the DMS
+    /// string — covered by the byte-exact conformance suite).
     #[test]
-    fn g1_emits_only_first_fix_at_doc0() {
+    fn g1_collapses_to_first_fix_at_doc0() {
       let samples = series();
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "QuickTime",
-        "QuickTime",
-        EmitOptions::g1(ConvMode::PrintConv, true),
-        true,
+        group_qt,
+        EmitOptions::g1(ConvMode::ValueConv, true),
+        false,
         no_measure,
+        raw_alt,
         |_s, _g, _o| {},
         &mut out,
       );
@@ -8943,10 +9110,63 @@ mod tests {
           )
         })
         .collect();
-      // -G1 summarizes to the first fix only: one row, Main group (doc 0).
+      // -G1 collapses to the FIRST fix: one row, Main group (doc 0).
       assert_eq!(lats, std::vec![(0u32, &TagValue::F64(1.0), "QuickTime")]);
       // Every emitted tag sits at doc 0 under `-G1`.
       assert!(out.iter().all(|t| t.tag().group_ref().doc() == 0));
+    }
+
+    /// `-G1` FIRST-wins collapse keeps a column carried ONLY by a LATER fix
+    /// (the camm6-after-camm5 GPSMeasureMode case): a series whose first fix has
+    /// no GPSDateTime and whose second does still surfaces the second fix's
+    /// GPSDateTime (at doc 0), while the COMMON GPSLatitude keeps the FIRST
+    /// fix's value.
+    #[test]
+    fn g1_keeps_later_only_column() {
+      use crate::metadata::GpsSample;
+      let mut a = GpsSample::new();
+      a.set_latitude(Some(1.0)).set_longitude(Some(2.0));
+      let mut b = GpsSample::new();
+      b.set_latitude(Some(3.0))
+        .set_longitude(Some(4.0))
+        .set_date_time(Some("2024:02:02 00:00:00Z".into()));
+      let samples = [a, b];
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::g1(ConvMode::ValueConv, true),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      // GPSLatitude collapses to the FIRST fix; GPSDateTime (only in fix 2) still
+      // appears. Both at doc 0.
+      let lat = out
+        .iter()
+        .find(|t| t.tag().name() == "GPSLatitude")
+        .expect("GPSLatitude");
+      assert_eq!(lat.tag().value_ref(), &TagValue::F64(1.0));
+      assert_eq!(lat.tag().group_ref().doc(), 0);
+      let dt = out
+        .iter()
+        .find(|t| t.tag().name() == "GPSDateTime")
+        .expect("GPSDateTime from the later fix must survive the -G1 collapse");
+      assert_eq!(
+        dt.tag().value_ref(),
+        &TagValue::Str("2024:02:02 00:00:00Z".into())
+      );
+      assert_eq!(dt.tag().group_ref().doc(), 0);
+      // Exactly one GPSLatitude (no duplicate at doc 0).
+      assert_eq!(
+        out
+          .iter()
+          .filter(|t| t.tag().name() == "GPSLatitude")
+          .count(),
+        1
+      );
     }
 
     /// `-G3` ⇒ EVERY coordinate fix as its own `Doc<N>` row (Doc1 = first fix,
@@ -8955,18 +9175,18 @@ mod tests {
     fn g3_emits_each_fix_as_docn() {
       let samples = series();
       let opts = EmitOptions {
-        mode: ConvMode::PrintConv,
+        mode: ConvMode::ValueConv,
         extract_embedded: true,
         group_mode: GroupMode::G3,
       };
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "QuickTime",
-        "QuickTime",
+        group_qt,
         opts,
-        true,
+        false,
         no_measure,
+        raw_alt,
         |_s, _g, _o| {},
         &mut out,
       );
@@ -8992,18 +9212,18 @@ mod tests {
     fn emit_extra_runs_per_fix_with_doc_group() {
       let samples = series();
       let opts = EmitOptions {
-        mode: ConvMode::PrintConv,
+        mode: ConvMode::ValueConv,
         extract_embedded: true,
         group_mode: GroupMode::G3,
       };
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "GoPro",
-        "GoPro",
+        |_s| crate::value::Group::new("GoPro", "GoPro"),
         opts,
-        true,
+        false,
         no_measure,
+        raw_alt,
         |_s, g, o| {
           o.push(EmittedTag::new(
             g.clone(),
@@ -9050,11 +9270,11 @@ mod tests {
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "QuickTime",
-        "QuickTime",
+        group_qt,
         opts,
         false,
         no_measure,
+        raw_alt,
         |_s, _g, _o| {},
         &mut out,
       );
@@ -9097,6 +9317,59 @@ mod tests {
       );
     }
 
+    /// lat/lon render mode-dependently: `-j` (PrintConv) → the `GPS::ToDMS`
+    /// string with the N/S · E/W hemisphere; `-n` (ValueConv) → the raw decimal
+    /// `F64`.
+    #[test]
+    fn lat_lon_dms_in_print_conv_raw_in_value_conv() {
+      let samples = [T::fix(47.6284216666667, -122.165016666667)];
+      // -j: DMS strings with hemisphere (S/W for the negative longitude).
+      let mut pc = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::g1(ConvMode::PrintConv, true),
+        true,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut pc,
+      );
+      let lat = pc
+        .iter()
+        .find(|t| t.tag().name() == "GPSLatitude")
+        .expect("GPSLatitude");
+      assert_eq!(
+        lat.tag().value_ref(),
+        &TagValue::Str("47 deg 37' 42.32\" N".into())
+      );
+      let lon = pc
+        .iter()
+        .find(|t| t.tag().name() == "GPSLongitude")
+        .expect("GPSLongitude");
+      assert_eq!(
+        lon.tag().value_ref(),
+        &TagValue::Str("122 deg 9' 54.06\" W".into())
+      );
+      // -n: raw decimal-degree F64 (no DMS, no hemisphere).
+      let mut nc = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::g1(ConvMode::ValueConv, true),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut nc,
+      );
+      let lat_n = nc
+        .iter()
+        .find(|t| t.tag().name() == "GPSLatitude")
+        .expect("GPSLatitude");
+      assert_eq!(lat_n.tag().value_ref(), &TagValue::F64(47.6284216666667));
+    }
+
     /// The measure-mode renderer IS invoked for a source that carries the
     /// column — a CammGpsSample (camm6) series renders `GPSMeasureMode` through
     /// the passed closure.
@@ -9111,11 +9384,11 @@ mod tests {
       let mut out = std::vec::Vec::new();
       emit_timed_samples(
         &samples,
-        "QuickTime",
-        "QuickTime",
+        group_qt,
         EmitOptions::g1(ConvMode::PrintConv, true),
         true,
         camm_gps_measure_mode_value,
+        raw_alt,
         |_s, _g, _o| {},
         &mut out,
       );

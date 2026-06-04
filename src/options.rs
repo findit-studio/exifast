@@ -14,6 +14,9 @@
 /// ExifTool `-ee`: it gates whether the per-sample timed-metadata tags are
 /// emitted, NOT whether they are parsed (the typed per-sample data — and thus
 /// the domain `GpsLocation` — is parsed unconditionally).
+/// [`group3`](Self::group3) mirrors `-G3:1`: it switches the JSON key from the
+/// default `-G1` (`<family1>:<name>`, the family-3 sub-document axis collapsed)
+/// to `Doc<N>:<family1>:<name>` (one row per timed sample).
 ///
 /// Construct with [`ParseOptions::default`] (everything off, the faithful
 /// `perl exiftool -j -G1` baseline) and chain the builder setters. D8
@@ -21,6 +24,10 @@
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ParseOptions {
   extract_embedded: bool,
+  /// `-G3:1` vs the default `-G1`. Stored as the crate-private
+  /// [`GroupMode`](crate::serialize_key::GroupMode) so the public surface stays
+  /// a plain `bool` (the enum is itself crate-internal).
+  group3: bool,
 }
 
 impl ParseOptions {
@@ -41,6 +48,35 @@ impl ParseOptions {
   #[inline(always)]
   pub const fn extract_embedded(&self) -> bool {
     self.extract_embedded
+  }
+
+  /// Select the `-G3:1` group rendering (every timed sample as a
+  /// `Doc<N>:<family1>:<name>` row) instead of the default `-G1` (the doc axis
+  /// collapsed, first-fix-wins). Off ⇒ `-G1`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_group3(mut self, on: bool) -> Self {
+    self.group3 = on;
+    self
+  }
+
+  /// Whether `-G3:1` rendering is selected (default `false` ⇒ `-G1`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn group3(&self) -> bool {
+    self.group3
+  }
+
+  /// The crate-internal [`GroupMode`](crate::serialize_key::GroupMode) this
+  /// option selects — `G3` when [`group3`](Self::group3) is set, else `G1`.
+  #[cfg(feature = "alloc")]
+  #[inline(always)]
+  pub(crate) const fn group_mode(&self) -> crate::serialize_key::GroupMode {
+    if self.group3 {
+      crate::serialize_key::GroupMode::G3
+    } else {
+      crate::serialize_key::GroupMode::G1
+    }
   }
 }
 

@@ -2140,10 +2140,20 @@ fn extract_info_with_options_threads_extract_embedded() {
     exifast::parser::extract_info("QuickTime_gps0.mov", &data, true),
     "default ParseOptions must match the legacy extract_info byte-for-byte"
   );
-  // The flag flows through, but the emitters don't gate on it yet ⇒ identical.
-  assert_eq!(
+  // The emission gate now consults `-ee`: ON emits the per-sample timed GPS
+  // tags that OFF suppresses, so the two documents MUST differ.
+  assert_ne!(
     off, on,
-    "threading-only: -ee gating lands in the emission task, so off == on today"
+    "-ee gating: ON must emit the timed GPS tags OFF suppresses"
+  );
+  // OFF carries no timed `QuickTime:GPS*`; ON carries them.
+  assert!(
+    !off.contains("\"QuickTime:GPSLatitude\""),
+    "-ee off suppresses the timed GPS stream"
+  );
+  assert!(
+    on.contains("\"QuickTime:GPSLatitude\""),
+    "-ee on emits the timed GPS stream"
   );
 }
 
@@ -2163,21 +2173,27 @@ fn rendered_new_with_options_threads_extract_embedded() {
   let on = Rendered::new_with_options(&meta, true, true);
   assert!(on.extract_embedded(), "new_with_options carries -ee on");
 
-  let off_json = serde_json::to_value(Rendered::new(&meta, true)).expect("serialize off");
-  let on_json = serde_json::to_value(on).expect("serialize on");
-  assert_eq!(
+  let off_json = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize off");
+  let on_json = serde_json::to_string(&on).expect("serialize on");
+  // The emission gate now consults `-ee`: ON carries the timed GPS stream that
+  // OFF suppresses.
+  assert_ne!(
     off_json, on_json,
-    "threading-only: -ee gating lands in the emission task, so off == on today"
+    "-ee gating: ON emits the timed GPS tags OFF suppresses"
   );
+  assert!(
+    !off_json.contains("GPSLatitude"),
+    "-ee off has no timed GPS"
+  );
+  assert!(on_json.contains("GPSLatitude"), "-ee on emits timed GPS");
 }
 
-/// PLACEHOLDER for the emission-gating task: once the four timed-metadata
-/// blocks honor `extract_embedded`, `-ee` ON must emit the per-sample
-/// `QuickTime:GPS*` tags from the `.ee.json` golden that `-ee` OFF suppresses
-/// (replacing them with the `[minor] ExtractEmbedded` warning). Ignored until
-/// that task wires the gate.
+/// The emission gate: `-ee` ON emits the per-sample `QuickTime:GPS*` tags from
+/// the `.ee.json` golden that `-ee` OFF suppresses (the SP3 stream is now routed
+/// through the `extract_embedded`-gated `emit_timed_samples`). The byte-exact
+/// value checks live in `tests/timed_metadata_conformance.rs`; this pins the
+/// gate itself.
 #[test]
-#[ignore = "behavioral gating lands in the emission task"]
 fn extract_embedded_on_emits_timed_gps_tags() {
   use exifast::ParseOptions;
   use exifast::parser::extract_info_with_options;

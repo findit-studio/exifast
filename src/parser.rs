@@ -446,7 +446,13 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String
   // No `TagMap` collector; the typed `AnyMeta` IS the tag source. ExifTool
   // `-ee` defaults off (the faithful baseline); use
   // [`extract_info_with_options`] to enable it.
-  extract_info_typed(name, data, print_conv_enabled, false)
+  extract_info_typed(
+    name,
+    data,
+    print_conv_enabled,
+    false,
+    crate::serialize_key::GroupMode::G1,
+  )
 }
 
 /// Like [`extract_info`] but with the render-time [`ParseOptions`](crate::ParseOptions)
@@ -462,7 +468,13 @@ pub fn extract_info_with_options(
   print_conv_enabled: bool,
   options: crate::ParseOptions,
 ) -> String {
-  extract_info_typed(name, data, print_conv_enabled, options.extract_embedded())
+  extract_info_typed(
+    name,
+    data,
+    print_conv_enabled,
+    options.extract_embedded(),
+    options.group_mode(),
+  )
 }
 
 /// The typed-serde engine entry — `extract_info`'s implementation. Detects the
@@ -483,6 +495,7 @@ fn extract_info_typed(
   data: &[u8],
   print_conv_enabled: bool,
   extract_embedded: bool,
+  group_mode: crate::serialize_key::GroupMode,
 ) -> String {
   use serde_json::{Map, Value};
 
@@ -844,7 +857,7 @@ fn extract_info_typed(
     // document's diagnostics; the format tags are serialized DIRECTLY at the
     // final step (P4 — no `serde_json::to_value` round-trip + no second key
     // alloc), see the `Document` serializer below.
-    let _ = meta.serialize_tags(print_conv_enabled, extract_embedded, &mut tm);
+    let _ = meta.serialize_tags(print_conv_enabled, extract_embedded, group_mode, &mut tm);
     if let Some(w) = tm.first_warning() {
       warning.get_or_insert_with(|| w.to_string());
     }
@@ -886,6 +899,7 @@ fn extract_info_typed(
   serde_json::to_string(&Document {
     obj: &obj,
     tags: &tm,
+    group_mode,
   })
   .unwrap_or_else(|_| Value::Array(vec![Value::Object(obj)]).to_string())
 }
@@ -902,6 +916,10 @@ fn extract_info_typed(
 struct Document<'a> {
   obj: &'a serde_json::Map<String, serde_json::Value>,
   tags: &'a crate::tagmap::TagMap,
+  /// `-G1` (the engine default — doc axis collapsed) vs `-G3` (`Doc<N>:`
+  /// prefix), threaded from [`extract_info_with_options`] /
+  /// [`crate::ParseOptions::group3`].
+  group_mode: crate::serialize_key::GroupMode,
 }
 
 #[cfg(feature = "json")]
@@ -912,7 +930,7 @@ impl serde::Serialize for Document<'_> {
     seq.serialize_element(&DocObject {
       obj: self.obj,
       entries: self.tags.entries(),
-      group_mode: crate::serialize_key::GroupMode::G1,
+      group_mode: self.group_mode,
     })?;
     seq.end()
   }
