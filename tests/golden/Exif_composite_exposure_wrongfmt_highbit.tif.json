@@ -1,0 +1,9 @@
+[{
+  "SourceFile": "Exif_composite_exposure_wrongfmt_highbit.tif",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "TIFF",
+  "File:FileTypeExtension": "tif",
+  "File:MIMEType": "image/tiff",
+  "File:ExifByteOrder": "Big-endian (Motorola, MM)",
+  "ExifIFD:CompositeImageExposureTimes": 1
+}]

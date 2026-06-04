@@ -7707,11 +7707,51 @@ fn exif_composite_exposure_edge_conformance() {
     false,
   );
 }
-// `Exif_composite_exposure_wrongfmt.tif` (WRONG on-disk format, ASCII not
-// `undef`) and its conformance were REMOVED: faithful wrong-format
-// `CompositeImageExposureTimes` (0xa462) decode is deferred to issue #198. The
-// dispatch now decodes only the verified real-camera `undef`/`RawValue::Bytes`
-// path; any other on-disk shape falls back to `emit_raw`.
+#[test]
+fn exif_composite_exposure_wrongfmt_conformance() {
+  // #198 — `CompositeImageExposureTimes` (0xa462) written with the WRONG
+  // on-disk format (`string`/ASCII, not `undef`). The bespoke `RawConv`
+  // (Exif.pm:3079) byte-walks `$val` REGARDLESS of `Format`, so the dispatch
+  // reads the bytes via `RawValue::val_bytes()` (A2) — for a `string` value
+  // that is the pre-FixUTF8 original bytes (A1's `RawValue::Text.raw`). The
+  // 8-byte ASCII `"ABCDEFGH"` decodes as ONE rational64u 0x41424344/0x45464748
+  // ≈ 0.9420: `-j` → `0.9` (PrintExposureTime `%.1f`, a BARE number), `-n` →
+  // `0.9420322801` (the RawConv token). Pre-fix this `RawValue::Text` shape
+  // fell to `emit_raw` (the raw string "ABCDEFGH") — the #198 deferral, now
+  // closed. Verified byte-identical to bundled `perl exiftool 13.59`.
+  check(
+    "Exif_composite_exposure_wrongfmt.tif",
+    "Exif_composite_exposure_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure_wrongfmt.tif",
+    "Exif_composite_exposure_wrongfmt.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_composite_exposure_wrongfmt_highbit_conformance() {
+  // #198 R4 — the LOSSY-BYTES case proving A1/A2 retain `$val`'s ORIGINAL
+  // bytes. A `string`-typed 0xa462 with INVALID-UTF-8 high-bit bytes
+  // (`\x80..\x87`): the byte-walk must see the original bytes, NOT the lossy
+  // FixUTF8 display text (where each high byte → U+FFFD, corrupting the
+  // rational decode). The 8 bytes decode as ONE rational64u
+  // 0x80818283/0x84858687 ≈ 0.9697: `-j` → `1` (PrintExposureTime `%.1f` =
+  // "1.0", `s/\.0$//`), `-n` → `0.9696978699`. Bundled `perl exiftool 13.59`
+  // byte-walks the same original bytes (this is the oracle of record); a
+  // pre-A1 lossy re-encode would have diverged. Verified byte-identical.
+  check(
+    "Exif_composite_exposure_wrongfmt_highbit.tif",
+    "Exif_composite_exposure_wrongfmt_highbit.tif.json",
+    true,
+  );
+  check(
+    "Exif_composite_exposure_wrongfmt_highbit.tif",
+    "Exif_composite_exposure_wrongfmt_highbit.tif.n.json",
+    false,
+  );
+}
 #[test]
 fn exif_composite_exposure_single_conformance() {
   // Codex R3 — `CompositeImageExposureTimes` (0xa462) decoding to EXACTLY ONE
@@ -7997,6 +8037,35 @@ fn exif_gps_proctext_conformance() {
   check(
     "Exif_gps_proctext.tif",
     "Exif_gps_proctext.tif.n.json",
+    false,
+  );
+}
+#[test]
+fn exif_gps_proctext_wrongfmt_conformance() {
+  // Golden-value Contract A (#198 byte-walk class, GPS sibling) — a GPS
+  // sub-IFD with GPSProcessingMethod (0x001b) declared `string` (format code
+  // 2) instead of `undef` (the documented mis-writer, Exif.pm:2499). UNLIKE
+  // UserComment 0x9286 the GPS text tags have NO `Format => 'undef'` override
+  // (`gps::format_override` is GPSDateStamp-only; GPS.pm:296/304 set only
+  // `Writable => 'undef'`), so the value is decoded as a STRING and reaches
+  // the `GpsConv::ExifText` `ConvertExifText` RawConv as `RawValue::Text`
+  // (NOT `RawValue::Bytes`). That arm now reads the bytes via
+  // `RawValue::val_bytes()` — the pre-FixUTF8 `raw` of the on-disk `$val`,
+  // not the lossy FixUTF8 display text the old `text.as_bytes()` arm used —
+  // mirroring the UserComment 0x9286 sibling in `Conv::ExifText`. The payload
+  // is a VALID all-ASCII, NUL-free, space-padded `ASCII   ` prefix + "Manual"
+  // (so the output is oracle-matchable and avoids the from_utf8_lossy-vs-
+  // FixUTF8 charset gap #200, which is observable only on invalid UTF-8).
+  // Bundled `exiftool 13.59` strips the 8-byte prefix ⇒ `GPS:
+  // GPSProcessingMethod` = "Manual" in BOTH -j and -n.
+  check(
+    "Exif_gps_proctext_wrongfmt.tif",
+    "Exif_gps_proctext_wrongfmt.tif.json",
+    true,
+  );
+  check(
+    "Exif_gps_proctext_wrongfmt.tif",
+    "Exif_gps_proctext_wrongfmt.tif.n.json",
     false,
   );
 }

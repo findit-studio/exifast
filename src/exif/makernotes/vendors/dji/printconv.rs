@@ -117,7 +117,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Text(s) => {
+    RawValue::Text { text: s, .. } => {
       // ASCII strings often end in NUL/spaces from TIFF padding; trim
       // to match Perl's bundled output.
       let trimmed = s.trim_end_matches(['\0', ' ']);
@@ -175,7 +175,10 @@ mod tests {
 
   #[test]
   fn none_string_strip_trailing_padding() {
-    let raw = RawValue::Text("DJI\0\0".into());
+    let raw = RawValue::Text {
+      text: "DJI\0\0".into(),
+      raw: b"DJI\0\0"[..].into(),
+    };
     assert_eq!(
       DjiPrintConv::None.apply(&raw, true),
       TagValue::Str("DJI".into())

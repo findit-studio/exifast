@@ -302,17 +302,17 @@ fn populate_typed(typed: &mut MakerNotesApple, entry: &AppleEntry) {
       typed.image_capture_type = entry.value.first_i64();
     }
     0x000b => {
-      if let RawValue::Text(s) = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = entry.value.raw() {
         typed.burst_uuid = Some(s.as_str().into());
       }
     }
     0x0011 => {
-      if let RawValue::Text(s) = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = entry.value.raw() {
         typed.content_identifier = Some(s.as_str().into());
       }
     }
     0x0015 => {
-      if let RawValue::Text(s) = entry.value.raw() {
+      if let RawValue::Text { text: s, .. } = entry.value.raw() {
         typed.image_unique_id = Some(s.as_str().into());
       }
     }

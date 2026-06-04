@@ -798,7 +798,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x51 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.lens_type = Some(trimmed.into());
@@ -806,7 +806,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x52 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.lens_serial_number = Some(trimmed.into());
@@ -814,7 +814,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x53 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.accessory_type = Some(trimmed.into());
@@ -822,7 +822,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x54 => {
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.accessory_serial_number = Some(trimmed.into());

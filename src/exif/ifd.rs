@@ -398,7 +398,18 @@ pub enum RawValue {
   Rational(Vec<Rational>),
   /// A `string` (ASCII / Exif-3.0 UTF-8). NUL-terminator trimmed
   /// (`ExifTool.pm:6301` `$vals[0] =~ s/\0.*//s`).
-  Text(std::string::String),
+  ///
+  /// Carries BOTH the FixUTF8 display text (`text`) AND the pre-FixUTF8,
+  /// NUL-trimmed original bytes (`raw`). A normal text conv reads `text`; a
+  /// byte-walking `RawConv` (`CompositeImageExposureTimes`, `UserComment`)
+  /// reads `raw` — ExifTool's post-`ReadValue` `$val` bytes, not a lossy
+  /// re-encoding (see [`RawValue::val_bytes`]).
+  Text {
+    /// The FixUTF8 display string (`lossy_string` of `raw`).
+    text: std::string::String,
+    /// The pre-FixUTF8, NUL-trimmed original bytes — `$val`'s bytes.
+    raw: Box<[u8]>,
+  },
   /// `undef`/`binary`/`unicode`/`complex` — raw bytes, not NUL-trimmed.
   Bytes(Vec<u8>),
 }
@@ -412,7 +423,7 @@ impl RawValue {
       RawValue::I64(v) => v.len(),
       RawValue::F64(v) => v.len(),
       RawValue::Rational(v) => v.len(),
-      RawValue::Text(_) => 1,
+      RawValue::Text { .. } => 1,
       RawValue::Bytes(v) => v.len(),
     }
   }
@@ -433,6 +444,70 @@ impl RawValue {
       RawValue::I64(v) => v.first().copied(),
       _ => None,
     }
+  }
+
+  /// ExifTool's post-`ReadValue` `$val` AS BYTES — what a byte-walking
+  /// `RawConv` consumes. Defined for EVERY shape so a conv never has to gate on
+  /// `Format`: `Text` → the pre-FixUTF8 `raw` (the original on-disk bytes);
+  /// `Bytes` → the bytes verbatim; numeric → the space-joined ExifTool `$val`
+  /// rendering (`ReadValue`'s `join(' ', @vals)`, [`Self::numeric_val_string`]).
+  ///
+  /// Borrows for `Text`/`Bytes` (zero-copy); allocates only for the numeric
+  /// shapes, which have no stored byte form.
+  #[must_use]
+  pub fn val_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    match self {
+      RawValue::Text { raw, .. } => Cow::Borrowed(raw),
+      RawValue::Bytes(b) => Cow::Borrowed(b),
+      _ => Cow::Owned(self.numeric_val_string().into_bytes()),
+    }
+  }
+
+  /// The numeric shapes as the single space-joined string ExifTool's
+  /// `ReadValue` produces for `$val` (`join(' ', @vals)`): each element via the
+  /// SAME per-element token form [`emit_raw`](crate::exif)/`value_space_joined`
+  /// render — `U64`/`I64` decimal, `F64` via `%.15g` ([`crate::value::format_g`]
+  /// `(_, 15)`), `Rational` via [`Rational::exiftool_val_str`]. A non-numeric
+  /// shape (`Text`/`Bytes`) returns the empty string (callers reach those via
+  /// [`Self::val_bytes`]'s borrowing arms, never here).
+  #[must_use]
+  fn numeric_val_string(&self) -> std::string::String {
+    use std::fmt::Write as _;
+    let mut s = std::string::String::new();
+    match self {
+      RawValue::U64(v) => join_display(&mut s, v),
+      RawValue::I64(v) => join_display(&mut s, v),
+      RawValue::F64(v) => {
+        for (i, val) in v.iter().enumerate() {
+          if i > 0 {
+            s.push(' ');
+          }
+          s.push_str(&crate::value::format_g(*val, 15));
+        }
+      }
+      RawValue::Rational(rs) => {
+        for (i, r) in rs.iter().enumerate() {
+          if i > 0 {
+            s.push(' ');
+          }
+          let _ = write!(s, "{}", r.exiftool_val_str());
+        }
+      }
+      RawValue::Text { .. } | RawValue::Bytes(_) => {}
+    }
+    s
+  }
+}
+
+/// Space-join `Display` elements into `s` (the `ReadValue` integer-array join).
+fn join_display<T: core::fmt::Display>(s: &mut std::string::String, vals: &[T]) {
+  use std::fmt::Write as _;
+  for (i, v) in vals.iter().enumerate() {
+    if i > 0 {
+      s.push(' ');
+    }
+    let _ = write!(s, "{v}");
   }
 }
 
@@ -508,8 +583,13 @@ pub fn read_value(
       };
       // ExifTool's `string` is Latin-1-ish bytes; for byte-equivalence with
       // the JSON oracle we keep valid UTF-8 verbatim and lossy-replace the
-      // rare non-UTF-8 byte (the bundled camera fixtures are all ASCII).
-      RawValue::Text(lossy_string(trimmed))
+      // rare non-UTF-8 byte (the bundled camera fixtures are all ASCII). The
+      // pre-FixUTF8 `trimmed` bytes are retained as `raw` so a byte-walking
+      // RawConv reads `$val`'s ORIGINAL bytes, not the lossy re-encoding.
+      RawValue::Text {
+        text: lossy_string(trimmed),
+        raw: trimmed.into(),
+      }
     }
     Format::Utf8 => {
       // Exif 3.0 `utf8` — decoded as UTF-8 (`Exif.pm:6786` `Decode(.., 'UTF8')`).
@@ -518,7 +598,10 @@ pub fn read_value(
         Some(nul) => raw.get(..nul).unwrap_or(raw),
         None => raw,
       };
-      RawValue::Text(lossy_string(trimmed))
+      RawValue::Text {
+        text: lossy_string(trimmed),
+        raw: trimmed.into(),
+      }
     }
     Format::Undef | Format::Unicode | Format::Complex => {
       // `undef`/`binary` — raw bytes, NOT NUL-trimmed. (`Unicode`/`Complex`
@@ -612,7 +695,10 @@ pub fn read_value(
 /// is the empty string; for the others an empty list.
 fn empty_value(format: Format) -> RawValue {
   match format {
-    Format::Ascii | Format::Utf8 => RawValue::Text(std::string::String::new()),
+    Format::Ascii | Format::Utf8 => RawValue::Text {
+      text: std::string::String::new(),
+      raw: Box::default(),
+    },
     Format::Undef | Format::Unicode | Format::Complex => RawValue::Bytes(Vec::new()),
     Format::Int8s | Format::Int16s | Format::Int32s | Format::Int64s => RawValue::I64(Vec::new()),
     Format::Float | Format::Double => RawValue::F64(Vec::new()),
@@ -682,7 +768,41 @@ mod tests {
     // "Canon\0..." — string trims at the first NUL (ExifTool.pm:6301).
     let data = b"Canon\0junk";
     let v = read_value(data, 0, Format::Ascii, 10, 10, ByteOrder::Big).unwrap();
-    assert_eq!(v, RawValue::Text("Canon".to_string()));
+    assert_eq!(
+      v,
+      RawValue::Text {
+        text: "Canon".to_string(),
+        raw: b"Canon"[..].into(),
+      }
+    );
+  }
+
+  #[test]
+  fn val_bytes_returns_original_for_every_shape() {
+    use std::borrow::Cow;
+    // Text → the pre-FixUTF8 raw bytes (NOT the lossy text).
+    let t = RawValue::Text {
+      text: "A\u{fffd}".into(),
+      raw: b"A\xff"[..].into(),
+    };
+    assert_eq!(&*t.val_bytes(), b"A\xff");
+    assert!(matches!(t.val_bytes(), Cow::Borrowed(_)));
+    // Bytes → the bytes verbatim.
+    let b = RawValue::Bytes(vec![1, 2, 3]);
+    assert_eq!(&*b.val_bytes(), &[1, 2, 3]);
+    assert!(matches!(b.val_bytes(), Cow::Borrowed(_)));
+    // numeric → ExifTool's space-joined `$val` rendering, as bytes.
+    let n = RawValue::U64(vec![16706, 17220]);
+    assert_eq!(&*n.val_bytes(), b"16706 17220");
+    assert!(matches!(n.val_bytes(), Cow::Owned(_)));
+    // signed + float + rational shapes render via the same token form
+    // `value_space_joined`/`emit_raw` use.
+    assert_eq!(&*RawValue::I64(vec![-5, 7]).val_bytes(), b"-5 7");
+    assert_eq!(&*RawValue::F64(vec![1.5, -0.25]).val_bytes(), b"1.5 -0.25");
+    assert_eq!(
+      &*RawValue::Rational(vec![Rational::new(1, 2, 7), Rational::new(3, 1, 7)]).val_bytes(),
+      b"0.5 3"
+    );
   }
 
   #[test]

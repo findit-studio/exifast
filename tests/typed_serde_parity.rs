@@ -264,9 +264,8 @@ const NOT_ACTIVE: &[&str] = &[
 /// typed 0x9400 `-5.5` → `"-5.5 C"` / `-5.5`, the `Bytes` shape
 /// `value_space_joined` omits). Additive — every PRE-EXISTING golden stays
 /// byte-identical. (The companion WRONG-format 0xa462
-/// `Exif_composite_exposure_wrongfmt.tif` was REMOVED: faithful wrong-format
-/// `CompositeImageExposureTimes` decode is deferred to issue #198; only the
-/// verified real-camera `undef` 0xa462 path is decoded.)
+/// `Exif_composite_exposure_wrongfmt.tif` was re-added at 411 → 413 once #198
+/// closed; see below.)
 ///
 /// 408 → 411: a Codex R3 follow-up adds three SINGLE-element `0xa462`
 /// `CompositeImageExposureTimes` fixtures — all `undef`-typed (the real-camera
@@ -281,7 +280,18 @@ const NOT_ACTIVE: &[&str] = &[
 ///     PrintExposureTime `"1/250"` a string, `-n` token `0.004` a number — the
 ///     PER-TOKEN, PER-MODE gating case).
 /// All additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 411;
+///
+/// 411 → 413: Contract A (#198) re-adds the two WRONG-on-disk-format 0xa462
+/// fixtures — now that the conv byte-walks `$val` for ANY shape via
+/// `RawValue::val_bytes()` (no longer `Format`-gated):
+///   * `Exif_composite_exposure_wrongfmt.tif` (`string` "ABCDEFGH" → one
+///     rational64u ≈ 0.9420 → `-j` `0.9` / `-n` `0.9420322801`);
+///   * `Exif_composite_exposure_wrongfmt_highbit.tif` (the R4 lossy-bytes case:
+///     `string` `\x80..\x87` invalid-UTF-8 → byte-walks the ORIGINAL bytes
+///     (A1's `RawValue::Text.raw`), one rational64u ≈ 0.9697 → `-j` `1` / `-n`
+///     `0.9696978699`).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 414;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

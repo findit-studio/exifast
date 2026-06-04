@@ -2412,7 +2412,15 @@ impl Walker<'_, '_> {
       // unknown tag is then dropped, matching bundled's verbose-only output).
       if count > 500 && known.is_none() {
         let placeholder = large_array_placeholder(count, format);
-        self.emit(kind, tag_id, RawValue::Text(placeholder));
+        let raw = placeholder.clone().into_bytes().into_boxed_slice();
+        self.emit(
+          kind,
+          tag_id,
+          RawValue::Text {
+            text: placeholder,
+            raw,
+          },
+        );
         // ExifTool sets `$val` to the placeholder and FALLS THROUGH to
         // FoundTag (Exif.pm:6778-6779) — it does NOT `next` (the lone `next`
         // is the `TAGS_FROM_FILE` copy-mode, not modelled). The placeholder
@@ -2910,7 +2918,7 @@ impl Walker<'_, '_> {
     // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
     // Make alone.
     if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110) {
-      if let RawValue::Text(s) = &raw {
+      if let RawValue::Text { text: s, .. } = &raw {
         let trimmed = s.trim_end_matches(is_perl_space);
         if tag_id == 0x010f && self.captured_make.is_none() {
           self.captured_make = Some(trimmed.to_string());
@@ -3462,7 +3470,7 @@ fn emit_exif_value<S: ExifSink>(
     Conv::StrLabel(slice) => {
       // STRING-keyed HASH PrintConv (`InteropIndex` 0x0001, Exif.pm:417-427).
       // The on-disk value is a `string`; `read_value` already NUL-trimmed it.
-      if let RawValue::Text(t) = raw {
+      if let RawValue::Text { text: t, .. } = raw {
         // Trim a trailing NUL/space the on-disk `string` may carry.
         let key = t.trim_end_matches([' ', '\0']);
         if print_conv {
@@ -3680,6 +3688,17 @@ fn emit_exif_value<S: ExifSink>(
       // space-joined `ReadValue` string; `-n` shows the bare value via the
       // shared `emit_raw` (which keeps a single scalar as a bare JSON number —
       // NOT a quoted string — so the normal real-camera `-n` stays identical).
+      //
+      // #198 A4 audit: 0x9400 has NO `Format => 'undef'` override, so a
+      // wrong-format `string` value DOES reach here as `RawValue::Text` (unlike
+      // 0x9286). But `val_bytes()` is NOT needed: `"$val C"` interpolates a
+      // STRING, and the JSON output is a Rust `String` either way, so the only
+      // residual divergence on a high-bit `string` `$val` is the U+FFFD-vs-`?`
+      // rendering of an INVALID byte (`value_space_joined`/`lossy_string` emit
+      // U+FFFD; bundled ExifTool's JSON writer emits `?`) — the SAME pre-existing
+      // charset-rendering gap `Conv::ExifText` has, NOT a byte-walk loss. The
+      // byte-walk itself is already faithful (it reads `$val`'s exact value);
+      // rerouting through `val_bytes()` would change nothing. So: no change here.
       if print_conv && let Some(v) = value_space_joined(raw) {
         out.write_str(group, name, &std::format!("{v} C"))?;
         return Ok(());
@@ -3691,12 +3710,14 @@ fn emit_exif_value<S: ExifSink>(
       // `undef` blob is decoded by a bespoke `RawConv` (`Exif.pm:3079-3098`)
       // that byte-walks `$val` then a `PrintConv` (`Exif.pm:3104-3115`).
       //
-      // Only the verified real-camera `undef` path is decoded here: a
-      // `RawValue::Bytes` blob is byte-walked by `composite_image_exposure_times`.
-      // Any other on-disk shape (a camera that wrote the WRONG format —
-      // `string`/numeric) falls through to `emit_raw`; faithfully byte-walking
-      // the post-`ReadValue` string for those mis-formatted values is deferred to
-      // issue #198.
+      // The RawConv byte-walks `$val` REGARDLESS of the on-disk `Format`
+      // (ExifTool applies it to whatever `ReadValue` returned), so read the
+      // bytes via `val_bytes()`: a real-camera `undef` blob borrows its bytes;
+      // a camera that mis-wrote the format (`string`/numeric) byte-walks the
+      // post-`ReadValue` `$val` rendering — `string`'s original bytes (not the
+      // lossy display text — A1/A2) or the space-joined numeric `$val`. The
+      // decoder bounds-checks every read, so a short/mis-formatted `$val` is
+      // safe (closes #198).
       //
       // `composite_image_exposure_times` returns ONE token per decoded element.
       // ExifTool's JSON typing is element-count dependent (the `RawConv`/
@@ -3715,10 +3736,8 @@ fn emit_exif_value<S: ExifSink>(
       // (the same `EscapeJSON` number gate the rest of EXIF emission uses) so a
       // one-element numeric result is a bare number, not a type-wrong string;
       // keep `write_str` for the 0-/multi-token space-joined case.
-      let RawValue::Bytes(b) = raw else {
-        return emit_raw(group, name, raw, out);
-      };
-      let parts = composite_image_exposure_times(b, order, print_conv);
+      let bytes = raw.val_bytes();
+      let parts = composite_image_exposure_times(&bytes, order, print_conv);
       if let [token] = parts.as_slice() {
         // One element: the lone token is the entire scalar — gate it so a
         // numeric token is a bare JSON number and `undef`/`1/N` stays a string.
@@ -3731,21 +3750,26 @@ fn emit_exif_value<S: ExifSink>(
     Conv::ExifText => {
       // `UserComment` (0x9286) — `RawConv => ConvertExifText($self,$val,1,$tag)`
       // (Exif.pm:2502). A RawConv runs BEFORE Value/PrintConv and applies in
-      // BOTH -n and -j modes; UserComment has no further conversion. The
-      // `undef` format makes the on-disk value `RawValue::Bytes`; a camera
-      // that wrote the wrong format (`string`/`int8u` — Exif.pm:2499) is
-      // forced back to bytes (`Format => 'undef'`) so the charset-ID prefix
-      // logic still applies.
-      let bytes: Vec<u8> = match raw {
-        RawValue::Bytes(b) => b.clone(),
-        // A `string`-typed value (camera wrote the wrong format) — re-read
-        // its bytes per `Format => 'undef'`.
-        RawValue::Text(t) => t.as_bytes().to_vec(),
-        // An `int8u`-typed value (the other documented mis-format) — the
-        // `undef` re-read is the raw 1-byte-per-element octet stream.
-        RawValue::U64(vals) => vals.iter().map(|&v| v as u8).collect(),
-        _ => return emit_raw(group, name, raw, out),
-      };
+      // BOTH -n and -j modes; UserComment has no further conversion. Like the
+      // 0xa462 RawConv, `ConvertExifText` byte-walks `$val` REGARDLESS of the
+      // on-disk `Format`, so read the bytes via `val_bytes()` (A2) — unifying on
+      // the same format-agnostic byte view 0xa462 uses (#198 class).
+      //
+      // For 0x9286 specifically the `Format => 'undef'` override
+      // (`tables::format_override`) forces the value through `undef` BEFORE
+      // `ReadValue` (count != 1 ⇒ `RawValue::Bytes`; the degenerate 1-byte case
+      // ⇒ `RawValue::U64` via the int8u carve-out), so the value never reaches
+      // here as `RawValue::Text` — the prior per-shape `match` had a `Text` arm
+      // that was unreachable for the only tag using this conv. `val_bytes()`
+      // borrows the `Bytes` verbatim (byte-identical to the old `b.clone()`),
+      // so every real-camera path is unchanged; the unification just removes the
+      // dead/lossy `Text` arm and keeps the conv robust if a future `ExifText`
+      // tag lacks the override (it would then byte-walk `Text.raw`, not the
+      // lossy FixUTF8 text). NOTE: `convert_exif_text`'s ASCII branch renders an
+      // invalid-UTF-8 payload byte via `from_utf8_lossy` (U+FFFD), whereas
+      // bundled ExifTool's JSON writer emits `?` for it — a separate, pre-
+      // existing charset-rendering gap (NOT a byte-walk loss), out of #198 scope.
+      let bytes = raw.val_bytes();
       out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
     }
@@ -3756,7 +3780,9 @@ fn emit_exif_value<S: ExifSink>(
       // value. A RawConv applies in BOTH -n and -j, so the trim happens at
       // the raw stage here for either output mode.
       match raw {
-        RawValue::Text(t) => out.write_str(group, name, t.trim_end_matches(is_perl_space)),
+        RawValue::Text { text, .. } => {
+          out.write_str(group, name, text.trim_end_matches(is_perl_space))
+        }
         // The regex is a no-op on a non-string value; these tags are always
         // `string`, but emit any off-spec value faithfully unchanged.
         _ => emit_raw(group, name, raw, out),
@@ -3769,7 +3795,7 @@ fn emit_exif_value<S: ExifSink>(
       // kept. A ValueConv result is what -n shows; the identity PrintConv
       // carries the same trimmed value through in -j.
       match raw {
-        RawValue::Text(t) => out.write_str(group, name, t.trim_end_matches(' ')),
+        RawValue::Text { text, .. } => out.write_str(group, name, text.trim_end_matches(' ')),
         _ => emit_raw(group, name, raw, out),
       }
     }
@@ -3877,7 +3903,7 @@ fn emit_gps_value<S: ExifSink>(
           };
           String::from_utf8_lossy(&trimmed).into_owned()
         }
-        RawValue::Text(t) => t.clone(),
+        RawValue::Text { text, .. } => text.clone(),
         _ => {
           return emit_raw(group, name, raw, out);
         }
@@ -3886,23 +3912,35 @@ fn emit_gps_value<S: ExifSink>(
       Ok(())
     }
     GpsConv::ExifText => {
-      // GPSProcessingMethod / GPSAreaInformation: `ConvertExifText` RawConv
-      // (Exif.pm:5554-5601) strips the 8-byte charset-ID prefix and decodes
-      // the payload. A RawConv runs BEFORE Value/PrintConv and applies in
-      // both -n and -j modes; these tags have no further conversion.
-      let bytes: &[u8] = match raw {
-        RawValue::Bytes(b) => b,
-        // A `string`-typed value (camera wrote the wrong format) — apply
-        // the same prefix logic to its bytes.
-        RawValue::Text(t) => t.as_bytes(),
-        _ => return emit_raw(group, name, raw, out),
-      };
-      out.write_str(group, name, &exiftext::convert_exif_text(bytes, order))?;
+      // GPSProcessingMethod (0x001b) / GPSAreaInformation (0x001c):
+      // `ConvertExifText` RawConv (Exif.pm:5554-5601) strips the 8-byte
+      // charset-ID prefix and decodes the payload. A RawConv runs BEFORE
+      // Value/PrintConv and applies in both -n and -j modes; these tags have
+      // no further conversion.
+      //
+      // `ConvertExifText` byte-walks `$val` REGARDLESS of the on-disk
+      // `Format`, so read the bytes via `val_bytes()` (#198 class, mirroring
+      // the EXIF `Conv::ExifText` sibling for UserComment 0x9286). UNLIKE
+      // 0x9286 these GPS tags have NO `Format => 'undef'` override
+      // (`gps::format_override` covers only GPSDateStamp 0x001d; GPS.pm:296/304
+      // give them `Writable => 'undef'` but leave `Format` unset), so a
+      // wrong-format `string`-on-disk GPS value DOES reach here as
+      // `RawValue::Text` — and `val_bytes()` returns its pre-FixUTF8 `raw`
+      // bytes (the original on-disk `$val`), NOT the lossy FixUTF8 display
+      // text the prior `text.as_bytes()` arm read. The real-camera path is
+      // `undef` → `RawValue::Bytes`, which `val_bytes()` borrows verbatim, so
+      // every real GPS path stays byte-identical. NOTE: `convert_exif_text`'s
+      // ASCII branch renders an invalid-UTF-8 payload byte via
+      // `from_utf8_lossy` (U+FFFD) whereas bundled ExifTool's JSON writer
+      // emits `?` — a separate, pre-existing charset-rendering gap (#200), NOT
+      // a byte-walk loss, out of #198 scope.
+      let bytes = raw.val_bytes();
+      out.write_str(group, name, &exiftext::convert_exif_text(&bytes, order))?;
       Ok(())
     }
     GpsConv::StrLabel(slice) => {
       // String → label (GPSStatus etc.). The on-disk value is a `string`.
-      if let RawValue::Text(t) = raw {
+      if let RawValue::Text { text: t, .. } = raw {
         // ExifTool's `string` count includes a NUL terminator; the decoded
         // `Text` is already NUL-trimmed. A trailing space is also possible
         // (Count => 2 strings) — match on the trimmed token.
@@ -4154,7 +4192,7 @@ fn emit_raw<S: ExifSink>(
         out.write_str(group, name, &parts.join(" "))
       }
     }
-    RawValue::Text(t) => out.write_str(group, name, t),
+    RawValue::Text { text, .. } => out.write_str(group, name, text),
     RawValue::Bytes(b) => out.write_bytes(group, name, b),
   }
 }
@@ -4245,7 +4283,7 @@ fn value_space_joined(raw: &RawValue) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" "),
     ),
-    RawValue::Text(t) => Some(t.to_string()),
+    RawValue::Text { text, .. } => Some(text.to_string()),
     RawValue::Bytes(_) => None,
   }
 }
@@ -4630,7 +4668,7 @@ mod tests {
     assert_eq!(make.group(), "IFD0");
     assert_eq!(make.tag_id(), 0x010f);
     match make.value_ref().raw() {
-      RawValue::Text(s) => assert_eq!(s, "Canon"),
+      RawValue::Text { text, .. } => assert_eq!(text, "Canon"),
       other => panic!("expected Text, got {other:?}"),
     }
   }
@@ -4813,7 +4851,7 @@ mod tests {
     assert_eq!(datum.ifd(), IfdKind::Gps);
     assert_eq!(datum.group(), "GPS");
     match datum.value_ref().raw() {
-      RawValue::Text(s) => assert_eq!(s, "WGS84"),
+      RawValue::Text { text, .. } => assert_eq!(text, "WGS84"),
       other => panic!("expected Text, got {other:?}"),
     }
   }
@@ -5001,7 +5039,10 @@ mod tests {
   #[cfg(feature = "alloc")]
   fn emit_text_conv(value: &str, conv: Conv) -> String {
     let mut map = crate::tagmap::TagMap::new();
-    let raw = RawValue::Text(value.to_string());
+    let raw = RawValue::Text {
+      text: value.to_string(),
+      raw: value.as_bytes().into(),
+    };
     emit_exif_value("IFD0", "T", &raw, conv, ByteOrder::Big, true, &mut map).unwrap();
     map.get_str("IFD0", "T").expect("emitted")
   }
@@ -5699,30 +5740,37 @@ mod tests {
 
   // -- Fix 3: InteropIndex string-keyed PrintConv ----------------------------
 
+  /// A `RawValue::Text` from a UTF-8 `&str` (raw == the str's bytes, as the
+  /// real `string` builder produces for valid UTF-8).
+  #[cfg(feature = "alloc")]
+  fn text_rv(s: &str) -> RawValue {
+    RawValue::Text {
+      text: s.to_string(),
+      raw: s.as_bytes().into(),
+    }
+  }
+
   #[test]
   #[cfg(feature = "alloc")]
   fn interop_index_string_keyed_print_conv() {
     let conv = tables::lookup(0x0001).expect("InteropIndex").conv;
     // Hits map to the full DCF label with print_conv ON, raw token with OFF.
     assert_eq!(
-      emit_conv(&RawValue::Text("R98".into()), conv, true),
+      emit_conv(&text_rv("R98"), conv, true),
       "R98 - DCF basic file (sRGB)"
     );
-    assert_eq!(emit_conv(&RawValue::Text("R98".into()), conv, false), "R98");
+    assert_eq!(emit_conv(&text_rv("R98"), conv, false), "R98");
     assert_eq!(
-      emit_conv(&RawValue::Text("R03".into()), conv, true),
+      emit_conv(&text_rv("R03"), conv, true),
       "R03 - DCF option file (Adobe RGB)"
     );
     assert_eq!(
-      emit_conv(&RawValue::Text("THM".into()), conv, true),
+      emit_conv(&text_rv("THM"), conv, true),
       "THM - DCF thumbnail file"
     );
     // A miss → `Unknown ($val)` (ON) / the raw token (OFF).
-    assert_eq!(
-      emit_conv(&RawValue::Text("XYZ".into()), conv, true),
-      "Unknown (XYZ)"
-    );
-    assert_eq!(emit_conv(&RawValue::Text("XYZ".into()), conv, false), "XYZ");
+    assert_eq!(emit_conv(&text_rv("XYZ"), conv, true), "Unknown (XYZ)");
+    assert_eq!(emit_conv(&text_rv("XYZ"), conv, false), "XYZ");
   }
 
   #[test]

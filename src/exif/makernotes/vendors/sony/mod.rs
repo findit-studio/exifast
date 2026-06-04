@@ -603,7 +603,7 @@ fn populate_typed(typed: &mut MakerNotesSony, entry: &SonyEntry, val: &TagValue)
     }
     0xb020 => {
       // CreativeStyle — string passthrough.
-      if let RawValue::Text(s) = &entry.value {
+      if let RawValue::Text { text: s, .. } = &entry.value {
         typed.creative_style = Some(s.as_str().into());
       } else if let TagValue::Str(s) = val {
         typed.creative_style = Some(s.clone());

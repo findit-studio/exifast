@@ -446,7 +446,7 @@ pub(crate) fn raw_to_tag_value(raw: &RawValue) -> TagValue {
         .join(" ")
         .into(),
     ),
-    RawValue::Text(s) => TagValue::Str(s.as_str().into()),
+    RawValue::Text { text, .. } => TagValue::Str(text.as_str().into()),
     RawValue::Bytes(b) => TagValue::Bytes(b.clone()),
   }
 }

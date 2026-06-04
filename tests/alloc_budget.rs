@@ -201,15 +201,23 @@ fn alloc_budget() {
 /// regression past these means a redundant decode / clone / per-tag key build
 /// crept back in; an intentional new allocation should re-baseline WITH a
 /// justifying comment, not just bump the number.
+///
+/// RE-BASELINED for Contract A (golden-value pipeline, #198): `RawValue::Text`
+/// now carries the pre-FixUTF8 `raw` bytes alongside the display `text`, so each
+/// decoded EXIF `string` leaf allocates ONE extra `Box<[u8]>`. This is an
+/// intentional, faithful cost (a byte-walking RawConv must see `$val`'s original
+/// bytes); the string-heavy fixtures rise by their string-leaf count (Apple
+/// +15, Canon +9, ID3 +15 — ID3 strings flow through the same EXIF `Text`).
 fn media_metadata_budget(name: &str) -> usize {
   match name {
     // Canon dominates (the MakerNote vendor decode). P0 (single-mode decode)
-    // took its `media_metadata` from 1391 → 756.
-    "MakerNotes_Canon.jpg" => 800,        // measured 756
-    "MakerNotes_Apple.jpg" => 145,        // measured 133 (P0: 176 → 133)
-    "ID3v2_4_big.mp3" => 210,             // measured 194
-    "QuickTime_frea_rexing17b.mov" => 40, // measured 31
-    "Real.ra" => 30,                      // measured 21 (P8: 31 → 21)
+    // took its `media_metadata` from 1391 → 756; Contract A adds the per-string
+    // `raw` box (756 → 765).
+    "MakerNotes_Canon.jpg" => 820, // measured 765 (Contract A: 756 → 765)
+    "MakerNotes_Apple.jpg" => 160, // measured 148 (Contract A: 133 → 148)
+    "ID3v2_4_big.mp3" => 225,      // measured 209 (Contract A: 194 → 209)
+    "QuickTime_frea_rexing17b.mov" => 40, // measured 31 (no EXIF string leaf)
+    "Real.ra" => 30,               // measured 21 (P8: 31 → 21)
     // An unlisted fixture: no pinned budget (the harness still prints + checks
     // parse acceptance, just no ceiling).
     _ => usize::MAX,
@@ -219,13 +227,17 @@ fn media_metadata_budget(name: &str) -> usize {
 /// `extract_info` `(-j, -n)` per-fixture allocation budget — the JSON render
 /// path that carries the P1 O(1) dedup + P4 direct-serialize + P0 single-mode
 /// MakerNote wins. PINNED at the improved Phase-A.3 counts + headroom.
+///
+/// RE-BASELINED for Contract A (#198): the per-string `raw` box (see
+/// `media_metadata_budget`) also surfaces on the render path (Apple +18/+18,
+/// Canon +9/+12, ID3 +8/+8) — an intentional, faithful cost.
 fn extract_info_budget(name: &str) -> (usize, usize) {
   match name {
     // P1+P4 took -j 2085 → 1547; P0 then took it 1547 → 907. -n stays ~1632
-    // (one value-conv decode, now on demand).
-    "MakerNotes_Canon.jpg" => (960, 1720), // measured (907, 1632)
-    "MakerNotes_Apple.jpg" => (370, 490),  // measured (339, 456)
-    "ID3v2_4_big.mp3" => (125, 125),       // measured (110, 109)
+    // (one value-conv decode, now on demand). Contract A: (907,1632) → (916,1644).
+    "MakerNotes_Canon.jpg" => (985, 1750), // measured (916, 1644)
+    "MakerNotes_Apple.jpg" => (385, 510),  // measured (357, 474)
+    "ID3v2_4_big.mp3" => (130, 130),       // measured (118, 117)
     "QuickTime_frea_rexing17b.mov" => (150, 150), // measured (135, 137); P1: 266/259 → 135/137
     "Real.ra" => (100, 100),               // measured (88, 87)
     _ => (usize::MAX, usize::MAX),
