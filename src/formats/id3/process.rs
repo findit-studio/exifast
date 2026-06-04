@@ -2989,7 +2989,12 @@ mod tests {
   ) -> Vec<(SmolStr, SmolStr, TagValue)> {
     let mut tm = crate::tagmap::TagMap::new();
     crate::emit::run_emission(meta, mode, &mut tm);
-    tm.entries().to_vec()
+    // ID3v1 has no sub-documents (doc is always 0); drop it to keep the
+    // `(family1, name, value)` shape this comparison helper compares.
+    tm.entries()
+      .iter()
+      .map(|(_, g, n, v)| (g.clone(), n.clone(), v.clone()))
+      .collect()
   }
 
   /// `Id3v1Meta`'s `Taggable` reproduces `real::emit_id3v1` byte-for-byte —
@@ -3040,7 +3045,11 @@ mod tests {
           out.write_u64(group, "Genre", u64::from(g)).unwrap();
         }
       }
-      out.entries().to_vec()
+      out
+        .entries()
+        .iter()
+        .map(|(_, g, n, v)| (g.clone(), n.clone(), v.clone()))
+        .collect()
     }
 
     // Two distinct ID3v1 shapes: a normal-genre trailer (last 128 bytes of

@@ -134,7 +134,7 @@ pub(crate) fn run_emission<T: Taggable>(meta: &T, mode: ConvMode, out: &mut crat
     // keys on the family-1 group (`exiftool:2948` — only family-1 reaches the
     // `-G1` key) and owns the dedup.
     let (group, name, value) = e.into_tag().into_parts();
-    let _ = out.write_value(group.family1(), name.as_str(), value);
+    let _ = out.write_value_doc(group.doc(), group.family1(), name.as_str(), value);
   }
 }
 

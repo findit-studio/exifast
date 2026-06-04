@@ -142,6 +142,12 @@ pub mod format_parser;
 pub mod processbinarydata;
 #[cfg(feature = "json")]
 pub mod serialize;
+// The single group-key join (`-G1` doc-collapse / `-G3` `Doc<N>:` prefix)
+// shared by every JSON serializer. `pub(crate)`, `alloc`-gated (the `group_key`
+// join builds an owned `String`, and every serializer that calls it is itself
+// `json`- or `serde`+`alloc`-gated).
+#[cfg(feature = "alloc")]
+pub(crate) mod serialize_key;
 // The single inline tag-collection sink the typed-Meta rendering path emits
 // into (replaces the removed `TagWriter`/`MetaSinker` trait pair and the
 // `JsonTagWriter`/`MapTagWriter` collectors). `pub(crate)`, `alloc`-gated so

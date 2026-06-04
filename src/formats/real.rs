@@ -3059,7 +3059,7 @@ mod tests {
   fn keys(tm: &crate::tagmap::TagMap) -> Vec<String> {
     tm.entries()
       .iter()
-      .map(|(g, n, _)| std::format!("{g}:{n}"))
+      .map(|(_, g, n, _)| std::format!("{g}:{n}"))
       .collect()
   }
 

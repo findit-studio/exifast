@@ -1443,6 +1443,10 @@ impl AnyMeta<'_> {
 pub struct Rendered<'a, 'm> {
   meta: &'a AnyMeta<'m>,
   print_conv: bool,
+  /// The group-key form the serializer renders: `-G1` (collapse the family-3
+  /// `doc` axis — the conformance golden form) vs `-G3` (`Doc<N>:` prefix).
+  /// `Rendered::new` defaults to `G1`, matching the engine's `extract_info`.
+  group_mode: crate::serialize_key::GroupMode,
 }
 
 #[cfg(all(feature = "serde", feature = "alloc"))]
@@ -1453,7 +1457,11 @@ impl<'a, 'm> Rendered<'a, 'm> {
   #[must_use]
   #[inline(always)]
   pub const fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
-    Self { meta, print_conv }
+    Self {
+      meta,
+      print_conv,
+      group_mode: crate::serialize_key::GroupMode::G1,
+    }
   }
 
   /// The wrapped Meta.
@@ -1498,16 +1506,13 @@ const _: () = {
       let warning = tm.first_warning();
       let extra = usize::from(warning.is_some());
       let mut map = s.serialize_map(Some(entries.len() + extra))?;
-      // Build the `"<family1>:<name>"` JSON key ONCE per surviving entry (P1+P4:
-      // the `TagMap` no longer carries a per-insert combined key). A single
-      // reused `String` buffer (cleared each turn) avoids a per-entry alloc.
+      // Build the JSON key ONCE per surviving entry via the shared `group_key`
+      // join (P1+P4: the `TagMap` no longer carries a per-insert combined key) —
+      // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
+      let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (group, name, value) in entries {
-        key.clear();
-        key.reserve(group.len() + 1 + name.len());
-        key.push_str(group);
-        key.push(':');
-        key.push_str(name);
+      for (doc, group, name, value) in entries {
+        crate::serialize_key::group_key_into(&mut key, *doc, group, name, group_mode);
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {
