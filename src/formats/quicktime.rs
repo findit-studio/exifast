@@ -199,14 +199,24 @@ pub const QUICKTIME_KEYS_CONVLESS_ALLOW: &[&str] = &["CameraDirection", "CameraM
 ///  - `MUID` MediaUID (2127): `ValueConv => 'unpack("H*", $val)'`.
 pub const USERDATA_UNPORTED: &[&str] = &["SerialNumberHash", "MediaUID"];
 
-/// `%QuickTime::Keys` candidate atoms NOT codegen'd — HAND-ported in
-/// [`apply_key_name`]:
+/// `%QuickTime::Keys` candidate atoms kept OUT of the generated conv-less map —
+/// dispatched by an EXPLICIT arm in [`apply_key_name`] instead. Both are
+/// genuinely CONV-LESS (no `Format`, no `ValueConv`), so each routes its
+/// `data`-atom value through the SAME full string→numeric→binary cascade as a
+/// map entry ([`ilst_data_convless`], QuickTime.pm:10387-10416) — NOT a typed
+/// single-flavor field. They are hand-dispatched (not auto-codegen'd from the
+/// `-listx` allowlist, which intentionally covers only `direction.*`) because
+/// they resolve via the full-key fallback, not the bare `mdta`-stripped key:
 ///  - `com.android.capture.fps` AndroidCaptureFPS (6763): `Writable => 'float'`
-///    ⇒ the data-atom value is an IEEE float/double (`QuickTimeFormat`), not a
-///    string — needs a typed numeric decode.
+///    is a WRITER hint, NOT a read `Format` ⇒ conv-less. The cascade reads a
+///    float/double flag as an IEEE number, a string flag as the string, etc.
 ///  - `samsung.android.utc_offset` AndroidTimeZone (6769): a non-
-///    `com.apple.quicktime` (full-key-fallback) key, decoded as a typed Keys
-///    field alongside the other Android keys.
+///    `com.apple.quicktime` (full-key-fallback) conv-less key.
+///
+/// `Make`/`Model`/`Software` and the other `com.android.*` keys are likewise
+/// conv-less explicit arms, but are NOT listed here: they carry string readers
+/// (`make()`/`model()`/`software()`) for the domain projection, so they live as
+/// named arms rather than UNPORTED documentation entries.
 pub const KEYS_UNPORTED: &[&str] = &["AndroidCaptureFPS", "AndroidTimeZone"];
 
 // ===========================================================================
@@ -479,6 +489,36 @@ fn truncated_atom_warning(
   std::format!("Truncated '{tag}' data (missing {missing} bytes)")
 }
 
+/// `true` when the header at `pos` is the directory's BARE trailing 8-byte
+/// header — i.e. a prior atom was already walked (`pos > start`) and exactly
+/// the 8-byte header remains before the container end (`end - pos == 8`).
+///
+/// ExifTool's contained `ProcessMOV` loop validates an atom's `size` only
+/// AFTER its bottom-of-loop guard reads the next header; when the previous
+/// atom advanced `$dataPos` to within 8 bytes of `$dirEnd`, the trailing 8
+/// bytes are consumed as the loop terminator (`last if $dataPos >= $dirEnd` /
+/// the short next-header read), NEVER reaching the `$size < 8` / overrun check.
+/// So a bare trailing header carrying a structurally-invalid or overrunning
+/// `size` word emits NO warning (verified vs bundled 13.59 across `size`
+/// `0..=7`, `size == 1` truncated-extended, and a `>EOF` size). The FIRST atom
+/// (`pos == start`) IS validated (it is read before the loop body, so an
+/// invalid first-atom size still warns), and a trailing header WITH a body
+/// (`end - pos > 8`) is a real over-/under-sized atom that ExifTool reads and
+/// warns on — both excluded here. This only suppresses a spurious warning on
+/// malformed input; a well-formed directory never ends on a bare malformed
+/// header, so the happy path is byte-identical.
+///
+/// The SAME rule applies to a *valid* bare trailing header (`size == 8`, a
+/// header-only atom with a zero-length body): ExifTool's `last if $dataPos >=
+/// $dirEnd` (QuickTime.pm:10597, "ignores last value if 0 bytes") fires on the
+/// preceding atom's advance, so the trailing 0-byte atom is never read and
+/// emits NO tag either. The `walk_atoms` `Atom` arm checks this predicate
+/// (plus an empty-body assertion) to skip dispatching such an atom.
+#[inline]
+fn is_bare_trailing_header(pos: usize, start: usize, end: usize) -> bool {
+  pos > start && end.saturating_sub(pos) == 8
+}
+
 /// Iterate the *contained* sibling atoms in `data[start..end]` (a directory
 /// buffer — QuickTime.pm `$dataPt` set), invoking `f` for each. Stops on the
 /// first malformed/truncated header OR a contained `size == 0` terminator
@@ -518,6 +558,26 @@ fn walk_atoms(
   while pos < end {
     match read_atom_header(data, pos, false) {
       Some(HeaderOutcome::Atom(header, next)) => {
+        // A BARE trailing 8-byte header carrying a VALID `size == 8` (a
+        // header-only atom with a ZERO-length body) after ≥1 already-walked
+        // atom is NOT processed by ExifTool: the *preceding* atom's
+        // `$dataPos += $size + 8` advances `$dataPos` to exactly `$dirEnd`, so
+        // `last if $dataPos >= $dirEnd` (QuickTime.pm:10597, commented "ignores
+        // last value if 0 bytes") fires BEFORE the bottom-of-loop next-header
+        // read — the trailing 8 bytes are never read as an atom and no tag is
+        // emitted. Verified vs bundled 13.59: a `udta(©mak, <bare size-8
+        // CAME>)` yields `Make` but NO `SerialNumberHash`, whereas the same
+        // `CAME` with ANY body byte DOES emit it. `is_bare_trailing_header`
+        // already encodes "post-first (`pos > start`) with exactly the 8-byte
+        // remainder (`end - pos == 8`)"; for a non-overrunning `Atom` that
+        // implies `size == 8` ⇒ an empty body (`payload_start == payload_end`),
+        // asserted here so a FIRST atom or a NON-trailing empty atom is
+        // unaffected — only the LAST, empty, non-first atom is skipped,
+        // matching `last if $dataPos >= $dirEnd`. The malformed/truncated
+        // trailing-header arms below carry the same rule for invalid sizes.
+        if is_bare_trailing_header(pos, start, end) && header.payload_start == header.payload_end {
+          break;
+        }
         // Clamp the payload to the parent's declared end (a child must not
         // overrun its container).
         if header.payload_end > end {
@@ -551,12 +611,33 @@ fn walk_atoms(
         // R7/F2: a contained atom whose header was read but whose declared
         // payload overruns EOF — surface the same `Truncated '...' data`
         // warning the top-level loop emits, then stop (`last`).
+        //
+        // …UNLESS it is a BARE trailing 8-byte header after ≥1 already-walked
+        // atom (see [`is_bare_trailing_header`]): ExifTool treats the final 8
+        // bytes of a directory as a non-atom (the loop's `last if $dataPos >=
+        // $dirEnd` / short next-header read fires BEFORE the size check), so a
+        // size word that would overrun is NEVER validated there. Verified vs
+        // bundled 13.59: `moov(mvhd, <size=200 'free' bare header>)` emits NO
+        // warning, whereas the same with ANY body byte emits `Truncated …`.
+        if is_bare_trailing_header(pos, start, end) {
+          break;
+        }
         warning.get_or_insert_with(|| {
           truncated_atom_warning(&atom_type, payload_start, declared_payload_len, end)
         });
         break;
       }
       Some(HeaderOutcome::Malformed { warning: w }) => {
+        // Same directory-boundary rule as `TruncatedAtom`: a structurally
+        // invalid size in a BARE trailing 8-byte header after a prior atom is
+        // the directory's end to ExifTool, not a validated atom — so it emits
+        // no warning. Verified vs bundled 13.59: `moov(mvhd, <size in 1..=7,
+        // bare header>)` ⇒ NONE; a FIRST such atom (`pos == start`) or one with
+        // a body (`end - pos > 8`) still warns (the existing first-atom +
+        // mid-stream tests). Must run BEFORE the `get_or_insert` below.
+        if is_bare_trailing_header(pos, start, end) {
+          break;
+        }
         // R9/F2: a CONTAINED atom whose 8-byte tag/size header WAS read but
         // whose declared size is structurally invalid — a `size` in `2..=7`
         // (`Invalid atom size`), a `size == 1` with a truncated 8-byte
@@ -1715,9 +1796,10 @@ fn walk_udta(
           // `©gpt` CameraPitch, `©gyw` CameraYaw, `©grl` CameraRoll): consult
           // the generated conv-less map by the FULL 4-cc. These are bare
           // `'Name'` international-text atoms (QuickTime.pm:1639/2148-2150),
-          // emitted verbatim under `QuickTime:UserData`.
+          // emitted verbatim under `QuickTime:UserData` (always a string — the
+          // `%QuickTime::UserData` table is `FORMAT => 'string'`).
           if let Some(name) = userdata_convless_name(&t) {
-            ud.push_convless(name, text);
+            ud.push_convless(name, crate::value::TagValue::Str(text.into()));
           }
         }
       }
@@ -1786,10 +1868,14 @@ fn walk_udta(
       // Any OTHER plain 4-cc atom: consult the generated conv-less map (`GoPr`
       // GoProType, `LENS` LensSerialNumber, `FOV\0` FieldOfView — bare `'Name'`
       // plain-string atoms, QuickTime.pm:2117/2119/2131). Emitted verbatim
-      // under `QuickTime:UserData` via the `string`-format NUL-terminated read.
+      // under `QuickTime:UserData` via the `string`-format NUL-terminated read
+      // (the `%QuickTime::UserData` table is `FORMAT => 'string'`).
       other => {
         if let Some(name) = userdata_convless_name(other) {
-          ud.push_convless(name, decode_qt_string(body));
+          ud.push_convless(
+            name,
+            crate::value::TagValue::Str(decode_qt_string(body).into()),
+          );
         }
       }
     }
@@ -1872,19 +1958,32 @@ fn decode_ilst_data(depth: u32, payload: &[u8], w: &mut Option<String>) -> Optio
 }
 
 /// Render an `ilst` `data` value as a string, faithful to the `%stringEncoding`
-/// branch of the `data`-atom handler (QuickTime.pm:357-363, 10393-10398). The
-/// flag's low byte selects the encoding: `1`/`4` = UTF-8, `2`/`5` = UTF-16BE;
-/// any other flag is treated as raw bytes interpreted as UTF-8 (the
-/// camera-metadata keys all carry text values). Trailing NULs are stripped.
-fn ilst_data_string(data: &IlstData) -> String {
+/// branch of the `data`-atom handler (QuickTime.pm:357-363, 10396-10399).
+///
+/// ExifTool string-decodes the value ONLY when the FULL `int32u` flags word is a
+/// `%stringEncoding` key — `1`/`4` = UTF-8, `2`/`5` = UTF-16BE, `3` = ShiftJIS
+/// (QuickTime.pm:357-363). The flags are read as a whole word
+/// (`unpack("...N...")`, QuickTime.pm:10383), so the comparison is exact — a
+/// non-string flag (binary `0x00`, JPEG `0x0d`, int `0x15`/`0x16`, float `0x17`,
+/// double `0x18`, …) takes the `else` branch and is decoded by
+/// `QuickTimeFormat`/left as a binary scalar ref, NOT rendered as text. Such a
+/// value is therefore NOT a string, so `None` is returned and the caller drops
+/// the (string-typed) tag rather than mis-rendering arbitrary bytes as UTF-8.
+///
+/// ShiftJIS (flag `3`) has no dedicated decoder here, so it falls back to the
+/// UTF-8 path (a pre-existing charset-coverage gap, not a leniency: ExifTool
+/// DOES emit a string for flag `3`, just via `Decode(..., 'ShiftJIS')`).
+/// Trailing NULs are stripped (QuickTime.pm:10398 `s/\0$//`).
+fn ilst_data_string(data: &IlstData) -> Option<String> {
   let mut s = match data.flags {
     2 | 5 => decode_utf16be(&data.bytes),
-    _ => String::from_utf8_lossy(&data.bytes).into_owned(),
+    1 | 3 | 4 => String::from_utf8_lossy(&data.bytes).into_owned(),
+    _ => return None,
   };
   while s.ends_with('\0') {
     s.pop();
   }
-  s
+  Some(s)
 }
 
 /// One `keys`-box entry: the `mdta`-stripped key plus the FULL (un-stripped)
@@ -2036,56 +2135,91 @@ fn apply_key_name(
   data: &IlstData,
   keys_out: &mut crate::metadata::QuickTimeKeys,
 ) -> bool {
+  // The CONV-BEARING keys (`creationdate` has `%iso8601Date`, `location.ISO6709`
+  // has `ValueConv => \&ConvertISO6709`, QuickTime.pm:6683-6712) stay bespoke:
+  // they carry a value conversion that the generic conv-less cascade does NOT
+  // apply, so they decode as typed fields. They return `true` (name matched,
+  // ExifTool's `for(;;)` key lookup QuickTime.pm:9807-9824) regardless of
+  // whether the `data` atom is a string — a non-string flag yields `None` from
+  // [`ilst_data_string`] and the typed field is simply not set, mirroring
+  // ExifTool turning a non-string data atom for that tag into a binary scalar
+  // ref this layer does not model.
+  //
+  // EVERY OTHER modeled key (`make`/`model`/`software`/`direction.*`/the
+  // `com.android.*` / `samsung.android.utc_offset` identity set) is genuinely
+  // CONV-LESS in `%QuickTime::Keys` (no `Format`, no `ValueConv` — the table has
+  // no table-level FORMAT either), so it MUST follow the SAME full
+  // string→numeric→binary `data`-atom cascade ExifTool's `ProcessMOV` runs for
+  // a conv-less tag (QuickTime.pm:10387-10416 / [`ilst_data_convless`]). Routing
+  // each through [`crate::metadata::QuickTimeKeys::push_convless`] (by the exact
+  // table `Name`, walk order) keeps EVERY format flag faithful — a `Make` with a
+  // numeric flag emits a number, an `AndroidCaptureFPS` with a string flag emits
+  // the string — instead of the prior typed paths that only handled one flavor.
   match name {
-    "make" => {
-      keys_out.set_make(Some(ilst_data_string(data)));
-    }
-    "model" => {
-      keys_out.set_model(Some(ilst_data_string(data)));
-    }
-    "software" => {
-      keys_out.set_software(Some(ilst_data_string(data)));
-    }
     "creationdate" => {
-      keys_out.set_creation_date(Some(convert_iso8601_date(&ilst_data_string(data))));
+      // ValueConv-bearing (`%iso8601Date` ⇒ `ConvertXMPDate`). ExifTool feeds the
+      // pre-ValueConv `data`-atom value — a string flag → decoded; a numeric flag
+      // → the `ReadValue` number; any other flag → the RAW bytes (the binary
+      // scalar-ref placeholder is gated on NO ValueConv, QuickTime.pm:10411, so it
+      // does NOT apply here) — to the date ValueConv, which passes a NON-date
+      // through verbatim. So `creationdate` ALWAYS emits for ANY flag: a numeric
+      // flag emits the bare number (the `"300"` passthrough re-numberifies via the
+      // terminal EscapeJSON gate), a non-date string emits itself. See
+      // [`ilst_data_valueconv_str`].
+      keys_out.set_creation_date(Some(convert_iso8601_date(&ilst_data_valueconv_str(data))));
     }
     "location.ISO6709" => {
-      // Key PRESENT ⇒ GPS tag always emitted (raw string when undecodable).
-      keys_out.set_gps(Some(parse_iso6709(&ilst_data_string(data))));
+      // ValueConv-bearing (`ConvertISO6709` + `PrintGPSCoordinates`). Same
+      // pre-ValueConv `$val` as `creationdate`. `ConvertISO6709`/
+      // `PrintGPSCoordinates` ALWAYS yield a value (a non-numeric field → `0` via
+      // `ToDMS`), so the GPS tag ALWAYS emits for ANY flag — a numeric flag → e.g.
+      // `"300 deg 0' 0.00\" N, "`, raw/undecodable bytes → parsed or `0`-filled
+      // coordinates.
+      keys_out.set_gps(Some(parse_iso6709(&ilst_data_valueconv_str(data))));
     }
-    // Keys NOT in the com.apple.quicktime namespace (full-key fallback).
+    // Conv-less Apple identity keys (`com.apple.quicktime.*`, stripped form).
+    "make" => {
+      keys_out.push_convless("Make", ilst_data_convless(data));
+    }
+    "model" => {
+      keys_out.push_convless("Model", ilst_data_convless(data));
+    }
+    "software" => {
+      keys_out.push_convless("Software", ilst_data_convless(data));
+    }
+    // Conv-less keys NOT in the com.apple.quicktime namespace (full-key
+    // fallback): the table id keeps the `com.`/vendor prefix, so the stripped
+    // form does not match and the FULL key resolves here.
     "com.android.manufacturer" => {
-      keys_out.set_android_make(Some(ilst_data_string(data)));
+      keys_out.push_convless("AndroidMake", ilst_data_convless(data));
     }
     "com.android.model" => {
-      keys_out.set_android_model(Some(ilst_data_string(data)));
+      keys_out.push_convless("AndroidModel", ilst_data_convless(data));
     }
     "com.android.version" => {
-      keys_out.set_android_version(Some(ilst_data_string(data)));
+      keys_out.push_convless("AndroidVersion", ilst_data_convless(data));
     }
-    // `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
-    // `Writable => 'float'`): the value is NOT a string — with no `Format`,
-    // `QuickTimeFormat($flags,$len)` decodes the data-atom bytes as an IEEE
-    // float (flag 0x17) / double (flag 0x18) (QuickTime.pm:10402-10410 +
-    // 9555-9569). HAND-ported (code-valued numeric).
+    // `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763): the
+    // `Writable => 'float'` is a WRITER hint, NOT a read `Format`, and there is
+    // no `ValueConv` ⇒ the tag is CONV-LESS. So the data-atom value follows the
+    // cascade like any other: a float/double flag (`0x17`/`0x18`) reads an IEEE
+    // number, a string flag emits the string, etc. — NOT a typed-float-only path.
     "com.android.capture.fps" => {
-      let Some(fps) = ilst_data_float(data) else {
-        return false;
-      };
-      keys_out.set_android_capture_fps(Some(fps));
+      keys_out.push_convless("AndroidCaptureFPS", ilst_data_convless(data));
     }
     // `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769): a non-
-    // `com.apple.quicktime` (full-key fallback) plain-string key.
+    // `com.apple.quicktime` (full-key fallback) conv-less key.
     "samsung.android.utc_offset" => {
-      keys_out.set_android_time_zone(Some(ilst_data_string(data)));
+      keys_out.push_convless("AndroidTimeZone", ilst_data_convless(data));
     }
     // Any OTHER key: consult the generated conv-less Keys map (`direction.facing`
-    // CameraDirection, `direction.motion` CameraMotion — bare `Name`
-    // plain-string keys, QuickTime.pm:6735-6736). Emitted verbatim under
-    // `QuickTime:Keys`.
+    // CameraDirection, `direction.motion` CameraMotion — bare `Name` keys with
+    // NO Format/ValueConv, QuickTime.pm:6735-6736). Same full cascade
+    // ([`ilst_data_convless`]), which ALWAYS yields a value (the binary
+    // scalar-ref branch is the catch-all). Emitted verbatim under `QuickTime:Keys`.
     other => match keys_convless_name(other) {
       Some(name) => {
-        keys_out.push_convless(name, ilst_data_string(data));
+        keys_out.push_convless(name, ilst_data_convless(data));
       }
       None => return false,
     },
@@ -2093,53 +2227,286 @@ fn apply_key_name(
   true
 }
 
-/// Decode a `Keys`/`ItemList` `data`-atom value as an IEEE float/double per its
-/// format flag, faithful to the `not $format ⇒ QuickTimeFormat($flags,$len)`
-/// path (QuickTime.pm:10402-10410 + 9555-9569): flag `0x17` = `float` (4-byte
-/// big-endian), `0x18` = `double` (8-byte big-endian). Returns `None` for any
-/// other flag or a short payload (the tag is then dropped — ExifTool would
-/// `ReadValue` an undef and skip it). The value is the IEEE bits as an `f64`.
-fn ilst_data_float(data: &IlstData) -> Option<f64> {
-  match data.flags & 0xff {
-    0x17 => {
-      let b: [u8; 4] = data.bytes.get(..4)?.try_into().ok()?;
-      Some(f64::from(f32::from_be_bytes(b)))
+/// Decode a conv-less `Keys`/`ItemList` `data`-atom value — a tag with NO
+/// `Format` and NO `ValueConv` — into a [`TagValue`], faithful to the full
+/// `data`-atom cascade of `ProcessMOV` (QuickTime.pm:10396-10416). The
+/// `%QuickTime::Keys` table has no table-level `FORMAT`, so its conv-less tags
+/// (e.g. `direction.facing` ⇒ `CameraDirection`) reach this cascade:
+///
+///   1. **String** — `if ($stringEncoding{$flags})` (QuickTime.pm:10396): the
+///      value is decoded as a string (UTF-8 / UTF-16BE / ShiftJIS-via-UTF-8) and
+///      one trailing NUL stripped (10398). Reuses [`ilst_data_string`].
+///   2. **Numeric** — `else { $format = QuickTimeFormat($flags,$len) }`
+///      (QuickTime.pm:10402): a `0x15` signed / `0x16` unsigned / `0x17` float /
+///      `0x18` double / `0x00` (len 1|2) int flag with a length in `{1,2,4,8}`
+///      yields a single-element `ReadValue` NUMBER (QuickTime.pm:9560-9569 +
+///      10409). Emitted as a [`TagValue::I64`] / [`TagValue::U64`] /
+///      [`TagValue::F64`] (a JSON number in both `-j` and `-n`).
+///   3. **Binary** — `elsif (not $$tagInfo{ValueConv}) { $value = \$buf }`
+///      (QuickTime.pm:10411-10414): no string flag and no usable numeric format
+///      (e.g. flag `0x00`/`0x0d` with a length not in `{1,2}`/`{1,2,4,8}`). The
+///      raw bytes become a scalar reference, which `FoundTag` still records
+///      (10442 `if defined $value` — a ref is defined) and the writer renders as
+///      the `(Binary data N bytes, use -b option to extract)` placeholder. Modeled
+///      as [`TagValue::Bytes`] (serializes to exactly that placeholder,
+///      value.rs:1088), so this branch ALWAYS yields a value — matching ExifTool.
+///
+/// Mirrors `QuickTimeFormat`'s EXACT full-`int32u`-flags-word comparison: the
+/// flags are read whole (`unpack("...N...")`, QuickTime.pm:10383), so a word
+/// that merely *ends* in a known flag byte is neither a string nor a number and
+/// falls to the binary branch.
+/// The pre-ValueConv `$val` ExifTool passes to a **ValueConv-bearing** Keys
+/// `data` atom (`creationdate` ⇒ `ConvertXMPDate`, `location.ISO6709` ⇒
+/// `ConvertISO6709`), faithful to `ProcessMOV` (QuickTime.pm:10396-10416). A
+/// ValueConv-bearing tag NEVER takes the binary scalar-ref placeholder branch
+/// (10411 `elsif (not $$tagInfo{ValueConv})`), so the value is always a defined
+/// scalar fed straight to the ValueConv: a `%stringEncoding` flag → the decoded
+/// string; a `QuickTimeFormat` numeric flag → the `ReadValue` number, stringified
+/// (the ValueConv operates on it in string context); any OTHER flag (no usable
+/// format) → the RAW bytes as a lossy string. ALWAYS returns a value (these tags
+/// always `FoundTag`). A numeric string re-numberifies through the terminal
+/// EscapeJSON gate where the ValueConv passes it through (e.g. a numeric
+/// `creationdate` emits the bare number, matching bundled 13.59).
+///
+/// Contrast [`ilst_data_convless`] (NO ValueConv): there a non-string/non-numeric
+/// flag becomes the `(Binary data N bytes…)` placeholder; here it stays raw for
+/// the ValueConv.
+fn ilst_data_valueconv_str(data: &IlstData) -> String {
+  use crate::value::TagValue;
+  // 1. String-encoding flag ⇒ the decoded string.
+  if let Some(s) = ilst_data_string(data) {
+    return s;
+  }
+  // 2. A `QuickTimeFormat` numeric flag ⇒ the `ReadValue` number, stringified.
+  let len = data.bytes.len();
+  match data.flags {
+    0x15 => {
+      if let Some(v) = read_be_int_signed(&data.bytes, len) {
+        return v.to_string();
+      }
     }
-    0x18 => {
-      let b: [u8; 8] = data.bytes.get(..8)?.try_into().ok()?;
-      Some(f64::from_be_bytes(b))
+    0x16 => {
+      if let Some(v) = read_be_int_unsigned(&data.bytes, len) {
+        return v.to_string();
+      }
+    }
+    0x17 | 0x18 => match read_be_floats(&data.bytes, if data.flags == 0x17 { 4 } else { 8 }) {
+      TagValue::F64(f) => return perl_num(f),
+      // Empty (short) or the space-joined multi-value string.
+      TagValue::Str(s) => return s.to_string(),
+      _ => {}
+    },
+    0x00 => {
+      if len == 1 || len == 2 {
+        if let Some(v) = read_be_int_unsigned(&data.bytes, len) {
+          return v.to_string();
+        }
+      }
+    }
+    _ => {}
+  }
+  // 3. No string, no usable numeric format ⇒ the RAW bytes, lossy (fed to the
+  //    ValueConv verbatim — NOT the binary placeholder, which needs no ValueConv).
+  String::from_utf8_lossy(&data.bytes).into_owned()
+}
+
+fn ilst_data_convless(data: &IlstData) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  // 1. String formats (the `%stringEncoding` flags 1..=5).
+  if let Some(s) = ilst_data_string(data) {
+    return TagValue::Str(s.into());
+  }
+  // 2. A numeric format from `QuickTimeFormat($flags, $len)`. For the INTEGER
+  //    flags the format is length-gated (`{...}->{$len}` is defined only for a
+  //    length in `{1,2,4,8}`, and `{1,2}` for `0x00`), so `ReadValue` reads
+  //    exactly one element — a single scalar number — or, for any other length,
+  //    yields no format and falls to the binary branch. The FLOAT/DOUBLE flags
+  //    are NOT length-gated (handled in [`read_be_floats`]).
+  let len = data.bytes.len();
+  match data.flags {
+    // `0x15` signed int: int8s/int16s/int32s/int64s by length.
+    0x15 => {
+      if let Some(v) = read_be_int_signed(&data.bytes, len) {
+        return TagValue::I64(v);
+      }
+    }
+    // `0x16` unsigned int: int8u/int16u/int32u/int64u by length.
+    0x16 => {
+      if let Some(v) = read_be_int_unsigned(&data.bytes, len) {
+        return TagValue::U64(v);
+      }
+    }
+    // `0x17` float / `0x18` double. UNLIKE the integer flags, `QuickTimeFormat`
+    // returns the float/double format UNCONDITIONALLY (QuickTime.pm:9562-9565 —
+    // no `->{$len}` length gate), so this branch NEVER falls through to the
+    // binary scalar-ref case. `ReadValue` with an undef count (ExifTool.pm:
+    // 6296-6331) reads `int(len/elem)` values: the empty scalar for a payload
+    // shorter than one element, a single number, or a space-joined string for
+    // multiple — see [`read_be_floats`].
+    0x17 | 0x18 => {
+      let elem = if data.flags == 0x17 { 4 } else { 8 };
+      return read_be_floats(&data.bytes, elem);
+    }
+    // `0x00` binary: int8u (len 1) / int16u (len 2); any other length ⇒ no
+    // format ⇒ the binary branch below (QuickTime.pm:9568 `{1,2}->{$len}`).
+    0x00 => {
+      if len == 1 || len == 2 {
+        if let Some(v) = read_be_int_unsigned(&data.bytes, len) {
+          return TagValue::U64(v);
+        }
+      }
+    }
+    _ => {}
+  }
+  // 3. No string, no numeric format, no ValueConv ⇒ a binary scalar ref. Stored
+  //    as the raw bytes; the serializer renders the universal binary placeholder
+  //    derived from the byte length (value.rs:1088).
+  TagValue::Bytes(data.bytes.clone())
+}
+
+/// `ReadValue` for a big-endian unsigned `int8u`/`int16u`/`int32u`/`int64u` of
+/// `len` bytes — the [`QuickTimeFormat`]-selected unsigned numeric read
+/// (QuickTime.pm:9560). Returns `None` for a length not in `{1,2,4,8}` or a
+/// short buffer (the `{...}->{$len}` undef ⇒ no format ⇒ the binary branch).
+fn read_be_int_unsigned(bytes: &[u8], len: usize) -> Option<u64> {
+  match len {
+    1 => bytes.first().map(|&b| u64::from(b)),
+    2 => {
+      let b: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+      Some(u64::from(u16::from_be_bytes(b)))
+    }
+    4 => {
+      let b: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+      Some(u64::from(u32::from_be_bytes(b)))
+    }
+    8 => {
+      let b: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+      Some(u64::from_be_bytes(b))
     }
     _ => None,
   }
 }
 
+/// `ReadValue` for a big-endian signed `int8s`/`int16s`/`int32s`/`int64s` of
+/// `len` bytes — the [`QuickTimeFormat`]-selected signed numeric read
+/// (QuickTime.pm:9560). Returns `None` for a length not in `{1,2,4,8}` or a
+/// short buffer.
+fn read_be_int_signed(bytes: &[u8], len: usize) -> Option<i64> {
+  match len {
+    1 => bytes.first().map(|&b| i64::from(b as i8)),
+    2 => {
+      let b: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+      Some(i64::from(i16::from_be_bytes(b)))
+    }
+    4 => {
+      let b: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+      Some(i64::from(i32::from_be_bytes(b)))
+    }
+    8 => {
+      let b: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+      Some(i64::from_be_bytes(b))
+    }
+    _ => None,
+  }
+}
+
+/// `ReadValue` for a big-endian `float` (`elem` = 4) / `double` (`elem` = 8)
+/// list read with an undef `count` — the conv-less `0x17`/`0x18` data-atom path.
+/// `QuickTimeFormat` selects the format from the flag ALONE (QuickTime.pm:
+/// 9562-9565), so the read is NOT length-gated and never falls to the binary
+/// branch. Mirrors `ReadValue` (ExifTool.pm:6296-6331) for `count` undef: a
+/// payload shorter than one element yields the empty scalar (`return ''`);
+/// otherwise `n = int(len / elem)` values are read and returned as a single
+/// [`TagValue::F64`] number (`n == 1`) or a space-joined [`perl_num`] string
+/// (`n > 1`). A trailing partial element is ignored, exactly as `ReadValue`'s
+/// `int($size / $len)` truncates the count.
+fn read_be_floats(bytes: &[u8], elem: usize) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  let vals: Vec<f64> = bytes
+    .chunks_exact(elem)
+    .map(|c| {
+      if elem == 4 {
+        f64::from(f32::from_be_bytes(c.try_into().unwrap_or([0; 4])))
+      } else {
+        f64::from_be_bytes(c.try_into().unwrap_or([0; 8]))
+      }
+    })
+    .collect();
+  match vals.as_slice() {
+    // `ReadValue` `return ''` when the payload is shorter than one element.
+    [] => TagValue::Str("".into()),
+    [one] => TagValue::F64(*one),
+    many => TagValue::Str(
+      many
+        .iter()
+        .map(|v| perl_num(*v))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into(),
+    ),
+  }
+}
+
 // ── SP2 text decode (international text + UTF-16BE) ───────────────────────
 
-/// Decode the FIRST international-text entry of a `©`-prefixed `udta` atom
-/// payload, faithful to the `$tag =~ /^\xa9/` loop of `ProcessMOV`
-/// (QuickTime.pm:10454-10516). Each entry is `int16u len`, `int16u lang`, then
-/// `len` bytes of text. ExifTool tolerates a `len` that does or does not
-/// include the 4-byte header (QuickTime.pm:10470-10478); SP2 decodes the first
-/// entry, which is what the camera-metadata atoms carry. Returns the decoded,
-/// NUL-trimmed text.
+/// Decode the FIRST non-empty international-text entry of a `©`-prefixed `udta`
+/// atom payload, faithful to the `$tag =~ /^\xa9/` entry loop of `ProcessMOV`
+/// (QuickTime.pm:10461-10524). Each entry is `int16u len`, `int16u lang`, then
+/// `len` bytes of text. The loop is reproduced exactly:
+///
+///   - `last if $pos + 4 > $size` (10472): stop when no 4-byte header remains.
+///   - read `($len,$lang)`, `$pos += 4` (10473-10474).
+///   - **len-overrun retry** (10477-10480): "nobody adds the 4 header bytes to
+///     `$len`, so try either" — `if ($pos+$len > $size) { $len -= 4; last if
+///     $pos+$len > $size or $len < 0 }`. With unsigned `len`, the `$len -= 4`
+///     underflow (when `len < 4`) is the `$len < 0` bail.
+///   - **skip empty entries** (10483): `next if not $len and $pos`. `$pos` is
+///     already advanced (`>= 4`), so this skips EVERY zero-length entry — it
+///     does NOT bail the loop. A leading empty/NUL-padding entry is stepped over
+///     and the next entry is tried.
+///   - otherwise decode `substr($val,$pos,$len)` via [`decode_qt_text`] (the
+///     lang/charset branch, 10485-10516) and `$pos += $len`.
+///
+/// ExifTool's loop `FoundTag`s EVERY non-empty entry; this typed layer surfaces
+/// the camera-metadata atom's value, so it returns the FIRST non-empty decoded
+/// entry (an all-empty/short payload yields `None` ⇒ no tag).
 fn decode_itext_first(payload: &[u8]) -> Option<String> {
-  // QuickTime.pm:10468 `($len,$lang) = unpack("x${pos}nn",$val)`.
-  let len = be_u16(payload, 0)? as usize;
-  let lang = be_u16(payload, 2)?;
-  let body_start = 4usize;
-  // QuickTime.pm:10474-10477: if `pos+len` overruns, retry with `len-4`.
-  let text_slice = if let Some(end) = body_start.checked_add(len).filter(|&e| e <= payload.len()) {
-    payload.get(body_start..end)?
-  } else if len >= 4
-    && let Some(end) = body_start
-      .checked_add(len - 4)
-      .filter(|&e| e <= payload.len())
-  {
-    payload.get(body_start..end)?
-  } else {
-    return None;
-  };
-  Some(decode_qt_text(text_slice, lang))
+  let size = payload.len();
+  let mut pos = 0usize;
+  loop {
+    // QuickTime.pm:10472 `last if $pos + 4 > $size`.
+    if pos.checked_add(4).is_none_or(|e| e > size) {
+      return None;
+    }
+    // QuickTime.pm:10473 `($len,$lang) = unpack("x${pos}nn",$val)`.
+    let mut len = be_u16(payload, pos)? as usize;
+    let lang = be_u16(payload, pos + 2)?;
+    // QuickTime.pm:10474 `$pos += 4`.
+    pos += 4;
+    // QuickTime.pm:10477-10480 — len-overrun retry (allow for the 4 header bytes
+    // either being included in `$len` or not).
+    if pos.checked_add(len).is_none_or(|e| e > size) {
+      // `$len -= 4`; `last if $pos + $len > $size or $len < 0` (the unsigned
+      // underflow for `len < 4` IS the `$len < 0` bail).
+      let Some(adj) = len.checked_sub(4) else {
+        return None;
+      };
+      len = adj;
+      if pos.checked_add(len).is_none_or(|e| e > size) {
+        return None;
+      }
+    }
+    // QuickTime.pm:10483 `next if not $len and $pos` — skip an empty entry (pos
+    // is always >= 4 here) and continue to the next (the bottom `$pos += $len`
+    // is reached only after a FoundTag, so a skipped entry advances `pos` only
+    // by its already-consumed 4-byte header).
+    if len == 0 {
+      continue;
+    }
+    // QuickTime.pm:10484 `$str = substr($val, $pos, $len)`.
+    let text_slice = payload.get(pos..pos + len)?;
+    return Some(decode_qt_text(text_slice, lang));
+  }
 }
 
 /// Decode a `udta` international-text byte slice, faithful to the
@@ -4505,47 +4872,41 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
-      // The generated conv-less plain-string atoms (`GoProType` /
-      // `LensSerialNumber` / `FieldOfView` / `MakerURL` / `CameraPitch` /
-      // `CameraYaw` / `CameraRoll`), emitted by Name in walk order. Conv-less ⇒
-      // the value is mode-invariant; all are known table keys ⇒ `unknown:
-      // false`.
+      // The generated conv-less atoms (`GoProType` / `LensSerialNumber` /
+      // `FieldOfView` / `MakerURL` / `CameraPitch` / `CameraYaw` / `CameraRoll`),
+      // emitted by Name in walk order. Conv-less ⇒ the stored [`TagValue`] is
+      // mode-invariant (always a string for UserData); all are known table keys
+      // ⇒ `unknown: false`.
       for (name, value) in ud.convless() {
         tags.push(EmittedTag::new(
           user_data(),
           name.clone(),
-          TagValue::Str(value.as_str().into()),
+          value.clone(),
           false,
         ));
       }
     }
 
     // ── SP2: moov/meta Keys/ItemList (QuickTime.pm:6651-6760) ──────────
-    // Group `QuickTime:Keys` (family-0 `QuickTime`, family-1 `Keys`). Software
-    // is emitted as the raw text value — a numeric-looking value (`"17.3"`)
-    // value-equals the bundled JSON number under the conformance gate. The date
-    // and GPSCoordinates follow the same conversions as UserData.
+    // Group `QuickTime:Keys` (family-0 `QuickTime`, family-1 `Keys`). All the
+    // CONV-LESS identity keys (`Make`/`Model`/`Software`/`AndroidMake`/
+    // `AndroidModel`/`AndroidVersion`/`AndroidCaptureFPS`/`AndroidTimeZone`/
+    // `CameraDirection`/`CameraMotion`) flow through the generic `convless` loop
+    // below — each carries its full string→numeric→binary cascade `TagValue`
+    // ([`ilst_data_convless`], mode-invariant), so a string flag emits a string,
+    // a numeric flag a number, a float flag the IEEE value, etc. Only the two
+    // CONV-BEARING keys are emitted typed here: `CreationDate` (`%iso8601Date`)
+    // and `GPSCoordinates` (`ConvertISO6709` + `PrintGPSCoordinates`).
     let keys = self.qt.keys();
     if !keys.is_empty() {
       let keys_group = || Group::new("QuickTime", "Keys");
-      for (val, name) in [
-        (keys.make(), "Make"),
-        (keys.model(), "Model"),
-        (keys.software(), "Software"),
-        (keys.creation_date(), "CreationDate"),
-        // Keys NOT in the com.apple.quicktime namespace (full-key fallback).
-        (keys.android_make(), "AndroidMake"),
-        (keys.android_model(), "AndroidModel"),
-        (keys.android_version(), "AndroidVersion"),
-      ] {
-        if let Some(v) = val {
-          tags.push(EmittedTag::new(
-            keys_group(),
-            name.into(),
-            TagValue::Str(v.into()),
-            false,
-          ));
-        }
+      if let Some(date) = keys.creation_date() {
+        tags.push(EmittedTag::new(
+          keys_group(),
+          "CreationDate".into(),
+          TagValue::Str(date.into()),
+          false,
+        ));
       }
       if let Some(gps) = keys.gps() {
         tags.push(EmittedTag::new(
@@ -4555,34 +4916,15 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
-      // `com.android.capture.fps` AndroidCaptureFPS — the IEEE float value
-      // (`Writable => 'float'`, no PrintConv ⇒ the numeric value is emitted in
-      // BOTH modes; the F32→F64 widening is exact, so `%.15g` renders the float
-      // verbatim, e.g. `29.97`).
-      if let Some(fps) = keys.android_capture_fps() {
-        tags.push(EmittedTag::new(
-          keys_group(),
-          "AndroidCaptureFPS".into(),
-          TagValue::F64(fps),
-          false,
-        ));
-      }
-      // `samsung.android.utc_offset` AndroidTimeZone — plain string.
-      if let Some(v) = keys.android_time_zone() {
-        tags.push(EmittedTag::new(
-          keys_group(),
-          "AndroidTimeZone".into(),
-          TagValue::Str(v.into()),
-          false,
-        ));
-      }
-      // The generated conv-less plain-string Keys atoms (`CameraDirection` /
-      // `CameraMotion`), emitted by Name in walk order (mode-invariant).
+      // The conv-less Keys atoms (every modeled key except CreationDate/GPS),
+      // emitted by Name in walk order. The stored [`TagValue`] carries the full
+      // string→numeric→binary cascade result ([`ilst_data_convless`]) and is
+      // mode-invariant (conv-less ⇒ identical under `-j`/`-n`).
       for (name, value) in keys.convless() {
         tags.push(EmittedTag::new(
           keys_group(),
           name.clone(),
-          TagValue::Str(value.as_str().into()),
+          value.clone(),
           false,
         ));
       }
@@ -5042,9 +5384,13 @@ mod tests {
     assert_eq!(unpack_h_star(&[]), "");
   }
 
-  /// The generated conv-less maps resolve the verified atoms (by 4cc / key) and
-  /// reject everything else — incl. the conv-bearing `CAME`/`MUID` (UNPORTED),
-  /// which must NOT leak into the UserData map.
+  /// The GENERATED conv-less maps resolve only their verified-allowlist atoms
+  /// (by 4cc / key) and reject everything else. The conv-BEARING `CAME`/`MUID`
+  /// must NOT leak into the UserData map; the hand-dispatched Keys identity atoms
+  /// (`make`/`com.android.capture.fps`/`samsung.android.utc_offset`, …) are
+  /// EXPLICIT arms in [`apply_key_name`], NOT generated-map entries — so they too
+  /// must be absent from the generated lookup (they still route through the same
+  /// [`ilst_data_convless`] cascade, just by hand).
   #[test]
   fn convless_lookup_covers_only_verified_atoms() {
     assert_eq!(userdata_convless_name(b"GoPr"), Some("GoProType"));
@@ -5059,48 +5405,456 @@ mod tests {
     assert_eq!(userdata_convless_name(b"MUID"), None);
     assert_eq!(userdata_convless_name(b"manu"), None);
 
+    // The GENERATED Keys map covers only the `direction.*` allowlist.
     assert_eq!(
       keys_convless_name("direction.facing"),
       Some("CameraDirection")
     );
     assert_eq!(keys_convless_name("direction.motion"), Some("CameraMotion"));
-    // The hand-ported / unmodeled keys are NOT in the conv-less map.
+    // The hand-dispatched explicit-arm keys are NOT in the generated map (they
+    // route through `ilst_data_convless` via their own match arms instead).
     assert_eq!(keys_convless_name("com.android.capture.fps"), None);
     assert_eq!(keys_convless_name("samsung.android.utc_offset"), None);
     assert_eq!(keys_convless_name("make"), None);
   }
 
-  /// `ilst_data_float` decodes the data-atom value by its format flag (the
-  /// `QuickTimeFormat` path): `0x17` = big-endian IEEE `float`, `0x18` =
-  /// `double`; any other flag or a short payload → `None`.
+  /// The rerouted conv-less identity keys (`make` / `com.android.capture.fps`)
+  /// now run through [`ilst_data_convless`] like any other conv-less Keys atom,
+  /// so EVERY format flag is faithful — a `Make` with a NUMERIC flag emits a
+  /// number (`U64`), an `AndroidCaptureFPS` with a STRING flag emits the string,
+  /// a multi-float emits the space-joined string — matching the bundled-13.59
+  /// oracle for the crafted `QuickTime_sp2_keys_*` fixtures. (The OLD per-key
+  /// typed paths required one specific flavor and dropped/truncated the rest.)
   #[test]
-  fn ilst_data_float_by_format_flag() {
-    let f32_data = IlstData {
-      flags: 0x17,
-      bytes: 29.97_f32.to_be_bytes().to_vec(),
-    };
-    // f32→f64 widening is exact; compare against the same widening.
-    assert_eq!(ilst_data_float(&f32_data), Some(f64::from(29.97_f32)));
+  fn rerouted_keys_follow_convless_cascade_on_every_flag() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
 
-    let f64_data = IlstData {
-      flags: 0x18,
-      bytes: 1.5_f64.to_be_bytes().to_vec(),
-    };
-    assert_eq!(ilst_data_float(&f64_data), Some(1.5));
+    // `make` with a NUMERIC flag (0x16 int16u 0x012c = 300) ⇒ U64(300), emitted
+    // under tag `Make` in walk order (bundled: `Keys:Make` = the number 300).
+    let mut k = QuickTimeKeys::new();
+    assert!(apply_key_name(
+      "make",
+      &IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0x2c],
+      },
+      &mut k,
+    ));
+    assert_eq!(
+      k.convless(),
+      [("Make".into(), TagValue::U64(300))],
+      "numeric-flag Make must emit the number, not be dropped"
+    );
 
-    // A string flag (UTF-8) is NOT a float → None (the caller keeps the tag out).
-    let str_data = IlstData {
+    // `com.android.capture.fps` with a STRING flag (0x01 "29.97") ⇒ Str.
+    let mut k = QuickTimeKeys::new();
+    assert!(apply_key_name(
+      "com.android.capture.fps",
+      &IlstData {
+        flags: 0x01,
+        bytes: b"29.97".to_vec(),
+      },
+      &mut k,
+    ));
+    assert_eq!(
+      k.convless(),
+      [("AndroidCaptureFPS".into(), TagValue::Str("29.97".into()))],
+      "string-flag AndroidCaptureFPS must emit the string, not be dropped"
+    );
+
+    // `com.android.capture.fps` SHORT float (0x17, 2 bytes) ⇒ "" (empty string).
+    let mut k = QuickTimeKeys::new();
+    apply_key_name(
+      "com.android.capture.fps",
+      &IlstData {
+        flags: 0x17,
+        bytes: vec![0x3f, 0xc0],
+      },
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [("AndroidCaptureFPS".into(), TagValue::Str("".into()))]
+    );
+
+    // `com.android.capture.fps` MULTI float (0x17, two floats 1.5 2.5) ⇒
+    // "1.5 2.5" (space-joined; the OLD typed path read only the first element).
+    let mut k = QuickTimeKeys::new();
+    let mut bytes = 1.5_f32.to_be_bytes().to_vec();
+    bytes.extend_from_slice(&2.5_f32.to_be_bytes());
+    apply_key_name(
+      "com.android.capture.fps",
+      &IlstData { flags: 0x17, bytes },
+      &mut k,
+    );
+    assert_eq!(
+      k.convless(),
+      [("AndroidCaptureFPS".into(), TagValue::Str("1.5 2.5".into()))]
+    );
+  }
+
+  /// After rerouting Make/Model/Software through the conv-less cascade, the
+  /// domain-layer accessors `make()`/`model()`/`software()` are backed by a
+  /// `convless` scan and STILL return the string value when the `data` atom is a
+  /// string (the iOS camera case the `CameraInfo` projection reads). A
+  /// non-string flag stores a non-`Str` value ⇒ the accessor yields `None`
+  /// (faithful to the typed-string source it replaced, which also dropped it).
+  #[test]
+  fn keys_make_model_software_accessors_back_by_convless_scan() {
+    use crate::metadata::QuickTimeKeys;
+    use crate::value::TagValue;
+
+    let mut k = QuickTimeKeys::new();
+    for (key, val) in [
+      ("make", "Apple Computer"),
+      ("model", "iPhone 15 Pro Max"),
+      ("software", "17.3"),
+    ] {
+      assert!(apply_key_name(
+        key,
+        &IlstData {
+          flags: 0x01,
+          bytes: val.as_bytes().to_vec(),
+        },
+        &mut k,
+      ));
+    }
+    assert_eq!(k.make(), Some("Apple Computer"));
+    assert_eq!(k.model(), Some("iPhone 15 Pro Max"));
+    assert_eq!(k.software(), Some("17.3"));
+
+    // A numeric-flag Make stores U64, so the string accessor returns None even
+    // though the `Make` tag IS emitted (as a number) via `convless()`.
+    let mut k = QuickTimeKeys::new();
+    apply_key_name(
+      "make",
+      &IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0x2c],
+      },
+      &mut k,
+    );
+    assert_eq!(k.make(), None);
+    assert_eq!(k.convless(), [("Make".into(), TagValue::U64(300))]);
+  }
+
+  /// `ilst_data_convless` implements the FULL conv-less `data`-atom cascade
+  /// (QuickTime.pm:10396-10416): a `%stringEncoding` flag ⇒ a string; else a
+  /// `QuickTimeFormat` numeric flag ⇒ a number; else (no usable format, no
+  /// ValueConv) ⇒ the binary scalar-ref placeholder. EVERY branch yields a value
+  /// (the binary branch is the catch-all). Pins all three against the byte forms
+  /// the bundled 13.59 oracle produced for the crafted Keys fixtures.
+  #[test]
+  fn ilst_data_convless_string_numeric_binary_cascade() {
+    use crate::value::TagValue;
+    // 1. STRING (flag 0x01 UTF-8) ⇒ TagValue::Str.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x01,
+        bytes: b"front".to_vec(),
+      }),
+      TagValue::Str("front".into())
+    );
+    // 2a. NUMERIC unsigned (0x16, len 2 = 0x012c) ⇒ TagValue::U64(300) — the
+    //     bundled oracle emits the JSON number `300`.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0x2c],
+      }),
+      TagValue::U64(300)
+    );
+    // 2b. NUMERIC unsigned (0x16, len 4) ⇒ TagValue::U64.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x00, 0x00, 0x04, 0xd2],
+      }),
+      TagValue::U64(1234)
+    );
+    // 2c. NUMERIC signed (0x15, len 2 = 0xffff = -1) ⇒ TagValue::I64(-1).
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x15,
+        bytes: vec![0xff, 0xff],
+      }),
+      TagValue::I64(-1)
+    );
+    // 2d. NUMERIC float (0x17) / double (0x18) ⇒ TagValue::F64.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x17,
+        bytes: 29.97_f32.to_be_bytes().to_vec(),
+      }),
+      TagValue::F64(f64::from(29.97_f32))
+    );
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x18,
+        bytes: 1.5_f64.to_be_bytes().to_vec(),
+      }),
+      TagValue::F64(1.5)
+    );
+    // 2e. `0x00` with len 1 / 2 IS int8u / int16u (QuickTimeFormat 9568).
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x00,
+        bytes: vec![0x2a],
+      }),
+      TagValue::U64(42)
+    );
+    // 3a. BINARY: flag `0x00` with len 3 ⇒ no QuickTimeFormat ⇒ binary scalar
+    //     ref ⇒ TagValue::Bytes (renders `(Binary data 3 bytes, ...)`). This is
+    //     the exact byte form the bundled oracle produced.
+    let bin = ilst_data_convless(&IlstData {
+      flags: 0x00,
+      bytes: vec![0x01, 0x02, 0x03],
+    });
+    assert_eq!(bin, TagValue::Bytes(vec![0x01, 0x02, 0x03]));
+    // 3b. BINARY: JPEG flag `0x0d` (not a string, not a numeric format).
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x0d,
+        bytes: vec![0xff, 0xd8, 0xff],
+      }),
+      TagValue::Bytes(vec![0xff, 0xd8, 0xff])
+    );
+    // 3c. BINARY: an unsigned-int flag (0x16) with a non-{1,2,4,8} length (3) ⇒
+    //     QuickTimeFormat returns undef ⇒ the binary branch (NOT a number).
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0x02, 0x03],
+      }),
+      TagValue::Bytes(vec![0x01, 0x02, 0x03])
+    );
+    // 3d. BINARY: a high-bit flags word that merely ENDS in a known flag byte is
+    //     neither string nor numeric (full-word compare) ⇒ binary.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x0100_0016,
+        bytes: vec![0x00, 0x01],
+      }),
+      TagValue::Bytes(vec![0x00, 0x01])
+    );
+  }
+
+  /// `read_be_floats` mirrors `ReadValue` with an undef count (ExifTool.pm:
+  /// 6296-6331) for the conv-less `0x17` float / `0x18` double path, where
+  /// `QuickTimeFormat` is NOT length-gated: a payload shorter than one element
+  /// is the empty scalar (`""`), one element is a single `F64` number, and
+  /// several are a space-joined `perl_num` string. A trailing partial element is
+  /// ignored (`int(size/len)` truncation). The byte forms + emitted values are
+  /// exactly what the bundled 13.59 oracle produced for the crafted float/double
+  /// fixtures (`""`, `1.5`, `"1.5 2.5"`).
+  #[test]
+  fn read_be_floats_mirrors_readvalue_count_undef() {
+    use crate::value::TagValue;
+    // SHORT: flag 0x17 (float, elem 4) with only 2 bytes ⇒ ReadValue `return ''`
+    // ⇒ empty string (NOT the binary placeholder, NOT dropped).
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x17,
+        bytes: vec![0x3f, 0xc0],
+      }),
+      TagValue::Str("".into())
+    );
+    // SINGLE: one big-endian float 1.5 ⇒ a single F64 number.
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x17,
+        bytes: 1.5_f32.to_be_bytes().to_vec(),
+      }),
+      TagValue::F64(1.5)
+    );
+    // MULTI float: two floats 1.5, 2.5 ⇒ "1.5 2.5" (space-joined string).
+    let mut two_floats = 1.5_f32.to_be_bytes().to_vec();
+    two_floats.extend_from_slice(&2.5_f32.to_be_bytes());
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x17,
+        bytes: two_floats,
+      }),
+      TagValue::Str("1.5 2.5".into())
+    );
+    // MULTI double: two doubles 1.5, 2.5 (elem 8) ⇒ "1.5 2.5".
+    let mut two_doubles = 1.5_f64.to_be_bytes().to_vec();
+    two_doubles.extend_from_slice(&2.5_f64.to_be_bytes());
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x18,
+        bytes: two_doubles,
+      }),
+      TagValue::Str("1.5 2.5".into())
+    );
+    // TRAILING PARTIAL: float 1.5 + 2 extra bytes (len 6) ⇒ int(6/4)=1 value ⇒
+    // F64(1.5); the partial trailing element is ignored, as `ReadValue` truncates.
+    let mut one_and_partial = 1.5_f32.to_be_bytes().to_vec();
+    one_and_partial.extend_from_slice(&[0xff, 0xff]);
+    assert_eq!(
+      ilst_data_convless(&IlstData {
+        flags: 0x17,
+        bytes: one_and_partial,
+      }),
+      TagValue::F64(1.5)
+    );
+  }
+
+  /// `ilst_data_valueconv_str` extracts the pre-ValueConv `$val` that a
+  /// ValueConv-bearing Keys atom (creationdate/location) feeds to its conv
+  /// (QuickTime.pm:10396-10416): a string flag → the decoded string; a numeric
+  /// flag → the `ReadValue` number stringified; any OTHER flag → the RAW bytes
+  /// (lossy) — NEVER the binary placeholder (that branch needs no ValueConv).
+  /// Always returns a value.
+  #[test]
+  fn ilst_data_valueconv_str_is_the_pre_valueconv_scalar() {
+    // string flag (0x01) → the decoded string.
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x01,
+        bytes: b"2024".to_vec(),
+      }),
+      "2024"
+    );
+    // numeric unsigned (0x16, 300) → "300" (re-numberifies via the downstream gate).
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x01, 0x2c],
+      }),
+      "300"
+    );
+    // numeric signed (0x15, 0xffff = -1) → "-1".
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x15,
+        bytes: vec![0xff, 0xff],
+      }),
+      "-1"
+    );
+    // float (0x17, 1.5) → "1.5".
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x17,
+        bytes: 1.5_f32.to_be_bytes().to_vec(),
+      }),
+      "1.5"
+    );
+    // binary/no-format flag (0x00, len 12) → the raw bytes, lossy (fed to the
+    // ValueConv verbatim — e.g. an ISO6709 string carried under a binary flag).
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x00,
+        bytes: b"+12.3+045.6/".to_vec(),
+      }),
+      "+12.3+045.6/"
+    );
+    // a numeric flag with a non-{1,2,4,8} length yields NO format ⇒ raw bytes.
+    assert_eq!(
+      ilst_data_valueconv_str(&IlstData {
+        flags: 0x16,
+        bytes: vec![0x41, 0x42, 0x43],
+      }),
+      "ABC"
+    );
+  }
+
+  /// `ilst_data_string` decodes ONLY the `%stringEncoding` flags (the FULL word
+  /// ∈ {1,2,3,4,5}, QuickTime.pm:357-363). A non-string flag (binary `0x00`,
+  /// JPEG `0x0d`, int `0x16`, float `0x17`, double `0x18`, or a high-bit word
+  /// like `0x01000001`) is NOT string-decoded by ExifTool, so it returns `None`
+  /// and the caller drops the (string-typed) tag rather than mis-rendering the
+  /// bytes as lossy UTF-8.
+  #[test]
+  fn ilst_data_string_matches_string_encoding_flags() {
+    let utf8 = IlstData {
       flags: 0x01,
-      bytes: b"29.97".to_vec(),
+      bytes: b"front".to_vec(),
     };
-    assert_eq!(ilst_data_float(&str_data), None);
+    assert_eq!(ilst_data_string(&utf8).as_deref(), Some("front"));
+    let utf8_sort = IlstData {
+      flags: 0x04,
+      bytes: b"front".to_vec(),
+    };
+    assert_eq!(ilst_data_string(&utf8_sort).as_deref(), Some("front"));
+    let utf16 = IlstData {
+      flags: 0x02,
+      bytes: vec![0x00, 0x66, 0x00, 0x6f, 0x00, 0x6f], // "foo" UTF-16BE
+    };
+    assert_eq!(ilst_data_string(&utf16).as_deref(), Some("foo"));
+    // Trailing NUL stripped (QuickTime.pm:10398-10399).
+    let utf8_nul = IlstData {
+      flags: 0x01,
+      bytes: b"front\0".to_vec(),
+    };
+    assert_eq!(ilst_data_string(&utf8_nul).as_deref(), Some("front"));
+    // Non-string flags ⇒ None (not rendered as UTF-8 text).
+    for flag in [
+      0x00u32,
+      0x0d,
+      0x0e,
+      0x15,
+      0x16,
+      0x17,
+      0x18,
+      0x1b,
+      0x0100_0001,
+    ] {
+      assert_eq!(
+        ilst_data_string(&IlstData {
+          flags: flag,
+          bytes: b"front".to_vec(),
+        }),
+        None,
+        "flag {flag:#x} is not a %stringEncoding key and must not string-decode"
+      );
+    }
+  }
 
-    // A short float payload → None.
-    let short = IlstData {
-      flags: 0x17,
-      bytes: vec![0x41, 0xef],
-    };
-    assert_eq!(ilst_data_float(&short), None);
+  /// The international-text loop SKIPS empty entries and CONTINUES to later ones
+  /// (QuickTime.pm:10483 `next if not $len and $pos`), it does NOT bail. So an
+  /// empty first entry followed by a real one yields the real one; an only-empty
+  /// (or too-short-for-a-second-header) payload yields no value. Verified vs
+  /// bundled 13.59 (the crafted `QuickTime_sp2_itext_empty_*` fixtures).
+  #[test]
+  fn decode_itext_first_skips_empty_and_continues() {
+    // Only entry is empty (len=0) ⇒ no value (next header would overrun).
+    assert_eq!(decode_itext_first(&[0x00, 0x00, 0x00, 0x00]), None);
+    // Empty header + only 2 trailing bytes ⇒ no room for a second 4-byte header
+    // (`pos=4`, `pos+4=8 > size=6`) ⇒ no value.
+    assert_eq!(
+      decode_itext_first(&[0x00, 0x00, 0x00, 0x00, b'h', b'i']),
+      None
+    );
+    // Empty first entry FOLLOWED BY a valid (len=2, lang=0, "Hi") entry ⇒ the
+    // empty one is skipped and the later one is returned (the Finding-2 fix; the
+    // pre-fix code bailed on the empty first entry and returned None).
+    assert_eq!(
+      decode_itext_first(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, b'H', b'i']).as_deref(),
+      Some("Hi")
+    );
+    // Two empty entries then a valid one ⇒ still reaches the valid one.
+    assert_eq!(
+      decode_itext_first(&[
+        0x00, 0x00, 0x00, 0x00, // empty entry 1
+        0x00, 0x00, 0x00, 0x00, // empty entry 2
+        0x00, 0x03, 0x00, 0x00, b'a', b'b', b'c', // "abc"
+      ])
+      .as_deref(),
+      Some("abc")
+    );
+    // A lone non-empty entry (len=2, lang=0, "Hi") decodes directly.
+    assert_eq!(
+      decode_itext_first(&[0x00, 0x02, 0x00, 0x00, b'H', b'i']).as_deref(),
+      Some("Hi")
+    );
+    // len-overrun retry: a `len` that includes the 4 header bytes (len=6 for a
+    // 2-byte "Hi") is accepted via the `$len -= 4` path.
+    assert_eq!(
+      decode_itext_first(&[0x00, 0x06, 0x00, 0x00, b'H', b'i']).as_deref(),
+      Some("Hi")
+    );
   }
 
   /// `ConvertISO6709` has NO `else` branch: an undecodable string is returned
@@ -7538,5 +8292,291 @@ mod tests {
     let mut meta2 = GoProMeta::new();
     let _ = quicktime_stream::extract_stream(&trunc, None, None, &mut meta2);
     assert!(meta2.is_empty());
+  }
+
+  // ===========================================================================
+  // Golden-v2 robustness contracts — box/atom walker hardening (SP2 Part 3)
+  // ===========================================================================
+
+  /// A minimal valid v0 `mvhd` payload (100 bytes) carrying `TimeScale` and
+  /// `Duration`, used to assert "tags decoded before a malformed sibling are
+  /// preserved" (Contract 2 — do NOT drop tags already extracted).
+  fn mvhd_ts_dur(ts: u32, dur: u32) -> Vec<u8> {
+    let mut v = 108u32.to_be_bytes().to_vec(); // size word (8 + 100 payload)
+    v.extend_from_slice(b"mvhd");
+    let mut payload = vec![0u8; 100];
+    wr(&mut payload, 12, &ts.to_be_bytes()); // TimeScale @ idx 3
+    wr(&mut payload, 16, &dur.to_be_bytes()); // Duration  @ idx 4
+    v.extend_from_slice(&payload);
+    v
+  }
+
+  /// Wrap a `moov(body)` behind a recognized `ftyp` so [`parse_inner`] accepts
+  /// the file (the first-atom gate keys on the 4-cc only).
+  fn file_with_moov(moov_body: &[u8]) -> Vec<u8> {
+    let mut full = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    full.extend_from_slice(&atom(b"moov", moov_body));
+    full
+  }
+
+  /// **Contract 2 (recovery Step + tags-before-corruption preserved).** A valid
+  /// `mvhd` followed by a malformed sibling: the `mvhd`-derived `TimeScale` /
+  /// `Duration` MUST survive (the walk stops at the bad atom but keeps what it
+  /// already decoded), faithful to ExifTool's `last`-after-extract.
+  ///
+  /// **Diagnostics faithfulness (Contract 4).** A BARE trailing 8-byte
+  /// malformed header after a prior atom is the directory boundary to ExifTool
+  /// (the loop terminates BEFORE the size check), so it emits NO warning —
+  /// across `size` `1..=7`, `size == 0`, a truncated `size == 1` extended
+  /// header, and a `>EOF` size. Each row here was verified against bundled
+  /// ExifTool 13.59 (`moov(mvhd, <trailer>)` ⇒ the listed warning/none).
+  #[test]
+  fn valid_tags_survive_trailing_malformed_sibling() {
+    let hdr = |sz: u32, t: &[u8; 4]| {
+      let mut v = sz.to_be_bytes().to_vec();
+      v.extend_from_slice(t);
+      v
+    };
+    // (trailer bytes, expected document warning) — oracle-verified, ExifTool 13.59.
+    let bare_none: &[(Vec<u8>, Option<&str>)] = &[
+      (hdr(0, b"free"), None),   // size-0 terminator
+      (hdr(1, b"junk"), None),   // truncated extended-size header, bare
+      (hdr(2, b"junk"), None),   // invalid size, bare trailing
+      (hdr(4, b"junk"), None),   // invalid size, bare trailing
+      (hdr(7, b"junk"), None),   // invalid size, bare trailing
+      (hdr(200, b"free"), None), // declared payload overruns EOF, bare trailing
+    ];
+    for (trailer, expect) in bare_none {
+      let mut body = mvhd_ts_dur(1000, 5000);
+      body.extend_from_slice(trailer);
+      let file = file_with_moov(&body);
+      let meta = parse_inner(&file, None).expect("accepted");
+      // Tags decoded BEFORE the malformed atom are preserved (Contract 2).
+      assert_eq!(
+        meta.quicktime().time_scale(),
+        Some(1000),
+        "TimeScale must survive the trailing malformed atom"
+      );
+      assert_eq!(meta.quicktime().duration_count(), Some(5000));
+      assert_eq!(meta.quicktime().movie_header_version(), Some(0));
+      // …and the bare trailing malformed header emits NO spurious warning.
+      assert_eq!(meta.warning.as_deref(), *expect, "trailer {trailer:02x?}");
+    }
+
+    // A malformed atom WITH a body (`end - pos > 8`) after the valid mvhd IS a
+    // real atom to ExifTool ⇒ it warns `Invalid atom size` (and still keeps the
+    // mvhd tags). Verified vs bundled.
+    let mut with_body = mvhd_ts_dur(1000, 5000);
+    with_body.extend_from_slice(&hdr(4, b"junk"));
+    with_body.extend_from_slice(&[0xAA; 4]); // one+ body byte past the header
+    let file = file_with_moov(&with_body);
+    let meta = parse_inner(&file, None).expect("accepted");
+    assert_eq!(meta.quicktime().time_scale(), Some(1000));
+    assert_eq!(meta.warning.as_deref(), Some("Invalid atom size"));
+  }
+
+  /// The bare-trailing suppression must NOT swallow a malformed FIRST atom
+  /// (`pos == start`): ExifTool reads the first header before the loop body, so
+  /// an invalid first-atom size still warns. (Guards the `pos > start` half of
+  /// [`is_bare_trailing_header`].) Verified vs bundled ExifTool 13.59.
+  #[test]
+  fn malformed_first_child_still_warns_despite_bare_trailing_rule() {
+    let first = |sz: u32, t: &[u8; 4], expect: Option<&str>| {
+      let mut body = sz.to_be_bytes().to_vec();
+      body.extend_from_slice(t);
+      let file = file_with_moov(&body);
+      let meta = parse_inner(&file, None).expect("accepted");
+      assert_eq!(meta.warning.as_deref(), expect, "first child size={sz}");
+      // The invalid-size atom is never decoded.
+      assert_eq!(meta.quicktime().time_scale(), None);
+    };
+    first(4, b"junk", Some("Invalid atom size"));
+    first(7, b"junk", Some("Invalid atom size"));
+    first(1, b"junk", Some("Truncated atom header"));
+    first(
+      200,
+      b"free",
+      Some("Truncated 'free' data (missing 192 bytes)"),
+    );
+  }
+
+  /// [`is_bare_trailing_header`] truth table (unit-level): only a post-first
+  /// header (`pos > start`) with exactly the 8-byte remainder (`end - pos == 8`)
+  /// is the directory's bare trailing header.
+  #[test]
+  fn bare_trailing_header_predicate() {
+    assert!(is_bare_trailing_header(108, 0, 116)); // after a prior atom, 8 bytes left
+    assert!(!is_bare_trailing_header(0, 0, 8)); // FIRST atom, even if 8 bytes
+    assert!(!is_bare_trailing_header(108, 0, 120)); // 12 bytes left ⇒ has a body
+    assert!(!is_bare_trailing_header(108, 0, 108)); // 0 bytes left (no header)
+    assert!(!is_bare_trailing_header(108, 108, 116)); // pos == start (first here)
+  }
+
+  /// A VALID `size == 8` trailing atom (header only, ZERO body) after ≥1
+  /// already-walked sibling is NOT emitted — ExifTool's `last if $dataPos >=
+  /// $dirEnd` (QuickTime.pm:10597, "ignores last value if 0 bytes") fires on the
+  /// PRECEDING atom's advance, so the trailing 0-byte atom is never read. The
+  /// skip is scoped to the trailing position (`pos > start` + 8-byte remainder):
+  /// a FIRST/only empty atom IS still emitted (it is read before the loop body),
+  /// and a trailing atom WITH a body is processed normally. Every case below was
+  /// verified against bundled ExifTool 13.59.
+  #[test]
+  fn valid_trailing_empty_udta_atom_is_skipped() {
+    use crate::metadata::QuickTimeUserData;
+
+    // `©mak` international-text body: `int16u len`, `int16u lang`, then text.
+    let mak = |text: &[u8]| {
+      let mut b = (text.len() as u16).to_be_bytes().to_vec();
+      b.extend_from_slice(&0u16.to_be_bytes()); // lang 0
+      b.extend_from_slice(text);
+      atom(b"\xa9mak", &b)
+    };
+    // A bare size-8 (header-only, zero-body) atom — its declared size word is 8,
+    // so `payload_start == payload_end`.
+    let bare8 = |t: &[u8; 4]| {
+      8u32
+        .to_be_bytes()
+        .iter()
+        .copied()
+        .chain(*t)
+        .collect::<Vec<u8>>()
+    };
+
+    // (1) valid `©mak` THEN a bare trailing empty `CAME`: Make survives, the
+    // trailing empty `CAME` emits NO SerialNumberHash (ExifTool: `Make` only).
+    let mut body = mak(b"TrailingEmptyTest");
+    body.extend_from_slice(&bare8(b"CAME"));
+    let mut ud = QuickTimeUserData::new();
+    let mut w = None;
+    walk_udta(1, &body, &mut w, &mut ud);
+    assert_eq!(ud.make(), Some("TrailingEmptyTest"));
+    assert_eq!(
+      ud.serial_number_hash(),
+      None,
+      "a bare size-8 trailing CAME must NOT emit SerialNumberHash"
+    );
+    assert_eq!(w, None, "the trailing empty atom emits no warning");
+
+    // (2) valid `©mak` THEN a trailing `CAME` WITH a body: ExifTool DOES emit
+    // the hash (the skip is body-gated, not type-gated) — proves the fix does
+    // not over-suppress a real trailing atom.
+    let mut body2 = mak(b"TrailingEmptyTest");
+    body2.extend_from_slice(&atom(b"CAME", &[0x01, 0x02, 0x03, 0x04]));
+    let mut ud2 = QuickTimeUserData::new();
+    let mut w2 = None;
+    walk_udta(1, &body2, &mut w2, &mut ud2);
+    assert_eq!(ud2.make(), Some("TrailingEmptyTest"));
+    assert_eq!(
+      ud2.serial_number_hash(),
+      Some("01020304"),
+      "a trailing CAME WITH a body must still emit"
+    );
+
+    // (3) a bare empty `CAME` as the FIRST/only atom (`pos == start`): ExifTool
+    // reads the first header before the loop body, so it IS emitted (empty hash,
+    // `unpack("H*","") == ""`) — the skip must NOT fire here.
+    let mut ud3 = QuickTimeUserData::new();
+    let mut w3 = None;
+    walk_udta(1, &bare8(b"CAME"), &mut w3, &mut ud3);
+    assert_eq!(
+      ud3.serial_number_hash(),
+      Some(""),
+      "a FIRST/only empty CAME is still emitted (empty hash)"
+    );
+  }
+
+  /// **Contracts 1+2+3 (no-panic / bounded / recovery) — malformed-input
+  /// matrix.** Every shape the task enumerates is driven through the public
+  /// [`parse_inner`] entry: it must return WITHOUT panicking, OOB-indexing, or
+  /// looping unboundedly. `parse_inner` returning at all (vs hanging/aborting)
+  /// is the bound; the `#![deny(clippy::indexing_slicing)]` on this module plus
+  /// the checked `.get()` reads are the no-OOB guarantee. Where a valid prefix
+  /// precedes the corruption, the prefix tags are asserted to survive.
+  #[test]
+  fn malformed_input_matrix_never_panics_and_is_bounded() {
+    let mvhd = mvhd_ts_dur(600, 1200);
+
+    // 1) Empty + sub-header buffers (below the 8-byte first-read).
+    for n in 0..8usize {
+      assert!(parse_inner(&vec![0u8; n], None).is_none(), "len {n}");
+    }
+
+    // 2) A recognized first atom (`ftyp`) with a structurally invalid size word
+    //    (size in 2..=7) — accepted, warns, no decode, no panic.
+    for sz in 2u32..=7 {
+      let mut data = sz.to_be_bytes().to_vec();
+      data.extend_from_slice(b"ftyp");
+      // Pad so the buffer is longer than the 8-byte header.
+      data.extend_from_slice(&[0u8; 8]);
+      let _ = parse_inner(&data, None); // must not panic
+    }
+
+    // 3) size == 0 first atom (extends-to-EOF / terminator) — no panic.
+    {
+      let mut data = 0u32.to_be_bytes().to_vec();
+      data.extend_from_slice(b"moov");
+      data.extend_from_slice(&mvhd);
+      let _ = parse_inner(&data, None);
+    }
+
+    // 4) A `moov` whose declared size FAR exceeds the buffer (size > file): the
+    //    top-level TruncatedAtom path records nothing decodable and stops.
+    {
+      let mut data = atom(b"ftyp", b"qt  \0\0\0\0");
+      data.extend_from_slice(&0x7fff_ffffu32.to_be_bytes()); // ~2GB moov
+      data.extend_from_slice(b"moov");
+      data.extend_from_slice(&mvhd); // only a few real bytes present
+      let meta = parse_inner(&data, None).expect("accepted (ftyp recognized)");
+      // The overrunning moov is never descended ⇒ no TimeScale.
+      assert_eq!(meta.quicktime().time_scale(), None);
+    }
+
+    // 5) Garbage 4-cc as the first atom ⇒ rejected (not QuickTime), no panic.
+    {
+      let data = atom(b"\xff\x00\xee\x01", &[0u8; 16]);
+      assert!(parse_inner(&data, None).is_none());
+    }
+
+    // 6) Truncated mid-box: a valid `moov`+`mvhd`, then the file is cut in the
+    //    middle of a trailing atom's header/body. Walk both halves; the mvhd
+    //    tags must survive every cut, and none may panic.
+    {
+      let mut full = file_with_moov(&mvhd);
+      // Append a partial trailing top-level atom header (cut at every length).
+      full.extend_from_slice(&[0u8, 0, 1, 0, b'j', b'u']); // 6 of 8 header bytes
+      for cut in 8..full.len() {
+        let meta = parse_inner(full.get(..cut).unwrap_or_default(), None);
+        if let Some(m) = meta {
+          // If the moov survived the cut, its mvhd tags are intact.
+          if m.quicktime().time_scale().is_some() {
+            assert_eq!(m.quicktime().time_scale(), Some(600));
+            assert_eq!(m.quicktime().duration_count(), Some(1200));
+          }
+        }
+      }
+    }
+
+    // 7) Non-advancing / self-nesting bomb: a `moov` containing a child whose
+    //    size word is 8 (header only, zero body) repeated, plus a deeply nested
+    //    `udta` chain — both must terminate (the zero-advance break + the
+    //    MAX_ATOM_DEPTH cap), not hang.
+    {
+      // 4096 zero-body `free` atoms inside a moov (each advances by 8; a
+      // zero-SIZE one would break — exercised in (3)). Bounded by `end`.
+      let mut body = Vec::new();
+      for _ in 0..4096 {
+        body.extend_from_slice(&8u32.to_be_bytes());
+        body.extend_from_slice(b"free");
+      }
+      let _ = parse_inner(&file_with_moov(&body), None); // returns, no hang
+
+      // A 2000-deep nested `udta` chain (detect_embedded_exif / GPMF scans
+      // recurse on udta) — capped by MAX_ATOM_DEPTH, no stack overflow.
+      let mut nested = atom(b"udta", &[]);
+      for _ in 0..2000 {
+        nested = atom(b"udta", &nested);
+      }
+      let _ = parse_inner(&file_with_moov(&nested), None);
+    }
   }
 }

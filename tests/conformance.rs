@@ -736,6 +736,100 @@ fn quicktime_sp2_keys_direction_conformance() {
 }
 
 #[test]
+fn quicktime_sp2_ilst_binary_conformance() {
+  // QuickTime SP2 — the conv-less Keys `data`-atom BINARY branch
+  // (QuickTime.pm:10411-10414 `elsif (not $$tagInfo{ValueConv}) { $value =
+  // \$buf }`). `tests/fixtures/QuickTime_sp2_ilst_binary.mov` (crafted by
+  // `tools/gen_quicktime_sp2_decode_fixtures.py`) holds a `moov/meta` keys box
+  // with `com.apple.quicktime.direction.facing` (CameraDirection — conv-less +
+  // Format-less in `%QuickTime::Keys`) whose `data` atom carries the BINARY flag
+  // `0x00` with a 3-byte value. `QuickTimeFormat(0x00, 3)` returns undef (only
+  // len 1/2 map to int8u/int16u), so with no ValueConv the value becomes a
+  // binary scalar ref ⇒ `Keys:CameraDirection` renders the universal
+  // `(Binary data 3 bytes, use -b option to extract)` placeholder in BOTH modes.
+  // Verified vs bundled 13.59. Goldens via the bundled `perl exiftool -j -G1
+  // -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_ilst_binary.mov",
+    "QuickTime_sp2_ilst_binary.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_ilst_binary.mov",
+    "QuickTime_sp2_ilst_binary.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_ilst_numeric_conformance() {
+  // QuickTime SP2 — the conv-less Keys `data`-atom NUMERIC branch
+  // (QuickTime.pm:10402-10409 `$format = QuickTimeFormat($flags,$len); ... $value
+  // = ReadValue(...)`). `tests/fixtures/QuickTime_sp2_ilst_numeric.mov` holds
+  // `com.apple.quicktime.direction.facing` (CameraDirection) whose `data` atom
+  // carries the unsigned-int flag `0x16` with a 2-byte value `0x012c`.
+  // `QuickTimeFormat(0x16, 2)` ⇒ `int16u` ⇒ `ReadValue` ⇒ the NUMBER 300, with
+  // no PrintConv/ValueConv ⇒ `Keys:CameraDirection` = the bare JSON number `300`
+  // in BOTH modes. Verified vs bundled 13.59. Goldens via the bundled `perl
+  // exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_ilst_numeric.mov",
+    "QuickTime_sp2_ilst_numeric.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_ilst_numeric.mov",
+    "QuickTime_sp2_ilst_numeric.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_itext_empty_first_conformance() {
+  // QuickTime SP2 — the international-text empty-entry CONTINUATION
+  // (QuickTime.pm:10483 `next if not $len and $pos`). `tests/fixtures/
+  // QuickTime_sp2_itext_empty_first.mov` holds a `moov/udta` `©nam` (Title)
+  // whose FIRST international-text entry is empty (len 0) FOLLOWED BY a valid
+  // entry (len 2, lang 0, `Hi`). ExifTool's entry loop advances past the empty
+  // header then `next`s (it does NOT bail), so the later entry is decoded ⇒
+  // `UserData:Title` = `Hi` in BOTH modes. Regression for the prior code that
+  // bailed on an empty first entry. Verified vs bundled 13.59. Goldens via the
+  // bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite
+  // excluded).
+  check(
+    "QuickTime_sp2_itext_empty_first.mov",
+    "QuickTime_sp2_itext_empty_first.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_itext_empty_first.mov",
+    "QuickTime_sp2_itext_empty_first.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_itext_empty_only_conformance() {
+  // QuickTime SP2 — an international-text atom whose ONLY entry is empty emits
+  // NO tag. `tests/fixtures/QuickTime_sp2_itext_empty_only.mov` holds a `©nam`
+  // (Title) with a single empty (len 0) entry; the loop skips it
+  // (QuickTime.pm:10483) and the next 4-byte-header read overruns, so the loop
+  // ends with NO `FoundTag` ⇒ the golden has no `UserData:Title` (and no `udta`
+  // tag at all). Verified vs bundled 13.59. Goldens via the bundled `perl
+  // exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_itext_empty_only.mov",
+    "QuickTime_sp2_itext_empty_only.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_itext_empty_only.mov",
+    "QuickTime_sp2_itext_empty_only.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn mxf_conformance() {
   // FORMATS.md row 24 (Engine-only). `tests/fixtures/MXF.mxf` is the
   // bundled `lib/Image/ExifTool/t/images/MXF.mxf` (7510 bytes — header

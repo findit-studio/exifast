@@ -334,7 +334,82 @@ const NOT_ACTIVE: &[&str] = &[
 /// `QuickTime_sp2_keys_direction.mov` exercises the Keys conv-less map
 /// (`direction.facing`/`direction.motion`) + the code-valued
 /// `com.android.capture.fps` (float `data` atom) / `samsung.android.utc_offset`.
-const EXPECTED_ACTIVE_FIXTURES: usize = 427;
+///
+/// 427 → 428: QuickTime SP2 Part-3 trailing-empty-atom fix adds
+/// `QuickTime_sp2_trailing_empty.mov` — a `moov/udta` holding a valid `©mak`
+/// (`Make`) FOLLOWED BY a BARE size-8 (header-only, zero-body) `CAME` atom.
+/// ExifTool's `ProcessMOV` `last if $dataPos >= $dirEnd` (QuickTime.pm:10597,
+/// "ignores last value if 0 bytes") fires on the `©mak` advance, so the
+/// trailing 0-byte `CAME` is NEVER read ⇒ the golden carries `UserData:Make`
+/// but NO `UserData:SerialNumberHash`. Pins `walk_atoms`' valid-bare-trailing
+/// skip (verified vs bundled 13.59).
+///
+/// 428 → 432: the QuickTime SP2 conv-less data-atom / international-text decode
+/// fix adds 4 crafted fixtures (built by `tools/gen_quicktime_sp2_decode_fixtures.py`,
+/// goldens pinned against bundled 13.59) exercising the full `ProcessMOV` decode
+/// branches the real camera fixtures never reach:
+///   - `QuickTime_sp2_ilst_binary.mov` — a Keys conv-less `data` atom with a
+///     BINARY flag (`0x00`, len 3 ⇒ no `QuickTimeFormat`) ⇒
+///     `Keys:CameraDirection` = `(Binary data 3 bytes, ...)` (the binary
+///     scalar-ref branch, QuickTime.pm:10411-10414);
+///   - `QuickTime_sp2_ilst_numeric.mov` — a Keys conv-less `data` atom with a
+///     NUMERIC flag (`0x16` int16u, len 2) ⇒ `Keys:CameraDirection` = `300` (a
+///     JSON number via `QuickTimeFormat`, QuickTime.pm:10402-10409);
+///   - `QuickTime_sp2_itext_empty_first.mov` — a `©nam` (`Title`) whose EMPTY
+///     first international-text entry is followed by a valid one ⇒ the empty
+///     entry is skipped and `UserData:Title` = `Hi` (the `next if not $len`
+///     continuation, QuickTime.pm:10483);
+///   - `QuickTime_sp2_itext_empty_only.mov` — a `©nam` whose ONLY entry is empty
+///     ⇒ NO `UserData:Title` (no `udta` tag at all).
+///
+/// 432 → 436: the conv-less `0x17`/`0x18` float/double branch is NOT length-gated
+/// (`QuickTimeFormat` returns the format from the flag alone), so `ReadValue` with
+/// an undef count (ExifTool.pm:6296-6331) reads `int(len/elem)` values. 4 crafted
+/// fixtures pin every shape against bundled 13.59:
+///   - `QuickTime_sp2_ilst_float_short.mov` — flag `0x17`, 2-byte payload (< one
+///     float) ⇒ `ReadValue` `return ''` ⇒ `Keys:CameraDirection` = `""` (an empty
+///     string, NOT the binary placeholder, NOT dropped);
+///   - `QuickTime_sp2_ilst_float_single.mov` — flag `0x17`, one float `1.5` ⇒
+///     `Keys:CameraDirection` = `1.5` (a single JSON number);
+///   - `QuickTime_sp2_ilst_float_multi.mov` — flag `0x17`, two floats `1.5 2.5` ⇒
+///     `Keys:CameraDirection` = `"1.5 2.5"` (the space-joined string);
+///   - `QuickTime_sp2_ilst_double_multi.mov` — flag `0x18`, two doubles ⇒
+///     `Keys:CameraDirection` = `"1.5 2.5"`.
+///
+/// 436 → 440: the QuickTime SP2 conv-less-Keys faithfulness refactor routes EVERY
+/// conv-less identity key (`Make`/`Model`/`Software`/`Android*`) through the SAME
+/// `data`-atom cascade as `direction.facing` (QuickTime.pm:10387-10416), so a
+/// non-default format flag on them no longer drops/truncates (the prior per-key
+/// typed paths handled only one flavor). 4 crafted fixtures pin the rerouted
+/// atoms on the OLD-dropped flavors, each against bundled 13.59:
+///   - `QuickTime_sp2_keys_make_numeric.mov` — `com.apple.quicktime.make` with a
+///     NUMERIC flag (`0x16` int16u, len 2) ⇒ `Keys:Make` = `300` (a JSON number;
+///     the OLD typed-string Make path dropped a non-string flag);
+///   - `QuickTime_sp2_keys_fps_string.mov` — `com.android.capture.fps` with a
+///     UTF-8 STRING flag (`0x01`, `"29.97"`) ⇒ `Keys:AndroidCaptureFPS` = the
+///     string `29.97` (the OLD typed-float path dropped a string flag);
+///   - `QuickTime_sp2_keys_fps_short.mov` — `com.android.capture.fps` flag `0x17`,
+///     2-byte payload (< one float) ⇒ `Keys:AndroidCaptureFPS` = `""` (an empty
+///     string, NOT dropped);
+///   - `QuickTime_sp2_keys_fps_multi.mov` — `com.android.capture.fps` flag `0x17`,
+///     two floats ⇒ `Keys:AndroidCaptureFPS` = `"1.5 2.5"` (space-joined; the OLD
+///     typed-float path read only the first element).
+///
+/// 440 → 444: the ValueConv-BEARING Keys atoms (`creationdate` ⇒ `ConvertXMPDate`,
+/// `location.ISO6709` ⇒ `ConvertISO6709`) also receive the pre-ValueConv value for
+/// ANY flag (string → decoded, numeric → number, else → raw bytes — NOT the binary
+/// placeholder, which needs no ValueConv), and the ValueConv passes a non-date /
+/// non-ISO6709 value through, so they ALWAYS emit. 4 crafted fixtures pin the
+/// flavors the OLD `ilst_data_string`-only arms DROPPED, each vs bundled 13.59:
+///   - `QuickTime_sp2_keys_cdate_numeric.mov` — `creationdate` NUMERIC flag (`0x16`
+///     300) ⇒ `Keys:CreationDate` = the bare number `300` (date conv passthrough);
+///   - `QuickTime_sp2_keys_cdate_binary.mov` — `creationdate` BINARY flag (`0x00`)
+///     with non-date raw bytes ⇒ `Keys:CreationDate` = the raw string;
+///   - `QuickTime_sp2_keys_loc_numeric.mov` — `location.ISO6709` NUMERIC flag
+///     (`0x16` 300) ⇒ `Keys:GPSCoordinates` = `"300 deg 0' 0.00\" N, "`;
+///   - `QuickTime_sp2_keys_loc_binary.mov` — `location.ISO6709` BINARY flag
+///     (`0x00`) with raw ISO6709 bytes ⇒ parsed `Keys:GPSCoordinates` coordinates.
+const EXPECTED_ACTIVE_FIXTURES: usize = 444;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -893,13 +893,21 @@ pub struct QuickTimeUserData {
   /// 'unpack("H*", $val)'` result — the lower-case hex of the raw bytes.
   /// Code-valued, HAND-ported.
   media_uid: Option<String>,
-  /// The conv-less plain-string camera atoms decoded via the generated
-  /// `4cc → Name` map ([`crate::formats::quicktime::quicktime_generated`]) —
-  /// `(Name, value)` in walk order. These carry NO conversion and NO priority,
-  /// so they are emitted verbatim under `QuickTime:UserData`; modeling them in
-  /// one ordered sink (vs a typed field each) keeps the supplementary map the
-  /// single source of truth (a new conv-less atom = regenerate, no Rust edit).
-  convless: Vec<(smol_str::SmolStr, String)>,
+  /// The conv-less camera atoms decoded via the generated `4cc → Name` map
+  /// ([`crate::formats::quicktime::quicktime_generated`]) — `(Name, value)` in
+  /// walk order. These carry NO conversion and NO priority, so they are emitted
+  /// verbatim under `QuickTime:UserData`; modeling them in one ordered sink (vs
+  /// a typed field each) keeps the supplementary map the single source of truth
+  /// (a new conv-less atom = regenerate, no Rust edit).
+  ///
+  /// The value is a [`crate::value::TagValue`] rather than a `String` because
+  /// the `%QuickTime::UserData` table is `FORMAT => 'string'`, so a conv-less
+  /// UserData atom is always read as a string and stored as
+  /// [`crate::value::TagValue::Str`]. The richer value type is shared with the
+  /// `Keys` block (whose table has NO `FORMAT`, so a conv-less `data` atom can
+  /// faithfully be a number or binary placeholder — QuickTime.pm:10396-10416);
+  /// keeping one value type across both keeps the emit path uniform.
+  convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
 }
 
 impl QuickTimeUserData {
@@ -1033,11 +1041,12 @@ impl QuickTimeUserData {
     self.media_uid.as_deref()
   }
 
-  /// The conv-less plain-string atoms decoded via the generated map, as
-  /// `(Name, value)` in walk order.
+  /// The conv-less atoms decoded via the generated map, as `(Name, value)` in
+  /// walk order. Each value is a [`crate::value::TagValue`] (always
+  /// [`crate::value::TagValue::Str`] for UserData — see [`Self`]).
   #[inline(always)]
   #[must_use]
-  pub fn convless(&self) -> &[(smol_str::SmolStr, String)] {
+  pub fn convless(&self) -> &[(smol_str::SmolStr, crate::value::TagValue)] {
     &self.convless
   }
 
@@ -1186,10 +1195,16 @@ impl QuickTimeUserData {
     self
   }
 
-  /// Record a conv-less plain-string atom (from the generated map) by its tag
-  /// NAME and verbatim text value, preserving walk order.
+  /// Record a conv-less atom (from the generated map) by its tag NAME and
+  /// decoded [`crate::value::TagValue`], preserving walk order. UserData passes
+  /// a [`crate::value::TagValue::Str`]; the parameter is the richer value type
+  /// shared with the `Keys` block (see [`Self`]).
   #[inline(always)]
-  pub fn push_convless(&mut self, name: impl Into<smol_str::SmolStr>, value: String) -> &mut Self {
+  pub fn push_convless(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    value: crate::value::TagValue,
+  ) -> &mut Self {
     self.convless.push((name.into(), value));
     self
   }
@@ -1209,84 +1224,143 @@ impl Default for QuickTimeUserData {
 /// `QuickTime:Keys`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickTimeKeys {
-  /// `make` Make (QuickTime.pm:6696).
-  make: Option<String>,
-  /// `model` Model (QuickTime.pm:6697).
-  model: Option<String>,
-  /// `software` Software (QuickTime.pm:6699).
-  software: Option<String>,
   /// `creationdate` CreationDate, ISO-8601 normalized (QuickTime.pm:6683-6687).
+  /// CONV-BEARING (`%iso8601Date`), so it is decoded into a typed field rather
+  /// than flowing through the conv-less cascade.
   creation_date: Option<String>,
   /// `location.ISO6709` GPSCoordinates, decoded from ISO 6709
-  /// (QuickTime.pm:6701-6712).
+  /// (QuickTime.pm:6701-6712). CONV-BEARING (`ConvertISO6709` + the
+  /// `PrintGPSCoordinates` print-conv), so it is decoded into a typed field.
   gps: Option<QuickTimeGps>,
-  /// `com.android.manufacturer` AndroidMake (QuickTime.pm:6764). This key is
-  /// NOT in the `com.apple.quicktime` namespace, so after `ProcessKeys` strips
-  /// the bare `com.` prefix the stripped form (`android.manufacturer`) does NOT
-  /// match; the FULL key (`com.android.manufacturer`) does — see the
-  /// stripped-then-full key fallback in [`crate::formats::quicktime`].
-  android_make: Option<String>,
-  /// `com.android.model` AndroidModel (QuickTime.pm:6765, full-key fallback).
-  android_model: Option<String>,
-  /// `com.android.version` AndroidVersion (QuickTime.pm:6762, full-key
-  /// fallback).
-  android_version: Option<String>,
-  /// `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
-  /// `Writable => 'float'`). The `data`-atom value is an IEEE float/double
-  /// (decoded by the flag-driven `QuickTimeFormat`, QuickTime.pm:9555-9569),
-  /// NOT a string — so it is HAND-ported (not in the conv-less string map) and
-  /// stored numerically.
-  android_capture_fps: Option<f64>,
-  /// `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769): a non-
-  /// `com.apple.quicktime` (full-key-fallback) key whose value is a plain
-  /// string (e.g. `"+09:00"`). HAND-ported as a typed Keys field alongside the
-  /// other Android keys (`Groups => { 2 => 'Time' }` is family-2 only).
-  android_time_zone: Option<String>,
-  /// The conv-less plain-string Keys atoms decoded via the generated
-  /// `key → Name` map ([`crate::formats::quicktime::quicktime_generated`]) —
-  /// `(Name, value)` in walk order. Emitted verbatim under `QuickTime:Keys`.
-  convless: Vec<(smol_str::SmolStr, String)>,
+  /// Every CONV-LESS `%QuickTime::Keys` atom (no `Format`, no `ValueConv`), as
+  /// `(Name, value)` in walk order — the camera-identity keys
+  /// (`Make`/`Model`/`Software`/`AndroidMake`/`AndroidModel`/`AndroidVersion`/
+  /// `AndroidCaptureFPS`/`AndroidTimeZone`) AND the generated map keys
+  /// (`CameraDirection`/`CameraMotion`,
+  /// [`crate::formats::quicktime::quicktime_generated`]). Emitted verbatim under
+  /// `QuickTime:Keys`. Only `creation_date` / `gps` (conv-bearing) live in
+  /// dedicated typed fields.
+  ///
+  /// The value is a [`crate::value::TagValue`]: the `%QuickTime::Keys` table has
+  /// NO table-level `FORMAT` (unlike `%QuickTime::UserData`), so a conv-less
+  /// `data` atom with no `Format`/`ValueConv` follows the full
+  /// string→numeric→binary cascade (QuickTime.pm:10387-10416) — a string
+  /// ([`crate::value::TagValue::Str`]), a number ([`crate::value::TagValue::U64`]
+  /// / `I64` / `F64`, from `QuickTimeFormat`), or, with no usable format, the
+  /// binary scalar-ref placeholder ([`crate::value::TagValue::Bytes`]). This is
+  /// faithful to EVERY format flag — a `Make` written with a numeric flag emits
+  /// a number, an `AndroidCaptureFPS` written with a string flag emits the
+  /// string — whereas the prior per-key typed fields handled only one flavor.
+  convless: Vec<(smol_str::SmolStr, crate::value::TagValue)>,
 }
 
 impl QuickTimeKeys {
-  /// An empty Keys block (every field `None`).
+  /// An empty Keys block (no key decoded).
   #[inline(always)]
   #[must_use]
   pub const fn new() -> Self {
     Self {
-      make: None,
-      model: None,
-      software: None,
       creation_date: None,
       gps: None,
-      android_make: None,
-      android_model: None,
-      android_version: None,
-      android_capture_fps: None,
-      android_time_zone: None,
       convless: Vec::new(),
     }
   }
 
-  /// `make` Make.
-  #[inline(always)]
+  /// The string value of the conv-less atom emitted under tag `name`, resolving
+  /// duplicates the SAME way the emitted tag stream does: **last-wins**. A file
+  /// with two `Make` atoms emits both, and the downstream tag dedup keeps the
+  /// LAST (matching the prior typed `set_make` which overwrote on each later
+  /// entry); the domain projection must read that same survivor. So this returns
+  /// the LAST [`Self::convless`] entry named `name`, as a string — or `None` if
+  /// that surviving entry's `data`-atom flag was numeric / binary (a non-`Str`
+  /// value: the emitted tag is then a number, not a usable identity string,
+  /// matching the typed-string source this replaced, which dropped non-string
+  /// flags). NB: scanning for the last *`Str`* instead would disagree with the
+  /// emitted (last-wins) tag when the surviving duplicate is non-string.
+  #[inline]
+  #[must_use]
+  fn convless_str(&self, name: &str) -> Option<&str> {
+    self
+      .convless
+      .iter()
+      .rev()
+      .find(|(n, _)| n == name)
+      .and_then(|(_, v)| match v {
+        crate::value::TagValue::Str(s) => Some(s.as_str()),
+        _ => None,
+      })
+  }
+
+  /// `make` Make — the conv-less `Make` atom's string value (the domain camera
+  /// projection reads this). Backed by a [`Self::convless`] scan.
+  #[inline]
   #[must_use]
   pub fn make(&self) -> Option<&str> {
-    self.make.as_deref()
+    self.convless_str("Make")
   }
 
-  /// `model` Model.
-  #[inline(always)]
+  /// `model` Model — the conv-less `Model` atom's string value.
+  #[inline]
   #[must_use]
   pub fn model(&self) -> Option<&str> {
-    self.model.as_deref()
+    self.convless_str("Model")
   }
 
-  /// `software` Software.
-  #[inline(always)]
+  /// `software` Software — the conv-less `Software` atom's string value.
+  #[inline]
   #[must_use]
   pub fn software(&self) -> Option<&str> {
-    self.software.as_deref()
+    self.convless_str("Software")
+  }
+
+  /// `com.android.manufacturer` AndroidMake — the conv-less `AndroidMake` atom's
+  /// string value (a full-key-fallback Keys atom routed through the SAME
+  /// string→numeric→binary cascade as `Make`). Backed by a [`Self::convless`]
+  /// scan (last-wins, string-or-`None`), like [`Self::make`].
+  #[inline]
+  #[must_use]
+  pub fn android_make(&self) -> Option<&str> {
+    self.convless_str("AndroidMake")
+  }
+
+  /// `com.android.model` AndroidModel — the conv-less `AndroidModel` atom's value.
+  #[inline]
+  #[must_use]
+  pub fn android_model(&self) -> Option<&str> {
+    self.convless_str("AndroidModel")
+  }
+
+  /// `com.android.version` AndroidVersion — the conv-less `AndroidVersion` value.
+  #[inline]
+  #[must_use]
+  pub fn android_version(&self) -> Option<&str> {
+    self.convless_str("AndroidVersion")
+  }
+
+  /// `samsung.android.utc_offset` AndroidTimeZone — the conv-less `AndroidTimeZone`
+  /// atom's string value.
+  #[inline]
+  #[must_use]
+  pub fn android_time_zone(&self) -> Option<&str> {
+    self.convless_str("AndroidTimeZone")
+  }
+
+  /// `com.android.capture.fps` AndroidCaptureFPS — the conv-less `AndroidCaptureFPS`
+  /// atom's value as an `f64` (the typed-float view). Last-wins (matching the
+  /// emitted tag); `None` unless the surviving atom decoded to a number — a
+  /// string/binary flag emits a non-`F64` value, which has no typed float here.
+  #[inline]
+  #[must_use]
+  pub fn android_capture_fps(&self) -> Option<f64> {
+    self
+      .convless
+      .iter()
+      .rev()
+      .find(|(n, _)| n == "AndroidCaptureFPS")
+      .and_then(|(_, v)| match v {
+        crate::value::TagValue::F64(f) => Some(*f),
+        _ => None,
+      })
   }
 
   /// `creationdate` CreationDate (ISO-8601 normalized).
@@ -1303,46 +1377,13 @@ impl QuickTimeKeys {
     self.gps.as_ref()
   }
 
-  /// `com.android.manufacturer` AndroidMake.
+  /// The conv-less Keys atoms, as `(Name, value)` in walk order — the
+  /// camera-identity keys and the generated-map keys. Each value is a
+  /// [`crate::value::TagValue`] (string, number, or binary placeholder — see
+  /// [`Self`]).
   #[inline(always)]
   #[must_use]
-  pub fn android_make(&self) -> Option<&str> {
-    self.android_make.as_deref()
-  }
-
-  /// `com.android.model` AndroidModel.
-  #[inline(always)]
-  #[must_use]
-  pub fn android_model(&self) -> Option<&str> {
-    self.android_model.as_deref()
-  }
-
-  /// `com.android.version` AndroidVersion.
-  #[inline(always)]
-  #[must_use]
-  pub fn android_version(&self) -> Option<&str> {
-    self.android_version.as_deref()
-  }
-
-  /// `com.android.capture.fps` AndroidCaptureFPS (the IEEE float/double value).
-  #[inline(always)]
-  #[must_use]
-  pub const fn android_capture_fps(&self) -> Option<f64> {
-    self.android_capture_fps
-  }
-
-  /// `samsung.android.utc_offset` AndroidTimeZone (the plain-string value).
-  #[inline(always)]
-  #[must_use]
-  pub fn android_time_zone(&self) -> Option<&str> {
-    self.android_time_zone.as_deref()
-  }
-
-  /// The conv-less plain-string Keys atoms decoded via the generated map, as
-  /// `(Name, value)` in walk order.
-  #[inline(always)]
-  #[must_use]
-  pub fn convless(&self) -> &[(smol_str::SmolStr, String)] {
+  pub fn convless(&self) -> &[(smol_str::SmolStr, crate::value::TagValue)] {
     &self.convless
   }
 
@@ -1350,38 +1391,7 @@ impl QuickTimeKeys {
   #[inline(always)]
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.make.is_none()
-      && self.model.is_none()
-      && self.software.is_none()
-      && self.creation_date.is_none()
-      && self.gps.is_none()
-      && self.android_make.is_none()
-      && self.android_model.is_none()
-      && self.android_version.is_none()
-      && self.android_capture_fps.is_none()
-      && self.android_time_zone.is_none()
-      && self.convless.is_empty()
-  }
-
-  /// Set `make` Make.
-  #[inline(always)]
-  pub fn set_make(&mut self, v: Option<String>) -> &mut Self {
-    self.make = v;
-    self
-  }
-
-  /// Set `model` Model.
-  #[inline(always)]
-  pub fn set_model(&mut self, v: Option<String>) -> &mut Self {
-    self.model = v;
-    self
-  }
-
-  /// Set `software` Software.
-  #[inline(always)]
-  pub fn set_software(&mut self, v: Option<String>) -> &mut Self {
-    self.software = v;
-    self
+    self.creation_date.is_none() && self.gps.is_none() && self.convless.is_empty()
   }
 
   /// Set `creationdate` CreationDate.
@@ -1398,45 +1408,15 @@ impl QuickTimeKeys {
     self
   }
 
-  /// Set `com.android.manufacturer` AndroidMake.
+  /// Record a conv-less Keys atom by its tag NAME and decoded
+  /// [`crate::value::TagValue`] (string / number / binary placeholder),
+  /// preserving walk order.
   #[inline(always)]
-  pub fn set_android_make(&mut self, v: Option<String>) -> &mut Self {
-    self.android_make = v;
-    self
-  }
-
-  /// Set `com.android.model` AndroidModel.
-  #[inline(always)]
-  pub fn set_android_model(&mut self, v: Option<String>) -> &mut Self {
-    self.android_model = v;
-    self
-  }
-
-  /// Set `com.android.version` AndroidVersion.
-  #[inline(always)]
-  pub fn set_android_version(&mut self, v: Option<String>) -> &mut Self {
-    self.android_version = v;
-    self
-  }
-
-  /// Set `com.android.capture.fps` AndroidCaptureFPS (the IEEE float/double).
-  #[inline(always)]
-  pub const fn set_android_capture_fps(&mut self, v: Option<f64>) -> &mut Self {
-    self.android_capture_fps = v;
-    self
-  }
-
-  /// Set `samsung.android.utc_offset` AndroidTimeZone (plain string).
-  #[inline(always)]
-  pub fn set_android_time_zone(&mut self, v: Option<String>) -> &mut Self {
-    self.android_time_zone = v;
-    self
-  }
-
-  /// Record a conv-less plain-string Keys atom (from the generated map) by its
-  /// tag NAME and verbatim text value, preserving walk order.
-  #[inline(always)]
-  pub fn push_convless(&mut self, name: impl Into<smol_str::SmolStr>, value: String) -> &mut Self {
+  pub fn push_convless(
+    &mut self,
+    name: impl Into<smol_str::SmolStr>,
+    value: crate::value::TagValue,
+  ) -> &mut Self {
     self.convless.push((name.into(), value));
     self
   }
@@ -2030,6 +2010,55 @@ mod tests {
     assert_eq!(other.code(), "url "); // trailing space preserved
     // Named variant codes are canonical.
     assert_eq!(HandlerKind::Video.code(), "vide");
+  }
+
+  #[test]
+  fn keys_convless_str_accessor_is_last_wins_or_none() {
+    use crate::value::TagValue;
+    // Two `Make` atoms (duplicate Keys): the emitted tag stream dedups
+    // last-wins, so the domain accessor must read the LAST entry, not the first
+    // (the prior typed `set_make` also overwrote on each later entry).
+    let mut keys = QuickTimeKeys::new();
+    keys
+      .push_convless("Make", TagValue::Str("FIRST".into()))
+      .push_convless("Make", TagValue::Str("SECOND".into()));
+    assert_eq!(keys.make(), Some("SECOND"));
+    // When the SURVIVING (last) duplicate is a non-string flag (numeric/binary),
+    // the emitted `Make` is a number, so the string accessor yields `None` — even
+    // though an EARLIER entry was a string. (Scanning for the last *`Str`* would
+    // wrongly disagree with the emitted last-wins tag.)
+    let mut keys2 = QuickTimeKeys::new();
+    keys2
+      .push_convless("Make", TagValue::Str("STR".into()))
+      .push_convless("Make", TagValue::U64(300));
+    assert_eq!(keys2.make(), None);
+    // A single string entry resolves normally.
+    let mut keys3 = QuickTimeKeys::new();
+    keys3.push_convless("Model", TagValue::Str("iPhone".into()));
+    assert_eq!(keys3.model(), Some("iPhone"));
+  }
+
+  #[test]
+  fn keys_android_accessors_back_by_convless() {
+    use crate::value::TagValue;
+    // The Android Keys accessors are convless-backed (the atoms route through the
+    // same cascade as the apple identity keys), preserving the public typed API.
+    let mut keys = QuickTimeKeys::new();
+    keys
+      .push_convless("AndroidMake", TagValue::Str("motorola".into()))
+      .push_convless("AndroidModel", TagValue::Str("Pixel".into()))
+      .push_convless("AndroidVersion", TagValue::Str("13".into()))
+      .push_convless("AndroidTimeZone", TagValue::Str("+09:00".into()))
+      .push_convless("AndroidCaptureFPS", TagValue::F64(29.97));
+    assert_eq!(keys.android_make(), Some("motorola"));
+    assert_eq!(keys.android_model(), Some("Pixel"));
+    assert_eq!(keys.android_version(), Some("13"));
+    assert_eq!(keys.android_time_zone(), Some("+09:00"));
+    assert_eq!(keys.android_capture_fps(), Some(29.97));
+    // A non-`F64` AndroidCaptureFPS (e.g. a string flag) has no typed float view.
+    let mut k2 = QuickTimeKeys::new();
+    k2.push_convless("AndroidCaptureFPS", TagValue::Str("29.97".into()));
+    assert_eq!(k2.android_capture_fps(), None);
   }
 
   #[test]
