@@ -9817,6 +9817,48 @@ fn xmp_generated_unported_conv_passes_through_raw_conformance() {
   check("XMP_gen_unported.xmp", "XMP_gen_unported.xmp.n.json", false);
 }
 
+#[test]
+#[cfg(all(feature = "png", feature = "xmp"))]
+fn png_rawprofile_xmp_conformance() {
+  // Issue #179: an ImageMagick `Raw profile type xmp` tEXt chunk (`PNG.pm:746`)
+  // hex-decodes to a raw XMP packet that `ProcessProfile` dispatches to
+  // `ProcessDirectory(XMP::Main)` = `ProcessXMP`. The PNG port now routes that
+  // packet through the ported XMP module (`exifast::formats::xmp`) and emits the
+  // decoded `XMP-x`/`XMP-dc`/`XMP-xmp`/`XMP-exif` tags (previously the chunk
+  // only reset `$$et{PROCESSED}` and its content was dropped). Crafted minimal
+  // 1x1 RGB fixture (`tools/gen_png_rawprofile_fixtures.py`); the golden drops
+  // `Composite:*` (the PNG port has no Composite subsystem — see
+  // `tools/gen_golden.sh`'s `PNG_rawprofile_*` case). Gated on the `xmp` feature
+  // because the PNG crate feature does not pull it in. Oracle: bundled
+  // `perl exiftool -j -G1 -struct` 13.59.
+  check(
+    "PNG_rawprofile_xmp.png",
+    "PNG_rawprofile_xmp.png.json",
+    true,
+  );
+  check(
+    "PNG_rawprofile_xmp.png",
+    "PNG_rawprofile_xmp.png.n.json",
+    false,
+  );
+  // NONCANONICAL raw-profile: the hex body has a dangling odd nibble. Perl
+  // `pack('H*')` PADS it (trailing `\xa0`, declared length set to match) rather
+  // than dropping it, and the byte lands harmlessly after the XMP packet end —
+  // so bundled emits the same XMP tags and NO wrong-size warning. A decoder that
+  // truncated the odd nibble would mis-size the profile; this golden pins the
+  // faithful pad behavior end-to-end (`PNG.pm:1169` `pack('H*', …)`).
+  check(
+    "PNG_rawprofile_xmp_oddnibble.png",
+    "PNG_rawprofile_xmp_oddnibble.png.json",
+    true,
+  );
+  check(
+    "PNG_rawprofile_xmp_oddnibble.png",
+    "PNG_rawprofile_xmp_oddnibble.png.n.json",
+    false,
+  );
+}
+
 // Add one `#[test]` per ported format here, in FORMATS.md order, each
 // asserting both snapshots: check("X.ext","X.ext.json",true) and
 // check("X.ext","X.ext.n.json",false).

@@ -61,6 +61,11 @@ EXCLUDE_ARR=(${EXCLUDE:-})
 # Composite tags. (Idempotent if the caller already passed it via EXCLUDE.)
 case "$FIX" in
   XMP*) EXCLUDE_ARR+=(-x Composite:all) ;;
+  # The PNG raw-profile fixtures (#179) carry the engine-synthesized
+  # `Composite:ImageSize`/`Megapixels` (from the IHDR dimensions) that the PNG
+  # port does not emit (it has no Composite subsystem). Drop Composite so the
+  # decoded profile content (`XMP-*`) is what the golden compares.
+  PNG_rawprofile_*) EXCLUDE_ARR+=(-x Composite:all) ;;
 esac
 
 # Run from the fixtures dir and pass only the basename so the embedded

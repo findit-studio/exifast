@@ -52,22 +52,33 @@
 //!   EXIF / ICC / IPTC / XMP / Photoshop into PNG as `tEXt` / `zTXt` chunks
 //!   whose keyword is `Raw profile type <X>` and whose body is
 //!   `\n<type>\n  <len>\n<hex-encoded bytes>`. The body is hex-decoded
-//!   (`PNG.pm:1169`) and dispatched to the embedded module. Each WELL-FORMED
-//!   raw profile becomes a [`crate::metadata::PngExifEvent`] in the ordered
-//!   [`crate::metadata::PngMeta::exif_events`] stream the `eXIf` chunk also
-//!   feeds: the EXIF-bearing variants — `Raw profile type exif` (`:710`) and
-//!   the EXIF-content arm of `Raw profile type APP1` (`:689`) — push
-//!   [`crate::metadata::PngExifEvent::ExifProfile`]; the non-EXIF variants —
-//!   `icc` / `icm` (ICC_Profile), `iptc` / `8bim` (Photoshop), `xmp`, the XMP
-//!   arm of `APP1`, AND any unrecognized-content `exif`/`APP1` — push
-//!   [`crate::metadata::PngExifEvent::ResetOnlyProfile`] (no ported sub-module,
-//!   so no tags, but `ProcessProfile` STILL resets `$$et{PROCESSED}`,
-//!   `PNG.pm:1193`, which the event models — oracle-verified). The wrong-size
-//!   warning (`:1172`) and the `Unknown raw profile` warning (`:1267`) are
-//!   still emitted. A MALFORMED raw profile (framing fails, `:1166`) pushes NO
-//!   event (bundled `return 0`s before the reset). In NO case is the
-//!   `PNG:"Raw profile type X"` keyword=hex text tag emitted (bundled emits the
-//!   DECODED tags or nothing).
+//!   (`PNG.pm:1169`) and dispatched to the embedded module. The dispatch splits:
+//!   - **EXIF-bearing** — `Raw profile type exif` (`:710`) and the EXIF-content
+//!     arm of `Raw profile type APP1` (`:689`) push
+//!     [`crate::metadata::PngExifEvent::ExifProfile`] (reset + `ProcessTIFF`)
+//!     into the ordered [`crate::metadata::PngMeta::exif_events`] stream the
+//!     `eXIf` chunk also feeds.
+//!   - **XMP** — `Raw profile type xmp` (`:746`) and the XMP-content arm of
+//!     `Raw profile type {exif,APP1}` (`:1236`) hex-decode to a raw XMP packet
+//!     that `ProcessProfile` feeds to `ProcessDirectory(XMP::Main)` =
+//!     `ProcessXMP`. exifast HAS a ported XMP module, so (when the `xmp` feature
+//!     is built) the packet is captured into
+//!     [`crate::metadata::PngMeta::xmp_profiles`] and decoded into `XMP-*:*`
+//!     tags via [`crate::formats::xmp::parse_borrowed`]; the `$$et{PROCESSED}`
+//!     reset (`:1193`) is modeled by a parallel
+//!     [`crate::metadata::PngExifEvent::ResetOnlyProfile`]. Without the `xmp`
+//!     feature the packet is dropped (faithful "no module") but the reset stays.
+//!   - **No ported module** — `icc` / `icm` (ICC_Profile), `iptc` / `8bim`
+//!     (Photoshop), AND any unrecognized-content `exif`/`APP1` — push
+//!     [`crate::metadata::PngExifEvent::ResetOnlyProfile`] (no tags, but
+//!     `ProcessProfile` STILL resets `$$et{PROCESSED}`, `:1193`, which the event
+//!     models — oracle-verified). ICC_Profile / Photoshop / IPTC remain deferred
+//!     (no ported module; tracked under #179 follow-ups).
+//!   The wrong-size warning (`:1172`) and the `Unknown raw profile` warning
+//!   (`:1267`) are still emitted. A MALFORMED raw profile (framing fails,
+//!   `:1166`) pushes NO event (bundled `return 0`s before the reset). In NO case
+//!   is the `PNG:"Raw profile type X"` keyword=hex text tag emitted (bundled
+//!   emits the DECODED tags or nothing).
 //! - **`eXIf` / `zXIf`** (`PNG.pm:309-317`, `:1358-1404`) — the Exif TIFF
 //!   block. A normal `eXIf` (`II`/`MM` header) is appended to
 //!   [`crate::metadata::PngMeta::exif_events`] as a
@@ -618,12 +629,21 @@ enum RawProfileKind {
   ExifTable { name: &'static str },
   /// A profile whose embedded module exifast does NOT port — `icc` / `icm`
   /// (→ `ICC_Profile::Main`, `PNG.pm:719`/`:727`), `iptc` / `8bim`
-  /// (→ `Photoshop::Main`, `PNG.pm:735`/`:755`), `xmp` (→ `XMP::Main`,
-  /// `PNG.pm:746`). The body IS hex-decoded + the wrong-size warning IS still
-  /// emitted (faithful to `ProcessProfile`, which runs before the module
-  /// dispatch), but the decoded bytes are then SUPPRESSED (no tags) — the
-  /// missing-sub-port deferral. `name` is the wrong-size-warning Name.
+  /// (→ `Photoshop::Main`, `PNG.pm:735`/`:755`). The body IS hex-decoded + the
+  /// wrong-size warning IS still emitted (faithful to `ProcessProfile`, which
+  /// runs before the module dispatch), but the decoded bytes are then
+  /// SUPPRESSED (no tags) — the missing-sub-port deferral. `name` is the
+  /// wrong-size-warning Name.
   SuppressedTable { name: &'static str },
+  /// `Raw profile type xmp` (`PNG.pm:746`, Name `XMP_Profile`) → `XMP::Main`.
+  /// `ProcessProfile` hex-decodes the body and dispatches it to
+  /// `ProcessDirectory(XMP::Main)` = `ProcessXMP` on the RAW packet (no header
+  /// strip). exifast HAS a ported XMP module ([`crate::formats::xmp`], built
+  /// when the `xmp` feature is active), so the decoded packet is captured for
+  /// `XMP-*` tag emission — while the `$$et{PROCESSED}` reset (`PNG.pm:1193`)
+  /// is still modeled by the `ResetOnlyProfile` event the same chunk pushes.
+  /// `name` is the wrong-size-warning Name (`XMP_Profile`).
+  XmpTable { name: &'static str },
 }
 
 /// Map a `tEXt` / `zTXt` keyword to its [`RawProfileKind`], or `None` for an
@@ -660,7 +680,8 @@ fn raw_profile_kind(keyword: &str) -> Option<RawProfileKind> {
     b"Raw profile type 8bim" => Some(RawProfileKind::SuppressedTable {
       name: "Photoshop_Profile",
     }),
-    b"Raw profile type xmp" => Some(RawProfileKind::SuppressedTable {
+    // XMP → the ported XMP module (decode the packet into XMP-* tags).
+    b"Raw profile type xmp" => Some(RawProfileKind::XmpTable {
       name: "XMP_Profile",
     }),
     _ => None,
@@ -827,31 +848,34 @@ fn process_profile(body: &[u8], name: &str) -> Option<DecodedProfile> {
     .unwrap_or(usize::MAX);
   let hex_region = after_type.get(i + 1..).unwrap_or(&[]);
 
-  // `pack('H*', join('',split(' ',$3)))` — strip ALL ASCII whitespace, then
-  // hex-decode. Perl's `pack('H*', …)` ignores a trailing nibble (an odd-length
-  // hex string drops the last char); non-hex chars decode as 0 in `pack` but
-  // ImageMagick always emits clean hex, so we treat a stray non-hex nibble as a
-  // decode stop (faithful enough for real input — see the module docs).
-  let mut decoded = Vec::with_capacity(hex_region.len() / 2);
+  // `pack('H*', join('',split(' ',$3)))` — strip ASCII whitespace, then
+  // hex-decode exactly as Perl `pack('H*', …)`:
+  //   * `split ' '` (the magic single-space form) splits on RUNS of whitespace
+  //     `[ \t\n\r\f\v]+` and strips leading whitespace; `join ''` collapses the
+  //     fields — net effect is "remove all ASCII whitespace" (matched by the
+  //     `is_ascii_whitespace` skip below).
+  //   * `pack('H*')` then maps EVERY remaining char to a nibble via libperl's
+  //     `(isALPHA(c) ? c + 9 : c) & 0xf` (empirically verified against Perl for
+  //     all bytes 0..=255). So non-hex chars do NOT stop the decode — they
+  //     contribute a (wrapped) nibble, exactly like ImageMagick-clean hex.
+  //   * an odd final nibble is the HIGH half of a trailing byte whose low half
+  //     is `0` (Perl pads, e.g. `pack('H*',"abc")` → `ab a0`… → `0xab 0xc0`).
+  let mut decoded = Vec::with_capacity(hex_region.len().div_ceil(2));
   let mut hi: Option<u8> = None;
   for &b in hex_region {
     if b.is_ascii_whitespace() {
       continue;
     }
-    let Some(nib) = hex_nibble(b) else {
-      // Non-hex, non-space char: bundled `pack('H*')` would treat it as 0, but
-      // real ImageMagick output never contains one. Stop decoding here (the
-      // wrong-size warning then reports the short length, matching a truncated
-      // profile).
-      break;
-    };
+    let nib = pack_h_nibble(b);
     match hi.take() {
       None => hi = Some(nib),
       Some(h) => decoded.push((h << 4) | nib),
     }
   }
-  // `pack('H*', …)` on an odd nibble count drops the dangling nibble — so a
-  // leftover `hi` contributes nothing.
+  // A leftover high nibble is Perl's odd-length pad: emit `<hi>0`.
+  if let Some(h) = hi {
+    decoded.push(h << 4);
+  }
 
   let actual_len = decoded.len();
   let size_warning = if declared_len != actual_len {
@@ -868,14 +892,19 @@ fn process_profile(body: &[u8], name: &str) -> Option<DecodedProfile> {
   })
 }
 
-/// ASCII hex nibble (`0-9A-Fa-f`) → value, or `None`. (`pack('H*', …)` is
-/// case-insensitive.)
-const fn hex_nibble(b: u8) -> Option<u8> {
-  match b {
-    b'0'..=b'9' => Some(b - b'0'),
-    b'a'..=b'f' => Some(b - b'a' + 10),
-    b'A'..=b'F' => Some(b - b'A' + 10),
-    _ => None,
+/// One Perl `pack('H*', …)` hex nibble: libperl's
+/// `(isALPHA(c) ? c + 9 : c) & 0xf`. For `0-9A-Fa-f` this is the usual hex
+/// value; for any other byte it is the SAME wrapped low nibble Perl produces
+/// (verified against Perl `pack`/`unpack` for every byte `0..=255`), so a
+/// noncanonical raw-profile chunk decodes byte-for-byte like ExifTool instead
+/// of truncating at the first non-hex char.
+const fn pack_h_nibble(b: u8) -> u8 {
+  // `isALPHA` is the C-locale ASCII test: `A-Z` / `a-z` only (bytes ≥ 128 and
+  // all symbols take the bare `& 0xf` branch).
+  if b.is_ascii_alphabetic() {
+    b.wrapping_add(9) & 0x0f
+  } else {
+    b & 0x0f
   }
 }
 
@@ -915,12 +944,17 @@ fn route_exif_profile(meta: &mut PngMeta<'_>, bytes: Vec<u8>, profile_type: &[u8
     meta.push_exif_event(PngExifEvent::ExifProfile(tiff.to_vec()));
     return;
   }
-  // 2. XMP APP1 — no ported XMP module (#37), so no tags. But `ProcessProfile`
-  //    has already RESET `$$et{PROCESSED}` (`PNG.pm:1193`) before this XMP
-  //    dispatch (oracle-confirmed: a `Raw profile type {exif,APP1}` carrying XMP
-  //    un-blocks a following same-`$addr` `eXIf`), so emit a reset-only event.
-  if bytes.starts_with(XMP_APP1_HDR) {
-    meta.push_exif_event(PngExifEvent::ResetOnlyProfile);
+  // 2. XMP APP1 (`PNG.pm:1236`) — strip the 29-byte `$xmpAPP1hdr` marker
+  //    (`$dirInfo{DirStart} += $hdrLen`) and dispatch the remaining RAW XMP
+  //    packet to `ProcessDirectory(XMP::Main)` = `ProcessXMP`. Capture the
+  //    stripped packet for `XMP-*` tag emission (when the `xmp` feature is
+  //    built). `ProcessProfile` has already RESET `$$et{PROCESSED}`
+  //    (`PNG.pm:1193`) before this dispatch (oracle-confirmed: a `Raw profile
+  //    type {exif,APP1}` carrying XMP un-blocks a following same-`$addr`
+  //    `eXIf`), modeled by the `ResetOnlyProfile` event `capture_xmp_profile`
+  //    pushes.
+  if let Some(packet) = bytes.strip_prefix(XMP_APP1_HDR) {
+    capture_xmp_profile(meta, packet.to_vec());
     return;
   }
   // 3. Bare TIFF (`II\x2a\0` / `MM\0\x2a`) — capture directly.
@@ -960,13 +994,18 @@ fn route_exif_profile(meta: &mut PngMeta<'_>, bytes: Vec<u8>, profile_type: &[u8
 /// 2. Any wrong-size warning (`PNG.pm:1172`) is pushed.
 /// 3. The decoded bytes route per kind: [`RawProfileKind::ExifTable`] →
 ///    [`route_exif_profile`] (content-keyed EXIF/XMP/TIFF dispatch);
-///    [`RawProfileKind::SuppressedTable`] → suppressed (no ported module).
+///    [`RawProfileKind::XmpTable`] → [`capture_xmp_profile`] (decode the packet
+///    into `XMP-*` tags via the ported XMP module + reset);
+///    [`RawProfileKind::SuppressedTable`] → suppressed (ICC / IPTC / Photoshop
+///    module not ported) + reset.
 ///
 /// In NO case is a `PNG:"Raw profile type X"` text record pushed (bundled emits
 /// the DECODED tags or nothing — never the keyword=hex text tag).
 fn handle_raw_profile(meta: &mut PngMeta<'_>, kind: RawProfileKind, body: &[u8]) {
   let name = match kind {
-    RawProfileKind::ExifTable { name } | RawProfileKind::SuppressedTable { name } => name,
+    RawProfileKind::ExifTable { name }
+    | RawProfileKind::SuppressedTable { name }
+    | RawProfileKind::XmpTable { name } => name,
   };
   // `PNG.pm:1166` `return 0 unless …` — a malformed body decodes to nothing.
   let Some(profile) = process_profile(body, name) else {
@@ -983,17 +1022,41 @@ fn handle_raw_profile(meta: &mut PngMeta<'_>, kind: RawProfileKind, body: &[u8])
     RawProfileKind::ExifTable { .. } => {
       route_exif_profile(meta, profile.bytes, &profile.profile_type);
     }
-    // ICC / IPTC / XMP / Photoshop → module not ported; no tags emitted.
-    // Bundled would `ProcessDirectory` into ICC_Profile / Photoshop / XMP, but
-    // crucially `ProcessProfile` has ALREADY RESET `$$et{PROCESSED}`
-    // (`PNG.pm:1193`) before that module dispatch — oracle-confirmed: a
-    // well-formed `icc`/`iptc`/`8bim`/`xmp` profile un-blocks a following
-    // same-`$addr` `eXIf`. So emit a reset-only event (the deferred module's
-    // tags stay unemitted; the cross-source reset is the load-bearing effect).
+    // ICC / IPTC / Photoshop → module not ported; no tags emitted. Bundled
+    // would `ProcessDirectory` into ICC_Profile / Photoshop, but crucially
+    // `ProcessProfile` has ALREADY RESET `$$et{PROCESSED}` (`PNG.pm:1193`)
+    // before that module dispatch — oracle-confirmed: a well-formed
+    // `icc`/`iptc`/`8bim` profile un-blocks a following same-`$addr` `eXIf`. So
+    // emit a reset-only event (the deferred module's tags stay unemitted; the
+    // cross-source reset is the load-bearing effect).
     RawProfileKind::SuppressedTable { .. } => {
       meta.push_exif_event(PngExifEvent::ResetOnlyProfile);
     }
+    // XMP → `ProcessDirectory(XMP::Main)` = `ProcessXMP` on the RAW hex-decoded
+    // packet (`PNG.pm:746` → `ProcessProfile`'s `$tagTablePtr ne $exifTable`
+    // branch, no header strip). Capture the packet for `XMP-*` tag emission;
+    // ALSO push the `ResetOnlyProfile` event so the `$$et{PROCESSED}` reset
+    // (`PNG.pm:1193`) un-blocks a following same-`$addr` `eXIf` exactly as
+    // before. When the `xmp` feature is NOT built the packet is dropped (the
+    // PNG port falls back to the faithful "no XMP module" reset-only behaviour).
+    RawProfileKind::XmpTable { .. } => {
+      capture_xmp_profile(meta, profile.bytes);
+    }
   }
+}
+
+/// Capture a hex-decoded XMP packet for `XMP-*` tag emission and push the
+/// `$$et{PROCESSED}` reset event (`PNG.pm:1193`) the XMP profile dispatch
+/// performs. The packet is stored only when the `xmp` feature is built;
+/// otherwise just the reset is modeled (faithful "no ported XMP module").
+fn capture_xmp_profile(meta: &mut PngMeta<'_>, packet: Vec<u8>) {
+  #[cfg(feature = "xmp")]
+  meta.push_xmp_profile(packet);
+  #[cfg(not(feature = "xmp"))]
+  let _ = packet;
+  // The reset is performed for EVERY well-formed profile (`PNG.pm:1193`),
+  // independent of whether the XMP tags are emitted.
+  meta.push_exif_event(PngExifEvent::ResetOnlyProfile);
 }
 
 // ===========================================================================
@@ -2030,6 +2093,39 @@ impl crate::emit::Taggable for PngMeta<'_> {
       }
     }
 
+    // ---- Raw-profile XMP — chain the XMP sub-Meta's tag stream -------------
+    // A `Raw profile type xmp` chunk (`PNG.pm:746`) and the XMP-content arm of
+    // `Raw profile type {exif,APP1}` (`PNG.pm:1236`) feed the hex-decoded packet
+    // to `ProcessDirectory(XMP::Main)` = `ProcessXMP`. We parse each captured
+    // packet through the ported XMP module ([`crate::formats::xmp`]) and splice
+    // its `Taggable` stream (the `XMP-*:*` tags under family-0 `XMP`) here. The
+    // engine's last-wins `TagMap` dedup keeps every unique tag (multiple XMP
+    // profiles are uncommon but merge faithfully). Object key order is
+    // conformance-insensitive, so the splice position (after the EXIF chain)
+    // does not affect output. A post-`IEND` TRAILER XMP profile carries the
+    // `Trailer` family-1 override (`PNG.pm:1484`); the `XMP-*` groups are not
+    // `Exif::Main` IFDs, so [`apply_trailer_group`] shifts them to `Trailer`.
+    #[cfg(feature = "xmp")]
+    for (xi, packet) in self.xmp_profiles().iter().enumerate() {
+      let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) else {
+        continue;
+      };
+      if self.xmp_is_trailing(xi) {
+        for e in xmp_meta.tags(mode) {
+          let unknown = e.unknown();
+          let tag = e.into_tag();
+          tags.push(EmittedTag::new(
+            apply_trailer_group(tag.group_ref().clone()),
+            tag.name().into(),
+            tag.value_ref().clone(),
+            unknown,
+          ));
+        }
+      } else {
+        tags.extend(xmp_meta.tags(mode));
+      }
+    }
+
     tags.into_iter()
   }
 }
@@ -2070,6 +2166,17 @@ impl crate::diagnostics::Diagnose for PngMeta<'_> {
           .iter()
           .map(|w| crate::diagnostics::Diagnostic::warn(w.as_str())),
       );
+    }
+    // Raw-profile XMP sub-Metas' own decode/walk warnings (`ProcessXMP` records
+    // at most one first-occurrence `$et->Warn`, e.g. `XMP is double UTF-encoded`
+    // XMP.pm:4491). These follow the PNG-level + EXIF warnings (XMP profiles are
+    // dispatched after the chunk walk), so the document-level first-warning is
+    // unchanged.
+    #[cfg(feature = "xmp")]
+    for packet in self.xmp_profiles() {
+      if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
+        out.extend(crate::diagnostics::Diagnose::diagnostics(&xmp_meta));
+      }
     }
     out
   }
@@ -2897,6 +3004,28 @@ impl crate::metadata::Project for PngMeta<'_> {
     // blocked event's `ExifMeta` has no entries ⇒ projects to an empty
     // `MediaMetadata`; a reset-only profile yields no `meta` ⇒ contributes
     // nothing.
+    // Raw-profile XMP fold (creator / title / description / GPS). Parse each
+    // captured packet through the ported XMP module and merge LATER-WINS, the
+    // same accumulation the EXIF fold uses. XMP is then merged UNDER the EXIF
+    // facts (EXIF/MakerNote camera data is the higher-priority source; XMP fills
+    // gaps), and the PNG IHDR dimensions fill any remaining `MediaInfo` gap.
+    #[cfg(feature = "xmp")]
+    let xmp_media: Option<crate::metadata::MediaMetadata> = {
+      let mut acc: Option<crate::metadata::MediaMetadata> = None;
+      for packet in self.xmp_profiles() {
+        if let Some(xmp_meta) = crate::formats::xmp::parse_borrowed(packet) {
+          let projected = crate::metadata::Project::project(&xmp_meta);
+          acc = Some(match acc {
+            Some(prev) => projected.merge(prev),
+            None => projected,
+          });
+        }
+      }
+      acc
+    };
+    #[cfg(not(feature = "xmp"))]
+    let xmp_media: Option<crate::metadata::MediaMetadata> = None;
+
     #[cfg(feature = "exif")]
     {
       let mut acc: Option<crate::metadata::MediaMetadata> = None;
@@ -2912,9 +3041,20 @@ impl crate::metadata::Project for PngMeta<'_> {
         }
       }
       if let Some(exif_media) = acc {
-        // EXIF (camera facts) is higher-priority; the PNG dimensions fill gaps.
-        return exif_media.merge(png_media);
+        // EXIF (camera facts) is higher-priority; XMP fills gaps, then the PNG
+        // dimensions fill any remaining `MediaInfo` gap.
+        let merged = match xmp_media {
+          Some(xmp) => exif_media.merge(xmp),
+          None => exif_media,
+        };
+        return merged.merge(png_media);
       }
+    }
+
+    // No EXIF source (or `exif` disabled): XMP (if any) is the camera-facts
+    // source over the PNG dimensions.
+    if let Some(xmp) = xmp_media {
+      return xmp.merge(png_media);
     }
 
     png_media
@@ -3629,9 +3769,11 @@ mod tests {
         name: "Photoshop_Profile"
       }),
     ));
+    // XMP → the ported XMP module (decoded into `XMP-*` tags, #179) rather than
+    // suppressed.
     assert!(matches!(
       raw_profile_kind("Raw profile type xmp"),
-      Some(RawProfileKind::SuppressedTable {
+      Some(RawProfileKind::XmpTable {
         name: "XMP_Profile"
       }),
     ));
@@ -3741,11 +3883,67 @@ mod tests {
   }
 
   #[test]
-  fn process_profile_odd_nibble_dropped_like_pack_h_star() {
-    // `pack('H*', "abc")` drops the dangling nibble — 1 byte from 3 nibbles.
-    let body = b"\nexif\n       1\nabc\n";
+  fn process_profile_odd_nibble_padded_like_pack_h_star() {
+    // Oracle: `perl -e 'print unpack("H*", pack("H*","abc"))'` → `abc0`. Perl
+    // pads the dangling nibble as the HIGH half of a `<hi>0` byte (it does NOT
+    // drop it), so 3 nibbles → 2 bytes `0xab 0xc0`.
+    let body = b"\nexif\n       2\nabc\n";
     let p = process_profile(body, "EXIF_Profile").expect("framing matches");
-    assert_eq!(p.bytes, vec![0xab]); // 'c' is the dropped odd nibble
+    assert_eq!(p.bytes, vec![0xab, 0xc0]);
+    assert!(p.size_warning.is_none(), "len 2 matches 2 decoded bytes");
+  }
+
+  #[test]
+  fn process_profile_single_odd_nibble_pads_low_zero() {
+    // Oracle: `pack("H*","a")` → `a0`. One nibble → one byte `0xa0`.
+    let body = b"\nexif\n       1\na\n";
+    let p = process_profile(body, "EXIF_Profile").expect("framing matches");
+    assert_eq!(p.bytes, vec![0xa0]);
+  }
+
+  #[test]
+  fn process_profile_non_hex_decodes_via_pack_nibble_rule() {
+    // The whole point of the fix: a non-hex char does NOT stop the decode —
+    // `pack('H*')` maps it through `(isALPHA? c+9 : c) & 0xf`. Oracle outputs:
+    //   pack("H*","zc") → "3c"  ('z'=0x7a → (0x7a+9)&0xf = 3)
+    //   pack("H*","g0") → "00"  ('g'=0x67 → (0x67+9)&0xf = 0)
+    let zc = process_profile(b"\nexif\n       1\nzc\n", "EXIF_Profile").unwrap();
+    assert_eq!(zc.bytes, vec![0x3c]);
+    let g0 = process_profile(b"\nexif\n       1\ng0\n", "EXIF_Profile").unwrap();
+    assert_eq!(g0.bytes, vec![0x00]);
+    // A non-hex char mid-stream keeps decoding the rest (no truncation):
+    //   pack("H*","01g203") → "01" . "02" . "03" with 'g'→0 ⇒ 0x01 0x02 0x03.
+    let mid = process_profile(b"\nexif\n       3\n01g203\n", "EXIF_Profile").unwrap();
+    assert_eq!(mid.bytes, vec![0x01, 0x02, 0x03]);
+  }
+
+  #[test]
+  fn pack_h_nibble_matches_perl_for_all_bytes() {
+    // `(isALPHA(c) ? c + 9 : c) & 0xf`, verified against Perl `pack('H*')` for
+    // every byte 0..=255. Spot-check the canonical hex set plus the boundary
+    // chars that distinguish the alpha (+9) branch from the bare-mask branch.
+    for (b, want) in [
+      (b'0', 0x0),
+      (b'9', 0x9),
+      (b'a', 0xa),
+      (b'f', 0xf),
+      (b'A', 0xa),
+      (b'F', 0xf),
+      (b'g', 0x0), // 0x67 alpha → (0x67+9)&0xf
+      (b'z', 0x3), // 0x7a alpha → (0x7a+9)&0xf
+      (b'G', 0x0),
+      (b'Z', 0x3),
+      (b'!', 0x1), // 0x21 not alpha → 0x21&0xf
+      (b'@', 0x0), // 0x40 not alpha
+      (b'/', 0xf), // 0x2f not alpha
+      (b':', 0xa), // 0x3a not alpha
+      (b'`', 0x0), // 0x60 not alpha (just below 'a')
+      (b'{', 0xb), // 0x7b not alpha (just above 'z')
+      (0x80, 0x0), // high byte: not alpha
+      (0xff, 0xf),
+    ] {
+      assert_eq!(pack_h_nibble(b), want, "byte {b:#04x}");
+    }
   }
 
   #[test]
@@ -3763,11 +3961,13 @@ mod tests {
   }
 
   #[test]
-  fn route_exif_profile_xmp_content_emits_reset_only_no_warning() {
-    // An XMP-namespace body has no ported XMP module ⇒ no EXIF tags, no
-    // warning. But `ProcessProfile` has ALREADY reset `$$et{PROCESSED}`
-    // (PNG.pm:1193) before this XMP dispatch (oracle-confirmed: such a profile
-    // un-blocks a following same-addr eXIf), so it emits ONE reset-only event.
+  fn route_exif_profile_xmp_content_captures_packet_and_resets() {
+    // An `Exif`/`APP1`-table profile whose decoded content is `$xmpAPP1hdr`-led
+    // XMP (PNG.pm:1236): strip the marker, CAPTURE the remaining XMP packet for
+    // tag emission (#179), and — since `ProcessProfile` has ALREADY reset
+    // `$$et{PROCESSED}` (PNG.pm:1193) before this dispatch (oracle-confirmed:
+    // such a profile un-blocks a following same-addr eXIf) — push ONE
+    // reset-only event. No warning either way.
     let mut m = PngMeta::new();
     let mut block = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
     block.extend_from_slice(b"<x:xmpmeta/>");
@@ -3776,6 +3976,11 @@ mod tests {
     assert_eq!(evs.len(), 1, "expected one reset-only event, got {evs:?}");
     assert!(evs[0].is_reset_only());
     assert!(m.warnings().is_empty(), "got {:?}", m.warnings());
+    #[cfg(feature = "xmp")]
+    {
+      assert_eq!(m.xmp_profiles().len(), 1);
+      assert_eq!(m.xmp_profiles()[0], b"<x:xmpmeta/>");
+    }
   }
 
   #[test]
@@ -3991,6 +4196,138 @@ mod tests {
       meta.text_records(),
     );
     assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
+  }
+
+  /// Build an ImageMagick `Raw profile type <profile_type>` tEXt chunk body
+  /// (`\n<type>\n<8-wide len>\n<hex>\n`) for `payload`, returning the full
+  /// `keyword\0body` chunk-data slice the tEXt decoder receives.
+  fn raw_profile_payload(profile_type: &str, payload: &[u8]) -> Vec<u8> {
+    let hexstr: String = payload.iter().map(|b| std::format!("{b:02x}")).collect();
+    let mut body = std::format!("\n{profile_type}\n{:8}\n", payload.len()).into_bytes();
+    body.extend_from_slice(hexstr.as_bytes());
+    body.push(b'\n');
+    let mut data = std::format!("Raw profile type {profile_type}\0").into_bytes();
+    data.extend_from_slice(&body);
+    data
+  }
+
+  /// Wrap `tEXt` chunk data into a minimal IHDR + tEXt + IEND PNG buffer.
+  fn png_with_text(text_data: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(PNG_SIGNATURE);
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    bytes.extend_from_slice(&chunk(b"tEXt", text_data));
+    bytes.extend_from_slice(&chunk(b"IEND", &[]));
+    bytes
+  }
+
+  /// A small, valid XMP packet carrying one `dc:creator` (`PNG.pm:746` →
+  /// `ProcessXMP` recognizes the `<?xpacket`/`<x:xmpmeta` root).
+  const XMP_TEST_PACKET: &[u8] = br#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">
+   <dc:creator><rdf:Seq><rdf:li>Ansel Adams</rdf:li></rdf:Seq></dc:creator>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn raw_profile_xmp_text_captures_packet_and_resets() {
+    // `Raw profile type xmp` (PNG.pm:746): the hex-decoded packet is CAPTURED
+    // for XMP tag emission AND a `ResetOnlyProfile` event is pushed (the
+    // `$$et{PROCESSED}` reset, PNG.pm:1193). No text record, no warning.
+    let data = raw_profile_payload("xmp", XMP_TEST_PACKET);
+    let bytes = png_with_text(&data);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert_eq!(meta.xmp_profiles().len(), 1, "one XMP packet captured");
+    assert_eq!(
+      meta.xmp_profiles()[0],
+      XMP_TEST_PACKET,
+      "captured packet is the raw hex-decoded XMP (no header strip)"
+    );
+    // The PROCESSED reset is still modeled (un-blocks a following same-$addr eXIf).
+    assert_eq!(meta.exif_events().len(), 1);
+    assert!(meta.exif_events()[0].is_reset_only());
+    assert!(
+      meta.text_records().is_empty(),
+      "xmp raw-profile keyword must NOT push a text record"
+    );
+    assert!(meta.warnings().is_empty(), "got {:?}", meta.warnings());
+  }
+
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn raw_profile_app1_xmp_content_strips_marker_and_captures() {
+    // `Raw profile type APP1` whose decoded content is the `$xmpAPP1hdr`-led XMP
+    // (PNG.pm:1236): strip the 29-byte marker, capture the remaining raw packet.
+    let mut content = XMP_APP1_HDR.to_vec();
+    content.extend_from_slice(XMP_TEST_PACKET);
+    let data = raw_profile_payload("APP1", &content);
+    let bytes = png_with_text(&data);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert_eq!(meta.xmp_profiles().len(), 1);
+    assert_eq!(
+      meta.xmp_profiles()[0],
+      XMP_TEST_PACKET,
+      "the $xmpAPP1hdr marker is stripped before capture"
+    );
+    assert_eq!(meta.exif_events().len(), 1);
+    assert!(meta.exif_events()[0].is_reset_only());
+  }
+
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn raw_profile_xmp_emits_xmp_tags_through_taggable() {
+    // End-to-end through the golden emission engine: the captured XMP packet's
+    // `XMP-dc:Creator` reaches PNG's `tags()` stream (chained via the ported
+    // XMP module's `Taggable`).
+    use crate::emit::{ConvMode, Taggable};
+    let data = raw_profile_payload("xmp", XMP_TEST_PACKET);
+    let bytes = png_with_text(&data);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    let creator = meta
+      .tags(ConvMode::PrintConv)
+      .find(|t| t.tag().name() == "Creator")
+      .expect("XMP-dc:Creator emitted from the raw-profile-xmp chunk");
+    assert_eq!(creator.tag().group_ref().family0(), "XMP");
+    assert_eq!(creator.tag().group_ref().family1(), "XMP-dc");
+  }
+
+  #[cfg(feature = "xmp")]
+  #[test]
+  fn raw_profile_xmp_wrong_size_still_warns() {
+    // The wrong-size warning (PNG.pm:1172) fires before the module dispatch —
+    // unchanged by the XMP decode. Declare a bogus length.
+    let hexstr: String = XMP_TEST_PACKET
+      .iter()
+      .map(|b| std::format!("{b:02x}"))
+      .collect();
+    // Declared length 9999 ≠ actual — forces the wrong-size warning.
+    let mut body = b"\nxmp\n    9999\n".to_vec();
+    body.extend_from_slice(hexstr.as_bytes());
+    body.push(b'\n');
+    let mut data = b"Raw profile type xmp\0".to_vec();
+    data.extend_from_slice(&body);
+    let bytes = png_with_text(&data);
+    let meta = parse_borrowed(&bytes).expect("png parses");
+    assert!(
+      meta
+        .warnings()
+        .iter()
+        .any(|w| w.contains("XMP_Profile is wrong size")),
+      "got {:?}",
+      meta.warnings()
+    );
+    // Despite the size mismatch the packet is still captured (bundled continues
+    // with the actual bytes).
+    assert_eq!(meta.xmp_profiles().len(), 1);
   }
 
   #[test]
