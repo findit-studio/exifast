@@ -7,6 +7,18 @@
 #               (default: <repo>/../exiftool/exiftool — the sibling checkout)
 #   GOLDEN_DIR  directory to write <fix>.json / <fix>.n.json into
 #               (default: <repo>/tests/golden)
+#   EXCLUDE     extra `-x …` exclusions applied to EVERY run (see below)
+#   EE          when set to a non-empty value, ALSO emit the timed-metadata
+#               (`ExtractEmbedded`/`-ee`) oracle goldens for this fixture:
+#                 <fix>.ee.json     (`-ee`, family-1 groups — same COMMON flags)
+#                 <fix>.ee.g3.json  (`-ee -G3:1`, adds the `Doc<N>:` family-3
+#                                    document axis for per-fix timed samples)
+#               This is PURELY ADDITIVE: the `.ee.*` goldens are not part of the
+#               both-standard-goldens active conformance set (which requires
+#               BOTH `<fix>.json` AND `<fix>.n.json`); they pin the bundled
+#               `-ee` truth for the QuickTime timed-metadata (GPS) stream, which
+#               the default (non-`-ee`) runs never reach. The default path is
+#               UNCHANGED when EE is unset/empty.
 set -euo pipefail
 
 [ "$#" -ge 1 ] || { echo "usage: $0 <fixture-name>" >&2; exit 1; }
@@ -78,3 +90,17 @@ esac
 ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"}    "$FIX" ) > "$OUT"
 ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -n "$FIX" ) > "$OUT_N"
 echo "wrote $OUT and $OUT_N"
+
+# --- EE (ExtractEmbedded) timed-metadata oracle goldens ---------------------
+# Opt-in via `EE=1`. ADDITIVE: writes `<fix>.ee.json` (family-1 groups, same
+# COMMON flags + `-ee`) and `<fix>.ee.g3.json` (`-ee -G3:1` → `Doc<N>:` family-3
+# document axis). `-G1` from COMMON and `-G3:1` coexist (verified): the g3 run
+# emits `Doc<N>:QuickTime:GPS…` (family-3 ∘ family-1), so no array tweak is
+# needed. Same `${EXCLUDE_ARR[@]+…}` guard for bash-3.2 `set -u` safety.
+if [ -n "${EE:-}" ]; then
+  OUT_EE="$OUTDIR/$FIX.ee.json"
+  OUT_EE_G3="$OUTDIR/$FIX.ee.g3.json"
+  ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -ee        "$FIX" ) > "$OUT_EE"
+  ( cd "$FIXDIR" && LC_ALL=C TZ=UTC perl "$EXIFTOOL" "${COMMON[@]}" ${EXCLUDE_ARR[@]+"${EXCLUDE_ARR[@]}"} -ee -G3:1 "$FIX" ) > "$OUT_EE_G3"
+  echo "wrote $OUT_EE and $OUT_EE_G3"
+fi
