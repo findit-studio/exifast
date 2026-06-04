@@ -292,9 +292,9 @@ pub(crate) fn escape_json_is_number(s: &str) -> bool {
 /// Whether a [`escape_json_is_number`] token's SIGNIFICAND represents a nonzero
 /// value — i.e. it contains a digit `1..=9` before the exponent marker.
 ///
-/// Used by the `serialize_in_gate_number_str` / `classify_json_scalar` /
-/// `emit_gated_number` consumers to complete the f64-representation gate
-/// (Contract B / #197). The gate admits an exponent up to `e[-+]?\d{1,3}`
+/// The significand half of the [`f64_token_is_faithful`] predicate (Contract B
+/// / #197), which the four f64-emitting paths share to complete the
+/// f64-representation gate. The gate admits an exponent up to `e[-+]?\d{1,3}`
 /// (faithful to `exiftool:3810`), so it accepts tokens OUTSIDE finite-f64 range
 /// on BOTH sides: `1e999` OVERFLOWS to `INFINITY` (caught by `!is_finite()`),
 /// and `1e-999` UNDERFLOWS to a FINITE `0.0` — which the finite-only guard would
@@ -313,6 +313,37 @@ pub(crate) fn lexeme_is_nonzero(token: &str) -> bool {
     .bytes()
     .take_while(|&b| b != b'e' && b != b'E')
     .any(|b| b.is_ascii_digit() && b != b'0')
+}
+
+/// The COMPLETE f64-representation predicate (Contract B / #197): whether a
+/// `parsed` f64 faithfully denotes its source `token`, so the value may be
+/// emitted as a BARE JSON number rather than a quoted string.
+///
+/// The `EscapeJSON` gate ([`escape_json_is_number`]) admits an exponent up to
+/// `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it accepts a token whose
+/// magnitude is OUTSIDE finite-f64 range on BOTH sides — and the same overflow
+/// arises when a FINITE f64 near `f64::MAX` is `format_g`-rounded to a token
+/// that exceeds `f64::MAX` (e.g. `f64::MAX` → `"1.79769313486232e+308"`). The
+/// predicate is faithful ⟺ BOTH:
+///   (a) `parsed.is_finite()` — an OVERFLOW (`1e999`, or a near-`f64::MAX` value
+///       whose rounded token over-ranges) reparses to `±INFINITY`, which
+///       `serialize_f64` would corrupt to `null` (or, via `TagValue::F64`, the
+///       titlecase `"Inf"`); and
+///   (b) `!(parsed == 0.0 && lexeme_is_nonzero(token))` — a nonzero significand
+///       that UNDERFLOWED to a finite `0.0` (`1e-999`) must stay a string, not a
+///       bare `0` that rewrites the value to zero.
+/// A genuine-zero token (`0`, `0.0`, `0e-5`) stays a bare `0`; finite-nonzero
+/// precision loss (`1.50` ≈ `1.5`) is value-preserving under the comparator.
+///
+/// The SINGLE crate-wide source of truth for this predicate — the four
+/// f64-emitting paths delegate here so they can never diverge: the string-origin
+/// consumers [`serialize_in_gate_number_str`] (this module),
+/// `emit_gated_number` (`exif::mod`), `classify_json_scalar` (`formats::h264`),
+/// AND the numeric-origin `TagValue::F64` serializer arm (this module). When
+/// false, the caller emits the source token as a SOUND quoted string.
+#[must_use]
+pub(crate) fn f64_token_is_faithful(parsed: f64, token: &str) -> bool {
+  parsed.is_finite() && !(parsed == 0.0 && lexeme_is_nonzero(token))
 }
 
 /// ExifTool's universal no-`-b` binary placeholder string for a value of `len`
@@ -866,9 +897,9 @@ const _: () = {
   /// fourth corrupting case: a genuine-zero lexeme (`0`/`0.0`/`0e-5`/`-0`) is
   /// `f == 0.0` with a zero significand, so it stays a bare `0`; and precision
   /// loss strictly within finite-nonzero range is value-preserving under the
-  /// token-exact comparator (`1.50` ≈ `1.5`). Hence `is_finite() && !(f == 0.0 &&
-  /// lexeme_is_nonzero)` is the complete predicate for "the f64 may be emitted
-  /// bare".
+  /// token-exact comparator (`1.50` ≈ `1.5`). Hence [`f64_token_is_faithful`]
+  /// (`is_finite() && !(f == 0.0 && lexeme_is_nonzero)`) is the complete,
+  /// crate-wide predicate for "the f64 may be emitted bare".
   ///
   /// NOTE — this is a deliberate CRAFTED-input divergence from ExifTool's
   /// `EscapeJSON`, which `return $str`s an over-range exponent BARE. Emitting a
@@ -886,8 +917,7 @@ const _: () = {
   /// could perturb the comparator.)
   fn serialize_in_gate_number_str<S: Serializer>(text: &str, s: S) -> Result<S::Ok, S::Error> {
     if let Ok(f) = text.parse::<f64>()
-      && f.is_finite()
-      && !(f == 0.0 && crate::value::lexeme_is_nonzero(text))
+      && crate::value::f64_token_is_faithful(f, text)
     {
       return s.serialize_f64(f);
     }
@@ -967,11 +997,25 @@ const _: () = {
             // number equals the golden's rounded number.
             let rounded = format_g(*n, 15);
             if escape_json_is_number(&rounded) {
+              // Re-parse the ROUNDED token and emit a bare number ONLY when it
+              // is FAITHFUL ([`f64_token_is_faithful`], Contract B / #197) — this
+              // makes the f64-representation predicate UNIVERSAL across the
+              // string-origin paths (the R5 consumers) AND this numeric-origin
+              // arm. `n` is finite, but `format_g(_, 15)` of a value near
+              // `f64::MAX` can round UP past `f64::MAX` (e.g. `f64::MAX` →
+              // `"1.79769313486232e+308"`), which the gate admits yet which
+              // reparses to `INFINITY` → `serialize_f64(INFINITY)` would emit
+              // `null`, silently corrupting a valid finite value. The faithful
+              // predicate routes that extreme rounded form to a SOUND quoted
+              // string instead (never `null`). Every normal finite metadata
+              // double round-trips finite → bare number, UNCHANGED. (The residual
+              // crafted-input faithful-bare-emission gap for such an extreme value
+              // is tracked in the followup issue.)
               match rounded.parse::<f64>() {
-                Ok(f) => s.serialize_f64(f),
-                // `format_g` always yields a parseable decimal for a finite f64;
-                // fall back to the rounded text defensively.
-                Err(_) => s.serialize_str(&rounded),
+                Ok(f) if f64_token_is_faithful(f, &rounded) => s.serialize_f64(f),
+                // Over-range rounded token (overflow to non-finite) or an
+                // unreachable non-parse: the faithful quoted source string.
+                _ => s.serialize_str(&rounded),
               }
             } else {
               // Out of gate (a `>16`-fraction-digit or `>15`-integer-digit
@@ -1474,6 +1518,34 @@ mod tests {
     assert!(!lexeme_is_nonzero("0e9"));
   }
 
+  /// Contract B / #197 — the consolidated [`f64_token_is_faithful`] predicate
+  /// that the four f64-emitting paths share. Faithful ⟺ the reparsed f64 is
+  /// finite AND not a nonzero-significand value that underflowed to `0.0`.
+  #[test]
+  fn f64_token_is_faithful_predicate() {
+    // FAITHFUL: an in-range finite value round-trips bare (its token is irrelevant
+    // beyond the underflow check, but pass the matching token).
+    for (tok, n) in [("13.59", 13.59f64), ("1e-300", 1e-300f64), ("0", 0.0f64)] {
+      assert!(f64_token_is_faithful(n, tok), "{tok} is faithful");
+    }
+    // A GENUINE-zero token parsing to `0.0` is faithful (stays a bare `0`).
+    assert!(f64_token_is_faithful(0.0, "0e-5"));
+    // NOT faithful — OVERFLOW: a token (or near-`f64::MAX` rounded form) that
+    // reparses to ±INFINITY (would corrupt to `null`/`Inf`).
+    assert!(!f64_token_is_faithful(f64::INFINITY, "1e999"));
+    assert!(!f64_token_is_faithful(f64::NEG_INFINITY, "-1e999"));
+    assert!(!f64_token_is_faithful(
+      "1.79769313486232e+308".parse::<f64>().unwrap(),
+      "1.79769313486232e+308"
+    ));
+    // NOT faithful — nonzero-UNDERFLOW: a nonzero significand that parsed to
+    // `0.0` (would rewrite the token to a bare `0`).
+    assert!(!f64_token_is_faithful(0.0, "1e-999"));
+    assert!(!f64_token_is_faithful(0.0, "9e-400"));
+    // NaN is never faithful.
+    assert!(!f64_token_is_faithful(f64::NAN, "NaN"));
+  }
+
   /// Contract B / #197 — the integer and float serializers run the SAME
   /// terminal `EscapeJSON` number gate (the value is stringified, then gated):
   /// an in-gate value is a bare JSON number; an out-of-gate value (a `>= 16`-
@@ -1511,5 +1583,77 @@ mod tests {
     // Non-finite floats stay the titlecase quoted word (unchanged).
     assert_eq!(j(&TagValue::F64(f64::INFINITY)), "\"Inf\"");
     assert_eq!(j(&TagValue::F64(f64::NAN)), "\"NaN\"");
+  }
+
+  /// Contract B / #197 — the NUMERIC-ORIGIN counterpart of the
+  /// f64-representation predicate (the final structural piece of the class). A
+  /// FINITE `TagValue::F64` near `f64::MAX` is `format_g(_, 15)`-rounded to a
+  /// token that OVERFLOWS `f64::MAX` (`f64::MAX` → `"1.79769313486232e+308"`),
+  /// which the `EscapeJSON` gate ADMITS (a 3-digit exponent) yet which reparses
+  /// to `INFINITY`. The pre-fix `TagValue::F64` arm passed that reparse to
+  /// `serialize_f64` WITHOUT re-checking `is_finite()`, so serde emitted `null`
+  /// — silent corruption of a VALID finite value. The fix gates the reparse
+  /// through the shared [`f64_token_is_faithful`] predicate (now universal across
+  /// the string-origin R5 consumers AND this numeric-origin arm): the extreme
+  /// rounded form falls to a SOUND quoted string (never `null`, never a panic) on
+  /// `to_string` AND `to_value`, while every normal finite double is UNCHANGED.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn f64_near_max_rounds_to_quoted_string_not_null() {
+    let js = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // The exact rounded form `format_g(f64::MAX, 15)` produces, which over-ranges
+    // `f64::MAX` on reparse → would be the corrupting `null` without the recheck.
+    let max_tok = r#""1.79769313486232e+308""#;
+    let min_tok = r#""-1.79769313486232e+308""#;
+    assert_eq!(js(&TagValue::F64(f64::MAX)), max_tok);
+    assert_eq!(js(&TagValue::F64(f64::MIN)), min_tok);
+    // SOUNDNESS on `to_string`: a VALID JSON string, NEVER `null`, round-trips as
+    // a `RawValue`, and its decoded payload is the exact rounded token.
+    for n in [f64::MAX, f64::MIN] {
+      let out = js(&TagValue::F64(n));
+      assert_ne!(out, "null", "near-f64::MAX value must not corrupt to null");
+      let rv: Result<Box<serde_json::value::RawValue>, _> = serde_json::from_str(&out);
+      assert!(
+        rv.is_ok(),
+        "emitted token {out:?} must re-parse as a RawValue"
+      );
+      assert_eq!(
+        serde_json::from_str::<String>(&out).unwrap(),
+        format_g(n, 15),
+        "near-f64::MAX value must serialize to its rounded %.15g token as a string"
+      );
+    }
+    // A NORMAL finite double still emits a BARE number, byte-identical to before
+    // the fix (the common case is UNCHANGED — it round-trips finite → bare).
+    assert_eq!(js(&TagValue::F64(2.6)), "2.6");
+    assert_eq!(js(&TagValue::F64(0.5)), "0.5");
+    // A large-but-in-range double still round-trips finite ⇒ a bare number.
+    assert_eq!(js(&TagValue::F64(1.5e308)), "1.5e+308");
+  }
+
+  /// Contract B / #197 — the numeric-origin near-`f64::MAX` soundness must hold on
+  /// `to_value` too (the `Serialize` impl is also driven by `serde_json::to_value`
+  /// via `Rendered`/the typed-serde+parity harness). A reparse to `INFINITY` would
+  /// make `serialize_f64(INFINITY)` corrupt the value to `Value::Null`; the
+  /// faithful predicate emits a quoted JSON STRING instead — `Ok`, never `Err`,
+  /// never `null`, never a panic — exactly like the string-origin `to_value` test.
+  #[cfg(feature = "json")]
+  #[test]
+  fn f64_near_max_to_value_is_ok_string_not_null() {
+    for n in [f64::MAX, f64::MIN] {
+      let v = serde_json::to_value(TagValue::F64(n))
+        .expect("to_value must not error on a near-f64::MAX double");
+      assert_eq!(
+        v,
+        serde_json::Value::String(format_g(n, 15)),
+        "near-f64::MAX value must serialize to its rounded token as a quoted string"
+      );
+      assert!(!v.is_null(), "near-f64::MAX value must never become null");
+    }
+    // A normal finite double is a BARE number on `to_value` too (unchanged).
+    assert_eq!(
+      serde_json::to_value(TagValue::F64(2.6)).unwrap(),
+      serde_json::json!(2.6)
+    );
   }
 }

@@ -4059,30 +4059,19 @@ fn emit_gated_number<S: ExifSink>(
       return out.write_u64(group, name, n);
     }
   }
-  // A FINITE in-gate fractional/exponent value that FAITHFULLY represents its
-  // token emits a value-equal bare number via `write_f64`. The gate admits an
-  // exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it also
-  // accepts a token OUTSIDE finite-f64 range on BOTH sides: `1e999` OVERFLOWS to
-  // `INFINITY` (`write_f64(INFINITY)` would reach `TagValue::F64`'s serializer
-  // and emit the titlecase `"Inf"` string, corrupting the verbatim source token,
-  // which ExifTool's `EscapeJSON` `return $str`s unchanged), and `1e-999`
-  // UNDERFLOWS a nonzero significand to a FINITE `0.0` (a finite-only guard would
-  // emit a bare `0`, rewriting the nonzero token to zero). In EITHER case emit
-  // the ORIGINAL `rendered` text as a quoted JSON string — sound on every path,
-  // never `null`/`Inf`/`0` corruption (mirrors
-  // `value.rs::serialize_in_gate_number_str`, Contract B / #197). The predicate
-  // `is_finite() && !(f == 0.0 && lexeme_is_nonzero)` is COMPLETE for the
-  // f64-representation class: overflow ⇒ !finite ⇒ string; nonzero-underflow ⇒
-  // `0.0`+nonzero-significand ⇒ string; else the finite f64 faithfully denotes
-  // the value ⇒ bare (a genuine-zero token stays a bare `0`; finite-nonzero
-  // precision loss is value-preserving under the comparator). Every current EXIF
-  // caller feeds a bounded format or a pre-finite `format_g` render, so the
-  // string arm is unreachable today; the guard keeps the gate class closed
-  // against a future caller passing such a token.
+  // Emit a value-equal bare number via `write_f64` ONLY when the f64 FAITHFULLY
+  // represents its token ([`crate::value::f64_token_is_faithful`], the shared
+  // f64-representation predicate). The gate admits an over-range exponent, so a
+  // token outside finite-f64 range — `1e999` (OVERFLOW → `INFINITY`, which
+  // `write_f64` would lower to `TagValue::F64`'s titlecase `"Inf"`) or `1e-999`
+  // (nonzero-UNDERFLOW → finite `0.0`, a bare `0` rewriting the token to zero) —
+  // instead emits the ORIGINAL `rendered` text as a quoted JSON string, sound on
+  // every path (mirrors `value.rs::serialize_in_gate_number_str`, Contract B /
+  // #197). Every current EXIF caller feeds a bounded format or a pre-finite
+  // `format_g` render, so the string arm is unreachable today; the guard keeps
+  // the gate class closed against a future caller passing such a token.
   match rendered.parse::<f64>() {
-    Ok(f) if f.is_finite() && !(f == 0.0 && crate::value::lexeme_is_nonzero(rendered)) => {
-      out.write_f64(group, name, f)
-    }
+    Ok(f) if crate::value::f64_token_is_faithful(f, rendered) => out.write_f64(group, name, f),
     // Over-range exponent (overflow to non-finite OR nonzero-underflow to `0.0`)
     // or an unreachable non-parse: fall back to the faithful quoted source
     // string.

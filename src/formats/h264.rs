@@ -2982,27 +2982,18 @@ fn classify_json_scalar(s: &str) -> JsonScalar {
       return JsonScalar::U64(n);
     }
   }
-  // A finite fractional/exponent value that FAITHFULLY represents its token
-  // routes through the float writer as a bare JSON number. The gate admits an
-  // exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it ALSO
-  // accepts a token outside finite-f64 range on BOTH sides: `1e999` OVERFLOWS to
-  // `INFINITY`, and `1e-999` UNDERFLOWS a nonzero significand to a FINITE `0.0`.
-  // Neither may become `JsonScalar::F64(..)` — the caller lowers an overflow to
-  // `TagValue::F64(INFINITY)` (serializer emits the titlecase `"Inf"`), and a
-  // nonzero-underflow to `TagValue::F64(0.0)` (emits a bare `0`), both silently
+  // Emit a bare `JsonScalar::F64` ONLY when the f64 FAITHFULLY represents its
+  // token ([`crate::value::f64_token_is_faithful`], the shared
+  // f64-representation predicate). The gate admits an over-range exponent, so an
+  // overflow (`1e999` → `INFINITY`) or nonzero-underflow (`1e-999` → finite
+  // `0.0`) would otherwise be lowered to `TagValue::F64(INFINITY)` (serializer
+  // emits the titlecase `"Inf"`) or `TagValue::F64(0.0)` (a bare `0`), silently
   // corrupting the source token. Fall back to `Str` so the ORIGINAL token reaches
-  // `TagValue::Str`, where the consolidated `value.rs` number gate emits it as a
-  // sound quoted string (Contract B / #197). The predicate `is_finite() && !(f ==
-  // 0.0 && lexeme_is_nonzero)` is COMPLETE for the f64-representation class:
-  // overflow ⇒ !finite ⇒ `Str`; nonzero-underflow ⇒ `0.0`+nonzero-significand ⇒
-  // `Str`; else the finite f64 faithfully denotes the value ⇒ `F64` (a
-  // genuine-zero token stays a bare `0`; finite-nonzero precision loss is
-  // value-preserving under the comparator). Real H264 MDPM metadata never carries
-  // such a magnitude.
+  // `TagValue::Str`'s consolidated `value.rs` number gate as a sound quoted
+  // string (Contract B / #197). Real H264 MDPM metadata never carries such a
+  // magnitude.
   match s.parse::<f64>() {
-    Ok(f) if f.is_finite() && !(f == 0.0 && crate::value::lexeme_is_nonzero(s)) => {
-      JsonScalar::F64(f)
-    }
+    Ok(f) if crate::value::f64_token_is_faithful(f, s) => JsonScalar::F64(f),
     _ => JsonScalar::Str,
   }
 }
