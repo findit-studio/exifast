@@ -291,7 +291,24 @@ const NOT_ACTIVE: &[&str] = &[
 ///     (A1's `RawValue::Text.raw`), one rational64u ≈ 0.9697 → `-j` `1` / `-n`
 ///     `0.9696978699`).
 /// Additive — every PRE-EXISTING golden stays byte-identical.
-const EXPECTED_ACTIVE_FIXTURES: usize = 414;
+///
+/// 414 → 415: issue #179 adds one crafted PNG raw-profile fixture pinning the
+/// new ImageMagick `Raw profile type xmp` content decode (`PNG.pm:746` →
+/// `ProcessProfile` → `ProcessDirectory(XMP::Main)` = `ProcessXMP`, the packet
+/// routed through the ported XMP module):
+///   * `PNG_rawprofile_xmp.png` (1x1 RGB + a `tEXt` `Raw profile type xmp`
+///     carrying `XMP-x`/`XMP-dc`/`XMP-xmp`/`XMP-exif` tags; golden drops
+///     `Composite:*` — the PNG port has no Composite subsystem).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+///
+/// 415 → 416: a NONCANONICAL companion fixture pinning the faithful
+/// `pack('H*')` odd-nibble PAD (vs a truncating decode):
+///   * `PNG_rawprofile_xmp_oddnibble.png` (same XMP payload but the hex body has
+///     a dangling odd nibble; Perl `pack('H*')` pads it to a trailing `\xa0`
+///     byte after the XMP packet end, declared length set to match ⇒ same XMP
+///     tags, NO wrong-size warning — `PNG.pm:1169`).
+/// Additive — every PRE-EXISTING golden stays byte-identical.
+const EXPECTED_ACTIVE_FIXTURES: usize = 416;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -518,9 +518,13 @@ pub enum PngExifEvent {
   /// (`PNG.pm:719`/`:727`), `iptc` (`:735`), `8bim` (`:755`), `xmp` (`:746`) —
   /// AND the `exif`/`APP1` profiles whose decoded content is XMP
   /// (`PNG.pm:1236`) or unrecognized (`PNG.pm:1266`). exifast has no ported ICC
-  /// / IPTC / Photoshop / XMP module, so their tags are deferred (none emitted),
-  /// but the cross-source `$$et{PROCESSED}` reset is the load-bearing effect and
-  /// IS modeled. Carries no payload (no EXIF block to walk).
+  /// / IPTC / Photoshop module, so their tags are deferred (none emitted), but
+  /// the cross-source `$$et{PROCESSED}` reset is the load-bearing effect and IS
+  /// modeled. For the XMP kinds (`xmp` and the XMP-content `exif`/`APP1` arm)
+  /// the reset event is pushed ALONGSIDE the decoded packet in
+  /// [`PngMeta::xmp_profiles`] (#179) — the ported XMP module emits the `XMP-*`
+  /// tags while this event still performs the reset. Carries no payload (no EXIF
+  /// block to walk).
   ResetOnlyProfile,
 }
 
@@ -644,6 +648,22 @@ pub struct PngMeta<'a> {
   /// offset jointly decide which directories contribute and which warn (verified
   /// against `perl exiftool -j -G1`). Empty when the PNG carries no EXIF event.
   exif_events: Vec<PngExifEvent>,
+  // ----- XMP raw profiles (PNG.pm:746 / :1216-1248) ----------------------
+  /// The hex-decoded XMP packets captured from `Raw profile type xmp` chunks
+  /// (`PNG.pm:746` → `ProcessProfile` → `ProcessDirectory(XMP::Main)`) and from
+  /// the XMP-content arm of `Raw profile type {exif,APP1}` (`PNG.pm:1236`, after
+  /// the `$xmpAPP1hdr` strip), in WALK (chunk) ORDER. Each entry is the raw XMP
+  /// packet bytes bundled feeds to `ProcessXMP`; they are decoded into
+  /// `XMP-*:*` tags by [`crate::formats::png::ProcessPng`]'s `tags()` /
+  /// `project()` / warning-drain via [`crate::formats::xmp::parse_borrowed`]
+  /// when the `xmp` feature is built. The `ResetOnlyProfile` event the same
+  /// chunk pushes models the `$$et{PROCESSED}` reset (`PNG.pm:1193`); this field
+  /// carries the decodable CONTENT. Gated on the `xmp` feature because the PNG
+  /// port does not depend on the XMP module (`png = ["exif", …]`) — without it
+  /// the packet is still captured by the chunk walk but no XMP tags are emitted
+  /// (faithful to "no ported XMP module").
+  #[cfg(feature = "xmp")]
+  xmp_profiles: Vec<Vec<u8>>,
   // ----- trailer (post-IEND) bookkeeping (PNG.pm:1479-1484) --------------
   /// `true` once the chunk walker has crossed the `IEND` end chunk with
   /// unconsumed trailer bytes remaining and re-entered the chunk loop in
@@ -664,6 +684,10 @@ pub struct PngMeta<'a> {
   /// Index into [`Self::exif_events`] at which the TRAILER EXIF events begin.
   /// `usize::MAX` until the trailer is entered.
   trailer_event_start: usize,
+  /// Index into [`Self::xmp_profiles`] at which the TRAILER XMP profiles begin.
+  /// `usize::MAX` until the trailer is entered.
+  #[cfg(feature = "xmp")]
+  trailer_xmp_start: usize,
   /// Set when a structural single-value chunk (`IHDR` / `pHYs` / `bKGD` /
   /// `tIME` / `iCCP-name`) was last written from a TRAILER chunk — so its
   /// emitted PNG-level tags carry the `Trailer` family-1 override. (A trailing
@@ -730,10 +754,14 @@ impl PngMeta<'_> {
       text_records: Vec::new(),
       dynamic_profile_tags: Vec::new(),
       exif_events: Vec::new(),
+      #[cfg(feature = "xmp")]
+      xmp_profiles: Vec::new(),
       in_trailer: false,
       trailer_text_start: usize::MAX,
       trailer_dynamic_start: usize::MAX,
       trailer_event_start: usize::MAX,
+      #[cfg(feature = "xmp")]
+      trailer_xmp_start: usize::MAX,
       structural_trailing: StructuralTrailing {
         ihdr: false,
         phys: false,
@@ -918,6 +946,22 @@ impl PngMeta<'_> {
     &self.exif_events
   }
 
+  // ===== XMP raw profiles ==============================================
+
+  /// The hex-decoded XMP packets captured from `Raw profile type xmp` chunks
+  /// (and the XMP-content arm of `Raw profile type {exif,APP1}`) in WALK
+  /// ORDER. Each is the raw XMP packet bundled feeds to `ProcessXMP`
+  /// (`PNG.pm:746`/`:1236`); decode via
+  /// [`crate::formats::xmp::parse_borrowed`]. Empty when the PNG carries no XMP
+  /// raw profile. Present only when the `xmp` feature is built (the PNG port
+  /// does not otherwise depend on the XMP module).
+  #[cfg(feature = "xmp")]
+  #[inline(always)]
+  #[must_use]
+  pub fn xmp_profiles(&self) -> &[Vec<u8>] {
+    &self.xmp_profiles
+  }
+
   // ===== warnings =======================================================
 
   /// Warnings raised during the chunk walk.
@@ -978,6 +1022,14 @@ impl PngMeta<'_> {
     self.exif_events.push(event);
   }
 
+  /// Append a hex-decoded XMP packet captured from a `Raw profile type xmp`
+  /// chunk (or the XMP-content arm of `Raw profile type {exif,APP1}`), in WALK
+  /// ORDER (`PNG.pm:746`/`:1236`). Decoded into `XMP-*` tags at emission time.
+  #[cfg(feature = "xmp")]
+  pub(crate) fn push_xmp_profile(&mut self, packet: Vec<u8>) {
+    self.xmp_profiles.push(packet);
+  }
+
   /// Append a text record.
   pub(crate) fn push_text_record(&mut self, record: PngTextRecord) {
     self.text_records.push(record);
@@ -1010,6 +1062,10 @@ impl PngMeta<'_> {
       self.trailer_text_start = self.text_records.len();
       self.trailer_dynamic_start = self.dynamic_profile_tags.len();
       self.trailer_event_start = self.exif_events.len();
+      #[cfg(feature = "xmp")]
+      {
+        self.trailer_xmp_start = self.xmp_profiles.len();
+      }
     }
   }
 
@@ -1035,6 +1091,16 @@ impl PngMeta<'_> {
   #[must_use]
   pub(crate) const fn event_is_trailing(&self, i: usize) -> bool {
     i >= self.trailer_event_start
+  }
+
+  /// Whether the XMP raw profile at index `i` came from a post-`IEND` TRAILER
+  /// chunk (so its decoded `XMP-*` tags carry the `Trailer` family-1 override,
+  /// `PNG.pm:1484`).
+  #[cfg(feature = "xmp")]
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn xmp_is_trailing(&self, i: usize) -> bool {
+    i >= self.trailer_xmp_start
   }
 
   /// Whether the `IHDR` sub-table tags came from a TRAILER chunk.
