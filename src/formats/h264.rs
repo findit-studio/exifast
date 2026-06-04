@@ -2982,9 +2982,19 @@ fn classify_json_scalar(s: &str) -> JsonScalar {
       return JsonScalar::U64(n);
     }
   }
+  // A finite fractional/exponent value routes through the float writer as a bare
+  // JSON number. The gate admits an exponent up to `e[-+]?\d{1,3}` (faithful to
+  // `exiftool:3810`), so it ALSO accepts a token outside finite-f64 range such as
+  // `1e999` (parses to `INFINITY`). A non-finite parse must NOT become
+  // `JsonScalar::F64(INFINITY)` — the caller would lower that to
+  // `TagValue::F64(INFINITY)`, whose serializer emits the titlecase `"Inf"`
+  // string, silently corrupting the source token. Fall back to `Str` so the
+  // ORIGINAL token reaches `TagValue::Str`, where the consolidated `value.rs`
+  // number gate emits it as a sound quoted string (Contract B / #197). Real
+  // H264 MDPM metadata never carries such a magnitude.
   match s.parse::<f64>() {
-    Ok(f) => JsonScalar::F64(f),
-    Err(_) => JsonScalar::Str,
+    Ok(f) if f.is_finite() => JsonScalar::F64(f),
+    _ => JsonScalar::Str,
   }
 }
 
@@ -3971,6 +3981,73 @@ mod tests {
       classify_json_scalar("04:03:02:01"),
       JsonScalar::Str
     ));
+  }
+
+  /// Contract B / #197 over-f64-gate class (same defect class as
+  /// `value.rs::str_over_f64_range_emits_quoted_token_not_null`, different
+  /// consumer). `escape_json_is_number` admits an exponent up to
+  /// `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so a crafted MDPM scalar
+  /// such as `1e999` matches the gate yet is OUTSIDE finite-f64 range
+  /// (`parse::<f64>()` ⇒ `INFINITY`). The classifier must NOT return
+  /// `JsonScalar::F64(INFINITY)` — the lowering would build
+  /// `TagValue::F64(INFINITY)`, whose serializer emits the titlecase `"Inf"`
+  /// string (silently corrupting the source token). It must return
+  /// `JsonScalar::Str` so the ORIGINAL token reaches `TagValue::Str`, where the
+  /// consolidated `value.rs` gate emits it as a SOUND quoted string (never
+  /// `Inf`/`null`, never a panic). Real H264 MDPM metadata never carries such a
+  /// magnitude; the priority is consistency + no silent corruption.
+  #[test]
+  fn classify_json_scalar_over_f64_range_stays_string() {
+    for tok in ["1e999", "-1e999", "1e309"] {
+      assert!(
+        matches!(classify_json_scalar(tok), JsonScalar::Str),
+        "{tok:?} (over-f64 exponent) must classify as Str, not F64(INFINITY)"
+      );
+    }
+    // A finite exponent value still routes to the float writer (no regression).
+    assert!(matches!(classify_json_scalar("1e10"), JsonScalar::F64(_)));
+    assert!(matches!(classify_json_scalar("-1e10"), JsonScalar::F64(_)));
+  }
+
+  /// End-to-end (`-n` AND `-j`) for the over-f64 MDPM token: lowering the
+  /// classifier's arm to a [`TagValue`] then serializing must preserve the
+  /// EXACT source token as a quoted JSON string — never `Inf`, never `null`,
+  /// never a panic — on both the post-ValueConv (`-n`) and PrintConv (`-j`)
+  /// paths. Mirrors the production `H264Value::Text` lowering at
+  /// `impl Taggable::tags` (`classify_json_scalar` → `TagValue`).
+  #[cfg(feature = "serde")]
+  #[test]
+  fn over_f64_range_mdpm_token_serializes_quoted_both_modes() {
+    use crate::value::TagValue;
+    // `-n` (ValueConv scalar): the production lowering routes the numeric text
+    // through `classify_json_scalar` → `TagValue`. Replicate that one block.
+    let lower_n = |numeric: &str| -> TagValue {
+      match classify_json_scalar(numeric) {
+        JsonScalar::U64(v) => TagValue::U64(v),
+        JsonScalar::I64(v) => TagValue::I64(v),
+        JsonScalar::F64(v) => TagValue::F64(v),
+        JsonScalar::Str => TagValue::Str(numeric.into()),
+      }
+    };
+    for tok in ["1e999", "-1e999", "1e309"] {
+      // `-n`: the raw token is preserved as a quoted string (the gate fix).
+      let json_n = serde_json::to_string(&lower_n(tok)).unwrap();
+      assert_eq!(
+        json_n,
+        std::format!("{tok:?}"),
+        "`-n` over-f64 token must stay a quoted string, got {json_n}"
+      );
+      assert!(json_n != "null" && !json_n.contains("Inf"));
+      // `-j` (PrintConv): the production lowering emits the PrintConv string as
+      // `TagValue::Str`; the same `value.rs` gate keeps an over-f64 token a
+      // sound quoted string.
+      let json_j = serde_json::to_string(&TagValue::Str(tok.into())).unwrap();
+      assert_eq!(json_j, std::format!("{tok:?}"));
+      assert!(json_j != "null" && !json_j.contains("Inf"));
+      // Valid JSON on every path (round-trips, never `null`).
+      let v: serde_json::Value = serde_json::from_str(&json_n).unwrap();
+      assert!(v.is_string());
+    }
   }
 
   // === Codex R12 F1 — short MDPM TimeCode / DateTimeOriginal ===

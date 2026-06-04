@@ -4059,10 +4059,23 @@ fn emit_gated_number<S: ExifSink>(
       return out.write_u64(group, name, n);
     }
   }
+  // A FINITE in-gate fractional/exponent value emits a value-equal bare number
+  // via `write_f64`. The gate admits an exponent up to `e[-+]?\d{1,3}` (faithful
+  // to `exiftool:3810`), so it also accepts a token OUTSIDE finite-f64 range
+  // such as `1e999` (parses to `INFINITY`); `write_f64(INFINITY)` would reach
+  // `TagValue::F64`'s serializer and emit the titlecase `"Inf"` string, silently
+  // corrupting the verbatim source token (ExifTool's `EscapeJSON` `return $str`s
+  // the in-gate token unchanged). Emit the ORIGINAL `rendered` text as a quoted
+  // JSON string instead — sound on every path, never `null`, never `Inf`
+  // (mirrors `value.rs::serialize_in_gate_number_str`, Contract B / #197). Every
+  // current EXIF caller feeds a bounded format or a pre-finite `format_g`
+  // render, so the non-finite arm is unreachable today; the guard keeps the gate
+  // class closed against a future caller passing such a token.
   match rendered.parse::<f64>() {
-    Ok(f) => out.write_f64(group, name, f),
-    // Unreachable for an in-gate string; fall back to a faithful quoted string.
-    Err(_) => out.write_str(group, name, rendered),
+    Ok(f) if f.is_finite() => out.write_f64(group, name, f),
+    // Non-finite (over-f64-range exponent) or an unreachable non-parse: fall
+    // back to the faithful quoted source string.
+    _ => out.write_str(group, name, rendered),
   }
 }
 
@@ -5163,6 +5176,24 @@ mod tests {
     // The zero-denominator rational word stays a `Str`.
     emit_gated_number("E", "Inf", "inf", &mut map).unwrap();
     assert_eq!(map.get("E", "Inf"), Some(&TagValue::Str("inf".into())));
+    // Contract B / #197 over-f64-gate class (same defect class as the H264
+    // classifier + `value.rs::serialize_in_gate_number_str`): a gate-matching
+    // exponent OUTSIDE finite-f64 range (`1e999`, `parse::<f64>()` ⇒ `INFINITY`)
+    // must NOT route through `write_f64` to `TagValue::F64(INFINITY)` (which
+    // serializes the titlecase `"Inf"`, silently corrupting the verbatim
+    // token); it stays the quoted source `Str`. No real EXIF caller feeds such
+    // a token, but the guard keeps the gate class closed.
+    for tok in ["1e999", "-1e999", "1e309"] {
+      emit_gated_number("E", "Over", tok, &mut map).unwrap();
+      assert_eq!(
+        map.get("E", "Over"),
+        Some(&TagValue::Str(tok.into())),
+        "{tok:?} (over-f64 exponent) must stay a quoted string, not F64(INFINITY)"
+      );
+    }
+    // A FINITE exponent value still routes to the float writer (no regression).
+    emit_gated_number("E", "Exp", "1e10", &mut map).unwrap();
+    assert_eq!(map.get("E", "Exp"), Some(&TagValue::F64(1e10)));
   }
 
   /// `emit_gated_f64` renders a finite value with `%.15g` then gates it: an
