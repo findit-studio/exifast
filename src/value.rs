@@ -813,6 +813,48 @@ impl Metadata {
 const _: () = {
   use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
+  /// Emit an in-gate fractional/exponent numeric STRING (`escape_json_is_number`
+  /// already verified its grammar) as a BARE JSON number.
+  ///
+  /// **Common path (the value parses to a FINITE f64).** Emit via the
+  /// allocation-free `serialize_f64`. serde renders a value-equal bare number
+  /// (`"13.59"` → `13.59`), which the token-exact (strict) comparator accepts
+  /// under its within-one-type numeric insensitivity (`1.50` ≈ `1.5`,
+  /// `1.4e2` ≈ `140.0`). This keeps every existing golden byte-output unchanged
+  /// AND adds NO allocation on the hot path (the alloc-budget regression guard).
+  ///
+  /// **Soundness path (the value parses to a NON-FINITE f64).** The gate admits
+  /// an exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it
+  /// accepts a token OUTSIDE finite-f64 range such as `1e999` (parses to
+  /// `INFINITY`). `serialize_f64(INFINITY)` would emit `null` (silent
+  /// corruption). Emit the ORIGINAL token as a QUOTED JSON STRING instead.
+  ///
+  /// NOTE — this is a deliberate CRAFTED-input divergence from ExifTool's
+  /// `EscapeJSON`, which `return $str`s an over-range exponent BARE. Emitting a
+  /// bare number here (e.g. via `serde_json::value::RawValue`) is NOT sound on
+  /// every serde path: the same `Serialize` impl is driven by
+  /// `serde_json::to_value` (`Rendered` / the typed-serde+parity harness), and
+  /// with this crate's serde_json features (`raw_value`+`alloc`, NO
+  /// `arbitrary_precision`) materializing a `RawValue("1e999")` into a
+  /// `serde_json::Value` REPARSES the token → `NumberOutOfRange` → `to_value`
+  /// returns `Err`/panics. A quoted string is sound on EVERY path
+  /// (`to_string` AND `to_value`), never panics, never emits `null`. Per the
+  /// project ship-bar, `1e999` never appears in real metadata, so byte-for-byte
+  /// crafted-faithfulness is optional here while soundness is required. (We do
+  /// NOT enable `arbitrary_precision` — a broad dependency-feature change that
+  /// could perturb the comparator.)
+  fn serialize_in_gate_number_str<S: Serializer>(text: &str, s: S) -> Result<S::Ok, S::Error> {
+    if let Ok(f) = text.parse::<f64>()
+      && f.is_finite()
+    {
+      return s.serialize_f64(f);
+    }
+    // Non-finite (over-f64-range exponent, e.g. `1e999`) — emit the source
+    // token as a QUOTED string. Sound on every serde path (never `null`, never
+    // a `to_value` `NumberOutOfRange` error/panic).
+    s.serialize_str(text)
+  }
+
   impl Serialize for Rational {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
       if self.denominator == 0 {
@@ -937,11 +979,15 @@ const _: () = {
               return s.serialize_u64(n);
             }
           }
-          match text.parse::<f64>() {
-            Ok(f) => s.serialize_f64(f),
-            // Unreachable for an in-gate string; keep a faithful quoted string.
-            Err(_) => s.serialize_str(text),
-          }
+          // Fractional / exponent in-gate string (Contract B / #197). A FINITE
+          // value emits a value-equal bare number via the allocation-free
+          // `serialize_f64` (unchanged golden bytes); a value OUTSIDE finite-f64
+          // range that the gate still admits (`e[-+]?\d{1,3}`, e.g. `1e999`)
+          // emits the ORIGINAL token as a QUOTED string — sound on every serde
+          // path (`to_string` AND `to_value`) instead of the `null` that
+          // `serialize_f64(INFINITY)` would corrupt it to, or the `to_value`
+          // `NumberOutOfRange` a bare raw token would trigger. See the helper.
+          serialize_in_gate_number_str(text, s)
         }
         // Otherwise STANDARD string emission: a non-numeric value (a PrintConv
         // label, a `:`/`/`/space-bearing value, `inf`/`undef`/`Inf`/`NaN`)
@@ -1233,6 +1279,94 @@ mod tests {
     // The `true`/`false` boolean coercion still precedes the number gate.
     assert_eq!(j(&TagValue::Str("True".into())), "true");
     assert_eq!(j(&TagValue::Str("false".into())), "false");
+  }
+
+  /// FINDING 2 (Codex) — `escape_json_is_number` admits an exponent of up to
+  /// `e[-+]?\d{1,3}` (faithful to ExifTool `exiftool:3810`), so it accepts
+  /// `1e999`, which is OUTSIDE finite-f64 range. Routing such a string through
+  /// `f64` (the old path) produced `INFINITY` → `serialize_f64` → `null` (silent
+  /// corruption). The fix: a FINITE in-gate value keeps the hot,
+  /// allocation-free `serialize_f64` path (a value-equal bare number the strict
+  /// comparator accepts, no golden/budget change); a NON-FINITE one (the rare
+  /// over-range crafted case) emits the ORIGINAL token as a QUOTED string —
+  /// SOUND on every serde path (a bare raw token would `NumberOutOfRange` under
+  /// `serde_json::to_value`; see `str_over_f64_range_exponent_to_value_is_ok_…`).
+  /// This must (a) NOT panic, (b) emit VALID JSON, and (c) NEVER emit `null`.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn str_over_f64_range_exponent_emits_quoted_token_not_null() {
+    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // SOUNDNESS — out-of-f64-range exponents must NOT become `null`. They are
+    // emitted as a QUOTED string carrying the EXACT source token (sound on
+    // every serde path).
+    assert_eq!(j(&TagValue::Str("1e999".into())), r#""1e999""#);
+    assert_eq!(j(&TagValue::Str("-1e999".into())), r#""-1e999""#);
+    assert_eq!(j(&TagValue::Str("1e309".into())), r#""1e309""#); // just above f64 max
+    // The emitted text is syntactically VALID JSON (a string), it round-trips
+    // as a `RawValue`, and it is never the `null` the old
+    // `serialize_f64(INFINITY)` produced.
+    for tok in ["1e999", "-1e999", "1e309"] {
+      let out = j(&TagValue::Str(tok.into()));
+      assert_ne!(out, "null", "over-range token must not corrupt to null");
+      let rv: Result<Box<serde_json::value::RawValue>, _> = serde_json::from_str(&out);
+      assert!(
+        rv.is_ok(),
+        "emitted token {out:?} must re-parse as a RawValue"
+      );
+      // The string's decoded payload is the exact original token.
+      assert_eq!(
+        serde_json::from_str::<String>(&out).unwrap(),
+        tok,
+        "over-range token must round-trip byte-identically as the string payload"
+      );
+    }
+    // In-RANGE fractional/exponent strings keep the value-equal bare number from
+    // the allocation-free f64 path (serde's canonical rendering). The strict
+    // comparator's within-type numeric insensitivity treats these as equal to
+    // any same-valued golden token (`3.4e38` == `3.4e+38`, `1e3` == `1000.0`).
+    assert_eq!(j(&TagValue::Str("3.4e38".into())), "3.4e+38");
+    assert_eq!(j(&TagValue::Str("1e3".into())), "1000.0");
+    assert_eq!(j(&TagValue::Str("13.59".into())), "13.59");
+    // A pure in-gate integer still routes through the exact integer writer.
+    assert_eq!(j(&TagValue::Str("2005".into())), "2005");
+  }
+
+  /// FINDING 1 (Codex, R-B follow-up) — the over-f64-range raw-token path must be
+  /// SOUND on EVERY serde path, not just `serde_json::to_string`. The `Serialize`
+  /// impl is also driven by `serde_json::to_value` (used by `Rendered` and the
+  /// typed-serde / parity harness). With THIS crate's serde_json features
+  /// (`raw_value`+`alloc`, NO `arbitrary_precision`), serializing a
+  /// `RawValue("1e999")` INTO a `serde_json::Value` REPARSES the token and
+  /// `1e999` → `NumberOutOfRange` → `to_value` returns `Err` (or panics at an
+  /// `expect` site). The fix emits a QUOTED STRING for the non-finite over-range
+  /// case (sound on `to_string` AND `to_value`; never `Err`, never panic, never
+  /// `null`). This test exercises `to_value` specifically and asserts `Ok(String)`.
+  #[cfg(feature = "json")]
+  #[test]
+  fn str_over_f64_range_exponent_to_value_is_ok_string_not_err() {
+    for tok in ["1e999", "-1e999", "1e309"] {
+      // `to_value` must NOT error/panic for an over-range numeric token.
+      let v = serde_json::to_value(TagValue::Str(tok.into()))
+        .expect("to_value must not error on an over-f64-range numeric string");
+      // The sound fallback is a JSON STRING carrying the original token (never a
+      // number, never null) — value-faithful and round-trippable on every path.
+      assert_eq!(
+        v,
+        serde_json::Value::String(tok.to_string()),
+        "over-range token must serialize to a quoted JSON string under to_value"
+      );
+      assert!(!v.is_null(), "over-range token must never become null");
+    }
+    // The FINITE in-gate fractional/exponent path is unchanged: a value-equal
+    // BARE number on `to_value` too (no quoting, no allocation regression).
+    assert_eq!(
+      serde_json::to_value(TagValue::Str("1e3".into())).unwrap(),
+      serde_json::json!(1000.0)
+    );
+    assert_eq!(
+      serde_json::to_value(TagValue::Str("13.59".into())).unwrap(),
+      serde_json::json!(13.59)
+    );
   }
 
   /// Contract B / #197 — the integer and float serializers run the SAME
