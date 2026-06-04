@@ -27,13 +27,15 @@
 //!   probe (`ExifTool.pm:8715` sets `TIFF_TYPE` from the detected file
 //!   type). [`dispatch`] takes it as the `tiff_type` input and the
 //!   `MakerNoteSamsung2` arm consumes it (`MakerNotes.pm:969`). The
-//!   current Exif-block hook does not yet have the container's file type
-//!   plumbed through the IFD walker, so it passes `None`; the Samsung2 SRW
-//!   clause then degrades to its EXIF-format-magic clause (`MakerNotes.pm:
-//!   970`), which is faithful for every Samsung body whose blob carries
-//!   the magic. The SRW-WITHOUT-magic case (a Samsung `.srw` raw whose
-//!   MakerNote blob lacks the magic) is the only residual Phase-1 gap, and
-//!   it closes the moment a caller threads `tiff_type = Some("SRW")`.
+//!   standalone-TIFF IFD walker (`crate::exif`'s MakerNote dispatch hook)
+//!   threads the container's detected file type here (#172), so a Samsung
+//!   `.srw` raw whose MakerNote blob LACKS the EXIF-format magic still
+//!   dispatches to `MakerNoteSamsung2` via this SRW clause. The
+//!   embedded-block callers (`parse_exif_block`, e.g. a JPEG `APP1` /
+//!   QuickTime EXIF Samsung body) pass `None` — for those, `$$self{TIFF_TYPE}`
+//!   is the OUTER container type (`APP1`/`QuickTime`/…), never `"SRW"`, so the
+//!   Samsung2 SRW clause is correctly inert and the body relies on its
+//!   EXIF-format-magic clause (`MakerNotes.pm:970`).
 //!
 //! ## Subdir parsing — `SubDirectory` directives
 //!
@@ -85,11 +87,14 @@ use crate::exif::ifd::ByteOrder;
 ///   `$$self{TIFF_TYPE} = $fileType`) — the detected file type of the
 ///   enclosing TIFF stream (`"SRW"`, `"NEF"`, `"TIFF"`, `"APP1"`, …). The
 ///   ONLY arm that reads it is `MakerNoteSamsung2` (`MakerNotes.pm:969`
-///   `$$self{TIFF_TYPE} eq 'SRW'`). Pass `None` when the file type is not
-///   known to the caller (the current Exif-block hook does not yet thread
-///   `TIFF_TYPE`; see [`crate::exif`]'s MakerNote dispatch) — the Samsung2
-///   SRW clause then degrades to its signature clause, which is faithful
-///   for every Samsung body that carries the EXIF-format magic.
+///   `$$self{TIFF_TYPE} eq 'SRW'`). The standalone-TIFF IFD walker threads
+///   the finalized container file type here (#172 — for an SRW candidate that
+///   is exactly `"SRW"`, since SRW's base module is `TIFF`); the embedded-block
+///   callers pass `None` when the file type is not known to the caller (a
+///   JPEG/PNG/QuickTime-embedded Samsung body — see [`crate::exif`]'s MakerNote
+///   dispatch). With `None`, the Samsung2 SRW clause degrades to its signature
+///   clause, which is faithful for every Samsung body that carries the
+///   EXIF-format magic.
 ///
 /// Returns a [`DetectedMakerNote`]. The dispatcher is TOTAL —
 /// [`Vendor::Unknown`] is the catch-all for blobs no signature/make

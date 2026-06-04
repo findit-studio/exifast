@@ -3146,3 +3146,129 @@ fn canon_crw_full_real_fixture_matches_oracle() {
     Some("125 124 125 124")
   );
 }
+
+// ===========================================================================
+// #172 — TIFF_TYPE threading: a Samsung `.srw` raw whose MakerNote LACKS the
+// EXIF-format magic dispatches to `MakerNoteSamsung2` via `$$self{TIFF_TYPE}
+// eq 'SRW'` (`MakerNotes.pm:966-969`), now that the standalone-TIFF IFD walker
+// threads the container's detected file type into [`makernotes::dispatch`].
+// ===========================================================================
+
+/// The bundled-faithful end-to-end proof for #172: `parse_any` on the crafted
+/// `tests/fixtures/MakerNotesSamsung2.srw` — driven with the candidate
+/// `Parent`/`ext` the engine derives for a `.srw` file — threads
+/// `$$self{TIFF_TYPE} = "SRW"` (`ExifTool.pm:8715`) into the MakerNote
+/// dispatch, so the magic-LESS Samsung body resolves to [`Vendor::Samsung`]
+/// via the SRW clause alone (NOT the EXIF-format-magic clause).
+///
+/// ORACLE (bundled exiftool 13.59 on this exact fixture):
+/// ```text
+/// $ exiftool -j MakerNotesSamsung2.srw
+///   "FileType": "SRW", "MIMEType": "image/x-samsung-srw",
+///   "Make": "SAMSUNG", "Warning": "[minor] Unrecognized MakerNotes"
+/// $ exiftool -v3 …  →  `MakerNoteSamsung2 (SubDirectory) -->`
+/// ```
+/// i.e. bundled classifies the file as `SRW` and routes the 0x927C blob to
+/// `MakerNoteSamsung2`. The fixture's MakerNote body is a deliberately EMPTY
+/// IFD (count 0, `0xFF` padding) — it carries NEITHER the EXIF-format magic
+/// (`MakerNotes.pm:970`, bytes 10..14 `"0100"`) NOR any decodable Samsung tag,
+/// so the dispatch can ONLY be reached through the threaded SRW `tiff_type`.
+/// (The full `Samsung::Type2` tag table — `MakerNoteVersion`/`DeviceType`/
+/// `SamsungModelID`/… — is UNPORTED, so exifast captures the blob + identifies
+/// the vendor but emits no `Samsung:*` leaves; that table is a separate
+/// follow-up. This test pins the PLUMBING, which is the #172 deliverable.)
+#[test]
+fn samsung_srw_makernote_dispatches_via_tiff_type() {
+  use exifast::format_parser::{AnyMeta, SharedFlags, any_parser_for};
+
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotesSamsung2.srw"
+  ))
+  .expect("read MakerNotesSamsung2.srw fixture");
+
+  // The engine maps a `.srw` candidate to the TIFF parser with
+  // `file_type() == "TIFF"` and `parent_type() == "SRW"` (the uppercased
+  // extension; `ExifTool.pm:3038` `$dirInfo{Parent} = $tiffType`). Drive
+  // `parse_any` with exactly those — the SAME inputs `extract_info` passes for
+  // a `.srw` file — so `DoProcessTIFF` finalizes `$$self{FILE_TYPE}`/
+  // `TIFF_TYPE` to `"SRW"` (SRW's base module is `TIFF`, `ExifTool.pm:536`).
+  let parser = any_parser_for("TIFF").expect("TIFF parser (exif feature)");
+  let mut shared = SharedFlags::new();
+  let meta = parser
+    .parse_any(&data, &mut shared, Some("srw"), 0, Some("SRW"))
+    .expect("crafted SRW TIFF is recognized");
+
+  let AnyMeta::Exif(exif) = &meta else {
+    panic!("a TIFF parses to AnyMeta::Exif");
+  };
+
+  // The threaded `$$self{FILE_TYPE}`/`TIFF_TYPE` reached the walker as "SRW".
+  assert_eq!(
+    exif.file_type(),
+    Some("SRW"),
+    "the finalized container file type threads through as SRW"
+  );
+
+  // The Make (0x010f) was captured for the dispatcher's `uc Make eq 'SAMSUNG'`.
+  let make = exif.entry("Make").and_then(|e| match e.value_ref().raw() {
+    exifast::exif::ifd::RawValue::Text { text, .. } => Some(text.as_str()),
+    _ => None,
+  });
+  assert_eq!(make, Some("SAMSUNG"), "IFD0 Make captured for the dispatch");
+
+  // THE LOAD-BEARING ASSERTION (#172): the 0x927C blob — which has NO Samsung2
+  // EXIF-format magic — dispatched to `Vendor::Samsung` PURELY via the threaded
+  // `tiff_type == Some("SRW")` (`MakerNotes.pm:969`). Before the plumbing this
+  // fell through to `Vendor::Unknown`.
+  let mn = exif.maker_note().expect("0x927C MakerNote captured");
+  assert!(
+    mn.vendor().is_samsung(),
+    "magic-less Samsung SRW body must dispatch to Vendor::Samsung via the \
+     threaded TIFF_TYPE, got {:?}",
+    mn.vendor()
+  );
+  // `MakerNoteSamsung2` sets `FixBase => 1` (`MakerNotes.pm:977`).
+  assert!(mn.detected().fix_base(), "Samsung2 carries FixBase => 1");
+}
+
+/// CONTROL for #172: the SAME magic-less Samsung body, parsed via the
+/// embedded-block entry [`exifast::parse_exif_block`] (a JPEG `APP1` /
+/// QuickTime EXIF / PNG `eXIf` Samsung body, where `$$self{TIFF_TYPE}` is the
+/// OUTER container type, never `"SRW"`), threads `tiff_type = None` into the
+/// dispatch and so FALLS THROUGH past Samsung2 (its SRW clause is inert and the
+/// blob has no magic). This proves the threaded `Some("SRW")` from the
+/// standalone-TIFF path is what enables the Samsung2 dispatch — the body does
+/// NOT match Samsung2 on its own bytes, so the change is purely additive and
+/// the embedded-block behavior is unchanged.
+#[test]
+fn samsung_srw_body_without_tiff_type_does_not_reach_samsung2() {
+  let data = std::fs::read(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/MakerNotesSamsung2.srw"
+  ))
+  .expect("read MakerNotesSamsung2.srw fixture");
+
+  // The embedded-block entry passes `file_type = None` to the IFD walker, so
+  // the MakerNote dispatch receives `tiff_type = None` — exactly the path a
+  // JPEG/PNG/QuickTime-embedded Samsung body takes (its `$$self{TIFF_TYPE}` is
+  // the container type, not "SRW").
+  let exif = exifast::parse_exif_block(&data).expect("the TIFF block is valid");
+  assert_eq!(
+    exif.file_type(),
+    None,
+    "the embedded-block entry threads no container file type"
+  );
+
+  let mn = exif.maker_note().expect("0x927C MakerNote captured");
+  // The magic-less SAMSUNG body matches NO signature and (without the SRW
+  // tiff_type) no make-only Samsung arm, so it lands on the Unknown catch-all
+  // (`MakerNoteUnknown`, `MakerNotes.pm:1117-1126`). The point is only that it
+  // is NOT Samsung here — reaching Samsung2 requires the threaded TIFF_TYPE.
+  assert!(
+    !mn.vendor().is_samsung(),
+    "without the threaded SRW tiff_type the magic-less body must NOT reach \
+     Samsung2, got {:?}",
+    mn.vendor()
+  );
+}
