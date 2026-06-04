@@ -728,7 +728,11 @@ impl AnyMeta<'_> {
   /// [`drain_diagnostics`](Self::drain_diagnostics).
   ///
   /// `print_conv = true` emits PrintConv strings (`-j`); `false` emits
-  /// post-ValueConv raw scalars (`-n`). Infallible.
+  /// post-ValueConv raw scalars (`-n`). `extract_embedded` mirrors ExifTool
+  /// `-ee` (default `false` ⇒ byte-identical to the prior hard-coded baseline);
+  /// it is threaded into [`EmitOptions`](crate::emit::EmitOptions) and consumed
+  /// by the timed-metadata emitters at render time (parsing is always-extract).
+  /// Infallible.
   ///
   /// The tag write is driven by the canonical engine
   /// [`run_emission`](crate::emit::run_emission) over this `AnyMeta`'s
@@ -744,11 +748,13 @@ impl AnyMeta<'_> {
   pub(crate) fn serialize_tags(
     &self,
     print_conv: bool,
+    extract_embedded: bool,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    // -ee defaults off; the ParseOptions task threads the real flag.
-    let opts =
-      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+    let opts = crate::emit::EmitOptions::g1(
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      extract_embedded,
+    );
     crate::emit::run_emission(self, opts, out);
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
@@ -1451,6 +1457,11 @@ impl AnyMeta<'_> {
 pub struct Rendered<'a, 'm> {
   meta: &'a AnyMeta<'m>,
   print_conv: bool,
+  /// ExifTool `-ee` (extract embedded): gates per-sample timed-metadata
+  /// emission. `Rendered::new` defaults it `false` (the faithful
+  /// `perl exiftool -j -G1` baseline); set via [`Rendered::new_with_options`].
+  /// Threaded into `serialize_tags` → `EmitOptions`; parsing is always-extract.
+  extract_embedded: bool,
   /// The group-key form the serializer renders: `-G1` (collapse the family-3
   /// `doc` axis — the conformance golden form) vs `-G3` (`Doc<N>:` prefix).
   /// `Rendered::new` defaults to `G1`, matching the engine's `extract_info`.
@@ -1462,12 +1473,31 @@ pub struct Rendered<'a, 'm> {
 impl<'a, 'm> Rendered<'a, 'm> {
   /// Wrap `meta` for serialization in the given mode (`print_conv = true` ⇒
   /// `-j` PrintConv strings; `false` ⇒ `-n` raw post-ValueConv scalars).
+  /// `extract_embedded` defaults `false` (the faithful baseline); use
+  /// [`new_with_options`](Self::new_with_options) to set ExifTool `-ee`.
   #[must_use]
   #[inline(always)]
   pub const fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
+    Self::new_with_options(meta, print_conv, false)
+  }
+
+  /// Wrap `meta` like [`new`](Self::new) but also set ExifTool `-ee`
+  /// (`extract_embedded`): `true` ⇒ emit the per-sample timed-metadata tags;
+  /// `false` ⇒ the faithful baseline (no per-sample tags, the
+  /// `[minor] ExtractEmbedded` warning instead). The flag is threaded into
+  /// `serialize_tags` → `EmitOptions` and consumed at render time — the typed
+  /// per-sample data is parsed unconditionally either way.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new_with_options(
+    meta: &'a AnyMeta<'m>,
+    print_conv: bool,
+    extract_embedded: bool,
+  ) -> Self {
     Self {
       meta,
       print_conv,
+      extract_embedded,
       group_mode: crate::serialize_key::GroupMode::G1,
     }
   }
@@ -1484,6 +1514,14 @@ impl<'a, 'm> Rendered<'a, 'm> {
   #[inline(always)]
   pub const fn print_conv(&self) -> bool {
     self.print_conv
+  }
+
+  /// Whether ExifTool `-ee` (extract embedded) per-sample emission is enabled
+  /// (default `false`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn extract_embedded(&self) -> bool {
+    self.extract_embedded
   }
 }
 
@@ -1505,7 +1543,9 @@ const _: () = {
       // typed-path tag emission). `Rendered` emits only the format tags, not
       // the orchestration triplet. `serialize_tags` is infallible.
       let mut tm = TagMap::new();
-      let _ = self.meta.serialize_tags(self.print_conv, &mut tm);
+      let _ = self
+        .meta
+        .serialize_tags(self.print_conv, self.extract_embedded, &mut tm);
       let entries = tm.entries();
       // The FIRST `$et->Warn` surfaces as `ExifTool:Warning`, faithful to
       // the full document serializer (`serialize.rs:134-138`). `Rendered`

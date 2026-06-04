@@ -2057,3 +2057,102 @@ fn atom_bytes(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
   v.extend_from_slice(body);
   v
 }
+
+// ===========================================================================
+// `ParseOptions { extract_embedded }` THREADING — the render-time `-ee` flag
+// reaches the typed Meta's `serialize_tags` → `EmitOptions`.
+//
+// The BEHAVIORAL difference (the four timed-metadata blocks gated on the flag)
+// lands in a LATER emission-gating task; these tests pin only the threading:
+// the flag compiles + flows end-to-end through both public render seams
+// (`extract_info_with_options` and `Rendered::new_with_options`), and — because
+// the emitters don't yet consult it — `false` vs `true` render IDENTICALLY
+// today (which is also the default-off byte-identical regression guard).
+// ===========================================================================
+
+/// `extract_info_with_options` threads `ParseOptions { extract_embedded }` into
+/// the document render. Until the emission-gating task consults the flag, `-ee`
+/// off and on render the SAME JSON document (the flag merely reaches emission).
+#[test]
+fn extract_info_with_options_threads_extract_embedded() {
+  use exifast::ParseOptions;
+  use exifast::parser::extract_info_with_options;
+
+  let data = fixture("QuickTime_gps0.mov");
+
+  let off = extract_info_with_options("QuickTime_gps0.mov", &data, true, ParseOptions::default());
+  let on = extract_info_with_options(
+    "QuickTime_gps0.mov",
+    &data,
+    true,
+    ParseOptions::default().with_extract_embedded(true),
+  );
+
+  // Sanity: the default-off render equals the legacy `extract_info` exactly
+  // (the regression guard — default `extract_embedded = false` keeps output
+  // byte-identical to the hard-coded baseline).
+  assert_eq!(
+    off,
+    exifast::parser::extract_info("QuickTime_gps0.mov", &data, true),
+    "default ParseOptions must match the legacy extract_info byte-for-byte"
+  );
+  // The flag flows through, but the emitters don't gate on it yet ⇒ identical.
+  assert_eq!(
+    off, on,
+    "threading-only: -ee gating lands in the emission task, so off == on today"
+  );
+}
+
+/// `Rendered::new_with_options` carries `extract_embedded` into the serde
+/// `Serialize` path (the same `serialize_tags` seam). Threading-only: off == on
+/// until the emission-gating task.
+#[test]
+fn rendered_new_with_options_threads_extract_embedded() {
+  use exifast::Rendered;
+
+  let data = fixture("QuickTime_gps0.mov");
+  let meta = parse_bytes(&data).expect("recognized");
+
+  let base = Rendered::new(&meta, true);
+  assert!(!base.extract_embedded(), "Rendered::new defaults -ee off");
+
+  let on = Rendered::new_with_options(&meta, true, true);
+  assert!(on.extract_embedded(), "new_with_options carries -ee on");
+
+  let off_json = serde_json::to_value(Rendered::new(&meta, true)).expect("serialize off");
+  let on_json = serde_json::to_value(on).expect("serialize on");
+  assert_eq!(
+    off_json, on_json,
+    "threading-only: -ee gating lands in the emission task, so off == on today"
+  );
+}
+
+/// PLACEHOLDER for the emission-gating task: once the four timed-metadata
+/// blocks honor `extract_embedded`, `-ee` ON must emit the per-sample
+/// `QuickTime:GPS*` tags from the `.ee.json` golden that `-ee` OFF suppresses
+/// (replacing them with the `[minor] ExtractEmbedded` warning). Ignored until
+/// that task wires the gate.
+#[test]
+#[ignore = "behavioral gating lands in the emission task"]
+fn extract_embedded_on_emits_timed_gps_tags() {
+  use exifast::ParseOptions;
+  use exifast::parser::extract_info_with_options;
+
+  let data = fixture("QuickTime_gps0.mov");
+  let on = extract_info_with_options(
+    "QuickTime_gps0.mov",
+    &data,
+    true,
+    ParseOptions::default().with_extract_embedded(true),
+  );
+  let doc: serde_json::Value = serde_json::from_str(&on).expect("valid JSON");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|d| d.as_object())
+    .expect("document object");
+  assert!(
+    obj.contains_key("QuickTime:GPSLatitude"),
+    "-ee on must emit the per-sample timed GPS tags"
+  );
+}

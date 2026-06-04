@@ -116,6 +116,13 @@ pub mod formats;
 // `QuickTimeMeta`). Unconditional — pure typed data with no serde/json
 // dependency; the QuickTime port's `from_quicktime` projection lives here.
 pub mod metadata;
+// Render-time options (`ParseOptions`) mirroring ExifTool flags that gate the
+// EMITTED tag stream, not the always-on typed domain extraction (the parse
+// walkers extract per-sample data unconditionally). Threaded along the SAME
+// path as the `-j`/`-n` `print_conv` toggle: `extract_info_with_options` /
+// `Rendered::new_with_options` → `serialize_tags` → `EmitOptions`. Unconditional
+// — a tiny `Copy` value-type with no heap or feature dependency.
+pub mod options;
 // `jsondiff` (value-semantic golden-diff oracle) and `serialize` (the
 // `serde_json` document renderer) depend on `serde_json` + `serde`, gated on
 // the `json` feature (`json = ["serde", "alloc", "dep:serde_json", "dep:serde"]`).
@@ -158,6 +165,7 @@ pub mod tagtable;
 pub mod value;
 
 pub use error::{Error, OutOfBounds, Result, UnexpectedEof};
+pub use options::ParseOptions;
 pub use value::{Group, Metadata, Rational, Tag, TagValue};
 
 // The normalized cross-format domain layer (golden pattern L2). Re-exported

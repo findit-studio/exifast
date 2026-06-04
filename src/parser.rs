@@ -443,8 +443,26 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String
   // The unified typed path: detect → run the typed parse (complete `AnyMeta`
   // incl. chains) → emit the orchestration tags (`ExifTool:ExifToolVersion`,
   // `SourceFile`, the `File:*` triplet) → serde-render the whole document.
-  // No `TagMap` collector; the typed `AnyMeta` IS the tag source.
-  extract_info_typed(name, data, print_conv_enabled)
+  // No `TagMap` collector; the typed `AnyMeta` IS the tag source. ExifTool
+  // `-ee` defaults off (the faithful baseline); use
+  // [`extract_info_with_options`] to enable it.
+  extract_info_typed(name, data, print_conv_enabled, false)
+}
+
+/// Like [`extract_info`] but with the render-time [`ParseOptions`](crate::ParseOptions)
+/// (ExifTool `-ee`) made explicit. `extract_embedded = true` mirrors `-ee`:
+/// emit the per-sample timed-metadata tags (the typed per-sample data is parsed
+/// unconditionally either way — only the rendered stream is gated). The flag is
+/// threaded into the typed Meta's `serialize_tags` → `EmitOptions`.
+#[cfg(feature = "json")]
+#[must_use]
+pub fn extract_info_with_options(
+  name: &str,
+  data: &[u8],
+  print_conv_enabled: bool,
+  options: crate::ParseOptions,
+) -> String {
+  extract_info_typed(name, data, print_conv_enabled, options.extract_embedded())
 }
 
 /// The typed-serde engine entry — `extract_info`'s implementation. Detects the
@@ -460,7 +478,12 @@ pub fn extract_info(name: &str, data: &[u8], print_conv_enabled: bool) -> String
 /// `ExifTool:Error` carry the FIRST of each (ExifTool.pm:1288-1297).
 #[cfg(feature = "json")]
 #[must_use]
-fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> String {
+fn extract_info_typed(
+  name: &str,
+  data: &[u8],
+  print_conv_enabled: bool,
+  extract_embedded: bool,
+) -> String {
   use serde_json::{Map, Value};
 
   // The single per-file object. `%noDups` first-wins ⇒ insert-if-absent.
@@ -821,7 +844,7 @@ fn extract_info_typed(name: &str, data: &[u8], print_conv_enabled: bool) -> Stri
     // document's diagnostics; the format tags are serialized DIRECTLY at the
     // final step (P4 — no `serde_json::to_value` round-trip + no second key
     // alloc), see the `Document` serializer below.
-    let _ = meta.serialize_tags(print_conv_enabled, &mut tm);
+    let _ = meta.serialize_tags(print_conv_enabled, extract_embedded, &mut tm);
     if let Some(w) = tm.first_warning() {
       warning.get_or_insert_with(|| w.to_string());
     }
