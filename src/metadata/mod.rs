@@ -38,7 +38,9 @@ mod timed_sample;
 #[cfg(feature = "riff")]
 pub(crate) mod riff;
 
-pub use android_camm::{CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammVector3};
+pub use android_camm::{
+  CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammTimingOnly, CammVector3, CammWarning,
+};
 #[cfg(feature = "crw")]
 pub use crw::{
   CrwDecoderTable, CrwExposureInfo, CrwFlashInfo, CrwImageInfo, CrwMeta, CrwRawArray,
@@ -58,5 +60,6 @@ pub use project::Project;
 pub use quicktime::{
   HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeKeys, QuickTimeMeta, QuickTimeUserData,
 };
+pub(crate) use quicktime_stream::GpsOrigin;
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
 pub(crate) use timed_sample::TimedSample;

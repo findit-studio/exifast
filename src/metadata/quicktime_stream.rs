@@ -31,6 +31,48 @@ use smol_str::SmolStr;
 
 use crate::value::Tag;
 
+/// The WALKER PATH (box of origin) that reached a [`GpsSample`] — NOT the decode
+/// type. ExifTool processes the top-level magic boxes (`gps0` / `gsen` / `3gf`)
+/// during `ProcessMOV` REGARDLESS of `-ee` (they are `%QuickTime::Main`
+/// SubDirectories, not `ScanMediaData`/`ProcessSamples` sources), so when one of
+/// them holds more than one record ExifTool emits the FIRST fix + raises a
+/// DOCUMENT-level `[minor] ExtractEmbedded` warning even WITHOUT `-ee`. The other
+/// three sources — the `moov`-level Novatek `gps ` offset box, the Kenwood `GPS `
+/// box, and the brute-force `mdat` freeGPS scan — run only inside
+/// `ProcessSamples`/`ScanMediaData`, so they stay fully `-ee` gated (no no-`ee`
+/// fix, no warning). The marker lets [`crate::formats::quicktime`]'s emitter gate
+/// per-sample (`extract_embedded || origin.emits_without_ee()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpsOrigin {
+  /// Top-level DuDuBell / VSYS `gps0` box (`Process_gps0`) — processed without
+  /// `-ee`.
+  Gps0,
+  /// Top-level DuDuBell / VSYS `gsen` accelerometer box (`Process_gsen`) —
+  /// processed without `-ee`.
+  Gsen,
+  /// Top-level Pittasoft BlackVue `3gf ` accelerometer box (`Process_3gf`) —
+  /// processed without `-ee`.
+  ThreeGf,
+  /// The `moov`-level Novatek `gps ` offset box → freeGPS dispatch — `-ee` only.
+  MoovGpsBox,
+  /// The top-level Kenwood `GPS ` inline box (`parse_kenwood_gps`) — `-ee` only.
+  Kenwood,
+  /// The brute-force `mdat` `freeGPS ` scan (`ScanMediaData`) — `-ee` only.
+  FreeGpsScan,
+}
+
+impl GpsOrigin {
+  /// `true` for the top-level magic boxes ExifTool processes WITHOUT `-ee`
+  /// (`gps0` / `gsen` / `3gf`): a fix from one of these surfaces its FIRST record
+  /// + a file-level `ExtractEmbedded` warning even at no-`ee`. The remaining
+  /// origins are `ScanMediaData`/`ProcessSamples`-only ⇒ fully `-ee` gated.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn emits_without_ee(&self) -> bool {
+    matches!(self, Self::Gps0 | Self::Gsen | Self::ThreeGf)
+  }
+}
+
 /// One timed GPS / sensor fix decoded from a video metadata sample — the
 /// typed mirror of the per-`Doc<N>` tag group ExifTool's `FoundSomething`
 /// opens for each sample (QuickTimeStream.pl:967-973). Every field is
@@ -71,6 +113,47 @@ pub struct GpsSample {
   accelerometer: Option<SmolStr>,
   /// `TimeCode` — video timecode in seconds (QuickTimeStream.pl:159).
   time_code: Option<f64>,
+  /// The WALKER PATH (box of origin) that produced this sample — stamped by the
+  /// stream walker at the dispatch point, not by the per-format decoder. Drives
+  /// the no-`ee` emission gate ([`GpsOrigin::emits_without_ee`]): a `gps0` /
+  /// `gsen` / `3gf` fix surfaces (first-only) + raises a file-level
+  /// `ExtractEmbedded` warning even without `-ee`; the `moov`-`gps `-box /
+  /// Kenwood / freeGPS-scan origins stay `-ee` gated. `None` for samples built
+  /// directly in unit tests (treated as `-ee`-only — no no-`ee` leak).
+  origin: Option<GpsOrigin>,
+  /// The 0-based PHYSICAL record index within a top-level magic box
+  /// (`gps0`/`gsen`/`3gf`), stamped by the decoder for EVERY physical record
+  /// BEFORE the validity skip — the typed mirror of ExifTool's
+  /// `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the `Process_gps0`/
+  /// `Process_gsen`/`Process_3gf` loop (QuickTimeStream.pl:2743/2783/2700), which
+  /// counts a record EVEN IF it is then `next`-skipped (an out-of-range gps0
+  /// fix). The emitter ([`crate::formats::quicktime::emit_timed_samples`]) reads
+  /// it for the no-`ee` magic-box path: at no-`ee` only physical record 0
+  /// surfaces (truncate-to-first), and at `-ee -G3` the `Doc<N>` number is
+  /// `index + 1` (so a valid record after a skipped one is `Doc<index+1>`, not the
+  /// next sequential emitted-sample ordinal). `None` for the `-ee`-only sources
+  /// (their Doc numbering is the running emitted-sample ordinal) and for
+  /// unit-built samples.
+  magic_box_record_index: Option<u32>,
+  /// 1-based global document ordinal (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`) of
+  /// this sample's record — the `Doc<N>` the `-ee -G3` emitter writes. Stamped at
+  /// extraction from the shared [`QuickTimeStreamMeta`] doc counter for ALL of
+  /// this struct's sources: the top-level magic boxes (`gps0`/`gsen`/`3gf`) stamp
+  /// it IN-DECODER per PHYSICAL record at the TOP of the loop
+  /// (QuickTimeStream.pl:2743/2783/2700), so a SKIPPED out-of-range record still
+  /// consumes a global ordinal — the next valid record's stamp accounts for it;
+  /// the `-ee`-only Kenwood `GPS ` box / `moov`-`gps `-box freeGPS blocks /
+  /// brute-force freeGPS-scan stamp it POST-decode per appended fix
+  /// ([`QuickTimeStreamMeta::stamp_gps_doc_from`]). Because it comes from the
+  /// meta-wide counter it is a true GLOBAL ordinal across the other timed sources
+  /// in the same file (including camm, in a separate struct off the same
+  /// counter). When `Some` the emitter uses it VERBATIM for `-ee -G3` (no
+  /// `magic_box_record_index + 1` arithmetic); `None` only for unit-built samples
+  /// (the emitter then keeps its running per-call ordinal). `magic_box_record_index`
+  /// is retained SEPARATELY: it is the PHYSICAL index (0-based) that selects
+  /// record 0 for the no-`ee` truncate-to-first decision — distinct from this
+  /// global `Doc<N>` number.
+  doc: Option<u32>,
 }
 
 impl GpsSample {
@@ -91,6 +174,9 @@ impl GpsSample {
       date_time: None,
       accelerometer: None,
       time_code: None,
+      origin: None,
+      magic_box_record_index: None,
+      doc: None,
     }
   }
 
@@ -180,6 +266,32 @@ impl GpsSample {
   #[must_use]
   pub const fn time_code(&self) -> Option<f64> {
     self.time_code
+  }
+
+  /// The WALKER PATH (box of origin) that produced this sample, or `None` until
+  /// the stream walker stamps it (see [`GpsOrigin`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn origin(&self) -> Option<GpsOrigin> {
+    self.origin
+  }
+
+  /// The 0-based PHYSICAL record index this magic-box (`gps0`/`gsen`/`3gf`)
+  /// sample came from, or `None` for non-magic-box / unit-built samples (see
+  /// the `magic_box_record_index` field docs).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn magic_box_record_index(&self) -> Option<u32> {
+    self.magic_box_record_index
+  }
+
+  /// The 1-based global document ordinal (`Doc<N>`) stamped on this sample, or
+  /// `None` for the `-ee`-only sources / unit-built samples (see the `doc` field
+  /// docs). When `Some`, the emitter uses it verbatim for `-ee -G3`.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn doc(&self) -> Option<u32> {
+    self.doc
   }
 
   /// `true` when no field is populated (a sample worth dropping).
@@ -290,6 +402,32 @@ impl GpsSample {
     self.time_code = v;
     self
   }
+
+  /// Stamp the WALKER PATH (box of origin) — set by the stream walker at the
+  /// dispatch point that reached this sample (see [`GpsOrigin`]).
+  #[inline(always)]
+  pub(crate) const fn set_origin(&mut self, v: Option<GpsOrigin>) -> &mut Self {
+    self.origin = v;
+    self
+  }
+
+  /// Stamp the 0-based PHYSICAL record index — set by the magic-box decoder
+  /// (`process_gps0`/`process_gsen`/`process_3gf`) for EVERY physical record
+  /// BEFORE the validity skip (see the `magic_box_record_index` field docs).
+  #[inline(always)]
+  pub(crate) const fn set_magic_box_record_index(&mut self, v: Option<u32>) -> &mut Self {
+    self.magic_box_record_index = v;
+    self
+  }
+
+  /// Stamp the 1-based global document ordinal — set by the magic-box decoder
+  /// from the shared [`QuickTimeStreamMeta`] doc counter, per PHYSICAL record
+  /// (see the `doc` field docs).
+  #[inline(always)]
+  pub(crate) const fn set_doc(&mut self, v: Option<u32>) -> &mut Self {
+    self.doc = v;
+    self
+  }
 }
 
 impl Default for GpsSample {
@@ -334,6 +472,19 @@ pub struct MebxSample {
   /// enclosing [`QuickTimeStreamMeta`] is file-scoped and could accumulate
   /// samples from more than one metadata `trak`.
   track_index: Option<u32>,
+  /// 1-based global document ordinal (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`) of
+  /// the TIMED SAMPLE this record came from — the `Doc<N>` number the `-ee -G3`
+  /// emitter writes. ExifTool sets `DOC_NUM` ONCE per timed sample via
+  /// `FoundSomething` (ProcessSamples:1517) before dispatching `Process_mebx`,
+  /// which `HandleTag`s ALL records of that sample under the SAME `DOC_NUM`
+  /// (`Process_mebx` never bumps the doc itself, QuickTimeStream.pl:2644). So
+  /// every record decoded by one `process_mebx` invocation — including the
+  /// nested `detected-face` leaves — shares ONE ordinal. Stamped by the stream
+  /// walker (see [`QuickTimeStreamMeta::stamp_mebx_doc_from`]) from the shared
+  /// [`QuickTimeStreamMeta`] doc counter, so it is a true GLOBAL ordinal across
+  /// the other timed sources in the same file (e.g. a `gps0` box after a `mebx`
+  /// track). `None` until stamped.
+  doc: Option<u32>,
 }
 
 impl MebxSample {
@@ -352,6 +503,7 @@ impl MebxSample {
       sample_time,
       sample_duration,
       track_index: None,
+      doc: None,
     }
   }
 
@@ -398,6 +550,22 @@ impl MebxSample {
     self.track_index = v;
     self
   }
+
+  /// The 1-based global document ordinal (`Doc<N>`) of the timed sample this
+  /// record came from — all records of one timed sample share it (see the
+  /// `doc` field docs). `None` until the stream walker stamps it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc(&self) -> Option<u32> {
+    self.doc
+  }
+
+  /// Stamp the 1-based global document ordinal of the originating timed sample.
+  #[inline(always)]
+  pub const fn set_doc(&mut self, v: Option<u32>) -> &mut Self {
+    self.doc = v;
+    self
+  }
 }
 
 /// The typed result of QuickTimeStream timed-metadata extraction — the SP3
@@ -430,6 +598,39 @@ pub struct QuickTimeStreamMeta {
   /// `%PLIST::Main` static `PrintConv`, so the rendering is mode-invariant —
   /// see `quicktime_stream::process_mebx`).
   plist_subdir_tags: Vec<Tag>,
+  /// `true` when a top-level magic box (`gps0` / `gsen` / `3gf`) carried MORE
+  /// than one record (`$dirLen > $recLen`) — the exact condition under which
+  /// ExifTool TRUNCATES that box to its first record and raises the
+  /// document-level `[minor] The ExtractEmbedded option may find more tags in
+  /// the media data` warning WITHOUT `-ee` (`EEWarn`, QuickTimeStream.pl:2693/
+  /// 2738/2776, QuickTime.pm:9545-9549). Set by the decoders ([`process_gps0`]
+  /// etc.) at the byte-length check, BEFORE any per-record decode, so it is
+  /// faithful to the raw record count (independent of how many records survive
+  /// the out-of-range skip). The emitter consults it (only at no-`ee`) to raise
+  /// the file-level `ExifTool:Warning`. The `-ee`-only sources (moov-`gps `-box /
+  /// Kenwood / freeGPS-scan) never set it — they raise different warnings the
+  /// oracle shows ABSENT at no-`ee`.
+  magic_box_truncated_no_ee: bool,
+  /// The running global document counter — the typed mirror of ExifTool's
+  /// `$$et{DOC_COUNT}`. Bumped in EXTRACTION (walk) order at each point ExifTool
+  /// runs `$$et{DOC_NUM} = ++$$et{DOC_COUNT}`: ONCE per `mebx` timed sample
+  /// ([`decode_one_sample`] via [`Self::open_doc`] +
+  /// [`Self::stamp_mebx_doc_from`]); once per PHYSICAL `gps0`/`gsen`/`3gf` record
+  /// ([`process_gps0`]/[`process_gsen`]/[`process_3gf`], INCLUDING a skipped
+  /// out-of-range record); and once per fix appended by the `-ee`-only
+  /// `ProcessSamples`/`ScanMediaData` sources — the Kenwood `GPS ` box, the
+  /// `moov`-level `gps `-box freeGPS blocks, and the brute-force `mdat`
+  /// freeGPS-scan ([`Self::stamp_gps_doc_from`] at each source's walk position).
+  /// It is ALSO shared with the camm decoder, which bumps it once per camm sample
+  /// off the SAME counter (`decode_one_sample` camm arm → [`Self::open_doc`] →
+  /// [`crate::metadata::CammMeta::stamp_gps_doc_from`]) even though camm fixes
+  /// live in a SEPARATE struct. Because the SAME counter spans every embedded
+  /// source in the file, the stamped `Doc<N>` ordinals are GLOBAL across them
+  /// (e.g. a `camm` `trak` following a `mebx` `trak` continues the ordinal —
+  /// `mebx` Doc1, camm Doc2.. — not a colliding `Doc1`; #214). For a SINGLE-source
+  /// file the ordinal equals the old per-source numbering, so the byte-exact
+  /// goldens are unchanged.
+  doc_counter: u32,
 }
 
 impl QuickTimeStreamMeta {
@@ -441,6 +642,8 @@ impl QuickTimeStreamMeta {
       gps_samples: Vec::new(),
       mebx_samples: Vec::new(),
       plist_subdir_tags: Vec::new(),
+      magic_box_truncated_no_ee: false,
+      doc_counter: 0,
     }
   }
 
@@ -513,6 +716,105 @@ impl QuickTimeStreamMeta {
     }
   }
 
+  /// Bump the global document counter and return the new 1-based ordinal — the
+  /// typed mirror of `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` (see the `doc_counter`
+  /// field docs). Called ONCE per `mebx` timed sample (before
+  /// [`Self::stamp_mebx_doc_from`]) and once per PHYSICAL `gps0`/`gsen`/`3gf`
+  /// record. Saturating, so a hostile record count cannot wrap.
+  #[inline(always)]
+  pub(crate) const fn open_doc(&mut self) -> u32 {
+    self.doc_counter = self.doc_counter.saturating_add(1);
+    self.doc_counter
+  }
+
+  /// Stamp the global document ordinal `doc` onto every `mebx` sample at or
+  /// after `start` — the records decoded by ONE `process_mebx` invocation (one
+  /// timed sample) since the walker took its [`Self::mebx_sample_count`]
+  /// watermark. Faithful to ExifTool calling `FoundSomething` ONCE per timed
+  /// sample (ProcessSamples:1517) then `HandleTag`ing ALL of that sample's
+  /// records — including the nested `detected-face` leaves — under the SAME
+  /// `$$et{DOC_NUM}` (`Process_mebx` never bumps the doc, QuickTimeStream.pl:2644).
+  pub(crate) fn stamp_mebx_doc_from(&mut self, start: usize, doc: u32) {
+    if let Some(slice) = self.mebx_samples.get_mut(start..) {
+      for s in slice {
+        s.set_doc(Some(doc));
+      }
+    }
+  }
+
+  /// The number of GPS / sensor samples decoded so far — a watermark the stream
+  /// walker takes BEFORE decoding one box's records so it can stamp the
+  /// [`GpsOrigin`] onto exactly the samples that box produced (see
+  /// [`Self::stamp_gps_origin_from`]). Mirrors [`Self::mebx_sample_count`].
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn gps_sample_count(&self) -> usize {
+    self.gps_samples.len()
+  }
+
+  /// Stamp `origin` onto every GPS sample at or after `start` — the samples
+  /// decoded since the walker took its [`Self::gps_sample_count`] watermark. The
+  /// origin is the WALKER PATH (box of origin) that reached those samples, NOT
+  /// the decode type; it gates the no-`ee` emission (see [`GpsOrigin`]). Mirrors
+  /// [`Self::stamp_mebx_track_index_from`].
+  pub(crate) fn stamp_gps_origin_from(&mut self, start: usize, origin: GpsOrigin) {
+    if let Some(slice) = self.gps_samples.get_mut(start..) {
+      for s in slice {
+        s.set_origin(Some(origin));
+      }
+    }
+  }
+
+  /// Assign the running GLOBAL document ordinal (`++DOC_COUNT`) to each GPS
+  /// sample at or after `start` that does not already carry one — the
+  /// `-ee`-only `ProcessSamples`/`ScanMediaData` sources (Kenwood `GPS ` box,
+  /// the `moov`-level `gps `-box freeGPS blocks, the brute-force `mdat`
+  /// freeGPS-scan), each of which bumps `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` once
+  /// per fix it appends (QuickTimeStream.pl:2565 Kenwood, the per-record /
+  /// per-block `FoundSomething` of `ProcessFreeGPS`). Called AFTER the source's
+  /// decode (watermark-then-stamp, mirroring [`Self::stamp_gps_origin_from`]),
+  /// so the bumps land in the source's append order. Because the counter is the
+  /// SAME `doc_counter` the `mebx`/`gps0`/`gsen`/`3gf` decoders already bump (via
+  /// [`Self::open_doc`]), the stamped `Doc<N>` ordinals are GLOBAL across every
+  /// source in WALK order (e.g. a Kenwood box after a `mebx` track continues the
+  /// ordinal). Samples already stamped in-decoder (`gps0`/`gsen`/`3gf`, which
+  /// `++DOC_COUNT` per PHYSICAL record incl. a skipped one) are LEFT UNTOUCHED —
+  /// the `doc().is_none()` guard preserves their physical-record numbering. The
+  /// emitter then reads each sample's [`GpsSample::doc`] VERBATIM for `-ee -G3`.
+  pub(crate) fn stamp_gps_doc_from(&mut self, start: usize) {
+    // Snapshot the counter, bump it locally per unstamped sample, then write it
+    // back — avoids aliasing `self.open_doc()` with the `gps_samples` slice
+    // borrow while preserving `open_doc`'s saturating semantics.
+    let mut counter = self.doc_counter;
+    if let Some(slice) = self.gps_samples.get_mut(start..) {
+      for s in slice {
+        if s.doc().is_none() {
+          counter = counter.saturating_add(1);
+          s.set_doc(Some(counter));
+        }
+      }
+    }
+    self.doc_counter = counter;
+  }
+
+  /// `true` when a top-level magic box (`gps0`/`gsen`/`3gf`) carried more than
+  /// one record — ExifTool's `$dirLen > $recLen` truncation + `EEWarn` trigger
+  /// (see the `magic_box_truncated_no_ee` field docs). Consulted by the emitter
+  /// (only at no-`ee`) to raise the file-level `ExifTool:Warning`.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn magic_box_truncated_no_ee(&self) -> bool {
+    self.magic_box_truncated_no_ee
+  }
+
+  /// Record that a top-level magic box carried more than one record — call at
+  /// the decoder's `$dirLen > $recLen` byte-length check, BEFORE the per-record
+  /// loop, so it is faithful to the raw record count (see the field docs).
+  #[inline(always)]
+  pub(crate) fn note_magic_box_truncated(&mut self) {
+    self.magic_box_truncated_no_ee = true;
+  }
+
   /// Append a fully-rendered tag from a `mebx` `SubDirectory` key (the
   /// `smartstyle-info` embedded-PLIST path).
   #[inline(always)]
@@ -576,5 +878,75 @@ mod tests {
     assert_eq!(s.value(), "123456");
     assert_eq!(s.sample_time(), Some(0.5));
     assert_eq!(s.sample_duration(), Some(1.0));
+  }
+
+  /// Only the top-level magic boxes (`gps0`/`gsen`/`3gf`) are processed without
+  /// `-ee`; the `ProcessSamples`/`ScanMediaData` origins stay `-ee`-gated.
+  #[test]
+  fn gps_origin_emits_without_ee_only_for_magic_boxes() {
+    for o in [GpsOrigin::Gps0, GpsOrigin::Gsen, GpsOrigin::ThreeGf] {
+      assert!(o.emits_without_ee(), "{o:?} is a no-ee top-level magic box");
+    }
+    for o in [
+      GpsOrigin::MoovGpsBox,
+      GpsOrigin::Kenwood,
+      GpsOrigin::FreeGpsScan,
+    ] {
+      assert!(!o.emits_without_ee(), "{o:?} is -ee-only");
+    }
+  }
+
+  /// `origin` defaults to `None` and the accessor round-trips the setter; the
+  /// origin marker does NOT make an otherwise-empty sample non-empty (it is
+  /// provenance, not data).
+  #[test]
+  fn gps_sample_origin_roundtrip_and_emptiness() {
+    let mut s = GpsSample::new();
+    assert_eq!(s.origin(), None);
+    s.set_origin(Some(GpsOrigin::Gps0));
+    assert_eq!(s.origin(), Some(GpsOrigin::Gps0));
+    // An origin-only sample is still empty (no data field set).
+    assert!(s.is_empty());
+  }
+
+  /// `stamp_gps_origin_from` stamps EXACTLY the samples appended since the
+  /// watermark — earlier samples keep their prior origin (the per-box
+  /// watermark-then-stamp the walker uses to attribute each box's records).
+  #[test]
+  fn stamp_gps_origin_from_only_touches_samples_after_watermark() {
+    let mut m = QuickTimeStreamMeta::new();
+    // A pre-existing sample from an earlier box (e.g. a Kenwood `GPS ` fix).
+    let mut earlier = GpsSample::new();
+    earlier
+      .set_latitude(Some(1.0))
+      .set_longitude(Some(2.0))
+      .set_origin(Some(GpsOrigin::Kenwood));
+    m.push_gps_sample(earlier);
+    // Watermark, then decode a `gps0` box (two fixes).
+    let start = m.gps_sample_count();
+    for (lat, lon) in [(3.0, 4.0), (5.0, 6.0)] {
+      let mut s = GpsSample::new();
+      s.set_latitude(Some(lat)).set_longitude(Some(lon));
+      m.push_gps_sample(s);
+    }
+    m.stamp_gps_origin_from(start, GpsOrigin::Gps0);
+    let origins: Vec<Option<GpsOrigin>> = m.gps_samples().iter().map(GpsSample::origin).collect();
+    assert_eq!(
+      origins,
+      [
+        Some(GpsOrigin::Kenwood), // earlier sample untouched
+        Some(GpsOrigin::Gps0),
+        Some(GpsOrigin::Gps0),
+      ]
+    );
+  }
+
+  /// The truncation/`EEWarn` flag defaults off and latches once noted.
+  #[test]
+  fn magic_box_truncation_flag_latches() {
+    let mut m = QuickTimeStreamMeta::new();
+    assert!(!m.magic_box_truncated_no_ee());
+    m.note_magic_box_truncated();
+    assert!(m.magic_box_truncated_no_ee());
   }
 }

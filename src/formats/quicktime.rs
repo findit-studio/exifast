@@ -3650,6 +3650,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // now appends to the freeGPS-style stream samples AND fills `gopro`.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = found_embedded;
+    // `-ee`-only source (the brute-force `mdat` scan runs inside
+    // `ScanMediaData`, fully `-ee` gated): watermark-then-stamp `FreeGpsScan`
+    // onto exactly the fixes the scan appends so the emitter keeps them gated
+    // (no no-`ee` fix, no file-level warning).
+    let scan_start = stream.gps_sample_count();
     quicktime_freegps::scan_media_data(
       data,
       off,
@@ -3660,6 +3665,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       &mut stream,
       &mut gopro_meta,
     );
+    stream.stamp_gps_origin_from(scan_start, crate::metadata::GpsOrigin::FreeGpsScan);
+    // The brute-force `mdat` freeGPS scan runs LAST in ExifTool's walk
+    // (`ScanMediaData`, after `ProcessMOV`), `++DOC_COUNT` per fix it appends:
+    // stamp the GLOBAL doc onto exactly those fixes, continuing the shared
+    // counter after every earlier source (P1 + cross-source #214).
+    stream.stamp_gps_doc_from(scan_start);
   }
 
   // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
@@ -4484,7 +4495,8 @@ impl crate::emit::Taggable for Meta<'_> {
         }
         // Accelerometer (QuickTimeStream.pl:149): the space-joined 3-axis
         // string, NO PrintConv (a `Notes`-only tag) — emit verbatim in both
-        // modes (oracle `moov_gps`: `Accelerometer "0 0 0"`).
+        // modes (oracle `moov_gps`: `Accelerometer "0 0 0"`; `gsen`:
+        // `Accelerometer "1 -2 3"`).
         if let Some(acc) = s.accelerometer() {
           scratch.push(EmittedTag::new(
             group.clone(),
@@ -4493,9 +4505,45 @@ impl crate::emit::Taggable for Meta<'_> {
             false,
           ));
         }
+        // TimeCode (QuickTimeStream.pl:159): a plain numeric tag — NO PrintConv,
+        // NO ValueConv (the table entry is bare). `Process_3gf` HandleTags
+        // `$tc / 1000` (:2703); the typed layer already holds that f64. Emit the
+        // raw `F64` (a bare JSON number) in both modes.
+        if let Some(tc) = s.time_code() {
+          scratch.push(EmittedTag::new(
+            group.clone(),
+            "TimeCode".into(),
+            TagValue::F64(tc),
+            false,
+          ));
+        }
       },
       &mut tags,
     );
+    // No-`ee` DOCUMENT-level `EEWarn` (QuickTime.pm:9545-9549 `EEWarn` →
+    // `Warn('The ExtractEmbedded option may find more tags in the media data',
+    // 3)`): a TOP-LEVEL magic box (`gps0`/`gsen`/`3gf`) holding more than one
+    // record is TRUNCATED to its first record at no-`ee` and raises this
+    // file-level warning (QuickTimeStream.pl:2693/2738/2776). Unlike the eeBox
+    // `Track<N>:Warning` above (a HANDLER-track RawConv, scoped to that track's
+    // family-1 group), these magic boxes are NOT `trak`s — no `SET_GROUP1` is
+    // active — so the warning is DOCUMENT-level (`ExifTool:Warning`). Emitted
+    // IN-STREAM as a family-0/1 `ExifTool` `Warning` tag (the `tags()` path is
+    // the only one that sees `opts.extract_embedded`; the `Diagnose` channel
+    // does not). It lands in the `Warning` priority-0 first-wins slot, so a real
+    // document warning raised earlier (a `ProcessMOV` `ExifTool:Warning`, which
+    // rides the `Diagnose` accumulator into the orchestration object) still wins
+    // — no incorrect double-warn. The `-ee`-only sources (moov-`gps `-box /
+    // Kenwood / freeGPS-scan) never set the flag — they raise different warnings
+    // the oracle shows ABSENT at no-`ee`.
+    if !opts.extract_embedded && self.stream.magic_box_truncated_no_ee() {
+      tags.push(EmittedTag::new(
+        Group::new("ExifTool", "ExifTool"),
+        "Warning".into(),
+        TagValue::Str(EE_WARNING.into()),
+        false,
+      ));
+    }
     // The Apple `mebx` key/value pairs — ExifTool emits these per timed sample
     // under the enclosing `Track<N>` (family-1) at its `Doc<N>` (oracle:
     // `Track1:GPSCoordinates` / `Doc1:Track1:GPSCoordinates`), preceded by the
@@ -4505,15 +4553,68 @@ impl crate::emit::Taggable for Meta<'_> {
     // track number stamped by the walker (default `Track1`).
     if opts.extract_embedded {
       let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+      // `doc` is the FALLBACK running ordinal for any `mebx` sample left
+      // unstamped (none in practice — the walker stamps every record). When the
+      // extraction stamp is present (`sample.doc()`), it is used VERBATIM, so all
+      // records of ONE timed sample share ONE `Doc<N>` (ExifTool sets `DOC_NUM`
+      // once per sample via `FoundSomething`, then `HandleTag`s every record under
+      // it — QuickTimeStream.pl:2644). The stamp is also GLOBAL across the file's
+      // stream sources (e.g. a `gps0` box after this `mebx` track continues the
+      // ordinal). The legacy per-record `doc += 1` would have scattered a
+      // multi-key sample (mebx_keys/detface) across `Doc1..DocN`.
       let mut doc: u32 = 0;
       let mut mebx_scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
-      let mut mebx_seen: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
+      // `-G1` collapse state (unused at `-G3`). ExifTool's `-ee -G1` collapses
+      // every `Doc<N>` to one `(family1, name)` row with TWO precedence rules,
+      // BOTH driven by the per-record `Doc<N>`:
+      //   * WITHIN one document (one timed sample — its records share a doc):
+      //     LAST-wins, because each record `HandleTag`s into the same
+      //     `(DOC_NUM, tag)` VALUE slot and a later record OVERWRITES the earlier
+      //     (the `detected-face` sample's two faces ⇒ the SECOND face's
+      //     `DetectedFace*` win — QuickTimeStream.pl:2644/2671).
+      //   * ACROSS documents: FIRST-document-wins (the same first-fix-wins the
+      //     GPS sources show at `-ee -G1`: gps0/gsen keep the Doc1 fix, not Doc2).
+      // So: accumulate one document's records with within-doc last-wins
+      // (`doc_vals`), and on the doc boundary FLUSH them into `tags` honoring
+      // across-doc first-wins (`mebx_committed`). At `-G3` neither buffer is used —
+      // the records emit verbatim and the last-wins-within-doc collapse happens in
+      // the flat `TagMap` sink (a later same-key `Doc<N>:` row overwrites).
+      // Keyed by `(family1, name)`, NOT bare `name`: ExifTool's `%noDups`
+      // collapse is per FULL tag (group included), so two `mebx` `trak`s emitting
+      // the SAME key (`Track1:SceneIlluminance` + `Track2:SceneIlluminance`) are
+      // DISTINCT rows and BOTH survive `-ee -G1` (a name-only set would drop the
+      // later track's value). The family-1 group is the per-`trak` `Track<N>`.
+      let mut mebx_committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
         std::vec::Vec::new();
+      // ((family1, name), EmittedTag) for the document currently being
+      // accumulated, plus the doc number it belongs to. `None` until the first
+      // sample opens a doc.
+      let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+        std::vec::Vec::new();
+      let mut cur_doc: Option<u32> = None;
+      // Flush one accumulated document's last-wins values into `tags`, dropping a
+      // `(family1, name)` already committed by an EARLIER document (across-doc
+      // first-wins). Emits in first-seen order within the document.
+      let flush_doc =
+        |doc_vals: &mut std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)>,
+         committed: &mut std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
+         tags: &mut std::vec::Vec<EmittedTag>| {
+          for (key, tag) in doc_vals.drain(..) {
+            if committed.contains(&key) {
+              continue;
+            }
+            committed.push(key);
+            tags.push(tag);
+          }
+        };
       for sample in self.stream.mebx_samples() {
-        doc += 1;
+        let doc_n = sample.doc().unwrap_or_else(|| {
+          doc += 1;
+          doc
+        });
         let track = std::format!("Track{}", sample.track_index().unwrap_or(1));
         let group = if g3 {
-          Group::with_doc("QuickTime", track.as_str(), doc)
+          Group::with_doc("QuickTime", track.as_str(), doc_n)
         } else {
           Group::new("QuickTime", track.as_str())
         };
@@ -4543,19 +4644,29 @@ impl crate::emit::Taggable for Meta<'_> {
         if g3 {
           tags.append(&mut mebx_scratch);
         } else {
+          // A new document — flush the previous one (across-doc first-wins).
+          if cur_doc != Some(doc_n) {
+            flush_doc(&mut doc_vals, &mut mebx_committed, &mut tags);
+            cur_doc = Some(doc_n);
+          }
+          // Accumulate this record's tags with WITHIN-doc last-wins by
+          // `(family1, name)` (the records of one timed sample all share that
+          // sample's `Track<N>`, so this matches the cross-doc collapse key).
           for tag in mebx_scratch.drain(..) {
             let key = (
               smol_str::SmolStr::new(tag.tag().group_ref().family1()),
               smol_str::SmolStr::new(tag.tag().name()),
             );
-            if mebx_seen.contains(&key) {
-              continue;
+            if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+              slot.1 = tag;
+            } else {
+              doc_vals.push((key, tag));
             }
-            mebx_seen.push(key);
-            tags.push(tag);
           }
         }
       }
+      // Flush the final accumulated document (no-op at `-G3` / when empty).
+      flush_doc(&mut doc_vals, &mut mebx_committed, &mut tags);
       // Tags from a `mebx` `SubDirectory` key (currently only `smartstyle-info`'s
       // embedded binary PLIST, QuickTime.pm:6847-6852). These were rendered by
       // the nested PLIST `Taggable` stream and stored as fully-typed [`Tag`]s —
@@ -4893,6 +5004,62 @@ impl crate::emit::Taggable for Meta<'_> {
       }
     }
 
+    // ── SP4: Android CAMM cross-kind `-G1` SampleTime/SampleDuration ────────
+    // At `-ee -G1` the single `Track<N>:SampleTime`/`SampleDuration` is the timing
+    // of that track's MINIMUM-`doc()` (FIRST) camm SAMPLE across ALL record kinds
+    // — GPS, motion (camm2/3/4/7 + camm1 exposure), AND `ProcessCAMM` warnings —
+    // because ExifTool emits each sample's timing in sample order BEFORE
+    // dispatching that sample's packets and `%noDups` is first-wins
+    // (QuickTimeStream.pl:1518-1523; [`camm_min_doc_timing`]). exifast's per-kind
+    // emitters below drain records in EMITTER-KIND order (warnings, then GPS, then
+    // motion), NOT sample order, so the cross-kind minimum cannot be found by a
+    // per-kind first-wins gate (a track whose first sample is a kind emitted LATER
+    // would wrongly keep an earlier-emitted-but-later-sample kind's timing). So
+    // precompute the min-`doc()` timing per track HERE and emit it FIRST through
+    // the shared `first_seen` gate: it occupies the priority-0 first-wins
+    // `(Track<N>, SampleTime)`/`SampleDuration` slot, and the per-kind emitters'
+    // own `-G1` timing (now `-G3`-only) is gated out. This SUPERSEDES the previous
+    // per-emitter `-G1` timing gating (the warning path's `push_timing`-through-
+    // `first_seen`, the GPS path's post-emit filter, the motion path's
+    // `timing_first_seen`), which only happened to work when the FIRST emitter
+    // (warnings) owned the minimum sample. At `-G3` each `Doc<N>` keeps its own
+    // sample's timing (no precompute — this block is `-G1`-only).
+    if opts.extract_embedded && !matches!(opts.group_mode, crate::serialize_key::GroupMode::G3) {
+      for (track, st, sd) in camm_min_doc_timing(&self.android_camm) {
+        let group = Group::new("QuickTime", std::format!("Track{track}").as_str());
+        for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
+          if let Some(secs) = val
+            && first_seen(group.family1(), name)
+          {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+      }
+    }
+
+    // ── SP4: Android CAMM ProcessCAMM warnings (QuickTimeStream.pl:3495-96) ─
+    // `ProcessCAMM` `$et->Warn`s then `last`s on an UNKNOWN packet type
+    // (`Unknown camm record type N`, incl. type 0) or a TRUNCATED packet
+    // (`Truncated camm record N`). Both are plain `$et->Warn(msg)` calls (NO
+    // `ignorable` arg) ⇒ NO `[minor]` prefix (contrast the eeBox EEWarn's
+    // `Warn(msg, 3)`). `ProcessCAMM` runs only under `ExtractEmbedded`, so the
+    // warning surfaces ONLY at `-ee`; a no-`ee` parse instead shows the
+    // `[minor]` EEWarn raised in the `HandlerType` RawConv above. See
+    // [`emit_camm_warnings`] for the `WAS_WARNED` string-dedup (`[xN]` count),
+    // the `Doc<N>:Track<N>` axis, and the priority-0 first-wins `-G1` collapse.
+    emit_camm_warnings(
+      self.android_camm.warnings(),
+      opts,
+      print_conv,
+      &mut first_seen,
+      &mut tags,
+    );
+
     // ── SP4: Android CAMM (Image::ExifTool::QuickTime::camm5/camm6) ─────
     // The `%QuickTime::camm5`/`camm6` GPS tables (QuickTimeStream.pl:479-560)
     // emit one `Doc<N>` sub-document per CAMM packet, family-1 `Track<N>` (the
@@ -4904,11 +5071,14 @@ impl crate::emit::Taggable for Meta<'_> {
     // the walker stamped (default `Track1`); the altitude PrintConv differs by
     // packet type (camm5 `%.6f`, camm6 `%.3f`). The camm6 accuracy / velocity
     // columns (no PrintConv) ride `emit_extra` as raw `F64` (the f32→f64
-    // widening the oracle prints, e.g. `0.100000001490116`). The per-sample
-    // motion records (camm1-4/7) stay on the typed accessor — not emitted,
-    // matching the gps0/gsen/3gf sensor precedent. `SampleTime`/`SampleDuration`
-    // (ExifTool's sample-table timing) are NOT modeled by the typed
-    // `CammGpsSample` — an accepted gap (the GPS payload is complete).
+    // widening the oracle prints, e.g. `0.100000001490116`). `SampleTime`/
+    // `SampleDuration` (the sample-table timing): at `-G3` each `Doc<N>` carries
+    // its own via `sample_timing()` (`None` for the stream-GPS / magic-box sources,
+    // so none leak onto gps0/gsen/3gf/Kenwood/moov-`gps `/freeGPS); at `-G1` the
+    // single `Track<N>:SampleTime` is the cross-kind MINIMUM-`doc()` sample's,
+    // emitted by the [`camm_min_doc_timing`] precompute block above (through the
+    // shared first-wins gate), so `emit_timed_samples` no longer emits any `-G1`
+    // timing for the GPS path to reconcile.
     emit_timed_samples(
       self.android_camm.gps_samples(),
       |s| {
@@ -4946,6 +5116,82 @@ impl crate::emit::Taggable for Meta<'_> {
       },
       &mut tags,
     );
+
+    // ── SP4: Android CAMM MOTION (camm1-4/7 — QuickTimeStream.pl:428-569) ──
+    // The non-GPS camm records `ProcessCAMM` `HandleTag`s — camm2 AngularVelocity
+    // / camm3 Acceleration / camm4 Position / camm7 MagneticField (`float[3]`
+    // space-joined, mode-invariant) and camm1 PixelExposureTime /
+    // RollingShutterSkewTime (seconds, `sprintf("%.4g ms")` PrintConv at `-j`).
+    // ExifTool emits each under the same `Track<N>` / `Doc<N>` axis as the GPS
+    // camm fixes (one doc per camm SAMPLE; a sample with both a GPS and a motion
+    // packet shares the doc — stamped at extraction). `-ee`-gated like the GPS
+    // path (camm is a handler `trak`): at no-`ee` nothing here surfaces. camm0's
+    // `AngleAxis` is intentionally absent — type 0 is not in `ProcessCAMM`'s
+    // `%size`, so the walk `last`s on it (the typed `angle_axis` vec stays empty).
+    // Each vector type carries a DISTINCT tag name, so the per-type collapse is
+    // independent (no cross-type `(family1, name)` collision).
+    for (samples, name) in [
+      (self.android_camm.angular_velocity(), "AngularVelocity"),
+      (self.android_camm.acceleration(), "Acceleration"),
+      (self.android_camm.position(), "Position"),
+      (self.android_camm.magnetic_field(), "MagneticField"),
+    ] {
+      emit_camm_motion(
+        samples,
+        crate::metadata::CammVector3::doc,
+        crate::metadata::CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        print_conv,
+        |v, group, scratch| {
+          scratch.push(EmittedTag::new(
+            group.clone(),
+            name.into(),
+            camm_vec3_value(v),
+            false,
+          ));
+        },
+        opts,
+        &mut tags,
+      );
+    }
+    emit_camm_motion(
+      self.android_camm.exposure(),
+      crate::metadata::CammExposure::doc,
+      crate::metadata::CammExposure::track_index,
+      |e| (e.sample_time(), e.sample_duration()),
+      print_conv,
+      |e, group, scratch| {
+        // camm1: PixelExposureTime THEN RollingShutterSkewTime (the table's
+        // offset order, 4 before 8 — QuickTimeStream.pl:429/435), both with the
+        // `%.4g ms` PrintConv at `-j`.
+        scratch.push(EmittedTag::new(
+          group.clone(),
+          "PixelExposureTime".into(),
+          camm_exposure_ms_value(e.pixel_exposure_time_s(), print_conv),
+          false,
+        ));
+        scratch.push(EmittedTag::new(
+          group.clone(),
+          "RollingShutterSkewTime".into(),
+          camm_exposure_ms_value(e.rolling_shutter_skew_time_s(), print_conv),
+          false,
+        ));
+      },
+      opts,
+      &mut tags,
+    );
+
+    // ── SP4: Android CAMM TIMING-ONLY samples (recognized-empty) ───────────
+    // A recognized first-packet camm sample (its first packet matched a
+    // `camm0..camm7` Condition) that `ProcessCAMM` decoded to NO stored record —
+    // no GPS / motion / exposure fix AND no `Unknown`/`Truncated` warning (e.g. a
+    // 4-byte-only header sample). ExifTool's `FoundSomething` still emitted its
+    // `SampleTime`/`SampleDuration` under the sample's `Doc<N>`
+    // (QuickTimeStream.pl:1523; oracle `QuickTime_camm_emptypayload.mov`). At `-G3`
+    // emit that timing on the marker's own `Doc<N>`/`Track<N>`; at `-G1` the timing
+    // is owned by the cross-kind min-`doc()` precompute above (these markers are
+    // among its candidates), so nothing is emitted here.
+    emit_camm_timing_only(self.android_camm.timing_only(), opts, print_conv, &mut tags);
 
     // ── SP2: moov/meta HandlerClass + HandlerType (QuickTime.pm:8391-8444) ─
     // The `moov/meta` `hdlr` uses the SAME `%QuickTime::Handler` table as the
@@ -5157,29 +5403,139 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
   use crate::emit::EmittedTag;
   use crate::serialize_key::GroupMode;
   use crate::value::{Group, TagValue};
-  if !opts.extract_embedded {
+  // Per-sample no-`ee` gate (Task 10b): a sample emits when `-ee` is on OR its
+  // box-of-origin is one ExifTool processes WITHOUT `-ee` (the top-level
+  // `gps0`/`gsen`/`3gf` magic boxes — `emits_without_ee`). Every other source
+  // (GoPro / camm / moov-`gps `-box / Kenwood / freeGPS-scan) stays fully `-ee`
+  // gated. When NOTHING qualifies (the common no-`ee` case with no top-level
+  // magic box), bail before paying the dedup bookkeeping — the doc-0 hot path is
+  // unchanged.
+  let any = opts.extract_embedded || samples.iter().any(|s| s.emits_without_ee());
+  if !any {
     return;
   }
-  let g3 = matches!(opts.group_mode, GroupMode::G3);
-  // `-G1` collapses every `Doc<N>` to one `(family1, name)` row, FIRST-wins
-  // (the TagMap sink is last-wins, so the dedup must happen HERE before the
-  // value reaches it). `scratch` buffers one sample's emissions so the
-  // `emit_extra` columns participate in the same name-collapse as the common
-  // ones; `seen` records the `(family1, name)` pairs already emitted. Both are
-  // paid only under `-ee` (this fn returns early otherwise), so the doc-0 hot
-  // path stays untouched.
+  // Without `-ee` ExifTool opens NO `Doc<N>` sub-document (`++DOC_COUNT` is the
+  // `FoundSomething`/ExtractEmbedded path) and TRUNCATES a top-level magic box
+  // to its FIRST record, so the qualifying fix surfaces FLAT (`QuickTime:…`).
+  // Force the `Doc<N>` axis off + the first-wins `(family1, name)` collapse on
+  // at no-`ee` (regardless of the requested `-G3`), so only the first
+  // emits-without-`ee` fix's columns survive. With `-ee` on, the requested
+  // group mode drives the doc axis exactly as before.
+  let g3 = opts.extract_embedded && matches!(opts.group_mode, GroupMode::G3);
+  // `-G1` collapses every `Doc<N>` to one `(family1, name)` row with ExifTool's
+  // TWO precedence rules (the same the `mebx` collapse uses, mirrored here so
+  // both timed paths agree):
+  //   * WITHIN one document (one camm SAMPLE — its packets share a `doc()`):
+  //     LAST-wins, because each packet `HandleTag`s into the same `(DOC_NUM, tag)`
+  //     VALUE slot and a later packet OVERWRITES the earlier (ExifTool.pm:9564-
+  //     9604). A camm sample with two camm5 GPS packets thus keeps the SECOND
+  //     fix's lat/lon/alt at `-ee -G1`.
+  //   * ACROSS documents: FIRST-document-wins (the first-fix-wins the GPS sources
+  //     show at `-ee -G1`: gps0/gsen keep the Doc1 fix, not Doc2 —
+  //     QuickTimeStream.pl:967-973).
+  // So accumulate one document's tags with within-doc last-wins (`doc_vals`), and
+  // on the doc boundary FLUSH them honoring across-doc first-wins (`committed`).
+  // At `-G3` neither buffer is used — the records emit verbatim and the
+  // within-doc last-wins collapse happens in the flat `TagMap` sink (a later
+  // same-key `Doc<N>:` row overwrites). The grouping key is `(family1, name)`,
+  // NOT bare `name`: two `camm` `trak`s emitting the SAME key under DISTINCT
+  // `Track<N>` groups are separate rows that BOTH survive (group-aware `%noDups`).
   let mut doc: u32 = 0;
   let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
-  let mut seen: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
-  for s in samples.iter().filter(|s| s.has_coordinates()) {
+  // ((family1, name), EmittedTag) for the document currently being accumulated,
+  // plus its doc number; `committed` records the `(family1, name)` pairs an
+  // EARLIER document already flushed (across-doc first-wins).
+  let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+    std::vec::Vec::new();
+  let mut committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
+  let mut cur_doc: Option<u32> = None;
+  // Flush one accumulated document's last-wins values into `out`, dropping a
+  // `(family1, name)` already committed by an EARLIER document (across-doc
+  // first-wins). Emits in first-seen order within the document.
+  let flush_doc =
+    |doc_vals: &mut std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)>,
+     committed: &mut std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
+     out: &mut std::vec::Vec<EmittedTag>| {
+      for (key, tag) in doc_vals.drain(..) {
+        if committed.contains(&key) {
+          continue;
+        }
+        committed.push(key);
+        out.push(tag);
+      }
+    };
+  // At no-`ee` only the emits-without-`ee` origins (gps0/gsen/3gf) contribute;
+  // with `-ee` every emittable sample does. The gate is `has_emittable_data`
+  // (NOT `has_coordinates`): ExifTool opens a `Doc<N>` + `HandleTag`s for every
+  // record that yields any `%QuickTime::Stream` tag, which includes the
+  // accelerometer/timecode-only `gsen`/`3gf` records (`Process_gsen`/
+  // `Process_3gf`). For the GPS sources `has_emittable_data == has_coordinates`,
+  // so their Doc numbering + output are unchanged.
+  //
+  // At no-`ee`, a magic-box (`gps0`/`gsen`/`3gf`) origin is additionally
+  // PHYSICAL-RECORD-0-only: `Process_*` truncates `$dirLen = $recLen` BEFORE the
+  // loop (QuickTimeStream.pl:2738), so ONLY physical record 0 is inspected. A
+  // valid fix decoded from a LATER physical record (e.g. record 1, when record 0
+  // was an out-of-range `next`-skip) must NOT surface — the truncation stops at
+  // record 0. The `magic_box_record_index` carried from the decoder (stamped per
+  // PHYSICAL record, including skipped ones) is the faithful test. With `-ee` on
+  // every emittable record surfaces (no truncation).
+  for s in samples.iter().filter(|s| {
+    s.has_emittable_data()
+      && (opts.extract_embedded || (s.emits_without_ee() && s.magic_box_record_index() == Some(0)))
+  }) {
     doc += 1;
     let base = group_for(s);
+    // `Doc<N>` number (QuickTimeStream.pl `$$et{DOC_NUM} = ++$$et{DOC_COUNT}`):
+    // EVERY production sample reaching this emitter now carries the GLOBAL
+    // ordinal stamped at extraction off the SHARED `QuickTimeStreamMeta` doc
+    // counter — the `gps0`/`gsen`/`3gf` magic boxes (per PHYSICAL record, incl.
+    // a `next`-skipped one), the Kenwood `GPS ` box, the `moov`-`gps `-box +
+    // brute-force freeGPS scan, AND camm (one doc per camm sample, in
+    // `CammMeta`). `s.doc()` is therefore used VERBATIM, so the doc axis is
+    // GLOBAL across the file's sources in walk order (no per-source restart) and
+    // supersedes both the running `doc` and the legacy `magic_box_record_index
+    // + 1`. The `unwrap_or_else` is now ONLY a defensive fallback for UNSTAMPED
+    // unit-built samples (the in-crate emitter tests): a magic-box origin falls
+    // back to `magic_box_record_index + 1` (the original per-box formula), any
+    // other to the running per-call `doc`. Computed for BOTH modes: `-G3` puts it
+    // in the group; `-G1` groups the within-doc-last-wins buffer by it (so two
+    // packets that share one camm sample's doc collapse last-wins).
+    let doc_n = s.doc().unwrap_or_else(|| {
+      s.magic_box_record_index()
+        .map_or(doc, |idx| idx.saturating_add(1))
+    });
     let group = if g3 {
-      Group::with_doc(base.family0(), base.family1(), doc)
+      Group::with_doc(base.family0(), base.family1(), doc_n)
     } else {
       base
     };
     scratch.clear();
+    // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
+    // `-n`) — the sample-table timing ExifTool's `ProcessSamples` emits AHEAD of
+    // the decoded GPS payload. ONLY the SAMPLE-TABLE TRACK sources carry it
+    // (`sample_timing()` is `Some` only for camm; gps0/gsen/3gf/Kenwood/moov-`gps `
+    // /freeGPS keep the trait default `None`, so NO SampleTime leaks onto the
+    // stream-GPS / magic-box emission — their goldens have none). Emitted before
+    // lat/lon, matching the camm goldens (SampleTime, SampleDuration, then the GPS
+    // columns) and the `mebx` path. EMITTED ONLY at `-G3` (each `Doc<N>` keeps its
+    // own sample's timing): the single `-G1` `Track<N>:SampleTime` is the
+    // cross-kind MINIMUM-`doc()` sample's, precomputed by [`camm_min_doc_timing`]
+    // at the camm call site and emitted there through the shared first-wins gate
+    // (so it wins over this GPS sample's whenever a smaller-`doc()` sample of any
+    // kind exists). Non-camm sources have `sample_timing() == None` regardless.
+    if g3 && let Some((st, sd)) = s.sample_timing() {
+      for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
+        if let Some(secs) = val {
+          let value = if print_conv {
+            TagValue::Str(crate::datetime::convert_duration(secs).into())
+          } else {
+            TagValue::F64(secs)
+          };
+          scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+        }
+      }
+    }
     if let (Some(lat), Some(lon)) = (s.latitude(), s.longitude()) {
       // `GPS::ToDMS($val, 1, "N"/"E")` at `-j` (with the hemisphere suffix);
       // the raw decimal-degree `F64` at `-n`.
@@ -5250,19 +5606,455 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
     if g3 {
       out.append(&mut scratch);
     } else {
-      // `-G1`: collapse to one row per `(family1, name)`, keeping the FIRST.
+      // A new document — flush the previous one (across-doc first-wins) before
+      // accumulating this sample's packets. Consecutive samples that share a
+      // `doc_n` (two camm5 packets in one camm sample) accumulate into the SAME
+      // document buffer, so a later packet's value overwrites the earlier
+      // (within-doc last-wins).
+      if cur_doc != Some(doc_n) {
+        flush_doc(&mut doc_vals, &mut committed, out);
+        cur_doc = Some(doc_n);
+      }
       for tag in scratch.drain(..) {
         let key = (
           smol_str::SmolStr::new(tag.tag().group_ref().family1()),
           smol_str::SmolStr::new(tag.tag().name()),
         );
-        if seen.contains(&key) {
-          continue;
+        if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+          slot.1 = tag;
+        } else {
+          doc_vals.push((key, tag));
         }
-        seen.push(key);
-        out.push(tag);
       }
     }
+  }
+  // Flush the final accumulated document (no-op at `-G3` / when empty).
+  flush_doc(&mut doc_vals, &mut committed, out);
+}
+
+/// Emit, at `-ee -G1`, ONE `Track<N>:SampleTime` + `Track<N>:SampleDuration` per
+/// camm track from that track's MINIMUM-`doc()` (first) camm SAMPLE, across ALL
+/// camm record kinds (GPS, motion vectors camm2/3/4/7, camm1 exposure, AND
+/// `ProcessCAMM` warnings).
+///
+/// ExifTool processes camm samples SEQUENTIALLY: `ProcessSamples` runs
+/// `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`) and emits this sample's
+/// `SampleTime`/`SampleDuration` BEFORE dispatching `ProcessCAMM` for that sample
+/// (QuickTimeStream.pl:1518-1523), which then `HandleTag`s the sample's packets.
+/// JSON `%noDups` is FIRST-wins by walk order (exiftool:2952-2953), so the single
+/// `-ee -G1` `Track<N>:SampleTime` is the FIRST (minimum-`doc()`) camm sample's —
+/// regardless of which packet KIND that sample carried (a GPS, a motion vector, an
+/// exposure pair, or just a `ProcessCAMM` warning).
+///
+/// exifast's per-kind emitters (`emit_camm_warnings`, then the camm GPS
+/// `emit_timed_samples`, then the per-type `emit_camm_motion`s) drain records in
+/// EMITTER-KIND order, NOT sample order, so a per-kind first-wins timing gate
+/// would record whichever KIND emits first — wrong when a later-emitted kind owns
+/// the earlier (smaller-`doc()`) sample. This precompute is correct-by-
+/// construction: it scans every kind, keeps the smallest `doc()` per
+/// `track_index`, and (routed through the shared `first_seen` gate by the caller)
+/// emits ONLY that sample's timing at `-G1` — so the per-kind emitters' own
+/// `-G1` timing is gated out and the min-`doc()` sample's wins. At `-G3` this is
+/// NOT used: each `Doc<N>` carries its own sample's timing.
+///
+/// Returns `(track_index, sample_time, sample_duration)` per track in ascending
+/// `track_index` order (deterministic emission). The `doc()` ordinal is GLOBAL
+/// and monotonic in walk order (`CammMeta` stamps it once per camm sample off the
+/// shared `QuickTimeStreamMeta` doc counter), so "smallest `doc()`" is exactly
+/// "first sample" for the track.
+#[cfg(feature = "alloc")]
+fn camm_min_doc_timing(
+  camm: &crate::metadata::CammMeta,
+) -> std::vec::Vec<(u32, Option<f64>, Option<f64>)> {
+  // (track_index, min_doc, sample_time, sample_duration) — linear-scanned, as the
+  // camm emitters do (one entry per camm track; realistic files carry 1-2 tracks).
+  let mut per_track: std::vec::Vec<(u32, u32, Option<f64>, Option<f64>)> = std::vec::Vec::new();
+  let mut consider = |track: Option<u32>, doc: Option<u32>, st: Option<f64>, sd: Option<f64>| {
+    // A sample with no stamped `doc()` cannot be ordered against the others, so it
+    // cannot establish the per-track minimum — skip it (production camm samples are
+    // always stamped; this guards only unit-built records). `track` defaults to
+    // `Track1`, matching every camm emitter's `track_index().unwrap_or(1)`.
+    let Some(doc) = doc else { return };
+    let track = track.unwrap_or(1);
+    if let Some(slot) = per_track.iter_mut().find(|(t, ..)| *t == track) {
+      if doc < slot.1 {
+        *slot = (track, doc, st, sd);
+      }
+    } else {
+      per_track.push((track, doc, st, sd));
+    }
+  };
+  for s in camm.gps_samples() {
+    consider(
+      s.track_index(),
+      s.doc(),
+      s.sample_time(),
+      s.sample_duration(),
+    );
+  }
+  for samples in [
+    camm.angular_velocity(),
+    camm.acceleration(),
+    camm.position(),
+    camm.magnetic_field(),
+  ] {
+    for v in samples {
+      consider(
+        v.track_index(),
+        v.doc(),
+        v.sample_time(),
+        v.sample_duration(),
+      );
+    }
+  }
+  for e in camm.exposure() {
+    consider(
+      e.track_index(),
+      e.doc(),
+      e.sample_time(),
+      e.sample_duration(),
+    );
+  }
+  for w in camm.warnings() {
+    consider(
+      w.track_index(),
+      w.doc(),
+      w.sample_time(),
+      w.sample_duration(),
+    );
+  }
+  // TIMING-ONLY markers (recognized-empty samples) carry their own min-doc
+  // candidate timing — ExifTool's `FoundSomething` emitted their
+  // SampleTime/SampleDuration too (QuickTimeStream.pl:1523), so a track whose
+  // FIRST (smallest-`doc()`) sample is a recognized-empty one owns the `-G1`
+  // `Track<N>:SampleTime` (oracle `QuickTime_camm_emptypayload.mov`).
+  for m in camm.timing_only() {
+    consider(
+      m.track_index(),
+      m.doc(),
+      m.sample_time(),
+      m.sample_duration(),
+    );
+  }
+  per_track.sort_by_key(|(t, ..)| *t);
+  per_track
+    .into_iter()
+    .map(|(t, _doc, st, sd)| (t, st, sd))
+    .collect()
+}
+
+/// Emit the `ProcessCAMM` per-packet warnings (`Unknown camm record type N` /
+/// `Truncated camm record N`, QuickTimeStream.pl:3495-3496) as `Track<N>:Warning`
+/// tags. Both are plain `$et->Warn(msg)` (NO `ignorable` arg) ⇒ NO `[minor]`
+/// prefix, and `ProcessCAMM` runs only under `ExtractEmbedded`, so they surface
+/// ONLY at `-ee`. WAS_WARNED dedups identical strings file-wide (a warning string
+/// is recorded once, `ExifTool.pm` `sub Warn`), so an identical message repeated
+/// across camm samples emits a single `Warning`. At `-ee -G3` the warning carries
+/// its camm sample's stamped `Doc<N>`; at `-ee -G1` it collapses to one
+/// `Track<N>:Warning` via the shared priority-0 first-wins `first_seen` gate (a
+/// truncation warning thus takes precedence over the no-`ee` EEWarn — which does
+/// not fire at `-ee` anyway). `first_seen` keys on `(family1, name)`, matching the
+/// `TagMap` sink's priority-0 first-wins for the `Warning` pseudo-tag.
+#[cfg(feature = "alloc")]
+fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
+  warnings: &[crate::metadata::CammWarning],
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  // `ProcessCAMM` runs only under `ExtractEmbedded` → these surface only at `-ee`.
+  if !opts.extract_embedded {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+  // WAS_WARNED (`ExifTool.pm:5632-5639`): a warning string is recorded once
+  // file-wide; a repeat only bumps an occurrence COUNT. The surviving (first-
+  // emitted) `Warning` tag then gains a ` [x$n]` suffix when `n > 1`
+  // (`ExifTool.pm:3196-3203`) — that end-of-extraction pass rewrites the
+  // `Warning` value in the flat `$$self{VALUE}` hash keyed on the message string,
+  // so it applies to a group-scoped `Track<N>:Warning` too (oracle: TWO
+  // duplicate-message camm warning samples → ONE `Warning "… [x2]"`). Precompute
+  // the per-message count over ALL camm warnings so the suffix reflects the final
+  // total even though only the FIRST occurrence emits a tag.
+  let count_of = |msg: &str| -> usize { warnings.iter().filter(|w| w.message() == msg).count() };
+  // Build the WAS_WARNED-suffixed value: ` [x$n]` when the message recurs.
+  let warning_value = |msg: &str| -> TagValue {
+    let n = count_of(msg);
+    let text = if n > 1 {
+      smol_str::SmolStr::from(std::format!("{msg} [x{n}]"))
+    } else {
+      smol_str::SmolStr::from(msg)
+    };
+    TagValue::Str(text)
+  };
+  // Message strings whose surviving `Warning` tag has already been emitted (the
+  // WAS_WARNED first-occurrence gate, keyed on the message string — a SECOND
+  // sample with the same message emits NO further `Warning`, only its own timing).
+  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // The sample-table `SampleTime`/`SampleDuration` (`ConvertDuration` at `-j`, raw
+  // seconds at `-n`) ExifTool's `ProcessSamples` emits AHEAD of a warning under the
+  // raising sample's `Doc<N>` — `FoundSomething` runs PER SAMPLE before the
+  // `ProcessCAMM` dispatch (QuickTimeStream.pl:1518-1523), so EVERY warning
+  // sample's timing exists even when its later `Warn` is WAS_WARNED-deduped (oracle
+  // `QuickTime_camm_dup_warn.mov`: `Doc2:Track1:SampleTime`/`SampleDuration` with NO
+  // `Doc2:…Warning`). EMITTED ONLY at `-G3` (each `Doc<N>` keeps its own warning
+  // sample's timing) — and ALWAYS, BEFORE the message-dedup. At `-G1` the single
+  // `Track<N>:SampleTime` is the cross-kind MINIMUM-`doc()` sample's, precomputed by
+  // [`camm_min_doc_timing`] at the camm call site (this emitter runs AFTER that
+  // block, so the warning sample's timing — when it is NOT the minimum — is
+  // correctly gated out, and when it IS the minimum the precompute already emitted
+  // it). This emitter therefore never touches `-G1` timing; it only emits the
+  // `Track<N>:Warning` payload (priority-0 first-wins via `first_seen`).
+  fn push_timing_g3(
+    w: &crate::metadata::CammWarning,
+    group: &Group,
+    print_conv: bool,
+    tags: &mut std::vec::Vec<EmittedTag>,
+  ) {
+    for (val, name) in [
+      (w.sample_time(), "SampleTime"),
+      (w.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+  }
+  for w in warnings {
+    let family1 = std::format!("Track{}", w.track_index().unwrap_or(1));
+    if g3 {
+      // `-G3`: the warning carries its camm sample's `Doc<N>`; the `TagMap` sink
+      // keeps distinct `(doc, family1, name)` rows.
+      let group = Group::with_doc("QuickTime", family1.as_str(), w.doc().unwrap_or(0));
+      // EVERY warning sample emits its OWN `Doc<N>` timing — BEFORE the WAS_WARNED
+      // message-dedup, so a duplicate-message second sample keeps its
+      // `Doc<N>:SampleTime`/`SampleDuration` even when its `Warning` text is deduped.
+      push_timing_g3(w, &group, print_conv, tags);
+      let msg = smol_str::SmolStr::from(w.message());
+      if !warned_msgs.contains(&msg) {
+        warned_msgs.push(msg);
+        tags.push(EmittedTag::new(
+          group,
+          "Warning".into(),
+          warning_value(w.message()),
+          false,
+        ));
+      }
+    } else if first_seen(family1.as_str(), "Warning") {
+      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
+      // Timing is owned by the cross-kind min-`doc()` precompute (above).
+      tags.push(EmittedTag::new(
+        Group::new("QuickTime", family1.as_str()),
+        "Warning".into(),
+        warning_value(w.message()),
+        false,
+      ));
+    }
+  }
+}
+
+/// Emit the per-sample `SampleTime`/`SampleDuration` for camm TIMING-ONLY markers
+/// — recognized first-packet samples (their first packet matched a
+/// `camm0..camm7` Condition) that `ProcessCAMM` decoded to NO stored record (no
+/// GPS / motion / exposure fix AND no `Unknown`/`Truncated` warning, e.g. a
+/// 4-byte-only header sample). ExifTool's `FoundSomething` still emitted their
+/// timing under the sample's `Doc<N>` (QuickTimeStream.pl:1523; oracle
+/// `QuickTime_camm_emptypayload.mov` → `Doc1:Track1:SampleTime`/`SampleDuration`,
+/// no payload). `-ee`-gated like every other camm emitter (camm is a handler
+/// `trak`). EMITTED ONLY at `-G3`: each marker writes its own
+/// `Doc<N>:Track<N>:SampleTime`/`SampleDuration`. At `-G1` the single
+/// `Track<N>:SampleTime` is the cross-kind MINIMUM-`doc()` sample's, owned by the
+/// [`camm_min_doc_timing`] precompute at the call site (these markers are among
+/// its candidates), so this emitter pushes nothing at `-G1`.
+#[cfg(feature = "alloc")]
+fn emit_camm_timing_only(
+  markers: &[crate::metadata::CammTimingOnly],
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  // `-ee`-only (a camm `trak` source); and the timing emits ONLY at `-G3` (at
+  // `-G1` the min-doc precompute owns it).
+  if !opts.extract_embedded || !matches!(opts.group_mode, GroupMode::G3) || markers.is_empty() {
+    return;
+  }
+  for m in markers {
+    let track = std::format!("Track{}", m.track_index().unwrap_or(1));
+    let group = Group::with_doc("QuickTime", track.as_str(), m.doc().unwrap_or(0));
+    for (val, name) in [
+      (m.sample_time(), "SampleTime"),
+      (m.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+  }
+}
+
+/// Emit one camm MOTION sample-vector (camm1-4/7) under the shared `-ee` `Doc<N>`
+/// / `Track<N>` axis — the motion counterpart of [`emit_timed_samples`] for the
+/// records `ProcessCAMM` `HandleTag`s that are NOT GPS fixes (camm1
+/// PixelExposureTime/RollingShutterSkewTime, camm2 AngularVelocity, camm3
+/// Acceleration, camm4 Position, camm7 MagneticField — QuickTimeStream.pl:428-
+/// 569). Fully `-ee`-gated (camm is a handler `trak`; no no-`ee` magic-box path),
+/// so at no-`ee` NOTHING here surfaces (only the `Track<N>:Warning` raised
+/// elsewhere). At `-ee -G3` each sample is its own `Doc<N>` (its stamped `doc()`)
+/// under its stamped `Track<N>`, carrying its own `SampleTime`/`SampleDuration`;
+/// at `-ee -G1` the motion PAYLOAD takes the SAME two-rule `%noDups` collapse
+/// [`emit_timed_samples`] uses — within one document (one camm sample, its packets
+/// share a `doc()`) LAST-wins, across documents FIRST-wins — while the single
+/// `Track<N>:SampleTime`/`SampleDuration` is owned by the cross-kind min-`doc()`
+/// [`camm_min_doc_timing`] precompute (so this emitter pushes timing only at
+/// `-G3`). `push` renders the format-specific tag(s) for one sample into the
+/// scratch buffer (the vec3 space-join, or the camm1 exposure PrintConv).
+#[cfg(feature = "alloc")]
+fn emit_camm_motion<T>(
+  samples: &[T],
+  doc_of: impl Fn(&T) -> Option<u32>,
+  track_of: impl Fn(&T) -> Option<u32>,
+  timing_of: impl Fn(&T) -> (Option<f64>, Option<f64>),
+  print_conv: bool,
+  push: impl Fn(&T, &crate::value::Group, &mut std::vec::Vec<crate::emit::EmittedTag>),
+  opts: crate::emit::EmitOptions,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  // Motion is `-ee`-only (a camm `trak` source). The no-`ee` path emits no
+  // per-sample record; bail before any bookkeeping.
+  if !opts.extract_embedded || samples.is_empty() {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+  // Two-rule `-G1` collapse state (unused at `-G3`), mirroring `emit_timed_samples`.
+  let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+    std::vec::Vec::new();
+  let mut committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
+  let mut cur_doc: Option<u32> = None;
+  let mut running: u32 = 0;
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  let flush_doc =
+    |doc_vals: &mut std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)>,
+     committed: &mut std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
+     out: &mut std::vec::Vec<EmittedTag>| {
+      for (key, tag) in doc_vals.drain(..) {
+        if committed.contains(&key) {
+          continue;
+        }
+        committed.push(key);
+        out.push(tag);
+      }
+    };
+  for s in samples {
+    running += 1;
+    // The stamped GLOBAL `Doc<N>` (verbatim, as `emit_timed_samples` does); the
+    // `running` per-call ordinal is the fallback for an UNSTAMPED unit-built
+    // sample only. `Track<N>` defaults to `Track1`.
+    let doc_n = doc_of(s).unwrap_or(running);
+    let track = std::format!("Track{}", track_of(s).unwrap_or(1));
+    let group = if g3 {
+      Group::with_doc("QuickTime", track.as_str(), doc_n)
+    } else {
+      Group::new("QuickTime", track.as_str())
+    };
+    scratch.clear();
+    // SampleTime / SampleDuration ahead of this sample's motion payload — the
+    // sample-table timing ExifTool emits per camm SAMPLE (`ConvertDuration` at
+    // `-j`, raw seconds at `-n`), under the same `Doc<N>`/`Track<N>`. EMITTED ONLY
+    // at `-G3` (each `Doc<N>` carries its own sample's timing). At `-G1` the single
+    // `Track<N>:SampleTime` is the cross-kind MINIMUM-`doc()` sample's, precomputed
+    // by [`camm_min_doc_timing`] at the camm call site (which runs BEFORE the five
+    // per-type `emit_camm_motion` calls and the camm GPS path), so a motion
+    // sample's timing is correctly used iff it is that track's first sample — and
+    // emitted by the precompute, not here. The motion PAYLOAD still rides the
+    // within-call two-rule `%noDups` collapse below (its tag names are per-type-
+    // unique, so no cross-call gate is needed for it).
+    if g3 {
+      let (st, sd) = timing_of(s);
+      for (val, name) in [(st, "SampleTime"), (sd, "SampleDuration")] {
+        if let Some(secs) = val {
+          let value = if print_conv {
+            TagValue::Str(crate::datetime::convert_duration(secs).into())
+          } else {
+            TagValue::F64(secs)
+          };
+          scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+        }
+      }
+    }
+    push(s, &group, &mut scratch);
+    if g3 {
+      out.append(&mut scratch);
+    } else {
+      if cur_doc != Some(doc_n) {
+        flush_doc(&mut doc_vals, &mut committed, out);
+        cur_doc = Some(doc_n);
+      }
+      for tag in scratch.drain(..) {
+        let key = (
+          smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+          smol_str::SmolStr::new(tag.tag().name()),
+        );
+        if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+          slot.1 = tag;
+        } else {
+          doc_vals.push((key, tag));
+        }
+      }
+    }
+  }
+  flush_doc(&mut doc_vals, &mut committed, out);
+}
+
+/// A camm `float[3]` value rendered as the three components space-joined via
+/// Perl's default `%.15g` stringification — ExifTool's `"@a"` interpolation of
+/// the `Format => 'float[3]'` array (QuickTimeStream.pl:448/460/472/568). Each
+/// `f32` is widened to `f64` and rendered by [`format_g`], matching the oracle
+/// (`AngularVelocity "0.100000001490116 -0.200000002980232 0.300000011920929"`).
+/// Mode-invariant — the vec3 tags carry NO PrintConv (`Notes`-only).
+#[cfg(feature = "alloc")]
+fn camm_vec3_value(v: &crate::metadata::CammVector3) -> crate::value::TagValue {
+  use crate::value::format_g;
+  let g = |x: f32| format_g(f64::from(x), 15);
+  let mut s = g(v.x());
+  s.push(' ');
+  s.push_str(&g(v.y()));
+  s.push(' ');
+  s.push_str(&g(v.z()));
+  crate::value::TagValue::Str(s.into())
+}
+
+/// A camm1 exposure / rolling-shutter time value. The typed layer already holds
+/// SECONDS (post-`ValueConv $val * 1e-9`). At `-j` the PrintConv
+/// `sprintf("%.4g ms", $val * 1000)` (QuickTimeStream.pl:432/438) renders e.g.
+/// `0.008 → "8 ms"`; at `-n` the raw `F64` seconds (`0.008`) is emitted.
+#[cfg(feature = "alloc")]
+fn camm_exposure_ms_value(seconds: f64, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::{TagValue, format_g};
+  if print_conv {
+    let mut s = format_g(seconds * 1000.0, 4);
+    s.push_str(" ms");
+    TagValue::Str(s.into())
+  } else {
+    TagValue::F64(seconds)
   }
 }
 
@@ -9131,6 +9923,239 @@ mod tests {
       assert!(out.is_empty(), "ee-disabled ⇒ no tags");
     }
 
+    /// Task 10b — at no-`ee` a `GpsSample` whose origin is a top-level magic box
+    /// (`Gps0`) emits ONLY physical record 0 FLAT (`doc == 0`, no `Doc<N>`), even
+    /// with `-G3` requested; the SECOND magic-box record (physical index 1) is
+    /// dropped (truncate-to-first), reproducing ExifTool's `$dirLen = $recLen`.
+    /// An `-ee`-only origin (`Kenwood`) in the same series contributes nothing at
+    /// no-`ee`.
+    #[test]
+    fn noee_emits_first_magic_box_fix_flat_only() {
+      use crate::metadata::{GpsOrigin, GpsSample};
+      let mk = |lat: f64, lon: f64, o: GpsOrigin, idx: Option<u32>| {
+        let mut s = GpsSample::new();
+        s.set_latitude(Some(lat))
+          .set_longitude(Some(lon))
+          .set_origin(Some(o))
+          .set_magic_box_record_index(idx);
+        s
+      };
+      // Two gps0 records (physical 0 + 1; no-ee → record 0 only, flat) + a
+      // Kenwood fix (-ee only, no physical index → dropped at no-ee).
+      let samples = [
+        mk(1.0, 2.0, GpsOrigin::Gps0, Some(0)),
+        mk(3.0, 4.0, GpsOrigin::Gps0, Some(1)),
+        mk(9.0, 9.0, GpsOrigin::Kenwood, None),
+      ];
+      let mut out = std::vec::Vec::new();
+      // `-G3` requested + no `-ee`: the emitter must still force the flat,
+      // first-wins form (ExifTool opens no `Doc<N>` without `-ee`).
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, false, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      let lats: std::vec::Vec<(u32, &TagValue)> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().value_ref()))
+        .collect();
+      // Exactly ONE GPSLatitude: physical record 0's fix, at the Main group (doc 0).
+      assert_eq!(lats, [(0, &TagValue::F64(1.0))]);
+    }
+
+    /// The PHYSICAL-record fix (the confirmed [high] finding): when magic-box
+    /// physical record 0 is OUT-OF-RANGE (skipped during decode → no sample with
+    /// `magic_box_record_index == 0`) and record 1 is valid (carries index 1):
+    ///   - no-`ee` emits NOTHING (record 0 was the only inspected record; the
+    ///     truncate-to-first stops there).
+    ///   - `-ee -G3` emits the valid record-1 fix at `Doc2` (record 0 consumed a
+    ///     doc number via `++DOC_COUNT`-before-skip → `index + 1 == 2`).
+    ///   - `-ee -G1` emits the valid record-1 fix collapsed FLAT (`doc == 0`).
+    /// Oracle-pinned by `QuickTime_gps0_oor0.mov` in the conformance suite; this
+    /// unit test exercises the emitter directly with the post-skip sample shape.
+    #[test]
+    fn noee_skips_when_physical_record0_out_of_range() {
+      use crate::metadata::{GpsOrigin, GpsSample};
+      // Only the VALID record survives decoding; it carries PHYSICAL index 1
+      // (record 0 was `next`-skipped but still bumped the index).
+      let mut rec1 = GpsSample::new();
+      rec1
+        .set_latitude(Some(33.752))
+        .set_longitude(Some(151.205_67))
+        .set_origin(Some(GpsOrigin::Gps0))
+        .set_magic_box_record_index(Some(1));
+      let samples = [rec1];
+
+      // no-`ee` (even with `-G3` requested) ⇒ NOTHING: no sample has physical
+      // index 0, so the truncate-to-first surfaces no fix.
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, false, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      assert!(
+        out.is_empty(),
+        "no-ee: out-of-range record 0 ⇒ no GPS (truncate-to-first stops at record 0)"
+      );
+
+      // `-ee -G3` ⇒ the valid record-1 fix at Doc2 (index 1 + 1).
+      let mut out_g3 = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out_g3,
+      );
+      let g3_lats: std::vec::Vec<(u32, &TagValue)> = out_g3
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().value_ref()))
+        .collect();
+      assert_eq!(
+        g3_lats,
+        [(2, &TagValue::F64(33.752))],
+        "-ee -G3: valid record-1 fix lands at Doc2 (record 0 consumed Doc1)"
+      );
+
+      // `-ee -G1` ⇒ the valid record-1 fix collapsed flat (doc 0).
+      let mut out_g1 = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::g1(ConvMode::ValueConv, true),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out_g1,
+      );
+      let g1_lats: std::vec::Vec<(u32, &TagValue)> = out_g1
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().value_ref()))
+        .collect();
+      assert_eq!(
+        g1_lats,
+        [(0, &TagValue::F64(33.752))],
+        "-ee -G1: valid record-1 fix collapses to the first-present row (doc 0)"
+      );
+    }
+
+    /// When a magic-box sample carries a STAMPED global `doc()` (the structural
+    /// fix — the decoder now stamps it off the meta-wide counter), the `-ee -G3`
+    /// emitter uses it VERBATIM, superseding the legacy `magic_box_record_index +
+    /// 1` formula. A deliberately MISMATCHED pair (`doc = 5`, physical index `0`)
+    /// pins the precedence: the stamped global ordinal wins, so a magic box that
+    /// follows earlier embedded docs in the same file numbers correctly.
+    #[test]
+    fn stamped_global_doc_supersedes_record_index_at_g3() {
+      use crate::metadata::{GpsOrigin, GpsSample};
+      let mut s = GpsSample::new();
+      s.set_latitude(Some(1.0))
+        .set_longitude(Some(2.0))
+        .set_origin(Some(GpsOrigin::Gps0))
+        .set_magic_box_record_index(Some(0)) // legacy formula would say Doc1
+        .set_doc(Some(5)); // global ordinal: this record is the 5th doc in-file
+      let samples = [s];
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      let g3_docs: std::vec::Vec<u32> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| t.tag().group_ref().doc())
+        .collect();
+      assert_eq!(
+        g3_docs,
+        [5],
+        "the stamped global doc (5) wins over magic_box_record_index + 1 (1)"
+      );
+    }
+
+    /// At no-`ee`, a series of ONLY `-ee`-only origins (`MoovGpsBox`) emits
+    /// NOTHING — the early-`any` bail keeps the gate closed.
+    #[test]
+    fn noee_emits_nothing_for_ee_only_origins() {
+      use crate::metadata::{GpsOrigin, GpsSample};
+      let mut s = GpsSample::new();
+      s.set_latitude(Some(1.0))
+        .set_longitude(Some(2.0))
+        .set_origin(Some(GpsOrigin::MoovGpsBox));
+      let samples = [s];
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::g1(ConvMode::ValueConv, false),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      assert!(out.is_empty(), "-ee-only origins ⇒ no no-ee tags");
+    }
+
+    /// With `-ee` ON, ALL origins emit and the `Doc<N>` axis is honored —
+    /// proving the no-`ee` gate does not perturb the `-ee` path.
+    #[test]
+    fn ee_on_emits_all_origins_with_doc_axis() {
+      use crate::metadata::{GpsOrigin, GpsSample};
+      let mk = |lat: f64, lon: f64, o: GpsOrigin| {
+        let mut s = GpsSample::new();
+        s.set_latitude(Some(lat))
+          .set_longitude(Some(lon))
+          .set_origin(Some(o));
+        s
+      };
+      let samples = [
+        mk(1.0, 2.0, GpsOrigin::Gps0),
+        mk(3.0, 4.0, GpsOrigin::Kenwood),
+      ];
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      let lats: std::vec::Vec<(u32, &TagValue)> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().value_ref()))
+        .collect();
+      // Both fixes, each its own Doc<N> row (Doc1 gps0, Doc2 Kenwood).
+      assert_eq!(lats, [(1, &TagValue::F64(1.0)), (2, &TagValue::F64(3.0))]);
+    }
+
     /// `-G1` (the default) ⇒ the doc axis collapses to ONE row per
     /// `(family1, name)`, FIRST-wins: with two fixes, exactly one GPSLatitude
     /// carrying the FIRST fix, at the Main group (`doc == 0`). Rendered in
@@ -9299,7 +10324,8 @@ mod tests {
 
     /// A GpsSample series exercises the real `TimedSample` impl end-to-end: the
     /// common GPSAltitude / GPSTrack / GPSDateTime columns flow through the
-    /// emitter, and a no-coordinate (accelerometer-only) sample is skipped.
+    /// emitter, and a no-coordinate (accelerometer-only) sample still opens its
+    /// own `Doc<N>` (faithful to `Process_gsen`/`Process_3gf`).
     #[test]
     fn gps_sample_series_common_columns_g3() {
       use crate::metadata::GpsSample;
@@ -9331,14 +10357,15 @@ mod tests {
         |_s, _g, _o| {},
         &mut out,
       );
-      // Two coordinate fixes ⇒ Doc1 + Doc2; the accelerometer-only sample is
-      // skipped (no coordinates) and does not advance the doc counter.
+      // The accelerometer-only sample is EMITTABLE (`Process_gsen`/`Process_3gf`
+      // `++DOC_COUNT` + `HandleTag` it without coordinates), so it opens Doc2 and
+      // advances the counter — the two coordinate fixes land at Doc1 and Doc3.
       let lat_docs: std::vec::Vec<u32> = out
         .iter()
         .filter(|t| t.tag().name() == "GPSLatitude")
         .map(|t| t.tag().group_ref().doc())
         .collect();
-      assert_eq!(lat_docs, std::vec![1u32, 2u32]);
+      assert_eq!(lat_docs, std::vec![1u32, 3u32]);
       // Doc1 carries the common columns of the first fix.
       let doc1: std::vec::Vec<&EmittedTag> = out
         .iter()
@@ -9362,11 +10389,11 @@ mod tests {
         dt.tag().value_ref(),
         &TagValue::Str("2024:01:01 00:00:00Z".into())
       );
-      // The second fix (Doc2) carries no altitude/track/date_time.
+      // The second coordinate fix (Doc3) carries no altitude/track/date_time.
       assert!(
         !out
           .iter()
-          .any(|t| t.tag().group_ref().doc() == 2 && t.tag().name() == "GPSAltitude")
+          .any(|t| t.tag().group_ref().doc() == 3 && t.tag().name() == "GPSAltitude")
       );
     }
 
@@ -9452,6 +10479,244 @@ mod tests {
       assert_eq!(
         mm.tag().value_ref(),
         &TagValue::Str("3-Dimensional Measurement".into())
+      );
+    }
+
+    // ── camm MOTION value rendering + emission ───────────────────────────────
+
+    /// `camm_vec3_value` renders the three `f32` components space-joined via
+    /// `%.15g` of each widened to `f64` — byte-exact to the bundled oracle
+    /// `"@a"` interpolation (e.g. `AngularVelocity
+    /// "0.100000001490116 -0.200000002980232 0.300000011920929"`).
+    #[test]
+    fn camm_vec3_value_space_joins_with_perl_g() {
+      use crate::metadata::CammVector3;
+      let v = CammVector3::new(0.1, -0.2, 0.3);
+      assert_eq!(
+        camm_vec3_value(&v),
+        TagValue::Str("0.100000001490116 -0.200000002980232 0.300000011920929".into())
+      );
+      // Whole numbers print with no fraction (`Position "1 2 3"`).
+      let p = CammVector3::new(1.0, 2.0, 3.0);
+      assert_eq!(camm_vec3_value(&p), TagValue::Str("1 2 3".into()));
+    }
+
+    /// camm1 exposure: `-j` applies `sprintf("%.4g ms", $val*1000)`; `-n` emits
+    /// the raw `F64` seconds.
+    #[test]
+    fn camm_exposure_ms_value_print_vs_raw() {
+      // 0.008 s ⇒ "8 ms" at -j, 0.008 at -n.
+      assert_eq!(
+        camm_exposure_ms_value(0.008, true),
+        TagValue::Str("8 ms".into())
+      );
+      assert_eq!(camm_exposure_ms_value(0.008, false), TagValue::F64(0.008));
+      // 0.0015 s ⇒ "1.5 ms".
+      assert_eq!(
+        camm_exposure_ms_value(0.0015, true),
+        TagValue::Str("1.5 ms".into())
+      );
+    }
+
+    /// `emit_camm_motion` is fully `-ee`-gated: with `-ee` OFF nothing is
+    /// emitted (camm is a handler `trak` source — its motion records surface
+    /// only under `-ee`, like the GPS camm path).
+    #[test]
+    fn emit_camm_motion_no_ee_emits_nothing() {
+      use crate::metadata::CammVector3;
+      let mut v = CammVector3::new(1.0, 2.0, 3.0);
+      v.set_track_index(Some(1)).set_doc(Some(1));
+      let samples = [v];
+      let mut out = std::vec::Vec::new();
+      emit_camm_motion(
+        &samples,
+        CammVector3::doc,
+        CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        false,
+        |s, g, sc| {
+          sc.push(EmittedTag::new(
+            g.clone(),
+            "Acceleration".into(),
+            camm_vec3_value(s),
+            false,
+          ))
+        },
+        EmitOptions::with_group_mode(ConvMode::PrintConv, false, GroupMode::G3), // -ee OFF
+        &mut out,
+      );
+      assert!(out.is_empty(), "motion is -ee-only");
+    }
+
+    /// `-ee -G3`: each stamped sample is its own `Doc<N>` under its `Track<N>`,
+    /// the doc taken VERBATIM from the stamp (GLOBAL ordinal), so a Doc2 motion
+    /// record following a Doc1 fix keeps Doc2 (no per-source restart).
+    #[test]
+    fn emit_camm_motion_g3_uses_stamped_doc_and_track() {
+      use crate::metadata::CammVector3;
+      let mut a = CammVector3::new(1.0, 1.0, 1.0);
+      a.set_track_index(Some(1)).set_doc(Some(2));
+      let mut b = CammVector3::new(9.0, 9.0, 9.0);
+      b.set_track_index(Some(1)).set_doc(Some(5));
+      let samples = [a, b];
+      let mut out = std::vec::Vec::new();
+      emit_camm_motion(
+        &samples,
+        CammVector3::doc,
+        CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        false,
+        |s, g, sc| {
+          sc.push(EmittedTag::new(
+            g.clone(),
+            "Acceleration".into(),
+            camm_vec3_value(s),
+            false,
+          ))
+        },
+        EmitOptions::with_group_mode(ConvMode::PrintConv, true, GroupMode::G3),
+        &mut out,
+      );
+      let docs: std::vec::Vec<u32> = out.iter().map(|t| t.tag().group_ref().doc()).collect();
+      assert_eq!(docs, [2, 5], "stamped global docs used verbatim");
+      assert!(
+        out
+          .iter()
+          .all(|t| t.tag().group_ref().family1() == "Track1")
+      );
+    }
+
+    /// `-ee -G1` two-rule collapse for motion: TWO records sharing ONE doc keep
+    /// the LAST (within-doc last-wins); records in SEPARATE docs keep the FIRST
+    /// (across-doc first-wins). The same two-rule collapse the camm5 GPS path uses.
+    #[test]
+    fn emit_camm_motion_g1_within_doc_last_then_across_doc_first() {
+      use crate::metadata::CammVector3;
+      // Doc1 holds TWO Acceleration packets (1 1 1 then 2 2 2 → last wins);
+      // Doc2 holds one (3 3 3 → dropped, Doc1 already committed the name).
+      let mut p1 = CammVector3::new(1.0, 1.0, 1.0);
+      p1.set_track_index(Some(1)).set_doc(Some(1));
+      let mut p2 = CammVector3::new(2.0, 2.0, 2.0);
+      p2.set_track_index(Some(1)).set_doc(Some(1));
+      let mut p3 = CammVector3::new(3.0, 3.0, 3.0);
+      p3.set_track_index(Some(1)).set_doc(Some(2));
+      let samples = [p1, p2, p3];
+      let mut out = std::vec::Vec::new();
+      emit_camm_motion(
+        &samples,
+        CammVector3::doc,
+        CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        false,
+        |s, g, sc| {
+          sc.push(EmittedTag::new(
+            g.clone(),
+            "Acceleration".into(),
+            camm_vec3_value(s),
+            false,
+          ))
+        },
+        EmitOptions::g1(ConvMode::PrintConv, true),
+        &mut out,
+      );
+      let accel: std::vec::Vec<&EmittedTag> = out
+        .iter()
+        .filter(|t| t.tag().name() == "Acceleration")
+        .collect();
+      assert_eq!(accel.len(), 1, "one collapsed row");
+      assert_eq!(
+        accel
+          .first()
+          .expect("one Acceleration row")
+          .tag()
+          .value_ref(),
+        &TagValue::Str("2 2 2".into()),
+        "within Doc1 the SECOND packet wins; Doc2 dropped (across-doc first-wins)"
+      );
+    }
+
+    /// `-ee -G3`: the camm sample-table `SampleTime`/`SampleDuration` are emitted
+    /// AHEAD of the motion payload, under the sample's `Doc<N>`, via the
+    /// `ConvertDuration` PrintConv (`"0 s"` / `"1.00 s"` at `-j`). One per camm
+    /// sample (the timing the walker stamped); the raw seconds surface at `-n`.
+    #[test]
+    fn emit_camm_motion_g3_emits_sample_timing_via_convert_duration() {
+      use crate::metadata::CammVector3;
+      let mut a = CammVector3::new(1.0, 1.0, 1.0);
+      a.set_track_index(Some(1))
+        .set_doc(Some(1))
+        .set_sample_timing(Some(0.0), Some(1.0));
+      let samples = [a];
+      // -j: ConvertDuration applied.
+      let mut out = std::vec::Vec::new();
+      emit_camm_motion(
+        &samples,
+        CammVector3::doc,
+        CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        true,
+        |s, g, sc| {
+          sc.push(EmittedTag::new(
+            g.clone(),
+            "Acceleration".into(),
+            camm_vec3_value(s),
+            false,
+          ))
+        },
+        EmitOptions::with_group_mode(ConvMode::PrintConv, true, GroupMode::G3),
+        &mut out,
+      );
+      let rows: std::vec::Vec<(&str, &TagValue, u32)> = out
+        .iter()
+        .map(|t| {
+          (
+            t.tag().name(),
+            t.tag().value_ref(),
+            t.tag().group_ref().doc(),
+          )
+        })
+        .collect();
+      assert_eq!(
+        rows,
+        [
+          ("SampleTime", &TagValue::Str("0 s".into()), 1),
+          ("SampleDuration", &TagValue::Str("1.00 s".into()), 1),
+          ("Acceleration", &TagValue::Str("1 1 1".into()), 1),
+        ],
+        "timing (ConvertDuration) precedes the motion payload, under the sample's Doc"
+      );
+
+      // -n: raw seconds (F64), no ConvertDuration.
+      let mut raw = std::vec::Vec::new();
+      emit_camm_motion(
+        &samples,
+        CammVector3::doc,
+        CammVector3::track_index,
+        |v| (v.sample_time(), v.sample_duration()),
+        false,
+        |s, g, sc| {
+          sc.push(EmittedTag::new(
+            g.clone(),
+            "Acceleration".into(),
+            camm_vec3_value(s),
+            false,
+          ))
+        },
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        &mut raw,
+      );
+      let raw_timing: std::vec::Vec<(&str, &TagValue)> = raw
+        .iter()
+        .filter(|t| matches!(t.tag().name(), "SampleTime" | "SampleDuration"))
+        .map(|t| (t.tag().name(), t.tag().value_ref()))
+        .collect();
+      assert_eq!(
+        raw_timing,
+        [
+          ("SampleTime", &TagValue::F64(0.0)),
+          ("SampleDuration", &TagValue::F64(1.0)),
+        ],
+        "-n emits raw seconds, no ConvertDuration"
       );
     }
   }

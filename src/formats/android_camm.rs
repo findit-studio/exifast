@@ -73,11 +73,13 @@
 //! Android device's own GNSS.
 
 extern crate alloc;
-use alloc::string::String;
+use alloc::{format, string::String};
+
+use smol_str::SmolStr;
 
 use crate::{
-  datetime::{convert_datetime, convert_unix_time},
-  metadata::{CammExposure, CammGpsSample, CammMeta, CammVector3},
+  datetime::{convert_datetime, convert_unix_time_trim_frac_f64},
+  metadata::{CammExposure, CammGpsSample, CammMeta, CammVector3, CammWarning},
   value::perl_nonfinite_str,
 };
 
@@ -253,10 +255,14 @@ fn format_camm6_gps_datetime(raw: f64, create_date_unix_s: Option<f64>) -> Strin
     Some(cd) if cd - raw > FIVE_YEARS_S => raw + GPS_TO_UNIX_OFFSET_S,
     _ => raw,
   };
-  // `ConvertUnixTime($val, 0, -6)`. Truncate to integer seconds for the
-  // displayed string (bundled's `-6` flag opts out of fractional rendering
-  // on the integer-rounded path).
-  let mut s = convert_datetime(&convert_unix_time(shifted as i64));
+  // `ConvertUnixTime($val, 0, -6)` (QuickTimeStream.pl:522). The `-6` (NEGATIVE
+  // fractional-format flag) renders UP TO 6 fractional-second digits with
+  // trailing zeros stripped (a whole second → no fractional part), faithful to
+  // `ExifTool.pm:6790-6797`. Feed the FULL double (NOT a truncated `as i64`),
+  // so a real-device `…789` sub-second timestamp keeps its fraction. PrintConv
+  // is `$self->ConvertDateTime($val)` (:525) — identity under the default
+  // options, applied here for symmetry with the rest of the camm6 columns.
+  let mut s = convert_datetime(&convert_unix_time_trim_frac_f64(shifted, 6));
   s.push('Z');
   s
 }
@@ -274,13 +280,20 @@ fn format_camm6_gps_datetime(raw: f64, create_date_unix_s: Option<f64>) -> Strin
 ///  - Loop condition `while ($pos + 4 < $end)`
 ///    (QuickTimeStream.pl:3493) — strictly less, NOT `<=`. A trailing 4
 ///    bytes is NEVER processed.
-///  - `$size = $size{$type} or warn + last`
+///  - `$size = $size{$type} or $et->Warn("Unknown camm record type $type"), last`
 ///    (QuickTimeStream.pl:3495) — UNKNOWN packet type (including type 0,
-///    which is absent from the `%size` table) STOPS the whole walk for
-///    this sample. exifast mirrors this (no per-packet continue).
-///  - `$pos + $size > $end and warn + last`
-///    (QuickTimeStream.pl:3496) — a TRUNCATED packet also stops the walk.
+///    which is absent from the `%size` table) records the warning and STOPS
+///    the whole walk for this sample. exifast mirrors this: it pushes a
+///    [`CammWarning`] (NO `[minor]` prefix — a plain `$et->Warn`) then breaks.
+///  - `$pos + $size > $end and $et->Warn("Truncated camm record $type"), last`
+///    (QuickTimeStream.pl:3496) — a TRUNCATED packet records `"Truncated camm
+///    record $type"` then stops the walk (same warn-then-`last`).
 ///  - The packet `$size` INCLUDES the 4-byte header.
+///
+/// The recorded warnings carry NO `Track<N>` index yet; the stream walker
+/// stamps it after this call (mirroring the GPS / motion sample stamps). They
+/// surface as `Track<N>:Warning` ONLY under `-ee` (this whole walk runs only
+/// when `ExtractEmbedded` is requested).
 ///
 /// `create_date_unix_s` is the `mvhd` CreateDate as UNIX seconds (or
 /// `None`); routed onto camm6 GPS records only (QuickTimeStream.pl:519).
@@ -296,16 +309,27 @@ pub fn process_camm(data: &[u8], create_date_unix_s: Option<f64>, out: &mut Camm
     let Some(t) = le_u16(data, pos + 2) else {
       break;
     };
-    // QuickTimeStream.pl:3495 `$size{$type} or warn + last`.
+    // QuickTimeStream.pl:3495 `$size{$type} or $et->Warn("Unknown camm record
+    // type $type"), last`. An unknown type (incl. type 0) records the warning
+    // (NO `[minor]` prefix — a plain `$et->Warn` with no `ignorable` arg) then
+    // stops the walk.
     let Some(size) = camm_packet_size(t) else {
+      out.push_warning(CammWarning::new(SmolStr::from(format!(
+        "Unknown camm record type {t}"
+      ))));
       break;
     };
     let size = size as usize;
-    // QuickTimeStream.pl:3496 `$pos + $size > $end and warn + last`. The
-    // checked slice doubles as the bounds guard (avoids raw indexing under the
-    // `formats` file-level `#![deny(clippy::indexing_slicing)]`); a `None`
-    // means the packet overruns the sample ⇒ `last`.
+    // QuickTimeStream.pl:3496 `$pos + $size > $end and $et->Warn("Truncated
+    // camm record $type"), last`. The checked slice doubles as the bounds
+    // guard (avoids raw indexing under the `formats` file-level
+    // `#![deny(clippy::indexing_slicing)]`); a `None` means the packet
+    // overruns the sample ⇒ record `"Truncated camm record $type"` (again NO
+    // `[minor]` prefix) and `last`.
     let Some(packet) = pos.checked_add(size).and_then(|e| data.get(pos..e)) else {
+      out.push_warning(CammWarning::new(SmolStr::from(format!(
+        "Truncated camm record {t}"
+      ))));
       break;
     };
     // Dispatch by type — `ProcessBinaryData($dirInfo, $tagTbl)` in bundled
@@ -356,6 +380,39 @@ pub fn process_camm(data: &[u8], create_date_unix_s: Option<f64>, out: &mut Camm
   }
 }
 
+/// Whether a `camm` MetaFormat SAMPLE's FIRST packet matches a `camm0..camm7`
+/// SubDirectory `Condition` — i.e. whether ExifTool's `GetTagInfo` would return
+/// a tagInfo and so `FoundSomething` + `ProcessCAMM` would run for this sample.
+///
+/// Faithful port of the `camm => [{ Condition => '$$valPt =~ /^..\x0N\0/s' }, …]`
+/// dispatch (QuickTimeStream.pl:251-309), evaluated by `GetTagInfo`
+/// (ExifTool.pm:9155-9189) against the SAMPLE bytes (`$$valPt`):
+///
+///  - Each Condition `/^..\x0N\0/s` requires AT LEAST 4 bytes (two `.` wildcards
+///    + the type byte + a `\0`), so a sample shorter than 4 bytes matches NONE
+///    ⇒ no dispatch (a too-short sample emits nothing — no doc, no SampleTime).
+///  - Byte +2 is the int16u-LE packet TYPE low byte and byte +3 is its high
+///    byte; the Condition fixes byte +2 to `N` (0..7) AND byte +3 to `\0`. So
+///    the matching set is exactly TYPE in `0..=7` (high byte zero). A first
+///    packet whose type is >7 (e.g. 8 = byte +2 `\x08`, not listed; or 0x0108 =
+///    byte +3 `\x01`) matches no `camm<N>` Condition ⇒ no dispatch.
+///
+/// When this returns `true` the stream walker opens the sample's `Doc<N>`,
+/// emits `SampleTime`/`SampleDuration` (`FoundSomething`), and runs
+/// [`process_camm`]. When `false` it emits NOTHING for the sample (no doc, no
+/// timing, no warning, no `process_camm`). NOTE the gate is on the FIRST packet
+/// ONLY: a recognized first packet (0..7) followed by an unknown/truncated
+/// SUBSEQUENT packet STILL dispatches — `process_camm` then raises the
+/// `Unknown`/`Truncated` warning for that later packet (QuickTimeStream.pl:3495-
+/// 3496), faithful to ExifTool warning AFTER the dispatch.
+#[inline]
+#[must_use]
+pub fn camm_first_packet_dispatches(sample: &[u8]) -> bool {
+  // `Get16u($valPt, 2)` read at the same offset `ProcessCAMM` uses (+2); a
+  // `None` (sample < 4 bytes) means no `Condition` can match.
+  matches!(le_u16(sample, 2), Some(t) if t <= 7)
+}
+
 /// `%size` (QuickTimeStream.pl:3491) — HEADER-INCLUDED packet size per
 /// CAMM type. Returns `None` for types absent from the bundled hash
 /// (including type 0); the caller treats a `None` as "unknown — bail".
@@ -398,6 +455,7 @@ pub fn create_date_to_unix(raw_1904_s: u64) -> f64 {
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+  use crate::metadata::CammTimingOnly;
   use alloc::vec::Vec;
 
   /// Build a CAMM packet: `[reserved:2 (=0)][type:int16u-le][payload]`.
@@ -530,6 +588,45 @@ mod tests {
   }
 
   #[test]
+  fn camm6_gps_datetime_preserves_fractional_seconds() {
+    // F1: the camm6 GPSDateTime ValueConv `ConvertUnixTime($val, 0, -6) . 'Z'`
+    // (QuickTimeStream.pl:522) renders UP TO 6 fractional-second digits with
+    // trailing zeros stripped — it must NOT cast the double to an integer
+    // before formatting. Bundled ExifTool 13.59 (`exiftool -ee -j -G3:1` on a
+    // crafted camm6 fixture, TZ=UTC):
+    //   1704067200.789 => "2024:01:01 00:00:00.789Z"
+    //   1704067200.5   => "2024:01:01 00:00:00.5Z"    (NOT ".500000")
+    //   1704067200.0   => "2024:01:01 00:00:00Z"      (whole second, no frac)
+    let build = |dt: f64| -> Option<smol_str::SmolStr> {
+      let mut payload = Vec::new();
+      payload.extend_from_slice(&dt.to_le_bytes()); // GPSDateTime
+      payload.extend_from_slice(&3u32.to_le_bytes()); // measure mode
+      payload.extend_from_slice(&0.0f64.to_le_bytes()); // lat
+      payload.extend_from_slice(&0.0f64.to_le_bytes()); // lon
+      payload.extend_from_slice(&[0u8; 4 * 7]); // alt + 6 accuracy/velocity floats
+      let p = pkt(6, &payload);
+      let mut out = CammMeta::new();
+      // No CreateDate ⇒ the GPS-epoch heuristic does NOT shift; raw passes through.
+      process_camm(&p, None, &mut out);
+      out.gps_samples()[0]
+        .date_time()
+        .map(smol_str::SmolStr::from)
+    };
+    assert_eq!(
+      build(1_704_067_200.789).as_deref(),
+      Some("2024:01:01 00:00:00.789Z")
+    );
+    assert_eq!(
+      build(1_704_067_200.5).as_deref(),
+      Some("2024:01:01 00:00:00.5Z")
+    );
+    assert_eq!(
+      build(1_704_067_200.0).as_deref(),
+      Some("2024:01:01 00:00:00Z")
+    );
+  }
+
+  #[test]
   fn camm6_gps_epoch_heuristic_shifts_when_create_date_far_ahead() {
     // A GPS-epoch timestamp ≈ 1_388_534_400 ≈ Jan 1 2024 in GPS-epoch ⇒
     // bundled treats it as GPS-epoch if `create_date - raw > 5y`.
@@ -548,10 +645,12 @@ mod tests {
     let s = &out.gps_samples()[0];
     // After GPS→Unix shift: raw + 315964800 ≈ Mar 9 2014 (the GPS-epoch of
     // 1_388_534_400 + offset). Bundled would render the post-shift Unix time.
+    // The shifted value is a WHOLE second, so the `-6` fractional rule appends
+    // no fractional part (byte-identical to the pre-fix integer rendering).
     let want_unix = gps_dt_raw + GPS_TO_UNIX_OFFSET_S;
     let want = format!(
       "{}Z",
-      convert_datetime(&convert_unix_time(want_unix as i64))
+      convert_datetime(&convert_unix_time_trim_frac_f64(want_unix, 6))
     );
     assert_eq!(s.date_time(), Some(want.as_str()));
   }
@@ -612,6 +711,13 @@ mod tests {
       0,
       "bundled `last`s on type 0; nothing after must be decoded"
     );
+    // F2: ProcessCAMM `$et->Warn("Unknown camm record type 0")` then `last`
+    // (QuickTimeStream.pl:3495). The warning is recorded (NO `[minor]` prefix);
+    // bundled oracle `Track1:Warning "Unknown camm record type 0"`.
+    assert_eq!(out.warnings().len(), 1);
+    assert_eq!(out.warnings()[0].message(), "Unknown camm record type 0");
+    // Track index is unset until the walker stamps it.
+    assert_eq!(out.warnings()[0].track_index(), None);
   }
 
   #[test]
@@ -630,21 +736,35 @@ mod tests {
     stream.extend_from_slice(&pkt(7, &vec3));
     let mut out = CammMeta::new();
     process_camm(&stream, None, &mut out);
-    assert!(out.is_empty());
+    assert!(
+      out.is_empty(),
+      "is_empty() reflects DATA records, not warnings"
+    );
+    // F2: unknown type 99 ⇒ `Unknown camm record type 99` (NO `[minor]`).
+    assert_eq!(out.warnings().len(), 1);
+    assert_eq!(out.warnings()[0].message(), "Unknown camm record type 99");
   }
 
   #[test]
   fn truncated_packet_aborts_walk_faithfully() {
-    // QuickTimeStream.pl:3496 — `$pos + $size > $end and last`. A camm5
-    // declares 28 bytes but only 20 are provided ⇒ the FIRST packet is
-    // dropped and the walk stops.
+    // QuickTimeStream.pl:3496 — `$pos + $size > $end and
+    // $et->Warn("Truncated camm record $type"), last`. A camm5 declares 28
+    // bytes but only 20 are provided ⇒ the FIRST packet is dropped, the
+    // warning recorded, and the walk stops.
     let mut stream = Vec::new();
     stream.extend_from_slice(&[0u8, 0u8]);
     stream.extend_from_slice(&5u16.to_le_bytes()); // type=5
     stream.extend_from_slice(&[0u8; 16]); // 20 bytes total, need 28
     let mut out = CammMeta::new();
     process_camm(&stream, None, &mut out);
-    assert!(out.is_empty());
+    assert!(
+      out.is_empty(),
+      "is_empty() reflects DATA records, not warnings"
+    );
+    // F2: `Truncated camm record 5` (NO `[minor]` prefix); bundled oracle
+    // `Track1:Warning "Truncated camm record 5"`.
+    assert_eq!(out.warnings().len(), 1);
+    assert_eq!(out.warnings()[0].message(), "Truncated camm record 5");
   }
 
   #[test]
@@ -665,6 +785,9 @@ mod tests {
     let mut out = CammMeta::new();
     process_camm(&stream, None, &mut out);
     assert_eq!(out.angular_velocity().len(), 1);
+    // The trailing 4 bytes are below the `$pos + 4 < $end` threshold and are
+    // NEVER read — so NO spurious `Unknown camm record type 0` warning fires.
+    assert!(out.warnings().is_empty());
   }
 
   #[test]
@@ -697,5 +820,76 @@ mod tests {
   fn create_date_to_unix_round_trip() {
     // 1904 epoch = -2082844800 unix.
     assert!((create_date_to_unix(0) + 2_082_844_800.0).abs() < 1e-3);
+  }
+
+  /// The first-packet dispatch gate mirrors ExifTool's `camm0..camm7` Conditions
+  /// `/^..\x0N\0/s` (N=0..7): TYPE 0..=7 (high byte zero) dispatches, anything
+  /// else does NOT, and a sample shorter than 4 bytes (cannot read the +2 type)
+  /// never dispatches.
+  #[test]
+  fn first_packet_dispatches_for_types_0_through_7_only() {
+    // Types 0..=7 dispatch (a bare 4-byte header is enough — the Condition needs
+    // only `..` + the type byte + `\0`).
+    for t in 0u16..=7 {
+      assert!(
+        camm_first_packet_dispatches(&pkt(t, &[])),
+        "type {t} must dispatch"
+      );
+    }
+    // Type 8 (byte +2 = 8) matches no Condition.
+    assert!(!camm_first_packet_dispatches(&pkt(8, &[])));
+    // A high-byte-set type (e.g. 0x0108: byte +2 = 8, byte +3 = 1) — the
+    // int16u-LE type 264 is >7, so no dispatch.
+    assert!(!camm_first_packet_dispatches(&pkt(0x0108, &[])));
+    // A real type-5 GPS packet still dispatches.
+    assert!(camm_first_packet_dispatches(&pkt(5, &[0u8; 24])));
+  }
+
+  /// A sample too short to read the +2 int16u type (0..3 bytes) never dispatches
+  /// — every `camm<N>` Condition `/^..\x0N\0/s` needs at least 4 bytes.
+  #[test]
+  fn first_packet_does_not_dispatch_when_too_short() {
+    assert!(!camm_first_packet_dispatches(&[]));
+    assert!(!camm_first_packet_dispatches(&[0u8]));
+    assert!(!camm_first_packet_dispatches(&[0u8, 0u8]));
+    assert!(!camm_first_packet_dispatches(&[0u8, 0u8, 5u8])); // only 3 bytes: no +3
+    // Exactly 4 bytes (a bare header) with a recognized type DOES dispatch.
+    assert!(camm_first_packet_dispatches(&[0u8, 0u8, 5u8, 0u8]));
+  }
+
+  /// `CammTimingOnly` round-trips its stamp (track/doc/timing) and defaults to all
+  /// `None` before stamping.
+  #[test]
+  fn timing_only_marker_stamp_round_trip() {
+    let mut m = CammTimingOnly::new();
+    assert_eq!(m.track_index(), None);
+    assert_eq!(m.doc(), None);
+    assert_eq!(m.sample_time(), None);
+    assert_eq!(m.sample_duration(), None);
+    m.set_stamp(2, 7, Some(0.0), Some(1.0));
+    assert_eq!(m.track_index(), Some(2));
+    assert_eq!(m.doc(), Some(7));
+    assert_eq!(m.sample_time(), Some(0.0));
+    assert_eq!(m.sample_duration(), Some(1.0));
+  }
+
+  /// `CammMeta::push_timing_only` + `stamp_timing_only_last` stamp ONLY the
+  /// last-pushed marker (the just-decoded sample's), leaving an earlier one
+  /// untouched — the same per-sample scoping the GPS/motion/warning stamps use.
+  #[test]
+  fn meta_timing_only_push_and_stamp_last() {
+    let mut m = CammMeta::new();
+    m.push_timing_only(CammTimingOnly::new());
+    m.stamp_timing_only_last(1, 1, Some(0.0), Some(1.0));
+    m.push_timing_only(CammTimingOnly::new());
+    m.stamp_timing_only_last(1, 2, Some(1.0), Some(1.0));
+    assert_eq!(m.timing_only().len(), 2);
+    assert_eq!(m.timing_only()[0].doc(), Some(1));
+    assert_eq!(m.timing_only()[0].sample_time(), Some(0.0));
+    assert_eq!(m.timing_only()[1].doc(), Some(2));
+    assert_eq!(m.timing_only()[1].sample_time(), Some(1.0));
+    // A timing-only marker carries no decoded record, so it does not flip
+    // `is_empty` (CAMM contributed no extractable GPS/motion payload).
+    assert!(m.is_empty());
   }
 }

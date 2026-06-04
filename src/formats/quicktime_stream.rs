@@ -1488,8 +1488,26 @@ fn read_numeric_array(
 /// `0xffffffff` terminates.
 fn process_3gf(data: &[u8], out: &mut QuickTimeStreamMeta) {
   const REC: usize = 10;
+  // QuickTimeStream.pl:2693 — `$dirLen > $recLen` ⇒ truncate-to-first + `EEWarn`
+  // at no-`ee` (see [`process_gps0`]).
+  if data.len() > REC {
+    out.note_magic_box_truncated();
+  }
   let mut pos = 0usize;
+  // `rec` is the 0-based PHYSICAL record index — bumped for EVERY physical record
+  // (mirroring `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the loop,
+  // QuickTimeStream.pl:2700) and stamped onto each pushed sample so the emitter
+  // can reproduce ExifTool's no-`ee` truncate-to-first + `-ee -G3` doc=index+1.
+  let mut rec: u32 = 0;
   while pos + REC <= data.len() {
+    let idx = rec;
+    rec = rec.saturating_add(1);
+    // QuickTimeStream.pl:2700 `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` is the FIRST
+    // statement of the loop body — BEFORE the terminator check below — so even
+    // the `0xffffffff` terminator record consumes a global doc (the bump runs,
+    // then the loop `last`s). Keep `open_doc` here, paired with the same
+    // pre-check `magic_box_record_index` bump (`idx`/`rec` above).
+    let doc = out.open_doc();
     let tc = be_u32(data, pos).unwrap_or(0);
     // QuickTimeStream.pl:2701 `last if $tc == 0xffffffff`.
     if tc == 0xffff_ffff {
@@ -1502,6 +1520,8 @@ fn process_3gf(data: &[u8], out: &mut QuickTimeStreamMeta) {
     // QuickTimeStream.pl:2703 `TimeCode => $tc / 1000`.
     sample.set_time_code(Some(f64::from(tc) / 1000.0));
     sample.set_accelerometer(Some(smol_str::SmolStr::from(join3(x, y, z))));
+    sample.set_magic_box_record_index(Some(idx));
+    sample.set_doc(Some(doc));
     out.push_gps_sample(sample);
     pos += REC;
   }
@@ -1522,11 +1542,34 @@ fn process_gps0(data: &[u8], out: &mut QuickTimeStreamMeta) {
     return; // DEFERRED: Lamax encrypted-text gps0 (Process_text NMEA path).
   }
   const REC: usize = 32;
+  // QuickTimeStream.pl:2738 `if ($dirLen > $recLen and not ExtractEmbedded)` —
+  // a box with more than one record is truncated to its first + raises the
+  // document `EEWarn` at no-`ee`. Note the truncation independent of decode
+  // success (the next-loop skips out-of-range records); the warning condition
+  // is the raw byte length, so flag it here BEFORE the loop.
+  if data.len() > REC {
+    out.note_magic_box_truncated();
+  }
   let mut pos = 0usize;
+  // `rec` is the 0-based PHYSICAL record index — bumped for EVERY physical record
+  // (mirroring `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the loop,
+  // QuickTimeStream.pl:2743) BEFORE the `next`-skip on line 2747, so a valid
+  // record after a skipped (out-of-range) one keeps its true physical index. The
+  // emitter reads it for the no-`ee` truncate-to-first + `-ee -G3` doc=index+1.
+  let mut rec: u32 = 0;
   while pos + REC <= data.len() {
+    let idx = rec;
+    rec = rec.saturating_add(1);
+    // QuickTimeStream.pl:2743 `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the
+    // loop, BEFORE the out-of-range `next` skip — so a skipped record STILL
+    // consumes a global doc. Open it here, paired with the same pre-skip
+    // `magic_box_record_index` bump (`idx`/`rec`).
+    let doc = out.open_doc();
     let lat_raw = le_f64(data, pos).unwrap_or(0.0);
     let lon_raw = le_f64(data, pos + 8).unwrap_or(0.0);
-    // QuickTimeStream.pl:2747 `next if abs($lat) > 9000 or abs($lon) > 18000`.
+    // QuickTimeStream.pl:2747 `next if abs($lat) > 9000 or abs($lon) > 18000` —
+    // the record is skipped (no fix) but its `idx` + global `doc` were ALREADY
+    // consumed above.
     if lat_raw.abs() > 9000.0 || lon_raw.abs() > 18000.0 {
       pos += REC;
       continue;
@@ -1558,6 +1601,8 @@ fn process_gps0(data: &[u8], out: &mut QuickTimeStreamMeta) {
     // QuickTimeStream.pl:2755 `GPSTrack => Get8u(.., 0x1c) * 2`.
     sample.set_track(data.get(pos + 0x1c).map(|&b| f64::from(b) * 2.0));
     sample.set_altitude_m(le_i32(data, pos + 0x10).map(f64::from));
+    sample.set_magic_box_record_index(Some(idx));
+    sample.set_doc(Some(doc));
     out.push_gps_sample(sample);
     pos += REC;
   }
@@ -1568,8 +1613,25 @@ fn process_gps0(data: &[u8], out: &mut QuickTimeStreamMeta) {
 /// scaled by 1/16.
 fn process_gsen(data: &[u8], out: &mut QuickTimeStreamMeta) {
   const REC: usize = 3;
+  // QuickTimeStream.pl:2776 — `$dirLen > $recLen` ⇒ truncate-to-first + `EEWarn`
+  // at no-`ee` (see [`process_gps0`]).
+  if data.len() > REC {
+    out.note_magic_box_truncated();
+  }
   let mut pos = 0usize;
+  // `rec` is the 0-based PHYSICAL record index — bumped for EVERY physical record
+  // (mirroring `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the loop,
+  // QuickTimeStream.pl:2783). `gsen` has no validity skip (every record emits),
+  // so `idx` always equals the emitted-sample ordinal here; stamping it keeps the
+  // emitter's no-`ee` record-0 + `-ee -G3` doc=index+1 logic uniform across the
+  // three magic boxes.
+  let mut rec: u32 = 0;
   while pos + REC <= data.len() {
+    let idx = rec;
+    rec = rec.saturating_add(1);
+    // QuickTimeStream.pl:2783 `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` at the top of the
+    // loop (every `gsen` record emits — no validity skip).
+    let doc = out.open_doc();
     // The `while` guard proves `pos + 3 <= data.len()`, so this `.get`
     // always yields a 3-slice; the `else` break matches the guard failing.
     let Some(&[rx, ry, rz]) = data.get(pos..pos + REC) else {
@@ -1580,6 +1642,8 @@ fn process_gsen(data: &[u8], out: &mut QuickTimeStreamMeta) {
     let z = f64::from(rz as i8) / 16.0;
     let mut sample = GpsSample::new();
     sample.set_accelerometer(Some(smol_str::SmolStr::from(join3(x, y, z))));
+    sample.set_magic_box_record_index(Some(idx));
+    sample.set_doc(Some(doc));
     out.push_gps_sample(sample);
     pos += REC;
   }
@@ -1743,14 +1807,24 @@ fn decode_one_sample(
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
   // SampleTime/SampleDuration; the decoded `mebx` pairs carry both.
   if &track.meta_format == b"mebx" {
-    // Stamp the `Track<N>` index onto exactly the `mebx` samples this sample's
-    // decode produces (including any nested `detected-face` leaves), faithful
+    // ExifTool opens ONE `Doc<N>` for this whole timed sample — `FoundSomething`
+    // (ProcessSamples:1517) runs `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` ONCE, BEFORE
+    // dispatching `Process_mebx`, which then `HandleTag`s EVERY record (incl. the
+    // nested `detected-face` leaves) under that same `DOC_NUM` (Process_mebx
+    // never bumps the doc, QuickTimeStream.pl:2644). Open the global doc here and
+    // stamp it onto exactly the records this `process_mebx` produces (same
+    // `mebx_start` watermark as the `Track<N>` stamp below), so all of one
+    // sample's keys share one `Doc<N>` and the counter stays global across the
+    // file's other stream sources.
+    let mebx_start = out.mebx_sample_count();
+    let doc = out.open_doc();
+    process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
+    out.stamp_mebx_doc_from(mebx_start, doc);
+    // Stamp the `Track<N>` index onto exactly the same `mebx` samples, faithful
     // to ExifTool scoping `SET_GROUP1 = "Track$num"` per-`trak`. The watermark
-    // is taken before the (recursive) `process_mebx` call so a file-scoped
+    // was taken before the (recursive) `process_mebx` call so a file-scoped
     // meta accumulating multiple metadata `trak`s stamps each `trak`'s samples
     // with its own index.
-    let mebx_start = out.mebx_sample_count();
-    process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
     out.stamp_mebx_track_index_from(mebx_start, track_index);
     return false;
   }
@@ -1807,15 +1881,94 @@ fn decode_one_sample(
   // `ProcessGoPro` (GoPro.pm:822) and a `moov`-level `gps `-box freeGPS decode
   // do), so a `camm` track must NOT suppress the brute-force `mdat` scan.
   if &track.meta_format == b"camm" {
+    // GATE on the first-packet `Condition` — ExifTool dispatches `FoundSomething`
+    // + `ProcessCAMM` ONLY after `GetTagInfo` matches a `camm0..camm7`
+    // SubDirectory Condition `$$valPt =~ /^..\x0N\0/s` (N=0..7) against the SAMPLE
+    // bytes (QuickTimeStream.pl:251-309, ProcessSamples:1520-1523). A first packet
+    // whose int16u-LE type (byte +2) is >7, or a sample too short to read it,
+    // matches NO Condition ⇒ `GetTagInfo` returns undef ⇒ NO `FoundSomething` (no
+    // `Doc<N>`, no SampleTime) and `ProcessCAMM` NEVER runs (no `Unknown camm
+    // record type N` warning — that fires only AFTER a first-packet Condition
+    // matched). Emit NOTHING for such a sample (oracle `QuickTime_camm_badtype.mov`:
+    // ends at `Track1:MetaFormat`). The gate is on the FIRST packet only — a
+    // recognized first packet followed by an unknown/truncated SUBSEQUENT packet
+    // STILL dispatches + warns (handled inside `process_camm`).
+    //
+    // (ExifTool has one further camm branch — the `$buff =~ /^X/` ASCII text-camm
+    // accelerometer path, QuickTimeStream.pl:1540-1545 — that fires when no
+    // camm<N> Condition matched but the sample starts with `X` (0x58). That
+    // `Process_text` NMEA path is DEFERRED port-wide (like the other text/NMEA
+    // re-dispatches); an `X`-prefixed sample has byte +2 = `0x30` (`'0'`) ⇒ type
+    // 12336 > 7, so this gate also returns `false` for it — strictly closer to
+    // ExifTool than the pre-gate spurious `Unknown camm record type 12336`.)
+    if !crate::formats::android_camm::camm_first_packet_dispatches(buff) {
+      return false;
+    }
     let create_date_unix = create_date_raw.map(crate::formats::android_camm::create_date_to_unix);
-    // Stamp the `Track<N>` index onto exactly the camm GPS samples this
-    // sample's decode produces, faithful to ExifTool scoping `SET_GROUP1 =
-    // "Track$num"` per-`trak`. Watermark before the (multi-packet) call so a
-    // file-scoped meta accumulating multiple `camm` `trak`s stamps each
-    // `trak`'s samples with its own index.
+    // ExifTool opens ONE `Doc<N>` for this whole camm SAMPLE — `ProcessSamples`
+    // runs `FoundSomething` (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`) ONCE BEFORE
+    // dispatching `ProcessCAMM` (QuickTimeStream.pl:1523), which then `HandleTag`s
+    // EVERY packet of the sample under that same `DOC_NUM` (it never bumps the doc
+    // itself, QuickTimeStream.pl:3493-3504). Open the GLOBAL doc here (on the
+    // SHARED stream-meta counter, so it continues the ordinal across the file's
+    // `mebx`/SP3 sources — `mebx` Doc1, a following camm `trak` Doc2..) and stamp
+    // it onto exactly the fixes this `process_camm` produces (same `gps_start`
+    // watermark as the `Track<N>` stamp). All of one sample's packets thus share
+    // one `Doc<N>`. The bump runs unconditionally per DISPATCHED camm sample,
+    // faithful to `FoundSomething` firing even for a motion-only sample that
+    // yields no fix (and for a recognized-but-empty sample — see the timing-only
+    // marker below).
     let gps_start = camm_out.gps_sample_count();
+    let motion_start = camm_out.motion_sample_counts();
+    let warning_start = camm_out.warning_count();
+    let doc = out.open_doc();
     crate::formats::android_camm::process_camm(buff, create_date_unix, camm_out);
+    // Stamp the `Track<N>` index onto exactly the camm GPS samples this sample's
+    // decode produces, faithful to ExifTool scoping `SET_GROUP1 = "Track$num"`
+    // per-`trak`. Watermark before the (multi-packet) call so a file-scoped meta
+    // accumulating multiple `camm` `trak`s stamps each `trak`'s samples with its
+    // own index.
     camm_out.stamp_gps_track_index_from(gps_start, track_index);
+    // The sample-table `SampleTime`/`SampleDuration` (seconds) of THIS camm
+    // sample — ExifTool's `ProcessSamples` emits them ahead of the decoded
+    // payload (QuickTimeStream.pl:1520), under the same `Doc<N>`/`Track<N>`. All
+    // packets of one camm sample share the one sample-table entry, so they share
+    // the timing (the `mebx` arm above threads `sample.time`/`sample.dur` the same
+    // way). Stamped together with the `doc`.
+    camm_out.stamp_gps_doc_from(gps_start, doc, sample.time, sample.dur);
+    // A `ProcessCAMM` walk-abort warning (`Unknown camm record type N` /
+    // `Truncated camm record N`, QuickTimeStream.pl:3495-3496) is scoped to the
+    // SAME `Track<N>` + `Doc<N>` as this sample's fixes: ExifTool's `SET_GROUP1
+    // = "Track$num"` is active for the whole `ProcessCAMM` call, and
+    // `$et->Warn` `FoundTag`s the `Warning` under the sample's open `DOC_NUM`
+    // (the `doc` opened above, bumped once per camm sample even when it yields
+    // no fix). Stamp exactly the warning this call raised (watermark before the
+    // call), so a camm0 sample following a GPS-fix sample warns at `Doc2`. The
+    // sample-table timing rides ahead of the `Warning` (oracle camm0:
+    // `Doc1:Track1:SampleTime`, `SampleDuration`, then `Warning`).
+    camm_out.stamp_warning_from(warning_start, track_index, doc, sample.time, sample.dur);
+    // The MOTION records (camm1-4/7) of this SAME sample share its `Track<N>` and
+    // `Doc<N>` (ExifTool `HandleTag`s every packet — GPS or motion — under the one
+    // `DOC_NUM` opened above). Stamp them off the same `doc`/`track_index` so a
+    // sample with both a GPS and a motion packet keeps them on one document.
+    camm_out.stamp_motion_from(motion_start, track_index, doc, sample.time, sample.dur);
+    // TIMING-ONLY marker — a recognized first-packet sample (the gate above passed)
+    // whose `process_camm` produced NO stored record: no GPS / motion / exposure
+    // fix AND no `Unknown`/`Truncated` warning (e.g. a 4-byte-only header sample,
+    // whose `ProcessCAMM` `while ($pos + 4 < $end)` loop never iterates). ExifTool's
+    // `FoundSomething` STILL emitted this sample's `SampleTime`/`SampleDuration`
+    // under the open `Doc<N>` (QuickTimeStream.pl:1523; oracle
+    // `QuickTime_camm_emptypayload.mov`: `Doc1:Track1:SampleTime`/`SampleDuration`,
+    // no payload). Record a marker carrying that timing so it (i) participates in
+    // the `-G1` cross-kind min-doc scan and (ii) emits its own `Doc<N>` timing at
+    // `-G3`. Detected by comparing the post-call counts to the pre-call watermarks.
+    let produced_record = camm_out.gps_sample_count() != gps_start
+      || camm_out.motion_sample_counts() != motion_start
+      || camm_out.warning_count() != warning_start;
+    if !produced_record {
+      camm_out.push_timing_only(crate::metadata::CammTimingOnly::new());
+      camm_out.stamp_timing_only_last(track_index, doc, sample.time, sample.dur);
+    }
     return false;
   }
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
@@ -2083,20 +2236,45 @@ pub(crate) fn extract_stream(
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
       // `atom_at` guarantees `ps <= body_end <= data.len()`, so `.get` is
       // always `Some`; `unwrap_or_default()` (an empty slice) is unreachable.
-      b"gps0" => process_gps0(data.get(ps..body_end).unwrap_or_default(), &mut out),
+      // Watermark-then-stamp the `Gps0` origin onto exactly the records this box
+      // decodes (it is processed without `-ee` ⇒ the no-`ee` first-fix path).
+      b"gps0" => {
+        let start = out.gps_sample_count();
+        process_gps0(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Gps0);
+      }
       // Top-level DuDuBell / VSYS `gsen` (3-byte accelerometer triples).
-      b"gsen" => process_gsen(data.get(ps..body_end).unwrap_or_default(), &mut out),
-      // Top-level Kenwood `GPS ` (36-byte LE inline GPS records).
-      b"GPS " => parse_kenwood_gps(
-        data.get(ps..body_end).unwrap_or_default(),
-        create_date_raw,
-        &mut out,
-      ),
+      b"gsen" => {
+        let start = out.gps_sample_count();
+        process_gsen(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Gsen);
+      }
+      // Top-level Kenwood `GPS ` (36-byte LE inline GPS records) — `-ee`-only
+      // (`ProcessSamples`/`ScanMediaData` source): stamp `Kenwood` so the
+      // emitter keeps it gated (no no-`ee` fix, no warning).
+      b"GPS " => {
+        let start = out.gps_sample_count();
+        parse_kenwood_gps(
+          data.get(ps..body_end).unwrap_or_default(),
+          create_date_raw,
+          &mut out,
+        );
+        out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Kenwood);
+        // Kenwood `++DOC_COUNT` per 36-byte record (QuickTimeStream.pl:2565):
+        // stamp the GLOBAL doc onto exactly the fixes this box appended, in
+        // record order, continuing the shared counter (P1 + cross-source #214).
+        out.stamp_gps_doc_from(start);
+      }
       // Pittasoft BlackVue `3gf ` accelerometer (QuickTimeStream.pl
       // `Process_3gf`:2686-2708). ExifTool routes this via the
       // `%QuickTime::Pittasoft` parent table (an SP4 brand-variant); SP3
-      // decodes a `3gf ` box wherever it appears in the atoms it walks.
-      b"3gf " => process_3gf(data.get(ps..body_end).unwrap_or_default(), &mut out),
+      // decodes a `3gf ` box wherever it appears in the atoms it walks. A
+      // top-level magic box ExifTool processes without `-ee` ⇒ stamp `ThreeGf`.
+      b"3gf " => {
+        let start = out.gps_sample_count();
+        process_3gf(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::ThreeGf);
+      }
       _ => {}
     }
     if next <= pos {
@@ -2302,6 +2480,10 @@ fn walk_moov(
       // `mdat`), decoded by `ParseTag`'s `gps ` arm (QuickTimeStream.pl:2544).
       // `body` here is the box VALUE (payload after the atom header).
       b"gps " => {
+        // `-ee`-only source (the freeGPS dispatch runs inside `ProcessSamples`):
+        // stamp `MoovGpsBox` onto exactly the fixes this box decodes so the
+        // emitter keeps them gated (no no-`ee` fix, no file-level warning).
+        let start = out.gps_sample_count();
         process_moov_gps_box(
           data,
           body,
@@ -2310,6 +2492,12 @@ fn walk_moov(
           free_gps_state,
           out,
         );
+        out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::MoovGpsBox);
+        // The moov-`gps `-box freeGPS blocks `++DOC_COUNT` per fix
+        // (`ProcessFreeGPS`'s per-record / per-block `FoundSomething`): stamp the
+        // GLOBAL doc onto exactly the fixes this box appended, continuing the
+        // shared counter at this walk position (P1 + cross-source #214).
+        out.stamp_gps_doc_from(start);
       }
       // The GoPro `moov/udta/GPMF` atom (QuickTime.pm:2132-2135). ExifTool
       // dispatches it via `$et->ProcessDirectory` (QuickTime.pm:10359) the
@@ -3291,5 +3479,99 @@ mod tests {
     assert_eq!(s.speed_kph(), Some(60.0));
     assert_eq!(s.track(), Some(60.0)); // 30 * 2
     assert_eq!(s.date_time(), Some("2024:01:07 11:19:14Z"));
+    // The single record is PHYSICAL index 0.
+    assert_eq!(s.magic_box_record_index(), Some(0));
+    // The single record opens the FIRST global doc (`++DOC_COUNT` ⇒ 1). For a
+    // sole magic box the global ordinal equals the legacy `magic_box_record_index
+    // + 1`, so the byte-exact goldens are unchanged.
+    assert_eq!(s.doc(), Some(1));
+  }
+
+  // `Process_gps0` `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` (QuickTimeStream.pl:2743)
+  // runs BEFORE `next if abs($lat) > 9000` (2747): an out-of-range record 0 is
+  // skipped (no fix) yet still CONSUMES a physical index, so a valid record AFTER
+  // it must carry index 1 (not 0). The decoder stamps the PHYSICAL index — the
+  // emitter relies on it for the no-`ee` record-0-only + `-ee -G3` doc=index+1.
+  #[test]
+  fn process_gps0_stamps_physical_index_past_skipped_record0() {
+    let mut body = alloc::vec![0u8; 64]; // two 32-byte records
+    // record 0: OUT-OF-RANGE lat (abs > 9000) ⇒ `next`-skipped, but index 0 used.
+    wr(&mut body, 0, &90000.0f64.to_le_bytes());
+    wr(&mut body, 8, &0.0f64.to_le_bytes());
+    // record 1: a VALID fix.
+    wr(&mut body, 32, &4737.7053f64.to_le_bytes()); // lat DDDMM.MMMM
+    wr(&mut body, 40, &12209.901f64.to_le_bytes()); // lon
+    wr(&mut body, 32 + 0x10, &80i32.to_le_bytes()); // altitude
+    wr(&mut body, 32 + 0x14, &45u16.to_le_bytes()); // speed
+    wr(&mut body, 32 + 0x16, &[24, 1, 7, 11, 19, 15]); // y m d H M S
+    wb(&mut body, 32 + 0x1c, 20); // track/2
+    let mut out = QuickTimeStreamMeta::new();
+    process_gps0(&body, &mut out);
+    // Only the valid record produced a sample; it carries PHYSICAL index 1.
+    assert_eq!(out.gps_samples().len(), 1);
+    let s = out.gps_samples().first().unwrap();
+    assert_eq!(s.altitude_m(), Some(80.0));
+    assert_eq!(s.date_time(), Some("2024:01:07 11:19:15Z"));
+    assert_eq!(
+      s.magic_box_record_index(),
+      Some(1),
+      "a valid record after a skipped record 0 keeps its true PHYSICAL index 1"
+    );
+    // `++DOC_COUNT` runs for the skipped record 0 too (before the `next`), so the
+    // valid record-1 fix opens the SECOND global doc — the typed mirror of
+    // ExifTool's `-ee -G3` `Doc2`.
+    assert_eq!(
+      s.doc(),
+      Some(2),
+      "the skipped record 0 still consumed Doc1, so the valid record is Doc2"
+    );
+    // The byte-length truncation flag is set (two physical records > one record).
+    assert!(out.magic_box_truncated_no_ee());
+  }
+
+  // F2 — the GLOBAL document ordinal across stream sources in ONE file. A `mebx`
+  // timed sample (decoded first, via the moov walk) opens Doc1 and stamps ALL its
+  // records with it; a `gps0` magic box decoded AFTER it (a top-level sibling)
+  // must continue the SAME counter — its first record opens Doc2, NOT a colliding
+  // Doc1. This reproduces ExifTool's single `$$et{DOC_COUNT}` shared across every
+  // embedded source (`gps0` record 0 after an earlier `mebx` doc is `Doc2`).
+  #[test]
+  fn global_doc_ordinal_spans_mebx_then_gps0() {
+    let mut out = QuickTimeStreamMeta::new();
+    // Simulate the moov walk reaching a `mebx` sample first: open one doc, push a
+    // pair of records (one timed sample), stamp them all with that doc — exactly
+    // what `decode_one_sample`'s `mebx` arm does.
+    let mebx_start = out.mebx_sample_count();
+    let mebx_doc = out.open_doc();
+    out.push_mebx_sample(MebxSample::new(
+      "SceneIlluminance",
+      "1234",
+      Some(0.0),
+      Some(1.0),
+    ));
+    out.push_mebx_sample(MebxSample::new("TestFooBar", "hi", Some(0.0), Some(1.0)));
+    out.stamp_mebx_doc_from(mebx_start, mebx_doc);
+    // Both mebx records share Doc1.
+    assert_eq!(mebx_doc, 1);
+    for s in out.mebx_samples() {
+      assert_eq!(
+        s.doc(),
+        Some(1),
+        "all records of one timed sample share Doc1"
+      );
+    }
+    // Now a top-level `gps0` box is reached (a sibling AFTER moov): its first
+    // record must open Doc2 off the SAME counter.
+    let mut rec = alloc::vec![0u8; 32];
+    wr(&mut rec, 0, &4737.7053f64.to_le_bytes()); // lat
+    wr(&mut rec, 8, &12209.901f64.to_le_bytes()); // lon
+    wr(&mut rec, 0x16, &[24, 1, 7, 11, 19, 14]); // y m d H M S
+    process_gps0(&rec, &mut out);
+    assert_eq!(out.gps_samples().len(), 1);
+    assert_eq!(
+      out.gps_samples().first().unwrap().doc(),
+      Some(2),
+      "a gps0 record after an earlier mebx doc gets the next GLOBAL ordinal Doc2, not Doc1"
+    );
   }
 }

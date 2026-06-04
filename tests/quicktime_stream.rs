@@ -2103,20 +2103,23 @@ fn atom_bytes(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
 }
 
 // ===========================================================================
-// `ParseOptions { extract_embedded }` THREADING — the render-time `-ee` flag
-// reaches the typed Meta's `serialize_tags` → `EmitOptions`.
+// `ParseOptions { extract_embedded }` THREADING + the timed-metadata emission
+// gate — the render-time `-ee` flag reaches the typed Meta's `serialize_tags`
+// → `EmitOptions` and drives the per-source gating.
 //
-// The BEHAVIORAL difference (the four timed-metadata blocks gated on the flag)
-// lands in a LATER emission-gating task; these tests pin only the threading:
-// the flag compiles + flows end-to-end through both public render seams
-// (`extract_info_with_options` and `Rendered::new_with_options`), and — because
-// the emitters don't yet consult it — `false` vs `true` render IDENTICALLY
-// today (which is also the default-off byte-identical regression guard).
+// `QuickTime_gps0.mov` carries a TOP-LEVEL `gps0` magic box ExifTool processes
+// WITHOUT `-ee` (Task 10b): at no-`ee` it emits the FIRST fix flat
+// (`QuickTime:GPS*`) + a file-level `ExifTool:Warning` (the `EEWarn`); with
+// `-ee` it emits the FULL `Doc<N>` series and NO file warning. So `-ee` off vs
+// on render DIFFERENT documents (more fixes under `-ee`, the warning only
+// without). The byte-exact value checks live in
+// `tests/timed_metadata_conformance.rs`; these pin the threading + gate.
 // ===========================================================================
 
 /// `extract_info_with_options` threads `ParseOptions { extract_embedded }` into
-/// the document render. Until the emission-gating task consults the flag, `-ee`
-/// off and on render the SAME JSON document (the flag merely reaches emission).
+/// the document render, and the emission gate consults it: `-ee` off vs on
+/// render DIFFERENT documents (the gps0 box's no-`ee` first-fix + file warning
+/// vs the full `-ee` `Doc<N>` series).
 #[test]
 fn extract_info_with_options_threads_extract_embedded() {
   use exifast::ParseOptions;
@@ -2140,26 +2143,34 @@ fn extract_info_with_options_threads_extract_embedded() {
     exifast::parser::extract_info("QuickTime_gps0.mov", &data, true),
     "default ParseOptions must match the legacy extract_info byte-for-byte"
   );
-  // The emission gate now consults `-ee`: ON emits the per-sample timed GPS
-  // tags that OFF suppresses, so the two documents MUST differ.
-  assert_ne!(
-    off, on,
-    "-ee gating: ON must emit the timed GPS tags OFF suppresses"
-  );
-  // OFF carries no timed `QuickTime:GPS*`; ON carries them.
+  // The emission gate consults `-ee`: ON emits the full `Doc<N>` series, OFF the
+  // truncated first fix + the file warning — the two documents MUST differ.
+  assert_ne!(off, on, "-ee gating: ON and OFF must render differently");
+  // The top-level `gps0` box is processed WITHOUT `-ee`, so OFF emits the FIRST
+  // fix flat AND the file-level `ExtractEmbedded` warning.
   assert!(
-    !off.contains("\"QuickTime:GPSLatitude\""),
-    "-ee off suppresses the timed GPS stream"
+    off.contains("\"QuickTime:GPSLatitude\""),
+    "-ee off emits the first gps0 fix (top-level magic box)"
   );
+  assert!(
+    off.contains("\"ExifTool:Warning\""),
+    "-ee off raises the file-level ExtractEmbedded warning"
+  );
+  // ON also surfaces the GPS stream (the `-ee -G1` first-wins collapse) but
+  // raises NO file warning (the EEWarn is the truncation, no-`ee`-only).
   assert!(
     on.contains("\"QuickTime:GPSLatitude\""),
     "-ee on emits the timed GPS stream"
   );
+  assert!(
+    !on.contains("\"ExifTool:Warning\""),
+    "-ee on does not raise the no-ee ExtractEmbedded warning"
+  );
 }
 
 /// `Rendered::new_with_options` carries `extract_embedded` into the serde
-/// `Serialize` path (the same `serialize_tags` seam). Threading-only: off == on
-/// until the emission-gating task.
+/// `Serialize` path (the same `serialize_tags` seam). The gate consults it, so
+/// off and on render differently (see [`extract_info_with_options_threads_extract_embedded`]).
 #[test]
 fn rendered_new_with_options_threads_extract_embedded() {
   use exifast::Rendered;
@@ -2175,17 +2186,26 @@ fn rendered_new_with_options_threads_extract_embedded() {
 
   let off_json = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize off");
   let on_json = serde_json::to_string(&on).expect("serialize on");
-  // The emission gate now consults `-ee`: ON carries the timed GPS stream that
-  // OFF suppresses.
+  // The emission gate consults `-ee`: off and on render differently.
   assert_ne!(
     off_json, on_json,
-    "-ee gating: ON emits the timed GPS tags OFF suppresses"
+    "-ee gating: off and on render differently"
+  );
+  // The gps0 top-level box emits its first fix WITHOUT `-ee` (+ the file
+  // warning); `-ee` ON emits the full series with no file warning.
+  assert!(
+    off_json.contains("GPSLatitude"),
+    "-ee off emits the first gps0 fix"
   );
   assert!(
-    !off_json.contains("GPSLatitude"),
-    "-ee off has no timed GPS"
+    off_json.contains("ExifTool:Warning"),
+    "-ee off raises the file-level ExtractEmbedded warning"
   );
   assert!(on_json.contains("GPSLatitude"), "-ee on emits timed GPS");
+  assert!(
+    !on_json.contains("ExifTool:Warning"),
+    "-ee on does not raise the no-ee warning"
+  );
 }
 
 /// The emission gate: `-ee` ON emits the per-sample `QuickTime:GPS*` tags from

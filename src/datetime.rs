@@ -64,6 +64,82 @@ pub fn convert_unix_time_f64(time: f64) -> String {
   render_gmt(reduce_unix_time_float(time))
 }
 
+/// `ConvertUnixTime($time, 0, -$digits)` (the GMT branch, ExifTool.pm:6784-
+/// 6811) for a *floating-point* `$time` with a NEGATIVE fractional-format
+/// flag — the form `%QuickTime::camm6 GPSDateTime` (`QuickTimeStream.pl:522`,
+/// `ConvertUnixTime($val, 0, -6)`) hits.
+///
+/// A NEGATIVE `$dec` (`-$digits`) sets `$trim = 1` (`:6790`): the second is
+/// rendered with UP TO `$digits` fractional digits, then trailing zeros (and a
+/// bare trailing dot) are stripped (`$dec =~ s/\.?0+$//`, `:6797`). A whole
+/// second therefore renders with NO fractional part at all (e.g. `…:00`, not
+/// `…:00.000000`). Contrast a POSITIVE `$dec`, which would be fixed-width.
+///
+/// Faithful chain (`:6791-6797` + `:6808`):
+/// ```text
+/// $itime = int($time);                       # truncate toward zero
+/// $frac  = $time - $itime;
+/// $frac < 0 and $frac += 1, $itime -= 1;     # fold frac into [0,1)
+/// $dec = sprintf('%.*f', $digits, $frac);    # e.g. "0.789000"
+/// $dec =~ s/^(\d)// and $1 eq '1' and $itime += 1;   # strip int digit, carry
+/// $dec =~ s/\.?0+$//;                         # trim trailing zeros (+bare dot)
+/// # str = sprintf("…%.2d$dec", …, $sec)      # $dec is ".789" / ".5" / ""
+/// ```
+///
+/// The `$time == 0` sentinel (`:6787`) is honoured on the ORIGINAL float, like
+/// [`convert_unix_time_f64`]; a sub-second non-zero float (reduced `$itime ==
+/// 0`) renders `1970:01:01 00:00:00<frac>`, NOT the sentinel.
+#[must_use]
+pub fn convert_unix_time_trim_frac_f64(time: f64, digits: u8) -> String {
+  // ExifTool.pm:6787 — sentinel on the ORIGINAL float (a whole `0` is the
+  // sentinel; a sub-second non-zero value is NOT).
+  if time == 0.0 {
+    return "0000:00:00 00:00:00".to_string();
+  }
+  // ExifTool.pm:6791-6793 — `int($time)` truncate-toward-zero, then fold a
+  // negative fraction into `[0,1)` by borrowing a second (true floor).
+  #[allow(clippy::cast_possible_truncation)]
+  let mut itime = time.trunc() as i64;
+  let mut frac = time - time.trunc();
+  if frac < 0.0 {
+    frac += 1.0;
+    itime -= 1;
+  }
+  // ExifTool.pm:6794 `$dec = sprintf('%.*f', $digits, $frac)`. `$frac` is in
+  // `[0,1)`; Rust's `format!("{:.*}", digits, _)` rounds half-to-EVEN exactly
+  // like Perl's `sprintf('%.*f', …)`. Yields `"0.789000"` / `"0.500000"` /
+  // `"0.000000"` — or `"1.000000"` if the fraction rounds up to a full second.
+  let digits = digits as usize;
+  let dec = format!("{frac:.digits$}");
+  // ExifTool.pm:6796 `$dec =~ s/^(\d)// and $1 eq '1' and $itime += 1` — drop
+  // the integer digit; a leading `1` (rounded up to the next whole second)
+  // carries into `$itime`.
+  let (lead, rest) = dec.split_at(1);
+  if lead == "1" {
+    itime += 1;
+  }
+  // ExifTool.pm:6797 `$dec =~ s/\.?0+$//` (the `$trim` branch, always taken
+  // for a negative `$dec`): strip trailing zeros and, if nothing but zeros
+  // followed the dot, the dot itself. `rest` is the post-integer-digit
+  // remainder (`".789000"` / `".500000"` / `".000000"`).
+  let frac_suffix = trim_trailing_zeros(rest);
+  // ExifTool.pm:6808 — `sprintf("%.2d:%.2d:%.2d$dec", …)`: the GMT clock with
+  // the trimmed fractional suffix appended to the seconds field.
+  let (y, mo, d, h, mi, s) = gmtime(itime);
+  format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}{frac_suffix}")
+}
+
+/// `s/\.?0+$//` (ExifTool.pm:6797) — remove a run of trailing `'0'`s at the
+/// end of `s`, plus the dot immediately preceding that run if the dot is left
+/// dangling. `".789000"` ⇒ `".789"`; `".500000"` ⇒ `".5"`; `".000000"` ⇒ `""`.
+/// A string with no trailing zero (`".789"`) is returned unchanged.
+fn trim_trailing_zeros(s: &str) -> &str {
+  let trimmed = s.trim_end_matches('0');
+  // After dropping trailing zeros, a dangling `.` (the whole fraction was
+  // zeros) is itself removed by the `\.?` in the Perl regex.
+  trimmed.strip_suffix('.').unwrap_or(trimmed)
+}
+
 /// `ConvertUnixTime($time, 1)` (the `$toLocal = 1` localtime branch) for a
 /// *floating-point* `$time` — the form PLIST's binary `<date>` path
 /// (`PLIST.pm:277`, `ConvertUnixTime($val + 11323*24*3600, 1)`) hits.
@@ -460,6 +536,63 @@ mod tests {
     // A negative non-tie fraction floors then may carry: -0.4 ⇒ floor -1,
     // frac 0.6 ⇒ "1" carry ⇒ 0.
     assert_eq!(reduce_unix_time_float(-0.4), 0);
+  }
+
+  #[test]
+  fn convert_unix_time_trim_frac_f64_matches_camm6_minus6_oracle() {
+    // `ConvertUnixTime($val, 0, -6)` (QuickTimeStream.pl:522) — the camm6
+    // GPSDateTime fractional rule. Bundled ExifTool 13.59 (TZ=UTC) on crafted
+    // camm6 GPSDateTime doubles (verified via `exiftool -ee -j -G3:1`):
+    //   1704067200.789 => "2024:01:01 00:00:00.789"   (up to 6 digits)
+    //   1704067200.5   => "2024:01:01 00:00:00.5"     (trailing zeros stripped)
+    //   1704067200.0   => "2024:01:01 00:00:00"       (whole second: no frac)
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(1_704_067_200.789, 6),
+      "2024:01:01 00:00:00.789"
+    );
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(1_704_067_200.5, 6),
+      "2024:01:01 00:00:00.5"
+    );
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(1_704_067_200.0, 6),
+      "2024:01:01 00:00:00"
+    );
+  }
+
+  #[test]
+  fn convert_unix_time_trim_frac_f64_carry_and_sentinel() {
+    // A fraction that rounds UP to a full second carries into `$itime`
+    // (ExifTool.pm:6796) and leaves NO fractional part (the rounded "1.000000"
+    // → strip leading "1" + carry, then `s/\.?0+$//` empties ".000000").
+    // 0.9999999 at 6 digits ⇒ "1.000000" ⇒ +1 second, no frac.
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(1_704_067_200.999_999_9, 6),
+      "2024:01:01 00:00:01"
+    );
+    // The `$time == 0` sentinel is on the ORIGINAL float (ExifTool.pm:6787).
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(0.0, 6),
+      "0000:00:00 00:00:00"
+    );
+    // A sub-second non-zero float reduces to `$itime == 0` but renders
+    // `1970:01:01 …` (NOT the sentinel), with its fractional suffix.
+    assert_eq!(
+      convert_unix_time_trim_frac_f64(0.25, 6),
+      "1970:01:01 00:00:00.25"
+    );
+  }
+
+  #[test]
+  fn trim_trailing_zeros_matches_perl_regex() {
+    // ExifTool.pm:6797 `s/\.?0+$//`: strip trailing zeros + a dangling dot.
+    assert_eq!(trim_trailing_zeros(".789000"), ".789");
+    assert_eq!(trim_trailing_zeros(".500000"), ".5");
+    assert_eq!(trim_trailing_zeros(".000000"), "");
+    // No trailing zero ⇒ unchanged.
+    assert_eq!(trim_trailing_zeros(".789"), ".789");
+    // A whole-second-only ".0" collapses to empty.
+    assert_eq!(trim_trailing_zeros(".0"), "");
   }
 
   #[test]
