@@ -1,32 +1,33 @@
-//! §4 conformance: `exifast::extract_info` output must be VALUE-EQUIVALENT to
-//! the bundled-ExifTool golden for every ported fixture, for both the default
-//! (`-j -G1 -struct`) and `-n` snapshots. The gate is the value-semantic
-//! [`json_equivalent`] (`src/jsondiff.rs`): object key ORDER is insensitive,
-//! the key MULTISET must match, array order IS significant, and scalars compare
-//! by VALUE — `1 == 1.0`, `"123" == 123`, `3.4e+38 == 3.4e38`. We deliberately
-//! do NOT compare scalar TOKENS or key order: the serializer uses standard
-//! `serde_json` formatting, and a different valid spelling of the same value is
-//! not a regression (same principle as "JSON key order doesn't matter"). One
-//! case per ported format — add a `#[test]` per format as it lands (FORMATS.md
-//! order).
+//! §4 conformance: `exifast::extract_info` output must match the
+//! bundled-ExifTool golden for every ported fixture, for both the default
+//! (`-j -G1 -struct`) and `-n` snapshots. The gate is the TOKEN-EXACT
+//! [`json_equivalent_strict`] (`src/jsondiff.rs`, Contract B / #197): object
+//! key ORDER is insensitive, the key MULTISET must match, array order IS
+//! significant, and every scalar must match by JSON TYPE as well as value — a
+//! quoted `"123"` is NOT the bare number `123` (within-type value-style
+//! insensitivity is still kept: `1 == 1.0`, `3.4e+38 == 3.4e38`). The
+//! serializer reproduces ExifTool's exact `EscapeJSON` bare-number-vs-quoted-
+//! string typing, so the goldens pin that typing. One case per ported format —
+//! add a `#[test]` per format as it lands (FORMATS.md order).
 //!
 //! Gated on `feature = "json"`: the suite imports the `json`-gated `jsondiff`,
 //! and `std` does NOT imply `json`, so a `--features std,id3` test build must
 //! skip this whole file (the lib still builds; this is a json-output
 //! conformance check).
 #![cfg(feature = "json")]
-use exifast::{jsondiff::json_equivalent, parser::extract_info};
+use exifast::{jsondiff::json_equivalent_strict as json_equivalent, parser::extract_info};
 
-/// Assert exifast's output for `fixture` is VALUE-EQUIVALENT to the committed
-/// bundled-ExifTool golden `golden` via [`json_equivalent`]. `print_on` =
+/// Assert exifast's output for `fixture` matches the committed bundled-ExifTool
+/// golden `golden` TOKEN-EXACTLY via [`json_equivalent_strict`]. `print_on` =
 /// ExifTool PrintConv (`false` ⇒ `-n`).
 ///
-/// Value-semantic (not raw byte) comparison is correct here because the
-/// serializer emits STANDARD `serde_json` scalars and does not chase ExifTool's
-/// `sprintf` token style; a value-equal-but-differently-spelled scalar (or a
-/// reordered object key) is the same JSON value, not a regression. A genuine
-/// value or structure difference — a wrong number, a missing/extra key, a
-/// different array order — still fails (do NOT weaken the goldens to mask one).
+/// Token-exact (Contract B / #197): the serializer reproduces ExifTool's
+/// `EscapeJSON` bare-number-vs-quoted-string typing, so a numeric scalar must
+/// match the golden's JSON TYPE as well as its value (within-type spelling —
+/// `1`==`1.0`, trailing zeros — stays insensitive; object key order stays
+/// insensitive). A genuine value/structure difference — a wrong number, a
+/// quote-vs-bare type mismatch, a missing/extra key, a different array order —
+/// fails (do NOT weaken the goldens to mask one).
 fn check(fixture: &str, golden: &str, print_on: bool) {
   let root = env!("CARGO_MANIFEST_DIR");
   let data = std::fs::read(format!("{root}/tests/fixtures/{fixture}"))

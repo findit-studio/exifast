@@ -73,7 +73,7 @@
 use exifast::{
   filetype::detection_candidates,
   format_parser::{Rendered, SharedFlags, any_parser_for},
-  jsondiff::json_equivalent,
+  jsondiff::json_equivalent_strict as json_equivalent,
   parser::extract_info,
 };
 

@@ -1,9 +1,9 @@
 {
   "H264:ExposureTime": "1/60",
-  "H264:FNumber": "3.5",
-  "H264:BrightnessValue": "2.5",
+  "H264:FNumber": 3.5,
+  "H264:BrightnessValue": 2.5,
   "H264:ExposureCompensation": "-1/3",
-  "H264:MaxApertureValue": "8.0",
+  "H264:MaxApertureValue": 8.0,
   "H264:Flash": "Auto, Fired",
   "H264:CustomRendered": "Custom",
   "H264:FocalLengthIn35mmFormat": "50 mm"

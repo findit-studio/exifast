@@ -1,6 +1,6 @@
 {
   "H264:TimeCode": "04:03:02:01",
-  "H264:ApertureSetting": "1.0",
+  "H264:ApertureSetting": 1.0,
   "H264:Gain": "9 dB",
   "H264:ExposureProgram": "Gain",
   "H264:WhiteBalance": "1-Push",
@@ -8,6 +8,6 @@
   "H264:ImageStabilization": "On (0x3f)",
   "H264:Make": "Canon",
   "H264:RecordingMode": "FXP",
-  "H264:CaptureFrameRate": "30",
-  "H264:VideoFrameRate": "25"
+  "H264:CaptureFrameRate": 30,
+  "H264:VideoFrameRate": 25
 }

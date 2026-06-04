@@ -1,5 +1,5 @@
 {
-  "H264:BrightnessValue": "0.3333333",
-  "H264:MaxApertureValue": "1.1",
+  "H264:BrightnessValue": 0.3333333,
+  "H264:MaxApertureValue": 1.1,
   "H264:FocalLengthIn35mmFormat": "0.3333333 mm"
 }
