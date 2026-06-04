@@ -4059,22 +4059,33 @@ fn emit_gated_number<S: ExifSink>(
       return out.write_u64(group, name, n);
     }
   }
-  // A FINITE in-gate fractional/exponent value emits a value-equal bare number
-  // via `write_f64`. The gate admits an exponent up to `e[-+]?\d{1,3}` (faithful
-  // to `exiftool:3810`), so it also accepts a token OUTSIDE finite-f64 range
-  // such as `1e999` (parses to `INFINITY`); `write_f64(INFINITY)` would reach
-  // `TagValue::F64`'s serializer and emit the titlecase `"Inf"` string, silently
-  // corrupting the verbatim source token (ExifTool's `EscapeJSON` `return $str`s
-  // the in-gate token unchanged). Emit the ORIGINAL `rendered` text as a quoted
-  // JSON string instead — sound on every path, never `null`, never `Inf`
-  // (mirrors `value.rs::serialize_in_gate_number_str`, Contract B / #197). Every
-  // current EXIF caller feeds a bounded format or a pre-finite `format_g`
-  // render, so the non-finite arm is unreachable today; the guard keeps the gate
-  // class closed against a future caller passing such a token.
+  // A FINITE in-gate fractional/exponent value that FAITHFULLY represents its
+  // token emits a value-equal bare number via `write_f64`. The gate admits an
+  // exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it also
+  // accepts a token OUTSIDE finite-f64 range on BOTH sides: `1e999` OVERFLOWS to
+  // `INFINITY` (`write_f64(INFINITY)` would reach `TagValue::F64`'s serializer
+  // and emit the titlecase `"Inf"` string, corrupting the verbatim source token,
+  // which ExifTool's `EscapeJSON` `return $str`s unchanged), and `1e-999`
+  // UNDERFLOWS a nonzero significand to a FINITE `0.0` (a finite-only guard would
+  // emit a bare `0`, rewriting the nonzero token to zero). In EITHER case emit
+  // the ORIGINAL `rendered` text as a quoted JSON string — sound on every path,
+  // never `null`/`Inf`/`0` corruption (mirrors
+  // `value.rs::serialize_in_gate_number_str`, Contract B / #197). The predicate
+  // `is_finite() && !(f == 0.0 && lexeme_is_nonzero)` is COMPLETE for the
+  // f64-representation class: overflow ⇒ !finite ⇒ string; nonzero-underflow ⇒
+  // `0.0`+nonzero-significand ⇒ string; else the finite f64 faithfully denotes
+  // the value ⇒ bare (a genuine-zero token stays a bare `0`; finite-nonzero
+  // precision loss is value-preserving under the comparator). Every current EXIF
+  // caller feeds a bounded format or a pre-finite `format_g` render, so the
+  // string arm is unreachable today; the guard keeps the gate class closed
+  // against a future caller passing such a token.
   match rendered.parse::<f64>() {
-    Ok(f) if f.is_finite() => out.write_f64(group, name, f),
-    // Non-finite (over-f64-range exponent) or an unreachable non-parse: fall
-    // back to the faithful quoted source string.
+    Ok(f) if f.is_finite() && !(f == 0.0 && crate::value::lexeme_is_nonzero(rendered)) => {
+      out.write_f64(group, name, f)
+    }
+    // Over-range exponent (overflow to non-finite OR nonzero-underflow to `0.0`)
+    // or an unreachable non-parse: fall back to the faithful quoted source
+    // string.
     _ => out.write_str(group, name, rendered),
   }
 }
@@ -5194,6 +5205,27 @@ mod tests {
     // A FINITE exponent value still routes to the float writer (no regression).
     emit_gated_number("E", "Exp", "1e10", &mut map).unwrap();
     assert_eq!(map.get("E", "Exp"), Some(&TagValue::F64(1e10)));
+    // Contract B / #197 SYMMETRIC (under) side: a gate-matching token whose
+    // nonzero significand UNDERFLOWS to a finite `0.0` (`1e-999`, `parse::<f64>()`
+    // ⇒ `Ok(0.0)`) must NOT route through `write_f64` to `TagValue::F64(0.0)`
+    // (which serializes a bare `0`, rewriting the nonzero token to zero); it stays
+    // the quoted source `Str`.
+    for tok in ["1e-999", "-1e-999", "9e-400"] {
+      emit_gated_number("E", "Under", tok, &mut map).unwrap();
+      assert_eq!(
+        map.get("E", "Under"),
+        Some(&TagValue::Str(tok.into())),
+        "{tok:?} (nonzero-underflow exponent) must stay a quoted string, not F64(0.0)"
+      );
+    }
+    // A GENUINE zero token (significand is zero) stays a BARE number — it
+    // legitimately denotes zero, so the predicate must NOT preserve it as a string.
+    emit_gated_number("E", "Zero", "0e-5", &mut map).unwrap();
+    assert_eq!(map.get("E", "Zero"), Some(&TagValue::F64(0.0)));
+    // A FINITE tiny IN-RANGE value (nonzero, no underflow) still routes to the
+    // float writer — the predicate must not over-trigger on small magnitudes.
+    emit_gated_number("E", "Tiny", "1e-300", &mut map).unwrap();
+    assert_eq!(map.get("E", "Tiny"), Some(&TagValue::F64(1e-300)));
   }
 
   /// `emit_gated_f64` renders a finite value with `%.15g` then gates it: an

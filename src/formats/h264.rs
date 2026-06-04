@@ -2982,18 +2982,27 @@ fn classify_json_scalar(s: &str) -> JsonScalar {
       return JsonScalar::U64(n);
     }
   }
-  // A finite fractional/exponent value routes through the float writer as a bare
-  // JSON number. The gate admits an exponent up to `e[-+]?\d{1,3}` (faithful to
-  // `exiftool:3810`), so it ALSO accepts a token outside finite-f64 range such as
-  // `1e999` (parses to `INFINITY`). A non-finite parse must NOT become
-  // `JsonScalar::F64(INFINITY)` — the caller would lower that to
-  // `TagValue::F64(INFINITY)`, whose serializer emits the titlecase `"Inf"`
-  // string, silently corrupting the source token. Fall back to `Str` so the
-  // ORIGINAL token reaches `TagValue::Str`, where the consolidated `value.rs`
-  // number gate emits it as a sound quoted string (Contract B / #197). Real
-  // H264 MDPM metadata never carries such a magnitude.
+  // A finite fractional/exponent value that FAITHFULLY represents its token
+  // routes through the float writer as a bare JSON number. The gate admits an
+  // exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it ALSO
+  // accepts a token outside finite-f64 range on BOTH sides: `1e999` OVERFLOWS to
+  // `INFINITY`, and `1e-999` UNDERFLOWS a nonzero significand to a FINITE `0.0`.
+  // Neither may become `JsonScalar::F64(..)` — the caller lowers an overflow to
+  // `TagValue::F64(INFINITY)` (serializer emits the titlecase `"Inf"`), and a
+  // nonzero-underflow to `TagValue::F64(0.0)` (emits a bare `0`), both silently
+  // corrupting the source token. Fall back to `Str` so the ORIGINAL token reaches
+  // `TagValue::Str`, where the consolidated `value.rs` number gate emits it as a
+  // sound quoted string (Contract B / #197). The predicate `is_finite() && !(f ==
+  // 0.0 && lexeme_is_nonzero)` is COMPLETE for the f64-representation class:
+  // overflow ⇒ !finite ⇒ `Str`; nonzero-underflow ⇒ `0.0`+nonzero-significand ⇒
+  // `Str`; else the finite f64 faithfully denotes the value ⇒ `F64` (a
+  // genuine-zero token stays a bare `0`; finite-nonzero precision loss is
+  // value-preserving under the comparator). Real H264 MDPM metadata never carries
+  // such a magnitude.
   match s.parse::<f64>() {
-    Ok(f) if f.is_finite() => JsonScalar::F64(f),
+    Ok(f) if f.is_finite() && !(f == 0.0 && crate::value::lexeme_is_nonzero(s)) => {
+      JsonScalar::F64(f)
+    }
     _ => JsonScalar::Str,
   }
 }
@@ -4009,6 +4018,31 @@ mod tests {
     assert!(matches!(classify_json_scalar("-1e10"), JsonScalar::F64(_)));
   }
 
+  /// Contract B / #197 SYMMETRIC (under) side of the f64-representation class. A
+  /// gate-matching token whose nonzero significand UNDERFLOWS to a finite `0.0`
+  /// (`1e-999`, `parse::<f64>()` ⇒ `Ok(0.0)`) must NOT classify as
+  /// `JsonScalar::F64(0.0)` — the lowering would build `TagValue::F64(0.0)`, a
+  /// bare `0` that rewrites the nonzero source token to zero. It must classify as
+  /// `JsonScalar::Str` so the ORIGINAL token reaches `TagValue::Str` (a sound
+  /// quoted string). A GENUINE zero token stays a bare `0`; a finite tiny IN-RANGE
+  /// nonzero value still routes to the float writer (the predicate must not
+  /// over-trigger on small magnitudes).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn classify_json_scalar_underflow_nonzero_stays_string() {
+    for tok in ["1e-999", "-1e-999", "9e-400"] {
+      assert!(
+        matches!(classify_json_scalar(tok), JsonScalar::Str),
+        "{tok:?} (nonzero-underflow exponent) must classify as Str, not F64(0.0)"
+      );
+    }
+    // A genuine zero token (zero significand) is a legitimate bare number.
+    assert!(matches!(classify_json_scalar("0e-5"), JsonScalar::F64(_)));
+    assert!(matches!(classify_json_scalar("0.0"), JsonScalar::F64(_)));
+    // A finite tiny in-range nonzero value still routes to the float writer.
+    assert!(matches!(classify_json_scalar("1e-300"), JsonScalar::F64(_)));
+  }
+
   /// End-to-end (`-n` AND `-j`) for the over-f64 MDPM token: lowering the
   /// classifier's arm to a [`TagValue`] then serializing must preserve the
   /// EXACT source token as a quoted JSON string — never `Inf`, never `null`,
@@ -4029,21 +4063,24 @@ mod tests {
         JsonScalar::Str => TagValue::Str(numeric.into()),
       }
     };
-    for tok in ["1e999", "-1e999", "1e309"] {
+    // Both SIDES of the f64-representation class: OVERFLOW (`1e999` ⇒ INFINITY)
+    // and nonzero-UNDERFLOW (`1e-999` ⇒ finite `0.0`) must each be preserved as
+    // the EXACT quoted source token — never `Inf`, never `0`/`0.0`, never `null`.
+    for tok in ["1e999", "-1e999", "1e309", "1e-999", "-1e-999", "9e-400"] {
       // `-n`: the raw token is preserved as a quoted string (the gate fix).
       let json_n = serde_json::to_string(&lower_n(tok)).unwrap();
       assert_eq!(
         json_n,
         std::format!("{tok:?}"),
-        "`-n` over-f64 token must stay a quoted string, got {json_n}"
+        "`-n` out-of-range token must stay a quoted string, got {json_n}"
       );
-      assert!(json_n != "null" && !json_n.contains("Inf"));
+      assert!(json_n != "null" && json_n != "0" && json_n != "0.0" && !json_n.contains("Inf"));
       // `-j` (PrintConv): the production lowering emits the PrintConv string as
-      // `TagValue::Str`; the same `value.rs` gate keeps an over-f64 token a
+      // `TagValue::Str`; the same `value.rs` gate keeps an out-of-range token a
       // sound quoted string.
       let json_j = serde_json::to_string(&TagValue::Str(tok.into())).unwrap();
       assert_eq!(json_j, std::format!("{tok:?}"));
-      assert!(json_j != "null" && !json_j.contains("Inf"));
+      assert!(json_j != "null" && json_j != "0" && json_j != "0.0" && !json_j.contains("Inf"));
       // Valid JSON on every path (round-trips, never `null`).
       let v: serde_json::Value = serde_json::from_str(&json_n).unwrap();
       assert!(v.is_string());

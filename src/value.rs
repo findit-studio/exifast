@@ -289,6 +289,32 @@ pub(crate) fn escape_json_is_number(s: &str) -> bool {
   i == b.len()
 }
 
+/// Whether a [`escape_json_is_number`] token's SIGNIFICAND represents a nonzero
+/// value — i.e. it contains a digit `1..=9` before the exponent marker.
+///
+/// Used by the `serialize_in_gate_number_str` / `classify_json_scalar` /
+/// `emit_gated_number` consumers to complete the f64-representation gate
+/// (Contract B / #197). The gate admits an exponent up to `e[-+]?\d{1,3}`
+/// (faithful to `exiftool:3810`), so it accepts tokens OUTSIDE finite-f64 range
+/// on BOTH sides: `1e999` OVERFLOWS to `INFINITY` (caught by `!is_finite()`),
+/// and `1e-999` UNDERFLOWS to a FINITE `0.0` — which the finite-only guard would
+/// silently rewrite the nonzero token to. A token whose significand is nonzero
+/// but which `parse::<f64>()`'d to `0.0` therefore underflowed and must be
+/// preserved as a string, NOT emitted as a bare `0.0`. A token whose significand
+/// is genuinely zero (`0`, `0.0`, `0.`, `.0`, `-0`, `0e-5`, …) legitimately
+/// denotes the value zero and stays a bare number.
+///
+/// Scans the significand only: bytes before `e`/`E`. The sign (`-`/`+`) and the
+/// decimal point are non-digits, so they are naturally skipped; any remaining
+/// byte in `1..=9` makes the significand nonzero. Allocation-free byte scan.
+#[must_use]
+pub(crate) fn lexeme_is_nonzero(token: &str) -> bool {
+  token
+    .bytes()
+    .take_while(|&b| b != b'e' && b != b'E')
+    .any(|b| b.is_ascii_digit() && b != b'0')
+}
+
 /// ExifTool's universal no-`-b` binary placeholder string for a value of `len`
 /// bytes: `"(Binary data <len> bytes, use -b option to extract)"`
 /// (`ExifTool.pm` `ConvertBinary` / the writer's `Binary data` rendering, and
@@ -823,11 +849,26 @@ const _: () = {
   /// `1.4e2` ≈ `140.0`). This keeps every existing golden byte-output unchanged
   /// AND adds NO allocation on the hot path (the alloc-budget regression guard).
   ///
-  /// **Soundness path (the value parses to a NON-FINITE f64).** The gate admits
-  /// an exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`), so it
-  /// accepts a token OUTSIDE finite-f64 range such as `1e999` (parses to
-  /// `INFINITY`). `serialize_f64(INFINITY)` would emit `null` (silent
-  /// corruption). Emit the ORIGINAL token as a QUOTED JSON STRING instead.
+  /// **Soundness path (the f64 does not FAITHFULLY represent the token).** The
+  /// gate admits an exponent up to `e[-+]?\d{1,3}` (faithful to `exiftool:3810`),
+  /// so it accepts a token OUTSIDE finite-f64 range on BOTH sides. An OVERFLOW
+  /// token such as `1e999` parses to `INFINITY`; `serialize_f64(INFINITY)` would
+  /// emit `null` (silent corruption). An UNDERFLOW token such as `1e-999` parses
+  /// to a FINITE `0.0`, so `is_finite()` alone would let it through and emit a
+  /// bare `0.0`, silently rewriting the nonzero source token to zero. In EITHER
+  /// case emit the ORIGINAL token as a QUOTED JSON STRING instead.
+  ///
+  /// **Completeness (the f64-representation class is CLOSED).** A gate-matching
+  /// token falls into exactly one of three cases: (a) it overflows finite-f64
+  /// range ⇒ `!is_finite()` ⇒ string; (b) it is a nonzero value that underflows
+  /// to zero ⇒ `f == 0.0 && lexeme_is_nonzero(token)` ⇒ string; or (c) it parses
+  /// to a finite f64 that faithfully denotes its value ⇒ bare number. There is no
+  /// fourth corrupting case: a genuine-zero lexeme (`0`/`0.0`/`0e-5`/`-0`) is
+  /// `f == 0.0` with a zero significand, so it stays a bare `0`; and precision
+  /// loss strictly within finite-nonzero range is value-preserving under the
+  /// token-exact comparator (`1.50` ≈ `1.5`). Hence `is_finite() && !(f == 0.0 &&
+  /// lexeme_is_nonzero)` is the complete predicate for "the f64 may be emitted
+  /// bare".
   ///
   /// NOTE — this is a deliberate CRAFTED-input divergence from ExifTool's
   /// `EscapeJSON`, which `return $str`s an over-range exponent BARE. Emitting a
@@ -846,12 +887,15 @@ const _: () = {
   fn serialize_in_gate_number_str<S: Serializer>(text: &str, s: S) -> Result<S::Ok, S::Error> {
     if let Ok(f) = text.parse::<f64>()
       && f.is_finite()
+      && !(f == 0.0 && crate::value::lexeme_is_nonzero(text))
     {
       return s.serialize_f64(f);
     }
-    // Non-finite (over-f64-range exponent, e.g. `1e999`) — emit the source
-    // token as a QUOTED string. Sound on every serde path (never `null`, never
-    // a `to_value` `NumberOutOfRange` error/panic).
+    // The f64 does NOT faithfully represent the token: an over-range exponent
+    // either OVERFLOWED to non-finite (`1e999`) or UNDERFLOWED a nonzero
+    // significand to `0.0` (`1e-999`). Emit the source token as a QUOTED string.
+    // Sound on every serde path (never `null`/`0.0` corruption, never a
+    // `to_value` `NumberOutOfRange` error/panic).
     s.serialize_str(text)
   }
 
@@ -1367,6 +1411,67 @@ mod tests {
       serde_json::to_value(TagValue::Str("13.59".into())).unwrap(),
       serde_json::json!(13.59)
     );
+  }
+
+  /// Contract B / #197 — the SYMMETRIC (under) side of the f64-representation
+  /// class. The gate admits an exponent `e[-+]?\d{1,3}`, so it also accepts a
+  /// token that UNDERFLOWS to a finite `0.0`: `1e-999` `parse::<f64>()`'s to
+  /// `Ok(0.0)` (finite), which the finite-only guard would emit as a bare `0.0`,
+  /// silently rewriting the nonzero source token to zero. The completed predicate
+  /// `is_finite() && !(f == 0.0 && lexeme_is_nonzero)` routes a nonzero-underflow
+  /// token to the QUOTED-string (preserve) path while keeping a GENUINE zero
+  /// token a bare `0`/`0.0` and a finite-nonzero in-range value a bare number.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn str_underflow_exponent_preserves_nonzero_token_not_zero() {
+    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // A NONZERO significand that underflows to `0.0` ⇒ preserved as a QUOTED
+    // string carrying the exact token, NEVER rewritten to a bare `0`/`0.0`.
+    assert_eq!(j(&TagValue::Str("1e-999".into())), r#""1e-999""#);
+    assert_eq!(j(&TagValue::Str("-1e-999".into())), r#""-1e-999""#);
+    assert_eq!(j(&TagValue::Str("9e-400".into())), r#""9e-400""#);
+    for tok in ["1e-999", "-1e-999", "9e-400"] {
+      let out = j(&TagValue::Str(tok.into()));
+      assert_ne!(out, "0", "nonzero-underflow token must not corrupt to 0");
+      assert_ne!(
+        out, "0.0",
+        "nonzero-underflow token must not corrupt to 0.0"
+      );
+      assert_eq!(
+        serde_json::from_str::<String>(&out).unwrap(),
+        tok,
+        "nonzero-underflow token must round-trip byte-identically as the string payload"
+      );
+    }
+    // A GENUINE zero token (significand is zero) legitimately denotes the value
+    // zero ⇒ stays a BARE number, not quoted.
+    assert_eq!(j(&TagValue::Str("0e-5".into())), "0.0");
+    assert_eq!(j(&TagValue::Str("0.0".into())), "0.0");
+    // A FINITE tiny IN-RANGE value (nonzero, does NOT underflow) ⇒ a bare number,
+    // NOT a quoted string — the predicate must not over-trigger on small magnitudes.
+    assert_eq!(j(&TagValue::Str("1e-300".into())), "1e-300");
+  }
+
+  /// Contract B / #197 — the `lexeme_is_nonzero` significand predicate that
+  /// completes the f64-representation gate. True iff a digit `1..=9` precedes the
+  /// exponent marker (sign and decimal point are non-digits, skipped).
+  #[test]
+  fn lexeme_is_nonzero_classifies_significand() {
+    // Nonzero significands (a `1..=9` digit before any `e`/`E`).
+    for tok in ["1e-999", "-1e-999", "9e-400", "1.5", "0.0001", "1e3", "100"] {
+      assert!(lexeme_is_nonzero(tok), "{tok} has a nonzero significand");
+    }
+    // Genuine-zero significands (every significand digit is `0`).
+    for tok in [
+      "0", "0.0", "0.", ".0", "-0", "+0.0", "0e-5", "0e10", "00.000",
+    ] {
+      assert!(
+        !lexeme_is_nonzero(tok),
+        "{tok} legitimately denotes the value zero"
+      );
+    }
+    // A nonzero EXPONENT must NOT count toward the significand: `0e9` is zero.
+    assert!(!lexeme_is_nonzero("0e9"));
   }
 
   /// Contract B / #197 — the integer and float serializers run the SAME
