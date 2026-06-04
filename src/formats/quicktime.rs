@@ -5040,6 +5040,105 @@ impl crate::emit::Taggable for Meta<'_> {
   }
 }
 
+/// Emit a timed-metadata GPS sample series faithfully. `-G1` (the default) emits
+/// only the FIRST coordinate fix (collapsed, Main group); `-G3` emits every fix
+/// as a `Doc<N>` row (Doc1 = first fix). `extract_embedded=false` ⇒ emit nothing
+/// (the caller emits the `[minor] ExtractEmbedded` warning instead, a later task).
+/// `emit_common` (this body) writes lat/lon/alt/track/dop/measure-mode/date_time;
+/// the `emit_extra` closure writes the per-source speed/extra columns (it has the
+/// quicktime PrintConv helpers). Both receive the per-fix `Group` + a push fn.
+///
+/// Doc numbering mirrors ExifTool `$$et{DOC_NUM} = ++$$et{DOC_COUNT}`
+/// (QuickTimeStream.pl:967-973): `++doc` ONLY for a coordinate-bearing fix, so a
+/// no-coordinate sample neither emits nor consumes a `Doc<N>` slot.
+#[cfg(feature = "alloc")]
+#[allow(dead_code)] // wired into Meta::tags by the next task
+fn emit_timed_samples<S: crate::metadata::TimedSample>(
+  samples: &[S],
+  family0: &str,
+  family1: &str,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  measure_mode_render: impl Fn(u32, bool) -> crate::value::TagValue,
+  mut emit_extra: impl FnMut(&S, &crate::value::Group, &mut std::vec::Vec<crate::emit::EmittedTag>),
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  if !opts.extract_embedded {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+  let mut doc: u32 = 0;
+  for s in samples.iter().filter(|s| s.has_coordinates()) {
+    doc += 1;
+    if !g3 && doc > 1 {
+      break;
+    }
+    let group = if g3 {
+      Group::with_doc(family0, family1, doc)
+    } else {
+      Group::new(family0, family1)
+    };
+    if let (Some(lat), Some(lon)) = (s.latitude(), s.longitude()) {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSLatitude".into(),
+        TagValue::F64(lat),
+        false,
+      ));
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSLongitude".into(),
+        TagValue::F64(lon),
+        false,
+      ));
+    }
+    if let Some(a) = s.altitude_m() {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSAltitude".into(),
+        TagValue::F64(a),
+        false,
+      ));
+    }
+    if let Some(t) = s.track_deg() {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSTrack".into(),
+        TagValue::F64(t),
+        false,
+      ));
+    }
+    if let Some(d) = s.dop() {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSDOP".into(),
+        TagValue::F64(d),
+        false,
+      ));
+    }
+    if let Some(m) = s.measure_mode() {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSMeasureMode".into(),
+        measure_mode_render(m, print_conv),
+        false,
+      ));
+    }
+    if let Some(dt) = s.date_time() {
+      out.push(EmittedTag::new(
+        group.clone(),
+        "GPSDateTime".into(),
+        TagValue::Str(dt.into()),
+        false,
+      ));
+    }
+    emit_extra(s, &group, out);
+  }
+}
+
 /// Build a GoPro unit-suffix tag value — the `'"$val <unit>"'` PrintConv shared
 /// by the Karma GLPI speeds (`" m/s"`, GoPro.pm:622-624) and the KBAT
 /// current/capacity/temperature/voltage/level columns (GoPro.pm:634-648). `-j`
@@ -8743,6 +8842,291 @@ mod tests {
         nested = atom(b"udta", &nested);
       }
       let _ = parse_inner(&file_with_moov(&nested), None);
+    }
+  }
+
+  // ── emit_timed_samples (shared `-ee` Doc<N> emitter, Task 7+8) ─────────────
+  mod emit_timed_samples_tests {
+    use super::*;
+    use crate::emit::{ConvMode, EmitOptions, EmittedTag};
+    use crate::metadata::TimedSample;
+    use crate::serialize_key::GroupMode;
+    use crate::value::TagValue;
+
+    /// A minimal coordinate-bearing sample: lat + lon only. A `None`-coordinate
+    /// fixture is built with `T::no_coord()`.
+    struct T {
+      lat: Option<f64>,
+      lon: Option<f64>,
+    }
+    impl T {
+      const fn fix(lat: f64, lon: f64) -> Self {
+        Self {
+          lat: Some(lat),
+          lon: Some(lon),
+        }
+      }
+      const fn no_coord() -> Self {
+        Self {
+          lat: None,
+          lon: None,
+        }
+      }
+    }
+    impl TimedSample for T {
+      fn latitude(&self) -> Option<f64> {
+        self.lat
+      }
+      fn longitude(&self) -> Option<f64> {
+        self.lon
+      }
+    }
+
+    /// Two coordinate fixes bracketing one no-coordinate sample (the no-coord
+    /// row must be skipped AND not advance the Doc counter).
+    fn series() -> [T; 3] {
+      [T::fix(1.0, 2.0), T::no_coord(), T::fix(3.0, 4.0)]
+    }
+
+    /// A never-called measure-mode renderer (these `T` fixtures carry no
+    /// measure-mode column) — exercises the "caller passes a never-called
+    /// closure" path.
+    fn no_measure(_m: u32, _pc: bool) -> TagValue {
+      unreachable!("T samples carry no measure-mode")
+    }
+
+    /// `extract_embedded=false` ⇒ the emitter writes NOTHING (the caller emits
+    /// the `[minor] ExtractEmbedded` warning instead, a later task).
+    #[test]
+    fn ee_disabled_emits_nothing() {
+      let samples = series();
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "QuickTime",
+        "QuickTime",
+        EmitOptions::g1(ConvMode::PrintConv, false),
+        true,
+        no_measure,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      assert!(out.is_empty(), "ee-disabled ⇒ no tags");
+    }
+
+    /// `-G1` (the default) ⇒ ONLY the first coordinate fix, collapsed to the
+    /// Main group (`doc == 0`): exactly one GPSLatitude carrying the first fix.
+    #[test]
+    fn g1_emits_only_first_fix_at_doc0() {
+      let samples = series();
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "QuickTime",
+        "QuickTime",
+        EmitOptions::g1(ConvMode::PrintConv, true),
+        true,
+        no_measure,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      // Project each GPSLatitude into (doc, value, family1) to assert without
+      // panicking `Vec` indexing (clippy `indexing_slicing`).
+      let lats: std::vec::Vec<(u32, &TagValue, &str)> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| {
+          (
+            t.tag().group_ref().doc(),
+            t.tag().value_ref(),
+            t.tag().group_ref().family1(),
+          )
+        })
+        .collect();
+      // -G1 summarizes to the first fix only: one row, Main group (doc 0).
+      assert_eq!(lats, std::vec![(0u32, &TagValue::F64(1.0), "QuickTime")]);
+      // Every emitted tag sits at doc 0 under `-G1`.
+      assert!(out.iter().all(|t| t.tag().group_ref().doc() == 0));
+    }
+
+    /// `-G3` ⇒ EVERY coordinate fix as its own `Doc<N>` row (Doc1 = first fix,
+    /// Doc2 = second). The no-coordinate sample neither emits nor advances `doc`.
+    #[test]
+    fn g3_emits_each_fix_as_docn() {
+      let samples = series();
+      let opts = EmitOptions {
+        mode: ConvMode::PrintConv,
+        extract_embedded: true,
+        group_mode: GroupMode::G3,
+      };
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "QuickTime",
+        "QuickTime",
+        opts,
+        true,
+        no_measure,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      // Doc1 = first fix (lat 1.0); Doc2 = second fix (lat 3.0). The no-coord
+      // middle sample did NOT consume a doc number. Project to (doc, value)
+      // pairs and assert the whole sequence (no panicking indexing).
+      let lats: std::vec::Vec<(u32, &TagValue)> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().value_ref()))
+        .collect();
+      assert_eq!(
+        lats,
+        std::vec![(1u32, &TagValue::F64(1.0)), (2u32, &TagValue::F64(3.0))],
+        "-G3 emits one Doc<N> row per coordinate fix"
+      );
+    }
+
+    /// The `emit_extra` closure receives the per-fix `Group` (carrying the right
+    /// `Doc<N>`) and can push per-source columns; with two `-G3` fixes it fires
+    /// once per fix at the matching doc.
+    #[test]
+    fn emit_extra_runs_per_fix_with_doc_group() {
+      let samples = series();
+      let opts = EmitOptions {
+        mode: ConvMode::PrintConv,
+        extract_embedded: true,
+        group_mode: GroupMode::G3,
+      };
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "GoPro",
+        "GoPro",
+        opts,
+        true,
+        no_measure,
+        |_s, g, o| {
+          o.push(EmittedTag::new(
+            g.clone(),
+            "GPSSpeed".into(),
+            TagValue::F64(99.0),
+            false,
+          ));
+        },
+        &mut out,
+      );
+      // emit_extra fires once per coordinate fix, at the matching Doc<N> and
+      // family1. Project to (doc, family1) and assert the sequence.
+      let speeds: std::vec::Vec<(u32, &str)> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSSpeed")
+        .map(|t| (t.tag().group_ref().doc(), t.tag().group_ref().family1()))
+        .collect();
+      assert_eq!(speeds, std::vec![(1u32, "GoPro"), (2u32, "GoPro")]);
+    }
+
+    /// A GpsSample series exercises the real `TimedSample` impl end-to-end: the
+    /// common GPSAltitude / GPSTrack / GPSDateTime columns flow through the
+    /// emitter, and a no-coordinate (accelerometer-only) sample is skipped.
+    #[test]
+    fn gps_sample_series_common_columns_g3() {
+      use crate::metadata::GpsSample;
+      let mut a = GpsSample::new();
+      a.set_latitude(Some(10.0))
+        .set_longitude(Some(20.0))
+        .set_altitude_m(Some(100.0))
+        .set_track(Some(45.0))
+        .set_date_time(Some("2024:01:01 00:00:00Z".into()));
+      let mut accel_only = GpsSample::new();
+      accel_only.set_accelerometer(Some("1 2 3".into()));
+      let mut b = GpsSample::new();
+      b.set_latitude(Some(11.0)).set_longitude(Some(21.0));
+      let samples = [a, accel_only, b];
+
+      let opts = EmitOptions {
+        mode: ConvMode::ValueConv,
+        extract_embedded: true,
+        group_mode: GroupMode::G3,
+      };
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "QuickTime",
+        "QuickTime",
+        opts,
+        false,
+        no_measure,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      // Two coordinate fixes ⇒ Doc1 + Doc2; the accelerometer-only sample is
+      // skipped (no coordinates) and does not advance the doc counter.
+      let lat_docs: std::vec::Vec<u32> = out
+        .iter()
+        .filter(|t| t.tag().name() == "GPSLatitude")
+        .map(|t| t.tag().group_ref().doc())
+        .collect();
+      assert_eq!(lat_docs, std::vec![1u32, 2u32]);
+      // Doc1 carries the common columns of the first fix.
+      let doc1: std::vec::Vec<&EmittedTag> = out
+        .iter()
+        .filter(|t| t.tag().group_ref().doc() == 1)
+        .collect();
+      let alt = doc1
+        .iter()
+        .find(|t| t.tag().name() == "GPSAltitude")
+        .expect("GPSAltitude");
+      assert_eq!(alt.tag().value_ref(), &TagValue::F64(100.0));
+      let trk = doc1
+        .iter()
+        .find(|t| t.tag().name() == "GPSTrack")
+        .expect("GPSTrack");
+      assert_eq!(trk.tag().value_ref(), &TagValue::F64(45.0));
+      let dt = doc1
+        .iter()
+        .find(|t| t.tag().name() == "GPSDateTime")
+        .expect("GPSDateTime");
+      assert_eq!(
+        dt.tag().value_ref(),
+        &TagValue::Str("2024:01:01 00:00:00Z".into())
+      );
+      // The second fix (Doc2) carries no altitude/track/date_time.
+      assert!(
+        !out
+          .iter()
+          .any(|t| t.tag().group_ref().doc() == 2 && t.tag().name() == "GPSAltitude")
+      );
+    }
+
+    /// The measure-mode renderer IS invoked for a source that carries the
+    /// column — a CammGpsSample (camm6) series renders `GPSMeasureMode` through
+    /// the passed closure.
+    #[test]
+    fn measure_mode_rendered_for_camm6() {
+      use crate::metadata::CammGpsSample;
+      let mut s = CammGpsSample::new(6);
+      s.set_latitude(Some(37.0))
+        .set_longitude(Some(-122.0))
+        .set_measure_mode(Some(3));
+      let samples = [s];
+      let mut out = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        "QuickTime",
+        "QuickTime",
+        EmitOptions::g1(ConvMode::PrintConv, true),
+        true,
+        camm_gps_measure_mode_value,
+        |_s, _g, _o| {},
+        &mut out,
+      );
+      let mm = out
+        .iter()
+        .find(|t| t.tag().name() == "GPSMeasureMode")
+        .expect("GPSMeasureMode emitted");
+      assert_eq!(
+        mm.tag().value_ref(),
+        &TagValue::Str("3-Dimensional Measurement".into())
+      );
     }
   }
 }

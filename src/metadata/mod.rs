@@ -31,6 +31,7 @@ pub(crate) mod png;
 pub mod project;
 mod quicktime;
 mod quicktime_stream;
+mod timed_sample;
 // RIFF / AVI domain projection (`impl Project for RiffMeta`). Gated on the
 // `riff` feature; the module holds only the trait impl (no public items to
 // re-export).
@@ -58,3 +59,4 @@ pub use quicktime::{
   HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeKeys, QuickTimeMeta, QuickTimeUserData,
 };
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
+pub(crate) use timed_sample::TimedSample;
