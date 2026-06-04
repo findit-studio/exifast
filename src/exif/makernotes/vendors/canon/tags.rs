@@ -870,12 +870,16 @@ pub const CANON_TAGS: &[CanonTag] = &[
   },
 ];
 
-/// Look up a Canon Main tag by ID. Linear scan over the 78-entry table
-/// is in the noise (the table is sorted by ID for diagnostics + future
-/// `binary_search` swap).
+/// Look up a Canon Main tag by ID via binary search over the ID-sorted
+/// 78-entry table (`canon_tags_sorted_by_id` guards the invariant).
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static CanonTag> {
-  CANON_TAGS.iter().find(|t| t.id == id)
+  match CANON_TAGS.binary_search_by_key(&id, |t| t.id) {
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => CANON_TAGS.get(i),
+    Err(_) => None,
+  }
 }
 
 #[cfg(test)]

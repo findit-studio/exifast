@@ -377,13 +377,16 @@ pub const APPLE_TAGS: &[AppleTag] = &[
   },
 ];
 
-/// Resolve a tag ID against [`APPLE_TAGS`] via linear scan. The 40-entry
-/// table is small enough that a binary-search win is in the noise — but
-/// we keep the table SORTED by ID for diagnostics + a future
-/// `binary_search` swap.
+/// Resolve a tag ID against the ID-sorted [`APPLE_TAGS`] table via binary
+/// search (`apple_tags_sorted_by_id` guards the sorted invariant).
 #[must_use]
 pub fn lookup(id: u16) -> Option<&'static AppleTag> {
-  APPLE_TAGS.iter().find(|t| t.id == id)
+  match APPLE_TAGS.binary_search_by_key(&id, |t| t.id) {
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => APPLE_TAGS.get(i),
+    Err(_) => None,
+  }
 }
 
 #[cfg(test)]
