@@ -875,9 +875,15 @@ const MDPM_TABLE: &[MdpmTag] = &[
   },
 ];
 
-/// Look up an MDPM tag id in [`MDPM_TABLE`].
+/// Look up an MDPM tag id in the id-sorted [`MDPM_TABLE`] via binary search
+/// (`mdpm_table_sorted_by_id` guards the sorted invariant).
 fn mdpm_tag(id: u8) -> Option<&'static MdpmTag> {
-  MDPM_TABLE.iter().find(|t| t.id == id)
+  match MDPM_TABLE.binary_search_by_key(&id, |t| t.id) {
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => MDPM_TABLE.get(i),
+    Err(_) => None,
+  }
 }
 
 /// Evaluate a tag's `Condition => '$$self{Make} eq "…"'` (H264.pm:396/405/
@@ -3198,6 +3204,26 @@ impl crate::metadata::Project for H264Meta<'_> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+
+  /// [`MDPM_TABLE`] must stay strictly sorted by `id` — the invariant
+  /// `mdpm_tag`'s `binary_search_by_key` relies on. A future unsorted edit
+  /// trips this test rather than silently breaking lookups.
+  #[test]
+  fn mdpm_table_sorted_by_id() {
+    let mut prev: i16 = -1;
+    for t in MDPM_TABLE {
+      assert!(
+        i16::from(t.id) > prev,
+        "MDPM_TABLE not sorted: 0x{:02x} after {prev}",
+        t.id
+      );
+      prev = i16::from(t.id);
+    }
+    // Every row is still reachable through the binary search.
+    for t in MDPM_TABLE {
+      assert_eq!(mdpm_tag(t.id).map(|d| d.id), Some(t.id));
+    }
+  }
 
   /// Drive the `H264Meta` through the production sink path that replaced the
   /// retired `serialize_tags`: the golden-pattern engine

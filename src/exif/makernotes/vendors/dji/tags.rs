@@ -98,14 +98,17 @@ pub const DJI_TAGS: &[DjiTag] = &[
   },
 ];
 
-/// Resolve a tag ID to its [`DjiTag`] row, or `None` for unknown.
+/// Resolve a tag ID to its [`DjiTag`] row, or `None` for unknown. Binary
+/// search over the ID-sorted table (`table_is_sorted_by_id` guards it).
 #[must_use]
 #[inline]
 pub fn lookup(id: u16) -> Option<&'static DjiTag> {
-  // Linear search — the table is 10 rows; binary search is overkill.
-  // Phase 3's Panasonic/Sony tables use binary search because they're
-  // 100s of rows.
-  DJI_TAGS.iter().find(|t| t.id == id)
+  match DJI_TAGS.binary_search_by_key(&id, |t| t.id) {
+    // `binary_search_by_key` returns the found index, so `i` is in-bounds;
+    // `.get(i)` is the checked form (always `Some` here) — byte-identical.
+    Ok(i) => DJI_TAGS.get(i),
+    Err(_) => None,
+  }
 }
 
 #[cfg(test)]

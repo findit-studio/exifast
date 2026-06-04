@@ -1388,10 +1388,234 @@ const TAG_TABLE: &[TagDef] = &[
   }, // Binary (Matroska.pm:695; bundled emits as `(Binary data N bytes, use -b option to extract)` placeholder)
 ];
 
-/// Resolve `id` → `TagDef`. `None` for unknown ID (faithful to
-/// Matroska.pm:1127-1129 — "unknown tag, verbose log, skip past size bytes").
+/// Element-ID → [`TAG_TABLE`] index, sorted ascending by ID for
+/// `binary_search`.
+///
+/// [`TAG_TABLE`] stays in faithful Matroska.pm section order (its per-section
+/// provenance comments would be lost if it were sorted by ID), so this
+/// companion index carries the key order. The crate is `no_std`, so a
+/// runtime `OnceLock` index is unavailable; this const array is the
+/// `no_std`-compatible substitute.
+///
+/// The second field is the row's position in [`TAG_TABLE`].
+/// `tag_index_round_trips` re-derives the mapping and fails on any drift, so
+/// the hand-listed row numbers can never silently go stale.
+const TAG_INDEX: &[(i64, u16)] = &[
+  (0x0, 174),
+  (0x3, 72),
+  (0x5, 175),
+  (0x6, 86),
+  (0x8, 74),
+  (0x9, 173),
+  (0xe, 60),
+  (0xf, 172),
+  (0x11, 165),
+  (0x12, 166),
+  (0x16, 145),
+  (0x17, 146),
+  (0x18, 167),
+  (0x1a, 100),
+  (0x1b, 55),
+  (0x1c, 76),
+  (0x1f, 118),
+  (0x20, 48),
+  (0x21, 49),
+  (0x22, 50),
+  (0x23, 47),
+  (0x24, 59),
+  (0x25, 54),
+  (0x26, 52),
+  (0x27, 45),
+  (0x2a, 93),
+  (0x2b, 46),
+  (0x2e, 69),
+  (0x2f, 67),
+  (0x30, 102),
+  (0x33, 138),
+  (0x35, 116),
+  (0x36, 163),
+  (0x37, 139),
+  (0x39, 73),
+  (0x3a, 103),
+  (0x3b, 137),
+  (0x3f, 8),
+  (0x4b, 64),
+  (0x4c, 62),
+  (0x4d, 63),
+  (0x4e, 65),
+  (0x4f, 66),
+  (0x57, 70),
+  (0x5b, 144),
+  (0x60, 99),
+  (0x61, 115),
+  (0x67, 42),
+  (0x68, 61),
+  (0x6a, 143),
+  (0x6b, 148),
+  (0x6c, 9),
+  (0x6e, 53),
+  (0x71, 141),
+  (0x77, 140),
+  (0x7a, 56),
+  (0x7b, 57),
+  (0x7d, 58),
+  (0x254, 127),
+  (0x255, 128),
+  (0x282, 5),
+  (0x285, 7),
+  (0x286, 1),
+  (0x287, 6),
+  (0x2f2, 3),
+  (0x2f3, 4),
+  (0x2f7, 2),
+  (0x37c, 176),
+  (0x37e, 177),
+  (0x444, 30),
+  (0x461, 37),
+  (0x47a, 195),
+  (0x484, 196),
+  (0x485, 198),
+  (0x487, 197),
+  (0x489, 36),
+  (0x50d, 180),
+  (0x598, 168),
+  (0x5a3, 194),
+  (0x5b9, 158),
+  (0x5bc, 159),
+  (0x5bd, 160),
+  (0x5db, 161),
+  (0x5dd, 162),
+  (0x65c, 154),
+  (0x660, 153),
+  (0x66e, 152),
+  (0x675, 156),
+  (0x67e, 151),
+  (0x6ae, 155),
+  (0x7e1, 130),
+  (0x7e2, 131),
+  (0x7e3, 132),
+  (0x7e4, 133),
+  (0x7e5, 134),
+  (0x7e6, 135),
+  (0xd80, 39),
+  (0xdbb, 20),
+  (0x1031, 123),
+  (0x1032, 124),
+  (0x1033, 125),
+  (0x1034, 126),
+  (0x1035, 129),
+  (0x135f, 147),
+  (0x136e, 83),
+  (0x1378, 142),
+  (0x137f, 81),
+  (0x13ab, 21),
+  (0x13ac, 22),
+  (0x13b8, 101),
+  (0x14aa, 104),
+  (0x14b0, 108),
+  (0x14b2, 110),
+  (0x14b3, 111),
+  (0x14ba, 109),
+  (0x14bb, 105),
+  (0x14cc, 106),
+  (0x14dd, 107),
+  (0x15aa, 75),
+  (0x15ee, 82),
+  (0x1741, 40),
+  (0x1854, 43),
+  (0x18d7, 44),
+  (0x21a7, 150),
+  (0x2240, 122),
+  (0x2264, 120),
+  (0x23a2, 87),
+  (0x23c0, 186),
+  (0x23c3, 171),
+  (0x23c4, 191),
+  (0x23c5, 189),
+  (0x23c6, 192),
+  (0x23c9, 190),
+  (0x23ca, 188),
+  (0x2532, 17),
+  (0x2624, 95),
+  (0x26a5, 98),
+  (0x26bf, 97),
+  (0x26fc, 96),
+  (0x27c8, 193),
+  (0x28ca, 187),
+  (0x2911, 181),
+  (0x2922, 182),
+  (0x2924, 31),
+  (0x2933, 183),
+  (0x2944, 178),
+  (0x2955, 179),
+  (0x29a5, 34),
+  (0x29bf, 33),
+  (0x29fc, 32),
+  (0x2d80, 121),
+  (0x2de7, 77),
+  (0x2df8, 78),
+  (0x2e67, 169),
+  (0x2ebc, 170),
+  (0x2fab, 94),
+  (0x3373, 185),
+  (0x3384, 25),
+  (0x33a4, 24),
+  (0x33c4, 164),
+  (0x33c5, 71),
+  (0x3446, 89),
+  (0x35a1, 51),
+  (0x38b5, 117),
+  (0x3ba9, 38),
+  (0x3d7b, 119),
+  (0x3e5b, 15),
+  (0x3e7b, 16),
+  (0x3e8a, 11),
+  (0x3e9a, 12),
+  (0x3ea5, 13),
+  (0x3eb5, 14),
+  (0x2b59c, 84),
+  (0x2b59d, 85),
+  (0x3314f, 80),
+  (0x383e3, 114),
+  (0x3e383, 79),
+  (0x58688, 88),
+  (0x6b240, 92),
+  (0xad7b1, 35),
+  (0xeb524, 112),
+  (0xfb523, 113),
+  (0x1a9697, 90),
+  (0x1b4040, 91),
+  (0x1c83ab, 27),
+  (0x1cb923, 26),
+  (0x1e83bb, 29),
+  (0x1eb923, 28),
+  (0x43a770, 157),
+  (0x14d9b74, 19),
+  (0x254c367, 184),
+  (0x549a966, 23),
+  (0x654ae6b, 68),
+  (0x8538067, 18),
+  (0x941a469, 149),
+  (0xa45dfa3, 0),
+  (0xb538667, 10),
+  (0xc53bb6b, 136),
+  (0xf43b675, 41),
+];
+
+/// Resolve `id` → `TagDef` via binary search over [`TAG_INDEX`]. `None` for
+/// unknown ID (faithful to Matroska.pm:1127-1129 — "unknown tag, verbose
+/// log, skip past size bytes").
 fn tag_def(id: i64) -> Option<&'static TagDef> {
-  TAG_TABLE.iter().find(|t| t.id == id)
+  let i = TAG_INDEX.binary_search_by_key(&id, |&(k, _)| k).ok()?;
+  // `binary_search_by_key` yields an in-bounds `TAG_INDEX` slot on `Ok`; the
+  // row it stores is `< TAG_TABLE.len()` (guarded by `tag_index_round_trips`),
+  // so both `.get`s are the checked, provably-`Some` form.
+  let &(_, row) = TAG_INDEX.get(i)?;
+  let def = TAG_TABLE.get(row as usize)?;
+  // The index slot must point at the row that actually holds this ID — cheap
+  // in debug, compiled out in release. Also keeps `TagDef::id` a live read.
+  debug_assert_eq!(def.id, id, "TAG_INDEX row {row} mismatched ID");
+  Some(def)
 }
 
 // ===========================================================================
@@ -1981,11 +2205,135 @@ const STD_TAG_TABLE: &[StdTagEntry] = &[
   },
 ];
 
-/// Resolve a SimpleTag's `TagName` to its canonical tag name. Returns
-/// `None` for unknown keys — the caller falls back to the bundled-Perl
-/// "synthesize a name" path (Matroska.pm:905-911).
+/// SimpleTag-`TagName` → [`STD_TAG_TABLE`] index, sorted ascending by key
+/// for `binary_search`. [`STD_TAG_TABLE`] keeps its faithful Matroska.pm
+/// section order; this `no_std`-compatible companion index supplies the key
+/// order. `std_tag_index_round_trips` re-derives + verifies the mapping, so
+/// the hand-listed row numbers cannot silently go stale.
+const STD_TAG_INDEX: &[(&str, u16)] = &[
+  ("ACCOMPANIMENT", 16),
+  ("ACTOR", 30),
+  ("ADDRESS", 11),
+  ("ARRANGER", 18),
+  ("ARTIST", 14),
+  ("ART_DIRECTOR", 26),
+  ("ASSISTANT_DIRECTOR", 23),
+  ("BARCODE", 84),
+  ("BPM", 76),
+  ("BPS", 74),
+  ("CATALOG_NUMBER", 85),
+  ("CHARACTER", 31),
+  ("CHOREGRAPHER", 28),
+  ("COMMENT", 69),
+  ("COMPOSER", 17),
+  ("COMPOSER_NATIONALITY", 68),
+  ("COMPOSITION_LOCATION", 67),
+  ("CONDUCTOR", 21),
+  ("CONTENT_TYPE", 50),
+  ("COPRODUCER", 36),
+  ("COPYRIGHT", 96),
+  ("COSTUME_DESIGNER", 29),
+  ("COUNTRY", 2),
+  ("DATE_DIGITIZED", 63),
+  ("DATE_ENCODED", 61),
+  ("DATE_PURCHASED", 65),
+  ("DATE_RECORDED", 60),
+  ("DATE_RELEASED", 59),
+  ("DATE_TAGGED", 62),
+  ("DATE_WRITTEN", 64),
+  ("DESCRIPTION", 52),
+  ("DIRECTOR", 22),
+  ("DIRECTOR_OF_PHOTOGRAPHY", 24),
+  ("DISTRIBUTED_BY", 38),
+  ("DURATION", 103),
+  ("EDITED_BY", 34),
+  ("EMAIL", 10),
+  ("ENCODED_BY", 40),
+  ("ENCODER", 72),
+  ("ENCODER_SETTINGS", 73),
+  ("EXECUTIVE_PRODUCER", 37),
+  ("FAX", 12),
+  ("FPS", 75),
+  ("GENRE", 47),
+  ("IMDB", 88),
+  ("INITIAL_KEY", 56),
+  ("ISBN", 83),
+  ("ISRC", 81),
+  ("KEYWORDS", 53),
+  ("LABEL", 46),
+  ("LABEL_CODE", 86),
+  ("LAW_RATING", 58),
+  ("LCCN", 87),
+  ("LEAD_PERFORMER", 15),
+  ("LICENSE", 98),
+  ("LYRICIST", 20),
+  ("LYRICS", 19),
+  ("MASTERED_BY", 39),
+  ("MCDI", 82),
+  ("MEASURE", 77),
+  ("MIXED_BY", 41),
+  ("MOOD", 48),
+  ("NUMBER_OF_BYTES", 105),
+  ("NUMBER_OF_FRAMES", 104),
+  ("ORIGINAL", 0),
+  ("ORIGINAL_MEDIA_TYPE", 49),
+  ("PART_NUMBER", 4),
+  ("PART_OFFSET", 5),
+  ("PERIOD", 57),
+  ("PHONE", 13),
+  ("PLAY_COUNTER", 70),
+  ("PRODUCER", 35),
+  ("PRODUCTION_COPYRIGHT", 97),
+  ("PRODUCTION_DESIGNER", 27),
+  ("PRODUCTION_STUDIO", 43),
+  ("PUBLISHER", 45),
+  ("PURCHASE_CURRENCY", 95),
+  ("PURCHASE_INFO", 92),
+  ("PURCHASE_ITEM", 91),
+  ("PURCHASE_OWNER", 93),
+  ("PURCHASE_PRICE", 94),
+  ("RATING", 71),
+  ("RECORDING_LOCATION", 66),
+  ("REMIXED_BY", 42),
+  ("REPLAYGAIN_GAIN", 79),
+  ("REPLAYGAIN_PEAK", 80),
+  ("SAMPLE", 1),
+  ("SCREENPLAY_BY", 33),
+  ("SORT_WITH", 9),
+  ("SOUND_ENGINEER", 25),
+  ("SUBJECT", 51),
+  ("SUBTITLE", 7),
+  ("SUMMARY", 54),
+  ("SYNOPSIS", 55),
+  ("TERMS_OF_USE", 99),
+  ("THANKS_TO", 44),
+  ("TITLE", 6),
+  ("TMDB", 89),
+  ("TOTAL_PARTS", 3),
+  ("TUNING", 78),
+  ("TVDB", 90),
+  ("URL", 8),
+  ("WRITTEN_BY", 32),
+  ("_STATISTICS_TAGS", 102),
+  ("_STATISTICS_WRITING_APP", 101),
+  ("_STATISTICS_WRITING_DATE_UTC", 100),
+];
+
+/// Resolve a SimpleTag's `TagName` to its canonical tag name via binary
+/// search over [`STD_TAG_INDEX`]. Returns `None` for unknown keys — the
+/// caller falls back to the bundled-Perl "synthesize a name" path
+/// (Matroska.pm:905-911).
 fn std_tag_lookup(key: &str) -> Option<StdTagEntry> {
-  STD_TAG_TABLE.iter().find(|e| e.key == key).copied()
+  let i = STD_TAG_INDEX.binary_search_by(|&(k, _)| k.cmp(key)).ok()?;
+  // `binary_search` yields an in-bounds `STD_TAG_INDEX` slot on `Ok`; the row
+  // it stores is `< STD_TAG_TABLE.len()` (guarded by the round-trip test), so
+  // both `.get`s are the checked, provably-`Some` form.
+  let &(_, row) = STD_TAG_INDEX.get(i)?;
+  let entry = STD_TAG_TABLE.get(row as usize)?;
+  // The index slot must point at the row that actually holds this key — cheap
+  // in debug, compiled out in release. Also keeps `StdTagEntry::key` a live read.
+  debug_assert_eq!(entry.key, key, "STD_TAG_INDEX row {row} mismatched key");
+  Some(*entry)
 }
 
 /// Synthesize a canonical tag name from an off-table TagName key — faithful
@@ -3896,6 +4244,66 @@ fn maybe_handle_conditional<'a>(w: &mut Walker<'a>, id: i64, body: &'a [u8]) -> 
 #[allow(clippy::indexing_slicing)]
 mod tests {
   use super::*;
+
+  /// [`TAG_INDEX`] must stay sorted by ID (the `binary_search` invariant)
+  /// AND map every ID back to the [`TAG_TABLE`] row that holds it.
+  /// Re-deriving the mapping here makes any drift in the hand-listed index
+  /// (stale row number, missing/extra row, broken sort) a hard test failure.
+  #[test]
+  fn tag_index_round_trips() {
+    assert_eq!(
+      TAG_INDEX.len(),
+      TAG_TABLE.len(),
+      "TAG_INDEX must have one slot per TAG_TABLE row"
+    );
+    let mut prev: i64 = -1;
+    for &(id, row) in TAG_INDEX {
+      assert!(id > prev, "TAG_INDEX not sorted: 0x{id:x} after 0x{prev:x}");
+      prev = id;
+      assert_eq!(
+        TAG_TABLE[row as usize].id, id,
+        "TAG_INDEX[{row}] points at the wrong TAG_TABLE row"
+      );
+    }
+    for (i, t) in TAG_TABLE.iter().enumerate() {
+      assert_eq!(
+        tag_def(t.id).map(|d| d.id),
+        Some(t.id),
+        "row {i} (0x{:x}) is not reachable via tag_def",
+        t.id
+      );
+    }
+  }
+
+  /// [`STD_TAG_INDEX`] must stay sorted by key AND map every key back to the
+  /// [`STD_TAG_TABLE`] row that holds it; drift becomes a hard test failure.
+  #[test]
+  fn std_tag_index_round_trips() {
+    assert_eq!(
+      STD_TAG_INDEX.len(),
+      STD_TAG_TABLE.len(),
+      "STD_TAG_INDEX must have one slot per STD_TAG_TABLE row"
+    );
+    let mut prev: Option<&str> = None;
+    for &(key, row) in STD_TAG_INDEX {
+      if let Some(p) = prev {
+        assert!(p < key, "STD_TAG_INDEX not sorted: {key} after {p}");
+      }
+      prev = Some(key);
+      assert_eq!(
+        STD_TAG_TABLE[row as usize].key, key,
+        "STD_TAG_INDEX[{row}] points at the wrong STD_TAG_TABLE row"
+      );
+    }
+    for (i, e) in STD_TAG_TABLE.iter().enumerate() {
+      assert_eq!(
+        std_tag_lookup(e.key).map(|x| x.key),
+        Some(e.key),
+        "row {i} ({}) is not reachable via std_tag_lookup",
+        e.key
+      );
+    }
+  }
 
   /// Drive the `Meta` through the golden-pattern engine
   /// ([`run_emission`](crate::emit::run_emission)) for `print_conv` and
