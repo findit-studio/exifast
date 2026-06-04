@@ -371,10 +371,14 @@ fn scalar_value_eq(a: &RawValue, g: &RawValue, strict: bool) -> bool {
 }
 
 /// A normal form of a SCALAR under our value-equivalence, used only as a sort
-/// key when pairing duplicate object keys (`canonical`). Two scalars that are
-/// `scalar_value_eq` MUST map to the same string here, else the dup-pairing
-/// sort could mis-rank value-equal-but-differently-spelled duplicates. Numbers
-/// canonicalize to a single normalized form; non-numbers keep their raw text.
+/// key when pairing duplicate object keys (`canonical`). The invariant the
+/// dup-pairing sort relies on: `scalar_value_eq(a, g, strict)` ⟺
+/// `canonical_scalar(a, strict) == canonical_scalar(g, strict)` — two scalars
+/// that are value-equal MUST map to the same string, else the sort could
+/// mis-rank value-equal-but-differently-spelled duplicates against a neighbor
+/// and report a false mismatch. The numeric key therefore derives from the
+/// SAME exact-value notion `scalar_value_eq` uses (every integer-valued number
+/// folds to one `#i<decimal>` key); non-numbers keep their raw text.
 ///
 /// `strict` mirrors [`scalar_value_eq`]'s typing: under strict, a QUOTED scalar
 /// is canonicalized by its EXACT quoted lexeme (the `q:`-prefixed `None` arm),
@@ -391,20 +395,41 @@ fn canonical_scalar(r: &RawValue, strict: bool) -> String {
   if strict && quoted {
     return format!("q:{}", r.get().trim());
   }
+  // The numeric key must derive from the SAME exact-value notion
+  // `scalar_value_eq`/`NumVal::value_eq` uses, so canonicalization ⇔ equality
+  // holds for ALL numeric pairs: `scalar_value_eq(a,b)` ⟺
+  // `canonical_scalar(a) == canonical_scalar(b)` for numbers, in both modes.
+  // `value_eq` treats a bare integer EQUAL to an integer-valued float that
+  // recovers to the same integer via `f_as_exact_i128`/`f_as_exact_u128`, so the
+  // canonical key folds EVERY integer-valued number (`Int`/`Uint`, OR a `Float`
+  // that recovers exactly) onto one `#i<exact-integer-decimal>` key. A keying by
+  // the float's `{}` text would diverge from the int's decimal — `1e23` displays
+  // `100000000000000000000000` but recovers to the integer `99999999999999991611392`
+  // (R3), and `-0.0`/`0.0` both recover to `0` (R2, now subsumed: the `±0.0`
+  // case falls out of the exact-integer path). A genuinely non-integer (or
+  // out-of-u128-range) float keys by its f64 `{}` form, tagged `#f`: equal-value
+  // spellings (`1.5`==`1.50`==`1.5e0`) share one f64 ⇒ one key, matching
+  // `value_eq`'s raw `f64 ==`. The `#i`/`#f` tags can never alias each other, a
+  // bare non-number's raw text (`true`/`null`, never `#`-prefixed), or — under
+  // strict — a quoted scalar's `q:` key. This is a SORT KEY only;
+  // `scalar_value_eq` remains the verdict.
   match parse_number(text) {
-    // Integers print exactly; floats via `{}` (a single deterministic form,
-    // e.g. `0.0` and `0.00000000` both canonicalize to `0`). This is a SORT
-    // KEY only — `scalar_value_eq` remains the verdict (so f64 round-trip
-    // imprecision in the key can never change equality, only pairing order).
-    Some(NumVal::Int(i)) => format!("#{i}"),
-    Some(NumVal::Uint(u)) => format!("#{u}"),
-    // Zero must be SIGN-AGNOSTIC: `scalar_value_eq` treats `-0.0 == 0.0`, but
-    // `{}`-formatting them yields DIFFERENT keys (`#-0` vs `#0`), which would
-    // mispair an equal duplicate-key multiset whose zeros are spelled with
-    // opposite sign (FINDING 2). Collapse both ±0.0 to a single `#0` key so the
-    // sort ranks them identically (consistent with the equality verdict).
-    Some(NumVal::Float(f)) if f == 0.0 => "#0".to_string(),
-    Some(NumVal::Float(f)) => format!("#{}", f),
+    Some(NumVal::Int(i)) => format!("#i{i}"),
+    Some(NumVal::Uint(u)) => format!("#i{u}"),
+    Some(NumVal::Float(f)) => {
+      if let Some(i) = f_as_exact_i128(f) {
+        format!("#i{i}")
+      } else if let Some(u) = f_as_exact_u128(f) {
+        // Positive integer-valued floats above i128 but within u128 (mirrors the
+        // `Uint`/`Float` `value_eq` arm), e.g. a `3.4e38`-magnitude whole number.
+        format!("#i{u}")
+      } else {
+        // Genuinely fractional, or out of u128 range (then a bare integer literal
+        // of the same magnitude is itself parsed as a `Float`, so both sides key
+        // here identically). `{}` is deterministic per f64 value.
+        format!("#f{f}")
+      }
+    }
     None => r.get().trim().to_string(),
   }
 }
@@ -629,6 +654,74 @@ mod tests {
     // when the other side holds two non-zero values).
     assert!(json_equivalent_strict(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.5}]"#).is_err());
     assert!(json_equivalent(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.5}]"#).is_err());
+  }
+
+  #[test]
+  fn dup_keys_integer_valued_float_pairs_with_exact_integer() {
+    // FINDING (Codex R3): the dup-key multiset sort key (`canonical_scalar`)
+    // keyed a bare integer by its EXACT decimal but a non-zero integer-valued
+    // FLOAT by `format!("#{}", f)` — DIFFERENT keys for value-EQUAL scalars,
+    // because `scalar_value_eq` treats a bare int equal to an integer-valued
+    // float via `f_as_exact_i128`/`f_as_exact_u128`. The R2 `#0`-for-zero guard
+    // patched ONLY zero; non-zero stayed broken. e.g. `1e23` recovers to the
+    // exact integer `99999999999999991611392` (so they value-equal), yet the
+    // float `{}`-formatted to `100000000000000000000000` ⇒ key `#100…000` while
+    // the int keyed `#99…392`. With both sides holding the SAME multiset
+    // {that value, a neighbor `2`} but the value spelled as the float on one
+    // side and the exact int on the other, the neighbor's `#2` key sorts
+    // BETWEEN the two divergent keys, so the value-equal item landed at opposite
+    // ranks and mispaired against `2` ⇒ a FALSE MISMATCH. The numeric canonical
+    // key must derive from the same exact-value notion `scalar_value_eq` uses,
+    // so an integer-valued float and the bare integer share one `#i…` key.
+    // Both sides bare numbers ⇒ the strict numeric canonical key applies.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":1e23,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // Same value spelled with an explicit `.0`, plus the same neighbor straddle.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":99999999999999991611392.0,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // u128-range integer-valued float: `1.8446744073709552e19` recovers to the
+    // exact integer `18446744073709551616` (= 2^64), keyed `#18446744073709552000`
+    // by `{}` but `#18446744073709551616` as an int — must now share one key.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":1.8446744073709552e19,"A":2}]"#,
+        r#"[{"A":18446744073709551616,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // value-semantic mode pairs identically (it also coerces quoted/bare).
+    assert!(
+      json_equivalent(
+        r#"[{"A":1e23,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // (b) The R2 ±0.0 / 0.0 case still pairs sign-agnostically (now subsumed by
+    // the exact-integer path: both ±0.0 recover to the exact integer 0 ⇒ `#i0`).
+    assert!(json_equivalent_strict(r#"[{"A":-0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":0.0}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.0}]"#).is_ok());
+    // (c) A genuinely DIFFERENT multiset must still mismatch: the big value has
+    // no partner when the other side holds a different non-neighbor value.
+    assert!(json_equivalent_strict(r#"[{"A":1e23,"A":2}]"#, r#"[{"A":3,"A":2}]"#).is_err());
+    assert!(json_equivalent(r#"[{"A":1e23,"A":2}]"#, r#"[{"A":3,"A":2}]"#).is_err());
+    // (d) A genuinely-NON-integer float pairs across value-equal spellings:
+    // `1.5` == `1.50` == `1.5e0` share one f64 ⇒ one `#f…` key. Reorder against
+    // a neighbor and they must still pair (not mispair on a spelling difference).
+    assert!(json_equivalent_strict(r#"[{"A":1.5,"A":9}]"#, r#"[{"A":9,"A":1.50}]"#).is_ok());
+    assert!(json_equivalent_strict(r#"[{"A":1.5e0,"A":9}]"#, r#"[{"A":9,"A":1.5}]"#).is_ok());
+    // ...but a different non-integer float still mismatches.
+    assert!(json_equivalent_strict(r#"[{"A":1.5,"A":9}]"#, r#"[{"A":9,"A":1.25}]"#).is_err());
   }
 
   #[test]
