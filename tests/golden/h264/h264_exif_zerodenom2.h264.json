@@ -1,4 +1,4 @@
 {
-  "H264:ExposureCompensation": "0",
-  "H264:MaxApertureValue": "1.0"
+  "H264:ExposureCompensation": 0,
+  "H264:MaxApertureValue": 1.0
 }

@@ -3371,6 +3371,16 @@ impl ExifSink for EmittedTagSink<'_> {
     name: &str,
     value: &str,
   ) -> Result<(), core::convert::Infallible> {
+    // Contract B (#197): a string-origin EXIF scalar is stored as a
+    // [`TagValue::Str`]; the SINGLE crate-wide terminal `EscapeJSON` number gate
+    // ([`crate::value::TagValue`]'s serializer) then renders a numeric-looking
+    // value (`escape_json_is_number`) as a BARE JSON number and a non-numeric
+    // value (PrintConv label, joined array, `inf`/`undef`/`Inf`/`NaN`) as a
+    // quoted string — the same gate `emit_gated_number` applies to the numeric
+    // writers, now consolidated in one place (no separate EXIF-path gate, no
+    // `force_string` opt-out: the oracle has NO tag that is quoted-despite-
+    // numeric — the apparent cases are stale fixtures or the digit-cap the gate
+    // already handles).
     self.push(group, name, crate::value::TagValue::Str(value.into()));
     Ok(())
   }
@@ -3989,70 +3999,20 @@ fn emit_gps_value<S: ExifSink>(
 // load-bearing — bundled emits a bare number, exifast must too. So this module
 // gates its own numeric output here.
 //
-// NOTE (post-merge dedup candidate): this is a deliberate LOCAL copy of the
-// same gate H264 ports as `escape_json_is_number` (`src/formats/h264.rs`); a
-// concurrent PLIST branch also touches a shared copy. Once those land, fold
-// the three into one shared `crate`-level `escape_json` gate.
+// CONSOLIDATED (Contract B / #197): the number gate is now the SINGLE
+// crate-wide [`crate::value::escape_json_is_number`] — the same predicate the
+// terminal `TagValue::Str` serializer applies. The Exif/GPS emitter delegates
+// to it (below) so the `exiftool:3809` regex lives in exactly one place; H264's
+// `-n` classifier delegates likewise.
 
-/// Faithful port of `EscapeJSON`'s number-detection regex (`exiftool:3809`):
-/// `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$` (the `e` is
-/// case-insensitive). A hand-rolled byte scan — dependency-free, identical
-/// logic to `h264::escape_json_is_number`.
+/// The `EscapeJSON` number gate (`exiftool:3809`) for the Exif/GPS scalar
+/// emitter — a thin alias for the shared [`crate::value::escape_json_is_number`]
+/// so this module's many call sites read unchanged while the regex is defined
+/// once, crate-wide.
 #[cfg(feature = "alloc")]
+#[inline]
 fn escape_json_is_number(s: &str) -> bool {
-  // Every `b[i]` read below was gated by `i < b.len() && …`; `b.get(i)` folds
-  // that bound into the access (`b.get(i) == Some(&c)` ⟺ `i < len && b[i] == c`;
-  // `b.get(i).is_some_and(pred)` ⟺ `i < len && pred(b[i])`), and `b.get(int_start)`
-  // is dominated by the `int_len > 0` proof — all byte-identical to the index
-  // form, panic-safe by construction.
-  let b = s.as_bytes();
-  let mut i = 0usize;
-  // optional leading `-`
-  if b.first() == Some(&b'-') {
-    i += 1;
-  }
-  // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
-  // leading zero).
-  let int_start = i;
-  while b.get(i).is_some_and(u8::is_ascii_digit) {
-    i += 1;
-  }
-  let int_len = i - int_start;
-  if int_len == 0 {
-    return false;
-  }
-  if int_len > 1 && (int_len > 15 || b.get(int_start) == Some(&b'0')) {
-    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`).
-    return false;
-  }
-  // optional fraction `\.\d{1,16}`.
-  if b.get(i) == Some(&b'.') {
-    i += 1;
-    let frac_start = i;
-    while b.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    let frac_len = i - frac_start;
-    if frac_len == 0 || frac_len > 16 {
-      return false;
-    }
-  }
-  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`).
-  if matches!(b.get(i), Some(&b'e' | &b'E')) {
-    i += 1;
-    if matches!(b.get(i), Some(&b'+' | &b'-')) {
-      i += 1;
-    }
-    let exp_start = i;
-    while b.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    let exp_len = i - exp_start;
-    if exp_len == 0 || exp_len > 3 {
-      return false;
-    }
-  }
-  i == b.len()
+  crate::value::escape_json_is_number(s)
 }
 
 /// Emit a value ExifTool would stringify as `rendered` through the JSON
@@ -4099,10 +4059,23 @@ fn emit_gated_number<S: ExifSink>(
       return out.write_u64(group, name, n);
     }
   }
+  // Emit a value-equal bare number via `write_f64` ONLY when the f64 FAITHFULLY
+  // represents its token ([`crate::value::f64_token_is_faithful`], the shared
+  // f64-representation predicate). The gate admits an over-range exponent, so a
+  // token outside finite-f64 range — `1e999` (OVERFLOW → `INFINITY`, which
+  // `write_f64` would lower to `TagValue::F64`'s titlecase `"Inf"`) or `1e-999`
+  // (nonzero-UNDERFLOW → finite `0.0`, a bare `0` rewriting the token to zero) —
+  // instead emits the ORIGINAL `rendered` text as a quoted JSON string, sound on
+  // every path (mirrors `value.rs::serialize_in_gate_number_str`, Contract B /
+  // #197). Every current EXIF caller feeds a bounded format or a pre-finite
+  // `format_g` render, so the string arm is unreachable today; the guard keeps
+  // the gate class closed against a future caller passing such a token.
   match rendered.parse::<f64>() {
-    Ok(f) => out.write_f64(group, name, f),
-    // Unreachable for an in-gate string; fall back to a faithful quoted string.
-    Err(_) => out.write_str(group, name, rendered),
+    Ok(f) if crate::value::f64_token_is_faithful(f, rendered) => out.write_f64(group, name, f),
+    // Over-range exponent (overflow to non-finite OR nonzero-underflow to `0.0`)
+    // or an unreachable non-parse: fall back to the faithful quoted source
+    // string.
+    _ => out.write_str(group, name, rendered),
   }
 }
 
@@ -5203,6 +5176,45 @@ mod tests {
     // The zero-denominator rational word stays a `Str`.
     emit_gated_number("E", "Inf", "inf", &mut map).unwrap();
     assert_eq!(map.get("E", "Inf"), Some(&TagValue::Str("inf".into())));
+    // Contract B / #197 over-f64-gate class (same defect class as the H264
+    // classifier + `value.rs::serialize_in_gate_number_str`): a gate-matching
+    // exponent OUTSIDE finite-f64 range (`1e999`, `parse::<f64>()` ⇒ `INFINITY`)
+    // must NOT route through `write_f64` to `TagValue::F64(INFINITY)` (which
+    // serializes the titlecase `"Inf"`, silently corrupting the verbatim
+    // token); it stays the quoted source `Str`. No real EXIF caller feeds such
+    // a token, but the guard keeps the gate class closed.
+    for tok in ["1e999", "-1e999", "1e309"] {
+      emit_gated_number("E", "Over", tok, &mut map).unwrap();
+      assert_eq!(
+        map.get("E", "Over"),
+        Some(&TagValue::Str(tok.into())),
+        "{tok:?} (over-f64 exponent) must stay a quoted string, not F64(INFINITY)"
+      );
+    }
+    // A FINITE exponent value still routes to the float writer (no regression).
+    emit_gated_number("E", "Exp", "1e10", &mut map).unwrap();
+    assert_eq!(map.get("E", "Exp"), Some(&TagValue::F64(1e10)));
+    // Contract B / #197 SYMMETRIC (under) side: a gate-matching token whose
+    // nonzero significand UNDERFLOWS to a finite `0.0` (`1e-999`, `parse::<f64>()`
+    // ⇒ `Ok(0.0)`) must NOT route through `write_f64` to `TagValue::F64(0.0)`
+    // (which serializes a bare `0`, rewriting the nonzero token to zero); it stays
+    // the quoted source `Str`.
+    for tok in ["1e-999", "-1e-999", "9e-400"] {
+      emit_gated_number("E", "Under", tok, &mut map).unwrap();
+      assert_eq!(
+        map.get("E", "Under"),
+        Some(&TagValue::Str(tok.into())),
+        "{tok:?} (nonzero-underflow exponent) must stay a quoted string, not F64(0.0)"
+      );
+    }
+    // A GENUINE zero token (significand is zero) stays a BARE number — it
+    // legitimately denotes zero, so the predicate must NOT preserve it as a string.
+    emit_gated_number("E", "Zero", "0e-5", &mut map).unwrap();
+    assert_eq!(map.get("E", "Zero"), Some(&TagValue::F64(0.0)));
+    // A FINITE tiny IN-RANGE value (nonzero, no underflow) still routes to the
+    // float writer — the predicate must not over-trigger on small magnitudes.
+    emit_gated_number("E", "Tiny", "1e-300", &mut map).unwrap();
+    assert_eq!(map.get("E", "Tiny"), Some(&TagValue::F64(1e-300)));
   }
 
   /// `emit_gated_f64` renders a finite value with `%.15g` then gates it: an
@@ -5231,6 +5243,40 @@ mod tests {
     // `Inf`/`NaN` string); `emit_gated_f64` emits the `F64` variant itself.
     emit_gated_f64("E", "Bad", f64::INFINITY, &mut map).unwrap();
     assert_eq!(map.get("E", "Bad"), Some(&TagValue::F64(f64::INFINITY)));
+  }
+
+  /// Render one EXIF string-origin scalar through the production sink path
+  /// (`EmittedTagSink::write_str` → [`crate::value::TagValue`]'s serializer) and
+  /// return its JSON token. The string is stored as a `TagValue::Str` and the
+  /// SINGLE consolidated `EscapeJSON` gate (in the serializer) decides
+  /// bare-number-vs-quoted-string.
+  #[cfg(all(feature = "alloc", feature = "serde"))]
+  fn emit_str_scalar_json(value: &str) -> String {
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let mut sink = EmittedTagSink::new(&mut tags);
+    sink.write_str("IFD0", "T", value).unwrap();
+    serde_json::to_string(tags[0].tag().value_ref()).expect("scalar serializes")
+  }
+
+  /// Contract B (#197): an EXIF string-origin scalar lands as the JSON token
+  /// ExifTool's terminal `EscapeJSON` gate produces — a numeric-looking value
+  /// is a BARE number, a non-numeric value (incl. a leading-zero `01`, out of
+  /// the number regex) stays a quoted string. No `force_string` opt-out exists:
+  /// the oracle has no tag that is quoted-despite-numeric (proven against
+  /// bundled 13.59 + the real-pipeline `M2TS.mts` golden).
+  #[cfg(all(feature = "alloc", feature = "serde"))]
+  #[test]
+  fn exif_str_scalar_serializes_through_escape_json_gate() {
+    // Numeric-looking ⇒ bare number.
+    assert_eq!(emit_str_scalar_json("2"), "2");
+    assert_eq!(emit_str_scalar_json("0.5"), "0.5");
+    // Non-numeric ⇒ quoted string.
+    assert_eq!(emit_str_scalar_json("abc"), "\"abc\"");
+    // A leading-zero `01` is OUT of the `EscapeJSON` number regex ⇒ stays a
+    // quoted string.
+    assert_eq!(emit_str_scalar_json("01"), "\"01\"");
+    // A `:`-bearing value (e.g. a TimeCode/GPS string) stays quoted.
+    assert_eq!(emit_str_scalar_json("04:03:02:01"), "\"04:03:02:01\"");
   }
 
   // -- Shared helpers for the IFD-level guard tests -------------------------

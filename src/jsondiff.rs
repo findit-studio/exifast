@@ -73,11 +73,35 @@ impl Mismatch {
 /// still escape-exact, so the literal `"A"` ≠ the escaped `"A"`). Returns
 /// the first `Mismatch`.
 pub fn json_equivalent(actual: &str, golden: &str) -> Result<(), Mismatch> {
+  json_equivalent_with(actual, golden, false)
+}
+
+/// TOKEN-EXACT (strict) variant of [`json_equivalent`]: identical structure
+/// rules (object key order insensitive but multiset-significant, array order
+/// significant), and numeric VALUE-style insensitivity is still kept *within
+/// one JSON type* (`2 == 2.0`, `0.50 == 0.5`, `3.4e+38 == 3.4e38`), BUT a
+/// quoted numeric string and the bare number of the same value are NO LONGER
+/// equal — the JSON *type* must match (Contract B / #197). So `"2"` ≠ `2` and
+/// `"0.0"` ≠ `0.0`, reproducing ExifTool's exact `EscapeJSON` number-vs-string
+/// typing. Non-numeric strings stay escape-exact exactly as in value mode.
+///
+/// Opt-in: callers that want the documented value-semantic behaviour keep using
+/// [`json_equivalent`]; this is the comparator the token-exact conformance pass
+/// uses. Returns the first [`Mismatch`].
+pub fn json_equivalent_strict(actual: &str, golden: &str) -> Result<(), Mismatch> {
+  json_equivalent_with(actual, golden, true)
+}
+
+/// Shared entry point for [`json_equivalent`] (value-semantic, `strict=false`)
+/// and [`json_equivalent_strict`] (token-exact, `strict=true`). The only
+/// behavioural difference is in the scalar arm: `strict` rejects a quoted-vs-
+/// bare type mismatch even when the numeric values coincide.
+fn json_equivalent_with(actual: &str, golden: &str, strict: bool) -> Result<(), Mismatch> {
   let a: &RawValue = serde_json::from_str(actual)
     .map_err(|e| Mismatch::new(format!("actual is invalid JSON: {e}")))?;
   let g: &RawValue = serde_json::from_str(golden)
     .map_err(|e| Mismatch::new(format!("golden is invalid JSON: {e}")))?;
-  cmp(a, g, "$")
+  cmp(a, g, "$", strict)
 }
 
 /// An object parsed as ORDERED `(key, value)` pairs, preserving duplicate
@@ -323,33 +347,89 @@ fn f_as_exact_u128(f: f64) -> Option<u128> {
 /// 2. Otherwise compare the scalars' raw lexeme text byte-for-byte — so
 ///    non-numeric strings stay escape-exact, and `true`/`null`/`"NaN"` match
 ///    only their identical spelling.
-fn scalar_value_eq(a: &RawValue, g: &RawValue) -> bool {
-  let (at, _) = scalar_payload(a);
-  let (gt, _) = scalar_payload(g);
-  if let (Some(an), Some(gn)) = (parse_number(at), parse_number(gt)) {
+fn scalar_value_eq(a: &RawValue, g: &RawValue, strict: bool) -> bool {
+  let (at, a_quoted) = scalar_payload(a);
+  let (gt, g_quoted) = scalar_payload(g);
+  // TOKEN-EXACT (strict): numeric VALUE-style insensitivity (`2.0` == `2`,
+  // `0.50` == `0.5`) is allowed ONLY between two BARE numbers. When EITHER side
+  // is QUOTED, the comparison falls through to the exact-lexeme path below:
+  //  - quoted vs bare ⇒ a JSON *type* mismatch (`"2"` ≠ `2`, Contract B);
+  //  - quoted vs quoted ⇒ compared as EXACT STRINGS, so a value ExifTool
+  //    intentionally quotes (a leading-zero string `"01"`, an over-cap integer)
+  //    is NOT normalized to a differently-spelled quoted numeric of the same
+  //    value (`"01"` ≠ `"1"`). Only the strict path is affected — value mode
+  //    keeps full numeric coercion regardless of quoting.
+  let allow_numeric = !strict || (!a_quoted && !g_quoted);
+  if allow_numeric && let (Some(an), Some(gn)) = (parse_number(at), parse_number(gt)) {
     return an.value_eq(gn);
   }
-  // Non-numeric (or only-one-side-numeric): exact lexeme compare. Using the
-  // raw `get()` keeps a bare `123` distinct from the string `"abc"` and a
-  // quoted `"NaN"` matching only another quoted `"NaN"`.
+  // Non-numeric (or, under strict, any quoted side): exact lexeme compare.
+  // Using the raw `get()` keeps a bare `123` distinct from the string `"abc"`,
+  // a quoted `"NaN"` matching only another quoted `"NaN"`, and (under strict)
+  // `"01"` distinct from `"1"`.
   a.get().trim() == g.get().trim()
 }
 
 /// A normal form of a SCALAR under our value-equivalence, used only as a sort
-/// key when pairing duplicate object keys (`canonical`). Two scalars that are
-/// `scalar_value_eq` MUST map to the same string here, else the dup-pairing
-/// sort could mis-rank value-equal-but-differently-spelled duplicates. Numbers
-/// canonicalize to a single normalized form; non-numbers keep their raw text.
-fn canonical_scalar(r: &RawValue) -> String {
-  let (text, _) = scalar_payload(r);
+/// key when pairing duplicate object keys (`canonical`). The invariant the
+/// dup-pairing sort relies on: `scalar_value_eq(a, g, strict)` ⟺
+/// `canonical_scalar(a, strict) == canonical_scalar(g, strict)` — two scalars
+/// that are value-equal MUST map to the same string, else the sort could
+/// mis-rank value-equal-but-differently-spelled duplicates against a neighbor
+/// and report a false mismatch. The numeric key therefore derives from the
+/// SAME exact-value notion `scalar_value_eq` uses (every integer-valued number
+/// folds to one `#i<decimal>` key); non-numbers keep their raw text.
+///
+/// `strict` mirrors [`scalar_value_eq`]'s typing: under strict, a QUOTED scalar
+/// is canonicalized by its EXACT quoted lexeme (the `q:`-prefixed `None` arm),
+/// never collapsed to a bare numeric form — otherwise the dup-pairing sort
+/// could not separate a quoted `"1"` from a bare `1` (they are NOT strict-equal
+/// yet would share a numeric key), mispairing a reordered quoted/bare duplicate
+/// into a false mismatch. Only two BARE numbers share a numeric key under
+/// strict; in value mode the quoting is irrelevant (full numeric collapse).
+fn canonical_scalar(r: &RawValue, strict: bool) -> String {
+  let (text, quoted) = scalar_payload(r);
+  // Under strict a quoted scalar must NOT take the numeric key — its EXACT
+  // quoted lexeme is the key, tagged `q:` so it can never alias a bare number's
+  // `#…` key (or a bare non-number's plain text).
+  if strict && quoted {
+    return format!("q:{}", r.get().trim());
+  }
+  // The numeric key must derive from the SAME exact-value notion
+  // `scalar_value_eq`/`NumVal::value_eq` uses, so canonicalization ⇔ equality
+  // holds for ALL numeric pairs: `scalar_value_eq(a,b)` ⟺
+  // `canonical_scalar(a) == canonical_scalar(b)` for numbers, in both modes.
+  // `value_eq` treats a bare integer EQUAL to an integer-valued float that
+  // recovers to the same integer via `f_as_exact_i128`/`f_as_exact_u128`, so the
+  // canonical key folds EVERY integer-valued number (`Int`/`Uint`, OR a `Float`
+  // that recovers exactly) onto one `#i<exact-integer-decimal>` key. A keying by
+  // the float's `{}` text would diverge from the int's decimal — `1e23` displays
+  // `100000000000000000000000` but recovers to the integer `99999999999999991611392`
+  // (R3), and `-0.0`/`0.0` both recover to `0` (R2, now subsumed: the `±0.0`
+  // case falls out of the exact-integer path). A genuinely non-integer (or
+  // out-of-u128-range) float keys by its f64 `{}` form, tagged `#f`: equal-value
+  // spellings (`1.5`==`1.50`==`1.5e0`) share one f64 ⇒ one key, matching
+  // `value_eq`'s raw `f64 ==`. The `#i`/`#f` tags can never alias each other, a
+  // bare non-number's raw text (`true`/`null`, never `#`-prefixed), or — under
+  // strict — a quoted scalar's `q:` key. This is a SORT KEY only;
+  // `scalar_value_eq` remains the verdict.
   match parse_number(text) {
-    // Integers print exactly; floats via `{}` (a single deterministic form,
-    // e.g. `0.0` and `0.00000000` both canonicalize to `0`). This is a SORT
-    // KEY only — `scalar_value_eq` remains the verdict (so f64 round-trip
-    // imprecision in the key can never change equality, only pairing order).
-    Some(NumVal::Int(i)) => format!("#{i}"),
-    Some(NumVal::Uint(u)) => format!("#{u}"),
-    Some(NumVal::Float(f)) => format!("#{}", f),
+    Some(NumVal::Int(i)) => format!("#i{i}"),
+    Some(NumVal::Uint(u)) => format!("#i{u}"),
+    Some(NumVal::Float(f)) => {
+      if let Some(i) = f_as_exact_i128(f) {
+        format!("#i{i}")
+      } else if let Some(u) = f_as_exact_u128(f) {
+        // Positive integer-valued floats above i128 but within u128 (mirrors the
+        // `Uint`/`Float` `value_eq` arm), e.g. a `3.4e38`-magnitude whole number.
+        format!("#i{u}")
+      } else {
+        // Genuinely fractional, or out of u128 range (then a bare integer literal
+        // of the same magnitude is itself parsed as a `Float`, so both sides key
+        // here identically). `{}` is deterministic per f64 value.
+        format!("#f{f}")
+      }
+    }
     None => r.get().trim().to_string(),
   }
 }
@@ -362,14 +442,17 @@ fn canonical_scalar(r: &RawValue) -> String {
 /// mispair them and report a false mismatch. The recursive `cmp` remains
 /// the source of truth — this only fixes the *pairing order*, never the
 /// verdict, so byte-exact scalars / array order / dup cardinality stand.
-fn canonical(r: &RawValue) -> String {
+fn canonical(r: &RawValue, strict: bool) -> String {
   match kind_of(r) {
     Kind::Object => {
       // Recurse, then sort entries by (key, canonical value),
       // KEEPING duplicates so cardinality stays significant (the
       // ExifTool `%noDups` regression class).
       let mut entries: Vec<(String, String)> = match serde_json::from_str(r.get()) {
-        Ok(OrderedObject(p)) => p.into_iter().map(|(k, v)| (k, canonical(v))).collect(),
+        Ok(OrderedObject(p)) => p
+          .into_iter()
+          .map(|(k, v)| (k, canonical(v, strict)))
+          .collect(),
         Err(_) => return r.get().to_string(),
       };
       entries.sort();
@@ -395,19 +478,21 @@ fn canonical(r: &RawValue) -> String {
         if i > 0 {
           s.push(',');
         }
-        s.push_str(&canonical(it));
+        s.push_str(&canonical(it, strict));
       }
       s.push(']');
       s
     }
     // Scalar: a VALUE-normalized form so value-equal-but-differently-spelled
-    // scalars (`1` vs `1.0`, `"123"` vs `123`) sort to the same rank for
-    // dup-pairing. `scalar_value_eq` remains the actual verdict.
-    Kind::Scalar => canonical_scalar(r),
+    // scalars (`1` vs `1.0`, and — value mode only — `"123"` vs `123`) sort to
+    // the same rank for dup-pairing. Under `strict` a quoted scalar keeps its
+    // exact lexeme so it never aliases a bare number. `scalar_value_eq` remains
+    // the actual verdict.
+    Kind::Scalar => canonical_scalar(r, strict),
   }
 }
 
-fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
+fn cmp(a: &RawValue, g: &RawValue, path: &str, strict: bool) -> Result<(), Mismatch> {
   match (kind_of(a), kind_of(g)) {
     (Kind::Object, Kind::Object) => {
       // Parse as ORDERED (key, value) pairs preserving duplicate keys.
@@ -435,8 +520,8 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
       // whose values are equivalent-but-reordered objects (a false
       // mismatch); the canonical form is invariant under our
       // equivalence, so equivalent values sort to the same rank.
-      ap.sort_by_cached_key(|e| (e.0.clone(), canonical(e.1)));
-      gp.sort_by_cached_key(|e| (e.0.clone(), canonical(e.1)));
+      ap.sort_by_cached_key(|e| (e.0.clone(), canonical(e.1, strict)));
+      gp.sort_by_cached_key(|e| (e.0.clone(), canonical(e.1, strict)));
       for ((ak, av), (gk, gv)) in ap.iter().zip(&gp) {
         if ak != gk {
           return Err(Mismatch::new(format!(
@@ -447,7 +532,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
         }
         // Same key (and same rank after the (key,value) sort): recurse
         // so the precise first scalar-mismatch path is still reported.
-        cmp(av, gv, &format!("{path}.{ak}"))?;
+        cmp(av, gv, &format!("{path}.{ak}"), strict)?;
       }
       Ok(())
     }
@@ -464,7 +549,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
         )));
       }
       for (i, (x, y)) in aa.iter().zip(&ga).enumerate() {
-        cmp(x, y, &format!("{path}[{i}]"))?;
+        cmp(x, y, &format!("{path}[{i}]"), strict)?;
       }
       Ok(())
     }
@@ -474,7 +559,7 @@ fn cmp(a: &RawValue, g: &RawValue, path: &str) -> Result<(), Mismatch> {
     // For a shape mismatch (e.g. object vs array) neither side parses as a
     // number and the raw texts differ, so this still reports correctly.
     _ => {
-      if scalar_value_eq(a, g) {
+      if scalar_value_eq(a, g, strict) {
         Ok(())
       } else {
         Err(Mismatch::new(format!(
@@ -494,6 +579,149 @@ mod tests {
   #[test]
   fn identical_is_ok() {
     assert!(json_equivalent(r#"[{"a":1,"b":2}]"#, r#"[{"a":1,"b":2}]"#).is_ok());
+  }
+
+  #[test]
+  fn strict_mode_distinguishes_number_from_string() {
+    // TOKEN-EXACT (strict) mode: a quoted numeric string is NOT the bare number
+    // of the same value — the JSON *type* differs (Contract B).
+    assert!(json_equivalent_strict(r#"{"X":"2"}"#, r#"{"X":2}"#).is_err());
+    // Same type (both bare numbers) still matches — and numeric VALUE-style
+    // insensitivity inside one type is preserved (`2` == `2.0`).
+    assert!(json_equivalent_strict(r#"{"X":2}"#, r#"{"X":2}"#).is_ok());
+    // value-semantic mode still coerces (unchanged):
+    assert!(json_equivalent(r#"{"X":"2"}"#, r#"{"X":2}"#).is_ok());
+  }
+
+  #[test]
+  fn strict_mode_compares_two_quoted_strings_exactly() {
+    // FINDING 1 (Codex): in STRICT mode two QUOTED strings must compare as
+    // EXACT strings, NOT numerically — so a leading-zero / out-of-gate value
+    // ExifTool intentionally quotes (`"01"`, an over-cap integer) is NOT equal
+    // to a differently-spelled quoted numeric of the same value (`"1"`). Only
+    // two BARE numbers keep style-insensitivity.
+    assert!(json_equivalent_strict(r#"{"X":"01"}"#, r#"{"X":"1"}"#).is_err());
+    // Two quoted strings that ARE byte-identical still match.
+    assert!(json_equivalent_strict(r#"{"X":"1"}"#, r#"{"X":"1"}"#).is_ok());
+    // A leading-zero pair that differs textually is caught even though their
+    // numeric values coincide.
+    assert!(json_equivalent_strict(r#"{"X":"007"}"#, r#"{"X":"7"}"#).is_err());
+    // Two BARE numbers keep numeric style-insensitivity (`1` == `1.0`).
+    assert!(json_equivalent_strict(r#"{"X":1}"#, r#"{"X":1.0}"#).is_ok());
+    // VALUE-semantic mode is UNCHANGED: two quoted numerics still coerce.
+    assert!(json_equivalent(r#"{"X":"01"}"#, r#"{"X":"1"}"#).is_ok());
+    assert!(json_equivalent(r#"{"X":"1"}"#, r#"{"X":1.0}"#).is_ok());
+  }
+
+  #[test]
+  fn strict_mode_dup_keys_are_type_aware_when_reordered() {
+    // FINDING 3 (Codex): the duplicate-key multiset pairing sorts by the
+    // canonical value, but `canonical_scalar` collapses a quoted numeric string
+    // and the bare number to the SAME key — so the type-blind sort cannot
+    // separate `"1"` from `1`. With both sides holding the SAME multiset
+    // {quoted "1", bare 1} but in opposite ORDER, the stable sort keeps each
+    // side's input order, mispairs `"1"`↔`1`, and reports a FALSE MISMATCH.
+    // The canonical key must be strict-type-aware so each side sorts its quoted
+    // and bare entries to matching ranks ⇒ the equal multiset compares EQUAL.
+    assert!(json_equivalent_strict(r#"[{"A":"1","A":1}]"#, r#"[{"A":1,"A":"1"}]"#).is_ok());
+    // A genuinely DIFFERENT multiset (two bare vs one-bare-one-quoted) must
+    // still mismatch under strict (the quoted "1" has no bare partner).
+    assert!(json_equivalent_strict(r#"[{"A":1,"A":1}]"#, r#"[{"A":1,"A":"1"}]"#).is_err());
+    // value-semantic mode is unchanged: quoted/bare coerce, so BOTH the
+    // reordered pair and the bare-vs-quoted pair match.
+    assert!(json_equivalent(r#"[{"A":"1","A":1}]"#, r#"[{"A":1,"A":"1"}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"A":1,"A":1}]"#, r#"[{"A":1,"A":"1"}]"#).is_ok());
+  }
+
+  #[test]
+  fn dup_keys_negative_zero_pairs_with_positive_zero() {
+    // FINDING 2 (Codex): the dup-key multiset sort key (`canonical_scalar`)
+    // formatted floats directly, so `-0.0` → `#-0` and `0.0` → `#0` — DIFFERENT
+    // keys — even though `scalar_value_eq` treats `-0.0 == 0.0`. With both sides
+    // holding the SAME multiset {a zero, a -0.5} but the zeros spelled with
+    // opposite sign AND reordered, the type-blind sort ranked them differently
+    // and mispaired the zero against `-0.5` ⇒ a FALSE MISMATCH. The numeric
+    // canonical key for zero must be sign-agnostic (`#0` for both ±0.0) so the
+    // equal multiset sorts into matching ranks and compares EQUAL — in BOTH
+    // modes (consistent with `scalar_value_eq`).
+    // Strict mode (both sides bare numbers ⇒ the numeric canonical key applies).
+    assert!(json_equivalent_strict(r#"[{"A":-0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":0.0}]"#).is_ok());
+    assert!(json_equivalent_strict(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.0}]"#).is_ok());
+    // Value mode: same sign-agnostic zero pairing.
+    assert!(json_equivalent(r#"[{"A":-0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":0.0}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.0}]"#).is_ok());
+    // A genuinely different multiset still mismatches (the zero has no partner
+    // when the other side holds two non-zero values).
+    assert!(json_equivalent_strict(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.5}]"#).is_err());
+    assert!(json_equivalent(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.5}]"#).is_err());
+  }
+
+  #[test]
+  fn dup_keys_integer_valued_float_pairs_with_exact_integer() {
+    // FINDING (Codex R3): the dup-key multiset sort key (`canonical_scalar`)
+    // keyed a bare integer by its EXACT decimal but a non-zero integer-valued
+    // FLOAT by `format!("#{}", f)` — DIFFERENT keys for value-EQUAL scalars,
+    // because `scalar_value_eq` treats a bare int equal to an integer-valued
+    // float via `f_as_exact_i128`/`f_as_exact_u128`. The R2 `#0`-for-zero guard
+    // patched ONLY zero; non-zero stayed broken. e.g. `1e23` recovers to the
+    // exact integer `99999999999999991611392` (so they value-equal), yet the
+    // float `{}`-formatted to `100000000000000000000000` ⇒ key `#100…000` while
+    // the int keyed `#99…392`. With both sides holding the SAME multiset
+    // {that value, a neighbor `2`} but the value spelled as the float on one
+    // side and the exact int on the other, the neighbor's `#2` key sorts
+    // BETWEEN the two divergent keys, so the value-equal item landed at opposite
+    // ranks and mispaired against `2` ⇒ a FALSE MISMATCH. The numeric canonical
+    // key must derive from the same exact-value notion `scalar_value_eq` uses,
+    // so an integer-valued float and the bare integer share one `#i…` key.
+    // Both sides bare numbers ⇒ the strict numeric canonical key applies.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":1e23,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // Same value spelled with an explicit `.0`, plus the same neighbor straddle.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":99999999999999991611392.0,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // u128-range integer-valued float: `1.8446744073709552e19` recovers to the
+    // exact integer `18446744073709551616` (= 2^64), keyed `#18446744073709552000`
+    // by `{}` but `#18446744073709551616` as an int — must now share one key.
+    assert!(
+      json_equivalent_strict(
+        r#"[{"A":1.8446744073709552e19,"A":2}]"#,
+        r#"[{"A":18446744073709551616,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // value-semantic mode pairs identically (it also coerces quoted/bare).
+    assert!(
+      json_equivalent(
+        r#"[{"A":1e23,"A":2}]"#,
+        r#"[{"A":99999999999999991611392,"A":2}]"#
+      )
+      .is_ok()
+    );
+    // (b) The R2 ±0.0 / 0.0 case still pairs sign-agnostically (now subsumed by
+    // the exact-integer path: both ±0.0 recover to the exact integer 0 ⇒ `#i0`).
+    assert!(json_equivalent_strict(r#"[{"A":-0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":0.0}]"#).is_ok());
+    assert!(json_equivalent(r#"[{"A":0.0,"A":-0.5}]"#, r#"[{"A":-0.5,"A":-0.0}]"#).is_ok());
+    // (c) A genuinely DIFFERENT multiset must still mismatch: the big value has
+    // no partner when the other side holds a different non-neighbor value.
+    assert!(json_equivalent_strict(r#"[{"A":1e23,"A":2}]"#, r#"[{"A":3,"A":2}]"#).is_err());
+    assert!(json_equivalent(r#"[{"A":1e23,"A":2}]"#, r#"[{"A":3,"A":2}]"#).is_err());
+    // (d) A genuinely-NON-integer float pairs across value-equal spellings:
+    // `1.5` == `1.50` == `1.5e0` share one f64 ⇒ one `#f…` key. Reorder against
+    // a neighbor and they must still pair (not mispair on a spelling difference).
+    assert!(json_equivalent_strict(r#"[{"A":1.5,"A":9}]"#, r#"[{"A":9,"A":1.50}]"#).is_ok());
+    assert!(json_equivalent_strict(r#"[{"A":1.5e0,"A":9}]"#, r#"[{"A":9,"A":1.5}]"#).is_ok());
+    // ...but a different non-integer float still mismatches.
+    assert!(json_equivalent_strict(r#"[{"A":1.5,"A":9}]"#, r#"[{"A":9,"A":1.25}]"#).is_err());
   }
 
   #[test]
