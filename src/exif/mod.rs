@@ -2531,18 +2531,31 @@ impl Walker<'_, '_> {
           // First MakerNote wins (a malformed TIFF with two 0x927c tags is
           // degenerate; ExifTool's `FoundTag` keeps the canonical name).
           if self.maker_note.is_none() {
-            // `tiff_type` (`$$self{TIFF_TYPE}`, `ExifTool.pm:8715`) is read
-            // ONLY by `MakerNoteSamsung2`'s SRW clause (`MakerNotes.pm:969`).
-            // The IFD walker does not yet carry the container's detected file
-            // type, so pass `None`: the Samsung2 SRW-without-magic case is the
-            // documented Phase-1 gap (a SAMSUNG body that IS an EXIF-format
-            // maker note still matches via its magic clause). Threading the
-            // real file type here closes the gap with no dispatcher change.
+            // `tiff_type` (`$$self{TIFF_TYPE}`, `ExifTool.pm:8715`
+            // `$$self{TIFF_TYPE} = $fileType`) is read ONLY by
+            // `MakerNoteSamsung2`'s SRW clause (`MakerNotes.pm:969`
+            // `$$self{TIFF_TYPE} eq 'SRW'`). Thread the container's detected
+            // file type so a Samsung `.srw` raw whose maker note LACKS the
+            // EXIF-format magic header still dispatches to `MakerNoteSamsung2`
+            // (#172). `self.file_type` is the finalized `$$self{FILE_TYPE}`
+            // (`finalized_tiff_file_type`, the candidate `Parent` run through
+            // `DoProcessTIFF`'s `$t` rule) — for an SRW candidate it equals
+            // `"SRW"` exactly as `$$self{TIFF_TYPE}` does: `TIFF_TYPE` IS that
+            // same `$fileType`/`Parent` (`ExifTool.pm:8715`/`:8730`), and SRW's
+            // base module is `TIFF` (`fileTypeLookup{SRW} = ['TIFF', …]`,
+            // `ExifTool.pm:536`), so `$t == $fileType == "SRW"` and the
+            // finalized name stays `"SRW"`. The dispatcher reads `tiff_type`
+            // ONLY in the Samsung2 arm, gated on `uc Make eq 'SAMSUNG'`, so
+            // threading it changes dispatch for the SRW-Samsung case ALONE;
+            // every other vendor/file-type path is byte-identical (additive —
+            // it enables one previously-dead branch). The embedded-block
+            // callers (`parse_exif_block`) still pass `file_type = None`, so a
+            // JPEG/PNG-embedded Samsung body keeps relying on its magic clause.
             let detected = makernotes::dispatch(
               bytes,
               self.captured_make.as_deref(),
               self.captured_model.as_deref(),
-              None,
+              self.file_type.as_deref(),
             );
             // Phase 2: parse the Apple/Canon/Sony/Panasonic/Leica/DJI vendor
             // body here. P0 single-mode decode: the walker decodes the body
