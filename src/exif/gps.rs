@@ -402,13 +402,12 @@ pub fn to_degrees(d: Option<f64>, m: Option<f64>, s: Option<f64>) -> Option<f64>
 /// ```
 #[must_use]
 pub fn to_dms(val: f64) -> std::string::String {
-  if !val.is_finite() {
-    // `unless (length $val)` / non-numeric ⇒ ExifTool returns the value
-    // unchanged; a non-finite coordinate is degenerate. Render plainly.
-    use std::string::ToString;
-    return val.to_string();
-  }
-  // No `$ref` ⇒ `$val = abs($val)` (GPS.pm:543).
+  // No `$ref` ⇒ `$val = abs($val)` (GPS.pm:543). Note Perl does NOT
+  // short-circuit a non-finite value: `length $val` is non-zero for the
+  // string `"Inf"`/`"NaN"`, so the full DMS computation runs and propagates
+  // `Inf`/`NaN` through `int`/`%d`/`%.2f` (e.g. `ToDMS(Inf)` →
+  // `Inf deg NaN' NaN"`, `ToDMS(NaN)` → `NaN deg NaN' NaN"`). `abs(NaN)` is
+  // NaN; `abs(-Inf)` is Inf.
   let val = val.abs();
   // `$num = 3` (no CoordFormat). `$c[0] = int($val)` — truncate toward 0.
   let mut c0 = val.trunc();
@@ -418,14 +417,16 @@ pub fn to_dms(val: f64) -> std::string::String {
   let c2_raw = (val - c0 - c1 / 60.0) * 3600.0;
   // `$c[-1] = sprintf($fmt[-1], $c[-1])` — the last coordinate is formatted
   // with `%.2f` BEFORE the round-off carry test (GPS.pm:558).
-  let mut c2_str = std::format!("{c2_raw:.2}");
+  let mut c2_str = perl_f2(c2_raw);
   // `if ($c[-1] >= 60)` — the carry test compares the FORMATTED string
-  // numerically (Perl auto-stringifies; "60.00" >= 60 is true).
+  // numerically (Perl auto-stringifies; "60.00" >= 60 is true). A non-finite
+  // `c2_str` ("NaN"/"Inf") parses back to NaN/Inf: `NaN >= 60` is false (no
+  // carry, the degenerate path), matching Perl.
   if let Ok(c2_num) = c2_str.parse::<f64>()
     && c2_num >= 60.0
   {
     let carried = c2_num - 60.0;
-    c2_str = std::format!("{carried:.2}");
+    c2_str = perl_f2(carried);
     c1 += 1.0;
     if c1 >= 60.0 {
       c1 -= 60.0;
@@ -433,7 +434,30 @@ pub fn to_dms(val: f64) -> std::string::String {
     }
   }
   // `sprintf(q{%d deg %d' %.2f"}, @c)` — `%d` truncates the float to int.
-  std::format!("{} deg {}' {}\"", c0 as i64, c1 as i64, c2_str)
+  std::format!("{} deg {}' {}\"", perl_d(c0), perl_d(c1), c2_str)
+}
+
+/// Perl `sprintf("%d", $x)` of an (already integer-valued / truncated) `f64`.
+/// For a finite value this is the truncated integer (`$x` here is always a
+/// `.trunc()` result, so the cast is exact); for a non-finite value Perl prints
+/// `Inf` / `-Inf` / `NaN` (titlecase) rather than Rust's lowercase `inf`/`nan`
+/// or a saturating `as i64` cast (`Inf as i64` would be `i64::MAX`).
+fn perl_d(x: f64) -> std::string::String {
+  use std::string::ToString;
+  match crate::value::perl_nonfinite_str(x) {
+    Some(s) => s.to_string(),
+    None => (x as i64).to_string(),
+  }
+}
+
+/// Perl `sprintf("%.2f", $x)` of an `f64`. Finite values format identically to
+/// Rust `{:.2}`; non-finite values print Perl's `Inf` / `-Inf` / `NaN`
+/// (titlecase) instead of Rust's lowercase `inf` (NaN already matches).
+fn perl_f2(x: f64) -> std::string::String {
+  match crate::value::perl_nonfinite_str(x) {
+    Some(s) => s.to_string(),
+    None => std::format!("{x:.2}"),
+  }
 }
 
 // ===========================================================================
@@ -695,6 +719,20 @@ mod tests {
     // 1.91416666...° → `1 deg 54' 51.00"`.
     let s = to_dms(1.914_166_666_666_67);
     assert_eq!(s, "1 deg 54' 51.00\"");
+  }
+
+  #[test]
+  fn to_dms_non_finite_matches_perl_inf_nan() {
+    // Perl's `GPS::ToDMS` does NOT short-circuit a non-finite value: the full
+    // DMS computation runs and propagates Inf/NaN through `int`/`%d`/`%.2f`,
+    // which Perl prints TITLECASE. Oracle (bundled 13.59,
+    // `GPS::ToDMS($et, $v, 1, "N")`):
+    //   inf  → `Inf deg NaN' NaN"` ; nan → `NaN deg NaN' NaN"`.
+    // `to_dms` formats only the magnitude (the ref letter is added by the
+    // caller); `abs(-Inf)` = Inf, so -inf yields the same magnitude as inf.
+    assert_eq!(to_dms(f64::INFINITY), "Inf deg NaN' NaN\"");
+    assert_eq!(to_dms(f64::NEG_INFINITY), "Inf deg NaN' NaN\"");
+    assert_eq!(to_dms(f64::NAN), "NaN deg NaN' NaN\"");
   }
 
   #[test]

@@ -11,7 +11,7 @@ fn main() -> Result<()> {
     Some("gen-tables") => gen_tables(&args[1..]),
     _ => {
       eprintln!(
-        "usage: cargo xtask gen-tables --module <M> --out <path> [--kind field|tagdef|exif] [--check]"
+        "usage: cargo xtask gen-tables --module <M> --out <path> [--kind field|tagdef|exif|quicktime] [--check]"
       );
       bail!("unknown command");
     }
@@ -65,6 +65,31 @@ fn gen_tables(rest: &[String]) -> Result<()> {
       other => bail!("--kind exif supports only --module Exif::Main / GPS::Main, got `{other}`"),
     };
     emit::emit_exif_table(&model, exif_kind, &allow)
+  } else if kind == "quicktime" {
+    // The SP2 supplementary conv-less camera-atom map needs BOTH the
+    // `%QuickTime::UserData` AND `%QuickTime::Keys` tables (4cc + string keys)
+    // in one file, each filtered to the lib's hand-verified-conv-less allowlist
+    // (`--module` is ignored — there is one canonical output for this kind).
+    let userdata = listx::parse_listx(&xml, "QuickTime::UserData")?;
+    let keys = listx::parse_listx(&xml, "QuickTime::Keys")?;
+    let ud_allow: Vec<emit::QuickTimeCandidate> =
+      exifast::formats::quicktime::QUICKTIME_USERDATA_CONVLESS_ALLOW
+        .iter()
+        .map(|&name| emit::QuickTimeCandidate { name })
+        .collect();
+    let keys_allow: Vec<emit::QuickTimeCandidate> =
+      exifast::formats::quicktime::QUICKTIME_KEYS_CONVLESS_ALLOW
+        .iter()
+        .map(|&name| emit::QuickTimeCandidate { name })
+        .collect();
+    // The conv/priority-bearing candidates kept out of the maps (hand-ported),
+    // listed for documentation + drift coverage.
+    let unported: Vec<&str> = exifast::formats::quicktime::USERDATA_UNPORTED
+      .iter()
+      .chain(exifast::formats::quicktime::KEYS_UNPORTED.iter())
+      .copied()
+      .collect();
+    emit::emit_quicktime_map(&userdata, &keys, &ud_allow, &keys_allow, &unported)
   } else if kind == "tagdef" {
     let table_name = table_name_for_module(module);
     let model = listx::parse_listx(&xml, &table_name)?;

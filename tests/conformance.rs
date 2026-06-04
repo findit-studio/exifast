@@ -410,6 +410,426 @@ fn quicktime_moov_order_conformance() {
 }
 
 #[test]
+fn quicktime_sp2_conformance() {
+  // QuickTime port Sub-Port 2 — the `udta` camera atoms + `moov/meta`
+  // Keys/ItemList metadata (make + model + software + capture-date + GPS).
+  // `tests/fixtures/QuickTime_sp2.mov` is a SYNTHETIC minimal `.mov` carrying
+  // a `moov/udta` with the `©mak`/`©mod`/`©swr`/`©nam`/`©day`/`©xyz`/`©cmt`
+  // atoms AND a `moov/meta` (`hdlr`=mdta + `keys`/`ilst`) with the
+  // `com.apple.quicktime.make`/`model`/`software`/`creationdate`/`location.ISO6709`
+  // keys. Exercises: the international-text decoder, the `%iso8601Date`
+  // ValueConv (©day / creationdate), the `ConvertISO6709` ValueConv + the
+  // `PrintGPSCoordinates` PrintConv (©xyz / location), the Keys index table +
+  // ilst-data decode, and the `QuickTime:HandlerType=mdta` (moov/meta hdlr).
+  // Group split (`-G1`): `QuickTime:UserData` vs `QuickTime:Keys`. Goldens are
+  // the full bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` output
+  // (`System:*` / `Composite:*` excluded per the uniform Phase-2 forward-item
+  // exclusion).
+  check("QuickTime_sp2.mov", "QuickTime_sp2.mov.json", true);
+  check("QuickTime_sp2.mov", "QuickTime_sp2.mov.n.json", false);
+}
+
+#[test]
+fn quicktime_sp2_badgps_conformance() {
+  // QuickTime SP2 — the `ConvertISO6709` raw-string PASS-THROUGH (the high
+  // Codex finding). `tests/fixtures/QuickTime_sp2_badgps.mov` is the SP2 fixture
+  // with its `©xyz` payload binary-patched from the decodable
+  // `+37.3318-122.0312+010.500/` to the NON-coordinate string `hello` (atom +
+  // `udta` + `moov` sizes fixed; no `stco`/sample tables ⇒ no offset shifts).
+  // ExifTool's `ConvertISO6709` (QuickTime.pm:8884-8909) has NO `else` branch —
+  // a string matching none of the three ISO 6709 forms is `return $val`
+  // UNCHANGED — so `UserData:GPSCoordinates` is STILL emitted: under `-n` the
+  // raw `hello`; under `-j` `PrintGPSCoordinates("hello")` = `0 deg 0' 0.00" N,
+  // ` (the non-numeric latitude numifies to 0; the missing longitude is `undef`
+  // and renders as the empty string after the `, `). The Keys
+  // `location.ISO6709` is left a valid coordinate, so the decoded happy path is
+  // still exercised in the SAME file. Regression for the port previously
+  // DROPPING the tag on an undecodable-but-present `©xyz`. Goldens via the same
+  // bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite
+  // excluded per the Phase-2 forward-item exclusion).
+  check(
+    "QuickTime_sp2_badgps.mov",
+    "QuickTime_sp2_badgps.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_badgps.mov",
+    "QuickTime_sp2_badgps.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_iso6709long_conformance() {
+  // QuickTime SP2 — `ConvertISO6709` DECIMAL-form numification fidelity (a
+  // verified Codex [medium]). `tests/fixtures/QuickTime_sp2_iso6709long.mov` is
+  // the SP2 fixture with its `©xyz` payload binary-patched from the decodable
+  // `+37.3318-122.0312+010.500/` to the LONG-fractional decimal coordinate
+  // `+12.123456789012345678901-034.9876543210987654321+010.123456789012345/`
+  // (atom + `udta` + `moov` sizes fixed). ExifTool's `ConvertISO6709`
+  // (QuickTime.pm:8887) builds the decimal ValueConv from `($1+0)`/`($2+0)`/
+  // `($3+0)` — Perl NUMIFIES each matched substring to a double then
+  // stringifies it (~15 significant digits), so `-n`
+  // `UserData:GPSCoordinates` = `12.1234567890123 -34.9876543210988
+  // 10.1234567890123` (f64-rounded), NOT the verbatim 21-digit string. The port
+  // builds the decimal form from the parsed f64 via `perl_num`
+  // (`format_g(_, 15)`), matching exactly. The Keys `location.ISO6709` keeps a
+  // normal coordinate so the byte-identical happy path coexists in the file.
+  // Goldens via the same bundled `perl exiftool -j -G1 -struct -api
+  // QuickTimeUTC=1` (System/Composite excluded per the Phase-2 forward item).
+  check(
+    "QuickTime_sp2_iso6709long.mov",
+    "QuickTime_sp2_iso6709long.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_iso6709long.mov",
+    "QuickTime_sp2_iso6709long.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_infgps_conformance() {
+  // QuickTime SP2 — `PrintGPSCoordinates`/`GPS::ToDMS` non-finite fidelity (a
+  // verified Codex [medium]). `tests/fixtures/QuickTime_sp2_infgps.mov` is the
+  // SP2 fixture with its `©xyz` payload binary-patched to the NON-finite raw
+  // string `inf inf -inf` (atom + `udta` + `moov` sizes fixed). No ISO 6709 form
+  // matches, so `ConvertISO6709` returns the string UNCHANGED: under `-n`
+  // `UserData:GPSCoordinates` = the verbatim `inf inf -inf` (lowercase — never
+  // numified), while under `-j` `PrintGPSCoordinates` runs each token through
+  // `GPS::ToDMS` + Perl numeric stringification, which use Perl's titlecase
+  // `Inf`/`-Inf`/`NaN`: `Inf deg NaN' NaN" N, Inf deg NaN' NaN" E, Inf m Below
+  // Sea Level` (the `-inf` altitude is `-(-Inf)` = `Inf` in the Below-Sea-Level
+  // branch). Regression for `to_dms`/`perl_num` previously emitting Rust's
+  // lowercase `inf`. Goldens via the same bundled `perl exiftool -j -G1 -struct
+  // -api QuickTimeUTC=1` (System/Composite excluded per the Phase-2 forward
+  // item).
+  check(
+    "QuickTime_sp2_infgps.mov",
+    "QuickTime_sp2_infgps.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_infgps.mov",
+    "QuickTime_sp2_infgps.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_ilst_before_keys_conformance() {
+  // QuickTime SP2 — `ProcessKeys` SINGLE-PASS, file-order key resolution (a
+  // verified Codex [high]). `tests/fixtures/QuickTime_sp2_ilst_before_keys.mov`
+  // is the SP2 fixture with the `moov/meta` children REORDERED so the `ilst`
+  // box precedes the `keys` box (hdlr, ilst, keys). ExifTool's `ProcessMOV`
+  // walks `meta` children in order with no look-ahead: `ProcessKeys` registers
+  // the ItemList key tags (id `"$KeysCount.$index"`) only when the `keys` atom
+  // is reached (QuickTime.pm:9857), and an `ilst` item resolves its id
+  // `"$KeysCount.unpack('N')"` against the table built SO FAR
+  // (QuickTime.pm:10132). An `ilst` ahead of its `keys` therefore finds NO
+  // registered id ⇒ EVERY item is dropped, so the bundled output has ZERO
+  // `Keys:*` tags (the udta `UserData:*`, both tracks, and the `mdta`
+  // HandlerType are byte-identical to the base `QuickTime_sp2.mov` golden).
+  // Regression for the prior two-pass design, which wrongly resolved the `ilst`
+  // against a FUTURE `keys` table and populated the Keys tags anyway. Goldens
+  // via the same bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1`
+  // (System/Composite excluded per the Phase-2 forward item).
+  check(
+    "QuickTime_sp2_ilst_before_keys.mov",
+    "QuickTime_sp2_ilst_before_keys.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_ilst_before_keys.mov",
+    "QuickTime_sp2_ilst_before_keys.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_macroman_conformance() {
+  // QuickTime SP2 — default-language (`lang 0`) `udta` text is MacRoman by
+  // default (a verified Codex [medium]). `tests/fixtures/QuickTime_sp2_macroman
+  // .mov` is the SP2 fixture with the `©nam` (Title) text bytes changed to the
+  // MacRoman sequence `Caf\x8e Clip` (lang 0; `0x8e` = MacRoman é = U+00E9),
+  // size-preserving (same 9-byte length as the original `Test Clip`). ExifTool
+  // treats QuickTime language 0 as a Macintosh language code whose charset
+  // defaults to `CharsetQuickTime` = MacRoman, using UTF-8 ONLY when the bytes
+  // are "obviously UTF8" (`IsUTF8 > 0`, QuickTime.pm:10499-10506). `Caf\x8e
+  // Clip` is NOT valid UTF-8 (`0x8e` is an invalid lead byte), so it decodes as
+  // MacRoman ⇒ `UserData:Title` = `Café Clip` in BOTH `-j` and `-n` (a charset
+  // decode, not a PrintConv). Regression for the prior code, which treated
+  // `lang 0` as UTF-8 unconditionally and corrupted the byte to U+FFFD. Every
+  // other tag is byte-identical to the base `QuickTime_sp2.mov` golden. Goldens
+  // via the same bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1`
+  // (System/Composite excluded per the Phase-2 forward item).
+  check(
+    "QuickTime_sp2_macroman.mov",
+    "QuickTime_sp2_macroman.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_macroman.mov",
+    "QuickTime_sp2_macroman.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_meta_handlerclass_conformance() {
+  // QuickTime SP2 — `moov/meta/hdlr` HandlerClass / ComponentType emission (a
+  // verified Codex [medium]). `tests/fixtures/QuickTime_sp2_meta_handlerclass
+  // .mov` is the SP2 fixture with the `moov/meta/hdlr` body offset-4
+  // ComponentType changed from all-zero to `mhlr` (size-preserving). The SAME
+  // `%QuickTime::Handler` table drives the `moov/meta/hdlr` and the per-`trak`
+  // hdlr (QuickTime.pm:2824 + 7229/7321 → 8391-8402), so a non-zero meta
+  // ComponentType emits `QuickTime:HandlerClass` (`mhlr` → "Media Handler" under
+  // `-j`, raw `mhlr` under `-n`) — the RawConv drops only an all-zero value.
+  // Regression for the prior code, which decoded only the meta HandlerType
+  // (offset 8) and never the meta HandlerClass. Every other tag is
+  // byte-identical to the base `QuickTime_sp2.mov` golden (whose meta
+  // ComponentType IS all-zero ⇒ no meta HandlerClass). Goldens via the same
+  // bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite
+  // excluded per the Phase-2 forward item).
+  check(
+    "QuickTime_sp2_meta_handlerclass.mov",
+    "QuickTime_sp2_meta_handlerclass.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_meta_handlerclass.mov",
+    "QuickTime_sp2_meta_handlerclass.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_udta_camid_conformance() {
+  // QuickTime SP2 camera-identity sweep — the NON-copyright-symbol `udta`
+  // camera atoms plus the new copyright-symbol identity atoms.
+  // `tests/fixtures/QuickTime_sp2_udta_camid.mov` is a SYNTHETIC `.mov` whose
+  // `moov/udta` carries `manu`/`modl` (Canon SX280-style, each prefixed with the
+  // 6 unknown bytes `00 00 00 00 15 c7` consumed by the RawConv
+  // `s/^\0{4}..//s; s/\0.*//`), three competing Avoid Model atoms
+  // (`modl`/`cmnm`/`CNMN`) plus a non-Avoid copyright-symbol `mod`, `slno` vs the
+  // Avoid `SNum` (SerialNumber), `CNFV` vs the Avoid `FIRM` (FirmwareVersion),
+  // `CNCV` (CompressorVersion), `cmid` (CameraID), the copyright-symbol `cpy`
+  // (Copyright) and `date` (DateTimeOriginal, %iso8601Date). Exercises:
+  //
+  //   - the `manu`/`modl` Canon-prefix RawConv (Make=`Canon`, the bare value
+  //     after the 6-byte strip + NUL truncation);
+  //   - ExifTool's duplicate-tag PRIORITY rule (ExifTool.pm:9468-9566): the
+  //     non-Avoid copyright-symbol `mod` (`Canon EOS R5`) WINS over the three
+  //     Avoid Model atoms; `slno` beats `SNum`; `CNFV` beats `FIRM` — i.e. a
+  //     priority-1 source always overrides an `Avoid` (priority-0) one
+  //     regardless of file order (verified vs bundled);
+  //   - the `Format => 'string'` NUL truncation (`cmnm`/`CNMN`/`slno`/`CNCV`/
+  //     `CNFV`/`cmid`);
+  //   - the new copyright-symbol `cpy` Copyright + `date` DateTimeOriginal.
+  //
+  // Goldens via the same bundled `perl exiftool -j -G1 -struct -api
+  // QuickTimeUTC=1` (System/Composite excluded per the Phase-2 forward item).
+  check(
+    "QuickTime_sp2_udta_camid.mov",
+    "QuickTime_sp2_udta_camid.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_udta_camid.mov",
+    "QuickTime_sp2_udta_camid.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_android_conformance() {
+  // QuickTime SP2 camera-identity sweep — the `com.android.*` Keys full-key
+  // FALLBACK (a verified Codex [medium]). `tests/fixtures/QuickTime_sp2_android
+  // .mov` is a SYNTHETIC `.mov` whose `moov/meta` keys box holds
+  // `com.android.version` / `com.android.manufacturer` / `com.android.model`
+  // (plus a `moov/udta` copyright-symbol `mak`). These keys are NOT in the
+  // `com.apple.quicktime` namespace, so `ProcessKeys` (QuickTime.pm:9803) strips
+  // only the bare `com.` prefix to `android.manufacturer` (which is not a table
+  // id), then the `for(;;)` loop (9807-9824) FALLS BACK to the FULL key
+  // `com.android.manufacturer` — which resolves to `Keys:AndroidMake`. So the
+  // bundled output is `Keys:AndroidVersion=13` / `Keys:AndroidMake=Google` /
+  // `Keys:AndroidModel=Pixel 8 Pro` (plus `UserData:Make=motorola`). Regression
+  // for the prior code, which kept only the stripped key and DROPPED every
+  // `com.android.*` tag. Goldens via the same bundled `perl exiftool -j -G1
+  // -struct -api QuickTimeUTC=1` (System/Composite excluded per the Phase-2
+  // forward item).
+  check(
+    "QuickTime_sp2_android.mov",
+    "QuickTime_sp2_android.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_android.mov",
+    "QuickTime_sp2_android.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_gopro_conformance() {
+  // QuickTime SP2 Part-2 — the conv-less `%QuickTime::UserData` camera atoms
+  // (the xtask `--kind quicktime` generated `4cc → Name` map) PLUS the two
+  // code-valued atoms hand-ported in the walker. `tests/fixtures/
+  // QuickTime_sp2_gopro.mov` is a SYNTHETIC `.mov` whose `moov/udta` carries:
+  //   - international-text (©-prefixed) atoms `©mal` MakerURL / `©gpt`
+  //     CameraPitch / `©gyw` CameraYaw / `©grl` CameraRoll (QuickTime.pm:1639,
+  //     2148-2150 — bare `'Name'`, conv-less);
+  //   - plain-string atoms `GoPr` GoProType / `LENS` LensSerialNumber / `FOV\0`
+  //     FieldOfView (QuickTime.pm:2117/2119/2131 — bare `'Name'`, conv-less);
+  //   - code-valued `CAME` SerialNumberHash / `MUID` MediaUID
+  //     (QuickTime.pm:2120-2127 — `ValueConv => 'unpack("H*",$val)'`), whose
+  //     raw bytes `00 11 de ad be ef` / `ca fe f0 0d 12 34` HASH to the
+  //     lower-case hex `0011deadbeef` / `cafef00d1234`.
+  // The conv-less atoms emit verbatim under `QuickTime:UserData`; the numeric-
+  // looking `©gpt`/`©gyw`/`©grl` strings (`12.5` / `-3.0` / `0.0`) render as
+  // JSON NUMBERS via the token-exact JSON typing (Contract B), exactly as
+  // ExifTool's `-j` numifies them. Goldens via the bundled `perl exiftool -j
+  // -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded per the
+  // Phase-2 forward item).
+  check(
+    "QuickTime_sp2_gopro.mov",
+    "QuickTime_sp2_gopro.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_gopro.mov",
+    "QuickTime_sp2_gopro.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_keys_direction_conformance() {
+  // QuickTime SP2 Part-2 — the conv-less `%QuickTime::Keys` atoms (generated
+  // `key → Name` map) PLUS the two code-valued Keys atoms hand-ported in the
+  // walker. `tests/fixtures/QuickTime_sp2_keys_direction.mov` is a SYNTHETIC
+  // `.mov` whose `moov/meta` keys box holds:
+  //   - `com.apple.quicktime.direction.facing` CameraDirection /
+  //     `…direction.motion` CameraMotion (QuickTime.pm:6735-6736 — bare `Name`
+  //     + a family-2-only `Groups => { 2 => 'Location' }`, conv-less), each a
+  //     plain UTF-8 `data` value (`front` / `walking`);
+  //   - `com.android.capture.fps` AndroidCaptureFPS (QuickTime.pm:6763,
+  //     `Writable => 'float'`), a `data` atom with the float flag `0x17` and
+  //     the IEEE big-endian `f32` `29.97` — decoded numerically (the f32→f64
+  //     widening renders `%.15g` as `29.9699993133545` in BOTH modes);
+  //   - `samsung.android.utc_offset` AndroidTimeZone (QuickTime.pm:6769), a
+  //     full-key-fallback plain string (`+09:00`).
+  // Exercises the float `data`-atom decode (`QuickTimeFormat` flag path) and
+  // the generated conv-less Keys map. Goldens via the bundled `perl exiftool -j
+  // -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_keys_direction.mov",
+    "QuickTime_sp2_keys_direction.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_keys_direction.mov",
+    "QuickTime_sp2_keys_direction.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_ilst_binary_conformance() {
+  // QuickTime SP2 — the conv-less Keys `data`-atom BINARY branch
+  // (QuickTime.pm:10411-10414 `elsif (not $$tagInfo{ValueConv}) { $value =
+  // \$buf }`). `tests/fixtures/QuickTime_sp2_ilst_binary.mov` (crafted by
+  // `tools/gen_quicktime_sp2_decode_fixtures.py`) holds a `moov/meta` keys box
+  // with `com.apple.quicktime.direction.facing` (CameraDirection — conv-less +
+  // Format-less in `%QuickTime::Keys`) whose `data` atom carries the BINARY flag
+  // `0x00` with a 3-byte value. `QuickTimeFormat(0x00, 3)` returns undef (only
+  // len 1/2 map to int8u/int16u), so with no ValueConv the value becomes a
+  // binary scalar ref ⇒ `Keys:CameraDirection` renders the universal
+  // `(Binary data 3 bytes, use -b option to extract)` placeholder in BOTH modes.
+  // Verified vs bundled 13.59. Goldens via the bundled `perl exiftool -j -G1
+  // -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_ilst_binary.mov",
+    "QuickTime_sp2_ilst_binary.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_ilst_binary.mov",
+    "QuickTime_sp2_ilst_binary.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_ilst_numeric_conformance() {
+  // QuickTime SP2 — the conv-less Keys `data`-atom NUMERIC branch
+  // (QuickTime.pm:10402-10409 `$format = QuickTimeFormat($flags,$len); ... $value
+  // = ReadValue(...)`). `tests/fixtures/QuickTime_sp2_ilst_numeric.mov` holds
+  // `com.apple.quicktime.direction.facing` (CameraDirection) whose `data` atom
+  // carries the unsigned-int flag `0x16` with a 2-byte value `0x012c`.
+  // `QuickTimeFormat(0x16, 2)` ⇒ `int16u` ⇒ `ReadValue` ⇒ the NUMBER 300, with
+  // no PrintConv/ValueConv ⇒ `Keys:CameraDirection` = the bare JSON number `300`
+  // in BOTH modes. Verified vs bundled 13.59. Goldens via the bundled `perl
+  // exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_ilst_numeric.mov",
+    "QuickTime_sp2_ilst_numeric.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_ilst_numeric.mov",
+    "QuickTime_sp2_ilst_numeric.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_itext_empty_first_conformance() {
+  // QuickTime SP2 — the international-text empty-entry CONTINUATION
+  // (QuickTime.pm:10483 `next if not $len and $pos`). `tests/fixtures/
+  // QuickTime_sp2_itext_empty_first.mov` holds a `moov/udta` `©nam` (Title)
+  // whose FIRST international-text entry is empty (len 0) FOLLOWED BY a valid
+  // entry (len 2, lang 0, `Hi`). ExifTool's entry loop advances past the empty
+  // header then `next`s (it does NOT bail), so the later entry is decoded ⇒
+  // `UserData:Title` = `Hi` in BOTH modes. Regression for the prior code that
+  // bailed on an empty first entry. Verified vs bundled 13.59. Goldens via the
+  // bundled `perl exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite
+  // excluded).
+  check(
+    "QuickTime_sp2_itext_empty_first.mov",
+    "QuickTime_sp2_itext_empty_first.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_itext_empty_first.mov",
+    "QuickTime_sp2_itext_empty_first.mov.n.json",
+    false,
+  );
+}
+
+#[test]
+fn quicktime_sp2_itext_empty_only_conformance() {
+  // QuickTime SP2 — an international-text atom whose ONLY entry is empty emits
+  // NO tag. `tests/fixtures/QuickTime_sp2_itext_empty_only.mov` holds a `©nam`
+  // (Title) with a single empty (len 0) entry; the loop skips it
+  // (QuickTime.pm:10483) and the next 4-byte-header read overruns, so the loop
+  // ends with NO `FoundTag` ⇒ the golden has no `UserData:Title` (and no `udta`
+  // tag at all). Verified vs bundled 13.59. Goldens via the bundled `perl
+  // exiftool -j -G1 -struct -api QuickTimeUTC=1` (System/Composite excluded).
+  check(
+    "QuickTime_sp2_itext_empty_only.mov",
+    "QuickTime_sp2_itext_empty_only.mov.json",
+    true,
+  );
+  check(
+    "QuickTime_sp2_itext_empty_only.mov",
+    "QuickTime_sp2_itext_empty_only.mov.n.json",
+    false,
+  );
+}
+
+#[test]
 fn mxf_conformance() {
   // FORMATS.md row 24 (Engine-only). `tests/fixtures/MXF.mxf` is the
   // bundled `lib/Image/ExifTool/t/images/MXF.mxf` (7510 bytes — header

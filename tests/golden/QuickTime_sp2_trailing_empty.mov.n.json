@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "QuickTime_sp2_trailing_empty.mov",
+  "ExifTool:ExifToolVersion": 13.59,
+  "File:FileType": "MOV",
+  "File:FileTypeExtension": "MOV",
+  "File:MIMEType": "video/quicktime",
+  "QuickTime:MajorBrand": "qt  ",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["qt  "],
+  "UserData:Make": "TrailingEmptyTest"
+}]
