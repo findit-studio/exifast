@@ -51,6 +51,41 @@ impl ConvMode {
   }
 }
 
+/// Options that shape a [`Taggable::tags`] emission: the conv mode (`-j`/`-n`),
+/// ExifTool `-ee` (gates per-sample timed-metadata emission, landed in a later
+/// task), and the `-G1`/`-G3` group rendering. Non-timed formats read only
+/// [`mode`](Self::mode).
+///
+/// Built by external callers via [`EmitOptions::g1`] and handed to
+/// [`Taggable::tags`]; the fields are crate-internal (the D8 no-public-fields
+/// convention — and `group_mode`'s `GroupMode` is itself crate-private), read
+/// by the in-crate emitters.
+#[derive(Debug, Clone, Copy)]
+pub struct EmitOptions {
+  /// The `-j`/`-n` conversion mode every [`Taggable`] renders its values for.
+  pub(crate) mode: ConvMode,
+  /// ExifTool `-ee`: gates per-sample timed-metadata emission.
+  // read by the timed-metadata emission task
+  #[allow(dead_code)]
+  pub(crate) extract_embedded: bool,
+  /// `-G1` (doc axis collapsed) vs `-G3` (`Doc<N>:` prefixed) group rendering.
+  // read by the timed-metadata emission task
+  #[allow(dead_code)]
+  pub(crate) group_mode: crate::serialize_key::GroupMode,
+}
+
+impl EmitOptions {
+  /// The default `-G1` emission for a given conv mode + `-ee` flag.
+  #[must_use]
+  pub const fn g1(mode: ConvMode, extract_embedded: bool) -> Self {
+    Self {
+      mode,
+      extract_embedded,
+      group_mode: crate::serialize_key::GroupMode::G1,
+    }
+  }
+}
+
 /// A rendered, ready-to-emit tag: the existing [`Tag`] (group + name + value,
 /// already converted for the active [`ConvMode`]) plus the `Unknown=>1` flag
 /// the engine uses to suppress it from default output (`ExifTool.pm:9179`).
@@ -107,9 +142,11 @@ impl EmittedTag {
 /// domain-struct archetype); the [`run_emission`] engine then applies the
 /// cross-cutting rules.
 pub trait Taggable {
-  /// Yield this `Meta`'s [`EmittedTag`]s for the given conversion `mode`, in
-  /// emission order (the sink keeps first-occurrence position on dedup).
-  fn tags(&self, mode: ConvMode) -> impl Iterator<Item = EmittedTag> + '_;
+  /// Yield this `Meta`'s [`EmittedTag`]s for the given [`EmitOptions`], in
+  /// emission order (the sink keeps first-occurrence position on dedup). Most
+  /// formats read only [`EmitOptions::mode`]; the timed-metadata path also
+  /// consults `extract_embedded` / `group_mode`.
+  fn tags(&self, opts: EmitOptions) -> impl Iterator<Item = EmittedTag> + '_;
 }
 
 /// Drive any [`Taggable`] into the [`TagMap`](crate::tagmap::TagMap) sink,
@@ -123,8 +160,12 @@ pub trait Taggable {
 ///    (faithful `FoundTag` last-wins-in-place — a repeated key replaces the
 ///    earlier value while keeping its first-occurrence position,
 ///    `ExifTool.pm:9437-9519`).
-pub(crate) fn run_emission<T: Taggable>(meta: &T, mode: ConvMode, out: &mut crate::tagmap::TagMap) {
-  for e in meta.tags(mode) {
+pub(crate) fn run_emission<T: Taggable>(
+  meta: &T,
+  opts: EmitOptions,
+  out: &mut crate::tagmap::TagMap,
+) {
+  for e in meta.tags(opts) {
     if e.unknown() {
       continue;
     }
@@ -176,7 +217,7 @@ mod tests {
   fn engine_suppresses_unknown_and_dedups() {
     struct Src;
     impl Taggable for Src {
-      fn tags(&self, _m: ConvMode) -> impl Iterator<Item = EmittedTag> + '_ {
+      fn tags(&self, _opts: EmitOptions) -> impl Iterator<Item = EmittedTag> + '_ {
         [
           EmittedTag::new(
             Group::new("EXIF", "IFD0"),
@@ -204,12 +245,31 @@ mod tests {
     }
 
     let mut tm = crate::tagmap::TagMap::new();
-    run_emission(&Src, ConvMode::PrintConv, &mut tm);
+    run_emission(&Src, EmitOptions::g1(ConvMode::PrintConv, false), &mut tm);
 
     // The single surviving `IFD0:Make` carries the LAST value (faithful
     // last-wins-in-place; the first `"Canon"` was overwritten by `"AGAIN"`).
     assert_eq!(tm.get_str("IFD0", "Make").as_deref(), Some("AGAIN"));
     // The Unknown tag never reached the sink.
     assert!(tm.get("MakerNotes", "Hidden").is_none());
+  }
+
+  /// [`EmitOptions::g1`] carries the requested conv mode + `-ee` flag and the
+  /// `-G1` (doc-collapsed) group rendering — the documented default the typed
+  /// `serialize_tags` path builds until the `ParseOptions` task threads the real
+  /// `-ee`.
+  #[test]
+  fn emit_options_g1_defaults() {
+    let opts = EmitOptions::g1(ConvMode::ValueConv, false);
+    assert_eq!(opts.mode, ConvMode::ValueConv);
+    assert!(!opts.extract_embedded);
+    assert!(matches!(
+      opts.group_mode,
+      crate::serialize_key::GroupMode::G1
+    ));
+
+    let ee = EmitOptions::g1(ConvMode::PrintConv, true);
+    assert_eq!(ee.mode, ConvMode::PrintConv);
+    assert!(ee.extract_embedded);
   }
 }

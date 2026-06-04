@@ -417,8 +417,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// known tag (no `Unknown => 1` in AAC.pm) ⇒ `unknown: false`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -655,7 +656,7 @@ mod tests {
   /// resulting [`TagMap`](crate::tagmap::TagMap) — the production sink path.
   fn emit_into_tagmap(meta: &Meta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(meta, mode, &mut w);
+    crate::emit::run_emission(meta, crate::emit::EmitOptions::g1(mode, false), &mut w);
     w
   }
 
@@ -725,7 +726,9 @@ mod tests {
       channels: 2,
       encoder: Some("Enc"),
     };
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // ProfileType, SampleRate, Channels, Encoder — four tags, none Unknown.
     assert_eq!(tags.len(), 4);
     for t in &tags {

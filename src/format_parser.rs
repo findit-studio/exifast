@@ -536,7 +536,7 @@ impl AnyMeta<'_> {
   /// [`serialize_tags`](Self::serialize_tags) (the `-j`/`-n` JSON path) and
   /// [`iter_tags`](Self::iter_tags) (the public generic-extraction path).
   ///
-  /// Each arm is exactly `m.tags(mode).collect()` — the format's
+  /// Each arm is exactly `m.tags(opts).collect()` — the format's
   /// [`Taggable`](crate::emit::Taggable) stream, already rendered for `mode`
   /// (PrintConv vs ValueConv), with each sub-Meta's tags spliced in the
   /// faithful `FoundTag` order inside its own `tags()`. NO warning/error
@@ -548,86 +548,89 @@ impl AnyMeta<'_> {
   /// arms), and when NO format feature is on (only the `_Phantom` arm, Codex
   /// CF3). The `all-formats` default takes the former path; the phantom arm
   /// keeps the no-format build type-checking.
-  fn collect_emitted(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::emit::EmittedTag> {
+  fn collect_emitted(
+    &self,
+    opts: crate::emit::EmitOptions,
+  ) -> std::vec::Vec<crate::emit::EmittedTag> {
     use crate::emit::Taggable as _;
     match self {
       #[cfg(feature = "moi")]
-      AnyMeta::Moi(m) => m.tags(mode).collect(),
+      AnyMeta::Moi(m) => m.tags(opts).collect(),
       #[cfg(feature = "aac")]
-      AnyMeta::Aac(m) => m.tags(mode).collect(),
+      AnyMeta::Aac(m) => m.tags(opts).collect(),
       // DV: only the `Meta` variant yields tags; `UnrecognizedProfile`
       // (DV.pm:188 — Warn + return 1 without DV:* tags) yields NONE — its
       // warning is drained by `drain_diagnostics`.
       #[cfg(feature = "dv")]
       AnyMeta::Dv(o) => match o {
         crate::formats::dv::ParseOutcome::UnrecognizedProfile => std::vec::Vec::new(),
-        crate::formats::dv::ParseOutcome::Meta(m) => m.tags(mode).collect(),
+        crate::formats::dv::ParseOutcome::Meta(m) => m.tags(opts).collect(),
       },
       #[cfg(feature = "audible")]
-      AnyMeta::Aa(m) => m.tags(mode).collect(),
+      AnyMeta::Aa(m) => m.tags(opts).collect(),
       #[cfg(feature = "crw")]
-      AnyMeta::Crw(m) => m.tags(mode).collect(),
+      AnyMeta::Crw(m) => m.tags(opts).collect(),
       #[cfg(feature = "red")]
-      AnyMeta::R3d(m) => m.tags(mode).collect(),
+      AnyMeta::R3d(m) => m.tags(opts).collect(),
       #[cfg(feature = "id3")]
-      AnyMeta::Id3(m) => m.tags(mode).collect(),
+      AnyMeta::Id3(m) => m.tags(opts).collect(),
       #[cfg(feature = "m2ts")]
-      AnyMeta::M2ts(m) => m.tags(mode).collect(),
+      AnyMeta::M2ts(m) => m.tags(opts).collect(),
       #[cfg(feature = "mp3")]
-      AnyMeta::Mp3(m) => m.tags(mode).collect(),
+      AnyMeta::Mp3(m) => m.tags(opts).collect(),
       #[cfg(feature = "aiff")]
-      AnyMeta::Aiff(m) => m.tags(mode).collect(),
+      AnyMeta::Aiff(m) => m.tags(opts).collect(),
       #[cfg(feature = "ape")]
-      AnyMeta::Ape(m) => m.tags(mode).collect(),
+      AnyMeta::Ape(m) => m.tags(opts).collect(),
       #[cfg(feature = "dsf")]
-      AnyMeta::Dsf(m) => m.tags(mode).collect(),
+      AnyMeta::Dsf(m) => m.tags(opts).collect(),
       #[cfg(feature = "flac")]
-      AnyMeta::Flac(m) => m.tags(mode).collect(),
+      AnyMeta::Flac(m) => m.tags(opts).collect(),
       #[cfg(feature = "h264")]
-      AnyMeta::H264(m) => m.tags(mode).collect(),
+      AnyMeta::H264(m) => m.tags(opts).collect(),
       #[cfg(feature = "flash")]
-      AnyMeta::Flv(m) => m.tags(mode).collect(),
+      AnyMeta::Flv(m) => m.tags(opts).collect(),
       #[cfg(feature = "ogg")]
-      AnyMeta::Ogg(m) => m.tags(mode).collect(),
+      AnyMeta::Ogg(m) => m.tags(opts).collect(),
       #[cfg(feature = "png")]
-      AnyMeta::Png(m) => m.tags(mode).collect(),
+      AnyMeta::Png(m) => m.tags(opts).collect(),
       #[cfg(feature = "real")]
-      AnyMeta::Real(m) => m.tags(mode).collect(),
+      AnyMeta::Real(m) => m.tags(opts).collect(),
       #[cfg(feature = "mpeg-audio")]
-      AnyMeta::MpegAudio(m) => m.tags(mode).collect(),
+      AnyMeta::MpegAudio(m) => m.tags(opts).collect(),
       #[cfg(feature = "mpc")]
-      AnyMeta::Mpc(m) => m.tags(mode).collect(),
+      AnyMeta::Mpc(m) => m.tags(opts).collect(),
       #[cfg(feature = "wavpack")]
-      AnyMeta::Wv(m) => m.tags(mode).collect(),
+      AnyMeta::Wv(m) => m.tags(opts).collect(),
       #[cfg(feature = "matroska")]
-      AnyMeta::Matroska(m) => m.tags(mode).collect(),
+      AnyMeta::Matroska(m) => m.tags(opts).collect(),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => m.tags(mode).collect(),
+      AnyMeta::QuickTime(m) => m.tags(opts).collect(),
       #[cfg(feature = "mxf")]
-      AnyMeta::Mxf(m) => m.tags(mode).collect(),
+      AnyMeta::Mxf(m) => m.tags(opts).collect(),
       // PLIST: `tags()` yields the recognized-PLIST error tag (binary
       // `PLIST:Error`, family-1 — a TAG not a diagnostic), then the walk-order
       // plist tags (PLIST / XML family-1), each leaf already rendered for the
       // mode. The AAE inflate `$et->Warn` is a diagnostic (drained in
       // `drain_diagnostics`), NOT a tag.
       #[cfg(feature = "plist")]
-      AnyMeta::Plist(m) => m.tags(mode).collect(),
+      AnyMeta::Plist(m) => m.tags(opts).collect(),
       // EXIF's `tags()` yields `File:ExifByteOrder` first (when a TIFF block
       // was processed), then the IFD-walk entries, then the MakerNote vendor
       // emissions — uniform with every other format.
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => m.tags(mode).collect(),
+      AnyMeta::Exif(m) => m.tags(opts).collect(),
       // RIFF: `tags()` yields the AVI sub-table entries (RIFF / File family-1,
       // each leaf already rendered for the mode) in file order — uniform with
       // every other format.
       #[cfg(feature = "riff")]
-      AnyMeta::Riff(m) => m.tags(mode).collect(),
+      AnyMeta::Riff(m) => m.tags(opts).collect(),
       // XMP: `tags()` yields the extracted XMP tags in `FoundTag` order
       // (family-0 "XMP", family-1 the namespace group `XMP-exif` / `XMP-dc`
       // / …), each leaf already rendered for the mode. The decode/walk
       // `$et->Warn` is a diagnostic (drained in `Diagnose`), NOT a tag.
       #[cfg(feature = "xmp")]
-      AnyMeta::Xmp(m) => m.tags(mode).collect(),
+      AnyMeta::Xmp(m) => m.tags(opts).collect(),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and yields no tags.
@@ -661,7 +664,7 @@ impl AnyMeta<'_> {
         feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => {
-        let _ = mode;
+        let _ = opts;
         std::vec::Vec::new()
       }
     }
@@ -685,8 +688,11 @@ impl AnyMeta<'_> {
     &self,
     mode: crate::emit::ConvMode,
   ) -> impl Iterator<Item = crate::value::Tag> + '_ {
+    // The generic-extraction path is the `-G1` default; `-ee` defaults off until
+    // the ParseOptions task threads the real flag.
+    let opts = crate::emit::EmitOptions::g1(mode, false);
     let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
-    for e in self.collect_emitted(mode) {
+    for e in self.collect_emitted(opts) {
       // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
       // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
       if e.unknown() {
@@ -740,8 +746,10 @@ impl AnyMeta<'_> {
     print_conv: bool,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    let mode = crate::emit::ConvMode::from_print_conv(print_conv);
-    crate::emit::run_emission(self, mode, out);
+    // -ee defaults off; the ParseOptions task threads the real flag.
+    let opts =
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+    crate::emit::run_emission(self, opts, out);
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }
@@ -906,9 +914,9 @@ impl crate::emit::Taggable for AnyMeta<'_> {
   /// separately by [`drain_diagnostics`](AnyMeta::drain_diagnostics).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
-    self.collect_emitted(mode).into_iter()
+    self.collect_emitted(opts).into_iter()
   }
 }
 

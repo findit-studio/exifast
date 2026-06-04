@@ -3178,8 +3178,9 @@ impl crate::emit::Taggable for PlistMeta<'_> {
   /// `SET_GROUP1 = 'PLIST'` scope) and IS emitted here.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -3699,7 +3700,7 @@ mod tests {
   /// layer, so it is NOT reflected here — these tests assert the TAG stream.)
   fn emit_into_tagmap(meta: &PlistMeta<'_>, mode: crate::emit::ConvMode) -> TagMap {
     let mut tm = TagMap::new();
-    crate::emit::run_emission(meta, mode, &mut tm);
+    crate::emit::run_emission(meta, crate::emit::EmitOptions::g1(mode, false), &mut tm);
     tm
   }
 

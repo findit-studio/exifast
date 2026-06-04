@@ -1887,8 +1887,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// [`run_diagnostics`](crate::diagnostics::run_diagnostics).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -2023,7 +2024,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // tags under their own family-1 groups). Identical to the standalone H.264
     // conformance path.
     if let Some(h) = &self.h264 {
-      tags.extend(h.tags(mode));
+      tags.extend(h.tags(opts));
     }
 
     tags.into_iter()

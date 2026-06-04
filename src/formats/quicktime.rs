@@ -3886,8 +3886,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// [`Meta::warning`] into `out.write_warning` (R6/F2).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -5489,7 +5490,7 @@ mod tests {
   #[cfg(feature = "alloc")]
   fn emit_into_tagmap(meta: &Meta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(meta, mode, &mut w);
+    crate::emit::run_emission(meta, crate::emit::EmitOptions::g1(mode, false), &mut w);
     w
   }
 
@@ -8072,7 +8073,7 @@ mod tests {
     let meta = sp1_meta();
     for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
       let list = meta
-        .tags(mode)
+        .tags(crate::emit::EmitOptions::g1(mode, false))
         .find(|t| t.tag().name() == "CompatibleBrands")
         .expect("CompatibleBrands emitted");
       assert_eq!(
@@ -8139,7 +8140,9 @@ mod tests {
     // for the per-track atoms. No tag carries Unknown=>1 in SP1.
     use crate::emit::{ConvMode, Taggable};
     let meta = sp1_meta();
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     for t in &tags {
       assert_eq!(
         t.tag().group_ref().family0(),

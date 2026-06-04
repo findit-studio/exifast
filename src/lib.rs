@@ -171,7 +171,7 @@ pub use metadata::{MediaMetadata, Project};
 // it writes into the crate-private `TagMap` sink). `alloc`-gated to match the
 // `emit` module.
 #[cfg(feature = "alloc")]
-pub use emit::{ConvMode, EmittedTag, Taggable};
+pub use emit::{ConvMode, EmitOptions, EmittedTag, Taggable};
 
 // The diagnostic-framework public surface (`run_diagnostics` stays `pub(crate)`
 // — it writes into the crate-private `TagMap` sink). `alloc`-gated to match the

@@ -2194,8 +2194,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// other APE tag has `PrintConv::None` ⇒ identical under both modes.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
 
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
@@ -2208,7 +2209,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // by the `AnyMeta::Ape` arm.
     #[cfg(feature = "id3")]
     if let Some(id3) = &self.id3 {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     // (1) MAC binary-data header. Family-1 group `"MAC"` (APE.pm:47/67).
@@ -3544,7 +3545,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     // Binary value MUST be "BINARY" (6 bytes), not "\0BINARY" (7 bytes).
     match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => {
@@ -3569,7 +3574,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     match tm.get("APE", "CoverArtFront").expect("CoverArtFront tag") {
       TagValue::Bytes(b) => assert_eq!(b.as_slice(), b"BINARY"),
       other => panic!("expected Bytes, got {other:?}"),
@@ -3585,7 +3594,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     assert_eq!(
       tm.get("APE", "CoverArtFrontDesc"),
       Some(&TagValue::Str("Foo".into()))
@@ -3726,7 +3739,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     // Exactly two APE:* trailer tags, in order, no File:*.
     let names: Vec<&str> = tm
       .entries()
@@ -3782,7 +3799,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_trailer_only_owned(&data, &mut shared).expect("trailer parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     // Composite:Duration MUST be present (14.71 s — same arithmetic + PrintConv
     // as the standalone APE_spaced_composite fixture).
     assert_eq!(
@@ -4200,7 +4221,11 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&data, &mut shared).expect("APE parsed");
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut tm,
+    );
     // Confirm CoverArtFront is emitted with the raw JPEG bytes intact.
     match tm
       .get("APE", "CoverArtFront")
@@ -4339,7 +4364,11 @@ mod tests {
     let meta = <ProcessApe as FormatParser>::parse(&ProcessApe, Context::new(&data, &mut shared))
       .expect("parsed");
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     // Family-1 key is "APE" for main-tag emissions in the writer's
     // single-string `group` model.
     assert_eq!(w.get_str("APE", "Artist"), Some("Tester".to_string()));
@@ -4476,7 +4505,9 @@ mod tests {
     let mut shared = SharedFlags::new();
     let meta = parse_full_chained(&bytes, &mut shared).expect("APE parsed");
 
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty(), "APE.ape must emit tags");
 
     // MAC header + main tags are family-0 "APE" (APE_GROUP0); the intra-APE

@@ -3778,8 +3778,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// `Unknown => 1`) ⇒ `unknown: false`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
@@ -4314,7 +4315,7 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -4789,7 +4790,9 @@ mod tests {
     ))
     .expect("read fixture");
     let meta = parse_borrowed(&bytes).expect("accepted");
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // No Matroska tag carries `Unknown => 1`.
     assert!(tags.iter().all(|t| !t.unknown()));
     // family0 is the constant "Matroska" table group; family1 is the

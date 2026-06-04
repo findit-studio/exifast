@@ -1605,8 +1605,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// ([`crate::parser::extract_info`]) `SetFileType` responsibility.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -1631,7 +1632,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // arm (matching the retired position — see fn docs).
     #[cfg(feature = "id3")]
     if let Some(id3) = self.id3.as_ref() {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     // -- StreamInfo (FLAC.pm:59-82) ---------------------------------------
@@ -2015,7 +2016,11 @@ mod tests {
   /// the in-module tests exercise the same net `TagMap` the engine produces.
   /// `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
-    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    crate::emit::run_emission(
+      meta,
+      crate::emit::EmitOptions::g1(ConvMode::from_print_conv(print_conv), false),
+      out,
+    );
     crate::diagnostics::run_diagnostics(meta, out);
   }
 
@@ -2648,7 +2653,11 @@ mod tests {
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("FLAC", "SampleRate"), Some("8000".to_string()));
     assert_eq!(w.get_str("FLAC", "Channels"), Some("2".to_string()));
     assert_eq!(w.get_str("FLAC", "BitsPerSample"), Some("8".to_string()));
@@ -2679,7 +2688,7 @@ mod tests {
     let meta = parse_borrowed(&data, &mut shared).unwrap();
     for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
       let mut w = TagMap::new();
-      crate::emit::run_emission(&meta, mode, &mut w);
+      crate::emit::run_emission(&meta, crate::emit::EmitOptions::g1(mode, false), &mut w);
       match w.get("Vorbis", "Artist") {
         Some(TagValue::List(items)) => {
           assert_eq!(items.len(), 2, "mode={mode:?}");
@@ -2701,7 +2710,11 @@ mod tests {
     let meta = parse_borrowed(&data, &mut shared).unwrap();
     // -j: PrintConv name + binary bytes.
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(
       w.get_str("FLAC", "PictureType"),
       Some("Front Cover".to_string())
@@ -2709,7 +2722,11 @@ mod tests {
     assert!(matches!(w.get("FLAC", "Picture"), Some(TagValue::Bytes(_))));
     // -n: raw numeric PictureType (3 = Front Cover).
     let mut wn = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert_eq!(wn.get_str("FLAC", "PictureType"), Some("3".to_string()));
   }
 
@@ -2721,7 +2738,9 @@ mod tests {
     let data = fixture("FLAC_duration.flac");
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap();
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty());
     let mut saw_flac = false;
     let mut saw_vorbis = false;
@@ -2751,13 +2770,21 @@ mod tests {
     let mut shared = crate::format_parser::SharedFlags::new();
     let meta = parse_borrowed(&data, &mut shared).unwrap();
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(
       w.get_str("Composite", "Duration"),
       Some("0:00:30".to_string())
     );
     let mut wn = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert!(matches!(wn.get("Composite", "Duration"), Some(TagValue::F64(x)) if *x == 30.0));
   }
 
@@ -2773,7 +2800,7 @@ mod tests {
     let meta = parse_borrowed(&data, &mut shared).unwrap();
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
     let names: Vec<String> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
       .collect();
     let id3_pos = names

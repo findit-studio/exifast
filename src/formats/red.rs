@@ -1716,8 +1716,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// surface through `TagMap::first_warning`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
 
@@ -2491,7 +2492,7 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -2533,7 +2534,9 @@ mod tests {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/Red.r3d");
     let bytes = std::fs::read(&path).expect("read Red.r3d fixture");
     let meta = parse_borrowed(&bytes).expect("real Red.r3d parses");
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty());
     for t in &tags {
       // family0 = family1 = "Red" (golden `"Red:…"`; Red.pm:168 sets only

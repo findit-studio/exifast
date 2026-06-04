@@ -2216,8 +2216,9 @@ impl crate::emit::Taggable for RealMeta<'_> {
   /// tags AND no tagmap warning), so the `AnyMeta::Real` arm needs no drain.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
 
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
@@ -2234,7 +2235,7 @@ impl crate::emit::Taggable for RealMeta<'_> {
     // SAME position the old `serialize_rm` called `emit_id3v1` keeps the
     // net output identical. ID3v1 has no warnings/errors to drain.
     if let Some(id3) = &self.id3v1 {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
     tags.into_iter()
   }
@@ -3047,7 +3048,7 @@ mod tests {
     let mut tm = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       m,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut tm,
     );
     tm
@@ -3169,7 +3170,9 @@ mod tests {
     use crate::emit::{ConvMode, Taggable};
     let rm = fixture("Real.rm");
     let m = parse_borrowed(&rm).expect("RM parses");
-    let tags: Vec<_> = m.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = m
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // Every Real-* subgroup carries family-0 = the module name "Real"; the
     // chained ID3v1 carries family-0/1 both "ID3v1".
     let mut saw_prop = false;
@@ -3215,7 +3218,9 @@ mod tests {
     // RA header subgroup: family-0 "Real", family-1 "Real-RA4".
     let ra = fixture("Real.ra");
     let mra = parse_borrowed(&ra).expect("RA parses");
-    let ra_tags: Vec<_> = mra.tags(ConvMode::PrintConv).collect();
+    let ra_tags: Vec<_> = mra
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!ra_tags.is_empty());
     for t in &ra_tags {
       assert_eq!(t.tag().group_ref().family0(), "Real");
@@ -3225,7 +3230,9 @@ mod tests {
     // Metafile subgroup: family-0/1 both "Real".
     let ram = fixture("real_synth_ram_pnm.ram");
     let mram = parse_with_ext(&ram, Some("RAM")).expect("RAM parses");
-    let ram_tags: Vec<_> = mram.tags(ConvMode::PrintConv).collect();
+    let ram_tags: Vec<_> = mram
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!ram_tags.is_empty());
     for t in &ram_tags {
       assert_eq!(t.tag().group_ref().family0(), "Real");

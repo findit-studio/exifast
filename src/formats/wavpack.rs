@@ -899,8 +899,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// trailer`). The net `TagMap` is identical.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -984,7 +985,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // `AnyMeta::Wv` arm.
     #[cfg(feature = "id3")]
     if let Some(id3) = &self.id3 {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     // Chained APE sub-Meta (WavPack.pm:101-103). `ape::Meta` is `Taggable`;
@@ -992,7 +993,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // are drained by the `AnyMeta::Wv` arm.
     #[cfg(feature = "ape")]
     if let Some(ape) = &self.ape {
-      tags.extend(ape.tags(mode));
+      tags.extend(ape.tags(opts));
     }
 
     tags.into_iter()
@@ -1302,7 +1303,7 @@ mod tests {
     let mut w = TagMap::new();
     crate::emit::run_emission(
       &meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -1458,7 +1459,11 @@ mod tests {
     let data = header_with_flags(0x0480_008d);
     let meta = parse_borrowed(&data).unwrap();
     let mut tm = TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut tm);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut tm,
+    );
     // WavPack tags use family-1 group "File" (WavPack.pm GROUPS{1}); the
     // typed sink emits ONLY these 5 (the File:* triplet is engine-added).
     let names: std::vec::Vec<&str> = tm

@@ -1057,8 +1057,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// `serialize_tags`). DV.pm has no `Unknown => 1` tags ⇒ `unknown: false`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::Group;
 
@@ -1593,7 +1594,7 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -1628,7 +1629,9 @@ mod tests {
   fn taggable_group_is_dv_family0_and_family1() {
     use crate::emit::{ConvMode, Taggable};
     let meta = sample_meta();
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // All 13 @dvTags present (every field is Some on `sample_meta`).
     assert_eq!(tags.len(), DV_TAGS.len());
     for t in &tags {

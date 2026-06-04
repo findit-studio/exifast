@@ -2418,8 +2418,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// `SetFileType` / `finalize_file_type` responsibility.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -2442,7 +2443,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // retired position — see fn docs).
     #[cfg(feature = "id3")]
     if let Some(id3) = self.id3.as_ref() {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     // (1) Vorbis identification (Vorbis.pm:40-70). DECLARED-OFFSET order:
@@ -2750,7 +2751,11 @@ mod tests {
   /// `format_parser.rs` exactly so the in-module tests exercise the same net
   /// `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
-    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    crate::emit::run_emission(
+      meta,
+      crate::emit::EmitOptions::g1(ConvMode::from_print_conv(print_conv), false),
+      out,
+    );
     crate::diagnostics::run_diagnostics(meta, out);
   }
 
@@ -3663,7 +3668,11 @@ mod tests {
     let data = fixture("Vorbis.ogg");
     let meta = parse_borrowed(&data, true).unwrap();
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     // Vendor is always emitted (Vorbis.pm:181-187).
     assert!(w.get("Vorbis", "Vendor").is_some(), "Vorbis:Vendor present");
     // The fixture carries an ENCODER comment among others; at least one
@@ -3701,7 +3710,7 @@ mod tests {
     );
     for mode in [ConvMode::PrintConv, ConvMode::ValueConv] {
       let mut w = TagMap::new();
-      crate::emit::run_emission(&meta, mode, &mut w);
+      crate::emit::run_emission(&meta, crate::emit::EmitOptions::g1(mode, false), &mut w);
       match w.get("Vorbis", &name) {
         Some(TagValue::List(items)) => {
           let got: Vec<String> = items
@@ -3730,7 +3739,11 @@ mod tests {
       "fixture carries an OpusHead packet"
     );
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     // OpusVersion present and family-1 group is "Opus".
     assert!(w.get("Opus", "OpusVersion").is_some(), "Opus:OpusVersion");
     // No Vorbis-identification fields under an Opus stream.
@@ -3755,7 +3768,11 @@ mod tests {
     );
     // -j: PrintConv name + binary bytes under the FLAC group.
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(
       w.get_str("FLAC", "PictureType"),
       Some("Front Cover".to_string())
@@ -3767,7 +3784,11 @@ mod tests {
     );
     // -n: raw numeric PictureType (3 = Front Cover).
     let mut wn = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert_eq!(wn.get_str("FLAC", "PictureType"), Some("3".to_string()));
   }
 
@@ -3780,7 +3801,9 @@ mod tests {
     // Vorbis:* comments in one stream.
     let data = fixture("Opus.opus");
     let meta = parse_borrowed(&data, true).unwrap();
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty());
     let mut saw_opus = false;
     let mut saw_flac = false;
@@ -3820,7 +3843,7 @@ mod tests {
     let meta = parse_borrowed(&data, true).unwrap();
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
     let names: Vec<String> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
       .collect();
     let id3_pos = names
@@ -3876,13 +3899,21 @@ mod tests {
       _marker: core::marker::PhantomData,
     };
     let mut wj = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut wj);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut wj,
+    );
     assert_eq!(
       wj.get_str("Vorbis", "NominalBitrate"),
       Some("128 kbps".to_string())
     );
     let mut wn = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert!(matches!(wn.get("Vorbis", "NominalBitrate"), Some(TagValue::U64(n)) if *n == 128_000));
   }
 

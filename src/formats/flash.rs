@@ -3078,8 +3078,9 @@ impl crate::emit::Taggable for Meta<'_> {
   #[cfg_attr(not(feature = "json"), allow(dead_code))]
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     let mut tags: std::vec::Vec<EmittedTag> = std::vec::Vec::with_capacity(self.entries.len());
@@ -4266,7 +4267,7 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     for warn in meta.warnings() {
@@ -4308,7 +4309,9 @@ mod tests {
     ))
     .expect("read Flash.flv fixture");
     let meta = parse_borrowed(&bytes).expect("accepted");
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty(), "the onMetaData packet must yield tags");
     for t in &tags {
       // family0 = "Flash" (table group); family1 = "Flash" (constant -G1 key).

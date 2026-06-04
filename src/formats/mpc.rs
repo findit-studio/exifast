@@ -921,8 +921,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// `run_emission`. The net `TagMap` is identical.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -939,7 +940,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // by the `AnyMeta::Mpc` arm.
     #[cfg(feature = "id3")]
     if let Some(id3) = self.id3.as_ref() {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     if let Some(h) = self.sv7_header.as_ref() {
@@ -1094,7 +1095,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // drained by the `AnyMeta::Mpc` arm.
     #[cfg(feature = "ape")]
     if let Some(ape) = self.ape.as_ref() {
-      tags.extend(ape.tags(mode));
+      tags.extend(ape.tags(opts));
     }
 
     tags.into_iter()
@@ -1160,7 +1161,11 @@ mod tests {
   /// exercise the same net `TagMap` the engine produces. `print_conv` ⇒ `-j`,
   /// else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
-    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    crate::emit::run_emission(
+      meta,
+      crate::emit::EmitOptions::g1(ConvMode::from_print_conv(print_conv), false),
+      out,
+    );
     crate::diagnostics::run_diagnostics(meta, out);
   }
 
@@ -1601,7 +1606,11 @@ mod tests {
     let bytes = fixture("MPC.mpc");
     let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("MPC", "TotalFrames"), Some("102".to_string()));
     assert_eq!(w.get_str("MPC", "SampleRate"), Some("44100".to_string()));
     assert_eq!(
@@ -1622,7 +1631,11 @@ mod tests {
     let bytes = fixture("MPC.mpc");
     let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("MPC", "SampleRate"), Some("0".to_string()));
     assert_eq!(w.get_str("MPC", "Quality"), Some("10".to_string()));
     assert_eq!(w.get_str("MPC", "Gapless"), Some("1".to_string()));
@@ -1636,7 +1649,7 @@ mod tests {
     let bytes = fixture("MPC.mpc");
     let meta = parse_borrowed(&bytes).expect("parsed");
     let tags: std::vec::Vec<_> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .filter(|t| t.tag().group_ref().family1() == "MPC")
       .collect();
     assert!(
@@ -1662,7 +1675,7 @@ mod tests {
     assert!(meta.id3_ref().is_some(), "fixture carries an ID3v2 prefix");
 
     let names: std::vec::Vec<String> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
       .collect();
     let id3_pos = names
@@ -1690,7 +1703,7 @@ mod tests {
     // The `tags()` stream now carries the APE:* tags (ape::Meta is Taggable);
     // they follow the MPC:* body in the same stream.
     let names: std::vec::Vec<String> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
       .collect();
     let stream_mpc = names.iter().position(|n| n.starts_with("MPC:"));

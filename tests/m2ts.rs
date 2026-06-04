@@ -682,10 +682,12 @@ fn ac3_audio_channels_raw_in_numeric_mode() {
   let m = parse_m2ts(&buf);
   assert_eq!(m.ac3_audio_channels(), Some(5));
 
-  use exifast::emit::{ConvMode, Taggable};
+  use exifast::emit::{ConvMode, EmitOptions, Taggable};
   use exifast::value::TagValue;
   // `-n` (Numeric) must be the RAW index 5, NOT the PrintConv string "3/1".
-  let numeric: Vec<_> = m.tags(ConvMode::ValueConv).collect();
+  let numeric: Vec<_> = m
+    .tags(EmitOptions::g1(ConvMode::ValueConv, false))
+    .collect();
   let ch_n = numeric
     .iter()
     .find(|t| t.tag().name() == "AudioChannels")
@@ -696,7 +698,9 @@ fn ac3_audio_channels_raw_in_numeric_mode() {
     "AC3:AudioChannels in -n must be the raw index 5, not a PrintConv string"
   );
   // `-j` (PrintConv) is "3/1".
-  let pc: Vec<_> = m.tags(ConvMode::PrintConv).collect();
+  let pc: Vec<_> = m
+    .tags(EmitOptions::g1(ConvMode::PrintConv, false))
+    .collect();
   let ch_p = pc
     .iter()
     .find(|t| t.tag().name() == "AudioChannels")
@@ -753,9 +757,11 @@ fn duration_keeps_full_pcr_precision_in_numeric() {
   );
 
   // Render the M2TS:Duration tag in -n and confirm the full-precision f64.
-  use exifast::emit::{ConvMode, Taggable};
+  use exifast::emit::{ConvMode, EmitOptions, Taggable};
   use exifast::value::TagValue;
-  let numeric: Vec<_> = m.tags(ConvMode::ValueConv).collect();
+  let numeric: Vec<_> = m
+    .tags(EmitOptions::g1(ConvMode::ValueConv, false))
+    .collect();
   let dur = numeric
     .iter()
     .find(|t| t.tag().name() == "Duration")
@@ -1033,10 +1039,12 @@ fn pmt_on_reserved_pid_emits_ac3_bitrate_value() {
     buf.extend_from_slice(&ts_packet(0x1fff, false, None, &[0xff; 10]));
   }
   // `-n` (Numeric / ValueConv): AudioBitrate idx 12 → 256000 (M2TS.pm:192).
-  use exifast::emit::{ConvMode, Taggable};
+  use exifast::emit::{ConvMode, EmitOptions, Taggable};
   use exifast::value::TagValue;
   let m = parse_m2ts(&buf);
-  let numeric: Vec<_> = m.tags(ConvMode::ValueConv).collect();
+  let numeric: Vec<_> = m
+    .tags(EmitOptions::g1(ConvMode::ValueConv, false))
+    .collect();
   let br = numeric
     .iter()
     .find(|t| t.tag().name() == "AudioBitrate")
