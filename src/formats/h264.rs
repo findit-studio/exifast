@@ -2988,68 +2988,15 @@ fn classify_json_scalar(s: &str) -> JsonScalar {
   }
 }
 
-/// Faithful port of `EscapeJSON`'s number-detection regex (exiftool:3809):
-/// `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$` (the `e` is
-/// case-insensitive). Implemented as a hand-rolled byte scan to stay
-/// dependency-free.
+/// The `EscapeJSON` number gate (`exiftool:3809`) for the H264 `-n` scalar
+/// classifier — a thin alias for the shared
+/// [`crate::value::escape_json_is_number`] (Contract B / #197 consolidated the
+/// regex crate-wide). `classify_json_scalar` calls this; keeping the local name
+/// leaves that call site (and its tests) unchanged.
 #[cfg(feature = "alloc")]
+#[inline]
 fn escape_json_is_number(s: &str) -> bool {
-  let b = s.as_bytes();
-  let mut i = 0usize;
-  // optional leading `-`
-  if b.first() == Some(&b'-') {
-    i += 1;
-  }
-  // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
-  // leading zero).
-  let int_start = i;
-  // Every `b[i]` below is guarded by `i < b.len()`, so the `.get(i)` form is
-  // byte-identical (it collapses to the same predicate when in range).
-  while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
-    i += 1;
-  }
-  let int_len = i - int_start;
-  if int_len == 0 {
-    return false;
-  }
-  if int_len == 1 {
-    // a single digit `\d` — any 0..=9 is fine.
-  } else {
-    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`). `int_len >= 2`
-    // ⇒ `int_start < i <= b.len()`, so `.get(int_start)` hits (byte-identical).
-    if int_len > 15 || b.get(int_start) == Some(&b'0') {
-      return false;
-    }
-  }
-  // optional fraction `\.\d{1,16}`.
-  if i < b.len() && b.get(i) == Some(&b'.') {
-    i += 1;
-    let frac_start = i;
-    while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    let frac_len = i - frac_start;
-    if frac_len == 0 || frac_len > 16 {
-      return false;
-    }
-  }
-  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`). The `i < b.len()`
-  // guards make the `.get(i)` forms byte-identical to the raw `b[i]` checks.
-  if i < b.len() && matches!(b.get(i), Some(&b'e' | &b'E')) {
-    i += 1;
-    if i < b.len() && matches!(b.get(i), Some(&b'+' | &b'-')) {
-      i += 1;
-    }
-    let exp_start = i;
-    while i < b.len() && b.get(i).is_some_and(u8::is_ascii_digit) {
-      i += 1;
-    }
-    let exp_len = i - exp_start;
-    if exp_len == 0 || exp_len > 3 {
-      return false;
-    }
-  }
-  i == b.len()
+  crate::value::escape_json_is_number(s)
 }
 
 // ===========================================================================

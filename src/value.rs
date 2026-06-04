@@ -215,6 +215,80 @@ pub fn perl_nonfinite_str(val: f64) -> Option<&'static str> {
   }
 }
 
+/// Faithful port of ExifTool's `EscapeJSON` number-detection regex
+/// (`exiftool:3809`):
+/// `^-?(\d|[1-9]\d{1,14})(\.\d{1,16})?(e[-+]?\d{1,3})?$` (the `e` is
+/// case-insensitive). When the JSON writer's `$quote` flag is false (every
+/// non-`StructFormat=JSONQ` `-j`/`-n` run), a value whose ENTIRE stringified
+/// form matches this regex is printed as a BARE JSON NUMBER; anything else is
+/// quoted as a JSON string.
+///
+/// This is the SINGLE crate-wide source of truth for the gate — the
+/// [`TagValue::Str`] serializer (token-exact JSON typing, Contract B / #197),
+/// the Exif/GPS scalar emitter (`exif::mod`), and the H264 `-n` classifier
+/// (`formats::h264`) all delegate here so the regex is never duplicated.
+///
+/// A hand-rolled byte scan: dependency-free (no `regex`) and allocation-free,
+/// so it is available in every feature tier (it gates nothing). The conservative
+/// 15-digit integer cap (`int_len > 15` ⇒ not a number) is what keeps a large
+/// integer — e.g. a `u64` above `i64::MAX` such as `9223372036854775808` — a
+/// QUOTED string, byte-identical to bundled (which quotes those "big numbers
+/// that caused problems for some JSON parsers", `exiftool:3808`).
+#[must_use]
+pub(crate) fn escape_json_is_number(s: &str) -> bool {
+  // Every `b.get(i)` read is bound-folded (`b.get(i) == Some(&c)` ⟺ `i < len &&
+  // b[i] == c`; `b.get(i).is_some_and(pred)` ⟺ `i < len && pred(b[i])`), so this
+  // is panic-safe by construction and byte-identical to an indexed scan.
+  let b = s.as_bytes();
+  let mut i = 0usize;
+  // optional leading `-`
+  if b.first() == Some(&b'-') {
+    i += 1;
+  }
+  // integer part: `\d` (one digit) OR `[1-9]\d{1,14}` (2..=15 digits, no
+  // leading zero).
+  let int_start = i;
+  while b.get(i).is_some_and(u8::is_ascii_digit) {
+    i += 1;
+  }
+  let int_len = i - int_start;
+  if int_len == 0 {
+    return false;
+  }
+  if int_len > 1 && (int_len > 15 || b.get(int_start) == Some(&b'0')) {
+    // 2..=15 digits, first must be 1..=9 (`[1-9]\d{1,14}`).
+    return false;
+  }
+  // optional fraction `\.\d{1,16}`.
+  if b.get(i) == Some(&b'.') {
+    i += 1;
+    let frac_start = i;
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+      i += 1;
+    }
+    let frac_len = i - frac_start;
+    if frac_len == 0 || frac_len > 16 {
+      return false;
+    }
+  }
+  // optional exponent `e[-+]?\d{1,3}` (case-insensitive `e`).
+  if matches!(b.get(i), Some(&b'e' | &b'E')) {
+    i += 1;
+    if matches!(b.get(i), Some(&b'+' | &b'-')) {
+      i += 1;
+    }
+    let exp_start = i;
+    while b.get(i).is_some_and(u8::is_ascii_digit) {
+      i += 1;
+    }
+    let exp_len = i - exp_start;
+    if exp_len == 0 || exp_len > 3 {
+      return false;
+    }
+  }
+  i == b.len()
+}
+
 /// ExifTool's universal no-`-b` binary placeholder string for a value of `len`
 /// bytes: `"(Binary data <len> bytes, use -b option to extract)"`
 /// (`ExifTool.pm` `ConvertBinary` / the writer's `Binary data` rendering, and
@@ -704,20 +778,34 @@ impl Metadata {
 // Optional serde `Serialize` impls (skill §8: one anonymous gated const block;
 // single `#[cfg]` + `doc(cfg)`; private helpers scoped inside; nothing `pub`).
 //
-// DESIGN: we emit STANDARD `serde_json` scalars and do NOT reproduce ExifTool's
-// `sprintf` token style — the value-semantic [`crate::jsondiff`] comparator
-// treats a different valid spelling of the same value as equal (`"123"==123`,
-// `0.0==0.00000000`). So a numeric-looking `Str` is serialized as a plain JSON
-// string (the comparator coerces it), a finite `f64` via `serialize_f64`
-// (ryu shortest round-trip), and a large `u64` via `serialize_u64` (full
-// value). The only value-shaping needed is for the variants whose JSON VALUE
-// (not token) is special: `Bytes` -> the binary placeholder string; non-finite
-// `f64` -> the titlecase `Inf`/`-Inf`/`NaN` string (serde_json errors on a
-// non-finite number) AND `%.15g`-rounded for a finite float (ExifTool's default
-// NV stringification — a VALUE difference, not token style); `Rational` -> its
-// ExifTool-rounded numeric value (or the `inf`/`undef` word); a `"true"`/
-// `"false"` string -> a bare JSON boolean (`exiftool:3804-3805`). These mirror
-// the rules the retired hand-rolled encoder applied, VALUE-faithfully.
+// DESIGN (Contract B / #197): the serializer reproduces ExifTool's TOKEN-EXACT
+// JSON typing — the bare-number-vs-quoted-string distinction the real `exiftool`
+// JSON writer produces. ExifTool stringifies EVERY scalar then runs ONE
+// `EscapeJSON` number gate (`exiftool:3809`,
+// [`escape_json_is_number`](crate::value::escape_json_is_number)): a value whose
+// stringified form is a clean JSON number is printed BARE, everything else is
+// QUOTED. Each numeric/string arm below mirrors that exactly:
+//   * `Str`  -> a numeric-looking string lands as a BARE number (e.g. an
+//               `APE:Year` "2005" -> `2005`, `ExifTool:ExifToolVersion` "13.59"
+//               -> `13.59`); a non-numeric string (PrintConv label,
+//               `:`/`/`/space-bearing value) stays quoted; a `"true"`/`"false"`
+//               string stays a bare JSON boolean (`exiftool:3804-3805`).
+//   * `I64`/`U64` -> a bare integer token, EXCEPT a `>= 16`-digit integer (the
+//               gate's 15-digit cap; e.g. a `u64` above `i64::MAX` such as
+//               `PLIST:Big`) which FAILS the gate and is QUOTED with its true
+//               value.
+//   * `F64`  -> `%.15g` (ExifTool's default NV stringification) then gated: a
+//               finite in-gate rendering is a bare number; an out-of-gate
+//               rendering (a `>16`-fraction-digit float such as a `DV:Duration`
+//               `0.00122222222222222`) is QUOTED; a non-finite f64 is the
+//               titlecase `Inf`/`-Inf`/`NaN` quoted word.
+//   * `Bytes` -> the binary placeholder string; `Rational` -> its
+//               ExifTool-rounded numeric value (gated) or the `inf`/`undef` word.
+// The companion [`crate::jsondiff`] comparator is STRICT (token-exact) by
+// default ([`json_equivalent_strict`](crate::jsondiff::json_equivalent_strict)):
+// it distinguishes `"2"` from `2`, so the conformance suite pins this typing.
+// (The value-semantic [`json_equivalent`](crate::jsondiff::json_equivalent) is
+// retained for the few call sites that compare two exifast renderings.)
 // ===========================================================================
 
 #[cfg(feature = "serde")]
@@ -751,26 +839,58 @@ const _: () = {
   impl Serialize for TagValue {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
       match self {
-        TagValue::I64(n) => s.serialize_i64(*n),
-        // Full unsigned value (no saturation to i64::MAX); the comparator
-        // keeps huge integers exact.
-        TagValue::U64(n) => s.serialize_u64(*n),
+        // ExifTool stringifies every integer and runs the one `EscapeJSON`
+        // number gate (`exiftool:3809`). A value within the gate's 15-digit
+        // integer cap is a bare JSON number; a `>= 16`-digit integer FAILS the
+        // gate and is emitted as a QUOTED string, byte-identical to bundled
+        // (Contract B / #197). `serialize_i64` emits an exact integer token for
+        // the common in-gate case; the out-of-gate quoted form renders the same
+        // decimal text.
+        TagValue::I64(n) => {
+          let text = n.to_string();
+          if escape_json_is_number(&text) {
+            s.serialize_i64(*n)
+          } else {
+            s.serialize_str(&text)
+          }
+        }
+        // Full unsigned value (no saturation to i64::MAX); the gate keeps a
+        // `>= 16`-digit `u64` (e.g. a `PLIST:Big` above `i64::MAX`, or a large
+        // file size) a QUOTED string exactly as bundled stringifies-then-gates
+        // it, while an in-gate value stays a bare number.
+        TagValue::U64(n) => {
+          let text = n.to_string();
+          if escape_json_is_number(&text) {
+            s.serialize_u64(*n)
+          } else {
+            s.serialize_str(&text)
+          }
+        }
         TagValue::F64(n) => {
           if n.is_finite() {
             // ExifTool stringifies a float with `%.15g` (its default NV
-            // stringification, `ExifTool.pm` RoundFloat / the JSON writer), so
-            // the GOLDEN value is the 15-sig-fig rounding of the true f64 —
-            // e.g. 2.639229024943311 -> 2.63922902494331. This is a VALUE
-            // difference, not token style: emit the rounded value (round via
-            // `format_g(_,15)` then re-parse, so serde's number equals the
-            // golden's rounded number). The raw f64 would be a DIFFERENT value
-            // and fail the value-semantic gate.
+            // stringification, `ExifTool.pm` RoundFloat / the JSON writer), then
+            // runs the `EscapeJSON` number gate on that text. The 15-sig-fig
+            // rounding is a VALUE step (e.g. 2.639229024943311 ->
+            // 2.63922902494331); the gate is a TOKEN step — a rendering whose
+            // fraction exceeds the gate's 16-digit cap (e.g. a `DV:Duration` of
+            // `0.00122222222222222`, 17 fraction digits because the leading
+            // zeros do not count toward `%.15g`'s significant figures) FAILS the
+            // gate and is emitted as a QUOTED string, byte-identical to bundled
+            // (Contract B / #197). An in-gate rendering is re-parsed so serde's
+            // number equals the golden's rounded number.
             let rounded = format_g(*n, 15);
-            match rounded.parse::<f64>() {
-              Ok(f) => s.serialize_f64(f),
-              // `format_g` always yields a parseable decimal for a finite f64;
-              // fall back to the raw value defensively.
-              Err(_) => s.serialize_f64(*n),
+            if escape_json_is_number(&rounded) {
+              match rounded.parse::<f64>() {
+                Ok(f) => s.serialize_f64(f),
+                // `format_g` always yields a parseable decimal for a finite f64;
+                // fall back to the rounded text defensively.
+                Err(_) => s.serialize_str(&rounded),
+              }
+            } else {
+              // Out of gate (a `>16`-fraction-digit or `>15`-integer-digit
+              // rendering) ⇒ the quoted string ExifTool's `EscapeJSON` emits.
+              s.serialize_str(&rounded)
             }
           } else {
             // serde_json errors on a non-finite number; ExifTool emits the
@@ -792,9 +912,40 @@ const _: () = {
         // here to match the golden's bare `true`/`false`.
         TagValue::Str(text) if text.eq_ignore_ascii_case("true") => s.serialize_bool(true),
         TagValue::Str(text) if text.eq_ignore_ascii_case("false") => s.serialize_bool(false),
-        // Otherwise STANDARD string emission: a numeric-looking value (e.g. a
-        // `"3.5"` PrintConv) stays a JSON string; the value-semantic comparator
-        // coerces it to the bare number the golden carries.
+        // ExifTool's terminal `EscapeJSON` NUMBER gate (`exiftool:3809`,
+        // Contract B / #197): a string whose ENTIRE text is an
+        // [`escape_json_is_number`] is emitted as a BARE JSON number — exactly
+        // the token ExifTool's JSON writer produces for that value (e.g.
+        // `ExifTool:ExifToolVersion` "13.59" -> `13.59`, an `APE:Year` "2005"
+        // -> `2005`). A pure integer (no `.`/`e`) routes through the integer
+        // writer so serde emits an exact integer token (`2005`, not `2005.0`);
+        // a fractional/exponent value routes through `serialize_f64`. The gate's
+        // 15-digit integer cap keeps a `>= 16`-digit integer (e.g. a `u64` above
+        // `i64::MAX`) a QUOTED string, byte-identical to bundled. Anything not a
+        // clean JSON number (a PrintConv label, a `:`/`/`/space-bearing value,
+        // `inf`/`undef`/`Inf`/`NaN`) stays a quoted string.
+        TagValue::Str(text) if escape_json_is_number(text) => {
+          // A pure integer ⇒ an exact integer token; the gate caps the integer
+          // part at 15 digits, so it always fits `i64`/`u64`.
+          let is_integer = !text.bytes().any(|b| b == b'.' || b == b'e' || b == b'E');
+          if is_integer {
+            if let Some(rest) = text.strip_prefix('-') {
+              if let Ok(n) = rest.parse::<i64>() {
+                return s.serialize_i64(-n);
+              }
+            } else if let Ok(n) = text.parse::<u64>() {
+              return s.serialize_u64(n);
+            }
+          }
+          match text.parse::<f64>() {
+            Ok(f) => s.serialize_f64(f),
+            // Unreachable for an in-gate string; keep a faithful quoted string.
+            Err(_) => s.serialize_str(text),
+          }
+        }
+        // Otherwise STANDARD string emission: a non-numeric value (a PrintConv
+        // label, a `:`/`/`/space-bearing value, `inf`/`undef`/`Inf`/`NaN`)
+        // stays a quoted JSON string.
         TagValue::Str(text) => s.serialize_str(text),
         TagValue::Bool(b) => s.serialize_bool(*b),
         // ExifTool universal no-`-b` placeholder (a plain string, never
@@ -1041,5 +1192,85 @@ mod tests {
     );
     assert!(!replaced);
     assert_eq!(m.tags_slice()[0].value_ref(), &TagValue::Str("nope".into()));
+  }
+
+  /// Contract B / #197 — the `TagValue::Str` serializer applies ExifTool's
+  /// terminal `EscapeJSON` number gate (`exiftool:3809`): a numeric-looking
+  /// string lands as a BARE JSON number (token-exact with bundled), a
+  /// non-numeric string stays quoted, and an integer of `>= 16` digits stays
+  /// quoted (the gate's 15-digit integer cap — this is what keeps `PLIST:Big`
+  /// = `9223372036854775808` a quoted string, exactly as bundled emits it).
+  #[cfg(feature = "serde")]
+  #[test]
+  fn str_serializes_through_escape_json_number_gate() {
+    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // A plain integer string ⇒ a bare JSON number.
+    assert_eq!(j(&TagValue::Str("2".into())), "2");
+    assert_eq!(j(&TagValue::Str("44100".into())), "44100");
+    assert_eq!(j(&TagValue::Str("-3".into())), "-3");
+    // A fractional/exponent numeric string ⇒ a bare JSON number.
+    assert_eq!(j(&TagValue::Str("13.59".into())), "13.59");
+    // A non-numeric string ⇒ stays a quoted JSON string.
+    assert_eq!(j(&TagValue::Str("abc".into())), "\"abc\"");
+    assert_eq!(j(&TagValue::Str("2.64 s".into())), "\"2.64 s\"");
+    assert_eq!(j(&TagValue::Str("11.1.102".into())), "\"11.1.102\"");
+    // The gate's 15-digit integer cap: a 16+-digit integer is OUT of gate and
+    // stays a quoted string (the `PLIST:Big` u64-above-i64::MAX case).
+    assert_eq!(
+      j(&TagValue::Str("9223372036854775808".into())),
+      "\"9223372036854775808\""
+    );
+    // A 19-digit integer (u64::MAX-ish) likewise stays quoted.
+    assert_eq!(
+      j(&TagValue::Str("1234567890123456789".into())),
+      "\"1234567890123456789\""
+    );
+    // A 15-digit integer is IN gate ⇒ bare number (boundary just below the cap).
+    assert_eq!(
+      j(&TagValue::Str("123456789012345".into())),
+      "123456789012345"
+    );
+    // The `true`/`false` boolean coercion still precedes the number gate.
+    assert_eq!(j(&TagValue::Str("True".into())), "true");
+    assert_eq!(j(&TagValue::Str("false".into())), "false");
+  }
+
+  /// Contract B / #197 — the integer and float serializers run the SAME
+  /// terminal `EscapeJSON` number gate (the value is stringified, then gated):
+  /// an in-gate value is a bare JSON number; an out-of-gate value (a `>= 16`-
+  /// digit integer such as a `u64` above `i64::MAX`, or a float whose `%.15g`
+  /// rendering exceeds the 16-fraction-digit cap such as a `DV:Duration`) is a
+  /// QUOTED string, byte-identical to bundled.
+  #[cfg(feature = "serde")]
+  #[test]
+  fn numeric_scalars_serialize_through_escape_json_gate() {
+    let j = |v: &TagValue| serde_json::to_string(v).unwrap();
+    // In-gate integers ⇒ bare numbers.
+    assert_eq!(j(&TagValue::U64(44100)), "44100");
+    assert_eq!(j(&TagValue::I64(-3)), "-3");
+    assert_eq!(j(&TagValue::U64(123456789012345)), "123456789012345"); // 15 digits
+    // The `PLIST:Big` case: a `u64` above `i64::MAX` (19 digits) is OUT of the
+    // gate's 15-digit integer cap ⇒ a QUOTED string, exactly as bundled emits.
+    assert_eq!(
+      j(&TagValue::U64(9223372036854775808)),
+      "\"9223372036854775808\""
+    );
+    // u64::MAX (20 digits) likewise stays a quoted string with its TRUE value.
+    assert_eq!(j(&TagValue::U64(u64::MAX)), "\"18446744073709551615\"");
+    // i64::MIN (19 digits + sign) is out of gate ⇒ quoted with the true value.
+    assert_eq!(j(&TagValue::I64(i64::MIN)), "\"-9223372036854775808\"");
+    // The `DV:Duration` case: a float whose `%.15g` rendering has 17 fraction
+    // digits (leading zeros do not count toward the 15 significant figures) is
+    // OUT of the gate's 16-fraction-digit cap ⇒ a QUOTED string.
+    assert_eq!(
+      j(&TagValue::F64(0.001_222_222_222_222_22)),
+      "\"0.00122222222222222\""
+    );
+    // An ordinary finite float stays a bare number (rounded to %.15g).
+    assert_eq!(j(&TagValue::F64(0.5)), "0.5");
+    assert_eq!(j(&TagValue::F64(2.4)), "2.4");
+    // Non-finite floats stay the titlecase quoted word (unchanged).
+    assert_eq!(j(&TagValue::F64(f64::INFINITY)), "\"Inf\"");
+    assert_eq!(j(&TagValue::F64(f64::NAN)), "\"NaN\"");
   }
 }
