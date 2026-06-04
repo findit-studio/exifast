@@ -1859,6 +1859,50 @@ fn quicktime_camm_round_trip_via_media_metadata_priority() {
   assert!((gps.longitude().unwrap() - 4.56).abs() < 1e-9);
 }
 
+#[test]
+fn quicktime_camm_stamps_track_index_from_real_fixture() {
+  // The 1-based moov track number ExifTool stamps via `SET_GROUP1 =
+  // "Track$num"` (QuickTime.pm:10353-10354) — the family-1 group the camm GPS
+  // samples are emitted under. Oracle (`exiftool -ee -G1 QuickTime_camm.mov`)
+  // groups EVERY GPS record under `Track1` (the camm `trak` is the file's
+  // first/only `trak`). The stream walker must stamp `track_index() == Some(1)`
+  // onto each decoded camm GPS sample so a later task can emit `Track1:`.
+  let data = fixture("QuickTime_camm.mov");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let camm = meta.android_camm();
+  assert!(
+    !camm.gps_samples().is_empty(),
+    "real camm fixture must decode GPS samples"
+  );
+  for s in camm.gps_samples() {
+    assert_eq!(
+      s.track_index(),
+      Some(1),
+      "every camm GPS sample carries the 1-based moov Track index (oracle Track1)"
+    );
+  }
+}
+
+#[test]
+fn quicktime_mebx_stamps_track_index_from_real_fixture() {
+  // Same Track<N> stamping for the Apple `mebx` path. Oracle (`exiftool -ee
+  // -G1 QuickTime_mebx_gps.mov`) emits `Track1:GPSCoordinates` — the mebx
+  // `trak` is the file's first/only `trak`. The walker must stamp
+  // `track_index() == Some(1)` onto the decoded mebx sample.
+  let data = fixture("QuickTime_mebx_gps.mov");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let stream = meta.stream();
+  let pairs = stream.mebx_samples();
+  assert!(!pairs.is_empty(), "mebx fixture must decode a sample");
+  for p in pairs {
+    assert_eq!(
+      p.track_index(),
+      Some(1),
+      "every mebx sample carries the 1-based moov Track index (oracle Track1)"
+    );
+  }
+}
+
 /// Real-fixture conformance stub for Android CAMM.
 ///
 /// Bundled exiftool has no Pixel/Samsung CAMM `.mp4` fixture in

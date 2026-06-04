@@ -1633,10 +1633,16 @@ struct StreamTrack {
 /// non-deferred `gpmd` sample (ExifTool's `$$et{FoundEmbedded}`, set on
 /// `ProcessGoPro` entry, GoPro.pm:822), regardless of whether the KLV parse
 /// extracted anything.
+///
+/// `track_index` is the 1-based moov track number of this `trak` (ExifTool's
+/// `SET_GROUP1 = "Track$num"`, QuickTime.pm:10353-10354); it is stamped onto
+/// every track-scoped timed sample (`mebx` / `camm` GPS) so a later emission
+/// task can group them under `Track<N>:` (the oracle group).
 #[must_use]
 fn process_samples(
   data: &[u8],
   track: &StreamTrack,
+  track_index: u32,
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
@@ -1674,6 +1680,7 @@ fn process_samples(
     found_embedded |= decode_one_sample(
       buff,
       track,
+      track_index,
       sample,
       create_date_raw,
       out,
@@ -1725,6 +1732,7 @@ fn is_deferred_gpmd_variant(buff: &[u8]) -> bool {
 fn decode_one_sample(
   buff: &[u8],
   track: &StreamTrack,
+  track_index: u32,
   sample: &Sample,
   create_date_raw: Option<u64>,
   out: &mut QuickTimeStreamMeta,
@@ -1735,7 +1743,15 @@ fn decode_one_sample(
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
   // SampleTime/SampleDuration; the decoded `mebx` pairs carry both.
   if &track.meta_format == b"mebx" {
+    // Stamp the `Track<N>` index onto exactly the `mebx` samples this sample's
+    // decode produces (including any nested `detected-face` leaves), faithful
+    // to ExifTool scoping `SET_GROUP1 = "Track$num"` per-`trak`. The watermark
+    // is taken before the (recursive) `process_mebx` call so a file-scoped
+    // meta accumulating multiple metadata `trak`s stamps each `trak`'s samples
+    // with its own index.
+    let mebx_start = out.mebx_sample_count();
     process_mebx(buff, &track.meta_keys, sample.time, sample.dur, out);
+    out.stamp_mebx_track_index_from(mebx_start, track_index);
     return false;
   }
   // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
@@ -1792,7 +1808,14 @@ fn decode_one_sample(
   // do), so a `camm` track must NOT suppress the brute-force `mdat` scan.
   if &track.meta_format == b"camm" {
     let create_date_unix = create_date_raw.map(crate::formats::android_camm::create_date_to_unix);
+    // Stamp the `Track<N>` index onto exactly the camm GPS samples this
+    // sample's decode produces, faithful to ExifTool scoping `SET_GROUP1 =
+    // "Track$num"` per-`trak`. Watermark before the (multi-packet) call so a
+    // file-scoped meta accumulating multiple `camm` `trak`s stamps each
+    // `trak`'s samples with its own index.
+    let gps_start = camm_out.gps_sample_count();
     crate::formats::android_camm::process_camm(buff, create_date_unix, camm_out);
+    camm_out.stamp_gps_track_index_from(gps_start, track_index);
     return false;
   }
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
@@ -2237,10 +2260,19 @@ fn walk_moov(
   camm_out: &mut crate::metadata::CammMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
+  // ExifTool's `$track` (QuickTime.pm:10353-10354): incremented for EVERY
+  // `trak` SubDirectory as `ProcessMOV` descends it, then used as
+  // `SET_GROUP1 = "Track$track"`. It counts ALL `trak`s in moov order (video /
+  // audio / metadata alike), 1-based — NOT the `tkhd` TrackID (the camm
+  // fixture has TrackID 0 yet emits `Track1`). We mirror that by incrementing
+  // on every `trak` atom BEFORE the metadata-handler test, so a metadata
+  // `trak` preceded by a `vide`/`soun` `trak` gets the correct higher index.
+  let mut track_index: u32 = 0;
   for_each_atom(data, start, end, |t, body| {
     let base = body.as_ptr() as usize - data.as_ptr() as usize;
     match t {
       b"trak" => {
+        track_index += 1;
         let track = walk_trak(data, base, base + body.len());
         // Only metadata-bearing handlers feed `ProcessSamples`
         // (QuickTimeStream.pl:1315-1331 — `vide`/`soun` are hash-only). A
@@ -2250,8 +2282,15 @@ fn walk_moov(
         // HandlerType is `gps ` is ignored for embedded extraction. See
         // [`is_meta_handler`].
         if is_meta_handler(&track.handler) {
-          gopro_found_embedded |=
-            process_samples(data, &track, create_date_raw, out, gopro_out, camm_out);
+          gopro_found_embedded |= process_samples(
+            data,
+            &track,
+            track_index,
+            create_date_raw,
+            out,
+            gopro_out,
+            camm_out,
+          );
         }
       }
       // The `moov`-level Novatek `gps ` box — a DIRECT child atom of `moov`
@@ -2395,6 +2434,7 @@ mod tests {
       decode_one_sample(
         &zero,
         &gpmd_track,
+        1,
         &sample,
         None,
         &mut out,
@@ -2418,6 +2458,7 @@ mod tests {
       decode_one_sample(
         &nonprintable,
         &gpmd_track,
+        1,
         &sample,
         None,
         &mut out,
@@ -2435,6 +2476,7 @@ mod tests {
       !decode_one_sample(
         fmas,
         &gpmd_track,
+        1,
         &sample,
         None,
         &mut out,
@@ -2450,6 +2492,7 @@ mod tests {
       decode_one_sample(
         devc,
         &gpmd_track,
+        1,
         &sample,
         None,
         &mut out,
@@ -2470,6 +2513,7 @@ mod tests {
       !decode_one_sample(
         &zero,
         &other_track,
+        1,
         &sample,
         None,
         &mut out,
@@ -2489,6 +2533,7 @@ mod tests {
       !decode_one_sample(
         &zero,
         &camm_track,
+        1,
         &sample,
         None,
         &mut out,

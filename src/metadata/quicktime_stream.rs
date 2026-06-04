@@ -326,6 +326,14 @@ pub struct MebxSample {
   /// `SampleDuration` in seconds for the timed sample
   /// (QuickTimeStream.pl:162, 972).
   sample_duration: Option<f64>,
+  /// 1-based moov track number of the `trak` this sample was decoded from —
+  /// ExifTool's `SET_GROUP1 = "Track$num"` (`++$track` over EVERY `trak`
+  /// SubDirectory, QuickTime.pm:10353-10354), the family-1 group under which a
+  /// `mebx` sample is emitted (oracle: `Track1:GPSCoordinates`). `None` until
+  /// the stream walker stamps it. Stored per-sample (not per-meta) because the
+  /// enclosing [`QuickTimeStreamMeta`] is file-scoped and could accumulate
+  /// samples from more than one metadata `trak`.
+  track_index: Option<u32>,
 }
 
 impl MebxSample {
@@ -343,6 +351,7 @@ impl MebxSample {
       value: value.into(),
       sample_time,
       sample_duration,
+      track_index: None,
     }
   }
 
@@ -372,6 +381,22 @@ impl MebxSample {
   #[must_use]
   pub const fn sample_duration(&self) -> Option<f64> {
     self.sample_duration
+  }
+
+  /// 1-based moov track number of the originating `trak` — the family-1
+  /// `Track<N>` group ExifTool emits this `mebx` sample under (oracle:
+  /// `Track1:GPSCoordinates`). `None` until the stream walker stamps it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> Option<u32> {
+    self.track_index
+  }
+
+  /// Stamp the 1-based moov track number of the originating `trak`.
+  #[inline(always)]
+  pub const fn set_track_index(&mut self, v: Option<u32>) -> &mut Self {
+    self.track_index = v;
+    self
   }
 }
 
@@ -462,6 +487,30 @@ impl QuickTimeStreamMeta {
   pub fn push_mebx_sample(&mut self, sample: MebxSample) -> &mut Self {
     self.mebx_samples.push(sample);
     self
+  }
+
+  /// The number of `mebx` samples decoded so far — a watermark the stream
+  /// walker takes BEFORE decoding one `trak`'s samples so it can stamp the
+  /// `Track<N>` index onto exactly the samples that `trak` produced (see
+  /// [`Self::stamp_mebx_track_index_from`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn mebx_sample_count(&self) -> usize {
+    self.mebx_samples.len()
+  }
+
+  /// Stamp the 1-based moov `track_index` onto every `mebx` sample at or after
+  /// `start` — the samples decoded from a single `trak` since the walker took
+  /// its [`Self::mebx_sample_count`] watermark. Faithful to ExifTool scoping
+  /// `SET_GROUP1 = "Track$num"` per-`trak` (QuickTime.pm:10353-10354): each
+  /// sample carries the group of the `trak` it actually came from, even when
+  /// this file-scoped meta accumulates more than one metadata `trak`.
+  pub(crate) fn stamp_mebx_track_index_from(&mut self, start: usize, track: u32) {
+    if let Some(slice) = self.mebx_samples.get_mut(start..) {
+      for s in slice {
+        s.set_track_index(Some(track));
+      }
+    }
   }
 
   /// Append a fully-rendered tag from a `mebx` `SubDirectory` key (the

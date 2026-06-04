@@ -243,6 +243,14 @@ pub struct CammGpsSample {
   velocity_up_mps: Option<f32>,
   /// **camm6 only.** `GPSSpeedAccuracy` in m/s (QuickTimeStream.pl:559).
   speed_accuracy_mps: Option<f32>,
+  /// 1-based moov track number of the `camm` `trak` this sample was decoded
+  /// from — ExifTool's `SET_GROUP1 = "Track$num"` (`++$track` over EVERY
+  /// `trak` SubDirectory, QuickTime.pm:10353-10354), the family-1 group under
+  /// which a camm GPS sample is emitted (oracle: `Track1:GPSLatitude`). `None`
+  /// until the stream walker stamps it. Stored per-sample (not per-meta)
+  /// because the enclosing [`CammMeta`] is file-scoped and could accumulate
+  /// samples from more than one `camm` `trak`.
+  track_index: Option<u32>,
 }
 
 impl CammGpsSample {
@@ -263,6 +271,7 @@ impl CammGpsSample {
       velocity_north_mps: None,
       velocity_up_mps: None,
       speed_accuracy_mps: None,
+      track_index: None,
     }
   }
 
@@ -349,6 +358,22 @@ impl CammGpsSample {
   #[must_use]
   pub const fn speed_accuracy_mps(&self) -> Option<f32> {
     self.speed_accuracy_mps
+  }
+
+  /// 1-based moov track number of the originating `camm` `trak` — the
+  /// family-1 `Track<N>` group ExifTool emits this sample under (oracle:
+  /// `Track1:GPSLatitude`). `None` until the stream walker stamps it.
+  #[inline(always)]
+  #[must_use]
+  pub const fn track_index(&self) -> Option<u32> {
+    self.track_index
+  }
+
+  /// Stamp the 1-based moov track number of the originating `trak`.
+  #[inline(always)]
+  pub const fn set_track_index(&mut self, v: Option<u32>) -> &mut Self {
+    self.track_index = v;
+    self
   }
 
   /// `true` when the sample carries a non-zero coordinate pair.
@@ -618,6 +643,31 @@ impl CammMeta {
   pub fn push_gps_sample(&mut self, sample: CammGpsSample) -> &mut Self {
     self.gps_samples.push(sample);
     self
+  }
+
+  /// The number of GPS samples decoded so far — a watermark the stream walker
+  /// takes BEFORE decoding one `camm` `trak`'s samples so it can stamp the
+  /// `Track<N>` index onto exactly the samples that `trak` produced (see
+  /// [`Self::stamp_gps_track_index_from`]).
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn gps_sample_count(&self) -> usize {
+    self.gps_samples.len()
+  }
+
+  /// Stamp the 1-based moov `track_index` onto every GPS sample at or after
+  /// `start` — the samples decoded from a single `camm` `trak` since the
+  /// walker took its [`Self::gps_sample_count`] watermark. Faithful to
+  /// ExifTool scoping `SET_GROUP1 = "Track$num"` per-`trak`
+  /// (QuickTime.pm:10353-10354): each sample carries the group of the `trak`
+  /// it actually came from, even when this file-scoped meta accumulates more
+  /// than one `camm` `trak`.
+  pub(crate) fn stamp_gps_track_index_from(&mut self, start: usize, track: u32) {
+    if let Some(slice) = self.gps_samples.get_mut(start..) {
+      for s in slice {
+        s.set_track_index(Some(track));
+      }
+    }
   }
 
   /// Append a decoded `MagneticField` (type-7) sample.
