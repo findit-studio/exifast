@@ -413,16 +413,31 @@ pub enum TagValue {
 pub struct Group {
   family0: SmolStr,
   family1: SmolStr,
+  /// ExifTool family-3 sub-document: `0` = Main, `N` = `Doc<N>` (the per-sample
+  /// document index for `-ee` timed metadata). Almost every group is `0`.
+  doc: u32,
 }
 
 impl Group {
-  /// Construct a group from two string-ish values.
+  /// A Main (doc 0) group from two string-ish values.
   #[must_use]
   #[inline(always)]
   pub fn new(family0: impl Into<SmolStr>, family1: impl Into<SmolStr>) -> Self {
     Self {
       family0: family0.into(),
       family1: family1.into(),
+      doc: 0,
+    }
+  }
+
+  /// A sub-document (`Doc<N>`) group; `doc==0` is Main (identical to `new`).
+  #[must_use]
+  #[inline(always)]
+  pub fn with_doc(family0: impl Into<SmolStr>, family1: impl Into<SmolStr>, doc: u32) -> Self {
+    Self {
+      family0: family0.into(),
+      family1: family1.into(),
+      doc,
     }
   }
 
@@ -438,6 +453,13 @@ impl Group {
   #[inline(always)]
   pub fn family1(&self) -> &str {
     self.family1.as_str()
+  }
+
+  /// The family-3 sub-document index (`0` = Main).
+  #[must_use]
+  #[inline(always)]
+  pub const fn doc(&self) -> u32 {
+    self.doc
   }
 }
 
@@ -1655,5 +1677,15 @@ mod tests {
       serde_json::to_value(TagValue::F64(2.6)).unwrap(),
       serde_json::json!(2.6)
     );
+  }
+
+  #[test]
+  fn group_doc_defaults_to_zero_and_with_doc_sets_it() {
+    let g = Group::new("QuickTime", "QuickTime");
+    assert_eq!(g.doc(), 0, "new() => Main/doc 0");
+    let d = Group::with_doc("QuickTime", "QuickTime", 2);
+    assert_eq!(d.doc(), 2);
+    assert_eq!(d.family1(), "QuickTime");
+    assert_ne!(Group::with_doc("QuickTime", "QuickTime", 1), g);
   }
 }

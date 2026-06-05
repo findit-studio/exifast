@@ -1451,7 +1451,8 @@ impl crate::emit::Taggable for CrwMeta<'_> {
   /// emission order. `Unknown => 1` is absent among these records ⇒
   /// `unknown = false` (the Canon sub-table decoders already drop their own
   /// `Unknown` positions internally).
-  fn tags(&self, mode: ConvMode) -> impl Iterator<Item = EmittedTag> + '_ {
+  fn tags(&self, opts: crate::emit::EmitOptions) -> impl Iterator<Item = EmittedTag> + '_ {
+    let mode = opts.mode;
     let print_conv = matches!(mode, ConvMode::PrintConv);
     let mut tags: Vec<EmittedTag> = Vec::new();
 
@@ -2124,7 +2125,7 @@ mod tests {
     // The CRW container threads FILE_TYPE = "CRW" into shot_info::parse, so the
     // raw-0 ExposureTime survives ⇒ a `Canon:ExposureTime` tag is emitted.
     let has_exposure_time = m
-      .tags(ConvMode::ValueConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::ValueConv, false))
       .any(|t| t.tag().group_ref().family1() == "Canon" && t.tag().name() == "ExposureTime");
     assert!(
       has_exposure_time,
@@ -2135,7 +2136,7 @@ mod tests {
   /// Collect the `CanonRaw:` family-1 `(name, value)` pairs for a mode.
   fn canonraw_tags(m: &CrwMeta<'_>, mode: crate::emit::ConvMode) -> Vec<(String, TagValue)> {
     use crate::emit::Taggable as _;
-    m.tags(mode)
+    m.tags(crate::emit::EmitOptions::g1(mode, false))
       .filter(|t| t.tag().group_ref().family1() == "CanonRaw")
       .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
       .collect()

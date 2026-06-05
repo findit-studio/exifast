@@ -814,8 +814,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// (DSF.pm:64).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -928,7 +929,7 @@ impl crate::emit::Taggable for Meta<'_> {
     // warnings/errors are drained by the `AnyMeta::Dsf` arm.
     #[cfg(feature = "id3")]
     if let Some(id3) = self.id3.as_ref() {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
 
     tags.into_iter()
@@ -1045,7 +1046,11 @@ mod tests {
   /// `format_parser.rs` arm exactly so the in-module tests exercise the same
   /// net `TagMap` the engine produces. `print_conv` ⇒ `-j`, else `-n`.
   fn emit_via_engine(meta: &Meta<'_>, print_conv: bool, out: &mut TagMap) {
-    crate::emit::run_emission(meta, ConvMode::from_print_conv(print_conv), out);
+    crate::emit::run_emission(
+      meta,
+      crate::emit::EmitOptions::g1(ConvMode::from_print_conv(print_conv), false),
+      out,
+    );
     // Drain diagnostics through the SAME `run_diagnostics` path the
     // `format_parser.rs` arm uses, so the `[minor]`/`[x$n]` prefixing matches
     // production (the chained ID3 sub-Meta's ignorable levels flow through
@@ -1803,7 +1808,11 @@ mod tests {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("File", "FormatVersion"), Some("1".to_string()));
     assert_eq!(w.get_str("File", "FormatID"), Some("DSD Raw".to_string()));
     assert_eq!(
@@ -1824,7 +1833,11 @@ mod tests {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("parsed");
     let mut w = TagMap::new();
-    crate::emit::run_emission(&meta, ConvMode::ValueConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::ValueConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("File", "FormatID"), Some("0".to_string()));
     assert_eq!(w.get_str("File", "ChannelType"), Some("2".to_string()));
     assert_eq!(w.get_str("File", "SampleRate"), Some("2822400".to_string()));
@@ -1837,7 +1850,9 @@ mod tests {
   fn taggable_group_is_file_family0_and_family1() {
     let bytes = happy_path_dsf();
     let meta = parse_borrowed(&bytes).expect("parsed");
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty());
     for t in &tags {
       assert_eq!(t.tag().group_ref().family0(), "File");
@@ -1865,7 +1880,7 @@ mod tests {
 
     // The tag stream: fmt-chunk `File:*` tags, THEN the ID3 trailer tags.
     let names: std::vec::Vec<String> = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .map(|t| std::format!("{}:{}", t.tag().group_ref().family1(), t.tag().name()))
       .collect();
     // fmt-chunk FormatVersion is first; it precedes any ID3 entry.
@@ -1889,7 +1904,7 @@ mod tests {
     assert!(
       w.entries()
         .iter()
-        .any(|(g, n, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
+        .any(|(_, g, n, _)| g.starts_with("ID3v2") || (g == "File" && n == "ID3Size")),
       "ID3 trailer tags present in the engine output"
     );
   }

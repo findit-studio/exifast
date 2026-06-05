@@ -511,8 +511,9 @@ impl crate::emit::Taggable for Id3v1Meta<'_> {
   /// `Unknown => 1` and no warnings/errors.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -1494,8 +1495,9 @@ impl crate::emit::Taggable for Id3Meta<'_> {
   /// Audible/Red/AIFF arm pattern), so the net output is unchanged.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -1630,7 +1632,7 @@ impl crate::emit::Taggable for Mp3Meta<'_> {
   /// after `run_emission` in that exact order, so the net `TagMap` is identical.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
     use crate::emit::EmittedTag;
 
@@ -1638,18 +1640,18 @@ impl crate::emit::Taggable for Mp3Meta<'_> {
     // 1. ID3 sub-Meta (header frames + v1 trailer). `Id3Meta` is `Taggable`;
     // its warnings/errors are drained by the `AnyMeta::Mp3` arm.
     if let Some(id3) = &self.id3 {
-      tags.extend(id3.tags(mode));
+      tags.extend(id3.tags(opts));
     }
     // 2. MPEG-audio sub-Meta (frame header + Xing/LAME tail). `AudioMeta` is
     // `Taggable` and emits no warnings/errors.
     if let Some(mpeg) = &self.mpeg {
-      tags.extend(mpeg.tags(mode));
+      tags.extend(mpeg.tags(opts));
     }
     // 3. APE-trailer sub-Meta. `ape::Meta` is `Taggable`; its `Bad APE
     // trailer` warning + any nested-ID3 warnings/errors are drained by the
     // `AnyMeta::Mp3` arm.
     if let Some(ape) = &self.ape {
-      tags.extend(ape.tags(mode));
+      tags.extend(ape.tags(opts));
     }
     tags.into_iter()
   }
@@ -2129,7 +2131,11 @@ mod tests {
     // Sink emits MPEG:* tags (golden `run_emission` over the `Mp3Meta`
     // `Taggable` chain).
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("MPEG", "MPEGAudioVersion"), Some("1".into()));
     assert_eq!(w.get_str("MPEG", "AudioBitrate"), Some("128 kbps".into()));
   }
@@ -2191,7 +2197,11 @@ mod tests {
     // Sink emits BOTH ID3v2_3:Title and MPEG:* tags (golden `run_emission`
     // over the `Mp3Meta` `Taggable` chain).
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("ID3v2_3", "Title"), Some("Test".into()));
     assert_eq!(w.get_str("MPEG", "MPEGAudioVersion"), Some("1".into()));
   }
@@ -2747,7 +2757,11 @@ mod tests {
     data.extend_from_slice(&build_id3v1_block());
     let meta = parse_id3_borrowed(&data, None, true).expect("found");
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("ID3v1", "Title"), Some("Hello".into()));
     assert_eq!(w.get_str("ID3v1", "Genre"), Some("Hip-Hop".into()));
     assert_eq!(w.get_str("File", "ID3Size"), Some("128".into()));
@@ -2772,14 +2786,22 @@ mod tests {
     // -j mode: parse + sink in PrintConv mode → "Hip-Hop".
     let meta_j = parse_id3_borrowed(&data, None, true).expect("found");
     let mut wj = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
+    crate::emit::run_emission(
+      &meta_j,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut wj,
+    );
     assert_eq!(wj.get_str("ID3v1", "Genre"), Some("Hip-Hop".into()));
 
     // -n mode: parse + sink in raw mode → "7" (the raw genre byte),
     // matching bundled `exiftool -j -n`.
     let meta_n = parse_id3_borrowed(&data, None, false).expect("found");
     let mut wn = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta_n,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert_eq!(
       wn.get_str("ID3v1", "Genre"),
       Some("7".into()),
@@ -2815,13 +2837,21 @@ mod tests {
     // -j: "7 s" (PrintConv).
     let meta_j = parse_id3_borrowed(&data, None, true).expect("found");
     let mut wj = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta_j, crate::emit::ConvMode::PrintConv, &mut wj);
+    crate::emit::run_emission(
+      &meta_j,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut wj,
+    );
     assert_eq!(wj.get_str("ID3v2_3", "Length"), Some("7 s".into()));
 
     // -n: 7 (raw ValueConv seconds), matching bundled `exiftool -j -n`.
     let meta_n = parse_id3_borrowed(&data, None, false).expect("found");
     let mut wn = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta_n, crate::emit::ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta_n,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert_eq!(
       wn.get_str("ID3v2_3", "Length"),
       Some("7".into()),
@@ -2867,7 +2897,11 @@ mod tests {
 
     // sink(true) — PrintConv `-j`.
     let mut wj = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut wj);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut wj,
+    );
     assert_eq!(
       wj.get_str("ID3v2_3", "Length"),
       Some("7 s".into()),
@@ -2881,7 +2915,11 @@ mod tests {
 
     // sink(false) — raw `-j -n`, from the SAME `meta`.
     let mut wn = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::ValueConv, &mut wn);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::ValueConv, false),
+      &mut wn,
+    );
     assert_eq!(
       wn.get_str("ID3v2_3", "Length"),
       Some("7".into()),
@@ -2988,8 +3026,13 @@ mod tests {
     mode: crate::emit::ConvMode,
   ) -> Vec<(SmolStr, SmolStr, TagValue)> {
     let mut tm = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(meta, mode, &mut tm);
-    tm.entries().to_vec()
+    crate::emit::run_emission(meta, crate::emit::EmitOptions::g1(mode, false), &mut tm);
+    // ID3v1 has no sub-documents (doc is always 0); drop it to keep the
+    // `(family1, name, value)` shape this comparison helper compares.
+    tm.entries()
+      .iter()
+      .map(|(_, g, n, v)| (g.clone(), n.clone(), v.clone()))
+      .collect()
   }
 
   /// `Id3v1Meta`'s `Taggable` reproduces `real::emit_id3v1` byte-for-byte —
@@ -3040,7 +3083,11 @@ mod tests {
           out.write_u64(group, "Genre", u64::from(g)).unwrap();
         }
       }
-      out.entries().to_vec()
+      out
+        .entries()
+        .iter()
+        .map(|(_, g, n, v)| (g.clone(), n.clone(), v.clone()))
+        .collect()
     }
 
     // Two distinct ID3v1 shapes: a normal-genre trailer (last 128 bytes of

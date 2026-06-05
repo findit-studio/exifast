@@ -1809,8 +1809,9 @@ impl crate::emit::Taggable for AudioMeta<'_> {
   /// yielded tag is `unknown: false`. No lists, no warnings/errors.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -2254,7 +2255,7 @@ mod tests {
     let meta = parse_borrowed(buf, true, "MP3").expect("parsed");
     crate::emit::run_emission(
       &meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -2603,7 +2604,11 @@ mod tests {
     assert_eq!(m.ms_stereo(), Some(true));
     // Emit under -j via the golden engine.
     let mut w = TagMap::new();
-    crate::emit::run_emission(&m, crate::emit::ConvMode::PrintConv, &mut w);
+    crate::emit::run_emission(
+      &m,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut w,
+    );
     assert_eq!(w.get_str("MPEG", "MSStereo"), Some("On".into()));
   }
 

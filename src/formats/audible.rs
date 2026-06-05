@@ -1381,7 +1381,7 @@ impl crate::emit::Taggable for Meta<'_> {
   /// [`run_emission`]: crate::emit::run_emission
   fn tags(
     &self,
-    _mode: crate::emit::ConvMode,
+    _opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
@@ -1722,7 +1722,7 @@ mod tests {
     let mut w = TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -1735,7 +1735,7 @@ mod tests {
     let tm = emit_into_tagmap(&meta, true);
     tm.entries()
       .iter()
-      .filter_map(|(g, n, v)| (g == "Audible").then(|| (n.to_string(), v.clone())))
+      .filter_map(|(_, g, n, v)| (g == "Audible").then(|| (n.to_string(), v.clone())))
       .collect()
   }
 
@@ -2039,7 +2039,9 @@ mod tests {
     use crate::emit::{ConvMode, Taggable};
     let bytes = build_aa_with_dict(&[("author", "Alice"), ("title", "Book")]);
     let meta = parse_borrowed(&bytes).expect("parsed");
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert_eq!(tags.len(), 2);
     for t in &tags {
       // family0 = family1 = "Audible" (no GROUPS{0} override → module name).

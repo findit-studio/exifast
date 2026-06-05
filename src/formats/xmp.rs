@@ -4865,8 +4865,9 @@ impl crate::emit::Taggable for XmpMeta<'_> {
   /// [`Diagnose`](crate::diagnostics::Diagnose) channel.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     self.tags.iter().map(move |tag| {
       crate::emit::EmittedTag::new(

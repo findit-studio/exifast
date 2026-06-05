@@ -663,8 +663,9 @@ impl crate::emit::Taggable for Meta<'_> {
   /// has no `Unknown => 1` tags ⇒ `unknown: false`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
     use core::fmt::Write as _;
@@ -1156,7 +1157,7 @@ mod tests {
     let mut w = TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     w
@@ -1325,7 +1326,7 @@ mod tests {
     let format_names: std::vec::Vec<&str> = tm
       .entries()
       .iter()
-      .filter_map(|(g, n, _)| (g == "MOI").then_some(n.as_str()))
+      .filter_map(|(_, g, n, _)| (g == "MOI").then_some(n.as_str()))
       .collect();
     assert_eq!(
       format_names,
@@ -1346,7 +1347,9 @@ mod tests {
     use crate::emit::{ConvMode, Taggable};
     let buf = fixture_buffer();
     let meta = parse_borrowed(&buf).expect("parsed");
-    let tags: std::vec::Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: std::vec::Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // MOIVersion, DateTimeOriginal, Duration, AspectRatio, AudioCodec,
     // AudioBitrate, VideoBitrate — 7 tags, none Unknown.
     assert_eq!(tags.len(), 7);

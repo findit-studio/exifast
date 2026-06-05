@@ -126,7 +126,12 @@ mod serde_doc {
       // join the SAME dedup set (`exiftool:2951`).
       let mut seen: BTreeSet<String> = BTreeSet::new();
       for t in doc.tags {
-        let token = std::format!("{}:{}", t.group_ref().family1(), t.name());
+        let token = crate::serialize_key::group_key(
+          t.group_ref().doc(),
+          t.group_ref().family1(),
+          t.name(),
+          crate::serialize_key::GroupMode::G1,
+        );
         if seen.insert(token.clone()) {
           map.serialize_entry(&token, t.value_ref())?;
         }

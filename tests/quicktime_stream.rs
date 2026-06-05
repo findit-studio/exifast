@@ -1753,3 +1753,486 @@ fn quicktime_sp2_projects_camera_capture_date_and_gps() {
     gps.altitude_m()
   );
 }
+
+// ===========================================================================
+// SP4 — Android Google CAMM (Camera Motion Metadata)
+// ===========================================================================
+
+#[test]
+fn quicktime_camm_decodes_camm5_minimal_gps() {
+  // Synthetic .mov with a `camm` MetaFormat metadata track carrying one
+  // 28-byte camm5 packet (minimal GPS: 3×f64 lat/lon/alt). The walker must
+  // populate `Meta::android_camm` and the MediaMetadata projection must
+  // fill GpsLocation from the first fix.
+  let data = build_mov_with_camm_track(&camm5_packet(37.5, -122.0, 50.0));
+  let meta = parse_quicktime(&data).expect("recognized");
+  let camm = meta.android_camm();
+  assert!(!camm.is_empty(), "camm5 must populate android_camm");
+  assert_eq!(camm.gps_samples().len(), 1);
+  let s = &camm.gps_samples()[0];
+  assert_eq!(s.packet_type(), 5);
+  assert_eq!(s.latitude(), Some(37.5));
+  assert_eq!(s.longitude(), Some(-122.0));
+  assert_eq!(s.altitude_m(), Some(50.0));
+  // MediaMetadata projects the first fix into GpsLocation.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from camm5");
+  assert_eq!(gps.latitude(), Some(37.5));
+  assert_eq!(gps.longitude(), Some(-122.0));
+  assert_eq!(gps.altitude_m(), Some(50.0));
+}
+
+#[test]
+fn quicktime_camm_decodes_camm6_full_gps_with_date_time() {
+  // Synthetic .mov with a camm6 packet (60 bytes: f64 ts + u32 mm + 2×f64 +
+  // 7×f32). The projected GpsLocation carries the timestamp.
+  let unix_ts = 1_704_067_200.0f64; // 2024-01-01 00:00 UTC
+  let data = build_mov_with_camm_track(&camm6_packet(
+    unix_ts, /* measure_mode */ 3, /* lat */ 40.0, /* lon */ -75.0,
+    /* alt */ 200.0, /* h_acc */ 5.0, /* v_acc */ 10.0, /* v_e */ 1.0,
+    /* v_n */ 2.0, /* v_u */ 0.5, /* spd_acc */ 0.1,
+  ));
+  let meta = parse_quicktime(&data).expect("recognized");
+  let camm = meta.android_camm();
+  assert_eq!(camm.gps_samples().len(), 1);
+  let s = &camm.gps_samples()[0];
+  assert_eq!(s.packet_type(), 6);
+  assert_eq!(s.latitude(), Some(40.0));
+  assert_eq!(s.longitude(), Some(-75.0));
+  assert!((s.altitude_m().unwrap() - 200.0).abs() < 1e-3);
+  assert_eq!(s.measure_mode(), Some(3));
+  assert_eq!(s.horizontal_accuracy_m(), Some(5.0));
+  assert_eq!(s.velocity_east_mps(), Some(1.0));
+  // Date/time renders via convert_unix_time + 'Z'.
+  assert_eq!(s.date_time(), Some("2024:01:01 00:00:00Z"));
+  // MediaMetadata projection picks up the timestamp.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from camm6");
+  assert_eq!(gps.timestamp(), Some("2024:01:01 00:00:00Z"));
+}
+
+#[test]
+fn quicktime_camm_decodes_motion_records() {
+  // Synthetic .mov with a camm track carrying the four "motion" packet
+  // types in a single sample: camm1 (exposure), camm2 (gyro), camm3
+  // (accel), camm7 (magnetic field). All must populate their respective
+  // Vec in android_camm.
+  let mut payload = Vec::new();
+  payload.extend_from_slice(&camm_packet(
+    1,
+    &[
+      &500_000_000i32.to_le_bytes()[..], // 0.5 s pixel exposure
+      &200_000_000i32.to_le_bytes()[..], // 0.2 s skew
+    ]
+    .concat(),
+  ));
+  payload.extend_from_slice(&camm_packet(2, &vec3_le(0.1, 0.2, 0.3)));
+  payload.extend_from_slice(&camm_packet(3, &vec3_le(0.0, 0.0, 9.81)));
+  payload.extend_from_slice(&camm_packet(7, &vec3_le(25.0, -10.0, 40.0)));
+  let data = build_mov_with_camm_track(&payload);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let camm = meta.android_camm();
+  assert_eq!(camm.exposure().len(), 1);
+  assert!((camm.exposure()[0].pixel_exposure_time_s() - 0.5).abs() < 1e-9);
+  assert!((camm.exposure()[0].rolling_shutter_skew_time_s() - 0.2).abs() < 1e-9);
+  assert_eq!(camm.angular_velocity().len(), 1);
+  assert!((camm.angular_velocity()[0].x() - 0.1).abs() < 1e-6);
+  assert_eq!(camm.acceleration().len(), 1);
+  assert!((camm.acceleration()[0].z() - 9.81).abs() < 1e-3);
+  assert_eq!(camm.magnetic_field().len(), 1);
+  assert!((camm.magnetic_field()[0].z() - 40.0).abs() < 1e-3);
+}
+
+#[test]
+fn quicktime_camm_round_trip_via_media_metadata_priority() {
+  // The MediaMetadata GPS projection orders sources GoPro → camm → stream;
+  // with NO GoPro data, a camm5 packet wins over an absent stream/freeGPS
+  // sample.
+  let data = build_mov_with_camm_track(&camm5_packet(1.23, 4.56, 100.0));
+  let meta = parse_quicktime(&data).expect("recognized");
+  assert!(meta.gopro().is_empty());
+  assert!(meta.stream().is_empty());
+  assert!(!meta.android_camm().is_empty());
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("projected from camm");
+  assert!((gps.latitude().unwrap() - 1.23).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 4.56).abs() < 1e-9);
+}
+
+#[test]
+fn quicktime_camm_stamps_track_index_from_real_fixture() {
+  // The 1-based moov track number ExifTool stamps via `SET_GROUP1 =
+  // "Track$num"` (QuickTime.pm:10353-10354) — the family-1 group the camm GPS
+  // samples are emitted under. Oracle (`exiftool -ee -G1 QuickTime_camm.mov`)
+  // groups EVERY GPS record under `Track1` (the camm `trak` is the file's
+  // first/only `trak`). The stream walker must stamp `track_index() == Some(1)`
+  // onto each decoded camm GPS sample so a later task can emit `Track1:`.
+  let data = fixture("QuickTime_camm.mov");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let camm = meta.android_camm();
+  assert!(
+    !camm.gps_samples().is_empty(),
+    "real camm fixture must decode GPS samples"
+  );
+  for s in camm.gps_samples() {
+    assert_eq!(
+      s.track_index(),
+      Some(1),
+      "every camm GPS sample carries the 1-based moov Track index (oracle Track1)"
+    );
+  }
+}
+
+#[test]
+fn quicktime_mebx_stamps_track_index_from_real_fixture() {
+  // Same Track<N> stamping for the Apple `mebx` path. Oracle (`exiftool -ee
+  // -G1 QuickTime_mebx_gps.mov`) emits `Track1:GPSCoordinates` — the mebx
+  // `trak` is the file's first/only `trak`. The walker must stamp
+  // `track_index() == Some(1)` onto the decoded mebx sample.
+  let data = fixture("QuickTime_mebx_gps.mov");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let stream = meta.stream();
+  let pairs = stream.mebx_samples();
+  assert!(!pairs.is_empty(), "mebx fixture must decode a sample");
+  for p in pairs {
+    assert_eq!(
+      p.track_index(),
+      Some(1),
+      "every mebx sample carries the 1-based moov Track index (oracle Track1)"
+    );
+  }
+}
+
+/// Real-fixture conformance stub for Android CAMM.
+///
+/// Bundled exiftool has no Pixel/Samsung CAMM `.mp4` fixture in
+/// `t/images/`; the synthetic-packet unit tests carry the algorithmic
+/// coverage. When a small camm5/camm6 `.mp4` fixture lands (per follow-up
+/// issue #60), unignore this test and add the round-trip assertions
+/// against the bundled `exiftool -j -G -ee <fixture>`.
+#[test]
+#[ignore = "needs real Pixel/Samsung CAMM .mp4 fixture; see #60"]
+fn camm_real_fixture_conformance() {
+  // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
+}
+
+// --- camm packet builders ---------------------------------------------------
+
+/// Build a CAMM packet `[reserved:2 (=0)][type:int16u-le][payload]`.
+fn camm_packet(t: u16, payload: &[u8]) -> Vec<u8> {
+  let mut v = Vec::with_capacity(4 + payload.len());
+  v.extend_from_slice(&[0u8, 0u8]); // reserved
+  v.extend_from_slice(&t.to_le_bytes());
+  v.extend_from_slice(payload);
+  v
+}
+
+fn camm5_packet(lat: f64, lon: f64, alt: f64) -> Vec<u8> {
+  let mut payload = Vec::with_capacity(24);
+  payload.extend_from_slice(&lat.to_le_bytes());
+  payload.extend_from_slice(&lon.to_le_bytes());
+  payload.extend_from_slice(&alt.to_le_bytes());
+  camm_packet(5, &payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn camm6_packet(
+  gps_dt: f64,
+  measure_mode: u32,
+  lat: f64,
+  lon: f64,
+  alt: f32,
+  h_acc: f32,
+  v_acc: f32,
+  v_e: f32,
+  v_n: f32,
+  v_u: f32,
+  spd_acc: f32,
+) -> Vec<u8> {
+  let mut payload = Vec::with_capacity(56);
+  payload.extend_from_slice(&gps_dt.to_le_bytes());
+  payload.extend_from_slice(&measure_mode.to_le_bytes());
+  payload.extend_from_slice(&lat.to_le_bytes());
+  payload.extend_from_slice(&lon.to_le_bytes());
+  payload.extend_from_slice(&alt.to_le_bytes());
+  payload.extend_from_slice(&h_acc.to_le_bytes());
+  payload.extend_from_slice(&v_acc.to_le_bytes());
+  payload.extend_from_slice(&v_e.to_le_bytes());
+  payload.extend_from_slice(&v_n.to_le_bytes());
+  payload.extend_from_slice(&v_u.to_le_bytes());
+  payload.extend_from_slice(&spd_acc.to_le_bytes());
+  camm_packet(6, &payload)
+}
+
+fn vec3_le(x: f32, y: f32, z: f32) -> Vec<u8> {
+  let mut v = Vec::with_capacity(12);
+  v.extend_from_slice(&x.to_le_bytes());
+  v.extend_from_slice(&y.to_le_bytes());
+  v.extend_from_slice(&z.to_le_bytes());
+  v
+}
+
+/// Build a minimal but valid .mov whose moov contains ONE metadata `trak`
+/// with `mhlr/meta` handler + a `mebx`-style stsd whose first 4-byte
+/// "format" code is `camm`. The track's single sample is `sample_bytes`,
+/// stored at the start of `mdat`.
+fn build_mov_with_camm_track(sample_bytes: &[u8]) -> Vec<u8> {
+  // ftyp atom: 'qt  '.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+
+  let sample_len = sample_bytes.len() as u32;
+
+  // mdat — sample data lives at offset (ftyp.len() + 8) from file start
+  // (after ftyp + mdat 8-byte header). The stco entry below points at it.
+  let mut mdat = (sample_len + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(sample_bytes);
+  let sample_file_offset_val = (ftyp.len() as u32) + 8;
+
+  // mvhd (v0, 100 bytes payload).
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mvhd.extend_from_slice(&[0u8; 8]); // create/modify
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mvhd.extend_from_slice(&1000u32.to_be_bytes()); // duration
+  mvhd.extend_from_slice(&[0u8; 80]); // rest
+
+  // hdlr (mhlr/meta), 33-byte payload incl. version+flags+pre_defined+type+reserved+name(empty).
+  let mut hdlr = Vec::new();
+  hdlr.extend_from_slice(&[0u8; 4]); // version+flags
+  hdlr.extend_from_slice(b"mhlr"); // pre_defined (matches mebx fixture)
+  hdlr.extend_from_slice(b"meta"); // handler_type — meta_handler dispatches
+  hdlr.extend_from_slice(&[0u8; 12]); // reserved
+  hdlr.push(0); // name (empty)
+
+  // mdhd (v0, 24-byte payload).
+  let mut mdhd = Vec::new();
+  mdhd.extend_from_slice(&[0u8; 4]); // version+flags
+  mdhd.extend_from_slice(&[0u8; 8]); // create/modify
+  mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+  mdhd.extend_from_slice(&1000u32.to_be_bytes()); // duration
+  mdhd.extend_from_slice(&[0u8; 4]); // language+quality
+
+  // stsd — 1 entry whose first 4-byte format code is `camm`.
+  // [version+flags:4][count:4][entry-size:4][format:4][reserved:6][data-ref-index:2]
+  let mut stsd_entry = Vec::new();
+  // Entry: size(=16)+format=camm+6 reserved bytes+data-ref-index(=1).
+  stsd_entry.extend_from_slice(&16u32.to_be_bytes());
+  stsd_entry.extend_from_slice(b"camm");
+  stsd_entry.extend_from_slice(&[0u8; 6]);
+  stsd_entry.extend_from_slice(&1u16.to_be_bytes());
+  let mut stsd = Vec::new();
+  stsd.extend_from_slice(&[0u8; 4]); // version+flags
+  stsd.extend_from_slice(&1u32.to_be_bytes()); // entry count
+  stsd.extend_from_slice(&stsd_entry);
+
+  // stts: 1 entry, count=1 delta=1000.
+  let mut stts = Vec::new();
+  stts.extend_from_slice(&[0u8; 4]);
+  stts.extend_from_slice(&1u32.to_be_bytes());
+  stts.extend_from_slice(&1u32.to_be_bytes());
+  stts.extend_from_slice(&1000u32.to_be_bytes());
+
+  // stsc: 1 entry (first_chunk=1, samples_per_chunk=1, desc_index=1).
+  let mut stsc = Vec::new();
+  stsc.extend_from_slice(&[0u8; 4]);
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+  stsc.extend_from_slice(&1u32.to_be_bytes());
+
+  // stsz: 1 sample, explicit size.
+  let mut stsz = Vec::new();
+  stsz.extend_from_slice(&[0u8; 4]); // version+flags
+  stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size=0 (variable)
+  stsz.extend_from_slice(&1u32.to_be_bytes()); // count
+  stsz.extend_from_slice(&sample_len.to_be_bytes());
+
+  // stco: 1 chunk offset (pointing at the sample inside mdat).
+  let mut stco = Vec::new();
+  stco.extend_from_slice(&[0u8; 4]);
+  stco.extend_from_slice(&1u32.to_be_bytes());
+  stco.extend_from_slice(&sample_file_offset_val.to_be_bytes());
+
+  // Assemble stbl from the tables.
+  let mut stbl = Vec::new();
+  stbl.extend_from_slice(&atom_bytes(b"stsd", &stsd));
+  stbl.extend_from_slice(&atom_bytes(b"stts", &stts));
+  stbl.extend_from_slice(&atom_bytes(b"stsc", &stsc));
+  stbl.extend_from_slice(&atom_bytes(b"stsz", &stsz));
+  stbl.extend_from_slice(&atom_bytes(b"stco", &stco));
+
+  // minf with nmhd + stbl.
+  let nmhd = atom_bytes(b"nmhd", &[0u8; 4]);
+  let mut minf = nmhd;
+  minf.extend_from_slice(&atom_bytes(b"stbl", &stbl));
+
+  // mdia with mdhd + hdlr + minf.
+  let mut mdia = atom_bytes(b"mdhd", &mdhd);
+  mdia.extend_from_slice(&atom_bytes(b"hdlr", &hdlr));
+  mdia.extend_from_slice(&atom_bytes(b"minf", &minf));
+
+  // trak with tkhd (minimal) + mdia.
+  let tkhd_payload = vec![0u8; 84];
+  let mut trak = atom_bytes(b"tkhd", &tkhd_payload);
+  trak.extend_from_slice(&atom_bytes(b"mdia", &mdia));
+
+  // moov with mvhd + trak.
+  let mut moov = atom_bytes(b"mvhd", &mvhd);
+  moov.extend_from_slice(&atom_bytes(b"trak", &trak));
+
+  let mut out = ftyp;
+  // Mirror the fixture order: ftyp / mdat / moov is also valid; we use
+  // ftyp / moov / mdat which matches build_mov_with_gpro6_in_mdat.
+  // Note: stco offset MUST land inside the mdat we emit; we placed mdat
+  // RIGHT AFTER ftyp, so sample_file_offset is correct.
+  out.extend_from_slice(&mdat);
+  out.extend_from_slice(&atom_bytes(b"moov", &moov));
+  out
+}
+
+/// Wrap `body` as a top-level atom `[size:u32 BE][type:4][body]`.
+fn atom_bytes(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
+  let mut v = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+  v.extend_from_slice(t);
+  v.extend_from_slice(body);
+  v
+}
+
+// ===========================================================================
+// `ParseOptions { extract_embedded }` THREADING + the timed-metadata emission
+// gate — the render-time `-ee` flag reaches the typed Meta's `serialize_tags`
+// → `EmitOptions` and drives the per-source gating.
+//
+// `QuickTime_gps0.mov` carries a TOP-LEVEL `gps0` magic box ExifTool processes
+// WITHOUT `-ee` (Task 10b): at no-`ee` it emits the FIRST fix flat
+// (`QuickTime:GPS*`) + a file-level `ExifTool:Warning` (the `EEWarn`); with
+// `-ee` it emits the FULL `Doc<N>` series and NO file warning. So `-ee` off vs
+// on render DIFFERENT documents (more fixes under `-ee`, the warning only
+// without). The byte-exact value checks live in
+// `tests/timed_metadata_conformance.rs`; these pin the threading + gate.
+// ===========================================================================
+
+/// `extract_info_with_options` threads `ParseOptions { extract_embedded }` into
+/// the document render, and the emission gate consults it: `-ee` off vs on
+/// render DIFFERENT documents (the gps0 box's no-`ee` first-fix + file warning
+/// vs the full `-ee` `Doc<N>` series).
+#[test]
+fn extract_info_with_options_threads_extract_embedded() {
+  use exifast::ParseOptions;
+  use exifast::parser::extract_info_with_options;
+
+  let data = fixture("QuickTime_gps0.mov");
+
+  let off = extract_info_with_options("QuickTime_gps0.mov", &data, true, ParseOptions::default());
+  let on = extract_info_with_options(
+    "QuickTime_gps0.mov",
+    &data,
+    true,
+    ParseOptions::default().with_extract_embedded(true),
+  );
+
+  // Sanity: the default-off render equals the legacy `extract_info` exactly
+  // (the regression guard — default `extract_embedded = false` keeps output
+  // byte-identical to the hard-coded baseline).
+  assert_eq!(
+    off,
+    exifast::parser::extract_info("QuickTime_gps0.mov", &data, true),
+    "default ParseOptions must match the legacy extract_info byte-for-byte"
+  );
+  // The emission gate consults `-ee`: ON emits the full `Doc<N>` series, OFF the
+  // truncated first fix + the file warning — the two documents MUST differ.
+  assert_ne!(off, on, "-ee gating: ON and OFF must render differently");
+  // The top-level `gps0` box is processed WITHOUT `-ee`, so OFF emits the FIRST
+  // fix flat AND the file-level `ExtractEmbedded` warning.
+  assert!(
+    off.contains("\"QuickTime:GPSLatitude\""),
+    "-ee off emits the first gps0 fix (top-level magic box)"
+  );
+  assert!(
+    off.contains("\"ExifTool:Warning\""),
+    "-ee off raises the file-level ExtractEmbedded warning"
+  );
+  // ON also surfaces the GPS stream (the `-ee -G1` first-wins collapse) but
+  // raises NO file warning (the EEWarn is the truncation, no-`ee`-only).
+  assert!(
+    on.contains("\"QuickTime:GPSLatitude\""),
+    "-ee on emits the timed GPS stream"
+  );
+  assert!(
+    !on.contains("\"ExifTool:Warning\""),
+    "-ee on does not raise the no-ee ExtractEmbedded warning"
+  );
+}
+
+/// `Rendered::new_with_options` carries `extract_embedded` into the serde
+/// `Serialize` path (the same `serialize_tags` seam). The gate consults it, so
+/// off and on render differently (see [`extract_info_with_options_threads_extract_embedded`]).
+#[test]
+fn rendered_new_with_options_threads_extract_embedded() {
+  use exifast::Rendered;
+
+  let data = fixture("QuickTime_gps0.mov");
+  let meta = parse_bytes(&data).expect("recognized");
+
+  let base = Rendered::new(&meta, true);
+  assert!(!base.extract_embedded(), "Rendered::new defaults -ee off");
+
+  let on = Rendered::new_with_options(&meta, true, true);
+  assert!(on.extract_embedded(), "new_with_options carries -ee on");
+
+  let off_json = serde_json::to_string(&Rendered::new(&meta, true)).expect("serialize off");
+  let on_json = serde_json::to_string(&on).expect("serialize on");
+  // The emission gate consults `-ee`: off and on render differently.
+  assert_ne!(
+    off_json, on_json,
+    "-ee gating: off and on render differently"
+  );
+  // The gps0 top-level box emits its first fix WITHOUT `-ee` (+ the file
+  // warning); `-ee` ON emits the full series with no file warning.
+  assert!(
+    off_json.contains("GPSLatitude"),
+    "-ee off emits the first gps0 fix"
+  );
+  assert!(
+    off_json.contains("ExifTool:Warning"),
+    "-ee off raises the file-level ExtractEmbedded warning"
+  );
+  assert!(on_json.contains("GPSLatitude"), "-ee on emits timed GPS");
+  assert!(
+    !on_json.contains("ExifTool:Warning"),
+    "-ee on does not raise the no-ee warning"
+  );
+}
+
+/// The emission gate: `-ee` ON emits the per-sample `QuickTime:GPS*` tags from
+/// the `.ee.json` golden that `-ee` OFF suppresses (the SP3 stream is now routed
+/// through the `extract_embedded`-gated `emit_timed_samples`). The byte-exact
+/// value checks live in `tests/timed_metadata_conformance.rs`; this pins the
+/// gate itself.
+#[test]
+fn extract_embedded_on_emits_timed_gps_tags() {
+  use exifast::ParseOptions;
+  use exifast::parser::extract_info_with_options;
+
+  let data = fixture("QuickTime_gps0.mov");
+  let on = extract_info_with_options(
+    "QuickTime_gps0.mov",
+    &data,
+    true,
+    ParseOptions::default().with_extract_embedded(true),
+  );
+  let doc: serde_json::Value = serde_json::from_str(&on).expect("valid JSON");
+  let obj = doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|d| d.as_object())
+    .expect("document object");
+  assert!(
+    obj.contains_key("QuickTime:GPSLatitude"),
+    "-ee on must emit the per-sample timed GPS tags"
+  );
+}

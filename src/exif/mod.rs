@@ -3133,8 +3133,9 @@ impl crate::emit::Taggable for ExifMeta<'_> {
   /// drained by `serialize_tags`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     // `-j` (PrintConv) vs `-n` (ValueConv) maps to the `print_conv` bool the
     // EXIF emitters thread (identical to `serialize_tags`'s argument).
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
@@ -5385,7 +5386,11 @@ mod tests {
     let mut map = crate::tagmap::TagMap::new();
     // The EXIF tag stream flows through the golden-pattern engine (the same
     // `run_emission` over `ExifMeta::tags()` the document path drives).
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut map);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut map,
+    );
     let s = map.get_str("IFD0", "BitsPerSample").expect("emitted");
     assert!(
       !s.starts_with("(large array"),
@@ -5857,7 +5862,11 @@ mod tests {
     let mut map = crate::tagmap::TagMap::new();
     // The EXIF tag stream flows through the golden-pattern engine (the same
     // `run_emission` over `ExifMeta::tags()` the document path drives).
-    crate::emit::run_emission(&meta, crate::emit::ConvMode::PrintConv, &mut map);
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::PrintConv, false),
+      &mut map,
+    );
     assert_eq!(
       map.get_str("InteropIFD", "InteropIndex").as_deref(),
       Some("R98 - DCF basic file (sRGB)")

@@ -104,11 +104,88 @@ use exifast::{
 ///   accept-defer (see `tests/conformance.rs::
 ///   exif_makernote_subdirectory_deferred_conformance`, the
 ///   `SubDirKind::MakerNote` code comment, and docs/tracking.md).
+/// - `QuickTime_mebx_gps.mov` / `QuickTime_camm.mov` /
+///   `QuickTime_camm_motion.mov` / `QuickTime_camm_multipkt.mov` — the no-`ee`
+///   `.json` goldens carry the structural `Track1:MetaFormat` (`mebx`/`camm`, the
+///   `stsd` 4-char sample-description code) that the structural trak parse does
+///   not capture. The no-`ee` `[minor] ExtractEmbedded` warning + all other
+///   tags ARE byte-exact (proven, with `MetaFormat` excluded, by
+///   `tests/timed_metadata_conformance.rs::{mebx_gps,camm}_noee_warning_*` and
+///   the `camm_motion`/`camm_multipkt` `-ee` byte-exact tests); the lone
+///   `MetaFormat` gap keeps them accept-deferred here (same gap as their `-ee`
+///   byte-exact tests). The `_motion` fixture pins the camm1-4/7 MOTION telemetry
+///   emission and `_multipkt` the within-doc-last-wins `-G1` collapse.
+/// (`QuickTime_gps0.mov` is now ACTIVE — Task 10b added the per-sample
+/// [`GpsOrigin`] marker, so the no-`ee` `.json`/`.n.json` path emits the FIRST
+/// `gps0` fix + the file-level `ExifTool:Warning` byte-exactly while the
+/// `-ee`-only sources stay gated; see `tests/timed_metadata_conformance.rs`.)
+/// - `QuickTime_camm_2track.mov` / `QuickTime_mebx_camm.mov` /
+///   `QuickTime_mebx_2track.mov` — the cross-struct / multi-track GLOBAL-`Doc<N>`
+///   fixtures (#214). Each carries the same structural `Track<N>:MetaFormat` gap
+///   as the single-source `mebx`/`camm` fixtures (the `stsd` 4-char code is not
+///   captured by the structural trak parse), so the no-`ee` `.json`/`.n.json`
+///   path diverges on that lone tag. Their `-ee` global-doc behaviour + no-`ee`
+///   warning ARE byte-exact (with `MetaFormat` excluded), proven by
+///   `tests/timed_metadata_conformance.rs::{camm_2track,mebx_camm,mebx_2track}_*`;
+///   the `MetaFormat` gap keeps them accept-deferred here.
+/// - `QuickTime_camm_warn_gps.mov` — a MIXED warning+GPS-on-one-track camm
+///   fixture (sample 0 a camm0 `Track1:Warning`, sample 1 a camm5 GPS fix, with
+///   DIFFERENT sample-table SampleTimes). Carries the same structural
+///   `Track1:MetaFormat` gap as the other camm fixtures (the `stsd` 4-char code
+///   is not captured), so it is accept-deferred here; its `-ee -G1`/`-G3:1`
+///   behaviour — the warning sample's `Track1:SampleTime` FIRST-wins over the
+///   later GPS sample's at `-G1`, both docs keep their own timing at `-G3` — is
+///   byte-exact (with `MetaFormat` excluded), proven by
+///   `tests/timed_metadata_conformance.rs::camm_warn_gps_mixed_track_sample_time_first_wins_byte_exact`.
+/// - `QuickTime_camm_gps_warn.mov` / `QuickTime_camm_motion_gps.mov` — the
+///   REVERSE-order mirrors of `camm_warn_gps` (sample 0 a GPS / a MOTION packet,
+///   sample 1 the warning / a GPS fix), pinning that the `-ee -G1`
+///   `Track1:SampleTime` is the cross-kind MINIMUM-`doc()` sample's regardless of
+///   emitter KIND order. Same structural `Track1:MetaFormat` gap as the other
+///   camm fixtures (the `stsd` 4-char code is not captured), so accept-deferred
+///   here; their `-ee -G1`/`-G3:1` behaviour is byte-exact (with `MetaFormat`
+///   excluded), proven by `tests/timed_metadata_conformance.rs::{camm_gps_warn,
+///   camm_motion_gps}_reverse_order_min_doc_sample_time_byte_exact`.
+/// - `QuickTime_camm_badtype.mov` / `QuickTime_camm_emptypayload.mov` — the
+///   crafted DISPATCH-GATE fixtures (PR #61 [medium] fix): a first-packet type
+///   >7 (matches no `camm<N>` Condition → emits NOTHING) and a recognized
+///   first-packet 4-byte-only header (dispatches → `SampleTime`/`SampleDuration`
+///   only, no payload). Same structural `Track1:MetaFormat` gap as the other camm
+///   fixtures, so accept-deferred here; their `-ee -G1`/`-G3:1` behaviour is
+///   byte-exact (with `MetaFormat` excluded), proven by
+///   `tests/timed_metadata_conformance.rs::{camm_badtype_first_packet_out_of_range_emits_nothing,
+///   camm_emptypayload_recognized_first_packet_emits_timing_only}_byte_exact`.
+/// - `QuickTime_camm_dup_warn.mov` — the crafted DUPLICATE-WARNING fixture (PR #61
+///   [medium] fix): TWO warning-only camm0 samples carrying the SAME warning
+///   string, so `-ee -G3` keeps each sample's `Doc<N>` `SampleTime`/`SampleDuration`
+///   while the second `Warning` is WAS_WARNED-deduped (the surviving one gains
+///   ` [x2]`). Same structural `Track1:MetaFormat` gap as the other camm fixtures,
+///   so accept-deferred here; its `-ee -G1`/`-G3:1` behaviour is byte-exact (with
+///   `MetaFormat` excluded), proven by
+///   `tests/timed_metadata_conformance.rs::camm_dup_warn_g3_timing_before_message_dedup_byte_exact`.
 const NOT_ACTIVE: &[&str] = &[
   "AIFF_id3.aif",
   "FLAC.ogg",
   "flash_xmp_livexml.flv",
   "Exif_makernote.tif",
+  "QuickTime_mebx_gps.mov",
+  "QuickTime_mebx_keys.mov",
+  "QuickTime_mebx_detface.mov",
+  "QuickTime_camm.mov",
+  "QuickTime_camm_motion.mov",
+  "QuickTime_camm_multipkt.mov",
+  "QuickTime_camm_2track.mov",
+  "QuickTime_mebx_camm.mov",
+  "QuickTime_mebx_2track.mov",
+  "QuickTime_camm0.mov",
+  "QuickTime_camm6_frac.mov",
+  "QuickTime_camm_trunc.mov",
+  "QuickTime_camm_warn_gps.mov",
+  "QuickTime_camm_gps_warn.mov",
+  "QuickTime_camm_motion_gps.mov",
+  "QuickTime_camm_badtype.mov",
+  "QuickTime_camm_emptypayload.mov",
+  "QuickTime_camm_dup_warn.mov",
 ];
 
 /// Expected count of ACTIVE conformance fixtures (every `tests/fixtures/<f>`
@@ -409,7 +486,29 @@ const NOT_ACTIVE: &[&str] = &[
 ///     (`0x16` 300) ⇒ `Keys:GPSCoordinates` = `"300 deg 0' 0.00\" N, "`;
 ///   - `QuickTime_sp2_keys_loc_binary.mov` — `location.ISO6709` BINARY flag
 ///     (`0x00`) with raw ISO6709 bytes ⇒ parsed `Keys:GPSCoordinates` coordinates.
-const EXPECTED_ACTIVE_FIXTURES: usize = 444;
+///
+/// 444 → 447: the no-`ee` faithfulness path (Task 10) adds `.json`/`.n.json`
+/// goldens for the QuickTime timed-metadata fixtures. Three enter the active set
+/// — `QuickTime_moov_gps.mov`, `QuickTime_gps_kenwood.mov`,
+/// `QuickTime_frea_rexing17b.mov` — whose moov-`gps `-box / `GPS `-Kenwood /
+/// freeGPS-scan sources are fully `-ee`-gated (no no-`ee` warning, no no-`ee`
+/// GPS) and which exifast already matches byte-for-byte. Two timed fixtures
+/// (`QuickTime_mebx_gps.mov`, `QuickTime_camm.mov` — `MetaFormat` gap) stay
+/// accept-deferred in [`NOT_ACTIVE`].
+///
+/// 447 → 448: Task 10b adds the per-sample [`GpsOrigin`] marker, so
+/// `QuickTime_gps0.mov` becomes ACTIVE — at no-`ee` it now emits the FIRST
+/// top-level-`gps0`-box fix + the document `ExifTool:Warning` byte-exactly (the
+/// `-ee`-only sources stay gated), matching its `.json`/`.n.json` goldens.
+///
+/// 448 → 449: the `gsen` accelerometer-only fix. `Process_gsen`/`Process_3gf`
+/// open a `Doc<N>` + `HandleTag` `Accelerometer`/`TimeCode` per record with NO
+/// coordinate pair, so the shared emitter now gates on `has_emittable_data`
+/// (not `has_coordinates`); `QuickTime_gsen.mov` becomes ACTIVE — at no-`ee` it
+/// emits the FIRST `gsen` record's `QuickTime:Accelerometer` + the document
+/// `ExifTool:Warning` byte-exactly, matching its `.json`/`.n.json` goldens. The
+/// GPS sources are unaffected (`has_emittable_data == has_coordinates`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 449;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

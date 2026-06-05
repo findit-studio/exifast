@@ -1705,8 +1705,9 @@ impl crate::emit::Taggable for PngMeta<'_> {
   /// the retired `serialize_tags` emitted them.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
 
@@ -2077,7 +2078,7 @@ impl crate::emit::Taggable for PngMeta<'_> {
     {
       if let Some(exif_meta) = replay.meta() {
         if self.event_is_trailing(ei) {
-          for e in exif_meta.tags(mode) {
+          for e in exif_meta.tags(opts) {
             let unknown = e.unknown();
             let tag = e.into_tag();
             tags.push(EmittedTag::new(
@@ -2088,7 +2089,7 @@ impl crate::emit::Taggable for PngMeta<'_> {
             ));
           }
         } else {
-          tags.extend(exif_meta.tags(mode));
+          tags.extend(exif_meta.tags(opts));
         }
       }
     }
@@ -2111,7 +2112,7 @@ impl crate::emit::Taggable for PngMeta<'_> {
         continue;
       };
       if self.xmp_is_trailing(xi) {
-        for e in xmp_meta.tags(mode) {
+        for e in xmp_meta.tags(opts) {
           let unknown = e.unknown();
           let tag = e.into_tag();
           tags.push(EmittedTag::new(
@@ -2122,7 +2123,7 @@ impl crate::emit::Taggable for PngMeta<'_> {
           ));
         }
       } else {
-        tags.extend(xmp_meta.tags(mode));
+        tags.extend(xmp_meta.tags(opts));
       }
     }
 
@@ -4293,7 +4294,7 @@ mod tests {
     let bytes = png_with_text(&data);
     let meta = parse_borrowed(&bytes).expect("png parses");
     let creator = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .find(|t| t.tag().name() == "Creator")
       .expect("XMP-dc:Creator emitted from the raw-profile-xmp chunk");
     assert_eq!(creator.tag().group_ref().family0(), "XMP");

@@ -89,14 +89,18 @@ fn is_priority_zero_pseudo_tag(name: &str) -> bool {
 /// emission. Net per-insert: one `HashMap` probe + (on a new key) two inline
 /// `SmolStr` clones, vs the old heap `format!` + a growing linear scan.
 pub(crate) struct TagMap {
-  /// `(family1, name, value)` in first-occurrence order; the latest value for a
-  /// repeated `(family1, name)` replaces in place (faithful `FoundTag`
-  /// last-wins, keeping first-occurrence POSITION — `ExifTool.pm:9437-9519`).
-  entries: Vec<(SmolStr, SmolStr, TagValue)>,
-  /// `(family1, name) → index into `entries`` for O(1) dedup. The key clones
-  /// the two short `SmolStr`s (inline for ≤23 bytes — no heap), so the dedup
-  /// probe never builds the `"g:n"` string the old design allocated per insert.
-  index: HashMap<(SmolStr, SmolStr), usize>,
+  /// `(doc, family1, name, value)` in first-occurrence order; the latest value
+  /// for a repeated `(doc, family1, name)` replaces in place (faithful
+  /// `FoundTag` last-wins, keeping first-occurrence POSITION —
+  /// `ExifTool.pm:9437-9519`). The leading `doc` is the family-3 sub-document
+  /// index (`0` = Main); it widens the dedup identity so a sub-document tag
+  /// (`Doc<N>`) never collides with the same `family1:name` in another document.
+  entries: Vec<(u32, SmolStr, SmolStr, TagValue)>,
+  /// `(doc, family1, name) → index into `entries`` for O(1) dedup. The key
+  /// clones the two short `SmolStr`s (inline for ≤23 bytes — no heap), so the
+  /// dedup probe never builds the `"g:n"` string the old design allocated per
+  /// insert. The leading `doc` keeps per-sub-document tags distinct.
+  index: HashMap<(u32, SmolStr, SmolStr), usize>,
   warnings: Vec<String>,
   errors: Vec<String>,
 }
@@ -141,27 +145,32 @@ impl TagMap {
   /// therefore both ride the in-stream `tags()` path so their FoundTag order is
   /// faithful (the survivor is whichever the walk reached FIRST). Pinned by the
   /// `Matroska_warning_collision*.mkv` goldens.
-  fn insert(&mut self, group: &str, name: &str, value: TagValue) {
-    // O(1) dedup on the `(family1, name)` PAIR — no `"g:n"` string is built here
-    // (it is materialized once per surviving entry at serialization). The probe
-    // key clones the two `SmolStr`s; tag groups + names are short identifiers
-    // (`"EXIF"`/`"IFD0"`/`"Canon"`, `"MakerNoteVersion"` — all ≤23 bytes), so
-    // `SmolStr::new` stores them INLINE (a memcpy, NO heap allocation). On a
-    // MISS the freshly-built key is moved straight into the index + entries (no
-    // re-clone); on a HIT the latest value replaces in place, keeping
-    // first-occurrence POSITION (faithful `FoundTag` last-wins) — EXCEPT for the
-    // priority-0 `Warning`/`Error` pseudo-tags, where a HIT keeps the
-    // FIRST-extracted value (see the doc comment).
-    let key = (SmolStr::new(group), SmolStr::new(name));
+  fn insert(&mut self, doc: u32, group: &str, name: &str, value: TagValue) {
+    // O(1) dedup on the `(doc, family1, name)` TRIPLE — no `"g:n"` string is
+    // built here (it is materialized once per surviving entry at serialization).
+    // The probe key clones the two `SmolStr`s; tag groups + names are short
+    // identifiers (`"EXIF"`/`"IFD0"`/`"Canon"`, `"MakerNoteVersion"` — all ≤23
+    // bytes), so `SmolStr::new` stores them INLINE (a memcpy, NO heap
+    // allocation). On a MISS the freshly-built key is moved straight into the
+    // index + entries (no re-clone); on a HIT the latest value replaces in
+    // place, keeping first-occurrence POSITION (faithful `FoundTag` last-wins) —
+    // EXCEPT for the priority-0 `Warning`/`Error` pseudo-tags, where a HIT keeps
+    // the FIRST-extracted value (see the doc comment). The leading `doc` keeps a
+    // sub-document tag (`Doc<N>`) distinct from the same `family1:name` in
+    // another document; the `Warning`/`Error` first-wins exception stays keyed
+    // on `name` only (doc-agnostic — correct, it never overrides regardless).
+    let key = (doc, SmolStr::new(group), SmolStr::new(name));
     if let Some(&idx) = self.index.get(&key) {
       // `Warning`/`Error` are priority-0 ⇒ first-extracted wins (no override).
       if !is_priority_zero_pseudo_tag(name) {
-        self.entries[idx].2 = value;
+        self.entries[idx].3 = value;
       }
       return;
     }
     let idx = self.entries.len();
-    self.entries.push((key.0.clone(), key.1.clone(), value));
+    self
+      .entries
+      .push((key.0, key.1.clone(), key.2.clone(), value));
     self.index.insert(key, idx);
   }
 
@@ -191,7 +200,7 @@ impl TagMap {
     name: &str,
     value: &str,
   ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::Str(value.into()));
+    self.insert(0, group, name, TagValue::Str(value.into()));
     Ok(())
   }
 
@@ -203,7 +212,7 @@ impl TagMap {
     name: &str,
     value: u64,
   ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::U64(value));
+    self.insert(0, group, name, TagValue::U64(value));
     Ok(())
   }
 
@@ -215,7 +224,7 @@ impl TagMap {
     name: &str,
     value: i64,
   ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::I64(value));
+    self.insert(0, group, name, TagValue::I64(value));
     Ok(())
   }
 
@@ -227,7 +236,7 @@ impl TagMap {
     name: &str,
     value: f64,
   ) -> Result<(), Infallible> {
-    self.insert(group, name, TagValue::F64(value));
+    self.insert(0, group, name, TagValue::F64(value));
     Ok(())
   }
 
@@ -243,7 +252,7 @@ impl TagMap {
   ) -> Result<(), Infallible> {
     let mut s = String::new();
     let _ = f(&mut s); // in-memory String write cannot fail
-    self.insert(group, name, TagValue::Str(s.into()));
+    self.insert(0, group, name, TagValue::Str(s.into()));
     Ok(())
   }
 
@@ -260,7 +269,23 @@ impl TagMap {
     name: &str,
     value: TagValue,
   ) -> Result<(), Infallible> {
-    self.insert(group, name, value);
+    self.insert(0, group, name, value);
+    Ok(())
+  }
+
+  /// Emit a pre-built [`TagValue`] under a specific family-3 sub-document
+  /// (`doc==0` is Main, identical to [`write_value`](Self::write_value)). The
+  /// doc widens the dedup identity so a per-sample (`Doc<N>`) tag never collides
+  /// with the same `family1:name` in another document — the doc-aware entry
+  /// point for the timed-metadata (`-ee`) walkers.
+  pub(crate) fn write_value_doc(
+    &mut self,
+    doc: u32,
+    group: &str,
+    name: &str,
+    value: TagValue,
+  ) -> Result<(), Infallible> {
+    self.insert(doc, group, name, value);
     Ok(())
   }
 
@@ -276,12 +301,14 @@ impl TagMap {
     Ok(())
   }
 
-  /// The collected format-tag entries `(family1, name, value)` in
+  /// The collected format-tag entries `(doc, family1, name, value)` in
   /// first-occurrence order (last-wins dedup already applied). The consumer
-  /// builds the `"<family1>:<name>"` JSON key ONCE per entry here (not per
-  /// emission). Slice view of the backing `Vec` (§3: never expose `&Vec<T>`).
+  /// builds the JSON key ONCE per entry here via
+  /// [`crate::serialize_key::group_key`] (not per emission) — `-G1` collapses
+  /// the leading `doc`, `-G3` renders it as a `Doc<N>:` prefix. Slice view of
+  /// the backing `Vec` (§3: never expose `&Vec<T>`).
   #[inline(always)]
-  pub(crate) const fn entries(&self) -> &[(SmolStr, SmolStr, TagValue)] {
+  pub(crate) const fn entries(&self) -> &[(u32, SmolStr, SmolStr, TagValue)] {
     self.entries.as_slice()
   }
 
@@ -308,8 +335,8 @@ impl TagMap {
   /// emitted. Uses the O(1) dedup index.
   #[cfg(test)]
   pub(crate) fn get(&self, group: &str, name: &str) -> Option<&TagValue> {
-    let key = (SmolStr::new(group), SmolStr::new(name));
-    self.index.get(&key).map(|&idx| &self.entries[idx].2)
+    let key = (0u32, SmolStr::new(group), SmolStr::new(name));
+    self.index.get(&key).map(|&idx| &self.entries[idx].3)
   }
 
   /// `true` if no tags / warnings / errors were emitted (test-only).
@@ -350,5 +377,26 @@ impl TagMap {
       }
       TagValue::List(_) | TagValue::Map(_) => std::format!("{v:?}"),
     })
+  }
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn tagmap_dedup_is_doc_aware() {
+    let mut m = TagMap::new();
+    m.write_value_doc(1, "QuickTime", "GPSLatitude", TagValue::F64(47.0))
+      .unwrap();
+    m.write_value_doc(2, "QuickTime", "GPSLatitude", TagValue::F64(-33.0))
+      .unwrap();
+    m.write_value_doc(0, "QuickTime", "TimeScale", TagValue::U64(600))
+      .unwrap();
+    m.write_value_doc(0, "QuickTime", "TimeScale", TagValue::U64(1000))
+      .unwrap();
+    assert_eq!(m.entries().len(), 3);
+    let doc2 = m.entries().iter().filter(|(d, _, _, _)| *d == 2).count();
+    assert_eq!(doc2, 1);
   }
 }

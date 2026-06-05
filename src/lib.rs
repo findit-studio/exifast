@@ -116,6 +116,13 @@ pub mod formats;
 // `QuickTimeMeta`). Unconditional — pure typed data with no serde/json
 // dependency; the QuickTime port's `from_quicktime` projection lives here.
 pub mod metadata;
+// Render-time options (`ParseOptions`) mirroring ExifTool flags that gate the
+// EMITTED tag stream, not the always-on typed domain extraction (the parse
+// walkers extract per-sample data unconditionally). Threaded along the SAME
+// path as the `-j`/`-n` `print_conv` toggle: `extract_info_with_options` /
+// `Rendered::new_with_options` → `serialize_tags` → `EmitOptions`. Unconditional
+// — a tiny `Copy` value-type with no heap or feature dependency.
+pub mod options;
 // `jsondiff` (value-semantic golden-diff oracle) and `serialize` (the
 // `serde_json` document renderer) depend on `serde_json` + `serde`, gated on
 // the `json` feature (`json = ["serde", "alloc", "dep:serde_json", "dep:serde"]`).
@@ -142,6 +149,12 @@ pub mod format_parser;
 pub mod processbinarydata;
 #[cfg(feature = "json")]
 pub mod serialize;
+// The single group-key join (`-G1` doc-collapse / `-G3` `Doc<N>:` prefix)
+// shared by every JSON serializer. `pub(crate)`, `alloc`-gated (the `group_key`
+// join builds an owned `String`, and every serializer that calls it is itself
+// `json`- or `serde`+`alloc`-gated).
+#[cfg(feature = "alloc")]
+pub(crate) mod serialize_key;
 // The single inline tag-collection sink the typed-Meta rendering path emits
 // into (replaces the removed `TagWriter`/`MetaSinker` trait pair and the
 // `JsonTagWriter`/`MapTagWriter` collectors). `pub(crate)`, `alloc`-gated so
@@ -152,6 +165,7 @@ pub mod tagtable;
 pub mod value;
 
 pub use error::{Error, OutOfBounds, Result, UnexpectedEof};
+pub use options::ParseOptions;
 pub use value::{Group, Metadata, Rational, Tag, TagValue};
 
 // The normalized cross-format domain layer (golden pattern L2). Re-exported
@@ -165,7 +179,7 @@ pub use metadata::{MediaMetadata, Project};
 // it writes into the crate-private `TagMap` sink). `alloc`-gated to match the
 // `emit` module.
 #[cfg(feature = "alloc")]
-pub use emit::{ConvMode, EmittedTag, Taggable};
+pub use emit::{ConvMode, EmitOptions, EmittedTag, Taggable};
 
 // The diagnostic-framework public surface (`run_diagnostics` stays `pub(crate)`
 // — it writes into the crate-private `TagMap` sink). `alloc`-gated to match the

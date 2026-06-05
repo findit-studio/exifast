@@ -3162,8 +3162,9 @@ impl crate::emit::Taggable for MxfMeta<'_> {
   /// `taggable_yields_unknown_but_engine_suppresses` test).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     let mut tags: Vec<EmittedTag> = Vec::with_capacity(self.entries.len());
@@ -3594,7 +3595,7 @@ mod tests {
   #[cfg(feature = "alloc")]
   fn emit_into_tagmap(meta: &MxfMeta<'_>, mode: crate::emit::ConvMode) -> crate::tagmap::TagMap {
     let mut w = crate::tagmap::TagMap::new();
-    crate::emit::run_emission(meta, mode, &mut w);
+    crate::emit::run_emission(meta, crate::emit::EmitOptions::g1(mode, false), &mut w);
     w
   }
 
@@ -3668,7 +3669,9 @@ mod tests {
     ))
     .expect("read fixture");
     let meta = parse_borrowed(&bytes).expect("accepted");
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     // Every production entry is visible (the walk pre-filters Unknown rows).
     assert!(tags.iter().all(|t| !t.unknown()));
     // family0 is the constant "MXF" table group; family1 is the per-entry
@@ -3718,7 +3721,9 @@ mod tests {
     };
 
     // `tags()` yields BOTH entries, the second flagged unknown.
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert_eq!(tags.len(), 2);
     let hidden = tags
       .iter()

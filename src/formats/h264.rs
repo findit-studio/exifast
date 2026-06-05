@@ -3075,8 +3075,9 @@ impl crate::emit::Taggable for H264Meta<'_> {
   /// `docs/tracking.md` for the scoped `-a` duplicate-copy follow-up.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     use crate::emit::EmittedTag;
     use crate::value::{Group, TagValue};
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
@@ -3236,7 +3237,7 @@ mod tests {
     let mut w = crate::tagmap::TagMap::new();
     crate::emit::run_emission(
       meta,
-      crate::emit::ConvMode::from_print_conv(print_conv),
+      crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false),
       &mut w,
     );
     for warn in meta.warnings() {
@@ -3506,7 +3507,7 @@ mod tests {
     let wb_keys = j
       .entries()
       .iter()
-      .filter(|(_, n, _)| n.contains("WhiteBalance"))
+      .filter(|(_, _, n, _)| n.contains("WhiteBalance"))
       .count();
     assert_eq!(wb_keys, 1, "only the priority winner is emitted");
   }
@@ -4321,7 +4322,9 @@ mod tests {
     use crate::emit::{ConvMode, Taggable};
     let data = avchd_fixture();
     let meta = parse_borrowed(&data).unwrap();
-    let tags: Vec<_> = meta.tags(ConvMode::PrintConv).collect();
+    let tags: Vec<_> = meta
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
+      .collect();
     assert!(!tags.is_empty(), "the MDPM block must yield tags");
     // No H264 table row is `Unknown => 1`.
     assert!(tags.iter().all(|t| !t.unknown()));
@@ -4346,7 +4349,7 @@ mod tests {
     let data = avchd_fixture();
     let meta = parse_borrowed(&data).unwrap();
     let wb_count = meta
-      .tags(ConvMode::PrintConv)
+      .tags(crate::emit::EmitOptions::g1(ConvMode::PrintConv, false))
       .filter(|t| t.tag().name() == "WhiteBalance")
       .count();
     assert_eq!(wb_count, 1, "the visibility filter yields one winner");

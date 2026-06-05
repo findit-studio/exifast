@@ -2090,8 +2090,9 @@ impl crate::emit::Taggable for RiffMeta<'_> {
   /// `unknown: false`.
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
+    let mode = opts.mode;
     let print_conv = matches!(mode, crate::emit::ConvMode::PrintConv);
     let mut tags: Vec<crate::emit::EmittedTag> = Vec::with_capacity(self.entries.len());
     for entry in &self.entries {

@@ -536,7 +536,7 @@ impl AnyMeta<'_> {
   /// [`serialize_tags`](Self::serialize_tags) (the `-j`/`-n` JSON path) and
   /// [`iter_tags`](Self::iter_tags) (the public generic-extraction path).
   ///
-  /// Each arm is exactly `m.tags(mode).collect()` — the format's
+  /// Each arm is exactly `m.tags(opts).collect()` — the format's
   /// [`Taggable`](crate::emit::Taggable) stream, already rendered for `mode`
   /// (PrintConv vs ValueConv), with each sub-Meta's tags spliced in the
   /// faithful `FoundTag` order inside its own `tags()`. NO warning/error
@@ -548,86 +548,89 @@ impl AnyMeta<'_> {
   /// arms), and when NO format feature is on (only the `_Phantom` arm, Codex
   /// CF3). The `all-formats` default takes the former path; the phantom arm
   /// keeps the no-format build type-checking.
-  fn collect_emitted(&self, mode: crate::emit::ConvMode) -> std::vec::Vec<crate::emit::EmittedTag> {
+  fn collect_emitted(
+    &self,
+    opts: crate::emit::EmitOptions,
+  ) -> std::vec::Vec<crate::emit::EmittedTag> {
     use crate::emit::Taggable as _;
     match self {
       #[cfg(feature = "moi")]
-      AnyMeta::Moi(m) => m.tags(mode).collect(),
+      AnyMeta::Moi(m) => m.tags(opts).collect(),
       #[cfg(feature = "aac")]
-      AnyMeta::Aac(m) => m.tags(mode).collect(),
+      AnyMeta::Aac(m) => m.tags(opts).collect(),
       // DV: only the `Meta` variant yields tags; `UnrecognizedProfile`
       // (DV.pm:188 — Warn + return 1 without DV:* tags) yields NONE — its
       // warning is drained by `drain_diagnostics`.
       #[cfg(feature = "dv")]
       AnyMeta::Dv(o) => match o {
         crate::formats::dv::ParseOutcome::UnrecognizedProfile => std::vec::Vec::new(),
-        crate::formats::dv::ParseOutcome::Meta(m) => m.tags(mode).collect(),
+        crate::formats::dv::ParseOutcome::Meta(m) => m.tags(opts).collect(),
       },
       #[cfg(feature = "audible")]
-      AnyMeta::Aa(m) => m.tags(mode).collect(),
+      AnyMeta::Aa(m) => m.tags(opts).collect(),
       #[cfg(feature = "crw")]
-      AnyMeta::Crw(m) => m.tags(mode).collect(),
+      AnyMeta::Crw(m) => m.tags(opts).collect(),
       #[cfg(feature = "red")]
-      AnyMeta::R3d(m) => m.tags(mode).collect(),
+      AnyMeta::R3d(m) => m.tags(opts).collect(),
       #[cfg(feature = "id3")]
-      AnyMeta::Id3(m) => m.tags(mode).collect(),
+      AnyMeta::Id3(m) => m.tags(opts).collect(),
       #[cfg(feature = "m2ts")]
-      AnyMeta::M2ts(m) => m.tags(mode).collect(),
+      AnyMeta::M2ts(m) => m.tags(opts).collect(),
       #[cfg(feature = "mp3")]
-      AnyMeta::Mp3(m) => m.tags(mode).collect(),
+      AnyMeta::Mp3(m) => m.tags(opts).collect(),
       #[cfg(feature = "aiff")]
-      AnyMeta::Aiff(m) => m.tags(mode).collect(),
+      AnyMeta::Aiff(m) => m.tags(opts).collect(),
       #[cfg(feature = "ape")]
-      AnyMeta::Ape(m) => m.tags(mode).collect(),
+      AnyMeta::Ape(m) => m.tags(opts).collect(),
       #[cfg(feature = "dsf")]
-      AnyMeta::Dsf(m) => m.tags(mode).collect(),
+      AnyMeta::Dsf(m) => m.tags(opts).collect(),
       #[cfg(feature = "flac")]
-      AnyMeta::Flac(m) => m.tags(mode).collect(),
+      AnyMeta::Flac(m) => m.tags(opts).collect(),
       #[cfg(feature = "h264")]
-      AnyMeta::H264(m) => m.tags(mode).collect(),
+      AnyMeta::H264(m) => m.tags(opts).collect(),
       #[cfg(feature = "flash")]
-      AnyMeta::Flv(m) => m.tags(mode).collect(),
+      AnyMeta::Flv(m) => m.tags(opts).collect(),
       #[cfg(feature = "ogg")]
-      AnyMeta::Ogg(m) => m.tags(mode).collect(),
+      AnyMeta::Ogg(m) => m.tags(opts).collect(),
       #[cfg(feature = "png")]
-      AnyMeta::Png(m) => m.tags(mode).collect(),
+      AnyMeta::Png(m) => m.tags(opts).collect(),
       #[cfg(feature = "real")]
-      AnyMeta::Real(m) => m.tags(mode).collect(),
+      AnyMeta::Real(m) => m.tags(opts).collect(),
       #[cfg(feature = "mpeg-audio")]
-      AnyMeta::MpegAudio(m) => m.tags(mode).collect(),
+      AnyMeta::MpegAudio(m) => m.tags(opts).collect(),
       #[cfg(feature = "mpc")]
-      AnyMeta::Mpc(m) => m.tags(mode).collect(),
+      AnyMeta::Mpc(m) => m.tags(opts).collect(),
       #[cfg(feature = "wavpack")]
-      AnyMeta::Wv(m) => m.tags(mode).collect(),
+      AnyMeta::Wv(m) => m.tags(opts).collect(),
       #[cfg(feature = "matroska")]
-      AnyMeta::Matroska(m) => m.tags(mode).collect(),
+      AnyMeta::Matroska(m) => m.tags(opts).collect(),
       #[cfg(feature = "quicktime")]
-      AnyMeta::QuickTime(m) => m.tags(mode).collect(),
+      AnyMeta::QuickTime(m) => m.tags(opts).collect(),
       #[cfg(feature = "mxf")]
-      AnyMeta::Mxf(m) => m.tags(mode).collect(),
+      AnyMeta::Mxf(m) => m.tags(opts).collect(),
       // PLIST: `tags()` yields the recognized-PLIST error tag (binary
       // `PLIST:Error`, family-1 — a TAG not a diagnostic), then the walk-order
       // plist tags (PLIST / XML family-1), each leaf already rendered for the
       // mode. The AAE inflate `$et->Warn` is a diagnostic (drained in
       // `drain_diagnostics`), NOT a tag.
       #[cfg(feature = "plist")]
-      AnyMeta::Plist(m) => m.tags(mode).collect(),
+      AnyMeta::Plist(m) => m.tags(opts).collect(),
       // EXIF's `tags()` yields `File:ExifByteOrder` first (when a TIFF block
       // was processed), then the IFD-walk entries, then the MakerNote vendor
       // emissions — uniform with every other format.
       #[cfg(feature = "exif")]
-      AnyMeta::Exif(m) => m.tags(mode).collect(),
+      AnyMeta::Exif(m) => m.tags(opts).collect(),
       // RIFF: `tags()` yields the AVI sub-table entries (RIFF / File family-1,
       // each leaf already rendered for the mode) in file order — uniform with
       // every other format.
       #[cfg(feature = "riff")]
-      AnyMeta::Riff(m) => m.tags(mode).collect(),
+      AnyMeta::Riff(m) => m.tags(opts).collect(),
       // XMP: `tags()` yields the extracted XMP tags in `FoundTag` order
       // (family-0 "XMP", family-1 the namespace group `XMP-exif` / `XMP-dc`
       // / …), each leaf already rendered for the mode. The decode/walk
       // `$et->Warn` is a diagnostic (drained in `Diagnose`), NOT a tag.
       #[cfg(feature = "xmp")]
-      AnyMeta::Xmp(m) => m.tags(mode).collect(),
+      AnyMeta::Xmp(m) => m.tags(opts).collect(),
       // No-format build: the only variant is the uninhabitable phantom
       // (Codex CF3). `PhantomData` carries no data; the arm exists purely
       // for exhaustiveness and yields no tags.
@@ -661,7 +664,7 @@ impl AnyMeta<'_> {
         feature = "xmp",
       )))]
       AnyMeta::_Phantom(_) => {
-        let _ = mode;
+        let _ = opts;
         std::vec::Vec::new()
       }
     }
@@ -685,8 +688,11 @@ impl AnyMeta<'_> {
     &self,
     mode: crate::emit::ConvMode,
   ) -> impl Iterator<Item = crate::value::Tag> + '_ {
+    // The generic-extraction path is the `-G1` default; `-ee` defaults off until
+    // the ParseOptions task threads the real flag.
+    let opts = crate::emit::EmitOptions::g1(mode, false);
     let mut out: std::vec::Vec<crate::value::Tag> = std::vec::Vec::new();
-    for e in self.collect_emitted(mode) {
+    for e in self.collect_emitted(opts) {
       // Unknown-suppression — ExifTool's default output omits `Unknown=>1`
       // tags (`ExifTool.pm:9179`); identical to `run_emission`'s gate.
       if e.unknown() {
@@ -722,7 +728,11 @@ impl AnyMeta<'_> {
   /// [`drain_diagnostics`](Self::drain_diagnostics).
   ///
   /// `print_conv = true` emits PrintConv strings (`-j`); `false` emits
-  /// post-ValueConv raw scalars (`-n`). Infallible.
+  /// post-ValueConv raw scalars (`-n`). `extract_embedded` mirrors ExifTool
+  /// `-ee` (default `false` ⇒ byte-identical to the prior hard-coded baseline);
+  /// it is threaded into [`EmitOptions`](crate::emit::EmitOptions) and consumed
+  /// by the timed-metadata emitters at render time (parsing is always-extract).
+  /// Infallible.
   ///
   /// The tag write is driven by the canonical engine
   /// [`run_emission`](crate::emit::run_emission) over this `AnyMeta`'s
@@ -738,10 +748,16 @@ impl AnyMeta<'_> {
   pub(crate) fn serialize_tags(
     &self,
     print_conv: bool,
+    extract_embedded: bool,
+    group_mode: crate::serialize_key::GroupMode,
     out: &mut crate::tagmap::TagMap,
   ) -> Result<(), core::convert::Infallible> {
-    let mode = crate::emit::ConvMode::from_print_conv(print_conv);
-    crate::emit::run_emission(self, mode, out);
+    let opts = crate::emit::EmitOptions::with_group_mode(
+      crate::emit::ConvMode::from_print_conv(print_conv),
+      extract_embedded,
+      group_mode,
+    );
+    crate::emit::run_emission(self, opts, out);
     crate::diagnostics::run_diagnostics(self, out);
     Ok(())
   }
@@ -906,9 +922,9 @@ impl crate::emit::Taggable for AnyMeta<'_> {
   /// separately by [`drain_diagnostics`](AnyMeta::drain_diagnostics).
   fn tags(
     &self,
-    mode: crate::emit::ConvMode,
+    opts: crate::emit::EmitOptions,
   ) -> impl Iterator<Item = crate::emit::EmittedTag> + '_ {
-    self.collect_emitted(mode).into_iter()
+    self.collect_emitted(opts).into_iter()
   }
 }
 
@@ -1443,6 +1459,15 @@ impl AnyMeta<'_> {
 pub struct Rendered<'a, 'm> {
   meta: &'a AnyMeta<'m>,
   print_conv: bool,
+  /// ExifTool `-ee` (extract embedded): gates per-sample timed-metadata
+  /// emission. `Rendered::new` defaults it `false` (the faithful
+  /// `perl exiftool -j -G1` baseline); set via [`Rendered::new_with_options`].
+  /// Threaded into `serialize_tags` → `EmitOptions`; parsing is always-extract.
+  extract_embedded: bool,
+  /// The group-key form the serializer renders: `-G1` (collapse the family-3
+  /// `doc` axis — the conformance golden form) vs `-G3` (`Doc<N>:` prefix).
+  /// `Rendered::new` defaults to `G1`, matching the engine's `extract_info`.
+  group_mode: crate::serialize_key::GroupMode,
 }
 
 #[cfg(all(feature = "serde", feature = "alloc"))]
@@ -1450,10 +1475,33 @@ pub struct Rendered<'a, 'm> {
 impl<'a, 'm> Rendered<'a, 'm> {
   /// Wrap `meta` for serialization in the given mode (`print_conv = true` ⇒
   /// `-j` PrintConv strings; `false` ⇒ `-n` raw post-ValueConv scalars).
+  /// `extract_embedded` defaults `false` (the faithful baseline); use
+  /// [`new_with_options`](Self::new_with_options) to set ExifTool `-ee`.
   #[must_use]
   #[inline(always)]
   pub const fn new(meta: &'a AnyMeta<'m>, print_conv: bool) -> Self {
-    Self { meta, print_conv }
+    Self::new_with_options(meta, print_conv, false)
+  }
+
+  /// Wrap `meta` like [`new`](Self::new) but also set ExifTool `-ee`
+  /// (`extract_embedded`): `true` ⇒ emit the per-sample timed-metadata tags;
+  /// `false` ⇒ the faithful baseline (no per-sample tags, the
+  /// `[minor] ExtractEmbedded` warning instead). The flag is threaded into
+  /// `serialize_tags` → `EmitOptions` and consumed at render time — the typed
+  /// per-sample data is parsed unconditionally either way.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new_with_options(
+    meta: &'a AnyMeta<'m>,
+    print_conv: bool,
+    extract_embedded: bool,
+  ) -> Self {
+    Self {
+      meta,
+      print_conv,
+      extract_embedded,
+      group_mode: crate::serialize_key::GroupMode::G1,
+    }
   }
 
   /// The wrapped Meta.
@@ -1468,6 +1516,14 @@ impl<'a, 'm> Rendered<'a, 'm> {
   #[inline(always)]
   pub const fn print_conv(&self) -> bool {
     self.print_conv
+  }
+
+  /// Whether ExifTool `-ee` (extract embedded) per-sample emission is enabled
+  /// (default `false`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn extract_embedded(&self) -> bool {
+    self.extract_embedded
   }
 }
 
@@ -1489,7 +1545,12 @@ const _: () = {
       // typed-path tag emission). `Rendered` emits only the format tags, not
       // the orchestration triplet. `serialize_tags` is infallible.
       let mut tm = TagMap::new();
-      let _ = self.meta.serialize_tags(self.print_conv, &mut tm);
+      let _ = self.meta.serialize_tags(
+        self.print_conv,
+        self.extract_embedded,
+        self.group_mode,
+        &mut tm,
+      );
       let entries = tm.entries();
       // The FIRST `$et->Warn` surfaces as `ExifTool:Warning`, faithful to
       // the full document serializer (`serialize.rs:134-138`). `Rendered`
@@ -1498,16 +1559,13 @@ const _: () = {
       let warning = tm.first_warning();
       let extra = usize::from(warning.is_some());
       let mut map = s.serialize_map(Some(entries.len() + extra))?;
-      // Build the `"<family1>:<name>"` JSON key ONCE per surviving entry (P1+P4:
-      // the `TagMap` no longer carries a per-insert combined key). A single
-      // reused `String` buffer (cleared each turn) avoids a per-entry alloc.
+      // Build the JSON key ONCE per surviving entry via the shared `group_key`
+      // join (P1+P4: the `TagMap` no longer carries a per-insert combined key) —
+      // `-G1` collapses the leading `doc`, `-G3` prefixes `Doc<N>:`.
+      let group_mode = self.group_mode;
       let mut key = std::string::String::new();
-      for (group, name, value) in entries {
-        key.clear();
-        key.reserve(group.len() + 1 + name.len());
-        key.push_str(group);
-        key.push(':');
-        key.push_str(name);
+      for (doc, group, name, value) in entries {
+        crate::serialize_key::group_key_into(&mut key, *doc, group, name, group_mode);
         map.serialize_entry(key.as_str(), value)?;
       }
       if let Some(w) = warning {
