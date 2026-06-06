@@ -22,6 +22,7 @@
 //! deliberately extensible.
 
 mod android_camm;
+mod canon_ctmd;
 #[cfg(feature = "crw")]
 pub(crate) mod crw;
 mod domain;
@@ -41,6 +42,10 @@ pub(crate) mod riff;
 
 pub use android_camm::{
   CammAngleAxis, CammExposure, CammGpsSample, CammMeta, CammTimingOnly, CammVector3, CammWarning,
+};
+pub use canon_ctmd::{
+  CanonCtmdExposure, CanonCtmdFocal, CanonCtmdMeta, CanonCtmdSample, CanonCtmdWarning,
+  CtmdExifInfo, CtmdExifTag,
 };
 #[cfg(feature = "crw")]
 pub use crw::{

@@ -452,7 +452,99 @@ const NOT_ACTIVE: &[&str] = &[
 /// malformed pre-NUL bytes through the engine's faithful `fix_utf8`, one ASCII
 /// `?` per bad byte, so the tag is PRESENT not dropped) = 484. Every one is
 /// byte-exact end-to-end with NO exclusion.
-const EXPECTED_ACTIVE_FIXTURES: usize = 484;
+///
+/// 484 → 485: the Canon CTMD timed-metadata fixture
+/// `QuickTime_canon_ctmd.mov` (T3+T4). Like the Sony `rtmd` fixtures it is a
+/// `meta`-handler `CTMD` trak whose per-sample emission is fully `-ee`-gated;
+/// at no-`ee` it emits the structural `Track1:MetaFormat` (`CTMD`) + the
+/// document `ExifTool:Warning` byte-exactly, matching its `.json`/`.n.json`
+/// goldens.
+///
+/// 485 → 490: the five Canon CTMD fixtures —
+/// `QuickTime_canon_ctmd_rational.mov` (rational32u `-n` %.7g precision),
+/// `QuickTime_canon_ctmd_warn_{short,trunc,residue}.mov` (the three ProcessCTMD
+/// `Doc<N>:Track<N>:Warning`s) and `QuickTime_canon_ctmd_shortts.mov` (the
+/// short-`TimeStamp` partial unpack + RawConv warnings). All are `-ee`-gated
+/// `CTMD` traks, so at no-`ee` each emits only the structural `MetaFormat` + the
+/// document `ExifTool:Warning`, byte-exact vs its `.json`/`.n.json` goldens.
+///
+/// 490 → 491: the Canon CTMD `ExifInfo7/8/9` re-dispatch fixture
+/// `QuickTime_canon_ctmd_exifinfo.mov` (#82) — a type-7 record whose
+/// `ProcessExifInfo` payload carries a `0x8769` ExifIFD (ExposureTime + ISO) and
+/// a `0x927c` MakerNoteCanon (CanonFirmwareVersion) embedded TIFF, re-dispatched
+/// into the Exif / Canon-MakerNote walkers. The `-ee` goldens pin the bundled
+/// re-stamped groups (`EXIF:ExifIFD` / `MakerNotes:Track<N>` /
+/// `File:Track<N>` ExifByteOrder); at no-`ee` it emits only the structural
+/// `MetaFormat` + the document `ExifTool:Warning`, byte-exact vs its
+/// `.json`/`.n.json` goldens.
+///
+/// 492 → 494: the bad-embedded-TIFF diagnostics fixtures
+/// `QuickTime_canon_ctmd_badexif.mov` (a type-7 `0x8769` block with a valid
+/// header but a bad IFD0 offset ⇒ `Track1:ExifByteOrder` + the non-minor `Bad
+/// ExifIFD directory`) and `QuickTime_canon_ctmd_badmn.mov` (the `0x927c`
+/// MakerNote counterpart ⇒ the MINOR `[minor] Bad MakerNotes directory`, no
+/// ExifByteOrder). At no-`ee` both emit only the structural `MetaFormat` + the
+/// document `ExifTool:Warning`, byte-exact vs their `.json`/`.n.json` goldens.
+///
+/// 494 → 496: the Canon CTMD fixtures —
+/// `QuickTime_canon_ctmd_badmn_nested.mov` (a type-7 `0x927c` block whose
+/// readable IFD0 carries a bogus `0x8769` pointer that `Canon::Main` never
+/// follows ⇒ `CanonFirmwareVersion` decodes, NO spurious nested `Bad ExifIFD
+/// directory`) and `QuickTime_canon_ctmd_partialdup.mov` (a full type-5
+/// ExposureInfo followed by an 8-byte then a 4-byte type-5 ⇒ per-field
+/// duplicate merge: FNumber 5.6 / ExposureTime 1/250 / ISO 12800). Both are
+/// `-ee`-gated `CTMD` traks, so at no-`ee` each emits only the structural
+/// `MetaFormat` + the document `ExifTool:Warning`, byte-exact vs its
+/// `.json`/`.n.json` goldens.
+///
+/// 496 → 497: the Canon CTMD nested-sub-IFD fixture
+/// `QuickTime_canon_ctmd_exifinfo_nested.mov` — a type-7 `0x8769` ExifIFD block
+/// whose IFD0 carries ExposureTime + ISO AND a `0xa005` InteropOffset → a nested
+/// InteropIFD (`InteropIndex` "R98"). The `0x8769` re-dispatch keeps the nested
+/// sub-IFD's DirName intact (`EXIF:InteropIFD:InteropIndex`, NOT collapsed to
+/// `ExifIFD`) while the top-level IFD0 tags stay `EXIF:ExifIFD`. An `-ee`-gated
+/// `CTMD` trak, so at no-`ee` it emits only the structural `MetaFormat` + the
+/// document `ExifTool:Warning`, byte-exact vs its `.json`/`.n.json` goldens.
+///
+/// 497 → 498: the Canon CTMD `0x8769`-Model-hand-off fixture
+/// `QuickTime_canon_ctmd_exifinfo_model.mov` — a type-7 sample whose `0x8769`
+/// ExifIFD IFD0 `Model` ("Canon EOS R5") sets `$$self{Model}`, followed by a
+/// `0x927c` MakerNoteCanon whose `Canon::ShotInfo` decode keys the MODEL-
+/// CONDITIONAL `CameraTemperature` on it (Doc1 "30 C"), plus a SECOND `0x927c`-only
+/// sample proving `$$self{Model}` is sticky across CTMD samples (Doc2 "72 C").
+/// An `-ee`-gated `CTMD` trak, so at no-`ee` it emits only the structural
+/// `MetaFormat` + the document `ExifTool:Warning`, byte-exact vs its
+/// `.json`/`.n.json` goldens.
+///
+/// 498 → 501: three Canon CTMD crafted-edge fixtures (all `-ee`-gated
+/// `CTMD` traks, no-`ee` emitting only the structural `MetaFormat` + the document
+/// `ExifTool:Warning`):
+/// - `QuickTime_canon_ctmd_exifinfo_dupmodel.mov` (R6-1) — a `0x8769` ExifIFD
+///   IFD0 with TWO `Model` tags (non-EOS then "Canon EOS R5"); the LAST (EOS)
+///   wins `$$self{Model}` (Exif.pm:599 `$$self{Model} = $val` each time), so the
+///   following `0x927c` `Canon::ShotInfo` `CameraTemperature` fires ("30 C").
+/// - `QuickTime_canon_ctmd_badmnval.mov` (R6-2) — a `0x927c` MakerNoteCanon IFD0
+///   whose `CanonFirmwareVersion` value pointer is past EOF ⇒ `[minor] Bad offset
+///   for MakerNotes CanonFirmwareVersion`.
+/// - `QuickTime_canon_ctmd_badmnsusp.mov` (R6-2) — the same with an in-bounds
+///   directory-overlapping pointer ⇒ `[minor] Suspicious MakerNotes offset for
+///   CanonFirmwareVersion`.
+/// - The IFD-validation crafted edges (`+8`): a `0x927c` suspect offset
+///   with a `0`-byte (`…_badmnsusp_tail0`) and `2`-byte (`…_tail2`) IFD tail (the
+///   R8 case — `Suspicious MakerNotes offset` now fires alongside the emission
+///   skip); the illegal `1`-/`3`-byte tails (`…_badmn_tail1`/`…_tail3` ⇒ NON-minor
+///   `Illegal MakerNotes directory size`); a bad-format entry 0 (`…_badmnfmt0`)
+///   and entry 1 (`…_badmnfmt1`); a count-overflow (`…_badmnsize` ⇒ `Invalid
+///   size`); and the `0x8769` no-RAF `Bad offset for ExifIFD` + later-entry-survives
+///   case (`…_badexifval`).
+/// - The ProcessExif edges (`+5`): the `$warnCount > 10`
+///   directory abort on the `0x927c` MakerNote (`…_warnmany_mn` — a later valid
+///   entry is suppressed) and the `0x8769` ExifIFD (`…_warnmany_exif`); plus the
+///   removal of the synthetic zero-entry / `>1024` directory rejects — a ZERO-entry
+///   `1`/`3`-byte-tail MakerNote (`…_badmn_zero_tail1`/`…_tail3` ⇒ `Illegal
+///   MakerNotes directory size (0 entries)`) and a `>1024`-entry in-bounds
+///   directory that is fully WALKED (`…_mn_manyentries`).
+const EXPECTED_ACTIVE_FIXTURES: usize = 514;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

@@ -24,8 +24,235 @@
 #![deny(clippy::indexing_slicing)]
 
 use super::printconv;
-use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
+use crate::exif::ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, read_value};
 use std::vec::Vec;
+
+/// The directory-shape decision shared by the Canon `0x927c` emission walk
+/// ([`walk_canon_in_tiff`]) and the CTMD diagnostic walk
+/// ([`super::redispatch_ctmd_makernote_value_offset_diagnostics`]). This is the
+/// 1:1 port of `ProcessExif`'s directory framing (`Exif.pm:6343-6400`) for the
+/// in-memory, no-RAF, `$inMakerNotes = 1` Canon::Main re-dispatch — so the
+/// emission SKIP and the WARNING are driven by ONE predicate and can never
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonDirShape {
+  /// Walk `num_entries`; the directory ends at `dir_end` (`$dirEnd`,
+  /// `Exif.pm:6391`). Reached for a readable directory whose
+  /// `$bytesFromEnd` is `0`, `2`, or `>= 4` (`Exif.pm:6395-6399`).
+  Walk { num_entries: usize, dir_end: usize },
+  /// Abort with NO warning here — the structural path already raised
+  /// `Bad <dir> directory` (`Exif.pm:6383`): the IFD0 count is unreadable, or
+  /// the directory overruns the block (`$dirEnd > $dataLen`,
+  /// `Exif.pm:6356`; for the `$inMakerNotes = 0` framing the generic walker
+  /// reuses, an overrun aborts rather than salvages).
+  AbortBadDirectory,
+  /// Abort AND raise `Illegal <dir> directory size (<n> entries)`
+  /// (`Exif.pm:6397`) — a `$bytesFromEnd` of `1` or `3`. NON-minor (the Perl
+  /// `$et->Warn` carries no minor arg).
+  AbortIllegalSize { num_entries: usize },
+}
+
+/// Classify the IFD directory shape for a Canon `0x927c` re-dispatch
+/// (`ProcessExif`, `Exif.pm:6343-6400`). `dir_start` is the IFD0 offset within
+/// `tiff_data`; `data_len` is the re-dispatched block length (`$dataLen`,
+/// i.e. `tiff_data.len()` — the CTMD block is framed with `$dataPos == 0`).
+///
+/// Mirrors the in-memory, no-RAF path: an unreadable count or an overrunning
+/// directory is [`CanonDirShape::AbortBadDirectory`] (the structural path warns
+/// `Bad <dir> directory`); a `1`/`3`-byte tail is
+/// [`CanonDirShape::AbortIllegalSize`]; a `0`/`2`/`>= 4`-byte tail is
+/// [`CanonDirShape::Walk`].
+pub(crate) fn classify_canon_directory(
+  tiff_data: &[u8],
+  dir_start: usize,
+  data_len: usize,
+  order: ByteOrder,
+) -> CanonDirShape {
+  // `$dirStart >= 0 and $dirStart <= $dataLen-2` (Exif.pm:6344) — the count
+  // word must be readable. (Also guards the `data_len < 2` underflow.)
+  if data_len < 2 || dir_start > data_len - 2 {
+    return CanonDirShape::AbortBadDirectory;
+  }
+  let Some(num_entries) = get_u16(tiff_data, dir_start, order) else {
+    return CanonDirShape::AbortBadDirectory;
+  };
+  let num_entries = num_entries as usize;
+  // NO entry-count gate here: `ProcessExif` (`Exif.pm:6343-6400`) has no
+  // zero-entry or maximum-count special case — it computes `$dirSize = 2 + 12 *
+  // $numEntries` and is bounded only by `$dirEnd <= $dataLen` + the 0/1/2/3/>=4
+  // tail rule. A zero-entry directory walks zero entries (and, with a 1/3-byte
+  // tail, still warns `Illegal … directory size (0 entries)`, Exif.pm:6397); a
+  // many-entry (>1024) directory that fits the block is fully walked. The
+  // `checked_mul` below already keeps the extent arithmetic overflow-safe, and
+  // `dir_end <= data_len` rejects an over-claimed count — so an explicit ceiling
+  // would only DIVERGE from ExifTool (oracle-verified: a 0-entry valid-tail IFD
+  // is silent, a 2000-entry in-bounds IFD is walked).
+  // `$dirSize = 2 + 12 * $numEntries; $dirEnd = $dirStart + $dirSize`
+  // (Exif.pm:6347-6348), each step checked for the 32-bit/wasm overflow class.
+  let Some(dir_end) = num_entries
+    .checked_mul(12)
+    .and_then(|body| body.checked_add(2))
+    .and_then(|size| dir_start.checked_add(size))
+  else {
+    return CanonDirShape::AbortBadDirectory;
+  };
+  // `undef $dirSize if $dirEnd > $dataLen` (Exif.pm:6356) ⇒ the no-RAF
+  // `$success = 0` path ⇒ `Bad <dir> directory` + abort (the `$inMakerNotes`
+  // salvage only changes the VERBOSE entry walk, which is not modelled).
+  if dir_end > data_len {
+    return CanonDirShape::AbortBadDirectory;
+  }
+  // `my $bytesFromEnd = $dataLen - $dirEnd; if ($bytesFromEnd < 4) { unless
+  // ($bytesFromEnd==2 or $bytesFromEnd==0) { Warn("Illegal …"); return 0 } }`
+  // (Exif.pm:6394-6399). `dir_end <= data_len` above ⇒ no underflow.
+  let bytes_from_end = data_len - dir_end;
+  if bytes_from_end == 1 || bytes_from_end == 3 {
+    return CanonDirShape::AbortIllegalSize { num_entries };
+  }
+  CanonDirShape::Walk {
+    num_entries,
+    dir_end,
+  }
+}
+
+/// The per-entry classification shared by the Canon `0x927c` emission walk and
+/// the diagnostic walk — the 1:1 port of `ProcessExif`'s per-entry handling
+/// (`Exif.pm:6454-6679`) for the in-memory, no-RAF, `$inMakerNotes = 1` frame.
+/// Each variant names exactly what bundled does at that entry, so the emission
+/// SKIP and the WARNING agree by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonEntryClass {
+  /// A normal entry: read the value at `value_offset` (`$valuePtr`). Covers both
+  /// the inline (`$size <= 4`, value at `$entry+8`) and the valid out-of-line
+  /// (`$size > 4`, in-bounds, not suspect) arms.
+  Read { value_offset: usize },
+  /// An unrecognized NONZERO format code (`Exif.pm:6463-6477`) ⇒ `Bad format
+  /// (<code>) for <dir> entry <index>`. For `index == 0` ExifTool `return 0`s
+  /// (aborts the directory); for `index != 0` it `next`-skips. Either way no
+  /// value is read.
+  BadFormat { code: u16, abort: bool },
+  /// A format code of `0` — IFD zero-padding (`Exif.pm:6470` `if ($format …)`):
+  /// SILENT (no warning). `index == 0` aborts the directory; `index != 0` skips.
+  SilentBadFormat { abort: bool },
+  /// `$size > 0x7fffffff` (`Exif.pm:6505`) ⇒ `Invalid size (<size>) for <dir>
+  /// <tag>` + `next`-skip.
+  InvalidSize { size: usize },
+  /// An out-of-line value past EOF with NO RAF (`Exif.pm:6660`) ⇒ `Bad offset
+  /// for <dir> <tag>` + `$bad = 1` (the value is dropped) + CONTINUE. Takes
+  /// precedence over `Suspicious` (the `++$warnCount` makes `$suspect !=
+  /// $warnCount`, `Exif.pm:6672`).
+  BadOffset,
+  /// An in-bounds out-of-line value whose offset is suspect — points into the
+  /// TIFF header (`< 8`, `Exif.pm:6539`) or overlaps the IFD directory
+  /// (`Exif.pm:6549`) ⇒ `Suspicious <dir> offset for <tag>` + `next`-skip
+  /// (`Exif.pm:6675`, non-verbose).
+  Suspicious,
+}
+
+impl CanonEntryClass {
+  /// Whether this entry's classification bumps `$warnCount` (`++$warnCount`) —
+  /// the per-entry warnings ExifTool counts toward the `$warnCount > 10` abort
+  /// (`Exif.pm:6455-6456`). The counted classes are `BadFormat` (`:6472`),
+  /// `InvalidSize` (`:6507`), `BadOffset` (`:6661`) and `Suspicious` (`:6676`);
+  /// `SilentBadFormat` (a `0` code, NO `Warn`) and `Read` (a clean entry) do
+  /// NOT. Shared by both Canon walks so the emission abort and the diagnostic
+  /// abort fire on the same entry.
+  #[must_use]
+  pub(crate) const fn bumps_warn_count(self) -> bool {
+    matches!(
+      self,
+      CanonEntryClass::BadFormat { .. }
+        | CanonEntryClass::InvalidSize { .. }
+        | CanonEntryClass::BadOffset
+        | CanonEntryClass::Suspicious
+    )
+  }
+}
+
+/// Classify one Canon `0x927c` IFD entry (`ProcessExif`, `Exif.pm:6454-6679`,
+/// in-memory no-RAF `$inMakerNotes = 1` frame). `entry_off` is the 12-byte
+/// entry's offset within `tiff_data`; `index` its 0-based position; `dir_start`
+/// / `dir_end` bound the IFD; `data_len` is `tiff_data.len()` (`$dataLen`).
+///
+/// The result drives BOTH walks: the emission walk reads
+/// [`CanonEntryClass::Read`] and skips every other variant; the diagnostic walk
+/// emits the corresponding warning. The entry-header read is checked (the caller
+/// proved `entry_off + 12 <= data_len`); an unreadable header yields a silent,
+/// non-aborting skip (unreachable for an in-range entry).
+pub(crate) fn classify_canon_entry(
+  tiff_data: &[u8],
+  entry_off: usize,
+  index: usize,
+  dir_start: usize,
+  dir_end: usize,
+  data_len: usize,
+  order: ByteOrder,
+) -> CanonEntryClass {
+  let (Some(format_code), Some(count)) = (
+    get_u16(tiff_data, entry_off + 2, order),
+    get_u32(tiff_data, entry_off + 4, order),
+  ) else {
+    // Unreachable for an in-range entry (the caller bounds `entry_off + 12`);
+    // treat as a non-aborting skip.
+    return CanonEntryClass::SilentBadFormat { abort: false };
+  };
+  let count = count as usize;
+  // `if (($format < 1 or $format > 13) and $format != 129 …)` (Exif.pm:6463).
+  // The BigTIFF codes 14-18 map to real `Format`s but are BAD in a standard
+  // Canon IFD entry (the Apple-ProRaw `$format == 16` carve-out is Apple-only).
+  let recognized = matches!(format_code, 1..=13 | 129);
+  if !recognized {
+    // `next if $index` (Exif.pm:6475) ⇒ skip for index ≠ 0; ELSE `return 0`
+    // (abort). `if ($format or $validate)` (Exif.pm:6470) ⇒ a `0` code warns
+    // SILENTLY (IFD zero-padding); any other code warns `Bad format (<code>)`.
+    let abort = index == 0;
+    return if format_code == 0 {
+      CanonEntryClass::SilentBadFormat { abort }
+    } else {
+      CanonEntryClass::BadFormat {
+        code: format_code,
+        abort,
+      }
+    };
+  }
+  let elem_size = Format::from_code(format_code).byte_size();
+  // `my $size = $count * $formatSize[$format]` (Exif.pm:6502).
+  let size = count.saturating_mul(elem_size);
+  if size > 4 {
+    // `if ($size > 0x7fffffff …) { Warn('Invalid size …'); ++$warnCount; next }`
+    // (Exif.pm:6505) — the FIRST test inside the `$size > 4` block, before the
+    // offset is even read.
+    if size > 0x7fff_ffff {
+      return CanonEntryClass::InvalidSize { size };
+    }
+    let Some(value_ptr) = get_u32(tiff_data, entry_off + 8, order) else {
+      return CanonEntryClass::SilentBadFormat { abort: false };
+    };
+    let value_ptr = value_ptr as usize;
+    // `$valuePtr < 8 and not ZeroOffsetOK and $suspect = $warnCount`
+    // (Exif.pm:6539) OR `$valuePtr < $dirEnd and $valuePtr+$size > $dirStart`
+    // (Exif.pm:6549). Canon's MakerNote is NOT `ZeroOffsetOK`.
+    let value_end = value_ptr.saturating_add(size);
+    let suspect = value_ptr < 8 || (value_ptr < dir_end && value_end > dir_start);
+    // OOB out-of-line + no RAF ⇒ `Bad offset` (Exif.pm:6660), `++$warnCount` ⇒
+    // a co-incident suspect offset is NOT also reported (Exif.pm:6672). The OOB
+    // test is FIRST (matches ExifTool's read-before-suspect ordering).
+    if value_end > data_len {
+      CanonEntryClass::BadOffset
+    } else if suspect {
+      CanonEntryClass::Suspicious
+    } else {
+      CanonEntryClass::Read {
+        value_offset: value_ptr,
+      }
+    }
+  } else {
+    // Inline: the value occupies the first `$size` bytes at `$entry+8`.
+    CanonEntryClass::Read {
+      value_offset: entry_off + 8,
+    }
+  }
+}
 
 /// One decoded Canon MakerNote IFD entry — the tag + format + the
 /// post-Format-decode `RawValue`.
@@ -73,51 +300,71 @@ pub fn walk_canon_in_tiff(
     return out;
   }
   let order = parent_order;
-  let num_entries = read_u16(tiff_data, mn_offset, order).unwrap_or(0) as usize;
-  if num_entries == 0 || num_entries > 1024 {
+  // `$dataLen` is the whole backing buffer (`length $$dataPt`, Exif.pm:6283):
+  // for the CTMD `0x927c` re-dispatch `ProcessTIFF` re-frames `$dataPt` to the
+  // embedded block, so `tiff_data.len()` IS that block length; for the
+  // static-file Canon MakerNote `$dataPt` is the whole parent TIFF and value
+  // offsets resolve against it (the `$dataPos == 0` frame). Either way it is
+  // `tiff_data.len()`. (`mn_len` is the MakerNote `$dirLen`, which only changes
+  // the VERBOSE short-directory salvage — not the non-verbose walk modelled
+  // here.)
+  let data_len = tiff_data.len();
+  // The directory-shape gate — SHARED with the CTMD diagnostic walk
+  // ([`super::redispatch_ctmd_makernote_value_offset_diagnostics`]) so the
+  // emission SKIP and the WARNING are driven by ONE predicate (the R8 fix). An
+  // unreadable / overrunning / `1`/`3`-byte-tail directory aborts the walk (the
+  // diagnostic walk raises the matching `Bad`/`Illegal directory` warning);
+  // a `0`/`2`/`>= 4`-byte tail walks `num_entries`.
+  let CanonDirShape::Walk {
+    num_entries,
+    dir_end,
+  } = classify_canon_directory(tiff_data, mn_offset, data_len, order)
+  else {
     return out;
-  }
+  };
   let entries_start = mn_offset + 2;
-  let dir_end = entries_start.saturating_add(12usize.saturating_mul(num_entries));
-  let mn_end = mn_offset + mn_len;
-  if dir_end > mn_end.min(tiff_data.len()) {
-    return out;
-  }
+  // `$warnCount` (`Exif.pm:6453`) — counts the per-entry validation warnings
+  // ([`CanonEntryClass::bumps_warn_count`]). Once it exceeds ten, ExifTool emits
+  // `Too many warnings -- $dir parsing aborted` (the diagnostic walk raises it)
+  // and `return 0`s (`Exif.pm:6455-6456`), so this emission walk must STOP
+  // reading entries at the same point — otherwise a valid entry AFTER a >10-warning
+  // run would leak (the OwnerName-after-bad-run bug). Checked at the top of the
+  // loop, BEFORE this entry is classified, mirroring the Perl loop guard.
+  let mut warn_count: u32 = 0;
   for i in 0..num_entries {
+    // `if ($warnCount > 10) { … return 0 }` (`Exif.pm:6455-6456`) — abort the
+    // directory before reading any further entry.
+    if warn_count > 10 {
+      break;
+    }
     let entry_off = entries_start + 12 * i;
     let Some(tag_id) = read_u16(tiff_data, entry_off, order) else {
-      continue;
-    };
-    let Some(format_code) = read_u16(tiff_data, entry_off + 2, order) else {
       continue;
     };
     let Some(count) = read_u32(tiff_data, entry_off + 4, order) else {
       continue;
     };
     let count = count as usize;
-    let format = Format::from_code(format_code);
-    let elem_size = format.byte_size();
-    if elem_size == 0 {
-      continue;
+    let format = Format::from_code(read_u16(tiff_data, entry_off + 2, order).unwrap_or(0));
+    let total_size = format.byte_size().saturating_mul(count);
+    // The per-entry classification — SHARED with the diagnostic walk. The
+    // emission reads ONLY a `Read` entry; every bad class (bad/zero format,
+    // oversized count, out-of-bounds or suspect out-of-line offset) is skipped
+    // here while the diagnostic walk raises the matching warning, so SKIP and
+    // WARNING agree by construction. `index == 0` bad-format aborts the whole
+    // directory (ExifTool `return 0`, Exif.pm:6475); every other bad class is a
+    // single-entry `next`-skip.
+    let class = classify_canon_entry(tiff_data, entry_off, i, mn_offset, dir_end, data_len, order);
+    // `++$warnCount` for the counted classes (`Exif.pm:6472`/6507/6661/6676) so
+    // the abort cap above fires on the SAME entry as the diagnostic walk's.
+    if class.bumps_warn_count() {
+      warn_count = warn_count.saturating_add(1);
     }
-    let total_size = elem_size.saturating_mul(count);
-    // Inline if total ≤ 4 bytes — value sits at entry_off+8 (still
-    // within tiff_data; we read directly from there).
-    let value_data_offset = if total_size <= 4 {
-      entry_off + 8
-    } else {
-      // Out-of-line: offset is RELATIVE to the TIFF block start.
-      let Some(off) = read_u32(tiff_data, entry_off + 8, order) else {
-        continue;
-      };
-      let abs_off = off as usize;
-      if abs_off >= tiff_data.len() {
-        continue;
-      }
-      if abs_off.saturating_add(total_size) > tiff_data.len() {
-        continue;
-      }
-      abs_off
+    let value_data_offset = match class {
+      CanonEntryClass::Read { value_offset } => value_offset,
+      CanonEntryClass::BadFormat { abort: true, .. }
+      | CanonEntryClass::SilentBadFormat { abort: true } => break,
+      _ => continue,
     };
     let avail = tiff_data.len() - value_data_offset;
     let Some(mut raw) = read_value(tiff_data, value_data_offset, format, count, avail, order)
@@ -354,12 +601,120 @@ mod tests {
     assert!(walk_canon_body(&blob, ByteOrder::Little, None).is_empty());
   }
 
-  /// Implausible entry count → return early.
+  /// A huge entry count whose directory OVERRUNS the block → no entries. This
+  /// is the FAITHFUL `$dirEnd > $dataLen` gate (`Exif.pm:6356` ⇒ `Bad … directory`
+  /// + abort), NOT a synthetic count ceiling: `dir_end = 8 + 2 + 12*9999` far
+  /// exceeds the 2-byte block, so `classify_canon_directory` returns
+  /// `AbortBadDirectory`. (An in-BOUNDS large count is walked — see
+  /// [`large_in_bounds_count_is_walked`].)
   #[test]
-  fn implausible_count_short_circuits() {
+  fn overrunning_count_aborts() {
     let mut blob: Vec<u8> = Vec::new();
-    // 9999 entries (huge) in 4 bytes of data — implausible.
-    blob.extend_from_slice(&[0x0f, 0x27]); // 9999 LE
+    blob.extend_from_slice(&[0x0f, 0x27]); // 9999 LE — overruns the 2-byte block
     assert!(walk_canon_body(&blob, ByteOrder::Little, None).is_empty());
+  }
+
+  /// A directory whose entry count exceeds 1024 but whose extent FITS the block
+  /// must be fully walked — `ProcessExif` has no count ceiling (`Exif.pm:6343-6400`),
+  /// only `$dirEnd <= $dataLen`. Build a 1100-entry LE Canon IFD0 (every entry a
+  /// valid inline ASCII tag) and assert all 1100 decode. Guards against
+  /// re-introducing a synthetic max-entry reject (oracle: bundled walks a
+  /// 2000-entry in-bounds IFD with no warning).
+  #[test]
+  fn large_in_bounds_count_is_walked() {
+    let n: usize = 1100;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&(n as u16).to_le_bytes());
+    for i in 0..n {
+      // tag id ascending, ASCII (2), count 2, inline value "A\0".
+      blob.extend_from_slice(&(0x1000u16.wrapping_add(i as u16)).to_le_bytes());
+      blob.extend_from_slice(&2u16.to_le_bytes());
+      blob.extend_from_slice(&2u32.to_le_bytes());
+      blob.extend_from_slice(b"A\x00\x00\x00");
+    }
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD pointer (0)
+    let entries = walk_canon_body(&blob, ByteOrder::Little, None);
+    assert_eq!(
+      entries.len(),
+      n,
+      "a >1024-entry in-bounds Canon IFD must be fully walked (no count ceiling)"
+    );
+  }
+
+  /// Build a minimal TIFF-frame buffer for the SUSPECT/STATIC path: an 8-byte
+  /// TIFF header, then a 1-entry Canon IFD0 at `mn_offset = 8` whose single
+  /// out-of-line entry (tag 0x07 = CanonFirmwareVersion, ASCII, count
+  /// `value_bytes.len()`) stores `value_ptr` as its offset. The IFD directory
+  /// occupies `[8, 22)` (count word + one 12-byte entry); `value_data_region`
+  /// is appended at the buffer tail so a LEGITIMATE pointer (≥ `dir_end`, in
+  /// bounds) has real data to read. The header bytes (`[0,8)`) double as the
+  /// readable region for a `value_ptr < 8` (TIFF-header) probe.
+  fn tiff_with_one_outofline_entry(value_ptr: u32, value_len: usize) -> (Vec<u8>, usize, usize) {
+    let mn_offset = 8usize;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"II\x2a\x00"); // TIFF header magic (II, 0x2a)
+    buf.extend_from_slice(&8u32.to_le_bytes()); // IFD0 pointer → offset 8
+    buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry (offset 8)
+    buf.extend_from_slice(&0x07u16.to_le_bytes()); // tag 0x07 (CanonFirmwareVersion)
+    buf.extend_from_slice(&0x02u16.to_le_bytes()); // ASCII
+    buf.extend_from_slice(&(value_len as u32).to_le_bytes()); // count
+    buf.extend_from_slice(&value_ptr.to_le_bytes()); // out-of-line value offset
+    // Pad to `dir_end` (offset 22) so a legitimate pointer can land just past
+    // the directory, then append `value_len` bytes of real value data there.
+    while buf.len() < 22 {
+      buf.push(0);
+    }
+    buf.extend(std::iter::repeat_n(b'A', value_len));
+    let mn_len = buf.len() - mn_offset;
+    (buf, mn_offset, mn_len)
+  }
+
+  /// SUSPECT — value byte-range overlaps the IFD directory (`Exif.pm:6549`).
+  /// `value_ptr = 16` puts `[16, 16+8)` inside the directory's `[8, 22)`, so
+  /// bundled `next`-SKIPS the entry (Exif.pm:6672-6678) and emits NO value. The
+  /// shared walker must skip it too (no `CanonEntry`), matching bundled.
+  #[test]
+  fn suspect_offset_overlapping_directory_is_skipped() {
+    let (buf, mn_offset, mn_len) = tiff_with_one_outofline_entry(16, 8);
+    let entries = walk_canon_in_tiff(&buf, mn_offset, mn_len, ByteOrder::Little, None);
+    assert!(
+      entries.is_empty(),
+      "in-bounds value overlapping the IFD directory must be next-skipped, got {entries:?}"
+    );
+  }
+
+  /// SUSPECT — stored offset points into the 8-byte TIFF header (`< 8`,
+  /// `Exif.pm:6539`; Canon has no `ZeroOffsetOK`). `value_ptr = 0`, count 5 ⇒
+  /// `[0, 5)` lies wholly in the header and does NOT reach the directory
+  /// (`[8, 22)`), isolating the header guard from the overlap guard. Bundled
+  /// `next`-SKIPS; the walker must skip too.
+  #[test]
+  fn suspect_offset_into_tiff_header_is_skipped() {
+    let (buf, mn_offset, mn_len) = tiff_with_one_outofline_entry(0, 5);
+    let entries = walk_canon_in_tiff(&buf, mn_offset, mn_len, ByteOrder::Little, None);
+    assert!(
+      entries.is_empty(),
+      "in-bounds value pointing into the TIFF header (<8) must be next-skipped, got {entries:?}"
+    );
+  }
+
+  /// NOT SUSPECT (over-skip guard) — a legitimate out-of-line value pointing
+  /// just PAST the directory (`value_ptr = dir_end = 22`, in bounds, no
+  /// overlap, ≥ 8) must STILL be read & emitted. This pins that the suspect
+  /// skip does NOT over-fire on the normal Canon out-of-line layout.
+  #[test]
+  fn valid_outofline_offset_past_directory_is_emitted() {
+    let (buf, mn_offset, mn_len) = tiff_with_one_outofline_entry(22, 8);
+    let entries = walk_canon_in_tiff(&buf, mn_offset, mn_len, ByteOrder::Little, None);
+    assert_eq!(
+      entries.len(),
+      1,
+      "a legitimate out-of-line value must be emitted"
+    );
+    assert_eq!(entries[0].tag_id, 0x07);
+    match &entries[0].value {
+      RawValue::Text { text: s, .. } => assert_eq!(s, "AAAAAAAA"),
+      other => panic!("expected Text, got {other:?}"),
+    }
   }
 }

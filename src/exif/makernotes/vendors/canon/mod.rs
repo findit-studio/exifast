@@ -347,6 +347,324 @@ pub fn parse(blob: &[u8], parent_order: ByteOrder) -> (MakerNotesCanon, Vec<Vend
   parse_in_tiff(blob, 0, blob.len(), parent_order, true, None, None)
 }
 
+/// Re-dispatch a Canon CTMD `MakerNoteCanon` (`0x927c`) embedded TIFF block
+/// through `Canon::Main` — the `%Canon::ExifInfo` `ProcessProc => ProcessTIFF`
+/// hop (`Canon.pm:9845-9852`).
+///
+/// Unlike the JPEG/TIFF MakerNote (a bare IFD embedded in the parent TIFF), the
+/// CTMD `0x927c` block is a COMPLETE TIFF: `ProcessExifInfo` re-dispatches it via
+/// `ProcessTIFF` (Canon.pm:10745-10751), so it carries its own `II*\0` / `MM\0*`
+/// header + IFD0 offset, and IFD0 IS the Canon MakerNote (`Canon::Main` tags at
+/// the top level). This parses the header (the block's OWN byte order, which may
+/// differ from the parent), then walks IFD0 with [`parse_in_tiff`] at `mn_offset
+/// = ifd0_offset` — the block is self-contained (its out-of-line value offsets
+/// are relative to its own start, ExifTool's `DataPos => -($pos + 8)`,
+/// Canon.pm:10748), so it walks at base 0.
+///
+/// Returns the cached [`VendorEmission`]s for `print_conv` (the `Unknown => 1`
+/// flag is preserved for the caller's engine to suppress). An empty `Vec` for a
+/// block with no valid TIFF header / IFD0 offset. `model` is the body
+/// `$$self{Model}` in effect at this block's `ProcessExifInfo` walk position —
+/// the IFD0 `Model` of a preceding in-sample `0x8769` `ExifIFD` block
+/// (Canon.pm:10739-10751), used to evaluate model-conditional Canon sub-tables
+/// (`Canon::ShotInfo` `CameraTemperature`, `Canon::FileInfo` position 1); `None`
+/// when no preceding `0x8769` set one. `file_type` is `None` (a `.mov`/`.cr3`
+/// container is never "CRW", so the ShotInfo CRW clause stays off).
+#[must_use]
+pub fn redispatch_ctmd_makernote(
+  tiff_block: &[u8],
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<VendorEmission> {
+  // TIFF header: `[II/MM][0x2a][ifd0_offset:u32]` (8 bytes). Bail on a short /
+  // unrecognized header (ExifTool's `ProcessTIFF` would `return 0`).
+  let Some(order) = tiff_block
+    .first_chunk::<2>()
+    .and_then(|m| ByteOrder::from_marker(m))
+  else {
+    return Vec::new();
+  };
+  let Some(ifd0_offset) = crate::exif::ifd::get_u32(tiff_block, 4, order) else {
+    return Vec::new();
+  };
+  let ifd0_offset = ifd0_offset as usize;
+  // `$offset >= 8 or return 0` (ExifTool.pm:8639): the IFD0 pointer must clear
+  // the 8-byte header, and stay within the block.
+  if ifd0_offset < 8 || ifd0_offset >= tiff_block.len() {
+    return Vec::new();
+  }
+  // `mn_len` spans from IFD0 to the block end (the walker bounds-checks each
+  // entry against `tiff_data.len()` anyway).
+  let mn_len = tiff_block.len() - ifd0_offset;
+  let (_, emissions) = parse_in_tiff(
+    tiff_block,
+    ifd0_offset,
+    mn_len,
+    order,
+    print_conv,
+    model,
+    /* file_type */ None,
+  );
+  emissions
+}
+
+/// The PARSE-time diagnostics a Canon CTMD `MakerNoteCanon` (`0x927c`) embedded
+/// TIFF block raises when re-dispatched through `Canon::Main` — the same
+/// `%Canon::ExifInfo` `ProcessProc => ProcessTIFF` hop [`redispatch_ctmd_makernote`]
+/// walks for emission (`Canon.pm:9845-9852`).
+///
+/// Bundled re-dispatches the block via `ProcessTIFF` → `ProcessExif` with
+/// `$tagTablePtr = Canon::Main` (`Canon.pm:10745-10751`). The ONLY `$et->Warn`
+/// that path raises for a structurally-bad block is `ProcessExif`'s top-level
+/// IFD0-readability gate (`Exif.pm:6342-6399`) — `Bad <dir> directory`
+/// (`Exif.pm:6383`) / `Illegal <dir> directory size` (`Exif.pm:6397`). That gate
+/// is tag-table-INDEPENDENT (it runs before any `Canon::Main` lookup), so it
+/// matches the standard Exif walker's IFD0 gate verbatim; this reuses
+/// [`parse_standalone_tiff_with_base`](crate::exif::parse_standalone_tiff_with_base)
+/// (the 1:1 `ProcessExif` port) and keeps ONLY those top-level structural
+/// diagnostics (still named `IFD0` — the caller re-maps the token to the
+/// `MakerNotes` re-dispatch DirName + forces `$inMakerNotes` minor).
+///
+/// Crucially, `Canon::Main` has NO Exif sub-directory pointers (`0x8769`
+/// ExifIFD / `0x8825` GPS / `0xa005` Interop are NOT `Canon::Main` keys — its
+/// own sub-tables are `ProcessBinaryData`, never `ProcessExif` IFD sub-dirs), so
+/// a crafted IFD0 carrying such a pointer is NEVER followed and raises NO nested
+/// `Bad ExifIFD directory` / `Bad GPS directory`. Dropping every non-top-level
+/// diagnostic here is what makes that faithful (the standard Exif walker WOULD
+/// follow `0x8769` and emit a spurious nested warning — the bug this fixes).
+///
+/// A block whose TIFF header does not even parse yields no diagnostics (bundled
+/// `ProcessTIFF` `return 0` with no `Bad directory` warning).
+///
+/// Per-entry value-offset diagnostics (`Bad offset for MakerNotes <tag>` /
+/// `Suspicious MakerNotes offset for <tag>`; `Exif.pm:6549`/`:6660`/`:6675`)
+/// that bundled's `ProcessExif`-under-`Canon::Main` raises for a READABLE IFD0
+/// with a bad value pointer are surfaced SEPARATELY by
+/// [`redispatch_ctmd_makernote_value_offset_diagnostics`] (the generic Exif
+/// walker reused here models a RAF-backed NON-MakerNotes directory, so it would
+/// raise the wrong `Error reading value` text and abort — the in-memory
+/// `$inMakerNotes` path warns `Bad offset` / `Suspicious offset` and CONTINUES).
+#[must_use]
+pub fn redispatch_ctmd_makernote_diagnostics(
+  tiff_block: &[u8],
+) -> Vec<crate::diagnostics::Diagnostic> {
+  use crate::diagnostics::Diagnose;
+  // The 1:1 `ProcessExif` IFD0 gate. A header that does not parse ⇒ `None` ⇒ no
+  // diagnostic (bundled `ProcessTIFF` `return 0`, no warning).
+  let Some(meta) = crate::exif::parse_standalone_tiff_with_base(
+    tiff_block, /* base */ 0, /* tiff_type_is_tiff */ false, /* file_type */ None,
+  ) else {
+    return Vec::new();
+  };
+  // Keep ONLY the top-level IFD0 STRUCTURAL diagnostics — the table-independent
+  // readability gate (`Exif.pm:6383`/`:6397`). Nested sub-dir warnings (from
+  // following an Exif pointer the generic walker would chase) are NOT what
+  // `Canon::Main` raises (it has no Exif sub-dirs); the per-entry value-offset
+  // warnings are surfaced by `redispatch_ctmd_makernote_value_offset_diagnostics`
+  // with the faithful `$inMakerNotes` text instead of the generic walker's
+  // RAF-path `Error reading value`.
+  meta
+    .diagnostics()
+    .into_iter()
+    .filter(|d| {
+      // ONLY the unreadable/overrunning-directory gate (`Bad <dir> directory`,
+      // `Exif.pm:6383`). The `Illegal <dir> directory size` warning
+      // (`Exif.pm:6397`) is owned by
+      // [`redispatch_ctmd_makernote_value_offset_diagnostics`] (its
+      // [`body::classify_canon_directory`] gate), which emits it at the faithful
+      // NON-minor level — keeping it here would double-warn AND force it minor.
+      d.message().starts_with("Bad IFD0 directory")
+    })
+    .collect()
+}
+
+/// The PER-ENTRY value-offset diagnostics a Canon CTMD `MakerNoteCanon`
+/// (`0x927c`) block raises for a READABLE IFD0 whose entry has a bad OUT-OF-LINE
+/// value pointer — the `$inMakerNotes` branch of `ProcessExif`-under-`Canon::Main`
+/// (`Canon.pm:9845-9852` → `Exif.pm` value-pointer handling).
+///
+/// This CANNOT reuse the generic Exif walker
+/// ([`parse_standalone_tiff_with_base`]) because that walker models a RAF-backed,
+/// NON-MakerNotes standalone-TIFF directory: an out-of-bounds out-of-line value
+/// takes the `if ($raf)` branch and warns `Error reading value for $dir entry
+/// $index …` (`Exif.pm:6594`) then ABORTS the directory (`return 0`,
+/// `Exif.pm:6602`). The CTMD `0x927c` block is re-dispatched FROM MEMORY with
+/// `$inMakerNotes = 1` (`$$et{INDENT}`-level state set by `ProcessTIFF`), so it
+/// takes the no-RAF `else` branch and warns the DIFFERENT text — and CONTINUES
+/// the walk (`$bad = 1`, not an abort). This diagnostic-only walk models that
+/// branch directly, mirroring [`body::walk_canon_in_tiff`]'s IFD0 parse:
+///
+/// - `$suspect = $warnCount` if the offset points into the TIFF header
+///   (`$valuePtr < 8 and not ZeroOffsetOK`, `Exif.pm:6538`) OR overlaps the
+///   directory (`$valuePtr < $dirEnd and $valuePtr+$size > $dirStart`,
+///   `Exif.pm:6549`). `Canon::Main` is NOT `ZeroOffsetOK`.
+/// - if the value is OUT of bounds (`$valuePtr + $size > $dataLen`,
+///   `Exif.pm:6551`; `$valuePtr < 0` is impossible for a `u32` offset) and there
+///   is no RAF ⇒ `Bad offset for $dir $tagStr` (`Exif.pm:6660`) + `++$warnCount`
+///   ⇒ the trailing `$suspect == $warnCount` test (`Exif.pm:6672`) is now FALSE,
+///   so a suspect offset that is ALSO out-of-bounds reports ONLY `Bad offset`.
+/// - else if the offset was suspect ⇒ `Suspicious $dir offset for $tagStr`
+///   (`Exif.pm:6675`).
+///
+/// EMISSION: a SUSPECT offset is IN bounds, so bundled's `next`
+/// (Exif.pm:6672-6678) SKIPS the entry and emits no value. The shared emission
+/// walker [`body::walk_canon_in_tiff`] now `next`-skips the same suspect-offset
+/// entry (the identical `value_ptr < 8 || (value_ptr < dir_end && value_end >
+/// dir_start)` condition), so the SKIP and this WARNING always agree and no
+/// spurious tag is emitted. The `Bad offset` (out-of-bounds) case is likewise
+/// dropped by both bundled and the walker.
+///
+/// `$dir` is the literal token `IFD0` here — the caller
+/// ([`crate::formats::canon_ctmd`]) re-maps it to the `$inMakerNotes` `MakerNotes`
+/// DirName AND forces the `[minor]` level via the SAME `push_redispatch_diagnostic`
+/// path the structural diagnostics use (every emitted `Diagnostic` is already
+/// [`Diagnostic::warn_minor`], `$inMakerNotes` ⇒ minor, but the level is forced
+/// there regardless). `$tagStr` is resolved against `%Canon::Main`
+/// ([`tags::lookup`]) — `$$tagInfo{Name}`, e.g. `CanonFirmwareVersion`; an
+/// unknown tag is `tag 0x%.4x` (`Exif.pm:6674`). The diagnostics are emitted in
+/// IFD-entry order (matching bundled's walk position). Only OUT-OF-LINE entries
+/// (`$size > 4`) carry a value pointer; an inline value (`$size <= 4`) cannot be
+/// mis-offset. A header / IFD0 that does not parse yields no per-entry
+/// diagnostic (the structural path already covered `Bad … directory`).
+#[must_use]
+pub fn redispatch_ctmd_makernote_value_offset_diagnostics(
+  tiff_block: &[u8],
+) -> Vec<crate::diagnostics::Diagnostic> {
+  use crate::diagnostics::Diagnostic;
+  use crate::exif::ifd::{get_u16, get_u32};
+  use body::{CanonDirShape, CanonEntryClass, classify_canon_directory, classify_canon_entry};
+  let mut out = Vec::new();
+  // TIFF header — bail (no diagnostic) on a short/unrecognized header or an
+  // IFD0 pointer that fails the `>= 8`/in-bounds gate (the structural path
+  // raised `Bad … directory` for an in-bounds-but-unreadable directory).
+  let Some(order) = tiff_block
+    .first_chunk::<2>()
+    .and_then(|m| ByteOrder::from_marker(m))
+  else {
+    return out;
+  };
+  let Some(ifd0_offset) = get_u32(tiff_block, 4, order) else {
+    return out;
+  };
+  let dir_start = ifd0_offset as usize;
+  if dir_start < 8 || dir_start >= tiff_block.len() {
+    return out;
+  }
+  // `$dataLen` — the whole re-dispatched TIFF block (`$dataPos == 0`, so a
+  // stored value pointer is already a block-relative index — oracle-confirmed).
+  let data_len = tiff_block.len();
+  // The directory-shape gate — the SAME [`classify_canon_directory`] the
+  // emission walk ([`body::walk_canon_in_tiff`]) runs, so the SKIP and the
+  // WARNING agree by construction (the R8 fix: the prior `dir_end + 4 <=
+  // data_len` gate suppressed the per-entry warnings for a `0`/`2`-byte IFD tail
+  // while the emission still skipped — they now share one gate). An
+  // `AbortBadDirectory` is the STRUCTURAL path's `Bad <dir> directory`
+  // (not raised here); an `AbortIllegalSize` is the NON-minor `Illegal <dir>
+  // directory size (<n> entries)` (`Exif.pm:6397`; `$dir` re-mapped by the
+  // caller).
+  let (num_entries, dir_end) =
+    match classify_canon_directory(tiff_block, dir_start, data_len, order) {
+      CanonDirShape::Walk {
+        num_entries,
+        dir_end,
+      } => (num_entries, dir_end),
+      CanonDirShape::AbortBadDirectory => return out,
+      CanonDirShape::AbortIllegalSize { num_entries } => {
+        out.push(Diagnostic::warn(std::format!(
+          "Illegal IFD0 directory size ({num_entries} entries)"
+        )));
+        return out;
+      }
+    };
+  let entries_start = dir_start + 2;
+  // `$warnCount` (`Exif.pm:6453`) — the per-entry warning counter. Once it
+  // exceeds ten, ExifTool emits `Too many warnings -- $dir parsing aborted`
+  // (`Warn(..., 2)`, the capital-M `[Minor]` level) at the TOP of the loop and
+  // `return 0`s (`Exif.pm:6455-6456`), so the LATER bad entries are never warned
+  // about. Tracked here in lock-step with [`body::walk_canon_in_tiff`]'s
+  // emission abort (the SAME `bumps_warn_count` predicate), so the SKIP and the
+  // WARNING stop on the same entry. (In practice the abort warning is the 12th
+  // distinct one and is deduped behind the first `Bad …` warning — first-wins —
+  // so it is rarely the surviving `Doc<N>:Track<N>:Warning`; emitting it keeps
+  // the warning STREAM faithful regardless.)
+  let mut warn_count: u32 = 0;
+  for i in 0..num_entries {
+    if warn_count > 10 {
+      // `Warn("Too many warnings -- $dir parsing aborted", 2)` — `$dir` is the
+      // literal `IFD0` token the caller re-maps to `MakerNotes`; ignorable `2`
+      // ⇒ `[Minor]` (`warn_minor_behavioral`).
+      out.push(Diagnostic::warn_minor_behavioral(
+        "Too many warnings -- IFD0 parsing aborted".to_string(),
+      ));
+      break;
+    }
+    let entry_off = entries_start + 12 * i;
+    let Some(tag_id) = get_u16(tiff_block, entry_off, order) else {
+      continue;
+    };
+    // `$tagStr = $tagInfo ? $$tagInfo{Name} : sprintf('tag 0x%.4x', $tagID)`
+    // (`Exif.pm:6674`) — resolved against `%Canon::Main`. The `Invalid size`
+    // warning instead uses `TagName` (`Exif.pm:6252-6256`) — `tag 0x%.4x` plus
+    // ` Name` for a known tag.
+    let known = tags::lookup(tag_id).map(|t| t.name());
+    let tag_str = match known {
+      Some(name) => name.to_string(),
+      None => std::format!("tag 0x{tag_id:04x}"),
+    };
+    let tag_name = match known {
+      Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
+      None => std::format!("tag 0x{tag_id:04x}"),
+    };
+    let class = classify_canon_entry(
+      tiff_block, entry_off, i, dir_start, dir_end, data_len, order,
+    );
+    // `++$warnCount` for the counted classes (`Exif.pm:6472`/6507/6661/6676).
+    if class.bumps_warn_count() {
+      warn_count = warn_count.saturating_add(1);
+    }
+    match class {
+      // A read entry (inline or valid out-of-line) raises no value-offset
+      // warning. `SilentBadFormat` (a `0` code = IFD zero-padding) is silent by
+      // construction (`Exif.pm:6470`).
+      CanonEntryClass::Read { .. } | CanonEntryClass::SilentBadFormat { .. } => {}
+      // `Bad format (<code>) for <dir> entry <index>` (`Exif.pm:6471`), MINOR
+      // (`$inMakerNotes`). For `index == 0` ExifTool ALSO aborts the directory —
+      // there are no later entries to warn about, so stopping here matches.
+      CanonEntryClass::BadFormat { code, abort } => {
+        out.push(Diagnostic::warn_minor(std::format!(
+          "Bad format ({code}) for IFD0 entry {i}"
+        )));
+        if abort {
+          break;
+        }
+      }
+      // `Invalid size (<size>) for <dir> <TagName>` (`Exif.pm:6506`), MINOR.
+      CanonEntryClass::InvalidSize { size } => {
+        out.push(Diagnostic::warn_minor(std::format!(
+          "Invalid size ({size}) for IFD0 {tag_name}"
+        )));
+      }
+      // Out of bounds + no RAF ⇒ `Bad offset for <dir> <tagStr>` (`Exif.pm:6660`),
+      // MINOR. The `++$warnCount` it does means a co-incident suspect offset is
+      // NOT also reported (`$suspect != $warnCount` at `Exif.pm:6672`) — the
+      // classifier already gives `BadOffset` precedence over `Suspicious`.
+      CanonEntryClass::BadOffset => {
+        out.push(Diagnostic::warn_minor(std::format!(
+          "Bad offset for IFD0 {tag_str}"
+        )));
+      }
+      // In bounds but suspect ⇒ `Suspicious <dir> offset for <tagStr>`
+      // (`Exif.pm:6675`), MINOR.
+      CanonEntryClass::Suspicious => {
+        out.push(Diagnostic::warn_minor(std::format!(
+          "Suspicious IFD0 offset for {tag_str}"
+        )));
+      }
+    }
+  }
+  out
+}
+
 /// Parse with the parent TIFF context.
 ///
 /// `tiff_data` is the parent TIFF block; `mn_offset` is the MakerNote
@@ -1052,5 +1370,91 @@ mod tests {
     let (typed, emissions) = parse(&[], ByteOrder::Little);
     assert_eq!(typed, MakerNotesCanon::new());
     assert!(emissions.is_empty());
+  }
+
+  // -- R6-2: 0x927c per-entry value-offset diagnostics ------------------------
+
+  /// Build a complete LE TIFF whose IFD0 has ONE out-of-line entry (tag/format/
+  /// count) with the given raw value pointer. `trailer_len` extra zero bytes pad
+  /// the block so an in-bounds offset has somewhere to point.
+  fn ctmd_makernote_one_entry(
+    tag: u16,
+    format: u16,
+    count: u32,
+    value_ptr: u32,
+    trailer_len: usize,
+  ) -> Vec<u8> {
+    let mut t: Vec<u8> = std::vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    t.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+    t.extend_from_slice(&tag.to_le_bytes());
+    t.extend_from_slice(&format.to_le_bytes());
+    t.extend_from_slice(&count.to_le_bytes());
+    t.extend_from_slice(&value_ptr.to_le_bytes());
+    t.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    t.extend(std::iter::repeat_n(0u8, trailer_len));
+    t
+  }
+
+  /// An out-of-line value pointer past the block end ⇒ `Bad offset for IFD0
+  /// <Name>` (Exif.pm:6660; no RAF). The caller re-maps `IFD0` → `MakerNotes`.
+  #[test]
+  fn ctmd_value_offset_bad_offset() {
+    // 0x0007 CanonFirmwareVersion, ASCII count 8 (out-of-line), ptr past EOF.
+    let t = ctmd_makernote_one_entry(0x0007, 2, 8, 0x7000_0000, 8);
+    let d = redispatch_ctmd_makernote_value_offset_diagnostics(&t);
+    assert_eq!(d.len(), 1, "exactly one value-offset diagnostic");
+    assert_eq!(d[0].message(), "Bad offset for IFD0 CanonFirmwareVersion");
+    assert_eq!(d[0].ignorable(), 1, "$inMakerNotes ⇒ minor");
+  }
+
+  /// An in-bounds out-of-line value pointer that OVERLAPS the directory ⇒
+  /// `Suspicious IFD0 offset for <Name>` (Exif.pm:6549/6675).
+  #[test]
+  fn ctmd_value_offset_suspicious() {
+    // ptr = 10 (inside the IFD directory at 8..22), size 8, block big enough.
+    let t = ctmd_makernote_one_entry(0x0007, 2, 8, 10, 16);
+    let d = redispatch_ctmd_makernote_value_offset_diagnostics(&t);
+    assert_eq!(d.len(), 1);
+    assert_eq!(
+      d[0].message(),
+      "Suspicious IFD0 offset for CanonFirmwareVersion"
+    );
+    assert_eq!(d[0].ignorable(), 1);
+  }
+
+  /// An out-of-bounds offset that is ALSO suspect reports ONLY `Bad offset`
+  /// (bundled's `++$warnCount` makes `$suspect != $warnCount`, Exif.pm:6672).
+  #[test]
+  fn ctmd_value_offset_bad_offset_suppresses_suspicious() {
+    // The block is header(8) + IFD(2 + 12 + 4) = 26 bytes (trailer 0). ptr = 4
+    // (< 8 ⇒ suspect) AND size 23 ⇒ 4+23=27 > 26 ⇒ out of bounds. The Bad-offset
+    // warning fires; the suspect Suspicious does NOT.
+    let t = ctmd_makernote_one_entry(0x0007, 2, 23, 4, 0);
+    assert_eq!(t.len(), 26);
+    let d = redispatch_ctmd_makernote_value_offset_diagnostics(&t);
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].message(), "Bad offset for IFD0 CanonFirmwareVersion");
+  }
+
+  /// A well-formed in-bounds out-of-line value raises NO value-offset diagnostic.
+  #[test]
+  fn ctmd_value_offset_clean_no_diagnostic() {
+    // ptr = 22 (just after the 22-byte header+IFD), size 8, 8-byte trailer.
+    let t = ctmd_makernote_one_entry(0x0007, 2, 8, 22, 8);
+    let d = redispatch_ctmd_makernote_value_offset_diagnostics(&t);
+    assert!(
+      d.is_empty(),
+      "a clean out-of-line value warns nothing: {d:?}"
+    );
+  }
+
+  /// An inline value (`size <= 4`) can never be mis-offset ⇒ no diagnostic even
+  /// with a degenerate inline-value field.
+  #[test]
+  fn ctmd_value_offset_inline_never_warns() {
+    // 0x0007 ASCII count 3 ⇒ size 3 ≤ 4 (inline); the "ptr" field IS the value.
+    let t = ctmd_makernote_one_entry(0x0007, 2, 3, 0x7000_0000, 8);
+    let d = redispatch_ctmd_makernote_value_offset_diagnostics(&t);
+    assert!(d.is_empty(), "an inline value never warns: {d:?}");
   }
 }

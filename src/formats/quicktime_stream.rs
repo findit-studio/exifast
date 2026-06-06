@@ -1712,6 +1712,7 @@ fn process_samples(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -1752,6 +1753,7 @@ fn process_samples(
       gopro_out,
       camm_out,
       sony_rtmd_out,
+      canon_ctmd_out,
     );
   }
   found_embedded
@@ -1805,6 +1807,7 @@ fn decode_one_sample(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1851,6 +1854,39 @@ fn decode_one_sample(
     crate::formats::sony_rtmd::process_rtmd(buff, sony_rtmd_out);
     sony_rtmd_out.stamp_track_index_from(start, track_index);
     sony_rtmd_out.stamp_doc_from(start, doc, sample.time, sample.dur);
+    return false;
+  }
+  // The `CTMD` MetaFormat (QuickTimeStream.pl:227-230) — Canon "Canon Timed
+  // MetaData", SubDirectory-routed into `Image::ExifTool::Canon::CTMD` (PROCESS_PROC
+  // `Canon::ProcessCTMD`). `ProcessSamples` opens ONE `Doc<N>` per timed sample
+  // (`FoundSomething`), then `ProcessCTMD` `HandleTag`s every record of that
+  // sample under it — so all of a sample's TimeStamp / FocalInfo / ExposureInfo
+  // tags share one document (QuickTimeStream.pl:1517-1523; `ProcessCTMD` never
+  // bumps the doc itself). Mirror the `rtmd` arm: open the GLOBAL doc (the shared
+  // stream counter, so the ordinal continues across the file's mebx/camm/rtmd/SP3
+  // sources), decode the sample, and stamp that `doc` + `Track<N>` + the
+  // sample-table SampleTime/SampleDuration onto exactly the records this decode
+  // produced (watermark `sample_count()` before the call). `process_ctmd` pushes
+  // ONE `CanonCtmdSample` per sample (even an all-empty one — faithful to
+  // `FoundSomething` firing per sample; an empty/truncated header still leaves the
+  // doc + SampleTime/SampleDuration row).
+  if &track.meta_format == b"CTMD" {
+    let start = canon_ctmd_out.sample_count();
+    let warning_start = canon_ctmd_out.warning_count();
+    let doc = out.open_doc();
+    crate::formats::canon_ctmd::process_ctmd(buff, canon_ctmd_out);
+    canon_ctmd_out.stamp_track_index_from(start, track_index);
+    canon_ctmd_out.stamp_doc_from(start, doc, sample.time, sample.dur);
+    // A `ProcessCTMD` walk-abort warning (`Short`/`Truncated CTMD record`,
+    // `Error parsing Canon CTMD data`) or a type-1 `TimeStamp` `RawConv`
+    // warning is scoped to the SAME `Track<N>` + `Doc<N>` as this sample:
+    // ExifTool's `SET_GROUP1 = "Track$num"` is active for the whole
+    // `ProcessCTMD` call and `$et->Warn` `FoundTag`s the `Warning` under the
+    // sample's open `DOC_NUM` (the `doc` opened above). Stamp exactly the
+    // warnings this call raised (watermark before the call), mirroring the
+    // `camm` arm; the sample-table timing rides ahead via the CTMD payload
+    // emission block.
+    canon_ctmd_out.stamp_warning_from(warning_start, track_index, doc, sample.time, sample.dur);
     return false;
   }
   // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
@@ -2249,6 +2285,7 @@ pub(crate) fn extract_stream(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) -> (QuickTimeStreamMeta, bool) {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
@@ -2285,6 +2322,7 @@ pub(crate) fn extract_stream(
           gopro_out,
           camm_out,
           sony_rtmd_out,
+          canon_ctmd_out,
         );
       }
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
@@ -2491,6 +2529,7 @@ fn walk_moov(
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
+  canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
   // ExifTool's `$track` (QuickTime.pm:10353-10354): incremented for EVERY
@@ -2524,6 +2563,7 @@ fn walk_moov(
             gopro_out,
             camm_out,
             sony_rtmd_out,
+            canon_ctmd_out,
           );
         }
       }
@@ -2669,6 +2709,7 @@ mod tests {
     let mut gopro = crate::metadata::GoProMeta::new();
     let mut camm = crate::metadata::CammMeta::new();
     let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
 
     // A zero-filled `gpmd` sample: `process_gopro` extracts nothing (the KLV
     // walker bails on the four-NUL tag, GoPro.pm:844) — but it is NOT a
@@ -2685,7 +2726,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
     );
@@ -2710,7 +2752,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
     );
@@ -2729,7 +2772,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
     );
@@ -2746,7 +2790,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
     );
@@ -2768,7 +2813,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
     );
@@ -2789,7 +2835,8 @@ mod tests {
         &mut out,
         &mut gopro,
         &mut camm,
-        &mut sony
+        &mut sony,
+        &mut canon
       ),
       "a camm track does not set FoundEmbedded"
     );
@@ -3362,6 +3409,7 @@ mod tests {
       &mut gp,
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
@@ -3427,6 +3475,7 @@ mod tests {
       &mut gp,
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(
       meta.gps_samples().len(),
@@ -3526,6 +3575,7 @@ mod tests {
       &mut gp,
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert!(
       meta.is_empty(),

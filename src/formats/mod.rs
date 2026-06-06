@@ -93,6 +93,14 @@ pub mod gopro;
 // [`quicktime_stream`]. Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod android_camm;
+// Canon CTMD — Canon Timed MetaData timed records in Canon EOS R-line /
+// Cinema-line CR3 / CRM / MP4 / MOV containers. Faithful port of
+// `Image::ExifTool::Canon::ProcessCTMD` (Canon.pm:10758-10804) + the
+// `Image::ExifTool::Canon::CTMD` / `FocalInfo` / `ExposureInfo` tag tables
+// (Canon.pm:9790-9887). Reached through the `CTMD` MetaFormat dispatch in
+// [`quicktime_stream`]. Gated on the `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod canon_ctmd;
 #[cfg(feature = "real")]
 pub mod real;
 #[cfg(feature = "red")]
