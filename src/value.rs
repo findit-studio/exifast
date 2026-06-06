@@ -113,6 +113,17 @@ impl Rational {
     let v = self.numerator as f64 / self.denominator as f64;
     format_g(v, self.sig as usize)
   }
+
+  /// The raw IEEE quotient `numerator / denominator` as an `f64` — the value
+  /// BEFORE `RoundFloat`/`%g` stringification. Mirrors Perl's float coercion
+  /// of a rational scalar: `n/0` (n≠0) is `±inf`, `0/0` is `NaN`. Callers
+  /// that want the ExifTool-rounded *string* use [`Self::exiftool_val_str`];
+  /// this is for downstream arithmetic (e.g. the cross-format domain layer).
+  #[must_use]
+  #[inline(always)]
+  pub fn to_f64(&self) -> f64 {
+    self.numerator as f64 / self.denominator as f64
+  }
 }
 
 /// Faithful C/Perl `sprintf("%.*g", precision, val)` for `f64`.

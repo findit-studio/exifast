@@ -1711,6 +1711,7 @@ fn process_samples(
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
+  sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
 ) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -1750,6 +1751,7 @@ fn process_samples(
       out,
       gopro_out,
       camm_out,
+      sony_rtmd_out,
     );
   }
   found_embedded
@@ -1802,6 +1804,7 @@ fn decode_one_sample(
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
+  sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1826,6 +1829,28 @@ fn decode_one_sample(
     // meta accumulating multiple metadata `trak`s stamps each `trak`'s samples
     // with its own index.
     out.stamp_mebx_track_index_from(mebx_start, track_index);
+    return false;
+  }
+  // The `rtmd` MetaFormat (QuickTimeStream.pl:219-222) — Sony "Real-Time
+  // MetaData", SubDirectory-routed into `Image::ExifTool::Sony::rtmd` (PROCESS_PROC
+  // `Sony::Process_rtmd`). `ProcessSamples` opens ONE `Doc<N>` per timed sample
+  // (`FoundSomething`), then `Process_rtmd` `HandleTag`s every TLV record of that
+  // sample under it — so all of a sample's camera + GPS tags share one document
+  // (QuickTimeStream.pl:1517-1523; `Process_rtmd` never bumps the doc itself).
+  // Mirror the `mebx`/`camm` arms: open the GLOBAL doc (the shared stream counter,
+  // so the ordinal continues across the file's mebx/camm/SP3 sources), decode the
+  // sample, and stamp that `doc` + `Track<N>` + the sample-table SampleTime/
+  // SampleDuration onto exactly the records this decode produced (watermark
+  // `sample_count()` before the call). `process_rtmd` pushes ONE `SonyRtmdSample`
+  // per sample (even an all-empty one — faithful to `FoundSomething` firing per
+  // sample); a truncated (<2-byte) header pushes an empty sample too (bundled
+  // `return 0` is silent, but the doc + SampleTime/SampleDuration row survives).
+  if &track.meta_format == b"rtmd" {
+    let start = sony_rtmd_out.sample_count();
+    let doc = out.open_doc();
+    crate::formats::sony_rtmd::process_rtmd(buff, sony_rtmd_out);
+    sony_rtmd_out.stamp_track_index_from(start, track_index);
+    sony_rtmd_out.stamp_doc_from(start, doc, sample.time, sample.dur);
     return false;
   }
   // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
@@ -2074,40 +2099,67 @@ fn walk_stbl(data: &[u8], start: usize, end: usize, track: &mut StreamTrack) {
 /// atoms. The 4-byte `format` is the `MetaFormat`; for a `mebx` format the
 /// `keys` child atom holds the metadata-key table.
 fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
-  // The 8-byte version/flags + entry-count header, then the FIRST
-  // sample-description entry (timed-metadata tracks carry exactly one;
-  // ExifTool's `MetaFormat` is last-wins, but a single entry is the
-  // universal real-world shape).
-  let pos = 8usize;
-  if pos + 8 > data.len() {
-    return;
-  }
-  let size = be_u32(data, pos).unwrap_or(0) as usize;
-  if size < 16 || pos + size > data.len() {
-    return;
-  }
-  // bytes 4..8 of the entry = the 4-byte format code.
-  // The `pos + 8 > len` guard proves this 4-byte read is in range; the
-  // `else` return is unreachable and matches that guard's recovery.
-  let Some(fmt): Option<[u8; 4]> = data.get(pos + 4..pos + 8).and_then(|s| s.try_into().ok())
-  else {
-    return;
-  };
-  track.meta_format = fmt;
-  // Child atoms follow the 16-byte SampleDescription header. Scan for
-  // `keys` (the `mebx` metadata-key table).
-  let entry_end = pos + size;
-  for_each_atom(data, pos + 16, entry_end, |t, body| {
-    if t == b"keys" {
-      // The `keys` box body is itself `[version+flags:4][count:4]` then the
-      // key-entry table — `SaveMetaKeys` skips the 8-byte header.
-      if body.len() > 8
-        && let Some(rest) = body.get(8..)
-      {
-        track.meta_keys = save_meta_keys(rest);
-      }
+  // Walk ALL sample-description entries. ExifTool's `ProcessSampleDesc`
+  // (QuickTime.pm:9640-9648) loops every entry and the per-entry `RawConv`
+  // `$$self{MetaFormat} = $val` makes `MetaFormat` LAST-WINS (a later entry's
+  // format overwrites the earlier); `ProcessSamples` then dispatches every
+  // sample on that single track-wide format and DISCARDS the `stsc`
+  // description index (QuickTimeStream.pl:1378 `# (eventually should use the
+  // description indices: $descIdx)`). A single-entry stsd (the universal
+  // real-world shape) resolves to that one entry, identical to before.
+  let Some(count) = be_u32(data, 4) else { return };
+  let mut pos = 8usize;
+  let mut merged_keys: Vec<(u32, MetaKey)> = Vec::new();
+  for _ in 0..count {
+    let Some(size) = be_u32(data, pos).map(|s| s as usize) else {
+      break;
+    };
+    // ExifTool `ProcessSampleDesc` stops only on `$size < 8` (the entry needs at
+    // least the `[size:4][format:4]` header) or an overrunning entry
+    // (QuickTime.pm:9642-9643). An 8-15 byte entry STILL sets the last-wins
+    // format from offset 4 — it just has no room for the child-atom region.
+    // `checked_add` so a crafted overflowing `size` breaks the walk rather than
+    // panicking (debug) / wrapping (release) on a narrow target.
+    let Some(entry_end) = pos.checked_add(size) else {
+      break;
+    };
+    if size < 8 || entry_end > data.len() {
+      break;
     }
-  });
+    // bytes 4..8 of the entry = the 4-byte format code (last-wins; present for
+    // any `size >= 8`). `pos + 8 <= entry_end <= data.len()`, so in range.
+    if let Some(fmt) = data
+      .get(pos + 4..pos + 8)
+      .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    {
+      track.meta_format = fmt;
+    }
+    // Child atoms (the `keys` table) follow the 16-byte SampleDescription
+    // header — only present when the entry is large enough to hold them.
+    if size >= 16
+      && let Some(child_start) = pos.checked_add(16)
+    {
+      for_each_atom(data, child_start, entry_end, |t, body| {
+        if t == b"keys" {
+          // The `keys` box body is itself `[version+flags:4][count:4]` then the
+          // key-entry table — `SaveMetaKeys` skips the 8-byte header.
+          if body.len() > 8
+            && let Some(rest) = body.get(8..)
+          {
+            // `$$ee{keys}{$id}` is a HASH (last-wins per local-id): a later
+            // entry's key for the same id replaces the earlier. Mirror that —
+            // drop any existing same-id key, then append the new one.
+            for (id, key) in save_meta_keys(rest) {
+              merged_keys.retain(|(existing, _)| *existing != id);
+              merged_keys.push((id, key));
+            }
+          }
+        }
+      });
+    }
+    pos = entry_end;
+  }
+  track.meta_keys = merged_keys;
 }
 
 /// Walk one `trak`, collecting its `HandlerType`, `MediaTimeScale` and (when
@@ -2196,6 +2248,7 @@ pub(crate) fn extract_stream(
   kodak_version: Option<&str>,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
+  sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
 ) -> (QuickTimeStreamMeta, bool) {
   let mut out = QuickTimeStreamMeta::new();
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
@@ -2231,6 +2284,7 @@ pub(crate) fn extract_stream(
           &mut out,
           gopro_out,
           camm_out,
+          sony_rtmd_out,
         );
       }
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
@@ -2436,6 +2490,7 @@ fn walk_moov(
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
+  sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
   // ExifTool's `$track` (QuickTime.pm:10353-10354): incremented for EVERY
@@ -2468,6 +2523,7 @@ fn walk_moov(
             out,
             gopro_out,
             camm_out,
+            sony_rtmd_out,
           );
         }
       }
@@ -2612,6 +2668,7 @@ mod tests {
     let mut out = QuickTimeStreamMeta::default();
     let mut gopro = crate::metadata::GoProMeta::new();
     let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
 
     // A zero-filled `gpmd` sample: `process_gopro` extracts nothing (the KLV
     // walker bails on the four-NUL tag, GoPro.pm:844) — but it is NOT a
@@ -2627,7 +2684,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
     );
@@ -2651,7 +2709,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
     );
@@ -2669,7 +2728,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
     );
@@ -2685,7 +2745,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
     );
@@ -2706,7 +2767,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
     );
@@ -2726,7 +2788,8 @@ mod tests {
         None,
         &mut out,
         &mut gopro,
-        &mut camm
+        &mut camm,
+        &mut sony
       ),
       "a camm track does not set FoundEmbedded"
     );
@@ -3292,7 +3355,14 @@ mod tests {
     data.extend_from_slice(&moov);
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
+    let (meta, found_embedded) = extract_stream(
+      &data,
+      None,
+      None,
+      &mut gp,
+      &mut cm,
+      &mut crate::metadata::SonyRtmdMeta::new(),
+    );
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
     assert!(!found_embedded);
@@ -3350,7 +3420,14 @@ mod tests {
 
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
+    let (meta, found_embedded) = extract_stream(
+      &data,
+      None,
+      None,
+      &mut gp,
+      &mut cm,
+      &mut crate::metadata::SonyRtmdMeta::new(),
+    );
     assert_eq!(
       meta.gps_samples().len(),
       1,
@@ -3442,7 +3519,14 @@ mod tests {
 
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(&data, None, None, &mut gp, &mut cm);
+    let (meta, found_embedded) = extract_stream(
+      &data,
+      None,
+      None,
+      &mut gp,
+      &mut cm,
+      &mut crate::metadata::SonyRtmdMeta::new(),
+    );
     assert!(
       meta.is_empty(),
       "a gps '-HandlerType trak must yield no embedded GPS (ExifTool ignores it)"

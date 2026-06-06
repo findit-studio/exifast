@@ -180,6 +180,17 @@ pub struct MediaTrack {
   /// classification). The flat `HandlerType` tag is emitted from
   /// [`Self::handler_code`] so distinct codes are never collapsed.
   handler: Option<HandlerKind>,
+  /// `stsd` sample-description 4-byte format code (`minf/stbl/stsd` entry, the
+  /// `undef[4]` at offset 4 — QuickTime.pm:7765/7803). This is the value of the
+  /// `MetaFormat` tag (`MetaSampleDesc`, emitted ONLY for a `meta`-handler track
+  /// — `Condition => '$$self{HandlerType} eq "meta"'`, QuickTime.pm:7393) — e.g.
+  /// `"rtmd"` / `"camm"` / `"mebx"` for a Sony / Android / Apple timed-metadata
+  /// track. `None` when no `stsd` 4cc was decoded (e.g. a non-metadata track).
+  /// The emission gates `Track<N>:MetaFormat` on the `meta` handler, mirroring
+  /// the `MetaSampleDesc` condition (a `soun`/`vide` track routes to its own
+  /// sample-desc table; an unmatched handler to `OtherSampleDesc`'s
+  /// `OtherFormat`, NOT `MetaFormat`).
+  meta_format: Option<String>,
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427 `1 =>
   /// 'Track#'`). ExifTool's `$track` counter is a `my` local of each
   /// `ProcessMOV` invocation (QuickTime.pm:9944) that increments per `trak`
@@ -225,6 +236,7 @@ impl MediaTrack {
       handler_class: None,
       handler_code: None,
       handler: None,
+      meta_format: None,
       track_group: None,
       warning: None,
     }
@@ -366,6 +378,16 @@ impl MediaTrack {
   #[must_use]
   pub const fn handler(&self) -> Option<&HandlerKind> {
     self.handler.as_ref()
+  }
+
+  /// The `stsd` sample-description 4-byte format code (the `MetaFormat` value —
+  /// `"rtmd"` / `"camm"` / `"mebx"` for a timed-metadata track), or `None` when
+  /// no `stsd` 4cc was decoded. The flat `Track<N>:MetaFormat` tag is emitted
+  /// from this, gated on a `meta` handler (QuickTime.pm:7393 `MetaSampleDesc`).
+  #[inline(always)]
+  #[must_use]
+  pub fn meta_format(&self) -> Option<&str> {
+    self.meta_format.as_deref()
   }
 
   /// The ExifTool family-1 `Track#` group number (QuickTime.pm:1427), reset
@@ -530,6 +552,14 @@ impl MediaTrack {
   #[inline(always)]
   pub fn set_handler_class(&mut self, v: Option<String>) -> &mut Self {
     self.handler_class = v;
+    self
+  }
+
+  /// Set the `stsd` sample-description 4-byte format code (the `MetaFormat`
+  /// value). Filled by the parser when it descends `mdia/minf/stbl/stsd`.
+  #[inline(always)]
+  pub fn set_meta_format(&mut self, v: Option<String>) -> &mut Self {
+    self.meta_format = v;
     self
   }
 

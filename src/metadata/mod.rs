@@ -31,6 +31,7 @@ pub(crate) mod png;
 pub mod project;
 mod quicktime;
 mod quicktime_stream;
+mod sony_rtmd;
 mod timed_sample;
 // RIFF / AVI domain projection (`impl Project for RiffMeta`). Gated on the
 // `riff` feature; the module holds only the trait impl (no public items to
@@ -62,4 +63,8 @@ pub use quicktime::{
 };
 pub(crate) use quicktime_stream::GpsOrigin;
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
+pub use sony_rtmd::{
+  NumericRead, SonyRtmdCameraSnapshot, SonyRtmdCoord, SonyRtmdGpsSample, SonyRtmdMeta,
+  SonyRtmdSample,
+};
 pub(crate) use timed_sample::TimedSample;
