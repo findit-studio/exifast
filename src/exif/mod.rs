@@ -909,6 +909,15 @@ pub struct ExifMeta<'a> {
   /// reachable input is a CRW, so the pos-22 behaviour — hence all output —
   /// is unchanged; only the gate is now spelled faithfully.)
   file_type: Option<smol_str::SmolStr>,
+  /// IFD0's `Model` (`0x0110`) as the MakerNotes dispatcher records it —
+  /// `$$self{Model}`, captured during the top-level Exif walk and TRIMMED of
+  /// trailing whitespace (the `Exif.pm:599` `RawConv` `s/\s+$//`). The Canon CTMD
+  /// `ProcessExifInfo` walker reads it from a `0x8769` `ExifIFD` block to hand
+  /// off to the in-sample `0x927c` re-dispatch for model-conditional sub-tables
+  /// (Canon.pm:10739-10751). `None` for a TIFF with no IFD0 `Model`. WRITE-ONLY
+  /// inside the engine except for that single CTMD read (exposed via
+  /// [`ExifMeta::dispatcher_model`]).
+  captured_model: Option<smol_str::SmolStr>,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -980,6 +989,21 @@ impl<'a> ExifMeta<'a> {
     self.entries.iter().find(|e| e.name == name)
   }
 
+  /// IFD0's `Model` (`0x0110`) as the MakerNotes dispatcher sees it —
+  /// `$$self{Model}`, captured during the top-level Exif walk and TRIMMED of
+  /// trailing whitespace (the `Exif.pm:599` `RawConv` `s/\s+$//`). This is the
+  /// value that keys every model-conditional MakerNote sub-table (`Canon::Main`
+  /// `Canon::ShotInfo`/`Canon::FileInfo` conditions, `MakerNotes.pm`'s
+  /// `$$self{Model}` carve-outs). The Canon CTMD `ProcessExifInfo` walker reads
+  /// it from a `0x8769` `ExifIFD` block to hand off to the in-sample `0x927c`
+  /// re-dispatch (Canon.pm:10739-10751). `None` for a TIFF with no IFD0 `Model`.
+  /// (`pub(crate)`: an internal dispatch input, not API surface.)
+  #[must_use]
+  #[inline]
+  pub(crate) fn dispatcher_model(&self) -> Option<&str> {
+    self.captured_model.as_deref()
+  }
+
   /// Build an `ExifMeta` from the JPEG container front-end's merged parts —
   /// the entries / warnings collected across every independent `APP1` Exif
   /// block, the byte order of the first block that carried one (`None` when
@@ -1020,6 +1044,10 @@ impl<'a> ExifMeta<'a> {
       // correctly off. We model that as `None` (no CRW), matching the embedded
       // `parse_exif_block` path.
       file_type: None,
+      // The Canon CTMD `ProcessExifInfo` model hand-off reads `dispatcher_model`
+      // only from a standalone `0x8769` TIFF (`parse_standalone_tiff_with_base`),
+      // never from a JPEG `APP1` merge — so `None` here is correct.
+      captured_model: None,
     }
   }
 
@@ -1191,6 +1219,31 @@ pub fn parse_standalone_tiff_with_base<'a>(
   parse_tiff_with_base(block, base, tiff_type_is_tiff, file_type)
 }
 
+/// The Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD re-dispatch
+/// (`Canon.pm:10745-10751` → `ProcessTIFF` with `TagTable => Exif::Main`).
+///
+/// IDENTICAL to [`parse_standalone_tiff_with_base`] (the 1:1 `ProcessExif`
+/// port under `Exif::Main`) EXCEPT the block is re-dispatched FROM MEMORY with
+/// NO RAF: bundled re-frames `$dataPt` to the embedded TIFF slice
+/// (`ExifTool.pm:8585`) with no `RAF`, so an out-of-bounds out-of-line value
+/// takes the no-RAF `else` branch (`Exif.pm:6616-6670`) — warn `Bad offset for
+/// $dir $tagStr` (`Exif.pm:6660`, NON-minor since `$inMakerNotes = 0` for
+/// `Exif::Main`) and CONTINUE the walk (the value is dropped, `$bad = 1`) —
+/// rather than the RAF path's `Error reading value …` + directory abort
+/// (`Exif.pm:6594-6602`) the standalone/JPEG/QuickTime callers correctly model
+/// (their block IS the whole readable buffer). See [`Walker::no_raf`].
+///
+/// `base == 0` (the embedded TIFF is self-contained); `tiff_type_is_tiff` is
+/// `false` (the CTMD container is never the standalone-TIFF dispatch) and
+/// `file_type` is `None` (never "CRW").
+#[must_use]
+pub fn parse_ctmd_exif_ifd_redispatch(block: &[u8]) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base_no_raf(
+    block, /* base */ 0, /* tiff_type_is_tiff */ false, /* file_type */ None,
+    /* no_raf */ true,
+  )
+}
+
 // ===========================================================================
 // TIFF header parser — DoProcessTIFF front-end (ExifTool.pm:8628-8645)
 // ===========================================================================
@@ -1251,6 +1304,25 @@ fn parse_tiff_with_base<'a>(
   tiff_type_is_tiff: bool,
   file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
+  parse_tiff_with_base_no_raf(
+    data,
+    base,
+    tiff_type_is_tiff,
+    file_type,
+    /* no_raf */ false,
+  )
+}
+
+/// [`parse_tiff_with_base`] with the no-RAF framing made explicit. `no_raf` is
+/// `false` for every caller except the Canon CTMD `0x8769` ExifIFD re-dispatch
+/// ([`parse_ctmd_exif_ifd_redispatch`]) — see [`Walker::no_raf`].
+fn parse_tiff_with_base_no_raf<'a>(
+  data: &'a [u8],
+  base: u32,
+  tiff_type_is_tiff: bool,
+  file_type: Option<&str>,
+  no_raf: bool,
+) -> Option<ExifMeta<'a>> {
   // `length $$dataPt < 8` — the TIFF header is 8 bytes.
   if data.len() < 8 {
     return None;
@@ -1304,6 +1376,13 @@ fn parse_tiff_with_base<'a>(
     page_count: 0,
     multi_page: false,
     file_type: file_type.clone(),
+    // RAF-backed framing — every caller of this function has an effective RAF
+    // (the block IS the whole readable buffer). The no-RAF CTMD `0x8769` hop
+    // uses [`parse_ctmd_exif_ifd_redispatch`] instead.
+    no_raf,
+    // `$warnCount` starts at 0 (`Exif.pm:6453`); `walk_one_ifd_body` re-zeroes
+    // it per directory.
+    warn_count: 0,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk.
@@ -1337,6 +1416,7 @@ fn parse_tiff_with_base<'a>(
     maker_note: w.maker_note,
     multi_page_count,
     file_type,
+    captured_model: w.captured_model.map(smol_str::SmolStr::from),
   })
 }
 
@@ -1451,6 +1531,12 @@ fn parse_tiff_with_base_shared<'a>(
     // Embedded block (PNG `eXIf`): `$$self{FILE_TYPE}` is "PNG", never "CRW",
     // so the ShotInfo pos-22 CRW clause is off — model it as `None`.
     file_type: None,
+    // PNG `eXIf` is a self-contained block read into memory; its value offsets
+    // resolve within the block (an effective RAF, like the standalone path), so
+    // the RAF-backed framing is faithful. Only the CTMD `0x8769` hop is no-RAF.
+    no_raf: false,
+    // `$warnCount` starts at 0 (`Exif.pm:6453`); re-zeroed per directory.
+    warn_count: 0,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -1466,6 +1552,7 @@ fn parse_tiff_with_base_shared<'a>(
     multi_page_count: None,
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
+    captured_model: w.captured_model.map(smol_str::SmolStr::from),
   };
   (Some(meta), cycle_guard_warnings)
 }
@@ -1556,14 +1643,19 @@ struct Walker<'a, 'g> {
   /// in file order, matching ExifTool's `FoundTag` order), the walk has
   /// `Make` resolved before MakerNote dispatch; a malformed file that
   /// orders 0x8769 before `Make` would dispatch with `None`. `None` also
-  /// for a file with no `Make` tag.
+  /// for a file with no `Make` tag. LAST-WINS on a duplicate IFD0 `Make`
+  /// (the `RawConv` `$$self{Make} = $val` runs each time — Exif.pm:585).
   /// Owned `String` (transient builder per SmolStr policy: this lives a
   /// few microseconds during one TIFF parse).
   captured_make: Option<String>,
   /// IFD0's `Model` tag value (`Exif.pm:599`) — same role as
   /// [`captured_make`](Self::captured_make), used for the Model-keyed
   /// dispatch conditions (`$$self{Model} eq "DC-FT7"` etc.,
-  /// `MakerNotes.pm:735` Panasonic-DC-FT7 carve-out).
+  /// `MakerNotes.pm:735` Panasonic-DC-FT7 carve-out) AND the Canon CTMD
+  /// `ProcessExifInfo` `0x8769` → `0x927c` model hand-off (read via
+  /// [`ExifMeta::dispatcher_model`]). LAST-WINS on a duplicate IFD0 `Model`
+  /// (the `RawConv` `$$self{Model} = $val` runs each time — Exif.pm:599), so
+  /// a hostile two-`Model` IFD0 hands off the LATER value.
   captured_model: Option<String>,
   /// Chain-IFD (IFD0 / trailing-IFD) reprocess guard — the trailing-chain
   /// loop breaker AND (in [`ChainGuard::Shared`] mode) the cross-source
@@ -1633,6 +1725,38 @@ struct Walker<'a, 'g> {
   /// `APP1` — never "CRW") or when the type is unknown. WRITE-ONLY apart from
   /// that single pos-22 read; it influences no other tag.
   file_type: Option<smol_str::SmolStr>,
+  /// `true` when this TIFF block is re-dispatched FROM MEMORY with NO RAF —
+  /// the Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD hop (`Canon.pm:10745`
+  /// → `ProcessTIFF` with `$dataPt` = the embedded block, no `RAF`). ExifTool's
+  /// `ProcessExif` value read (`Exif.pm:6551-6670`) branches on `$raf`: with a
+  /// RAF an out-of-bounds out-of-line value is read from the file and, on a
+  /// short read, warns `Error reading value …` and ABORTS the directory
+  /// (`Exif.pm:6594-6602`); with NO RAF it instead warns `Bad offset for $dir
+  /// $tagStr` (`Exif.pm:6660`) and CONTINUES the walk (`$bad = 1`, the value is
+  /// dropped). Every reachable caller of this walker EXCEPT the CTMD `0x8769`
+  /// hop has an effective RAF (the standalone-TIFF / JPEG-`APP1` / QuickTime-
+  /// `Exif` block IS the whole readable buffer, so a past-`data.len()` value is
+  /// genuinely past EOF — the RAF read would fail identically), so this is
+  /// `false` for all of them and the prior byte-identical behaviour is
+  /// preserved. The CTMD `0x8769` hop sets it `true` (the embedded block is a
+  /// slice of a larger CTMD payload; bundled re-frames `$dataPt` to that slice
+  /// with no RAF). Independent of `$inMakerNotes` (the `0x8769` table is
+  /// `Exif::Main`, GROUPS{0} = 'EXIF', so `$inMakerNotes = 0` ⇒ the `Bad offset`
+  /// is NON-minor); the `0x927c` Canon-MakerNote hop does not use this walker.
+  no_raf: bool,
+  /// `$warnCount` — `ProcessExif`'s PER-DIRECTORY warning counter
+  /// (`Exif.pm:6453`, `my ($warnCount, $lastID) = (0, -1)`). ExifTool bumps it
+  /// for each per-entry validation warning it counts (`++$warnCount` at
+  /// `Exif.pm:6472`/6507/6606/6661/6676) and, BEFORE processing each entry,
+  /// `if ($warnCount > 10) { Warn("Too many warnings -- $dir parsing aborted",
+  /// 2) and return 0 }` (`Exif.pm:6455-6456`) — so an IFD that piles up more
+  /// than ten counted warnings is abandoned (with its later entries + next-IFD
+  /// pointer NOT processed) after emitting one `[Minor]` abort warning. RESET
+  /// to 0 at the start of every directory body ([`walk_one_ifd_body`]); the
+  /// counted warnings funnel through [`warn_counted`](Self::warn_counted) and
+  /// the cap is enforced in [`walk_entries`](Self::walk_entries). `u32` because
+  /// the only entries that bump it are bounded by `num_entries` (≤ 65535).
+  warn_count: u32,
 }
 
 impl Walker<'_, '_> {
@@ -1650,6 +1774,24 @@ impl Walker<'_, '_> {
   fn warn_minor_behavioral(&mut self, message: String) {
     self.warnings.push(message);
     self.warnings_ignorable.push(2);
+  }
+
+  /// Record a NORMAL `$et->Warn(msg)` that ALSO bumps `$warnCount`
+  /// (`++$warnCount`) — the per-entry validation warnings ExifTool counts
+  /// toward the [`warn_count`](Self::warn_count) abort cap: `Bad format …`
+  /// (`Exif.pm:6471-6472`), `Invalid size …` (`:6506-6507`), `Error reading
+  /// value …` (`:6604-6606`), `Bad offset …` (`:6660-6661`) and `Suspicious …
+  /// offset …` (`:6675-6676`). These are exactly the `self.warn` callers inside
+  /// the entry loop whose ExifTool site is immediately followed by
+  /// `++$warnCount`; the directory-level (`Bad … directory`, `Illegal …
+  /// directory size`), the SubIFD `Wrong format`, and the excessive-count
+  /// warnings are NOT counted by ExifTool, so they keep using [`warn`](Self::warn)
+  /// / [`warn_minor_behavioral`](Self::warn_minor_behavioral). All are NON-minor
+  /// (`$inMakerNotes = 0` for every IFD this walker reaches), matching the
+  /// generic-Exif frame.
+  fn warn_counted(&mut self, message: String) {
+    self.warn(message);
+    self.warn_count = self.warn_count.saturating_add(1);
   }
 
   /// Walk an IFD and then follow its next-IFD pointer chain (IFD0 → IFD1 →
@@ -1812,6 +1954,12 @@ impl Walker<'_, '_> {
   /// of `ProcessExif` (`Exif.pm:6278-7240`).
   fn walk_one_ifd_body(&mut self, ifd_start: usize, kind: IfdKind) -> Option<usize> {
     let data = self.data;
+    // `$warnCount` is a fresh `my` local per `ProcessExif` call (`Exif.pm:6453`):
+    // each directory starts with a clean counter, so a sibling/earlier IFD's
+    // warnings never carry into this one's abort cap. Reset here (the walker
+    // reuses ONE `Walker` across the whole chain + every sub-IFD recursion, so
+    // the field is shared state that must be re-zeroed per directory).
+    self.warn_count = 0;
     // `$numEntries = Get16u($dataPt, $dirStart)` (Exif.pm:6344). The count
     // is readable only when `$dirStart <= $dataLen-2` (Exif.pm:6343); if
     // not, `$dirSize` is left undef and — with no RAF to read the IFD
@@ -1944,6 +2092,26 @@ impl Walker<'_, '_> {
     kind: IfdKind,
   ) -> bool {
     for index in 0..num_entries {
+      // `if ($warnCount > 10) { Warn("Too many warnings -- $dir parsing
+      // aborted", 2) and return 0 }` (Exif.pm:6455-6456) — checked at the TOP
+      // of the loop body, BEFORE this entry is read. Once more than ten
+      // per-entry validation warnings (`warn_counted`) have accumulated in THIS
+      // directory, ExifTool abandons the rest of it: it emits one `[Minor]` (the
+      // hard-coded `2` ignorable, NOT `$inMakerNotes`-derived) abort warning and
+      // `return 0`s — so neither the remaining entries NOR the trailing next-IFD
+      // pointer is processed. `Warn(..., 2)` returns true in normal mode (the
+      // `and return 0` always fires), so this is an unconditional directory
+      // abort. Returns `false` (the `Step::AbortDir` analogue) — the caller
+      // (`walk_one_ifd_body`) then does NOT read the next-IFD pointer, matching
+      // the Perl `return 0` exiting `ProcessExif` before the line-7202 `Multi`
+      // scan. `$dir` is `kind.as_str()` for every IFD this walker reaches.
+      if self.warn_count > 10 {
+        self.warn_minor_behavioral(std::format!(
+          "Too many warnings -- {} parsing aborted",
+          kind.as_str()
+        ));
+        return false;
+      }
       // `$entry = $dirStart + 2 + 12*$index` (Exif.pm:6452), `checked_*` for
       // the 32-bit/wasm overflow class. The caller's checked `dir_end =
       // ifd_start + 2 + 12*num_entries` already guarantees every `entry`
@@ -2093,10 +2261,11 @@ impl Walker<'_, '_> {
     let recognized = matches!(format_code, 1..=13 | 129);
     if !recognized {
       // `if ($format or $validate) { Warn(...); ++$warnCount }` — a 0
-      // code is silent padding; any other bad code warns.
+      // code is silent padding; any other bad code warns AND counts toward the
+      // `$warnCount` abort cap (`Exif.pm:6471-6472`).
       if format_code != 0 {
         let dir = kind.as_str();
-        self.warn(std::format!(
+        self.warn_counted(std::format!(
           "Bad format ({format_code}) for {dir} entry {index}"
         ));
       }
@@ -2141,7 +2310,8 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
           None => std::format!("tag 0x{tag_id:04x}"),
         };
-        self.warn(std::format!("Invalid size ({size}) for {dir} {tag}"));
+        // `++$warnCount` (Exif.pm:6507) — counts toward the abort cap.
+        self.warn_counted(std::format!("Invalid size ({size}) for {dir} {tag}"));
         return Step::Skip; // `next` — skip this entry, continue the IFD.
       }
       let off = match get_u32(data, entry + 8, order) {
@@ -2203,12 +2373,31 @@ impl Walker<'_, '_> {
       // check). The validated end is reused for the IFD-overlap test below.
       let value_end = match off.checked_add(size) {
         Some(end) if end <= data.len() => end,
+        // No-RAF re-dispatch (the Canon CTMD `0x8769` ExifIFD hop): bundled
+        // takes the no-RAF `else` branch (`Exif.pm:6616-6670`) — `Bad offset
+        // for $dir $tagStr` (`Exif.pm:6660`) + `$bad = 1` (the value is
+        // dropped) + CONTINUE the loop. `$tagStr` is the name-if-known form
+        // (`Exif.pm:6634`), NOT the RAF path's `ID 0x…` text. NON-minor
+        // (`$inMakerNotes = 0` for `Exif::Main`). Takes precedence over the
+        // suspect test below (the read happens first, `Exif.pm:6660` before
+        // `:6672`).
+        _ if self.no_raf => {
+          let warning = match Self::warn_tag_name(kind, tag_id) {
+            Some(name) => std::format!("Bad offset for {dir} {name}"),
+            None => std::format!("Bad offset for {dir} tag 0x{tag_id:04x}"),
+          };
+          // `++$warnCount` (Exif.pm:6661) — counts toward the abort cap.
+          self.warn_counted(warning);
+          return Step::Skip;
+        }
         _ => {
-          // `Error reading value` — the tag name is appended only for a
-          // known, non-Unknown tag (Exif.pm:6596-6598). The name is
-          // resolved against the IFD's OWN table (GPS vs Exif/Interop —
-          // see `warn_tag_name`); a GPS IFD's 0x0002 is `GPSLatitude`,
-          // not the Interop table's `InteropVersion`.
+          // RAF-backed (the standalone-TIFF / JPEG-`APP1` / QuickTime / PNG
+          // path): the out-of-line value is past the readable buffer, so the
+          // `$raf->Read` short-reads ⇒ `Error reading value` — the tag name is
+          // appended only for a known, non-Unknown tag (Exif.pm:6596-6598).
+          // The name is resolved against the IFD's OWN table (GPS vs
+          // Exif/Interop — see `warn_tag_name`); a GPS IFD's 0x0002 is
+          // `GPSLatitude`, not the Interop table's `InteropVersion`.
           let tag = match Self::warn_tag_name(kind, tag_id) {
             Some(name) => std::format!(" {name}"),
             None => String::new(),
@@ -2218,7 +2407,7 @@ impl Walker<'_, '_> {
           ));
           // `return 0 unless $inMakerNotes or $htmlDump or $truncOK`
           // (Exif.pm:6602) — abort the directory (see the precedence note
-          // above for why the exception never applies to this walker).
+          // above for why the exception never applies to a RAF-backed walk).
           // [`Step::AbortDir`] = this mid-walk `return 0`.
           return Step::AbortDir;
         }
@@ -2234,7 +2423,10 @@ impl Walker<'_, '_> {
           Some(name) => std::format!("Suspicious {dir} offset for {name}"),
           None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
         };
-        self.warn(warning);
+        // `if ($et->Warn(...)) { ++$warnCount; next unless $verbose }`
+        // (Exif.pm:6675-6677) — `Warn` returns true in normal mode, so the
+        // suspicious-offset warning counts toward the abort cap.
+        self.warn_counted(warning);
         // `next unless $verbose` (Exif.pm:6675) — skip this entry, CONTINUE
         // the IFD: [`Step::Skip`].
         return Step::Skip;
@@ -2926,6 +3118,19 @@ impl Walker<'_, '_> {
     // trim here so the dispatcher sees the trimmed value, faithful to
     // bundled's view of `$$self{Make}` (which is the RawConv'd value).
     //
+    // LAST-WINS: bundled's `RawConv` ends `… $$self{Make} = $val` (Exif.pm:585)
+    // / `… $$self{Model} = $val` (Exif.pm:599) — the assignment runs EACH time
+    // a Make/Model tag is handled, so a duplicate IFD0 Make/Model leaves the
+    // LATER value in object state. A hostile IFD0 carrying two `0x0110` Model
+    // tags (or two `0x8769` blocks each setting one — the CTMD ProcessExifInfo
+    // hand-off) must end with the LAST-seen value, because a following
+    // model-conditional MakerNote (`0x927c` → `Canon::Main`, or the dispatcher's
+    // `$$self{Model}` carve-outs) keys on it. Overwrite unconditionally — NOT
+    // first-wins (the `is_none()` guard this replaces was the R6 bug). This is a
+    // separate captured-STATE field; the EMITTED `Make`/`Model` tags
+    // (`self.entries`, pushed below) keep their own TagMap last-wins dedup, so
+    // this does not disturb emitted-tag priority.
+    //
     // `kind.is_ifd0()` gate: bundled stores `$$self{Make}` only from the
     // top-level Exif walk (IFD0); a trailing-IFD or maker-note re-emission
     // of 0x010f is NOT what the dispatcher sees. The walker keeps IFD0's
@@ -2933,9 +3138,9 @@ impl Walker<'_, '_> {
     if matches!(kind, IfdKind::Ifd0) && (tag_id == 0x010f || tag_id == 0x0110) {
       if let RawValue::Text { text: s, .. } = &raw {
         let trimmed = s.trim_end_matches(is_perl_space);
-        if tag_id == 0x010f && self.captured_make.is_none() {
+        if tag_id == 0x010f {
           self.captured_make = Some(trimmed.to_string());
-        } else if tag_id == 0x0110 && self.captured_model.is_none() {
+        } else if tag_id == 0x0110 {
           self.captured_model = Some(trimmed.to_string());
         }
       }
@@ -5506,6 +5711,50 @@ mod tests {
     );
   }
 
+  // -- R6-1: duplicate IFD0 Model is LAST-WINS for the dispatcher -------------
+
+  /// A hostile IFD0 carrying TWO `Model` (`0x0110`) tags must leave the
+  /// dispatcher's `$$self{Model}` ([`ExifMeta::dispatcher_model`]) set to the
+  /// LAST one walked, not the first — bundled's `RawConv` `$val =~ s/\s+$//;
+  /// $$self{Model} = $val` (Exif.pm:599) runs EACH time the tag is handled, so
+  /// the later assignment wins. The pre-R6 first-wins (`is_none()`) guard kept
+  /// the FIRST, which would decode a following model-conditional MakerNote
+  /// (Canon CTMD `0x927c`) against the WRONG model. Same class for `Make`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn duplicate_ifd0_model_is_last_wins_for_dispatcher() {
+    // Two out-of-line strings appended after the next-IFD pointer. The IFD0
+    // header is 8 bytes; the directory is 2 (count) + 2*12 (Model x2) + 4
+    // (next-IFD) = 30 bytes, so it ends at offset 38. Place "AAA\0" at 38 and
+    // "Canon EOS R5\0" at 42.
+    let s1 = b"AAA\0";
+    let s2 = b"Canon EOS R5\0";
+    let off1: u32 = 38;
+    let off2: u32 = off1 + s1.len() as u32;
+    let m1 = entry(
+      0x0110,
+      2, /* string */
+      s1.len() as u32,
+      off1.to_be_bytes(),
+    );
+    let m2 = entry(
+      0x0110,
+      2, /* string */
+      s2.len() as u32,
+      off2.to_be_bytes(),
+    );
+    let mut t = tiff_with_entries(&[m1, m2]);
+    t.extend_from_slice(s1);
+    t.extend_from_slice(s2);
+    let meta = parse_exif_block(&t).expect("valid TIFF");
+    assert_eq!(
+      meta.dispatcher_model(),
+      Some("Canon EOS R5"),
+      "the dispatcher Model must be the LAST IFD0 Model walked (Exif.pm:599 \
+       $$self{{Model}} = $val runs each time), not the first"
+    );
+  }
+
   // -- Fix 2: HASH PrintConv miss → "Unknown (N)" / "Unknown (0xN)" ----------
 
   #[test]
@@ -5667,6 +5916,10 @@ mod tests {
       page_count: 0,
       multi_page: false,
       file_type: None,
+      // RAF-backed (the standalone-TIFF model the existing tests assume); the
+      // no-RAF CTMD `0x8769` path is covered via `parse_ctmd_exif_ifd_redispatch`.
+      no_raf: false,
+      warn_count: 0,
     }
   }
 

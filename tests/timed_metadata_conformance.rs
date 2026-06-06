@@ -1756,6 +1756,983 @@ fn sony_rtmd_wbdt_n_match_bundled() {
   );
 }
 
+// ── Track<N>: Canon CTMD (Canon Timed MetaData — per-sample Track<N>) ────────
+// `Image::ExifTool::Canon::ProcessCTMD` (Canon.pm:10758-10804) decodes ONE
+// timed sample per `CTMD` sample-table entry; `ProcessSamples` opens a `Doc<N>`
+// per sample and `HandleTag`s every record under it. NOTE (oracle-verified):
+// although `%Canon::CTMD` declares `GROUPS => { 1 => 'Canon' }`, the timed-
+// metadata machinery re-scopes the family-1 group to the trak's `Track<N>`
+// (oracle `Doc1:Track1:TimeStamp`, NOT `Canon:…`) — same as `rtmd`/`mebx`.
+// Per sample (Canon.pm record order): SampleTime / SampleDuration / TimeStamp
+// (type 1) / FocalLength (type 4) / FNumber + ExposureTime + ISO (type 5). The
+// `-G1` collapse keeps Doc1's values (ISO 12800); `-G3:1` shows both docs
+// (Doc2 ISO 6400). FocalLength/ExposureTime store the f64 quotient, so `-n`
+// renders the bare quotient (15 / 0.0125), `-j` the `%.1f mm` / PrintExposureTime
+// shaping. Only the structural `Track<N>:MetaFormat` (the stsd `CTMD` 4cc) plus
+// the camera scalars are compared — everything is byte-exact with NO exclusion.
+
+#[test]
+fn canon_ctmd_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd.mov",
+    "QuickTime_canon_ctmd.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd.mov",
+    "QuickTime_canon_ctmd.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The Canon CTMD fixture at no-`ee`: `CTMD` is a `meta`-handler `trak`, so the
+// per-sample TimeStamp/Focal/Exposure emission is fully `-ee`-gated. The no-`ee`
+// path emits the standard `Track1:Warning` ([minor] ExtractEmbedded) + the
+// structural `Track<N>:MetaFormat` and NO per-sample record — the same shape as
+// the `rtmd`/`mebx`/`camm` fixtures. Byte-exact with NO exclusion.
+#[test]
+fn canon_ctmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_canon_ctmd.mov",
+    "QuickTime_canon_ctmd.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G3:1 -n` (ValueConv) for the Canon CTMD camera scalars — the
+// `.ee.*` `-j` goldens render the PrintConvs, so this pins the raw post-ValueConv
+// `-n` scalars per Doc. Canon CTMD stores the f64 QUOTIENT (not a Rational like
+// Sony rtmd), so at `-n`: FocalLength is the bare quotient `15` (NOT `"15.0 mm"`),
+// FNumber `3.5`, ExposureTime the bare quotient `0.0125` (NOT `"1/80"`), ISO the
+// integer `12800` (Doc1) / `6400` (Doc2); TimeStamp is the SAME Date/Time string
+// (ConvertDateTime passes it through, so `-n` == `-j`). Oracle: bundled ExifTool
+// 13.59 (`-ee -G3:1 -n QuickTime_canon_ctmd.mov`).
+#[test]
+fn canon_ctmd_n_match_bundled() {
+  let data = fixture("QuickTime_canon_ctmd.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_canon_ctmd.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // Doc1: FocalLength is the bare f64 quotient at -n (not the `%.1f mm` string).
+  assert_eq!(
+    obj
+      .get("Doc1:Track1:FocalLength")
+      .and_then(serde_json::Value::as_f64),
+    Some(15.0),
+    "FocalLength -n must be the raw quotient (f64), not the `%.1f mm` PrintConv string"
+  );
+  // FNumber renders the bare number in both modes (PrintFNumber numifies).
+  assert_eq!(
+    obj
+      .get("Doc1:Track1:FNumber")
+      .and_then(serde_json::Value::as_f64),
+    Some(3.5),
+  );
+  // ExposureTime is the raw quotient seconds at -n (1/80 = 0.0125), not "1/80".
+  assert_eq!(
+    obj
+      .get("Doc1:Track1:ExposureTime")
+      .and_then(serde_json::Value::as_f64),
+    Some(0.0125),
+    "ExposureTime -n must be the raw quotient seconds, not the PrintExposureTime string"
+  );
+  // ISO is the plain integer; Doc1 = 12800.
+  assert_eq!(
+    obj
+      .get("Doc1:Track1:ISO")
+      .and_then(serde_json::Value::as_u64),
+    Some(12800),
+  );
+  // TimeStamp passes through ConvertDateTime unchanged → identical at -n / -j.
+  assert_eq!(
+    obj.get("Doc1:Track1:TimeStamp"),
+    Some(&serde_json::json!("2018:02:21 12:08:56.21")),
+  );
+  // Doc2 keeps its own ISO under -G3:1 (the across-doc value the -G1 collapse drops).
+  assert_eq!(
+    obj
+      .get("Doc2:Track1:ISO")
+      .and_then(serde_json::Value::as_u64),
+    Some(6400),
+  );
+  // The track-level `MetaFormat` is the `stsd` 4cc, emitted once at the
+  // `Track<N>` level (NOT under `Doc<N>`).
+  assert_eq!(
+    obj.get("Track1:MetaFormat"),
+    Some(&serde_json::json!("CTMD")),
+    "MetaFormat is emitted at the family-1 Track level"
+  );
+  assert!(
+    obj.get("Doc1:Track1:MetaFormat").is_none() && obj.get("Doc2:Track1:MetaFormat").is_none(),
+    "MetaFormat is track-level only, never under a Doc<N>"
+  );
+}
+
+// ── Canon CTMD: FIX #3 rational32u `-n` %.7g precision ──────────────────────
+//
+// `FocalLength` / `FNumber` / `ExposureTime` are `rational32u`, so the bundled
+// `GetRational32u` (ExifTool.pm:6094) renders `RoundFloat(n/d, 7)` = `%.7g`, NOT
+// a 15-digit f64. This fixture uses non-terminating quotients (FocalLength 10/3,
+// FNumber 1/3, ExposureTime 1/3): the `.ee.*` `-j` goldens pin the PrintConvs
+// (`3.3 mm` / `0.33` / `0.3`, byte-exact); the `-n` test below pins the raw
+// `%.7g` ValueConv (`3.333333` / `0.3333333` / `0.3333333`) — the precision a
+// stored f64 quotient would lose (it would emit `3.3333333333333335`).
+#[test]
+fn canon_ctmd_rational_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_rational.mov",
+    "QuickTime_canon_ctmd_rational.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_rational.mov",
+    "QuickTime_canon_ctmd_rational.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn canon_ctmd_rational_n_precision_match_bundled() {
+  let data = fixture("QuickTime_canon_ctmd_rational.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  // `-n` (ValueConv): the raw `rational32u` rendered as ExifTool's `%.7g`.
+  let got = extract_info_with_options("QuickTime_canon_ctmd_rational.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // The byte-exact `-n` tokens bundled emits (oracle: `-ee -G3:1 -n`). A stored
+  // f64 quotient would instead serialize the 15-/17-digit IEEE value.
+  for (key, want) in [
+    ("Doc1:Track1:FocalLength", "3.333333"),
+    ("Doc1:Track1:FNumber", "0.3333333"),
+    ("Doc1:Track1:ExposureTime", "0.3333333"),
+  ] {
+    let got_num = obj.get(key).expect("tag present");
+    // Serialize the JSON value back to its token to compare the EXACT digits.
+    assert_eq!(
+      serde_json::to_string(got_num).unwrap(),
+      want,
+      "{key} -n must be the GetRational32u %.7g token, not a 15-digit f64"
+    );
+  }
+}
+
+// Canon CTMD duplicate type-4/type-5 within one sample: bundled
+// `HandleTag`s every record, so a repeated FocalInfo/ExposureInfo is a same-Doc
+// duplicate tag and the LATER value wins (ExifTool.pm:9437-9519). The fixture
+// writes 15.0 mm then 24.0 mm (type 4) and F3.5/1-80/ISO12800 then
+// F8.0/1-250/ISO6400 (type 5) in ONE sample; bundled (and exifast) keep the
+// SECOND of each. Pins the `set_focal`/`set_exposure` last-wins fix.
+#[test]
+fn canon_ctmd_dup_last_wins_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_dup.mov",
+    "QuickTime_canon_ctmd_dup.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_dup.mov",
+    "QuickTime_canon_ctmd_dup.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// ── Canon CTMD: FIX #2 ProcessCTMD `Doc<N>:Track<N>:Warning` ─────────────────
+//
+// `ProcessCTMD` raises three walk-abort warnings, each surfaced under the
+// raising sample's `Doc<N>`/`Track<N>` (the camm `Warning` channel): `Short CTMD
+// record` (size<12), `Truncated CTMD record` (pos+size>dirLen, the preceding
+// TimeStamp still emits), and the MINOR `[minor] Error parsing Canon CTMD data`
+// (trailing-byte residue, `Warn(...,1)`). Each fixture isolates one warning;
+// byte-exact at both `-G1` (`.ee.json`) and `-G3:1` (`.ee.g3.json`).
+#[test]
+fn canon_ctmd_warning_short_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_short.mov",
+    "QuickTime_canon_ctmd_warn_short.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_short.mov",
+    "QuickTime_canon_ctmd_warn_short.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn canon_ctmd_warning_truncated_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_trunc.mov",
+    "QuickTime_canon_ctmd_warn_trunc.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_trunc.mov",
+    "QuickTime_canon_ctmd_warn_trunc.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn canon_ctmd_warning_residue_minor_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_residue.mov",
+    "QuickTime_canon_ctmd_warn_residue.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_warn_residue.mov",
+    "QuickTime_canon_ctmd_warn_residue.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// ── Canon CTMD: FIX #4 short TimeStamp partial unpack + RawConv warning ──────
+//
+// The type-1 `TimeStamp` `RawConv` ALWAYS runs `unpack('x2vCCCCCC')` +
+// `sprintf`, so a SHORT payload yields a PARTIAL string (not a dropped tag) plus
+// a RawConv-context warning. This fixture's two samples cover both arms: a len-4
+// payload → `2018:00:00 00:00:00.00` + `RawConv TimeStamp: Missing argument in
+// sprintf`; a len-0 payload → NO TimeStamp (the `x2` skip croaks) + `RawConv
+// TimeStamp: 'x' outside of string in unpack`. Byte-exact at both group modes;
+// the per-length strings 0..=12 are additionally pinned in the parser unit test.
+#[test]
+fn canon_ctmd_short_timestamp_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_shortts.mov",
+    "QuickTime_canon_ctmd_shortts.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_shortts.mov",
+    "QuickTime_canon_ctmd_shortts.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// Canon CTMD `ExifInfo7/8/9` re-dispatch (#82 — types 7/8/9 ProcessExifInfo,
+// Canon.pm:9818-9853 / 10730-10754). A type-7 record whose ProcessExifInfo
+// payload carries TWO `[len][tag][TIFF]` entries: a `0x8769` ExifIFD (a full
+// TIFF with ExposureTime 1/80 + ISO 400) and a `0x927c` MakerNoteCanon (a full
+// TIFF whose IFD0 is the Canon MakerNote, CanonFirmwareVersion). Bundled
+// re-dispatches each embedded TIFF via `ProcessTIFF` under the sample's open
+// `Doc<N>`/`Track<N>` scope; the recovered tags re-stamp to:
+//   - `EXIF:ExifIFD:ExposureTime` / `:ISO` (the 0x8769 EXIF tags — family-1
+//     `ExifIFD`, distinct from the CTMD type-5 `Track<N>:ExposureTime`/`:ISO`),
+//   - `File:Track<N>:ExifByteOrder` (the 0x8769 ProcessTIFF byte-order marker),
+//   - `MakerNotes:Track<N>:CanonFirmwareVersion` (the 0x927c MakerNote tag).
+// Every group + value is oracle-verified vs bundled 13.59 (`-ee -G3:1:0`).
+// Byte-exact at both group modes, NO exclusion.
+#[test]
+fn canon_ctmd_exifinfo_redispatch_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo.mov",
+    "QuickTime_canon_ctmd_exifinfo.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo.mov",
+    "QuickTime_canon_ctmd_exifinfo.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G3:1 -n` (ValueConv) for the Canon CTMD ExifInfo re-dispatch:
+// the `.ee.*` goldens render the PrintConvs, so this pins the raw post-ValueConv
+// `-n` tokens of the re-dispatched EXIF tags per Doc. At `-n` the 0x8769 EXIF
+// ExposureTime is the raw quotient seconds (1/80 = 0.0125, NOT "1/80"), ISO the
+// plain integer (Doc1 400 / Doc2 200), ExifByteOrder the bare `II` marker, and
+// the 0x927c CanonFirmwareVersion the same string (ConvertString passthrough).
+// Oracle: bundled ExifTool 13.59 (`-ee -G3:1 -n`).
+#[test]
+fn canon_ctmd_exifinfo_n_match_bundled() {
+  let data = fixture("QuickTime_canon_ctmd_exifinfo.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_canon_ctmd_exifinfo.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // The 0x8769 EXIF re-dispatch under `EXIF:ExifIFD`, per-Doc.
+  for (key, want) in [
+    ("Doc1:ExifIFD:ExposureTime", serde_json::json!(0.0125)),
+    ("Doc1:ExifIFD:ISO", serde_json::json!(400)),
+    ("Doc2:ExifIFD:ExposureTime", serde_json::json!(0.0125)),
+    ("Doc2:ExifIFD:ISO", serde_json::json!(200)),
+    // ExifByteOrder re-scopes to `File:Track<N>`, bare `II` at -n.
+    ("Doc1:Track1:ExifByteOrder", serde_json::json!("II")),
+    // The 0x927c MakerNote re-dispatch under `MakerNotes:Track<N>`.
+    (
+      "Doc1:Track1:CanonFirmwareVersion",
+      serde_json::json!("Firmware Version 1.0.0"),
+    ),
+  ] {
+    assert_eq!(obj.get(key), Some(&want), "{key} -n token mismatch");
+  }
+}
+
+// Canon CTMD `ExifInfo` 0x8769 re-dispatch with a NESTED EXIF sub-IFD.
+// The 0x8769 ProcessExifInfo TIFF's IFD0 carries ExposureTime + ISO AND a 0xa005
+// InteropOffset → a nested InteropIFD with InteropIndex (0x0001 "R98"). When
+// bundled re-dispatches the 0x8769 TIFF via `Exif::Main` (Canon.pm:9838-9843),
+// it names the top-level directory `ExifIFD` (so IFD0's direct tags group
+// `EXIF:ExifIFD`) but PRESERVES the DirName of the nested sub-IFD (Exif.pm:416 +
+// 2720-2729 SET_GROUP1 `InteropIFD`). So the re-stamp keeps nested groups intact:
+//   - `EXIF:ExifIFD:ExposureTime` / `:ISO`           (top-level IFD0 → ExifIFD),
+//   - `EXIF:InteropIFD:InteropIndex`                 (nested 0xa005 → InteropIFD,
+//     NOT collapsed to ExifIFD),
+//   - `File:Track<N>:ExifByteOrder`                  (the ProcessTIFF marker).
+// Oracle-verified vs bundled 13.59 (`-ee -G3:1` and `-ee -G1`). Byte-exact at
+// both group modes, NO exclusion.
+#[test]
+fn canon_ctmd_exifinfo_nested_subifd_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_nested.mov",
+    "QuickTime_canon_ctmd_exifinfo_nested.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_nested.mov",
+    "QuickTime_canon_ctmd_exifinfo_nested.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// `-ee -G3:1 -n` (ValueConv) for the nested-sub-IFD re-dispatch: pins the raw
+// post-ValueConv `-n` tokens. The nested InteropIFD's `InteropIndex` stays under
+// `EXIF:InteropIFD` (raw token "R98", NOT the DCF PrintConv label, NOT under
+// ExifIFD); the top-level IFD0 tags stay under `EXIF:ExifIFD`. Oracle: bundled
+// ExifTool 13.59 (`-ee -G3:1 -n`).
+#[test]
+fn canon_ctmd_exifinfo_nested_n_match_bundled() {
+  let data = fixture("QuickTime_canon_ctmd_exifinfo_nested.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options(
+    "QuickTime_canon_ctmd_exifinfo_nested.mov",
+    &data,
+    false,
+    opts,
+  );
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  for (key, want) in [
+    ("Doc1:ExifIFD:ExposureTime", serde_json::json!(0.0125)),
+    ("Doc1:ExifIFD:ISO", serde_json::json!(400)),
+    // The nested InteropIFD keeps its DirName (NOT collapsed to ExifIFD).
+    ("Doc1:InteropIFD:InteropIndex", serde_json::json!("R98")),
+    ("Doc1:Track1:ExifByteOrder", serde_json::json!("II")),
+  ] {
+    assert_eq!(obj.get(key), Some(&want), "{key} -n token mismatch");
+  }
+  // The nested sub-IFD tag MUST NOT appear under ExifIFD (the collapse bug).
+  assert_eq!(
+    obj.get("Doc1:ExifIFD:InteropIndex"),
+    None,
+    "InteropIndex must not collapse to ExifIFD"
+  );
+}
+
+// ── Canon CTMD: 0x8769 Model hand-off to a 0x927c model-conditional tag ──────
+//
+// `ProcessExifInfo` processes a sample's ExifInfo entries IN ORDER
+// (Canon.pm:10739-10751): a 0x8769 (ExifIFD) entry's IFD0 Model sets
+// `$$self{Model}`, and a LATER 0x927c (MakerNoteCanon) entry's `Canon::Main`
+// decode keys its MODEL-CONDITIONAL sub-tables on it. `$$self{Model}` is
+// OBJECT-level state — STICKY across records AND across samples. The fixture's
+// two samples prove both halves (oracle-verified vs bundled 13.59):
+//   Doc1: 0x8769(Model="Canon EOS R5") THEN 0x927c(ShotInfo CameraTemperature
+//         raw=158). The handed-off EOS Model passes the CameraTemperature
+//         Condition (`$$self{Model} =~ /EOS/ and !~ /EOS-1DS?$/`, Canon.pm:2868),
+//         so `Doc1:Track1:CameraTemperature` = 158-128 = "30 C". WITHOUT the
+//         hand-off (the emitter passing None) the tag would be ABSENT.
+//   Doc2: 0x927c-only(ShotInfo CameraTemperature raw=200). No 0x8769 in this
+//         sample, but `$$self{Model}` STAYS "Canon EOS R5" from Doc1, so
+//         `Doc2:Track1:CameraTemperature` = 200-128 = "72 C" — the cross-sample
+//         stickiness. (AutoISO=100 is model-AGNOSTIC: present in both as the
+//         control proving the ShotInfo array itself decoded.)
+// Byte-exact at both `-G1` (`.ee.json`) and `-G3:1` (`.ee.g3.json`), NO exclusion.
+#[test]
+fn canon_ctmd_exifinfo_model_handoff_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_model.mov",
+    "QuickTime_canon_ctmd_exifinfo_model.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_model.mov",
+    "QuickTime_canon_ctmd_exifinfo_model.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The model hand-off at `-ee -G3:1` (PrintConv) and `-ee -G1 -n` (ValueConv),
+// asserting the model-CONDITIONAL `CameraTemperature` tags directly: Doc1 gets
+// it from the in-sample 0x8769 Model, Doc2 from the STICKY cross-sample
+// `$$self{Model}`. WITHOUT the hand-off the emitter would pass `None`, the
+// Condition (`$$self{Model} =~ /EOS/`) would fail, and BOTH CameraTemperature
+// tags would be absent — so these assertions pin that bundled decodes them USING
+// the handed-off Model and exifast matches. Oracle: bundled ExifTool 13.59.
+#[test]
+fn canon_ctmd_exifinfo_model_handoff_camera_temperature_present() {
+  let data = fixture("QuickTime_canon_ctmd_exifinfo_model.mov");
+  // `-ee -G3:1` PrintConv: per-Doc CameraTemperature with the `"$val C"` PrintConv.
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_canon_ctmd_exifinfo_model.mov", &data, true, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  for (key, want) in [
+    // Doc1: from the in-sample 0x8769 Model "Canon EOS R5" (158-128 = 30).
+    ("Doc1:Track1:CameraTemperature", serde_json::json!("30 C")),
+    ("Doc1:ExifIFD:Model", serde_json::json!("Canon EOS R5")),
+    // Doc2: NO 0x8769 here, but $$self{Model} is sticky ⇒ 200-128 = 72.
+    ("Doc2:Track1:CameraTemperature", serde_json::json!("72 C")),
+  ] {
+    assert_eq!(obj.get(key), Some(&want), "{key} (PrintConv) mismatch");
+  }
+
+  // `-ee -G1 -n` ValueConv: at G1 the two Docs collapse first-wins onto Doc1's
+  // raw CameraTemperature (30, the post-ValueConv `$val - 128` integer).
+  let nopts = ParseOptions::default().with_extract_embedded(true);
+  let ngot = extract_info_with_options(
+    "QuickTime_canon_ctmd_exifinfo_model.mov",
+    &data,
+    false,
+    nopts,
+  );
+  let nv: serde_json::Value = serde_json::from_str(&ngot).expect("valid JSON");
+  let nobj = nv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    nobj.get("Track1:CameraTemperature"),
+    Some(&serde_json::json!(30)),
+    "the -n CameraTemperature is the raw post-ValueConv integer keyed on the handed-off Model"
+  );
+}
+
+// ── Canon CTMD: duplicate IFD0 Model in one 0x8769 — last-wins ──
+//
+// A hostile 0x8769 (ExifIFD) whose IFD0 carries TWO Model tags — a non-EOS
+// "Canon PowerShot S100" FIRST, then "Canon EOS R5" — followed by a 0x927c
+// (MakerNoteCanon) ShotInfo CameraTemperature (raw=158). Exif.pm:599's RawConv
+// `$$self{Model} = $val` runs EACH time a Model tag is handled, so the LATER
+// (EOS) Model is in `$$self{Model}` when the 0x927c re-dispatches (LAST-wins).
+// The EOS Model passes the CameraTemperature Condition (`$$self{Model} =~ /EOS/`,
+// Canon.pm:2868) ⇒ `Doc1:Track1:CameraTemperature` = 158-128 = "30 C", and the
+// emitted `Doc1:ExifIFD:Model` is ALSO last-wins ("Canon EOS R5"). Under the
+// pre-R6 FIRST-wins capture the non-EOS PowerShot would win, the Condition would
+// FAIL, and CameraTemperature would be ABSENT — so this fixture is a direct
+// last-vs-first discriminator. Byte-exact at both `-G1` and `-G3:1`, NO exclusion.
+#[test]
+fn canon_ctmd_exifinfo_dup_model_last_wins_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_dupmodel.mov",
+    "QuickTime_canon_ctmd_exifinfo_dupmodel.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_exifinfo_dupmodel.mov",
+    "QuickTime_canon_ctmd_exifinfo_dupmodel.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The duplicate-Model last-wins asserted directly: the model-CONDITIONAL
+// `CameraTemperature` is present ONLY because the LAST (EOS) Model won. WITHOUT
+// last-wins (the pre-R6 first-wins keeping the non-EOS PowerShot) the Condition
+// would fail and the tag would be absent — so this pins that exifast hands off
+// the LAST IFD0 Model, matching bundled 13.59.
+#[test]
+fn canon_ctmd_exifinfo_dup_model_camera_temperature_present() {
+  let data = fixture("QuickTime_canon_ctmd_exifinfo_dupmodel.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options(
+    "QuickTime_canon_ctmd_exifinfo_dupmodel.mov",
+    &data,
+    true,
+    opts,
+  );
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  for (key, want) in [
+    ("Doc1:Track1:CameraTemperature", serde_json::json!("30 C")),
+    ("Doc1:ExifIFD:Model", serde_json::json!("Canon EOS R5")),
+  ] {
+    assert_eq!(obj.get(key), Some(&want), "{key} (PrintConv) mismatch");
+  }
+}
+
+// ── Canon CTMD: embedded ExifInfo TIFF diagnostics ───────────────────────────
+//
+// The CTMD type-7/8/9 re-dispatch parses each embedded TIFF (Canon.pm:10745-
+// 10751); a MALFORMED one (valid header + bad IFD0 offset) raises a normal EXIF
+// `Bad $dir directory` warning UNDER the active Doc/Track scope. Two one-sample
+// fixtures isolate each re-dispatch tag — the warning rides the SAME
+// `Doc<N>:Track<N>:Warning` channel (priority-0 first-wins) as the ProcessCTMD
+// walk-abort warnings:
+//   badexif — a 0x8769 (ExifIFD) block ⇒ `Track1:ExifByteOrder` STILL emits
+//             (the header parsed) AND a NON-minor `Bad ExifIFD directory`.
+//   badmn   — a 0x927c (MakerNoteCanon) block ⇒ NO ExifByteOrder (the MakerNote
+//             re-dispatch never surfaces it) and the MINOR `[minor] Bad
+//             MakerNotes directory` ($inMakerNotes ⇒ minor). The TimeStamp ahead
+//             of each bad block still decodes.
+// Byte-exact at both `-G1` (`.ee.json`) and `-G3:1` (`.ee.g3.json`), NO exclusion.
+#[test]
+fn canon_ctmd_bad_embedded_exif_diagnostics_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badexif.mov",
+    "QuickTime_canon_ctmd_badexif.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badexif.mov",
+    "QuickTime_canon_ctmd_badexif.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn canon_ctmd_bad_embedded_makernote_diagnostics_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmn.mov",
+    "QuickTime_canon_ctmd_badmn.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmn.mov",
+    "QuickTime_canon_ctmd_badmn.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G3:1 -n` (ValueConv): the warning string renders identically
+// at `-n` (it carries no conv), so the bad-block `Doc1:Track1:Warning` token is
+// the SAME as `-j`, while the 0x8769 `Doc1:Track1:ExifByteOrder` drops to the
+// bare `II` marker. Oracle: bundled ExifTool 13.59 (`-ee -G3:1 -n`).
+#[test]
+fn canon_ctmd_bad_embedded_n_match_bundled() {
+  // badexif: ExifByteOrder bare `II` + the non-minor warning.
+  let edata = fixture("QuickTime_canon_ctmd_badexif.mov");
+  let eopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let egot = extract_info_with_options("QuickTime_canon_ctmd_badexif.mov", &edata, false, eopts);
+  let ev: serde_json::Value = serde_json::from_str(&egot).expect("valid JSON");
+  let eobj = ev.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    eobj.get("Doc1:Track1:ExifByteOrder"),
+    Some(&serde_json::json!("II")),
+    "0x8769 ExifByteOrder is the bare `II` marker at -n"
+  );
+  assert_eq!(
+    eobj.get("Doc1:Track1:Warning"),
+    Some(&serde_json::json!("Bad ExifIFD directory")),
+    "0x8769 bad IFD0 raises the non-minor `Bad ExifIFD directory` warning"
+  );
+
+  // badmn: the MINOR warning (`[minor] ` prefix preserved at -n), no ExifByteOrder.
+  let mdata = fixture("QuickTime_canon_ctmd_badmn.mov");
+  let mopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let mgot = extract_info_with_options("QuickTime_canon_ctmd_badmn.mov", &mdata, false, mopts);
+  let mv: serde_json::Value = serde_json::from_str(&mgot).expect("valid JSON");
+  let mobj = mv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    mobj.get("Doc1:Track1:Warning"),
+    Some(&serde_json::json!("[minor] Bad MakerNotes directory")),
+    "0x927c bad IFD0 raises the MINOR `[minor] Bad MakerNotes directory` warning"
+  );
+  assert!(
+    mobj.get("Doc1:Track1:ExifByteOrder").is_none(),
+    "the 0x927c MakerNote re-dispatch never surfaces ExifByteOrder"
+  );
+}
+
+// Canon CTMD 0x927c re-dispatch routes through `Canon::Main` — NOT the generic
+// Exif walker. A type-7 carries a 0x927c (MakerNoteCanon) block
+// whose READABLE IFD0 holds a CanonFirmwareVersion AND a bogus 0x8769
+// (ExifIFD-style) pointer. `%Canon::Main` has no 0x8769 key (Canon's MakerNote
+// carries no ExifIFD pointer; its sub-tables are ProcessBinaryData, not
+// ProcessExif IFD sub-dirs), so bundled NEVER follows it: the block decodes
+// (`Doc1:Track1:CanonFirmwareVersion = "FW1.0.0"`) and NO `Bad ExifIFD
+// directory` warning is raised. Using the generic Exif walker for the 0x927c
+// diagnostics would emit that spurious nested warning. Byte-exact at both group
+// modes (the goldens carry NO `Warning` for this Doc), NO exclusion.
+#[test]
+fn canon_ctmd_makernote_nested_exif_pointer_not_followed_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmn_nested.mov",
+    "QuickTime_canon_ctmd_badmn_nested.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmn_nested.mov",
+    "QuickTime_canon_ctmd_badmn_nested.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// ── Canon CTMD: 0x927c PER-ENTRY value-offset warnings ──────────
+//
+// A READABLE 0x927c (MakerNoteCanon) IFD0 whose Canon tag has a bad OUT-OF-LINE
+// value pointer raises a per-entry value-offset warning under `$inMakerNotes`
+// (ProcessTIFF → ProcessExif-under-`Canon::Main`, in-memory ⇒ no RAF). Two
+// one-sample fixtures isolate each (oracle-verified vs bundled 13.59):
+//   badmnval  — value pointer far past EOF ⇒ the no-RAF `Bad offset for $dir
+//               $tagStr` (Exif.pm:6660), `$dir` re-mapped to `MakerNotes`,
+//               `$tagStr` the `%Canon::Main` name, MINOR (`$inMakerNotes`):
+//               `Doc1:Track1:Warning = "[minor] Bad offset for MakerNotes
+//               CanonFirmwareVersion"`.
+//   badmnsusp — value pointer IN bounds but overlapping the directory ⇒ the
+//               `Suspicious $dir offset for $tagStr` (Exif.pm:6675), MINOR:
+//               `"[minor] Suspicious MakerNotes offset for CanonFirmwareVersion"`.
+// The IFD0 directory itself parses, so NO `Bad MakerNotes directory`; the warning
+// rides the SAME priority-0 first-wins `Doc<N>:Track<N>:Warning` channel as the
+// ProcessCTMD/ExifInfo diagnostics, after the clean `TimeStamp`. The generic Exif
+// walker would emit the wrong `Error reading value` text (its RAF/non-MakerNotes
+// model) and abort — this pins the in-memory `$inMakerNotes` path. Byte-exact at
+// both group modes, NO exclusion.
+#[test]
+fn canon_ctmd_makernote_bad_value_offset_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnval.mov",
+    "QuickTime_canon_ctmd_badmnval.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnval.mov",
+    "QuickTime_canon_ctmd_badmnval.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The `badmnsusp` value pointer is IN bounds (it merely OVERLAPS the directory),
+// so bundled's `$inMakerNotes` path `next`-SKIPS the entry (Exif.pm:6672-6678)
+// and emits NO `CanonFirmwareVersion`. The shared Canon body walker
+// (`walk_canon_in_tiff`) now ALSO `next`-skips a suspect-offset entry (
+// `value_ptr < 8` OR a value range overlapping the IFD directory), so the
+// spurious `Track<N>:CanonFirmwareVersion` is gone and this is FULLY byte-exact
+// — NO exclusion. The `Suspicious MakerNotes offset` Warning still rides the
+// diagnostic channel (asserted by `canon_ctmd_makernote_value_offset_warning_text`).
+#[test]
+fn canon_ctmd_makernote_suspicious_value_offset_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnsusp.mov",
+    "QuickTime_canon_ctmd_badmnsusp.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnsusp.mov",
+    "QuickTime_canon_ctmd_badmnsusp.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// The 0x927c value-offset warnings assert directly at `-ee -G3:1` (PrintConv):
+// the exact bundled `Doc1:Track1:Warning` text, AND that the `Bad offset` /
+// `Suspicious offset` case is MINOR (`[minor]` prefix). The clean `TimeStamp`
+// still decodes (the warning rides alongside, not an abort). Oracle: bundled 13.59.
+#[test]
+fn canon_ctmd_makernote_value_offset_warning_text() {
+  for (fix, want) in [
+    (
+      "QuickTime_canon_ctmd_badmnval.mov",
+      "[minor] Bad offset for MakerNotes CanonFirmwareVersion",
+    ),
+    (
+      "QuickTime_canon_ctmd_badmnsusp.mov",
+      "[minor] Suspicious MakerNotes offset for CanonFirmwareVersion",
+    ),
+  ] {
+    let data = fixture(fix);
+    let opts = ParseOptions::default()
+      .with_extract_embedded(true)
+      .with_group3(true);
+    let got = extract_info_with_options(fix, &data, true, opts);
+    let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+    let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+    assert_eq!(
+      obj.get("Doc1:Track1:Warning"),
+      Some(&serde_json::json!(want)),
+      "{fix}: 0x927c per-entry value-offset Warning text mismatch"
+    );
+    assert_eq!(
+      obj.get("Doc1:Track1:TimeStamp"),
+      Some(&serde_json::json!("2018:02:21 12:08:56.21")),
+      "{fix}: the clean TimeStamp still decodes alongside the value-offset Warning"
+    );
+  }
+}
+
+// ── Canon CTMD: IFD-tail + per-entry validation crafted edges ─────
+//
+// The CTMD re-dispatch's IFD-validation reproduces `ProcessExif`'s
+// directory-shape gate (`Exif.pm:6343-6400`) AND per-entry checks
+// (`Exif.pm:6454-6679`) BYTE-EXACTLY, with the emission SKIP and the diagnostic
+// WARNING driven by ONE shared predicate ([`body::classify_canon_directory`] /
+// [`body::classify_canon_entry`] for `0x927c`; the no-RAF generic walker for
+// `0x8769`) — they can NEVER disagree (the R8 bug was a `dir_end + 4 <=
+// data_len` diagnostic gate that suppressed the warning while the emission still
+// skipped). Each fixture isolates one shape; byte-exact at BOTH group modes
+// (`.ee.json` `-G1` and `.ee.g3.json` `-G3:1`), NO exclusion. Oracle: bundled
+// ExifTool 13.59.
+
+// R8 PROPER: a `0x927c` IFD ending EXACTLY at the block boundary (`$bytesFromEnd
+// == 0`) AND a `2`-byte-tail variant (`$bytesFromEnd == 2`) — both LEGAL tails,
+// so the directory is walked and the suspect (directory-overlapping) value
+// offset is reached ⇒ `[minor] Suspicious MakerNotes offset for
+// CanonFirmwareVersion` (the warning NOW fires alongside the emission skip).
+#[test]
+fn canon_ctmd_makernote_suspicious_offset_block_boundary_tail_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_badmnsusp_tail0.mov",
+    "QuickTime_canon_ctmd_badmnsusp_tail2.mov",
+  ] {
+    check_ee_excluding(fix, &format!("{fix}.ee.json"), false, NO_EXCL);
+    check_ee_excluding(fix, &format!("{fix}.ee.g3.json"), true, NO_EXCL);
+  }
+}
+
+// Illegal `1`-/`3`-byte IFD tails (`$bytesFromEnd` ∈ {1,3}) ⇒ the directory
+// ABORTS with `Illegal MakerNotes directory size (1 entries)` (`Exif.pm:6397`) —
+// NON-minor (the Perl `$et->Warn` carries no minor arg even under
+// `$inMakerNotes`), no entry read. Pins both the abort (emission) and the
+// NON-minor level (the prior force-minor was wrong).
+#[test]
+fn canon_ctmd_makernote_illegal_directory_tail_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_badmn_tail1.mov",
+    "QuickTime_canon_ctmd_badmn_tail3.mov",
+  ] {
+    check_ee_excluding(fix, &format!("{fix}.ee.json"), false, NO_EXCL);
+    check_ee_excluding(fix, &format!("{fix}.ee.g3.json"), true, NO_EXCL);
+  }
+}
+
+// Bad NONZERO format code (`Exif.pm:6463-6477`): on entry 0 ⇒ `[minor] Bad
+// format (99) for MakerNotes entry 0` + ABORT (no value); on entry 1 (after a
+// VALID entry 0) ⇒ CanonFirmwareVersion STILL emits AND `[minor] Bad format (99)
+// for MakerNotes entry 1` (`next`-skip, NOT abort). The `Bad format` warning was
+// previously absent from the `0x927c` diagnostic walk entirely.
+#[test]
+fn canon_ctmd_makernote_bad_format_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_badmnfmt0.mov",
+    "QuickTime_canon_ctmd_badmnfmt1.mov",
+  ] {
+    check_ee_excluding(fix, &format!("{fix}.ee.json"), false, NO_EXCL);
+    check_ee_excluding(fix, &format!("{fix}.ee.g3.json"), true, NO_EXCL);
+  }
+}
+
+// Count overflow (`$size > 0x7fffffff`, `Exif.pm:6505`) ⇒ `[minor] Invalid size
+// (4294967296) for MakerNotes tag 0x0007 CanonFirmwareVersion` — the FIRST
+// `$size > 4` test, reported as `Invalid size` (with the `TagName` form), NOT as
+// `Bad offset`. (The prior hand-walk mis-reported it as `Bad offset`.)
+#[test]
+fn canon_ctmd_makernote_invalid_size_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnsize.mov",
+    "QuickTime_canon_ctmd_badmnsize.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badmnsize.mov",
+    "QuickTime_canon_ctmd_badmnsize.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// `0x8769` ExifIFD no-RAF re-dispatch: an OUT-OF-BOUNDS Make (entry 0) then a
+// VALID inline Software (entry 1). Bundled re-frames `$dataPt` to the embedded
+// block with NO RAF, so the OOB value warns `Bad offset for ExifIFD Make`
+// (NON-minor, `$inMakerNotes = 0`) + `$bad = 1` and CONTINUES ⇒ the LATER
+// Software STILL decodes (`Doc1:ExifIFD:Software`). A RAF-modeled walk would
+// `Error reading value` + ABORT, dropping Software AND mis-naming the warning —
+// this pins the faithful no-RAF branch (both the text and the survival of the
+// later entry).
+#[test]
+fn canon_ctmd_exififd_no_raf_bad_offset_continues_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badexifval.mov",
+    "QuickTime_canon_ctmd_badexifval.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_badexifval.mov",
+    "QuickTime_canon_ctmd_badexifval.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// `$warnCount > 10` directory abort (`Exif.pm:6455-6456`). An IFD0
+// with a VALID entry 0, 12 BAD-format entries (entries 1..12), then a VALID
+// later entry: ExifTool counts entries 1..11 (11 warnings) and at entry 12
+// `$warnCount > 10` fires ⇒ `Too many warnings -- $dir parsing aborted` +
+// `return 0`, so the LATER valid entry is SUPPRESSED. The abort warning is the
+// 12th distinct one (deduped behind the first `Bad format … entry 1` — first-
+// wins), so the surviving `Warning` is `Bad format (255) for <dir> entry 1` and
+// the OBSERVABLE effect is the dropped later entry. Two re-dispatch tables:
+//   warnmany_mn   — `0x927c` MakerNoteCanon (Canon emission + diagnostic walks,
+//                   `$inMakerNotes = 1` ⇒ `[minor]`): CanonFirmwareVersion emits,
+//                   OwnerName (entry 13) suppressed.
+//   warnmany_exif — `0x8769` ExifIFD (the shared generic Walker,
+//                   `$inMakerNotes = 0`): ExposureTime emits, ISO suppressed.
+#[test]
+fn canon_ctmd_too_many_warnings_directory_abort_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_warnmany_mn.mov",
+    "QuickTime_canon_ctmd_warnmany_exif.mov",
+  ] {
+    check_ee_excluding(fix, &std::format!("{fix}.ee.json"), false, NO_EXCL);
+    check_ee_excluding(fix, &std::format!("{fix}.ee.g3.json"), true, NO_EXCL);
+  }
+}
+
+// R9-2: `ProcessExif` has NO zero-entry or maximum-count directory gate
+// (`Exif.pm:6343-6400`). Two ends:
+//   badmn_zero_tail1/3 — a `0x927c` IFD0 with ZERO entries and a `1`/`3`-byte
+//     tail ⇒ the NON-minor `Illegal MakerNotes directory size (0 entries)`
+//     (`Exif.pm:6397`) + abort. (The retired `num_entries == 0` reject would
+//     have dropped this warning.)
+//   mn_manyentries — a `0x927c` IFD0 with 1100 (> 1024) VALID in-bounds entries
+//     ⇒ bundled WALKS them all (the first decodes `CanonFirmwareVersion`), NO
+//     warning. (The retired `MAX_SANE_ENTRIES = 1024` ceiling dropped the whole
+//     directory.)
+#[test]
+fn canon_ctmd_makernote_zero_and_large_directory_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_badmn_zero_tail1.mov",
+    "QuickTime_canon_ctmd_badmn_zero_tail3.mov",
+    "QuickTime_canon_ctmd_mn_manyentries.mov",
+  ] {
+    check_ee_excluding(fix, &std::format!("{fix}.ee.json"), false, NO_EXCL);
+    check_ee_excluding(fix, &std::format!("{fix}.ee.g3.json"), true, NO_EXCL);
+  }
+}
+
+// Canon CTMD partial-duplicate type-5 ExposureInfo merges PER FIELD (Codex
+// R3-2). ONE sample: a FULL type-5 (FNumber 3.5 / ExposureTime 1/80 / ISO
+// 12800), then an 8-byte type-5 (FNumber 8.0 + ExposureTime 1/250, no ISO),
+// then a 4-byte type-5 (FNumber 5.6 only). Bundled HandleTags each record;
+// ProcessBinaryData emits only the fields that fit the payload and resolves
+// duplicates per tag NAME (Canon.pm:9874-9887; ExifTool.pm:9514-9565), so the
+// merged sample is FNumber 5.6 (LAST record), ExposureTime 1/250 (the 8-byte
+// record — the 4-byte one omitted it), ISO 12800 (the FULL record — neither
+// partial carried it). A partial record must NOT clobber the sibling fields.
+// Byte-exact at both group modes, NO exclusion.
+#[test]
+fn canon_ctmd_partial_duplicate_exposure_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_partialdup.mov",
+    "QuickTime_canon_ctmd_partialdup.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_canon_ctmd_partialdup.mov",
+    "QuickTime_canon_ctmd_partialdup.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G3:1 -n` (ValueConv) for the partial-duplicate ExposureInfo:
+// the per-field merge holds at `-n` too — FNumber 5.6 (raw F64), ExposureTime
+// the raw quotient seconds (1/250 = 0.004, NOT "1/250"), ISO the plain integer
+// 12800. Oracle: bundled ExifTool 13.59 (`-ee -G3:1 -n`).
+#[test]
+fn canon_ctmd_partial_duplicate_exposure_n_match_bundled() {
+  let data = fixture("QuickTime_canon_ctmd_partialdup.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_canon_ctmd_partialdup.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  for (key, want) in [
+    ("Doc1:Track1:FNumber", serde_json::json!(5.6)),
+    ("Doc1:Track1:ExposureTime", serde_json::json!(0.004)),
+    ("Doc1:Track1:ISO", serde_json::json!(12800)),
+  ] {
+    assert_eq!(obj.get(key), Some(&want), "{key} -n token mismatch");
+  }
+}
+
+// All the new CTMD fixtures at no-`ee`: `CTMD` is a `meta`-handler `trak`, so
+// the per-sample emission (incl. the ProcessCTMD warnings + the ExifInfo
+// re-dispatch) is fully `-ee`-gated. The no-`ee` path emits only the standard
+// `[minor] ExtractEmbedded` `Track1:Warning` + the structural
+// `Track1:MetaFormat`. Byte-exact, NO exclusion.
+#[test]
+fn canon_ctmd_variants_noee_byte_exact() {
+  for fix in [
+    "QuickTime_canon_ctmd_rational.mov",
+    "QuickTime_canon_ctmd_warn_short.mov",
+    "QuickTime_canon_ctmd_warn_trunc.mov",
+    "QuickTime_canon_ctmd_warn_residue.mov",
+    "QuickTime_canon_ctmd_shortts.mov",
+    "QuickTime_canon_ctmd_exifinfo.mov",
+    "QuickTime_canon_ctmd_exifinfo_model.mov",
+    "QuickTime_canon_ctmd_badexif.mov",
+    "QuickTime_canon_ctmd_badmn.mov",
+    "QuickTime_canon_ctmd_badmn_nested.mov",
+    "QuickTime_canon_ctmd_partialdup.mov",
+    "QuickTime_canon_ctmd_warnmany_mn.mov",
+    "QuickTime_canon_ctmd_warnmany_exif.mov",
+    "QuickTime_canon_ctmd_badmn_zero_tail1.mov",
+    "QuickTime_canon_ctmd_badmn_zero_tail3.mov",
+    "QuickTime_canon_ctmd_mn_manyentries.mov",
+  ] {
+    check_noee_excluding(fix, &std::format!("{fix}.json"), NO_EXCL);
+  }
+}
+
 #[test]
 fn camm_noee_warning_byte_exact() {
   check_noee_excluding("QuickTime_camm.mov", "QuickTime_camm.mov.json", NO_EXCL);

@@ -57,8 +57,8 @@ use crate::{
   format_parser::{FormatParser, parser_sealed},
   formats::{quicktime_freegps, quicktime_stream},
   metadata::{
-    CammMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeGps,
-    QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
+    CammMeta, CanonCtmdMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack,
+    QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -3093,6 +3093,15 @@ pub struct Meta<'a> {
   /// that frame's camera + GPS tags. Faithful port of
   /// `Image::ExifTool::Sony::Process_rtmd` + the `Sony::rtmd` tag table.
   sony_rtmd: SonyRtmdMeta,
+  /// **SP4** — Canon EOS R-line / Cinema-line `CTMD` ("Canon Timed
+  /// MetaData") — decoded through the `CTMD` MetaFormat dispatch in
+  /// [`quicktime_stream`]. Empty ([`CanonCtmdMeta::is_empty`]) for a non-Canon
+  /// video (or one whose `CTMD` track is absent). Each timed sample is one
+  /// `Doc<N>` sub-document carrying that frame's TimeStamp / FocalInfo /
+  /// ExposureInfo. Faithful port of `Image::ExifTool::Canon::ProcessCTMD`
+  /// (Canon.pm:10758-10804) + the `Canon::CTMD` / `FocalInfo` / `ExposureInfo`
+  /// tag tables (Canon.pm:9790-9887).
+  canon_ctmd: CanonCtmdMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3192,6 +3201,19 @@ impl Meta<'_> {
     &self.sony_rtmd
   }
 
+  /// **SP4** — Canon EOS R-line / Cinema-line `CTMD` ("Canon Timed
+  /// MetaData"). [`CanonCtmdMeta::is_empty`] for a non-Canon video (or one
+  /// whose `CTMD` metadata track is absent). Faithful port of
+  /// `Image::ExifTool::Canon::ProcessCTMD` (Canon.pm:10758-10804) + the
+  /// `Image::ExifTool::Canon::CTMD` / `FocalInfo` / `ExposureInfo` tag tables
+  /// (Canon.pm:9790-9887). Populated by the `CTMD` MetaFormat dispatch in
+  /// [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn canon_ctmd(&self) -> &CanonCtmdMeta {
+    &self.canon_ctmd
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3235,6 +3257,13 @@ impl Meta<'_> {
     // hardware, above the generic SP3 timed-metadata scan. Set-once per domain
     // (no-ops when a higher-priority source already populated camera / GPS).
     self.sony_rtmd.project_into(&mut md);
+    // **SP4 — Canon CTMD** camera identity (Make="Canon") + capture / lens from
+    // the timed CTMD records. Sits at the SAME tier as Sony rtmd (below GoPro /
+    // CAMM on-device hardware, above the generic SP3 timed-metadata scan).
+    // Set-once per domain (no-ops when a higher-priority source already
+    // populated the domain it would write). Canon CTMD surfaces no GPS today
+    // (Canon writes GPS via the embedded Exif TIFF blocks, deferred — #82).
+    self.canon_ctmd.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -3681,6 +3710,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `rtmd` track (one `SonyRtmdSample` per sample). Additive to the existing
   // per-format sample dispatch, exactly like `camm_meta`.
   let mut sony_rtmd_meta = SonyRtmdMeta::new();
+  // **SP4 — Canon CTMD** accumulator, populated by the `CTMD` MetaFormat
+  // dispatch in [`quicktime_stream`] for each timed-metadata sample of a Canon
+  // CR3 / CRM / MOV / MP4 video's `CTMD` track (one `CanonCtmdSample` per
+  // sample). Additive to the existing per-format sample dispatch, exactly like
+  // `sony_rtmd_meta`.
+  let mut canon_ctmd_meta = CanonCtmdMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
   // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
   // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
@@ -3718,6 +3753,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     &mut gopro_meta,
     &mut camm_meta,
     &mut sony_rtmd_meta,
+    &mut canon_ctmd_meta,
   );
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
@@ -3774,6 +3810,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     gopro: gopro_meta,
     android_camm: camm_meta,
     sony_rtmd: sony_rtmd_meta,
+    canon_ctmd: canon_ctmd_meta,
     embedded_exif_deferred,
     file_type,
     mime,
@@ -5174,6 +5211,200 @@ impl crate::emit::Taggable for Meta<'_> {
       flush_doc(&mut doc_vals, &mut sony_committed, &mut tags);
     }
 
+    // ── SP4: Canon CTMD per-sample TimeStamp / Focal / Exposure (Canon) ──
+    // `ProcessCTMD` (Canon.pm:10758-10804) decodes ONE timed sample per `CTMD`
+    // sample-table entry; ExifTool's `ProcessSamples` opens a `Doc<N>` per
+    // sample and `HandleTag`s every decoded record under it, scoped to the
+    // enclosing `Track<N>` (family-1). NOTE (oracle-verified vs bundled 13.59):
+    // although `%Canon::CTMD` declares `GROUPS => { 1 => 'Canon' }`, the timed-
+    // metadata `ProcessSamples` machinery re-scopes every record's family-1 to
+    // the trak's `Track<N>` (oracle `Doc1:Track1:TimeStamp`, NOT `Canon:…`) —
+    // IDENTICAL group machinery to the `rtmd` / `mebx` blocks above. Gated on
+    // `-ee`; `-G1` collapses every `Doc<N>` to one `(Track<N>, name)` row
+    // (within-sample last-wins, across-sample first-wins). Each sample's records
+    // emit in the fixed Canon.pm record order (SampleTime/SampleDuration, then
+    // TimeStamp, FocalLength, then the ExposureInfo FNumber/ExposureTime/ISO) so
+    // the rendered key order matches the oracle token-for-token.
+    if opts.extract_embedded {
+      let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+      // Fallback running ordinal for any unstamped sample (none in practice —
+      // the walker stamps `doc()` on every sample); when stamped, used verbatim
+      // so all of one sample's records share ONE `Doc<N>`.
+      let mut doc: u32 = 0;
+      let mut ctmd_scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+      // `-G1` collapse state (unused at `-G3`), keyed by `(family1, name)` —
+      // the same two-rule collapse the `rtmd` block documents: within one
+      // sample last-wins, across samples first-wins.
+      let mut ctmd_committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
+        std::vec::Vec::new();
+      let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+        std::vec::Vec::new();
+      let mut cur_doc: Option<u32> = None;
+      let flush_doc =
+        |doc_vals: &mut std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)>,
+         committed: &mut std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
+         tags: &mut std::vec::Vec<EmittedTag>| {
+          for (key, tag) in doc_vals.drain(..) {
+            if committed.contains(&key) {
+              continue;
+            }
+            committed.push(key);
+            tags.push(tag);
+          }
+        };
+      for sample in self.canon_ctmd.samples() {
+        let doc_n = if sample.doc() == 0 {
+          doc += 1;
+          doc
+        } else {
+          sample.doc()
+        };
+        let track = std::format!("Track{}", {
+          let t = sample.track_index();
+          if t == 0 { 1 } else { t }
+        });
+        let group = if g3 {
+          Group::with_doc("QuickTime", track.as_str(), doc_n)
+        } else {
+          Group::new("QuickTime", track.as_str())
+        };
+        ctmd_scratch.clear();
+        // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
+        // `-n`) — the sample-table timing emitted ahead of the decoded payload.
+        for (val, name) in [
+          (sample.sample_time(), "SampleTime"),
+          (sample.sample_duration(), "SampleDuration"),
+        ] {
+          if let Some(secs) = val {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            ctmd_scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+        // TimeStamp (type 1, Canon.pm:9798-9806): the assembled
+        // `"YYYY:MM:DD HH:MM:SS.cc"` string. The PrintConv is `ConvertDateTime`,
+        // which passes this already-formatted Date/Time string through
+        // unchanged — emit verbatim in BOTH `-j` and `-n` (oracle-verified).
+        if let Some(v) = sample.time_stamp() {
+          ctmd_scratch.push(EmittedTag::new(
+            group.clone(),
+            "TimeStamp".into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+        // FocalLength (type 4, Canon.pm:9853-9864): `rational32u`, stored as the
+        // raw [`Rational`] (num/denom). At `-j` the PrintConv `sprintf("%.1f
+        // mm",$val)` → e.g. `"15.0 mm"` / `"3.3 mm"` for a finite quotient, or
+        // the numified non-finite (`"Inf mm"` for `n/0`, `"0.0 mm"` for `0/0`);
+        // at `-n` the raw `rational32u` `%.7g` form (`10/3` → `3.333333`,
+        // `inf`/`undef` for a zero denominator). See the helper.
+        if let Some(focal) = sample.focal()
+          && let Some(r) = focal.focal_length_rational()
+        {
+          ctmd_scratch.push(EmittedTag::new(
+            group.clone(),
+            "FocalLength".into(),
+            canon_ctmd_focal_length_value(r, print_conv),
+            false,
+          ));
+        }
+        // ── ExposureInfo (type 5, Canon.pm:9866-9887) ─────────────────────
+        if let Some(exp) = sample.exposure() {
+          // FNumber (index 0): `rational32u`, stored as the raw [`Rational`]. At
+          // `-j` the PrintConv `Exif::PrintFNumber` of the ValueConv string
+          // (a finite quotient rounds to 1-2 decimals, e.g. `3.5`; a zero
+          // denominator's `undef`/`inf` word passes through unchanged); at `-n`
+          // the raw `rational32u` `%.7g` form. See the helper.
+          if let Some(r) = exp.f_number_rational() {
+            ctmd_scratch.push(EmittedTag::new(
+              group.clone(),
+              "FNumber".into(),
+              canon_ctmd_fnumber_value(r, print_conv),
+              false,
+            ));
+          }
+          // ExposureTime (index 1): `rational32u`, stored as the raw
+          // [`Rational`]. At `-j` the PrintConv `Exif::PrintExposureTime` of the
+          // ValueConv string (`1/80` → `"1/80"`; a zero denominator's
+          // `undef`/`inf` passes through); at `-n` the raw `rational32u` `%.7g`
+          // form (`1/3` → `0.3333333`). See the helper.
+          if let Some(r) = exp.exposure_time_rational() {
+            ctmd_scratch.push(EmittedTag::new(
+              group.clone(),
+              "ExposureTime".into(),
+              canon_ctmd_exposure_time_value(r, print_conv),
+              false,
+            ));
+          }
+          // ISO (index 2): `int32u` with `ValueConv => '$val & 0x7fffffff'`
+          // (already masked in the typed layer). No PrintConv — the plain
+          // integer in BOTH modes (oracle `12800`).
+          if let Some(iso) = exp.iso() {
+            ctmd_scratch.push(EmittedTag::new(
+              group.clone(),
+              "ISO".into(),
+              TagValue::U64(u64::from(iso)),
+              false,
+            ));
+          }
+        }
+        // ── ExifInfo7/8/9 (types 7/8/9, Canon.pm:9818-9853) ───────────────
+        // Re-dispatch each embedded TIFF block through the Exif / Canon
+        // MakerNote walker, re-stamped to the bundled group (the EXIF tags
+        // re-scope to `EXIF:ExifIFD`, the MakerNote tags to `MakerNotes:
+        // Track<N>`, ExifByteOrder to `File:Track<N>` — all under this
+        // sample's `Doc<N>`). The blocks ride after the type-1/4/5 scalars in
+        // walk order; the same g3 / first-wins dedup below folds them.
+        for info in sample.exif_info() {
+          emit_ctmd_exif_info(
+            info,
+            track.as_str(),
+            doc_n,
+            g3,
+            print_conv,
+            &mut ctmd_scratch,
+          );
+        }
+        if g3 {
+          tags.append(&mut ctmd_scratch);
+        } else {
+          if cur_doc != Some(doc_n) {
+            flush_doc(&mut doc_vals, &mut ctmd_committed, &mut tags);
+            cur_doc = Some(doc_n);
+          }
+          for tag in ctmd_scratch.drain(..) {
+            let key = (
+              smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+              smol_str::SmolStr::new(tag.tag().name()),
+            );
+            if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+              slot.1 = tag;
+            } else {
+              doc_vals.push((key, tag));
+            }
+          }
+        }
+      }
+      flush_doc(&mut doc_vals, &mut ctmd_committed, &mut tags);
+    }
+
+    // ── SP4: Canon CTMD ProcessCTMD / TimeStamp-RawConv warnings ───────────
+    // `ProcessCTMD` (Canon.pm:10781/10782/10802) + the type-1 `TimeStamp`
+    // `RawConv` (Canon.pm:9801-9805) raise warnings under the SAMPLE that
+    // raised them — `ProcessSamples` opens a `Doc<N>` per sample
+    // (`FoundSomething`) and `$et->Warn` `FoundTag`s the `Warning` under that
+    // open `DOC_NUM`, scoped to the trak's `Track<N>`. The per-sample
+    // SampleTime/SampleDuration are already emitted by the CTMD payload block
+    // above (every CTMD sample — warning-only ones included — gets one), so
+    // this emitter pushes ONLY the `Warning` payload (priority-0 first-wins +
+    // WAS_WARNED `[xN]` dedup), exactly like [`emit_camm_warnings`]. The
+    // MINOR residue warning (`Warn(..., 1)`) carries the `[minor] ` prefix.
+    emit_ctmd_warnings(self.canon_ctmd.warnings(), opts, &mut first_seen, &mut tags);
+
     // ── SP4: GoPro GPMF (Image::ExifTool::GoPro) ───────────────────────
     // The `%GoPro::GPMF` / `%GoPro::GPS5` / `%GoPro::GPS9` tables emit under
     // family-0 `GoPro` (the module group) and family-1 `GoPro`
@@ -6349,6 +6580,99 @@ fn emit_camm_warnings<F: FnMut(&str, &str) -> bool>(
   }
 }
 
+/// Emit the Canon CTMD `ProcessCTMD` / `TimeStamp`-RawConv warnings as
+/// `Track<N>:Warning` tags — the CTMD counterpart of [`emit_camm_warnings`].
+///
+/// `ProcessCTMD` raises `Short CTMD record` / `Truncated CTMD record` (plain
+/// `$et->Warn`, Canon.pm:10781-10782) and the MINOR `Error parsing Canon CTMD
+/// data` (`$et->Warn(..., 1)`, Canon.pm:10802 ⇒ rendered `[minor] …`); the
+/// type-1 `TimeStamp` `RawConv` raises `'x' outside of string in unpack` /
+/// `Missing argument in sprintf` for a short payload (Canon.pm:9801-9805). All
+/// `FoundTag` a `Warning` under the raising SAMPLE's open `Doc<N>`
+/// (`ProcessSamples` opens one per sample), scoped to the trak's `Track<N>`.
+/// `ProcessCTMD` runs only under `ExtractEmbedded`, so they surface ONLY at
+/// `-ee`.
+///
+/// WAS_WARNED (`ExifTool.pm:5632-5639`) records each FINAL warning string once
+/// file-wide and bumps an occurrence COUNT; the surviving (first-emitted)
+/// `Warning` then gains a ` [x$n]` suffix when `n > 1` (`ExifTool.pm:3196-3203`)
+/// — applied to the `[minor] `-prefixed string (oracle: TWO residue samples →
+/// `[minor] Error parsing Canon CTMD data [x2]`). At `-ee -G3` the warning
+/// carries its CTMD sample's stamped `Doc<N>`; at `-ee -G1` it collapses to one
+/// `Track<N>:Warning` via the shared priority-0 first-wins `first_seen` gate.
+/// The per-sample SampleTime/SampleDuration are emitted by the CTMD payload
+/// block, so this emitter pushes ONLY the `Warning` payload.
+#[cfg(feature = "alloc")]
+fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
+  warnings: &[crate::metadata::CanonCtmdWarning],
+  opts: crate::emit::EmitOptions,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  // `ProcessCTMD` runs only under `ExtractEmbedded` → these surface only at `-ee`.
+  if !opts.extract_embedded {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+  // The FINAL rendered message (the `[minor] ` prefix applied for a minor
+  // warning) — the string WAS_WARNED keys + counts on, and the value bundled
+  // emits (before the ` [x$n]` suffix).
+  let rendered = |w: &crate::metadata::CanonCtmdWarning| -> std::string::String {
+    if w.minor() {
+      std::format!("[minor] {}", w.message())
+    } else {
+      w.message().to_string()
+    }
+  };
+  // WAS_WARNED occurrence count over ALL CTMD warnings, keyed on the FINAL
+  // rendered string (so the ` [x$n]` suffix reflects the file-wide total even
+  // though only the first occurrence emits a tag).
+  let count_of = |msg: &str| -> usize { warnings.iter().filter(|w| rendered(w) == msg).count() };
+  let warning_value = |msg: &str| -> TagValue {
+    let n = count_of(msg);
+    let text = if n > 1 {
+      smol_str::SmolStr::from(std::format!("{msg} [x{n}]"))
+    } else {
+      smol_str::SmolStr::from(msg)
+    };
+    TagValue::Str(text)
+  };
+  // FINAL-message strings whose surviving `Warning` has already been emitted at
+  // `-G3` (the WAS_WARNED first-occurrence gate — a later same-message sample
+  // emits no further `Warning`, only the CTMD payload block's own timing).
+  let mut warned_msgs: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  for w in warnings {
+    let family1 = std::format!("Track{}", w.track_index().unwrap_or(1));
+    let msg = rendered(w);
+    if g3 {
+      // `-G3`: the warning carries its CTMD sample's `Doc<N>`; the `TagMap` sink
+      // keeps distinct `(doc, family1, name)` rows. WAS_WARNED still suppresses a
+      // duplicate FINAL message after the first occurrence.
+      let key = smol_str::SmolStr::from(msg.as_str());
+      if !warned_msgs.contains(&key) {
+        warned_msgs.push(key);
+        let group = Group::with_doc("QuickTime", family1.as_str(), w.doc().unwrap_or(0));
+        tags.push(EmittedTag::new(
+          group,
+          "Warning".into(),
+          warning_value(&msg),
+          false,
+        ));
+      }
+    } else if first_seen(family1.as_str(), "Warning") {
+      // `-G1`: one `Track<N>:Warning` (priority-0 first-wins via the shared gate).
+      tags.push(EmittedTag::new(
+        Group::new("QuickTime", family1.as_str()),
+        "Warning".into(),
+        warning_value(&msg),
+        false,
+      ));
+    }
+  }
+}
+
 /// Emit the per-sample `SampleTime`/`SampleDuration` for camm TIMING-ONLY markers
 /// — recognized first-packet samples (their first packet matched a
 /// `camm0..camm7` Condition) that `ProcessCAMM` decoded to NO stored record (no
@@ -6881,6 +7205,209 @@ fn sony_rtmd_exposure_time_value(
     // `"undef"` / `"inf"` (zero denominator) ⇒ `IsFloat` is false ⇒
     // PrintExposureTime returns the value-string verbatim.
     _ => TagValue::Str(val_str.into()),
+  }
+}
+
+// ── Canon CTMD rational32u emission (FocalLength / FNumber / ExposureTime) ──
+//
+// Canon CTMD stores these three records as the RAW `rational32u`
+// ([`crate::value::Rational`] with `sig = 7`), so `-n` (ValueConv) renders
+// ExifTool's `GetRational32u` `%.7g` form (`10/3` → `3.333333`, NOT the
+// 15-digit f64) and a zero denominator keeps the bare `inf`/`undef` word — both
+// handled by the `Rational` serializer via [`TagValue::Rational`]. `-j`
+// (PrintConv) numifies the SAME ValueConv string the way each Perl PrintConv
+// does, all oracle-verified vs bundled ExifTool 13.59.
+
+/// `FocalLength`'s `sprintf("%.1f mm",$val)` PrintConv (Canon.pm:9863) applied
+/// to the `rational32u` ValueConv string. The Perl PrintConv has NO `IsFloat`
+/// guard — it always `sprintf`-numifies: a finite quotient → `"%.1f mm"`
+/// (`3.333…` → `"3.3 mm"`), `"undef"` (`0/0`) numifies to `0` → `"0.0 mm"`,
+/// `"inf"` (`n/0`) numifies to `Inf` → `"Inf mm"` (Perl `%f` titlecases
+/// infinity). `-n` is the raw [`Rational`].
+#[cfg(feature = "alloc")]
+fn canon_ctmd_focal_length_value(
+  r: crate::value::Rational,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::Rational(r);
+  }
+  let val_str = r.exiftool_val_str();
+  // Perl numification of the ValueConv scalar: a finite `%.7g` number parses;
+  // `"undef"` → 0.0; `"inf"` → +∞.
+  let numified = val_str.parse::<f64>().unwrap_or(0.0);
+  if numified.is_finite() {
+    TagValue::Str(std::format!("{numified:.1} mm").into())
+  } else {
+    // Perl `sprintf("%.1f mm", non-finite)`: titlecase `Inf`/`NaN`, then ` mm`.
+    match crate::value::perl_nonfinite_str(numified) {
+      Some(text) => TagValue::Str(std::format!("{text} mm").into()),
+      None => TagValue::Str(std::format!("{val_str} mm").into()),
+    }
+  }
+}
+
+/// `FNumber`'s `Exif::PrintFNumber($val)` PrintConv applied to the `rational32u`
+/// ValueConv string. `PrintFNumber` returns its argument UNCHANGED unless
+/// `IsFloat($val) and $val > 0` (Exif.pm:5715-5723), so a zero-denominator
+/// `"undef"`/`"inf"` passes through verbatim; a finite quotient rounds to 2
+/// decimals (`< 1`) or 1 decimal (`≥ 1`). `-n` is the raw [`Rational`].
+#[cfg(feature = "alloc")]
+fn canon_ctmd_fnumber_value(r: crate::value::Rational, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::Rational(r);
+  }
+  let val_str = r.exiftool_val_str();
+  match val_str.parse::<f64>() {
+    // A finite ValueConv number ⇒ the normal PrintFNumber shaping.
+    Ok(f) if f.is_finite() => TagValue::Str(crate::exif::tables::print_fnumber(f).into()),
+    // `"undef"` / `"inf"` ⇒ `IsFloat` is false ⇒ PrintFNumber returns it verbatim.
+    _ => TagValue::Str(val_str.into()),
+  }
+}
+
+/// `ExposureTime`'s `Exif::PrintExposureTime($val)` PrintConv applied to the
+/// `rational32u` ValueConv string — IDENTICAL shaping to
+/// [`sony_rtmd_exposure_time_value`] (the `1/x` / `%.1f` form for a finite
+/// value, the `"undef"`/`"inf"` word passed through for a zero denominator),
+/// but over a `sig = 7` rational. `-n` is the raw [`Rational`].
+#[cfg(feature = "alloc")]
+fn canon_ctmd_exposure_time_value(
+  r: crate::value::Rational,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::Rational(r);
+  }
+  let val_str = r.exiftool_val_str();
+  match val_str.parse::<f64>() {
+    Ok(f) if f.is_finite() => TagValue::Str(crate::exif::tables::print_exposure_time(f).into()),
+    _ => TagValue::Str(val_str.into()),
+  }
+}
+
+/// Re-dispatch one Canon CTMD `ExifInfo*` (type 7/8/9) embedded TIFF block and
+/// push its recovered tags into `out`, re-stamped to the bundled-faithful group
+/// (oracle-verified vs ExifTool 13.59 `-ee -G3:1:0`).
+///
+/// `Image::ExifTool::Canon::ProcessExifInfo` (Canon.pm:10730-10754) re-dispatches
+/// each `[len][tag][TIFF]` block via `ProcessTIFF` under the CTMD sample's open
+/// `Doc<N>` / `Track<N>` scope. The recovered tags carry these groups (which the
+/// standalone Exif / Canon-MakerNote walkers do NOT produce verbatim, so we
+/// re-stamp):
+///
+///  - **`0x8769` `ExifIFD`** → the standard Exif walker
+///    ([`parse_standalone_tiff_with_base`](crate::exif::parse_standalone_tiff_with_base)).
+///    Its `File:ExifByteOrder` re-scopes to family-1 `Track<N>` (family-0
+///    `File`); the walker's TOP-LEVEL `IFD0` tags emit under family-0 `EXIF`,
+///    family-1 `ExifIFD` (the 0x8769 directory's bundled name) — but a NESTED
+///    sub-IFD keeps its own DirName (`InteropIFD` via 0xa005, `IFD1`, …), and a
+///    GPS-IFD tag re-scopes family-1 to `Track<N>` (still family-0 `EXIF`). All
+///    under `Doc<N>` (`-G3`).
+///  - **`0x927c` `MakerNoteCanon`** → the Canon MakerNote walker
+///    ([`canon::redispatch_ctmd_makernote`](crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote)).
+///    Every recovered tag emits under family-0 `MakerNotes`, family-1
+///    `Track<N>`, `Doc<N>` (NO `ExifByteOrder` — the MakerNote re-dispatch does
+///    not surface it).
+///
+/// `print_conv` selects `-j` (PrintConv) vs `-n` (ValueConv); `g3` adds the
+/// `Doc<N>` family-3 axis (collapsed at `-G1`, where the across-doc first-wins
+/// dedup in the caller keeps the first sample's value per `family1:name`).
+#[cfg(feature = "alloc")]
+fn emit_ctmd_exif_info(
+  info: &crate::metadata::CtmdExifInfo,
+  track: &str,
+  doc_n: u32,
+  g3: bool,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::{EmittedTag, Taggable};
+  use crate::value::Group;
+  // Build a group on the CTMD sample's family-3 axis: `Doc<N>` when `-G3`, else
+  // collapsed (doc 0) — the caller's first-wins dedup folds the doc axis.
+  let scoped = |family0: &str, family1: &str| -> Group {
+    if g3 {
+      Group::with_doc(family0, family1, doc_n)
+    } else {
+      Group::new(family0, family1)
+    }
+  };
+  match info.tag() {
+    crate::metadata::CtmdExifTag::ExifIfd => {
+      // The embedded TIFF is self-contained (base 0); `ProcessExifInfo`'s
+      // `DataPos => -($pos + 8)` makes its out-of-line offsets block-relative.
+      // No-RAF re-dispatch: bundled re-frames `$dataPt` to the embedded block
+      // with no `RAF`, so an out-of-bounds out-of-line value warns `Bad offset
+      // for ExifIFD <tag>` and CONTINUES (the value is dropped) — NOT the
+      // RAF path's `Error reading value` + directory abort that would drop
+      // every LATER valid entry too. The diagnostic harvest
+      // ([`crate::formats::canon_ctmd`]) uses the same no-RAF entry point.
+      let Some(meta) = crate::exif::parse_ctmd_exif_ifd_redispatch(info.tiff()) else {
+        return;
+      };
+      let opts =
+        crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+      for tag in meta.tags(opts) {
+        let unknown = tag.unknown();
+        let (group, name, value) = tag.into_tag().into_parts();
+        let family0 = group.family0();
+        let family1 = group.family1();
+        // Re-stamp per the oracle (ExifTool 13.59, `-ee -G3:1`): the 0x8769
+        // SubDirectory is `ProcessTIFF`ed via `Exif::Main`, which names the
+        // top-level directory `ExifIFD` (Canon.pm:9838-9843; Exif.pm SET_GROUP1)
+        // but PRESERVES the DirName of any NESTED sub-IFD reached from it. So:
+        //   - `File:ExifByteOrder` → `File:Track<N>` (the byte-order marker rides
+        //     the sample's track scope);
+        //   - a GPS-IFD tag → `EXIF:Track<N>` (the GPS sub-IFD collapses onto the
+        //     track, oracle-confirmed);
+        //   - the generic walker's TOP-LEVEL `IFD0` → `EXIF:ExifIFD` (the 0x8769
+        //     directory's bundled name);
+        //   - every OTHER nested family-1 group (InteropIFD via 0xa005, IFD1, a
+        //     nested ExifIFD, …) keeps its DirName — bundled emits e.g.
+        //     `Doc1:InteropIFD:InteropIndex`, NOT collapsed to ExifIFD.
+        let restamped = if family0 == "File" {
+          scoped("File", track)
+        } else if family1 == "GPS" {
+          scoped("EXIF", track)
+        } else if family1 == "IFD0" {
+          scoped("EXIF", "ExifIFD")
+        } else {
+          scoped("EXIF", family1)
+        };
+        out.push(EmittedTag::new(restamped, name, value, unknown));
+      }
+    }
+    crate::metadata::CtmdExifTag::MakerNoteCanon => {
+      // The `0x927c` block is a complete TIFF whose IFD0 IS the Canon
+      // MakerNote — route it through `Canon::Main` (the same machinery the
+      // static-file MakerNote path uses). `model` is the `$$self{Model}` in
+      // effect at this block's `ProcessExifInfo` walk position — the IFD0 `Model`
+      // of a preceding in-sample `0x8769` `ExifIFD` block (captured at parse
+      // time, Canon.pm:10739-10751), so model-conditional Canon sub-tables
+      // (`Canon::ShotInfo` `CameraTemperature`, `Canon::FileInfo` position 1)
+      // evaluate against the handed-off Model exactly as bundled does. `None`
+      // when no preceding `0x8769` set one.
+      let emissions = crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(
+        info.tiff(),
+        print_conv,
+        info.model(),
+      );
+      let group = scoped("MakerNotes", track);
+      for e in emissions {
+        // The engine's Unknown-suppression runs centrally; the caller's CTMD
+        // scratch is appended into the engine sink, so carry the flag through.
+        out.push(EmittedTag::new(
+          group.clone(),
+          smol_str::SmolStr::new(e.name()),
+          e.value().clone(),
+          e.unknown(),
+        ));
+      }
+    }
   }
 }
 
@@ -10261,6 +10788,7 @@ mod tests {
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero8 Black"));
     assert!(
@@ -10295,6 +10823,7 @@ mod tests {
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(
       meta.device_name(),
@@ -10336,6 +10865,7 @@ mod tests {
       &mut meta_a,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(
       meta_a.device_name(),
@@ -10363,6 +10893,7 @@ mod tests {
       &mut meta_b,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(
       meta_b.device_name(),
@@ -10388,6 +10919,7 @@ mod tests {
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero6 Black"));
     assert!(found_embedded);
@@ -10406,6 +10938,7 @@ mod tests {
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert!(meta.is_empty());
     assert!(!found_embedded);
@@ -10424,6 +10957,7 @@ mod tests {
       &mut meta2,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
+      &mut crate::metadata::CanonCtmdMeta::new(),
     );
     assert!(meta2.is_empty());
   }
