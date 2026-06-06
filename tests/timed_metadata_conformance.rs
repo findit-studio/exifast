@@ -14,29 +14,35 @@
 //! are all applied here at `-j`; `-n` would emit the raw post-ValueConv scalars
 //! (covered by the in-crate unit tests).
 //!
-//! ## Structurally-absent fields (noted gaps)
+//! ## Full structural coverage (no excluded tags)
 //!
-//! One structural (NON-GPS) track field is not modeled by the typed layer and
-//! is EXCLUDED from the comparison (the GPS lat/lon/alt/datetime/measure-mode/
-//! accuracy/velocity columns — the camera-metadata payload — MUST still match
-//! exactly):
+//! Every emitted tag — including the structural `Track<N>:MetaFormat` — is now
+//! compared byte-exact; NOTHING is excluded.
 //!
 //! - `Track<N>:MetaFormat` — the `stsd` sample-description 4-char format code
-//!   (`"camm"`/`"mebx"`). The structural QuickTime trak parse does not capture
-//!   the sample-description format, so this tag is absent for BOTH camm and
-//!   mebx. (Adding it is a structural-parse feature, not part of the timed-GPS
-//!   emission — issue #212.)
+//!   (`"rtmd"`/`"camm"`/`"mebx"`). The structural QuickTime trak parse now
+//!   descends `mdia/minf/stbl/stsd` and pulls the format 4cc onto the
+//!   `MediaTrack`; the emission surfaces it at the family-1 `Track<N>` level
+//!   (right after `HandlerType`), gated on the `meta` handler — exactly
+//!   ExifTool's `MetaSampleDesc` `MetaFormat` (QuickTime.pm:7393, `Condition =>
+//!   '$$self{HandlerType} eq "meta"'`). Implemented subsystem-wide in R13;
+//!   resolves issue #212.
 //!
 //! `Track<N>:SampleTime` / `Track<N>:SampleDuration` — the `ProcessSamples`
-//! sample-table timing emitted ahead of each decoded sample's payload — ARE now
-//! emitted and compared byte-exact for BOTH **camm** and **mebx** (each timed
-//! sample carries its `SampleTime`/`SampleDuration` off the `stts`/`stsz` tables,
-//! threaded onto the camm GPS / motion / warning records of that sample).
+//! sample-table timing emitted ahead of each decoded sample's payload — are also
+//! compared byte-exact for BOTH **camm** and **mebx** (each timed sample carries
+//! its `SampleTime`/`SampleDuration` off the `stts`/`stsz` tables, threaded onto
+//! the camm GPS / motion / warning records of that sample).
 #![cfg(all(feature = "quicktime", feature = "json"))]
 
 use exifast::ParseOptions;
 use exifast::jsondiff::json_equivalent_strict;
 use exifast::parser::extract_info_with_options;
+
+/// No exclusions — every key (including `Track<N>:MetaFormat`, now emitted) is
+/// compared byte-exact. Retained as a named constant so the `*_excluding` call
+/// sites read clearly after the `MetaFormat` gap was closed (R13).
+const NO_EXCL: &[&str] = &[];
 
 /// Read a fixture into memory.
 fn fixture(name: &str) -> Vec<u8> {
@@ -205,26 +211,25 @@ fn gsen_ee_byte_exact() {
 
 // ── Track<N>: camm (Android CAMM — per-sample Track<N>, via track_index) ─────
 // SampleTime / SampleDuration ARE emitted (one per camm SAMPLE, off the
-// sample-table timing threaded onto each sample's records) and compared; only
-// the structural `MetaFormat` (stsd 4cc, #212) is excluded.
+// sample-table timing threaded onto each sample's records) and compared; every
+// tag (incl. `Track<N>:MetaFormat`, the stsd 4cc, #212) is compared byte-exact.
 
 #[test]
 fn camm_ee_byte_exact_gps_columns() {
-  // Excluded: only the structural `MetaFormat` (stsd code, not captured). The
-  // sample-table `SampleTime`/`SampleDuration` ARE emitted (the camm sample
-  // carries the timing) and compared byte-exact.
-  let excl = ["MetaFormat"];
+  // Every tag — incl. the structural `Track<N>:MetaFormat` (the stsd 4cc, #212)
+  // and the sample-table `SampleTime`/`SampleDuration` — is emitted and compared
+  // byte-exact.
   check_ee_excluding(
     "QuickTime_camm.mov",
     "QuickTime_camm.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm.mov",
     "QuickTime_camm.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -242,21 +247,20 @@ fn camm_ee_byte_exact_gps_columns() {
 // camm0's `AngleAxis` is NOT emitted (type 0 is absent from `%size`, so
 // `ProcessCAMM` `last`s — verified separately). SampleTime/SampleDuration ARE
 // emitted (one per camm SAMPLE, ahead of that sample's motion payload) and
-// compared; only the structural `MetaFormat` is excluded.
+// compared; every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_motion_ee_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_motion.mov",
     "QuickTime_camm_motion.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_motion.mov",
     "QuickTime_camm_motion.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -265,11 +269,11 @@ fn camm_motion_ee_byte_exact() {
 // ExtractEmbedded), NOT any motion record. Pins that the new motion emission is
 // `-ee`-only (same gate as the GPS camm), so a no-`ee` parse leaks nothing.
 #[test]
-fn camm_motion_noee_warning_byte_exact_except_metaformat() {
+fn camm_motion_noee_warning_byte_exact() {
   check_noee_excluding(
     "QuickTime_camm_motion.mov",
     "QuickTime_camm_motion.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
   );
 }
 
@@ -284,22 +288,21 @@ fn camm_motion_noee_warning_byte_exact_except_metaformat() {
 // wins ⇒ Doc2's 11/21/31 is DROPPED at `-G1`. At `-ee -G3` Doc1 = 40/50/60 (the
 // flat TagMap sink is last-wins in place) and Doc2 = 11/21/31. SampleTime/
 // SampleDuration ARE emitted: ONE per camm SAMPLE (Doc1 carries the first
-// sample's timing once, even though it has two packets) and compared; only the
-// structural `MetaFormat` is excluded.
+// sample's timing once, even though it has two packets) and compared; every tag
+// (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_multipkt_within_doc_last_wins_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_multipkt.mov",
     "QuickTime_camm_multipkt.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_multipkt.mov",
     "QuickTime_camm_multipkt.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -319,22 +322,21 @@ fn camm_multipkt_within_doc_last_wins_byte_exact() {
 // later GPS `Track1:SampleTime` is gated out. (Pre-fix the warning path pushed
 // its timing UNGATED, so the later GPS SampleTime overwrote it in the last-wins
 // `TagMap` sink — `-G1` wrongly showed "1.00 s".) At `-ee -G3:1` there is NO
-// gate: Doc1 keeps "0 s"+Warning and Doc2 keeps "1.00 s"+GPS. Only the
-// structural `MetaFormat` is excluded.
+// gate: Doc1 keeps "0 s"+Warning and Doc2 keeps "1.00 s"+GPS. Every tag (incl.
+// `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_warn_gps_mixed_track_sample_time_first_wins_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_warn_gps.mov",
     "QuickTime_camm_warn_gps.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_warn_gps.mov",
     "QuickTime_camm_warn_gps.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -350,21 +352,20 @@ fn camm_warn_gps_mixed_track_sample_time_first_wins_byte_exact() {
 // fix precomputes, per Track<N>, the SampleTime/SampleDuration of the
 // MINIMUM-doc camm sample across ALL kinds (here the GPS sample, Doc1) and emits
 // only THAT at `-G1`. At `-ee -G3:1` each doc keeps its own timing. Only the
-// structural `MetaFormat` (stsd 4cc, #212) is excluded.
+// structural `Track<N>:MetaFormat` (the stsd 4cc) is now compared byte-exact.
 #[test]
 fn camm_gps_warn_reverse_order_min_doc_sample_time_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_gps_warn.mov",
     "QuickTime_camm_gps_warn.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_gps_warn.mov",
     "QuickTime_camm_gps_warn.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -378,21 +379,20 @@ fn camm_gps_warn_reverse_order_min_doc_sample_time_byte_exact() {
 // "1.00 s" first and `-G1` showed "1.00 s". The structural min-doc precompute
 // picks the motion sample (Doc1, "0 s") for `Track1:SampleTime`. At `-ee -G3:1`
 // each doc keeps its own (Doc1 = "0 s"+AngularVelocity, Doc2 = "1.00 s"+GPS).
-// Only the structural `MetaFormat` is excluded.
+// every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_motion_gps_reverse_order_min_doc_sample_time_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_motion_gps.mov",
     "QuickTime_camm_motion_gps.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_motion_gps.mov",
     "QuickTime_camm_motion_gps.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -406,21 +406,20 @@ fn camm_motion_gps_reverse_order_min_doc_sample_time_byte_exact() {
 // REGRESSION-pins that the new first-packet dispatch gate STILL dispatches a
 // type-0 first packet (camm0 Condition matches) — the gate rejects only types
 // OUTSIDE 0..7 (or a sample too short to read the +2 type). Only the structural
-// `MetaFormat` (stsd 4cc, #212) is excluded.
+// `Track<N>:MetaFormat` (the stsd 4cc) is now compared byte-exact.
 #[test]
 fn camm0_unknown_record_dispatches_and_warns_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm0.mov",
     "QuickTime_camm0.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm0.mov",
     "QuickTime_camm0.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -432,21 +431,20 @@ fn camm0_unknown_record_dispatches_and_warns_byte_exact() {
 // `Doc1:Track1:SampleTime`, `SampleDuration`, then `Warning "Truncated camm
 // record 5"`. REGRESSION-pins that a recognized first packet that then truncates
 // STILL dispatches + warns (the gate is on the FIRST packet matching a Condition,
-// not on the decode succeeding). Only the structural `MetaFormat` is excluded.
+// not on the decode succeeding). every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_trunc_recognized_first_packet_dispatches_and_warns_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_trunc.mov",
     "QuickTime_camm_trunc.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_trunc.mov",
     "QuickTime_camm_trunc.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -464,21 +462,20 @@ fn camm_trunc_recognized_first_packet_dispatches_and_warns_byte_exact() {
 // first-packet type outside 0..7 emits no doc, no SampleTime, no warning, and must
 // NOT run `process_camm`. RED before the fix (exifast unconditionally opened a doc
 // + warned `Unknown camm record type 8`); GREEN after. Only the structural
-// `MetaFormat` (stsd 4cc) is excluded.
+// `Track<N>:MetaFormat` (the stsd 4cc) is now compared byte-exact.
 #[test]
 fn camm_badtype_first_packet_out_of_range_emits_nothing_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_badtype.mov",
     "QuickTime_camm_badtype.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_badtype.mov",
     "QuickTime_camm_badtype.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -495,21 +492,20 @@ fn camm_badtype_first_packet_out_of_range_emits_nothing_byte_exact() {
 // records per-sample timing so it participates in the `-G1` cross-kind min-doc
 // timing AND emits its own `Doc<N>` SampleTime/SampleDuration at `-G3`. RED
 // before the fix (exifast decoded nothing → stored no marker → missed the
-// timing); GREEN after. Only the structural `MetaFormat` is excluded.
+// timing); GREEN after. every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_emptypayload_recognized_first_packet_emits_timing_only_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_emptypayload.mov",
     "QuickTime_camm_emptypayload.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_emptypayload.mov",
     "QuickTime_camm_emptypayload.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -531,21 +527,20 @@ fn camm_emptypayload_recognized_first_packet_emits_timing_only_byte_exact() {
 // sample's `-G3` `Doc<N>` timing EVEN WHEN its `Warning` text is deduped. RED
 // before the fix (the message-dedup `continue` skipped the whole second sample,
 // losing its `Doc2:Track1:SampleTime`/`SampleDuration`, AND no `[x2]` count
-// suffix); GREEN after. Only the structural `MetaFormat` (stsd 4cc) is excluded.
+// suffix); GREEN after. every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn camm_dup_warn_g3_timing_before_message_dedup_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_dup_warn.mov",
     "QuickTime_camm_dup_warn.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_dup_warn.mov",
     "QuickTime_camm_dup_warn.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -553,39 +548,39 @@ fn camm_dup_warn_g3_timing_before_message_dedup_byte_exact() {
 // `trak`, so the per-sample dispatch is `-ee`-only. The no-`ee` path emits the
 // standard `[minor] ExtractEmbedded` warning (mdat sample data is present) and
 // NO per-sample record — the same shape as the other camm fixtures. Only the
-// structural `MetaFormat` (stsd 4cc) is excluded.
+// structural `Track<N>:MetaFormat` (the stsd 4cc) is now compared byte-exact.
 #[test]
-fn camm_badtype_emptypayload_noee_warning_byte_exact_except_metaformat() {
+fn camm_badtype_emptypayload_noee_warning_byte_exact() {
   check_noee_excluding(
     "QuickTime_camm_badtype.mov",
     "QuickTime_camm_badtype.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
   );
   check_noee_excluding(
     "QuickTime_camm_emptypayload.mov",
     "QuickTime_camm_emptypayload.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
   );
 }
 
 // ── Track<N>: mebx (Apple metadata keys — per-sample Track<N>, with timing) ──
-// SampleTime / SampleDuration ARE emitted (the mebx sample carries timing); only
-// the structural `MetaFormat` (stsd code) is an unmodeled gap.
+// SampleTime / SampleDuration ARE emitted (the mebx sample carries timing), and
+// the structural `Track<N>:MetaFormat` (stsd `mebx` 4cc) is now emitted +
+// compared too — every tag is byte-exact.
 
 #[test]
-fn mebx_gps_ee_byte_exact_except_metaformat() {
-  let excl = ["MetaFormat"];
+fn mebx_gps_ee_byte_exact() {
   check_ee_excluding(
     "QuickTime_mebx_gps.mov",
     "QuickTime_mebx_gps.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_mebx_gps.mov",
     "QuickTime_mebx_gps.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -599,19 +594,18 @@ fn mebx_gps_ee_byte_exact_except_metaformat() {
 // (NOT Doc1/Doc2), with a single `Doc1:Track1:SampleTime`/`SampleDuration`. The
 // single-key `mebx_gps` fixture above could not catch a per-record doc bump.
 #[test]
-fn mebx_keys_ee_byte_exact_except_metaformat() {
-  let excl = ["MetaFormat"];
+fn mebx_keys_ee_byte_exact() {
   check_ee_excluding(
     "QuickTime_mebx_keys.mov",
     "QuickTime_mebx_keys.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_mebx_keys.mov",
     "QuickTime_mebx_keys.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -622,19 +616,18 @@ fn mebx_keys_ee_byte_exact_except_metaformat() {
 // (one SampleTime). This is the strongest per-timed-sample-doc pin: a per-record
 // bump would scatter the four face leaves across Doc1..Doc4.
 #[test]
-fn mebx_detface_ee_byte_exact_except_metaformat() {
-  let excl = ["MetaFormat"];
+fn mebx_detface_ee_byte_exact() {
   check_ee_excluding(
     "QuickTime_mebx_detface.mov",
     "QuickTime_mebx_detface.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_mebx_detface.mov",
     "QuickTime_mebx_detface.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -646,16 +639,16 @@ fn mebx_detface_ee_byte_exact_except_metaformat() {
 // `%eeBox` member (`meta`/`text`/`sbtl`/`data`/`camm`/`ctbx`; `vide` excluded)
 // — and emits NO per-sample GPS. Both `mebx` and `camm` tracks carry the `meta`
 // handler, so the oracle shows `Track1:Warning` (between `HandlerClass` and
-// `HandlerType`) and no GPS columns. exifast reproduces the warning; the
-// structural `MetaFormat` (stsd 4-char code) remains the only unmodeled gap, so
-// it is excluded from the comparison (same gap as the `-ee` tests above).
+// `HandlerType`) and no GPS columns. exifast reproduces the warning AND the
+// structural `Track<N>:MetaFormat` (stsd 4-char code), so every tag is compared
+// byte-exact (no exclusion — same as the `-ee` tests above).
 
 #[test]
-fn mebx_gps_noee_warning_byte_exact_except_metaformat() {
+fn mebx_gps_noee_warning_byte_exact() {
   check_noee_excluding(
     "QuickTime_mebx_gps.mov",
     "QuickTime_mebx_gps.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
   );
 }
 
@@ -664,30 +657,1108 @@ fn mebx_gps_noee_warning_byte_exact_except_metaformat() {
 // surface only under `-ee`). Pins that the per-timed-sample doc change does not
 // leak any record into the no-`ee` path.
 #[test]
-fn mebx_keys_noee_warning_byte_exact_except_metaformat() {
+fn mebx_keys_noee_warning_byte_exact() {
   check_noee_excluding(
     "QuickTime_mebx_keys.mov",
     "QuickTime_mebx_keys.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
   );
 }
 
 #[test]
-fn mebx_detface_noee_warning_byte_exact_except_metaformat() {
+fn mebx_detface_noee_warning_byte_exact() {
   check_noee_excluding(
     "QuickTime_mebx_detface.mov",
     "QuickTime_mebx_detface.mov.json",
-    &["MetaFormat"],
+    NO_EXCL,
+  );
+}
+
+// ── Track<N>: Sony rtmd (Sony Alpha/FX "Real-Time MetaData" — per-sample
+// Track<N>, camera + GPS, with timing) ───────────────────────────────────────
+// `Process_rtmd` (Sony.pm:11569-11602) decodes one timed sample per `rtmd`
+// sample, each its own `Doc<N>` under the enclosing `Track<N>`. The fixture
+// carries 2 samples: Doc1 = camera + a full `0x85xx` GPS fix (ISO 800), Doc2 =
+// camera-only (ISO 1600). The `-ee -G3:1` oracle keeps both as
+// `Doc1:Track1:*` / `Doc2:Track1:*`; `-ee -G1` collapses to the first-wins
+// `Track1:*` row per name (Doc1's camera scalars + its GPS family win; Doc2's
+// differing ISO is dropped). The camera scalars carry their Sony.pm PrintConvs
+// at `-j` (FNumber `PrintFNumber`, FrameRate `%.2f`, ExposureTime
+// `PrintExposureTime`, MasterGainAdjustment `%.2f dB`, WhiteBalance the
+// `0xe303` map → `Unknown (0)`); the GPS family carries the GPS.pm ref/status/
+// measure-mode PrintConvs + `GPS::ToDMS` lat/lon. SampleTime/SampleDuration ARE
+// emitted (the rtmd sample carries the sample-table timing); only the
+// structural `Track<N>:MetaFormat` (the stsd rtmd 4cc) is now compared byte-exact.
+
+#[test]
+fn sony_rtmd_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd.mov",
+    "QuickTime_sony_rtmd.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd.mov",
+    "QuickTime_sony_rtmd.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) check for the rational64u FrameRate /
+// ExposureTime and the fractional GPSTimeStamp.
+// The conformance `.ee.*` goldens are `-j` only, so this pins the `-n` path
+// the harness never reaches. Oracle (bundled ExifTool 13.59
+// `-ee -j -G1 -n QuickTime_sony_rtmd.mov`): `Track1:FrameRate 29.97002997`
+// (the rational `%g` form, NOT the 15-digit f64 `29.97002997002997`) and
+// `Track1:ExposureTime 0.01666666667`; and for the fractsec fixture
+// `Track1:GPSTimeStamp "01:02:03.123456789"` (the full 9-digit ValueConv form,
+// unrounded at `-n`).
+#[test]
+fn sony_rtmd_ee_n_rational64u_and_gps_timestamp_match_bundled() {
+  // FrameRate / ExposureTime `-n` on the base fixture.
+  let data = fixture("QuickTime_sony_rtmd.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // Rational renders as a bare JSON NUMBER equal to the bundled `%.10g` value.
+  assert_eq!(
+    obj.get("Track1:FrameRate"),
+    Some(&serde_json::json!(29.97002997)),
+    "FrameRate -n must be the rational %g value, not the 15-digit f64"
+  );
+  assert_eq!(
+    obj.get("Track1:ExposureTime"),
+    Some(&serde_json::json!(0.01666666667)),
+  );
+
+  // GPSTimeStamp `-n` on the fractional fixture: the full unrounded string.
+  let fdata = fixture("QuickTime_sony_rtmd_fractsec.mov");
+  let fopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let fgot = extract_info_with_options("QuickTime_sony_rtmd_fractsec.mov", &fdata, false, fopts);
+  let fv: serde_json::Value = serde_json::from_str(&fgot).expect("valid JSON");
+  let fobj = fv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    fobj.get("Track1:GPSTimeStamp"),
+    Some(&serde_json::json!("01:02:03.123456789")),
+    "GPSTimeStamp -n must be the unrounded 9-digit ConvertTimeStamp form"
+  );
+
+  // GPSLatitude/GPSLongitude `-n` on the non-decimal-denominator COORDINATE
+  // fixture: each D/M/S `rational64u` is `GetRational64u`-rounded (RoundFloat
+  // 10) BEFORE `GPS::ToDegrees` sums `D + M/60 + S/3600`. Seconds = 1/3 (lat)
+  // and 2/3 (lon) must round to `0.3333333333`/`0.6666666667` first, so the
+  // `-n` coordinate is the bundled value, not a raw 15-digit f64 divide.
+  let cdata = fixture("QuickTime_sony_rtmd_coordround.mov");
+  let copts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let cgot = extract_info_with_options("QuickTime_sony_rtmd_coordround.mov", &cdata, false, copts);
+  let cv: serde_json::Value = serde_json::from_str(&cgot).expect("valid JSON");
+  let cobj = cv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    cobj.get("Track1:GPSLatitude"),
+    Some(&serde_json::json!(47.6167592592592)),
+    "GPSLatitude -n must round each rational64u component to 10 sig-figs before ToDegrees"
+  );
+  assert_eq!(
+    cobj.get("Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.150185185185)),
+  );
+}
+
+// The Sony rtmd fixture at no-`ee`: `rtmd` is a `meta`-handler `trak`, so the
+// per-sample camera/GPS emission is fully `-ee`-gated. The no-`ee` path emits
+// the standard `Track1:Warning` ([minor] ExtractEmbedded) and NO per-sample
+// record — the same shape as the `mebx`/`camm` fixtures. Only the structural
+// `Track<N>:MetaFormat` (the stsd rtmd 4cc) is now compared byte-exact.
+#[test]
+fn sony_rtmd_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd.mov",
+    "QuickTime_sony_rtmd.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd FRACTIONAL-seconds GPSTimeStamp fixture. The
+// `0x8507` GPSTimeStamp encodes S = 3.123456789 (rational 3123456789/1e9), so
+// `ConvertTimeStamp` (the `-n`/ValueConv form) yields `01:02:03.123456789` and
+// `PrintTimeStamp` (the `-j`/PrintConv) ROUNDS to microseconds:
+// `01:02:03.123457`. The `.ee.json`/`.ee.g3.json` goldens are `-j`, so they pin
+// the 6-digit-rounded form — exifast must match byte-exact. Only the structural
+// `Track<N>:MetaFormat` (the stsd rtmd 4cc) is now compared byte-exact.
+#[test]
+fn sony_rtmd_fractsec_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_fractsec.mov",
+    "QuickTime_sony_rtmd_fractsec.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_fractsec.mov",
+    "QuickTime_sony_rtmd_fractsec.mov.ee.g3.json",
+    true,
+    NO_EXCL,
   );
 }
 
 #[test]
-fn camm_noee_warning_byte_exact_except_metaformat() {
+fn sony_rtmd_fractsec_noee_warning_byte_exact() {
   check_noee_excluding(
-    "QuickTime_camm.mov",
-    "QuickTime_camm.mov.json",
-    &["MetaFormat"],
+    "QuickTime_sony_rtmd_fractsec.mov",
+    "QuickTime_sony_rtmd_fractsec.mov.json",
+    NO_EXCL,
   );
+}
+
+// The Sony rtmd SHORT-SAMPLE timing-Doc fixture. Sample 0 is a
+// single byte (`< 2`), which `Process_rtmd` `return 0`s SILENTLY — but
+// `ProcessSamples` already opened `Doc1` and emitted its SampleTime/
+// SampleDuration, so the timing row must survive. The normal sample 1 becomes
+// `Doc2`. So `-ee -G3:1` shows `Doc1:Track1:SampleTime/SampleDuration` (timing
+// only) then the full `Doc2:Track1:…`; `-ee -G1` collapses with the Doc1 timing
+// winning (first-wins). exifast pushes an empty sample for the `< 2`-byte case
+// so the dispatcher stamps that timing-only doc. every tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn sony_rtmd_shortsample_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_shortsample.mov",
+    "QuickTime_sony_rtmd_shortsample.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_shortsample.mov",
+    "QuickTime_sony_rtmd_shortsample.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_shortsample_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_shortsample.mov",
+    "QuickTime_sony_rtmd_shortsample.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd ZERO-DENOMINATOR FrameRate/ExposureTime fixture.
+// `0x8106 FrameRate` (`sprintf("%.2f",$val)`) and `0x8109
+// ExposureTime` (`PrintExposureTime`) read `rational64u`; a zero denominator
+// makes `GetRational64u` yield the WORD `"undef"` (0/0) or `"inf"` (n/0).
+// Sample 0 = 0/0 → `-j` FrameRate `0.00` (numified) + ExposureTime `"undef"`;
+// sample 1 = n/0 → `-j` FrameRate `"Inf"` + ExposureTime `"inf"`. The `-G3:1`
+// golden carries both Docs; `-G1` first-wins keeps Doc1. The earlier-NaN bug
+// is gone (the `-j` path no longer formats a non-finite quotient). Only the
+// structural `Track<N>:MetaFormat` (the stsd rtmd 4cc) is now compared byte-exact.
+#[test]
+fn sony_rtmd_zerodenom_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_zerodenom.mov",
+    "QuickTime_sony_rtmd_zerodenom.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_zerodenom.mov",
+    "QuickTime_sony_rtmd_zerodenom.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_zerodenom_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_zerodenom.mov",
+    "QuickTime_sony_rtmd_zerodenom.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd NON-DECIMAL-DENOMINATOR GPSTimeStamp fixture.
+// `0x8507` seconds = 1496725904/123456789 (= 12.1234799327…); ExifTool
+// `GetRational64u`-rounds each H/M/S component to 10 sig-figs BEFORE
+// `ConvertTimeStamp`, so the `-n`/ValueConv value is `12:00:12.12347993` (NOT
+// the 11-digit raw quotient) and `PrintTimeStamp` rounds it to `12:00:12.12348`
+// at `-j`. The `.ee.*` goldens are `-j`, pinning the 5-digit-rounded form; the
+// `-n` value is pinned separately below. every tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn sony_rtmd_gpsts_round_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_gpsts_round.mov",
+    "QuickTime_sony_rtmd_gpsts_round.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_gpsts_round.mov",
+    "QuickTime_sony_rtmd_gpsts_round.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_gpsts_round_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_gpsts_round.mov",
+    "QuickTime_sony_rtmd_gpsts_round.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd NON-DECIMAL-DENOMINATOR GPS COORDINATE fixture.
+// `0x8502 GPSLatitude` / `0x8504 GPSLongitude` each read three `rational64u`
+// (D,M,S) THROUGH `GetRational64u` (RoundFloat-10 per component) BEFORE
+// `GPS::ToDegrees` sums `D + M/60 + S/3600`. Seconds = 1/3 (lat) / 2/3 (lon)
+// round to `0.3333333333`/`0.6666666667` first, so the `-j`/`GPS::ToDMS`
+// PrintConv renders `47 deg 37' 0.33"` / `122 deg 9' 0.67"` (the `-n` decimal
+// is pinned in `sony_rtmd_ee_n_rational64u_and_gps_timestamp_match_bundled`).
+// The `.ee.*` goldens are `-j`; exifast must match byte-exact. Only the
+// structural `Track<N>:MetaFormat` (the stsd rtmd 4cc) is now compared byte-exact.
+#[test]
+fn sony_rtmd_coordround_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_coordround.mov",
+    "QuickTime_sony_rtmd_coordround.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_coordround.mov",
+    "QuickTime_sony_rtmd_coordround.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_coordround_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_coordround.mov",
+    "QuickTime_sony_rtmd_coordround.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd ZERO-DENOMINATOR GPS COORDINATE fixture. The `0x8502
+// GPSLatitude` seconds = 423/0 renders the WORD `"inf"` via `GetRational64u`,
+// and `GPS::ToDegrees` (GPS.pm:585) `return ''` yields the EMPTY STRING `""` (a
+// DEFINED value) for any `\b(inf|undef)\b` component. exifast now emits that
+// `""` BYTE-EXACT (a present `SonyRtmdCoord::Empty` → `Str("")` at both `-j`/
+// `-n`), so `GPSLatitude` is NO LONGER excluded — only the structural
+// `MetaFormat` (stsd 4cc) remains. The surviving GPSLongitude (a normal
+// 122/9/54 fix) also matches, proving the inf component renders ONLY its own
+// coordinate empty, not the whole GPS record.
+#[test]
+fn sony_rtmd_coordzero_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_coordzero.mov",
+    "QuickTime_sony_rtmd_coordzero.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_coordzero.mov",
+    "QuickTime_sony_rtmd_coordzero.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_coordzero_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_coordzero.mov",
+    "QuickTime_sony_rtmd_coordzero.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd NON-FINITE (n/0) GPSTimeStamp fixture. The `0x8507` seconds =
+// 423/0 renders the WORD `"inf"` via `GetRational64u`; unlike `GPS::ToDegrees`
+// (which guards inf/undef), `GPS::ConvertTimeStamp` has NO such guard, so its
+// arithmetic + string interpolation emit the CONSTANT bogus string
+// `"Inf:NaN:000000000NaN"` (the same for an inf in ANY H/M/S position).
+// exifast now emits that constant verbatim BYTE-EXACT (at both `-j`/`-n`), so
+// `GPSTimeStamp` (like every tag, incl. `Track<N>:MetaFormat`) is compared
+// byte-exact. The valid GPSLatitude/GPSLongitude (a normal 47/37/42.3 + 122/9/54
+// fix) also match, proving the inf SECONDS poisons ONLY the timestamp.
+#[test]
+fn sony_rtmd_gpsts_inf_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_gpsts_inf.mov",
+    "QuickTime_sony_rtmd_gpsts_inf.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_gpsts_inf.mov",
+    "QuickTime_sony_rtmd_gpsts_inf.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_gpsts_inf_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_gpsts_inf.mov",
+    "QuickTime_sony_rtmd_gpsts_inf.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd PARTIAL-GPS fixture. `0x8502 GPSLatitude` /
+// `0x8504 GPSLongitude` / `0x8507 GPSTimeStamp` are `Format => 'rational64u'`
+// with NO Count, so `ReadValue` derives the component count from the RECORD
+// SIZE: a 1-component (8-byte) or 2-component (16-byte) record is valid and
+// `GPS::ToDegrees`/`ConvertTimeStamp` default the missing minute/second to 0.
+// The fixture's 8-byte GPSLatitude (`"12/1"` → `12`), 16-byte GPSLongitude
+// (`"122/1 30/1"` → `122.5`) and 8-byte GPSTimeStamp (`"12/1"` → `12:00:00`)
+// MUST decode byte-exact (the old `< 24` guard dropped them). EVERYTHING is
+// byte-exact; every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn sony_rtmd_partialgps_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_partialgps.mov",
+    "QuickTime_sony_rtmd_partialgps.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_partialgps.mov",
+    "QuickTime_sony_rtmd_partialgps.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_partialgps_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_partialgps.mov",
+    "QuickTime_sony_rtmd_partialgps.mov.json",
+    NO_EXCL,
+  );
+}
+
+// The Sony rtmd NON-FINITE-BY-POSITION fixture. A PRESENT
+// GPSLatitude/GPSLongitude record always yields a DEFINED tag — the decimal
+// (all-finite) OR `""` (`GPS::ToDegrees` GPS.pm:585, for ANY inf/undef
+// component in ANY D/M/S position); a GPSTimeStamp with an inf component (ANY
+// H/M/S position) emits the CONSTANT `"Inf:NaN:000000000NaN"`. Three Docs sweep
+// the positions: Doc1 (lat inf@D, lon undef@M, time inf@H), Doc2 (lat inf@M,
+// lon inf@S, time inf@M), Doc3 (a VALID coord pair + time inf@S). Under `-G1`
+// Doc1's EMPTY GPSLatitude/GPSLongitude `""` WIN over Doc3's valid DMS (bundled
+// first-extracted-wins); under `-G3:1` each Doc keeps its own. exifast emits all
+// of these BYTE-EXACT — every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn sony_rtmd_nonfinite_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_nonfinite.mov",
+    "QuickTime_sony_rtmd_nonfinite.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_nonfinite.mov",
+    "QuickTime_sony_rtmd_nonfinite.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_nonfinite_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_nonfinite.mov",
+    "QuickTime_sony_rtmd_nonfinite.mov.json",
+    NO_EXCL,
+  );
+}
+
+// `-ee -G3:1 -n` (ValueConv) for the NON-FINITE-BY-POSITION fixture — the
+// `.ee.*` `-j` goldens render the `ToDMS` PrintConv, so this pins the raw
+// post-ValueConv scalars per Doc/position: every Empty coordinate (inf/undef in
+// ANY of D/M/S) is the empty string `""`, every inf-component timestamp (ANY of
+// H/M/S) is the constant `"Inf:NaN:000000000NaN"`, and Doc3's VALID coordinate
+// pair surfaces its `-n` decimals (47.628…/122.165) — proving the Empty/bogus
+// values never poison a real fix. Oracle: bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_nonfinite_n_by_position_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_nonfinite.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_nonfinite.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  let empty = serde_json::json!("");
+  let bogus = serde_json::json!("Inf:NaN:000000000NaN");
+  // Doc1: lat inf@D, lon undef@M, time inf@H.
+  assert_eq!(
+    obj.get("Doc1:Track1:GPSLatitude"),
+    Some(&empty),
+    "inf@D lat"
+  );
+  assert_eq!(
+    obj.get("Doc1:Track1:GPSLongitude"),
+    Some(&empty),
+    "undef@M lon"
+  );
+  assert_eq!(
+    obj.get("Doc1:Track1:GPSTimeStamp"),
+    Some(&bogus),
+    "inf@H ts"
+  );
+  // Doc2: lat inf@M, lon inf@S, time inf@M.
+  assert_eq!(
+    obj.get("Doc2:Track1:GPSLatitude"),
+    Some(&empty),
+    "inf@M lat"
+  );
+  assert_eq!(
+    obj.get("Doc2:Track1:GPSLongitude"),
+    Some(&empty),
+    "inf@S lon"
+  );
+  assert_eq!(
+    obj.get("Doc2:Track1:GPSTimeStamp"),
+    Some(&bogus),
+    "inf@M ts"
+  );
+  // Doc3: a VALID coordinate pair (-n decimals) + time inf@S.
+  assert_eq!(
+    obj.get("Doc3:Track1:GPSLatitude"),
+    Some(&serde_json::json!(47.6284166666667)),
+    "Doc3 valid latitude -n decimal"
+  );
+  assert_eq!(
+    obj.get("Doc3:Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.165)),
+    "Doc3 valid longitude -n decimal"
+  );
+  assert_eq!(
+    obj.get("Doc3:Track1:GPSTimeStamp"),
+    Some(&bogus),
+    "inf@S ts"
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) for the partial GPS rationals — the
+// `.ee.*` `-j` goldens render the `ToDMS` PrintConv, so this pins the raw
+// post-ValueConv scalars: an 8-byte `"12/1"` GPSLatitude → `12`, a 16-byte
+// `"122/1 30/1"` GPSLongitude → `122.5`, an 8-byte `"12/1"` GPSTimeStamp →
+// `"12:00:00"`. Oracle: bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_partialgps_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_partialgps.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_partialgps.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    obj.get("Track1:GPSLatitude"),
+    Some(&serde_json::json!(12.0)),
+    "a 1-component (8-byte) GPSLatitude decodes its degrees, defaulting M/S to 0"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.5)),
+    "a 2-component (16-byte) GPSLongitude decodes D + M/60, defaulting S to 0"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSTimeStamp"),
+    Some(&serde_json::json!("12:00:00")),
+    "a 1-component (8-byte) GPSTimeStamp decodes its hours, defaulting M/S to 0"
+  );
+}
+
+// The Sony rtmd DEFINED-EMPTY-STRING fixture. A `string` record
+// of length >= 1 that truncates to empty (a LEADING NUL) is a DEFINED EMPTY
+// value bundled EMITS the tag for (only a zero-length record is omitted). The
+// PrintConv render of an empty value (verified vs bundled ExifTool 13.59):
+// SerialNumber / GPSMapDatum / GPSDateStamp (no hash PrintConv) → `""` at `-j`
+// AND `-n`; GPSLatitudeRef / GPSLongitudeRef / GPSStatus / GPSMeasureMode (a
+// bare inline hash PrintConv with NO `OTHER`) → the DEFAULT hash-miss
+// `"Unknown ()"` at `-j`, `""` at `-n`. Two samples prove the `-G1` first-wins
+// collapse with an EMPTY first-Doc value (sample 0 = empty, sample 1 = normal
+// → Doc1's empty values win the collapse; the `-G3:1` golden shows Doc1 empty +
+// Doc2 normal). EVERYTHING is byte-exact; only the structural `MetaFormat`
+// (stsd rtmd 4cc) is excluded.
+#[test]
+fn sony_rtmd_emptystr_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_emptystr.mov",
+    "QuickTime_sony_rtmd_emptystr.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_emptystr.mov",
+    "QuickTime_sony_rtmd_emptystr.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_emptystr_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_emptystr.mov",
+    "QuickTime_sony_rtmd_emptystr.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) for the defined-empty strings — the
+// `.ee.*` `-j` goldens render the GPS-ref/status/measure-mode PrintConv as
+// `"Unknown ()"`, so this pins the RAW empty scalars: every empty string tag
+// (SerialNumber + the GPS refs/status/measure-mode/map-datum/date-stamp)
+// renders `""` at `-n`. Oracle: bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_emptystr_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_emptystr.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_emptystr.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // Under `-G1` the EMPTY first-Doc (sample 0) values win the collapse.
+  for name in [
+    "Track1:SerialNumber",
+    "Track1:GPSLatitudeRef",
+    "Track1:GPSLongitudeRef",
+    "Track1:GPSStatus",
+    "Track1:GPSMeasureMode",
+    "Track1:GPSMapDatum",
+    "Track1:GPSDateStamp",
+  ] {
+    assert_eq!(
+      obj.get(name),
+      Some(&serde_json::json!("")),
+      "{name} -n must be the defined empty string (present, not omitted)"
+    );
+  }
+}
+
+// The Sony rtmd INVALID-UTF8 string fixture. A `string` record whose
+// pre-NUL bytes are NOT valid UTF-8 is STILL a DEFINED tag: bundled `ReadValue`
+// does not validate UTF-8 and `exiftool` FixUTF8's the value at JSON output
+// (exiftool:3822) — one ASCII `?` per malformed byte (XMP.pm:2949-2972) — in BOTH
+// -j and -n. exifast's old `from_utf8(...).ok()?` dropped the tag entirely; the
+// fix routes decode_string through the engine's faithful fix_utf8. One sample
+// with a single 0xff in: SerialNumber (raw → "A?B"), GPSMapDatum (raw → "WG?S"),
+// GPSLatitudeRef + GPSStatus (inline-hash PrintConv miss → "Unknown (?)" at -j).
+// Byte-exact vs bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_badutf8_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_badutf8.mov",
+    "QuickTime_sony_rtmd_badutf8.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_badutf8.mov",
+    "QuickTime_sony_rtmd_badutf8.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_badutf8_noee_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_badutf8.mov",
+    "QuickTime_sony_rtmd_badutf8.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) — the `.ee.*` `-j` goldens render the GPS
+// ref/status PrintConv as "Unknown (?)", so this pins the RAW FixUTF8 scalars:
+// each malformed string emits one ASCII `?` per bad byte ("A?B" / "?" / "WG?S"),
+// PRESENT (never the dropped tag of the old `from_utf8(...).ok()?`). Oracle:
+// bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_badutf8_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_badutf8.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_badutf8.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  for (name, want) in [
+    ("Track1:SerialNumber", "A?B"),
+    ("Track1:GPSLatitudeRef", "?"),
+    ("Track1:GPSStatus", "?"),
+    ("Track1:GPSMapDatum", "WG?S"),
+  ] {
+    assert_eq!(
+      obj.get(name),
+      Some(&serde_json::json!(want)),
+      "{name} -n must be the FixUTF8 raw value (present, one `?` per bad byte)"
+    );
+  }
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) checks the `.ee.*` `-j` goldens cannot
+// reach: the zero-denominator FrameRate/ExposureTime words and the
+// rounded non-decimal GPSTimeStamp. Oracle: bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_zerodenom_and_gpsts_round_n_match_bundled() {
+  // Zero-denominator FrameRate/ExposureTime `-n` (both Docs via -G3:1).
+  let zdata = fixture("QuickTime_sony_rtmd_zerodenom.mov");
+  let zopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let zgot = extract_info_with_options("QuickTime_sony_rtmd_zerodenom.mov", &zdata, false, zopts);
+  let zv: serde_json::Value = serde_json::from_str(&zgot).expect("valid JSON");
+  let zobj = zv.as_array().and_then(|a| a.first()).expect("one object");
+  // 0/0 (Doc1) → "undef"; n/0 (Doc2) → "inf" — JSON strings at `-n`.
+  assert_eq!(
+    zobj.get("Doc1:Track1:FrameRate"),
+    Some(&serde_json::json!("undef")),
+    "0/0 FrameRate -n is the rational `undef` word, never NaN"
+  );
+  assert_eq!(
+    zobj.get("Doc1:Track1:ExposureTime"),
+    Some(&serde_json::json!("undef")),
+  );
+  assert_eq!(
+    zobj.get("Doc2:Track1:FrameRate"),
+    Some(&serde_json::json!("inf")),
+  );
+  assert_eq!(
+    zobj.get("Doc2:Track1:ExposureTime"),
+    Some(&serde_json::json!("inf")),
+  );
+
+  // Non-decimal-denominator GPSTimeStamp `-n` (the rounded 8-digit form).
+  let gdata = fixture("QuickTime_sony_rtmd_gpsts_round.mov");
+  let gopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let ggot = extract_info_with_options("QuickTime_sony_rtmd_gpsts_round.mov", &gdata, false, gopts);
+  let gv: serde_json::Value = serde_json::from_str(&ggot).expect("valid JSON");
+  let gobj = gv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    gobj.get("Track1:GPSTimeStamp"),
+    Some(&serde_json::json!("12:00:12.12347993")),
+    "GPSTimeStamp -n must round each rational64u to 10 sig-figs before ConvertTimeStamp"
+  );
+
+  // Zero-denominator GPS COORDINATE empty `-n`: the `0x8502` latitude seconds =
+  // 423/0 renders `"inf"`, so `GPS::ToDegrees` (GPS.pm:585) `return ''` yields
+  // the EMPTY STRING `""` (a DEFINED value). exifast emits `GPSLatitude` as
+  // `""` at `-n` (a present `SonyRtmdCoord::Empty`), BYTE-EXACT with bundled;
+  // the sibling GPSLongitude (a normal fix) surfaces its `-n` decimal. This
+  // pins that an inf component renders ONLY its own coordinate empty, never a
+  // bogus Inf/NaN and never the whole GPS record.
+  let czdata = fixture("QuickTime_sony_rtmd_coordzero.mov");
+  let czopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let czgot =
+    extract_info_with_options("QuickTime_sony_rtmd_coordzero.mov", &czdata, false, czopts);
+  let czv: serde_json::Value = serde_json::from_str(&czgot).expect("valid JSON");
+  let czobj = czv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    czobj.get("Track1:GPSLatitude"),
+    Some(&serde_json::json!("")),
+    "an inf (zero-denominator) latitude component renders the empty string at -n"
+  );
+  assert_eq!(
+    czobj.get("Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.165)),
+    "the sibling longitude (a normal fix) is unaffected by the empty latitude"
+  );
+
+  // Non-finite (n/0) GPSTimeStamp `-n`: the `0x8507` seconds = 423/0 renders
+  // `"inf"`, which `GPS::ConvertTimeStamp` (no inf/undef guard) numifies into
+  // the CONSTANT bogus string `"Inf:NaN:000000000NaN"`. exifast emits that
+  // constant verbatim at `-n`, BYTE-EXACT with bundled. The valid
+  // GPSLatitude/GPSLongitude (a normal 47/37/42.3 + 122/9/54 fix) surface their
+  // `-n` decimals. This pins that an inf seconds poisons ONLY the timestamp.
+  // (Contrast a `0/0` `undef` component, which `($x||0)` numifies to 0.)
+  let gidata = fixture("QuickTime_sony_rtmd_gpsts_inf.mov");
+  let giopts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let gigot =
+    extract_info_with_options("QuickTime_sony_rtmd_gpsts_inf.mov", &gidata, false, giopts);
+  let giv: serde_json::Value = serde_json::from_str(&gigot).expect("valid JSON");
+  let giobj = giv.as_array().and_then(|a| a.first()).expect("one object");
+  assert_eq!(
+    giobj.get("Track1:GPSTimeStamp"),
+    Some(&serde_json::json!("Inf:NaN:000000000NaN")),
+    "an inf (zero-denominator) seconds component emits the constant bogus ConvertTimeStamp string"
+  );
+  assert_eq!(
+    giobj.get("Track1:GPSLatitude"),
+    Some(&serde_json::json!(47.6284166666667)),
+    "the valid latitude is unaffected by the bogus timestamp"
+  );
+  assert_eq!(
+    giobj.get("Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.165)),
+    "the valid longitude is unaffected by the bogus timestamp"
+  );
+}
+
+// The Sony rtmd NON-FINAL ZERO-LENGTH TLV fixture.
+// `Process_rtmd`'s walker (`while $pos+4 < $end`) processes a NON-FINAL
+// zero-length record (`Size => 0`): `HandleTag(Size => 0)` is reached and
+// `ReadValue` returns `''` (ExifTool.pm:6297) — a DEFINED value (the R9 "0-byte
+// → absent" decision was WRONG for non-final records). SerialNumber(0x8114),
+// GPSLatitudeRef(0x8501), GPSTimeStamp(0x8507) and GPSLatitude(0x8502) are each
+// zero-length and NON-FINAL (followed by further records). Bundled emits
+// SerialNumber `""`, GPSLatitudeRef `"Unknown ()"`@-j/`""`@-n, GPSTimeStamp
+// `"00:00:00"`, GPSLatitude `""`; the surviving GPSLongitude (a normal 122/9/54
+// fix) + the LongitudeRef/status/datum/datestamp + the full camera record set
+// ALL stay byte-exact, proving a zero-length record renders ONLY its own tag
+// empty. EVERYTHING is byte-exact; every emitted tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
+#[test]
+fn sony_rtmd_zerolen_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_zerolen.mov",
+    "QuickTime_sony_rtmd_zerolen.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_zerolen.mov",
+    "QuickTime_sony_rtmd_zerolen.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_zerolen_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_zerolen.mov",
+    "QuickTime_sony_rtmd_zerolen.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) for the zero-length records — the
+// `.ee.*` `-j` goldens render the ref/timestamp PrintConvs, so this pins the raw
+// post-ValueConv scalars for the defined-empty values: the zero-length
+// SerialNumber / GPSLatitudeRef / GPSLatitude are the empty string `""`, the
+// zero-length GPSTimeStamp is `"00:00:00"`, and the surviving GPSLongitude is a
+// real `-n` decimal — proving the present-empty values never poison the real
+// fix. Oracle: bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_zerolen_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_zerolen.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_zerolen.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  let empty = serde_json::json!("");
+  assert_eq!(
+    obj.get("Track1:SerialNumber"),
+    Some(&empty),
+    "a NON-FINAL zero-length SerialNumber is a defined empty string"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSLatitudeRef"),
+    Some(&empty),
+    "a NON-FINAL zero-length GPSLatitudeRef is the empty string at -n"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSLatitude"),
+    Some(&empty),
+    "a NON-FINAL zero-length GPSLatitude renders the GPS::ToDegrees empty string"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSTimeStamp"),
+    Some(&serde_json::json!("00:00:00")),
+    "a NON-FINAL zero-length GPSTimeStamp is ConvertTimeStamp('') = 00:00:00"
+  );
+  assert_eq!(
+    obj.get("Track1:GPSLongitude"),
+    Some(&serde_json::json!(122.165)),
+    "the surviving longitude fix is unaffected by the zero-length siblings"
+  );
+}
+
+// ── PRESENT-but-sub-width NUMERIC conformance ───────
+//
+// `QuickTime_sony_rtmd_shortnum.mov` makes EACH numeric record (FNumber 0x8000,
+// FrameRate 0x8106, ExposureTime 0x8109, MasterGainAdjustment 0x810a, ISO
+// 0x810b, ElectricalExtenderMagnification 0x810c) sub-width AND NON-FINAL in
+// sample 0 (Doc1) — the walker (`while $pos+4 < $end`) processes each, and
+// `ReadValue` returns `''` → each tag's ValueConv numifies a DEFINED value.
+// Bundled emits (verified vs ExifTool 13.59):
+//   FNumber 256.0 (`2^(8-0/8192)`)   FrameRate 0.00 (`sprintf("%.2f",'')`)
+//   ExposureTime "" (PrintExposureTime('') passes through)
+//   MasterGainAdjustment "0.00 dB" (`''/100=0`)   ISO ""   EEM ""  (raw '')
+// Sample 1 (Doc2) is the FULL VALID camera + GPS set (proves valid numerics stay
+// byte-exact under the SAME emission). Under `-G1` Doc1's empty-read numerics WIN
+// (first-extracted); under `-G3:1` each Doc keeps its own. EVERYTHING is
+// byte-exact — NO numeric-tag exclusions; only the structural `MetaFormat` is
+// excluded (the whole point of the fix).
+#[test]
+fn sony_rtmd_shortnum_ee_byte_exact() {
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_shortnum.mov",
+    "QuickTime_sony_rtmd_shortnum.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_shortnum.mov",
+    "QuickTime_sony_rtmd_shortnum.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_shortnum_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_shortnum.mov",
+    "QuickTime_sony_rtmd_shortnum.mov.json",
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_multistsd_ee_byte_exact() {
+  // A 2-entry `stsd` `[rtmd, camm]` whose `stsc` points the chunk at description
+  // index 1 (the rtmd decoy). ExifTool's `MetaFormat` is LAST-WINS across stsd
+  // entries (`ProcessSampleDesc` per-entry `$$self{MetaFormat} = $val`) and it
+  // dispatches every sample on that single last-wins format while DISCARDING the
+  // `stsc` description index (QuickTimeStream.pl:1378). So the track resolves to
+  // `camm` (NOT the desc-1 rtmd) and the sample decodes as camm — pinning
+  // last-wins + the no-desc-index-routing behavior, `MetaFormat = "camm"`
+  // compared byte-exact (no exclusion).
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_multistsd.mov",
+    "QuickTime_sony_rtmd_multistsd.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_multistsd.mov",
+    "QuickTime_sony_rtmd_multistsd.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_multistsd_noee_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_multistsd.mov",
+    "QuickTime_sony_rtmd_multistsd.mov.json",
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_multistsd8_ee_byte_exact() {
+  // Like `multistsd` but the active LAST stsd entry is an UNDERSIZED 8-byte
+  // `camm` (`[size=8][camm]`, no reserved/dref/children). ExifTool stops the
+  // stsd loop only at `$size < 8` (QuickTime.pm:9642), so the 8-byte entry STILL
+  // sets last-wins MetaFormat = "camm" and drives the camm decoder — pinning the
+  // `size >= 8` (not `>= 16`) guard in walk_stsd / decode_stsd_meta_format.
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_multistsd8.mov",
+    "QuickTime_sony_rtmd_multistsd8.mov.ee.json",
+    false,
+    NO_EXCL,
+  );
+  check_ee_excluding(
+    "QuickTime_sony_rtmd_multistsd8.mov",
+    "QuickTime_sony_rtmd_multistsd8.mov.ee.g3.json",
+    true,
+    NO_EXCL,
+  );
+}
+
+#[test]
+fn sony_rtmd_multistsd8_noee_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_multistsd8.mov",
+    "QuickTime_sony_rtmd_multistsd8.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G1 -n` (ValueConv) for the sub-width numerics — the `.ee.*`
+// `-j` goldens render the PrintConvs, so this pins the raw post-ValueConv scalars
+// of the empty-read values: FNumber `256` (the `2^(8-0/8192)` F64, no PrintConv),
+// MasterGainAdjustment `0` (the `''/100` F64), and FrameRate / ExposureTime / ISO
+// / ElectricalExtenderMagnification the EMPTY STRING `""` (the raw `''` / the `-n`
+// rational `''`). Under `-G1` Doc1's empty-read values win the first-extracted
+// collapse. Oracle: bundled ExifTool 13.59 (`-ee -G1 -n`).
+#[test]
+fn sony_rtmd_shortnum_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_shortnum.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(false);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_shortnum.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // FNumber / MasterGainAdjustment empty-read: a bare NUMBER (the ValueConv-of-
+  // `''`: `2^(8-''/8192)=256`, `''/100=0`). Compare by NUMERIC VALUE — bundled's
+  // integer-valued NV writer emits `256`/`0` while the typed `F64` serializer
+  // emits `256.0`/`0.0`; `json_equivalent_strict` treats them equal (both parse
+  // to the same f64). The KEY assertion is that the tag is PRESENT and numeric
+  // (NOT dropped, NOT the `""` of a degenerate string).
+  let num = |key: &str| -> f64 {
+    obj
+      .get(key)
+      .and_then(serde_json::Value::as_f64)
+      .unwrap_or_else(|| panic!("{key} is a bare number, not {:?}", obj.get(key)))
+  };
+  assert!(
+    (num("Track1:FNumber") - 256.0).abs() < 1e-9,
+    "a sub-width FNumber renders the ValueConv-of-'' = 256 at -n"
+  );
+  assert!(
+    num("Track1:MasterGainAdjustment").abs() < 1e-9,
+    "a sub-width MasterGainAdjustment renders the ValueConv-of-'' = 0 at -n"
+  );
+  // FrameRate / ExposureTime / ISO / EEM empty-read: the EMPTY STRING `""` (the
+  // raw ValueConv `''` / the `-n` rational `''` / the no-conv raw `''`).
+  let empty = serde_json::json!("");
+  for key in [
+    "Track1:FrameRate",
+    "Track1:ExposureTime",
+    "Track1:ISO",
+    "Track1:ElectricalExtenderMagnification",
+  ] {
+    assert_eq!(
+      obj.get(key),
+      Some(&empty),
+      "a sub-width {key} renders the raw '' empty string at -n (present, not dropped)"
+    );
+  }
+  // SerialNumber survives (the sub-width numerics render ONLY their own tag
+  // degenerate; the walker continued through every one).
+  assert_eq!(
+    obj.get("Track1:SerialNumber"),
+    Some(&serde_json::json!("ILCE-7SM3 5072108")),
+    "the surviving SerialNumber proves the walker stepped past every sub-width numeric"
+  );
+}
+
+// ── DEGENERATE WhiteBalance + DateTime ─────────────────
+//
+// A PRESENT-but-degenerate `0xe303 WhiteBalance` / `0xe304 DateTime` record is
+// walker-processed (NON-FINAL) and emits a DEFINED value — NOT a dropped tag.
+// Sample 0 (Doc1) carries a zero-length WhiteBalance (`ReadValue '' → -j
+// "Unknown ()" / -n ""`) + a 4-byte DateTime (`unpack` partial → `"2024:03:
+// ::"`); a valid ISO + SerialNumber follow so both stay NON-FINAL. Sample 1
+// (Doc2) is the full valid camera set (WhiteBalance raw 0 → `"Unknown (0)"`,
+// full DateTime). EVERYTHING is byte-exact — NO WhiteBalance/DateTime
+// exclusions, AND (R13) `Track<N>:MetaFormat = rtmd` is now emitted + compared,
+// so NOTHING is excluded. Verified byte-exact vs bundled ExifTool 13.59.
+#[test]
+fn sony_rtmd_wbdt_ee_byte_exact() {
+  check_ee(
+    "QuickTime_sony_rtmd_wbdt.mov",
+    "QuickTime_sony_rtmd_wbdt.mov.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_sony_rtmd_wbdt.mov",
+    "QuickTime_sony_rtmd_wbdt.mov.ee.g3.json",
+    true,
+  );
+}
+
+#[test]
+fn sony_rtmd_wbdt_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_sony_rtmd_wbdt.mov",
+    "QuickTime_sony_rtmd_wbdt.mov.json",
+    NO_EXCL,
+  );
+}
+
+// End-to-end `-ee -G3:1 -n` (ValueConv) for the degenerate WhiteBalance /
+// DateTime — the `.ee.*` `-j` goldens render the PrintConvs, so this pins the
+// raw post-ValueConv `-n` scalars per Doc: the zero-length WhiteBalance is the
+// EMPTY STRING `""` (raw `''`, NOT the `-j` `"Unknown ()"`), the 4-byte DateTime
+// is the SAME partial `"2024:03: ::"` (ConvertDateTime passes a malformed value
+// through, so `-n` == `-j`), and Doc2's valid WhiteBalance raw 0 is the bare
+// number `0`. Oracle: bundled ExifTool 13.59 (`-ee -G3:1 -n`).
+#[test]
+fn sony_rtmd_wbdt_n_match_bundled() {
+  let data = fixture("QuickTime_sony_rtmd_wbdt.mov");
+  let opts = ParseOptions::default()
+    .with_extract_embedded(true)
+    .with_group3(true);
+  let got = extract_info_with_options("QuickTime_sony_rtmd_wbdt.mov", &data, false, opts);
+  let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+  let obj = v.as_array().and_then(|a| a.first()).expect("one object");
+  // Doc1: degenerate. Zero-length WhiteBalance → raw `''` empty string at `-n`.
+  assert_eq!(
+    obj.get("Doc1:Track1:WhiteBalance"),
+    Some(&serde_json::json!("")),
+    "a zero-length WhiteBalance renders the raw '' empty string at -n (present, not dropped)"
+  );
+  // 4-byte DateTime → the partial BCD string (identical at -j / -n).
+  assert_eq!(
+    obj.get("Doc1:Track1:DateTime"),
+    Some(&serde_json::json!("2024:03: ::")),
+    "a 4-byte DateTime renders its partial unpack output at -n"
+  );
+  // Doc2: a valid WhiteBalance raw 0 → the bare number 0 at -n.
+  assert_eq!(
+    obj
+      .get("Doc2:Track1:WhiteBalance")
+      .and_then(serde_json::Value::as_f64),
+    Some(0.0),
+    "a valid WhiteBalance raw 0 renders the bare numeric key at -n"
+  );
+  // Doc2: the full valid DateTime survives.
+  assert_eq!(
+    obj.get("Doc2:Track1:DateTime"),
+    Some(&serde_json::json!("2024:01:07 11:19:15")),
+  );
+  // The track-level `MetaFormat` (R13) is the `stsd` 4cc, emitted once at the
+  // `Track<N>` level (NOT under `Doc<N>`) — verify both presence + position.
+  assert_eq!(
+    obj.get("Track1:MetaFormat"),
+    Some(&serde_json::json!("rtmd")),
+    "MetaFormat is emitted at the family-1 Track level"
+  );
+  assert!(
+    obj.get("Doc1:Track1:MetaFormat").is_none() && obj.get("Doc2:Track1:MetaFormat").is_none(),
+    "MetaFormat is track-level only, never under a Doc<N>"
+  );
+}
+
+#[test]
+fn camm_noee_warning_byte_exact() {
+  check_noee_excluding("QuickTime_camm.mov", "QuickTime_camm.mov.json", NO_EXCL);
 }
 
 // ── No-`ee` faithfulness: the top-level magic boxes (gps0/gsen/3gf) ──────────
@@ -802,21 +1873,20 @@ fn moov_gps_kenwood_frea_noee_no_warning_no_gps() {
 // colliding `Doc1`). `-ee -G1` ⇒ BOTH `Track1:GPSLatitude` and
 // `Track2:GPSLatitude` survive (group-aware first-wins collapse). `SampleTime`/
 // `SampleDuration` ARE emitted per camm SAMPLE (each `Doc<N>` carries its own
-// timing) and compared; only `MetaFormat` (the `stsd` 4-char code) is excluded.
+// timing) and compared; every tag (incl. `Track<N>:MetaFormat`, the stsd 4-char code) is compared byte-exact.
 #[test]
 fn camm_2track_ee_global_doc_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_camm_2track.mov",
     "QuickTime_camm_2track.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_camm_2track.mov",
     "QuickTime_camm_2track.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -827,22 +1897,21 @@ fn camm_2track_ee_global_doc_byte_exact() {
 // across the two structs IN WALK ORDER (mebx trak walked before camm trak). At
 // `-ee -G1` the mebx and camm tags occupy distinct `Track1`/`Track2` groups and
 // all survive. `SampleTime`/`SampleDuration` are emitted for BOTH the mebx and
-// the camm samples (each carries its sample-table timing) and compared; only the
-// structural `MetaFormat` is excluded.
+// the camm samples (each carries its sample-table timing) and compared; every
+// tag (incl. `Track<N>:MetaFormat`) is compared byte-exact.
 #[test]
 fn mebx_camm_ee_cross_struct_global_doc_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_mebx_camm.mov",
     "QuickTime_mebx_camm.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_mebx_camm.mov",
     "QuickTime_mebx_camm.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -852,22 +1921,21 @@ fn mebx_camm_ee_cross_struct_global_doc_byte_exact() {
 // `-ee -G1` ⇒ BOTH `Track1:SceneIlluminance` AND `Track2:SceneIlluminance`
 // survive: a name-only collapse would drop Track2's value, so this is the
 // strongest pin that the mebx `-G1` `%noDups` collapse is GROUP-AWARE
-// (`(family1, name)`-keyed). Only the structural `MetaFormat` is excluded; the
-// mebx `SampleTime`/`SampleDuration` ARE emitted and compared.
+// (`(family1, name)`-keyed). Every tag (incl. `Track<N>:MetaFormat`) is compared
+// byte-exact; the mebx `SampleTime`/`SampleDuration` ARE emitted and compared.
 #[test]
 fn mebx_2track_ee_global_doc_and_group_aware_collapse_byte_exact() {
-  let excl = ["MetaFormat"];
   check_ee_excluding(
     "QuickTime_mebx_2track.mov",
     "QuickTime_mebx_2track.mov.ee.json",
     false,
-    &excl,
+    NO_EXCL,
   );
   check_ee_excluding(
     "QuickTime_mebx_2track.mov",
     "QuickTime_mebx_2track.mov.ee.g3.json",
     true,
-    &excl,
+    NO_EXCL,
   );
 }
 
@@ -876,7 +1944,7 @@ fn mebx_2track_ee_global_doc_and_group_aware_collapse_byte_exact() {
 // per-sample payload (the records surface only under `-ee`). Pins that the
 // global-doc threading does not leak any record into the no-`ee` path.
 #[test]
-fn cross_struct_noee_warning_byte_exact_except_metaformat() {
+fn cross_struct_noee_warning_byte_exact() {
   for (fix, gold) in [
     (
       "QuickTime_camm_2track.mov",
@@ -888,6 +1956,6 @@ fn cross_struct_noee_warning_byte_exact_except_metaformat() {
       "QuickTime_mebx_2track.mov.json",
     ),
   ] {
-    check_noee_excluding(fix, gold, &["MetaFormat"]);
+    check_noee_excluding(fix, gold, NO_EXCL);
   }
 }

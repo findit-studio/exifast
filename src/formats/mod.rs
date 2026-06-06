@@ -99,6 +99,8 @@ pub mod real;
 pub mod red;
 #[cfg(feature = "riff")]
 pub mod riff;
+#[cfg(feature = "quicktime")]
+pub mod sony_rtmd;
 #[cfg(feature = "wavpack")]
 pub mod wavpack;
 #[cfg(feature = "xmp")]

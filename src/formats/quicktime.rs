@@ -58,7 +58,7 @@ use crate::{
   formats::{quicktime_freegps, quicktime_stream},
   metadata::{
     CammMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack, QuickTimeGps,
-    QuickTimeMeta, QuickTimeStreamMeta,
+    QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -1534,6 +1534,47 @@ fn decode_hdlr_class(payload: &[u8]) -> Option<String> {
   Some(String::from_utf8_lossy(raw).into_owned())
 }
 
+/// Read the `stsd` (Sample Description) box's first-entry 4-byte format code
+/// (the `MetaFormat` / `OtherFormat` value — `undef[4]` at offset 4 of the
+/// sample-description entry, QuickTime.pm:7765/7803). The `stsd` body is
+/// `[version+flags:4][entry-count:4]` then each entry `[size:4][format:4]…`, so
+/// the FIRST entry's format 4cc is at body offset 12. Mirrors the stream
+/// walker's `walk_stsd` bounds (entry size >= 16, entry within the box). Returns
+/// the lossless 4-char string, or `None` when the box is too short / malformed.
+/// Timed-metadata tracks carry exactly one entry; ExifTool's `MetaFormat` is
+/// last-wins, but a single entry is the universal real-world shape.
+fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
+  // Walk ALL sample-description entries, LAST-WINS — ExifTool's
+  // `ProcessSampleDesc` per-entry `RawConv => '$$self{MetaFormat} = $val'`
+  // makes a later entry's format overwrite the earlier (QuickTime.pm:9640-
+  // 9648). A single entry (the universal real-world shape) resolves to itself.
+  // Each entry is `[size:4][format:4][reserved:6][data-ref-index:2]` + children.
+  let count = be_u32(payload, 4)? as usize;
+  let mut pos = 8usize;
+  let mut last: Option<String> = None;
+  for _ in 0..count {
+    let Some(size) = be_u32(payload, pos).map(|s| s as usize) else {
+      break;
+    };
+    // ExifTool `ProcessSampleDesc` stops only on `$size < 8` (the entry needs at
+    // least the `[size:4][format:4]` header) or an overrunning entry
+    // (QuickTime.pm:9642-9643) — keeping the last-wins format accumulated so
+    // far. An 8-15 byte entry still contributes its offset-4 format. `checked_add`
+    // so a crafted overflowing `size` breaks rather than wrapping/panicking.
+    let Some(entry_end) = pos.checked_add(size) else {
+      break;
+    };
+    if size < 8 || entry_end > payload.len() {
+      break;
+    }
+    if let Some(raw) = payload.get(pos + 4..pos + 8) {
+      last = Some(String::from_utf8_lossy(raw).into_owned());
+    }
+    pos = entry_end;
+  }
+  last
+}
+
 /// Decode every `mvhd` inside one `moov` atom into `qt` (QuickTime.pm:660-
 /// 700, 1343-1421). This is the FIRST of the two top-level passes (see
 /// [`parse_inner`]): it establishes the movie `TimeScale` (and the movie
@@ -1688,13 +1729,30 @@ fn walk_trak(depth: u32, payload: &[u8], movie_timescale: Option<u32>) -> MediaT
             0,
             body.len(),
             w,
-            |inner, ibody, _w| match &inner.atom_type {
+            |inner, ibody, iw| match &inner.atom_type {
               b"mdhd" => decode_mdhd(ibody, &mut track),
               b"hdlr" => {
                 if let Some(code) = decode_hdlr(ibody) {
                   track.set_handler_code(code);
                 }
                 track.set_handler_class(decode_hdlr_class(ibody));
+              }
+              // `minf/stbl/stsd` carries the sample-description 4-byte format
+              // code (the `MetaFormat`). Descend two more levels and pull it onto
+              // the track so the emission can surface `Track<N>:MetaFormat` for a
+              // `meta`-handler timed-metadata track (QuickTime.pm:7765/7803).
+              b"minf" => {
+                walk_atoms(depth + 2, ibody, 0, ibody.len(), iw, |m, mbody, mw| {
+                  if &m.atom_type == b"stbl" {
+                    walk_atoms(depth + 3, mbody, 0, mbody.len(), mw, |s, sbody, _sw| {
+                      if &s.atom_type == b"stsd"
+                        && let Some(fmt) = decode_stsd_meta_format(sbody)
+                      {
+                        track.set_meta_format(Some(fmt));
+                      }
+                    });
+                  }
+                });
               }
               _ => {}
             },
@@ -3028,6 +3086,13 @@ pub struct Meta<'a> {
   /// ([`CammMeta::is_empty`]) for a non-Android video (or one whose CAMM
   /// track is absent).
   android_camm: CammMeta,
+  /// **SP4** — Sony Alpha / FX / RX `rtmd` ("Real-Time MetaData") — decoded
+  /// through the `rtmd` MetaFormat dispatch in [`quicktime_stream`]. Empty
+  /// ([`SonyRtmdMeta::is_empty`]) for a non-Sony video (or one whose `rtmd`
+  /// track is absent). Each timed sample is one `Doc<N>` sub-document carrying
+  /// that frame's camera + GPS tags. Faithful port of
+  /// `Image::ExifTool::Sony::Process_rtmd` + the `Sony::rtmd` tag table.
+  sony_rtmd: SonyRtmdMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3116,6 +3181,17 @@ impl Meta<'_> {
     &self.android_camm
   }
 
+  /// **SP4** — Sony Alpha / FX / RX `rtmd` ("Real-Time MetaData").
+  /// [`SonyRtmdMeta::is_empty`] for a non-Sony video (or one whose `rtmd`
+  /// track is absent). Faithful port of `Image::ExifTool::Sony::Process_rtmd`
+  /// + the `Image::ExifTool::Sony::rtmd` tag table. Populated by the `rtmd`
+  /// MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn sony_rtmd(&self) -> &SonyRtmdMeta {
+    &self.sony_rtmd
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3154,6 +3230,11 @@ impl Meta<'_> {
     // source already populated GPS); fills only the GPS domain (CAMM carries
     // no camera-identity record).
     self.android_camm.project_into(&mut md);
+    // **SP4 — Sony rtmd** phone-paired GPS (Imaging Edge Mobile) + camera
+    // identity/capture. THIRD-HIGHEST tier — below GoPro / CAMM on-device
+    // hardware, above the generic SP3 timed-metadata scan. Set-once per domain
+    // (no-ops when a higher-priority source already populated camera / GPS).
+    self.sony_rtmd.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -3595,6 +3676,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // GoPro meta + the `found_embedded`/`kodak_version` state below (the camm arm
   // is purely additive to the existing per-format sample dispatch).
   let mut camm_meta = CammMeta::new();
+  // **SP4 — Sony rtmd** accumulator, populated by the `rtmd` MetaFormat dispatch
+  // in [`quicktime_stream`] for each timed-metadata sample of a Sony video's
+  // `rtmd` track (one `SonyRtmdSample` per sample). Additive to the existing
+  // per-format sample dispatch, exactly like `camm_meta`.
+  let mut sony_rtmd_meta = SonyRtmdMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
   // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
   // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
@@ -3631,6 +3717,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     kodak_version,
     &mut gopro_meta,
     &mut camm_meta,
+    &mut sony_rtmd_meta,
   );
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
@@ -3686,6 +3773,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     stream,
     gopro: gopro_meta,
     android_camm: camm_meta,
+    sony_rtmd: sony_rtmd_meta,
     embedded_exif_deferred,
     file_type,
     mime,
@@ -4457,6 +4545,26 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+      // MetaFormat (`stsd` 4cc): the `MetaSampleDesc` `MetaFormat` tag, emitted
+      // ONLY for a `meta`-handler track (QuickTime.pm:7393 `Condition =>
+      // '$$self{HandlerType} eq "meta"'`) — a `soun`/`vide`/`hint` track routes
+      // to its own sample-desc table, an unmatched handler to `OtherSampleDesc`'s
+      // `OtherFormat` (NOT `MetaFormat`). Positioned at the family-1 `Track<N>`
+      // level right AFTER `HandlerType` (the golden order; track-level, NOT under
+      // `Doc<N>`). Emit the raw 4-char code verbatim in both modes (no PrintConv
+      // — `Format => 'undef[4]'`, the RawConv only stashes `$$self{MetaFormat}`).
+      // Verified vs bundled 13.59: `Track1:MetaFormat = rtmd`/`camm`/`mebx`.
+      if let Some(fmt) = track.meta_format()
+        && track.handler_code() == Some("meta")
+        && first_seen(grp, "MetaFormat")
+      {
+        tags.push(EmittedTag::new(
+          track_group(),
+          "MetaFormat".into(),
+          TagValue::Str(fmt.into()),
+          false,
+        ));
+      }
     }
 
     // ── SP3: embedded timed-metadata (QuickTimeStream) ─────────────────
@@ -4684,6 +4792,386 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+    }
+
+    // ── SP4: Sony rtmd per-sample camera + GPS (Image::ExifTool::Sony) ──
+    // `Process_rtmd` (Sony.pm:11569-11602) decodes ONE timed sample per `rtmd`
+    // sample-table entry; ExifTool's `ProcessSamples` opens a `Doc<N>` per
+    // sample and `HandleTag`s every decoded record under it, scoped to the
+    // enclosing `Track<N>` (family-1; oracle: `Doc1:Track1:FNumber`,
+    // `Doc1:Track1:GPSLatitude`) — IDENTICAL group machinery to the `mebx`
+    // block above. Gated on `-ee`; `-G1` collapses every `Doc<N>` to one
+    // `(Track<N>, name)` row (within-sample last-wins, across-sample
+    // first-wins). Each sample's records emit in the fixed Sony.pm tag order
+    // (SampleTime/SampleDuration, then the camera scalars, then the `0x85xx`
+    // GPS family) so the rendered key order matches the oracle token-for-token.
+    if opts.extract_embedded {
+      let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+      // Fallback running ordinal for any unstamped sample (none in practice —
+      // the walker stamps `doc()` on every sample); when stamped, used verbatim
+      // so all of one sample's records share ONE `Doc<N>`.
+      let mut doc: u32 = 0;
+      let mut sony_scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+      // `-G1` collapse state (unused at `-G3`), keyed by `(family1, name)` —
+      // the same two-rule collapse the `mebx` block documents: within one
+      // sample last-wins, across samples first-wins.
+      let mut sony_committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
+        std::vec::Vec::new();
+      let mut doc_vals: std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)> =
+        std::vec::Vec::new();
+      let mut cur_doc: Option<u32> = None;
+      let flush_doc =
+        |doc_vals: &mut std::vec::Vec<((smol_str::SmolStr, smol_str::SmolStr), EmittedTag)>,
+         committed: &mut std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
+         tags: &mut std::vec::Vec<EmittedTag>| {
+          for (key, tag) in doc_vals.drain(..) {
+            if committed.contains(&key) {
+              continue;
+            }
+            committed.push(key);
+            tags.push(tag);
+          }
+        };
+      for sample in self.sony_rtmd.samples() {
+        let doc_n = if sample.doc() == 0 {
+          doc += 1;
+          doc
+        } else {
+          sample.doc()
+        };
+        let track = std::format!("Track{}", {
+          let t = sample.track_index();
+          if t == 0 { 1 } else { t }
+        });
+        let group = if g3 {
+          Group::with_doc("QuickTime", track.as_str(), doc_n)
+        } else {
+          Group::new("QuickTime", track.as_str())
+        };
+        sony_scratch.clear();
+        // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
+        // `-n`) — the sample-table timing emitted ahead of the decoded payload.
+        for (val, name) in [
+          (sample.sample_time(), "SampleTime"),
+          (sample.sample_duration(), "SampleDuration"),
+        ] {
+          if let Some(secs) = val {
+            let value = if print_conv {
+              TagValue::Str(crate::datetime::convert_duration(secs).into())
+            } else {
+              TagValue::F64(secs)
+            };
+            sony_scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+          }
+        }
+        // ── camera scalars (Sony.pm:10700-10833 order) ─────────────────────
+        let cam = sample.camera();
+        // FNumber (0x8000): a PRESENT record is always a DEFINED tag — the
+        // post-ValueConv linear f-number for a `Valid` read (`PrintFNumber` at
+        // `-j`, raw F64 at `-n`), OR the ValueConv-of-`''` `2^(8-0/8192) = 256`
+        // for an `EmptyRead` (a sub-width record — `256.0` at `-j`, `256` at
+        // `-n`, verified vs bundled 13.59). See the helper.
+        if let Some(read) = cam.f_number_read() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "FNumber".into(),
+            sony_rtmd_fnumber_value(read, print_conv),
+            false,
+          ));
+        }
+        // FrameRate (0x8106): `sprintf("%.2f")` PrintConv at `-j` (oracle
+        // `29.97`), the raw `rational64u` at `-n` — ExifTool reads `0x8106`
+        // as `rational64u` and `-n` renders its rational `%g` form
+        // (`30000/1001` → `29.97002997`, NOT the 15-digit f64). A zero
+        // denominator stays `undef`; an `EmptyRead` (sub-width record) is the
+        // ValueConv-of-`''`: `0.00` at `-j` (`sprintf("%.2f",'')` numifies `''`
+        // to 0), `''` at `-n` (verified vs bundled 13.59).
+        if let Some(read) = cam.frame_rate_read() {
+          let value = sony_rtmd_frame_rate_read_value(read, print_conv);
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "FrameRate".into(),
+            value,
+            false,
+          ));
+        }
+        // ExposureTime (0x8109): `PrintExposureTime` at `-j` (oracle `"1/60"`),
+        // the raw `rational64u` at `-n` (`1/60` → `0.01666666667`, the
+        // rational `%g` form, not the f64; zero denominator → `undef`). An
+        // `EmptyRead` (sub-width record) is the ValueConv-of-`''`: the EMPTY
+        // STRING `''` at BOTH `-j` and `-n` (`PrintExposureTime('')` returns its
+        // argument unchanged — `IsFloat('')` is false — verified vs bundled).
+        if let Some(read) = cam.exposure_time_read() {
+          let value = sony_rtmd_exposure_time_read_value(read, print_conv);
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "ExposureTime".into(),
+            value,
+            false,
+          ));
+        }
+        // MasterGainAdjustment (0x810a): `sprintf("%.2f dB")` PrintConv at `-j`
+        // (oracle `"6.00 dB"`), raw F64 dB at `-n`. An `EmptyRead` (sub-width
+        // record) is the ValueConv-of-`''` `''/100 = 0`: `"0.00 dB"` at `-j`,
+        // `0` at `-n` (verified vs bundled 13.59).
+        if let Some(read) = cam.master_gain_db_read() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "MasterGainAdjustment".into(),
+            sony_rtmd_master_gain_value(read, print_conv),
+            false,
+          ));
+        }
+        // ISO (0x810b): emitted ONLY when the CANONICAL `0x810b` tag was present
+        // — the alternate `0xe301` int32u channel is `%hidUnk` (Hidden+Unknown),
+        // which bundled does not surface as `Sony:ISO`. Plain integer for a
+        // `Valid` read; an `EmptyRead` (sub-width canonical record) is the raw
+        // `''` EMPTY STRING in BOTH modes (verified vs bundled 13.59).
+        if cam.iso_from_canonical()
+          && let Some(read) = cam.iso_read()
+        {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "ISO".into(),
+            sony_rtmd_raw_int_read_value(read),
+            false,
+          ));
+        }
+        // ElectricalExtenderMagnification (0x810c): `int16u`, no conv — the plain
+        // integer for a `Valid` read, the raw `''` EMPTY STRING for an
+        // `EmptyRead` (sub-width record), in both modes; positioned after `ISO`
+        // per tag-id order (Sony.pm:10769-10772, verified vs bundled 13.59).
+        if let Some(read) = cam.electrical_extender_magnification_read() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "ElectricalExtenderMagnification".into(),
+            sony_rtmd_raw_int_read_value(read),
+            false,
+          ));
+        }
+        // SerialNumber (0x8114): the raw composite (`"<MODEL> <SERIAL>"`), no
+        // conv — emit verbatim in both modes.
+        if let Some(v) = cam.serial_number() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "SerialNumber".into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+        // WhiteBalance (0xe303): Sony.pm:10818-10827 `int8u` + PrintConv hash. A
+        // `Valid` read → the hash PrintConv at `-j` (an out-of-table code →
+        // `Unknown ($val)`, oracle `"Unknown (0)"`) / the raw key at `-n`. An
+        // `EmptyRead` (present zero-length record, `ReadValue` ⇒ `''`) → the
+        // PrintConv-of-`''` `"Unknown ()"` at `-j` / `''` at `-n` (verified vs
+        // bundled 13.59).
+        if let Some(read) = cam.white_balance_read() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "WhiteBalance".into(),
+            sony_rtmd_white_balance_read_value(read, print_conv),
+            false,
+          ));
+        }
+        // DateTime (0xe304): the assembled `"YYYY:MM:DD HH:MM:SS"` (or a PARTIAL
+        // BCD string for a sub-width record — `unpack` fills each field from the
+        // bytes that remain, e.g. a 4-byte record → `"2024:03: ::"`). No PrintConv
+        // distinction (`ConvertDateTime` passes a malformed value through) — emit
+        // verbatim in both modes. The decoder always yields a string for a present
+        // record, so a degenerate DateTime still surfaces (verified vs bundled
+        // 13.59 for each length 0..8).
+        if let Some(v) = cam.date_time() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "DateTime".into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+        // PitchRollYaw (0xe43b) / Accelerometer (0xe44b): the typed layer holds
+        // the FINAL post-`RawConv` string (the whole record's `int16s` array
+        // space-joined, then `substr` from CHARACTER index 8 — see the parser).
+        // No PrintConv ⇒ emit verbatim in both modes, positioned after
+        // `DateTime` per tag-id order (Sony.pm:10877-10887).
+        if let Some(v) = cam.pitch_roll_yaw() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "PitchRollYaw".into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+        if let Some(v) = cam.accelerometer() {
+          sony_scratch.push(EmittedTag::new(
+            group.clone(),
+            "Accelerometer".into(),
+            TagValue::Str(v.into()),
+            false,
+          ));
+        }
+        // ── GPS family (Sony.pm:10738-10811 order) ─────────────────────────
+        if let Some(gps) = sample.gps() {
+          // GPSVersionID (0x8500): the typed layer holds the DOTTED form
+          // (`"2.2.0.0"`, post-`tr/ /./`); `-j` emits it verbatim, `-n` the
+          // pre-PrintConv SPACE-joined form (`"2 2 0 0"`).
+          if let Some(v) = gps.version_id() {
+            let value = if print_conv {
+              TagValue::Str(v.into())
+            } else {
+              TagValue::Str(v.replace('.', " ").into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSVersionID".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSLatitudeRef (0x8501): `%printConvLatRef` `N`→North / `S`→South at
+          // `-j`; the raw char at `-n`.
+          if let Some(v) = gps.latitude_ref() {
+            let value = if print_conv {
+              TagValue::Str(sony_rtmd_lat_ref_print(v).into())
+            } else {
+              TagValue::Str(v.into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSLatitudeRef".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSLatitude (0x8502): a PRESENT record is always a DEFINED tag —
+          // the UNSIGNED magnitude (the hemisphere is the separate `Ref` tag)
+          // for a finite `SonyRtmdCoord::Value` (`GPS::ToDMS` at `-j`, NO
+          // hemisphere suffix — oracle `"47 deg 37' 42.30\""`; raw F64 at
+          // `-n`), OR the EMPTY STRING `""` for a `SonyRtmdCoord::Empty` (the
+          // `GPS::ToDegrees` `""` render of an inf/undef component — emitted at
+          // BOTH `-j` and `-n`, verified vs bundled 13.59).
+          if let Some(coord) = gps.latitude() {
+            let value = sony_rtmd_gps_coord_value(coord, print_conv);
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSLatitude".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSLongitudeRef (0x8503): `%printConvLonRef` `E`→East / `W`→West.
+          if let Some(v) = gps.longitude_ref() {
+            let value = if print_conv {
+              TagValue::Str(sony_rtmd_lon_ref_print(v).into())
+            } else {
+              TagValue::Str(v.into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSLongitudeRef".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSLongitude (0x8504): same shape as GPSLatitude — the UNSIGNED
+          // magnitude (`ToDMS` at `-j`) for a finite `Value`, or `""` for an
+          // `Empty` (the `GPS::ToDegrees` `""` render).
+          if let Some(coord) = gps.longitude() {
+            let value = sony_rtmd_gps_coord_value(coord, print_conv);
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSLongitude".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSTimeStamp (0x8507): the stored value is the post-ValueConv
+          // (`ConvertTimeStamp`) `HH:MM:SS[.ddd…]` string (up to 9 fractional
+          // digits) — emitted verbatim at `-n`. At `-j` the PrintConv
+          // `PrintTimeStamp` ROUNDS the fractional seconds to microseconds
+          // (6 digits); a whole-second value is unchanged.
+          if let Some(v) = gps.time_stamp() {
+            let value = if print_conv {
+              TagValue::Str(sony_rtmd_print_time_stamp(v).into())
+            } else {
+              TagValue::Str(v.into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSTimeStamp".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSStatus (0x8509): `A`→"Measurement Active" / `V`→"Measurement
+          // Void" at `-j`; the raw char at `-n`.
+          if let Some(v) = gps.status() {
+            let value = if print_conv {
+              TagValue::Str(sony_rtmd_gps_status_print(v).into())
+            } else {
+              TagValue::Str(v.into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSStatus".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSMeasureMode (0x850a): `2`/`3`→"<n>-Dimensional Measurement" at
+          // `-j`; the raw char at `-n`.
+          if let Some(v) = gps.measure_mode() {
+            let value = if print_conv {
+              TagValue::Str(sony_rtmd_gps_measure_mode_print(v).into())
+            } else {
+              TagValue::Str(v.into())
+            };
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSMeasureMode".into(),
+              value,
+              false,
+            ));
+          }
+          // GPSMapDatum (0x8512): the datum string (`"WGS-84"`), no conv.
+          if let Some(v) = gps.map_datum() {
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSMapDatum".into(),
+              TagValue::Str(v.into()),
+              false,
+            ));
+          }
+          // GPSDateStamp (0x851d): the `YYYY:MM:DD` string, no conv.
+          if let Some(v) = gps.date_stamp() {
+            sony_scratch.push(EmittedTag::new(
+              group.clone(),
+              "GPSDateStamp".into(),
+              TagValue::Str(v.into()),
+              false,
+            ));
+          }
+        }
+        if g3 {
+          tags.append(&mut sony_scratch);
+        } else {
+          if cur_doc != Some(doc_n) {
+            flush_doc(&mut doc_vals, &mut sony_committed, &mut tags);
+            cur_doc = Some(doc_n);
+          }
+          for tag in sony_scratch.drain(..) {
+            let key = (
+              smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+              smol_str::SmolStr::new(tag.tag().name()),
+            );
+            if let Some(slot) = doc_vals.iter_mut().find(|(k, _)| *k == key) {
+              slot.1 = tag;
+            } else {
+              doc_vals.push((key, tag));
+            }
+          }
+        }
+      }
+      flush_doc(&mut doc_vals, &mut sony_committed, &mut tags);
     }
 
     // ── SP4: GoPro GPMF (Image::ExifTool::GoPro) ───────────────────────
@@ -6135,6 +6623,382 @@ fn round_to_decimals(val: f64, decimals: u32) -> f64 {
   let factor = 10f64.powi(decimals as i32);
   // `sprintf` rounds half away from zero; `f64::round` does the same.
   (val * factor).round() / factor
+}
+
+/// Sony rtmd `0xe303 WhiteBalance` PrintConv (Sony.pm:10818-10827). A code
+/// OUTSIDE the table falls through to `Unknown ($val)` (ExifTool.pm:3622) —
+/// the real fixture carries `0`, so the oracle shows `"Unknown (0)"`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_white_balance_print(v: u8) -> std::string::String {
+  match v {
+    1 => "Incandescent".to_string(),
+    2 => "Fluorescent".to_string(),
+    4 => "Daylight".to_string(),
+    5 => "Cloudy".to_string(),
+    6 => "Custom".to_string(),
+    255 => "Preset".to_string(),
+    other => std::format!("Unknown ({other})"),
+  }
+}
+
+/// `0xe303 WhiteBalance` from a [`crate::metadata::NumericRead`] (Sony.pm:10817-
+/// 10827, `int8u` + PrintConv hash). `Valid(v)` ⇒ the hash PrintConv at `-j`
+/// (an out-of-table code → `Unknown ($val)`) / the raw numeric key at `-n`.
+/// `EmptyRead` (a present zero-length record whose `ReadValue` ⇒ `''`) ⇒ the
+/// PrintConv-of-`''`: the hash MISSES the empty string (no `0`/empty key) so
+/// bundled renders `"Unknown ()"` at `-j`, and the raw `''` EMPTY STRING at
+/// `-n` (verified byte-exact vs bundled ExifTool 13.59).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_white_balance_read_value(
+  read: crate::metadata::NumericRead<u8>,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  match read {
+    NumericRead::Valid(v) => {
+      if print_conv {
+        TagValue::Str(sony_rtmd_white_balance_print(v).into())
+      } else {
+        TagValue::U64(u64::from(v))
+      }
+    }
+    NumericRead::EmptyRead => {
+      if print_conv {
+        // The hash has no key for `''` and no `OTHER`/`BITMASK` → `Unknown ()`.
+        TagValue::Str(print_conv_unknown("").into())
+      } else {
+        TagValue::Str("".into())
+      }
+    }
+  }
+}
+
+/// ExifTool's default PrintConv hash-miss rendering (ExifTool.pm:3633,
+/// `$value = "Unknown ($val)"`) — for a value with no matching hash key and no
+/// `OTHER`/`BITMASK`/`PrintHex`. The Sony rtmd GPS ref / status / measure-mode
+/// tables are bare inline hashes (Sony.pm:10788/10804/10827/10836) with NO
+/// `OTHER` handler, so ANY out-of-table value (incl. a DEFINED EMPTY STRING from
+/// a leading-NUL record) renders `Unknown (<val>)` — e.g. an empty value →
+/// `"Unknown ()"`, `"X"` → `"Unknown (X)"`. Verified against bundled ExifTool
+/// 13.59. (These tags never set `PrintHex`, so the hex branch never applies.)
+#[cfg(feature = "alloc")]
+fn print_conv_unknown(v: &str) -> std::string::String {
+  std::format!("Unknown ({v})")
+}
+
+/// Sony rtmd `0x8501 GPSLatitudeRef` PrintConv (Sony.pm:10788, a bare
+/// `{ N => 'North', S => 'South' }` hash): `N`→North / `S`→South. Any other
+/// value renders ExifTool's default `Unknown (<val>)` (no `OTHER` handler).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_lat_ref_print(v: &str) -> std::string::String {
+  match v {
+    "N" => "North".to_string(),
+    "S" => "South".to_string(),
+    other => print_conv_unknown(other),
+  }
+}
+
+/// Sony rtmd `0x8503 GPSLongitudeRef` PrintConv (Sony.pm:10804, a bare
+/// `{ E => 'East', W => 'West' }` hash): `E`→East / `W`→West. Any other value
+/// renders `Unknown (<val>)`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_lon_ref_print(v: &str) -> std::string::String {
+  match v {
+    "E" => "East".to_string(),
+    "W" => "West".to_string(),
+    other => print_conv_unknown(other),
+  }
+}
+
+/// Sony rtmd `0x8509 GPSStatus` PrintConv (Sony.pm:10827, a bare
+/// `{ A => 'Measurement Active', V => 'Measurement Void' }` hash). Any other
+/// value renders `Unknown (<val>)`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_gps_status_print(v: &str) -> std::string::String {
+  match v {
+    "A" => "Measurement Active".to_string(),
+    "V" => "Measurement Void".to_string(),
+    other => print_conv_unknown(other),
+  }
+}
+
+/// Sony rtmd `0x850a GPSMeasureMode` PrintConv (Sony.pm:10836, a bare
+/// `{ 2 => '2-Dimensional Measurement', 3 => '3-Dimensional Measurement' }`
+/// hash). Any other value renders `Unknown (<val>)`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_gps_measure_mode_print(v: &str) -> std::string::String {
+  match v {
+    "2" => "2-Dimensional Measurement".to_string(),
+    "3" => "3-Dimensional Measurement".to_string(),
+    other => print_conv_unknown(other),
+  }
+}
+
+/// `Image::ExifTool::GPS::PrintTimeStamp` (GPS.pm:480-486) — the PrintConv on
+/// `GPSTimeStamp` (`0x8507`). The stored value is the post-`ConvertTimeStamp`
+/// `HH:MM:SS[.ddd…]` string (the `-n` / ValueConv form, up to 9 fractional
+/// digits); at `-j` the fractional seconds are ROUNDED to microseconds:
+///
+/// ```text
+/// return $val unless $val =~ s/:(\d{2}\.\d+)$//;   # only a fractional :SS.d…
+/// my $s = int($1 * 1000000 + 0.5) / 1000000;       # round to 1e-6
+/// $s = "0$s" if $s < 10;                            # re-pad a single digit
+/// return "${val}:$s";
+/// ```
+///
+/// A whole-second timestamp (`:SS` with no fraction) does NOT match the
+/// regex and is returned unchanged. The rounded number is stringified with
+/// Perl's default `%g` (≤ 15 sig-figs) — [`crate::value::format_g`] with
+/// precision 15 reproduces that (e.g. `3.123456789` → `3.123457`).
+/// Render a Sony rtmd `0x8502 GPSLatitude` / `0x8504 GPSLongitude`
+/// [`crate::metadata::SonyRtmdCoord`] for emission. A present record is always
+/// a DEFINED tag:
+///  - [`crate::metadata::SonyRtmdCoord::Value`] — the UNSIGNED magnitude (the
+///    hemisphere is the separate `*Ref` tag): `GPS::ToDMS` at `-j`
+///    (`print_conv` true), the raw F64 magnitude at `-n`;
+///  - [`crate::metadata::SonyRtmdCoord::Empty`] — the EMPTY STRING `""` at BOTH
+///    modes (the `GPS::ToDegrees` `""` render for an inf/undef / too-short
+///    component, GPS.pm:585; verified byte-exact vs bundled ExifTool 13.59).
+///
+/// Emitting the `Empty` as a real `Str("")` entry (rather than dropping the
+/// tag) reproduces bundled's `-G1` first-wins collapse: a Doc1 present-empty
+/// coordinate keeps `""` over a later Doc's finite value (the empty string is a
+/// defined value extracted first).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_gps_coord_value(
+  coord: crate::metadata::SonyRtmdCoord,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::SonyRtmdCoord;
+  use crate::value::TagValue;
+  match coord {
+    SonyRtmdCoord::Value(v) => {
+      if print_conv {
+        TagValue::Str(crate::exif::gps::to_dms(v.abs()).into())
+      } else {
+        TagValue::F64(v.abs())
+      }
+    }
+    SonyRtmdCoord::Empty => TagValue::Str("".into()),
+  }
+}
+
+#[cfg(feature = "alloc")]
+fn sony_rtmd_print_time_stamp(val: &str) -> std::string::String {
+  // Match a trailing `:` + exactly two digits + `.` + one-or-more digits.
+  // Find the LAST ':' and test the tail shape (no regex dependency).
+  let Some(colon) = val.rfind(':') else {
+    return val.to_string();
+  };
+  let (head, tail) = val.split_at(colon); // tail starts with ':'
+  let frac = &tail[1..]; // drop the ':'
+  let Some(dot) = frac.find('.') else {
+    return val.to_string(); // whole second — unchanged
+  };
+  let (sec, rest) = frac.split_at(dot); // sec = "SS", rest = ".ddd…"
+  let dec = &rest[1..]; // drop the '.'
+  // Faithful to `\d{2}\.\d+`: exactly two leading second digits, ≥ 1
+  // fractional digit, all ASCII digits. Anything else ⇒ no match.
+  if sec.len() != 2
+    || !sec.bytes().all(|b| b.is_ascii_digit())
+    || dec.is_empty()
+    || !dec.bytes().all(|b| b.is_ascii_digit())
+  {
+    return val.to_string();
+  }
+  // `$1` is the whole `SS.ddd…` number.
+  let Ok(num) = frac.parse::<f64>() else {
+    return val.to_string();
+  };
+  // `int($1 * 1e6 + 0.5) / 1e6` — Perl `int()` truncates toward zero; the
+  // input is non-negative so `trunc()` matches. Stringify the result via
+  // Perl's default `%g` (15 sig-figs).
+  let rounded = (num * 1_000_000.0 + 0.5).trunc() / 1_000_000.0;
+  let mut s = crate::value::format_g(rounded, 15);
+  if rounded < 10.0 {
+    s.insert(0, '0');
+  }
+  std::format!("{head}:{s}")
+}
+
+/// Numify a rational's ValueConv string the way Perl `sprintf("%.2f", $val)`
+/// would, for `0x8106 FrameRate`'s `sprintf("%.2f",$val)` PrintConv. The
+/// ValueConv result is `GetRational64u` ([`crate::value::Rational::exiftool_val_str`]):
+/// a `%.10g` number for a finite quotient, or the non-numeric word `"undef"`
+/// (`0/0`) / `"inf"` (`n/0`).
+///
+/// Perl `sprintf("%.2f", $s)` NUMIFIES `$s` first: `"undef"` → `0` →
+/// `"0.00"` (a bare JSON number), `"inf"` → `Inf` → `"Inf"` (Perl's `%f`
+/// titlecases infinity → a quoted JSON string), a finite number → `"%.2f"`.
+/// Verified empirically against bundled ExifTool 13.59 (a `0/0` FrameRate
+/// renders `0.00` at `-j`, an `n/0` FrameRate renders `"Inf"`).
+fn sony_rtmd_frame_rate_value(
+  r: crate::value::Rational,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    // `-n` (ValueConv): the rational renders its `%.10g` value, or the
+    // `"undef"`/`"inf"` word for a zero denominator (handled by the
+    // `Rational` serializer).
+    return TagValue::Rational(r);
+  }
+  let val_str = r.exiftool_val_str();
+  // Perl numification of the ValueConv scalar: a finite `%.10g` number parses;
+  // `"undef"` → 0.0; `"inf"` → +∞ (numerator of a `rational64u` is unsigned,
+  // so `-inf` is unreachable, but `parse` would handle it).
+  let numified = val_str.parse::<f64>().unwrap_or(0.0);
+  if numified.is_finite() {
+    TagValue::Str(std::format!("{numified:.2}").into())
+  } else {
+    // Perl `%f` of a non-finite value: titlecase `Inf` / `-Inf` / `NaN`.
+    match crate::value::perl_nonfinite_str(numified) {
+      Some(text) => TagValue::Str(text.into()),
+      None => TagValue::Str(val_str.into()),
+    }
+  }
+}
+
+/// `0x8109 ExposureTime`'s `PrintExposureTime($val)` PrintConv applied to the
+/// rational's ValueConv string. `PrintExposureTime` returns its argument
+/// UNCHANGED `unless IsFloat($val)` (ExifTool.pm `IsFloat` rejects `"undef"`
+/// and `"inf"`), so a zero-denominator value passes through verbatim
+/// (`0/0` → `"undef"`, `n/0` → `"inf"` — both verified against bundled 13.59);
+/// a finite quotient runs the normal `1/x` / `%.1f` shaping.
+fn sony_rtmd_exposure_time_value(
+  r: crate::value::Rational,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if !print_conv {
+    return TagValue::Rational(r);
+  }
+  let val_str = r.exiftool_val_str();
+  match val_str.parse::<f64>() {
+    // A finite ValueConv number ⇒ the normal PrintExposureTime shaping.
+    Ok(f) if f.is_finite() => TagValue::Str(crate::exif::tables::print_exposure_time(f).into()),
+    // `"undef"` / `"inf"` (zero denominator) ⇒ `IsFloat` is false ⇒
+    // PrintExposureTime returns the value-string verbatim.
+    _ => TagValue::Str(val_str.into()),
+  }
+}
+
+// ── Sony rtmd NUMERIC-tag `NumericRead` emission (present sub-width records) ──
+//
+// A PRESENT Sony rtmd numeric record always emits a DEFINED tag (Sony.pm:11582
+// `while $pos+4 < $end` walks a NON-FINAL present record even when its value is
+// sub-width; `ReadValue` returns `''`, the tag's ValueConv NUMIFIES it). These
+// helpers render a [`crate::metadata::NumericRead`]: `Valid(t)` EXACTLY as the
+// non-degenerate path did (byte-identical for valid input), `EmptyRead` as the
+// ValueConv-of-`''` measured against bundled ExifTool 13.59. Record ABSENCE (a
+// FINAL bare header) never reaches here — the emission `if let Some(read)` is
+// the absent gate.
+
+/// `0x8000 FNumber` from a [`crate::metadata::NumericRead`]. `Valid(f)` ⇒
+/// `PrintFNumber(f)` at `-j` / raw F64 at `-n` (unchanged). `EmptyRead` ⇒ the
+/// ValueConv-of-`''` `2^(8-0/8192) = 256` rendered the SAME way: `PrintFNumber(256)`
+/// = `"256.0"` at `-j`, `256` at `-n` (the integer-valued F64 serializes `256`).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_fnumber_value(
+  read: crate::metadata::NumericRead<f64>,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  // `EmptyRead` ⇒ the ValueConv numifies `''` to 0 ⇒ `2^(8-0/8192) = 256`.
+  let v = match read {
+    NumericRead::Valid(v) => v,
+    NumericRead::EmptyRead => 256.0,
+  };
+  if print_conv {
+    TagValue::Str(crate::exif::tables::print_fnumber(v).into())
+  } else {
+    TagValue::F64(v)
+  }
+}
+
+/// `0x810a MasterGainAdjustment` from a [`crate::metadata::NumericRead`].
+/// `Valid(v)` ⇒ `sprintf("%.2f dB",v)` at `-j` / raw F64 at `-n` (unchanged).
+/// `EmptyRead` ⇒ the ValueConv-of-`''` `''/100 = 0`: `"0.00 dB"` at `-j`, `0`
+/// at `-n`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_master_gain_value(
+  read: crate::metadata::NumericRead<f64>,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  let v = match read {
+    NumericRead::Valid(v) => v,
+    NumericRead::EmptyRead => 0.0,
+  };
+  if print_conv {
+    TagValue::Str(std::format!("{v:.2} dB").into())
+  } else {
+    TagValue::F64(v)
+  }
+}
+
+/// A no-conv raw-integer numeric tag (`0x810b ISO`, `0x810c
+/// ElectricalExtenderMagnification`) from a [`crate::metadata::NumericRead`].
+/// `Valid(v)` ⇒ the plain integer in both modes (unchanged). `EmptyRead` ⇒ the
+/// raw `''` EMPTY STRING in both modes (no ValueConv to numify it — `ReadValue`
+/// returns `''` and there is no conv, so bundled emits `""`).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_raw_int_read_value<T: Into<u64>>(
+  read: crate::metadata::NumericRead<T>,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  match read {
+    NumericRead::Valid(v) => TagValue::U64(v.into()),
+    NumericRead::EmptyRead => TagValue::Str("".into()),
+  }
+}
+
+/// `0x8106 FrameRate` from a [`crate::metadata::NumericRead`]. `Valid(r)` ⇒ the
+/// existing rational rendering (`sprintf("%.2f")` at `-j`, raw `rational64u` at
+/// `-n`). `EmptyRead` ⇒ the ValueConv-of-`''`: `sprintf("%.2f",'')` numifies
+/// `''` to 0 ⇒ `0.00` (a bare number) at `-j`, the raw `''` EMPTY STRING at
+/// `-n`.
+#[cfg(feature = "alloc")]
+fn sony_rtmd_frame_rate_read_value(
+  read: crate::metadata::NumericRead<crate::value::Rational>,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  match read {
+    NumericRead::Valid(r) => sony_rtmd_frame_rate_value(r, print_conv),
+    NumericRead::EmptyRead => {
+      if print_conv {
+        // `sprintf("%.2f",'')` → `0.00`. `Str("0.00")` routes through the
+        // numeric-gate → a bare number (value-equal to bundled's `0.00`).
+        TagValue::Str("0.00".into())
+      } else {
+        TagValue::Str("".into())
+      }
+    }
+  }
+}
+
+/// `0x8109 ExposureTime` from a [`crate::metadata::NumericRead`]. `Valid(r)` ⇒
+/// the existing rational rendering (`PrintExposureTime` at `-j`, raw
+/// `rational64u` at `-n`). `EmptyRead` ⇒ the ValueConv-of-`''`: the EMPTY STRING
+/// `''` in BOTH modes (`PrintExposureTime('')` returns its argument unchanged —
+/// `IsFloat('')` is false).
+#[cfg(feature = "alloc")]
+fn sony_rtmd_exposure_time_read_value(
+  read: crate::metadata::NumericRead<crate::value::Rational>,
+  print_conv: bool,
+) -> crate::value::TagValue {
+  use crate::metadata::NumericRead;
+  use crate::value::TagValue;
+  match read {
+    NumericRead::Valid(r) => sony_rtmd_exposure_time_value(r, print_conv),
+    NumericRead::EmptyRead => TagValue::Str("".into()),
+  }
 }
 
 /// Build a GoPro unit-suffix tag value — the `'"$val <unit>"'` PrintConv shared
@@ -9396,6 +10260,7 @@ mod tests {
       None,
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero8 Black"));
     assert!(
@@ -9429,6 +10294,7 @@ mod tests {
       None,
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert_eq!(
       meta.device_name(),
@@ -9469,6 +10335,7 @@ mod tests {
       None,
       &mut meta_a,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert_eq!(
       meta_a.device_name(),
@@ -9495,6 +10362,7 @@ mod tests {
       None,
       &mut meta_b,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert_eq!(
       meta_b.device_name(),
@@ -9519,6 +10387,7 @@ mod tests {
       None,
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero6 Black"));
     assert!(found_embedded);
@@ -9536,6 +10405,7 @@ mod tests {
       None,
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert!(meta.is_empty());
     assert!(!found_embedded);
@@ -9553,6 +10423,7 @@ mod tests {
       None,
       &mut meta2,
       &mut crate::metadata::CammMeta::new(),
+      &mut crate::metadata::SonyRtmdMeta::new(),
     );
     assert!(meta2.is_empty());
   }
@@ -10719,5 +11590,201 @@ mod tests {
         "-n emits raw seconds, no ConvertDuration"
       );
     }
+  }
+
+  // ── Sony rtmd `PrintTimeStamp` (0x8507 GPSTimeStamp PrintConv) ─────────────
+  // Oracle-pinned against bundled ExifTool 13.59
+  // (`Image::ExifTool::GPS::PrintTimeStamp`): the fractional seconds are
+  // ROUNDED to microseconds at `-j`; a whole second is unchanged.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn sony_rtmd_print_time_stamp_rounds_to_microseconds() {
+    // >6 fractional digits ⇒ rounded to 6 (the finding-1 case).
+    assert_eq!(
+      sony_rtmd_print_time_stamp("01:02:03.123456789"),
+      "01:02:03.123457"
+    );
+    // Exactly-6 / fewer digits pass through (no spurious change).
+    assert_eq!(
+      sony_rtmd_print_time_stamp("01:02:03.1234561"),
+      "01:02:03.123456"
+    );
+    assert_eq!(sony_rtmd_print_time_stamp("10:20:30.5"), "10:20:30.5");
+    // A fraction that rounds the seconds up to / past a 2-digit value: the
+    // single-digit re-pad (`$s = "0$s" if $s < 10`) and the no-carry behaviour.
+    assert_eq!(sony_rtmd_print_time_stamp("00:00:09.9999999"), "00:00:10");
+    assert_eq!(sony_rtmd_print_time_stamp("01:02:59.9999996"), "01:02:60");
+    // A fraction that rounds down to a whole second drops the decimal entirely
+    // (Perl stringifies `3.0` as `3`).
+    assert_eq!(sony_rtmd_print_time_stamp("01:02:03.0000001"), "01:02:03");
+    // A whole-second timestamp does NOT match the regex ⇒ unchanged.
+    assert_eq!(sony_rtmd_print_time_stamp("11:19:15"), "11:19:15");
+    assert_eq!(sony_rtmd_print_time_stamp("00:00:00"), "00:00:00");
+  }
+
+  // ── Sony rtmd FrameRate / ExposureTime `-n` rational64u rendering ──────────
+  // The parser stores `0x8106`/`0x8109` as the raw `rational64u`; the `-n`
+  // emission emits `TagValue::Rational`, whose serialized number is
+  // `Rational::exiftool_val_str` (ExifTool's `RoundFloat(n/d, 10)` = `%.10g`).
+  // Oracle-pinned: bundled `-ee -n` shows `FrameRate 29.97002997` (NOT the
+  // 15-digit f64 `29.97002997002997`) and `ExposureTime 0.01666666667`.
+  #[test]
+  fn sony_rtmd_frame_rate_exposure_n_render_rational_not_f64() {
+    use crate::formats::sony_rtmd::process_rtmd;
+    use crate::metadata::SonyRtmdMeta;
+    // Build a minimal rtmd sample: 0x1c header, then FrameRate 30000/1001 +
+    // ExposureTime 1/60.
+    let mut records = std::vec::Vec::new();
+    // FrameRate 0x8106, len 8, num=30000 den=1001.
+    records.extend_from_slice(&[0x81, 0x06, 0x00, 0x08]);
+    records.extend_from_slice(&30_000u32.to_be_bytes());
+    records.extend_from_slice(&1001u32.to_be_bytes());
+    // ExposureTime 0x8109, len 8, num=1 den=60.
+    records.extend_from_slice(&[0x81, 0x09, 0x00, 0x08]);
+    records.extend_from_slice(&1u32.to_be_bytes());
+    records.extend_from_slice(&60u32.to_be_bytes());
+    let mut data = std::vec::Vec::new();
+    data.extend_from_slice(&0x001cu16.to_be_bytes());
+    data.extend(core::iter::repeat_n(0u8, 0x1c - 2));
+    data.extend_from_slice(&records);
+
+    let mut meta = SonyRtmdMeta::new();
+    process_rtmd(&data, &mut meta);
+    let cam = meta.samples()[0].camera();
+
+    // The `-n` emission path emits `TagValue::Rational(r)`; its serialized
+    // number is `exiftool_val_str()`.
+    let fr = cam.frame_rate_rational().expect("frame rate rational");
+    assert_eq!(fr.exiftool_val_str(), "29.97002997");
+    let et = cam.exposure_time_rational().expect("exposure rational");
+    assert_eq!(et.exiftool_val_str(), "0.01666666667");
+
+    // The f64 accessors still derive the quotient for the domain / `-j` path.
+    assert!((cam.frame_rate().unwrap() - 30_000.0 / 1001.0).abs() < 1e-9);
+    assert!((cam.exposure_time_s().unwrap() - 1.0 / 60.0).abs() < 1e-12);
+  }
+
+  // A zero denominator on the rational64u FrameRate stays `undef` at `-n`
+  // (ExifTool `n/0` with n==0 ⇒ `undef`), never a NaN — the rational
+  // preserves the case the old pre-divided f64 would have lost.
+  #[test]
+  fn sony_rtmd_frame_rate_zero_denominator_is_undef() {
+    use crate::formats::sony_rtmd::process_rtmd;
+    use crate::metadata::SonyRtmdMeta;
+    let mut records = std::vec::Vec::new();
+    records.extend_from_slice(&[0x81, 0x06, 0x00, 0x08]);
+    records.extend_from_slice(&0u32.to_be_bytes()); // num = 0
+    records.extend_from_slice(&0u32.to_be_bytes()); // den = 0
+    let mut data = std::vec::Vec::new();
+    data.extend_from_slice(&0x001cu16.to_be_bytes());
+    data.extend(core::iter::repeat_n(0u8, 0x1c - 2));
+    data.extend_from_slice(&records);
+    let mut meta = SonyRtmdMeta::new();
+    process_rtmd(&data, &mut meta);
+    let r = meta.samples()[0]
+      .camera()
+      .frame_rate_rational()
+      .expect("rational stored even with zero denominator");
+    assert_eq!(r.exiftool_val_str(), "undef");
+  }
+
+  // ── Sony rtmd FrameRate / ExposureTime `-j` zero-denominator value typing ──
+  // The `-j` (PrintConv) path must NOT format a zero-denominator rational's
+  // NaN/inf quotient as `"NaN"`. Oracle-pinned vs
+  // bundled ExifTool 13.59 (`-ee -j`): a `0/0` FrameRate renders the bare
+  // number `0.00` (`sprintf("%.2f","undef")` numifies to 0), an `n/0`
+  // FrameRate renders the quoted `"Inf"`; ExposureTime passes the
+  // `"undef"`/`"inf"` ValueConv word through (`PrintExposureTime` `IsFloat`
+  // gate). The serde typing (bare number vs quoted string) is asserted.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn sony_rtmd_frame_rate_j_zero_denominator_numifies() {
+    use crate::value::{Rational, TagValue};
+    // `0/0` → `sprintf("%.2f","undef")` → the value-string "0.00". The
+    // `TagValue::Str` serializer runs ExifTool's `EscapeJSON` number gate, so
+    // "0.00" emits as a BARE JSON NUMBER (0.0) — the value-faithful form the
+    // conformance comparator equates to the golden's `0.00`. The crux of the
+    // fix: it is a NUMBER, never the quoted `"NaN"` the old `to_f64` path made.
+    let v = sony_rtmd_frame_rate_value(Rational::rational64(0, 0), true);
+    match &v {
+      TagValue::Str(s) => assert_eq!(s.as_str(), "0.00"),
+      other => panic!("expected Str(\"0.00\"), got {other:?}"),
+    }
+    let jv: serde_json::Value =
+      serde_json::from_str(&serde_json::to_string(&v).expect("serialize")).expect("json");
+    assert_eq!(
+      jv,
+      serde_json::json!(0.0),
+      "0/0 FrameRate -j is the number 0.0"
+    );
+
+    // `n/0` (n != 0) → `sprintf("%.2f","inf")` → "Inf" as a JSON STRING.
+    let vi = sony_rtmd_frame_rate_value(Rational::rational64(30_000, 0), true);
+    match &vi {
+      TagValue::Str(s) => assert_eq!(s.as_str(), "Inf"),
+      other => panic!("expected Str(\"Inf\"), got {other:?}"),
+    }
+    assert_eq!(serde_json::to_string(&vi).expect("serialize"), "\"Inf\"");
+
+    // A finite quotient still renders `%.2f` (as the number 29.97).
+    let vf = sony_rtmd_frame_rate_value(Rational::rational64(30_000, 1001), true);
+    let jf: serde_json::Value =
+      serde_json::from_str(&serde_json::to_string(&vf).expect("serialize")).expect("json");
+    assert_eq!(jf, serde_json::json!(29.97));
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn sony_rtmd_exposure_time_j_zero_denominator_passes_word_through() {
+    use crate::value::{Rational, TagValue};
+    // `0/0` → ValueConv "undef" → PrintExposureTime returns it verbatim.
+    let v = sony_rtmd_exposure_time_value(Rational::rational64(0, 0), true);
+    match &v {
+      TagValue::Str(s) => assert_eq!(s.as_str(), "undef"),
+      other => panic!("expected Str(\"undef\"), got {other:?}"),
+    }
+    assert_eq!(serde_json::to_string(&v).expect("serialize"), "\"undef\"");
+
+    // `n/0` → ValueConv "inf" → PrintExposureTime returns it verbatim.
+    let vi = sony_rtmd_exposure_time_value(Rational::rational64(1, 0), true);
+    assert_eq!(serde_json::to_string(&vi).expect("serialize"), "\"inf\"");
+
+    // A finite quotient → the `1/x` shaping (1/60 → "1/60").
+    let vf = sony_rtmd_exposure_time_value(Rational::rational64(1, 60), true);
+    assert_eq!(serde_json::to_string(&vf).expect("serialize"), "\"1/60\"");
+  }
+
+  #[test]
+  fn decode_stsd_meta_format_crafted_overflow_size_preserves_prior() {
+    // A crafted entry `size` must not overflow `pos + size`
+    // (a usize wrap → potential OOB / panic). The `checked_add` guard breaks on
+    // the giant entry while PRESERVING the last-wins format from a valid prior
+    // entry. Layout: `[version/flags:4][count:4]` then each entry
+    // `[size:4][format:4][reserved:6][data-ref-index:2]…`.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0, 0, 0, 0]); // version/flags
+    payload.extend_from_slice(&2u32.to_be_bytes()); // entry count = 2
+    // Entry 0: a well-formed 16-byte `mebx` descriptor.
+    payload.extend_from_slice(&16u32.to_be_bytes());
+    payload.extend_from_slice(b"mebx");
+    payload.extend_from_slice(&[0; 8]); // reserved(6) + data-ref-index(2)
+    // Entry 1: a crafted `size = 0xffffffff` that would overflow `pos + size`.
+    payload.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
+    payload.extend_from_slice(b"rtmd");
+    // The giant entry overruns → break; the prior `mebx` survives (no panic, no
+    // OOB read, no silent override by the unreachable `rtmd`).
+    assert_eq!(decode_stsd_meta_format(&payload).as_deref(), Some("mebx"));
+  }
+
+  #[test]
+  fn decode_stsd_meta_format_crafted_overflow_only_entry_yields_none() {
+    // A lone crafted `0xffffffff` entry resolves to no format (the guard breaks
+    // before reading the format), with no panic.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0, 0, 0, 0]);
+    payload.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+    payload.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
+    payload.extend_from_slice(b"rtmd");
+    assert!(decode_stsd_meta_format(&payload).is_none());
   }
 }
