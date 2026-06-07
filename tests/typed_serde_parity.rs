@@ -544,7 +544,71 @@ const NOT_ACTIVE: &[&str] = &[
 ///   `1`/`3`-byte-tail MakerNote (`…_badmn_zero_tail1`/`…_tail3` ⇒ `Illegal
 ///   MakerNotes directory size (0 entries)`) and a `>1024`-entry in-bounds
 ///   directory that is fully WALKED (`…_mn_manyentries`).
-const EXPECTED_ACTIVE_FIXTURES: usize = 514;
+///
+/// 514 → 515 after the Insta360 INSV/INSP trailer faithful `-ee` emission
+/// (lib/insta360): added `QuickTime_insta360.mp4` — a crafted minimal MP4
+/// carrying an Insta360 file-end trailer (identity 0x101 + accelerometer
+/// 0x300 + videotimestamp 0x600 + exposure 0x400 + GPS 0x700). Its standard
+/// `.json` / `.n.json` goldens (no-`-ee`) carry ONLY the always-on `[minor]
+/// Insta360 trailer at offset …` warning (`ProcessInsta360` runs under `-ee`,
+/// so no timed records surface at no-`-ee`); the `-ee` `.ee.json` / `.ee.g3.json`
+/// goldens (the Doc<N> emission) are pinned by `tests/timed_metadata_conformance.rs`.
+///
+/// 515 → 516 after the Insta360 bad-size trailer fix (lib/insta360): added
+/// `QuickTime_insta360_badtrailer.mp4` — the valid fixture with `trailerLen`
+/// overwritten to exceed the file size (QuickTimeStream.pl:3277). Its goldens
+/// carry ONLY the always-on `[minor] Insta360 trailer at offset …` positional
+/// warning with the WRAPPED (negative→unsigned) offset `0xfffffffffffffc18`;
+/// ExifTool suppresses the "Bad Insta360 trailer size" warning via priority-0
+/// first-wins, and no trailer records surface.
+///
+/// 517 → 518 after the Insta360 non-multiple fixed-stride fix (lib/insta360):
+/// added `QuickTime_insta360_badstride.mp4` — a valid trailer with a 0x400
+/// (len 17) and a 0x600 (len 9) record whose lengths are NOT multiples of their
+/// fixed stride (QuickTimeStream.pl:3355-3357), alongside a valid 0x700 GPS fix
+/// + 0x101 identity. Its no-`-ee` `.json`/`.n.json` goldens carry ONLY the
+/// positional `[minor] Insta360 trailer at offset …` warning; the `-ee`
+/// `.ee.json`/`.ee.g3.json` goldens (the GPS fix + identity + the FIRST
+/// group-scoped `Insta360:Warning "Unexpected Insta360 record 0x600 length"`,
+/// and NO ExposureTime/VideoTimeStamp/TimeCode rows) are pinned by
+/// `tests/timed_metadata_conformance.rs`.
+///
+/// 518 → 519 after the Insta360 linked-list trailer-discovery fix (lib/insta360):
+/// added `QuickTime_insta360_chained.mp4` — the SAME valid Insta360 trailer
+/// followed by an (empty) LigoGPS trailer (`&&&&` + a BE u32 length), so the
+/// Insta360 trailer is NOT the final block. ExifTool's `IdentifyTrailers`
+/// (QuickTime.pm:9897-9926) walks the trailers BACKWARD from EOF, steps past the
+/// LigoGPS block, and STILL finds + fully decodes the Insta360 trailer. exifast
+/// does not extract LigoGPS, so the output is byte-IDENTICAL to the standalone
+/// `QuickTime_insta360.mp4`: its no-`-ee` `.json`/`.n.json` goldens carry the
+/// full Insta360 identity + the positional `[minor] Insta360 trailer at offset
+/// 0x8c (442 bytes)` warning; the `-ee` `.ee.*` goldens (the full GPS/exposure/
+/// videotime/accel rows + identity) are pinned by
+/// `tests/timed_metadata_conformance.rs`.
+///
+/// 519 → 520 after the Insta360 atom-spans-trailer fix (lib/insta360): added
+/// `QuickTime_insta360_atomspan.mp4` — a `moov` whose DECLARED size spans into
+/// the Insta360 trailer (but stays within the file). ExifTool walks top-level
+/// atoms by declared size (QuickTime.pm:10597-10602): the over-large moov is
+/// read in full, its buffer's trailing trailer bytes parse as a contained
+/// `SE12` atom whose huge size overruns ⇒ `Truncated 'SE12' data at offset
+/// 0x8c`; after the moov the cursor is past the trailer start, so the trailer
+/// is SKIPPED (:10656) and NO Insta360 metadata is extracted. Its `.json`/
+/// `.n.json` goldens carry exactly that warning + the mvhd-derived QuickTime
+/// tags + no Insta360 tags.
+///
+/// 520 → 521 after the Insta360 short-0x300 fix (lib/insta360, R8): added
+/// `QuickTime_insta360_short300.mp4` — a 0x300 accelerometer record with a
+/// 10-byte body (a multiple of NEITHER 20 nor 56) followed by a 0x700 GPS fix +
+/// 0x101 identity. The QuickTimeStream.pl:3340 else-branch stride probe is
+/// `$raf->Read($buff, 20)` against the FILE (not the record body), so with
+/// records after the 0x300 the probe reads past the short body, succeeds, and
+/// the 10-byte record's non-multiple length raises `Unexpected Insta360 record
+/// 0x300 length` (NOT a silent skip). Its `.json`/`.n.json` goldens carry only
+/// the positional `[minor] Insta360 trailer …` warning + the mvhd-derived
+/// QuickTime tags; the `-ee` `.ee.*` goldens (the GPS fix + identity + that
+/// warning) are pinned by `tests/timed_metadata_conformance.rs`.
+const EXPECTED_ACTIVE_FIXTURES: usize = 521;
 
 /// Every `tests/fixtures/<f>` that has both `tests/golden/<f>.json` and
 /// `tests/golden/<f>.n.json`, MINUS the [`NOT_ACTIVE`] formally-accept-

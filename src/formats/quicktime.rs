@@ -55,10 +55,10 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::{quicktime_freegps, quicktime_stream},
+  formats::{insta360 as insta360_fmt, quicktime_freegps, quicktime_stream},
   metadata::{
-    CammMeta, CanonCtmdMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, MediaTrack,
-    QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
+    CammMeta, CanonCtmdMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, Insta360Meta,
+    MediaTrack, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -470,6 +470,79 @@ fn read_atom_header(data: &[u8], pos: usize, top_level: bool) -> Option<HeaderOu
   ))
 }
 
+/// March the TOP-LEVEL atom sequence by DECLARED size to reproduce ExifTool's
+/// in-loop trailer stop (QuickTime.pm:10597-10602) and return
+/// `(last_pos, box_region_end)`:
+///
+///  - **`last_pos`** — the file offset one-past the LAST COMPLETE atom (= Perl
+///    `$lastPos`, updated only at the BOTTOM of the `for(;;)` loop after an atom
+///    is fully handled). An atom that aborts the walk mid-loop (a declared size
+///    that overruns EOF ⇒ a short read; a structurally invalid size) does NOT
+///    advance it (Perl `last`s before the `$lastPos = Tell()` update). This is
+///    the value the trailer-processing loop compares against each trailer's
+///    start (`next if $lastPos > $$trailer[1]`, :10656) — i.e. exifast's
+///    Insta360 EXTRACTION gate.
+///  - **`box_region_end`** — the furthest file offset the box walk's atom READS
+///    reach: the max over every processed atom's declared end, clamped to EOF
+///    (a truncated/overrunning atom reads only the bytes available before EOF).
+///    This bounds the box view (`scan_data`) + every downstream box-region scan
+///    so the trailer's bytes are never mis-read as a top-level atom in the
+///    normal case, yet a legitimately-spanning atom is read in full.
+///
+/// `head_signed_start` is the EARLIEST trailer's SIGNED start (`$$trailer[1]`):
+/// `Some(start)` stops the march after the atom whose end reaches `start` (a
+/// NEGATIVE bad-size start stops after the very first atom, since any real
+/// `last_pos >= 0 > start`); `None` (no trailer) marches to natural end and
+/// returns `box_region_end == data.len()`.
+fn box_walk_extent(data: &[u8], head_signed_start: Option<i64>) -> (usize, usize) {
+  // No trailer: the box region is the whole file (the downstream scans see all
+  // of `data`, byte-identical to the pre-FIX behaviour).
+  let Some(trailer_start) = head_signed_start else {
+    return (0, data.len());
+  };
+  let mut pos = 0usize;
+  let mut last_pos = 0usize;
+  let mut box_region_end = 0usize;
+  loop {
+    match read_atom_header(data, pos, true) {
+      Some(HeaderOutcome::Atom(header, next)) => {
+        // This atom is fully present in `data`; its reads reach `payload_end`.
+        box_region_end = box_region_end.max(header.payload_end);
+        last_pos = next;
+        // QuickTime.pm:10598-10602 — after a COMPLETE atom, stop if the cursor
+        // reached the trailer. The SIGNED compare preserves the bad-size
+        // (negative start ⇒ first-atom-only) behaviour.
+        if (last_pos as i64) >= trailer_start {
+          break;
+        }
+        if next <= pos {
+          break; // hostile non-advancing size
+        }
+        pos = next;
+      }
+      Some(HeaderOutcome::TruncatedAtom { .. }) => {
+        // QuickTime.pm:10238-10242 / 10585-10591 — the atom's declared payload
+        // overruns EOF: ExifTool reads only the available bytes (to EOF) and
+        // `last`s with a truncation warning WITHOUT updating `$lastPos`. So the
+        // box reads reach EOF, but `last_pos` stays at the previous complete
+        // atom (so a trailer the walk did NOT pass is still extracted).
+        box_region_end = data.len();
+        break;
+      }
+      // A top-level size-0 atom (`ExtendsToEof`) extends to EOF and STOPS the
+      // walk (QuickTime.pm:10044-10056); a structurally invalid size
+      // (`Malformed`) sets `$warnStr` and `last`s (:10058-10075). Either way the
+      // walk ends here; the box view reaches EOF and `last_pos` is unchanged.
+      Some(HeaderOutcome::ExtendsToEof { .. } | HeaderOutcome::Malformed { .. }) => {
+        box_region_end = data.len();
+        break;
+      }
+      Some(HeaderOutcome::Terminator) | None => break,
+    }
+  }
+  (last_pos, box_region_end)
+}
+
 /// Format the `Truncated '...' data (missing N bytes)` warning for a contained
 /// atom whose header was read but whose declared payload overruns the
 /// available data (QuickTime.pm:10242 — `$missing = $size - $raf->Read(...)`).
@@ -487,6 +560,113 @@ fn truncated_atom_warning(
   let missing = declared.saturating_sub(available);
   let tag = String::from_utf8_lossy(atom_type).into_owned();
   std::format!("Truncated '{tag}' data (missing {missing} bytes)")
+}
+
+/// The QuickTime atom 4-CCs ExifTool's `%QuickTime::*` tables recognize (every
+/// 4-byte key across all QuickTime container/leaf tables, snapshotted from
+/// bundled 13.59), encoded big-endian as `u32` and SORTED for binary search.
+/// Drives the truncation-warning FORMAT only (see [`contained_truncation_warning`]):
+/// an overrunning atom whose type is in a table takes ExifTool's READ path
+/// (`Truncated '..' data (missing N bytes)`, QuickTime.pm:10242), while an
+/// UNKNOWN type (no `GetTagInfo`, Unknown option off) takes the SKIP path
+/// (`Truncated '..' data at offset 0x%x`, QuickTime.pm:10590). The `\xa9`-prefixed
+/// (`©…`) UserData atoms are included: ExifTool synthesizes a tagInfo for them
+/// (QuickTime.pm:10138-10142), so they too take the READ path.
+#[rustfmt::skip]
+const RECOGNIZED_QT_ATOMS: [u32; 521] = [
+  0x2d2d2d2d, 0x32312e31, 0x32312e32, 0x33676620, 0x40505354, 0x40646179, 0x406d616b, 0x406d6f64, 0x40707069, 0x40707469,
+  0x40736563, 0x40737469, 0x40737772, 0x4078797a, 0x41414352, 0x41505246, 0x416c6c46, 0x43414d45, 0x4344454b, 0x43444554,
+  0x43444931, 0x434d5031, 0x434e4356, 0x434e4656, 0x434e4d4e, 0x434e4f50, 0x434e5448, 0x44634d44, 0x46464d56, 0x4649524d,
+  0x464f5600, 0x46505246, 0x47504d46, 0x47505320, 0x47554944, 0x476f5072, 0x49444954, 0x494e464f, 0x4a504547, 0x4c454943,
+  0x4c454e53, 0x4c4f4f50, 0x4c766c6d, 0x4d4d4130, 0x4d4d4131, 0x4d4f4f44, 0x4d544454, 0x4d554944, 0x4d565447, 0x4e424344,
+  0x4e434454, 0x4f4c594d, 0x50414e41, 0x50454e54, 0x50494354, 0x50584d4e, 0x50585448, 0x51564d49, 0x52445441, 0x52445442,
+  0x52445443, 0x52445447, 0x5244544c, 0x5249434f, 0x524d4b4e, 0x52544855, 0x52544f53, 0x53413344, 0x53444c4e, 0x5345414c,
+  0x5349474d, 0x534e756d, 0x53656c4f, 0x54414753, 0x5449504c, 0x54544144, 0x5454484c, 0x54544944, 0x54544d44, 0x54545644,
+  0x54545649, 0x56415253, 0x56455253, 0x56505246, 0x574c4f43, 0x584d505f, 0x58747261, 0x5f63785f, 0x5f63795f, 0x5f687463,
+  0x5f796177, 0x61415254, 0x61627274, 0x61636266, 0x61636566, 0x61647a63, 0x61647a65, 0x61647a6d, 0x616b4944, 0x616c626d,
+  0x616c6272, 0x616e676c, 0x61704944, 0x61706d64, 0x61726474, 0x61744944, 0x61757468, 0x61757843, 0x6175786c, 0x61763143,
+  0x61766343, 0x61766572, 0x62726174, 0x62746563, 0x62747274, 0x62786d6c, 0x63616d6d, 0x63617467, 0x63626d70, 0x63636964,
+  0x63646376, 0x63646973, 0x63647363, 0x63657274, 0x6368616e, 0x63686170, 0x6368706c, 0x63697473, 0x636c6170, 0x636c6370,
+  0x636c6566, 0x636c666e, 0x636c6964, 0x636c6c69, 0x636c7366, 0x636d4944, 0x636d6964, 0x636d6e63, 0x636d6e6d, 0x636d6f76,
+  0x636e4944, 0x636f3634, 0x636f6c6c, 0x636f6c72, 0x636f7672, 0x6370696c, 0x63707274, 0x63726563, 0x63736c67, 0x63746278,
+  0x63747473, 0x63757374, 0x63766572, 0x63767275, 0x64616d72, 0x64617461, 0x64617465, 0x64636f6d, 0x64657363, 0x64696d67,
+  0x64696d6d, 0x64696e66, 0x6469736b, 0x646d6178, 0x646d6564, 0x64726566, 0x64726570, 0x64736370, 0x65676964, 0x656c6e67,
+  0x656e6461, 0x656e6f66, 0x65717569, 0x66616c6c, 0x6669656c, 0x66696e6d, 0x666f6c77, 0x666f7263, 0x66726561, 0x66726565,
+  0x66726d61, 0x66736964, 0x66746162, 0x66747970, 0x67616d61, 0x67646174, 0x67654944, 0x676d6864, 0x676d696e, 0x676e7265,
+  0x67707320, 0x67707330, 0x6772706c, 0x67727570, 0x6773656e, 0x67736868, 0x6773706d, 0x67737075, 0x67737364, 0x67737374,
+  0x67737464, 0x68646c72, 0x68647664, 0x68696e66, 0x68696e76, 0x686d6864, 0x686e7469, 0x68746362, 0x68746b61, 0x68766343,
+  0x69636e75, 0x69646174, 0x69647363, 0x69696363, 0x69696e66, 0x696c6f63, 0x696c7374, 0x696d6972, 0x696e6665, 0x696e6669,
+  0x696e666f, 0x696e6675, 0x696e6974, 0x696e7374, 0x696f6473, 0x6970636f, 0x69706d61, 0x69706d63, 0x6970726f, 0x69707270,
+  0x69726566, 0x69726f74, 0x69737065, 0x69746e75, 0x69766976, 0x6a756e6b, 0x6b657920, 0x6b657973, 0x6b657977, 0x6b666978,
+  0x6b677474, 0x6b737462, 0x6b766172, 0x6b797764, 0x6c646573, 0x6c6d7263, 0x6c6f6369, 0x6c726375, 0x6c766c6d, 0x6d616b65,
+  0x6d616e75, 0x6d617872, 0x6d637672, 0x6d646174, 0x6d64656c, 0x6d646864, 0x6d646961, 0x6d65616e, 0x6d65636f, 0x6d656469,
+  0x6d657265, 0x6d657461, 0x6d666864, 0x6d696e66, 0x6d6e6970, 0x6d6e6f70, 0x6d6f6465, 0x6d6f646c, 0x6d6f6f66, 0x6d6f6f76,
+  0x6d706f64, 0x6d707664, 0x6d726c64, 0x6d726c68, 0x6d726c76, 0x6d766864, 0x6e61696c, 0x6e616d65, 0x6e626d74, 0x6e62706c,
+  0x6e6d6864, 0x6e70636b, 0x6e756d70, 0x6f707072, 0x6f776e72, 0x70616430, 0x70616462, 0x70616b62, 0x70616b64, 0x70616b66,
+  0x70617370, 0x70617974, 0x70637374, 0x70657266, 0x70676170, 0x70696374, 0x70696e66, 0x7069746d, 0x70697869, 0x706c4944,
+  0x706c6174, 0x706d6178, 0x706d6363, 0x706e6f74, 0x706f7365, 0x70724944, 0x70726864, 0x70726d6d, 0x70726f66, 0x70726f6a,
+  0x70727274, 0x70746368, 0x70746e6d, 0x70747268, 0x70747620, 0x70757264, 0x7075726c, 0x72616473, 0x72617465, 0x7265656c,
+  0x72696768, 0x726c6474, 0x726c6f63, 0x726f6c6c, 0x72746e67, 0x72747020, 0x73626770, 0x7362746c, 0x7363656e, 0x73636869,
+  0x7363686d, 0x73637074, 0x7363726e, 0x73646573, 0x73647020, 0x73647064, 0x73647470, 0x73656664, 0x73657475, 0x73664944,
+  0x73677064, 0x73686f74, 0x7368776d, 0x73696e66, 0x736b6970, 0x736c6d74, 0x736c6e6f, 0x736d6864, 0x736d7461, 0x736e616c,
+  0x736e726f, 0x736f6161, 0x736f616c, 0x736f6172, 0x736f636f, 0x736f6e67, 0x736f6e6d, 0x736f736e, 0x736f756e, 0x73726371,
+  0x73737263, 0x73743364, 0x7374626c, 0x7374636f, 0x73746470, 0x7374696b, 0x73747073, 0x73747363, 0x73747364, 0x73747368,
+  0x73747373, 0x7374737a, 0x7374746d, 0x73747473, 0x73747a32, 0x73756273, 0x73763364, 0x73766864, 0x73796e63, 0x74616773,
+  0x74617074, 0x74627566, 0x74636d69, 0x74657874, 0x74686d20, 0x74686d61, 0x74686d62, 0x7468756d, 0x74696d65, 0x74696d73,
+  0x7469746c, 0x746b6864, 0x746d6178, 0x746d6364, 0x746d696e, 0x746d706f, 0x746e616c, 0x746e616d, 0x746f6f6c, 0x746f746c,
+  0x74706159, 0x74706179, 0x7470796c, 0x74726166, 0x7472616b, 0x7472616e, 0x74726566, 0x74726b6e, 0x74727059, 0x74727079,
+  0x7473726f, 0x7476656e, 0x74766573, 0x74766e6e, 0x74767368, 0x7476736e, 0x75627566, 0x75646174, 0x75647461, 0x75726174,
+  0x75726c00, 0x75726c20, 0x75726e20, 0x75727372, 0x75736572, 0x75756964, 0x76627271, 0x76654944, 0x76657220, 0x76657273,
+  0x76696465, 0x766d6864, 0x766e6472, 0x76706b3f, 0x76726f74, 0x77617665, 0x77696465, 0x78696420, 0x786d6c20, 0x79656172,
+  0x79727263, 0xa9415254, 0xa954494d, 0xa9545343, 0xa954535a, 0xa9616c62, 0xa9617264, 0xa9617267, 0xa961726b, 0xa9617574,
+  0xa9636d74, 0xa9636f6b, 0xa9636f6d, 0xa9636f6e, 0xa9637079, 0xa9646179, 0xa9646573, 0xa9646972, 0xa9646a69, 0xa9656431,
+  0xa9656432, 0xa9656433, 0xa9656434, 0xa9656435, 0xa9656436, 0xa9656437, 0xa9656438, 0xa9656439, 0xa9656e63, 0xa9666d74,
+  0xa9667074, 0xa966726c, 0xa9667977, 0xa967656e, 0xa9677074, 0xa967726c, 0xa9677270, 0xa9677977, 0xa9696e66, 0xa9697372,
+  0xa96c6162, 0xa96c616c, 0xa96c7972, 0xa96d616b, 0xa96d616c, 0xa96d646c, 0xa96d6f64, 0xa96d7663, 0xa96d7669, 0xa96d766e,
+  0xa96e616d, 0xa96e7274, 0xa96f7065, 0xa970646b, 0xa9706867, 0xa9707264, 0xa9707266, 0xa970726b, 0xa970726c, 0xa9707562,
+  0xa9726571, 0xa9726573, 0xa9736e65, 0xa9736e6b, 0xa9736e6d, 0xa9736f6c, 0xa9737263, 0xa9737433, 0xa9737766, 0xa973776b,
+  0xa9737772, 0xa9746f6f, 0xa974726b, 0xa9756964, 0xa977726b, 0xa9777274, 0xa9787064, 0xa9787370, 0xa978797a, 0xa9797370,
+  0xa97a7370,
+];
+
+/// `true` iff `atom_type` is a known `%QuickTime::*` atom — i.e. ExifTool's
+/// `GetTagInfo` would return a tagInfo for it (with the Unknown option off) and
+/// take the READ path on a truncation. See [`RECOGNIZED_QT_ATOMS`].
+#[inline]
+fn is_recognized_qt_atom(atom_type: &[u8; 4]) -> bool {
+  RECOGNIZED_QT_ATOMS
+    .binary_search(&u32::from_be_bytes(*atom_type))
+    .is_ok()
+}
+
+/// Format the truncation warning for a CONTAINED atom that overruns its
+/// container, choosing ExifTool's two distinct messages by atom recognition:
+///  - a RECOGNIZED atom (a `%QuickTime::*` table key) takes the READ path
+///    (`$raf->Read($val,$size)` short read) ⇒
+///    `Truncated '..' data (missing N bytes)` (QuickTime.pm:10242);
+///  - an UNKNOWN atom (no `GetTagInfo`, Unknown off) takes the SKIP path
+///    (`Seek($seekTo-1)` fails) ⇒ `Truncated '..' data at offset 0x%x`
+///    (QuickTime.pm:10590), where the offset is `$lastPos` — the atom's START
+///    file offset = `file_base + header_pos`.
+///
+/// `header_file_offset` is the absolute file offset of this atom's 8-byte header
+/// (`file_base + pos`); `payload_start`/`end` are buffer-relative (for the
+/// `missing` byte count). Verified vs bundled 13.59 (`Truncated 'udta' data
+/// (missing …)` for a known atom, `Truncated 'ZZZZ' data at offset 0x..` /
+/// `Truncated 'SE12' data at offset 0x8c` for unknown ones).
+fn contained_truncation_warning(
+  atom_type: &[u8; 4],
+  header_file_offset: usize,
+  payload_start: usize,
+  declared: u64,
+  end: usize,
+) -> String {
+  if is_recognized_qt_atom(atom_type) {
+    truncated_atom_warning(atom_type, payload_start, declared, end)
+  } else {
+    let tag = String::from_utf8_lossy(atom_type).into_owned();
+    std::format!("Truncated '{tag}' data at offset {header_file_offset:#x}")
+  }
 }
 
 /// `true` when the header at `pos` is the directory's BARE trailing 8-byte
@@ -542,6 +722,26 @@ fn is_bare_trailing_header(pos: usize, start: usize, end: usize) -> bool {
 fn walk_atoms(
   depth: u32,
   data: &[u8],
+  start: usize,
+  end: usize,
+  warning: &mut Option<String>,
+  f: impl FnMut(&AtomHeader, &[u8], &mut Option<String>),
+) {
+  walk_atoms_based(depth, data, 0, start, end, warning, f);
+}
+
+/// Like [`walk_atoms`] but carries `file_base` — the absolute file offset of
+/// `data[0]` — so the SKIP-path truncation warning of an UNKNOWN contained atom
+/// can report its FILE offset (`Truncated '..' data at offset 0x%x`, where the
+/// offset is `file_base + pos`; see [`contained_truncation_warning`]). Entry
+/// decoders that walk a sub-slice of the file pass that slice's file offset;
+/// the public [`walk_atoms`] (sub-slices already file-offset-agnostic, or
+/// warning-discarding scans) passes `0`. Nested re-entries pass
+/// `file_base + inner.payload_start` so the offset stays absolute through depth.
+fn walk_atoms_based(
+  depth: u32,
+  data: &[u8],
+  file_base: usize,
   start: usize,
   end: usize,
   warning: &mut Option<String>,
@@ -623,7 +823,17 @@ fn walk_atoms(
           break;
         }
         warning.get_or_insert_with(|| {
-          truncated_atom_warning(&atom_type, payload_start, declared_payload_len, end)
+          // ExifTool picks two distinct truncation messages by atom recognition:
+          // a `%QuickTime::*` table atom → READ path `(missing N bytes)`; an
+          // UNKNOWN atom → SKIP path `at offset 0x%x` (the atom's START file
+          // offset = `file_base + pos`). See `contained_truncation_warning`.
+          contained_truncation_warning(
+            &atom_type,
+            file_base + pos,
+            payload_start,
+            declared_payload_len,
+            end,
+          )
         });
         break;
       }
@@ -1602,13 +1812,29 @@ fn decode_stsd_meta_format(payload: &[u8]) -> Option<String> {
 /// (Contrast `MediaDuration`, which is a *RawConv* using the per-track
 /// `$$self{MediaTS}` set by the SAME mdhd table — that one IS parse-order
 /// and is handled inside [`decode_mdhd`].)
-fn decode_moov_mvhd(payload: &[u8], qt: &mut QuickTimeMeta, warning: &mut Option<String>) {
-  // Top-level entry (the `parse_inner` file loop) — depth 0.
-  walk_atoms(0, payload, 0, payload.len(), warning, |inner, ibody, _w| {
-    if &inner.atom_type == b"mvhd" {
-      decode_mvhd(ibody, qt);
-    }
-  });
+fn decode_moov_mvhd(
+  payload: &[u8],
+  payload_file_offset: usize,
+  qt: &mut QuickTimeMeta,
+  warning: &mut Option<String>,
+) {
+  // Top-level entry (the `parse_inner` file loop) — depth 0. `payload_file_offset`
+  // is this moov body's absolute file offset, so a truncated UNKNOWN child (e.g.
+  // the trailer bytes a SPANNING moov reads in, parsed as `SE12`) reports its
+  // correct `at offset 0x%x` (QuickTime.pm:10590).
+  walk_atoms_based(
+    0,
+    payload,
+    payload_file_offset,
+    0,
+    payload.len(),
+    warning,
+    |inner, ibody, _w| {
+      if &inner.atom_type == b"mvhd" {
+        decode_mvhd(ibody, qt);
+      }
+    },
+  );
 }
 
 /// Decode the top-level `frea` atom — a `SubDirectory` dispatched to
@@ -3102,6 +3328,17 @@ pub struct Meta<'a> {
   /// (Canon.pm:10758-10804) + the `Canon::CTMD` / `FocalInfo` / `ExposureInfo`
   /// tag tables (Canon.pm:9790-9887).
   canon_ctmd: CanonCtmdMeta,
+  /// **SP4** — Insta360 INSV/INSP trailer metadata (identity / GPS /
+  /// exposure-time records). Decoded by [`insta360_fmt::scan_trailer`]
+  /// at the end of the QuickTime parse — Insta360 is a file-end
+  /// trailer, NOT a `gpmd`/`camm`/`CTMD`-style timed-metadata track.
+  /// Empty ([`Insta360Meta::is_empty`]) for a non-Insta360 video.
+  /// Faithful port of `Image::ExifTool::QuickTimeStream::ProcessInsta360`
+  /// (QuickTimeStream.pl:3252-3478) and the `INSV_MakerNotes` identity
+  /// table (QuickTimeStream.pl:696-707). Holds a BOUNDED domain summary +
+  /// a borrow of the input bytes (`'a`); the heavy timed-row decode is
+  /// deferred to `-ee` emit time (lazy-decode DoS guard).
+  insta360: Insta360Meta<'a>,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3119,8 +3356,6 @@ pub struct Meta<'a> {
   /// overruns EOF) is accepted as QuickTime but stops the walk with a
   /// `Truncated '...' data` warning (QuickTime.pm:10242 / 10590).
   warning: Option<String>,
-  /// Phantom anchor for the [`FormatParser::Meta`] GAT lifetime.
-  _marker: core::marker::PhantomData<&'a ()>,
 }
 
 impl Meta<'_> {
@@ -3214,6 +3449,21 @@ impl Meta<'_> {
     &self.canon_ctmd
   }
 
+  /// **SP4** — Insta360 INSV/INSP trailer metadata.
+  /// [`Insta360Meta::is_empty`] for a non-Insta360 file (or one whose
+  /// trailer signature is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::QuickTimeStream::ProcessInsta360`
+  /// (QuickTimeStream.pl:3252-3478) and the `INSV_MakerNotes` identity
+  /// table (QuickTimeStream.pl:696-707). Populated by a direct
+  /// file-end pass after the QuickTime moov walk — Insta360 trailers
+  /// live AFTER the QuickTime box hierarchy.
+  #[must_use]
+  #[inline(always)]
+  pub const fn insta360(&self) -> &Insta360Meta<'_> {
+    &self.insta360
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3264,6 +3514,13 @@ impl Meta<'_> {
     // populated the domain it would write). Canon CTMD surfaces no GPS today
     // (Canon writes GPS via the embedded Exif TIFF blocks, deferred — #82).
     self.canon_ctmd.project_into(&mut md);
+    // **SP4 — Insta360 trailer** camera identity (Make="Insta360") + GPS +
+    // exposure-time from the file-end INSV/INSP trailer. FOURTH GPS tier
+    // (below GoPro / CAMM / Sony rtmd, above the generic SP3 timed-metadata
+    // scan); phone-paired GPS via the Insta360 Studio app. Set-once per
+    // domain (no-ops when a higher-priority source already populated the
+    // domain it would write).
+    self.insta360.project_into(&mut md);
     // SP3 stream sits at the LOWEST tier of the GPS priority chain — only
     // populates when no higher-priority source set `md.gps()`.
     if md.gps().is_none()
@@ -3494,23 +3751,103 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // for `mdat-offset`. F5's top-level-vs-contained size-0 distinction is
   // threaded via `read_atom_header(.., top_level=true)`.
   //
+  // **SP4** — Insta360 INSV/INSP trailer (QuickTime.pm:9975-9979 +
+  // QuickTime.pm:10669-10673 + QuickTimeStream.pl:3258-3478). ExifTool's
+  // `IdentifyTrailers` (QuickTime.pm:9897-9926) runs up-front and `ProcessMOV`
+  // then walks the top-level atoms BY THEIR DECLARED SIZE, stopping IN-LOOP
+  // after the atom whose end reaches the trailer (`$lastPos >= $$trailer[1]`,
+  // QuickTime.pm:10597-10602). The trailer-processing loop afterward SKIPS a
+  // trailer an atom already consumed (`next if $lastPos > $$trailer[1]`,
+  // :10656). So we do NOT pre-bound the box view to the trailer's start (which
+  // would truncate an atom that legitimately spans into the trailer, e.g. an
+  // over-large `moov`, and mis-report it). Instead we compute the box region's
+  // effective END from the in-loop stop — the declared end of the atom that
+  // tripped the trailer check — and gate Insta360 EXTRACTION on whether the box
+  // walk consumed the trailer.
+  //
+  // `IdentifyTrailers` is a BACKWARD linked-list walk: each block at EOF is
+  // classified (Insta360 / LigoGPS / MIE) and stepped past by its declared
+  // length, so an Insta360 trailer is found EVEN when it is not the final block
+  // (followed by a LigoGPS/MIE trailer). exifast extracts only the Insta360
+  // trailer; the others are recognized solely to walk past them + bound the box
+  // scan. `trailers` is HEAD-FIRST (earliest trailer first).
+  let trailers = insta360_fmt::identify_trailers(data);
+  let mut insta360_meta = Insta360Meta::new();
+  // The HEAD (earliest) trailer drives BOTH the box-walk stop and the positional
+  // warning (QuickTime.pm:10599-10600 use `$$trailer[1]`/`[0]`/`[2]` of the
+  // linked-list head). Record its `(name, start, len)` for the always-on
+  // positional warning (emitted in `emit_insta360`); the box walk stops where
+  // the trailer chain begins.
+  let head_signed_start: Option<i64> = trailers.first().map(|head| {
+    insta360_meta.set_head_trailer(head.kind().as_str(), head.start(), head.len());
+    // The head's SIGNED start (`$$trailer[1]`, QuickTime.pm:9920). `start` is
+    // stored u64-WRAPPED, so `as i64` recovers Perl's negative value on a
+    // bad-size trailer (`trailerLen > file size`) — preserving the
+    // first-atom-only stop in that case.
+    head.start() as i64
+  });
+  // Walk the top-level atoms by declared size to find the in-loop trailer stop
+  // (QuickTime.pm:10597-10602). `last_pos` is the position after the LAST
+  // COMPLETE atom (= ExifTool `$lastPos`, updated only at the bottom of the loop
+  // — a truncated/malformed atom that aborts mid-loop does NOT advance it);
+  // `box_region_end` is the furthest file offset the box walk's atom reads reach
+  // (the bound every downstream box-region scan uses). For a trailer-less file
+  // `head_signed_start` is `None` and `box_region_end == data.len()`.
+  let (last_pos, box_region_end) = box_walk_extent(data, head_signed_start);
+  // The bounded view the box walk + the downstream scans see. In the NORMAL case
+  // an atom ends exactly at (or before) the trailer start, so `box_region_end ==
+  // trailer.start` and the trailer's bytes are never read. In the SPANNING case
+  // an atom's declared size overruns the trailer start, so `box_region_end` is
+  // that atom's declared end (≥ trailer.start, possibly EOF) — the atom is read
+  // in full (matching bundled), and a truncated child inside it warns. For a
+  // trailer-less file `box_region_end == data.len()`.
+  let scan_end = box_region_end;
+  let scan_data: &[u8] = data.get(..scan_end).unwrap_or(data);
+  // EXTRACT the Insta360 trailer only when the box walk did NOT consume it
+  // (`$lastPos <= $$trailer[1]`, the negation of QuickTime.pm:10656's
+  // `next if $lastPos > $$trailer[1]`). When an atom SPANNED the trailer the
+  // reference still emits the positional warning (via `head_trailer` above, then
+  // suppressed by the box-walk's own earlier `ExifTool:Warning` under
+  // priority-0 first-wins) but does NOT re-process the trailer as a trailer.
+  if let Some(entry) = trailers.iter().find(|e| e.kind().is_insta360()) {
+    let entry_signed_start = entry.start() as i64;
+    if (last_pos as i64) <= entry_signed_start {
+      // Scan the FIRST Insta360 trailer in the chain (its body ends at `start +
+      // len`, which == EOF for a standalone trailer at the file end). A bad-size
+      // trailer (`trailerLen > file size`) has a NEGATIVE signed start, so the
+      // gate is false and we skip extraction — the positional warning still
+      // fires off `head_trailer`, and bundled likewise decodes no records.
+      let entry_end = entry
+        .start()
+        .saturating_add(entry.len())
+        .min(data.len() as u64) as usize;
+      insta360_fmt::scan_trailer(data, entry_end, &mut insta360_meta);
+      insta360_meta.set_trail_end(entry_end);
+    }
+  }
+
   // Pass 1: ftyp + every moov's mvhd (last-wins TimeScale) + mdat.
   let mut qt = QuickTimeMeta::new();
   // R6/F2: the FIRST `ProcessMOV` warning (`ExifTool:Warning` under `-j`).
   let mut warning: Option<String> = None;
   let mut pos = 0usize;
-  while pos < data.len() {
-    match read_atom_header(data, pos, true) {
+  while pos < scan_end {
+    match read_atom_header(scan_data, pos, true) {
       Some(HeaderOutcome::Atom(header, next)) => {
-        let body_end = header.payload_end.min(data.len());
-        // `body_end <= data.len()` and a well-formed `payload_start <=
+        let body_end = header.payload_end.min(scan_data.len());
+        // `body_end <= scan_data.len()` and a well-formed `payload_start <=
         // body_end`, so `.get` is `Some` (byte-identical); a hostile overrun
         // yields an empty body (no-panic).
-        let body = data.get(header.payload_start..body_end).unwrap_or_default();
+        let body = scan_data
+          .get(header.payload_start..body_end)
+          .unwrap_or_default();
         match &header.atom_type {
           b"ftyp" => decode_ftyp(body, &mut qt),
           b"moov" => {
-            decode_moov_mvhd(body, &mut qt, &mut warning);
+            // `header.payload_start` is the moov body's absolute file offset, so
+            // a SPANNING moov's truncated UNKNOWN child reports its correct
+            // `at offset 0x%x` (FIX 2 / QuickTime.pm:10590).
+            decode_moov_mvhd(body, header.payload_start, &mut qt, &mut warning);
             // **SP2** — the `moov/udta` camera atoms + `moov/meta` Keys/ItemList
             // metadata. Decoded in Pass 1 (alongside `mvhd`) so the typed
             // UserData/Keys are populated before emission; the box walk runs at
@@ -3544,7 +3881,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
         // entry with those tags), then STOP — the payload is NOT decoded, so a
         // size-0 `moov` (or any other atom) contributes NOTHING here (R4/F1).
         if &atom_type == b"mdat" {
-          qt.set_media_data_size(Some((data.len() - payload_start) as u64));
+          qt.set_media_data_size(Some((scan_data.len() - payload_start) as u64));
           qt.set_media_data_offset(Some(payload_start as u64));
         }
         break;
@@ -3585,7 +3922,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // bytes ⇒ `$missing` is the WHOLE declared payload. Any other
           // recognized atom is not pre-read, so `$missing` is the declared
           // payload minus the bytes still available before EOF.
-          let available = data.len().saturating_sub(payload_start) as u64;
+          let available = scan_data.len().saturating_sub(payload_start) as u64;
           let consumed_by_ftyp_preread = pos == 0 && &atom_type == b"ftyp";
           let missing = if consumed_by_ftyp_preread {
             declared_payload_len
@@ -3620,17 +3957,19 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // TimeScale (in file order, so TrackN numbering is unchanged).
   let movie_ts = qt.time_scale();
   let mut pos = 0usize;
-  while pos < data.len() {
+  while pos < scan_end {
     // A top-level size-0 atom (`ExtendsToEof`) STOPS the walk with NO payload
     // decoded — never decode `trak`s out of a size-0 `moov` (R4/F1).
-    let Some(HeaderOutcome::Atom(header, next)) = read_atom_header(data, pos, true) else {
+    let Some(HeaderOutcome::Atom(header, next)) = read_atom_header(scan_data, pos, true) else {
       break;
     };
-    let body_end = header.payload_end.min(data.len());
-    // `body_end <= data.len()` and a well-formed `payload_start <= body_end`,
-    // so `.get` is `Some` (byte-identical); a hostile header that overruns
-    // its declared end yields an empty body (no-panic).
-    let body = data.get(header.payload_start..body_end).unwrap_or_default();
+    let body_end = header.payload_end.min(scan_data.len());
+    // `body_end <= scan_data.len()` and a well-formed `payload_start <=
+    // body_end`, so `.get` is `Some` (byte-identical); a hostile header that
+    // overruns its declared end yields an empty body (no-panic).
+    let body = scan_data
+      .get(header.payload_start..body_end)
+      .unwrap_or_default();
     if &header.atom_type == b"moov" {
       decode_moov_trak(body, movie_ts, &mut qt, &mut warning);
     }
@@ -3685,7 +4024,9 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // re-parsed, so we re-derive the raw count from the first decoded `mvhd`
   // via `qt`'s stored Duration timescale-count is unrelated; instead the
   // stream walker is given the raw CreateDate it can recover from the file.
-  let create_date_raw = first_moov_create_date_raw(data);
+  // Bounded to `scan_data` (the box hierarchy ends at the Insta360 trailer's
+  // start) so a trailer's bytes are never mis-read as a top-level atom.
+  let create_date_raw = first_moov_create_date_raw(scan_data);
   // The Kodak `frea`-atom `KodakVersion` global (set in Pass 1) is visible to
   // EVERY `ProcessFreeGPS` call — including the `moov`-level `gps ` offset-box
   // path inside `extract_stream` — so a Rexing dashcam that references its
@@ -3746,8 +4087,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `moov/GPMF` child stays IGNORED (GPMF is reached only via `udta` — R8);
   // the R7 multi-moov order is preserved (the walk runs per top-level `moov`
   // in file order).
+  // Bounded to `scan_data`: ExifTool's stream sources (the moov-level
+  // `gps `/timed-metadata trak walk AND the `mdat` `ScanMediaData` brute-force
+  // freeGPS/GP6 scan) all live inside the QuickTime box hierarchy, which ends
+  // at the Insta360 trailer's start — the trailer's bytes must not be scanned
+  // for a freeGPS signature.
   let (mut stream, found_embedded) = quicktime_stream::extract_stream(
-    data,
+    scan_data,
     create_date_raw,
     kodak_version,
     &mut gopro_meta,
@@ -3778,8 +4124,15 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     // onto exactly the fixes the scan appends so the emitter keeps them gated
     // (no no-`ee` fix, no file-level warning).
     let scan_start = stream.gps_sample_count();
+    // Bounded to `scan_data` (the box hierarchy / mdat end at the Insta360
+    // trailer's start): the brute-force freeGPS scan + its first-GP6 window
+    // expansion must NOT reach into the trailer, which is `ProcessInsta360`'s
+    // domain — re-scanning those bytes as freeGPS would double-extract. For a
+    // trailer-less file `scan_data == data`, so this is a no-op. Passing
+    // `scan_data` clamps both the `size` window and the GP6 EOF-expansion to
+    // `scan_end` regardless of the declared `size`.
     quicktime_freegps::scan_media_data(
-      data,
+      scan_data,
       off,
       size,
       create_date_raw,
@@ -3802,7 +4155,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // Exif IFD parser is on the UNMERGED PR #36 (`lib/exif-gps`); detect the
   // block here and DEFER the parse.
   // DEFERRED: wire exif::parse_exif_block once #36 (Exif+GPS) merges.
-  let embedded_exif_deferred = detect_embedded_exif(data);
+  // Bounded to `scan_data` (the embedded-Exif atoms live in `moov`/`udta`,
+  // inside the box hierarchy — never in the file-end trailer).
+  let embedded_exif_deferred = detect_embedded_exif(scan_data);
+
+  // **SP4** — the Insta360 INSV/INSP trailer (`insta360_meta`) was already
+  // decoded up-front (before the box walk), because `IdentifyTrailers`
+  // (QuickTime.pm:9897-9926) bounds the atom walk to the trailer's start. See
+  // the `scan_trailer` call near Pass 1.
 
   Some(Meta {
     qt,
@@ -3811,11 +4171,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     android_camm: camm_meta,
     sony_rtmd: sony_rtmd_meta,
     canon_ctmd: canon_ctmd_meta,
+    insta360: insta360_meta,
     embedded_exif_deferred,
     file_type,
     mime,
     warning,
-    _marker: core::marker::PhantomData,
   })
 }
 
@@ -5405,6 +5765,17 @@ impl crate::emit::Taggable for Meta<'_> {
     // MINOR residue warning (`Warn(..., 1)`) carries the `[minor] ` prefix.
     emit_ctmd_warnings(self.canon_ctmd.warnings(), opts, &mut first_seen, &mut tags);
 
+    // ── SP4: Insta360 INSV/INSP trailer (ProcessInsta360) ──────────────────
+    // The file-END trailer's tags (QuickTimeStream.pl:3252-3478) under the
+    // family-1 `Insta360` group: the always-on `[minor]` trailer warning
+    // (QuickTime.pm:10600, every mode), then — at `-ee` — the timed records
+    // (GPS/exposure/videotimestamp/accelerometer) on the shared global
+    // `Doc<N>` axis + the sticky-doc identity. The two-rule `%noDups` `-G1`
+    // collapse is applied over the doc-ORDERED UNION of ALL record types (so
+    // the cross-type `TimeCode` collision resolves to the lowest doc). See
+    // [`emit_insta360`].
+    emit_insta360(&self.insta360, opts, print_conv, &mut first_seen, &mut tags);
+
     // ── SP4: GoPro GPMF (Image::ExifTool::GoPro) ───────────────────────
     // The `%GoPro::GPMF` / `%GoPro::GPS5` / `%GoPro::GPS9` tables emit under
     // family-0 `GoPro` (the module group) and family-1 `GoPro`
@@ -6670,6 +7041,466 @@ fn emit_ctmd_warnings<F: FnMut(&str, &str) -> bool>(
         false,
       ));
     }
+  }
+}
+
+/// Format one Insta360 `0x700` GPS fix into its `Insta360:*` tags
+/// (QuickTimeStream.pl:3397-3425), appending to `out` under `base`. SHARED by
+/// both the `-G3` (per-Doc) and the streaming `-G1` emission paths so the
+/// per-sample PrintConv lives in ONE place. The `Doc<N>` re-stamp (`-G3`) and
+/// the first-wins collapse (`-G1`) are applied by the caller.
+#[cfg(feature = "alloc")]
+fn push_insta360_gps_tags(
+  s: &crate::metadata::Insta360GpsSample,
+  base: &crate::value::Group,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  let push = |out: &mut std::vec::Vec<EmittedTag>, name: &str, v: TagValue| {
+    out.push(EmittedTag::new(base.clone(), name.into(), v, false));
+  };
+  if let Some(dt) = s.date_time() {
+    push(out, "GPSDateTime", TagValue::Str(dt.into()));
+  }
+  if let Some(lat) = s.latitude() {
+    let v = if print_conv {
+      TagValue::Str(dms_signed(lat, 'N', 'S').into())
+    } else {
+      TagValue::F64(lat)
+    };
+    push(out, "GPSLatitude", v);
+  }
+  if let Some(lon) = s.longitude() {
+    let v = if print_conv {
+      TagValue::Str(dms_signed(lon, 'E', 'W').into())
+    } else {
+      TagValue::F64(lon)
+    };
+    push(out, "GPSLongitude", v);
+  }
+  if let Some(sp) = s.speed_kph() {
+    // `%QuickTime::Stream` GPSSpeed PrintConv `sprintf("%.4f", $val) + 0`
+    // (QuickTimeStream.pl:121): round to 4 decimals, drop trailing zeros (the
+    // `+ 0` numify re-stringifies the rounded NV with `%.15g`). `-n` emits the
+    // raw km/h F64. Same `%.4f`+0 idiom as the Stream GPSAltitude (extracted
+    // into `round_to_decimals` + `format_g`).
+    let v = if print_conv {
+      TagValue::Str(crate::value::format_g(round_to_decimals(sp, 4), 15).into())
+    } else {
+      TagValue::F64(sp)
+    };
+    push(out, "GPSSpeed", v);
+  }
+  if let Some(tr) = s.track_deg() {
+    // GPSTrack PrintConv `sprintf("%.4f", $val) + 0` (QuickTimeStream.pl:123) —
+    // the same `%.4f`+0 numeric strip as GPSSpeed.
+    let v = if print_conv {
+      TagValue::Str(crate::value::format_g(round_to_decimals(tr, 4), 15).into())
+    } else {
+      TagValue::F64(tr)
+    };
+    push(out, "GPSTrack", v);
+  }
+  if let Some(alt) = s.altitude_m() {
+    push(
+      out,
+      "GPSAltitude",
+      gps_altitude_stream_value(alt, print_conv),
+    );
+  }
+}
+
+/// Format one Insta360 `0x400` exposure row into `TimeCode`/`ExposureTime`
+/// (QuickTimeStream.pl:3386-3391). SHARED by `-G3` and the streaming `-G1`.
+#[cfg(feature = "alloc")]
+fn push_insta360_exposure_tags(
+  s: &crate::metadata::Insta360ExposureSample,
+  base: &crate::value::Group,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  if let Some(ms) = s.timestamp_ms() {
+    // `TimeCode` PrintConv `sprintf('%.3f', $val/1000)` — both modes (the `.3f`
+    // string is emitted at `-n` too; no separate ValueConv form in the oracle).
+    let v = TagValue::Str(std::format!("{:.3}", ms as f64 / 1000.0).into());
+    out.push(EmittedTag::new(base.clone(), "TimeCode".into(), v, false));
+  }
+  if let Some(et) = s.exposure_time_s() {
+    let v = if print_conv {
+      TagValue::Str(crate::exif::tables::print_exposure_time(et).into())
+    } else {
+      TagValue::F64(et)
+    };
+    out.push(EmittedTag::new(
+      base.clone(),
+      "ExposureTime".into(),
+      v,
+      false,
+    ));
+  }
+}
+
+/// Format one Insta360 `0x600` video-timestamp row into `VideoTimeStamp`
+/// (QuickTimeStream.pl:3392-3396). SHARED by `-G3` and the streaming `-G1`.
+#[cfg(feature = "alloc")]
+fn push_insta360_videotime_tags(
+  s: &crate::metadata::Insta360VideoTimeSample,
+  base: &crate::value::Group,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  if let Some(ms) = s.timecode_ms() {
+    // Same `%.3f` (ms → s) rendering as `TimeCode`, both modes.
+    let v = TagValue::Str(std::format!("{:.3}", ms as f64 / 1000.0).into());
+    out.push(EmittedTag::new(
+      base.clone(),
+      "VideoTimeStamp".into(),
+      v,
+      false,
+    ));
+  }
+}
+
+/// Format one Insta360 `0x300` accelerometer row into
+/// `TimeCode`/`Accelerometer`/`AngularVelocity` (QuickTimeStream.pl:3372-3385).
+/// The vec3 tags carry NO PrintConv — three f64 space-joined via Perl's `%.15g`
+/// (`"@a"`), mode-invariant. SHARED by `-G3` and the streaming `-G1`.
+#[cfg(feature = "alloc")]
+fn push_insta360_accel_tags(
+  s: &crate::metadata::Insta360AccelSample,
+  base: &crate::value::Group,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  let vec3 = |v: [f64; 3]| -> TagValue {
+    let mut s = crate::value::format_g(v[0], 15);
+    s.push(' ');
+    s.push_str(&crate::value::format_g(v[1], 15));
+    s.push(' ');
+    s.push_str(&crate::value::format_g(v[2], 15));
+    TagValue::Str(s.into())
+  };
+  if let Some(ms) = s.timecode_ms() {
+    let v = TagValue::Str(std::format!("{:.3}", ms as f64 / 1000.0).into());
+    out.push(EmittedTag::new(base.clone(), "TimeCode".into(), v, false));
+  }
+  if let Some(a) = s.accelerometer() {
+    out.push(EmittedTag::new(
+      base.clone(),
+      "Accelerometer".into(),
+      vec3(a),
+      false,
+    ));
+  }
+  if let Some(w) = s.angular_velocity() {
+    out.push(EmittedTag::new(
+      base.clone(),
+      "AngularVelocity".into(),
+      vec3(w),
+      false,
+    ));
+  }
+}
+
+/// Format the Insta360 `0x101` identity into its `SerialNumber`/`Model`/
+/// `Firmware`/`Parameters` tags (QuickTimeStream.pl:3427-3436) under `group`.
+/// SHARED by `-G3` (group carries the sticky `Doc<N>`) and the streaming `-G1`
+/// (group is the bare `Insta360`; the names are file-unique so they survive the
+/// collapse).
+#[cfg(feature = "alloc")]
+fn push_insta360_identity_tags(
+  id: &crate::metadata::Insta360Identity,
+  group: &crate::value::Group,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  for (val, name) in [
+    (id.serial_number(), "SerialNumber"),
+    (id.model(), "Model"),
+    (id.firmware(), "Firmware"),
+    (id.parameters(), "Parameters"),
+  ] {
+    if let Some(v) = val {
+      out.push(EmittedTag::new(
+        group.clone(),
+        name.into(),
+        TagValue::Str(v.into()),
+        false,
+      ));
+    }
+  }
+}
+
+/// The streaming `-ee -G1` Insta360 timed-record + identity emission — bounded
+/// to O(distinct tag names) memory (Finding 2). Drives
+/// [`insta360_fmt::stream_records`] (one decoded row at a time, NO per-row Vec)
+/// and accumulates FIRST-WINS-by-name directly into `tags`: because the walk
+/// visits records in doc-ascending order and every row's tag names are unique
+/// within its own doc, the `-G1` `%noDups` collapse reduces to "the first
+/// occurrence of each name in walk order wins" — identical output to the
+/// doc-sorted two-rule collapse the `-G3` path's full decode would feed, but
+/// without ever storing all rows. Decode-time warnings route through the shared
+/// priority-0 first-wins `ExifTool:Warning` gate (in practice suppressed by the
+/// earlier positional trailer warning). The identity record is walked LAST, so
+/// its (file-unique) tags land after the timed rows — matching the oracle.
+#[cfg(feature = "alloc")]
+fn emit_insta360_g1_streaming<F: FnMut(&str, &str) -> bool>(
+  raw: &[u8],
+  trail_end: usize,
+  print_conv: bool,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::formats::insta360::Insta360StreamItem;
+  use crate::value::{Group, TagValue};
+
+  let base = Group::new("Trailer", "Insta360");
+  // The committed-names set IS the entire `-G1` memory of the timed rows:
+  // O(distinct names), never O(rows).
+  let mut committed: std::vec::Vec<smol_str::SmolStr> = std::vec::Vec::new();
+  // A small reused scratch buffer for the (≤3) tags one row formats into.
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+
+  // First-wins-accumulate the formatted tags of one row/identity into `tags`.
+  let commit = |scratch: &mut std::vec::Vec<EmittedTag>,
+                committed: &mut std::vec::Vec<smol_str::SmolStr>,
+                tags: &mut std::vec::Vec<EmittedTag>| {
+    for tag in scratch.drain(..) {
+      let name = smol_str::SmolStr::new(tag.tag().name());
+      if committed.contains(&name) {
+        continue; // an earlier (lower-doc) row already emitted this name.
+      }
+      committed.push(name);
+      tags.push(tag);
+    }
+  };
+
+  insta360_fmt::stream_records(raw, trail_end, &mut |item| match item {
+    Insta360StreamItem::Warning(w) => {
+      // A `Trailer`/`Insta360` `Warning` (raised under `SET_GROUP1='Insta360'`),
+      // priority-0 first-wins. At `-G1` the doc axis collapses, so all such
+      // warnings reduce to ONE `Insta360:Warning` — emit only the FIRST (the
+      // `first_seen` gate keeps this bounded: a crafted run of thousands of
+      // non-multiple records still pushes a single tag). NOT `ExifTool:Warning`.
+      if first_seen("Insta360", "Warning") {
+        tags.push(EmittedTag::new(
+          base.clone(),
+          "Warning".into(),
+          TagValue::Str(w),
+          false,
+        ));
+      }
+    }
+    Insta360StreamItem::Gps(s) => {
+      push_insta360_gps_tags(&s, &base, print_conv, &mut scratch);
+      commit(&mut scratch, &mut committed, tags);
+    }
+    Insta360StreamItem::Exposure(s) => {
+      push_insta360_exposure_tags(&s, &base, print_conv, &mut scratch);
+      commit(&mut scratch, &mut committed, tags);
+    }
+    Insta360StreamItem::VideoTime(s) => {
+      push_insta360_videotime_tags(&s, &base, &mut scratch);
+      commit(&mut scratch, &mut committed, tags);
+    }
+    Insta360StreamItem::Accel(s) => {
+      push_insta360_accel_tags(&s, &base, &mut scratch);
+      commit(&mut scratch, &mut committed, tags);
+    }
+    Insta360StreamItem::Identity(id) => {
+      push_insta360_identity_tags(&id, &base, &mut scratch);
+      commit(&mut scratch, &mut committed, tags);
+    }
+  });
+}
+
+/// Emit the Insta360 INSV/INSP trailer's tags faithfully — the
+/// `ProcessInsta360` output (QuickTimeStream.pl:3252-3478) under the
+/// family-1 `Insta360` group (family-0 `Trailer`, the `SET_GROUP0` of the
+/// trailer walker; QuickTime.pm:10669-10673).
+///
+/// Three independent pieces, all driven off the typed [`Insta360Meta`]:
+///
+///  1. **The always-on trailer warning.** `ProcessMOV` raises
+///     `Warn(sprintf('%s trailer at offset 0x%x (%d bytes)', …), 1)` whenever
+///     its box walk reaches a trailer (QuickTime.pm:10600) — present in EVERY
+///     mode (incl. no-`-ee`; the oracle's `.json` carries it). The `1`st
+///     `Warn` arg ⇒ ignorable ⇒ the rendered value carries the `[minor] `
+///     prefix. Emitted UNCONDITIONALLY when a trailer is detected, as a
+///     document-level `ExifTool:Warning` tag through the shared priority-0
+///     first-wins [`first_seen`] gate (a real earlier `ProcessMOV` warning
+///     still wins). On a bad-size trailer (`trailerLen > file size`) the offset
+///     is the WRAPPED (negative→unsigned) value — bundled emits this positional
+///     warning then suppresses "Bad trailer size" via the same first-wins rule.
+///  2. **The timed records** (`-ee`-only — `ProcessInsta360` runs under
+///     `ExtractEmbedded`): GPS (`0x700`), exposure (`0x400`), videotimestamp
+///     (`0x600`), accelerometer (`0x300`). Each surfaced row carries its
+///     global `Doc<N>` stamp. At `-ee -G3` every row emits under
+///     `Doc<N>:Insta360:*`; at `-ee -G1` the doc axis collapses with the SAME
+///     two-rule `%noDups` precedence as [`emit_camm_motion`] — within one
+///     `Doc<N>` LAST-wins, ACROSS documents FIRST-wins (lowest `Doc<N>`) by
+///     `(family1, name)` — applied over the doc-ORDERED UNION of ALL record
+///     types (so e.g. the `TimeCode` shared by exposure Doc3/4 and accel
+///     Doc7/8 collapses to the single lowest-doc Doc3 value).
+///  3. **The identity** (`0x101`): SerialNumber / Model / Firmware /
+///     Parameters. NOT incremented into `DOC_NUM` — it inherits the sticky
+///     value the last surfaced timed row left (QuickTimeStream.pl:3427-3436).
+///     At `-G3` it rides `Doc<N>:Insta360:*` (the sticky doc, or Main when 0);
+///     at `-G1` its names are file-unique so they always survive. Emitted at
+///     BOTH `-ee` and no-`-ee` (the identity is not gated on `ExtractEmbedded`
+///     in the typed layer — but in practice `ProcessInsta360` itself runs
+///     under `-ee`, so a no-`-ee` parse decodes no trailer records at all;
+///     this matches the oracle's no-`-ee` `.json`, which shows ONLY the
+///     warning).
+#[cfg(feature = "alloc")]
+fn emit_insta360<F: FnMut(&str, &str) -> bool>(
+  meta: &crate::metadata::Insta360Meta<'_>,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+
+  // Push one document-level `ExifTool:Warning` through the shared priority-0
+  // first-wins gate (a real earlier `ProcessMOV` warning still wins).
+  let push_warning =
+    |first_seen: &mut F, tags: &mut std::vec::Vec<EmittedTag>, msg: smol_str::SmolStr| {
+      if first_seen("ExifTool", "Warning") {
+        tags.push(EmittedTag::new(
+          Group::new("ExifTool", "ExifTool"),
+          "Warning".into(),
+          TagValue::Str(msg),
+          false,
+        ));
+      }
+    };
+
+  // ── (1) the always-on `[minor]` trailer warning ──────────────────────────
+  // Emitted whenever a trailer is detected — NOT `-ee`-gated, NOT
+  // `print_conv`-gated (the oracle shows it in every mode). Driven off the
+  // linked-list HEAD trailer (QuickTime.pm:10600 warns `$$trailer[0/1/2]`):
+  // usually the Insta360 trailer itself, but its NAME reflects the head kind so
+  // a LigoGPS/MIE head reports that kind faithfully.
+  if let Some((name, start, len)) = meta.head_trailer() {
+    push_warning(
+      first_seen,
+      tags,
+      std::format!("[minor] {name} trailer at offset 0x{start:x} ({len} bytes)").into(),
+    );
+  }
+
+  // The timed records are `ProcessInsta360`-under-`-ee` only. The identity
+  // record only ever decodes under `-ee` too (same routine), so the whole
+  // record body below is `-ee`-gated; the no-`-ee` path emitted just the
+  // warning(s) above.
+  if !opts.extract_embedded {
+    return;
+  }
+  // DEFERRED heavy decode: only NOW (under `-ee`) do we materialize the timed
+  // rows from the borrowed input bytes — the opts-agnostic parse stored only a
+  // bounded domain summary (lazy-decode DoS guard). No trailer ⇒ nothing.
+  let Some(raw) = meta.raw() else {
+    return;
+  };
+  // The Insta360 trailer's end offset (== EOF for a standalone trailer, or its
+  // `start + len` when found behind a later LigoGPS/MIE trailer) — the backward
+  // anchor the record walk reads from.
+  let trail_end = meta.trail_end();
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+
+  if !g3 {
+    // ── (2+3) the `-ee -G1` path — STREAMED (Finding 2) ────────────────────
+    // O(distinct names) memory: never materialize the full per-row Vecs nor a
+    // sorted union. Walk-order first-wins reproduces the `-G1` two-rule
+    // collapse byte-for-byte (each row is its own doc with file-unique names).
+    emit_insta360_g1_streaming(raw, trail_end, print_conv, first_seen, tags);
+    return;
+  }
+
+  // ── (2+3) the `-ee -G3` path — full decode + doc-sorted per-Doc emission ──
+  // Inherently O(rows) = O(output) (one `Doc<N>` per row, matching ExifTool).
+  let full = insta360_fmt::decode_all_records(raw, trail_end);
+
+  // Build the doc-ORDERED UNION of every timed record's tags as
+  // `(doc, EmittedTag)` pairs (the per-sample formatting is the SHARED
+  // `push_insta360_*_tags` helpers, also used by the streaming `-G1` path).
+  // The per-Vec order is already ascending-doc, but we sort by `doc` (STABLE)
+  // so the per-Doc emission is correct even when record types interleave in the
+  // file (so `full.gps()`/`full.exposure()` are individually doc-ascending but
+  // their concatenation is not).
+  let base = Group::new("Trailer", "Insta360");
+  let mut rows: std::vec::Vec<(u32, EmittedTag)> = std::vec::Vec::new();
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  let stamp = |rows: &mut std::vec::Vec<(u32, EmittedTag)>,
+               scratch: &mut std::vec::Vec<EmittedTag>,
+               doc: u32| {
+    for tag in scratch.drain(..) {
+      rows.push((doc, tag));
+    }
+  };
+  for s in full.gps() {
+    push_insta360_gps_tags(s, &base, print_conv, &mut scratch);
+    stamp(&mut rows, &mut scratch, s.doc().unwrap_or(0));
+  }
+  for s in full.exposure() {
+    push_insta360_exposure_tags(s, &base, print_conv, &mut scratch);
+    stamp(&mut rows, &mut scratch, s.doc().unwrap_or(0));
+  }
+  for s in full.videotime() {
+    push_insta360_videotime_tags(s, &base, &mut scratch);
+    stamp(&mut rows, &mut scratch, s.doc().unwrap_or(0));
+  }
+  for s in full.accel() {
+    push_insta360_accel_tags(s, &base, &mut scratch);
+    stamp(&mut rows, &mut scratch, s.doc().unwrap_or(0));
+  }
+  // Decode-time warnings (`Insta360 ... data is huge` :3349, `Unexpected
+  // Insta360 record 0x%x length` :3357, `Unrecognized INSV GPS format` :3408) —
+  // raised inside `ProcessInsta360` while `SET_GROUP1='Insta360'` is active, so
+  // they are `Trailer`/`Insta360` `Warning` tags (NOT `ExifTool:Warning`),
+  // riding the STICKY `Doc<N>` they were raised under. Push AFTER the row tags
+  // so the STABLE doc-sort keeps each warning after its own doc's payload rows
+  // (the bundled FoundTag order); the downstream `TagMap` first-wins on
+  // `(doc, Insta360, Warning)` then keeps only the first per doc (priority-0).
+  for (doc, w) in full.warnings() {
+    rows.push((
+      *doc,
+      EmittedTag::new(
+        base.clone(),
+        "Warning".into(),
+        TagValue::Str(w.clone()),
+        false,
+      ),
+    ));
+  }
+
+  rows.sort_by_key(|(doc, _)| *doc);
+
+  // Each row under its own `Doc<N>:Insta360:*` (Main when doc 0). Re-stamp the
+  // group's doc; MOVE the name + value out (no clone).
+  for (doc, tag) in rows {
+    let (_, name, value) = tag.into_tag().into_parts();
+    let group = Group::with_doc("Trailer", "Insta360", doc);
+    tags.push(EmittedTag::new(group, name, value, false));
+  }
+
+  // ── (3) the identity (`0x101`) ───────────────────────────────────────────
+  // SerialNumber / Model / Firmware / Parameters ride the sticky `Doc<N>`
+  // (Main when 0/None) at `-G3`.
+  if let Some(id) = full.identity() {
+    let group = Group::with_doc("Trailer", "Insta360", id.doc().unwrap_or(0));
+    push_insta360_identity_tags(id, &group, tags);
   }
 }
 

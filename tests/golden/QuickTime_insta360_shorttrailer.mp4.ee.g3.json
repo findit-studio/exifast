@@ -1,0 +1,11 @@
+[{
+  "SourceFile": "QuickTime_insta360_shorttrailer.mp4",
+  "ExifTool:ExifToolVersion": 13.59,
+  "ExifTool:Warning": "[minor] Insta360 trailer at offset 0x18 (40 bytes)",
+  "File:FileType": "MP4",
+  "File:FileTypeExtension": "mp4",
+  "File:MIMEType": "video/mp4",
+  "QuickTime:MajorBrand": "MP4 v2 [ISO 14496-14]",
+  "QuickTime:MinorVersion": "0.0.0",
+  "QuickTime:CompatibleBrands": ["mp42","isom"]
+}]
