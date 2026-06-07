@@ -27,6 +27,7 @@ mod canon_ctmd;
 pub(crate) mod crw;
 mod domain;
 mod gopro;
+mod insta360;
 #[cfg(feature = "png")]
 pub(crate) mod png;
 pub mod project;
@@ -57,6 +58,10 @@ pub use domain::{
 };
 pub use gopro::{
   GoProConv, GoProGlpiSample, GoProGpsSample, GoProKbat, GoProMeta, GoProTag, GoProTagValue,
+};
+pub use insta360::{
+  Insta360AccelSample, Insta360ExposureSample, Insta360GpsSample, Insta360Identity, Insta360Meta,
+  Insta360VideoTimeSample,
 };
 #[cfg(feature = "png")]
 pub use png::{

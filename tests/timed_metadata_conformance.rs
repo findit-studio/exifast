@@ -2936,3 +2936,246 @@ fn cross_struct_noee_warning_byte_exact() {
     check_noee_excluding(fix, gold, NO_EXCL);
   }
 }
+
+// ── Insta360 INSV/INSP file-end trailer (ProcessInsta360) ───────────────────
+// A crafted minimal MP4 carrying an Insta360 trailer with EVERY surfaced record
+// type (identity 0x101 + accelerometer 0x300 [a 56-byte doubles row + a 20-byte
+// int16 row] + videotimestamp 0x600 [2 rows] + exposure 0x400 [2 rows] + GPS
+// 0x700 [2 'A' fixes + 1 void 'V']). The walker steps last-record-first, and a
+// SINGLE global `DOC_NUM` `++`s per surfaced timed row across ALL types — so
+// GPS=Doc1/Doc2, exposure=Doc3/Doc4, videotime=Doc5/Doc6, accel=Doc7/Doc8 —
+// while the identity record (walked LAST, file-first) does NOT increment it and
+// rides the sticky Doc8.
+//
+// The `-ee -G3` oracle (`QuickTime_insta360.mp4.ee.g3.json`) is each row under
+// its own `Doc<N>:Insta360:*`; the `-ee -G1` oracle (`…ee.json`) is the two-rule
+// `%noDups` collapse over the doc-ORDERED UNION of all record types — the
+// strongest pin being the cross-TYPE `TimeCode` collision (exposure Doc3=1.000 /
+// Doc4=2.000 AND accel Doc7=2.000 / Doc8=1.000) resolving to the single LOWEST-doc
+// `TimeCode: 1.000` (Doc3), and `Accelerometer`/`AngularVelocity` keeping the
+// lower-doc accel20 row (Doc7). The unique identity names always survive at `-G1`.
+#[test]
+fn insta360_ee_byte_exact_all_record_types() {
+  check_ee(
+    "QuickTime_insta360.mp4",
+    "QuickTime_insta360.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360.mp4",
+    "QuickTime_insta360.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// At no-`ee`: `ProcessInsta360` runs only under `ExtractEmbedded`, so NO trailer
+// record surfaces — but `ProcessMOV` STILL raises the always-on `[minor] Insta360
+// trailer at offset 0x8c (442 bytes)` warning (QuickTime.pm:10600) on reaching the
+// trailer, present in EVERY mode. Pins that the trailer emission is `-ee`-gated for
+// records yet the positional warning is unconditional.
+#[test]
+fn insta360_noee_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360.mp4",
+    "QuickTime_insta360.mp4.json",
+    NO_EXCL,
+  );
+}
+
+// A trailer whose declared `trailerLen` (1582) EXCEEDS the file size (582 bytes)
+// — the QuickTimeStream.pl:3277 bad-size branch. `ProcessInsta360` raises "Bad
+// Insta360 trailer size" internally, but `ProcessMOV`'s POSITIONAL trailer
+// warning (QuickTime.pm:10600) fires FIRST whenever a trailer is identified, and
+// ExifTool's priority-0 first-wins keeps it — so the ONLY `-j` warning is the
+// positional one, with the WRAPPED (negative→unsigned) offset
+// `0xfffffffffffffc18` (= 582 − 1582 = −1000 as u64) and the declared 1582-byte
+// size. No trailer records surface (the walk decodes nothing past the bad-size
+// check). Pins that exifast emits the wrapped-offset positional warning, NOT
+// "Bad Insta360 trailer size". Byte-exact at no-`-ee` (G1) and at `-ee` (G1+G3),
+// all of which carry only the positional warning.
+#[test]
+fn insta360_badtrailer_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_badtrailer.mp4",
+    "QuickTime_insta360_badtrailer.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_badtrailer.mp4",
+    "QuickTime_insta360_badtrailer.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_badtrailer.mp4",
+    "QuickTime_insta360_badtrailer.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// A trailer-bearing QuickTime file SHORTER than the 78-byte `ProcessInsta360`
+// footer: a recognized `ftyp` + ONLY the 40-byte EOF-40 `IdentifyTrailers`
+// locator (`[trailerLen:u32][4 opaque][32-byte magic]`), 64 bytes total.
+// ExifTool's EOF-40 locator (QuickTime.pm:9897-9926) still IDENTIFIES the
+// trailer — emitting the positional `[minor] … trailer at offset 0x18 (40
+// bytes)` warning and bounding the box walk to the trailer start (so only
+// `ftyp` decodes, no `moov`) — but `ProcessInsta360`'s `Seek(-78)` fails on the
+// <78-byte file so NO records decode. Pins that exifast identifies via the
+// 40-byte locator (NOT the 78-byte footer): without that, a 40..77-byte trailer
+// would be missed, losing the warning and leaving the box/freeGPS scans to
+// consume trailer bytes. Byte-exact at no-`-ee` (G1) and `-ee` (G1+G3).
+#[test]
+fn insta360_shorttrailer_warning_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_shorttrailer.mp4",
+    "QuickTime_insta360_shorttrailer.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_shorttrailer.mp4",
+    "QuickTime_insta360_shorttrailer.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_shorttrailer.mp4",
+    "QuickTime_insta360_shorttrailer.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// A valid trailer carrying NON-MULTIPLE fixed-stride records — the
+// QuickTimeStream.pl:3355-3357 `if ($len % $dlen and $id != 0x700)` branch. The
+// trailer holds a 0x400 exposure record of 17 bytes (one 16-byte row + 1
+// trailing byte) and a 0x600 videotimestamp record of 9 bytes (one 8-byte row +
+// 1 trailing byte) alongside a VALID 0x700 GPS fix + 0x101 identity. A
+// fixed-stride record whose post-cap length is NOT a multiple of its stride
+// (0x300/0x400/0x600; 0x700 EXEMPT) decodes ZERO rows in bundled (the `elsif`
+// decode is skipped) and raises only `Unexpected Insta360 record 0x%x length` —
+// a `Trailer`/`Insta360` `Warning` (priority-0 first-wins), NOT
+// `ExifTool:Warning`. So the `-ee` oracle surfaces the GPS fix (Doc1) + identity
+// (sticky Doc1) + the FIRST such warning (0x600, walked first → collapses the
+// later 0x400 one) and NO ExposureTime / VideoTimeStamp / TimeCode rows. Pins
+// (1) the non-multiple records emit no rows and (2) the warning is group-scoped
+// `Insta360:Warning` riding the sticky `Doc<N>` (`Doc1` at `-G3`). At no-`ee`,
+// only the positional `ExifTool:Warning` (records decode only under `-ee`).
+// Byte-exact at no-`ee` (G1) and `-ee` (G1+G3).
+#[test]
+fn insta360_badstride_non_multiple_records_emit_no_rows_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_badstride.mp4",
+    "QuickTime_insta360_badstride.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_badstride.mp4",
+    "QuickTime_insta360_badstride.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_badstride.mp4",
+    "QuickTime_insta360_badstride.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// A 0x300 accelerometer record with a SHORT 10-byte body — a length that is a
+// multiple of NEITHER 20 nor 56 — FOLLOWED by a 0x700 GPS fix + 0x101 identity.
+// Pins the QuickTimeStream.pl:3327-3346 else-branch stride probe semantics (R8):
+// that probe is `$raf->Read($buff, 20)` against the RAF (the FILE), NOT the
+// record's own body, so it reads PAST the short body into the following
+// footer/record bytes and SUCCEEDS whenever ≥ 20 bytes remain to EOF. Because
+// records follow the 0x300 here, the probe succeeds → picks a stride (20/56) →
+// the 10-byte record's `len % stride != 0` raises `Unexpected Insta360 record
+// 0x300 length` (a `Trailer`/`Insta360` `Warning`, priority-0 first-wins, riding
+// the sticky `Doc1` the GPS fix left) and decodes ZERO accel rows — it is NOT
+// silently skipped. (A PRIOR fix wrongly skipped a sub-19-byte body silently;
+// the genuine `$dlen == 0` silent skip happens ONLY when that `Read(20)` FAILS,
+// i.e. fewer than 20 bytes remain to EOF, which a 0x300 followed by more records
+// can never trigger.) The GPS 'A' fix (Doc1) + the identity (sticky Main) still
+// extract. At no-`ee`: only the positional `ExifTool:Warning` (records decode
+// only under `-ee`). Byte-exact at no-`ee` (G1) and `-ee` (G1+G3).
+#[test]
+fn insta360_short300_read20_reads_past_body_warns_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_short300.mp4",
+    "QuickTime_insta360_short300.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_short300.mp4",
+    "QuickTime_insta360_short300.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_short300.mp4",
+    "QuickTime_insta360_short300.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// The SAME valid Insta360 trailer followed by an (empty) LigoGPS trailer, so the
+// Insta360 trailer is NOT the final block. ExifTool's `IdentifyTrailers`
+// (QuickTime.pm:9897-9926) is a BACKWARD linked-list walk: it reads 40 bytes at
+// EOF, recognizes the LigoGPS signature (`&&&&` + a BE u32 length), steps PAST
+// the 8-byte LigoGPS block, re-reads, and now recognizes the Insta360 signature
+// — so the non-last Insta360 trailer is STILL found and fully decoded. The
+// EARLIEST (Insta360) trailer is the linked-list head, so `ProcessMOV` bounds
+// its box walk to the Insta360 start and warns the Insta360 positional `[minor]
+// Insta360 trailer at offset 0x8c (442 bytes)`. exifast does not extract LigoGPS
+// (and an empty one has nothing to extract), so the output is byte-IDENTICAL to
+// the standalone `QuickTime_insta360.mp4` fixture: full Insta360 metadata + the
+// positional warning + NO LigoGPS tags. Byte-exact at no-`ee` (G1) and `-ee`
+// (G1+G3). Pins the linked-list trailer discovery (without it, a non-last
+// Insta360 trailer is MISSED — losing the metadata + warning + the box bound).
+#[test]
+fn insta360_chained_trailer_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_chained.mp4",
+    "QuickTime_insta360_chained.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_chained.mp4",
+    "QuickTime_insta360_chained.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_chained.mp4",
+    "QuickTime_insta360_chained.mp4.ee.g3.json",
+    true,
+  );
+}
+
+// A `moov` whose DECLARED size SPANS into the Insta360 trailer (but stays within
+// the file). ExifTool's `ProcessMOV` walks top-level atoms by their DECLARED
+// size (QuickTime.pm:10597-10602): the over-large `moov` is read in full (mvhd +
+// the first trailer bytes), and walking that buffer the trailer's first record
+// bytes parse as a contained atom `(size=0x0a0d4958, tag='SE12')` whose huge
+// size overruns the buffer ⇒ `Truncated 'SE12' data at offset 0x8c` (the unknown
+// atom's skip path, :10590). After the moov the cursor is PAST the trailer
+// start, so the trailer-processing loop SKIPS it (`next if $lastPos >
+// $$trailer[1]`, :10656) — NO Insta360 metadata is extracted. The positional
+// `[minor] Insta360 trailer …` warning is also emitted but suppressed under `-j`
+// by the earlier `Truncated 'SE12'` warning (priority-0 first-wins). Pins FIX 2:
+// the in-loop trailer stop + extraction gate REPLACED the old pre-bound box view
+// (which truncated the spanning moov at the trailer start, mis-warning
+// `Truncated 'moov'` and still extracting). Byte-exact at no-`ee` (G1) and `-ee`
+// (G1+G3) — all three goldens carry exactly the `Truncated 'SE12'` warning + the
+// mvhd-derived QuickTime tags + no Insta360 tags.
+#[test]
+fn insta360_atomspan_trailer_byte_exact() {
+  check_noee_excluding(
+    "QuickTime_insta360_atomspan.mp4",
+    "QuickTime_insta360_atomspan.mp4.json",
+    NO_EXCL,
+  );
+  check_ee(
+    "QuickTime_insta360_atomspan.mp4",
+    "QuickTime_insta360_atomspan.mp4.ee.json",
+    false,
+  );
+  check_ee(
+    "QuickTime_insta360_atomspan.mp4",
+    "QuickTime_insta360_atomspan.mp4.ee.g3.json",
+    true,
+  );
+}
