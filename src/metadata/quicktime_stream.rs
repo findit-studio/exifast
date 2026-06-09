@@ -727,6 +727,27 @@ impl QuickTimeStreamMeta {
     self.doc_counter
   }
 
+  /// The CURRENT value of the global document counter (`$$et{DOC_COUNT}`) —
+  /// read by the LigoGPS sources (a SEPARATE [`crate::metadata::LigoGpsMeta`]
+  /// struct that does not own this counter) so they can continue the SAME
+  /// global `Doc<N>` sequence as the in-struct sources. Paired with
+  /// [`Self::set_doc_counter`] after the LigoGPS source bumps it once per record
+  /// (`LigoGpsMeta::stamp_doc_from`), mirroring the snapshot-bump-write-back the
+  /// in-struct [`Self::stamp_gps_doc_from`] does internally.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn doc_counter(&self) -> u32 {
+    self.doc_counter
+  }
+
+  /// Write back the global document counter after a LigoGPS source bumped it
+  /// once per record (see [`Self::doc_counter`]).
+  #[inline(always)]
+  pub(crate) const fn set_doc_counter(&mut self, counter: u32) -> &mut Self {
+    self.doc_counter = counter;
+    self
+  }
+
   /// Stamp the global document ordinal `doc` onto every `mebx` sample at or
   /// after `start` — the records decoded by ONE `process_mebx` invocation (one
   /// timed sample) since the walker took its [`Self::mebx_sample_count`]

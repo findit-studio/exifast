@@ -270,12 +270,20 @@ impl TrailerKind {
     }
   }
 
-  /// `true` iff this is the Insta360 trailer (the only kind exifast extracts —
-  /// the [`identify_trailers`] consumer dispatches on this; LigoGPS/MIE are only
-  /// stepped past, so they get no dedicated predicate, matched via `==` instead).
+  /// `true` iff this is the Insta360 trailer. The [`identify_trailers`] consumer
+  /// dispatches on this to drive `ProcessInsta360`.
   #[inline(always)]
   pub(crate) const fn is_insta360(&self) -> bool {
     matches!(self, Self::Insta360)
+  }
+
+  /// `true` iff this is the LigoGPS trailer. The [`identify_trailers`] consumer
+  /// dispatches on this to drive
+  /// [`crate::formats::ligogps::process_trailer`] (QuickTime.pm:10658-10668).
+  /// MIE is still only stepped past (no dedicated predicate, matched via `==`).
+  #[inline(always)]
+  pub(crate) const fn is_ligogps(&self) -> bool {
+    matches!(self, Self::LigoGPS)
   }
 }
 
@@ -1171,19 +1179,38 @@ impl Insta360FullDecode {
 /// (last record first); a void/skipped GPS row does NOT bump it, and the
 /// `0x101` identity INHERITS the current (sticky) value
 /// (QuickTimeStream.pl:3427-3436 has no `FoundSomething`).
+///
+/// `doc_base` is the SHARED `$$et{DOC_COUNT}` value at the moment
+/// `ProcessInsta360` runs in `ProcessMOV`'s trailer loop (after every moov-timed
+/// + `udta`-LigoGPS + earlier-chain trailer source), so each surfaced row gets
+/// `Doc<doc_base + N>` — continuing the ONE global sequence (`$$et{DOC_NUM} =
+/// ++$$et{DOC_COUNT}`). For an Insta360-only file `doc_base == 0` and the first
+/// surfaced row is `Doc1` (byte-identical to the pre-unification local counter).
+/// The STICKY current doc (`$$et{DOC_NUM}`, which the `0x101` identity + the
+/// warnings inherit) starts UNDEF (rendered Main / `0`) at trailer start — it is
+/// NOT seeded from `doc_base`: a warning/identity BEFORE any timed row stays Main
+/// even when `doc_base > 0` (ExifTool `delete`s `$$et{DOC_NUM}` between subs, so
+/// it is undef until the first row's `FoundSomething`).
 #[must_use]
-pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
+pub fn decode_all_records(raw: &[u8], trail_end: usize, doc_base: u32) -> Insta360FullDecode {
   let mut out = Insta360FullDecode::default();
-  // The GLOBAL `DOC_NUM`: `++` once per surfaced timed row; starts at 0, so
-  // the first surfaced row becomes `Doc1`.
-  let mut doc_count: u32 = 0;
+  // The SHARED global running count (`$$et{DOC_COUNT}`): `++` once per surfaced
+  // timed row; starts at `doc_base`, so the first surfaced row becomes
+  // `Doc<doc_base + 1>`.
+  let mut doc_count: u32 = doc_base;
+  // The STICKY current doc (`$$et{DOC_NUM}`) the identity + warnings inherit;
+  // UNDEF (Main → `0`) until the first surfaced row, then the last row's global
+  // doc. Tracked SEPARATELY from `doc_count` so a warning/identity before any row
+  // stays Main even when `doc_base > 0` (ExifTool starts each sub with `$$et
+  // {DOC_NUM}` deleted).
+  let mut sticky_doc: u32 = 0;
 
   let mut visit = |rec: RecordView<'_>| -> core::ops::ControlFlow<()> {
     if rec.accel_capped {
       // QuickTimeStream.pl:3347-3352 — the once-only `%insvLimit` warning,
       // raised before this record's row loop, so it rides the sticky DOC_NUM.
       out.warnings.push((
-        doc_count,
+        sticky_doc,
         SmolStr::new(
           "Insta360 accelerometer data is huge. Processing only the first 20000 records",
         ),
@@ -1196,7 +1223,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
     // `Insta360` `Warning`, priority-0 first-wins) under the sticky DOC_NUM.
     if rec.non_multiple {
       out.warnings.push((
-        doc_count,
+        sticky_doc,
         SmolStr::from(alloc::format!(
           "Unexpected Insta360 record 0x{:x} length",
           rec.id
@@ -1211,7 +1238,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
           // Sticky DOC_NUM: the identity rides whatever the last surfaced
           // timed row left the counter at (0 ⇒ flat/Main). Bundled emits at
           // most one 0x101 per trailer — keep the FIRST.
-          id_dec.set_doc(Some(doc_count));
+          id_dec.set_doc(Some(sticky_doc));
           if out.identity.is_none() {
             out.identity = Some(id_dec);
           }
@@ -1233,6 +1260,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
           while let Some(slot) = rec.body.get(p..p + dlen) {
             if let Some(mut s) = decode_accel_row(slot, dlen) {
               doc_count += 1;
+              sticky_doc = doc_count;
               s.set_doc(Some(doc_count));
               out.accel.push(s);
             }
@@ -1248,6 +1276,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
         while let Some(slot) = rec.body.get(p..p + dlen) {
           if let Some(mut s) = decode_exposure_row(slot) {
             doc_count += 1;
+            sticky_doc = doc_count;
             s.set_doc(Some(doc_count));
             out.exposure.push(s);
           }
@@ -1261,6 +1290,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
         while let Some(slot) = rec.body.get(p..p + dlen) {
           if let Some(mut s) = decode_videotime_row(slot) {
             doc_count += 1;
+            sticky_doc = doc_count;
             s.set_doc(Some(doc_count));
             out.videotime.push(s);
           }
@@ -1280,6 +1310,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
               // `FoundSomething` (the `++$$et{DOC_NUM}`) runs only then; a void
               // ('V') row is `next`-skipped and does NOT advance the counter.
               doc_count += 1;
+              sticky_doc = doc_count;
               s.set_doc(Some(doc_count));
               out.gps.push(s);
             }
@@ -1287,7 +1318,7 @@ pub fn decode_all_records(raw: &[u8], trail_end: usize) -> Insta360FullDecode {
             Err(w) => {
               // QuickTimeStream.pl:3408 — raised BEFORE this row's DOC_NUM bump,
               // so it rides the sticky doc (the last surfaced row's, or 0).
-              out.warnings.push((doc_count, SmolStr::new(w)));
+              out.warnings.push((sticky_doc, SmolStr::new(w)));
               // QuickTimeStream.pl:3409 `last;` — stop walking this record's
               // remaining rows on a format-warning. The outer record-loop
               // continues with the next record.
@@ -1441,6 +1472,32 @@ where
   };
 
   let _ = walk_records(raw, trail_end, &mut visit);
+}
+
+/// Count the SURFACED timed rows of an Insta360 trailer — exactly the number of
+/// `$$et{DOC_NUM} = ++$$et{DOC_COUNT}` bumps `ProcessInsta360` performs
+/// (QuickTimeStream.pl:3374/3388/3394/3412): one per emitted `0x300`/`0x400`/
+/// `0x600`/`0x700`-'A' row. The `0x101` identity + every decode-warning are NOT
+/// counted (they ride the sticky doc, no `FoundSomething`).
+///
+/// Run at PARSE time, in `ProcessMOV`'s trailer phase, to advance the SHARED
+/// global counter past the Insta360 doc range so any LATER chain trailer
+/// (LigoGPS/MIE) takes the next ordinals. Reuses [`stream_records`] — the same
+/// surfacing walk as [`decode_all_records`] — so the count is byte-identical to
+/// the rows the `-ee` decode later emits, but allocation-free (it stores no
+/// row): a crafted huge `0x600`/`0x300` trailer cannot force O(rows) memory here.
+/// Saturating, so a hostile row count cannot wrap.
+#[must_use]
+pub fn count_surfaced_rows(raw: &[u8], trail_end: usize) -> u32 {
+  let mut count: u32 = 0;
+  stream_records(raw, trail_end, &mut |item| match item {
+    Insta360StreamItem::Gps(_)
+    | Insta360StreamItem::Exposure(_)
+    | Insta360StreamItem::VideoTime(_)
+    | Insta360StreamItem::Accel(_) => count = count.saturating_add(1),
+    Insta360StreamItem::Identity(_) | Insta360StreamItem::Warning(_) => {}
+  });
+  count
 }
 
 // ===========================================================================
@@ -1914,7 +1971,7 @@ mod tests {
     let file = build_file(b"PREFIX-BYTES", &[(ID_ACCELEROMETER, body)]);
     // The 0x300 cap lives in the shared walk and is exercised by the FULL
     // (`-ee`) decode — the light scan_trailer skips 0x300 entirely.
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(
       full.accel().len(),
       20000,
@@ -1947,7 +2004,7 @@ mod tests {
       body.extend_from_slice(&accel56_row(i, [0.1, 0.2, 9.8], [0.01, -0.02, 0.03]));
     }
     let file = build_file(b"PFX", &[(ID_ACCELEROMETER, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(
       full.accel().len(),
       20000,
@@ -1971,7 +2028,7 @@ mod tests {
     assert!(out.first_gps().is_none());
     assert!(out.first_exposure().is_none());
     // The full (`-ee`) decode over the same borrowed table is also clean.
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(full.identity().is_none());
     assert!(full.gps().is_empty());
     assert!(full.accel().is_empty());
@@ -2012,7 +2069,7 @@ mod tests {
         (ID_DIRECTORY_TABLE, dir_entry),
       ],
     );
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(
       full.videotime().len(),
       1,
@@ -2183,7 +2240,7 @@ mod tests {
     assert_eq!(first.timestamp_ms(), Some(1000));
     assert!((first.exposure_time_s().unwrap() - 0.008).abs() < 1e-12);
     // The FULL (`-ee`) decode materializes every row.
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     let samples = full.exposure();
     assert_eq!(samples.len(), 2);
     assert_eq!(samples[0].timestamp_ms(), Some(1000));
@@ -2214,7 +2271,7 @@ mod tests {
     assert!(out.first_gps().is_none());
     assert!(out.first_exposure().is_none());
     // The deferred `-ee` decode over the same bytes yields NOTHING.
-    let full = decode_all_records(&buf, buf.len());
+    let full = decode_all_records(&buf, buf.len(), 0);
     assert!(full.gps().is_empty());
     assert!(full.exposure().is_empty());
     assert!(full.videotime().is_empty());
@@ -2271,7 +2328,7 @@ mod tests {
         (ID_GPS, gps),
       ],
     );
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
 
     // GPS walked first: row1 -> Doc1, row2 -> Doc2 (void -> no doc).
     assert_eq!(full.gps().len(), 2);
@@ -2296,6 +2353,58 @@ mod tests {
   }
 
   #[test]
+  fn decode_all_records_continues_shared_counter_from_doc_base() {
+    // The Insta360 trailer draws its `Doc<N>` from the SHARED global counter, NOT
+    // a local 0-based one. With `doc_base = 5` (5 docs already consumed by
+    // moov-timed + earlier sources) the FIRST surfaced row is `Doc6`
+    // (`++$$et{DOC_COUNT}`), continuing the ONE global sequence.
+    let gps = {
+      let mut g = Vec::new();
+      g.extend_from_slice(&gps_row(
+        1717250400, 0, b'A', 45.0, b'N', 8.0, b'E', 10.0, 90.0, 200.0,
+      ));
+      g.extend_from_slice(&gps_row(
+        1717250401, 0, b'A', 46.0, b'N', 9.0, b'E', 11.0, 91.0, 201.0,
+      ));
+      g
+    };
+    let exposure = {
+      let mut e = exposure_row(1000, 0.008);
+      e.extend_from_slice(&exposure_row(1001, 0.009));
+      e
+    };
+    // Identity is LAST in the file ⇒ walked FIRST (last-record-first) ⇒ before any
+    // timed row ⇒ inherits the sticky doc, which is STILL Main (0), NOT `doc_base`.
+    let identity = identity_body(&[(TAG_MODEL, b"Insta360 X3")]);
+    let file = build_file(
+      b"prefix-bytes",
+      &[
+        (ID_GPS, gps),
+        (ID_EXPOSURE, exposure),
+        (ID_IDENTITY, identity),
+      ],
+    );
+
+    let full = decode_all_records(&file, file.len(), 5);
+    // The walk is LAST-record-first, so the file order [GPS, EXPOSURE, IDENTITY]
+    // is visited IDENTITY → EXPOSURE → GPS. The identity (before any timed row)
+    // rides sticky Main (0); then EXPOSURE rows take Doc6/Doc7, GPS rows Doc8/Doc9.
+    assert_eq!(full.exposure().len(), 2);
+    assert_eq!(full.exposure()[0].doc(), Some(6));
+    assert_eq!(full.exposure()[1].doc(), Some(7));
+    assert_eq!(full.gps().len(), 2);
+    assert_eq!(full.gps()[0].doc(), Some(8));
+    assert_eq!(full.gps()[1].doc(), Some(9));
+    // The identity walked BEFORE any timed row ⇒ sticky doc Main (0), NOT 5: a
+    // record before the first `FoundSomething` rides undef `$$et{DOC_NUM}`.
+    assert_eq!(full.identity().unwrap().doc(), Some(0));
+
+    // `count_surfaced_rows` (the parse-time advance) == the 4 surfaced rows,
+    // INDEPENDENT of `doc_base` (it counts bumps, not absolute ordinals).
+    assert_eq!(count_surfaced_rows(&file, file.len()), 4);
+  }
+
+  #[test]
   fn non_multiple_0x400_decodes_no_rows_and_warns() {
     // QuickTimeStream.pl:3355-3357: a 0x400 (stride 16) record whose length is
     // NOT a multiple of 16 emits ZERO rows (the `elsif` decode is skipped) +
@@ -2304,7 +2413,7 @@ mod tests {
     let mut body = exposure_row(1000, 0.008);
     body.push(0xff); // 17 bytes total — not a multiple of 16
     let file = build_file(b"PFX", &[(ID_EXPOSURE, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(
       full.exposure().is_empty(),
       "a non-multiple 0x400 must emit no exposure rows"
@@ -2322,7 +2431,7 @@ mod tests {
     let mut body = videotime_row(1000);
     body.push(0xff); // 9 bytes total — not a multiple of 8
     let file = build_file(b"PFX", &[(ID_VIDEO_TIMESTAMP, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(
       full.videotime().is_empty(),
       "a non-multiple 0x600 must emit no videotime rows"
@@ -2340,7 +2449,7 @@ mod tests {
     let mut body = accel20_row(2000, [32768, 33768, 31768, 32868, 32668, 41768]);
     body.push(0xff); // 21 bytes — not a multiple of 20 (probed stride)
     let file = build_file(b"PFX", &[(ID_ACCELEROMETER, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(
       full.accel().is_empty(),
       "a non-multiple 0x300 must emit no accel rows"
@@ -2368,7 +2477,7 @@ mod tests {
     // 0x300 record is reached with the terminal block still after it → ≥ 20
     // file bytes from its body start to EOF → probe succeeds).
     let file = build_file(b"PFX", &[(ID_ACCELEROMETER, body), (ID_GPS, gps)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(
       full.accel().is_empty(),
       "a non-multiple 0x300 emits no rows"
@@ -2410,7 +2519,7 @@ mod tests {
     // pinned at the `accel_stride` unit level instead.
     let body = vec![0u8; 10];
     let file = build_file(b"PFX", &[(ID_ACCELEROMETER, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert!(full.accel().is_empty());
     assert_eq!(
       full.warnings(),
@@ -2429,7 +2538,7 @@ mod tests {
     );
     body.extend_from_slice(&[0u8; 5]); // 58 bytes — not a multiple of 53
     let file = build_file(b"PFX", &[(ID_GPS, body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(
       full.gps().len(),
       1,
@@ -2460,7 +2569,7 @@ mod tests {
     // (the flat/Main document case).
     let id_body = identity_body(&[(TAG_MODEL, b"Insta360 X3")]);
     let file = build_file(b"prefix", &[(ID_IDENTITY, id_body)]);
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(full.identity().unwrap().doc(), Some(0));
   }
 
@@ -2499,7 +2608,7 @@ mod tests {
     assert!(out.trailer().is_some());
 
     // (b) The full decode over the same bytes yields all 100000 videotime rows.
-    let full = decode_all_records(&file, file.len());
+    let full = decode_all_records(&file, file.len(), 0);
     assert_eq!(full.videotime().len(), ROWS as usize);
     assert_eq!(full.gps().len(), 1);
   }

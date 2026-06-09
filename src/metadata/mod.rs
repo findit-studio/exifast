@@ -28,6 +28,8 @@ pub(crate) mod crw;
 mod domain;
 mod gopro;
 mod insta360;
+mod ligogps;
+mod parrot;
 #[cfg(feature = "png")]
 pub(crate) mod png;
 pub mod project;
@@ -62,6 +64,13 @@ pub use gopro::{
 pub use insta360::{
   Insta360AccelSample, Insta360ExposureSample, Insta360GpsSample, Insta360Identity, Insta360Meta,
   Insta360VideoTimeSample,
+};
+pub(crate) use ligogps::LigoSource;
+pub use ligogps::{LigoGpsMeta, LigoGpsSample};
+pub use parrot::{
+  ParrotAutomationAnimation, ParrotAutomationSample, ParrotFlightSample, ParrotFlyingState,
+  ParrotFollowMeAnimation, ParrotFollowMeSample, ParrotGpsSample, ParrotMeta, ParrotPilotingMode,
+  ParrotRecordVersion,
 };
 #[cfg(feature = "png")]
 pub use png::{

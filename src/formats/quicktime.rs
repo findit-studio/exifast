@@ -55,10 +55,13 @@
 use crate::{
   datetime::{convert_datetime, convert_duration, convert_unix_time},
   format_parser::{FormatParser, parser_sealed},
-  formats::{insta360 as insta360_fmt, quicktime_freegps, quicktime_stream},
+  formats::{
+    insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
+  },
   metadata::{
     CammMeta, CanonCtmdMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, Insta360Meta,
-    MediaTrack, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta, SonyRtmdMeta,
+    LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
+    SonyRtmdMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -2025,6 +2028,45 @@ fn decode_moov_udta_meta(
   );
 }
 
+/// Mirror ExifTool's LigoGPS `udta` SubDirectory Conditions in the
+/// `%QuickTime::Main` (TOP-LEVEL) `udta` table (QuickTime.pm:826-846): match the
+/// WHOLE udta payload (`$$valPt`) against the `LigoJSON` and `GKUData` Conditions
+/// and dispatch the matching decoder into the shared `ligo` accumulator. Returns
+/// `true` when a Condition matched (the udta is consumed — these arms are
+/// mutually exclusive with each other, like ExifTool's first-match Condition
+/// list). Called ONLY from the top-level `udta` arm: the `moov/udta`
+/// (`%QuickTime::Movie`) UserData walk does NOT host these Conditions.
+///
+///   - `LigoJSON` (QuickTime.pm:835 `$$valPt =~ /^LIGOGPSINFO \{/`) →
+///     `Image::ExifTool::LigoGPS::ProcessLigoJSON`.
+///   - `GKUData` (QuickTime.pm:842 `$$valPt =~ /^.{8}__V35AX_QVDATA__/`) →
+///     `Image::ExifTool::LigoGPS::ProcessGKU`.
+///
+/// `KenwoodData` (QuickTime.pm:827) and the `FLIRData` default arm
+/// (QuickTime.pm:847) are out of scope here (Kenwood timed GPS is decoded via
+/// the freeGPS stream path; FLIR UserData is unported).
+fn dispatch_udta_ligogps(payload: &[u8], ligo: &mut crate::metadata::LigoGpsMeta) -> bool {
+  use crate::formats::ligogps as ligogps_fmt;
+  // QuickTime.pm:835 `^LIGOGPSINFO \{`.
+  if payload.get(..ligogps_fmt::HDR_LIGOGPSINFO_JSON.len())
+    == Some(ligogps_fmt::HDR_LIGOGPSINFO_JSON.as_slice())
+  {
+    ligogps_fmt::process_ligogps_json(payload, ligo);
+    return true;
+  }
+  // QuickTime.pm:842 `^.{8}__V35AX_QVDATA__` — the marker sits at offset 8 (the
+  // leading 8 bytes carry the LE u32 offset that `ProcessGKU` reads). The
+  // Condition has no `/s`, so `.` excludes newline: each of the first 8 bytes
+  // must be non-`\n` for the regex to match (faithful to the un-`/s` `.{8}`).
+  if payload.get(8..8 + ligogps_fmt::GKU_MARKER.len()) == Some(ligogps_fmt::GKU_MARKER.as_slice())
+    && payload.get(..8).is_some_and(|h| !h.contains(&b'\n'))
+  {
+    ligogps_fmt::process_gku(payload, ligo);
+    return true;
+  }
+  false
+}
+
 /// Walk one `udta` atom payload, decoding the camera/GPS/capture-identity
 /// atoms into `ud` (QuickTime.pm:1585-1900). Two atom families are handled:
 ///
@@ -2042,6 +2084,11 @@ fn decode_moov_udta_meta(
 /// layer resolves duplicates (see
 /// [`crate::metadata::QuickTimeUserData`]). A contained malformed atom surfaces
 /// a warning through `w`.
+///
+/// This is the `%QuickTime::Movie` `moov/udta` UserData walk (QuickTime.pm:1214),
+/// which does NOT host the LigoGPS Conditions — those live in the `%QuickTime::Main`
+/// (top-level) `udta` (QuickTime.pm:834-846) and are dispatched there via
+/// [`dispatch_udta_ligogps`], not here.
 fn walk_udta(
   depth: u32,
   payload: &[u8],
@@ -3339,6 +3386,25 @@ pub struct Meta<'a> {
   /// a borrow of the input bytes (`'a`); the heavy timed-row decode is
   /// deferred to `-ee` emit time (lazy-decode DoS guard).
   insta360: Insta360Meta<'a>,
+  /// **SP4** — Parrot drone `mett` timed-metadata (GPS + flight
+  /// telemetry). Decoded through the `mett` MetaFormat dispatch in
+  /// [`quicktime_stream`]. Empty ([`ParrotMeta::is_empty`]) for a
+  /// non-Parrot video. Faithful port of
+  /// `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) plus
+  /// the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
+  /// `V3`/`TimeStamp` (Parrot.pm:86-551).
+  parrot: ParrotMeta,
+  /// **SP4** — LigoGPS dashcam vendor GPS records. Decoded via TWO
+  /// faithful entry points: (a) the `&&&& `-prefixed trailer at file
+  /// EOF (QuickTime.pm:9906-9907 + 10658-10668) — populated by
+  /// [`ligogps_fmt::scan_trailer`]; (b) the freeGPS-embedded sample
+  /// dispatch (QuickTimeStream.pl:1843-1888) — populated by
+  /// [`quicktime_freegps::process_free_gps`] which calls
+  /// [`ligogps_fmt::process_ligogps_with_scale`] on a `LIGOGPSINFO\0`
+  /// fingerprint hit. Empty ([`LigoGpsMeta::is_empty`]) for a non-
+  /// LigoGPS file. Faithful port of `Image::ExifTool::LigoGPS`
+  /// (LigoGPS.pm:1-431).
+  ligogps: LigoGpsMeta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3464,6 +3530,36 @@ impl Meta<'_> {
     &self.insta360
   }
 
+  /// **SP4** — Parrot drone `mett` timed metadata. [`ParrotMeta::is_empty`]
+  /// for a non-Parrot video (or one whose `mett` track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::Parrot::Process_mett`
+  /// (Parrot.pm:791-854) plus the per-version binary tables
+  /// `Image::ExifTool::Parrot::V1`/`V2`/`V3` (Parrot.pm:86-539).
+  /// Populated by the `mett` MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn parrot(&self) -> &ParrotMeta {
+    &self.parrot
+  }
+
+  /// **SP4** — LigoGPS dashcam vendor GPS records.
+  /// [`LigoGpsMeta::is_empty`] for a non-LigoGPS file (or one whose
+  /// trailer / embedded fingerprint is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::LigoGPS` (LigoGPS.pm:1-431).
+  /// Reached through TWO paths:
+  ///  - the `&&&& `-prefixed trailer at file EOF (QuickTime.pm:9906-9907 +
+  ///    :10658-10668) — populated by [`ligogps_fmt::scan_trailer`];
+  ///  - the freeGPS-embedded sample dispatch (QuickTimeStream.pl:1843-
+  ///    1888) — populated by [`quicktime_freegps::process_free_gps`]
+  ///    when it detects `LIGOGPSINFO\0` at offset 16/48/80.
+  #[must_use]
+  #[inline(always)]
+  pub const fn ligogps(&self) -> &LigoGpsMeta {
+    &self.ligogps
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3502,6 +3598,12 @@ impl Meta<'_> {
     // source already populated GPS); fills only the GPS domain (CAMM carries
     // no camera-identity record).
     self.android_camm.project_into(&mut md);
+    // **SP4 — Parrot mett** on-device GNSS (drone hardware GPS) — same
+    // fidelity tier as GoPro / CAMM; ordered after CAMM by implementation
+    // arrival (a single file is produced by exactly one body so the
+    // tie-break is hypothetical). Sits ABOVE the phone-paired Sony rtmd /
+    // generic SP3 timed-metadata scan.
+    self.parrot.project_into(&mut md);
     // **SP4 — Sony rtmd** phone-paired GPS (Imaging Edge Mobile) + camera
     // identity/capture. THIRD-HIGHEST tier — below GoPro / CAMM on-device
     // hardware, above the generic SP3 timed-metadata scan. Set-once per domain
@@ -3534,6 +3636,13 @@ impl Meta<'_> {
         .update_timestamp(fix.date_time().map(str::to_string));
       md.set_gps(gps);
     }
+    // LigoGPS sits at the SAME tier as the SP3 stream — dashcam vendor
+    // GPS (best-effort brute-force-scan) projects AFTER everything
+    // else. The freeGPS embedded path already routes its decoded
+    // LigoGPS samples through this same field (see
+    // [`quicktime_freegps::process_free_gps`]), so this projection
+    // covers both the trailer + embedded sources.
+    self.ligogps.project_into(&mut md);
     md
   }
 
@@ -3773,6 +3882,24 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // scan. `trailers` is HEAD-FIRST (earliest trailer first).
   let trailers = insta360_fmt::identify_trailers(data);
   let mut insta360_meta = Insta360Meta::new();
+  // **SP4** — the LigoGPS accumulator. Populated (in `ProcessMOV` walk order) by
+  // the moov-timed `gps `-box GPSType-5 path (inside `extract_stream`), THEN the
+  // deferred top-level `udta`-LigoGPS (appended after `extract_stream`), THEN the
+  // file-end `&&&&` trailer (the trailer phase, off the SAME `identify_trailers`
+  // discovery), THEN the `mdat` freeGPS-embedded `LIGOGPSINFO\0` fingerprint
+  // (`scan_media_data`, LAST). Declared here so each phase can fill it in order;
+  // most files leave it empty (`LigoGpsMeta::is_empty()`).
+  let mut ligogps_meta = LigoGpsMeta::new();
+  // The embedded timed-metadata accumulator (`mebx`/`gps0`/`gsen`/camm/freeGPS/
+  // …). Created HERE — BEFORE the LigoGPS `udta`/trailer/freeGPS sources — so it
+  // owns the single GLOBAL `Doc<N>` counter (`$$et{DOC_COUNT}`) that EVERY
+  // embedded source shares: the LigoGPS sources decode into the SEPARATE
+  // `ligogps_meta` yet allocate their per-record `Doc<N>` off THIS counter (via
+  // [`LigoGpsMeta::stamp_doc_from`] + [`QuickTimeStreamMeta::doc_counter`]),
+  // continuing the same global sequence as the in-`stream` sources — so a mixed
+  // file (LigoGPS + camm/mebx) gets non-colliding, monotonically-increasing doc
+  // ordinals across all of them (LigoGPS.pm:243/:354; #214 cross-source rule).
+  let mut stream = QuickTimeStreamMeta::new();
   // The HEAD (earliest) trailer drives BOTH the box-walk stop and the positional
   // warning (QuickTime.pm:10599-10600 use `$$trailer[1]`/`[0]`/`[2]` of the
   // linked-list head). Record its `(name, start, len)` for the always-on
@@ -3803,31 +3930,29 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // trailer-less file `box_region_end == data.len()`.
   let scan_end = box_region_end;
   let scan_data: &[u8] = data.get(..scan_end).unwrap_or(data);
-  // EXTRACT the Insta360 trailer only when the box walk did NOT consume it
-  // (`$lastPos <= $$trailer[1]`, the negation of QuickTime.pm:10656's
-  // `next if $lastPos > $$trailer[1]`). When an atom SPANNED the trailer the
-  // reference still emits the positional warning (via `head_trailer` above, then
-  // suppressed by the box-walk's own earlier `ExifTool:Warning` under
-  // priority-0 first-wins) but does NOT re-process the trailer as a trailer.
-  if let Some(entry) = trailers.iter().find(|e| e.kind().is_insta360()) {
-    let entry_signed_start = entry.start() as i64;
-    if (last_pos as i64) <= entry_signed_start {
-      // Scan the FIRST Insta360 trailer in the chain (its body ends at `start +
-      // len`, which == EOF for a standalone trailer at the file end). A bad-size
-      // trailer (`trailerLen > file size`) has a NEGATIVE signed start, so the
-      // gate is false and we skip extraction — the positional warning still
-      // fires off `head_trailer`, and bundled likewise decodes no records.
-      let entry_end = entry
-        .start()
-        .saturating_add(entry.len())
-        .min(data.len() as u64) as usize;
-      insta360_fmt::scan_trailer(data, entry_end, &mut insta360_meta);
-      insta360_meta.set_trail_end(entry_end);
-    }
-  }
+
+  // **SP4 — the TRAILER PHASE is DEFERRED** to AFTER `extract_stream` (the
+  // moov-timed sources) + the deferred `udta`-LigoGPS stamp, then the `mdat`
+  // `ScanMediaData` runs LAST. This mirrors ExifTool's single `ProcessMOV` order
+  // (QuickTime.pm:10654-10681): the atom walk's moov-timed metadata + top-level
+  // `udta` FIRST, THEN the trailer linked-list loop (`for (; $trailer; $trailer =
+  // $$trailer[3])`, Insta360 + LigoGPS + MIE in CHAIN order), THEN
+  // `ScanMediaData`. So NEITHER the Insta360 NOR the LigoGPS trailer is processed
+  // here — both happen in the `process_trailers` block below `extract_stream`,
+  // each drawing its `Doc<N>` from the ONE shared counter. The box-walk-consumed
+  // gate (`$lastPos <= $$trailer[1]`) is applied there too.
 
   // Pass 1: ftyp + every moov's mvhd (last-wins TimeScale) + mdat.
   let mut qt = QuickTimeMeta::new();
+  // **SP4 / Finding 3** — the top-level `udta`-LigoGPS (LigoJSON/GKU) records are
+  // DECODED here in Pass 1 (their atom-walk position) but their `Doc<N>` stamp is
+  // DEFERRED: ExifTool's single `ProcessMOV` walk emits the moov-timed metadata
+  // BEFORE a top-level `udta` that follows `moov` in file order, so the udta
+  // records must take the HIGHER `Doc<N>` ordinals. Decode into this TEMP holder
+  // now; stamp it off the shared counter AFTER `extract_stream` and APPEND to
+  // `ligogps_meta` then (so its samples land after the moov-timed LigoGPS in both
+  // doc order AND append order). See the post-`extract_stream` stamp block.
+  let mut udta_ligo = LigoGpsMeta::new();
   // R6/F2: the FIRST `ProcessMOV` warning (`ExifTool:Warning` under `-j`).
   let mut warning: Option<String> = None;
   let mut pos = 0usize;
@@ -3853,6 +3978,23 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
             // UserData/Keys are populated before emission; the box walk runs at
             // the moov child depth (1, one level below the top-level walk).
             decode_moov_udta_meta(1, body, &mut qt, &mut warning);
+          }
+          // A TOP-LEVEL `udta` atom (`%QuickTime::Main` ⇒ QuickTime.pm:826-850).
+          // The Main table's `udta` is a Condition list whose first matching arm
+          // wins; the only in-scope arms are the LigoGPS GPS decoders
+          // (`LigoJSON` / `GKUData`). This is the genuinely-faithful home of the
+          // LigoGPS JSON `udta` path (the Main table — NOT the `moov/udta`
+          // UserData walk, which is `%QuickTime::Movie`). A non-LigoGPS root-udta
+          // is left to the (unported) FLIRData default arm.
+          b"udta" => {
+            // **SP4 / Finding 3** — the `udta` LigoGPS JSON/GKU records open a
+            // new GLOBAL `Doc<N>` each (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`,
+            // LigoGPS.pm:354). DECODE here (atom-walk position) into the TEMP
+            // `udta_ligo`, but DEFER the doc stamp + the merge into `ligogps_meta`
+            // until AFTER `extract_stream`: the moov-timed sources take the LOWER
+            // ordinals (ExifTool emits them before a top-level `udta` that follows
+            // `moov` in file order). See the post-`extract_stream` stamp block.
+            dispatch_udta_ligogps(body, &mut udta_ligo);
           }
           // The top-level `frea` atom (Kodak PixPro / Rexing — QuickTime.pm:610
           // `%QuickTime::Main` ⇒ `Image::ExifTool::Kodak::frea`). Decoded in
@@ -4057,6 +4199,13 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // sample). Additive to the existing per-format sample dispatch, exactly like
   // `sony_rtmd_meta`.
   let mut canon_ctmd_meta = CanonCtmdMeta::new();
+  // **SP4 — Parrot mett**: the `mett` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `parrot_meta` for each timed-
+  // metadata sample whose track carries Parrot drone telemetry. Faithful
+  // port of `Image::ExifTool::Parrot::Process_mett` (Parrot.pm:791-854) +
+  // the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
+  // `V3` (Parrot.pm:86-539).
+  let mut parrot_meta = ParrotMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
   // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
   // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
@@ -4092,15 +4241,95 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // freeGPS/GP6 scan) all live inside the QuickTime box hierarchy, which ends
   // at the Insta360 trailer's start — the trailer's bytes must not be scanned
   // for a freeGPS signature.
-  let (mut stream, found_embedded) = quicktime_stream::extract_stream(
+  // `stream` is created up-front (above) so it owns the shared global `Doc<N>`
+  // counter across the LigoGPS `udta`/trailer sources too — pass it in by `&mut`
+  // (the in-`stream` `mebx`/camm/gps0/freeGPS sources continue the counter the
+  // `udta` LigoGPS records already advanced).
+  let found_embedded = quicktime_stream::extract_stream(
     scan_data,
     create_date_raw,
     kodak_version,
+    &mut stream,
     &mut gopro_meta,
     &mut camm_meta,
     &mut sony_rtmd_meta,
     &mut canon_ctmd_meta,
+    &mut parrot_meta,
+    &mut ligogps_meta,
   );
+
+  // **SP4 / Finding 3** — stamp the DEFERRED top-level `udta`-LigoGPS records
+  // (decoded into `udta_ligo` during Pass 1) NOW, AFTER every moov-timed source
+  // bumped the shared counter — so the udta records take the HIGHER `Doc<N>`
+  // ordinals (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`, LigoGPS.pm:354), mirroring
+  // ExifTool's single `ProcessMOV` walk emitting moov-timed metadata BEFORE a
+  // top-level `udta` that follows `moov` in file order. Then APPEND `udta_ligo`
+  // to `ligogps_meta`, so the udta samples land AFTER the moov-timed LigoGPS in
+  // append order too. (Documented LIMITATION: a `udta` PRECEDING `moov` in file
+  // order would, in ExifTool, take the LOWER ordinals — this multi-phase port
+  // always stamps udta after moov-timed, a phase-boundary divergence only for
+  // that uncommon layout; within each phase the order is faithful.)
+  let next = udta_ligo.stamp_doc_from(0, stream.doc_counter());
+  stream.set_doc_counter(next);
+  ligogps_meta.append(udta_ligo);
+
+  // **SP4 — the TRAILER PHASE** (QuickTime.pm:10654-10677 `for (; $trailer;
+  // $trailer = $$trailer[3])`). ExifTool walks the trailer linked list in CHAIN
+  // order — `identify_trailers` returns it HEAD-first (earliest/closest-to-BOF
+  // trailer first), exactly ExifTool's `$trailer`→`[3]` direction (its backward
+  // EOF walk builds the list so the returned head is the earliest and `[3]` steps
+  // toward EOF). Each trailer draws its `Doc<N>` from the ONE shared counter
+  // (which already reflects every moov-timed + `udta`-LigoGPS bump), so the
+  // trailers take the HIGHEST, non-colliding ordinals — and they precede only the
+  // `mdat` `ScanMediaData` scan (run LAST, below). The box-walk-consumed gate
+  // (`next if $lastPos > $$trailer[1]`, QuickTime.pm:10656) is applied per
+  // trailer: a trailer an atom already spanned is skipped (a bad-size trailer's
+  // NEGATIVE signed start likewise fails the gate, matching bundled, which would
+  // fail its `Seek`/`Read`). MIE trailers are recognized by `identify_trailers`
+  // (to walk past them) but not processed (unported, like the pre-reorder code).
+  for entry in &trailers {
+    let entry_signed_start = entry.start() as i64;
+    if (last_pos as i64) > entry_signed_start {
+      continue; // QuickTime.pm:10656 — an atom already consumed this trailer.
+    }
+    if entry.kind().is_insta360() {
+      // **Insta360** (QuickTime.pm:10669-10673 → `ProcessInsta360`). Scan the
+      // trailer (its body ends at `start + len`, == EOF for a standalone trailer)
+      // and FOLD it onto the shared counter: record `doc_base` (the counter value
+      // NOW, so the deferred `-ee` row decode stamps `Doc<doc_base + N>`), then
+      // advance the counter by the trailer's surfaced-row count
+      // (`count_surfaced_rows`) so any LATER chain trailer continues after the
+      // Insta360 doc range. Only the FIRST Insta360 trailer is extracted
+      // (`set_*`/`set_raw` are set-once); a second one's rows would not surface.
+      let entry_end = entry
+        .start()
+        .saturating_add(entry.len())
+        .min(data.len() as u64) as usize;
+      if insta360_meta.raw().is_none() {
+        insta360_meta.set_doc_base(stream.doc_counter());
+        insta360_fmt::scan_trailer(data, entry_end, &mut insta360_meta);
+        insta360_meta.set_trail_end(entry_end);
+        let rows = insta360_fmt::count_surfaced_rows(data, entry_end);
+        stream.set_doc_counter(stream.doc_counter().saturating_add(rows));
+      }
+    } else if entry.kind().is_ligogps() {
+      // **LigoGPS** file-end trailer (QuickTime.pm:10658-10668 → `ProcessLigoGPS`).
+      // `identify_trailers` recognized the `&&&& ` magic at `buff[32..36]` (BE u32
+      // length at `buff[36..40]`); the `skip`-atom + `LIGOGPSINFO\0` decode is in
+      // [`ligogps_fmt::process_trailer`]. Watermark-then-stamp off the shared
+      // counter: each record opens a new GLOBAL `Doc<N>` (LigoGPS.pm:243), in
+      // append (walk) order.
+      let ligo_start = ligogps_meta.sample_count();
+      ligogps_fmt::process_trailer(
+        data,
+        entry.start() as usize,
+        entry.len() as usize,
+        &mut ligogps_meta,
+      );
+      let next = ligogps_meta.stamp_doc_from(ligo_start, stream.doc_counter());
+      stream.set_doc_counter(next);
+    }
+  }
 
   // **SP3.5** — `ProcessFreeGPS` + brute-force scan of `mdat`
   // (QuickTimeStream.pl `ScanMediaData`:3679-3789). Faithful: ExifTool only
@@ -4117,6 +4346,8 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // `Image::ExifTool::GoPro::ProcessGP6` which parses the contained GPMF
   // KLV. exifast routes both through this single call: `scan_media_data`
   // now appends to the freeGPS-style stream samples AND fills `gopro`.
+  // It ALSO fills `ligogps_meta` (declared up-front with the trailer scan)
+  // on a freeGPS-embedded `LIGOGPSINFO\0` fingerprint hit.
   if let (Some(off), Some(size)) = (qt.media_data_offset(), qt.media_data_size()) {
     let already = found_embedded;
     // `-ee`-only source (the brute-force `mdat` scan runs inside
@@ -4124,6 +4355,9 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     // onto exactly the fixes the scan appends so the emitter keeps them gated
     // (no no-`ee` fix, no file-level warning).
     let scan_start = stream.gps_sample_count();
+    // (A freeGPS Type-5 `LIGOGPSINFO\0` block decoded by the scan opens its own
+    // GLOBAL `Doc<N>` per record off the shared counter — stamped INSIDE
+    // `process_free_gps` at the record's walk position, Finding 3.)
     // Bounded to `scan_data` (the box hierarchy / mdat end at the Insta360
     // trailer's start): the brute-force freeGPS scan + its first-GP6 window
     // expansion must NOT reach into the trailer, which is `ProcessInsta360`'s
@@ -4131,6 +4365,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     // trailer-less file `scan_data == data`, so this is a no-op. Passing
     // `scan_data` clamps both the `size` window and the GP6 EOF-expansion to
     // `scan_end` regardless of the declared `size`.
+    //
+    // **SP4** — the `Some(&mut ligogps_meta)` accumulator routes a GPSType-5
+    // (`LIGOGPSINFO\0`) fingerprint hit inside a `freeGPS ` block to
+    // `LigoGPS::ProcessLigoGPS` (QuickTimeStream.pl:1843-1888); most files
+    // leave it empty.
     quicktime_freegps::scan_media_data(
       scan_data,
       off,
@@ -4140,6 +4379,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       already,
       &mut stream,
       &mut gopro_meta,
+      Some(&mut ligogps_meta),
     );
     stream.stamp_gps_origin_from(scan_start, crate::metadata::GpsOrigin::FreeGpsScan);
     // The brute-force `mdat` freeGPS scan runs LAST in ExifTool's walk
@@ -4148,6 +4388,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     // counter after every earlier source (P1 + cross-source #214).
     stream.stamp_gps_doc_from(scan_start);
   }
+
+  // (The Insta360 + LigoGPS file-end trailers were processed in the TRAILER PHASE
+  // above — BEFORE this `mdat` `ScanMediaData` scan, mirroring ExifTool's
+  // `ProcessMOV` order: the trailer loop THEN `ScanMediaData`,
+  // QuickTime.pm:10654-10681.)
 
   // **SP3** — embedded Exif/TIFF hop. ExifTool dispatches certain atoms
   // (`QVMI` Casio, `MVTG` FujiFilm, `uuid`-Exif) to
@@ -4159,10 +4404,11 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // inside the box hierarchy — never in the file-end trailer).
   let embedded_exif_deferred = detect_embedded_exif(scan_data);
 
-  // **SP4** — the Insta360 INSV/INSP trailer (`insta360_meta`) was already
-  // decoded up-front (before the box walk), because `IdentifyTrailers`
-  // (QuickTime.pm:9897-9926) bounds the atom walk to the trailer's start. See
-  // the `scan_trailer` call near Pass 1.
+  // **SP4** — the Insta360 INSV/INSP trailer (`insta360_meta`) was decoded in the
+  // TRAILER PHASE (above, after `extract_stream` + the deferred `udta`-LigoGPS
+  // stamp, before the `mdat` scan), folding its `Doc<N>` onto the shared counter
+  // in `identify_trailers` chain order — ExifTool's `ProcessMOV` trailer loop
+  // (QuickTime.pm:10654-10677).
 
   Some(Meta {
     qt,
@@ -4172,6 +4418,8 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     sony_rtmd: sony_rtmd_meta,
     canon_ctmd: canon_ctmd_meta,
     insta360: insta360_meta,
+    parrot: parrot_meta,
+    ligogps: ligogps_meta,
     embedded_exif_deferred,
     file_type,
     mime,
@@ -4352,13 +4600,36 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// QuickTime's diagnostics in the retired drain order: (a) the FIRST
   /// `ProcessMOV` warning (`Truncated '...' data` / `Invalid atom size`,
   /// QuickTime.pm:10242/10590) — the per-track truncation warnings ride the
-  /// TAG stream under `Track<N>:Warning`, not here (R6/F2); (b) the SP3
-  /// embedded-Exif-hop deferral notice when an Exif/TIFF block was detected
-  /// (`embedded_exif_deferred`, awaiting the Exif+GPS port). Byte-identical
-  /// net `TagMap`.
+  /// TAG stream under `Track<N>:Warning`, not here (R6/F2); (b) the LigoGPS
+  /// decoder warning (`Unrecognized data in LigoGPS trailer` /
+  /// `LIGOGPSINFO coordinates out of range` / `LIGOGPSINFO format error` / the
+  /// decrypt-failure deferral); (c) the SP3 embedded-Exif-hop deferral notice
+  /// when an Exif/TIFF block was detected (`embedded_exif_deferred`, awaiting
+  /// the Exif+GPS port).
+  ///
+  /// The LigoGPS warning is **document-level** (`ExifTool:Warning`), NOT a
+  /// group-scoped `LIGO:Warning`. ExifTool only sets `$$et{SET_GROUP1} = 'LIGO'`
+  /// AFTER the out-of-range / format-error returns: `ParseLigoGPS` raises both
+  /// `LIGOGPSINFO coordinates out of range` (LigoGPS.pm:254) and `LIGOGPSINFO
+  /// format error` (LigoGPS.pm:236) BEFORE the `SET_GROUP1='LIGO'` at
+  /// LigoGPS.pm:255, while `Unrecognized data in LigoGPS trailer`
+  /// (QuickTime.pm:10667) is raised in the `ProcessMOV` trailer loop with no
+  /// `SET_GROUP1` in effect. With `$$self{SET_GROUP1}` unset, `FoundTag`
+  /// (ExifTool.pm:9475 `$grps[1] or $grps[1] = $$self{SET_GROUP1}`) leaves the
+  /// `Warning` tag at the document level — contrast the LigoGPS *GPS tags*, which
+  /// ARE `LIGO`-grouped because they are `HandleTag`'d AFTER LigoGPS.pm:255 (the
+  /// camm/CTMD `Track<N>:Warning` ride does NOT apply — those decoders run inside
+  /// a `trak` whose `SET_GROUP1='Track<N>'` is active at the `Warn`). Pushed
+  /// AFTER the `ProcessMOV` warning so the priority-0 first-wins `Warning` slot
+  /// (LigoGPS warnings fire DURING extraction — the trailer loop / `ScanMediaData`
+  /// freeGPS pass — i.e. after the atom-walk `ProcessMOV` warning) keeps the
+  /// earlier-extracted document warning, matching ExifTool's file order.
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     let mut out = std::vec::Vec::new();
     if let Some(w) = self.warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    if let Some(w) = self.ligogps().warning() {
       out.push(crate::diagnostics::Diagnostic::warn(w));
     }
     if self.embedded_exif_deferred() {
@@ -5049,6 +5320,15 @@ impl crate::emit::Taggable for Meta<'_> {
         false,
       ));
     }
+
+    // ── SP4: LigoGPS dashcam GPS (Image::ExifTool::LigoGPS) ─────────────────
+    // The dashcam vendor GPS records (`ProcessLigoGPS` / `ProcessLigoJSON`,
+    // reached via the `&&&& ` file-end trailer OR a `freeGPS`-embedded
+    // `LIGOGPSINFO` sample) emit through the `%QuickTime::Stream` table under the
+    // family-1 `LIGO` group, one `Doc<N>` per record. `-ee`-gated. See
+    // [`emit_ligogps`] for the per-record order + per-tag PrintConv.
+    emit_ligogps(&self.ligogps, opts, print_conv, &mut tags);
+
     // The Apple `mebx` key/value pairs — ExifTool emits these per timed sample
     // under the enclosing `Track<N>` (family-1) at its `Doc<N>` (oracle:
     // `Track1:GPSCoordinates` / `Doc1:Track1:GPSCoordinates`), preceded by the
@@ -5764,6 +6044,13 @@ impl crate::emit::Taggable for Meta<'_> {
     // WAS_WARNED `[xN]` dedup), exactly like [`emit_camm_warnings`]. The
     // MINOR residue warning (`Warn(..., 1)`) carries the `[minor] ` prefix.
     emit_ctmd_warnings(self.canon_ctmd.warnings(), opts, &mut first_seen, &mut tags);
+
+    // ── SP4: Parrot drone `mett` (Image::ExifTool::Parrot) ─────────────────
+    // The per-sample GPS + flight telemetry decoded from a Parrot `mett` track
+    // (`Process_mett`, Parrot.pm:791-854) on the shared `-ee` `Doc<N>` /
+    // `Track<N>` axis — same machinery as the rtmd / CTMD arms above. See
+    // [`emit_parrot`] for the per-version offset order + per-tag PrintConv.
+    emit_parrot(&self.parrot, opts, print_conv, &mut tags);
 
     // ── SP4: Insta360 INSV/INSP trailer (ProcessInsta360) ──────────────────
     // The file-END trailer's tags (QuickTimeStream.pl:3252-3478) under the
@@ -7430,7 +7717,11 @@ fn emit_insta360<F: FnMut(&str, &str) -> bool>(
 
   // ── (2+3) the `-ee -G3` path — full decode + doc-sorted per-Doc emission ──
   // Inherently O(rows) = O(output) (one `Doc<N>` per row, matching ExifTool).
-  let full = insta360_fmt::decode_all_records(raw, trail_end);
+  // `doc_base` is the SHARED global counter value at the trailer-phase point
+  // `ProcessInsta360` ran (after moov-timed + `udta`-LigoGPS + earlier-chain
+  // trailers), so each row gets `Doc<doc_base + N>` — the ONE global sequence. `0`
+  // for an Insta360-only file (byte-identical to the pre-unification 0-based).
+  let full = insta360_fmt::decode_all_records(raw, trail_end, meta.doc_base());
 
   // Build the doc-ORDERED UNION of every timed record's tags as
   // `(doc, EmittedTag)` pairs (the per-sample formatting is the SHARED
@@ -7546,6 +7837,1003 @@ fn emit_camm_timing_only(
           TagValue::F64(secs)
         };
         tags.push(EmittedTag::new(group.clone(), name.into(), value, false));
+      }
+    }
+  }
+}
+
+/// `sprintf("%.3f m", $val)` PrintConv shared by the Parrot `GPSAltitude` /
+/// `AltitudeFromTakeOff` / `Elevation` tags (Parrot.pm:161 / :172 / :240 /
+/// :259 / :381 / :400) — fixed 3 decimals with a literal `" m"` suffix. `-n`
+/// emits the raw metres [`TagValue::F64`]. (Distinct from the `%QuickTime::Stream`
+/// altitude's `+ 0` numeric strip — Parrot keeps the trailing zeros.)
+#[cfg(feature = "alloc")]
+fn parrot_metres_value(val: f64, print_conv: bool) -> crate::value::TagValue {
+  use crate::value::TagValue;
+  if print_conv {
+    TagValue::Str(std::format!("{val:.3} m").into())
+  } else {
+    TagValue::F64(val)
+  }
+}
+
+/// The `"@a"` interpolation of a scaled `int16s[N]` / `int16u[N]` Parrot vector
+/// (`FrameView` / `FrameBaseView` / `DroneQuaternion` / `FOV`, Parrot.pm:119
+/// etc.) — the per-component f64 stringified via Perl's default number format
+/// (`%.15g`, [`crate::value::format_g`]) and space-joined. These columns carry
+/// NO PrintConv, so the value is the same in `-n` and `-j` (a string in both).
+#[cfg(feature = "alloc")]
+fn parrot_vec_value(components: &[f64]) -> crate::value::TagValue {
+  use crate::value::format_g;
+  let mut s = std::string::String::new();
+  for (i, &c) in components.iter().enumerate() {
+    if i != 0 {
+      s.push(' ');
+    }
+    s.push_str(&format_g(c, 15));
+  }
+  crate::value::TagValue::Str(s.into())
+}
+
+/// Parrot `FlyingState` PrintConv display (Parrot.pm:203-211 V1 / :328-338 V2 /
+/// :509-519 V3). V1 only defines keys 0..=5; V2 / V3 add 6..=8. A value with no
+/// table entry renders as the raw integer (ExifTool's PrintConv-hash miss).
+fn parrot_flying_state_display(
+  s: crate::metadata::ParrotFlyingState,
+  version: crate::metadata::ParrotRecordVersion,
+) -> std::string::String {
+  use crate::metadata::{ParrotFlyingState as F, ParrotRecordVersion as V};
+  let name = match s {
+    F::Landed => Some("Landed"),
+    F::TakingOff => Some("Taking Off"),
+    F::Hovering => Some("Hovering"),
+    F::Flying => Some("Flying"),
+    F::Landing => Some("Landing"),
+    F::Emergency => Some("Emergency"),
+    // 6..=8 exist only in the V2 / V3 PrintConv hash; a V1 record carrying one
+    // would miss the hash and render raw (faithful to the per-version table).
+    F::UserTakeoff if !matches!(version, V::V1) => Some("User Takeoff"),
+    F::MotorRamping if !matches!(version, V::V1) => Some("Motor Ramping"),
+    F::EmergencyLanding if !matches!(version, V::V1) => Some("Emergency Landing"),
+    _ => None,
+  };
+  match name {
+    Some(n) => n.into(),
+    None => std::format!("{}", s.as_u8()),
+  }
+}
+
+/// Parrot `PilotingMode` PrintConv display (Parrot.pm:221-227 V1 / :349-356 V2 /
+/// :530-537 V3). Key 3 is `"Follow Me"` for V1 but `"Follow Me / Tracking"` for
+/// V2 / V3 (same numeric value, wider description); keys 4..=5 exist only in
+/// V2 / V3. A miss renders the raw integer.
+fn parrot_piloting_mode_display(
+  s: crate::metadata::ParrotPilotingMode,
+  version: crate::metadata::ParrotRecordVersion,
+) -> std::string::String {
+  use crate::metadata::{ParrotPilotingMode as P, ParrotRecordVersion as V};
+  let v1 = matches!(version, V::V1);
+  let name = match s {
+    P::Manual => Some("Manual"),
+    P::ReturnHome => Some("Return Home"),
+    P::FlightPlan => Some("Flight Plan"),
+    P::FollowMe if v1 => Some("Follow Me"),
+    P::FollowMe => Some("Follow Me / Tracking"),
+    P::MagicCarpet if !v1 => Some("Magic Carpet"),
+    P::MoveTo if !v1 => Some("Move To"),
+    _ => None,
+  };
+  match name {
+    Some(n) => n.into(),
+    None => std::format!("{}", s.as_u8()),
+  }
+}
+
+/// Emit the Parrot drone `mett` timed-metadata samples (`Process_mett`,
+/// Parrot.pm:791-854; per-version binary tables `Parrot::V1`/`V2`/`V3` +
+/// `TimeStamp`) through the `tags()` engine. `ProcessSamples` opens ONE `Doc<N>`
+/// per `mett` SAMPLE and `Process_mett` `HandleTag`s every record (the P-record
+/// GPS + flight fields, then any concat'd E1 `TimeStamp`) under that one
+/// document, scoped to the enclosing `Track<N>` (family-1) — IDENTICAL group
+/// machinery to the `rtmd` / `CTMD` arms (the Parrot tables declare only
+/// `GROUPS => { 2 => ... }`, so `ProcessSamples`' `SET_GROUP1 = "Track$num"`
+/// supplies family-1 and family-0 is `QuickTime`). Gated on `-ee`; `-G3` emits
+/// each sample as its own `Doc<N>`, `-G1` collapses the doc axis to one
+/// `(Track<N>, name)` row FIRST-wins.
+///
+/// FULL mett parity: the typed [`ParrotMeta`] stores a [`ParrotGpsSample`] + a
+/// [`ParrotFlightSample`] per P-record and a [`ParrotFollowMeSample`] /
+/// [`ParrotAutomationSample`] per E2 / E3 extension (all stamped with the
+/// record's `Doc<N>` + `Track<N>`). This emits EVERY decoded field in the
+/// bundled per-version OFFSET order (ProcessBinaryData emits by ascending
+/// offset, so the rendered key order matches the oracle). The vectors are
+/// re-paired by their shared `Doc<N>` (one `mett` SAMPLE = one document — the
+/// P-record + any E1/E2/E3 concatenated after share it), so the fields of a
+/// sample interleave in offset / buffer order.
+///
+/// Emitted tags + PrintConv (VERBATIM from the V1/V2/V3 + E1/E2/E3 tables):
+///  - `ExposureTime` — `Exif::PrintExposureTime` (typed seconds, post-ValueConv).
+///  - `ISO` — plain integer.
+///  - `WifiRSSI` — `"$val dBm"`.
+///  - `Battery` — `"$val %"`.
+///  - `GPSLatitude` / `GPSLongitude` — `GPS::ToDMS` signed (N/S · E/W).
+///  - `GPSAltitude` / `AltitudeFromTakeOff` (V1) / `Elevation` (V2/V3) —
+///    `sprintf("%.3f m", $val)` ([`parrot_metres_value`]).
+///  - `GPSSatellites` — plain integer.
+///  - `GPSVelocityNorth`/`East`/`Down` (V2/V3) — raw number (ValueConv only).
+///  - `DistanceFromHome` (V1) / `AirSpeed` (V2/V3) — raw number (no PrintConv).
+///  - `DroneYaw`/`DronePitch`/`DroneRoll` (V1), `CameraPan`/`CameraTilt`
+///    (V1/V2) — rad→deg ValueConv, raw number (no PrintConv).
+///  - `SpeedX`/`SpeedY`/`SpeedZ` (V1) — raw number (`/0x100` ValueConv).
+///  - `FrameView` (all) / `DroneQuaternion` (V2/V3) / `FrameBaseView` (V3) /
+///    `FOV` (V3) — space-joined `"@a"` vector ([`parrot_vec_value`]).
+///  - `RedBalance`/`BlueBalance` (V3) — raw number (`/0x4000` ValueConv).
+///  - `LinkGoodput` (V3) — `"$val kbit/s"`; `LinkQuality` (V3) — plain integer.
+///  - `Binning`/`Animation` — `Mask => 0x80` flag, raw 0/1 (no PrintConv).
+///  - `FlyingState` / `PilotingMode` — the per-version PrintConv hash
+///    ([`parrot_flying_state_display`] / [`parrot_piloting_mode_display`]).
+///  - `TimeStamp` (E1 extension) — `$val / 1e6` seconds, raw number, emitted
+///    AFTER the P-record fields (the later `HandleTag` in buffer order).
+///  - `E2 FollowMe` — `GPSTargetLatitude`/`Longitude`/`Altitude` (raw, no
+///    PrintConv), `Follow-meMode` (BITMASK DecodeBits), `Follow-meAnimation`
+///    (PrintConv hash) ([`parrot_emit_follow_me`]).
+///  - `E3 Automation` — `GPSFramingLatitude` … / `GPSDestLatitude` … (raw),
+///    `AutomationAnimation` (PrintConv hash), `AutomationFlags` (BITMASK
+///    DecodeBits) ([`parrot_emit_automation`]).
+///
+/// The ARCore `application/arcore-*` subtables remain walk-and-discard (phone-
+/// side AR telemetry, not drone GPS — see the `parrot` module docs).
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_lines)]
+fn emit_parrot(
+  meta: &crate::metadata::ParrotMeta,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  if !opts.extract_embedded {
+    return;
+  }
+  let gps = meta.gps_samples();
+  let flight = meta.flight_samples();
+  let follow_me = meta.follow_me_samples();
+  let automation = meta.automation_samples();
+  if gps.is_empty() && flight.is_empty() && follow_me.is_empty() && automation.is_empty() {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+  // Distinct `Doc<N>` values across ALL FOUR record vectors, in ascending
+  // (= walk) order. Every production record carries a non-zero stamped doc;
+  // unit-built samples (doc == 0) all share document 0, which still emits as one
+  // group. `ProcessSamples` opens ONE `Doc<N>` per `mett` SAMPLE, so a P-record
+  // and any E1/E2/E3 extensions concatenated after it in the SAME sample share
+  // the doc — they re-pair here by `doc()`.
+  let mut docs: std::vec::Vec<u32> = std::vec::Vec::new();
+  for d in gps
+    .iter()
+    .map(|s| s.doc())
+    .chain(flight.iter().map(|s| s.doc()))
+    .chain(follow_me.iter().map(|s| s.doc()))
+    .chain(automation.iter().map(|s| s.doc()))
+  {
+    if !docs.contains(&d) {
+      docs.push(d);
+    }
+  }
+  docs.sort_unstable();
+  // `-G1` across-doc FIRST-wins collapse, keyed by `(family1, name)`.
+  let mut committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  for doc in docs {
+    // One P-record (+ its E1/E2/E3 extensions) per document in real Parrot
+    // files: the FIRST gps / flight / follow-me / automation sample stamped with
+    // this doc. (A degenerate multi-record sample re-pairs positionally by doc;
+    // the universal real-world shape is one of each.)
+    let g = gps.iter().find(|s| s.doc() == doc);
+    let f = flight.iter().find(|s| s.doc() == doc);
+    let e2 = follow_me.iter().find(|s| s.doc() == doc);
+    let e3 = automation.iter().find(|s| s.doc() == doc);
+    // The family-1 `Track<N>` + the sample-table timing come from whichever
+    // sample carries them (flight / E2 / E3 hold SampleTime/SampleDuration). A
+    // `0` (unstamped, unit-built) track index renders `Track1` like the other
+    // timed-sample emitters.
+    let track_index = f
+      .map(crate::metadata::ParrotFlightSample::track_index)
+      .or_else(|| g.map(crate::metadata::ParrotGpsSample::track_index))
+      .or_else(|| e2.map(crate::metadata::ParrotFollowMeSample::track_index))
+      .or_else(|| e3.map(crate::metadata::ParrotAutomationSample::track_index))
+      .filter(|&t| t != 0)
+      .unwrap_or(1);
+    let track = std::format!("Track{track_index}");
+    let group = if g3 {
+      Group::with_doc("QuickTime", track.as_str(), doc)
+    } else {
+      Group::new("QuickTime", track.as_str())
+    };
+    scratch.clear();
+    // SampleTime / SampleDuration (`ConvertDuration` at `-j`, raw seconds at
+    // `-n`) — emitted ONLY at `-G3` ahead of the payload (the `mett` track's
+    // `ProcessSamples` timing); at `-G1` the cross-kind min-doc precompute owns
+    // the single `Track<N>:SampleTime`, so do not duplicate it here. The timing
+    // comes from whichever record of this doc carries it.
+    let (sample_time, sample_duration) = f
+      .map(|f| (f.sample_time(), f.sample_duration()))
+      .or_else(|| e2.map(|s| (s.sample_time(), s.sample_duration())))
+      .or_else(|| e3.map(|s| (s.sample_time(), s.sample_duration())))
+      .unwrap_or((None, None));
+    if g3 {
+      for (val, name) in [
+        (sample_time, "SampleTime"),
+        (sample_duration, "SampleDuration"),
+      ] {
+        if let Some(secs) = val {
+          let value = if print_conv {
+            TagValue::Str(crate::datetime::convert_duration(secs).into())
+          } else {
+            TagValue::F64(secs)
+          };
+          scratch.push(EmittedTag::new(group.clone(), name.into(), value, false));
+        }
+      }
+    }
+    let version = f
+      .map(crate::metadata::ParrotFlightSample::version)
+      .or_else(|| g.map(crate::metadata::ParrotGpsSample::version))
+      .unwrap_or(crate::metadata::ParrotRecordVersion::V1);
+    parrot_emit_record(version, g, f, &group, print_conv, &mut scratch);
+    // E2 FollowMe / E3 Automation extensions of THIS sample (Parrot.pm:553-660),
+    // emitted AFTER the P-record + E1 fields (later records in buffer order).
+    if let Some(s) = e2 {
+      parrot_emit_follow_me(s, &group, print_conv, &mut scratch);
+    }
+    if let Some(s) = e3 {
+      parrot_emit_automation(s, &group, print_conv, &mut scratch);
+    }
+    if g3 {
+      tags.append(&mut scratch);
+    } else {
+      for tag in scratch.drain(..) {
+        let key = (
+          smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+          smol_str::SmolStr::new(tag.tag().name()),
+        );
+        if committed.contains(&key) {
+          continue;
+        }
+        committed.push(key);
+        tags.push(tag);
+      }
+    }
+  }
+}
+
+/// Emit ONE Parrot P-record's stored fields in the bundled per-version OFFSET
+/// order (the order `ProcessBinaryData` `HandleTag`s ascending offsets), then the
+/// E1 `TimeStamp` extension. Helper for [`emit_parrot`] — keeps the offset-order
+/// table in one place per version.
+#[cfg(feature = "alloc")]
+fn parrot_emit_record(
+  version: crate::metadata::ParrotRecordVersion,
+  g: Option<&crate::metadata::ParrotGpsSample>,
+  f: Option<&crate::metadata::ParrotFlightSample>,
+  group: &crate::value::Group,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::metadata::ParrotRecordVersion as V;
+  use crate::value::TagValue;
+  let push = |out: &mut std::vec::Vec<EmittedTag>, name: &str, value: TagValue| {
+    out.push(EmittedTag::new(group.clone(), name.into(), value, false));
+  };
+  // Shared field emitters (each guarded on the typed Option).
+  let emit_exposure = |out: &mut std::vec::Vec<EmittedTag>,
+                       f: &crate::metadata::ParrotFlightSample| {
+    if let Some(secs) = f.exposure_time_s() {
+      let v = if print_conv {
+        TagValue::Str(crate::exif::tables::print_exposure_time(secs).into())
+      } else {
+        TagValue::F64(secs)
+      };
+      push(out, "ExposureTime", v);
+    }
+  };
+  let emit_iso = |out: &mut std::vec::Vec<EmittedTag>, f: &crate::metadata::ParrotFlightSample| {
+    if let Some(iso) = f.iso() {
+      push(out, "ISO", TagValue::I64(i64::from(iso)));
+    }
+  };
+  let emit_wifi = |out: &mut std::vec::Vec<EmittedTag>, f: &crate::metadata::ParrotFlightSample| {
+    if let Some(rssi) = f.wifi_rssi_dbm() {
+      // PrintConv `"$val dBm"`; `-n` emits the raw int8s.
+      let v = if print_conv {
+        TagValue::Str(std::format!("{rssi} dBm").into())
+      } else {
+        TagValue::I64(i64::from(rssi))
+      };
+      push(out, "WifiRSSI", v);
+    }
+  };
+  let emit_battery = |out: &mut std::vec::Vec<EmittedTag>,
+                      f: &crate::metadata::ParrotFlightSample| {
+    if let Some(b) = f.battery_percent() {
+      // PrintConv `"$val %"`; `-n` emits the raw int.
+      let v = if print_conv {
+        TagValue::Str(std::format!("{b} %").into())
+      } else {
+        TagValue::U64(u64::from(b))
+      };
+      push(out, "Battery", v);
+    }
+  };
+  let emit_gps_core = |out: &mut std::vec::Vec<EmittedTag>,
+                       g: &crate::metadata::ParrotGpsSample| {
+    if let Some(lat) = g.latitude() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lat, 'N', 'S').into())
+      } else {
+        TagValue::F64(lat)
+      };
+      push(out, "GPSLatitude", v);
+    }
+    if let Some(lon) = g.longitude() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lon, 'E', 'W').into())
+      } else {
+        TagValue::F64(lon)
+      };
+      push(out, "GPSLongitude", v);
+    }
+    if let Some(alt) = g.altitude_m() {
+      push(out, "GPSAltitude", parrot_metres_value(alt, print_conv));
+    }
+    if let Some(sv) = g.satellites() {
+      push(out, "GPSSatellites", TagValue::U64(u64::from(sv)));
+    }
+    // GPSVelocity{North,East,Down} (V2/V3 — Parrot.pm:266-280 / :407-421):
+    // ValueConv `/0x100` only, no PrintConv ⇒ raw f64 in both modes. V1 fixes
+    // never set these (naturally skipped), so the offset order holds: the
+    // velocity triple sits at offsets 20/22/24, right after GPSSatellites(16.1)
+    // and before AirSpeed(26).
+    if let Some(v) = g.velocity_north_mps() {
+      push(out, "GPSVelocityNorth", TagValue::F64(v));
+    }
+    if let Some(v) = g.velocity_east_mps() {
+      push(out, "GPSVelocityEast", TagValue::F64(v));
+    }
+    if let Some(v) = g.velocity_down_mps() {
+      push(out, "GPSVelocityDown", TagValue::F64(v));
+    }
+  };
+  // FlyingState / PilotingMode are emitted individually (per-version their
+  // sibling Binning / Animation flag interleaves at the SAME byte offset BEFORE
+  // them in offset order — `54` Binning then `54.1` FlyingState, etc.).
+  let emit_flying = |out: &mut std::vec::Vec<EmittedTag>,
+                     f: &crate::metadata::ParrotFlightSample| {
+    if let Some(fs) = f.flying_state() {
+      let v = if print_conv {
+        TagValue::Str(parrot_flying_state_display(fs, version).into())
+      } else {
+        TagValue::U64(u64::from(fs.as_u8()))
+      };
+      push(out, "FlyingState", v);
+    }
+  };
+  let emit_piloting = |out: &mut std::vec::Vec<EmittedTag>,
+                       f: &crate::metadata::ParrotFlightSample| {
+    if let Some(pm) = f.piloting_mode() {
+      let v = if print_conv {
+        TagValue::Str(parrot_piloting_mode_display(pm, version).into())
+      } else {
+        TagValue::U64(u64::from(pm.as_u8()))
+      };
+      push(out, "PilotingMode", v);
+    }
+  };
+  // `Binning` / `Animation` (Parrot.pm:194/212 etc.) — `Mask => 0x80` integer
+  // flag, no PrintConv ⇒ raw 0/1 in both modes.
+  let emit_binning = |out: &mut std::vec::Vec<EmittedTag>,
+                      f: &crate::metadata::ParrotFlightSample| {
+    if let Some(b) = f.binning() {
+      push(out, "Binning", TagValue::U64(u64::from(b)));
+    }
+  };
+  let emit_animation = |out: &mut std::vec::Vec<EmittedTag>,
+                        f: &crate::metadata::ParrotFlightSample| {
+    if let Some(a) = f.animation() {
+      push(out, "Animation", TagValue::U64(u64::from(a)));
+    }
+  };
+  // The rad→deg pose / gimbal scalars (`DroneYaw` … `CameraTilt`) — ValueConv
+  // only, no PrintConv ⇒ raw f64 in both modes.
+  let emit_deg = |out: &mut std::vec::Vec<EmittedTag>, name: &str, v: Option<f64>| {
+    if let Some(d) = v {
+      push(out, name, TagValue::F64(d));
+    }
+  };
+  // The `/0x100` speed scalars (`SpeedX/Y/Z`) — ValueConv only ⇒ raw f64.
+  let emit_speed = |out: &mut std::vec::Vec<EmittedTag>, name: &str, v: Option<f64>| {
+    if let Some(s) = v {
+      push(out, name, TagValue::F64(s));
+    }
+  };
+  match version {
+    V::V1 => {
+      // Offset order (Parrot.pm:91-227): DroneYaw(4) DronePitch(6) DroneRoll(8)
+      // CameraPan(10) CameraTilt(12) FrameView(14) ExposureTime(22) ISO(24)
+      // WifiRSSI(26) Battery(27) GPS{Lat(28)/Lon(32)/Alt(36)/Sat(36.1)}
+      // AltitudeFromTakeOff(40) DistanceFromHome(44) SpeedX(48) SpeedY(50)
+      // SpeedZ(52) Binning(54) FlyingState(54.1) Animation(55) PilotingMode(55.1).
+      if let Some(f) = f {
+        emit_deg(out, "DroneYaw", f.drone_yaw_deg());
+        emit_deg(out, "DronePitch", f.drone_pitch_deg());
+        emit_deg(out, "DroneRoll", f.drone_roll_deg());
+        emit_deg(out, "CameraPan", f.camera_pan_deg());
+        emit_deg(out, "CameraTilt", f.camera_tilt_deg());
+        if let Some(v) = f.frame_view() {
+          push(out, "FrameView", parrot_vec_value(&v));
+        }
+        emit_exposure(out, f);
+        emit_iso(out, f);
+        emit_wifi(out, f);
+        emit_battery(out, f);
+      }
+      if let Some(g) = g {
+        emit_gps_core(out, g);
+      }
+      if let Some(f) = f {
+        if let Some(a) = f.altitude_from_takeoff_m() {
+          push(
+            out,
+            "AltitudeFromTakeOff",
+            parrot_metres_value(a, print_conv),
+          );
+        }
+        if let Some(d) = f.distance_from_home_m() {
+          // No PrintConv (Parrot.pm:174-178) — raw number in both modes.
+          push(out, "DistanceFromHome", TagValue::F64(d));
+        }
+        emit_speed(out, "SpeedX", f.speed_x());
+        emit_speed(out, "SpeedY", f.speed_y());
+        emit_speed(out, "SpeedZ", f.speed_z());
+        emit_binning(out, f);
+        emit_flying(out, f);
+        emit_animation(out, f);
+        emit_piloting(out, f);
+      }
+    }
+    V::V2 => {
+      // Offset order (Parrot.pm:235-368): Elevation(4)
+      // GPS{Lat(8)/Lon(12)/Alt(16)/Sat(16.1)/VelN(20)/VelE(22)/VelD(24)}
+      // AirSpeed(26) DroneQuaternion(28) FrameView(36) CameraPan(44)
+      // CameraTilt(46) ExposureTime(48) ISO(50) Binning(52) FlyingState(52.1)
+      // Animation(53) PilotingMode(53.1) WifiRSSI(54) Battery(55).
+      if let Some(f) = f
+        && let Some(e) = f.elevation_m()
+      {
+        push(out, "Elevation", parrot_metres_value(e, print_conv));
+      }
+      if let Some(g) = g {
+        emit_gps_core(out, g);
+      }
+      if let Some(f) = f {
+        if let Some(a) = f.air_speed_mps() {
+          // No PrintConv (Parrot.pm:281-286) — raw number.
+          push(out, "AirSpeed", TagValue::F64(a));
+        }
+        if let Some(v) = f.drone_quaternion() {
+          push(out, "DroneQuaternion", parrot_vec_value(&v));
+        }
+        if let Some(v) = f.frame_view() {
+          push(out, "FrameView", parrot_vec_value(&v));
+        }
+        emit_deg(out, "CameraPan", f.camera_pan_deg());
+        emit_deg(out, "CameraTilt", f.camera_tilt_deg());
+        emit_exposure(out, f);
+        emit_iso(out, f);
+        emit_binning(out, f);
+        emit_flying(out, f);
+        emit_animation(out, f);
+        emit_piloting(out, f);
+        emit_wifi(out, f);
+        emit_battery(out, f);
+      }
+    }
+    V::V3 => {
+      // Offset order (Parrot.pm:376-538): Elevation(4)
+      // GPS{Lat(8)/Lon(12)/Alt(16)/Sat(16.1)/VelN(20)/VelE(22)/VelD(24)}
+      // AirSpeed(26) DroneQuaternion(28) FrameBaseView(36) FrameView(44)
+      // ExposureTime(52) ISO(54) RedBalance(56) BlueBalance(58) FOV(60)
+      // LinkGoodput(64) LinkQuality(64.1) WifiRSSI(68) Battery(69) Binning(70)
+      // FlyingState(70.1) Animation(71) PilotingMode(71.1).
+      if let Some(f) = f
+        && let Some(e) = f.elevation_m()
+      {
+        push(out, "Elevation", parrot_metres_value(e, print_conv));
+      }
+      if let Some(g) = g {
+        emit_gps_core(out, g);
+      }
+      if let Some(f) = f {
+        if let Some(a) = f.air_speed_mps() {
+          push(out, "AirSpeed", TagValue::F64(a));
+        }
+        if let Some(v) = f.drone_quaternion() {
+          push(out, "DroneQuaternion", parrot_vec_value(&v));
+        }
+        if let Some(v) = f.frame_base_view() {
+          push(out, "FrameBaseView", parrot_vec_value(&v));
+        }
+        if let Some(v) = f.frame_view() {
+          push(out, "FrameView", parrot_vec_value(&v));
+        }
+        emit_exposure(out, f);
+        emit_iso(out, f);
+        // RedBalance / BlueBalance (Parrot.pm:455-466) — ValueConv only ⇒ raw f64.
+        if let Some(r) = f.red_balance() {
+          push(out, "RedBalance", TagValue::F64(r));
+        }
+        if let Some(b) = f.blue_balance() {
+          push(out, "BlueBalance", TagValue::F64(b));
+        }
+        if let Some(v) = f.fov_deg() {
+          // FOV (Parrot.pm:467-474) — int16u[2] `"@a"` join, no PrintConv.
+          push(out, "FOV", parrot_vec_value(&v));
+        }
+        // LinkGoodput (Parrot.pm:475-481): PrintConv `"$val kbit/s"`; `-n` raw int.
+        if let Some(lg) = f.link_goodput_kbitps() {
+          let v = if print_conv {
+            TagValue::Str(std::format!("{lg} kbit/s").into())
+          } else {
+            TagValue::U64(u64::from(lg))
+          };
+          push(out, "LinkGoodput", v);
+        }
+        // LinkQuality (Parrot.pm:482-488): low byte, no PrintConv ⇒ raw int.
+        if let Some(lq) = f.link_quality() {
+          push(out, "LinkQuality", TagValue::U64(u64::from(lq)));
+        }
+        emit_wifi(out, f);
+        emit_battery(out, f);
+        emit_binning(out, f);
+        emit_flying(out, f);
+        emit_animation(out, f);
+        emit_piloting(out, f);
+      }
+    }
+  }
+  // E1 `TimeStamp` extension (Parrot.pm:541-551) — ValueConv `$val / 1e6`
+  // (seconds), no PrintConv, emitted AFTER the P-record fields (a later record
+  // in buffer order). The typed layer holds the raw microsecond counter.
+  if let Some(f) = f
+    && let Some(us) = f.time_stamp_us()
+  {
+    let secs = us as f64 / 1e6;
+    push(out, "TimeStamp", TagValue::F64(secs));
+  }
+}
+
+/// `Follow-meAnimation` PrintConv hash display (Parrot.pm:585-591). A miss
+/// renders the raw integer (ExifTool's PrintConv-hash miss).
+fn parrot_follow_me_animation_display(
+  a: crate::metadata::ParrotFollowMeAnimation,
+) -> std::string::String {
+  use crate::metadata::ParrotFollowMeAnimation as A;
+  match a {
+    A::None => "None".into(),
+    A::Orbit => "Orbit".into(),
+    A::Boomerang => "Boomerang".into(),
+    A::Parabola => "Parabola".into(),
+    A::Zenith => "Zenith".into(),
+    A::Unknown(n) => std::format!("{n}"),
+  }
+}
+
+/// `AutomationAnimation` PrintConv hash display (Parrot.pm:633-649). A miss
+/// renders the raw integer.
+fn parrot_automation_animation_display(
+  a: crate::metadata::ParrotAutomationAnimation,
+) -> std::string::String {
+  use crate::metadata::ParrotAutomationAnimation as A;
+  let name = match a {
+    A::None => "None",
+    A::Orbit => "Orbit",
+    A::Boomerang => "Boomerang",
+    A::Parabola => "Parabola",
+    A::DollySlide => "Dolly Slide",
+    A::DollyZoom => "Dolly Zoom",
+    A::RevealVertical => "Reveal Vertical",
+    A::RevealHorizontal => "Reveal Horizontal",
+    A::Candle => "Candle",
+    A::FlipFront => "Flip Front",
+    A::FlipBack => "Flip Back",
+    A::FlipLeft => "Flip Left",
+    A::FlipRight => "Flip Right",
+    A::TwistUp => "Twist Up",
+    A::PositionTwistUp => "Position Twist Up",
+    A::Unknown(n) => return std::format!("{n}"),
+  };
+  name.into()
+}
+
+/// Emit ONE Parrot `E2` FollowMe extension record (`Parrot::FollowMe`,
+/// Parrot.pm:553-593) in offset order: GPSTargetLatitude(4) /
+/// GPSTargetLongitude(8) / GPSTargetAltitude(12) — ValueConv only (raw decimal
+/// degrees / metres in both modes, NO ToDMS) — then Follow-meMode(16) (BITMASK
+/// DecodeBits) and Follow-meAnimation(17) (PrintConv hash; `-n` raw int).
+#[cfg(feature = "alloc")]
+fn parrot_emit_follow_me(
+  s: &crate::metadata::ParrotFollowMeSample,
+  group: &crate::value::Group,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  let push = |out: &mut std::vec::Vec<EmittedTag>, name: &str, value: TagValue| {
+    out.push(EmittedTag::new(group.clone(), name.into(), value, false));
+  };
+  // GPSTarget{Latitude,Longitude,Altitude} — ValueConv only, no PrintConv.
+  if let Some(v) = s.target_latitude() {
+    push(out, "GPSTargetLatitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.target_longitude() {
+    push(out, "GPSTargetLongitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.target_altitude_m() {
+    push(out, "GPSTargetAltitude", TagValue::F64(v));
+  }
+  // Follow-meMode (Parrot.pm:573-581): `PrintConv => { BITMASK => {...} }` ⇒
+  // DecodeBits; the table has no `BitsPerWord` so the bundled default of 32 bits
+  // applies (`0` ⇒ 32 in the helper, mirroring Perl's `$bits or $bits = 32`).
+  // The field is int8u so only bits 0-7 can ever be set — 32 vs 8 is identical
+  // here, but `0` is the faithful "BitsPerWord omitted". `-n` emits the raw int.
+  if let Some(flags) = s.mode_flags() {
+    let v = if print_conv {
+      let lookup = [
+        (0u8, "Follow-me enabled"),
+        (1, "Follow-me"),
+        (2, "Angle locked"),
+      ];
+      TagValue::Str(crate::convert::decode_bits(&std::format!("{flags}"), Some(&lookup), 0).into())
+    } else {
+      TagValue::U64(u64::from(flags))
+    };
+    push(out, "Follow-meMode", v);
+  }
+  // Follow-meAnimation (Parrot.pm:582-592): PrintConv hash; `-n` raw int.
+  if let Some(a) = s.animation() {
+    let v = if print_conv {
+      TagValue::Str(parrot_follow_me_animation_display(a).into())
+    } else {
+      TagValue::U64(u64::from(a.as_u8()))
+    };
+    push(out, "Follow-meAnimation", v);
+  }
+}
+
+/// Emit ONE Parrot `E3` Automation extension record (`Parrot::Automation`,
+/// Parrot.pm:595-660) in offset order: GPSFramingLatitude(4) /
+/// GPSFramingLongitude(8) / GPSFramingAltitude(12) / GPSDestLatitude(16) /
+/// GPSDestLongitude(20) / GPSDestAltitude(24) — ValueConv only (raw, NO ToDMS)
+/// — then AutomationAnimation(28) (PrintConv hash; `-n` raw int) and
+/// AutomationFlags(29) (BITMASK DecodeBits; `-n` raw int).
+#[cfg(feature = "alloc")]
+fn parrot_emit_automation(
+  s: &crate::metadata::ParrotAutomationSample,
+  group: &crate::value::Group,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  let push = |out: &mut std::vec::Vec<EmittedTag>, name: &str, value: TagValue| {
+    out.push(EmittedTag::new(group.clone(), name.into(), value, false));
+  };
+  // GPSFraming{Latitude,Longitude,Altitude} / GPSDest{...} — ValueConv only.
+  if let Some(v) = s.framing_latitude() {
+    push(out, "GPSFramingLatitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.framing_longitude() {
+    push(out, "GPSFramingLongitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.framing_altitude_m() {
+    push(out, "GPSFramingAltitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.dest_latitude() {
+    push(out, "GPSDestLatitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.dest_longitude() {
+    push(out, "GPSDestLongitude", TagValue::F64(v));
+  }
+  if let Some(v) = s.dest_altitude_m() {
+    push(out, "GPSDestAltitude", TagValue::F64(v));
+  }
+  // AutomationAnimation (Parrot.pm:630-650): PrintConv hash; `-n` raw int.
+  if let Some(a) = s.animation() {
+    let v = if print_conv {
+      TagValue::Str(parrot_automation_animation_display(a).into())
+    } else {
+      TagValue::U64(u64::from(a.as_u8()))
+    };
+    push(out, "AutomationAnimation", v);
+  }
+  // AutomationFlags (Parrot.pm:651-659): `PrintConv => { BITMASK => {...} }`; no
+  // `BitsPerWord` ⇒ DecodeBits default 32 bits (`0` ⇒ 32 in the helper). The
+  // field is int8u, so 32 vs 8 is identical. `-n` raw int.
+  if let Some(flags) = s.flags() {
+    let v = if print_conv {
+      let lookup = [
+        (0u8, "Follow-me enabled"),
+        (1, "Look-at-me enabled"),
+        (2, "Angle locked"),
+      ];
+      TagValue::Str(crate::convert::decode_bits(&std::format!("{flags}"), Some(&lookup), 0).into())
+    } else {
+      TagValue::U64(u64::from(flags))
+    };
+    push(out, "AutomationFlags", v);
+  }
+}
+
+/// Emit the LigoGPS dashcam GPS samples (`ProcessLigoGPS` / `ProcessLigoJSON`,
+/// LigoGPS.pm) through the `tags()` engine. ExifTool routes these through the
+/// shared `%QuickTime::Stream` tag table (LigoGPS.pm passes the caller's
+/// `$tagTbl`, which is `QuickTime::Stream`), opening a NEW `Doc<N>` per record
+/// (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`, LigoGPS.pm:243 / :354) and scoping every
+/// record to family-1 `LIGO` (`$$et{SET_GROUP1} = 'LIGO'`, LigoGPS.pm:255 / :341).
+/// family-0 is `QuickTime` (the Stream table's module group — IDENTICAL to the
+/// SP3 stream / rtmd / CTMD timed sources, which the port emits under
+/// `QuickTime:…`).
+///
+/// **`-ee` gating (FINDING 1 — split by source, [`crate::metadata::LigoSource`]).**
+/// The two LigoGPS families gate differently:
+///  - **`udta` JSON/GKU** (`ProcessLigoJSON`): ExifTool processes the FIRST
+///    active record EVEN WITHOUT `-ee`, then `Warn`s + `last`s
+///    (LigoGPS.pm:390-393); `-ee` extracts the rest. So at no-`ee` the FIRST
+///    `udta`-JSON-sourced record emits (FLAT, no `Doc<N>`); the remaining
+///    `udta`-JSON records + ALL binary records are suppressed.
+///  - **binary `ProcessLigoGPS`** (trailer / freeGPS-embedded): the entry points
+///    run only inside the `-ee` trailer / scan pass, so the binary family is
+///    FULLY `-ee`-gated (nothing at no-`ee`).
+///
+/// **`Doc<N>` (FINDING 3 — global counter).** Each record's `Doc<N>` is the
+/// GLOBAL ordinal stamped at extraction off the SHARED `QuickTimeStreamMeta` doc
+/// counter (`crate::metadata::LigoGpsSample::doc`), allocated at the record's
+/// walk position from the SAME `++DOC_COUNT` the `mebx`/camm/`gps0`/freeGPS
+/// sources use — so a mixed `-ee -G3` file gets non-colliding, monotone doc
+/// ordinals across every source (no per-source restart). `s.doc()` is used
+/// VERBATIM; the running fallback covers only UNSTAMPED unit-built samples.
+/// `-G3` emits every record as its own `Doc<N>` row; `-G1` (and no-`ee`)
+/// collapses the `Doc<N>` axis to one `(family1, name)` row, FIRST-wins (each
+/// record is its own document, so the collapse is purely across-doc first-wins —
+/// the same `%noDups` rule the other timed sources use).
+///
+/// Per-record emit ORDER + PrintConv are taken VERBATIM from `ParseLigoGPS`
+/// (LigoGPS.pm:256-265) and the `%QuickTime::Stream` table (QuickTimeStream.pl:
+/// 116-150): GPSDateTime (`ConvertDateTime`, identity at the default DateFormat —
+/// emitted verbatim like every other Stream GPSDateTime), GPSLatitude /
+/// GPSLongitude (`GPS::ToDMS` with the N/S · E/W hemisphere at `-j`, raw decimal
+/// degrees at `-n`), GPSSpeed (`sprintf("%.4f",$val)+0` km/h, no suffix),
+/// GPSTrack (`sprintf("%.4f",$val)+0`), GPSAltitude (`(sprintf("%.4f",$val)+0)."
+/// m"`), MagneticVariation (no conv), Accelerometer (no conv), and — for the JSON
+/// variant — DateTimeOriginal (`ConvertDateTime`, verbatim) after Accelerometer
+/// (LigoGPS.pm:380).
+#[cfg(feature = "alloc")]
+fn emit_ligogps(
+  meta: &crate::metadata::LigoGpsMeta,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  // FINDING 1 — per-sample no-`ee` gate. The binary family is fully `-ee`-gated;
+  // the `udta`-JSON family emits its FIRST active record even without `-ee`
+  // (`ProcessLigoJSON` processes record 1 then `last`s, LigoGPS.pm:390-393). So
+  // at no-`ee` ONLY the FIRST `udta`-JSON-sourced sample qualifies — track
+  // whether it has been emitted yet. With `-ee` every sample qualifies. Bail
+  // early when nothing can emit (the common no-`ee` non-`udta`-JSON case), so the
+  // hot path pays no dedup bookkeeping.
+  let has_first_udta_json = meta.samples().iter().any(|s| s.source().is_udta_json());
+  if !opts.extract_embedded && !has_first_udta_json {
+    return;
+  }
+  // Without `-ee` ExifTool opens NO `Doc<N>` sub-document (the single record
+  // surfaces FLAT, `QuickTime:…`) and only the first `udta`-JSON record's columns
+  // survive: force the `Doc<N>` axis OFF + the first-wins collapse ON at no-`ee`
+  // (regardless of the requested `-G3`), mirroring [`emit_timed_samples`]. With
+  // `-ee` the requested group mode drives the doc axis.
+  let g3 = opts.extract_embedded && matches!(opts.group_mode, GroupMode::G3);
+  // Fallback running ordinal for an UNSTAMPED sample (unit-built samples in the
+  // emitter tests). Production samples carry the GLOBAL `s.doc()` stamped at
+  // extraction (Finding 3); each record is its own `Doc<N>` (LigoGPS.pm:243), so
+  // a per-record running ordinal is a faithful fallback.
+  let mut doc: u32 = 0;
+  // `-G1` / no-`ee` collapse state, keyed by `(family1, name)`. Each LigoGPS
+  // record is its own document, so the collapse is across-doc FIRST-wins (no
+  // within-doc last-wins case as for camm). Mirrors the sony/rtmd `flush_doc`.
+  let mut committed: std::vec::Vec<(smol_str::SmolStr, smol_str::SmolStr)> = std::vec::Vec::new();
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  // FINDING 1 — has the no-`ee` first `udta`-JSON record been emitted?
+  let mut emitted_no_ee_first = false;
+  for sample in meta.samples() {
+    // FINDING 1 — skip samples that don't qualify under the current `-ee` state.
+    if !opts.extract_embedded {
+      // No-`ee`: emit ONLY the first `udta`-JSON record; skip the rest + all
+      // binary records.
+      if emitted_no_ee_first || !sample.source().is_udta_json() {
+        continue;
+      }
+      emitted_no_ee_first = true;
+    }
+    doc += 1;
+    // FINDING 3 — use the GLOBAL doc stamped at extraction; the running `doc` is
+    // only a fallback for unstamped unit-built samples.
+    let doc_n = sample.doc().unwrap_or(doc);
+    // An out-of-range binary record burned a `Doc<N>` (LigoGPS.pm:243 before the
+    // :254 range-check return) but emits NO GPS tags: it has already advanced the
+    // `doc` ordinal above (so the NEXT record gets the burned slot's successor) —
+    // skip its tag emission. (At no-`ee` it is a binary record, already skipped
+    // by the `continue` above, so this only matters under `-ee`.)
+    if sample.is_suppressed() {
+      continue;
+    }
+    let group = if g3 {
+      Group::with_doc("QuickTime", "LIGO", doc_n)
+    } else {
+      Group::new("QuickTime", "LIGO")
+    };
+    scratch.clear();
+    // GPSDateTime (LigoGPS.pm:256 / :360): `ConvertDateTime` is identity at the
+    // default DateFormat — emit the stored `YYYY:MM:DD HH:MM:SS[Z]` verbatim in
+    // both modes (the same treatment as the SP3 / rtmd GPSDateTime).
+    if let Some(dt) = sample.date_time() {
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSDateTime".into(),
+        TagValue::Str(dt.into()),
+        false,
+      ));
+    }
+    // GPSLatitude / GPSLongitude (LigoGPS.pm:258-259): the typed layer holds the
+    // SIGNED decimal degrees (the hemisphere sign already applied). `GPS::ToDMS`
+    // with the N/S · E/W hemisphere suffix at `-j`, raw `F64` at `-n`.
+    if let Some(lat) = sample.latitude() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lat, 'N', 'S').into())
+      } else {
+        TagValue::F64(lat)
+      };
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSLatitude".into(),
+        v,
+        false,
+      ));
+    }
+    if let Some(lon) = sample.longitude() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lon, 'E', 'W').into())
+      } else {
+        TagValue::F64(lon)
+      };
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSLongitude".into(),
+        v,
+        false,
+      ));
+    }
+    // GPSSpeed (LigoGPS.pm:260): km/h post-scale; `sprintf("%.4f",$val)+0`
+    // PrintConv (QuickTimeStream.pl:121), raw F64 at `-n`.
+    if let Some(sp) = sample.speed_kph() {
+      let v = if print_conv {
+        TagValue::Str(crate::value::format_g(round_to_decimals(sp, 4), 15).into())
+      } else {
+        TagValue::F64(sp)
+      };
+      scratch.push(EmittedTag::new(group.clone(), "GPSSpeed".into(), v, false));
+    }
+    // GPSTrack (LigoGPS.pm:261): `sprintf("%.4f",$val)+0` (QuickTimeStream.pl:123).
+    if let Some(tr) = sample.track_deg() {
+      let v = if print_conv {
+        TagValue::Str(crate::value::format_g(round_to_decimals(tr, 4), 15).into())
+      } else {
+        TagValue::F64(tr)
+      };
+      scratch.push(EmittedTag::new(group.clone(), "GPSTrack".into(), v, false));
+    }
+    // GPSAltitude (LigoGPS.pm:262): `(sprintf("%.4f",$val)+0)." m"`
+    // (QuickTimeStream.pl:120), raw metres at `-n`.
+    if let Some(alt) = sample.altitude_m() {
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSAltitude".into(),
+        gps_altitude_stream_value(alt, print_conv),
+        false,
+      ));
+    }
+    // MagneticVariation (LigoGPS.pm:263): no PrintConv (QuickTimeStream.pl:363 is
+    // a bare `{}`) — emit the raw `F64` in both modes.
+    if let Some(mv) = sample.magnetic_variation() {
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "MagneticVariation".into(),
+        TagValue::F64(mv),
+        false,
+      ));
+    }
+    // Accelerometer (LigoGPS.pm:265 / :373): the space-joined "ax ay az" string,
+    // no PrintConv (QuickTimeStream.pl:149 is `Notes`-only) — emit verbatim.
+    if let Some(acc) = sample.accelerometer() {
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "Accelerometer".into(),
+        TagValue::Str(acc.into()),
+        false,
+      ));
+    }
+    // DateTimeOriginal (JSON variant only, LigoGPS.pm:380): the dashcam local
+    // clock; `ConvertDateTime` is identity at the default DateFormat — verbatim.
+    if let Some(dt) = sample.date_time_local() {
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "DateTimeOriginal".into(),
+        TagValue::Str(dt.into()),
+        false,
+      ));
+    }
+    // GPSLatitude2 / GPSLongitude2 (JSON variant only, LigoGPS.pm:387-388 from
+    // OLatitude/OLongitude): the typed layer holds the SIGNED decimal degrees.
+    // Same `GPS::ToDMS` PrintConv as the primary lat/lon (QuickTimeStream.pl:
+    // 118-119), raw `F64` at `-n`. Emitted AFTER DateTimeOriginal, matching the
+    // bundled `HandleTag` order.
+    if let Some(lat2) = sample.latitude2() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lat2, 'N', 'S').into())
+      } else {
+        TagValue::F64(lat2)
+      };
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSLatitude2".into(),
+        v,
+        false,
+      ));
+    }
+    if let Some(lon2) = sample.longitude2() {
+      let v = if print_conv {
+        TagValue::Str(dms_signed(lon2, 'E', 'W').into())
+      } else {
+        TagValue::F64(lon2)
+      };
+      scratch.push(EmittedTag::new(
+        group.clone(),
+        "GPSLongitude2".into(),
+        v,
+        false,
+      ));
+    }
+    if g3 {
+      tags.append(&mut scratch);
+    } else {
+      // `-G1` / default: collapse the `Doc<N>` axis to one `(family1, name)` row,
+      // FIRST-wins across records (each record is its own doc).
+      for tag in scratch.drain(..) {
+        let key = (
+          smol_str::SmolStr::new(tag.tag().group_ref().family1()),
+          smol_str::SmolStr::new(tag.tag().name()),
+        );
+        if committed.contains(&key) {
+          continue;
+        }
+        committed.push(key);
+        tags.push(tag);
       }
     }
   }
@@ -10196,6 +11484,1465 @@ mod tests {
     );
   }
 
+  /// A `gpmd_Kingslim` timed-metadata sample routes to
+  /// the bundled `ProcessFreeGPS` process-proc (QuickTimeStream.pl:182-187),
+  /// which sets `$$et{FoundEmbedded} = 1` (:1650) and so SUPPRESSES the later
+  /// brute-force `ScanMediaData` `mdat` scan (:3689). The pre-fix port decoded
+  /// the Kingslim block against a THROWAWAY `FreeGpsState`, so the flag never
+  /// reached `extract_stream` and a stray `freeGPS`-looking block buried in
+  /// `mdat` would be double-decoded by the scan. Threading the walk-level
+  /// `FreeGpsState` into `dispatch_gpmd` fixes it: the Kingslim LigoGPS sample is
+  /// extracted AND the redundant `mdat` scan is suppressed (no spurious stream
+  /// GPS). Mirrors `moov_gps_box_decode_suppresses_redundant_mdat_scan`.
+  #[test]
+  fn kingslim_gpmd_sample_suppresses_mdat_scan() {
+    // The Kingslim D4 `gpmd` sample (same shape as the freegps unit test
+    // `dispatch_gpmd_routes_kingslim_to_ligogps`): Condition `^.{21}\0\0\0A[NS][EW]`,
+    // `LIGOGPSINFO\0` at 0x50, an ASCII LigoGPS record at 0x50+0x14.
+    let mut kingslim = vec![0u8; 240];
+    kingslim[24] = b'A';
+    kingslim[25] = b'N';
+    kingslim[26] = b'W';
+    kingslim[80..92].copy_from_slice(b"LIGOGPSINFO\0");
+    let mut rec = vec![0u8, 0, 0, 0]; // 4-byte counter consumed by `.{4}`
+    rec.extend_from_slice(b"2024/01/15 10:00:00 N:45.5 E:170.5 30.0");
+    kingslim[100..100 + rec.len()].copy_from_slice(&rec);
+
+    // A SEPARATE Type-6 (Akaso) freeGPS block (distinct coordinates) that the
+    // brute-force `mdat` scan WOULD decode if it were not suppressed.
+    let mut stray = vec![0u8; 0x100];
+    wr(&mut stray, 0, &0x0100u32.to_be_bytes());
+    wr(&mut stray, 4, b"freeGPS ");
+    wb(&mut stray, 60, b'A');
+    wb(&mut stray, 68, b'N');
+    wb(&mut stray, 76, b'W');
+    wr(&mut stray, 0x30, &12u32.to_le_bytes());
+    wr(&mut stray, 0x34, &13u32.to_le_bytes());
+    wr(&mut stray, 0x38, &14u32.to_le_bytes());
+    wr(&mut stray, 0x58, &2023u32.to_le_bytes());
+    wr(&mut stray, 0x5c, &1u32.to_le_bytes());
+    wr(&mut stray, 0x60, &2u32.to_le_bytes());
+    wr(&mut stray, 0x40, &1000.0f32.to_le_bytes());
+    wr(&mut stray, 0x48, &2000.0f32.to_le_bytes());
+
+    // Layout = ftyp || mdat(kingslim + stray + >=0x8000 pad) || moov(gpmd trak).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = kingslim.clone();
+    mdat_payload.extend_from_slice(&stray);
+    mdat_payload.extend_from_slice(&[0u8; 0x8000]);
+    let mdat = atom(b"mdat", &mdat_payload);
+    // The Kingslim sample's ABSOLUTE offset = ftyp.len() + 8 (mdat payload start).
+    let kingslim_offset = (ftyp.len() + 8) as u32;
+
+    // A `meta`-HandlerType trak with a `gpmd` MetaFormat stsd whose single
+    // sample is the Kingslim block.
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"meta");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &1000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut stsd_body = vec![0u8; 8];
+    wr(&mut stsd_body, 4, &1u32.to_be_bytes());
+    let mut entry = vec![0u8; 16];
+    wr(&mut entry, 0, &16u32.to_be_bytes());
+    wr(&mut entry, 4, b"gpmd");
+    stsd_body.extend_from_slice(&entry);
+    let stsd = atom(b"stsd", &stsd_body);
+    let mut stco_body = vec![0u8; 8];
+    wr(&mut stco_body, 4, &1u32.to_be_bytes());
+    stco_body.extend_from_slice(&kingslim_offset.to_be_bytes());
+    let stco = atom(b"stco", &stco_body);
+    let mut stsc_body = vec![0u8; 8];
+    wr(&mut stsc_body, 4, &1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = atom(b"stsc", &stsc_body);
+    let mut stsz_body = vec![0u8; 8];
+    wr(&mut stsz_body, 4, &0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&1u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(kingslim.len() as u32).to_be_bytes());
+    let stsz = atom(b"stsz", &stsz_body);
+    let mut stbl_body = stsd;
+    stbl_body.extend_from_slice(&stco);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    // The Kingslim sample decoded into the LigoGPS accumulator.
+    let ligo = meta
+      .ligogps()
+      .samples()
+      .first()
+      .expect("Kingslim must decode via the GPSType-5 LigoGPS arm");
+    assert_eq!(ligo.latitude(), Some(45.5));
+    assert_eq!(ligo.longitude(), Some(170.5));
+    // And FoundEmbedded (set by the Kingslim ProcessFreeGPS) suppressed the
+    // brute-force `mdat` scan — the stray block is NOT decoded, so there is no
+    // spurious stream GPS sample.
+    assert_eq!(
+      meta.stream().gps_samples().len(),
+      0,
+      "Kingslim FoundEmbedded must suppress the redundant mdat freeGPS scan (no spurious GPS)"
+    );
+  }
+
+  /// Build an MP4 whose single `meta`-handler `gpmd` track sample is a Kingslim
+  /// D4 LigoGPS block (decodes via the GPSType-5 `ProcessLigoGPS` arm into
+  /// `ligogps`). Shared by the LigoGPS emission tests.
+  fn kingslim_ligogps_mp4() -> Vec<u8> {
+    // N:45.5 E:170.5, 30.0 km/h, A:120 track, H:46 alt (ParseLigoGPS fields).
+    let mut rec = vec![0u8, 0, 0, 0];
+    rec.extend_from_slice(b"2024/01/15 10:00:00 N:45.5 E:170.5 30.0 A:120 H:46");
+    kingslim_ligogps_mp4_with_record(&rec)
+  }
+
+  /// Build the Kingslim-D4-shaped `gpmd`-track MP4 of [`kingslim_ligogps_mp4`]
+  /// but with a CUSTOM 132-byte-max LigoGPS record body (the `[4-byte counter]
+  /// …` payload written at offset 100 of the `LIGOGPSINFO\0`-at-80 block). Used
+  /// by the Finding 2 warning tests to drive an out-of-range / decrypt-failure
+  /// record through the FULL freeGPS-embedded `ProcessLigoGPS` path.
+  fn kingslim_ligogps_mp4_with_record(record_body: &[u8]) -> Vec<u8> {
+    let mut kingslim = vec![0u8; 240];
+    kingslim[24] = b'A';
+    kingslim[25] = b'N';
+    kingslim[26] = b'W';
+    kingslim[80..92].copy_from_slice(b"LIGOGPSINFO\0");
+    // Records start at the `LIGOGPSINFO\0` offset (80) + 0x14 = 100; one 0x84
+    // (132)-byte stride fits in the 240-byte block (100..232).
+    assert!(record_body.len() <= 0x84, "record exceeds one 0x84 stride");
+    kingslim[100..100 + record_body.len()].copy_from_slice(record_body);
+
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut mdat_payload = kingslim.clone();
+    mdat_payload.extend_from_slice(&[0u8; 0x100]); // small pad (no stray block)
+    let mdat = atom(b"mdat", &mdat_payload);
+    let kingslim_offset = (ftyp.len() + 8) as u32;
+
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"meta");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &1000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    let mut stsd_body = vec![0u8; 8];
+    wr(&mut stsd_body, 4, &1u32.to_be_bytes());
+    let mut entry = vec![0u8; 16];
+    wr(&mut entry, 0, &16u32.to_be_bytes());
+    wr(&mut entry, 4, b"gpmd");
+    stsd_body.extend_from_slice(&entry);
+    let stsd = atom(b"stsd", &stsd_body);
+    let mut stco_body = vec![0u8; 8];
+    wr(&mut stco_body, 4, &1u32.to_be_bytes());
+    stco_body.extend_from_slice(&kingslim_offset.to_be_bytes());
+    let stco = atom(b"stco", &stco_body);
+    let mut stsc_body = vec![0u8; 8];
+    wr(&mut stsc_body, 4, &1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = atom(b"stsc", &stsc_body);
+    let mut stsz_body = vec![0u8; 8];
+    wr(&mut stsz_body, 4, &0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&1u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(kingslim.len() as u32).to_be_bytes());
+    let stsz = atom(b"stsz", &stsz_body);
+    let mut stbl_body = stsd;
+    stbl_body.extend_from_slice(&stco);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+    data
+  }
+
+  /// Decoded LigoGPS records must EMIT through
+  /// `Meta::tags()` under family-1 `LIGO` (the `%QuickTime::Stream` table,
+  /// `$$et{SET_GROUP1}='LIGO'`, LigoGPS.pm:255). At `-ee -n` the GPS columns are
+  /// the raw post-ValueConv scalars (lat/lon decimal degrees, speed km/h, track
+  /// degrees), GPSDateTime the normalised UTC string.
+  #[test]
+  fn ligogps_tags_emitted_under_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let data = kingslim_ligogps_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    // Sanity: the LigoGPS record decoded.
+    assert!(!meta.ligogps().samples().is_empty(), "LigoGPS must decode");
+
+    // `-ee -n`: collect the family-1 `LIGO` tags.
+    let ee = EmitOptions::g1(ConvMode::ValueConv, true);
+    let ligo: std::vec::Vec<(String, crate::value::TagValue)> = meta
+      .tags(ee)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let get = |name: &str| ligo.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    use crate::value::TagValue;
+    assert_eq!(get("GPSLatitude"), Some(&TagValue::F64(45.5)));
+    assert_eq!(get("GPSLongitude"), Some(&TagValue::F64(170.5)));
+    assert_eq!(get("GPSTrack"), Some(&TagValue::F64(120.0)));
+    assert_eq!(get("GPSAltitude"), Some(&TagValue::F64(46.0)));
+    assert_eq!(
+      get("GPSDateTime"),
+      Some(&TagValue::Str("2024:01:15 10:00:00".into()))
+    );
+    // GPSSpeed: km/h post-scale (flags 0x03 ⇒ spdScl = 1, so the raw 30.0).
+    assert_eq!(get("GPSSpeed"), Some(&TagValue::F64(30.0)));
+
+    // `-j` (PrintConv): GPSLatitude is the DMS string WITH the hemisphere.
+    let pj = EmitOptions::g1(ConvMode::PrintConv, true);
+    let lat_pj = meta
+      .tags(pj)
+      .find(|t| t.tag().group_ref().family1() == "LIGO" && t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().value_ref().clone());
+    match lat_pj {
+      Some(TagValue::Str(s)) => {
+        assert!(
+          s.ends_with(" N"),
+          "GPSLatitude DMS carries the N hemisphere: {s}"
+        );
+      }
+      other => panic!("GPSLatitude -j should be a DMS string, got {other:?}"),
+    }
+  }
+
+  /// The LigoGPS tags are `-ee`-gated: WITHOUT
+  /// ExtractEmbedded `Meta::tags()` emits NONE of them (LigoGPS emission only
+  /// happens under the `-ee` scan / trailer pass).
+  #[test]
+  fn ligogps_tags_absent_without_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let data = kingslim_ligogps_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      !meta.ligogps().samples().is_empty(),
+      "LigoGPS still decodes"
+    );
+    let noee = EmitOptions::g1(ConvMode::PrintConv, false);
+    let any_ligo = meta
+      .tags(noee)
+      .any(|t| t.tag().group_ref().family1() == "LIGO");
+    assert!(!any_ligo, "no LIGO tags without -ee");
+  }
+
+  /// Drain a `Meta`'s `Diagnose` stream into a `TagMap` and return the
+  /// document-level warning channel (`ExifTool:Warning`) — the production sink
+  /// path (`AnyMeta::serialize_tags` runs `run_emission` + `run_diagnostics`).
+  #[cfg(feature = "alloc")]
+  fn rendered_warnings(meta: &Meta<'_>) -> std::vec::Vec<String> {
+    let mut w = crate::tagmap::TagMap::new();
+    crate::diagnostics::run_diagnostics(meta, &mut w);
+    w.warnings().to_vec()
+  }
+
+  /// FINDING 2 — an out-of-range binary LigoGPS record (lat > 90) decoded via the
+  /// freeGPS-embedded `ProcessLigoGPS` path surfaces its `LIGOGPSINFO coordinates
+  /// out of range` warning (LigoGPS.pm:254) in the RENDERED output, as a
+  /// DOCUMENT-level `ExifTool:Warning` (the `Warn` fires BEFORE the LigoGPS.pm:255
+  /// `SET_GROUP1='LIGO'`, so it is not `LIGO`-scoped). Before this fix the warning
+  /// was stored on `LigoGpsMeta::warning()` but never surfaced — a file whose GPS
+  /// record was rejected looked clean.
+  #[test]
+  fn ligogps_out_of_range_warning_surfaces_in_rendered_output() {
+    // Plain-ASCII record (no `####`) with lat 91 (> 90). flags 0x03 (not fuzzed)
+    // ⇒ the raw 91.0 survives the unfuzz step and trips the range check.
+    let mut rec = vec![0u8, 0, 0, 0];
+    rec.extend_from_slice(b"2024/01/15 10:00:00 N:91.0 E:0.0 0.0 km/h");
+    let data = kingslim_ligogps_mp4_with_record(&rec);
+    let meta = parse_inner(&data, None).expect("accepted");
+    // The record burned a Doc<N> (suppressed sample) and recorded the warning.
+    assert_eq!(
+      meta.ligogps().warning(),
+      Some("LIGOGPSINFO coordinates out of range")
+    );
+    assert!(
+      rendered_warnings(&meta)
+        .iter()
+        .any(|w| w == "LIGOGPSINFO coordinates out of range"),
+      "the out-of-range warning must surface as a document-level ExifTool:Warning, got {:?}",
+      rendered_warnings(&meta)
+    );
+  }
+
+  /// FINDING 2 — a `####`-prefixed record whose cipher stream is malformed fails
+  /// `DecryptLigoGPS` (LigoGPS.pm:312); the port records the decrypt-failure
+  /// deferral warning (cipher discovery is the deferred LigoGPS.pm:143-221
+  /// `DecipherLigoGPS` fallback). It must surface in the rendered output.
+  #[test]
+  fn ligogps_decrypt_failure_warning_surfaces_in_rendered_output() {
+    // `####` + LE u32 count(4) + a first input byte 0x20 whose steering bits
+    // (0x20 & 0xe0 = 0x20) hit `DecryptLigoGPS`'s final `else { return undef }`
+    // (LigoGPS.pm:94-96) ⇒ decode fails on the first byte.
+    let mut rec = Vec::new();
+    rec.extend_from_slice(b"####");
+    rec.extend_from_slice(&4u32.to_le_bytes()); // num = 4
+    rec.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]); // first input byte → return None
+    let data = kingslim_ligogps_mp4_with_record(&rec);
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert_eq!(
+      meta.ligogps().warning(),
+      Some("LigoGPS record decryption failed (cipher discovery deferred)")
+    );
+    assert!(
+      rendered_warnings(&meta)
+        .iter()
+        .any(|w| w == "LigoGPS record decryption failed (cipher discovery deferred)"),
+      "the decrypt-failure warning must surface in the rendered output, got {:?}",
+      rendered_warnings(&meta)
+    );
+  }
+
+  /// Build a file-end LigoGPS `&&&&` trailer whose `skip`-atom payload is NOT
+  /// `LIGOGPSINFO\0` (random bytes) — the `Unrecognized data in LigoGPS trailer`
+  /// case (QuickTime.pm:10667). Same shape as [`ligogps_ampersand_trailer`] minus
+  /// the `LIGOGPSINFO\0` magic.
+  fn ligogps_ampersand_trailer_unrecognized() -> Vec<u8> {
+    // Payload: 24 non-LIGOGPSINFO bytes (after the 8-byte skip header).
+    let mut payload = Vec::new();
+    for i in 0..24u8 {
+      payload.push(i.wrapping_add(0x40));
+    }
+    let skip_atom_size = (16 + payload.len()) as u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&skip_atom_size.to_be_bytes());
+    body.extend_from_slice(b"skip");
+    body.extend_from_slice(&payload);
+    let trailer_len = (body.len() + 8) as u32;
+    let mut out = body;
+    out.extend_from_slice(b"&&&&");
+    out.extend_from_slice(&trailer_len.to_be_bytes());
+    out
+  }
+
+  /// FINDING 2 — an unrecognized LigoGPS `&&&&` trailer (a valid `skip` atom but a
+  /// non-`LIGOGPSINFO\0` payload) surfaces `Unrecognized data in LigoGPS trailer`
+  /// (QuickTime.pm:10667) in the rendered output, as a DOCUMENT-level
+  /// `ExifTool:Warning` (the `Warn` is raised in the `ProcessMOV` trailer loop
+  /// with no `SET_GROUP1` in effect).
+  #[test]
+  fn ligogps_unrecognized_trailer_warning_surfaces_in_rendered_output() {
+    // ftyp || moov(mvhd) || &&&&-trailer (the trailer follows complete atoms, so
+    // the box-walk `last_pos` lands at the trailer start and the gate passes).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&atom(b"moov", &atom(b"mvhd", &[0u8; 100])));
+    data.extend_from_slice(&ligogps_ampersand_trailer_unrecognized());
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert_eq!(
+      meta.ligogps().warning(),
+      Some("Unrecognized data in LigoGPS trailer")
+    );
+    assert!(
+      rendered_warnings(&meta)
+        .iter()
+        .any(|w| w == "Unrecognized data in LigoGPS trailer"),
+      "the unrecognized-trailer warning must surface in the rendered output, got {:?}",
+      rendered_warnings(&meta)
+    );
+  }
+
+  /// Wrap a `udta`-payload `body` inside a minimal `ftyp` + ROOT-level `udta`
+  /// MP4. A top-level `udta` is the `%QuickTime::Main` path (QuickTime.pm:826-846)
+  /// that hosts the LigoGPS Conditions and reaches [`dispatch_udta_ligogps`]
+  /// through the full container parser. (The `moov/udta` `%QuickTime::Movie`
+  /// UserData walk does NOT carry those Conditions, so it is NOT exercised here.)
+  fn top_level_udta_mp4(body: &[u8]) -> Vec<u8> {
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let udta = atom(b"udta", body);
+    let mut data = ftyp;
+    data.extend_from_slice(&udta);
+    data
+  }
+
+  /// Collect the `-ee` `-G1` `LIGO`-group `(name, value)` tags emitted by a Meta.
+  fn ligo_tags(meta: &Meta<'_>) -> std::vec::Vec<(String, crate::value::TagValue)> {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let ee = EmitOptions::g1(ConvMode::ValueConv, true);
+    meta
+      .tags(ee)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect()
+  }
+
+  /// FAITHFUL udta `LigoJSON` path (QuickTime.pm:835): a TOP-LEVEL (`%QuickTime::Main`)
+  /// `udta` atom whose payload begins `LIGOGPSINFO {` reaches `process_ligogps_json`
+  /// via `dispatch_udta_ligogps` through the FULL container parser
+  /// (`parse_inner` → `tags()`), emitting the GPS tags — including
+  /// GPSLatitude2/GPSLongitude2 from the JSON OLatitude/OLongitude
+  /// (LigoGPS.pm:387-388).
+  #[test]
+  fn udta_ligojson_emitted_end_to_end() {
+    use crate::value::TagValue;
+    let json = br#"LIGOGPSINFO {"Hour": "10", "Minute": "00", "Second": "00", "Year": "2024", "Month": "01", "Day": "15", "status": "A", "NS": "N", "EW": "E", "Latitude": "12.5", "Longitude": "34.5", "OLatitude": "12.25", "OLongitude": "34.75"}"#;
+    let data = top_level_udta_mp4(json);
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      !meta.ligogps().samples().is_empty(),
+      "udta LigoJSON must decode via the container dispatch"
+    );
+
+    let ligo = ligo_tags(&meta);
+    let get = |name: &str| ligo.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(get("GPSLatitude"), Some(&TagValue::F64(12.5)));
+    assert_eq!(get("GPSLongitude"), Some(&TagValue::F64(34.5)));
+    assert_eq!(
+      get("GPSDateTime"),
+      Some(&TagValue::Str("2024:01:15 10:00:00Z".into()))
+    );
+    // OLatitude/OLongitude surface as GPSLatitude2/GPSLongitude2.
+    assert_eq!(get("GPSLatitude2"), Some(&TagValue::F64(12.25)));
+    assert_eq!(get("GPSLongitude2"), Some(&TagValue::F64(34.75)));
+  }
+
+  /// FAITHFUL top-level (`%QuickTime::Main`) udta `LigoJSON` path: a ROOT-level
+  /// `udta` (not under `moov`) is where ExifTool actually hosts the LigoGPS
+  /// Conditions (QuickTime.pm:826-846). It must also reach the JSON decoder.
+  #[test]
+  fn top_level_udta_ligojson_emitted() {
+    use crate::value::TagValue;
+    let json = br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "W", "Latitude": "1.5", "Longitude": "2.5"}"#;
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let udta = atom(b"udta", json);
+    let mut data = ftyp;
+    data.extend_from_slice(&udta);
+    let meta = parse_inner(&data, None).expect("accepted");
+    let ligo = ligo_tags(&meta);
+    let get = |name: &str| ligo.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(get("GPSLatitude"), Some(&TagValue::F64(1.5)));
+    // EW=W ⇒ negative longitude.
+    assert_eq!(get("GPSLongitude"), Some(&TagValue::F64(-2.5)));
+  }
+
+  /// FAITHFUL udta `GKUData` path (QuickTime.pm:842 + LigoGPS.pm:273-281): a
+  /// TOP-LEVEL (`%QuickTime::Main`) `udta` whose payload is
+  /// `[offset:u32-LE][..]__V35AX_QVDATA__` with the LE u32 pointing at an inner
+  /// `LIGOGPSINFO {` JSON reaches `ProcessGKU` → `process_ligogps_json`.
+  #[test]
+  fn udta_gkudata_emitted_end_to_end() {
+    use crate::value::TagValue;
+    let json = br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "3.5", "Longitude": "4.5"}"#;
+    // udta payload: [LE u32 offset][marker `__V35AX_QVDATA__` at byte 8][pad up
+    // to `offset`][JSON]. Put the JSON right after the 8-byte header + 16-byte
+    // marker (offset = 24).
+    let json_off = 24u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&json_off.to_le_bytes()); // bytes 0..4 = offset
+    body.extend_from_slice(&[0u8; 4]); // bytes 4..8 (the `.{8}` head)
+    body.extend_from_slice(b"__V35AX_QVDATA__"); // bytes 8..24 = marker
+    assert_eq!(body.len(), json_off as usize);
+    body.extend_from_slice(json); // JSON at `offset`
+
+    let data = top_level_udta_mp4(&body);
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      !meta.ligogps().samples().is_empty(),
+      "udta GKUData must decode via ProcessGKU"
+    );
+    let ligo = ligo_tags(&meta);
+    let get = |name: &str| ligo.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(get("GPSLatitude"), Some(&TagValue::F64(3.5)));
+    assert_eq!(get("GPSLongitude"), Some(&TagValue::F64(4.5)));
+  }
+
+  /// A top-level `udta` LigoJSON payload carrying THREE active records. Two
+  /// concatenated `LIGOGPSINFO {...}` objects are the bundled chained-record
+  /// shape (LigoGPS.pm:326 "chained 512-byte records").
+  fn multi_record_udta_ligojson_mp4() -> Vec<u8> {
+    let mut json = Vec::new();
+    json.extend_from_slice(br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "1.0", "Longitude": "10.0"}"#);
+    json.extend_from_slice(br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "2.0", "Longitude": "20.0"}"#);
+    json.extend_from_slice(br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "3.0", "Longitude": "30.0"}"#);
+    top_level_udta_mp4(&json)
+  }
+
+  /// **FINDING 1** — WITHOUT `-ee`, a `udta` LigoJSON file emits EXACTLY the
+  /// FIRST record (`ProcessLigoJSON` processes record 1 then `Warn`s + `last`s,
+  /// LigoGPS.pm:390-393). The output is FLAT (no `Doc<N>`).
+  #[test]
+  fn udta_ligojson_no_ee_emits_only_first_record() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::value::TagValue;
+    let data = multi_record_udta_ligojson_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert_eq!(
+      meta.ligogps().samples().len(),
+      3,
+      "all three records decode into the typed surface"
+    );
+    // No-`ee` `-G1` (PrintConv): collect every LIGO-group GPSLatitude.
+    let noee = EmitOptions::g1(ConvMode::ValueConv, false);
+    let lats: std::vec::Vec<TagValue> = meta
+      .tags(noee)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO" && t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().value_ref().clone())
+      .collect();
+    assert_eq!(
+      lats,
+      std::vec![TagValue::F64(1.0)],
+      "without -ee, ONLY the first udta-JSON record emits (LigoGPS.pm:390-393)"
+    );
+  }
+
+  /// **FINDING 1** — WITH `-ee`, the SAME `udta` LigoJSON file emits ALL records,
+  /// each as its own `Doc<N>` row at `-G3`.
+  #[test]
+  fn udta_ligojson_ee_emits_all_records() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+    use crate::value::TagValue;
+    let data = multi_record_udta_ligojson_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    // `-ee -G3`: every record surfaces as its own `Doc<N>:QuickTime:LIGO` row.
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let lats: std::vec::Vec<TagValue> = meta
+      .tags(ee_g3)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO" && t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().value_ref().clone())
+      .collect();
+    assert_eq!(
+      lats,
+      std::vec![TagValue::F64(1.0), TagValue::F64(2.0), TagValue::F64(3.0)],
+      "with -ee, ALL three udta-JSON records emit"
+    );
+  }
+
+  /// **FINDING 3** — in a MIXED `-ee -G3` file (a freeGPS-embedded LigoGPS block
+  /// PLUS another GPS source), the LigoGPS records open `Doc<N>` ordinals off the
+  /// SAME global counter as the other source — so the two sources' docs do NOT
+  /// collide and the LigoGPS rows continue the global sequence in walk order
+  /// (`$$et{DOC_NUM} = ++$$et{DOC_COUNT}`, LigoGPS.pm:243; #214 cross-source).
+  #[test]
+  fn ligogps_mixed_source_global_doc_ordering() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+    // Build a file with a TOP-LEVEL `gps0` magic box (one fix → Doc1, walked
+    // first) FOLLOWED by a `moov` whose `gps ` offset box points at a freeGPS
+    // Type-5 LigoGPS block (→ Doc2..). The `gps0` box bumps the global counter
+    // first (walk order), so the LigoGPS records must take the HIGHER ordinals.
+    // (The `moov`-`gps `-box vehicle decodes a freeGPS block at any absolute
+    // offset — no 0x8000 `mdat`-chunk requirement, so it is reliable in a unit
+    // fixture.)
+    //
+    // gps0: one 32-byte LE record (DDDMM.MMMM lat/lon, alt, speed, date, track).
+    let mut gps0 = Vec::new();
+    gps0.extend_from_slice(&4530.0f64.to_le_bytes()); // lat 45°30' = 45.5
+    gps0.extend_from_slice(&12030.0f64.to_le_bytes()); // lon 120°30' = 120.5
+    gps0.extend_from_slice(&100i32.to_le_bytes()); // altitude
+    gps0.extend_from_slice(&50u16.to_le_bytes()); // speed
+    gps0.extend_from_slice(&[24, 1, 15, 10, 0, 0]); // y-2000,mo,d,h,mi,s @0x16
+    gps0.extend_from_slice(&[0, 0]); // pad to 0x1c
+    gps0.extend_from_slice(&[60]); // track/2 @0x1c
+    while gps0.len() < 32 {
+      gps0.push(0);
+    }
+    let gps0_atom = atom(b"gps0", &gps0);
+
+    // freeGPS Type-5 LigoGPS block: 4-byte BE size word (0x100, NUL bytes 0+3 so
+    // the scanner regex is happy + a multiple of 256) + `freeGPS ` magic at
+    // offset 4, then `LIGOGPSINFO\0` at offset 16 (the GPSType-5 fingerprint,
+    // QuickTimeStream.pl:1843), an 8-byte preamble, and one plain-ASCII record.
+    // Built push-only (no indexing) so the byte layout is explicit.
+    let mut block = Vec::new();
+    block.extend_from_slice(&0x0100u32.to_be_bytes()); // 0..4: BE size word
+    block.extend_from_slice(b"freeGPS "); // 4..12: magic
+    block.extend_from_slice(&[0u8; 4]); // 12..16
+    block.extend_from_slice(crate::formats::ligogps::HDR_LIGOGPSINFO); // 16..28
+    block.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]); // 28..36: preamble tail
+    block.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // record counter
+    block.extend_from_slice(b"2024/01/15 10:00:01 N:46.5 E:171.5 30.0 km/h");
+    while block.len() < 0x100 {
+      block.push(0); // pad to the declared 0x100 size
+    }
+
+    // Layout = ftyp || gps0 || freeGPS-block || moov(mvhd + gps -offset-box).
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&gps0_atom);
+    let block_offset = data.len() as u32; // absolute offset of the freeGPS block
+    data.extend_from_slice(&block);
+
+    // The moov `gps ` offset box: [reserved:4=0][count:4=1] + one (start, size)
+    // pair, big-endian (the QuickTime `'MM'` order).
+    let mut gps_body = Vec::new();
+    gps_body.extend_from_slice(&[0u8; 4]); // reserved
+    gps_body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+    gps_body.extend_from_slice(&block_offset.to_be_bytes()); // absolute start
+    gps_body.extend_from_slice(&(block.len() as u32).to_be_bytes()); // size
+    let gps_box = atom(b"gps ", &gps_body);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&gps_box);
+    let moov = atom(b"moov", &moov_body);
+    data.extend_from_slice(&moov);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(
+      !meta.ligogps().samples().is_empty(),
+      "the freeGPS-embedded LigoGPS block must decode"
+    );
+    // The LigoGPS sample's stamped doc must be GREATER than the gps0 fix's doc
+    // (gps0 was processed first in walk order → lower global ordinal).
+    let ligo_doc = meta.ligogps().samples()[0]
+      .doc()
+      .expect("LigoGPS sample carries a GLOBAL doc (Finding 3)");
+    let gps0_doc = meta
+      .stream()
+      .gps_samples()
+      .iter()
+      .find_map(|s| s.doc())
+      .expect("gps0 fix carries a global doc");
+    assert!(
+      ligo_doc > gps0_doc,
+      "LigoGPS doc {ligo_doc} must continue the GLOBAL sequence after the gps0 doc {gps0_doc} (no restart/collision)"
+    );
+
+    // `-ee -G3`: the LigoGPS row carries its stamped global `Doc<N>` (family-3).
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let ligo_docs: std::vec::Vec<u32> = meta
+      .tags(ee_g3)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO" && t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().group_ref().doc())
+      .collect();
+    assert_eq!(ligo_docs.len(), 1, "one LigoGPS GPSLatitude row");
+    assert_eq!(
+      ligo_docs[0], ligo_doc,
+      "the LigoGPS row uses its stamped global Doc<N>"
+    );
+  }
+
+  /// Build a file-end LigoGPS `&&&&` trailer carrying ONE plain-ASCII binary
+  /// record at `lat`/`lon`. Layout = `[skip atom: size:u32-BE | "skip"]` +
+  /// `LIGOGPSINFO\0` + 8-byte preamble (`\0\0\0\x14…`) + a 0x84 ASCII record,
+  /// then the `&&&&` magic + the trailer length as BE-u32 (the `IdentifyTrailers`
+  /// `Get32u(buff,36)` order, QuickTime.pm:9907). The `skip` atom's declared SIZE
+  /// is `16 + payload.len()` (the QuickTime.pm:10660 `$len = size - 16` rule).
+  fn ligogps_ampersand_trailer(lat: &str, lon: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(crate::formats::ligogps::HDR_LIGOGPSINFO);
+    payload.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]);
+    let mut record = Vec::with_capacity(0x84);
+    record.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    record
+      .extend_from_slice(std::format!("2024/01/15 10:00:02 N:{lat} E:{lon} 30.0 km/h").as_bytes());
+    while record.len() < 0x84 {
+      record.push(0);
+    }
+    payload.extend_from_slice(&record);
+    let skip_atom_size = (16 + payload.len()) as u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&skip_atom_size.to_be_bytes());
+    body.extend_from_slice(b"skip");
+    body.extend_from_slice(&payload);
+    let trailer_len = (body.len() + 8) as u32;
+    let mut out = body;
+    out.extend_from_slice(b"&&&&");
+    out.extend_from_slice(&trailer_len.to_be_bytes());
+    out
+  }
+
+  /// The canonical `ProcessMOV` `Doc<N>` allocation order across a MIXED-source
+  /// file (QuickTime.pm:10654-10681). One file carries THREE LigoGPS-tier GPS
+  /// sources at DIFFERENT phases: a top-level `gps0` magic box (moov-timed, via
+  /// `extract_stream`), a top-level `udta`-LigoGPS-JSON record, and a file-end
+  /// `&&&&` LigoGPS binary trailer. The faithful single-walk order is:
+  /// moov-timed FIRST (`gps0` → Doc1), THEN the `udta`-LigoGPS (→ Doc2, stamped
+  /// AFTER the moov-timed phase), THEN the trailer (→ Doc3, the trailer phase) —
+  /// one CONTINUOUS global sequence, NO collision. (`ScanMediaData` would run
+  /// last; this file has no `mdat` freeGPS so it contributes nothing.)
+  #[test]
+  fn mixed_source_canonical_doc_order_moov_then_udta_then_trailer() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+
+    // gps0 — one 32-byte LE record (the existing `ligogps_mixed_source` shape).
+    let mut gps0 = Vec::new();
+    gps0.extend_from_slice(&4530.0f64.to_le_bytes()); // lat 45°30' = 45.5
+    gps0.extend_from_slice(&12030.0f64.to_le_bytes()); // lon 120°30' = 120.5
+    gps0.extend_from_slice(&100i32.to_le_bytes());
+    gps0.extend_from_slice(&50u16.to_le_bytes());
+    gps0.extend_from_slice(&[24, 1, 15, 10, 0, 0]);
+    gps0.extend_from_slice(&[0, 0]);
+    gps0.extend_from_slice(&[60]);
+    while gps0.len() < 32 {
+      gps0.push(0);
+    }
+    let gps0_atom = atom(b"gps0", &gps0);
+
+    // Top-level `udta` carrying a LigoGPS JSON record (one active fix).
+    let udta_json = br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "46.5", "Longitude": "121.5"}"#;
+    let udta_atom = atom(b"udta", udta_json);
+
+    // Layout = ftyp || gps0 || udta || moov(mvhd) || &&&&-trailer.
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&gps0_atom);
+    data.extend_from_slice(&udta_atom);
+    data.extend_from_slice(&atom(b"moov", &atom(b"mvhd", &[0u8; 100])));
+    data.extend_from_slice(&ligogps_ampersand_trailer("47.5", "122.5"));
+
+    let meta = parse_inner(&data, None).expect("accepted");
+
+    // ── typed-layer doc assertions ────────────────────────────────────────────
+    // gps0 → Doc1 (the lone moov-timed GPS sample).
+    let gps0_doc = meta
+      .stream()
+      .gps_samples()
+      .iter()
+      .find_map(|s| s.doc())
+      .expect("gps0 fix carries a global doc");
+    assert_eq!(gps0_doc, 1, "gps0 (moov-timed) opens Doc1");
+    // The two LigoGPS samples (udta first in the Vec, then trailer) → Doc2, Doc3.
+    let ligo: std::vec::Vec<u32> = meta
+      .ligogps()
+      .samples()
+      .iter()
+      .map(|s| s.doc().expect("LigoGPS sample carries a global doc"))
+      .collect();
+    assert_eq!(
+      ligo,
+      std::vec![2, 3],
+      "udta-LigoGPS (Doc2) precedes the &&&&-trailer (Doc3) — the canonical phase order"
+    );
+
+    // ── `-ee -G3` emission: continuous, collision-free global sequence ─────────
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let mut lat_docs: std::vec::Vec<u32> = meta
+      .tags(ee_g3)
+      .filter(|t| t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().group_ref().doc())
+      .collect();
+    lat_docs.sort_unstable();
+    assert_eq!(
+      lat_docs,
+      std::vec![1, 2, 3],
+      "the three GPSLatitude rows take a CONTINUOUS, non-colliding global Doc1/Doc2/Doc3"
+    );
+    // gps0's GPSLatitude is family1 `QuickTime`; the two LigoGPS ones are `LIGO`.
+    let gps0_lat_doc = meta
+      .tags(ee_g3)
+      .find(|t| t.tag().name() == "GPSLatitude" && t.tag().group_ref().family1() == "QuickTime")
+      .map(|t| t.tag().group_ref().doc())
+      .expect("gps0 GPSLatitude row");
+    assert_eq!(gps0_lat_doc, 1, "the moov-timed gps0 row is Doc1 (lowest)");
+  }
+
+  /// The Insta360 INSV/INSP trailer draws its `Doc<N>` from the ONE SHARED global
+  /// counter (NOT a local 0-based one) AND is processed in the TRAILER PHASE
+  /// (AFTER `extract_stream`), mirroring ExifTool's `ProcessMOV` trailer loop
+  /// (QuickTime.pm:10669-10673 `ProcessInsta360`). A file with a moov-timed `gps0`
+  /// box (→ Doc1) followed by an Insta360 trailer carrying one GPS `'A'` row: the
+  /// Insta360 row must take Doc2 (`doc_base = 1` after gps0), proving divergences
+  /// (c) the shared counter + (d) the trailer-LAST phase order end-to-end.
+  #[test]
+  fn insta360_trailer_doc_continues_shared_counter_after_moov_timed() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+
+    // gps0 — one 32-byte LE record → Doc1 (moov-timed, via `extract_stream`).
+    let mut gps0 = Vec::new();
+    gps0.extend_from_slice(&4530.0f64.to_le_bytes()); // 45.5
+    gps0.extend_from_slice(&12030.0f64.to_le_bytes()); // 120.5
+    gps0.extend_from_slice(&100i32.to_le_bytes());
+    gps0.extend_from_slice(&50u16.to_le_bytes());
+    gps0.extend_from_slice(&[24, 1, 15, 10, 0, 0]);
+    gps0.extend_from_slice(&[0, 0, 60]);
+    while gps0.len() < 32 {
+      gps0.push(0);
+    }
+
+    // A minimal Insta360 trailer: one 0x700 GPS `'A'` row + its 6-byte record
+    // footer, then the 78-byte trailer footer (`[id:u16][len:u32]` + opaque +
+    // `[trailer_len:u32]` + opaque + the 32-byte MAGIC). The record body is
+    // `[unixtime:u32][unknown:u32][ms:u16][status:u8][lat:f64][NS:u8][lon:f64]
+    // [EW:u8][speed:f64][track:f64][alt:f64]` (53 bytes, QuickTimeStream.pl:3397).
+    const INSTA360_GPS: u16 = 0x700;
+    let mut gps_body = Vec::new();
+    gps_body.extend_from_slice(&1_717_250_400u32.to_le_bytes()); // unixtime
+    gps_body.extend_from_slice(&0u32.to_le_bytes()); // unknown
+    gps_body.extend_from_slice(&0u16.to_le_bytes()); // ms
+    gps_body.push(b'A'); // status
+    gps_body.extend_from_slice(&48.0f64.to_le_bytes()); // lat
+    gps_body.push(b'N');
+    gps_body.extend_from_slice(&9.0f64.to_le_bytes()); // lon
+    gps_body.push(b'E');
+    gps_body.extend_from_slice(&10.0f64.to_le_bytes()); // speed m/s
+    gps_body.extend_from_slice(&90.0f64.to_le_bytes()); // track
+    gps_body.extend_from_slice(&200.0f64.to_le_bytes()); // altitude
+    assert_eq!(gps_body.len(), 53);
+
+    // The trailer span = [record body][record footer(6) is FOLDED into the 78-byte
+    // trailer footer's first 6 bytes]. So: body + 72 opaque bytes + MAGIC, with the
+    // footer's leading `[id:u16][len:u32]` = the last record's (id, len).
+    let mut trailer = gps_body.clone();
+    // The Insta360 trailer footer is a FIXED 78 bytes (QuickTimeStream.pl:3270
+    // `Seek(-78,2)`): id/len (6) + 32 opaque + trailer_len (4) + 4 opaque + the
+    // 32-byte MAGIC.
+    let trailer_len = (trailer.len() + 78) as u32;
+    trailer.extend_from_slice(&INSTA360_GPS.to_le_bytes());
+    trailer.extend_from_slice(&(gps_body.len() as u32).to_le_bytes());
+    trailer.resize(trailer.len() + 32, 0);
+    trailer.extend_from_slice(&trailer_len.to_le_bytes());
+    trailer.resize(trailer.len() + 4, 0);
+    trailer.extend_from_slice(crate::formats::insta360::MAGIC);
+
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&atom(b"gps0", &gps0));
+    data.extend_from_slice(&atom(b"moov", &atom(b"mvhd", &[0u8; 100])));
+    data.extend_from_slice(&trailer);
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    // gps0 → Doc1.
+    let gps0_doc = meta
+      .stream()
+      .gps_samples()
+      .iter()
+      .find_map(|s| s.doc())
+      .expect("gps0 doc");
+    assert_eq!(gps0_doc, 1, "gps0 (moov-timed) is Doc1");
+    // The Insta360 trailer's `doc_base` is the shared counter AFTER gps0 = 1, so
+    // its first surfaced row is Doc2 (NOT Doc1 — proving the shared counter).
+    assert_eq!(
+      meta.insta360().doc_base(),
+      1,
+      "Insta360 doc_base continues the shared counter after gps0 (Doc1)"
+    );
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let insta_lat_doc = meta
+      .tags(ee_g3)
+      .find(|t| t.tag().name() == "GPSLatitude" && t.tag().group_ref().family1() == "Insta360")
+      .map(|t| t.tag().group_ref().doc())
+      .expect("Insta360 GPSLatitude row");
+    assert_eq!(
+      insta_lat_doc, 2,
+      "the Insta360 GPS row takes Doc2 — the shared global successor of gps0's Doc1"
+    );
+  }
+
+  /// An out-of-range binary LigoGPS record BEFORE a good one BURNS a `Doc<N>`
+  /// (LigoGPS.pm:243 `++DOC_COUNT` runs BEFORE the :254 range-check `return`), so
+  /// the good record's `Doc<N>` is the burned slot's SUCCESSOR — an off-by-one vs
+  /// a no-reject file, matching bundled. Driven through the full `&&&&`-trailer
+  /// pipeline so the doc stamping is exercised end-to-end.
+  #[test]
+  fn out_of_range_binary_ligogps_burns_a_doc_before_good_record() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+
+    // A trailer with TWO 0x84 records: record 1 out-of-range (N:91.0 > 90),
+    // record 2 valid (N:45.5). Both share the one `LIGOGPSINFO\0` payload.
+    fn two_record_trailer() -> Vec<u8> {
+      let mut payload = Vec::new();
+      payload.extend_from_slice(crate::formats::ligogps::HDR_LIGOGPSINFO);
+      payload.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]);
+      for (i, rec) in [
+        b"2024/01/15 10:00:00 N:91.0 E:181.0 0.0 km/h".as_slice(),
+        b"2024/01/15 10:00:01 N:45.5 E:170.5 30.0 km/h".as_slice(),
+      ]
+      .into_iter()
+      .enumerate()
+      {
+        let mut record = Vec::with_capacity(0x84);
+        record.extend_from_slice(&[0x01, 0x02, 0x03, i as u8]);
+        record.extend_from_slice(rec);
+        while record.len() < 0x84 {
+          record.push(0);
+        }
+        payload.extend_from_slice(&record);
+      }
+      let skip_atom_size = (16 + payload.len()) as u32;
+      let mut body = Vec::new();
+      body.extend_from_slice(&skip_atom_size.to_be_bytes());
+      body.extend_from_slice(b"skip");
+      body.extend_from_slice(&payload);
+      let trailer_len = (body.len() + 8) as u32;
+      let mut out = body;
+      out.extend_from_slice(b"&&&&");
+      out.extend_from_slice(&trailer_len.to_be_bytes());
+      out
+    }
+
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&atom(b"moov", &atom(b"mvhd", &[0u8; 100])));
+    data.extend_from_slice(&two_record_trailer());
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    // Two samples: [0] = the burned out-of-range placeholder, [1] = the good fix.
+    let samples = meta.ligogps().samples();
+    assert_eq!(samples.len(), 2, "the rejected record burns a slot");
+    assert!(
+      samples[0].is_suppressed(),
+      "record 1 is the burned placeholder"
+    );
+    assert_eq!(samples[0].doc(), Some(1), "the burned record consumed Doc1");
+    assert!(!samples[1].is_suppressed());
+    assert_eq!(
+      samples[1].doc(),
+      Some(2),
+      "the good record's Doc is the burned slot's successor (off-by-one)"
+    );
+    assert_eq!(
+      meta.ligogps().warning(),
+      Some("LIGOGPSINFO coordinates out of range")
+    );
+
+    // `-ee -G3`: ONLY the good record emits a GPSLatitude, under Doc2 (the burned
+    // slot emits nothing yet still consumed Doc1).
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let lat_docs: std::vec::Vec<u32> = meta
+      .tags(ee_g3)
+      .filter(|t| t.tag().name() == "GPSLatitude")
+      .map(|t| t.tag().group_ref().doc())
+      .collect();
+    assert_eq!(
+      lat_docs,
+      std::vec![2],
+      "only the good record emits GPSLatitude, at Doc2 (the burned Doc1 emits nothing)"
+    );
+  }
+
+  /// A JSON LigoGPS record at latitude 0 (the equator written as `"0"`) emits NO
+  /// primary GPSLatitude/GPSLongitude (ExifTool's `$$info{Latitude} and
+  /// $$info{Longitude}` is Perl-FALSE for `"0"`, LigoGPS.pm:362) but STILL emits
+  /// GPSLatitude2/GPSLongitude2 from OLatitude/OLongitude (`defined`-gated,
+  /// LigoGPS.pm:382) and STILL consumes its `Doc<N>` (the bump is at :354, before
+  /// the coordinate emission).
+  #[test]
+  fn json_zero_primary_coord_suppresses_primary_keeps_secondary_and_doc() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+
+    // Latitude exactly "0" (Perl-false) ⇒ primary suppressed; OLatitude/OLongitude
+    // present ⇒ GPSLatitude2/GPSLongitude2 emit; the record still gets a Doc.
+    let udta_json = br#"LIGOGPSINFO {"status": "A", "NS": "N", "EW": "E", "Latitude": "0", "Longitude": "121.5", "OLatitude": "12.25", "OLongitude": "121.5"}"#;
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mut data = ftyp;
+    data.extend_from_slice(&atom(b"udta", udta_json));
+    data.extend_from_slice(&atom(b"moov", &atom(b"mvhd", &[0u8; 100])));
+
+    let meta = parse_inner(&data, None).expect("accepted");
+    let samples = meta.ligogps().samples();
+    assert_eq!(samples.len(), 1, "the active record decodes");
+    let s = &samples[0];
+    assert_eq!(
+      s.latitude(),
+      None,
+      "primary GPSLatitude suppressed (lat == 0)"
+    );
+    assert_eq!(
+      s.longitude(),
+      None,
+      "primary GPSLongitude suppressed (lat == 0)"
+    );
+    assert_eq!(
+      s.latitude2(),
+      Some(12.25),
+      "GPSLatitude2 from OLatitude survives"
+    );
+    assert_eq!(
+      s.longitude2(),
+      Some(121.5),
+      "GPSLongitude2 from OLongitude survives"
+    );
+    assert_eq!(s.doc(), Some(1), "the record still consumed its Doc1");
+
+    // `-ee -G3`: no primary GPSLatitude, but a GPSLatitude2 under Doc1.
+    let ee_g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let names: std::vec::Vec<smol_str::SmolStr> = meta
+      .tags(ee_g3)
+      .filter(|t| t.tag().group_ref().family1() == "LIGO")
+      .map(|t| smol_str::SmolStr::new(t.tag().name()))
+      .collect();
+    assert!(
+      !names.iter().any(|n| n == "GPSLatitude"),
+      "no primary GPSLatitude emitted"
+    );
+    assert!(
+      names.iter().any(|n| n == "GPSLatitude2"),
+      "GPSLatitude2 IS emitted"
+    );
+  }
+
+  /// Wrap an arbitrary single `mett`-MetaFormat track SAMPLE (the raw record
+  /// bytes) in a minimal MP4 (no `application/...` MetaType ⇒ the Parrot drone
+  /// `[EP]\d` path). Shared by the Parrot emission tests so each can supply its
+  /// own V1 / V2 / V3 / E* sample.
+  fn parrot_mett_mp4_from(sample: &[u8]) -> Vec<u8> {
+    let ftyp = atom(b"ftyp", b"qt  \0\0\0\0");
+    let mdat = atom(b"mdat", sample);
+    let sample_offset = (ftyp.len() + 8) as u32;
+
+    let mut hdlr_body = vec![0u8; 24];
+    wr(&mut hdlr_body, 8, b"meta");
+    let hdlr = atom(b"hdlr", &hdlr_body);
+    let mut mdhd_body = vec![0u8; 24];
+    wr(&mut mdhd_body, 12, &1000u32.to_be_bytes());
+    let mdhd = atom(b"mdhd", &mdhd_body);
+    // stsd: one `mett` entry (no `application/...` ⇒ MetaType cleared ⇒ drone path).
+    let mut stsd_body = vec![0u8; 8];
+    wr(&mut stsd_body, 4, &1u32.to_be_bytes());
+    let mut entry = vec![0u8; 16];
+    wr(&mut entry, 0, &16u32.to_be_bytes());
+    wr(&mut entry, 4, b"mett");
+    stsd_body.extend_from_slice(&entry);
+    let stsd = atom(b"stsd", &stsd_body);
+    let mut stco_body = vec![0u8; 8];
+    wr(&mut stco_body, 4, &1u32.to_be_bytes());
+    stco_body.extend_from_slice(&sample_offset.to_be_bytes());
+    let stco = atom(b"stco", &stco_body);
+    let mut stsc_body = vec![0u8; 8];
+    wr(&mut stsc_body, 4, &1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = atom(b"stsc", &stsc_body);
+    let mut stsz_body = vec![0u8; 8];
+    wr(&mut stsz_body, 4, &0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&1u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(sample.len() as u32).to_be_bytes());
+    let stsz = atom(b"stsz", &stsz_body);
+    let mut stbl_body = stsd;
+    stbl_body.extend_from_slice(&stco);
+    stbl_body.extend_from_slice(&stsc);
+    stbl_body.extend_from_slice(&stsz);
+    let stbl = atom(b"stbl", &stbl_body);
+    let minf = atom(b"minf", &stbl);
+    let mut mdia_body = mdhd;
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = atom(b"mdia", &mdia_body);
+    let trak = atom(b"trak", &mdia);
+    let mvhd = atom(b"mvhd", &[0u8; 100]);
+    let mut moov_body = mvhd;
+    moov_body.extend_from_slice(&trak);
+    let moov = atom(b"moov", &moov_body);
+    let mut data = ftyp;
+    data.extend_from_slice(&mdat);
+    data.extend_from_slice(&moov);
+    data
+  }
+
+  /// Build an MP4 whose single `mett`-MetaFormat track sample is a Parrot V1
+  /// (`P1`) drone record carrying GPS + flight + pose telemetry. Shared by the
+  /// Parrot emission tests.
+  fn parrot_mett_mp4() -> Vec<u8> {
+    // A 60-byte V1 record: `[P1][nwords=14]` then bundled V1 offsets.
+    let mut p1 = vec![0u8; 60];
+    p1[0..2].copy_from_slice(b"P1");
+    wr(&mut p1, 2, &14u16.to_be_bytes());
+    // DroneYaw int16s @4, rad→deg: raw 0x1000 ⇒ 1*180/3.14159 ≈ 57.2959 deg.
+    p1[4..6].copy_from_slice(&(0x1000i16).to_be_bytes());
+    // CameraTilt int16s @12, rad→deg: raw -0x800 ⇒ -0.5*180/3.14159 ≈ -28.648.
+    p1[12..14].copy_from_slice(&(-0x800i16).to_be_bytes());
+    // FrameView int16s[4] @14, each /0x1000 ⇒ [1, 0.5, -0.25, 0].
+    p1[14..16].copy_from_slice(&(0x1000i16).to_be_bytes());
+    p1[16..18].copy_from_slice(&(0x800i16).to_be_bytes());
+    p1[18..20].copy_from_slice(&(-0x400i16).to_be_bytes());
+    p1[20..22].copy_from_slice(&(0i16).to_be_bytes());
+    // ExposureTime int16s @22, ValueConv /0x100/1000 — 1/60 s ⇒ raw ≈ 4267.
+    p1[22..24].copy_from_slice(&4267i16.to_be_bytes());
+    // ISO int16s @24.
+    p1[24..26].copy_from_slice(&800i16.to_be_bytes());
+    // WifiRSSI int8s @26.
+    p1[26] = (-65i8) as u8;
+    // Battery @27.
+    p1[27] = 75;
+    // GPSLatitude int32s @28 / 0x100000.
+    let lat_raw = (47.6062_f64 * f64::from(0x10_0000)).round() as i32;
+    p1[28..32].copy_from_slice(&lat_raw.to_be_bytes());
+    // GPSLongitude int32s @32 / 0x100000.
+    let lon_raw = (-122.3321_f64 * f64::from(0x10_0000)).round() as i32;
+    p1[32..36].copy_from_slice(&lon_raw.to_be_bytes());
+    // GPSAltitude word @36: (alt_m * 0x10000) | sv ⇒ ((w&0xffffff00)>>8)/256 = alt.
+    let alt_word = (120u32 * 0x1_0000) | 9;
+    p1[36..40].copy_from_slice(&alt_word.to_be_bytes());
+    // SpeedX int16s @48 / 0x100 ⇒ raw 0x100 ⇒ 1.0.
+    p1[48..50].copy_from_slice(&(0x100i16).to_be_bytes());
+    // Binning @54: high bit set (0x80) ⇒ Binning=1; low 7 bits = 3 (Flying).
+    p1[54] = 0x80 | 3;
+    // Animation @55: high bit clear ⇒ Animation=0; PilotingMode = 1 (Return Home).
+    p1[55] = 1;
+    parrot_mett_mp4_from(&p1)
+  }
+
+  /// Decoded Parrot `mett` telemetry must EMIT through
+  /// `Meta::tags()` under the enclosing `Track<N>` (family-1) at `-ee`, with the
+  /// per-version PrintConv from the V1 table (Parrot.pm:87-228).
+  // The DroneYaw/CameraTilt expectations recompute the bundled `180/3.14159`
+  // rad→deg ValueConv with the SAME literal the port uses (byte-exact parity).
+  #[allow(clippy::approx_constant)]
+  #[test]
+  fn parrot_tags_emitted_under_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+    use crate::value::TagValue;
+    let data = parrot_mett_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(!meta.parrot().is_empty(), "Parrot mett must decode");
+
+    // `-ee -n`: the raw post-ValueConv scalars under `Track1`.
+    let ee = EmitOptions::g1(ConvMode::ValueConv, true);
+    let parrot: std::vec::Vec<(String, TagValue)> = meta
+      .tags(ee)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let get = |name: &str| parrot.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(get("GPSLatitude"), Some(&TagValue::F64(lat_round(47.6062))));
+    assert_eq!(
+      get("GPSLongitude"),
+      Some(&TagValue::F64(lat_round(-122.3321)))
+    );
+    assert_eq!(get("GPSAltitude"), Some(&TagValue::F64(120.0)));
+    assert_eq!(get("GPSSatellites"), Some(&TagValue::U64(9)));
+    assert_eq!(get("ISO"), Some(&TagValue::I64(800)));
+    // FlyingState / PilotingMode raw codes at `-n`.
+    assert_eq!(get("FlyingState"), Some(&TagValue::U64(3)));
+    assert_eq!(get("PilotingMode"), Some(&TagValue::U64(1)));
+    // NEW V1 fields. DroneYaw raw 0x1000 → 0x1000/0x1000*180/3.14159 (rad→deg).
+    assert_eq!(
+      get("DroneYaw"),
+      Some(&TagValue::F64(
+        f64::from(0x1000) / f64::from(0x1000) * 180.0 / 3.14159
+      ))
+    );
+    // CameraTilt raw -0x800 → -0.5*180/3.14159.
+    assert_eq!(
+      get("CameraTilt"),
+      Some(&TagValue::F64(
+        f64::from(-0x800) / f64::from(0x1000) * 180.0 / 3.14159
+      ))
+    );
+    // FrameView int16s[4] @14, each /0x1000 → "1 0.5 -0.25 0" (space-joined,
+    // no PrintConv ⇒ same string at `-n`).
+    assert_eq!(
+      get("FrameView"),
+      Some(&TagValue::Str("1 0.5 -0.25 0".into()))
+    );
+    // SpeedX int16s @48 / 0x100, raw 0x100 → 1.0.
+    assert_eq!(get("SpeedX"), Some(&TagValue::F64(1.0)));
+    // Binning (high bit of FlyingState byte) → 1; Animation (high bit of
+    // PilotingMode byte) → 0. Raw int both modes.
+    assert_eq!(get("Binning"), Some(&TagValue::U64(1)));
+    assert_eq!(get("Animation"), Some(&TagValue::U64(0)));
+
+    // `-j`: the per-version PrintConv hashes + the WifiRSSI/Battery suffixes.
+    let pj = EmitOptions::g1(ConvMode::PrintConv, true);
+    let parrot_pj: std::vec::Vec<(String, TagValue)> = meta
+      .tags(pj)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let getp = |name: &str| parrot_pj.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(getp("FlyingState"), Some(&TagValue::Str("Flying".into())));
+    assert_eq!(
+      getp("PilotingMode"),
+      Some(&TagValue::Str("Return Home".into()))
+    );
+    assert_eq!(getp("WifiRSSI"), Some(&TagValue::Str("-65 dBm".into())));
+    assert_eq!(getp("Battery"), Some(&TagValue::Str("75 %".into())));
+    assert_eq!(
+      getp("GPSAltitude"),
+      Some(&TagValue::Str("120.000 m".into()))
+    );
+    assert_eq!(getp("ExposureTime"), Some(&TagValue::Str("1/60".into())));
+
+    // `-ee -G3`: every record is its own `Doc<N>` (one `mett` sample = Doc1),
+    // scoped to `Track1` (oracle `Doc1:Track1:GPSLatitude`).
+    let g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let lat = meta
+      .tags(g3)
+      .find(|t| t.tag().group_ref().family1() == "Track1" && t.tag().name() == "GPSLatitude")
+      .expect("GPSLatitude under Track1 at -G3");
+    assert_eq!(lat.tag().group_ref().doc(), 1, "first mett sample is Doc1");
+  }
+
+  /// Build an MP4 whose single `mett` sample is a Parrot V3 (`P3`) record
+  /// exercising the NEW V3-only columns (velocity, quaternion, colour balance,
+  /// FOV, link quality) — Parrot.pm:371-539.
+  fn parrot_v3_mett_mp4() -> Vec<u8> {
+    // 72-byte V3 record: `[P3][nwords]` + bundled V3 offsets (walker forces 72).
+    let mut p3 = vec![0u8; 72];
+    p3[0..2].copy_from_slice(b"P3");
+    wr(&mut p3, 2, &17u16.to_be_bytes());
+    // GPSLatitude/Longitude int32s @8/12 / 0x400000.
+    let lat_raw = (45.0_f64 * f64::from(0x40_0000)).round() as i32;
+    let lon_raw = (8.0_f64 * f64::from(0x40_0000)).round() as i32;
+    p3[8..12].copy_from_slice(&lat_raw.to_be_bytes());
+    p3[12..16].copy_from_slice(&lon_raw.to_be_bytes());
+    // GPSAltitude word @16: (100 m * 0x10000) | sv=12.
+    let alt_word = (100u32 * 0x1_0000) | 12;
+    p3[16..20].copy_from_slice(&alt_word.to_be_bytes());
+    // GPSVelocityNorth int16s @20 / 0x100 ⇒ raw 0x100 ⇒ 1.0.
+    p3[20..22].copy_from_slice(&(0x100i16).to_be_bytes());
+    // DroneQuaternion int16s[4] @28, each /0x4000 ⇒ [1, 0, 0, 0].
+    p3[28..30].copy_from_slice(&(0x4000i16).to_be_bytes());
+    // ExposureTime int16u @52 ⇒ 1/120 s ⇒ raw ≈ 2133.
+    p3[52..54].copy_from_slice(&(2133u16).to_be_bytes());
+    // ISO int16u @54.
+    p3[54..56].copy_from_slice(&(200u16).to_be_bytes());
+    // RedBalance int16u @56 / 0x4000 ⇒ raw 0x4000 ⇒ 1.0; BlueBalance @58 ⇒ 0.5.
+    p3[56..58].copy_from_slice(&(0x4000u16).to_be_bytes());
+    p3[58..60].copy_from_slice(&(0x2000u16).to_be_bytes());
+    // FOV int16u[2] @60, each /0x100 ⇒ [96, 64].
+    p3[60..62].copy_from_slice(&(0x6000u16).to_be_bytes());
+    p3[62..64].copy_from_slice(&(0x4000u16).to_be_bytes());
+    // LinkGoodput/LinkQuality word @64: (5000 << 8) | 4.
+    let link_word = (5000u32 << 8) | 4;
+    p3[64..68].copy_from_slice(&link_word.to_be_bytes());
+    // WifiRSSI @68, Battery @69.
+    p3[68] = (-70i8) as u8;
+    p3[69] = 50;
+    // FlyingState @70 = 4 (Landing); PilotingMode @71 = 5 (Move To).
+    p3[70] = 4;
+    p3[71] = 5;
+    parrot_mett_mp4_from(&p3)
+  }
+
+  /// The NEW V3-only Parrot columns must EMIT through `Meta::tags()` at `-ee`
+  /// with their bundled ValueConv (`-n`) and PrintConv (`-j`).
+  #[test]
+  fn parrot_v3_new_fields_emitted_under_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::value::TagValue;
+    let data = parrot_v3_mett_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(!meta.parrot().is_empty(), "Parrot V3 mett must decode");
+
+    // `-ee -n`: raw post-ValueConv scalars.
+    let ee = EmitOptions::g1(ConvMode::ValueConv, true);
+    let parrot: std::vec::Vec<(String, TagValue)> = meta
+      .tags(ee)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let get = |name: &str| parrot.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    // GPSVelocityNorth raw 0x100 / 0x100 = 1.0 (raw number, no PrintConv).
+    assert_eq!(get("GPSVelocityNorth"), Some(&TagValue::F64(1.0)));
+    // DroneQuaternion [0x4000,0,0,0] / 0x4000 = "1 0 0 0" (space-joined).
+    assert_eq!(
+      get("DroneQuaternion"),
+      Some(&TagValue::Str("1 0 0 0".into()))
+    );
+    // RedBalance raw 0x4000 / 0x4000 = 1.0; BlueBalance 0x2000 = 0.5.
+    assert_eq!(get("RedBalance"), Some(&TagValue::F64(1.0)));
+    assert_eq!(get("BlueBalance"), Some(&TagValue::F64(0.5)));
+    // FOV int16u[2] [0x6000,0x4000] / 0x100 = "96 64" (space-joined).
+    assert_eq!(get("FOV"), Some(&TagValue::Str("96 64".into())));
+    // LinkGoodput (Mask 0xffffff00 >> 8) = 5000 (raw int at -n).
+    assert_eq!(get("LinkGoodput"), Some(&TagValue::U64(5000)));
+    // LinkQuality (Mask 0xff) = 4.
+    assert_eq!(get("LinkQuality"), Some(&TagValue::U64(4)));
+    // FlyingState / PilotingMode raw codes.
+    assert_eq!(get("FlyingState"), Some(&TagValue::U64(4)));
+    assert_eq!(get("PilotingMode"), Some(&TagValue::U64(5)));
+
+    // `-j`: LinkGoodput PrintConv `"$val kbit/s"` + per-version state hashes.
+    let pj = EmitOptions::g1(ConvMode::PrintConv, true);
+    let parrot_pj: std::vec::Vec<(String, TagValue)> = meta
+      .tags(pj)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let getp = |name: &str| parrot_pj.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    assert_eq!(
+      getp("LinkGoodput"),
+      Some(&TagValue::Str("5000 kbit/s".into()))
+    );
+    assert_eq!(getp("FlyingState"), Some(&TagValue::Str("Landing".into())));
+    assert_eq!(getp("PilotingMode"), Some(&TagValue::Str("Move To".into())));
+    // FOV / DroneQuaternion carry no PrintConv ⇒ identical strings at `-j`.
+    assert_eq!(getp("FOV"), Some(&TagValue::Str("96 64".into())));
+  }
+
+  /// Build an MP4 whose single `mett` sample is a P2 V2 basic record followed by
+  /// concatenated `E2` FollowMe and `E3` Automation extension records (the
+  /// universal real-world shape — Parrot.pm:836-852 folds the extensions into the
+  /// same sample buffer). All three share the one `Doc<N>` `ProcessSamples` opens.
+  fn parrot_e2_e3_mett_mp4() -> Vec<u8> {
+    // P2 record forced to 56 bytes; put a GPS fix so the sample is non-empty.
+    let mut p2 = vec![0u8; 56];
+    p2[0..2].copy_from_slice(b"P2");
+    wr(&mut p2, 2, &13u16.to_be_bytes());
+    let lat_raw = (47.0_f64 * f64::from(0x40_0000)).round() as i32;
+    p2[8..12].copy_from_slice(&lat_raw.to_be_bytes());
+
+    // E2 FollowMe: `[E2][nwords]` + table offsets. nwords*4+4 = size; the body
+    // runs through offset 17 (Follow-meAnimation) ⇒ need ≥ 18 bytes ⇒ nwords=4
+    // gives 20 bytes.
+    let mut e2 = vec![0u8; 20];
+    e2[0..2].copy_from_slice(b"E2");
+    wr(&mut e2, 2, &4u16.to_be_bytes());
+    // GPSTargetLatitude int32s @4 / 0x400000.
+    let tlat_raw = (47.5_f64 * f64::from(0x40_0000)).round() as i32;
+    e2[4..8].copy_from_slice(&tlat_raw.to_be_bytes());
+    // Follow-meMode int8u @16: bits 0 and 1 set ⇒ "Follow-me enabled, Follow-me".
+    e2[16] = 0b011;
+    // Follow-meAnimation int8u @17 = 1 (Orbit).
+    e2[17] = 1;
+
+    // E3 Automation: body through offset 29 (AutomationFlags) ⇒ ≥ 30 bytes ⇒
+    // nwords=7 gives 32 bytes.
+    let mut e3 = vec![0u8; 32];
+    e3[0..2].copy_from_slice(b"E3");
+    wr(&mut e3, 2, &7u16.to_be_bytes());
+    // GPSFramingLatitude int32s @4 / 0x400000.
+    let flat_raw = (47.25_f64 * f64::from(0x40_0000)).round() as i32;
+    e3[4..8].copy_from_slice(&flat_raw.to_be_bytes());
+    // AutomationAnimation int8u @28 = 4 (Dolly Slide).
+    e3[28] = 4;
+    // AutomationFlags int8u @29: bit 1 set ⇒ "Look-at-me enabled".
+    e3[29] = 0b010;
+
+    let mut sample = p2;
+    sample.extend_from_slice(&e2);
+    sample.extend_from_slice(&e3);
+    parrot_mett_mp4_from(&sample)
+  }
+
+  /// The `E2` FollowMe + `E3` Automation extension fields must EMIT through
+  /// `Meta::tags()` at `-ee`, under the SAME `Track1` / `Doc1` as the host P2,
+  /// with their bundled ValueConv (`-n`) and PrintConv / BITMASK (`-j`).
+  #[test]
+  fn parrot_e2_e3_fields_emitted_under_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    use crate::serialize_key::GroupMode;
+    use crate::value::TagValue;
+    let data = parrot_e2_e3_mett_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(!meta.parrot().is_empty(), "Parrot E2/E3 mett must decode");
+
+    // `-ee -n`: raw post-ValueConv scalars (the waypoint coords carry NO ToDMS).
+    let ee = EmitOptions::g1(ConvMode::ValueConv, true);
+    let parrot: std::vec::Vec<(String, TagValue)> = meta
+      .tags(ee)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let get = |name: &str| parrot.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    // GPSTargetLatitude raw decimal degrees (round-trip through the fixture).
+    let tlat = {
+      let raw = (47.5_f64 * f64::from(0x40_0000)).round() as i32;
+      f64::from(raw) / f64::from(0x40_0000)
+    };
+    assert_eq!(get("GPSTargetLatitude"), Some(&TagValue::F64(tlat)));
+    // GPSFramingLatitude likewise.
+    let flat = {
+      let raw = (47.25_f64 * f64::from(0x40_0000)).round() as i32;
+      f64::from(raw) / f64::from(0x40_0000)
+    };
+    assert_eq!(get("GPSFramingLatitude"), Some(&TagValue::F64(flat)));
+    // Follow-meMode / AutomationFlags raw ints at `-n`.
+    assert_eq!(get("Follow-meMode"), Some(&TagValue::U64(0b011)));
+    assert_eq!(get("AutomationFlags"), Some(&TagValue::U64(0b010)));
+    // Follow-meAnimation / AutomationAnimation raw ints at `-n`.
+    assert_eq!(get("Follow-meAnimation"), Some(&TagValue::U64(1)));
+    assert_eq!(get("AutomationAnimation"), Some(&TagValue::U64(4)));
+
+    // `-j`: the BITMASK DecodeBits + the animation PrintConv hashes.
+    let pj = EmitOptions::g1(ConvMode::PrintConv, true);
+    let parrot_pj: std::vec::Vec<(String, TagValue)> = meta
+      .tags(pj)
+      .filter(|t| t.tag().group_ref().family1() == "Track1")
+      .map(|t| (t.tag().name().to_string(), t.tag().value_ref().clone()))
+      .collect();
+    let getp = |name: &str| parrot_pj.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    // Follow-meMode bits 0,1 ⇒ "Follow-me enabled, Follow-me" (DecodeBits join).
+    assert_eq!(
+      getp("Follow-meMode"),
+      Some(&TagValue::Str("Follow-me enabled, Follow-me".into()))
+    );
+    assert_eq!(
+      getp("Follow-meAnimation"),
+      Some(&TagValue::Str("Orbit".into()))
+    );
+    // AutomationFlags bit 1 ⇒ "Look-at-me enabled".
+    assert_eq!(
+      getp("AutomationFlags"),
+      Some(&TagValue::Str("Look-at-me enabled".into()))
+    );
+    assert_eq!(
+      getp("AutomationAnimation"),
+      Some(&TagValue::Str("Dolly Slide".into()))
+    );
+
+    // All three records share ONE `Doc<N>` (the `mett` sample's document) at -G3.
+    let g3 = EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3);
+    let docs: std::vec::Vec<u32> = meta
+      .tags(g3)
+      .filter(|t| {
+        t.tag().group_ref().family1() == "Track1"
+          && matches!(
+            t.tag().name(),
+            "GPSLatitude" | "GPSTargetLatitude" | "GPSFramingLatitude"
+          )
+      })
+      .map(|t| t.tag().group_ref().doc())
+      .collect();
+    assert_eq!(docs.len(), 3, "P2 + E2 + E3 latitudes all present");
+    assert!(
+      docs.iter().all(|&d| d == 1),
+      "P2/E2/E3 share the one sample Doc1"
+    );
+  }
+
+  /// The Parrot tags are `-ee`-gated: WITHOUT
+  /// ExtractEmbedded `Meta::tags()` emits NONE of them.
+  #[test]
+  fn parrot_tags_absent_without_ee() {
+    use crate::emit::{ConvMode, EmitOptions, Taggable};
+    let data = parrot_mett_mp4();
+    let meta = parse_inner(&data, None).expect("accepted");
+    assert!(!meta.parrot().is_empty(), "Parrot still decodes");
+    let noee = EmitOptions::g1(ConvMode::PrintConv, false);
+    let any_parrot = meta.tags(noee).any(|t| {
+      t.tag().group_ref().family1() == "Track1"
+        && matches!(
+          t.tag().name(),
+          "GPSLatitude" | "GPSAltitude" | "FlyingState" | "Battery" | "ISO"
+        )
+    });
+    assert!(!any_parrot, "no Parrot mett tags without -ee");
+  }
+
+  /// The `f64::from(int32s)/0x100000` round-trip the V1 GPS decoder applies —
+  /// the test's expected decimal-degree value (not exactly the literal, since the
+  /// fixture encodes `round(deg * 0x100000)`).
+  fn lat_round(deg: f64) -> f64 {
+    let raw = (deg * f64::from(0x10_0000)).round() as i32;
+    f64::from(raw) / f64::from(0x10_0000)
+  }
+
   /// **R8-B class-sweep** — a `moov/udta/GPMF` atom sets ExifTool's
   /// `$$et{FoundEmbedded}` (it routes through `GoPro::ProcessGoPro`, which sets
   /// the flag on ENTRY, GoPro.pm:822), and in ExifTool the `moov` walk runs
@@ -11612,14 +14359,17 @@ mod tests {
     data.extend_from_slice(&moov2);
 
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+    let found_embedded = quicktime_stream::extract_stream(
       &data,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero8 Black"));
     assert!(
@@ -11651,10 +14401,13 @@ mod tests {
       &data,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
       meta.device_name(),
@@ -11693,10 +14446,13 @@ mod tests {
       &data_a,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta_a,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
       meta_a.device_name(),
@@ -11721,10 +14477,13 @@ mod tests {
       &data_b,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta_b,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
       meta_b.device_name(),
@@ -11743,14 +14502,17 @@ mod tests {
     let mut data = atom(b"ftyp", b"qt  ");
     data.extend_from_slice(&moov);
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+    let found_embedded = quicktime_stream::extract_stream(
       &data,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero6 Black"));
     assert!(found_embedded);
@@ -11762,14 +14524,17 @@ mod tests {
   fn moov_udta_gpmf_none_and_truncation_safe() {
     let data = atom(b"ftyp", b"qt  ");
     let mut meta = GoProMeta::new();
-    let (_stream, found_embedded) = quicktime_stream::extract_stream(
+    let found_embedded = quicktime_stream::extract_stream(
       &data,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(meta.is_empty());
     assert!(!found_embedded);
@@ -11785,10 +14550,13 @@ mod tests {
       &trunc,
       None,
       None,
+      &mut crate::metadata::QuickTimeStreamMeta::new(),
       &mut meta2,
       &mut crate::metadata::CammMeta::new(),
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(meta2.is_empty());
   }

@@ -74,7 +74,7 @@ use alloc::{
 use crate::{
   datetime::{convert_datetime, convert_unix_time},
   formats::quicktime_freegps::{self, FreeGpsState},
-  metadata::{GpsSample, MebxSample, QuickTimeStreamMeta},
+  metadata::{GpsSample, MebxSample, ParrotMeta, QuickTimeStreamMeta},
 };
 
 /// QuickTime epoch offset: seconds between 1904-01-01 and 1970-01-01.
@@ -1673,6 +1673,12 @@ struct StreamTrack {
   /// `stsd` MetaFormat — the sample-description format code
   /// (QuickTime.pm:7765-7768).
   meta_format: [u8; 4],
+  /// `stsd` MetaType — the `(application/...)` substring extracted from
+  /// the sample-description entry bytes per QuickTime.pm:7769-7774. Empty
+  /// when no `application/...` string was present. Used by the `mett`
+  /// MetaFormat dispatch to switch the Parrot walker between ARCore-TLV
+  /// and drone-`[EP]\d` modes (Parrot.pm:802-822 vs :823-852).
+  meta_type: alloc::string::String,
   /// `mdhd` MediaTimeScale.
   media_ts: u32,
   /// The `stbl` sample tables.
@@ -1708,11 +1714,14 @@ fn process_samples(
   track: &StreamTrack,
   track_index: u32,
   create_date_raw: Option<u64>,
+  free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
+  ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
     Some(s) => s,
@@ -1749,11 +1758,14 @@ fn process_samples(
       track_index,
       sample,
       create_date_raw,
+      free_gps_state,
       out,
       gopro_out,
       camm_out,
       sony_rtmd_out,
       canon_ctmd_out,
+      parrot_out,
+      &mut *ligogps_out,
     );
   }
   found_embedded
@@ -1763,51 +1775,28 @@ fn process_samples(
 /// the dispatch arms of QuickTimeStream.pl:1467-1578.
 ///
 /// Returns `true` iff the sample ENTERED the GoPro GPMF processor — i.e. a
-/// non-deferred `gpmd` sample — mirroring ExifTool's `$$et{FoundEmbedded} = 1`
-/// set on `ProcessGoPro` entry (GoPro.pm:822), which fires before the KLV loop
-/// and so is independent of extraction success. A deferred `gpmd` variant
-/// (Kingslim/Rove/FMAS/Wolfbox) and the `mebx`/other paths set no
-/// `FoundEmbedded`.
+/// `gpmd` sample that matched no dashcam variant `Condition` and so fell
+/// through to the no-`Condition` `gpmd_GoPro` fallback — mirroring ExifTool's
+/// `$$et{FoundEmbedded} = 1` set on `ProcessGoPro` entry (GoPro.pm:822), which
+/// fires before the KLV loop and so is independent of extraction success. A
+/// matched `gpmd` variant (Kingslim/Rove/FMAS/Wolfbox, decoded in-place via
+/// [`crate::formats::quicktime_freegps::dispatch_gpmd`]) and the `mebx`/other
+/// paths set no `FoundEmbedded`.
 #[must_use]
-/// The non-GoPro `gpmd` MetaFormat variants (QuickTimeStream.pl:181-208):
-/// Kingslim / Rove / FMAS / Wolfbox. Each matches a leading-byte `Condition`
-/// and routes to a processor this port DEFERS (the brute-force `mdat` scan
-/// recovers them instead), so a matching `gpmd` sample must not be dispatched
-/// to the GoPro KLV walker nor set `FoundEmbedded`. Byte-checks use the
-/// checked `.get` form (file-level `deny(indexing_slicing)`).
-fn is_deferred_gpmd_variant(buff: &[u8]) -> bool {
-  // gpmd_Kingslim: `/^.{21}\0\0\0A[NS][EW]/s` (QuickTimeStream.pl:182-184).
-  let kingslim = buff.get(21..24) == Some(&[0, 0, 0][..])
-    && buff.get(24) == Some(&b'A')
-    && matches!(buff.get(25), Some(b'N' | b'S'))
-    && matches!(buff.get(26), Some(b'E' | b'W'));
-  // gpmd_Rove: `/^\0\0\xf2\xe1\xf0\xeeTT/` (QuickTimeStream.pl:189-191).
-  let rove = buff.get(0..8) == Some(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, b'T', b'T'][..]);
-  // gpmd_FMAS: `/^FMAS\0\0\0\0/` (QuickTimeStream.pl:196-198).
-  let fmas = buff.get(0..8) == Some(b"FMAS\0\0\0\0".as_slice());
-  // gpmd_Wolfbox: `/^.{136}(0{16}[A-Z]{4}|https:\/\/www.redtiger\0)/s`
-  // (QuickTimeStream.pl:203-205).
-  let wolfbox = (buff
-    .get(136..152)
-    .is_some_and(|s| s.iter().all(|&b| b == b'0'))
-    && buff
-      .get(152..156)
-      .is_some_and(|s| s.iter().all(|&b| b.is_ascii_uppercase())))
-    || buff.get(136..157) == Some(b"https://www.redtiger\0".as_slice());
-  kingslim || rove || fmas || wolfbox
-}
-
 fn decode_one_sample(
   buff: &[u8],
   track: &StreamTrack,
   track_index: u32,
   sample: &Sample,
   create_date_raw: Option<u64>,
+  free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
+  ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
   // metadata via the `keys` table. `FoundSomething` records the per-`Doc<N>`
@@ -1890,38 +1879,51 @@ fn decode_one_sample(
     return false;
   }
   // The `gpmd` MetaFormat (QuickTimeStream.pl:181-212) — five condition-
-  // dispatched variants. The fallback (no other Condition matches) is
-  // `gpmd_GoPro`, whose SubDirectory routes the sample bytes into
-  // `Image::ExifTool::GoPro::GPMF`. exifast's GoPro KLV parser is
-  // [`crate::formats::gopro::process_gopro`]. The Kingslim / Rove / FMAS /
-  // Wolfbox variants re-dispatch into ProcessFreeGPS / Process_text /
-  // ProcessFMAS / ProcessWolfbox — DEFERRED at the `gpmd` dispatch level
-  // (the brute-force `mdat` scan already locates Kingslim/Rove/FMAS records
-  // when they're stored in `free`/`mdat` rather than as `gpmd` samples).
+  // dispatched variants. exifast's dispatch mirrors the bundled Condition
+  // cascade in [`crate::formats::quicktime_freegps::dispatch_gpmd`]: the
+  // Kingslim D4 dashcam, Rove Stealth 4K, Vantrue N2S (FMAS), and Wolfbox
+  // G900 / Redtiger F9 4K branches feed the typed [`GpsSample`] vector via
+  // [`crate::formats::quicktime_freegps`]; the unmatched fallback routes
+  // through the GoPro KLV walker
+  // (`Image::ExifTool::GoPro::GPMF`).
   if &track.meta_format == b"gpmd" {
     // QuickTimeStream.pl:181-212 is an ORDERED `Condition` list: Kingslim /
     // Rove / FMAS / Wolfbox each match a leading-byte signature and route to a
     // deferred non-GoPro processor (ProcessFreeGPS / Process_text / ProcessFMAS
     // / ProcessWolfbox); only the no-`Condition` `gpmd_GoPro` fallback reaches
-    // `GoPro::GPMF`. A deferred variant must NOT be parsed as GoPro and must
-    // NOT set `FoundEmbedded` — otherwise its printable FourCC (e.g. `FMAS`)
-    // would be mistaken for a GoPro record and suppress the brute-force `mdat`
-    // scan that actually recovers these records. Mirror the ordered dispatch:
-    // skip a deferred signature, fall through to GoPro only otherwise.
-    if is_deferred_gpmd_variant(buff) {
+    // `GoPro::GPMF`. Decode a matching dashcam variant in-place (the bundled
+    // Condition cascade routes it to its process-proc HERE, during
+    // `ProcessSamples`, not via the later `ScanMediaData` brute-force scan);
+    // fall through to the GoPro KLV walker only when no signature matched.
+    if crate::formats::quicktime_freegps::dispatch_gpmd(buff, out, ligogps_out, free_gps_state) {
+      // A matched dashcam variant is NOT the GoPro GPMF path, so do not set the
+      // GoPro `FoundEmbedded` flag (return `false`). This matches bundled for
+      // Rove (`Process_text`), FMAS (`ProcessFMAS`) and Wolfbox
+      // (`ProcessWolfbox`) — none of those set `$$et{FoundEmbedded}`.
+      //
+      // The Kingslim branch routes to GPSType-5 / `ProcessLigoGPS` (the
+      // `.{80}LIGOGPSINFO` arm, QuickTimeStream.pl:1843-1888) via
+      // `process_free_gps`, which is the bundled `gpmd_Kingslim` process-proc
+      // `ProcessFreeGPS` and sets `$$et{FoundEmbedded} = 1`
+      // (QuickTimeStream.pl:1650). The WALK-LEVEL `free_gps_state` is threaded
+      // into `dispatch_gpmd`, so that flag reaches `extract_stream` and
+      // suppresses the brute-force `mdat` re-scan (QuickTimeStream.pl:3689) — a
+      // real Kingslim file plus stray `freeGPS`-looking `mdat` bytes no longer
+      // double-emits. (The `return false` here is only the GoPro `FoundEmbedded`
+      // channel; the Kingslim `FoundEmbedded` rides `free_gps_state`.)
       return false;
     }
     // The `gpmd_GoPro` fallback — the KLV walker. Run it for EXTRACTION, but
     // the `FoundEmbedded` side-effect is decoupled from extraction success:
     // ExifTool sets `$$et{FoundEmbedded} = 1` on ENTRY to `ProcessGoPro`
     // (GoPro.pm:822), BEFORE the KLV record loop (:831), so it fires for EVERY
-    // non-deferred `gpmd` sample — even one whose payload is zero-filled,
+    // non-variant `gpmd` sample — even one whose payload is zero-filled,
     // truncated, or otherwise extracts nothing. Because `gpmd_GoPro` is the
-    // no-`Condition` fallback (QuickTimeStream.pl:209-212), a non-deferred
-    // `gpmd` sample ALWAYS enters `ProcessGoPro`, so `FoundEmbedded` is always
-    // set ⇒ `ScanMediaData` returns early (QuickTimeStream.pl:3689). Returning
-    // the walker's recognition bool instead would let a corrupt-but-
-    // non-deferred `gpmd` sample leave `FoundEmbedded` unset, and the later
+    // no-`Condition` fallback (QuickTimeStream.pl:209-212), a `gpmd` sample
+    // that matched no variant ALWAYS enters `ProcessGoPro`, so `FoundEmbedded`
+    // is always set ⇒ `ScanMediaData` returns early (QuickTimeStream.pl:3689).
+    // Returning the walker's recognition bool instead would let a corrupt-but-
+    // non-variant `gpmd` sample leave `FoundEmbedded` unset, and the later
     // brute-force `mdat` scan would emit extra GP6/freeGPS tags ExifTool skips.
     // So: extract via the walker, but report `true` UNCONDITIONALLY.
     let _extracted = crate::formats::gopro::process_gopro(buff, gopro_out);
@@ -2032,16 +2034,59 @@ fn decode_one_sample(
     }
     return false;
   }
+  // Parrot `mett` MetaFormat (QuickTimeStream.pl:312-315 — the SubDirectory
+  // route into `Image::ExifTool::Parrot::mett` whose PROCESS_PROC is
+  // `Parrot::Process_mett`). Drone metadata samples (Parrot.pm:23-84)
+  // dispatch by 2-char ID `[EP]\d` to per-version V1/V2/V3 binary tables;
+  // ARCore phone-camera variants dispatch by `MetaType` (an `application/
+  // arcore-*` string extracted from the `stsd` entry by QuickTime.pm:7769-
+  // 7774). `process_mett` carries both walker shapes.
+  //
+  // `ProcessSamples` opens ONE `Doc<N>` per timed sample (`FoundSomething`),
+  // then `Process_mett` `HandleTag`s every record (the P-record GPS + flight
+  // fields, and any concat'd E1 TimeStamp) under it — so all of a sample's tags
+  // share one document (QuickTimeStream.pl:1517-1523; `Process_mett` never bumps
+  // the doc). Mirror the `rtmd` / `CTMD` arms: open the GLOBAL doc (the shared
+  // stream counter, so the ordinal continues across the file's mebx/camm/rtmd/
+  // CTMD/SP3 sources), decode the sample, and stamp that `doc` + `Track<N>` + the
+  // sample-table SampleTime/SampleDuration onto exactly the records this decode
+  // produced (watermark `*_sample_count()` before the call). `Process_mett` does
+  // NOT set `$$et{FoundEmbedded}`, so this returns `false` (no `mdat`-scan
+  // suppression).
+  if &track.meta_format == b"mett" {
+    let meta_type = if track.meta_type.is_empty() {
+      None
+    } else {
+      Some(track.meta_type.as_str())
+    };
+    let gps_start = parrot_out.gps_sample_count();
+    let flight_start = parrot_out.flight_sample_count();
+    let follow_me_start = parrot_out.follow_me_sample_count();
+    let automation_start = parrot_out.automation_sample_count();
+    let doc = out.open_doc();
+    crate::formats::parrot::process_mett(buff, meta_type, parrot_out);
+    parrot_out.stamp_doc_from(
+      gps_start,
+      flight_start,
+      follow_me_start,
+      automation_start,
+      doc,
+      track_index,
+      sample.time,
+      sample.dur,
+    );
+    return false;
+  }
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
   // reaches `process_samples` ([`is_meta_handler`] excludes `gps `, faithful
   // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
   // EMPTY-HandlerType `moov`-level box ([`process_moov_gps_box`]), not a track.
   //
-  // Sony `rtmd` / Canon `CTMD` / `tx3g` / …:
-  // DEFERRED — these re-dispatch into other ExifTool modules (Sony.pm,
-  // Canon.pm) or the 850-line ProcessFreeGPS. See module docs +
-  // docs/tracking.md. An unrecognized MetaFormat yields no samples, exactly
-  // as ExifTool's "Unknown $type format" branch (QuickTimeStream.pl:1547).
+  // `tx3g` / …:
+  // DEFERRED — these re-dispatch into other ExifTool modules or the 850-line
+  // ProcessFreeGPS. See module docs + docs/tracking.md. An unrecognized
+  // MetaFormat yields no samples, exactly as ExifTool's "Unknown $type
+  // format" branch (QuickTimeStream.pl:1547).
   let _ = (buff, &track.handler);
   false
 }
@@ -2170,6 +2215,22 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
     {
       track.meta_format = fmt;
     }
+    // QuickTime.pm:7769-7774 — MetaType is decoded by the per-entry `RawConv`
+    // `$$self{MetaType} = ($val=~/(application[^\0]+)/ ? $1 : undef)` against the
+    // SampleDescription entry bytes starting at offset 8. The assignment runs on
+    // EVERY entry (last-wins) and SETS THE RESULT — including `undef` (clearing
+    // it) when the entry carries no `application/...` run. Faithful: assign
+    // unconditionally per entry, so an earlier `application/arcore-*` entry does
+    // NOT leak its MetaType into a later entry that lacks one (which would make
+    // the Parrot `mett` walker wrongly take the ARCore-TLV path). Mirrors
+    // `meta_format` (also last-wins). A size-8..15 entry has the field absent;
+    // `scan_application_string` over the (possibly empty) body yields "" =
+    // ExifTool's `undef` clear, faithful to the regex matching nothing.
+    if let Some(entry_body) = pos.checked_add(8).and_then(|s| data.get(s..entry_end)) {
+      track.meta_type = scan_application_string(entry_body);
+    } else {
+      track.meta_type = alloc::string::String::new();
+    }
     // Child atoms (the `keys` table) follow the 16-byte SampleDescription
     // header — only present when the entry is large enough to hold them.
     if size >= 16
@@ -2196,6 +2257,33 @@ fn walk_stsd(data: &[u8], track: &mut StreamTrack) {
     pos = entry_end;
   }
   track.meta_keys = merged_keys;
+}
+
+/// QuickTime.pm:7773 — extract the first `application/...` substring
+/// from a `stsd` sample-description entry body, terminated by NUL or
+/// end-of-buffer. Returns an empty string when no match is found.
+/// Faithful: the bundled regex `(application[^\0]+)` matches greedily
+/// from the first occurrence of `"application"` up to (but not
+/// including) the first `\0` byte after that point.
+fn scan_application_string(bytes: &[u8]) -> alloc::string::String {
+  const NEEDLE: &[u8] = b"application";
+  // Sliding window over `bytes` looking for `NEEDLE` (checked via
+  // `windows` so a too-short buffer simply yields no match).
+  let Some(i) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) else {
+    return alloc::string::String::new();
+  };
+  // Run forward from the match start until NUL or end.
+  let mut end = i + NEEDLE.len();
+  while bytes.get(end).is_some_and(|&b| b != 0) {
+    end += 1;
+  }
+  // Faithful to Perl: the regex matches the entire `application[^\0]+`
+  // run as one capture. Stay UTF-8-lossy-tolerant (the typed layer
+  // matches against the byte content via `is_arcore_meta_type`).
+  bytes
+    .get(i..end)
+    .map(|m| alloc::string::String::from_utf8_lossy(m).into_owned())
+    .unwrap_or_default()
 }
 
 /// Walk one `trak`, collecting its `HandlerType`, `MediaTimeScale` and (when
@@ -2264,30 +2352,37 @@ fn walk_trak(data: &[u8], tr_start: usize, tr_end: usize) -> StreamTrack {
 /// freeGPS Type-17b Rexing scaling in [`quicktime_freegps::process_free_gps`]
 /// for the `moov`-level `gps ` offset-box path.
 ///
-/// Returns the decoded [`QuickTimeStreamMeta`] (empty for the common case of a
-/// video with no timed metadata) plus the `FoundEmbedded` flag. `FoundEmbedded`
-/// is `true` iff EITHER a `moov`-level `gps ` offset box dispatched a `freeGPS `
-/// block into [`quicktime_freegps::process_free_gps`] (ExifTool's
-/// `$$et{FoundEmbedded}`, QuickTimeStream.pl:1650) OR a GoPro source entered
-/// `ProcessGoPro` — a `gpmd` GoPro timed-metadata sample OR a `moov/udta/GPMF`
-/// atom (GoPro.pm:822 sets `$$et{FoundEmbedded} = 1` on entry, for both paths).
-/// The caller threads that flag into [`quicktime_freegps::scan_media_data`] so
-/// the brute-force `mdat` scan is suppressed by a real freeGPS decode or a
-/// dispatched GoPro source — NOT by a bare `gps0`/`gsen`/`GPS `/`3gf`/`mebx`
-/// timed-metadata sample (those set no `FoundEmbedded`, so a file carrying one
-/// of them PLUS a buried `freeGPS ` block is still scanned;
-/// QuickTimeStream.pl:967-973 vs :3689).
+/// Returns the `FoundEmbedded` flag, decoding into the caller-owned `out`
+/// [`QuickTimeStreamMeta`] (empty for the common case of a video with no timed
+/// metadata). `out` is passed in (not created here) so it can be created BEFORE
+/// the LigoGPS `udta`/trailer sources, which decode into a SEPARATE
+/// [`crate::metadata::LigoGpsMeta`] yet must continue the SAME global `Doc<N>`
+/// counter this struct owns (`$$et{DOC_COUNT}`); see
+/// [`QuickTimeStreamMeta::doc_counter`]. `FoundEmbedded` is `true` iff EITHER a
+/// `moov`-level `gps ` offset box dispatched a `freeGPS ` block into
+/// [`quicktime_freegps::process_free_gps`] (ExifTool's `$$et{FoundEmbedded}`,
+/// QuickTimeStream.pl:1650) OR a GoPro source entered `ProcessGoPro` — a `gpmd`
+/// GoPro timed-metadata sample OR a `moov/udta/GPMF` atom (GoPro.pm:822 sets
+/// `$$et{FoundEmbedded} = 1` on entry, for both paths). The caller threads that
+/// flag into [`quicktime_freegps::scan_media_data`] so the brute-force `mdat`
+/// scan is suppressed by a real freeGPS decode or a dispatched GoPro source —
+/// NOT by a bare `gps0`/`gsen`/`GPS `/`3gf`/`mebx` timed-metadata sample (those
+/// set no `FoundEmbedded`, so a file carrying one of them PLUS a buried
+/// `freeGPS ` block is still scanned; QuickTimeStream.pl:967-973 vs :3689).
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub(crate) fn extract_stream(
   data: &[u8],
   create_date_raw: Option<u64>,
   kodak_version: Option<&str>,
+  out: &mut QuickTimeStreamMeta,
   gopro_out: &mut crate::metadata::GoProMeta,
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
-) -> (QuickTimeStreamMeta, bool) {
-  let mut out = QuickTimeStreamMeta::new();
+  parrot_out: &mut ParrotMeta,
+  ligogps_out: &mut crate::metadata::LigoGpsMeta,
+) -> bool {
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
   // `moov`-level `gps ` offset box (QuickTimeStream.pl:2058). It ALSO carries
   // `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650), set iff a `gps `-box block
@@ -2318,11 +2413,13 @@ pub(crate) fn extract_stream(
           create_date_raw,
           kodak_version,
           &mut free_gps_state,
-          &mut out,
+          &mut *out,
           gopro_out,
           camm_out,
           sony_rtmd_out,
           canon_ctmd_out,
+          parrot_out,
+          ligogps_out,
         );
       }
       // Top-level DuDuBell / VSYS `gps0` (32-byte LE binary GPS records).
@@ -2332,13 +2429,13 @@ pub(crate) fn extract_stream(
       // decodes (it is processed without `-ee` ⇒ the no-`ee` first-fix path).
       b"gps0" => {
         let start = out.gps_sample_count();
-        process_gps0(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        process_gps0(data.get(ps..body_end).unwrap_or_default(), &mut *out);
         out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Gps0);
       }
       // Top-level DuDuBell / VSYS `gsen` (3-byte accelerometer triples).
       b"gsen" => {
         let start = out.gps_sample_count();
-        process_gsen(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        process_gsen(data.get(ps..body_end).unwrap_or_default(), &mut *out);
         out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Gsen);
       }
       // Top-level Kenwood `GPS ` (36-byte LE inline GPS records) — `-ee`-only
@@ -2349,7 +2446,7 @@ pub(crate) fn extract_stream(
         parse_kenwood_gps(
           data.get(ps..body_end).unwrap_or_default(),
           create_date_raw,
-          &mut out,
+          &mut *out,
         );
         out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::Kenwood);
         // Kenwood `++DOC_COUNT` per 36-byte record (QuickTimeStream.pl:2565):
@@ -2364,7 +2461,7 @@ pub(crate) fn extract_stream(
       // top-level magic box ExifTool processes without `-ee` ⇒ stamp `ThreeGf`.
       b"3gf " => {
         let start = out.gps_sample_count();
-        process_3gf(data.get(ps..body_end).unwrap_or_default(), &mut out);
+        process_3gf(data.get(ps..body_end).unwrap_or_default(), &mut *out);
         out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::ThreeGf);
       }
       _ => {}
@@ -2384,8 +2481,7 @@ pub(crate) fn extract_stream(
   // that also carries unreferenced GP6 trailer records is correctly NOT
   // re-scanned (already extracted via the sample / `udta/GPMF` path),
   // matching ExifTool.
-  let found_embedded = free_gps_state.found_embedded() || gopro_found_embedded;
-  (out, found_embedded)
+  free_gps_state.found_embedded() || gopro_found_embedded
 }
 
 /// Decode the `moov`-level Novatek `gps ` box — the offset TABLE that
@@ -2422,6 +2518,7 @@ fn process_moov_gps_box(
   kodak_version: Option<&str>,
   free_gps_state: &mut FreeGpsState,
   out: &mut QuickTimeStreamMeta,
+  ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) {
   // QuickTimeStream.pl:2544 `elsif ($tag eq 'gps ' and $dataLen > 8)`.
   if payload.len() <= 8 {
@@ -2458,6 +2555,11 @@ fn process_moov_gps_box(
     if buff.get(4..12) == Some(b"freeGPS ".as_slice()) {
       // QuickTimeStream.pl:1559-1564 — `ProcessFreeGPS` with `SampleTime =>
       // $time[$i]`, which is `undef` for this box (no `stts`); see fn docs.
+      // The walk-level `LigoGpsMeta` is threaded in (reborrowed per offset-
+      // table entry) so a `freeGPS `-block-with-`LIGOGPSINFO` in the `moov`
+      // `gps ` offset table (XGODY-style stores its blocks OUTSIDE `mdat`,
+      // QuickTimeStream.pl:1852) routes through the GPSType-5 LigoGPS arm of
+      // `process_free_gps` instead of being dropped.
       quicktime_freegps::process_free_gps(
         buff,
         create_date_raw,
@@ -2465,6 +2567,7 @@ fn process_moov_gps_box(
         kodak_version,
         free_gps_state,
         out,
+        Some(&mut *ligogps_out),
       );
     }
   }
@@ -2530,6 +2633,8 @@ fn walk_moov(
   camm_out: &mut crate::metadata::CammMeta,
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
+  parrot_out: &mut ParrotMeta,
+  ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
   // ExifTool's `$track` (QuickTime.pm:10353-10354): incremented for EVERY
@@ -2559,11 +2664,14 @@ fn walk_moov(
             &track,
             track_index,
             create_date_raw,
+            free_gps_state,
             out,
             gopro_out,
             camm_out,
             sony_rtmd_out,
             canon_ctmd_out,
+            parrot_out,
+            ligogps_out,
           );
         }
       }
@@ -2587,6 +2695,7 @@ fn walk_moov(
           kodak_version,
           free_gps_state,
           out,
+          ligogps_out,
         );
         out.stamp_gps_origin_from(start, crate::metadata::GpsOrigin::MoovGpsBox);
         // The moov-`gps `-box freeGPS blocks `++DOC_COUNT` per fix
@@ -2652,38 +2761,6 @@ fn is_meta_handler(h: &[u8; 4]) -> bool {
 mod tests {
   use super::*;
 
-  /// R2 finding regression — the deferred non-GoPro `gpmd` variants
-  /// (QuickTimeStream.pl:181-208) must be recognized so they are NOT
-  /// dispatched to the GoPro KLV walker (and so they do not set
-  /// `FoundEmbedded`, which would suppress the brute-force `mdat` scan that
-  /// recovers them). The GoPro fallback (no signature match) must NOT be
-  /// classified as deferred.
-  #[test]
-  fn deferred_gpmd_variants_are_classified() {
-    // gpmd_FMAS: `/^FMAS\0\0\0\0/` (Vantrue N2S). A printable FourCC the
-    // GoPro KLV walker would otherwise mistake for a record.
-    assert!(is_deferred_gpmd_variant(b"FMAS\0\0\0\0\xde\xad\xbe\xef"));
-    // gpmd_Rove: `/^\0\0\xf2\xe1\xf0\xeeTT/`.
-    assert!(is_deferred_gpmd_variant(&[
-      0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, b'T', b'T', 0x01, 0x02
-    ]));
-    // gpmd_Kingslim: `/^.{21}\0\0\0A[NS][EW]/s`.
-    let mut kingslim = vec![0xaau8; 21];
-    kingslim.extend_from_slice(&[0, 0, 0, b'A', b'N', b'E']);
-    assert!(is_deferred_gpmd_variant(&kingslim));
-    // gpmd_Wolfbox: `/^.{136}(0{16}[A-Z]{4}|...)/s`.
-    let mut wolfbox = vec![0x11u8; 136];
-    wolfbox.extend_from_slice(b"0000000000000000ABCD");
-    assert!(is_deferred_gpmd_variant(&wolfbox));
-    // gpmd_GoPro fallback — a real GoPro `DEVC` sample is NOT deferred.
-    assert!(!is_deferred_gpmd_variant(
-      b"DEVC\0\x01\x00\x01\x00\x00\x00\x00"
-    ));
-    // Too-short buffers never match (no panic — checked `.get`).
-    assert!(!is_deferred_gpmd_variant(b"FMA"));
-    assert!(!is_deferred_gpmd_variant(&[]));
-  }
-
   /// **R8-B** — `decode_one_sample` sets `FoundEmbedded` (returns `true`) for
   /// ANY non-deferred `gpmd` sample, regardless of whether the GoPro KLV parse
   /// extracted a record. ExifTool sets `$$et{FoundEmbedded} = 1` on ENTRY to
@@ -2710,6 +2787,9 @@ mod tests {
     let mut camm = crate::metadata::CammMeta::new();
     let mut sony = crate::metadata::SonyRtmdMeta::new();
     let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
 
     // A zero-filled `gpmd` sample: `process_gopro` extracts nothing (the KLV
     // walker bails on the four-NUL tag, GoPro.pm:844) — but it is NOT a
@@ -2723,25 +2803,25 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
     );
 
     // A `gpmd` sample whose leading tag bytes are non-printable: the walker
     // bails on the tag-char guard (GoPro.pm:833), extracting nothing — but it
-    // is still the non-deferred `gpmd_GoPro` fallback, so `FoundEmbedded` is
-    // set. (All-`\xff` matches none of Kingslim/Rove/FMAS/Wolfbox: Wolfbox
-    // needs `0` bytes at offsets 136-151, which `\xff` fails.)
+    // matches no dashcam variant `Condition`, so it is still the `gpmd_GoPro`
+    // fallback and `FoundEmbedded` is set. (All-`\xff` matches none of
+    // Kingslim/Rove/FMAS/Wolfbox: Wolfbox needs `0` bytes at offsets 136-151,
+    // which `\xff` fails — so `dispatch_gpmd` returns false here.)
     let nonprintable = vec![0xffu8; 64];
-    assert!(
-      !is_deferred_gpmd_variant(&nonprintable),
-      "the non-printable sample is NOT a deferred variant"
-    );
     assert!(
       decode_one_sample(
         &nonprintable,
@@ -2749,19 +2829,24 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
     );
 
-    // No-regression: a DEFERRED variant (FMAS) returns false (NOT GoPro, must
-    // not set FoundEmbedded — preserves the R2/R6 fix).
+    // No-regression: a matched variant (FMAS) returns false (NOT GoPro, must
+    // not set FoundEmbedded — preserves the R2/R6 fix). `dispatch_gpmd` matches
+    // the `FMAS\0\0\0\0` signature and routes to `process_fmas` (which emits
+    // nothing for this 12-byte runt — `decode_fmas` needs >= 160 bytes — but
+    // the dispatch still returns `true`, so `decode_one_sample` returns false).
     let fmas = b"FMAS\0\0\0\0\xde\xad\xbe\xef";
-    assert!(is_deferred_gpmd_variant(fmas));
     assert!(
       !decode_one_sample(
         fmas,
@@ -2769,11 +2854,14 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
     );
@@ -2787,11 +2875,14 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
     );
@@ -2810,11 +2901,14 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
     );
@@ -2832,11 +2926,14 @@ mod tests {
         1,
         &sample,
         None,
+        &mut free_gps_state,
         &mut out,
         &mut gopro,
         &mut camm,
         &mut sony,
-        &mut canon
+        &mut canon,
+        &mut pr,
+        &mut lg
       ),
       "a camm track does not set FoundEmbedded"
     );
@@ -3402,20 +3499,111 @@ mod tests {
     data.extend_from_slice(&moov);
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(
-      &data,
-      None,
-      None,
-      &mut gp,
-      &mut cm,
-      &mut crate::metadata::SonyRtmdMeta::new(),
-      &mut crate::metadata::CanonCtmdMeta::new(),
+    let mut sr = crate::metadata::SonyRtmdMeta::new();
+    let mut cc = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut meta = QuickTimeStreamMeta::new();
+    let found_embedded = extract_stream(
+      &data, None, None, &mut meta, &mut gp, &mut cm, &mut sr, &mut cc, &mut pr, &mut lg,
     );
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
     assert!(!found_embedded);
     assert!(gp.is_empty());
     assert!(cm.is_empty());
+    assert!(sr.is_empty());
+    assert!(cc.is_empty());
+    assert!(pr.is_empty());
+  }
+
+  #[test]
+  fn scan_application_string_extracts_arcore_metatype() {
+    // QuickTime.pm:7773 — the regex `(application[^\0]+)` captures the
+    // run from "application" up to (not including) the first NUL.
+    let mut bytes = alloc::vec![0u8; 4];
+    bytes.extend_from_slice(b"application/arcore-accel");
+    bytes.push(0);
+    bytes.extend_from_slice(b"trailing-bytes");
+    let s = scan_application_string(&bytes);
+    assert_eq!(s, "application/arcore-accel");
+    // No `application` substring ⇒ empty string.
+    let none = scan_application_string(b"random opaque bytes");
+    assert!(none.is_empty());
+    // Runs all the way to end-of-buffer when no NUL is present.
+    let unterminated = scan_application_string(b"application/x-foo");
+    assert_eq!(unterminated, "application/x-foo");
+  }
+
+  /// `walk_stsd` must assign `MetaType` on EVERY
+  /// sample-description entry (QuickTime.pm:7773 `RawConv` `$$self{MetaType} =
+  /// ($val=~/(application[^\0]+)/ ? $1 : undef)`), CLEARING it when an entry
+  /// carries no `application/...` run. A multi-entry `mett` stsd whose EARLIER
+  /// entry is `application/arcore-accel` and whose FINAL entry has no application
+  /// string must end with `meta_type` CLEARED (not leaking the ARCore type) so
+  /// the Parrot `mett` walker takes the normal drone `[EP]\d` path, not the
+  /// ARCore-TLV path. Pre-fix the conditional `if !mt.is_empty()` left the stale
+  /// ARCore MetaType in place.
+  #[test]
+  fn walk_stsd_multi_entry_clears_stale_arcore_metatype() {
+    // Entry 1: a `mett` SampleDescription whose body carries
+    // `application/arcore-accel` (the ARCore MetaType).
+    let mut e1_body = alloc::vec![0u8; 8]; // reserved[6] + data-ref-index[2]
+    e1_body.extend_from_slice(b"application/arcore-accel\0");
+    let e1_len = 8 + e1_body.len(); // [size:4][format:4] + body
+    let mut entry1 = (e1_len as u32).to_be_bytes().to_vec();
+    entry1.extend_from_slice(b"mett");
+    entry1.extend_from_slice(&e1_body);
+
+    // Entry 2: a `mett` SampleDescription whose body has NO `application/...`
+    // run (plain opaque bytes) — ExifTool's RawConv sets MetaType = undef here.
+    let mut e2_body = alloc::vec![0u8; 8];
+    e2_body.extend_from_slice(b"\x01\x02\x03\x04opaque-no-app\0");
+    let e2_len = 8 + e2_body.len();
+    let mut entry2 = (e2_len as u32).to_be_bytes().to_vec();
+    entry2.extend_from_slice(b"mett");
+    entry2.extend_from_slice(&e2_body);
+
+    // stsd body: [version+flags:4][entry-count:4=2] then the two entries.
+    let mut stsd = alloc::vec![0u8; 8];
+    wr(&mut stsd, 4, &2u32.to_be_bytes());
+    stsd.extend_from_slice(&entry1);
+    stsd.extend_from_slice(&entry2);
+
+    let mut track = StreamTrack::default();
+    walk_stsd(&stsd, &mut track);
+
+    // Last-wins format is `mett`; the trailing no-application entry CLEARED the
+    // MetaType the first (ARCore) entry set.
+    assert_eq!(&track.meta_format, b"mett");
+    assert!(
+      track.meta_type.is_empty(),
+      "the trailing non-application entry must CLEAR the stale ARCore MetaType, got {:?}",
+      track.meta_type
+    );
+
+    // And so the Parrot `mett` walker takes the DRONE path (meta_type = None),
+    // decoding a P1 record as drone telemetry rather than the ARCore-TLV path
+    // (which would skip a normal `[EP]\d` record).
+    let meta_type = if track.meta_type.is_empty() {
+      None
+    } else {
+      Some(track.meta_type.as_str())
+    };
+    // A minimal V1 drone record: `[P1][nwords=14]` + 56 bytes (60-byte slot),
+    // with a GPSLatitude at record offset 28 (int32s / 0x100000).
+    let lat_raw = (47.6062_f64 * f64::from(0x10_0000)).round() as i32;
+    let mut p1 = alloc::vec![0u8; 60];
+    p1[0..2].copy_from_slice(b"P1");
+    wr(&mut p1, 2, &14u16.to_be_bytes());
+    p1[28..32].copy_from_slice(&lat_raw.to_be_bytes());
+    let mut pr = ParrotMeta::new();
+    crate::formats::parrot::process_mett(&p1, meta_type, &mut pr);
+    let g = pr
+      .gps_samples()
+      .first()
+      .expect("drone P1 must decode (not the ARCore-TLV path)");
+    assert!((g.latitude().expect("lat") - 47.6062).abs() < 1e-5);
   }
 
   /// Codex R3 — the `moov`-level Novatek `gps ` box (the EMPTY-HandlerType box
@@ -3468,14 +3656,18 @@ mod tests {
 
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(
+    let mut meta = QuickTimeStreamMeta::new();
+    let found_embedded = extract_stream(
       &data,
       None,
       None,
+      &mut meta,
       &mut gp,
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
       meta.gps_samples().len(),
@@ -3568,14 +3760,18 @@ mod tests {
 
     let mut gp = crate::metadata::GoProMeta::new();
     let mut cm = crate::metadata::CammMeta::new();
-    let (meta, found_embedded) = extract_stream(
+    let mut meta = QuickTimeStreamMeta::new();
+    let found_embedded = extract_stream(
       &data,
       None,
       None,
+      &mut meta,
       &mut gp,
       &mut cm,
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
+      &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(
       meta.is_empty(),
