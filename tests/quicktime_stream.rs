@@ -950,6 +950,160 @@ fn build_mov_with_gpro6_in_mdat() -> Vec<u8> {
   out
 }
 
+// ===========================================================================
+// gpmd dashcam variants — Kingslim / Rove / FMAS / Wolfbox
+// (QuickTimeStream.pl:181-212 Condition cascade)
+// ===========================================================================
+
+#[test]
+fn quicktime_gpmd_rove_dispatch_decodes_xor_aa_block() {
+  // QuickTimeStream.pl:190-194 — `gpmd_Rove` Condition
+  // `^\0\0\xf2\xe1\xf0\xeeTT` re-routes to Process_text → BlueSkySea /
+  // Ambarella XOR-0xAA decoder (1175-1211). The sample bytes carry the
+  // signature + an XOR-encrypted date/lat/lon/spd/alt block.
+  let sample = build_rove_xor_aa_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "Rove gpmd must produce one GPS sample");
+  let s = &samples[0];
+  assert!(s.date_time().unwrap().contains("2019:08:20 07:51:57"));
+  assert!((s.latitude().unwrap() - (48.0 + 515873.0 / 600000.0)).abs() < 1e-4);
+  assert!((s.longitude().unwrap() - (2.0 + 197769.0 / 600000.0)).abs() < 1e-4);
+  // MediaMetadata projects the GPS fix.
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation projected from Rove gpmd");
+  assert!(gps.latitude().is_some());
+  assert!(gps.longitude().is_some());
+}
+
+#[test]
+fn quicktime_gpmd_fmas_dispatch_decodes_vantrue_n2s_record() {
+  // QuickTimeStream.pl:196-201 — `gpmd_FMAS` (Vantrue N2S) routes to
+  // ProcessFMAS (3580-3609).
+  let sample = build_fmas_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "FMAS gpmd must produce one GPS sample");
+  let s = &samples[0];
+  // Lat 47 + (37 + 4200/6000)/60 ≈ 47.628333
+  let want_lat = 47.0 + (37.0 + 4200.0 / 6000.0) / 60.0;
+  assert!((s.latitude().unwrap() - want_lat).abs() < 1e-6);
+  // 50 mph * 1.60934 = 80.467 kph
+  assert!((s.speed_kph().unwrap() - 80.467).abs() < 0.01);
+  // Projection.
+  let md = meta.media_metadata();
+  assert!(md.gps().is_some());
+}
+
+#[test]
+fn quicktime_gpmd_wolfbox_dispatch_decodes_g900_record() {
+  // QuickTimeStream.pl:203-208 — `gpmd_Wolfbox` routes to ProcessWolfbox
+  // (3615-3676). The Wolfbox G900 marker `00000000HYTH` at offset 152.
+  let sample = build_wolfbox_sample();
+  let data = build_mov_with_meta_track(b"gpmd", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let stream = meta.stream();
+  let samples = stream.gps_samples();
+  assert_eq!(samples.len(), 1, "Wolfbox gpmd must produce one GPS sample");
+  let s = &samples[0];
+  // ConvertLatLon(4737.7053) ≈ 47.628421
+  assert!((s.latitude().unwrap() - 47.628421).abs() < 1e-4);
+  assert_eq!(s.altitude_m(), Some(412.5));
+  // 25.5 knots * 1.852 = 47.226
+  assert!((s.speed_kph().unwrap() - 47.226).abs() < 0.01);
+}
+
+/// Build a 282-byte Rove `gpmd` sample (Ambarella A12 XOR-0xAA cipher,
+/// matching the bundled `gpmd_Rove` Condition `^\0\0\xf2\xe1\xf0\xeeTT`).
+fn build_rove_xor_aa_sample() -> Vec<u8> {
+  let mut data = vec![0u8; 282];
+  // Ambarella sig: literal `\0\0\xf2\xe1\xf0\xee\x54\x54` at offset 0..8.
+  data[0..8].copy_from_slice(&[0x00, 0x00, 0xf2, 0xe1, 0xf0, 0xee, 0x54, 0x54]);
+  // Encrypted date+time `20190820075157` at offset 8 (XOR'd later via
+  // decode_xor_aa_block).
+  for (i, &c) in b"20190820075157".iter().enumerate() {
+    data[8 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"N48515873".iter().enumerate() {
+    data[38 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"E002197769".iter().enumerate() {
+    data[47 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"+0031".iter().enumerate() {
+    data[0x39 + i] = c ^ 0xaa;
+  }
+  for (i, &c) in b"045".iter().enumerate() {
+    data[0x3e + i] = c ^ 0xaa;
+  }
+  data
+}
+
+/// Build a 160-byte Vantrue N2S FMAS sample.
+fn build_fmas_sample() -> Vec<u8> {
+  let mut d = vec![0u8; 160];
+  d[0..8].copy_from_slice(b"FMAS\0\0\0\0");
+  d[80..84].copy_from_slice(b"SAMM");
+  d[120] = b'A';
+  d[0x60..0x62].copy_from_slice(&2025u16.to_le_bytes());
+  d[0x62] = 6;
+  d[0x63] = 15;
+  d[0x64] = 14;
+  d[0x65] = 30;
+  d[0x66] = 45;
+  d[0x78] = b'A';
+  d[0x79] = b'E';
+  d[0x7a] = b'N';
+  d[0x7b] = 8;
+  d[0x7c] = 30;
+  d[0x7d] = 0;
+  d[0x7e..0x80].copy_from_slice(&600u16.to_le_bytes());
+  d[0x80] = 47;
+  d[0x81] = 37;
+  d[0x82..0x84].copy_from_slice(&4200u16.to_le_bytes());
+  d[0x84..0x86].copy_from_slice(&50u16.to_le_bytes());
+  d[0x86..0x88].copy_from_slice(&180u16.to_le_bytes());
+  d[0x6c..0x70].copy_from_slice(&0.1f32.to_le_bytes());
+  d[0x70..0x74].copy_from_slice(&0.2f32.to_le_bytes());
+  d[0x74..0x78].copy_from_slice(&0.3f32.to_le_bytes());
+  d
+}
+
+/// Build a 0x100-byte Wolfbox G900 sample.
+fn build_wolfbox_sample() -> Vec<u8> {
+  let mut d = vec![0u8; 0x100];
+  for i in 0..16 {
+    d[136 + i] = b'0';
+  }
+  d[152..156].copy_from_slice(b"HYTH");
+  d[0x68..0x6c].copy_from_slice(&15u32.to_le_bytes());
+  d[0x6c..0x70].copy_from_slice(&6u32.to_le_bytes());
+  d[0x70..0x74].copy_from_slice(&2025u32.to_le_bytes());
+  d[0xa0..0xa4].copy_from_slice(&14u32.to_le_bytes());
+  d[0xa4..0xa8].copy_from_slice(&30u32.to_le_bytes());
+  d[0xa8..0xac].copy_from_slice(&45u32.to_le_bytes());
+  // Speed val/div: 25.5 knots
+  d[0x48..0x50].copy_from_slice(&25500i64.to_le_bytes());
+  d[0x50..0x58].copy_from_slice(&1000i64.to_le_bytes());
+  // Track val/div: 90.0
+  d[0x58..0x60].copy_from_slice(&9000i64.to_le_bytes());
+  d[0x60..0x68].copy_from_slice(&100i64.to_le_bytes());
+  // Lat val/div: 4737.7053
+  d[0xb0..0xb8].copy_from_slice(&47377053i64.to_le_bytes());
+  d[0xb8..0xc0].copy_from_slice(&10000i64.to_le_bytes());
+  // Lon val/div: 822.5076
+  d[0xc0..0xc8].copy_from_slice(&8225076i64.to_le_bytes());
+  d[0xc8..0xd0].copy_from_slice(&10000i64.to_le_bytes());
+  // Alt val/div: 412.5
+  d[0xe8..0xf0].copy_from_slice(&4125i64.to_le_bytes());
+  d[0xf0..0xf8].copy_from_slice(&10i64.to_le_bytes());
+  d
+}
+
 /// Build a minimal but valid `.mov` whose moov/udta carries a `GPMF` atom
 /// with a one-DVNM-record DEVC payload.
 fn build_mov_with_gpmf_in_udta() -> Vec<u8> {
@@ -1977,6 +2131,15 @@ fn vec3_le(x: f32, y: f32, z: f32) -> Vec<u8> {
 /// "format" code is `camm`. The track's single sample is `sample_bytes`,
 /// stored at the start of `mdat`.
 fn build_mov_with_camm_track(sample_bytes: &[u8]) -> Vec<u8> {
+  build_mov_with_meta_track(b"camm", sample_bytes)
+}
+
+/// Build a minimal but valid `.mov` whose moov contains ONE metadata `trak`
+/// with the `mhlr/meta` handler and a stsd whose first 4-byte "format" code is
+/// `meta_format` (e.g. `gpmd` / `camm`). The track's single sample is
+/// `sample_bytes`, stored at the start of `mdat`. Mirrors the dispatch path
+/// `ProcessSamples` takes for a timed-metadata `trak`.
+fn build_mov_with_meta_track(meta_format: &[u8; 4], sample_bytes: &[u8]) -> Vec<u8> {
   // ftyp atom: 'qt  '.
   let mut ftyp = 16u32.to_be_bytes().to_vec();
   ftyp.extend_from_slice(b"ftyp");
@@ -2016,12 +2179,12 @@ fn build_mov_with_camm_track(sample_bytes: &[u8]) -> Vec<u8> {
   mdhd.extend_from_slice(&1000u32.to_be_bytes()); // duration
   mdhd.extend_from_slice(&[0u8; 4]); // language+quality
 
-  // stsd — 1 entry whose first 4-byte format code is `camm`.
+  // stsd — 1 entry whose first 4-byte format code is `meta_format`.
   // [version+flags:4][count:4][entry-size:4][format:4][reserved:6][data-ref-index:2]
   let mut stsd_entry = Vec::new();
-  // Entry: size(=16)+format=camm+6 reserved bytes+data-ref-index(=1).
+  // Entry: size(=16)+format+6 reserved bytes+data-ref-index(=1).
   stsd_entry.extend_from_slice(&16u32.to_be_bytes());
-  stsd_entry.extend_from_slice(b"camm");
+  stsd_entry.extend_from_slice(meta_format);
   stsd_entry.extend_from_slice(&[0u8; 6]);
   stsd_entry.extend_from_slice(&1u16.to_be_bytes());
   let mut stsd = Vec::new();
@@ -2234,5 +2397,162 @@ fn extract_embedded_on_emits_timed_gps_tags() {
   assert!(
     obj.contains_key("QuickTime:GPSLatitude"),
     "-ee on must emit the per-sample timed GPS tags"
+  );
+}
+
+// ===========================================================================
+// SP4 — LigoGPS dashcam vendor GPS module + trailer (LigoGPS.pm:1-431,
+// QuickTime.pm:9906-9907 + :10658-10668)
+// ===========================================================================
+
+/// Build a minimal `.mov` with a LigoGPS `&&&& `-prefixed trailer carrying
+/// one plain-ASCII (Redtiger F9 4K format) record. The trailer layout
+/// (QuickTime.pm:10658-10668) is:
+///
+///   [base file: ftyp + moov + mdat]
+///   [trailer body:
+///     [skip atom header: size:u32-BE = body_len, "skip"]
+///     [LIGOGPSINFO\0]
+///     [8 more bytes of preamble incl. \0\0\0\x14 at offset 12]
+///     [0x84 bytes of plain-ASCII record]
+///   ]
+///   [&&&& : 4 bytes]
+///   [trailer_len : u32-LE]
+fn build_mov_with_ligogps_trailer(record_text: &[u8]) -> Vec<u8> {
+  // Reuse the minimal ftyp+moov+mdat from `build_mov_with_freegps_in_mdat`
+  // but discard the freeGPS block so the file is truly plain QuickTime.
+  let mut ftyp = 16u32.to_be_bytes().to_vec();
+  ftyp.extend_from_slice(b"ftyp");
+  ftyp.extend_from_slice(b"qt  ");
+  ftyp.extend_from_slice(&0u32.to_be_bytes());
+
+  let mut mvhd = Vec::new();
+  mvhd.extend_from_slice(&[0u8; 4]);
+  mvhd.extend_from_slice(&[0u8; 8]);
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&1000u32.to_be_bytes());
+  mvhd.extend_from_slice(&[0u8; 80]);
+  let mut mvhd_atom = (mvhd.len() as u32 + 8).to_be_bytes().to_vec();
+  mvhd_atom.extend_from_slice(b"mvhd");
+  mvhd_atom.extend_from_slice(&mvhd);
+  let mut moov = (mvhd_atom.len() as u32 + 8).to_be_bytes().to_vec();
+  moov.extend_from_slice(b"moov");
+  moov.extend_from_slice(&mvhd_atom);
+  let mdat_payload = vec![0u8; 16];
+  let mut mdat = (mdat_payload.len() as u32 + 8).to_be_bytes().to_vec();
+  mdat.extend_from_slice(b"mdat");
+  mdat.extend_from_slice(&mdat_payload);
+
+  // Build the trailer payload: LIGOGPSINFO\0 + 8-byte preamble + 0x84 rec.
+  let mut payload = Vec::new();
+  payload.extend_from_slice(b"LIGOGPSINFO\0");
+  // 8 more preamble bytes: bytes [pos-8..pos-4] (pos = 0x14) = [0,0,0,0x14]
+  // triggers the LigoGPS no_fuzz auto-detect for the BlueSkySea-style
+  // firmware (LigoGPS.pm:299).
+  payload.extend_from_slice(&[0, 0, 0, 0x14, 0, 0, 0, 0]);
+  // Build one 0x84-byte record. First 4 bytes are the counter; rest is
+  // the ASCII text payload (null-padded to 0x84).
+  let mut record = Vec::with_capacity(0x84);
+  record.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+  record.extend_from_slice(record_text);
+  while record.len() < 0x84 {
+    record.push(0);
+  }
+  payload.extend_from_slice(&record);
+
+  // Trailer body: skip atom header + payload. QuickTime.pm:10660 reads the
+  // inner LIGOGPSINFO buffer as `$len = Get32u(buff,0) - 16` bytes, so the
+  // skip atom's declared SIZE field must be `16 + payload.len()` to capture the
+  // FULL payload (the `- 16` drops the 8-byte read + an 8-byte inner header).
+  let skip_atom_size = (16 + payload.len()) as u32;
+  let mut body = Vec::with_capacity(8 + payload.len());
+  body.extend_from_slice(&skip_atom_size.to_be_bytes());
+  body.extend_from_slice(b"skip");
+  body.extend_from_slice(&payload);
+
+  // The discovery length (`$$trailer[2]`) is the trailer's byte span: body +
+  // the 8-byte `[&&&&][len]` footer.
+  let trailer_len = (body.len() + 8) as u32;
+
+  // Assemble the file.
+  let mut file = ftyp;
+  file.extend_from_slice(&moov);
+  file.extend_from_slice(&mdat);
+  file.extend_from_slice(&body);
+  file.extend_from_slice(b"&&&&");
+  // `IdentifyTrailers` reads the LigoGPS length as BE `Get32u(buff,36)`
+  // (QuickTime.pm:9907, default `MM` — see `insta360::identify_trailers`).
+  file.extend_from_slice(&trailer_len.to_be_bytes());
+  file
+}
+
+#[test]
+fn quicktime_ligogps_trailer_decodes_plain_ascii_record() {
+  // The Redtiger F9 4K plain-ASCII record format: `[4 bytes counter]
+  // YYYY/MM/DD HH:MM:SS [NS]:lat [EW]:lon spd [optional " km/h"]`.
+  let data = build_mov_with_ligogps_trailer(
+    b"2024/06/15 14:30:00 N:45.500 W:120.500 50.0 km/h A:90.0 H:100.0 x:0 y:0 z:0",
+  );
+  let meta = parse_quicktime(&data).expect("recognized");
+  let ligo = meta.ligogps();
+  assert!(!ligo.is_empty(), "ligogps() must populate");
+  let s = ligo.samples().first().expect("decoded sample");
+  assert_eq!(s.date_time(), Some("2024:06:15 14:30:00"));
+  assert_eq!(s.latitude(), Some(45.5));
+  assert_eq!(s.longitude(), Some(-120.5));
+  assert_eq!(s.speed_kph(), Some(50.0));
+  assert_eq!(s.track_deg(), Some(90.0));
+  assert_eq!(s.altitude_m(), Some(100.0));
+}
+
+#[test]
+fn quicktime_ligogps_trailer_projects_gps_location() {
+  // The decoded sample's lat/lon/altitude/timestamp must surface through
+  // `MediaMetadata::gps()`. Date format in the record body is YYYY/MM/DD
+  // (LigoGPS.pm:244 `tr|/|:|` normalises it to YYYY:MM:DD on output).
+  let data =
+    build_mov_with_ligogps_trailer(b"2024/01/15 10:00:00 N:35.000 E:139.000 30.0 km/h H:50.0");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let md = meta.media_metadata();
+  let gps = md.gps().expect("GpsLocation from LigoGPS");
+  assert!((gps.latitude().unwrap() - 35.000).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 139.000).abs() < 1e-9);
+  assert!((gps.altitude_m().unwrap() - 50.0).abs() < 1e-9);
+  assert_eq!(gps.timestamp(), Some("2024:01:15 10:00:00"));
+}
+
+#[test]
+fn quicktime_no_ligogps_trailer_leaves_meta_empty() {
+  // A plain QuickTime file (no LigoGPS trailer) must have an empty
+  // `ligogps()` meta. The signature check is a 4-byte compare at offset
+  // EOF-8.
+  let data = build_mov_with_freegps_in_mdat();
+  let meta = parse_quicktime(&data).expect("recognized");
+  assert!(meta.ligogps().is_empty());
+}
+
+#[test]
+fn quicktime_ligogps_trailer_with_explicit_south_latitude() {
+  // S = negative latitude (LigoGPS.pm:258).
+  let data =
+    build_mov_with_ligogps_trailer(b"2024/12/25 23:59:59 S:33.865 E:151.209 80.0 km/h H:25.0");
+  let meta = parse_quicktime(&data).expect("recognized");
+  let s = meta.ligogps().samples().first().expect("sample");
+  // Latitude is negative (S).
+  assert_eq!(s.latitude(), Some(-33.865));
+  // Longitude is positive (E).
+  assert_eq!(s.longitude(), Some(151.209));
+}
+
+#[test]
+fn quicktime_ligogps_trailer_short_file_silent() {
+  // A file shorter than 40 bytes can't carry the trailer signature; the
+  // scan_trailer fast-path returns silently without warning.
+  let data = vec![0u8; 30];
+  // Must use parse_borrowed direct since this isn't a real QT file.
+  let meta = exifast::formats::quicktime::parse_borrowed(&data);
+  assert!(
+    meta.is_none(),
+    "30-byte all-zero data isn't recognised as QT"
   );
 }

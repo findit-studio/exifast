@@ -749,6 +749,18 @@ pub struct Insta360Meta<'a> {
   /// trailer behind a later LigoGPS/MIE trailer. `0` (unused) when no Insta360
   /// trailer is present; read only alongside [`Self::raw`].
   trail_end: usize,
+  /// The value of the SHARED global document counter (`$$et{DOC_COUNT}`) at the
+  /// moment `ProcessInsta360` begins in `ProcessMOV`'s trailer loop
+  /// (QuickTime.pm:10654-10677) — i.e. AFTER every moov-timed + `udta`-LigoGPS +
+  /// earlier-chain trailer source has bumped it. The deferred `-ee` row decode
+  /// (`decode_all_records`) seeds its running counter from this base, so each
+  /// surfaced Insta360 row gets `Doc<doc_base + N>` (`$$et{DOC_NUM} =
+  /// ++$$et{DOC_COUNT}`, QuickTimeStream.pl:3374/3388/3394/3412) — continuing the
+  /// ONE global sequence instead of restarting at 1. `0` for an Insta360-only
+  /// file (the common case; byte-identical to the pre-unification local 0-based
+  /// counter). The `0x101` identity still inherits the STICKY current doc (Main
+  /// when no timed row preceded it), NOT this base.
+  doc_base: u32,
 }
 
 impl<'a> Insta360Meta<'a> {
@@ -764,6 +776,7 @@ impl<'a> Insta360Meta<'a> {
       head_trailer: None,
       raw: None,
       trail_end: 0,
+      doc_base: 0,
     }
   }
 
@@ -827,6 +840,16 @@ impl<'a> Insta360Meta<'a> {
   #[must_use]
   pub const fn trail_end(&self) -> usize {
     self.trail_end
+  }
+
+  /// The SHARED global document counter (`$$et{DOC_COUNT}`) value at the moment
+  /// `ProcessInsta360` runs in the trailer phase — the base the deferred `-ee`
+  /// row decode adds its per-row ordinals to (see the field doc). `0` for an
+  /// Insta360-only file.
+  #[inline(always)]
+  #[must_use]
+  pub const fn doc_base(&self) -> u32 {
+    self.doc_base
   }
 
   /// `true` when no domain-summary content decoded. The [`Self::trailer`]
@@ -906,6 +929,16 @@ impl<'a> Insta360Meta<'a> {
   #[inline]
   pub const fn set_trail_end(&mut self, trail_end: usize) -> &mut Self {
     self.trail_end = trail_end;
+    self
+  }
+
+  /// Record the SHARED global document-counter base (`$$et{DOC_COUNT}` when
+  /// `ProcessInsta360` begins in the trailer phase) — seeds the deferred `-ee`
+  /// row decode's running counter so each row gets `Doc<doc_base + N>`. See the
+  /// field doc.
+  #[inline]
+  pub const fn set_doc_base(&mut self, doc_base: u32) -> &mut Self {
+    self.doc_base = doc_base;
     self
   }
 
