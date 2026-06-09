@@ -78,6 +78,24 @@ pub mod quicktime_stream;
 // stubbed; GoPro GPMF wires through to [`gopro`] (SP4).
 #[cfg(feature = "quicktime")]
 pub mod quicktime_freegps;
+// QuickTime SP4 — brand-variant container dispatch (HEIC/AVIF/CR3/JP2/
+// iso5/hvc1). Faithful port of:
+//  - %ftypLookup brand table (QuickTime.pm:130-237) + %mimeLookup
+//    (QuickTime.pm:103-126).
+//  - HEIF/HEIC/AVIF `meta` box walker — iinf/iloc/ipma/ipco/iref/pitm
+//    (QuickTime.pm:2834-2916 + 9131-9523).
+//  - CR3 / CRM Canon UUID atom dispatch (QuickTime.pm:1236-1242 +
+//    Canon.pm:9657-9738) — CNCV CompressorVersion override + CMT1-4
+//    location records.
+//  - JP2 / JPX / JPM box walker (Jpeg2000.pm:1538-1597 + UUID-Exif/XMP
+//    at :279-352).
+//
+// Each variant produces a typed `HeifMeta` / `Cr3Meta` / `Jp2Meta`
+// (in [`crate::metadata`]) that the QuickTime walker carries through
+// to the per-variant `MetaProjectInto` projection. Gated on the same
+// `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod quicktime_brands;
 // GoPro SP4 — GPMF KLV parser + the GPS family of GoPro.pm tag tables.
 // Reached either via the QuickTime ProcessFreeGPS brute-force scan (GoPro
 // `GP\x06\0\0` records in `mdat`) or via the `gpmd` timed-metadata sample

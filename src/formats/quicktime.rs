@@ -80,7 +80,11 @@ const QT_EPOCH_OFFSET: i64 = (66 * 365 + 17) * 24 * 3600;
 /// large superset that never trips on a real file; the output stays
 /// byte-identical. Exceeding the cap simply stops recursion (no warning),
 /// faithful to a truncated/garbage subtree contributing no tags.
-const MAX_ATOM_DEPTH: u32 = 100;
+///
+/// `pub(crate)` so the sibling SP4 brand-dispatch walkers
+/// (`quicktime_brands`) bound their independent `moov`/container descents at
+/// the SAME budget instead of inventing a second cap.
+pub(crate) const MAX_ATOM_DEPTH: u32 = 100;
 
 // ===========================================================================
 // SP2 supplementary conv-less camera-atom map (xtask `--kind quicktime`)
@@ -1419,57 +1423,17 @@ fn decode_ftyp(payload: &[u8], qt: &mut QuickTimeMeta) {
 /// Resolve the `File:FileType` from an `ftyp` atom payload. The major brand
 /// is the first 4 bytes; compatible brands follow at offset 8 in 4-byte
 /// groups (QuickTime.pm:9993-10002). Returns `(file_type, mime)`.
+///
+/// **SP4.** The full `%ftypLookup` brand table (QuickTime.pm:130-237) +
+/// `%mimeLookup` (QuickTime.pm:103-126) is implemented in
+/// [`crate::formats::quicktime_brands::resolve_ftyp_file_type`]; this
+/// shim forwards. Covers every brand bundled supports — HEIC / AVIF /
+/// CR3 / JP2 / JPX / iso5 / mqt / mj2 / 3GP family / Audible AAX /
+/// Adobe Flash F4V family / Apple M4A/M4B/M4P/M4V variants / DVB and
+/// the rest. The CR3-vs-CRM override (Canon.pm:9667) happens later in
+/// `parse_inner` after the moov Canon-UUID walk.
 fn file_type_from_ftyp(payload: &[u8]) -> (&'static str, &'static str) {
-  // QuickTime.pm:9993 `$ftypLookup{$type}` — SP1 covers the common
-  // brands; the full %ftypLookup table is an SP4 item. `payload.get(0..4)`
-  // is `None` exactly when `payload.len() < 4`, byte-identical to the guard.
-  if let Some(brand) = payload.get(0..4) {
-    match brand {
-      b"qt  " => return ("MOV", "video/quicktime"),
-      b"M4A " => return ("M4A", "audio/mp4"),
-      b"M4V " => return ("M4V", "video/x-m4v"),
-      b"M4B " => return ("M4B", "audio/mp4"),
-      _ => {}
-    }
-  }
-  // QuickTime.pm:9996-10001: scan compatible brands. ExifTool matches three
-  // `elsif` regexes against the WHOLE ftyp buffer, in this order:
-  //   `/^.{8}(.{4})+(mp41|mp42|avc1)/s`  ⇒ MP4
-  //   `/^.{8}(.{4})+(f4v )/s`            ⇒ F4V
-  //   `/^.{8}(.{4})+(qt  )/s`            ⇒ MOV
-  // The leading `^.{8}` skips the 4-byte major brand + 4-byte minor version;
-  // the `(.{4})+` then requires **one or more** 4-byte compatible-brand slots
-  // BEFORE the matched brand. So the matched brand must sit at buffer offset
-  // ≥ 12 — a `qt  `/`mp4x`/`f4v ` in the FIRST compatible-brand slot (offset 8)
-  // can NOT trigger the match (R9/F1: an `isom\0\0\0\0qt  ` payload stays MP4).
-  // The three regexes are tried in `elsif` order, so `mp4x`/`avc1` anywhere in
-  // a non-first slot wins over a `qt  ` / `f4v ` in another non-first slot.
-  let non_first_slot = |needles: &[&[u8; 4]]| -> bool {
-    let mut i = 12; // skip major+minor (offset 8) AND the first compat slot.
-    while i + 4 <= payload.len() {
-      // The `while` guard proves `i + 4 <= len`, so `.get` is always `Some`;
-      // the comparison is byte-identical to the raw slice.
-      let Some(slot) = payload.get(i..i + 4) else {
-        break;
-      };
-      if needles.iter().any(|n| slot == &n[..]) {
-        return true;
-      }
-      i += 4;
-    }
-    false
-  };
-  if non_first_slot(&[b"mp41", b"mp42", b"avc1"]) {
-    return ("MP4", "video/mp4");
-  }
-  if non_first_slot(&[b"f4v "]) {
-    return ("F4V", "video/mp4");
-  }
-  if non_first_slot(&[b"qt  "]) {
-    return ("MOV", "video/quicktime");
-  }
-  // QuickTime.pm:10004 `$fileType or $fileType = 'MP4'`.
-  ("MP4", "video/mp4")
+  crate::formats::quicktime_brands::resolve_ftyp_file_type(payload)
 }
 
 /// `%useExt` — "use extension to determine file type" (QuickTime.pm:240).
@@ -3405,6 +3369,28 @@ pub struct Meta<'a> {
   /// LigoGPS file. Faithful port of `Image::ExifTool::LigoGPS`
   /// (LigoGPS.pm:1-431).
   ligogps: LigoGpsMeta,
+  /// **SP4** — HEIF / HEIC / AVIF `meta` box contents (iinf / iloc /
+  /// pitm / iref). Empty ([`HeifMeta::is_empty`]) for any non-HEIF
+  /// QuickTime file. Faithful port of `Image::ExifTool::QuickTime::Meta`
+  /// (QuickTime.pm:2834-2916) + `ParseItemInfoEntry` (:9228-9281),
+  /// `ParseItemLocation` (:9131-9195), and `HandleItemInfo` (:9343-9526).
+  /// Populated by [`quicktime_brands::scan_heif_meta`].
+  heif: crate::metadata::HeifMeta,
+  /// **SP4** — Canon CR3 / CRM container identity (CNCV + CMT1-4 +
+  /// CNTH + THMB block locations). Reached through the Canon UUID
+  /// (`85 c0 b6 87 82 0f 11 e0 81 11 f4 ce 46 2b 6a 48`) at
+  /// QuickTime.pm:1236-1242, dispatching to `Image::ExifTool::Canon::uuid`
+  /// (Canon.pm:9657-9738). Empty ([`Cr3Meta::is_empty`]) for any
+  /// non-CR3 / non-CRM file. Populated by
+  /// [`quicktime_brands::scan_canon_uuid`].
+  cr3: crate::metadata::Cr3Meta,
+  /// **SP4** — JPEG 2000 (`JP2` / `JPX` / `JPM` / `JXL` / `JPH`)
+  /// container identity. Reached via the dedicated 12-byte JP2
+  /// signature (`00 00 00 0c jP  \r\n\x87\n`, Jpeg2000.pm:1548-1549);
+  /// the inner `ftyp` brand determines the sub-type
+  /// (Jpeg2000.pm:1577-1587). Empty ([`Jp2Meta::is_empty`]) for any
+  /// non-JP2 file. Populated by [`quicktime_brands::walk_jp2`].
+  jp2: crate::metadata::Jp2Meta,
   /// **SP3** — `true` when an embedded Exif/TIFF block (a `QVMI` / `MVTG` /
   /// `uuid`-Exif atom) was DETECTED but its parse is DEFERRED until the
   /// Exif+GPS port (`exif::parse_exif_block`, PR #36 / `lib/exif-gps`) lands.
@@ -3422,6 +3408,13 @@ pub struct Meta<'a> {
   /// overruns EOF) is accepted as QuickTime but stops the walk with a
   /// `Truncated '...' data` warning (QuickTime.pm:10242 / 10590).
   warning: Option<String>,
+  /// **#159** — the absolute file offset of the top-level atom during which
+  /// [`Self::warning`] was raised (`None` when there is no `ProcessMOV`
+  /// warning). Lets [`Self::diagnostics`] order this atom-walk warning against
+  /// the HEIF `meta`-box walk warning ([`crate::metadata::HeifMeta::warning`])
+  /// by file position — ExifTool emits `Warning` tags priority-0 first-wins, so
+  /// the EARLIER-positioned warning becomes the public `ExifTool:Warning`.
+  warning_offset: Option<u64>,
 }
 
 impl Meta<'_> {
@@ -3457,6 +3450,16 @@ impl Meta<'_> {
   #[inline(always)]
   pub fn warning(&self) -> Option<&str> {
     self.warning.as_deref()
+  }
+
+  /// **#159** — the absolute file offset of the top-level atom that produced
+  /// [`Self::warning`] (`None` when there is no `ProcessMOV` warning). Used by
+  /// [`Self::diagnostics`] to rank the atom-walk warning against the HEIF
+  /// `meta`-box walk warning by file position (priority-0 first-wins).
+  #[must_use]
+  #[inline(always)]
+  pub const fn warning_offset(&self) -> Option<u64> {
+    self.warning_offset
   }
 
   /// **SP3** — the embedded QuickTimeStream timed GPS / sensor metadata.
@@ -3560,6 +3563,50 @@ impl Meta<'_> {
     &self.ligogps
   }
 
+  /// **SP4** — HEIF / HEIC / AVIF `meta` box contents.
+  /// [`crate::metadata::HeifMeta::is_empty`] for any non-HEIF file.
+  ///
+  /// Faithful port of `Image::ExifTool::QuickTime::Meta`
+  /// (QuickTime.pm:2834-2916) — surfaces the PrimaryItem, per-item
+  /// Type/Name/Extents, and idat location. Populated by
+  /// [`quicktime_brands::scan_heif_meta`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn heif(&self) -> &crate::metadata::HeifMeta {
+    &self.heif
+  }
+
+  /// **SP4** — Canon CR3 / CRM container identity.
+  /// [`crate::metadata::Cr3Meta::is_empty`] for any non-CR3 / non-CRM file.
+  ///
+  /// Faithful port of the QuickTime Canon-UUID dispatch
+  /// (QuickTime.pm:1236-1242) + `Image::ExifTool::Canon::uuid`
+  /// (Canon.pm:9657-9738). Surfaces CompressorVersion (CNCV), the
+  /// CR3-vs-CRM override-file-type derivation (Canon.pm:9667), and
+  /// per-block locations of CMT1 (IFD0), CMT2 (ExifIFD), CMT3
+  /// (MakerNotes), CMT4 (GPS), CNTH (preview), THMB (thumbnail).
+  /// Populated by [`quicktime_brands::scan_canon_uuid`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn cr3(&self) -> &crate::metadata::Cr3Meta {
+    &self.cr3
+  }
+
+  /// **SP4** — JPEG 2000 (`JP2` / `JPX` / `JPM`) container identity.
+  /// [`crate::metadata::Jp2Meta::is_empty`] for any non-JP2 file.
+  ///
+  /// Faithful port of `ProcessJP2` (Jpeg2000.pm:1538-1597) + the UUID
+  /// dispatch at Jpeg2000.pm:279-352. Surfaces the JP2 sub-type
+  /// (JP2/JPX/JPM/JXL/JPH from the inner `ftyp` brand), the
+  /// UUID-Exif / UUID-XMP body locations (for deferred TIFF parse),
+  /// and the `ihdr` Image Header block location. Populated by
+  /// [`quicktime_brands::walk_jp2`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn jp2(&self) -> &crate::metadata::Jp2Meta {
+    &self.jp2
+  }
+
   /// **SP3** — `true` when an embedded Exif/TIFF block was detected but its
   /// parse is deferred until the Exif+GPS port lands (see [`Meta`]).
   #[must_use]
@@ -3643,6 +3690,13 @@ impl Meta<'_> {
     // [`quicktime_freegps::process_free_gps`]), so this projection
     // covers both the trailer + embedded sources.
     self.ligogps.project_into(&mut md);
+    // SP4 brand-variant projections — each fires only when its source
+    // signature was detected. HEIF / JP2 surface only warnings (their
+    // Exif bodies go through the deferred #36 PR); CR3 sets the Canon
+    // brand stamp on `CameraInfo`.
+    self.heif.project_into(&mut md);
+    self.cr3.project_into(&mut md);
+    self.jp2.project_into(&mut md);
     md
   }
 
@@ -3955,6 +4009,17 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   let mut udta_ligo = LigoGpsMeta::new();
   // R6/F2: the FIRST `ProcessMOV` warning (`ExifTool:Warning` under `-j`).
   let mut warning: Option<String> = None;
+  // **#159** — the absolute file offset of the top-level atom DURING which the
+  // first `ProcessMOV` warning was raised. Captured first-wins (the first
+  // iteration that flips `warning` to `Some` records the earliest position),
+  // so the document-level diagnostics drain can rank `self.warning` against a
+  // HEIF `meta`-box walk warning by file position (priority-0 first-wins ⇒ the
+  // earlier-positioned warning becomes the public `ExifTool:Warning`). `pos`
+  // is the atom's absolute file offset throughout its decode (it advances to
+  // `next` only at the loop bottom), and every warning-raising path keeps `pos`
+  // at the offending atom — so a single check after the per-atom decode (plus
+  // capture in the early-`break` error arms) records the right position.
+  let mut warning_offset: Option<u64> = None;
   let mut pos = 0usize;
   while pos < scan_end {
     match read_atom_header(scan_data, pos, true) {
@@ -4009,6 +4074,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           }
           _ => {}
         }
+        // #159: a `moov`/`frea` child decode may have raised the first warning
+        // (`decode_moov_mvhd`/`decode_moov_udta_meta`/`decode_frea`) — `pos` is
+        // still this top-level atom's offset, so record it first-wins.
+        if warning.is_some() && warning_offset.is_none() {
+          warning_offset = Some(pos as u64);
+        }
         if next <= pos {
           break; // never advance backwards (hostile size)
         }
@@ -4050,6 +4121,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           // branch fires `Truncated '${t}' data at offset 0x%x`
           // (QuickTime.pm:10590), where `$lastPos` is the atom's file offset.
           warning.get_or_insert_with(|| std::format!("Truncated 'mdat' data at offset {pos:#x}"));
+          // #159: this is the offending top-level atom's offset (first-wins).
+          if warning_offset.is_none() {
+            warning_offset = Some(pos as u64);
+          }
         } else {
           // A recognized atom WITH a real tagInfo (e.g. `ftyp`, `moov`) takes
           // the `$raf->Read($val,$size)` path; the short read yields
@@ -4075,6 +4150,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
           warning.get_or_insert_with(|| {
             std::format!("Truncated '{tag}' data (missing {missing} bytes)")
           });
+          // #159: the offending top-level atom's offset (first-wins).
+          if warning_offset.is_none() {
+            warning_offset = Some(pos as u64);
+          }
         }
         break;
       }
@@ -4087,6 +4166,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
         // `ProcessMOV`. For the FIRST atom `$lastTag` is empty, so it is the
         // plain warning (not the `Unknown trailer with ...` mdat/moov wrap).
         warning.get_or_insert_with(|| w.to_string());
+        // #159: the offending top-level atom's offset (first-wins).
+        if warning_offset.is_none() {
+          warning_offset = Some(pos as u64);
+        }
         break;
       }
       // `read_atom_header(.., top_level=true)` never yields `Terminator` (that
@@ -4114,6 +4197,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
       .unwrap_or_default();
     if &header.atom_type == b"moov" {
       decode_moov_trak(body, movie_ts, &mut qt, &mut warning);
+    }
+    // #159: a `trak` child decode runs only in this second pass; if it raised
+    // the first warning of the whole walk (Pass 1 set none), record this
+    // `moov`'s top-level offset (first-wins). In ExifTool's single walk the
+    // `mvhd`/`udta` (Pass 1) precede the `trak` (Pass 2) of the SAME `moov`, so
+    // any Pass-1 warning already won — this only fires for a trak-only warning.
+    if warning.is_some() && warning_offset.is_none() {
+      warning_offset = Some(pos as u64);
     }
     if next <= pos {
       break;
@@ -4410,6 +4501,104 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // in `identify_trailers` chain order — ExifTool's `ProcessMOV` trailer loop
   // (QuickTime.pm:10654-10677).
 
+  // ── SP4 brand dispatch begin ──────────────────────────────────────────
+  //
+  // After the SP1/SP2/SP3 walks (and the deferred trailer phase above,
+  // which decoded the Insta360 INSV/INSP + LigoGPS `&&&&` trailers in
+  // `ProcessMOV` chain order off the shared `Doc<N>` counter), run the
+  // per-brand decoders. Each walker is a no-op when its signature is
+  // absent, so a plain MOV/MP4 pays only the cost of one box-walk over
+  // the top-level boxes (which we already did several times above — the
+  // brand walkers re-walk independently because the cost is dominated by
+  // I/O not parsing).
+  //
+  // - HEIF/HEIC/AVIF `meta` box (QuickTime.pm:2834-2916 + 9131-9523):
+  //   the `meta` box can sit at the top level (HEIF still images,
+  //   `%QuickTime::Main`) or in ANY moov/moof container position
+  //   (`%Movie`/`%Track`/`%MovieFragment`/`%TrackFragment`/`%UserData`).
+  // - Canon CR3 / CRM Canon-UUID atom (QuickTime.pm:1239 +
+  //   Canon.pm:9657-9738): the UUID `85 c0 b6 87 82 0f 11 e0 81 11 f4
+  //   ce 46 2b 6a 48` is dispatched ONLY from `%Movie` (moov children).
+  //
+  // Both are handled by ONE container-table-context walker
+  // (`scan_quicktime_brands`) that mirrors ExifTool's QuickTime container
+  // hierarchy: it starts in `%QuickTime::Main` and recurses through the
+  // SubDirectory `TagTable` edges (moov→Movie, trak→Track, udta→UserData,
+  // moof→MovieFragment, traf→TrackFragment), parsing each `meta` at its
+  // table-correct child offset (`Start => 4` for the Main/UserData FullBox
+  // positions, else 0) and dispatching the Canon `uuid` only under `%Movie`.
+  //
+  // The walker runs over the BOUNDED `scan_data` (the top-level box region,
+  // `..box_region_end`) — the SAME slice ProcessMOV's main walk + every other
+  // downstream box scan use — so a Canon-`uuid` / HEIF-`meta` shaped run of
+  // bytes that lives in a file-end TRAILER (past `box_region_end`) is NOT
+  // parsed as a top-level box. `scan_data` is a prefix of `data` starting at
+  // offset 0, so the folded `h.abs_start` offsets stay file-absolute.
+  let mut heif_meta = crate::metadata::HeifMeta::new();
+  let mut cr3_meta = crate::metadata::Cr3Meta::new();
+  crate::formats::quicktime_brands::scan_quicktime_brands(
+    scan_data,
+    0,
+    crate::formats::quicktime_brands::QtTable::Main,
+    0,
+    &mut heif_meta,
+    &mut cr3_meta,
+  );
+
+  // SP4 — CR3 / CRM file-type override. Canon.pm:9667 `OverrideFileType
+  // ($1) if $val =~ /^Canon(\w{3})/i` — extract the 3 chars after
+  // `Canon` in CNCV. `OverrideFileType` (ExifTool.pm:9712-9731) also
+  // rewrites the MIME from the GLOBAL `%mimeType` table
+  // (ExifTool.pm:637-640):
+  //   `CR2 => 'image/x-canon-cr2', CR3 => 'image/x-canon-cr3',
+  //    CRM => 'video/x-canon-crm', CRW => 'image/x-canon-crw'`
+  // (ExifTool.pm:638-641). So a CR3 file goes from `CRX` /
+  // `video/x-canon-crx` (the `crx ` brand defaults) to `CR3` /
+  // `image/x-canon-cr3`, and a CRM file to `CRM` / `video/x-canon-crm`.
+  if let Some(ft_override) = cr3_meta.override_file_type() {
+    match ft_override {
+      "CR3" => {
+        file_type = "CR3";
+        mime = "image/x-canon-cr3";
+      }
+      "CRM" => {
+        file_type = "CRM";
+        // ExifTool.pm:640 `CRM => 'video/x-canon-crm'`. `OverrideFileType`
+        // rewrites the MIME from the global `%mimeType` table, so a CRM
+        // file's MIME is `video/x-canon-crm` (NOT the brand-derived
+        // `video/x-canon-crx`).
+        mime = "video/x-canon-crm";
+      }
+      _ => {
+        // An unrecognized 3-char suffix — stay with the ftyp-derived
+        // brand (CRX or whatever).
+      }
+    }
+  }
+
+  // **SP4 — JPEG 2000 dispatch.** A JP2 / JPX / JPM file does NOT use
+  // the QuickTime/ISO-BMFF wrapper at the top level — it starts with
+  // the dedicated 12-byte JP2 signature `00 00 00 0c 6A 50 20 20 0D
+  // 0A 87 0A` (`jP  \r\n\x87\n`, Jpeg2000.pm:1548). So `parse_inner`'s
+  // top-level walk above (which expects a recognized QuickTime first
+  // atom like `ftyp`/`moov`/`mdat`) WOULD have returned `None` at
+  // the `is_known_top_level` gate.
+  //
+  // The actual JP2 entry point is `Image::ExifTool::Jpeg2000::ProcessJP2`
+  // — a SEPARATE process proc dispatched by ExifTool's file-type
+  // detection. exifast's `quicktime` format DOES NOT currently handle
+  // JP2 files (the magic-byte regex routes them to a `JP2` parser that
+  // is its own follow-up issue). HOWEVER, when a JP2 sub-section sits
+  // INSIDE another ISO-BMFF file (e.g. some MJ2 / MOV containers that
+  // re-encapsulate a JPEG 2000 codestream), running the JP2 walker on
+  // the same buffer still discovers nothing — the JP2 signature check
+  // returns false. So this call is faithful (matches bundled's "JP2
+  // signature check first" gate) and a no-op for QuickTime/MP4.
+  let mut jp2_meta = crate::metadata::Jp2Meta::new();
+  crate::formats::quicktime_brands::walk_jp2(data, &mut jp2_meta);
+
+  // ── SP4 brand dispatch end ────────────────────────────────────────────
+
   Some(Meta {
     qt,
     stream,
@@ -4420,10 +4609,14 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     insta360: insta360_meta,
     parrot: parrot_meta,
     ligogps: ligogps_meta,
+    heif: heif_meta,
+    cr3: cr3_meta,
+    jp2: jp2_meta,
     embedded_exif_deferred,
     file_type,
     mime,
     warning,
+    warning_offset,
   })
 }
 
@@ -4597,10 +4790,13 @@ fn is_known_top_level(t: &[u8; 4]) -> bool {
 
 #[cfg(feature = "alloc")]
 impl crate::diagnostics::Diagnose for Meta<'_> {
-  /// QuickTime's diagnostics in the retired drain order: (a) the FIRST
-  /// `ProcessMOV` warning (`Truncated '...' data` / `Invalid atom size`,
-  /// QuickTime.pm:10242/10590) — the per-track truncation warnings ride the
-  /// TAG stream under `Track<N>:Warning`, not here (R6/F2); (b) the LigoGPS
+  /// QuickTime's document-level diagnostics: (a) the FIRST `ProcessMOV`
+  /// warning (`Truncated '...' data` / `Invalid atom size`,
+  /// QuickTime.pm:10242/10590) and the HEIF `meta`-box walk warning
+  /// (`HeifMeta::warning`), emitted in ASCENDING file-position order (#159) so
+  /// the consumer's priority-0 first-wins slot keeps the EARLIER-positioned
+  /// `Warning` — the per-track truncation warnings ride the TAG stream under
+  /// `Track<N>:Warning`, not here (R6/F2); (b) the LigoGPS
   /// decoder warning (`Unrecognized data in LigoGPS trailer` /
   /// `LIGOGPSINFO coordinates out of range` / `LIGOGPSINFO format error` / the
   /// decrypt-failure deferral); (c) the SP3 embedded-Exif-hop deferral notice
@@ -4626,7 +4822,46 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
   /// earlier-extracted document warning, matching ExifTool's file order.
   fn diagnostics(&self) -> std::vec::Vec<crate::diagnostics::Diagnostic> {
     let mut out = std::vec::Vec::new();
-    if let Some(w) = self.warning() {
+    // SP4: the `ftyp`-dispatched brand walkers raise their own non-fatal walk
+    // warnings (truncated iloc/iinf/ipma + `Item info entries are out of order`
+    // for HEIF; a malformed Canon UUID for CR3) during the moov/meta atom walk
+    // — drained here as document-level `Warning`s alongside the `ProcessMOV`
+    // warning (resolves the `TODO(#159 audit)` on `HeifMeta`/`Cr3Meta`).
+    //
+    // **#159** — the consumer (`diagnostics.rs` `TagMap`) keeps the FIRST
+    // document-level `Warning` (ExifTool emits `Warning` priority-0 first-wins
+    // ⇒ the earliest by WALK POSITION). The `ProcessMOV` warning
+    // (`Meta::warning`) and the HEIF `meta`-box walk warning
+    // (`HeifMeta::warning`) are raised at DIFFERENT file positions: the HEIF
+    // `meta` box at its atom offset, the `ProcessMOV` warning at its offending
+    // top-level atom. So the two are pushed in ASCENDING offset order — a HEIF
+    // `iinf` out-of-order warning (early `meta` box) must outrank a LATER
+    // malformed top-level atom's warning, and vice-versa. A `ProcessMOV`
+    // warning with NO recorded offset (`warning_offset == None`) does not
+    // outrank the HEIF one (push HEIF first). The CR3 walker has no warning
+    // producer yet but the drain is wired for symmetry / future hardening.
+    let heif_first = match (self.warning_offset(), self.heif().warning_offset()) {
+      // Both positioned: the smaller offset wins the first-wins slot. A tie
+      // keeps the `ProcessMOV` warning first (HEIF's `meta` box is the SAME
+      // top-level atom as the surrounding walk, never strictly earlier).
+      (Some(self_off), Some(heif_off)) => heif_off < self_off,
+      // The `ProcessMOV` warning has no position but HEIF does: HEIF (a
+      // located walk warning) is not outranked by an offset-less one.
+      (None, Some(_)) => true,
+      // HEIF has no position (no HEIF warning, or — defensively — an
+      // unpositioned one): keep the existing `self`-then-HEIF order.
+      (_, None) => false,
+    };
+    if !heif_first && let Some(w) = self.warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    if let Some(w) = self.heif().warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    if heif_first && let Some(w) = self.warning() {
+      out.push(crate::diagnostics::Diagnostic::warn(w));
+    }
+    if let Some(w) = self.cr3().warning() {
       out.push(crate::diagnostics::Diagnostic::warn(w));
     }
     if let Some(w) = self.ligogps().warning() {
@@ -6733,6 +6968,41 @@ impl crate::emit::Taggable for Meta<'_> {
           false,
         ));
       }
+    }
+
+    // ── SP4: brand sub-meta document-level tags (always-on) ─────────────
+    // The `ftyp`-dispatched brand walkers (`crate::formats::quicktime_brands`)
+    // populate [`Meta::cr3`] / [`Meta::heif`]; their one-per-file
+    // document-level identity tags ride QuickTime's `tags()` under their
+    // foreign groups (like the GoPro/PLIST tags above), emitted REGARDLESS of
+    // `-ee` / group mode.
+    //
+    // CR3 CompressorVersion (`Image::ExifTool::Canon::uuid` CNCV,
+    // Canon.pm:9666-9668): the FULL CNCV string under `MakerNotes`/`Canon`
+    // (the `%Canon::uuid` table `GROUPS => { 0 => 'MakerNotes', 1 => 'Canon'
+    // }`). No PrintConv (the RawConv only stashes the OverrideFileType and
+    // returns `$val`) ⇒ mode-invariant. Oracle (CanonRaw.cr3):
+    // `MakerNotes:Canon:CompressorVersion = "CanonCR3_001/00.09.00/00.00.00"`.
+    if let Some(cncv) = self.cr3().compressor_version() {
+      tags.push(EmittedTag::new(
+        Group::new("MakerNotes", "Canon"),
+        "CompressorVersion".into(),
+        TagValue::Str(cncv.into()),
+        false,
+      ));
+    }
+    // HEIF PrimaryItemReference (`%QuickTime::Meta` pitm, QuickTime.pm:2883):
+    // the `$$self{PrimaryItem}` id under `QuickTime`/`Meta` (the `%QuickTime::
+    // Meta` table `GROUPS => { 1 => 'Meta' }`). No PrintConv (the RawConv
+    // stashes the unpacked id) ⇒ mode-invariant `int`. Oracle
+    // (QuickTime.heic): `QuickTime:Meta:PrimaryItemReference = 20002`.
+    if let Some(id) = self.heif().primary_item() {
+      tags.push(EmittedTag::new(
+        Group::new("QuickTime", "Meta"),
+        "PrimaryItemReference".into(),
+        TagValue::U64(u64::from(id)),
+        false,
+      ));
     }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
@@ -11820,6 +12090,128 @@ mod tests {
     );
   }
 
+  /// A v2 `infe` body (version 2 + flags, 2-byte id, 2-byte ProtectionIndex,
+  /// 4-byte ItemType, NUL-terminated Name) — the QuickTime.pm:9252 layout, the
+  /// quicktime.rs-test mirror of the brands-test `infe_v2` builder.
+  #[cfg(feature = "alloc")]
+  fn infe_v2_body(id: u16, item_type: &[u8; 4], name: &[u8]) -> Vec<u8> {
+    let mut b = std::vec::Vec::new();
+    b.extend_from_slice(&[2, 0, 0, 0]);
+    b.extend_from_slice(&id.to_be_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(item_type);
+    b.extend_from_slice(name);
+    b.push(0);
+    b
+  }
+
+  /// Wrap `infe` bodies in a top-level `meta` box (FullBox version/flags +
+  /// `iinf` v0 + the `infe` children) — the brands-test `meta_with_iinf`
+  /// mirror. The returned bytes are a complete `[size][meta][...]` atom.
+  #[cfg(feature = "alloc")]
+  fn meta_box_with_infes(infes: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+    let mut iinf = std::vec::Vec::new();
+    iinf.extend_from_slice(&[0, 0, 0, 0]); // iinf version 0 + flags
+    iinf.extend_from_slice(&(infes.len() as u16).to_be_bytes()); // count
+    for infe in infes {
+      iinf.extend(atom(b"infe", infe));
+    }
+    let mut meta = std::vec::Vec::new();
+    meta.extend_from_slice(&[0, 0, 0, 0]); // meta version + flags
+    meta.extend(atom(b"iinf", &iinf));
+    atom(b"meta", &meta)
+  }
+
+  /// #159 — a HEIF whose `iinf` lists DESCENDING `infe` ids (→ the
+  /// `HeifMeta::warning` "Item info entries are out of order", raised at the
+  /// EARLY `meta`-box atom) FOLLOWED BY a later size-4 junk top-level atom (→
+  /// the `ProcessMOV` "Invalid atom size", at a LATER position). ExifTool emits
+  /// `Warning` priority-0 first-wins by WALK POSITION, so the public
+  /// `ExifTool:Warning` is the EARLIER out-of-order one — even though the
+  /// `Meta::diagnostics` source order lists `self.warning` (the atom warning)
+  /// structurally before `heif().warning`. The offset-ordered drain (#159)
+  /// must surface the meta/iinf warning FIRST.
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn heif_iinf_warning_precedes_later_atom_warning() {
+    // ftyp(heic) so the file resolves as HEIC; meta{iinf: infe id 2, infe id 1}
+    // → out-of-order at the meta box; then a size-4 junk top-level atom.
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    let meta_off = data.len() as u64;
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(2, b"hvc1", b"a"),
+      infe_v2_body(1, b"hvc1", b"b"),
+    ]));
+    let junk_off = data.len();
+    // A top-level atom whose declared size is 4 (`< 8`) ⇒ `Malformed`
+    // "Invalid atom size" at THIS (later) offset (QuickTime.pm:10058).
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"junk");
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    // Sanity: BOTH warnings exist and their captured offsets order meta < atom.
+    assert_eq!(
+      meta.heif().warning(),
+      Some("Item info entries are out of order")
+    );
+    assert_eq!(meta.heif().warning_offset(), Some(meta_off + 8));
+    assert_eq!(meta.warning(), Some("Invalid atom size"));
+    assert_eq!(meta.warning_offset(), Some(junk_off as u64));
+    assert!(
+      meta.heif().warning_offset() < meta.warning_offset(),
+      "the meta-box walk warning is positioned earlier than the atom warning"
+    );
+
+    // The priority-0 first-wins public `ExifTool:Warning` (TagMap keeps the
+    // FIRST drained doc-level Warning) must be the EARLIER out-of-order one.
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Item info entries are out of order"),
+      "the earlier meta/iinf warning must win the first-wins slot, got {warnings:?}"
+    );
+    // Both warnings still surface (just ordered) — the atom warning is present
+    // but AFTER the meta one.
+    assert!(
+      warnings.iter().any(|w| w == "Invalid atom size"),
+      "the atom warning still surfaces (after the meta one), got {warnings:?}"
+    );
+  }
+
+  /// #159 control — a HEIC with a malformed (size-4) top-level atom but NO
+  /// `meta`-box warning still surfaces the `ProcessMOV` "Invalid atom size" as
+  /// the document-level `Warning`. The offset-ordering must NOT regress the
+  /// self-only case (no HEIF warning ⇒ keep the atom warning).
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn malformed_atom_warning_surfaces_without_meta_warning() {
+    // ftyp(heic) + an IN-ORDER meta box (ids 1 then 2 → NO order warning) +
+    // a later size-4 junk atom.
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    data.extend(meta_box_with_infes(&[
+      infe_v2_body(1, b"hvc1", b"a"),
+      infe_v2_body(2, b"hvc1", b"b"),
+    ]));
+    let junk_off = data.len();
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"junk");
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    assert_eq!(
+      meta.heif().warning(),
+      None,
+      "in-order ids → no meta warning"
+    );
+    assert_eq!(meta.warning(), Some("Invalid atom size"));
+    assert_eq!(meta.warning_offset(), Some(junk_off as u64));
+    let warnings = rendered_warnings(&meta);
+    assert_eq!(
+      warnings.first().map(String::as_str),
+      Some("Invalid atom size"),
+      "the atom warning must surface when there is no meta warning, got {warnings:?}"
+    );
+  }
+
   /// Build a file-end LigoGPS `&&&&` trailer whose `skip`-atom payload is NOT
   /// `LIGOGPSINFO\0` (random bytes) — the `Unrecognized data in LigoGPS trailer`
   /// case (QuickTime.pm:10667). Same shape as [`ligogps_ampersand_trailer`] minus
@@ -13139,9 +13531,15 @@ mod tests {
     assert_eq!(ft(b"dash", &[b"soun"]), ("M4A", "audio/mp4"));
     assert_eq!(ft(b"mp42", &[b"soun"]), ("M4A", "audio/mp4"));
     assert_eq!(ft(b"iso2", &[b"soun"]), ("M4A", "audio/mp4"));
-    // A non-matching major brand (`3gp4` ⇒ resolves to MP4 via the mp42 compat
-    // slot, but the brand does not start with iso/dash/mp42) ⇒ no override.
-    assert_eq!(ft(b"3gp4", &[b"soun"]), ("MP4", "video/mp4"));
+    // A non-matching major brand. **SP4 NOTE:** `3gp4` IS in
+    // `%ftypLookup` (QuickTime.pm:140 `'3gp4' => '3GPP Media (.3GP)
+    // Release 4'`) and its value has a `(.3GP)` substring, so the
+    // bundled regex extracts `3GP` and `$fileType = '3GP'` (NOT MP4).
+    // The M4A override predicate `$$et{FileType} eq 'MP4'` then fails,
+    // so the file stays `3GP` (NOT M4A). SP1 lacked this `%ftypLookup`
+    // entry and resolved `3gp4` to MP4 via the mp42 compat slot;
+    // SP4's full table is faithful to bundled.
+    assert_eq!(ft(b"3gp4", &[b"soun"]), ("3GP", "video/3gpp"));
   }
 
   #[test]
@@ -13348,6 +13746,123 @@ mod tests {
     assert_eq!(qt.time_scale(), Some(300));
     // durationInfo ValueConv at OUTPUT: 3000 / 300 = 10.0 (NOT 3000/600 = 5).
     assert_eq!(qt.duration_seconds(), Some(10.0));
+  }
+
+  #[test]
+  fn crm_override_sets_canon_crm_mime() {
+    // A `crx ` ftyp + a Canon-UUID atom whose CNCV is `CanonCRM …`
+    // drives `OverrideFileType('CRM')` (Canon.pm:9667). `OverrideFileType`
+    // rewrites the MIME from `%mimeType{CRM}` = `video/x-canon-crm`
+    // (ExifTool.pm:640) — NOT the brand-derived `video/x-canon-crx`.
+    let canon_uuid: [u8; 16] = [
+      0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a,
+      0x48,
+    ];
+    let mut uuid_body = canon_uuid.to_vec();
+    uuid_body.extend(atom(b"CNCV", b"CanonCRM 0.1.00"));
+    let moov = atom(b"moov", &atom(b"uuid", &uuid_body));
+    let mut full = atom(b"ftyp", b"crx \0\0\0\0crx ");
+    full.extend_from_slice(&moov);
+    let meta = parse_inner(&full, None).expect("accepted");
+    assert_eq!(meta.cr3().override_file_type(), Some("CRM"));
+    assert_eq!(meta.file_type(), "CRM");
+    assert_eq!(meta.mime(), "video/x-canon-crm");
+  }
+
+  #[test]
+  fn cr3_override_sets_canon_cr3_mime() {
+    // Sibling of `crm_override_sets_canon_crm_mime`: a `CanonCR3` CNCV →
+    // FileType CR3 + MIME `image/x-canon-cr3` (ExifTool.pm:639).
+    let canon_uuid: [u8; 16] = [
+      0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a,
+      0x48,
+    ];
+    let mut uuid_body = canon_uuid.to_vec();
+    uuid_body.extend(atom(b"CNCV", b"CanonCR3 0.1.00"));
+    let moov = atom(b"moov", &atom(b"uuid", &uuid_body));
+    let mut full = atom(b"ftyp", b"crx \0\0\0\0crx ");
+    full.extend_from_slice(&moov);
+    let meta = parse_inner(&full, None).expect("accepted");
+    assert_eq!(meta.file_type(), "CR3");
+    assert_eq!(meta.mime(), "image/x-canon-cr3");
+  }
+
+  #[test]
+  fn scan_canon_size0_moov_does_not_override_to_cr3() {
+    // R16/F1: `ftyp(crx )` + a TOP-LEVEL size-0 `moov` whose (would-be)
+    // payload is a Canon-UUID atom with `CNCV = CanonCR3 …`. A size-0 box is
+    // ExtendsToEof at the top level (QuickTime.pm:10044-10056) — ProcessMOV
+    // STOPS without decoding its body — so the Canon-UUID scanner must NOT
+    // descend into the size-0 moov. The CNCV is therefore never read, the
+    // CR3 override never fires, and the FileType/MIME stay the `crx `-brand
+    // defaults (CRX / video/x-canon-crx). `walk_boxes` decoding the size-0
+    // moov body would WRONGLY override CRX → CR3 here.
+    let canon_uuid: [u8; 16] = [
+      0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a,
+      0x48,
+    ];
+    let mut uuid_body = canon_uuid.to_vec();
+    uuid_body.extend(atom(b"CNCV", b"CanonCR3 0.1.00"));
+    let uuid = atom(b"uuid", &uuid_body);
+    let mut full = atom(b"ftyp", b"crx \0\0\0\0crx ");
+    // A size-0 `moov` header (size 0 + tag) followed by the uuid bytes as its
+    // would-be payload (extends to EOF, never decoded as child boxes).
+    full.extend_from_slice(&0u32.to_be_bytes());
+    full.extend_from_slice(b"moov");
+    full.extend_from_slice(&uuid);
+    let meta = parse_inner(&full, None).expect("accepted");
+    // The size-0 moov is not scanned ⇒ no CNCV ⇒ no override ⇒ empty Cr3Meta.
+    assert_eq!(meta.cr3().override_file_type(), None);
+    assert!(
+      meta.cr3().is_empty(),
+      "the size-0 moov's Canon UUID must not be decoded"
+    );
+    // FileType / MIME stay the `crx `-brand defaults (no CR3 promotion).
+    assert_eq!(meta.file_type(), "CRX");
+    assert_eq!(meta.mime(), "video/x-canon-crx");
+  }
+
+  #[cfg(feature = "alloc")]
+  #[test]
+  fn scan_heif_size0_meta_not_decoded() {
+    // R16/F1: `ftyp(heic)` + a TOP-LEVEL size-0 `meta` whose (would-be)
+    // payload is an `iinf` listing DESCENDING infe ids. A size-0 box is
+    // ExtendsToEof at the top level (QuickTime.pm:10044-10056) — ProcessMOV
+    // STOPS without decoding its body — so the HEIF `meta` scanner must NOT
+    // descend into the size-0 meta. The HeifMeta therefore stays EMPTY (no
+    // items, no "out of order" warning), and the FileType is HEIC (from the
+    // ftyp brand). `walk_boxes` decoding the size-0 meta body would WRONGLY
+    // emit the out-of-order warning the oracle never produces.
+    let mut data = atom(b"ftyp", b"heic\0\0\0\0heic");
+    // Build the `meta` payload the helper would (version/flags + iinf with
+    // DESCENDING ids 2 then 1 — an out-of-order list when decoded).
+    let mut iinf = std::vec::Vec::new();
+    iinf.extend_from_slice(&[0, 0, 0, 0]); // iinf version 0 + flags
+    iinf.extend_from_slice(&2u16.to_be_bytes()); // count = 2
+    iinf.extend(atom(b"infe", &infe_v2_body(2, b"hvc1", b"a")));
+    iinf.extend(atom(b"infe", &infe_v2_body(1, b"hvc1", b"b")));
+    let mut meta_body = std::vec::Vec::new();
+    meta_body.extend_from_slice(&[0, 0, 0, 0]); // meta version + flags
+    meta_body.extend(atom(b"iinf", &iinf));
+    // A size-0 `meta` header (size 0 + tag) + the would-be payload.
+    data.extend_from_slice(&0u32.to_be_bytes());
+    data.extend_from_slice(b"meta");
+    data.extend_from_slice(&meta_body);
+
+    let meta = parse_inner(&data, None).expect("accepted as HEIC");
+    // The size-0 meta is not scanned ⇒ no items + no order warning.
+    assert!(
+      meta.heif().items().is_empty(),
+      "the size-0 meta's items must not be decoded"
+    );
+    assert_eq!(
+      meta.heif().warning(),
+      None,
+      "the size-0 meta must not raise the out-of-order warning"
+    );
+    assert!(meta.heif().is_empty());
+    // FileType stays HEIC (from the ftyp brand).
+    assert_eq!(meta.file_type(), "HEIC");
   }
 
   #[test]

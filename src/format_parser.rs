@@ -332,6 +332,19 @@ pub enum AnyParser {
   /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — ISO-BMFF box container).
   #[cfg(feature = "quicktime")]
   QuickTime(crate::formats::quicktime::ProcessMov),
+  /// JPEG 2000 (JP2/JPX/JPM/JPH/JXL — the standalone JP2-signature
+  /// container, `ProcessJP2`/Jpeg2000.pm). Routed separately from the
+  /// QuickTime `ftyp`/`moov` gate because a real `.jp2` starts with the
+  /// 12-byte JP2 signature box, not an `ftyp` atom.
+  #[cfg(feature = "quicktime")]
+  Jp2(crate::formats::quicktime_brands::ProcessJp2),
+  /// JPEG XL (`JXL` boxed / `JXL Codestream` raw — `ProcessJXL`,
+  /// Jpeg2000.pm:1603-1653). A separate magic from JP2 (`\xff\x0a` raw or
+  /// `\0\0\0\x0cJXL ` boxed), so it has its own parser entry; it produces
+  /// the SAME [`crate::metadata::Jp2Meta`] surface (with `is_jxl` set) and
+  /// reuses the JP2 box walker for the boxed form.
+  #[cfg(feature = "quicktime")]
+  Jxl(crate::formats::quicktime_brands::ProcessJxl),
   /// MXF (FORMATS.md row 24 — Material Exchange Format KLV container).
   #[cfg(feature = "mxf")]
   Mxf(crate::formats::mxf::ProcessMxf),
@@ -472,6 +485,11 @@ pub enum AnyMeta<'a> {
   /// QuickTime (MOV/MP4/M4A/M4V/3GP/3G2 — SP1 core structural atoms).
   #[cfg(feature = "quicktime")]
   QuickTime(crate::formats::quicktime::Meta<'a>),
+  /// JPEG 2000 (JP2/JPX/JPM/JPH/JXL). [`Jp2Meta`](crate::metadata::Jp2Meta)
+  /// owns its data (it records only offsets/sub-type, no input borrow), so
+  /// the enum `'a` is unused by this variant.
+  #[cfg(feature = "quicktime")]
+  Jp2(crate::metadata::Jp2Meta),
   /// MXF (FORMATS.md row 24 — Material Exchange Format). `MxfMeta` owns its
   /// data (every value is transformed during the KLV walk); `'a` is a
   /// phantom there, kept for GAT uniformity.
@@ -612,6 +630,10 @@ impl AnyMeta<'_> {
       AnyMeta::Matroska(m) => m.tags(opts).collect(),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => m.tags(opts).collect(),
+      // JP2 emits no direct tags (FileType is finalized by the engine;
+      // the UUID-Exif camera body is deferred to PR #36).
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) => m.tags(opts).collect(),
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => m.tags(opts).collect(),
       // PLIST: `tags()` yields the recognized-PLIST error tag (binary
@@ -856,6 +878,8 @@ impl crate::diagnostics::Diagnose for AnyMeta<'_> {
       AnyMeta::Matroska(m) => crate::diagnostics::Diagnose::diagnostics(m),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => crate::diagnostics::Diagnose::diagnostics(m),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) => crate::diagnostics::Diagnose::diagnostics(m),
       // MXF runs entirely under `$$et{SET_GROUP1} = 'MXF'` (MXF.pm:2838, cleared
       // :2966), so EVERY `$et->Warn` (the lone reachable site is `Bad array or
       // batch size`, MXF.pm:2528) is the group-scoped `MXF:Warning` TAG, emitted
@@ -1007,6 +1031,56 @@ impl ExplicitWithMime {
   }
 }
 
+/// Payload for [`FileTypeFinalize::ExplicitWithMimeAndExt`]: a
+/// `SetFileType($set, $mime, $normExt)` where the parser supplies the
+/// explicit file type, its MIME, AND its file-type extension — all three
+/// `SetFileType` arguments (ExifTool.pm:9688 `sub SetFileType($;$$$)`).
+/// The 3rd `$normExt` arg sets `FileTypeExtension` DIRECTLY (uppercased →
+/// PrintConv lowercased, ExifTool.pm:9714), bypassing the `%fileTypeExt`
+/// table — so neither the FileType NAME nor the extension need a generic
+/// table entry. The lone case is JXL's raw codestream:
+/// `SetFileType('JXL Codestream','image/jxl','jxl')` (Jpeg2000.pm:1628),
+/// where the FileType `JXL Codestream` is NOT a `%mimeType`/`%fileTypeExt`
+/// key. Extracted into a named struct so the enum stays unit-or-newtype
+/// only (§2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplicitWithMimeAndExt {
+  set: &'static str,
+  mime: &'static str,
+  ext: &'static str,
+}
+
+impl ExplicitWithMimeAndExt {
+  /// Construct from the `SetFileType($set, $mime, $ext)` arguments.
+  #[must_use]
+  #[inline(always)]
+  pub const fn new(set: &'static str, mime: &'static str, ext: &'static str) -> Self {
+    Self { set, mime, ext }
+  }
+
+  /// The explicit `File:FileType` (the first `SetFileType` argument).
+  #[must_use]
+  #[inline(always)]
+  pub const fn set(&self) -> &'static str {
+    self.set
+  }
+
+  /// The explicit `File:MIMEType` (the second `SetFileType` argument).
+  #[must_use]
+  #[inline(always)]
+  pub const fn mime(&self) -> &'static str {
+    self.mime
+  }
+
+  /// The explicit file-type extension (the third `SetFileType` argument) —
+  /// stored uppercased and PrintConv-lowercased into `FileTypeExtension`.
+  #[must_use]
+  #[inline(always)]
+  pub const fn ext(&self) -> &'static str {
+    self.ext
+  }
+}
+
 /// Payload for [`FileTypeFinalize::DetectedThenOverrideWithMime`]: a
 /// `SetFileType()` (detected) followed by `OverrideFileType($file_type,$mime)`
 /// where the override carries an EXPLICIT MIME (ExifTool.pm:9723 — the explicit
@@ -1099,6 +1173,15 @@ pub enum FileTypeFinalize {
   /// which are absent from `%mimeType`, QuickTime.pm:10008). The payload (see
   /// [`ExplicitWithMime`]) carries the `set` + `mime`.
   ExplicitWithMime(ExplicitWithMime),
+  /// `SetFileType($set, $mime, $ext)` — finalize to an EXPLICIT type WITH
+  /// an explicit MIME AND an explicit file-type extension, all three passed
+  /// to `SetFileType` (the 3rd `$normExt` arg, ExifTool.pm:9688/9714,
+  /// bypasses the `%fileTypeExt` table). The lone case is JXL's raw
+  /// codestream: `SetFileType('JXL Codestream','image/jxl','jxl')`
+  /// (Jpeg2000.pm:1628), where the FileType `JXL Codestream` is not a
+  /// `%mimeType`/`%fileTypeExt` key. The payload (see
+  /// [`ExplicitWithMimeAndExt`]) carries `set` + `mime` + `ext`.
+  ExplicitWithMimeAndExt(ExplicitWithMimeAndExt),
   /// `SetFileType()` then `OverrideFileType($file_type,$mime)` with an
   /// EXPLICIT MIME argument (XMP Nikon NX-D: `OverrideFileType('NXD',
   /// 'application/x-nikon-nxd')`, XMP.pm:3916). Distinct from
@@ -1194,6 +1277,8 @@ impl AnyMeta<'_> {
       AnyMeta::Matroska(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "quicktime")]
       AnyMeta::QuickTime(m) => crate::metadata::Project::project(m),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) => crate::metadata::Project::project(m),
       #[cfg(feature = "mxf")]
       AnyMeta::Mxf(m) => crate::metadata::Project::project(m),
       // PLIST: an Apple Property List carries no camera/lens/GPS/capture facts
@@ -1353,6 +1438,51 @@ impl AnyMeta<'_> {
       AnyMeta::QuickTime(m) => {
         FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new(m.file_type(), m.mime()))
       }
+      // JP2: `ProcessJP2` calls `SetFileType($fileType)` where `$fileType`
+      // is the sub-type promoted from the inner `ftyp` brand (JPX/JPM/JXL/
+      // JPH) or `undef` (Jpeg2000.pm:1578-1587). With NO mime argument the
+      // MIME comes from `%mimeType{$fileType}` (image/jpx, image/jpm,
+      // image/jxl, image/jph) — all present in the engine's generic table,
+      // so `Explicit` (which derives MIME from the table) is faithful. A
+      // bare/legacy JP2 (no ftyp, sub_type stays "JP2") takes the `undef`
+      // branch ⇒ `Detected` (the signature-detected `JP2` candidate →
+      // image/jp2).
+      //
+      // A raw J2C codestream (sub_type "J2C") is the
+      // `/^\xff\x4f\xff\x51\0/` arm of `ProcessJP2`, which
+      // `SetFileType('J2C')` EXPLICITLY (Jpeg2000.pm:1561). `Explicit("J2C")`
+      // resolves `File:FileType=J2C` + the generic `%mimeType{J2C}`
+      // (`image/x-j2c`, ExifTool.pm:702) — both already in the engine's
+      // tables — without an explicit MIME argument.
+      // JXL (`ProcessJXL`, Jpeg2000.pm:1603-1653) shares the `Jp2Meta`
+      // surface. The raw codestream form calls `SetFileType('JXL
+      // Codestream','image/jxl','jxl')` (:1628) — an EXPLICIT FileType +
+      // MIME + extension (all three `SetFileType` arguments). The FileType
+      // `JXL Codestream` is NOT a `%mimeType`/`%fileTypeExt` key, so the
+      // MIME + extension MUST be carried verbatim (`ExplicitWithMimeAndExt`),
+      // NOT looked up — exactly mirroring the explicit `SetFileType` args.
+      // The boxed form keeps `File:FileType = JXL` (the inner `ftyp jxl `
+      // brand → sub_type "JXL", :1583) with MIME `image/jxl` (the generic
+      // `%mimeType{JXL}` table, ExifTool.pm:711) + extension `jxl` (the
+      // `$fileType`→`jxl` fallback) via `Explicit("JXL")`.
+      // These two JXL checks MUST precede the JP2 sub_type match (a boxed
+      // JXL has sub_type "JXL" too, but a raw codestream has no sub_type).
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) if m.jxl_raw_codestream() => FileTypeFinalize::ExplicitWithMimeAndExt(
+        ExplicitWithMimeAndExt::new("JXL Codestream", "image/jxl", "jxl"),
+      ),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) if m.is_jxl() => FileTypeFinalize::Explicit("JXL"),
+      #[cfg(feature = "quicktime")]
+      AnyMeta::Jp2(m) => match m.sub_type() {
+        Some("JPX") => FileTypeFinalize::Explicit("JPX"),
+        Some("JPM") => FileTypeFinalize::Explicit("JPM"),
+        Some("JXL") => FileTypeFinalize::Explicit("JXL"),
+        Some("JPH") => FileTypeFinalize::Explicit("JPH"),
+        Some("J2C") => FileTypeFinalize::Explicit("J2C"),
+        // "JP2" / None ⇒ the detected `JP2` candidate (SetFileType(undef)).
+        _ => FileTypeFinalize::Detected,
+      },
       // MXF: `ProcessMXF` calls `SetFileType()` with no argument
       // (MXF.pm:2820) ⇒ finalize to the detected candidate type.
       #[cfg(feature = "mxf")]
@@ -1892,6 +2022,22 @@ impl AnyParser {
         let _ = (p, shared);
         crate::formats::quicktime::parse_with_ext(bytes, ext).map(AnyMeta::QuickTime)
       }
+      #[cfg(feature = "quicktime")]
+      AnyParser::Jp2(p) => {
+        // JP2 is a leaf format (no chained state, no extension rule — the
+        // sub-type comes from the inner ftyp brand, not the file extension).
+        let _ = (shared, ext);
+        p.parse(bytes).map(AnyMeta::Jp2)
+      }
+      #[cfg(feature = "quicktime")]
+      AnyParser::Jxl(p) => {
+        // JXL is a leaf format (no chained state, no extension rule — the
+        // form/dimensions come from the codestream + the inner ftyp brand).
+        // It shares the `Jp2Meta` surface (with `is_jxl` set), so it maps to
+        // `AnyMeta::Jp2` and the finalize/tags/diagnostics ride the JP2 arms.
+        let _ = (shared, ext);
+        p.parse(bytes).map(AnyMeta::Jp2)
+      }
       #[cfg(feature = "mxf")]
       AnyParser::Mxf(p) => {
         // MXF is a leaf format (Engine-only, no chained state): `shared`
@@ -2083,6 +2229,24 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     // `FileTypeFinalize::Explicit`).
     #[cfg(feature = "quicktime")]
     "MOV" => Some(AnyParser::QuickTime(crate::formats::quicktime::ProcessMov)),
+    // JP2 (JPEG 2000) — `%fileTypeLookup{JP2}` resolves the `.jp2`/`.jpx`/
+    // `.jpm`/`.jpf` extension + the 12-byte JP2-signature magic
+    // (filetype_data.rs:1122) to file type "JP2" (base module `Jpeg2000`,
+    // MIME `image/jp2`). Bundled `ProcessJP2` (Jpeg2000.pm:1538) reads the
+    // signature box + the optional inner `ftyp` brand (promoting JPX/JPM/
+    // JXL/JPH) + the UUID-Exif/XMP boxes. Routed to the dedicated
+    // `ProcessJp2` parser (NOT the QuickTime `ftyp`/`moov` walker, which a
+    // JP2 file would fail at the top-level gate).
+    #[cfg(feature = "quicktime")]
+    "JP2" => Some(AnyParser::Jp2(crate::formats::quicktime_brands::ProcessJp2)),
+    // JXL (JPEG XL) — `%fileTypeLookup{JXL}` resolves the `.jxl` extension +
+    // the magic (`\xff\x0a` raw codestream OR `\0\0\0\x0cJXL ` boxed,
+    // filetype_data.rs:1164) to file type "JXL" (base module `Jpeg2000`,
+    // MIME `image/jxl`). Bundled `ProcessJXL` (Jpeg2000.pm:1603) detects the
+    // form, decodes the codestream dimensions, and reuses `ProcessJP2`'s box
+    // walk for the boxed case. Routed to the dedicated `ProcessJxl` parser.
+    #[cfg(feature = "quicktime")]
+    "JXL" => Some(AnyParser::Jxl(crate::formats::quicktime_brands::ProcessJxl)),
     #[cfg(feature = "mpc")]
     "MPC" => Some(AnyParser::Mpc(crate::formats::mpc::ProcessMpc)),
     #[cfg(feature = "mxf")]

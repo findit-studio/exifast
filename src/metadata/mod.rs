@@ -34,6 +34,7 @@ mod parrot;
 pub(crate) mod png;
 pub mod project;
 mod quicktime;
+mod quicktime_brand;
 mod quicktime_stream;
 mod sony_rtmd;
 mod timed_sample;
@@ -80,6 +81,7 @@ pub use project::Project;
 pub use quicktime::{
   HandlerKind, KodakFrea, MediaTrack, QuickTimeGps, QuickTimeKeys, QuickTimeMeta, QuickTimeUserData,
 };
+pub use quicktime_brand::{Cr3Block, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta};
 pub(crate) use quicktime_stream::GpsOrigin;
 pub use quicktime_stream::{GpsSample, MebxSample, QuickTimeStreamMeta};
 pub use sony_rtmd::{
