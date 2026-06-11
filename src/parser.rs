@@ -727,6 +727,38 @@ fn extract_info_typed(
             Value::String(mime.to_string()),
           );
         }
+        FileTypeFinalize::ExplicitWithMimeAndExt(payload) => {
+          // SetFileType($set, $mime, $normExt) — all three explicit
+          // (ExifTool.pm:9688/9714). FileType = `set` VERBATIM, MIMEType =
+          // `mime` VERBATIM, and FileTypeExtension = `ext` set DIRECTLY
+          // (uppercased → PrintConv lowercased, bypassing %fileTypeExt). The
+          // lone case is JXL raw codestream `SetFileType('JXL
+          // Codestream','image/jxl','jxl')` (Jpeg2000.pm:1628), where the
+          // FileType name is not a %mimeType/%fileTypeExt key.
+          insert(
+            &mut obj,
+            "File:FileType".into(),
+            Value::String(payload.set().to_string()),
+          );
+          // FoundTag('FileTypeExtension', uc $normExt) + PrintConv lc
+          // (ExifTool.pm:9714) — the explicit 3rd `SetFileType` arg, NOT a
+          // %fileTypeExt lookup.
+          let ext_shown = apply(
+            &FILE_TYPE_EXT,
+            &TagValue::Str(payload.ext().to_uppercase().into()),
+            print_conv_enabled,
+          );
+          insert(
+            &mut obj,
+            "File:FileTypeExtension".into(),
+            serde_json::to_value(&ext_shown).unwrap_or(Value::Null),
+          );
+          insert(
+            &mut obj,
+            "File:MIMEType".into(),
+            Value::String(payload.mime().to_string()),
+          );
+        }
         FileTypeFinalize::DetectedWithMime(mime) => {
           // SetFileType($baseType, $mimeType) — the FileType + FileTypeExtension
           // are the detected triplet's, but the MIME is the explicit 2nd arg
