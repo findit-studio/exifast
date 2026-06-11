@@ -72,7 +72,7 @@ use alloc::{
 };
 
 use crate::{
-  datetime::{convert_datetime, convert_unix_time},
+  datetime::convert_unix_time_frac_f64,
   formats::quicktime_freegps::{self, FreeGpsState},
   metadata::{GpsSample, MebxSample, ParrotMeta, QuickTimeStreamMeta},
 };
@@ -155,9 +155,11 @@ pub(crate) fn convert_lat_lon(v: f64) -> f64 {
 ///
 /// `create_date_raw` is the `mvhd` CreateDate as raw 1904-epoch seconds;
 /// `sample_time` is the sample decoding time in seconds. Returns the displayed
-/// `YYYY:MM:DD HH:MM:SS[.sss]Z` string, or `None` when there is no
-/// CreateDate to anchor against (QuickTimeStream.pl:984 `if defined
-/// $sampleTime and $$value{CreateDate}`).
+/// `YYYY:MM:DD HH:MM:SS.sssZ` string — the `$dec = 3` positive flag renders a
+/// FIXED three-digit fractional second (`.000` for a whole second, no
+/// trailing-zero trim) — or `None` when there is no CreateDate to anchor
+/// against (QuickTimeStream.pl:984 `if defined $sampleTime and
+/// $$value{CreateDate}`).
 pub(crate) fn synth_gps_date_time(
   create_date_raw: Option<u64>,
   sample_time: Option<f64>,
@@ -170,9 +172,13 @@ pub(crate) fn synth_gps_date_time(
   let st = sample_time?;
   // $sampleTime += CreateDate (1904-epoch seconds), then to Unix epoch.
   let unix = create as f64 - QT_EPOCH_OFFSET as f64 + st;
-  // ConvertUnixTime($sampleTime, 0, 3): integer-seconds resolution here
-  // (the bounded decoders never carry sub-second sample times). 'Z' suffix.
-  let mut s = convert_datetime(&convert_unix_time(unix as i64));
+  // QuickTimeStream.pl:1006 `ConvertUnixTime($sampleTime, 0, 3) . 'Z'` — a
+  // POSITIVE `$dec` of 3 ⇒ a fixed THREE-digit fractional second (no
+  // trailing-zero trim): a whole second renders `…:SS.000Z`, a `.25` sample
+  // renders `…:SS.250Z`, and a fraction that rounds up to `1.000` at 3dp
+  // carries into the integer seconds. Keep the f64 sub-second precision (a
+  // dashcam/drone sample time can be `cur_time / timescale`, fractional).
+  let mut s = convert_unix_time_frac_f64(unix, 3);
   s.push('Z');
   Some(s)
 }
@@ -1721,6 +1727,7 @@ fn process_samples(
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
   parrot_out: &mut ParrotMeta,
+  dji_out: &mut crate::metadata::DjiProtobufMeta,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   let samples = match expand_samples(&track.ee, track.media_ts) {
@@ -1728,6 +1735,15 @@ fn process_samples(
     None => return false,
   };
   let mut found_embedded = false;
+  // The MUTABLE per-track DJI decode state (`$$et{ProtoPrefix}{$dirName}` +
+  // `$$self{CoordUnits}`) — created FRESH here, once per metadata `trak` (one
+  // `djmd` `trak` = one `$dirName`, init EMPTY per track, Protobuf.pm:143). It
+  // PERSISTS across THIS trak's samples (threaded through every
+  // `decode_one_sample` below, so a later data-only sample reuses the last
+  // `.proto`/units this track set) but is NEVER inherited by another `djmd` trak
+  // — a second metadata `trak` re-enters `process_samples` and gets a NEW empty
+  // state (R15-F2). Unused by non-`djmd` traks (only the `djmd` arm reads it).
+  let mut dji_track_state = crate::formats::dji_protobuf::DjiTrackState::new();
   // QuickTimeStream.pl:1418 `for ($i=0; $i<@$start and $i<@$size; ++$i)`.
   for sample in &samples {
     let start = sample.start as usize;
@@ -1765,6 +1781,8 @@ fn process_samples(
       sony_rtmd_out,
       canon_ctmd_out,
       parrot_out,
+      &mut *dji_out,
+      &mut dji_track_state,
       &mut *ligogps_out,
     );
   }
@@ -1796,6 +1814,8 @@ fn decode_one_sample(
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
   parrot_out: &mut ParrotMeta,
+  dji_out: &mut crate::metadata::DjiProtobufMeta,
+  dji_track_state: &mut crate::formats::dji_protobuf::DjiTrackState,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   // The `mebx` MetaFormat (QuickTimeStream.pl:174-180) — Apple timed
@@ -2077,6 +2097,99 @@ fn decode_one_sample(
     );
     return false;
   }
+  // DJI `djmd` (real metadata) MetaFormat (QuickTimeStream.pl:349-352 — the
+  // SubDirectory route into `Image::ExifTool::DJI::Protobuf` whose
+  // PROCESS_PROC is `Protobuf::ProcessProtobuf`). Each sample is one
+  // protobuf message carrying drone / handheld-cam GNSS + camera settings +
+  // orientation. `ProcessSamples` opens ONE `Doc<N>` per timed sample
+  // (`FoundSomething`), then `ProcessProtobuf` `HandleTag`s every leaf of that
+  // sample under it — so all of a sample's tags share one document
+  // (QuickTimeStream.pl:1517-1523; `ProcessProtobuf` never bumps the doc
+  // itself). Mirror the `rtmd` / `CTMD` / `mett` arms: open the GLOBAL doc
+  // (the shared stream counter, so the ordinal continues across the file's
+  // mebx/camm/rtmd/CTMD/mett/SP3 sources), decode the sample, and stamp that
+  // `doc` + `Track<N>` + the sample-table SampleTime/SampleDuration onto
+  // exactly the row this decode produced (watermark `sample_count()` before
+  // the call). `process_djmd` pushes AT MOST one `DjiTelemetrySample` (none
+  // when the message decodes nothing — e.g. an unknown protocol or an
+  // identity-only sample); the doc bump still runs per dispatched djmd sample,
+  // faithful to `FoundSomething` firing even when the sample yields no leaf.
+  if &track.meta_format == b"djmd" {
+    let start = dji_out.sample_count();
+    let warning_start = dji_out.warning_count();
+    let doc = out.open_doc();
+    // Thread the PER-TRACK decode state (`dji_track_state`, fresh per `djmd`
+    // trak in `process_samples`) so this trak's samples persist the prefix/units
+    // across each other but never inherit another trak's (R15-F2). The decoded
+    // row + first-wins identity + warnings still land on the file-level
+    // `dji_out` aggregate.
+    crate::formats::dji_protobuf::process_djmd(buff, dji_track_state, dji_out);
+    dji_out.stamp_track_index_from(start, track_index);
+    dji_out.stamp_doc_from(start, doc, sample.time, sample.dur);
+    // Synthesize GPSDateTime for a djmd sample that decoded GPSLatitude AND
+    // GPSLongitude but NO GPSDateTime leaf (QuickTimeStream.pl:1531-1539): after
+    // the sample is decoded+stamped, ExifTool runs `SetGPSDateTime($et, $tagTbl,
+    // $time[$i], 1)` (isUTC=1 for djmd) to approximate the GPS time from
+    // `CreateDate + SampleTime`, then DELETES `$$et{GPSLatitude/GPSLongitude/
+    // GPSDateTime}` so the synthesis is strictly PER-SAMPLE. exifast's per-sample
+    // `DjiTelemetrySample` row already isolates lat/lon/datetime per sample (each
+    // `process_djmd` builds a fresh row), so the Perl delete is structurally
+    // inherent — a later GPS-less sample cannot inherit this one's value.
+    // `synth_gps_date_time` is the project's shared `SetGPSDateTime` mirror (the
+    // same helper the freeGPS/Kenwood sources call): it adds the raw 1904-epoch
+    // CreateDate to the sample time and renders `ConvertUnixTime(..,0,3).'Z'`
+    // under the gen-golden `QuickTimeUTC=1` pin (the local-time `tzOff` branch is
+    // dead — matching isUTC=1's "no tz shift"). The value surfaces under
+    // `SET_GROUP0='Composite'` (`Composite:GPSDateTime`), emitted by `emit_dji`.
+    // A protocol WITH a GPSDateTime row (Action 4/5/6/Osmo 360/Matrice 4E/Mavic 3
+    // Pro) decoded its own leaf ⇒ `sample_wants_synth_gps_date_time` is false ⇒
+    // no synthesis (the decoded leaf is used as-is).
+    if dji_out.sample_wants_synth_gps_date_time(start)
+      && let Some(dt) = synth_gps_date_time(create_date_raw, sample.time)
+    {
+      // `SetGPSDateTime` raises the MINOR `Approximating GPSDateTime as
+      // CreateDate + SampleTime` warning (`$et->Warn(.., 1)`,
+      // QuickTimeStream.pl:991) inside `if defined $sampleTime and
+      // $$value{CreateDate}` — the SAME gate `synth_gps_date_time` checks
+      // (non-zero CreateDate + defined sample time) — BEFORE the GPSDateTime
+      // HandleTag. So the warning fires exactly when synthesis produces a value:
+      // an `Some(dt)` here. WAS_WARNED collapses the N synth samples to one
+      // `[minor] … [xN]` `Track<N>:Warning` at emit time. This synth-`Warn`
+      // fires AFTER `ProcessProtobuf` (so AFTER the walker warnings) and is keyed
+      // to the same sample's `Track<N>` / `Doc<N>` — pushed here within the
+      // warning watermark so the stamp below scopes it. NOTE: this minor
+      // `Approximating` warning is a SYSTEMIC gap across ALL exifast synth
+      // sources (freeGPS/insta360/Garmin all call the same `synth_gps_date_time`
+      // helper without raising it) — fixed here for DJI only as part of #163;
+      // the others are a separate follow-up and are deliberately NOT touched.
+      dji_out.push_warning(crate::metadata::DjiWarning::new(
+        smol_str::SmolStr::new_static("Approximating GPSDateTime as CreateDate + SampleTime"),
+        true,
+      ));
+      dji_out.set_sample_synth_gps_date_time(start, smol_str::SmolStr::from(dt));
+    }
+    // The `ProcessProtobuf` / `Protocol`-RawConv warnings (`Unknown protocol …`
+    // DJI.pm:261-264, `Protobuf format error` + `Truncated protobuf data`
+    // Protobuf.pm:156/278) AND the minor `Approximating GPSDateTime …` pushed
+    // above are scoped to the SAME `Track<N>` + `Doc<N>` as this sample:
+    // ExifTool's `SET_GROUP1 = "Track$num"` is active for the whole sample and
+    // `$self->Warn` `FoundTag`s each `Warning` under the sample's open `DOC_NUM`
+    // (the `doc` opened above). Stamp every warning this sample raised (the
+    // `warning_start` watermark window) to this `doc` / `track_index` (mirrors
+    // the `CTMD` arm's warning watermark).
+    dji_out.stamp_warnings_from(warning_start, track_index, doc);
+    return false;
+  }
+  // DJI `dbgi` (debug) MetaFormat (QuickTimeStream.pl:353-358 — same
+  // SubDirectory, but `Unknown => 2`: "extracted only if Unknown option is 2 or
+  // greater"). exifast is default-options / camera-indexing and does NOT model
+  // the `Unknown >= 2` option, so under the default `Unknown = 0` ExifTool's
+  // `ProcessSamples` never processes a `dbgi` sample at all — no `Doc<N>`, no
+  // `Protocol`, no tag, no warning. A `dbgi` MetaFormat is therefore a COMPLETE
+  // NO-OP here: it is NOT special-cased, falling through to the unrecognized-
+  // MetaFormat tail below (no document opened, no counter bumped, nothing
+  // recorded) — exactly the empty result of ExifTool's default-options skip.
+  //
   // NOTE: a real `gps `-HandlerType track is NOT dispatched here — it never
   // reaches `process_samples` ([`is_meta_handler`] excludes `gps `, faithful
   // to ExifTool having no `$eeBox{'gps '}`). The Novatek `gps ` source is the
@@ -2381,6 +2494,7 @@ pub(crate) fn extract_stream(
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
   parrot_out: &mut ParrotMeta,
+  dji_out: &mut crate::metadata::DjiProtobufMeta,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   // The freeGPS `$$et{FreeGPS2}` cross-block ring-buffer state shared by the
@@ -2419,6 +2533,7 @@ pub(crate) fn extract_stream(
           sony_rtmd_out,
           canon_ctmd_out,
           parrot_out,
+          dji_out,
           ligogps_out,
         );
       }
@@ -2634,6 +2749,7 @@ fn walk_moov(
   sony_rtmd_out: &mut crate::metadata::SonyRtmdMeta,
   canon_ctmd_out: &mut crate::metadata::CanonCtmdMeta,
   parrot_out: &mut ParrotMeta,
+  dji_out: &mut crate::metadata::DjiProtobufMeta,
   ligogps_out: &mut crate::metadata::LigoGpsMeta,
 ) -> bool {
   let mut gopro_found_embedded = false;
@@ -2671,6 +2787,7 @@ fn walk_moov(
             sony_rtmd_out,
             canon_ctmd_out,
             parrot_out,
+            dji_out,
             ligogps_out,
           );
         }
@@ -2788,6 +2905,8 @@ mod tests {
     let mut sony = crate::metadata::SonyRtmdMeta::new();
     let mut canon = crate::metadata::CanonCtmdMeta::new();
     let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut free_gps_state = FreeGpsState::new();
 
@@ -2810,6 +2929,8 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "zero-filled non-deferred gpmd still sets FoundEmbedded (ProcessGoPro entry)"
@@ -2836,6 +2957,8 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "non-printable non-deferred gpmd still sets FoundEmbedded"
@@ -2861,6 +2984,8 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "deferred FMAS gpmd does NOT set FoundEmbedded (no regression)"
@@ -2882,6 +3007,8 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "a valid GoPro DEVC sample sets FoundEmbedded"
@@ -2908,6 +3035,8 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "a non-gpmd/non-mebx/non-camm track sets no FoundEmbedded"
@@ -2933,10 +3062,664 @@ mod tests {
         &mut sony,
         &mut canon,
         &mut pr,
+        &mut dji,
+        &mut dji_st,
         &mut lg
       ),
       "a camm track does not set FoundEmbedded"
     );
+  }
+
+  // ── #163: DJI djmd/dbgi dispatch — Doc<N> bump + sample stamp ──────────────
+
+  /// Minimal protobuf encoders for the DJI dispatch tests.
+  fn pb_varint(mut v: u64) -> Vec<u8> {
+    let mut o = Vec::new();
+    loop {
+      let mut b = (v & 0x7f) as u8;
+      v >>= 7;
+      if v != 0 {
+        b |= 0x80;
+      }
+      o.push(b);
+      if v == 0 {
+        break;
+      }
+    }
+    o
+  }
+  fn pb_tag(field: u32, wire: u8) -> Vec<u8> {
+    pb_varint((u64::from(field) << 3) | u64::from(wire))
+  }
+  fn pb_len(field: u32, body: &[u8]) -> Vec<u8> {
+    let mut o = pb_tag(field, 2);
+    o.extend(pb_varint(body.len() as u64));
+    o.extend_from_slice(body);
+    o
+  }
+  fn pb_i64(field: u32, v: f64) -> Vec<u8> {
+    let mut o = pb_tag(field, 1);
+    o.extend_from_slice(&v.to_le_bytes());
+    o
+  }
+  fn pb_nest(field: u32, children: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for c in children {
+      body.extend_from_slice(c);
+    }
+    pb_len(field, &body)
+  }
+
+  /// A FAITHFUL DJI identity block `1-1` = `{ 1-1-1: name, 1-1-5: serial }`. The
+  /// trailing SerialNumber means neither the `1-1` container nor the enclosing
+  /// `1` record ends in the bytes `.proto` — only the leaf's own bytes do — so
+  /// ExifTool's raw-byte line-157 switch (`$buff =~ /\.proto$/`) fires EXACTLY
+  /// ONCE, on the genuine leaf, exactly as in real DJI (where the `.proto` string
+  /// at `1-1-1` is followed by serial/model fields). The bare
+  /// `pb_nest(1,&[pb_len(1, name)])` shape is NON-faithful: the leaf is the
+  /// container's last field, so every enclosing message ALSO ends in `.proto` and
+  /// the switch fires on each — overwriting the protocol to garbage and warning.
+  fn dji_identity(name: &[u8]) -> Vec<u8> {
+    let lvl11 = {
+      let mut v = Vec::new();
+      v.extend(pb_len(1, name)); // 1-1-1 Protocol
+      v.extend(pb_len(5, b"SER123")); // 1-1-5 SerialNumber (AFTER the leaf)
+      v
+    };
+    pb_nest(1, &[pb_len(1, &lvl11)])
+  }
+
+  /// A wm265e djmd sample carrying identity (1-1) + a GPS fix at 3-3-4-1
+  /// (degrees) for the dispatch tests.
+  fn dji_wm265e_sample() -> Vec<u8> {
+    let lvl11 = {
+      let mut v = Vec::new();
+      v.extend(pb_len(1, b"dvtm_wm265e.proto")); // 1-1-1 Protocol
+      v.extend(pb_len(5, b"SER123")); // 1-1-5 SerialNumber
+      v.extend(pb_len(10, b"FC8482")); // 1-1-10 Model
+      v
+    };
+    let lvl1 = pb_nest(1, &[pb_len(1, &lvl11)]);
+    let gps_info = {
+      let mut v = Vec::new();
+      v.extend({
+        let mut t = pb_tag(1, 0); // CoordinateUnits = 1 (degrees)
+        t.extend(pb_varint(1));
+        t
+      });
+      v.extend(pb_i64(2, 45.0)); // GPSLatitude
+      v.extend(pb_i64(3, 8.0)); // GPSLongitude
+      v
+    };
+    let lvl334 = pb_nest(4, &[pb_nest(1, &[gps_info])]); // 3-3-4-1
+    let lvl3 = pb_nest(3, &[pb_nest(3, &[lvl334])]); // 3 -> 3 -> 4 -> 1
+    let mut buf = Vec::new();
+    buf.extend(lvl1);
+    buf.extend(lvl3);
+    buf
+  }
+
+  #[test]
+  fn djmd_dispatch_opens_doc_and_stamps_sample() {
+    let djmd_track = StreamTrack {
+      meta_format: *b"djmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+    let buf = dji_wm265e_sample();
+
+    // Sample 1 at track 7, time 0.0 / dur 0.5.
+    let s1 = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    assert!(
+      !decode_one_sample(
+        &buf,
+        &djmd_track,
+        7,
+        &s1,
+        None,
+        &mut free_gps_state,
+        &mut out,
+        &mut gopro,
+        &mut camm,
+        &mut sony,
+        &mut canon,
+        &mut pr,
+        &mut dji,
+        &mut dji_st,
+        &mut lg
+      ),
+      "djmd does not set FoundEmbedded (ProcessProtobuf never does)"
+    );
+    assert_eq!(out.doc_counter(), 1, "djmd sample opened Doc1");
+    assert_eq!(dji.samples().len(), 1);
+    let row0 = &dji.samples()[0];
+    assert_eq!(row0.doc(), 1, "row stamped with Doc1");
+    assert_eq!(row0.track_index(), 7, "row stamped with Track7");
+    assert_eq!(row0.sample_time(), Some(0.0));
+    assert_eq!(row0.sample_duration(), Some(0.5));
+    assert_eq!(row0.latitude(), Some(45.0));
+
+    // Sample 2 → Doc2 (the global counter continues).
+    let s2 = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.5),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &buf,
+      &djmd_track,
+      7,
+      &s2,
+      None,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    assert_eq!(out.doc_counter(), 2, "second djmd sample opened Doc2");
+    assert_eq!(dji.samples().len(), 2);
+    assert_eq!(dji.samples()[1].doc(), 2, "second row distinct Doc2");
+  }
+
+  // ── R4-F1: SetGPSDateTime synthesis for a GPS sample lacking a leaf ──────
+  #[test]
+  fn djmd_wm265e_synthesizes_gps_date_time() {
+    // A wm265e djmd sample carries a GPS fix (lat/lon) but has NO GPSDateTime
+    // leaf (wm265e has no GPSDateTime table row). The dispatch arm must run
+    // `SetGPSDateTime($et, $tagTbl, $time[$i], 1)` (QuickTimeStream.pl:1531-1539)
+    // ⇒ a synthesized `Composite:GPSDateTime` = ConvertUnixTime(CreateDate +
+    // SampleTime, 0, 3) . 'Z'. The per-sample clear (Perl deletes
+    // GPSLatitude/GPSLongitude/GPSDateTime after each sample) is structurally
+    // inherent in exifast's per-sample row model — a later GPS-less sample does
+    // NOT inherit this one's synthesized value.
+    let djmd_track = StreamTrack {
+      meta_format: *b"djmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+    // CreateDate = QT_EPOCH_OFFSET + 1s ⇒ unix 1; with SampleTime 0.0 the
+    // synthesized value is `ConvertUnixTime(1, 0, 3) . 'Z'` =
+    // "1970:01:01 00:00:01.000Z" — the fixed three-digit fractional second of
+    // the positive `$dec = 3` (mirrors `synth_gps_date_time_integer_shows_000`).
+    let create = Some(QT_EPOCH_OFFSET as u64 + 1);
+
+    // Sample 1: the GPS sample → synthesizes GPSDateTime.
+    let buf = dji_wm265e_sample();
+    let s1 = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &buf,
+      &djmd_track,
+      1,
+      &s1,
+      create,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    let row0 = &dji.samples()[0];
+    assert_eq!(row0.latitude(), Some(45.0));
+    assert_eq!(row0.longitude(), Some(8.0));
+    assert!(
+      row0.gps_date_time().is_none(),
+      "wm265e decoded no GPSDateTime leaf"
+    );
+    assert_eq!(
+      row0.synth_gps_date_time(),
+      Some("1970:01:01 00:00:01.000Z"),
+      "synthesized from CreateDate + SampleTime under SET_GROUP0='Composite'"
+    );
+    assert_eq!(
+      row0.effective_gps_date_time(),
+      Some("1970:01:01 00:00:01.000Z"),
+      "the effective timestamp is the synthesized value"
+    );
+
+    // Sample 2: a data-only sample with NO GPS (just a TimeStamp at 3-1-2 under
+    // the persisted wm265e protocol). It must NOT inherit sample 1's synthesized
+    // GPSDateTime (per-sample isolation).
+    let buf2 = {
+      let lvl31 = pb_nest(
+        1,
+        &[{
+          let mut t = pb_tag(2, 0);
+          t.extend(pb_varint(999));
+          t
+        }],
+      ); // 3-1-2 TimeStamp
+      pb_nest(3, &[lvl31])
+    };
+    let s2 = Sample {
+      start: 0,
+      size: buf2.len() as u32,
+      time: Some(0.5),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &buf2,
+      &djmd_track,
+      1,
+      &s2,
+      create,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    let row1 = &dji.samples()[1];
+    assert!(row1.latitude().is_none(), "sample 2 has no GPS");
+    assert!(
+      row1.synth_gps_date_time().is_none(),
+      "a GPS-less sample synthesizes nothing (no inheritance from sample 1)"
+    );
+
+    // Projection: the first fix populates GpsLocation.timestamp with the
+    // synthesized value.
+    let mut md = crate::metadata::MediaMetadata::new();
+    dji.project_into(&mut md);
+    assert_eq!(
+      md.gps().expect("gps").timestamp(),
+      Some("1970:01:01 00:00:01.000Z"),
+      "the synthesized GPSDateTime projects into GpsLocation.timestamp"
+    );
+  }
+
+  #[test]
+  fn djmd_with_gps_date_time_leaf_does_not_synthesize() {
+    // A protocol WITH a GPSDateTime leaf (ac203: GPSInfo at 3-4-2-1, GPSDateTime
+    // at 3-4-2-6-1) uses the DECODED value and does NOT synthesize
+    // (`not $$et{GPSDateTime}` is false ⇒ SetGPSDateTime is skipped,
+    // QuickTimeStream.pl:1536).
+    let djmd_track = StreamTrack {
+      meta_format: *b"djmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+
+    // ac203: 1-1-1 protocol + GPSInfo (3-4-2-1: CoordinateUnits=1, lat/lon) +
+    // GPSDateTime (3-4-2-6-1).
+    let buf = {
+      let lvl1 = dji_identity(b"dvtm_ac203.proto");
+      let gps_info = {
+        let mut v = Vec::new();
+        let mut cu = pb_tag(1, 0);
+        cu.extend(pb_varint(1)); // CoordinateUnits = 1 (degrees)
+        v.extend(cu);
+        v.extend(pb_i64(2, 45.0)); // GPSLatitude
+        v.extend(pb_i64(3, 8.0)); // GPSLongitude
+        v
+      };
+      // 3-4-2: child 1 = GPSInfo, child 6 = {1 = GPSDateTime string}.
+      let lvl342 = {
+        let mut v = Vec::new();
+        v.extend(pb_nest(1, &[gps_info])); // 3-4-2-1
+        v.extend(pb_nest(6, &[pb_len(1, b"2025-01-15 12:34:56")])); // 3-4-2-6-1
+        v
+      };
+      let lvl3 = pb_nest(3, &[pb_nest(4, &[pb_len(2, &lvl342)])]);
+      let mut buf = Vec::new();
+      buf.extend(lvl1);
+      buf.extend(lvl3);
+      buf
+    };
+    let s = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &buf,
+      &djmd_track,
+      1,
+      &s,
+      Some(QT_EPOCH_OFFSET as u64 + 1),
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    let row0 = &dji.samples()[0];
+    assert_eq!(
+      row0.gps_date_time(),
+      Some("2025:01:15 12:34:56"),
+      "the decoded leaf is `tr/-/:/`-converted"
+    );
+    assert!(
+      row0.synth_gps_date_time().is_none(),
+      "a decoded GPSDateTime leaf suppresses synthesis"
+    );
+    assert_eq!(
+      row0.effective_gps_date_time(),
+      Some("2025:01:15 12:34:56"),
+      "the effective timestamp is the decoded leaf (no 'Z' suffix)"
+    );
+  }
+
+  #[test]
+  fn dbgi_is_noop_under_default_options() {
+    // QuickTimeStream.pl:355 marks the `dbgi` table `Unknown => 2` ("extracted
+    // only if Unknown option is 2 or greater"). exifast is default-options
+    // (`Unknown = 0`) and does NOT model that option, so a `dbgi` sample is a
+    // COMPLETE NO-OP: the dispatch arm opens NO `Doc<N>`, sets NO protocol,
+    // pushes NO telemetry row, records NO warning, and projects nothing — even
+    // a telemetry-shaped (or unknown-protocol) `dbgi` body must surface NONE of
+    // the output the oracle never produces under default options.
+    let dbgi_track = StreamTrack {
+      meta_format: *b"dbgi",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+    // A full wm265e body (protocol + identity + GPS fix) AND an unknown-protocol
+    // variant — neither may produce anything off the `dbgi` arm.
+    let buf = dji_wm265e_sample();
+    let s = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &buf,
+      &dbgi_track,
+      1,
+      &s,
+      Some(QT_EPOCH_OFFSET as u64 + 1), // a real CreateDate is present …
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    assert_eq!(out.doc_counter(), 0, "dbgi must NOT bump the doc counter");
+    assert_eq!(dji.protocol(), None, "dbgi sets no protocol");
+    assert!(dji.samples().is_empty(), "dbgi pushes no telemetry row");
+    assert!(dji.warnings().is_empty(), "dbgi records no warning");
+    assert!(dji.is_empty(), "a dbgi-only DjiProtobufMeta is empty");
+    // … yet nothing projects (no Make/GPS synthesised from a dbgi sample).
+    let mut md = crate::metadata::MediaMetadata::new();
+    dji.project_into(&mut md);
+    assert!(
+      md.camera().is_none(),
+      "dbgi projects no DJI camera (Make unset)"
+    );
+    assert!(md.gps().is_none(), "dbgi projects no GPS");
+
+    // An UNKNOWN-protocol dbgi body must ALSO be silent (no warning leak — the
+    // pre-no-op code raised `Unknown protocol …` here, which the oracle never
+    // emits under default options).
+    let unknown = dji_identity(b"dvtm_FUTURE99.proto");
+    let su = Sample {
+      start: 0,
+      size: unknown.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    let _ = decode_one_sample(
+      &unknown,
+      &dbgi_track,
+      1,
+      &su,
+      None,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    assert!(
+      dji.warnings().is_empty(),
+      "an unknown-protocol dbgi body must not warn under default options"
+    );
+    assert_eq!(out.doc_counter(), 0, "still no Doc from the dbgi arm");
+  }
+
+  #[test]
+  fn djmd_with_dbgi_present_emits_only_djmd() {
+    // A file with BOTH a `djmd` track (protocol dvtm_ac203) and a `dbgi` track
+    // (protocol dvtm_oq101) must emit ONLY the djmd telemetry: `dbgi` is a
+    // default-options no-op (QuickTimeStream.pl:355 `Unknown => 2`) and adds
+    // NO Doc / protocol / row / warning. Walk order is irrelevant — a `dbgi`
+    // sample walked FIRST cannot poison the djmd protocol (it does nothing).
+    let dbgi_track = StreamTrack {
+      meta_format: *b"dbgi",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let djmd_track = StreamTrack {
+      meta_format: *b"djmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+
+    // dbgi sample: identity-only, protocol dvtm_oq101 at 1-1-1. (Whatever it
+    // carries, the dbgi arm is a no-op — it contributes nothing.)
+    let dbgi_buf = dji_identity(b"dvtm_oq101.proto");
+    // djmd sample: protocol dvtm_ac203 at 1-1-1 + GPSAltitude at 3-4-2-2
+    // (123.456 m).
+    let djmd_buf = {
+      let lvl1 = dji_identity(b"dvtm_ac203.proto");
+      let mut alt = pb_tag(2, 0); // 3-4-2-2 (unsigned varint, /1000 metres)
+      alt.extend(pb_varint(123_456));
+      let lvl3 = pb_nest(3, &[pb_nest(4, &[pb_nest(2, &[alt])])]);
+      let mut buf = Vec::new();
+      buf.extend(lvl1);
+      buf.extend(lvl3);
+      buf
+    };
+    let mk = |b: &[u8]| Sample {
+      start: 0,
+      size: b.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.5),
+    };
+    // dbgi walked FIRST (the poisoning order).
+    let sd = mk(&dbgi_buf);
+    let _ = decode_one_sample(
+      &dbgi_buf,
+      &dbgi_track,
+      1,
+      &sd,
+      None,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    // djmd walked SECOND.
+    let sj = mk(&djmd_buf);
+    let _ = decode_one_sample(
+      &djmd_buf,
+      &djmd_track,
+      2,
+      &sj,
+      None,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    // The DJMD emission protocol is ac203 — the dbgi sample contributed nothing.
+    assert_eq!(
+      dji.protocol(),
+      Some("dvtm_ac203.proto"),
+      "djmd protocol must win — dbgi is a no-op and cannot poison it"
+    );
+    // Only the djmd sample opened a Doc + pushed a row (dbgi opened none).
+    assert_eq!(out.doc_counter(), 1, "only djmd bumps the doc counter");
+    assert_eq!(dji.samples().len(), 1, "only djmd pushes a telemetry row");
+    assert_eq!(dji.samples()[0].absolute_altitude_m(), Some(123.456));
+    assert!(
+      dji.warnings().is_empty(),
+      "djmd protocol is known; dbgi is silent"
+    );
+  }
+
+  #[test]
+  fn djmd_dispatch_unknown_protocol_warns_and_stamps_warning() {
+    let djmd_track = StreamTrack {
+      meta_format: *b"djmd",
+      handler: *b"meta",
+      ..StreamTrack::default()
+    };
+    let mut out = QuickTimeStreamMeta::default();
+    let mut gopro = crate::metadata::GoProMeta::new();
+    let mut camm = crate::metadata::CammMeta::new();
+    let mut sony = crate::metadata::SonyRtmdMeta::new();
+    let mut canon = crate::metadata::CanonCtmdMeta::new();
+    let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dji = crate::metadata::DjiProtobufMeta::new();
+    let mut dji_st = crate::formats::dji_protobuf::DjiTrackState::new();
+    let mut lg = crate::metadata::LigoGpsMeta::new();
+    let mut free_gps_state = FreeGpsState::new();
+    // Unknown-protocol djmd sample (identity-only, future proto). FAITHFUL block:
+    // the `.proto` leaf is followed by a serial field so only the leaf bytes end
+    // in `.proto` ⇒ exactly one switch, warning the genuine future protocol.
+    let buf = dji_identity(b"dvtm_FUTURE99.proto");
+    let s = Sample {
+      start: 0,
+      size: buf.len() as u32,
+      time: Some(0.0),
+      dur: Some(0.25),
+    };
+    let _ = decode_one_sample(
+      &buf,
+      &djmd_track,
+      3,
+      &s,
+      None,
+      &mut free_gps_state,
+      &mut out,
+      &mut gopro,
+      &mut camm,
+      &mut sony,
+      &mut canon,
+      &mut pr,
+      &mut dji,
+      &mut dji_st,
+      &mut lg,
+    );
+    // The doc still bumps (FoundSomething fires per dispatched djmd sample),
+    // and the warning is stamped to that sample's Doc1 / Track3. An
+    // identity-only unknown-protocol sample raises EXACTLY ONE warning (the
+    // unknown-protocol RawConv; no GPS fix ⇒ no synth `Approximating` warning).
+    assert_eq!(out.doc_counter(), 1);
+    assert_eq!(dji.warnings().len(), 1, "one warning for this sample");
+    let w = &dji.warnings()[0];
+    assert_eq!(
+      w.message(),
+      "Unknown protocol dvtm_FUTURE99.proto (please submit sample for testing)"
+    );
+    assert!(!w.minor(), "the unknown-protocol warning is NOT minor");
+    assert_eq!(w.doc(), 1, "stamped to the sample's Doc1");
+    assert_eq!(w.track_index(), 3, "stamped to the trak's Track3");
   }
 
   fn atom(t: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -3113,14 +3896,51 @@ mod tests {
     // QuickTimeStream.pl:984 — a raw CreateDate of 0 is FALSY ⇒ no synth (even
     // with a sample time present).
     assert_eq!(synth_gps_date_time(Some(0), Some(1.0)), None);
-    // create_date = QT_EPOCH_OFFSET + 1s ⇒ unix 1 ⇒ 1970-01-01 00:00:01
+    // create_date = QT_EPOCH_OFFSET + 1s ⇒ unix 1 ⇒ 1970-01-01 00:00:01.000Z
     // (unix 0 hits ExifTool's `0000:00:00 00:00:00` zero sentinel,
-    // ExifTool.pm:6776 — so anchor 1s past the epoch).
+    // ExifTool.pm:6776 — so anchor 1s past the epoch). `ConvertUnixTime(1,0,3)`
+    // ⇒ a fixed `.000` fractional second (ground-truthed against ExifTool 13.59).
     let s = synth_gps_date_time(Some(QT_EPOCH_OFFSET as u64 + 1), Some(0.0)).expect("dt");
-    assert_eq!(s, "1970:01:01 00:00:01Z");
+    assert_eq!(s, "1970:01:01 00:00:01.000Z");
     // adding the sample time shifts the result forward.
     let s2 = synth_gps_date_time(Some(QT_EPOCH_OFFSET as u64), Some(61.0)).expect("dt");
-    assert_eq!(s2, "1970:01:01 00:01:01Z");
+    assert_eq!(s2, "1970:01:01 00:01:01.000Z");
+  }
+
+  #[test]
+  fn synth_gps_date_time_fractional_3dp() {
+    // QuickTimeStream.pl:1006 `ConvertUnixTime($sampleTime, 0, 3)` keeps the
+    // sub-second precision of a fractional sample time: a `.25` sample renders
+    // a `.250` fractional second (ground-truthed: ExifTool 13.59
+    // `ConvertUnixTime(1704067200.25, 0, 3)` ⇒ `2024:01:01 00:00:00.250`).
+    // create_date = QT_EPOCH_OFFSET + 1704067200 ⇒ unix 1704067200.25 with the
+    // .25 sample time added.
+    let create = QT_EPOCH_OFFSET as u64 + 1_704_067_200;
+    let s = synth_gps_date_time(Some(create), Some(0.25)).expect("dt");
+    assert_eq!(s, "2024:01:01 00:00:00.250Z");
+  }
+
+  #[test]
+  fn synth_gps_date_time_integer_shows_000() {
+    // A WHOLE-second sample time still renders the FULL three-digit `.000`
+    // fractional part — the positive `$dec = 3` does NOT trim trailing zeros
+    // (contrast the negative-`$dec` camm6 trim path). ExifTool 13.59
+    // `ConvertUnixTime(1704067200, 0, 3)` ⇒ `2024:01:01 00:00:00.000`.
+    let create = QT_EPOCH_OFFSET as u64 + 1_704_067_200;
+    let s = synth_gps_date_time(Some(create), Some(0.0)).expect("dt");
+    assert_eq!(s, "2024:01:01 00:00:00.000Z");
+  }
+
+  #[test]
+  fn synth_gps_date_time_carry_rounds_up() {
+    // A fraction that rounds up to `1.000` at 3 decimal places carries into the
+    // integer seconds (and rolls the minute over). ExifTool 13.59
+    // `ConvertUnixTime(<...59.9996>, 0, 3)` ⇒ the next whole second with `.000`.
+    // create_date = QT_EPOCH_OFFSET + 1704067259 (…00:00:59), sample .9996 ⇒
+    // unix 1704067259.9996 ⇒ rounds to 1704067260 ⇒ `00:01:00.000`.
+    let create = QT_EPOCH_OFFSET as u64 + 1_704_067_259;
+    let s = synth_gps_date_time(Some(create), Some(0.9996)).expect("dt");
+    assert_eq!(s, "2024:01:01 00:01:00.000Z");
   }
 
   #[test]
@@ -3502,10 +4322,11 @@ mod tests {
     let mut sr = crate::metadata::SonyRtmdMeta::new();
     let mut cc = crate::metadata::CanonCtmdMeta::new();
     let mut pr = crate::metadata::ParrotMeta::new();
+    let mut dj = crate::metadata::DjiProtobufMeta::new();
     let mut lg = crate::metadata::LigoGpsMeta::new();
     let mut meta = QuickTimeStreamMeta::new();
     let found_embedded = extract_stream(
-      &data, None, None, &mut meta, &mut gp, &mut cm, &mut sr, &mut cc, &mut pr, &mut lg,
+      &data, None, None, &mut meta, &mut gp, &mut cm, &mut sr, &mut cc, &mut pr, &mut dj, &mut lg,
     );
     assert!(meta.is_empty());
     // No `gps ` box ⇒ ProcessFreeGPS never ran ⇒ FoundEmbedded stays false.
@@ -3515,6 +4336,7 @@ mod tests {
     assert!(sr.is_empty());
     assert!(cc.is_empty());
     assert!(pr.is_empty());
+    assert!(dj.is_empty());
   }
 
   #[test]
@@ -3667,6 +4489,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
@@ -3771,6 +4594,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(

@@ -119,6 +119,18 @@ pub mod android_camm;
 // [`quicktime_stream`]. Gated on the `quicktime` feature.
 #[cfg(feature = "quicktime")]
 pub mod canon_ctmd;
+// DJI Protobuf — `djmd` / `dbgi` timed-metadata walker. Faithful port of
+// `Image::ExifTool::Protobuf::ProcessProtobuf` (Protobuf.pm:128-300) driven
+// by the `%Image::ExifTool::DJI::Protobuf` tag table (DJI.pm:235-859) and its
+// nested message tables (DJI::FrameInfo / GPSInfo / DroneInfo / GimbalInfo,
+// DJI.pm:867-921). Reached through the `djmd` + `dbgi` MetaFormat dispatch in
+// [`quicktime_stream`] (QuickTimeStream.pl:349-358 routes both SubDirectories
+// into `Image::ExifTool::DJI::Protobuf`). Surfaces drone / handheld-cam GNSS
+// + camera settings + orientation for Mavic 3/3 Pro/4 Pro, Air 3/3s, Mini 4
+// Pro/5 Pro, Avata 2, Neo, Matrice 30/4E, Osmo Action 4/5/6, Pocket 3, Osmo
+// 360. Gated on the `quicktime` feature.
+#[cfg(feature = "quicktime")]
+pub mod dji_protobuf;
 // Insta360 — INSV/INSP trailer walker. Faithful port of
 // `Image::ExifTool::QuickTimeStream::ProcessInsta360`
 // (QuickTimeStream.pl:3252-3478) + the `%insvDataLen` length catalogue
