@@ -25,6 +25,7 @@ mod android_camm;
 mod canon_ctmd;
 #[cfg(feature = "crw")]
 pub(crate) mod crw;
+mod dji_protobuf;
 mod domain;
 mod gopro;
 mod insta360;
@@ -56,6 +57,7 @@ pub use crw::{
   CrwDecoderTable, CrwExposureInfo, CrwFlashInfo, CrwImageInfo, CrwMeta, CrwRawArray,
   CrwRawJpgInfo, CrwSubTable, CrwSubTableBlock, CrwTimeStamp, CrwWhiteSample,
 };
+pub use dji_protobuf::{DjiProtobufMeta, DjiTelemetrySample, DjiWarning, RationalValue};
 pub use domain::{
   CameraInfo, CaptureSettings, GpsLocation, LensInfo, MediaInfo, MediaMetadata, TrackKind,
 };

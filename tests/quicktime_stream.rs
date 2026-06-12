@@ -2070,6 +2070,207 @@ fn camm_real_fixture_conformance() {
   // Placeholder: load fixture, parse via exifast, golden-compare per-tag.
 }
 
+// ===========================================================================
+// SP4 — DJI Protobuf (djmd / dbgi)
+// ===========================================================================
+
+#[test]
+fn quicktime_dji_djmd_decodes_identity_gps_capture_and_projects() {
+  // Synthetic .mov with a `djmd` MetaFormat track carrying one Mavic 3
+  // (dvtm_wm265e) protobuf sample: Protocol(1-1-1) + SerialNumber(1-1-5) +
+  // Model(1-1-10) + ISO(3-2-2-1) + ShutterSpeed(3-2-3-1) + GPSInfo(3-3-4-1
+  // CoordinateUnits=degrees, lat, lon) + AbsoluteAltitude(3-3-4-2). The
+  // walker must populate `Meta::dji_protobuf()` and the MediaMetadata
+  // projection must surface CameraInfo (DJI) + GpsLocation + CaptureSettings.
+  let sample = dji_wm265e_sample();
+  let data = build_mov_with_meta_track(b"djmd", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let dji = meta.dji_protobuf();
+  assert!(!dji.is_empty(), "djmd must populate dji_protobuf");
+  assert_eq!(dji.protocol(), Some("dvtm_wm265e.proto"));
+  assert_eq!(dji.serial_number(), Some("1ZNBJ9U0010078"));
+  assert_eq!(dji.model(), Some("FC8482"));
+  assert!(dji.warnings().is_empty(), "wm265e is a known protocol");
+
+  let fix = dji.first_fix().expect("a GPS fix");
+  assert!((fix.latitude().unwrap() - 45.5).abs() < 1e-9);
+  assert!((fix.longitude().unwrap() - 8.25).abs() < 1e-9);
+  assert!((fix.absolute_altitude_m().unwrap() - 123.456).abs() < 1e-6);
+
+  let cap = dji.first_capture().expect("capture sample");
+  assert!((cap.iso().unwrap() - 100.0).abs() < 1e-9);
+  assert!((cap.shutter_speed_s().unwrap() - 1.0 / 500.0).abs() < 1e-12);
+
+  // MediaMetadata projection: CameraInfo (DJI / FC8482 / serial).
+  let md = meta.media_metadata();
+  let cam = md.camera().expect("CameraInfo from djmd");
+  assert_eq!(cam.make(), Some("DJI"));
+  assert_eq!(cam.model(), Some("FC8482"));
+  assert_eq!(cam.serial(), Some("1ZNBJ9U0010078"));
+
+  // GpsLocation (absolute altitude preferred).
+  let gps = md.gps().expect("GpsLocation from djmd");
+  assert!((gps.latitude().unwrap() - 45.5).abs() < 1e-9);
+  assert!((gps.longitude().unwrap() - 8.25).abs() < 1e-9);
+  assert!((gps.altitude_m().unwrap() - 123.456).abs() < 1e-6);
+
+  // CaptureSettings (ISO 100, 1/500 s).
+  let cap_md = md.capture().expect("CaptureSettings from djmd");
+  assert_eq!(cap_md.iso(), Some(100));
+  assert!((cap_md.exposure_time_s().unwrap() - 1.0 / 500.0).abs() < 1e-12);
+}
+
+#[test]
+fn quicktime_dji_djmd_radians_coordinates_convert_to_degrees() {
+  // Osmo Action 4 (dvtm_ac203): GPSInfo at 3-4-2-1 with NO CoordinateUnits
+  // ⇒ radians. lat = π/4 rad must surface as 45°.
+  let sample = dji_ac203_radians_sample();
+  let data = build_mov_with_meta_track(b"djmd", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let fix = meta.dji_protobuf().first_fix().expect("a GPS fix");
+  assert!(
+    (fix.latitude().unwrap() - 45.0).abs() < 1e-9,
+    "radians→degrees: {:?}",
+    fix.latitude()
+  );
+}
+
+#[test]
+fn quicktime_dji_dbgi_is_noop() {
+  // The `dbgi` MetaFormat is `Unknown => 2` (QuickTimeStream.pl:355): under the
+  // default `Unknown = 0` ExifTool's `ProcessSamples` does not process a `dbgi`
+  // sample at all. exifast is default-options, so a `dbgi`-ONLY .mov surfaces
+  // NOTHING — no protocol, no telemetry sample, an empty `DjiProtobufMeta`, and
+  // no MediaMetadata projection (no false `Make = "DJI"`). Even a full
+  // telemetry-shaped `dbgi` body must be silent.
+  let sample = dji_wm265e_sample();
+  let data = build_mov_with_meta_track(b"dbgi", &sample);
+  let meta = parse_quicktime(&data).expect("recognized");
+  let dji = meta.dji_protobuf();
+  assert_eq!(dji.protocol(), None, "dbgi sets no protocol");
+  assert!(dji.samples().is_empty(), "dbgi keeps no telemetry sample");
+  assert!(dji.warnings().is_empty(), "dbgi records no warning");
+  assert!(
+    dji.is_empty(),
+    "a dbgi-only track yields an empty DjiProtobufMeta"
+  );
+  // No projection from a dbgi-only file.
+  let md = meta.media_metadata();
+  assert!(md.camera().is_none(), "dbgi must NOT project a DJI camera");
+  assert!(md.gps().is_none(), "dbgi must NOT project GPS");
+}
+
+// --- DJI protobuf wire encoders + sample builders ---------------------------
+
+/// Encode a base-128 little-endian protobuf varint.
+fn pb_varint(mut v: u64) -> Vec<u8> {
+  let mut out = Vec::new();
+  loop {
+    let mut b = (v & 0x7f) as u8;
+    v >>= 7;
+    if v != 0 {
+      b |= 0x80;
+    }
+    out.push(b);
+    if v == 0 {
+      break;
+    }
+  }
+  out
+}
+/// Encode a protobuf record tag `(field << 3) | wire_type`.
+fn pb_tag(field: u32, wire: u8) -> Vec<u8> {
+  pb_varint((u64::from(field) << 3) | u64::from(wire))
+}
+/// VARINT (wire 0) record.
+fn pb_vint(field: u32, v: u64) -> Vec<u8> {
+  let mut o = pb_tag(field, 0);
+  o.extend(pb_varint(v));
+  o
+}
+/// I64 (wire 1) `double` record.
+fn pb_double(field: u32, v: f64) -> Vec<u8> {
+  let mut o = pb_tag(field, 1);
+  o.extend_from_slice(&v.to_le_bytes());
+  o
+}
+/// I32 (wire 5) `float` record.
+fn pb_float(field: u32, v: f32) -> Vec<u8> {
+  let mut o = pb_tag(field, 5);
+  o.extend_from_slice(&v.to_le_bytes());
+  o
+}
+/// LEN (wire 2) record with an explicit body.
+fn pb_len(field: u32, body: &[u8]) -> Vec<u8> {
+  let mut o = pb_tag(field, 2);
+  o.extend(pb_varint(body.len() as u64));
+  o.extend_from_slice(body);
+  o
+}
+/// LEN string record.
+fn pb_str(field: u32, s: &str) -> Vec<u8> {
+  pb_len(field, s.as_bytes())
+}
+/// LEN packed-rational record (two inner varints num/den).
+fn pb_rational(field: u32, num: u64, den: u64) -> Vec<u8> {
+  let mut body = pb_varint(num);
+  body.extend(pb_varint(den));
+  pb_len(field, &body)
+}
+/// Concatenate child records into one buffer (a nested-message body).
+fn pb_cat(children: &[Vec<u8>]) -> Vec<u8> {
+  let mut v = Vec::new();
+  for c in children {
+    v.extend_from_slice(c);
+  }
+  v
+}
+
+/// One Mavic 3 (dvtm_wm265e) djmd sample with identity + capture + GPS.
+fn dji_wm265e_sample() -> Vec<u8> {
+  // 1-1 message: Protocol(1), SerialNumber(5), Model(10).
+  let l11 = pb_cat(&[
+    pb_str(1, "dvtm_wm265e.proto"),
+    pb_str(5, "1ZNBJ9U0010078"),
+    pb_str(10, "FC8482"),
+  ]);
+  let l1 = pb_len(1, &pb_len(1, &l11));
+
+  // 3-2 message: ISO(2-1) float, ShutterSpeed(3-1) rational.
+  let l32 = pb_cat(&[
+    pb_len(2, &pb_float(1, 100.0)),     // 3-2-2-1 ISO
+    pb_len(3, &pb_rational(1, 1, 500)), // 3-2-3-1 ShutterSpeed (1/500 s)
+  ]);
+  // 3-3-4 message: GPSInfo(1) + AbsoluteAltitude(2).
+  let gps_info = pb_cat(&[
+    pb_vint(1, 1),      // CoordinateUnits = degrees
+    pb_double(2, 45.5), // GPSLatitude
+    pb_double(3, 8.25), // GPSLongitude
+  ]);
+  let l334 = pb_cat(&[
+    pb_len(1, &gps_info), // 3-3-4-1 GPSInfo
+    pb_vint(2, 123_456),  // 3-3-4-2 AbsoluteAltitude (123.456 m)
+  ]);
+  // 3 message: contains 2 (=l32) and 3 (=3-3 → 4 → l334).
+  let l3_body = pb_cat(&[pb_len(2, &l32), pb_len(3, &pb_len(4, &l334))]);
+  let l3 = pb_len(3, &l3_body);
+
+  pb_cat(&[l1, l3])
+}
+
+/// One Osmo Action 4 (dvtm_ac203) djmd sample with radians GPS (no
+/// CoordinateUnits) at the ac203 GPSInfo path 3-4-2-1.
+fn dji_ac203_radians_sample() -> Vec<u8> {
+  let l1 = pb_len(1, &pb_len(1, &pb_str(1, "dvtm_ac203.proto")));
+  let gps_info = pb_cat(&[
+    pb_double(2, core::f64::consts::FRAC_PI_4), // lat π/4 rad → 45°
+    pb_double(3, core::f64::consts::FRAC_PI_6), // lon π/6 rad → 30°
+  ]);
+  // 3-4-2-1 GPSInfo: 3 → 4 → 2 → 1 → gps_info.
+  let l3 = pb_len(3, &pb_len(4, &pb_len(2, &pb_len(1, &gps_info))));
+  pb_cat(&[l1, l3])
+}
+
 // --- camm packet builders ---------------------------------------------------
 
 /// Build a CAMM packet `[reserved:2 (=0)][type:int16u-le][payload]`.

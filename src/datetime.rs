@@ -129,6 +129,68 @@ pub fn convert_unix_time_trim_frac_f64(time: f64, digits: u8) -> String {
   format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}{frac_suffix}")
 }
 
+/// `ConvertUnixTime($time, 0, $digits)` (the GMT branch, ExifTool.pm:6784-6811)
+/// for a *floating-point* `$time` with a POSITIVE fractional-format flag — the
+/// form `SetGPSDateTime` (`QuickTimeStream.pl:1006`, `ConvertUnixTime($sampleTime,
+/// 0, 3) . 'Z'`) hits.
+///
+/// A POSITIVE `$dec` (`$digits`) leaves `$trim` UNSET (`:6790`): the second is
+/// rendered with EXACTLY `$digits` fractional digits — the trailing-zero strip
+/// (`:6797`) is gated on `$trim` and so is NOT applied. A whole second therefore
+/// renders with the full `.000` (e.g. `…:00.000`), and a `.250` keeps its zero.
+/// Contrast [`convert_unix_time_trim_frac_f64`] (the negative-`$dec` trim form).
+///
+/// Faithful chain (`:6791-6796` + `:6808`):
+/// ```text
+/// $itime = int($time);                       # truncate toward zero
+/// $frac  = $time - $itime;
+/// $frac < 0 and $frac += 1, $itime -= 1;     # fold frac into [0,1)
+/// $dec = sprintf('%.*f', $digits, $frac);    # ALWAYS $digits digits: "0.250" / "0.000" / "1.000"
+/// $dec =~ s/^(\d)// and $1 eq '1' and $itime += 1;   # strip int digit; "1" (rounding carry) bumps itime
+/// # (NO trailing-zero trim — that is the $trim/negative-$dec branch only)
+/// # str = sprintf("…%.2d$dec", …, $sec)      # $dec is ".250" / ".000"
+/// ```
+///
+/// The `$time == 0` sentinel (`:6787`) is honoured on the ORIGINAL float, like
+/// [`convert_unix_time_f64`]; a sub-second non-zero float (reduced `$itime == 0`)
+/// renders `1970:01:01 00:00:00.<dec>`, NOT the sentinel.
+#[must_use]
+pub fn convert_unix_time_frac_f64(time: f64, digits: u8) -> String {
+  // ExifTool.pm:6787 — sentinel on the ORIGINAL float (a whole `0` is the
+  // sentinel; a sub-second non-zero value is NOT).
+  if time == 0.0 {
+    return "0000:00:00 00:00:00".to_string();
+  }
+  // ExifTool.pm:6791-6793 — `int($time)` truncate-toward-zero, then fold a
+  // negative fraction into `[0,1)` by borrowing a second (true floor).
+  #[allow(clippy::cast_possible_truncation)]
+  let mut itime = time.trunc() as i64;
+  let mut frac = time - time.trunc();
+  if frac < 0.0 {
+    frac += 1.0;
+    itime -= 1;
+  }
+  // ExifTool.pm:6794 `$dec = sprintf('%.*f', $digits, $frac)`. `$frac` is in
+  // `[0,1)`; Rust's `format!("{:.*}", digits, _)` rounds half-to-EVEN exactly
+  // like Perl's `sprintf('%.*f', …)`. Yields `"0.250"` / `"0.000"` — or
+  // `"1.000"` if the fraction rounds up to a full second.
+  let digits = digits as usize;
+  let dec = format!("{frac:.digits$}");
+  // ExifTool.pm:6796 `$dec =~ s/^(\d)// and $1 eq '1' and $itime += 1` — drop
+  // the integer digit; a leading `1` (rounded up to the next whole second)
+  // carries into `$itime`. The `:6797` trailing-zero strip is GATED on `$trim`
+  // (only set for a negative `$dec`), so it is NOT applied here: the fractional
+  // suffix keeps its full fixed width.
+  let (lead, rest) = dec.split_at(1);
+  if lead == "1" {
+    itime += 1;
+  }
+  // ExifTool.pm:6808 — `sprintf("%.2d:%.2d:%.2d$dec", …)`: the GMT clock with
+  // the fixed-width fractional suffix (`rest` = `".250"` / `".000"`) appended.
+  let (y, mo, d, h, mi, s) = gmtime(itime);
+  format!("{y:04}:{mo:02}:{d:02} {h:02}:{mi:02}:{s:02}{rest}")
+}
+
 /// `s/\.?0+$//` (ExifTool.pm:6797) — remove a run of trailing `'0'`s at the
 /// end of `s`, plus the dot immediately preceding that run if the dot is left
 /// dangling. `".789000"` ⇒ `".789"`; `".500000"` ⇒ `".5"`; `".000000"` ⇒ `""`.

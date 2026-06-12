@@ -4697,13 +4697,16 @@ mod tests {
     wr(&mut block, 43, &42i32.to_le_bytes());
 
     // CreateDate raw 1904-epoch = 3_791_457_280 (= unix 1_708_612_480 =
-    // 2024:02:22 14:34:40Z); SampleTime 2.0s ⇒ GPSDateTime 14:34:42Z.
+    // 2024:02:22 14:34:40.000Z); SampleTime 2.0s ⇒ GPSDateTime 14:34:42.000Z.
+    // `SetGPSDateTime` (QuickTimeStream.pl:1006) formats via
+    // `ConvertUnixTime($sampleTime, 0, 3)` — the positive `$dec = 3` renders a
+    // FIXED three-digit fractional second (`.000` for a whole second, no trim).
     let mut out = QuickTimeStreamMeta::new();
     decode_block_with_time(&block, 3_791_457_280, 2.0, &mut out);
     assert_eq!(out.gps_samples().len(), 1);
     assert_eq!(
       out.gps_samples().first().unwrap().date_time(),
-      Some("2024:02:22 14:34:42Z"),
+      Some("2024:02:22 14:34:42.000Z"),
       "GPSDateTime = CreateDate + SampleTime"
     );
     // lat/lon still decode (ConvertLatLon applied).

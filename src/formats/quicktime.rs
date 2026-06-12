@@ -59,9 +59,9 @@ use crate::{
     insta360 as insta360_fmt, ligogps as ligogps_fmt, quicktime_freegps, quicktime_stream,
   },
   metadata::{
-    CammMeta, CanonCtmdMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue, Insta360Meta,
-    LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta, QuickTimeStreamMeta,
-    SonyRtmdMeta,
+    CammMeta, CanonCtmdMeta, DjiProtobufMeta, GoProConv, GoProMeta, GoProTag, GoProTagValue,
+    Insta360Meta, LigoGpsMeta, MediaTrack, ParrotMeta, QuickTimeGps, QuickTimeMeta,
+    QuickTimeStreamMeta, SonyRtmdMeta,
   },
   value::{binary_placeholder, format_g},
 };
@@ -3358,6 +3358,15 @@ pub struct Meta<'a> {
   /// the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
   /// `V3`/`TimeStamp` (Parrot.pm:86-551).
   parrot: ParrotMeta,
+  /// **SP4** — DJI `djmd` / `dbgi` protobuf timed metadata (drone /
+  /// handheld-cam GNSS + camera settings + orientation). Decoded through
+  /// the `djmd` + `dbgi` MetaFormat dispatch in [`quicktime_stream`].
+  /// Empty ([`DjiProtobufMeta::is_empty`]) for a non-DJI video. Faithful
+  /// port of `Image::ExifTool::Protobuf::ProcessProtobuf`
+  /// (Protobuf.pm:128-300) driven by `%Image::ExifTool::DJI::Protobuf`
+  /// (DJI.pm:235-859) + the nested DJI::FrameInfo / GPSInfo / DroneInfo /
+  /// GimbalInfo tables (DJI.pm:867-921).
+  dji_protobuf: DjiProtobufMeta,
   /// **SP4** — LigoGPS dashcam vendor GPS records. Decoded via TWO
   /// faithful entry points: (a) the `&&&& `-prefixed trailer at file
   /// EOF (QuickTime.pm:9906-9907 + 10658-10668) — populated by
@@ -3546,6 +3555,21 @@ impl Meta<'_> {
     &self.parrot
   }
 
+  /// **SP4** — DJI `djmd` / `dbgi` protobuf timed metadata.
+  /// [`DjiProtobufMeta::is_empty`] for a non-DJI video (or one whose
+  /// `djmd` / `dbgi` track is absent).
+  ///
+  /// Faithful port of `Image::ExifTool::Protobuf::ProcessProtobuf`
+  /// (Protobuf.pm:128-300) driven by the `%Image::ExifTool::DJI::Protobuf`
+  /// tag table (DJI.pm:235-859) and its nested DJI::FrameInfo / GPSInfo /
+  /// DroneInfo / GimbalInfo message tables (DJI.pm:867-921). Populated by
+  /// the `djmd` + `dbgi` MetaFormat dispatch in [`quicktime_stream`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn dji_protobuf(&self) -> &DjiProtobufMeta {
+    &self.dji_protobuf
+  }
+
   /// **SP4** — LigoGPS dashcam vendor GPS records.
   /// [`LigoGpsMeta::is_empty`] for a non-LigoGPS file (or one whose
   /// trailer / embedded fingerprint is absent).
@@ -3651,6 +3675,12 @@ impl Meta<'_> {
     // tie-break is hypothetical). Sits ABOVE the phone-paired Sony rtmd /
     // generic SP3 timed-metadata scan.
     self.parrot.project_into(&mut md);
+    // DJI Protobuf (`djmd`) is dedicated DRONE / handheld-cam GNSS hardware
+    // — same on-device-hardware tier as GoPro / CAMM / Parrot, and ABOVE
+    // Sony rtmd (which is phone-paired via Imaging Edge Mobile). A single
+    // file is produced by exactly one body, so the intra-tier order is a
+    // hypothetical tie-break; DJI is placed before the phone-paired sources.
+    self.dji_protobuf.project_into(&mut md);
     // **SP4 — Sony rtmd** phone-paired GPS (Imaging Edge Mobile) + camera
     // identity/capture. THIRD-HIGHEST tier — below GoPro / CAMM on-device
     // hardware, above the generic SP3 timed-metadata scan. Set-once per domain
@@ -4297,6 +4327,12 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // the per-version binary tables `Image::ExifTool::Parrot::V1`/`V2`/
   // `V3` (Parrot.pm:86-539).
   let mut parrot_meta = ParrotMeta::new();
+  // **SP4 — DJI Protobuf**: the `djmd` + `dbgi` MetaFormat dispatch in
+  // [`quicktime_stream`] populates `dji_meta` for each timed-metadata
+  // sample whose track carries DJI protobuf metadata. Faithful port of
+  // `Image::ExifTool::Protobuf::ProcessProtobuf` (Protobuf.pm:128-300)
+  // driven by `%Image::ExifTool::DJI::Protobuf` (DJI.pm:235-859).
+  let mut dji_meta = DjiProtobufMeta::new();
   // `found_embedded` is ExifTool's `$$et{FoundEmbedded}` (QuickTimeStream.pl:1650):
   // set when a `moov`-level `gps ` box dispatched a `freeGPS ` block into
   // `ProcessFreeGPS`, OR when a GoPro source entered `ProcessGoPro`
@@ -4346,6 +4382,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     &mut sony_rtmd_meta,
     &mut canon_ctmd_meta,
     &mut parrot_meta,
+    &mut dji_meta,
     &mut ligogps_meta,
   );
 
@@ -4608,6 +4645,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     canon_ctmd: canon_ctmd_meta,
     insta360: insta360_meta,
     parrot: parrot_meta,
+    dji_protobuf: dji_meta,
     ligogps: ligogps_meta,
     heif: heif_meta,
     cr3: cr3_meta,
@@ -6286,6 +6324,29 @@ impl crate::emit::Taggable for Meta<'_> {
     // `Track<N>` axis — same machinery as the rtmd / CTMD arms above. See
     // [`emit_parrot`] for the per-version offset order + per-tag PrintConv.
     emit_parrot(&self.parrot, opts, print_conv, &mut tags);
+
+    // ── #163: DJI `djmd` protobuf timed metadata (Image::ExifTool::DJI) ────
+    // The per-sample drone / handheld-cam GNSS + camera settings + orientation
+    // decoded from a DJI `djmd` track (`Protobuf::ProcessProtobuf` driven by
+    // `%DJI::Protobuf`) on the shared `-ee` `Doc<N>` axis. UNLIKE the
+    // rtmd/CTMD/mett siblings, the DJI tables carry their OWN `GROUPS => { 0 =>
+    // 'Protobuf', 1 => 'DJI' }`, so the payload emits under `Protobuf:DJI`
+    // (SET_GROUP1 = "Track$num" does NOT override a non-empty family-1,
+    // ExifTool.pm:9475); only the `FoundSomething` SampleTime/SampleDuration
+    // ride `QuickTime:Track<N>`. See [`emit_dji`]. The walker / `SetGPSDateTime`
+    // warnings (`Unknown protocol …`, `Protobuf format error` / `Truncated
+    // protobuf data`, the minor `Approximating GPSDateTime …`) emit as
+    // `Track<N>:Warning` tags carrying each raising sample's `Doc<N>`
+    // ([`emit_dji_warning`]) — family-1 `Track<N>` via the empty-family
+    // `SET_GROUP1` fill, sharing the `first_seen` priority-0 first-wins gate.
+    emit_dji(
+      &self.dji_protobuf,
+      opts,
+      print_conv,
+      &mut first_seen,
+      &mut tags,
+    );
+    emit_dji_warning(&self.dji_protobuf, opts, &mut first_seen, &mut tags);
 
     // ── SP4: Insta360 INSV/INSP trailer (ProcessInsta360) ──────────────────
     // The file-END trailer's tags (QuickTimeStream.pl:3252-3478) under the
@@ -8376,6 +8437,555 @@ fn emit_parrot(
         committed.push(key);
         tags.push(tag);
       }
+    }
+  }
+}
+
+/// Emit the DJI `djmd` timed-metadata samples (`Protobuf::ProcessProtobuf`
+/// driven by `%DJI::Protobuf`, DJI.pm:235-876 + the nested FrameInfo / GPSInfo
+/// / DroneInfo / GimbalInfo tables) through the `tags()` engine.
+/// `ProcessSamples` opens ONE `Doc<N>` per `djmd` SAMPLE and `ProcessProtobuf`
+/// `HandleTag`s every decoded leaf under that one document
+/// (QuickTimeStream.pl:1517-1523).
+///
+/// ## Group axis — distinct from the `rtmd`/`CTMD`/`mett` siblings
+///
+/// The DJI tables ALL declare `GROUPS => { 0 => 'Protobuf', 1 => 'DJI', 2 =>
+/// ... }` (DJI.pm:236/886/895/904/914). ExifTool's `SET_GROUP1 = "Track$num"`
+/// (active for the whole `ProcessSamples` call) only fills in a tag's family-1
+/// when the tag's OWN `$grps[1]` is empty (ExifTool.pm:9475) — and every DJI
+/// payload tag already carries `family1 = 'DJI'`, so SET_GROUP1 does NOT
+/// override it. Thus the payload emits under family-0 `Protobuf` / family-1
+/// `DJI` (NOT `QuickTime`/`Track<N>` like the Sony/Canon/Parrot tables whose
+/// GROUPS define only family-2). Only `SampleTime`/`SampleDuration` — emitted
+/// by `FoundSomething` on the Stream `$tagTbl` (which has no family-1, so
+/// SET_GROUP1 applies) — ride family-0 `QuickTime` / family-1 `Track<N>`.
+///
+/// Gated on `-ee`; `-G3` emits each sample as its own `Doc<N>`, `-G1`
+/// collapses the doc axis to one `(DJI, name)` row FIRST-wins (and one
+/// `Track<N>:SampleTime`/`SampleDuration` via the shared `first_seen` gate).
+///
+/// ## What is emitted (per the DJI.pm table Names + ValueConv/PrintConv)
+///
+/// Track-wide identity is emitted ONCE, at the FIRST (lowest) `Doc<N>` — where
+/// DJI's first sample's `1-1` block lives (`-G1` dedups it to one row anyway;
+/// first-doc-only avoids a `-G3` over-emission for a later sample):
+///  - `Protocol` — verbatim `.proto` string (no conv).
+///  - `SerialNumber` / `Model` — verbatim ASCII strings.
+///
+/// Per-sample payload (each guarded on the typed Option), in path/walk order:
+///  - `FrameWidth` / `FrameHeight` — plain integers; `FrameRate` — float, raw.
+///  - `TimeStamp` — `$val / 1e6` seconds (the typed surface keeps the raw
+///    microsecond `u64`; divide here), raw number.
+///  - `ISO` — float, raw number; `ShutterSpeed` — `Exif::PrintExposureTime`;
+///    `FNumber` — `Exif::PrintFNumber`; `ColorTemperature` — plain integer;
+///    `DigitalZoom` — float, raw; `Temperature` — float, raw.
+///  - `DroneRoll`/`DronePitch`/`DroneYaw`, `GimbalPitch`/`GimbalRoll`/
+///    `GimbalYaw` — int64s `/10`, raw number.
+///  - `GPSLatitude`/`GPSLongitude` — `GPS::ToDMS` signed (N/S · E/W) at `-j`,
+///    raw decimal degrees at `-n` (the radians→degrees conversion already
+///    applied at decode).
+///  - `GPSAltitude` (ac203/ac204/ac206) / `AbsoluteAltitude` (every other arm)
+///    — `$val/1000` metres, raw number (NO PrintConv). The NAME is chosen by
+///    protocol ([`dji_altitude_name`]); `RelativeAltitude` — `$val/1000`
+///    metres, raw number.
+///  - `GPSDateTime` — the `tr/-/:/`-converted `"YYYY:MM:DD HH:MM:SS"` string
+///    (emitted verbatim, as the sibling Insta360 block does).
+///
+/// `SerialNumber2` (`2-2-3-1`, AVATA2 / DJI Neo) is a NAMED, default-extracted
+/// tag (DJI.pm:399/:553) and IS emitted (verbatim string, after `SerialNumber`).
+/// `FrameNumber` (`3-1-1`) and the Accelerometer / model-code / version fields
+/// are intentionally dropped (camera-indexing scope; see the `dji_protobuf`
+/// module docs) — the typed surface never stored them.
+///
+/// AccelerometerX/Y/Z: the typed [`crate::metadata::DjiTelemetrySample`] drops
+/// them (NOT camera/GPS metadata), so they are not emitted here.
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_lines)]
+fn emit_dji<F: FnMut(&str, &str) -> bool>(
+  meta: &crate::metadata::DjiProtobufMeta,
+  opts: crate::emit::EmitOptions,
+  print_conv: bool,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::serialize_key::GroupMode;
+  use crate::value::{Group, TagValue};
+  // `ProcessProtobuf` runs only under `ExtractEmbedded` → DJI timed tags
+  // surface only at `-ee`. (The walker / `SetGPSDateTime` warnings are emitted
+  // separately, also at `-ee`, by [`emit_dji_warning`].)
+  if !opts.extract_embedded {
+    return;
+  }
+  let samples = meta.samples();
+  if samples.is_empty() {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, GroupMode::G3);
+  // The altitude tag NAME is chosen PER-SAMPLE from the leaf KIND that decoded
+  // it (ac203/ac204/ac206 name the `3-4-2-2` leaf `GPSAltitude`/unsigned; every
+  // other arm `AbsoluteAltitude`/int64s — DJI.pm:296-301 vs :700) — see
+  // [`dji_push_sample_tags`]. A mid-track protocol switch can decode an altitude
+  // under one protocol's leaf and another's name otherwise. The aggregate
+  // protocol name is the FALLBACK for a degenerate sample carrying an altitude
+  // value with no recorded leaf kind.
+  let altitude_name_fallback = dji_altitude_name(meta.protocol());
+  // Distinct `Doc<N>` across all samples → the sample that owns each, in
+  // ascending (= walk) doc order, built in ONE O(n log n) pass. Every
+  // production row carries a strictly-increasing stamped doc (the `djmd` arm
+  // calls `open_doc()` — a monotonic global counter — once per dispatched
+  // sample, in source/push order; 1 sample = 1 row = 1 doc); a degenerate
+  // unit-built sample (doc 0) shares document 0. A `std::collections::BTreeMap`
+  // (an `alloc::…` map under the no_std tier via the crate-root `alloc as std`
+  // alias) keyed by doc keeps the FIRST sample for each doc (`or_insert` =
+  // first-wins) and iterates ascending — byte-identical to the prior
+  // sorted-distinct-doc + `find`-first-sample-per-doc behaviour for ANY input
+  // order, but WITHOUT the per-doc linear `find` scan a long DJI video (100k+
+  // timed samples) paid (which made the whole emission O(n^2)).
+  let doc_owner: std::collections::BTreeMap<u32, &crate::metadata::DjiTelemetrySample> = {
+    let mut m = std::collections::BTreeMap::new();
+    for s in samples {
+      m.entry(s.doc()).or_insert(s);
+    }
+    m
+  };
+  // `-G1` across-doc FIRST-wins collapse for the DJI payload, keyed by
+  // `(family1 = "DJI", name)`. A `BTreeSet` makes the per-tag membership test
+  // O(log k) (k = the fixed ≤24-name DJI universe) instead of a linear `Vec`
+  // scan, keeping the whole emission off any in-loop linear scan; first-wins is
+  // preserved (`insert` is false ⇒ the name is already committed ⇒ skip).
+  let mut committed: std::collections::BTreeSet<smol_str::SmolStr> =
+    std::collections::BTreeSet::new();
+  let mut scratch: std::vec::Vec<EmittedTag> = std::vec::Vec::new();
+  // Identity (Protocol/SerialNumber/Model) is emitted PER-SAMPLE at the
+  // `Doc<N>` of the sample that actually carried it — ExifTool `HandleTag`s
+  // `Protocol` exactly when a sample's own records hold a `.proto` leaf
+  // (Protobuf.pm:158-160) and `SerialNumber`/`Model` at the `1-1-5`/`1-1-10`
+  // leaf's position. Real DJI writes identity once (the first sample), so it
+  // lands at the lowest `Doc<N>`; a data-only later sample (which reused the
+  // persisted protocol but had no `.proto` leaf) emits none. `-G1` collapses
+  // duplicates first-wins.
+  for (&doc, &s) in &doc_owner {
+    // `s` is the FIRST sample stamped with this doc (one djmd SAMPLE = one
+    // document; a real djmd track pushes at most one row per doc) — resolved in
+    // the single map-building pass above, NOT a per-doc linear scan.
+    let track_index = {
+      let t = s.track_index();
+      if t == 0 { 1 } else { t }
+    };
+    let track = std::format!("Track{track_index}");
+    // ── SampleTime / SampleDuration ────────────────────────────────────────
+    // Emitted by `FoundSomething` on the Stream `$tagTbl` ⇒ family-0
+    // `QuickTime`, family-1 `Track<N>` (SET_GROUP1 applies). `ConvertDuration`
+    // PrintConv at `-j`, raw seconds at `-n`. At `-G3` each `Doc<N>` carries
+    // its own; at `-G1` ONE `Track<N>:SampleTime`/`SampleDuration` survives via
+    // the shared priority-0-style first-wins `first_seen` gate (docs ascend, so
+    // the minimum-doc timing wins). DJI tracks own their own `Track<N>`.
+    for (val, name) in [
+      (s.sample_time(), "SampleTime"),
+      (s.sample_duration(), "SampleDuration"),
+    ] {
+      if let Some(secs) = val {
+        let value = if print_conv {
+          TagValue::Str(crate::datetime::convert_duration(secs).into())
+        } else {
+          TagValue::F64(secs)
+        };
+        if g3 {
+          tags.push(EmittedTag::new(
+            Group::with_doc("QuickTime", track.as_str(), doc),
+            name.into(),
+            value,
+            false,
+          ));
+        } else if first_seen(track.as_str(), name) {
+          tags.push(EmittedTag::new(
+            Group::new("QuickTime", track.as_str()),
+            name.into(),
+            value,
+            false,
+          ));
+        }
+      }
+    }
+    // ── DJI payload — family-0 `Protobuf`, family-1 `DJI` ──────────────────
+    // Emitted BEFORE the synthesized `Composite:GPSDateTime` below: ExifTool
+    // `HandleTag`s the djmd sample's protobuf payload (via `ProcessProtobuf`,
+    // QuickTimeStream.pl:1525) and ONLY AFTER it returns runs the GPSDateTime
+    // synthesis (`SetGPSDateTime`, :1534). So in `-ee`/`-G3` order, for a given
+    // djmd Doc, the `Protobuf:DJI` payload tags come before the synthesized
+    // `Composite:GPSDateTime`. A real decoded `GPSDateTime` leaf lives inside
+    // this payload and so naturally stays in payload position.
+    let group = if g3 {
+      Group::with_doc("Protobuf", "DJI", doc)
+    } else {
+      Group::new("Protobuf", "DJI")
+    };
+    scratch.clear();
+    dji_push_sample_tags(s, altitude_name_fallback, &group, print_conv, &mut scratch);
+    if g3 {
+      tags.append(&mut scratch);
+    } else {
+      for tag in scratch.drain(..) {
+        // `insert` returns false when the name was already committed by an
+        // earlier (lower) doc ⇒ FIRST-wins skip; true ⇒ first sighting, emit.
+        if committed.insert(smol_str::SmolStr::new(tag.tag().name())) {
+          tags.push(tag);
+        }
+      }
+    }
+    // ── Synthesized GPSDateTime — family-0 `Composite`, family-1 `Track<N>` ──
+    // `SetGPSDateTime` `HandleTag`s its result under `$$et{SET_GROUP0} =
+    // 'Composite'` (QuickTimeStream.pl:1005) while `SET_GROUP1 = "Track$num"` is
+    // still active for the sample — so it surfaces as `Composite:GPSDateTime` at
+    // the sample's `Track<N>` + `Doc<N>`. DISTINCT from the decoded
+    // `Protobuf:DJI:GPSDateTime` leaf (the two never coexist — synthesis runs
+    // only when the leaf is absent). Runs AFTER `ProcessProtobuf` (the payload
+    // block above), matching QuickTimeStream.pl:1525-1534, so it is appended
+    // here — after this sample's payload tags. Emitted verbatim (the helper
+    // already applied `ConvertUnixTime(..,0,3).'Z'`; the Composite GPSDateTime
+    // PrintConv is identity at the default DateFormat, like the sibling stream
+    // GPSDateTimes).
+    if let Some(dt) = s.synth_gps_date_time() {
+      if g3 {
+        tags.push(EmittedTag::new(
+          Group::with_doc("Composite", track.as_str(), doc),
+          "GPSDateTime".into(),
+          TagValue::Str(dt.into()),
+          false,
+        ));
+      } else if first_seen(track.as_str(), "GPSDateTime") {
+        tags.push(EmittedTag::new(
+          Group::new("Composite", track.as_str()),
+          "GPSDateTime".into(),
+          TagValue::Str(dt.into()),
+          false,
+        ));
+      }
+    }
+  }
+}
+
+/// The `3-4-2-2` / `3-3-4-2` altitude tag NAME for a DJI protocol: the
+/// ac203/ac204/ac206 arms name it `GPSAltitude` (`Format => 'unsigned'`,
+/// DJI.pm:296-301/:336/:377); every OTHER protocol (incl. oq101, DJI.pm:700)
+/// names it `AbsoluteAltitude` (`Format => 'int64s'`). The typed surface stores
+/// both on `absolute_altitude_m`, so the protocol picks the emitted name.
+#[cfg(feature = "alloc")]
+fn dji_altitude_name(protocol: Option<&str>) -> &'static str {
+  match protocol {
+    Some("dvtm_ac203.proto" | "dvtm_ac204.proto" | "dvtm_ac206.proto") => "GPSAltitude",
+    _ => "AbsoluteAltitude",
+  }
+}
+
+/// Emit ONE DJI sample's identity + payload tags into `scratch` under `group`
+/// (family-0 `Protobuf`, family-1 `DJI`), in path/walk order. Identity
+/// (Protocol/SerialNumber/Model — DJI's `1-1` block) is emitted from THIS
+/// sample's OWN decoded fields — ExifTool `HandleTag`s each at the position of
+/// the sample whose records carried it (Protobuf.pm:160-162), so it lands under
+/// this sample's `Doc<N>`. A data-only sample (no `.proto` leaf, reused the
+/// persisted protocol) carries no `Protocol` and emits none. Helper for
+/// [`emit_dji`].
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_lines)]
+fn dji_push_sample_tags(
+  s: &crate::metadata::DjiTelemetrySample,
+  altitude_name_fallback: &'static str,
+  group: &crate::value::Group,
+  print_conv: bool,
+  scratch: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::TagValue;
+  let push = |out: &mut std::vec::Vec<EmittedTag>, name: &str, value: TagValue| {
+    out.push(EmittedTag::new(group.clone(), name.into(), value, false));
+  };
+  // ── Identity (1-1-1 / 1-1-5 / 1-1-10) — verbatim strings, no conv ────────
+  // Emitted from THIS sample's own decoded identity (HandleTag-when-seen), so
+  // it lands at the document of the sample that physically carried it.
+  // The per-sample `Protocol` scalar is LAST-WINS within the sample (the deepest
+  // `.proto` leaf walked) — matching ExifTool's within-Doc `HandleTag` dedup,
+  // whose `-G3` JSON is tag-key-order-insensitive so wire order is unobservable
+  // in the goldens (see `DjiTelemetrySample::set_protocol`).
+  if let Some(p) = s.protocol() {
+    push(scratch, "Protocol", TagValue::Str(p.into()));
+  }
+  if let Some(sn) = s.serial_number() {
+    push(scratch, "SerialNumber", TagValue::Str(sn.into()));
+  }
+  // `SerialNumber2` (`2-2-3-1`, AVATA2 / DJI Neo) — a NAMED, default-extracted
+  // tag (DJI.pm:399/:553); verbatim ASCII string, no conv.
+  if let Some(sn2) = s.serial_number_2() {
+    push(scratch, "SerialNumber2", TagValue::Str(sn2.into()));
+  }
+  if let Some(m) = s.model() {
+    push(scratch, "Model", TagValue::Str(m.into()));
+  }
+  // ── FrameInfo (2-x) — FrameWidth/Height plain int, FrameRate float raw ───
+  if let Some(w) = s.frame_width() {
+    push(scratch, "FrameWidth", TagValue::U64(u64::from(w)));
+  }
+  if let Some(h) = s.frame_height() {
+    push(scratch, "FrameHeight", TagValue::U64(u64::from(h)));
+  }
+  if let Some(r) = s.frame_rate() {
+    push(scratch, "FrameRate", TagValue::F64(r));
+  }
+  // ── TimeStamp (3-1-2) — ValueConv `$val / 1e6` seconds, raw number ───────
+  if let Some(us) = s.time_stamp_us() {
+    #[allow(clippy::cast_precision_loss)]
+    let secs = us as f64 / 1e6;
+    push(scratch, "TimeStamp", TagValue::F64(secs));
+  }
+  // ── Capture settings (3-2-x) ─────────────────────────────────────────────
+  if let Some(iso) = s.iso() {
+    // Format => 'float', no PrintConv ⇒ raw number.
+    push(scratch, "ISO", TagValue::F64(iso));
+  }
+  if let Some(ss) = s.shutter_speed_read() {
+    // Format => 'rational', PrintConv => Exif::PrintExposureTime. A zero/missing-
+    // denominator rational decodes to ExifTool's literal `'err'` (Protobuf.pm:205)
+    // — STILL HandleTag'd, so emit the tag valued `err` (no PrintConv applies to
+    // the non-numeric reading) rather than dropping it.
+    let v = match ss {
+      crate::metadata::RationalValue::Num(n) if print_conv => {
+        TagValue::Str(crate::exif::tables::print_exposure_time(n).into())
+      }
+      crate::metadata::RationalValue::Num(n) => TagValue::F64(n),
+      crate::metadata::RationalValue::Err => {
+        TagValue::Str(crate::metadata::RationalValue::ERR_STR.into())
+      }
+    };
+    push(scratch, "ShutterSpeed", v);
+  }
+  if let Some(fnum) = s.f_number_read() {
+    // Format => 'rational', PrintConv => Exif::PrintFNumber. `'err'` for a
+    // zero/missing denominator (Protobuf.pm:205) — emitted verbatim.
+    let v = match fnum {
+      crate::metadata::RationalValue::Num(n) if print_conv => {
+        TagValue::Str(crate::exif::tables::print_fnumber(n).into())
+      }
+      crate::metadata::RationalValue::Num(n) => TagValue::F64(n),
+      crate::metadata::RationalValue::Err => {
+        TagValue::Str(crate::metadata::RationalValue::ERR_STR.into())
+      }
+    };
+    push(scratch, "FNumber", v);
+  }
+  if let Some(ct) = s.color_temperature() {
+    // Format => 'unsigned', no PrintConv ⇒ plain integer.
+    push(scratch, "ColorTemperature", TagValue::U64(u64::from(ct)));
+  }
+  if let Some(dz) = s.digital_zoom() {
+    // Format => 'float', no PrintConv ⇒ raw number.
+    push(scratch, "DigitalZoom", TagValue::F64(dz));
+  }
+  if let Some(t) = s.temperature_c() {
+    // Format => 'float', no PrintConv ⇒ raw number.
+    push(scratch, "Temperature", TagValue::F64(t));
+  }
+  // ── DroneInfo (int64s `/10`, raw number) ─────────────────────────────────
+  if let Some(v) = s.drone_roll_deg() {
+    push(scratch, "DroneRoll", TagValue::F64(v));
+  }
+  if let Some(v) = s.drone_pitch_deg() {
+    push(scratch, "DronePitch", TagValue::F64(v));
+  }
+  if let Some(v) = s.drone_yaw_deg() {
+    push(scratch, "DroneYaw", TagValue::F64(v));
+  }
+  // ── GPSInfo (GPSLatitude/GPSLongitude — `GPS::ToDMS` signed at `-j`) ──────
+  if let Some(lat) = s.latitude() {
+    let v = if print_conv {
+      TagValue::Str(dms_signed(lat, 'N', 'S').into())
+    } else {
+      TagValue::F64(lat)
+    };
+    push(scratch, "GPSLatitude", v);
+  }
+  if let Some(lon) = s.longitude() {
+    let v = if print_conv {
+      TagValue::Str(dms_signed(lon, 'E', 'W').into())
+    } else {
+      TagValue::F64(lon)
+    };
+    push(scratch, "GPSLongitude", v);
+  }
+  // ── Altitudes (`$val/1000` metres, raw number, NO PrintConv) ─────────────
+  // The absolute/GPS altitude NAME is chosen PER-SAMPLE from the leaf KIND that
+  // decoded THIS sample's altitude (`GPSAltitude` unsigned vs `AbsoluteAltitude`
+  // int64s — DJI.pm:296-301 vs :700): a mid-track protocol switch can decode an
+  // altitude under one protocol's leaf even though the track's aggregate
+  // protocol differs. Falls back to the aggregate-protocol name only for a
+  // degenerate sample carrying an altitude with no recorded leaf kind.
+  if let Some(alt) = s.absolute_altitude_m() {
+    let altitude_name = match s.altitude_is_gps_named() {
+      Some(true) => "GPSAltitude",
+      Some(false) => "AbsoluteAltitude",
+      None => altitude_name_fallback,
+    };
+    push(scratch, altitude_name, TagValue::F64(alt));
+  }
+  if let Some(rel) = s.relative_altitude_m() {
+    push(scratch, "RelativeAltitude", TagValue::F64(rel));
+  }
+  // ── GimbalInfo (int64s `/10`, raw number) ────────────────────────────────
+  if let Some(v) = s.gimbal_pitch_deg() {
+    push(scratch, "GimbalPitch", TagValue::F64(v));
+  }
+  if let Some(v) = s.gimbal_roll_deg() {
+    push(scratch, "GimbalRoll", TagValue::F64(v));
+  }
+  if let Some(v) = s.gimbal_yaw_deg() {
+    push(scratch, "GimbalYaw", TagValue::F64(v));
+  }
+  // ── GPSDateTime — the post-ValueConv `"YYYY:MM:DD HH:MM:SS"` string ──────
+  // (`tr/-/:/` already applied at decode; emitted verbatim like the sibling
+  // Insta360 GPSDateTime block).
+  if let Some(dt) = s.gps_date_time() {
+    push(scratch, "GPSDateTime", TagValue::Str(dt.into()));
+  }
+}
+
+/// Emit the DJI `djmd` walker / `SetGPSDateTime` warnings
+/// (`DjiProtobufMeta::warnings`) as `Track<N>:Warning` tags — the DJI
+/// counterpart of [`emit_camm_warnings`] / [`emit_ctmd_warnings`].
+///
+/// `ProcessProtobuf` raises `Unknown protocol <val> (please submit sample for
+/// testing)` (DJI.pm:261-264, per `.proto` leaf), `Protobuf format error`
+/// (Protobuf.pm:156) and — at the top-level call only — `Truncated protobuf
+/// data` (Protobuf.pm:278); `SetGPSDateTime` raises the MINOR `Approximating
+/// GPSDateTime as CreateDate + SampleTime` (`$et->Warn(.., 1)`,
+/// QuickTimeStream.pl:991) per synth sample. Each is a plain `$self->Warn`
+/// `FoundTag`-ing the `Extra` `Warning` tag with an EMPTY `@grps`
+/// (ExifTool.pm:9601-9602), so its `Groups => %allGroupsExifTool` family-0 stays
+/// `ExifTool` but `SET_GROUP1 = "Track$num"` (active through `ProcessSamples`)
+/// FILLS the empty family-1 (ExifTool.pm:9474-9475): the net group is family-0
+/// `ExifTool`, family-1 `Track<N>` — a `Track<N>:Warning` (NOT the prior port's
+/// document-level `ExifTool:Warning`), carrying the raising sample's `Doc<N>`
+/// (family-3). Oracle (Perl `$self->Warn` trace under a djmd `DOC_NUM`/
+/// `SET_GROUP1`): `G0=ExifTool G1=Track1 G3=Doc1`.
+///
+/// WAS_WARNED (ExifTool.pm:5632-5639 / 3196-3203): a distinct FINAL message
+/// emits ONE `Warning` whose value gains a ` [x$n]` suffix when it recurred
+/// `n > 1` times (the unknown-protocol warning recurs per sample, the minor
+/// `Approximating` per synth sample). DISTINCT messages are NUMBERED — the
+/// second `Warning`, the third `Warning (1)`, … (the bare-`Warning` key's
+/// global duplicate index, ExifTool.pm:9536-9537) — so each survives the
+/// `TagMap`'s priority-0 first-wins `(doc, family1, name)` dedup as its own key.
+/// Oracle: a truncated top-level djmd sample → `Track1:Warning = "Protobuf
+/// format error"` + `Track1:Warning (1) = "Truncated protobuf data"`. The
+/// `minor` flag renders the `[minor] ` prefix on the `Approximating` message.
+///
+/// NOTE — the `Warning (i)` index is numbered LOCALLY over the DJI warnings
+/// here, NOT over the file-global bare-`Warning` count. ExifTool's index spans
+/// every `Warning` `FoundTag` (DJI + ProcessMOV + camm/ctmd/…); the port's
+/// other `Warning` producers (camm/ctmd/Matroska) likewise emit bare `Warning`
+/// and rely on the `TagMap`'s first-wins-drop for a same-(doc,group) collision
+/// rather than the numbered copy-keys (golden-locked, e.g.
+/// `Matroska_warning_collision`). Numbering DJI's own distinct messages is what
+/// makes a same-sample `Protobuf format error` + `Truncated protobuf data` pair
+/// BOTH surface; the cross-source global index is the same accepted divergence
+/// the sibling producers already carry. In practice a REAL djmd sample raises at
+/// most ONE distinct message per `Doc<N>` (unknown-protocol OR the minor
+/// `Approximating`), so only the crafted top-level-truncation case exercises the
+/// numbering.
+///
+/// Gated on `-ee` (`ProcessProtobuf` / `ProcessSamples` run only under
+/// `ExtractEmbedded`). At `-G3` each warning carries its sample's stamped
+/// `Doc<N>`; at `-G1` it collapses to one `Track<N>:Warning` (per distinct
+/// numbered name) via the shared priority-0 first-wins `first_seen` gate. The
+/// per-sample SampleTime/SampleDuration are emitted by [`emit_dji`]'s payload
+/// block, so this emitter pushes ONLY the `Warning` payload. Only a `djmd`
+/// sample can raise these — the `dbgi` track is a default-options no-op.
+#[cfg(feature = "alloc")]
+fn emit_dji_warning<F: FnMut(&str, &str) -> bool>(
+  meta: &crate::metadata::DjiProtobufMeta,
+  opts: crate::emit::EmitOptions,
+  first_seen: &mut F,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  // `ProcessProtobuf` / `ProcessSamples` run only under `ExtractEmbedded` →
+  // these surface only at `-ee`.
+  if !opts.extract_embedded {
+    return;
+  }
+  let warnings = meta.warnings();
+  if warnings.is_empty() {
+    return;
+  }
+  let g3 = matches!(opts.group_mode, crate::serialize_key::GroupMode::G3);
+  // The FINAL rendered message (the `[minor] ` prefix applied for a minor
+  // warning) — the string WAS_WARNED keys + counts on, and the value emitted
+  // (before the ` [x$n]` suffix).
+  let rendered = |w: &crate::metadata::DjiWarning| -> std::string::String {
+    if w.minor() {
+      std::format!("[minor] {}", w.message())
+    } else {
+      w.message().to_string()
+    }
+  };
+  // WAS_WARNED occurrence count over ALL DJI warnings, keyed on the FINAL
+  // rendered string (so ` [x$n]` reflects the file-wide total even though one
+  // distinct message emits one numbered `Warning`).
+  let count_of = |msg: &str| -> usize { warnings.iter().filter(|w| rendered(w) == msg).count() };
+  let warning_value = |msg: &str| -> TagValue {
+    let n = count_of(msg);
+    let text = if n > 1 {
+      smol_str::SmolStr::from(std::format!("{msg} [x{n}]"))
+    } else {
+      smol_str::SmolStr::from(msg)
+    };
+    TagValue::Str(text)
+  };
+  // Distinct FINAL messages already emitted, in first-emission order — drives
+  // both the WAS_WARNED first-occurrence gate (a later same-message warning
+  // emits nothing further) AND the `Warning (i)` numbering (the i-th DISTINCT
+  // message after the first becomes `Warning (i-1)`, ExifTool.pm:9536-9537).
+  let mut emitted_msgs: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+  for w in warnings {
+    let msg = rendered(w);
+    if emitted_msgs.iter().any(|m| *m == msg) {
+      // A repeat of an already-emitted distinct message — WAS_WARNED only bumped
+      // its count (folded into the ` [x$n]` suffix above); no further tag.
+      continue;
+    }
+    // The numbered tag NAME: the first distinct message is `Warning`, the next
+    // `Warning (1)`, … (the bare-`Warning` key's duplicate index).
+    let name = if emitted_msgs.is_empty() {
+      smol_str::SmolStr::new_static("Warning")
+    } else {
+      smol_str::SmolStr::from(std::format!("Warning ({})", emitted_msgs.len()))
+    };
+    emitted_msgs.push(msg.clone());
+    let track_index = if w.track_index() == 0 {
+      1
+    } else {
+      w.track_index()
+    };
+    let family1 = std::format!("Track{track_index}");
+    if g3 {
+      // `-G3`: the warning carries its sample's stamped `Doc<N>`; the `TagMap`
+      // sink keeps distinct `(doc, family1, name)` rows.
+      tags.push(EmittedTag::new(
+        Group::with_doc("ExifTool", family1.as_str(), w.doc()),
+        name,
+        warning_value(&msg),
+        false,
+      ));
+    } else if first_seen(family1.as_str(), name.as_str()) {
+      // `-G1`: one `Track<N>:Warning` per distinct numbered name (priority-0
+      // first-wins via the shared gate).
+      tags.push(EmittedTag::new(
+        Group::new("ExifTool", family1.as_str()),
+        name,
+        warning_value(&msg),
+        false,
+      ));
     }
   }
 }
@@ -11954,6 +12564,1257 @@ mod tests {
     data
   }
 
+  // ── #163: DJI djmd protobuf emission (emit_dji / emit_dji_warning) ────────
+
+  /// A simple `(family1, name)` first-wins gate for the DJI emit helpers —
+  /// mirrors the production `first_seen` closure (returns `true` the first time
+  /// a `(family1, name)` pair is seen).
+  #[cfg(feature = "alloc")]
+  fn dji_first_seen_gate() -> impl FnMut(&str, &str) -> bool {
+    let mut seen: std::vec::Vec<(String, String)> = std::vec::Vec::new();
+    move |g: &str, n: &str| {
+      let key = (g.to_string(), n.to_string());
+      if seen.contains(&key) {
+        false
+      } else {
+        seen.push(key);
+        true
+      }
+    }
+  }
+
+  /// Build a two-sample `DjiProtobufMeta` (Mavic-3-style identity + two GPS
+  /// fixes), each sample stamped with its own `Doc<N>` / `Track1` / timing —
+  /// exactly what the `djmd` dispatch arm produces.
+  #[cfg(feature = "alloc")]
+  fn dji_two_sample_meta() -> crate::metadata::DjiProtobufMeta {
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    let mut m = DjiProtobufMeta::new();
+    // The track-wide persisted protocol (drives altitude-name selection).
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    m.set_serial_number(smol_str::SmolStr::new("SERIAL123"));
+    m.set_model(smol_str::SmolStr::new("FC8482"));
+    // Sample 0 → Doc1 — the IDENTITY sample (its own records held the `.proto`
+    // leaf + serial/model), so its row carries Protocol/SerialNumber/Model.
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_protocol(Some(smol_str::SmolStr::new("dvtm_wm265e.proto")))
+      .set_serial_number(Some(smol_str::SmolStr::new("SERIAL123")))
+      .set_model(Some(smol_str::SmolStr::new("FC8482")))
+      .set_latitude(Some(45.0))
+      .set_longitude(Some(8.0))
+      .set_absolute_altitude_m(Some(105.5))
+      .set_iso(Some(800.0))
+      .set_shutter_speed_s(Some(crate::metadata::RationalValue::Num(1.0 / 250.0)));
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(0.5));
+    // Sample 1 → Doc2.
+    let mut s1 = DjiTelemetrySample::new();
+    s1.set_latitude(Some(46.0)).set_longitude(Some(9.0));
+    m.push_sample(s1);
+    m.stamp_track_index_from(1, 1);
+    m.stamp_doc_from(1, 2, Some(0.5), Some(0.5));
+    m
+  }
+
+  /// `-ee -G3`: each DJI sample emits its OWN `Doc<N>` under family-0
+  /// `Protobuf` / family-1 `DJI`; identity is re-emitted per-Doc;
+  /// SampleTime/SampleDuration ride `QuickTime:Track1`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_g3_per_doc_groups_and_values() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::value::TagValue;
+    let meta = dji_two_sample_meta();
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&meta, opts, false, &mut gate, &mut tags);
+    let find = |doc: u32, f0: &str, f1: &str, name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| {
+          let g = t.tag().group_ref();
+          g.doc() == doc && g.family0() == f0 && g.family1() == f1 && t.tag().name() == name
+        })
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // Doc1 payload (Protobuf:DJI).
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "GPSLatitude"),
+      Some(TagValue::F64(45.0))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "GPSLongitude"),
+      Some(TagValue::F64(8.0))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "AbsoluteAltitude"),
+      Some(TagValue::F64(105.5))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "ISO"),
+      Some(TagValue::F64(800.0))
+    );
+    // Identity emitted ONCE, at the first doc (Doc1) only.
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "Protocol"),
+      Some(TagValue::Str("dvtm_wm265e.proto".into()))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "Model"),
+      Some(TagValue::Str("FC8482".into()))
+    );
+    assert_eq!(
+      find(2, "Protobuf", "DJI", "Protocol"),
+      None,
+      "identity is NOT re-emitted at later docs"
+    );
+    // Doc2 GPS (the second fix).
+    assert_eq!(
+      find(2, "Protobuf", "DJI", "GPSLatitude"),
+      Some(TagValue::F64(46.0))
+    );
+    // SampleTime/SampleDuration ride QuickTime:Track1 (NOT Protobuf:DJI).
+    assert_eq!(
+      find(1, "QuickTime", "Track1", "SampleTime"),
+      Some(TagValue::F64(0.0))
+    );
+    assert_eq!(
+      find(2, "QuickTime", "Track1", "SampleDuration"),
+      Some(TagValue::F64(0.5))
+    );
+    // No DJI payload ever leaks onto QuickTime/Track1.
+    assert!(
+      !tags
+        .iter()
+        .any(|t| { t.tag().group_ref().family1() == "Track1" && t.tag().name() == "GPSLatitude" }),
+      "DJI GPS must not ride Track1"
+    );
+  }
+
+  /// `-ee -G3`: a djmd sample carrying ONLY a `.proto` leaf (+
+  /// SerialNumber/Model, no GPS/capture) emits its `Protobuf:DJI:Protocol`/
+  /// `SerialNumber`/`Model` AND its `QuickTime:Track<N>:SampleTime`/
+  /// `SampleDuration` at its OWN `Doc<N>` (it must not be empty nor merged into
+  /// a telemetry sample's Doc). A following telemetry sample emits at the NEXT
+  /// distinct Doc, and the emitted Doc count == the dispatched-sample count.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_identity_only_sample_emits_its_own_doc() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // Sample 0 = identity-ONLY → Doc1. Its row carries Protocol/Serial/Model
+    // (the `.proto` + `1-1-5`/`1-1-10` leaves it physically held), NO telemetry.
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_protocol(Some(smol_str::SmolStr::new("dvtm_wm265e.proto")))
+      .set_serial_number(Some(smol_str::SmolStr::new("SERIAL123")))
+      .set_model(Some(smol_str::SmolStr::new("FC8482")));
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(0.5));
+    // Sample 1 = telemetry (a data-only sample that reused the persisted
+    // protocol; no per-row Protocol) → Doc2.
+    let mut s1 = DjiTelemetrySample::new();
+    s1.set_latitude(Some(46.0)).set_longitude(Some(9.0));
+    m.push_sample(s1);
+    m.stamp_track_index_from(1, 1);
+    m.stamp_doc_from(1, 2, Some(0.5), Some(0.5));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+    let find = |doc: u32, f0: &str, f1: &str, name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| {
+          let g = t.tag().group_ref();
+          g.doc() == doc && g.family0() == f0 && g.family1() == f1 && t.tag().name() == name
+        })
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // The identity-only sample's OWN Doc (Doc1) emits its identity …
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "Protocol"),
+      Some(TagValue::Str("dvtm_wm265e.proto".into()))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "SerialNumber"),
+      Some(TagValue::Str("SERIAL123".into()))
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "Model"),
+      Some(TagValue::Str("FC8482".into()))
+    );
+    // … plus its own SampleTime/SampleDuration (NOT empty, NOT merged).
+    assert_eq!(
+      find(1, "QuickTime", "Track1", "SampleTime"),
+      Some(TagValue::F64(0.0))
+    );
+    assert_eq!(
+      find(1, "QuickTime", "Track1", "SampleDuration"),
+      Some(TagValue::F64(0.5))
+    );
+    // The following telemetry sample emits at the NEXT, distinct Doc (Doc2),
+    // and carries no Protocol (it had no `.proto` leaf of its own).
+    assert_eq!(
+      find(2, "Protobuf", "DJI", "GPSLatitude"),
+      Some(TagValue::F64(46.0))
+    );
+    assert_eq!(
+      find(2, "Protobuf", "DJI", "Protocol"),
+      None,
+      "the data-only telemetry sample emits no Protocol"
+    );
+    // Doc count == dispatched-sample count (2 distinct docs over the DJI tags).
+    let mut docs: std::vec::Vec<u32> = tags
+      .iter()
+      .filter(|t| t.tag().group_ref().family1() == "DJI")
+      .map(|t| t.tag().group_ref().doc())
+      .collect();
+    docs.sort_unstable();
+    docs.dedup();
+    assert_eq!(docs, std::vec![1u32, 2u32], "one Doc per dispatched sample");
+  }
+
+  /// `-ee -G1`: the doc axis collapses to ONE `(DJI, name)` row FIRST-wins
+  /// (Doc1's fix), and ONE `QuickTime:Track1:SampleTime` (the minimum-doc).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_g1_first_wins_collapse() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::value::TagValue;
+    let meta = dji_two_sample_meta();
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji(
+      &meta,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate,
+      &mut tags,
+    );
+    // Exactly one GPSLatitude, the FIRST fix (45.0), at doc 0 under DJI.
+    let lats: std::vec::Vec<(u32, &TagValue, &str)> = tags
+      .iter()
+      .filter(|t| t.tag().name() == "GPSLatitude")
+      .map(|t| {
+        (
+          t.tag().group_ref().doc(),
+          t.tag().value_ref(),
+          t.tag().group_ref().family1(),
+        )
+      })
+      .collect();
+    assert_eq!(lats, std::vec![(0u32, &TagValue::F64(45.0), "DJI")]);
+    // Exactly one SampleTime, at QuickTime:Track1, doc 0.
+    let times: std::vec::Vec<(u32, &str)> = tags
+      .iter()
+      .filter(|t| t.tag().name() == "SampleTime")
+      .map(|t| (t.tag().group_ref().doc(), t.tag().group_ref().family1()))
+      .collect();
+    assert_eq!(times, std::vec![(0u32, "Track1")]);
+    // Every emitted tag sits at doc 0 under -G1.
+    assert!(tags.iter().all(|t| t.tag().group_ref().doc() == 0));
+  }
+
+  /// `-ee -j` (PrintConv): ShutterSpeed → `PrintExposureTime` ("1/250"),
+  /// GPSLatitude → the signed-DMS string (N hemisphere).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_printconv_shutter_and_gps() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::value::TagValue;
+    let meta = dji_two_sample_meta();
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji(
+      &meta,
+      EmitOptions::g1(ConvMode::PrintConv, true),
+      true,
+      &mut gate,
+      &mut tags,
+    );
+    let get = |name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| t.tag().group_ref().family1() == "DJI" && t.tag().name() == name)
+        .map(|t| t.tag().value_ref().clone())
+    };
+    assert_eq!(get("ShutterSpeed"), Some(TagValue::Str("1/250".into())));
+    match get("GPSLatitude") {
+      Some(TagValue::Str(s)) => assert!(s.ends_with(" N"), "DMS carries N: {s}"),
+      other => panic!("GPSLatitude -j should be a DMS string, got {other:?}"),
+    }
+  }
+
+  /// WITHOUT `-ee`, `emit_dji` emits NOTHING (the `djmd` payload is
+  /// ExtractEmbedded-gated).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_absent_without_ee() {
+    use crate::emit::{ConvMode, EmitOptions};
+    let meta = dji_two_sample_meta();
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji(
+      &meta,
+      EmitOptions::g1(ConvMode::ValueConv, false),
+      false,
+      &mut gate,
+      &mut tags,
+    );
+    assert!(tags.is_empty(), "no DJI tags without -ee");
+  }
+
+  /// The FALLBACK altitude-name path (R4-F3): a degenerate sample carrying an
+  /// altitude value with NO recorded leaf kind (`altitude_is_gps_named` unset)
+  /// falls back to the aggregate-protocol name — ac203/ac204/ac206 →
+  /// `GPSAltitude`, every other protocol → `AbsoluteAltitude`. (The normal,
+  /// walker-produced path records the kind PER-SAMPLE; see
+  /// `djmd_altitude_name_per_sample_protocol`.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_altitude_name_by_protocol_fallback() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let build = |proto: &str| -> std::vec::Vec<crate::emit::EmittedTag> {
+      let mut m = DjiProtobufMeta::new();
+      m.set_protocol(smol_str::SmolStr::new(proto));
+      let mut s = DjiTelemetrySample::new();
+      s.set_absolute_altitude_m(Some(50.0));
+      m.push_sample(s);
+      m.stamp_doc_from(0, 1, None, None);
+      let mut gate = dji_first_seen_gate();
+      let mut tags = std::vec::Vec::new();
+      emit_dji(
+        &m,
+        EmitOptions::g1(ConvMode::ValueConv, true),
+        false,
+        &mut gate,
+        &mut tags,
+      );
+      tags
+    };
+    let has = |tags: &[crate::emit::EmittedTag], name: &str| {
+      tags
+        .iter()
+        .any(|t| t.tag().name() == name && t.tag().value_ref() == &TagValue::F64(50.0))
+    };
+    let ac = build("dvtm_ac203.proto");
+    assert!(has(&ac, "GPSAltitude"), "ac203 → GPSAltitude");
+    assert!(!has(&ac, "AbsoluteAltitude"));
+    let wm = build("dvtm_wm265e.proto");
+    assert!(has(&wm, "AbsoluteAltitude"), "wm265e → AbsoluteAltitude");
+    assert!(!has(&wm, "GPSAltitude"));
+  }
+
+  /// R4-F3: the altitude tag NAME is chosen PER-SAMPLE from the leaf kind that
+  /// decoded each sample's altitude — NOT once from the aggregate
+  /// `meta.protocol()`. A track whose aggregate protocol is ac203 but that
+  /// contains one sample decoded under ac203 (→ `GPSAltitude`) and a later
+  /// sample decoded under oq101 (→ `AbsoluteAltitude`, the int64s leaf) must
+  /// emit EACH sample's altitude under its OWN name. Before R4-F3 the aggregate
+  /// name was applied to every sample, so the oq101 sample would have wrongly
+  /// emitted `GPSAltitude`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn djmd_altitude_name_per_sample_protocol() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    // Aggregate (first-wins) protocol = ac203 (its fallback name = GPSAltitude).
+    m.set_protocol(smol_str::SmolStr::new("dvtm_ac203.proto"));
+    // Sample 0 → Doc1: altitude decoded under the ac203 GPSAltitude leaf.
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_protocol(Some(smol_str::SmolStr::new("dvtm_ac203.proto")))
+      .set_absolute_altitude_m(Some(50.0))
+      .set_altitude_is_gps_named(Some(true)); // GPSAltitude (unsigned)
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, None, None);
+    // Sample 1 → Doc2: altitude decoded under the oq101 AbsoluteAltitude leaf
+    // (a mid-track `.proto` switch to oq101). Its own row carries the oq101
+    // Protocol; the aggregate stays ac203.
+    let mut s1 = DjiTelemetrySample::new();
+    s1.set_protocol(Some(smol_str::SmolStr::new("dvtm_oq101.proto")))
+      .set_absolute_altitude_m(Some(75.0))
+      .set_altitude_is_gps_named(Some(false)); // AbsoluteAltitude (int64s)
+    m.push_sample(s1);
+    m.stamp_track_index_from(1, 1);
+    m.stamp_doc_from(1, 2, None, None);
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+    let find = |doc: u32, name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| t.tag().group_ref().doc() == doc && t.tag().name() == name)
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // Doc1 (ac203 leaf) → GPSAltitude, NOT AbsoluteAltitude.
+    assert_eq!(
+      find(1, "GPSAltitude"),
+      Some(TagValue::F64(50.0)),
+      "the ac203-leaf sample emits GPSAltitude"
+    );
+    assert_eq!(find(1, "AbsoluteAltitude"), None);
+    // Doc2 (oq101 leaf) → AbsoluteAltitude, NOT GPSAltitude — even though the
+    // aggregate protocol is ac203.
+    assert_eq!(
+      find(2, "AbsoluteAltitude"),
+      Some(TagValue::F64(75.0)),
+      "the oq101-leaf sample emits AbsoluteAltitude despite the ac203 aggregate"
+    );
+    assert_eq!(find(2, "GPSAltitude"), None);
+  }
+
+  /// A SYNTHESIZED GPSDateTime emits under family-0 `Composite`, family-1
+  /// `Track<N>` (`Composite:GPSDateTime`, SET_GROUP0='Composite') — at the
+  /// sample's `Doc<N>` — under a DIFFERENT group than a DECODED leaf, which
+  /// emits under `Protobuf:DJI:GPSDateTime`. With a Perl-true leaf only the
+  /// decoded value is present (no synth); see
+  /// `emit_dji_empty_leaf_and_synth_coexist` for the degraded case where a
+  /// Perl-false leaf rides alongside the synthesized value.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_synthesized_gps_date_time_is_composite() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // Sample 0 → Doc1: a GPS fix with a SYNTHESIZED GPSDateTime (no leaf).
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_latitude(Some(45.0))
+      .set_longitude(Some(8.0))
+      .set_synth_gps_date_time(Some(smol_str::SmolStr::new("1970:01:01 00:00:01.000Z")));
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(0.5));
+    // Sample 1 → Doc2: a GPS fix with a DECODED GPSDateTime leaf (ac203-style).
+    let mut s1 = DjiTelemetrySample::new();
+    s1.set_latitude(Some(46.0))
+      .set_longitude(Some(9.0))
+      .set_gps_date_time(Some(smol_str::SmolStr::new("2025:01:15 12:34:56")));
+    m.push_sample(s1);
+    m.stamp_track_index_from(1, 1);
+    m.stamp_doc_from(1, 2, Some(0.5), Some(0.5));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+    let find = |doc: u32, f0: &str, f1: &str, name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| {
+          let g = t.tag().group_ref();
+          g.doc() == doc && g.family0() == f0 && g.family1() == f1 && t.tag().name() == name
+        })
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // Doc1: the synthesized value is `Composite:GPSDateTime` at Track1 — NOT
+    // `Protobuf:DJI:GPSDateTime`.
+    assert_eq!(
+      find(1, "Composite", "Track1", "GPSDateTime"),
+      Some(TagValue::Str("1970:01:01 00:00:01.000Z".into())),
+      "synthesized GPSDateTime is Composite:Track1"
+    );
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "GPSDateTime"),
+      None,
+      "a synthesized value never rides Protobuf:DJI"
+    );
+    // Doc2: the decoded leaf is `Protobuf:DJI:GPSDateTime` — NOT Composite.
+    assert_eq!(
+      find(2, "Protobuf", "DJI", "GPSDateTime"),
+      Some(TagValue::Str("2025:01:15 12:34:56".into())),
+      "decoded GPSDateTime leaf is Protobuf:DJI"
+    );
+    assert_eq!(
+      find(2, "Composite", "Track1", "GPSDateTime"),
+      None,
+      "a decoded leaf never rides Composite"
+    );
+  }
+
+  /// A degraded sample whose decoded GPSDateTime leaf is Perl-FALSE (here `""`)
+  /// triggers SYNTHESIS while the leaf STILL `HandleTag`s. Both must emit at the
+  /// SAME `Doc<N>` / `Track<N>`: the empty leaf under `Protobuf:DJI:GPSDateTime`
+  /// and the synthesized value under `Composite:GPSDateTime`. They coexist —
+  /// distinct family-0 groups (ExifTool's `not $$et{GPSDateTime}` gate fires on
+  /// the Perl-false leaf, QuickTimeStream.pl:1536, but the leaf tag is already
+  /// extracted under Protobuf:DJI).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_empty_leaf_and_synth_coexist() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // Sample 0 → Doc1: a GPS fix whose decoded GPSDateTime leaf is "" (Perl
+    // false) AND a synthesized Composite value (SetGPSDateTime fired).
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_latitude(Some(45.0))
+      .set_longitude(Some(8.0))
+      .set_gps_date_time(Some(smol_str::SmolStr::new("")))
+      .set_synth_gps_date_time(Some(smol_str::SmolStr::new("1970:01:01 00:00:01.000Z")));
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(0.5));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+    let find = |doc: u32, f0: &str, f1: &str, name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| {
+          let g = t.tag().group_ref();
+          g.doc() == doc && g.family0() == f0 && g.family1() == f1 && t.tag().name() == name
+        })
+        .map(|t| t.tag().value_ref().clone())
+    };
+    // The synthesized value rides Composite:Track1 at Doc1.
+    assert_eq!(
+      find(1, "Composite", "Track1", "GPSDateTime"),
+      Some(TagValue::Str("1970:01:01 00:00:01.000Z".into())),
+      "synthesized GPSDateTime is Composite:Track1"
+    );
+    // The Perl-false decoded leaf STILL emits under Protobuf:DJI at the same doc.
+    assert_eq!(
+      find(1, "Protobuf", "DJI", "GPSDateTime"),
+      Some(TagValue::Str("".into())),
+      "the empty decoded leaf still rides Protobuf:DJI (coexists with synth)"
+    );
+  }
+
+  /// R13-F2: for a given djmd sample/Doc the `Protobuf:DJI` payload tags are
+  /// emitted BEFORE the synthesized `Composite:GPSDateTime` — matching
+  /// QuickTimeStream.pl:1525-1534 (`ProcessProtobuf` HandleTags the payload
+  /// first, then `SetGPSDateTime` synthesizes). The synthesized Composite value
+  /// must therefore appear AFTER every `Protobuf:DJI` tag of that Doc.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn synth_gps_date_time_emits_after_protobuf_payload() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // One wm265e sample → Doc1: identity (Protocol/SerialNumber/Model) + a GPS
+    // fix whose GPSDateTime is SYNTHESIZED (no decoded leaf).
+    let mut s0 = DjiTelemetrySample::new();
+    s0.set_protocol(Some(smol_str::SmolStr::new("dvtm_wm265e.proto")))
+      .set_serial_number(Some(smol_str::SmolStr::new("SERIAL123")))
+      .set_model(Some(smol_str::SmolStr::new("FC8482")))
+      .set_latitude(Some(45.0))
+      .set_longitude(Some(8.0))
+      .set_absolute_altitude_m(Some(105.5))
+      .set_synth_gps_date_time(Some(smol_str::SmolStr::new("1970:01:01 00:00:01.000Z")));
+    m.push_sample(s0);
+    m.stamp_track_index_from(0, 1);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(0.5));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+    // The synthesized Composite:GPSDateTime exists at Doc1/Track1.
+    let synth_idx = tags
+      .iter()
+      .position(|t| {
+        let g = t.tag().group_ref();
+        g.doc() == 1
+          && g.family0() == "Composite"
+          && g.family1() == "Track1"
+          && t.tag().name() == "GPSDateTime"
+      })
+      .expect("synthesized Composite:GPSDateTime present");
+    // Every Doc1 Protobuf:DJI payload tag must precede it.
+    let last_payload_idx = tags
+      .iter()
+      .enumerate()
+      .filter(|(_, t)| {
+        let g = t.tag().group_ref();
+        g.doc() == 1 && g.family0() == "Protobuf" && g.family1() == "DJI"
+      })
+      .map(|(i, _)| i)
+      .max()
+      .expect("at least one Protobuf:DJI payload tag");
+    assert!(
+      last_payload_idx < synth_idx,
+      "Protobuf:DJI payload (last idx {last_payload_idx}) must precede the \
+       synthesized Composite:GPSDateTime (idx {synth_idx})"
+    );
+    // The synth value never rides Protobuf:DJI (the two groups stay distinct).
+    assert!(
+      !tags.iter().any(|t| {
+        let g = t.tag().group_ref();
+        g.family0() == "Protobuf" && g.family1() == "DJI" && t.tag().name() == "GPSDateTime"
+      }),
+      "synthesized GPSDateTime must not appear under Protobuf:DJI"
+    );
+  }
+
+  /// F2: `emit_dji`'s distinct-`Doc<N>` list is built in O(n log n) (a
+  /// `BTreeSet`, not the old O(n^2) `contains` scan), and the emitted per-doc
+  /// blocks appear in the SAME sorted-distinct order as before — including
+  /// consecutive samples sharing a doc (collapsed once) and gaps between docs.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_doc_dedup_is_linear_and_order_stable() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // Per-sample docs with consecutive dups AND gaps (monotonic, as the walker
+    // produces — `open_doc()` is a monotonic global counter shared with other
+    // sources, so DJI docs ascend but need not be consecutive).
+    let docs_per_sample = [1u32, 1, 2, 5, 5, 5, 9];
+    for _ in &docs_per_sample {
+      let mut s = DjiTelemetrySample::new();
+      // A GPS fix so each sample emits a `GPSLatitude` under its own doc.
+      s.set_latitude(Some(45.0)).set_longitude(Some(8.0));
+      m.push_sample(s);
+    }
+    // Stamp each row's doc in ascending start order: `stamp_doc_from(i, d)`
+    // overwrites rows i.. , so the call at start=i is the last to touch row i ⇒
+    // row i ends with docs_per_sample[i].
+    for (i, &d) in docs_per_sample.iter().enumerate() {
+      m.stamp_track_index_from(i, 1);
+      m.stamp_doc_from(i, d, Some(i as f64), Some(1.0));
+    }
+    // Sanity: the rows carry exactly the intended per-sample docs.
+    let row_docs: std::vec::Vec<u32> = m
+      .samples()
+      .iter()
+      .map(crate::metadata::DjiTelemetrySample::doc)
+      .collect();
+    assert_eq!(row_docs, docs_per_sample, "per-row doc stamping");
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+
+    // The ORDER of distinct docs as they appear in the emitted Protobuf:DJI
+    // stream (first appearance of each doc).
+    let mut emitted_doc_order: std::vec::Vec<u32> = std::vec::Vec::new();
+    for t in &tags {
+      let g = t.tag().group_ref();
+      if g.family0() == "Protobuf" && g.family1() == "DJI" {
+        let d = g.doc();
+        if emitted_doc_order.last() != Some(&d) && !emitted_doc_order.contains(&d) {
+          emitted_doc_order.push(d);
+        }
+      }
+    }
+    // The reference = the OLD algorithm (unique-preserving push + sort).
+    let mut reference: std::vec::Vec<u32> = std::vec::Vec::new();
+    for &d in &docs_per_sample {
+      if !reference.contains(&d) {
+        reference.push(d);
+      }
+    }
+    reference.sort_unstable();
+    assert_eq!(
+      emitted_doc_order, reference,
+      "distinct-doc emission order is byte-identical to the prior dedup"
+    );
+    assert_eq!(
+      emitted_doc_order,
+      std::vec![1u32, 2, 5, 9],
+      "consecutive dups collapse once; gaps preserved; ascending"
+    );
+  }
+
+  /// F1 (R8): the WHOLE `emit_dji` emission is O(n log n) — the distinct-doc
+  /// list AND the per-doc sample resolution are built in ONE pass (a
+  /// `BTreeMap<doc, &sample>` with first-entry-wins), NOT the prior
+  /// `find`-per-doc linear scan that re-made the emission O(n^2). With many
+  /// samples carrying unique monotonic docs PLUS a constructed duplicate-doc
+  /// pair, the emitted per-doc ORDER and the per-doc SAMPLE chosen are
+  /// byte-identical to the OLD algorithm (sorted distinct docs, FIRST sample of
+  /// each). A per-sample unique `ColorTemperature` tags which sample each doc's
+  /// `Protobuf:DJI` block came from.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_emission_is_log_linear_and_order_stable() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    // 60 samples. Docs are monotonic non-decreasing (as `open_doc()` produces):
+    // indices 0..=30 → docs 1..=31, then a deliberate consecutive DUPLICATE at
+    // index 31 (also doc 31) to exercise first-entry-wins, then indices 32..=59 →
+    // docs 32..=59. So docs are 1,2,…,31,31,32,…,59 — 59 distinct over 60 rows.
+    let n = 60usize;
+    let docs_per_sample: std::vec::Vec<u32> = (0..n)
+      .map(|i| if i <= 30 { (i as u32) + 1 } else { i as u32 })
+      .collect();
+    for (i, _) in docs_per_sample.iter().enumerate() {
+      let mut s = DjiTelemetrySample::new();
+      // A unique per-sample ColorTemperature (1000 + index) identifies which
+      // sample a doc's emitted block came from; a GPS fix so each doc emits.
+      s.set_latitude(Some(45.0)).set_longitude(Some(8.0));
+      s.set_color_temperature(Some(1000 + i as u32));
+      m.push_sample(s);
+    }
+    for (i, &d) in docs_per_sample.iter().enumerate() {
+      m.stamp_track_index_from(i, 1);
+      m.stamp_doc_from(i, d, Some(i as f64), Some(1.0));
+    }
+    // Sanity: the duplicate is where we put it.
+    assert_eq!(docs_per_sample[30], 31);
+    assert_eq!(docs_per_sample[31], 31, "indices 30 & 31 share doc 31");
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    let opts = EmitOptions::with_group_mode(
+      ConvMode::ValueConv,
+      true,
+      crate::serialize_key::GroupMode::G3,
+    );
+    emit_dji(&m, opts, false, &mut gate, &mut tags);
+
+    // Walk the emitted `Protobuf:DJI` ColorTemperature tags in emission order →
+    // (doc, color_temp) pairs, i.e. the per-doc sample chosen, in emit order.
+    let mut emitted: std::vec::Vec<(u32, u64)> = std::vec::Vec::new();
+    for t in &tags {
+      let g = t.tag().group_ref();
+      if g.family0() == "Protobuf"
+        && g.family1() == "DJI"
+        && t.tag().name() == "ColorTemperature"
+        && let TagValue::U64(ct) = t.tag().value_ref()
+      {
+        emitted.push((g.doc(), *ct));
+      }
+    }
+
+    // The REFERENCE = the OLD algorithm: sorted DISTINCT docs, and for each the
+    // FIRST sample (lowest index) carrying it → its ColorTemperature.
+    let mut reference: std::vec::Vec<(u32, u64)> = std::vec::Vec::new();
+    {
+      let mut seen_docs: std::vec::Vec<u32> = std::vec::Vec::new();
+      let mut distinct: std::vec::Vec<u32> = std::vec::Vec::new();
+      for &d in &docs_per_sample {
+        if !seen_docs.contains(&d) {
+          seen_docs.push(d);
+          distinct.push(d);
+        }
+      }
+      distinct.sort_unstable();
+      for d in distinct {
+        // FIRST sample index with this doc (linear find = the OLD behaviour).
+        let idx = docs_per_sample.iter().position(|&x| x == d).unwrap();
+        reference.push((d, 1000 + idx as u64));
+      }
+    }
+
+    assert_eq!(
+      emitted, reference,
+      "per-doc emission order AND per-doc sample chosen are byte-identical to \
+       the prior sorted-distinct + first-sample-per-doc algorithm"
+    );
+    // Spot-check the duplicate-doc first-wins: doc 31 must carry sample index 30
+    // (ColorTemperature 1030), NOT the later index-31 sample (1031).
+    let doc31: std::vec::Vec<u64> = emitted
+      .iter()
+      .filter(|(d, _)| *d == 31)
+      .map(|(_, ct)| *ct)
+      .collect();
+    assert_eq!(
+      doc31,
+      std::vec![1030u64],
+      "duplicate doc 31 collapses to the FIRST sample (index 30 ⇒ 1030)"
+    );
+    // 59 distinct docs over 60 rows.
+    assert_eq!(emitted.len(), 59, "59 distinct docs emitted once each");
+  }
+
+  /// F2 (R8): a `ShutterSpeed` leaf whose rational has a ZERO denominator decodes
+  /// to ExifTool's literal `'err'` (Protobuf.pm:205) — the tag is STILL emitted
+  /// (`Protobuf:DJI:ShutterSpeed = "err"`), NOT dropped, and the `MediaMetadata`
+  /// projection SKIPS it (it is not a number). A valid (den != 0) ShutterSpeed
+  /// still emits the numeric value and projects normally.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_shutterspeed_zero_denom_emits_err() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample, MediaMetadata, RationalValue};
+    use crate::value::TagValue;
+
+    // ── Err reading → emits "err", projection skips ──────────────────────────
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    let mut s = DjiTelemetrySample::new();
+    s.set_shutter_speed_s(Some(RationalValue::Err));
+    m.push_sample(s);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(1.0));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags = std::vec::Vec::new();
+    // `-n` (ValueConv): the Err reading has no PrintConv; it is the verbatim
+    // string regardless of -n/-j.
+    emit_dji(
+      &m,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate,
+      &mut tags,
+    );
+    let ss: std::vec::Vec<&TagValue> = tags
+      .iter()
+      .filter(|t| t.tag().name() == "ShutterSpeed")
+      .map(|t| t.tag().value_ref())
+      .collect();
+    assert_eq!(
+      ss,
+      std::vec![&TagValue::Str("err".into())],
+      "a zero-denominator ShutterSpeed emits the literal 'err' tag, not dropped"
+    );
+    // Projection skips the 'err' reading (not a number).
+    let mut md = MediaMetadata::new();
+    m.project_into(&mut md);
+    assert!(
+      md.capture().is_none_or(|c| c.exposure_time_s().is_none()),
+      "an 'err' ShutterSpeed must NOT project as a number"
+    );
+
+    // ── -j (PrintConv) also renders the verbatim 'err' (no PrintConv applies) ─
+    let mut gate2 = dji_first_seen_gate();
+    let mut tags2 = std::vec::Vec::new();
+    emit_dji(
+      &m,
+      EmitOptions::g1(ConvMode::PrintConv, true),
+      true,
+      &mut gate2,
+      &mut tags2,
+    );
+    assert!(
+      tags2
+        .iter()
+        .any(|t| t.tag().name() == "ShutterSpeed"
+          && t.tag().value_ref() == &TagValue::Str("err".into())),
+      "-j ShutterSpeed 'err' is verbatim (the non-numeric reading has no PrintConv)"
+    );
+
+    // ── A VALID ShutterSpeed still emits the number + projects ───────────────
+    let mut mv = DjiProtobufMeta::new();
+    mv.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    let mut sv = DjiTelemetrySample::new();
+    sv.set_shutter_speed_s(Some(RationalValue::Num(1.0 / 250.0)));
+    mv.push_sample(sv);
+    mv.stamp_doc_from(0, 1, Some(0.0), Some(1.0));
+    let mut gate3 = dji_first_seen_gate();
+    let mut tags3 = std::vec::Vec::new();
+    emit_dji(
+      &mv,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate3,
+      &mut tags3,
+    );
+    assert!(
+      tags3
+        .iter()
+        .any(|t| t.tag().name() == "ShutterSpeed"
+          && t.tag().value_ref() == &TagValue::F64(1.0 / 250.0)),
+      "a valid ShutterSpeed emits the numeric value"
+    );
+    let mut mdv = MediaMetadata::new();
+    mv.project_into(&mut mdv);
+    assert_eq!(
+      mdv.capture().and_then(|c| c.exposure_time_s()),
+      Some(1.0 / 250.0),
+      "a valid ShutterSpeed projects normally"
+    );
+  }
+
+  /// F2 (R8): the same `'err'` emit + projection-skip for a zero-denominator
+  /// `FNumber` (the other `Format == 'rational'` DJI field).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_fnumber_zero_denom_emits_err() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample, MediaMetadata, RationalValue};
+    use crate::value::TagValue;
+
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    let mut s = DjiTelemetrySample::new();
+    s.set_f_number(Some(RationalValue::Err));
+    m.push_sample(s);
+    m.stamp_doc_from(0, 1, Some(0.0), Some(1.0));
+
+    let mut gate = dji_first_seen_gate();
+    let mut tags = std::vec::Vec::new();
+    emit_dji(
+      &m,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate,
+      &mut tags,
+    );
+    assert!(
+      tags
+        .iter()
+        .any(|t| t.tag().name() == "FNumber"
+          && t.tag().value_ref() == &TagValue::Str("err".into())),
+      "a zero-denominator FNumber emits the literal 'err' tag"
+    );
+    let mut md = MediaMetadata::new();
+    m.project_into(&mut md);
+    assert!(
+      md.capture().is_none_or(|c| c.f_number().is_none()),
+      "an 'err' FNumber must NOT project as a number"
+    );
+
+    // A VALID FNumber still emits the number + projects.
+    let mut mv = DjiProtobufMeta::new();
+    mv.set_protocol(smol_str::SmolStr::new("dvtm_wm265e.proto"));
+    let mut sv = DjiTelemetrySample::new();
+    sv.set_f_number(Some(RationalValue::Num(2.8)));
+    mv.push_sample(sv);
+    mv.stamp_doc_from(0, 1, Some(0.0), Some(1.0));
+    let mut gate2 = dji_first_seen_gate();
+    let mut tags2 = std::vec::Vec::new();
+    emit_dji(
+      &mv,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate2,
+      &mut tags2,
+    );
+    assert!(
+      tags2
+        .iter()
+        .any(|t| t.tag().name() == "FNumber" && t.tag().value_ref() == &TagValue::F64(2.8)),
+      "a valid FNumber emits the numeric value"
+    );
+    let mut mdv = MediaMetadata::new();
+    mv.project_into(&mut mdv);
+    assert_eq!(
+      mdv.capture().and_then(|c| c.f_number()),
+      Some(2.8),
+      "a valid FNumber projects normally"
+    );
+  }
+
+  /// The altitude NAME the DJMD emission picks follows the DJMD `protocol`: with
+  /// protocol = ac203 (unsigned `GPSAltitude`) the emitted altitude leaf is
+  /// `GPSAltitude`, never `AbsoluteAltitude` (the int64s name of a protocol like
+  /// oq101). Mirrors the typed-surface outcome of `djmd_with_dbgi_present_emits_
+  /// only_djmd` (a `dbgi` track is a default-options no-op and never feeds the
+  /// altitude-name selection).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn emit_dji_altitude_name_follows_djmd_protocol() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiTelemetrySample};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_ac203.proto"));
+    let mut s = DjiTelemetrySample::new();
+    // The identity sample's row carries the DJMD protocol it decoded.
+    s.set_protocol(Some(smol_str::SmolStr::new("dvtm_ac203.proto")));
+    s.set_absolute_altitude_m(Some(123.456));
+    m.push_sample(s);
+    m.stamp_doc_from(0, 1, None, None);
+    let mut gate = dji_first_seen_gate();
+    let mut tags = std::vec::Vec::new();
+    emit_dji(
+      &m,
+      EmitOptions::g1(ConvMode::ValueConv, true),
+      false,
+      &mut gate,
+      &mut tags,
+    );
+    let has = |name: &str| {
+      tags
+        .iter()
+        .any(|t| t.tag().name() == name && t.tag().value_ref() == &TagValue::F64(123.456))
+    };
+    assert!(has("GPSAltitude"), "ac203 DJMD protocol → GPSAltitude");
+    assert!(
+      !has("AbsoluteAltitude"),
+      "the ac203 protocol must NOT name it AbsoluteAltitude"
+    );
+    // And the emitted Protocol tag is the DJMD one.
+    assert!(
+      tags.iter().any(|t| t.tag().name() == "Protocol"
+        && t.tag().value_ref() == &TagValue::Str("dvtm_ac203.proto".into())),
+      "emitted Protocol is the DJMD protocol"
+    );
+  }
+
+  /// The DJI walker warning emits under family-0 `ExifTool`, family-1
+  /// `Track<N>` (a `Track<N>:Warning` — the empty-family `SET_GROUP1` fill,
+  /// oracle `G0=ExifTool G1=Track1 G3=Doc1`), carrying the sample's `Doc<N>` at
+  /// `-G3`, with the FULL `Unknown protocol … (please submit sample for
+  /// testing)` message — NOT a document-level `ExifTool:Warning` (#163).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn dji_unknown_protocol_warning_is_track_group() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiWarning};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    m.set_protocol(smol_str::SmolStr::new("dvtm_FUTURE99.proto"));
+    m.push_warning(DjiWarning::new(
+      smol_str::SmolStr::new(
+        "Unknown protocol dvtm_FUTURE99.proto (please submit sample for testing)",
+      ),
+      false,
+    ));
+    // The dispatch arm stamps the sample's Track1 / Doc3 onto the warning.
+    m.stamp_warnings_from(0, 1, 3);
+    // -G3: Track1:Warning at Doc3 (key `Doc3:Track1:Warning`).
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::with_group_mode(
+        ConvMode::PrintConv,
+        true,
+        crate::serialize_key::GroupMode::G3,
+      ),
+      &mut gate,
+      &mut tags,
+    );
+    let w = tags
+      .iter()
+      .find(|t| t.tag().name() == "Warning")
+      .expect("a Warning");
+    assert_eq!(w.tag().group_ref().family0(), "ExifTool");
+    assert_eq!(
+      w.tag().group_ref().family1(),
+      "Track1",
+      "family-1 is Track<N>, NOT ExifTool (A1 fix)"
+    );
+    assert_eq!(w.tag().group_ref().doc(), 3);
+    assert_eq!(
+      w.tag().value_ref(),
+      &TagValue::Str(
+        "Unknown protocol dvtm_FUTURE99.proto (please submit sample for testing)".into()
+      )
+    );
+    // -G1: collapses to one `Track1:Warning` (no Doc prefix).
+    let mut gate1 = dji_first_seen_gate();
+    let mut tags1: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::g1(ConvMode::PrintConv, true),
+      &mut gate1,
+      &mut tags1,
+    );
+    let w1 = tags1
+      .iter()
+      .find(|t| t.tag().name() == "Warning")
+      .expect("a Warning at -G1");
+    assert_eq!(w1.tag().group_ref().family1(), "Track1");
+    assert_eq!(w1.tag().group_ref().doc(), 0, "-G1 collapses the doc axis");
+    // Without -ee: no warning emitted.
+    let mut gate2 = dji_first_seen_gate();
+    let mut tags2: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut gate2,
+      &mut tags2,
+    );
+    assert!(tags2.is_empty(), "no warning without -ee");
+  }
+
+  /// N samples all raising the SAME unknown-protocol message collapse to ONE
+  /// `Track<N>:Warning` whose value carries the WAS_WARNED `[xN]` suffix (one
+  /// distinct message ⇒ no numbering). Mirrors `emit_camm_warnings` /
+  /// `emit_ctmd_warnings` `[xN]`.
+  #[test]
+  #[cfg(feature = "alloc")]
+  #[allow(non_snake_case)] // `xN` mirrors ExifTool's WAS_WARNED ` [x$n]` suffix
+  fn dji_repeated_unknown_protocol_warning_has_xN_count() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiWarning};
+    use crate::value::TagValue;
+    let msg = "Unknown protocol dvtm_FUTURE99.proto (please submit sample for testing)";
+    let mut m = DjiProtobufMeta::new();
+    // Three samples (Doc1/2/3), each raising the same unknown-protocol warning.
+    for doc in 1..=3u32 {
+      let start = m.warning_count();
+      m.push_warning(DjiWarning::new(smol_str::SmolStr::new(msg), false));
+      m.stamp_warnings_from(start, 1, doc);
+    }
+    // -G3: ONE `Warning` survives (the first, Doc1), valued `… [x3]`.
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::with_group_mode(
+        ConvMode::ValueConv,
+        true,
+        crate::serialize_key::GroupMode::G3,
+      ),
+      &mut gate,
+      &mut tags,
+    );
+    let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
+      .iter()
+      .filter(|t| t.tag().name().starts_with("Warning"))
+      .collect();
+    assert_eq!(warns.len(), 1, "one distinct message ⇒ one Warning tag");
+    assert_eq!(warns[0].tag().name(), "Warning", "not numbered");
+    assert_eq!(warns[0].tag().group_ref().family1(), "Track1");
+    assert_eq!(warns[0].tag().group_ref().doc(), 1, "the first occurrence");
+    assert_eq!(
+      warns[0].tag().value_ref(),
+      &TagValue::Str(smol_str::SmolStr::from(std::format!("{msg} [x3]")))
+    );
+  }
+
+  /// The minor `Approximating GPSDateTime as CreateDate + SampleTime` synth
+  /// warning emits as a `[minor] `-prefixed `Track<N>:Warning` with the
+  /// WAS_WARNED `[xN]` for N synth samples. `Warn(.., 1)` ⇒ `[minor]` (oracle
+  /// `[minor] Approximating … [x2]`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn dji_synth_gps_date_time_emits_minor_approximating_warning() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiWarning};
+    use crate::value::TagValue;
+    let msg = "Approximating GPSDateTime as CreateDate + SampleTime";
+    let mut m = DjiProtobufMeta::new();
+    // Two synth samples (Doc1/Doc2), each raising the minor warning.
+    for doc in 1..=2u32 {
+      let start = m.warning_count();
+      m.push_warning(DjiWarning::new(smol_str::SmolStr::new(msg), true));
+      m.stamp_warnings_from(start, 1, doc);
+    }
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::with_group_mode(
+        ConvMode::ValueConv,
+        true,
+        crate::serialize_key::GroupMode::G3,
+      ),
+      &mut gate,
+      &mut tags,
+    );
+    let warns: std::vec::Vec<&crate::emit::EmittedTag> = tags
+      .iter()
+      .filter(|t| t.tag().name().starts_with("Warning"))
+      .collect();
+    assert_eq!(warns.len(), 1, "one distinct minor message ⇒ one Warning");
+    assert_eq!(warns[0].tag().group_ref().family1(), "Track1");
+    assert_eq!(
+      warns[0].tag().value_ref(),
+      &TagValue::Str(smol_str::SmolStr::from(std::format!("[minor] {msg} [x2]"))),
+      "the minor prefix AND the [x2] count"
+    );
+  }
+
+  /// A malformed TOP-LEVEL djmd record raises BOTH `Protobuf format error` AND
+  /// `Truncated protobuf data` (Protobuf.pm:156 + :278). They are DISTINCT
+  /// same-(Doc,Track) messages, so they emit as NUMBERED `Track<N>:Warning` +
+  /// `Track<N>:Warning (1)` (oracle: `Warning = "Protobuf format error"`,
+  /// `Warning (1) = "Truncated protobuf data"`).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn dji_truncated_top_level_emits_both_warnings() {
+    use crate::emit::{ConvMode, EmitOptions};
+    use crate::metadata::{DjiProtobufMeta, DjiWarning};
+    use crate::value::TagValue;
+    let mut m = DjiProtobufMeta::new();
+    // One sample (Doc1/Track1) raising both, in walk order.
+    let start = m.warning_count();
+    m.push_warning(DjiWarning::new(
+      smol_str::SmolStr::new_static("Protobuf format error"),
+      false,
+    ));
+    m.push_warning(DjiWarning::new(
+      smol_str::SmolStr::new_static("Truncated protobuf data"),
+      false,
+    ));
+    m.stamp_warnings_from(start, 1, 1);
+    let mut gate = dji_first_seen_gate();
+    let mut tags: std::vec::Vec<crate::emit::EmittedTag> = std::vec::Vec::new();
+    emit_dji_warning(
+      &m,
+      EmitOptions::with_group_mode(
+        ConvMode::ValueConv,
+        true,
+        crate::serialize_key::GroupMode::G3,
+      ),
+      &mut gate,
+      &mut tags,
+    );
+    let find = |name: &str| -> Option<TagValue> {
+      tags
+        .iter()
+        .find(|t| t.tag().name() == name && t.tag().group_ref().family1() == "Track1")
+        .map(|t| t.tag().value_ref().clone())
+    };
+    assert_eq!(
+      find("Warning"),
+      Some(TagValue::Str("Protobuf format error".into())),
+      "first distinct message is the bare Warning"
+    );
+    assert_eq!(
+      find("Warning (1)"),
+      Some(TagValue::Str("Truncated protobuf data".into())),
+      "second distinct message is numbered Warning (1) — so BOTH survive"
+    );
+    // Both at Doc1.
+    assert!(
+      tags
+        .iter()
+        .filter(|t| t.tag().name().starts_with("Warning"))
+        .all(|t| t.tag().group_ref().doc() == 1)
+    );
+  }
+
   /// Decoded LigoGPS records must EMIT through
   /// `Meta::tags()` under family-1 `LIGO` (the `%QuickTime::Stream` table,
   /// `$$et{SET_GROUP1}='LIGO'`, LigoGPS.pm:255). At `-ee -n` the GPS columns are
@@ -14884,6 +16745,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero8 Black"));
@@ -14922,6 +16784,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
@@ -14967,6 +16830,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
@@ -14998,6 +16862,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(
@@ -15027,6 +16892,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert_eq!(meta.device_name(), Some("Hero6 Black"));
@@ -15049,6 +16915,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(meta.is_empty());
@@ -15071,6 +16938,7 @@ mod tests {
       &mut crate::metadata::SonyRtmdMeta::new(),
       &mut crate::metadata::CanonCtmdMeta::new(),
       &mut crate::metadata::ParrotMeta::new(),
+      &mut crate::metadata::DjiProtobufMeta::new(),
       &mut crate::metadata::LigoGpsMeta::new(),
     );
     assert!(meta2.is_empty());
