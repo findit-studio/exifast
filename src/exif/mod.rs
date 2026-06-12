@@ -1239,8 +1239,38 @@ pub fn parse_standalone_tiff_with_base<'a>(
 #[must_use]
 pub fn parse_ctmd_exif_ifd_redispatch(block: &[u8]) -> Option<ExifMeta<'_>> {
   parse_tiff_with_base_no_raf(
-    block, /* base */ 0, /* tiff_type_is_tiff */ false, /* file_type */ None,
+    block,
+    /* base */ 0,
+    /* tiff_type_is_tiff */ false,
+    /* file_type */ None,
     /* no_raf */ true,
+    /* ifd0_kind */ IfdKind::Ifd0,
+  )
+}
+
+/// Parse a standalone TIFF block whose TOP-LEVEL directory IS a GPS IFD —
+/// the Canon CR3 `CMT4` box (Canon.pm:9719-9726
+/// `SubDirectory { Name => 'GPSInfo', TagTable => GPS::Main, ProcessProc =>
+/// ProcessTIFF, DirName => 'GPS' }`).
+///
+/// IDENTICAL to [`parse_exif_block`] (the embedded-block `ProcessTIFF` entry:
+/// `base == 0`, `tiff_type_is_tiff == false`, `file_type == None`, RAF-backed)
+/// EXCEPT IFD0 is walked against the `GPS::Main` table ([`IfdKind::Gps`]) instead
+/// of `Exif::Main`. A standard [`parse_exif_block`] would mis-decode `CMT4`: its
+/// IFD0 holds GPS tag IDs (`GPSVersionID` `0x0000`, …) that the `Exif::Main`
+/// table reads as unrelated / unknown tags — so the GPS table MUST drive the top
+/// directory, exactly as ExifTool's `CMT4` SubDirectory specifies. The recovered
+/// tags carry the family-1 group `"GPS"`. `None` for a block with no valid TIFF
+/// header (bad byte-order marker / IFD0 offset < 8).
+#[must_use]
+pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
+  parse_tiff_with_base_no_raf(
+    block,
+    /* base */ 0,
+    /* tiff_type_is_tiff */ false,
+    /* file_type */ None,
+    /* no_raf */ false,
+    /* ifd0_kind */ IfdKind::Gps,
   )
 }
 
@@ -1310,18 +1340,29 @@ fn parse_tiff_with_base<'a>(
     tiff_type_is_tiff,
     file_type,
     /* no_raf */ false,
+    /* ifd0_kind */ IfdKind::Ifd0,
   )
 }
 
 /// [`parse_tiff_with_base`] with the no-RAF framing made explicit. `no_raf` is
 /// `false` for every caller except the Canon CTMD `0x8769` ExifIFD re-dispatch
 /// ([`parse_ctmd_exif_ifd_redispatch`]) — see [`Walker::no_raf`].
+///
+/// `ifd0_kind` is the [`IfdKind`] the TOP-LEVEL directory is walked as — almost
+/// always [`IfdKind::Ifd0`] (the standard `ProcessTIFF` entry, whose IFD0 uses
+/// `Exif::Main` and reaches GPS/ExifIFD/Interop via SubIFD pointers). The Canon
+/// CR3 `CMT4` box is the sole exception: ExifTool dispatches it through
+/// `SubDirectory { TagTable => GPS::Main, ProcessProc => ProcessTIFF }`
+/// (Canon.pm:9719-9726), so its top-level directory IS the GPS IFD —
+/// [`parse_gps_block`] passes [`IfdKind::Gps`] to walk IFD0 against the GPS
+/// table directly.
 fn parse_tiff_with_base_no_raf<'a>(
   data: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
   file_type: Option<&str>,
   no_raf: bool,
+  ifd0_kind: IfdKind,
 ) -> Option<ExifMeta<'a>> {
   // `length $$dataPt < 8` — the TIFF header is 8 bytes.
   if data.len() < 8 {
@@ -1385,8 +1426,10 @@ fn parse_tiff_with_base_no_raf<'a>(
     warn_count: 0,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
-  // are reached as SubDirectories from inside the walk.
-  w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
+  // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
+  // for the standard `ProcessTIFF` entry; the CR3 `CMT4` GPS block passes
+  // `Gps` so the top directory walks against the GPS table (Canon.pm:9719-9726).
+  w.walk_ifd_chain(ifd0_offset, ifd0_kind);
   // The Owned guard never raises a cross-source cycle-guard warning, so this
   // is always empty on the common path — assert it to lock the invariant.
   debug_assert!(

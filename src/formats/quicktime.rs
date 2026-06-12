@@ -4573,6 +4573,10 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
   // offset 0, so the folded `h.abs_start` offsets stay file-absolute.
   let mut heif_meta = crate::metadata::HeifMeta::new();
   let mut cr3_meta = crate::metadata::Cr3Meta::new();
+  // The file-walk `$$self{Model}` for the Canon `uuid` CMT3 dispatch — a single
+  // value threaded across the whole brand walk so a CMT3 sees the most-recent
+  // preceding CMT1 `Model`, even one in an earlier Canon `uuid` atom.
+  let mut canon_uuid_model: Option<smol_str::SmolStr> = None;
   crate::formats::quicktime_brands::scan_quicktime_brands(
     scan_data,
     0,
@@ -4580,6 +4584,7 @@ fn parse_inner<'a>(data: &'a [u8], ext: Option<&str>) -> Option<Meta<'a>> {
     0,
     &mut heif_meta,
     &mut cr3_meta,
+    &mut canon_uuid_model,
   );
 
   // SP4 — CR3 / CRM file-type override. Canon.pm:9667 `OverrideFileType
@@ -4897,9 +4902,6 @@ impl crate::diagnostics::Diagnose for Meta<'_> {
       out.push(crate::diagnostics::Diagnostic::warn(w));
     }
     if heif_first && let Some(w) = self.warning() {
-      out.push(crate::diagnostics::Diagnostic::warn(w));
-    }
-    if let Some(w) = self.cr3().warning() {
       out.push(crate::diagnostics::Diagnostic::warn(w));
     }
     if let Some(w) = self.ligogps().warning() {
@@ -7052,6 +7054,17 @@ impl crate::emit::Taggable for Meta<'_> {
         false,
       ));
     }
+    // CR3 CMT1-4 Exif / GPS / Canon-MakerNote (#148). The `Image::ExifTool::
+    // Canon::uuid` table re-dispatches each CMT box body — a self-contained TIFF
+    // — through `ProcessTIFF` / `ProcessCMT3` (Canon.pm:9686-9726):
+    //   CMT1 → IFD0    (`Exif::Main`)      → `EXIF:IFD0`
+    //   CMT2 → ExifIFD (`Exif::Main`)      → `EXIF:ExifIFD`
+    //   CMT3 → MakerNoteCanon (`Canon::Main` via `ProcessCMT3`) → `MakerNotes:Canon`
+    //   CMT4 → GPSInfo (`GPS::Main`)       → `EXIF:GPS`
+    // The blocks were parsed EAGERLY at walk time and their tags rendered for
+    // both modes onto `Cr3Meta`; emit the active mode's slice here (the
+    // always-on document axis, regardless of `-ee`).
+    emit_cr3_cmt(self.cr3(), print_conv, &mut tags);
     // HEIF PrimaryItemReference (`%QuickTime::Meta` pitm, QuickTime.pm:2883):
     // the `$$self{PrimaryItem}` id under `QuickTime`/`Meta` (the `%QuickTime::
     // Meta` table `GROUPS => { 1 => 'Meta' }`). No PrintConv (the RawConv
@@ -7065,6 +7078,29 @@ impl crate::emit::Taggable for Meta<'_> {
         false,
       ));
     }
+    // HEIF `File:ImageWidth` / `File:ImageHeight` (#146) from the PRIMARY item's
+    // `ispe` (ImageSpatialExtent, QuickTime.pm:3034-3047). The `ispe` `RawConv`
+    // `FoundTag(ImageWidth/ImageHeight)` runs only for the primary (main-document)
+    // item; the `%Image::ExifTool::Extra` `ImageWidth`/`ImageHeight` tags have
+    // GROUPS `File,File` and no PrintConv ⇒ a bare int in both modes. ImageWidth
+    // BEFORE ImageHeight (the `ispe` RawConv FoundTag order). Oracle
+    // (QuickTime.heic): `File:ImageWidth = 1596`, `File:ImageHeight = 1064`.
+    if let Some(w) = self.heif().image_width() {
+      tags.push(EmittedTag::new(
+        Group::new("File", "File"),
+        "ImageWidth".into(),
+        TagValue::U64(u64::from(w)),
+        false,
+      ));
+    }
+    if let Some(h) = self.heif().image_height() {
+      tags.push(EmittedTag::new(
+        Group::new("File", "File"),
+        "ImageHeight".into(),
+        TagValue::U64(u64::from(h)),
+        false,
+      ));
+    }
 
     // NOTE: the SP3 embedded-Exif hop deferral warning is NOT part of the
     // `Taggable` stream (`run_emission` has no warning channel). It flows
@@ -7072,6 +7108,42 @@ impl crate::emit::Taggable for Meta<'_> {
     // the `ProcessMOV` warning.
     tags.into_iter()
   }
+}
+
+/// Emit the Canon CR3 `CMT1`/`CMT2`/`CMT3`/`CMT4` recovered tags (#148).
+///
+/// The `Image::ExifTool::Canon::uuid` table (Canon.pm:9686-9726) re-dispatches
+/// each CMT box body — a self-contained TIFF block carrying its own `II*\0` /
+/// `MM\0*` header + IFD — through `ProcessTIFF` (CMT1/2/4) or `ProcessCMT3`
+/// (CMT3). The four blocks map to four faithful family-0/1 groups:
+///
+/// | box  | ExifTool `Name`/table          | emitted group        |
+/// |------|--------------------------------|----------------------|
+/// | CMT1 | `IFD0` / `Exif::Main`          | `EXIF:IFD0`          |
+/// | CMT2 | `ExifIFD` / `Exif::Main`       | `EXIF:ExifIFD`       |
+/// | CMT3 | `MakerNoteCanon` / `Canon::Main` | `MakerNotes:Canon` |
+/// | CMT4 | `GPSInfo` / `GPS::Main`        | `EXIF:GPS`           |
+///
+/// The blocks are parsed EAGERLY during the Canon-`uuid` walk
+/// ([`walk_canon_uuid`](crate::formats::quicktime_brands::walk_canon_uuid)),
+/// in the file order ExifTool's `ProcessMOV` encountered them, with
+/// `$$self{Model}` threaded from each preceding CMT1 IFD0 (so a CMT3 before any
+/// CMT1 sees no Model, a model-less CMT1 leaves an earlier Model in place) and
+/// the IFD0 re-stamp / `MakerNotes:Canon` routing / `File:ExifByteOrder`
+/// passthrough applied at the walk. The decoded tags are rendered for BOTH conv
+/// modes and stored on [`Cr3Meta`](crate::metadata::Cr3Meta); this emitter just
+/// pushes the slice for the active mode (the raw box bytes are never retained,
+/// so there is nothing to re-parse here). The sink dedups the three identical
+/// `File:ExifByteOrder` copies. For a real CR3 (one CMT1<CMT2<CMT3<CMT4) the
+/// file order equals the type order ⇒ emission is byte-identical to the prior
+/// re-parse-at-emit pass.
+#[cfg(feature = "alloc")]
+fn emit_cr3_cmt(
+  cr3: &crate::metadata::Cr3Meta,
+  print_conv: bool,
+  out: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  out.extend(cr3.cmt_tags(print_conv).iter().cloned());
 }
 
 /// Emit a timed-metadata GPS sample series faithfully. `extract_embedded=false`
