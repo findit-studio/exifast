@@ -3686,6 +3686,112 @@ mod tests {
     );
   }
 
+  /// #43 packet-segmentation faithfulness: ExifTool's `ProcessOGG`
+  /// accumulates page bodies PER PAGE and processes a packet only when a
+  /// fresh-packet page (`not $flag & 0x01`) arrives — it does NOT split a
+  /// packet at every `lacing < 255` boundary (Ogg.pm:142-188; the page-body
+  /// length is `$dataLen` = SUM of all segment lacing values, Ogg.pm:146-152,
+  /// and continuation pages are concatenated via `$val{$stream} .= $buff`,
+  /// Ogg.pm:171). `parse_inner` mirrors this (`data_len` = `seg_table.iter()
+  /// .sum()`; continuation pages `existing.extend_from_slice(page_bytes)`).
+  ///
+  /// `Vorbis.ogg` is the regression witness: its comment-header packet spans
+  /// page#1 (17 segments, last lacing 255 ⇒ packet continues) into page#2
+  /// (continuation flag `0x01` set). The vendor string, the 1351-byte JPEG
+  /// `CoverArt`, and every comment all live in that spanning packet, so they
+  /// decode ONLY if continuation pages are concatenated before
+  /// `process_packet`. If the engine wrongly split at lacing boundaries the
+  /// header would be truncated mid-`METADATA_BLOCK_PICTURE` and these tags
+  /// would be lost or corrupt.
+  #[test]
+  fn multi_page_vorbis_comment_packet_accumulates_across_pages() {
+    let data = fixture("Vorbis.ogg");
+    // Sanity-pin the fixture's page geometry so this test stays a genuine
+    // multi-page witness even if the fixture is ever regenerated.
+    let geometry = {
+      let mut pages = Vec::new();
+      let mut i = 0usize;
+      while i + 27 <= data.len() {
+        if data.get(i..i + 4) != Some(&b"OggS"[..]) {
+          break;
+        }
+        let flag = data.get(i + 5).copied().unwrap_or(0);
+        let nseg = data.get(i + 26).copied().unwrap_or(0) as usize;
+        let Some(segs) = data.get(i + 27..i + 27 + nseg) else {
+          break;
+        };
+        let dlen: usize = segs.iter().map(|&b| b as usize).sum();
+        let last = segs.last().copied().unwrap_or(0);
+        pages.push((flag, last, dlen));
+        i = i + 27 + nseg + dlen;
+      }
+      pages
+    };
+    // page#1 ends with a 255 lacing value (packet spills over) and page#2
+    // carries the continuation flag 0x01 — the comment header straddles them.
+    assert!(
+      geometry.len() >= 3,
+      "Vorbis.ogg has >= 3 pages: {geometry:?}"
+    );
+    assert_eq!(
+      geometry.get(1).map(|p| p.1),
+      Some(255),
+      "page#1 last lacing == 255 (packet continues): {geometry:?}"
+    );
+    assert_eq!(
+      geometry.get(2).map(|p| p.0 & 0x01),
+      Some(0x01),
+      "page#2 is a continuation (flag 0x01 set): {geometry:?}"
+    );
+
+    let meta = parse_borrowed(&data, true).unwrap();
+    // Tags that live in the spanning packet (matched against
+    // `tests/golden/Vorbis.ogg.json`, captured from
+    // `perl exiftool -G1 -j Vorbis.ogg`). The vendor, the cover-art MIME, and
+    // every comment decode ONLY if the continuation page was concatenated
+    // before `process_packet`.
+    let mut w = TagMap::new();
+    crate::emit::run_emission(
+      &meta,
+      crate::emit::EmitOptions::g1(ConvMode::PrintConv, false),
+      &mut w,
+    );
+    assert_eq!(
+      w.get_str("Vorbis", "Vendor").as_deref(),
+      Some("AO; aoTuV b4b [20051117] (based on Xiph.Org's libVorbis)")
+    );
+    assert_eq!(
+      w.get_str("Vorbis", "CoverArtMIMEType").as_deref(),
+      Some("image/jpeg")
+    );
+    assert_eq!(
+      w.get_str("Vorbis", "Title").as_deref(),
+      Some("A 4s sample for testing embedded cover art")
+    );
+    assert_eq!(w.get_str("Vorbis", "Artist").as_deref(), Some("Who Knows"));
+    // The 1351-byte JPEG cover art lives entirely inside the page-1→page-2
+    // spanning packet (a base64 `COVERART` Vorbis comment). Its emitted value
+    // is the full decoded image (`TagValue::Bytes`), far larger than any single
+    // page body here — so a 1351-byte decode is the multi-page witness: if the
+    // continuation page were dropped the image would be truncated.
+    match w.get("Vorbis", "CoverArt") {
+      Some(TagValue::Bytes(bytes)) => assert_eq!(
+        bytes.len(),
+        1351,
+        "full cover-art image reassembled across the page boundary"
+      ),
+      other => panic!("expected CoverArt bytes, got {other:?}"),
+    }
+
+    // The product JSON path renders the cover art as the bundled `-b`
+    // placeholder (`(Binary data 1351 bytes, …)`) — byte-exact with the golden.
+    let json = crate::parser::extract_info("Vorbis.ogg", &data, true);
+    assert!(
+      json.contains(r#""Vorbis:CoverArt":"(Binary data 1351 bytes, use -b option to extract)""#),
+      "CoverArt JSON placeholder:\n{json}"
+    );
+  }
+
   /// `Taggable::tags` reproduces the Vorbis `List => 1` coalesce as ONE
   /// `EmittedTag` carrying a `TagValue::List` (interleaved multi-value
   /// fixture), driven through `run_emission` — the `-n` value is identical

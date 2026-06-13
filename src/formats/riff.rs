@@ -222,9 +222,15 @@ pub enum RiffValue {
   Str(SmolStr),
   /// An unsigned integer (audio encoding, frame count, dimensions, …).
   U32(u32),
+  /// A 64-bit unsigned integer. Used by the WAV-specific chunks whose raw
+  /// values exceed `u32`: `ds64` `int64u` sizes (RIFF.pm:762-784, rendered
+  /// via `ConvertFileSize`), `bext` `TimeReference` (the combined 64-bit
+  /// sample count `low + high * 2^32`, RIFF.pm:739-744), and
+  /// `NumberOfSamples64` (RIFF.pm:780).
+  U64(u64),
   /// A signed integer (rare — image-height can be negative in BMP V3 to
   /// flag top-to-bottom storage; we apply abs(), so the stored value is
-  /// non-negative).
+  /// non-negative; the `inst` chunk's `int8s` fields, RIFF.pm:824-831).
   I32(i32),
   /// A 32-bit float (rate-derived field like `FrameRate` / `VideoFrameRate`,
   /// `AudioSampleRate`).
@@ -606,9 +612,11 @@ impl<'a> Walker<'a> {
           // LIST_Tdat (Adobe CS3 Bridge) RIFF.pm:411-414 — empty table
           // in bundled; nothing to emit.
           b"Tdat" => {}
-          // LIST_adtl RIFF.pm:437-440 — cue-point sub-chunks (labl/note/
-          // ltxt). Deferred (WAV-side). Skip.
-          b"adtl" => {}
+          // LIST_adtl RIFF.pm:437-440 → `%Main` — cue-point sub-chunks
+          // (labl/note/ltxt, RIFF.pm:369-390).
+          b"adtl" => {
+            process_chunks_adtl(body, &mut self.entries);
+          }
           // LIST_ncdt / LIST_hydt / LIST_pntx — Nikon/Pentax AVI maker
           // notes. Deferred (separate ports).
           b"ncdt" | b"hydt" | b"pntx" => {}
@@ -630,6 +638,39 @@ impl<'a> Walker<'a> {
       };
       match &tag {
         b"fmt " => emit_audio_format(body, &mut self.entries),
+        // WAV-specific sub-chunks (RIFF.pm:360-668). Each is a
+        // `ProcessBinaryData`/`RawConv` table dispatched at the top level.
+        b"bext" => emit_bext(body, &mut self.entries),
+        b"ds64" => emit_ds64(body, &mut self.entries),
+        b"smpl" => emit_smpl(body, &mut self.entries),
+        b"inst" => emit_inst(body, &mut self.entries),
+        b"acid" => emit_acid(body, &mut self.entries),
+        // `fact` NumberOfSamples — RawConv `Get32u(\$val, 0)` (RIFF.pm:512-515).
+        b"fact" => {
+          if body.len() >= 4 {
+            self.entries.push(RiffEntry::new(
+              "RIFF",
+              "NumberOfSamples",
+              RiffValue::U32(le_u32_at(body, 0)),
+            ));
+          }
+        }
+        // `cue ` CuePoints / `plst` Playlist — `Binary => 1` (RIFF.pm:516-524).
+        // No sub-table; the whole chunk renders as the binary placeholder.
+        b"cue " => {
+          self.entries.push(RiffEntry::new(
+            "RIFF",
+            "CuePoints",
+            RiffValue::Str(crate::value::binary_data_placeholder(body.len()).into()),
+          ));
+        }
+        b"plst" => {
+          self.entries.push(RiffEntry::new(
+            "RIFF",
+            "Playlist",
+            RiffValue::Str(crate::value::binary_data_placeholder(body.len()).into()),
+          ));
+        }
         b"IDIT" => emit_idit(body, &mut self.entries),
         b"ISMP" => emit_ismp(body, &mut self.entries),
         // CSET (RIFF.pm:533-536 → `%RIFF::CSET`, ProcessBinaryData int16u):
@@ -1188,6 +1229,440 @@ fn emit_audio_format(payload: &[u8], entries: &mut Vec<RiffEntry>) {
   ));
 }
 
+/// Read a fixed-width `string[N]` field at byte `off` (faithful to ExifTool's
+/// `ReadValue($_, 'string', N)` — exactly `N` bytes, trailing NULs trimmed,
+/// invalid UTF-8 rendered as `?` per the JSON FixUTF8 step). Returns `None`
+/// when the window runs past the chunk (a short read ⇒ no emission, matching
+/// `ProcessBinaryData`'s skip of an out-of-range entry).
+#[cfg(feature = "alloc")]
+fn string_field(payload: &[u8], off: usize, len: usize) -> Option<String> {
+  payload
+    .get(off..off.saturating_add(len))
+    .map(string_trim_nulls)
+}
+
+/// `bext` BroadcastExtension (RIFF.pm:712-759) — the Broadcast Audio Extension
+/// chunk (EBU Tech 3285). `ProcessBinaryData` over fixed-offset fields. All
+/// emit under family-1 `RIFF` (the table declares only `GROUPS{2}=Audio`).
+///
+/// `DateTimeOriginal` runs the date ValueConv `tr/-/:/; s/^(\d{4}:\d{2}:\d{2})
+/// /$1 /` (RIFF.pm:736); `TimeReference` combines the `int32u[2]` pair into the
+/// 64-bit sample count `low + high * 2^32` (RIFF.pm:743); `BWF_UMID` is the
+/// `undef[64]` hex-encoded, uppercased, with a single trailing `0{64}` group
+/// stripped (RIFF.pm:752); `CodingHistory` is `string[$size-602]`
+/// (RIFF.pm:755-758) — emitted only when the chunk extends past offset 602.
+#[cfg(feature = "alloc")]
+fn emit_bext(payload: &[u8], entries: &mut Vec<RiffEntry>) {
+  // 0: Description string[256].
+  if let Some(s) = string_field(payload, 0, 256) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "Description",
+      RiffValue::Str(s.into()),
+    ));
+  }
+  // 256: Originator string[32].
+  if let Some(s) = string_field(payload, 256, 32) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "Originator",
+      RiffValue::Str(s.into()),
+    ));
+  }
+  // 288: OriginatorReference string[32].
+  if let Some(s) = string_field(payload, 288, 32) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "OriginatorReference",
+      RiffValue::Str(s.into()),
+    ));
+  }
+  // 320: DateTimeOriginal string[18] + date ValueConv (RIFF.pm:731-738).
+  if let Some(raw) = string_field(payload, 320, 18) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "DateTimeOriginal",
+      RiffValue::Str(bext_datetime_value_conv(&raw).into()),
+    ));
+  }
+  // 338: TimeReference int32u[2] → low + high * 2^32 (RIFF.pm:739-744).
+  if payload.len() >= 346 {
+    let low = le_u32_at(payload, 338) as u64;
+    let high = le_u32_at(payload, 342) as u64;
+    let combined = low.wrapping_add(high.wrapping_mul(4_294_967_296));
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "TimeReference",
+      RiffValue::U64(combined),
+    ));
+  }
+  // 346: BWFVersion int16u (RIFF.pm:745-748).
+  if payload.len() >= 348 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "BWFVersion",
+      RiffValue::U32(le_u16_at(payload, 346) as u32),
+    ));
+  }
+  // 348: BWF_UMID undef[64] → hex, strip trailing 0{64}, uppercase
+  // (RIFF.pm:749-753).
+  if let Some(window) = payload.get(348..348usize.saturating_add(64)) {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "BWF_UMID",
+      RiffValue::Str(bext_umid_value_conv(window).into()),
+    ));
+  }
+  // 602: CodingHistory string[$size-602] (RIFF.pm:755-758). Emitted only when
+  // the chunk extends past 602 (a positive `$size-602` count).
+  if payload.len() > 602
+    && let Some(s) = string_field(payload, 602, payload.len() - 602)
+  {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "CodingHistory",
+      RiffValue::Str(s.into()),
+    ));
+  }
+}
+
+/// `bext` `DateTimeOriginal` ValueConv (RIFF.pm:736):
+/// `$_=$val; tr/-/:/; s/^(\d{4}:\d{2}:\d{2})/$1 /; $_`. Translates every `-`
+/// to `:` then inserts a space after a leading `yyyy:mm:dd`.
+#[cfg(feature = "alloc")]
+fn bext_datetime_value_conv(raw: &str) -> String {
+  // `tr/-/:/` — every hyphen becomes a colon.
+  let translated: String = raw
+    .chars()
+    .map(|c| if c == '-' { ':' } else { c })
+    .collect();
+  // `s/^(\d{4}:\d{2}:\d{2})/$1 /` — anchored at start: 4 digits, ':', 2 digits,
+  // ':', 2 digits ⇒ insert a single space after the 10-char date.
+  let b = translated.as_bytes();
+  let is_date_prefix = b.len() >= 10
+    && b.first().is_some_and(u8::is_ascii_digit)
+    && b.get(1).is_some_and(u8::is_ascii_digit)
+    && b.get(2).is_some_and(u8::is_ascii_digit)
+    && b.get(3).is_some_and(u8::is_ascii_digit)
+    && b.get(4) == Some(&b':')
+    && b.get(5).is_some_and(u8::is_ascii_digit)
+    && b.get(6).is_some_and(u8::is_ascii_digit)
+    && b.get(7) == Some(&b':')
+    && b.get(8).is_some_and(u8::is_ascii_digit)
+    && b.get(9).is_some_and(u8::is_ascii_digit);
+  if is_date_prefix {
+    let (date, rest) = translated.split_at(10);
+    std::format!("{date} {rest}")
+  } else {
+    translated
+  }
+}
+
+/// `bext` `BWF_UMID` ValueConv (RIFF.pm:752):
+/// `$_=unpack("H*",$val); s/0{64}$//; uc $_`. Lowercase hex of the 64 raw
+/// bytes (128 hex chars), strip a single trailing run of exactly 64 `0`s, then
+/// uppercase the whole string.
+#[cfg(feature = "alloc")]
+fn bext_umid_value_conv(window: &[u8]) -> String {
+  // `unpack("H*", $val)` — lowercase hex, high nibble first.
+  let mut hex = String::with_capacity(window.len().saturating_mul(2));
+  for &b in window {
+    hex.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+    hex.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+  }
+  // `s/0{64}$//` — remove a trailing run of EXACTLY 64 '0' chars (anchored at
+  // end). Perl's `0{64}` matches 64 consecutive zeros; a longer trailing run
+  // leaves the excess (matches the LAST 64). We strip the final 64 chars iff
+  // they are all '0'.
+  if hex.len() >= 64
+    && hex
+      .get(hex.len() - 64..)
+      .is_some_and(|tail| tail.bytes().all(|c| c == b'0'))
+  {
+    hex.truncate(hex.len() - 64);
+  }
+  // `uc $_`.
+  hex.to_ascii_uppercase()
+}
+
+/// `ds64` DataSize64 chunk (RIFF.pm:762-784) — 64-bit sizes for MBWF/RF64
+/// files. `FORMAT => 'int64u'`: `RIFFSize64` (0), `DataSize64` (1),
+/// `NumberOfSamples64` (2). The first two render via `ConvertFileSize`
+/// (applied at emit time); `NumberOfSamples64` has no PrintConv. The trailing
+/// chunk-override table (RIFF.pm:781-783) is NOT implemented (bundled doesn't
+/// either).
+#[cfg(feature = "alloc")]
+fn emit_ds64(payload: &[u8], entries: &mut Vec<RiffEntry>) {
+  if payload.len() >= 8 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "RIFFSize64",
+      RiffValue::U64(le_u64_at(payload, 0)),
+    ));
+  }
+  if payload.len() >= 16 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "DataSize64",
+      RiffValue::U64(le_u64_at(payload, 8)),
+    ));
+  }
+  if payload.len() >= 24 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "NumberOfSamples64",
+      RiffValue::U64(le_u64_at(payload, 16)),
+    ));
+  }
+}
+
+/// `smpl` Sampler chunk (RIFF.pm:787-818) — `FORMAT => 'int32u'`. Nine
+/// int32u scalars (offsets 0..32) then `SamplerData undef[$size-40]` at byte
+/// 36. `SMPTEFormat` (5) takes a hash PrintConv; `SMPTEOffset` (6) takes the
+/// `HH:MM:SS:FF` hex ValueConv (RIFF.pm:809-813); `SamplerData` (9) is the
+/// binary placeholder, emitted only when `$size >= 40` (a non-negative
+/// `undef[$size-40]` count — verified vs bundled: `$size=36` ⇒ no emission,
+/// `$size=40` ⇒ "0 bytes").
+#[cfg(feature = "alloc")]
+fn emit_smpl(payload: &[u8], entries: &mut Vec<RiffEntry>) {
+  // int32u scalars 0..=8 at byte offsets 0,4,...,32. Each emits independently
+  // when its 4-byte window is in range (ProcessBinaryData skips out-of-range).
+  const NAMES: [&str; 9] = [
+    "Manufacturer",
+    "Product",
+    "SamplePeriod",
+    "MIDIUnityNote",
+    "MIDIPitchFraction",
+    "SMPTEFormat",
+    "SMPTEOffset",
+    "NumSampleLoops",
+    "SamplerDataLen",
+  ];
+  for (i, name) in NAMES.iter().enumerate() {
+    let off = i.saturating_mul(4);
+    if payload.len() < off.saturating_add(4) {
+      break;
+    }
+    let raw = le_u32_at(payload, off);
+    let value = if *name == "SMPTEOffset" {
+      // ValueConv: 8-hex-digit `HH:MM:SS:FF` (RIFF.pm:809-813).
+      RiffValue::Str(smpte_offset_value_conv(raw).into())
+    } else {
+      RiffValue::U32(raw)
+    };
+    entries.push(RiffEntry::new("RIFF", name, value));
+  }
+  // 9: SamplerData undef[$size-40] at byte 36 (RIFF.pm:817). `$size` = chunk
+  // payload length. Emit iff `$size - 40 >= 0` (a non-negative count).
+  if payload.len() >= 40 {
+    let data_len = payload.len() - 40;
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "SamplerData",
+      RiffValue::Str(crate::value::binary_data_placeholder(data_len).into()),
+    ));
+  }
+}
+
+/// `smpl` `SMPTEOffset` ValueConv (RIFF.pm:809-813):
+/// `sprintf('%.8x', $val)` then `s/(..)(..)(..)(..)/$1:$2:$3:$4/` ⇒
+/// 8-hex-digit value split into four colon-separated byte pairs `HH:MM:SS:FF`.
+#[cfg(feature = "alloc")]
+fn smpte_offset_value_conv(val: u32) -> String {
+  let hex = std::format!("{val:08x}");
+  // The hex is always exactly 8 chars; split into 4 pairs.
+  let b = hex.as_bytes();
+  let pair = |i: usize| -> &str {
+    b.get(i..i + 2)
+      .and_then(|s| core::str::from_utf8(s).ok())
+      .unwrap_or("00")
+  };
+  std::format!("{}:{}:{}:{}", pair(0), pair(2), pair(4), pair(6))
+}
+
+/// `inst` Instrument chunk (RIFF.pm:821-832) — `FORMAT => 'int8s'`. Seven
+/// signed-byte fields. All emit under family-1 `RIFF`.
+#[cfg(feature = "alloc")]
+fn emit_inst(payload: &[u8], entries: &mut Vec<RiffEntry>) {
+  const NAMES: [&str; 7] = [
+    "UnshiftedNote",
+    "FineTune",
+    "Gain",
+    "LowNote",
+    "HighNote",
+    "LowVelocity",
+    "HighVelocity",
+  ];
+  for (i, name) in NAMES.iter().enumerate() {
+    if payload.len() <= i {
+      break;
+    }
+    entries.push(RiffEntry::new(
+      "RIFF",
+      name,
+      RiffValue::I32(le_i8_at(payload, i) as i32),
+    ));
+  }
+}
+
+/// `acid` Acidizer chunk (RIFF.pm:1500-1545) — written by Acidizer.
+/// `AcidizerFlags` (0, int32u) takes the BITMASK PrintConv; `RootNote` (4,
+/// int16u) the note-name hash; `Beats` (12, int32u); `Meter` (16, int16u[2])
+/// the swap PrintConv (stored "DEN NUM"); `Tempo` (20, float).
+#[cfg(feature = "alloc")]
+fn emit_acid(payload: &[u8], entries: &mut Vec<RiffEntry>) {
+  // 0: AcidizerFlags int32u.
+  if payload.len() >= 4 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "AcidizerFlags",
+      RiffValue::U32(le_u32_at(payload, 0)),
+    ));
+  }
+  // 4: RootNote int16u.
+  if payload.len() >= 6 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "RootNote",
+      RiffValue::U32(le_u16_at(payload, 4) as u32),
+    ));
+  }
+  // 12: Beats int32u.
+  if payload.len() >= 16 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "Beats",
+      RiffValue::U32(le_u32_at(payload, 12)),
+    ));
+  }
+  // 16: Meter int16u[2] — stored space-joined "DEN NUM" (the ReadValue of an
+  // int16u[2]); the swap to "NUM/DEN" is the PrintConv (RIFF.pm:1536-1540).
+  if payload.len() >= 20 {
+    let den = le_u16_at(payload, 16);
+    let num = le_u16_at(payload, 18);
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "Meter",
+      RiffValue::Str(std::format!("{den} {num}").into()),
+    ));
+  }
+  // 20: Tempo float.
+  if payload.len() >= 24 {
+    entries.push(RiffEntry::new(
+      "RIFF",
+      "Tempo",
+      RiffValue::F64(le_f32_at(payload, 20) as f64),
+    ));
+  }
+}
+
+/// `labl`/`note` ValueConv (RIFF.pm:372/377): `my $str=substr($val,4);
+/// $str=~s/\0+$//; unpack("V",$val) . " " . $str`. The leading `int32u`
+/// cue-point ID, a space, then the trailing NUL-trimmed text. Shared by both
+/// `CuePointLabel` and `CuePointNote` (identical conv). Returns `None` when
+/// the payload is shorter than the 4-byte ID.
+#[cfg(feature = "alloc")]
+fn cue_label_value_conv(payload: &[u8]) -> Option<String> {
+  if payload.len() < 4 {
+    return None;
+  }
+  let id = le_u32_at(payload, 0);
+  let text = payload.get(4..).map(string_trim_nulls).unwrap_or_default();
+  Some(std::format!("{id} {text}"))
+}
+
+/// `ltxt` LabeledText ValueConv (RIFF.pm:383-389):
+/// `my @a = unpack('VVa4vvvv', $val); $a[2] = "'$a[2]'"; my $txt =
+/// substr($val,18); $txt=~s/\0+$//; return join(' ', @a, $txt)`. Fields:
+/// CuePointID Length Purpose(quoted 4-byte FourCC) Country Language Dialect
+/// Codepage, then the NUL-trimmed text. Returns `None` when the payload is
+/// shorter than the 18-byte fixed header.
+#[cfg(feature = "alloc")]
+fn ltxt_value_conv(payload: &[u8]) -> Option<String> {
+  if payload.len() < 18 {
+    return None;
+  }
+  let cue_id = le_u32_at(payload, 0);
+  let length = le_u32_at(payload, 4);
+  // `a4` — 4 raw bytes verbatim (Perl `a4` keeps trailing NULs AND spaces, NO
+  // trim — unlike `A4`). The bytes pass straight through the ValueConv (no
+  // `\x`-escape regex, unlike `render_fourcc`); invalid UTF-8 renders as `?`
+  // (the JSON FixUTF8 step) and any NUL is removed by the JSON `tr/\0//d`. So
+  // a Purpose of `b"rgn "` stays `'rgn '` (trailing space KEPT — verified vs
+  // bundled 13.59).
+  let purpose_bytes = fourcc_at(payload, 8);
+  let purpose = crate::convert::fix_utf8(&purpose_bytes);
+  let country = le_u16_at(payload, 12);
+  let language = le_u16_at(payload, 14);
+  let dialect = le_u16_at(payload, 16);
+  // `vvvv` is 4 `int16u`; the 4th (Codepage) is at byte 18 — but `unpack`
+  // reads only as many as the buffer has. ExifTool's `unpack('VVa4vvvv', $val)`
+  // on an 18-byte-minimum buffer yields Country/Language/Dialect from bytes
+  // 12/14/16 and Codepage from byte 18 (absent ⇒ undef ⇒ empty in the join).
+  let codepage_present = payload.len() >= 20;
+  let codepage = if codepage_present {
+    Some(le_u16_at(payload, 18))
+  } else {
+    None
+  };
+  // `$txt = substr($val, 18)` — the text starts at byte 18 (NOT 20); the
+  // `vvvv` overlaps the text region for short records, but ExifTool slices the
+  // text from offset 18 regardless.
+  let text = payload.get(18..).map(string_trim_nulls).unwrap_or_default();
+  // `join(' ', @a, $txt)` — @a is the 7 unpacked fields (Purpose already
+  // quoted); a missing trailing int16u contributes an empty field.
+  let mut out = std::format!("{cue_id} {length} '{purpose}' {country} {language} {dialect}");
+  match codepage {
+    Some(cp) => out.push_str(&std::format!(" {cp}")),
+    None => out.push(' '),
+  }
+  out.push(' ');
+  out.push_str(&text);
+  Some(out)
+}
+
+/// Walk an `adtl` LIST body (RIFF.pm:437-440 → `%Main`) emitting the
+/// `labl`/`note`/`ltxt` cue-point sub-chunks (RIFF.pm:369-390). Each is a
+/// `(FOURCC, le-u32 length, payload)` triplet with odd-length padding, like
+/// the top-level walker. All three carry `Priority => 0` ("so they are stored
+/// in sequence"): the tag NAME (`CuePointLabel`/`CuePointNote`/`LabeledText`)
+/// is fixed per sub-chunk type regardless of the embedded cue-point ID, so a
+/// second sub-chunk of the same type collides on `(group, name)` and ExifTool
+/// keeps the FIRST-extracted. We route every emission through
+/// [`push_priority0`] to model that walk-first-wins survivor.
+#[cfg(feature = "alloc")]
+fn process_chunks_adtl(body: &[u8], entries: &mut Vec<RiffEntry>) {
+  let mut p: usize = 0;
+  while body.len().saturating_sub(p) >= 8 {
+    let tag = fourcc_at(body, p);
+    let len = le_u32_at(body, p + 4) as usize;
+    let payload_start = p + 8;
+    let Some(payload) = body.get(payload_start..payload_start.saturating_add(len)) else {
+      break; // declared length runs past the LIST body — stop (faithful skip)
+    };
+    match &tag {
+      b"labl" => {
+        if let Some(v) = cue_label_value_conv(payload) {
+          push_priority0(entries, "RIFF", "CuePointLabel", RiffValue::Str(v.into()));
+        }
+      }
+      b"note" => {
+        if let Some(v) = cue_label_value_conv(payload) {
+          push_priority0(entries, "RIFF", "CuePointNote", RiffValue::Str(v.into()));
+        }
+      }
+      b"ltxt" => {
+        if let Some(v) = ltxt_value_conv(payload) {
+          push_priority0(entries, "RIFF", "LabeledText", RiffValue::Str(v.into()));
+        }
+      }
+      _ => {}
+    }
+    // Advance past payload + odd-length pad byte (RIFF.pm:2140).
+    p = payload_start.saturating_add(len).saturating_add(len & 1);
+  }
+}
+
 /// `%AVIHeader` — RIFF.pm:1076-1108. `int32u` table at offsets 0/1/4/6/8/9
 /// drives FrameRate/MaxDataRate/FrameCount/StreamCount/ImageWidth/Height.
 fn emit_avi_header(payload: &[u8], entries: &mut Vec<RiffEntry>) {
@@ -1332,8 +1807,9 @@ fn emit_stream_header(payload: &[u8], entries: &mut Vec<RiffEntry>) -> Option<[u
 
 /// Push an entry honoring `Priority => 0` first-wins: if a `(group, name)`
 /// pair is already present in `entries`, drop the new value. Used by
-/// [`emit_stream_header`] for the `%StreamHeader` table (RIFF.pm:1165) and
-/// any other table that carries PRIORITY=0.
+/// [`emit_stream_header`] for the `%StreamHeader` table (RIFF.pm:1165), by
+/// [`process_chunks_adtl`] for the `labl`/`note`/`ltxt` cue-point tags
+/// (RIFF.pm:371-390), and any other table that carries PRIORITY=0.
 fn push_priority0(
   entries: &mut Vec<RiffEntry>,
   group: &'static str,
@@ -2021,6 +2497,36 @@ fn fourcc_at(buf: &[u8], off: usize) -> [u8; 4] {
     .unwrap_or([0; 4])
 }
 
+/// Read a little-endian `u64` at byte offset `off` — the checked form of
+/// `le_u64(&buf[off..off + 8])` (Phase C S2; see [`le_u16_at`]). Used by the
+/// `ds64` `int64u` table (RIFF.pm:762-784).
+#[inline(always)]
+fn le_u64_at(buf: &[u8], off: usize) -> u64 {
+  buf
+    .get(off..off.saturating_add(8))
+    .and_then(|s| <[u8; 8]>::try_from(s).ok())
+    .map_or(0, u64::from_le_bytes)
+}
+
+/// Read a signed `int8s` at byte offset `off` — the `inst` chunk's fields
+/// (RIFF.pm:824-831, `FORMAT => 'int8s'`). Out-of-range ⇒ `0` (every caller
+/// guards the length first ⇒ byte-identical).
+#[inline(always)]
+fn le_i8_at(buf: &[u8], off: usize) -> i8 {
+  buf.get(off).map_or(0, |&b| b as i8)
+}
+
+/// Read a little-endian 32-bit `float` at byte offset `off` — the `acid`
+/// `Tempo` field (RIFF.pm:1542-1544, `Format => 'float'`). The decoded `f32`
+/// is widened to `f64` for [`RiffValue::F64`].
+#[inline(always)]
+fn le_f32_at(buf: &[u8], off: usize) -> f32 {
+  buf
+    .get(off..off.saturating_add(4))
+    .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    .map_or(0.0, f32::from_le_bytes)
+}
+
 // ===========================================================================
 // §7. `Taggable` — the golden tag-emission stream
 // ===========================================================================
@@ -2128,6 +2634,15 @@ fn emit_one(entry: &RiffEntry, print_conv: bool) -> crate::emit::EmittedTag {
       }
     }
     RiffValue::I32(n) => TagValue::I64(*n as i64),
+    RiffValue::U64(n) => {
+      // PrintConv dispatch for 64-bit values (ds64 `ConvertFileSize`) —
+      // applied only in `-j` mode; otherwise the raw `u64` is emitted.
+      if print_conv && let Some(printed) = print_conv_u64(name, *n) {
+        TagValue::Str(printed.into())
+      } else {
+        TagValue::U64(*n)
+      }
+    }
     RiffValue::U32(n) => {
       // PrintConv dispatch — applied only in `-j` mode.
       if print_conv && let Some(printed) = print_conv_u32(group, name, *n) {
@@ -2186,8 +2701,33 @@ fn print_conv_str(group: &str, name: &str, val: &str) -> Option<String> {
     // "7318 0 3.430307 1" ⇒ "7318 frames captured; 0 dropped; Data rate
     // 3.430307; OK").
     ("RIFF", "Statistics") => Some(stat_print_conv(val)),
+    // `acid` `Meter` int16u[2] (RIFF.pm:1536-1540). The ValueConv space-joins
+    // the two ints as "DENOMINATOR NUMERATOR" (ReadValue of `int16u[2]`); the
+    // PrintConv `$val =~ s/(\d+) (\d+)/$2\/$1/` swaps them to "NUMERATOR/
+    // DENOMINATOR". A value not matching `\d+ \d+` passes through unchanged.
+    ("RIFF", "Meter") => Some(acidizer_meter_print(val)),
     _ => None,
   }
+}
+
+/// `acid` `Meter` PrintConv (RIFF.pm:1539) — `s/(\d+) (\d+)/$2\/$1/`. Swaps
+/// the first two whitespace-free decimal runs "A B" → "B/A". A value that
+/// does not match the pattern is returned verbatim (faithful to Perl's `s///`
+/// no-op on a non-match).
+#[cfg(feature = "alloc")]
+fn acidizer_meter_print(val: &str) -> String {
+  // The stored value is always exactly "DEN NUM" from `read_int16u_pair`; the
+  // Perl regex matches the FIRST "\d+ \d+" anywhere in the string and swaps.
+  let mut parts = val.splitn(2, ' ');
+  if let (Some(a), Some(b)) = (parts.next(), parts.next())
+    && !a.is_empty()
+    && a.bytes().all(|c| c.is_ascii_digit())
+    && !b.is_empty()
+    && b.bytes().all(|c| c.is_ascii_digit())
+  {
+    return std::format!("{b}/{a}");
+  }
+  val.to_string()
 }
 
 /// PrintConv for f64 values whose `-j` rendering is a STRING. `RIFF:Length`
@@ -2269,8 +2809,125 @@ fn print_conv_u32(group: &str, name: &str, val: u32) -> Option<String> {
         None
       }
     }
+    // `acid` Acidizer (RIFF.pm:1500-1545).
+    ("RIFF", "AcidizerFlags") => Some(acidizer_flags_print(val)),
+    // `RootNote` / `SMPTEFormat` are plain `PrintConv => { ... }` hashes with
+    // NO `OTHER`/`PrintHex` (RIFF.pm:1508-1531 / 797-805), so a hash MISS
+    // renders ExifTool's generic fallback `Unknown ($val)` with the DECIMAL
+    // `$val` (ExifTool.pm:3622), NOT a raw number.
+    ("RIFF", "RootNote") => Some(
+      acidizer_root_note_label(val).map_or_else(|| std::format!("Unknown ({val})"), str::to_string),
+    ),
+    // `smpl` Sampler `SMPTEFormat` hash (RIFF.pm:796-805).
+    ("RIFF", "SMPTEFormat") => {
+      Some(smpte_format_label(val).map_or_else(|| std::format!("Unknown ({val})"), str::to_string))
+    }
     _ => None,
   }
+}
+
+/// PrintConv for `u64`-typed values. The `ds64` `RIFFSize64`/`DataSize64`
+/// fields render via `ConvertFileSize` (RIFF.pm:772/778). `NumberOfSamples64`
+/// (RIFF.pm:780) and `bext` `TimeReference` (RIFF.pm:739-744) have NO
+/// PrintConv ⇒ `None` (raw integer emission).
+#[cfg(feature = "alloc")]
+fn print_conv_u64(name: &str, val: u64) -> Option<String> {
+  match name {
+    "RIFFSize64" | "DataSize64" => Some(convert_file_size_decimal(val)),
+    _ => None,
+  }
+}
+
+/// Faithful `ConvertFileSize` (ExifTool.pm:6851-6871), the default decimal
+/// (`else`) branch — the `ByteUnit eq 'Binary'` arm is gated on the
+/// `ByteUnit` option which this read path does not expose (YAGNI; consistent
+/// with the no-options deferrals, mirrors `parser.rs::convert_file_size`).
+/// Perl `sprintf("%.1f"/"%.0f", …)` rounds half-to-even on the IEEE-754
+/// quotients, byte-identical to Rust `{:.1}`/`{:.0}` (verified vs bundled
+/// 13.59: 5000000 → "5.0 MB", 4000000 → "4.0 MB").
+#[cfg(feature = "alloc")]
+fn convert_file_size_decimal(val: u64) -> String {
+  let v = val as f64;
+  if val < 2000 {
+    std::format!("{val} bytes")
+  } else if val < 10000 {
+    std::format!("{:.1} kB", v / 1000.0)
+  } else if val < 2_000_000 {
+    std::format!("{:.0} kB", v / 1000.0)
+  } else if val < 10_000_000 {
+    std::format!("{:.1} MB", v / 1_000_000.0)
+  } else if val < 2_000_000_000 {
+    std::format!("{:.0} MB", v / 1_000_000.0)
+  } else if val < 10_000_000_000 {
+    std::format!("{:.1} GB", v / 1_000_000_000.0)
+  } else {
+    std::format!("{:.0} GB", v / 1_000_000_000.0)
+  }
+}
+
+/// `acid` `AcidizerFlags` BITMASK PrintConv (RIFF.pm:1506-1512). DecodeBits
+/// over a 32-bit word (default `BitsPerWord`); bit `n` → label or `"[n]"`,
+/// joined with `", "`, `0` → `"(none)"`.
+#[cfg(feature = "alloc")]
+fn acidizer_flags_print(val: u32) -> String {
+  const FLAGS: &[(u8, &str)] = &[
+    (0, "One shot"),
+    (1, "Root note set"),
+    (2, "Stretch"),
+    (3, "Disk-based"),
+    (4, "High octave"),
+  ];
+  crate::convert::decode_bits(&val.to_string(), Some(FLAGS), 0)
+}
+
+/// `acid` `RootNote` hash PrintConv (RIFF.pm:1517-1530). MIDI note numbers
+/// `0x30..=0x47` map to note names (`0x30 => C`, `0x3c => High C`, …). Returns
+/// `None` for an unlisted key; the caller renders the generic
+/// `Unknown ($val)` fallback (this plain hash has no `OTHER`/`PrintHex`).
+#[cfg(feature = "alloc")]
+const fn acidizer_root_note_label(val: u32) -> Option<&'static str> {
+  Some(match val {
+    0x30 => "C",
+    0x31 => "C#",
+    0x32 => "D",
+    0x33 => "D#",
+    0x34 => "E",
+    0x35 => "F",
+    0x36 => "F#",
+    0x37 => "G",
+    0x38 => "G#",
+    0x39 => "A",
+    0x3a => "A#",
+    0x3b => "B",
+    0x3c => "High C",
+    0x3d => "High C#",
+    0x3e => "High D",
+    0x3f => "High D#",
+    0x40 => "High E",
+    0x41 => "High F",
+    0x42 => "High F#",
+    0x43 => "High G",
+    0x44 => "High G#",
+    0x45 => "High A",
+    0x46 => "High A#",
+    0x47 => "High B",
+    _ => return None,
+  })
+}
+
+/// `smpl` `SMPTEFormat` hash PrintConv (RIFF.pm:798-804). Returns `None` for
+/// an unlisted key; the caller renders the generic `Unknown ($val)` fallback
+/// (this plain hash has no `OTHER`/`PrintHex`).
+#[cfg(feature = "alloc")]
+const fn smpte_format_label(val: u32) -> Option<&'static str> {
+  Some(match val {
+    0 => "none",
+    24 => "24 fps",
+    25 => "25 fps",
+    29 => "29 fps",
+    30 => "30 fps",
+    _ => return None,
+  })
 }
 
 /// PrintConv for f64 values whose `-j` rendering rounds (FrameRate /
