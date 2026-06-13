@@ -905,10 +905,18 @@ pub fn parse_in_tiff(
           }
         }
         _ => {
-          // Deferred sub-table (Panorama / MyColors / FaceDetect1 / FaceDetect2
-          // / ContrastInfo / WBInfo / ProcessingInfo / MovieInfo / LensInfo —
-          // `is_walked() == false`). A SubDirectory row DESCENDS into a child
-          // table and NEVER emits the parent pointer as a value: ExifTool's
+          // Every deferred Canon::Main SubDirectory (`is_walked() == false`):
+          // the Phase-2 raw set (Panorama / MyColors / FaceDetect1 / FaceDetect2
+          // / ContrastInfo / WBInfo / ProcessingInfo / MovieInfo / LensInfo) PLUS
+          // the #223 swept-from-`None` set (CameraInfo / CropInfo /
+          // CustomFunctions{,1D,2} / AspectInfo / MeasuredColor / ColorData /
+          // AFMicroAdj / UnknownD30 / FaceDetect3 / TimeInfo / PersonalFunctions
+          // / PersonalFunctionValues / CanonFlags / ModifiedInfo /
+          // PreviewImageInfo / ColorInfo / VignettingCorr{,2} / LightingOpt /
+          // AmbienceInfo / MultiExp / FilterInfo / HDRInfo / LogInfo / AFConfig /
+          // RawBurstModeRoll / FocusBracketingInfo / LevelInfo). A SubDirectory
+          // row DESCENDS into a child table and NEVER emits the parent pointer as
+          // a value: ExifTool's
           // `ProcessExif` enters the `if ($subdir)` block (`Exif.pm:6919`),
           // processes the sub-directory, then hits `next unless $doMaker or
           // $$et{REQ_TAG_LOOKUP}{…} or $$tagInfo{BlockExtract}`
@@ -942,6 +950,46 @@ pub fn parse_in_tiff(
       // `internal_serial_number` stays unset. Previously this arm emitted the
       // raw `SerialInfo` value, leaking a bogus `Canon:SerialInfo` parent that
       // ExifTool never emits.
+    } else if entry.tag_id == 0x28 {
+      // `ImageUniqueID` (`Canon.pm:1726-1735`): the table forces
+      // `Format => 'undef'`, so the walker captured the ORIGINAL on-disk
+      // value bytes as `RawValue::Bytes` ([`body::walk_canon_in_tiff`]) —
+      // ExifTool reads `int8u[16]` / `int16u[8]` / `int32u[4]` / `undef[16]`
+      // / `float[4]` / `double[2]` / `rational[2]` all as the SAME literal
+      // bytes (the verbose dump: `int8u[16] read as undef[16]`;
+      // oracle-verified identical hex across every shape and both byte
+      // orders). `RawConv => '$val eq "\0" x 16 ? undef : $val'` drops the
+      // value ONLY when it is EXACTLY sixteen NUL bytes (Perl string
+      // equality — NOT `/^\0+$/`, so a SHORT all-zero value of any other
+      // length is NOT dropped); `ValueConv => 'unpack("H*", $val)'` renders
+      // the survivor as lowercase hex. Operate on the original undef bytes,
+      // never the lossy numeric decode.
+      let val_bytes: &[u8] = match &entry.value {
+        // The faithful `Format => 'undef'` view captured at walk time.
+        RawValue::Bytes(b) => b,
+        // Defensive: if the walker did not rewrite this entry (it always
+        // does for an in-bounds 0x28), treat as no value — emit nothing.
+        _ => &[],
+      };
+      // `$val eq "\0" x 16` — EXACTLY sixteen NUL bytes (oracle: an all-zero
+      // `int8u[16]` is dropped, but an all-zero `int8u[8]` emits
+      // "0000000000000000"). A length other than 16 — or any non-NUL byte —
+      // is NOT equal and survives the RawConv.
+      let is_undef = val_bytes.len() == 16 && val_bytes.iter().all(|&b| b == 0);
+      if is_undef {
+        // RawConv undef ⇒ tag not extracted (emit NOTHING; the typed
+        // `image_unique_id` stays unset).
+      } else {
+        let hex = hex_lower(val_bytes);
+        typed.image_unique_id = Some(SmolStr::from(&hex));
+        // No `PrintConv` on 0x28, so `-j` and `-n` agree (the ValueConv hex
+        // is the final value). `Writable`, non-`Unknown` ⇒ `unknown = false`.
+        emissions.push(VendorEmission::new(
+          "ImageUniqueID".into(),
+          TagValue::Str(SmolStr::from(hex)),
+          false,
+        ));
+      }
     } else {
       // Leaf tag: apply PrintConv + emit. `model` threads the parent
       // body `$$self{Model}` into the conditional SerialNumber PrintConv
@@ -950,7 +998,7 @@ pub fn parse_in_tiff(
       // (`Canon.pm:1840-1845`) — the `0xff` strip already ran in
       // `walk_canon_in_tiff`.
       let val = def.conv().apply(&entry.value, print_conv, model);
-      populate_typed(&mut typed, entry, &val);
+      populate_typed(&mut typed, entry);
       // Carry the tag's `Unknown` flag (the single Unknown Canon::Main tag,
       // `0x03 CanonFlashInfo`, lands here); the engine suppresses it.
       emissions.push(VendorEmission::new(
@@ -989,8 +1037,11 @@ pub fn parse_into_metadata(
   }
 }
 
-/// Populate the typed struct from one Main-IFD leaf-tag emission.
-fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry, val: &TagValue) {
+/// Populate the typed struct from one Main-IFD leaf-tag emission. Reads the
+/// entry's pre-PrintConv [`RawValue`] directly (every typed source here is a
+/// string/integer leaf, not a PrintConv string), so the converted `TagValue`
+/// is not needed.
+fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry) {
   match entry.tag_id {
     0x06 => {
       if let RawValue::Text { text: s, .. } = &entry.value {
@@ -1030,12 +1081,9 @@ fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry, val: &TagValu
         typed.model_name = model_ids::lookup_name(id);
       }
     }
-    0x28 => {
-      // ImageUniqueID — undef[16]; PrintConv emits hex.
-      if let TagValue::Str(s) = val {
-        typed.image_unique_id = Some(s.clone());
-      }
-    }
+    // 0x28 (`ImageUniqueID`) is handled in the dispatch loop's dedicated
+    // `Format => 'undef'` arm (raw-byte RawConv + hex ValueConv) and never
+    // reaches the generic leaf path, so it has no `populate_typed` case.
     0x95 => {
       if let RawValue::Text { text: s, .. } = &entry.value {
         typed.lens_model_string = Some(s.as_str().into());
@@ -1101,6 +1149,17 @@ fn first4_all_zero(blob: &[u8]) -> bool {
   blob
     .get(..4)
     .is_some_and(|head| head.iter().all(|&b| b == 0))
+}
+
+/// Lowercase, separator-free hex of a byte string — ExifTool's
+/// `unpack("H*", $val)` (the `ImageUniqueID` ValueConv, `Canon.pm:1733`).
+fn hex_lower(bytes: &[u8]) -> std::string::String {
+  use std::fmt::Write;
+  let mut out = std::string::String::with_capacity(bytes.len() * 2);
+  for &b in bytes {
+    let _ = write!(&mut out, "{b:02x}");
+  }
+  out
 }
 
 /// Reserialize a RawValue (int16s/int16u/Bytes) back into bytes in the

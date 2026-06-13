@@ -10,9 +10,30 @@
 //!   0x04, Panorama 0x05, AFInfo 0x12, AFInfo2 0x26, FileInfo 0x93,
 //!   ProcessingInfo 0x10/etc.) trigger a SECONDARY sub-table parse — the
 //!   port handles CameraSettings + FileInfo natively (see
-//!   [`super::camera_settings`] / [`super::file_info`]); the rest are
-//!   captured as raw bytes (Phase-2 deferred — see follow-up issue
-//!   linked from #62 umbrella).
+//!   [`super::camera_settings`] / [`super::file_info`]). Every `SubDirectory`
+//!   tag carries `sub_table: Some(..)`; the deferred ones
+//!   (`is_walked() == false`) are SUPPRESSED, not emitted as a raw parent
+//!   value — a SubDirectory pointer descends into its child table and never
+//!   emits its own value (`Exif.pm:7103-7104`), so the faithful default
+//!   output omits the parent (issue #177). EVERY `%Canon::Main` `SubDirectory`
+//!   tag ID carries `sub_table: Some(..)` — the full set was swept against
+//!   `Canon.pm` in #223 (first the 8 siblings
+//!   `CanonCameraInfo`/`CropInfo`/`CustomFunctions2`/`AspectInfo`/
+//!   `MeasuredColor`/`ColorData`/`AFMicroAdj`, then the remaining 23:
+//!   `UnknownD30` 0x0a, `CustomFunctions` 0x0f, `FaceDetect3` 0x2f,
+//!   `TimeInfo` 0x35, `CustomFunctions1D` 0x90, `PersonalFunctions` 0x91,
+//!   `PersonalFunctionValues` 0x92, `CanonFlags` 0xb0, `ModifiedInfo` 0xb1,
+//!   `PreviewImageInfo` 0xb6, `ColorInfo` 0x4003, `VignettingCorr` 0x4015,
+//!   `VignettingCorr2` 0x4016, `LightingOpt` 0x4018, `AmbienceInfo` 0x4020,
+//!   `MultiExp` 0x4021, `FilterInfo` 0x4024, `HDRInfo` 0x4025, `LogInfo`
+//!   0x4026, `AFConfig` 0x4028, `RawBurstModeRoll` 0x403f,
+//!   `FocusBracketingInfo` 0x4053, `LevelInfo` 0x4059). The ONLY exception is
+//!   tag 0x96, whose `SerialInfo` `SubDirectory` lives in a model-conditional
+//!   FIRST arm — it stays `sub_table: None` and is suppressed in a dedicated
+//!   `parse_in_tiff` arm (the SECOND arm `InternalSerialNumber` is a real leaf
+//!   for non-EOS-5D bodies). The `canon_tags_subdirectory_rows_are_marked`
+//!   invariant test guards the whole set. The child leaves stay Phase-2
+//!   deferred (see the #62 umbrella).
 //! - Model-specific `CanonCameraInfoXXX` conditional sub-directories at
 //!   tag 0x0d (`Canon.pm:1307-1494`) are DEFERRED — each model has its
 //!   own micro-table.
@@ -138,6 +159,95 @@ pub enum SubTable {
   /// `%Canon::ColorBalance` (`Canon.pm:7268-7293`) — Main tag 0xa9. FORMAT
   /// int16s, FIRST_ENTRY 0. The `WB_RGGBLevels{Auto,Daylight,…}` quads.
   ColorBalance,
+  /// `CanonCameraInfo` conditional SubDirectory list — Main tag 0x0d
+  /// (`Canon.pm:1308-1494`). Per-model `Canon::CameraInfo<Model>` micro-tables.
+  /// DEFERRED (children unported, issue #85): `is_walked() == false` so the
+  /// parent pointer is suppressed (no bogus raw value).
+  CameraInfo,
+  /// `%Canon::CropInfo` (`Canon.pm:1880-1882`) — Main tag 0x98. DEFERRED.
+  CropInfo,
+  /// `CanonCustom::Functions2` (`Canon.pm:1884-1889`) — Main tag 0x99
+  /// (`CustomFunctions2`). DEFERRED (issue #87).
+  CustomFunctions2,
+  /// `%Canon::AspectInfo` (`Canon.pm:1891-1893`) — Main tag 0x9a. DEFERRED.
+  AspectInfo,
+  /// `%Canon::MeasuredColor` (`Canon.pm:1913-1918`) — Main tag 0xaa. DEFERRED.
+  MeasuredColor,
+  /// `Canon::ColorData<N>` conditional SubDirectory list — Main tag 0x4001
+  /// (`Canon.pm:1973-2046`). Count-selected `ColorData1..12`. DEFERRED
+  /// (issue #84): `is_walked() == false` so the parent pointer is suppressed.
+  ColorData,
+  /// `%Canon::AFMicroAdj` (`Canon.pm:2088-2095`) — Main tag 0x4013. DEFERRED.
+  AfMicroAdj,
+  /// `%Canon::UnknownD30` (`Canon.pm:1275-1281`) — Main tag 0x0a. DEFERRED.
+  UnknownD30,
+  /// `CanonCustom::Functions<Model>` conditional SubDirectory list — Main tag
+  /// 0x0f (`Canon.pm:1501-1583`): `CustomFunctions1D`/`5D`/`10D`/`20D`/`30D`/
+  /// `350D`/`400D`/`D30`/`D60`/`Unknown`, all `SubDirectory` arms. DEFERRED
+  /// (issue #87): the parent pointer is suppressed.
+  CustomFunctions,
+  /// `%Canon::FaceDetect3` (`Canon.pm:1741-1747`) — Main tag 0x2f. DEFERRED.
+  FaceDetect3,
+  /// `%Canon::TimeInfo` (`Canon.pm:1750-1756`) — Main tag 0x35. DEFERRED.
+  TimeInfo,
+  /// `CanonCustom::Functions1D` (`Canon.pm:1796-1802`) — Main tag 0x90
+  /// (`CustomFunctions1D`, used by 1D/1Ds). DEFERRED (issue #87).
+  CustomFunctions1D,
+  /// `CanonCustom::PersonalFuncs` (`Canon.pm:1803-1809`) — Main tag 0x91
+  /// (`PersonalFunctions`). DEFERRED (issue #87).
+  PersonalFunctions,
+  /// `CanonCustom::PersonalFuncValues` (`Canon.pm:1810-1816`) — Main tag 0x92
+  /// (`PersonalFunctionValues`). DEFERRED (issue #87).
+  PersonalFunctionValues,
+  /// `%Canon::Flags` (`Canon.pm:1924-1930`) — Main tag 0xb0 (`CanonFlags`).
+  /// DEFERRED.
+  CanonFlags,
+  /// `%Canon::ModifiedInfo` (`Canon.pm:1931-1937`) — Main tag 0xb1
+  /// (`ModifiedInfo`). DEFERRED.
+  ModifiedInfo,
+  /// `%Canon::PreviewImageInfo` (`Canon.pm:1949-1957`) — Main tag 0xb6
+  /// (`PreviewImageInfo`). DEFERRED.
+  PreviewImageInfo,
+  /// `%Canon::ColorInfo` (`Canon.pm:2056-2059`) — Main tag 0x4003
+  /// (`ColorInfo`). DEFERRED.
+  ColorInfo,
+  /// `Canon::VignettingCorr` conditional SubDirectory list — Main tag 0x4015
+  /// (`Canon.pm:2098-2122`): `VignettingCorr`/`VignettingCorrUnknown1`/
+  /// `VignettingCorrUnknown2`, all `SubDirectory` arms. DEFERRED.
+  VignettingCorr,
+  /// `%Canon::VignettingCorr2` (`Canon.pm:2123-2130`) — Main tag 0x4016
+  /// (`VignettingCorr2`). DEFERRED.
+  VignettingCorr2,
+  /// `%Canon::LightingOpt` (`Canon.pm:2131-2137`) — Main tag 0x4018
+  /// (`LightingOpt`). DEFERRED.
+  LightingOpt,
+  /// `%Canon::Ambience` (`Canon.pm:2144-2151`) — Main tag 0x4020
+  /// (`AmbienceInfo`). DEFERRED.
+  AmbienceInfo,
+  /// `%Canon::MultiExp` (`Canon.pm:2152-2158`) — Main tag 0x4021 (`MultiExp`).
+  /// DEFERRED.
+  MultiExp,
+  /// `%Canon::FilterInfo` (`Canon.pm:2159-2165`) — Main tag 0x4024
+  /// (`FilterInfo`). DEFERRED.
+  FilterInfo,
+  /// `%Canon::HDRInfo` (`Canon.pm:2166-2172`) — Main tag 0x4025 (`HDRInfo`).
+  /// DEFERRED.
+  HdrInfo,
+  /// `%Canon::LogInfo` (`Canon.pm:2173-2179`) — Main tag 0x4026 (`LogInfo`).
+  /// DEFERRED.
+  LogInfo,
+  /// `%Canon::AFConfig` (`Canon.pm:2180-2186`) — Main tag 0x4028 (`AFConfig`).
+  /// DEFERRED.
+  AfConfig,
+  /// `%Canon::RawBurstInfo` (`Canon.pm:2188-2194`) — Main tag 0x403f
+  /// (`RawBurstModeRoll`). DEFERRED.
+  RawBurstModeRoll,
+  /// `%Canon::FocusBracketingInfo` (`Canon.pm:2196-2202`) — Main tag 0x4053
+  /// (`FocusBracketingInfo`). DEFERRED.
+  FocusBracketingInfo,
+  /// `%Canon::LevelInfo` (`Canon.pm:2203-2209`) — Main tag 0x4059
+  /// (`LevelInfo`). DEFERRED.
+  LevelInfo,
 }
 
 impl SubTable {
@@ -244,12 +354,14 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x0a — UnknownD30 (`Canon.pm:1274-1280`) — sub-table, raw.
+  // 0x0a — UnknownD30 (`Canon.pm:1275-1281`) — SubDirectory to
+  // `Canon::UnknownD30`. DEFERRED child walk: suppressed (no bogus raw parent),
+  // issue #177.
   CanonTag {
     id: 0x0a,
     name: "UnknownD30",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::UnknownD30),
     unknown: false,
   },
   // 0x0c — SerialNumber (`Canon.pm:1281-1306`) — conditional Print format.
@@ -260,12 +372,15 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x0d — CanonCameraInfo (`Canon.pm:1307-1494`) — conditional model-specific.
+  // 0x0d — CanonCameraInfo (`Canon.pm:1307-1494`) — conditional model-specific
+  // SubDirectory list. DEFERRED child walk (issue #85): a SubDirectory pointer
+  // descends into the child table and never emits the parent value, so mark it
+  // `Some(..)` (suppressed by the deferred-SubDirectory arm, issue #177).
   CanonTag {
     id: 0x0d,
     name: "CanonCameraInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CameraInfo),
     unknown: false,
   },
   // 0x0e — CanonFileLength (`Canon.pm:1495-1499`) — int32u
@@ -276,12 +391,15 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x0f — CustomFunctions (`Canon.pm:1500-1582`) — model-specific.
+  // 0x0f — CustomFunctions (`Canon.pm:1501-1583`) — model-specific
+  // SubDirectory list (every arm is a `CanonCustom::Functions<Model>`
+  // SubDirectory). DEFERRED child walk (issue #87): suppressed (no bogus raw
+  // parent), issue #177.
   CanonTag {
     id: 0x0f,
     name: "CustomFunctions",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CustomFunctions),
     unknown: false,
   },
   // 0x10 — CanonModelID (`Canon.pm:1583-1589`) — int32u, printConv via canonModelID.
@@ -412,20 +530,22 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::WbInfo),
     unknown: false,
   },
-  // 0x2f — FaceDetect3 (`Canon.pm:1740-1745`)
+  // 0x2f — FaceDetect3 (`Canon.pm:1741-1747`) — SubDirectory to
+  // `Canon::FaceDetect3`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x2f,
     name: "FaceDetect3",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::FaceDetect3),
     unknown: false,
   },
-  // 0x35 — TimeInfo (`Canon.pm:1748-1754`)
+  // 0x35 — TimeInfo (`Canon.pm:1750-1756`) — SubDirectory to `Canon::TimeInfo`.
+  // DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x35,
     name: "TimeInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::TimeInfo),
     unknown: false,
   },
   // 0x38 — BatteryType (`Canon.pm:1757-1764`) — string
@@ -471,29 +591,33 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x90 — CustomFunctions1D (`Canon.pm:1796-1801`) — SubDirectory
-  // (CanonCustom::Functions1D), deferred → emit raw.
+  // 0x90 — CustomFunctions1D (`Canon.pm:1796-1802`) — SubDirectory to
+  // `CanonCustom::Functions1D` (used by 1D/1Ds). DEFERRED child walk
+  // (issue #87): suppressed (no bogus raw parent), issue #177.
   CanonTag {
     id: 0x90,
     name: "CustomFunctions1D",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CustomFunctions1D),
     unknown: false,
   },
-  // 0x91 — PersonalFunctions (`Canon.pm:1804-1808`)
+  // 0x91 — PersonalFunctions (`Canon.pm:1803-1809`) — SubDirectory to
+  // `CanonCustom::PersonalFuncs`. DEFERRED child walk (issue #87): suppressed.
   CanonTag {
     id: 0x91,
     name: "PersonalFunctions",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::PersonalFunctions),
     unknown: false,
   },
-  // 0x92 — PersonalFunctionValues (`Canon.pm:1811-1815`)
+  // 0x92 — PersonalFunctionValues (`Canon.pm:1810-1816`) — SubDirectory to
+  // `CanonCustom::PersonalFuncValues`. DEFERRED child walk (issue #87):
+  // suppressed.
   CanonTag {
     id: 0x92,
     name: "PersonalFunctionValues",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::PersonalFunctionValues),
     unknown: false,
   },
   // 0x93 — CanonFileInfo (`Canon.pm:1816-1822`)
@@ -544,28 +668,31 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x98 — CropInfo (`Canon.pm:1880-1882`)
+  // 0x98 — CropInfo (`Canon.pm:1880-1882`) — SubDirectory to `Canon::CropInfo`.
+  // DEFERRED child walk: suppressed (no bogus raw parent), issue #177.
   CanonTag {
     id: 0x98,
     name: "CropInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CropInfo),
     unknown: false,
   },
-  // 0x99 — CustomFunctions2 (`Canon.pm:1884-1888`)
+  // 0x99 — CustomFunctions2 (`Canon.pm:1884-1889`) — SubDirectory to
+  // `CanonCustom::Functions2`. DEFERRED child walk (issue #87): suppressed.
   CanonTag {
     id: 0x99,
     name: "CustomFunctions2",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CustomFunctions2),
     unknown: false,
   },
-  // 0x9a — AspectInfo (`Canon.pm:1891-1893`)
+  // 0x9a — AspectInfo (`Canon.pm:1891-1893`) — SubDirectory to
+  // `Canon::AspectInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x9a,
     name: "AspectInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::AspectInfo),
     unknown: false,
   },
   // 0xa0 — ProcessingInfo (`Canon.pm:1897-1901`)
@@ -617,12 +744,13 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::ColorBalance),
     unknown: false,
   },
-  // 0xaa — MeasuredColor (`Canon.pm:1914-1919`)
+  // 0xaa — MeasuredColor (`Canon.pm:1913-1918`) — SubDirectory to
+  // `Canon::MeasuredColor`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0xaa,
     name: "MeasuredColor",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::MeasuredColor),
     unknown: false,
   },
   // 0xae — ColorTemperature (`Canon.pm:1921-1924`)
@@ -633,20 +761,22 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0xb0 — CanonFlags (`Canon.pm:1925-1933`)
+  // 0xb0 — CanonFlags (`Canon.pm:1924-1930`) — SubDirectory to `Canon::Flags`.
+  // DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0xb0,
     name: "CanonFlags",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::CanonFlags),
     unknown: false,
   },
-  // 0xb1 — ModifiedInfo (`Canon.pm:1932-1939`)
+  // 0xb1 — ModifiedInfo (`Canon.pm:1931-1937`) — SubDirectory to
+  // `Canon::ModifiedInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0xb1,
     name: "ModifiedInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::ModifiedInfo),
     unknown: false,
   },
   // 0xb2 — ToneCurveMatching (`Canon.pm:1940`)
@@ -673,12 +803,13 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0xb6 — PreviewImageInfo (`Canon.pm:1951-1958`)
+  // 0xb6 — PreviewImageInfo (`Canon.pm:1949-1957`) — SubDirectory to
+  // `Canon::PreviewImageInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0xb6,
     name: "PreviewImageInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::PreviewImageInfo),
     unknown: false,
   },
   // 0xd0 — VRDOffset (`Canon.pm:1959-1966`) — int32u
@@ -698,12 +829,15 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::SensorInfo),
     unknown: false,
   },
-  // 0x4001 — ColorData (`Canon.pm:1974-2046`) — model-specific ColorDataN.
+  // 0x4001 — ColorData (`Canon.pm:1973-2046`) — count-selected ColorData<N>
+  // SubDirectory list. DEFERRED child walk (issue #84): a SubDirectory pointer
+  // descends into the child table and never emits the parent value, so mark it
+  // `Some(..)` (suppressed by the deferred-SubDirectory arm, issue #177).
   CanonTag {
     id: 0x4001,
     name: "ColorData",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::ColorData),
     unknown: false,
   },
   // 0x4002 — CRWParam (`Canon.pm:2048-2053`)
@@ -714,12 +848,13 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x4003 — ColorInfo (`Canon.pm:2055-2057`)
+  // 0x4003 — ColorInfo (`Canon.pm:2056-2059`) — SubDirectory to
+  // `Canon::ColorInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4003,
     name: "ColorInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::ColorInfo),
     unknown: false,
   },
   // 0x4005 — Flavor (`Canon.pm:2059-2063`)
@@ -756,36 +891,41 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: None,
     unknown: false,
   },
-  // 0x4013 — AFMicroAdj (`Canon.pm:2087-2095`)
+  // 0x4013 — AFMicroAdj (`Canon.pm:2088-2095`) — SubDirectory to
+  // `Canon::AFMicroAdj`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4013,
     name: "AFMicroAdj",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::AfMicroAdj),
     unknown: false,
   },
-  // 0x4015 — VignettingCorr (`Canon.pm:2097-2120`) — conditional
+  // 0x4015 — VignettingCorr (`Canon.pm:2098-2122`) — conditional SubDirectory
+  // list (every arm is a SubDirectory to `Canon::VignettingCorr{,Unknown}`).
+  // DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4015,
     name: "VignettingCorr",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::VignettingCorr),
     unknown: false,
   },
-  // 0x4016 — VignettingCorr2 (`Canon.pm:2121-2128`)
+  // 0x4016 — VignettingCorr2 (`Canon.pm:2123-2130`) — SubDirectory to
+  // `Canon::VignettingCorr2`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4016,
     name: "VignettingCorr2",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::VignettingCorr2),
     unknown: false,
   },
-  // 0x4018 — LightingOpt (`Canon.pm:2130-2136`)
+  // 0x4018 — LightingOpt (`Canon.pm:2131-2137`) — SubDirectory to
+  // `Canon::LightingOpt`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4018,
     name: "LightingOpt",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::LightingOpt),
     unknown: false,
   },
   // 0x4019 — LensInfo (`Canon.pm:2137-2142`) — Phase-2: emit raw.
@@ -796,76 +936,85 @@ pub const CANON_TAGS: &[CanonTag] = &[
     sub_table: Some(SubTable::LensInfo),
     unknown: false,
   },
-  // 0x4020 — AmbienceInfo (`Canon.pm:2144-2151`) — SubDirectory, deferred.
+  // 0x4020 — AmbienceInfo (`Canon.pm:2144-2151`) — SubDirectory to
+  // `Canon::Ambience`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4020,
     name: "AmbienceInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::AmbienceInfo),
     unknown: false,
   },
-  // 0x4021 — MultiExp (`Canon.pm:2150-2156`)
+  // 0x4021 — MultiExp (`Canon.pm:2152-2158`) — SubDirectory to
+  // `Canon::MultiExp`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4021,
     name: "MultiExp",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::MultiExp),
     unknown: false,
   },
-  // 0x4024 — FilterInfo (`Canon.pm:2158-2163`)
+  // 0x4024 — FilterInfo (`Canon.pm:2159-2165`) — SubDirectory to
+  // `Canon::FilterInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4024,
     name: "FilterInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::FilterInfo),
     unknown: false,
   },
-  // 0x4025 — HDRInfo (`Canon.pm:2164-2170`)
+  // 0x4025 — HDRInfo (`Canon.pm:2166-2172`) — SubDirectory to `Canon::HDRInfo`.
+  // DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4025,
     name: "HDRInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::HdrInfo),
     unknown: false,
   },
-  // 0x4026 — LogInfo (`Canon.pm:2171-2178`)
+  // 0x4026 — LogInfo (`Canon.pm:2173-2179`) — SubDirectory to `Canon::LogInfo`.
+  // DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4026,
     name: "LogInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::LogInfo),
     unknown: false,
   },
-  // 0x4028 — AFConfig (`Canon.pm:2179-2184`)
+  // 0x4028 — AFConfig (`Canon.pm:2180-2186`) — SubDirectory to
+  // `Canon::AFConfig`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4028,
     name: "AFConfig",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::AfConfig),
     unknown: false,
   },
-  // 0x403f — RawBurstModeRoll (`Canon.pm:2186-2189`)
+  // 0x403f — RawBurstModeRoll (`Canon.pm:2188-2194`) — SubDirectory to
+  // `Canon::RawBurstInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x403f,
     name: "RawBurstModeRoll",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::RawBurstModeRoll),
     unknown: false,
   },
-  // 0x4053 — FocusBracketingInfo (`Canon.pm:2196-2202`)
+  // 0x4053 — FocusBracketingInfo (`Canon.pm:2196-2202`) — SubDirectory to
+  // `Canon::FocusBracketingInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4053,
     name: "FocusBracketingInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::FocusBracketingInfo),
     unknown: false,
   },
-  // 0x4059 — LevelInfo (`Canon.pm:2203-2209`)
+  // 0x4059 — LevelInfo (`Canon.pm:2203-2209`) — SubDirectory to
+  // `Canon::LevelInfo`. DEFERRED child walk: suppressed (issue #177).
   CanonTag {
     id: 0x4059,
     name: "LevelInfo",
     conv: CanonPrintConv::None,
-    sub_table: None,
+    sub_table: Some(SubTable::LevelInfo),
     unknown: false,
   },
 ];
@@ -950,6 +1099,95 @@ mod tests {
   fn focus_bracketing_and_level_info_not_swapped() {
     assert_eq!(lookup(0x4053).unwrap().name, "FocusBracketingInfo");
     assert_eq!(lookup(0x4059).unwrap().name, "LevelInfo");
+  }
+
+  /// The COMPLETE set of `%Image::ExifTool::Canon::Main` tag IDs that carry a
+  /// `SubDirectory` (`Canon.pm:1222-2210`, every `SubDirectory => { TagTable
+  /// => … }` entry, including the conditional-list IDs where EVERY arm is a
+  /// SubDirectory). A `SubDirectory` pointer descends into its child table and
+  /// emits NO parent value (`Exif.pm:7103-7104`), so each must reach the
+  /// suppression path — either walked (`is_walked()`) or marked
+  /// `sub_table: Some(..)` (deferred). NONE may be `sub_table: None`, otherwise
+  /// it hits the leaf arm and leaks a bogus raw parent (the #177/#223 bug).
+  ///
+  /// 0x96 is the sole documented exception: its `SerialInfo` SubDirectory is a
+  /// model-conditional FIRST arm; the SECOND arm `InternalSerialNumber` is a
+  /// real leaf, so the row stays `None` and the SerialInfo suppression lives in
+  /// a dedicated `parse_in_tiff` arm (covered by the dispatch tests).
+  const CANON_MAIN_SUBDIRECTORY_IDS: &[u16] = &[
+    0x01, 0x02, 0x04, 0x05, 0x0a, 0x0d, 0x0f, 0x11, 0x12, 0x1d, 0x24, 0x25, 0x26, 0x27, 0x29, 0x2f,
+    0x35, 0x3c, 0x90, 0x91, 0x92, 0x93, /* 0x96 — model-conditional, see above */
+    0x98, 0x99, 0x9a, 0xa0, 0xa9, 0xaa, 0xb0, 0xb1, 0xb6, 0xe0, 0x4001, 0x4003, 0x4013, 0x4015,
+    0x4016, 0x4018, 0x4019, 0x4020, 0x4021, 0x4024, 0x4025, 0x4026, 0x4028, 0x403f, 0x4053, 0x4059,
+  ];
+
+  /// Table invariant (#223 class guard): every Canon::Main SubDirectory ID is
+  /// walked-or-deferred — i.e. `sub_table.is_some()` — so a future mis-mark to
+  /// `None` (which would leak a bogus raw parent) fails this test.
+  #[test]
+  fn canon_tags_subdirectory_rows_are_marked() {
+    for &id in CANON_MAIN_SUBDIRECTORY_IDS {
+      let t = lookup(id)
+        .unwrap_or_else(|| panic!("Canon::Main SubDirectory 0x{id:04x} missing from table"));
+      assert!(
+        t.sub_table().is_some(),
+        "Canon::Main SubDirectory 0x{id:04x} ({}) must be sub_table: Some(..) \
+         (walked or deferred) so it reaches the suppression path, not the leaf \
+         arm — else it leaks a bogus raw parent (#177/#223)",
+        t.name()
+      );
+    }
+    // 0x96 is the sole exception (model-conditional SerialInfo): it MUST stay
+    // None so the non-5D second-arm InternalSerialNumber leaf still emits.
+    assert_eq!(
+      lookup(0x96).and_then(CanonTag::sub_table),
+      None,
+      "0x96 must stay None — SerialInfo is a model-conditional arm handled in parse_in_tiff"
+    );
+  }
+
+  /// The 23 SubDirectory rows the SECOND #223 pass corrected from `None` to a
+  /// deferred `Some(..)` (the first pass had done 8). Spot-check the new
+  /// variants resolve and stay NON-walked (so they hit the suppression arm).
+  #[test]
+  fn canon_223_second_pass_rows_are_deferred_subdirs() {
+    for (id, name, sub) in [
+      (0x0au16, "UnknownD30", SubTable::UnknownD30),
+      (0x0f, "CustomFunctions", SubTable::CustomFunctions),
+      (0x2f, "FaceDetect3", SubTable::FaceDetect3),
+      (0x35, "TimeInfo", SubTable::TimeInfo),
+      (0x90, "CustomFunctions1D", SubTable::CustomFunctions1D),
+      (0x91, "PersonalFunctions", SubTable::PersonalFunctions),
+      (
+        0x92,
+        "PersonalFunctionValues",
+        SubTable::PersonalFunctionValues,
+      ),
+      (0xb0, "CanonFlags", SubTable::CanonFlags),
+      (0xb1, "ModifiedInfo", SubTable::ModifiedInfo),
+      (0xb6, "PreviewImageInfo", SubTable::PreviewImageInfo),
+      (0x4003, "ColorInfo", SubTable::ColorInfo),
+      (0x4015, "VignettingCorr", SubTable::VignettingCorr),
+      (0x4016, "VignettingCorr2", SubTable::VignettingCorr2),
+      (0x4018, "LightingOpt", SubTable::LightingOpt),
+      (0x4020, "AmbienceInfo", SubTable::AmbienceInfo),
+      (0x4021, "MultiExp", SubTable::MultiExp),
+      (0x4024, "FilterInfo", SubTable::FilterInfo),
+      (0x4025, "HDRInfo", SubTable::HdrInfo),
+      (0x4026, "LogInfo", SubTable::LogInfo),
+      (0x4028, "AFConfig", SubTable::AfConfig),
+      (0x403f, "RawBurstModeRoll", SubTable::RawBurstModeRoll),
+      (0x4053, "FocusBracketingInfo", SubTable::FocusBracketingInfo),
+      (0x4059, "LevelInfo", SubTable::LevelInfo),
+    ] {
+      let t = lookup(id).unwrap();
+      assert_eq!(t.name(), name, "0x{id:04x} name");
+      assert_eq!(t.sub_table(), Some(sub), "0x{id:04x} sub_table");
+      assert!(
+        !sub.is_walked(),
+        "0x{id:04x} ({name}) is a DEFERRED SubDirectory — must NOT be walked"
+      );
+    }
   }
 
   #[test]
