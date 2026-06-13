@@ -5533,14 +5533,24 @@ impl crate::emit::Taggable for Meta<'_> {
       |_s, _a, pc| gps_altitude_stream_value(_a, pc),
       |s, group, scratch| {
         // GPSSpeed (`%QuickTime::Stream`, QuickTimeStream.pl:121): the typed
-        // layer already holds km/h (post-ValueConv); the `sprintf("%.4f")+0`
-        // PrintConv only rounds/strips, value-identical for the camera-clean
-        // speeds — emit the raw `F64` (a bare JSON number) in both modes.
+        // layer already holds km/h (post-ValueConv). The `sprintf("%.4f", $val)
+        // + 0` PrintConv rounds to 4 decimals and the `+ 0` numify drops trailing
+        // zeros (`%.15g`); ExifTool's JSON writer then numifies the in-gate token,
+        // so it emits as a BARE number (clean ≤4-decimal speeds round-trip
+        // unchanged: the goldens carry `60`/`92.6`, but a >4-decimal speed like
+        // `12.345678` rounds to `12.3457` to match the oracle). `-n` (ValueConv)
+        // emits the raw km/h F64. Same `%.4f`+0 idiom as the shared GPSTrack /
+        // GPSAltitude (the shared [`sprintf_4_plus_0`] helper).
         if let Some(spd) = s.speed_kph() {
+          let speed_v = if print_conv {
+            TagValue::Str(sprintf_4_plus_0(spd).into())
+          } else {
+            TagValue::F64(spd)
+          };
           scratch.push(EmittedTag::new(
             group.clone(),
             "GPSSpeed".into(),
-            TagValue::F64(spd),
+            speed_v,
             false,
           ));
         }
@@ -7351,10 +7361,25 @@ fn emit_timed_samples<S: crate::metadata::TimedSample>(
       ));
     }
     if let Some(t) = s.track_deg() {
+      // `%QuickTime::Stream` GPSTrack PrintConv `sprintf("%.4f", $val) + 0`
+      // (QuickTimeStream.pl:123): round to 4 decimals, then the `+ 0` numify
+      // re-stringifies the rounded NV with `%.15g` (dropping trailing zeros).
+      // ExifTool's JSON writer numifies the result, so an in-gate token emits as
+      // a BARE number (the SP3 goldens carry `60`/`90`, not `"60"`). `-n`
+      // (ValueConv) keeps the raw heading F64. Same `%.4f`+0 idiom as GPSSpeed
+      // below (the shared [`sprintf_4_plus_0`] helper). The only production
+      // `track_deg()`-bearing source reaching this shared emitter is the SP3
+      // `%QuickTime::Stream` table (camm carries no track column; GoPro
+      // GLPI/GPS9 emit GPSTrack raw through their own inline blocks, never here).
+      let track_v = if print_conv {
+        TagValue::Str(sprintf_4_plus_0(t).into())
+      } else {
+        TagValue::F64(t)
+      };
       scratch.push(EmittedTag::new(
         group.clone(),
         "GPSTrack".into(),
-        TagValue::F64(t),
+        track_v,
         false,
       ));
     }
@@ -7775,9 +7800,9 @@ fn push_insta360_gps_tags(
     // (QuickTimeStream.pl:121): round to 4 decimals, drop trailing zeros (the
     // `+ 0` numify re-stringifies the rounded NV with `%.15g`). `-n` emits the
     // raw km/h F64. Same `%.4f`+0 idiom as the Stream GPSAltitude (extracted
-    // into `round_to_decimals` + `format_g`).
+    // into the shared [`sprintf_4_plus_0`] helper).
     let v = if print_conv {
-      TagValue::Str(crate::value::format_g(round_to_decimals(sp, 4), 15).into())
+      TagValue::Str(sprintf_4_plus_0(sp).into())
     } else {
       TagValue::F64(sp)
     };
@@ -7787,7 +7812,7 @@ fn push_insta360_gps_tags(
     // GPSTrack PrintConv `sprintf("%.4f", $val) + 0` (QuickTimeStream.pl:123) —
     // the same `%.4f`+0 numeric strip as GPSSpeed.
     let v = if print_conv {
-      TagValue::Str(crate::value::format_g(round_to_decimals(tr, 4), 15).into())
+      TagValue::Str(sprintf_4_plus_0(tr).into())
     } else {
       TagValue::F64(tr)
     };
@@ -9685,7 +9710,7 @@ fn emit_ligogps(
     // PrintConv (QuickTimeStream.pl:121), raw F64 at `-n`.
     if let Some(sp) = sample.speed_kph() {
       let v = if print_conv {
-        TagValue::Str(crate::value::format_g(round_to_decimals(sp, 4), 15).into())
+        TagValue::Str(sprintf_4_plus_0(sp).into())
       } else {
         TagValue::F64(sp)
       };
@@ -9694,7 +9719,7 @@ fn emit_ligogps(
     // GPSTrack (LigoGPS.pm:261): `sprintf("%.4f",$val)+0` (QuickTimeStream.pl:123).
     if let Some(tr) = sample.track_deg() {
       let v = if print_conv {
-        TagValue::Str(crate::value::format_g(round_to_decimals(tr, 4), 15).into())
+        TagValue::Str(sprintf_4_plus_0(tr).into())
       } else {
         TagValue::F64(tr)
       };
@@ -9963,11 +9988,9 @@ fn dms_signed(val: f64, ref_pos: char, ref_neg: char) -> std::string::String {
 fn gps_altitude_stream_value(val: f64, print_conv: bool) -> crate::value::TagValue {
   use crate::value::TagValue;
   if print_conv {
-    // `sprintf("%.4f", $val)` then `+ 0` (numify) ⇒ Perl re-stringifies the
-    // rounded NV with `%.15g`. Round the f64 to 4 decimals first, then render
-    // with `format_g` — the `%.15g` of a 4-decimal value never re-expands.
-    let rounded = round_to_decimals(val, 4);
-    let mut s = format_g(rounded, 15);
+    // `(sprintf("%.4f", $val) + 0) . " m"`: the shared `%.4f`+0 numeric strip
+    // (non-finite / huge-finite / `-0` all handled faithfully), then `" m"`.
+    let mut s = sprintf_4_plus_0(val);
     s.push_str(" m");
     TagValue::Str(s.into())
   } else {
@@ -10006,18 +10029,52 @@ fn gps_altitude_camm_value(val: f64, packet_type: u8, print_conv: bool) -> crate
   }
 }
 
-/// Round `val` to `decimals` fractional digits the way Perl `sprintf("%.Nf")`
-/// does (round half away from zero), returning the rounded f64. Used by the
-/// Stream `GPSAltitude` `+ 0` numeric strip (the value is then re-rendered by
-/// `format_g`).
+/// Faithful port of the `%QuickTime::Stream` `sprintf("%.4f", $val) + 0`
+/// PrintConv (QuickTimeStream.pl:121 GPSSpeed / :123 GPSTrack, and the `. " m"`
+/// GPSAltitude on :120). Returns the BARE numeric token (no `" m"` suffix — the
+/// GPSAltitude caller appends that itself).
+///
+/// Mirrors Perl's TWO STEPS literally rather than rounding the binary product
+/// `val * 1e4`:
+///
+/// 1. `sprintf("%.4f", $val)` — Rust `format!("{val:.4}")` is C/Perl `%.4f`:
+///    it formats the TRUE decimal value to 4 places. Rounding the binary
+///    `val * 1e4` instead diverges in the mid-large band (well below any
+///    overflow): e.g. `98640247574.07605` → Perl `98640247574.076`, but
+///    `(val*1e4).round()/1e4` → `98640247574.0761`; `-3666810733266.1748` →
+///    Perl `-3666810733266.17`, but the binary round → `-3666810733266.18`
+///    (#216 R2).
+/// 2. `... + 0` — Perl numifies the fixed string back to an NV, then its
+///    default `%.15g` ([`format_g`]) re-stringifies it (dropping trailing
+///    zeros). We `parse()` the fixed string to `f64` and feed [`format_g`].
+///
+/// This subsumes the two #216-R1 classes with no special-casing:
+///
+/// * **Non-finite `$val`.** `sprintf("%.4f", $val) + 0` numifies to the
+///   titlecase `Inf` / `-Inf` / `NaN` ([`perl_nonfinite_str`]); we branch on
+///   `is_finite` so `format_g` never emits Rust's lowercase `inf` / `-inf`.
+/// * **Huge finite `$val`.** `format!("{val:.4}")` produces the long fixed
+///   string (never an overflowing `val * 1e4`), `parse` returns the original
+///   magnitude, `format_g` → `1e305` ⇒ `"1e+305"`. No magnitude threshold is
+///   needed — the format-then-parse path is faithful for every finite value.
+///
+/// The `-0.0` normalization handles the third divergence: a tiny negative value
+/// formats to `"-0.0000"` which parses to `-0.0` (printed `-0` by `format_g`),
+/// but Perl's `+ 0` yields a positive zero printed `0`.
 #[cfg(feature = "alloc")]
-fn round_to_decimals(val: f64, decimals: u32) -> f64 {
-  if !val.is_finite() {
-    return val;
+fn sprintf_4_plus_0(val: f64) -> std::string::String {
+  // `sprintf("%.4f", non-finite) + 0` numifies to Perl's titlecase Inf/-Inf/NaN.
+  if let Some(nf) = crate::value::perl_nonfinite_str(val) {
+    return nf.to_string();
   }
-  let factor = 10f64.powi(decimals as i32);
-  // `sprintf` rounds half away from zero; `f64::round` does the same.
-  (val * factor).round() / factor
+  // Step 1: `sprintf("%.4f", $val)` — fixed-decimal, correct decimal rounding.
+  let fixed = std::format!("{val:.4}");
+  // Step 2: `... + 0` numifies the fixed string back to an NV …
+  let numified: f64 = fixed.parse().unwrap_or(val);
+  // … and Perl `+ 0` yields a positive zero (`-0.00001` → "-0.0000" → `-0.0`).
+  let normalized = if numified == 0.0 { 0.0 } else { numified };
+  // … then its default `%.15g` re-stringifies it.
+  format_g(normalized, 15)
 }
 
 /// Sony rtmd `0xe303 WhiteBalance` PrintConv (Sony.pm:10818-10827). A code
@@ -18177,6 +18234,327 @@ mod tests {
         ],
         "-n emits raw seconds, no ConvertDuration"
       );
+    }
+
+    /// SP3/camm `%QuickTime::Stream` GPSSpeed + GPSTrack PrintConv
+    /// `sprintf("%.4f", $val) + 0` (#216, QuickTimeStream.pl:121/123). Drives the
+    /// shared [`emit_timed_samples`] GPSTrack arm AND the SP3 `emit_extra`
+    /// GPSSpeed closure (the same closure shape `Meta::tags()` passes at the SP3
+    /// call site) across a value with >4 decimals, a clean ≤4-decimal value, and
+    /// an integer:
+    ///   * `-j` (PrintConv): round to 4 decimals + `+ 0` trailing-zero strip,
+    ///     emitted as a numeric STRING (`escape_json_is_number` renders it as a
+    ///     BARE JSON number). The values are oracle-cited from
+    ///     `perl exiftool`-equivalent `sprintf("%.4f",$v)+0`:
+    ///     `12.345678 -> "12.3457"`, `123.45678 -> "123.4568"`, `10.5 -> "10.5"`,
+    ///     `60 -> "60"`.
+    ///   * `-n` (ValueConv): the RAW post-ValueConv `F64` (ExifTool `-n` shows the
+    ///     unrounded number), unchanged.
+    #[test]
+    fn sp3_gpsspeed_gpstrack_printconv_rounds_to_4_decimals() {
+      use crate::metadata::GpsSample;
+      // A `GpsSample` carries a coordinate pair (so `has_emittable_data`), plus
+      // the per-fix speed (km/h) and track (deg) `%QuickTime::Stream` columns.
+      let mk = |speed: f64, track: f64| {
+        let mut s = GpsSample::new();
+        s.set_latitude(Some(1.0))
+          .set_longitude(Some(2.0))
+          .set_speed_kph(Some(speed))
+          .set_track(Some(track));
+        s
+      };
+      // (speed, track): a >4-decimal pair, a clean ≤4-decimal pair, an integer pair.
+      let samples = [mk(12.345678, 123.45678), mk(10.5, 92.6), mk(60.0, 60.0)];
+      // The SP3 GPSSpeed emit_extra closure (mirrors the `Meta::tags()` SP3 site):
+      // GPSSpeed from `speed_kph()` with the `%.4f`+0 PrintConv / raw `-n`.
+      let sp3_speed = |s: &GpsSample,
+                       group: &crate::value::Group,
+                       scratch: &mut std::vec::Vec<EmittedTag>,
+                       print_conv: bool| {
+        if let Some(spd) = s.speed_kph() {
+          let v = if print_conv {
+            TagValue::Str(sprintf_4_plus_0(spd).into())
+          } else {
+            TagValue::F64(spd)
+          };
+          scratch.push(EmittedTag::new(group.clone(), "GPSSpeed".into(), v, false));
+        }
+      };
+      // -j (PrintConv): -G3 keeps every fix as its own Doc so all three surface.
+      let mut pj = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::PrintConv, true, GroupMode::G3),
+        true,
+        no_measure,
+        raw_alt,
+        |s, g, sc| sp3_speed(s, g, sc, true),
+        &mut pj,
+      );
+      let pj_vals = |name: &str| -> std::vec::Vec<&TagValue> {
+        pj.iter()
+          .filter(|t| t.tag().name() == name)
+          .map(|t| t.tag().value_ref())
+          .collect()
+      };
+      // GPSSpeed: >4-dec rounds to "12.3457"; clean "10.5"; integer "60".
+      assert_eq!(
+        pj_vals("GPSSpeed"),
+        [
+          &TagValue::Str("12.3457".into()),
+          &TagValue::Str("10.5".into()),
+          &TagValue::Str("60".into()),
+        ],
+        "GPSSpeed PrintConv = sprintf(%.4f,$v)+0 (oracle 12.3457 / 10.5 / 60)"
+      );
+      // GPSTrack (shared emit_timed_samples arm): >4-dec rounds to "123.4568";
+      // clean "92.6"; integer "60".
+      assert_eq!(
+        pj_vals("GPSTrack"),
+        [
+          &TagValue::Str("123.4568".into()),
+          &TagValue::Str("92.6".into()),
+          &TagValue::Str("60".into()),
+        ],
+        "GPSTrack PrintConv = sprintf(%.4f,$v)+0 (oracle 123.4568 / 92.6 / 60)"
+      );
+
+      // -n (ValueConv): the RAW F64 in both columns, unrounded.
+      let mut pn = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |s, g, sc| sp3_speed(s, g, sc, false),
+        &mut pn,
+      );
+      let pn_vals = |name: &str| -> std::vec::Vec<&TagValue> {
+        pn.iter()
+          .filter(|t| t.tag().name() == name)
+          .map(|t| t.tag().value_ref())
+          .collect()
+      };
+      assert_eq!(
+        pn_vals("GPSSpeed"),
+        [
+          &TagValue::F64(12.345678),
+          &TagValue::F64(10.5),
+          &TagValue::F64(60.0),
+        ],
+        "-n GPSSpeed stays the raw unrounded km/h F64"
+      );
+      assert_eq!(
+        pn_vals("GPSTrack"),
+        [
+          &TagValue::F64(123.45678),
+          &TagValue::F64(92.6),
+          &TagValue::F64(60.0),
+        ],
+        "-n GPSTrack stays the raw unrounded heading F64"
+      );
+    }
+
+    /// End-to-end #216 R2: a mid-large speed/track pair (well below 1e15, where
+    /// rounding the BINARY product `v*1e4` diverges from `sprintf("%.4f")`'s
+    /// fixed-decimal rounding) routed through the shared [`emit_timed_samples`]
+    /// GPSTrack arm AND the SP3 `emit_extra` GPSSpeed closure emits the
+    /// fixed-decimal-then-numify Perl string, not the binary-rounded one. Values
+    /// oracle-cited from `perl -e 'printf "%s", sprintf("%.4f",$v)+0'`:
+    ///   * speed `98640247574.07605` -> `"98640247574.076"` (binary `…0761`)
+    ///   * track `-3666810733266.1748` -> `"-3666810733266.17"` (binary `…18`)
+    #[test]
+    fn sp3_gpsspeed_gpstrack_midlarge_is_perl_faithful() {
+      use crate::metadata::GpsSample;
+      let mut s = GpsSample::new();
+      s.set_latitude(Some(1.0))
+        .set_longitude(Some(2.0))
+        .set_speed_kph(Some(98640247574.07605))
+        .set_track(Some(-3666810733266.1748));
+      let samples = [s];
+      let sp3_speed = |s: &GpsSample,
+                       group: &crate::value::Group,
+                       scratch: &mut std::vec::Vec<EmittedTag>,
+                       print_conv: bool| {
+        if let Some(spd) = s.speed_kph() {
+          let v = if print_conv {
+            TagValue::Str(sprintf_4_plus_0(spd).into())
+          } else {
+            TagValue::F64(spd)
+          };
+          scratch.push(EmittedTag::new(group.clone(), "GPSSpeed".into(), v, false));
+        }
+      };
+      let mut pj = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::PrintConv, true, GroupMode::G3),
+        true,
+        no_measure,
+        raw_alt,
+        |s, g, sc| sp3_speed(s, g, sc, true),
+        &mut pj,
+      );
+      let pj_val = |name: &str| -> Option<TagValue> {
+        pj.iter()
+          .find(|t| t.tag().name() == name)
+          .map(|t| t.tag().value_ref().clone())
+      };
+      // The format-then-parse path matches Perl's two-step; the binary round
+      // would have produced 98640247574.0761 / -3666810733266.18.
+      assert_eq!(
+        pj_val("GPSSpeed"),
+        Some(TagValue::Str("98640247574.076".into())),
+        "SP3 GPSSpeed mid-large = sprintf(%.4f,$v)+0 (oracle 98640247574.076)"
+      );
+      assert_eq!(
+        pj_val("GPSTrack"),
+        Some(TagValue::Str("-3666810733266.17".into())),
+        "GPSTrack mid-large = sprintf(%.4f,$v)+0 (oracle -3666810733266.17)"
+      );
+    }
+
+    /// [`sprintf_4_plus_0`] is byte-identical to Perl `sprintf("%.4f",$v)+0` on
+    /// the value classes that a `format_g((v*1e4).round()/1e4, 15)` binary-round
+    /// composite mishandled (#216 R1 + R2). Each expectation is oracle-cited from
+    /// `perl -e 'printf "%s", sprintf("%.4f",$ARGV[0])+0'`:
+    ///   * `Inf`   -> `"Inf"`     (Rust binary-round gave `"inf"`)
+    ///   * `-Inf`  -> `"-Inf"`    (Rust binary-round gave `"-inf"`)
+    ///   * `NaN`   -> `"NaN"`
+    ///   * `1e305` -> `"1e+305"`  (the format-then-parse path renders huge finite
+    ///                             values faithfully — no magnitude threshold)
+    ///   * `-0.00001` -> `"0"`    (formats to `"-0.0000"` → `-0.0`; the
+    ///                             normalization yields `"0"`, not `"-0"`)
+    ///   * `12.345678` -> `"12.3457"`, `60.0` -> `"60"`, `10.5` -> `"10.5"`
+    ///     (clean values — byte-identical, no regression).
+    ///   * `98640247574.07605` -> `"98640247574.076"` and `-3666810733266.1748`
+    ///     -> `"-3666810733266.17"` (#216 R2: the mid-large band where rounding
+    ///     the BINARY product `v*1e4` diverges from `sprintf("%.4f")`'s
+    ///     fixed-decimal rounding — binary-round gave `…0761` / `…18`).
+    #[test]
+    fn sprintf_4_plus_0_matches_perl_edge_cases() {
+      // perl -e 'printf "%s\n", sprintf("%.4f",9**9**9)+0'      => Inf
+      assert_eq!(sprintf_4_plus_0(f64::INFINITY), "Inf");
+      // perl -e 'printf "%s\n", sprintf("%.4f",-9**9**9)+0'     => -Inf
+      assert_eq!(sprintf_4_plus_0(f64::NEG_INFINITY), "-Inf");
+      // perl -e 'printf "%s\n", sprintf("%.4f",9**9**9-9**9**9)+0' => NaN
+      assert_eq!(sprintf_4_plus_0(f64::NAN), "NaN");
+      // perl -e 'printf "%s\n", sprintf("%.4f",1e305)+0'        => 1e+305
+      assert_eq!(sprintf_4_plus_0(1e305), "1e+305");
+      // perl -e 'printf "%s\n", sprintf("%.4f",-0.00001)+0'     => 0
+      assert_eq!(sprintf_4_plus_0(-0.00001), "0");
+      // perl -e 'printf "%s\n", sprintf("%.4f",12.345678)+0'    => 12.3457
+      assert_eq!(sprintf_4_plus_0(12.345678), "12.3457");
+      // perl -e 'printf "%s\n", sprintf("%.4f",60.0)+0'         => 60
+      assert_eq!(sprintf_4_plus_0(60.0), "60");
+      // perl -e 'printf "%s\n", sprintf("%.4f",10.5)+0'         => 10.5
+      assert_eq!(sprintf_4_plus_0(10.5), "10.5");
+      // A huge-finite value that a `val*1e4` binary round corrupts (1e304 ->
+      // 1e308 -> rounds back wrong) but the format-then-parse path renders
+      // directly: perl `sprintf("%.4f",1e304)+0` => 1e+304.
+      assert_eq!(sprintf_4_plus_0(1e304), "1e+304");
+      // Above ~5.5e11 the f64 ULP exceeds 1e-4 so %.4f is a no-op; the path is
+      // still faithful: perl `sprintf("%.4f",1e15)+0` => 1e+15.
+      assert_eq!(sprintf_4_plus_0(1e15), "1e+15");
+      // The negative non-zero-rounding `-0` only collapses for a value that
+      // ROUNDS to zero — a true small value keeps its sign: perl
+      // `sprintf("%.4f",-0.5)+0` => -0.5.
+      assert_eq!(sprintf_4_plus_0(-0.5), "-0.5");
+      // #216 R2 — the mid-large band (well below 1e15) where rounding the BINARY
+      // product `val*1e4` diverges from `sprintf("%.4f")`'s fixed-decimal
+      // rounding. perl `sprintf("%.4f",98640247574.07605)+0` => 98640247574.076
+      // (the binary round gave 98640247574.0761).
+      assert_eq!(sprintf_4_plus_0(98640247574.07605), "98640247574.076");
+      // perl `sprintf("%.4f",-3666810733266.1748)+0` => -3666810733266.17
+      // (the binary round gave -3666810733266.18).
+      assert_eq!(sprintf_4_plus_0(-3666810733266.1748), "-3666810733266.17");
+      // `gps_altitude_stream_value` appends `" m"` to the same numeric strip,
+      // so a non-finite altitude renders `"Inf m"` (NOT `"inf m"`): perl
+      // `(sprintf("%.4f",9**9**9)+0)." m"` => "Inf m".
+      assert_eq!(
+        gps_altitude_stream_value(f64::INFINITY, true),
+        TagValue::Str("Inf m".into())
+      );
+      // A clean altitude is byte-identical to the pre-fix output: perl
+      // `(sprintf("%.4f",12.5)+0)." m"` => "12.5 m".
+      assert_eq!(
+        gps_altitude_stream_value(12.5, true),
+        TagValue::Str("12.5 m".into())
+      );
+    }
+
+    /// End-to-end: an SP3 GPSSpeed (the `emit_extra` closure) and a shared-path
+    /// GPSTrack (the [`emit_timed_samples`] arm) carrying a non-finite value
+    /// emit the Perl-faithful titlecase string in PrintConv mode and the raw
+    /// non-finite `F64` at `-n` (oracle: `sprintf("%.4f",Inf)+0` => `Inf`).
+    #[test]
+    fn sp3_gpsspeed_gpstrack_nonfinite_is_perl_faithful() {
+      use crate::metadata::GpsSample;
+      let mut s = GpsSample::new();
+      s.set_latitude(Some(1.0))
+        .set_longitude(Some(2.0))
+        .set_speed_kph(Some(f64::INFINITY))
+        .set_track(Some(f64::NEG_INFINITY));
+      let samples = [s];
+      let sp3_speed = |s: &GpsSample,
+                       group: &crate::value::Group,
+                       scratch: &mut std::vec::Vec<EmittedTag>,
+                       print_conv: bool| {
+        if let Some(spd) = s.speed_kph() {
+          let v = if print_conv {
+            TagValue::Str(sprintf_4_plus_0(spd).into())
+          } else {
+            TagValue::F64(spd)
+          };
+          scratch.push(EmittedTag::new(group.clone(), "GPSSpeed".into(), v, false));
+        }
+      };
+      // -j (PrintConv): titlecase Inf / -Inf, never Rust's lowercase.
+      let mut pj = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::PrintConv, true, GroupMode::G3),
+        true,
+        no_measure,
+        raw_alt,
+        |s, g, sc| sp3_speed(s, g, sc, true),
+        &mut pj,
+      );
+      let pj_val = |name: &str| -> Option<TagValue> {
+        pj.iter()
+          .find(|t| t.tag().name() == name)
+          .map(|t| t.tag().value_ref().clone())
+      };
+      assert_eq!(pj_val("GPSSpeed"), Some(TagValue::Str("Inf".into())));
+      assert_eq!(pj_val("GPSTrack"), Some(TagValue::Str("-Inf".into())));
+
+      // -n (ValueConv): the raw non-finite F64, unrounded.
+      let mut pn = std::vec::Vec::new();
+      emit_timed_samples(
+        &samples,
+        group_qt,
+        EmitOptions::with_group_mode(ConvMode::ValueConv, true, GroupMode::G3),
+        false,
+        no_measure,
+        raw_alt,
+        |s, g, sc| sp3_speed(s, g, sc, false),
+        &mut pn,
+      );
+      let speed_raw = pn
+        .iter()
+        .find(|t| t.tag().name() == "GPSSpeed")
+        .map(|t| t.tag().value_ref().clone());
+      let track_raw = pn
+        .iter()
+        .find(|t| t.tag().name() == "GPSTrack")
+        .map(|t| t.tag().value_ref().clone());
+      assert_eq!(speed_raw, Some(TagValue::F64(f64::INFINITY)));
+      assert_eq!(track_raw, Some(TagValue::F64(f64::NEG_INFINITY)));
     }
   }
 
