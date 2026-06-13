@@ -1113,7 +1113,23 @@ const _: () = {
         // Otherwise STANDARD string emission: a non-numeric value (a PrintConv
         // label, a `:`/`/`/space-bearing value, `inf`/`undef`/`Inf`/`NaN`)
         // stays a quoted JSON string.
-        TagValue::Str(text) => s.serialize_str(text),
+        //
+        // ExifTool's JSON writer runs `$str =~ tr/\0//d` (`exiftool:3819`) —
+        // it removes EVERY NUL from a string value (NOT just trailing) before
+        // the `\u`-escape of the other control characters. `serde_json`
+        // instead escapes a NUL as `\0`, so a value carrying embedded NULs
+        // (e.g. a RIFF `ltxt` LabeledText whose `substr($val,18)` text region
+        // begins with the unconsumed `int16u` Codepage bytes) would diverge.
+        // Strip the NULs here to match — only allocates when a NUL is present,
+        // which no non-RIFF-cue value carries, so existing output is unchanged.
+        TagValue::Str(text) => {
+          if text.as_bytes().contains(&0) {
+            let stripped: String = text.chars().filter(|&c| c != '\0').collect();
+            s.serialize_str(&stripped)
+          } else {
+            s.serialize_str(text)
+          }
+        }
         TagValue::Bool(b) => s.serialize_bool(*b),
         // ExifTool universal no-`-b` placeholder (a plain string, never
         // numeric). N = byte length. Shares `binary_placeholder` with the
