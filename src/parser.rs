@@ -210,6 +210,64 @@ fn tiff_finalize_file_type(
   resolve_file_type(base_type, t, ext, print_conv)
 }
 
+/// [`tiff_finalize_file_type`] PLUS the two content-based RAW-subtype
+/// refinements `DoProcessTIFF` applies from the file body — faithful to the
+/// CR2-magic `$fileType = 'CR2'` (ExifTool.pm:8636-8641) and the post-walk
+/// `DNGVersion` override (ExifTool.pm:8763-8765), in that order.
+///
+/// `cr2_magic` (the `CR\x02\0` signature at byte 8) makes bundled set
+/// `$fileType = 'CR2'` BEFORE `SetFileType` (ExifTool.pm:8694), so the resolved
+/// type is `CR2` (`image/x-canon-cr2`) regardless of extension — modelled as
+/// `SetFileType('CR2')`, overriding the extension-derived `$t`.
+///
+/// `dng_version` (the `$$self{DNGVersion}` DataMember, set only when the
+/// decoded `DNGVersion` value is Perl-TRUTHY — a count-0 / scalar-`0`
+/// `DNGVersion` is falsy, matching `ExifTool.pm:8763`'s `if ($$self{DNGVersion}
+/// and …)` gate) then drives
+/// `OverrideFileType('DNG')` — but ONLY when the detection-time
+/// `$$self{FILE_TYPE}` is `TIFF` (`base_type == "TIFF"`, the sole `Detected`
+/// Exif dispatch) AND the already-resolved `File:FileType` is not `DNG`/`GPR`
+/// (the `$$self{FileType} !~ /^(DNG|GPR)$/` guard). So a `.dng`-named file
+/// (resolved `DNG` by extension) is NOT re-overridden, while a CR2-with-
+/// DNGVersion (resolved `CR2`) WOULD be promoted to `DNG` — exactly bundled's
+/// precedence (the override runs after, and past, the CR2 magic).
+#[cfg(feature = "exif")]
+fn tiff_finalize_file_type_with_content(
+  base_type: &str,
+  parent_type: &str,
+  ext: Option<&str>,
+  cr2_magic: bool,
+  dng_version: bool,
+  print_conv: bool,
+) -> FileTypeTriplet {
+  // ExifTool.pm:8636-8641 — the CR2 magic supplies `$fileType = 'CR2'`, which
+  // becomes the `SetFileType` argument (ExifTool.pm:8694), bypassing the
+  // extension-derived `$t`. Otherwise keep the extension/parent-type result.
+  let mut t = if cr2_magic {
+    resolve_file_type(base_type, Some("CR2"), ext, print_conv)
+  } else {
+    tiff_finalize_file_type(base_type, parent_type, ext, print_conv)
+  };
+  // ExifTool.pm:8763-8765 — `if ($$self{DNGVersion} and $$self{FILE_TYPE} eq
+  // 'TIFF' and $$self{FileType} !~ /^(DNG|GPR)$/) { OverrideFileType('DNG') }`.
+  // `$$self{FILE_TYPE}` is the detection `$type` (`base_type`), which is "TIFF"
+  // for the standalone-TIFF dispatch; `$$self{FileType}` is the value just
+  // resolved into `t.file_type`.
+  if dng_version && base_type == "TIFF" && !matches!(t.file_type.as_str(), "DNG" | "GPR") {
+    let (ov_ft, ov_ext, ov_mime) = resolve_override_file_type("DNG", print_conv);
+    t.file_type = ov_ft;
+    t.file_type_extension = ov_ext;
+    // ExifTool.pm:9734 `$$self{VALUE}{MIMEType} = $mimeType if $mimeType` — the
+    // in-place MIME rewrite only when a MIME is known. `DNG` has one
+    // (`image/x-adobe-dng`), so this always fires; keep the existing MIME if
+    // `resolve_override_file_type` ever returns `None` (defensive).
+    if let Some(mime) = ov_mime {
+      t.mime_type = mime;
+    }
+  }
+  t
+}
+
 /// The `$t` argument `DoProcessTIFF` feeds to `SetFileType` (ExifTool.pm:8685-
 /// 8690) — the COMPUTATION shared by [`tiff_finalize_file_type`] (which then
 /// resolves the full `File:*` triplet) and [`finalized_tiff_file_type`] (which
@@ -648,8 +706,19 @@ fn extract_info_typed(
           // them too — but routing it only through the Exif arm keeps the
           // TIFF/RAW-specific `$baseType` rule scoped to `DoProcessTIFF`.
           #[cfg(feature = "exif")]
-          let t = if matches!(&meta, crate::format_parser::AnyMeta::Exif(_)) {
-            tiff_finalize_file_type(ft, cand.parent_type(), ext_ref, print_conv_enabled)
+          let t = if let crate::format_parser::AnyMeta::Exif(em) = &meta {
+            // `DoProcessTIFF`'s `SetFileType($t)` (the extension-driven
+            // parent-type rule) THEN the content-based RAW-subtype refinements:
+            // the CR2 magic at byte 8 (`ExifTool.pm:8636-8641`) and the
+            // `DNGVersion` override (`ExifTool.pm:8763-8765`).
+            tiff_finalize_file_type_with_content(
+              ft,
+              cand.parent_type(),
+              ext_ref,
+              em.is_cr2_magic(),
+              em.has_dng_version(),
+              print_conv_enabled,
+            )
           } else {
             resolve_file_type(ft, None, ext_ref, print_conv_enabled)
           };

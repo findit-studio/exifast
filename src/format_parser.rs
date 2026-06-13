@@ -1500,11 +1500,17 @@ impl AnyMeta<'_> {
           FileTypeFinalize::Detected
         }
       }
-      // Exif/TIFF: `DoProcessTIFF` calls `SetFileType($t)` (ExifTool.pm:
-      // 8683) — finalize to the DETECTED candidate type ("TIFF" for a
-      // standalone `.tif`). DNG/NEF/RAW overrides (ExifTool.pm:8754-8765)
-      // depend on MakerNote/DNGVersion tags — deferred to the MakerNotes
-      // wave; the camera-metadata-core TIFF fixtures finalize as TIFF.
+      // Exif/TIFF: `DoProcessTIFF` calls `SetFileType($t)` (ExifTool.pm:8694)
+      // — `Detected`, but the engine's Exif `Detected` arm does NOT use the
+      // bare resolution: it routes through `tiff_finalize_file_type_with_content`
+      // (parser.rs), which applies the extension/parent-type rule PLUS the two
+      // content-based RAW-subtype refinements read off the typed `ExifMeta` —
+      // the CR2 magic (`is_cr2_magic`, ExifTool.pm:8636-8641) and the
+      // `DNGVersion` override (`has_dng_version`, ExifTool.pm:8763-8765). So a
+      // misnamed DNG/CR2 still finalizes to DNG/CR2 from content. The remaining
+      // NEF/RW2/ORF/… body overrides depend on unported vendor tags and stay
+      // deferred. The `Detected` variant carries no payload — the per-Meta
+      // content signals come from the `ExifMeta` accessors, not the enum.
       #[cfg(feature = "exif")]
       AnyMeta::Exif(_) => FileTypeFinalize::Detected,
       // RIFF: `SetFileType($type, $mime)` where `$type` is the body TYPE
@@ -2106,9 +2112,15 @@ impl AnyParser {
         // offsets. The `File:PageCount` gate follows bundled's
         // `$$self{TIFF_TYPE} eq 'TIFF'` (`ExifTool.pm:8715`/`:8767`): ON for a
         // plain `TIFF` candidate Parent, OFF for a TIFF-rooted SUBTYPE
-        // (`DNG`/`NEF`/`CR2`/…), which reaches this arm via its `TIFF` candidate
-        // (`file_type() == "TIFF"`) but carries the subtype as its `parent_type`
-        // — so a multi-page RAW does NOT gain a non-bundled `File:PageCount`.
+        // (`DNG`/`NEF`/`CR2`/…) detected by EXTENSION, which reaches this arm via
+        // its `TIFF` candidate (`file_type() == "TIFF"`) but carries the subtype
+        // as its `parent_type`. A subtype detected by CONTENT instead (a misnamed
+        // DNG via its `DNGVersion` tag, or a CR2 via the `CR\x02\0` magic) passes
+        // `tiff_type_is_tiff = true` here — the parse itself then re-clears the
+        // gate inside `parse_standalone_tiff_with_base` once the walk/header
+        // reveals `TIFF_TYPE` is `DNG`/`CR2` (`ExifTool.pm:8715`/`:8765`), so
+        // neither an extension- nor a content-detected RAW gains a non-bundled
+        // `File:PageCount`.
         let base = u32::try_from(header_skip).unwrap_or(u32::MAX);
         let tiff_type_is_tiff = tiff_parent_type == Some("TIFF");
         // Thread the FINALIZED `$$self{FILE_TYPE}` — the SAME string the engine
@@ -2136,6 +2148,14 @@ impl AnyParser {
           body,
           base,
           tiff_type_is_tiff,
+          // The genuine top-level standalone-TIFF parse IS `$raf`-backed
+          // (`ExifTool.pm:8629`), so the CR2 magic is checked for EVERY such
+          // file regardless of the extension-derived subtype: a CR2 body
+          // renamed `.dng`/`.nef`/`.arw` (where `tiff_type_is_tiff` is false)
+          // still finalizes `File:FileType = CR2`. DISTINCT from
+          // `tiff_type_is_tiff` (the PageCount gate).
+          /* standalone_tiff */
+          true,
           Some(&file_type),
         )
         .map(AnyMeta::Exif)

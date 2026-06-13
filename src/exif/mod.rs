@@ -918,6 +918,33 @@ pub struct ExifMeta<'a> {
   /// inside the engine except for that single CTMD read (exposed via
   /// [`ExifMeta::dispatcher_model`]).
   captured_model: Option<smol_str::SmolStr>,
+  /// `$$self{DNGVersion}` — `true` when IFD0 carried a TRUTHY `DNGVersion`
+  /// (0xc612) value (the walker's [`Walker::dng_version`] tap; Perl-truthiness
+  /// of the RawConv'd `$val`, so a count-0 / scalar-`0` value does NOT set it).
+  /// The engine's TIFF finalization reads it via [`ExifMeta::has_dng_version`]
+  /// to apply
+  /// `DoProcessTIFF`'s `OverrideFileType('DNG')` (`ExifTool.pm:8763-8765`) when
+  /// the container `$$self{FILE_TYPE}` is `TIFF` and the resolved type is not
+  /// already `DNG`/`GPR`. Always `false` for an embedded Exif block (a JPEG /
+  /// PNG / QuickTime / RIFF container is never `$$self{FILE_TYPE} eq 'TIFF'`,
+  /// so the DNG override there is unreachable in bundled).
+  dng_version: bool,
+  /// `true` when this standalone-TIFF header carries the Canon CR2 magic
+  /// `CR\x02\0` at byte 8 (`ExifTool.pm:8633-8641`): TIFF identifier 0x2a,
+  /// IFD0 offset ≥ 16, the full 8-byte signature read at byte 8 succeeds
+  /// (`data[8..16]` exists — `$raf->Read($sig, 8) == 8`, 8634), and its first
+  /// four bytes are `CR\x02\0`. `DoProcessTIFF` sets
+  /// `$fileType = 'CR2'` from this signature, so the engine finalizes
+  /// `File:FileType = CR2` (`image/x-canon-cr2`) regardless of extension —
+  /// including a CR2 body renamed to another RAW extension (`.dng`/`.nef`/
+  /// `.arw`), since the read is gated on the standalone-TIFF `$raf` path
+  /// (`standalone_tiff`, `ExifTool.pm:8629`), NOT on the extension-derived
+  /// `TIFF_TYPE eq 'TIFF'` PageCount gate. Read via [`ExifMeta::is_cr2_magic`].
+  /// Always `false` for an embedded Exif block (a JPEG `APP1` / PNG `eXIf` /
+  /// QuickTime `EXIF` / RIFF `exif` TIFF, the Canon CTMD `0x8769` re-dispatch,
+  /// the CR3 `CMT4` GPS block — none has a top-level `$raf`) — bundled never
+  /// detects CR2 from an embedded block.
+  cr2_magic: bool,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -968,6 +995,31 @@ impl<'a> ExifMeta<'a> {
   #[inline(always)]
   pub const fn multi_page_count(&self) -> Option<u32> {
     self.multi_page_count
+  }
+
+  /// `$$self{DNGVersion}` — `true` when IFD0 carried a TRUTHY `DNGVersion`
+  /// (0xc612) value (Perl-truthiness of the RawConv'd `$val`; a count-0 /
+  /// scalar-`0` value is falsy and does NOT set it).
+  /// `DoProcessTIFF` (`ExifTool.pm:8763`) reads this to override
+  /// `File:FileType` to `DNG` for a TIFF-structured file whose container
+  /// `$$self{FILE_TYPE}` is `TIFF` (regardless of extension). `false` for an
+  /// embedded Exif block (a JPEG/PNG/QuickTime/RIFF container is never
+  /// `FILE_TYPE eq 'TIFF'`, so the override is unreachable there).
+  #[must_use]
+  #[inline(always)]
+  pub const fn has_dng_version(&self) -> bool {
+    self.dng_version
+  }
+
+  /// `true` when this standalone-TIFF header carries the Canon CR2 magic
+  /// `CR\x02\0` at byte 8 (`ExifTool.pm:8633-8641`). The engine reads this to
+  /// finalize `File:FileType = CR2` (`image/x-canon-cr2`) regardless of
+  /// extension. `false` for an embedded Exif block (the CR2 signature read is
+  /// gated on `$raf`, which only the standalone-TIFF dispatch has).
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cr2_magic(&self) -> bool {
+    self.cr2_magic
   }
 
   /// The container's detected FILE_TYPE (`$$self{FILE_TYPE}`) — see the field
@@ -1048,6 +1100,12 @@ impl<'a> ExifMeta<'a> {
       // only from a standalone `0x8769` TIFF (`parse_standalone_tiff_with_base`),
       // never from a JPEG `APP1` merge — so `None` here is correct.
       captured_model: None,
+      // A JPEG container's `$$self{FILE_TYPE}` is "JPEG", never "TIFF", and the
+      // CR2 signature read is gated on the standalone-TIFF `$raf`, so neither
+      // the DNG override (`ExifTool.pm:8763`) nor the CR2 magic
+      // (`ExifTool.pm:8629`) is reachable for an `APP1` Exif merge.
+      dng_version: false,
+      cr2_magic: false,
     }
   }
 
@@ -1111,7 +1169,8 @@ impl FormatParser for ProcessExif {
     // `parse_standalone_tiff_with_base`), so `file_type = None`. A `.tif` is
     // never a CRW, so the ShotInfo pos-22 CRW clause is correctly off.
     parse_tiff(
-      data, /* tiff_type_is_tiff */ true, /* file_type */ None,
+      data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
+      /* file_type */ None,
     )
   }
 }
@@ -1128,7 +1187,8 @@ pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
   // Direct standalone-TIFF lib entry — no candidate `Parent`, so `file_type =
   // None` (see [`ProcessExif::parse`]).
   parse_tiff(
-    data, /* tiff_type_is_tiff */ true, /* file_type */ None,
+    data, /* tiff_type_is_tiff */ true, /* standalone_tiff */ true,
+    /* file_type */ None,
   )
 }
 
@@ -1158,9 +1218,11 @@ pub fn parse_borrowed(data: &[u8]) -> Option<ExifMeta<'_>> {
 pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (QuickTime/RIFF/PNG/MakerNotes seam) — the container's
   // `$$self{FILE_TYPE}` is the OUTER type, never "CRW", so `file_type = None`
-  // (the ShotInfo pos-22 CRW clause stays off).
+  // (the ShotInfo pos-22 CRW clause stays off). `standalone_tiff = false`: an
+  // embedded block has no `$raf`, so the CR2 magic is NOT checked here.
   parse_tiff(
-    block, /* tiff_type_is_tiff */ false, /* file_type */ None,
+    block, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
+    /* file_type */ None,
   )
 }
 
@@ -1179,8 +1241,11 @@ pub fn parse_exif_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_>> {
   // Embedded Exif block (JPEG `APP1`, etc.) — the OUTER container type is never
   // "CRW", so `file_type = None` (the ShotInfo pos-22 CRW clause stays off).
+  // `standalone_tiff = false`: an embedded `APP1` TIFF has no `$raf`, so the CR2
+  // magic is NOT checked here (a JPEG's embedded TIFF must never become CR2).
   parse_tiff_with_base(
-    block, base, /* tiff_type_is_tiff */ false, /* file_type */ None,
+    block, base, /* tiff_type_is_tiff */ false, /* standalone_tiff */ false,
+    /* file_type */ None,
   )
 }
 
@@ -1206,17 +1271,26 @@ pub fn parse_exif_block_with_base(block: &[u8], base: u32) -> Option<ExifMeta<'_
 /// `Some(parent_type)`; it is WRITE-ONLY apart from that single pos-22 read.
 /// (A standalone TIFF/RAW is never a CRW — the CRW path is the unported CIFF
 /// front-end — so this changes no output today.)
+///
+/// `standalone_tiff` is the CR2-magic `$raf` gate (`ExifTool.pm:8629`): the
+/// genuine top-level standalone-TIFF dispatch passes `true` (the CR2 magic IS
+/// checked, regardless of the extension-derived subtype — see
+/// [`parse_tiff_with_base_no_raf`]); the Canon CTMD `MakerNoteCanon`
+/// IFD0-diagnostics re-dispatch passes `false` (an embedded MakerNote blob is
+/// not a top-level `$raf`-backed file, and that caller reads only the IFD0
+/// structural diagnostics — never `is_cr2_magic`).
 #[must_use]
 pub fn parse_standalone_tiff_with_base<'a>(
   block: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
+  standalone_tiff: bool,
   file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   // The returned `ExifMeta<'a>` borrows ONLY from `block` (the IFD bytes); the
   // `file_type` is copied into an owned `SmolStr` inside `parse_tiff_with_base`,
   // so its lifetime is independent and need not appear in the return type.
-  parse_tiff_with_base(block, base, tiff_type_is_tiff, file_type)
+  parse_tiff_with_base(block, base, tiff_type_is_tiff, standalone_tiff, file_type)
 }
 
 /// The Canon CTMD `ProcessExifInfo` `0x8769` ExifIFD re-dispatch
@@ -1242,6 +1316,7 @@ pub fn parse_ctmd_exif_ifd_redispatch(block: &[u8]) -> Option<ExifMeta<'_>> {
     block,
     /* base */ 0,
     /* tiff_type_is_tiff */ false,
+    /* standalone_tiff */ false,
     /* file_type */ None,
     /* no_raf */ true,
     /* ifd0_kind */ IfdKind::Ifd0,
@@ -1268,6 +1343,7 @@ pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
     block,
     /* base */ 0,
     /* tiff_type_is_tiff */ false,
+    /* standalone_tiff */ false,
     /* file_type */ None,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Gps,
@@ -1300,9 +1376,10 @@ pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
 fn parse_tiff<'a>(
   data: &'a [u8],
   tiff_type_is_tiff: bool,
+  standalone_tiff: bool,
   file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
-  parse_tiff_with_base(data, 0, tiff_type_is_tiff, file_type)
+  parse_tiff_with_base(data, 0, tiff_type_is_tiff, standalone_tiff, file_type)
 }
 
 /// Parse a TIFF block whose start sits at file offset `base` (`$$dirInfo{Base}`).
@@ -1321,6 +1398,11 @@ fn parse_tiff<'a>(
 /// stays the outer container's name and never becomes "TIFF" in those
 /// recursive `ProcessTIFF` calls.
 ///
+/// `standalone_tiff` is the CR2-magic `$raf` gate (`ExifTool.pm:8629`): `true`
+/// only for the standalone-TIFF dispatch, `false` for the embedded-block
+/// callers — DISTINCT from `tiff_type_is_tiff` (see
+/// [`parse_tiff_with_base_no_raf`]).
+///
 /// `file_type` is the container's detected `$$self{FILE_TYPE}` — stored on the
 /// resulting [`ExifMeta`] and threaded to the Canon MakerNote decoder for the
 /// `Canon::ShotInfo` pos-22 CRW-allows-0 RawConv (`Canon.pm:2977`/`:2990`).
@@ -1332,12 +1414,14 @@ fn parse_tiff_with_base<'a>(
   data: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
+  standalone_tiff: bool,
   file_type: Option<&str>,
 ) -> Option<ExifMeta<'a>> {
   parse_tiff_with_base_no_raf(
     data,
     base,
     tiff_type_is_tiff,
+    standalone_tiff,
     file_type,
     /* no_raf */ false,
     /* ifd0_kind */ IfdKind::Ifd0,
@@ -1347,6 +1431,19 @@ fn parse_tiff_with_base<'a>(
 /// [`parse_tiff_with_base`] with the no-RAF framing made explicit. `no_raf` is
 /// `false` for every caller except the Canon CTMD `0x8769` ExifIFD re-dispatch
 /// ([`parse_ctmd_exif_ifd_redispatch`]) — see [`Walker::no_raf`].
+///
+/// `standalone_tiff` stands in for ExifTool's `$raf` gate on the CR2-magic read
+/// (`ExifTool.pm:8629`): it is `true` ONLY for the standalone-TIFF parse path
+/// (the top-level `$raf`-backed file — [`parse_tiff`] via [`ProcessExif::parse`]
+/// / [`parse_borrowed`], and [`parse_standalone_tiff_with_base`]), and `false`
+/// for every embedded block (a JPEG `APP1` / PNG `eXIf` / QuickTime `EXIF` /
+/// RIFF `exif` TIFF, the Canon CTMD `0x8769` re-dispatch, the CR3 `CMT4` GPS
+/// block). It is DISTINCT from `tiff_type_is_tiff` (the extension-derived
+/// `$$self{TIFF_TYPE} eq 'TIFF'` PageCount gate, `ExifTool.pm:8767`): the CR2
+/// magic must be computed for EVERY standalone TIFF regardless of the
+/// extension-derived subtype, so a CR2 body renamed `.dng`/`.nef`/`.arw` (whose
+/// extension maps to a RAW subtype ⇒ `tiff_type_is_tiff` false) STILL records
+/// the byte-8 signature and finalizes `File:FileType = CR2` (oracle-verified).
 ///
 /// `ifd0_kind` is the [`IfdKind`] the TOP-LEVEL directory is walked as — almost
 /// always [`IfdKind::Ifd0`] (the standard `ProcessTIFF` entry, whose IFD0 uses
@@ -1360,6 +1457,7 @@ fn parse_tiff_with_base_no_raf<'a>(
   data: &'a [u8],
   base: u32,
   tiff_type_is_tiff: bool,
+  standalone_tiff: bool,
   file_type: Option<&str>,
   no_raf: bool,
   ifd0_kind: IfdKind,
@@ -1394,6 +1492,62 @@ fn parse_tiff_with_base_no_raf<'a>(
   if ifd0_offset < 8 {
     return None;
   }
+  // Canon CR2 magic (`ExifTool.pm:8629-8645`): gated on `$raf` (8629 — the
+  // standalone-TIFF dispatch has one; embedded `APP1`/`eXIf` blocks do not, so
+  // `standalone_tiff` stands in for it) and `$identifier == 0x2a and $offset
+  // >= 16` (8633), then an 8-byte signature read at byte 8 (8634:
+  // `$raf->Read($sig, 8) == 8 or return 0`). A leading `CR\x02\0` (8636/8641)
+  // makes `$fileType = 'CR2'`, so the engine finalizes `File:FileType = CR2`
+  // (`image/x-canon-cr2`) regardless of extension. The gate is
+  // `standalone_tiff`, NOT `tiff_type_is_tiff`: the latter is the
+  // extension-derived `TIFF_TYPE eq 'TIFF'` PageCount gate (false for a CR2
+  // body renamed `.dng`/`.nef`/`.arw`, whose extension maps to a RAW subtype),
+  // and ExifTool's `$raf` CR2 check runs for EVERY standalone TIFF before any
+  // extension-derived subtype is consulted — so the magic wins over the RAW
+  // extension (oracle: CanonRaw.cr2 as foo.dng/foo.nef → CR2). We detect ONLY
+  // the `CR2` signature here (the `\xba\xb0\xac\xbb` "Canon 1D RAW" arm has no
+  // bundled fixture / is out of #181 scope).
+  //
+  // The 8-byte read at 8634 is a HARD prerequisite — and ExifTool's `return 0`
+  // there rejects the WHOLE TIFF, not merely the CR2 arm. Faithful to
+  // `ExifTool.pm:8629-8634`:
+  //
+  // ```perl
+  // if ($raf) {                                    # 8629
+  //     if ($identifier == 0x2a and $offset >= 16) {  # 8633
+  //         $raf->Read($sig, 8) == 8 or return 0;      # 8634
+  // ```
+  //
+  // i.e. for a `$raf`-backed (standalone) classic TIFF whose IFD0 offset is
+  // already ≥ 16, an 8-byte read at byte 8 that comes up short aborts
+  // `DoProcessTIFF` BEFORE any IFD walk — yielding `File format error` / NO
+  // `File:FileType`. So a standalone classic TIFF (`magic == 0x2a`) declaring
+  // `ifd0_offset >= 16` yet shorter than 16 bytes must REJECT the candidate
+  // (return `None`) here, rather than fall through to the lenient IFD walker
+  // (which would recover it to a plain `TIFF` — a divergence). The reject is
+  // PRECISE: it fires only for this malformed/truncated shape (the IFD0 offset
+  // already points past EOF, so the walk would fail/recover anyway); a valid
+  // small TIFF (`ifd0_offset < 16`, or ≥ 16 bytes present) is untouched, as is
+  // every embedded `APP1`/`eXIf` block (gated by `standalone_tiff`). The engine
+  // then exhausts the candidate loop and emits the same finalization `Error`
+  // ExifTool does (`File format error` for a recognized `.tif`, `Unknown file
+  // type` for a dotless name) — oracle-verified on a crafted 12/13/15-byte
+  // `II*\0` + offset-16 header.
+  if standalone_tiff && magic == 0x2a && ifd0_offset >= 16 && data.get(8..16).is_none() {
+    return None;
+  }
+  // The CR2 signature: now that the 8-byte read at byte 8 is guaranteed
+  // satisfiable under the same gate (the reject above bailed otherwise), test
+  // only its leading four bytes for `CR\x02\0` (8636/8641 — `$fileType =
+  // 'CR2'`, so the engine finalizes `File:FileType = CR2` regardless of
+  // extension). The `data.get(8..16).is_some()` clause is retained so this stays
+  // self-evidently panic-free in isolation (bounds-checked `.get()`, no slicing);
+  // it is redundant after the reject but a cheap guard, not a behavior change.
+  let cr2_magic = standalone_tiff
+    && magic == 0x2a
+    && ifd0_offset >= 16
+    && data.get(8..16).is_some()
+    && data.get(8..12) == Some(b"CR\x02\0".as_slice());
 
   // The container `$$self{FILE_TYPE}` — owned once so it can be both threaded
   // to the Canon MakerNote decoder (the pos-22 CRW gate, read at walk time)
@@ -1416,6 +1570,7 @@ fn parse_tiff_with_base_no_raf<'a>(
     active_ifd_offsets: Vec::new(),
     page_count: 0,
     multi_page: false,
+    dng_version: false,
     file_type: file_type.clone(),
     // RAF-backed framing — every caller of this function has an effective RAF
     // (the block IS the whole readable buffer). The no-RAF CTMD `0x8769` hop
@@ -1438,13 +1593,19 @@ fn parse_tiff_with_base_no_raf<'a>(
   );
 
   // `File:PageCount` synthesis (`ExifTool.pm:8756-8757`): emitted ONLY when
-  // the outer file type is "TIFF" (`$$self{TIFF_TYPE} eq 'TIFF'`), i.e. the
-  // standalone-TIFF entry. The embedded paths (PNG `eXIf`, JPEG `APP1`,
+  // `$$self{TIFF_TYPE} eq 'TIFF'`. The embedded paths (PNG `eXIf`, JPEG `APP1`,
   // QuickTime EXIF atom, RIFF `exif` chunk — for those `TIFF_TYPE` is
   // 'PNG'/'APP1'/'QuickTime'/'RIFF') call [`parse_exif_block`] / the
-  // `_with_base` variant, which pass `tiff_type_is_tiff = false` and drop
-  // the synthesized tag. The standalone entry passes `true` and emits the
-  // count when `MultiPage` is set.
+  // `_with_base` variant, which pass `tiff_type_is_tiff = false` and drop the
+  // synthesized tag. The standalone entry passes `true`.
+  //
+  // A content-detected RAW subtype rewrites `$$self{TIFF_TYPE}` away from
+  // "TIFF" BEFORE this `PageCount` check: the CR2 magic sets it directly
+  // (`= 'CR2'`, `ExifTool.pm:8715`) and the `DNGVersion` override sets it to
+  // 'DNG' (`ExifTool.pm:8765`). Both run before `ExifTool.pm:8767`, so neither
+  // a CR2 nor a DNG ever emits `File:PageCount` — suppress it here when the
+  // standalone walk detected either signature.
+  let tiff_type_is_tiff = tiff_type_is_tiff && !cr2_magic && !w.dng_version;
   let multi_page_count = if tiff_type_is_tiff && w.multi_page {
     Some(w.page_count)
   } else {
@@ -1460,6 +1621,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     multi_page_count,
     file_type,
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
+    dng_version: w.dng_version,
+    cr2_magic,
   })
 }
 
@@ -1571,6 +1734,10 @@ fn parse_tiff_with_base_shared<'a>(
     // is gated to the standalone-TIFF dispatch (`tiff_type_is_tiff`).
     page_count: 0,
     multi_page: false,
+    // The `DNGVersion` tap still ticks, but this SHARED path is the embedded
+    // PNG `eXIf` / CTMD `0x8769` parse, never the standalone-TIFF dispatch, so
+    // the DNG override (gated on `FILE_TYPE eq 'TIFF'`) is unreachable from it.
+    dng_version: false,
     // Embedded block (PNG `eXIf`): `$$self{FILE_TYPE}` is "PNG", never "CRW",
     // so the ShotInfo pos-22 CRW clause is off — model it as `None`.
     file_type: None,
@@ -1596,6 +1763,11 @@ fn parse_tiff_with_base_shared<'a>(
     // Embedded block (PNG `eXIf`) — never "CRW" (see the Walker field above).
     file_type: None,
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
+    // Embedded PNG `eXIf` / CTMD `0x8769` block: `$$self{FILE_TYPE}` is the
+    // OUTER container ("PNG"/…), never "TIFF", so the DNG override is
+    // unreachable; the CR2 magic read is gated on the standalone-TIFF `$raf`.
+    dng_version: false,
+    cr2_magic: false,
   };
   (Some(meta), cycle_guard_warnings)
 }
@@ -1761,6 +1933,17 @@ struct Walker<'a, 'g> {
   /// reached (`$$self{PageCount} > 1`). Gates the `File:PageCount`
   /// emission at `ExifTool.pm:8757`.
   multi_page: bool,
+  /// `$$self{DNGVersion}` — sticky flag set when a `DNGVersion` (0xc612) tag
+  /// with a TRUTHY value is seen during the walk, mirroring its `RawConv`
+  /// DataMember side effect (`Exif.pm:3365` `$$self{DNGVersion} = $val`) AND the
+  /// `if ($$self{DNGVersion} and …)` Perl-truthiness gate of `DoProcessTIFF`
+  /// (`ExifTool.pm:8763`), which tests it to override `File:FileType` to `DNG`
+  /// for a TIFF-structured file regardless of extension. The tag is NOT in the
+  /// port's leaf table, so the tap runs before the unknown-tag `return` in
+  /// [`Walker::emit`]; the value is gated through
+  /// [`RawValue::is_perl_truthy`](crate::exif::ifd::RawValue::is_perl_truthy)
+  /// (a count-0 / scalar-`0` `DNGVersion` is falsy → not set) but never emitted.
+  dng_version: bool,
   /// The container's detected `$$self{FILE_TYPE}` (`ExifTool.pm:8715`).
   /// Threaded into the Canon MakerNote decoder so `Canon::ShotInfo` position
   /// 22's RawConv (`Canon.pm:2977`/`:2990`) can keep a raw-0 ExposureTime for
@@ -3114,6 +3297,40 @@ impl Walker<'_, '_> {
           self.multi_page = true;
         }
       }
+    }
+
+    // `DNGVersion` (0xc612) `RawConv` DataMember tap (`Exif.pm:3365`
+    // `$$self{DNGVersion} = $val`). Like `OldSubfileType`, the tag is absent
+    // from the port's leaf table, so the side effect MUST run before the
+    // unknown-tag `return` below. `DoProcessTIFF` (`ExifTool.pm:8763`) reads
+    // `$$self{DNGVersion}` to override `File:FileType` to `DNG`. The DataMember
+    // stores the RawConv'd `$val`, and the override gate is `if
+    // ($$self{DNGVersion} and …)` (`ExifTool.pm:8763`) — PERL TRUTHINESS of that
+    // value, NOT mere tag presence. So the flag must reflect the decoded value's
+    // truthiness: an `int8u[4]` `1 1 0 0`/`0 0 0 0` is truthy → DNG, but a
+    // count-0 (empty `$val == ''`) or scalar-`0` (`$val == '0'`) DNGVersion is
+    // falsy → the file stays a plain TIFF (oracle-confirmed on ExifTool 13.59:
+    // empty/`0` → `FileType TIFF` + `PageCount`; `0 0 0 0` → `DNG`). The OUTER
+    // override is still gated separately on `$$self{FILE_TYPE} eq 'TIFF'`.
+    //
+    // ASSIGNMENT, NOT A LATCH: the RawConv `$$self{DNGVersion} = $val` runs each
+    // time the tag is handled, so the DataMember holds the LAST-handled value;
+    // `DoProcessTIFF` tests that final stored value. Mirror that — ASSIGN the
+    // truthiness on every occurrence (so a later falsy duplicate, e.g. a
+    // count-0/scalar-`0` 0xc612 after a truthy `1 1 0 0`, OVERWRITES the earlier
+    // truthy and the file stays a plain TIFF; the reverse leaves DNG). A sticky
+    // `set-true-only` latch would wrongly keep the earlier truthy.
+    //
+    // TABLE-SCOPED to `%Exif::Main`: DNGVersion's RawConv lives in `%Exif::Main`
+    // (Exif.pm:3353), which the walker applies in the IFD0 / ExifIFD / SubIFD /
+    // trailing-IFD / InteropIFD directories — every IFD walked against the Exif
+    // main [`tables`] table. The GPS IFD ([`IfdKind::Gps`]) is walked against
+    // `%GPS::Main` instead (the same `kind.is_gps()` split that routes the leaf
+    // lookup below to `gps::lookup`), and `%GPS::Main` has NO 0xc612 entry — so
+    // an unknown GPS-IFD tag with id 0xc612 must NOT touch the DataMember. Gate
+    // the assignment on `!kind.is_gps()` to match that scoping exactly.
+    if tag_id == tables::TAG_DNG_VERSION && !kind.is_gps() {
+      self.dng_version = raw.is_perl_truthy();
     }
 
     // `#### eval IsOffset ($val, $et) … $val += $offsetBase` (Exif.pm:7156-
@@ -5958,6 +6175,7 @@ mod tests {
       active_ifd_offsets: Vec::new(),
       page_count: 0,
       multi_page: false,
+      dng_version: false,
       file_type: None,
       // RAF-backed (the standalone-TIFF model the existing tests assume); the
       // no-RAF CTMD `0x8769` path is covered via `parse_ctmd_exif_ifd_redispatch`.

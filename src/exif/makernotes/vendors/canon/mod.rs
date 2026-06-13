@@ -452,7 +452,12 @@ pub fn redispatch_ctmd_makernote_diagnostics(
   // The 1:1 `ProcessExif` IFD0 gate. A header that does not parse ⇒ `None` ⇒ no
   // diagnostic (bundled `ProcessTIFF` `return 0`, no warning).
   let Some(meta) = crate::exif::parse_standalone_tiff_with_base(
-    tiff_block, /* base */ 0, /* tiff_type_is_tiff */ false, /* file_type */ None,
+    tiff_block, /* base */ 0, /* tiff_type_is_tiff */ false,
+    // An embedded `MakerNoteCanon` blob re-dispatched FROM MEMORY is not a
+    // top-level `$raf`-backed file, so the CR2 magic is NOT checked (this
+    // caller reads only the IFD0 structural diagnostics, never `is_cr2_magic`).
+    /* standalone_tiff */
+    false, /* file_type */ None,
   ) else {
     return Vec::new();
   };

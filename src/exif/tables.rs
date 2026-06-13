@@ -96,6 +96,20 @@ pub const TAG_SUBFILE_TYPE: u16 = 0x00fe;
 /// the camera-relevant fixtures carry tag 0xff).
 pub const TAG_OLD_SUBFILE_TYPE: u16 = 0x00ff;
 
+/// `DNGVersion` (0xc612, `Exif.pm:3354-3365`) — the Digital Negative
+/// specification version (`int8u[4]`). Its `RawConv` (`Exif.pm:3365`
+/// `$$self{DNGVersion} = $val`) sets the `$$self{DNGVersion}` DataMember as a
+/// side effect of the IFD walk — even though the tag is itself absent from the
+/// port's leaf table (a deferred-table item, like [`TAG_OLD_SUBFILE_TYPE`]).
+/// That DataMember is what `DoProcessTIFF` (`ExifTool.pm:8763`) tests — via the
+/// Perl-truthiness gate `if ($$self{DNGVersion} and …)` — to override
+/// `File:FileType` to `DNG` for a TIFF-structured file regardless of extension.
+/// The walker taps it before the unknown-tag `next` (`Exif.pm:6757`) drops it
+/// from the emitted entries; the value's truthiness is tracked (a count-0 /
+/// scalar-`0` value is falsy → no override), but the value is never emitted
+/// (the port emits no `IFD0:DNGVersion` tag).
+pub const TAG_DNG_VERSION: u16 = 0xc612;
+
 // ===========================================================================
 // Conversion descriptor — `Conv`
 // ===========================================================================
