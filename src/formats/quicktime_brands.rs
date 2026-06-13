@@ -59,12 +59,18 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 #[cfg(feature = "alloc")]
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+  collections::{BTreeMap, BTreeSet},
+  string::String,
+  vec::Vec,
+};
 
 use smol_str::SmolStr;
 
 use crate::formats::quicktime::MAX_ATOM_DEPTH;
-use crate::metadata::{Cr3Block, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta};
+use crate::metadata::{
+  Cr3Block, Cr3CmtKind, Cr3Meta, HeifExtent, HeifItem, HeifMeta, Jp2Block, Jp2Meta,
+};
 
 // ===========================================================================
 // %ftypLookup brand → (file_type, MIME)
@@ -611,6 +617,15 @@ pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out
     .enumerate()
     .map(|(idx, it)| (it.id(), idx))
     .collect();
+  // #146 — the `iprp` property store: each decoded `ispe`'s 1-based `ipco`
+  // property index + dims, plus the `ipma` item→property associations. Both are
+  // collected during the walk and resolved into `File:ImageWidth`/`Height` AFTER
+  // it completes, mirroring ExifTool's delayed `ipco` processing (QuickTime.pm:
+  // 10361-10364 defers `ipco` until `ipma` + `pitm` are known). The property
+  // index is a `u32` with a checked increment so an `ipco` with >65535 children
+  // cannot overflow a narrower counter and alias one property index onto another.
+  let mut ispe_props: Vec<(u32, u32, u32)> = Vec::new();
+  let mut ipma_assoc: Vec<(u32, Vec<u16>)> = Vec::new();
   walk_boxes(children, children_abs, Size0Behavior::Stop, |h| {
     match h.tag {
       // pitm — PrimaryItemReference (QuickTime.pm:2883-2892).
@@ -764,17 +779,67 @@ pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out
       }
       // iprp — ItemProperties (QuickTime.pm:2897-2900). A container whose
       // children are `ipco` (the property store) and `ipma` (the item→
-      // property associations). SP4 descends only far enough to run the
-      // `ipma` order check (the sibling of the `iinf` out-of-order warning)
-      // and surface ipco/ipma PRESENCE.
-      // TODO(#146): the `ipco` property EXTRACTION (ImageSpatialExtent /
-      // Rotation / Mirroring / ColorSpec) and the per-item `ipma`
-      // Association/Essential VALUES are deferred; this arm discards the
-      // association bytes and only emits the out-of-order warning.
+      // property associations).
+      //
+      // #146 — decode the `ipco` `ispe` (ImageSpatialExtent) property boxes
+      // keyed by their 1-based property index, AND capture the `ipma`
+      // associations, so the primary item's `ispe` resolves to
+      // `File:ImageWidth`/`File:ImageHeight` after the walk. `ipma_order_walk`
+      // also keeps the out-of-order warning (the sibling of the `iinf` check).
+      // The `irot`/`colr`/`pixi` properties are NOT surfaced (no bundled HEIC
+      // fixture exercises them to ground-truth the group/PrintConv).
       b"iprp" => {
         walk_boxes(h.body, 0, Size0Behavior::Stop, |child| {
-          if child.tag == b"ipma" {
-            ipma_order_walk(child.body, meta_abs_offset, out);
+          match child.tag {
+            b"ipco" => {
+              // The `ipco` children are property boxes in declaration order;
+              // ExifTool addresses them by 1-based index (QuickTime.pm:9119,
+              // the `ipma` Association indices). Record each `ispe`'s decoded
+              // dims at its index for the deferred-resolution pass below.
+              //
+              // A SECOND `ipco` in the same `meta` REPLACES the first — it does
+              // NOT accumulate. ExifTool DEFERS the `ipco` directory by a plain
+              // ASSIGNMENT `$$et{ItemPropertyContainer} = [ \%dirInfo, ... ]`
+              // (QuickTime.pm:10363) and `%dupDirOK` whitelists `ipco`
+              // (QuickTime.pm:510), so a later `ipco` overwrites the stored
+              // container and ONLY the LAST one is processed after the meta walk
+              // (QuickTime.pm:9530-9534). The `ipma` association indices then
+              // refer into the LAST `ipco`'s property list. So decode each
+              // `ipco` into a FRESH per-container list and OVERWRITE the pending
+              // `ispe_props` — a stale earlier-`ipco` `ispe` must not survive
+              // (oracle: ipco#1[ispe…] + ipco#2[ispe(W×H)] → the dims resolve
+              // against ipco#2 only).
+              //
+              // The counter is a `u32` with a CHECKED increment so an `ipco`
+              // with >65535 children cannot overflow a narrower type (a debug
+              // panic / release wrap that would alias a high property index
+              // onto a low one). EVERY decoded `ispe` is recorded regardless of
+              // index: ExifTool walks every `ipco` child positionally and a
+              // property is bound to an item only by an `ipma` association, so
+              // an `ispe` at a high index that no `ipma` row references is still
+              // a "main-document" property and FoundTags `ImageWidth`/`Height`
+              // (oracle: a lone `ispe` at `ipco` index 65537 → `File:ImageWidth`
+              // = its width). The list is input-bounded — each `ispe` box is
+              // ≥20 bytes in the file, so the count cannot exceed `len / 20`.
+              let mut this_ipco: Vec<(u32, u32, u32)> = Vec::new();
+              let mut prop_index: u32 = 0;
+              walk_boxes(child.body, 0, Size0Behavior::Stop, |prop| {
+                let Some(next) = prop_index.checked_add(1) else {
+                  return;
+                };
+                prop_index = next;
+                if prop.tag == b"ispe"
+                  && let Some((w, hh)) = decode_ispe(prop.body)
+                {
+                  this_ipco.push((prop_index, w, hh));
+                }
+              });
+              ispe_props = this_ipco;
+            }
+            b"ipma" => {
+              ipma_order_walk(child.body, meta_abs_offset, out, &mut ipma_assoc);
+            }
+            _ => {}
           }
         });
       }
@@ -785,6 +850,21 @@ pub fn walk_heif_meta(body: &[u8], meta_abs_offset: u64, child_start: usize, out
       _ => {}
     }
   });
+  // #146 — emit `File:ImageWidth`/`ImageHeight` from the `ipco` `ispe` boxes.
+  // Done AFTER the walk so `pitm` + `ipma` are known regardless of box order
+  // (ExifTool defers `ipco` until both are set, QuickTime.pm:10361-10364).
+  //
+  // Run whenever THIS meta decoded at least one `ispe`; the association list may
+  // be empty (an unassociated `ispe` is still main-document, see
+  // [`emit_ispe_dimensions`]). `scan_quicktime_brands` walks EVERY `meta` box
+  // into the SAME `HeifMeta`; ExifTool FoundTags `ImageWidth`/`Height` per
+  // main-document `ispe` cumulatively over the whole file, so this NEVER clears
+  // — a later `meta` with no main-document `ispe` (or no `ispe` at all) leaves
+  // the earlier dims intact, and a later main-document `ispe` overrides them
+  // (last-wins).
+  if !ispe_props.is_empty() {
+    emit_ispe_dimensions(&ispe_props, &ipma_assoc, out);
+  }
 }
 
 /// Parse a single `infe` box body into a [`HeifItem`]. Faithful port of
@@ -910,7 +990,12 @@ fn parse_infe(buf: &[u8]) -> Option<HeifItem> {
 /// sibling of the `iinf` out-of-order warning. `meta_abs_offset` is the
 /// enclosing `meta` box's absolute file offset, recorded alongside the warning
 /// (first-wins) so the document-level drain can order it by file position (#159).
-fn ipma_order_walk(body: &[u8], meta_abs_offset: u64, out: &mut HeifMeta) {
+fn ipma_order_walk(
+  body: &[u8],
+  meta_abs_offset: u64,
+  out: &mut HeifMeta,
+  assoc_out: &mut Vec<(u32, Vec<u16>)>,
+) {
   // QuickTime.pm:9295 `return undef if $len < 8`.
   if body.len() < 8 {
     return;
@@ -966,7 +1051,9 @@ fn ipma_order_walk(body: &[u8], meta_abs_offset: u64, out: &mut HeifMeta) {
     };
     pos += 1;
     // QuickTime.pm:9313-9328 — 2 bytes per association when the flags low bit
-    // is set, else 1 byte. The association VALUES are #146; advance past them.
+    // is set, else 1 byte. The low 15/7 bits are the 1-based `ipco` property
+    // index; the top bit is the Essential flag (#146 records the index only —
+    // the property store dispatch needs it to resolve the primary item's `ispe`).
     let assoc_bytes = if flg & 0x01 != 0 {
       usize::from(n) * 2
     } else {
@@ -976,6 +1063,23 @@ fn ipma_order_walk(body: &[u8], meta_abs_offset: u64, out: &mut HeifMeta) {
     if pos + assoc_bytes > len {
       return;
     }
+    let mut indices: Vec<u16> = Vec::with_capacity(usize::from(n));
+    if flg & 0x01 != 0 {
+      // 2-byte entries: `Get16u & 0x7fff` (QuickTime.pm:9317).
+      for j in 0..usize::from(n) {
+        if let Some(tmp) = be_u16(body, pos + j * 2) {
+          indices.push(tmp & 0x7fff);
+        }
+      }
+    } else {
+      // 1-byte entries: `Get8u & 0x7f` (QuickTime.pm:9324).
+      for j in 0..usize::from(n) {
+        if let Some(&tmp) = body.get(pos + j) {
+          indices.push(u16::from(tmp & 0x7f));
+        }
+      }
+    }
+    assoc_out.push((id, indices));
     pos += assoc_bytes;
     // QuickTime.pm:9334 `Warn(...) unless $id > $lastID`; 9335 `$lastID = $id`.
     if let Some(prev) = last_id
@@ -989,6 +1093,102 @@ fn ipma_order_walk(body: &[u8], meta_abs_offset: u64, out: &mut HeifMeta) {
       );
     }
     last_id = Some(id);
+  }
+}
+
+/// Decode an `ispe` (ImageSpatialExtent) box body → `(width, height)` (#146).
+///
+/// Faithful to QuickTime.pm:3034-3046: the box is `[version/flags 4 bytes]
+/// [width int32u BE][height int32u BE]`, gated on `Condition => $$valPt =~
+/// /^\0{4}/` (version/flags == 0). The `RawConv` `unpack("x4N*", $val)` skips
+/// the 4-byte FullBox header and reads the u32 BE dimension array; `return undef
+/// if @dim < 2`. Returns `None` for a non-zero version/flags word or a body
+/// shorter than 12 bytes.
+fn decode_ispe(body: &[u8]) -> Option<(u32, u32)> {
+  // `Condition => '$$valPt =~ /^\0{4}/'` — version/flags must be all-zero.
+  if body.get(..4) != Some(&[0, 0, 0, 0]) {
+    return None;
+  }
+  let width = be_u32(body, 4)?;
+  let height = be_u32(body, 8)?;
+  Some((width, height))
+}
+
+/// Emit `File:ImageWidth`/`File:ImageHeight` from this `meta`'s decoded `ipco`
+/// `ispe` boxes, applying ExifTool's `DOC_NUM` main-document gate (#146).
+///
+/// ExifTool FoundTags `ImageWidth`/`ImageHeight` from the `ispe` `RawConv`
+/// `unless ($$self{DOC_NUM})` (QuickTime.pm:3037-3045). The `ipco` container is
+/// processed LAST (after `ipma` + `pitm`, QuickTime.pm:10361-10364) with
+/// `IsItemProperty` set, and `DOC_NUM` is then derived per property index from
+/// the item→property associations (QuickTime.pm:10196-10238):
+///   * A property whose index NO item associates → `DOC_NUM` left undef → main
+///     document → emits.
+///   * A property associated with the PRIMARY item (`pitm`) → main document →
+///     emits. (For `ispe`, `%dontInherit{ispe} == 1` (QuickTime.pm:497) disables
+///     the refers-to-primary inheritance branches, so ONLY a direct primary
+///     association — or no association at all — counts as main-document.)
+///   * A property associated ONLY by non-primary item(s) → a sub-document
+///     `DOC_NUM` → gated OUT (no dims).
+///
+/// Among all main-document `ispe`, ExifTool's duplicate-`ImageWidth` handling is
+/// last-FoundTag-wins (the non-list `File:ImageWidth` is overwritten in `ipco`
+/// walk order). So this walks `ispe_props` in `ipco` order and keeps the LAST
+/// main-document one (oracle: two unassociated `ispe` 640×480 then 1280×960 →
+/// `File:ImageWidth` = 1280; QuickTime.heic's primary `ispe` at index 2 →
+/// 1596×1064, its index-4 thumbnail `ispe` gated out).
+///
+/// NEVER clears `out`: ExifTool's FoundTag is cumulative across the whole file,
+/// so a later `meta` with no main-document `ispe` leaves the earlier dims intact
+/// (oracle: meta1 primary `ispe` 640×480 + meta2 whose `ispe` is associated only
+/// to a non-primary item → `File:ImageWidth` stays 640), while a later
+/// main-document `ispe` overrides (oracle: meta2's primary `ispe` 11×22 wins).
+fn emit_ispe_dimensions(
+  ispe_props: &[(u32, u32, u32)],
+  assoc: &[(u32, Vec<u16>)],
+  out: &mut HeifMeta,
+) {
+  // `$$et{PrimaryItem} || 0` (QuickTime.pm:10199): ExifTool's Perl `|| 0` folds
+  // a MISSING `pitm` (or a `pitm` of 0) to the EFFECTIVE primary item id `0`. So
+  // an `ipma` row for item id 0 then matches the primary (`$id == $primary`) and
+  // its associated `ispe` is main-document — a no-`pitm` file with an item-0
+  // association DOES emit dims (oracle: no `pitm` + `ipma`{0 → ispe(111×222)} →
+  // `File:ImageWidth` 111). With no `pitm` and only non-zero-id associations,
+  // item 0 has no row so every associated `ispe` is a sub-document and only
+  // UNassociated `ispe` stay main-document.
+  let primary = out.primary_item().unwrap_or(0);
+
+  // Precompute the effective association ONCE, instead of rescanning `assoc`
+  // per `ispe`. A duplicate `ipma` row for an id overwrites the prior one
+  // (QuickTime.pm:9331 `$$items{$id}{Association} = \@association`, a plain `=`),
+  // so the LAST row per id is authoritative. Iterating rows in file order and
+  // overwriting the per-id entry reproduces that last-wins rule (the old
+  // `rfind`-per-distinct-id walk computed the same set, just quadratically).
+  let mut effective: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+  for (id, indices) in assoc {
+    effective.insert(*id, indices.iter().map(|&i| u32::from(i)).collect());
+  }
+
+  // Derive the two per-`ipco`-index lookups in one pass over the effective sets:
+  // every property index referenced by ANY item, and those referenced by the
+  // PRIMARY item. Total work is O(distinct ids × associations per id) = O(input),
+  // done once rather than once per `ispe`.
+  let mut associated_by_any: BTreeSet<u32> = BTreeSet::new();
+  let mut associated_by_primary: BTreeSet<u32> = BTreeSet::new();
+  for (id, indices) in &effective {
+    associated_by_any.extend(indices.iter().copied());
+    if *id == primary {
+      associated_by_primary = indices.clone();
+    }
+  }
+
+  // Walk `ispe_props` in `ipco` order ONCE. Main-document iff no item associates
+  // the index OR the primary does; the in-order walk keeps the LAST such `ispe`.
+  for &(index, w, h) in ispe_props {
+    if !associated_by_any.contains(&index) || associated_by_primary.contains(&index) {
+      out.set_image_width(Some(w));
+      out.set_image_height(Some(h));
+    }
   }
 }
 
@@ -1178,13 +1378,141 @@ const CANON_UUID: [u8; 16] = [
   0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48,
 ];
 
+/// Render one parsed CMT Exif block (`ExifMeta`) into [`EmittedTag`]s for the
+/// requested conv mode, re-stamping its TOP-LEVEL `IFD0` directory to
+/// `top_family1` (CMT1 → `"IFD0"`; CMT2 → `"ExifIFD"`). The
+/// `File:ExifByteOrder` marker (family-0 `File`) and any NESTED sub-IFD group
+/// (ExifIFD/GPS/InteropIFD/IFD1) pass through verbatim — mirroring the CTMD
+/// re-stamp. `meta` is borrowed, so this is called twice (once per mode) on the
+/// SAME parse.
+#[cfg(feature = "alloc")]
+fn render_exif_block(
+  meta: &crate::exif::ExifMeta<'_>,
+  top_family1: &str,
+  print_conv: bool,
+) -> Vec<crate::emit::EmittedTag> {
+  use crate::emit::{EmittedTag, Taggable};
+  use crate::value::Group;
+  let opts =
+    crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+  let mut out = Vec::new();
+  for tag in meta.tags(opts) {
+    let unknown = tag.unknown();
+    let (group, name, value) = tag.into_tag().into_parts();
+    let restamped = if group.family0() == "File" {
+      // `File:ExifByteOrder` (and the gated `File:PageCount`, never set for an
+      // embedded block) keep their `File:File` group.
+      group
+    } else if group.family1() == "IFD0" {
+      // The generic walker's top-level directory → the box's SubDirectory Name.
+      Group::new("EXIF", top_family1)
+    } else {
+      // A nested sub-IFD (ExifIFD/GPS/InteropIFD/IFD1) keeps its DirName.
+      group
+    };
+    out.push(EmittedTag::new(restamped, name, value, unknown));
+  }
+  out
+}
+
+/// Render a CMT3 Canon-MakerNote block (a self-contained TIFF whose IFD0 IS the
+/// Canon MakerNote) into `MakerNotes:Canon` [`EmittedTag`]s for the requested
+/// mode, threading `model` (`$$self{Model}` of the most-recent PRECEDING CMT1)
+/// into `Canon::Main` for its model-conditional sub-tables. Routes through
+/// [`redispatch_ctmd_makernote`](crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote)
+/// (the SAME `ProcessTIFF`-under-`Canon::Main` machinery CTMD's `0x927c` uses).
+#[cfg(feature = "alloc")]
+fn render_cmt3_block(
+  body: &[u8],
+  print_conv: bool,
+  model: Option<&str>,
+) -> Vec<crate::emit::EmittedTag> {
+  use crate::emit::EmittedTag;
+  use crate::value::Group;
+  let group = Group::new("MakerNotes", "Canon");
+  crate::exif::makernotes::vendors::canon::redispatch_ctmd_makernote(body, print_conv, model)
+    .into_iter()
+    .map(|e| {
+      EmittedTag::new(
+        group.clone(),
+        smol_str::SmolStr::new(e.name()),
+        e.value().clone(),
+        e.unknown(),
+      )
+    })
+    .collect()
+}
+
+/// Render a CMT4 GPS block (walked top-level against the GPS table) into
+/// [`EmittedTag`]s for the requested mode. `meta` is borrowed, so this is
+/// called twice (once per mode) on the SAME parse.
+#[cfg(feature = "alloc")]
+fn render_gps_block(
+  meta: &crate::exif::ExifMeta<'_>,
+  print_conv: bool,
+) -> Vec<crate::emit::EmittedTag> {
+  use crate::emit::Taggable;
+  let opts =
+    crate::emit::EmitOptions::g1(crate::emit::ConvMode::from_print_conv(print_conv), false);
+  meta.tags(opts).collect()
+}
+
 /// Walk a Canon-UUID atom body and populate `out`. The UUID prefix has
 /// ALREADY been stripped — `body` is the post-`Start => 16` payload
 /// (QuickTime.pm:1240).
 ///
 /// `abs_offset` is the absolute file offset of `body`'s first byte —
 /// used so CMT block offsets stay file-absolute.
+///
+/// Each CMT1-4 box is a self-contained TIFF / Canon-MakerNote block that
+/// ExifTool re-dispatches through `ProcessTIFF` / `ProcessCMT3`
+/// (Canon.pm:9686-9726): CMT1 → IFD0 (`Exif::Main`), CMT2 → ExifIFD
+/// (`Exif::Main`), CMT3 → MakerNoteCanon (`Canon::Main` via `ProcessCMT3`),
+/// CMT4 → GPS (`GPS::Main`). Those bodies are parsed EAGERLY here, in FILE
+/// order, while the input buffer is in scope — the body is a SUB-SLICE of the
+/// loaded input ([`walk_boxes`] rejects any box whose declared length exceeds
+/// the buffer), so the parse borrows it with NO copy. The decoded tags are
+/// rendered for BOTH conv modes (`-j` PrintConv + `-n` ValueConv, since
+/// emission is mode-dependent) and the resulting OWNED [`EmittedTag`]s stored
+/// on `out` ([`Cr3Meta::push_cmt_tags`]). The raw box bytes are NEVER retained;
+/// only the box LOCATION (offset + length) is recorded
+/// ([`Cr3Meta::record_cmt_location`], a fixed per-kind slot).
+///
+/// This bounds the total CMT allocation to the parsed TAG count (the Exif
+/// walker already caps IFD entries) — proportional to the input size, with NO
+/// per-box growth (an empty CMT box yields no tags) and NO per-`uuid`-atom
+/// amplification (every box appends to the SAME `out`, there is no running
+/// per-atom budget to reset). So multiple moov-level Canon `uuid` atoms, or
+/// millions of tiny / empty CMT boxes, can neither blow memory nor spin CPU.
+///
+/// `$$self{Model}` is FILE-WALK object state, NOT per-`uuid`-atom: ExifTool sets
+/// it whenever ANY IFD0 / CMT1 `Model` (0x0110) is handled, and it persists for
+/// the rest of the moov tree walk. So a CMT3's model-conditional dispatch reads
+/// the most-recent PRECEDING CMT1 `Model` even when that CMT1 was in an EARLIER
+/// Canon `uuid` atom. To match that, the model state is owned by the SCAN
+/// ([`scan_quicktime_brands`]) and threaded in through `current_model` so it
+/// survives across multiple Canon `uuid` atoms in file order. This entry point
+/// is a thin wrapper that runs an ISOLATED walk with a FRESH `None` state (for
+/// standalone callers); the scan uses [`walk_canon_uuid_with_state`] directly.
+/// ExifTool only ASSIGNS `$$self{Model}` when a `Model` tag is handled, so a
+/// model-LESS CMT1 does NOT clear an earlier Model, and a CMT3 before ANY CMT1
+/// sees `None`.
 pub fn walk_canon_uuid(body: &[u8], abs_offset: u64, out: &mut Cr3Meta) {
+  let mut current_model: Option<SmolStr> = None;
+  walk_canon_uuid_with_state(body, abs_offset, out, &mut current_model);
+}
+
+/// [`walk_canon_uuid`] threaded with the FILE-WALK `$$self{Model}` state
+/// (`current_model`) so it persists across multiple Canon `uuid` atoms — the
+/// IFD0 `Model` of the most-recent PRECEDING CMT1 that actually carried one. A
+/// CMT1 with a `Model` UPDATES it; a model-less CMT1 leaves it; a CMT3 READS it
+/// for model-conditional Canon MakerNote sub-tables (Canon.pm:1834, `0x96`).
+pub fn walk_canon_uuid_with_state(
+  body: &[u8],
+  abs_offset: u64,
+  out: &mut Cr3Meta,
+  current_model: &mut Option<SmolStr>,
+) {
   walk_boxes(body, abs_offset, Size0Behavior::Stop, |h| {
     match h.tag {
       // CNCV — CompressorVersion (Canon.pm:9666-9669). The body is an ASCII
@@ -1222,49 +1550,71 @@ pub fn walk_canon_uuid(body: &[u8], abs_offset: u64, out: &mut Cr3Meta) {
           out.set_compressor_version(Some(SmolStr::from(s)));
         }
       }
-      // CMT1 / CMT2 / CMT3 / CMT4 — file-offset + length records.
+      // CMT1 — IFD0 (`Exif::Main`). Parsed ONCE; the parse both updates the
+      // file-walk `$$self{Model}` (read by a later CMT3, even one in a LATER
+      // Canon `uuid` atom) and renders the IFD0 tags for both modes. The Model
+      // is updated ONLY when this CMT1 actually carries one (a model-less CMT1
+      // does not clear an earlier Model).
       b"CMT1" => {
-        let mut b = Cr3Block::new();
-        // Offset is the absolute start of the box payload (past the real
-        // header), and length is the exact payload byte count.
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_cmt1(Some(b));
+        out.record_cmt_location(
+          Cr3CmtKind::Cmt1,
+          Cr3Block::at(h.body_abs_start, h.body.len() as u64),
+        );
+        if let Some(meta) = crate::exif::parse_exif_block(h.body) {
+          if let Some(model) = meta.dispatcher_model() {
+            *current_model = Some(SmolStr::new(model));
+          }
+          let print = render_exif_block(&meta, "IFD0", true);
+          let value = render_exif_block(&meta, "IFD0", false);
+          out.push_cmt_tags(print, value);
+        }
       }
+      // CMT2 — ExifIFD (`Exif::Main`).
       b"CMT2" => {
-        let mut b = Cr3Block::new();
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_cmt2(Some(b));
+        out.record_cmt_location(
+          Cr3CmtKind::Cmt2,
+          Cr3Block::at(h.body_abs_start, h.body.len() as u64),
+        );
+        if let Some(meta) = crate::exif::parse_exif_block(h.body) {
+          let print = render_exif_block(&meta, "ExifIFD", true);
+          let value = render_exif_block(&meta, "ExifIFD", false);
+          out.push_cmt_tags(print, value);
+        }
       }
+      // CMT3 — MakerNoteCanon (`Canon::Main` via `ProcessCMT3`), threaded with
+      // the file-walk `$$self{Model}` of the most-recent PRECEDING CMT1 (or
+      // `None`) — which may have been set in an EARLIER Canon `uuid` atom.
       b"CMT3" => {
-        let mut b = Cr3Block::new();
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_cmt3(Some(b));
+        out.record_cmt_location(
+          Cr3CmtKind::Cmt3,
+          Cr3Block::at(h.body_abs_start, h.body.len() as u64),
+        );
+        let print = render_cmt3_block(h.body, true, current_model.as_deref());
+        let value = render_cmt3_block(h.body, false, current_model.as_deref());
+        out.push_cmt_tags(print, value);
       }
+      // CMT4 — GPS (`GPS::Main`).
       b"CMT4" => {
-        let mut b = Cr3Block::new();
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_cmt4(Some(b));
+        out.record_cmt_location(
+          Cr3CmtKind::Cmt4,
+          Cr3Block::at(h.body_abs_start, h.body.len() as u64),
+        );
+        if let Some(meta) = crate::exif::parse_gps_block(h.body) {
+          let print = render_gps_block(&meta, true);
+          let value = render_gps_block(&meta, false);
+          out.push_cmt_tags(print, value);
+        }
       }
       // CNTH — CanonCNTH preview (Canon.pm:9670-9673).
       b"CNTH" => {
-        let mut b = Cr3Block::new();
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_cnth(Some(b));
+        out.set_cnth(Some(Cr3Block::at(h.body_abs_start, h.body.len() as u64)));
       }
       // THMB — ThumbnailImage (Canon.pm:9727-9733).
       // TODO(#159-followup: CR3 ThumbnailImage): only the THMB block location
       // is recorded; the `(Binary data N bytes, …)` ThumbnailImage extraction
       // is out of camera-indexing scope.
       b"THMB" => {
-        let mut b = Cr3Block::new();
-        b.set_offset(h.body_abs_start)
-          .set_length(h.body.len() as u64);
-        out.set_thmb(Some(b));
+        out.set_thmb(Some(Cr3Block::at(h.body_abs_start, h.body.len() as u64)));
       }
       _ => {}
     }
@@ -1398,12 +1748,18 @@ impl QtTable {
 ///    `QuickTime::Meta` table holds the HEIF item parsers (`iinf`/`iloc`/
 ///    `pitm`/`iprp`) in EVERY position, so a `moov/meta` / `trak/meta` / etc.
 ///    carrying item info IS parsed — at the position-correct offset.
-///  - a Canon-prefix `uuid` box → dispatched to [`walk_canon_uuid`] ONLY when
-///    `table.dispatches_canon_uuid()` (i.e. `table == Movie`,
+///  - a Canon-prefix `uuid` box → dispatched to [`walk_canon_uuid_with_state`]
+///    ONLY when `table.dispatches_canon_uuid()` (i.e. `table == Movie`,
 ///    QuickTime.pm:1239); otherwise it is IGNORED (a top-level / `trak` /
 ///    `udta` Canon `uuid` is not in those tables, so the file stays CRX).
 ///  - any other box that is a recursion edge ([`QtTable::child_table`]) →
 ///    recurse into it with the child table.
+///
+/// `current_model` is the file-walk `$$self{Model}` — a single mutable value
+/// threaded through the WHOLE recursive walk in file order so a CMT3's
+/// model-conditional Canon MakerNote dispatch reads the most-recent preceding
+/// CMT1 `Model` even across multiple Canon `uuid` atoms (or recursion edges).
+/// The top-level caller seeds it with `None`.
 ///
 /// `boxes` is the atom's payload, `abs_offset` its absolute file offset
 /// (folded into per-extent / per-block offsets), `depth` the recursion
@@ -1421,6 +1777,7 @@ pub fn scan_quicktime_brands(
   depth: u32,
   heif: &mut HeifMeta,
   cr3: &mut Cr3Meta,
+  current_model: &mut Option<SmolStr>,
 ) {
   if depth >= MAX_ATOM_DEPTH {
     return;
@@ -1439,12 +1796,21 @@ pub fn scan_quicktime_brands(
     {
       // A Canon-prefix `uuid` is dispatched (CNCV + CR3/CRM override) ONLY
       // from `%Movie` (QuickTime.pm:1239); elsewhere it is not in the table,
-      // so leave the file as CRX.
+      // so leave the file as CRX. The file-walk `$$self{Model}` is threaded
+      // in so a CMT3 here sees a CMT1 `Model` from an EARLIER Canon uuid.
       if table.dispatches_canon_uuid() {
-        walk_canon_uuid(rest, h.body_abs_start + 16, cr3);
+        walk_canon_uuid_with_state(rest, h.body_abs_start + 16, cr3, current_model);
       }
     } else if let Some(child) = table.child_table(h.tag) {
-      scan_quicktime_brands(h.body, h.body_abs_start, child, depth + 1, heif, cr3);
+      scan_quicktime_brands(
+        h.body,
+        h.body_abs_start,
+        child,
+        depth + 1,
+        heif,
+        cr3,
+        current_model,
+      );
     }
   });
 }
@@ -2614,7 +2980,8 @@ mod tests {
   /// standalone `scan_heif_meta` entry point.
   fn scan_heif_meta(data: &[u8], out: &mut HeifMeta) {
     let mut cr3 = Cr3Meta::new();
-    scan_quicktime_brands(data, 0, QtTable::Main, 0, out, &mut cr3);
+    let mut model = None;
+    scan_quicktime_brands(data, 0, QtTable::Main, 0, out, &mut cr3, &mut model);
   }
 
   /// Test shim: run the unified [`scan_quicktime_brands`] from `%Main` over
@@ -2625,7 +2992,8 @@ mod tests {
   /// never dispatched and `cr3` stays empty).
   fn scan_canon_uuid(data: &[u8], out: &mut Cr3Meta) -> bool {
     let mut heif = HeifMeta::new();
-    scan_quicktime_brands(data, 0, QtTable::Main, 0, &mut heif, out);
+    let mut model = None;
+    scan_quicktime_brands(data, 0, QtTable::Main, 0, &mut heif, out, &mut model);
     !out.is_empty()
   }
 

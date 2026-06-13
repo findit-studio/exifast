@@ -366,6 +366,14 @@ pub struct HeifMeta {
   items: Vec<HeifItem>,
   idat_offset: Option<u64>,
   idat_length: Option<u64>,
+  /// `File:ImageWidth` from a main-document `ispe` (ImageSpatialExtent)
+  /// property in `ipco` (QuickTime.pm:3034-3047). The last main-document
+  /// `ispe` in `ipco` order wins (last-FoundTag-wins); a main-document `ispe`
+  /// is one no item associates, or one the primary item associates. `None`
+  /// when no main-document `ispe` was decoded (e.g. a non-HEIF `meta` box). #146.
+  image_width: Option<u32>,
+  /// `File:ImageHeight` from the same main-document `ispe` (#146).
+  image_height: Option<u32>,
   warning: Option<String>,
   /// The absolute file offset of the `meta` box whose walk produced
   /// [`Self::warning`] — recorded first-wins alongside the warning so the
@@ -388,6 +396,8 @@ impl HeifMeta {
       items: Vec::new(),
       idat_offset: None,
       idat_length: None,
+      image_width: None,
+      image_height: None,
       warning: None,
       warning_offset: None,
     }
@@ -424,6 +434,21 @@ impl HeifMeta {
   #[inline(always)]
   pub const fn idat_length(&self) -> Option<u64> {
     self.idat_length
+  }
+
+  /// `File:ImageWidth` — the last main-document `ispe` width (#146). `None`
+  /// when no main-document `ispe` was decoded.
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_width(&self) -> Option<u32> {
+    self.image_width
+  }
+
+  /// `File:ImageHeight` — the last main-document `ispe` height (#146).
+  #[must_use]
+  #[inline(always)]
+  pub const fn image_height(&self) -> Option<u32> {
+    self.image_height
   }
 
   /// First non-fatal warning surfaced during the meta-box walk
@@ -543,6 +568,20 @@ impl HeifMeta {
     self
   }
 
+  /// Setter (`File:ImageWidth` — main-document `ispe` width).
+  #[inline(always)]
+  pub const fn set_image_width(&mut self, v: Option<u32>) -> &mut Self {
+    self.image_width = v;
+    self
+  }
+
+  /// Setter (`File:ImageHeight` — main-document `ispe` height).
+  #[inline(always)]
+  pub const fn set_image_height(&mut self, v: Option<u32>) -> &mut Self {
+    self.image_height = v;
+    self
+  }
+
   /// Setter (warning — first-wins, mirroring the SP1 convention). Leaves
   /// [`Self::warning_offset`] untouched (no position recorded); the production
   /// meta-box walk uses [`Self::set_warning_at`] so the document-level
@@ -606,6 +645,67 @@ impl HeifMeta {
 // Cr3Meta — Canon CR3 / CRM identity
 // ===========================================================================
 
+/// Which Canon `uuid` CMT block a [`Cr3Block`] location is, used to drive the
+/// re-dispatch table (`Image::ExifTool::Canon::uuid`, Canon.pm:9684-9726):
+/// `Cmt1` → IFD0 (`Exif::Main`), `Cmt2` → ExifIFD (`Exif::Main`), `Cmt3` →
+/// MakerNoteCanon (`Canon::Main` via `ProcessCMT3`), `Cmt4` → GPS (`GPS::Main`).
+/// The Canon-`uuid` walk uses it to dispatch each box's eager parse and to
+/// record the box LOCATION in the matching [`Cr3Meta`] slot
+/// ([`Cr3Meta::record_cmt_location`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cr3CmtKind {
+  /// `CMT1` — IFD0 (`Exif::Main`); its IFD0 `Model` seeds `$$self{Model}`.
+  Cmt1,
+  /// `CMT2` — ExifIFD (`Exif::Main`).
+  Cmt2,
+  /// `CMT3` — MakerNoteCanon (`Canon::Main` via `ProcessCMT3`).
+  Cmt3,
+  /// `CMT4` — GPS (`GPS::Main`).
+  Cmt4,
+}
+
+impl Cr3CmtKind {
+  /// The block's 4CC tag as a string (`"CMT1"`..`"CMT4"`).
+  #[must_use]
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Cmt1 => "CMT1",
+      Self::Cmt2 => "CMT2",
+      Self::Cmt3 => "CMT3",
+      Self::Cmt4 => "CMT4",
+    }
+  }
+
+  /// True iff this is [`Self::Cmt1`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cmt1(&self) -> bool {
+    matches!(self, Self::Cmt1)
+  }
+
+  /// True iff this is [`Self::Cmt2`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cmt2(&self) -> bool {
+    matches!(self, Self::Cmt2)
+  }
+
+  /// True iff this is [`Self::Cmt3`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cmt3(&self) -> bool {
+    matches!(self, Self::Cmt3)
+  }
+
+  /// True iff this is [`Self::Cmt4`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn is_cmt4(&self) -> bool {
+    matches!(self, Self::Cmt4)
+  }
+}
+
 /// Typed mirror of the Canon CR3 / CRM (`crx ` brand) container identity
 /// — the `Image::ExifTool::Canon::uuid` atom set (Canon.pm:9657-9738)
 /// reached via the QuickTime UUID-Canon dispatch (QuickTime.pm:1236-1242).
@@ -636,25 +736,50 @@ pub struct Cr3Meta {
   /// 3-char file-type override extracted from `compressor_version`:
   /// `Canon(\w{3})` → `CR3` or `CRM` (Canon.pm:9667).
   override_file_type: Option<SmolStr>,
-  /// Offset / length of CMT1 (IFD0 / TIFF) body — Canon.pm:9684-9692.
+  /// Location (file-absolute offset + length) of the LAST CMT1 box seen
+  /// (Exif IFD0). Last-wins per kind, mirroring ExifTool's `FoundTag`
+  /// last-wins-in-place: a duplicate `CMT1` overwrites this slot. This is a
+  /// FIXED slot, NOT a per-box list — a crafted CR3 with millions of CMT
+  /// boxes cannot grow it (the COUNT-amplification surface is gone).
   cmt1: Option<Cr3Block>,
-  /// Offset / length of CMT2 (ExifIFD) — Canon.pm:9693-9701.
+  /// Location of the last CMT2 box (ExifIFD) — see [`Self::cmt1`].
   cmt2: Option<Cr3Block>,
-  /// Offset / length of CMT3 (Canon MakerNotes) — Canon.pm:9702-9716.
+  /// Location of the last CMT3 box (Canon MakerNotes) — see [`Self::cmt1`].
   cmt3: Option<Cr3Block>,
-  /// Offset / length of CMT4 (GPS) — Canon.pm:9717-9726.
+  /// Location of the last CMT4 box (GPS) — see [`Self::cmt1`].
   cmt4: Option<Cr3Block>,
+  /// The CMT1-4 tags RENDERED for `-j` (PrintConv), in file-walk order. The
+  /// CMT box bodies are TIFF/Canon-MakerNote sub-slices of the input buffer
+  /// that ExifTool re-dispatches through `ProcessTIFF` / `ProcessCMT3`
+  /// (Canon.pm:9686-9726); they are parsed EAGERLY during the Canon-`uuid`
+  /// walk (where the input buffer is in scope) and the resulting OWNED
+  /// [`EmittedTag`]s stored here — the raw bodies are NEVER retained. This
+  /// bounds CMT storage to the parsed TAG count (the Exif walker already caps
+  /// IFD entries), proportional to input size, with NO per-box and NO
+  /// per-`uuid`-atom amplification.
+  cmt_print: Vec<crate::emit::EmittedTag>,
+  /// The CMT1-4 tags rendered for `-n` (ValueConv), in file-walk order — the
+  /// `-n` counterpart of [`Self::cmt_print`] (the same blocks, rendered in the
+  /// other [`ConvMode`](crate::emit::ConvMode); emission is mode-dependent, so
+  /// both renderings are produced once at walk time).
+  cmt_value: Vec<crate::emit::EmittedTag>,
   /// Offset / length of CNTH (CanonCNTH preview) — Canon.pm:9670-9673.
   cnth: Option<Cr3Block>,
   /// Offset / length of THMB (ThumbnailImage) — Canon.pm:9727-9733.
   thmb: Option<Cr3Block>,
-  warning: Option<String>,
 }
 
-/// One Canon CR3 CMT-family block: an absolute file offset + length
-/// into a TIFF/Exif body. Faithful to the Canon::uuid SubDirectory
-/// pattern (Canon.pm:9687-9691).
-#[derive(Debug, Clone, Default)]
+/// One Canon CR3 CMT-family block LOCATION: an absolute file offset + length.
+/// Faithful to the Canon::uuid SubDirectory pattern (Canon.pm:9687-9691).
+///
+/// This records ONLY where a CMT1-4 / CNTH / THMB box sits — it carries NO box
+/// body. The CMT1-4 TIFF/Canon-MakerNote bodies are parsed EAGERLY during the
+/// Canon-`uuid` walk and their decoded tags stored on
+/// [`Cr3Meta::cmt_print`](Cr3Meta) / [`Cr3Meta::cmt_value`](Cr3Meta); keeping
+/// no raw bytes here is what makes a file-controlled wholesale-clone of a
+/// crafted multi-MB CMT box STRUCTURALLY impossible (there is no field to copy
+/// it into).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cr3Block {
   offset: u64,
   length: u64,
@@ -669,6 +794,14 @@ impl Cr3Block {
       offset: 0,
       length: 0,
     }
+  }
+
+  /// A block at `offset` of `length` bytes (the common ctor — the walk records
+  /// each box's location in one call).
+  #[must_use]
+  #[inline(always)]
+  pub const fn at(offset: u64, length: u64) -> Self {
+    Self { offset, length }
   }
 
   /// The block's absolute file offset.
@@ -712,9 +845,10 @@ impl Cr3Meta {
       cmt2: None,
       cmt3: None,
       cmt4: None,
+      cmt_print: Vec::new(),
+      cmt_value: Vec::new(),
       cnth: None,
       thmb: None,
-      warning: None,
     }
   }
 
@@ -734,33 +868,48 @@ impl Cr3Meta {
     self.override_file_type.as_deref()
   }
 
-  /// The CMT1 block (Exif IFD0 — Canon.pm:9684-9692). `None` when no
-  /// CMT1 child was present in the Canon UUID atom.
+  /// The CMT1 block location (Exif IFD0 — Canon.pm:9684-9692). `None` when no
+  /// CMT1 child was present. Last-wins on a duplicate (the LAST CMT1's
+  /// location).
   #[must_use]
   #[inline(always)]
   pub const fn cmt1(&self) -> Option<&Cr3Block> {
     self.cmt1.as_ref()
   }
 
-  /// The CMT2 block (ExifIFD — Canon.pm:9693-9701).
+  /// The CMT2 block location (ExifIFD — Canon.pm:9693-9701; last-wins).
   #[must_use]
   #[inline(always)]
   pub const fn cmt2(&self) -> Option<&Cr3Block> {
     self.cmt2.as_ref()
   }
 
-  /// The CMT3 block (Canon MakerNotes — Canon.pm:9702-9716).
+  /// The CMT3 block location (Canon MakerNotes — Canon.pm:9702-9716; last-wins).
   #[must_use]
   #[inline(always)]
   pub const fn cmt3(&self) -> Option<&Cr3Block> {
     self.cmt3.as_ref()
   }
 
-  /// The CMT4 block (GPS — Canon.pm:9717-9726).
+  /// The CMT4 block location (GPS — Canon.pm:9717-9726; last-wins).
   #[must_use]
   #[inline(always)]
   pub const fn cmt4(&self) -> Option<&Cr3Block> {
     self.cmt4.as_ref()
+  }
+
+  /// The CMT1-4 tags decoded during the Canon-`uuid` walk, rendered for the
+  /// requested [`ConvMode`](crate::emit::ConvMode) (`print_conv` ⇒ `-j`
+  /// PrintConv, else `-n` ValueConv), in file-walk order. The emission path
+  /// pushes these verbatim (the parse already happened at walk time).
+  #[must_use]
+  #[inline(always)]
+  pub fn cmt_tags(&self, print_conv: bool) -> &[crate::emit::EmittedTag] {
+    if print_conv {
+      self.cmt_print.as_slice()
+    } else {
+      self.cmt_value.as_slice()
+    }
   }
 
   /// The CNTH block (CanonCNTH preview — Canon.pm:9670-9673).
@@ -777,13 +926,6 @@ impl Cr3Meta {
     self.thmb.as_ref()
   }
 
-  /// First non-fatal warning surfaced during the Canon UUID walk.
-  #[must_use]
-  #[inline(always)]
-  pub fn warning(&self) -> Option<&str> {
-    self.warning.as_deref()
-  }
-
   /// `true` when no Canon UUID atom (`85 c0 b6 87 82 0f 11 e0 81 11
   /// f4 ce 46 2b 6a 48`) was found in the file's moov tree.
   #[must_use]
@@ -794,9 +936,10 @@ impl Cr3Meta {
       && self.cmt2.is_none()
       && self.cmt3.is_none()
       && self.cmt4.is_none()
+      && self.cmt_print.is_empty()
+      && self.cmt_value.is_empty()
       && self.cnth.is_none()
       && self.thmb.is_none()
-      && self.warning.is_none()
   }
 
   /// Setter (compressor version).
@@ -813,31 +956,34 @@ impl Cr3Meta {
     self
   }
 
-  /// Setter (CMT1).
+  /// Record the LOCATION of a CMT1-4 box (last-wins per kind — a duplicate
+  /// overwrites the slot, mirroring ExifTool's `FoundTag` last-wins-in-place).
+  /// Stores no body; the decoded tags are added separately via
+  /// [`Self::push_cmt_tags`].
   #[inline(always)]
-  pub fn set_cmt1(&mut self, v: Option<Cr3Block>) -> &mut Self {
-    self.cmt1 = v;
+  pub fn record_cmt_location(&mut self, kind: Cr3CmtKind, block: Cr3Block) -> &mut Self {
+    match kind {
+      Cr3CmtKind::Cmt1 => self.cmt1 = Some(block),
+      Cr3CmtKind::Cmt2 => self.cmt2 = Some(block),
+      Cr3CmtKind::Cmt3 => self.cmt3 = Some(block),
+      Cr3CmtKind::Cmt4 => self.cmt4 = Some(block),
+    }
     self
   }
 
-  /// Setter (CMT2).
+  /// Append one CMT block's decoded tags for BOTH conv modes (`-j` PrintConv
+  /// in `print`, `-n` ValueConv in `value`), in file-walk order. Called once
+  /// per CMT box from the Canon-`uuid` walk after the body is parsed; an empty
+  /// box (no parseable TIFF / no tags) appends nothing, so the buffers grow
+  /// with the parsed TAG count, never the box count.
   #[inline(always)]
-  pub fn set_cmt2(&mut self, v: Option<Cr3Block>) -> &mut Self {
-    self.cmt2 = v;
-    self
-  }
-
-  /// Setter (CMT3).
-  #[inline(always)]
-  pub fn set_cmt3(&mut self, v: Option<Cr3Block>) -> &mut Self {
-    self.cmt3 = v;
-    self
-  }
-
-  /// Setter (CMT4).
-  #[inline(always)]
-  pub fn set_cmt4(&mut self, v: Option<Cr3Block>) -> &mut Self {
-    self.cmt4 = v;
+  pub fn push_cmt_tags(
+    &mut self,
+    print: Vec<crate::emit::EmittedTag>,
+    value: Vec<crate::emit::EmittedTag>,
+  ) -> &mut Self {
+    self.cmt_print.extend(print);
+    self.cmt_value.extend(value);
     self
   }
 
@@ -852,15 +998,6 @@ impl Cr3Meta {
   #[inline(always)]
   pub fn set_thmb(&mut self, v: Option<Cr3Block>) -> &mut Self {
     self.thmb = v;
-    self
-  }
-
-  /// Setter (warning).
-  #[inline(always)]
-  pub fn set_warning(&mut self, v: Option<String>) -> &mut Self {
-    if self.warning.is_none() {
-      self.warning = v;
-    }
     self
   }
 }
@@ -1572,13 +1709,14 @@ mod tests {
     let mut m = Cr3Meta::new();
     m.set_compressor_version(Some(SmolStr::new_static("CanonCR3 0.1.00")))
       .set_override_file_type(Some(SmolStr::new_static("CR3")));
-    let mut b1 = Cr3Block::new();
-    b1.set_offset(0x100).set_length(0x40);
-    m.set_cmt1(Some(b1));
+    // CMT box LOCATIONS go in fixed per-kind slots (last-wins); the eager
+    // walk records them with `record_cmt_location`.
+    m.record_cmt_location(Cr3CmtKind::Cmt1, Cr3Block::at(0x100, 0x40));
     assert!(!m.is_empty());
     assert_eq!(m.compressor_version(), Some("CanonCR3 0.1.00"));
     assert_eq!(m.override_file_type(), Some("CR3"));
     assert_eq!(m.cmt1().unwrap().offset(), 0x100);
+    assert_eq!(m.cmt1().unwrap().length(), 0x40);
   }
 
   #[test]
