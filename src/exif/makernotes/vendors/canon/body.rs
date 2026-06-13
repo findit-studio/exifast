@@ -366,10 +366,47 @@ pub fn walk_canon_in_tiff(
       | CanonEntryClass::SilentBadFormat { abort: true } => break,
       _ => continue,
     };
-    let avail = tiff_data.len() - value_data_offset;
-    let Some(mut raw) = read_value(tiff_data, value_data_offset, format, count, avail, order)
-    else {
-      continue;
+    // `0x28` `ImageUniqueID` forces `Format => 'undef'` (`Canon.pm:1729`).
+    // ExifTool's `ProcessExif` overrides the entry's declared numeric format
+    // with `undef` (`Exif.pm:6735-6744`) and re-derives `$count = int($size /
+    // $formatSize['undef'])` BEFORE `ReadValue` runs, so `ReadValue` reads the
+    // ORIGINAL `$size` on-disk bytes (`$size = $count * $formatSize[$declared]`)
+    // verbatim and NEVER runs the declared numeric decode — the verbose dump
+    // literally reads `int8u[16] read as undef[16]`. Take that raw-byte view
+    // HERE, BEFORE `read_value`, so the declared-format path is skipped
+    // entirely: we never enter `read_value`'s count-zero expansion (which would
+    // re-derive `$count` from the trailing buffer that ExifTool's `undef[0]`
+    // view, `$size == 0`, never touches — ExifTool's `ReadValue` returns `''`
+    // for a defined `$count == 0`, `ExifTool.pm:6296-6298`), and never allocate
+    // the discarded numeric `Vec` a large declared count would build. The
+    // window was already proved in-bounds by the `CanonEntryClass::Read`
+    // classification (`$valuePtr + $size <= dataLen` for out-of-line, or the
+    // ≤4-byte inline value inside the entry); recompute it with checked
+    // arithmetic + `get` so a truncated/oversized shape can only yield an empty
+    // (`undef`) value, never an OOB read or panic. The downstream
+    // RawConv (`$val eq "\0" x 16 ? undef : $val`) + hex `ValueConv` then
+    // operate on these original `undef` bytes — NOT on a lossy numeric decode
+    // (which would truncate an `int16u[8]` element > 255, zero out a
+    // `float`/`double`/`rational` shape, or NUL-trim the `Ascii` string). This
+    // makes `int8u[16]` / `int16u[8]` / `int32u[4]` / `undef[16]` / `float[4]`
+    // / `double[2]` / `rational[2]` all read the SAME bytes (oracle-verified
+    // identical hex), keeps embedded NULs, and emits the empty string for a
+    // count-0 entry (oracle: `undef[0]` ⇒ `Canon:ImageUniqueID = ""`).
+    let mut raw = if tag_id == 0x28 {
+      let window = format
+        .byte_size()
+        .checked_mul(count)
+        .and_then(|size| value_data_offset.checked_add(size))
+        .and_then(|end| tiff_data.get(value_data_offset..end))
+        .unwrap_or(&[]);
+      RawValue::Bytes(window.to_vec())
+    } else {
+      let avail = tiff_data.len() - value_data_offset;
+      let Some(decoded) = read_value(tiff_data, value_data_offset, format, count, avail, order)
+      else {
+        continue;
+      };
+      decoded
     };
     // `0x96` is a MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`):
     //

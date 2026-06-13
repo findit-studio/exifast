@@ -3386,3 +3386,509 @@ fn canon_1dmk3_real_fixture_no_bogus_processinginfo_parent() {
     );
   }
 }
+
+// ===========================================================================
+// #223 — sibling class of #177: Canon::Main tags that ARE real `SubDirectory`
+// pointers in Canon.pm were MIS-MARKED `sub_table: None`, so they missed the
+// deferred-SubDirectory suppression arm (#177) and instead hit the LEAF arm,
+// leaking a bogus raw-array PARENT value ExifTool never emits.
+//
+// The first pass corrected 7 SubDirectory pointers + the all-zero `ImageUniqueID`
+// RawConv (`ImageUniqueID` 0x28 is NOT a SubDirectory — `Canon.pm:1732`,
+// `$val eq "\0" x 16 ? undef : $val`). A FULL `%Canon::Main` sweep against
+// Canon.pm then found 23 MORE mis-marked SubDirectory IDs (0x90 CustomFunctions1D
+// was the one Codex flagged): UnknownD30 0x0a, CustomFunctions 0x0f, FaceDetect3
+// 0x2f, TimeInfo 0x35, CustomFunctions1D 0x90, PersonalFunctions 0x91,
+// PersonalFunctionValues 0x92, CanonFlags 0xb0, ModifiedInfo 0xb1,
+// PreviewImageInfo 0xb6, ColorInfo 0x4003, VignettingCorr 0x4015,
+// VignettingCorr2 0x4016, LightingOpt 0x4018, AmbienceInfo 0x4020, MultiExp
+// 0x4021, FilterInfo 0x4024, HDRInfo 0x4025, LogInfo 0x4026, AFConfig 0x4028,
+// RawBurstModeRoll 0x403f, FocusBracketingInfo 0x4053, LevelInfo 0x4059. All are
+// now `sub_table: Some(..)` (suppressed; children stay #84/#85/#87-deferred).
+// (None of the 3 available fixtures CARRIES any of these 23 — they appear only
+// on un-fixtured bodies (1D/1Ds for 0x90, newer bodies for the 0x40xx set) — so
+// the fix is verified by the `canon::tags` table-invariant test plus the
+// synthetic suppression test below, not a fixture diff.) The whole-table guard
+// lives in `canon::tags::canon_tags_subdirectory_rows_are_marked`.
+// ===========================================================================
+
+/// The seven Canon::Main `SubDirectory` parents that #223 corrected from
+/// `sub_table: None` to `Some(..)` — none may appear as a raw parent key (their
+/// child tables stay deferred). `CanonCameraInfo` (0x0d) and `MeasuredColor`
+/// (0xaa) are present in the bundled `MakerNotes_Canon.jpg` (== `t/images/
+/// Canon.jpg`); all seven plus an all-zero `ImageUniqueID` are present in
+/// `Canon1DmkIII.jpg` (`EXIFTOOL_T_IMAGES`).
+#[cfg(feature = "exif")]
+const CANON_223_MISMARKED_SUBDIR_PARENTS: &[&str] = &[
+  "CanonCameraInfo",  // 0x0d   Canon::CameraInfo<Model>
+  "CropInfo",         // 0x98   Canon::CropInfo
+  "CustomFunctions2", // 0x99   CanonCustom::Functions2
+  "AspectInfo",       // 0x9a   Canon::AspectInfo
+  "MeasuredColor",    // 0xaa   Canon::MeasuredColor
+  "ColorData",        // 0x4001 Canon::ColorData<N>
+  "AFMicroAdj",       // 0x4013 Canon::AFMicroAdj
+];
+
+/// #223 — none of the seven mis-marked SubDirectory parents (nor an all-zero
+/// `ImageUniqueID`) may be emitted, while real Canon tags stay present.
+/// Bundled `MakerNotes_Canon.jpg` runs in CI (carries `CanonCameraInfo` +
+/// `MeasuredColor` as the bogus parents — verified against the
+/// `perl exiftool -G1 -j` oracle, which emits NEITHER).
+#[cfg(feature = "json")]
+#[test]
+fn canon_mismarked_subdir_parents_not_emitted() {
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Canon.jpg", print_on);
+    for parent in CANON_223_MISMARKED_SUBDIR_PARENTS {
+      assert!(
+        !map.contains_key(&format!("Canon:{parent}")),
+        "bogus mis-marked SubDirectory parent Canon:{parent} must not be emitted ({mode}); keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+      );
+    }
+    // An all-zero ImageUniqueID (0x28) is dropped by the RawConv; this fixture
+    // has no ImageUniqueID at all, so it must be absent either way.
+    assert!(
+      !map.contains_key("Canon:ImageUniqueID"),
+      "Canon:ImageUniqueID must be absent for this fixture ({mode})"
+    );
+    // Real Canon tags the oracle DOES emit stay present + unchanged.
+    assert!(
+      map.contains_key("Canon:CanonImageType"),
+      "real Canon:CanonImageType must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:LensType"),
+      "walked CameraSettings leaf Canon:LensType must still be present ({mode})"
+    );
+  }
+}
+
+/// #223 — the real `Canon1DmkIII.jpg` (NOT bundled; gated on
+/// `EXIFTOOL_T_IMAGES`) carries ALL SEVEN mis-marked SubDirectory parents
+/// (`CanonCameraInfo`/`CropInfo`/`CustomFunctions2`/`AspectInfo`/
+/// `MeasuredColor`/`ColorData`/`AFMicroAdj`) AND an all-zero `ImageUniqueID`
+/// (0x28 = 16 NUL bytes). The `perl exiftool -G1 -j` oracle emits NONE of
+/// them (it descends the SubDirectories — emitting e.g. `ColorDataVersion`,
+/// `AFMicroAdjMode`, all #84/#85/#87-deferred children this port does not yet
+/// produce — and the RawConv drops the all-zero ImageUniqueID). Assert none of
+/// the eight bogus parents/values leak, while the walked Canon tags stay
+/// present and unchanged.
+#[cfg(feature = "json")]
+#[test]
+fn canon_1dmk3_real_fixture_no_mismarked_subdir_parents() {
+  let Ok(dir) = std::env::var("EXIFTOOL_T_IMAGES") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES not set");
+    return;
+  };
+  let path = format!("{dir}/Canon1DmkIII.jpg");
+  let Ok(data) = std::fs::read(&path) else {
+    eprintln!("skipping: {path} not readable");
+    return;
+  };
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("Canon1DmkIII.jpg", &data, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{json}"));
+    let map = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("doc is not [{{…}}]:\n{json}"));
+    for parent in CANON_223_MISMARKED_SUBDIR_PARENTS {
+      assert!(
+        !map.contains_key(&format!("Canon:{parent}")),
+        "bogus mis-marked SubDirectory parent Canon:{parent} must not be emitted ({mode}); keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+      );
+    }
+    // The all-zero ImageUniqueID (0x28 = 16 NUL bytes) → undef RawConv → dropped.
+    assert!(
+      !map.contains_key("Canon:ImageUniqueID"),
+      "all-zero Canon:ImageUniqueID must be dropped by the RawConv ({mode})"
+    );
+    // The walked Canon tags the oracle DOES emit stay present + unaffected: a
+    // CameraSettings leaf, a SensorInfo leaf (0xe0, walked here), and the
+    // Main-IFD LensModel string (0x95) — proving the suppression is surgical
+    // (only the bogus parents removed). (`WB_RGGBLevels*` on this body come
+    // from the DEFERRED ColorData4 child of 0x4001, so they are oracle-only —
+    // the #84-deferral, out of #223 scope.)
+    assert!(
+      map.contains_key("Canon:ContinuousDrive"),
+      "walked CameraSettings leaf Canon:ContinuousDrive must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:SensorWidth"),
+      "walked SensorInfo leaf Canon:SensorWidth must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:LensModel"),
+      "Main-IFD leaf Canon:LensModel must still be present ({mode})"
+    );
+  }
+}
+
+/// Build a one-entry Canon Main IFD blob (little-endian) carrying tag 0x28
+/// `ImageUniqueID`, with `value_bytes` stored OUT-OF-LINE (>4 bytes) and the
+/// entry declaring TIFF format code `format` with element count `count`. The
+/// 16 on-disk value bytes are written verbatim regardless of the declared
+/// numeric shape — mirroring how ExifTool's `Format => 'undef'` reads the
+/// literal bytes. Mirrors [`canon_mn_one_int16u_array`].
+#[cfg(all(feature = "exif", feature = "std"))]
+fn canon_mn_image_unique_id_shape(format: u16, count: u32, value_bytes: &[u8]) -> Vec<u8> {
+  let mut blob: Vec<u8> = Vec::new();
+  blob.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+  blob.extend_from_slice(&0x28u16.to_le_bytes()); // tag 0x28 ImageUniqueID
+  blob.extend_from_slice(&format.to_le_bytes()); // declared on-disk format
+  blob.extend_from_slice(&count.to_le_bytes()); // element count
+  // value offset: 2-byte count + one 12-byte entry + 4-byte next-IFD = 18.
+  let data_off = 2 + 12 + 4;
+  blob.extend_from_slice(&(data_off as u32).to_le_bytes());
+  blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+  blob.extend_from_slice(value_bytes);
+  blob
+}
+
+/// #223 — `ImageUniqueID` (0x28) `Format => 'undef'` raw-byte handling
+/// (`Canon.pm:1726-1735`): `RawConv => '$val eq "\0" x 16 ? undef : $val'`
+/// then `ValueConv => 'unpack("H*", $val)'`.
+///
+/// ExifTool forces `Format => 'undef'` (`Exif.pm:6735-6744`: override the
+/// declared numeric format with `undef` and re-derive `$count = $size /
+/// $formatSize['undef']`, so `ReadValue` returns the ORIGINAL on-disk
+/// `$size` bytes — the verbose dump literally reads `int8u[16] read as
+/// undef[16]`). It therefore reads the SAME 16 raw value bytes whether the
+/// entry is declared `int8u[16]`, `int16u[8]`, `int32u[4]`, `undef[16]`,
+/// `float[4]`, `double[2]`, or `rational[2]` — a *16-NUL* value is dropped
+/// (undef), and a non-zero value is lowercase-hex-encoded to the SAME string
+/// across every shape. The expected hex string is oracle-cited: a crafted
+/// Canon TIFF with these bytes in each shape was confirmed against `perl
+/// exiftool -G1 -j` to yield
+/// `Canon:ImageUniqueID = "00112233445566778899aabbccddeeff"` identically
+/// (and identically under `-n`); the float/double/rational shapes were
+/// individually oracle-checked to yield the SAME hex (NOT a numeric decode).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_image_unique_id_all_zero_dropped() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  // The oracle-cited 16 raw bytes and their `unpack("H*")` rendering.
+  const ID_BYTES: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+  ];
+  const ID_HEX: &str = "00112233445566778899aabbccddeeff";
+
+  // (format code, element count) for the same 16 raw bytes — every TIFF
+  // shape that multiplies out to 16 on-disk bytes: int8u[16], int16u[8],
+  // int32u[4], undef[16], AND the FLOAT (11) / DOUBLE (12) / RATIONAL (5)
+  // shapes that the previous decode-then-reserialize path zeroed out
+  // (`reserialize_value_bytes` fell through to `Vec::new()` for those).
+  // ExifTool's `undef` read ignores the numeric shape, so every shape yields
+  // the IDENTICAL result (each oracle-verified via `perl exiftool -G1 -j`).
+  for &(format, count) in &[
+    (1u16, 16u32), // int8u[16]
+    (3, 8),        // int16u[8]
+    (4, 4),        // int32u[4]
+    (7, 16),       // undef[16]
+    (11, 4),       // float[4]
+    (12, 2),       // double[2]
+    (5, 2),        // rational[2]
+  ] {
+    // All-zero 16-byte value ⇒ `$val eq "\0" x 16` ⇒ RawConv undef ⇒ dropped
+    // (no emission, typed surface unset). Oracle: an all-zero `int8u[16]`
+    // emits NO `Canon:ImageUniqueID`.
+    let zero_blob = canon_mn_image_unique_id_shape(format, count, &[0u8; 16]);
+    let (typed, em) = canon::parse(&zero_blob, ByteOrder::Little);
+    assert!(
+      !em.iter().any(|e| e.name() == "ImageUniqueID"),
+      "all-zero 16-byte ImageUniqueID must NOT be emitted (format {format}, count {count}); got {:?}",
+      em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
+    );
+    assert!(
+      typed.image_unique_id().is_none(),
+      "all-zero 16-byte ImageUniqueID must not populate the typed surface (format {format}, count {count})"
+    );
+
+    // Non-zero ⇒ emitted hex-encoded, typed surface populated — SAME string
+    // across all shapes (the `undef` read sees the literal 16 bytes).
+    let nz_blob = canon_mn_image_unique_id_shape(format, count, &ID_BYTES);
+    let (typed, em) = canon::parse(&nz_blob, ByteOrder::Little);
+    let emitted = em
+      .iter()
+      .find(|e| e.name() == "ImageUniqueID")
+      .map(|e| e.value().clone());
+    assert_eq!(
+      emitted,
+      Some(exifast::value::TagValue::Str(ID_HEX.into())),
+      "non-zero ImageUniqueID must be hex-encoded from the raw 16 bytes (format {format}, count {count})"
+    );
+    assert_eq!(
+      typed.image_unique_id(),
+      Some(ID_HEX),
+      "non-zero ImageUniqueID must populate the typed surface (format {format}, count {count})"
+    );
+  }
+}
+
+/// #223 R3 — a SHORT all-zero `ImageUniqueID` is EMITTED, not dropped. The
+/// RawConv is `$val eq "\0" x 16` (Perl string equality to EXACTLY sixteen
+/// NUL bytes), NOT `/^\0+$/` — so an all-zero value of any length OTHER than
+/// 16 is NOT equal and survives. Oracle (`perl exiftool -G1 -j` on a crafted
+/// Canon TIFF, tag 0x28 declared `int8u[8]`/`int16u[4]` with eight NUL value
+/// bytes): `"Canon:ImageUniqueID": "0000000000000000"` (eight bytes ⇒ sixteen
+/// hex zeros) — it does NOT drop. The previous port wrongly suppressed ANY
+/// all-zero byte string (`val_bytes.iter().all(|&b| b == 0)`).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_image_unique_id_short_all_zero_is_emitted() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  // Eight NUL bytes ⇒ NOT `"\0" x 16` ⇒ emitted as sixteen hex zeros.
+  const SHORT_ZERO_HEX: &str = "0000000000000000";
+
+  // int8u[8] and int16u[4] both multiply to 8 on-disk bytes; the `undef`
+  // read sees the SAME eight NUL bytes (oracle-identical hex for both).
+  for &(format, count) in &[(1u16, 8u32), (3, 4)] {
+    let blob = canon_mn_image_unique_id_shape(format, count, &[0u8; 8]);
+    let (typed, em) = canon::parse(&blob, ByteOrder::Little);
+    let emitted = em
+      .iter()
+      .find(|e| e.name() == "ImageUniqueID")
+      .map(|e| e.value().clone());
+    assert_eq!(
+      emitted,
+      Some(exifast::value::TagValue::Str(SHORT_ZERO_HEX.into())),
+      "a SHORT (8-byte) all-zero ImageUniqueID must be EMITTED as hex zeros, not dropped (format {format}, count {count})"
+    );
+    assert_eq!(
+      typed.image_unique_id(),
+      Some(SHORT_ZERO_HEX),
+      "a SHORT all-zero ImageUniqueID must populate the typed surface (format {format}, count {count})"
+    );
+  }
+}
+
+/// #223 R3 — a 16-byte value with EMBEDDED NULs (but not all-zero) keeps its
+/// NULs in the hex render — the `Format => 'undef'` read is byte-exact and
+/// does NOT NUL-trim (the previous `Ascii`/`Text` path would have truncated
+/// at the first NUL). Oracle (`perl exiftool -G1 -j` on a crafted Canon TIFF,
+/// tag 0x28 declared `int8u[16]` with bytes `00 ff 00 … 00 aa`):
+/// `"Canon:ImageUniqueID": "00ff00000000000000000000000000aa"` — the full 32
+/// hex chars, including the internal NULs.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_image_unique_id_embedded_nuls_not_truncated() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  // Leading NUL, embedded NUL run, trailing non-NUL — not all-zero, so it
+  // survives the RawConv, and the hex must include every NUL byte.
+  const NUL_BYTES: [u8; 16] = [
+    0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa,
+  ];
+  const NUL_HEX: &str = "00ff00000000000000000000000000aa";
+
+  let blob = canon_mn_image_unique_id_shape(1, 16, &NUL_BYTES);
+  let (typed, em) = canon::parse(&blob, ByteOrder::Little);
+  let emitted = em
+    .iter()
+    .find(|e| e.name() == "ImageUniqueID")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    emitted,
+    Some(exifast::value::TagValue::Str(NUL_HEX.into())),
+    "an ImageUniqueID with embedded NULs must hex-render the FULL 16 bytes (no NUL-trim)"
+  );
+  assert_eq!(typed.image_unique_id(), Some(NUL_HEX));
+}
+
+/// #223 R4 — a `0x28` entry with `count == 0` must take the `Format => 'undef'`
+/// raw-byte view BEFORE `read_value`, so the declared-format decode (and its
+/// count-zero expansion) is skipped: the `undef[0]` value is the EMPTY string,
+/// derived WITHOUT reading/allocating the trailing buffer that follows the IFD.
+///
+/// ExifTool overrides the format to `undef` and re-derives `$count =
+/// int($size / 1)` where `$size = $count_declared * $formatSize[$declared] = 0`
+/// (`Exif.pm:6740-6743`). With a DEFINED `$count == 0`, `ReadValue` returns `''`
+/// immediately (`ExifTool.pm:6296-6298` — it does NOT fall through to `$count =
+/// int($size / $len)`, which only runs for an UNDEFINED count). The `RawConv`
+/// (`'' eq "\0" x 16` is false) keeps `''`, and `unpack("H*", '')` is `''`.
+/// Oracle (`perl exiftool -G1 -j` on a crafted Canon TIFF, tag 0x28 declared
+/// `int8u[0]` with 16 trailing value bytes): `"Canon:ImageUniqueID": ""` — an
+/// EMPTY string, not the hex of the trailing bytes. The pre-R4 code called
+/// `read_value` first, which (seeing `count == 0`, `size == avail`) expanded
+/// `$count` from the WHOLE remaining buffer and allocated a discarded `Vec`
+/// before the `0x28` override replaced it with the (empty) `total_size` window.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_0x28_count_zero_no_trailing_decode() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  // Sixteen NON-zero trailing bytes sit right after the IFD (the helper stores
+  // `value_bytes` at offset 18). A `count == 0` entry is classified INLINE
+  // (`$size == 0 <= 4`), so the raw window is the empty slice at `entry+8`; if
+  // the declared-numeric path ran instead, `read_value` would expand into
+  // these trailing bytes and the hex would be non-empty.
+  const TRAILING: [u8; 16] = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
+  ];
+  // int8u[0] and int32u[0] both multiply to size 0 (inline, empty window).
+  for &(format, count) in &[(1u16, 0u32), (4, 0)] {
+    let blob = canon_mn_image_unique_id_shape(format, count, &TRAILING);
+    let (typed, em) = canon::parse(&blob, ByteOrder::Little);
+    let emitted = em
+      .iter()
+      .find(|e| e.name() == "ImageUniqueID")
+      .map(|e| e.value().clone());
+    // Oracle: `undef[0]` ⇒ empty string (the trailing bytes are NOT decoded).
+    assert_eq!(
+      emitted,
+      Some(exifast::value::TagValue::Str("".into())),
+      "count-0 ImageUniqueID must emit the EMPTY string (undef[0]), not decode the trailing buffer (format {format})"
+    );
+    assert_eq!(
+      typed.image_unique_id(),
+      Some(""),
+      "count-0 ImageUniqueID must populate the typed surface with the empty string (format {format})"
+    );
+  }
+}
+
+/// #223 R4 — a `0x28` entry declaring a HUGE element count must be bounds-safe:
+/// the checked window computation (`byte_size().checked_mul(count)` +
+/// `checked_add` + `get`) never panics and never allocates the discarded
+/// multi-gigabyte numeric `Vec` the pre-R4 `read_value`-first path would have.
+///
+/// `int32u[0x40000000]` ⇒ `$size = 0x40000000 * 4 = 0x1_0000_0000 >
+/// 0x7fffffff`, so `ProcessExif` warns `Invalid size (...)` and skips the entry
+/// (`Exif.pm:6505`); ExifTool emits NO `ImageUniqueID`. The exifast classifier
+/// reaches the SAME verdict (`CanonEntryClass::InvalidSize`, `body.rs`), so the
+/// entry never reaches the `0x28` raw-window code — proving the huge count is
+/// rejected WITHOUT a panic or a large allocation. Oracle (`perl exiftool -G1
+/// -j`): the tag is absent.
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_0x28_large_count_bounded() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  // int32u, count 0x40000000 → declared size 4 GiB, value region truncated to
+  // 16 bytes. Must not panic, must not allocate, must emit nothing.
+  let blob = canon_mn_image_unique_id_shape(4, 0x4000_0000, &[0u8; 16]);
+  let (typed, em) = canon::parse(&blob, ByteOrder::Little);
+  assert!(
+    !em.iter().any(|e| e.name() == "ImageUniqueID"),
+    "a huge-count (int32u[0x40000000]) ImageUniqueID must be rejected with no emission; got {:?}",
+    em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
+  );
+  assert!(
+    typed.image_unique_id().is_none(),
+    "a huge-count ImageUniqueID must not populate the typed surface"
+  );
+}
+
+/// The 23 Canon::Main `SubDirectory` parents the SECOND #223 pass corrected
+/// from `sub_table: None` to a deferred `Some(..)` (`0x90 CustomFunctions1D` is
+/// the one Codex flagged). None appears in any available fixture, so the
+/// suppression is exercised SYNTHETICALLY: each is a real SubDirectory pointer
+/// that — left as `None` — would hit the leaf arm and leak a bogus raw-array
+/// parent ExifTool never emits.
+#[cfg(all(feature = "exif", feature = "std"))]
+const CANON_223_SECOND_PASS_PARENTS: &[(u16, &str)] = &[
+  (0x0a, "UnknownD30"),             // Canon::UnknownD30
+  (0x0f, "CustomFunctions"),        // CanonCustom::Functions<Model>
+  (0x2f, "FaceDetect3"),            // Canon::FaceDetect3
+  (0x35, "TimeInfo"),               // Canon::TimeInfo
+  (0x90, "CustomFunctions1D"),      // CanonCustom::Functions1D
+  (0x91, "PersonalFunctions"),      // CanonCustom::PersonalFuncs
+  (0x92, "PersonalFunctionValues"), // CanonCustom::PersonalFuncValues
+  (0xb0, "CanonFlags"),             // Canon::Flags
+  (0xb1, "ModifiedInfo"),           // Canon::ModifiedInfo
+  (0xb6, "PreviewImageInfo"),       // Canon::PreviewImageInfo
+  (0x4003, "ColorInfo"),            // Canon::ColorInfo
+  (0x4015, "VignettingCorr"),       // Canon::VignettingCorr{,Unknown}
+  (0x4016, "VignettingCorr2"),      // Canon::VignettingCorr2
+  (0x4018, "LightingOpt"),          // Canon::LightingOpt
+  (0x4020, "AmbienceInfo"),         // Canon::Ambience
+  (0x4021, "MultiExp"),             // Canon::MultiExp
+  (0x4024, "FilterInfo"),           // Canon::FilterInfo
+  (0x4025, "HDRInfo"),              // Canon::HDRInfo
+  (0x4026, "LogInfo"),              // Canon::LogInfo
+  (0x4028, "AFConfig"),             // Canon::AFConfig
+  (0x403f, "RawBurstModeRoll"),     // Canon::RawBurstInfo
+  (0x4053, "FocusBracketingInfo"),  // Canon::FocusBracketingInfo
+  (0x4059, "LevelInfo"),            // Canon::LevelInfo
+];
+
+/// #223 (second pass) — a Canon Main IFD carrying tag `id` as an int16u array
+/// must emit NO `Canon:<parent>` raw value: it is a deferred SubDirectory and
+/// is suppressed (the same descend-no-parent-value rule as #177). A co-present
+/// real leaf (`CanonImageType` 0x06) is still emitted, proving the suppression
+/// is surgical and the walk did run. Driven through the public standalone
+/// `canon::parse`, in BOTH `-j` (PrintConv on) and `-n` (off).
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn canon_223_second_pass_subdir_parents_suppressed() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::vendors::canon;
+
+  for &(id, parent) in CANON_223_SECOND_PASS_PARENTS {
+    // Two-entry Main IFD (LE): the SubDirectory tag (out-of-line int16u[8]) +
+    // CanonImageType (0x06, ASCII, out-of-line). If `id` were mis-marked
+    // `None`, the int16u[8] would leak as a bogus `Canon:<parent>` array.
+    let words: [i16; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let image_type = b"CanonTest\x00"; // 10 bytes, out-of-line
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
+    // Entry 1: the deferred SubDirectory tag, int16u(3) count 8, out-of-line.
+    let entries_end = 2 + 12 * 2 + 4; // count + 2 entries + next-IFD
+    let words_off = entries_end;
+    let it_off = words_off + words.len() * 2;
+    blob.extend_from_slice(&id.to_le_bytes());
+    blob.extend_from_slice(&3u16.to_le_bytes()); // int16u
+    blob.extend_from_slice(&(words.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(words_off as u32).to_le_bytes());
+    // Entry 2: CanonImageType 0x06, ASCII(2), out-of-line.
+    blob.extend_from_slice(&0x06u16.to_le_bytes());
+    blob.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    blob.extend_from_slice(&(image_type.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(it_off as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    for &w in &words {
+      blob.extend_from_slice(&w.to_le_bytes());
+    }
+    blob.extend_from_slice(image_type);
+
+    for print_on in [true, false] {
+      let mode = if print_on { "-j" } else { "-n" };
+      let (_typed, em) = canon::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        ByteOrder::Little,
+        print_on,
+        // Use a 1D body so the 0x0f/0x90 model-conditional SubDirectory arms
+        // resolve (they are SubDirectories for EVERY model; the body only
+        // affects WHICH child table, which we defer regardless).
+        Some("Canon EOS-1D"),
+        None,
+      );
+      assert!(
+        !em.iter().any(|e| e.name() == parent),
+        "deferred SubDirectory parent Canon:{parent} (0x{id:04x}) must NOT be emitted ({mode}); \
+         got {:?}",
+        em.iter().map(|e| e.name().to_string()).collect::<Vec<_>>()
+      );
+      // The co-present real leaf still emits — suppression is surgical.
+      assert!(
+        em.iter().any(|e| e.name() == "CanonImageType"),
+        "co-present real leaf Canon:CanonImageType must still be emitted ({mode}) for 0x{id:04x}"
+      );
+    }
+  }
+}
