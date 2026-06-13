@@ -428,6 +428,26 @@ impl RawValue {
     }
   }
 
+  /// Perl boolean truthiness of this value's post-`ReadValue` `$val` — the
+  /// test an `if ($val)` (or `if ($$self{Member})` after a `RawConv` storing
+  /// `$val`) applies. Perl treats a scalar as FALSE only when it is the empty
+  /// string `""` or the one-character string `"0"`; every other value
+  /// (including `"0.0"`, `"0 0 0 0"`, or a multi-element join) is TRUE. The
+  /// `$val` form is taken from [`Self::val_bytes`] (numeric shapes → the
+  /// space-joined `join(' ', @vals)` string `ReadValue` returns; `Text`/`Bytes`
+  /// → the original bytes), so this matches ExifTool's truthiness for any
+  /// shape. A count-0 numeric value yields the empty `$val` (`""`), hence false.
+  ///
+  /// Used by the `DNGVersion` (0xc612) `RawConv` DataMember tap to gate
+  /// `OverrideFileType('DNG')` (`ExifTool.pm:8763` `if ($$self{DNGVersion} …`):
+  /// `int8u[4]` `1 1 0 0`/`0 0 0 0` are TRUE → DNG, while a count-0 (empty) or a
+  /// scalar `0` `DNGVersion` is FALSE → the file stays its non-DNG type.
+  #[must_use]
+  pub fn is_perl_truthy(&self) -> bool {
+    let val = self.val_bytes();
+    !val.is_empty() && &*val != b"0"
+  }
+
   /// The first integer of a SubIFD pointer, as a SIGNED `i64`, accepting BOTH
   /// `U64` and `I64` shapes. `%intFormat` (Exif.pm:125-136) treats the signed
   /// formats (`int8s`/`int16s`/`int32s`/`int64s`) as valid integer offsets, so
