@@ -845,6 +845,108 @@ impl GoProTag {
   }
 }
 
+/// One camera-identity field of [`GoProMeta`], used to record the GPMF-walk
+/// order in which the identity records were extracted so emission reproduces
+/// ExifTool's `HandleTag` stream-position sequence (GoPro.pm:885) instead of a
+/// fixed struct order. Internal to the crate — the emission side
+/// ([`crate::formats::quicktime::emit_gopro_tags`]) consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoProIdentity {
+  /// `DVNM` → `DeviceName`.
+  DeviceName,
+  /// `MINF` → `Model`.
+  Model,
+  /// `CASN` → `CameraSerialNumber`.
+  CameraSerialNumber,
+  /// `FMWR` → `FirmwareVersion`.
+  FirmwareVersion,
+  /// `MUID` → `MediaUniqueID`.
+  MediaUniqueID,
+}
+
+impl GoProIdentity {
+  /// The emitted GoPro tag name for this identity field.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn as_str(self) -> &'static str {
+    match self {
+      Self::DeviceName => "DeviceName",
+      Self::Model => "Model",
+      Self::CameraSerialNumber => "CameraSerialNumber",
+      Self::FirmwareVersion => "FirmwareVersion",
+      Self::MediaUniqueID => "MediaUniqueID",
+    }
+  }
+}
+
+/// One FLAT main-group GPS / system scalar of [`GoProMeta`] — the `%GoPro::GPMF`
+/// tags that emit as a SINGLE main-group leaf (NOT the per-sample `Doc<N>`
+/// telemetry of `GPS5`/`GPS9`/`GLPI`/`KBAT`). Recorded on the unified
+/// [`GoProMeta::main_group_order`] axis so each emits at its GPMF-walk position,
+/// interleaved with the camera-identity and generic settings tags — ExifTool's
+/// `ProcessGoPro` is one linear `HandleTag` loop (GoPro.pm:885), so a crafted
+/// `STRM { GPSU, OREN }` emits `GPSDateTime` BEFORE `AutoRotation`.
+///
+/// The value of each is read LIVE from its dedicated [`GoProMeta`] field at
+/// emission (last-wins for a duplicate); this axis only records WHERE the tag
+/// sits in the walk. Internal to the crate — consumed by
+/// [`crate::formats::quicktime::emit_gopro_tags`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoProScalar {
+  /// `GPSU` → `GPSDateTime` (GoPro.pm:242-248).
+  GpsDateTime,
+  /// `GPSF` → `GPSMeasureMode` (GoPro.pm:230-236).
+  GpsMeasureMode,
+  /// `GPSP` → `GPSHPositioningError` (GoPro.pm:237-241).
+  GpsHPositioningError,
+  /// `GPSA` → `GPSAltitudeSystem` (GoPro.pm:472).
+  GpsAltitudeSystem,
+  /// `SYST` → `SystemTime` (GoPro.pm:390-405).
+  SystemTime,
+}
+
+/// One entry of [`GoProMeta::main_group_order`] — the UNIFIED first-occurrence
+/// GPMF-walk order of EVERY emitted MAIN-GROUP tag: the typed camera-identity
+/// fields, the generic table-driven settings, AND the flat GPS / system scalars
+/// (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`). Emission walks this one ordered stream
+/// so it reproduces ExifTool's single linear `HandleTag` stream-position
+/// sequence (GoPro.pm:885) instead of dumping a whole identity block, then a
+/// settings block, then a GPS-scalar block.
+///
+/// ExifTool's `ProcessGoPro` is one loop that `HandleTag`s each record at its
+/// walk position — `DVNM` (DeviceName), `OREN` (AutoRotation) and `GPSU`
+/// (GPSDateTime) emit in the order their KLV records appear, so a crafted
+/// `STRM { OREN, DVNM }` emits `AutoRotation` before `DeviceName`, and a crafted
+/// `STRM { GPSU, OREN }` emits `GPSDateTime` before `AutoRotation`. The typed
+/// fields keep their dedicated [`GoProMeta`] accessors (the value is read live
+/// = last-wins); this axis only records WHERE each tag sits in the walk.
+///
+/// The per-sample `Doc<N>` telemetry (`GPS5`/`GPS9`/`GLPI`/`KBAT`) is NOT on
+/// this axis — it is emitted as its own block (the first-fix summaries), faithful
+/// to ExifTool's `ProcessString` `Doc<N>` model and untouched by the main-group
+/// walk ordering.
+///
+/// Internal to the crate — consumed by
+/// [`crate::formats::quicktime::emit_gopro_tags`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoProMainGroupTag {
+  /// A typed camera-identity field (`DVNM`/`FMWR`/`CASN`/`MINF`/`MUID`).
+  /// Recorded once, at its first set; the value is read live from the typed
+  /// field (a later duplicate updates the value last-wins but does not move
+  /// the key, matching ExifTool's `%noDups` first-position key ordering).
+  Identity(GoProIdentity),
+  /// A generic table-driven settings tag, by its index into
+  /// [`GoProMeta::generic_tags`]. Recorded for EVERY pushed generic record (a
+  /// duplicate name is emitted at each position and the sink's
+  /// last-wins-in-place dedup keeps the first position + last value).
+  Generic(usize),
+  /// A flat main-group GPS / system scalar (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`).
+  /// Recorded once, at its first set; the value is read live from the dedicated
+  /// [`GoProMeta`] field (last-wins for a duplicate, first-position key per
+  /// `%noDups`).
+  Scalar(GoProScalar),
+}
+
 /// The typed result of GoPro GPMF metadata extraction — the per-format
 /// mirror of every `%GoPro::GPMF` tag this sub-port decodes.
 ///
@@ -877,6 +979,29 @@ pub struct GoProMeta {
   /// raw space-joined value, matching bundled ExifTool. Stored as [`SmolStr`]
   /// (cheap to clone since `MUID` is short and constant per file).
   media_uid: Option<SmolStr>,
+  /// UNIFIED first-occurrence GPMF-walk order of EVERY emitted MAIN-GROUP tag —
+  /// the typed camera-identity fields (`DVNM`/`FMWR`/`CASN`/`MINF`/`MUID`), the
+  /// generic table-driven settings (`OREN`/`PRTN`/… on [`Self::generic_tags`]),
+  /// AND the flat GPS / system scalars (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`).
+  /// ExifTool's `ProcessGoPro` is one linear loop that `HandleTag`s each record
+  /// at its stream position (GoPro.pm:885), so all these tags appear in the
+  /// order their KLV records are walked — identity, settings and GPS scalars
+  /// INTERLEAVED, NOT a whole identity block, then a whole settings block, then
+  /// a GPS-scalar block. A crafted `STRM { OREN, DVNM }` therefore emits
+  /// `AutoRotation` BEFORE `DeviceName`, and `STRM { GPSU, OREN }` emits
+  /// `GPSDateTime` BEFORE `AutoRotation`. The typed surface still stores each
+  /// value in a dedicated field; this axis records the unified walk position so
+  /// [`crate::formats::quicktime::emit_gopro_tags`] reproduces ExifTool's exact
+  /// emission sequence (e.g. real GoPro streams write `DVNM`,`FMWR`,`CASN`,
+  /// `MINF`,`MUID`, then the settings block). An identity / scalar field is
+  /// recorded once, at its first set (a duplicate KLV record updates the value
+  /// last-wins but does not move the key, matching ExifTool's `%noDups`
+  /// first-position key ordering); a generic tag is recorded at EVERY push (a
+  /// duplicate name emits at each position and the sink's last-wins-in-place
+  /// dedup keeps the first position + last value). The per-sample `Doc<N>`
+  /// telemetry (`GPS5`/`GPS9`/`GLPI`/`KBAT`) is NOT on this axis (emitted as its
+  /// own first-fix block, faithful to the `ProcessString` `Doc<N>` model).
+  main_group_order: Vec<GoProMainGroupTag>,
   /// `GPSDateTime` (`GPSU`, GoPro.pm:242-248). The block-level UTC fix the
   /// `GPS5` family is anchored to; `GPS9` carries per-sample timestamps in
   /// the samples themselves.
@@ -946,6 +1071,7 @@ impl GoProMeta {
       camera_serial_number: None,
       firmware_version: None,
       media_uid: None,
+      main_group_order: Vec::new(),
       gps_date_time: None,
       gps_measure_mode: None,
       gps_h_positioning_error_m: None,
@@ -1117,6 +1243,47 @@ impl GoProMeta {
     self
   }
 
+  /// Record that an identity field was extracted at the CURRENT GPMF-walk
+  /// position. Pushes the marker into the unified [`Self::main_group_order`]
+  /// only on first occurrence of that field (a later duplicate KLV record
+  /// updates the stored value last-wins but does not reorder the emitted key,
+  /// matching ExifTool's `%noDups` first-position ordering). The walker calls
+  /// this right after the matching setter.
+  #[inline]
+  pub(crate) fn record_identity(&mut self, field: GoProIdentity) -> &mut Self {
+    let marker = GoProMainGroupTag::Identity(field);
+    if !self.main_group_order.contains(&marker) {
+      self.main_group_order.push(marker);
+    }
+    self
+  }
+
+  /// Record that a flat main-group GPS / system scalar was extracted at the
+  /// CURRENT GPMF-walk position, on first occurrence only (same `%noDups`
+  /// first-position semantics as [`Self::record_identity`]). The walker calls
+  /// this right after the matching typed setter so the scalar emits interleaved
+  /// with the identity / settings tags at its true KLV-walk position
+  /// (GoPro.pm:885), not in a trailing GPS-scalar block.
+  #[inline]
+  pub(crate) fn record_scalar(&mut self, field: GoProScalar) -> &mut Self {
+    let marker = GoProMainGroupTag::Scalar(field);
+    if !self.main_group_order.contains(&marker) {
+      self.main_group_order.push(marker);
+    }
+    self
+  }
+
+  /// The unified MAIN-GROUP-tag (identity + generic settings + GPS / system
+  /// scalars) sequence in GPMF-walk (first-occurrence) order. Empty when this
+  /// [`GoProMeta`] was populated without recording order (e.g. a hand-built test
+  /// fixture); the emission side falls back to the canonical
+  /// identity-then-scalars-then-settings order in that case.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) fn main_group_order(&self) -> &[GoProMainGroupTag] {
+    self.main_group_order.as_slice()
+  }
+
   /// Assign block-level `GPSDateTime`.
   #[inline(always)]
   pub fn set_gps_date_time(&mut self, v: Option<SmolStr>) -> &mut Self {
@@ -1211,10 +1378,16 @@ impl GoProMeta {
     self.generic_tags.as_slice()
   }
 
-  /// Append a table-driven generic tag (GoPro.pm default-visible, non-typed).
+  /// Append a table-driven generic tag (GoPro.pm default-visible, non-typed)
+  /// and record its position in the unified [`Self::main_group_order`] walk so
+  /// it emits interleaved with the identity and GPS-scalar tags at its true
+  /// stream position. A duplicate name is recorded at each push; the sink's
+  /// last-wins-in-place dedup keeps the first position and the last value.
   #[inline(always)]
   pub fn push_generic_tag(&mut self, tag: GoProTag) -> &mut Self {
+    let idx = self.generic_tags.len();
     self.generic_tags.push(tag);
+    self.main_group_order.push(GoProMainGroupTag::Generic(idx));
     self
   }
 }

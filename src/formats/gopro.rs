@@ -121,7 +121,8 @@ use alloc::{
 use smol_str::SmolStr;
 
 use crate::metadata::{
-  GoProConv, GoProGlpiSample, GoProGpsSample, GoProKbat, GoProMeta, GoProTag, GoProTagValue,
+  GoProConv, GoProGlpiSample, GoProGpsSample, GoProIdentity, GoProKbat, GoProMeta, GoProScalar,
+  GoProTag, GoProTagValue,
 };
 
 // ===========================================================================
@@ -468,28 +469,37 @@ impl Walker<'_> {
   ) {
     match tag {
       b"DVNM" => {
-        // GoPro.pm:170-172 — `DeviceName` (`c` ASCII), trim trailing NULs.
-        if let Some(s) = read_ascii(payload) {
-          self.out.set_device_name(Some(SmolStr::from(s)));
-        }
+        // GoPro.pm:170-172 — `DeviceName` (`c` ASCII), trim trailing NULs. A
+        // non-zero-size all-NUL payload NUL-trims to "" and is still
+        // `HandleTag`-emitted (GoPro.pm:845 skips only `$size == 0`, which the
+        // `payload.is_empty()` guard in `visit` already mirrors), so map an
+        // empty `read_ascii` to `Some("")` rather than dropping the tag — and a
+        // later duplicate DVNM whose value is "" wins last (typed setter
+        // overwrites; the recorded device position is kept first).
+        let s = read_ascii(payload).unwrap_or_default();
+        self.out.set_device_name(Some(SmolStr::from(s)));
+        self.out.record_identity(GoProIdentity::DeviceName);
       }
       b"MINF" => {
-        // GoPro.pm:286-290 — `Model`, ASCII `c`.
-        if let Some(s) = read_ascii(payload) {
-          self.out.set_model(Some(SmolStr::from(s)));
-        }
+        // GoPro.pm:286-290 — `Model`, ASCII `c`. Empty-string-emitting +
+        // last-wins like `DVNM` above.
+        let s = read_ascii(payload).unwrap_or_default();
+        self.out.set_model(Some(SmolStr::from(s)));
+        self.out.record_identity(GoProIdentity::Model);
       }
       b"CASN" => {
-        // GoPro.pm:121 — `CameraSerialNumber`, ASCII `c`.
-        if let Some(s) = read_ascii(payload) {
-          self.out.set_camera_serial_number(Some(SmolStr::from(s)));
-        }
+        // GoPro.pm:121 — `CameraSerialNumber`, ASCII `c`. Empty-string-emitting
+        // + last-wins like `DVNM` above.
+        let s = read_ascii(payload).unwrap_or_default();
+        self.out.set_camera_serial_number(Some(SmolStr::from(s)));
+        self.out.record_identity(GoProIdentity::CameraSerialNumber);
       }
       b"FMWR" => {
-        // GoPro.pm:195 — `FirmwareVersion`, ASCII `c`.
-        if let Some(s) = read_ascii(payload) {
-          self.out.set_firmware_version(Some(SmolStr::from(s)));
-        }
+        // GoPro.pm:195 — `FirmwareVersion`, ASCII `c`. Empty-string-emitting +
+        // last-wins like `DVNM` above.
+        let s = read_ascii(payload).unwrap_or_default();
+        self.out.set_firmware_version(Some(SmolStr::from(s)));
+        self.out.record_identity(GoProIdentity::FirmwareVersion);
       }
       b"MUID" => {
         // GoPro.pm:456-462 — `MediaUniqueID`. The "forum12825" entry defines
@@ -520,6 +530,7 @@ impl Walker<'_> {
         }
         if !s.is_empty() {
           self.out.set_media_uid(Some(SmolStr::from(s)));
+          self.out.record_identity(GoProIdentity::MediaUniqueID);
         }
       }
       b"GPSU" => {
@@ -536,6 +547,7 @@ impl Walker<'_> {
           self
             .out
             .set_gps_date_time(Some(SmolStr::from(convert_gpsu(&raw))));
+          self.out.record_scalar(GoProScalar::GpsDateTime);
         }
       }
       b"GPSF" => {
@@ -544,6 +556,7 @@ impl Walker<'_> {
         // Measurement'; the typed surface stores the raw numeric.
         if let Some(v) = be_u32(payload, 0) {
           self.out.set_gps_measure_mode(Some(v));
+          self.out.record_scalar(GoProScalar::GpsMeasureMode);
         }
       }
       b"GPSP" => {
@@ -553,12 +566,14 @@ impl Walker<'_> {
           self
             .out
             .set_gps_h_positioning_error_m(Some(f64::from(v) / 100.0));
+          self.out.record_scalar(GoProScalar::GpsHPositioningError);
         }
       }
       b"GPSA" => {
         // GoPro.pm:472 — `GPSAltitudeSystem` (4-char ID, e.g. 'MSLV').
         if let Some(s) = read_ascii(payload) {
           self.out.set_gps_altitude_system(Some(SmolStr::from(s)));
+          self.out.record_scalar(GoProScalar::GpsAltitudeSystem);
         }
       }
       b"GPS5" => {
@@ -706,7 +721,16 @@ impl Walker<'_> {
 
     let value = self.decode_generic_value(fmt, len, count, payload, apply_scal);
     let Some(value) = value else { return };
-    if value.is_empty() {
+    // GoPro.pm:845 `next unless $size or $verbose` skips ONLY a zero-SIZE
+    // record (the `payload.is_empty()` guard in `visit` already mirrors that);
+    // a non-zero-size `c`/`undef` record whose bytes are all NUL decodes to an
+    // EMPTY STRING that ExifTool still `HandleTag`s (e.g. GoPro.jpg's
+    // 8-NUL-byte `EXPT` ⇒ `GoPro:ExposureType = ""`). So an empty
+    // [`GoProTagValue::Str`] MUST emit. Only a numeric/complex decode that
+    // resolved ZERO elements ([`GoProTagValue::NumList`]/[`Rows`] empty —
+    // a too-short payload that produced no `ReadValue` element) carries nothing
+    // to emit and is dropped.
+    if value.is_empty() && !matches!(value, GoProTagValue::Str(_)) {
       return;
     }
     // `%addUnits` (SCPR/SIMU) carries the captured per-element units so the
@@ -759,9 +783,17 @@ impl Walker<'_> {
       }
       return Some(GoProTagValue::Rows(rows));
     }
-    // `string` (`c`) / `undef` (`F`/`G`/`U`) — the NUL-trimmed text.
+    // `string` (`c`) / `undef` (`F`/`G`/`U`) — the NUL-trimmed text. ExifTool's
+    // `ReadValue($dataPt, $pos, 'string'/'undef', undef, $size)` (GoPro.pm:869)
+    // returns the NUL-trimmed text, which is the EMPTY STRING for an all-NUL
+    // (but non-zero-`$size`) record. `read_ascii` already returns `Some("")` for
+    // that all-NUL case (the helper reserves `None` for the `$size == 0`
+    // payload, which `visit` filters), so the empty `Str` emits — a non-zero
+    // record MUST emit (GoPro.pm:845 only skips `$size == 0`), e.g. GoPro.jpg's
+    // 8-NUL-byte `EXPT` ⇒ `GoPro:ExposureType = ""`.
     if matches!(fmt, 0x63 | 0x46 | 0x47 | 0x55) {
-      return read_ascii(payload).map(|s| GoProTagValue::Str(SmolStr::from(s)));
+      let s = read_ascii(payload).unwrap_or_default();
+      return Some(GoProTagValue::Str(SmolStr::from(s)));
     }
     // Numeric — a FLAT ReadValue list (GoPro.pm:869) with per-column SCAL.
     let flat = read_scalar_vec(fmt, len, count, payload);
@@ -1058,6 +1090,10 @@ impl Walker<'_> {
       .collect::<Vec<_>>()
       .join(", ");
     self.out.set_system_time(SmolStr::from(display));
+    // Record the main-group walk position so `SystemTime` emits at its KLV
+    // position interleaved with the device/settings/GPS-scalar tags. First-set
+    // wins (idempotent), matching `set_system_time`'s first-record semantics.
+    self.out.record_scalar(GoProScalar::SystemTime);
     // GoPro.pm:863 + 396-404: only `$val = $v[0]` (exactly one non-empty row)
     // that splits to EXACTLY two tokens is a calibration pair.
     if let [only] = rows.as_slice()
@@ -1459,6 +1495,20 @@ fn scal_at(scal: &[f64], i: usize) -> f64 {
 /// Read a NUL-terminated / NUL-padded ASCII string from a GPMF `c` (or
 /// `F`/`G`/`U`) payload. Trims trailing NULs.
 fn read_ascii(payload: &[u8]) -> Option<String> {
+  // GoPro.pm:845 `next unless $size or $verbose` skips ONLY a zero-`$size`
+  // record; `visit` already mirrors that (the `payload.is_empty()` guard). For
+  // ANY non-zero-size payload ExifTool's `ReadValue('string')` returns the
+  // NUL-trimmed bytes — which is the EMPTY STRING for an all-NUL (or
+  // leading-NUL) payload, and ExifTool still `HandleTag`s it (oracle-confirmed:
+  // an all-NUL RMRK/GPSU/GPSA emits `""`, and GoPro.jpg's 8-NUL `EXPT` emits
+  // `ExposureType = ""`). So return `Some("")` for an all-NUL payload and
+  // reserve `None` for a genuinely empty payload (the `$size == 0` case, never
+  // reached through `visit`). This makes EVERY string tag — typed identity,
+  // generic, RMRK→Comments, GPSU, GPSA — uniformly emit the empty string at the
+  // helper, with no per-arm patching.
+  if payload.is_empty() {
+    return None;
+  }
   let end = payload
     .iter()
     .position(|&b| b == 0)
@@ -1466,13 +1516,11 @@ fn read_ascii(payload: &[u8]) -> Option<String> {
   // `end <= payload.len()` by construction (a found NUL index or the length),
   // so the checked slice is always `Some`.
   let slice = payload.get(..end)?;
-  if slice.is_empty() {
-    return None;
-  }
   // Faithful: ExifTool's string ReadValue keeps non-ASCII as raw bytes;
   // the GoPro module then re-decodes via `Latin` for the RMRK/SIUN/UNIT
   // strings. The typed surface targets ASCII-only fields (model, serial,
-  // firmware, GPSU, GPSA) — UTF-8-lossy is a safe rendering.
+  // firmware, GPSU, GPSA) — UTF-8-lossy is a safe rendering. An empty `slice`
+  // (all-NUL payload) yields the empty string.
   Some(String::from_utf8_lossy(slice).into_owned())
 }
 
@@ -1870,15 +1918,21 @@ fn read_unit_strings(fmt: u8, len: usize, count: usize, payload: &[u8]) -> Vec<S
 /// the Unicode code point of the same value. Trailing NULs are trimmed first
 /// (the `c`-format records are NUL-padded). Returns `None` for an empty result.
 fn read_latin1(payload: &[u8]) -> Option<String> {
+  // Same faithfulness contract as [`read_ascii`]: a NON-zero-size payload
+  // always decodes (the empty string for an all-NUL payload), and `None` is
+  // reserved for the `$size == 0` case that `visit` already filters. This makes
+  // an all-NUL `RMRK` emit `GoPro:Comments = ""` (oracle-confirmed) rather than
+  // dropping the tag.
+  if payload.is_empty() {
+    return None;
+  }
   let end = payload
     .iter()
     .position(|&b| b == 0)
     .unwrap_or(payload.len());
   let slice = payload.get(..end)?;
-  if slice.is_empty() {
-    return None;
-  }
-  // Latin-1 → UTF-8: each byte is its own code point (`char::from(byte)`).
+  // Latin-1 → UTF-8: each byte is its own code point (`char::from(byte)`). An
+  // empty `slice` (all-NUL payload) yields the empty string.
   Some(slice.iter().map(|&b| char::from(b)).collect())
 }
 
@@ -3764,6 +3818,21 @@ mod tests {
   fn read_latin1_decodes_high_bytes() {
     // 0xE9 = é in Latin-1 ⇒ the Unicode code point U+00E9.
     assert_eq!(read_latin1(b"caf\xe9\0\0").as_deref(), Some("caf\u{e9}"));
-    assert_eq!(read_latin1(b"\0\0").as_deref(), None);
+    // A NON-zero-size all-NUL payload NUL-trims to the EMPTY STRING and still
+    // decodes (GoPro.pm:845 skips only `$size == 0`); `None` is reserved for a
+    // genuinely empty (`$size == 0`) payload, which `visit` filters upstream.
+    assert_eq!(read_latin1(b"\0\0").as_deref(), Some(""));
+    assert_eq!(read_latin1(b"").as_deref(), None);
+  }
+
+  #[test]
+  fn read_ascii_all_nul_is_empty_string_not_none() {
+    // Parallel faithfulness contract to `read_latin1`: a non-zero-size all-NUL
+    // payload decodes to "" (so every `c`/string tag — typed identity, generic,
+    // GPSU, GPSA — emits the empty string), and only a `$size == 0` payload is
+    // `None`.
+    assert_eq!(read_ascii(b"Camera\0\0").as_deref(), Some("Camera"));
+    assert_eq!(read_ascii(&[0u8; 6]).as_deref(), Some(""));
+    assert_eq!(read_ascii(b"").as_deref(), None);
   }
 }
