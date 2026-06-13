@@ -1186,6 +1186,58 @@ fn canon_unknown_tags_suppressed_in_default_output() {
   }
 }
 
+/// #177 — a DEFERRED (non-walked) Canon SubDirectory tag must NOT leak its raw
+/// value as a bogus `Canon:<parent>` key. ExifTool descends into the child
+/// table and emits its leaves but NEVER the SubDirectory PARENT (`Exif.pm` `next
+/// unless $doMaker or … or $$tagInfo{BlockExtract}` skips `FoundTag` for a
+/// no-value SubDirectory row); the port mirrors that by suppressing the parent
+/// in the Canon vendor walk's deferred-SubDirectory arm (same class as the
+/// merged #96 R14 Sony/Panasonic fix). `MakerNotes_Canon.jpg` (== bundled
+/// `t/images/Canon.jpg`) carries ONLY walked SubDirectories (CameraSettings /
+/// ShotInfo / FileInfo / ColorBalance / AFInfo), so none of the deferred
+/// parent names may ever appear — and the walked leaves stay present unchanged.
+/// (The Canon1DmkIII.jpg `EXIFTOOL_T_IMAGES` test exercises the `ProcessingInfo`
+/// trigger that this `Canon.jpg` lacks.)
+#[cfg(feature = "json")]
+#[test]
+fn canon_deferred_subdir_parents_not_emitted() {
+  // The Canon::Main names whose `SubDirectory` the port DEFERS (not walked):
+  // `CANON_DEFERRED_SUBDIR_PARENTS` is the `is_walked() == false` set.
+  const CANON_DEFERRED_SUBDIR_PARENTS: &[&str] = &[
+    "CanonPanorama",  // 0x05  Canon::Panorama
+    "MovieInfo",      // 0x11  Canon::MovieInfo
+    "MyColors",       // 0x1d  Canon::MyColors
+    "FaceDetect1",    // 0x24  Canon::FaceDetect1
+    "FaceDetect2",    // 0x25  Canon::FaceDetect2
+    "ContrastInfo",   // 0x27  Canon::ContrastInfo
+    "WBInfo",         // 0x29  Canon::WBInfo
+    "ProcessingInfo", // 0xa0  Canon::Processing
+    "LensInfo",       // 0x4019 Canon::LensInfo
+    "SerialInfo",     // 0x96 first arm (EOS 5D) Canon::SerialInfo
+  ];
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let map = extract_info_map("MakerNotes_Canon.jpg", print_on);
+    for parent in CANON_DEFERRED_SUBDIR_PARENTS {
+      assert!(
+        !map.contains_key(&format!("Canon:{parent}")),
+        "bogus deferred SubDirectory parent Canon:{parent} must not be emitted ({mode}); keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+      );
+    }
+    // The WALKED leaves are unaffected — a CameraSettings leaf (LensType) and
+    // a ColorBalance leaf (WB_RGGBLevelsAuto) the oracle DOES emit stay present.
+    assert!(
+      map.contains_key("Canon:LensType"),
+      "walked CameraSettings leaf Canon:LensType must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:WB_RGGBLevelsAuto"),
+      "walked ColorBalance leaf Canon:WB_RGGBLevelsAuto must still be present ({mode})"
+    );
+  }
+}
+
 /// Unknown-tag suppression (Apple) — the `Unknown => 1` Apple MakerNote tags
 /// (`Apple.pm` AEMatrix 0x0002, ImageProcessingFlags 0x0019, SceneFlags
 /// 0x0025, …) are OMITTED from the default `-j -G1` output. This fixture
@@ -3271,4 +3323,66 @@ fn samsung_srw_body_without_tiff_type_does_not_reach_samsung2() {
      Samsung2, got {:?}",
     mn.vendor()
   );
+}
+
+// ===========================================================================
+// #177 — Canon1DmkIII.jpg (NOT bundled; gated on EXIFTOOL_T_IMAGES) is the real
+// fixture that carries a DEFERRED `ProcessingInfo` (0xa0) SubDirectory, the
+// concrete trigger for the bogus-parent bug. (The bundled Canon.jpg has only
+// walked SubDirectories, so it cannot exercise the deferred arm.)
+// ===========================================================================
+
+/// #177 — the deferred `ProcessingInfo` (0xa0 → Canon::Processing) SubDirectory
+/// in Canon1DmkIII.jpg must NOT leak as a bogus `Canon:ProcessingInfo` key,
+/// while the walked Canon tags the oracle emits stay present and unchanged.
+///
+/// Oracle (`perl exiftool -G1 -j t/images/Canon1DmkIII.jpg`) emits NO
+/// `Canon:ProcessingInfo` (it descends into `Canon::Processing` and emits its
+/// leaves but never the parent). The bundled fixtures dir is supplied via the
+/// `EXIFTOOL_T_IMAGES` env var (ExifTool's `t/images`); the test skips when it
+/// is unset so a checkout without the ExifTool sources still passes.
+#[cfg(feature = "json")]
+#[test]
+fn canon_1dmk3_real_fixture_no_bogus_processinginfo_parent() {
+  let Ok(dir) = std::env::var("EXIFTOOL_T_IMAGES") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES not set");
+    return;
+  };
+  let path = format!("{dir}/Canon1DmkIII.jpg");
+  let Ok(data) = std::fs::read(&path) else {
+    eprintln!("skipping: {path} not readable");
+    return;
+  };
+  for print_on in [true, false] {
+    let mode = if print_on { "-j" } else { "-n" };
+    let json = exifast::parser::extract_info("Canon1DmkIII.jpg", &data, print_on);
+    let doc: serde_json::Value =
+      serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON ({e}):\n{json}"));
+    let map = doc
+      .as_array()
+      .and_then(|a| a.first())
+      .and_then(|o| o.as_object())
+      .unwrap_or_else(|| panic!("doc is not [{{…}}]:\n{json}"));
+    // The bug: a bogus `Canon:ProcessingInfo` parent (raw int16s array) that
+    // ExifTool never emits.
+    assert!(
+      !map.contains_key("Canon:ProcessingInfo"),
+      "bogus deferred SubDirectory parent Canon:ProcessingInfo must not be emitted ({mode})"
+    );
+    // The walked tags the oracle DOES emit stay present + unaffected:
+    // a CameraSettings leaf, the Main-IFD LensModel string (0x95), and a
+    // SensorInfo leaf (0xe0, a walked SubDirectory in this fixture).
+    assert!(
+      map.contains_key("Canon:LensModel"),
+      "walked Canon:LensModel must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:ContinuousDrive"),
+      "walked CameraSettings leaf Canon:ContinuousDrive must still be present ({mode})"
+    );
+    assert!(
+      map.contains_key("Canon:SensorWidth"),
+      "walked SensorInfo leaf Canon:SensorWidth must still be present ({mode})"
+    );
+  }
 }

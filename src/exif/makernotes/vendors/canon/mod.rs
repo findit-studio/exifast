@@ -905,32 +905,43 @@ pub fn parse_in_tiff(
           }
         }
         _ => {
-          // Deferred sub-table — emit the SubDirectory tag's raw value
-          // so downstream users see "this sub-directory was present"
-          // (Phase 2+1 will walk these). Carry the tag's `Unknown` flag.
-          let val = def.conv().apply(&entry.value, print_conv, model);
-          emissions.push(VendorEmission::new(
-            def.name().into(),
-            val,
-            def.is_unknown(),
-          ));
+          // Deferred sub-table (Panorama / MyColors / FaceDetect1 / FaceDetect2
+          // / ContrastInfo / WBInfo / ProcessingInfo / MovieInfo / LensInfo —
+          // `is_walked() == false`). A SubDirectory row DESCENDS into a child
+          // table and NEVER emits the parent pointer as a value: ExifTool's
+          // `ProcessExif` enters the `if ($subdir)` block (`Exif.pm:6919`),
+          // processes the sub-directory, then hits `next unless $doMaker or
+          // $$et{REQ_TAG_LOOKUP}{…} or $$tagInfo{BlockExtract}`
+          // (`Exif.pm:7103-7104`) — for a plain SubDirectory tag in default
+          // output (no value emission) that `next` SKIPS `FoundTag`
+          // (`Exif.pm:7180`), so the parent is ABSENT from default `-j` output
+          // (every deferred `%Canon::Main` SubDirectory row here is a pure
+          // descend-no-parent-value pointer — none is `Writable`/`MakerNotes`/
+          // `BlockExtract`). The port DEFERS the child-table walk, so the
+          // faithful behaviour is to emit NEITHER the parent nor (for now) the
+          // children: skip the emission. Mirrors the Sony/Panasonic
+          // `if def.sub_table.is_some() { continue; }` guard (issue #177).
+          // Previously this arm emitted the SubDirectory's raw value, leaking a
+          // bogus `Canon:ProcessingInfo` (and the other deferred parents) that
+          // ExifTool never emits.
         }
       }
     } else if entry.tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d) {
       // `0x96` MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`): for an
-      // EOS-5D body the FIRST arm wins — `SerialInfo`, a SubDirectory to
-      // `Canon::SerialInfo`. That sub-table decode is DEFERRED (a deep
-      // binary table, like ShotInfo/ColorData), so we emit it the SAME
-      // way as the other deferred Canon::Main SubDirectories (the `_ =>`
-      // arm above): the first-arm `Name` paired with the raw value
-      // (`walk_canon_in_tiff` left it as un-stripped `RawValue::Bytes`).
-      // CRITICALLY: this is NOT `InternalSerialNumber` and the
-      // trailing-`0xff` `ValueConv` strip does NOT apply, so we also skip
-      // `populate_typed` (the typed `internal_serial_number` stays unset).
-      let val = CanonPrintConv::None.apply(&entry.value, print_conv, model);
-      // `0x96` is not `Unknown` (it is the conditional SerialInfo/
-      // InternalSerialNumber tag), so emit with `unknown = false`.
-      emissions.push(VendorEmission::new("SerialInfo".into(), val, false));
+      // EOS-5D body the FIRST arm wins — `SerialInfo`, a pure SubDirectory
+      // pointer to `Canon::SerialInfo` (`Canon.pm:1836-1838`; NO `Writable`,
+      // no value emission). Like every other deferred Canon::Main
+      // SubDirectory (the `_ =>` arm above), ExifTool descends into the child
+      // table and emits its leaves but NEVER the `SerialInfo` parent value
+      // (`Exif.pm:7103-7104` `next` skips `FoundTag` for a no-value
+      // SubDirectory). The port DEFERS that child walk, so the faithful
+      // behaviour is to emit nothing here — suppress the parent (issue #177;
+      // same bogus-parent class). CRITICALLY this is the SerialInfo branch,
+      // NOT `InternalSerialNumber`, so the trailing-`0xff` `ValueConv` strip
+      // does NOT apply and `populate_typed` is (correctly) not run — the typed
+      // `internal_serial_number` stays unset. Previously this arm emitted the
+      // raw `SerialInfo` value, leaking a bogus `Canon:SerialInfo` parent that
+      // ExifTool never emits.
     } else {
       // Leaf tag: apply PrintConv + emit. `model` threads the parent
       // body `$$self{Model}` into the conditional SerialNumber PrintConv
@@ -1277,11 +1288,16 @@ mod tests {
   }
 
   /// `0x96` MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`), FIRST arm: an
-  /// EOS-5D body routes `0x96` to the `SerialInfo` SubDirectory (deferred
-  /// raw blob), NOT `InternalSerialNumber`. The trailing-`0xff` strip
-  /// MUST NOT apply, and the typed `internal_serial_number` stays unset.
+  /// EOS-5D body routes `0x96` to the `SerialInfo` SubDirectory pointer
+  /// (`Canon.pm:1836-1838`; no `Writable`, no value emission), NOT
+  /// `InternalSerialNumber`. ExifTool descends into `Canon::SerialInfo` and
+  /// emits its leaves but NEVER the `SerialInfo` parent value; the port
+  /// defers that child walk, so it emits NEITHER `SerialInfo` (the bogus
+  /// parent, suppressed per #177) NOR `InternalSerialNumber` (the
+  /// trailing-`0xff` strip does NOT apply on this arm). The typed
+  /// `internal_serial_number` stays unset.
   #[test]
-  fn parse_eos_5d_0x96_emits_serialinfo_not_internal_serial() {
+  fn parse_eos_5d_0x96_suppresses_serialinfo_parent() {
     let value = b"ABC123\xff\xff\xff";
     let blob = one_main_entry_blob(0x96, 0x02, value.len() as u32, value);
     let (typed, emissions) = parse_in_tiff(
@@ -1293,25 +1309,25 @@ mod tests {
       Some("Canon EOS 5D Mark II"),
       None,
     );
-    // First arm: SerialInfo, raw (un-stripped) blob.
+    // The SerialInfo SubDirectory parent is suppressed (deferred child walk),
+    // and the second-arm InternalSerialNumber is NOT selected for an EOS-5D.
+    assert!(
+      !emissions.iter().any(|e| e.name() == "SerialInfo"),
+      "EOS 5D must NOT emit the bogus SerialInfo SubDirectory parent (#177)"
+    );
     assert!(
       !emissions.iter().any(|e| e.name() == "InternalSerialNumber"),
-      "EOS 5D must NOT emit InternalSerialNumber"
+      "EOS 5D must NOT emit InternalSerialNumber (it took the SerialInfo arm)"
     );
-    let v = emissions
-      .iter()
-      .find(|e| e.name() == "SerialInfo")
-      .map(|e| e.value().clone())
-      .expect("EOS 5D must emit SerialInfo");
-    assert_eq!(v, TagValue::Bytes(value.to_vec()));
     // Typed accessor for InternalSerialNumber stays unset.
     assert_eq!(typed.internal_serial_number(), None);
   }
 
   /// `/EOS 5D/` is an UNANCHORED substring (`Canon.pm:1837`) — base
-  /// "EOS 5D" matches just as "EOS 5D Mark IV" does.
+  /// "EOS 5D" matches just as "EOS 5D Mark IV" does; the SerialInfo
+  /// SubDirectory parent is suppressed (#177) for either spelling.
   #[test]
-  fn parse_eos_5d_base_model_0x96_emits_serialinfo() {
+  fn parse_eos_5d_base_model_0x96_suppresses_serialinfo_parent() {
     let value = b"WXYZ";
     let blob = one_main_entry_blob(0x96, 0x02, value.len() as u32, value);
     let (typed, emissions) = parse_in_tiff(
@@ -1323,7 +1339,7 @@ mod tests {
       Some("Canon EOS 5D"),
       None,
     );
-    assert!(emissions.iter().any(|e| e.name() == "SerialInfo"));
+    assert!(!emissions.iter().any(|e| e.name() == "SerialInfo"));
     assert!(!emissions.iter().any(|e| e.name() == "InternalSerialNumber"));
     assert_eq!(typed.internal_serial_number(), None);
   }
