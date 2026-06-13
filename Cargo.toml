@@ -240,7 +240,7 @@ jiff        = { version = "0.2", default-features = false }
 #     header) ⇒ `inflate::decompress_to_vec`.
 # no_std-capable — `with-alloc` pulls only `alloc`, matching the crate's
 # no_std+alloc contract.
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"], optional = true }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"], optional = true }
 serde       = { version = "1", default-features = false, features = ["derive"], optional = true }
 # `raw_value` exposes `serde_json::value::RawValue`, used by `jsondiff` to
 # compare scalar lexemes byte-for-byte (strings escape-exact, numbers
