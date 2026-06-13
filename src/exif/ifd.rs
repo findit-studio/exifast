@@ -349,6 +349,25 @@ impl Format {
     }
   }
 
+  /// `true` for an on-disk format code that `ProcessExif` accepts in a standard
+  /// TIFF/Exif IFD entry: the 13 standard TIFF types (`1..=13`) plus the
+  /// Exif-3.0 UTF-8 type (`129`) (`Exif.pm:6463-6464` `if (($format < 1 or
+  /// $format > 13) and $format != 129 …)`). Codes `14`/`15` (`unicode`/
+  /// `complex`) and the BigTIFF additions `16`/`17`/`18` (`int64u`/`int64s`/
+  /// `ifd64`) are NOT accepted on the IFD-walk decode path — a standard IFD
+  /// entry carrying one is `Bad format` (warned, then entry-0-abort vs
+  /// later-skip), never decoded.
+  ///
+  /// This is the SINGLE source of truth for the per-entry format-validity gate,
+  /// shared by the standalone-TIFF walker (`mod.rs`), the Canon MakerNote
+  /// classifier ([`crate::exif::makernotes::vendors::canon`]) and the Nikon
+  /// MakerNote walker — each `ProcessExif`-equivalent reuses it so the
+  /// `recognized` test cannot drift between vendors.
+  #[must_use]
+  pub const fn is_valid_ifd_code(code: u16) -> bool {
+    matches!(code, 1..=13 | 129)
+  }
+
   /// `true` for an integer format that may legitimately hold an IFD pointer
   /// (`%intFormat`, `Exif.pm:124-135`). The Exif IFD walker uses this to
   /// faithfully warn `Wrong format` when a SubIFD pointer has a non-integer

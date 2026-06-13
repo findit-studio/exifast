@@ -49,6 +49,9 @@ pub enum VendorStatus {
   Phase3,
   /// Phase 4 — GoPro/DJI.
   Phase4,
+  /// Phase 5 — Nikon (`%Nikon::Main` readable scalars + AFInfo +
+  /// unencrypted ColorBalance; the encrypted sub-tables stay deferred).
+  Phase5,
   /// Phase ∞ (deferred) — long-tail vendor. Identifies in Phase 1, but
   /// no Phase-N tag table is currently scheduled.
   Deferred,
@@ -68,18 +71,19 @@ impl VendorStatus {
       VendorStatus::Phase2 => "phase2",
       VendorStatus::Phase3 => "phase3",
       VendorStatus::Phase4 => "phase4",
+      VendorStatus::Phase5 => "phase5",
       VendorStatus::Deferred => "deferred",
       VendorStatus::Unknown => "unknown",
     }
   }
 
-  /// `true` if a per-vendor tag table is currently scheduled (Phase 2-4).
+  /// `true` if a per-vendor tag table is currently scheduled (Phase 2-5).
   #[must_use]
   #[inline(always)]
   pub const fn is_scheduled(self) -> bool {
     matches!(
       self,
-      VendorStatus::Phase2 | VendorStatus::Phase3 | VendorStatus::Phase4
+      VendorStatus::Phase2 | VendorStatus::Phase3 | VendorStatus::Phase4 | VendorStatus::Phase5
     )
   }
 
@@ -283,6 +287,11 @@ impl Vendor {
       // group is the vendor name `DJI` (DJI.pm:56 sets only family-0
       // `MakerNotes`), so `-G1` emits `DJI:Pitch` etc.
       Vendor::Dji => "DJI",
+      // Nikon MakerNotes route to `Image::ExifTool::Nikon::Main`
+      // (`Nikon.pm:1778`, `GROUPS => { 0 => 'MakerNotes', 2 => 'Camera' }`);
+      // the family-1 group is the module name `Nikon`, so `-G1` emits
+      // `Nikon:Quality` etc.
+      Vendor::Nikon => "Nikon",
       _ => "MakerNotes",
     }
   }
@@ -300,6 +309,7 @@ impl Vendor {
       Vendor::Apple | Vendor::Canon => VendorStatus::Phase2,
       Vendor::Sony | Vendor::Panasonic => VendorStatus::Phase3,
       Vendor::Dji => VendorStatus::Phase4,
+      Vendor::Nikon => VendorStatus::Phase5,
       Vendor::Unknown => VendorStatus::Unknown,
       Vendor::Casio
       | Vendor::Flir
@@ -315,7 +325,6 @@ impl Vendor {
       | Vendor::Leica
       | Vendor::Minolta
       | Vendor::Motorola
-      | Vendor::Nikon
       | Vendor::Nintendo
       | Vendor::Olympus
       | Vendor::Pentax

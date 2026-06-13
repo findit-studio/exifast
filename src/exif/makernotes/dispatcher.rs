@@ -2442,10 +2442,12 @@ mod tests {
     assert_eq!(Vendor::Sony.status(), VendorStatus::Phase3);
     assert_eq!(Vendor::Panasonic.status(), VendorStatus::Phase3);
     assert_eq!(Vendor::Dji.status(), VendorStatus::Phase4);
-    assert_eq!(Vendor::Nikon.status(), VendorStatus::Deferred);
+    assert_eq!(Vendor::Nikon.status(), VendorStatus::Phase5);
+    assert_eq!(Vendor::Pentax.status(), VendorStatus::Deferred);
     assert_eq!(Vendor::Unknown.status(), VendorStatus::Unknown);
     assert!(Vendor::Apple.status().is_scheduled());
-    assert!(Vendor::Nikon.status().is_deferred());
+    assert!(Vendor::Nikon.status().is_scheduled());
+    assert!(Vendor::Pentax.status().is_deferred());
     assert!(Vendor::Unknown.status().is_unknown());
   }
 
