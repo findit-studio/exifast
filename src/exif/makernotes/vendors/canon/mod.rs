@@ -78,6 +78,7 @@ pub mod lens_types;
 pub mod model_ids;
 pub mod printconv;
 pub mod sensor_info;
+pub mod serial_info;
 pub mod shot_info;
 pub mod tags;
 
@@ -941,20 +942,32 @@ pub fn parse_in_tiff(
       }
     } else if entry.tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d) {
       // `0x96` MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`): for an
-      // EOS-5D body the FIRST arm wins — `SerialInfo`, a pure SubDirectory
-      // pointer to `Canon::SerialInfo` (`Canon.pm:1836-1838`; NO `Writable`,
-      // no value emission). Like every other deferred Canon::Main
-      // SubDirectory (the `_ =>` arm above), ExifTool descends into the child
-      // table and emits its leaves but NEVER the `SerialInfo` parent value
-      // (`Exif.pm:7103-7104` `next` skips `FoundTag` for a no-value
-      // SubDirectory). The port DEFERS that child walk, so the faithful
-      // behaviour is to emit nothing here — suppress the parent (issue #177;
-      // same bogus-parent class). CRITICALLY this is the SerialInfo branch,
-      // NOT `InternalSerialNumber`, so the trailing-`0xff` `ValueConv` strip
-      // does NOT apply and `populate_typed` is (correctly) not run — the typed
-      // `internal_serial_number` stays unset. Previously this arm emitted the
-      // raw `SerialInfo` value, leaking a bogus `Canon:SerialInfo` parent that
-      // ExifTool never emits.
+      // EOS-5D body the FIRST arm wins — `SerialInfo`, the SubDirectory
+      // pointer to `%Canon::SerialInfo` (`Canon.pm:1836-1838`). ExifTool
+      // descends into that child table and emits ITS leaves
+      // (`InternalSerialNumber2` / `InternalSerialNumber`) but NEVER the
+      // `SerialInfo` parent value (`Exif.pm:7103-7104` `next` skips `FoundTag`
+      // for a no-value SubDirectory) — so the parent is correctly absent (issue
+      // #177). The walker captured the raw on-disk SerialInfo blob verbatim
+      // (`RawValue::Bytes`, un-stripped — the trailing-`0xff`/NUL `string`
+      // semantics belong only to the SECOND arm `InternalSerialNumber`), so
+      // decode it here (`serial_info::parse`). The two leaves are
+      // family-1 `Canon` like every other Canon MakerNote tag; each carries the
+      // `Camera` family-2 group of the SerialInfo table, but the JSON sink keys
+      // on family-1 (`-G1`). `populate_typed` is (correctly) not run for this
+      // arm — the typed `internal_serial_number` accessor tracks only the
+      // model-agnostic SECOND-arm leaf, which an EOS-5D body never takes.
+      let blob = match &entry.value {
+        // The faithful `$$valPt` view the body walker captured for the 5D arm.
+        RawValue::Bytes(b) => b.as_slice(),
+        // Defensive: the walker always rewrites a 5D `0x96` to `Bytes`; any
+        // other shape means no SerialInfo blob to decode — emit nothing.
+        _ => &[],
+      };
+      for (name, value) in serial_info::parse(blob, print_conv) {
+        // Explicit BinaryData positions are never `Unknown`.
+        emissions.push(VendorEmission::new(name, value, false));
+      }
     } else if entry.tag_id == 0x28 {
       // `ImageUniqueID` (`Canon.pm:1726-1735`): the table forces
       // `Format => 'undef'`, so the walker captured the ORIGINAL on-disk
@@ -1352,17 +1365,20 @@ mod tests {
   }
 
   /// `0x96` MODEL-CONDITIONAL LIST (`Canon.pm:1834-1846`), FIRST arm: an
-  /// EOS-5D body routes `0x96` to the `SerialInfo` SubDirectory pointer
-  /// (`Canon.pm:1836-1838`; no `Writable`, no value emission), NOT
-  /// `InternalSerialNumber`. ExifTool descends into `Canon::SerialInfo` and
-  /// emits its leaves but NEVER the `SerialInfo` parent value; the port
-  /// defers that child walk, so it emits NEITHER `SerialInfo` (the bogus
-  /// parent, suppressed per #177) NOR `InternalSerialNumber` (the
-  /// trailing-`0xff` strip does NOT apply on this arm). The typed
-  /// `internal_serial_number` stays unset.
+  /// EOS-5D body routes `0x96` to the `SerialInfo` SubDirectory
+  /// (`Canon.pm:1836-1838`), NOT `InternalSerialNumber`. ExifTool descends
+  /// into `%Canon::SerialInfo` and emits its leaves (`InternalSerialNumber2` /
+  /// `InternalSerialNumber`) but NEVER the `SerialInfo` parent value; the port
+  /// decodes the sub-table (#175) while still suppressing the bogus parent
+  /// (#177). The typed `internal_serial_number` accessor (the model-agnostic
+  /// SECOND-arm leaf) stays unset — an EOS-5D never takes that arm.
+  ///
+  /// Oracle (`perl exiftool -G1 -j` on a crafted EOS 5D Mark II with this
+  /// SerialInfo blob): `Canon:InternalSerialNumber2 = "ABC123XYZ"`,
+  /// `Canon:InternalSerialNumber = "DEF456"`.
   #[test]
-  fn parse_eos_5d_0x96_suppresses_serialinfo_parent() {
-    let value = b"ABC123\xff\xff\xff";
+  fn parse_eos_5d_0x96_decodes_serialinfo_subtable() {
+    let value = b"ABC123XYZDEF456\x00";
     let blob = one_main_entry_blob(0x96, 0x02, value.len() as u32, value);
     let (typed, emissions) = parse_in_tiff(
       &blob,
@@ -1373,26 +1389,64 @@ mod tests {
       Some("Canon EOS 5D Mark II"),
       None,
     );
-    // The SerialInfo SubDirectory parent is suppressed (deferred child walk),
-    // and the second-arm InternalSerialNumber is NOT selected for an EOS-5D.
+    // The bogus `SerialInfo` SubDirectory parent is NEVER emitted (#177)…
     assert!(
       !emissions.iter().any(|e| e.name() == "SerialInfo"),
       "EOS 5D must NOT emit the bogus SerialInfo SubDirectory parent (#177)"
     );
-    assert!(
-      !emissions.iter().any(|e| e.name() == "InternalSerialNumber"),
-      "EOS 5D must NOT emit InternalSerialNumber (it took the SerialInfo arm)"
-    );
-    // Typed accessor for InternalSerialNumber stays unset.
+    // …but its decoded leaves ARE (#175).
+    let isn2 = emissions
+      .iter()
+      .find(|e| e.name() == "InternalSerialNumber2")
+      .map(|e| e.value().clone());
+    assert_eq!(isn2, Some(TagValue::Str("ABC123XYZ".into())));
+    let isn = emissions
+      .iter()
+      .find(|e| e.name() == "InternalSerialNumber")
+      .map(|e| e.value().clone());
+    assert_eq!(isn, Some(TagValue::Str("DEF456".into())));
+    // The typed `internal_serial_number` tracks only the model-agnostic
+    // SECOND-arm leaf, which an EOS-5D never takes — it stays unset.
     assert_eq!(typed.internal_serial_number(), None);
+  }
+
+  /// `RawConv => '$val =~ /^\w{6}/ ? $val : undef'` (`Canon.pm:7154`/`:7159`):
+  /// a SerialInfo `InternalSerialNumber2` whose first six bytes are NOT all
+  /// word characters is dropped, exactly like the oracle returns undef. The
+  /// valid offset-9 `InternalSerialNumber` still emits.
+  #[test]
+  fn parse_eos_5d_0x96_rawconv_drops_non_word_internal_serial2() {
+    let value = b"!!ABC123ZDEF456\x00";
+    let blob = one_main_entry_blob(0x96, 0x02, value.len() as u32, value);
+    let (_typed, emissions) = parse_in_tiff(
+      &blob,
+      0,
+      blob.len(),
+      ByteOrder::Little,
+      true,
+      Some("Canon EOS 5D Mark III"),
+      None,
+    );
+    assert!(
+      !emissions
+        .iter()
+        .any(|e| e.name() == "InternalSerialNumber2"),
+      "non-/^\\w{{6}}/ InternalSerialNumber2 must be dropped (RawConv undef)"
+    );
+    let isn = emissions
+      .iter()
+      .find(|e| e.name() == "InternalSerialNumber")
+      .map(|e| e.value().clone());
+    assert_eq!(isn, Some(TagValue::Str("DEF456".into())));
   }
 
   /// `/EOS 5D/` is an UNANCHORED substring (`Canon.pm:1837`) — base
   /// "EOS 5D" matches just as "EOS 5D Mark IV" does; the SerialInfo
-  /// SubDirectory parent is suppressed (#177) for either spelling.
+  /// sub-table is decoded (and the bogus parent suppressed, #177) for either
+  /// spelling.
   #[test]
-  fn parse_eos_5d_base_model_0x96_suppresses_serialinfo_parent() {
-    let value = b"WXYZ";
+  fn parse_eos_5d_base_model_0x96_decodes_serialinfo() {
+    let value = b"WXYZ12ABCSER789\x00";
     let blob = one_main_entry_blob(0x96, 0x02, value.len() as u32, value);
     let (typed, emissions) = parse_in_tiff(
       &blob,
@@ -1404,7 +1458,12 @@ mod tests {
       None,
     );
     assert!(!emissions.iter().any(|e| e.name() == "SerialInfo"));
-    assert!(!emissions.iter().any(|e| e.name() == "InternalSerialNumber"));
+    let isn2 = emissions
+      .iter()
+      .find(|e| e.name() == "InternalSerialNumber2")
+      .map(|e| e.value().clone());
+    assert_eq!(isn2, Some(TagValue::Str("WXYZ12ABC".into())));
+    // The typed `internal_serial_number` (SECOND-arm) stays unset.
     assert_eq!(typed.internal_serial_number(), None);
   }
 

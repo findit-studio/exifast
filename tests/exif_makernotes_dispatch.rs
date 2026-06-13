@@ -431,6 +431,151 @@ fn canon_eos_real_fixture_decodes_typed_fields() {
   assert_eq!(canon.focus_distance_decoded(), None);
 }
 
+/// Build a crafted EOS-5D JPEG (no bundled 5D fixture exists — the `t/images`
+/// Canon bodies are REBEL/1D-III/350D/M50). Big-endian (MM) TIFF: IFD0 carries
+/// `Make`="Canon" / `Model` (so the `0x96` LIST evaluates `$$self{Model} =~
+/// /EOS 5D/`) / an ExifIFD pointer; ExifIFD carries the `0x927c` MakerNote; the
+/// Canon MakerNote IFD (a bare IFD) carries a single `0x96` entry whose
+/// out-of-line value is `serialinfo_blob` — the raw `%Canon::SerialInfo` bytes.
+/// Wrapped in `SOI + APP1(Exif\0\0…) + EOI`. Mirrors `/tmp/build5d.py`, which
+/// produced the oracle-cited expectations.
+fn craft_eos_5d_jpeg(model: &[u8], serialinfo_blob: &[u8]) -> Vec<u8> {
+  let make = b"Canon\x00";
+  // TIFF-relative offsets (8-byte header at the start).
+  let hdr = 8usize;
+  let ifd0_start = hdr; // 8
+  let ifd0_size = 2 + 12 * 3 + 4; // count + 3 entries + next
+  let make_off = ifd0_start + ifd0_size;
+  let model_off = make_off + make.len();
+  let exif_start = model_off + model.len();
+  let exif_size = 2 + 12 + 4; // count + 1 entry + next
+  let canon_start = exif_start + exif_size;
+  let canon_size = 2 + 12 + 4; // count + 1 entry + next
+  let serial_off = canon_start + canon_size;
+  let mn_len = (serial_off + serialinfo_blob.len()) - canon_start;
+
+  let u16 = |v: u16| v.to_be_bytes();
+  let u32 = |v: u32| v.to_be_bytes();
+  let mut t: Vec<u8> = Vec::new();
+  t.extend_from_slice(b"MM");
+  t.extend_from_slice(&u16(0x2a));
+  t.extend_from_slice(&u32(ifd0_start as u32));
+  // ---- IFD0: Make, Model, ExifIFD ----
+  t.extend_from_slice(&u16(3));
+  t.extend_from_slice(&u16(0x010f)); // Make
+  t.extend_from_slice(&u16(2)); // ASCII
+  t.extend_from_slice(&u32(make.len() as u32));
+  t.extend_from_slice(&u32(make_off as u32));
+  t.extend_from_slice(&u16(0x0110)); // Model
+  t.extend_from_slice(&u16(2)); // ASCII
+  t.extend_from_slice(&u32(model.len() as u32));
+  t.extend_from_slice(&u32(model_off as u32));
+  t.extend_from_slice(&u16(0x8769)); // ExifIFD pointer
+  t.extend_from_slice(&u16(4)); // LONG
+  t.extend_from_slice(&u32(1));
+  t.extend_from_slice(&u32(exif_start as u32));
+  t.extend_from_slice(&u32(0)); // IFD0 next = 0
+  // ---- strings ----
+  t.extend_from_slice(make);
+  t.extend_from_slice(model);
+  // ---- ExifIFD: MakerNote ----
+  t.extend_from_slice(&u16(1));
+  t.extend_from_slice(&u16(0x927c)); // MakerNote
+  t.extend_from_slice(&u16(7)); // UNDEF
+  t.extend_from_slice(&u32(mn_len as u32));
+  t.extend_from_slice(&u32(canon_start as u32));
+  t.extend_from_slice(&u32(0)); // ExifIFD next = 0
+  // ---- Canon MakerNote IFD: 0x96 SerialInfo ----
+  t.extend_from_slice(&u16(1));
+  t.extend_from_slice(&u16(0x0096)); // 0x96
+  t.extend_from_slice(&u16(2)); // ASCII (the on-disk declared format)
+  t.extend_from_slice(&u32(serialinfo_blob.len() as u32));
+  t.extend_from_slice(&u32(serial_off as u32));
+  t.extend_from_slice(&u32(0)); // Canon IFD next = 0
+  // ---- SerialInfo blob ----
+  t.extend_from_slice(serialinfo_blob);
+
+  // Wrap in a JPEG: SOI + APP1(Exif\0\0 + tiff) + EOI.
+  let mut app1: Vec<u8> = Vec::new();
+  app1.extend_from_slice(b"Exif\x00\x00");
+  app1.extend_from_slice(&t);
+  let mut jpeg: Vec<u8> = Vec::new();
+  jpeg.extend_from_slice(&[0xff, 0xd8]); // SOI
+  jpeg.extend_from_slice(&[0xff, 0xe1]); // APP1
+  jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+  jpeg.extend_from_slice(&app1);
+  jpeg.extend_from_slice(&[0xff, 0xd9]); // EOI
+  jpeg
+}
+
+/// `Canon::SerialInfo` (`Canon.pm:7145-7161`) end-to-end, FIRST arm of the
+/// `0x96` LIST (`Canon.pm:1835-1838`): a crafted EOS 5D Mark III JPEG with a
+/// valid SerialInfo blob decodes into `Canon:InternalSerialNumber2` /
+/// `Canon:InternalSerialNumber`, and NEVER the bogus `SerialInfo` parent (#177).
+///
+/// Oracle (`perl exiftool -G1 -j` on the SAME crafted bytes):
+///
+/// ```text
+/// "IFD0:Model": "Canon EOS 5D Mark III",
+/// "Canon:InternalSerialNumber2": "ABC123XYZ",
+/// "Canon:InternalSerialNumber": "DEF456"
+/// ```
+#[test]
+fn canon_serialinfo_5d_decodes_internal_serial_number2() {
+  let data = craft_eos_5d_jpeg(b"Canon EOS 5D Mark III\x00", b"ABC123XYZDEF456\x00");
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted 5D JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  assert!(mn.vendor().is_canon(), "vendor = Canon");
+  let emissions = mn.emissions_print_conv();
+
+  // The decoded SerialInfo leaves (oracle byte-exact).
+  let isn2 = emissions
+    .iter()
+    .find(|e| e.name() == "InternalSerialNumber2")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    isn2,
+    Some(exifast::TagValue::Str("ABC123XYZ".into())),
+    "InternalSerialNumber2 must decode to the oracle value"
+  );
+  let isn = emissions
+    .iter()
+    .find(|e| e.name() == "InternalSerialNumber")
+    .map(|e| e.value().clone());
+  assert_eq!(isn, Some(exifast::TagValue::Str("DEF456".into())));
+
+  // The bogus `SerialInfo` SubDirectory parent is NEVER emitted (#177).
+  assert!(
+    !emissions.iter().any(|e| e.name() == "SerialInfo"),
+    "the raw SerialInfo blob must NOT be emitted as a parent (#177)"
+  );
+}
+
+/// `RawConv => '$val =~ /^\w{6}/ ? $val : undef'` (`Canon.pm:7154`): a crafted
+/// EOS 5D SerialInfo blob whose `InternalSerialNumber2` first six bytes are NOT
+/// all word characters is DROPPED — matching the oracle's undef (the offset-9
+/// `InternalSerialNumber` still emits).
+#[test]
+fn canon_serialinfo_rawconv_drops_non_word() {
+  let data = craft_eos_5d_jpeg(b"Canon EOS 5D Mark III\x00", b"!!ABC123ZDEF456\x00");
+  let meta = exifast::exif::jpeg::parse_jpeg_exif(&data).expect("crafted 5D JPEG parsed");
+  let mn = meta.maker_note().expect("MakerNote captured");
+  let emissions = mn.emissions_print_conv();
+
+  assert!(
+    !emissions
+      .iter()
+      .any(|e| e.name() == "InternalSerialNumber2"),
+    "non-/^\\w{{6}}/ InternalSerialNumber2 must be dropped (RawConv undef)"
+  );
+  // The valid offset-9 InternalSerialNumber still emits.
+  let isn = emissions
+    .iter()
+    .find(|e| e.name() == "InternalSerialNumber")
+    .map(|e| e.value().clone());
+  assert_eq!(isn, Some(exifast::TagValue::Str("DEF456".into())));
+}
+
 // ===========================================================================
 // Phase 3 — real-input Sony/Panasonic JPEG fixtures
 // ===========================================================================
