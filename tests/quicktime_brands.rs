@@ -1690,12 +1690,16 @@ fn cr3_cmt3_before_cmt1_no_model_threaded() {
   // NO Model in state; a CMT1-before-CMT3 threads the Model.
   //
   // The clean model-gated observable is Canon Main tag `0x96` (Canon.pm:1834):
-  //   - Model =~ /EOS 5D/  ⇒ FIRST arm `SerialInfo` (a SubDirectory; exifast
-  //     surfaces it as the raw blob) ⇒ `InternalSerialNumber` is ABSENT.
+  //   - Model =~ /EOS 5D/  ⇒ FIRST arm `SerialInfo` SubDirectory (decoded into
+  //     `%Canon::SerialInfo`, #175) ⇒ `Canon:InternalSerialNumber2` IS emitted
+  //     and the bare `Canon:InternalSerialNumber` is ABSENT (offset-9 string is
+  //     empty in this 9-byte blob).
   //   - no/other Model      ⇒ SECOND arm `InternalSerialNumber` (the trailing
-  //     `0xff` strip applies) ⇒ `Canon:InternalSerialNumber` IS emitted.
-  // Ground-truthed against `exiftool -G1 -j`: the reordered file emits
-  // `Canon:InternalSerialNumber":"ABC123"` while the in-order file does not.
+  //     `0xff` strip applies) ⇒ the bare `Canon:InternalSerialNumber` IS emitted
+  //     (and `InternalSerialNumber2` is ABSENT).
+  // Ground-truthed against `exiftool -G1 -j`: the in-order file emits
+  // `Canon:InternalSerialNumber2` (the SerialInfo arm); the reordered file emits
+  // the bare `Canon:InternalSerialNumber":"ABC123"`.
 
   // CMT1 IFD0 with Model (0x0110) ASCII = "Canon EOS 5D\0".
   let cmt1 = tiff_le_one_entry(0x0110, 2, b"Canon EOS 5D\0");
@@ -1703,7 +1707,8 @@ fn cr3_cmt3_before_cmt1_no_model_threaded() {
   let cmt3 = tiff_le_one_entry(0x0096, 2, b"ABC123\xff\xff\xff");
 
   // In-order [CMT1, CMT3]: the Model is in state at the CMT3 walk ⇒ 0x96 routes
-  // to the SerialInfo arm ⇒ InternalSerialNumber is NOT emitted.
+  // to the SerialInfo arm ⇒ `InternalSerialNumber2` emitted, bare
+  // `InternalSerialNumber` absent.
   let in_order = cr3_with_cmt_order(&[(b"CMT1", cmt1.clone()), (b"CMT3", cmt3.clone())]);
   let json_in = exifast::parser::extract_info("cr3_inorder.cr3", &in_order, true);
   assert!(
@@ -1711,8 +1716,10 @@ fn cr3_cmt3_before_cmt1_no_model_threaded() {
     "in-order CMT1 Model missing: {json_in}"
   );
   assert!(
-    !json_in.contains("InternalSerialNumber"),
-    "in-order: Model in state ⇒ 0x96 is SerialInfo, InternalSerialNumber must be absent: {json_in}"
+    json_in.contains(r#""Canon:InternalSerialNumber2""#)
+      && !json_in.contains(r#""Canon:InternalSerialNumber":"#),
+    "in-order: Model in state ⇒ 0x96 is SerialInfo ⇒ InternalSerialNumber2 \
+     present and bare InternalSerialNumber absent: {json_in}"
   );
 
   // Reordered [CMT3, CMT1]: the Model is NOT yet in state at the CMT3 walk ⇒
@@ -1815,10 +1822,10 @@ fn cr3_overbudget_or_dropped_cmt1_no_stale_model_for_cmt3() {
   // never clears it. This test pins BOTH directions.
   //
   // Discriminating observable is Canon Main tag `0x96` (Canon.pm:1834):
-  //   - Model =~ /EOS 5D/ ⇒ `SerialInfo` SubDirectory arm ⇒ InternalSerialNumber
-  //     ABSENT.
+  //   - Model =~ /EOS 5D/ ⇒ `SerialInfo` SubDirectory arm (decoded, #175) ⇒
+  //     `InternalSerialNumber2` present, bare `InternalSerialNumber` ABSENT.
   //   - other / no Model  ⇒ `InternalSerialNumber` arm (trailing 0xff stripped)
-  //     ⇒ present.
+  //     ⇒ bare `InternalSerialNumber` present.
   // Ground-truthed against `exiftool -G1 -j`.
 
   let cmt1_5d = || tiff_le_one_entry(0x0110, 2, b"Canon EOS 5D\0");
@@ -1828,7 +1835,7 @@ fn cr3_overbudget_or_dropped_cmt1_no_stale_model_for_cmt3() {
 
   // (a) The spec scenario — CMT1(5D), then a model-LESS CMT1, then CMT3. The 5D
   // Model must STILL thread (the model-less CMT1 does not clear it) ⇒ 0x96 is
-  // SerialInfo ⇒ InternalSerialNumber ABSENT.
+  // SerialInfo ⇒ InternalSerialNumber2 present, bare InternalSerialNumber ABSENT.
   let data_a = cr3_with_cmt_order(&[
     (b"CMT1", cmt1_5d()),
     (b"CMT1", cmt1_nomodel()),
@@ -1840,9 +1847,10 @@ fn cr3_overbudget_or_dropped_cmt1_no_stale_model_for_cmt3() {
     "the 5D Model is emitted (the model-less CMT1 carries no Model tag): {json_a}"
   );
   assert!(
-    !json_a.contains("InternalSerialNumber"),
+    json_a.contains(r#""Canon:InternalSerialNumber2""#)
+      && !json_a.contains(r#""Canon:InternalSerialNumber":"#),
     "model-less middle CMT1 must NOT clear the 5D Model: 0x96 stays SerialInfo \
-     ⇒ InternalSerialNumber absent: {json_a}"
+     ⇒ InternalSerialNumber2 present, bare InternalSerialNumber absent: {json_a}"
   );
 
   // (b) The supersede direction (the exact R4 drop-bug inverse) — CMT1(5D),
@@ -1877,12 +1885,13 @@ fn cr3_modelless_cmt1_does_not_clear_threaded_model() {
   // CMT1 would be wrong.
   //
   // Discriminating observable is Canon Main tag `0x96` (Canon.pm:1834): with
-  // Model =~ /EOS 5D/ ⇒ the `SerialInfo` SubDirectory arm (InternalSerialNumber
-  // ABSENT); with no Model in state ⇒ the `InternalSerialNumber` arm (present,
-  // trailing 0xff stripped). The threaded model is therefore "Canon EOS 5D" (the
-  // model the `0x96` condition actually keys on), so the assertion is meaningful:
-  // if the model-less CMT1 wrongly cleared the Model, InternalSerialNumber would
-  // appear. Ground-truthed against `exiftool -G1 -j`.
+  // Model =~ /EOS 5D/ ⇒ the `SerialInfo` SubDirectory arm (decoded, #175 ⇒
+  // `InternalSerialNumber2` present, bare `InternalSerialNumber` ABSENT); with no
+  // Model in state ⇒ the bare `InternalSerialNumber` arm (present, trailing 0xff
+  // stripped). The threaded model is therefore "Canon EOS 5D" (the model the
+  // `0x96` condition actually keys on), so the assertion is meaningful: if the
+  // model-less CMT1 wrongly cleared the Model, the bare InternalSerialNumber
+  // would appear. Ground-truthed against `exiftool -G1 -j`.
 
   // CMT1 #1: IFD0 with Model (0x0110) = "Canon EOS 5D\0".
   let cmt1_model = tiff_le_one_entry(0x0110, 2, b"Canon EOS 5D\0");
@@ -1906,11 +1915,14 @@ fn cr3_modelless_cmt1_does_not_clear_threaded_model() {
     "CMT1 Model missing: {json}"
   );
   // The CMT3 walk saw the threaded Model (NOT cleared by the model-less CMT1) ⇒
-  // 0x96 routes to SerialInfo ⇒ InternalSerialNumber must be ABSENT.
+  // 0x96 routes to SerialInfo ⇒ InternalSerialNumber2 present, bare
+  // InternalSerialNumber ABSENT.
   assert!(
-    !json.contains("InternalSerialNumber"),
+    json.contains(r#""Canon:InternalSerialNumber2""#)
+      && !json.contains(r#""Canon:InternalSerialNumber":"#),
     "model-less CMT1 must NOT clear the threaded Model: with EOS 5D in state, \
-     0x96 is SerialInfo and InternalSerialNumber must be absent: {json}"
+     0x96 is SerialInfo ⇒ InternalSerialNumber2 present, bare \
+     InternalSerialNumber absent: {json}"
   );
 }
 
@@ -1960,10 +1972,10 @@ fn cr3_cmt1_in_earlier_uuid_threads_model_to_cmt3_in_later_uuid() {
   // `uuid` atom must see the `Model` of a CMT1 in an EARLIER Canon `uuid` atom.
   // The old per-uuid-local model reset this between atoms, silently flipping the
   // model-conditional `0x96` arm (Canon.pm:1834):
-  //   - Model =~ /EOS 5D/ ⇒ `SerialInfo` SubDirectory arm ⇒ InternalSerialNumber
-  //     ABSENT.
-  //   - no/other Model     ⇒ `InternalSerialNumber` arm (trailing 0xff stripped)
-  //     ⇒ present.
+  //   - Model =~ /EOS 5D/ ⇒ `SerialInfo` SubDirectory arm (decoded, #175) ⇒
+  //     `InternalSerialNumber2` present, bare `InternalSerialNumber` ABSENT.
+  //   - no/other Model     ⇒ bare `InternalSerialNumber` arm (trailing 0xff
+  //     stripped) ⇒ present.
   // Ground-truthed against `exiftool -G1 -j` on this multi-uuid layout.
 
   let cmt1_5d = || tiff_le_one_entry(0x0110, 2, b"Canon EOS 5D\0");
@@ -1971,7 +1983,8 @@ fn cr3_cmt1_in_earlier_uuid_threads_model_to_cmt3_in_later_uuid() {
 
   // uuid#1 { CMT1(Model="Canon EOS 5D") }, then uuid#2 { CMT3(0x96) }. The 5D
   // Model set while walking uuid#1 must STILL be in state at the uuid#2 CMT3 ⇒
-  // 0x96 routes to SerialInfo ⇒ InternalSerialNumber ABSENT.
+  // 0x96 routes to SerialInfo ⇒ InternalSerialNumber2 present, bare
+  // InternalSerialNumber ABSENT.
   let threaded = cr3_with_canon_uuids(&[&[(b"CMT1", cmt1_5d())], &[(b"CMT3", cmt3())]]);
   let json = exifast::parser::extract_info("cr3_cross_uuid.cr3", &threaded, true);
   assert!(
@@ -1979,9 +1992,11 @@ fn cr3_cmt1_in_earlier_uuid_threads_model_to_cmt3_in_later_uuid() {
     "the uuid#1 CMT1 Model is emitted: {json}"
   );
   assert!(
-    !json.contains("InternalSerialNumber"),
+    json.contains(r#""Canon:InternalSerialNumber2""#)
+      && !json.contains(r#""Canon:InternalSerialNumber":"#),
     "R5: a CMT1 Model in an EARLIER Canon uuid must thread to a CMT3 in a LATER \
-     uuid ⇒ 0x96 is SerialInfo ⇒ InternalSerialNumber absent: {json}"
+     uuid ⇒ 0x96 is SerialInfo ⇒ InternalSerialNumber2 present, bare \
+     InternalSerialNumber absent: {json}"
   );
 
   // Non-vacuousness: the SAME 0x96 bytes WITHOUT a preceding CMT1 Model take the
