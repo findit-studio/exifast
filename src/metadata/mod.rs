@@ -64,6 +64,7 @@ pub use domain::{
 pub use gopro::{
   GoProConv, GoProGlpiSample, GoProGpsSample, GoProKbat, GoProMeta, GoProTag, GoProTagValue,
 };
+pub(crate) use gopro::{GoProIdentity, GoProMainGroupTag, GoProScalar};
 pub use insta360::{
   Insta360AccelSample, Insta360ExposureSample, Insta360GpsSample, Insta360Identity, Insta360Meta,
   Insta360VideoTimeSample,

@@ -6379,315 +6379,10 @@ impl crate::emit::Taggable for Meta<'_> {
     // exifast's flat TagMap cannot reproduce that shape, so the FIRST GPS fix
     // is summarized here (the typed [`Meta::gopro`] accessor exposes the full
     // per-sample list). The block-level camera-identity + GPSU/GPSF/GPSP/GPSA
-    // scalars are one-per-file. Emitted under `GoPro`:`GoPro`.
-    {
-      let gp = &self.gopro;
-      // family0 = family1 = "GoPro" for every GoPro GPMF tag.
-      let gpg = || Group::new("GoPro", "GoPro");
-      // ── camera identity (block-level, `c` ASCII; no conv) ──────────────
-      // DVNM/MINF/CASN/FMWR (GoPro.pm:57/286-290/121/195). Plain ASCII strings
-      // with no ValueConv/PrintConv — emit verbatim in both modes.
-      for (val, name) in [
-        (gp.device_name(), "DeviceName"),
-        (gp.model(), "Model"),
-        (gp.camera_serial_number(), "CameraSerialNumber"),
-        (gp.firmware_version(), "FirmwareVersion"),
-      ] {
-        if let Some(s) = val {
-          tags.push(EmittedTag::new(
-            gpg(),
-            name.into(),
-            TagValue::Str(s.into()),
-            false,
-          ));
-        }
-      }
-      // MUID `MediaUniqueID` (GoPro.pm:456-462): the typed layer stores the
-      // RAW space-joined `u32` list (ExifTool's ValueConv). `-n` emits that
-      // raw value; `-j` (PrintConv) hex-renders each element and concatenates.
-      if let Some(raw) = gp.media_uid() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "MediaUniqueID".into(),
-          media_uid_value(raw, print_conv),
-          false,
-        ));
-      }
-      // ── block-level GPS scalars ────────────────────────────────────────
-      // GPSU `GPSDateTime` (GoPro.pm:242-248): the typed layer stores the
-      // post-ValueConv `20YY:MM:DD HH:MM:SS[.fff]` (NO timezone suffix — the
-      // `ConvertDateTime` PrintConv adds none by default); it is a no-op
-      // cosmetic on that shape (emit in both modes).
-      if let Some(dt) = gp.gps_date_time() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "GPSDateTime".into(),
-          TagValue::Str(dt.into()),
-          false,
-        ));
-      }
-      // GPSF `GPSMeasureMode` (GoPro.pm:230-236): PrintConv 2/3 →
-      // "<n>-Dimensional Measurement"; `-n` emits the raw code.
-      if let Some(mode) = gp.gps_measure_mode() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "GPSMeasureMode".into(),
-          gps_measure_mode_value(mode, print_conv),
-          false,
-        ));
-      }
-      // GPSP `GPSHPositioningError` (GoPro.pm:237-241): ValueConv `$val / 100`
-      // (cm→m) already applied in the typed layer; no PrintConv. F64 metres.
-      if let Some(err_m) = gp.gps_h_positioning_error_m() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "GPSHPositioningError".into(),
-          TagValue::F64(err_m),
-          false,
-        ));
-      }
-      // GPSA `GPSAltitudeSystem` (GoPro.pm:472): 4-char ID, no conv.
-      if let Some(sys) = gp.gps_altitude_system() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "GPSAltitudeSystem".into(),
-          TagValue::Str(sys.into()),
-          false,
-        ));
-      }
-      // SYST `SystemTime` (GoPro.pm:390-405): a DEFAULT tag (no
-      // `Unknown`/`Hidden`), emitted by `exiftool -ee`. The typed layer stores
-      // the post-`SCAL` space-joined display string of the FIRST `SYST` record
-      // (the calibration side-effect lives on the `SystemTimeList`). No
-      // ValueConv/PrintConv beyond the `RawConv` pass-through ⇒ emit verbatim in
-      // both modes.
-      if let Some(st) = gp.system_time() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          "SystemTime".into(),
-          TagValue::Str(st.into()),
-          false,
-        ));
-      }
-      // ── first GPS5/GPS9 fix (summarized; full list via `Meta::gopro`) ──
-      if let Some(fix) = gp.first_fix() {
-        // GPSLatitude/GPSLongitude: the `GPS::ToDMS` PrintConv
-        // (GoPro.pm:493-499) is a GPS-port dependency (same deferral as the
-        // SP3 stream above); emit post-ValueConv decimal degrees in BOTH
-        // modes.
-        if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSLatitude".into(),
-            TagValue::F64(lat),
-            false,
-          ));
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSLongitude".into(),
-            TagValue::F64(lon),
-            false,
-          ));
-        }
-        // GPSAltitude (GoPro.pm:500-503): typed layer stores metres; the
-        // `"$val m"` PrintConv is deferred (consistent with the SP3 stream's
-        // raw-F64 altitude). Emit F64 metres in both modes.
-        if let Some(alt) = fix.altitude_m() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSAltitude".into(),
-            TagValue::F64(alt),
-            false,
-          ));
-        }
-        // GPSSpeed / GPSSpeed3D (GoPro.pm:504-513): ValueConv `$val * 3.6`
-        // converts the stored m/s to KM/H — applied HERE on emission (the
-        // typed [`GoProGpsSample`] keeps m/s). No PrintConv ⇒ faithful in both
-        // `-j`/`-n`.
-        if let Some(spd) = fix.speed_2d_mps() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSSpeed".into(),
-            TagValue::F64(spd * 3.6),
-            false,
-          ));
-        }
-        if let Some(s3d) = fix.speed_3d_mps() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSSpeed3D".into(),
-            TagValue::F64(s3d * 3.6),
-            false,
-          ));
-        }
-        // GPS9-only per-sample columns (GoPro.pm:543-562). `GPSDateTime` here
-        // is the per-sample value (derived from the GPS-days/seconds columns);
-        // it overrides the block-level GPSU above under the sink's last-wins
-        // when a GPS9 file also carried a GPSU (a GPS9 file normally does not).
-        if let Some(dt) = fix.date_time() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSDateTime".into(),
-            TagValue::Str(dt.into()),
-            false,
-          ));
-        }
-        if let Some(dop) = fix.dop() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSDOP".into(),
-            TagValue::F64(dop),
-            false,
-          ));
-        }
-        if let Some(mode) = fix.measure_mode() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSMeasureMode".into(),
-            gps_measure_mode_value(mode, print_conv),
-            false,
-          ));
-        }
-      }
-      // ── Karma GLPI (`GPSPos`, GoPro.pm:197-204/598-626) ────────────────
-      // Like the GPS5/GPS9 fix above, ExifTool emits one `Doc<N>` per GLPI
-      // row; the FIRST sample is summarized here (the full per-sample list is
-      // on [`Meta::gopro`]'s `glpi_samples()`). Column order = table order
-      // (GoPro.pm:602-625): GPSDateTime, GPSLatitude, GPSLongitude,
-      // GPSAltitude, GPSSpeedX/Y/Z, GPSTrack. The `Unknown`/`Hidden` col 4 is
-      // not emitted. Lat/lon defer the `GPS::ToDMS` PrintConv (raw decimal
-      // degrees, like GPS5/GPS9); altitude defers its `"$val m"` PrintConv (raw
-      // F64). The speeds (cols 5-7) DO apply their `'"$val m/s"'` PrintConv in
-      // `-j` mode (R6-C) — GLPI speeds carry NO `*3.6` km/h `ValueConv` (the
-      // table has only the suffix PrintConv), so they stay m/s; `-n` emits the
-      // raw F64. `GPSTrack` (col 8) has no PrintConv (raw both modes).
-      // `GPSDateTime` is the `ConvertSystemTime` string emitted verbatim (incl.
-      // the `<uncalibrated>` / `0000:00:00 00:00:00` literals).
-      if let Some(g) = gp.first_glpi_fix() {
-        if let Some(dt) = g.date_time() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSDateTime".into(),
-            TagValue::Str(dt.into()),
-            false,
-          ));
-        }
-        if let (Some(lat), Some(lon)) = (g.latitude(), g.longitude()) {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSLatitude".into(),
-            TagValue::F64(lat),
-            false,
-          ));
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSLongitude".into(),
-            TagValue::F64(lon),
-            false,
-          ));
-        }
-        if let Some(alt) = g.altitude_m() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSAltitude".into(),
-            TagValue::F64(alt),
-            false,
-          ));
-        }
-        // GPSSpeedX/Y/Z (GoPro.pm:622-624): PrintConv `'"$val m/s"'`. `-j`
-        // renders the scaled m/s value with the ` m/s` suffix
-        // ([`unit_suffix_value`]); `-n` (ValueConv) emits the raw F64.
-        for (val, name) in [
-          (g.speed_x_mps(), "GPSSpeedX"),
-          (g.speed_y_mps(), "GPSSpeedY"),
-          (g.speed_z_mps(), "GPSSpeedZ"),
-        ] {
-          if let Some(v) = val {
-            tags.push(EmittedTag::new(
-              gpg(),
-              name.into(),
-              unit_suffix_value(v, " m/s", print_conv),
-              false,
-            ));
-          }
-        }
-        if let Some(tr) = g.track_deg() {
-          tags.push(EmittedTag::new(
-            gpg(),
-            "GPSTrack".into(),
-            TagValue::F64(tr),
-            false,
-          ));
-        }
-      }
-      // ── Karma KBAT (`BatteryStatus`, GoPro.pm:264-270/628-649) ─────────
-      // The FIRST battery record is summarized (full list on
-      // [`Meta::gopro`]'s `kbat_records()`). Column order = table order
-      // (GoPro.pm:634-648): BatteryCurrent, BatteryCapacity,
-      // BatteryTemperature, BatteryVoltage1..4, BatteryTime, BatteryLevel.
-      // The `Unknown`/`Hidden` cols (2/9/10-13) are not emitted. Each named
-      // column carries a unit-suffix PrintConv (GoPro.pm:634-648) applied in
-      // `-j` (PrintConv) mode via [`unit_suffix_value`]; `-n` (ValueConv) emits
-      // the raw scaled F64. `BatteryTime` (col 8) instead uses
-      // `ConvertDuration(int($val + 0.5))` — emitted in column order, before
-      // `BatteryLevel`.
-      if let Some(k) = gp.kbat_records().first() {
-        // (value, name, PrintConv): `Suffix` = `'"$val <unit>"'`; `Duration` =
-        // `ConvertDuration(int($val + 0.5))`.
-        enum KbatConv {
-          Suffix(&'static str),
-          Duration,
-        }
-        for (val, name, conv) in [
-          (k.current_a(), "BatteryCurrent", KbatConv::Suffix(" A")),
-          (k.capacity_ah(), "BatteryCapacity", KbatConv::Suffix(" Ah")),
-          (
-            k.temperature_c(),
-            "BatteryTemperature",
-            KbatConv::Suffix(" C"),
-          ),
-          (k.voltage1_v(), "BatteryVoltage1", KbatConv::Suffix(" V")),
-          (k.voltage2_v(), "BatteryVoltage2", KbatConv::Suffix(" V")),
-          (k.voltage3_v(), "BatteryVoltage3", KbatConv::Suffix(" V")),
-          (k.voltage4_v(), "BatteryVoltage4", KbatConv::Suffix(" V")),
-          (k.time_s(), "BatteryTime", KbatConv::Duration),
-          (k.level_pct(), "BatteryLevel", KbatConv::Suffix(" %")),
-        ] {
-          if let Some(v) = val {
-            let value = match conv {
-              KbatConv::Suffix(unit) => unit_suffix_value(v, unit, print_conv),
-              // `int($val + 0.5)` rounds the scaled seconds to the nearest
-              // second (Perl `int()` truncates toward zero; battery time is a
-              // non-negative duration) before `ConvertDuration` ([`convert_duration`]);
-              // `-n` emits the raw scaled F64 seconds.
-              KbatConv::Duration if print_conv => {
-                TagValue::Str(convert_duration((v + 0.5).trunc()).into())
-              }
-              KbatConv::Duration => TagValue::F64(v),
-            };
-            tags.push(EmittedTag::new(gpg(), name.into(), value, false));
-          }
-        }
-      }
-      // ── every OTHER default-visible %GoPro::GPMF tag (table-driven) ────
-      // ExifTool's `ProcessGoPro` `HandleTag`s every default-visible tag
-      // (GoPro.pm:885); the typed surface above models the GPS/Karma/camera-id
-      // subset, and [`GoProMeta::generic_tags`] carries the remaining ~95
-      // (sensor streams + Protune/codec settings + calibrations) decoded in
-      // walk order. Each is rendered to its `-n`/`-j` value here by conv family
-      // ([`gopro_generic_value`]) under the same `GoPro`:`GoPro` group. A
-      // `Binary => 1` tag renders as the `(Binary data N bytes…)` placeholder
-      // in BOTH modes (GoPro.pm `Binary` → ValueConv `'\$val'`), N = byte length
-      // of the post-`ScaleValues` value string (exiftool:3987).
-      for gt in gp.generic_tags() {
-        tags.push(EmittedTag::new(
-          gpg(),
-          gt.name().into(),
-          gopro_generic_value(gt, print_conv),
-          false,
-        ));
-      }
-    }
+    // scalars are one-per-file. Emitted under `GoPro`:`GoPro` (family-0 =
+    // family-1 = `GoPro`; the JPEG `APP6` path reuses [`emit_gopro_tags`] with
+    // the `APP6` family-0).
+    emit_gopro_tags(&self.gopro, "GoPro", "GoPro", print_conv, &mut tags);
 
     // ── SP4: Android CAMM cross-kind `-G1` SampleTime/SampleDuration ────────
     // At `-ee -G1` the single `Track<N>:SampleTime`/`SampleDuration` is the timing
@@ -10654,6 +10349,371 @@ fn sony_rtmd_exposure_time_read_value(
     NumericRead::Valid(r) => sony_rtmd_exposure_time_value(r, print_conv),
     NumericRead::EmptyRead => TagValue::Str("".into()),
   }
+}
+
+/// Emit every default-visible `%GoPro::GPMF` tag a [`GoProMeta`] carries, under
+/// the group `(family0, family1)`, into `tags`. The faithful `HandleTag` stream
+/// of `ProcessGoPro` (GoPro.pm:846-896), shared by the QuickTime `GPMF` /
+/// `gpmd` path (group `GoPro`:`GoPro`, GoPro.pm:67-69) and the JPEG `APP6`
+/// `GoPro` segment (group `APP6`:`GoPro`, JPEG.pm:183-198 → the SAME
+/// `%GoPro::GPMF` table, whose family-1 stays `GoPro` but whose family-0 is the
+/// `APP6` parent the segment was reached through).
+///
+/// Like the SP3/Insta360 streams, ExifTool emits one `Doc<N>` sub-document per
+/// GPS / GLPI / KBAT row; exifast's flat sink cannot reproduce that shape, so
+/// the FIRST fix/record of each is summarized here (the typed [`GoProMeta`]
+/// accessors expose the full per-sample lists). The block-level camera-identity
+/// + `GPSU`/`GPSF`/`GPSP`/`GPSA` scalars and the generic settings tags are
+/// one-per-file. A still-image `APP6` device record carries ONLY the
+/// camera-identity + settings tags (no GPS/telemetry streams), so the GPS/GLPI/
+/// KBAT branches are simply empty for that source.
+#[cfg(feature = "alloc")]
+pub(crate) fn emit_gopro_tags(
+  gp: &GoProMeta,
+  family0: &str,
+  family1: &str,
+  print_conv: bool,
+  tags: &mut std::vec::Vec<crate::emit::EmittedTag>,
+) {
+  use crate::emit::EmittedTag;
+  use crate::value::{Group, TagValue};
+  let gpg = || Group::new(family0, family1);
+  // ── main-group tags (camera identity + generic settings + GPS/system
+  // scalars), in GPMF-walk order ──
+  // ExifTool's `ProcessGoPro` is ONE linear loop that `HandleTag`s each record
+  // at its stream position (GoPro.pm:885) — the typed camera-identity fields
+  // (`DVNM`/`FMWR`/`CASN`/`MINF`/`MUID`), the generic table-driven settings
+  // (`OREN`/`PRTN`/…), AND the flat GPS / system scalars
+  // (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`) all emit INTERLEAVED in the order their
+  // KLV records were walked, NOT a whole identity block, then a settings block,
+  // then a GPS-scalar block. So a crafted `STRM { OREN, DVNM }` stream emits
+  // `AutoRotation` BEFORE `DeviceName`, and `STRM { GPSU, OREN }` emits
+  // `GPSDateTime` BEFORE `AutoRotation`. The unified order is recorded on
+  // [`GoProMeta::main_group_order`]; a duplicate name is emitted at each
+  // recorded position and the sink's last-wins-in-place dedup keeps the first
+  // position + last value (ExifTool's `%noDups`).
+  //
+  // Identity values:
+  //  - DVNM/FMWR/CASN/MINF are `c` ASCII (no conv); read live from the typed
+  //    field so a duplicate's last value wins.
+  //  - MUID is the RAW space-joined `u32` ValueConv list (`-j` hex-renders each
+  //    element, GoPro.pm:456-462).
+  //
+  // GPS / system scalar values (also read live from their dedicated typed
+  // fields, so a duplicate's last value wins at the recorded first position):
+  //  - GPSU `GPSDateTime`: the post-ValueConv `20YY:MM:DD HH:MM:SS[.fff]` (NO
+  //    timezone suffix — `ConvertDateTime` adds none by default; cosmetic no-op
+  //    on that shape, so it emits verbatim in both modes).
+  //  - GPSF `GPSMeasureMode`: PrintConv 2/3 → "<n>-Dimensional Measurement";
+  //    `-n` emits the raw code.
+  //  - GPSP `GPSHPositioningError`: ValueConv `$val / 100` (cm→m) already applied
+  //    in the typed layer; no PrintConv (F64 metres).
+  //  - GPSA `GPSAltitudeSystem`: 4-char ID, no conv.
+  //  - SYST `SystemTime`: a DEFAULT tag (no `Unknown`/`Hidden`), emitted by
+  //    `exiftool -ee` — the post-`SCAL` space-joined display string of the FIRST
+  //    `SYST` record (the calibration side-effect lives on the `SystemTimeList`);
+  //    no conv beyond the `RawConv` pass-through ⇒ emit verbatim in both modes.
+  //
+  // A hand-built [`GoProMeta`] with no recorded order (e.g. a test fixture)
+  // falls back to the canonical identity → GPS-scalars → settings sequence.
+  {
+    use crate::metadata::{GoProIdentity, GoProMainGroupTag, GoProScalar};
+    let str_value = |s: &str| TagValue::Str(s.into());
+    let emit_identity = |field: GoProIdentity, tags: &mut std::vec::Vec<EmittedTag>| {
+      let value = match field {
+        GoProIdentity::DeviceName => gp.device_name().map(str_value),
+        GoProIdentity::FirmwareVersion => gp.firmware_version().map(str_value),
+        GoProIdentity::CameraSerialNumber => gp.camera_serial_number().map(str_value),
+        GoProIdentity::Model => gp.model().map(str_value),
+        GoProIdentity::MediaUniqueID => gp.media_uid().map(|raw| media_uid_value(raw, print_conv)),
+      };
+      if let Some(v) = value {
+        tags.push(EmittedTag::new(gpg(), field.as_str().into(), v, false));
+      }
+    };
+    let emit_scalar = |field: GoProScalar, tags: &mut std::vec::Vec<EmittedTag>| {
+      let entry: Option<(&str, TagValue)> = match field {
+        GoProScalar::GpsDateTime => gp
+          .gps_date_time()
+          .map(|dt| ("GPSDateTime", TagValue::Str(dt.into()))),
+        GoProScalar::GpsMeasureMode => gp
+          .gps_measure_mode()
+          .map(|m| ("GPSMeasureMode", gps_measure_mode_value(m, print_conv))),
+        GoProScalar::GpsHPositioningError => gp
+          .gps_h_positioning_error_m()
+          .map(|e| ("GPSHPositioningError", TagValue::F64(e))),
+        GoProScalar::GpsAltitudeSystem => gp
+          .gps_altitude_system()
+          .map(|s| ("GPSAltitudeSystem", TagValue::Str(s.into()))),
+        GoProScalar::SystemTime => gp
+          .system_time()
+          .map(|st| ("SystemTime", TagValue::Str(st.into()))),
+      };
+      if let Some((name, value)) = entry {
+        tags.push(EmittedTag::new(gpg(), name.into(), value, false));
+      }
+    };
+    let emit_generic = |idx: usize, tags: &mut std::vec::Vec<EmittedTag>| {
+      // A recorded index is always in range, but the `.get()` keeps the access
+      // checked (the file-wide indexing deny is honoured).
+      if let Some(gt) = gp.generic_tags().get(idx) {
+        tags.push(EmittedTag::new(
+          gpg(),
+          gt.name().into(),
+          gopro_generic_value(gt, print_conv),
+          false,
+        ));
+      }
+    };
+    let recorded = gp.main_group_order();
+    if recorded.is_empty() {
+      // Fallback for an order-less hand-built meta: canonical identity order,
+      // then the GPS / system scalars, then the generic settings in their stored
+      // (push) order.
+      const CANONICAL: [GoProIdentity; 5] = [
+        GoProIdentity::DeviceName,
+        GoProIdentity::FirmwareVersion,
+        GoProIdentity::CameraSerialNumber,
+        GoProIdentity::Model,
+        GoProIdentity::MediaUniqueID,
+      ];
+      for field in CANONICAL {
+        emit_identity(field, tags);
+      }
+      const SCALARS: [GoProScalar; 5] = [
+        GoProScalar::GpsDateTime,
+        GoProScalar::GpsMeasureMode,
+        GoProScalar::GpsHPositioningError,
+        GoProScalar::GpsAltitudeSystem,
+        GoProScalar::SystemTime,
+      ];
+      for field in SCALARS {
+        emit_scalar(field, tags);
+      }
+      for idx in 0..gp.generic_tags().len() {
+        emit_generic(idx, tags);
+      }
+    } else {
+      // The faithful path: emit every main-group tag at its recorded walk
+      // position.
+      for entry in recorded {
+        match entry {
+          GoProMainGroupTag::Identity(field) => emit_identity(*field, tags),
+          GoProMainGroupTag::Scalar(field) => emit_scalar(*field, tags),
+          GoProMainGroupTag::Generic(idx) => emit_generic(*idx, tags),
+        }
+      }
+    }
+  }
+  // ── first GPS5/GPS9 fix (summarized; full list via `Meta::gopro`) ──
+  if let Some(fix) = gp.first_fix() {
+    // GPSLatitude/GPSLongitude: the `GPS::ToDMS` PrintConv
+    // (GoPro.pm:493-499) is a GPS-port dependency (same deferral as the
+    // SP3 stream above); emit post-ValueConv decimal degrees in BOTH
+    // modes.
+    if let (Some(lat), Some(lon)) = (fix.latitude(), fix.longitude()) {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSLatitude".into(),
+        TagValue::F64(lat),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSLongitude".into(),
+        TagValue::F64(lon),
+        false,
+      ));
+    }
+    // GPSAltitude (GoPro.pm:500-503): typed layer stores metres; the
+    // `"$val m"` PrintConv is deferred (consistent with the SP3 stream's
+    // raw-F64 altitude). Emit F64 metres in both modes.
+    if let Some(alt) = fix.altitude_m() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSAltitude".into(),
+        TagValue::F64(alt),
+        false,
+      ));
+    }
+    // GPSSpeed / GPSSpeed3D (GoPro.pm:504-513): ValueConv `$val * 3.6`
+    // converts the stored m/s to KM/H — applied HERE on emission (the
+    // typed [`GoProGpsSample`] keeps m/s). No PrintConv ⇒ faithful in both
+    // `-j`/`-n`.
+    if let Some(spd) = fix.speed_2d_mps() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSSpeed".into(),
+        TagValue::F64(spd * 3.6),
+        false,
+      ));
+    }
+    if let Some(s3d) = fix.speed_3d_mps() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSSpeed3D".into(),
+        TagValue::F64(s3d * 3.6),
+        false,
+      ));
+    }
+    // GPS9-only per-sample columns (GoPro.pm:543-562). `GPSDateTime` here
+    // is the per-sample value (derived from the GPS-days/seconds columns);
+    // it overrides the block-level GPSU above under the sink's last-wins
+    // when a GPS9 file also carried a GPSU (a GPS9 file normally does not).
+    if let Some(dt) = fix.date_time() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSDateTime".into(),
+        TagValue::Str(dt.into()),
+        false,
+      ));
+    }
+    if let Some(dop) = fix.dop() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSDOP".into(),
+        TagValue::F64(dop),
+        false,
+      ));
+    }
+    if let Some(mode) = fix.measure_mode() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSMeasureMode".into(),
+        gps_measure_mode_value(mode, print_conv),
+        false,
+      ));
+    }
+  }
+  // ── Karma GLPI (`GPSPos`, GoPro.pm:197-204/598-626) ────────────────
+  // Like the GPS5/GPS9 fix above, ExifTool emits one `Doc<N>` per GLPI
+  // row; the FIRST sample is summarized here (the full per-sample list is
+  // on [`Meta::gopro`]'s `glpi_samples()`). Column order = table order
+  // (GoPro.pm:602-625): GPSDateTime, GPSLatitude, GPSLongitude,
+  // GPSAltitude, GPSSpeedX/Y/Z, GPSTrack. The `Unknown`/`Hidden` col 4 is
+  // not emitted. Lat/lon defer the `GPS::ToDMS` PrintConv (raw decimal
+  // degrees, like GPS5/GPS9); altitude defers its `"$val m"` PrintConv (raw
+  // F64). The speeds (cols 5-7) DO apply their `'"$val m/s"'` PrintConv in
+  // `-j` mode (R6-C) — GLPI speeds carry NO `*3.6` km/h `ValueConv` (the
+  // table has only the suffix PrintConv), so they stay m/s; `-n` emits the
+  // raw F64. `GPSTrack` (col 8) has no PrintConv (raw both modes).
+  // `GPSDateTime` is the `ConvertSystemTime` string emitted verbatim (incl.
+  // the `<uncalibrated>` / `0000:00:00 00:00:00` literals).
+  if let Some(g) = gp.first_glpi_fix() {
+    if let Some(dt) = g.date_time() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSDateTime".into(),
+        TagValue::Str(dt.into()),
+        false,
+      ));
+    }
+    if let (Some(lat), Some(lon)) = (g.latitude(), g.longitude()) {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSLatitude".into(),
+        TagValue::F64(lat),
+        false,
+      ));
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSLongitude".into(),
+        TagValue::F64(lon),
+        false,
+      ));
+    }
+    if let Some(alt) = g.altitude_m() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSAltitude".into(),
+        TagValue::F64(alt),
+        false,
+      ));
+    }
+    // GPSSpeedX/Y/Z (GoPro.pm:622-624): PrintConv `'"$val m/s"'`. `-j`
+    // renders the scaled m/s value with the ` m/s` suffix
+    // ([`unit_suffix_value`]); `-n` (ValueConv) emits the raw F64.
+    for (val, name) in [
+      (g.speed_x_mps(), "GPSSpeedX"),
+      (g.speed_y_mps(), "GPSSpeedY"),
+      (g.speed_z_mps(), "GPSSpeedZ"),
+    ] {
+      if let Some(v) = val {
+        tags.push(EmittedTag::new(
+          gpg(),
+          name.into(),
+          unit_suffix_value(v, " m/s", print_conv),
+          false,
+        ));
+      }
+    }
+    if let Some(tr) = g.track_deg() {
+      tags.push(EmittedTag::new(
+        gpg(),
+        "GPSTrack".into(),
+        TagValue::F64(tr),
+        false,
+      ));
+    }
+  }
+  // ── Karma KBAT (`BatteryStatus`, GoPro.pm:264-270/628-649) ─────────
+  // The FIRST battery record is summarized (full list on
+  // [`Meta::gopro`]'s `kbat_records()`). Column order = table order
+  // (GoPro.pm:634-648): BatteryCurrent, BatteryCapacity,
+  // BatteryTemperature, BatteryVoltage1..4, BatteryTime, BatteryLevel.
+  // The `Unknown`/`Hidden` cols (2/9/10-13) are not emitted. Each named
+  // column carries a unit-suffix PrintConv (GoPro.pm:634-648) applied in
+  // `-j` (PrintConv) mode via [`unit_suffix_value`]; `-n` (ValueConv) emits
+  // the raw scaled F64. `BatteryTime` (col 8) instead uses
+  // `ConvertDuration(int($val + 0.5))` — emitted in column order, before
+  // `BatteryLevel`.
+  if let Some(k) = gp.kbat_records().first() {
+    // (value, name, PrintConv): `Suffix` = `'"$val <unit>"'`; `Duration` =
+    // `ConvertDuration(int($val + 0.5))`.
+    enum KbatConv {
+      Suffix(&'static str),
+      Duration,
+    }
+    for (val, name, conv) in [
+      (k.current_a(), "BatteryCurrent", KbatConv::Suffix(" A")),
+      (k.capacity_ah(), "BatteryCapacity", KbatConv::Suffix(" Ah")),
+      (
+        k.temperature_c(),
+        "BatteryTemperature",
+        KbatConv::Suffix(" C"),
+      ),
+      (k.voltage1_v(), "BatteryVoltage1", KbatConv::Suffix(" V")),
+      (k.voltage2_v(), "BatteryVoltage2", KbatConv::Suffix(" V")),
+      (k.voltage3_v(), "BatteryVoltage3", KbatConv::Suffix(" V")),
+      (k.voltage4_v(), "BatteryVoltage4", KbatConv::Suffix(" V")),
+      (k.time_s(), "BatteryTime", KbatConv::Duration),
+      (k.level_pct(), "BatteryLevel", KbatConv::Suffix(" %")),
+    ] {
+      if let Some(v) = val {
+        let value = match conv {
+          KbatConv::Suffix(unit) => unit_suffix_value(v, unit, print_conv),
+          // `int($val + 0.5)` rounds the scaled seconds to the nearest
+          // second (Perl `int()` truncates toward zero; battery time is a
+          // non-negative duration) before `ConvertDuration` ([`convert_duration`]);
+          // `-n` emits the raw scaled F64 seconds.
+          KbatConv::Duration if print_conv => {
+            TagValue::Str(convert_duration((v + 0.5).trunc()).into())
+          }
+          KbatConv::Duration => TagValue::F64(v),
+        };
+        tags.push(EmittedTag::new(gpg(), name.into(), value, false));
+      }
+    }
+  }
+  // NOTE: the generic table-driven `%GoPro::GPMF` settings (sensor streams,
+  // Protune/codec settings, calibrations — `Binary => 1` rendered as the
+  // `(Binary data N bytes…)` placeholder in both modes) and the flat GPS /
+  // system scalars (`GPSU`/`GPSF`/`GPSP`/`GPSA`/`SYST`) are NOT separate trailing
+  // blocks: they are emitted INTERLEAVED with the camera identity in the
+  // GPMF-walk-ordered main-group block above ([`GoProMeta::main_group_order`]),
+  // faithful to ExifTool's single linear `HandleTag` loop (GoPro.pm:885). Only
+  // the per-sample `Doc<N>` telemetry (GPS5/GPS9/GLPI/KBAT first-fix summaries)
+  // is emitted here, after the main-group block.
 }
 
 /// Build a GoPro unit-suffix tag value — the `'"$val <unit>"'` PrintConv shared

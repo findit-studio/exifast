@@ -98,10 +98,8 @@ use crate::recovery::Step;
 use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, read_value};
 use tables::Conv;
 
-// ===========================================================================
-// IFD identity — the family-1 group an IFD's tags carry
-// ===========================================================================
-
+// ====================================================================// IFD identity — the family-1 group an IFD's tags carry
+// ====================================================================
 /// The kind of IFD currently being walked — drives the family-1 group of
 /// the tags it emits. `ProcessExif` sets `$$dirInfo{DirName}` to one of
 /// these (`ExifTool.pm:8688` IFD0; `Exif.pm:7064-7077` `SubdirInfo{DirName}`
@@ -292,10 +290,8 @@ impl IfdKind {
   }
 }
 
-// ===========================================================================
-// SubDirectory dispatch seam — `SubDirKind`
-// ===========================================================================
-
+// ====================================================================// SubDirectory dispatch seam — `SubDirKind`
+// ====================================================================
 /// The SubDirectory a pointer tag dispatches into — the seam that keeps the
 /// IFD walker reusable and lets a future MakerNotes port plug in.
 ///
@@ -360,10 +356,8 @@ impl SubDirKind {
   }
 }
 
-// ===========================================================================
-// Typed value carrier — `ExifValue<'a>`
-// ===========================================================================
-
+// ====================================================================// Typed value carrier — `ExifValue<'a>`
+// ====================================================================
 /// One decoded Exif/GPS tag value — the post-Format-decode, pre-conversion
 /// `$val`.
 ///
@@ -397,10 +391,8 @@ impl ExifValue {
   }
 }
 
-// ===========================================================================
-// One emitted tag — `ExifEntry<'a>`
-// ===========================================================================
-
+// ====================================================================// One emitted tag — `ExifEntry<'a>`
+// ====================================================================
 /// One emitted Exif/GPS tag — the family-1 group, the on-disk tag ID, the
 /// resolved name, and the decoded value. Faithful to a single ExifTool
 /// `FoundTag` call (`Exif.pm:7181`). Fully OWNED (no input-buffer lifetime).
@@ -468,10 +460,8 @@ enum ResolvedConv {
   Gps(gps::GpsConv),
 }
 
-// ===========================================================================
-// MakerNote capture — the deferred-vendor-parsing seam
-// ===========================================================================
-
+// ====================================================================// MakerNote capture — the deferred-vendor-parsing seam
+// ====================================================================
 /// How to recompute a captured MakerNote's `-n` (ValueConv) vendor emissions on
 /// demand — Golden-v2 P0 single-mode decode. The eager walk decodes each vendor
 /// body ONCE (PrintConv), keeping the typed slot + the PrintConv emissions; this
@@ -869,10 +859,8 @@ impl<'a> MakerNote<'a> {
   }
 }
 
-// ===========================================================================
-// Typed Meta — `ExifMeta<'a>`
-// ===========================================================================
-
+// ====================================================================// Typed Meta — `ExifMeta<'a>`
+// ====================================================================
 /// Typed Exif/TIFF metadata — the lib-first output of [`ProcessExif`] and
 /// the reusable [`parse_exif_block`].
 ///
@@ -973,6 +961,49 @@ pub struct ExifMeta<'a> {
   /// the CR3 `CMT4` GPS block — none has a top-level `$raf`) — bundled never
   /// detects CR2 from an embedded block.
   cr2_magic: bool,
+  /// The decoded GoPro GPMF metadata of a JPEG `APP6` "GoPro" segment
+  /// (JPEG.pm:183-198 → `%GoPro::GPMF` via `ProcessGoPro`). A GoPro still
+  /// (`GOPR*.JPG`) carries its device-settings GPMF stream in `APP6`; the
+  /// marker walk ([`crate::exif::jpeg`]) recognizes the `GoPro\0`-prefixed
+  /// segment, strips the 6-byte prefix, and runs the shared GPMF KLV walker
+  /// into this field. The tags emit under group `APP6`:`GoPro` from
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) — AFTER the EXIF + MakerNote
+  /// tags in the realistic layout (`APP1` Exif before the later `APP6`,
+  /// `gopro_before_exif == false`), or BEFORE them when
+  /// [`gopro_before_exif`](Self::gopro_before_exif) is set (a non-standard
+  /// `APP6`-before-`APP1` JPEG) — faithful to ExifTool's `Marker:`-loop file
+  /// order. `None` for a non-GoPro JPEG / a standalone TIFF / any embedded-Exif
+  /// block other than a JPEG with an `APP6` GoPro segment.
+  ///
+  /// Gated on `quicktime`: the `GoProMeta` model + the GPMF parser live in the
+  /// `quicktime`-feature module ([`crate::formats::gopro`]); the `exif` feature
+  /// builds standalone (no `quicktime`) with this field absent.
+  #[cfg(feature = "quicktime")]
+  gopro: Option<crate::metadata::GoProMeta>,
+  /// `true` when the `APP6` "GoPro" segment occurs BEFORE the first `APP1` Exif
+  /// segment in JPEG marker (file) order — ExifTool runs each `APP6`/`APP1` arm
+  /// inside its `Marker:` loop in file order (`ExifTool.pm:7325`), so a
+  /// non-standard JPEG that places the `GoPro\0` `APP6` ahead of the `Exif\0\0`
+  /// `APP1` emits the `GoPro:*` tags BEFORE the `IFD0:*` tags. The marker walk
+  /// ([`crate::exif::jpeg`]) records this; [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// emits the GoPro block first when it is set, else after the EXIF + MakerNote
+  /// tags (the realistic layout — every real GoPro still, including the
+  /// `t/images/GoPro.jpg` fixture, has `APP1` before `APP6`, so this defaults
+  /// `false` and that path is unchanged).
+  ///
+  /// This handles the GoPro block being wholly before or wholly after the EXIF
+  /// block (the realistic cases ExifTool emits as one contiguous group each); a
+  /// pathological `APP6`/`APP1`/`APP6` straddle — or multiple INDEPENDENT `APP1`
+  /// Exif blocks straddling a GoPro `APP6` — is NOT fully marker-order-replayed
+  /// here (that would need an engine-wide per-segment emission model, the
+  /// limitation tracked in issue 233) — fine, because a real GoPro JPEG never
+  /// straddles, and because ExifTool's `-G1 -j` output co-locates the family-1
+  /// `IFD0` group anyway, so the whole-block order this flag computes still
+  /// matches the oracle at the conformance target (the strict marker-order
+  /// interleaving never surfaces in JSON). `false` for every non-GoPro /
+  /// standalone / embedded-block source.
+  #[cfg(feature = "quicktime")]
+  gopro_before_exif: bool,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -1134,7 +1165,60 @@ impl<'a> ExifMeta<'a> {
       // (`ExifTool.pm:8629`) is reachable for an `APP1` Exif merge.
       dng_version: false,
       cr2_magic: false,
+      // The JPEG marker walk attaches an `APP6` GoPro GPMF stream AFTER this
+      // construction via [`set_jpeg_gopro`](Self::set_jpeg_gopro); a freshly
+      // built JPEG `ExifMeta` starts with none, in the realistic
+      // `APP1`-before-`APP6` order (GoPro tags emit AFTER EXIF).
+      #[cfg(feature = "quicktime")]
+      gopro: None,
+      #[cfg(feature = "quicktime")]
+      gopro_before_exif: false,
     }
+  }
+
+  /// Attach the GoPro GPMF metadata decoded from a JPEG `APP6` "GoPro" segment
+  /// (JPEG.pm:183-198). Called by the JPEG marker walk
+  /// ([`crate::exif::jpeg`]) after [`from_jpeg_parts`](Self::from_jpeg_parts)
+  /// when an `APP6` segment whose payload began `GoPro\0` decoded at least one
+  /// GPMF record. The tags emit under group `APP6`:`GoPro` from
+  /// [`Taggable::tags`](crate::emit::Taggable::tags). A no-op-equivalent empty
+  /// `GoProMeta` is simply stored as-is (it emits nothing).
+  ///
+  /// `before_exif` records whether that `APP6` segment preceded the first
+  /// `APP1` Exif segment in JPEG marker (file) order (see
+  /// [`gopro_before_exif`](Self::gopro_before_exif)): `true` makes `tags` emit
+  /// the GoPro block BEFORE the EXIF + MakerNote tags (faithful to ExifTool's
+  /// `Marker:`-loop file order), `false` (the realistic `APP1`-before-`APP6`
+  /// layout) keeps it after.
+  #[cfg(feature = "quicktime")]
+  pub(crate) fn set_jpeg_gopro(&mut self, gopro: crate::metadata::GoProMeta, before_exif: bool) {
+    self.gopro = Some(gopro);
+    self.gopro_before_exif = before_exif;
+  }
+
+  /// The GoPro GPMF metadata decoded from a JPEG `APP6` "GoPro" segment, if
+  /// any (`None` for every non-GoPro-JPEG source). Exposes the full typed
+  /// [`GoProMeta`](crate::metadata::GoProMeta) surface (per-sample lists, camera
+  /// identity, settings) the `APP6`:`GoPro` tag stream is rendered from.
+  #[cfg(feature = "quicktime")]
+  #[must_use]
+  #[inline]
+  pub fn gopro(&self) -> Option<&crate::metadata::GoProMeta> {
+    self.gopro.as_ref()
+  }
+
+  /// `true` when the source JPEG's `APP6` "GoPro" segment preceded its first
+  /// `APP1` Exif segment in marker (file) order, so [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// emits the `GoPro:*` tags BEFORE the `IFD0:*`/`ExifIFD:*` tags (faithful to
+  /// ExifTool's `Marker:`-loop file order, `ExifTool.pm:7325`). `false` for the
+  /// realistic `APP1`-before-`APP6` layout (every real GoPro still, including
+  /// `t/images/GoPro.jpg`) and for every non-GoPro / standalone / embedded
+  /// source.
+  #[cfg(feature = "quicktime")]
+  #[must_use]
+  #[inline]
+  pub fn gopro_before_exif(&self) -> bool {
+    self.gopro_before_exif
   }
 
   /// Decompose this `ExifMeta` into `(entries, warnings, byte_order,
@@ -1167,10 +1251,8 @@ impl<'a> ExifMeta<'a> {
   }
 }
 
-// ===========================================================================
-// `ProcessExif` — the lib-first parser
-// ===========================================================================
-
+// ====================================================================// `ProcessExif` — the lib-first parser
+// ====================================================================
 /// Exif / TIFF parser — faithful port of `Image::ExifTool::Exif::ProcessExif`
 /// (`Exif.pm:6278-7240`) plus the TIFF-header front-end of
 /// `Image::ExifTool::DoProcessTIFF` (`ExifTool.pm:8628-8730`).
@@ -1378,10 +1460,8 @@ pub fn parse_gps_block(block: &[u8]) -> Option<ExifMeta<'_>> {
   )
 }
 
-// ===========================================================================
-// TIFF header parser — DoProcessTIFF front-end (ExifTool.pm:8628-8645)
-// ===========================================================================
-
+// ====================================================================// TIFF header parser — DoProcessTIFF front-end (ExifTool.pm:8628-8645)
+// ====================================================================
 /// Parse a TIFF block: validate the header, then walk the IFD chain.
 ///
 /// `ExifTool.pm:8628-8645`:
@@ -1651,6 +1731,11 @@ fn parse_tiff_with_base_no_raf<'a>(
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     dng_version: w.dng_version,
     cr2_magic,
+    // A standalone-TIFF walk has no JPEG `APP6` GoPro segment.
+    #[cfg(feature = "quicktime")]
+    gopro: None,
+    #[cfg(feature = "quicktime")]
+    gopro_before_exif: false,
   })
 }
 
@@ -1796,14 +1881,17 @@ fn parse_tiff_with_base_shared<'a>(
     // unreachable; the CR2 magic read is gated on the standalone-TIFF `$raf`.
     dng_version: false,
     cr2_magic: false,
+    // An embedded-Exif block (PNG `eXIf`) has no JPEG `APP6` GoPro segment.
+    #[cfg(feature = "quicktime")]
+    gopro: None,
+    #[cfg(feature = "quicktime")]
+    gopro_before_exif: false,
   };
   (Some(meta), cycle_guard_warnings)
 }
 
-// ===========================================================================
-// IFD walker — ProcessExif (Exif.pm:6278-7240)
-// ===========================================================================
-
+// ====================================================================// IFD walker — ProcessExif (Exif.pm:6278-7240)
+// ====================================================================
 /// The chain-IFD (IFD0 / trailing-IFD) reprocess guard — the storage behind
 /// ExifTool's `$$self{PROCESSED}` for the non-zero-`DirLen` directories
 /// (`ExifTool.pm:9050-9072`). Two modes:
@@ -3544,8 +3632,7 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
   }
 }
 
-// ===========================================================================
-// `Taggable` — the golden-pattern emission path (EXIF entries + MakerNotes)
+// ====================================================================// `Taggable` — the golden-pattern emission path (EXIF entries + MakerNotes)
 //
 // EXIF no longer has an inherent `serialize_tags`: the full EXIF tag stream
 // (`File:ExifByteOrder` first, then the IFD-walk entries, then the MakerNote
@@ -3553,8 +3640,7 @@ fn sub_dir_for(tag_id: u16, kind: IfdKind) -> Option<SubDirKind> {
 // single-sourced by `AnyMeta::serialize_tags` / `AnyMeta::iter_tags`. The
 // `$et->Warn(...)` channel flows through the sibling `Diagnose`/`run_diagnostics`
 // engine (`ExifMeta::diagnostics`).
-// ===========================================================================
-
+// ====================================================================
 #[cfg(feature = "alloc")]
 impl ExifMeta<'_> {
   /// Push this `ExifMeta`'s EXIF/GPS [`ExifEntry`] tags into `out` for the
@@ -3631,6 +3717,66 @@ impl ExifMeta<'_> {
       push(out, &mn.emissions_value_conv());
     }
   }
+
+  /// `true` iff this `ExifMeta` would emit AT LEAST ONE default-visible tag in a
+  /// family-0 group OTHER than `File` — a MOVABLE tag whose position in
+  /// ExifTool's `FoundTag` stream participates in cross-segment ordering.
+  ///
+  /// This is the anchor predicate for a JPEG `APP6` "GoPro" block's
+  /// before/after-EXIF ordering ([`attach_app6_gopro`](crate::exif::jpeg)): the
+  /// EFFECTIVE EXIF block is the first `APP1` for which this returns `true`.
+  /// ExifTool emits the `File`-group tags (`File:ExifByteOrder`,
+  /// `File:PageCount`, ...) as an UNCONDITIONAL prefix ahead of every segment's
+  /// content, so they never order against a `GoPro:*` block and MUST NOT count;
+  /// the first non-`File` tag is ExifTool's first movable EXIF key, the thing a
+  /// leading/trailing `APP6` is positioned relative to.
+  ///
+  /// ## Single source: this IS the `tags()` stream
+  ///
+  /// The predicate is computed by EMITTING this `ExifMeta`'s
+  /// [`tags`](crate::emit::Taggable::tags) (the same source the `-G1` `-j` JSON
+  /// path drives — [`EmitOptions::g1`]`(PrintConv, false)`) and asking whether
+  /// any yielded tag is default-visible (NON-`Unknown`) in a family-0 group
+  /// OTHER than `File`. There is no hand-maintained channel list: WHATEVER
+  /// `tags` emits is what this sees, so a future default-visible non-`File`
+  /// channel added to `tags` is covered automatically. This is the fix for the
+  /// channel-by-channel drift that bit the earlier per-channel guesses — they
+  /// missed `entries` (R8), then the MakerNote (R9); deriving from the real
+  /// stream closes that loop for good.
+  ///
+  /// The `File` exclusion is faithful to ExifTool: it emits the `File`-group
+  /// tags (`File:ExifByteOrder`, `File:PageCount`, …) as an UNCONDITIONAL prefix
+  /// ahead of every segment's content, so they never order against a `GoPro:*`
+  /// block. The `Unknown` exclusion mirrors [`run_emission`](crate::emit::run_emission),
+  /// which drops `Unknown=>1` tags from `-j` output: a MakerNote that decodes to
+  /// ONLY `Unknown` vendor leaves is NOT default-visible and must NOT anchor
+  /// (ExifTool's first movable EXIF key then comes from a later segment).
+  ///
+  /// The movable-vs-`File` classification is MODE-INVARIANT — PrintConv vs
+  /// ValueConv changes only the rendered VALUE, never a tag's group or its
+  /// `Unknown` flag — so this single PrintConv pass answers the question for
+  /// both `-j` and `-n`.
+  ///
+  /// ## Cost / where it runs
+  ///
+  /// The call is read-only and side-effect-free, but it materializes the full
+  /// `tags` `Vec` (rendering values and cloning the MakerNote emissions — the
+  /// price of being single-source). To keep that off the parse hot path, the
+  /// SOLE caller (the JPEG `APP1` parse loop, first-wins) invokes it ONLY when
+  /// the JPEG carries a GoPro `APP6` block (the anchor's only consumer) AND only
+  /// until the first movable `APP1` is found — so a non-GoPro JPEG never pays
+  /// it. The Golden-v2 C4 `alloc_budget` fixtures (none are GoPro JPEGs)
+  /// therefore see no change.
+  #[cfg(feature = "quicktime")]
+  pub(crate) fn emits_movable_tag(&self) -> bool {
+    use crate::emit::Taggable;
+    self
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .any(|t| !t.unknown() && t.tag().group_ref().family0() != "File")
+  }
 }
 
 #[cfg(feature = "alloc")]
@@ -3701,8 +3847,40 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
+    // A JPEG `APP6` "GoPro" GPMF stream (JPEG.pm:183-198 → `%GoPro::GPMF`):
+    // ExifTool runs each `APP6`/`APP1` arm inside its `Marker:` loop in file
+    // order (`ExifTool.pm:7325`), so the `GoPro:*` tags emit in segment order
+    // relative to the `APP1` Exif `IFD0:*` tags. The shared GoPro emitter
+    // renders the device-settings + camera-identity tags under group
+    // `APP6`:`GoPro` (family-1 stays `GoPro`; family-0 is the `APP6` parent the
+    // segment was reached through). The realistic GoPro still — including the
+    // `t/images/GoPro.jpg` fixture — places `APP1` BEFORE `APP6`, so the GoPro
+    // block emits AFTER the EXIF + MakerNote tags (`gopro_before_exif ==
+    // false`); a non-standard JPEG with `APP6` before `APP1` emits the GoPro
+    // block BEFORE them. This is a whole-block before/after swap (each side is
+    // one contiguous group in ExifTool's output); a pathological
+    // `APP6`/`APP1`/`APP6` straddle is not fully marker-order-replayed (real
+    // GoPro JPEGs never straddle). `None` for every non-GoPro-JPEG source.
+    #[cfg(feature = "quicktime")]
+    let emit_gopro = |tags: &mut std::vec::Vec<crate::emit::EmittedTag>| {
+      if let Some(gp) = self.gopro.as_ref() {
+        crate::formats::quicktime::emit_gopro_tags(gp, "APP6", "GoPro", print_conv, tags);
+      }
+    };
+    // GoPro block before the EXIF + MakerNote tags when its `APP6` preceded the
+    // `APP1` Exif segment (`File:ExifByteOrder`/`PageCount` still lead — they
+    // are the `File` group ExifTool emits ahead of every segment). Otherwise it
+    // follows them (the realistic layout, GoPro.jpg unchanged).
+    #[cfg(feature = "quicktime")]
+    if self.gopro_before_exif {
+      emit_gopro(&mut tags);
+    }
     self.push_exif_tags(print_conv, &mut tags);
     self.push_maker_note_tags(print_conv, &mut tags);
+    #[cfg(feature = "quicktime")]
+    if !self.gopro_before_exif {
+      emit_gopro(&mut tags);
+    }
     tags.into_iter()
   }
 }
@@ -3745,10 +3923,8 @@ impl crate::diagnostics::Diagnose for ExifMeta<'_> {
   }
 }
 
-// ===========================================================================
-// `ExifSink` — the value-emission sink seam (golden-pattern refactor)
-// ===========================================================================
-
+// ====================================================================// `ExifSink` — the value-emission sink seam (golden-pattern refactor)
+// ====================================================================
 /// The per-value sink the Exif/GPS emitters (`emit_exif_value` /
 /// `emit_gps_value` + helpers) write a CONVERTED scalar into. Abstracting the
 /// sink behind these five typed writers lets the conversion-logic bodies stay
@@ -3995,10 +4171,8 @@ fn emit_entry<S: ExifSink>(
   }
 }
 
-// ===========================================================================
-// Exif value emission — applies a `Conv` to a `RawValue`
-// ===========================================================================
-
+// ====================================================================// Exif value emission — applies a `Conv` to a `RawValue`
+// ====================================================================
 /// Render a [`RawValue`] under a plain Exif [`Conv`] into the sink. This is
 /// the serialize-time PrintConv/ValueConv application; the value stored in
 /// the `ExifEntry` is post-Format-decode but pre-conversion.
@@ -4381,10 +4555,8 @@ fn first_uint(raw: &RawValue) -> Option<u64> {
   }
 }
 
-// ===========================================================================
-// GPS value emission — applies a `GpsConv` to a `RawValue`
-// ===========================================================================
-
+// ====================================================================// GPS value emission — applies a `GpsConv` to a `RawValue`
+// ====================================================================
 /// Render a [`RawValue`] under a [`gps::GpsConv`] into the sink.
 #[cfg(all(feature = "alloc", feature = "gps"))]
 fn emit_gps_value<S: ExifSink>(
@@ -4519,10 +4691,8 @@ fn emit_gps_value<S: ExifSink>(
   }
 }
 
-// ===========================================================================
-// `EscapeJSON` number gate — bundled `exiftool` script line 3809
-// ===========================================================================
-//
+// ====================================================================// `EscapeJSON` number gate — bundled `exiftool` script line 3809
+// ====================================================================//
 // Bundled ExifTool stringifies EVERY tag value (`$val`) and runs the JSON
 // writer's `EscapeJSON` (`exiftool` script, sub `EscapeJSON`, line 3800). With
 // the default `$quote` flag false (every non-`StructFormat=JSONQ` `-j`/`-n`
@@ -4646,10 +4816,8 @@ fn emit_gated_f64<S: ExifSink>(
   emit_gated_number(group, name, &crate::value::format_g(value, 15), out)
 }
 
-// ===========================================================================
-// Emission helpers
-// ===========================================================================
-
+// ====================================================================// Emission helpers
+// ====================================================================
 /// Emit a [`RawValue`] verbatim (the `Conv::None` path) — multi-element
 /// numeric arrays are space-joined (ExifTool's `ReadValue` joins with
 /// spaces, `ExifTool.pm:6319`); a string is emitted as-is; bytes become the
@@ -4993,10 +5161,8 @@ fn join_floats(vals: &[f64]) -> String {
   s
 }
 
-// ===========================================================================
-// Table-codegen allowlist accessors (`cargo xtask gen-tables --kind exif`)
-// ===========================================================================
-
+// ====================================================================// Table-codegen allowlist accessors (`cargo xtask gen-tables --kind exif`)
+// ====================================================================
 /// The Step-B binary-EXIF coverage-gap ids — genuine `%Exif::Main` leaf tags
 /// (`Exif.pm`) that the camera-relevant hand subset ([`tables::EXIF_TAGS`]) does
 /// NOT carry, so they were silently dropped on the binary IFD path (reachable
@@ -5068,10 +5234,8 @@ pub fn gps_main_tag_ids() -> Vec<u16> {
   gps::GPS_TAGS.iter().map(|t| t.id).collect()
 }
 
-// ===========================================================================
-// Unit tests
-// ===========================================================================
-
+// ====================================================================// Unit tests
+// ====================================================================
 #[cfg(test)]
 // The file-level `#![deny(clippy::indexing_slicing)]` is a parser-panic-safety
 // contract (Phase C w2d); the test TIFF/IFD builders index fixed-layout buffers
@@ -5317,6 +5481,134 @@ mod tests {
     assert_eq!(mn.len(), 8);
     // No `MakerNote` leaf tag — vendor parsing deferred.
     assert!(meta.entry("MakerNote").is_none());
+  }
+
+  /// [`ExifMeta::emits_movable_tag`] is now DERIVED from the real
+  /// [`tags`](crate::emit::Taggable::tags) stream (`any(non-`File`,
+  /// non-`Unknown`)`), so a "does it match `tags`" oracle would be tautological.
+  /// Instead this PINS the two boundary behaviors the predicate exists to
+  /// enforce, against blocks built through the real parser:
+  ///
+  /// - the `File` exclusion — a byte-order-only block emits ONLY
+  ///   `File:ExifByteOrder` ⇒ `false`;
+  /// - the `Unknown` exclusion — a MakerNote that decodes to ONLY `Unknown=>1`
+  ///   leaves is not default-visible ⇒ `false`;
+  ///
+  /// plus the two POSITIVE channels (`entries`, a default-visible MakerNote with
+  /// empty `entries` — the R8 / R9 cases) ⇒ `true`. Because the predicate reads
+  /// whatever `tags` yields, any future default-visible non-`File` channel added
+  /// to `tags` is covered automatically — the channel-by-channel drift that
+  /// missed `entries` (R8) then the MakerNote (R9) cannot recur.
+  #[cfg(feature = "quicktime")]
+  #[test]
+  fn emits_movable_tag_excludes_file_and_unknown() {
+    // A minimal big-endian TIFF: header + IFD0 (the given entry bytes) + extra.
+    fn tiff(ifd0_entries: &[u8], n_entries: u16, extra: &[u8]) -> Vec<u8> {
+      let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+      t.extend_from_slice(&n_entries.to_be_bytes());
+      t.extend_from_slice(ifd0_entries);
+      t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // IFD0 next = 0
+      t.extend_from_slice(extra);
+      t
+    }
+
+    // An Apple MakerNote-only TIFF: IFD0 → ExifIFD → MakerNote, no IFD0 entry,
+    // the blob carrying a single `entry`. `entries` stays EMPTY; whether the
+    // block is "movable" depends solely on whether the MakerNote's lone leaf is
+    // default-visible. `entry` = (tag, format, inline-value) for a count-1 slot.
+    fn apple_mn_only_tiff(tag: u16, format: u16, inline_value: u32) -> Vec<u8> {
+      let mut apple_blob: Vec<u8> = Vec::new();
+      apple_blob.extend_from_slice(b"Apple iOS\x00\x00\x01MM"); // 14-byte header
+      apple_blob.extend_from_slice(&1u16.to_be_bytes()); // 1 IFD entry
+      apple_blob.extend_from_slice(&tag.to_be_bytes());
+      apple_blob.extend_from_slice(&format.to_be_bytes());
+      apple_blob.extend_from_slice(&1u32.to_be_bytes()); // count 1
+      apple_blob.extend_from_slice(&inline_value.to_be_bytes());
+      let exififd_off: u32 = 8 + (2 + 12 + 4); // 26
+      let mn_off: u32 = exififd_off + (2 + 12 + 4); // 44
+      let mut mn_ifd0: Vec<u8> = Vec::new();
+      mn_ifd0.extend_from_slice(&[0x87, 0x69]); // ExifIFD pointer 0x8769
+      mn_ifd0.extend_from_slice(&[0x00, 0x04]); // LONG
+      mn_ifd0.extend_from_slice(&1u32.to_be_bytes());
+      mn_ifd0.extend_from_slice(&exififd_off.to_be_bytes());
+      let mut exififd: Vec<u8> = Vec::new();
+      exififd.extend_from_slice(&1u16.to_be_bytes()); // 1 entry
+      exififd.extend_from_slice(&[0x92, 0x7c]); // MakerNote 0x927c
+      exififd.extend_from_slice(&[0x00, 0x07]); // UNDEFINED
+      exififd.extend_from_slice(&(apple_blob.len() as u32).to_be_bytes());
+      exififd.extend_from_slice(&mn_off.to_be_bytes());
+      exififd.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ExifIFD next = 0
+      let mut extra = exififd;
+      extra.extend_from_slice(&apple_blob);
+      tiff(&mn_ifd0, 1, &extra)
+    }
+
+    // (a) byte-order-only / empty IFD0: `tags` emits ONLY `File:ExifByteOrder`
+    // (family-0 `File`) ⇒ the `File` exclusion makes this NOT movable.
+    let empty_tiff = tiff(&[], 0, &[]);
+    let empty = parse_exif_block(&empty_tiff).expect("empty TIFF");
+    assert!(
+      !empty.emits_movable_tag(),
+      "byte-order-only (File-prefix) ⇒ not movable"
+    );
+
+    // (b) one IFD0 ASCII entry (`Make`): the `entries` channel emits an `EXIF:*`
+    // tag ⇒ movable.
+    let mut make_entry: Vec<u8> = Vec::new();
+    make_entry.extend_from_slice(&[0x01, 0x0f]); // tag 0x010f Make
+    make_entry.extend_from_slice(&[0x00, 0x02]); // ASCII
+    make_entry.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4
+    make_entry.extend_from_slice(b"AB\x00\x00"); // ASCII "AB" + NUL pad
+    let make_tiff = tiff(&make_entry, 1, &[]);
+    let with_make = parse_exif_block(&make_tiff).expect("Make TIFF");
+    assert!(with_make.emits_movable_tag(), "IFD0 entry ⇒ movable");
+
+    // (c) MakerNote-only IFD0, the lone leaf a DEFAULT-VISIBLE Apple tag
+    // (`MakerNoteVersion`, 0x0001 int32s, `unknown:false`). `entries` is EMPTY,
+    // yet the MakerNote channel emits a `MakerNotes:*` tag ⇒ movable (the R9
+    // case the old `!entries.is_empty()` guess missed).
+    let mn_visible_tiff = apple_mn_only_tiff(0x0001, 0x0009, 4);
+    let mn_visible = parse_exif_block(&mn_visible_tiff).expect("MakerNote TIFF");
+    assert!(
+      mn_visible.entries().is_empty(),
+      "the MakerNote-only block has NO IFD-walk entry"
+    );
+    assert!(
+      mn_visible.maker_note().is_some(),
+      "the MakerNote blob is captured"
+    );
+    assert!(
+      mn_visible.emits_movable_tag(),
+      "a default-visible MakerNote (no entries) ⇒ movable"
+    );
+
+    // (d) MakerNote-only IFD0, the lone leaf an `Unknown=>1` Apple tag
+    // (`ImageProcessingFlags`, 0x0019 int32s — Apple.pm:147). `entries` is
+    // EMPTY and the only emission is `Unknown`, which `run_emission` drops from
+    // `-j` output, so `tags` yields NO default-visible non-`File` tag ⇒ NOT
+    // movable. This pins the `Unknown` exclusion: an Unknown-only MakerNote must
+    // not anchor (ExifTool's first movable EXIF key comes from a later segment).
+    let mn_unknown_tiff = apple_mn_only_tiff(0x0019, 0x0009, 1);
+    let mn_unknown = parse_exif_block(&mn_unknown_tiff).expect("Unknown-MN TIFF");
+    assert!(
+      mn_unknown.entries().is_empty(),
+      "the Unknown-MakerNote block has NO IFD-walk entry"
+    );
+    assert!(
+      mn_unknown.maker_note().is_some(),
+      "the Unknown MakerNote blob is still captured"
+    );
+    assert!(
+      mn_unknown
+        .maker_note()
+        .is_some_and(|mn| !mn.emissions_print_conv().is_empty()
+          && mn.emissions_print_conv().iter().all(|e| e.unknown())),
+      "the lone Apple emission is `Unknown=>1`"
+    );
+    assert!(
+      !mn_unknown.emits_movable_tag(),
+      "an Unknown-only MakerNote ⇒ not movable — the `Unknown` exclusion"
+    );
   }
 
   /// A self-referencing IFD pointer (IFD0 → IFD0) is rejected by the

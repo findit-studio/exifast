@@ -193,6 +193,44 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
   // mis-parsing a continuation fragment as a standalone TIFF (which would emit
   // a spurious `Malformed APP1 EXIF segment` warning bundled never raises).
   let mut in_multisegment = false;
+  // File-order index of the `APP1` segment that ACTUALLY emits a MOVABLE EXIF
+  // tag — the first whose `ProcessTIFF` (`parse_exif_block_with_base`) succeeds
+  // AND whose [`ExifMeta::emits_movable_tag`] is `true`, i.e. its real
+  // `Taggable::tags` output carries a default-visible tag in a family-0 group
+  // OTHER than `File` (an `EXIF:*` IFD-walk entry OR a `MakerNotes:*` vendor
+  // tag). FIRST-wins (the primary EXIF block, matching `byte_order`/
+  // `maker_note`). This is the anchor a GoPro `APP6` block is ordered against.
+  // It is NOT the first segment whose payload merely MATCHES the Exif arm
+  // signature (a malformed / BigTIFF-skipped / deferred-multi-segment `APP1`
+  // produces nothing), and it is NOT a byte-order-only `APP1` either: a
+  // byte-order marker + empty IFD0 with no MakerNote parses to `Some` but emits
+  // ONLY `File:ExifByteOrder` — the unconditional `File`-group prefix, not a
+  // movable tag. A MakerNote-only `APP1` (an `ExifIFD` pointer + a decoded
+  // vendor MakerNote, no other IFD0 entry) DOES anchor: it emits `MakerNotes:*`.
+  // ExifTool then emits a GoPro `APP6` ahead of a non-effective leading `APP1`
+  // BEFORE the EFFECTIVE (movable-tag-producing) EXIF block (see
+  // [`attach_app6_gopro`]). Threaded out for the `quicktime`-gated GoPro
+  // ordering only.
+  #[cfg(feature = "quicktime")]
+  let mut effective_exif_idx: Option<usize> = None;
+  // The anchor is consumed ONLY by `attach_app6_gopro`, and only when a GoPro
+  // `APP6` block actually attaches (`!gopro.is_empty()` there — which requires
+  // at least one `GoPro\0`-prefixed `APP6` segment). [`ExifMeta::emits_movable_tag`]
+  // is now derived from the full [`Taggable::tags`] stream (single source — no
+  // hand-maintained channel list, so a future default-visible non-`File`
+  // channel is covered for free), which renders values and clones the MakerNote
+  // emissions. To keep that cost OFF the hot path for the overwhelming majority
+  // of JPEGs (no GoPro `APP6`, so the result would be unused), only TRACK the
+  // anchor when such a segment is present. This cannot change output: a JPEG
+  // with no GoPro `APP6` never reads `effective_exif_idx`. The probe mirrors the
+  // exact identifier `attach_app6_gopro` keys on (`0xe6` + `GoPro\0`).
+  #[cfg(feature = "quicktime")]
+  let has_gopro_app6 = segments.iter().any(|seg| {
+    seg.marker == 0xe6
+      && data
+        .get(seg.payload_start..seg.payload_end)
+        .is_some_and(|p| p.starts_with(b"GoPro\0"))
+  });
 
   for (i, seg) in segments.iter().enumerate() {
     // `ExifTool.pm:7736`: APP1 (EXIF / XMP / QVCI / PARROT). Only APP1.
@@ -255,14 +293,43 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
     // (`ExifTool.pm:7783`). A bad TIFF block is a non-fatal `Warn` — the JPEG
     // container is still accepted and the walk continues.
     match parse_exif_block_with_base(block, base) {
-      Some(exif) => merge_exif_block(
-        &mut entries,
-        &mut warnings,
-        &mut warnings_ignorable,
-        &mut byte_order,
-        &mut maker_note,
-        exif,
-      ),
+      Some(exif) => {
+        // Record the FIRST `APP1` that emits a MOVABLE EXIF tag — the EFFECTIVE
+        // EXIF block a GoPro `APP6` is ordered against (first-wins, the primary
+        // block, like `byte_order`/`maker_note`). A "movable" tag is any
+        // default-visible tag in a family-0 group OTHER than `File`: the
+        // `File:ExifByteOrder`/`File:PageCount` prefix is the unconditional
+        // `File`-group prefix `Taggable::tags` emits FIRST regardless, so it
+        // never participates in the GoPro-vs-EXIF ordering. The predicate is
+        // computed by INSPECTING the block's REAL `Taggable::tags` output
+        // ([`ExifMeta::emits_movable_tag`]) — `any(non-`File`, non-Unknown tag)`
+        // — NOT by guessing which channels are movable: a valid-but-EMPTY TIFF
+        // (byte-order marker + 0-entry IFD0) emits ONLY `File:ExifByteOrder` and
+        // is NOT effective (`false`); an `APP1` with IFD entries emits `EXIF:*`
+        // (`true`); an `APP1` carrying ONLY a decoded MakerNote (an `ExifIFD`
+        // pointer + an `Apple`/`Canon`/… MakerNote, no other IFD0 entry, so
+        // `entries` is EMPTY) emits `MakerNotes:*` (`true`) even though the old
+        // `!entries.is_empty()` guess missed it. So a GoPro `APP6` ahead of such
+        // a MakerNote-only `APP1` correctly emits BEFORE it. This mirrors the
+        // GoPro-side anchor (the empty-to-non-empty `GoProMeta` accumulator
+        // transition in [`attach_app6_gopro`]): both anchors are "first segment
+        // producing a default-visible non-`File` tag". Inspecting the real
+        // emission ends the channel-by-channel drift (this guess missed
+        // `entries` at R8, then MakerNote at R9) and covers any future
+        // non-`File` channel for free.
+        #[cfg(feature = "quicktime")]
+        if has_gopro_app6 && effective_exif_idx.is_none() && exif.emits_movable_tag() {
+          effective_exif_idx = Some(i);
+        }
+        merge_exif_block(
+          &mut entries,
+          &mut warnings,
+          &mut warnings_ignorable,
+          &mut byte_order,
+          &mut maker_note,
+          exif,
+        );
+      }
       // `parse_exif_block_with_base` also returns `None` for a BigTIFF (0x2b)
       // header — a clean, deliberate no-Exif skip (bundled SUPPORTS BigTIFF, so
       // emitting a "Malformed APP1" warning would diverge). A genuinely
@@ -279,13 +346,170 @@ pub fn parse_jpeg_exif_with_base(data: &[u8], base_offset: usize) -> Option<Exif
 
   // A valid JPEG ALWAYS yields an `ExifMeta` (the container is accepted);
   // `entries`/`byte_order` are empty/`None` when no `APP1` Exif block parsed.
-  Some(ExifMeta::from_jpeg_parts(
+  #[allow(unused_mut)]
+  let mut meta = ExifMeta::from_jpeg_parts(
     entries,
     warnings,
     warnings_ignorable,
     byte_order,
     maker_note,
-  ))
+  );
+  // `APP6` "GoPro" GPMF (JPEG.pm:196-198): a GoPro still (`GOPR*.JPG`) carries
+  // its device-settings GPMF stream in an `APP6` (`0xe6`) segment whose payload
+  // begins with the 6-byte `GoPro\0` identifier. ExifTool's JPEG.pm `APP6`
+  // (JPEG.pm:183-216) is a multi-arm `Condition`-dispatched segment; the GoPro
+  // arm (`$$valPt =~ /^GoPro\0/`, JPEG.pm:196-198) hands the remainder to
+  // `%GoPro::GPMF`'s `ProcessGoPro` (the KLV walker). Only the GoPro arm is in
+  // scope here (the EPPIM / NITF / HP_TDHD / InfiRay / DJI / Motorola `APP6`
+  // arms are separate ports). Attached with a flag recording whether the
+  // `APP6` GoPro block preceded the `APP1` Exif block in marker order, so
+  // `Taggable::tags` emits the GoPro tags before/after EXIF to match ExifTool's
+  // `Marker:`-loop file order (the real GoPro layout — `APP1` then `APP6` —
+  // emits GoPro after EXIF, unchanged).
+  #[cfg(feature = "quicktime")]
+  attach_app6_gopro(data, &segments, effective_exif_idx, &mut meta);
+  Some(meta)
+}
+
+/// Scan the collected JPEG segments for every `APP6` (`0xe6`) "GoPro" segment
+/// and decode each one's GPMF KLV stream into the `meta` (JPEG.pm:196-198).
+///
+/// The GoPro arm of JPEG.pm's multi-arm `APP6` is `$$valPt =~ /^GoPro\0/`
+/// (JPEG.pm:197): strip the 6-byte `GoPro\0` prefix and dispatch the remainder
+/// into `%GoPro::GPMF` via `ProcessGoPro` (the recursive Key-Length-Value
+/// walker). ExifTool runs this `ProcessDirectory(GoPro::GPMF)` inside its
+/// `Marker:` loop (ExifTool.pm:8176-8181), so it processes EVERY matching
+/// `APP6` segment in file (marker) order — it does NOT stop at the first.
+/// All tags accumulate into the one extracted-tag table (the typed equivalent
+/// is a single [`GoProMeta`] walked across every GoPro `APP6`), so a leading
+/// truncated / empty `GoPro\0` segment that decodes nothing does NOT suppress a
+/// later valid one. A GoPro still normally carries exactly one such segment;
+/// the multi-segment path matters only for malformed / crafted inputs.
+///
+/// Duplicate tag names across segments resolve under the emission engine's
+/// last-wins dedup, matching ExifTool's default `%noDups` (these GoPro tags
+/// have no `Priority => 0`). A segment that decodes no record contributes
+/// nothing; the accumulator is attached only if at least one record landed, so
+/// a non-GoPro `APP6` mislabeled with the prefix adds no spurious tags.
+///
+/// The accumulator is attached with a `before_exif` flag recording whether the
+/// first TAG-PRODUCING GoPro `APP6` segment precedes the EFFECTIVE EXIF block —
+/// the first `APP1` contributing a MOVABLE EXIF tag in the main loop
+/// (`effective_exif_idx`: the first `APP1` whose real `Taggable::tags` emits a
+/// movable, non-`File` tag — an `EXIF:*` IFD entry OR a `MakerNotes:*` vendor
+/// tag, per [`ExifMeta::emits_movable_tag`]) — in file (marker)
+/// order: ExifTool emits each segment's tags at its `Marker:`-loop position
+/// (`ExifTool.pm:7325`), so a non-standard JPEG with a tag-producing `APP6`
+/// ahead of the EFFECTIVE EXIF block emits the `GoPro:*` tags BEFORE the
+/// `IFD0:*` tags. `File:ExifByteOrder` (and any `File:PageCount`) is NOT the
+/// anchor: it is the unconditional `File`-group prefix that `Taggable::tags`
+/// emits FIRST regardless, so only MOVABLE EXIF tags participate in the
+/// GoPro-vs-EXIF ordering. BOTH anchors are EFFECTIVE (movable / default-visible
+/// tag-producing), NOT merely signature-matching: on the EXIF side a malformed /
+/// BigTIFF-skipped / deferred-multi-segment leading `APP1` produces NOTHING, and
+/// a byte-order-only / empty-IFD0 `APP1` produces ONLY the `File:ExifByteOrder`
+/// prefix (no movable tag); SYMMETRICALLY on the GoPro side a leading truncated /
+/// empty `GoPro\0` `APP6` whose GPMF walker recognizes nothing produces NO GoPro
+/// tag. So with `APP6(empty GoPro) → APP1(valid Exif) → APP6(valid GoPro)` the
+/// first tag-producing GoPro segment is the LATER one (after the `APP1`), and
+/// ExifTool emits `IFD0:*` BEFORE `GoPro:*` — anchoring on the inert first
+/// `GoPro\0` segment would wrongly reverse them (the GoPro-side mirror of the
+/// inert-leading-`APP1` case: an empty-IFD0 first `APP1` must not anchor EXIF
+/// ahead of a GoPro `APP6` whose tags ExifTool emits between it and the later
+/// movable EXIF block). A real GoPro still has its (single, valid) `APP1`
+/// before `APP6` (`false`), so [`Taggable::tags`](crate::emit::Taggable::tags)
+/// keeps the GoPro block after EXIF unchanged. With NO `APP1` ever contributing
+/// a movable EXIF tag (`effective_exif_idx == None`) the GoPro block is the only
+/// EXIF-or-GoPro content, so its absolute position is moot — `false` keeps the
+/// simple after-`File`-group path (there is nothing to order against). (The
+/// comparison is whole-block: one GoPro `APP6` vs the one effective `APP1` Exif
+/// block — the realistic shapes; an `APP6`/`APP1`/`APP6` straddle is not
+/// marker-order-replayed, see the field docs.)
+#[cfg(feature = "quicktime")]
+fn attach_app6_gopro(
+  data: &[u8],
+  segments: &[Segment],
+  effective_exif_idx: Option<usize>,
+  meta: &mut ExifMeta<'_>,
+) {
+  /// JPEG.pm:197 `$$valPt =~ /^GoPro\0/` — the GoPro `APP6` identifier.
+  const GOPRO_APP6_HDR: &[u8] = b"GoPro\0";
+  let mut gopro = crate::metadata::GoProMeta::new();
+  // File-order index of the first GoPro `APP6` segment that ACTUALLY PRODUCES a
+  // GoPro tag — the marker position at which ExifTool's GoPro arm first emits a
+  // default-visible `GoPro:*` (or `Doc<N>:GoPro*`) tag. `None` until such a
+  // segment is processed. NOT the first `GoPro\0`-prefixed segment: a leading
+  // truncated / empty `GoPro\0` `APP6` whose GPMF walker recognizes nothing
+  // emits no tag, so ExifTool's first GoPro key comes from a LATER segment —
+  // possibly after an intervening `APP1` Exif block. Anchoring on the inert
+  // first GoPro segment would wrongly order the (later, tag-producing) GoPro
+  // block before the EXIF it actually follows. (The EXIF-side mirror of this is
+  // `effective_exif_idx` in the main loop — the first `APP1` whose real
+  // `Taggable::tags` emits a MOVABLE (non-`File`) tag ([`ExifMeta::emits_movable_tag`]):
+  // an `EXIF:*` IFD entry OR a `MakerNotes:*` vendor tag, not the first
+  // Exif-signature match and not a byte-order-only `APP1`. Both anchors are
+  // symmetric: "first segment producing a default-visible non-`File` tag".)
+  let mut first_gopro_idx: Option<usize> = None;
+  for (i, seg) in segments.iter().enumerate() {
+    // The GoPro arm fires only on the `APP6` marker (`0xe6`).
+    if seg.marker != 0xe6 {
+      continue;
+    }
+    let Some(payload) = data.get(seg.payload_start..seg.payload_end) else {
+      continue;
+    };
+    // GoPro arm: payload begins `GoPro\0`. Strip the 6-byte prefix and hand the
+    // GPMF KLV remainder to the shared `ProcessGoPro` walker, accumulating into
+    // the SAME `GoProMeta` across every GoPro `APP6` in file order (ExifTool's
+    // per-marker `ProcessDirectory`). A segment whose walker recognizes nothing
+    // (truncated / mislabeled) simply adds nothing and the scan continues.
+    let Some(gpmf) = payload.strip_prefix(GOPRO_APP6_HDR) else {
+      continue;
+    };
+    // Snapshot whether the accumulator is empty BEFORE processing this segment;
+    // `process_gopro` only ever ADDS records, so a transition from empty to
+    // non-empty marks THIS segment as the first one that produced a tag (the
+    // same "did this contribute anything" predicate as the `is_empty()` attach
+    // gate below). Record its marker index as the GoPro-side ordering anchor.
+    let was_empty = gopro.is_empty();
+    let _ = crate::formats::gopro::process_gopro(gpmf, &mut gopro);
+    if first_gopro_idx.is_none() && was_empty && !gopro.is_empty() {
+      first_gopro_idx = Some(i);
+    }
+  }
+  // Attach iff at least one GPMF record landed (ExifTool's `FoundEmbedded`);
+  // a file with only empty / mislabeled GoPro `APP6` segments stays GoPro-free.
+  if !gopro.is_empty() {
+    // GoPro-before-Exif when the first TAG-PRODUCING GoPro `APP6` precedes the
+    // EFFECTIVE EXIF block (the `APP1` whose `ProcessTIFF` succeeded —
+    // `effective_exif_idx`). BOTH indices are tag-producing, not merely
+    // signature/prefix-matching: a malformed / BigTIFF / deferred-multi-segment
+    // `APP1` produces no EXIF tags (so does not anchor the EXIF side), and a
+    // truncated / empty `GoPro\0` `APP6` produces no GoPro tag (so does not
+    // anchor the GoPro side). With no `APP1` producing a parsed EXIF block the
+    // GoPro block is the only EXIF-or-GoPro content, so its absolute position
+    // does not matter — `false` keeps the simple after-`File`-group path
+    // (nothing to order against), matching ExifTool (no `IFD0:*` tags to be
+    // before/after).
+    //
+    // This whole-GoPro-block before/after ordering is byte-exact for every
+    // single-effective-`APP1` layout — all realistic GoPro JPEGs (one early
+    // `APP1` Exif + a later GoPro `APP6`, e.g. `t/images/GoPro.jpg`). It also
+    // matches the oracle for multi-independent-`APP1` and `APP6`/`APP1`/`APP6`
+    // straddle layouts at the `-G1 -j` conformance target, because ExifTool's
+    // JSON co-locates the family-1 `IFD0` group and decides `IFD0`-vs-`GoPro`
+    // order by this same first-GoPro-vs-effective-EXIF index comparison. A
+    // strict per-segment marker-order replay (under which the GoPro `HandleTag`
+    // block would interleave BETWEEN two independent `APP1` tag blocks, or
+    // straddle the EXIF block) is the engine-wide limitation tracked in
+    // issue 233; it does not surface in `-G1 -j` output (see
+    // [`ExifMeta::gopro_before_exif`] docs).
+    let before_exif = match (first_gopro_idx, effective_exif_idx) {
+      (Some(g), Some(e)) => g < e,
+      _ => false,
+    };
+    meta.set_jpeg_gopro(gopro, before_exif);
+  }
 }
 
 /// Pass 1 of [`parse_jpeg_exif`]: walk the JPEG markers from just past `SOI`
