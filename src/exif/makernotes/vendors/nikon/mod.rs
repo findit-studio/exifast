@@ -37,10 +37,11 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod body;
+pub mod decrypt;
 pub mod printconv;
 pub mod tags;
 
-use crate::exif::ifd::{ByteOrder, Format, read_value};
+use crate::exif::ifd::{ByteOrder, Format, RawValue, read_value};
 use crate::exif::makernotes::VendorEmission;
 use crate::value::{Group, Metadata, TagValue};
 use smol_str::SmolStr;
@@ -308,7 +309,51 @@ pub fn parse_in_tiff(
     layout.value_base,
     layout.table,
   );
+  // PRE-SCAN for the decryption keys (`Nikon.pm:14199-14203`
+  // `PrescanExif(... 0x001d, 0x00a7 ...)`): ExifTool reads SerialNumber
+  // (0x001d) and ShutterCount (0x00a7) from the IFD BEFORE processing it, so
+  // the keys are available to ANY encrypted sub-table regardless of its IFD
+  // position. The MakerNote IFD is tag-ID-ordered (0x001d < 0x00a7 < 0x0098),
+  // so they precede LensData in walk order anyway, but a separate pass makes
+  // the capture order-independent (and only ever runs on the Main table — the
+  // Type2 layout has no encrypted sub-tables / 0x001d/0x00a7 semantics).
+  let decrypt_keys = if layout.table == NikonTable::Main {
+    scan_decrypt_keys(
+      walk_data,
+      ifd_offset,
+      layout.order,
+      layout.value_base,
+      model,
+    )
+  } else {
+    None
+  };
+  // The RAW `FocusMode` (`$$self{FocusMode}`) from tag 0x0007 (`Nikon.pm:1816`,
+  // RawConv `$$self{FocusMode} = $val`) — gates the LensData0800 Z telemetry's
+  // `FocusMode ne "Manual"` members (0x4c/0x56). UNLIKE the decrypt keys (which
+  // ExifTool genuinely pre-scans, `Nikon.pm:14199-14203`), 0x0007 is a NORMAL
+  // RawConv DataMember set DURING the IFD walk: `$$self{FocusMode}` holds
+  // whatever the LAST-walked 0x0007 entry stored AT the moment the 0x0098
+  // LensData SubDirectory is processed. So the gate must see the value
+  // POSITIONALLY — the last 0x0007 BEFORE this 0x0098 in walk order (`None` /
+  // `undef ne "Manual"` = open when no 0x0007 precedes it). The IFD is normally
+  // tag-ID-ordered (0x0007 < 0x0098), so this matches the pre-scan for a
+  // well-formed MakerNote; it differs only for an unsorted/duplicate IFD where a
+  // `FocusMode = Manual` follows the LensData. The type-2 layout reuses 0x0007
+  // for a different tag, so only the Main table tracks it.
+  let track_focus_mode = layout.table == NikonTable::Main;
+  let mut focus_mode: Option<SmolStr> = None;
   for entry in &entries {
+    // Capture the running `$$self{FocusMode}` the instant tag 0x0007 is walked,
+    // BEFORE any later 0x0098 reaches `emit_lens_data` (the RawConv stores the
+    // raw on-disk string; a non-`Text` 0x0007 leaves the member unchanged, as
+    // `as_text` returns `None` and we keep the prior value).
+    if track_focus_mode
+      && entry.tag_id == 0x0007
+      && let Some(s) = ParsedValue::new(entry.value.clone()).as_text()
+    {
+      focus_mode = Some(SmolStr::new(s));
+    }
     let Some(def) = layout.table.lookup(entry.tag_id) else {
       continue; // Unknown tag — verbose-only in ExifTool; omit.
     };
@@ -325,9 +370,19 @@ pub fn parse_in_tiff(
         SubTable::ColorBalance0103 => {
           emit_color_balance(walk_data, entry, layout, print_conv, &mut emissions);
         }
+        SubTable::LensData => {
+          emit_lens_data(
+            walk_data,
+            entry,
+            layout,
+            print_conv,
+            decrypt_keys,
+            focus_mode.as_deref(),
+            &mut emissions,
+          );
+        }
         // Deferred (encrypted / unported child table): emit nothing.
-        SubTable::LensData
-        | SubTable::ShotInfo
+        SubTable::ShotInfo
         | SubTable::FlashInfo
         | SubTable::ColorBalanceEncrypted
         | SubTable::OtherDeferred => {}
@@ -453,6 +508,698 @@ fn emit_color_balance(
     return;
   };
   emissions.push(VendorEmission::new("WB_RGBGLevels".into(), value, false));
+}
+
+/// The decryption keys captured for the encrypted Nikon sub-tables —
+/// ExifTool's `$$et{NikonSerialKey}` (the derived serial key) and
+/// `$$et{NikonCountKey}` (the raw ShutterCount).
+#[derive(Debug, Clone, Copy)]
+struct DecryptKeys {
+  /// `SerialKey($et, SerialNumber)` (`Nikon.pm:14202`) — the serial key, after
+  /// the numeric/string derivation ([`decrypt::serial_key`]).
+  serial: u32,
+  /// `ShutterCount` (0x00a7) raw value (`Nikon.pm:14203`) — the count key.
+  count: u32,
+}
+
+/// Capture the decryption keys via ExifTool's `PrescanExif` pre-scan
+/// (`Nikon.pm:14199-14203`): the `SerialNumber` (0x001d) `ReadValue` `$val` →
+/// the `SerialKey` derivation, and the `ShutterCount` (0x00a7) `$val` → the
+/// count key. Returns `None` only when no usable `ShutterCount` (0x00a7) is
+/// present; an ABSENT `SerialNumber` defaults to serial key 0 (ExifTool seeds
+/// its prescan with `0x001d => 0`), so encrypted LensData still decrypts
+/// without `0x001d`.
+///
+/// The capture runs over the RAW IFD via [`body::prescan_decrypt_keys`], NOT the
+/// post-`walk_nikon_ifd` entries: ExifTool's prescan uses LOOSER entry gates than
+/// the main walk (no suspicious-offset / excessive-count / warn-abort), so a
+/// 0x001d / 0x00a7 the walk would drop is still keyed here (see that function).
+/// Both keys derive from the post-`ReadValue` `$val` STRING (`Nikon.pm:14122`),
+/// FORMAT-AGNOSTIC: an integer-format `0x001d`/`0x00a7` renders to its decimal,
+/// an ASCII one to its string, so a present-but-integer serial and an ASCII-digit
+/// count feed `SerialKey` and the `/^\d+$/` count test just like the native
+/// format (see [`decrypt::serial_key`] and [`ParsedValue::single_digit_count`]).
+///
+/// `model` threads IFD0 `Model` for the `SerialKey` `D50` discriminator.
+fn scan_decrypt_keys(
+  blob: &[u8],
+  ifd_offset: usize,
+  order: ByteOrder,
+  value_base: usize,
+  model: Option<&str>,
+) -> Option<DecryptKeys> {
+  // ExifTool captures the keys with a SEPARATE PrescanExif pass over the raw IFD
+  // (NOT the main extraction walk) — see [`body::prescan_decrypt_keys`].
+  let (serial_val, count_val) = body::prescan_decrypt_keys(blob, ifd_offset, order, value_base);
+  // `%needTags = (0x001d => 0, …)` (`Nikon.pm:14200`): the prescan seeds
+  // `0x001d => 0`, so a TRULY ABSENT — or gated-out — `SerialNumber` decrypts
+  // with serial key 0 (`SerialKey($et, 0)` ⇒ 0). A PRESENT 0x001d feeds
+  // `SerialKey` its format-agnostic `ReadValue` `$val` (ASCII string or rendered
+  // integer), yielding the digit value or the D50/0x60 string fallback;
+  // `serial_key` is always `Some`, so `unwrap_or(0x60)` never fires.
+  let serial = match serial_val {
+    Some(raw) => {
+      let rendered = raw.val_bytes();
+      let s = std::string::String::from_utf8_lossy(&rendered);
+      decrypt::serial_key(&s, model).unwrap_or(0x60)
+    }
+    None => 0,
+  };
+  // `$$et{NikonCountKey} = $needTags{0x00a7}` (`:14203`), gated by
+  // `$count =~ /^\d+$/` in `ProcessNikonEncrypted` (`:13948`): only a SINGLE
+  // all-digit `ShutterCount` unlocks decryption (a multi-element `int32u[2]` ⇒
+  // `"100 0"`, a negative, or a non-digit value fails and leaves it undefined).
+  let count = count_val.and_then(|raw| ParsedValue::new(raw).single_digit_count())?;
+  Some(DecryptKeys { serial, count })
+}
+
+/// The `%Nikon::LensData*` layout the 4-byte `LensDataVersion` prefix selects
+/// — the faithful port of the `0x0098` conditional SubDirectory list
+/// (`Nikon.pm:2814-2899`). Each arm carries its member table, whether the body
+/// after the version is encrypted (`ProcessProc => \&ProcessNikonEncrypted` +
+/// `DecryptStart => 4`), and the table's `ByteOrder` (only `0800` overrides it
+/// to LittleEndian — but every PORTED `0800` member is a single byte, so the
+/// override is recorded for fidelity and is a no-op on those reads).
+struct LensDataLayout {
+  /// The member positions to read off the (decrypted) block.
+  table: &'static [tags::LensDataEntry],
+  /// `true` when the body after the 4-byte version is encrypted
+  /// (`DecryptStart => 4`); decrypt with the captured serial/count keys first.
+  encrypted: bool,
+  /// `Some` when this `0800` layout gates its members on the forward-looking
+  /// `$$self{OldLensData}` flag (`Nikon.pm:5726-5731`): the `undef[17]` at this
+  /// offset sets the flag UNLESS it is `/^.\0+$/s` (first byte anything, the
+  /// other 16 all NUL). When the flag is clear the gated members are skipped.
+  old_lens_data_gate: Option<usize>,
+  /// `true` for the `0800` (Z6/Z7/Z9) layout, which ALSO carries the NEW Z-lens
+  /// telemetry block (offsets 0x2f onward — `NewLensData`, `LensID` int16u + the
+  /// `FocusMode`-gated focus telemetry, `Nikon.pm:5809-5961`). Decoded by
+  /// [`emit_lens_data_0800_new`] after the legacy block.
+  has_z_block: bool,
+  /// The SubDirectory's `ByteOrder` (`MakerNotes.pm`/`Nikon.pm:2887` —
+  /// `0800` overrides it to `LittleEndian`; every other LensData table inherits
+  /// the parent MakerNote IFD's order). Drives the MULTI-BYTE Z-block reads
+  /// (int16u/int32s); the legacy block's int8u members are order-agnostic.
+  order: Option<ByteOrder>,
+}
+
+/// Resolve the `LensDataVersion` prefix to its [`LensDataLayout`]
+/// (`Nikon.pm:2814-2899`). NEVER returns `None` for a readable 4-byte version —
+/// an unrecognized version falls through to the `LensDataUnknown` arm
+/// (`Nikon.pm:2890-2898`), which emits ONLY `LensDataVersion` (its table has no
+/// other member), so no `0x0098` SubDirectory is ever silently dropped.
+fn lens_data_layout(version: &[u8; 4]) -> LensDataLayout {
+  match version {
+    b"0100" => LensDataLayout {
+      table: tags::LENS_DATA_00,
+      encrypted: false,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    b"0101" => LensDataLayout {
+      table: tags::LENS_DATA_01,
+      encrypted: false,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^020[1-3]/` — encrypted, read against `%LensData01`.
+    [b'0', b'2', b'0', b'1' | b'2' | b'3'] => LensDataLayout {
+      table: tags::LENS_DATA_01,
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^0204/` (D90, D7000) — `%LensData0204`.
+    b"0204" => LensDataLayout {
+      table: tags::LENS_DATA_0204,
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^040[01]/` (Nikon 1 J1/V1/J2) — `%LensData0400`.
+    [b'0', b'4', b'0', b'0' | b'1'] => LensDataLayout {
+      table: tags::LENS_DATA_0400,
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^0402/` (Nikon 1 J3/S1/V2) — `%LensData0402`.
+    b"0402" => LensDataLayout {
+      table: tags::LENS_DATA_0402,
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^0403/` (Nikon 1 J4/J5) — `%LensData0403`.
+    b"0403" => LensDataLayout {
+      table: tags::LENS_DATA_0403,
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+    // `$$valPt =~ /^080[012]/` (Z6/Z7/Z9) — `%LensData0800` (LittleEndian, the
+    // `ByteOrder => 'LittleEndian'` SubDirectory override, `Nikon.pm:2887`). The
+    // legacy OldLensData block is gated on the `undef[17]` at 0x03; the NEW Z
+    // telemetry block (0x2f onward) is decoded by [`emit_lens_data_0800_new`].
+    [b'0', b'8', b'0', b'0' | b'1' | b'2'] => LensDataLayout {
+      table: tags::LENS_DATA_0800_OLD,
+      encrypted: true,
+      old_lens_data_gate: Some(0x03),
+      has_z_block: true,
+      order: Some(ByteOrder::Little),
+    },
+    // `LensDataUnknown` fallback (`Nikon.pm:2890-2898`) — emit ONLY the version.
+    _ => LensDataLayout {
+      table: &[],
+      encrypted: true,
+      old_lens_data_gate: None,
+      has_z_block: false,
+      order: None,
+    },
+  }
+}
+
+/// `$$self{OldLensData}` (`Nikon.pm:5726-5731`): the forward-looking `undef[17]`
+/// RawConv sets the flag UNLESS the 17 bytes are `/^.\0+$/s` — i.e. the first
+/// byte is anything and bytes 1..17 are ALL NUL. A block too short to hold the
+/// 17 bytes leaves the flag unset (the `Format => 'undef[17]'` read fails),
+/// matching ExifTool's `last`-on-short-read in `ProcessBinaryData`.
+fn old_lens_data_present(body: &[u8], gate_offset: usize) -> bool {
+  let end = gate_offset.saturating_add(17);
+  let Some(window) = body.get(gate_offset..end) else {
+    return false;
+  };
+  // `/^.\0+$/s`: at least the lead byte + one NUL, and every byte after the
+  // first is NUL. `OldLensData` is set when this does NOT match — i.e. some
+  // byte from index 1 onward is non-zero.
+  match window.split_first() {
+    Some((_lead, rest)) => rest.iter().any(|&b| b != 0),
+    None => false,
+  }
+}
+
+/// Emit the `%Nikon::LensData*` leaves (0x0098). The `LensDataVersion` (first 4
+/// ASCII bytes, `Format => 'string[4]'`) version-dispatches the layout exactly
+/// as `Nikon.pm:2814-2899` does:
+///
+/// - `0100` → [`tags::LENS_DATA_00`], UNENCRYPTED.
+/// - `0101` → [`tags::LENS_DATA_01`], UNENCRYPTED.
+/// - `020[1-3]` → [`tags::LENS_DATA_01`], `040[01]`/`0402`/`0403`/`0204`/
+///   `080[012]` → their own tables — all ENCRYPTED: the bytes AFTER the 4-byte
+///   version are DECRYPTED first ([`decrypt::decrypt`] with `DecryptStart => 4`,
+///   `Nikon.pm:2836`) using the captured serial/count keys.
+/// - ANY other version → the `LensDataUnknown` arm (`Nikon.pm:2890`), an empty
+///   member table — ENCRYPTED (`ProcessProc => \&ProcessNikonEncrypted`,
+///   `DecryptStart => 4`), so ONLY `LensDataVersion` is emitted, and only when
+///   the decryption keys are valid.
+///
+/// `LensDataVersion` is emitted for a readable 4-byte version of an UNENCRYPTED
+/// layout (`0100`/`0101`) unconditionally, and of an ENCRYPTED layout ONLY once
+/// the serial/count key gate has passed. An encrypted layout without valid keys
+/// emits NOTHING — not even `LensDataVersion`: ExifTool's `ProcessNikonEncrypted`
+/// returns 0 before its callback reads the cleartext `string[4]` at offset 0
+/// (`Nikon.pm:13948-13961`), so the whole `0x0098` SubDirectory yields no tags.
+/// The maximum byte offset a [`LensDataLayout`] actually reads — the largest
+/// member `offset + size` in its table, plus the `0800` Z telemetry's
+/// `0x60`-byte window (it reads up to `LensMountType` at `0x5f`). Used to cap
+/// the encrypted-blob clone + decrypt to ONLY the bytes the decode consumes, so
+/// a crafted in-bounds LensData value near the size ceiling cannot force a large
+/// heap copy + linear decrypt of bytes that are never read. The stream cipher is
+/// causal (each byte's keystream depends only on earlier bytes), so decrypting
+/// the needed prefix is byte-identical to decrypting the whole block.
+fn lens_data_read_extent(plan: &LensDataLayout) -> usize {
+  let table_max = plan
+    .table
+    .iter()
+    .map(|e| {
+      e.offset
+        + match &e.read {
+          tags::LensRead::Byte => 1,
+          tags::LensRead::Str(len) => *len,
+        }
+    })
+    .max()
+    .unwrap_or(0);
+  // The `0800` Z telemetry ([`emit_lens_data_0800_new`]) reads up to
+  // `LensMountType` at `0x5f` (one byte ⇒ `0x60`).
+  let z_max = if plan.has_z_block { 0x60 } else { 0 };
+  table_max.max(z_max)
+}
+
+fn emit_lens_data(
+  walk_data: &[u8],
+  entry: &NikonEntry,
+  layout: Layout,
+  print_conv: bool,
+  keys: Option<DecryptKeys>,
+  focus_mode: Option<&str>,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
+    return;
+  };
+  // `LensDataVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
+  let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
+    return;
+  };
+  let plan = lens_data_layout(version);
+  // An ENCRYPTED layout (every `02xx`/`04xx`/`08xx` arm AND the LensDataUnknown
+  // fallback — all `ProcessProc => \&ProcessNikonEncrypted`, `Nikon.pm:2834-
+  // 2897`) is processed by `ProcessNikonEncrypted`, which RETURNS 0 (extracting
+  // NOTHING — not even the cleartext `LensDataVersion` at offset 0) when the
+  // serial/count keys are missing/invalid (`Nikon.pm:13948-13961`). The keys
+  // are valid IFF `scan_decrypt_keys` returned `Some` (the serial defaults to 0
+  // and the count is a single `/^\d+$/` scalar), so gate the WHOLE emission on
+  // it BEFORE pushing `LensDataVersion`. An UNENCRYPTED layout (`0100`/`0101`)
+  // uses plain `ProcessBinaryData` with no key check, so it always emits.
+  let valid_keys = if plan.encrypted {
+    let Some(keys) = keys else {
+      return; // ProcessNikonEncrypted returned 0 — emit nothing at all.
+    };
+    Some(keys)
+  } else {
+    None
+  };
+  // `LensDataVersion` itself is emitted as the 4-char ASCII string (it is never
+  // encrypted, so read from the original cleartext `version` bytes). This is
+  // emitted for EVERY readable 4-byte version once the key gate (encrypted
+  // layouts) has passed — incl. the LensDataUnknown fallback, so no decryptable
+  // `0x0098` SubDirectory is silently dropped.
+  let version_str = SmolStr::new(String::from_utf8_lossy(version));
+  emissions.push(VendorEmission::new(
+    "LensDataVersion".into(),
+    TagValue::Str(version_str),
+    false,
+  ));
+  if plan.table.is_empty() {
+    return; // LensDataUnknown — only the version, no members.
+  }
+  // The decoded body buffer: the raw bytes for an unencrypted layout, or a
+  // decrypted copy for the `02xx`+ layouts. The 4-byte version prefix is NEVER
+  // encrypted (`DecryptStart => 4`).
+  let decoded: std::borrow::Cow<'_, [u8]> = if let Some(keys) = valid_keys {
+    // Cap the clone+decrypt to the byte range this layout actually reads
+    // (R2: a crafted in-bounds LensData value near the size ceiling otherwise
+    // forces a large heap copy + linear decrypt of bytes never read).
+    let cap = lens_data_read_extent(&plan).min(sub.len());
+    let mut buf = sub.get(..cap).unwrap_or(sub).to_vec();
+    let len = buf.len().saturating_sub(4);
+    decrypt::decrypt(&mut buf, 4, len, keys.serial, keys.count);
+    std::borrow::Cow::Owned(buf)
+  } else {
+    std::borrow::Cow::Borrowed(sub)
+  };
+  let body = decoded.as_ref();
+  // The byte order for MULTI-BYTE members: the SubDirectory's `ByteOrder` when
+  // the layout overrides it (`0800` ⇒ LittleEndian, `Nikon.pm:2887`), else the
+  // parent MakerNote IFD's order. The legacy block's int8u members are
+  // order-agnostic, but the Z block's int16u/int32s reads need it.
+  let sub_order = plan.order.unwrap_or(layout.order);
+  // The `0800` OldLensData members are gated on the forward-looking flag; when
+  // it is clear (the `undef[17]` is `/^.\0+$/`), skip the LEGACY block (no member
+  // emits) — but the NEW Z telemetry below is INDEPENDENTLY gated on
+  // `NewLensData`, so it is still decoded. (`ProcessBinaryData` walks every
+  // table key; only the per-member `Condition` decides emission.)
+  let legacy_gate_open = plan
+    .old_lens_data_gate
+    .is_none_or(|gate| old_lens_data_present(body, gate));
+  if legacy_gate_open {
+    for pos in plan.table {
+      match pos.read {
+        // The default `int8u` member: a single byte at its offset. The sub-table
+        // byte order does not affect a one-byte read. Read from `body`
+        // (post-decrypt for the encrypted layouts).
+        tags::LensRead::Byte => {
+          let Some(&byte) = body.get(pos.offset) else {
+            continue; // member past the (short) block — emit nothing for it.
+          };
+          let raw = RawValue::U64(std::vec![u64::from(byte)]);
+          let parsed = ParsedValue::new(raw);
+          let Some(value) = pos.conv.apply(&parsed, print_conv, None, layout.order) else {
+            continue;
+          };
+          emissions.push(VendorEmission::new(pos.name.into(), value, false));
+        }
+        // `LensModel`, `Format => 'string[len]'`: `len` ASCII bytes, NUL-truncated
+        // (`ReadValue`'s `s/\0.*//s`). An entirely-empty (all-NUL) field yields the
+        // empty string, which ExifTool still emits (the `040x`/`0402`/`0403`
+        // tables have no RawConv suppressing it).
+        tags::LensRead::Str(len) => {
+          let end = pos.offset.saturating_add(len);
+          let Some(window) = body.get(pos.offset..end) else {
+            continue; // field runs past the (short) block — drop it.
+          };
+          let trimmed = match window.iter().position(|&b| b == 0) {
+            Some(nul) => window.get(..nul).unwrap_or(window),
+            None => window,
+          };
+          let value = TagValue::Str(SmolStr::from(crate::convert::fix_utf8(trimmed)));
+          emissions.push(VendorEmission::new(pos.name.into(), value, false));
+        }
+      }
+    }
+  }
+  // The NEW Z-lens telemetry block (`Nikon.pm:5809-5961`) — only the `0800`
+  // layout carries it; gated internally on `NewLensData`/`LensID`/`FocusMode`.
+  if plan.has_z_block {
+    emit_lens_data_0800_new(body, sub_order, print_conv, focus_mode, emissions);
+  }
+}
+
+/// Decode the NEW Z-lens telemetry of `%Nikon::LensData0800` (`Nikon.pm:5809-
+/// 5961`) off the DECRYPTED block `body`, in the SubDirectory's `order`
+/// (LittleEndian for `0800`). This is the faithful port of `ProcessBinaryData`
+/// over the table keys `0x2f..=0x5f`, honouring the DATAMEMBER state machine and
+/// each member's `Condition`/`Format`/`ValueConv`/`PrintConv`/`Mask`:
+///
+/// - `0x2f` `NewLensData` (`undef[17]`, RawConv `$$self{NewLensData} = 1 unless
+///   $val =~ /^.\0+$/s`) — the forward-looking flag that gates the rest. Hidden.
+/// - `0x30` `LensID` (`int16u`, `Condition => $$self{NewLensData}`, RawConv
+///   `$$self{LensID} = $val`) — the ~80-entry Z-lens PrintConv
+///   ([`NikonConv::LensId`]). A non-zero LensID ⇒ a native Z lens.
+/// - `0x34` `LensFirmwareVersion` (`int16u`, `Condition => $$self{LensID} and
+///   $$self{LensID} != 0`) — the V.R.M PrintConv ([`NikonConv::LensFirmwareZ`]).
+/// - `0x36` `MaxAperture` / `0x38` `FNumber` (`int16u`, `Condition =>
+///   $$self{NewLensData}`, `2**($val/384-1)`, [`NikonConv::LensApertureZ`]).
+/// - `0x3c` `FocalLength` (`int16u`, `Condition => $$self{NewLensData}`,
+///   PrintConv `"$val mm"`, [`NikonConv::FocalLengthZ`]).
+/// - `0x4c` `FocusDistanceRangeWidth` (`int8u`, `Unknown => 1`, `Condition =>
+///   $$self{LensID} … and $$self{FocusMode} ne "Manual"`).
+/// - `0x4e` `FocusDistance` (`int16u`, `Condition => $$self{LensID} …`, RawConv
+///   `$val/256` then `2**(($val-80)/12)`, [`NikonConv::FocusDistanceZ`]).
+/// - `0x56` `LensDriveEnd` (`int8u`, `Unknown => 1`, `Condition => … FocusMode
+///   ne "Manual"`) — the `No`/`CFD`/`Inf` RawConv label.
+/// - `0x58` `FocusStepsFromInfinity` (`int8u`, `Unknown => 1`, `Condition =>
+///   $$self{LensID} …`).
+/// - `0x5a` `LensPositionAbsolute` (`int32s`, `Condition => $$self{LensID} …`).
+/// - `0x5f` `LensMountType` (`int8u`, `Mask => 0x01`, `{0=>'Z-mount',
+///   1=>'F-mount'}`).
+///
+/// The three `Unknown => 1` members (0x4c/0x56/0x58) are emitted with the
+/// `unknown` flag so the engine suppresses them from default output but keeps
+/// them under `-u` — byte-exact with ExifTool's default `-j` (`ProcessBinaryData`
+/// `next if $$tagInfo{Unknown}` at `ExifTool.pm:9945` for `Unknown=0`).
+fn emit_lens_data_0800_new(
+  body: &[u8],
+  order: ByteOrder,
+  print_conv: bool,
+  focus_mode: Option<&str>,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  // `0x2f` NewLensData (`undef[17]`): set the flag UNLESS `/^.\0+$/s` (the lead
+  // byte is anything and bytes 1..17 are all NUL) — the same forward-look test
+  // as OldLensData. A block too short to hold the 17 bytes leaves it clear
+  // (the `Format => 'undef[17]'` read fails ⇒ no DataMember set).
+  let new_lens_data = old_lens_data_present(body, 0x2f);
+  // `0x30` LensID (`int16u`, `Condition => $$self{NewLensData}`, RawConv
+  // `$$self{LensID} = $val`). Read only when NewLensData is set; an absent /
+  // short-block / NewLensData-clear LensID leaves it `None`, which suppresses
+  // every LensID-gated member below. NOTE: we do NOT early-return on a clear
+  // NewLensData — `LensMountType` (0x5f) has NO `Condition` in ExifTool, so it
+  // must still be emitted when byte 0x5f is present (R3 fix).
+  let lens_id: Option<u16> = if new_lens_data {
+    read_z_int16u(body, 0x30, order)
+  } else {
+    None
+  };
+  if let Some(id) = lens_id {
+    let raw = RawValue::U64(std::vec![u64::from(id)]);
+    let parsed = ParsedValue::new(raw);
+    if let Some(value) = NikonConv::LensId.apply(&parsed, print_conv, None, order) {
+      emissions.push(VendorEmission::new("LensID".into(), value, false));
+    }
+  }
+  // `$$self{LensID} and $$self{LensID} != 0` — the native-Z-lens gate shared by
+  // 0x34/0x4c/0x4e/0x56/0x58/0x5a.
+  let z_lens = lens_id.is_some_and(|id| id != 0);
+  // `$$self{FocusMode} ne "Manual"` — an ABSENT FocusMode is `undef ne
+  // "Manual"` = TRUE in Perl, so the gate is open unless FocusMode is exactly
+  // "Manual" (the RAW on-disk string).
+  let not_manual = focus_mode != Some("Manual");
+
+  // `0x34` LensFirmwareVersion (`int16u`, `Condition => $$self{LensID} and
+  // $$self{LensID} != 0`).
+  if z_lens {
+    emit_z_int16u(
+      body,
+      0x34,
+      order,
+      print_conv,
+      NikonConv::LensFirmwareZ,
+      false,
+      "LensFirmwareVersion",
+      emissions,
+    );
+  }
+  // `0x36` MaxAperture / `0x38` FNumber / `0x3c` FocalLength — gated on
+  // `$$self{NewLensData}`.
+  if new_lens_data {
+    emit_z_int16u(
+      body,
+      0x36,
+      order,
+      print_conv,
+      NikonConv::LensApertureZ,
+      false,
+      "MaxAperture",
+      emissions,
+    );
+    emit_z_int16u(
+      body,
+      0x38,
+      order,
+      print_conv,
+      NikonConv::LensApertureZ,
+      false,
+      "FNumber",
+      emissions,
+    );
+    emit_z_int16u(
+      body,
+      0x3c,
+      order,
+      print_conv,
+      NikonConv::FocalLengthZ,
+      false,
+      "FocalLength",
+      emissions,
+    );
+  }
+  // `0x4c` FocusDistanceRangeWidth (`int8u`, `Unknown => 1`, gated on z_lens AND
+  // FocusMode ne "Manual"). Its RawConv sets `$$self{FocusDistanceRangeWidth}`,
+  // but that DataMember is consumed only by LensDriveEnd's RawConv (handled
+  // there); the Unknown flag suppresses it from default output.
+  if z_lens && not_manual {
+    emit_z_int8u(
+      body,
+      0x4c,
+      print_conv,
+      NikonConv::Raw,
+      true,
+      "FocusDistanceRangeWidth",
+      emissions,
+    );
+  }
+  // `0x4e` FocusDistance (`int16u`, gated on z_lens). The PrintConv references
+  // `$$self{FocusStepsFromInfinity}`, which is `Unknown => 1` and therefore NEVER
+  // set in default mode (`next if Unknown` at `ExifTool.pm:9945`), so the "Inf"
+  // branch is unreachable — [`NikonConv::FocusDistanceZ`] formats accordingly.
+  if z_lens {
+    emit_z_int16u(
+      body,
+      0x4e,
+      order,
+      print_conv,
+      NikonConv::FocusDistanceZ,
+      false,
+      "FocusDistance",
+      emissions,
+    );
+  }
+  // `0x56` LensDriveEnd (`int8u`, `Unknown => 1`, gated on z_lens AND not
+  // Manual). STATEFUL RawConv (`Nikon.pm:5933-5939`):
+  //   unless (defined $$self{FocusDistanceRangeWidth}
+  //           and not $$self{FocusDistanceRangeWidth}) {
+  //     if ($val == 0) { $$self{LensDriveEnd} = "No" }
+  //     else           { $$self{LensDriveEnd} = "CFD" }
+  //   } else           { $$self{LensDriveEnd} = "Inf" }
+  // The RawConv's RETURN value (a Perl assignment yields its RHS) is the emitted
+  // `$val` — the STRING "No"/"CFD"/"Inf", NOT the raw int8u. It reads the 0x4c
+  // `FocusDistanceRangeWidth` DataMember, set by 0x4c's RawConv `$$self{...} =
+  // $val`. That DataMember is set ONLY when 0x4c is EXTRACTED; 0x4c is `Unknown
+  // => 1`, so it is set IFF the member survives the binary-table Unknown gate
+  // (`ExifTool.pm:9945` `next if Unknown and Unknown > $unknown`). LensDriveEnd
+  // is ITSELF `Unknown => 1` ⇒ observable only under `-u`, and in `-u` the
+  // lower-index 0x4c is ALSO extracted and runs FIRST, so whenever LensDriveEnd
+  // is visible its DataMember IS defined = the raw byte at 0x4c (byte 0x56 sits
+  // above 0x4c, so reaching 0x56 guarantees 0x4c is in-block). Thus the faithful
+  // mapping reads BOTH bytes off the same decrypted `body`:
+  //   FocusDistanceRangeWidth(0x4c) == 0 → "Inf";
+  //   else LensDriveEnd(0x56) == 0      → "No"; else → "CFD".
+  // exifast has NO `-u` mode — the engine ALWAYS drops `Unknown => 1` tags
+  // (`run_emission`'s `if e.unknown() { continue }`), so LensDriveEnd NEVER
+  // reaches output; it is emitted (unknown-flagged) and converted faithfully for
+  // correctness, exercised directly via [`lens_drive_end`].
+  if z_lens
+    && not_manual
+    && let Some(&byte) = body.get(0x56)
+  {
+    let focus_distance_range_width = body.get(0x4c).copied();
+    let label = lens_drive_end(byte, focus_distance_range_width);
+    emissions.push(VendorEmission::new(
+      "LensDriveEnd".into(),
+      TagValue::Str(SmolStr::new(label)),
+      true,
+    ));
+  }
+  // `0x58` FocusStepsFromInfinity (`int8u`, `Unknown => 1`, gated on z_lens).
+  if z_lens {
+    emit_z_int8u(
+      body,
+      0x58,
+      print_conv,
+      NikonConv::Raw,
+      true,
+      "FocusStepsFromInfinity",
+      emissions,
+    );
+  }
+  // `0x5a` LensPositionAbsolute (`int32s`, gated on z_lens). NOT Unknown.
+  if z_lens {
+    emit_z_int32s(
+      body,
+      0x5a,
+      order,
+      print_conv,
+      "LensPositionAbsolute",
+      emissions,
+    );
+  }
+  // `0x5f` LensMountType (`int8u`, `Mask => 0x01`, `{0=>'Z-mount',1=>'F-mount'}`).
+  // NO Condition — always emitted when the byte is present. The Mask is applied
+  // BEFORE the PrintConv (`ExifTool.pm:10079` `$val = ($val & $mask) >> 0`).
+  if let Some(&byte) = body.get(0x5f) {
+    let masked = i64::from(byte & 0x01);
+    let raw = RawValue::I64(std::vec![masked]);
+    let parsed = ParsedValue::new(raw);
+    if let Some(value) = NikonConv::LensMountType.apply(&parsed, print_conv, None, order) {
+      emissions.push(VendorEmission::new("LensMountType".into(), value, false));
+    }
+  }
+}
+
+/// Read an `int16u` member at `offset` off the decrypted Z block in `order`
+/// (the faithful `ReadValue($dataPt, $entry, 'int16u', 1, $more)`). `None` when
+/// the 2 bytes do not fit (a short block — `ProcessBinaryData` `last if $more <=
+/// 0`), so the member emits nothing.
+fn read_z_int16u(body: &[u8], offset: usize, order: ByteOrder) -> Option<u16> {
+  let avail = body.len().checked_sub(offset)?;
+  let raw = read_value(body, offset, Format::Int16u, 1, avail, order)?;
+  match raw {
+    RawValue::U64(v) => v.first().and_then(|&n| u16::try_from(n).ok()),
+    _ => None,
+  }
+}
+
+/// Emit one `int16u` Z member: read it in `order`, apply `conv`, push under
+/// `name` with the `unknown` flag. A short block (member past the end) emits
+/// nothing.
+fn emit_z_int16u(
+  body: &[u8],
+  offset: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  conv: NikonConv,
+  unknown: bool,
+  name: &'static str,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(n) = read_z_int16u(body, offset, order) else {
+    return;
+  };
+  let raw = RawValue::U64(std::vec![u64::from(n)]);
+  let parsed = ParsedValue::new(raw);
+  if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
+    emissions.push(VendorEmission::new(name.into(), value, unknown));
+  }
+}
+
+/// Emit one `int8u` Z member at `offset` (the default `FORMAT => 'int8u'`): a
+/// single byte, order-agnostic. A short block emits nothing.
+fn emit_z_int8u(
+  body: &[u8],
+  offset: usize,
+  print_conv: bool,
+  conv: NikonConv,
+  unknown: bool,
+  name: &'static str,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(&byte) = body.get(offset) else {
+    return;
+  };
+  let raw = RawValue::U64(std::vec![u64::from(byte)]);
+  let parsed = ParsedValue::new(raw);
+  if let Some(value) = conv.apply(&parsed, print_conv, None, ByteOrder::Little) {
+    emissions.push(VendorEmission::new(name.into(), value, unknown));
+  }
+}
+
+/// The `0x56` `LensDriveEnd` RawConv (`Nikon.pm:5933-5939`) — the STATEFUL
+/// label derived from the `LensDriveEnd` byte (`val`) and the `0x4c`
+/// `FocusDistanceRangeWidth` DataMember (`fdrw`, the raw byte at 0x4c, `None`
+/// when undefined — but see [`emit_lens_data_0800_new`]: when LensDriveEnd is
+/// reached, 0x4c is always in-block, so `fdrw` is `Some`):
+///
+/// ```text
+/// unless (defined $fdrw and not $fdrw) {       # !(fdrw defined && fdrw == 0)
+///     if ($val == 0) { "No" } else { "CFD" }
+/// } else { "Inf" }                              #   fdrw defined && fdrw == 0
+/// ```
+///
+/// i.e. `Inf` iff `FocusDistanceRangeWidth` is defined and `0`; otherwise `No`
+/// for `val == 0` and `CFD` for `val != 0`. Returns the `&'static str` the
+/// RawConv's terminal assignment yields (the emitted `$val`).
+#[must_use]
+const fn lens_drive_end(val: u8, fdrw: Option<u8>) -> &'static str {
+  match fdrw {
+    Some(0) => "Inf",
+    _ if val == 0 => "No",
+    _ => "CFD",
+  }
+}
+
+/// Emit `LensPositionAbsolute` (`0x5a`, `int32s`): read 4 bytes in `order` as a
+/// signed int, no ValueConv/PrintConv (rendered as the bare integer). A short
+/// block emits nothing.
+fn emit_z_int32s(
+  body: &[u8],
+  offset: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  name: &'static str,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let avail = match body.len().checked_sub(offset) {
+    Some(a) => a,
+    None => return,
+  };
+  let Some(raw) = read_value(body, offset, Format::Int32s, 1, avail, order) else {
+    return;
+  };
+  let parsed = ParsedValue::new(raw);
+  // No ValueConv/PrintConv on LensPositionAbsolute ⇒ the default `ReadValue`
+  // render (the signed integer).
+  if let Some(value) = NikonConv::Raw.apply(&parsed, print_conv, None, order) {
+    emissions.push(VendorEmission::new(name.into(), value, false));
+  }
 }
 
 /// `$$self{Model} =~ /^NIKON D/i` (`Nikon.pm:2115`) — the AFInfo BigEndian
@@ -1008,5 +1755,975 @@ mod tests {
       emissions.iter().any(|e| e.name() == "Quality"),
       "the IFD at +8 must be walked (Quality emitted): {emissions:?}"
     );
+  }
+
+  // ---- LensData version-dispatch (0x0098) ---------------------------------
+  //
+  // Each test crafts a self-contained type-3 Nikon blob carrying SerialNumber
+  // (0x001d), ShutterCount (0x00a7) and a LensData (0x0098) block whose
+  // encrypted body was produced by ENCRYPTING a known plaintext with this
+  // module's own symmetric `decrypt` (the `cipher_is_symmetric` property), so
+  // the decode round-trips a KNOWN field set. The expected rendered values are
+  // the `perl exiftool 13.59` oracle (verified out-of-band on the identical
+  // crafted bytes — see the issue-#227 verification notes).
+
+  /// The crafted-blob serial/count keys (numeric serial `12345678` ⇒ the key is
+  /// the integer itself; ShutterCount `100`).
+  const KEY_SERIAL: u32 = 12_345_678;
+  const KEY_COUNT: u32 = 100;
+
+  /// Build a self-contained type-3 Nikon blob (the `parse()` standalone path)
+  /// with SerialNumber=`12345678`, ShutterCount=`100`, and a `0x0098` LensData
+  /// value of `lens_block` (the version prefix + already-encrypted body, or a
+  /// cleartext body for the unencrypted `0100`/`0101`).
+  fn type3_with_lens_data(lens_block: &[u8]) -> Vec<u8> {
+    // Embedded TIFF (big-endian) at blob offset 10; IFD0 at embedded+8 (blob
+    // 18). Out-of-line value offsets are embedded-relative (value_base 10).
+    let serial = b"12345678\x00"; // 9 bytes (out-of-line)
+    let n_entries: u16 = 3;
+    // value area begins after count(2) + 3*12 + next(4) = 42 ⇒ embedded 8+42=50.
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_serial = val_emb;
+    let off_lens = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00"); // 10-byte type-3 header
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes()); // IFD0 at embedded+8
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line.
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(serial.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_serial.to_be_bytes());
+    // 0x0098 LensData — undef, out-of-line.
+    b.extend_from_slice(&0x0098u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&(lens_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = 100.
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_serial);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(lens_block);
+    b
+  }
+
+  /// Like [`type3_with_lens_data`] but ALSO carries a `FocusMode` (tag 0x0007)
+  /// string so the LensData0800 Z `FocusMode ne "Manual"` gate can be exercised.
+  /// `focus_mode` is the RAW on-disk bytes (NUL-terminated as the camera writes
+  /// it). Four out-of-line entries in tag-ID order: 0x0007, 0x001d, 0x0098, plus
+  /// the inline 0x00a7.
+  fn type3_with_focus_mode_and_lens_data(focus_mode: &[u8], lens_block: &[u8]) -> Vec<u8> {
+    let serial = b"12345678\x00"; // 9 bytes (out-of-line)
+    let n_entries: u16 = 4;
+    // value area begins after count(2) + 4*12 + next(4) = 54 ⇒ embedded 8+54=62.
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_focus = val_emb;
+    let off_serial = off_focus + focus_mode.len() as u32;
+    let off_lens = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00"); // 10-byte type-3 header
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes()); // IFD0 at embedded+8
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x0007 FocusMode — ASCII, out-of-line.
+    b.extend_from_slice(&0x0007u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(focus_mode.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_focus.to_be_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line.
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(serial.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_serial.to_be_bytes());
+    // 0x0098 LensData — undef, out-of-line.
+    b.extend_from_slice(&0x0098u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&(lens_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = 100.
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_focus);
+    b.extend_from_slice(focus_mode);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(lens_block);
+    b
+  }
+
+  /// Like [`type3_with_focus_mode_and_lens_data`] but with the IFD entry RECORDS
+  /// in the UNSORTED order `0x001d, 0x0098, 0x00a7, 0x0007` — so the `0x0098`
+  /// LensData is WALKED BEFORE the `0x0007` `FocusMode` entry. This exercises the
+  /// positional `$$self{FocusMode}` gate: at the LensData position no `0x0007`
+  /// has run yet, so the member is `undef` (`undef ne "Manual"` = TRUE ⇒ open),
+  /// even though a later `0x0007 = "Manual"` exists. The value AREA layout is
+  /// unchanged (offsets are record-order-independent); only the 4 entry records
+  /// are reordered.
+  fn type3_lens_data_before_focus_mode(focus_mode: &[u8], lens_block: &[u8]) -> Vec<u8> {
+    let serial = b"12345678\x00"; // 9 bytes (out-of-line)
+    let n_entries: u16 = 4;
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_focus = val_emb;
+    let off_serial = off_focus + focus_mode.len() as u32;
+    let off_lens = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00"); // 10-byte type-3 header
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes()); // IFD0 at embedded+8
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line (a prescan key; order-independent).
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(serial.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_serial.to_be_bytes());
+    // 0x0098 LensData — undef, out-of-line. WALKED BEFORE 0x0007 below.
+    b.extend_from_slice(&0x0098u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&(lens_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = 100 (a prescan key).
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    // 0x0007 FocusMode — ASCII, out-of-line. AFTER 0x0098 in walk order.
+    b.extend_from_slice(&0x0007u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(focus_mode.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_focus.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_focus);
+    b.extend_from_slice(focus_mode);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(lens_block);
+    b
+  }
+
+  /// Encrypt `plain` (the cleartext version+body) with this module's symmetric
+  /// cipher (`DecryptStart => 4`, the crafted keys) — the inverse of the read
+  /// path, used to forge an encrypted LensData block from a known plaintext.
+  fn encrypt_lens(plain: &[u8]) -> Vec<u8> {
+    let mut buf = plain.to_vec();
+    let len = buf.len().saturating_sub(4);
+    decrypt::decrypt(&mut buf, 4, len, KEY_SERIAL, KEY_COUNT);
+    buf
+  }
+
+  fn lens_get(emissions: &[VendorEmission], name: &str) -> Option<TagValue> {
+    emissions
+      .iter()
+      .find(|e| e.name() == name)
+      .map(|e| e.value().clone())
+  }
+
+  fn str_val(s: &str) -> TagValue {
+    TagValue::Str(SmolStr::new(s))
+  }
+
+  /// `LensDataVersion 0204` (D90/D7000) DISPATCHES to `%LensData0204` (NOT the
+  /// Unknown fallback) and decodes its 13 shifted-offset members byte-exact to
+  /// the `perl exiftool` oracle (the offsets differ from 0101 by the +1 shift at
+  /// 0x09). This is the OLD-BUG-FIXED case: pre-fix a `0204` block emitted
+  /// NOTHING (not even `LensDataVersion`); now the full member set emits.
+  #[test]
+  fn lens_data_0204_dispatches_and_decodes() {
+    // Known plaintext: "0204" + body bytes at the 0204 offsets (see the table).
+    let mut plain = [0u8; 20];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40; // ExitPupilPosition raw 64 → 2048/64 = "32.0 mm"
+    plain[0x05] = 0x18; // AFAperture raw 24 → 2**(24/24) = "2.0"
+    plain[0x08] = 0x2a; // FocusPosition raw 0x2a → "0x2a"
+    plain[0x0a] = 0x14; // FocusDistance raw 20 → "0.03 m"
+    plain[0x0b] = 0x76; // FocalLength raw 118 → "151.0 mm"
+    plain[0x0c] = 0x18; // LensIDNumber 24
+    plain[0x0d] = 0x18; // LensFStops raw 24 → 24/12 = "2.00"
+    plain[0x0e] = 0x18; // MinFocalLength raw 24 → "10.0 mm"
+    plain[0x0f] = 0x18; // MaxFocalLength raw 24 → "10.0 mm"
+    plain[0x10] = 0x30; // MaxApertureAtMinFocal raw 48 → "4.0"
+    plain[0x11] = 0x30; // MaxApertureAtMaxFocal raw 48 → "4.0"
+    plain[0x12] = 0x07; // MCUVersion 7
+    plain[0x13] = 0x42; // EffectiveMaxAperture raw 66 → "6.7"
+    let blob = type3_with_lens_data(&encrypt_lens(&plain));
+
+    let (_t, em) = parse(&blob, ByteOrder::Big, Some("NIKON D7000"));
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0204")));
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert_eq!(lens_get(&em, "AFAperture"), Some(str_val("2.0")));
+    assert_eq!(lens_get(&em, "FocusPosition"), Some(str_val("0x2a")));
+    assert_eq!(lens_get(&em, "FocusDistance"), Some(str_val("0.03 m")));
+    assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("151.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+    assert_eq!(lens_get(&em, "LensFStops"), Some(str_val("2.00")));
+    assert_eq!(lens_get(&em, "MinFocalLength"), Some(str_val("10.0 mm")));
+    assert_eq!(lens_get(&em, "MaxFocalLength"), Some(str_val("10.0 mm")));
+    assert_eq!(lens_get(&em, "MaxApertureAtMinFocal"), Some(str_val("4.0")));
+    assert_eq!(lens_get(&em, "MaxApertureAtMaxFocal"), Some(str_val("4.0")));
+    assert_eq!(lens_get(&em, "MCUVersion"), Some(TagValue::I64(7)));
+    assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+  }
+
+  #[test]
+  fn lens_data_read_extent_is_bounded_per_layout() {
+    // The decrypt cap is the layout's largest member offset+size — small and
+    // FIXED per version, NEVER the (attacker-controlled) declared blob length.
+    assert_eq!(lens_data_read_extent(&lens_data_layout(b"0204")), 0x14);
+    assert_eq!(
+      lens_data_read_extent(&lens_data_layout(b"0403")),
+      0x2ac + 64
+    );
+    // 0800: the Z telemetry reads up to LensMountType 0x5f ⇒ 0x60.
+    let e0800 = lens_data_read_extent(&lens_data_layout(b"0800"));
+    assert!((0x60..0x100).contains(&e0800), "0800 extent {e0800:#x}");
+  }
+
+  #[test]
+  fn lens_data_large_in_bounds_value_caps_decrypt() {
+    // R2: a crafted encrypted LensData declaring a huge in-bounds value must NOT
+    // clone+decrypt the whole blob — only the layout's read window (0x14 for
+    // 0204). The first bytes carry the real members; the 60 KB tail is padding
+    // the cap never decrypts. Decoding still succeeds (the cipher is causal).
+    let mut plain = vec![0u8; 60_000];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40; // ExitPupilPosition → "32.0 mm"
+    plain[0x0c] = 0x18; // LensIDNumber 24
+    plain[0x13] = 0x42; // EffectiveMaxAperture → "6.7"
+    let blob = type3_with_lens_data(&encrypt_lens(&plain));
+    let (_t, em) = parse(&blob, ByteOrder::Big, Some("NIKON D7000"));
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0204")));
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+    assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+    // The decrypt window is the 0204 layout (0x14), not the 60 KB value.
+    assert_eq!(lens_data_read_extent(&lens_data_layout(b"0204")), 0x14);
+  }
+
+  #[test]
+  fn encrypted_lens_data_decrypts_without_serial_number() {
+    // R4: ExifTool seeds its prescan with `0x001d => 0`, so encrypted LensData
+    // with ShutterCount (0x00a7) but NO SerialNumber (0x001d) still decrypts
+    // with serial key 0. The 0204 block is encrypted with serial key 0 + the
+    // count, embedded in a type-3 MakerNote carrying 0x00a7 but no 0x001d.
+    let mut plain = [0u8; 20];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40; // ExitPupilPosition → "32.0 mm"
+    plain[0x0c] = 0x18; // LensIDNumber 24
+    plain[0x13] = 0x42; // EffectiveMaxAperture → "6.7"
+    let mut enc = plain.to_vec();
+    let len = enc.len() - 4;
+    decrypt::decrypt(&mut enc, 4, len, 0, KEY_COUNT); // serial key 0
+    // Type-3 MakerNote: 2 out-of-line/inline entries (0x0098 LensData, 0x00a7
+    // ShutterCount) — tag-ID-ordered, NO 0x001d SerialNumber.
+    let n_entries: u16 = 2;
+    let off_lens: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4; // embedded-relative
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    b.extend_from_slice(&0x0098u16.to_be_bytes()); // LensData, undef, out-of-line
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(enc.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    b.extend_from_slice(&0x00a7u16.to_be_bytes()); // ShutterCount, int32u, inline
+    b.extend_from_slice(&[0x00, 0x04]);
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(&enc);
+    let (_t, em) = parse(&b, ByteOrder::Big, Some("NIKON D7000"));
+    // Decryption succeeded with the default serial key 0 (no 0x001d present).
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0204")));
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+    assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+  }
+
+  /// `LensDataVersion 0400` (Nikon 1 J1/V1/J2) dispatches to `%LensData0400` and
+  /// decodes the `LensModel` `string[64]` at offset 0x18a (the only readable
+  /// member). Byte-exact to the `perl exiftool` oracle. Proves the
+  /// large-offset string read + the `040[01]` alternation arm.
+  #[test]
+  fn lens_data_0400_decodes_lens_model() {
+    let model = b"1 NIKKOR VR 10-30mm f/3.5-5.6";
+    let mut plain = std::vec![0u8; 0x18a + 64];
+    plain[0..4].copy_from_slice(b"0400");
+    plain
+      .get_mut(0x18a..0x18a + model.len())
+      .unwrap()
+      .copy_from_slice(model);
+    let blob = type3_with_lens_data(&encrypt_lens(&plain));
+
+    let (_t, em) = parse(&blob, ByteOrder::Big, Some("NIKON 1 J1"));
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0400")));
+    assert_eq!(
+      lens_get(&em, "LensModel"),
+      Some(str_val("1 NIKKOR VR 10-30mm f/3.5-5.6"))
+    );
+    // The `0401` sibling shares the same table/arm.
+    let mut plain2 = plain.clone();
+    plain2[0..4].copy_from_slice(b"0401");
+    let blob2 = type3_with_lens_data(&encrypt_lens(&plain2));
+    let (_t2, em2) = parse(&blob2, ByteOrder::Big, Some("NIKON 1 J2"));
+    assert_eq!(lens_get(&em2, "LensDataVersion"), Some(str_val("0401")));
+    assert_eq!(
+      lens_get(&em2, "LensModel"),
+      Some(str_val("1 NIKKOR VR 10-30mm f/3.5-5.6"))
+    );
+  }
+
+  /// `LensDataVersion 0402` decodes `LensModel` (`string[64]`) at offset 0x18b,
+  /// and `0403` at offset 0x2ac — the per-version offsets matter. Byte-exact to
+  /// the `perl exiftool` oracle.
+  #[test]
+  fn lens_data_0402_0403_decode_lens_model() {
+    let model402 = b"1 NIKKOR 11-27.5mm f/3.5-5.6";
+    let mut p402 = std::vec![0u8; 0x18b + 64];
+    p402[0..4].copy_from_slice(b"0402");
+    p402
+      .get_mut(0x18b..0x18b + model402.len())
+      .unwrap()
+      .copy_from_slice(model402);
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&p402)),
+      ByteOrder::Big,
+      Some("NIKON 1 J3"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0402")));
+    assert_eq!(
+      lens_get(&em, "LensModel"),
+      Some(str_val("1 NIKKOR 11-27.5mm f/3.5-5.6"))
+    );
+
+    let model403 = b"1 NIKKOR VR 10-100mm f/4-5.6";
+    let mut p403 = std::vec![0u8; 0x2ac + 64];
+    p403[0..4].copy_from_slice(b"0403");
+    p403
+      .get_mut(0x2ac..0x2ac + model403.len())
+      .unwrap()
+      .copy_from_slice(model403);
+    let (_t2, em2) = parse(
+      &type3_with_lens_data(&encrypt_lens(&p403)),
+      ByteOrder::Big,
+      Some("NIKON 1 J4"),
+    );
+    assert_eq!(lens_get(&em2, "LensDataVersion"), Some(str_val("0403")));
+    assert_eq!(
+      lens_get(&em2, "LensModel"),
+      Some(str_val("1 NIKKOR VR 10-100mm f/4-5.6"))
+    );
+  }
+
+  /// `LensDataVersion 080[012]` (Z6/Z7/Z9) dispatches to `%LensData0800` and,
+  /// when the forward-looking `OldLensData` flag is SET (the `undef[17]` at 0x03
+  /// is NOT `/^.\0+$/`), decodes the LEGACY block (offsets 0x04-0x14, a second
+  /// +1 shift). Byte-exact to the `perl exiftool` oracle.
+  #[test]
+  fn lens_data_0800_old_block_decodes() {
+    let mut plain = [0u8; 0x15];
+    plain[0..4].copy_from_slice(b"0800");
+    plain[0x04] = 0x40; // ExitPupilPosition → "32.0 mm"
+    plain[0x05] = 0x18; // AFAperture → "2.0"
+    plain[0x0b] = 0x14; // FocusDistance → "0.03 m"
+    plain[0x0c] = 0x76; // FocalLength → "151.0 mm"
+    plain[0x0d] = 0x18; // LensIDNumber 24
+    plain[0x0e] = 0x18; // LensFStops → "2.00"
+    plain[0x0f] = 0x18; // MinFocalLength → "10.0 mm"
+    plain[0x10] = 0x18; // MaxFocalLength → "10.0 mm"
+    plain[0x11] = 0x30; // MaxApertureAtMinFocal → "4.0"
+    plain[0x12] = 0x30; // MaxApertureAtMaxFocal → "4.0"
+    plain[0x13] = 0x07; // MCUVersion 7
+    plain[0x14] = 0x42; // EffectiveMaxAperture → "6.7"
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&plain)),
+      ByteOrder::Big,
+      Some("NIKON Z 6"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0800")));
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert_eq!(lens_get(&em, "AFAperture"), Some(str_val("2.0")));
+    assert_eq!(lens_get(&em, "FocusDistance"), Some(str_val("0.03 m")));
+    assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("151.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+    assert_eq!(lens_get(&em, "LensFStops"), Some(str_val("2.00")));
+    assert_eq!(lens_get(&em, "MCUVersion"), Some(TagValue::I64(7)));
+    assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+  }
+
+  /// `LensDataVersion 0800` with the `OldLensData` flag CLEAR (the `undef[17]`
+  /// at 0x03 IS `/^.\0+$/` — all bytes after the lead are NUL) emits ONLY
+  /// `LensDataVersion`, NO legacy members (the `Condition => '$$self{OldLensData}'`
+  /// gate). Matches the `perl exiftool` oracle on the gate-off crafted bytes.
+  #[test]
+  fn lens_data_0800_gate_off_emits_only_version() {
+    let mut plain = [0u8; 0x15];
+    plain[0..4].copy_from_slice(b"0800");
+    // bytes 0x04.. all zero ⇒ undef[17] at 0x03 = lead + 16 NULs ⇒ flag clear.
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&plain)),
+      ByteOrder::Big,
+      Some("NIKON Z 6"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0800")));
+    for name in [
+      "ExitPupilPosition",
+      "AFAperture",
+      "FocusDistance",
+      "FocalLength",
+      "LensIDNumber",
+      "MCUVersion",
+      "EffectiveMaxAperture",
+    ] {
+      assert!(
+        lens_get(&em, name).is_none(),
+        "0800 gate-off must suppress {name}, got {em:?}"
+      );
+    }
+  }
+
+  /// `LensDataVersion 0800` NEW Z-lens telemetry (`Nikon.pm:5809-5961`): with
+  /// the legacy `OldLensData` gate CLEAR (so the legacy block is silent) but the
+  /// forward-looking `NewLensData` flag SET, the Z block (0x2f onward) decodes.
+  /// All multi-byte members are read LittleEndian (the `0800` `ByteOrder`
+  /// override). The expected rendered values were cross-checked against the
+  /// actual `Nikon.pm` PrintConv/ValueConv expressions evaluated in Perl.
+  #[test]
+  fn lens_data_0800_z_telemetry_decodes() {
+    // 0x60 bytes so the block reaches LensMountType (0x5f). 0x03..0x14 left NUL
+    // ⇒ OldLensData gate CLEAR. The Z block is filled from 0x30.
+    let mut plain = [0u8; 0x60];
+    plain[0..4].copy_from_slice(b"0800");
+    // 0x30 LensID int16u LE = 13 → "Nikkor Z 24-70mm f/2.8 S" (also makes the
+    // NewLensData undef[17] at 0x2f non-`/^.\0+$/` ⇒ flag SET, z_lens TRUE).
+    plain[0x30..0x32].copy_from_slice(&13u16.to_le_bytes());
+    // 0x34 LensFirmwareVersion int16u LE = 0x0123 (291) → "1.2.3".
+    plain[0x34..0x36].copy_from_slice(&0x0123u16.to_le_bytes());
+    // 0x36 MaxAperture int16u LE = 768 → 2**(768/384-1)=2.0 → "2.0".
+    plain[0x36..0x38].copy_from_slice(&768u16.to_le_bytes());
+    // 0x38 FNumber int16u LE = 1152 → 2**(1152/384-1)=4.0 → "4.0".
+    plain[0x38..0x3a].copy_from_slice(&1152u16.to_le_bytes());
+    // 0x3c FocalLength int16u LE = 50 → "50 mm".
+    plain[0x3c..0x3e].copy_from_slice(&50u16.to_le_bytes());
+    // 0x4c FocusDistanceRangeWidth int8u (Unknown=1) — emitted but unknown-flagged.
+    plain[0x4c] = 0x05;
+    // 0x4e FocusDistance int16u LE = 24576 → raw/256=96 → 2**((96-80)/12)=2.52 → "2.52 m".
+    plain[0x4e..0x50].copy_from_slice(&24576u16.to_le_bytes());
+    // 0x56 LensDriveEnd int8u (Unknown=1) / 0x58 FocusStepsFromInfinity (Unknown=1).
+    plain[0x56] = 0x02;
+    plain[0x58] = 0x07;
+    // 0x5a LensPositionAbsolute int32s LE = 58000 → I64(58000). NOT Unknown.
+    plain[0x5a..0x5e].copy_from_slice(&58000i32.to_le_bytes());
+    // 0x5f LensMountType int8u, Mask 0x01 = 0xf1 → masked 1 → "F-mount".
+    plain[0x5f] = 0xf1;
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&plain)),
+      ByteOrder::Big,
+      Some("NIKON Z 6"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0800")));
+    // The legacy block is gated OFF — no OldLensData members.
+    assert!(lens_get(&em, "ExitPupilPosition").is_none());
+    // Z telemetry (camera-identity, NOT unknown-flagged).
+    assert_eq!(
+      lens_get(&em, "LensID"),
+      Some(str_val("Nikkor Z 24-70mm f/2.8 S"))
+    );
+    assert_eq!(lens_get(&em, "LensFirmwareVersion"), Some(str_val("1.2.3")));
+    assert_eq!(lens_get(&em, "MaxAperture"), Some(str_val("2.0")));
+    assert_eq!(lens_get(&em, "FNumber"), Some(str_val("4.0")));
+    assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("50 mm")));
+    assert_eq!(lens_get(&em, "FocusDistance"), Some(str_val("2.52 m")));
+    assert_eq!(
+      lens_get(&em, "LensPositionAbsolute"),
+      Some(TagValue::I64(58000))
+    );
+    assert_eq!(lens_get(&em, "LensMountType"), Some(str_val("F-mount")));
+    // The three `Unknown => 1` members ARE emitted (the raw `parse()` Vec keeps
+    // them) but carry the unknown flag, so default `-j` output suppresses them.
+    for name in [
+      "FocusDistanceRangeWidth",
+      "LensDriveEnd",
+      "FocusStepsFromInfinity",
+    ] {
+      let e = em.iter().find(|e| e.name() == name);
+      assert!(
+        e.is_some_and(VendorEmission::unknown),
+        "{name} must be present and unknown-flagged: {em:?}"
+      );
+    }
+    // LensDriveEnd's STATEFUL RawConv renders the string label, not the raw byte
+    // — here 0x4c FocusDistanceRangeWidth=0x05 (non-zero) and 0x56=0x02
+    // (non-zero) ⇒ "CFD" (still unknown-flagged, so output-suppressed).
+    assert_eq!(lens_get(&em, "LensDriveEnd"), Some(str_val("CFD")));
+  }
+
+  /// The `0x56` `LensDriveEnd` stateful RawConv (`Nikon.pm:5933-5939`): `Inf`
+  /// iff `FocusDistanceRangeWidth` (0x4c) is defined and `0`;
+  /// otherwise `No` for byte `0` and `CFD` for a non-zero byte. (LensDriveEnd is
+  /// `Unknown => 1` and thus never surfaces in exifast output — `run_emission`
+  /// always drops Unknown tags — so the conversion is verified directly here.)
+  #[test]
+  fn lens_drive_end_stateful_rawconv() {
+    // FocusDistanceRangeWidth defined and 0 ⇒ "Inf", regardless of the 0x56 byte.
+    assert_eq!(lens_drive_end(0, Some(0)), "Inf");
+    assert_eq!(lens_drive_end(2, Some(0)), "Inf");
+    // FocusDistanceRangeWidth defined and non-zero ⇒ byte 0 → "No", else "CFD".
+    assert_eq!(lens_drive_end(0, Some(5)), "No");
+    assert_eq!(lens_drive_end(2, Some(5)), "CFD");
+    // FocusDistanceRangeWidth undefined (`unless defined …` ⇒ first branch) ⇒
+    // byte 0 → "No", else "CFD" (never "Inf").
+    assert_eq!(lens_drive_end(0, None), "No");
+    assert_eq!(lens_drive_end(2, None), "CFD");
+  }
+
+  /// `LensDataVersion 0800` with `NewLensData` CLEAR (the `undef[17]` at 0x2f is
+  /// `/^.\0+$/` — all bytes after the lead are NUL) suppresses the ENTIRE Z
+  /// block: no `LensID`/`MaxAperture`/`LensMountType`. Only `LensDataVersion`
+  /// (and any gated-on legacy members, here also off) survives.
+  #[test]
+  fn lens_data_0800_z_gate_off_suppresses_z_block() {
+    let mut plain = [0u8; 0x60];
+    plain[0..4].copy_from_slice(b"0800");
+    // 0x2f..0x40 all NUL ⇒ NewLensData undef[17] = lead + NULs ⇒ flag CLEAR.
+    // Put data at 0x5f to prove even the unconditional LensMountType is gated:
+    // it is NOT — LensMountType has no Condition — but with the block all-NUL it
+    // renders Z-mount (masked 0). Assert the CONDITIONAL Z members are absent.
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&plain)),
+      ByteOrder::Big,
+      Some("NIKON Z 6"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0800")));
+    for name in [
+      "LensID",
+      "LensFirmwareVersion",
+      "MaxAperture",
+      "FNumber",
+      "FocalLength",
+      "FocusDistance",
+      "LensPositionAbsolute",
+    ] {
+      assert!(
+        lens_get(&em, name).is_none(),
+        "NewLensData-clear must suppress Z member {name}, got {em:?}"
+      );
+    }
+    // LensMountType (0x5f) has NO `Condition` ⇒ it emits even with NewLensData
+    // clear (R3); the all-NUL block masks to 0 ⇒ "Z-mount".
+    assert_eq!(lens_get(&em, "LensMountType"), Some(str_val("Z-mount")));
+  }
+
+  #[test]
+  fn lens_data_0800_lens_mount_type_emits_when_new_lens_data_clear() {
+    // R3 regression: NewLensData clear (0x2f window all-NUL) but byte 0x5f set ⇒
+    // LensMountType still emits (no `Condition` in ExifTool), while the
+    // NewLensData-gated members stay suppressed.
+    let mut plain = [0u8; 0x60];
+    plain[0..4].copy_from_slice(b"0800");
+    plain[0x5f] = 0x01; // masked 0x01 ⇒ "F-mount"
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(&plain)),
+      ByteOrder::Big,
+      Some("NIKON Z 6"),
+    );
+    assert_eq!(lens_get(&em, "LensID"), None); // NewLensData-gated ⇒ suppressed
+    assert_eq!(lens_get(&em, "LensMountType"), Some(str_val("F-mount")));
+  }
+
+  /// `FocusMode` gating (`Nikon.pm:5918`/`5935`): the two `FocusMode ne
+  /// "Manual"` members (0x4c `FocusDistanceRangeWidth`, 0x56 `LensDriveEnd`) key
+  /// on the RAW on-disk `$$self{FocusMode}` string (set by tag 0x0007's
+  /// RawConv). With FocusMode exactly "Manual" their `Condition` is FALSE ⇒ they
+  /// are SUPPRESSED (not even unknown-flagged present), while the LensID-only
+  /// member 0x4e `FocusDistance` still emits.
+  #[test]
+  fn lens_data_0800_z_focus_mode_manual_gate() {
+    let mut plain = [0u8; 0x60];
+    plain[0..4].copy_from_slice(b"0800");
+    plain[0x30..0x32].copy_from_slice(&13u16.to_le_bytes()); // LensID 13 (z_lens)
+    plain[0x4c] = 0x05; // FocusDistanceRangeWidth (FocusMode-gated)
+    plain[0x4e..0x50].copy_from_slice(&24576u16.to_le_bytes()); // FocusDistance (LensID-only)
+    plain[0x56] = 0x02; // LensDriveEnd (FocusMode-gated)
+    // The crafted RAW 0x0007 string is exactly "Manual" ⇒ the gate closes.
+    let blob = type3_with_focus_mode_and_lens_data(b"Manual\x00", &encrypt_lens(&plain));
+    let (_t, em) = parse(&blob, ByteOrder::Big, Some("NIKON Z 6"));
+    // LensID-only member still emits.
+    assert_eq!(lens_get(&em, "FocusDistance"), Some(str_val("2.52 m")));
+    // FocusMode-ne-Manual members suppressed entirely (Condition false ⇒ not
+    // emitted at all, not merely unknown-flagged).
+    assert!(
+      em.iter().all(|e| e.name() != "FocusDistanceRangeWidth"),
+      "FocusMode==Manual must drop FocusDistanceRangeWidth: {em:?}"
+    );
+    assert!(
+      em.iter().all(|e| e.name() != "LensDriveEnd"),
+      "FocusMode==Manual must drop LensDriveEnd: {em:?}"
+    );
+  }
+
+  /// `$$self{FocusMode}` is POSITIONAL, not pre-scanned (`Nikon.pm:1816`: a
+  /// normal RawConv set during the IFD walk, NOT a `PrescanExif` tag). When the
+  /// `0x0098` LensData0800 is WALKED BEFORE the `0x0007 = "Manual"` entry (an
+  /// unsorted/duplicate MakerNote), the member is still `undef` at the LensData
+  /// position, so `undef ne "Manual"` is TRUE ⇒ the `FocusMode ne "Manual"` Z
+  /// members (0x4c `FocusDistanceRangeWidth`, 0x56 `LensDriveEnd`) DO emit —
+  /// matching ExifTool (a pre-scan would have WRONGLY suppressed them with the
+  /// later value). The same plaintext in tag-ID order (0x0007 first) keeps them
+  /// suppressed, proving the well-formed case is unchanged.
+  #[test]
+  fn lens_data_0800_focus_mode_after_lensdata_uses_undef() {
+    let mut plain = [0u8; 0x60];
+    plain[0..4].copy_from_slice(b"0800");
+    plain[0x30..0x32].copy_from_slice(&13u16.to_le_bytes()); // LensID 13 (native Z ⇒ NewLensData set)
+    plain[0x4c] = 0x05; // FocusDistanceRangeWidth (FocusMode-gated)
+    plain[0x4e..0x50].copy_from_slice(&24576u16.to_le_bytes()); // FocusDistance (LensID-only)
+    plain[0x56] = 0x02; // LensDriveEnd (FocusMode-gated)
+    let enc = encrypt_lens(&plain);
+
+    // LensData walked BEFORE the (later) 0x0007 = "Manual" ⇒ FocusMode is `undef`
+    // at the LensData position ⇒ the gate is OPEN ⇒ the two members emit
+    // (Unknown => 1, so present-and-unknown-flagged like the Z telemetry test).
+    let before = type3_lens_data_before_focus_mode(b"Manual\x00", &enc);
+    let (_t, em) = parse(&before, ByteOrder::Big, Some("NIKON Z 6"));
+    assert_eq!(
+      lens_get(&em, "LensID"),
+      Some(str_val("Nikkor Z 24-70mm f/2.8 S"))
+    );
+    assert_eq!(lens_get(&em, "FocusDistance"), Some(str_val("2.52 m")));
+    for name in ["FocusDistanceRangeWidth", "LensDriveEnd"] {
+      let e = em.iter().find(|e| e.name() == name);
+      assert!(
+        e.is_some_and(VendorEmission::unknown),
+        "0x0098-before-0x0007: {name} must emit (gate open via undef): {em:?}"
+      );
+    }
+
+    // The SAME plaintext in well-formed tag-ID order (0x0007 = "Manual" FIRST)
+    // closes the gate ⇒ the two members are suppressed (the existing-behavior
+    // guard for a normally-ordered MakerNote).
+    let after = type3_with_focus_mode_and_lens_data(b"Manual\x00", &enc);
+    let (_t2, em2) = parse(&after, ByteOrder::Big, Some("NIKON Z 6"));
+    assert_eq!(lens_get(&em2, "FocusDistance"), Some(str_val("2.52 m")));
+    for name in ["FocusDistanceRangeWidth", "LensDriveEnd"] {
+      assert!(
+        em2.iter().all(|e| e.name() != name),
+        "tag-ID order with FocusMode==Manual must drop {name}: {em2:?}"
+      );
+    }
+  }
+
+  /// An UNRECOGNIZED `LensDataVersion` (e.g. `9999`) falls through to the
+  /// `LensDataUnknown` arm (`Nikon.pm:2890`) — it emits ONLY `LensDataVersion`
+  /// (no members, no panic), matching the `perl exiftool` oracle. This is the
+  /// "no version silently dropped" guarantee for future/unknown versions.
+  #[test]
+  fn lens_data_unknown_version_emits_only_version() {
+    let plain = b"9999\xaa\xbb\xcc\xdd\xee\xff";
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(plain)),
+      ByteOrder::Big,
+      Some("NIKON D9999"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("9999")));
+    // No `LensData*` member tags beyond the version.
+    let member_names = [
+      "ExitPupilPosition",
+      "AFAperture",
+      "FocusPosition",
+      "FocusDistance",
+      "FocalLength",
+      "LensIDNumber",
+      "LensFStops",
+      "MCUVersion",
+      "EffectiveMaxAperture",
+      "LensModel",
+    ];
+    for name in member_names {
+      assert!(
+        lens_get(&em, name).is_none(),
+        "LensDataUnknown must emit no {name}"
+      );
+    }
+  }
+
+  /// THE OLD BUG, FIXED: before the version-dispatch completion, ANY
+  /// `LensDataVersion` above `0203` (here `0204`) returned from `emit_lens_data`
+  /// WITHOUT EMITTING ANYTHING — not even `LensDataVersion`. Now every readable
+  /// `0x0098` block emits at least `LensDataVersion`. This asserts the
+  /// regression directly: a `>0203` version is NEVER silent.
+  #[test]
+  fn lens_data_above_0203_is_never_silent() {
+    for ver in [b"0204", b"0400", b"0402", b"0403", b"0800", b"9999"] {
+      // A minimal block: just the version + a few body bytes (enough to be a
+      // readable 4-byte version; members may or may not decode, but the version
+      // MUST always appear).
+      let mut plain = [0u8; 8];
+      plain[0..4].copy_from_slice(ver);
+      let (_t, em) = parse(
+        &type3_with_lens_data(&encrypt_lens(&plain)),
+        ByteOrder::Big,
+        Some("NIKON D7000"),
+      );
+      let v = String::from_utf8_lossy(ver).into_owned();
+      assert_eq!(
+        lens_get(&em, "LensDataVersion"),
+        Some(str_val(&v)),
+        "version {v} must emit LensDataVersion (the old-bug-fixed guarantee)"
+      );
+    }
+  }
+
+  /// Bounds-safety: a TRUNCATED encrypted block (version present, body cut
+  /// short before a version's member offsets) emits `LensDataVersion` and never
+  /// panics — the per-member `get`/`get(..len)` reads simply skip absent
+  /// members. Covers the `string[64]` member running past a short block too.
+  #[test]
+  fn lens_data_truncated_block_no_panic() {
+    // 0204 with only 6 bytes (version + 2 body bytes): most members are absent.
+    let plain = b"0204\x40\x18";
+    let (_t, em) = parse(
+      &type3_with_lens_data(&encrypt_lens(plain)),
+      ByteOrder::Big,
+      Some("NIKON D7000"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0204")));
+    // ExitPupilPosition (0x04) is present; the later members are not — no panic.
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert!(lens_get(&em, "EffectiveMaxAperture").is_none());
+
+    // 0400 whose block is far shorter than the 0x18a LensModel offset: the
+    // string read is skipped, only LensDataVersion emits, no panic.
+    let short0400 = b"0400\x00\x00\x00\x00";
+    let (_t2, em2) = parse(
+      &type3_with_lens_data(&encrypt_lens(short0400)),
+      ByteOrder::Big,
+      Some("NIKON 1 J1"),
+    );
+    assert_eq!(lens_get(&em2, "LensDataVersion"), Some(str_val("0400")));
+    assert!(lens_get(&em2, "LensModel").is_none());
+  }
+
+  /// REGRESSION GUARD: the unencrypted `0101` (D70/D70s) path is unchanged by
+  /// the version-dispatch refactor — it still decodes `%LensData01` members from
+  /// the CLEARTEXT block (no keys needed). A representative member decodes to
+  /// the oracle value.
+  #[test]
+  fn lens_data_0101_unencrypted_unchanged() {
+    // Cleartext 0101 block (unencrypted): a value at FocalLength (0x0a).
+    let mut plain = [0u8; 0x13];
+    plain[0..4].copy_from_slice(b"0101");
+    plain[0x0a] = 0x76; // FocalLength raw 118 → "151.0 mm"
+    plain[0x0b] = 0x18; // LensIDNumber 24
+    // NOTE: 0101 is UNENCRYPTED — feed the cleartext block directly.
+    let (_t, em) = parse(
+      &type3_with_lens_data(&plain),
+      ByteOrder::Big,
+      Some("NIKON D70"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0101")));
+    assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("151.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+  }
+
+  /// The set of `LensData*` member tag names — used by the encrypted-no-decode
+  /// regression tests to assert that NOTHING (not even `LensDataVersion`) is
+  /// emitted when `ProcessNikonEncrypted` would return 0.
+  const LENS_MEMBER_NAMES: [&str; 11] = [
+    "LensDataVersion",
+    "ExitPupilPosition",
+    "AFAperture",
+    "FocusPosition",
+    "FocusDistance",
+    "FocalLength",
+    "LensIDNumber",
+    "LensFStops",
+    "MCUVersion",
+    "EffectiveMaxAperture",
+    "LensModel",
+  ];
+
+  /// Build a type-3 Nikon blob with a `0x0098` LensData value but NO 0x001d /
+  /// 0x00a7 — so `scan_decrypt_keys` finds no ShutterCount and returns `None`.
+  /// A single out-of-line `0x0098` entry; no SerialNumber, no ShutterCount.
+  fn type3_lens_data_only(lens_block: &[u8]) -> Vec<u8> {
+    let n_entries: u16 = 1;
+    let off_lens: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4; // embedded-relative
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    b.extend_from_slice(&0x0098u16.to_be_bytes()); // LensData, undef, out-of-line
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(lens_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(lens_block);
+    b
+  }
+
+  /// An ENCRYPTED `0204` LensData with NO ShutterCount (0x00a7) — and hence no
+  /// count key — mirrors `ProcessNikonEncrypted` returning 0
+  /// (`Nikon.pm:13948-13961`): the SubDirectory yields NO tags AT ALL, including
+  /// no `LensDataVersion`. The cleartext `string[4]` at offset 0 is read only
+  /// AFTER the key gate inside the encrypted ProcessProc, so a missing count key
+  /// suppresses the version too.
+  #[test]
+  fn encrypted_lens_data_no_shutter_count_emits_nothing() {
+    let mut plain = [0u8; 20];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40; // a would-be ExitPupilPosition, must NOT surface
+    let blob = type3_lens_data_only(&encrypt_lens(&plain));
+    let (_t, em) = parse(&blob, ByteOrder::Big, Some("NIKON D7000"));
+    for name in LENS_MEMBER_NAMES {
+      assert!(
+        lens_get(&em, name).is_none(),
+        "encrypted LensData without ShutterCount must emit no {name}"
+      );
+    }
+  }
+
+  /// A MULTI-ELEMENT ShutterCount (`int32u[2]`, prescan-rendered `"100 0"`)
+  /// fails ExifTool's `$count =~ /^\d+$/` (`Nikon.pm:13948`), so the count key
+  /// stays undefined and the encrypted `0204` LensData decrypts to nothing — no
+  /// members AND no `LensDataVersion` (the encrypted key gate fails). Taking
+  /// only the first element (`100`) would have wrongly unlocked decryption.
+  #[test]
+  fn encrypted_lens_data_multielement_shutter_count_rejected() {
+    let mut plain = [0u8; 20];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40;
+    let enc = encrypt_lens(&plain);
+    // Type-3 MakerNote: 0x0098 LensData (out-of-line) + 0x00a7 as int32u[2]
+    // (out-of-line, value `[100, 0]`). Tag-ID-ordered; NO 0x001d.
+    let n_entries: u16 = 2;
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_lens = val_emb;
+    let off_count = off_lens + enc.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    b.extend_from_slice(&0x0098u16.to_be_bytes()); // LensData, undef, out-of-line
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(enc.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    b.extend_from_slice(&0x00a7u16.to_be_bytes()); // ShutterCount, int32u[2], out-of-line
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&2u32.to_be_bytes()); // count = 2 ⇒ out-of-line
+    b.extend_from_slice(&off_count.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(&enc);
+    b.extend_from_slice(&100u32.to_be_bytes()); // count[0] = 100
+    b.extend_from_slice(&0u32.to_be_bytes()); // count[1] = 0
+    let (_t, em) = parse(&b, ByteOrder::Big, Some("NIKON D7000"));
+    for name in LENS_MEMBER_NAMES {
+      assert!(
+        lens_get(&em, name).is_none(),
+        "int32u[2] ShutterCount must reject decryption — no {name}"
+      );
+    }
+  }
+
+  /// FORMAT-AGNOSTIC key derivation: the prescan keys come from the `ReadValue`
+  /// `$val` STRING (`Nikon.pm:14122`), so an INTEGER-format `0x001d`
+  /// (`int32u 12345678` ⇒ `SerialKey("12345678") = 12345678`) and an ASCII
+  /// `0x00a7` (`string "100"` ⇒ `"100" =~ /^\d+$/` ⇒ count 100) derive the SAME
+  /// keys as the native `string 0x001d` + `int32u 0x00a7` layout. The block is
+  /// encrypted with `KEY_SERIAL`/`KEY_COUNT`, so a correct decode proves the
+  /// derivation reached exactly those keys despite the swapped storage formats.
+  #[test]
+  fn decrypt_keys_integer_serial_and_ascii_count() {
+    // Known 0204 plaintext (a subset of the dispatch test's field set).
+    let mut plain = [0u8; 20];
+    plain[0..4].copy_from_slice(b"0204");
+    plain[0x04] = 0x40; // ExitPupilPosition → "32.0 mm"
+    plain[0x0c] = 0x18; // LensIDNumber 24
+    plain[0x13] = 0x42; // EffectiveMaxAperture → "6.7"
+    let enc = encrypt_lens(&plain); // keys: KEY_SERIAL=12345678, KEY_COUNT=100
+
+    // Type-3 IFD, tag-ID order: 0x001d as int32u (inline = 12345678), 0x0098
+    // LensData (out-of-line), 0x00a7 as ASCII "100\0" (string, inline).
+    let n_entries: u16 = 3;
+    let off_lens: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4; // embedded-relative
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x001d SerialNumber — int32u (NOT a string), inline = 12345678. ReadValue
+    // renders "12345678", which SerialKey uses verbatim as the key.
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_SERIAL.to_be_bytes());
+    // 0x0098 LensData — undef, out-of-line.
+    b.extend_from_slice(&0x0098u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&(enc.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_lens.to_be_bytes());
+    // 0x00a7 ShutterCount — string "100\0" (ASCII digits, NOT int32u), inline.
+    // ReadValue NUL-trims to "100", which matches /^\d+$/ ⇒ count 100.
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&4u32.to_be_bytes()); // 4 bytes ⇒ inline
+    b.extend_from_slice(b"100\x00");
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(&enc);
+    let (_t, em) = parse(&b, ByteOrder::Big, Some("NIKON D7000"));
+    // Decoded ⇒ the integer serial + ASCII count derived KEY_SERIAL/KEY_COUNT.
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0204")));
+    assert_eq!(lens_get(&em, "ExitPupilPosition"), Some(str_val("32.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+    assert_eq!(lens_get(&em, "EffectiveMaxAperture"), Some(str_val("6.7")));
+
+    // Cross-check the helpers in isolation: the integer 0x001d renders the digit
+    // string SerialKey keys on, and the ASCII "100" passes the count /^\d+$/.
+    assert_eq!(
+      decrypt::serial_key("12345678", Some("NIKON D7000")),
+      Some(KEY_SERIAL)
+    );
+    let ascii_count = ParsedValue::new(RawValue::Text {
+      text: "100".into(),
+      raw: Box::from(&b"100"[..]),
+    });
+    assert_eq!(ascii_count.single_digit_count(), Some(KEY_COUNT));
+  }
+
+  /// REGRESSION GUARD (the key gate is ENCRYPTED-ONLY): an UNENCRYPTED `0101`
+  /// LensData with NO SerialNumber (0x001d) and NO ShutterCount (0x00a7) STILL
+  /// emits `LensDataVersion` + its members — `0100`/`0101` use plain
+  /// `ProcessBinaryData` (`Nikon.pm:2818`/`2823`, no `ProcessProc`), which has no
+  /// key check. Proves Finding 1's gate does not over-suppress the unencrypted
+  /// layouts.
+  #[test]
+  fn unencrypted_lens_data_0101_emits_without_keys() {
+    let mut plain = [0u8; 0x13];
+    plain[0..4].copy_from_slice(b"0101");
+    plain[0x0a] = 0x76; // FocalLength raw 118 → "151.0 mm"
+    plain[0x0b] = 0x18; // LensIDNumber 24
+    // UNENCRYPTED — cleartext block, NO 0x001d / 0x00a7 in the IFD.
+    let (_t, em) = parse(
+      &type3_lens_data_only(&plain),
+      ByteOrder::Big,
+      Some("NIKON D70"),
+    );
+    assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0101")));
+    assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("151.0 mm")));
+    assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
   }
 }

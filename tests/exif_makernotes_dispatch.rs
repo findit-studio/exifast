@@ -4070,8 +4070,9 @@ fn canon_0x28_count_zero_no_trailing_decode() {
 
 /// Nikon.nef (D70 NEF, type-3 embedded-TIFF MakerNote). The ported
 /// `%Nikon::Main` scalars + the unencrypted `ColorBalance0103`
-/// (WB_RGBGLevels) match the oracle; the deferred encrypted children
-/// (LensData/etc.) stay absent without a bogus parent. Make/Model from IFD0.
+/// (WB_RGBGLevels) + the UNENCRYPTED `LensData0101` (0x0098) children match
+/// the oracle; the deferred ENCRYPTED sub-tables (ShotInfo/FlashInfo) stay
+/// absent without a bogus parent. Make/Model from IFD0.
 #[cfg(feature = "json")]
 #[test]
 fn real_fixture_nikon_nef_makernotes() {
@@ -4106,19 +4107,28 @@ fn real_fixture_nikon_nef_makernotes() {
       ("Nikon:RawImageCenter", r#""1520 1008""#),
       ("Nikon:SensorPixelSize", r#""7.8 x 7.8 um""#),
       ("Nikon:Saturation", r#""Normal""#),
+      // LensData0101 (UNENCRYPTED, walked): the full member set.
+      ("Nikon:LensDataVersion", r#""0101""#),
+      ("Nikon:ExitPupilPosition", r#""102.4 mm""#),
+      ("Nikon:AFAperture", "3.6"),
+      ("Nikon:FocusPosition", r#""0xf1""#),
+      ("Nikon:FocusDistance", r#""2.37 m""#),
+      ("Nikon:FocalLength", r#""18.3 mm""#),
+      ("Nikon:LensIDNumber", "127"),
+      ("Nikon:LensFStops", "5.33"),
+      ("Nikon:MinFocalLength", r#""18.3 mm""#),
+      ("Nikon:MaxFocalLength", r#""71.3 mm""#),
+      ("Nikon:MaxApertureAtMinFocal", "3.6"),
+      ("Nikon:MaxApertureAtMaxFocal", "4.5"),
+      ("Nikon:MCUVersion", "132"),
+      ("Nikon:EffectiveMaxAperture", "3.6"),
     ],
   );
-  // The DEFERRED ENCRYPTED sub-tables (LensData 0x0098 / ShotInfo 0x0091 /
-  // FlashInfo 0x00a8) are oracle-only — neither the bogus parent NOR the
-  // (un-decrypted) children are emitted (#177/#223).
-  for absent in [
-    "Nikon:LensData",        // bogus parent
-    "Nikon:LensDataVersion", // encrypted child
-    "Nikon:FocusDistance",
-    "Nikon:LensIDNumber",
-    "Nikon:ShotInfo",
-    "Nikon:FlashInfo",
-  ] {
+  // The DEFERRED ENCRYPTED sub-tables (ShotInfo 0x0091 / FlashInfo 0x00a8)
+  // stay oracle-only — neither the bogus parent NOR the (un-decrypted)
+  // children are emitted (#177/#223). The LensData PARENT pointer is likewise
+  // never emitted (only its decoded children, above).
+  for absent in ["Nikon:LensData", "Nikon:ShotInfo", "Nikon:FlashInfo"] {
     assert!(
       !map.contains_key(absent),
       "deferred/bogus key {absent} must be absent"
@@ -4315,8 +4325,13 @@ fn canon_223_second_pass_subdir_parents_suppressed() {
 }
 
 /// NikonD2Hs.jpg (type-3) — exercises the FlashType empty string, the
-/// `ColorSpace` hash, AFInfo (BigEndian DSLR path) + the deferred ENCRYPTED
-/// ColorBalance (WB_RGGBLevels) which must NOT appear.
+/// `ColorSpace` hash, AFInfo (BigEndian DSLR path), the deferred ENCRYPTED
+/// ColorBalance (WB_RGGBLevels) which must NOT appear, AND — the headline of
+/// this PR — the ENCRYPTED `LensData0201` block: decrypted with serial key
+/// `3001006` + count `2`, then decoded against `%LensData01` to LensIDNumber
+/// 118 / LensFStops 7.33 / FocalLength 50.4 mm etc. A wrong serial/count key
+/// or a wrong cipher would decode garbage, not these exact oracle values, so
+/// this test is the decrypt's end-to-end proof.
 #[cfg(feature = "json")]
 #[test]
 fn real_fixture_nikon_d2hs_makernotes() {
@@ -4344,17 +4359,39 @@ fn real_fixture_nikon_d2hs_makernotes() {
       ("Nikon:AFAreaMode", r#""Single Area""#),
       ("Nikon:AFPointsInFocus", r#""Center""#),
       ("Nikon:HighISONoiseReduction", r#""Normal""#),
+      // LensData0201 (ENCRYPTED → DECRYPTED with serial 3001006 / count 2,
+      // then `%LensData01`). These prove the Decrypt + SerialKey are correct.
+      ("Nikon:LensDataVersion", r#""0201""#),
+      ("Nikon:ExitPupilPosition", r#""60.2 mm""#),
+      ("Nikon:AFAperture", "1.9"),
+      ("Nikon:FocusPosition", r#""0x11""#),
+      ("Nikon:FocusDistance", r#""0.71 m""#),
+      ("Nikon:FocalLength", r#""50.4 mm""#),
+      ("Nikon:LensIDNumber", "118"),
+      ("Nikon:LensFStops", "7.33"),
+      ("Nikon:MinFocalLength", r#""50.4 mm""#),
+      ("Nikon:MaxFocalLength", r#""50.4 mm""#),
+      ("Nikon:MaxApertureAtMinFocal", "1.8"),
+      ("Nikon:MaxApertureAtMaxFocal", "1.8"),
+      ("Nikon:MCUVersion", "122"),
+      ("Nikon:EffectiveMaxAperture", "1.8"),
     ],
   );
   // The D2Hs ColorBalance is the ENCRYPTED 0206 variant ⇒ WB_RGGBLevels is
-  // deferred (oracle-only), and no bogus ColorBalance parent is emitted.
+  // deferred (oracle-only), and no bogus ColorBalance / LensData parent is
+  // emitted.
   assert!(!map.contains_key("Nikon:WB_RGGBLevels"));
   assert!(!map.contains_key("Nikon:ColorBalance"));
+  assert!(!map.contains_key("Nikon:LensData"));
 }
 
 /// NikonD70.jpg (type-3) — exercises the `FlashExposureComp` PrintFraction
-/// (`-5/3`) and `ExposureDifference` (`%+.1f` → `-4.9`), plus the title-cased
-/// `FlashType` ("Built-in,TTL") + the unencrypted WB_RGBGLevels.
+/// (`-5/3`) and `ExposureDifference` (`%+.1f` → `-4.9`), the title-cased
+/// `FlashType` ("Built-in,TTL"), the unencrypted WB_RGBGLevels, AND the
+/// UNENCRYPTED `LensData0101` children. The D70 SerialNumber is the STRING
+/// `"No= 20025585"` (→ `SerialKey` 0x60), but LensData0101 is unencrypted so
+/// the key is unused here — the FocalLength 56.6 mm / SerialNumber-string path
+/// still decodes correctly.
 #[cfg(feature = "json")]
 #[test]
 fn real_fixture_nikon_d70_makernotes() {
@@ -4376,6 +4413,21 @@ fn real_fixture_nikon_d70_makernotes() {
       ("Nikon:WB_RGBGLevels", r#""597 256 361 256""#),
       ("Nikon:SerialNumber", r#""No= 20025585""#),
       ("Nikon:Saturation", r#""Enhanced""#),
+      // LensData0101 (UNENCRYPTED, walked): the D70's FocalLength is 56.6 mm.
+      ("Nikon:LensDataVersion", r#""0101""#),
+      ("Nikon:ExitPupilPosition", r#""89.0 mm""#),
+      ("Nikon:AFAperture", "4.6"),
+      ("Nikon:FocusPosition", r#""0x21""#),
+      ("Nikon:FocusDistance", r#""0.63 m""#),
+      ("Nikon:FocalLength", r#""56.6 mm""#),
+      ("Nikon:LensIDNumber", "127"),
+      ("Nikon:LensFStops", "5.33"),
+      ("Nikon:MinFocalLength", r#""18.3 mm""#),
+      ("Nikon:MaxFocalLength", r#""71.3 mm""#),
+      ("Nikon:MaxApertureAtMinFocal", "3.6"),
+      ("Nikon:MaxApertureAtMaxFocal", "4.5"),
+      ("Nikon:MCUVersion", "132"),
+      ("Nikon:EffectiveMaxAperture", "4.5"),
     ],
   );
   assert!(!map.contains_key("Nikon:LensData"));

@@ -18,15 +18,29 @@
 //! - `ColorBalance0103` (0x0097 `0103` variant, `Nikon.pm:2980`/
 //!   `Nikon.pm` `%ColorBalance3`) — D70/D70s, UNENCRYPTED, `Start =>
 //!   '$valuePtr + 20'`, 4×int16u → WB_RGBGLevels. WALKED.
+//! - `LensData` (0x0098, `%Nikon::LensData00`/`LensData01`/…,
+//!   `Nikon.pm:5456`/`5497`/`5582`+) — a `ProcessBinaryData` table
+//!   version-dispatched on the 4-byte `LensDataVersion` prefix
+//!   (`Nikon.pm:2814-2899`). `0100`/`0101` are UNENCRYPTED; `020[1-3]`/`0204`/
+//!   `040[01]`/`0402`/`0403`/`080[012]` are decrypted ([`super::decrypt`]) then
+//!   read against their version table with `DecryptStart => 4`. Any other
+//!   version falls through to `LensDataUnknown` (version-only). WALKED →
+//!   LensIDNumber, LensFStops, MaxAperture*, FocalLength*, LensModel, etc.
+//!   ([`LENS_DATA_00`]/[`LENS_DATA_01`]/[`LENS_DATA_0204`]/[`LENS_DATA_0400`]/
+//!   [`LENS_DATA_0402`]/[`LENS_DATA_0403`]/[`LENS_DATA_0800_OLD`]).
 //!
-//! ## Deferred (encrypted — need `Nikon::Decrypt`, a follow-up issue)
+//! ## Deferred (encrypted — need the remaining `ProcessNikonEncrypted` tables)
 //!
-//! `LensData` (0x0098), `ShotInfo*` (0x0091), `FlashInfo*` (0x00a8), and the
-//! ENCRYPTED `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) are
+//! `ShotInfo*` (0x0091), `FlashInfo*` (0x00a8), and the ENCRYPTED
+//! `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) are
 //! `ProcessNikonEncrypted` sub-tables keyed on the SerialNumber +
 //! ShutterCount XOR keystream (`Nikon.pm:13604` `Decrypt`). They carry a
 //! deferred [`SubTable`] marker so the parent is NOT emitted (the #177/#223
-//! bogus-parent rule), and their decrypted children stay unported here.
+//! bogus-parent rule), and their decrypted children stay unported here (a
+//! committed Phase 2 follow-up). The `%LensData0800` NEW Z-lens block (offsets
+//! 0x2f onward — int16u `LensID`/`MaxAperture`/`FNumber` + the
+//! `FocusMode`-gated focus telemetry) likewise stays a follow-up; its
+//! `LensDataVersion` + legacy OldLensData fields ARE emitted.
 
 #![deny(clippy::indexing_slicing)]
 
@@ -427,6 +441,167 @@ pub struct AfInfoEntry {
   pub format: crate::exif::ifd::Format,
 }
 
+/// How a `%Nikon::LensData*` member's bytes are read off the (decrypted) block.
+/// The vast majority are the table default `FORMAT => 'int8u'` (a single byte),
+/// but the newer `040x`/`0402`/`0403` tables carry a `LensModel`
+/// `Format => 'string[64]'` at a large offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensRead {
+  /// A single `int8u` at the member's byte offset (the table default
+  /// `FORMAT => 'int8u'`).
+  Byte,
+  /// `Format => 'string[N]'` — `N` bytes read as an ASCII string (NUL-truncated
+  /// per `ReadValue`'s `s/\0.*//s`). Only `LensModel` uses it (`N = 64`).
+  Str(usize),
+}
+
+/// One `%Nikon::LensData*` binary-data position. Most members are a single
+/// `int8u` ([`LensRead::Byte`], the table's default `FORMAT => 'int8u'`), so the
+/// offset is the byte index; the `040x`/`0402`/`0403` `LensModel` member is a
+/// `string[64]` ([`LensRead::Str`]).
+#[derive(Debug, Clone, Copy)]
+pub struct LensDataEntry {
+  /// Byte offset within the LensData blob (the `ProcessBinaryData` index,
+  /// relative to the start of the block including the version prefix).
+  pub offset: usize,
+  /// Tag `Name`.
+  pub name: &'static str,
+  /// Conversion ([`NikonConv`]) for this member.
+  pub conv: NikonConv,
+  /// How the member's bytes are read ([`LensRead::Byte`] for the int8u default).
+  pub read: LensRead,
+}
+
+/// `const`-fn `int8u` LensData member (the table-default `FORMAT => 'int8u'`).
+const fn lens(offset: usize, name: &'static str, conv: NikonConv) -> LensDataEntry {
+  LensDataEntry {
+    offset,
+    name,
+    conv,
+    read: LensRead::Byte,
+  }
+}
+
+/// `const`-fn `string[len]` LensData member (`LensModel`, `Format =>
+/// 'string[64]'`). Read as a NUL-truncated ASCII string ([`LensRead::Str`]).
+const fn lens_str(offset: usize, name: &'static str, len: usize) -> LensDataEntry {
+  LensDataEntry {
+    offset,
+    name,
+    conv: NikonConv::Raw,
+    read: LensRead::Str(len),
+  }
+}
+
+/// `%Image::ExifTool::Nikon::LensData00` (`Nikon.pm:5456-5494`) — the
+/// `LensDataVersion 0100` layout (D100, D1X firmware 1.1). UNENCRYPTED. All
+/// members `int8u`; `LensDataVersion` (offset 0) is read separately as the
+/// 4-byte version string. Big-endian (no table `ByteOrder` override ⇒ the
+/// in-effect `GetByteOrder` of the parent MakerNote IFD, which is the embedded
+/// TIFF's order; single-byte members are order-agnostic anyway).
+pub const LENS_DATA_00: &[LensDataEntry] = &[
+  lens(0x06, "LensIDNumber", NikonConv::Raw),
+  lens(0x07, "LensFStops", NikonConv::LensDataFStops),
+  lens(0x08, "MinFocalLength", NikonConv::LensDataFocal),
+  lens(0x09, "MaxFocalLength", NikonConv::LensDataFocal),
+  lens(0x0a, "MaxApertureAtMinFocal", NikonConv::LensDataAperture),
+  lens(0x0b, "MaxApertureAtMaxFocal", NikonConv::LensDataAperture),
+  lens(0x0c, "MCUVersion", NikonConv::Raw),
+];
+
+/// `%Image::ExifTool::Nikon::LensData01` (`Nikon.pm:5497-5580`) — the
+/// `LensDataVersion 0101` (D70/D70s, UNENCRYPTED) AND `020[1-3]` (D200, D2Hs,
+/// D2X, D40/D40X/D80, D300 — ENCRYPTED, decrypted before this walk) layout.
+/// All members `int8u`; `LensDataVersion` (offset 0) is read separately as the
+/// 4-byte version string. The `LensFStops` here (offset 0x0c) is `$val / 12`
+/// ([`NikonConv::LensDataFStops`]), DISTINCT from the 0x008b `LensFStops`.
+pub const LENS_DATA_01: &[LensDataEntry] = &[
+  lens(0x04, "ExitPupilPosition", NikonConv::ExitPupilPosition),
+  lens(0x05, "AFAperture", NikonConv::LensDataAperture),
+  lens(0x08, "FocusPosition", NikonConv::FocusPosition),
+  lens(0x09, "FocusDistance", NikonConv::FocusDistance),
+  lens(0x0a, "FocalLength", NikonConv::LensDataFocal),
+  lens(0x0b, "LensIDNumber", NikonConv::Raw),
+  lens(0x0c, "LensFStops", NikonConv::LensDataFStops),
+  lens(0x0d, "MinFocalLength", NikonConv::LensDataFocal),
+  lens(0x0e, "MaxFocalLength", NikonConv::LensDataFocal),
+  lens(0x0f, "MaxApertureAtMinFocal", NikonConv::LensDataAperture),
+  lens(0x10, "MaxApertureAtMaxFocal", NikonConv::LensDataAperture),
+  lens(0x11, "MCUVersion", NikonConv::Raw),
+  lens(0x12, "EffectiveMaxAperture", NikonConv::LensDataAperture),
+];
+
+/// `%Image::ExifTool::Nikon::LensData0204` (`Nikon.pm:5582-5665`) — the
+/// `LensDataVersion 0204` layout (D90, D7000). ENCRYPTED (`DecryptStart => 4`,
+/// `Nikon.pm:2846`); decrypted before this walk. Same members as
+/// [`LENS_DATA_01`] but with an EXTRA byte inserted at offset 0x09
+/// (`Nikon.pm:5616`), so every member from `FocusDistance` onward is shifted +1
+/// (FocusDistance 0x09→0x0a, FocalLength 0x0a→0x0b, …, EffectiveMaxAperture
+/// 0x12→0x13). All members `int8u`.
+pub const LENS_DATA_0204: &[LensDataEntry] = &[
+  lens(0x04, "ExitPupilPosition", NikonConv::ExitPupilPosition),
+  lens(0x05, "AFAperture", NikonConv::LensDataAperture),
+  lens(0x08, "FocusPosition", NikonConv::FocusPosition),
+  lens(0x0a, "FocusDistance", NikonConv::FocusDistance),
+  lens(0x0b, "FocalLength", NikonConv::LensDataFocal),
+  lens(0x0c, "LensIDNumber", NikonConv::Raw),
+  lens(0x0d, "LensFStops", NikonConv::LensDataFStops),
+  lens(0x0e, "MinFocalLength", NikonConv::LensDataFocal),
+  lens(0x0f, "MaxFocalLength", NikonConv::LensDataFocal),
+  lens(0x10, "MaxApertureAtMinFocal", NikonConv::LensDataAperture),
+  lens(0x11, "MaxApertureAtMaxFocal", NikonConv::LensDataAperture),
+  lens(0x12, "MCUVersion", NikonConv::Raw),
+  lens(0x13, "EffectiveMaxAperture", NikonConv::LensDataAperture),
+];
+
+/// `%Image::ExifTool::Nikon::LensData0400` (`Nikon.pm:5668-5681`) — the
+/// `LensDataVersion 040[01]` layout (Nikon 1 J1/V1/J2). ENCRYPTED
+/// (`DecryptStart => 4`). The only readable member besides `LensDataVersion` is
+/// `LensModel` (`Format => 'string[64]'`) at offset 0x18a.
+pub const LENS_DATA_0400: &[LensDataEntry] = &[lens_str(0x18a, "LensModel", 64)];
+
+/// `%Image::ExifTool::Nikon::LensData0402` (`Nikon.pm:5683-5697`) — the
+/// `LensDataVersion 0402` layout (Nikon 1 J3/S1/V2). ENCRYPTED
+/// (`DecryptStart => 4`). `LensModel` (`string[64]`) at offset 0x18b.
+pub const LENS_DATA_0402: &[LensDataEntry] = &[lens_str(0x18b, "LensModel", 64)];
+
+/// `%Image::ExifTool::Nikon::LensData0403` (`Nikon.pm:5699-5713`) — the
+/// `LensDataVersion 0403` layout (Nikon 1 J4/J5). ENCRYPTED
+/// (`DecryptStart => 4`). `LensModel` (`string[64]`) at offset 0x2ac.
+pub const LENS_DATA_0403: &[LensDataEntry] = &[lens_str(0x2ac, "LensModel", 64)];
+
+/// `%Image::ExifTool::Nikon::LensData0800` OldLensData block
+/// (`Nikon.pm:5716-5808`) — the `LensDataVersion 080[012]` layout (Z6/Z7/Z9).
+/// ENCRYPTED (`DecryptStart => 4`, **`ByteOrder => 'LittleEndian'`**).
+///
+/// This table ports the LEGACY `$$self{OldLensData}` block (offsets 0x04-0x14),
+/// which is structurally [`LENS_DATA_0204`] shifted +1 again (a second extra
+/// byte at 0x08, `Nikon.pm:5745`) and gated on the forward-looking
+/// `OldLensData` flag (`Nikon.pm:5726-5731`: set unless the `undef[17]` at 0x03
+/// is `/^.\0+$/`). All these members are `int8u`, so the LittleEndian table
+/// order does not change their single-byte reads.
+///
+/// The NEWER Z-lens block (offsets 0x2f onward — `NewLensData`, `LensID` int16u
+/// with a ~90-entry PrintConv, `MaxAperture`/`FNumber`/`FocalLength` int16u, the
+/// `FocusMode`-gated focus telemetry) is a committed follow-up; its multi-byte
+/// LittleEndian fields + the `LensID`/`FocusMode`/`FocusStepsFromInfinity`
+/// DATAMEMBER state machine are out of scope here. `LensDataVersion` (always)
+/// plus the OldLensData fields still emit, so no Z file is silently dropped.
+pub const LENS_DATA_0800_OLD: &[LensDataEntry] = &[
+  lens(0x04, "ExitPupilPosition", NikonConv::ExitPupilPosition),
+  lens(0x05, "AFAperture", NikonConv::LensDataAperture),
+  lens(0x0b, "FocusDistance", NikonConv::FocusDistance),
+  lens(0x0c, "FocalLength", NikonConv::LensDataFocal),
+  lens(0x0d, "LensIDNumber", NikonConv::Raw),
+  lens(0x0e, "LensFStops", NikonConv::LensDataFStops),
+  lens(0x0f, "MinFocalLength", NikonConv::LensDataFocal),
+  lens(0x10, "MaxFocalLength", NikonConv::LensDataFocal),
+  lens(0x11, "MaxApertureAtMinFocal", NikonConv::LensDataAperture),
+  lens(0x12, "MaxApertureAtMaxFocal", NikonConv::LensDataAperture),
+  lens(0x13, "MCUVersion", NikonConv::Raw),
+  lens(0x14, "EffectiveMaxAperture", NikonConv::LensDataAperture),
+];
+
 /// `const`-fn leaf-tag constructor (no sub-table, no format override).
 const fn tag(id: u16, name: &'static str, conv: NikonConv) -> NikonTag {
   NikonTag {
@@ -675,5 +850,62 @@ mod tests {
     assert_eq!(AF_INFO.first().unwrap().name, "AFAreaMode");
     assert_eq!(AF_INFO.get(1).unwrap().name, "AFPoint");
     assert_eq!(AF_INFO.get(2).unwrap().name, "AFPointsInFocus");
+  }
+
+  /// The ported LensData version tables exist with the faithful
+  /// (`Nikon.pm`-cited) member offsets. `LensData0204` is the +1-shifted
+  /// `%LensData01` (extra byte at 0x09, `Nikon.pm:5616`); the `040x`/`0402`/
+  /// `0403` tables carry the single `LensModel` `string[64]` at their per-version
+  /// offset; `0800`'s legacy block runs 0x04-0x14.
+  #[test]
+  fn lens_data_version_tables_offsets() {
+    // 0204 — 13 members, EffectiveMaxAperture last at 0x13.
+    assert_eq!(LENS_DATA_0204.len(), 13);
+    assert_eq!(LENS_DATA_0204.first().unwrap().name, "ExitPupilPosition");
+    assert_eq!(LENS_DATA_0204.first().unwrap().offset, 0x04);
+    let eff = LENS_DATA_0204.last().unwrap();
+    assert_eq!(eff.name, "EffectiveMaxAperture");
+    assert_eq!(eff.offset, 0x13);
+    // The +1 shift relative to LENS_DATA_01: FocusDistance 0x09→0x0a.
+    let fd01 = LENS_DATA_01
+      .iter()
+      .find(|p| p.name == "FocusDistance")
+      .unwrap();
+    let fd04 = LENS_DATA_0204
+      .iter()
+      .find(|p| p.name == "FocusDistance")
+      .unwrap();
+    assert_eq!(fd01.offset, 0x09);
+    assert_eq!(fd04.offset, 0x0a);
+
+    // 040x / 0402 / 0403 — one LensModel string[64] member at the per-version
+    // offset.
+    for (table, off) in [
+      (LENS_DATA_0400, 0x18a),
+      (LENS_DATA_0402, 0x18b),
+      (LENS_DATA_0403, 0x2ac),
+    ] {
+      assert_eq!(table.len(), 1);
+      let m = table.first().unwrap();
+      assert_eq!(m.name, "LensModel");
+      assert_eq!(m.offset, off);
+      assert_eq!(m.read, LensRead::Str(64));
+    }
+
+    // 0800 legacy block — 12 members, the second +1 shift (FocusDistance 0x0b).
+    assert_eq!(LENS_DATA_0800_OLD.len(), 12);
+    assert_eq!(
+      LENS_DATA_0800_OLD
+        .iter()
+        .find(|p| p.name == "FocusDistance")
+        .unwrap()
+        .offset,
+      0x0b
+    );
+    assert_eq!(LENS_DATA_0800_OLD.last().unwrap().offset, 0x14);
+    // Every legacy/0204 member is a single-byte read (the table FORMAT default).
+    for p in LENS_DATA_0204.iter().chain(LENS_DATA_0800_OLD) {
+      assert_eq!(p.read, LensRead::Byte, "{} must be int8u", p.name);
+    }
   }
 }

@@ -1,0 +1,193 @@
+//! Nikon's symmetric data-block cipher (`Image::ExifTool::Nikon::Decrypt`,
+//! `Nikon.pm:13604-13638`) and the two 256-byte translation tables `@xlat`
+//! (`Nikon.pm:13555-13603`).
+//!
+//! The encrypted Nikon sub-tables (`LensData02xx`, `ShotInfo`, `FlashInfo`,
+//! encrypted `ColorBalance`) are scrambled with a stream cipher keyed by the
+//! body `SerialNumber` (0x001d) and `ShutterCount` (0x00a7). The decryption
+//! algorithm is published, so the data is recoverable.
+//!
+//! Phase 1 ports the cipher + the `SerialKey` derivation for `LensData`
+//! decoding (`super::lens_data`); the `ShotInfo`/`FlashInfo` tables stay
+//! deferred to a follow-up.
+
+/// `@xlat` (`Nikon.pm:13555-13603`) — the two 256-byte translation tables that
+/// seed the cipher state from the serial/count keys. `xlat[0]` is indexed by
+/// `serial & 0xff`, `xlat[1]` by the XOR-folded `count` key.
+const XLAT: [[u8; 256]; 2] = [
+  [
+    0xc1, 0xbf, 0x6d, 0x0d, 0x59, 0xc5, 0x13, 0x9d, 0x83, 0x61, 0x6b, 0x4f, 0xc7, 0x7f, 0x3d, 0x3d,
+    0x53, 0x59, 0xe3, 0xc7, 0xe9, 0x2f, 0x95, 0xa7, 0x95, 0x1f, 0xdf, 0x7f, 0x2b, 0x29, 0xc7, 0x0d,
+    0xdf, 0x07, 0xef, 0x71, 0x89, 0x3d, 0x13, 0x3d, 0x3b, 0x13, 0xfb, 0x0d, 0x89, 0xc1, 0x65, 0x1f,
+    0xb3, 0x0d, 0x6b, 0x29, 0xe3, 0xfb, 0xef, 0xa3, 0x6b, 0x47, 0x7f, 0x95, 0x35, 0xa7, 0x47, 0x4f,
+    0xc7, 0xf1, 0x59, 0x95, 0x35, 0x11, 0x29, 0x61, 0xf1, 0x3d, 0xb3, 0x2b, 0x0d, 0x43, 0x89, 0xc1,
+    0x9d, 0x9d, 0x89, 0x65, 0xf1, 0xe9, 0xdf, 0xbf, 0x3d, 0x7f, 0x53, 0x97, 0xe5, 0xe9, 0x95, 0x17,
+    0x1d, 0x3d, 0x8b, 0xfb, 0xc7, 0xe3, 0x67, 0xa7, 0x07, 0xf1, 0x71, 0xa7, 0x53, 0xb5, 0x29, 0x89,
+    0xe5, 0x2b, 0xa7, 0x17, 0x29, 0xe9, 0x4f, 0xc5, 0x65, 0x6d, 0x6b, 0xef, 0x0d, 0x89, 0x49, 0x2f,
+    0xb3, 0x43, 0x53, 0x65, 0x1d, 0x49, 0xa3, 0x13, 0x89, 0x59, 0xef, 0x6b, 0xef, 0x65, 0x1d, 0x0b,
+    0x59, 0x13, 0xe3, 0x4f, 0x9d, 0xb3, 0x29, 0x43, 0x2b, 0x07, 0x1d, 0x95, 0x59, 0x59, 0x47, 0xfb,
+    0xe5, 0xe9, 0x61, 0x47, 0x2f, 0x35, 0x7f, 0x17, 0x7f, 0xef, 0x7f, 0x95, 0x95, 0x71, 0xd3, 0xa3,
+    0x0b, 0x71, 0xa3, 0xad, 0x0b, 0x3b, 0xb5, 0xfb, 0xa3, 0xbf, 0x4f, 0x83, 0x1d, 0xad, 0xe9, 0x2f,
+    0x71, 0x65, 0xa3, 0xe5, 0x07, 0x35, 0x3d, 0x0d, 0xb5, 0xe9, 0xe5, 0x47, 0x3b, 0x9d, 0xef, 0x35,
+    0xa3, 0xbf, 0xb3, 0xdf, 0x53, 0xd3, 0x97, 0x53, 0x49, 0x71, 0x07, 0x35, 0x61, 0x71, 0x2f, 0x43,
+    0x2f, 0x11, 0xdf, 0x17, 0x97, 0xfb, 0x95, 0x3b, 0x7f, 0x6b, 0xd3, 0x25, 0xbf, 0xad, 0xc7, 0xc5,
+    0xc5, 0xb5, 0x8b, 0xef, 0x2f, 0xd3, 0x07, 0x6b, 0x25, 0x49, 0x95, 0x25, 0x49, 0x6d, 0x71, 0xc7,
+  ],
+  [
+    0xa7, 0xbc, 0xc9, 0xad, 0x91, 0xdf, 0x85, 0xe5, 0xd4, 0x78, 0xd5, 0x17, 0x46, 0x7c, 0x29, 0x4c,
+    0x4d, 0x03, 0xe9, 0x25, 0x68, 0x11, 0x86, 0xb3, 0xbd, 0xf7, 0x6f, 0x61, 0x22, 0xa2, 0x26, 0x34,
+    0x2a, 0xbe, 0x1e, 0x46, 0x14, 0x68, 0x9d, 0x44, 0x18, 0xc2, 0x40, 0xf4, 0x7e, 0x5f, 0x1b, 0xad,
+    0x0b, 0x94, 0xb6, 0x67, 0xb4, 0x0b, 0xe1, 0xea, 0x95, 0x9c, 0x66, 0xdc, 0xe7, 0x5d, 0x6c, 0x05,
+    0xda, 0xd5, 0xdf, 0x7a, 0xef, 0xf6, 0xdb, 0x1f, 0x82, 0x4c, 0xc0, 0x68, 0x47, 0xa1, 0xbd, 0xee,
+    0x39, 0x50, 0x56, 0x4a, 0xdd, 0xdf, 0xa5, 0xf8, 0xc6, 0xda, 0xca, 0x90, 0xca, 0x01, 0x42, 0x9d,
+    0x8b, 0x0c, 0x73, 0x43, 0x75, 0x05, 0x94, 0xde, 0x24, 0xb3, 0x80, 0x34, 0xe5, 0x2c, 0xdc, 0x9b,
+    0x3f, 0xca, 0x33, 0x45, 0xd0, 0xdb, 0x5f, 0xf5, 0x52, 0xc3, 0x21, 0xda, 0xe2, 0x22, 0x72, 0x6b,
+    0x3e, 0xd0, 0x5b, 0xa8, 0x87, 0x8c, 0x06, 0x5d, 0x0f, 0xdd, 0x09, 0x19, 0x93, 0xd0, 0xb9, 0xfc,
+    0x8b, 0x0f, 0x84, 0x60, 0x33, 0x1c, 0x9b, 0x45, 0xf1, 0xf0, 0xa3, 0x94, 0x3a, 0x12, 0x77, 0x33,
+    0x4d, 0x44, 0x78, 0x28, 0x3c, 0x9e, 0xfd, 0x65, 0x57, 0x16, 0x94, 0x6b, 0xfb, 0x59, 0xd0, 0xc8,
+    0x22, 0x36, 0xdb, 0xd2, 0x63, 0x98, 0x43, 0xa1, 0x04, 0x87, 0x86, 0xf7, 0xa6, 0x26, 0xbb, 0xd6,
+    0x59, 0x4d, 0xbf, 0x6a, 0x2e, 0xaa, 0x2b, 0xef, 0xe6, 0x78, 0xb6, 0x4e, 0xe0, 0x2f, 0xdc, 0x7c,
+    0xbe, 0x57, 0x19, 0x32, 0x7e, 0x2a, 0xd0, 0xb8, 0xba, 0x29, 0x00, 0x3c, 0x52, 0x7d, 0xa8, 0x49,
+    0x3b, 0x2d, 0xeb, 0x25, 0x49, 0xfa, 0xa3, 0xaa, 0x39, 0xa7, 0xc5, 0xa7, 0x50, 0x11, 0x36, 0xfb,
+    0xc6, 0x67, 0x4a, 0xf5, 0xa5, 0x12, 0x65, 0x7e, 0xb0, 0xdf, 0xaf, 0x4e, 0xb3, 0x61, 0x7f, 0x2f,
+  ],
+];
+
+/// Decrypt the Nikon data block `data` in place over `[start, start + len)`,
+/// keyed by `serial` and `count` — the faithful single-shot transliteration of
+/// `Image::ExifTool::Nikon::Decrypt` (`Nikon.pm:13604-13638`) for the
+/// first-call (`defined $serial and defined $count`) initialization path.
+///
+/// The cipher seeds `ci0 = xlat[0][serial & 0xff]`, `cj0 = xlat[1][key]` (where
+/// `key` is the XOR fold of the four bytes of `count`), `ck0 = 0x60`, then for
+/// each byte from `start` runs `cj = cj + ci0*ck`, `ck += 1`, `byte ^= cj` (all
+/// `u8` wrapping). It is symmetric (decrypt == encrypt), but only the read path
+/// (decrypt) is needed here.
+///
+/// `start`/`len` are clamped to `data` (the Perl `$maxLen = length - $start;
+/// $len = $maxLen if … > $maxLen`), so a short or malformed block never reads
+/// out of bounds: a `start` past the end (or `len == 0`) decrypts nothing.
+pub fn decrypt(data: &mut [u8], start: usize, len: usize, serial: u32, count: u32) {
+  if start >= data.len() {
+    return;
+  }
+  // `$maxLen = length($$dataPt) - $start; $len = $maxLen if … > $maxLen`
+  // (`Nikon.pm:13615-13616`).
+  let max_len = data.len() - start;
+  let len = len.min(max_len);
+  if len == 0 {
+    return; // `return $$dataPt if $len <= 0` (`Nikon.pm:13634`).
+  }
+  // `my $key = 0; $key ^= ($count >> ($_*8)) & 0xff foreach 0..3;`
+  // (`Nikon.pm:13620-13621`) — XOR-fold the four bytes of `count`.
+  let key =
+    (count & 0xff) ^ ((count >> 8) & 0xff) ^ ((count >> 16) & 0xff) ^ ((count >> 24) & 0xff);
+  // `$ci0 = $xlat[0][$serial & 0xff]; $cj0 = $xlat[1][$key]; $ck0 = 0x60;`
+  // (`Nikon.pm:13622-13624`). The `& 0xff` indices are always in `0..256`.
+  // `& 0xff` indices are always in `0..256`; the checked accessors satisfy the
+  // module's `deny(indexing_slicing)` (the `unwrap_or(0)` is unreachable).
+  let ci0 = XLAT
+    .first()
+    .and_then(|row| row.get((serial & 0xff) as usize))
+    .copied()
+    .unwrap_or(0);
+  let cj0 = XLAT
+    .get(1)
+    .and_then(|row| row.get((key & 0xff) as usize))
+    .copied()
+    .unwrap_or(0);
+  // First-call path (`$decryptStart` undef): `($cj, $ck) = ($cj0, $ck0)`
+  // (`Nikon.pm:13631`). The non-zero-start continuation branch is not used —
+  // every Nikon encrypted sub-table this port decodes calls `Decrypt` once
+  // with the keys and the directory's `DecryptStart`, so the parameters always
+  // initialize here.
+  let mut cj = cj0;
+  let mut ck: u8 = 0x60;
+  // `foreach $ch (@data) { $cj = ($cj + $ci0 * $ck) & 0xff; $ck = ($ck + 1) &
+  // 0xff; $ch ^= $cj; }` (`Nikon.pm:13636-13638`) — all `u8` wrapping.
+  // `len` is clamped to `data.len() - start` above, so the slice is always
+  // `Some`; `get_mut` satisfies `deny(indexing_slicing)`.
+  if let Some(slice) = data.get_mut(start..start + len) {
+    for byte in slice {
+      cj = cj.wrapping_add(ci0.wrapping_mul(ck));
+      ck = ck.wrapping_add(1);
+      *byte ^= cj;
+    }
+  }
+}
+
+/// Coerce an all-digit decimal string to the numeric key value, faithfully
+/// modeling the 64-bit Perl numeric (IV/UV) coercion the Nikon cipher keys rely
+/// on (`Nikon.pm:13620-13622`, `$count`/`$serial` used in bitwise expressions):
+/// the value as a `u64`, SATURATING at `u64::MAX` for a decimal that overflows
+/// the 64-bit range.
+///
+/// The keys consume only the LOW bits — `serial & 0xff` and `count`'s four-byte
+/// XOR fold — so the caller truncates (`as u32` → low 32 bits); this returns the
+/// full saturated `u64`. For every value a 64-bit Perl holds as an EXACT integer
+/// (`<= u64::MAX` — which covers every real `ShutterCount`/`SerialNumber` and the
+/// whole `int32u` range) the low bits are EXACT. A decimal EXCEEDING `u64::MAX`
+/// is a crafted value with NO portable oracle — Perl coerces it to an NV (double)
+/// and the NV→UV cast is platform-defined C behavior — so saturation is the
+/// chosen deterministic, panic-free approximation (and `u64::MAX as u32 =
+/// 0xffff_ffff` ⇒ count XOR-fold key 0, matching a 64-bit Perl on `2^64`-class
+/// inputs). The caller's `/^\d+$/` digit check runs BEFORE this.
+pub(super) fn digit_key_u64(digits: &[u8]) -> u64 {
+  digits.iter().fold(0u64, |acc, &b| {
+    acc.saturating_mul(10).saturating_add(u64::from(b - b'0'))
+  })
+}
+
+/// `Image::ExifTool::Nikon::SerialKey($et, $serial)` (`Nikon.pm:13644-13651`) —
+/// derive the cipher's serial-number key from the raw `SerialNumber` value.
+///
+/// - A purely-numeric serial (`/^\d+$/`, e.g. the D2Hs `3001006`) is used
+///   verbatim as the key.
+/// - A non-numeric / model-coded string serial (e.g. the D70 `"No= 20025585"`)
+///   has no usable integer, so a fixed per-model key is substituted: `0x22`
+///   for a `D50`, else `0x60` (D200, D40X, etc.).
+///
+/// Only `serial & 0xff` is consumed by [`decrypt`], so the key is returned as a
+/// `u32`. `model` is the parent IFD0 `Model` (the `D50` discriminator).
+///
+/// `serial` is the post-`ReadValue` `$val` string for the prescan `0x001d` slot
+/// (`PrescanExif`, `Nikon.pm:14122`), so it is format-agnostic: an ASCII serial
+/// is its string, while an INTEGER-format `0x001d` arrives as the rendered
+/// decimal (e.g. `int32u 12345678` ⇒ `"12345678"`) and still matches `/^\d+$/`.
+#[must_use]
+pub fn serial_key(serial: &str, model: Option<&str>) -> Option<u32> {
+  // `return $serial if … $serial =~ /^\d+$/` (`Nikon.pm:13647`) — a serial of
+  // one-or-more ASCII digits is the key itself. ExifTool uses the numeric value;
+  // only its low byte is consumed (`serial & 0xff` in [`decrypt`]), so coerce via
+  // the shared 64-bit-saturating [`digit_key_u64`] (exact low byte for every real
+  // serial; saturating beyond `u64::MAX`) and keep the low 32 bits.
+  if !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit()) {
+    return Some(digit_key_u64(serial.as_bytes()) as u32);
+  }
+  // `return 0x22 if $$et{Model} =~ /\bD50$/` (`Nikon.pm:13649`) — the D50 uses
+  // 0x22 for its string serial; a word boundary before `D50` at end-of-string.
+  if model.is_some_and(model_ends_in_d50) {
+    return Some(0x22);
+  }
+  // `return 0x60` (`Nikon.pm:13650`) — D200, D40X, D70, etc.
+  Some(0x60)
+}
+
+/// `$$et{Model} =~ /\bD50$/` — the model name ends in the word `D50` (a `\b`
+/// word boundary precedes the `D`, i.e. the preceding char is not a word
+/// character). Real D50 models are `"NIKON D50"`.
+fn model_ends_in_d50(model: &str) -> bool {
+  let Some(prefix) = model.strip_suffix("D50") else {
+    return false;
+  };
+  // `\b` before `D`: a boundary exists when the char before `D50` is NOT a
+  // word character (`[A-Za-z0-9_]`). An empty prefix (the whole string is
+  // `D50`) is also a boundary.
+  match prefix.as_bytes().last() {
+    None => true,
+    Some(&c) => !(c.is_ascii_alphanumeric() || c == b'_'),
+  }
+}
+
+#[cfg(test)]
+mod tests;

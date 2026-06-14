@@ -142,6 +142,62 @@ pub enum NikonConv {
   /// `NEFBitDepth` (0x0e22, `Nikon.pm:3280`) — `int16u[4]`; a space-joined
   /// PrintConv hash (`'8 8 8 0' => '8 x 3'`, …) keyed on the whole record.
   NefBitDepth,
+  /// `%Nikon::LensData00/01` aperture members (`AFAperture`,
+  /// `MaxApertureAtMinFocal`, `MaxApertureAtMaxFocal`, `EffectiveMaxAperture`)
+  /// — `%nikonApertureConversions` (`Nikon.pm:5441`): `ValueConv =>
+  /// '2**($val/24)'`, `PrintConv => sprintf("%.1f",$val)`.
+  LensDataAperture,
+  /// `%Nikon::LensData00/01` focal-length members (`FocalLength`,
+  /// `MinFocalLength`, `MaxFocalLength`) — `%nikonFocalConversions`
+  /// (`Nikon.pm:5448`): `ValueConv => '5 * 2**($val/24)'`, `PrintConv =>
+  /// sprintf("%.1f mm",$val)`.
+  LensDataFocal,
+  /// `%Nikon::LensData01` `LensFStops` (0x0c) — `ValueConv => '$val / 12'`,
+  /// `PrintConv => sprintf("%.2f", $val)` (`Nikon.pm:5552`). DISTINCT from the
+  /// 0x008b `LensFStops` ([`Self::LensFStops`], a `c3` ValueConv).
+  LensDataFStops,
+  /// `%Nikon::LensData01` `ExitPupilPosition` (0x04) — `ValueConv => '$val ?
+  /// 2048 / $val : $val'`, `PrintConv => sprintf("%.1f mm",$val)`
+  /// (`Nikon.pm:5512`).
+  ExitPupilPosition,
+  /// `%Nikon::LensData01` `FocusPosition` (0x08) — `PrintConv =>
+  /// sprintf("0x%02x", $val)` (`Nikon.pm:5524`), no ValueConv.
+  FocusPosition,
+  /// `%Nikon::LensData01` `FocusDistance` (0x09) — `ValueConv => '0.01 *
+  /// 10**($val/40)'` (metres), `PrintConv => '$val ? sprintf("%.2f m",$val) :
+  /// "inf"'` (`Nikon.pm:5538`).
+  FocusDistance,
+  /// `%Nikon::LensData0800` `LensID` (0x30, `int16u`, `Nikon.pm:5819-5875`) —
+  /// the Nikkor-Z lens-name PrintConv hash. The raw value is the LensID
+  /// integer; an unmapped value renders `Unknown (N)`. `-n` emits the integer.
+  LensId,
+  /// `%Nikon::LensData0800` `LensFirmwareVersion` (0x34, `int16u`,
+  /// `Nikon.pm:5876-5886`) — the V.R.M PrintConv: `version=int($val/256)`,
+  /// `release=int(($val-256*version)/16)`, `modification=$val-(256*version+
+  /// 16*release)`, then `sprintf("%.0f.%.0f.%.0f", version, release,
+  /// modification)`. No ValueConv (`-n` emits the raw integer).
+  LensFirmwareZ,
+  /// `%Nikon::LensData0800` `MaxAperture` (0x36) / `FNumber` (0x38) (`int16u`,
+  /// `Nikon.pm:5887-5906`) — `ValueConv => '2**($val/384-1)'`, `PrintConv =>
+  /// sprintf("%.1f",$val)`. `-n` emits the post-ValueConv float.
+  LensApertureZ,
+  /// `%Nikon::LensData0800` `FocalLength` (0x3c, `int16u`, `Nikon.pm:5907-
+  /// 5914`) — NO ValueConv; `PrintConv => '"$val mm"'`. `-n` emits the raw
+  /// integer.
+  FocalLengthZ,
+  /// `%Nikon::LensData0800` `FocusDistance` (0x4e, `int16u`, `Nikon.pm:5922-
+  /// 5932`) — `RawConv => '$val = $val/256'` (the 1st byte is the fractional
+  /// component), `ValueConv => '2**(($val-80)/12)'` (metres), then a nested
+  /// PrintConv that picks the decimal precision from the magnitude. The "Inf"
+  /// branch keys on `$$self{FocusStepsFromInfinity}`, which is `Unknown => 1`
+  /// and therefore NEVER set in default mode (`next if Unknown`), so it is
+  /// unreachable here. `-n` emits the post-ValueConv metres float.
+  FocusDistanceZ,
+  /// `%Nikon::LensData0800` `LensMountType` (0x5f, `int8u`, `Mask => 0x01`,
+  /// `Nikon.pm:5953-5961`) — `{0=>'Z-mount',1=>'F-mount'}`. The Mask is applied
+  /// by the caller BEFORE this PrintConv; the raw value here is already masked
+  /// to 0/1. `-n` emits the masked integer.
+  LensMountType,
 }
 
 impl NikonConv {
@@ -293,8 +349,269 @@ impl NikonConv {
       NikonConv::RetouchHistory => retouch_history_conv(raw, print_conv),
       NikonConv::PowerUpTime => power_up_time_conv(raw, print_conv, order),
       NikonConv::NefBitDepth => nef_bit_depth_conv(raw, print_conv),
+      NikonConv::LensDataAperture => {
+        // `2**($val/24)`; PrintConv `sprintf("%.1f",$val)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = 2f64.powf(n as f64 / 24.0);
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{v:.1}")))
+        } else {
+          TagValue::F64(v)
+        }
+      }
+      NikonConv::LensDataFocal => {
+        // `5 * 2**($val/24)`; PrintConv `sprintf("%.1f mm",$val)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = 5.0 * 2f64.powf(n as f64 / 24.0);
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{v:.1} mm")))
+        } else {
+          TagValue::F64(v)
+        }
+      }
+      NikonConv::LensDataFStops => {
+        // `$val / 12`; PrintConv `sprintf("%.2f", $val)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = n as f64 / 12.0;
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{v:.2}")))
+        } else {
+          value_conv_number(v)
+        }
+      }
+      NikonConv::ExitPupilPosition => {
+        // `$val ? 2048 / $val : $val`; PrintConv `sprintf("%.1f mm",$val)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = if n != 0 { 2048.0 / n as f64 } else { 0.0 };
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{v:.1} mm")))
+        } else {
+          value_conv_number(v)
+        }
+      }
+      NikonConv::FocusPosition => {
+        // No ValueConv; PrintConv `sprintf("0x%02x", $val)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("0x{n:02x}")))
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::FocusDistance => {
+        // `0.01 * 10**($val/40)` (metres); PrintConv `$val ? sprintf("%.2f
+        // m",$val) : "inf"`. The ValueConv-then-PrintConv `$val` is the
+        // post-ValueConv metres; a raw `0` ⇒ ValueConv `0.01` (non-zero) ⇒ NOT
+        // "inf" — "inf" only when the ValueConv result is zero, which never
+        // happens (`0.01 * 10**x > 0`). Faithful: a zero ValueConv would print
+        // "inf", but it is unreachable on this conversion.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = 0.01 * 10f64.powf(n as f64 / 40.0);
+        if print_conv {
+          if v == 0.0 {
+            TagValue::Str(SmolStr::new("inf"))
+          } else {
+            TagValue::Str(SmolStr::new(std::format!("{v:.2} m")))
+          }
+        } else {
+          value_conv_number(v)
+        }
+      }
+      NikonConv::LensId => {
+        // `int16u` hash (`Nikon.pm:5825-5874`); unmapped → `Unknown (N)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          match lens_id_z_label(n) {
+            Some(s) => TagValue::Str(SmolStr::new(s)),
+            None => TagValue::Str(SmolStr::new(std::format!("Unknown ({n})"))),
+          }
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::LensFirmwareZ => {
+        // No ValueConv; PrintConv decomposes the int16u into V.R.M
+        // (`Nikon.pm:5880-5885`). `-n` emits the raw integer.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          // int() truncates toward zero (the values are non-negative int16u).
+          let version = n / 256;
+          let release = (n - 256 * version) / 16;
+          let modification = n - (256 * version + 16 * release);
+          TagValue::Str(SmolStr::new(std::format!(
+            "{version}.{release}.{modification}"
+          )))
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::LensApertureZ => {
+        // `2**($val/384-1)`; PrintConv `sprintf("%.1f",$val)`
+        // (`Nikon.pm:5892-5894`).
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = 2f64.powf(n as f64 / 384.0 - 1.0);
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{v:.1}")))
+        } else {
+          TagValue::F64(v)
+        }
+      }
+      NikonConv::FocalLengthZ => {
+        // No ValueConv; PrintConv `"$val mm"` (`Nikon.pm:5912`). `-n` emits the
+        // raw integer.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{n} mm")))
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::FocusDistanceZ => return Some(focus_distance_z_conv(raw, print_conv)),
+      NikonConv::LensMountType => {
+        // `{0=>'Z-mount',1=>'F-mount'}` (`Nikon.pm:5957-5960`); the Mask 0x01 is
+        // applied by the caller, so `$val` here is already 0/1. An unmapped
+        // value (impossible after the mask) renders `Unknown (N)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          match n {
+            0 => TagValue::Str(SmolStr::new("Z-mount")),
+            1 => TagValue::Str(SmolStr::new("F-mount")),
+            _ => TagValue::Str(SmolStr::new(std::format!("Unknown ({n})"))),
+          }
+        } else {
+          TagValue::I64(n)
+        }
+      }
     })
   }
+}
+
+/// `%Nikon::LensData0800` `FocusDistance` (0x4e) ValueConv + PrintConv
+/// (`Nikon.pm:5922-5932`). The decoded `$val` is the raw `int16u`; RawConv
+/// `$val = $val/256` (the 1st byte is the fractional part), ValueConv
+/// `2**(($val-80)/12)` (metres). The PrintConv selects the decimal precision by
+/// magnitude:
+///
+/// ```text
+/// $val < 100 ? $val < 10 ? $val < 1 ? $val < 0.35 ? "%.4f m" : "%.3f m"
+///                                                  : "%.2f m"
+///                                   : "%.1f m"
+///                        : "%.0f m"
+/// ```
+///
+/// The leading `(defined $$self{FocusStepsFromInfinity} and … eq 0) ? "Inf"`
+/// branch keys on a `Unknown => 1` DataMember, which is never set in default
+/// mode (`next if $$tagInfo{Unknown}`), so it is unreachable and omitted.
+/// `-n` emits the post-ValueConv metres float.
+fn focus_distance_z_conv(raw: &ParsedValue, print_conv: bool) -> TagValue {
+  let Some(n) = raw.first_i64() else {
+    return raw.to_default_tag_value();
+  };
+  // RawConv `$val = $val/256` then ValueConv `2**(($val-80)/12)`.
+  let raw_div = n as f64 / 256.0;
+  let v = 2f64.powf((raw_div - 80.0) / 12.0);
+  if !print_conv {
+    return value_conv_number(v);
+  }
+  let s = if v < 100.0 {
+    if v < 10.0 {
+      if v < 1.0 {
+        if v < 0.35 {
+          std::format!("{v:.4} m")
+        } else {
+          std::format!("{v:.3} m")
+        }
+      } else {
+        std::format!("{v:.2} m")
+      }
+    } else {
+      std::format!("{v:.1} m")
+    }
+  } else {
+    std::format!("{v:.0} m")
+  };
+  TagValue::Str(SmolStr::new(s))
+}
+
+/// `%Nikon::LensData0800` `LensID` (0x30) PrintConv hash (`Nikon.pm:5825-5874`)
+/// — the Nikkor-Z lens-name table. A non-zero LensID denotes a native Z lens;
+/// `0` / an unlisted value falls through to `Unknown (N)` at the call site. The
+/// keys are NOT contiguous (the two 327xx entries are the TC-1.4x teleconverter
+/// combinations).
+fn lens_id_z_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    1 => "Nikkor Z 24-70mm f/4 S",
+    2 => "Nikkor Z 14-30mm f/4 S",
+    4 => "Nikkor Z 35mm f/1.8 S",
+    8 => "Nikkor Z 58mm f/0.95 S Noct",
+    9 => "Nikkor Z 50mm f/1.8 S",
+    11 => "Nikkor Z DX 16-50mm f/3.5-6.3 VR",
+    12 => "Nikkor Z DX 50-250mm f/4.5-6.3 VR",
+    13 => "Nikkor Z 24-70mm f/2.8 S",
+    14 => "Nikkor Z 85mm f/1.8 S",
+    15 => "Nikkor Z 24mm f/1.8 S",
+    16 => "Nikkor Z 70-200mm f/2.8 VR S",
+    17 => "Nikkor Z 20mm f/1.8 S",
+    18 => "Nikkor Z 24-200mm f/4-6.3 VR",
+    21 => "Nikkor Z 50mm f/1.2 S",
+    22 => "Nikkor Z 24-50mm f/4-6.3",
+    23 => "Nikkor Z 14-24mm f/2.8 S",
+    24 => "Nikkor Z MC 105mm f/2.8 VR S",
+    25 => "Nikkor Z 40mm f/2",
+    26 => "Nikkor Z DX 18-140mm f/3.5-6.3 VR",
+    27 => "Nikkor Z MC 50mm f/2.8",
+    28 => "Nikkor Z 100-400mm f/4.5-5.6 VR S",
+    29 => "Nikkor Z 28mm f/2.8",
+    30 => "Nikkor Z 400mm f/2.8 TC VR S",
+    31 => "Nikkor Z 24-120mm f/4 S",
+    32 => "Nikkor Z 800mm f/6.3 VR S",
+    35 => "Nikkor Z 28-75mm f/2.8",
+    36 => "Nikkor Z 400mm f/4.5 VR S",
+    37 => "Nikkor Z 600mm f/4 TC VR S",
+    38 => "Nikkor Z 85mm f/1.2 S",
+    39 => "Nikkor Z 17-28mm f/2.8",
+    40 => "Nikkor Z 26mm f/2.8",
+    41 => "Nikkor Z DX 12-28mm f/3.5-5.6 PZ VR",
+    42 => "Nikkor Z 180-600mm f/5.6-6.3 VR",
+    43 => "Nikkor Z DX 24mm f/1.7",
+    44 => "Nikkor Z 70-180mm f/2.8",
+    45 => "Nikkor Z 600mm f/6.3 VR S",
+    46 => "Nikkor Z 135mm f/1.8 S Plena",
+    47 => "Nikkor Z 35mm f/1.2 S",
+    48 => "Nikkor Z 28-400mm f/4-8 VR",
+    49 => "Nikkor Z 28-135mm f/4 PZ",
+    50 => "Nikkor Z 24-70mm f/2.8 S II",
+    51 => "Nikkor Z 35mm f/1.4",
+    52 => "Nikkor Z 50mm f/1.4",
+    54 => "Nikkor Z 70-200mm f/2.8 VR S II",
+    57 => "Nikkor Z 24-105mm f/4-7.1",
+    2305 => "Laowa FFII 10mm F2.8 C&D Dreamer",
+    32768 => "Nikkor Z 400mm f/2.8 TC VR S TC-1.4x",
+    32769 => "Nikkor Z 600mm f/4 TC VR S TC-1.4x",
+    _ => return None,
+  })
 }
 
 /// `%afPoints11` (`Nikon.pm:2152`) PrintConv: `0 => '(none)'`,

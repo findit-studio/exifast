@@ -72,6 +72,44 @@ impl ParsedValue {
     }
   }
 
+  /// The post-`ReadValue` `$val` as a SINGLE all-digit count key — the faithful,
+  /// FORMAT-AGNOSTIC port of ExifTool's `$count =~ /^\d+$/` test applied to the
+  /// prescan-captured `$val` (`ProcessNikonEncrypted`, `Nikon.pm:13948`; the
+  /// `$val` is `PrescanExif`'s `ReadValue` result, `Nikon.pm:14122`).
+  ///
+  /// `/^\d+$/` matches the WHOLE rendered scalar against one-or-more ASCII
+  /// digits, so it is independent of the TIFF storage format: an `int32u 100`
+  /// renders `"100"` (matches), an ASCII `"100"` (`string`/`undef` `0x00a7`)
+  /// also renders `"100"` (matches), while a multi-element value renders
+  /// space-joined (`int32u[2]` ⇒ `"100 0"`, the space fails), a negative
+  /// renders with a leading `-` (fails), and a non-digit string fails. The
+  /// rendering is [`RawValue::val_bytes`] — ExifTool's exact `$val` bytes for
+  /// every shape. Used for the `ShutterCount` (0x00a7) count key, so a malformed
+  /// `int32u[2]`/`int32s` 0x00a7 must NOT unlock decryption, while an integer OR
+  /// ASCII-digit 0x00a7 does.
+  ///
+  /// The returned value is the count's LOW 32 BITS: ExifTool keeps the count as a
+  /// numeric scalar and the cipher consumes only its four low bytes
+  /// (`$key ^= ($count >> $i*8) & 0xff foreach 0..3`, `Nikon.pm:13620-13621`), so
+  /// an all-digit string exceeding `u32` — which ExifTool still accepts via
+  /// `/^\d+$/` and decrypts — is KEYED (not REJECTED for not fitting `u32`). The
+  /// coercion uses the shared 64-bit-saturating [`super::decrypt::digit_key_u64`],
+  /// faithfully modeling Perl's 64-bit numeric model: exact across the whole
+  /// `u64` range, saturating beyond it (a `> u64` decimal is a crafted value Perl
+  /// itself resolves via platform-defined NV→UV — no portable oracle).
+  #[must_use]
+  pub fn single_digit_count(&self) -> Option<u32> {
+    let rendered = self.raw.val_bytes();
+    // `/^\d+$/`: non-empty AND every byte an ASCII digit (no sign, space, NUL,
+    // or non-digit). A space-joined multi-element render fails here.
+    if rendered.is_empty() || !rendered.iter().all(u8::is_ascii_digit) {
+      return None;
+    }
+    // The cipher's four-byte XOR fold consumes the count's low 32 bits; coerce via
+    // the shared 64-bit-saturating helper and keep the low 32 bits.
+    Some(super::decrypt::digit_key_u64(&rendered) as u32)
+  }
+
   /// The first two unsigned integers (for `int16u[2]` ISO/ISOSetting).
   #[must_use]
   pub fn first_two_u64(&self) -> Option<(u64, u64)> {
@@ -599,26 +637,155 @@ pub fn walk_nikon_ifd(
     if tag_def.is_none() {
       continue; // Unknown tag — emits nothing (no `-u`); skip the value decode.
     }
-    let Some(raw) = read_value(
-      blob,
-      value_data_offset,
-      read_format,
-      read_count,
-      total_size,
-      order,
-    ) else {
-      continue;
+    // For a binary-block SubDirectory (the implicit-`undef` path that feeds the
+    // AFInfo / ColorBalance / LensData sub-decoders), the materialized `value`
+    // is DEAD — those decoders re-read the block from `walk_data` at
+    // `value_offset..value_offset + value_size`, never from this entry — so
+    // store a ZERO-COPY empty `RawValue::Bytes` instead of cloning ANY of the
+    // (possibly crafted-huge, in-bounds) value. The full value range is already
+    // proven in-bounds (the `value_end > blob.len()` Bad-offset drop above), so
+    // a `read_value` here could only ever return `Some` — skipping the read
+    // changes NO walk decision. The recorded `count`/`value_size` below keep
+    // ExifTool's faithful full `undef[N]` extent (the child walker reads the
+    // real bytes from `walk_data`; the `undef[400004]` contract holds). This
+    // CLOSES a memory-amplification vector independent of entry count: a u16's
+    // worth of binary-subdir entries (e.g. a duplicated 0x0098 LensData) all
+    // pointing at ONE in-bounds value now retains NOTHING, whereas a per-entry
+    // clone — even a bounded window — drove `N * window` heap growth from a
+    // sub-MB MakerNote. Leaf values and IFD-pointer SubDirectories (PreviewIFD
+    // 0x0011, NikonScanIFD 0x0e10, `is_sub_ifd`) keep their real decoded value
+    // (they are excluded from `implicit_undef`).
+    let value = if implicit_undef {
+      RawValue::Bytes(Vec::new())
+    } else {
+      let Some(raw) = read_value(
+        blob,
+        value_data_offset,
+        read_format,
+        read_count,
+        total_size,
+        order,
+      ) else {
+        continue;
+      };
+      raw
     };
     out.push(NikonEntry {
       tag_id,
       format,
       count: read_count,
-      value: raw,
+      value,
       value_offset: value_data_offset,
       value_size: total_size,
     });
   }
   out
+}
+
+/// Faithful port of the Nikon `PrescanExif` decryption-key pre-scan
+/// (`Nikon.pm:14067-14125`, invoked at `:14199-14203`): a SEPARATE pass over the
+/// raw MakerNote IFD that captures ONLY the `SerialNumber` (0x001d) and
+/// `ShutterCount` (0x00a7) DataMembers used to key the encrypted sub-tables,
+/// BEFORE — and INDEPENDENT of — the main [`walk_nikon_ifd`] extraction.
+///
+/// ## Why a separate scan and not the walked entries
+///
+/// ExifTool runs `PrescanExif` with DIFFERENT, simpler entry gates than the main
+/// `ProcessExif` walk: a `needTags` filter (only 0x001d / 0x00a7,
+/// `Nikon.pm:14102`), a `format 1..=13` check (`:14104` — note this DROPS code
+/// 129, which the main walk accepts), a 16 MB out-of-line size cap (`:14110`),
+/// and an in-bounds check (`:14115`). It has NO suspicious-offset gate, NO
+/// excessive-count (`> 100000`) skip, NO invalid-size (`> 0x7fffffff`) gate, and
+/// NO `warnCount > 10` directory abort. So a 0x001d / 0x00a7 that the main walk
+/// would DROP — at a suspicious offset, with an over-100000 count, or sitting
+/// after ten earlier malformed entries tripped the abort — is STILL captured
+/// here for the key, exactly as ExifTool. Sourcing the keys from the walked
+/// entries (which have already passed the stricter gates) would suppress
+/// decryption on those crafted layouts where ExifTool still decrypts.
+///
+/// Offsets resolve EXACTLY as the walk (inline at `entry + 8` for size ≤ 4, else
+/// `offset + value_base`), so the captured value bytes are identical for any
+/// well-formed file — the 0x001d / 0x00a7 of every real Nikon body passes both
+/// scans, keeping decryption byte-identical. Returns the decoded 0x001d / 0x00a7
+/// `ReadValue` results (`None` when absent, unreadable, or gated out); the caller
+/// derives the serial/count keys ([`super::scan_decrypt_keys`]). Duplicate tags
+/// keep the LAST occurrence (`$$tagHash{$tagID} = …` overwrites).
+#[must_use]
+pub fn prescan_decrypt_keys(
+  blob: &[u8],
+  ifd_offset: usize,
+  order: ByteOrder,
+  value_base: usize,
+) -> (Option<RawValue>, Option<RawValue>) {
+  let mut serial = None;
+  let mut count = None;
+  // numEntries (`Nikon.pm:14079-14082`): the 2-byte count plus the full 12-byte
+  // entry table must fit the buffer; ExifTool otherwise falls back to the RAF,
+  // and with no RAF (the in-memory MakerNote) captures nothing.
+  let Some(num_entries) = read_u16(blob, ifd_offset, order) else {
+    return (serial, count);
+  };
+  let num_entries = num_entries as usize;
+  let Some(table_end) = ifd_offset.checked_add(2).and_then(|n| {
+    12usize
+      .checked_mul(num_entries)
+      .and_then(|m| n.checked_add(m))
+  }) else {
+    return (serial, count);
+  };
+  if table_end > blob.len() {
+    return (serial, count);
+  }
+  for index in 0..num_entries {
+    let entry_off = ifd_offset + 2 + 12 * index; // < table_end ≤ blob.len()
+    let Some(tag_id) = read_u16(blob, entry_off, order) else {
+      continue;
+    };
+    // `next unless exists $$tagHash{$tagID}` (`:14102`) — only the two needTags.
+    let slot = match tag_id {
+      0x001d => &mut serial,
+      0x00a7 => &mut count,
+      _ => continue,
+    };
+    let Some(format_code) = read_u16(blob, entry_off + 2, order) else {
+      continue;
+    };
+    // `next if $format < 1 or $format > 13` (`:14104`) — drops code 129, which
+    // the main walk accepts; the prescan is format 1..=13 only.
+    if !(1..=13).contains(&format_code) {
+      continue;
+    }
+    let format = Format::from_code(format_code);
+    let Some(count_n) = read_u32(blob, entry_off + 4, order) else {
+      continue;
+    };
+    let count_n = count_n as usize;
+    let size = format.byte_size().saturating_mul(count_n);
+    let value_off = if size <= 4 {
+      entry_off + 8 // inline value (`$valuePtr = $entry + 8`)
+    } else {
+      if size > 0x0100_0000 {
+        continue; // `next if $size > 0x1000000` — the 16 MB cap (`:14110`).
+      }
+      let Some(off) = read_u32(blob, entry_off + 8, order) else {
+        continue;
+      };
+      let Some(abs) = (off as usize).checked_add(value_base) else {
+        continue;
+      };
+      // `next … if $valuePtr+$size > $dataLen` with no RAF (`:14115`) — the same
+      // in-bounds rule the walk applies (`value_end > blob.len()`).
+      match abs.checked_add(size) {
+        Some(end) if end <= blob.len() => abs,
+        _ => continue,
+      }
+    };
+    // `ReadValue($dataPt, $valuePtr, $formatStr, $count, $size)` (`:14122`).
+    if let Some(raw) = read_value(blob, value_off, format, count_n, size, order) {
+      *slot = Some(raw);
+    }
+  }
+  (serial, count)
 }
 
 /// Resolve the embedded-TIFF header for the type-3 layout. `blob` is the whole
@@ -1218,13 +1385,19 @@ mod tests {
       .iter()
       .find(|e| e.tag_id == 0x0088)
       .expect("AFInfo entry must be produced (read as undef, not skipped)");
-    // Read as `undef`: count recomputed to the on-disk byte size (400004) and
-    // the value is the raw block (`Bytes`), exactly ExifTool's `undef[400004]`.
+    // Read as `undef`: the recorded `count` keeps the on-disk byte size (400004),
+    // exactly ExifTool's `undef[400004]`, while the materialized `value` is a
+    // ZERO-COPY empty block (the clone is dead for AFInfo/ColorBalance/LensData,
+    // which re-read from `value_offset`/`value_size` in `walk_data`).
     assert_eq!(af_entry.count, count as usize * 4);
-    assert!(
-      matches!(af_entry.value, RawValue::Bytes(_)),
-      "an undef-read SubDirectory value is the raw byte block"
-    );
+    match &af_entry.value {
+      RawValue::Bytes(b) => assert_eq!(
+        b.len(),
+        0,
+        "the binary-SubDirectory value is zero-copy empty, not the full 400004 bytes"
+      ),
+      other => panic!("an undef-read SubDirectory value is the raw byte block, got {other:?}"),
+    }
     assert!(entries.iter().any(|e| e.tag_id == 0x0083));
 
     // CONTRAST: the SAME huge count on a NON-SubDirectory numeric tag
@@ -1241,6 +1414,163 @@ mod tests {
       "a non-SubDirectory numeric entry of huge count is still excessive-count-skipped"
     );
     assert_eq!(zentries[0].tag_id, 0x0083);
+  }
+
+  /// A crafted LARGE in-bounds `0x0098` LensData value (declared
+  /// `undef[200000]`) must NOT clone ANY of the declared block into the entry's
+  /// `RawValue::Bytes`: the binary-SubDirectory value is ZERO-COPY empty (the
+  /// sub-decoders re-read from `value_offset`/`value_size` in `walk_data`, so the
+  /// clone is dead). The recorded `count` / `value_size` keep ExifTool's faithful
+  /// full extent (it reads the in-bounds value too — the empty materialized value
+  /// is OUTPUT-EQUIVALENT). A later valid `LensType` sentinel still decodes (the
+  /// walk is not disturbed).
+  #[test]
+  fn nikon_subdir_large_value_zero_copy() {
+    let big: u32 = 200_000; // declared `undef` byte count, < 0x7fffffff
+    // 0x0098 LensData (binary SubDirectory, no explicit Format ⇒ implicit-undef),
+    // OUT-OF-LINE; a valid inline LensType sentinel after it.
+    let lens_data = entry_offset(0x0098, 7, big, 2 + 12 * 2 + 4); // undef, out-of-line
+    let lens_type = entry_inline(0x0083, 1, 1, [0x06, 0x00, 0x00, 0x00]); // int8u = 6
+    let mut b = headerless_ifd(&[lens_data, lens_type]);
+    // Lay the full 200000-byte value region in-bounds so ExifTool reads it.
+    b.resize(b.len() + big as usize, 0);
+    let entries = walk_nikon_ifd(&b, 0, ByteOrder::Big, 0, NikonTable::Main);
+    let ld = entries
+      .iter()
+      .find(|e| e.tag_id == 0x0098)
+      .expect("LensData entry must be produced (read as undef)");
+    // The recorded extent is faithful (the full declared `undef[200000]`)…
+    assert_eq!(ld.count, big as usize);
+    assert_eq!(ld.value_size, big as usize);
+    // …but the materialized value is ZERO-COPY empty, NOT 200000 bytes.
+    match &ld.value {
+      RawValue::Bytes(v) => assert_eq!(
+        v.len(),
+        0,
+        "0x0098 LensData value must be zero-copy empty (got {} bytes)",
+        v.len()
+      ),
+      other => panic!("LensData value is the raw byte block, got {other:?}"),
+    }
+    // The sentinel after the huge entry still decodes.
+    let lt = entries
+      .iter()
+      .find(|e| e.tag_id == 0x0083)
+      .expect("the LensType sentinel after the huge LensData still walks");
+    assert_eq!(lt.value, RawValue::U64(vec![6]));
+  }
+
+  /// REPEAT-ENTRY AMPLIFICATION regression (the R8 finding): a crafted IFD can
+  /// repeat a binary-SubDirectory tag (here `0x0098` LensData) MANY times, every
+  /// entry pointing at the SAME in-bounds value. Because each implicit-`undef`
+  /// entry stores a ZERO-COPY empty `RawValue::Bytes`, retained heap is bounded
+  /// INDEPENDENT of entry count — a per-entry clone (even a bounded window) would
+  /// instead drive `N * window` growth (a u16's worth of entries ⇒ hundreds of MB
+  /// from a sub-MB MakerNote). Every repeated entry is still produced with the
+  /// faithful full `value_size`, and all share one value region.
+  #[test]
+  fn nikon_repeated_subdir_value_is_bounded() {
+    let big: u32 = 100_000; // shared in-bounds `undef` value, < 0x7fffffff
+    const N: usize = 64; // many repeats of the SAME 0x0098 LensData subdir
+    // All N entries point OUT-OF-LINE at the same value region just past the IFD.
+    let value_at: u32 = 2 + 12 * N as u32 + 4;
+    let dirs: Vec<_> = (0..N)
+      .map(|_| entry_offset(0x0098, 7, big, value_at)) // undef, out-of-line, shared
+      .collect();
+    let mut b = headerless_ifd(&dirs);
+    b.resize(b.len() + big as usize, 0); // lay the shared value in-bounds
+    let entries = walk_nikon_ifd(&b, 0, ByteOrder::Big, 0, NikonTable::Main);
+    // Every repeated subdir entry is produced with the faithful full extent…
+    let lens = entries.iter().filter(|e| e.tag_id == 0x0098).count();
+    assert_eq!(lens, N, "every repeated LensData subdir entry is walked");
+    // …yet NONE retains the value bytes — total retained value heap is 0 across
+    // all N, so retained memory is independent of entry count.
+    let total_value_bytes: usize = entries
+      .iter()
+      .map(|e| match &e.value {
+        RawValue::Bytes(v) => v.len(),
+        _ => 0,
+      })
+      .sum();
+    assert_eq!(
+      total_value_bytes, 0,
+      "repeated binary-subdir entries retain zero value bytes (got {total_value_bytes})"
+    );
+    for e in entries.iter().filter(|e| e.tag_id == 0x0098) {
+      assert_eq!(
+        e.value_size, big as usize,
+        "each keeps the faithful full extent"
+      );
+    }
+  }
+
+  /// `single_digit_count` keys the count's LOW 32 BITS via the shared
+  /// 64-bit-saturating coercion (the cipher's four-byte XOR fold), so an all-digit
+  /// `ShutterCount` EXCEEDING `u32` — which ExifTool still accepts via `/^\d+$/`
+  /// and decrypts — is keyed, NOT rejected for not fitting `u32`. Exact across the
+  /// whole `u64` range; a `> u64` decimal saturates (Perl's NV→UV is platform
+  /// UB — no portable oracle). (R9/R10 finding: the prior `parse::<u32>()`
+  /// suppressed decryption, then an arbitrary-precision fold diverged from Perl's
+  /// 64-bit model above `u64`.)
+  #[test]
+  fn single_digit_count_keys_low_32_bits() {
+    let c = |s: &[u8]| ParsedValue::new(RawValue::Bytes(s.to_vec())).single_digit_count();
+    assert_eq!(c(b"100"), Some(100)); // in range
+    assert_eq!(c(b"4294967296"), Some(0)); // 2^32 ⇒ low 32 bits 0 (was rejected)
+    assert_eq!(c(b"4294967297"), Some(1)); // 2^32 + 1 ⇒ low 32 bits 1
+    // u64 boundary: u64::MAX = 0xffff_ffff_ffff_ffff ⇒ low 32 bits 0xffff_ffff;
+    // u64::MAX + 1 / + 2 SATURATE to u64::MAX ⇒ same low 32 bits (Perl 64-bit
+    // model; the cipher's XOR fold of 0xffff_ffff is key 0, matching 64-bit Perl).
+    assert_eq!(c(b"18446744073709551615"), Some(0xffff_ffff)); // u64::MAX
+    assert_eq!(c(b"18446744073709551616"), Some(0xffff_ffff)); // u64::MAX + 1
+    assert_eq!(c(b"18446744073709551617"), Some(0xffff_ffff)); // u64::MAX + 2
+    assert_eq!(c(b"100 0"), None); // space-joined multi-element render fails
+    assert_eq!(c(b"-5"), None); // a sign fails
+    assert_eq!(c(b""), None); // empty fails
+  }
+
+  /// `prescan_decrypt_keys` (ExifTool's `PrescanExif`) captures the decryption
+  /// key with LOOSER gates than the main walk: it has NO `warnCount > 10` abort,
+  /// so a trailing `ShutterCount` (0x00a7) the walk never reaches — because 11
+  /// earlier bad-offset entries tripped the abort — is STILL keyed, exactly as
+  /// ExifTool. (R9 finding: sourcing keys from the post-walk entries suppressed
+  /// decryption on such crafted layouts.)
+  #[test]
+  fn prescan_captures_key_past_walk_warn_abort() {
+    // 11 out-of-line entries whose value runs past EOF (each `++warnCount`).
+    let mut entries: Vec<Vec<u8>> = (0..11u16)
+      .map(|i| entry_offset(0x9000 + i, 2, 8, 0xffff)) // ascii[8] past EOF
+      .collect();
+    // A trailing ShutterCount (int32u 100, inline) after the 11 bad entries.
+    entries.push(entry_inline(0x00a7, 4, 1, [0x00, 0x00, 0x00, 0x64])); // big-endian 100
+    let b = headerless_ifd(&entries);
+    // The main walk ABORTS (warnCount > 10) before 0x00a7 — it is never produced.
+    let walked = walk_nikon_ifd(&b, 0, ByteOrder::Big, 0, NikonTable::Main);
+    assert!(
+      walked.iter().all(|e| e.tag_id != 0x00a7),
+      "the walk aborts before reaching the trailing 0x00a7"
+    );
+    // The prescan has no abort, so it still captures the ShutterCount key (100).
+    let (_serial, count) = prescan_decrypt_keys(&b, 0, ByteOrder::Big, 0);
+    let count = count.expect("PrescanExif captures the count key past the walk abort");
+    assert_eq!(ParsedValue::new(count).single_digit_count(), Some(100));
+  }
+
+  /// `prescan_decrypt_keys` captures ONLY the two needTags (0x001d / 0x00a7) and
+  /// reads them format-agnostically, matching `PrescanExif`'s `needTags` filter +
+  /// `ReadValue`. An unrelated tag is ignored; a present SerialNumber + a present
+  /// ShutterCount are both returned.
+  #[test]
+  fn prescan_captures_only_needtags() {
+    let serial = entry_inline(0x001d, 2, 4, [b'9', b'9', b'9', 0]); // ascii "999"
+    let other = entry_inline(0x0005, 4, 1, [0x00, 0x00, 0x00, 0x07]); // ignored
+    let shutter = entry_inline(0x00a7, 4, 1, [0x00, 0x00, 0x00, 0x2a]); // int32u 42
+    let b = headerless_ifd(&[serial, other, shutter]);
+    let (serial_val, count_val) = prescan_decrypt_keys(&b, 0, ByteOrder::Big, 0);
+    let s = serial_val.expect("0x001d captured");
+    assert_eq!(std::string::String::from_utf8_lossy(&s.val_bytes()), "999");
+    let count = count_val.expect("0x00a7 captured");
+    assert_eq!(ParsedValue::new(count).single_digit_count(), Some(42));
   }
 
   /// A `SubIFD` pointer (PreviewIFD 0x0011, NikonScanIFD 0x0e10 —
