@@ -38,14 +38,22 @@
 //!   (`0102`/`010[345]`/`0106`/`010[78]`/`030[01]`/other) are a committed
 //!   follow-up (the dispatch adds them one arm at a time).
 //!
+//! - `ShotInfo` (0x0091, `%Nikon::ShotInfo`, `Nikon.pm:5976-6090`) — the BASE
+//!   table is WALKED for every version: `ShotInfoVersion` (offset 0, cleartext)
+//!   plus the RawConv-gated `FirmwareVersion` (offset 4) plus the version-exact
+//!   fields (`0204`/`0205`/`0207`/`0211`, and a P6000 `DistortionControl`). A
+//!   `/^0[28]/` version is ENCRYPTED (decrypted via [`super::decrypt`],
+//!   `DecryptStart => 4`), else PLAINTEXT. The ~30 model-specific arms
+//!   (ShotInfoD40…Z9 EXTRA fields) are a phase-3 follow-up.
+//!
 //! ## Deferred (encrypted — need the remaining `ProcessNikonEncrypted` tables)
 //!
-//! `ShotInfo*` (0x0091) and the ENCRYPTED `ColorBalance` variants (0x0097
-//! `0205`/`0209`/`02xx`) are `ProcessNikonEncrypted` sub-tables keyed on the
-//! SerialNumber + ShutterCount XOR keystream (`Nikon.pm:13604` `Decrypt`). They
-//! carry a deferred [`SubTable`] marker so the parent is NOT emitted (the
-//! #177/#223 bogus-parent rule), and their decrypted children stay unported here
-//! (a committed Phase 2 follow-up). The `%LensData0800` NEW Z-lens block (offsets
+//! The ENCRYPTED `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) are
+//! `ProcessNikonEncrypted` sub-tables keyed on the SerialNumber + ShutterCount
+//! XOR keystream (`Nikon.pm:13604` `Decrypt`). They carry a deferred [`SubTable`]
+//! marker so the parent is NOT emitted (the #177/#223 bogus-parent rule), and
+//! their decrypted children stay unported here (a committed Phase 2 follow-up).
+//! The `%LensData0800` NEW Z-lens block (offsets
 //! 0x2f onward — int16u `LensID`/`MaxAperture`/`FNumber` + the
 //! `FocusMode`-gated focus telemetry) likewise stays a follow-up; its
 //! `LensDataVersion` + legacy OldLensData fields ARE emitted.
@@ -150,7 +158,13 @@ pub enum SubTable {
   ColorBalance0103,
   /// `LensData00`/`01`/`02`/… (0x0098) — `ProcessNikonEncrypted`. DEFERRED.
   LensData,
-  /// `ShotInfo*` (0x0091) — `ProcessNikonEncrypted`. DEFERRED.
+  /// `ShotInfo` (0x0091, `%Nikon::ShotInfo`, `Nikon.pm:5976-6090`) — the BASE
+  /// table for every version. WALKED: the cleartext `ShotInfoVersion` (offset 0)
+  /// plus the RawConv-gated `FirmwareVersion` (offset 4) and the version-exact
+  /// fields (`0204`/`0205`/`0207`/`0211`, + a P6000 `DistortionControl`). A
+  /// `/^0[28]/` version is ENCRYPTED (decrypted via [`super::decrypt`] with
+  /// `DecryptStart => 4`), else PLAINTEXT. The ~30 model-specific arms
+  /// (ShotInfoD40…Z9, their EXTRA fields) are a phase-3 follow-up.
   ShotInfo,
   /// `FlashInfo*` (0x00a8) — an UNENCRYPTED plaintext `ProcessBinaryData` table
   /// version-dispatched on the 4-byte `FlashInfoVersion` prefix
@@ -177,7 +191,7 @@ impl SubTable {
   pub const fn is_walked(self) -> bool {
     matches!(
       self,
-      SubTable::AfInfo | SubTable::ColorBalance0103 | SubTable::FlashInfo
+      SubTable::AfInfo | SubTable::ColorBalance0103 | SubTable::FlashInfo | SubTable::ShotInfo
     )
   }
 }
@@ -707,14 +721,16 @@ mod tests {
   /// The deferred sub-tables carry a DEFERRED (`!is_walked`) marker so the
   /// parent pointer is suppressed (#177/#223), while the walked ones emit their
   /// leaves. `LensData` (0x0098) defers the parent but DECRYPTS+emits children;
-  /// `FlashInfo` (0x00a8) is UNENCRYPTED and walked.
+  /// `FlashInfo` (0x00a8) is UNENCRYPTED and walked; `ShotInfo` (0x0091) now
+  /// walks the base table (the parent is still suppressed — a SubDirectory
+  /// pointer never emits its own value).
   #[test]
   fn deferred_subdirs_marker() {
     assert_eq!(
       lookup(0x0091).unwrap().sub_table(),
       Some(SubTable::ShotInfo)
     );
-    assert!(!SubTable::ShotInfo.is_walked());
+    assert!(SubTable::ShotInfo.is_walked());
     assert_eq!(
       lookup(0x0098).unwrap().sub_table(),
       Some(SubTable::LensData)
