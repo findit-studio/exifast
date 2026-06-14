@@ -27,10 +27,14 @@
 //!
 //! ## Scope
 //!
-//! See [`tags`]: every readable `%Nikon::Main` scalar + the two UNENCRYPTED
-//! fixture sub-tables (`AFInfo`, `ColorBalance0103`). The ENCRYPTED
-//! sub-tables (`LensData`/`ShotInfo`/`FlashInfo`/encrypted `ColorBalance`)
-//! are deferred (they need `Nikon::Decrypt`) — they carry a deferred
+//! See [`tags`]: every readable `%Nikon::Main` scalar + the UNENCRYPTED
+//! fixture sub-tables (`AFInfo`, `ColorBalance0103`, `LensData00`/`01`, and the
+//! UNENCRYPTED plaintext `FlashInfo0100`). `LensData` decrypts the `02xx`+ arms
+//! ([`decrypt`]); `FlashInfo` (0x00a8) is unencrypted `ProcessBinaryData`
+//! version-dispatched on the 4-byte `FlashInfoVersion` prefix
+//! ([`emit_flash_info`], `Nikon.pm:2987-3009`) — only the `0100`/`0101` arm is
+//! ported here, other versions emit nothing (a committed follow-up). The
+//! deferred `ShotInfo` (0x0091) + encrypted `ColorBalance` carry a deferred
 //! [`tags::SubTable`] marker so the parent pointer is NOT emitted (the
 //! #177/#223 bogus-parent rule).
 
@@ -381,11 +385,11 @@ pub fn parse_in_tiff(
             &mut emissions,
           );
         }
+        SubTable::FlashInfo => {
+          emit_flash_info(walk_data, entry, layout, print_conv, &mut emissions);
+        }
         // Deferred (encrypted / unported child table): emit nothing.
-        SubTable::ShotInfo
-        | SubTable::FlashInfo
-        | SubTable::ColorBalanceEncrypted
-        | SubTable::OtherDeferred => {}
+        SubTable::ShotInfo | SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
       }
       continue;
     }
@@ -508,6 +512,294 @@ fn emit_color_balance(
     return;
   };
   emissions.push(VendorEmission::new("WB_RGBGLevels".into(), value, false));
+}
+
+/// Emit the `%Nikon::FlashInfo0100` leaves (0x00a8) — an UNENCRYPTED plaintext
+/// `ProcessBinaryData` table (NO `DecryptStart` on any arm), version-dispatched
+/// on the 4-byte `FlashInfoVersion` prefix (`Nikon.pm:2987-3009`). Only the
+/// `010[01]` arm (`%Nikon::FlashInfo0100`, `Nikon.pm:10810`) is ported here;
+/// every other version (`0102`/`010[345]`/`0106`/`010[78]`/`030[01]`/other)
+/// emits NOTHING (a committed follow-up) — the dispatch is a one-line addition
+/// per arm. FlashInfo0100 has NO `ByteOrder` SubDirectory directive, so it
+/// inherits the parent MakerNote IFD order; every member is a single int8u/int8s
+/// byte, so the order is irrelevant for these reads.
+///
+/// The fields are read at their byte offsets into the value, in offset order,
+/// honouring the byte-9 dual read (`FlashCommanderMode` Mask 0x80 then
+/// `FlashControlMode` Mask 0x7f), the three DataMembers (`FlashControlMode`,
+/// `FlashGroup{A,B}ControlMode`), the offset-10/17/18 `>= 0x06` Manual/comp
+/// conditionals, and the offset-11/12/13 `RawConv => '$val ? $val : undef'`
+/// drops. A field whose offset is past the available value length emits nothing
+/// (bounds-safe, like [`emit_color_balance`]).
+fn emit_flash_info(
+  walk_data: &[u8],
+  entry: &NikonEntry,
+  layout: Layout,
+  print_conv: bool,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
+    return;
+  };
+  // `FlashInfoVersion` = the first 4 ASCII bytes (`Format => 'string[4]'`).
+  let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
+    return;
+  };
+  // The 0x00a8 conditional SubDirectory list (`Nikon.pm:2987-3009`): only the
+  // `010[01]` arm (FlashInfo0100) is ported. Any other version is deferred —
+  // emit nothing (the parent SubDirectory pointer is already suppressed by the
+  // deferred dispatch; a follow-up adds the remaining arms here).
+  if !matches!(version, b"0100" | b"0101") {
+    return;
+  }
+  // offset 0 `FlashInfoVersion` (`string[4]`, no conversion — verbatim).
+  emissions.push(VendorEmission::new(
+    "FlashInfoVersion".into(),
+    TagValue::Str(SmolStr::new(String::from_utf8_lossy(version))),
+    false,
+  ));
+  // The shared int8u read + conv push (`FORMAT => 'int8u'` is the table
+  // default). A byte past the value length emits nothing; a `None` from a
+  // RawConv-undef drop (FlashFocalLength/RepeatingFlashRate 0) is skipped.
+  let push_u8 =
+    |emissions: &mut Vec<VendorEmission>, offset: usize, name: &'static str, conv: NikonConv| {
+      let Some(&byte) = sub.get(offset) else {
+        return;
+      };
+      let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
+      if let Some(value) = conv.apply(&parsed, print_conv, None, layout.order) {
+        emissions.push(VendorEmission::new(name.into(), value, false));
+      }
+    };
+
+  // offset 4 `FlashSource` (int8u).
+  push_u8(emissions, 4, "FlashSource", NikonConv::FlashSource);
+
+  // offset 6 `ExternalFlashFirmware` (`int8u[2]`): the value is the space-joined
+  // pair "A B"; the PrintConv looks it up in `%flashFirmware`, with an OTHER
+  // sub `sprintf('%d.%.2d (Unknown model)', A, B)`. `-n` emits the raw "A B".
+  if let (Some(&a), Some(&b)) = (sub.get(6), sub.get(7)) {
+    let joined = std::format!("{a} {b}");
+    let value = if print_conv {
+      match flash_firmware_label(&joined) {
+        Some(s) => TagValue::Str(SmolStr::new(s)),
+        // OTHER => sprintf('%d.%.2d (Unknown model)', split(' ', $val)).
+        None => TagValue::Str(SmolStr::new(std::format!("{a}.{b:02} (Unknown model)"))),
+      }
+    } else {
+      TagValue::Str(SmolStr::new(joined))
+    };
+    emissions.push(VendorEmission::new(
+      "ExternalFlashFirmware".into(),
+      value,
+      false,
+    ));
+  }
+
+  // offset 8 `ExternalFlashFlags` (int8u BITMASK).
+  push_u8(
+    emissions,
+    8,
+    "ExternalFlashFlags",
+    NikonConv::ExternalFlashFlags,
+  );
+
+  // offset 9 read TWICE (two tags from one byte, via Mask + BitShift; ExifTool
+  // `$val = ($val & $mask) >> $bitShift`, `ExifTool.pm:10079`):
+  //   9.1 FlashCommanderMode — Mask 0x80 ⇒ (byte9 & 0x80) >> 7; {0=>Off,1=>On}.
+  //   9.2 FlashControlMode    — Mask 0x7f ⇒ (byte9 & 0x7f); DataMember; the
+  //                             %flashControlMode hash.
+  let flash_control_mode: Option<i64> = sub.get(9).map(|&b9| {
+    let commander = i64::from((b9 & 0x80) >> 7);
+    let parsed = ParsedValue::new(RawValue::I64(std::vec![commander]));
+    if let Some(value) = NikonConv::OffOn.apply(&parsed, print_conv, None, layout.order) {
+      emissions.push(VendorEmission::new(
+        "FlashCommanderMode".into(),
+        value,
+        false,
+      ));
+    }
+    let control = i64::from(b9 & 0x7f);
+    let parsed = ParsedValue::new(RawValue::I64(std::vec![control]));
+    if let Some(value) = NikonConv::FlashControlMode.apply(&parsed, print_conv, None, layout.order)
+    {
+      emissions.push(VendorEmission::new("FlashControlMode".into(), value, false));
+    }
+    control
+  });
+
+  // offset 10 CONDITIONAL on the FlashControlMode DataMember:
+  //   >= 0x06 ⇒ FlashOutput (int8u, 2**(-val/6), Full/%); else FlashCompensation
+  //   (int8s, -val/6, PrintFraction). A missing byte 9 leaves the member undef;
+  //   ExifTool's `$$self{FlashControlMode} >= 0x06` is then `undef >= 6` = false
+  //   ⇒ the FlashCompensation arm.
+  emit_flash_output_or_comp(
+    sub,
+    10,
+    flash_control_mode,
+    print_conv,
+    layout.order,
+    "FlashOutput",
+    "FlashCompensation",
+    NikonConv::FlashCompensation,
+    emissions,
+  );
+
+  // offset 11 FlashFocalLength (int8u, RawConv 0⇒undef, "$val mm").
+  push_u8(
+    emissions,
+    11,
+    "FlashFocalLength",
+    NikonConv::FlashFocalLength,
+  );
+  // offset 12 RepeatingFlashRate (int8u, RawConv 0⇒undef, "$val Hz").
+  push_u8(
+    emissions,
+    12,
+    "RepeatingFlashRate",
+    NikonConv::RepeatingFlashRate,
+  );
+  // offset 13 RepeatingFlashCount (int8u, RawConv 0⇒undef, no PrintConv — the
+  // raw integer).
+  if let Some(&byte) = sub.get(13)
+    && byte != 0
+  {
+    emissions.push(VendorEmission::new(
+      "RepeatingFlashCount".into(),
+      TagValue::I64(i64::from(byte)),
+      false,
+    ));
+  }
+  // offset 14 FlashGNDistance (int8u, %flashGNDistance).
+  push_u8(emissions, 14, "FlashGNDistance", NikonConv::FlashGnDistance);
+
+  // offset 15/16 FlashGroup{A,B}ControlMode (int8u, Mask 0x0f ⇒ byte & 0x0f;
+  // DataMembers; %flashControlMode).
+  let group_a_mode = emit_masked_control_mode(
+    sub,
+    15,
+    "FlashGroupAControlMode",
+    print_conv,
+    layout.order,
+    emissions,
+  );
+  let group_b_mode = emit_masked_control_mode(
+    sub,
+    16,
+    "FlashGroupBControlMode",
+    print_conv,
+    layout.order,
+    emissions,
+  );
+
+  // offset 17 CONDITIONAL on FlashGroupAControlMode: >= 0x06 ⇒ FlashGroupAOutput
+  // (2**(-val/6)); else FlashGroupACompensation (int8s, -val/6, '%+.1f'/0).
+  emit_flash_output_or_comp(
+    sub,
+    17,
+    group_a_mode,
+    print_conv,
+    layout.order,
+    "FlashGroupAOutput",
+    "FlashGroupACompensation",
+    NikonConv::FlashGroupCompensation,
+    emissions,
+  );
+  // offset 18 CONDITIONAL on FlashGroupBControlMode (same as 17, group B).
+  emit_flash_output_or_comp(
+    sub,
+    18,
+    group_b_mode,
+    print_conv,
+    layout.order,
+    "FlashGroupBOutput",
+    "FlashGroupBCompensation",
+    NikonConv::FlashGroupCompensation,
+    emissions,
+  );
+}
+
+/// `%flashFirmware` (`Nikon.pm:767-789`) — the `ExternalFlashFirmware` "A B"
+/// space-joined lookup. Returns `None` for an unlisted pair (the caller renders
+/// the OTHER `sprintf('%d.%.2d (Unknown model)', A, B)`).
+fn flash_firmware_label(joined: &str) -> Option<&'static str> {
+  Some(match joined {
+    "0 0" => "n/a",
+    "1 1" => "1.01 (SB-800 or Metz 58 AF-1)",
+    "1 3" => "1.03 (SB-800)",
+    "2 1" => "2.01 (SB-800)",
+    "2 4" => "2.04 (SB-600)",
+    "2 5" => "2.05 (SB-600)",
+    "3 1" => "3.01 (SU-800 Remote Commander)",
+    "4 1" => "4.01 (SB-400)",
+    "4 2" => "4.02 (SB-400)",
+    "4 4" => "4.04 (SB-400)",
+    "5 1" => "5.01 (SB-900)",
+    "5 2" => "5.02 (SB-900)",
+    "6 1" => "6.01 (SB-700)",
+    "7 1" => "7.01 (SB-910)",
+    "14 3" => "14.03 (SB-5000)",
+    _ => return None,
+  })
+}
+
+/// A `%Nikon::FlashInfo0100` `int8u Mask 0x0f` control-mode DataMember (offset
+/// 15/16). Reads byte at `offset`, masks to `byte & 0x0f` (BitShift 0), emits
+/// it via `%flashControlMode`, and RETURNS the masked value (the DataMember the
+/// offset-17/18 conditional reads). `None` when the byte is past the value
+/// length (the member emits nothing and the conditional sees `undef`).
+fn emit_masked_control_mode(
+  sub: &[u8],
+  offset: usize,
+  name: &'static str,
+  print_conv: bool,
+  order: ByteOrder,
+  emissions: &mut Vec<VendorEmission>,
+) -> Option<i64> {
+  let &byte = sub.get(offset)?;
+  let masked = i64::from(byte & 0x0f);
+  let parsed = ParsedValue::new(RawValue::I64(std::vec![masked]));
+  if let Some(value) = NikonConv::FlashControlMode.apply(&parsed, print_conv, None, order) {
+    emissions.push(VendorEmission::new(name.into(), value, false));
+  }
+  Some(masked)
+}
+
+/// The shared offset-10/17/18 `FlashControlMode`-gated conditional
+/// (`Nikon.pm:10854-10881`/`10920-10940`): `>= 0x06` ⇒ the `Output` tag (int8u,
+/// `NikonConv::FlashOutput`); else the `Comp` tag (int8s `Format` override,
+/// `comp_conv` = `FlashCompensation` PrintFraction at offset 10 /
+/// `FlashGroupCompensation` `%+.1f` at offset 17/18). `mode` is the gating
+/// DataMember (`None` = `undef >= 0x06` = false ⇒ the Comp arm). A byte past the
+/// value length emits nothing.
+#[expect(clippy::too_many_arguments)]
+fn emit_flash_output_or_comp(
+  sub: &[u8],
+  offset: usize,
+  mode: Option<i64>,
+  print_conv: bool,
+  order: ByteOrder,
+  output_name: &'static str,
+  comp_name: &'static str,
+  comp_conv: NikonConv,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(&byte) = sub.get(offset) else {
+    return;
+  };
+  if mode.is_some_and(|m| m >= 0x06) {
+    // The `Manual`-arm `FlashOutput` (int8u).
+    let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
+    if let Some(value) = NikonConv::FlashOutput.apply(&parsed, print_conv, None, order) {
+      emissions.push(VendorEmission::new(output_name.into(), value, false));
+    }
+  } else {
+    // The `Compensation`-arm (int8s `Format` override — the byte is signed).
+    let parsed = ParsedValue::new(RawValue::I64(std::vec![i64::from(byte as i8)]));
+    if let Some(value) = comp_conv.apply(&parsed, print_conv, None, order) {
+      emissions.push(VendorEmission::new(comp_name.into(), value, false));
+    }
+  }
 }
 
 /// The decryption keys captured for the encrypted Nikon sub-tables —
@@ -1316,9 +1608,10 @@ mod tests {
     assert_eq!(q.value(), &TagValue::Str(SmolStr::new("Fine")));
   }
 
-  /// A deferred (encrypted) SubDirectory pointer (LensData 0x0098, ShotInfo
-  /// 0x0091, FlashInfo 0x00a8) emits NEITHER a parent NOR children — the
-  /// #177/#223 bogus-parent rule.
+  /// A deferred (encrypted) SubDirectory pointer (ShotInfo 0x0091) emits
+  /// NEITHER a parent NOR children — the #177/#223 bogus-parent rule. (LensData
+  /// 0x0098 defers only the PARENT; FlashInfo 0x00a8 is now WALKED — see
+  /// [`flash_info_0100_decodes`].)
   #[test]
   fn deferred_encrypted_subdir_emits_no_parent() {
     let mut b: Vec<u8> = Vec::new();
@@ -2725,5 +3018,182 @@ mod tests {
     assert_eq!(lens_get(&em, "LensDataVersion"), Some(str_val("0101")));
     assert_eq!(lens_get(&em, "FocalLength"), Some(str_val("151.0 mm")));
     assert_eq!(lens_get(&em, "LensIDNumber"), Some(TagValue::I64(24)));
+  }
+
+  /// Build a type-3 Nikon blob with a single out-of-line `0x00a8` FlashInfo
+  /// value (UNENCRYPTED, so no key prescan is needed). Mirrors
+  /// [`type3_lens_data_only`] for the FlashInfo SubDirectory.
+  fn type3_flash_info(flash_block: &[u8]) -> Vec<u8> {
+    let n_entries: u16 = 1;
+    let off_flash: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4; // embedded-relative
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    b.extend_from_slice(&0x00a8u16.to_be_bytes()); // FlashInfo, undef, out-of-line
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(flash_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_flash.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(flash_block);
+    b
+  }
+
+  /// `%Nikon::FlashInfo0100` (0x00a8) decode — a crafted `0100` block exercising
+  /// the full conditional matrix, BYTE-EXACT to the `perl exiftool 13.59`
+  /// ProcessBinaryData oracle (verified directly against
+  /// `Image::ExifTool::Nikon::FlashInfo0100`):
+  ///   FlashSource Internal, ExternalFlashFirmware OTHER `"9.05 (Unknown
+  ///   model)"`, ExternalFlashFlags BITMASK `Fired, Bounce Flash, Wide Flash
+  ///   Adapter`, FlashCommanderMode On + FlashControlMode Manual (byte-9 dual
+  ///   read), the Manual-branch FlashOutput `25%`, FlashFocalLength `35 mm`,
+  ///   RepeatingFlashRate `10 Hz`, RepeatingFlashCount `3`, FlashGNDistance
+  ///   `1.0 m`, FlashGroupAControlMode Manual → FlashGroupAOutput `50%`,
+  ///   FlashGroupBControlMode iTTL → FlashGroupBCompensation `-1.5`.
+  #[test]
+  fn flash_info_0100_decodes() {
+    let block: Vec<u8> = b"0100"
+      .iter()
+      .copied()
+      .chain([2, 48, 9, 5, 0x15, 0x86, 12, 35, 10, 3, 10, 0x06, 0x02, 6, 9])
+      .collect();
+    let (_t, em) = parse(&type3_flash_info(&block), ByteOrder::Big, Some("NIKON D70"));
+    let get = |n: &str| lens_get(&em, n);
+    assert_eq!(get("FlashInfoVersion"), Some(str_val("0100")));
+    assert_eq!(get("FlashSource"), Some(str_val("Internal")));
+    assert_eq!(
+      get("ExternalFlashFirmware"),
+      Some(str_val("9.05 (Unknown model)"))
+    );
+    assert_eq!(
+      get("ExternalFlashFlags"),
+      Some(str_val("Fired, Bounce Flash, Wide Flash Adapter"))
+    );
+    assert_eq!(get("FlashCommanderMode"), Some(str_val("On")));
+    assert_eq!(get("FlashControlMode"), Some(str_val("Manual")));
+    // FlashControlMode Manual (0x06) ⇒ the Output arm at offset 10, NOT the
+    // FlashCompensation arm.
+    assert_eq!(get("FlashOutput"), Some(str_val("25%")));
+    assert!(get("FlashCompensation").is_none());
+    assert_eq!(get("FlashFocalLength"), Some(str_val("35 mm")));
+    assert_eq!(get("RepeatingFlashRate"), Some(str_val("10 Hz")));
+    assert_eq!(get("RepeatingFlashCount"), Some(TagValue::I64(3)));
+    assert_eq!(get("FlashGNDistance"), Some(str_val("1.0 m")));
+    assert_eq!(get("FlashGroupAControlMode"), Some(str_val("Manual")));
+    assert_eq!(get("FlashGroupBControlMode"), Some(str_val("iTTL")));
+    // GroupA Manual (0x06) ⇒ Output arm; GroupB iTTL (0x02) ⇒ Compensation arm.
+    assert_eq!(get("FlashGroupAOutput"), Some(str_val("50%")));
+    assert!(get("FlashGroupACompensation").is_none());
+    assert_eq!(get("FlashGroupBCompensation"), Some(str_val("-1.5")));
+    assert!(get("FlashGroupBOutput").is_none());
+    // No bogus FlashInfo parent (the SubDirectory pointer never emits it).
+    assert!(em.iter().all(|e| e.name() != "FlashInfo"));
+  }
+
+  /// `%Nikon::FlashInfo0100` — the all-Off fixture shape (NikonD2Hs/D70 oracle):
+  /// firmware `"0 0"` → `"n/a"`, flags `0` → `"(none)"`, the byte-9 Off/Off, the
+  /// FlashControlMode-Off branch ⇒ FlashCompensation `0` (a BARE number, NOT the
+  /// FlashOutput arm), GN `0`, both group comps `0`. The offset-11/12/13
+  /// `RawConv => '$val ? $val : undef'` drops (focal/rate/count 0) emit NOTHING.
+  #[test]
+  fn flash_info_0100_all_off_with_rawconv_drops() {
+    // 19 bytes, all zero after the version + firmware "0 0" + the GN/groups 0.
+    let mut block = std::vec![0u8; 19];
+    block.get_mut(0..4).unwrap().copy_from_slice(b"0100");
+    let (_t, em) = parse(
+      &type3_flash_info(&block),
+      ByteOrder::Big,
+      Some("NIKON D2Hs"),
+    );
+    let get = |n: &str| lens_get(&em, n);
+    assert_eq!(get("FlashInfoVersion"), Some(str_val("0100")));
+    assert_eq!(get("FlashSource"), Some(str_val("None")));
+    assert_eq!(get("ExternalFlashFirmware"), Some(str_val("n/a")));
+    assert_eq!(get("ExternalFlashFlags"), Some(str_val("(none)")));
+    assert_eq!(get("FlashCommanderMode"), Some(str_val("Off")));
+    assert_eq!(get("FlashControlMode"), Some(str_val("Off")));
+    // FlashControlMode Off (< 0x06) ⇒ FlashCompensation; -0/6 = 0 ⇒
+    // `PrintFraction(0)` = the STRING "0" (the shared `SignedFractionPrintFraction`
+    // contract), which the JSON layer serializes as the BARE number 0 — matching
+    // the oracle `"Nikon:FlashCompensation": 0`.
+    assert_eq!(get("FlashCompensation"), Some(str_val("0")));
+    assert!(get("FlashOutput").is_none());
+    assert_eq!(get("FlashGNDistance"), Some(str_val("0")));
+    assert_eq!(get("FlashGroupAControlMode"), Some(str_val("Off")));
+    assert_eq!(get("FlashGroupBControlMode"), Some(str_val("Off")));
+    assert_eq!(get("FlashGroupACompensation"), Some(TagValue::I64(0)));
+    assert_eq!(get("FlashGroupBCompensation"), Some(TagValue::I64(0)));
+    // RawConv `$val ? $val : undef` drops for a 0 byte — NOT emitted.
+    assert!(
+      get("FlashFocalLength").is_none(),
+      "FlashFocalLength 0 must drop (RawConv undef)"
+    );
+    assert!(
+      get("RepeatingFlashRate").is_none(),
+      "RepeatingFlashRate 0 must drop (RawConv undef)"
+    );
+    assert!(
+      get("RepeatingFlashCount").is_none(),
+      "RepeatingFlashCount 0 must drop (RawConv undef)"
+    );
+  }
+
+  /// `%Nikon::FlashInfo0100` — a NON-`0100`/`0101` version (`0103`) is DEFERRED:
+  /// the dispatch emits NOTHING (no FlashInfoVersion, no children, no parent),
+  /// matching the still-unported FlashInfo0103 arm. A `0101` version IS walked.
+  #[test]
+  fn flash_info_version_dispatch_gate() {
+    // 0103 — deferred arm, emits nothing.
+    let mut v0103 = std::vec![0u8; 19];
+    v0103.get_mut(0..4).unwrap().copy_from_slice(b"0103");
+    let (_t, em) = parse(&type3_flash_info(&v0103), ByteOrder::Big, Some("NIKON D80"));
+    assert!(
+      em.iter().all(|e| !e.name().starts_with("Flash")),
+      "a 0103 FlashInfo must emit nothing (deferred), got {em:?}"
+    );
+    // 0101 — walked (same FlashInfo0100 table as 0100).
+    let mut v0101 = std::vec![0u8; 19];
+    v0101.get_mut(0..4).unwrap().copy_from_slice(b"0101");
+    let (_t, em) = parse(&type3_flash_info(&v0101), ByteOrder::Big, Some("NIKON D80"));
+    assert_eq!(lens_get(&em, "FlashInfoVersion"), Some(str_val("0101")));
+    assert_eq!(lens_get(&em, "FlashSource"), Some(str_val("None")));
+  }
+
+  /// `%Nikon::FlashInfo0100` `-n` mode (PrintConv off): the post-ValueConv raw
+  /// scalars (the firmware "A B" join, the raw int8u flags/GN, the
+  /// FlashControlMode masked integer) — verified against `perl exiftool -n`.
+  #[test]
+  fn flash_info_0100_value_mode() {
+    let block: Vec<u8> = b"0100"
+      .iter()
+      .copied()
+      .chain([2, 48, 9, 5, 0x15, 0x86, 12, 35, 10, 3, 10, 0x06, 0x02, 6, 9])
+      .collect();
+    // print_conv = false ⇒ -n.
+    let (_t, em) = parse_with_print_conv(
+      &type3_flash_info(&block),
+      ByteOrder::Big,
+      false,
+      Some("NIKON D70"),
+    );
+    let get = |n: &str| lens_get(&em, n);
+    assert_eq!(get("FlashInfoVersion"), Some(str_val("0100")));
+    assert_eq!(get("FlashSource"), Some(TagValue::I64(2)));
+    // int8u[2] raw join "A B".
+    assert_eq!(get("ExternalFlashFirmware"), Some(str_val("9 5")));
+    assert_eq!(get("ExternalFlashFlags"), Some(TagValue::I64(0x15)));
+    assert_eq!(get("FlashCommanderMode"), Some(TagValue::I64(1)));
+    assert_eq!(get("FlashControlMode"), Some(TagValue::I64(6)));
+    // FlashOutput -n: post-ValueConv 2**(-12/6) = 0.25.
+    assert_eq!(get("FlashOutput"), Some(TagValue::F64(0.25)));
+    assert_eq!(get("FlashFocalLength"), Some(TagValue::I64(35)));
+    assert_eq!(get("RepeatingFlashRate"), Some(TagValue::I64(10)));
+    assert_eq!(get("FlashGNDistance"), Some(TagValue::I64(10)));
+    assert_eq!(get("FlashGroupAControlMode"), Some(TagValue::I64(6)));
+    assert_eq!(get("FlashGroupBControlMode"), Some(TagValue::I64(2)));
+    // GroupB Compensation -n: post-ValueConv -9/6 = -1.5.
+    assert_eq!(get("FlashGroupBCompensation"), Some(TagValue::F64(-1.5)));
   }
 }
