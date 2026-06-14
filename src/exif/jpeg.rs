@@ -480,19 +480,23 @@ fn attach_app6_gopro(
   // Attach iff at least one GPMF record landed (ExifTool's `FoundEmbedded`);
   // a file with only empty / mislabeled GoPro `APP6` segments stays GoPro-free.
   if !gopro.is_empty() {
-    // GoPro-before-Exif when the first TAG-PRODUCING GoPro `APP6` precedes the
-    // EFFECTIVE EXIF block (the `APP1` whose `ProcessTIFF` succeeded —
-    // `effective_exif_idx`). BOTH indices are tag-producing, not merely
+    // Attach the GoPro block at its marker position (`first_gopro_idx`, the
+    // first TAG-PRODUCING GoPro `APP6`) alongside the EFFECTIVE EXIF block
+    // position (`effective_exif_idx`, the `APP1` whose `ProcessTIFF` emitted a
+    // movable tag). `Taggable::tags` interleaves them by ascending position, so
+    // a GoPro block below the EXIF block emits before it, otherwise after —
+    // reproducing exactly the old `first_gopro_idx < effective_exif_idx`
+    // comparison. BOTH indices are tag-producing, not merely
     // signature/prefix-matching: a malformed / BigTIFF / deferred-multi-segment
-    // `APP1` produces no EXIF tags (so does not anchor the EXIF side), and a
-    // truncated / empty `GoPro\0` `APP6` produces no GoPro tag (so does not
-    // anchor the GoPro side). With no `APP1` producing a parsed EXIF block the
-    // GoPro block is the only EXIF-or-GoPro content, so its absolute position
-    // does not matter — `false` keeps the simple after-`File`-group path
-    // (nothing to order against), matching ExifTool (no `IFD0:*` tags to be
+    // `APP1` produces no EXIF tags (so does not anchor the EXIF side, leaving
+    // `effective_exif_idx == None`), and a truncated / empty `GoPro\0` `APP6`
+    // produces no GoPro tag (so does not advance `first_gopro_idx`). With no
+    // `APP1` producing a parsed EXIF block (`effective_exif_idx == None`) the
+    // EXIF block has no position — it sorts FIRST (`Option`'s `None < Some`), so
+    // the GoPro block trails it, matching ExifTool (no `IFD0:*` tags to be
     // before/after).
     //
-    // This whole-GoPro-block before/after ordering is byte-exact for every
+    // This whole-GoPro-block ordering is byte-exact for every
     // single-effective-`APP1` layout — all realistic GoPro JPEGs (one early
     // `APP1` Exif + a later GoPro `APP6`, e.g. `t/images/GoPro.jpg`). It also
     // matches the oracle for multi-independent-`APP1` and `APP6`/`APP1`/`APP6`
@@ -502,13 +506,15 @@ fn attach_app6_gopro(
     // strict per-segment marker-order replay (under which the GoPro `HandleTag`
     // block would interleave BETWEEN two independent `APP1` tag blocks, or
     // straddle the EXIF block) is the engine-wide limitation tracked in
-    // issue 233; it does not surface in `-G1 -j` output (see
-    // [`ExifMeta::gopro_before_exif`] docs).
-    let before_exif = match (first_gopro_idx, effective_exif_idx) {
-      (Some(g), Some(e)) => g < e,
-      _ => false,
-    };
-    meta.set_jpeg_gopro(gopro, before_exif);
+    // issue 233; it does not surface in `-G1 -j` output (see the
+    // [`ExifMeta`] / [`JpegAuxBlock`](crate::exif::JpegAuxBlock) ordering docs).
+    //
+    // `first_gopro_idx` is `Some` here — it is set on the empty→non-empty
+    // `GoProMeta` transition, which must have occurred for `!gopro.is_empty()`.
+    // The `usize::MAX` fallback is unreachable; were it taken it would sort the
+    // GoPro block last (after the EXIF block), the old `_ => false` behaviour.
+    let gopro_pos = first_gopro_idx.unwrap_or(usize::MAX);
+    meta.set_jpeg_gopro(gopro, gopro_pos, effective_exif_idx);
   }
 }
 

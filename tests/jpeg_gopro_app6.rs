@@ -1395,10 +1395,11 @@ fn gopro_byte_order_only_app1_does_not_anchor_exif_first() {
 /// With NO `APP1` ever producing a parsed EXIF block — only a malformed `APP1`
 /// (Exif-signature match, no tags) plus a valid GoPro `APP6` — there is no
 /// `IFD0:*` content to order against, so the GoPro tags simply emit (after the
-/// `File` group). exifast attaches the GoPro block with `before_exif = false`
-/// (the `effective_exif_idx == None` path); `GoPro:DeviceName` is present and no
-/// `IFD0:*` tag appears, matching the oracle (which emits `GoPro:DeviceName`
-/// with the `Malformed APP1 EXIF segment` warning and no `IFD0:*`).
+/// `File` group). exifast records no EXIF block position (the
+/// `effective_exif_idx == None` path), so the EXIF block sorts first and the
+/// GoPro aux block trails it; `GoPro:DeviceName` is present and no `IFD0:*` tag
+/// appears, matching the oracle (which emits `GoPro:DeviceName` with the
+/// `Malformed APP1 EXIF segment` warning and no `IFD0:*`).
 #[test]
 fn gopro_app6_with_only_a_malformed_app1_still_emits_gopro() {
   let mut strm = Vec::new();
@@ -1456,10 +1457,11 @@ fn gopro_app6_with_only_a_malformed_app1_still_emits_gopro() {
 // FENCED: multiple INDEPENDENT valid `APP1` Exif blocks straddling a GoPro
 // `APP6` (issue 233, the engine-wide strict per-segment marker-order JPEG
 // emission limitation). exifast merges every `APP1` Exif block into ONE
-// `IFD0:*` stream and emits the whole GoPro block on ONE side of it, anchored
-// on `before_exif = first_gopro_idx < effective_exif_idx`
-// (`src/exif/jpeg.rs`). A strict ExifTool marker replay would instead emit
-// each segment's tags AT its `Marker:`-loop position
+// `IFD0:*` stream and emits the whole GoPro block on ONE side of it, ordered by
+// the marker-position sort in `ExifMeta::tags` (the GoPro aux block at
+// `first_gopro_idx` vs the EXIF block at `effective_exif_idx`,
+// `src/exif/jpeg.rs` + `src/exif/mod.rs`). A strict ExifTool marker replay
+// would instead emit each segment's tags AT its `Marker:`-loop position
 // (`ExifTool.pm:7325`) — so the GoPro `HandleTag` block would fall BETWEEN the
 // first `APP1`'s tags and the later independent `APP1`'s tags.
 //
@@ -1471,7 +1473,7 @@ fn gopro_app6_with_only_a_malformed_app1_still_emits_gopro() {
 // effective-EXIF index comparison. The cases below therefore VALUE- AND
 // ORDER-match the live oracle today; the fence is for the hypothetical strict
 // per-tag stream model (which neither tool's JSON exercises), the same class as
-// the `APP6`/`APP1`/`APP6` straddle (`ExifMeta::gopro_before_exif` docs).
+// the `APP6`/`APP1`/`APP6` straddle (`ExifMeta` / `JpegAuxBlock` ordering docs).
 // Real GoPro stills carry a SINGLE early `APP1` Exif + a later GoPro `APP6`
 // (the `t/images/GoPro.jpg` fixture), so they never hit this layout.
 // ===========================================================================
@@ -1530,8 +1532,9 @@ fn app6_gopro_payload(gpmf: &[u8]) -> Vec<u8> {
 /// `GoPro:DeviceName='BBB'` — i.e. BOTH independent `APP1` blocks are parsed and
 /// merged into one `IFD0` stream (extraction is faithful; nothing is dropped).
 /// The emission ORDER is `IFD0:Make`, `IFD0:Model`, `GoPro:DeviceName` (the
-/// merged `IFD0` run, then the GoPro block — `before_exif = false` because the
-/// GoPro `APP6` sits AFTER the FIRST effective `APP1`).
+/// merged `IFD0` run, then the GoPro block — the GoPro aux block's marker
+/// position sorts AFTER the EXIF block because the GoPro `APP6` sits AFTER the
+/// FIRST effective `APP1`).
 ///
 /// This VALUE- and ORDER-matches the live oracle (asserted below): ExifTool's
 /// `-G1 -j` co-locates the family-1 `IFD0` group, so it too renders

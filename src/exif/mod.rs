@@ -859,6 +859,59 @@ impl<'a> MakerNote<'a> {
   }
 }
 
+/// A positioned AUXILIARY JPEG metadata block — an `APP`-segment payload other
+/// than the EXIF (`APP1`) block, carried by an [`ExifMeta`] for a JPEG
+/// container and emitted by [`Taggable::tags`](crate::emit::Taggable::tags) at
+/// its marker position relative to the EXIF block.
+///
+/// ExifTool processes each `APP` segment inside its `Marker:` loop in file
+/// (marker) order (`ExifTool.pm:7325`), so each block's tags render as one
+/// contiguous group at the segment's position. `ExifMeta` reproduces that by
+/// interleaving these aux blocks with the EXIF block by ascending marker
+/// position (see the [`ExifMeta`] type docs and `Taggable::tags`).
+///
+/// Today the only variant is `GoPro` (the `APP6` `GoPro\0` GPMF stream,
+/// `JPEG.pm:196-198`). The enum is the extension point for future
+/// `APP`-segment extractors: adding XMP (`APP1` `http://ns.adobe.com/xap/1.0/`),
+/// ICC_Profile (`APP2`), MPF (`APP2`), or IPTC is a new variant here plus a
+/// [`push_jpeg_aux_block`](ExifMeta::push_jpeg_aux_block) call at the segment's
+/// marker index — the position-sort then orders it against the EXIF block
+/// automatically, with no new ordering code. (XMP/ICC/MPF/IPTC extraction
+/// itself is separate backlog work; this models only the ordering seam.)
+///
+/// Gated on `quicktime`: the sole variant payload
+/// ([`GoProMeta`](crate::metadata::GoProMeta)) and its GPMF parser live in the
+/// `quicktime`-feature module ([`crate::formats::gopro`]); the `exif` feature
+/// builds standalone with this enum absent. A future non-`quicktime` aux
+/// variant (XMP/ICC/…) would drop the gate.
+#[cfg(feature = "quicktime")]
+#[derive(Debug, Clone)]
+pub(crate) enum JpegAuxBlock {
+  /// The `APP6` "GoPro" GPMF device-settings stream (`JPEG.pm:196-198` →
+  /// `%GoPro::GPMF`), accumulated across every `GoPro\0`-prefixed `APP6`
+  /// segment. Renders under group `APP6`:`GoPro` via
+  /// [`emit_gopro_tags`](crate::formats::quicktime::emit_gopro_tags).
+  GoPro(crate::metadata::GoProMeta),
+}
+
+#[cfg(feature = "quicktime")]
+impl JpegAuxBlock {
+  /// Append this block's tags to `out` as [`EmittedTag`](crate::emit::EmittedTag)s
+  /// for `print_conv`, in the block's own internal (GPMF-walk) order — the
+  /// contiguous group ExifTool emits at the segment's marker position.
+  fn push_tags(&self, print_conv: bool, out: &mut std::vec::Vec<crate::emit::EmittedTag>) {
+    match self {
+      // The `APP6` "GoPro" GPMF stream renders the device-settings +
+      // camera-identity tags under group `APP6`:`GoPro` (family-1 stays
+      // `GoPro`; family-0 is the `APP6` parent the segment was reached
+      // through).
+      JpegAuxBlock::GoPro(gp) => {
+        crate::formats::quicktime::emit_gopro_tags(gp, "APP6", "GoPro", print_conv, out);
+      }
+    }
+  }
+}
+
 // ====================================================================// Typed Meta — `ExifMeta<'a>`
 // ====================================================================
 /// Typed Exif/TIFF metadata — the lib-first output of [`ProcessExif`] and
@@ -880,6 +933,32 @@ impl<'a> MakerNote<'a> {
 /// TIFF block was processed it has empty entries and `byte_order == None`
 /// (faithful: `File:ExifByteOrder` is `FoundTag`'d only inside `DoProcessTIFF`,
 /// `ExifTool.pm:8691`), possibly with a `Malformed APP1 EXIF segment` warning.
+///
+/// ## JPEG metadata-block ordering
+///
+/// For a JPEG container, ExifTool emits a file's tags in this overall shape
+/// (verified via `exiftool -G1 -j` on `XMP.jpg`/`Canon.jpg`/`ExifTool.jpg`):
+///
+/// 1. a synthetic prefix — the `File`-group tags (`File:ExifByteOrder`,
+///    `File:PageCount`, …) lead UNCONDITIONALLY, ahead of every segment;
+/// 2. the metadata blocks (the EXIF IFDs + the captured MakerNote; and any
+///    auxiliary `APP`-segment block — GoPro GPMF today; XMP / ICC_Profile /
+///    MPF / IPTC in future), each rendered as one CONTIGUOUS group, in the
+///    order their `APP` segment is processed (file / marker order —
+///    `ExifTool.pm:7325` runs each `Marker:` arm in segment order);
+/// 3. the `Composite` group LAST (synthesized after every block — `ExifMeta`
+///    itself emits no `Composite` tag; the engine appends that group).
+///
+/// `ExifMeta` models step 2 with a marker-POSITION-ordered block list rather
+/// than a per-block boolean: the EXIF block sits at
+/// [`exif_block_pos`](Self::exif_block_pos) and each positioned auxiliary block
+/// ([`JpegAuxBlock`], at its own marker index) is interleaved with it by
+/// ascending position (a STABLE sort — ties keep insertion order, a `None`
+/// EXIF position sorts the block first). A future `APP`-segment extractor slots
+/// in by adding a [`JpegAuxBlock`] variant and pushing it at its marker
+/// position ([`push_jpeg_aux_block`](Self::push_jpeg_aux_block)); it then
+/// auto-orders against the EXIF block with no further ordering logic. See
+/// [`Taggable::tags`](crate::emit::Taggable::tags).
 #[derive(Debug, Clone)]
 pub struct ExifMeta<'a> {
   /// Every emitted tag, in IFD-walk order. Fully owned (the `'a` lifetime is
@@ -966,44 +1045,54 @@ pub struct ExifMeta<'a> {
   /// (`GOPR*.JPG`) carries its device-settings GPMF stream in `APP6`; the
   /// marker walk ([`crate::exif::jpeg`]) recognizes the `GoPro\0`-prefixed
   /// segment, strips the 6-byte prefix, and runs the shared GPMF KLV walker
-  /// into this field. The tags emit under group `APP6`:`GoPro` from
-  /// [`Taggable::tags`](crate::emit::Taggable::tags) — AFTER the EXIF + MakerNote
-  /// tags in the realistic layout (`APP1` Exif before the later `APP6`,
-  /// `gopro_before_exif == false`), or BEFORE them when
-  /// [`gopro_before_exif`](Self::gopro_before_exif) is set (a non-standard
-  /// `APP6`-before-`APP1` JPEG) — faithful to ExifTool's `Marker:`-loop file
-  /// order. `None` for a non-GoPro JPEG / a standalone TIFF / any embedded-Exif
-  /// block other than a JPEG with an `APP6` GoPro segment.
+  /// into the aux block, which [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// emits under group `APP6`:`GoPro`.
   ///
-  /// Gated on `quicktime`: the `GoProMeta` model + the GPMF parser live in the
-  /// `quicktime`-feature module ([`crate::formats::gopro`]); the `exif` feature
-  /// builds standalone (no `quicktime`) with this field absent.
-  #[cfg(feature = "quicktime")]
-  gopro: Option<crate::metadata::GoProMeta>,
-  /// `true` when the `APP6` "GoPro" segment occurs BEFORE the first `APP1` Exif
-  /// segment in JPEG marker (file) order — ExifTool runs each `APP6`/`APP1` arm
-  /// inside its `Marker:` loop in file order (`ExifTool.pm:7325`), so a
-  /// non-standard JPEG that places the `GoPro\0` `APP6` ahead of the `Exif\0\0`
-  /// `APP1` emits the `GoPro:*` tags BEFORE the `IFD0:*` tags. The marker walk
-  /// ([`crate::exif::jpeg`]) records this; [`Taggable::tags`](crate::emit::Taggable::tags)
-  /// emits the GoPro block first when it is set, else after the EXIF + MakerNote
-  /// tags (the realistic layout — every real GoPro still, including the
-  /// `t/images/GoPro.jpg` fixture, has `APP1` before `APP6`, so this defaults
-  /// `false` and that path is unchanged).
+  /// The marker (file) position of the EXIF metadata block — the index of the
+  /// first `APP1` segment whose `ProcessTIFF` produced a MOVABLE (default-
+  /// visible, non-`File`) EXIF tag ([`emits_movable_tag`](Self::emits_movable_tag)),
+  /// the anchor [`jpeg_aux_blocks`](Self::jpeg_aux_blocks) interleave against.
+  /// `None` for a standalone TIFF / an embedded eXIf block (no JPEG marker
+  /// positions), and for a JPEG with no movable-tag-producing `APP1` (the EXIF
+  /// block then has no position to order against — it sorts first, so a GoPro
+  /// `APP6` still trails it, matching ExifTool with no `IFD0:*` to be
+  /// before/after). ExifTool runs each `APP1`/`APP6` arm inside its `Marker:`
+  /// loop in file order (`ExifTool.pm:7325`), so this position decides whether
+  /// a GoPro block's tags emit BEFORE or AFTER the `IFD0:*` tags. `File:*`
+  /// prefix tags do NOT participate (they lead unconditionally), so only the
+  /// MOVABLE EXIF tag anchors the position.
   ///
-  /// This handles the GoPro block being wholly before or wholly after the EXIF
-  /// block (the realistic cases ExifTool emits as one contiguous group each); a
-  /// pathological `APP6`/`APP1`/`APP6` straddle — or multiple INDEPENDENT `APP1`
-  /// Exif blocks straddling a GoPro `APP6` — is NOT fully marker-order-replayed
-  /// here (that would need an engine-wide per-segment emission model, the
-  /// limitation tracked in issue 233) — fine, because a real GoPro JPEG never
-  /// straddles, and because ExifTool's `-G1 -j` output co-locates the family-1
-  /// `IFD0` group anyway, so the whole-block order this flag computes still
-  /// matches the oracle at the conformance target (the strict marker-order
-  /// interleaving never surfaces in JSON). `false` for every non-GoPro /
-  /// standalone / embedded-block source.
+  /// Gated on `quicktime`: positioned only against `quicktime`-gated aux blocks
+  /// ([`JpegAuxBlock`]); the `exif` feature builds standalone with this field
+  /// absent (a non-`quicktime` build has no aux blocks to order against).
   #[cfg(feature = "quicktime")]
-  gopro_before_exif: bool,
+  exif_block_pos: Option<usize>,
+  /// The positioned AUXILIARY JPEG metadata blocks ([`JpegAuxBlock`]) — each an
+  /// `APP`-segment payload other than the EXIF block (the `APP6` GoPro GPMF
+  /// stream today), paired with its marker (file) position.
+  /// [`Taggable::tags`](crate::emit::Taggable::tags) interleaves them with the
+  /// EXIF block (at [`exif_block_pos`](Self::exif_block_pos)) by ascending
+  /// position (a STABLE sort), reproducing ExifTool's `Marker:`-loop file order
+  /// (`ExifTool.pm:7325`) where each block is one contiguous group.
+  ///
+  /// Currently holds at most the one GoPro block (at the first tag-producing
+  /// `APP6` position); the overwhelming common case is EMPTY (a non-GoPro JPEG,
+  /// a standalone TIFF, an embedded eXIf block). This is the extension point:
+  /// a future XMP / ICC_Profile / MPF / IPTC extractor pushes its own
+  /// [`JpegAuxBlock`] variant here at its segment's marker index
+  /// ([`push_jpeg_aux_block`](Self::push_jpeg_aux_block)) and it auto-orders.
+  ///
+  /// A pathological `APP6`/`APP1`/`APP6` straddle (one block split around the
+  /// EXIF block) is modeled as one block at its FIRST tag-producing position,
+  /// not split into two — a real GoPro JPEG never straddles, and ExifTool's
+  /// `-G1 -j` output co-locates the family-1 `IFD0` group, so the whole-block
+  /// order this computes matches the oracle at the conformance target (the
+  /// strict per-segment interleave never surfaces in JSON).
+  ///
+  /// Gated on `quicktime`: the sole current variant payload
+  /// ([`GoProMeta`](crate::metadata::GoProMeta)) is `quicktime`-only.
+  #[cfg(feature = "quicktime")]
+  jpeg_aux_blocks: std::vec::Vec<(usize, JpegAuxBlock)>,
 }
 
 impl<'a> ExifMeta<'a> {
@@ -1165,60 +1254,94 @@ impl<'a> ExifMeta<'a> {
       // (`ExifTool.pm:8629`) is reachable for an `APP1` Exif merge.
       dng_version: false,
       cr2_magic: false,
-      // The JPEG marker walk attaches an `APP6` GoPro GPMF stream AFTER this
+      // The JPEG marker walk records the EXIF block position and attaches any
+      // `APP`-segment aux block (an `APP6` GoPro GPMF stream) AFTER this
       // construction via [`set_jpeg_gopro`](Self::set_jpeg_gopro); a freshly
-      // built JPEG `ExifMeta` starts with none, in the realistic
-      // `APP1`-before-`APP6` order (GoPro tags emit AFTER EXIF).
+      // built JPEG `ExifMeta` starts with no recorded position and no aux
+      // blocks (the realistic `APP1`-before-`APP6` order — GoPro tags emit
+      // AFTER EXIF — is what the position-sort then yields).
       #[cfg(feature = "quicktime")]
-      gopro: None,
+      exif_block_pos: None,
       #[cfg(feature = "quicktime")]
-      gopro_before_exif: false,
+      jpeg_aux_blocks: std::vec::Vec::new(),
     }
   }
 
-  /// Attach the GoPro GPMF metadata decoded from a JPEG `APP6` "GoPro" segment
-  /// (JPEG.pm:183-198). Called by the JPEG marker walk
-  /// ([`crate::exif::jpeg`]) after [`from_jpeg_parts`](Self::from_jpeg_parts)
-  /// when an `APP6` segment whose payload began `GoPro\0` decoded at least one
-  /// GPMF record. The tags emit under group `APP6`:`GoPro` from
-  /// [`Taggable::tags`](crate::emit::Taggable::tags). A no-op-equivalent empty
-  /// `GoProMeta` is simply stored as-is (it emits nothing).
-  ///
-  /// `before_exif` records whether that `APP6` segment preceded the first
-  /// `APP1` Exif segment in JPEG marker (file) order (see
-  /// [`gopro_before_exif`](Self::gopro_before_exif)): `true` makes `tags` emit
-  /// the GoPro block BEFORE the EXIF + MakerNote tags (faithful to ExifTool's
-  /// `Marker:`-loop file order), `false` (the realistic `APP1`-before-`APP6`
-  /// layout) keeps it after.
+  /// Record the marker (file) position of the EXIF metadata block — the index
+  /// of the `APP1` segment whose `ProcessTIFF` emits the first MOVABLE EXIF tag
+  /// ([`emits_movable_tag`](Self::emits_movable_tag)) — for the JPEG
+  /// position-ordered block model. `None` when no `APP1` produced a movable tag
+  /// (the EXIF block then sorts first, so aux blocks trail it). The general
+  /// seam every positioned [`JpegAuxBlock`] interleaves against; see the
+  /// [`ExifMeta`] type docs and [`Taggable::tags`](crate::emit::Taggable::tags).
+  /// (`pub(crate)`: a JPEG-front-end construction-time internal.)
   #[cfg(feature = "quicktime")]
-  pub(crate) fn set_jpeg_gopro(&mut self, gopro: crate::metadata::GoProMeta, before_exif: bool) {
-    self.gopro = Some(gopro);
-    self.gopro_before_exif = before_exif;
+  pub(crate) fn set_jpeg_exif_block_pos(&mut self, pos: Option<usize>) {
+    self.exif_block_pos = pos;
+  }
+
+  /// Push a positioned AUXILIARY JPEG metadata block ([`JpegAuxBlock`]) at its
+  /// marker (file) `pos`. [`Taggable::tags`](crate::emit::Taggable::tags)
+  /// interleaves it with the EXIF block (and any other aux block) by ascending
+  /// position. This is the general extension point: a future XMP / ICC_Profile
+  /// / MPF / IPTC extractor pushes its own variant here and it auto-orders with
+  /// no further ordering code. (`pub(crate)`: a JPEG-front-end
+  /// construction-time internal.)
+  #[cfg(feature = "quicktime")]
+  pub(crate) fn push_jpeg_aux_block(&mut self, pos: usize, block: JpegAuxBlock) {
+    self.jpeg_aux_blocks.push((pos, block));
+  }
+
+  /// Attach the GoPro GPMF metadata decoded from a JPEG `APP6` "GoPro" segment
+  /// (JPEG.pm:183-198) at its marker `gopro_pos`, recording the EXIF block's
+  /// marker `exif_pos`. Called by the JPEG marker walk ([`crate::exif::jpeg`])
+  /// after [`from_jpeg_parts`](Self::from_jpeg_parts) when an `APP6` segment
+  /// whose payload began `GoPro\0` decoded at least one GPMF record. The tags
+  /// emit under group `APP6`:`GoPro` from
+  /// [`Taggable::tags`](crate::emit::Taggable::tags), interleaved with the EXIF
+  /// block by marker position. A no-op-equivalent empty `GoProMeta` is simply
+  /// stored as-is (it emits nothing).
+  ///
+  /// `gopro_pos` is the marker index of the first TAG-PRODUCING GoPro `APP6`;
+  /// `exif_pos` the EXIF block position (`None` when no `APP1` produced a
+  /// movable tag). When `gopro_pos < exif_pos` the GoPro block sorts BEFORE the
+  /// EXIF + MakerNote tags (faithful to ExifTool's `Marker:`-loop file order,
+  /// `ExifTool.pm:7325`); otherwise after (the realistic `APP1`-before-`APP6`
+  /// layout). A thin GoPro-named wrapper over the general
+  /// [`set_jpeg_exif_block_pos`](Self::set_jpeg_exif_block_pos) +
+  /// [`push_jpeg_aux_block`](Self::push_jpeg_aux_block) seam.
+  #[cfg(feature = "quicktime")]
+  pub(crate) fn set_jpeg_gopro(
+    &mut self,
+    gopro: crate::metadata::GoProMeta,
+    gopro_pos: usize,
+    exif_pos: Option<usize>,
+  ) {
+    self.set_jpeg_exif_block_pos(exif_pos);
+    self.push_jpeg_aux_block(gopro_pos, JpegAuxBlock::GoPro(gopro));
   }
 
   /// The GoPro GPMF metadata decoded from a JPEG `APP6` "GoPro" segment, if
   /// any (`None` for every non-GoPro-JPEG source). Exposes the full typed
   /// [`GoProMeta`](crate::metadata::GoProMeta) surface (per-sample lists, camera
-  /// identity, settings) the `APP6`:`GoPro` tag stream is rendered from.
+  /// identity, settings) the `APP6`:`GoPro` tag stream is rendered from. Reads
+  /// the GoPro [`JpegAuxBlock`] out of the positioned block list.
   #[cfg(feature = "quicktime")]
   #[must_use]
   #[inline]
+  // `find_map` reads as degenerate while `JpegAuxBlock` has one variant (the
+  // match cannot return `None`), but it is the SELECT-the-GoPro-block form: the
+  // moment a second variant (XMP/ICC/…) lands the arm gains a `_ => None` and
+  // the search becomes real. Keeping it now means adding a variant touches only
+  // the match, not the iterator shape.
+  #[allow(clippy::unnecessary_find_map)]
   pub fn gopro(&self) -> Option<&crate::metadata::GoProMeta> {
-    self.gopro.as_ref()
-  }
-
-  /// `true` when the source JPEG's `APP6` "GoPro" segment preceded its first
-  /// `APP1` Exif segment in marker (file) order, so [`Taggable::tags`](crate::emit::Taggable::tags)
-  /// emits the `GoPro:*` tags BEFORE the `IFD0:*`/`ExifIFD:*` tags (faithful to
-  /// ExifTool's `Marker:`-loop file order, `ExifTool.pm:7325`). `false` for the
-  /// realistic `APP1`-before-`APP6` layout (every real GoPro still, including
-  /// `t/images/GoPro.jpg`) and for every non-GoPro / standalone / embedded
-  /// source.
-  #[cfg(feature = "quicktime")]
-  #[must_use]
-  #[inline]
-  pub fn gopro_before_exif(&self) -> bool {
-    self.gopro_before_exif
+    self
+      .jpeg_aux_blocks
+      .iter()
+      .find_map(|(_, block)| match block {
+        JpegAuxBlock::GoPro(gp) => Some(gp),
+      })
   }
 
   /// Decompose this `ExifMeta` into `(entries, warnings, byte_order,
@@ -1731,11 +1854,12 @@ fn parse_tiff_with_base_no_raf<'a>(
     captured_model: w.captured_model.map(smol_str::SmolStr::from),
     dng_version: w.dng_version,
     cr2_magic,
-    // A standalone-TIFF walk has no JPEG `APP6` GoPro segment.
+    // A standalone-TIFF walk has no JPEG marker positions and no `APP`-segment
+    // aux blocks (no `APP6` GoPro).
     #[cfg(feature = "quicktime")]
-    gopro: None,
+    exif_block_pos: None,
     #[cfg(feature = "quicktime")]
-    gopro_before_exif: false,
+    jpeg_aux_blocks: std::vec::Vec::new(),
   })
 }
 
@@ -1881,11 +2005,12 @@ fn parse_tiff_with_base_shared<'a>(
     // unreachable; the CR2 magic read is gated on the standalone-TIFF `$raf`.
     dng_version: false,
     cr2_magic: false,
-    // An embedded-Exif block (PNG `eXIf`) has no JPEG `APP6` GoPro segment.
+    // An embedded-Exif block (PNG `eXIf`) has no JPEG marker positions and no
+    // `APP`-segment aux blocks (no `APP6` GoPro).
     #[cfg(feature = "quicktime")]
-    gopro: None,
+    exif_block_pos: None,
     #[cfg(feature = "quicktime")]
-    gopro_before_exif: false,
+    jpeg_aux_blocks: std::vec::Vec::new(),
   };
   (Some(meta), cycle_guard_warnings)
 }
@@ -3722,9 +3847,11 @@ impl ExifMeta<'_> {
   /// family-0 group OTHER than `File` — a MOVABLE tag whose position in
   /// ExifTool's `FoundTag` stream participates in cross-segment ordering.
   ///
-  /// This is the anchor predicate for a JPEG `APP6` "GoPro" block's
-  /// before/after-EXIF ordering ([`attach_app6_gopro`](crate::exif::jpeg)): the
-  /// EFFECTIVE EXIF block is the first `APP1` for which this returns `true`.
+  /// This is the anchor predicate that fixes the EXIF block's marker position
+  /// ([`exif_block_pos`](Self::exif_block_pos)) in the JPEG position-ordered
+  /// block model — the position a positioned [`JpegAuxBlock`] (a GoPro `APP6`
+  /// block today) interleaves against ([`attach_app6_gopro`](crate::exif::jpeg)):
+  /// the EFFECTIVE EXIF block is the first `APP1` for which this returns `true`.
   /// ExifTool emits the `File`-group tags (`File:ExifByteOrder`,
   /// `File:PageCount`, ...) as an UNCONDITIONAL prefix ahead of every segment's
   /// content, so they never order against a `GoPro:*` block and MUST NOT count;
@@ -3798,9 +3925,21 @@ impl crate::emit::Taggable for ExifMeta<'_> {
   ///    (`unknown:false`). The `File:FileType`/`FileTypeExtension`/`MIMEType`
   ///    triplet stays the engine's job — different `File:*` names, no key
   ///    collision.
-  /// 2. The EXIF entries (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) in IFD-walk order.
-  /// 3. The captured MakerNote's vendor emissions (`Apple:*`/`Canon:*`)
-  ///    carrying their `Unknown => 1` flag for the engine to suppress.
+  /// 2. The metadata blocks in marker-POSITION order. The EXIF block — the IFD
+  ///    entries (`IFD0`/`ExifIFD`/`GPS`/`IFD1`/…) in IFD-walk order, then the
+  ///    captured MakerNote's vendor emissions (`Apple:*`/`Canon:*`, carrying
+  ///    their `Unknown => 1` flag for the engine to suppress) — sits at
+  ///    [`exif_block_pos`](Self::exif_block_pos); each positioned auxiliary
+  ///    `APP`-segment block ([`JpegAuxBlock`] — the `APP6` "GoPro" GPMF stream
+  ///    today) sits at its own marker index. They are INTERLEAVED by ascending
+  ///    marker position (a STABLE sort; a `None` EXIF position sorts first), so
+  ///    each block emits at its segment's file-order position, reproducing
+  ///    ExifTool's `Marker:`-loop order (`ExifTool.pm:7325`). For the common
+  ///    case (no aux blocks) this is just the EXIF block, unchanged.
+  ///
+  /// `ExifMeta` emits no `Composite` group; the engine appends that LAST,
+  /// completing ExifTool's [`File`-prefix → marker-order blocks → `Composite`]
+  /// JPEG structure (see the [`ExifMeta`] type docs).
   ///
   /// This is the SINGLE source of the EXIF tag stream: both `serialize_tags`
   /// (`-j`/`-n` JSON) and [`crate::format_parser::AnyMeta::iter_tags`] drive
@@ -3847,39 +3986,60 @@ impl crate::emit::Taggable for ExifMeta<'_> {
         false,
       ));
     }
-    // A JPEG `APP6` "GoPro" GPMF stream (JPEG.pm:183-198 → `%GoPro::GPMF`):
-    // ExifTool runs each `APP6`/`APP1` arm inside its `Marker:` loop in file
-    // order (`ExifTool.pm:7325`), so the `GoPro:*` tags emit in segment order
-    // relative to the `APP1` Exif `IFD0:*` tags. The shared GoPro emitter
-    // renders the device-settings + camera-identity tags under group
-    // `APP6`:`GoPro` (family-1 stays `GoPro`; family-0 is the `APP6` parent the
-    // segment was reached through). The realistic GoPro still — including the
-    // `t/images/GoPro.jpg` fixture — places `APP1` BEFORE `APP6`, so the GoPro
-    // block emits AFTER the EXIF + MakerNote tags (`gopro_before_exif ==
-    // false`); a non-standard JPEG with `APP6` before `APP1` emits the GoPro
-    // block BEFORE them. This is a whole-block before/after swap (each side is
-    // one contiguous group in ExifTool's output); a pathological
-    // `APP6`/`APP1`/`APP6` straddle is not fully marker-order-replayed (real
-    // GoPro JPEGs never straddle). `None` for every non-GoPro-JPEG source.
+    // Emit the metadata blocks in marker-POSITION order: the EXIF block (the
+    // IFD entries + the captured MakerNote — one contiguous group, internal
+    // order unchanged) at `exif_block_pos`, INTERLEAVED with each positioned
+    // auxiliary `APP`-segment block ([`JpegAuxBlock`] — the `APP6` "GoPro"
+    // GPMF stream today) at its own marker index. ExifTool runs each
+    // `APP1`/`APP6` arm inside its `Marker:` loop in file order
+    // (`ExifTool.pm:7325`), so a block's tags emit at its segment's position;
+    // this reproduces that ordering. The `File:*` prefix already emitted above
+    // leads unconditionally (it never participates), and any `Composite` group
+    // is appended LATER by the engine (`ExifMeta` emits none), so this step is
+    // exactly the marker-ordered middle of ExifTool's [File → blocks →
+    // Composite] structure.
     #[cfg(feature = "quicktime")]
-    let emit_gopro = |tags: &mut std::vec::Vec<crate::emit::EmittedTag>| {
-      if let Some(gp) = self.gopro.as_ref() {
-        crate::formats::quicktime::emit_gopro_tags(gp, "APP6", "GoPro", print_conv, tags);
+    {
+      // A block reference paired with its marker position. The EXIF block's
+      // position is `Option`: `None` (no movable-tag `APP1`) sorts FIRST via
+      // `Option`'s `None < Some` ordering, so aux blocks (positive positions)
+      // trail it — matching ExifTool with no `IFD0:*` to order against.
+      enum Block<'b> {
+        Exif,
+        Aux(&'b JpegAuxBlock),
       }
-    };
-    // GoPro block before the EXIF + MakerNote tags when its `APP6` preceded the
-    // `APP1` Exif segment (`File:ExifByteOrder`/`PageCount` still lead — they
-    // are the `File` group ExifTool emits ahead of every segment). Otherwise it
-    // follows them (the realistic layout, GoPro.jpg unchanged).
-    #[cfg(feature = "quicktime")]
-    if self.gopro_before_exif {
-      emit_gopro(&mut tags);
+      let mut order: std::vec::Vec<(Option<usize>, Block<'_>)> =
+        std::vec::Vec::with_capacity(1 + self.jpeg_aux_blocks.len());
+      // Push the EXIF block FIRST so a position tie resolves EXIF-before-aux
+      // (the stable sort preserves insertion order on equal keys) — the
+      // realistic `APP1`-before-`APP6` layout the retired `before_exif == false`
+      // path produced.
+      order.push((self.exif_block_pos, Block::Exif));
+      for (pos, block) in &self.jpeg_aux_blocks {
+        order.push((Some(*pos), Block::Aux(block)));
+      }
+      // STABLE sort by ascending marker position (`Option<usize>`: `None`
+      // first, then ascending `Some`). Reproduces the old
+      // `first_gopro_idx < effective_exif_idx` comparison: a GoPro block at a
+      // position below the EXIF block sorts before it (GoPro-first), otherwise
+      // after.
+      order.sort_by_key(|(pos, _)| *pos);
+      for (_, block) in order {
+        match block {
+          Block::Exif => {
+            self.push_exif_tags(print_conv, &mut tags);
+            self.push_maker_note_tags(print_conv, &mut tags);
+          }
+          Block::Aux(aux) => aux.push_tags(print_conv, &mut tags),
+        }
+      }
     }
-    self.push_exif_tags(print_conv, &mut tags);
-    self.push_maker_note_tags(print_conv, &mut tags);
-    #[cfg(feature = "quicktime")]
-    if !self.gopro_before_exif {
-      emit_gopro(&mut tags);
+    // Without `quicktime` there are no aux blocks, so the EXIF block is the only
+    // metadata block — emitted in its normal position (unchanged).
+    #[cfg(not(feature = "quicktime"))]
+    {
+      self.push_exif_tags(print_conv, &mut tags);
+      self.push_maker_note_tags(print_conv, &mut tags);
     }
     tags.into_iter()
   }
@@ -6797,6 +6957,251 @@ mod tests {
     assert_eq!(
       emit_conv(&RawValue::Bytes(std::vec![0, 0, 0]), conv, true),
       ""
+    );
+  }
+
+  // -- JPEG positioned metadata-block ordering (issue 233) -------------------
+  //
+  // The general marker-position block model: `ExifMeta::tags` emits the
+  // `File`-group prefix first, then the EXIF block (at `exif_block_pos`) and
+  // each positioned `JpegAuxBlock` (at its marker index) INTERLEAVED by
+  // ascending position. These tests pin that the model reproduces the retired
+  // `gopro_before_exif` bool (both orders) and generalizes to more than one
+  // aux block (a second positioned block falls on the other side of the EXIF
+  // block purely by its marker position — exactly how a future XMP / ICC /
+  // MPF / IPTC `JpegAuxBlock` variant would slot in).
+
+  /// One GPMF `KLV` record (Key-Length-Value), 4-byte aligned (GoPro.pm).
+  #[cfg(feature = "quicktime")]
+  fn gpmf_klv(
+    out: &mut std::vec::Vec<u8>,
+    key: &[u8; 4],
+    fmt: u8,
+    size: u8,
+    count: u16,
+    payload: &[u8],
+  ) {
+    out.extend_from_slice(key);
+    out.push(fmt);
+    out.push(size);
+    out.extend_from_slice(&count.to_be_bytes());
+    out.extend_from_slice(payload);
+    while out.len() % 4 != 0 {
+      out.push(0);
+    }
+  }
+
+  /// A minimal `GoProMeta` whose sole tag is `DeviceName = name` — a single
+  /// `DEVC` → `STRM` → `DVNM` GPMF stream decoded by `process_gopro`.
+  #[cfg(feature = "quicktime")]
+  fn gopro_device_name(name: &str) -> crate::metadata::GoProMeta {
+    let mut dvnm = std::vec::Vec::new();
+    gpmf_klv(
+      &mut dvnm,
+      b"DVNM",
+      0x63,
+      1,
+      name.len() as u16,
+      name.as_bytes(),
+    );
+    let mut strm = std::vec::Vec::new();
+    gpmf_klv(&mut strm, b"STRM", 0x00, 1, dvnm.len() as u16, &dvnm);
+    let mut devc = std::vec::Vec::new();
+    gpmf_klv(&mut devc, b"DEVC", 0x00, 1, strm.len() as u16, &strm);
+    let mut gp = crate::metadata::GoProMeta::new();
+    assert!(
+      crate::formats::gopro::process_gopro(&devc, &mut gp),
+      "the crafted DEVC/STRM/DVNM stream decodes a record"
+    );
+    assert!(!gp.is_empty());
+    gp
+  }
+
+  /// Collect `(family0, family1, name)` for each emitted tag, in order — the
+  /// stream `ExifMeta::tags` yields for `-G1 -j`.
+  #[cfg(feature = "quicktime")]
+  fn ordered_groups(meta: &ExifMeta<'_>) -> std::vec::Vec<(String, String, String)> {
+    use crate::emit::Taggable;
+    meta
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .map(|t| {
+        let g = t.tag().group_ref();
+        (
+          g.family0().to_string(),
+          g.family1().to_string(),
+          t.tag().name().to_string(),
+        )
+      })
+      .collect()
+  }
+
+  /// The DeviceName VALUE of the first `GoPro:DeviceName` tag (to tell two
+  /// GoPro aux blocks apart by position).
+  #[cfg(feature = "quicktime")]
+  fn device_name_values(meta: &ExifMeta<'_>) -> std::vec::Vec<String> {
+    use crate::emit::Taggable;
+    meta
+      .tags(crate::emit::EmitOptions::g1(
+        crate::emit::ConvMode::PrintConv,
+        false,
+      ))
+      .filter(|t| t.tag().name() == "DeviceName")
+      .map(|t| match t.tag().value_ref() {
+        crate::value::TagValue::Str(s) => s.to_string(),
+        other => std::format!("{other:?}"),
+      })
+      .collect()
+  }
+
+  /// A GoPro aux block at a position AFTER the EXIF block (the realistic
+  /// `APP1`-before-`APP6` layout) emits `File:ExifByteOrder` → `IFD0:Make`
+  /// (the EXIF block) → `GoPro:DeviceName` (the aux block) — i.e. the EXIF
+  /// block then the aux block. Reproduces the old `before_exif == false`.
+  #[test]
+  #[cfg(feature = "quicktime")]
+  fn jpeg_aux_block_after_exif_by_position() {
+    let tiff = minimal_tiff_with_make();
+    let mut meta = parse_exif_block(&tiff).expect("valid TIFF");
+    // EXIF block at marker index 2; GoPro `APP6` at index 5 (after it).
+    meta.set_jpeg_gopro(gopro_device_name("GoP-After"), 5, Some(2));
+    let order = ordered_groups(&meta);
+    assert_eq!(
+      order,
+      std::vec![
+        (
+          "File".to_string(),
+          "File".to_string(),
+          "ExifByteOrder".to_string()
+        ),
+        ("EXIF".to_string(), "IFD0".to_string(), "Make".to_string()),
+        (
+          "APP6".to_string(),
+          "GoPro".to_string(),
+          "DeviceName".to_string()
+        ),
+      ],
+      "File prefix first, then EXIF block, then the later-positioned aux block"
+    );
+  }
+
+  /// A GoPro aux block at a position BEFORE the EXIF block (a non-standard
+  /// `APP6`-before-`APP1` JPEG) emits `File:ExifByteOrder` → `GoPro:DeviceName`
+  /// (the aux block) → `IFD0:Make` (the EXIF block). The `File`-group prefix
+  /// STILL leads; only the movable EXIF block reorders. Reproduces the old
+  /// `before_exif == true`.
+  #[test]
+  #[cfg(feature = "quicktime")]
+  fn jpeg_aux_block_before_exif_by_position() {
+    let tiff = minimal_tiff_with_make();
+    let mut meta = parse_exif_block(&tiff).expect("valid TIFF");
+    // GoPro `APP6` at marker index 1; EXIF block at index 3 (after it).
+    meta.set_jpeg_gopro(gopro_device_name("GoP-Before"), 1, Some(3));
+    let order = ordered_groups(&meta);
+    assert_eq!(
+      order,
+      std::vec![
+        (
+          "File".to_string(),
+          "File".to_string(),
+          "ExifByteOrder".to_string()
+        ),
+        (
+          "APP6".to_string(),
+          "GoPro".to_string(),
+          "DeviceName".to_string()
+        ),
+        ("EXIF".to_string(), "IFD0".to_string(), "Make".to_string()),
+      ],
+      "File prefix first, then the earlier-positioned aux block, then the EXIF block"
+    );
+  }
+
+  /// With NO recorded EXIF block position (`exif_block_pos == None`, the
+  /// no-movable-`APP1` path), the EXIF block sorts FIRST (`Option`'s
+  /// `None < Some`), so the GoPro aux block trails it — matching ExifTool with
+  /// no `IFD0:*` to order against. Reproduces the old `_ => false` arm.
+  #[test]
+  #[cfg(feature = "quicktime")]
+  fn jpeg_aux_block_with_no_exif_position_trails_exif_block() {
+    // A byte-order-only TIFF (empty IFD0): the EXIF block emits ONLY the
+    // `File:ExifByteOrder` prefix — no movable tag — so a real JPEG front-end
+    // would leave `exif_block_pos == None`. Model that directly.
+    let mut t: std::vec::Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x00]); // IFD0 with 0 entries
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    let mut meta = parse_exif_block(&t).expect("valid empty-IFD0 TIFF");
+    meta.set_jpeg_gopro(gopro_device_name("GoP-NoExif"), 9, None);
+    let order = ordered_groups(&meta);
+    assert_eq!(
+      order,
+      std::vec![
+        (
+          "File".to_string(),
+          "File".to_string(),
+          "ExifByteOrder".to_string()
+        ),
+        (
+          "APP6".to_string(),
+          "GoPro".to_string(),
+          "DeviceName".to_string()
+        ),
+      ],
+      "no movable EXIF tag: File prefix, then the aux block trailing the \
+       position-less EXIF block"
+    );
+  }
+
+  /// GENERALITY: the model interleaves MORE than one positioned aux block — the
+  /// EXIF block is sandwiched between two aux blocks purely by marker position.
+  /// Pushed via the GENERAL `set_jpeg_exif_block_pos` + `push_jpeg_aux_block`
+  /// seam (not the GoPro-named wrapper), out of marker order, to prove the sort
+  /// — not insertion order — decides emission. A future non-GoPro
+  /// `JpegAuxBlock` variant (XMP / ICC / MPF / IPTC) slots in identically: push
+  /// it at its segment's marker index and it auto-orders.
+  #[test]
+  #[cfg(feature = "quicktime")]
+  fn jpeg_multiple_aux_blocks_interleave_by_position() {
+    let tiff = minimal_tiff_with_make();
+    let mut meta = parse_exif_block(&tiff).expect("valid TIFF");
+    // EXIF block at marker index 4. Two aux blocks straddle it: one at index 1
+    // (before), one at index 7 (after). Pushed in REVERSE marker order to show
+    // the position-sort (not push order) governs.
+    meta.set_jpeg_exif_block_pos(Some(4));
+    meta.push_jpeg_aux_block(7, JpegAuxBlock::GoPro(gopro_device_name("aux-late")));
+    meta.push_jpeg_aux_block(1, JpegAuxBlock::GoPro(gopro_device_name("aux-early")));
+    let order = ordered_groups(&meta);
+    assert_eq!(
+      order,
+      std::vec![
+        (
+          "File".to_string(),
+          "File".to_string(),
+          "ExifByteOrder".to_string()
+        ),
+        (
+          "APP6".to_string(),
+          "GoPro".to_string(),
+          "DeviceName".to_string()
+        ),
+        ("EXIF".to_string(), "IFD0".to_string(), "Make".to_string()),
+        (
+          "APP6".to_string(),
+          "GoPro".to_string(),
+          "DeviceName".to_string()
+        ),
+      ],
+      "File prefix, then aux@1, then the EXIF block, then aux@7 — interleaved \
+       by ascending marker position regardless of push order"
+    );
+    // The values confirm WHICH block landed where: the early block (index 1)
+    // emits before the EXIF block, the late one (index 7) after.
+    assert_eq!(
+      device_name_values(&meta),
+      std::vec!["aux-early".to_string(), "aux-late".to_string()],
+      "the position-1 block sorts before the EXIF block, the position-7 after"
     );
   }
 }
