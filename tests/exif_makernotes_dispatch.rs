@@ -4325,13 +4325,13 @@ fn canon_223_second_pass_subdir_parents_suppressed() {
 }
 
 /// NikonD2Hs.jpg (type-3) — exercises the FlashType empty string, the
-/// `ColorSpace` hash, AFInfo (BigEndian DSLR path), the deferred ENCRYPTED
-/// ColorBalance (WB_RGGBLevels) which must NOT appear, AND — the headline of
-/// this PR — the ENCRYPTED `LensData0201` block: decrypted with serial key
-/// `3001006` + count `2`, then decoded against `%LensData01` to LensIDNumber
-/// 118 / LensFStops 7.33 / FocalLength 50.4 mm etc. A wrong serial/count key
-/// or a wrong cipher would decode garbage, not these exact oracle values, so
-/// this test is the decrypt's end-to-end proof.
+/// `ColorSpace` hash, AFInfo (BigEndian DSLR path), the UNENCRYPTED
+/// `FlashInfo0100` (0x00a8) block, the deferred ENCRYPTED ColorBalance
+/// (WB_RGGBLevels) which must NOT appear, AND the ENCRYPTED `LensData0201`
+/// block: decrypted with serial key `3001006` + count `2`, then decoded against
+/// `%LensData01` to LensIDNumber 118 / LensFStops 7.33 / FocalLength 50.4 mm
+/// etc. A wrong serial/count key or a wrong cipher would decode garbage, not
+/// these exact oracle values, so this test is the decrypt's end-to-end proof.
 #[cfg(feature = "json")]
 #[test]
 fn real_fixture_nikon_d2hs_makernotes() {
@@ -4359,6 +4359,22 @@ fn real_fixture_nikon_d2hs_makernotes() {
       ("Nikon:AFAreaMode", r#""Single Area""#),
       ("Nikon:AFPointsInFocus", r#""Center""#),
       ("Nikon:HighISONoiseReduction", r#""Normal""#),
+      // FlashInfo0100 (UNENCRYPTED plaintext ProcessBinaryData, 0x00a8). The
+      // all-Off SB-less shape: FlashCompensation/GNDistance/GroupA/BCompensation
+      // are the bare number 0 (the FlashControlMode-Off branch, NOT FlashOutput);
+      // FlashFocalLength/RepeatingFlashRate/Count drop (RawConv `$val?:undef`).
+      ("Nikon:FlashInfoVersion", r#""0100""#),
+      ("Nikon:FlashSource", r#""None""#),
+      ("Nikon:ExternalFlashFirmware", r#""n/a""#),
+      ("Nikon:ExternalFlashFlags", r#""(none)""#),
+      ("Nikon:FlashCommanderMode", r#""Off""#),
+      ("Nikon:FlashControlMode", r#""Off""#),
+      ("Nikon:FlashCompensation", "0"),
+      ("Nikon:FlashGNDistance", "0"),
+      ("Nikon:FlashGroupAControlMode", r#""Off""#),
+      ("Nikon:FlashGroupBControlMode", r#""Off""#),
+      ("Nikon:FlashGroupACompensation", "0"),
+      ("Nikon:FlashGroupBCompensation", "0"),
       // LensData0201 (ENCRYPTED → DECRYPTED with serial 3001006 / count 2,
       // then `%LensData01`). These prove the Decrypt + SerialKey are correct.
       ("Nikon:LensDataVersion", r#""0201""#),
@@ -4378,17 +4394,30 @@ fn real_fixture_nikon_d2hs_makernotes() {
     ],
   );
   // The D2Hs ColorBalance is the ENCRYPTED 0206 variant ⇒ WB_RGGBLevels is
-  // deferred (oracle-only), and no bogus ColorBalance / LensData parent is
-  // emitted.
+  // deferred (oracle-only), and no bogus ColorBalance / LensData / FlashInfo
+  // parent is emitted.
   assert!(!map.contains_key("Nikon:WB_RGGBLevels"));
   assert!(!map.contains_key("Nikon:ColorBalance"));
   assert!(!map.contains_key("Nikon:LensData"));
+  assert!(!map.contains_key("Nikon:FlashInfo"));
+  // The RawConv-undef FlashInfo0100 members (raw 0) drop (oracle has none).
+  for absent in [
+    "Nikon:FlashFocalLength",
+    "Nikon:RepeatingFlashRate",
+    "Nikon:RepeatingFlashCount",
+    "Nikon:FlashOutput",
+    "Nikon:FlashGroupAOutput",
+    "Nikon:FlashGroupBOutput",
+  ] {
+    assert!(!map.contains_key(absent), "{absent} must be absent");
+  }
 }
 
 /// NikonD70.jpg (type-3) — exercises the `FlashExposureComp` PrintFraction
 /// (`-5/3`) and `ExposureDifference` (`%+.1f` → `-4.9`), the title-cased
-/// `FlashType` ("Built-in,TTL"), the unencrypted WB_RGBGLevels, AND the
-/// UNENCRYPTED `LensData0101` children. The D70 SerialNumber is the STRING
+/// `FlashType` ("Built-in,TTL"), the unencrypted WB_RGBGLevels, the UNENCRYPTED
+/// `FlashInfo0100` (0x00a8) block, AND the UNENCRYPTED `LensData0101` children.
+/// The D70 SerialNumber is the STRING
 /// `"No= 20025585"` (→ `SerialKey` 0x60), but LensData0101 is unencrypted so
 /// the key is unused here — the FocalLength 56.6 mm / SerialNumber-string path
 /// still decodes correctly.
@@ -4413,6 +4442,19 @@ fn real_fixture_nikon_d70_makernotes() {
       ("Nikon:WB_RGBGLevels", r#""597 256 361 256""#),
       ("Nikon:SerialNumber", r#""No= 20025585""#),
       ("Nikon:Saturation", r#""Enhanced""#),
+      // FlashInfo0100 (UNENCRYPTED, 0x00a8) — the same all-Off shape as D2Hs.
+      ("Nikon:FlashInfoVersion", r#""0100""#),
+      ("Nikon:FlashSource", r#""None""#),
+      ("Nikon:ExternalFlashFirmware", r#""n/a""#),
+      ("Nikon:ExternalFlashFlags", r#""(none)""#),
+      ("Nikon:FlashCommanderMode", r#""Off""#),
+      ("Nikon:FlashControlMode", r#""Off""#),
+      ("Nikon:FlashCompensation", "0"),
+      ("Nikon:FlashGNDistance", "0"),
+      ("Nikon:FlashGroupAControlMode", r#""Off""#),
+      ("Nikon:FlashGroupBControlMode", r#""Off""#),
+      ("Nikon:FlashGroupACompensation", "0"),
+      ("Nikon:FlashGroupBCompensation", "0"),
       // LensData0101 (UNENCRYPTED, walked): the D70's FocalLength is 56.6 mm.
       ("Nikon:LensDataVersion", r#""0101""#),
       ("Nikon:ExitPupilPosition", r#""89.0 mm""#),
@@ -4431,4 +4473,15 @@ fn real_fixture_nikon_d70_makernotes() {
     ],
   );
   assert!(!map.contains_key("Nikon:LensData"));
+  assert!(!map.contains_key("Nikon:FlashInfo"));
+  for absent in [
+    "Nikon:FlashFocalLength",
+    "Nikon:RepeatingFlashRate",
+    "Nikon:RepeatingFlashCount",
+    "Nikon:FlashOutput",
+    "Nikon:FlashGroupAOutput",
+    "Nikon:FlashGroupBOutput",
+  ] {
+    assert!(!map.contains_key(absent), "{absent} must be absent");
+  }
 }

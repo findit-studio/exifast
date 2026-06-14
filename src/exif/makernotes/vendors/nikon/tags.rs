@@ -29,15 +29,23 @@
 //!   ([`LENS_DATA_00`]/[`LENS_DATA_01`]/[`LENS_DATA_0204`]/[`LENS_DATA_0400`]/
 //!   [`LENS_DATA_0402`]/[`LENS_DATA_0403`]/[`LENS_DATA_0800_OLD`]).
 //!
+//! - `FlashInfo` (0x00a8, `%Nikon::FlashInfo0100`, `Nikon.pm:2987-3009`/
+//!   `10810`) — an UNENCRYPTED plaintext `ProcessBinaryData` table
+//!   version-dispatched on the 4-byte `FlashInfoVersion` prefix. The `010[01]`
+//!   arm is WALKED → FlashInfoVersion, FlashSource, ExternalFlashFirmware/Flags,
+//!   FlashCommanderMode, FlashControlMode, the Manual/comp conditional outputs,
+//!   FlashGNDistance, the FlashGroup{A,B} modes/outputs. The other versions
+//!   (`0102`/`010[345]`/`0106`/`010[78]`/`030[01]`/other) are a committed
+//!   follow-up (the dispatch adds them one arm at a time).
+//!
 //! ## Deferred (encrypted — need the remaining `ProcessNikonEncrypted` tables)
 //!
-//! `ShotInfo*` (0x0091), `FlashInfo*` (0x00a8), and the ENCRYPTED
-//! `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) are
-//! `ProcessNikonEncrypted` sub-tables keyed on the SerialNumber +
-//! ShutterCount XOR keystream (`Nikon.pm:13604` `Decrypt`). They carry a
-//! deferred [`SubTable`] marker so the parent is NOT emitted (the #177/#223
-//! bogus-parent rule), and their decrypted children stay unported here (a
-//! committed Phase 2 follow-up). The `%LensData0800` NEW Z-lens block (offsets
+//! `ShotInfo*` (0x0091) and the ENCRYPTED `ColorBalance` variants (0x0097
+//! `0205`/`0209`/`02xx`) are `ProcessNikonEncrypted` sub-tables keyed on the
+//! SerialNumber + ShutterCount XOR keystream (`Nikon.pm:13604` `Decrypt`). They
+//! carry a deferred [`SubTable`] marker so the parent is NOT emitted (the
+//! #177/#223 bogus-parent rule), and their decrypted children stay unported here
+//! (a committed Phase 2 follow-up). The `%LensData0800` NEW Z-lens block (offsets
 //! 0x2f onward — int16u `LensID`/`MaxAperture`/`FNumber` + the
 //! `FocusMode`-gated focus telemetry) likewise stays a follow-up; its
 //! `LensDataVersion` + legacy OldLensData fields ARE emitted.
@@ -144,7 +152,11 @@ pub enum SubTable {
   LensData,
   /// `ShotInfo*` (0x0091) — `ProcessNikonEncrypted`. DEFERRED.
   ShotInfo,
-  /// `FlashInfo*` (0x00a8) — `ProcessNikonEncrypted`. DEFERRED.
+  /// `FlashInfo*` (0x00a8) — an UNENCRYPTED plaintext `ProcessBinaryData` table
+  /// version-dispatched on the 4-byte `FlashInfoVersion` prefix
+  /// (`Nikon.pm:2987-3009`). The `010[01]` arm (`%Nikon::FlashInfo0100`) is
+  /// WALKED; the other versions (`0102`/`010[345]`/`0106`/`010[78]`/`030[01]`/
+  /// other) are not yet ported (a committed follow-up) and emit nothing.
   FlashInfo,
   /// The ENCRYPTED `ColorBalance` variants (0x0097 `0205`/`0209`/`02xx`) —
   /// `ProcessNikonEncrypted`. DEFERRED. (The unencrypted `0100`/`0102`/`0103`
@@ -163,7 +175,10 @@ impl SubTable {
   #[must_use]
   #[inline(always)]
   pub const fn is_walked(self) -> bool {
-    matches!(self, SubTable::AfInfo | SubTable::ColorBalance0103)
+    matches!(
+      self,
+      SubTable::AfInfo | SubTable::ColorBalance0103 | SubTable::FlashInfo
+    )
   }
 }
 
@@ -689,11 +704,12 @@ mod tests {
     assert_eq!(lookup(0x00a7).unwrap().name(), "ShutterCount");
   }
 
-  /// The encrypted sub-tables carry a DEFERRED (`!is_walked`) marker so the
-  /// parent pointer is suppressed (#177/#223), while the two unencrypted ones
-  /// are walked.
+  /// The deferred sub-tables carry a DEFERRED (`!is_walked`) marker so the
+  /// parent pointer is suppressed (#177/#223), while the walked ones emit their
+  /// leaves. `LensData` (0x0098) defers the parent but DECRYPTS+emits children;
+  /// `FlashInfo` (0x00a8) is UNENCRYPTED and walked.
   #[test]
-  fn encrypted_subdirs_are_deferred() {
+  fn deferred_subdirs_marker() {
     assert_eq!(
       lookup(0x0091).unwrap().sub_table(),
       Some(SubTable::ShotInfo)
@@ -704,12 +720,12 @@ mod tests {
       Some(SubTable::LensData)
     );
     assert!(!SubTable::LensData.is_walked());
+    // Walked sub-tables — incl. the UNENCRYPTED FlashInfo0100 (0x00a8).
     assert_eq!(
       lookup(0x00a8).unwrap().sub_table(),
       Some(SubTable::FlashInfo)
     );
-    assert!(!SubTable::FlashInfo.is_walked());
-    // Walked sub-tables.
+    assert!(SubTable::FlashInfo.is_walked());
     assert_eq!(lookup(0x0088).unwrap().sub_table(), Some(SubTable::AfInfo));
     assert!(SubTable::AfInfo.is_walked());
     assert_eq!(

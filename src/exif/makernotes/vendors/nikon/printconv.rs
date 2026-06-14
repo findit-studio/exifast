@@ -198,6 +198,52 @@ pub enum NikonConv {
   /// by the caller BEFORE this PrintConv; the raw value here is already masked
   /// to 0/1. `-n` emits the masked integer.
   LensMountType,
+  /// `%Nikon::FlashInfo0100` `FlashSource` (offset 4, `Nikon.pm:10824`) —
+  /// `{0=>'None',1=>'External',2=>'Internal'}`.
+  FlashSource,
+  /// `%Nikon::FlashInfo0100` `FlashControlMode` / `FlashGroupAControlMode` /
+  /// `FlashGroupBControlMode` (`Nikon.pm:829-838`, the shared `%flashControlMode`
+  /// hash) — `{0=>'Off',1=>'iTTL-BL',…,7=>'Repeating Flash'}`. The `Mask` is
+  /// applied by the caller; the raw value here is already masked.
+  FlashControlMode,
+  /// `%Nikon::FlashInfo0100` `ExternalFlashFlags` (offset 8, `Nikon.pm:10838`) —
+  /// `PrintConv => { 0 => '(none)', BITMASK => { 0=>'Fired', 2=>'Bounce Flash',
+  /// 4=>'Wide Flash Adapter', 5=>'Dome Diffuser' } }`. The `0` key short-circuits
+  /// `(none)`; otherwise the `DecodeBits` walk (the same path `LensType` uses) —
+  /// an unlisted set bit renders `[n]`. `-n` emits the raw int8u.
+  ExternalFlashFlags,
+  /// `%Nikon::FlashInfo0100` `FlashGNDistance` (offset 14, `Nikon.pm:792-815`,
+  /// the `%flashGNDistance` hash) — `{0=>'0',1=>'0.1 m',…,255=>'n/a'}`. Key `0`
+  /// maps to the bare string `"0"`; an unlisted value renders `Unknown (N)` —
+  /// the standard ExifTool HASH-PrintConv miss fallback (`ExifTool.pm:3632`,
+  /// no `BITMASK`/`OTHER`/`PrintHex` on this hash), via the shared `hash_conv`.
+  /// `-n` emits the raw int8u.
+  FlashGnDistance,
+  /// `%Nikon::FlashInfo0100` `FlashOutput` / `FlashGroupAOutput` /
+  /// `FlashGroupBOutput` (the `Manual`-arm of the offset-10/17/18 conditional,
+  /// `Nikon.pm:10864`) — `ValueConv => '2 ** (-$val/6)'`, `PrintConv =>
+  /// '$val>0.99 ? "Full" : sprintf("%.0f%%",$val*100)'`. `-n` emits the
+  /// post-ValueConv float.
+  FlashOutput,
+  /// `%Nikon::FlashInfo0100` `FlashCompensation` (the non-Manual arm of offset
+  /// 10, `Nikon.pm:10872-10879`) — `int8s`, `ValueConv => '-$val/6'`, `PrintConv
+  /// => Image::ExifTool::Exif::PrintFraction`. `-n` emits the post-ValueConv
+  /// float.
+  FlashCompensation,
+  /// `%Nikon::FlashInfo0100` `FlashGroupACompensation` / `FlashGroupBCompensation`
+  /// (the non-Manual arm of offset 17/18, `Nikon.pm:10934-10939`) — `int8s`,
+  /// `ValueConv => '-$val/6'`, `PrintConv => '$val ? sprintf("%+.1f",$val) : 0'`
+  /// (NOT PrintFraction — a `%+.1f` render, and exactly 0 renders the integer
+  /// `0`). `-n` emits the post-ValueConv float.
+  FlashGroupCompensation,
+  /// `%Nikon::FlashInfo0100` `FlashFocalLength` (offset 11, `Nikon.pm:10882`) —
+  /// `RawConv => '$val ? $val : undef'` (a raw `0` ⇒ the tag is NOT emitted),
+  /// `PrintConv => '"$val mm"'`. `-n` emits the raw int8u.
+  FlashFocalLength,
+  /// `%Nikon::FlashInfo0100` `RepeatingFlashRate` (offset 12, `Nikon.pm:10889`) —
+  /// `RawConv => '$val ? $val : undef'` (0 ⇒ drop), `PrintConv => '"$val Hz"'`.
+  /// `-n` emits the raw int8u.
+  RepeatingFlashRate,
 }
 
 impl NikonConv {
@@ -500,6 +546,84 @@ impl NikonConv {
             1 => TagValue::Str(SmolStr::new("F-mount")),
             _ => TagValue::Str(SmolStr::new(std::format!("Unknown ({n})"))),
           }
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::FlashSource => hash_conv(raw, print_conv, flash_source_label),
+      NikonConv::FlashControlMode => hash_conv(raw, print_conv, flash_control_mode_label),
+      NikonConv::ExternalFlashFlags => external_flash_flags_conv(raw, print_conv),
+      NikonConv::FlashGnDistance => hash_conv(raw, print_conv, flash_gn_distance_label),
+      NikonConv::FlashOutput => {
+        // `ValueConv => '2 ** (-$val/6)'`; PrintConv `$val>0.99 ? "Full" :
+        // sprintf("%.0f%%",$val*100)`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = 2f64.powf(-(n as f64) / 6.0);
+        if print_conv {
+          if v > 0.99 {
+            TagValue::Str(SmolStr::new("Full"))
+          } else {
+            TagValue::Str(SmolStr::new(std::format!("{}%", flash_pct(v * 100.0))))
+          }
+        } else {
+          TagValue::F64(v)
+        }
+      }
+      NikonConv::FlashCompensation => {
+        // `int8s`, `ValueConv => '-$val/6'`, PrintConv PrintFraction.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = -(n as f64) / 6.0;
+        if print_conv {
+          TagValue::Str(SmolStr::new(print_fraction(v)))
+        } else {
+          value_conv_number(v)
+        }
+      }
+      NikonConv::FlashGroupCompensation => {
+        // `int8s`, `ValueConv => '-$val/6'`, PrintConv `$val ?
+        // sprintf("%+.1f",$val) : 0` (the integer 0 for an exact-zero value).
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        let v = -(n as f64) / 6.0;
+        if print_conv {
+          if v == 0.0 {
+            TagValue::I64(0)
+          } else {
+            TagValue::Str(SmolStr::new(std::format!("{v:+.1}")))
+          }
+        } else {
+          value_conv_number(v)
+        }
+      }
+      NikonConv::FlashFocalLength => {
+        // `RawConv => '$val ? $val : undef'` (0 ⇒ drop), PrintConv `"$val mm"`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if n == 0 {
+          return None;
+        }
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{n} mm")))
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::RepeatingFlashRate => {
+        // `RawConv => '$val ? $val : undef'` (0 ⇒ drop), PrintConv `"$val Hz"`.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if n == 0 {
+          return None;
+        }
+        if print_conv {
+          TagValue::Str(SmolStr::new(std::format!("{n} Hz")))
         } else {
           TagValue::I64(n)
         }
@@ -1402,6 +1526,107 @@ fn af_point_label(n: i64) -> Option<&'static str> {
   })
 }
 
+/// `%Nikon::FlashInfo0100` `FlashSource` (offset 4, `Nikon.pm:10826-10828`).
+fn flash_source_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    0 => "None",
+    1 => "External",
+    2 => "Internal",
+    _ => return None,
+  })
+}
+
+/// `%flashControlMode` (`Nikon.pm:829-838`) — the shared
+/// `FlashControlMode`/`FlashGroupAControlMode`/`FlashGroupBControlMode` hash.
+fn flash_control_mode_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    0x00 => "Off",
+    0x01 => "iTTL-BL",
+    0x02 => "iTTL",
+    0x03 => "Auto Aperture",
+    0x04 => "Automatic",
+    0x05 => "GN (distance priority)",
+    0x06 => "Manual",
+    0x07 => "Repeating Flash",
+    _ => return None,
+  })
+}
+
+/// `ExternalFlashFlags` (offset 8, `Nikon.pm:10829-10843`) — `PrintConv =>
+/// { 0 => '(none)', BITMASK => {…} }`. ExifTool tries the direct hash key
+/// FIRST (`0 => '(none)'`), then the `DecodeBits` BITMASK (the same
+/// `0 → "(none)"` / set-bit-label / `[n]` path `LensType` 0x0083 uses); an
+/// unlisted set bit renders `[n]`. The lone direct key is `0`, which the empty
+/// DecodeBits already renders `"(none)"`, so the BITMASK path subsumes it.
+/// `-n` emits the raw int8u.
+fn external_flash_flags_conv(raw: &ParsedValue, print_conv: bool) -> TagValue {
+  let Some(n) = raw.first_i64() else {
+    return raw.to_default_tag_value();
+  };
+  if !print_conv {
+    return TagValue::I64(n);
+  }
+  TagValue::Str(SmolStr::new(crate::convert::decode_bits(
+    &n.to_string(),
+    Some(EXTERNAL_FLASH_FLAGS_BITS),
+    8,
+  )))
+}
+
+/// `%flashGNDistance` labels (`Nikon.pm:792-815`). Key `0` is the bare string
+/// `"0"` (NOT a metre value); `255` is `"n/a"`.
+fn flash_gn_distance_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    0 => "0",
+    1 => "0.1 m",
+    2 => "0.2 m",
+    3 => "0.3 m",
+    4 => "0.4 m",
+    5 => "0.5 m",
+    6 => "0.6 m",
+    7 => "0.7 m",
+    8 => "0.8 m",
+    9 => "0.9 m",
+    10 => "1.0 m",
+    11 => "1.1 m",
+    12 => "1.3 m",
+    13 => "1.4 m",
+    14 => "1.6 m",
+    15 => "1.8 m",
+    16 => "2.0 m",
+    17 => "2.2 m",
+    18 => "2.5 m",
+    19 => "2.8 m",
+    20 => "3.2 m",
+    21 => "3.6 m",
+    22 => "4.0 m",
+    23 => "4.5 m",
+    24 => "5.0 m",
+    25 => "5.6 m",
+    26 => "6.3 m",
+    27 => "7.1 m",
+    28 => "8.0 m",
+    29 => "9.0 m",
+    30 => "10.0 m",
+    31 => "11.0 m",
+    32 => "13.0 m",
+    33 => "14.0 m",
+    34 => "16.0 m",
+    35 => "18.0 m",
+    36 => "20.0 m",
+    255 => "n/a",
+    _ => return None,
+  })
+}
+
+/// `sprintf("%.0f", v)` for the `FlashOutput` percent — `{:.0}` rounds
+/// half-to-even like glibc `printf` (the `Manual`-arm of offset 10/17/18; never
+/// reached by the bundled DSLR fixtures, which take the `FlashCompensation`
+/// arm).
+fn flash_pct(v: f64) -> String {
+  std::format!("{v:.0}")
+}
+
 /// `%afPoints11` BITMASK labels (`Nikon.pm:2152`). Sorted by bit.
 const AF_POINTS11_BITS: &[(u8, &str)] = &[
   (0, "Center"),
@@ -1546,6 +1771,15 @@ const LENS_TYPE_BITS: &[(u8, &str)] = &[
   (7, "AF-P"),
 ];
 
+/// `ExternalFlashFlags` BITMASK labels (`Nikon.pm:10840-10843`). Sorted by bit
+/// for the `DecodeBits` walk; bits 1/3/6/7 are unlisted ⇒ render `[n]`.
+const EXTERNAL_FLASH_FLAGS_BITS: &[(u8, &str)] = &[
+  (0, "Fired"),
+  (2, "Bounce Flash"),
+  (4, "Wide Flash Adapter"),
+  (5, "Dome Diffuser"),
+];
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -1664,6 +1898,26 @@ mod tests {
       NikonConv::MakerNoteVersion.apply(&v, true, None, ByteOrder::Big),
       Some(TagValue::Str(SmolStr::new("1.00")))
     );
+  }
+
+  /// `FlashGNDistance` (`%flashGNDistance`) is a plain HASH PrintConv: key 0 →
+  /// the bare `"0"`, listed bytes render their metre label, 255 → `"n/a"`, and
+  /// an UNLISTED valid byte (37-254) renders ExifTool's HASH-miss fallback
+  /// `Unknown (N)` (`ExifTool.pm:3632` — no `BITMASK`/`OTHER`/`PrintHex`), NOT
+  /// the raw number. `-n` (print_conv false) emits the raw int8u.
+  #[test]
+  fn flash_gn_distance_hash_miss_is_unknown() {
+    let c = |n: u64, pc: bool| NikonConv::FlashGnDistance.apply(&u8v(n), pc, None, ByteOrder::Big);
+    let s = |t: &str| Some(TagValue::Str(SmolStr::new(t)));
+    assert_eq!(c(0, true), s("0")); // key 0 → bare "0"
+    assert_eq!(c(10, true), s("1.0 m"));
+    assert_eq!(c(36, true), s("20.0 m")); // last listed metre value
+    assert_eq!(c(255, true), s("n/a"));
+    // Unlisted valid byte ⇒ the standard hash-miss "Unknown (N)" (was: raw N).
+    assert_eq!(c(37, true), s("Unknown (37)"));
+    assert_eq!(c(200, true), s("Unknown (200)"));
+    // -n value mode emits the raw int.
+    assert_eq!(c(37, false), Some(TagValue::I64(37)));
   }
 
   /// `ShootingMode` (0x0089) — value 0 → "Single-Frame"; the DecodeBits path.
