@@ -1511,6 +1511,16 @@ impl AnyMeta<'_> {
       // NEF/RW2/ORF/… body overrides depend on unported vendor tags and stay
       // deferred. The `Detected` variant carries no payload — the per-Meta
       // content signals come from the `ExifMeta` accessors, not the enum.
+      // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`): a parsed
+      // BigTIFF (magic 0x2b — `parse_bigtiff` forced the `file_type` signal to
+      // `"BTF"`) is `BTF` REGARDLESS of the detection candidate/extension, so a
+      // BigTIFF named `.tif` / dotless still finalizes `File:FileType = BTF`.
+      // Override the candidate-based TIFF/subtype resolution with an explicit BTF
+      // type + `image/x-tiff-big` MIME (FileTypeExtension `btf` derives from BTF).
+      #[cfg(feature = "exif")]
+      AnyMeta::Exif(m) if m.file_type() == Some("BTF") => {
+        FileTypeFinalize::ExplicitWithMime(ExplicitWithMime::new("BTF", "image/x-tiff-big"))
+      }
       #[cfg(feature = "exif")]
       AnyMeta::Exif(_) => FileTypeFinalize::Detected,
       // RIFF: `SetFileType($type, $mime)` where `$type` is the body TYPE
@@ -2195,6 +2205,21 @@ pub fn any_parser_for(file_type: &str) -> Option<AnyParser> {
     "AIFF" => Some(AnyParser::Aiff(crate::formats::aiff::ProcessAiff)),
     #[cfg(feature = "ape")]
     "APE" => Some(AnyParser::Ape(crate::formats::ape::ProcessApe)),
+    // BigTIFF — `%fileTypeLookup{BTF}` resolves the `.btf`/`.tif` extension +
+    // the `(II\x2b\0|MM\0\x2b)` magic to file type "BTF" (base module
+    // `BigTIFF`, MIME `image/x-tiff-big`). Bundled `ProcessBTF`
+    // (`BigTIFF.pm:234`, dispatched from `DoProcessTIFF`'s `$identifier ==
+    // 0x2b` arm, `ExifTool.pm:8661-8669`) validates the 16-byte header and
+    // walks the BigTIFF IFD chain via `ProcessBigIFD` against `%Exif::Main`.
+    // We route it through the SAME `AnyParser::Exif` arm as classic TIFF: the
+    // `parse_any` dispatch detects the `0x2b` magic in the TIFF header and
+    // branches to the dedicated BigTIFF walker
+    // ([`crate::exif::parse_bigtiff`], 8-byte widths), reusing the Exif tag
+    // table + value decode. `File:FileType` finalizes to `BTF` because the
+    // candidate's base type is `BTF` (not `TIFF`), so the TIFF/RAW-subtype and
+    // DNG-override rules in `tiff_finalize_file_type_with_content` are inert.
+    #[cfg(feature = "exif")]
+    "BTF" => Some(AnyParser::Exif(crate::exif::ProcessExif)),
     // Canon CRW (CIFF) raw container. `%fileTypeLookup{CRW}` resolves the
     // `.crw` extension + the `HEAP(CCDR|JPGM)` CIFF signature to file type
     // "CRW" (base module `CanonRaw`, MIME `image/x-canon-crw`); bundled

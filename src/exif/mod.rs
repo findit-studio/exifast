@@ -28,6 +28,10 @@
 //!
 //! - **TIFF header** (`ExifTool.pm:8628-8645`): 2-byte byte order
 //!   (`II`/`MM`), the 16-bit magic (0x2a for TIFF), the 32-bit IFD0 offset.
+//!   The 0x2b magic is **BigTIFF** — a 16-byte header (offset-bytesize 8,
+//!   8-byte IFD0 offset) walked by the dedicated [`parse_bigtiff`] path
+//!   (8-byte counts, 20-byte entries), the faithful port of
+//!   `Image::ExifTool::BigTIFF` (a SEPARATE walker reusing `Exif::Main`).
 //! - **IFD walker** (`Exif.pm:6278-7240 ProcessExif`): each IFD is an
 //!   entry-count (`int16u`) + N×12-byte entries + a next-IFD-offset
 //!   (`int32u`). Each entry is `tag(u16) format(u16) count(u32)
@@ -95,7 +99,7 @@ use std::{string::String, vec::Vec};
 
 use crate::format_parser::{FormatParser, parser_sealed};
 use crate::recovery::Step;
-use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, read_value};
+use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value};
 use tables::Conv;
 
 // ====================================================================// IFD identity — the family-1 group an IFD's tags carry
@@ -1705,18 +1709,26 @@ fn parse_tiff_with_base_no_raf<'a>(
   // TIFF is 0x2a (42), BigTIFF is 0x2b (43). Classic TIFF stores the IFD0
   // pointer as a 32-bit offset at byte 4 and walks 16-bit entry counts /
   // 12-byte entries; BigTIFF uses an 8-byte offset, 64-bit counts and 20-byte
-  // entries — decoding it with the classic layout below misreads it into
-  // garbage. BigTIFF (0x2b) is intentionally NOT parsed yet: a full BigTIFF
-  // walker (8-byte offsets, 64-bit counts, 20-byte entries, formats 16-18) is a
-  // deferred port. Cleanly bail with the same "no Exif parsed" result the
-  // invalid-header path returns (`None`) — no tags, no misdecode, no panic.
-  // ExifTool DOES support BigTIFF, so we deliberately emit NO "unsupported"
-  // warning (that would itself diverge); the only accepted divergence is the
-  // missing Exif tags, tracked as a follow-up. (File:FileType detection is a
-  // separate front-end and is unaffected.)
+  // entries, so the classic layout below would misread it. BigTIFF has its OWN
+  // module in bundled (`Image::ExifTool::BigTIFF::ProcessBTF` /
+  // `ProcessBigIFD`, dispatched from `DoProcessTIFF`'s `$identifier == 0x2b`
+  // arm, `ExifTool.pm:8661-8669`) — NOT `ProcessExif` — so we branch to the
+  // dedicated [`parse_bigtiff`] walker (8-byte widths, the same `Exif::Main`
+  // table + `ReadValue`), faithful to that module's separate-walker design.
+  //
+  // The `0x2b` arm is GATED on `standalone_tiff`: bundled reaches `ProcessBTF`
+  // only from inside `DoProcessTIFF`'s `if ($raf)` block (`ExifTool.pm:8629`/
+  // `:8661`), i.e. the top-level standalone-TIFF dispatch. An EMBEDDED block
+  // (JPEG `APP1` / PNG `eXIf` / QuickTime `EXIF` / a MakerNote / GPS re-dispatch
+  // — `standalone_tiff == false`) has no `$raf`, so a stray `0x2b` there never
+  // becomes BigTIFF; it returns `None` (no Exif), as bundled (an `APP1` with a
+  // non-`0x2a` identifier merely warns + falls through, never `ProcessBTF`).
   let magic = get_u16(data, 2, order)?;
   if magic == 0x2b {
-    return None;
+    if !standalone_tiff {
+      return None;
+    }
+    return parse_bigtiff(data, order, base, file_type, no_raf, ifd0_kind);
   }
   // `my $offset = Get32u($dataPt, 4); $offset >= 8 or return 0`.
   let ifd0_offset = get_u32(data, 4, order)? as usize;
@@ -1856,6 +1868,137 @@ fn parse_tiff_with_base_no_raf<'a>(
     cr2_magic,
     // A standalone-TIFF walk has no JPEG marker positions and no `APP`-segment
     // aux blocks (no `APP6` GoPro).
+    #[cfg(feature = "quicktime")]
+    exif_block_pos: None,
+    #[cfg(feature = "quicktime")]
+    jpeg_aux_blocks: std::vec::Vec::new(),
+  })
+}
+
+// ====================================================================// BigTIFF (0x2b) — Image::ExifTool::BigTIFF (ProcessBTF / ProcessBigIFD)
+// ====================================================================
+/// Parse a BigTIFF (`0x2b`) block — the faithful port of `ProcessBTF`
+/// (`BigTIFF.pm:234-264`).
+///
+/// BigTIFF differs from classic TIFF ONLY in widths: a 16-byte header (8-byte
+/// IFD0 offset), an 8-byte entry count, 20-byte entries
+/// (`tag(2) format(2) count(8) value-or-offset(8)`), an 8-byte next-IFD
+/// pointer, and the inline-value cutoff is 8 (not 4) bytes. ExifTool walks it
+/// through the dedicated `ProcessBigIFD` (NOT `ProcessExif`), reusing the same
+/// `Exif::Main` tag table + `ReadValue`; this mirrors that with the shared
+/// [`Walker`] (so [`Walker::emit`] / [`Walker::dispatch_subdir`] and the
+/// `Exif`/`GPS` tables are reused unchanged) and a focused 8-byte-width IFD
+/// walk ([`Walker::walk_big_ifd_chain`]).
+///
+/// `ProcessBTF`'s header gate (`BigTIFF.pm:240-241`) is a strict 16-byte
+/// signature: `^(MM\0\x2b\0\x08\0\0|II\x2b\0\x08\0\0\0)` — the byte order, the
+/// `0x2b` magic, **offset-bytesize `0x0008`** (bytes 4-5) and the **`0x0000`
+/// constant** (bytes 6-7) must ALL match. A non-8 offset-bytesize or a
+/// non-zero constant is REJECTED (`return None`), faithful to the regex not
+/// matching → `ProcessBTF return 0`.
+///
+/// `order` / `magic == 0x2b` were already decoded by the caller
+/// ([`parse_tiff_with_base_no_raf`]); `base` / `no_raf` / `ifd0_kind` are
+/// threaded for parity with the classic path. In practice BigTIFF is reachable
+/// ONLY from the standalone-TIFF dispatch (`DoProcessTIFF`'s `$raf` arm,
+/// `ExifTool.pm:8661`), so `base == 0`, `no_raf == false` and
+/// `ifd0_kind == IfdKind::Ifd0` for every real caller.
+fn parse_bigtiff<'a>(
+  data: &'a [u8],
+  order: ByteOrder,
+  base: u32,
+  file_type: Option<&str>,
+  no_raf: bool,
+  ifd0_kind: IfdKind,
+) -> Option<ExifMeta<'a>> {
+  // `$raf->Read($buff, 16) == 16` then the 16-byte signature regex
+  // (`BigTIFF.pm:240-241`). The order + `0x2b` magic are already validated by
+  // the caller; here we enforce the remaining two header fields in `order`:
+  //   - offset-bytesize at byte 4 MUST be `0x0008` (`\x08\0` LE / `\0\x08` BE);
+  //   - the constant at byte 6 MUST be `0x0000`.
+  // A short (< 16-byte) header fails the `Read == 16` → `return None`.
+  if get_u16(data, 4, order)? != 8 {
+    return None;
+  }
+  if get_u16(data, 6, order)? != 0 {
+    return None;
+  }
+  // `my $offset = Get64u(\$buff, 8)` (`BigTIFF.pm:248`) — the 8-byte IFD0
+  // offset. (ExifTool does NOT gate it `>= 16` the way classic TIFF gates
+  // `>= 8`; `ProcessBigIFD`'s seek/read bounds-check it.)
+  let ifd0_offset = usize::try_from(get_u64(data, 8, order)?).ok()?;
+
+  let file_type: Option<smol_str::SmolStr> = file_type.map(smol_str::SmolStr::new);
+  let mut w = Walker {
+    data,
+    order,
+    base,
+    entries: Vec::new(),
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    captured_make: None,
+    captured_model: None,
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    file_type: file_type.clone(),
+    no_raf,
+    warn_count: 0,
+  };
+  w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
+  debug_assert!(
+    w.cycle_guard_warnings.is_empty(),
+    "the common (Owned) path must never produce cross-source cycle-guard warnings"
+  );
+
+  Some(ExifMeta {
+    entries: w.entries,
+    warnings: w.warnings,
+    warnings_ignorable: w.warnings_ignorable,
+    // `DoProcessTIFF`'s BigTIFF arm (`ExifTool.pm:8661-8668`) is: call
+    // `ProcessBTF`, then `FoundTag(PageCount => …) if $$self{MultiPage}` (`:8667`),
+    // then `return 1` (`:8668`) — BEFORE the classic `File:ExifByteOrder`
+    // `FoundTag` (`:8691`). So a BigTIFF emits `File:PageCount` (reached at :8667)
+    // but NOT `File:ExifByteOrder` (after the :8668 return; oracle-confirmed — the
+    // bundled `BigTIFF.btf` has none while a classic TIFF does). Leave `byte_order`
+    // (the `File:ExifByteOrder` emission signal) `None`; the walk already used the
+    // local `order`.
+    byte_order: None,
+    maker_note: w.maker_note,
+    // `File:PageCount` IS emitted for a BigTIFF whose IFD chain tripped `MultiPage`
+    // (a `SubfileType == 2` / `OldSubfileType == 3` `RawConv` tap in `Walker::emit`,
+    // `Exif.pm:456`/`:473`) — the `:8667` `FoundTag` gates on `$$self{MultiPage}`
+    // ALONE (unlike the classic `:8768` site it has NO `TIFF_TYPE eq 'TIFF'`
+    // check), so mirror it on `w.multi_page`. The flat `BigTIFF.btf` has no
+    // SubfileType ⇒ `multi_page == false` ⇒ `None`, matching its oracle.
+    multi_page_count: if w.multi_page {
+      Some(w.page_count)
+    } else {
+      None
+    },
+    // `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) FORCES the file
+    // type to `BTF` on the 0x2b magic, REGARDLESS of extension — so a BigTIFF
+    // named `.tif` / dotless still finalizes `File:FileType = BTF`. Carry that
+    // signal HERE (the ExifMeta's `file_type`), overriding the passed detection
+    // candidate (which is `TIFF` for a `.tif` BigTIFF); `finalize_file_type`'s
+    // `AnyMeta::Exif` arm maps a `Some("BTF")` signal to an explicit BTF type +
+    // `image/x-tiff-big` MIME. (The WALKER above keeps the passed container
+    // `file_type` for the Canon-CRW RawConv gate — `BTF` ≠ `CRW`, so unaffected.)
+    file_type: Some(smol_str::SmolStr::new("BTF")),
+    captured_model: w.captured_model.map(smol_str::SmolStr::from),
+    // `DNGVersion` (0xc612)'s RawConv still runs in `Walker::emit`, but a
+    // BigTIFF is finalized as `BTF` (`ProcessBTF` `SetFileType('BTF')`), NOT
+    // `TIFF`, so `DoProcessTIFF`'s `$$self{FILE_TYPE} eq 'TIFF'` DNG override
+    // (`ExifTool.pm:8763`) is unreachable for it — the engine reads
+    // `has_dng_version()` only when `base_type == "TIFF"`.
+    dng_version: w.dng_version,
+    // The Canon CR2 byte-8 magic is a CLASSIC-TIFF (`$identifier == 0x2a`)
+    // signal only (`ExifTool.pm:8633`); never set for BigTIFF.
+    cr2_magic: false,
     #[cfg(feature = "quicktime")]
     exif_block_pos: None,
     #[cfg(feature = "quicktime")]
@@ -2531,6 +2674,371 @@ impl Walker<'_, '_> {
       0
     };
     Some(next)
+  }
+
+  // ==================================================================
+  // BigTIFF IFD walk — ProcessBigIFD (BigTIFF.pm:26-228)
+  // ==================================================================
+  /// Walk a BigTIFF IFD0 → IFD1 → … chain — the faithful port of
+  /// `ProcessBigIFD`'s `for (;;)` loop (`BigTIFF.pm:42-226`).
+  ///
+  /// Identical in shape to [`walk_ifd_chain`] but with BigTIFF widths: each IFD
+  /// is an 8-byte entry count + N×20-byte entries + an 8-byte next-IFD pointer
+  /// (`Get64u`, `BigTIFF.pm:216`). The chain re-visit guard
+  /// ([`chain_guard`](Self::chain_guard)) breaks a looping next pointer
+  /// (`$$et{PROCESSED}{$dirStart}`, `BigTIFF.pm:220-225`).
+  fn walk_big_ifd_chain(&mut self, start: usize, first_kind: IfdKind) {
+    let mut offset = start;
+    let mut kind = first_kind;
+    let mut trailing_num: u32 = 1;
+    loop {
+      let Some(next) = self.walk_big_one_ifd(offset, kind) else {
+        return;
+      };
+      // `$dirStart or last` (`BigTIFF.pm:217`) — a 0 next pointer ends the
+      // chain. `walk_big_one_ifd` returns `Some(0)` when the IFD had no (or a
+      // zero) next pointer.
+      if next == 0 {
+        return;
+      }
+      kind = IfdKind::Trailing(trailing_num);
+      trailing_num += 1;
+      offset = next;
+    }
+  }
+
+  /// Walk ONE BigTIFF IFD at `ifd_start`, applying the same chain / active-path
+  /// reprocess guards as [`walk_one_ifd`] (they are shared [`Walker`] state),
+  /// then delegating to [`walk_big_ifd_body`](Self::walk_big_ifd_body).
+  /// Returns `Some(next_ifd_offset)` (0 ⇒ no next IFD) on success, `None` to
+  /// abort the chain.
+  fn walk_big_one_ifd(&mut self, ifd_start: usize, kind: IfdKind) -> Option<usize> {
+    let is_chain = matches!(kind, IfdKind::Ifd0 | IfdKind::Trailing(_));
+    if is_chain {
+      // `if ($$et{PROCESSED}{$dirStart}) { Warn("… references previous …");
+      // last }` (`BigTIFF.pm:220-225`) — a revisited chain address breaks the
+      // loop. The common (Owned) path mirrors `walk_ifd_chain`'s silent
+      // trailing-loop breaker.
+      match &mut self.chain_guard {
+        ChainGuard::Owned(set) => {
+          if !set.insert(ifd_start) {
+            return None;
+          }
+        }
+        ChainGuard::Shared(processed) => {
+          if let Some(prev) = processed.get(&ifd_start) {
+            self
+              .cycle_guard_warnings
+              .push(smol_str::SmolStr::from(std::format!(
+                "{} pointer references previous {} directory",
+                kind.as_str(),
+                prev
+              )));
+            return None;
+          }
+          processed.insert(ifd_start, kind.as_str());
+        }
+      }
+    } else if self.active_ifd_offsets.contains(&ifd_start) {
+      // A SubIFD (ExifIFD/GPS/InteropIFD) pointing back at an ancestor on the
+      // active recursion path is a genuine cycle — reject (keeps the in-memory
+      // walk finite, as in [`walk_one_ifd`]).
+      return None;
+    }
+    self.active_ifd_offsets.push(ifd_start);
+    let result = self.walk_big_ifd_body(ifd_start, kind);
+    let popped = self.active_ifd_offsets.pop();
+    debug_assert_eq!(popped, Some(ifd_start), "active-path stack imbalance");
+    result
+  }
+
+  /// The body of [`walk_big_one_ifd`] — the structural walk of one BigTIFF IFD.
+  /// Faithful to the per-directory work inside `ProcessBigIFD`'s loop
+  /// (`BigTIFF.pm:47-217`): read the 8-byte count, the N×20-byte entry block
+  /// and the 8-byte next-IFD pointer, then walk the entries. Returns the
+  /// next-IFD offset (`Some(0)` ⇒ end of chain), or `None` to abort.
+  fn walk_big_ifd_body(&mut self, ifd_start: usize, kind: IfdKind) -> Option<usize> {
+    let data = self.data;
+    let dir = kind.as_str();
+    // `unless ($raf->Read($dirBuff, 8) == 8) { Warn("Truncated $dirName
+    // count"); return 0 }` (`BigTIFF.pm:52-55`). The 8-byte count must be
+    // readable; `checked_add` guards the 32-bit/wasm offset-overflow class
+    // (an overflowing `ifd_start` describes no in-range directory → treat as
+    // truncated). `ProcessBigIFD` first does `Seek($dirStart)` and on failure
+    // warns `Bad $dirName offset` (`BigTIFF.pm:47-50`); for the whole-file
+    // buffer here a start past EOF is exactly the unreadable-count case, so we
+    // surface the single `Truncated $dirName count` warning.
+    if ifd_start.checked_add(8).is_none_or(|end| end > data.len()) {
+      self.warn(std::format!("Truncated {dir} count"));
+      return None;
+    }
+    let num_entries = usize::try_from(get_u64(data, ifd_start, self.order)?).ok()?;
+    // `my $bsize = $numEntries * 20; if ($bsize > $maxOffset) { Warn('Huge
+    // directory counts not yet supported'); last }` (`BigTIFF.pm:58-62`).
+    // `$maxOffset = 0x7fffffff`. `checked_mul` also covers the usize-overflow
+    // class; either way an over-large count ends THIS directory (no entries,
+    // no next pointer — `last`), so the chain stops here.
+    let Some(bsize) = num_entries.checked_mul(20) else {
+      self.warn(String::from("Huge directory counts not yet supported"));
+      return Some(0);
+    };
+    if bsize > 0x7fff_ffff {
+      self.warn(String::from("Huge directory counts not yet supported"));
+      return Some(0);
+    }
+    // `my $bufPos = $raf->Tell()` is the file offset of the FIRST entry — the
+    // 8 count bytes precede it. `unless ($raf->Read($dirBuff, $bsize) ==
+    // $bsize) { Warn("Truncated $dirName directory"); return 0 }`
+    // (`BigTIFF.pm:63-67`). `entries_start = ifd_start + 8`.
+    let entries_start = ifd_start.checked_add(8)?;
+    let Some(entries_end) = entries_start.checked_add(bsize) else {
+      self.warn(std::format!("Truncated {dir} directory"));
+      return None;
+    };
+    if entries_end > data.len() {
+      self.warn(std::format!("Truncated {dir} directory"));
+      return None;
+    }
+    // `$raf->Read($nextIFD, 8) == 8 or undef $nextIFD` (`BigTIFF.pm:69`) — the
+    // next-IFD pointer is OPTIONAL (a truncated tail just yields no next IFD,
+    // not an abort). It sits at `entries_end`.
+    let next_ifd = entries_end
+      .checked_add(8)
+      .filter(|&end| end <= data.len())
+      .and_then(|_| get_u64(data, entries_end, self.order))
+      .and_then(|off| usize::try_from(off).ok());
+
+    // Walk the entries. `walk_big_entry` returns a [`Step`]; `Reject`/`AbortDir`
+    // (the `return 0` ExifTool takes on a bad format code) stops the whole
+    // directory AND its chain — propagate `None` so the next pointer is NOT
+    // followed (faithful to `ProcessBigIFD`'s `return 0` exiting before the
+    // chain `last`).
+    for index in 0..num_entries {
+      // `my $entry = 20 * $index` (relative to `entries_start`).
+      let Some(entry) = index
+        .checked_mul(20)
+        .and_then(|off| entries_start.checked_add(off))
+      else {
+        break;
+      };
+      // The 20-byte entry read is bounded by `entries_end <= data.len()`, but
+      // keep it explicitly checked across the call boundary.
+      if entry.checked_add(20).is_none_or(|end| end > data.len()) {
+        break;
+      }
+      match self.walk_big_entry(entry, index, kind) {
+        step if step.continues() => {}
+        Step::AbortDir | Step::Reject => return None,
+        Step::Keep | Step::Skip => {}
+      }
+    }
+
+    // `last unless $dirName =~ /^(IFD|SubIFD)(\d*)$/` (`BigTIFF.pm:213`): only
+    // the chain directories (IFD0 / trailing IFDn) follow a next pointer; a
+    // SubIFD (ExifIFD/GPS/InteropIFD) does not. Plus `defined $nextIFD or
+    // Warn("Bad $dirName pointer"), return 0` (`BigTIFF.pm:215`) — but `$dirName`
+    // there is the INCREMENTED next name (e.g. `IFD1`), and the warning fires
+    // only when a chain directory expected a next pointer it could not read.
+    let follows_chain = matches!(kind, IfdKind::Ifd0 | IfdKind::Trailing(_));
+    if !follows_chain {
+      return Some(0);
+    }
+    match next_ifd {
+      Some(off) => Some(off),
+      // The next-pointer read came up short for a chain directory:
+      // `Bad <next> pointer` then `return 0` (`BigTIFF.pm:215`). The name is
+      // the NEXT directory's (`$dirName` after the `IFDn → IFDn+1` bump,
+      // `BigTIFF.pm:214`).
+      None => {
+        let next_name = match kind {
+          IfdKind::Ifd0 => IfdKind::Trailing(1),
+          IfdKind::Trailing(n) => IfdKind::Trailing(n.saturating_add(1)),
+          other => other,
+        };
+        self.warn(std::format!("Bad {} pointer", next_name.as_str()));
+        None
+      }
+    }
+  }
+
+  /// Decode + emit ONE 20-byte BigTIFF IFD entry — the faithful port of
+  /// `ProcessBigIFD`'s per-entry body (`BigTIFF.pm:81-211`).
+  ///
+  /// Entry layout (`BigTIFF.pm:83-85`/`:98`): `tag(2) format(2) count(8)
+  /// value-or-offset(8)`. A value ≤ 8 bytes is inline at `$entry+12`; otherwise
+  /// the 8 bytes there are an absolute file offset (`Get64u`, `BigTIFF.pm:105`)
+  /// — and since the standalone BigTIFF block IS the whole file (`base == 0`),
+  /// that offset indexes `data` directly.
+  ///
+  /// Returns a [`Step`]: [`Step::AbortDir`] for the bad-format `return 0`
+  /// (`BigTIFF.pm:92`, abort the directory), [`Step::Skip`] for a per-entry
+  /// `next` (unknown tag, huge size, unreadable value), [`Step::Keep`] for a
+  /// processed entry (leaf emitted or SubIFD recursed).
+  fn walk_big_entry(&mut self, entry: usize, index: usize, kind: IfdKind) -> Step {
+    let data = self.data;
+    let order = self.order;
+    let dir = kind.as_str();
+    // `Get16u($entry)` / `Get16u($entry+2)` / `Get64u($entry+4)` — the caller
+    // proved `entry + 20 <= data.len()`, so these reads are in-range (the `?`
+    // short-circuit is unreachable).
+    let Some(tag_id) = get_u16(data, entry, order) else {
+      return Step::Skip;
+    };
+    let Some(format_code) = get_u16(data, entry + 2, order) else {
+      return Step::Skip;
+    };
+    let Some(count) = get_u64(data, entry + 4, order) else {
+      return Step::Skip;
+    };
+    let count = match usize::try_from(count) {
+      Ok(c) => c,
+      // A 64-bit count that overflows `usize` cannot describe an in-range value
+      // on this target; treat it like the huge-size `next` below.
+      Err(_) => return Step::Skip,
+    };
+
+    // `my $formatSize = $formatSize[$format]; unless (defined $formatSize) {
+    // … Warn("Unknown format ($format) for $dirName tag 0x%x"); return 0 }`
+    // (`BigTIFF.pm:86-93`). `@formatSize` is defined for codes 1..=18 AND 129
+    // (`Exif.pm:82-83`) — BigTIFF accepts the `int64u`/`int64s`/`ifd64`
+    // additions (16/17/18) AND `unicode`/`complex` (14/15), unlike `ProcessExif`
+    // (1..=13|129 only). An undefined size (code 0 = zero padding, or > 18) is a
+    // corrupt IFD: warn (unconditionally — `ProcessBigIFD` does NOT silence the
+    // zero-pad case the way `ProcessExif` does) and `return 0` (abort the dir).
+    let format = Format::from_code(format_code);
+    let elem_size = format.byte_size();
+    if elem_size == 0 {
+      self.warn(std::format!(
+        "Unknown format ({format_code}) for {dir} tag 0x{tag_id:x}"
+      ));
+      return Step::AbortDir;
+    }
+    // `my $size = $count * $formatSize` (`BigTIFF.pm:95`).
+    let size = count.saturating_mul(elem_size);
+
+    // `next unless defined $tagInfo or $verbose` (`BigTIFF.pm:97`) — BigTIFF
+    // SKIPS a tag absent from the table entirely (no Unknown-tag emit, no
+    // large-array placeholder; `ProcessExif`'s 6760-6783 guards do NOT exist
+    // here). Resolve known-ness against the IFD's own table (GPS vs Exif), the
+    // same predicate [`emit`](Self::emit) uses to drop unknowns.
+    //
+    // EXCEPTION — `OldSubfileType` (0x00ff): it is absent from the port's leaf
+    // table but IS in `%Exif::Main` (so ExifTool's `defined $tagInfo` is true and
+    // it is NOT skipped), and it carries the `MultiPage` `RawConv` side-effect
+    // (`Exif.pm:470`) that [`emit`](Self::emit) runs BEFORE dropping the unported
+    // leaf — and `DoProcessTIFF` reads `MultiPage` to emit `File:PageCount` for a
+    // BigTIFF (`ExifTool.pm:8667`). So let it past this leaf-known gate to reach
+    // `emit`'s tap; the leaf itself is still dropped there. (`SubfileType` 0x00fe
+    // is already a known leaf, so its tap already runs; `DNGVersion` 0xc612's DNG
+    // override is unreachable for a BigTIFF — `ProcessBTF` finalizes `BTF` and
+    // `return 1`s at `:8668`, before the `:8763` override — so it is not needed.)
+    if !self.big_tag_known(kind, tag_id) && tag_id != tables::TAG_OLD_SUBFILE_TYPE {
+      return Step::Skip;
+    }
+
+    // The value pointer + readable length. `if ($size > 8) { … $valuePtr =
+    // Get64u($dirBuff, $valuePtr); … Seek+Read($valBuff,$size) … }` else `$valBuff
+    // = substr($dirBuff, $valuePtr, $size)` (`BigTIFF.pm:98-118`). The inline
+    // cutoff is 8 bytes (vs classic's 4); the value field is at `$entry+12`.
+    let (value_offset, read_len) = if size > 8 {
+      // `if ($size > $maxOffset) { Warn("Can't handle $dirName entry $index
+      // (huge size)"); next }` (`BigTIFF.pm:101-104`). `$maxOffset = 0x7fffffff`.
+      if size > 0x7fff_ffff {
+        self.warn(std::format!("Can't handle {dir} entry {index} (huge size)"));
+        return Step::Skip;
+      }
+      // `$valuePtr = Get64u($dirBuff, $entry+12)` — the 8-byte out-of-line
+      // offset. (The classic `>= 8` header gate / suspicious-offset / IFD-overlap
+      // checks of `ProcessExif` do NOT exist in `ProcessBigIFD`.)
+      let off = match get_u64(data, entry + 12, order).and_then(|o| usize::try_from(o).ok()) {
+        Some(o) => o,
+        None => return Step::Skip,
+      };
+      // `unless ($raf->Seek($valuePtr,0) and $raf->Read($valBuff,$size) ==
+      // $size) { Warn("Error reading $dirName entry $index"); next }`
+      // (`BigTIFF.pm:110-113`). For the whole-file buffer, the read fails iff
+      // `[off, off+size)` runs past EOF — a per-entry `next` (NOT a directory
+      // abort, unlike `ProcessExif`'s RAF-read overrun). `checked_add` guards
+      // the offset-overflow class.
+      match off.checked_add(size) {
+        Some(end) if end <= data.len() => (off, size),
+        _ => {
+          self.warn(std::format!("Error reading {dir} entry {index}"));
+          return Step::Skip;
+        }
+      }
+    } else {
+      // Inline: `$valBuff = substr($dirBuff, $entry+12, $size)` — the value
+      // occupies the first `$size` bytes at `$entry+12` (the caller proved
+      // `entry + 20 <= len`, so `entry + 12 + size <= entry + 20 <= len`).
+      let Some(value_offset) = entry.checked_add(12) else {
+        return Step::Skip;
+      };
+      (value_offset, size)
+    };
+
+    // ---- SubIFD pointer tags (ExifOffset/GPSInfo/InteropOffset) ---------
+    // `if ($tagInfo and $$tagInfo{SubIFD}) { … ProcessBigIFD on each offset }`
+    // (`BigTIFF.pm:171-198`). ExifTool's `ProcessBigIFD` recurses a SubIFD as
+    // BigTIFF REUSING the INHERITED `Exif::Main` table (`Table => $tagTablePtr`,
+    // `:149`/`:172` — NOT switching to `GPS::Main` for a GPSInfo pointer) and
+    // names the family-1 directory from the POINTER TAG (`ExifOffset`/`GPSInfo`/
+    // `InteropOffset`, NOT `ExifIFD`/`GPS`/`InteropIFD`). Faithfully reproducing
+    // that (the Exif-table-reuse + pointer-tag-group model) is DEFERRED to a
+    // follow-up (it is crafted-only — the bundled `BigTIFF.btf` is a FLAT
+    // single-IFD image with NO SubIFD pointers — and needs crafted ExifOffset/
+    // GPSInfo fixtures). For now a BigTIFF SubIFD pointer is NOT recursed: the
+    // pointer tag emits nothing (the SubDirectory bogus-parent rule), which
+    // UNDER-emits a SubIFD-bearing BigTIFF rather than decoding it under the
+    // WRONG table/group (R1 finding). (#168 follow-up: faithful BigTIFF SubIFDs.)
+    if let Some(sub) = sub_dir_for(tag_id, kind)
+      && sub.is_sub_ifd()
+    {
+      return Step::Keep; // deferred — emit nothing (no parent, no children)
+    }
+
+    // ---- Leaf tag — decode with the ON-DISK format + emit ---------------
+    // `my $val = ReadValue(\$valBuff, 0, $formatStr, $count, $size, …)`
+    // (`BigTIFF.pm:123`) — the on-disk format, NO tag-table `Format` override
+    // (that is a `ProcessExif`-only step, `Exif.pm:6729`). `read_value`
+    // shortens the count to the available window exactly as `ReadValue` does.
+    // The single-`undef`-byte → int8u carve-out (`Exif.pm:6644`) lives in
+    // `ReadValue`'s caller in `ProcessExif`, not `ProcessBigIFD`, so it is NOT
+    // applied here.
+    let Some(raw) = read_value(data, value_offset, format, count, read_len, order) else {
+      return Step::Skip;
+    };
+    // `$et->HandleTag(...)` then `SetGroup($tagKey, $dirName)` (`BigTIFF.pm:
+    // 200-210`). `emit` is the shared HandleTag/SetGroup path: it sets the
+    // family-1 group from `kind`, applies the `IsOffset` base add, runs the
+    // SubfileType/OldSubfileType/DNGVersion RawConv taps, and pushes the leaf —
+    // itself dropping a tag absent from the table. Most unknowns are filtered by
+    // the gate above; `OldSubfileType` (0x00ff) is admitted there expressly so
+    // its MultiPage tap runs HERE, and emit then drops its unported leaf.
+    self.emit(kind, tag_id, raw);
+    Step::Keep
+  }
+
+  /// `defined $tagInfo` for a BigTIFF entry (`BigTIFF.pm:96-97`) — `true` when
+  /// the tag id resolves in the IFD's own table (GPS vs Exif/Interop). The
+  /// SubIFD pointer tags (ExifIFD/GPS/InteropIFD/MakerNote) are handled
+  /// structurally and are NOT in the leaf-lookup tables, so they are admitted
+  /// here explicitly (ExifTool has tagInfo for them, so it does not `next`).
+  fn big_tag_known(&self, kind: IfdKind, tag_id: u16) -> bool {
+    if sub_dir_for(tag_id, kind).is_some() {
+      return true;
+    }
+    if kind.is_gps() {
+      #[cfg(feature = "gps")]
+      {
+        return gps::lookup(tag_id).is_some();
+      }
+      #[cfg(not(feature = "gps"))]
+      {
+        return false;
+      }
+    }
+    tables::lookup(tag_id).is_some()
   }
 
   /// Walk `num_entries` IFD entries starting at `ifd_start`. Each entry is
@@ -5445,25 +5953,21 @@ mod tests {
   }
 
   #[test]
-  fn bigtiff_magic_is_cleanly_skipped() {
-    // A minimal BigTIFF header: byte order + magic 0x2b (43) + the BigTIFF
-    // 8-byte-offset layout (bytesize=8, reserved=0, 8-byte IFD0 offset). The
-    // classic walker reads byte 4 as a 32-bit offset over 12-byte/16-bit
-    // entries, which would MISDECODE BigTIFF; instead we bail cleanly (the
-    // same `None` an invalid header returns) — NO tags, no panic, no garbage,
-    // and (deliberately) NO warning ExifTool wouldn't raise (it supports
-    // BigTIFF). A full BigTIFF walker is a deferred port.
+  fn embedded_bigtiff_magic_is_not_parsed() {
+    // A BigTIFF (0x2b) magic in an EMBEDDED block (`parse_exif_block` =
+    // `standalone_tiff == false`) is NOT parsed: bundled reaches `ProcessBTF`
+    // only from `DoProcessTIFF`'s `$raf` arm (`ExifTool.pm:8629`/`:8661`), which
+    // an embedded `APP1`/`eXIf`/MakerNote block lacks. Returns `None` (no Exif),
+    // no panic — exactly as before this walker existed.
 
     // Big-endian BigTIFF: MM, magic 0x002b, bytesize 0x0008, reserved 0x0000,
-    // then an 8-byte IFD0 offset (0x10). Padded so the (mis)read of byte 4 as
-    // a classic 32-bit offset would otherwise point inside the buffer — proves
-    // the magic gate fires BEFORE any classic decode, not the ≥8 sanity check.
+    // then an 8-byte IFD0 offset (0x10).
     let mut be: Vec<u8> = vec![b'M', b'M', 0x00, 0x2b, 0x00, 0x08, 0x00, 0x00];
-    be.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]); // 8-byte IFD0 offset
-    be.extend_from_slice(&[0u8; 32]); // body so a classic mis-walk would find bytes
+    be.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]);
+    be.extend_from_slice(&[0u8; 32]);
     assert!(
       parse_exif_block(&be).is_none(),
-      "big-endian BigTIFF (0x2b) must be cleanly skipped, no Exif"
+      "embedded big-endian BigTIFF (0x2b) must not be parsed, no Exif"
     );
 
     // Little-endian BigTIFF: II, magic 0x2b00, bytesize 0x0800.
@@ -5472,7 +5976,7 @@ mod tests {
     le.extend_from_slice(&[0u8; 32]);
     assert!(
       parse_exif_block(&le).is_none(),
-      "little-endian BigTIFF (0x2b) must be cleanly skipped, no Exif"
+      "embedded little-endian BigTIFF (0x2b) must not be parsed, no Exif"
     );
 
     // A classic 0x2a header still parses normally (the gate is BigTIFF-only).
@@ -5483,6 +5987,264 @@ mod tests {
       meta.entry("Make").map(|e| e.tag_id()),
       Some(0x010f),
       "classic TIFF's IFD0:Make must still decode"
+    );
+  }
+
+  /// Build a minimal little-endian BigTIFF (`0x2b`) in memory. `entries` are
+  /// 20-byte BigTIFF IFD entries (`tag(2) format(2) count(8) value-or-offset(8)`);
+  /// `trailing` is appended after the IFD0 block + its 8-byte next-IFD pointer
+  /// (so an out-of-line value's offset can point into it). The 16-byte header is
+  /// `II` + `0x002b` + offset-bytesize `0x0008` + `0x0000` + an 8-byte IFD0
+  /// offset of 16. `order` selects endianness.
+  fn minimal_bigtiff(order: ByteOrder, entries: &[[u8; 20]], trailing: &[u8]) -> Vec<u8> {
+    let u16b = |v: u16| -> [u8; 2] {
+      match order {
+        ByteOrder::Little => v.to_le_bytes(),
+        ByteOrder::Big => v.to_be_bytes(),
+      }
+    };
+    let u64b = |v: u64| -> [u8; 8] {
+      match order {
+        ByteOrder::Little => v.to_le_bytes(),
+        ByteOrder::Big => v.to_be_bytes(),
+      }
+    };
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(match order {
+      ByteOrder::Little => b"II",
+      ByteOrder::Big => b"MM",
+    });
+    out.extend_from_slice(&u16b(0x2b)); // magic 0x002b
+    out.extend_from_slice(&u16b(0x0008)); // offset bytesize = 8
+    out.extend_from_slice(&u16b(0x0000)); // constant 0
+    out.extend_from_slice(&u64b(16)); // IFD0 offset = 16 (right after the header)
+    // IFD0: 8-byte entry count.
+    out.extend_from_slice(&u64b(entries.len() as u64));
+    for e in entries {
+      out.extend_from_slice(e);
+    }
+    out.extend_from_slice(&u64b(0)); // next-IFD pointer = 0
+    out.extend_from_slice(trailing);
+    out
+  }
+
+  /// A 20-byte BigTIFF IFD entry with an INLINE value (`size <= 8`): `value` is
+  /// left-justified into the 8-byte value field.
+  fn big_entry_inline(
+    order: ByteOrder,
+    tag: u16,
+    format: u16,
+    count: u64,
+    value: &[u8],
+  ) -> [u8; 20] {
+    assert!(value.len() <= 8, "inline BigTIFF value must be <= 8 bytes");
+    let (u16b, u64b): (fn(u16) -> [u8; 2], fn(u64) -> [u8; 8]) = match order {
+      ByteOrder::Little => (u16::to_le_bytes, u64::to_le_bytes),
+      ByteOrder::Big => (u16::to_be_bytes, u64::to_be_bytes),
+    };
+    let mut e = [0u8; 20];
+    e[0..2].copy_from_slice(&u16b(tag));
+    e[2..4].copy_from_slice(&u16b(format));
+    e[4..12].copy_from_slice(&u64b(count));
+    e[12..12 + value.len()].copy_from_slice(value);
+    e
+  }
+
+  /// A 20-byte BigTIFF IFD entry with an OUT-OF-LINE value (`size > 8`): the
+  /// 8-byte value field holds the absolute file `offset`.
+  fn big_entry_offset(
+    order: ByteOrder,
+    tag: u16,
+    format: u16,
+    count: u64,
+    offset: u64,
+  ) -> [u8; 20] {
+    let (u16b, u64b): (fn(u16) -> [u8; 2], fn(u64) -> [u8; 8]) = match order {
+      ByteOrder::Little => (u16::to_le_bytes, u64::to_le_bytes),
+      ByteOrder::Big => (u16::to_be_bytes, u64::to_be_bytes),
+    };
+    let mut e = [0u8; 20];
+    e[0..2].copy_from_slice(&u16b(tag));
+    e[2..4].copy_from_slice(&u16b(format));
+    e[4..12].copy_from_slice(&u64b(count));
+    e[12..20].copy_from_slice(&u64b(offset));
+    e
+  }
+
+  #[test]
+  fn bigtiff_header_parses_both_byte_orders() {
+    // A single inline IFD0 entry: ImageWidth (0x0100), int16u (3), count 1,
+    // value 8 — exercised in BOTH II and MM order. The standalone-TIFF entry
+    // (`parse_borrowed`, `standalone_tiff == true`) must parse the 16-byte
+    // BigTIFF header + the 8-byte-count IFD and decode the leaf.
+    for order in [ByteOrder::Little, ByteOrder::Big] {
+      let width = match order {
+        ByteOrder::Little => big_entry_inline(order, 0x0100, 3, 1, &8u16.to_le_bytes()),
+        ByteOrder::Big => big_entry_inline(order, 0x0100, 3, 1, &8u16.to_be_bytes()),
+      };
+      let data = minimal_bigtiff(order, &[width], &[]);
+      let meta = parse_borrowed(&data).expect("BigTIFF parses");
+      // BigTIFF emits NO `File:ExifByteOrder` (`FoundTag`'d only in DoProcessTIFF,
+      // which `ProcessBTF` never reaches), so the emission signal is `None` in
+      // BOTH orders — the order was still applied to the DECODE: the int16u value
+      // below reads as 8, NOT the byte-swapped 0x0800 (2048).
+      assert_eq!(meta.byte_order(), None);
+      let w = meta.entry("ImageWidth").expect("ImageWidth decoded");
+      assert_eq!(w.tag_id(), 0x0100);
+      assert_eq!(w.value_ref().raw(), &RawValue::U64(vec![8]));
+      assert!(
+        meta.warnings().is_empty(),
+        "a clean BigTIFF raises no warnings: {:?}",
+        meta.warnings()
+      );
+    }
+  }
+
+  /// R3 finding: a multi-page BigTIFF DOES emit `File:PageCount`. An IFD0
+  /// `NewSubfileType` (0x00fe) == 2 trips the `MultiPage` flag (`Exif.pm:456`),
+  /// and `DoProcessTIFF` runs `FoundTag(PageCount => …) if $$self{MultiPage}`
+  /// (`ExifTool.pm:8667`) RIGHT AFTER `ProcessBTF` (the `:8668` `return 1` is
+  /// before the `:8691` ExifByteOrder site). So `parse_bigtiff` mirrors the
+  /// classic synthesis on `w.multi_page` (the flat `BigTIFF.btf` has no
+  /// SubfileType ⇒ no PageCount, asserted in the real-fixture test).
+  #[test]
+  fn bigtiff_multipage_subfiletype_emits_page_count() {
+    let order = ByteOrder::Big;
+    // IFD0: NewSubfileType (0x00fe, int32u, count 1) = 2 ⇒ MultiPage.
+    let st = big_entry_inline(order, 0x00fe, 4, 1, &2u32.to_be_bytes());
+    let data = minimal_bigtiff(order, &[st], &[]);
+    let meta = parse_borrowed(&data).expect("BigTIFF parses");
+    assert_eq!(
+      meta.multi_page_count(),
+      Some(1),
+      "an IFD0 SubfileType==2 sets MultiPage ⇒ File:PageCount = 1: {:?}",
+      meta.multi_page_count()
+    );
+  }
+
+  /// R4 finding: `OldSubfileType` (0x00ff) BigTIFFs ALSO emit `File:PageCount`.
+  /// 0x00ff is absent from the port's leaf table but IS in `%Exif::Main`, so
+  /// the walk lets it past the leaf-known gate to reach [`emit`](Walker::emit),
+  /// whose `MultiPage` RawConv tap (`Exif.pm:470`) trips on value 3 — exactly as
+  /// the classic walker does. The unported leaf is still dropped (no spurious
+  /// `OldSubfileType` tag), only the `DoProcessTIFF` `File:PageCount` synthesis
+  /// (`ExifTool.pm:8667`) fires. Crafted (deprecated tag), but the divergence
+  /// from the classic path was real.
+  #[test]
+  fn bigtiff_multipage_old_subfiletype_emits_page_count() {
+    let order = ByteOrder::Big;
+    // IFD0: OldSubfileType (0x00ff, int16u, count 1) = 3 ⇒ MultiPage.
+    let st = big_entry_inline(order, 0x00ff, 3, 1, &3u16.to_be_bytes());
+    let data = minimal_bigtiff(order, &[st], &[]);
+    let meta = parse_borrowed(&data).expect("BigTIFF parses");
+    assert_eq!(
+      meta.multi_page_count(),
+      Some(1),
+      "an IFD0 OldSubfileType==3 sets MultiPage ⇒ File:PageCount = 1: {:?}",
+      meta.multi_page_count()
+    );
+    assert!(
+      meta.entry("OldSubfileType").is_none(),
+      "0x00ff is unported — only the MultiPage side-effect runs, no leaf is emitted"
+    );
+  }
+
+  #[test]
+  fn bigtiff_rejects_bad_offset_bytesize_and_constant() {
+    // `ProcessBTF`'s regex requires offset-bytesize 0x0008 (bytes 4-5) AND the
+    // 0x0000 constant (bytes 6-7). A non-8 bytesize or a non-zero constant must
+    // be REJECTED (`None`), not misparsed.
+    let width = big_entry_inline(ByteOrder::Little, 0x0100, 3, 1, &8u16.to_le_bytes());
+
+    // Good header parses (control).
+    assert!(parse_borrowed(&minimal_bigtiff(ByteOrder::Little, &[width], &[])).is_some());
+
+    // Bad offset-bytesize (4 instead of 8) at bytes 4-5.
+    let mut bad_bytesize = minimal_bigtiff(ByteOrder::Little, &[width], &[]);
+    bad_bytesize[4] = 0x04;
+    assert!(
+      parse_borrowed(&bad_bytesize).is_none(),
+      "offset-bytesize != 8 must reject the BigTIFF header"
+    );
+
+    // Non-zero constant at bytes 6-7.
+    let mut bad_constant = minimal_bigtiff(ByteOrder::Little, &[width], &[]);
+    bad_constant[6] = 0x01;
+    assert!(
+      parse_borrowed(&bad_constant).is_none(),
+      "a non-zero constant must reject the BigTIFF header"
+    );
+
+    // A header truncated before the full 16 bytes (the `Read == 16` gate).
+    let short = &minimal_bigtiff(ByteOrder::Little, &[width], &[])[..15];
+    assert!(
+      parse_borrowed(short).is_none(),
+      "a < 16-byte BigTIFF header must reject"
+    );
+  }
+
+  #[test]
+  fn bigtiff_walks_inline_and_out_of_line_values() {
+    // IFD0 with TWO entries: an INLINE int16u (size 2 <= 8) and an OUT-OF-LINE
+    // BitsPerSample int16u[3] (size 6 <= 8 would be inline, so use int32u[3] =>
+    // size 12 > 8 to force the out-of-line path). The out-of-line value lives in
+    // the trailing block, at an absolute offset.
+    let order = ByteOrder::Little;
+    // ImageWidth 0x0100 int16u count 1 = 8, inline.
+    let width = big_entry_inline(order, 0x0100, 3, 1, &8u16.to_le_bytes());
+    // StripByteCounts 0x0117 int32u[3] => 12 bytes > 8 => out-of-line. The
+    // absolute offset is computed below once the layout is known.
+    //
+    // Layout: header(16) + count(8) + 2*entry(40) + nextptr(8) = 72. The
+    // out-of-line value block starts at offset 72 (the trailing bytes).
+    let value_off: u64 = 16 + 8 + 2 * 20 + 8;
+    let counts = big_entry_offset(order, 0x0117, 4, 3, value_off);
+    // Three int32u values 10, 20, 30 (little-endian) in the trailing block.
+    let mut trailing: Vec<u8> = Vec::new();
+    for v in [10u32, 20, 30] {
+      trailing.extend_from_slice(&v.to_le_bytes());
+    }
+    let data = minimal_bigtiff(order, &[width, counts], &trailing);
+    assert_eq!(data.len() as u64, value_off + 12, "layout sanity");
+
+    let meta = parse_borrowed(&data).expect("BigTIFF parses");
+    assert_eq!(
+      meta.entry("ImageWidth").map(|e| e.tag_id()),
+      Some(0x0100),
+      "inline value decoded"
+    );
+    let sbc = meta
+      .entry("StripByteCounts")
+      .expect("out-of-line StripByteCounts decoded");
+    assert_eq!(sbc.tag_id(), 0x0117);
+    assert!(
+      meta.warnings().is_empty(),
+      "clean BigTIFF raises no warnings: {:?}",
+      meta.warnings()
+    );
+  }
+
+  #[test]
+  fn bigtiff_truncated_directory_does_not_panic() {
+    // An 8-byte count claiming more entries than the buffer holds must warn
+    // "Truncated <dir> directory" and abort cleanly — no panic, no OOB
+    // (the `#![deny(clippy::indexing_slicing)]` bounds-safety contract). Build a
+    // valid header but truncate the body so `count*20` overruns.
+    let order = ByteOrder::Little;
+    let width = big_entry_inline(order, 0x0100, 3, 1, &8u16.to_le_bytes());
+    let mut data = minimal_bigtiff(order, &[width], &[]);
+    // Overwrite the IFD0 count (at offset 16) with a huge value; the body is
+    // far shorter, so the entry block read overruns.
+    data[16..24].copy_from_slice(&9999u64.to_le_bytes());
+    let meta = parse_borrowed(&data).expect("header still parses (count is read later)");
+    assert!(
+      meta.entries().is_empty(),
+      "a truncated BigTIFF directory yields no leaf tags"
+    );
+    assert!(
+      meta.warnings().iter().any(|w| w.contains("Truncated")),
+      "a truncated BigTIFF directory warns: {:?}",
+      meta.warnings()
     );
   }
 
