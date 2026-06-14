@@ -1030,7 +1030,7 @@ mod tests {
 
     // Big-endian BigTIFF header (MM, magic 0x002b, bytesize 8, reserved 0,
     // 8-byte IFD0 offset, plus body) — the same shape the `exif::mod`
-    // `bigtiff_magic_is_cleanly_skipped` test uses.
+    // `embedded_bigtiff_magic_is_not_parsed` test uses.
     let mut be: Vec<u8> = std::vec![b'M', b'M', 0x00, 0x2b, 0x00, 0x08, 0x00, 0x00];
     be.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]);
     be.extend_from_slice(&[0u8; 32]);

@@ -692,3 +692,148 @@ fn plain_tiff_stays_tiff() {
     }
   }
 }
+
+/// Run the REAL bundled `perl exiftool -G1 -j <args>` over `BigTIFF.btf` and
+/// return the first document's `-G1` object, or `None` when the oracle cannot
+/// be run (env unset / spawn failure) so the test self-skips.
+fn bigtiff_oracle(dir: &str, extra: &[&str]) -> Option<serde_json::Map<String, Value>> {
+  let mut cmd = std::process::Command::new("perl");
+  cmd
+    .arg("/Users/al/Developer/findit-studio/exiftool/exiftool")
+    .arg("-G1")
+    .arg("-j")
+    .args(extra)
+    .arg(format!("{dir}/BigTIFF.btf"));
+  let out = cmd.output().ok()?;
+  let json = String::from_utf8(out.stdout).ok()?;
+  let v: Value = serde_json::from_str(&json).ok()?;
+  v.as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .cloned()
+}
+
+/// **#168 — BigTIFF (magic 0x2b) walker.** `BigTIFF.btf` is an 8×8 RGB BigTIFF
+/// (16-byte header, 8-byte counts, 20-byte IFD entries). exifast must classify
+/// it as `BTF`/`btf`/`image/x-tiff-big` and decode its 8 IFD0 leaf tags via the
+/// dedicated BigTIFF walker (`ProcessBTF`/`ProcessBigIFD`, reusing `%Exif::Main`
+/// + `ReadValue`).
+///
+/// Two layers of assertion:
+///  1. the EXACT contract values (`File:FileType = BTF`, `IFD0:ImageWidth = 8`,
+///     …, `IFD0:StripByteCounts = 192`) as a hard backstop, in BOTH `-j` and
+///     `-n` modes;
+///  2. value-equality against the LIVE `perl exiftool` oracle for those same
+///     `IFD0:*` + `File:*` keys (skipped when `EXIFTOOL_T_IMAGES` is unset).
+///
+/// `Composite:ImageSize` / `Composite:Megapixels` (which the oracle also emits)
+/// are OUT OF SCOPE — the port's Composite subsystem is a separate known gap —
+/// so they are deliberately NOT asserted.
+#[test]
+fn real_fixture_bigtiff_walker_decodes_ifd0() {
+  let Some(data) = t_image("BigTIFF.btf") else {
+    return;
+  };
+
+  // The 8 IFD0 leaf tags + the File triplet, with their EXACT `-j` (PrintConv)
+  // values from the issue's oracle target (`perl exiftool -G1 -j BigTIFF.btf`,
+  // ExifTool 13.59). Numeric tags compare as `serde_json` numbers; the string
+  // tags (`BitsPerSample`, `PhotometricInterpretation`) as strings.
+  let expected_pc: &[(&str, Value)] = &[
+    ("File:FileType", Value::from("BTF")),
+    ("File:FileTypeExtension", Value::from("btf")),
+    ("File:MIMEType", Value::from("image/x-tiff-big")),
+    ("IFD0:ImageWidth", Value::from(8)),
+    ("IFD0:ImageHeight", Value::from(8)),
+    ("IFD0:BitsPerSample", Value::from("8 8 8")),
+    ("IFD0:PhotometricInterpretation", Value::from("RGB")),
+    ("IFD0:StripOffsets", Value::from(192)),
+    ("IFD0:SamplesPerPixel", Value::from(3)),
+    ("IFD0:RowsPerStrip", Value::from(8)),
+    ("IFD0:StripByteCounts", Value::from(192)),
+  ];
+
+  // Layer 1 (-j): exact contract values.
+  let pc = doc("BigTIFF.btf", &data, true);
+  for (key, want) in expected_pc {
+    assert_eq!(
+      pc.get(*key),
+      Some(want),
+      "BigTIFF.btf (-j): {key} must be {want:?} (got {:?})",
+      pc.get(*key)
+    );
+  }
+  // R2 finding: a BigTIFF must emit NEITHER `File:ExifByteOrder` NOR
+  // `File:PageCount` — both are `FoundTag`'d only inside `DoProcessTIFF`
+  // (`ExifTool.pm:8691`/`:8667`), which `ProcessBTF` never reaches (the oracle
+  // for BigTIFF.btf has neither, while a classic TIFF emits `File:ExifByteOrder`).
+  for absent in ["File:ExifByteOrder", "File:PageCount"] {
+    assert!(
+      pc.get(absent).is_none(),
+      "BigTIFF.btf (-j): {absent} must NOT be emitted (got {:?})",
+      pc.get(absent)
+    );
+  }
+
+  // Layer 1 (-n): the type triplet + the numeric IFD0 tags are unchanged in
+  // `-n` mode; the two PrintConv string tags differ (raw `2` for
+  // PhotometricInterpretation; `BitsPerSample` stays `8 8 8`).
+  let nc = doc("BigTIFF.btf", &data, false);
+  assert_eq!(
+    nc.get("File:FileType"),
+    Some(&Value::from("BTF")),
+    "BigTIFF.btf (-n): File:FileType"
+  );
+  assert_eq!(
+    nc.get("IFD0:ImageWidth"),
+    Some(&Value::from(8)),
+    "BigTIFF.btf (-n): IFD0:ImageWidth"
+  );
+  assert_eq!(
+    nc.get("IFD0:PhotometricInterpretation"),
+    Some(&Value::from(2)),
+    "BigTIFF.btf (-n): PhotometricInterpretation is raw 2 in -n mode"
+  );
+
+  // Layer 2: value-equality vs the LIVE oracle for the IFD0 + File keys (both
+  // modes). Skipped when the oracle cannot be run.
+  for (print_on, extra) in [(true, &[][..]), (false, &["-n"][..])] {
+    let Some(oracle) = bigtiff_oracle(
+      &std::env::var("EXIFTOOL_T_IMAGES").unwrap_or_default(),
+      extra,
+    ) else {
+      eprintln!("skipping oracle comparison: exiftool not runnable");
+      continue;
+    };
+    let got = doc("BigTIFF.btf", &data, print_on);
+    let mode = if print_on { "-j" } else { "-n" };
+    for key in oracle
+      .keys()
+      .filter(|k| k.starts_with("IFD0:") || matches!(k.as_str(), "File:FileType" | "File:MIMEType"))
+    {
+      assert_eq!(
+        got.get(key),
+        oracle.get(key),
+        "BigTIFF.btf ({mode}): {key} must match the oracle (got {:?}, oracle {:?})",
+        got.get(key),
+        oracle.get(key)
+      );
+    }
+  }
+}
+
+/// R1 finding: `ProcessBTF` `$et->SetFileType('BTF')` (`BigTIFF.pm:246`) forces
+/// `File:FileType = BTF` on the 0x2b magic REGARDLESS of extension — so the same
+/// BigTIFF bytes named `.tif` (whose detection candidate is TIFF) or dotless
+/// still finalize as `BTF` + `image/x-tiff-big`. Before the fix these resolved to
+/// the `TIFF` detection candidate (the magic only forced BTF for a `.btf` name).
+#[test]
+fn bigtiff_magic_forces_btf_regardless_of_extension() {
+  let Some(data) = t_image("BigTIFF.btf") else {
+    return; // EXIFTOOL_T_IMAGES not set
+  };
+  // Named `.tif` — the extension's TIFF candidate is overridden by the 0x2b magic.
+  assert_triplet_no_pagecount("renamed.tif", &data, "BTF", "btf", "image/x-tiff-big");
+  // Dotless — likewise BTF.
+  assert_triplet_no_pagecount("renamed", &data, "BTF", "btf", "image/x-tiff-big");
+}
