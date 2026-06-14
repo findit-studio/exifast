@@ -260,8 +260,9 @@ fn vendor_status_phase_buckets_are_observable() {
   assert!(Vendor::Sony.status().is_scheduled());
   assert!(Vendor::Panasonic.status().is_scheduled());
   assert!(Vendor::Dji.status().is_scheduled());
-  // Long-tail vendors are deferred.
-  assert!(Vendor::Nikon.status().is_deferred());
+  // Nikon is now scheduled (Phase 5 — `%Nikon::Main` + readable sub-tables).
+  assert!(Vendor::Nikon.status().is_scheduled());
+  // Long-tail vendors are still deferred.
   assert!(Vendor::Pentax.status().is_deferred());
   assert!(Vendor::Fuji.status().is_deferred());
 }
@@ -1689,6 +1690,123 @@ fn from_blob_panasonic3_dcft7_base12_reads_out_of_line_at_correct_offset() {
     Some("LUMIX-LENS-12"),
     "a base-0 (Inherit) read must NOT recover the real string from a \
      base-12-stored offset"
+  );
+}
+
+/// `MakerNotesMeta::from_blob_with_context` is a blob-ONLY constructor with no
+/// parent TIFF. Nikon's type-2 (`Nikon\0\x01`) and headerless-Nikon3 layouts
+/// have NO `Base` override ⇒ their out-of-line value offsets are
+/// PARENT-TIFF-relative; with only the blob, an absolute offset would index
+/// INTO the blob and read out-of-line values from the WRONG bytes (garbage).
+/// The constructor must therefore NOT decode those layouts (leave the Nikon
+/// slot ABSENT) — only the self-contained type-3 (`Nikon\0\x02`) embedded TIFF,
+/// whose `Base => '$start - 8'` makes the blob its own context, may decode.
+/// (The production decode never hits this path — `Exif` calls
+/// `nikon::parse_in_tiff` with the real parent TIFF — so the gate is purely
+/// defensive.)
+#[cfg(all(feature = "exif", feature = "std"))]
+#[test]
+fn nikon_blob_constructor_type2_headerless_no_garbage() {
+  use exifast::exif::ifd::ByteOrder;
+  use exifast::exif::makernotes::{MakerNotesMeta, dispatch, vendors};
+
+  // ---- Type-2 (`Nikon\0\x01`): IFD at offset 8, LE, offsets TIFF-relative,
+  // walked against `%Nikon::Type2`. A single OUT-OF-LINE ColorMode (0x0004 =
+  // ColorMode in Type2, ASCII[6]) whose stored offset (26) is a
+  // parent-TIFF-absolute position. With only the blob, offset 26 lands on
+  // bytes spelling "WRONG\0" — exactly the mis-rebased garbage the gate must
+  // suppress.
+  let mut t2: Vec<u8> = Vec::new();
+  t2.extend_from_slice(b"Nikon\x00\x01\x00"); // 8-byte header, IFD @8
+  t2.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+  t2.extend_from_slice(&0x0004u16.to_le_bytes()); // tag 0x0004 = ColorMode (Type2)
+  t2.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+  t2.extend_from_slice(&6u32.to_le_bytes()); // count 6 (out-of-line)
+  t2.extend_from_slice(&26u32.to_le_bytes()); // TIFF-absolute offset
+  t2.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  assert_eq!(
+    t2.len(),
+    26,
+    "the out-of-line bytes must start at offset 26"
+  );
+  t2.extend_from_slice(b"WRONG\x00"); // bytes a blob-only walk would mis-read
+
+  let detected_t2 = dispatch(&t2, Some("NIKON CORPORATION"), Some("E990"), None);
+  assert!(detected_t2.vendor().is_nikon());
+
+  // The gated constructor must leave the Nikon slot ABSENT.
+  let meta_t2 = MakerNotesMeta::from_blob(detected_t2, &t2, ByteOrder::Little);
+  assert!(
+    meta_t2.nikon().is_none(),
+    "from_blob must NOT decode a type-2 Nikon blob (no parent TIFF ⇒ \
+     out-of-line offsets cannot be faithfully rebased)"
+  );
+
+  // NEGATIVE CONTROL: the ungated blob-only walk (`vendors::nikon::parse`)
+  // DOES mis-read the out-of-line value from the blob — emitting it as the
+  // Type2 name `ColorMode` = "WRONG" (raw, no PrintConv). Proves the gate is
+  // load-bearing — without it the constructor would emit this garbage. (The
+  // emission name is `ColorMode`, the `%Nikon::Type2` 0x0004 tag, confirming
+  // the type-2 walk uses Type2, not `%Nikon::Main` where 0x0004 = Quality.)
+  let (_mis, mis_emit) = vendors::nikon::parse(&t2, ByteOrder::Little, Some("E990"));
+  let mis_color_mode = mis_emit
+    .iter()
+    .find(|e| e.name() == "ColorMode")
+    .map(|e| e.value().clone());
+  assert_eq!(
+    mis_color_mode,
+    Some(exifast::value::TagValue::Str("WRONG".into())),
+    "the ungated blob-only walk reads the mis-rebased out-of-line value as \
+     the Type2 ColorMode (0x0004), proving the Type2 table is used"
+  );
+
+  // ---- Headerless Nikon3: the blob IS the IFD (offset 0), offsets
+  // TIFF-relative. Same hazard ⇒ same gate.
+  let mut t3less: Vec<u8> = Vec::new();
+  t3less.extend_from_slice(&1u16.to_le_bytes()); // count = 1 (IFD @0)
+  t3less.extend_from_slice(&0x0004u16.to_le_bytes()); // Quality
+  t3less.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+  t3less.extend_from_slice(&6u32.to_le_bytes()); // count 6 (out-of-line)
+  t3less.extend_from_slice(&18u32.to_le_bytes()); // TIFF-absolute offset
+  t3less.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+  assert_eq!(t3less.len(), 18, "headerless out-of-line bytes start at 18");
+  t3less.extend_from_slice(b"WRONG\x00");
+
+  // Headerless Nikon3 needs a `^NIKON` make to dispatch (`MakerNotes.pm:550`).
+  let detected_hl = dispatch(&t3less, Some("NIKON"), Some("COOLPIX"), None);
+  assert!(detected_hl.vendor().is_nikon());
+  let meta_hl = MakerNotesMeta::from_blob(detected_hl, &t3less, ByteOrder::Little);
+  assert!(
+    meta_hl.nikon().is_none(),
+    "from_blob must NOT decode a headerless Nikon3 blob (offsets are \
+     parent-TIFF-relative, no parent TIFF available)"
+  );
+
+  // ---- Type-3 (`Nikon\0\x02`) self-contained embedded TIFF (BE): the blob IS
+  // its own context, so the SAME constructor decodes it correctly. Inline
+  // LensType = 0x06 → "G" (no out-of-line offset involved).
+  let mut t3: Vec<u8> = Vec::new();
+  t3.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00"); // 10-byte header
+  t3.extend_from_slice(b"MM"); // embedded TIFF: big-endian
+  t3.extend_from_slice(&[0x00, 0x2a]);
+  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]); // IFD0 @ embedded-TIFF +8
+  t3.extend_from_slice(&[0x00, 0x01]); // 1 entry
+  t3.extend_from_slice(&[0x00, 0x83]); // tag 0x0083 = LensType
+  t3.extend_from_slice(&[0x00, 0x01]); // int8u
+  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // count 1
+  t3.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]); // inline value 6 → "G"
+  t3.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next IFD
+
+  let detected_t3 = dispatch(&t3, Some("NIKON CORPORATION"), Some("NIKON D70"), None);
+  assert!(detected_t3.vendor().is_nikon());
+  let meta_t3 = MakerNotesMeta::from_blob(detected_t3, &t3, ByteOrder::Big);
+  let nikon_t3 = meta_t3
+    .nikon()
+    .expect("from_blob must still decode the self-contained type-3 layout");
+  assert_eq!(
+    nikon_t3.lens_type(),
+    Some("G"),
+    "the type-3 self-contained path through from_blob still decodes correctly"
   );
 }
 
@@ -3465,6 +3583,52 @@ fn canon_mismarked_subdir_parents_not_emitted() {
   }
 }
 
+// Phase 5 — real-input Nikon fixtures (#62/#74). NOT bundled; gated on
+// EXIFTOOL_T_IMAGES (ExifTool's t/images). Covers the three MakerNote
+// layouts: type-3 embedded-TIFF (Nikon.nef / NikonD2Hs / NikonD70) + the
+// headerless Nikon3 (Nikon.jpg, a Coolpix E775). Every PORTED `Nikon:*` tag
+// must match the bundled `exiftool -G1 -j` oracle value-semantic; the
+// oracle-only-remaining keys are the DEFERRED ENCRYPTED sub-tables
+// (LensData/ShotInfo/FlashInfo + the encrypted ColorBalance) + the
+// PreviewIFD subdir offsets — verified absent without leaking a bogus parent.
+// ===========================================================================
+
+/// Read `{dir}/{file}` from EXIFTOOL_T_IMAGES into our `-j` JSON map; `None`
+/// (skip) when the env var / file is unavailable.
+#[cfg(feature = "json")]
+fn nikon_fixture_map(file: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+  let dir = std::env::var("EXIFTOOL_T_IMAGES").ok()?;
+  let path = format!("{dir}/{file}");
+  let data = std::fs::read(&path).ok()?;
+  let json = exifast::parser::extract_info(file, &data, true);
+  let doc: serde_json::Value = serde_json::from_str(&json).expect("our json parses");
+  doc
+    .as_array()
+    .and_then(|a| a.first())
+    .and_then(|o| o.as_object())
+    .cloned()
+}
+
+/// Assert every `(key, oracle_json)` in `oracle` matches our map
+/// value-semantic (`"2.10"`==`2.10`, `1.0`==`1`); the cited values are from
+/// `perl exiftool -G1 -j <fixture>`.
+#[cfg(feature = "json")]
+fn assert_nikon_oracle(map: &serde_json::Map<String, serde_json::Value>, oracle: &[(&str, &str)]) {
+  use exifast::jsondiff::json_equivalent;
+  for (key, want) in oracle {
+    let got = map
+      .get(*key)
+      .unwrap_or_else(|| panic!("missing {key}; keys: {:?}", map.keys().collect::<Vec<_>>()));
+    let got_doc = serde_json::to_string(got).unwrap();
+    let got_obj = format!("[{{\"v\":{got_doc}}}]");
+    let want_obj = format!("[{{\"v\":{want}}}]");
+    assert!(
+      json_equivalent(&got_obj, &want_obj).is_ok(),
+      "{key}: got {got_doc}, want {want}"
+    );
+  }
+}
+
 /// #223 — the real `Canon1DmkIII.jpg` (NOT bundled; gated on
 /// `EXIFTOOL_T_IMAGES`) carries ALL SEVEN mis-marked SubDirectory parents
 /// (`CanonCameraInfo`/`CropInfo`/`CustomFunctions2`/`AspectInfo`/
@@ -3759,6 +3923,118 @@ fn canon_0x28_count_zero_no_trailing_decode() {
   }
 }
 
+/// Nikon.nef (D70 NEF, type-3 embedded-TIFF MakerNote). The ported
+/// `%Nikon::Main` scalars + the unencrypted `ColorBalance0103`
+/// (WB_RGBGLevels) match the oracle; the deferred encrypted children
+/// (LensData/etc.) stay absent without a bogus parent. Make/Model from IFD0.
+#[cfg(feature = "json")]
+#[test]
+fn real_fixture_nikon_nef_makernotes() {
+  let Some(map) = nikon_fixture_map("Nikon.nef") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES/Nikon.nef unavailable");
+    return;
+  };
+  // PORTED Nikon::Main + the embedded-TIFF base correctness (a wrong base
+  // would decode garbage, not these exact values).
+  assert_nikon_oracle(
+    &map,
+    &[
+      ("Nikon:MakerNoteVersion", "2.10"),
+      ("Nikon:ISO", "200"),
+      ("Nikon:Quality", r#""RAW""#),
+      ("Nikon:WhiteBalance", r#""Auto""#),
+      ("Nikon:Sharpness", r#""None""#),
+      ("Nikon:FocusMode", r#""AF-S""#),
+      ("Nikon:ToneComp", r#""CS""#),
+      ("Nikon:LensType", r#""G""#),
+      ("Nikon:Lens", r#""18-70mm f/3.5-4.5""#),
+      ("Nikon:FlashMode", r#""Did Not Fire""#),
+      ("Nikon:ShootingMode", r#""Single-Frame""#),
+      ("Nikon:ColorHue", r#""Mode2""#),
+      ("Nikon:LightSource", r#""Natural""#),
+      ("Nikon:NEFCompression", r#""Lossy (type 1)""#),
+      ("Nikon:NoiseReduction", r#""Off""#),
+      // ColorBalance0103 (UNENCRYPTED, walked): WB_RGBGLevels = int16u[4].
+      ("Nikon:WB_RGBGLevels", r#""478 265 493 265""#),
+      ("Nikon:SerialNumber", "12345678"),
+      ("Nikon:ShutterCount", "3619"),
+      ("Nikon:RawImageCenter", r#""1520 1008""#),
+      ("Nikon:SensorPixelSize", r#""7.8 x 7.8 um""#),
+      ("Nikon:Saturation", r#""Normal""#),
+    ],
+  );
+  // The DEFERRED ENCRYPTED sub-tables (LensData 0x0098 / ShotInfo 0x0091 /
+  // FlashInfo 0x00a8) are oracle-only — neither the bogus parent NOR the
+  // (un-decrypted) children are emitted (#177/#223).
+  for absent in [
+    "Nikon:LensData",        // bogus parent
+    "Nikon:LensDataVersion", // encrypted child
+    "Nikon:FocusDistance",
+    "Nikon:LensIDNumber",
+    "Nikon:ShotInfo",
+    "Nikon:FlashInfo",
+  ] {
+    assert!(
+      !map.contains_key(absent),
+      "deferred/bogus key {absent} must be absent"
+    );
+  }
+  // Make/Model still come from IFD0 unchanged.
+  assert_eq!(
+    map.get("IFD0:Make").and_then(|v| v.as_str()),
+    Some("NIKON CORPORATION")
+  );
+  assert_eq!(
+    map.get("IFD0:Model").and_then(|v| v.as_str()),
+    Some("NIKON D70")
+  );
+}
+
+/// Nikon.jpg (Coolpix E775 — HEADERLESS Nikon3 MakerNote, `Make =~ /^NIKON/i`,
+/// little-endian, offsets PARENT-TIFF-relative). Verifies the headerless
+/// layout decodes the full Main scalar set (a wrong base/slice would yield
+/// garbage), incl. the `(Binary data …)` DataDump placeholder.
+#[cfg(feature = "json")]
+#[test]
+fn real_fixture_nikon_jpg_makernotes() {
+  let Some(map) = nikon_fixture_map("Nikon.jpg") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES/Nikon.jpg unavailable");
+    return;
+  };
+  assert_nikon_oracle(
+    &map,
+    &[
+      ("Nikon:MakerNoteVersion", "1.00"),
+      ("Nikon:ISO", "0"),
+      ("Nikon:ColorMode", r#""Color""#),
+      ("Nikon:Quality", r#""Fine""#),
+      ("Nikon:WhiteBalance", r#""Auto""#),
+      ("Nikon:Sharpness", r#""Auto""#),
+      ("Nikon:FocusMode", r#""AF-C""#),
+      ("Nikon:ISOSelection", r#""Auto""#),
+      ("Nikon:ImageAdjustment", r#""Normal""#),
+      ("Nikon:AuxiliaryLens", r#""Off""#),
+      ("Nikon:DigitalZoom", "1"),
+      // AFInfo (UNENCRYPTED ProcessBinaryData, walked): the Coolpix is LE.
+      ("Nikon:AFAreaMode", r#""Single Area""#),
+      ("Nikon:AFPoint", r#""Center""#),
+      ("Nikon:AFPointsInFocus", r#""(none)""#),
+      // DataDump (Binary => 1) → the (Binary data N bytes, …) placeholder.
+      (
+        "Nikon:DataDump",
+        r#""(Binary data 122 bytes, use -b option to extract)""#,
+      ),
+    ],
+  );
+  // No bogus subdir parents.
+  for absent in ["Nikon:LensData", "Nikon:ShotInfo", "Nikon:FlashInfo"] {
+    assert!(
+      !map.contains_key(absent),
+      "bogus key {absent} must be absent"
+    );
+  }
+}
+
 /// #223 R4 — a `0x28` entry declaring a HUGE element count must be bounds-safe:
 /// the checked window computation (`byte_size().checked_mul(count)` +
 /// `checked_add` + `get`) never panics and never allocates the discarded
@@ -3891,4 +4167,71 @@ fn canon_223_second_pass_subdir_parents_suppressed() {
       );
     }
   }
+}
+
+/// NikonD2Hs.jpg (type-3) — exercises the FlashType empty string, the
+/// `ColorSpace` hash, AFInfo (BigEndian DSLR path) + the deferred ENCRYPTED
+/// ColorBalance (WB_RGGBLevels) which must NOT appear.
+#[cfg(feature = "json")]
+#[test]
+fn real_fixture_nikon_d2hs_makernotes() {
+  let Some(map) = nikon_fixture_map("NikonD2Hs.jpg") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES/NikonD2Hs.jpg unavailable");
+    return;
+  };
+  assert_nikon_oracle(
+    &map,
+    &[
+      ("Nikon:Quality", r#""Fine""#),
+      ("Nikon:WhiteBalance", r#""Preset0""#),
+      ("Nikon:FocusMode", r#""AF-C""#),
+      ("Nikon:FlashSetting", r#""Normal""#),
+      ("Nikon:ColorSpace", r#""sRGB""#),
+      ("Nikon:LensType", r#""D""#),
+      ("Nikon:Lens", r#""50mm f/1.8""#),
+      ("Nikon:ShootingMode", r#""Delay""#),
+      ("Nikon:SerialNumber", "3001006"),
+      ("Nikon:ImageDataSize", "1369271"),
+      ("Nikon:ImageCount", "2"),
+      ("Nikon:DeletedImageCount", "0"),
+      ("Nikon:ShutterCount", "2"),
+      // AFInfo (BigEndian DSLR path).
+      ("Nikon:AFAreaMode", r#""Single Area""#),
+      ("Nikon:AFPointsInFocus", r#""Center""#),
+      ("Nikon:HighISONoiseReduction", r#""Normal""#),
+    ],
+  );
+  // The D2Hs ColorBalance is the ENCRYPTED 0206 variant ⇒ WB_RGGBLevels is
+  // deferred (oracle-only), and no bogus ColorBalance parent is emitted.
+  assert!(!map.contains_key("Nikon:WB_RGGBLevels"));
+  assert!(!map.contains_key("Nikon:ColorBalance"));
+}
+
+/// NikonD70.jpg (type-3) — exercises the `FlashExposureComp` PrintFraction
+/// (`-5/3`) and `ExposureDifference` (`%+.1f` → `-4.9`), plus the title-cased
+/// `FlashType` ("Built-in,TTL") + the unencrypted WB_RGBGLevels.
+#[cfg(feature = "json")]
+#[test]
+fn real_fixture_nikon_d70_makernotes() {
+  let Some(map) = nikon_fixture_map("NikonD70.jpg") else {
+    eprintln!("skipping: EXIFTOOL_T_IMAGES/NikonD70.jpg unavailable");
+    return;
+  };
+  assert_nikon_oracle(
+    &map,
+    &[
+      ("Nikon:Sharpness", r#""Med.H""#),
+      ("Nikon:FlashType", r#""Built-in,TTL""#),
+      ("Nikon:ExposureDifference", "-4.9"),
+      ("Nikon:FlashExposureComp", r#""-5/3""#),
+      ("Nikon:LensType", r#""G""#),
+      ("Nikon:Lens", r#""18-70mm f/3.5-4.5""#),
+      ("Nikon:FlashMode", r#""Fired, TTL Mode""#),
+      ("Nikon:ShootingMode", r#""Continuous""#),
+      ("Nikon:WB_RGBGLevels", r#""597 256 361 256""#),
+      ("Nikon:SerialNumber", r#""No= 20025585""#),
+      ("Nikon:Saturation", r#""Enhanced""#),
+    ],
+  );
+  assert!(!map.contains_key("Nikon:LensData"));
 }

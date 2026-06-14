@@ -64,7 +64,7 @@ pub use vendor::{Vendor, VendorStatus};
 #[cfg(feature = "alloc")]
 pub use vendors::VendorEmission;
 pub use vendors::{
-  AppleMakerNote, CanonMakerNote, DjiMakerNote, PanasonicMakerNote, SonyMakerNote,
+  AppleMakerNote, CanonMakerNote, DjiMakerNote, MakerNotesNikon, PanasonicMakerNote, SonyMakerNote,
 };
 
 /// Typed MakerNotes metadata — the top-level surface for vendor MakerNote
@@ -95,6 +95,10 @@ pub struct MakerNotesMeta {
   panasonic: Option<PanasonicMakerNote>,
   /// DJI decoded data — Phase 4.
   dji: Option<DjiMakerNote>,
+  /// Nikon decoded data — populated when [`Vendor::Nikon`] dispatched AND
+  /// the Nikon port runs (`%Nikon::Main`, the readable scalars + AFInfo +
+  /// the unencrypted ColorBalance0103).
+  nikon: Option<MakerNotesNikon>,
 }
 
 impl MakerNotesMeta {
@@ -111,6 +115,7 @@ impl MakerNotesMeta {
       sony: None,
       panasonic: None,
       dji: None,
+      nikon: None,
     }
   }
 
@@ -145,6 +150,12 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub fn set_dji(&mut self, dji: DjiMakerNote) {
     self.dji = Some(dji);
+  }
+
+  /// Replace the Nikon slot — used by the IFD walker during walk.
+  #[inline(always)]
+  pub fn set_nikon(&mut self, nikon: MakerNotesNikon) {
+    self.nikon = Some(nikon);
   }
 
   /// Build a `MakerNotesMeta` and POPULATE the per-vendor slot when the
@@ -359,6 +370,30 @@ impl MakerNotesMeta {
         let (typed, _emissions) = vendors::dji::parse(blob, parent_order);
         meta.dji = Some(typed);
       }
+      // Nikon has THREE layouts with DIFFERENT base semantics, and only ONE is
+      // faithfully decodable from the captured blob ALONE — hence the `Nikon\0
+      // \x02` guard:
+      //   - type-3 (`Nikon\0\x02…`, `MakerNotes.pm:51-58`) carries a
+      //     SELF-CONTAINED embedded TIFF (`Base => '$start - 8'` rebases its
+      //     out-of-line offsets to blob offset 10) ⇒ the blob IS the TIFF
+      //     context, so the standalone-blob walk is faithful.
+      //   - type-2 (`Nikon\0\x01`, `MakerNotes.pm:539-545`) and headerless
+      //     Nikon3 (`MakerNotes.pm:546-554`) have NO `Base` override ⇒ their
+      //     out-of-line value offsets are PARENT-TIFF-relative. This blob-only
+      //     constructor has NO parent TIFF, so an absolute offset would index
+      //     INTO the blob and read out-of-line values from the wrong bytes
+      //     (garbage) or fall outside it. The production decode never reaches
+      //     here — `Exif`'s MakerNote arm calls `nikon::parse_in_tiff` with the
+      //     real parent TIFF (`src/exif/mod.rs`) — so this gate is purely
+      //     defensive for direct `from_blob`/`from_blob_with_context` callers
+      //     (tests/tools). They fall to the `_` arm below ⇒ the Nikon slot
+      //     stays UNPOPULATED (no mis-rebased garbage; the vendor is still
+      //     identified via `detected`).
+      // `model` threads the AFInfo byte-order + ShootingMode bit-5 `Condition`s.
+      Vendor::Nikon if blob.starts_with(b"Nikon\x00\x02") => {
+        let (typed, _emissions) = vendors::nikon::parse(blob, parent_order, model);
+        meta.nikon = Some(typed);
+      }
       _ => {}
     }
     meta
@@ -417,6 +452,14 @@ impl MakerNotesMeta {
   #[inline(always)]
   pub const fn dji(&self) -> Option<&DjiMakerNote> {
     self.dji.as_ref()
+  }
+
+  /// Nikon decoded data. `None` unless [`Vendor::Nikon`] dispatched and the
+  /// Nikon port ran.
+  #[must_use]
+  #[inline(always)]
+  pub const fn nikon(&self) -> Option<&MakerNotesNikon> {
+    self.nikon.as_ref()
   }
 }
 

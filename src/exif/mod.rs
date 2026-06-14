@@ -547,6 +547,17 @@ enum MakerNoteValueConvDecode<'a> {
     mn_len: usize,
     order: ByteOrder,
   },
+  /// Nikon — `parse_in_tiff(data, mn_offset, mn_len, order, ·, model)`.
+  /// Type-3 is self-contained (embedded TIFF), but type-2 / headerless Nikon3
+  /// resolve out-of-line offsets against the PARENT TIFF block, so the parent
+  /// `data` + the MakerNote window are retained (not just the blob).
+  Nikon {
+    data: &'a [u8],
+    mn_offset: usize,
+    mn_len: usize,
+    order: ByteOrder,
+    model: Option<smol_str::SmolStr>,
+  },
 }
 
 #[cfg(feature = "alloc")]
@@ -672,6 +683,23 @@ impl MakerNoteValueConvDecode<'_> {
         mn_len,
         order,
       } => dji::parse_in_tiff(data, *mn_offset, *mn_len, *order, false).1,
+      MakerNoteValueConvDecode::Nikon {
+        data,
+        mn_offset,
+        mn_len,
+        order,
+        model,
+      } => {
+        makernotes::vendors::nikon::parse_in_tiff(
+          data,
+          *mn_offset,
+          *mn_len,
+          *order,
+          false,
+          model.as_deref(),
+        )
+        .1
+      }
     }
   }
 }
@@ -2484,7 +2512,7 @@ impl Walker<'_, '_> {
     //     track `Model` during the IFD walk, and an ILCE camera with an
     //     empty first entry is a narrow Sony-specific case outside the
     //     standalone-TIFF camera-metadata scope (`docs/tracking.md`).
-    let recognized = matches!(format_code, 1..=13 | 129);
+    let recognized = Format::is_valid_ifd_code(format_code);
     if !recognized {
       // `if ($format or $validate) { Warn(...); ++$warnCount }` — a 0
       // code is silent padding; any other bad code warns AND counts toward the
@@ -3231,6 +3259,42 @@ impl Walker<'_, '_> {
                   mn_offset,
                   mn_len,
                   order: self.order,
+                };
+              }
+              makernotes::Vendor::Nikon => {
+                // Nikon has THREE layouts with DIFFERENT base semantics:
+                //   - type-3 (`Nikon\0\x02…`, `MakerNotes.pm:51-58`) carries a
+                //     SELF-CONTAINED embedded TIFF (`Base => '$start - 8'`
+                //     rebases its out-of-line offsets to blob offset 10), so it
+                //     decodes from the captured BLOB alone.
+                //   - type-2 (`Nikon\0\x01`, `MakerNotes.pm:539-545`) and
+                //     headerless Nikon3 (`MakerNotes.pm:546-554`) have NO `Base`
+                //     override ⇒ their out-of-line value offsets are
+                //     PARENT-TIFF-relative — they must resolve against the
+                //     parent TIFF block, NOT the captured blob.
+                // So thread the parent TIFF context (`self.data`/`value_offset`/
+                // `read_len`); `nikon::parse_in_tiff` walks the blob for type-3
+                // and the parent TIFF for type-2/Nikon3 (choosing the slice
+                // from the header). The byte order is read from the embedded
+                // marker (type-3) / explicit LE (type-2) / inherited (Nikon3),
+                // so `self.order` is only the Nikon3 fallback. `model` threads
+                // `$$self{Model}` for the AFInfo BigEndian gate
+                // (`$$self{Model} =~ /^NIKON D/i`, `Nikon.pm:2115`) + the
+                // `ShootingMode` bit-5 model branch (`Nikon.pm:2180`).
+                let mn_offset = value_offset;
+                let mn_len = read_len;
+                let model = self.captured_model.as_deref();
+                let (typed_pc, emi_pc) = makernotes::vendors::nikon::parse_in_tiff(
+                  self.data, mn_offset, mn_len, self.order, true, model,
+                );
+                meta.set_nikon(typed_pc);
+                cached_pc = emi_pc;
+                value_conv_decode = MakerNoteValueConvDecode::Nikon {
+                  data: self.data,
+                  mn_offset,
+                  mn_len,
+                  order: self.order,
+                  model: model.map(smol_str::SmolStr::new),
                 };
               }
               _ => {}

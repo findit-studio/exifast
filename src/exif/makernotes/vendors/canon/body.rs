@@ -200,7 +200,7 @@ pub(crate) fn classify_canon_entry(
   // `if (($format < 1 or $format > 13) and $format != 129 …)` (Exif.pm:6463).
   // The BigTIFF codes 14-18 map to real `Format`s but are BAD in a standard
   // Canon IFD entry (the Apple-ProRaw `$format == 16` carve-out is Apple-only).
-  let recognized = matches!(format_code, 1..=13 | 129);
+  let recognized = Format::is_valid_ifd_code(format_code);
   if !recognized {
     // `next if $index` (Exif.pm:6475) ⇒ skip for index ≠ 0; ELSE `return 0`
     // (abort). `if ($format or $validate)` (Exif.pm:6470) ⇒ a `0` code warns
