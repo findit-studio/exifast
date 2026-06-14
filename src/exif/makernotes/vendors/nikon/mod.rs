@@ -33,10 +33,13 @@
 //! ([`decrypt`]); `FlashInfo` (0x00a8) is unencrypted `ProcessBinaryData`
 //! version-dispatched on the 4-byte `FlashInfoVersion` prefix
 //! ([`emit_flash_info`], `Nikon.pm:2987-3009`) — only the `0100`/`0101` arm is
-//! ported here, other versions emit nothing (a committed follow-up). The
-//! deferred `ShotInfo` (0x0091) + encrypted `ColorBalance` carry a deferred
-//! [`tags::SubTable`] marker so the parent pointer is NOT emitted (the
-//! #177/#223 bogus-parent rule).
+//! ported here, other versions emit nothing (a committed follow-up).
+//! `ShotInfo` (0x0091) walks the BASE `%Nikon::ShotInfo` table
+//! ([`emit_shot_info`], `Nikon.pm:5976-6090`) for every version — `/^0[28]/` is
+//! ENCRYPTED (decrypted like `LensData02xx`), else PLAINTEXT; the ~30
+//! model-specific arms are a phase-3 follow-up. The encrypted `ColorBalance`
+//! carries a deferred [`tags::SubTable`] marker so the parent pointer is NOT
+//! emitted (the #177/#223 bogus-parent rule).
 
 #![deny(clippy::indexing_slicing)]
 
@@ -388,8 +391,19 @@ pub fn parse_in_tiff(
         SubTable::FlashInfo => {
           emit_flash_info(walk_data, entry, layout, print_conv, &mut emissions);
         }
+        SubTable::ShotInfo => {
+          emit_shot_info(
+            walk_data,
+            entry,
+            layout,
+            print_conv,
+            model,
+            decrypt_keys,
+            &mut emissions,
+          );
+        }
         // Deferred (encrypted / unported child table): emit nothing.
-        SubTable::ShotInfo | SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
+        SubTable::ColorBalanceEncrypted | SubTable::OtherDeferred => {}
       }
       continue;
     }
@@ -717,6 +731,285 @@ fn emit_flash_info(
     NikonConv::FlashGroupCompensation,
     emissions,
   );
+}
+
+/// The maximum byte offset the base `%Nikon::ShotInfo` table reads — the
+/// `ShutterCount` 0x24d `int32u` ends at 0x24d + 4 = 0x251. Used to cap the
+/// encrypted-`02xx` clone + decrypt to ONLY the bytes the decode consumes (the
+/// same `lens_data_read_extent` bound `emit_lens_data` applies), so a crafted
+/// in-bounds ShotInfo value near the size ceiling cannot force a large heap copy
+/// then a linear decrypt of bytes never read. The stream cipher is causal, so
+/// decrypting the needed prefix is byte-identical to decrypting the whole block.
+const SHOT_INFO_READ_EXTENT: usize = 0x24d + 4;
+
+/// Emit the base `%Image::ExifTool::Nikon::ShotInfo` leaves (0x0091,
+/// `Nikon.pm:5976-6090`) — the version-agnostic fallback table for EVERY
+/// ShotInfo arm. The conditional-array `0x0091` SubDirectory (`Nikon.pm:1923`)
+/// has ~30 model-specific arms (ShotInfoD40…Z9) keyed on the 4-byte
+/// `ShotInfoVersion` prefix, then two BASE-table fallbacks:
+///
+/// - `ShotInfo02xx` (`Condition => '$$valPt =~ /^0[28]/'`,
+///   `ProcessProc => \&ProcessNikonEncrypted`, `DecryptStart => 4`) — the body
+///   after the 4-byte version is ENCRYPTED (the same `02xx` cipher
+///   `emit_lens_data` decrypts).
+/// - `ShotInfoUnknown` (the catch-all, `ByteOrder => BigEndian`, NO ProcessProc)
+///   — PLAINTEXT.
+///
+/// This decodes EVERY version through the base table: a `/^0[28]/` version is
+/// ENCRYPTED, else PLAINTEXT. The ~30 model-specific tables (their EXTRA fields)
+/// are a follow-up (#227 phase 3); this is faithful because the base
+/// `ShotInfoVersion` (offset 0) is the cleartext version prefix by construction
+/// (correct for ANY model), and every emitted base field is gated on an EXACT
+/// version string (`0204`/`0205`/`0207`/`0211`, none of which a model arm claims)
+/// — so it only fires for base-routed versions, never a model-claimed one. A
+/// model file therefore emits only the shared `ShotInfoVersion` and misses its
+/// model-specific fields (a clean phase-3 gap, never a wrong value).
+///
+/// The TWO base fields NOT gated on an exact version — `FirmwareVersion` (offset
+/// 4, UNCONDITIONAL) and `DistortionControl` (offset 0x10, MODEL-gated on P6000) —
+/// cannot be emitted faithfully without the full 0x0091 model-vs-base dispatch
+/// (each would leak on a crafted block whose version routes to a model table that
+/// lacks the field), so BOTH are DEFERRED to phase 3 with that dispatch.
+///
+/// Bounds-safe like [`emit_lens_data`]: a field whose offset + size exceeds the
+/// value length emits nothing.
+fn emit_shot_info(
+  walk_data: &[u8],
+  entry: &NikonEntry,
+  layout: Layout,
+  print_conv: bool,
+  model: Option<&str>,
+  keys: Option<DecryptKeys>,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(sub) = walk_data.get(entry.value_offset..entry.value_offset + entry.value_size) else {
+    return;
+  };
+  // `ShotInfoVersion` (offset 0, `Format => 'string[4]'`): the first 4 ASCII
+  // bytes. Read from the ORIGINAL (cleartext) bytes — the version prefix is
+  // NEVER encrypted (`DecryptStart => 4`).
+  let Some(version) = sub.get(0..4).and_then(|v| <&[u8; 4]>::try_from(v).ok()) else {
+    return;
+  };
+  // RawConv `$$self{ShotInfoVersion}=$val; $val =~ /^\d+$/ ? $val : undef`
+  // (`Nikon.pm:5988`): a non-all-digit version makes the `ShotInfoVersion` TAG
+  // `undef` (not emitted) but does NOT abort the table — `ProcessBinaryData` still
+  // evaluates the other fields. The captured `$$self{ShotInfoVersion}` is the RAW
+  // value, so the exact-version conditionals (`eq "0204"` …) simply never match a
+  // non-digit version; with `FirmwareVersion`/`DistortionControl` deferred, a
+  // non-digit version emits nothing. So gate only the `ShotInfoVersion` emission
+  // on this, NOT the whole function (R1: an early return would have been a
+  // structural abort rather than the faithful per-tag `undef`).
+  let version_is_digits = version.iter().all(u8::is_ascii_digit);
+  // The `ShotInfo02xx` arm (`Condition => '$$valPt =~ /^0[28]/'`,
+  // `Nikon.pm:1903`) is ENCRYPTED via `ProcessNikonEncrypted` (`DecryptStart =>
+  // 4`); `ShotInfoUnknown` (the catch-all) is PLAINTEXT.
+  let encrypted = matches!(version, [b'0', b'2' | b'8', _, _]);
+  // An ENCRYPTED arm is processed by `ProcessNikonEncrypted`, which RETURNS 0
+  // (extracting NOTHING — not even the cleartext `ShotInfoVersion` at offset 0)
+  // when the serial/count keys are missing/invalid (`Nikon.pm:13948-13961`) —
+  // the same gate as [`emit_lens_data`]'s encrypted path. So gate the WHOLE
+  // emission on valid keys BEFORE pushing `ShotInfoVersion`.
+  let valid_keys = if encrypted {
+    let Some(keys) = keys else {
+      return; // ProcessNikonEncrypted returned 0 — emit nothing at all.
+    };
+    Some(keys)
+  } else {
+    None
+  };
+  // The decoded body: the raw bytes for the plaintext `ShotInfoUnknown` arm, or a
+  // decrypted (capped) copy for `ShotInfo02xx`. The 4-byte version is never
+  // encrypted (`DecryptStart => 4`); cap the clone+decrypt to the byte range the
+  // base table reads ([`SHOT_INFO_READ_EXTENT`]), like `emit_lens_data`.
+  let decoded: std::borrow::Cow<'_, [u8]> = if let Some(keys) = valid_keys {
+    let cap = SHOT_INFO_READ_EXTENT.min(sub.len());
+    let mut buf = sub.get(..cap).unwrap_or(sub).to_vec();
+    let len = buf.len().saturating_sub(4);
+    decrypt::decrypt(&mut buf, 4, len, keys.serial, keys.count);
+    std::borrow::Cow::Owned(buf)
+  } else {
+    std::borrow::Cow::Borrowed(sub)
+  };
+  let body = decoded.as_ref();
+  // The byte order for the multi-byte fields is BIG-ENDIAN: BOTH base-table arms
+  // set `ByteOrder => 'BigEndian'` (`ShotInfo02xx` `Nikon.pm:2651`, `ShotInfoUnknown`
+  // `:2659`) — ExifTool forces it regardless of the parent IFD order (the comment
+  // at the `ShotInfoD80` arm notes "Capture NX can change the makernote byte order,
+  // but this stays big-endian"). So a LITTLE-endian-carrier Nikon MakerNote that
+  // reaches base `0204`/`0211` still decodes `ShutterCount`/`DeletedImageCount`
+  // big-endian, matching the oracle — NOT the parent `layout.order`. The 0x157
+  // `ShutterCount` is big-endian regardless (its `unpack("n",$val)`, `:6066`).
+  // `model` is unused now that `DistortionControl` is deferred (see below).
+  let _ = (layout, model);
+  let order = ByteOrder::Big;
+  // offset 0 `ShotInfoVersion` — the 4-char cleartext version string, emitted
+  // ONLY when the all-digit RawConv passed (else the tag is `undef`; the table
+  // still processes the independent fields below).
+  if version_is_digits {
+    emissions.push(VendorEmission::new(
+      "ShotInfoVersion".into(),
+      TagValue::Str(SmolStr::new(String::from_utf8_lossy(version))),
+      false,
+    ));
+  }
+  // offset 4 `FirmwareVersion` (`Format => 'string[5]'`, RawConv `$val =~
+  // /^\d\.\d+.$/ ? $val : undef`, `Nikon.pm:5989`) is the ONLY UNCONDITIONAL base
+  // field, so it CANNOT be emitted here without the full 0x0091 model-vs-base
+  // dispatch: a model-specific version (e.g. `0208` → `ShotInfoD80`, which has NO
+  // FirmwareVersion) is wrongly routed to this Phase-2b base fallback, which would
+  // then emit a `FirmwareVersion` ExifTool does not (R3 finding — verified against
+  // a synthetic D80). DEFERRED to the phase that adds the model-arm dispatch (then
+  // it can be gated to the `ShotInfo02xx`/`ShotInfoUnknown` fallbacks only). The
+  // The base `DistortionControl` (offset 0x10, `Condition => '$$self{Model} =~
+  // /P6000\b/'`, `Nikon.pm:5995`) is gated on the MODEL, not the version, so it
+  // ALSO bypasses the 0x0091 dispatch: a crafted block with a P6000 model AND a
+  // model-arm version (e.g. `0208` → `ShotInfoD80`) routes to a MODEL table in
+  // ExifTool, yet would emit base `DistortionControl` here (R4 finding). Like
+  // `FirmwareVersion` it is the only OTHER non-exact-version-gated base field, so
+  // it is DEFERRED to the phase that adds the model-arm dispatch (then both can be
+  // gated to the `ShotInfo02xx`/`ShotInfoUnknown` fallbacks). The remaining base
+  // fields below are gated on the EXACT `ShotInfoVersion` string (`eq "0204"` …) —
+  // verified NOT model arms — so they only fire for base-routed versions, never a
+  // model-claimed one.
+  // 0x66 `VR_0x66` (0204) is `Unknown => 1` ⇒ NEVER surfaces (exifast has no
+  // `-u`; `run_emission` drops Unknown). Skipped entirely — emitting it would be
+  // a no-op (output-suppressed), and it carries no DataMember any later field
+  // reads. The remaining fields are gated on the EXACT `ShotInfoVersion` string.
+  if version == b"0204" {
+    // 0x6a `ShutterCount` / 0x6e `DeletedImageCount` (int32u, Priority 0, no
+    // PrintConv — the raw integer).
+    emit_shot_info_int(body, 0x6a, Format::Int32u, order, "ShutterCount", emissions);
+    emit_shot_info_int(
+      body,
+      0x6e,
+      Format::Int32u,
+      order,
+      "DeletedImageCount",
+      emissions,
+    );
+    // 0x82 `VibrationReduction` (int8u, `%offOn`).
+    emit_shot_info_u8(
+      body,
+      0x82,
+      order,
+      print_conv,
+      NikonConv::OffOn,
+      "VibrationReduction",
+      emissions,
+    );
+  } else if version == b"0205" {
+    // 0x157 `ShutterCount` (`Format => 'undef[2]'`, `ValueConv => 'unpack("n",
+    // $val)'` — a 2-byte BIG-endian integer, `Priority => 0`). Same Priority-0
+    // duplicate guard as [`emit_shot_info_int`]: skip if a same-name (Main) count
+    // is already present.
+    if !emissions.iter().any(|e| e.name() == "ShutterCount")
+      && let Some(record) = body.get(0x157..0x157 + 2)
+    {
+      let n = u16::from_be_bytes([*record.first().unwrap_or(&0), *record.get(1).unwrap_or(&0)]);
+      emissions.push(VendorEmission::new(
+        "ShutterCount".into(),
+        TagValue::I64(i64::from(n)),
+        false,
+      ));
+    }
+    // 0x1ae `VibrationReduction` (int8u, PrintHex, `{0x00=>'n/a',0x0c=>'Off',
+    // 0x0f=>'On'}` — an unmapped value renders `Unknown (0xNN)`).
+    emit_shot_info_u8(
+      body,
+      0x1ae,
+      order,
+      print_conv,
+      NikonConv::ShotInfoVibrationReduction0205,
+      "VibrationReduction",
+      emissions,
+    );
+  } else if version == b"0207" {
+    // 0x75 `VibrationReduction` (int8u, `{0=>'Off',1=>'On (1)',2=>'On (2)',
+    // 3=>'On (3)'}`).
+    emit_shot_info_u8(
+      body,
+      0x75,
+      order,
+      print_conv,
+      NikonConv::ShotInfoVibrationReduction0207,
+      "VibrationReduction",
+      emissions,
+    );
+  } else if version == b"0211" {
+    // 0x24d `ShutterCount` (int32u, Priority 0).
+    emit_shot_info_int(
+      body,
+      0x24d,
+      Format::Int32u,
+      order,
+      "ShutterCount",
+      emissions,
+    );
+  }
+}
+
+/// Read one int8u at `offset` off the (decoded) ShotInfo body, apply `conv`, and
+/// push it under `name`. A byte past the value length emits nothing; a `None`
+/// from a RawConv-undef drop is skipped (none of the base ShotInfo int8u fields
+/// drop, but the contract is honoured uniformly).
+fn emit_shot_info_u8(
+  body: &[u8],
+  offset: usize,
+  order: ByteOrder,
+  print_conv: bool,
+  conv: NikonConv,
+  name: &'static str,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  let Some(&byte) = body.get(offset) else {
+    return;
+  };
+  let parsed = ParsedValue::new(RawValue::U64(std::vec![u64::from(byte)]));
+  if let Some(value) = conv.apply(&parsed, print_conv, None, order) {
+    emissions.push(VendorEmission::new(name.into(), value, false));
+  }
+}
+
+/// Read one integer (`format`, e.g. `int32u`) at `offset` off the (decoded)
+/// ShotInfo body in `order` and push it under `name` as the bare integer
+/// (`Priority => 0`, no PrintConv). A field running past the value length emits
+/// nothing.
+fn emit_shot_info_int(
+  body: &[u8],
+  offset: usize,
+  format: Format,
+  order: ByteOrder,
+  name: &'static str,
+  emissions: &mut Vec<VendorEmission>,
+) {
+  // The base ShotInfo counts are `Priority => 0` (`Nikon.pm:6019/6026/6058/6081`):
+  // a duplicate must NOT override a higher-priority same-name tag (the Main 0x00a7
+  // `ShutterCount`, default priority). With the `TagMap` last-wins dedup this is
+  // byte-exact in BOTH orderings: in the normal tag-sorted IFD (0x0091 < 0x00a7)
+  // the Main count is pushed LATER and wins by last-wins; in an UNSORTED IFD where
+  // the Main count precedes 0x0091 it is already present here, so skip the
+  // Priority-0 push and let the Main count stand. (The only same-name sources are
+  // the Main count at default priority and this ShotInfo count at 0 — the lowest —
+  // so a present same-name tag is always >= priority and must win.)
+  if emissions.iter().any(|e| e.name() == name) {
+    return;
+  }
+  let elem = format.byte_size();
+  let Some(avail) = body.len().checked_sub(offset) else {
+    return;
+  };
+  if elem == 0 || avail < elem {
+    return; // field past the (short) block — emit nothing.
+  }
+  let Some(raw) = read_value(body, offset, format, 1, avail, order) else {
+    return;
+  };
+  // No PrintConv (Priority 0 raw integer) ⇒ the default `ReadValue` render.
+  let parsed = ParsedValue::new(raw);
+  if let Some(value) = NikonConv::Raw.apply(&parsed, false, None, order) {
+    emissions.push(VendorEmission::new(name.into(), value, false));
+  }
 }
 
 /// `%flashFirmware` (`Nikon.pm:767-789`) — the `ExternalFlashFirmware` "A B"
@@ -1608,19 +1901,23 @@ mod tests {
     assert_eq!(q.value(), &TagValue::Str(SmolStr::new("Fine")));
   }
 
-  /// A deferred (encrypted) SubDirectory pointer (ShotInfo 0x0091) emits
-  /// NEITHER a parent NOR children — the #177/#223 bogus-parent rule. (LensData
-  /// 0x0098 defers only the PARENT; FlashInfo 0x00a8 is now WALKED — see
-  /// [`flash_info_0100_decodes`].)
+  /// An ENCRYPTED ShotInfo (`02xx`) with NO decryption keys emits NOTHING — not
+  /// even `ShotInfoVersion` — because `ProcessNikonEncrypted` returns 0 before
+  /// reading the cleartext version (`Nikon.pm:13948-13961`), the same gate as
+  /// encrypted `LensData`. (A deferred subdir also never emits its PARENT, the
+  /// #177/#223 rule — asserted via [`deferred_other_subdir_emits_no_parent`].)
+  /// The WALKED ShotInfo path (plaintext + encrypted-with-keys) is covered by the
+  /// `shot_info_*` tests.
   #[test]
-  fn deferred_encrypted_subdir_emits_no_parent() {
+  fn encrypted_shot_info_without_keys_emits_nothing() {
     let mut b: Vec<u8> = Vec::new();
     b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
     b.extend_from_slice(b"MM");
     b.extend_from_slice(&[0x00, 0x2a]);
     b.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]);
     b.extend_from_slice(&[0x00, 0x01]); // 1 entry
-    // ShotInfo (0x0091): undef, count 4 (inline "0206").
+    // ShotInfo (0x0091): undef, count 4 (inline "0206") — encrypted `02xx`, but
+    // the MakerNote carries NO ShutterCount (0x00a7) ⇒ no decryption keys.
     b.extend_from_slice(&[0x00, 0x91]);
     b.extend_from_slice(&[0x00, 0x07]); // undef
     b.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4
@@ -1628,14 +1925,44 @@ mod tests {
     b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
 
     let (_typed, emissions) = parse(&b, ByteOrder::Big, Some("NIKON D2Hs"));
-    // No "ShotInfo" parent, no ShotInfoVersion child.
+    // No "ShotInfo" parent, no ShotInfoVersion child (ProcessNikonEncrypted ⇒ 0).
     assert!(
       emissions.iter().all(|e| e.name() != "ShotInfo"),
-      "deferred ShotInfo parent must NOT be emitted"
+      "the SubDirectory parent must NOT be emitted"
     );
     assert!(
       emissions.iter().all(|e| e.name() != "ShotInfoVersion"),
-      "deferred ShotInfo children must NOT be emitted (no Decrypt)"
+      "an encrypted ShotInfo with no keys emits nothing (no Decrypt)"
+    );
+  }
+
+  /// A genuinely DEFERRED SubDirectory (ColorBalanceA 0x0014 ⇒
+  /// `SubTable::OtherDeferred`) emits NEITHER its parent NOR any child — the
+  /// #177/#223 bogus-parent rule still holds for the unported sub-tables.
+  #[test]
+  fn deferred_other_subdir_emits_no_parent() {
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x08]);
+    b.extend_from_slice(&[0x00, 0x01]); // 1 entry
+    // ColorBalanceA (0x0014): undef, count 4 (inline) — a deferred OtherDeferred
+    // sub-table (no child walker).
+    b.extend_from_slice(&[0x00, 0x14]);
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count 4
+    b.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    let (_typed, emissions) = parse(&b, ByteOrder::Big, Some("NIKON D2Hs"));
+    assert!(
+      emissions.iter().all(|e| e.name() != "ColorBalanceA"),
+      "a deferred OtherDeferred SubDirectory parent must NOT be emitted"
+    );
+    assert!(
+      emissions.is_empty(),
+      "a lone deferred subdir yields no tags, got {emissions:?}"
     );
   }
 
@@ -3195,5 +3522,400 @@ mod tests {
     assert_eq!(get("FlashGroupBControlMode"), Some(TagValue::I64(2)));
     // GroupB Compensation -n: post-ValueConv -9/6 = -1.5.
     assert_eq!(get("FlashGroupBCompensation"), Some(TagValue::F64(-1.5)));
+  }
+
+  // ---- ShotInfo (0x0091) base table --------------------------------------
+
+  /// Build a type-3 Nikon blob with a single out-of-line `0x0091` ShotInfo value
+  /// (PLAINTEXT — `ShotInfoUnknown` arm; no key prescan needed). Mirrors
+  /// [`type3_flash_info`].
+  fn type3_shot_info(shot_block: &[u8]) -> Vec<u8> {
+    let n_entries: u16 = 1;
+    let off_shot: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4; // embedded-relative
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    b.extend_from_slice(&0x0091u16.to_be_bytes()); // ShotInfo, undef, out-of-line
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(shot_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_shot.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    b.extend_from_slice(shot_block);
+    b
+  }
+
+  /// Build a type-3 Nikon blob carrying SerialNumber=`12345678`,
+  /// ShutterCount=`100`, and a `0x0091` ShotInfo `shot_block` (the cleartext
+  /// version prefix + already-encrypted body, as the `02xx` arm stores it).
+  /// Mirrors [`type3_with_lens_data`] but at tag 0x0091 — so the prescan derives
+  /// the SAME crafted keys ([`KEY_SERIAL`]/[`KEY_COUNT`]) the body was encrypted
+  /// with.
+  fn type3_encrypted_shot_info(shot_block: &[u8]) -> Vec<u8> {
+    let serial = b"12345678\x00"; // 9 bytes (out-of-line)
+    let n_entries: u16 = 3;
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_serial = val_emb;
+    let off_shot = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line.
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]); // string
+    b.extend_from_slice(&(serial.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_serial.to_be_bytes());
+    // 0x0091 ShotInfo — undef, out-of-line.
+    b.extend_from_slice(&0x0091u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]); // undef
+    b.extend_from_slice(&(shot_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_shot.to_be_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = 100.
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]); // int32u
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_serial);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(shot_block);
+    b
+  }
+
+  /// LITTLE-endian (`II`) variant of [`type3_encrypted_shot_info`] — same
+  /// SerialNumber/ShutterCount/ShotInfo layout, but the embedded TIFF + IFD are
+  /// little-endian, so the parent `layout.order` resolves to `Little`. Proves the
+  /// base ShotInfo reads stay BIG-endian regardless of the carrier order.
+  fn type3_encrypted_shot_info_le(shot_block: &[u8]) -> Vec<u8> {
+    let serial = b"12345678\x00"; // 9 bytes (prescan ⇒ KEY_SERIAL/KEY_COUNT)
+    let n_entries: u16 = 3;
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_serial = val_emb;
+    let off_shot = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"II");
+    b.extend_from_slice(&[0x2a, 0x00]);
+    b.extend_from_slice(&8u32.to_le_bytes());
+    b.extend_from_slice(&n_entries.to_le_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line.
+    b.extend_from_slice(&0x001du16.to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes()); // string
+    b.extend_from_slice(&(serial.len() as u32).to_le_bytes());
+    b.extend_from_slice(&off_serial.to_le_bytes());
+    // 0x0091 ShotInfo — undef, out-of-line.
+    b.extend_from_slice(&0x0091u16.to_le_bytes());
+    b.extend_from_slice(&7u16.to_le_bytes()); // undef
+    b.extend_from_slice(&(shot_block.len() as u32).to_le_bytes());
+    b.extend_from_slice(&off_shot.to_le_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = KEY_COUNT (little-endian).
+    b.extend_from_slice(&0x00a7u16.to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes()); // int32u
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_le_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_serial);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(shot_block);
+    b
+  }
+
+  /// A PLAINTEXT `0103` ShotInfo (the D70 `ShotInfoUnknown` arm) emits ONLY
+  /// `ShotInfoVersion` — no FirmwareVersion (offset 4 here is all-NUL ⇒ the empty
+  /// string, which fails `^\d\.\d+.$`), no other base field (none is gated on
+  /// `0103`). Byte-exact to the D70 oracle.
+  #[test]
+  fn shot_info_0103_plaintext_version_only() {
+    let mut block = std::vec![0u8; 32];
+    block[0..4].copy_from_slice(b"0103");
+    let (_t, em) = parse(&type3_shot_info(&block), ByteOrder::Big, Some("NIKON D70"));
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0103")));
+    assert!(
+      em.iter().all(|e| e.name() != "FirmwareVersion"),
+      "all-NUL offset-4 firmware must be dropped: {em:?}"
+    );
+    // No base-table field is gated on 0103 ⇒ only ShotInfoVersion emits.
+    assert_eq!(em.len(), 1, "0103 emits ONLY ShotInfoVersion: {em:?}");
+    // No bogus ShotInfo parent (the SubDirectory pointer never emits it).
+    assert!(em.iter().all(|e| e.name() != "ShotInfo"));
+  }
+
+  /// A non-all-digit `ShotInfoVersion` (RawConv `/^\d+$/` fails) makes the
+  /// `ShotInfoVersion` TAG `undef` (not emitted). The RawConv only nulls the tag;
+  /// it does NOT abort the table (R1) — the conditionals are still evaluated. But
+  /// with `FirmwareVersion` + `DistortionControl` deferred, every remaining base
+  /// field is gated on an EXACT digit version (`0204`/…) that a non-digit version
+  /// never matches, so the block emits NOTHING. Uses `"ABCD"` (NOT `/^0[28]/`,
+  /// even for a P6000) ⇒ the plaintext arm.
+  #[test]
+  fn shot_info_non_digit_version_emits_nothing() {
+    let mut block = std::vec![0u8; 32];
+    block[0..4].copy_from_slice(b"ABCD"); // not all-digit, not /^0[28]/ ⇒ plaintext
+    block[0x10] = 0x01; // (a would-be DistortionControl byte — now deferred)
+    let (_t, em) = parse(
+      &type3_shot_info(&block),
+      ByteOrder::Big,
+      Some("COOLPIX P6000"),
+    );
+    assert!(
+      em.is_empty(),
+      "a non-digit version emits nothing (tag undef; no exact-version field matches; \
+       FirmwareVersion/DistortionControl deferred): {em:?}"
+    );
+  }
+
+  /// The base `%Nikon::ShotInfo` multi-byte reads are BIG-ENDIAN regardless of the
+  /// parent MakerNote IFD order — BOTH dispatch arms force `ByteOrder => 'BigEndian'`
+  /// (`Nikon.pm:2651`/`:2659`). R1 finding: a LITTLE-endian-carrier Nikon reaching
+  /// base `0204` must still read `ShutterCount` big-endian, matching the oracle.
+  /// Here the carrier is little-endian (`II`) but `ShutterCount` (0x6a) decodes
+  /// big-endian to `12345`, NOT the byte-swapped little-endian value.
+  #[test]
+  fn shot_info_base_reads_big_endian_on_le_carrier() {
+    let mut block = std::vec![0u8; 0x90];
+    block[0..4].copy_from_slice(b"0204");
+    block[0x6a..0x6e].copy_from_slice(&12345u32.to_be_bytes()); // ShutterCount, big-endian
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info_le(&encrypt_lens(&block)),
+      ByteOrder::Little,
+      Some("NIKON D2X"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0204")));
+    assert_eq!(
+      lens_get(&em, "ShutterCount"),
+      Some(TagValue::I64(12345)),
+      "base ShotInfo int32u must read big-endian even on a little-endian carrier: {em:?}"
+    );
+  }
+
+  /// An UNSORTED type-3 Nikon IFD laying the Main `ShutterCount` (0x00a7) BEFORE
+  /// the `0x0091` ShotInfo — the ordering the R2 Priority-0 finding needs. 0x001d
+  /// SerialNumber + 0x00a7 ShutterCount (= `KEY_COUNT`, also the count key) +
+  /// 0x0091 ShotInfo, in that file order (`0xa7 > 0x91` ⇒ unsorted).
+  fn type3_unsorted_count_before_shotinfo(shot_block: &[u8]) -> Vec<u8> {
+    let serial = b"12345678\x00"; // 9 bytes
+    let n_entries: u16 = 3;
+    let val_emb: u32 = 8 + 2 + u32::from(n_entries) * 12 + 4;
+    let off_serial = val_emb;
+    let off_shot = off_serial + serial.len() as u32;
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"Nikon\x00\x02\x10\x00\x00");
+    b.extend_from_slice(b"MM");
+    b.extend_from_slice(&[0x00, 0x2a]);
+    b.extend_from_slice(&8u32.to_be_bytes());
+    b.extend_from_slice(&n_entries.to_be_bytes());
+    // 0x001d SerialNumber — ASCII, out-of-line.
+    b.extend_from_slice(&0x001du16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x02]);
+    b.extend_from_slice(&(serial.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_serial.to_be_bytes());
+    // 0x00a7 ShutterCount — int32u, inline = KEY_COUNT (laid BEFORE 0x0091).
+    b.extend_from_slice(&0x00a7u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x04]);
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&KEY_COUNT.to_be_bytes());
+    // 0x0091 ShotInfo — undef, out-of-line (AFTER 0x00a7 ⇒ unsorted).
+    b.extend_from_slice(&0x0091u16.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x07]);
+    b.extend_from_slice(&(shot_block.len() as u32).to_be_bytes());
+    b.extend_from_slice(&off_shot.to_be_bytes());
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD
+    debug_assert_eq!(b.len() as u32, 10 + off_serial);
+    b.extend_from_slice(serial);
+    b.extend_from_slice(shot_block);
+    b
+  }
+
+  /// R2 finding: the base ShotInfo counts are `Priority => 0` and must NOT
+  /// override the Main 0x00a7 `ShutterCount` — even on an UNSORTED IFD that lays
+  /// 0x00a7 BEFORE 0x0091. The Main count (`KEY_COUNT` = 100) wins; the ShotInfo
+  /// 0204 0x6a count (a distinct 12345) is suppressed by the Priority-0 guard.
+  #[test]
+  fn shot_info_priority0_count_does_not_override_main() {
+    let mut block = std::vec![0u8; 0x90];
+    block[0..4].copy_from_slice(b"0204");
+    block[0x6a..0x6e].copy_from_slice(&12345u32.to_be_bytes()); // ShotInfo ShutterCount
+    let (_t, em) = parse(
+      &type3_unsorted_count_before_shotinfo(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("NIKON D2X"),
+    );
+    // The Main 0x00a7 ShutterCount (KEY_COUNT = 100) wins; the Priority-0 ShotInfo
+    // 12345 is suppressed (NOT a last-wins override).
+    assert_eq!(
+      lens_get(&em, "ShutterCount"),
+      Some(TagValue::I64(100)),
+      "Priority-0 ShotInfo count must not override the Main ShutterCount: {em:?}"
+    );
+  }
+
+  /// R3 + R4 findings: a MODEL-specific version (e.g. `0208` → `ShotInfoD80`)
+  /// routed to this Phase-2b base fallback must NOT emit a base field that
+  /// ExifTool's model table lacks. The two non-exact-version-gated base fields —
+  /// `FirmwareVersion` (offset 4, unconditional) and `DistortionControl` (offset
+  /// 0x10, P6000-gated) — are DEFERRED, so a `0208` block with firmware-looking
+  /// bytes at offset 4 AND a set byte 0x10, on a P6000 model (so the deferred
+  /// DistortionControl gate WOULD have fired), emits ONLY `ShotInfoVersion`.
+  #[test]
+  fn shot_info_model_version_does_not_leak_base_fields() {
+    let mut block = std::vec![0u8; 32];
+    block[0..4].copy_from_slice(b"0208"); // D80 model version (encrypted /^0[28]/)
+    block[4..9].copy_from_slice(b"1.00\x00"); // firmware-looking bytes at offset 4
+    block[0x10] = 0x01; // a would-be P6000 DistortionControl byte
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("COOLPIX P6000"), // the deferred DistortionControl gate would fire here
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0208")));
+    assert!(
+      em.iter()
+        .all(|e| e.name() != "FirmwareVersion" && e.name() != "DistortionControl"),
+      "no base FirmwareVersion/DistortionControl may leak on a model-specific version: {em:?}"
+    );
+  }
+
+  /// A crafted `0204` ShotInfo (the D2X arm via the BASE table) decodes its
+  /// version-exact base fields: 0x6a `ShutterCount` (int32u), 0x6e
+  /// `DeletedImageCount` (int32u), 0x82 `VibrationReduction` (int8u `%offOn`).
+  /// Big-endian (the type-3 embedded `MM`). `VR_0x66` (0x66, `Unknown=>1`) never
+  /// surfaces. `0204` matches `/^0[28]/` ⇒ ENCRYPTED (the `ShotInfo02xx` arm):
+  /// the body is encrypted with the crafted keys and decrypted on read.
+  #[test]
+  fn shot_info_0204_fields() {
+    let mut block = std::vec![0u8; 0x90];
+    block[0..4].copy_from_slice(b"0204");
+    block[0x6a..0x6e].copy_from_slice(&12345u32.to_be_bytes()); // ShutterCount
+    block[0x6e..0x72].copy_from_slice(&7u32.to_be_bytes()); // DeletedImageCount
+    block[0x82] = 0x01; // VibrationReduction → "On"
+    block[0x66] = 0x02; // VR_0x66 (Unknown) — must NOT surface
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("NIKON D2X"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0204")));
+    assert_eq!(lens_get(&em, "ShutterCount"), Some(TagValue::I64(12345)));
+    assert_eq!(lens_get(&em, "DeletedImageCount"), Some(TagValue::I64(7)));
+    assert_eq!(lens_get(&em, "VibrationReduction"), Some(str_val("On")));
+    // VR_0x66 (0x66, `Unknown => 1`) is never implemented/emitted.
+    assert!(
+      em.iter().all(|e| e.name() != "VR_0x66"),
+      "VR_0x66 (Unknown=>1) must never surface: {em:?}"
+    );
+  }
+
+  /// A crafted `0205` ShotInfo (the D50 arm) decodes 0x157 `ShutterCount`
+  /// (`undef[2]` ⇒ `unpack("n")` BIG-endian) and 0x1ae `VibrationReduction`
+  /// (int8u, PrintHex hash). An UNMAPPED 0x1ae value renders `Unknown (0xNN)`.
+  /// `0205` matches `/^0[28]/` ⇒ ENCRYPTED (decrypted on read with the keys).
+  #[test]
+  fn shot_info_0205_fields() {
+    let mut block = std::vec![0u8; 0x1b0];
+    block[0..4].copy_from_slice(b"0205");
+    // 0x157 ShutterCount undef[2] = big-endian 0x1234 = 4660.
+    block[0x157..0x159].copy_from_slice(&0x1234u16.to_be_bytes());
+    block[0x1ae] = 0x0f; // VibrationReduction → "On"
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("NIKON D50"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0205")));
+    assert_eq!(lens_get(&em, "ShutterCount"), Some(TagValue::I64(4660)));
+    assert_eq!(lens_get(&em, "VibrationReduction"), Some(str_val("On")));
+
+    // An UNMAPPED 0x1ae value (0x07) ⇒ PrintHex `Unknown (0x7)`.
+    let mut block2 = std::vec![0u8; 0x1b0];
+    block2[0..4].copy_from_slice(b"0205");
+    block2[0x1ae] = 0x07;
+    let (_t2, em2) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block2)),
+      ByteOrder::Big,
+      Some("NIKON D50"),
+    );
+    assert_eq!(
+      lens_get(&em2, "VibrationReduction"),
+      Some(str_val("Unknown (0x7)")),
+      "PrintHex miss renders the hex value: {em2:?}"
+    );
+  }
+
+  /// A crafted `0207` ShotInfo (the D200 arm) decodes 0x75 `VibrationReduction`
+  /// (int8u, `{0=>'Off',1=>'On (1)',2=>'On (2)',3=>'On (3)'}`). `0207` matches
+  /// `/^0[28]/` ⇒ ENCRYPTED (decrypted on read with the keys).
+  #[test]
+  fn shot_info_0207_vibration_reduction() {
+    let mut block = std::vec![0u8; 0x90];
+    block[0..4].copy_from_slice(b"0207");
+    block[0x75] = 0x02; // → "On (2)"
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("NIKON D200"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0207")));
+    assert_eq!(lens_get(&em, "VibrationReduction"), Some(str_val("On (2)")));
+  }
+
+  /// A crafted `0211` ShotInfo (the D60 arm) decodes 0x24d `ShutterCount`
+  /// (int32u, Priority 0). `0211` matches `/^0[28]/` ⇒ ENCRYPTED — and 0x24d +
+  /// 4 = 0x251 is EXACTLY [`SHOT_INFO_READ_EXTENT`], so this also exercises the
+  /// decrypt cap reaching the last base field.
+  #[test]
+  fn shot_info_0211_shutter_count() {
+    let mut block = std::vec![0u8; 0x260];
+    block[0..4].copy_from_slice(b"0211");
+    block[0x24d..0x251].copy_from_slice(&999u32.to_be_bytes());
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&encrypt_lens(&block)),
+      ByteOrder::Big,
+      Some("NIKON D60"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0211")));
+    assert_eq!(lens_get(&em, "ShutterCount"), Some(TagValue::I64(999)));
+  }
+
+  /// An ENCRYPTED `0206` ShotInfo with VALID keys (serial/count present)
+  /// DECRYPTS and emits `ShotInfoVersion` (the cleartext prefix). The crafted
+  /// body's offset-4 firmware bytes are non-conforming ⇒ FirmwareVersion is
+  /// dropped, and no `0206`-gated base field exists — matching the D2Hs oracle
+  /// (ShotInfoVersion `"0206"` only). Without keys it emits NOTHING.
+  #[test]
+  fn shot_info_0206_encrypted_with_and_without_keys() {
+    // Cleartext: "0206" + a body whose offset-4 5 bytes do NOT match the
+    // firmware regex (so FirmwareVersion drops, like the real D2Hs).
+    let mut plain = std::vec![0u8; 32];
+    plain[0..4].copy_from_slice(b"0206");
+    plain[4..9].copy_from_slice(&[0x12, 0x0f, 0x12, 0x13, 0x0e]); // non-firmware (D2Hs-like)
+    let enc = encrypt_lens(&plain); // encrypt body from offset 4 with the crafted keys
+
+    // WITH keys (serial 12345678 + count 100 present) ⇒ decrypts, emits version.
+    let (_t, em) = parse(
+      &type3_encrypted_shot_info(&enc),
+      ByteOrder::Big,
+      Some("NIKON D2Hs"),
+    );
+    assert_eq!(lens_get(&em, "ShotInfoVersion"), Some(str_val("0206")));
+    assert!(
+      em.iter().all(|e| e.name() != "FirmwareVersion"),
+      "the non-conforming firmware must be dropped: {em:?}"
+    );
+    // Only ShotInfoVersion from ShotInfo (the other emissions are SerialNumber +
+    // ShutterCount leaves from the carrier IFD).
+    assert!(em.iter().all(|e| e.name() != "ShotInfo"));
+
+    // WITHOUT keys: a type-3 blob carrying ONLY the encrypted 0x0091 (no 0x00a7)
+    // ⇒ ProcessNikonEncrypted returns 0 ⇒ NOTHING emits.
+    let (_t2, em2) = parse(&type3_shot_info(&enc), ByteOrder::Big, Some("NIKON D2Hs"));
+    assert!(
+      em2.iter().all(|e| e.name() != "ShotInfoVersion"),
+      "an encrypted ShotInfo with no keys emits nothing: {em2:?}"
+    );
   }
 }

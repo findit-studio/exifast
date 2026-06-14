@@ -4391,6 +4391,12 @@ fn real_fixture_nikon_d2hs_makernotes() {
       ("Nikon:MaxApertureAtMaxFocal", "1.8"),
       ("Nikon:MCUVersion", "122"),
       ("Nikon:EffectiveMaxAperture", "1.8"),
+      // ShotInfo (ENCRYPTED 0206, `ShotInfo02xx` arm). The base table decodes the
+      // cleartext ShotInfoVersion after a successful Decrypt (serial 3001006 /
+      // count 2); FirmwareVersion's RawConv rejects the decoded offset-4 bytes and
+      // no 0206-conditional base field exists ⇒ ShotInfoVersion is the ONLY new
+      // ShotInfo tag.
+      ("Nikon:ShotInfoVersion", r#""0206""#),
     ],
   );
   // The D2Hs ColorBalance is the ENCRYPTED 0206 variant ⇒ WB_RGGBLevels is
@@ -4400,6 +4406,14 @@ fn real_fixture_nikon_d2hs_makernotes() {
   assert!(!map.contains_key("Nikon:ColorBalance"));
   assert!(!map.contains_key("Nikon:LensData"));
   assert!(!map.contains_key("Nikon:FlashInfo"));
+  // The ShotInfo SubDirectory parent is suppressed, and the base table emits NO
+  // FirmwareVersion (the decoded offset-4 bytes fail the RawConv) nor any other
+  // ShotInfo-only field — only ShotInfoVersion (asserted above).
+  assert!(!map.contains_key("Nikon:ShotInfo"));
+  assert!(
+    !map.contains_key("Nikon:FirmwareVersion"),
+    "D2Hs FirmwareVersion is RawConv-dropped (oracle has none)"
+  );
   // The RawConv-undef FlashInfo0100 members (raw 0) drop (oracle has none).
   for absent in [
     "Nikon:FlashFocalLength",
@@ -4470,10 +4484,23 @@ fn real_fixture_nikon_d70_makernotes() {
       ("Nikon:MaxApertureAtMaxFocal", "4.5"),
       ("Nikon:MCUVersion", "132"),
       ("Nikon:EffectiveMaxAperture", "4.5"),
+      // ShotInfo (PLAINTEXT 0103, the `ShotInfoUnknown` BigEndian arm). The base
+      // table emits the cleartext ShotInfoVersion; the offset-4 firmware is empty
+      // (NUL-trimmed) ⇒ FirmwareVersion drops, and no 0103-conditional base field
+      // exists ⇒ ShotInfoVersion is the ONLY new ShotInfo tag.
+      ("Nikon:ShotInfoVersion", r#""0103""#),
     ],
   );
   assert!(!map.contains_key("Nikon:LensData"));
   assert!(!map.contains_key("Nikon:FlashInfo"));
+  // The ShotInfo SubDirectory parent is suppressed, and the base table emits NO
+  // FirmwareVersion (the offset-4 firmware is empty) nor any other ShotInfo-only
+  // field — only ShotInfoVersion (asserted above).
+  assert!(!map.contains_key("Nikon:ShotInfo"));
+  assert!(
+    !map.contains_key("Nikon:FirmwareVersion"),
+    "D70 FirmwareVersion is RawConv-dropped (oracle has none)"
+  );
   for absent in [
     "Nikon:FlashFocalLength",
     "Nikon:RepeatingFlashRate",

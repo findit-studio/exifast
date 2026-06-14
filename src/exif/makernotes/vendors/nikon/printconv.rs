@@ -244,6 +244,17 @@ pub enum NikonConv {
   /// `RawConv => '$val ? $val : undef'` (0 ⇒ drop), `PrintConv => '"$val Hz"'`.
   /// `-n` emits the raw int8u.
   RepeatingFlashRate,
+  /// `%Nikon::ShotInfo` `VibrationReduction` 0x75 (`Nikon.pm:6037`, the `0207`
+  /// D200 arm) — `int8u`, `{0=>'Off',1=>'On (1)',2=>'On (2)',3=>'On (3)'}`. A
+  /// miss renders `Unknown (N)` (no PrintHex on this hash). `-n` emits the raw
+  /// int8u.
+  ShotInfoVibrationReduction0207,
+  /// `%Nikon::ShotInfo` `VibrationReduction` 0x1ae (`Nikon.pm:6075`, the `0205`
+  /// D50 arm) — `int8u`, `PrintHex => 1`, `{0x00=>'n/a',0x0c=>'Off',
+  /// 0x0f=>'On'}`. With `PrintHex` an unmapped value renders `Unknown (0xNN)`
+  /// (`ExifTool.pm:3632` uses the hex `$val` when `PrintHex`). `-n` emits the
+  /// raw int8u.
+  ShotInfoVibrationReduction0205,
 }
 
 impl NikonConv {
@@ -624,6 +635,24 @@ impl NikonConv {
         }
         if print_conv {
           TagValue::Str(SmolStr::new(std::format!("{n} Hz")))
+        } else {
+          TagValue::I64(n)
+        }
+      }
+      NikonConv::ShotInfoVibrationReduction0207 => {
+        hash_conv(raw, print_conv, shot_info_vr_0207_label)
+      }
+      NikonConv::ShotInfoVibrationReduction0205 => {
+        // `PrintHex => 1`: a hash MISS renders the hex `$val` (`Unknown (0xNN)`),
+        // not the decimal (`ExifTool.pm:3632`). `-n` emits the raw int8u.
+        let Some(n) = raw.first_i64() else {
+          return Some(raw.to_default_tag_value());
+        };
+        if print_conv {
+          match shot_info_vr_0205_label(n) {
+            Some(s) => TagValue::Str(SmolStr::new(s)),
+            None => TagValue::Str(SmolStr::new(std::format!("Unknown (0x{n:x})"))),
+          }
         } else {
           TagValue::I64(n)
         }
@@ -1615,6 +1644,30 @@ fn flash_gn_distance_label(n: i64) -> Option<&'static str> {
     35 => "18.0 m",
     36 => "20.0 m",
     255 => "n/a",
+    _ => return None,
+  })
+}
+
+/// `%Nikon::ShotInfo` `VibrationReduction` 0x75 (`Nikon.pm:6037-6048`, the
+/// `0207` D200 arm). A miss → `Unknown (N)` (no PrintHex on this hash).
+fn shot_info_vr_0207_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    0 => "Off",
+    1 => "On (1)",
+    2 => "On (2)",
+    3 => "On (3)",
+    _ => return None,
+  })
+}
+
+/// `%Nikon::ShotInfo` `VibrationReduction` 0x1ae (`Nikon.pm:6071-6078`, the
+/// `0205` D50 arm, `PrintHex => 1`). The caller renders a miss as the hex
+/// `Unknown (0xNN)`.
+fn shot_info_vr_0205_label(n: i64) -> Option<&'static str> {
+  Some(match n {
+    0x00 => "n/a",
+    0x0c => "Off",
+    0x0f => "On",
     _ => return None,
   })
 }
