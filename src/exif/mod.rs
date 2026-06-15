@@ -97,9 +97,12 @@ pub mod jpeg;
 
 use std::{string::String, vec::Vec};
 
-use crate::format_parser::{FormatParser, parser_sealed};
-use crate::recovery::Step;
+use crate::{
+  format_parser::{FormatParser, parser_sealed},
+  recovery::Step,
+};
 use ifd::{ByteOrder, Format, RawValue, get_u16, get_u32, get_u64, read_value};
+use makernotes::subdir::{ByteOrderRule, FixBaseMode, ProcessProc, TableRef};
 use tables::Conv;
 
 // ====================================================================// IFD identity — the family-1 group an IFD's tags carry
@@ -294,6 +297,23 @@ impl IfdKind {
   }
 }
 
+/// The tag table a core IFD walks against, derived from its [`IfdKind`] — the
+/// faithful `$tagTablePtr` each `ProcessExif` directory carries
+/// (`Exif.pm:6341`). IFD0/ExifIFD/trailing IFDs and the Interop IFD use
+/// `%Exif::Main` (Interop has no table of its own — `Exif.pm:6939`); the GPS
+/// IFD uses `%GPS::Main`. This is the bridge that lets [`Walker::active_table`]
+/// be seeded from an `IfdKind` so the table-keyed lookup reproduces the prior
+/// `IfdKind::is_gps`-keyed selection byte-for-byte.
+#[must_use]
+#[inline]
+const fn table_for_ifd_kind(kind: IfdKind) -> TableRef {
+  match kind {
+    IfdKind::Gps => TableRef::Gps,
+    IfdKind::Interop => TableRef::Interop,
+    IfdKind::Ifd0 | IfdKind::Trailing(_) | IfdKind::ExifIfd => TableRef::Exif,
+  }
+}
+
 // ====================================================================// SubDirectory dispatch seam — `SubDirKind`
 // ====================================================================
 /// The SubDirectory a pointer tag dispatches into — the seam that keeps the
@@ -453,15 +473,19 @@ impl ExifEntry {
   }
 }
 
-/// Which conversion table an entry's value goes through at serialize time.
-/// Internal — `ExifEntry` carries it so `serialize_tags` does not re-look-up.
+/// Which tag-table descriptor an entry's value is converted under at serialize
+/// time. Internal — `ExifEntry` carries the resolved `'static` descriptor so the
+/// emit reads its golden [`ExifTag::value_conv`]/[`ExifTag::print_conv`] (the
+/// `Walker`'s golden conversion-resolution point, #243 phase 0) without
+/// re-looking-up, and reads its raw [`Conv`]/[`gps::GpsConv`] for the bespoke
+/// `RawValue`-shaped fallback.
 #[derive(Debug, Clone, Copy)]
 enum ResolvedConv {
-  /// A plain Exif conversion ([`Conv`]).
-  Exif(Conv),
-  /// A GPS conversion ([`gps::GpsConv`]).
+  /// An Exif IFD leaf (`%Exif::Main` descriptor).
+  Exif(&'static tables::ExifTag),
+  /// A GPS IFD leaf (`%GPS::Main` descriptor).
   #[cfg(feature = "gps")]
-  Gps(gps::GpsConv),
+  Gps(&'static gps::GpsTag),
 }
 
 // ====================================================================// MakerNote capture — the deferred-vendor-parsing seam
@@ -1822,6 +1846,9 @@ fn parse_tiff_with_base_no_raf<'a>(
     // `$warnCount` starts at 0 (`Exif.pm:6453`); `walk_one_ifd_body` re-zeroes
     // it per directory.
     warn_count: 0,
+    // The walk starts on the Exif table; `walk_ifd_chain` re-affirms it and
+    // `process_subdir` swaps it for a sub-IFD's table (GPS) and restores it.
+    active_table: TableRef::Exif,
   };
   // Walk the IFD0 → IFD1 chain (the next-IFD pointer). ExifIFD/GPS/Interop
   // are reached as SubDirectories from inside the walk. `ifd0_kind` is `Ifd0`
@@ -1948,6 +1975,9 @@ fn parse_bigtiff<'a>(
     file_type: file_type.clone(),
     no_raf,
     warn_count: 0,
+    // The BigTIFF walker keys its leaf lookup off `kind` directly
+    // (`big_tag_known`), not `active_table`; this just satisfies the struct.
+    active_table: TableRef::Exif,
   };
   w.walk_big_ifd_chain(ifd0_offset, ifd0_kind);
   debug_assert!(
@@ -2127,6 +2157,8 @@ fn parse_tiff_with_base_shared<'a>(
     no_raf: false,
     // `$warnCount` starts at 0 (`Exif.pm:6453`); re-zeroed per directory.
     warn_count: 0,
+    // Starts on the Exif table; `walk_ifd_chain` re-affirms it.
+    active_table: TableRef::Exif,
   };
   w.walk_ifd_chain(ifd0_offset, IfdKind::Ifd0);
 
@@ -2367,6 +2399,25 @@ struct Walker<'a, 'g> {
   /// the cap is enforced in [`walk_entries`](Self::walk_entries). `u32` because
   /// the only entries that bump it are bounded by `num_entries` (≤ 65535).
   warn_count: u32,
+  /// The tag table the walk currently resolves names/formats/conversions
+  /// against — `$tagTablePtr` in `ProcessExif` (`Exif.pm:6341`). The shared
+  /// `Walker` walks IFD0/ExifIFD/Interop/trailing IFDs against `%Exif::Main`
+  /// and the GPS IFD against `%GPS::Main`; ExifTool keys the leaf lookup off
+  /// the directory's OWN table, not its `DirName`. The pre-unification code
+  /// derived the table implicitly from [`IfdKind`] at each lookup site
+  /// ([`IfdKind::is_gps`]); threading it as state lets [`process_subdir`]
+  /// (the ONE sub-directory entry point) save/set/restore it around a
+  /// sub-IFD recursion so a GPS sub-IFD's table never leaks into the parent
+  /// IFD0's remaining entries, and lets a future vendor maker note walk the
+  /// same machinery against `%Canon::Main`/etc.
+  ///
+  /// INVARIANT (the Phase-0 byte-identity proof): on every REGULAR-walk
+  /// lookup site this field equals [`table_for_ifd_kind`] of the `kind`
+  /// being walked — `walk_ifd_chain` sets it to `Exif` for the IFD0→IFD1
+  /// chain and `process_subdir` sets it to the sub-IFD's table for the
+  /// duration of that recursion — so routing the lookups through it
+  /// reproduces the prior `IfdKind`-keyed selection exactly.
+  active_table: TableRef,
 }
 
 impl Walker<'_, '_> {
@@ -2408,6 +2459,17 @@ impl Walker<'_, '_> {
   /// …) — faithful to `ProcessExif`'s `$$dirInfo{Multi}` trailing-IFD scan
   /// (`Exif.pm:7202-7228`). `Multi` is set for IFD0 (`Exif.pm:6339`).
   fn walk_ifd_chain(&mut self, start: usize, first_kind: IfdKind) {
+    // Seed the active table from the chain's FIRST kind. The IFD0 → IFD1 → …
+    // chain re-enters `ProcessExif` with the SAME `$tagTablePtr` (`Exif.pm:7211`
+    // `for (;;)`), so the whole chain shares the first kind's table. This is
+    // `Exif` for a standard TIFF (`first_kind == Ifd0`), but `parse_gps_block`
+    // walks a GPS-only top-level block (`first_kind == Gps`, e.g. a Canon CR3
+    // CMT4 directory) against `%GPS::Main` — seeding from `first_kind` keeps that
+    // routing correct (a hard-coded `Exif` would resolve the GPS tags in the Exif
+    // table and drop/mis-name them). A sub-IFD recursion swaps the table for its
+    // own via `process_subdir` (save/set/restore) and restores it on return, so a
+    // GPS/Interop sub-IFD cannot leak its table into the chain's later entries.
+    self.active_table = table_for_ifd_kind(first_kind);
     let mut offset = start;
     let mut kind = first_kind;
     // The 1-based number of the NEXT trailing IFD. ExifTool strips the
@@ -3133,29 +3195,34 @@ impl Walker<'_, '_> {
     true
   }
 
-  /// Resolve a tag NAME for a warning message, against the table that owns
-  /// the IFD currently being walked. GPS and Interop tag IDs OVERLAP (e.g.
-  /// 0x0002 is `GPSLatitude` in `%GPS::Main` but `InteropVersion` in
-  /// `%Interop::Main`); ExifTool resolves a warning's `$$tagInfo{Name}`
-  /// against the IFD's own `$tagTablePtr` (`Exif.pm:6464`/6674), so the GPS
-  /// IFD must look up the GPS table. Returns `Some(name)` for a known tag,
+  /// Resolve a tag NAME against `table` — the table the active (sub-)directory
+  /// walks under. GPS and Interop/Exif tag IDs OVERLAP (e.g. 0x0002 is
+  /// `GPSLatitude` in `%GPS::Main` but `InteropVersion`/`GPSLatitude` shape in
+  /// `%Exif::Main`); ExifTool resolves `$$tagInfo{Name}` against the
+  /// directory's OWN `$tagTablePtr` (`Exif.pm:6464`/6674), so the GPS IFD must
+  /// look up `%GPS::Main`. `TableRef::Interop` reuses `%Exif::Main` for the
+  /// lookup (the Interop IFD has no table of its own — `Exif.pm:6939`). The
+  /// vendor arms are unreachable in Phase 1 (no maker note routes through this
+  /// walker yet); they map to `%Exif::Main` as a faithful placeholder until
+  /// Phase 2 wires their tables in. Returns `Some(name)` for a known tag,
   /// `None` for an unknown one (caller emits the `tag 0x%.4x` form).
-  fn warn_tag_name(kind: IfdKind, tag_id: u16) -> Option<&'static str> {
-    if kind.is_gps() {
-      #[cfg(feature = "gps")]
-      {
-        gps::lookup(tag_id).map(|t| t.name)
+  fn lookup_name_in(table: TableRef, tag_id: u16) -> Option<&'static str> {
+    match table {
+      TableRef::Gps => {
+        #[cfg(feature = "gps")]
+        {
+          gps::lookup(tag_id).map(|t| t.name)
+        }
+        // `gps` feature OFF ⇒ the GPS module is "not loaded": ExifTool's
+        // `GetTagInfo` yields nothing, so the warning uses the unknown-tag
+        // form. Faithful to the module-not-loaded path (`docs/tracking.md`).
+        #[cfg(not(feature = "gps"))]
+        {
+          let _ = tag_id;
+          None
+        }
       }
-      // `gps` feature OFF ⇒ the GPS module is "not loaded": ExifTool's
-      // `GetTagInfo` yields nothing, so the warning uses the unknown-tag
-      // form. Faithful to the module-not-loaded path (`docs/tracking.md`).
-      #[cfg(not(feature = "gps"))]
-      {
-        let _ = tag_id;
-        None
-      }
-    } else {
-      tables::lookup(tag_id).map(|t| t.name)
+      _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
 
@@ -3281,7 +3348,7 @@ impl Walker<'_, '_> {
       // `TagName` (`Exif.pm:6252`): `tag 0x%.4x` plus ` Name` for a known tag.
       if size > 0x7fff_ffff {
         let dir = kind.as_str();
-        let tag = match Self::warn_tag_name(kind, tag_id) {
+        let tag = match Self::lookup_name_in(self.active_table, tag_id) {
           Some(name) => std::format!("tag 0x{tag_id:04x} {name}"),
           None => std::format!("tag 0x{tag_id:04x}"),
         };
@@ -3357,7 +3424,7 @@ impl Walker<'_, '_> {
         // suspect test below (the read happens first, `Exif.pm:6660` before
         // `:6672`).
         _ if self.no_raf => {
-          let warning = match Self::warn_tag_name(kind, tag_id) {
+          let warning = match Self::lookup_name_in(self.active_table, tag_id) {
             Some(name) => std::format!("Bad offset for {dir} {name}"),
             None => std::format!("Bad offset for {dir} tag 0x{tag_id:04x}"),
           };
@@ -3373,7 +3440,7 @@ impl Walker<'_, '_> {
           // The name is resolved against the IFD's OWN table (GPS vs
           // Exif/Interop — see `warn_tag_name`); a GPS IFD's 0x0002 is
           // `GPSLatitude`, not the Interop table's `InteropVersion`.
-          let tag = match Self::warn_tag_name(kind, tag_id) {
+          let tag = match Self::lookup_name_in(self.active_table, tag_id) {
             Some(name) => std::format!(" {name}"),
             None => String::new(),
           };
@@ -3394,7 +3461,7 @@ impl Walker<'_, '_> {
         // `$tagStr = $tagInfo ? $$tagInfo{Name} : sprintf('tag 0x%.4x', …)`
         // (Exif.pm:6674). The name is resolved against the IFD's own table
         // (`warn_tag_name`) — GPS IDs overlap the Interop table.
-        let warning = match Self::warn_tag_name(kind, tag_id) {
+        let warning = match Self::lookup_name_in(self.active_table, tag_id) {
           Some(name) => std::format!("Suspicious {dir} offset for {name}"),
           None => std::format!("Suspicious {dir} offset for tag 0x{tag_id:04x}"),
         };
@@ -3478,21 +3545,25 @@ impl Walker<'_, '_> {
     // gating all GPS entries off) honors 0x001d while leaving the GPS text
     // tags 0x001b/0x001c — `Writable => 'undef'` but NO `Format`, GPS.pm:296/
     // 304 — correctly NUL-trimmed, exactly as bundled does.
-    let table_override = if kind.is_gps() {
-      #[cfg(feature = "gps")]
-      {
-        gps::format_override(tag_id)
+    // Resolved against the active table (`Exif.pm:6729-6744` reads the
+    // override off the directory's `$tagTablePtr`). `Interop`/vendor arms
+    // (unreachable in Phase 1) share the `%Exif::Main` override table.
+    let table_override = match self.active_table {
+      TableRef::Gps => {
+        #[cfg(feature = "gps")]
+        {
+          gps::format_override(tag_id)
+        }
+        // `gps` feature OFF ⇒ the GPS module is "not loaded": no GPS-table
+        // `Format` override is resolvable (the leaf isn't decoded as a GPS tag
+        // either), so fall through with the on-disk format unchanged.
+        #[cfg(not(feature = "gps"))]
+        {
+          let _ = tag_id;
+          None
+        }
       }
-      // `gps` feature OFF ⇒ the GPS module is "not loaded": no GPS-table
-      // `Format` override is resolvable (the leaf isn't decoded as a GPS tag
-      // either), so fall through with the on-disk format unchanged.
-      #[cfg(not(feature = "gps"))]
-      {
-        let _ = tag_id;
-        None
-      }
-    } else {
-      tables::format_override(tag_id)
+      _ => tables::format_override(tag_id),
     };
     let (format, count) = if let Some(over) = table_override {
       let new_elem = over.byte_size();
@@ -3521,7 +3592,7 @@ impl Walker<'_, '_> {
       // (Exif.pm:6762). NOTE the excessive-count message uses `$dirName`
       // (Exif.pm:6766); `$dir == $dirName == kind.as_str()` for every
       // non-MakerNotes IFD this walker reaches (Exif.pm:6341).
-      let known = Self::warn_tag_name(kind, tag_id);
+      let known = Self::lookup_name_in(self.active_table, tag_id);
 
       // Guard (a) — `if ($count > 100000 and ...)` (Exif.pm:6760-6770).
       if count > 100_000 {
@@ -3624,6 +3695,131 @@ impl Walker<'_, '_> {
     Step::Keep
   }
 
+  /// THE one sub-directory entry point — the faithful
+  /// `ProcessExif`-on-a-`SubDirectory` path (`Exif.pm:6919-7102`), parameterized
+  /// by the `SubDirectory` directive set the engine unification models
+  /// (`MakerNotes.pm:37-1127`). Every IFD-pointer subdirectory (ExifIFD/GPS/
+  /// Interop today; every vendor maker note in Phase 2+) is processed here, so
+  /// `FixBase`, `ByteOrder=Unknown` detection, the per-entry warnings, the
+  /// `warn_count>10` abort, sub-IFD recursion and `run_emission` are shared
+  /// engine features each directory inherits — not re-derived per vendor.
+  ///
+  /// It SAVES, sets, and RESTORES both [`active_table`](Self::active_table) (so
+  /// a sub-IFD's table never leaks into the parent's remaining entries) and
+  /// [`order`](Self::order) (so a `Fixed(other)` / `Unknown`-toggled child order
+  /// is honored only for the duration of the child walk — `Exif.pm:7078`'s
+  /// `SetByteOrder` is scoped to the subdirectory and the parent order is
+  /// restored on return).
+  ///
+  /// ## Pre-walk hooks — provably INERT for the core Exif/GPS/Interop sub-IFDs
+  ///
+  /// The core descriptors pass `ByteOrder = Fixed(parent_order)`,
+  /// `FixBase = No`, `Process = Exif`, so NONE of the three hooks fires and the
+  /// `ifd_start`/`order` handed to [`walk_one_ifd`] are EXACTLY the values the
+  /// pre-unification `self.walk_one_ifd(sub_offset, kind)` used — byte-identical
+  /// by construction. The hooks (each faithful to the cited Perl) fire only for
+  /// a maker-note descriptor (Phase 2+):
+  ///
+  /// - [`ByteOrderRule::Unknown`] → [`fixbase::detect_unknown_byte_order`]
+  ///   (`Exif.pm:6982-6993`) — probe the entry-count word; fall back to the
+  ///   parent order when fewer than 2 bytes are available.
+  /// - [`FixBaseMode`] `!= No` → [`fixbase::fix_base`] (`MakerNotes.pm:1282-
+  ///   1484`) — the offset-correction heuristic; relocates the value base.
+  /// - [`ProcessProc::Unknown`] → [`fixbase::locate_ifd`] (`MakerNotes.pm:1486-
+  ///   1663`) — scan for the real IFD start and resolve its order.
+  ///
+  /// `Fixed(parent_order)` resolves to `self.order` unchanged, `No` runs no
+  /// `fix_base`, and `Exif` runs no `locate_ifd`, so the save/restore of
+  /// `self.order` and the `ifd_start` passed on are no-ops for every current
+  /// caller. The full base/`data_pos` mutation that a non-`No` `fix_base`
+  /// implies is applied by the Phase-2 vendor migration (the Walker's `base`
+  /// model is threaded then); here `fix_base` is INVOKED behind the
+  /// `!= No` gate (wiring the feature in) but the core path never reaches it.
+  #[cfg_attr(not(feature = "alloc"), allow(dead_code))]
+  fn process_subdir(
+    &mut self,
+    ifd_start: usize,
+    kind: IfdKind,
+    table: TableRef,
+    byte_order: ByteOrderRule,
+    fix_base: FixBaseMode,
+    process: ProcessProc,
+  ) {
+    // ---- Pre-walk hook 1: resolve the child byte order (`Exif.pm:6982-6996`).
+    // `Fixed(o)` keeps `o`; `Unknown` probes the entry-count word, falling back
+    // to the parent order when the probe is inconclusive (`:6996`). For a core
+    // sub-IFD this is `Fixed(self.order)` ⇒ `resolved_order == self.order`.
+    let resolved_order = match byte_order {
+      ByteOrderRule::Fixed(o) => o,
+      ByteOrderRule::Unknown => {
+        makernotes::fixbase::detect_unknown_byte_order(self.data, ifd_start, self.order)
+          .unwrap_or(self.order)
+      }
+    };
+
+    // ---- Pre-walk hook 2: ProcessUnknown's `LocateIFD` (`MakerNotes.pm:1816-
+    // 1837`). Only `ProcessProc::Unknown` relocates the IFD start + order; the
+    // other processors keep `ifd_start`/`resolved_order` as derived. A failed
+    // locate leaves them unchanged (the walk then bounds-rejects, mirroring
+    // `ProcessUnknown`'s `Unrecognized` warn arm). Inert for `Exif`/`Canon`.
+    //
+    // `locate_ifd` returns the located IFD offset RELATIVE to the `ifd_start` it
+    // was handed (its scan runs `0..=32` from `dir_start`), so the ABSOLUTE
+    // position in `self.data` is `ifd_start + located`. Adding it back is
+    // essential for any maker note whose blob begins at a non-zero TIFF offset;
+    // a `checked_add` overflow (degenerate input) falls back to the unrelocated
+    // start, which the walk then bounds-rejects.
+    let (ifd_start, resolved_order) = match process {
+      ProcessProc::Unknown => makernotes::fixbase::locate_ifd(
+        self.data,
+        ifd_start,
+        None,
+        resolved_order,
+        self.captured_make.as_deref(),
+        self.captured_model.as_deref(),
+      )
+      .and_then(|(located, order)| ifd_start.checked_add(located).map(|abs| (abs, order)))
+      .unwrap_or((ifd_start, resolved_order)),
+      ProcessProc::Exif | ProcessProc::Canon | ProcessProc::BinaryData => {
+        (ifd_start, resolved_order)
+      }
+    };
+
+    // ---- Pre-walk hook 3: FixBase (`MakerNotes.pm:1282-1484`). The offset-
+    // correction heuristic runs ONLY when a `FixBase` directive is present
+    // (`!= No`); its base/`data_pos` mutation is applied by the Phase-2 vendor
+    // migration (the Walker's `base` is threaded then). Computing it here wires
+    // the feature behind the directive gate. INERT for `FixBaseMode::No` (every
+    // core sub-IFD), so the result is discarded with no effect on the walk.
+    if let Some(dir_fix_base) = fix_base.dir_fix_base() {
+      let input = makernotes::fixbase::FixBaseInput::new(
+        self.data,
+        ifd_start,
+        self.data.len().saturating_sub(ifd_start),
+        i64::from(self.base),
+        i64::from(self.base),
+        resolved_order,
+        self.captured_make.as_deref().unwrap_or(""),
+        self.captured_model.as_deref().unwrap_or(""),
+      )
+      .with_file_types(self.file_type.as_deref(), None)
+      .with_dir_fix_base(Some(dir_fix_base));
+      // Phase-0/1: the heuristic is wired but its base shift is consumed by the
+      // Phase-2 vendor migration; ignore it here (core never reaches this).
+      let _ = makernotes::fixbase::fix_base(&input);
+    }
+
+    // ---- The walk: SAME `walk_one_ifd` machinery IFD0/ExifIFD/GPS use, under
+    // the child table + resolved order, with both restored on return.
+    let saved_table = self.active_table;
+    let saved_order = self.order;
+    self.active_table = table;
+    self.order = resolved_order;
+    let _ = self.walk_one_ifd(ifd_start, kind);
+    self.order = saved_order;
+    self.active_table = saved_table;
+  }
+
   /// Dispatch a SubDirectory pointer tag.
   ///
   /// For ExifIFD/GPS/Interop the value is the 32-bit IFD offset
@@ -3679,8 +3875,21 @@ impl Walker<'_, '_> {
         // self-pointer.
         // Sub-IFDs are NOT chained via a next-IFD pointer (`MaxSubdirs => 1`
         // for GPS/Interop, `Exif.pm:2138`; ExifIFD is a single IFD too) —
-        // walk exactly one IFD.
-        let _ = self.walk_one_ifd(sub_offset, kind);
+        // walk exactly one IFD, through THE shared sub-directory entry point.
+        // The core descriptor (`Fixed(self.order)` + `No` + `Exif`) makes every
+        // `process_subdir` pre-walk hook inert, so this is byte-identical to the
+        // prior direct `walk_one_ifd(sub_offset, kind)` while routing GPS/
+        // Interop/ExifIFD recursion through the same machinery a vendor maker
+        // note will use — and it sets/restores `active_table` so the GPS table
+        // does not leak into the parent IFD0's remaining entries.
+        self.process_subdir(
+          sub_offset,
+          kind,
+          table_for_ifd_kind(kind),
+          ByteOrderRule::Fixed(self.order),
+          FixBaseMode::No,
+          ProcessProc::Exif,
+        );
       }
       SubDirKind::MakerNote => {
         // **MakerNotes Phase 1: identify vendor + capture `SubDirectory`
@@ -4113,8 +4322,13 @@ impl Walker<'_, '_> {
     // `%GPS::Main` instead (the same `kind.is_gps()` split that routes the leaf
     // lookup below to `gps::lookup`), and `%GPS::Main` has NO 0xc612 entry — so
     // an unknown GPS-IFD tag with id 0xc612 must NOT touch the DataMember. Gate
-    // the assignment on `!kind.is_gps()` to match that scoping exactly.
-    if tag_id == tables::TAG_DNG_VERSION && !kind.is_gps() {
+    // the assignment on the ACTIVE TABLE (not `kind`): `%GPS::Main` is selected
+    // by `active_table == Gps`, which holds for the GPS IFD AND for every IFD of
+    // a GPS-only chain (`parse_gps_block`, where the trailing dirs are `kind =
+    // Trailing` but still walk `%GPS::Main`). `kind.is_gps()` would wrongly fire
+    // the Exif `DNGVersion` tap in such a chain. Byte-identical for a normal
+    // TIFF, where `active_table == table_for_ifd_kind(kind)`.
+    if tag_id == tables::TAG_DNG_VERSION && self.active_table != TableRef::Gps {
       self.dng_version = raw.is_perl_truthy();
     }
 
@@ -4127,32 +4341,41 @@ impl Walker<'_, '_> {
     // (standalone TIFF) this is a no-op, so the existing TIFF goldens are
     // unaffected; for a JPEG `APP1` block `base` is the TIFF block's file
     // offset, matching bundled's absolute `ThumbnailOffset`.
-    let raw = if self.base != 0 && !kind.is_gps() && is_offset_tag(tag_id) {
+    // `!kind.is_gps()` → `active_table != Gps`: GPS has no `IsOffset` tags, and
+    // the gate must follow the ACTIVE TABLE so a GPS-only chain's trailing dirs
+    // (`kind = Trailing`, `active_table = Gps`) do not apply the Exif
+    // `StripOffsets`/`ThumbnailOffset` base-add. Byte-identical for a normal TIFF.
+    let raw = if self.base != 0 && self.active_table != TableRef::Gps && is_offset_tag(tag_id) {
       add_offset_base(raw, self.base)
     } else {
       raw
     };
-    let (name, conv): (&'static str, ResolvedConv) = if kind.is_gps() {
-      #[cfg(feature = "gps")]
-      {
-        match gps::lookup(tag_id) {
-          Some(t) => (t.name, ResolvedConv::Gps(t.conv)),
-          None => return, // unknown GPS tag — verbose-only, omit.
+    // Leaf name + conversions come from the ACTIVE table (`$tagTablePtr`,
+    // `Exif.pm:6464`). `Interop` and the Phase-1-unreachable vendor arms share
+    // `%Exif::Main` (`Exif.pm:6939` — InteropOffset has no own table); only the
+    // GPS IFD resolves against `%GPS::Main`.
+    let (name, conv): (&'static str, ResolvedConv) = match self.active_table {
+      TableRef::Gps => {
+        #[cfg(feature = "gps")]
+        {
+          match gps::lookup(tag_id) {
+            Some(t) => (t.name, ResolvedConv::Gps(t)),
+            None => return, // unknown GPS tag — verbose-only, omit.
+          }
+        }
+        // GPS IFD reached but the `gps` feature is OFF: faithful to ExifTool
+        // "module not loaded ⇒ tags not decoded". The GPS IFD's leaf tags are
+        // simply not emitted (the IFD walker still descended into it via the
+        // 0x8825 dispatch, which is harmless). `docs/tracking.md`.
+        #[cfg(not(feature = "gps"))]
+        {
+          return;
         }
       }
-      // GPS IFD reached but the `gps` feature is OFF: faithful to ExifTool
-      // "module not loaded ⇒ tags not decoded". The GPS IFD's leaf tags are
-      // simply not emitted (the IFD walker still descended into it via the
-      // 0x8825 dispatch, which is harmless). `docs/tracking.md`.
-      #[cfg(not(feature = "gps"))]
-      {
-        return;
-      }
-    } else {
-      match tables::lookup(tag_id) {
-        Some(t) => (t.name, ResolvedConv::Exif(t.conv)),
+      _ => match tables::lookup(tag_id) {
+        Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
-      }
+      },
     };
 
     // Capture `Make` (0x010f) and `Model` (0x0110) — both are IFD0 string
@@ -4705,7 +4928,12 @@ impl ExifSink for crate::tagmap::TagMap {
     // with the provider `serialize_tags` paths that were its last callers;
     // this `ExifSink for TagMap` impl is the only remaining `write_bytes`
     // user and owns the insert directly now).
-    self.write_value(group, name, crate::value::TagValue::Bytes(value.to_vec()))
+    crate::tagmap::TagMap::write_value(
+      self,
+      group,
+      name,
+      crate::value::TagValue::Bytes(value.to_vec()),
+    )
   }
 }
 
@@ -4828,14 +5056,19 @@ fn emit_entry<S: ExifSink>(
   let group = entry.group();
   let group = group.as_str();
   let name = entry.name();
+  let raw = entry.value.raw();
+  // Emit the leaf through the bespoke `emit_exif_value` / `emit_gps_value`
+  // renderer keyed on the entry's [`tables::Conv`] / [`gps::GpsConv`]. (The
+  // Exif/GPS leaf convs operate on the RAW value's first scalar / exact rational
+  // / byte shape, which the golden `convert::apply` runtime — written for the
+  // already-rendered `TagValue` — cannot reproduce byte-identically for a
+  // multi-element value or preserve in TagValue shape; #243 Codex R1/R2. The
+  // Phase-2 vendor tables are golden `TagDef`s and DO emit through
+  // `convert::apply`, via a separate path.)
   match entry.conv {
-    ResolvedConv::Exif(conv) => {
-      emit_exif_value(group, name, entry.value.raw(), conv, order, print_conv, out)
-    }
+    ResolvedConv::Exif(tag) => emit_exif_value(group, name, raw, tag.conv, order, print_conv, out),
     #[cfg(feature = "gps")]
-    ResolvedConv::Gps(conv) => {
-      emit_gps_value(group, name, entry.value.raw(), conv, order, print_conv, out)
-    }
+    ResolvedConv::Gps(tag) => emit_gps_value(group, name, raw, tag.conv, order, print_conv, out),
   }
 }
 
@@ -5950,6 +6183,88 @@ mod tests {
   fn rejects_ifd0_offset_below_8() {
     // Valid MM marker but IFD0 offset = 4 (< 8 ⇒ DoProcessTIFF return 0).
     assert!(parse_exif_block(b"MM\0\x2a\0\0\0\x04").is_none());
+  }
+
+  /// `parse_gps_block` walks a GPS-ONLY top-level TIFF block (a Canon CR3 `CMT4`
+  /// directory, `first_kind == Gps`) against `%GPS::Main`. The chain seeds its
+  /// `active_table` from `first_kind`, so tag 0x0001 resolves as `GPSLatitudeRef`
+  /// (its `%GPS::Main` name). A hard-coded `Exif` seed would look 0x0001 up in
+  /// `%Exif::Main` and drop the GPS tag entirely. (Codex R1 finding 1.)
+  #[test]
+  fn parse_gps_block_resolves_top_directory_via_gps_table() {
+    // MM, magic 0x002a, IFD0 offset 8.
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    // IFD0: 1 entry = GPSLatitudeRef (0x0001), ASCII, count 2, "N\0" inline.
+    t.extend_from_slice(&[0x00, 0x01]); // numEntries = 1
+    t.extend_from_slice(&[0x00, 0x01]); // tag 0x0001
+    t.extend_from_slice(&[0x00, 0x02]); // format = ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // count = 2
+    t.extend_from_slice(b"N\0\0\0"); // inline value "N\0"
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    let meta = parse_gps_block(&t).expect("GPS block parses");
+    assert!(
+      meta.entry("GPSLatitudeRef").is_some(),
+      "tag 0x0001 must resolve as GPSLatitudeRef via %GPS::Main, not the Exif table"
+    );
+  }
+
+  /// A GPS-table directory (`parse_gps_block`, `first_kind == Gps`) must NOT
+  /// apply Exif STRUCTURAL semantics — the `DNGVersion` 0xc612 RawConv
+  /// DataMember tap — because that tap now follows [`Walker::active_table`]
+  /// (`!= Gps`), NOT `kind` (`!is_gps()`). (Codex R2-1.)
+  ///
+  /// NOTE on the reachable shape: the R2-1 fix is written to also hold for a
+  /// trailing directory of a GPS chain (`kind == Trailing`, `active_table` still
+  /// `Gps`), but that exact shape is NOT reachable through the current walker —
+  /// a GPS directory does not follow the next-IFD pointer (no `Multi`:
+  /// [`Walker::walk_one_ifd_body`]'s `follows_chain` is `Ifd0`/`Trailing` only,
+  /// `Exif.pm:7203`), and a GPS sub-IFD is walked as a SINGLE dir via
+  /// [`Walker::process_subdir`]. So a GPS-only block is always one directory and
+  /// `active_table == Gps ⟺ kind.is_gps()` for every reachable input. This test
+  /// therefore pins the reachable analog: 0xc612 inside a GPS-table dir does NOT
+  /// set the DNG DataMember (the tap is gated off whenever `active_table` is the
+  /// GPS table), and the dir's leaves resolve via `%GPS::Main`.
+  #[test]
+  fn parse_gps_block_chain_trailing_dir_uses_gps_semantics() {
+    // MM, magic 0x002a, IFD0 offset 8. IFD0 is the GPS dir (first_kind == Gps);
+    // it holds a GPS leaf (0x0009 GPSStatus) AND tag 0xc612 (DNGVersion) with a
+    // TRUTHY `1 1 0 0` value. The 0xc612 tap must stay off under the GPS table.
+    let mut t: Vec<u8> = vec![b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08];
+    t.extend_from_slice(&[0x00, 0x02]); // numEntries = 2
+    // entry A: GPSStatus (0x0009), ASCII, count 2, "A\0" inline — a %GPS::Main
+    // leaf, present iff the dir is walked under the GPS table.
+    t.extend_from_slice(&[0x00, 0x09]); // tag 0x0009
+    t.extend_from_slice(&[0x00, 0x02]); // format = ASCII
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // count = 2
+    t.extend_from_slice(b"A\0\0\0"); // inline value "A\0"
+    // entry B: DNGVersion (0xc612), int8u[4], TRUTHY `1 1 0 0` inline — the Exif
+    // DNG RawConv tap, which must NOT fire because `active_table == Gps`.
+    t.extend_from_slice(&[0xc6, 0x12]); // tag 0xc612
+    t.extend_from_slice(&[0x00, 0x01]); // format = int8u
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]); // count = 4
+    t.extend_from_slice(&[0x01, 0x01, 0x00, 0x00]); // truthy DNGVersion value
+    t.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // next-IFD = 0
+    let meta = parse_gps_block(&t).expect("GPS block parses");
+    // THE DISCRIMINATOR: the 0xc612 DNG tap was skipped because the dir's
+    // `active_table == Gps`. (`%GPS::Main` has no 0xc612 entry; the Exif-only
+    // tap must not run under the GPS table.)
+    assert!(
+      !meta.has_dng_version(),
+      "0xc612 in a GPS-table dir must NOT fire the Exif DNGVersion tap \
+       (the gate follows active_table == Gps)"
+    );
+    // Corroborate that the dir IS walked under %GPS::Main: its GPSStatus leaf
+    // resolves (an Exif-table walk would read 0x0009 as a different/unknown tag).
+    assert!(
+      meta.entry("GPSStatus").is_some(),
+      "tag 0x0009 must resolve as GPSStatus via %GPS::Main"
+    );
+    // And the 0xc612 DNGVersion tag is itself absent from the leaf output (it is
+    // unknown to %GPS::Main — dropped, never emitted as an Exif DNGVersion).
+    assert!(
+      meta.entry("DNGVersion").is_none(),
+      "0xc612 is not a %GPS::Main leaf, so no DNGVersion tag is emitted"
+    );
   }
 
   #[test]
@@ -7459,6 +7774,7 @@ mod tests {
       // no-RAF CTMD `0x8769` path is covered via `parse_ctmd_exif_ifd_redispatch`.
       no_raf: false,
       warn_count: 0,
+      active_table: TableRef::Exif,
     }
   }
 
