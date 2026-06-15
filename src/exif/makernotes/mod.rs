@@ -52,7 +52,9 @@
 pub mod byte_order;
 pub mod detected;
 pub mod dispatcher;
+pub mod fixbase;
 pub mod offset;
+pub mod subdir;
 pub mod vendor;
 pub mod vendors;
 
