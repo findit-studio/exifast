@@ -6,6 +6,6 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-roxmltree = "0.20"
+roxmltree = "0.21"
 phf_codegen = "0.13"
 exifast = { path = "..", default-features = false, features = ["std", "all-formats"] }
