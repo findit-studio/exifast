@@ -485,6 +485,67 @@ impl RawValue {
     }
   }
 
+  /// The first scalar integer (signed) — works for `U64`/`I64`. The dominant
+  /// Apple maker-note shape (most tags are scalar int32s); the Apple PrintConv
+  /// and typed-population paths read it directly from the decoded `$val`.
+  #[must_use]
+  pub fn first_i64(&self) -> Option<i64> {
+    match self {
+      RawValue::I64(v) => v.first().copied(),
+      RawValue::U64(v) => v.first().and_then(|&n| i64::try_from(n).ok()),
+      _ => None,
+    }
+  }
+
+  /// The first two scalar integers (for Apple `AFPerformance`, `int32s[2]`).
+  #[must_use]
+  pub fn first_two_i64(&self) -> Option<(i64, i64)> {
+    // `[a, b, ..]` matches len ≥ 2 and binds the first two — byte-identical to
+    // the `if v.len() >= 2 => (v[0], v[1])` index pair, without raw indexing.
+    match self {
+      RawValue::I64(v) if let [a, b, ..] = v.as_slice() => Some((*a, *b)),
+      RawValue::U64(v) if let [a, b, ..] = v.as_slice() => {
+        let a = i64::try_from(*a).ok()?;
+        let b = i64::try_from(*b).ok()?;
+        Some((a, b))
+      }
+      _ => None,
+    }
+  }
+
+  /// The first two rational64 values as f64 — for Apple `FocusDistanceRange`.
+  #[must_use]
+  pub fn rational_pair(&self) -> Option<(f64, f64)> {
+    // `[r0, r1, ..]` matches len ≥ 2 and binds the first two — byte-identical to
+    // the `rs.len() >= 2` guard + `rs[0]`/`rs[1]`, without raw indexing.
+    match self {
+      RawValue::Rational(rs) if let [r0, r1, ..] = rs.as_slice() => {
+        let a = ratio_f64(r0.numerator(), r0.denominator())?;
+        let b = ratio_f64(r1.numerator(), r1.denominator())?;
+        Some((a, b))
+      }
+      _ => None,
+    }
+  }
+
+  /// Convert this raw value to a default [`TagValue`] (no PrintConv — used by
+  /// [`ApplePrintConv::None`](crate::exif::makernotes::vendors::apple::printconv::ApplePrintConv)
+  /// and the PLIST-deferred branches).
+  ///
+  /// Delegates to the shared [`render_value`](crate::exif::render::render_value)
+  /// — the single faithful `ReadValue` renderer (`ExifTool.pm:6275-6321`) the
+  /// EXIF emitters and this Apple default path both use: integers → `I64`/`U64`,
+  /// floats → `F64`, a single rational → `Rational` (its serializer renders the
+  /// rounded decimal), a multi-rational → space-joined DECIMAL scalars
+  /// (`Rational::exiftool_val_str`, NOT `n/d` fractions — e.g.
+  /// AccelerationVector, `Apple.pm:62`), text → `Str`, bytes → `Bytes`. The
+  /// no-conv default is mode-agnostic, so the active
+  /// [`ConvMode`](crate::emit::ConvMode) is irrelevant here.
+  #[must_use]
+  pub fn to_default_tag_value(&self) -> crate::value::TagValue {
+    crate::exif::render::render_value(self, crate::emit::ConvMode::PrintConv)
+  }
+
   /// ExifTool's post-`ReadValue` `$val` AS BYTES — what a byte-walking
   /// `RawConv` consumes. Defined for EVERY shape so a conv never has to gate on
   /// `Format`: `Text` → the pre-FixUTF8 `raw` (the original on-disk bytes);
@@ -548,6 +609,15 @@ fn join_display<T: core::fmt::Display>(s: &mut std::string::String, vals: &[T]) 
     }
     let _ = write!(s, "{v}");
   }
+}
+
+/// `numerator / denominator` as f64, `None` for a zero denominator — the
+/// rational→float coercion [`RawValue::rational_pair`] uses.
+fn ratio_f64(n: i64, d: i64) -> Option<f64> {
+  if d == 0 {
+    return None;
+  }
+  Some(n as f64 / d as f64)
 }
 
 // ===========================================================================

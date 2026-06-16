@@ -496,6 +496,16 @@ enum ResolvedConv {
   /// `parse_in_tiff` (so conformance is unchanged) — proven byte-identical by the
   /// differential test in `mod.rs`.
   Canon(&'static makernotes::vendors::canon::tags::CanonTag),
+  /// An Apple maker-note leaf (`%Apple::Main` descriptor). Carries the resolved
+  /// [`AppleTag`](makernotes::vendors::apple::tags::AppleTag) so the emit reapplies
+  /// its [`ApplePrintConv`](makernotes::vendors::apple::printconv::ApplePrintConv)
+  /// (the same render `parse_with_print_conv` does at collection time,
+  /// `apple/mod.rs`) and reads its `Unknown=>1` flag. Apple is the SIMPLE vendor
+  /// case (#243 phase 3): a BLOB-only table with no DataMember pre-scan, no binary
+  /// sub-tables, and no model-conditionals — so the shared `Walker` walking the
+  /// Apple Main IFD under `active_table == Apple` reproduces `walk_apple_body`
+  /// exactly (base 0, out-of-line offsets resolve blob-relative).
+  Apple(&'static makernotes::vendors::apple::tags::AppleTag),
 }
 
 impl ResolvedConv {
@@ -511,6 +521,7 @@ impl ResolvedConv {
       #[cfg(feature = "gps")]
       ResolvedConv::Gps(_) => vendor_group1_of(TableRef::Gps),
       ResolvedConv::Canon(_) => vendor_group1_of(TableRef::Canon),
+      ResolvedConv::Apple(_) => vendor_group1_of(TableRef::Apple),
     }
   }
 }
@@ -530,15 +541,19 @@ impl ResolvedConv {
 const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
   match table {
     TableRef::Canon => Some("Canon"),
+    // `%Apple::Main` — phase 3 of the engine migration (#243). An Apple maker-note
+    // leaf emits under the `Apple` family-1 group, exactly as
+    // `parse_with_print_conv` + `push_maker_note_tags` push every Apple
+    // `VendorEmission` under `("MakerNotes","Apple")`.
+    TableRef::Apple => Some("Apple"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
-    // tables never reach the emit through this walker in Step A.
+    // tables never reach the emit through this walker.
     TableRef::Exif
     | TableRef::Gps
     | TableRef::Interop
     | TableRef::Sony
     | TableRef::Panasonic
     | TableRef::Nikon
-    | TableRef::Apple
     | TableRef::Samsung => None,
   }
 }
@@ -564,8 +579,15 @@ enum MakerNoteValueConvDecode<'a> {
   /// No `-n` emissions (vendor has no body parser yet, or a gated vendor whose
   /// `%Main` route did not match — its PrintConv decode produced none either).
   None,
-  /// Apple — `parse_with_print_conv(blob, order, ·)`.
-  Apple { blob: &'a [u8], order: ByteOrder },
+  /// Apple — `apple_makernote_isolated(blob, order, ·, make)`. `make` is the
+  /// parent IFD0 `Make`, retained so the `-n` recompute gates the format-16
+  /// (`int64u`) Apple carve-out on `Make eq 'Apple'` identically to the `-j`
+  /// decode (`Exif.pm:6464`) — mirrors how the `Canon` variant retains `model`.
+  Apple {
+    blob: &'a [u8],
+    order: ByteOrder,
+    make: Option<smol_str::SmolStr>,
+  },
   /// Canon — re-drive the SHARED `Walker`'s Canon walk + emission capture
   /// ([`canon_recompute_value_conv`]) with `print_conv = false` (#243 phase 2
   /// step C). The Canon Main IFD walk is deterministic across the PrintConv flag
@@ -648,11 +670,15 @@ impl MakerNoteValueConvDecode<'_> {
   /// ValueConv too (same gate, PrintConv-independent).
   #[must_use]
   fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission> {
-    use makernotes::vendors::{apple, dji, panasonic, sony};
+    use makernotes::vendors::{dji, panasonic, sony};
     match self {
       MakerNoteValueConvDecode::None => std::vec::Vec::new(),
-      MakerNoteValueConvDecode::Apple { blob, order } => {
-        apple::parse_with_print_conv(blob, *order, false).1
+      MakerNoteValueConvDecode::Apple { blob, order, make } => {
+        // The `-n` recompute is the isolated walk with `print_conv = false` and the
+        // typed slot discarded (the `-n` path needs only the ValueConv emissions),
+        // mirroring `canon_recompute_value_conv` (#243 phase 3). `make` is threaded
+        // so the format-16 carve-out gate matches the `-j` decode (R4).
+        apple_makernote_isolated(blob, *order, false, make.as_deref()).0
       }
       MakerNoteValueConvDecode::Canon {
         data,
@@ -3330,6 +3356,10 @@ impl Walker<'_, '_> {
       // unknown Canon tag yields `None` (the unknown-tag warning form), matching
       // `parse_in_tiff`'s `tags::lookup(...).is_none()` skip.
       TableRef::Canon => makernotes::vendors::canon::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Apple::Main` — phase 3 of the engine migration (#243). An unknown Apple
+      // tag yields `None` (the unknown-tag warning form), matching
+      // `parse_with_print_conv`'s `tags::lookup(...).is_none()` skip.
+      TableRef::Apple => makernotes::vendors::apple::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -3408,7 +3438,24 @@ impl Walker<'_, '_> {
     //     track `Model` during the IFD walk, and an ILCE camera with an
     //     empty first entry is a narrow Sony-specific case outside the
     //     standalone-TIFF camera-metadata scope (`docs/tracking.md`).
-    let recognized = Format::is_valid_ifd_code(format_code);
+    // ExifTool ADMITS the BigTIFF `int64u` code 16 in a standard IFD entry ONLY
+    // for Apple maker notes: `not ($format == 16 and $$et{Make} eq 'Apple' and
+    // $inMakerNotes)` (`Exif.pm:6464`). `active_table == Apple` is the
+    // `$inMakerNotes` (Apple MakerNote walk) context, and the `$$et{Make} eq
+    // 'Apple'` condition is the parent IFD0 `Make`: Apple MakerNote dispatch is
+    // SIGNATURE-based (an `"Apple iOS\0"` blob routes to `Vendor::Apple`
+    // REGARDLESS of the container Make), so a crafted file with such a blob but
+    // IFD0 Make != `"Apple"` reaches this gate; ExifTool then classifies code 16
+    // as a BAD format (entry-0 abort / later-entry skip). The carve-out therefore
+    // ALSO requires `captured_make == Some("Apple")`, threaded from IFD0. An Apple
+    // ProRAW DNG (Make == "Apple") entry whose on-disk format is 16 (int64u,
+    // byte_size 8) is recognized and decoded — never the `Bad format`
+    // entry-0-abort that would lose the whole Apple walk. Every other table
+    // (Exif/Gps/Interop/Canon) keeps rejecting 16. (#243 phase 3 Apple R1/R4.)
+    let recognized = Format::is_valid_ifd_code(format_code)
+      || (format_code == 16
+        && self.active_table == TableRef::Apple
+        && self.captured_make.as_deref() == Some("Apple"));
     if !recognized {
       // `if ($format or $validate) { Warn(...); ++$warnCount }` — a 0
       // code is silent padding; any other bad code warns AND counts toward the
@@ -4508,17 +4555,44 @@ impl Walker<'_, '_> {
             let mut emission_group1 = detected.vendor().group1();
             match detected.vendor() {
               makernotes::Vendor::Apple => {
-                // Apple: parse using the body (after the 14-byte header).
-                // Apple's `Base => '$start - 14'` rebases offsets to the
-                // start of the BLOB, so the standalone-blob walker is
-                // faithful here.
-                let (typed_pc, emi_pc) =
-                  makernotes::vendors::apple::parse_with_print_conv(bytes, self.order, true);
-                meta.set_apple(typed_pc);
-                cached_pc = emi_pc;
+                // Apple: walk the Apple Main IFD in a FRESH, ISOLATED `Walker`
+                // ([`apple_makernote_isolated`]) — NOT on `self` — then capture
+                // its emissions into the cached-emission buffer exactly like the
+                // other vendors (#243 phase 3, structural isolation, mirroring
+                // Canon). The isolated walk builds its own `Walker` over the
+                // captured `bytes` (base 0, the Apple Main IFD after the 14-byte
+                // header), walks the IFD under `TableRef::Apple`, and DISCARDS its
+                // `warnings` / `warn_count` / `active_ifd_offsets` — so a malformed
+                // Apple entry cannot leak a core `ExifTool:Warning`, abort the
+                // parent ExifIFD's warn-count, or be suppressed by the parent's
+                // ancestor cycle guard. Apple's `Base => '$start - 14'`
+                // (`MakerNotes.pm:43`) rebases out-of-line offsets to the start of
+                // the BLOB, which `base: 0` over `data = bytes` reproduces exactly.
+                //
+                // `print_conv = true`: the eager single-mode decode yields the
+                // cached PrintConv (`-j`) emissions AND the typed `MakerNotesApple`
+                // slot. The `-n` (ValueConv) emissions are recomputed on demand via
+                // `value_conv_decode` below, through the SAME isolated helper with
+                // `print_conv = false` — so both modes share one walk path.
+                // `self.captured_make` is the parent IFD0 `Make`: the isolated
+                // walk's format-16 (`int64u`) carve-out gates on
+                // `captured_make == Some("Apple")` (`Exif.pm:6464`
+                // `$$et{Make} eq 'Apple'`), so a non-Apple container with an
+                // Apple-signature blob rejects code 16 (R4).
+                let (emissions, typed) =
+                  apple_makernote_isolated(bytes, self.order, true, self.captured_make.as_deref());
+                // `print_conv = true` always returns `Some(typed)`; the production
+                // dispatch needs the typed surface.
+                if let Some(typed) = typed {
+                  meta.set_apple(typed);
+                }
+                cached_pc = emissions;
                 value_conv_decode = MakerNoteValueConvDecode::Apple {
                   blob: bytes,
                   order: self.order,
+                  // Retained so the `-n` recompute gates the format-16 carve-out
+                  // identically (mirrors the `Canon` variant's `model`).
+                  make: self.captured_make.as_deref().map(smol_str::SmolStr::new),
                 };
               }
               makernotes::Vendor::Canon => {
@@ -4999,6 +5073,15 @@ impl Walker<'_, '_> {
       // `parse_in_tiff`'s `tags::lookup(...).is_none()` `continue`.
       TableRef::Canon => match makernotes::vendors::canon::tags::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Canon(t)),
+        None => return,
+      },
+      // `%Apple::Main` — phase 3 of the engine migration (#243). The resolved
+      // [`AppleTag`] rides in `ResolvedConv::Apple` so the emit reapplies its
+      // `ApplePrintConv` exactly as `parse_with_print_conv` does at collection time
+      // (`apple/mod.rs`). An unknown Apple tag is skipped here, matching
+      // `parse_with_print_conv`'s `tags::lookup(...).is_none()` `continue`.
+      TableRef::Apple => match makernotes::vendors::apple::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Apple(t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
@@ -5985,6 +6068,19 @@ fn emit_entry<S: ExifSink>(
         None => emit_canon_value(group1, name, raw, canon_tag, print_conv, model, out),
       }
     }
+    // `%Apple::Main` vendor leaf (#243 phase 3) — render via the Apple `PrintConv`
+    // (`ApplePrintConv::apply`) and emit under the vendor group
+    // `("MakerNotes","Apple")`, mirroring `parse_with_print_conv` +
+    // `push_maker_note_tags`. Apple is the SIMPLE case: every `%Apple::Main` entry
+    // is a plain LEAF (no sub-tables, no LIST / Format-override specials), so this
+    // is JUST the leaf emit — no `emit_canon_special` / `emit_canon_subtable`
+    // analogue. `vendor_group1()` is `Some("Apple")` here by construction; the
+    // unreachable `None` falls back to `group` so a leaf is never silently
+    // mis-grouped.
+    ResolvedConv::Apple(apple_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      emit_apple_value(group1, name, raw, apple_tag, print_conv, out)
+    }
   }
 }
 
@@ -6016,6 +6112,36 @@ fn emit_canon_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   let value = canon_tag.conv().apply(raw, print_conv, model);
   out.write_vendor_value("MakerNotes", group1, name, value, canon_tag.is_unknown())
+}
+
+/// Render ONE Apple maker-note leaf into the sink — the emit-time reproduction of
+/// `apple::parse_with_print_conv`'s per-tag emit (`apple/mod.rs`), through the
+/// shared `Walker` (#243 phase 3).
+///
+/// Applies the resolved tag's [`ApplePrintConv`](makernotes::vendors::apple::printconv::ApplePrintConv)
+/// to `raw` EXACTLY as the oracle does (`def.conv().apply(&entry.value, print_conv)`),
+/// then writes the already-rendered [`TagValue`] under `("MakerNotes", group1)`
+/// carrying the tag's `Unknown=>1` flag. The flag is NOT filtered here — it rides
+/// into the [`EmittedTag`](crate::emit::EmittedTag) so the shared
+/// [`run_emission`](crate::emit::run_emission) engine drops it ONCE, identical to
+/// how an Apple `VendorEmission`'s `is_unknown()` flows through
+/// [`ExifMeta::push_maker_note_tags`].
+///
+/// `ApplePrintConv::apply` reads the decoded [`RawValue`] BY REFERENCE (like
+/// `CanonPrintConv::apply`), so the Walker's borrowed `raw` is passed straight
+/// through — NO per-tag clone (the redundant `ParsedValue` clone is gone, the
+/// Apple leaf path now allocates exactly as Canon does).
+#[cfg(feature = "alloc")]
+fn emit_apple_value<S: ExifSink>(
+  group1: &str,
+  name: &str,
+  raw: &RawValue,
+  apple_tag: &makernotes::vendors::apple::tags::AppleTag,
+  print_conv: bool,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  let value = apple_tag.conv().apply(raw, print_conv);
+  out.write_vendor_value("MakerNotes", group1, name, value, apple_tag.is_unknown())
 }
 
 /// Emit the two Canon `%Main` LIST / Format-override SPECIALS at emit time —
@@ -6312,6 +6438,163 @@ fn canon_recompute_value_conv(
   // The `-n` recompute is the isolated walk with `print_conv = false` and the
   // typed slot discarded (the `-n` path needs only the ValueConv emissions).
   canon_makernote_isolated(data, mn_offset, mn_len, order, model, file_type, false).0
+}
+
+/// Walk the Apple Main IFD in a FRESH, ISOLATED [`Walker`] over the captured blob
+/// and capture its emissions + typed surface — the single entry point BOTH the
+/// `-j` production dispatch and the `-n` recompute drive (#243 phase 3, structural
+/// isolation, mirroring [`canon_makernote_isolated`]).
+///
+/// Apple is the SIMPLE vendor case: BLOB-only (`Base => '$start - 14'` rebases
+/// out-of-line offsets to the START of the blob, `MakerNotes.pm:43`), with no
+/// DataMember pre-scan, no binary sub-tables, and no model-conditionals. So a
+/// fresh `Walker` over `data = blob`, `base = 0`, walking the IFD at
+/// `14 + header_size` under `active_table == TableRef::Apple` reproduces the oracle
+/// [`walk_apple_body`](makernotes::vendors::apple::walk_apple_body) EXACTLY: an
+/// inline value reads at `entry + 8`, and an out-of-line value at `blob[off]`
+/// (`base = 0`, and `%Apple::Main` carries no `IsOffset`/`SubIFD` tag, so
+/// [`is_offset_tag`] never adds `base`) — the SAME byte window the oracle's
+/// `body[off - body_offset]` (= `blob[off]`) reads.
+///
+/// The byte ORDER + header size come from the body's own marker
+/// ([`ByteOrder::from_marker`] of `blob[14..]`): `MM`/`II` ⇒ that order +
+/// `header_size = 2`; no marker ⇒ the parent order + `header_size = 0` (degenerate
+/// — every real-iPhone fixture starts with `MM`). A blob shorter than the 14-byte
+/// `Apple iOS` header yields no emissions and an EMPTY `MakerNotesApple` — the
+/// oracle's `blob.len() < 14` guard.
+///
+/// A FRESH `Walker` has its OWN `warnings` / `warn_count` / `active_ifd_offsets`,
+/// populated by THIS walk and DISCARDED on return — so a malformed Apple entry
+/// cannot leak a core `ExifTool:Warning`, abort the parent ExifIFD's warn-count,
+/// or be suppressed by the parent's ancestor cycle guard (the oracle, an isolated
+/// `walk_apple_body`, has none of these side effects either). `print_conv = true`
+/// renders the `-j` (PrintConv) emissions; `print_conv = false` the `-n`
+/// (ValueConv) emissions; the typed `MakerNotesApple` is the SAME for both modes
+/// and is ALWAYS returned (non-Option — the oracle's `MakerNotesApple` is always
+/// present, even empty).
+#[cfg(feature = "alloc")]
+fn apple_makernote_isolated(
+  blob: &[u8],
+  parent_order: ByteOrder,
+  print_conv: bool,
+  make: Option<&str>,
+) -> (
+  std::vec::Vec<makernotes::VendorEmission>,
+  Option<makernotes::vendors::apple::MakerNotesApple>,
+) {
+  // The oracle's `blob.len() < 14` guard (`apple/mod.rs`): a blob too short to
+  // hold the 14-byte `Apple iOS\0\0\x01` header yields nothing + an empty typed
+  // slot. (`walk_apple_body` also returns nothing for `body_offset >= blob.len()`,
+  // i.e. `blob.len() <= 14`; the explicit `< 14` here matches
+  // `parse_with_print_conv`'s top guard exactly.) The typed slot is built ONLY
+  // for `-j` (`print_conv.then(...)`, mirroring `canon_makernote_isolated`): the
+  // `-n` recompute discards it, so building it there would waste the
+  // SmolStr-allocating string-tag population (`burst_uuid` / `content_identifier`
+  // / `image_unique_id`).
+  if blob.len() < 14 {
+    return (
+      std::vec::Vec::new(),
+      print_conv.then(makernotes::vendors::apple::MakerNotesApple::new),
+    );
+  }
+  // Resolve the body byte order + header size from the body marker (the oracle's
+  // `ByteOrder::from_marker(body)` at `body = &blob[14..]`). `MM`/`II` ⇒ that
+  // order, the marker occupies 2 bytes; no marker ⇒ inherit the parent order, the
+  // count word is at the body start. The `blob.len() >= 14` guard above makes
+  // `blob.get(14..)` `Some`.
+  let body = blob.get(14..).unwrap_or(&[]);
+  let (order, header_size) = match ByteOrder::from_marker(body) {
+    Some(o) => (o, 2usize),
+    None => (parent_order, 0usize),
+  };
+  // The IFD count word sits at `14 + header_size` in the blob (the oracle reads it
+  // at `header_size` in the `body` slice). The shared `Walker` walks `data = blob`
+  // from this offset, so the absolute blob offset is used directly.
+  let ifd_offset = 14usize.saturating_add(header_size);
+  let mut w = Walker {
+    data: blob,
+    order,
+    // `%Apple::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
+    // `base` to a value — `base: 0` resolves an out-of-line offset at `blob[off]`,
+    // byte-identical to the oracle's `Base => '$start - 14'` blob-relative read.
+    base: 0,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Apple entry warns into THESE, dropped on
+    // return — never the parent's `ExifTool:Warning` stream (the oracle
+    // `walk_apple_body` silently `next`s a bad entry, emitting no such warning).
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    // The parent IFD0 `Make`, threaded from the dispatch — the format-16
+    // (`int64u`) Apple carve-out in the per-entry gate requires
+    // `captured_make == Some("Apple")` (`Exif.pm:6464` `$$et{Make} eq 'Apple'`),
+    // so a non-Apple container with an Apple-signature blob rejects code 16. The
+    // real iPhone fixtures carry IFD0 Make == "Apple", so this stays admitted.
+    captured_make: make.map(String::from),
+    // Apple has no model-conditional tag, so `$$self{Model}` is irrelevant to the
+    // walk; leave it unset.
+    captured_model: None,
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has no ancestor on its recursion stack,
+    // so an Apple value offset that coincides with a parent IFD offset is still
+    // walked — the oracle, also pathless, always walks it.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Apple tag reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    // The captured blob IS the readable buffer (an effective RAF), like the
+    // dispatch walk.
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Apple)` swaps it to
+    // `Apple` for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Apple Main IFD walk — the SAME `process_subdir` entry the Canon walk uses,
+  // but with `ProcessProc::Exif` (Apple needs NO Canon DataMember pre-scan; the
+  // `if table == TableRef::Canon` pre-scan hook is therefore inert). `Fixed(order)`
+  // keeps the body-marker order; `IfdKind::ExifIfd` is a non-Ifd0 kind so the
+  // IFD0-only Make/Model capture tap never fires; `FixBaseMode::No` (the blob is
+  // already body-relative). It appends the Apple leaves to `w.entries` from index
+  // 0, isolating every core side effect from the parent.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Apple,
+    ByteOrderRule::Fixed(order),
+    FixBaseMode::No,
+    ProcessProc::Exif,
+  );
+  // Capture the walked `ResolvedConv::Apple` leaves into the vendor-emission `Vec`
+  // every other vendor body parser produces (the SAME `emit_entry` →
+  // `emit_apple_value` path, driven by `print_conv`). The render context Apple
+  // needs is empty (no model / file_type / DataMembers), so pass `None`s.
+  let mut emissions = std::vec::Vec::new();
+  let mut sink = VendorEmissionSink::new(&mut emissions);
+  for entry in &w.entries {
+    let Ok(()) = emit_entry(
+      entry, order, print_conv, None, None, None, None, None, &mut sink,
+    );
+  }
+  // Build the typed surface from the SAME walked entries, via the single-sourced
+  // per-tag router the oracle uses ([`apple::populate_typed_value`]). ONLY for
+  // `-j`: the production dispatch needs it, the `-n` recompute discards it, so
+  // gating on `print_conv` (like `canon_makernote_isolated`) saves the
+  // string-tag SmolStr allocations on the `-n` path.
+  let typed = print_conv.then(|| {
+    let mut typed = makernotes::vendors::apple::MakerNotesApple::new();
+    for entry in &w.entries {
+      makernotes::vendors::apple::populate_typed_value(&mut typed, entry.tag_id, entry.value.raw());
+    }
+    typed
+  });
+  (emissions, typed)
 }
 
 /// Walk the Canon Main IFD in a FRESH, ISOLATED [`Walker`] and capture its
@@ -9938,6 +10221,916 @@ mod tests {
     assert_eq!(vendor_group1_of(TableRef::Interop), None);
     #[cfg(feature = "gps")]
     assert_eq!(vendor_group1_of(TableRef::Gps), None);
+  }
+
+  // ====================================================================// Apple engine migration — differential test (#243 phase 3)
+  //
+  // PROVES the shared `Walker`'s Apple LEAF path (`apple_makernote_isolated` →
+  // `process_subdir` under `TableRef::Apple` → `emit_entry`'s `ResolvedConv::Apple`
+  // arm → `emit_apple_value`) is BYTE-IDENTICAL to the production oracle
+  // `apple::parse_with_print_conv` (`walk_apple_body` + per-tag `ApplePrintConv`).
+  // The same crafted Apple MakerNote blob is run through BOTH paths; the emitted
+  // `(name, value, group="MakerNotes:Apple", unknown)` tuples must match, in order,
+  // for `-j` (PrintConv) AND `-n` (ValueConv), and the typed `MakerNotesApple` must
+  // agree. Apple is the SIMPLE vendor case — BLOB-only, no DataMember pre-scan, no
+  // sub-tables, no specials — so this is the whole story (no Step B/C analogue).
+  // ====================================================================
+
+  /// Build a crafted big-endian Apple MakerNote blob: the 14-byte
+  /// `Apple iOS\0\0\x01` header, then the body's `MM` marker + a BE entry count +
+  /// the 12-byte IFD entries, then the next-IFD word, then any out-of-line value
+  /// bytes appended after it. `entries` is `(tag, format, count, inline_or_empty,
+  /// out_of_line_or_empty)`: an entry is INLINE when `out_of_line` is empty (the
+  /// value, zero-padded to 4 bytes, sits at `entry+8`), else OUT-OF-LINE (the 4
+  /// bytes at `entry+8` are the BLOB-relative offset — `Base => '$start - 14'` —
+  /// and `out_of_line` holds the value bytes appended past the directory).
+  ///
+  /// Out-of-line data is appended AFTER the next-IFD word, so every value offset is
+  /// past the directory extent — neither walker flags it `Suspicious`.
+  #[cfg(feature = "alloc")]
+  fn crafted_apple_blob(entries: &[(u16, u16, u32, &[u8], &[u8])]) -> Vec<u8> {
+    // Header (14 bytes) + body marker `MM` (2) + count (2). Out-of-line offsets are
+    // blob-relative, so the value-data region begins right after the next-IFD word.
+    let dir_bytes = 2 + 12 * entries.len(); // marker `MM` is BEFORE this; count+entries
+    // Body layout from offset 14: [MM][count u16][entries...][next-IFD u32][values].
+    // The first out-of-line value sits at blob offset 14 + 2 + dir_bytes + 4.
+    let mut value_cursor = 14 + 2 + dir_bytes + 4;
+    let mut header: Vec<u8> = Vec::new();
+    // The 14-byte `Apple iOS\0\0\x01MM` header (the trailing `MM` IS part of the
+    // fixed 14-byte header — `MakerNotes.pm`'s `Start => '$valuePtr + 14'`). The
+    // BODY then begins with its OWN `MM`/`II` marker.
+    header.extend_from_slice(b"Apple iOS\x00\x00\x01MM");
+    header.extend_from_slice(b"MM"); // body byte-order marker (big-endian)
+    header.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    let mut value_blob: Vec<u8> = Vec::new();
+    for &(tag, format, count, inline, out_of_line) in entries {
+      header.extend_from_slice(&tag.to_be_bytes());
+      header.extend_from_slice(&format.to_be_bytes());
+      header.extend_from_slice(&count.to_be_bytes());
+      if out_of_line.is_empty() {
+        assert!(inline.len() <= 4, "inline value must be <= 4 bytes");
+        let mut slot = [0u8; 4];
+        slot[..inline.len()].copy_from_slice(inline);
+        header.extend_from_slice(&slot);
+      } else {
+        header.extend_from_slice(&(value_cursor as u32).to_be_bytes());
+        value_blob.extend_from_slice(out_of_line);
+        value_cursor += out_of_line.len();
+      }
+    }
+    header.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+    header.extend_from_slice(&value_blob);
+    header
+  }
+
+  /// Drive the shared `Walker` through `apple_makernote_isolated`'s walk over
+  /// `blob`, then render every collected entry through `emit_entry` (the
+  /// `ResolvedConv::Apple` arm → `emit_apple_value`) into an `EmittedTagSink`.
+  /// Returns the emitted tags in walk order — the NEW path's output WITH the full
+  /// `MakerNotes:Apple` group (which the `VendorEmission` stream alone does not
+  /// carry). Mirrors the production isolated walk exactly (base 0, body-marker
+  /// order, `TableRef::Apple`, `ProcessProc::Exif`).
+  #[cfg(feature = "alloc")]
+  fn drive_apple_subdir(
+    blob: &[u8],
+    parent_order: ByteOrder,
+    print_conv: bool,
+  ) -> Vec<crate::emit::EmittedTag> {
+    let body = blob.get(14..).unwrap_or(&[]);
+    let (order, header_size) = match ByteOrder::from_marker(body) {
+      Some(o) => (o, 2usize),
+      None => (parent_order, 0usize),
+    };
+    let mut w = test_walker(blob);
+    w.order = order;
+    // Mirror the production Apple dispatch: the IFD0 Make is "Apple" for real
+    // fixtures, which the per-entry format-16 carve-out gate requires.
+    w.captured_make = Some(std::string::String::from("Apple"));
+    w.process_subdir(
+      14 + header_size,
+      IfdKind::ExifIfd,
+      TableRef::Apple,
+      ByteOrderRule::Fixed(order),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+    let mut out: Vec<crate::emit::EmittedTag> = Vec::new();
+    let mut sink = EmittedTagSink::new(&mut out);
+    for entry in &w.entries {
+      let Ok(()) = emit_entry(
+        entry, order, print_conv, None, None, None, None, None, &mut sink,
+      );
+    }
+    out
+  }
+
+  /// The Apple leaf-path differential proof: for BOTH `-j` (PrintConv) and `-n`
+  /// (ValueConv), the shared `Walker` Apple leaf path emits the EXACT same
+  /// `(name, value, group="MakerNotes:Apple", unknown)` stream — in order — as
+  /// `apple::parse_with_print_conv`, AND the typed `MakerNotesApple` agrees.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_isolated_emit_matches_parse_with_print_conv() {
+    // A 36-char UUID for the out-of-line BurstUUID (0x000b) — exercises an
+    // OUT-OF-LINE ASCII value + the typed `burst_uuid` accessor. ExifTool stores
+    // ASCII with a trailing NUL; `read_value` trims it, so the count includes it.
+    let uuid = b"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\0";
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x000a HDRImageType — int32s, hash PrintConv (3 ⇒ "HDR Image"). INLINE.
+      (0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+      // 0x000b BurstUUID — ASCII, conv None. OUT-OF-LINE (36 chars + NUL).
+      (0x000b, 0x0002, uuid.len() as u32, &[], uuid),
+      // 0x0014 ImageCaptureType — int32s, hash PrintConv miss (5 ⇒ "Unknown (5)").
+      (0x0014, 0x0009, 1, &[0x00, 0x00, 0x00, 0x05], &[]),
+      // 0x002e CameraType — int32s, hash PrintConv (1 ⇒ "Back Normal"). INLINE.
+      (0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]),
+      // 0x003F GreenGhostMitigationStatus — int32s, Unknown=>1, conv None. INLINE.
+      // Present-and-flagged on BOTH sides (run_emission drops it later, not here).
+      (0x003F, 0x0009, 1, &[0x00, 0x00, 0x00, 0x07], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+    // The parent IFD order is little-endian here, but the body marker is `MM`
+    // (big-endian) — proving the body-marker order is what governs the walk, NOT
+    // the parent order (the `from_marker` precedence in `apple_makernote_isolated`).
+    let parent_order = ByteOrder::Little;
+
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_with_print_conv` (renders leaves at
+      // collection). Returns `(typed, emissions)`; emissions carry (name, value,
+      // unknown) but NOT a group.
+      let (oracle_typed, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+        &blob,
+        parent_order,
+        print_conv,
+        Some("Apple"),
+      );
+
+      // ---- New path A: the isolated helper the production dispatch drives.
+      let (iso_emissions, iso_typed) =
+        apple_makernote_isolated(&blob, parent_order, print_conv, Some("Apple"));
+      // ---- New path B: the same walk emitted into an `EmittedTagSink` so the full
+      // `MakerNotes:Apple` group is asserted (the `VendorEmission` stream omits it).
+      let emitted = drive_apple_subdir(&blob, parent_order, print_conv);
+
+      // Both streams are in IFD-tag order (the entries are ascending here), so
+      // compare position-wise.
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "print_conv={print_conv}: isolated emission COUNT must match the oracle"
+      );
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: EmittedTag COUNT must match the oracle"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        // The `VendorEmission` stream the production dispatch caches.
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: VendorEmission NAME mismatch"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): VendorEmission VALUE mismatch \
+           (the new path must apply ApplePrintConv exactly as the oracle)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} leaf #{i} ({}): VendorEmission Unknown flag mismatch",
+          want.name()
+        );
+        // The `EmittedTag` stream — same name/value/unknown PLUS the group override.
+        let tag = emitted.get(i).expect("index in range").tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: EmittedTag NAME mismatch"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): EmittedTag VALUE mismatch",
+          want.name()
+        );
+        assert_eq!(
+          emitted.get(i).expect("index in range").unknown(),
+          want.unknown(),
+          "print_conv={print_conv} leaf #{i} ({}): EmittedTag Unknown flag mismatch",
+          want.name()
+        );
+        // The vendor group OVERRIDE — every Apple leaf is `MakerNotes:Apple`.
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} leaf #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Apple",
+          "print_conv={print_conv} leaf #{i} ({}): family-1 must be Apple",
+          want.name()
+        );
+      }
+
+      // The typed `MakerNotesApple` is built ONLY for `-j` (the `-n` recompute
+      // discards it, so the isolated helper skips it — `None`, mirroring
+      // `canon_makernote_isolated`). In `-j` it must equal the oracle's; compare
+      // representative accessors across the surfaced shapes.
+      if print_conv {
+        let iso_typed = iso_typed.expect("print_conv=true must build the typed slot");
+        assert_eq!(
+          iso_typed, oracle_typed,
+          "the isolated typed MakerNotesApple must equal the oracle's (-j)"
+        );
+        assert_eq!(
+          iso_typed.hdr_image_type(),
+          Some(3),
+          "HDRImageType (0x000a) → typed accessor"
+        );
+        assert_eq!(
+          iso_typed.image_capture_type(),
+          Some(5),
+          "ImageCaptureType (0x0014) → typed accessor"
+        );
+        assert_eq!(
+          iso_typed.camera_type(),
+          Some(1),
+          "CameraType (0x002e) → typed accessor"
+        );
+        assert_eq!(
+          iso_typed.burst_uuid(),
+          Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"),
+          "BurstUUID (0x000b) out-of-line ASCII → typed accessor"
+        );
+      } else {
+        assert!(
+          iso_typed.is_none(),
+          "the -n recompute discards the typed slot (no wasted SmolStr allocation)"
+        );
+      }
+    }
+  }
+
+  /// Assert the oracle (`apple::parse_with_print_conv`) and the shared-`Walker`
+  /// isolated path (`apple_makernote_isolated`) emit BYTE-IDENTICAL
+  /// `(name, value, unknown)` streams — in order — for BOTH `-j` and `-n`, over
+  /// the SAME crafted Apple blob. The shared differential harness for the #243
+  /// phase 3 Apple R2 oracle-alignment edges (undef[1]→int8u / count-0 /
+  /// excessive-count): each edge crafts a blob, then `assert_apple_oracle_matches`
+  /// proves the now-aligned `walk_apple_body` oracle agrees with the FAITHFUL
+  /// shared Walker (the authority — Apple::Main IS processed by ProcessExif).
+  #[cfg(feature = "alloc")]
+  fn assert_apple_oracle_matches(blob: &[u8], parent_order: ByteOrder, label: &str) {
+    // The differential edges here are real-Apple-blob decode equivalences, so
+    // both paths run with the Apple Make ("Apple") — the format-16 carve-out is
+    // exercised by its own dedicated gate tests.
+    for print_conv in [true, false] {
+      let (_oracle_typed, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+        blob,
+        parent_order,
+        print_conv,
+        Some("Apple"),
+      );
+      let (iso_emissions, _iso_typed) =
+        apple_makernote_isolated(blob, parent_order, print_conv, Some("Apple"));
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "{label} print_conv={print_conv}: shared-Walker emission COUNT must match the \
+         aligned oracle"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "{label} print_conv={print_conv} leaf #{i}: NAME mismatch"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "{label} print_conv={print_conv} leaf #{i} ({}): VALUE mismatch — the aligned \
+           oracle must decode identically to the shared Walker",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "{label} print_conv={print_conv} leaf #{i} ({}): Unknown flag mismatch",
+          want.name()
+        );
+      }
+    }
+  }
+
+  /// #243 phase 3 Apple R2 [R2-1, FLAGGED] — the `undef[1]` → `int8u` carve-out
+  /// (`Exif.pm:6644` `$formatStr = 'int8u' if $format == 7 and $count == 1`). A
+  /// crafted Apple `RunTime` (0x0003) entry with on-disk format `undef` (7) and
+  /// count 1, inline byte `0x2a`, must decode as an INTEGER (`int8u` ⇒
+  /// `RawValue::U64([0x2a])`) in BOTH `walk_apple_body` (the now-aligned oracle)
+  /// AND the shared `Walker` — NOT a 1-byte `RawValue::Bytes` blob. Before the
+  /// alignment the oracle passed the on-disk `undef` through and decoded
+  /// `RawValue::Bytes([0x2a])`, while the shared Walker coerced to int8u — the
+  /// flagged divergence. Real Apple leaves are never `undef[1]`; this pins the
+  /// crafted-edge consistency.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_undef_count1_leaf_coerces_int8u_like_shared_walker() {
+    use crate::value::TagValue;
+    // 0x0003 RunTime, on-disk format undef (7), count 1, inline byte 0x2a.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[(0x0003, 7, 1, &[0x2a], &[])];
+    let blob = crafted_apple_blob(entries);
+
+    // The oracle body walker's RAW shape — the truest expression of the
+    // carve-out: a single `undef` byte becomes `int8u` (`RawValue::U64`), not
+    // `RawValue::Bytes`. (`body_offset = 14`, parent order irrelevant — the body
+    // marker `MM` governs.)
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert_eq!(walked.len(), 1, "one RunTime entry");
+    let raw = walked.get(0).expect("entry 0").value.raw();
+    match raw {
+      RawValue::U64(v) => assert_eq!(
+        v.as_slice(),
+        &[0x2a],
+        "undef[1] must coerce to int8u (RawValue::U64([0x2a])), got {raw:?}"
+      ),
+      other => panic!(
+        "undef[1] RunTime must decode as int8u (U64), NOT a 1-byte Bytes blob; got {other:?}"
+      ),
+    }
+
+    // RunTime's `ConvertPLIST` ValueConv is deferred (`to_default_tag_value`), so
+    // the int8u decode renders the scalar 0x2a (42) — a `Bytes` decode would
+    // render the raw-bytes shape, so the rendered value also distinguishes the
+    // two. `0x0003` is `Unknown => 0`, so it emits.
+    let (_t, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+      &blob,
+      ByteOrder::Big,
+      false,
+      Some("Apple"),
+    );
+    assert_eq!(oracle.len(), 1);
+    let e = oracle.get(0).expect("emission 0");
+    assert_eq!(e.name(), "RunTime");
+    assert_eq!(
+      e.value(),
+      &TagValue::I64(42),
+      "the int8u 0x2a renders as the scalar 42, not a bytes blob"
+    );
+
+    // BOTH paths agree, byte-identical, for -j and -n.
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "undef[1]→int8u");
+  }
+
+  /// #243 phase 3 Apple R2 — count-based value size (`Exif.pm:6502` `$size =
+  /// $count * $formatSize`, with the `:6285` count-0 expansion). A count-0
+  /// `HDRImageType` (0x000a) followed by a VALID `CameraType` (0x002e) leaf:
+  /// ExifTool reads `$count * $formatSize == 0` on-disk bytes, so `ReadValue`
+  /// returns the empty `$val` (`Exif.pm:6285-6288`) — the count-0 leaf decodes
+  /// EMPTY (`render_value` then drops it: a count-0 numeric is the empty string).
+  /// The now-aligned oracle passes the COUNT-based `total_size` (not an EOF-bound
+  /// `avail`), so it expands the SAME way as the shared Walker — instead of
+  /// re-deriving a bogus count from the trailing buffer. The following valid leaf
+  /// must STILL emit identically on both sides.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_count_zero_leaf_decodes_empty_like_shared_walker() {
+    use crate::value::TagValue;
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x000a HDRImageType — int32s, COUNT 0 (inline slot is the zero word).
+      (0x000a, 0x0009, 0, &[], &[]),
+      // 0x002e CameraType — int32s, count 1, value 1 ⇒ "Back Normal". VALID.
+      (0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+
+    // The oracle body walker decodes the count-0 entry to the empty numeric value
+    // (no trailing-buffer over-read): `read_value(.., count=0, size=0, ..)` ⇒
+    // `empty_value` (an empty `U64`/`I64`). The CameraType leaf decodes normally.
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert_eq!(
+      walked.len(),
+      2,
+      "both entries are walked (count-0 is not skipped)"
+    );
+    let hdr = walked.get(0).expect("entry 0 HDRImageType");
+    // Empty numeric ⇒ `first_i64()` is None (no element), proving NO trailing-byte
+    // over-read produced a spurious scalar.
+    assert_eq!(
+      hdr.value.first_i64(),
+      None,
+      "a count-0 int32s must decode EMPTY (no trailing-buffer over-read), got {:?}",
+      hdr.value.raw()
+    );
+
+    // In the emitted stream the count-0 HDRImageType renders as the empty string
+    // on BOTH paths (a count-0 numeric `$val` is `''`); the CameraType leaf is
+    // present. The two streams must be byte-identical.
+    let (_t, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+      &blob,
+      ByteOrder::Big,
+      false,
+      Some("Apple"),
+    );
+    assert_eq!(
+      oracle.len(),
+      2,
+      "both leaves emit (the count-0 leaf renders the empty string, not dropped)"
+    );
+    assert_eq!(oracle.get(0).expect("0").name(), "HDRImageType");
+    assert_eq!(
+      oracle.get(0).expect("0").value(),
+      &TagValue::Str("".into()),
+      "count-0 numeric renders the empty string"
+    );
+    assert_eq!(oracle.get(1).expect("1").name(), "CameraType");
+
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "count-0");
+  }
+
+  /// #243 phase 3 Apple R2 — the excessive-count `> 100000` guard
+  /// (`Exif.pm:6760-6770` `if ($count > 100000 and $formatStr !~
+  /// /^(undef|string|binary)$/) { next }`). A crafted `HDRHeadroom` (0x0021,
+  /// int32s) with count `200000` (> 100000, NOT undef/ascii) — placed IN-BOUNDS
+  /// (its out-of-line offset points at real appended bytes) — must be SKIPPED by
+  /// BOTH the now-aligned oracle AND the shared Walker, before the value is read.
+  /// A following VALID `CameraType` (0x002e) leaf must STILL emit on both sides.
+  /// Before the alignment the oracle decoded such an entry (a large allocation +
+  /// a leaked tag); the shared Walker has always applied the guard (ProcessExif
+  /// has no `$inMakerNotes` exemption for it).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_excessive_count_leaf_is_skipped_like_shared_walker() {
+    // 0x0021 HDRHeadroom int32s, count 200000 (> 100000). The out-of-line value
+    // region is FULLY IN-BOUNDS (200000 × 4 = 800000 real bytes appended), so the
+    // skip is driven by the excessive-count guard — NOT a coincidental OOB read —
+    // on BOTH paths (the shared Walker's offset bounds-check passes, then its
+    // excessive-count guard fires, exactly as the now-aligned oracle's does).
+    let big = std::vec![0u8; 200_000 * 4];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x0021, 0x0009, 200_000, &[], &big),
+      // 0x002e CameraType — int32s, count 1, value 1 ⇒ "Back Normal". VALID,
+      // emitted AFTER the guard-skipped excessive-count entry.
+      (0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+
+    // The oracle body walker skips ONLY the excessive-count entry; the following
+    // valid leaf survives.
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert_eq!(
+      walked.len(),
+      1,
+      "the excessive-count entry is guard-skipped; only the valid leaf walks"
+    );
+    assert_eq!(
+      walked.get(0).expect("entry 0").tag_id,
+      0x002e,
+      "the surviving leaf is the post-guard CameraType (the over-count HDRHeadroom \
+       was skipped, NOT decoded)"
+    );
+
+    // The emitted stream contains ONLY CameraType on both sides (HDRHeadroom is
+    // skipped before render). The two streams must be byte-identical.
+    let (_t, oracle) =
+      makernotes::vendors::apple::parse_with_print_conv(&blob, ByteOrder::Big, true, Some("Apple"));
+    assert_eq!(oracle.len(), 1, "only the valid CameraType leaf emits");
+    assert_eq!(oracle.get(0).expect("0").name(), "CameraType");
+    assert!(
+      !oracle.iter().any(|e| e.name() == "HDRHeadroom"),
+      "the excessive-count HDRHeadroom must NOT emit (guard-skipped)"
+    );
+
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "excessive-count");
+  }
+
+  /// The crafted blob carries the `Unknown=>1` `GreenGhostMitigationStatus`
+  /// (0x003F), and the differential stream INCLUDES it with `unknown=true` on BOTH
+  /// sides (the shared engine's `run_emission` is what drops it later — neither leaf
+  /// path pre-filters). Asserting it is present-and-flagged proves the unknown flag
+  /// flows identically (not silently dropped early by the new path).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_leaf_unknown_flag_flows_like_oracle() {
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x000a HDRImageType — a normal leaf so the stream is non-trivial.
+      (0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+      // 0x003F GreenGhostMitigationStatus — Unknown=>1.
+      (0x003F, 0x0009, 1, &[0x00, 0x00, 0x00, 0x07], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+    let emitted = drive_apple_subdir(&blob, ByteOrder::Big, true);
+    let ghost = emitted
+      .iter()
+      .find(|t| t.tag().name() == "GreenGhostMitigationStatus")
+      .expect("GreenGhostMitigationStatus (0x003F) must be emitted (pre-drop) by the new path");
+    assert!(
+      ghost.unknown(),
+      "GreenGhostMitigationStatus carries Unknown=>1 — the flag must ride the \
+       EmittedTag so run_emission drops it centrally, NOT a per-path pre-filter"
+    );
+  }
+
+  /// FIX (#243 phase 3 Apple R1/R4): the shared Walker's per-entry format gate
+  /// admits the BigTIFF `int64u` code 16 for an Apple maker-note entry
+  /// (`Exif.pm:6464` `not ($format == 16 and $$et{Make} eq 'Apple' and
+  /// $inMakerNotes)`) — including when that entry is INDEX 0, which would
+  /// otherwise be a `Bad format` entry-0-abort that loses the whole Apple walk
+  /// (silent metadata loss on Apple ProRAW DNG MakerNotes). This is the POSITIVE
+  /// case: the parent IFD0 Make IS `"Apple"` (passed to BOTH paths), so the
+  /// carve-out is active. It proves the shared-Walker isolated path emits the
+  /// SAME stream as the `apple::parse_with_print_conv` oracle (whose
+  /// `walk_apple_body` admits code 16 under the same `Make == Some("Apple")`
+  /// gate) for a blob with a format-16 entry BOTH at index 0 AND after a valid
+  /// entry — i.e. the gate neither skips the int64u entry nor aborts the
+  /// directory. The non-Apple-Make REJECTION is proven by
+  /// [`apple_format16_int64u_rejected_when_make_not_apple`].
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_format16_int64u_admitted_at_index0_and_after_valid() {
+    // int64u (format 16, 8 bytes) is always OUT-OF-LINE (> 4). Big-endian body.
+    // `v0` has its top bit set (> i64::MAX) so the no-PrintConv default keeps the
+    // exact `TagValue::U64` (render_value only narrows to I64 within i64 range) —
+    // proving a genuine 8-byte int64u decode, not a coincidental int32.
+    let v0 = 0x8899_AABB_CCDD_EEFFu64.to_be_bytes();
+    let v2 = 0x1122_3344_5566_7788u64.to_be_bytes();
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // INDEX 0 — 0x0005 AETarget (conv None), format 16 int64u. The carve-out
+      // must NOT abort the directory on this first entry.
+      (0x0005, 16, 1, &[], &v0),
+      // INDEX 1 — 0x000a HDRImageType, a VALID int32s entry (3 ⇒ "HDR Image").
+      (0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+      // INDEX 2 — 0x0006 AEAverage (conv None), format 16 int64u AFTER a valid
+      // entry. Admitted as a per-entry skip-or-decode, here decoded.
+      (0x0006, 16, 1, &[], &v2),
+    ];
+    let blob = crafted_apple_blob(entries);
+    let parent_order = ByteOrder::Big;
+
+    for print_conv in [true, false] {
+      // Make == "Apple" ⇒ the format-16 carve-out is ACTIVE on both paths.
+      let (_oracle_typed, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+        &blob,
+        parent_order,
+        print_conv,
+        Some("Apple"),
+      );
+      let (iso_emissions, _iso_typed) =
+        apple_makernote_isolated(&blob, parent_order, print_conv, Some("Apple"));
+
+      // The walk did NOT abort: all THREE leaves survive (the int64u index-0
+      // entry did not trigger the entry-0 directory abort, and neither int64u
+      // entry was skipped). The oracle (which accepts format 16) is the witness.
+      assert_eq!(
+        oracle.len(),
+        3,
+        "print_conv={print_conv}: oracle must emit all 3 leaves (int64u accepted, no abort)"
+      );
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "print_conv={print_conv}: the shared-Walker path must NOT skip the int64u \
+         entries or abort on the index-0 int64u (format-16 Apple carve-out)"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: NAME mismatch"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): VALUE mismatch — the int64u \
+           value must decode as U64 identically on both paths",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} leaf #{i} ({}): Unknown flag mismatch",
+          want.name()
+        );
+      }
+      // The decoded int64u value, surfaced as the no-PrintConv default U64.
+      let ae_target = iso_emissions
+        .iter()
+        .find(|e| e.name() == "AETarget")
+        .expect("AETarget (the index-0 int64u entry) must be emitted");
+      assert_eq!(
+        ae_target.value(),
+        &crate::value::TagValue::U64(0x8899_AABB_CCDD_EEFF),
+        "print_conv={print_conv}: the index-0 int64u value decodes via Format::Int64u"
+      );
+    }
+  }
+
+  /// FIX (#243 phase 3 Apple R4 [high]): the format-16 (`int64u`) carve-out is
+  /// gated on the PARENT IFD0 `Make` being exactly `"Apple"` — ExifTool's
+  /// `not ($format == 16 and $$et{Make} eq 'Apple' and $inMakerNotes)`
+  /// (`Exif.pm:6464`), NOT merely on the Apple MakerNote (`active_table == Apple`)
+  /// context. Apple MakerNote dispatch is SIGNATURE-based, so a crafted file with
+  /// an `"Apple iOS\0"`-signature blob but IFD0 Make != `"Apple"` reaches the gate;
+  /// for a non-Apple Make ExifTool classifies code 16 as a BAD format and, at
+  /// INDEX 0, ABORTS the directory ("assume corrupted IFD") — suppressing every
+  /// later leaf. This NEGATIVE case reuses the SAME blob/shape as the positive
+  /// [`apple_format16_int64u_admitted_at_index0_and_after_valid`] (format-16 at
+  /// index 0 + a VALID Apple leaf after it) but passes `make = Some("Nikon")`: BOTH
+  /// the shared-Walker isolated path AND the `parse_with_print_conv` oracle must
+  /// emit NOTHING — the index-0 bad-format abort suppresses the later valid leaf —
+  /// proving the Make gate (without it the index-0 code-16 would be admitted and
+  /// all leaves would survive, the R4 divergence).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_format16_int64u_rejected_when_make_not_apple() {
+    let v0 = 0x8899_AABB_CCDD_EEFFu64.to_be_bytes();
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // INDEX 0 — format 16 int64u. For a NON-Apple Make this is a BAD format at
+      // entry 0 ⇒ directory abort.
+      (0x0005, 16, 1, &[], &v0),
+      // INDEX 1 — a VALID 0x000a HDRImageType leaf that MUST be suppressed by the
+      // entry-0 abort (it would emit if the directory were not aborted).
+      (0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+    let parent_order = ByteOrder::Big;
+
+    // Sanity floor: with Make == "Apple" the SAME blob admits code 16 and emits
+    // BOTH leaves (the carve-out is active) — so any difference below is the Make
+    // gate, not the blob shape.
+    let walked_apple =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, parent_order, Some("Apple"));
+    assert_eq!(
+      walked_apple.len(),
+      2,
+      "Make=Apple admits code 16 at index 0 ⇒ both leaves survive (control)"
+    );
+
+    for print_conv in [true, false] {
+      // Non-Apple Make ⇒ code 16 is a BAD format; at index 0 the directory aborts.
+      let (_oracle_typed, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+        &blob,
+        parent_order,
+        print_conv,
+        Some("Nikon"),
+      );
+      let (iso_emissions, _iso_typed) =
+        apple_makernote_isolated(&blob, parent_order, print_conv, Some("Nikon"));
+
+      assert!(
+        oracle.is_empty(),
+        "print_conv={print_conv}: Make=Nikon ⇒ the index-0 format-16 entry is a bad \
+         format that aborts the directory; the oracle must emit NOTHING (incl. the \
+         later valid HDRImageType)"
+      );
+      assert!(
+        iso_emissions.is_empty(),
+        "print_conv={print_conv}: the shared-Walker path must ALSO abort at the \
+         index-0 format-16 entry when Make != Apple — the carve-out requires \
+         captured_make == Some(\"Apple\")"
+      );
+    }
+
+    // The oracle body walker, with a non-Apple Make, aborts at the index-0 code-16
+    // ⇒ NO surviving entries (the truest expression of the gate).
+    let walked_nikon =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, parent_order, Some("Nikon"));
+    assert!(
+      walked_nikon.is_empty(),
+      "Make=Nikon: the index-0 format-16 bad-format aborts the whole directory, got {walked_nikon:?}"
+    );
+    // A missing Make (None) is likewise NOT "Apple" ⇒ same abort.
+    let walked_none = makernotes::vendors::apple::walk_apple_body(&blob, 14, parent_order, None);
+    assert!(
+      walked_none.is_empty(),
+      "Make=None is not \"Apple\" ⇒ code 16 stays a bad format (index-0 abort), got {walked_none:?}"
+    );
+  }
+
+  /// #243 phase 3 Apple R3 [classification] — a BAD (nonzero unrecognized)
+  /// format code at ENTRY 0 ABORTS the whole Apple directory, exactly as the
+  /// shared `Walker` does (`Exif.pm:6475` `return 0`, "assume corrupted IFD if
+  /// this is our first entry"). A VALID leaf at index 1 must therefore emit
+  /// NOTHING on BOTH paths — the now-aligned `walk_apple_body` oracle aborts the
+  /// directory at the index-0 bad format just like `apple_makernote_isolated`'s
+  /// ProcessExif walk. Before the alignment the oracle merely skipped the bad
+  /// entry (`elem_size == 0 => continue`) and went on to emit the index-1 leaf —
+  /// the R3 divergence (finding 1).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_bad_format_at_index0_aborts_directory_like_shared_walker() {
+    // Entry 0: tag 0x000a, format 0x00ff (255 — unrecognized, NONZERO), count 1,
+    // inline. Entry 1: a VALID 0x002e CameraType (int32s, value 1). The crafted
+    // builder lays entries inline (both have `byte_size 0`/`<= 4` ⇒ inline).
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x000a, 0x00ff, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+      (0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+
+    // The oracle body walker ABORTS at the index-0 bad format ⇒ NO entries.
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert!(
+      walked.is_empty(),
+      "a bad format at entry 0 aborts the whole directory (no entries), got {walked:?}"
+    );
+
+    // Both emission paths produce an EMPTY stream — the index-1 CameraType is
+    // NOT salvaged (the directory was aborted before reaching it).
+    let (_t, oracle) =
+      makernotes::vendors::apple::parse_with_print_conv(&blob, ByteOrder::Big, true, Some("Apple"));
+    assert!(
+      oracle.is_empty(),
+      "the index-0 abort suppresses ALL leaves incl. the later valid CameraType"
+    );
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "bad-format-index0-abort");
+  }
+
+  /// #243 phase 3 Apple R3 [classification] — a BAD (nonzero unrecognized)
+  /// format code at a LATER index is a per-entry SKIP (`Exif.pm:6476`
+  /// `next if $index`), NOT a directory abort: the surrounding VALID leaves
+  /// survive on BOTH paths. Entry 0 valid, entry 1 bad format, entry 2 valid ⇒
+  /// the oracle and the shared `Walker` both emit the two valid leaves and skip
+  /// the bad one.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_bad_format_at_later_index_skips_one_like_shared_walker() {
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // INDEX 0 — VALID 0x000a HDRImageType (int32s, 3 ⇒ "HDR Image").
+      (0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]),
+      // INDEX 1 — BAD format 0x00ff (255, nonzero), SKIPPED (not index 0).
+      (0x0099, 0x00ff, 1, &[0x00, 0x00, 0x00, 0x00], &[]),
+      // INDEX 2 — VALID 0x002e CameraType (int32s, 1 ⇒ "Back Normal").
+      (0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]),
+    ];
+    let blob = crafted_apple_blob(entries);
+
+    // The oracle walks both valid leaves, skips ONLY the bad-format entry.
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert_eq!(
+      walked.len(),
+      2,
+      "the two valid leaves survive; only the bad-format entry is skipped: {walked:?}"
+    );
+    assert_eq!(walked.get(0).expect("0").tag_id, 0x000a);
+    assert_eq!(walked.get(1).expect("1").tag_id, 0x002e);
+
+    // Both emission streams contain exactly the two valid leaves.
+    let (_t, oracle) =
+      makernotes::vendors::apple::parse_with_print_conv(&blob, ByteOrder::Big, true, Some("Apple"));
+    assert_eq!(
+      oracle.len(),
+      2,
+      "HDRImageType + CameraType emit; the bad entry is skipped"
+    );
+    assert_eq!(oracle.get(0).expect("0").name(), "HDRImageType");
+    assert_eq!(oracle.get(1).expect("1").name(), "CameraType");
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "bad-format-later-skip");
+  }
+
+  /// #243 phase 3 Apple R3 [classification, finding 2] — a SUSPICIOUS out-of-line
+  /// offset (`$valuePtr < 8`, into the TIFF header — `Exif.pm:6539`; OR overlapping
+  /// the IFD directory — `Exif.pm:6549`) is a per-entry SKIP (`Exif.pm:6675`
+  /// "Suspicious offset" + `next`), NOT a decode. The now-aligned `walk_apple_body`
+  /// applies the SAME gate in blob-absolute coordinates (the Apple IFD start =
+  /// `14 + header_size`); a following VALID leaf survives on BOTH paths. Before the
+  /// alignment the oracle only bounds-checked the offset (it decoded a `< 8` or
+  /// IFD-overlapping value), diverging from the shared `Walker`.
+  ///
+  /// Builds the blob BY HAND so the out-of-line offset is forced to the suspicious
+  /// value (the auto-offset `crafted_apple_blob` cannot point into the header/IFD).
+  /// Two sub-cases: an offset of 4 (`< 8`) and an offset of 20 (overlaps the
+  /// 1-entry IFD `[16, 30)`); each is IN-BOUNDS (passes the EOF check) so the SKIP
+  /// is driven by the suspicious gate, not the bad-offset EOF gate.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_suspicious_offset_skips_one_like_shared_walker() {
+    // Build a 2-entry Apple body where entry 0 is an out-of-line rational64u
+    // (size 8 > 4) whose offset is `suspicious_off`, and entry 1 is a VALID inline
+    // CameraType. `ifd_start = 16`; with 2 entries `dir_end = 16 + 2 + 24 = 42`.
+    fn build(suspicious_off: u32) -> Vec<u8> {
+      let mut blob: Vec<u8> = Vec::new();
+      blob.extend_from_slice(b"Apple iOS\x00\x00\x01MM"); // 14-byte header
+      blob.extend_from_slice(b"MM"); // body marker
+      blob.extend_from_slice(&2u16.to_be_bytes()); // 2 entries
+      // Entry 0 — tag 0x0008 AccelerationVector, rational64s (10), count 1,
+      // OUT-OF-LINE offset = suspicious_off.
+      blob.extend_from_slice(&0x0008u16.to_be_bytes());
+      blob.extend_from_slice(&0x000au16.to_be_bytes()); // rational64s
+      blob.extend_from_slice(&1u32.to_be_bytes()); // count 1 ⇒ size 8 > 4
+      blob.extend_from_slice(&suspicious_off.to_be_bytes());
+      // Entry 1 — tag 0x002e CameraType, int32s (9), count 1, INLINE value 1.
+      blob.extend_from_slice(&0x002eu16.to_be_bytes());
+      blob.extend_from_slice(&0x0009u16.to_be_bytes());
+      blob.extend_from_slice(&1u32.to_be_bytes());
+      blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+      blob.extend_from_slice(&0u32.to_be_bytes()); // next-IFD = 0
+      // Trailing value region so an in-bounds (but suspicious) offset+8 fits.
+      blob.extend_from_slice(&[0u8; 16]);
+      blob
+    }
+
+    // Sub-case 1: offset 4 (`< 8`). Sub-case 2: offset 20 (overlaps IFD [16,42)).
+    for (suspicious_off, label) in [(4u32, "off<8"), (20u32, "overlaps-ifd")] {
+      let blob = build(suspicious_off);
+      let walked =
+        makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+      assert_eq!(
+        walked.len(),
+        1,
+        "{label}: the suspicious-offset entry is skipped; only the valid CameraType \
+         survives, got {walked:?}"
+      );
+      assert_eq!(
+        walked.get(0).expect("0").tag_id,
+        0x002e,
+        "{label}: the surviving leaf is CameraType (the suspicious AccelerationVector \
+         was skipped, not decoded)"
+      );
+      let (_t, oracle) = makernotes::vendors::apple::parse_with_print_conv(
+        &blob,
+        ByteOrder::Big,
+        true,
+        Some("Apple"),
+      );
+      assert_eq!(oracle.len(), 1, "{label}: only CameraType emits");
+      assert_eq!(oracle.get(0).expect("0").name(), "CameraType");
+      assert!(
+        !oracle.iter().any(|e| e.name() == "AccelerationVector"),
+        "{label}: the suspicious-offset AccelerationVector must NOT emit"
+      );
+      assert_apple_oracle_matches(&blob, ByteOrder::Big, label);
+    }
+  }
+
+  /// #243 phase 3 Apple R3 [classification, next-steps] — the warn-count abort
+  /// (`Exif.pm:6455-6456` `if ($warnCount > 10) { Warn('Too many warnings');
+  /// return 0 }`). Eleven consecutive bad-format entries (each `++$warnCount`)
+  /// push the count to 11; the next entry trips the abort BEFORE it is processed,
+  /// so a VALID leaf placed after them emits NOTHING. The now-aligned
+  /// `walk_apple_body` mirrors the same per-entry warn cap as
+  /// `apple_makernote_isolated`'s ProcessExif walk. A valid leaf at index 0
+  /// (before any warning) emits on BOTH paths.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn apple_warn_count_abort_after_eleven_warnings_like_shared_walker() {
+    // Index 0: VALID 0x000a HDRImageType (emits). Indices 1..=11: bad nonzero
+    // format 0x00ff (each warns + counts; skipped, not index 0). Index 12: a VALID
+    // 0x002e CameraType that must NOT emit (warn_count == 11 > 10 aborts first).
+    let mut entries: Vec<(u16, u16, u32, &[u8], &[u8])> = Vec::new();
+    entries.push((0x000a, 0x0009, 1, &[0x00, 0x00, 0x00, 0x03], &[]));
+    for _ in 0..11 {
+      entries.push((0x0099, 0x00ff, 1, &[0x00, 0x00, 0x00, 0x00], &[]));
+    }
+    entries.push((0x002e, 0x0009, 1, &[0x00, 0x00, 0x00, 0x01], &[]));
+    let blob = crafted_apple_blob(&entries);
+
+    // The oracle walks index 0 (HDRImageType), skips+counts indices 1..=11, then
+    // aborts at index 12 BEFORE the CameraType — so ONLY HDRImageType survives.
+    let walked =
+      makernotes::vendors::apple::walk_apple_body(&blob, 14, ByteOrder::Big, Some("Apple"));
+    assert_eq!(
+      walked.len(),
+      1,
+      "only the pre-warning HDRImageType survives; the >10-warning abort suppresses \
+       the trailing CameraType, got {walked:?}"
+    );
+    assert_eq!(walked.get(0).expect("0").tag_id, 0x000a);
+
+    let (_t, oracle) =
+      makernotes::vendors::apple::parse_with_print_conv(&blob, ByteOrder::Big, true, Some("Apple"));
+    assert_eq!(
+      oracle.len(),
+      1,
+      "only HDRImageType emits (the warn-count abort)"
+    );
+    assert_eq!(oracle.get(0).expect("0").name(), "HDRImageType");
+    assert!(
+      !oracle.iter().any(|e| e.name() == "CameraType"),
+      "the trailing CameraType is suppressed by the >10-warning directory abort"
+    );
+    assert_apple_oracle_matches(&blob, ByteOrder::Big, "warn-count-abort");
+  }
+
+  /// The group OVERRIDE is scoped to the Apple table too: `vendor_group1_of` is
+  /// `Some(\"Apple\")` for `Apple` (so an Apple leaf emits as `Apple:*`) — phase 3
+  /// of the engine migration (#243).
+  #[test]
+  fn vendor_group1_override_includes_apple() {
+    assert_eq!(vendor_group1_of(TableRef::Apple), Some("Apple"));
   }
 
   // ====================================================================// Canon engine migration — Step B1 differential test (#243 phase 2)
