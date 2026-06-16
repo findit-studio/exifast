@@ -65,7 +65,7 @@ use std::vec::Vec;
 
 pub use body::{HEADER_LEN, PanasonicEntry, walk_panasonic_body, walk_panasonic_in_tiff};
 pub use printconv::{CONDITION_GATED_IDS, PanasonicPrintConv, RAWCONV_DROP_IDS};
-pub use tags::{PANASONIC_TAGS, PanasonicTag, SubTable, lookup};
+pub use tags::{PANASONIC_TAGS, PanasonicTag, SubTable, format_override, lookup};
 
 use super::super::super::ifd::{ByteOrder, RawValue};
 
@@ -713,7 +713,7 @@ pub fn parse_in_tiff(
       // `Some(v)` ⇒ emit the byte-swapped value; `None` ⇒ RawConv undef-drop
       // (zero value) ⇒ no emission for this entry.
       if let Some(value) = PanasonicPrintConv::apply_lens_type_model(&entry.value, print_conv) {
-        populate_typed(&mut typed, entry, &value);
+        populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
         emissions.push(VendorEmission::new(def.name.into(), value, def.unknown));
       }
       continue;
@@ -726,7 +726,7 @@ pub fn parse_in_tiff(
       _ => def.conv,
     };
     let value = conv.apply(&entry.value, print_conv);
-    populate_typed(&mut typed, entry, &value);
+    populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
     // Carry the bundled `Unknown => 1` flag through the emission so the
     // shared `run_emission` engine suppresses it from default output —
     // exactly like Apple/Canon (only 0x63 RecognizedFaceFlags is Unknown).
@@ -773,9 +773,25 @@ pub fn parse_into_metadata(
   }
 }
 
-/// Populate the typed struct with the parsed value for `entry`.
-fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: &TagValue) {
-  match entry.tag_id {
+/// Populate the typed struct from one Panasonic Main-IFD leaf-tag emission.
+/// `raw` is the entry's post-Format-decode [`RawValue`]; `val` the
+/// already-rendered [`TagValue`] (read by the 0x02/0x25/0x26/0x8000 string
+/// fields).
+///
+/// MUST be called ONLY for an entry that PASSED every suppression gate (the
+/// oracle [`parse_in_tiff`] calls it AFTER the SubDirectory-skip / single-HASH /
+/// RawConv-drop / 0xc5/0xe4-undef-drop checks, alongside the emission) — a
+/// rawconv-dropped 0xd1, for instance, must populate NOTHING. The
+/// shared-`Walker` Panasonic capture (`exif::mod::emit_panasonic_value`)
+/// preserves that ordering by calling this from the SAME gate-passing path it
+/// emits from (#243 phase 3).
+pub(crate) fn populate_typed(
+  typed: &mut MakerNotesPanasonic,
+  tag_id: u16,
+  raw: &RawValue,
+  val: &TagValue,
+) {
+  match tag_id {
     0x02 => {
       // FirmwareVersion — already PrintConv'd to dotted string.
       if let TagValue::Str(s) = val {
@@ -798,7 +814,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x51 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
+      if let RawValue::Text { text: s, .. } = raw {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.lens_type = Some(trimmed.into());
@@ -806,7 +822,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x52 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
+      if let RawValue::Text { text: s, .. } = raw {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.lens_serial_number = Some(trimmed.into());
@@ -814,7 +830,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x53 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
+      if let RawValue::Text { text: s, .. } = raw {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.accessory_type = Some(trimmed.into());
@@ -822,7 +838,7 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x54 => {
-      if let RawValue::Text { text: s, .. } = &entry.value {
+      if let RawValue::Text { text: s, .. } = raw {
         let trimmed = s.trim_end_matches([' ', '\0']);
         if !trimmed.is_empty() {
           typed.accessory_serial_number = Some(trimmed.into());
@@ -830,30 +846,30 @@ fn populate_typed(typed: &mut MakerNotesPanasonic, entry: &PanasonicEntry, val: 
       }
     }
     0x1a => {
-      typed.image_stabilization = first_i64(&entry.value);
+      typed.image_stabilization = first_i64(raw);
     }
     0x42 => {
-      typed.film_mode = first_i64(&entry.value);
+      typed.film_mode = first_i64(raw);
     }
     0x89 => {
-      typed.photo_style = first_i64(&entry.value);
+      typed.photo_style = first_i64(raw);
     }
     0x1f => {
-      typed.shooting_mode = first_i64(&entry.value);
+      typed.shooting_mode = first_i64(raw);
     }
     0x32 => {
-      typed.color_mode = first_i64(&entry.value);
+      typed.color_mode = first_i64(raw);
     }
     0x28 => {
-      typed.color_effect = first_i64(&entry.value);
+      typed.color_effect = first_i64(raw);
     }
     0x90 => {
       // RollAngle — int16s / 10 (`Panasonic.pm:1205`).
-      typed.roll_angle = first_i64(&entry.value).map(|n| n as f64 / 10.0);
+      typed.roll_angle = first_i64(raw).map(|n| n as f64 / 10.0);
     }
     0x91 => {
       // PitchAngle — -int16s / 10 (`Panasonic.pm:1213`).
-      typed.pitch_angle = first_i64(&entry.value).map(|n| -(n as f64) / 10.0);
+      typed.pitch_angle = first_i64(raw).map(|n| -(n as f64) / 10.0);
     }
     _ => {}
   }

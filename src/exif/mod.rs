@@ -535,6 +535,21 @@ enum ResolvedConv {
   /// [`emit_sony_value`] (NOT `emit_entry`) because of those gates + the in-IFD
   /// af_area thread.
   Sony(&'static makernotes::vendors::sony::tags::SonyTag),
+  /// A Panasonic maker-note leaf (`%Panasonic::Main` descriptor). Carries the
+  /// resolved [`PanasonicTag`](makernotes::vendors::panasonic::tags::PanasonicTag)
+  /// so the emit reapplies its
+  /// [`PanasonicPrintConv`](makernotes::vendors::panasonic::printconv::PanasonicPrintConv)
+  /// — with the model-conditional 0x0f AFAreaMode / 0x2c ContrastMode branch
+  /// selection — and the per-entry suppression gates (SubDirectory skip, the
+  /// `$format`-gated single-HASH `Condition` rows 0xc4/0xc5/0xe4, the 0x86/0xd1
+  /// RawConv sentinel drop, the 0xc5/0xe4 LensTypeModel zero-drop) the retired
+  /// `parse_in_tiff` applied at collection time (`panasonic/mod.rs:660-734`).
+  /// Like Sony, the per-leaf render lives in [`emit_panasonic_value`] (NOT
+  /// `emit_entry`) because of those gates; the shared `Walker` walks the
+  /// Panasonic Main IFD under `active_table == Panasonic` reproducing
+  /// `walk_panasonic_in_tiff` — including the DC-FT7 `Base => 12` out-of-line
+  /// shift via [`value_offset_base`](Walker::value_offset_base) (#243 phase 3).
+  Panasonic(&'static makernotes::vendors::panasonic::tags::PanasonicTag),
 }
 
 impl ResolvedConv {
@@ -552,6 +567,7 @@ impl ResolvedConv {
       ResolvedConv::Canon(_) => vendor_group1_of(TableRef::Canon),
       ResolvedConv::Apple(_) => vendor_group1_of(TableRef::Apple),
       ResolvedConv::Sony(_) => vendor_group1_of(TableRef::Sony),
+      ResolvedConv::Panasonic(_) => vendor_group1_of(TableRef::Panasonic),
     }
   }
 }
@@ -582,14 +598,22 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // `("MakerNotes","Sony")` (`Sony.pm:710` declares only `GROUPS => { 0 =>
     // 'MakerNotes' }`, so ExifTool derives family-1 from the vendor module).
     TableRef::Sony => Some("Sony"),
+    // `%Panasonic::Main` — phase 3 of the engine migration (#243). A Panasonic
+    // maker-note leaf emits under the `Panasonic` family-1 group, exactly as
+    // `parse_in_tiff` + `push_maker_note_tags` push every Panasonic
+    // `VendorEmission` under `("MakerNotes","Panasonic")` (`Panasonic.pm:268`
+    // declares only `GROUPS => { 0 => 'MakerNotes', … }`, so ExifTool derives
+    // family-1 from the vendor module — `exiftool -j -G1` emits
+    // `Panasonic:ImageQuality` on a Lumix). The cross-table Leica1/Leica10 routes
+    // (`Vendor::Leica`) ALSO emit `Panasonic:*` (their tags ARE `%Panasonic::Main`
+    // tags); that dispatch arm keeps its own `parse_leica*_gated` oracle and
+    // overrides `emission_group1` to `Panasonic` directly.
+    TableRef::Panasonic => Some("Panasonic"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
     // tables never reach the emit through this walker.
-    TableRef::Exif
-    | TableRef::Gps
-    | TableRef::Interop
-    | TableRef::Panasonic
-    | TableRef::Nikon
-    | TableRef::Samsung => None,
+    TableRef::Exif | TableRef::Gps | TableRef::Interop | TableRef::Nikon | TableRef::Samsung => {
+      None
+    }
   }
 }
 
@@ -772,17 +796,25 @@ impl MakerNoteValueConvDecode<'_> {
         model,
         base_rule,
       } => {
-        panasonic::parse_main_gated(
+        // The `-n` recompute is the isolated walk with `print_conv = false` and the
+        // typed slot discarded (the `-n` path needs only the ValueConv emissions),
+        // mirroring `canon_recompute_value_conv` (#243 phase 3). The `base_rule` →
+        // out-of-line-offset addend (the DC-FT7 `Base => 12` shift) is resolved the
+        // SAME way the `-j` dispatch resolved it (`main_base_offset`). The route
+        // matched in PrintConv ⇒ it matches in ValueConv (same `routes_to_main`
+        // gate, PrintConv-independent), so `Some` always holds; `unwrap_or_default`
+        // is the defensive empty `Vec` for the impossible `None`.
+        panasonic_makernote_isolated(
           data,
           *mn_offset,
           *mn_len,
+          panasonic::main_base_offset(*base_rule),
           *order,
-          false,
           model.as_deref(),
-          *base_rule,
+          false,
         )
-        .expect("routes_to_main is deterministic across print_conv")
-        .1
+        .map(|(e, _)| e)
+        .unwrap_or_default()
       }
       MakerNoteValueConvDecode::Leica1 {
         data,
@@ -1955,6 +1987,8 @@ fn parse_tiff_with_base_no_raf<'a>(
     data,
     order,
     base,
+    // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
@@ -2096,6 +2130,8 @@ fn parse_bigtiff<'a>(
     data,
     order,
     base,
+    // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
@@ -2267,6 +2303,8 @@ fn parse_tiff_with_base_shared<'a>(
     data,
     order,
     base,
+    // Core / inherit-base walk — child `$dataPos == 0`, no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     warnings: Vec::new(),
     warnings_ignorable: Vec::new(),
@@ -2396,6 +2434,22 @@ struct Walker<'a, 'g> {
   /// (set non-zero only for relative-base maker notes — out of scope), so we
   /// thread the single `$base` value.
   base: u32,
+  /// The OUT-OF-LINE value-offset addend — ExifTool's `$base - $subdirBase`
+  /// shift expressed in the port's buffer coordinates (the negative of the
+  /// child `$dataPos`, `Exif.pm:6546`/`:7040`). The `size > 4` value pointer
+  /// `off` resolves to `data[off + value_offset_base]`. It is `0` for every core
+  /// IFD and every INHERIT-base maker note (data IS the parent TIFF, child
+  /// `$dataPos == 0`), so the existing walks are byte-identical; it is the
+  /// SubDirectory `Base => N` literal for a relative-base maker note — `12` for
+  /// the `MakerNotePanasonic3` DC-FT7 (`Base => 12`, `MakerNotes.pm:758`),
+  /// reproducing `walk_panasonic_in_tiff`'s `off + base_offset` (`panasonic/
+  /// body.rs:150`). This is the value-pointer base the `process_subdir`
+  /// `fix_base` hook anticipated threading (`base/data_pos mutation … applied by
+  /// the Phase-2 vendor migration`); the Panasonic isolated walk is its first
+  /// user (#243 phase 3). INLINE values (`size <= 4`) carry no pointer and are
+  /// NEVER shifted (`Exif.pm:6504`). DISTINCT from [`base`](Self::base) (the
+  /// `IsOffset` file-offset addend, which Panasonic Main never uses).
+  value_offset_base: usize,
   /// Every emitted tag, in walk order (owned).
   entries: Vec<ExifEntry>,
   /// `$et->Warn(...)` messages collected during the walk, in emission
@@ -3413,6 +3467,10 @@ impl Walker<'_, '_> {
       // tag yields `None` (the unknown-tag warning form), matching
       // `parse_in_tiff`'s `tags::lookup(...).is_none()` skip.
       TableRef::Sony => makernotes::vendors::sony::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Panasonic::Main` — phase 3 of the engine migration (#243). An unknown
+      // Panasonic tag yields `None` (the unknown-tag warning form), matching
+      // `parse_in_tiff`'s `tags::lookup(...).is_none()` skip.
+      TableRef::Panasonic => makernotes::vendors::panasonic::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -3564,15 +3622,28 @@ impl Walker<'_, '_> {
         self.warn_counted(std::format!("Invalid size ({size}) for {dir} {tag}"));
         return Step::Skip; // `next` — skip this entry, continue the IFD.
       }
-      let off = match get_u32(data, entry + 8, order) {
+      let raw_off = match get_u32(data, entry + 8, order) {
         Some(o) => o as usize,
         // Unreadable offset bytes (unreachable given the caller's `entry+12`
         // bounds guard) — a `next`-skip.
         None => return Step::Skip,
       };
-      // `$valuePtr -= $dataPos` — `$dataPos == 0` here (the whole block IS
-      // the EXIF data). An out-of-line value pointer is subject to two
-      // ExifTool bounds checks, in this precedence:
+      // `$valuePtr -= $dataPos` (`Exif.pm:6546`). For a core IFD / inherit-base
+      // maker note `$dataPos == 0` (the whole block IS the EXIF data) and
+      // `value_offset_base == 0`, so the pointer is `raw_off` unchanged. For a
+      // relative-base maker note (`MakerNotePanasonic3` `Base => 12`) the
+      // SubDirectory shifted `$dataPos` by `$base - $subdirBase` (`Exif.pm:7040`),
+      // which in the port's buffer coordinates ADDS the `Base` literal — so the
+      // resolved pointer is `raw_off + value_offset_base` (`= raw_off + 12`),
+      // reproducing `walk_panasonic_in_tiff`'s `abs_off` (`panasonic/body.rs:150`).
+      // The shift is applied HERE, BEFORE every bounds check, exactly as ExifTool
+      // resolves `$valuePtr` before the `:6549` EOF / `:6675` suspect tests. A
+      // `saturating_add` keeps a degenerate `raw_off`/base near `usize::MAX` from
+      // wrapping the checks below (it lands past EOF ⇒ the read/bad-offset arm,
+      // never a low-address false pass).
+      let off = raw_off.saturating_add(self.value_offset_base);
+      // An out-of-line value pointer is subject to two ExifTool bounds checks, in
+      // this precedence:
       //
       //   1. `$valuePtr < 0 or $valuePtr + $size > $dataLen` ⇒ ExifTool
       //      reads the value from the file via `$raf` (Exif.pm:6549-6611).
@@ -3847,6 +3918,18 @@ impl Walker<'_, '_> {
       // Resolving them here keeps the shared-Walker walk byte-identical to the
       // retired `sony::parse_in_tiff` oracle for those six tags (#243 phase 3).
       TableRef::Sony => makernotes::vendors::sony::format_override(tag_id),
+      // `%Panasonic::Main` carries its OWN `Format =>` directives (MANY rows are
+      // `Writable => 'int16u'` but `Format => 'int16s'` so the on-disk unsigned
+      // bytes are read SIGNED — 0x23 WhiteBalanceBias `ff fd` ⇒ -3 ⇒ -1, not
+      // 65533 — plus the int32u-from-rational rows FilterEffect 0xa1 /
+      // PostFocusMerging 0xbf and the int16s pairs Transform/HighlightShadow,
+      // `Panasonic.pm`). ExifTool's `ProcessExif` reads the override off the ACTIVE
+      // `$tagTablePtr` (`Exif.pm:6729`), so the Panasonic table's directives apply
+      // on a Panasonic Main walk — reproducing `walk_panasonic_in_tiff`'s
+      // `resolve_read_format` step (`panasonic/body.rs:163-164`). Resolving them
+      // here keeps the shared-Walker walk byte-identical to the retired
+      // `panasonic::parse_in_tiff` oracle for those rows (#243 phase 3).
+      TableRef::Panasonic => makernotes::vendors::panasonic::format_override(tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -4795,22 +4878,43 @@ impl Walker<'_, '_> {
               // `MakerNotePanasonic2` (`:743`, "MKE") is a DIFFERENT structure
               // — `Panasonic::Type2` is a `ProcessBinaryData` table
               // (`Panasonic.pm:2259`), NOT an IFD over `%Panasonic::Main` — so
-              // the Main parser must NOT run on it. Both the `Panasonic`-prefix
-              // gate and the `base_rule` → out-of-line-offset-addend threading
-              // (`BaseRule::Inherit` ⇒ 0 vs `BaseRule::Literal(12)` ⇒ 12;
-              // a base-0 read of a DC-FT7 value lands 12 bytes early ⇒
-              // corruption) live in `panasonic::parse_main_gated`: it returns
-              // `None` for the `MKE`/Type2 blob (Panasonic slot stays absent;
-              // Type2 BinaryData is unported/deferred). This is the SAME gated
-              // entry the public `MakerNotesMeta::from_blob` constructor uses,
-              // so the gate cannot be bypassed by a parallel code path.
+              // the Main parser must NOT run on it.
+              //
+              // Walk the Panasonic Main IFD in a FRESH, ISOLATED `Walker`
+              // ([`panasonic_makernote_isolated`]) — NOT on `self` — then capture
+              // its emissions into the cached-emission buffer (#243 phase 3,
+              // structural isolation, mirroring Apple/Canon/Sony). The isolated
+              // walk builds its own `Walker` over `self.data` (the Panasonic Main
+              // IFD at `mn_offset + HEADER_LEN`), walks under
+              // `TableRef::Panasonic`, and DISCARDS its `warnings` / `warn_count` /
+              // `active_ifd_offsets` — so a malformed Panasonic entry cannot leak a
+              // core `ExifTool:Warning`, abort the parent ExifIFD's warn-count, or
+              // be suppressed by the parent's ancestor cycle guard. The
+              // `routes_to_main` variant gate runs INSIDE the helper (FIRST),
+              // returning `None` for the `MKE`/Type2 blob (Panasonic slot stays
+              // absent — Type2 BinaryData is unported/deferred). The `base_rule`
+              // distinguishes the inherit base (0) from DC-FT7's `Base => 12`
+              // (`main_base_offset`); it is threaded into the Walker's
+              // `value_offset_base` so a DC-FT7 out-of-line value resolves at `off +
+              // 12` (a base-0 read would land 12 bytes early ⇒ corruption). This is
+              // the SAME gated route the public `MakerNotesMeta::from_blob`
+              // constructor uses, so the gate cannot be bypassed by a parallel code
+              // path. `print_conv = true` yields the cached `-j` emissions + the
+              // typed `MakerNotesPanasonic`; the `-n` emissions are recomputed on
+              // demand via the SAME helper with `print_conv = false`.
               makernotes::Vendor::Panasonic => {
                 let mn_offset = value_offset;
                 let mn_len = read_len;
                 let model = self.captured_model.as_deref();
                 let base_rule = detected.base_rule();
-                if let Some((typed_pc, emi_pc)) = makernotes::vendors::panasonic::parse_main_gated(
-                  self.data, mn_offset, mn_len, self.order, true, model, base_rule,
+                if let Some((emi_pc, typed_pc)) = panasonic_makernote_isolated(
+                  self.data,
+                  mn_offset,
+                  mn_len,
+                  makernotes::vendors::panasonic::main_base_offset(base_rule),
+                  self.order,
+                  model,
+                  true,
                 ) {
                   meta.set_panasonic(typed_pc);
                   cached_pc = emi_pc;
@@ -5179,6 +5283,16 @@ impl Walker<'_, '_> {
       // `continue`.
       TableRef::Sony => match makernotes::vendors::sony::tags::lookup(tag_id) {
         Some(t) => (t.name(), ResolvedConv::Sony(t)),
+        None => return,
+      },
+      // `%Panasonic::Main` — phase 3 of the engine migration (#243). The resolved
+      // [`PanasonicTag`] rides in `ResolvedConv::Panasonic` so the emit
+      // ([`emit_panasonic_value`]) reapplies its `PanasonicPrintConv` + per-entry
+      // suppression gates exactly as `parse_in_tiff` does at collection time
+      // (`panasonic/mod.rs`). An unknown Panasonic tag is skipped here, matching
+      // `parse_in_tiff`'s `tags::lookup(...).is_none()` `continue`.
+      TableRef::Panasonic => match makernotes::vendors::panasonic::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Panasonic(t)),
         None => return,
       },
       _ => match tables::lookup(tag_id) {
@@ -6193,6 +6307,20 @@ fn emit_entry<S: ExifSink>(
       let group1 = entry.conv.vendor_group1().unwrap_or(group);
       emit_sony_value(group1, entry, sony_tag, model, None, print_conv, None, out)
     }
+    // `%Panasonic::Main` vendor leaf (#243 phase 3). Production routes a Panasonic
+    // Main walk through the DEDICATED capture loop in [`panasonic_makernote_isolated`],
+    // which calls [`emit_panasonic_value`] directly (the per-entry gates need the
+    // entry's on-disk format + the threaded model). `emit_entry` is therefore NOT
+    // the Panasonic capture path — but the match must be exhaustive, and no
+    // core-IFD walk produces a `ResolvedConv::Panasonic` entry (Panasonic leaves
+    // exist only under `active_table == Panasonic`, set solely by the isolated
+    // Panasonic walk). This arm is a panic-free fallback that renders every
+    // Panasonic leaf faithfully (the gates + 0x0f/0x2c model branch are reached the
+    // same way; the `model` is threaded, the typed sink is `None`).
+    ResolvedConv::Panasonic(panasonic_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      emit_panasonic_value(group1, entry, panasonic_tag, model, print_conv, None, out)
+    }
   }
 }
 
@@ -6357,6 +6485,120 @@ fn emit_sony_value<S: ExifSink>(
     sony_tag.name(),
     value,
     sony_tag.is_unknown(),
+  )
+}
+
+/// Render ONE Panasonic maker-note leaf into the sink — the emit-time
+/// reproduction of `panasonic::parse_in_tiff`'s per-tag emit loop
+/// (`panasonic/mod.rs:660-734`) through the shared `Walker` (#243 phase 3).
+///
+/// Like Sony, each `%Panasonic::Main` entry passes a chain of per-entry
+/// suppression gates that reproduce ExifTool's `GetTagInfo` / `Condition` /
+/// `RawConv` outcome (an absent tag, NOT a raw fallback). This emit reproduces,
+/// in `parse_in_tiff` order:
+///
+/// 1. **SubDirectory skip** — a row with a `sub_table` (FaceDetInfo 0x4e /
+///    FaceRecInfo 0x61 / PrintIM 0x0e00 / TimeInfo 0x2003) DESCENDS into a child
+///    table and never emits the parent pointer as a value; Phase 3 defers the
+///    child walk, so NEITHER parent nor children emit (`Exif.pm:7103-7104`).
+/// 2. **Single-HASH `Condition` suppression** — the `$format`-gated LensType rows
+///    0xc4/0xc5/0xe4 are dropped when `$format ne "int16u"` (and 0xc4 also drops
+///    the `0xffff` `$$valPt` sentinel), read off [`ExifEntry::on_disk_format`].
+/// 3. **RawConv sentinel drop** — 0x86 ManometerPressure (`$val==65535`) and 0xd1
+///    ISO (`$val > 0xfffffff0`) are suppressed on the RAW value.
+/// 4. **0xc5 / 0xe4 LensTypeModel** — `RawConv => 'return undef unless $val'`
+///    drops a ZERO value (absent), else emits the byte-swap conv; rendered via
+///    [`apply_lens_type_model`](makernotes::vendors::panasonic::printconv::PanasonicPrintConv::apply_lens_type_model)
+///    (`Some` ⇒ emit, `None` ⇒ drop).
+/// 5. **Model-conditional conv** — 0x0f AFAreaMode (FZ10 vs other) and 0x2c
+///    ContrastMode (PrintHex / GF-G2 / TZ10-ZS7 / raw) select their branch by
+///    `$$self{Model}`; every other leaf uses the table's default conv.
+/// 6. **Emit** — `write_vendor_value("MakerNotes", group1, …)` carrying the row's
+///    `Unknown=>1` flag (dropped ONCE by `run_emission`, like Apple/Canon/Sony).
+///
+/// A skipped gate writes NOTHING AND populates no typed field — the faithful port
+/// of ExifTool's absent-tag behaviour. `model` is the parent `$$self{Model}`.
+///
+/// `typed` is the optional sink for the
+/// [`populate_typed`](makernotes::vendors::panasonic::populate_typed) step —
+/// `Some` only for the production capture (which builds the typed
+/// `MakerNotesPanasonic` from the SAME gate-passing entries the oracle does, so a
+/// gated tag like a rawconv-dropped 0xd1 populates NEITHER the emission NOR a
+/// typed field). The `emit_entry` defensive arm passes `None`. Unlike Sony,
+/// Panasonic's gates read the entry's on-disk format + raw value (NOT the model),
+/// and there is no in-IFD DataMember thread.
+// Threads the full render context (entry, the resolved `PanasonicTag`, the model
+// gate input, the PrintConv mode, the optional typed sink, and the emit sink).
+// Bundling them into a struct would obscure the 1:1 mapping to `parse_in_tiff`'s
+// collection-time gates, not clarify it — the sibling `emit_sony_value`/`emit_entry`
+// carry the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+fn emit_panasonic_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  panasonic_tag: &makernotes::vendors::panasonic::tags::PanasonicTag,
+  model: Option<&str>,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::panasonic::MakerNotesPanasonic>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::panasonic::{PanasonicPrintConv, populate_typed};
+  let tag_id = entry.tag_id;
+  let raw = entry.value.raw();
+  // Step 1 — deferred SubDirectory row: emit NEITHER parent nor children.
+  if panasonic_tag.sub_table.is_some() {
+    return Ok(());
+  }
+  // Step 2 — single-HASH `Condition` suppression (0xc4/0xc5/0xe4 LensType rows).
+  // Reads the ON-DISK format (the `$format` ExifTool's `Condition` reads, NOT the
+  // post-override format) retained on the walked entry, + the RAW value (the
+  // 0xc4 `$$valPt ne "\xff\xff"` test).
+  if !PanasonicPrintConv::single_hash_condition_holds(tag_id, entry.on_disk_format.name(), raw) {
+    return Ok(());
+  }
+  // Step 3 — RawConv sentinel drop (0x86/0xd1; tests the RAW, pre-conv value).
+  if PanasonicPrintConv::rawconv_drops(tag_id, raw) {
+    return Ok(());
+  }
+  // Step 4 — 0xc5 / 0xe4 LensTypeModel: the `RawConv => 'return undef unless $val'`
+  // drops a ZERO value (no emission, no typed populate); else the byte-swap conv.
+  if matches!(tag_id, 0xc5 | 0xe4) {
+    let Some(value) = PanasonicPrintConv::apply_lens_type_model(raw, print_conv) else {
+      return Ok(());
+    };
+    if let Some(typed) = typed {
+      populate_typed(typed, tag_id, raw, &value);
+    }
+    return out.write_vendor_value(
+      "MakerNotes",
+      group1,
+      panasonic_tag.name(),
+      value,
+      panasonic_tag.is_unknown(),
+    );
+  }
+  // Step 5 — render. The model-conditional 0x0f / 0x2c rows override the table's
+  // default conv with the branch ExifTool's `Condition` chain selects for this
+  // body; every other leaf uses the table default.
+  let conv = match tag_id {
+    0x0f => PanasonicPrintConv::af_area_mode_for_model(model),
+    0x2c => PanasonicPrintConv::contrast_mode_for_model(model),
+    _ => panasonic_tag.conv,
+  };
+  let value = conv.apply(raw, print_conv);
+  // Step 6 — populate the typed surface (gate-passing only, exactly where the
+  // oracle does), THEN emit with the bundled `Unknown=>1` flag (run_emission drops
+  // it once).
+  if let Some(typed) = typed {
+    populate_typed(typed, tag_id, raw, &value);
+  }
+  out.write_vendor_value(
+    "MakerNotes",
+    group1,
+    panasonic_tag.name(),
+    value,
+    panasonic_tag.is_unknown(),
   )
 }
 
@@ -6734,6 +6976,9 @@ fn apple_makernote_isolated(
     // `base` to a value — `base: 0` resolves an out-of-line offset at `blob[off]`,
     // byte-identical to the oracle's `Base => '$start - 14'` blob-relative read.
     base: 0,
+    // Inherit-base vendor walk — out-of-line offsets are already TIFF-relative
+    // (child `$dataPos == 0`), so no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     // FRESH warning channels: a malformed Apple entry warns into THESE, dropped on
     // return — never the parent's `ExifTool:Warning` stream (the oracle
@@ -6928,6 +7173,9 @@ fn sony_makernote_isolated(
     // walk never adds `base` to a value — `base: 0` resolves an out-of-line offset
     // at `data[off]`, byte-identical to the oracle's TIFF-relative read.
     base: 0,
+    // Inherit-base vendor walk — out-of-line offsets are already TIFF-relative
+    // (child `$dataPos == 0`), so no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     // FRESH warning channels: a malformed Sony entry warns into THESE, dropped on
     // return — never the parent's `ExifTool:Warning` stream (the oracle
@@ -7014,6 +7262,232 @@ fn sony_makernote_isolated(
           sony_tag,
           model,
           af_area,
+          print_conv,
+          Some(&mut typed),
+          &mut sink,
+        );
+      }
+    }
+  }
+  Some((emissions, typed))
+}
+
+/// Walk the Panasonic `%Panasonic::Main` IFD in a FRESH, ISOLATED [`Walker`] over
+/// the parent TIFF and capture its emissions + typed surface — the single GATED
+/// entry point BOTH the `-j` production dispatch and the `-n` recompute drive
+/// (#243 phase 3, structural isolation, mirroring [`sony_makernote_isolated`]).
+///
+/// ## The variant gate (FIRST)
+///
+/// The dispatcher collapses the THREE Panasonic `MakerNotes.pm` variants
+/// (`:732-761`) to [`Vendor::Panasonic`], but only the two whose blob starts with
+/// `Panasonic` use `%Panasonic::Main`: `MakerNotePanasonic` (no `Base` ⇒ inherit)
+/// and `MakerNotePanasonic3` (DC-FT7, `Base => 12`). `MakerNotePanasonic2` (the
+/// `MKE` Type2 blob) is a `ProcessBinaryData` table (`Panasonic.pm:2259`, NOT an
+/// IFD over `%Panasonic::Main`), so running the Main walker on it is UNFAITHFUL.
+/// This function applies
+/// [`routes_to_main`](makernotes::vendors::panasonic::routes_to_main) on the
+/// captured blob (`data[mn_offset .. mn_offset + mn_len]`, computed EXACTLY as
+/// [`parse_main_gated`](makernotes::vendors::panasonic::parse_main_gated)) and
+/// returns `None` for a non-Main blob — the caller leaves the Panasonic slot
+/// ABSENT. This is the SAME gate the retired `parse_main_gated` oracle applies, so
+/// the route classification cannot be bypassed. (The cross-table Leica1/Leica10
+/// routes have their OWN make/signature gates on the `Vendor::Leica` arm, which
+/// keeps its `parse_leica*_gated` oracle.)
+///
+/// ## The walk + the DYNAMIC BASE (byte-identity to `parse_in_tiff`)
+///
+/// The IFD count word sits at `mn_offset + HEADER_LEN` (12, the `Panasonic\0\0\0`
+/// prefix — `MakerNotePanasonic`/`Panasonic3` both use it; the Leica 18/8 offsets
+/// route elsewhere). The walk runs under `active_table == TableRef::Panasonic` via
+/// [`process_subdir`](Walker::process_subdir) with `ProcessProc::Exif` — which
+/// resolves the Panasonic table's own `Format =>` directives (the many `Writable
+/// => 'int16u'` / `Format => 'int16s'` rows + the int32u-from-rational rows, just
+/// as ExifTool's `ProcessExif` reads them off the active `$tagTablePtr`,
+/// `Exif.pm:6729`), reproducing the oracle's `resolve_read_format` step.
+///
+/// `base_offset` is the KEY Panasonic difference from Sony/Canon/Apple: it is the
+/// SubDirectory `Base =>` literal (0 for `MakerNotePanasonic`'s inherited base, 12
+/// for `MakerNotePanasonic3`'s `Base => 12`), threaded into the Walker's
+/// [`value_offset_base`](Walker::value_offset_base) so every OUT-OF-LINE value
+/// pointer resolves at `data[off + base_offset]` — byte-identical to the oracle's
+/// `walk_panasonic_in_tiff`'s `abs_off = off + base_offset` (`panasonic/
+/// body.rs:150`). A base-0 read of a DC-FT7 value would land 12 bytes early
+/// (corruption); the `value_offset_base` thread is what makes the shared-Walker
+/// walk faithful for the `Base => 12` variant. Inline values (≤ 4 bytes) are never
+/// shifted. The directory `kind` is `ExifIfd` (a non-Ifd0 kind, so the IFD0-only
+/// Make/Model tap never fires); the bodies carry no MM/II marker, so the byte
+/// order is the PARENT order.
+///
+/// ## The per-entry gates (the capture loop)
+///
+/// Panasonic's `%Main` render is gated per entry (an ABSENT tag, not a raw
+/// fallback), so — unlike Apple/Canon's `emit_entry` capture — the loop drives the
+/// dedicated [`emit_panasonic_value`] (reproducing `parse_in_tiff`'s
+/// SubDirectory-skip / `$format`-gated single-HASH `Condition` / RawConv-drop /
+/// 0xc5-0xe4-LensTypeModel-zero-drop / model-conditional-0x0f-0x2c gates). Unlike
+/// Sony there is no in-IFD DataMember thread; the only context is the parent
+/// `$$self{Model}` (for the 0x0f/0x2c branch selection). The typed
+/// [`MakerNotesPanasonic`] is built INSIDE this loop (via `emit_panasonic_value`'s
+/// `Some(&mut typed)` populate) so a gated tag — e.g. a rawconv-dropped 0xd1 —
+/// populates NEITHER the emission NOR a typed field, exactly as the oracle.
+///
+/// ## Isolation
+///
+/// A FRESH `Walker` has its OWN `warnings` / `warn_count` / `active_ifd_offsets`,
+/// populated by THIS walk and DISCARDED on return — so a malformed Panasonic entry
+/// cannot leak a core `ExifTool:Warning`, abort the parent ExifIFD's warn-count,
+/// or be suppressed by the parent's ancestor cycle guard (the oracle, an isolated
+/// `walk_panasonic_in_tiff`, has none of these side effects either). `print_conv =
+/// true` renders the `-j` emissions + the typed slot; `print_conv = false` the
+/// `-n` emissions (the typed slot is the SAME for both and ALWAYS returned,
+/// non-Option, matching `parse_in_tiff`).
+#[cfg(feature = "alloc")]
+fn panasonic_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  base_offset: usize,
+  order: ByteOrder,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::panasonic::MakerNotesPanasonic,
+)> {
+  use makernotes::vendors::panasonic;
+  // The variant gate FIRST — the captured MakerNote blob is the bytes the
+  // dispatcher classified (`data[mn_offset .. mn_offset + mn_len]`), computed
+  // EXACTLY as `parse_main_gated` (saturating end, clamped to the buffer). A blob
+  // routing elsewhere (the `MKE` Type2 BinaryData) ⇒ `None` (the Panasonic slot
+  // stays absent — no spurious Main tags).
+  let blob_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let blob = data.get(mn_offset..blob_end)?;
+  if !panasonic::routes_to_main(blob) {
+    return None;
+  }
+  // Short-MakerNote guard (the oracle's `walk_panasonic_in_tiff:100` pre-check, in
+  // the REVERSE direction): the dispatcher's variant-gate window must at least
+  // contain the IFD count word INSIDE the declared MakerNote value (`mn_len >=
+  // HEADER_LEN + 2`); below that the value has no room for an IFD. Without this, a
+  // truncated MakerNote (e.g. the value is only `Panasonic\0\0\0`, `mn_len = 12`,
+  // body offset `HEADER_LEN = 12`) would still walk `data` at `mn_offset +
+  // HEADER_LEN` and read its count word from the UNRELATED following parent-TIFF
+  // bytes — emitting spurious Panasonic tags the oracle (`walk_panasonic_in_tiff`,
+  // which returns empty here) never does, and a migration regression vs the
+  // pre-migration body walker. `routes_to_main` already classified the blob as a
+  // Main variant, so the faithful result is present-but-empty (`Some((empty,
+  // empty))`), NOT `None` (which would drop the typed slot the oracle's
+  // `parse_in_tiff` still returns). The production body offset is always
+  // [`HEADER_LEN`](panasonic::HEADER_LEN) (12 — the `Panasonic\0\0\0` prefix both
+  // Main variants use); `HEADER_LEN + 2` is `checked_add`ed for the
+  // usize-overflow class — an overflow can never satisfy `mn_len >=`, so it trips
+  // the guard exactly as the oracle's `<` test does. (The cross-table Leica1/
+  // Leica10 routes — body offset 8/18 — go through `parse_leica*_gated`, not this
+  // helper, so the constant `HEADER_LEN` is the only body offset reachable here.)
+  match panasonic::HEADER_LEN.checked_add(2) {
+    Some(min_len) if mn_len >= min_len => {}
+    _ => {
+      return Some((std::vec::Vec::new(), panasonic::MakerNotesPanasonic::new()));
+    }
+  }
+  // The IFD sits at `mn_offset + HEADER_LEN` (12) in `data` — the
+  // `Panasonic\0\0\0` prefix both Main variants use (`MakerNotes.pm:738`/`:757`).
+  // A body offset past the buffer yields an empty walk (no entries) — the oracle's
+  // same out-of-bounds guard; `process_subdir` is bounds-checked.
+  let ifd_offset = mn_offset.saturating_add(panasonic::HEADER_LEN);
+  let mut w = Walker {
+    data,
+    order,
+    // `%Panasonic::Main` carries no `IsOffset`/`SubIFD` tag, so the walk never adds
+    // `base` to a value — `base: 0`. The DC-FT7 `Base => 12` out-of-line shift is
+    // the SEPARATE `value_offset_base` below (the `$dataPos`-shift addend), NOT
+    // `base` (the `IsOffset` file-offset addend, unused by Panasonic Main).
+    base: 0,
+    // THE DYNAMIC BASE — the SubDirectory `Base =>` literal: 0 for
+    // `MakerNotePanasonic` (inherit), 12 for `MakerNotePanasonic3` (DC-FT7). Every
+    // out-of-line value pointer resolves at `data[off + base_offset]`,
+    // byte-identical to `walk_panasonic_in_tiff`'s `off + base_offset`
+    // (`panasonic/body.rs:150`).
+    value_offset_base: base_offset,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Panasonic entry warns into THESE, dropped
+    // on return — never the parent's `ExifTool:Warning` stream (the oracle
+    // `walk_panasonic_in_tiff` silently `continue`s a bad entry, emitting no
+    // warning).
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    captured_make: None,
+    // `$$self{Model}` selects the 0x0f AFAreaMode / 0x2c ContrastMode branches; the
+    // Panasonic walk itself reads no model-conditional structure, but the captured
+    // model is threaded into the capture-loop gates below (not into the walk), so
+    // leave it unset on the Walker.
+    captured_model: None,
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
+    // so a Panasonic value offset that coincides with a PARENT IFD offset is still
+    // walked — the oracle, also pathless, always walks it.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Panasonic Main leaf reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    // The parent TIFF block IS the readable buffer (an effective RAF), like the
+    // dispatch walk.
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Panasonic)` swaps it to
+    // `Panasonic` for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Panasonic Main IFD walk — `ProcessProc::Exif` (Panasonic needs NO Canon
+  // DataMember pre-scan; the `if table == TableRef::Canon` hook is inert).
+  // `Fixed(order)` is the parent order; `FixBaseMode::No` (offsets are already
+  // resolved via `value_offset_base`). It appends the Panasonic leaves to
+  // `w.entries` from index 0, isolating every core side effect from the parent.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Panasonic,
+    ByteOrderRule::Fixed(order),
+    FixBaseMode::No,
+    ProcessProc::Exif,
+  );
+  // Capture the walked `ResolvedConv::Panasonic` leaves into the vendor-emission
+  // `Vec`. Unlike Apple/Canon this drives the dedicated `emit_panasonic_value` (the
+  // per-entry gates + the gate-passing typed populate), NOT `emit_entry`. The
+  // family-1 group is the Panasonic vendor group (`vendor_group1_of(Panasonic)` =
+  // `"Panasonic"`); `write_vendor_value` re-derives it from
+  // `MakerNote::emission_group1` for the cached emissions, but pass the resolved
+  // value so the `EmittedTagSink` path (the differential test) carries it too.
+  //
+  // The typed `MakerNotesPanasonic` is built INSIDE this loop (via
+  // `emit_panasonic_value`'s `Some(&mut typed)` populate) so a gated tag — e.g. a
+  // rawconv-dropped 0xd1 — populates NEITHER the emission NOR a typed field,
+  // exactly as the oracle's `parse_in_tiff` (which calls `populate_typed` only on a
+  // gate-passing entry).
+  let g1 = vendor_group1_of(TableRef::Panasonic).unwrap_or("Panasonic");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = panasonic::MakerNotesPanasonic::new();
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // Only `ResolvedConv::Panasonic` entries live in this run; the resolved
+      // `PanasonicTag` rides in the entry's `conv`. A defensive non-Panasonic conv
+      // (never produced under `TableRef::Panasonic`) is skipped —
+      // `emit_panasonic_value` needs the `PanasonicTag`.
+      if let ResolvedConv::Panasonic(panasonic_tag) = entry.conv {
+        let Ok(()) = emit_panasonic_value(
+          g1,
+          entry,
+          panasonic_tag,
+          model,
           print_conv,
           Some(&mut typed),
           &mut sink,
@@ -7125,6 +7599,9 @@ fn canon_makernote_isolated(
     // `base` to a value (`is_offset_tag` matches only 0x0111/0x0201, absent from
     // `%Canon::Main`) — `base: 0` is byte-identical to the parent-context walk.
     base: 0,
+    // Inherit-base vendor walk — out-of-line offsets are already TIFF-relative
+    // (child `$dataPos == 0`), so no value-pointer shift.
+    value_offset_base: 0,
     entries: Vec::new(),
     // FRESH warning channels: a malformed Canon entry warns into THESE, which are
     // dropped on return — never the parent's `ExifTool:Warning` stream (the
@@ -9876,6 +10353,7 @@ mod tests {
       data,
       order: ByteOrder::Big,
       base: 0,
+      value_offset_base: 0,
       entries: Vec::new(),
       warnings: Vec::new(),
       warnings_ignorable: Vec::new(),
@@ -12491,6 +12969,617 @@ mod tests {
         "body_offset-near-usize-max",
       );
     }
+  }
+
+  // ====================================================================// Panasonic engine migration — differential test (#243 phase 3)
+  //
+  // PROVES the shared `Walker`'s Panasonic Main leaf path (`process_subdir` under
+  // `TableRef::Panasonic` → the dedicated `emit_panasonic_value` capture, via
+  // `panasonic_makernote_isolated`) is BYTE-IDENTICAL to the production oracle
+  // `panasonic::parse_in_tiff` (`walk_panasonic_in_tiff` + the per-entry gates).
+  // The same crafted Panasonic Main blob is run through BOTH paths; the emitted
+  // `(name, value, group="MakerNotes:Panasonic", unknown)` tuples must match, in
+  // order, for `-j` (PrintConv) AND `-n` (ValueConv), and the typed
+  // `MakerNotesPanasonic` must agree. Two blobs are exercised:
+  //
+  // - The DYNAMIC-BASE blob (`base_offset = 12`, `MakerNotePanasonic3` DC-FT7):
+  //   an OUT-OF-LINE 0x51 LensType string PROVES the `value_offset_base` thread —
+  //   it resolves at `off + 12`; a base-0 walk would read 12 bytes early.
+  // - The gate blob (`base_offset = 0`, inherit `MakerNotePanasonic`): every
+  //   per-entry gate — a deferred SubDirectory (0x4e), a `$format`-gated single-
+  //   HASH LensType PASS (0xc4) + SUPPRESS (0xe4 non-int16u), a 0xc5 LensTypeModel
+  //   byte-swap, a 0x86 ManometerPressure RawConv sentinel drop (65535), the
+  //   model-conditional 0x0f AFAreaMode + 0x2c ContrastMode branches, and a plain
+  //   typed leaf (0x01 ImageQuality).
+  //
+  // A routes-AWAY blob ("MKE" Type2) returns `None`.
+  // ====================================================================
+
+  /// Build a crafted little-endian Panasonic Main blob: the 12-byte
+  /// `Panasonic\0\0\0` prefix (the `MakerNotePanasonic`/`Panasonic3` header, so
+  /// `routes_to_main` passes), then the body's entry count + the 12-byte IFD
+  /// entries, then the next-IFD word, then any out-of-line value bytes. `entries`
+  /// is `(tag, format, count, inline_or_empty, out_of_line_or_empty)`: INLINE when
+  /// `out_of_line` is empty (value zero-padded to 4 bytes at `entry+8`), else
+  /// OUT-OF-LINE (the 4 bytes at `entry+8` are the stored offset).
+  ///
+  /// `base_offset` is the SubDirectory `Base =>` literal: the walker (both the
+  /// oracle and the isolated path) resolves an out-of-line value at `stored +
+  /// base_offset`, so the STORED offset is `real_pos - base_offset` (for
+  /// `base_offset = 12` the DC-FT7 stores its offsets 12 LESS than the real buffer
+  /// position; `base_offset = 0` stores the real position). Out-of-line values sit
+  /// AFTER the next-IFD word (so the resolved `stored + base_offset` is past the
+  /// IFD ⇒ never trips the shared Walker's suspect-offset/IFD-overlap check, which
+  /// the simpler oracle omits — keeping the two byte-identical).
+  ///
+  /// Entries must be written in ASCENDING tag-id order (real cameras write sorted
+  /// Panasonic IFDs).
+  #[cfg(feature = "alloc")]
+  fn crafted_panasonic_blob(
+    entries: &[(u16, u16, u32, &[u8], &[u8])],
+    base_offset: usize,
+  ) -> Vec<u8> {
+    let elem_sizes: [usize; 14] = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4];
+    let dir_bytes = 2 + 12 * entries.len(); // count + entries
+    // The first out-of-line value's REAL buffer position (12-byte prefix + dir +
+    // next-IFD word); the STORED offset is this minus `base_offset`.
+    let mut real_cursor = 12 + dir_bytes + 4;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"Panasonic\x00\x00\x00"); // 12-byte prefix
+    blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    let mut value_blob: Vec<u8> = Vec::new();
+    for &(tag, format, count, inline, out_of_line) in entries {
+      blob.extend_from_slice(&tag.to_le_bytes());
+      blob.extend_from_slice(&format.to_le_bytes());
+      blob.extend_from_slice(&count.to_le_bytes());
+      if out_of_line.is_empty() {
+        let elem = elem_sizes[format as usize];
+        assert!(
+          elem * count as usize <= 4,
+          "inline value must fit in 4 bytes"
+        );
+        let mut slot = [0u8; 4];
+        slot[..inline.len().min(4)].copy_from_slice(&inline[..inline.len().min(4)]);
+        blob.extend_from_slice(&slot);
+      } else {
+        // STORED = real - base_offset, so the walker's `stored + base_offset`
+        // resolves to the real buffer position.
+        let stored = (real_cursor - base_offset) as u32;
+        blob.extend_from_slice(&stored.to_le_bytes());
+        value_blob.extend_from_slice(out_of_line);
+        real_cursor += out_of_line.len();
+      }
+    }
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    blob.extend_from_slice(&value_blob);
+    blob
+  }
+
+  /// Drive the shared `Walker` through the SAME walk `panasonic_makernote_isolated`
+  /// uses (`mn_offset = 0`, body at 12, `value_offset_base = base_offset`, parent
+  /// order, `TableRef::Panasonic`, `ProcessProc::Exif`), then render every
+  /// collected entry through the dedicated `emit_panasonic_value` into an
+  /// `EmittedTagSink` — the NEW path's output WITH the full `MakerNotes:Panasonic`
+  /// group (which the `VendorEmission` stream alone does not carry).
+  #[cfg(feature = "alloc")]
+  fn drive_panasonic_subdir(
+    blob: &[u8],
+    base_offset: usize,
+    order: ByteOrder,
+    model: Option<&str>,
+    print_conv: bool,
+  ) -> Vec<crate::emit::EmittedTag> {
+    let mut w = test_walker(blob);
+    w.order = order;
+    // The DYNAMIC BASE — the same addend the production isolated walk threads.
+    w.value_offset_base = base_offset;
+    w.process_subdir(
+      12, // body offset for the Panasonic\0\0\0 prefix
+      IfdKind::ExifIfd,
+      TableRef::Panasonic,
+      ByteOrderRule::Fixed(order),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+    let g1 = vendor_group1_of(TableRef::Panasonic).unwrap_or("Panasonic");
+    let mut out: Vec<crate::emit::EmittedTag> = Vec::new();
+    let mut sink = EmittedTagSink::new(&mut out);
+    for entry in &w.entries {
+      if let ResolvedConv::Panasonic(panasonic_tag) = entry.conv {
+        let Ok(()) =
+          emit_panasonic_value(g1, entry, panasonic_tag, model, print_conv, None, &mut sink);
+      }
+    }
+    out
+  }
+
+  /// Assert the THREE Panasonic paths agree for one crafted blob + base_offset:
+  /// the oracle `parse_in_tiff`, the gated `panasonic_makernote_isolated`
+  /// (`VendorEmission` stream + typed), and `drive_panasonic_subdir` (the
+  /// `EmittedTag` stream carrying the full `MakerNotes:Panasonic` group). Returns
+  /// the oracle emissions so the caller can pin survivor names/values.
+  #[cfg(feature = "alloc")]
+  fn assert_panasonic_paths_agree(
+    blob: &[u8],
+    base_offset: usize,
+    order: ByteOrder,
+    model: Option<&str>,
+    print_conv: bool,
+  ) -> Vec<makernotes::VendorEmission> {
+    // Oracle: production `parse_in_tiff` (returns `(typed, emissions)`), body at
+    // 12, the SAME base_offset.
+    let (oracle_typed, oracle) = makernotes::vendors::panasonic::parse_in_tiff(
+      blob,
+      0,
+      blob.len(),
+      makernotes::vendors::panasonic::HEADER_LEN,
+      order,
+      print_conv,
+      model,
+      base_offset,
+    );
+    // New path A: the gated isolated helper the production dispatch drives.
+    let (iso_emissions, iso_typed) =
+      panasonic_makernote_isolated(blob, 0, blob.len(), base_offset, order, model, print_conv)
+        .expect("Panasonic prefix ⇒ routes_to_main ⇒ Some");
+    // New path B: the same walk emitted into an `EmittedTagSink` so the full
+    // `MakerNotes:Panasonic` group is asserted.
+    let emitted = drive_panasonic_subdir(blob, base_offset, order, model, print_conv);
+
+    assert_eq!(
+      iso_emissions.len(),
+      oracle.len(),
+      "pc={print_conv} base={base_offset}: isolated emission COUNT must match the oracle"
+    );
+    assert_eq!(
+      emitted.len(),
+      oracle.len(),
+      "pc={print_conv} base={base_offset}: EmittedTag COUNT must match the oracle"
+    );
+    for (i, want) in oracle.iter().enumerate() {
+      let got = iso_emissions.get(i).expect("index in range");
+      assert_eq!(
+        got.name(),
+        want.name(),
+        "pc={print_conv} base={base_offset} leaf #{i}: VendorEmission NAME mismatch"
+      );
+      assert_eq!(
+        got.value(),
+        want.value(),
+        "pc={print_conv} base={base_offset} leaf #{i} ({}): VendorEmission VALUE mismatch \
+         (the new path must apply PanasonicPrintConv + gates exactly as the oracle)",
+        want.name()
+      );
+      assert_eq!(
+        got.unknown(),
+        want.unknown(),
+        "pc={print_conv} base={base_offset} leaf #{i} ({}): VendorEmission Unknown flag mismatch",
+        want.name()
+      );
+      let tag = emitted.get(i).expect("index in range").tag();
+      assert_eq!(
+        tag.name(),
+        want.name(),
+        "pc={print_conv} base={base_offset} leaf #{i}: EmittedTag NAME mismatch"
+      );
+      assert_eq!(
+        tag.value_ref(),
+        want.value(),
+        "pc={print_conv} base={base_offset} leaf #{i} ({}): EmittedTag VALUE mismatch",
+        want.name()
+      );
+      assert_eq!(
+        tag.group_ref().family0(),
+        "MakerNotes",
+        "pc={print_conv} base={base_offset} leaf #{i} ({}): family-0 must be MakerNotes",
+        want.name()
+      );
+      assert_eq!(
+        tag.group_ref().family1(),
+        "Panasonic",
+        "pc={print_conv} base={base_offset} leaf #{i} ({}): family-1 must be Panasonic",
+        want.name()
+      );
+    }
+    assert_eq!(
+      iso_typed, oracle_typed,
+      "pc={print_conv} base={base_offset}: the isolated typed MakerNotesPanasonic must equal the oracle's"
+    );
+    oracle
+  }
+
+  /// The Panasonic leaf-path differential proof. For BOTH `-j` and `-n`, the shared
+  /// `Walker` Panasonic leaf path emits the EXACT same `(name, value,
+  /// group="MakerNotes:Panasonic", unknown)` stream — in order — as
+  /// `panasonic::parse_in_tiff`, AND the typed `MakerNotesPanasonic` agrees. Two
+  /// blobs: the gate blob (base 0) and the dynamic-base blob (base 12).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn panasonic_isolated_emit_matches_parse_in_tiff() {
+    let order = ByteOrder::Little;
+    // Model "DMC-FZ10": 0x0f selects the FZ10 AFAreaMode branch; 0x2c selects the
+    // PrintHex ContrastMode branch (FZ10 ∉ the GF/G2/TZ10/ZS7/FX10/G1/L1/L10/LC80
+    // excluded set and is not a `DC-` body) — both deterministic.
+    let model = Some("DMC-FZ10");
+
+    // ---- Gate blob (base 0, inherit `MakerNotePanasonic`). ASCENDING tag order.
+    // int16u=3, int8u=1, undef=7, string=2.
+    let gate_entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x01 ImageQuality — plain typed leaf. int16u 2 ⇒ "High"; typed.* via 0x01
+      // is not a typed field, but it proves the plain leaf path.
+      (0x01, 0x03, 1, &[0x02, 0x00], &[]),
+      // 0x0f AFAreaMode — model-conditional (FZ10 branch). int8u[2] = [0,16].
+      (0x0f, 0x01, 2, &[0x00, 0x10], &[]),
+      // 0x2c ContrastMode — model-conditional (PrintHex branch). int16u 0.
+      (0x2c, 0x03, 1, &[0x00, 0x00], &[]),
+      // 0x4e FaceDetInfo — a DEFERRED SubDirectory row (`sub_table=Some`). Valid
+      // out-of-line int8u blob; the parent must be SUPPRESSED (no emission).
+      (0x4e, 0x01, 8, &[], &[1, 2, 3, 4, 5, 6, 7, 8]),
+      // 0x86 ManometerPressure — RawConv sentinel: int16u 65535 ⇒ DROPPED.
+      (0x86, 0x03, 1, &[0xff, 0xff], &[]),
+      // 0xc4 LensTypeMake — single-HASH `Condition` HOLDS (int16u, != 0xffff).
+      // int16u 5 ⇒ raw passthrough (conv None). Proves a single-HASH PASS.
+      (0xc4, 0x03, 1, &[0x05, 0x00], &[]),
+      // 0xc5 LensTypeModel — single-HASH HOLDS (int16u); 0x1234 ⇒ byte-swap
+      // "34 12". Proves the 0xc5 LensTypeModel special emit path.
+      (0xc5, 0x03, 1, &[0x34, 0x12], &[]),
+      // 0xe4 LensTypeModel — single-HASH FAILS (on-disk `string`, not int16u) ⇒
+      // SUPPRESSED. (string[4] inline.) Proves a single-HASH SUPPRESS.
+      (0xe4, 0x02, 4, b"abcd", &[]),
+    ];
+    let gate_blob = crafted_panasonic_blob(gate_entries, 0);
+
+    for print_conv in [true, false] {
+      let oracle = assert_panasonic_paths_agree(&gate_blob, 0, order, model, print_conv);
+      // Survivors: 0x01, 0x0f, 0x2c, 0xc4, 0xc5 (0x4e/0x86/0xe4 suppressed).
+      let names: Vec<&str> = oracle.iter().map(|e| e.name()).collect();
+      assert_eq!(
+        names,
+        std::vec![
+          "ImageQuality",
+          "AFAreaMode",
+          "ContrastMode",
+          "LensTypeMake",
+          "LensTypeModel"
+        ],
+        "pc={print_conv}: gate-blob survivor names + order (0x4e/0x86/0xe4 suppressed)"
+      );
+      // 0xc5 byte-swap is PrintConv-independent ⇒ "34 12" in both modes.
+      let lens = oracle
+        .iter()
+        .find(|e| e.name() == "LensTypeModel")
+        .expect("0xc5 survives");
+      assert_eq!(
+        lens.value(),
+        &crate::value::TagValue::Str("34 12".into()),
+        "pc={print_conv}: 0xc5 LensTypeModel byte-swap 0x1234 ⇒ \"34 12\""
+      );
+    }
+
+    // ---- Dynamic-base blob (base 12, `MakerNotePanasonic3` DC-FT7). The 0x51
+    // LensType is OUT-OF-LINE: it resolves at `stored + 12`. PROVES the dynamic
+    // base — a base-0 walk reads 12 bytes early and does NOT recover the string.
+    let lens_str = b"LUMIX-G\x00"; // 8 bytes (> 4 ⇒ out-of-line)
+    let base12_entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x01 ImageQuality — a plain inline leaf to anchor the IFD.
+      (0x01, 0x03, 1, &[0x02, 0x00], &[]),
+      // 0x51 LensType — OUT-OF-LINE string. typed.lens_type = "LUMIX-G".
+      (0x51, 0x02, lens_str.len() as u32, &[], lens_str),
+    ];
+    let base12_blob = crafted_panasonic_blob(base12_entries, 12);
+
+    for print_conv in [true, false] {
+      let oracle = assert_panasonic_paths_agree(&base12_blob, 12, order, model, print_conv);
+      let names: Vec<&str> = oracle.iter().map(|e| e.name()).collect();
+      assert_eq!(
+        names,
+        std::vec!["ImageQuality", "LensType"],
+        "pc={print_conv}: base-12 survivor names"
+      );
+      // The dynamic base RESOLVED the out-of-line string at off+12.
+      let (_, typed) = panasonic_makernote_isolated(
+        &base12_blob,
+        0,
+        base12_blob.len(),
+        12,
+        order,
+        model,
+        print_conv,
+      )
+      .expect("routes_to_main");
+      assert_eq!(
+        typed.lens_type(),
+        Some("LUMIX-G"),
+        "pc={print_conv}: base-12 out-of-line 0x51 LensType resolves at off+12 ⇒ \"LUMIX-G\""
+      );
+    }
+
+    // NEGATIVE oracle for the dynamic base: a base-0 walk of the SAME blob reads
+    // the 0x51 out-of-line offset 12 bytes early ⇒ it does NOT recover "LUMIX-G"
+    // (the +12 thread is load-bearing).
+    let (_, typed_base0) =
+      panasonic_makernote_isolated(&base12_blob, 0, base12_blob.len(), 0, order, model, true)
+        .expect("routes_to_main");
+    assert_ne!(
+      typed_base0.lens_type(),
+      Some("LUMIX-G"),
+      "base_offset=0 must NOT recover the DC-FT7 out-of-line string (reads 12 bytes early)"
+    );
+  }
+
+  /// A `Vendor::Panasonic` blob that routes AWAY from `%Panasonic::Main` (the
+  /// `MKE` Type2 `ProcessBinaryData` blob, unported) must yield `None` from
+  /// `panasonic_makernote_isolated` — the variant gate (`routes_to_main`) keeps the
+  /// Panasonic slot ABSENT rather than decoding a spurious Main tag on a tag-id
+  /// collision.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn panasonic_isolated_routes_away_blob_is_none() {
+    // An "MKE" Type2 body — enough bytes that the blob window is non-empty; the
+    // gate rejects on the `Panasonic`-prefix miss alone (no Main walk runs).
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"MKED"); // Type2 "MKE" prefix
+    blob.extend_from_slice(&[0u8; 24]); // arbitrary trailing bytes
+    for print_conv in [true, false] {
+      for base_offset in [0usize, 12] {
+        let out = panasonic_makernote_isolated(
+          &blob,
+          0,
+          blob.len(),
+          base_offset,
+          ByteOrder::Little,
+          Some("DC-FT7"),
+          print_conv,
+        );
+        assert!(
+          out.is_none(),
+          "pc={print_conv} base={base_offset}: an MKE (Type2) blob routes away from \
+           %Panasonic::Main ⇒ panasonic_makernote_isolated must return None"
+        );
+      }
+    }
+  }
+
+  /// Build a crafted little-endian `Panasonic\0\0\0`-prefixed Main blob with FULL
+  /// control over each entry's `(tag, format_code, count, value-slot)` and the
+  /// out-of-line payload — the edge-case builder for the ProcessExif-classification
+  /// differential proofs (bad format codes, oversized counts, hand-placed
+  /// out-of-line offsets) that `crafted_panasonic_blob` cannot express (it asserts
+  /// inline-fit + only knows the 13 standard format sizes). Each entry's 4-byte
+  /// value slot is written VERBATIM (an inline value, or a stored out-of-line
+  /// offset). Trailing `payload` bytes are appended after the next-IFD word.
+  #[cfg(feature = "alloc")]
+  fn crafted_panasonic_raw(entries: &[(u16, u16, u32, [u8; 4])], payload: &[u8]) -> Vec<u8> {
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"Panasonic\x00\x00\x00"); // 12-byte prefix
+    blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for &(tag, format, count, slot) in entries {
+      blob.extend_from_slice(&tag.to_le_bytes());
+      blob.extend_from_slice(&format.to_le_bytes());
+      blob.extend_from_slice(&count.to_le_bytes());
+      blob.extend_from_slice(&slot);
+    }
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    blob.extend_from_slice(payload);
+    blob
+  }
+
+  /// Crafted-edge differential proof: for a range of hostile/degenerate Panasonic
+  /// Main IFDs the oracle (`parse_in_tiff` → `walk_panasonic_in_tiff`) and the
+  /// production shared-`Walker` path (`panasonic_makernote_isolated`) emit the
+  /// BYTE-IDENTICAL `(name, value, unknown)` stream + typed surface, in BOTH `-j`
+  /// and `-n`. Each case targets one ProcessExif-classification rule
+  /// `walk_panasonic_in_tiff` mirrors: count-based size, `undef[1]`→int8u,
+  /// excessive-count skip, bad-format index-0-abort-vs-later-skip, suspicious
+  /// offset, the warn-count>10 abort, the short-MakerNote present-but-empty guard,
+  /// and `usize::MAX` offset-overflow safety.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn panasonic_isolated_matches_oracle_crafted_edges() {
+    let order = ByteOrder::Little;
+    let model = Some("DMC-FZ10");
+
+    // ---- count = 0 (empty value, Exif.pm:6285) + undef[1]→int8u (Exif.pm:6644).
+    // 0x01 ImageQuality int16u count 0 ⇒ empty value; 0x0f AFAreaMode undef[1] ⇒
+    // decoded as int8u (the model-conditional 0x0f leaf renders the FZ10 branch).
+    let count0_undef1 = crafted_panasonic_raw(
+      &[
+        (0x01, 0x03, 0, [0x00, 0x00, 0x00, 0x00]), // int16u, count 0 — empty
+        (0x0f, 0x07, 1, [0x10, 0x00, 0x00, 0x00]), // undef[1] = 0x10 ⇒ int8u
+      ],
+      &[],
+    );
+    for print_conv in [true, false] {
+      assert_panasonic_paths_agree(&count0_undef1, 0, order, model, print_conv);
+    }
+
+    // ---- excessive count > 100000 (Exif.pm:6760) ⇒ the entry is SKIPPED by the
+    // post-override guard (a), which fires AFTER the out-of-line bounds check — so
+    // the value must be IN BOUNDS to actually reach the guard (an out-of-bounds
+    // excessive value would be caught earlier as a "Bad offset"). Build a payload
+    // large enough that the count-100001 int16u value (200002 bytes) fits: stored
+    // offset points just past the next-IFD word. A known anchor (0x01) survives;
+    // the excessive 0x1f ShootingMode int16u is dropped by BOTH paths.
+    {
+      // header(12) + count(2) + 2*entry(24) + next-IFD(4) = 42 ⇒ payload at 42.
+      let value_off = 12 + 2 + 24 + 4;
+      let big_count = 100_001u32;
+      let payload = std::vec![0u8; (big_count as usize) * 2];
+      let excessive = crafted_panasonic_raw(
+        &[
+          (0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00]), // ImageQuality int16u 2
+          (
+            0x1f,
+            0x03,
+            big_count,
+            (value_off as u32).to_le_bytes(), // in-bounds out-of-line offset
+          ),
+        ],
+        &payload,
+      );
+      for print_conv in [true, false] {
+        let oracle = assert_panasonic_paths_agree(&excessive, 0, order, model, print_conv);
+        assert!(
+          oracle.iter().all(|e| e.name() != "ShootingMode"),
+          "pc={print_conv}: an excessive-count (>100000) 0x1f entry must be skipped"
+        );
+      }
+    }
+
+    // ---- bad format code at a LATER index (index != 0) ⇒ SKIP that one entry,
+    // continue the IFD (Exif.pm:6476). Code 99 is unrecognized (not 1..=13/129);
+    // code 16 (int64u, BigTIFF) is ALSO bad here (no Apple/Make carve-out for
+    // Panasonic). Both follow a valid index-0 entry, so the IFD is NOT aborted.
+    let bad_format_later = crafted_panasonic_raw(
+      &[
+        (0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00]), // valid index 0 — survives
+        (0x1a, 0x63, 1, [0x00, 0x00, 0x00, 0x00]), // code 99 ⇒ skip this one
+        (0x32, 0x10, 1, [0x00, 0x00, 0x00, 0x00]), // code 16 ⇒ skip this one
+        (0x2c, 0x03, 1, [0x00, 0x00, 0x00, 0x00]), // valid ContrastMode — survives
+      ],
+      &[],
+    );
+    for print_conv in [true, false] {
+      assert_panasonic_paths_agree(&bad_format_later, 0, order, model, print_conv);
+    }
+
+    // ---- bad format code at INDEX 0 ⇒ ABORT the whole directory (Exif.pm:6475,
+    // "assume corrupted IFD if this is our first entry") ⇒ NO entries, even though
+    // a perfectly valid 0x01 follows. Both paths must yield EMPTY.
+    let bad_format_index0 = crafted_panasonic_raw(
+      &[
+        (0x1a, 0x63, 1, [0x00, 0x00, 0x00, 0x00]), // code 99 at index 0 ⇒ abort
+        (0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00]), // valid — but never reached
+      ],
+      &[],
+    );
+    for print_conv in [true, false] {
+      let oracle = assert_panasonic_paths_agree(&bad_format_index0, 0, order, model, print_conv);
+      assert!(
+        oracle.is_empty(),
+        "pc={print_conv}: a bad format at index 0 aborts the whole Panasonic IFD"
+      );
+    }
+
+    // ---- suspicious offset (Exif.pm:6549): an out-of-line value whose resolved
+    // pointer OVERLAPS the IFD directory ⇒ "Suspicious offset" SKIP. 0x51 LensType
+    // string count 8 (>4 ⇒ out-of-line), stored offset = 14 (lands inside the IFD
+    // `[ifd_start=12 .. dir_end=12+2+12=26)`). Both paths must SKIP it; the 0x01
+    // anchor survives.
+    let suspicious = crafted_panasonic_raw(
+      &[
+        (0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00]), // ImageQuality — survives
+        (0x51, 0x02, 8, [14, 0x00, 0x00, 0x00]),   // out-of-line off 14 ⇒ overlaps IFD
+      ],
+      b"ABCDEFG\x00",
+    );
+    for print_conv in [true, false] {
+      let oracle = assert_panasonic_paths_agree(&suspicious, 0, order, model, print_conv);
+      assert!(
+        oracle.iter().all(|e| e.name() != "LensType"),
+        "pc={print_conv}: a suspicious (IFD-overlapping) 0x51 offset must be skipped"
+      );
+    }
+
+    // ---- warn-count > 10 abort (Exif.pm:6455): more than ten counted per-entry
+    // warnings (here: bad format codes at indices 1..=12, after a valid index 0)
+    // ABORT the directory before the remaining entries. The entry that pushes the
+    // count to 11 is fully processed; the NEXT one trips the abort — so a valid
+    // 0x2c placed AFTER the 12 bad entries must NOT survive. Both paths agree.
+    let mut warn_entries: Vec<(u16, u16, u32, [u8; 4])> = Vec::new();
+    warn_entries.push((0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00])); // valid index 0
+    for k in 0..12u16 {
+      // bad format code 99 at indices 1..=12 — each bumps warn_count.
+      warn_entries.push((0x1a00 + k, 0x63, 1, [0x00, 0x00, 0x00, 0x00]));
+    }
+    warn_entries.push((0x2c, 0x03, 1, [0x00, 0x00, 0x00, 0x00])); // valid — past the abort
+    let warn_blob = crafted_panasonic_raw(&warn_entries, &[]);
+    for print_conv in [true, false] {
+      let oracle = assert_panasonic_paths_agree(&warn_blob, 0, order, model, print_conv);
+      assert!(
+        oracle.iter().all(|e| e.name() != "ContrastMode"),
+        "pc={print_conv}: the >10-warn-count abort must drop the post-abort 0x2c entry"
+      );
+    }
+
+    // ---- the short-MakerNote guard. A MakerNote whose DECLARED value
+    // length cannot hold the IFD count word past the 12-byte header (`mn_len <
+    // HEADER_LEN + 2`) is present-but-EMPTY: the oracle returns no entries and the
+    // isolated helper returns `Some((empty, empty))` (NOT None — the slot stays).
+    // Build a 13-byte blob (`Panasonic\0\0\0` + 1 byte) and pass mn_len = 13.
+    {
+      let mut short = b"Panasonic\x00\x00\x00".to_vec();
+      short.push(0x01);
+      assert_eq!(short.len(), 13);
+      for print_conv in [true, false] {
+        let (oracle_typed, oracle) = makernotes::vendors::panasonic::parse_in_tiff(
+          &short,
+          0,
+          short.len(),
+          makernotes::vendors::panasonic::HEADER_LEN,
+          order,
+          print_conv,
+          model,
+          0,
+        );
+        let (iso, iso_typed) =
+          panasonic_makernote_isolated(&short, 0, short.len(), 0, order, model, print_conv)
+            .expect("routes_to_main ⇒ Some (present-but-empty), NOT None");
+        assert!(
+          oracle.is_empty() && iso.is_empty(),
+          "pc={print_conv}: short MakerNote (mn_len < 14) ⇒ both paths empty"
+        );
+        assert_eq!(
+          iso_typed, oracle_typed,
+          "pc={print_conv}: short MakerNote ⇒ both typed surfaces equal (empty)"
+        );
+      }
+    }
+
+    // ---- `body_offset`/offset overflow (`usize::MAX`) — NO panic, both
+    // paths empty. Pass mn_offset = usize::MAX so `mn_offset + HEADER_LEN`
+    // saturates / `mn_offset + mn_len` overflows: the oracle's `checked_add`
+    // guards and the isolated `saturating_add` ifd-offset both yield an empty walk
+    // without panicking. Use a real `Panasonic`-prefixed blob (so the gate would
+    // pass if reached) but an out-of-range offset.
+    {
+      let blob = crafted_panasonic_raw(&[(0x01, 0x03, 1, [0x02, 0x00, 0x00, 0x00])], &[]);
+      for print_conv in [true, false] {
+        // The oracle with a `usize::MAX` body offset: the short-MakerNote /
+        // checked-add framing returns empty without panic.
+        let (_oracle_typed, oracle) = makernotes::vendors::panasonic::parse_in_tiff(
+          &blob,
+          0,
+          blob.len(),
+          usize::MAX,
+          order,
+          print_conv,
+          model,
+          0,
+        );
+        assert!(
+          oracle.is_empty(),
+          "pc={print_conv}: oracle with body_offset = usize::MAX ⇒ empty, no panic"
+        );
+        // The isolated helper with mn_offset = usize::MAX: the blob window is
+        // clamped empty (`mn_offset.saturating_add(mn_len).min(len)` ⇒ a `get(MAX..)`
+        // ⇒ None) ⇒ `?` short-circuits to None. No panic.
+        let iso =
+          panasonic_makernote_isolated(&blob, usize::MAX, blob.len(), 0, order, model, print_conv);
+        assert!(
+          iso.is_none(),
+          "pc={print_conv}: isolated with mn_offset = usize::MAX ⇒ None (empty window), no panic"
+        );
+      }
+    }
+  }
+
+  /// The group OVERRIDE is scoped to the Panasonic table too: `vendor_group1_of` is
+  /// `Some(\"Panasonic\")` for `Panasonic` (so a Panasonic leaf emits as
+  /// `Panasonic:*`) — phase 3 of the engine migration (#243).
+  #[test]
+  fn vendor_group1_override_includes_panasonic() {
+    assert_eq!(vendor_group1_of(TableRef::Panasonic), Some("Panasonic"));
   }
 
   // ====================================================================// Canon engine migration — Step B1 differential test (#243 phase 2)
