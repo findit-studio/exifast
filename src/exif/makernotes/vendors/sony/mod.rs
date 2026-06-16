@@ -86,7 +86,7 @@ pub use model_ids::{SONY_MODEL_IDS, SonyModelEntry};
 pub use printconv::{
   CONDITION_GATED_IDS, RAWCONV_DROP_IDS, SonyPrintConv, rawconv_drops, single_hash_condition_holds,
 };
-pub use tags::{SONY_TAGS, SonyTag, SubTable, lookup};
+pub use tags::{SONY_TAGS, SonyTag, SubTable, format_override, lookup};
 
 use super::super::super::ifd::{ByteOrder, RawValue};
 
@@ -390,7 +390,7 @@ pub fn parse_in_tiff(
       }
       _ => def.conv.apply(&entry.value, print_conv),
     };
-    populate_typed(&mut typed, entry, &value);
+    populate_typed(&mut typed, entry.tag_id, &entry.value, &value);
     // Emit WITH the bundled `Unknown => 1` flag (`Sony.pm:675-681`
     // `%unknownCipherData`). Unknown-suppression is the emission engine's
     // job (`ExifTool.pm:9179-9185` returns undef for Unknown tags unless
@@ -425,8 +425,11 @@ pub fn parse_in_tiff(
 /// - `MakerNoteSony5` (`:1070`) — `(Make=~/^SONY/ or (Make=~/^HASSELBLAD/
 ///   and Model=~/^(HV|Stellar|Lusso|Lunar)/)) and blob !~ /^\x01\x00/`, and
 ///   the blob matched none of the earlier prefixed arms ⇒ **Sony::Main**.
+///   Tested BEFORE SonyEricsson, so a `SEMC MS\0` blob whose Make is `/^SONY/`
+///   is claimed HERE (`%Sony::Main`), exactly as ExifTool's `%Main` order.
 /// - `MakerNoteSonyEricsson` (`:1083`, `SEMC MS\0`) ⇒ `Sony::Ericsson`
-///   (`Base => '$start - 8'`) — NOT Main.
+///   (`Base => '$start - 8'`) — NOT Main. Reached only when Sony5 did NOT
+///   admit the blob (Make not `/^SONY/`, e.g. the real `"Sony Ericsson"`).
 /// - `MakerNoteSonySRF` (`:1093`, Make `^SONY` + the `\x01\x00` case) ⇒
 ///   `Sony::SRF` — NOT Main.
 ///
@@ -460,21 +463,35 @@ pub fn routes_to_main(blob: &[u8], make: Option<&str>, model: Option<&str>) -> b
   {
     return false;
   }
-  // SonyEricsson / SonySRF signatures are NOT Main even though Sony5's
-  // make gate would otherwise admit them. SonyEricsson is keyed by its
-  // `SEMC MS\0` signature; SonySRF is the `\x01\x00` SONY case (which the
-  // Sony5 `!~ /^\x01\x00/` lookahead already excludes below).
-  if blob.starts_with(b"SEMC MS\x00") {
-    return false; // → Sony::Ericsson
-  }
-  // MakerNoteSony5 — make-gated, headerless, blob NOT `\x01\x00`
-  // (`:1072-1075`). The `\x01\x00` case is SonySRF (`Sony::SRF`), not Main.
+  // MakerNoteSony5 (`:1070`) — make-gated, headerless, blob NOT `\x01\x00`
+  // (`:1072-1075`). This is tested BEFORE SonyEricsson (`:1083`) in `%Main`, so
+  // a `SEMC MS\0` blob whose parent Make matches `/^SONY/` is claimed by Sony5
+  // → `Sony::Main` here (ExifTool decodes it through `%Main`, even into bogus
+  // tags) — the SEMC rejection below only fires for a blob Sony5 did NOT admit
+  // (the common real Ericsson case, Make `"Sony Ericsson"`, which is not
+  // `/^SONY/`). The `\x01\x00` case is SonySRF (`Sony::SRF`), excluded here by
+  // the `!~ /^\x01\x00/` lookahead and rejected as non-Main below. This mirrors
+  // the dispatcher's own `%Main`-order classification (`dispatcher.rs:1325`
+  // Sony5 precedes `:1341` SonyEricsson) so the two cannot drift.
   let make_ok = matches!(make, Some(m) if m.starts_with("SONY"))
     || (matches!(make, Some(m) if m.starts_with("HASSELBLAD"))
       && matches!(model, Some(m) if {
         m.starts_with("HV") || m.starts_with("Stellar") || m.starts_with("Lusso") || m.starts_with("Lunar")
       }));
-  make_ok && !blob.starts_with(b"\x01\x00")
+  if make_ok && !blob.starts_with(b"\x01\x00") {
+    return true;
+  }
+  // SonyEricsson (`:1083`) / SonySRF (`:1093`) — NOT Main, tested AFTER Sony5
+  // (`%Main` order). A `SEMC MS\0` blob reaches here only when Sony5's make gate
+  // did NOT admit it (Make not `/^SONY/`) ⇒ `Sony::Ericsson`. Any other body
+  // that fell through Sony5 (a `\x01\x00` SonySRF blob, or a non-`SONY`/
+  // non-Hasselblad Make) is likewise NOT `%Sony::Main`.
+  if blob.starts_with(b"SEMC MS\x00") {
+    return false; // → Sony::Ericsson
+  }
+  // SonySRF (`Make=~/^SONY/`, the `\x01\x00` case) and every other fall-through
+  // are NOT Main.
+  false
 }
 
 /// **The single gated entry into the Sony `%Sony::Main` parser.** Every
@@ -582,20 +599,35 @@ pub fn parse_into_metadata(
   }
 }
 
-/// Populate the typed struct from one Sony Main-IFD leaf-tag emission.
-fn populate_typed(typed: &mut MakerNotesSony, entry: &SonyEntry, val: &TagValue) {
-  match entry.tag_id {
+/// Populate the typed struct from one Sony Main-IFD leaf-tag emission. `raw` is
+/// the entry's post-Format-decode [`RawValue`]; `val` the already-rendered
+/// [`TagValue`] (read ONLY by 0xb020's string fallback).
+///
+/// MUST be called ONLY for an entry that PASSED every suppression gate (the
+/// oracle [`parse_in_tiff`] calls it AFTER the SubDirectory-skip / single-HASH /
+/// RawConv-drop / conditional-AF checks, alongside the emission) — a rawconv-
+/// dropped 0xb041, for instance, must populate NEITHER the emission NOR
+/// `exposure_mode`. The shared-`Walker` Sony capture
+/// (`exif::mod::emit_sony_value`) preserves that ordering by calling this from the
+/// SAME gate-passing path it emits from (#243 phase 3).
+pub(crate) fn populate_typed(
+  typed: &mut MakerNotesSony,
+  tag_id: u16,
+  raw: &RawValue,
+  val: &TagValue,
+) {
+  match tag_id {
     0x0102 => {
-      typed.quality = first_u32(&entry.value);
+      typed.quality = first_u32(raw);
     }
     0x0115 => {
-      typed.white_balance = first_u32(&entry.value);
+      typed.white_balance = first_u32(raw);
     }
     0x200e => {
-      typed.picture_effect = first_u32(&entry.value);
+      typed.picture_effect = first_u32(raw);
     }
     0xb001 => {
-      if let Some(n) = first_u32(&entry.value) {
+      if let Some(n) = first_u32(raw) {
         let id = u16::try_from(n).unwrap_or(0);
         typed.model_id = Some(id);
         typed.model_name = model_ids::lookup_name(id);
@@ -603,23 +635,23 @@ fn populate_typed(typed: &mut MakerNotesSony, entry: &SonyEntry, val: &TagValue)
     }
     0xb020 => {
       // CreativeStyle — string passthrough.
-      if let RawValue::Text { text: s, .. } = &entry.value {
+      if let RawValue::Text { text: s, .. } = raw {
         typed.creative_style = Some(s.as_str().into());
       } else if let TagValue::Str(s) = val {
         typed.creative_style = Some(s.clone());
       }
     }
     0xb023 => {
-      typed.scene_mode = first_u32(&entry.value);
+      typed.scene_mode = first_u32(raw);
     }
     0xb025 => {
-      typed.dynamic_range_optimizer = first_u32(&entry.value);
+      typed.dynamic_range_optimizer = first_u32(raw);
     }
     0xb026 => {
-      typed.image_stabilization = first_u32(&entry.value);
+      typed.image_stabilization = first_u32(raw);
     }
     0xb027 => {
-      if let Some(n) = first_u32(&entry.value) {
+      if let Some(n) = first_u32(raw) {
         typed.lens_type = Some(n);
         // 0xb027 uses the A-mount `%sonyLensTypes` (`Sony.pm:2370`), NOT the
         // E-mount `%sonyLensTypes2` — 65535 ⇒ the E-mount sentinel name.
@@ -627,10 +659,10 @@ fn populate_typed(typed: &mut MakerNotesSony, entry: &SonyEntry, val: &TagValue)
       }
     }
     0xb041 => {
-      typed.exposure_mode = first_u32(&entry.value);
+      typed.exposure_mode = first_u32(raw);
     }
     0xb054 => {
-      typed.white_balance_2 = first_u32(&entry.value);
+      typed.white_balance_2 = first_u32(raw);
     }
     _ => {}
   }
@@ -653,8 +685,17 @@ fn first_u32(raw: &RawValue) -> Option<u32> {
 /// storing 0x201c's raw `$val`. Returns `Some(raw)` when this body sets it,
 /// else `None` (SLT/HV branch 1, or no branch — neither sets a DataMember).
 fn af_area_data_member(entry: &SonyEntry, model: Option<&str>) -> Option<i64> {
+  af_area_data_member_from_raw(&entry.value, model)
+}
+
+/// 0x201c's `AFAreaILCx` DataMember from its RAW value + the body `$$self{Model}`
+/// — the [`af_area_data_member`] core, taking the [`RawValue`] directly so the
+/// shared-`Walker` Sony capture (`exif::mod::sony_makernote_isolated`) can thread
+/// the same in-IFD side-effect 0x201e reads (#243 phase 3).
+#[must_use]
+pub(crate) fn af_area_data_member_from_raw(raw: &RawValue, model: Option<&str>) -> Option<i64> {
   if SonyPrintConv::af_area_sets_data_member(model) {
-    first_i64(&entry.value)
+    first_i64(raw)
   } else {
     None
   }
@@ -718,7 +759,10 @@ mod tests {
 
   /// `routes_to_main` admits ONLY the two `%Sony::Main` variants
   /// (`MakerNoteSony` prefixes + `MakerNoteSony5`) and rejects every
-  /// non-Main variant (Sony2/3 → Olympus, Sony4 → PIC, Ericsson, SRF).
+  /// non-Main variant (Sony2/3 → Olympus, Sony4 → PIC, Ericsson, SRF), in the
+  /// EXACT `%Main` order the dispatcher uses — Sony5 (`:1070`) BEFORE
+  /// SonyEricsson (`:1083`), so a `SEMC MS\0` blob with an uppercase `SONY` Make
+  /// is claimed by Sony5 → Main, not dropped to Ericsson.
   #[test]
   fn routes_to_main_gates_non_main_variants() {
     // MakerNoteSony prefixes → Main (signature-only).
@@ -746,8 +790,19 @@ mod tests {
       b"SEMC MS\x00rest",
       Some("Sony Ericsson"),
       None
-    )); // Ericsson
+    )); // Ericsson (Make not `^SONY` ⇒ Sony5 does NOT claim it)
     assert!(!routes_to_main(&[0x01, 0x00, 0x09], Some("SONY"), None)); // SonySRF (\x01\x00)
+
+    // %Main ORDER: MakerNoteSony5 (`:1070`) is tested BEFORE
+    // MakerNoteSonyEricsson (`:1083`), so a `SEMC MS\0` blob whose parent Make
+    // matches `/^SONY/` (uppercase) is claimed by Sony5 → `%Sony::Main` (ExifTool
+    // decodes it through Main, even into bogus tags), NOT rejected to Ericsson.
+    // This mirrors the dispatcher's own `%Main`-order classification
+    // (`dispatcher.rs` Sony5 precedes SonyEricsson) so the two cannot drift.
+    assert!(routes_to_main(b"SEMC MS\x00rest", Some("SONY"), None));
+    // The `\x01\x00` SonySRF lookahead still excludes a `\x01\x00` body from
+    // Sony5 even with an uppercase `SONY` Make ⇒ NOT Main (→ SonySRF).
+    assert!(!routes_to_main(b"\x01\x00SEMC", Some("SONY"), None));
     // A non-SONY make with no signature is not Main (would be Unknown).
     assert!(!routes_to_main(&[0x12, 0x34], Some("Canon"), None));
     assert!(!routes_to_main(&[0x12, 0x34], None, None));

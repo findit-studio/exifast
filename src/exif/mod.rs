@@ -430,6 +430,13 @@ pub struct ExifEntry {
   name: &'static str,
   /// The decoded value.
   value: ExifValue,
+  /// The ON-DISK TIFF format the entry was written with (the `$format` a
+  /// `Condition` reads, `GetTagInfo`), captured BEFORE any tag-table `Format`
+  /// override re-interprets the value bytes. Threaded so the Sony `%Main`
+  /// `$format`-gated single-HASH rows (0x1000/0x1001/0x1002) can be suppressed at
+  /// emit time exactly as `parse_in_tiff` does (#243 phase 3); the core Exif/GPS
+  /// emit + the other vendors ignore it.
+  on_disk_format: Format,
   /// The conversion ExifTool applies to this tag at serialize time.
   conv: ResolvedConv,
 }
@@ -471,6 +478,15 @@ impl ExifEntry {
   pub const fn value_ref(&self) -> &ExifValue {
     &self.value
   }
+
+  /// The ON-DISK TIFF format the entry was written with (pre-`Format`-override) —
+  /// the `$format` a bundled `Condition` reads. Consumed by the Sony emit's
+  /// `$format`-gated single-HASH rows; every other emit path ignores it.
+  #[must_use]
+  #[inline(always)]
+  pub const fn on_disk_format(&self) -> Format {
+    self.on_disk_format
+  }
 }
 
 /// Which tag-table descriptor an entry's value is converted under at serialize
@@ -506,6 +522,19 @@ enum ResolvedConv {
   /// Apple Main IFD under `active_table == Apple` reproduces `walk_apple_body`
   /// exactly (base 0, out-of-line offsets resolve blob-relative).
   Apple(&'static makernotes::vendors::apple::tags::AppleTag),
+  /// A Sony maker-note leaf (`%Sony::Main` descriptor). Carries the resolved
+  /// [`SonyTag`](makernotes::vendors::sony::tags::SonyTag) so the emit reapplies
+  /// its [`SonyPrintConv`](makernotes::vendors::sony::printconv::SonyPrintConv) —
+  /// with the model + `AFAreaILCx` DataMember context for the four
+  /// conditional-ARRAY AF tags — and the per-entry suppression gates
+  /// (SubDirectory skip, single-HASH `Condition`, sentinel RawConv drop) the
+  /// retired `parse_in_tiff` applied at collection time (`sony/mod.rs:311-404`).
+  /// Sony is the COMPLEX vendor case (#243 phase 3): the shared `Walker` walks the
+  /// Sony Main IFD under `active_table == Sony` (parent-TIFF data, base 0, parent
+  /// order) reproducing `walk_sony_in_tiff`, but the per-leaf render lives in
+  /// [`emit_sony_value`] (NOT `emit_entry`) because of those gates + the in-IFD
+  /// af_area thread.
+  Sony(&'static makernotes::vendors::sony::tags::SonyTag),
 }
 
 impl ResolvedConv {
@@ -522,6 +551,7 @@ impl ResolvedConv {
       ResolvedConv::Gps(_) => vendor_group1_of(TableRef::Gps),
       ResolvedConv::Canon(_) => vendor_group1_of(TableRef::Canon),
       ResolvedConv::Apple(_) => vendor_group1_of(TableRef::Apple),
+      ResolvedConv::Sony(_) => vendor_group1_of(TableRef::Sony),
     }
   }
 }
@@ -546,12 +576,17 @@ const fn vendor_group1_of(table: TableRef) -> Option<&'static str> {
     // `parse_with_print_conv` + `push_maker_note_tags` push every Apple
     // `VendorEmission` under `("MakerNotes","Apple")`.
     TableRef::Apple => Some("Apple"),
+    // `%Sony::Main` — phase 3 of the engine migration (#243). A Sony maker-note
+    // leaf emits under the `Sony` family-1 group, exactly as `parse_in_tiff` +
+    // `push_maker_note_tags` push every Sony `VendorEmission` under
+    // `("MakerNotes","Sony")` (`Sony.pm:710` declares only `GROUPS => { 0 =>
+    // 'MakerNotes' }`, so ExifTool derives family-1 from the vendor module).
+    TableRef::Sony => Some("Sony"),
     // Core IFD tables keep their `IfdName` group; the not-yet-migrated vendor
     // tables never reach the emit through this walker.
     TableRef::Exif
     | TableRef::Gps
     | TableRef::Interop
-    | TableRef::Sony
     | TableRef::Panasonic
     | TableRef::Nikon
     | TableRef::Samsung => None,
@@ -604,7 +639,13 @@ enum MakerNoteValueConvDecode<'a> {
     model: Option<smol_str::SmolStr>,
     file_type: Option<smol_str::SmolStr>,
   },
-  /// Sony — `parse_main_gated(data, mn_offset, mn_len, body_off, order, ·, make, model)`.
+  /// Sony — re-drive the SHARED `Walker`'s gated Sony Main walk + emission capture
+  /// ([`sony_makernote_isolated`]) with `print_conv = false` (#243 phase 3). The
+  /// walk is deterministic across the PrintConv flag (same `routes_to_main` gate,
+  /// same bytes through the same machinery; only the per-leaf render + the
+  /// conditional-AF gates differ on the flag), so the recomputed `-n` emissions are
+  /// byte-identical to the old eager `-n` cache. Carries the parent-TIFF window +
+  /// the `$$self{Make}`/`$$self{Model}` the gate + the AF-tag branches read.
   Sony {
     data: &'a [u8],
     mn_offset: usize,
@@ -670,7 +711,7 @@ impl MakerNoteValueConvDecode<'_> {
   /// ValueConv too (same gate, PrintConv-independent).
   #[must_use]
   fn recompute(&self) -> std::vec::Vec<makernotes::VendorEmission> {
-    use makernotes::vendors::{dji, panasonic, sony};
+    use makernotes::vendors::{dji, panasonic};
     match self {
       MakerNoteValueConvDecode::None => std::vec::Vec::new(),
       MakerNoteValueConvDecode::Apple { blob, order, make } => {
@@ -704,18 +745,24 @@ impl MakerNoteValueConvDecode<'_> {
         make,
         model,
       } => {
-        sony::parse_main_gated(
+        // The `-n` recompute is the isolated walk with `print_conv = false` and the
+        // typed slot discarded (the `-n` path needs only the ValueConv emissions),
+        // mirroring `canon_recompute_value_conv` (#243 phase 3). The route matched
+        // in PrintConv ⇒ it matches in ValueConv (same `routes_to_main` gate,
+        // PrintConv-independent), so `Some` always holds; `unwrap_or_default` is the
+        // defensive empty `Vec` for the impossible `None`.
+        sony_makernote_isolated(
           data,
           *mn_offset,
           *mn_len,
           *body_off,
           *order,
-          false,
           make.as_deref(),
           model.as_deref(),
+          false,
         )
-        .expect("routes_to_main is deterministic across print_conv")
-        .1
+        .map(|(e, _)| e)
+        .unwrap_or_default()
       }
       MakerNoteValueConvDecode::Panasonic {
         data,
@@ -3207,7 +3254,9 @@ impl Walker<'_, '_> {
     // itself dropping a tag absent from the table. Most unknowns are filtered by
     // the gate above; `OldSubfileType` (0x00ff) is admitted there expressly so
     // its MultiPage tap runs HERE, and emit then drops its unported leaf.
-    self.emit(kind, tag_id, raw);
+    // BigTIFF applies no tag-table `Format` override (`BigTIFF.pm` reads the
+    // on-disk `$formatStr` directly), so the emitted on-disk format IS `format`.
+    self.emit(kind, tag_id, format, raw);
     Step::Keep
   }
 
@@ -3360,6 +3409,10 @@ impl Walker<'_, '_> {
       // tag yields `None` (the unknown-tag warning form), matching
       // `parse_with_print_conv`'s `tags::lookup(...).is_none()` skip.
       TableRef::Apple => makernotes::vendors::apple::tags::lookup(tag_id).map(|t| t.name()),
+      // `%Sony::Main` — phase 3 of the engine migration (#243). An unknown Sony
+      // tag yields `None` (the unknown-tag warning form), matching
+      // `parse_in_tiff`'s `tags::lookup(...).is_none()` skip.
+      TableRef::Sony => makernotes::vendors::sony::tags::lookup(tag_id).map(|t| t.name()),
       _ => tables::lookup(tag_id).map(|t| t.name),
     }
   }
@@ -3734,7 +3787,9 @@ impl Walker<'_, '_> {
     if self.active_table == TableRef::Canon
       && let Some(raw) = self.canon_special_leaf_value(tag_id, format, value_offset, read_len)
     {
-      self.emit(kind, tag_id, raw);
+      // The Canon specials keep their on-disk `$format` (no Sony `$format` gate
+      // applies to a Canon walk).
+      self.emit(kind, tag_id, format, raw);
       // The special-case value was decoded + emitted (FoundTag) — [`Step::Keep`].
       return Step::Keep;
     }
@@ -3761,7 +3816,13 @@ impl Walker<'_, '_> {
     // 304 — correctly NUL-trimmed, exactly as bundled does.
     // Resolved against the active table (`Exif.pm:6729-6744` reads the
     // override off the directory's `$tagTablePtr`). `Interop` inherits the
-    // `%Exif::Main` override table; VENDOR tables (Canon) do NOT (see the `_` arm).
+    // `%Exif::Main` override table; the Canon vendor table does NOT (see its arm).
+    //
+    // The ON-DISK format is captured BEFORE the override reshapes `format`, so the
+    // emitted [`ExifEntry`] retains the `$format` a bundled `Condition` reads
+    // (`GetTagInfo`). The Sony `%Main` `$format`-gated single-HASH rows
+    // (0x1000/0x1001/0x1002) read it at emit time.
+    let on_disk_format = format;
     let table_override = match self.active_table {
       TableRef::Gps => {
         #[cfg(feature = "gps")]
@@ -3778,6 +3839,14 @@ impl Walker<'_, '_> {
         }
       }
       TableRef::Exif | TableRef::Interop => tables::format_override(tag_id),
+      // `%Sony::Main` carries its OWN `Format =>` directives (0x0112/0x1000/
+      // 0x200a/0x2037/0xb022/0xb02a — `Sony.pm`); ExifTool's `ProcessExif` reads
+      // the override off the ACTIVE `$tagTablePtr` (`Exif.pm:6729`), so the Sony
+      // table's directives apply on a Sony Main walk — reproducing
+      // `walk_sony_in_tiff`'s `resolve_read_format` step (`sony/body.rs:119`).
+      // Resolving them here keeps the shared-Walker walk byte-identical to the
+      // retired `sony::parse_in_tiff` oracle for those six tags (#243 phase 3).
+      TableRef::Sony => makernotes::vendors::sony::format_override(tag_id),
       // VENDOR tables (Canon, #243 phase 2) inherit NO `%Exif::Main` `Format`
       // override: a Canon MakerNote tag colliding with an EXIF override id (e.g.
       // 0x9286 `UserComment`, `Format => 'undef'`) must keep its ON-DISK format —
@@ -3879,6 +3948,7 @@ impl Walker<'_, '_> {
         self.emit(
           kind,
           tag_id,
+          on_disk_format,
           RawValue::Text {
             text: placeholder,
             raw,
@@ -3914,7 +3984,7 @@ impl Walker<'_, '_> {
       return Step::Skip;
     };
 
-    self.emit(kind, tag_id, raw);
+    self.emit(kind, tag_id, on_disk_format, raw);
     // The leaf value was decoded + emitted (FoundTag) — a normal entry:
     // [`Step::Keep`].
     Step::Keep
@@ -4681,8 +4751,25 @@ impl Walker<'_, '_> {
                 // branches (Canon/Panasonic-style model threading).
                 let make = self.captured_make.as_deref();
                 let model = self.captured_model.as_deref();
-                if let Some((typed_pc, emi_pc)) = makernotes::vendors::sony::parse_main_gated(
-                  self.data, mn_offset, mn_len, body_off, self.order, true, make, model,
+                // Walk the Sony Main IFD in a FRESH, ISOLATED `Walker`
+                // ([`sony_makernote_isolated`]) — NOT on `self` — then capture its
+                // emissions into the cached-emission buffer (#243 phase 3,
+                // structural isolation, mirroring Apple/Canon). The isolated walk
+                // builds its own `Walker` over `self.data` (base 0, the Sony Main
+                // IFD at `mn_offset + body_off`), walks under `TableRef::Sony`, and
+                // DISCARDS its `warnings` / `warn_count` / `active_ifd_offsets` — so
+                // a malformed Sony entry cannot leak a core `ExifTool:Warning`,
+                // abort the parent ExifIFD's warn-count, or be suppressed by the
+                // parent's ancestor cycle guard. The `routes_to_main` variant gate
+                // runs INSIDE the helper (FIRST), returning `None` for the non-Main
+                // variants — on which the Sony slot stays absent (blob captured,
+                // vendor identified, Main parser intentionally not run; their
+                // dedicated tables are unported). `print_conv = true` yields the
+                // cached `-j` emissions + the typed `MakerNotesSony`; the `-n`
+                // emissions are recomputed on demand via the SAME helper with
+                // `print_conv = false`.
+                if let Some((emi_pc, typed_pc)) = sony_makernote_isolated(
+                  self.data, mn_offset, mn_len, body_off, self.order, make, model, true,
                 ) {
                   meta.set_sony(typed_pc);
                   cached_pc = emi_pc;
@@ -4909,7 +4996,7 @@ impl Walker<'_, '_> {
   /// `Exif.pm:6757` `next unless $verbose` (an unknown tag surfaces only in
   /// verbose mode; the default `-j` output omits it). Documented
   /// incremental-completion item in `docs/tracking.md`.
-  fn emit(&mut self, kind: IfdKind, tag_id: u16, raw: RawValue) {
+  fn emit(&mut self, kind: IfdKind, tag_id: u16, on_disk_format: Format, raw: RawValue) {
     // PR #68 — `SubfileType` (0x00fe) / `OldSubfileType` (0x00ff) `RawConv`
     // taps (`Exif.pm:452-461` / `:469-475`). Bundled increments
     // `$$self{PageCount}` and sets `$$self{MultiPage}` BEFORE the tag value
@@ -5084,6 +5171,16 @@ impl Walker<'_, '_> {
         Some(t) => (t.name(), ResolvedConv::Apple(t)),
         None => return,
       },
+      // `%Sony::Main` — phase 3 of the engine migration (#243). The resolved
+      // [`SonyTag`] rides in `ResolvedConv::Sony` so the emit ([`emit_sony_value`])
+      // reapplies its `SonyPrintConv` + per-entry suppression gates exactly as
+      // `parse_in_tiff` does at collection time (`sony/mod.rs`). An unknown Sony tag
+      // is skipped here, matching `parse_in_tiff`'s `tags::lookup(...).is_none()`
+      // `continue`.
+      TableRef::Sony => match makernotes::vendors::sony::tags::lookup(tag_id) {
+        Some(t) => (t.name(), ResolvedConv::Sony(t)),
+        None => return,
+      },
       _ => match tables::lookup(tag_id) {
         Some(t) => (t.name, ResolvedConv::Exif(t)),
         None => return, // unknown Exif tag — verbose-only, omit.
@@ -5131,6 +5228,7 @@ impl Walker<'_, '_> {
       tag_id,
       name,
       value: ExifValue::new(raw),
+      on_disk_format,
       conv,
     });
   }
@@ -6081,6 +6179,20 @@ fn emit_entry<S: ExifSink>(
       let group1 = entry.conv.vendor_group1().unwrap_or(group);
       emit_apple_value(group1, name, raw, apple_tag, print_conv, out)
     }
+    // `%Sony::Main` vendor leaf (#243 phase 3). Production routes a Sony Main walk
+    // through the DEDICATED capture loop in [`sony_makernote_isolated`], which
+    // calls [`emit_sony_value`] directly so it can thread the in-IFD `AFAreaILCx`
+    // DataMember (set at 0x201c, read by 0x201e). `emit_entry` is therefore NOT the
+    // Sony capture path — but the match must be exhaustive, and no core-IFD walk
+    // produces a `ResolvedConv::Sony` entry (Sony leaves exist only under
+    // `active_table == Sony`, set solely by the isolated Sony walk). This arm is a
+    // panic-free fallback that renders every Sony leaf faithfully EXCEPT 0x201e's
+    // af_area-dependent branch (it passes `af_area = None`), which only the
+    // dedicated capture loop reaches; the `model` is still threaded.
+    ResolvedConv::Sony(sony_tag) => {
+      let group1 = entry.conv.vendor_group1().unwrap_or(group);
+      emit_sony_value(group1, entry, sony_tag, model, None, print_conv, None, out)
+    }
   }
 }
 
@@ -6142,6 +6254,110 @@ fn emit_apple_value<S: ExifSink>(
 ) -> Result<(), core::convert::Infallible> {
   let value = apple_tag.conv().apply(raw, print_conv);
   out.write_vendor_value("MakerNotes", group1, name, value, apple_tag.is_unknown())
+}
+
+/// Render ONE Sony maker-note leaf into the sink — the emit-time reproduction of
+/// `sony::parse_in_tiff`'s per-tag emit loop (`sony/mod.rs:311-404`) through the
+/// shared `Walker` (#243 phase 3).
+///
+/// Sony is the COMPLEX vendor case: unlike Apple/Canon's plain leaf render, each
+/// `%Sony::Main` entry passes through a chain of per-entry suppression gates that
+/// reproduce ExifTool's `GetTagInfo` / `Condition` / `RawConv` outcome (an
+/// absent tag, NOT a raw fallback). This emit reproduces, in `parse_in_tiff`
+/// order:
+///
+/// 2. **SubDirectory skip** — a row with a `sub_table` (CameraInfo / CameraSettings
+///    / ShotInfo / the 0x9xxx encrypted series / …) DESCENDS into a child table and
+///    never emits the parent pointer as a value; the Phase-3 port defers the child
+///    walk, so it emits NEITHER parent nor children (`sony/mod.rs:315-341`).
+/// 4. **Single-HASH `Condition` suppression** — the model-gated rows
+///    (0x201b/0x201d/0x2021/0x205c/0xb050) and the `$format`-gated MultiBurst rows
+///    (0x1000/0x1001/0x1002, read off [`ExifEntry::on_disk_format`]) are dropped
+///    when their `Condition` does not hold (`single_hash_condition_holds`).
+/// 5. **RawConv sentinel drop** — the 0xb04x `$val == 65535` rows + 0xb048's
+///    `-1`-on-DSLR-A100 drop are suppressed on the RAW value (`rawconv_drops`).
+/// 6. **The value** — the four conditional-ARRAY AF tags (0x201c/0x201e/0x2020/
+///    0x2022) render via `apply_with_context(.., model, af_area)` and SUPPRESS on a
+///    `None` (no `Condition` branch matched); every other leaf renders via the
+///    plain `apply`. The 0x201c `AFAreaILCx` DataMember CAPTURE is the caller's job
+///    (it precedes 0x201e in the IFD; threaded in as `af_area`).
+/// 7. **Emit** — `write_vendor_value("MakerNotes", group1, …)` carrying the row's
+///    `Unknown=>1` flag (dropped ONCE by `run_emission`, like Apple/Canon).
+///
+/// A skipped gate writes NOTHING (no emission for that entry) AND populates no
+/// typed field — the faithful port of ExifTool's absent-tag behaviour. `model` is
+/// the parent `$$self{Model}`; `af_area` the `AFAreaILCx` DataMember the capture
+/// loop set at 0x201c.
+///
+/// `typed` is the optional sink for step 7's
+/// [`populate_typed`](makernotes::vendors::sony::populate_typed) — `Some` only for
+/// the production capture (which builds the typed `MakerNotesSony` from the SAME
+/// gate-passing entries the oracle does, so a gated tag like a rawconv-dropped
+/// 0xb041 populates NEITHER the emission NOR `exposure_mode`). The `emit_entry`
+/// defensive arm passes `None`.
+// Threads the full render context (entry, the resolved `SonyTag`, the
+// model/af_area gate inputs, the PrintConv mode, the optional typed sink, and the
+// emit sink). Bundling them into a struct would obscure the 1:1 mapping to
+// `parse_in_tiff`'s collection-time gates, not clarify it — the sibling
+// `emit_entry`/`emit_canon_subtable` carry the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
+fn emit_sony_value<S: ExifSink>(
+  group1: &str,
+  entry: &ExifEntry,
+  sony_tag: &makernotes::vendors::sony::tags::SonyTag,
+  model: Option<&str>,
+  af_area: Option<i64>,
+  print_conv: bool,
+  typed: Option<&mut makernotes::vendors::sony::MakerNotesSony>,
+  out: &mut S,
+) -> Result<(), core::convert::Infallible> {
+  use makernotes::vendors::sony::{populate_typed, printconv};
+  let tag_id = entry.tag_id;
+  let raw = entry.value.raw();
+  // Step 2 — deferred SubDirectory row: emit NEITHER parent nor children.
+  if sony_tag.sub_table.is_some() {
+    return Ok(());
+  }
+  // Step 4 — single-HASH `Condition` suppression. The `$format`-gated MultiBurst
+  // rows read the ON-DISK format (the `$format` ExifTool's `Condition` reads, NOT
+  // the post-override format), retained on the walked entry.
+  if !printconv::single_hash_condition_holds(tag_id, entry.on_disk_format.name(), model) {
+    return Ok(());
+  }
+  // Step 5 — RawConv sentinel drop (tests the RAW, pre-conv value + the Model).
+  if printconv::rawconv_drops(tag_id, raw, model) {
+    return Ok(());
+  }
+  // Step 6 — render. The four conditional-ARRAY AF tags need the model (+ the
+  // af_area DataMember for 0x201e) and SUPPRESS on `None`; every other leaf
+  // ignores both.
+  let value = match tag_id {
+    0x201c | 0x201e | 0x2020 | 0x2022 => {
+      match sony_tag
+        .conv
+        .apply_with_context(raw, print_conv, model, af_area)
+      {
+        Some(v) => v,
+        // No branch matched ⇒ suppress (no emission for this entry).
+        None => return Ok(()),
+      }
+    }
+    _ => sony_tag.conv.apply(raw, print_conv),
+  };
+  // Step 7 — populate the typed surface (gate-passing only, exactly where the
+  // oracle does), THEN emit with the bundled `Unknown=>1` flag (run_emission drops
+  // it once). The typed populate reads `value` only for 0xb020's string fallback.
+  if let Some(typed) = typed {
+    populate_typed(typed, tag_id, raw, &value);
+  }
+  out.write_vendor_value(
+    "MakerNotes",
+    group1,
+    sony_tag.name(),
+    value,
+    sony_tag.is_unknown(),
+  )
 }
 
 /// Emit the two Canon `%Main` LIST / Format-override SPECIALS at emit time —
@@ -6595,6 +6811,217 @@ fn apple_makernote_isolated(
     typed
   });
   (emissions, typed)
+}
+
+/// Walk the Sony `%Sony::Main` IFD in a FRESH, ISOLATED [`Walker`] over the parent
+/// TIFF and capture its emissions + typed surface — the single GATED entry point
+/// BOTH the `-j` production dispatch and the `-n` recompute drive (#243 phase 3,
+/// structural isolation, mirroring [`apple_makernote_isolated`] /
+/// [`canon_makernote_isolated`]).
+///
+/// ## The variant gate (FIRST)
+///
+/// The dispatcher collapses ALL seven Sony `MakerNotes.pm` variants
+/// (`:1031-1099`) to [`Vendor::Sony`], but only `MakerNoteSony`/`MakerNoteSony5`
+/// use `%Sony::Main`; the rest (`Sony2`/`Sony3` → `Olympus::Main`, `Sony4` →
+/// `Sony::PIC`, `SonyEricsson` → `Sony::Ericsson`, `SonySRF` → `Sony::SRF`) route
+/// to tables this Phase-3 port has not ported, so running the Main walker on them
+/// is UNFAITHFUL (a coincidental tag-id collision decodes a bogus tag). This
+/// function applies [`routes_to_main`](makernotes::vendors::sony::routes_to_main)
+/// on the captured blob (`data[mn_offset .. mn_offset + mn_len]`, computed EXACTLY
+/// as [`parse_main_gated`](makernotes::vendors::sony::parse_main_gated)) and
+/// returns `None` for a non-Main blob — the caller leaves the Sony slot ABSENT.
+/// This is the SAME gate the retired `parse_main_gated` oracle applies, so the
+/// route classification cannot be bypassed.
+///
+/// ## The walk (byte-identity to `parse_in_tiff`)
+///
+/// Both Main variants INHERIT the parent base (no `Base =>` override,
+/// `MakerNotes.pm:1037-1041,1076-1080`), so out-of-line value offsets are
+/// TIFF-relative — a `base: 0` Walker over `data` (the parent TIFF) resolves them
+/// at `data[off]`, byte-identical to the oracle's `walk_sony_in_tiff` (the bodies
+/// carry no MM/II marker, so the byte order is the PARENT order). The IFD count
+/// word sits at `mn_offset + body_offset` (`body_offset` is 12 for the prefixed
+/// `SONY DSC`/CAM/MOBILE/VHAB/TF1 variants, 0 for headerless Sony5). The walk runs
+/// under `active_table == TableRef::Sony` via [`process_subdir`](Walker::process_subdir)
+/// with `ProcessProc::Exif` — which now resolves the Sony table's own `Format =>`
+/// directives (0x0112/0x1000/0x200a/0x2037/0xb022/0xb02a, `Sony.pm`) just as
+/// ExifTool's `ProcessExif` reads them off the active `$tagTablePtr`
+/// (`Exif.pm:6729`), reproducing the oracle's `resolve_read_format` step. The
+/// directory `kind` is `ExifIfd` (a non-Ifd0 kind, so the IFD0-only Make/Model tap
+/// never fires).
+///
+/// ## The per-entry gates (the capture loop)
+///
+/// Sony's `%Main` render is gated per entry (an ABSENT tag, not a raw fallback),
+/// so — unlike Apple/Canon's `emit_entry` capture — the loop drives the dedicated
+/// [`emit_sony_value`] (reproducing `parse_in_tiff`'s SubDirectory-skip /
+/// single-HASH `Condition` / RawConv-drop / conditional-AF gates), threading the
+/// in-IFD `AFAreaILCx` DataMember: 0x201c sets `af_area` (in IFD-tag order it
+/// precedes 0x201e, which reads it). The typed [`MakerNotesSony`] is built from
+/// the SAME walked entries via
+/// [`build_typed_from_pairs`](makernotes::vendors::sony::build_typed_from_pairs)
+/// (the typed leaf set is disjoint from every gated tag, so it is a clean separate
+/// pass, like Apple/Canon).
+///
+/// ## Isolation
+///
+/// A FRESH `Walker` has its OWN `warnings` / `warn_count` / `active_ifd_offsets`,
+/// populated by THIS walk and DISCARDED on return — so a malformed Sony entry
+/// cannot leak a core `ExifTool:Warning`, abort the parent ExifIFD's warn-count,
+/// or be suppressed by the parent's ancestor cycle guard (the oracle, an isolated
+/// `walk_sony_in_tiff`, has none of these side effects either). `print_conv = true`
+/// renders the `-j` emissions + the typed slot; `print_conv = false` the `-n`
+/// emissions (the typed slot is the SAME for both and ALWAYS returned, non-Option,
+/// matching `parse_in_tiff`).
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+fn sony_makernote_isolated(
+  data: &[u8],
+  mn_offset: usize,
+  mn_len: usize,
+  body_offset: usize,
+  order: ByteOrder,
+  make: Option<&str>,
+  model: Option<&str>,
+  print_conv: bool,
+) -> Option<(
+  std::vec::Vec<makernotes::VendorEmission>,
+  makernotes::vendors::sony::MakerNotesSony,
+)> {
+  use makernotes::vendors::sony;
+  // The variant gate FIRST — the captured MakerNote blob is the bytes the
+  // dispatcher classified (`data[mn_offset .. mn_offset + mn_len]`), computed
+  // EXACTLY as `parse_main_gated` (saturating end, clamped to the buffer). A blob
+  // routing elsewhere ⇒ `None` (the Sony slot stays absent — no spurious tags).
+  let blob_end = mn_offset.saturating_add(mn_len).min(data.len());
+  let blob = data.get(mn_offset..blob_end)?;
+  if !sony::routes_to_main(blob, make, model) {
+    return None;
+  }
+  // Short-MakerNote guard (the oracle's `walk_sony_in_tiff:131` pre-check, in the
+  // REVERSE direction): the dispatcher's variant-gate window must at least contain
+  // the IFD count word INSIDE the declared MakerNote value (`mn_len >= body_offset
+  // + 2`); below that the value has no room for an IFD. Without this, a truncated
+  // MakerNote (e.g. value is only `SONY DSC`, `mn_len = 9`, `body_offset = 12`)
+  // would still walk `data` at `mn_offset + body_offset` and read its count word
+  // from the UNRELATED following parent-TIFF bytes — emitting spurious Sony tags
+  // the oracle (`walk_sony_in_tiff`, which returns empty here) never does, and a
+  // migration regression vs the pre-migration `walk_sony_in_tiff`. `routes_to_main`
+  // already classified the blob as a Main variant, so the faithful result is
+  // present-but-empty (`Some((empty, empty))`), NOT `None` (which would drop the
+  // typed slot the oracle's `parse_in_tiff` still returns). `body_offset + 2` is
+  // `checked_add`ed for the usize-overflow class — an overflow can never satisfy
+  // `mn_len >=`, so it trips the guard exactly as the oracle's `<` test does.
+  match body_offset.checked_add(2) {
+    Some(min_len) if mn_len >= min_len => {}
+    _ => return Some((std::vec::Vec::new(), sony::MakerNotesSony::new())),
+  }
+  // The IFD sits at `mn_offset + body_offset` in `data`. A body offset past the
+  // buffer yields an empty walk (no entries) — the oracle's same out-of-bounds
+  // guard (`walk_sony_in_tiff` returns empty); `process_subdir` is bounds-checked.
+  let ifd_offset = mn_offset.saturating_add(body_offset);
+  let mut w = Walker {
+    data,
+    order,
+    // Both Main variants inherit the parent base (no `Base =>` override), so the
+    // walk never adds `base` to a value — `base: 0` resolves an out-of-line offset
+    // at `data[off]`, byte-identical to the oracle's TIFF-relative read.
+    base: 0,
+    entries: Vec::new(),
+    // FRESH warning channels: a malformed Sony entry warns into THESE, dropped on
+    // return — never the parent's `ExifTool:Warning` stream (the oracle
+    // `walk_sony_in_tiff` silently `continue`s a bad entry, emitting no warning).
+    warnings: Vec::new(),
+    warnings_ignorable: Vec::new(),
+    maker_note: None,
+    captured_make: None,
+    // `$$self{Model}` gates the four conditional-ARRAY AF tags + the single-HASH
+    // `Condition` rows; the Sony walk itself reads no model-conditional structure,
+    // but the captured model is threaded into the capture-loop gates below (not
+    // into the walk), so leave it unset on the Walker.
+    captured_model: None,
+    chain_guard: ChainGuard::Owned(std::collections::HashSet::new()),
+    cycle_guard_warnings: Vec::new(),
+    // EMPTY active path: the fresh walker has NO ancestor on its recursion stack,
+    // so a Sony value offset that coincides with a PARENT IFD offset is still
+    // walked — the oracle, also pathless, always walks it.
+    active_ifd_offsets: Vec::new(),
+    page_count: 0,
+    multi_page: false,
+    dng_version: false,
+    // No Sony Main leaf reads `$$self{FILE_TYPE}`.
+    file_type: None,
+    // The parent TIFF block IS the readable buffer (an effective RAF), like the
+    // dispatch walk.
+    no_raf: false,
+    warn_count: 0,
+    // Starts on the Exif table; `process_subdir(TableRef::Sony)` swaps it to `Sony`
+    // for the sub-walk and restores it.
+    active_table: TableRef::Exif,
+    canon_focal_units: None,
+    canon_lens_type: None,
+    canon_focal_length_blob: None,
+  };
+  // The Sony Main IFD walk — `ProcessProc::Exif` (Sony needs NO Canon DataMember
+  // pre-scan; the `if table == TableRef::Canon` hook is inert). `Fixed(order)` is
+  // the parent order; `FixBaseMode::No` (offsets are already TIFF-relative). It
+  // appends the Sony leaves to `w.entries` from index 0, isolating every core side
+  // effect from the parent.
+  w.process_subdir(
+    ifd_offset,
+    IfdKind::ExifIfd,
+    TableRef::Sony,
+    ByteOrderRule::Fixed(order),
+    FixBaseMode::No,
+    ProcessProc::Exif,
+  );
+  // Capture the walked `ResolvedConv::Sony` leaves into the vendor-emission `Vec`,
+  // threading the `AFAreaILCx` DataMember 0x201c sets (read by 0x201e). Unlike
+  // Apple/Canon this drives the dedicated `emit_sony_value` (the per-entry gates +
+  // af_area + the gate-passing typed populate), NOT `emit_entry`. The family-1
+  // group is the Sony vendor group (`vendor_group1_of(Sony)` = `"Sony"`);
+  // `write_vendor_value` re-derives it from `MakerNote::emission_group1` for the
+  // cached emissions, but pass the resolved value so the `EmittedTagSink` path (the
+  // differential test) carries it too.
+  //
+  // The typed `MakerNotesSony` is built INSIDE this loop (via `emit_sony_value`'s
+  // `Some(&mut typed)` step-7 populate) so a gated tag — e.g. a rawconv-dropped
+  // 0xb041 — populates NEITHER the emission NOR `exposure_mode`, exactly as the
+  // oracle's `parse_in_tiff` (which calls `populate_typed` only on a gate-passing
+  // entry). A separate gate-free pass would diverge for the typed leaves that are
+  // ALSO gated (0xb041 ∈ RAWCONV_DROP_IDS).
+  let g1 = vendor_group1_of(TableRef::Sony).unwrap_or("Sony");
+  let mut emissions = std::vec::Vec::new();
+  let mut typed = sony::MakerNotesSony::new();
+  let mut af_area: Option<i64> = None;
+  {
+    let mut sink = VendorEmissionSink::new(&mut emissions);
+    for entry in &w.entries {
+      // 0x201c's RawConv DataMember side-effect — captured BEFORE rendering so the
+      // later 0x201e can read it (entries are in IFD-tag order, so 0x201c precedes
+      // 0x201e), matching `parse_in_tiff`'s in-walk capture.
+      if entry.tag_id == 0x201c {
+        af_area = sony::af_area_data_member_from_raw(entry.value.raw(), model);
+      }
+      // Only `ResolvedConv::Sony` entries live in this run; the resolved `SonyTag`
+      // rides in the entry's `conv`. A defensive non-Sony conv (never produced
+      // under `TableRef::Sony`) is skipped — `emit_sony_value` needs the `SonyTag`.
+      if let ResolvedConv::Sony(sony_tag) = entry.conv {
+        let Ok(()) = emit_sony_value(
+          g1,
+          entry,
+          sony_tag,
+          model,
+          af_area,
+          print_conv,
+          Some(&mut typed),
+          &mut sink,
+        );
+      }
+    }
+  }
+  Some((emissions, typed))
 }
 
 /// Walk the Canon Main IFD in a FRESH, ISOLATED [`Walker`] and capture its
@@ -11131,6 +11558,939 @@ mod tests {
   #[test]
   fn vendor_group1_override_includes_apple() {
     assert_eq!(vendor_group1_of(TableRef::Apple), Some("Apple"));
+  }
+
+  // ====================================================================// Sony engine migration — differential test (#243 phase 3)
+  //
+  // PROVES the shared `Walker`'s Sony Main leaf path (`process_subdir` under
+  // `TableRef::Sony` → the dedicated `emit_sony_value` capture, via
+  // `sony_makernote_isolated`) is BYTE-IDENTICAL to the production oracle
+  // `sony::parse_in_tiff` (`walk_sony_in_tiff` + the per-entry gates). The same
+  // crafted Sony Main blob is run through BOTH paths; the emitted `(name, value,
+  // group="MakerNotes:Sony", unknown)` tuples must match, in order, for `-j`
+  // (PrintConv) AND `-n` (ValueConv), and the typed `MakerNotesSony` must agree.
+  // Sony is the COMPLEX vendor case — the blob exercises every per-entry gate:
+  // the af_area DataMember thread (0x201c sets it, 0x201e reads it), a single-HASH
+  // `Condition` PASS (0x201b) + SUPPRESS (0xb050), a `$format`-gated row needing
+  // the on-disk format (0x1000, which ALSO has a `Format =>` override), a RawConv
+  // sentinel drop (0xb041 == 65535), a deferred SubDirectory row (0x0010), and a
+  // plain typed leaf (0x0102). A routes-AWAY blob (SEMC) returns `None`.
+  // ====================================================================
+
+  /// Build a crafted little-endian Sony Main blob: the 12-byte `SONY DSC ` prefix
+  /// (the `MakerNoteSony` offset-12 header so `routes_to_main` passes), then the
+  /// body's entry count + the 12-byte IFD entries, then the next-IFD word, then any
+  /// out-of-line value bytes. `entries` is `(tag, format, count, inline_or_empty,
+  /// out_of_line_or_empty)`: INLINE when `out_of_line` is empty (value zero-padded
+  /// to 4 bytes at `entry+8`), else OUT-OF-LINE (the 4 bytes at `entry+8` are the
+  /// TIFF-relative offset — Sony inherits the parent base, and this blob IS the
+  /// parent TIFF at `mn_offset = 0`, so the offset is blob-relative).
+  ///
+  /// Entries must be written in ASCENDING tag-id order (real cameras write sorted
+  /// Sony IFDs — the oracle's 0x201c-before-0x201e af_area capture relies on it).
+  #[cfg(feature = "alloc")]
+  fn crafted_sony_blob(entries: &[(u16, u16, u32, &[u8], &[u8])]) -> Vec<u8> {
+    // Body layout (the blob, with the SONY DSC prefix at offset 0, body at 12):
+    // [SONY DSC \0\0\0][count u16][entries...][next-IFD u32][values]. The first
+    // out-of-line value sits right after the next-IFD word.
+    let elem_sizes: [usize; 14] = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4];
+    let dir_bytes = 2 + 12 * entries.len(); // count + entries
+    let mut value_cursor = 12 + dir_bytes + 4; // 12-byte prefix + dir + next-IFD
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte prefix
+    blob.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    let mut value_blob: Vec<u8> = Vec::new();
+    for &(tag, format, count, inline, out_of_line) in entries {
+      blob.extend_from_slice(&tag.to_le_bytes());
+      blob.extend_from_slice(&format.to_le_bytes());
+      blob.extend_from_slice(&count.to_le_bytes());
+      if out_of_line.is_empty() {
+        // Only the 13 standard TIFF codes have a known element size; a crafted
+        // BAD format (e.g. 255, or an inline 16) carries no `@formatSize` entry —
+        // skip the fit-check for it and just emit the (≤4-byte) inline slot, the
+        // same latitude `crafted_apple_blob` gives a bad-format inline entry.
+        if let Some(&elem) = elem_sizes.get(format as usize) {
+          assert!(
+            elem * count as usize <= 4,
+            "inline value must fit in 4 bytes"
+          );
+        }
+        let mut slot = [0u8; 4];
+        slot[..inline.len().min(4)].copy_from_slice(&inline[..inline.len().min(4)]);
+        blob.extend_from_slice(&slot);
+      } else {
+        blob.extend_from_slice(&(value_cursor as u32).to_le_bytes());
+        value_blob.extend_from_slice(out_of_line);
+        value_cursor += out_of_line.len();
+      }
+    }
+    blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+    blob.extend_from_slice(&value_blob);
+    blob
+  }
+
+  /// Drive the shared `Walker` through `sony_makernote_isolated`'s walk over the
+  /// blob (`mn_offset = 0`, body at 12, parent order), then render every collected
+  /// entry through the dedicated `emit_sony_value` (threading af_area) into an
+  /// `EmittedTagSink` — the NEW path's output WITH the full `MakerNotes:Sony` group
+  /// (which the `VendorEmission` stream alone does not carry). Mirrors the
+  /// production isolated walk exactly (base 0, parent order, `TableRef::Sony`,
+  /// `ProcessProc::Exif`).
+  #[cfg(feature = "alloc")]
+  fn drive_sony_subdir(
+    blob: &[u8],
+    order: ByteOrder,
+    model: Option<&str>,
+    print_conv: bool,
+  ) -> Vec<crate::emit::EmittedTag> {
+    let mut w = test_walker(blob);
+    w.order = order;
+    w.process_subdir(
+      12, // body offset for the SONY DSC prefix
+      IfdKind::ExifIfd,
+      TableRef::Sony,
+      ByteOrderRule::Fixed(order),
+      FixBaseMode::No,
+      ProcessProc::Exif,
+    );
+    let g1 = vendor_group1_of(TableRef::Sony).unwrap_or("Sony");
+    let mut out: Vec<crate::emit::EmittedTag> = Vec::new();
+    let mut sink = EmittedTagSink::new(&mut out);
+    let mut af_area: Option<i64> = None;
+    for entry in &w.entries {
+      if entry.tag_id == 0x201c {
+        af_area = makernotes::vendors::sony::af_area_data_member_from_raw(entry.value.raw(), model);
+      }
+      if let ResolvedConv::Sony(sony_tag) = entry.conv {
+        let Ok(()) = emit_sony_value(
+          g1, entry, sony_tag, model, af_area, print_conv, None, &mut sink,
+        );
+      }
+    }
+    out
+  }
+
+  /// The Sony leaf-path differential proof: for BOTH `-j` (PrintConv) and `-n`
+  /// (ValueConv), the shared `Walker` Sony leaf path emits the EXACT same
+  /// `(name, value, group="MakerNotes:Sony", unknown)` stream — in order — as
+  /// `sony::parse_in_tiff`, AND the typed `MakerNotesSony` agrees. Every per-entry
+  /// gate is exercised (see the section banner).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_emit_matches_parse_in_tiff() {
+    let order = ByteOrder::Little;
+    let model = Some("ILCE-7M3"); // NEX/ILCE branch ⇒ 0x201c sets af_area, 0x201e reads it
+    let make = Some("SONY");
+    // ASCENDING tag-id order (real Sony IFDs are sorted; 0x201c must precede
+    // 0x201e for the af_area thread). int16u=3, int8u=1, undef=7.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x0010 CameraInfo — a DEFERRED SubDirectory row (`sub_table=Some`). Use a
+      // valid out-of-line int8u blob; the parent must be SUPPRESSED (no emission).
+      (0x0010, 0x0001, 8, &[], &[1, 2, 3, 4, 5, 6, 7, 8]),
+      // 0x0102 Quality — plain typed leaf. int16u 2 ⇒ "Fine"; typed.quality = 2.
+      (0x0102, 0x0003, 1, &[0x02, 0x00], &[]),
+      // 0x1000 MultiBurstMode — ON-DISK `undef` (single-HASH `$format eq "undef"`
+      // HOLDS) AND a `Format => int8u` override (re-reads the byte as int8u). The
+      // value byte 1 ⇒ OnOff "On". Proves the on-disk format reaches the gate AND
+      // the Sony Format override is applied by the shared Walker.
+      (0x1000, 0x0007, 1, &[0x01], &[]),
+      // 0x201b FocusMode — single-HASH `Condition` HOLDS (Model not `DSC-`). int16u
+      // 0 ⇒ FocusMode2 render. Proves a single-HASH PASS.
+      (0x201b, 0x0003, 1, &[0x00, 0x00], &[]),
+      // 0x201c AfAreaModeSetting — int8u 4 ⇒ branch-2 "Flexible Spot (LA-EA4)" AND
+      // sets the AFAreaILCE DataMember to 4 (read by 0x201e below).
+      (0x201c, 0x0001, 1, &[0x04], &[]),
+      // 0x201e AfPointSelected — int8u 1 ⇒ branch-1 (ILCE && af_area==4) "Center".
+      // Proves the in-IFD af_area thread (a DIFFERENT branch fires when af_area==4).
+      (0x201e, 0x0001, 1, &[0x01], &[]),
+      // 0xb041 ExposureMode — RawConv sentinel: int16u 65535 ⇒ DROPPED (no emission,
+      // and typed.exposure_mode must stay None — it is ALSO a typed leaf).
+      (0xb041, 0x0003, 1, &[0xff, 0xff], &[]),
+      // 0xb050 HighISONoiseReduction2 — single-HASH `Condition` FAILS (Model is not
+      // `DSC-`/`Stellar`) ⇒ SUPPRESSED. Proves a single-HASH SUPPRESS.
+      (0xb050, 0x0003, 1, &[0x00, 0x00], &[]),
+    ];
+    let blob = crafted_sony_blob(entries);
+
+    for print_conv in [true, false] {
+      // ---- Oracle: production `parse_in_tiff` (returns `(typed, emissions)`).
+      let (oracle_typed, oracle) = makernotes::vendors::sony::parse_in_tiff(
+        &blob,
+        0,
+        blob.len(),
+        12,
+        order,
+        print_conv,
+        model,
+      );
+
+      // ---- New path A: the gated isolated helper the production dispatch drives.
+      let (iso_emissions, iso_typed) =
+        sony_makernote_isolated(&blob, 0, blob.len(), 12, order, make, model, print_conv)
+          .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some");
+      // ---- New path B: the same walk emitted into an `EmittedTagSink` so the full
+      // `MakerNotes:Sony` group is asserted (the `VendorEmission` stream omits it).
+      let emitted = drive_sony_subdir(&blob, order, model, print_conv);
+
+      // The emitted stream is in IFD-tag order (entries ascending), so compare
+      // position-wise. The four SUPPRESSED entries (0x0010/0xb041/0xb050) leave the
+      // stream with exactly four survivors: 0x0102, 0x1000, 0x201b, 0x201c, 0x201e.
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "print_conv={print_conv}: isolated emission COUNT must match the oracle"
+      );
+      assert_eq!(
+        emitted.len(),
+        oracle.len(),
+        "print_conv={print_conv}: EmittedTag COUNT must match the oracle"
+      );
+      assert_eq!(
+        oracle.len(),
+        5,
+        "print_conv={print_conv}: 5 survivors (0x0010/0xb041/0xb050 suppressed)"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        // The `VendorEmission` stream the production dispatch caches.
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: VendorEmission NAME mismatch"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): VendorEmission VALUE mismatch \
+           (the new path must apply SonyPrintConv + gates exactly as the oracle)",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "print_conv={print_conv} leaf #{i} ({}): VendorEmission Unknown flag mismatch",
+          want.name()
+        );
+        // The `EmittedTag` stream — same name/value/unknown PLUS the group override.
+        let tag = emitted.get(i).expect("index in range").tag();
+        assert_eq!(
+          tag.name(),
+          want.name(),
+          "print_conv={print_conv} leaf #{i}: EmittedTag NAME mismatch"
+        );
+        assert_eq!(
+          tag.value_ref(),
+          want.value(),
+          "print_conv={print_conv} leaf #{i} ({}): EmittedTag VALUE mismatch",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family0(),
+          "MakerNotes",
+          "print_conv={print_conv} leaf #{i} ({}): family-0 must be MakerNotes",
+          want.name()
+        );
+        assert_eq!(
+          tag.group_ref().family1(),
+          "Sony",
+          "print_conv={print_conv} leaf #{i} ({}): family-1 must be Sony",
+          want.name()
+        );
+      }
+
+      // Position-wise survivor names (a guard against a same-length permutation).
+      let names: Vec<&str> = iso_emissions.iter().map(|e| e.name()).collect();
+      assert_eq!(
+        names,
+        std::vec![
+          "Quality",
+          "MultiBurstMode",
+          "FocusMode",
+          "AFAreaModeSetting",
+          "AFPointSelected"
+        ],
+        "print_conv={print_conv}: survivor names + order"
+      );
+
+      // The typed `MakerNotesSony` is the SAME for both modes and must match the
+      // oracle's — including that the rawconv-dropped 0xb041 left `exposure_mode`
+      // None (the typed populate is gate-passing, like the oracle).
+      assert_eq!(
+        iso_typed, oracle_typed,
+        "print_conv={print_conv}: the isolated typed MakerNotesSony must equal the oracle's"
+      );
+      assert_eq!(
+        iso_typed.quality(),
+        Some(2),
+        "print_conv={print_conv}: Quality (0x0102) → typed accessor"
+      );
+      assert_eq!(
+        iso_typed.exposure_mode(),
+        None,
+        "print_conv={print_conv}: rawconv-dropped 0xb041 must NOT populate exposure_mode"
+      );
+    }
+  }
+
+  /// A `Vendor::Sony` blob that routes AWAY from `%Sony::Main` (a `SEMC MS\0`
+  /// SonyEricsson signature → `Sony::Ericsson`, unported) must yield `None` from
+  /// `sony_makernote_isolated` — the variant gate (`routes_to_main`) keeps the Sony
+  /// slot ABSENT rather than decoding a spurious tag on a tag-id collision. The
+  /// Make is the real Ericsson `"Sony Ericsson"` (mixed case, NOT `/^SONY/`), so
+  /// the `%Main`-order Sony5 gate (tested BEFORE SonyEricsson) does NOT claim it —
+  /// the SEMC rejection fires. (An uppercase `SONY` Make would route to Main per
+  /// `%Main` order — covered by `routes_to_main_gates_non_main_variants`.)
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_routes_away_blob_is_none() {
+    // A `SEMC MS\0` body — enough bytes that the blob window is non-empty; the gate
+    // rejects on the signature alone (no Main walk runs).
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(b"SEMC MS\x00");
+    blob.extend_from_slice(&[0u8; 16]); // arbitrary trailing bytes
+    for print_conv in [true, false] {
+      let out = sony_makernote_isolated(
+        &blob,
+        0,
+        blob.len(),
+        20, // SonyEricsson body offset (irrelevant — the gate rejects first)
+        ByteOrder::Little,
+        Some("Sony Ericsson"),
+        Some("C905"),
+        print_conv,
+      );
+      assert!(
+        out.is_none(),
+        "print_conv={print_conv}: a SEMC (SonyEricsson) blob with a non-`^SONY` Make \
+         routes away from %Sony::Main ⇒ sony_makernote_isolated must return None"
+      );
+    }
+  }
+
+  // ====================================================================
+  // Sony engine migration — ProcessExif-classification crafted edges (#243
+  // phase 3). The production Sony walk runs the shared `Walker` (faithful
+  // ProcessExif) via `sony_makernote_isolated`; the retained oracle
+  // `walk_sony_in_tiff` is now ProcessExif-classification-equivalent. These
+  // tests pin the byte-identity of the two on the FULL crafted-edge class the
+  // Apple migration discovered: `undef[1]`→int8u, count-0, excessive-count,
+  // bad-format (index-0 ABORT + later-index SKIP), suspicious offset (`<8` and
+  // IFD-overlap), and the warn-count>10 abort. Sony has NO ProRAW int64u, so the
+  // Apple format-16/Make carve-out is NOT exercised (code 16 is a bad format).
+  // ====================================================================
+
+  /// Assert the production shared-`Walker` Sony path (`sony_makernote_isolated`)
+  /// emits the EXACT same `(name, value, unknown)` stream — in order — as the
+  /// oracle `sony::parse_in_tiff`, for BOTH `-j` (PrintConv) and `-n`
+  /// (ValueConv), AND that the typed `MakerNotesSony` agrees. The crafted blob
+  /// carries the `SONY DSC ` prefix (`body_offset = 12`), so `routes_to_main`
+  /// passes; `make`/`model` are threaded into both paths' per-entry gates.
+  #[cfg(feature = "alloc")]
+  fn assert_sony_oracle_matches(
+    blob: &[u8],
+    order: ByteOrder,
+    make: Option<&str>,
+    model: Option<&str>,
+    label: &str,
+  ) {
+    for print_conv in [true, false] {
+      let (oracle_typed, oracle) =
+        makernotes::vendors::sony::parse_in_tiff(blob, 0, blob.len(), 12, order, print_conv, model);
+      let (iso_emissions, iso_typed) =
+        sony_makernote_isolated(blob, 0, blob.len(), 12, order, make, model, print_conv)
+          .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some");
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "{label} print_conv={print_conv}: shared-Walker emission COUNT must match the \
+         aligned oracle"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "{label} print_conv={print_conv} leaf #{i}: NAME mismatch"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "{label} print_conv={print_conv} leaf #{i} ({}): VALUE mismatch — the aligned \
+           oracle must decode identically to the shared Walker",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "{label} print_conv={print_conv} leaf #{i} ({}): Unknown flag mismatch",
+          want.name()
+        );
+      }
+      assert_eq!(
+        iso_typed, oracle_typed,
+        "{label} print_conv={print_conv}: the isolated typed MakerNotesSony must equal the \
+         oracle's"
+      );
+    }
+  }
+
+  /// `undef[1]` → `int8u` (`Exif.pm:6644`). A crafted `0x2000`-region tag whose
+  /// on-disk format is `undef` (7) with count 1 must decode as an INTEGER
+  /// (`int8u` ⇒ `RawValue::U64`), NOT a 1-byte `RawValue::Bytes` blob, in BOTH
+  /// `walk_sony_in_tiff` (the now-aligned oracle) AND the shared `Walker`. Uses
+  /// `0x0102 Quality` (`undef[1]` inline byte 2): even though Quality's on-disk
+  /// format is normally int16u, ExifTool's int8u carve-out applies to the
+  /// post-read pair, so the value decodes as the scalar 2 (Quality "Fine") on
+  /// both paths. Real Sony leaves are never `undef[1]`; this pins the
+  /// crafted-edge consistency.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_undef_count1_leaf_coerces_int8u_like_shared_walker() {
+    // 0x0102 Quality, on-disk format undef (7), count 1, inline byte 0x02.
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[(0x0102, 7, 1, &[0x02], &[])];
+    let blob = crafted_sony_blob(entries);
+
+    // The oracle body walker's RAW shape — a single `undef` byte becomes `int8u`
+    // (`RawValue::U64`), not `RawValue::Bytes`.
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert_eq!(walked.len(), 1, "one Quality entry");
+    let raw = &walked.get(0).expect("entry 0").value;
+    match raw {
+      RawValue::U64(v) => assert_eq!(
+        v.as_slice(),
+        &[0x02],
+        "undef[1] must coerce to int8u (RawValue::U64([2])), got {raw:?}"
+      ),
+      other => panic!(
+        "undef[1] Quality must decode as int8u (U64), NOT a 1-byte Bytes blob; got {other:?}"
+      ),
+    }
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "undef[1]→int8u",
+    );
+  }
+
+  /// Count-based value size (`Exif.pm:6502` `$size = $count * $formatSize`, with
+  /// the `:6285` count-0 expansion). A count-0 `0x200a` (int16u) followed by a
+  /// VALID `0x0102 Quality`: ExifTool reads `$count * $formatSize == 0` on-disk
+  /// bytes, so `ReadValue` returns the empty `$val` — the count-0 leaf decodes
+  /// EMPTY. The now-aligned oracle passes the COUNT-based `total_size` (not an
+  /// EOF-bound `avail`), so it expands the SAME way as the shared Walker. The
+  /// following valid leaf must STILL emit identically on both sides.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_count_zero_leaf_decodes_empty_like_shared_walker() {
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // 0x200a AutoHDR — int16u, COUNT 0 (inline slot is the zero word). 0x200a
+      // ALSO has a `Format =>` override; resolve_read_format keeps count 0.
+      (0x200a, 0x0003, 0, &[], &[]),
+      // 0x0102 Quality — int16u, count 1, value 2 ⇒ "Fine". VALID.
+      (0x0102, 0x0003, 1, &[0x02, 0x00], &[]),
+    ];
+    let blob = crafted_sony_blob(entries);
+
+    // The oracle body walker decodes BOTH entries (count-0 is not skipped); the
+    // count-0 entry's value has zero elements (no trailing-buffer over-read).
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert_eq!(
+      walked.len(),
+      2,
+      "both entries are walked (count-0 is not skipped): {walked:?}"
+    );
+    assert_eq!(
+      walked.get(0).expect("entry 0").value.count(),
+      0,
+      "a count-0 int16u must decode EMPTY (no trailing-buffer over-read)"
+    );
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "count-0",
+    );
+  }
+
+  /// The excessive-count `> 100000` guard (`Exif.pm:6760-6770` `if ($count >
+  /// 100000 and $formatStr !~ /^(undef|string|binary)$/) { next }`). A crafted
+  /// `0x2001` (int32u) with count `200000` (> 100000, NOT undef/ascii) — placed
+  /// IN-BOUNDS (its out-of-line offset points at real appended bytes) — must be
+  /// SKIPPED by BOTH the now-aligned oracle AND the shared Walker, before the
+  /// value is read. A following VALID `0x0102 Quality` must STILL emit on both
+  /// sides. Before the alignment the oracle decoded such an entry (a large
+  /// allocation + a leaked tag).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_excessive_count_leaf_is_skipped_like_shared_walker() {
+    // 0x2001 PreviewImage region tag id reused as a plain int32u count-200000
+    // entry; the out-of-line value region is FULLY IN-BOUNDS (200000 × 4 real
+    // bytes), so the skip is the excessive-count guard, NOT a coincidental OOB.
+    let big = std::vec![0u8; 200_000 * 4];
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x2001, 0x0004, 200_000, &[], &big),
+      // 0x0102 Quality — int16u, count 1, value 2 ⇒ "Fine". VALID, emitted AFTER
+      // the guard-skipped excessive-count entry.
+      (0x0102, 0x0003, 1, &[0x02, 0x00], &[]),
+    ];
+    let blob = crafted_sony_blob(entries);
+
+    // The oracle body walker skips ONLY the excessive-count entry; the following
+    // valid leaf survives.
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert_eq!(
+      walked.len(),
+      1,
+      "the excessive-count entry is guard-skipped; only the valid leaf walks: {walked:?}"
+    );
+    assert_eq!(
+      walked.get(0).expect("entry 0").tag_id,
+      0x0102,
+      "the surviving leaf is the post-guard Quality (the over-count entry was \
+       skipped, NOT decoded)"
+    );
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "excessive-count",
+    );
+  }
+
+  /// Bad-format at ENTRY 0 ABORTS the whole Sony directory (`Exif.pm:6475`
+  /// `return 0`, "assume corrupted IFD if this is our first entry"). A VALID leaf
+  /// at index 1 must therefore emit NOTHING on BOTH paths — the now-aligned
+  /// `walk_sony_in_tiff` oracle aborts the directory at the index-0 bad format
+  /// just like `sony_makernote_isolated`'s ProcessExif walk. Code 16 (`int64u`,
+  /// nonzero unrecognized — Sony has no Apple carve-out) is the bad format.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_bad_format_at_index0_aborts_directory_like_shared_walker() {
+    // Entry 0: tag 0x0102, format 16 (int64u — unrecognized in a standard IFD,
+    // NONZERO, NO Sony carve-out), count 1, OUT-OF-LINE (size 8 > 4). Entry 1: a
+    // VALID inline 0x0114 (int16u). The directory aborts at index 0.
+    let v0 = 0x0102_0304_0506_0708u64.to_le_bytes();
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      (0x0102, 16, 1, &[], &v0),
+      (0x0114, 0x0003, 1, &[0x01, 0x00], &[]),
+    ];
+    let blob = crafted_sony_blob(entries);
+
+    // The oracle body walker ABORTS at the index-0 bad format ⇒ NO entries.
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert!(
+      walked.is_empty(),
+      "a bad format (code 16) at entry 0 aborts the whole directory (no entries), got {walked:?}"
+    );
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "bad-format-index0-abort",
+    );
+  }
+
+  /// Bad-format at a LATER index is a per-entry SKIP (`Exif.pm:6476` `next if
+  /// $index`), NOT a directory abort: the surrounding VALID leaves survive on
+  /// BOTH paths. Entry 0 valid, entry 1 bad format (code 16), entry 2 valid ⇒ the
+  /// oracle and the shared `Walker` both emit the two valid leaves and skip the
+  /// bad one.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_bad_format_at_later_index_skips_one_like_shared_walker() {
+    let v1 = 0x0102_0304_0506_0708u64.to_le_bytes();
+    let entries: &[(u16, u16, u32, &[u8], &[u8])] = &[
+      // INDEX 0 — VALID 0x0102 Quality (int16u, 2 ⇒ "Fine").
+      (0x0102, 0x0003, 1, &[0x02, 0x00], &[]),
+      // INDEX 1 — BAD format 16 (int64u, nonzero, no Sony carve-out), SKIPPED.
+      (0x0114, 16, 1, &[], &v1),
+      // INDEX 2 — VALID 0x201b FocusMode (int16u, 0). Single-HASH condition holds
+      // for a non-DSC model.
+      (0x201b, 0x0003, 1, &[0x00, 0x00], &[]),
+    ];
+    let blob = crafted_sony_blob(entries);
+
+    // The oracle walks both valid leaves, skips ONLY the bad-format entry.
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert_eq!(
+      walked.len(),
+      2,
+      "the two valid leaves survive; only the bad-format entry is skipped: {walked:?}"
+    );
+    assert_eq!(walked.get(0).expect("0").tag_id, 0x0102);
+    assert_eq!(walked.get(1).expect("1").tag_id, 0x201b);
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "bad-format-later-skip",
+    );
+  }
+
+  /// A SUSPICIOUS out-of-line offset (`$valuePtr < 8`, into the TIFF header —
+  /// `Exif.pm:6539`; OR overlapping the IFD directory — `Exif.pm:6549`) is a
+  /// per-entry SKIP (`Exif.pm:6675` "Suspicious offset" + `next`), NOT a decode.
+  /// The now-aligned `walk_sony_in_tiff` applies the SAME gate in TIFF-relative
+  /// coordinates (the Sony IFD start = `mn_offset + body_offset == 12`); a
+  /// following VALID leaf survives on BOTH paths. Built BY HAND so the
+  /// out-of-line offset is forced to the suspicious value (the auto-offset
+  /// `crafted_sony_blob` cannot point into the header/IFD). Two sub-cases: an
+  /// offset of 4 (`< 8`) and an offset overlapping the IFD; each is IN-BOUNDS
+  /// (passes the EOF check) so the SKIP is driven by the suspicious gate.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_suspicious_offset_skips_one_like_shared_walker() {
+    // 2-entry Sony body (SONY DSC prefix at 0, IFD count word at 12). With 2
+    // entries: ifd_start = 12, dir_end = 12 + 2 + 24 = 38. Entry 0 is an
+    // out-of-line int32u (size > 4) whose offset is `suspicious_off`; entry 1 is
+    // a VALID inline Quality.
+    fn build(suspicious_off: u32) -> Vec<u8> {
+      let mut blob: Vec<u8> = Vec::new();
+      blob.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte prefix
+      blob.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
+      // Entry 0 — tag 0x2001, int32u (4), count 2 ⇒ size 8 > 4, OUT-OF-LINE
+      // offset = suspicious_off.
+      blob.extend_from_slice(&0x2001u16.to_le_bytes());
+      blob.extend_from_slice(&0x0004u16.to_le_bytes());
+      blob.extend_from_slice(&2u32.to_le_bytes());
+      blob.extend_from_slice(&suspicious_off.to_le_bytes());
+      // Entry 1 — tag 0x0102 Quality, int16u (3), count 1, INLINE value 2.
+      blob.extend_from_slice(&0x0102u16.to_le_bytes());
+      blob.extend_from_slice(&0x0003u16.to_le_bytes());
+      blob.extend_from_slice(&1u32.to_le_bytes());
+      blob.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
+      blob.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+      // Trailing value region so an in-bounds (but suspicious) offset+8 fits.
+      blob.extend_from_slice(&[0u8; 16]);
+      blob
+    }
+
+    // Sub-case 1: offset 4 (`< 8`). Sub-case 2: offset 16 (overlaps IFD [12,38)).
+    for (suspicious_off, label) in [(4u32, "off<8"), (16u32, "overlaps-ifd")] {
+      let blob = build(suspicious_off);
+      let walked =
+        makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+      assert_eq!(
+        walked.len(),
+        1,
+        "{label}: the suspicious-offset entry is skipped; only the valid Quality \
+         survives, got {walked:?}"
+      );
+      assert_eq!(
+        walked.get(0).expect("0").tag_id,
+        0x0102,
+        "{label}: the surviving leaf is Quality (the suspicious entry was skipped, \
+         not decoded)"
+      );
+      assert_sony_oracle_matches(
+        &blob,
+        ByteOrder::Little,
+        Some("SONY"),
+        Some("ILCE-7M3"),
+        label,
+      );
+    }
+  }
+
+  /// The warn-count abort (`Exif.pm:6455-6456` `if ($warnCount > 10) {
+  /// Warn('Too many warnings'); return 0 }`). Eleven consecutive bad-format
+  /// entries (each `++$warnCount`) push the count to 11; the next entry trips the
+  /// abort BEFORE it is processed, so a VALID leaf placed after them emits
+  /// NOTHING. The now-aligned `walk_sony_in_tiff` mirrors the same per-entry warn
+  /// cap as `sony_makernote_isolated`'s ProcessExif walk. A valid leaf at index 0
+  /// (before any warning) emits on BOTH paths.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_warn_count_abort_after_eleven_warnings_like_shared_walker() {
+    // Index 0: VALID 0x0102 Quality (emits). Indices 1..=11: bad nonzero format
+    // 0x00ff (each warns + counts; skipped, not index 0). Index 12: a VALID
+    // 0x201b FocusMode that must NOT emit (warn_count == 11 > 10 aborts first).
+    let mut entries: Vec<(u16, u16, u32, &[u8], &[u8])> = Vec::new();
+    entries.push((0x0102, 0x0003, 1, &[0x02, 0x00], &[]));
+    for _ in 0..11 {
+      entries.push((0x0103, 0x00ff, 1, &[0x00, 0x00, 0x00, 0x00], &[]));
+    }
+    entries.push((0x201b, 0x0003, 1, &[0x00, 0x00], &[]));
+    let blob = crafted_sony_blob(&entries);
+
+    // The oracle walks index 0 (Quality), skips+counts indices 1..=11, then aborts
+    // at index 12 BEFORE the FocusMode — so ONLY Quality survives.
+    let walked =
+      makernotes::vendors::sony::walk_sony_in_tiff(&blob, 0, blob.len(), 12, ByteOrder::Little);
+    assert_eq!(
+      walked.len(),
+      1,
+      "only the pre-warning Quality survives; the >10-warning abort suppresses the \
+       trailing FocusMode, got {walked:?}"
+    );
+    assert_eq!(walked.get(0).expect("0").tag_id, 0x0102);
+
+    assert_sony_oracle_matches(
+      &blob,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "warn-count-abort",
+    );
+  }
+
+  /// Compare `sony_makernote_isolated` to the oracle `sony::parse_in_tiff` at an
+  /// ARBITRARY `(mn_offset, mn_len, body_offset)` — the differential the fixed
+  /// SHORT-MakerNote guard must hold (`assert_sony_oracle_matches` only covers the
+  /// `mn_offset=0`, full-`mn_len`, body-12 case). Both paths must agree on the
+  /// emission stream (`-j` AND `-n`) and the typed slot.
+  #[cfg(feature = "alloc")]
+  fn assert_sony_oracle_matches_at(
+    data: &[u8],
+    mn_offset: usize,
+    mn_len: usize,
+    body_offset: usize,
+    order: ByteOrder,
+    make: Option<&str>,
+    model: Option<&str>,
+    label: &str,
+  ) {
+    for print_conv in [true, false] {
+      let (oracle_typed, oracle) = makernotes::vendors::sony::parse_in_tiff(
+        data,
+        mn_offset,
+        mn_len,
+        body_offset,
+        order,
+        print_conv,
+        model,
+      );
+      let (iso_emissions, iso_typed) = sony_makernote_isolated(
+        data,
+        mn_offset,
+        mn_len,
+        body_offset,
+        order,
+        make,
+        model,
+        print_conv,
+      )
+      .expect("routes_to_main admits a SONY DSC prefix ⇒ Some (present, possibly empty)");
+      assert_eq!(
+        iso_emissions.len(),
+        oracle.len(),
+        "{label} print_conv={print_conv}: emission COUNT must match the oracle"
+      );
+      for (i, want) in oracle.iter().enumerate() {
+        let got = iso_emissions.get(i).expect("index in range");
+        assert_eq!(
+          got.name(),
+          want.name(),
+          "{label} pc={print_conv} #{i}: NAME"
+        );
+        assert_eq!(
+          got.value(),
+          want.value(),
+          "{label} pc={print_conv} #{i} ({}): VALUE",
+          want.name()
+        );
+        assert_eq!(
+          got.unknown(),
+          want.unknown(),
+          "{label} pc={print_conv} #{i} ({}): Unknown",
+          want.name()
+        );
+      }
+      assert_eq!(
+        iso_typed, oracle_typed,
+        "{label} pc={print_conv}: typed MakerNotesSony must equal the oracle's"
+      );
+    }
+  }
+
+  /// Finding 1 (reverse guard): a Sony MakerNote whose DECLARED value is too short
+  /// for an IFD (`mn_len < body_offset + 2`) must yield NO Sony tags — EVEN when
+  /// the parent-TIFF bytes at `mn_offset + body_offset` happen to form a valid Sony
+  /// IFD. The oracle (`walk_sony_in_tiff`'s `mn_len < body_offset + 2` pre-check at
+  /// `body.rs:131`) returns empty; before the fix `sony_makernote_isolated` walked
+  /// `data` at `mn_offset + body_offset` and read the count word from the UNRELATED
+  /// following bytes, emitting a spurious `Quality` (a migration regression vs the
+  /// pre-migration `walk_sony_in_tiff`, which returned empty). Both paths must now
+  /// be present-but-EMPTY (`Some((empty, empty))` — NOT `None`, since
+  /// `routes_to_main` already classified the truncated blob as a Main variant).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_short_makernote_yields_empty_like_oracle() {
+    // Parent TIFF: the 12-byte `SONY DSC ` prefix, then a FULLY VALID Sony IFD at
+    // offset 12 (1 entry: 0x0102 Quality int16u count 1 value 2 ⇒ "Fine") + the
+    // next-IFD word. If the guard were absent, walking at offset 12 would decode
+    // this IFD and emit Quality.
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte prefix (offset 0..12)
+    data.extend_from_slice(&1u16.to_le_bytes()); // count = 1 (offset 12)
+    data.extend_from_slice(&0x0102u16.to_le_bytes()); // tag 0x0102 Quality
+    data.extend_from_slice(&0x0003u16.to_le_bytes()); // int16u
+    data.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    data.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // value 2 inline
+    data.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    // Sanity: with the FULL `mn_len` the IFD IS walked (one Quality leaf) — proves
+    // the trailing bytes form a real IFD, so the empty result below is the guard,
+    // not a coincidental no-decode.
+    let full =
+      makernotes::vendors::sony::walk_sony_in_tiff(&data, 0, data.len(), 12, ByteOrder::Little);
+    assert_eq!(
+      full.len(),
+      1,
+      "with the full mn_len the trailing IFD decodes one Quality leaf: {full:?}"
+    );
+
+    // The DECLARED MakerNote value is only 9 bytes (`mn_len = 9 < body_offset + 2
+    // == 14`): the blob window `data[0..9]` still starts with `SONY DSC` (so
+    // `routes_to_main` admits it as a Main variant), but the value has no room for
+    // the IFD count word — both paths return present-but-EMPTY.
+    let mn_len_short = 9;
+    let oracle =
+      makernotes::vendors::sony::walk_sony_in_tiff(&data, 0, mn_len_short, 12, ByteOrder::Little);
+    assert!(
+      oracle.is_empty(),
+      "the oracle's short-MakerNote guard (mn_len < body_offset + 2) returns empty, got {oracle:?}"
+    );
+    assert_sony_oracle_matches_at(
+      &data,
+      0,
+      mn_len_short,
+      12,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "short-makernote-no-ifd-room",
+    );
+  }
+
+  /// A NORMAL empty Sony IFD (`mn_len >= body_offset + 2`, count word = 0) decodes
+  /// to NO entries on BOTH paths — confirming the Finding-1 guard's present-but-
+  /// empty return value (`Some((empty, empty))`) is byte-identical to the value the
+  /// isolated path produces when a well-formed IFD simply yields zero leaves (so
+  /// the differential holds for the truncated case AND a real empty IFD).
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_isolated_empty_ifd_yields_empty_like_oracle() {
+    // `SONY DSC ` prefix + a 0-entry IFD + next-IFD word. mn_len = full (>= 14).
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"SONY DSC \x00\x00\x00");
+    data.extend_from_slice(&0u16.to_le_bytes()); // count = 0
+    data.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    let oracle =
+      makernotes::vendors::sony::walk_sony_in_tiff(&data, 0, data.len(), 12, ByteOrder::Little);
+    assert!(
+      oracle.is_empty(),
+      "a 0-entry Sony IFD walks to no entries: {oracle:?}"
+    );
+    assert_sony_oracle_matches(
+      &data,
+      ByteOrder::Little,
+      Some("SONY"),
+      Some("ILCE-7M3"),
+      "empty-ifd",
+    );
+  }
+
+  /// The group OVERRIDE is scoped to the Sony table too: `vendor_group1_of` is
+  /// `Some(\"Sony\")` for `Sony` (so a Sony leaf emits as `Sony:*`) — phase 3 of the
+  /// engine migration (#243).
+  #[test]
+  fn vendor_group1_override_includes_sony() {
+    assert_eq!(vendor_group1_of(TableRef::Sony), Some("Sony"));
+  }
+
+  /// Class sweep (body.rs unchecked integer arithmetic): a `body_offset` near
+  /// `usize::MAX` must NOT panic on EITHER Sony path. The oracle's short-MakerNote
+  /// guard (`walk_sony_in_tiff`'s `body_offset + 2`) and every per-entry/per-field
+  /// offset read now use `checked_add`, mirroring the production guard
+  /// (`sony_makernote_isolated`'s `body_offset.checked_add(2)`); an overflow can
+  /// never satisfy `mn_len >=`, so BOTH paths return present-but-EMPTY,
+  /// byte-identically. Before the sweep, `walk_sony_in_tiff:131`'s `body_offset +
+  /// 2` overflowed → a debug-assert panic (release: a wrap that skipped the guard),
+  /// contradicting the R2-hardened production path. A plain `#[test]` runs with
+  /// debug-assertions ON, so an arithmetic-overflow panic here would FAIL the test
+  /// (not silently wrap), pinning the no-panic floor for the public low-level path.
+  #[test]
+  #[cfg(feature = "alloc")]
+  fn sony_body_offset_near_usize_max_no_panic_empty_like_oracle() {
+    // A real, fully-valid Sony body at offset 12 (so `routes_to_main` admits the
+    // `SONY DSC ` prefix ⇒ `sony_makernote_isolated` returns `Some`, NOT `None`):
+    // 1 entry 0x0102 Quality int16u count 1 value 2 + next-IFD word. With a SANE
+    // `body_offset` this decodes one leaf — proving the empty results below are the
+    // overflow guards, not a degenerate buffer.
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(b"SONY DSC \x00\x00\x00"); // 12-byte prefix
+    data.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+    data.extend_from_slice(&0x0102u16.to_le_bytes()); // tag 0x0102 Quality
+    data.extend_from_slice(&0x0003u16.to_le_bytes()); // int16u
+    data.extend_from_slice(&1u32.to_le_bytes()); // count 1
+    data.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // value 2 inline
+    data.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = 0
+
+    // Both adversarial offsets exercise the `body_offset + 2` overflow class:
+    // `usize::MAX + 2` wraps, `(usize::MAX - 1) + 2` also wraps (== 0). Either way
+    // the checked guard returns empty rather than panicking/wrapping-past the guard.
+    for &body_offset in &[usize::MAX, usize::MAX - 1] {
+      let oracle = makernotes::vendors::sony::walk_sony_in_tiff(
+        &data,
+        0,
+        data.len(),
+        body_offset,
+        ByteOrder::Little,
+      );
+      assert!(
+        oracle.is_empty(),
+        "walk_sony_in_tiff must return empty (no panic) at body_offset={body_offset}, got {oracle:?}"
+      );
+
+      // The production path: `routes_to_main` admits the prefix ⇒ `Some`, and the
+      // overflowing `body_offset.checked_add(2)` ⇒ present-but-empty (NOT `None`).
+      let (iso_emissions, _typed) = sony_makernote_isolated(
+        &data,
+        0,
+        data.len(),
+        body_offset,
+        ByteOrder::Little,
+        Some("SONY"),
+        Some("ILCE-7M3"),
+        true,
+      )
+      .expect("SONY DSC prefix ⇒ routes_to_main ⇒ Some even when body_offset overflows");
+      assert!(
+        iso_emissions.is_empty(),
+        "sony_makernote_isolated must emit nothing (no panic) at body_offset={body_offset}"
+      );
+
+      // And the two paths are byte-identical (emission stream + typed slot, -j AND
+      // -n) at the overflow offset — the differential the class sweep preserves.
+      assert_sony_oracle_matches_at(
+        &data,
+        0,
+        data.len(),
+        body_offset,
+        ByteOrder::Little,
+        Some("SONY"),
+        Some("ILCE-7M3"),
+        "body_offset-near-usize-max",
+      );
+    }
   }
 
   // ====================================================================// Canon engine migration — Step B1 differential test (#243 phase 2)
