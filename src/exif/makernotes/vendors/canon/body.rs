@@ -366,6 +366,31 @@ pub fn walk_canon_in_tiff(
       | CanonEntryClass::SilentBadFormat { abort: true } => break,
       _ => continue,
     };
+    // `if ($count > 100000 and $formatStr !~ /^(undef|string|binary)$/) { Warn(
+    // 'Ignoring <dir> <tag> with excessive count'); next }` (`Exif.pm:6760-6770`)
+    // — the SAME excessive-count guard the shared `Walker` (production emission)
+    // applies in `walk_entry`. Mirror it PREDICATE-FOR-PREDICATE so the oracle
+    // matches for a crafted IN-BOUNDS Canon leaf with `count > 100000` (e.g. a
+    // `CanonModelID` mis-written with a huge count): BOTH paths SKIP it, emitting
+    // nothing. The `undef`/`string` formats are exempt (the format predicate). No
+    // Canon tag is `TransferFunction`, so the `196608` carve-out never applies.
+    //
+    // The production path runs `canon_special_leaf_value` BEFORE the guard, so an
+    // entry it REWRITES bypasses the guard. `0x28` is ALWAYS rewritten (`undef`
+    // blob). `0x96` is rewritten ONLY for an EOS-5D body (the `SerialInfo` arm,
+    // format-independent) or a non-5D `Ascii` value (the `InternalSerialNumber`
+    // strip arm — covered by the format predicate). So a non-5D, NON-`Ascii` 0x96
+    // is NOT rewritten: it reaches the generic guard in production, and the oracle
+    // MUST apply the guard to it too (#243 phase 2 R10 — `tag_id != 0x96` alone was
+    // too broad). `model_matches_eos_5d` is the SAME 5D predicate the 0x96 rewrite
+    // below uses. #243 phase 2 R9: ExifTool processes `%Canon::Main` via
+    // `ProcessExif`, whose excessive-count guard has NO `$inMakerNotes` exemption —
+    // SKIPPING is FAITHFUL (`parse_in_tiff` previously DECODED such a leaf).
+    let rewritten_special =
+      tag_id == 0x28 || (tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d));
+    if !rewritten_special && !matches!(format, Format::Undef | Format::Ascii) && count > 100_000 {
+      continue;
+    }
     // `0x28` `ImageUniqueID` forces `Format => 'undef'` (`Canon.pm:1729`).
     // ExifTool's `ProcessExif` overrides the entry's declared numeric format
     // with `undef` (`Exif.pm:6735-6744`) and re-derives `$count = int($size /
@@ -401,9 +426,45 @@ pub fn walk_canon_in_tiff(
         .unwrap_or(&[]);
       RawValue::Bytes(window.to_vec())
     } else {
-      let avail = tiff_data.len() - value_data_offset;
-      let Some(decoded) = read_value(tiff_data, value_data_offset, format, count, avail, order)
-      else {
+      // ExifTool `ProcessExif` reads `$count * $formatSize[$format]` ON-DISK bytes
+      // (`Exif.pm:6502` `my $size = $count * $formatSize[$format]`), NOT an
+      // EOF-bound read. Pass the COUNT-based `total_size` (the SAME size the `0x28`
+      // branch above already uses, and the size the shared-`Walker` production path
+      // passes to `read_value`) so a count-0 entry decodes to `undef`/empty
+      // (`Exif.pm:6285-6288` `unless ($count) { $count = int($size / $len) }` with
+      // `$size == 0` ⇒ `''`) — exactly as ProcessExif. The former EOF-bound `avail`
+      // triggered `ReadValue`'s count-0 expansion (`$count = int($size / $len)` with
+      // `$size = EOF`), re-deriving a bogus count from the trailing buffer that
+      // ExifTool's `undef[0]` view never touches — the very divergence the
+      // count-based `0x28` branch was written to avoid (`body.rs:369-379`), here
+      // generalized to every leaf (#243 phase 2 R6). For count > 0 this is
+      // byte-identical to `avail` (`read_value` shortens to the in-bounds window
+      // either way), so conformance is unaffected; it differs ONLY for the
+      // degenerate count-0 case.
+      //
+      // `$formatStr = 'int8u' if $format == 7 and $count == 1` (`Exif.pm:6644`) —
+      // ProcessExif treats a single `undef` byte as `int8u`. The shared-`Walker`
+      // production path (`walk_entry`) applies this carve-out, so mirror it here:
+      // a crafted `undef[1]` Canon leaf decodes as an integer in both paths (real
+      // Canon leaves are never `undef[1]`).
+      //
+      // (The ProcessExif excessive-count guard — `Exif.pm:6760-6770`,
+      // `count > 100000` ⇒ skip — is mirrored EARLIER in this loop, before the
+      // `0x28`/`0x96` specials, so an over-count leaf never reaches this read;
+      // #243 phase 2 R9.)
+      let decode_format = if matches!(format, Format::Undef) && count == 1 {
+        Format::Int8u
+      } else {
+        format
+      };
+      let Some(decoded) = read_value(
+        tiff_data,
+        value_data_offset,
+        decode_format,
+        count,
+        total_size,
+        order,
+      ) else {
         continue;
       };
       decoded

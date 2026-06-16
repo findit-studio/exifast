@@ -1116,6 +1116,210 @@ fn populate_typed(typed: &mut MakerNotesCanon, entry: &CanonEntry) {
   }
 }
 
+/// Build the typed [`MakerNotesCanon`] from the Canon Main IFD leaves the
+/// shared `Walker` produced (#243 phase 2 step C). The shared-walk emit path is
+/// CAPTURED into the MakerNote's cached vendor emissions (the JSON stream), but
+/// the typed accessors must still be populated; this reproduces EVERY
+/// `parse_in_tiff` typed-population site against the post-walk
+/// `(tag_id, RawValue)` pairs.
+///
+/// `entries` is the Canon Main IFD's decoded leaves IN WALK ORDER, each a
+/// `(tag_id, &RawValue)` — the `Walker` pushes these into `self.entries` as
+/// `ResolvedConv::Canon` entries (the `0x28` / `0x96` specials are already
+/// value-rewritten by the walk's `canon_special_leaf_value`, exactly as
+/// `walk_canon_in_tiff` rewrote them for `parse_in_tiff`). `order` is the parent
+/// byte order; `model` is the parent `$$self{Model}`; `file_type` the container
+/// `$$self{FILE_TYPE}`; `lens_type` is the pre-scanned `%CameraSettings` pos-22
+/// DataMember (`$$self{LensType}`) the FileInfo position-16 `MacroMagnification`
+/// `Condition` reads — IDENTICAL to the value `canon_prescan_datamembers` threads
+/// into the emission capture, so the typed surface and the JSON agree by
+/// construction. (The other DataMember, `$$self{FocalUnits}` pos 25, scales only
+/// the FocalLength EMISSIONS; no typed field reads it, so it is not threaded
+/// here — the typed focal RANGE comes from CameraSettings Max/MinFocalLength,
+/// exactly as in `parse_in_tiff`.)
+///
+/// Mirrors `parse_in_tiff` (`mod.rs` collection-time path): the CameraSettings
+/// (0x01) capture of `focal_range_mm` + `lens_type`/`lens_name`; the
+/// ShotInfo (0x04) / AFInfo (0x12) / AFInfo2 (0x26) / AFInfo3 (0x3c) /
+/// FileInfo (0x93) typed sub-structs; the `0x28` ImageUniqueID RawConv + hex
+/// ValueConv; and the leaf [`populate_typed`] sites (0x06/0x07/0x08/0x09/0x0c/
+/// 0x10/0x95/0x96). Deferred / `Unknown` sub-tables contribute no typed field
+/// (their `parse_in_tiff` arms do not either).
+#[must_use]
+pub(crate) fn build_typed_from_entries(
+  entries: &[(u16, &RawValue)],
+  order: ByteOrder,
+  model: Option<&str>,
+  file_type: Option<&str>,
+  lens_type: Option<u16>,
+) -> MakerNotesCanon {
+  let mut typed = MakerNotesCanon::new();
+  for &(tag_id, raw) in entries {
+    let Some(def) = tags::lookup(tag_id) else {
+      continue;
+    };
+    if let Some(sub) = def.sub_table() {
+      match sub {
+        SubTable::CameraSettings => {
+          let blob = reserialize_int_array(raw, order);
+          let mut lens_id: Option<u16> = None;
+          let cs = camera_settings::parse_with_lens_id_capture(&blob, order, true, &mut lens_id);
+          let mut min_focal: Option<f64> = None;
+          let mut max_focal: Option<f64> = None;
+          for (n, v) in &cs {
+            match n.as_str() {
+              "MaxFocalLength" => {
+                if let Some(mm) = focal_mm_from_tag_value(v) {
+                  max_focal = Some(mm);
+                }
+              }
+              "MinFocalLength" => {
+                if let Some(mm) = focal_mm_from_tag_value(v) {
+                  min_focal = Some(mm);
+                }
+              }
+              _ => {}
+            }
+          }
+          if let (Some(min), Some(max)) = (min_focal, max_focal) {
+            typed.focal_range_mm = Some((min, max));
+          }
+          if let Some(id) = lens_id {
+            typed.lens_type = Some(id);
+            typed.lens_name = lens_types::lookup_name(id);
+          }
+        }
+        SubTable::FileInfo => {
+          let blob = reserialize_int_array(raw, order);
+          let (_fi, decoded) = file_info::parse_with_model(&blob, order, true, lens_type, model);
+          if decoded != FileInfoDecoded::default() {
+            typed.file_info = Some(decoded);
+          }
+        }
+        SubTable::ShotInfo => {
+          let blob = reserialize_int_array(raw, order);
+          let (si, _em) = shot_info::parse(&blob, order, true, model, file_type);
+          if !si.is_empty() {
+            typed.shot_info = Some(si);
+          }
+        }
+        SubTable::AfInfo => {
+          let blob = reserialize_int_array(raw, order);
+          let (af, _em) = af_info::parse_af_info(&blob, order, true, model);
+          if !af.is_empty() {
+            typed.af_info = Some(af);
+          }
+        }
+        SubTable::AfInfo2 => {
+          let blob = reserialize_int_array(raw, order);
+          // 0x26 `Condition => '$$valPt !~ /^\0\0\0\0/'` (`Canon.pm:1713`): an
+          // all-zero first four bytes means the SubDirectory is NOT entered, so
+          // no typed AFInfo (identical to the emit-path skip).
+          if !first4_all_zero(&blob) {
+            let (af, _em) = af_info::parse_af_info2(&blob, order, true, model);
+            if !af.is_empty() {
+              typed.af_info = Some(af);
+            }
+          }
+        }
+        SubTable::AfInfo3 => {
+          let blob = reserialize_int_array(raw, order);
+          let (af, _em) = af_info::parse_af_info3(&blob, order, true, model);
+          if !af.is_empty() {
+            typed.af_info = Some(af);
+          }
+        }
+        // FocalLength / SensorInfo / ColorBalance contribute no typed field (the
+        // focal RANGE is captured from CameraSettings above, not FocalLength),
+        // and every deferred (`is_walked() == false`) SubDirectory likewise — so
+        // these arms populate nothing, matching `parse_in_tiff`.
+        _ => {}
+      }
+    } else if tag_id == 0x96 && model.is_some_and(printconv::model_matches_eos_5d) {
+      // 5D `0x96` SerialInfo SubDirectory — `parse_in_tiff` does NOT populate
+      // the typed `internal_serial_number` here (that accessor tracks only the
+      // model-agnostic SECOND-arm leaf, which a 5D body never takes).
+    } else if tag_id == 0x28 {
+      // `ImageUniqueID` (`Canon.pm:1726-1735`) — the walk captured the
+      // `Format => 'undef'` bytes; reproduce the RawConv 16-NUL drop + hex
+      // ValueConv exactly as `parse_in_tiff` / `emit_canon_special` do.
+      let val_bytes: &[u8] = match raw {
+        RawValue::Bytes(b) => b,
+        _ => &[],
+      };
+      let is_undef = val_bytes.len() == 16 && val_bytes.iter().all(|&b| b == 0);
+      if !is_undef {
+        typed.image_unique_id = Some(SmolStr::from(hex_lower(val_bytes)));
+      }
+    } else {
+      // Leaf — the `populate_typed` sites (a 0x96 non-5D is the LIST's SECOND
+      // arm `InternalSerialNumber`, whose value the walk already `0xff`-stripped
+      // into `RawValue::Text`).
+      populate_typed_raw(&mut typed, tag_id, raw);
+    }
+  }
+  typed
+}
+
+/// Populate the typed struct from ONE Main-IFD leaf's `(tag_id, RawValue)` —
+/// the `(tag_id, &RawValue)` form of [`populate_typed`] used by
+/// [`build_typed_from_entries`] (the shared-Walker path, which carries the
+/// decoded value without a [`CanonEntry`] wrapper). Reads the pre-PrintConv
+/// [`RawValue`] directly (every typed source is a string/integer leaf).
+fn populate_typed_raw(typed: &mut MakerNotesCanon, tag_id: u16, raw: &RawValue) {
+  match tag_id {
+    0x06 => {
+      if let RawValue::Text { text: s, .. } = raw {
+        typed.image_type = Some(s.as_str().into());
+      }
+    }
+    0x07 => {
+      if let RawValue::Text { text: s, .. } = raw {
+        typed.firmware_version = Some(s.as_str().into());
+      }
+    }
+    0x08 => {
+      if let RawValue::U64(v) = raw
+        && let Some(&n) = v.first()
+      {
+        typed.file_number = Some(n as u32);
+      }
+    }
+    0x09 => {
+      if let RawValue::Text { text: s, .. } = raw {
+        typed.owner_name = Some(s.as_str().into());
+      }
+    }
+    0x0c => {
+      if let RawValue::U64(v) = raw
+        && let Some(&n) = v.first()
+      {
+        typed.serial_number = Some(n);
+      }
+    }
+    0x10 => {
+      if let RawValue::U64(v) = raw
+        && let Some(&n) = v.first()
+      {
+        let id = n as u32;
+        typed.model_id = Some(id);
+        typed.model_name = model_ids::lookup_name(id);
+      }
+    }
+    0x95 => {
+      if let RawValue::Text { text: s, .. } = raw {
+        typed.lens_model_string = Some(s.as_str().into());
+      }
+    }
+    0x96 => {
+      if let RawValue::Text { text: s, .. } = raw {
+        typed.internal_serial_number = Some(s.as_str().into());
+      }
+    }
+    _ => {}
+  }
+}
+
 /// Extract a focal-length-in-mm from a TagValue (e.g. `"55 mm"` ⇒ 55.0).
 fn focal_mm_from_tag_value(v: &TagValue) -> Option<f64> {
   match v {
@@ -1132,7 +1336,13 @@ fn focal_mm_from_tag_value(v: &TagValue) -> Option<f64> {
 
 /// Read FocalUnits from a CameraSettings RawValue (the entry value
 /// before sub-table parsing). Returns `None` if the words are absent.
-fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
+///
+/// `pub(crate)` so the shared `Walker`'s Canon DataMember pre-scan
+/// (`crate::exif::mod`) extracts `$$self{FocalUnits}` (CameraSettings position
+/// 25) from the SAME decoded `RawValue` the collection-time pre-pass
+/// (`parse_in_tiff` lines 723-724) reads — the precondition for the emit-path
+/// DataMember byte-identity the step-B2 differential test proves.
+pub(crate) fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
   // The CameraSettings entry value is stored as a list of int16s words
   // (RawValue::I64) OR as raw bytes; reserialize to bytes and read
   // position 25 directly.
@@ -1161,7 +1371,11 @@ fn read_focal_units(raw: &RawValue, parent_order: ByteOrder) -> Option<u16> {
 /// A blob shorter than four bytes cannot match `/^\0\0\0\0/`, so it is
 /// NOT treated as all-zero (bundled would still enter the SubDirectory and
 /// let `ProcessSerialData` decode whatever fits).
-fn first4_all_zero(blob: &[u8]) -> bool {
+///
+/// `pub(crate)` so the shared `Walker`'s `emit_canon_subtable`
+/// (`crate::exif::mod`) can reproduce the AFInfo2 0x26 `Condition` skip at emit
+/// time, byte-identically to this collection-time use.
+pub(crate) fn first4_all_zero(blob: &[u8]) -> bool {
   // `blob.get(..4)` folds the `blob.len() >= 4` guard into the access — the
   // checked, byte-identical form of `blob.len() >= 4 && blob[..4].iter()...`.
   blob
@@ -1171,7 +1385,13 @@ fn first4_all_zero(blob: &[u8]) -> bool {
 
 /// Lowercase, separator-free hex of a byte string — ExifTool's
 /// `unpack("H*", $val)` (the `ImageUniqueID` ValueConv, `Canon.pm:1733`).
-fn hex_lower(bytes: &[u8]) -> std::string::String {
+///
+/// `pub(crate)` so the shared `Walker`'s Canon `0x28` ImageUniqueID emit
+/// (`crate::exif::mod`, #243 phase 2 step B3) renders the surviving undef
+/// bytes through the SAME `unpack("H*", $val)` this collection-time emit
+/// (`parse_in_tiff`) uses — the precondition for the emit-path byte-identity
+/// the differential test proves.
+pub(crate) fn hex_lower(bytes: &[u8]) -> std::string::String {
   use std::fmt::Write;
   let mut out = std::string::String::with_capacity(bytes.len() * 2);
   for &b in bytes {
@@ -1184,7 +1404,12 @@ fn hex_lower(bytes: &[u8]) -> std::string::String {
 /// parent IFD's byte order. The CameraSettings/FileInfo/FocalLength
 /// sub-table parsers want the BYTE blob (`$$valPt`), not the decoded
 /// `i64` array — bundled `ProcessBinaryData` reads bytes too.
-fn reserialize_int_array(raw: &RawValue, order: ByteOrder) -> Vec<u8> {
+///
+/// `pub(crate)` so the shared `Walker`'s `emit_canon_subtable`
+/// (`crate::exif::mod`) reserializes a sub-table entry's decoded value to the
+/// SAME `$$valPt` bytes these collection-time dispatches use — the precondition
+/// for the emit-path byte-identity the differential test proves.
+pub(crate) fn reserialize_int_array(raw: &RawValue, order: ByteOrder) -> Vec<u8> {
   match raw {
     RawValue::I64(words) => {
       let mut out = Vec::with_capacity(words.len() * 2);
